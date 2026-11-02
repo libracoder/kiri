@@ -45,5 +45,5 @@ once; see the README.
 - Sign your commits and the [Contributor License Agreement](CLA.md) when CLA
   Assistant asks for it on your first pull request.
 
-By submitting a contribution you agree it is licensed under AGPL-3.0-only, as
+By submitting a contribution you agree it is licensed under Apache-2.0, as
 described in the README and the Contributor License Agreement.

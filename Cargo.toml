@@ -7,7 +7,7 @@ members = ["crates/*", "xtask"]
 # set by the release build. Builds from a checkout say 0.0.0.
 version = "0.0.0"
 edition = "2024"
-license = "AGPL-3.0-only"
+license = "Apache-2.0"
 publish = false
 
 [workspace.lints.rust]

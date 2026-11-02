@@ -10,7 +10,7 @@ the following terms for every contribution you submit to Kiri.
 You grant Canestack Labs and the recipients of Kiri a perpetual, worldwide,
 non-exclusive, transferable, irrevocable, royalty-free copyright licence to
 reproduce, modify, publicly display, publicly perform, sublicense, and
-distribute your contribution and derivative works of it, under AGPL-3.0-only or
+distribute your contribution and derivative works of it, under Apache-2.0 or
 other licence terms.
 
 ## 2. Patent licence

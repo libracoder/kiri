@@ -17,4 +17,4 @@ scripts/ci/kernel-source.sh target/Kiri-VERSION-kernel-source.tar.xz
 
 This offer to provide the corresponding source is valid for three years from
 the date of each release. The guest kernel is a separate work from the
-AGPL-3.0-only Kiri application.
+Apache-2.0 Kiri application.

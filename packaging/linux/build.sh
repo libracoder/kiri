@@ -102,7 +102,7 @@ Source: https://github.com/libracoder/kiri
 
 Files: *
 Copyright: 2026 Kiri
-License: AGPL-3.0-only
+License: Apache-2.0
  See LICENSE and NOTICE in this directory.
 EOF
   if [ "$full" = 1 ]; then

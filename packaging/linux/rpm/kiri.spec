@@ -11,7 +11,7 @@ Name:           %{kiri_name}
 Version:        %{kiri_version}
 Release:        1%{?dist}
 Summary:        Tiny, fast container runtime (Docker API)%{!?with_cli:, engine only}
-License:        AGPL-3.0-only
+License:        Apache-2.0
 URL:            https://runkiri.com
 Source0:        kiri
 Source1:        kiri-init
