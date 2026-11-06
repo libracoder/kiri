@@ -142,21 +142,26 @@ t tty-shell "typed-42" bash -c "(sleep 1; printf 'echo typed-\$((6*7))\nexit\n')
 code tty-exit-code 5 bash -c "(sleep 1; printf 'exit 5\n') | script -q /dev/null $D run -it --rm alpine sh"
 # The client half-closes right behind its input, and the process must see the end.
 # A Mac can lose that on the daemon's socket, 1 to 5 runs in 100, hence the many
-# runs. The hang is timed here: an alarm does not stop a docker client.
+# runs. The hang is timed here: an alarm does not stop a docker client. Each run
+# must also exit 0 and print its input, or runs that all fail would pass this.
 if [ "${SLOW:-0}" = 1 ]; then
-  hung=0
+  hung=0 wrong=0 out=$(mktemp)
   for _ in $(seq 300); do
-    echo in | $D run -i --rm --name e2e-stdin-end alpine cat >/dev/null 2>&1 &
+    echo in | $D run -i --rm --name e2e-stdin-end alpine cat >"$out" 2>&1 &
     p=$!
     for _ in $(seq 150); do kill -0 $p 2>/dev/null || break; sleep 0.1; done
     if kill -0 $p 2>/dev/null; then
       hung=$((hung + 1))
       kill -9 $p
+      wait $p 2>/dev/null
+      $D rm -f e2e-stdin-end >/dev/null 2>&1
+    elif ! wait $p || [ "$(cat "$out")" != in ]; then
+      wrong=$((wrong + 1))
       $D rm -f e2e-stdin-end >/dev/null 2>&1
     fi
-    wait $p 2>/dev/null
   done
-  t stdin-end-every-time "hung 0" echo "hung $hung"
+  rm -f "$out"
+  t stdin-end-every-time "hung 0, wrong 0" echo "hung $hung, wrong $wrong"
 fi
 
 section "detached, logs, exec, lifecycle"

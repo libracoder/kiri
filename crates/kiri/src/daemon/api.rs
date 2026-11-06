@@ -2012,8 +2012,9 @@ fn forward_stdin(engine: Arc<Engine>, id: String, r: &mut BufReader<UnixStream>)
 /// in 1 to 5 runs in 100. poll is woken for it.
 fn wait_readable(stream: &UnixStream) {
     let mut fd = libc::pollfd { fd: stream.as_raw_fd(), events: libc::POLLIN, revents: 0 };
-    // SAFETY: one valid pollfd. If this fails the read just blocks, as without it.
-    unsafe { libc::poll(&mut fd, 1, -1) };
+    // SAFETY: one valid pollfd. Any other failure leaves the read to block or to
+    // report it, as without this.
+    while unsafe { libc::poll(&mut fd, 1, -1) } == -1 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {}
 }
 
 /// Sends output to an attached client: raw for a terminal, Docker's
@@ -2516,6 +2517,31 @@ mod tests {
         let rx = read_to_the_end(server);
         drop(client);
         assert_eq!(rx.recv_timeout(limit), Ok(0));
+    }
+
+    // Falling through to the read on a signal would bring the lost wake-up back.
+    #[test]
+    fn wait_readable_keeps_waiting_through_a_signal() {
+        use std::os::unix::thread::JoinHandleExt;
+        extern "C" fn nothing(_: libc::c_int) {}
+        // SAFETY: the handler does nothing, and with no SA_RESTART poll sees EINTR.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = nothing as *const () as libc::sighandler_t;
+            libc::sigaction(libc::SIGUSR2, &action, std::ptr::null_mut());
+        }
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            wait_readable(&server);
+            tx.send(()).unwrap();
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        // SAFETY: the thread is running, as nothing has woken it yet.
+        assert_eq!(unsafe { libc::pthread_kill(waiter.as_pthread_t() as libc::pthread_t, libc::SIGUSR2) }, 0);
+        assert!(rx.recv_timeout(Duration::from_millis(300)).is_err());
+        io::Write::write_all(&mut client, b"in").unwrap();
+        assert!(rx.recv_timeout(Duration::from_secs(10)).is_ok());
     }
 }
 
