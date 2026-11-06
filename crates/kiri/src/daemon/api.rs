@@ -3,6 +3,7 @@
 //! answers 404 with a message saying Kiri does not support it yet.
 
 use std::io::{self, BufReader};
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -1989,6 +1990,7 @@ fn forward_stdin(engine: Arc<Engine>, id: String, r: &mut BufReader<UnixStream>)
         }
         let mut buf = vec![0u8; 32 * 1024];
         loop {
+            wait_readable(&stream);
             match io::Read::read(&mut stream, &mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
@@ -2001,6 +2003,17 @@ fn forward_stdin(engine: Arc<Engine>, id: String, r: &mut BufReader<UnixStream>)
         let _ = engine.close_stdin(&id);
     })?;
     Ok(())
+}
+
+/// Waits until a read of `stream` will not block. macOS can leave a thread
+/// blocked in recv on a unix socket asleep through the peer's half-close when
+/// it closely follows data, though the next read would see the end. For
+/// `docker run -i` that was a process waiting forever for the end of its input,
+/// in 1 to 5 runs in 100. poll is woken for it.
+fn wait_readable(stream: &UnixStream) {
+    let mut fd = libc::pollfd { fd: stream.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+    // SAFETY: one valid pollfd. If this fails the read just blocks, as without it.
+    unsafe { libc::poll(&mut fd, 1, -1) };
 }
 
 /// Sends output to an attached client: raw for a terminal, Docker's
@@ -2465,6 +2478,44 @@ mod tests {
         }
         // A stop signal Docker would not parse stops with SIGTERM.
         assert_eq!(signal("BOGUS"), 15);
+    }
+
+    /// Reads a socket as `forward_stdin` does, reporting each read's length.
+    fn read_to_the_end(mut server: UnixStream) -> std::sync::mpsc::Receiver<usize> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 8];
+            loop {
+                wait_readable(&server);
+                let n = io::Read::read(&mut server, &mut buf).unwrap();
+                tx.send(n).unwrap();
+                if n == 0 {
+                    break;
+                }
+            }
+        });
+        rx
+    }
+
+    // This pins what wait_readable must do. The lost wake-up itself is too rare
+    // for a unit test: the SLOW check in tests/e2e.sh is what catches that.
+    #[test]
+    fn wait_readable_wakes_for_input_and_its_end_and_not_while_idle() {
+        let (idle, limit) = (Duration::from_millis(200), Duration::from_secs(10));
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let rx = read_to_the_end(server);
+        assert!(rx.recv_timeout(idle).is_err());
+        io::Write::write_all(&mut client, b"in").unwrap();
+        assert_eq!(rx.recv_timeout(limit), Ok(2));
+        assert!(rx.recv_timeout(idle).is_err());
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+        assert_eq!(rx.recv_timeout(limit), Ok(0));
+
+        // A client that dies, with no half-close, ends it too.
+        let (client, server) = UnixStream::pair().unwrap();
+        let rx = read_to_the_end(server);
+        drop(client);
+        assert_eq!(rx.recv_timeout(limit), Ok(0));
     }
 }
 

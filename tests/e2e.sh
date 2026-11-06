@@ -140,6 +140,24 @@ t tty-term "xterm" bash -c "script -q /dev/null $D run -it --rm alpine sh -c 'ec
 # Type after the shell is up: an interactive shell discards input typed before its first prompt.
 t tty-shell "typed-42" bash -c "(sleep 1; printf 'echo typed-\$((6*7))\nexit\n') | script -q /dev/null $D run -it --rm alpine sh"
 code tty-exit-code 5 bash -c "(sleep 1; printf 'exit 5\n') | script -q /dev/null $D run -it --rm alpine sh"
+# The client half-closes right behind its input, and the process must see the end.
+# A Mac can lose that on the daemon's socket, 1 to 5 runs in 100, hence the many
+# runs. The hang is timed here: an alarm does not stop a docker client.
+if [ "${SLOW:-0}" = 1 ]; then
+  hung=0
+  for _ in $(seq 300); do
+    echo in | $D run -i --rm --name e2e-stdin-end alpine cat >/dev/null 2>&1 &
+    p=$!
+    for _ in $(seq 150); do kill -0 $p 2>/dev/null || break; sleep 0.1; done
+    if kill -0 $p 2>/dev/null; then
+      hung=$((hung + 1))
+      kill -9 $p
+      $D rm -f e2e-stdin-end >/dev/null 2>&1
+    fi
+    wait $p 2>/dev/null
+  done
+  t stdin-end-every-time "hung 0" echo "hung $hung"
+fi
 
 section "detached, logs, exec, lifecycle"
 $D run -d --name web nginx:alpine >/dev/null
