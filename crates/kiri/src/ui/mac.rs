@@ -228,8 +228,10 @@ pub(super) fn set_appearance(theme: &str) {
     }
 }
 
-/// Shows the window (after it was closed or hidden) and brings Kiri forward.
+/// Shows the window (after it was closed or hidden) and brings Kiri forward,
+/// putting the Dock icon back that closing the window took away.
 fn show_window(mtm: MainThreadMarker) {
+    NSApplication::sharedApplication(mtm).setActivationPolicy(NSApplicationActivationPolicy::Regular);
     WINDOW.with(|w| {
         if let Some(window) = w.borrow().as_ref() {
             window.makeKeyAndOrderFront(None);
@@ -442,9 +444,11 @@ define_class!(
     unsafe impl NSObjectProtocol for AppDelegate {}
 
     unsafe impl NSApplicationDelegate for AppDelegate {
-        /// Closing the window leaves Kiri in the menu bar, as OrbStack does.
+        /// Closing the window leaves Kiri in the menu bar only, as the tray
+        /// does on Windows: the Dock icon goes until the window opens again.
         #[unsafe(method(applicationShouldTerminateAfterLastWindowClosed:))]
-        fn should_terminate_after_last_window(&self, _app: &NSApplication) -> bool {
+        fn should_terminate_after_last_window(&self, app: &NSApplication) -> bool {
+            app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
             false
         }
 
