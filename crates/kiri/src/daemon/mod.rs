@@ -92,15 +92,26 @@ pub fn run(_args: &[String]) -> io::Result<()> {
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
     // On a Linux host the daemon runs as root; `KIRI_SOCKET_GROUP=kiri`
     // lets that group's users in, as the docker group does for dockerd.
-    if let Some(group) = std::env::var_os("KIRI_SOCKET_GROUP") {
-        socket_group(&socket, &group)?;
-        // And each member by name, so one just added needn't sign in again.
-        #[cfg(target_os = "linux")]
-        match access::grant(&socket, &group.to_string_lossy()) {
-            Ok(n) => diag::info!("socket access list written", members = n),
-            Err(e) => diag::warn!("socket access list not written: new members sign in again first", error = e),
-        }
+    let access_group = std::env::var_os("KIRI_SOCKET_GROUP");
+    if let Some(group) = &access_group {
+        socket_group(&socket, group)?;
     }
+    // Each member by name too, so one just added needn't sign in again; and
+    // connections are checked against the group when made and while open, so
+    // a member removed is let go at once, whatever the list still says.
+    #[cfg(target_os = "linux")]
+    let gate = match &access_group {
+        Some(group) => {
+            let gate = access::Gate::new(&socket, group)?;
+            match gate.grant() {
+                Ok(n) => diag::info!("socket access list written", members = n),
+                Err(e) => diag::warn!("socket access list not written: new members sign in again first", error = e),
+            }
+            gate.clone().watch()?;
+            Some(gate)
+        }
+        None => None,
+    };
 
     // SIGINT/SIGTERM shut down cleanly: power the guest off, remove the socket.
     // Blocked here so every thread inherits it; one thread waits for them.
@@ -172,7 +183,19 @@ pub fn run(_args: &[String]) -> io::Result<()> {
     for conn in listener.incoming() {
         let Ok(conn) = conn else { continue };
         let engine = engine.clone();
+        #[cfg(target_os = "linux")]
+        let gate = gate.clone();
         let spawned = std::thread::Builder::new().name("kiri-api".into()).spawn(move || {
+            // Checked here, not in the accept loop: a slow user lookup holds up
+            // this connection only.
+            #[cfg(target_os = "linux")]
+            let _seat = match &gate {
+                Some(gate) => match gate.admit(&conn) {
+                    Some(seat) => Some(seat),
+                    None => return,
+                },
+                None => None,
+            };
             let _ = api::serve(conn, engine);
         });
         if let Err(e) = spawned {
