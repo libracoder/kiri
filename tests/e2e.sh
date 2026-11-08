@@ -405,6 +405,9 @@ section "volumes and bind mounts"
 BIND=$(mktemp -d); echo "from the mac" > "$BIND/hello.txt"
 t bind-read "from the mac" $D run --rm -v "$BIND:/data" alpine cat /data/hello.txt
 t bind-write "from the container" bash -c "$D run --rm -v $BIND:/data alpine sh -c 'echo from the container > /data/out.txt' && cat $BIND/out.txt"
+# A new file without owner read (Node's fs.cpSync creates with 0200) is made
+# and ends with that mode (guest/kernel/patches/0003).
+t bind-create-0200 "200 hi" bash -c "$D run --rm -v $BIND:/data alpine sh -c 'umask 577; echo hi > /data/w0200' && perl -e 'printf q(%o ), (stat shift)[2] & 07777' $BIND/w0200 && chmod u+r $BIND/w0200 && cat $BIND/w0200"
 t bind-ro "Read-only file system" $D run --rm -v "$BIND:/data:ro" alpine sh -c 'echo x > /data/nope'
 t bind-mount-flag "from the mac" $D run --rm --mount "type=bind,source=$BIND,target=/m" alpine cat /m/hello.txt
 code bind-mount-missing 125 $D run --rm --mount type=bind,source=/kiri/does/not/exist,target=/m alpine true
