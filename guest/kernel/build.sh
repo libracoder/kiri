@@ -14,7 +14,7 @@ case "$KARCH-$(uname -m)" in
   arm64-*) cross=aarch64-linux-gnu- pkgs=gcc-aarch64-linux-gnu ;;
   *) echo "KARCH must be arm64 or x86_64" >&2; exit 1 ;;
 esac
-apt-get update -qq && apt-get install -y -qq build-essential flex bison bc libssl-dev libelf-dev curl xz-utils python3 $pkgs >/dev/null
+apt-get update -qq && apt-get install -y -qq build-essential flex bison bc libssl-dev libelf-dev dwarves curl xz-utils python3 $pkgs >/dev/null
 cd /build
 [ -f "linux-$KVER/Makefile" ] && [ -f "linux-$KVER/scripts/Kbuild.include" ] || { rm -rf "linux-$KVER"; curl -fsSL "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$KVER.tar.xz" | tar xJ; }
 cd "linux-$KVER"
@@ -34,7 +34,7 @@ missing=0
 for line in $(grep -E '^CONFIG_[A-Z0-9_]+=y' "$config"); do
   grep -qx "$line" .config || { echo "MISSING: $line"; missing=1; }
 done
-[ "$missing" = 0 ] || echo "some options were not applied (dependency not met)"
+[ "$missing" = 0 ] || { echo "some options were not applied (dependency not met)" >&2; exit 1; }
 if [ "$KARCH" = x86_64 ]; then
   make -s -j"$(nproc)" ARCH=x86_64 CROSS_COMPILE="$cross" bzImage
   cp arch/x86/boot/bzImage .config /out/

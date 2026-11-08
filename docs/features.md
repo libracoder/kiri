@@ -41,7 +41,8 @@ Apple silicon and Intel Macs (macOS 14+), Windows 10 and 11 (x86-64 and Arm, thr
   `save`, `load`, `history`, `search`, `image prune`, `system df`;
   **amd64 images run through Rosetta**, `--platform` honoured
 - **Builds**: `docker build` / `buildx build` through BuildKit running in a
-  Kiri container (buildx's docker-container driver), stopped when idle
+  Kiri container (buildx's docker-container driver), stopped when idle;
+  on Apple silicon, amd64 build steps run through Rosetta too
 - **Compose**: `up`, `down`, `ps`, `logs`, `exec`, multiple networks, events
 - **Mac integration**: container files at `~/Kiri` in Finder (read-only
   NFS, always current), SSH agent forwarding at

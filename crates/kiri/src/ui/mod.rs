@@ -30,7 +30,12 @@ mod linux;
 #[cfg(target_os = "linux")]
 use linux::{import, setup, update};
 
+mod assemble;
+#[cfg(unix)]
+mod term;
+mod termwire;
 mod brands;
+mod recheck;
 mod detail;
 mod hub;
 mod k8s;
@@ -44,8 +49,6 @@ use crate::client;
 use crate::diag;
 
 const PAGE: &str = include_str!("index.html");
-/// The page's UI icons, spliced into its `/*ICONS*/` placeholder.
-const ICONS_JS: &str = include_str!("icons.js");
 
 /// How often the VM panel's figures refresh. The lists refresh on events.
 const TICK: Duration = Duration::from_secs(2);
@@ -438,7 +441,7 @@ pub(crate) fn prefs() -> serde_json::Value {
 }
 
 fn set_pref(name: &str, value: serde_json::Value) {
-    if !matches!(name, "font" | "mono" | "scale" | "domainsAsked" | "theme" | "accent" | "importSeen" | "updateAuto" | "updateSkip" | "updateSnoozeUntil" | "columnWidths" | "crashReports" | "ctxSnooze" | "ctxBack" | "logSize" | "starAsked" | "setupSkip") {
+    if !matches!(name, "font" | "mono" | "scale" | "termH" | "termFs" | "termFont" | "domainsAsked" | "theme" | "accent" | "importSeen" | "updateAuto" | "updateSkip" | "updateSnoozeUntil" | "columnWidths" | "crashReports" | "ctxSnooze" | "ctxBack" | "logSize" | "starAsked" | "setupSkip") {
         return;
     }
     let Some(path) = prefs_path() else { return };
@@ -566,7 +569,12 @@ fn update_check(manual: bool) {
     {
         emit(serde_json::json!({"type": "enginestale", "version": v}).to_string());
     }
-    // Kiri Dev is rebuilt from source, never updated from the feed, unless
+    feed_check(manual);
+}
+
+/// Whether the feed has a newer release, and one already staged; the
+/// window's check and the 6-hourly one (recheck.rs).
+fn feed_check(manual: bool) {    // Kiri Dev is rebuilt from source, never updated from the feed, unless
     // KIRI_UPDATE_URL names a test feed (to try the update card and What's new).
     if crate::flavor::dev() && std::env::var_os("KIRI_UPDATE_URL").is_none() {
         if manual {
@@ -591,6 +599,7 @@ fn update_check(manual: bool) {
     if !manual && prefs()["updateAuto"] == false {
         return;
     }
+    recheck::checked();
     // Linux's kiri comes from a .deb or .rpm: the feed only says whether a
     // newer one exists, and About links to the releases page, so no card.
     if cfg!(target_os = "linux") {
@@ -1579,6 +1588,29 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
             sharing::sign_out();
             Ok(())
         }
+        // The built-in terminal: its shells, and its own clipboard and links.
+        "term" => {
+            match msg.name.as_str() {
+                // A selection can be a whole screen of output.
+                "copy" => {
+                    if let Some(text) = msg.value.as_str().filter(|t| !t.is_empty() && t.len() <= termwire::COPY_MAX) {
+                        window::copy(text);
+                    }
+                }
+                "paste" => {
+                    let id = msg.id;
+                    window::paste(move |text| emit(termwire::paste(&id, &text)));
+                }
+                // A link in a shell's output: web pages only, never a file or an app's scheme.
+                "link" => {
+                    if let Some(url) = msg.value.as_str().filter(|u| termwire::web_link(u)) {
+                        open(url);
+                    }
+                }
+                action => term::handle(action, &msg.id, &msg.value, emit),
+            }
+            Ok(())
+        }
         // The page can't write the clipboard itself; IDs and short text only.
         "copy" => {
             if !msg.name.is_empty() && msg.name.len() <= 4096 {
@@ -1846,6 +1878,12 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
             window::drag();
             Ok(())
         }
+        // ⌘W when the built-in terminal doesn't have the focus.
+        #[cfg(target_os = "macos")]
+        "closewindow" => {
+            window::close_window();
+            Ok(())
+        }
         "zoom" => {
             window::zoom();
             Ok(())
@@ -1947,9 +1985,11 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
                 }
             });
             diag::report::spawn_crash_sender(Duration::from_secs(5), None);
-            // A newer release, checked once per window, quietly; one
-            // already downloaded; an engine still on an older build.
+            // A newer release, checked when the window opens and every 6
+            // hours after (recheck.rs), quietly; one already downloaded; an
+            // engine still on an older build.
             std::thread::spawn(|| update_check(false));
+            recheck::start(|| feed_check(false));
             // The first time the app opens: ask, once, whether to use *.kiri.local (the Mac only, so far).
             if cfg!(target_os = "macos") && !crate::flavor::dev() && !crate::daemon::dns::installed() && prefs()["domainsAsked"] != true {
                 set_pref("domainsAsked", true.into());
