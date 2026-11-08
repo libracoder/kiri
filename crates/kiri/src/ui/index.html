@@ -376,7 +376,8 @@ td.r, th.r { text-align: right; }
 .name { display: flex; align-items: center; gap: 10px; }
 .tile { width: 30px; height: 30px; border-radius: 8px; display: grid; place-items: center; flex: none; background: var(--raised); color: var(--faint); box-shadow: inset 0 0 0 1px var(--line); }
 .tile svg { width: 18px; height: 18px; fill: currentColor; }
-/* A tag never stretches its column: a long one ends in an ellipsis, whole in its title. */
+/* A tag never stretches its column: a long one ends in an ellipsis, whole in its title.
+   Cap the pill at 160px; Images' Tag cell (td.clip + fixed shares) can clip further when narrow. */
 .tag.k8s { margin-left: 6px; color: var(--blue); border-color: color-mix(in srgb, var(--blue) 40%, transparent); background: color-mix(in srgb, var(--blue) 10%, transparent); }
 .k8s-mark { margin-left: 6px; display: inline-flex; vertical-align: -3px; }
 .k8s-mark svg { width: 16px; height: 16px; fill: #326CE5; }
@@ -3481,8 +3482,10 @@ function fitColumns() {
   const fixed = (th) => !!th.dataset.fixed;
   let w = widths()[tbl.dataset.view];
   if (w && cells.length !== w.cols.length) w = null;
-  // A table with fixed columns is always laid out here; one without, only once it's been resized.
-  if (!w && !cells.some(fixed)) return;
+  // Laid out when columns declare a share or a fixed width, or after the
+  // person has resized once (saved widths). Share-only tables (Images,
+  // Containers) must not wait for a drag — otherwise a long tag pushes Actions off.
+  if (!w && !cells.some((th) => fixed(th) || th.dataset.share)) return;
   tbl.classList.add("sized");
   const box = getComputedStyle(tbl.parentElement);
   // Actions take what their buttons need, not a saved width: a saved one can be stale or inflated.
@@ -4037,8 +4040,8 @@ function renderImages() {
     const [repo, tag] = untagged(i) ? ["<none>", ""] : split(name);
     const picked = ui.picked && (i.RepoTags || []).some((t) => t === ui.picked || t === `${ui.picked}:latest`);
     rows.push(`<tr class="row${picked ? " picked" : ""}${chosen("images", i)}" data-rowopen="img" data-key="${esc(name)}"${pickAt("images", i)}>
-      ${pickCell("images", i)}<td><div class="name" data-img="${esc(name)}">${tile(i.icon)}<div><span class="link">${esc(repo)}</span></div></div></td>
-      <td>${untagged(i) ? '<span class="tag none">untagged</span>' : tagPill(tag)}</td>
+      ${pickCell("images", i)}<td class="clip"><div class="name" data-img="${esc(name)}" title="${esc(repo)}">${tile(i.icon)}<div><span class="link">${esc(repo)}</span></div></div></td>
+      <td class="clip">${untagged(i) ? '<span class="tag none">untagged</span>' : tagPill(tag)}</td>
       ${usedCell(i, lit)}
       <td class="mono muted col-id"><span class="sel">${esc(short(i.Id))}</span>${copyBtn(i.Id, "image ID")}</td>
       <td class="r num">${size(i.Size)}</td>
@@ -4050,7 +4053,9 @@ function renderImages() {
         ${ibtn("trash", "Remove", `data-rmi="${esc(name)}"`, "danger")}
       </div></td></tr>`);
   }
-  table([["Repository", "", "repo"], ["Tag", "", "tag"], ["Used by", "", "used"], ["ID", "col-id", "id"], ["Size", "r", "size"], ["Created", "col-created", "created"], ["Pulled", "", "pulled"]], rows, "images");
+  // Shares like Containers: the table is always fixed-layout so a long repo or
+  // tag ellipsises instead of pushing Actions off the window.
+  table([["Repository", "", "repo", { share: 3 }], ["Tag", "", "tag", { share: 1.2 }], ["Used by", "", "used", { share: 1.4 }], ["ID", "col-id", "id", { share: 1 }], ["Size", "r", "size", { share: 0.8 }], ["Created", "col-created", "created", { share: 1 }], ["Pulled", "", "pulled", { share: 1 }]], rows, "images");
 }
 
 // An image's page: Images › name, with its layers and settings read from Kiri's store.
