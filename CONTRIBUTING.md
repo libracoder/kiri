@@ -33,7 +33,8 @@ once; see the README.
 - `python3 scripts/ui-test.py` must pass. Its parity test opens the window as
   each system and fails when one shows something another doesn't, unless
   `tests/ui/parity-allow.txt` gives the reason. A new line there needs a
-  maintainer's OK.
+  maintainer's OK. It also runs on every pull request; on Linux, point
+  `CHROME` at your Chrome or Chromium.
 
 ## Pull requests
 

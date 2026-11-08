@@ -1,0 +1,35 @@
+# The window's page tests (scripts/ui-test.py) on every pull request, so a
+# change that breaks one shows on the PR before review.
+#
+# Safe for pull requests from forks: it runs on GitHub's machines with a
+# read-only token and no secrets, and uses pull_request (never
+# pull_request_target), so a fork's code can't write to the repository.
+name: UI tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ui-tests-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ui:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Run the page tests in headless Chrome
+        run: |
+          # The runner's Chrome, without the sandbox: it needs user
+          # namespaces the runner doesn't allow.
+          printf '#!/bin/sh\nexec google-chrome --no-sandbox "$@"\n' > "$RUNNER_TEMP/chrome"
+          chmod +x "$RUNNER_TEMP/chrome"
+          CHROME="$RUNNER_TEMP/chrome" python3 scripts/ui-test.py
