@@ -94,6 +94,7 @@ kiri UI ────┘
 | `guest/kernel` | kernel config and patches |
 | `tests/e2e.sh` | ~350 checks through the real `docker` CLI, plus a leak soak (`K8S=1` adds Kubernetes) |
 | `tests/linux-host.sh` | the Linux host build, driven in a privileged container |
+| `tests/finder-mount.sh` | the Mac's Finder mount at `~/Kiri`: covers only an empty folder or its own old mount, never your files or another mount |
 | `contrib/` | systemd unit, WSL2 and Windows install scripts |
 | `installer/windows` | the Windows MSI (WiX 5): `kiri.wxs`, licence, dialog bitmaps |
 | `packaging/` | Linux `.deb` and `.rpm` (`kiri` with the docker CLI, `kiri-lite` engine only), the Homebrew plan |

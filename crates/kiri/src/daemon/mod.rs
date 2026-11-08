@@ -21,7 +21,7 @@ mod logfile;
 mod names;
 mod network;
 #[cfg(target_os = "macos")]
-mod nfs;
+pub(crate) mod nfs;
 mod ops;
 pub(crate) mod ports;
 mod pulls;
