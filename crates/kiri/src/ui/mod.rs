@@ -486,6 +486,24 @@ fn proxy(save: Option<serde_json::Value>) {
     }
 }
 
+/// Reads (or saves, then reads) `~/.kiri/daemon.json` (registry mirrors).
+fn daemon(save: Option<serde_json::Value>) {
+    if let Some(body) = save {
+        match client::request("POST", "/kiri/daemon", Some(&body)) {
+            Ok(r) if r.ok() => emit(notice("ok", "daemon.json saved")),
+            Ok(r) => emit(notice("error", &r.error())),
+            Err(e) => emit(notice("error", &e.to_string())),
+        }
+    }
+    match client::get("/kiri/daemon") {
+        Ok(mut v) => {
+            v["type"] = "daemon".into();
+            emit(v.to_string());
+        }
+        Err(e) => emit(serde_json::json!({"type": "daemon", "error": e.to_string()}).to_string()),
+    }
+}
+
 /// Reads (or saves, then reads) the VM's CPUs and memory for Settings.
 fn resources(save: Option<serde_json::Value>) {
     let saved = save.map(|body| client::request("POST", "/kiri/resources", Some(&body)));
@@ -1752,6 +1770,16 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
         "setproxy" => {
             let body = msg.value;
             std::thread::spawn(move || proxy(Some(body)));
+            Ok(())
+        }
+        // Settings → Network: registry mirrors (`~/.kiri/daemon.json`).
+        "daemon" => {
+            std::thread::spawn(|| daemon(None));
+            Ok(())
+        }
+        "setdaemon" => {
+            let body = msg.value;
+            std::thread::spawn(move || daemon(Some(body)));
             Ok(())
         }
         // Settings → Resources.
