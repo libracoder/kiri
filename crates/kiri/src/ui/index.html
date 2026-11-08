@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -2032,41 +2032,41 @@ main { position: relative; }
   <button class="sb chev" id="nav-fwd" disabled><svg viewBox="0 0 256 256" data-ph="caret"></svg></button>
   <span class="drag"></span>
   <label class="gfind" id="gfind"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="7" cy="7" r="4.8"/><path d="M10.6 10.6L14 14"/></svg>
-    <input id="gq" placeholder="Search containers, images…" spellcheck="false" autocomplete="off" role="combobox" aria-controls="pal" aria-expanded="false" aria-label="Search Kiri"><kbd id="gkbd">⌘K</kbd></label>
-  <button class="sb" id="strip-settings" title="Settings" aria-label="Settings"><svg viewBox="0 0 256 256" data-ph="gear"></svg></button>
+    <input id="gq" placeholder="Search containers, images…" spellcheck="false" autocomplete="off" role="combobox" aria-controls="pal" aria-expanded="false" data-i18n-aria="Search Kiri" aria-label="Search Kiri"><kbd id="gkbd">⌘K</kbd></label>
+  <button class="sb" id="strip-settings" data-i18n-title="Settings" title="Settings" aria-label="Settings"><svg viewBox="0 0 256 256" data-ph="gear"></svg></button>
 </header>
 
 <aside>
 
-  <div class="navlabel" id="docker-label">Docker<button class="kwrench" id="theme-toggle"><svg class="i" viewBox="0 0 256 256"></svg></button></div>
+  <div class="navlabel" id="docker-label"><span data-i18n="Docker">Docker</span><button class="kwrench" id="theme-toggle"><svg class="i" viewBox="0 0 256 256"></svg></button></div>
   <nav>
-    <button data-view="containers"><svg class="i" viewBox="0 0 256 256" data-ph="cube"></svg><span class="lbl">Containers</span><span class="count" id="n-containers">0</span></button>
-    <button data-view="images"><svg class="i" viewBox="0 0 256 256" data-ph="stack"></svg><span class="lbl">Images</span><span class="count" id="n-images">0</span></button>
-    <button data-view="volumes"><svg class="i" viewBox="0 0 256 256" data-ph="database"></svg><span class="lbl">Volumes</span><span class="count" id="n-volumes">0</span></button>
-    <button data-view="networks"><svg class="i" viewBox="0 0 256 256" data-ph="network"></svg><span class="lbl">Networks</span><span class="count" id="n-networks">0</span></button>
-    <button data-view="builds"><svg class="i" viewBox="0 0 256 256" data-ph="hammer"></svg><span class="lbl">Builds</span><span class="count" id="n-builds"></span></button>
+    <button data-view="containers"><svg class="i" viewBox="0 0 256 256" data-ph="cube"></svg><span class="lbl" data-i18n="Containers">Containers</span><span class="count" id="n-containers">0</span></button>
+    <button data-view="images"><svg class="i" viewBox="0 0 256 256" data-ph="stack"></svg><span class="lbl" data-i18n="Images">Images</span><span class="count" id="n-images">0</span></button>
+    <button data-view="volumes"><svg class="i" viewBox="0 0 256 256" data-ph="database"></svg><span class="lbl" data-i18n="Volumes">Volumes</span><span class="count" id="n-volumes">0</span></button>
+    <button data-view="networks"><svg class="i" viewBox="0 0 256 256" data-ph="network"></svg><span class="lbl" data-i18n="Networks">Networks</span><span class="count" id="n-networks">0</span></button>
+    <button data-view="builds"><svg class="i" viewBox="0 0 256 256" data-ph="hammer"></svg><span class="lbl" data-i18n="Builds">Builds</span><span class="count" id="n-builds"></span></button>
   </nav>
-  <div class="navlabel" id="k8s-label">Kubernetes<button class="kwrench" id="k8s-settings" aria-label="Kubernetes settings" title="Kubernetes settings"><svg class="i" viewBox="0 0 256 256" data-ph="wrench"></svg></button><span class="kside" id="k8s-side"></span></div>
+  <div class="navlabel" id="k8s-label"><span data-i18n="Kubernetes">Kubernetes</span><button class="kwrench" id="k8s-settings" data-i18n-title="Kubernetes settings" aria-label="Kubernetes settings" title="Kubernetes settings"><svg class="i" viewBox="0 0 256 256" data-ph="wrench"></svg></button><span class="kside" id="k8s-side"></span></div>
   <nav id="k8s-nav">
-    <button data-view="pods"><svg class="i" viewBox="0 0 256 256" data-ph="pods"></svg><span class="lbl">Pods</span><span class="count" id="n-pods"></span></button>
-    <button data-view="services"><svg class="i" viewBox="0 0 256 256" data-ph="services"></svg><span class="lbl">Services</span><span class="count" id="n-services"></span></button>
+    <button data-view="pods"><svg class="i" viewBox="0 0 256 256" data-ph="pods"></svg><span class="lbl" data-i18n="Pods">Pods</span><span class="count" id="n-pods"></span></button>
+    <button data-view="services"><svg class="i" viewBox="0 0 256 256" data-ph="services"></svg><span class="lbl" data-i18n="Services">Services</span><span class="count" id="n-services"></span></button>
   </nav>
-  <div class="navlabel">Kiri</div>
+  <div class="navlabel" data-i18n="Kiri">Kiri</div>
   <nav>
-    <button data-view="share" class="shareonly"><svg class="i" viewBox="0 0 256 256" data-ph="globe"></svg><span class="lbl">Share</span></button>
-    <button data-view="settings"><svg class="i" viewBox="0 0 256 256" data-ph="gear"></svg><span class="lbl">Settings</span></button>
+    <button data-view="share" class="shareonly"><svg class="i" viewBox="0 0 256 256" data-ph="globe"></svg><span class="lbl" data-i18n="Share">Share</span></button>
+    <button data-view="settings"><svg class="i" viewBox="0 0 256 256" data-ph="gear"></svg><span class="lbl" data-i18n="Settings">Settings</span></button>
   </nav>
 
   <section class="vm">
     <div class="vm-head"><i class="dot"></i><span id="vm-name">Linux VM</span><span id="vm-state">Stopped</span></div>
     <div class="vm-sub" id="vm-sub" hidden></div>
     <dl class="num">
-      <dt>Running</dt><dd id="vm-running">—</dd>
-      <dt>CPUs</dt><dd id="vm-cpus">—</dd>
-      <dt>Memory</dt><dd id="vm-mem">—</dd>
+      <dt data-i18n="Running">Running</dt><dd id="vm-running">—</dd>
+      <dt data-i18n="CPUs">CPUs</dt><dd id="vm-cpus">—</dd>
+      <dt data-i18n="Memory">Memory</dt><dd id="vm-mem">—</dd>
       <div class="meter"><span id="vm-meter"></span></div>
-      <dt id="vm-k8s-l" hidden>Kubernetes</dt><dd class="kside" id="vm-k8s" hidden></dd>
-      <dt id="vm-sh-l" hidden>Shares</dt><dd class="kside" id="vm-sh" hidden></dd>
+      <dt id="vm-k8s-l" data-i18n="Kubernetes" hidden>Kubernetes</dt><dd class="kside" id="vm-k8s" hidden></dd>
+      <dt id="vm-sh-l" data-i18n="Shares" hidden>Shares</dt><dd class="kside" id="vm-sh" hidden></dd>
     </dl>
     <button class="btn primary full" id="vm-toggle">Start</button>
   </section>
@@ -2076,7 +2076,7 @@ main { position: relative; }
   <div class="toolbar">
     <h2 id="title">Containers</h2><span class="sub num" id="subtitle"></span>
     <span class="spacer"></span>
-    <div class="ltabs" id="ltabs" role="group" aria-label="Show" hidden></div>
+    <div class="ltabs" id="ltabs" role="group" data-i18n-aria="Show" aria-label="Show" hidden></div>
     <div class="hright" id="hright"></div>
   </div>
   <div class="content" id="content"></div>
@@ -2107,6 +2107,85 @@ const VM = LINUX ? "Engine" : "Linux VM";
 const shareOn = () => !!(ui.status?.share ?? ui.status?.dev);
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 
+/* Language: Settings → Appearance, or the system language when set to System.
+   English strings are the catalog keys; missing entries fall back to English. */
+const ZH = {
+  "Containers": "容器", "Images": "镜像", "Volumes": "卷", "Networks": "网络", "Builds": "构建",
+  "Pods": "Pods", "Services": "Services", "Settings": "设置", "Share": "分享", "Shares": "分享",
+  "Docker": "Docker", "Kubernetes": "Kubernetes", "Kiri": "Kiri", "Kubernetes settings": "Kubernetes 设置",
+  "Linux VM": "Linux 虚拟机", "Engine": "引擎",
+  "Running": "运行中", "CPUs": "CPU", "Memory": "内存",
+  "Start": "启动", "Stop": "停止", "Starting…": "正在启动…", "Stopping…": "正在停止…",
+  "Off": "已关闭", "Show": "显示", "Search Kiri": "搜索 Kiri",
+  "Search Kiri…": "搜索 Kiri…", "Search {view}…": "搜索{view}…",
+  "Search containers, images…": "搜索容器、镜像…",
+  "All": "全部", "Stopped": "已停止", "Failed": "失败", "In use": "使用中", "Unused": "未使用",
+  "Untagged": "未标记", "Building": "构建中", "Completed": "已完成", "Canceled": "已取消",
+  "Actions": "操作", "Pull image": "拉取镜像", "Pull": "拉取", "Delete": "删除",
+  "Start": "启动", "Stop": "停止",
+  "Clear {n} failed": "清理 {n} 个失败项", "Remove {n} untagged": "删除 {n} 个未标记镜像",
+  "selected": "已选", "Select all {n}": "全选 {n} 项", "Clear the selection": "清除选择",
+  "Removing {gone} of {n}…": "正在删除 {gone}/{n}…",
+  "{n} running · {total}": "{n} 个运行中 · 共 {total}",
+  "{n} total": "共 {n} 个",
+  "No containers yet": "还没有容器",
+  "Containers you start with <code>docker run</code> or Compose show up here, with the <code>kiri</code> context.": "用 <code>docker run</code> 或 Compose 启动的容器会显示在这里（使用 <code>kiri</code> 上下文）。",
+  "No images yet": "还没有镜像",
+  "Images you pull or build show up here: <code>docker pull alpine</code>, or search above.": "拉取或构建的镜像会显示在这里：可用 <code>docker pull alpine</code>，或在上方搜索。",
+  "No volumes yet": "还没有卷",
+  "Named volumes from <code>docker volume create</code> or <code>-v name:/path</code> show up here.": "来自 <code>docker volume create</code> 或 <code>-v name:/path</code> 的命名卷会显示在这里。",
+  "No networks yet": "还没有网络",
+  "Networks you create with <code>docker network create</code> show up here.": "用 <code>docker network create</code> 创建的网络会显示在这里。",
+  "No builds yet": "还没有构建",
+  "Builds you run with <code>docker build</code> show up here, with each step's time, cache and output.": "用 <code>docker build</code> 运行的构建会显示在这里，含每步耗时、缓存与输出。",
+  "Kiri is not running": "Kiri 未运行",
+  "Start it to run containers. It starts in a fraction of a second and sleeps when idle.": "启动后即可运行容器。启动只需片刻，空闲时会休眠。",
+  "Start Kiri": "启动 Kiri",
+  "Appearance": "外观", "Resources": "资源", "Network": "网络", "Registries": "镜像仓库",
+  "Import": "导入", "Domains": "域名", "Diagnostics": "诊断", "About": "关于",
+  "Theme": "主题", "Follow {os}, or always use the dark or light theme.": "跟随 {os}，或始终使用深色 / 浅色主题。",
+  "System": "系统", "Dark": "深色", "Light": "浅色", "In use": "使用中",
+  "Accent": "强调色", "Selection, focus rings and primary buttons.": "选中、焦点环与主按钮。",
+  "Interface font": "界面字体", "Tables, the sidebar and headings.": "表格、侧栏与标题。",
+  "Monospace font": "等宽字体", "IDs, commands and code.": "ID、命令与代码。",
+  "Text size": "文字大小", "Everything in the window.": "窗口内全部文字。",
+  "Log text": "日志文字", "Container, Kubernetes and diagnostics logs.": "容器、Kubernetes 与诊断日志。",
+  "Small": "小", "Medium": "中", "Large": "大",
+  "Language": "语言", "The window's language. System follows {os}.": "窗口语言。选择「系统」时跟随 {os}。",
+  "English": "English", "简体中文": "简体中文",
+  "Blue": "蓝", "Purple": "紫", "Orange": "橙", "Teal": "青", "Pink": "粉", "Green": "绿",
+  "Switch to the light theme": "切换到浅色主题", "Switch to the dark theme": "切换到深色主题",
+  "Repository": "仓库", "Tag": "标签", "Used by": "使用者", "ID": "ID", "Size": "大小",
+  "Created": "创建时间", "Pulled": "拉取时间", "Name": "名称", "State": "状态", "Ports": "端口",
+  "Status": "状态", "Driver": "驱动",
+};
+const VIEW_LABEL = { containers: "Containers", images: "Images", volumes: "Volumes", networks: "Networks", builds: "Builds", pods: "Pods", services: "Services", settings: "Settings", share: "Share" };
+function lang() {
+  const pick = prefs.lang || "system";
+  if (pick === "zh" || pick === "en") return pick;
+  const sys = (navigator.languages && navigator.languages[0]) || navigator.language || "en";
+  return /^zh\b/i.test(sys) ? "zh" : "en";
+}
+function tr(en, vars) {
+  let s = (lang() === "zh" && ZH[en]) || en;
+  if (vars) for (const [k, v] of Object.entries(vars)) s = s.replaceAll(`{${k}}`, String(v));
+  return s;
+}
+function paintChrome() {
+  const code = lang();
+  document.documentElement.lang = code === "zh" ? "zh-CN" : "en";
+  document.documentElement.dataset.lang = code;
+  document.querySelectorAll("[data-i18n]").forEach((el) => { el.textContent = tr(el.getAttribute("data-i18n")); });
+  document.querySelectorAll("[data-i18n-title]").forEach((el) => {
+    const s = tr(el.getAttribute("data-i18n-title"));
+    el.title = s; el.setAttribute("aria-label", s);
+  });
+  document.querySelectorAll("[data-i18n-aria]").forEach((el) => { el.setAttribute("aria-label", tr(el.getAttribute("data-i18n-aria"))); });
+  $("vm-name").textContent = tr(VM);
+  themeBtn();
+  paintEngine();
+}
+
 const ui = { running: new Set(), launched: new Map(), runWatch: new Map(), need: null, probed: new Map(), probing: new Set(), why: new Map(), startErr: {}, fixed: null, openTab: null, listening: new Map(), starting: new Map(), scans: new Map(), scanf: { sev: "", fix: false, own: false }, view: "containers", vm: "stopped", containers: [], images: [], volumes: [], networks: [], sort: { images: { key: "pulled", desc: true } }, filter: "", suffix: "kiri.localhost", collapsed: new Set(), res: null, resDraft: {}, proxy: null, pxDraft: {},
   imp: { sources: null, source: null, inv: null, picked: { images: new Set(), volumes: new Set(), containers: new Set() }, steps: {}, running: false, summary: "" },
   upd: null, engineStale: null, staleHidden: false,
@@ -2116,7 +2195,7 @@ function resetPicks() { ui.imp.picked = { images: new Set(), volumes: new Set(),
 // Asleep is ready: the VM sleeps after a minute with nothing running and the next
 // request wakes it in milliseconds, so it reads as Ready with Stop, never as stopped
 // with Start. Start is for an engine someone stopped (Stop, `kiri stop`).
-const vmLabels = { stopped: "Off", booting: "Starting…", running: "Running", stopping: "Stopping…" };
+const vmLabels = () => ({ stopped: tr("Off"), booting: tr("Starting…"), running: tr("Running"), stopping: tr("Stopping…") });
 
 function size(b) {
   const u = ["B", "KB", "MB", "GB"]; let i = 0;
@@ -2278,7 +2357,7 @@ const alertIco = (kind) => `<svg class="ico ${kind}" viewBox="0 0 256 256" aria-
 const copyBtn = (value, what) => `<button class="copy" data-copy="${esc(value)}" title="Copy ${what}" aria-label="Copy ${what}"><svg viewBox="0 0 256 256" aria-hidden="true"><path d="${PH.copy}"/></svg></button>`;
 
 /* Settings: the fonts and text size, applied to the whole window. */
-const prefs = { font: "System", mono: "System Mono", scale: 1, tab: "appearance", theme: "dark", accent: "blue" };
+const prefs = { font: "System", mono: "System Mono", scale: 1, tab: "appearance", theme: "dark", accent: "blue", lang: "system" };
 /* Accents; Kiri's own blue first. */
 const ACCENTS = [["blue", "Blue", "#0D6EFD"], ["purple", "Purple", "#8C6EF5"], ["orange", "Orange", "#F58228"], ["teal", "Teal", "#14B4A5"], ["pink", "Pink", "#EC408C"], ["green", "Green", "#28AA5A"]];
 const darkNow = () => prefs.theme === "dark" || (prefs.theme !== "light" && matchMedia("(prefers-color-scheme: dark)").matches);
@@ -2286,7 +2365,7 @@ matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => { th
 // The strip's theme button shows what a click switches to.
 function themeBtn() {
   const b = $("theme-toggle"), dark = darkNow();
-  b.title = dark ? "Switch to the light theme" : "Switch to the dark theme";
+  b.title = dark ? tr("Switch to the light theme") : tr("Switch to the dark theme");
   b.setAttribute("aria-label", b.title);
   b.firstElementChild.innerHTML = `<path d="${PH[dark ? "sun" : "moon"]}"/>`;
 }
@@ -2310,6 +2389,7 @@ function applyPrefs() {
   r.setProperty("--blue-active", `color-mix(in srgb, ${accent} 78%, black)`);
   r.setProperty("--blue-light", `color-mix(in srgb, ${accent} 60%, white)`);
   window.htApply?.();
+  paintChrome();
 }
 /* A right-click gets no browser menu (Reload, Back, Inspect): this is an app,
    not a web page. Text fields and selected text keep theirs, for Copy and Paste. */
@@ -2317,7 +2397,13 @@ document.addEventListener("contextmenu", (ev) => {
   const editable = ev.target.closest?.("input, textarea, [contenteditable]");
   if (!editable && !String(getSelection()).trim()) ev.preventDefault();
 });
-function setPref(name, value) { prefs[name] = value; applyPrefs(); send("setpref", { name, value }); render(); }
+function setPref(name, value) {
+  prefs[name] = value;
+  if (name === "lang") settingsShown.html = "";
+  applyPrefs();
+  send("setpref", { name, value });
+  render();
+}
 
 /* A container's page: Overview, Logs, Terminal, Files. The log console and
    the terminal are kept as live elements, so a list refresh never wipes
@@ -3279,7 +3365,7 @@ function enginePane() {
   const busy = shown === "booting" || shown === "stopping";
   const btn = off ? `<button class="btn primary" data-vmpower="start"${busy ? " disabled" : ""}>Start engine</button>`
     : `<button class="btn" data-vmpower="stop"${busy ? " disabled" : ""}>Turn off engine</button>`;
-  return `<div class="pane"><h3>${VM}</h3><div class="pref"><span class="t">${vmLabels[shown] ?? "—"}</span><span class="d">${d}</span><span class="pact">${btn}</span></div></div>`;
+  return `<div class="pane"><h3>${tr(VM)}</h3><div class="pref"><span class="t">${vmLabels()[shown] ?? "—"}</span><span class="d">${d}</span><span class="pact">${btn}</span></div></div>`;
 }
 
 function resourcesPane() {
@@ -3322,20 +3408,23 @@ function renderSettings() {
       <rect x="44" y="30.5" width="84" height="9" rx="2" fill="${accent}" fill-opacity=".14"/>${rows}<rect x="106" y="62" width="20" height="6" rx="2" fill="${accent}"/></svg>`;
   };
   const inUse = darkNow();
-  const appearance = `<div class="pane"><h3>Appearance</h3>
-    <div class="pref"><span class="t">Theme</span><span class="d">Follow ${OS}, or always use the dark or light theme.</span>
-      <div class="seg" role="group" aria-label="Theme">${[["system", "System"], ["dark", "Dark"], ["light", "Light"]].map(([v, l]) => `<button data-theme-pick="${v}" aria-pressed="${prefs.theme === v}">${l}</button>`).join("")}</div></div>
-    <div class="themes">${[[false, "Light"], [true, "Dark"]].map(([dark, l]) => `<button class="tcard" data-theme-pick="${dark ? "dark" : "light"}" aria-pressed="${inUse === dark}">${mini(dark)}<span>${l}${inUse === dark ? ' <em>In use</em>' : ""}</span></button>`).join("")}</div>
-    <div class="pref"><span class="t">Accent</span><span class="d">Selection, focus rings and primary buttons.</span>
-      <div class="swatches" role="radiogroup" aria-label="Accent">${ACCENTS.map(([id, l, hex]) => `<button role="radio" aria-checked="${prefs.accent === id}" aria-label="${l}" title="${l}" data-accent="${id}" style="--sw:${hex}"></button>`).join("")}</div></div>
-    <div class="pref"><span class="t">Interface font</span><span class="d">Tables, the sidebar and headings.</span>
-      <select id="pref-font" aria-label="Interface font">${opts(fontLists.families, prefs.font, "System")}</select></div>
-    <div class="pref"><span class="t">Monospace font</span><span class="d">IDs, commands and code.</span>
-      <select id="pref-mono" aria-label="Monospace font">${opts(fontLists.mono, prefs.mono, "System Mono")}</select></div>
-    <div class="pref"><span class="t">Text size</span><span class="d">Everything in the window.</span>
-      <div class="seg" role="group" aria-label="Text size">${SIZES.map((z) => `<button data-scale="${z}" aria-pressed="${Math.abs((prefs.scale || 1) - z) < 0.01}">${Math.round(z * 100)}%</button>`).join("")}</div></div>
-    <div class="pref"><span class="t">Log text</span><span class="d">Container, Kubernetes and diagnostics logs.</span>
-      <div class="seg" role="group" aria-label="Log text">${LOG_SIZES.map(([px, l]) => `<button data-logsize="${px}" aria-pressed="${prefs.logSize === px}">${l}</button>`).join("")}</div></div>
+  const langPick = prefs.lang || "system";
+  const appearance = `<div class="pane"><h3>${tr("Appearance")}</h3>
+    <div class="pref"><span class="t">${tr("Language")}</span><span class="d">${tr("The window's language. System follows {os}.", { os: OS })}</span>
+      <div class="seg" role="group" aria-label="${tr("Language")}">${[["system", tr("System")], ["en", tr("English")], ["zh", tr("简体中文")]].map(([v, l]) => `<button data-lang-pick="${v}" aria-pressed="${langPick === v}">${l}</button>`).join("")}</div></div>
+    <div class="pref"><span class="t">${tr("Theme")}</span><span class="d">${tr("Follow {os}, or always use the dark or light theme.", { os: OS })}</span>
+      <div class="seg" role="group" aria-label="${tr("Theme")}">${[["system", "System"], ["dark", "Dark"], ["light", "Light"]].map(([v, l]) => `<button data-theme-pick="${v}" aria-pressed="${prefs.theme === v}">${tr(l)}</button>`).join("")}</div></div>
+    <div class="themes">${[[false, "Light"], [true, "Dark"]].map(([dark, l]) => `<button class="tcard" data-theme-pick="${dark ? "dark" : "light"}" aria-pressed="${inUse === dark}">${mini(dark)}<span>${tr(l)}${inUse === dark ? ` <em>${tr("In use")}</em>` : ""}</span></button>`).join("")}</div>
+    <div class="pref"><span class="t">${tr("Accent")}</span><span class="d">${tr("Selection, focus rings and primary buttons.")}</span>
+      <div class="swatches" role="radiogroup" aria-label="${tr("Accent")}">${ACCENTS.map(([id, l, hex]) => `<button role="radio" aria-checked="${prefs.accent === id}" aria-label="${tr(l)}" title="${tr(l)}" data-accent="${id}" style="--sw:${hex}"></button>`).join("")}</div></div>
+    <div class="pref"><span class="t">${tr("Interface font")}</span><span class="d">${tr("Tables, the sidebar and headings.")}</span>
+      <select id="pref-font" aria-label="${tr("Interface font")}">${opts(fontLists.families, prefs.font, "System")}</select></div>
+    <div class="pref"><span class="t">${tr("Monospace font")}</span><span class="d">${tr("IDs, commands and code.")}</span>
+      <select id="pref-mono" aria-label="${tr("Monospace font")}">${opts(fontLists.mono, prefs.mono, "System Mono")}</select></div>
+    <div class="pref"><span class="t">${tr("Text size")}</span><span class="d">${tr("Everything in the window.")}</span>
+      <div class="seg" role="group" aria-label="${tr("Text size")}">${SIZES.map((z) => `<button data-scale="${z}" aria-pressed="${Math.abs((prefs.scale || 1) - z) < 0.01}">${Math.round(z * 100)}%</button>`).join("")}</div></div>
+    <div class="pref"><span class="t">${tr("Log text")}</span><span class="d">${tr("Container, Kubernetes and diagnostics logs.")}</span>
+      <div class="seg" role="group" aria-label="${tr("Log text")}">${LOG_SIZES.map(([px, l]) => `<button data-logsize="${px}" aria-pressed="${prefs.logSize === px}">${tr(l)}</button>`).join("")}</div></div>
     <div class="preview"><div class="p-title">web · nginx:alpine</div><div>Up 3 minutes · 26.3 MB · localhost:8080 → 80</div><div class="p-mono">ef9a6e2b45c2  docker run -p 8080:80 nginx</div></div>
   </div>`;
   // On Linux: kiri.localhost only, for now; nothing to switch.
@@ -3379,7 +3468,7 @@ function renderSettings() {
       <dt>Made by</dt><dd><a data-open-site="https://canestack.com">Canestack Labs</a></dd>
     </dl>
     <p class="muted">The name comes from the Igbo word ntakịrị, “small”.</p></div>`;
-  const html = `<div class="settings"><div class="tabs">${tab("appearance", "textaa", "Appearance")}${tab("resources", "stack", "Resources")}${tab("network", "globe", "Network")}${tab("builds", "hammer", "Builds")}${loginsOn() ? tab("registries", "lock", "Registries") : ""}${tab("kubernetes", "pods", "Kubernetes")}${tab("import", "stack", "Import")}${tab("domains", "network", "Domains")}${tab("diagnostics", "bug", "Diagnostics")}${tab("about", "info", "About")}</div>
+  const html = `<div class="settings"><div class="tabs">${tab("appearance", "textaa", tr("Appearance"))}${tab("resources", "stack", tr("Resources"))}${tab("network", "globe", tr("Network"))}${tab("builds", "hammer", tr("Builds"))}${loginsOn() ? tab("registries", "lock", tr("Registries")) : ""}${tab("kubernetes", "pods", tr("Kubernetes"))}${tab("import", "stack", tr("Import"))}${tab("domains", "network", tr("Domains"))}${tab("diagnostics", "bug", tr("Diagnostics"))}${tab("about", "info", tr("About"))}</div>
     ${prefs.tab === "diagnostics" ? diagPane() : prefs.tab === "about" ? aboutPane : prefs.tab === "domains" ? domainsPane : prefs.tab === "resources" ? `<div class="panes">${enginePane()}${resourcesPane()}</div>` : prefs.tab === "network" ? networkPane() : prefs.tab === "builds" ? buildsPane() : prefs.tab === "registries" && loginsOn() ? registriesPane() : prefs.tab === "kubernetes" ? kubernetesPane() : prefs.tab === "import" ? importPane() : appearance}</div>`;
   // The container lists arrive every few seconds; rebuilding an unchanged page
   // closes an open menu. The font menus list names in the interface font: an
@@ -3436,15 +3525,16 @@ const empty = {
 function renderEmpty(view) {
   const e = empty[view];
   // Nothing here downloads anything: exploring an empty Kiri shouldn't pull an image.
-  const action = view === "stopped" ? '<button class="btn primary" id="empty-start">Start Kiri</button>' : "";
+  const action = view === "stopped" ? `<button class="btn primary" id="empty-start">${tr("Start Kiri")}</button>` : "";
   $("content").innerHTML = `<div class="empty"><div><svg class="i art" viewBox="0 0 256 256"><path d="${PH[e.art]}"/></svg>
-    <h3>${e.title}</h3><p>${e.body}</p>${action}</div></div>`;
+    <h3>${tr(e.title)}</h3><p>${tr(e.body)}</p>${action}</div></div>`;
   $("empty-start")?.addEventListener("click", () => send("start"));
 }
 
 /* A column given a sort key ([label, class, key]) sorts on click, and again
    the other way; `view` names whose sort it is. */
-function table(head, rows, view, last = '<th class="r">Actions</th>') {
+function table(head, rows, view, last) {
+  last ??= `<th class="r">${tr("Actions")}</th>`;
   const sort = ui.sort[view];
   // A column can say how it sizes ({ fixed: ch } for one whose longest value is known, { share } for
   // its part of the rest). A column that isn't fixed has a resize edge when one after it isn't either:
@@ -4706,14 +4796,14 @@ function render() {
   navNote();
   const v = ui.view;
   document.querySelectorAll("nav button").forEach((b) => (b.dataset.view === v ? b.setAttribute("aria-current", "page") : b.removeAttribute("aria-current")));
-  $("title").textContent = v[0].toUpperCase() + v.slice(1);
+  $("title").textContent = tr(VIEW_LABEL[v] || v);
   const running = ui.containers.filter((c) => c.State === "running").length;
   const total = kept("images").reduce((a, i) => a + (i.Size || 0), 0);
   // A list's counts are its tabs; beside them, what they don't say (the images' size).
   $("subtitle").textContent = listPage(v) ? (v === "images" && total ? size(total) : "")
-    : v === "builds" ? (ui.bl.items?.length ? `${ui.bl.items.length} total` : "")
+    : v === "builds" ? (ui.bl.items?.length ? tr("{n} total", { n: ui.bl.items.length }) : "")
     : v === "images" && ui.images.length ? `${ui.images.length} · ${size(total)}`
-    : v === "containers" && ui.containers.length ? `${running} running · ${ui.containers.length}` : "";
+    : v === "containers" && ui.containers.length ? tr("{n} running · {total}", { n: running, total: ui.containers.length }) : "";
   batchTick();
   renderHead();
   $("n-containers").textContent = kept("containers").length;
@@ -4723,7 +4813,9 @@ function render() {
   // Builds is not in the sidebar on Windows.
   const nBuilds = $("n-builds"); if (nBuilds) nBuilds.textContent = ui.bl.items ? ui.bl.items.length : "";
   // The strip's search narrows the list on screen; it names what it searches.
-  $("gq").placeholder = ["containers", "images", "volumes", "networks", "builds", "pods", "services"].includes(v) && !ui.detail && !ui.imgd ? `Search ${v}…` : "Search Kiri…";
+  $("gq").placeholder = ["containers", "images", "volumes", "networks", "builds", "pods", "services"].includes(v) && !ui.detail && !ui.imgd
+    ? (lang() === "zh" ? `搜索${tr(VIEW_LABEL[v])}…` : `Search ${v}…`)
+    : tr("Search Kiri…");
   // A connection's pane belongs to the Share view; any other view takes the page back.
   if (v !== "share") { $("sh-pane")?.remove(); $("content").hidden = false; }
   if (v === "settings") return renderSettings();
@@ -4796,14 +4888,14 @@ function paintEngine() {
   if (shown === "running" && mineRunning()) setEngineOn(true);
   if (ui.vm === "running" || ui.vm === "stopped") ui.wantStart = false;
   document.body.dataset.vm = shown;
-  const label = vmLabels[shown] ?? shown;
+  const label = vmLabels()[shown] ?? shown;
   $("vm-state").textContent = label;
   const sub = $("vm-sub");
   sub.textContent = ""; sub.hidden = true;
-  if (document.body.classList.contains("rail")) document.querySelector(".vm").title = `${VM}: ${label}`;
+  if (document.body.classList.contains("rail")) document.querySelector(".vm").title = `${tr(VM)}: ${label}`;
   const b = $("vm-toggle");
   b.hidden = false;
-  b.textContent = shown === "running" ? "Stop" : shown === "booting" ? "Starting…" : shown === "stopping" ? "Stopping…" : "Start";
+  b.textContent = shown === "running" ? tr("Stop") : shown === "booting" ? tr("Starting…") : shown === "stopping" ? tr("Stopping…") : tr("Start");
   b.classList.toggle("primary", shown !== "running");
   b.disabled = shown === "booting" || shown === "stopping";
 }
@@ -6034,6 +6126,7 @@ $("content").addEventListener("click", (ev) => {
   else if ((el = t("[data-scale]"))) setPref("scale", +el.dataset.scale);
   else if ((el = t("[data-logsize]"))) setPref("logSize", +el.dataset.logsize);
   else if ((el = t("[data-theme-pick]"))) setPref("theme", el.dataset.themePick);
+  else if ((el = t("[data-lang-pick]"))) setPref("lang", el.dataset.langPick);
   else if ((el = t("[data-accent]"))) setPref("accent", el.dataset.accent);
   else if (t("[data-buildprune]")) { ui.bwPruning = true; send("buildprune"); render(); }
   else if ((el = t("[data-bw]"))) { const v = el.dataset.bw; if (ui.bw && !ui.bw.error && (v !== ui.bw.with || (v === "kiri" && !ui.bw.taken))) { ui.bw = { ...ui.bw, with: v }; send("buildwith", { value: v }); render(); } }
@@ -6912,7 +7005,7 @@ document.addEventListener("keydown", (ev) => {
 });
 document.body.classList.toggle("win", WIN);
 document.body.classList.toggle("linux", LINUX);
-$("vm-name").textContent = VM;
+paintChrome();
 // The live dots' beat: every 4 s while the window is in use and something
 // pulses, restarted on the next frame so every ring starts together. Every
 // fifth one (20 s), the lit boxes in Images' Used by spark.
@@ -7849,7 +7942,7 @@ const LISTS = {
     tabs: [["running", "Running", "moss"], ["stopped", "Stopped", ""], ["failed", "Failed", "red", true]],
     // A folded Compose project's containers aren't on screen, so Select all leaves them.
     shown: (c) => !ui.collapsed.has(c.Labels?.["com.docker.compose.project"]),
-    junk: { state: "failed", label: (n) => `Clear ${n} failed`, what: "failed containers",
+    junk: { state: "failed", label: (n) => tr("Clear {n} failed", { n }), what: "failed containers",
       tip: (xs) => `Removes the ${xs.length} ${xs.length === 1 ? "container" : "containers"} that exited with an error, with their files. Named volumes stay.` },
     remove: (c) => send("container", { action: "remove", id: c.Id }),
     bulk: [["Start", "play", "", (c) => !upC(c), (c) => containerAction("start", c.Id)], ["Stop", "stop", "", upC, (c) => isKiriK8s(c) ? containerAction("stop", c.Id) : send("container", { action: "stop", id: c.Id })], ["Delete", "trash", "danger", (c) => !isKiriK8s(c)]],
@@ -7858,12 +7951,12 @@ const LISTS = {
     all: () => ui.images, key: imgKey, name: imgKey, hit: (i) => match(i.RepoTags?.[0]), noun: "images", size: (i) => i.Size,
     state: (i) => (usersOf(i).length ? "inuse" : untagged(i) ? "untagged" : "unused"),
     tabs: [["inuse", "In use", "moss"], ["unused", "Unused", ""], ["untagged", "Untagged", "sun", true]],
-    junk: { state: "untagged", label: (n) => `Remove ${n} untagged`, what: "untagged images",
+    junk: { state: "untagged", label: (n) => tr("Remove {n} untagged", { n }), what: "untagged images",
       tip: (xs) => `Removes the ${xs.length} untagged ${xs.length === 1 ? "image" : "images"} rebuilds left behind. Nothing uses them. Frees ${size(xs.reduce((a, i) => a + (i.Size || 0), 0))}.` },
     remove: (i) => send("rmi", { name: imgKey(i) }),
     // Docker won't remove an image a container was made from: Delete leaves those.
     bulk: [["Pull", "pull", "", (i) => !untagged(i), (i) => pullRef(imgKey(i))], ["Delete", "trash", "danger", (i) => !usersOf(i).length]],
-    primary: () => `<button class="btn primary" data-ppopen aria-haspopup="dialog" aria-expanded="${pp.open}" title="Pull an image (${PP_KEY})">${svgOf("pull")}Pull image</button>`,
+    primary: () => `<button class="btn primary" data-ppopen aria-haspopup="dialog" aria-expanded="${pp.open}" title="${tr("Pull image")} (${PP_KEY})">${svgOf("pull")}${tr("Pull image")}</button>`,
   },
   volumes: {
     all: () => ui.volumes || [], key: (v) => v.Name, name: (v) => v.Name, hit: (v) => match(v.Name), noun: "volumes",
@@ -7944,7 +8037,7 @@ function renderHead() {
   const hits = all.filter((x) => L.hit(x)), n = (k) => (k === "all" ? hits.length : hits.filter((x) => L.state(x) === k).length);
   const tab = ([k, label, dot, bad]) => {
     const c = n(k), on = tabOf(v) === k;
-    return c || on ? `<button class="ltab${bad && c ? " bad" : ""}" data-ltab="${k}" aria-pressed="${on}">${dot !== undefined ? `<i class="${dot}"></i>` : ""}${label}<span class="n">${c}</span></button>` : "";
+    return c || on ? `<button class="ltab${bad && c ? " bad" : ""}" data-ltab="${k}" aria-pressed="${on}">${dot !== undefined ? `<i class="${dot}"></i>` : ""}${tr(label)}<span class="n">${c}</span></button>` : "";
   };
   tabs.hidden = !all.length;
   morph(tabs, all.length ? [["all", "All"], ...(L.tabs || [])].map(tab).join("") : "");
@@ -7956,17 +8049,17 @@ function renderHead() {
   document.body.classList.toggle("picking", keys.size > 0);
   if (keys.size) {
     const xs = can.filter((x) => keys.has(L.key(x)));
-    morph(right, `<div class="bulk" role="group" aria-label="Selected ${L.noun}"><span class="bcount"><b>${keys.size}</b> selected<button class="x" data-unpick title="Clear the selection (Esc)" aria-label="Clear the selection">×</button></span>
-      ${keys.size < can.length ? `<button class="linkish" data-pickall>Select all ${can.length}</button>` : ""}<span class="vsep"></span>
+    morph(right, `<div class="bulk" role="group" aria-label="${tr("selected")} ${L.noun}"><span class="bcount"><b>${keys.size}</b> ${tr("selected")}<button class="x" data-unpick title="${tr("Clear the selection")} (Esc)" aria-label="${tr("Clear the selection")}">×</button></span>
+      ${keys.size < can.length ? `<button class="linkish" data-pickall>${tr("Select all {n}", { n: can.length })}</button>` : ""}<span class="vsep"></span>
       ${L.bulk.map(([label, icon, kind, fits], i) => {
         const m = xs.filter(fits).length;
-        return `<button class="btn ${kind}" data-bulk="${i}"${m ? "" : " disabled"}${m < xs.length ? ` title="${m} of the ${xs.length} picked"` : ""}>${svgOf(icon)}${label}${m && m < xs.length ? ` ${m}` : ""}</button>`;
+        return `<button class="btn ${kind}" data-bulk="${i}"${m ? "" : " disabled"}${m < xs.length ? ` title="${m} of the ${xs.length} picked"` : ""}>${svgOf(icon)}${tr(label)}${m && m < xs.length ? ` ${m}` : ""}</button>`;
       }).join("")}</div>`);
     return ppPlace();
   }
   const going = ui.batches.find((b) => b.view === v && b.phase === "going");
   const junk = L.junk && !going ? all.filter((x) => L.state(x) === L.junk.state && !(v === "containers" && isKiriK8s(x))) : [];
-  morph(right, (going ? `<span class="hbusy" role="status"><span class="hspin"></span><span>Removing <b>${going.gone} of ${going.n}</b>…</span></span>` : "")
+  morph(right, (going ? `<span class="hbusy" role="status"><span class="hspin"></span><span>${lang() === "zh" ? `正在删除 <b>${going.gone}/${going.n}</b>…` : `Removing <b>${going.gone} of ${going.n}</b>…`}</span></span>` : "")
     + (junk.length ? `<button class="btn quiet" data-junk title="${esc(L.junk.tip(junk))}">${svgOf("broom").replace("<svg", '<svg class="cue"')}${L.junk.label(junk.length)}</button>` : "")
     + (L.primary ? L.primary() : ""));
   ppPlace();
