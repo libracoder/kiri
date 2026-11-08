@@ -34,7 +34,7 @@ missing=0
 for line in $(grep -E '^CONFIG_[A-Z0-9_]+=y' "$config"); do
   grep -qx "$line" .config || { echo "MISSING: $line"; missing=1; }
 done
-[ "$missing" = 0 ] || echo "some options were not applied (dependency not met)"
+[ "$missing" = 0 ] || { echo "some options were not applied (dependency not met)" >&2; exit 1; }
 if [ "$KARCH" = x86_64 ]; then
   make -s -j"$(nproc)" ARCH=x86_64 CROSS_COMPILE="$cross" bzImage
   cp arch/x86/boot/bzImage .config /out/
