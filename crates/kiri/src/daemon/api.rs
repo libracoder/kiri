@@ -2400,6 +2400,41 @@ fn archive_get(req: &Request, engine: &Engine, id: &str, w: &mut UnixStream) -> 
 
 /// `docker cp` into a container: the body is a tar archive, streamed to the
 /// guest as it arrives.
+#[derive(Debug, PartialEq)]
+enum Upload {
+    Tar,
+    Gzip,
+    Unsupported(&'static str),
+}
+
+/// What an archive upload is, from its first bytes. Docker accepts tar,
+/// gzip, bzip2, xz and zstd here; anything that isn't compressed is tar.
+fn upload_compression(head: &[u8]) -> Upload {
+    match head {
+        [0x1f, 0x8b, ..] => Upload::Gzip,
+        [b'B', b'Z', b'h', ..] => Upload::Unsupported("bzip2"),
+        [0xfd, b'7', b'z', b'X', b'Z', 0, ..] => Upload::Unsupported("xz"),
+        [0x28, 0xb5, 0x2f, 0xfd, ..] => Upload::Unsupported("zstd"),
+        _ => Upload::Tar,
+    }
+}
+
+/// A read of the upload failed. A damaged gzip archive is the client's
+/// input, as a damaged tar is (the guest refuses that one with 400).
+fn upload_error(gzip: bool, e: io::Error) -> Error {
+    if gzip { Error::BadRequest(format!("the gzip archive is damaged or cut short: {e}")) } else { Error::Io(e) }
+}
+
+/// The upload as tar: `head` (its first bytes, already read) then `rest`.
+fn upload_reader<'a>(head: Vec<u8>, rest: impl io::Read + 'a) -> Result<Box<dyn io::Read + 'a>, Error> {
+    use std::io::Read;
+    match upload_compression(&head) {
+        Upload::Tar => Ok(Box::new(io::Cursor::new(head).chain(rest))),
+        Upload::Gzip => Ok(Box::new(flate2::read::MultiGzDecoder::new(io::Cursor::new(head).chain(rest)))),
+        Upload::Unsupported(kind) => Err(Error::BadRequest(format!("a {kind}-compressed archive isn't supported yet: send it as tar or gzip"))),
+    }
+}
+
 fn archive_put(req: &Request, engine: &Engine, id: &str, w: &mut UnixStream, r: &mut BufReader<UnixStream>) -> io::Result<Next> {
     use kiri_proto::copy_flags;
     let path = req.query("path").unwrap_or("/");
@@ -2410,6 +2445,19 @@ fn archive_put(req: &Request, engine: &Engine, id: &str, w: &mut UnixStream, r: 
     if req.flag("noOverwriteDirNonDir") {
         flags |= copy_flags::NO_OVERWRITE_DIR_NON_DIR;
     }
+    // Docker takes the archive plain or compressed; the guest unpacks tar.
+    use std::io::Read;
+    let mut body = http::Body::new(req, r);
+    let mut head = Vec::with_capacity(6);
+    (&mut body).take(6).read_to_end(&mut head)?;
+    let gzip = upload_compression(&head) == Upload::Gzip;
+    let mut archive = match upload_reader(head, body) {
+        Ok(a) => a,
+        Err(e) => {
+            error(w, e)?;
+            return Ok(Next::Close);
+        }
+    };
     let stream = match engine.copy(id, kiri_proto::copy_op::IN, path, flags) {
         Ok(s) => s,
         Err(e) => {
@@ -2418,9 +2466,10 @@ fn archive_put(req: &Request, engine: &Engine, id: &str, w: &mut UnixStream, r: 
         }
     };
     let mut to_guest = std::fs::File::from(stream.fd.try_clone()?);
-    if let Err(e) = send_chunks(&mut http::Body::new(req, r), &mut to_guest) {
-        // The client's body broke off: dropping the stream ends the guest's copy.
-        error(w, Error::Io(e))?;
+    if let Err(e) = send_chunks(&mut archive, &mut to_guest) {
+        // The body broke off or isn't valid gzip: dropping the stream ends
+        // the guest's copy.
+        error(w, upload_error(gzip, e))?;
         return Ok(Next::Close);
     }
     let mut from_guest = std::fs::File::from(stream.fd.try_clone()?);
@@ -2513,6 +2562,79 @@ mod tests {
     #[test]
     fn vm_platforms_report_the_guest_kernel() {
         assert_eq!(version()["KernelVersion"], GUEST_KERNEL);
+    }
+
+    #[test]
+    fn archive_uploads_are_sniffed() {
+        assert_eq!(upload_compression(&[0x1f, 0x8b, 8, 0, 0, 0]), Upload::Gzip);
+        assert_eq!(upload_compression(b"BZh91A"), Upload::Unsupported("bzip2"));
+        assert_eq!(upload_compression(&[0xfd, b'7', b'z', b'X', b'Z', 0]), Upload::Unsupported("xz"));
+        assert_eq!(upload_compression(&[0x28, 0xb5, 0x2f, 0xfd, 0, 0]), Upload::Unsupported("zstd"));
+        assert_eq!(upload_compression(b"etc/ho"), Upload::Tar);
+        assert_eq!(upload_compression(b""), Upload::Tar);
+    }
+
+    /// DDEV's CopyIntoVolume sends a gzipped tar: the guest gets the tar.
+    #[test]
+    fn gzip_uploads_reach_the_guest_as_tar() {
+        use std::io::{Read, Write};
+        let mut t = tar::Builder::new(Vec::new());
+        let mut h = tar::Header::new_ustar();
+        h.set_size(5);
+        h.set_mode(0o644);
+        h.set_entry_type(tar::EntryType::Regular);
+        t.append_data(&mut h, "traefik/static_config.yaml", &b"hello"[..]).unwrap();
+        let plain = t.into_inner().unwrap();
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(&plain).unwrap();
+        let gz = gz.finish().unwrap();
+        for upload in [&gz, &plain] {
+            let (head, rest) = upload.split_at(6);
+            let mut got = Vec::new();
+            upload_reader(head.to_vec(), rest).ok().unwrap().read_to_end(&mut got).unwrap();
+            assert_eq!(got, plain);
+        }
+        assert!(matches!(upload_reader(b"BZh91A".to_vec(), &b""[..]), Err(Error::BadRequest(m)) if m.contains("bzip2")));
+    }
+
+    /// Every damaged gzip is a 400, including the ones Docker 29 accepts
+    /// with 200 because it never reads the trailer: a wrong CRC or length,
+    /// no trailer at all, and a byte flipped mid-stream (Docker writes that
+    /// file corrupted). Truncated is a 400 here too (500 on Docker).
+    #[test]
+    fn damaged_gzip_uploads_are_bad_requests() {
+        use std::io::Write;
+        // Half incompressible, so a flipped byte lands in literal data and
+        // the stream still decodes, to the wrong bytes.
+        let mut data: Vec<u8> = (0..1u32 << 20).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+        data.extend(std::iter::repeat_n(b'x', 1 << 20));
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(&data).unwrap();
+        let good = gz.finish().unwrap();
+        let n = good.len();
+        let flip = |at: usize| {
+            let mut d = good.clone();
+            d[at] ^= 0xff;
+            d
+        };
+        let cases = [
+            ("truncated", good[..n / 2].to_vec()),
+            ("wrong CRC", flip(n - 8)),
+            ("wrong length", flip(n - 1)),
+            ("no trailer", good[..n - 8].to_vec()),
+            ("flipped mid-stream", flip(n / 4)),
+        ];
+        for (what, upload) in cases {
+            let (head, rest) = upload.split_at(6);
+            let mut archive = upload_reader(head.to_vec(), rest).ok().unwrap();
+            let e = send_chunks(&mut archive, &mut io::sink()).expect_err(what);
+            assert!(matches!(upload_error(true, e), Error::BadRequest(m) if m.starts_with("the gzip archive is damaged")), "{what}");
+        }
+        // The undamaged one reads through.
+        let (head, rest) = good.split_at(6);
+        send_chunks(&mut upload_reader(head.to_vec(), rest).ok().unwrap(), &mut io::sink()).unwrap();
+        // A plain body that breaks off stays the server-side error it was.
+        assert!(matches!(upload_error(false, io::Error::other("cut")), Error::Io(_)));
     }
 
     #[test]
