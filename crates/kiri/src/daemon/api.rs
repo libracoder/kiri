@@ -285,12 +285,16 @@ fn go_arch() -> &'static str {
 }
 
 /// On an Intel Mac the VM is x86-64 and there is no Rosetta for Linux:
-/// amd64 images run natively, and Kiri does not emulate Arm (no qemu), so
-/// an image with no amd64 build is refused with the reason rather than
-/// failing later with `exec format error`. `None` elsewhere, and when
+/// amd64 images run natively, and arm64 ones only through qemu-user, which
+/// the app shares into the guest when it ships it (`guest::emulator_dir`).
+/// Without it an image with no amd64 build is refused with the reason rather
+/// than failing later with `exec format error`. `None` elsewhere, and when
 /// `platforms` has a linux/amd64 one.
 fn intel_mac_refusal(image: &str, platforms: &[String]) -> Option<String> {
     if !cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        return None;
+    }
+    if crate::guest::emulator_dir().is_some() {
         return None;
     }
     amd64_only_refusal(image, platforms)
@@ -788,6 +792,14 @@ fn run_pull(req: &Request, engine: &Engine, reference: &Reference, job: &super::
         if req.query("platform").is_none_or(str::is_empty) && wanted != amd64 && available.iter().any(|a| a == "linux/amd64") && kiri_vmm::rosetta_installed() {
             line(json!({"status": format!("{} has no {wanted} image; using linux/amd64 through Rosetta", reference.short())}));
             result = client.pull_with(&engine.store, reference, &amd64, &on_progress, &job.cancel);
+        }
+    }
+    // On an Intel Mac an arm64-only image runs through qemu, when shared in.
+    if let Err(kiri_image::registry::Error::NoPlatform { available, .. }) = &result {
+        let arm64 = Platform { os: "linux".into(), architecture: "arm64".into() };
+        if req.query("platform").is_none_or(str::is_empty) && wanted != arm64 && available.iter().any(|a| a == "linux/arm64") && crate::guest::emulator_dir().is_some() {
+            line(json!({"status": format!("{} has no {wanted} image; using linux/arm64 through qemu", reference.short())}));
+            result = client.pull_with(&engine.store, reference, &arm64, &on_progress, &job.cancel);
         }
     }
     match result {
