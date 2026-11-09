@@ -26,8 +26,10 @@ Apple silicon and Intel Macs (macOS 14+), Windows 10 and 11 (x86-64 and Arm, thr
   Docker, if that container restarts, the ones sharing its network keep the
   old, now empty namespace until they are restarted too), IPAM (`--subnet`,
   `--gateway`, `--ip-range`, `--aux-address`), `--ip`, `--mac-address`,
-  `--dns`, `--dns-search`, `--dns-option`, `--domainname` and `--link`
-  (IPv6 networks are refused, not ignored), and
+  `--dns`, `--dns-search`, `--dns-option`, `--domainname`, `--link`,
+  `--ipv6` (Compose `enable_ipv6`: an IPv6 subnet beside the IPv4 one, from
+  `--subnet` or a /64 of Kiri's own under fd00::/8; the default bridge stays
+  IPv4-only, as Docker's does), and
   `http://<name>.kiri.local` once you turn it on (the app asks on first open;
   Settings → Domains changes it), or `http://<name>.kiri.localhost` with no
   setup. Compose services answer at `<service>.<project>.kiri.local`, and a

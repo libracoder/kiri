@@ -42,8 +42,11 @@ both are in WSL Ubuntu). Without the CLI directory it builds only
 `scripts/windows-engine.sh` (static musl, so one package runs on every
 distro). What the packages do:
 
-- `/usr/bin/kiri`, `/usr/bin/kiri-init`, `kiri.service` (enabled and started
-  on install where systemd runs), the `kiri` group that owns
+- `/usr/bin/kiri`, `/usr/bin/kiri-init`, `kiri.service` (installed, not
+  started: installing alone runs nothing. The engine starts, and starts at
+  boot, when someone sets Kiri up: the window's Allow access, or
+  `sudo kiri host-access $USER`. An upgrade leaves a running engine as it
+  is), the `kiri` group that owns
   `/run/kiri/docker.sock`. Members of the kiri group can run containers as
   root on this machine; treat it like the docker group. State in
   `/var/lib/kiri-daemon` (0700), images and containers in `/var/lib/kiri`

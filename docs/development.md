@@ -53,8 +53,12 @@ containers over from OrbStack or Docker Desktop.) The daemon-free tools
 that boot their own guest are `kiri raw run|pull|images|rmi`.
 
 `kiri` keeps its data in `~/Library/Application Support/Kiri` (override with
-`KIRI_DATA_DIR`). It does not touch `/usr/local/bin/docker` or
-`/var/run/docker.sock`.
+`KIRI_DATA_DIR`). It does not touch `/usr/local/bin/docker`.
+`/var/run/docker.sock` changes only when you ask: `kiri setup --docker-socket`
+(or the password prompt for `*.kiri.local` names) links it to Kiri's socket
+when no other engine has it, after macOS asks for an administrator password,
+and installs `/Library/LaunchDaemons/dev.kiri.docker-socket.plist` to put the
+link back after a restart. A socket another engine owns is never replaced.
 
 ## Architecture
 
