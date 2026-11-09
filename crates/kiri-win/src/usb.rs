@@ -66,7 +66,7 @@ pub fn list() -> Value {
     }
     match run(&["state"]).and_then(|s| serde_json::from_str::<Value>(&s).map_err(io::Error::other)) {
         Ok(state) => json!({"type": "usb", "devices": rows(&state), "can": "attach",
-            "note": "A device in Kiri is gone from Windows until you detach it. In a container: --device /dev/ttyUSB0 (serial), /dev/input (HID) or /dev/bus/usb (raw)."}),
+            "note": crate::engine::tr("A device in Kiri is gone from Windows until you detach it. In a container: --device /dev/ttyUSB0 (serial), /dev/input (HID) or /dev/bus/usb (raw).")}),
         Err(e) => json!({"type": "usb", "devices": [], "error": e.to_string()}),
     }
 }
@@ -93,7 +93,7 @@ fn attach(bus: &str) -> io::Result<String> {
         }
     }
     run(&["attach", "--wsl", "--busid", bus]).map_err(|e| io::Error::other(format!("{name} was not attached: {e}")))?;
-    Ok(format!("{name} is in Kiri"))
+    Ok(crate::engine::trf("{name} is in Kiri", &[("name", &name)]))
 }
 
 fn detach(bus: &str) -> io::Result<String> {
@@ -101,7 +101,7 @@ fn detach(bus: &str) -> io::Result<String> {
         return Err(io::Error::other(format!("bad bus id {bus:?}")));
     }
     run(&["detach", "--busid", bus])?;
-    Ok("Given back to Windows".into())
+    Ok(crate::engine::tr("Given back to Windows"))
 }
 
 /// winget installs it; its installer asks for approval itself.
@@ -132,7 +132,7 @@ pub fn handle(cmd: &'static str, key: String) {
                 .to_string());
             }
             "usbinstall" => match install() {
-                Ok(()) => emit(notice("ok", "usbipd-win is installed")),
+                Ok(()) => emit(notice("ok", &crate::engine::tr("usbipd-win is installed"))),
                 Err(e) => emit(notice("error", &e.to_string())),
             },
             _ => {}

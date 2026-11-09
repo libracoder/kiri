@@ -31,6 +31,7 @@ mod linux;
 use linux::{import, setup, update};
 
 mod assemble;
+mod lang;
 #[cfg(unix)]
 mod term;
 mod termwire;
@@ -284,8 +285,8 @@ fn engine(rx: Receiver<Cmd>, tx: Sender<Cmd>) {
                 for id in &with {
                     match client::request("DELETE", &format!("/containers/{}", path_escape(id)), None) {
                         Ok(r) if r.ok() || r.status == 404 => {}
-                        Ok(r) => blocked = Some(format!("Kept {name}: {} couldn't be removed ({})", container_name(id), r.error())),
-                        Err(e) => blocked = Some(format!("Kept {name}: {e}")),
+                        Ok(r) => blocked = Some(trf("Kept {name}: {container} couldn't be removed ({error})", &[("name", &name), ("container", &container_name(id)), ("error", &r.error())])),
+                        Err(e) => blocked = Some(trf("Kept {name}: {error}", &[("name", &name), ("error", &e)])),
                     }
                     if blocked.is_some() {
                         break;
@@ -327,9 +328,9 @@ fn engine(rx: Receiver<Cmd>, tx: Sender<Cmd>) {
                 let result = if on { setup::domains() } else { setup::remove_domains() };
                 // Cancelling macOS's password prompt is a choice, not an error.
                 match result {
-                    Err(e) if !e.to_string().contains("-128") => emit(notice("error", &format!("Could not change container names: {e}"))),
-                    _ if crate::daemon::dns::installed() => emit(notice("ok", "Containers now answer at <name>.kiri.local")),
-                    _ if !on => emit(notice("ok", "Containers answer at <name>.kiri.localhost")),
+                    Err(e) if !e.to_string().contains("-128") => emit(notice("error", &trf("Could not change container names: {error}", &[("error", &e)]))),
+                    _ if crate::daemon::dns::installed() => emit(notice("ok", &tr("Containers now answer at <name>.kiri.local"))),
+                    _ if !on => emit(notice("ok", &tr("Containers answer at <name>.kiri.localhost"))),
                     _ => {}
                 }
                 // /var/run/docker.sock was asked for with the same password.
@@ -420,6 +421,22 @@ pub(crate) fn state_dir() -> Option<std::path::PathBuf> {
     client::socket().ok()?.parent()?.parent().map(std::path::Path::to_path_buf)
 }
 
+/// Kiri opening for the first time on this account: no settings were saved
+/// before this run. Worked out on the first read, before anything is saved.
+fn fresh() -> bool {
+    static FRESH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FRESH.get_or_init(|| prefs_path().is_some_and(|p| !p.exists()))
+}
+
+/// The language step, once: on a first start, or after an update that
+/// brings this computer's language (lang::should_ask). The welcome waits behind it.
+fn ask_language() {
+    static ASKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if lang::should_ask(fresh(), &prefs(), &lang::os_languages()) && !ASKED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        emit(r#"{"type":"langpick"}"#.to_owned());
+    }
+}
+
 /// The window's settings, kept in ~/.kiri/ui.json: font, mono, scale.
 fn prefs_path() -> Option<std::path::PathBuf> {
     let dir = state_dir()?;
@@ -430,6 +447,7 @@ fn prefs_path() -> Option<std::path::PathBuf> {
 /// The settings, with the defaults for what the person hasn't picked: Kiri
 /// starts dark until Settings → Appearance says otherwise.
 pub(crate) fn prefs() -> serde_json::Value {
+    fresh();
     let mut p: serde_json::Value = prefs_path().and_then(|p| std::fs::read(p).ok()).and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_else(|| serde_json::json!({}));
     if !p.is_object() {
         p = serde_json::json!({});
@@ -440,8 +458,43 @@ pub(crate) fn prefs() -> serde_json::Value {
     p
 }
 
+/// The USB view's note under the list, in the window's language
+/// (crate::usb words it in English; these are its notes).
+fn usb_words(mut v: serde_json::Value) -> serde_json::Value {
+    let note = match v["note"].as_str() {
+        Some("A device in Kiri is gone from the Mac until you detach it. In a container: --device /dev/ttyUSB0 (serial), /dev/input (HID) or /dev/bus/usb (raw).") => {
+            tr("A device in Kiri is gone from the Mac until you detach it. In a container: --device /dev/ttyUSB0 (serial), /dev/input (HID) or /dev/bus/usb (raw).")
+        }
+        Some("Containers run on this computer's own kernel, so they see its USB devices as they are: docker run --device with the path shown.") => {
+            tr("Containers run on this computer's own kernel, so they see its USB devices as they are: docker run --device with the path shown.")
+        }
+        _ => return v,
+    };
+    v["note"] = note.into();
+    v
+}
+
+/// Attach's and Detach's word back, in the window's language.
+fn usb_text(text: &str) -> String {
+    match text.strip_suffix(" is in Kiri") {
+        Some(name) => trf("{name} is in Kiri", &[("name", &name)]),
+        None if text == "Given back to the Mac" => tr("Given back to the Mac"),
+        None => text.to_owned(),
+    }
+}
+
+/// `en` in the window's language, for words the app sends the page (notices).
+fn tr(en: &str) -> String {
+    lang::tr(lang::resolve(prefs()["lang"].as_str()), en)
+}
+
+/// [`tr`] with `{name}` placeholders filled.
+fn trf(en: &str, vars: &[(&str, &dyn std::fmt::Display)]) -> String {
+    lang::fill(tr(en), vars)
+}
+
 fn set_pref(name: &str, value: serde_json::Value) {
-    if !matches!(name, "font" | "mono" | "scale" | "termH" | "termFs" | "termFont" | "domainsAsked" | "theme" | "accent" | "importSeen" | "updateAuto" | "updateSkip" | "updateSnoozeUntil" | "columnWidths" | "crashReports" | "ctxSnooze" | "ctxBack" | "logSize" | "starAsked" | "setupSkip") {
+    if !matches!(name, "font" | "mono" | "scale" | "termH" | "termFs" | "termFont" | "domainsAsked" | "theme" | "accent" | "importSeen" | "updateAuto" | "updateSkip" | "updateSnoozeUntil" | "columnWidths" | "crashReports" | "ctxSnooze" | "ctxBack" | "logSize" | "starAsked" | "setupSkip" | "lang" | "langAsked") {
         return;
     }
     let Some(path) = prefs_path() else { return };
@@ -463,7 +516,10 @@ fn set_pref(name: &str, value: serde_json::Value) {
     all[name] = value;
     let tmp = path.with_extension("json.tmp");
     if std::fs::write(&tmp, all.to_string()).and_then(|()| std::fs::rename(&tmp, &path)).is_err() {
-        emit(notice("error", "Could not save the setting to ~/.kiri/ui.json"));
+        emit(notice("error", &tr("Could not save the setting to ~/.kiri/ui.json")));
+    }
+    if name == "lang" {
+        window::relang();
     }
 }
 
@@ -472,7 +528,7 @@ fn set_pref(name: &str, value: serde_json::Value) {
 fn proxy(save: Option<serde_json::Value>) {
     if let Some(body) = save {
         match client::request("POST", "/kiri/proxy", Some(&body)) {
-            Ok(r) if r.ok() => emit(notice("ok", "Proxy settings saved")),
+            Ok(r) if r.ok() => emit(notice("ok", &tr("Proxy settings saved"))),
             Ok(r) => emit(notice("error", &r.error())),
             Err(e) => emit(notice("error", &e.to_string())),
         }
@@ -494,7 +550,7 @@ fn resources(save: Option<serde_json::Value>) {
         // While the VM runs, the toast offers to restart it now.
         Some(Ok(r)) if r.ok() => {
             let awake = now.as_ref().is_ok_and(|v| v["awake"] == true);
-            emit(serde_json::json!({"type": "notice", "kind": "ok", "text": "Saved. The VM uses these from its next start", "act": if awake { "restartvm" } else { "" }}).to_string());
+            emit(serde_json::json!({"type": "notice", "kind": "ok", "text": tr("Saved. The VM uses these from its next start"), "act": if awake { "restartvm" } else { "" }}).to_string());
         }
         Some(Ok(r)) => emit(notice("error", &r.error())),
         Some(Err(e)) => emit(notice("error", &e.to_string())),
@@ -562,7 +618,7 @@ fn update_check(manual: bool) {
     if !manual && !crate::flavor::dev()
         && let Some(p) = crate::stale::stale_kiri()
     {
-        emit(notice("error", &format!("{} comes first on your PATH, so terminals run it instead of this Kiri. If it's an older Kiri, remove it: rm {0}", p.display())));
+        emit(notice("error", &trf("{path} comes first on your PATH, so terminals run it instead of this Kiri. If it's an older Kiri, remove it: rm {path}", &[("path", &p.display())])));
     }
     if let Some(v) = crate::client::request("GET", "/version", None).ok().filter(|r| r.ok()).and_then(|r| r.json()["Version"].as_str().map(str::to_owned))
         && update::newer(env!("CARGO_PKG_VERSION"), &v)
@@ -578,7 +634,7 @@ fn feed_check(manual: bool) {    // Kiri Dev is rebuilt from source, never updat
     // KIRI_UPDATE_URL names a test feed (to try the update card and What's new).
     if crate::flavor::dev() && std::env::var_os("KIRI_UPDATE_URL").is_none() {
         if manual {
-            emit(notice("ok", &format!("{} doesn't update itself: rebuild it with cargo xtask app-dev", crate::flavor::APP)));
+            emit(notice("ok", &trf("{app} doesn't update itself: rebuild it with cargo xtask app-dev", &[("app", &crate::flavor::APP)])));
         }
         update_state("dev", None, None);
         return;
@@ -587,7 +643,7 @@ fn feed_check(manual: bool) {    // Kiri Dev is rebuilt from source, never updat
     // from the feed either: it would "update" back to the release it came from.
     if env!("CARGO_PKG_VERSION").contains("-dev") {
         if manual {
-            emit(notice("ok", &format!("Kiri {} is a test build: it doesn't update itself", env!("CARGO_PKG_VERSION"))));
+            emit(notice("ok", &trf("Kiri {version} is a test build: it doesn't update itself", &[("version", &env!("CARGO_PKG_VERSION"))])));
         }
         update_state("test", None, None);
         return;
@@ -617,13 +673,13 @@ fn feed_check(manual: bool) {    // Kiri Dev is rebuilt from source, never updat
         Ok(_) => {
             update_state("uptodate", None, None);
             if manual {
-                emit(notice("ok", &format!("Kiri {} is the newest version", env!("CARGO_PKG_VERSION"))));
+                emit(notice("ok", &trf("Kiri {version} is the newest version", &[("version", &env!("CARGO_PKG_VERSION"))])));
             }
         }
         Err(e) => {
             update_state("error", None, Some(e.to_string()));
             if manual {
-                emit(notice("error", &format!("Couldn't check for updates: {e}")));
+                emit(notice("error", &trf("Couldn't check for updates: {error}", &[("error", &e)])));
             }
         }
     }
@@ -747,7 +803,7 @@ fn set_ports(id: &str, ports: serde_json::Value) -> io::Result<()> {
             }
         }
     }
-    let text = if now.is_empty() { "Ports removed".to_owned() } else { format!("Ports saved: {}", now.join(", ")) };
+    let text = if now.is_empty() { tr("Ports removed") } else { trf("Ports saved: {ports}", &[("ports", &now.join(", "))]) };
     emit(notice("ok", &text));
     Ok(())
 }
@@ -762,8 +818,8 @@ fn set_env(id: &str, env: Vec<String>) -> io::Result<()> {
     expect_ok(Ok(r))?;
     let info = client::get(&format!("/containers/{id}/json"))?;
     let name = info["Name"].as_str().unwrap_or_default().trim_start_matches('/');
-    let how = if info["State"]["Running"].as_bool() == Some(true) { "restarted with" } else { "has" };
-    emit(notice("ok", &format!("{name} {how} the new environment")));
+    let text = if info["State"]["Running"].as_bool() == Some(true) { trf("{name} restarted with the new environment", &[("name", &name)]) } else { trf("{name} has the new environment", &[("name", &name)]) };
+    emit(notice("ok", &text));
     emit(serde_json::json!({"type": "inspect", "id": id, "info": info}).to_string());
     Ok(())
 }
@@ -786,7 +842,7 @@ fn run_image(image: &str, env: &[String]) -> io::Result<()> {
     let name = info["Name"].as_str().unwrap_or_default().trim_start_matches('/').to_owned();
     // Just the name: the container's page says where it answers.
     let published = info["NetworkSettings"]["Ports"].as_object().is_some_and(|m| m.values().any(|l| l.as_array().is_some_and(|l| !l.is_empty())));
-    let text = format!("Started {name}");
+    let text = trf("Started {name}", &[("name", &name)]);
     // View on the toast opens the container's page; `image` puts it beside
     // that image's Run button when the list shows it; `ms` is create and start.
     let ms = began.elapsed().as_millis() as u64;
@@ -1015,7 +1071,7 @@ fn container_name(id: &str) -> String {
 /// X is using its referenced image", in plain words with the container's name.
 fn image_refusal(name: &str, error: &str) -> String {
     match error.split("container ").nth(1).and_then(|r| r.split_whitespace().next()).filter(|_| error.contains("is using")) {
-        Some(id) => format!("{name} is still used by the container {}. Remove the container first.", container_name(id)),
+        Some(id) => trf("{name} is still used by the container {container}. Remove the container first.", &[("name", &name), ("container", &container_name(id))]),
         None => error.to_owned(),
     }
 }
@@ -1437,6 +1493,14 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
             set_pref(&msg.name, msg.value);
             Ok(())
         }
+        // A language the page doesn't carry yet (it opens with one): its words,
+        // which the page adds and shows if it's the one picked.
+        "langwords" => {
+            if let Some(js) = lang::words_js(&msg.name) {
+                window::eval(js);
+            }
+            Ok(())
+        }
         "about" => tx.send(Cmd::About),
         "domains" => tx.send(Cmd::Domains(msg.value.as_bool().unwrap_or(false))),
         // Settings → Domains → HTTPS: macOS asks for the password.
@@ -1445,10 +1509,10 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
             std::thread::spawn(move || {
                 let result = if on { crate::daemon::tls::trust() } else { crate::daemon::tls::untrust() };
                 match result {
-                    Ok(()) if on => emit(notice("ok", "Kiri's certificate is trusted: containers open over HTTPS")),
-                    Ok(()) => emit(notice("ok", "Kiri's certificate is no longer trusted")),
+                    Ok(()) if on => emit(notice("ok", &tr("Kiri's certificate is trusted: containers open over HTTPS"))),
+                    Ok(()) => emit(notice("ok", &tr("Kiri's certificate is no longer trusted"))),
                     Err(e) if e.to_string().contains("canceled") || e.to_string().contains("cancelled") => {}
-                    Err(e) => emit(notice("error", &format!("Could not change the certificate's trust: {e}"))),
+                    Err(e) => emit(notice("error", &trf("Could not change the certificate's trust: {error}", &[("error", &e)]))),
                 }
                 emit(domains_event());
             });
@@ -1456,7 +1520,7 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
         }
         // The USB view: the computer's devices, and which are in Kiri.
         "usb" => {
-            std::thread::spawn(|| emit(crate::usb::ui_list().to_string()));
+            std::thread::spawn(|| emit(usb_words(crate::usb::ui_list()).to_string()));
             Ok(())
         }
         // Attach asks for the password the first time (the USB helper).
@@ -1465,11 +1529,11 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
             std::thread::spawn(move || {
                 let r = if attach { crate::usb::ui_attach(&key) } else { crate::usb::ui_detach(&key) };
                 match r {
-                    Ok(text) => emit(serde_json::json!({"type": "usbdone", "key": key, "text": text}).to_string()),
+                    Ok(text) => emit(serde_json::json!({"type": "usbdone", "key": key, "text": usb_text(&text)}).to_string()),
                     Err(e) if e.to_string().contains("canceled") || e.to_string().contains("cancelled") => emit(serde_json::json!({"type": "usbdone", "key": key}).to_string()),
                     Err(e) => emit(serde_json::json!({"type": "usbdone", "key": key, "error": e.to_string()}).to_string()),
                 }
-                emit(crate::usb::ui_list().to_string());
+                emit(usb_words(crate::usb::ui_list()).to_string());
             });
             Ok(())
         }
@@ -1538,10 +1602,10 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
         "savesbom" => {
             match crate::scan::save_sbom(&msg.name, msg.id.parse().unwrap_or(0), &msg.path) {
                 Ok(to) => {
-                    emit(notice("ok", &format!("Saved the SBOM to Downloads as {}", to.file_name().unwrap_or_default().to_string_lossy())));
+                    emit(notice("ok", &trf("Saved the SBOM to Downloads as {file}", &[("file", &to.file_name().unwrap_or_default().to_string_lossy())])));
                     reveal(&to);
                 }
-                Err(e) => emit(notice("error", &format!("Could not save the SBOM: {e}"))),
+                Err(e) => emit(notice("error", &trf("Could not save the SBOM: {error}", &[("error", &e)]))),
             }
             Ok(())
         }
@@ -1673,7 +1737,7 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
             let (builder, id) = (msg.name, msg.id);
             std::thread::spawn(move || {
                 if let Err(e) = crate::builds::remove(&builder, &id) {
-                    emit(notice("error", &format!("Couldn't remove the build: {e}")));
+                    emit(notice("error", &trf("Couldn't remove the build: {error}", &[("error", &e)])));
                 }
                 emit(match crate::builds::list() {
                     Ok(b) => serde_json::json!({"type": "builds", "builds": b}),
@@ -1713,7 +1777,7 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
                     match crate::buildwith::choose(with) {
                         // Kiri's builder made now if it wasn't yet; it takes the choice.
                         Ok(()) => setup::ensure_builder(),
-                        Err(e) => emit(notice("error", &format!("Couldn't change which builder docker build uses: {e}"))),
+                        Err(e) => emit(notice("error", &trf("Couldn't change which builder docker build uses: {error}", &[("error", &e)]))),
                     }
                 }
                 emit(crate::buildwith::event());
@@ -1788,8 +1852,8 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
                 let _op = diag::enter_op(diag::new_op("restartvm"));
                 let result = expect_ok(client::request("POST", "/kiri/sleep", None)).and_then(|()| expect_ok(client::request("POST", "/kiri/wake", None)));
                 match result {
-                    Ok(()) => emit(notice("ok", "The Linux VM restarted with the new resources")),
-                    Err(e) => emit(notice("error", &format!("Could not restart the VM: {e}"))),
+                    Ok(()) => emit(notice("ok", &tr("The Linux VM restarted with the new resources"))),
+                    Err(e) => emit(notice("error", &trf("Could not restart the VM: {error}", &[("error", &e)]))),
                 }
                 resources(None);
             });
@@ -1848,7 +1912,7 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
         }
         "terminal" => {
             if let Err(e) = detail::terminal(&msg.name) {
-                emit(notice("error", &format!("Could not open Terminal: {e}")));
+                emit(notice("error", &trf("Could not open Terminal: {error}", &[("error", &e)])));
             }
             Ok(())
         }
@@ -1863,10 +1927,10 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
         "download" => {
             match detail::download(&msg.name, &msg.path) {
                 Ok(to) => {
-                    emit(notice("ok", &format!("Saved to Downloads as {}", to.file_name().unwrap_or_default().to_string_lossy())));
+                    emit(notice("ok", &trf("Saved to Downloads as {file}", &[("file", &to.file_name().unwrap_or_default().to_string_lossy())])));
                     reveal(&to);
                 }
-                Err(e) => emit(notice("error", &format!("Could not save the file: {e}"))),
+                Err(e) => emit(notice("error", &trf("Could not save the file: {error}", &[("error", &e)]))),
             }
             Ok(())
         }
@@ -2009,6 +2073,7 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
             // engine still on an older build.
             std::thread::spawn(|| update_check(false));
             recheck::start(|| feed_check(false));
+            ask_language();
             // The first time the app opens: ask, once, whether to use *.kiri.local (the Mac only, so far).
             if cfg!(target_os = "macos") && !crate::flavor::dev() && !crate::daemon::dns::installed() && prefs()["domainsAsked"] != true {
                 set_pref("domainsAsked", true.into());

@@ -7,25 +7,68 @@ with PASS or FAIL. Exits non-zero if any test fails or a page errors.
 
     python3 scripts/ui-test.py [tests/ui/switch.js ...]
 """
-import html, os, re, subprocess, sys, tempfile
+import html, json, os, re, subprocess, sys, tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CHROME = os.environ.get("CHROME", "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
 UI = os.path.join(ROOT, "crates/kiri/src/ui")
 
 
+def strings():
+    """lang/*.json packed as lang.rs packs them: the English keys once, each language its words in that order."""
+    d = os.path.join(UI, "lang")
+    files = {f[:-5]: json.load(open(os.path.join(d, f))) for f in sorted(os.listdir(d)) if f.endswith(".json")}
+    keys = sorted(set().union(*files.values()))
+    return {"en": keys, **{tag: [m.get(k) for k in keys] for tag, m in files.items()}}
+
+
+def opening(pick, packed):
+    """What assemble.rs splices in for `pick` on an en-US system: the keys and
+    the one language the page opens in (a file's tag, or English)."""
+    return {"en": packed["en"], **({pick: packed[pick]} if pick in packed and pick != "en" else {})}
+
+
+def host(packed):
+    """The host's half of langwords, after the fixture's recorder: it answers as
+    lang.rs's words_js does, calling kiriWords with that language's words, at
+    once (a real host answers a moment later). hostHold = true keeps the answers
+    until hostFlush(), for a test of the moment in between."""
+    words = {t: w for t, w in packed.items() if t != "en"}
+    return (f"const HOST_WORDS = {json.dumps(words, ensure_ascii=False)};\n"
+            "let hostHold = false; const hostHeld = [];\n"
+            "const hostFlush = () => hostHeld.splice(0).forEach((f) => f());\n"
+            "{ const post = window.webkit.messageHandlers.kiri.postMessage;\n"
+            "  window.webkit.messageHandlers.kiri.postMessage = (m) => { post(m); const o = JSON.parse(m);\n"
+            "    if (o.cmd !== \"langwords\" || !HOST_WORDS[o.name]) return;\n"
+            "    const answer = () => window.kiriWords && kiriWords({ [o.name]: HOST_WORDS[o.name] });\n"
+            "    if (hostHold) hostHeld.push(answer); else answer(); }; }\n")
+
+
+def lang_of(test):
+    """A test runs in English, as a system set to US English would, unless
+    one of its first lines says `// lang: zh-Hans`."""
+    for line in open(test).readlines()[:3]:
+        if line.startswith("// lang:"):
+            return line.split(":", 1)[1].strip()
+    return "system"
+
+
 def page(test, os_name=None):
-    # As assemble.rs builds it: the icons and xterm.js spliced in.
+    # As assemble.rs builds it: the icons and xterm.js spliced in, and the words
+    # for the language it opens in; the rest come through langwords (host()).
+    packed, pick = strings(), lang_of(test)
     xterm = lambda f: open(os.path.join(UI, "xterm", f)).read()
     index = (open(os.path.join(UI, "index.html")).read().replace("/*ICONS*/", open(os.path.join(UI, "icons.js")).read(), 1)
              .replace("/*XTERM_CSS*/", xterm("xterm.css"), 1)
-             .replace("/*XTERM_JS*/", "".join(xterm(f) + "\n" for f in ["xterm.js", "addon-fit.js", "addon-search.js", "addon-web-links.js"]), 1))
+             .replace("/*XTERM_JS*/", "".join(xterm(f) + "\n" for f in ["xterm.js", "addon-fit.js", "addon-search.js", "addon-web-links.js"]), 1)
+             .replace("/*LANG*/", f"window.KIRI_LANG = {json.dumps({'os': ['en-US'], 'pick': pick})};", 1)
+             .replace("/*STRINGS*/{}", json.dumps(opening(pick, packed), ensure_ascii=False), 1))
     if os_name and os_name != "macos":
         index = index.replace("<head>", f'<head><script>window.KIRI_OS = "{os_name}";</script>', 1)
     fixture = open(os.path.join(ROOT, "tests/ui/fixture.js")).read()
     report = 'const report = (lines) => document.body.insertAdjacentHTML("beforeend", `<pre id="results">${lines.join("\\n")}</pre>`);'
     catch = '<script>window.onerror = (m, u, l) => document.body.insertAdjacentHTML("beforeend", `<pre id="results">FAIL page error: ${m} (line ${l})</pre>`);</script>'
-    return index[: index.rindex("</body>")] + catch + f"<script>{report}\n{fixture}\n{open(test).read()}</script></body></html>"
+    return index[: index.rindex("</body>")] + catch + f"<script>{report}\n{fixture}\n{host(packed)}\n{open(test).read()}</script></body></html>"
 
 
 def run(test, os_name=None):

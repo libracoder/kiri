@@ -1,0 +1,74 @@
+// Switching the language and back leaves the window as it was: every view
+// and Settings tab reads the same in English after a round trip through
+// Chinese, and through System, as before it; in Chinese nothing is left from
+// the English it switched from; and nothing breaks on the way.
+const R = [];
+const t = (name, fn) => { try { fn(); R.push("PASS " + name); } catch (e) { R.push("FAIL " + name + ": " + e.message); } };
+ui.images.push({ Id: "sha256:" + "ab".repeat(32), RepoTags: ["nginx:alpine"], Size: 5e7, Created: Date.now() / 1000 - 86400 });
+const pick = (lang) => { show("settings"); document.querySelector('[data-stab="appearance"]').click(); const sel = document.getElementById("pref-lang"); sel.value = lang; sel.dispatchEvent(new Event("change")); };
+// What a person reads: the text and the words in attributes, of the whole window.
+const words = () => {
+  const c = document.body.cloneNode(true);
+  c.querySelectorAll("script, #results, .toasts").forEach((x) => x.remove());
+  const attrs = [...c.querySelectorAll("[title], [aria-label], [placeholder]")].map((el) => [el.title, el.getAttribute("aria-label"), el.getAttribute("placeholder")].join("|"));
+  return c.textContent.replace(/\s+/g, " ") + "\n" + attrs.join("\n");
+};
+const PLACES = [["containers"], ["images"], ["volumes"], ["networks"], ["builds"], ["share"], ["image", () => { show("images"); openImage("nginx:alpine"); }]];
+for (const id of ["appearance", "resources", "network", "builds", "kubernetes", "import", "domains", "diagnostics", "about"])
+  PLACES.push([`settings ${id}`, () => { show("settings"); document.querySelector(`[data-stab="${id}"]`).click(); }]);
+const visit = ([name, go]) => (go ? go() : show(name));
+const before = new Map(PLACES.map((p) => { visit(p); return [p[0], words()]; }));
+for (const round of ["zh-Hans", "system", "zh-Hans", "en", "zh-Hans"]) {
+  pick(round);
+  for (const p of PLACES) {
+    visit(p);
+    // In Chinese, nothing kept from the English it switched from.
+    if (round === "zh-Hans") { const left = english(document.body); if (left.length) R.push(`FAIL ${p[0]} in Chinese (switched to, round ${R.length}): English left: ${left.slice(0, 5).map((x) => JSON.stringify(x)).join(", ")}`); }
+  }
+}
+pick("en");
+for (const p of PLACES) t(`${p[0]} reads as before after the round trip`, () => {
+  visit(p);
+  const now = words(), was = before.get(p[0]);
+  if (now !== was) {
+    let i = 0; while (i < now.length && now[i] === was[i]) i++;
+    throw new Error(`differs at …${JSON.stringify(was.slice(Math.max(0, i - 30), i + 50))} → ${JSON.stringify(now.slice(Math.max(0, i - 30), i + 50))}`);
+  }
+});
+t("System picks English for an English system", () => {
+  pick("system");
+  if (document.documentElement.lang !== "en") throw new Error("lang is " + document.documentElement.lang);
+  if (!sent.some((m) => m.type === "setpref" && m.name === "lang" && m.value === "system")) throw new Error("System wasn't saved");
+});
+// Every language Settings offers: asked for from the host when the page lacks
+// it, then the window in it (its sidebar, lang, CJK fonts and wrapping), and
+// English again with nothing left behind.
+t("every language comes from the host when picked, and shows", () => {
+  for (const [id] of LANGS) {
+    if (id === "en") continue;
+    pick(id);
+    if (document.documentElement.lang !== id) throw new Error(`${id}: lang is ${document.documentElement.lang}`);
+    const nav = document.querySelector("nav [data-view=containers] .lbl").textContent;
+    if (nav !== STRINGS[id]["Containers"]) throw new Error(`${id}: the sidebar says ${nav}`);
+    if (document.documentElement.classList.contains("cjk") !== /^(zh|ja|ko)/.test(id)) throw new Error(`${id}: cjk is ${document.documentElement.classList.contains("cjk")}`);
+    const font = getComputedStyle(document.documentElement).getPropertyValue("--ui-font");
+    const want = { ja: "Hiragino Sans", ko: "Malgun Gothic", "zh-Hant": "PingFang TC", "zh-Hans": "PingFang SC" }[id] || "PingFang SC";
+    if (!font.includes(want)) throw new Error(`${id}: the font is ${font}`);
+  }
+  pick("en");
+  const now = (visit(PLACES[0]), words());
+  if (now !== before.get(PLACES[0][0])) throw new Error("containers differ after every language");
+});
+t("an answer for a language no longer picked changes nothing", () => {
+  hostHold = true;
+  pick("ko"); pick("en");
+  hostHold = false; hostFlush();
+  if (document.documentElement.lang !== "en") throw new Error("lang is " + document.documentElement.lang);
+});
+t("tags map to the languages Kiri has, as lang.rs maps them", () => {
+  const want = { zh: "zh-Hans", "zh-CN": "zh-Hans", "zh-SG": "zh-Hans", "zh-Hans-HK": "zh-Hans", zh_TW: "zh-Hant", "zh-TW": "zh-Hant", "zh-HK": "zh-Hant", "zh-MO": "zh-Hant", "zh-Hant": "zh-Hant", "zh-Hant-CN": "zh-Hant",
+    zhx: "", in: "id", "in-ID": "id", "id-ID": "id", iw: "", "iw-IL": "", "ja-JP": "ja", "ko-KR": "ko", "ru-RU": "ru", "pl-PL": "pl", "tr-TR": "tr", "vi-VN": "vi", "it-CH": "it", "pt-PT": "pt-BR", "fr-CA": "fr", "en-GB": "en", nl: "" };
+  const bad = Object.entries(want).filter(([tag, id]) => langFor(tag) !== id).map(([tag, id]) => `${tag} → ${langFor(tag)}, not ${id}`);
+  if (bad.length) throw new Error(bad.join("; "));
+});
+report(R);

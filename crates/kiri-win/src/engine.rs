@@ -486,7 +486,7 @@ fn pull(name: String) {
         };
         if reference.is_empty() || reference.contains(char::is_whitespace) {
             forget();
-            emit(notice("error", &format!("Not an image name: {reference}")));
+            emit(notice("error", &trf("Not an image name: {reference}", &[("reference", &reference)])));
             return;
         }
         if cancelled() {
@@ -600,7 +600,7 @@ fn host_ports(info: &Value, with_inner: bool) -> Vec<String> {
 fn set_ports(id: &str, ports: Value) -> io::Result<()> {
     expect_ok(client::request("POST", &format!("/kiri/containers/{id}/ports"), Some(&json!({"ports": ports}))))?;
     let now = host_ports(&client::get(&format!("/containers/{id}/json"))?, true);
-    emit(notice("ok", &if now.is_empty() { "Ports removed".to_owned() } else { format!("Ports saved: {}", now.join(", ")) }));
+    emit(notice("ok", &if now.is_empty() { tr("Ports removed") } else { trf("Ports saved: {ports}", &[("ports", &now.join(", "))]) }));
     Ok(())
 }
 
@@ -614,8 +614,8 @@ fn set_env(id: &str, env: Vec<String>) -> io::Result<()> {
     expect_ok(Ok(r))?;
     let info = client::get(&format!("/containers/{id}/json"))?;
     let name = info["Name"].as_str().unwrap_or_default().trim_start_matches('/');
-    let how = if info["State"]["Running"].as_bool() == Some(true) { "restarted with" } else { "has" };
-    emit(notice("ok", &format!("{name} {how} the new environment")));
+    let text = if info["State"]["Running"].as_bool() == Some(true) { trf("{name} restarted with the new environment", &[("name", &name)]) } else { trf("{name} has the new environment", &[("name", &name)]) };
+    emit(notice("ok", &text));
     emit(json!({"type": "inspect", "id": id, "info": info}).to_string());
     Ok(())
 }
@@ -635,7 +635,7 @@ fn run_image(image: &str, env: &[String]) -> io::Result<()> {
     let ports = host_ports(&info, false);
     // View on the toast opens the container's page; the list stays put, as on
     // the Mac, and `image` puts it beside that image's Run button.
-    let text = if ports.is_empty() { format!("Started {name}") } else { format!("Started {name} on {}", ports.join(", ")) };
+    let text = if ports.is_empty() { trf("Started {name}", &[("name", &name)]) } else { trf("Started {name} on {ports}", &[("name", &name), ("ports", &ports.join(", "))]) };
     emit(json!({"type": "notice", "kind": "ok", "text": text, "open": id, "image": image, "ms": ms}).to_string());
     Ok(())
 }
@@ -730,16 +730,16 @@ fn domains_event() -> String {
 fn domains(on: bool) {
     let _ = std::thread::Builder::new().name("kiri-domains".into()).spawn(move || {
         if on && !crate::dns::serving() {
-            emit(notice("error", "Another program holds 127.0.0.1:53, so Kiri cannot answer for <name>.kiri.local; containers stay at <name>.kiri.localhost"));
+            emit(notice("error", &tr("Another program holds 127.0.0.1:53, so Kiri cannot answer for <name>.kiri.local; containers stay at <name>.kiri.localhost")));
             emit(domains_event());
             return;
         }
         match crate::dns::install(on) {
             // Saying no to Windows' prompt is a choice, not an error.
             Err(e) if e.to_string().contains("canceled") => {}
-            Err(e) => emit(notice("error", &format!("Could not change container names: {e}"))),
-            Ok(()) if on => emit(notice("ok", "Containers now answer at <name>.kiri.local")),
-            Ok(()) => emit(notice("ok", "Containers answer at <name>.kiri.localhost")),
+            Err(e) => emit(notice("error", &trf("Could not change container names: {error}", &[("error", &e)]))),
+            Ok(()) if on => emit(notice("ok", &tr("Containers now answer at <name>.kiri.local"))),
+            Ok(()) => emit(notice("ok", &tr("Containers answer at <name>.kiri.localhost"))),
         }
         emit(domains_event());
         send(Cmd::Refresh);
@@ -758,6 +758,22 @@ pub(crate) fn clipboard(text: &str) -> io::Result<()> {
     if status.success() { Ok(()) } else { Err(io::Error::other("clip.exe failed")) }
 }
 
+/// Kiri opening for the first time on this account: no settings were saved
+/// before this run. Worked out on the first read, before anything is saved.
+pub(crate) fn fresh() -> bool {
+    static FRESH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FRESH.get_or_init(|| prefs_path().is_some_and(|p| !p.exists()))
+}
+
+/// The language step, once: on a first start, or after an update that
+/// brings this computer's language (lang::should_ask). The welcome waits behind it.
+fn ask_language() {
+    static ASKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if crate::lang::should_ask(fresh(), &prefs(), &crate::lang::os_languages()) && !ASKED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        emit(r#"{"type":"langpick"}"#.to_owned());
+    }
+}
+
 /// The window's settings, in %LOCALAPPDATA%\Kiri\ui.json.
 fn prefs_path() -> Option<std::path::PathBuf> {
     std::env::var_os("LOCALAPPDATA").map(|d| std::path::PathBuf::from(d).join("Kiri").join("ui.json"))
@@ -766,6 +782,7 @@ fn prefs_path() -> Option<std::path::PathBuf> {
 /// The settings, with the defaults for what the person hasn't picked: Kiri
 /// starts dark until Settings → Appearance says otherwise.
 pub fn prefs() -> Value {
+    fresh();
     let mut p: Value = prefs_path().and_then(|p| std::fs::read(p).ok()).and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_else(|| json!({}));
     if !p.is_object() {
         p = json!({});
@@ -776,8 +793,19 @@ pub fn prefs() -> Value {
     p
 }
 
+/// `en` in the window's language (lang.rs), for words sent to the page:
+/// notices, and the setup steps.
+pub fn tr(en: &str) -> String {
+    crate::lang::tr(crate::lang::resolve(prefs()["lang"].as_str()), en)
+}
+
+/// [`tr`] with `{name}` placeholders filled, as the page's tr() does.
+pub fn trf(en: &str, vars: &[(&str, &dyn std::fmt::Display)]) -> String {
+    crate::lang::fill(tr(en), vars)
+}
+
 fn set_pref(name: &str, value: Value) {
-    if !matches!(name, "font" | "mono" | "scale" | "termH" | "termFs" | "termFont" | "domainsAsked" | "theme" | "accent" | "starAsked" | "updateAuto") {
+    if !matches!(name, "font" | "mono" | "scale" | "termH" | "termFs" | "termFont" | "domainsAsked" | "theme" | "accent" | "starAsked" | "updateAuto" | "lang" | "langAsked") {
         return;
     }
     let Some(path) = prefs_path() else { return };
@@ -786,7 +814,7 @@ fn set_pref(name: &str, value: Value) {
     let tmp = path.with_extension("json.tmp");
     let saved = path.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| std::fs::write(&tmp, p.to_string())).and_then(|()| std::fs::rename(&tmp, &path));
     if saved.is_err() {
-        emit(notice("error", "Could not save the setting to %LOCALAPPDATA%\\Kiri\\ui.json"));
+        emit(notice("error", &trf("Could not save the setting to {path}", &[("path", &"%LOCALAPPDATA%\\Kiri\\ui.json")])));
     }
 }
 
@@ -847,6 +875,7 @@ pub fn on_message(msg: &str) {
             }
             emit(domains_event());
             emit(status_event());
+            ask_language();
             // The first time, offer <name>.kiri.local, as the Mac does.
             if !crate::dns::installed() && crate::dns::serving() && prefs()["domainsAsked"] != true {
                 set_pref("domainsAsked", json!(true));
@@ -912,7 +941,7 @@ pub fn on_message(msg: &str) {
                 if let Some(with) = with
                     && let Err(e) = crate::buildwith::choose(with)
                 {
-                    emit(notice("error", &format!("Couldn't change which builder docker build uses: {e}")));
+                    emit(notice("error", &trf("Couldn't change which builder docker build uses: {error}", &[("error", &e)])));
                 }
                 emit(crate::buildwith::event());
             });
@@ -953,7 +982,7 @@ pub fn on_message(msg: &str) {
                 if let Some(text) = c.value.as_str().filter(|t| !t.is_empty() && t.len() <= crate::term::COPY_MAX)
                     && clipboard(text).is_err()
                 {
-                    emit(notice("error", "Couldn't copy to the clipboard"));
+                    emit(notice("error", &tr("Couldn't copy to the clipboard")));
                 }
             }
             "paste" => {
@@ -971,7 +1000,7 @@ pub fn on_message(msg: &str) {
         // The page can't write the clipboard itself; IDs and short text only.
         "copy" => {
             if !c.name.is_empty() && c.name.len() <= 4096 && clipboard(&c.name).is_err() {
-                emit(notice("error", "Couldn't copy to the clipboard"));
+                emit(notice("error", &tr("Couldn't copy to the clipboard")));
             }
         }
         // About's Check now.
@@ -1006,7 +1035,7 @@ pub fn on_message(msg: &str) {
         "files" => detail::files(c.name, c.path),
         "preview" => detail::preview(c.name, c.path),
         "download" => detail::download(c.name, c.path),
-        "reveal" => emit(notice("error", "Container files are not on Windows' disk: use Save to Downloads")),
+        "reveal" => emit(notice("error", &tr("Container files are not on Windows' disk: use Save to Downloads"))),
         "terminal" => detail::terminal(&c.name, &env().pipe),
         "open" => {
             if allowed_url(&c.name) {
@@ -1019,6 +1048,14 @@ pub fn on_message(msg: &str) {
                 Handle.run(move |ui| ui.set_theme(&theme));
             }
             set_pref(&c.name, c.value);
+        }
+        // A language the page doesn't carry yet (the main window and setup open
+        // with one; setup's langwords comes here too, not being a setup- command):
+        // its words, which the page adds and shows if it's the one picked.
+        "langwords" => {
+            if let Some(js) = crate::lang::words_js(&c.name) {
+                Handle.eval(js);
+            }
         }
         "fonts" => emit(json!({"type": "fonts", "families": crate::app::font_families(false), "mono": crate::app::font_families(true)}).to_string()),
         "proxy" => {
@@ -1119,17 +1156,17 @@ pub fn on_message(msg: &str) {
         "savesbom" => {
             std::thread::spawn(move || match crate::scan::save_sbom(&c.name, c.id.parse().unwrap_or(0), &c.path) {
                 Ok(to) => {
-                    emit(notice("ok", &format!("Saved the SBOM to Downloads as {}", to.file_name().unwrap_or_default().to_string_lossy())));
+                    emit(notice("ok", &trf("Saved the SBOM to Downloads as {file}", &[("file", &to.file_name().unwrap_or_default().to_string_lossy())])));
                     crate::app::reveal(&to);
                 }
-                Err(e) => emit(notice("error", &format!("Could not save the SBOM: {e}"))),
+                Err(e) => emit(notice("error", &trf("Could not save the SBOM: {error}", &[("error", &e)]))),
             });
         }
         "advisory" => crate::scan::open_advisory(&c.name),
         "rmbuild" => {
             std::thread::spawn(move || {
                 if let Err(e) = crate::builds::remove(&c.name, &c.id) {
-                    emit(notice("error", &format!("Couldn't remove the build: {e}")));
+                    emit(notice("error", &trf("Couldn't remove the build: {error}", &[("error", &e)])));
                 }
                 emit(builds_event());
             });
@@ -1205,9 +1242,9 @@ fn proxy(set: Option<Value>) {
             Ok(()) => {
                 // A custom proxy on Windows' loopback needs the relay too.
                 send_windows_proxy();
-                emit(notice("ok", "Proxy settings saved"));
+                emit(notice("ok", &tr("Proxy settings saved")));
             }
-            Err(e) => emit(notice("error", &format!("Could not save the proxy settings: {e}"))),
+            Err(e) => emit(notice("error", &trf("Could not save the proxy settings: {error}", &[("error", &e)]))),
         }
     }
     let ev = match client::get("/kiri/proxy") {
