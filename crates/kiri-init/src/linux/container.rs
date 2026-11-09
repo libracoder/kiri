@@ -1182,6 +1182,7 @@ fn finish_child(p: &Prepared, io: &ChildStdio, console: bool) -> ! {
     let (uid, gid) = resolve_user(&p.user).unwrap_or_else(|e| fail("user", e));
     // The user's /etc/group memberships and --group-add, as Docker gives them.
     let groups = super::hostopts::supplementary_groups(&p.user, uid, &p.host.groups).unwrap_or_else(|e| fail("groups", e));
+    give_stdio(uid).unwrap_or_else(|e| fail("stdio", e));
     // SAFETY: plain id-setting syscalls; `groups` outlives setgroups.
     unsafe {
         if libc::setgroups(groups.len() as _, groups.as_ptr()) != 0 || libc::setgid(gid) != 0 || libc::setuid(uid) != 0 {
@@ -1390,6 +1391,54 @@ fn home_of(uid: u32) -> Option<String> {
     })
 }
 
+/// As runc's `fixStdioPermissions`: `uid` owns its standard streams, so it
+/// can reopen them by path (`/proc/self/fd/2`, `/dev/stderr`), as php-fpm
+/// and nginx open their logs. The agent made them as root, and Linux checks
+/// a pipe's or terminal's owner on such an open.
+///
+/// Only this process's own streams can change hands: `stdio` makes new
+/// pipes for every start and every exec, a TTY is a pty the child opens in
+/// the container's own devpts instance, and stdin without `-i` is /dev/null.
+/// Even so, only a pipe or a terminal is given away, never /dev/null or
+/// anything else. The owner changes and the group stays, as in runc. This
+/// runs as root, before the user switch: only root may give a file away.
+fn give_stdio(uid: libc::uid_t) -> io::Result<()> {
+    for fd in 0..=2 {
+        if !needs_owner(fd, uid)? {
+            continue;
+        }
+        // SAFETY: fchown on one of the process's own descriptors; -1 keeps the group.
+        if unsafe { libc::fchown(fd, uid, libc::gid_t::MAX) } != 0 {
+            let e = io::Error::last_os_error();
+            // As runc, the start goes on without it only for the errors a
+            // mount or user namespace causes; anything else fails the start.
+            if !chown_refused(&e) {
+                return Err(e);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether `fd` is a pipe or a terminal that `uid` doesn't own.
+fn needs_owner(fd: RawFd, uid: libc::uid_t) -> io::Result<bool> {
+    // SAFETY: fstat into a zeroed struct, and isatty, on a descriptor number.
+    unsafe {
+        let mut st: libc::stat = std::mem::zeroed();
+        if libc::fstat(fd, &mut st) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let pipe = st.st_mode & libc::S_IFMT == libc::S_IFIFO;
+        Ok(st.st_uid != uid && (pipe || libc::isatty(fd) == 1))
+    }
+}
+
+/// The `fchown` errors runc lets a start through with: EINVAL (the group
+/// isn't mapped), EPERM (the owner isn't mapped), EROFS (read-only).
+fn chown_refused(e: &io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(libc::EINVAL | libc::EPERM | libc::EROFS))
+}
+
 fn resolve_user(user: &str) -> io::Result<(libc::uid_t, libc::gid_t)> {
     if user.is_empty() {
         return Ok((0, 0));
@@ -1449,6 +1498,37 @@ fn find_executable(p: &Prepared) -> Option<CString> {
 #[cfg(test)]
 mod tests {
     use kiri_proto::{Limits, Msg, Net, decode, encode_run, run_flags};
+
+    /// Only a pipe or a terminal the user doesn't own yet changes hands:
+    /// never /dev/null, a file or a socket, which a stream could otherwise be.
+    #[test]
+    fn only_pipes_and_terminals_are_given_to_the_user() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+        let me = std::fs::metadata("/proc/self").unwrap().uid();
+        let other = me + 1;
+        let (r, w) = super::sys::pipe().unwrap();
+        assert!(super::needs_owner(w.as_raw_fd(), other).unwrap(), "a pipe");
+        assert!(super::needs_owner(r.as_raw_fd(), other).unwrap(), "its read end");
+        assert!(!super::needs_owner(w.as_raw_fd(), me).unwrap(), "a pipe the user owns already");
+        let null = std::fs::File::open("/dev/null").unwrap();
+        assert!(!super::needs_owner(null.as_raw_fd(), other).unwrap(), "/dev/null");
+        let file = std::fs::File::open("/proc/self/status").unwrap();
+        assert!(!super::needs_owner(file.as_raw_fd(), other).unwrap(), "a file");
+        let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+        assert!(!super::needs_owner(a.as_raw_fd(), other).unwrap(), "a socket");
+        if let Ok(ptmx) = std::fs::OpenOptions::new().read(true).write(true).open("/dev/ptmx") {
+            assert!(super::needs_owner(ptmx.as_raw_fd(), other).unwrap(), "a terminal");
+        }
+        assert!(super::needs_owner(9999, other).is_err(), "a closed descriptor");
+    }
+
+    #[test]
+    fn only_namespace_and_mount_chown_errors_let_a_start_through() {
+        for (errno, refused) in [(libc::EPERM, true), (libc::EINVAL, true), (libc::EROFS, true), (libc::EBADF, false), (libc::EIO, false)] {
+            assert_eq!(super::chown_refused(&std::io::Error::from_raw_os_error(errno)), refused, "errno {errno}");
+        }
+    }
 
     /// A volume is filled from the image's directory as `apply_mount` reaches
     /// it: through `/proc/self/fd/N` of an O_PATH descriptor. The volume

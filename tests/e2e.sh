@@ -121,6 +121,12 @@ t pid1 "1" $D run --rm alpine sh -c 'echo $$'
 t proc "PID" $D run --rm alpine ps
 t dev-null "ok" $D run --rm alpine sh -c 'echo x > /dev/null && echo ok'
 t dev-null-nonroot "ok" $D run --rm -u 1000 alpine sh -c 'echo x > /dev/null && head -c 1 /dev/urandom >/dev/null && echo ok'
+# A non-root user can reopen its own stdio by path, as php-fpm and nginx
+# open their logs; the pipes are the user's, as runc makes them.
+t stdio-reopen-nonroot "in-ok" bash -c "echo in | $D run -i --rm -u 1000 alpine sh -c 'read x < /proc/self/fd/0 && : > /dev/stdout && : > /dev/stderr && : > /proc/self/fd/2 && echo \$x-ok'"
+t stdio-reopen-exec "ok" bash -c "$D run -d --name stdioexec alpine sleep 60 >/dev/null && $D exec -u 1000 stdioexec sh -c 'echo ok > /dev/stderr'; $D rm -f stdioexec >/dev/null"
+# Without -i, stdin is /dev/null, which stays root's and 0666.
+t stdio-dev-null-kept "0:0:666 0:0:666" $D run --rm -u 1000 alpine sh -c 'stat -L -c %u:%g:%a /proc/self/fd/0 /dev/null | tr "\n" " "'
 t dev-modes "crw-rw-rw-" $D run --rm alpine ls -l /dev/null
 t dev-urandom "16" $D run --rm alpine sh -c 'head -c 16 /dev/urandom | wc -c'
 t caps-dropped "Operation not permitted" $D run --rm alpine sh -c 'hostname newname 2>&1 || true; mount -t tmpfs t /mnt 2>&1'
