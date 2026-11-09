@@ -1182,7 +1182,7 @@ fn finish_child(p: &Prepared, io: &ChildStdio, console: bool) -> ! {
     let (uid, gid) = resolve_user(&p.user).unwrap_or_else(|e| fail("user", e));
     // The user's /etc/group memberships and --group-add, as Docker gives them.
     let groups = super::hostopts::supplementary_groups(&p.user, uid, &p.host.groups).unwrap_or_else(|e| fail("groups", e));
-    give_stdio(uid).unwrap_or_else(|e| fail("stdio", e));
+    give_stdio([0, 1, 2], uid).unwrap_or_else(|e| fail("stdio", e));
     // SAFETY: plain id-setting syscalls; `groups` outlives setgroups.
     unsafe {
         if libc::setgroups(groups.len() as _, groups.as_ptr()) != 0 || libc::setgid(gid) != 0 || libc::setuid(uid) != 0 {
@@ -1391,7 +1391,7 @@ fn home_of(uid: u32) -> Option<String> {
     })
 }
 
-/// As runc's `fixStdioPermissions`: `uid` owns its standard streams, so it
+/// As runc's `fixStdioPermissions`: `uid` owns its standard streams `fds`, so it
 /// can reopen them by path (`/proc/self/fd/2`, `/dev/stderr`), as php-fpm
 /// and nginx open their logs. The agent made them as root, and Linux checks
 /// a pipe's or terminal's owner on such an open.
@@ -1402,8 +1402,8 @@ fn home_of(uid: u32) -> Option<String> {
 /// Even so, only a pipe or a terminal is given away, never /dev/null or
 /// anything else. The owner changes and the group stays, as in runc. This
 /// runs as root, before the user switch: only root may give a file away.
-fn give_stdio(uid: libc::uid_t) -> io::Result<()> {
-    for fd in 0..=2 {
+fn give_stdio(fds: [RawFd; 3], uid: libc::uid_t) -> io::Result<()> {
+    for fd in fds {
         if !needs_owner(fd, uid)? {
             continue;
         }
@@ -1506,7 +1506,7 @@ mod tests {
         use std::os::fd::AsRawFd;
         use std::os::unix::fs::MetadataExt;
         let me = std::fs::metadata("/proc/self").unwrap().uid();
-        let other = me + 1;
+        let other = me.wrapping_add(1);
         let (r, w) = super::sys::pipe().unwrap();
         assert!(super::needs_owner(w.as_raw_fd(), other).unwrap(), "a pipe");
         assert!(super::needs_owner(r.as_raw_fd(), other).unwrap(), "its read end");
@@ -1521,6 +1521,27 @@ mod tests {
             assert!(super::needs_owner(ptmx.as_raw_fd(), other).unwrap(), "a terminal");
         }
         assert!(super::needs_owner(9999, other).is_err(), "a closed descriptor");
+    }
+
+    /// `give_stdio` through real `fchown` calls: run as root, a pipe changes
+    /// hands; run as anyone else, `fchown` gets EPERM and the start goes on,
+    /// as in runc. /dev/null never changes, and a descriptor it can't
+    /// inspect fails the start.
+    #[test]
+    fn give_stdio_gives_pipes_and_fails_only_on_unexpected_errors() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+        let owner = |fd: i32| std::fs::metadata(format!("/proc/self/fd/{fd}")).unwrap().uid();
+        // SAFETY: a plain getter.
+        let me = unsafe { libc::geteuid() };
+        let other = me.wrapping_add(1);
+        let (r, w) = super::sys::pipe().unwrap();
+        let null = std::fs::File::open("/dev/null").unwrap();
+        let null_owner = owner(null.as_raw_fd());
+        super::give_stdio([r.as_raw_fd(), w.as_raw_fd(), null.as_raw_fd()], other).unwrap();
+        let pipe_owner = if me == 0 { other } else { me };
+        assert_eq!((owner(r.as_raw_fd()), owner(w.as_raw_fd()), owner(null.as_raw_fd())), (pipe_owner, pipe_owner, null_owner));
+        assert!(super::give_stdio([9999, r.as_raw_fd(), w.as_raw_fd()], other).is_err(), "a closed descriptor");
     }
 
     #[test]
