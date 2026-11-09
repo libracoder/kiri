@@ -154,9 +154,14 @@ fn shell(name: &str, cmd: &[&str]) -> io::Result<()> {
     let (user, _, _) = user();
     let cwd = std::env::current_dir().ok().filter(|d| d.starts_with("/Users")).map_or_else(|| format!("/Users/{user}"), |d| d.display().to_string());
     let mut c = Command::new(docker);
+    // The engine the other machine commands use (client::socket(), so
+    // KIRI_SOCKET too), as `kiri exec` does, not a docker context: with
+    // `--context kiri`, a second Kiri's machines (or any, once that context
+    // was removed or pointed elsewhere) were "No such container".
+    c.env("DOCKER_HOST", format!("unix://{}", client::socket()?.display())).env_remove("DOCKER_CONTEXT");
     // SAFETY: isatty has no preconditions.
     let tty = unsafe { libc::isatty(0) } == 1;
-    c.args(["--context", crate::flavor::CONTEXT.get(), "exec", if tty { "-it" } else { "-i" }, "-u", &user, "-w", &cwd, "-e", &format!("HOME=/Users/{user}"), &container(name)]);
+    c.args(["exec", if tty { "-it" } else { "-i" }, "-u", &user, "-w", &cwd, "-e", &format!("HOME=/Users/{user}"), &container(name)]);
     if cmd.is_empty() {
         // bash when the distro has it, else its sh.
         c.args(["sh", "-c", "exec $(command -v bash || command -v sh) -l"]);
