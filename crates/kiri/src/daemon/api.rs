@@ -306,6 +306,30 @@ fn amd64_only_refusal(image: &str, platforms: &[String]) -> Option<String> {
     ))
 }
 
+/// The kernel containers run on, as `uname -r` prints it. On Linux (native
+/// and WSL 2) the engine runs straight on the host kernel, so that is read;
+/// on macOS it is Kiri's own guest kernel in the VM.
+fn kernel_version() -> String {
+    #[cfg(target_os = "linux")]
+    if let Some(release) = linux_kernel_release() {
+        return release;
+    }
+    GUEST_KERNEL.to_owned()
+}
+
+const GUEST_KERNEL: &str = "6.18-kiri";
+
+#[cfg(target_os = "linux")]
+fn linux_kernel_release() -> Option<String> {
+    parse_release(&std::fs::read_to_string("/proc/sys/kernel/osrelease").ok()?)
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_release(raw: &str) -> Option<String> {
+    let release = raw.trim();
+    (!release.is_empty()).then(|| release.to_owned())
+}
+
 fn version() -> Value {
     let v = env!("CARGO_PKG_VERSION");
     json!({
@@ -316,7 +340,7 @@ fn version() -> Value {
         "MinAPIVersion": "1.24",
         "Os": "linux",
         "Arch": go_arch(),
-        "KernelVersion": "6.18-kiri",
+        "KernelVersion": kernel_version(),
         "GitCommit": "",
         "GoVersion": "n/a (Rust)",
     })
@@ -340,7 +364,7 @@ fn info(engine: &Engine) -> Value {
         "OperatingSystem": "Kiri",
         "OSType": "linux",
         "Architecture": std::env::consts::ARCH,
-        "KernelVersion": "6.18-kiri",
+        "KernelVersion": kernel_version(),
         "NCPU": engine.cpus(),
         "MemTotal": mem_total,
         "DockerRootDir": "/var/lib/kiri",
@@ -2471,6 +2495,25 @@ pub(super) fn parse_signal(raw: &str) -> Result<u32, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kernel_release_is_trimmed_and_empty_is_none() {
+        assert_eq!(parse_release("7.0.0-38-generic\n").as_deref(), Some("7.0.0-38-generic"));
+        assert_eq!(parse_release(" \n"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_reports_the_host_kernel() {
+        let host = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap();
+        assert_eq!(version()["KernelVersion"], host.trim());
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn vm_platforms_report_the_guest_kernel() {
+        assert_eq!(version()["KernelVersion"], GUEST_KERNEL);
+    }
 
     #[test]
     fn copy_in_archives_go_as_chunks_with_an_empty_one_last() {
