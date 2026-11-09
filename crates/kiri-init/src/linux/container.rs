@@ -1215,6 +1215,18 @@ fn finish_child(p: &Prepared, io: &ChildStdio, console: bool) -> ! {
     if console && p.init {
         super::pid1::run(&exe, argv.as_ptr(), envp.as_ptr(), p.tty);
     }
+    // The program starts as Docker would start it: nothing blocked and
+    // SIGPIPE at its default. The agent blocks SIGCHLD for its signalfd and
+    // Rust ignores SIGPIPE, and both survive exec: with SIGCHLD blocked, a
+    // shell's `cmd & wait` never wakes once cmd has already exited, and
+    // with SIGPIPE ignored, `yes | head -1` never ends.
+    // SAFETY: signal calls on a local set in the single-threaded child.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+        let mut none: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut none);
+        libc::sigprocmask(libc::SIG_SETMASK, &none, std::ptr::null_mut());
+    }
     // SAFETY: NULL-terminated arrays of valid C strings that outlive the call.
     unsafe { libc::execve(exe.as_ptr(), argv.as_ptr(), envp.as_ptr()) };
     fail("exec", io::Error::last_os_error())

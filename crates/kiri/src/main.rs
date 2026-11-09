@@ -57,6 +57,8 @@ mod scan;
 #[cfg(target_os = "macos")]
 mod setup;
 #[cfg(unix)]
+mod usb;
+#[cfg(unix)]
 mod stale;
 #[cfg(windows)]
 mod wsl;
@@ -84,6 +86,7 @@ usage: kiri COMMAND          docker's commands, on Kiri: kiri run, ps, exec,
        kiri PORT [NAME]           share a local port on the internet (same as kiri share PORT)
        kiri share PORT|CONTAINER [--name N] | share login | logout | status
        kiri k8s start [--use] | stop | status | delete | set [--lan on|off] [--tls-san NAME,…] [--port N]
+       kiri usb [list] | attach DEVICE | detach DEVICE   USB devices for containers, beta (Mac: pass through to the VM)
        kiri machine create NAME [--distro D] | list | shell NAME | stop | delete NAME
        kiri import [orbstack | desktop-linux] [--list]
        kiri bench [--runs N] [--image IMAGE] [--network none|bridge]
@@ -145,6 +148,8 @@ fn main() -> ExitCode {
         Some("k8s") => k8s::run(&args[1..]),
         #[cfg(unix)]
         Some("machine") => machine::run(&args[1..]),
+        #[cfg(unix)]
+        Some("usb") => usb::run(&args[1..]),
         #[cfg(target_os = "macos")]
         Some("import") => import::run(&args[1..]),
         #[cfg(target_os = "macos")]

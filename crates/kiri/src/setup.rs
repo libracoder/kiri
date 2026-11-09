@@ -424,7 +424,7 @@ pub fn remove_domains() -> io::Result<()> {
 /// script runs in this process, not through `osascript`, so the prompt says
 /// "Kiri wants to make changes". AppleScript belongs on the main thread: the
 /// window's workers hand it there, and the CLI is already on it.
-fn as_admin(command: &str, why: &str) -> io::Result<()> {
+pub(crate) fn as_admin(command: &str, why: &str) -> io::Result<()> {
     let script = format!("do shell script \"{}\" with prompt \"{}\" with administrator privileges", command.replace('"', "\\\""), why.replace('"', "\\\""));
     // SAFETY: pthread_main_np only reads the calling thread's state.
     if unsafe { libc::pthread_main_np() } == 1 {
@@ -835,6 +835,10 @@ fn uninstall() -> io::Result<()> {
     let _ = std::fs::remove_file(bin_dir()?.join("kiri"));
     // The cluster's kubectl context (`kiri k8s`); the cluster stays in Kiri's data.
     crate::k8s::forget();
+    // Every flavor has a helper of its own.
+    if let Err(e) = crate::usb::helper::remove() {
+        println!("could not remove the USB helper ({e})");
+    }
     if dev() {
         println!("{0}'s data stays in ~/Library/Application Support/{0}; delete it to remove images and volumes too", crate::flavor::APP);
         return Ok(());

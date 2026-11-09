@@ -80,6 +80,8 @@ pub fn serve(mut conn: File, paths: &Paths) -> io::Result<()> {
         super::relay::listen_engine().inspect_err(|e| eprintln!("kiri-init: no engine socket for containers: {e}")).ok()
     };
     let copies = super::copy::listen()?;
+    // USB passthrough (VM only: on a Linux host containers see the host's devices).
+    let usb = if host_process { None } else { super::usb::listen().inspect_err(|e| eprintln!("kiri-init: no USB passthrough: {e}")).ok() };
     let udp = super::relay::listen_udp()?;
     let pressure = memory_pressure_trigger();
     let mut last_pressure = std::time::Instant::now() - std::time::Duration::from_secs(1);
@@ -106,6 +108,7 @@ pub fn serve(mut conn: File, paths: &Paths) -> io::Result<()> {
         fds.push(libc::pollfd { fd: ssh_agent.as_raw_fd(), events: libc::POLLIN, revents: 0 });
         fds.push(libc::pollfd { fd: engine_api.as_ref().map_or(-1, |l| l.as_raw_fd()), events: libc::POLLIN, revents: 0 });
         fds.push(libc::pollfd { fd: copies.as_raw_fd(), events: libc::POLLIN, revents: 0 });
+        fds.push(libc::pollfd { fd: usb.as_ref().map_or(-1, |l| l.as_raw_fd()), events: libc::POLLIN, revents: 0 });
         fds.push(libc::pollfd { fd: udp.as_raw_fd(), events: libc::POLLIN, revents: 0 });
         fds.push(libc::pollfd { fd: pressure.as_ref().map_or(-1, |f| f.as_raw_fd()), events: libc::POLLPRI, revents: 0 });
         fds.push(libc::pollfd { fd: term.as_ref().map_or(-1, |f| f.as_raw_fd()), events: libc::POLLIN, revents: 0 });
@@ -200,6 +203,10 @@ pub fn serve(mut conn: File, paths: &Paths) -> io::Result<()> {
                 while let Some(r) = super::relay::accept_udp(&udp) {
                     relays.push(r);
                 }
+                continue;
+            }
+            if let Some(l) = usb.as_ref().filter(|l| pfd.fd == l.as_raw_fd()) {
+                super::usb::accept(l);
                 continue;
             }
             if pfd.fd == copies.as_raw_fd() {

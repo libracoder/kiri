@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 /// The commands passed to the engine in WSL.
-pub const COMMANDS: &[&str] = &["k8s", "machine", "diag"];
+pub const COMMANDS: &[&str] = &["k8s", "machine", "diag", "usb"];
 
 /// In Kiri Linux, kiri-start wakes the engine if it isn't up; in a distro
 /// of the user's own, systemd or wsl.conf runs it.

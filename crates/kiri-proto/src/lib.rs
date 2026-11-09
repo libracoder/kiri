@@ -172,6 +172,10 @@ pub const COPY_PORT: u32 = 1028;
 /// TCP frames it, and gets `u16 len | reply` back: one lookup per connection.
 pub const DNS_RELAY_PORT: u32 = 1037;
 
+/// vsock port of the guest's USB passthrough: one connection per device,
+/// `speed u32 | devid u32` then USB/IP (crates/kiri-init/src/linux/usb.rs).
+pub const USB_PORT: u32 = 1040;
+
 pub mod copy_op {
     pub const IN: u8 = 1;
     pub const OUT: u8 = 2;

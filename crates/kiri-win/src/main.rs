@@ -31,6 +31,9 @@ mod pipe;
 mod serve;
 #[cfg(windows)]
 mod win;
+// The window's USB view, through usbipd-win.
+#[cfg(windows)]
+mod usb;
 #[cfg(windows)]
 mod setup;
 // The built-in terminal's shells, on ConPTY.

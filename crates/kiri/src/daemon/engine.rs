@@ -869,7 +869,7 @@ impl Engine {
             let (busy, parked) = {
                 let st = engine.lock();
                 let parked: Vec<String> = st.containers.values().filter(|c| c.status == Status::Running && c.paused && is_builder(c)).map(|c| c.id.clone()).collect();
-                let busy = st.containers.values().any(|c| c.status == Status::Running && !(c.paused && is_builder(c))) || st.execs.values().any(|e| e.running);
+                let busy = st.containers.values().any(|c| c.status == Status::Running && !(c.paused && is_builder(c))) || st.execs.values().any(|e| e.running) || usb_attached();
                 (busy, parked)
             };
             let quiet = quiet_for >= idle;
@@ -893,8 +893,13 @@ impl Engine {
     fn sleep_if_idle(&self) -> bool {
         let mut link = self.link.lock().unwrap_or_else(|e| e.into_inner());
         // Check under the lock: a request may have woken it.
-        let idle = !self.lock().containers.values().any(|c| c.status == Status::Running);
-        let Some(vm) = link.take().filter(|_| idle) else { return false };
+        let idle = !self.lock().containers.values().any(|c| c.status == Status::Running) && !usb_attached();
+        // Not `link.take().filter(..)`: that takes the VM first and drops it
+        // when busy, which powers it off under whatever just started.
+        if !idle {
+            return false;
+        }
+        let Some(vm) = link.take() else { return false };
         self.sleeping.store(true, std::sync::atomic::Ordering::SeqCst);
         self.memory_used.store(0, std::sync::atomic::Ordering::Relaxed);
         self.memory_stall.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -943,6 +948,8 @@ impl Engine {
         for id in running {
             self.stop(&id, self.stop_timeout(&id))?;
         }
+        // Passed-through USB devices go back to the Mac, as containers stop.
+        detach_usb();
         if self.sleep_if_idle() {
             crate::diag::info!("VM stopped on request");
         }
@@ -3303,3 +3310,22 @@ mod net_opts_tests {
         assert!(super::net_opts(&old, None, "").is_empty());
     }
 }
+
+/// A passed-through USB device keeps the VM awake: sleeping would unplug it.
+#[cfg(target_os = "macos")]
+fn usb_attached() -> bool {
+    super::usb::any_attached()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn usb_attached() -> bool {
+    false
+}
+
+#[cfg(target_os = "macos")]
+fn detach_usb() {
+    super::usb::detach_all();
+}
+
+#[cfg(not(target_os = "macos"))]
+fn detach_usb() {}

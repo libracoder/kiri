@@ -26,6 +26,8 @@ mod ops;
 pub(crate) mod ports;
 mod pulls;
 pub mod time;
+#[cfg(target_os = "macos")]
+mod usb;
 mod vmcpu;
 mod vmlink;
 mod volumes;

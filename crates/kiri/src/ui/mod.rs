@@ -1454,6 +1454,25 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
             });
             Ok(())
         }
+        // The USB view: the computer's devices, and which are in Kiri.
+        "usb" => {
+            std::thread::spawn(|| emit(crate::usb::ui_list().to_string()));
+            Ok(())
+        }
+        // Attach asks for the password the first time (the USB helper).
+        "usbattach" | "usbdetach" => {
+            let (attach, key) = (msg.cmd == "usbattach", msg.name);
+            std::thread::spawn(move || {
+                let r = if attach { crate::usb::ui_attach(&key) } else { crate::usb::ui_detach(&key) };
+                match r {
+                    Ok(text) => emit(serde_json::json!({"type": "usbdone", "key": key, "text": text}).to_string()),
+                    Err(e) if e.to_string().contains("canceled") || e.to_string().contains("cancelled") => emit(serde_json::json!({"type": "usbdone", "key": key}).to_string()),
+                    Err(e) => emit(serde_json::json!({"type": "usbdone", "key": key, "error": e.to_string()}).to_string()),
+                }
+                emit(crate::usb::ui_list().to_string());
+            });
+            Ok(())
+        }
         // The Builds view: BuildKit's history, read only while the view is open.
         "builds" => {
             std::thread::spawn(|| {

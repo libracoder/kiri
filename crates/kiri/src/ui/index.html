@@ -126,7 +126,18 @@ body.rail aside { padding-left: 10px; padding-right: 10px; }
 body.rail .navlabel { height: 0; padding: 0; margin: 9px 6px; overflow: hidden; border-top: 1px solid var(--line); }
 body.rail .navlabel > * { display: none; }
 body.rail nav button { justify-content: center; padding: 0; }
-body.rail nav .lbl, body.rail nav .count { display: none; }
+body.rail nav .lbl, body.rail nav .count, body.rail nav .beta { display: none; }
+/* A feature still new: a quiet outline tag beside its name. */
+.beta { display: inline-block; margin-left: 6px; padding: 0 5px; border: 1px solid var(--line); border-radius: 4px; color: var(--muted); font-size: var(--fs-small); font-weight: 600; line-height: 1.5; vertical-align: 2px; letter-spacing: .02em; }
+h2 .beta { vertical-align: 3px; }
+.usb-beta { display: flex; align-items: flex-start; gap: 10px; margin: 0 0 14px; padding: 9px 12px; border: 1px solid color-mix(in srgb, var(--blue) 35%, var(--line)); border-radius: 8px; background: color-mix(in srgb, var(--blue) 9%, var(--panel)); color: var(--muted); }
+.usb-beta > svg { width: 16px; height: 16px; flex: none; margin-top: 1px; fill: var(--blue-light); }
+.usb-beta > span { flex: 1; }
+.usb-beta b { color: var(--text); font-weight: 600; }
+.usb-beta .link { display: block; padding: 0; border: 0; background: none; color: var(--blue-light); font: inherit; cursor: pointer; }
+.usb-beta .link:hover { text-decoration: underline; }
+.usb-beta .x { border: 0; background: none; color: var(--faint); font-size: var(--fs-head); line-height: 1; cursor: pointer; padding: 2px 4px; }
+.usb-beta .x:hover { color: var(--text); }
 /* Share's live-links badge rides on the icon's corner. */
 body.rail nav button { position: relative; }
 body.rail nav .sh-globes { position: absolute; top: 1px; right: 1px; transform: scale(.7); transform-origin: top right; }
@@ -2020,6 +2031,7 @@ main { position: relative; }
 .statusbar .httoggle kbd { font: 500 var(--fs-small) var(--ui-font); color: var(--faint); }
 .statusbar .httoggle.on { color: var(--text); }
 #strip-term svg { fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; width: 17px; height: 17px; }
+.usb-note { margin: 14px 16px; font-size: var(--fs-small); max-width: 70ch; }
 </style>
 <style>/*XTERM_CSS*/</style>
 </head>
@@ -2054,6 +2066,7 @@ main { position: relative; }
   </nav>
   <div class="navlabel">Kiri</div>
   <nav>
+    <button data-view="usb"><svg class="i" viewBox="0 0 256 256" data-ph="usb"></svg><span class="lbl">USB</span><span class="beta" title="USB passthrough is new: tell us how it works with your devices">Beta</span><span class="count" id="n-usb"></span></button>
     <button data-view="share" class="shareonly"><svg class="i" viewBox="0 0 256 256" data-ph="globe"></svg><span class="lbl">Share</span></button>
     <button data-view="settings"><svg class="i" viewBox="0 0 256 256" data-ph="gear"></svg><span class="lbl">Settings</span></button>
   </nav>
@@ -3417,6 +3430,7 @@ function show(view) {
   needClose();
   ui.view = view; ui.filter = ""; $("gq").value = "";
   if (view === "builds") send("builds");
+  if (view === "usb") usbPoll();
   if (view === "share") { send("shares"); send("shareusage"); shPoll(); }
   if (view === "settings") { if (!fontLists.families.length) send("fonts"); send("about"); send("logins"); send("resources"); send("proxy"); if (!ui.imp.sources) send("importsources"); if (prefs.tab === "diagnostics") diagOpen(); }
   render();
@@ -4096,6 +4110,104 @@ function renderVolumes() {
     <td class="actions"><div class="acts-row">${ibtn("trash", "Remove", `data-rmvol="${esc(v.Name)}"`, "danger")}</div></td></tr>`), "volumes");
 }
 
+/* USB: the computer's USB devices, and which are in Kiri. On a Mac a device is
+   passed through to the VM (Attach; the first one asks for the password, to
+   install Kiri's USB helper); on Windows, WSL takes it through usbipd-win (one
+   Windows prompt per device, the first time); on Linux containers already see
+   every device, so each row says where to find it. */
+ui.usb = { items: null, busy: new Map(), note: "", can: "", error: "", missing: false, timer: 0 };
+const USB_STATE = { kiri: ["In Kiri", "running"], host: [WIN ? "On this PC" : "On this Mac", ""], shared: ["Containers see it", "running"] };
+/* Each device's icon: its kind as the engine read it from the device's
+   interfaces, or, where it can't (Windows), from its name and vendor. A
+   kind once known stays with the device: one in Kiri hides its interfaces. */
+const USB_ICON = { mouse: "mouse", keyboard: "keyboard", network: "ethernet", serial: "circuitry", radio: "broadcast", storage: "harddrive", audio: "microphone", camera: "webcam" };
+const usbKinds = new Map();
+function usbKind(d) {
+  if (d.kind) { usbKinds.set(d.key, d.kind); return d.kind; }
+  if (usbKinds.has(d.key)) return usbKinds.get(d.key);
+  const n = (d.name || "").toLowerCase(), has = (...w) => w.some((x) => n.includes(x));
+  if (has("zigbee", "z-wave", "zwave", "conbee", "skyconnect", "sonoff", "lora")) return "radio";
+  if (has("mouse")) return "mouse";
+  if (has("keyboard")) return "keyboard";
+  if (has("ethernet", " lan", "lan ", "network adapter", "gbe")) return "network";
+  if (has("webcam", "camera")) return "camera";
+  if (has("microphone", "audio", "headset", "speaker")) return "audio";
+  if (has("storage", "disk", "flash", "card reader")) return "storage";
+  if (/^(10c4|1a86|0403|067b):/.test(d.id || "") || has("uart", "serial", "com", "arduino", "esp32")) return "serial";
+  return "";
+}
+function usbPoll() {
+  clearTimeout(ui.usb.timer);
+  if (ui.view !== "usb") return;
+  send("usb");
+  // Plugged in or out while the view is open: it follows within a few seconds.
+  ui.usb.timer = setTimeout(usbPoll, 3000);
+}
+function usbList(e) {
+  Object.assign(ui.usb, { items: e.devices || [], note: e.note || "", can: e.can || "", error: e.error || "", missing: !!e.missing });
+  const n = ui.usb.items.filter((d) => d.state === "kiri").length;
+  setText($("n-usb"), n ? String(n) : "");
+  if (ui.view === "usb") render();
+}
+function usbDone(e) {
+  ui.usb.busy.delete(e.key);
+  if (e.error) toast("error", e.error); else if (e.text) toast("ok", e.text);
+  if (ui.view === "usb") render();
+}
+function usbAct(act, key) {
+  if (act === "install") { ui.usb.busy.set("install", "Installing…"); send("usbinstall"); render(); return; }
+  ui.usb.busy.set(key, act === "attach" ? "Attaching…" : "Detaching…");
+  send(act === "attach" ? "usbattach" : "usbdetach", { name: key });
+  render();
+}
+function usbSubtitle() {
+  const xs = ui.usb.items || [], n = xs.filter((d) => d.state === "kiri").length;
+  return xs.length ? `${n ? `${n} in Kiri · ` : ""}${xs.length} ${xs.length === 1 ? "device" : "devices"}` : "";
+}
+/* While USB is in beta: what works, and where to say how it went. Closed, it stays closed. */
+const usbBanner = () => prefs.usbBetaClosed ? "" : `<div class="usb-beta" role="note"><svg class="i" viewBox="0 0 256 256" aria-hidden="true"><path d="${PH.usb}"/></svg>
+  <span><b>USB passthrough is in beta.</b> It works with serial adapters, Zigbee sticks, mice and keyboards; webcams and audio aren't supported yet.
+  <button class="link" data-open-site="${FEEDBACK_URL}?title=${encodeURIComponent("USB: ")}">Tell us how it goes</button></span>
+  <button class="x" data-usbbeta title="Close" aria-label="Close">×</button></div>`;
+function renderUsb() {
+  renderUsbBody();
+  const b = usbBanner();
+  if (b) $("content").insertAdjacentHTML("afterbegin", b);
+}
+function renderUsbBody() {
+  const u = ui.usb, c = $("content");
+  const art = (h, p, extra = "") => `<div class="empty"><div><svg class="i art" viewBox="0 0 256 256"><path d="${PH.usb}"/></svg><h3>${h}</h3><p>${p}</p>${extra}</div></div>`;
+  if (u.items === null) { c.innerHTML = art("Looking for USB devices…", ""); return; }
+  if (u.missing) {
+    const busy = u.busy.get("install");
+    c.innerHTML = art("USB needs usbipd-win", "Windows hands USB devices to WSL, where Kiri's containers run, through usbipd-win, Microsoft's recommended tool.",
+      `<button class="btn primary" data-usbgo="install"${busy ? " disabled" : ""}>${busy || "Install usbipd-win"}</button>`);
+    return;
+  }
+  if (u.error && !u.items.length) { c.innerHTML = art("Couldn't read the USB devices", esc(u.error)); return; }
+  if (!u.items.length) { c.innerHTML = art("No USB devices", "Plug one in: a serial adapter, a Zigbee stick, a microcontroller. It shows up here."); return; }
+  const q = ui.filter.toLowerCase();
+  const items = u.items.filter((d) => !q || `${d.name} ${d.id} ${d.path}`.toLowerCase().includes(q));
+  if (!items.length) return noMatch();
+  const act = (d) => {
+    const busy = u.busy.get(d.key);
+    if (busy) return `<button class="btn sm" disabled>${busy}</button>`;
+    if (u.can !== "attach") return d.path ? copyBtn(`--device ${d.path}`, "docker flag") : "";
+    return d.state === "kiri" ? `<button class="btn sm" data-usbgo="detach" data-key="${esc(d.key)}" title="Give it back to this computer"><svg class="i" viewBox="0 0 256 256" aria-hidden="true"><path d="${PH.eject}"/></svg>Detach</button>`
+      : `<button class="btn sm primary" data-usbgo="attach" data-key="${esc(d.key)}" title="Hand it to Kiri's containers"><svg class="i" viewBox="0 0 256 256" aria-hidden="true"><path d="${PH.plug}"/></svg>Attach</button>`;
+  };
+  table([["Device"], ["ID"], ["Speed"], ["State"]], items.map((d) => {
+    const [word, cls] = USB_STATE[d.state] || [d.state, ""];
+    return `<tr class="row" data-key="${esc(d.key)}">
+    <td><div class="name">${tile(null, USB_ICON[usbKind(d)] || "usb")}<div><div>${esc(d.name)}</div>${d.path ? `<div class="mono muted sub">--device ${esc(d.path)}</div>` : ""}</div></div></td>
+    <td class="mono muted">${esc(d.id || "—")}</td>
+    <td class="muted">${esc(d.speed ? d.speed[0].toUpperCase() + d.speed.slice(1) : "—")}</td>
+    <td><span class="pill ${cls}">${word}</span></td>
+    <td class="actions"><div class="acts-row">${act(d)}</div></td></tr>`;
+  }), "usb");
+  if (u.note) c.insertAdjacentHTML("beforeend", `<p class="usb-note muted">${esc(u.note)}</p>`);
+}
+
 function renderNetworks() {
   const items = listed("networks");
   if (!kept("networks").length) return renderEmpty("networks");
@@ -4711,12 +4823,14 @@ function render() {
   navNote();
   const v = ui.view;
   document.querySelectorAll("nav button").forEach((b) => (b.dataset.view === v ? b.setAttribute("aria-current", "page") : b.removeAttribute("aria-current")));
-  $("title").textContent = v[0].toUpperCase() + v.slice(1);
+  if (v === "usb") setHTML($("title"), 'USB<span class="beta" title="USB passthrough is new: tell us how it works with your devices">Beta</span>');
+  else $("title").textContent = v[0].toUpperCase() + v.slice(1);
   const running = ui.containers.filter((c) => c.State === "running").length;
   const total = kept("images").reduce((a, i) => a + (i.Size || 0), 0);
   // A list's counts are its tabs; beside them, what they don't say (the images' size).
   $("subtitle").textContent = listPage(v) ? (v === "images" && total ? size(total) : "")
     : v === "builds" ? (ui.bl.items?.length ? `${ui.bl.items.length} total` : "")
+    : v === "usb" ? usbSubtitle()
     : v === "images" && ui.images.length ? `${ui.images.length} · ${size(total)}`
     : v === "containers" && ui.containers.length ? `${running} running · ${ui.containers.length}` : "";
   batchTick();
@@ -4733,6 +4847,8 @@ function render() {
   if (v !== "share") { $("sh-pane")?.remove(); $("content").hidden = false; }
   if (v === "settings") return renderSettings();
   if (v === "share") return renderShare();
+  // The devices are the computer's: listed whether the engine runs or not.
+  if (v === "usb") return renderUsb();
   if (ui.vm === "stopped") return renderEmpty("stopped");
   if (v === "containers" && ui.detail) {
     // The list refreshes while you edit the environment: keep your place.
@@ -5845,6 +5961,8 @@ window.kiri = {
         if (ui.openAfter && ui.containers.some((c) => c.Id === ui.openAfter)) { openDetail(ui.openAfter); ui.openAfter = null; openedTab(); }
         break;
       case "pull": pullEvent(e); break;
+      case "usb": usbList(e); break;
+      case "usbdone": usbDone(e); break;
       case "buildpruned": ui.bwPruning = false; toast(e.error ? "error" : "ok", e.error ? `Couldn't clear the build cache: ${e.error}` : `Build cache cleared${e.freed ? `: freed ${size(e.freed)}` : ""}`); if (ui.view === "settings") render(); break;
       case "hub":
         (e.kind === "search" ? pp.search : pp.tags).set(e.key, e.error ? { error: e.error } : { items: e.items || [] });
@@ -6018,6 +6136,8 @@ $("content").addEventListener("click", (ev) => {
   else if ((el = t("[data-run]"))) ui.need?.image === el.dataset.run ? needClose() : runImage(el.dataset.run);
   else if ((el = t("[data-c]"))) containerAction(el.dataset.c, el.dataset.id);
   else if ((el = t("[data-rmvol]"))) { const v = el.dataset.rmvol; confirmRemove(`Remove volume ${esc(v)}?`, "Its data is deleted for good.", "Remove", () => send("rmvol", { name: v })); }
+  else if ((el = t("[data-usbgo]"))) usbAct(el.dataset.usbgo, el.dataset.key);
+  else if (t("[data-usbbeta]")) setPref("usbBetaClosed", true);
   else if ((el = t("[data-rmnet]"))) { const id = el.dataset.rmnet, n = ui.networks.find((x) => x.Id === id); confirmRemove(`Remove network ${esc(n?.Name || short(id))}?`, "", "Remove", () => send("rmnet", { id })); }
   else if ((el = t("[data-listenpub]"))) publishListening(el.dataset.listenpub);
   else if ((el = t("[data-open]"))) send("open", { name: el.dataset.open });

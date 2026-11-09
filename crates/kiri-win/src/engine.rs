@@ -1032,6 +1032,11 @@ pub fn on_message(msg: &str) {
         "resources" => crate::wslconfig::resources(None),
         "setresources" => crate::wslconfig::resources(Some(c.value)),
         "domains" => domains(c.value.as_bool().unwrap_or(false)),
+        // The USB view: usbipd-win's devices, and which are in WSL.
+        "usb" => {
+            std::thread::spawn(|| emit(crate::usb::list().to_string()));
+        }
+        "usbattach" | "usbdetach" | "usbinstall" => crate::usb::handle(if c.cmd == "usbattach" { "usbattach" } else if c.cmd == "usbdetach" { "usbdetach" } else { "usbinstall" }, c.name),
         // The Builds view: BuildKit's history, read only while the view is open.
         "builds" => {
             std::thread::spawn(|| emit(builds_event()));

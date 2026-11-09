@@ -107,6 +107,15 @@ fn route(req: &Request, engine: &Arc<Engine>, w: &mut UnixStream, r: &mut BufRea
         ("POST", "/kiri/proxy") => return reply(w, set_proxy(req), 200),
         ("PUT", "/kiri/proxy/system") => return reply(w, set_host_proxy(req), 200),
         ("GET", "/kiri/resources") => return reply(w, Ok(resources(engine)), 200),
+        // USB passthrough (macOS: the root helper `kiri usb serve` connects here).
+        #[cfg(target_os = "macos")]
+        ("POST", "/kiri/usb") => return super::usb::attach(req, engine, w, r),
+        #[cfg(target_os = "macos")]
+        ("GET", "/kiri/usb") => return reply(w, Ok(super::usb::list()), 200),
+        #[cfg(target_os = "macos")]
+        ("DELETE", p) if p.strip_prefix("/kiri/usb/").is_some_and(|l| !l.is_empty()) => {
+            return reply(w, super::usb::detach(p.strip_prefix("/kiri/usb/").unwrap_or_default()), 200);
+        }
         ("POST", "/kiri/resources") => return reply(w, set_resources(req).map(|()| resources(engine)), 200),
         ("POST", p) if p.strip_prefix("/kiri/containers/").and_then(|r| r.strip_suffix("/ports")).is_some_and(|id| !id.is_empty()) => {
             let id = p.strip_prefix("/kiri/containers/").and_then(|r| r.strip_suffix("/ports")).unwrap_or_default();
