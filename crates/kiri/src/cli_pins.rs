@@ -8,6 +8,16 @@ pub const DOCKER_CLI: (&str, &str) = ("29.9.2", "ea8a2ce5ac31f9f5f3fb711a7a485e1
 pub const COMPOSE: (&str, &str) = ("v5.6.1", "fcce41226abd2b7b2936094e688bbd61284673dddafea542e08cb9a3b4423a8b");
 pub const BUILDX: (&str, &str) = ("v0.38.1", "6f20ba2437865311ef99015bf5d1039c3c8e4d2177c1c64aa41b134b5ecd3012");
 
+/// qemu-user for the Intel guest: its VM is x86-64 and Rosetta for Linux is
+/// Apple silicon only, so arm64 images run through this static qemu-aarch64,
+/// shared into the guest over virtiofs. A release asset of
+/// multiarch/qemu-user-static, bundled in the Intel Kiri.app by `xtask qemu`.
+pub const QEMU_AARCH64: (&str, &str) = ("v7.2.0-1", "dce64b2dc6b005485c7aa735a7ea39cb0006bf7e5badc28b324b2cd0c73d883f");
+
+pub fn qemu_aarch64_url(v: &str) -> String {
+    format!("https://github.com/multiarch/qemu-user-static/releases/download/{v}/qemu-aarch64-static")
+}
+
 /// Grype, Anchore's image scanner (Builds → Security): the Apple Silicon
 /// tarball from GitHub, `grype` inside. Downloaded on the first scan.
 pub const GRYPE: (&str, &str) = ("0.120.1", "cf97957fa467d25575ec2cc3228289f391ea51cf88b9cffc5f83dc03d4cbc732");
