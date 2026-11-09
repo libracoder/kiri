@@ -19,6 +19,13 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 # Roots for `kiri share`'s connection to the edge.
 webpki-roots = "1"
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem", "crypto"] }
+# The built-in builder (daemon/grpc.rs): buildx's docker driver speaks gRPC,
+# which is HTTP/2. `tokio` runs only these sessions; the engine stays
+# thread-based, as it must stay tiny and without a full runtime.
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "io-util", "time", "sync"] }
+h2 = "0.4"
+http = "1"
+bytes = "1"
 
 [target.'cfg(any(unix, windows))'.dependencies]
 libc = "0.2"

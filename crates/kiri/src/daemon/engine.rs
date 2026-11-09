@@ -2022,6 +2022,27 @@ impl Engine {
         Ok(stream)
     }
 
+    /// A new stream into the guest's BuildKit relay (daemon/grpc.rs), which
+    /// the agent keeps pointing at buildkitd. Boots the VM if it is asleep.
+    pub fn buildkit_connect(&self) -> Result<kiri_vmm::VsockStream, Error> {
+        Ok(self.vm()?.connect(kiri_proto::BUILDKIT_PORT)?)
+    }
+
+    /// Tells the guest buildkitd (its builder root process) must be running
+    /// and has today's config. Boots the VM if it is asleep.
+    pub fn buildkit_start(&self, layers: &[String], config: &str) -> Result<(), Error> {
+        Ok(self.vm()?.buildkit_start(layers, config)?)
+    }
+
+    /// Tells the guest buildkitd is not needed any more: its sessions are
+    /// idle. Answers `Ok` even if the VM is asleep (it stopped with it).
+    pub fn buildkit_stop(&self) -> io::Result<()> {
+        match self.awake() {
+            Some(vm) => vm.buildkit_stop(),
+            None => Ok(()),
+        }
+    }
+
     /// Running containers' domains, for the router's "not found" page.
     pub fn domains(&self) -> Vec<String> {
         let suffix = if super::dns::installed() { "kiri.local" } else { "kiri.localhost" };

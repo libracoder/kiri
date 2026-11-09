@@ -435,6 +435,19 @@ impl VmLink {
         self.send(|o| Msg::Kill { id, signal }.encode(o))
     }
 
+    /// Tells the guest to have buildkitd (its builder root process) running:
+    /// spawn it if it is not, then hand it today's config. Answered by `Ack`
+    /// once the process is alive (or `Error`, as when the image's layers are
+    /// gone).
+    pub fn buildkit_start(&self, layers: &[String], config: &str) -> io::Result<()> {
+        self.ack(|o| kiri_proto::encode_buildkit_start(o, layers, config))
+    }
+
+    /// Tells the guest to stop buildkitd: its session has been idle.
+    pub fn buildkit_stop(&self) -> io::Result<()> {
+        self.ack(|o| Msg::BuildkitStop.encode(o))
+    }
+
     pub fn remove(&self, id: &str) -> io::Result<()> {
         self.send(|o| Msg::Remove { id }.encode(o))
     }

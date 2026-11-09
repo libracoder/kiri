@@ -81,6 +81,11 @@ pub fn serve(mut conn: File, paths: &Paths) -> io::Result<()> {
     };
     let copies = super::copy::listen()?;
     let udp = super::relay::listen_udp()?;
+    // BuildKit: the daemon's sessions to its builder root process (buildkit.rs).
+    // Kept even if listening fails (an older guest image): builds then fail
+    // with a clear message instead of the whole agent.
+    let buildkit_listener = super::relay::listen_buildkit().inspect_err(|e| eprintln!("kiri-init: no buildkit listener: {e}")).ok();
+    let mut buildkit = super::buildkit::Buildkit::default();
     let pressure = memory_pressure_trigger();
     let mut last_pressure = std::time::Instant::now() - std::time::Duration::from_secs(1);
     let mut relays: Vec<super::relay::Relay> = Vec::new();
@@ -107,6 +112,7 @@ pub fn serve(mut conn: File, paths: &Paths) -> io::Result<()> {
         fds.push(libc::pollfd { fd: engine_api.as_ref().map_or(-1, |l| l.as_raw_fd()), events: libc::POLLIN, revents: 0 });
         fds.push(libc::pollfd { fd: copies.as_raw_fd(), events: libc::POLLIN, revents: 0 });
         fds.push(libc::pollfd { fd: udp.as_raw_fd(), events: libc::POLLIN, revents: 0 });
+        fds.push(libc::pollfd { fd: buildkit_listener.as_ref().map_or(-1, |l| l.as_raw_fd()), events: libc::POLLIN, revents: 0 });
         fds.push(libc::pollfd { fd: pressure.as_ref().map_or(-1, |f| f.as_raw_fd()), events: libc::POLLPRI, revents: 0 });
         fds.push(libc::pollfd { fd: term.as_ref().map_or(-1, |f| f.as_raw_fd()), events: libc::POLLIN, revents: 0 });
         for r in &relays {
@@ -202,6 +208,12 @@ pub fn serve(mut conn: File, paths: &Paths) -> io::Result<()> {
                 }
                 continue;
             }
+            if let Some(l) = buildkit_listener.as_ref().filter(|l| l.as_raw_fd() == pfd.fd) {
+                while let Some(r) = super::relay::accept_buildkit(l) {
+                    relays.push(r);
+                }
+                continue;
+            }
             if pfd.fd == copies.as_raw_fd() {
                 let running: Vec<(&str, libc::pid_t)> =
                     procs.iter().filter(|(_, p)| p.run.container.is_none() && p.exited.is_none()).map(|(pid, p)| (p.run.id.as_str(), *pid)).collect();
@@ -268,7 +280,10 @@ pub fn serve(mut conn: File, paths: &Paths) -> io::Result<()> {
 
         if fds[1].revents != 0 {
             drain_signals(&sigfd);
-            reap(&mut procs);
+            for pid in reap(&mut procs) {
+                // Not a container this time: the builder root process.
+                buildkit.reaped(pid);
+            }
         }
 
         // Report processes that have exited and whose output is fully read,
@@ -596,6 +611,14 @@ pub fn serve(mut conn: File, paths: &Paths) -> io::Result<()> {
                     },
                     None => Msg::Error(&format!("container {id} is not running")).encode(&mut out),
                 },
+                Ok(Msg::BuildkitStart { layers, config }) => match buildkit.ensure(&paths.layers, layers, config) {
+                    Ok(()) => Msg::Ack.encode(&mut out),
+                    Err(e) => Msg::Error(&format!("buildkit: {e}")).encode(&mut out),
+                },
+                Ok(Msg::BuildkitStop) => {
+                    buildkit.stop();
+                    Msg::Ack.encode(&mut out)
+                }
                 Ok(other) => Msg::Error(&format!("unexpected {other:?}")).encode(&mut out),
                 Err(e) => Msg::Error(&format!("bad frame: {e:?}")).encode(&mut out),
             }
@@ -809,13 +832,14 @@ fn drain_signals(fd: &OwnedFd) {
     while unsafe { libc::read(fd.as_raw_fd(), info.as_mut_ptr().cast(), info.len()) } > 0 {}
 }
 
-fn reap(procs: &mut HashMap<libc::pid_t, Proc>) {
+fn reap(procs: &mut HashMap<libc::pid_t, Proc>) -> Vec<libc::pid_t> {
+    let mut unknown: Vec<libc::pid_t> = Vec::new();
     loop {
         let mut status = 0;
         // SAFETY: plain waitpid on any child.
         let pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
         if pid <= 0 {
-            return;
+            return unknown;
         }
         let code = if libc::WIFEXITED(status) {
             libc::WEXITSTATUS(status)
@@ -829,6 +853,8 @@ fn reap(procs: &mut HashMap<libc::pid_t, Proc>) {
             // Nobody will read input any more.
             p.input.clear();
             p.run.stdin = None;
+        } else {
+            unknown.push(pid);
         }
     }
 }
