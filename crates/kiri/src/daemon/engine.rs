@@ -628,6 +628,7 @@ impl Engine {
         engine.start_balloon();
         engine.start_cpu_meter();
         engine.start_sleeper();
+        engine.start_clock();
         engine.start_k8s_lb();
         Ok(engine)
     }
@@ -1360,6 +1361,36 @@ impl Engine {
     }
 
     /// Reads the VM's CPU time every two seconds, for `cpu_percent`.
+    /// Keeps the VM's clock on the Mac's. The guest is told the time at
+    /// boot, but its clock stops while the Mac sleeps, so after each sleep it
+    /// fell further behind: an hour behind after a few nights, and apt
+    /// refused Debian's signatures as made in the future. Sent again within
+    /// a few seconds of a wake (the wall clock moved on further than the
+    /// monotonic one, which stops in sleep too), and once a minute anyway;
+    /// the agent only steps its clock when it is off.
+    fn start_clock(self: &Arc<Self>) {
+        let me = Arc::downgrade(self);
+        let _ = std::thread::Builder::new().name("kiri-clock".into()).spawn(move || {
+            let (mut wall, mut mono) = (SystemTime::now(), std::time::Instant::now());
+            let mut sent = std::time::Instant::now();
+            loop {
+                std::thread::sleep(Duration::from_secs(5));
+                let Some(engine) = me.upgrade() else { return };
+                let (w, m) = (SystemTime::now(), std::time::Instant::now());
+                let slept = w.duration_since(wall).unwrap_or_default().saturating_sub(m.duration_since(mono)) > Duration::from_secs(2);
+                (wall, mono) = (w, m);
+                if !slept && sent.elapsed() < Duration::from_secs(60) {
+                    continue;
+                }
+                if let Some(vm) = engine.awake()
+                    && vm.set_time().is_ok()
+                {
+                    sent = m;
+                }
+            }
+        });
+    }
+
     fn start_cpu_meter(self: &Arc<Self>) {
         let me = Arc::downgrade(self);
         let _ = std::thread::Builder::new().name("kiri-cpu".into()).spawn(move || {

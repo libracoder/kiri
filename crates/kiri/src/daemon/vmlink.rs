@@ -421,6 +421,13 @@ impl VmLink {
         self.send(|o| Msg::RemoveBridge { bridge }.encode(o))
     }
 
+    /// The Mac's wall clock, for the guest. Sent at boot, and again while it
+    /// runs: the VM's clock stops while the Mac sleeps.
+    pub fn set_time(&self) -> io::Result<()> {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+        self.send(|o| Msg::SetTime(now.as_nanos() as u64).encode(o))
+    }
+
     /// Tells the guest which stopped containers still exist; it deletes the rest.
     pub fn retain(&self, ids: &[String]) -> io::Result<()> {
         self.send(|o| kiri_proto::encode_retain(o, ids))

@@ -479,9 +479,12 @@ pub fn serve(mut conn: File, paths: &Paths) -> io::Result<()> {
                     continue;
                 }
                 Ok(Msg::SetTime(ns)) => {
-                    let ts = libc::timespec { tv_sec: (ns / 1_000_000_000) as _, tv_nsec: (ns % 1_000_000_000) as _ };
-                    // A host process shares the host's clock; only the VM needs telling.
-                    if !host_process {
+                    // A host process shares the host's clock; only the VM needs
+                    // telling. The host sends it again every minute and after
+                    // the Mac wakes: stepped only when off by more than a
+                    // quarter second, so the clock is not nudged back and forth.
+                    if !host_process && clock_off(ns) {
+                        let ts = libc::timespec { tv_sec: (ns / 1_000_000_000) as _, tv_nsec: (ns % 1_000_000_000) as _ };
                         // SAFETY: `ts` is a valid timespec.
                         unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &ts) };
                     }
@@ -713,6 +716,17 @@ fn self_rss_kib() -> u64 {
     pages * unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64 / 1024
 }
 
+/// Whether the guest's clock is more than a quarter second from `ns`
+/// (Unix nanoseconds, the host's time).
+fn clock_off(ns: u64) -> bool {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
+    off_by_more(now, ns, 250_000_000)
+}
+
+fn off_by_more(a: u64, b: u64, limit: u64) -> bool {
+    a.abs_diff(b) > limit
+}
+
 /// Reads one frame into `buf`. Returns false on a clean end of stream.
 fn read_frame(conn: &mut File, buf: &mut Vec<u8>) -> io::Result<bool> {
     buf.resize(4, 0);
@@ -837,5 +851,21 @@ fn reap(procs: &mut HashMap<libc::pid_t, Proc>) {
             p.input.clear();
             p.run.stdin = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod clock_tests {
+    use super::off_by_more;
+
+    #[test]
+    fn steps_only_when_the_clock_is_off() {
+        let now = 1_792_800_000_000_000_000;
+        assert!(!off_by_more(now, now, 250_000_000));
+        assert!(!off_by_more(now, now + 200_000_000, 250_000_000));
+        assert!(!off_by_more(now + 200_000_000, now, 250_000_000));
+        // An hour behind, after the Mac slept.
+        assert!(off_by_more(now - 3_600_000_000_000, now, 250_000_000));
+        assert!(off_by_more(now + 300_000_000, now, 250_000_000));
     }
 }
