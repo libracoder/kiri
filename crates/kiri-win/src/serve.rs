@@ -603,10 +603,13 @@ pub fn log(msg: &str) {
     let Some(dir) = std::env::var_os("LOCALAPPDATA").map(|d| std::path::PathBuf::from(d).join("Kiri")) else { return };
     let _ = std::fs::create_dir_all(&dir);
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("kiri-win.log")) {
-        let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        // UTC to the millisecond, as the engine's /var/log/kiri.log writes
+        // it, so a moment reads the same in both.
+        let t = crate::daemon::time::rfc3339(std::time::SystemTime::now());
+        let stamp = format!("{}Z", t.get(..23).unwrap_or(&t));
         // One write per line: separate writes from two threads interleave
         // in the file and Diagnostics then cannot parse the line.
-        let _ = f.write_all(format!("{secs} {msg}\n").as_bytes());
+        let _ = f.write_all(format!("{stamp} {msg}\n").as_bytes());
     }
 }
 

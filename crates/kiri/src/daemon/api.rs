@@ -562,6 +562,11 @@ fn set_host_proxy(req: &Request) -> Result<Value, Error> {
     let url = |k: &str| body[k].as_str().map(str::trim).filter(|v| !v.is_empty()).map(|v| if v.contains("://") { v.to_owned() } else { format!("http://{v}") });
     let no_proxy = body["no_proxy"].as_array().into_iter().flatten().filter_map(|v| v.as_str()).map(str::to_owned).collect();
     super::proxy::set_host(super::proxy::Effective { http: url("http"), https: url("https"), no_proxy, pac: body["pac"].as_bool().unwrap_or(false) });
+    // kiri-win's relay to Windows' loopback: {"7892": 41234}. A kiri-win
+    // without one sends none, and proxies are dialled as set.
+    if let Some(relay) = body["relay"].as_object() {
+        super::proxy::set_relay(relay.iter().filter_map(|(k, v)| Some((k.parse().ok()?, u16::try_from(v.as_u64()?).ok()?))).collect());
+    }
     Ok(super::proxy::report())
 }
 
@@ -781,8 +786,43 @@ fn run_pull(req: &Request, engine: &Engine, reference: &Reference, job: &super::
                     message = why;
                 }
             }
+            if let Some(why) = pull_hint(&e, &reference.registry, super::proxy::shown().as_deref()) {
+                message = format!("{why} ({message})");
+            }
             line(json!({"errorDetail": {"message": message}, "error": message}))
         }
+    }
+}
+
+/// What a failed pull most likely means, in words that say what to fix: the
+/// network, the proxy, a login or the registry's rate limit. None when the
+/// error says it well enough itself.
+fn pull_hint(e: &kiri_image::registry::Error, registry: &str, proxy: Option<&str>) -> Option<String> {
+    use kiri_image::registry::Error;
+    let name = if registry == "docker.io" || registry.ends_with(".docker.io") { "Docker Hub".to_owned() } else { registry.to_owned() };
+    match e {
+        Error::Http(m) => {
+            let m = m.to_ascii_lowercase();
+            let refused = m.contains("refused") || m.contains("reset") || m.contains("unexpected eof") || m.contains("broken pipe");
+            let timeout = m.contains("timeout") || m.contains("timed out");
+            let lookup = ["lookup", "resolve", "dns", "not known", "host not found", "no address"].iter().any(|w| m.contains(w));
+            Some(match proxy {
+                Some(p) if refused => format!("the proxy {p} refused the connection or closed it: is it running?"),
+                Some(p) if timeout => format!("no answer from the proxy {p}"),
+                Some(p) if lookup => format!("couldn't look up the proxy {p}"),
+                Some(p) => format!("couldn't reach {name} through the proxy {p}"),
+                None if lookup => format!("couldn't look up {name}: check the network or DNS, or set a proxy in Settings → Network"),
+                None if refused || timeout || m.contains("unreachable") => format!("couldn't reach {name}: check the network, or set a proxy in Settings → Network"),
+                None => return None,
+            })
+        }
+        Error::Status { status: 429, .. } => Some(format!("{name} limits how many pulls it serves: docker login raises the limit, or try again later")),
+        Error::Status { status: 401 | 403, .. } => Some(format!("{name} asked for a login: docker login{}", if name == "Docker Hub" { String::new() } else { format!(" {registry}") })),
+        Error::Status { status: 407, .. } => Some(match proxy {
+            Some(p) => format!("the proxy {p} asked for a login: put it in the proxy address, http://user:password@host:port"),
+            None => "a proxy asked for a login".to_owned(),
+        }),
+        _ => None,
     }
 }
 
@@ -2601,5 +2641,22 @@ mod network_option_tests {
         assert_eq!(parse_link("db"), Some(("db", "db")));
         assert_eq!(parse_link("/db:/web/database"), Some(("db", "database")));
         assert_eq!(parse_link(":x"), None);
+    }
+
+    #[test]
+    fn failed_pulls_say_what_to_fix() {
+        use kiri_image::registry::Error;
+        let http = |m: &str| Error::Http(m.into());
+        let p = Some("http://127.0.0.1:7892");
+        assert_eq!(super::pull_hint(&http("io: Connection refused (os error 111)"), "docker.io", p).unwrap(), "the proxy http://127.0.0.1:7892 refused the connection or closed it: is it running?");
+        assert_eq!(super::pull_hint(&http("timeout: connect"), "docker.io", p).unwrap(), "no answer from the proxy http://127.0.0.1:7892");
+        assert_eq!(super::pull_hint(&http("timeout: connect"), "docker.io", None).unwrap(), "couldn't reach Docker Hub: check the network, or set a proxy in Settings → Network");
+        assert!(super::pull_hint(&http("io: failed to lookup address information"), "ghcr.io", None).unwrap().starts_with("couldn't look up ghcr.io"));
+        let status = |status| Error::Status { url: "u".into(), status, body: String::new() };
+        assert!(super::pull_hint(&status(429), "docker.io", None).unwrap().starts_with("Docker Hub limits"));
+        assert_eq!(super::pull_hint(&status(401), "ghcr.io", None).unwrap(), "ghcr.io asked for a login: docker login ghcr.io");
+        assert_eq!(super::pull_hint(&status(401), "docker.io", None).unwrap(), "Docker Hub asked for a login: docker login");
+        assert_eq!(super::pull_hint(&status(500), "docker.io", None), None);
+        assert_eq!(super::pull_hint(&Error::NotFound("no such image".into()), "docker.io", p), None);
     }
 }

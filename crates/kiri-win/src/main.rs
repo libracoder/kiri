@@ -29,6 +29,13 @@ mod engine;
 mod pipe;
 #[cfg(windows)]
 mod serve;
+// A proxy on Windows' loopback, reached from WSL: relay.rs, over the
+// relay's frames shared with the WSL end.
+#[cfg(windows)]
+mod relay;
+#[cfg(windows)]
+#[path = "../../kiri/src/hostrelay.rs"]
+mod hostrelay;
 #[cfg(windows)]
 mod win;
 // The window's USB view, through usbipd-win.

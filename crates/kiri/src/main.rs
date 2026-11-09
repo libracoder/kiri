@@ -24,6 +24,9 @@ mod buildwith;
 #[cfg(any(target_os = "linux", all(test, unix)))]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod bridge;
+// Linux only (WSL's end of kiri-win's proxy relay); its tests run anywhere.
+#[cfg(unix)]
+mod hostrelay;
 #[cfg(unix)]
 mod cli_pins;
 #[cfg(unix)]
@@ -114,6 +117,8 @@ fn main() -> ExitCode {
         Some("daemon") => daemon::run(&args[1..]),
         #[cfg(target_os = "linux")]
         Some("bridge") => bridge::run(&args[1..]),
+        #[cfg(target_os = "linux")]
+        Some("hostrelay") => hostrelay::run(),
         // Linux hosts: what the window's onboarding needs root for (through pkexec).
         #[cfg(target_os = "linux")]
         Some("host-access") => match hostaccess::run(&args[1..]) {

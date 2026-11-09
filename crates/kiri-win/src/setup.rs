@@ -619,6 +619,9 @@ fn engine() -> io::Result<()> {
     }
     task(0, "done", &format!("answered in {} ms", t0.elapsed().as_millis()));
     task(1, "done", r"\\.\pipe\kiri");
+    // Windows' proxy before the first pull, through the relay when it is on
+    // Windows' loopback: the minute's refresh may not have come yet.
+    crate::engine::send_windows_proxy();
     task(2, "active", "pulling alpine");
     log_line("$ docker run --rm alpine echo hello");
     // Before the installed copy exists, this runs the bundle's docker.exe:
@@ -632,10 +635,32 @@ fn engine() -> io::Result<()> {
         log_line(l);
     }
     if !out.status.success() || !text.contains("hello") {
-        return Err(io::Error::other("the test container did not run"));
+        // All of docker's words in the log, where the setup page shows a few.
+        for l in text.lines().map(str::trim).filter(|l| !l.is_empty()).take(20) {
+            crate::serve::log(&format!("setup engine: docker: {l}"));
+        }
+        return Err(io::Error::other(test_failure(&text)));
     }
     task(2, "done", "hello");
     tools()
+}
+
+/// Why `docker run alpine` failed, from what docker printed: the engine's
+/// own words, and whether it was the pull.
+fn test_failure(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    let said = lines
+        .iter()
+        .find_map(|l| l.split_once("Error response from daemon:").map(|(_, r)| r))
+        .or_else(|| lines.iter().find_map(|l| l.strip_prefix("docker: ")))
+        .or_else(|| lines.iter().rev().find(|l| !l.starts_with("See '") && !l.starts_with("Run '")).copied())
+        .map(|r| r.trim().trim_end_matches('.').to_owned());
+    let pulling = text.contains("Unable to find image") && !text.contains("Status: Downloaded");
+    match (said, pulling) {
+        (Some(why), true) => format!("couldn't pull alpine: {why}"),
+        (Some(why), false) => format!("the test container did not run: {why}"),
+        (None, _) => "the test container did not run".to_owned(),
+    }
 }
 
 /// Step 4: the Docker tools (setup-tools.ps1), task by task.
@@ -815,5 +840,20 @@ pub fn on_message(msg: &str) {
         "setup-quit" => Handle.run(|_| unsafe { windows::Win32::UI::WindowsAndMessaging::PostQuitMessage(0) }),
         "copy" => copy_to_clipboard(v["value"].as_str().unwrap_or("")),
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_failed_test_container_says_why() {
+        let pull = "Unable to find image 'alpine:latest' locally\ndocker: Error response from daemon: the proxy http://127.0.0.1:7892 refused the connection or closed it: is it running? (network error: io: Connection refused (os error 111)).\nSee 'docker run --help'.\n";
+        assert_eq!(super::test_failure(pull), "couldn't pull alpine: the proxy http://127.0.0.1:7892 refused the connection or closed it: is it running? (network error: io: Connection refused (os error 111))");
+        let stream = "Unable to find image 'alpine:latest' locally\nlatest: Pulling from library/alpine\ndocker: network error: timeout: connect\n\nRun 'docker run --help' for more information\n";
+        assert_eq!(super::test_failure(stream), "couldn't pull alpine: network error: timeout: connect");
+        let run = "Unable to find image 'alpine:latest' locally\nlatest: Pulling from library/alpine\nStatus: Downloaded newer image for alpine:latest\ndocker: Error response from daemon: no space left on device.\n";
+        assert_eq!(super::test_failure(run), "the test container did not run: no space left on device");
+        assert_eq!(super::test_failure("something odd\n"), "the test container did not run: something odd");
+        assert_eq!(super::test_failure(""), "the test container did not run");
     }
 }

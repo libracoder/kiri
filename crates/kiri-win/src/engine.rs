@@ -1179,9 +1179,22 @@ fn windows_proxy() -> Value {
     json!({"http": http, "https": https, "no_proxy": no_proxy, "pac": field("AutoConfigURL").is_some()})
 }
 
-/// Tells the daemon what Windows' proxy is.
-fn send_windows_proxy() {
-    let _ = client::request("PUT", "/kiri/proxy/system", Some(&windows_proxy()));
+/// Tells the daemon what Windows' proxy is. A proxy on Windows' own
+/// 127.0.0.1 (Windows' or one set in Settings → Network) is reached through
+/// the relay (relay.rs), and the daemon gets its ports too.
+pub(crate) fn send_windows_proxy() {
+    let mut body = windows_proxy();
+    let custom = client::get("/kiri/proxy").map(|v| v["settings"].clone()).unwrap_or_default();
+    let mut targets: Vec<u16> = [&body["http"], &body["https"], &custom["http"], &custom["https"]]
+        .iter()
+        .filter_map(|v| v.as_str())
+        .filter_map(|u| crate::hostrelay::loopback(u).map(|l| l.0))
+        .collect();
+    targets.sort_unstable();
+    targets.dedup();
+    let relay = crate::relay::ports(&targets);
+    body["relay"] = relay.iter().map(|(t, l)| (t.to_string(), json!(l))).collect::<serde_json::Map<_, _>>().into();
+    let _ = client::request("PUT", "/kiri/proxy/system", Some(&body));
 }
 
 /// Settings → Network: the daemon's proxy settings.
@@ -1189,7 +1202,11 @@ fn proxy(set: Option<Value>) {
     send_windows_proxy();
     if let Some(body) = set {
         match expect_ok(client::request("POST", "/kiri/proxy", Some(&body))) {
-            Ok(()) => emit(notice("ok", "Proxy settings saved")),
+            Ok(()) => {
+                // A custom proxy on Windows' loopback needs the relay too.
+                send_windows_proxy();
+                emit(notice("ok", "Proxy settings saved"));
+            }
             Err(e) => emit(notice("error", &format!("Could not save the proxy settings: {e}"))),
         }
     }
