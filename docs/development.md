@@ -105,3 +105,11 @@ kiri UI ────┘
 | `xtask` | build tasks |
 | `bench/results.json` | measured results; the website keeps a copy |
 | `brand/` | brand (the website and raw benchmark output live outside this repository) |
+
+## Unexpected VM stops
+
+The daemon keeps the guest's serial console, kernel oopses included, in
+`~/.kiri/logs/guest-console.log` (`.kiri-dev` for Kiri Dev). The file and two
+rotations (`.1`, `.2`) hold at most 1 MiB each. Files are private, credential
+patterns are redacted, and lines over 16 KiB are omitted. The unexpected-stop
+log line names this file. The console stays local; crash reports do not send it.
