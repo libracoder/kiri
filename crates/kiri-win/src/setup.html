@@ -214,6 +214,15 @@ main.choose .foot{position:sticky;bottom:-24px;margin-bottom:-24px;padding:14px 
   .log.hl .last::after{animation:none}
   .fill,.opt{transition:none}
 }
+.copied-tip{position:fixed;z-index:1000;transform:translate(-50%,-100%);pointer-events:none;display:inline-flex;align-items:center;gap:6px;
+  padding:5px 10px 5px 8px;border-radius:8px;white-space:nowrap;font:600 11px var(--f-text);color:#B9F0D2;background:#0F2A1F;
+  border:1px solid color-mix(in srgb,var(--moss) 55%,transparent);box-shadow:0 6px 18px rgb(0 0 0 / .45);animation:copied-rise .18s ease-out}
+.copied-tip svg{width:12px;height:12px;fill:var(--moss)}
+.copied-tip::after{content:"";position:absolute;left:50%;bottom:-5px;width:8px;height:8px;margin-left:-4px;transform:rotate(45deg);background:#0F2A1F;
+  border-right:1px solid color-mix(in srgb,var(--moss) 55%,transparent);border-bottom:1px solid color-mix(in srgb,var(--moss) 55%,transparent)}
+.copied-tip.out{opacity:0;transform:translate(-50%,calc(-100% - 4px));transition:opacity .2s,transform .2s}
+@keyframes copied-rise{from{opacity:0;transform:translate(-50%,calc(-100% + 4px))}}
+@media (prefers-reduced-motion:reduce){.copied-tip{animation:none}}
 </style>
 </head>
 <body>
@@ -696,7 +705,19 @@ function trn(n, one, other, vars) { var s = isOne(n) ? one : other, v = { n: n }
   onRelang = function () { var had = document.activeElement && document.activeElement.dataset && document.activeElement.dataset.lang; render(); if (had) focusLang(); };
 
   /* ---------- input ---------- */
+  /* As in the Kiri window: "Copied" in a bubble above the button, which stays as it is. */
   var copyTimer = 0;
+  function copiedTip(el) {
+    document.querySelectorAll('.copied-tip').forEach(function (x) { x.remove(); });
+    var r = el.getBoundingClientRect(), tip = document.createElement('div');
+    tip.className = 'copied-tip'; tip.setAttribute('role', 'status');
+    tip.innerHTML = '<svg viewBox="0 0 256 256" aria-hidden="true"><path d="M229.7 77.7l-128 128a8 8 0 0 1-11.3 0l-56-56a8 8 0 0 1 11.3-11.3L96 188.7 218.3 66.3a8 8 0 0 1 11.3 11.3Z"/></svg>';
+    tip.append(tr("Copied"));
+    tip.style.left = (r.left + r.width / 2) + 'px'; tip.style.top = (r.top - 8) + 'px';
+    document.body.append(tip);
+    clearTimeout(copyTimer);
+    copyTimer = setTimeout(function () { tip.classList.add('out'); setTimeout(function () { tip.remove(); }, 220); }, 1200);
+  }
   main.addEventListener('click', function (ev) {
     var a = ev.target.closest('a[data-open]');
     if (a) { ev.preventDefault(); send('open', { name: a.href }); return; }
@@ -713,8 +734,7 @@ function trn(n, one, other, vars) { var s = isOne(n) ? one : other, v = { n: n }
     if (b.dataset.act === 'choose') send('setup-choose', { value: choice });
     else if (b.dataset.act === 'copy') {
       send('copy', { value: 'docker run --rm alpine echo hello' });
-      b.textContent = tr("Copied"); clearTimeout(copyTimer);
-      copyTimer = setTimeout(function () { b.textContent = tr("Copy"); }, 1600);
+      copiedTip(b);
     }
   });
   main.addEventListener('change', function (ev) {

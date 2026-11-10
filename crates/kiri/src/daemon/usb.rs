@@ -26,6 +26,8 @@ struct Session {
     location: String,
     name: String,
     port: i32,
+    /// When it was attached (Unix seconds), for the window's Attached column.
+    since: i64,
     /// Both ends, so a detach (or the VM going away) can close them.
     helper: UnixStream,
     guest: OwnedFd,
@@ -40,9 +42,31 @@ pub fn any_attached() -> bool {
     !SESSIONS.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
 }
 
-pub fn list() -> Value {
-    let s = SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
-    Value::Array(s.iter().map(|s| json!({"Location": s.location, "Name": s.name, "Port": s.port})).collect())
+/// The attached devices, each with where it shows up in the VM (`Nodes`:
+/// `[{Path, What}]`, empty while the guest is still probing it or with an
+/// older agent).
+pub fn list(engine: &Engine) -> Value {
+    let rows: Vec<(String, String, i32, i64)> =
+        SESSIONS.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|s| (s.location.clone(), s.name.clone(), s.port, s.since)).collect();
+    // A device is attached only to a running VM: never boot one to ask.
+    let lines = if rows.is_empty() { Vec::new() } else { engine.vm().and_then(|vm| vm.usb_nodes()).unwrap_or_default() };
+    Value::Array(
+        rows.into_iter()
+            .map(|(location, name, port, since)| json!({"Location": location, "Name": name, "Port": port, "Since": since, "Nodes": nodes_on(&lines, port)}))
+            .collect(),
+    )
+}
+
+/// The `{Path, What}` of the guest's `PORT\tPATH\tWHAT` lines for one port.
+fn nodes_on(lines: &[String], port: i32) -> Vec<Value> {
+    lines
+        .iter()
+        .filter_map(|l| {
+            let mut f = l.splitn(3, '\t');
+            let (p, path, what) = (f.next()?, f.next()?, f.next()?);
+            (p.parse::<i32>().ok() == Some(port)).then(|| json!({"Path": path, "What": what}))
+        })
+        .collect()
 }
 
 pub fn detach(location: &str) -> Result<Value, Error> {
@@ -139,6 +163,7 @@ fn attach_claimed(location: &str, name: &str, speed: u32, devid: u32, engine: &A
         location: location.clone(),
         name,
         port,
+        since: super::time::unix(std::time::SystemTime::now()),
         helper: w.try_clone()?,
         guest: stream.fd.try_clone()?,
     });
@@ -170,5 +195,18 @@ fn set_timeout(fd: &OwnedFd, t: Option<Duration>) {
     // SAFETY: setsockopt with a valid timeval on a socket we own.
     unsafe {
         libc::setsockopt(fd.as_raw_fd(), libc::SOL_SOCKET, libc::SO_RCVTIMEO, (&raw const tv).cast(), size_of::<libc::timeval>() as libc::socklen_t);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nodes_are_matched_to_their_port() {
+        let lines = ["0\t/dev/ttyUSB0\tserial port", "0\t/dev/bus/usb/003/002\traw USB", "1\t/dev/hidraw0\traw HID", "bad"].map(String::from);
+        assert_eq!(nodes_on(&lines, 0), [json!({"Path": "/dev/ttyUSB0", "What": "serial port"}), json!({"Path": "/dev/bus/usb/003/002", "What": "raw USB"})]);
+        assert_eq!(nodes_on(&lines, 1).len(), 1);
+        assert!(nodes_on(&lines, 7).is_empty());
     }
 }

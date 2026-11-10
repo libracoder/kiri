@@ -154,6 +154,14 @@ pub enum Msg<'a> {
     /// The container's `/proc/net/tcp` and `tcp6` lines in state LISTEN, as
     /// the kernel writes them.
     Listening(StrList<'a>),
+    /// Host → guest: where the USB devices passed through to the VM show
+    /// up. Answered by `UsbNodes` or `Error`; an older agent answers `Error`.
+    UsbNodesQuery,
+    /// One `PORT\tPATH\tWHAT` line per device node: PORT is the vhci port
+    /// the device was attached on (the agent's answer to it), PATH the node
+    /// (`/dev/ttyUSB0`, or a network interface's name), WHAT what it is
+    /// (`serial port`, `raw USB`, …).
+    UsbNodes(StrList<'a>),
     /// Host → guest: route `dst/prefix` through `via` in the VM (or remove
     /// that route), so the host's relay can reach addresses that live behind
     /// a container, such as a Kubernetes node's pods and services. Answered
@@ -659,6 +667,8 @@ mod kind {
     pub const RETAIN_LAYERS: u16 = 73;
     pub const USAGE_QUERY: u16 = 74;
     pub const USAGE: u16 = 75;
+    pub const USB_NODES_QUERY: u16 = 76;
+    pub const USB_NODES: u16 = 77;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -735,6 +745,11 @@ pub fn encode_usage<S: AsRef<str>>(out: &mut Vec<u8>, lines: &[S]) {
 /// Encodes a `Top` reply from the sender's lines.
 pub fn encode_top<S: AsRef<str>>(out: &mut Vec<u8>, lines: &[S]) {
     frame(out, kind::TOP, |out| StrList::put(out, lines));
+}
+
+/// Encodes a `UsbNodes` reply from the sender's lines.
+pub fn encode_usb_nodes<S: AsRef<str>>(out: &mut Vec<u8>, lines: &[S]) {
+    frame(out, kind::USB_NODES, |out| StrList::put(out, lines));
 }
 
 /// Encodes a `Listening` reply from the sender's lines.
@@ -978,6 +993,11 @@ impl Msg<'_> {
                 o.extend_from_slice(lines.raw);
             }),
             Msg::ListenQuery { id } => frame(out, kind::LISTEN_QUERY, |o| put_str(o, id)),
+            Msg::UsbNodesQuery => frame(out, kind::USB_NODES_QUERY, |_| {}),
+            Msg::UsbNodes(lines) => frame(out, kind::USB_NODES, |o| {
+                put_u32(o, lines.count);
+                o.extend_from_slice(lines.raw);
+            }),
             Msg::Listening(lines) => frame(out, kind::LISTENING, |o| {
                 put_u32(o, lines.count);
                 o.extend_from_slice(lines.raw);
@@ -1235,6 +1255,8 @@ pub fn decode(frame: &[u8]) -> Result<Msg<'_>, DecodeError> {
         kind::TOP => Msg::Top(r.list()?),
         kind::LISTEN_QUERY => Msg::ListenQuery { id: r.str()? },
         kind::LISTENING => Msg::Listening(r.list()?),
+        kind::USB_NODES_QUERY => Msg::UsbNodesQuery,
+        kind::USB_NODES => Msg::UsbNodes(r.list()?),
         kind::NET_ATTACH => Msg::NetAttach {
             id: r.str()?,
             ifname: r.str()?,
@@ -1397,6 +1419,11 @@ mod tests {
         let Msg::Usage(lines) = decode(&buf).unwrap() else { panic!() };
         assert_eq!(lines.iter().collect::<Vec<_>>(), ["l 0a1b 4096", "c c1 0", "v data 12288"]);
         round(Msg::ListenQuery { id: "c1" });
+        round(Msg::UsbNodesQuery);
+        let mut buf = Vec::new();
+        encode_usb_nodes(&mut buf, &["0\t/dev/ttyUSB0\tserial port", "0\t/dev/bus/usb/003/002\traw USB"]);
+        let Msg::UsbNodes(lines) = decode(&buf).unwrap() else { panic!() };
+        assert_eq!(lines.iter().collect::<Vec<_>>(), ["0\t/dev/ttyUSB0\tserial port", "0\t/dev/bus/usb/003/002\traw USB"]);
         let mut buf = Vec::new();
         encode_listening(&mut buf, &["   0: 00000000:11D7 00000000:0000 0A"]);
         let Msg::Listening(lines) = decode(&buf).unwrap() else { panic!() };

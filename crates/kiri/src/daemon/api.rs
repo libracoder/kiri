@@ -115,7 +115,10 @@ fn route(req: &Request, engine: &Arc<Engine>, w: &mut UnixStream, r: &mut BufRea
         #[cfg(target_os = "macos")]
         ("POST", "/kiri/usb") => return super::usb::attach(req, engine, w, r),
         #[cfg(target_os = "macos")]
-        ("GET", "/kiri/usb") => return reply(w, Ok(super::usb::list()), 200),
+        ("GET", "/kiri/usb") => return reply(w, Ok(super::usb::list(engine)), 200),
+        // Linux and WSL: where each of this machine's USB devices shows up.
+        #[cfg(not(target_os = "macos"))]
+        ("GET", "/kiri/usb/nodes") => return reply(w, Ok(crate::usb::host_nodes()), 200),
         #[cfg(target_os = "macos")]
         ("DELETE", p) if p.strip_prefix("/kiri/usb/").is_some_and(|l| !l.is_empty()) => {
             return reply(w, super::usb::detach(p.strip_prefix("/kiri/usb/").unwrap_or_default()), 200);

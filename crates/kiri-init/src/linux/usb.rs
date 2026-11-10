@@ -18,6 +18,10 @@ use std::time::Duration;
 
 use kiri_proto::USB_PORT;
 
+/// Shared with the engine, which reads the same for a Linux host's devices.
+#[path = "../../../kiri/src/usb/sysfs.rs"]
+mod sysfs;
+
 const VHCI: &str = "/sys/devices/platform/vhci_hcd.0";
 /// USB_SPEED_SUPER: needs one of vhci's SuperSpeed ports.
 const SPEED_SUPER: u32 = 5;
@@ -78,6 +82,33 @@ fn free_port(speed: u32) -> io::Result<u32> {
     pick(&status, hub).ok_or_else(|| io::Error::from_raw_os_error(libc::EBUSY))
 }
 
+/// `PORT\tPATH\tWHAT` for every node of every attached device (see
+/// `kiri_proto::Msg::UsbNodes`).
+pub fn nodes() -> Vec<String> {
+    let status = fs::read_to_string(format!("{VHCI}/status")).unwrap_or_default();
+    attached(&status)
+        .into_iter()
+        .flat_map(|(port, busid)| {
+            let dev = std::path::Path::new("/sys/bus/usb/devices").join(&busid);
+            sysfs::nodes(&dev).into_iter().map(move |n| format!("{port}\t{}\t{}", n.path, n.what))
+        })
+        .collect()
+}
+
+/// (vhci port, sysfs name) of each attached device: `local_busid` is the
+/// name, `0-0` on a free port.
+fn attached(status: &str) -> Vec<(u32, String)> {
+    status
+        .lines()
+        .skip(1)
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            let (port, busid) = (f.get(1)?.parse().ok()?, *f.get(6)?);
+            (busid != "0-0" && busid.bytes().all(|c| c.is_ascii_digit() || c == b'-' || c == b'.')).then(|| (port, busid.to_owned()))
+        })
+        .collect()
+}
+
 fn pick(status: &str, hub: &str) -> Option<u32> {
     status.lines().skip(1).find_map(|line| {
         let mut f = line.split_whitespace();
@@ -100,5 +131,10 @@ mod tests {
         assert_eq!(pick(STATUS, "hs"), Some(1));
         assert_eq!(pick(STATUS, "ss"), Some(8));
         assert_eq!(pick("hub port sta\nhs 0000 006\n", "hs"), None);
+    }
+
+    #[test]
+    fn lists_the_attached_devices() {
+        assert_eq!(attached(STATUS), [(0, "1-1".to_owned())]);
     }
 }

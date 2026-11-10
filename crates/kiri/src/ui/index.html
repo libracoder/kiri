@@ -2087,6 +2087,38 @@ main { position: relative; }
 .statusbar .httoggle.on { color: var(--text); }
 #strip-term svg { fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; width: 17px; height: 17px; }
 .usb-note { margin: 14px 16px; font-size: var(--fs-small); max-width: 70ch; }
+.usb-row { cursor: pointer; }
+.usb-caret { flex: none; width: 16px; height: 16px; margin: 0 -2px 0 -6px; padding: 0; display: grid; place-items: center; border: 0; background: none; color: var(--faint); cursor: pointer; border-radius: 4px; }
+.usb-caret:hover { color: var(--text); background: var(--raised); }
+.usb-caret svg { width: 11px; height: 11px; transition: transform .15s; }
+.usb-row.open .usb-caret svg { transform: rotate(90deg); }
+.usb-row.open > td { background: color-mix(in srgb, var(--blue) 7%, transparent); }
+tr.usb-more > td { padding: 0; background: var(--panel); }
+.usb-more-in { display: grid; gap: 10px; padding: 10px 16px 14px 48px; max-width: 720px; }
+.usb-facts { display: grid; grid-template-columns: max-content 1fr; gap: 4px 20px; margin: 0; font-size: var(--fs-small); }
+.usb-facts dt { color: var(--faint); }
+.usb-facts dd { margin: 0; color: var(--text); }
+.usb-warn { display: flex; align-items: flex-start; gap: 8px; margin: 0; padding: 7px 10px; border-radius: 6px; font-size: var(--fs-small); color: var(--text);
+            background: color-mix(in srgb, var(--sun) 10%, transparent); border: 1px solid color-mix(in srgb, var(--sun) 30%, transparent); }
+.usb-warn svg { flex: none; width: 14px; height: 14px; fill: var(--sun); margin-top: 1px; }
+.usb-more-in { max-width: 920px; }
+.usb-cols { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr); gap: 28px; align-items: start; }
+@media (max-width: 760px) { .usb-cols { grid-template-columns: 1fr; gap: 14px; } }
+.usb-side .h4 { font-size: var(--fs-small); font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--faint); margin: 0 0 6px; }
+.usb-side .h4 ~ .h4 { margin-top: 14px; }
+.usb-note { margin: 0; font-size: var(--fs-small); color: var(--muted); }
+.usb-seg { display: inline-flex; gap: 2px; margin-bottom: 6px; }
+.usb-seg button { border: 0; background: none; color: var(--faint); font-size: var(--fs-small); font-weight: 600; padding: 2px 7px; border-radius: 4px; cursor: pointer; }
+.usb-seg button.on { background: var(--raised); color: var(--text); }
+.usb-seg button:hover { color: var(--text); }
+.usb-paths { display: grid; grid-template-columns: max-content 1fr; gap: 3px 16px; margin: 0; font-size: var(--fs-small); }
+.usb-paths dt { color: var(--text); }
+.usb-paths dd { margin: 0; color: var(--muted); }
+.usb-use { display: flex; align-items: center; gap: 8px; font-size: var(--fs-small); }
+.usb-use code { font: var(--fs-mono) var(--mono-font, ui-monospace, monospace); padding: 2px 8px; border-radius: 5px; background: var(--raised); border: 1px solid var(--line); }
+.usb-busy { min-width: 96px; justify-content: center; }
+.usb-busy .spin { display: inline-block; width: 11px; height: 11px; margin-right: 6px; border-radius: 50%; border: 2px solid color-mix(in srgb, currentColor 30%, transparent); border-top-color: currentColor; animation: spin .8s linear infinite; }
+@media (prefers-reduced-motion: reduce) { .usb-busy .spin { animation-duration: 2.4s; } }
 </style>
 <style>/*XTERM_CSS*/</style>
 </head>
@@ -4404,7 +4436,7 @@ function renderVolumes() {
    install Kiri's USB helper); on Windows, WSL takes it through usbipd-win (one
    Windows prompt per device, the first time); on Linux containers already see
    every device, so each row says where to find it. */
-ui.usb = { items: null, busy: new Map(), note: "", can: "", error: "", missing: false, timer: 0 };
+ui.usb = { items: null, busy: new Map(), note: "", can: "", error: "", missing: false, timer: 0, open: "", opening: "", tab: "run" };
 const usbState = (s) => ({ kiri: [tr("In Kiri"), "running"], host: [WIN ? tr("On this PC") : tr("On this Mac"), ""], shared: [tr("Containers see it"), "running"] })[s];
 /* Each device's icon: its kind as the engine read it from the device's
    interfaces, or, where it can't (Windows), from its name and vendor. A
@@ -4440,12 +4472,15 @@ function usbList(e) {
 }
 function usbDone(e) {
   ui.usb.busy.delete(e.key);
+  // Just attached: its details open (only its own), so the next step is in view.
+  if (ui.usb.opening === e.key) { if (e.text && !e.error) ui.usb.open = e.key; ui.usb.opening = ""; }
   if (e.error) toast("error", e.error); else if (e.text) toast("ok", e.text);
   if (ui.view === "usb") render();
 }
 function usbAct(act, key) {
   if (act === "install") { ui.usb.busy.set("install", tr("Installing…")); send("usbinstall"); render(); return; }
   ui.usb.busy.set(key, act === "attach" ? tr("Attaching…") : tr("Detaching…"));
+  ui.usb.opening = act === "attach" ? key : "";
   send(act === "attach" ? "usbattach" : "usbdetach", { name: key });
   render();
 }
@@ -4480,22 +4515,70 @@ function renderUsbBody() {
   if (!items.length) return noMatch();
   const act = (d) => {
     const busy = u.busy.get(d.key);
-    if (busy) return `<button class="btn sm" disabled>${busy}</button>`;
+    if (busy) return `<button class="btn sm usb-busy" disabled aria-busy="true"><span class="spin" aria-hidden="true"></span>${busy}</button>`;
     if (u.can !== "attach") return d.path ? copyBtn(`--device ${d.path}`, "docker flag") : "";
     return d.state === "kiri" ? `<button class="btn sm" data-usbgo="detach" data-key="${esc(d.key)}" title="${tr("Give it back to this computer")}"><svg class="i" viewBox="0 0 256 256" aria-hidden="true"><path d="${PH.eject}"/></svg>${tr("Detach")}</button>`
       : `<button class="btn sm primary" data-usbgo="attach" data-key="${esc(d.key)}" title="${tr("Hand it to Kiri's containers")}"><svg class="i" viewBox="0 0 256 256" aria-hidden="true"><path d="${PH.plug}"/></svg>${tr("Attach")}</button>`;
   };
-  table([[tr("Device")], ["ID"], [tr("Speed")], [tr("State")]], items.map((d) => {
+  table([[tr("Device")], ["ID"], [tr("Speed")], [tr("State")], [tr("Attached")]], items.map((d) => {
     const [word, cls] = usbState(d.state) || [d.state, ""];
-    return `<tr class="row" data-key="${esc(d.key)}">
-    <td><div class="name">${tile(null, USB_ICON[usbKind(d)] || "usb")}<div><div>${esc(d.name)}</div>${d.path ? `<div class="mono muted sub">--device ${esc(d.path)}</div>` : ""}</div></div></td>
+    const open = u.open === d.key;
+    return `<tr class="row usb-row${open ? " open" : ""}" data-key="${esc(d.key)}" data-usbrow="${esc(d.key)}">
+    <td><div class="name"><button class="usb-caret" data-usbmore="${esc(d.key)}" aria-expanded="${open}" title="${tr("Details")}" aria-label="${tr("Details")}"><svg class="i" viewBox="0 0 256 256" aria-hidden="true"><path d="${PH.caret}"/></svg></button>${tile(null, USB_ICON[usbKind(d)] || "usb")}<div><div>${esc(d.name)}</div>${d.path ? `<div class="mono muted sub">--device ${esc(d.path)}</div>` : ""}</div></div></td>
     <td class="mono muted">${esc(d.id || "—")}</td>
     <td class="muted">${esc(d.speed ? d.speed[0].toUpperCase() + d.speed.slice(1) : "—")}</td>
     <td><span class="pill ${cls}">${word}</span></td>
-    <td class="actions"><div class="acts-row">${act(d)}</div></td></tr>`;
+    <td class="muted">${d.state === "kiri" && d.since ? ago(d.since) : "—"}</td>
+    <td class="actions"><div class="acts-row">${act(d)}</div></td></tr>${open ? usbMore(d) : ""}`;
   }), "usb");
   if (u.note) c.insertAdjacentHTML("beforeend", `<p class="usb-note muted">${esc(u.note)}</p>`);
 }
+
+/* A device's details, under its row: what it is, where it is, since when, and how
+   to use it. Only what the system reports is shown. */
+const USB_SPEED = { low: "USB 1.0 · 1.5 Mbps", full: "USB 1.1 · 12 Mbps", high: "USB 2.0 · 480 Mbps", super: "USB 3 · 5 Gbps", "super+": "USB 3 · 10 Gbps" };
+function usbMore(d) {
+  const kind = usbKind(d);
+  const type = { mouse: tr("Mouse"), keyboard: tr("Keyboard"), network: tr("Network"), serial: tr("Serial"), radio: tr("Radio"), storage: tr("Storage"), audio: tr("Audio"), camera: tr("Camera") }[kind] || tr("USB device");
+  const warn = d.state === "kiri" && (kind === "mouse" || kind === "keyboard") ? tr("This computer can't use it while it's in Kiri: detach it to get it back.")
+    : kind === "audio" || kind === "camera" ? tr("Kiri can't pass sound or video through yet: containers won't get anything from it.") : "";
+  const mono = (v) => `<span class="mono">${esc(v)}</span>`;
+  const facts = [
+    [tr("Manufacturer"), d.maker && esc(d.maker)],
+    [tr("Type"), type],
+    ["ID", d.id && mono(d.id)],
+    [tr("Serial number"), d.serial && mono(d.serial)],
+    [tr("Speed"), USB_SPEED[d.speed] && mono(USB_SPEED[d.speed])],
+    [tr("Location"), d.bus && d.dev ? tr("Bus {bus} · Device {dev}", { bus: d.bus, dev: d.dev }) : d.busid ? mono(d.busid) : ""],
+    [tr("Attached"), d.state === "kiri" && d.since ? ago(d.since) : ""],
+  ].filter(([, v]) => v);
+  return `<tr class="usb-more" data-more="${esc(d.key)}"><td data-fill><div class="usb-more-in">
+    ${warn ? `<p class="usb-warn"><svg class="i" viewBox="0 0 256 256" aria-hidden="true"><path d="${PH.warning}"/></svg><span>${warn}</span></p>` : ""}
+    <div class="usb-cols"><dl class="usb-facts">${facts.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("")}</dl><div class="usb-side">${usbUse(d, kind)}</div></div></div></td></tr>`;
+}
+
+/* What each of a device's nodes in Linux is (the engine's words, from
+   crates/kiri/src/usb/sysfs.rs). */
+const USB_WHAT = { "serial port": tr("serial port"), "network interface": tr("network interface"), disk: tr("disk"), video: tr("video"),
+  "sound card": tr("sound card"), "input events": tr("input events"), "raw HID": tr("raw HID"), "raw USB": tr("raw USB") };
+/* The right side of a device's details: how a container gets it (docker run or
+   compose, copyable), and every path it has inside Linux. */
+function usbUse(d, kind) {
+  const paths = (d.paths || []).filter((p) => p && p.path);
+  const head = `<div class="h4">${tr("In a container")}</div>`;
+  if (d.state === "host") return `${head}<p class="usb-note">${tr("Attach it to see where it shows up in Linux.")}</p>`;
+  if (kind === "audio" || kind === "camera") return `${head}<p class="usb-note">${tr("Nothing to pass to a container yet.")}</p>${usbPaths(paths)}`;
+  const dev = paths.find((p) => p.path.startsWith("/dev/"))?.path || d.path;
+  if (!dev) return `${head}<p class="usb-note">${paths.length ? tr("It's a network interface inside Linux, not a device file.") : tr("Linux hasn't made a device for it yet.")}</p>${usbPaths(paths)}`;
+  const t = ui.usb.tab === "compose" ? "compose" : "run";
+  const text = t === "run" ? `--device ${dev}` : `devices: ["${dev}:${dev}"]`;
+  return `${head}<div class="usb-seg" role="tablist">${[["run", "docker run"], ["compose", "compose"]].map(([k, w]) =>
+      `<button class="mono${t === k ? " on" : ""}" role="tab" aria-selected="${t === k}" data-usbtab="${k}">${w}</button>`).join("")}</div>
+    <div class="usb-use"><code>${esc(text)}</code>${copyBtn(text, t === "run" ? "docker flag" : "compose lines")}</div>${usbPaths(paths)}`;
+}
+/* i18n */ void [tr("compose lines")];
+const usbPaths = (paths) => paths.length ? `<div class="h4">${tr("Inside Linux")}</div><dl class="usb-paths">${paths.map((p) =>
+  `<dt class="mono">${esc(p.path)}</dt><dd>${USB_WHAT[p.what] || esc(p.what)}</dd>`).join("")}</dl>` : "";
 
 function renderNetworks() {
   const items = listed("networks");
@@ -5337,7 +5420,7 @@ function toast(kind, text, op, open, act, why) {
   if (error && op) {
     el.querySelector(".txt").insertAdjacentHTML("beforeend", `<div class="dg-tacts"><button class="lnk" data-tdetails>${tr("Details")}</button><button class="lnk" data-tcopy>${tr("Copy")}</button></div>`);
     el.querySelector("[data-tdetails]").addEventListener("click", () => { el.remove(); detailsDialog(text, op); });
-    el.querySelector("[data-tcopy]").addEventListener("click", (ev) => { dg.copyOp = op; dg.copyText = text; send("diaglogs", { name: "", id: op, value: { errors: false, n: 200 } }); ev.target.textContent = tr("Copied"); });
+    el.querySelector("[data-tcopy]").addEventListener("click", (ev) => { dg.copyOp = op; dg.copyText = text; send("diaglogs", { name: "", id: op, value: { errors: false, n: 200 } }); copiedBtn(ev.target.closest("button")); });
   }
   // An error has no View, except a Run that failed: See why opens it.
   if (open && !op && (!error || why)) {
@@ -6098,7 +6181,7 @@ function reportDialog(mode) {
   scrim.addEventListener("change", (ev) => { if (ev.target.dataset.rpopt != null) rp.containers = ev.target.checked; });
   scrim.addEventListener("click", (ev) => {
     if (ev.target === scrim || ev.target.closest("[data-close]")) return close();
-    if (ev.target.closest("[data-rpcopy]")) { send("copy", { name: rp.id }); ev.target.closest("button").innerHTML = `${dgIcon("check")}${tr("Copied")}`; }
+    if (ev.target.closest("[data-rpcopy]")) { send("copy", { name: rp.id }); copiedBtn(ev.target.closest("button")); }
     if (ev.target.closest("[data-rpgo]")) { rp.state = "busy"; rp.error = ""; send(rp.mode === "send" ? "diagsend" : "diagreport", { value: { containers: rp.containers } }); drawReport(); }
   });
   scrim.querySelector("[data-rpgo]")?.focus();
@@ -6171,8 +6254,8 @@ function detailsDialog(text, op) {
     if (!b) return;
     const a = b.dataset.dt;
     if (a === "close") close();
-    else if (a === "copy") { send("copy", { name: [text, ...(dt.lines || []).map(dgPlain)].join("\n") }); b.innerHTML = `${dgIcon("check")}${tr("Copied")}`; }
-    else if (a === "copyid") { send("copy", { name: dt.id }); b.innerHTML = `${dgIcon("check")}${tr("Copied")}`; }
+    else if (a === "copy") { send("copy", { name: [text, ...(dt.lines || []).map(dgPlain)].join("\n") }); copiedBtn(b); }
+    else if (a === "copyid") { send("copy", { name: dt.id }); copiedBtn(b); }
     else if (a === "send") { Object.assign(dt, { state: "busy", error: "" }); send("diagsend", { value: { containers: false } }); drawDetails(); }
     else if (a === "diag") { close(); showDiag(op); }
   });
@@ -6446,6 +6529,12 @@ $("content").addEventListener("click", (ev) => {
   else if ((el = t("[data-c]"))) containerAction(el.dataset.c, el.dataset.id);
   else if ((el = t("[data-rmvol]"))) { const v = el.dataset.rmvol; confirmRemove(tr("Remove volume {name}?", { name: esc(v) }), tr("Its data is deleted for good."), tr("Remove"), () => send("rmvol", { name: v })); }
   else if ((el = t("[data-usbgo]"))) usbAct(el.dataset.usbgo, el.dataset.key);
+  else if ((el = t("[data-usbtab]"))) { ui.usb.tab = el.dataset.usbtab; render(); }
+  else if ((el = t("[data-usbmore]")) || ((el = t("tr[data-usbrow]")) && !t("button, a, input, .copy"))) {
+    const k = el.dataset.usbmore ?? el.dataset.usbrow;
+    ui.usb.open = ui.usb.open === k ? "" : k;
+    render();
+  }
   else if (t("[data-usbbeta]")) setPref("usbBetaClosed", true);
   else if ((el = t("[data-rmnet]"))) { const id = el.dataset.rmnet, n = ui.networks.find((x) => x.Id === id); confirmRemove(tr("Remove network {name}?", { name: esc(n?.Name || short(id)) }), "", tr("Remove"), () => send("rmnet", { id })); }
   else if ((el = t("[data-listenpub]"))) publishListening(el.dataset.listenpub);

@@ -123,6 +123,9 @@ pub struct Device {
     pub speed: u8,
     pub address: u8,
     pub name: String,
+    /// The maker and serial number the device reports, when it does.
+    pub maker: String,
+    pub serial: String,
 }
 
 impl Device {
@@ -177,6 +180,11 @@ impl Device {
         super::kind_of(class, &ifs, self.vendor, &self.name)
     }
 
+    /// The bus number, as Linux and System Information count it.
+    pub fn bus(&self) -> u32 {
+        (self.location >> 24) & 0xff
+    }
+
     /// USB/IP's bus << 16 | device address.
     pub fn devid(&self) -> u32 {
         ((self.location >> 24) & 0xff) << 16 | u32::from(self.address)
@@ -195,6 +203,8 @@ fn read_device(o: &IoObj) -> Option<Device> {
         speed: number(o.0, c"Device Speed").unwrap_or(1) as u8,
         address: number(o.0, c"USB Address").unwrap_or(0) as u8,
         name: string(o.0, c"USB Product Name").or_else(|| string(o.0, c"kUSBProductString")).unwrap_or_else(|| "USB device".into()),
+        maker: string(o.0, c"USB Vendor Name").or_else(|| string(o.0, c"kUSBVendorString")).unwrap_or_default().trim().to_owned(),
+        serial: string(o.0, c"USB Serial Number").or_else(|| string(o.0, c"kUSBSerialNumberString")).unwrap_or_default().trim().to_owned(),
     })
 }
 

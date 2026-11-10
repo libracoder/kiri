@@ -21,6 +21,9 @@ pub mod helper;
 pub mod mac;
 #[cfg(target_os = "macos")]
 mod usbip;
+/// Where a device shows up in Linux (shared with the guest agent).
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub mod sysfs;
 
 const USAGE: &str = "usage: kiri usb [list] | attach DEVICE | detach DEVICE | helper remove\n\
     DEVICE is a location (0x02114000), vendor:product (1532:00d7) or part of the name";
@@ -237,7 +240,9 @@ mod kind_tests {
 // --- The window's USB view -----------------------------------------------------------
 //
 // One shape on every system: { type: "usb", devices: [{ key, name, id,
-// speed, state, path }], note }. `state` is "kiri" (in the VM), "host" (on
+// speed, state, path, kind, maker, serial, bus, dev, busid, since }], note }.
+// maker, serial, bus/dev (or Windows' busid) and since (Unix seconds, when
+// it went into Kiri) are there when the system knows them. `state` is "kiri" (in the VM), "host" (on
 // this computer, can be attached) or "shared" (containers see it as it is).
 
 /// The devices for the window's USB view.
@@ -251,21 +256,29 @@ pub fn ui_list() -> serde_json::Value {
     };
     for d in &devices {
         let loc = d.location();
-        let inside = daemon.iter().any(|a| a["Location"].as_str() == Some(&loc));
+        let inside = daemon.iter().find(|a| a["Location"].as_str() == Some(&loc));
         rows.push(serde_json::json!({
             "key": loc, "name": d.name, "id": format!("{:04x}:{:04x}", d.vendor, d.product),
-            "speed": d.speed_name(), "state": if inside { "kiri" } else { "host" }, "path": "", "kind": d.kind(),
+            "speed": d.speed_name(), "state": if inside.is_some() { "kiri" } else { "host" }, "path": "", "kind": d.kind(),
+            "maker": d.maker, "serial": d.serial, "bus": d.bus(), "dev": d.address,
+            "since": inside.and_then(|a| a["Since"].as_i64()), "paths": inside.map(paths).unwrap_or_default(),
         }));
     }
     // In the VM but not on the Mac's bus (a test device): listed all the same.
     for a in &daemon {
         let loc = a["Location"].as_str().unwrap_or_default();
         if !loc.is_empty() && !rows.iter().any(|r| r["key"] == loc) {
-            rows.push(serde_json::json!({"key": loc, "name": a["Name"], "id": "", "speed": "", "state": "kiri", "path": ""}));
+            rows.push(serde_json::json!({"key": loc, "name": a["Name"], "id": "", "speed": "", "state": "kiri", "path": "", "since": a["Since"], "paths": paths(a)}));
         }
     }
     serde_json::json!({"type": "usb", "devices": rows, "can": "attach",
         "note": "A device in Kiri is gone from the Mac until you detach it. In a container: --device /dev/ttyUSB0 (serial), /dev/input (HID) or /dev/bus/usb (raw)."})
+}
+
+/// The daemon's `Nodes` as the page's `paths`: `[{path, what}]`.
+#[cfg(target_os = "macos")]
+fn paths(a: &serde_json::Value) -> Vec<serde_json::Value> {
+    a["Nodes"].as_array().into_iter().flatten().map(|n| serde_json::json!({"path": n["Path"], "what": n["What"]})).collect()
 }
 
 #[cfg(target_os = "macos")]
@@ -286,10 +299,23 @@ pub fn ui_detach(key: &str) -> io::Result<String> {
 pub fn ui_list() -> serde_json::Value {
     let rows: Vec<serde_json::Value> = sysfs_devices(std::path::Path::new("/sys/bus/usb/devices"))
         .into_iter()
-        .map(|d| serde_json::json!({"key": d.node, "name": d.name, "id": d.id, "speed": d.speed, "state": "shared", "kind": d.kind, "path": d.tty.unwrap_or(d.node)}))
+        .map(|d| serde_json::json!({"key": d.node, "name": d.name, "id": d.id, "speed": d.speed, "state": "shared", "kind": d.kind, "path": d.tty.unwrap_or(d.node), "maker": d.maker, "serial": d.serial, "bus": d.bus, "dev": d.dev, "paths": d.paths}))
         .collect();
     serde_json::json!({"type": "usb", "devices": rows, "can": "none",
         "note": "Containers run on this computer's own kernel, so they see its USB devices as they are: docker run --device with the path shown."})
+}
+
+/// The engine's `GET /kiri/usb/nodes` on Linux and in WSL: each device's
+/// id, serial number and nodes, so the Windows window can say where a
+/// device it attached to WSL shows up.
+#[cfg(not(target_os = "macos"))]
+pub fn host_nodes() -> serde_json::Value {
+    serde_json::Value::Array(
+        sysfs_devices(std::path::Path::new("/sys/bus/usb/devices"))
+            .into_iter()
+            .map(|d| serde_json::json!({"id": d.id, "serial": d.serial, "busid": d.busid, "paths": d.paths}))
+            .collect(),
+    )
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -310,6 +336,14 @@ struct SysDevice {
     speed: String,
     tty: Option<String>,
     kind: &'static str,
+    maker: String,
+    serial: String,
+    bus: u32,
+    dev: u32,
+    /// Its name in sysfs (`1-2`).
+    busid: String,
+    /// `[{path, what}]`, from `sysfs::nodes`.
+    paths: Vec<serde_json::Value>,
 }
 
 /// The USB devices under a sysfs bus directory, hubs left out.
@@ -324,7 +358,8 @@ fn sysfs_devices(dir: &std::path::Path) -> Vec<SysDevice> {
         if vid.is_empty() || read("bDeviceClass") == "09" {
             continue;
         }
-        let name = [read("manufacturer"), read("product")].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" ");
+        let maker = read("manufacturer");
+        let name = [maker.clone(), read("product")].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" ");
         let speed = match read("speed").as_str() {
             "1.5" => "low",
             "12" => "full",
@@ -350,6 +385,12 @@ fn sysfs_devices(dir: &std::path::Path) -> Vec<SysDevice> {
             name: if name.is_empty() { "USB device".into() } else { name },
             speed: speed.into(),
             tty: tty_of(&p),
+            serial: read("serial"),
+            bus: read("busnum").parse().unwrap_or(0),
+            dev: read("devnum").parse().unwrap_or(0),
+            busid: e.file_name().to_string_lossy().into_owned(),
+            paths: sysfs::nodes(&p).into_iter().map(|n| serde_json::json!({"path": n.path, "what": n.what})).collect(),
+            maker,
         });
     }
     out.sort_by(|a, b| a.node.cmp(&b.node));
@@ -388,7 +429,7 @@ mod tests {
             p
         };
         dev("usb1", &[("idVendor", "1d6b"), ("idProduct", "0002"), ("bDeviceClass", "09"), ("busnum", "1"), ("devnum", "1")]);
-        let s = dev("1-1", &[("idVendor", "10c4"), ("idProduct", "ea60"), ("bDeviceClass", "00"), ("busnum", "1"), ("devnum", "3"), ("product", "CP2102"), ("speed", "12")]);
+        let s = dev("1-1", &[("idVendor", "10c4"), ("idProduct", "ea60"), ("bDeviceClass", "00"), ("busnum", "1"), ("devnum", "3"), ("product", "CP2102"), ("speed", "12"), ("serial", "0001")]);
         std::fs::create_dir_all(s.join("1-1:1.0/ttyUSB0")).unwrap();
         dev("1-1:1.0", &[]);
         let got = sysfs_devices(&d);
@@ -397,6 +438,10 @@ mod tests {
         assert_eq!(got[0].id, "10c4:ea60");
         assert_eq!(got[0].speed, "full");
         assert_eq!(got[0].tty.as_deref(), Some("/dev/ttyUSB0"));
+        assert_eq!((got[0].bus, got[0].dev, got[0].serial.as_str()), (1, 3, "0001"));
+        assert_eq!(got[0].busid, "1-1");
+        let paths: Vec<&str> = got[0].paths.iter().filter_map(|p| p["path"].as_str()).collect();
+        assert_eq!(paths, ["/dev/ttyUSB0", "/dev/bus/usb/001/003"]);
         let _ = std::fs::remove_dir_all(&d);
     }
 }

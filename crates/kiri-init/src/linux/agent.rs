@@ -552,6 +552,7 @@ pub fn serve(mut conn: File, paths: &Paths) -> io::Result<()> {
                     }
                     None => Msg::Error(&format!("container {id} is not running")).encode(&mut out),
                 },
+                Ok(Msg::UsbNodesQuery) => kiri_proto::encode_usb_nodes(&mut out, &super::usb::nodes()),
                 Ok(Msg::ListenQuery { id }) => match running_pid(&procs, id) {
                     Some(pid) => kiri_proto::encode_listening(&mut out, &net::listening(pid)),
                     None => Msg::Error(&format!("container {id} is not running")).encode(&mut out),

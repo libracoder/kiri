@@ -34,6 +34,7 @@ pub enum Reply {
     ContainerStats(kiri_proto::ContainerStats),
     Top(Vec<String>),
     Listening(Vec<String>),
+    UsbNodes(Vec<String>),
     Uplink([u8; 4], [u8; 4]),
     Error(String),
 }
@@ -218,6 +219,7 @@ impl VmLink {
                     Ok(Msg::ContainerStats(s)) => Reply::ContainerStats(s),
                     Ok(Msg::Top(lines)) => Reply::Top(lines.iter().map(str::to_owned).collect()),
                     Ok(Msg::Listening(lines)) => Reply::Listening(lines.iter().map(str::to_owned).collect()),
+                    Ok(Msg::UsbNodes(lines)) => Reply::UsbNodes(lines.iter().map(str::to_owned).collect()),
                     Ok(Msg::Uplink { ip, gateway }) => Reply::Uplink(ip, gateway),
                     Ok(Msg::Error(e)) => Reply::Error(e.to_owned()),
                     Ok(other) => Reply::Error(format!("unexpected message from guest: {other:?}")),
@@ -368,6 +370,15 @@ impl VmLink {
         match self.call(|o| Msg::ListenQuery { id }.encode(o), None)? {
             Reply::Listening(lines) => Ok(lines),
             other => Err(io::Error::other(format!("expected Listening, got {other:?}"))),
+        }
+    }
+
+    /// `PORT\tPATH\tWHAT` for the nodes of the USB devices attached to the
+    /// VM (`Msg::UsbNodes`).
+    pub fn usb_nodes(&self) -> io::Result<Vec<String>> {
+        match self.call(|o| Msg::UsbNodesQuery.encode(o), None)? {
+            Reply::UsbNodes(lines) => Ok(lines),
+            other => Err(io::Error::other(format!("expected UsbNodes, got {other:?}"))),
         }
     }
 
