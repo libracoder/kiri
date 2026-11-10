@@ -113,3 +113,8 @@ The daemon keeps the guest's serial console, kernel oopses included, in
 rotations (`.1`, `.2`) hold at most 1 MiB each. Files are private, credential
 patterns are redacted, and lines over 16 KiB are omitted. The unexpected-stop
 log line names this file. The console stays local; crash reports do not send it.
+
+After a guest crash, the next request boots a new VM and restarts the
+containers that were running with `always` or `unless-stopped`. A manual stop,
+kill or removal wins over that recovery; `no`, `on-failure` and containers that
+never ran stay down.
