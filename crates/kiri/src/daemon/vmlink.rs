@@ -93,6 +93,39 @@ struct Writer {
     blob: Vec<u8>,
 }
 
+impl Writer {
+    fn write(&mut self, windows: &Windows, body: Option<(&Path, u64)>) -> io::Result<()> {
+        let result = self.write_request(body);
+        if result.is_err() {
+            // A partial frame cannot be retried on this stream. Publish
+            // loss now, then wake the reader to do the exit accounting.
+            windows.lose();
+            use std::os::fd::AsRawFd;
+            // SAFETY: conn owns a live stream socket for this entire call.
+            unsafe { libc::shutdown(self.conn.as_raw_fd(), libc::SHUT_RDWR); }
+        }
+        result
+    }
+
+    fn write_request(&mut self, body: Option<(&Path, u64)>) -> io::Result<()> {
+        self.conn.write_all(&self.out)?;
+        if let Some((path, size)) = body {
+            let mut file = File::open(path)?;
+            let mut left = size;
+            while left > 0 {
+                let want = left.min(self.blob.len() as u64) as usize;
+                let n = file.read(&mut self.blob[..want])?;
+                if n == 0 {
+                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "layer blob shrank while sending"));
+                }
+                self.conn.write_all(&self.blob[..n])?;
+                left -= n as u64;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// How much stdin each running process may still be sent before the guest
 /// reports some of it consumed. An entry exists from `run`/`exec` until
 /// `Exited`; `input` for a process without one is discarded.
@@ -275,9 +308,8 @@ impl VmLink {
         let (tx, rx) = mpsc::sync_channel(1);
         {
             let mut w = self.writer.lock().unwrap_or_else(|e| e.into_inner());
-            let Writer { conn, out, blob } = &mut *w;
-            out.clear();
-            encode(out);
+            w.out.clear();
+            encode(&mut w.out);
             // Queue the slot before writing, so the reply can never arrive first.
             {
                 let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
@@ -286,20 +318,7 @@ impl VmLink {
                 }
                 pending.push_back(tx);
             }
-            conn.write_all(out)?;
-            if let Some((path, size)) = body {
-                let mut file = File::open(path)?;
-                let mut left = size;
-                while left > 0 {
-                    let want = left.min(blob.len() as u64) as usize;
-                    let n = file.read(&mut blob[..want])?;
-                    if n == 0 {
-                        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "layer blob shrank while sending"));
-                    }
-                    conn.write_all(&blob[..n])?;
-                    left -= n as u64;
-                }
-            }
+            w.write(&self.windows, body)?;
         }
         match rx.recv() {
             Ok(Reply::Error(e)) => Err(io::Error::other(e)),
@@ -311,10 +330,9 @@ impl VmLink {
     /// Sends a message that has no reply.
     fn send(&self, encode: impl FnOnce(&mut Vec<u8>)) -> io::Result<()> {
         let mut w = self.writer.lock().unwrap_or_else(|e| e.into_inner());
-        let Writer { conn, out, .. } = &mut *w;
-        out.clear();
-        encode(out);
-        conn.write_all(out)
+        w.out.clear();
+        encode(&mut w.out);
+        w.write(&self.windows, None)
     }
 
     /// What the guest's layers, containers and volumes take on disk: the
@@ -598,4 +616,23 @@ fn read_frame(conn: &mut File, buf: &mut Vec<u8>) -> io::Result<()> {
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e:?}")))?;
     buf.resize(len.max(HEADER), 0);
     conn.read_exact(&mut buf[4..])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn a_failed_write_disconnects_before_the_reader_accounts_loss() {
+        let (socket, peer) = UnixStream::pair().unwrap();
+        socket.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut writer = Writer { conn: std::os::fd::OwnedFd::from(socket).into(), out: vec![1], blob: vec![0; 16] };
+        let windows = Windows::default();
+        assert!(writer.write(&windows, None).is_err());
+        assert!(windows.lock().lost, "a writer failure must publish loss before a start can record an ordinary failure");
+        assert!(!windows.lock().loss_handled, "only the reader owns exit accounting");
+        let mut peer = peer;
+        assert_eq!(peer.read(&mut [0]).unwrap(), 0, "the failed transport is closed in both directions");
+    }
 }
