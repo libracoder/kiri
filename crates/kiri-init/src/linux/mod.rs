@@ -16,6 +16,7 @@ mod seccomp;
 mod sys;
 mod transport;
 mod usb;
+mod usage;
 mod volmount;
 
 use std::fs::File;

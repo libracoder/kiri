@@ -34,8 +34,10 @@ pub const INPUT_WINDOW: usize = 4 << 20;
 
 /// The wire version. The host refuses an agent with another one: 3 added
 /// `InputConsumed`, which the host waits on, so an older agent would leave
-/// a client's stdin blocked after `INPUT_WINDOW` bytes.
-pub const PROTOCOL: u16 = 3;
+/// a client's stdin blocked after `INPUT_WINDOW` bytes. 4 added
+/// `UsageQuery`, which has no reply: an older agent's "unexpected" error
+/// would be taken as the reply to the next request.
+pub const PROTOCOL: u16 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Msg<'a> {
@@ -98,6 +100,12 @@ pub enum Msg<'a> {
     /// digest), and any left half-written. Sent once after connecting,
     /// before anything runs. No reply.
     RetainLayers(StrList<'a>),
+    /// Asks how much disk the guest's layers, containers and volumes use.
+    UsageQuery,
+    /// The reply: one `KIND NAME BYTES` line per entry, KIND `l` (an
+    /// unpacked layer, by blob hex), `c` (a container's writable layer, by
+    /// id) or `v` (a volume, by name). BYTES is what it takes on disk.
+    Usage(StrList<'a>),
     /// Host → guest: metadata of a path inside a running container's root
     /// (symlinks are not followed). Answered by `FsStat` or `Error`.
     FsStatRequest { id: &'a str, path: &'a str },
@@ -649,6 +657,8 @@ mod kind {
     pub const UPLINK: u16 = 71;
     pub const REMOVE_BRIDGE: u16 = 72;
     pub const RETAIN_LAYERS: u16 = 73;
+    pub const USAGE_QUERY: u16 = 74;
+    pub const USAGE: u16 = 75;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -715,6 +725,11 @@ pub fn encode_net_attach<S: AsRef<str>>(out: &mut Vec<u8>, id: &str, ifname: &st
         StrList::put(o, dns_names);
         StrList::put(o, opts);
     });
+}
+
+/// Encodes a `Usage` reply from the sender's lines.
+pub fn encode_usage<S: AsRef<str>>(out: &mut Vec<u8>, lines: &[S]) {
+    frame(out, kind::USAGE, |out| StrList::put(out, lines));
 }
 
 /// Encodes a `Top` reply from the sender's lines.
@@ -901,6 +916,11 @@ impl Msg<'_> {
             Msg::Retain(ids) => frame(out, kind::RETAIN, |o| {
                 put_u32(o, ids.count);
                 o.extend_from_slice(ids.raw);
+            }),
+            Msg::UsageQuery => frame(out, kind::USAGE_QUERY, |_| {}),
+            Msg::Usage(lines) => frame(out, kind::USAGE, |o| {
+                put_u32(o, lines.count);
+                o.extend_from_slice(lines.raw);
             }),
             Msg::RetainLayers(ids) => frame(out, kind::RETAIN_LAYERS, |o| {
                 put_u32(o, ids.count);
@@ -1186,6 +1206,8 @@ pub fn decode(frame: &[u8]) -> Result<Msg<'_>, DecodeError> {
         }),
         kind::RETAIN => Msg::Retain(r.list()?),
         kind::RETAIN_LAYERS => Msg::RetainLayers(r.list()?),
+        kind::USAGE_QUERY => Msg::UsageQuery,
+        kind::USAGE => Msg::Usage(r.list()?),
         kind::FS_STAT_REQUEST => Msg::FsStatRequest { id: r.str()?, path: r.str()? },
         kind::FS_STAT => Msg::FsStat(read_entry(&mut r)?),
         kind::FS_LIST_REQUEST => Msg::FsListRequest { id: r.str()?, path: r.str()? },
@@ -1369,6 +1391,11 @@ mod tests {
         round(Msg::StatsQuery { id: "c1" });
         round(Msg::ContainerStats(ContainerStats { read_ns: 1, mem_current: 2, online_cpus: 4, rx_bytes: 9, io_write_bytes: 11, ..Default::default() }));
         round(Msg::TopQuery { id: "c1" });
+        round(Msg::UsageQuery);
+        let mut buf = Vec::new();
+        encode_usage(&mut buf, &["l 0a1b 4096", "c c1 0", "v data 12288"]);
+        let Msg::Usage(lines) = decode(&buf).unwrap() else { panic!() };
+        assert_eq!(lines.iter().collect::<Vec<_>>(), ["l 0a1b 4096", "c c1 0", "v data 12288"]);
         round(Msg::ListenQuery { id: "c1" });
         let mut buf = Vec::new();
         encode_listening(&mut buf, &["   0: 00000000:11D7 00000000:0000 0A"]);

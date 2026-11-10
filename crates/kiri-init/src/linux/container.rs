@@ -541,6 +541,9 @@ fn undo_now(t: &Teardown, remove_files: bool) {
 
 /// Deletes a stopped container's directory (its writable layer).
 /// Deletes a named volume's data.
+/// Where volumes live: `<name>/_data` under it.
+pub const VOLUMES: &str = "/var/lib/kiri/volumes";
+
 pub fn remove_volume(name: &str) {
     // Docker's rule for volume names: [a-zA-Z0-9][a-zA-Z0-9_.-]*
     let valid = name.bytes().next().is_some_and(|b| b.is_ascii_alphanumeric())
@@ -553,7 +556,7 @@ pub fn remove_volume(name: &str) {
             eprintln!("kiri-init: volume {name}: {data} is still mounted, not deleting it");
             return;
         }
-        let _ = fs::remove_dir_all(PathBuf::from("/var/lib/kiri/volumes").join(name));
+        let _ = fs::remove_dir_all(PathBuf::from(VOLUMES).join(name));
     }
 }
 

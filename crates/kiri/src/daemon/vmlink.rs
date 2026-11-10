@@ -71,6 +71,8 @@ pub struct VmLink {
     writer: Mutex<Writer>,
     /// Stdin credit per running process; see `input`.
     windows: Arc<Windows>,
+    /// The guest's latest `Usage` lines, for `usage`.
+    usage: Arc<UsageSlot>,
     pending: Arc<Mutex<VecDeque<SyncSender<Reply>>>>,
     /// Kept so the VM lives as long as the link. Behind a mutex only so the
     /// link can be shared between threads; nothing touches it after boot.
@@ -149,6 +151,14 @@ impl Windows {
     }
 }
 
+/// Where the reader thread leaves `Usage` for whoever asked: a count of
+/// answers so far, and the latest one.
+#[derive(Default)]
+struct UsageSlot {
+    lines: Mutex<(u64, Option<Vec<String>>)>,
+    arrived: Condvar,
+}
+
 impl VmLink {
     /// Starts the reader thread. `on_event` runs on that thread, so it must
     /// not block for long: it holds up every reply behind it.
@@ -158,6 +168,8 @@ impl VmLink {
         let queue = pending.clone();
         let windows = Arc::new(Windows::default());
         let wins = windows.clone();
+        let usage = Arc::new(UsageSlot::default());
+        let slot = usage.clone();
         std::thread::Builder::new().name("kiri-vm-reader".into()).spawn(move || {
             let mut frame = Vec::with_capacity(64 * 1024);
             while read_frame(&mut reader, &mut frame).is_ok() {
@@ -165,6 +177,16 @@ impl VmLink {
                 let reply = match msg {
                     Ok(Msg::Output { id, stream, data }) => {
                         on_event(Event::Output { id, stream, data });
+                        continue;
+                    }
+                    // Not a reply: the guest measures on a thread and sends
+                    // this when done, between other replies.
+                    Ok(Msg::Usage(lines)) => {
+                        let mut g = slot.lines.lock().unwrap_or_else(|e| e.into_inner());
+                        g.0 += 1;
+                        g.1 = Some(lines.iter().map(str::to_owned).collect());
+                        drop(g);
+                        slot.arrived.notify_all();
                         continue;
                     }
                     Ok(Msg::Exited(e)) => {
@@ -216,6 +238,7 @@ impl VmLink {
             writer: Mutex::new(Writer { conn, out: Vec::with_capacity(4096), blob: vec![0; 256 * 1024] }),
             pending,
             windows,
+            usage,
             connector: vm.connector(),
             _vm: Mutex::new(vm),
         })
@@ -260,6 +283,17 @@ impl VmLink {
         out.clear();
         encode(out);
         conn.write_all(out)
+    }
+
+    /// What the guest's layers, containers and volumes take on disk: the
+    /// `KIND NAME BYTES` lines of `Msg::Usage`, or None if they don't come
+    /// within `wait` or the VM stops.
+    pub fn usage(&self, wait: std::time::Duration) -> Option<Vec<String>> {
+        let asked = self.usage.lines.lock().unwrap_or_else(|e| e.into_inner()).0;
+        self.send(|o| Msg::UsageQuery.encode(o)).ok()?;
+        let g = self.usage.lines.lock().unwrap_or_else(|e| e.into_inner());
+        let (g, _) = self.usage.arrived.wait_timeout_while(g, wait, |g| g.0 == asked).unwrap_or_else(|e| e.into_inner());
+        if g.0 == asked { None } else { g.1.clone() }
     }
 
     pub fn has_layer(&self, digest: &str) -> io::Result<bool> {

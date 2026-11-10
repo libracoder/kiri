@@ -2,6 +2,7 @@
 //! rename, diff, export, commit, prune, system df, history, search, events
 //! and network connect.
 
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Read};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
@@ -401,40 +402,84 @@ fn image_prune(req: &Request, engine: &Engine) -> Result<Value, Error> {
     Ok(json!({"ImagesDeleted": if deleted.is_empty() { Value::Null } else { Value::Array(deleted) }, "SpaceReclaimed": reclaimed}))
 }
 
+/// What the guest's storage takes on disk, by entry (`Msg::Usage`).
+#[derive(Default)]
+struct DiskUsage {
+    /// Unpacked layers by blob hex, half-done unpacks included.
+    layers: HashMap<String, u64>,
+    /// Writable layers by container id.
+    containers: HashMap<String, u64>,
+    volumes: HashMap<String, u64>,
+}
+
+impl DiskUsage {
+    fn parse(lines: &[String]) -> DiskUsage {
+        let mut du = DiskUsage::default();
+        for l in lines {
+            let mut f = l.split(' ');
+            let (Some(kind), Some(name), Some(Ok(bytes)), None) = (f.next(), f.next(), f.next().map(str::parse::<u64>), f.next()) else { continue };
+            let map = match kind {
+                "l" => &mut du.layers,
+                "c" => &mut du.containers,
+                "v" => &mut du.volumes,
+                _ => continue,
+            };
+            map.insert(name.to_owned(), bytes);
+        }
+        du
+    }
+}
+
+/// `docker system df`: sizes as they are on the engine's disk, measured by
+/// the guest. A layer not unpacked yet counts at its download size; if the
+/// guest doesn't answer, so does every layer, and containers and volumes go
+/// unmeasured, as before.
 fn system_df(engine: &Engine) -> Result<Value, Error> {
     let images = engine.store.images()?;
     let used: Vec<String> = engine.each(|c| Some(c.spec.image_id.clone()));
-    let layers_size: u64 = {
-        let mut seen: Vec<&str> = Vec::new();
-        let mut total = 0;
-        for i in &images {
-            for l in &i.layers {
-                if !seen.contains(&l.digest.as_str()) {
-                    seen.push(&l.digest);
-                    total += l.size;
-                }
-            }
+    let measured = engine.vm().ok().and_then(|vm| vm.usage(std::time::Duration::from_secs(120)));
+    let du = measured.as_deref().map(DiskUsage::parse);
+    let layer_size = |l: &kiri_image::Layer| du.as_ref().and_then(|d| d.layers.get(l.digest.trim_start_matches("sha256:")).copied()).unwrap_or(l.size);
+    // How many images use each layer, for each image's shared size.
+    let mut users: HashMap<&str, usize> = HashMap::new();
+    for i in &images {
+        let mut mine: Vec<&str> = i.layers.iter().map(|l| l.digest.as_str()).collect();
+        mine.dedup();
+        for d in mine {
+            *users.entry(d).or_default() += 1;
         }
-        total
-    };
+    }
+    // Every image layer once, as `layer_size` counts it; with the guest's
+    // numbers, plus the rest of the layer store: layers only stopped
+    // containers still use, and leftovers the next VM start clears.
+    let mut seen = HashSet::new();
+    let mut layers_size: u64 = images.iter().flat_map(|i| &i.layers).filter(|l| seen.insert(l.digest.trim_start_matches("sha256:"))).map(layer_size).sum();
+    if let Some(d) = &du {
+        layers_size += d.layers.iter().filter(|(hex, _)| !seen.contains(hex.as_str())).map(|(_, b)| b).sum::<u64>();
+    }
+    let image_size = |i: &kiri_image::Image| -> u64 { i.layers.iter().map(layer_size).sum() };
     let image_rows: Vec<Value> = images
         .iter()
         .map(|i| {
+            let size = image_size(i);
+            let shared: u64 = i.layers.iter().filter(|l| users.get(l.digest.as_str()).is_some_and(|n| *n > 1)).map(layer_size).sum();
             json!({
                 "Id": i.config_digest,
                 "ParentId": "",
                 "RepoTags": [i.name],
                 "RepoDigests": [],
                 "Created": time::parse_unix(&i.created),
-                "Size": i.size,
-                "SharedSize": -1,
-                "VirtualSize": i.size,
+                "Size": size,
+                "SharedSize": shared,
+                "VirtualSize": size,
                 "Labels": null,
                 "Containers": used.iter().filter(|u| **u == i.config_digest).count(),
             })
         })
         .collect();
     let containers = engine.each(|c| {
+        let rw = du.as_ref().and_then(|d| d.containers.get(&c.id).copied()).unwrap_or(0);
+        let image = images.iter().find(|i| i.config_digest == c.spec.image_id).map_or(0, image_size);
         Some(json!({
             "Id": c.id,
             "Names": [format!("/{}", c.name)],
@@ -444,8 +489,8 @@ fn system_df(engine: &Engine) -> Result<Value, Error> {
             "Created": time::unix(c.created),
             "State": c.status.as_str(),
             "Status": c.status.as_str(),
-            "SizeRw": 0,
-            "SizeRootFs": 0,
+            "SizeRw": rw,
+            "SizeRootFs": rw + image,
             "Labels": c.spec.labels,
         }))
     });
@@ -453,6 +498,7 @@ fn system_df(engine: &Engine) -> Result<Value, Error> {
         .volume_list()
         .iter()
         .map(|v| {
+            let size = du.as_ref().and_then(|d| d.volumes.get(&v.name)).map_or(-1, |b| *b as i64);
             json!({
                 "Name": v.name,
                 "Driver": "local",
@@ -460,7 +506,7 @@ fn system_df(engine: &Engine) -> Result<Value, Error> {
                 "Labels": v.labels,
                 "Scope": "local",
                 "Options": {},
-                "UsageData": {"Size": -1, "RefCount": engine.volume_users(&v.name).len()},
+                "UsageData": {"Size": size, "RefCount": engine.volume_users(&v.name).len()},
             })
         })
         .collect();
@@ -616,4 +662,19 @@ fn events(req: &Request, engine: &Engine, w: &mut UnixStream) -> io::Result<Next
     }
     http::end(w)?;
     Ok(Next::KeepAlive)
+}
+
+#[cfg(test)]
+mod disk_usage_tests {
+    use super::DiskUsage;
+
+    #[test]
+    fn reads_each_kind_and_skips_bad_lines() {
+        let lines: Vec<String> = ["l ab12 4096", "c c1 8192", "v data 12288", "v bad", "x odd 1", "l cd34 notanumber", "c c2 1 extra"].map(str::to_owned).to_vec();
+        let du = DiskUsage::parse(&lines);
+        assert_eq!(du.layers.get("ab12"), Some(&4096));
+        assert_eq!(du.containers.get("c1"), Some(&8192));
+        assert_eq!(du.volumes.get("data"), Some(&12288));
+        assert_eq!((du.layers.len(), du.containers.len(), du.volumes.len()), (1, 1, 1));
+    }
 }

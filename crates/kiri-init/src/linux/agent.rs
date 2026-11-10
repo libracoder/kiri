@@ -6,6 +6,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::path::Path;
 
 use kiri_proto::{Exited, MAX_OUTPUT_CHUNK, Msg, Stats, Stream};
 
@@ -85,6 +86,12 @@ pub fn serve(mut conn: File, paths: &Paths) -> io::Result<()> {
     let udp = super::relay::listen_udp()?;
     let pressure = memory_pressure_trigger();
     let mut last_pressure = std::time::Instant::now() - std::time::Duration::from_secs(1);
+    // `docker system df`: measured on a thread, which wakes the loop through
+    // this pipe; the loop sends the `Usage` lines (it is the only writer).
+    let (usage_wake, usage_ring) = usage_pipe()?;
+    let usage_ring = std::sync::Arc::new(usage_ring);
+    let (usage_tx, usage_rx) = std::sync::mpsc::channel::<Vec<String>>();
+    let mut measuring = false;
     let mut relays: Vec<super::relay::Relay> = Vec::new();
     let mut procs: HashMap<libc::pid_t, Proc> = HashMap::new();
     let mut fds: Vec<libc::pollfd> = Vec::with_capacity(16);
@@ -112,6 +119,7 @@ pub fn serve(mut conn: File, paths: &Paths) -> io::Result<()> {
         fds.push(libc::pollfd { fd: udp.as_raw_fd(), events: libc::POLLIN, revents: 0 });
         fds.push(libc::pollfd { fd: pressure.as_ref().map_or(-1, |f| f.as_raw_fd()), events: libc::POLLPRI, revents: 0 });
         fds.push(libc::pollfd { fd: term.as_ref().map_or(-1, |f| f.as_raw_fd()), events: libc::POLLIN, revents: 0 });
+        fds.push(libc::pollfd { fd: usage_wake.as_raw_fd(), events: libc::POLLIN, revents: 0 });
         for r in &relays {
             r.interest(&mut fds);
         }
@@ -176,6 +184,18 @@ pub fn serve(mut conn: File, paths: &Paths) -> io::Result<()> {
             if term.as_ref().is_some_and(|t| t.as_raw_fd() == pfd.fd) {
                 stop_containers(&mut procs);
                 return Ok(());
+            }
+            if pfd.fd == usage_wake.as_raw_fd() {
+                let mut sink = [0u8; 16];
+                // SAFETY: reading into a buffer we own from a descriptor we own.
+                while unsafe { libc::read(usage_wake.as_raw_fd(), sink.as_mut_ptr().cast(), sink.len()) } > 0 {}
+                while let Ok(lines) = usage_rx.try_recv() {
+                    measuring = false;
+                    out.clear();
+                    kiri_proto::encode_usage(&mut out, &lines);
+                    conn.write_all(&out)?;
+                }
+                continue;
             }
             if pfd.fd == forward.as_raw_fd() {
                 while let Some(r) = super::relay::accept(&forward) {
@@ -454,6 +474,20 @@ pub fn serve(mut conn: File, paths: &Paths) -> io::Result<()> {
                         if let Err(e) = if host_process { net::publish(&all) } else { net::publish_vm(&all, gateway) } {
                             eprintln!("kiri-init: unpublish {id}: {e}");
                         }
+                    }
+                    continue;
+                }
+                Ok(Msg::UsageQuery) => {
+                    // No reply here: replies go in order, and this can take
+                    // seconds. The lines follow as a `Usage` message.
+                    if !measuring {
+                        measuring = true;
+                        let (layers, containers, tx, ring) = (paths.layers.clone(), paths.containers.clone(), usage_tx.clone(), usage_ring.clone());
+                        let _ = std::thread::Builder::new().name("usage".into()).spawn(move || {
+                            let _ = tx.send(super::usage::measure(&layers, &containers, Path::new(container::VOLUMES)));
+                            // SAFETY: writing one byte from a buffer we own to a descriptor we own.
+                            unsafe { libc::write(ring.as_raw_fd(), [1u8].as_ptr().cast(), 1) };
+                        });
                     }
                     continue;
                 }
@@ -868,4 +902,13 @@ mod clock_tests {
         assert!(off_by_more(now - 3_600_000_000_000, now, 250_000_000));
         assert!(off_by_more(now + 300_000_000, now, 250_000_000));
     }
+}
+
+/// A non-blocking pipe: (read end the loop polls, write end the thread rings).
+fn usage_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+    let mut fds = [0; 2];
+    // SAFETY: `fds` has room for the two descriptors pipe2 writes.
+    sys::check(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } as _, "pipe")?;
+    // SAFETY: pipe2 just opened both; nothing else owns them.
+    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
 }
