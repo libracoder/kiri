@@ -65,6 +65,33 @@ impl Config {
 
 static HUB: std::sync::OnceLock<Arc<Hub>> = std::sync::OnceLock::new();
 
+/// Setup isn't finished: a docker command with no engine to answer it is
+/// told so, rather than having its connection simply closed.
+static SETUP_PENDING: AtomicBool = AtomicBool::new(false);
+
+pub fn set_setup_pending(pending: bool) {
+    SETUP_PENDING.store(pending, Ordering::SeqCst);
+}
+
+const SETUP_UNFINISHED: &str = "Kiri's setup isn't finished: open Kiri to finish it";
+
+/// Answers a client that got nothing from the engine while setup is
+/// unfinished: docker prints "Error response from daemon: <message>".
+/// True if it answered.
+fn refuse_unfinished(pipe: &Pipe) -> bool {
+    if !SETUP_PENDING.load(Ordering::SeqCst) {
+        return false;
+    }
+    let body = serde_json::json!({ "message": SETUP_UNFINISHED }).to_string();
+    let reply = format!("HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+    if pipe.write(reply.as_bytes()).is_err() {
+        return false;
+    }
+    pipe.flush();
+    let _ = pipe.write(&[]);
+    true
+}
+
 /// Docker's own pipe. docker-py, the Go and Java SDKs, Testcontainers and
 /// IDE plugins open it without reading docker contexts, so Kiri serves it
 /// too while no other engine does.
@@ -453,6 +480,9 @@ fn serve_shared(hub: &Hub, pipe: Arc<Pipe>) {
                 if e.kind() != io::ErrorKind::NotConnected {
                     log(&format!("bridge: {e}"));
                 }
+                if refuse_unfinished(&pipe) {
+                    linger(&pipe);
+                }
                 return;
             }
         };
@@ -517,12 +547,14 @@ fn serve_shared(hub: &Hub, pipe: Arc<Pipe>) {
 /// ended with EOF.
 fn to_client(pipe: &Pipe, rx: &Receiver<Reply>, queued: &AtomicUsize, credit: Option<(&Bridge, u32, &Window)>) -> bool {
     let mut done = 0usize;
+    let mut answered = false;
     for reply in rx {
         match reply {
             Reply::Data(d) => {
                 if pipe.write(&d).is_err() {
                     return false;
                 }
+                answered = true;
                 queued.fetch_sub(d.len(), Ordering::SeqCst);
                 done += d.len();
                 if let Some((b, id, _)) = credit
@@ -538,6 +570,9 @@ fn to_client(pipe: &Pipe, rx: &Receiver<Reply>, queued: &AtomicUsize, credit: Op
                 pipe.flush();
                 return pipe.write(&[]).is_ok();
             }
+            // Closed before a word, with setup unfinished: no engine is
+            // listening in Kiri's Linux yet. Say why.
+            Reply::Close if !answered && refuse_unfinished(pipe) => return true,
             Reply::Close => break,
         }
     }

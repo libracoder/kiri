@@ -96,9 +96,11 @@ fn env() -> Env {
     ENV.lock().unwrap_or_else(PoisonError::into_inner).clone().unwrap_or(Env { distro: None, pipe: r"\\.\pipe\kiri".into() })
 }
 
-/// The WSL distro Kiri's engine runs in, when not the default one.
+/// The WSL distro Kiri's engine runs in, when not the default one: the
+/// one named at start, or the one setup has just made (a first run starts
+/// with none, and setup's distro was otherwise left to WSL's default).
 pub(crate) fn distro() -> Option<String> {
-    env().distro
+    env().distro.or_else(crate::setup::saved_distro)
 }
 
 /// Starts the engine thread and the event watcher.
@@ -275,15 +277,16 @@ pub(crate) fn ensure_daemon() -> io::Result<()> {
         Ok(false) => {}
         Err(e) => crate::serve::log(&format!("engine: could not copy the engine into WSL ({e}); starting the one there")),
     }
+    let distro = distro();
     let mut cmd = crate::win::tool("wsl.exe");
-    if let Some(d) = &env().distro {
+    if let Some(d) = &distro {
         cmd.args(["-d", d]);
     }
     std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x0800_0000);
     let started = cmd.args(["-u", "root", "--", "systemctl", "start", "kiri"]).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
     if !started.is_ok_and(|s| s.success()) {
         let mut cmd = crate::win::tool("wsl.exe");
-        if let Some(d) = &env().distro {
+        if let Some(d) = &distro {
             cmd.args(["-d", d]);
         }
         std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x0800_0000);

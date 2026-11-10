@@ -145,6 +145,7 @@ fn main() -> std::process::ExitCode {
     // First run (or Kiri's Linux gone): the window opens on setup. Naming a
     // distro (--distro) is for development and skips it.
     let setup = !std::env::args().any(|a| a == "--distro") && setup::needed();
+    serve::set_setup_pending(setup);
     if let Err(e) = serve::start(cfg.clone()) {
         // Another kiri-win already serves the pipe: show its window instead.
         if app::running() {

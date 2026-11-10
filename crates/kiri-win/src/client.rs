@@ -18,6 +18,11 @@ pub fn set_pipe(name: &str) {
     let _ = PIPE.set(name.to_owned());
 }
 
+/// The pipe the daemon is served on.
+pub fn pipe() -> String {
+    PIPE.get().cloned().unwrap_or_else(|| r"\\.\pipe\kiri".to_owned())
+}
+
 fn connect() -> io::Result<Arc<Pipe>> {
     Pipe::open(PIPE.get().map_or(r"\\.\pipe\kiri", String::as_str)).map(Arc::new)
 }

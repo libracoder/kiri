@@ -79,6 +79,8 @@ struct Saved {
     distro: Option<String>,
     /// Unix seconds of the WSL install that needs a restart.
     restart_after: Option<u64>,
+    /// Why setup last stopped, kept so a restart of Kiri doesn't lose it.
+    last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -341,6 +343,11 @@ fn run(step: &'static str, work: impl FnOnce() -> io::Result<()> + Send + 'stati
         if let Err(e) = r {
             crate::serve::log(&format!("setup {step}: {e}"));
             let cancelled = CANCEL.load(Ordering::SeqCst);
+            if !cancelled {
+                let mut saved = saved();
+                saved.last_error = Some(e.to_string());
+                save(&saved);
+            }
             update(|s| {
                 if cancelled {
                     s.step = if step == "wsl" { "welcome" } else if step == "linux" { "choose" } else { step };
@@ -612,6 +619,14 @@ fn engine() -> io::Result<()> {
     });
     task(0, "active", "");
     let t0 = Instant::now();
+    // Started here, not only waited for: setup resumed after Kiri or
+    // Windows restarted finds Kiri's Linux there but its engine not running,
+    // and nothing else starts it while the window is on setup.
+    if !crate::client::alive()
+        && let Err(e) = crate::engine::ensure_daemon()
+    {
+        crate::serve::log(&format!("setup engine: {e}; still waiting for it"));
+    }
     while !crate::client::alive() {
         if CANCEL.load(Ordering::SeqCst) {
             return Err(io::Error::other("cancelled"));
@@ -622,7 +637,8 @@ fn engine() -> io::Result<()> {
         std::thread::sleep(Duration::from_millis(200));
     }
     task(0, "done", &trf("answered in {ms} ms", &[("ms", &t0.elapsed().as_millis())]));
-    task(1, "done", r"\\.\pipe\kiri");
+    let pipe = crate::client::pipe();
+    task(1, "done", &pipe);
     // Windows' proxy before the first pull, through the relay when it is on
     // Windows' loopback: the minute's refresh may not have come yet.
     crate::engine::send_windows_proxy();
@@ -633,7 +649,7 @@ fn engine() -> io::Result<()> {
     if !dir().join("bin").join("docker.exe").is_file() {
         verified("bin/docker.exe")?;
     }
-    let out = quiet(&docker().to_string_lossy()).args(["--host", "npipe:////./pipe/kiri", "run", "--rm", "alpine", "echo", "hello"]).output()?;
+    let out = quiet(&docker().to_string_lossy()).args(["--host", &format!("npipe://{}", pipe.replace('\\', "/")), "run", "--rm", "alpine", "echo", "hello"]).output()?;
     let text = String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
     for l in text.lines().rev().take(3).collect::<Vec<_>>().into_iter().rev() {
         log_line(l);
@@ -752,7 +768,9 @@ fn finish() {
     let mut s = saved();
     s.done = true;
     s.restart_after = None;
+    s.last_error = None;
     save(&s);
+    crate::serve::set_setup_pending(false);
     let exe = dir().join("kiri-win.exe");
     let run_key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
     if autostart {
@@ -793,7 +811,15 @@ pub fn on_message(msg: &str) {
             std::thread::spawn(|| {
                 let s = saved();
                 let step = current_step(&s);
-                let fresh = fresh_state(step, &s);
+                let mut fresh = fresh_state(step, &s);
+                if let Some(e) = &s.last_error {
+                    crate::serve::log(&format!("setup: carrying on at {step}; last time it stopped with: {e}"));
+                    // A step that carries on by itself shows its own result;
+                    // one waiting for a choice shows why setup stopped.
+                    if matches!(step, "choose" | "welcome") {
+                        fresh.error = Some(e.clone());
+                    }
+                }
                 *STATE.lock().unwrap_or_else(PoisonError::into_inner) = Some(fresh);
                 update(|_| {});
                 // A restart finished WSL, or the engine is there already: carry on by itself.
