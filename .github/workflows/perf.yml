@@ -8,29 +8,19 @@
 # The limits come from main's copy of the script when it has one, so a pull
 # request can't loosen them for itself.
 #
-# A maintainer can also run it for any open pull request by number (Actions →
-# Speed → Run workflow), without touching the pull request.
-#
 # Safe for pull requests from forks: it runs on GitHub's machines with a
 # read-only token and no secrets, and uses pull_request (never
 # pull_request_target), so a fork's code can't write to the repository.
 name: Speed
-run-name: Speed ${{ inputs.pr && format('for #{0}', inputs.pr) || '' }}
 
 on:
   pull_request:
-  workflow_dispatch:
-    inputs:
-      pr:
-        description: Pull request number
-        required: true
-        type: number
 
 permissions:
   contents: read
 
 concurrency:
-  group: speed-${{ github.event.pull_request.number || inputs.pr }}
+  group: speed-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:
@@ -43,7 +33,6 @@ jobs:
       - name: Check out this change
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/pull/{0}/merge', inputs.pr) || '' }}
           fetch-depth: 2
           path: head
           persist-credentials: false
@@ -72,7 +61,7 @@ jobs:
         run: sudo apt-get install -y -qq strace >/dev/null
       - name: Compare
         env:
-          PR: ${{ github.event.pull_request.number || inputs.pr }}
+          PR: ${{ github.event.pull_request.number }}
         run: |
           scripts=base/scripts
           [ -f "$scripts/perf.py" ] || scripts=head/scripts
