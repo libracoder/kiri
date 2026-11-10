@@ -36,6 +36,17 @@ once; see the README.
   maintainer's OK. It also runs on every pull request; on Linux, point
   `CHROME` at your Chrome or Chromium.
 
+## Speed is a feature
+
+Kiri is small and fast on purpose, and every pull request is checked for it.
+The Speed check builds main and your change, runs both engines side by side
+on one machine and compares them: `docker run`, API round trips, the daemon's
+memory, the system calls one container costs, and the binaries' size. It
+fails when the change is slower than main past the limits in
+`scripts/perf.py`; the table is in the check's summary. To run it yourself on
+Linux, build both with `cargo xtask linux` and run
+`scripts/perf-run.sh <main's build> <your build> <work folder>`.
+
 ## Pull requests
 
 - Keep each pull request to one change, with a message that says what it does
