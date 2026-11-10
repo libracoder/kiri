@@ -179,6 +179,11 @@ impl VmLink {
         self.windows.is_lost()
     }
 
+    /// Observes disconnection without waiting for the reader's cleanup.
+    pub fn is_disconnected(&self) -> bool {
+        self.windows.lock().lost
+    }
+
     /// Starts the reader thread. `on_event` runs on that thread, so it must
     /// not block for long: it holds up every reply behind it.
     pub fn new(vm: Vm, conn: File, on_event: impl Fn(Event<'_>) + Send + 'static) -> io::Result<VmLink> {
