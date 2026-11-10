@@ -1296,6 +1296,9 @@ impl Engine {
                         c.finished = Some(SystemTime::now());
                         c.attached.clear();
                         lock_log(&c.log).end_follow();
+                        if recover_after_vm_loss(c) {
+                            c.restart_count = c.restart_count.saturating_add(1);
+                        }
                     }
                 }
                 for e in st.execs.values_mut() {
@@ -3483,6 +3486,11 @@ mod vm_recovery_tests {
         assert_eq!(live.status, Status::Exited);
         assert_eq!(live.exit_code, 255);
         assert!(live.vm_stopped);
+        assert_eq!(live.restart_count, 1, "a VM recovery counts as a restart");
+        assert_eq!(saved.iter().find(|c| c.name == "unless-live").unwrap().restart_count, 1);
+        for name in ["always-stopped", "unless-stopped", "always-created", "unless-created", "no-live", "failure-live"] {
+            assert_eq!(saved.iter().find(|c| c.name == name).unwrap().restart_count, 0, "{name} must not restart");
+        }
         // A stop that arrives between the crash and the next boot wins.
         let lifecycle = engine.lifecycle(&ids["unless-live"]).unwrap();
         let starting = lifecycle.lock().unwrap();
