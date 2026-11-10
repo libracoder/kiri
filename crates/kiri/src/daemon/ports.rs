@@ -222,6 +222,10 @@ impl Drop for Forwards {
     }
 }
 
+/// A wake pipe: closing the write end stops a listener's thread. Both ends
+/// are close-on-exec: a child the daemon starts later (on a Linux host, the
+/// agent) would otherwise hold a copy of the write end, the pipe would never
+/// close, and stopping the listener would wait forever.
 pub(super) fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
     let mut fds = [0; 2];
     // SAFETY: `fds` has room for the two descriptors pipe writes.
@@ -229,7 +233,14 @@ pub(super) fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: pipe succeeded, so both are fresh and ours.
-    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
+    let (r, w) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    for fd in [&r, &w] {
+        // SAFETY: F_SETFD on a descriptor we own.
+        if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok((r, w))
 }
 
 fn kernel_host_ip(ip: &str) -> Option<[u8; 4]> {
