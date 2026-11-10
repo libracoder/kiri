@@ -5097,9 +5097,13 @@ function drawNotes() {
 /* A redraw while a mouse button is down replaces the button under the
    pointer, and the browser drops the click: Disconnect, Stop and the rest
    then need a second press. Redraws wait until the button is up, and run
-   right after the click it makes. */
+   right after the click it makes. A menu (<select>) is left out: its list is
+   the system's own, which takes the button's release, so no pointerup comes
+   and every redraw after it would wait for the next click anywhere (a new
+   language showed in the sidebar but not in Settings). A change, picked from
+   any menu, also lets held redraws go. */
 const press = { down: false, later: new Set() };
-document.addEventListener("pointerdown", (ev) => { if (ev.button === 0) press.down = true; }, true);
+document.addEventListener("pointerdown", (ev) => { if (ev.button === 0 && !ev.target.closest?.("select")) press.down = true; }, true);
 const pressDone = () => {
   if (!press.down) return;
   press.down = false;
@@ -5107,6 +5111,7 @@ const pressDone = () => {
 };
 document.addEventListener("pointerup", pressDone, true);
 document.addEventListener("pointercancel", pressDone, true);
+document.addEventListener("change", pressDone, true);
 window.addEventListener("blur", pressDone);
 const held = (fn) => (press.down ? (press.later.add(fn), true) : false);
 
