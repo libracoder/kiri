@@ -49,7 +49,11 @@ jobs:
         run: |
           # Static Linux builds, as `cargo xtask linux` makes them. Both use
           # one target folder, so the second only rebuilds what changed.
+          # Cargo tells what changed by file times, and this change was
+          # checked out before main was built: give each side's files the
+          # time now, or the second build keeps the first one's binary.
           for e in base head; do
+            find "$e" -type f -exec touch {} +
             mkdir -p "$RUNNER_TEMP/$e-bin"
             docker run --rm -v "$PWD/$e:/src" -v "$RUNNER_TEMP/$e-bin:/out" \
               -v kiri-perf-target:/t -v kiri-perf-cargo:/usr/local/cargo/registry \
