@@ -685,16 +685,14 @@ impl Engine {
                 return Err(io::Error::new(io::ErrorKind::WouldBlock, "VM recovery is backing off"));
             }
         }
-        if let Some(vm) = old {
-            if let Err(e) = vm.retire() {
-                let mut st = self.lock();
-                let delay = st.containers.values().filter(|c| recover_after_vm_loss(c))
-                    .map(|c| restart_backoff(c.restart_count.saturating_sub(1))).max();
-                st.vm_recovery_at = delay.map(|delay| std::time::Instant::now() + delay);
-                drop(st);
-                self.recover_vm();
-                return Err(e);
-            }
+        if let Some(vm) = old && let Err(e) = vm.retire() {
+            let mut st = self.lock();
+            let delay = st.containers.values().filter(|c| recover_after_vm_loss(c))
+                .map(|c| restart_backoff(c.restart_count.saturating_sub(1))).max();
+            st.vm_recovery_at = delay.map(|delay| std::time::Instant::now() + delay);
+            drop(st);
+            self.recover_vm();
+            return Err(e);
         }
         // Retained old links are inert; successful retirement has released
         // their VM and completed cleanup before the replacement opens disk.
