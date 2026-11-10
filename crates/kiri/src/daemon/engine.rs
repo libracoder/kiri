@@ -884,6 +884,9 @@ impl Engine {
             let Some(vm) = engine.awake() else { continue };
             let host_ip = if crate::k8s::config().lan { "0.0.0.0" } else { "127.0.0.1" };
             let mut lb = engine.k8s_lb.lock().unwrap_or_else(|e| e.into_inner());
+            if vm.is_disconnected() {
+                continue;
+            }
             if bound_on != host_ip {
                 lb.clear();
                 bound_on = host_ip.to_owned();
