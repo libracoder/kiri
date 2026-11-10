@@ -578,6 +578,26 @@ impl VmLink {
         let _ = self.send(|o| Msg::Shutdown.encode(o));
     }
 
+    /// Success confirms both shutdown and release of the old generation's
+    /// resources, even while relay threads retain this link.
+    pub fn retire(&self) -> io::Result<()> {
+        self._vm.lock().unwrap_or_else(|e| e.into_inner())
+            .retire(std::time::Duration::from_secs(10), std::time::Duration::from_secs(10))
+    }
+
+    #[cfg(test)]
+    pub(super) fn hold_retirement(&self) -> std::sync::MutexGuard<'_, Vm> {
+        self._vm.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[cfg(test)]
+    pub(super) fn interrupted_layer(&self, blob: &Path) -> io::Result<()> {
+        self.call(|out| Msg::LayerBegin(LayerBegin {
+            digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            media_type: "application/vnd.oci.image.layer.v1.tar+gzip", size: 1,
+        }).encode(out), Some((blob, 1))).map(|_| ())
+    }
+
     /// Waits for the guest to stop after `shutdown`, and forces it if it has
     /// not within `timeout`. False if it had to be forced.
     ///
