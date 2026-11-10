@@ -648,6 +648,7 @@ impl Engine {
         let t0 = std::time::Instant::now();
         let guest = crate::guest::Guest::boot(&crate::guest::BootOptions {
             data_disk: true,
+            console_log: Some(crate::diag::console::path()?),
             memory_mib: Some(ceiling >> 20),
             cpus: Some(cpus),
             ..Default::default()
@@ -1259,7 +1260,7 @@ impl Engine {
                 self.changed.notify_all();
                 if !self.sleeping.load(std::sync::atomic::Ordering::SeqCst) {
                     self.save();
-                    crate::diag::error!("the VM stopped unexpectedly; the next request boots a new one");
+                    crate::diag::error!("the VM stopped unexpectedly; the next request boots a new one", console = crate::diag::console::path().map(|p| p.display().to_string()).unwrap_or_default());
                     // A crashed VM: forget it, so the next request boots a fresh one.
                     if let Ok(mut link) = self.link.try_lock() {
                         *link = None;
