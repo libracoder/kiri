@@ -72,7 +72,8 @@ kiri UI ────┘
 - **VM**: Apple's Virtualization.framework, driven from Rust through objc2.
   A custom 10 MB kernel (`guest/kernel/`) built from allnoconfig, with one
   patch that cuts virtio-pci reset waits from a scheduler tick to
-  microseconds. Rosetta is shared in over virtiofs and registered with
+  microseconds, one that hands big TCP to the host as GSO, and an upstream
+  GRO fix that keeps forwarded packets segmentable. Rosetta is shared in over virtiofs and registered with
   binfmt_misc.
 - **Guest agent**: a ~900 KB static Rust binary that is PID 1. One `poll()`
   loop serves the host, reaps children, forwards container output, relays
