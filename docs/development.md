@@ -114,7 +114,15 @@ rotations (`.1`, `.2`) hold at most 1 MiB each. Files are private, credential
 patterns are redacted, and lines over 16 KiB are omitted. The unexpected-stop
 log line names this file. The console stays local; crash reports do not send it.
 
-After a guest crash, the next request boots a new VM and restarts the
-containers that were running with `always` or `unless-stopped`. A manual stop,
-kill or removal wins over that recovery; `no`, `on-failure` and containers that
-never ran stay down.
+After a guest crash, Kiri automatically boots a new VM when containers were
+running with `always` or `unless-stopped`, then restarts them and increments
+their `RestartCount`. Repeated losses back off from 100 ms to one minute. A
+manual stop, kill or removal wins, including during that wait; `no`,
+`on-failure` and containers that never ran stay down. If the automatic boot
+fails, the next request that needs the VM retries recovery.
+
+The real-VM regression is an opt-in ignored test:
+`vm_loss_live_recovers_without_a_request`. Run its signed test binary with
+an isolated `HOME` and `KIRI_DATA_DIR` containing `alpine:latest` and no
+containers, `KIRI_GUEST_DIR` pointing to matching guest assets, and
+`KIRI_LIVE_VM_RECOVERY=1`. It force-stops only the VM it creates.
