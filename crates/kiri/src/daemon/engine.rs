@@ -1360,7 +1360,6 @@ impl Engine {
         f64::from(self.cpu_permyriad.load(std::sync::atomic::Ordering::Relaxed)) / 100.0
     }
 
-    /// Reads the VM's CPU time every two seconds, for `cpu_percent`.
     /// Keeps the VM's clock on the Mac's. The guest is told the time at
     /// boot, but its clock stops while the Mac sleeps, so after each sleep it
     /// fell further behind: an hour behind after a few nights, and apt
@@ -1391,6 +1390,7 @@ impl Engine {
         });
     }
 
+    /// Reads the VM's CPU time every two seconds, for `cpu_percent`.
     fn start_cpu_meter(self: &Arc<Self>) {
         let me = Arc::downgrade(self);
         let _ = std::thread::Builder::new().name("kiri-cpu".into()).spawn(move || {
