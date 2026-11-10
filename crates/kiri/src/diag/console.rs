@@ -132,6 +132,23 @@ mod tests {
     }
 
     #[test]
+    fn rotation_failure_does_not_grow_the_current_file() {
+        let dir = dir("rotation-error");
+        let path = dir.join("guest-console.log");
+        record(io::Cursor::new(format!("{}\n", "x".repeat(99))), &path, 128).unwrap();
+        // A nonempty directory blocks each rename in the rotation chain.
+        for n in 1..=2 {
+            let rotated = super::super::rotated(&path, n);
+            std::fs::create_dir(&rotated).unwrap();
+            std::fs::write(rotated.join("blocker"), b"occupied").unwrap();
+        }
+        let result = record(io::Cursor::new(format!("{}\n", "y".repeat(99))), &path, 128);
+        assert!(result.is_err(), "failed rotation must stop writing");
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 100);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn unbounded_lines_are_omitted_and_files_stay_capped_across_boots() {
         let dir = dir("bounded");
         let path = dir.join("guest-console.log");

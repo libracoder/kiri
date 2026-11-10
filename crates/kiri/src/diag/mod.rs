@@ -298,9 +298,13 @@ pub fn append_to(path: &Path, line: &str, max: u64) -> io::Result<()> {
     let _held = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if std::fs::metadata(path).is_ok_and(|m| m.len() + line.len() as u64 + 1 > max) {
         for n in (1..KEEP).rev() {
-            let _ = std::fs::rename(rotated(path, n), rotated(path, n + 1));
+            if let Err(e) = std::fs::rename(rotated(path, n), rotated(path, n + 1))
+                && e.kind() != io::ErrorKind::NotFound
+            {
+                return Err(e);
+            }
         }
-        let _ = std::fs::rename(path, rotated(path, 1));
+        std::fs::rename(path, rotated(path, 1))?;
     }
     let open = || std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(path);
     let mut f = match open() {
