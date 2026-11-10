@@ -108,6 +108,9 @@ fn route(req: &Request, engine: &Arc<Engine>, w: &mut UnixStream, r: &mut BufRea
         ("POST", "/kiri/proxy") => return reply(w, set_proxy(req), 200),
         ("PUT", "/kiri/proxy/system") => return reply(w, set_host_proxy(req), 200),
         ("GET", "/kiri/resources") => return reply(w, Ok(resources(engine)), 200),
+        // Settings → Domains: the container-domain routers' ports.
+        ("GET", "/kiri/domains") => return reply(w, Ok(super::domains::report()), 200),
+        ("POST", "/kiri/domains") => return reply(w, set_domain_ports(req, engine), 200),
         // USB passthrough (macOS: the root helper `kiri usb serve` connects here).
         #[cfg(target_os = "macos")]
         ("POST", "/kiri/usb") => return super::usb::attach(req, engine, w, r),
@@ -607,6 +610,12 @@ fn set_proxy(req: &Request) -> Result<Value, Error> {
     super::proxy::save(&json!({"mode": mode, "http": field("http"), "https": field("https"), "no_proxy": field("no_proxy"), "containers": body["containers"].as_bool().unwrap_or(false)}))
         .map_err(Error::Io)?;
     Ok(super::proxy::report())
+}
+
+fn set_domain_ports(req: &Request, engine: &Arc<Engine>) -> Result<Value, Error> {
+    let body: Value = serde_json::from_slice(&req.body).map_err(|e| Error::BadRequest(format!("invalid JSON: {e}")))?;
+    let port = |k: &str| body[k].as_u64().and_then(|p| u16::try_from(p).ok()).filter(|&p| p != 0).ok_or_else(|| Error::BadRequest(format!("{k} must be a port from 1 to 65535")));
+    super::domains::set_ports(engine, port("http")?, port("https")?).map_err(Error::Conflict)
 }
 
 fn set_resources(req: &Request) -> Result<(), Error> {

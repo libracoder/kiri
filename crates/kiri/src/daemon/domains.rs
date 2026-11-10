@@ -146,30 +146,178 @@ fn reclaim() {
     }
 }
 
-fn start_router(engine: Arc<Engine>, port: u16, tls: Option<Arc<rustls::ServerConfig>>, var: &str) -> io::Result<u16> {
-    let router = Arc::new(Router { port, engine, tls, want: 0.into(), serving: Mutex::new(Vec::new()) });
-    let threads = router.listen(1).map_err(|_| io::Error::new(io::ErrorKind::AddrInUse, format!("port {port} is taken; set {var}")))?;
-    router.want.store(threads.len(), std::sync::atomic::Ordering::Relaxed);
-    *router.serving.lock().unwrap_or_else(PoisonError::into_inner) = threads;
+/// Adds a router to the list, starting the take-back thread with the first.
+fn register(router: Arc<Router>) -> io::Result<()> {
     let mut routers = ROUTERS.lock().unwrap_or_else(PoisonError::into_inner);
     if routers.is_empty() {
         std::thread::Builder::new().name("kiri-domains-reclaim".into()).spawn(reclaim)?;
     }
     routers.push(router);
+    Ok(())
+}
+
+/// A router on `port`, listening; an error when the port is taken.
+fn bind_router(engine: Arc<Engine>, port: u16, tls: Option<Arc<rustls::ServerConfig>>) -> io::Result<Arc<Router>> {
+    let router = Arc::new(Router { port, engine, tls, want: 0.into(), serving: Mutex::new(Vec::new()) });
+    let threads = router.listen(1)?;
+    router.want.store(threads.len(), std::sync::atomic::Ordering::Relaxed);
+    *router.serving.lock().unwrap_or_else(PoisonError::into_inner) = threads;
+    Ok(router)
+}
+
+fn start_router(engine: Arc<Engine>, kind: Kind, tls: Option<Arc<rustls::ServerConfig>>) -> io::Result<u16> {
+    let port = kind.port();
+    let how = if env_port(kind.var()).is_some() { format!("set {}", kind.var()) } else { "pick another in Settings → Domains".into() };
+    register(bind_router(engine, port, tls).map_err(|_| io::Error::new(io::ErrorKind::AddrInUse, format!("port {port} is taken; {how}")))?)?;
     Ok(port)
 }
 
-/// Starts the HTTPS router on port 443 (or `KIRI_HTTPS_PORT`): the same
-/// routing, behind TLS with certificates from tls.rs. Returns the port.
+/// Starts the HTTPS router on port 443, or the port Settings → Domains (or
+/// `KIRI_HTTPS_PORT`) gives: the same routing, behind TLS with certificates
+/// from tls.rs. Returns the port.
 pub fn start_tls(engine: Arc<Engine>) -> io::Result<u16> {
-    let port: u16 = std::env::var("KIRI_HTTPS_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(443);
-    start_router(engine, port, Some(super::tls::server_config()?), "KIRI_HTTPS_PORT")
+    start_router(engine, Kind::Https, Some(super::tls::server_config()?))
 }
 
-/// Starts the router on port 80 (or `KIRI_HTTP_PORT`). Returns the port.
+/// Starts the router on port 80, or the port Settings → Domains (or
+/// `KIRI_HTTP_PORT`) gives. Returns the port.
 pub fn start(engine: Arc<Engine>) -> io::Result<u16> {
-    let port: u16 = std::env::var("KIRI_HTTP_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(80);
-    start_router(engine, port, None, "KIRI_HTTP_PORT")
+    start_router(engine, Kind::Http, None)
+}
+
+/// The two routers.
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    Http,
+    Https,
+}
+
+impl Kind {
+    fn var(self) -> &'static str {
+        match self {
+            Kind::Http => "KIRI_HTTP_PORT",
+            Kind::Https => "KIRI_HTTPS_PORT",
+        }
+    }
+    fn key(self) -> &'static str {
+        match self {
+            Kind::Http => "http",
+            Kind::Https => "https",
+        }
+    }
+    fn default(self) -> u16 {
+        match self {
+            Kind::Http => 80,
+            Kind::Https => 443,
+        }
+    }
+    /// The port it should use: the environment variable, then Settings →
+    /// Domains (`~/.kiri/domains.json`), then 80 or 443.
+    fn port(self) -> u16 {
+        env_port(self.var()).or_else(|| saved_port(self)).unwrap_or(self.default())
+    }
+    /// The running router, serving or stepped aside.
+    fn router(self) -> Option<Arc<Router>> {
+        ROUTERS.lock().unwrap_or_else(PoisonError::into_inner).iter().find(|r| r.tls.is_some() == (self == Kind::Https)).cloned()
+    }
+}
+
+fn env_port(var: &str) -> Option<u16> {
+    std::env::var(var).ok().and_then(|p| p.trim().parse().ok()).filter(|&p| p != 0)
+}
+
+/// Settings → Domains keeps the routers' ports here.
+fn settings_path() -> Option<std::path::PathBuf> {
+    super::state_dir().ok().map(|d| d.join("domains.json"))
+}
+
+fn saved_port(kind: Kind) -> Option<u16> {
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(settings_path()?).ok()?).ok()?;
+    v[kind.key()].as_u64().and_then(|p| u16::try_from(p).ok()).filter(|&p| p != 0)
+}
+
+/// Whether this engine has router ports of its own: Kiri Dev starts its
+/// routers only then, leaving 80 and 443 to the installed Kiri.
+pub fn own_ports() -> bool {
+    env_port(Kind::Http.var()).is_some() || settings_path().is_some_and(|p| p.exists())
+}
+
+/// Settings → Domains: the routers' ports, whether each runs and serves
+/// (not while a container has its port), and which ones an environment
+/// variable fixes.
+pub fn report() -> serde_json::Value {
+    let mut v = serde_json::json!({});
+    for kind in [Kind::Http, Kind::Https] {
+        let r = kind.router();
+        v[kind.key()] = serde_json::json!({
+            "port": r.as_ref().map_or(kind.port(), |r| r.port),
+            "default": kind.default(),
+            // Off: no router (its port was taken at start, or Kiri Dev
+            // without ports of its own). Running but not serving: it
+            // stepped aside for a container.
+            "running": r.is_some(),
+            "serving": r.is_some_and(|r| !r.serving.lock().unwrap_or_else(PoisonError::into_inner).is_empty()),
+            "env": env_port(kind.var()).map(|_| kind.var()),
+        });
+    }
+    v
+}
+
+/// One change of ports at a time.
+static MOVING: Mutex<()> = Mutex::new(());
+
+/// Settings → Domains: moves the routers to `http` and `https`, at once,
+/// with no engine restart. Every new port is bound before an old one
+/// closes, so a taken port changes nothing and says so. Saved only once it
+/// worked. Connections already open finish on the old port.
+pub fn set_ports(engine: &Arc<Engine>, http: u16, https: u16) -> Result<serde_json::Value, String> {
+    let _one = MOVING.lock().unwrap_or_else(PoisonError::into_inner);
+    if http == 0 || https == 0 {
+        return Err("ports must be 1 to 65535".into());
+    }
+    if http == https {
+        return Err("HTTP and HTTPS need different ports".into());
+    }
+    let mut moves: Vec<(Option<Arc<Router>>, Arc<Router>)> = Vec::new();
+    for (kind, want) in [(Kind::Http, http), (Kind::Https, https)] {
+        if let Some(p) = env_port(kind.var())
+            && p != want
+        {
+            return Err(format!("{} sets this port to {p}; remove it to choose the port here", kind.var()));
+        }
+        let old = kind.router();
+        if old.as_ref().is_some_and(|r| r.port == want) {
+            continue;
+        }
+        let tls = match kind {
+            Kind::Https => Some(super::tls::server_config().map_err(|e| e.to_string())?),
+            Kind::Http => None,
+        };
+        match bind_router(engine.clone(), want, tls) {
+            Ok(new) => moves.push((old, new)),
+            Err(_) => {
+                for (_, new) in moves {
+                    new.stop();
+                }
+                return Err(format!("port {want} is in use; pick another"));
+            }
+        }
+    }
+    for (old, new) in moves {
+        if let Some(old) = old {
+            ROUTERS.lock().unwrap_or_else(PoisonError::into_inner).retain(|r| !Arc::ptr_eq(r, &old));
+            old.stop();
+        }
+        let port = new.port;
+        register(new).map_err(|e| e.to_string())?;
+        crate::diag::info!("the container-domain router moved", port = port);
+    }
+    let path = settings_path().ok_or("HOME is not set")?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::json!({"http": http, "https": https}).to_string())
+        .and_then(|()| std::fs::rename(&tmp, &path))
+        .map_err(|e| e.to_string())?;
+    Ok(report())
 }
 
 fn serve(mut client: TcpStream, engine: &Engine) -> io::Result<()> {

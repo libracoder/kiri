@@ -1069,6 +1069,13 @@ pub fn on_message(msg: &str) {
         "resources" => crate::wslconfig::resources(None),
         "setresources" => crate::wslconfig::resources(Some(c.value)),
         "domains" => domains(c.value.as_bool().unwrap_or(false)),
+        "routerports" => {
+            std::thread::spawn(|| router_ports(None));
+        }
+        "setrouterports" => {
+            let body = c.value;
+            std::thread::spawn(move || router_ports(Some(body)));
+        }
         // The USB view: usbipd-win's devices, and which are in WSL.
         "usb" => {
             std::thread::spawn(|| emit(crate::usb::list().to_string()));
@@ -1232,6 +1239,20 @@ pub(crate) fn send_windows_proxy() {
     let relay = crate::relay::ports(&targets);
     body["relay"] = relay.iter().map(|(t, l)| (t.to_string(), json!(l))).collect::<serde_json::Map<_, _>>().into();
     let _ = client::request("PUT", "/kiri/proxy/system", Some(&body));
+}
+
+/// Settings → Domains: reads (or moves, then reads) the routers' ports. The
+/// routers listen on WSL's loopback; WSL forwards their port to Windows'.
+fn router_ports(set: Option<Value>) {
+    if let Some(body) = set {
+        match expect_ok(client::request("POST", "/kiri/domains", Some(&body))) {
+            Ok(()) => emit(notice("ok", &tr("Ports changed"))),
+            Err(e) => emit(notice("error", &trf("Could not change the ports: {error}", &[("error", &e)]))),
+        }
+    }
+    let mut v = client::get("/kiri/domains").unwrap_or_else(|e| json!({"error": e.to_string()}));
+    v["type"] = json!("routerports");
+    emit(v.to_string());
 }
 
 /// Settings → Network: the daemon's proxy settings.

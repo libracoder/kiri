@@ -412,6 +412,41 @@ else
   skip domain-port-back "only the installed Kiri has the router on port 80"
 fi
 
+# Settings → Domains moves the routers with no restart; a taken port
+# changes nothing. Kiri Dev has no routers until given ports, so there the
+# move starts them, and its settings file goes afterwards.
+section "domain router ports"
+dpost() { curl -s --unix-socket "$SOCK" -X POST -H 'Content-Type: application/json' -d "$1" http://d/kiri/domains; }
+dport() { curl -s --unix-socket "$SOCK" http://d/kiri/domains | python3 -c "import json,sys; print(json.load(sys.stdin)['$1']['port'])"; }
+OLD_HTTP=$(dport http) OLD_HTTPS=$(dport https)
+$D run -d --name dmv nginx:alpine >/dev/null
+$D run -d --name dhold -p 18799:80 nginx:alpine >/dev/null
+t domain-ports-same "different ports" curl -s --unix-socket "$SOCK" -X POST -d '{"http":18780,"https":18780}' http://d/kiri/domains
+t domain-ports-zero "1 to 65535" curl -s --unix-socket "$SOCK" -X POST -d '{"http":0,"https":18743}' http://d/kiri/domains
+t domain-ports-taken "18799 is in use" curl -s --unix-socket "$SOCK" -X POST -d '{"http":18799,"https":18743}' http://d/kiri/domains
+t domain-ports-unchanged "$OLD_HTTP" bash -c "curl -s --unix-socket '$SOCK' http://d/kiri/domains | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"http\"][\"port\"])'"
+t domain-ports-move '"port":18780' curl -s --unix-socket "$SOCK" -X POST -d '{"http":18780,"https":18743}' http://d/kiri/domains
+t domain-ports-http "Welcome to nginx" bash -c "for i in \$(seq 20); do curl -s -m 2 http://dmv.kiri.localhost:18780 | grep -q nginx && break; sleep 0.5; done; curl -s -m 5 http://dmv.kiri.localhost:18780"
+t domain-ports-https "Welcome to nginx" curl -sk -m 5 https://dmv.kiri.localhost:18743
+# The old port is free afterwards: only the installed Kiri's (Kiri Dev's
+# old port 80 is the installed Kiri's own router).
+if [ -z "$FEATURE" ]; then
+  t domain-ports-old-free "closed" bash -c "curl -s -m 2 -o /dev/null http://dmv.kiri.localhost:$OLD_HTTP && echo open || echo closed"
+else
+  skip domain-ports-old-free "port $OLD_HTTP is the installed Kiri's"
+fi
+# A container can still take the moved port, and gives it back.
+t domain-ports-yield "Welcome to nginx" bash -c "$D run -d --name d18780 -p 18780:80 nginx:alpine >/dev/null && sleep 1 && curl -s -m 5 http://127.0.0.1:18780/"
+$D rm -f d18780 >/dev/null
+t domain-ports-back "Welcome to nginx" bash -c "for i in \$(seq 20); do curl -s -m 2 http://dmv.kiri.localhost:18780 | grep -q nginx && break; sleep 0.5; done; curl -s -m 5 http://dmv.kiri.localhost:18780"
+if [ -z "$FEATURE" ]; then
+  t domain-ports-restore "\"port\":$OLD_HTTP" dpost "{\"http\":$OLD_HTTP,\"https\":$OLD_HTTPS}"
+  t domain-ports-restored "Welcome to nginx" bash -c "for i in \$(seq 20); do curl -s -m 2 http://dmv.kiri.localhost:$OLD_HTTP | grep -q nginx && break; sleep 0.5; done; curl -s -m 5 http://dmv.kiri.localhost:$OLD_HTTP"
+else
+  rm -f "$HOME/.kiri-$FEATURE/domains.json"
+fi
+$D rm -f dmv dhold >/dev/null
+
 section "container files in Finder ($KF)"
 $D run -d --name fsv nginx:alpine >/dev/null; sleep 0.7
 t finder-lists "fsv" ls "$KF"

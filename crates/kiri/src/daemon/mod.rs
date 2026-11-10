@@ -142,10 +142,13 @@ pub fn run(_args: &[String]) -> io::Result<()> {
     // A Kubernetes node the engine restarted gets its kubectl context.
     crate::k8s::sync_at_start();
     // Kiri Dev leaves *.kiri.local and ports 80 and 443 to the installed
-    // Kiri, unless given ports of its own.
-    let routers = !crate::flavor::dev() || std::env::var_os("KIRI_HTTP_PORT").is_some();
+    // Kiri, unless given ports of its own (Settings → Domains, or
+    // KIRI_HTTP_PORT and KIRI_HTTPS_PORT).
+    let routers = !crate::flavor::dev() || domains::own_ports();
     if crate::flavor::dev() {
-        diag::info!(format!("{}: container domains off (KIRI_HTTP_PORT and KIRI_HTTPS_PORT turn them on)", crate::flavor::APP));
+        if !routers {
+            diag::info!(format!("{}: container domains off (ports in Settings → Domains turn them on)", crate::flavor::APP));
+        }
     } else if let Err(e) = dns::start() {
         diag::warn!("*.kiri.local off", error = e);
     }

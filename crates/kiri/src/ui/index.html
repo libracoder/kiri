@@ -842,6 +842,17 @@ td.actions .acts-row { margin-left: auto; width: max-content; padding-left: 24px
 .seg { grid-row: 1 / span 2; grid-column: 2; display: inline-flex; border: 1px solid var(--line); border-radius: 7px; overflow: hidden; }
 .seg button { height: 30px; padding: 0 12px; border: 0; border-left: 1px solid var(--line); background: var(--panel); color: var(--muted); font: 500 var(--fs) var(--ui-font); cursor: pointer; }
 .seg button:first-child { border-left: 0; }
+/* Settings → Domains → Ports: two small port boxes and their button, where a
+   row's switch would be. */
+.rports { grid-row: 1 / span 2; grid-column: 2; display: flex; align-items: center; gap: 8px; }
+.rports label { display: inline-flex; align-items: center; height: 32px; border: 1px solid var(--line); border-radius: 7px; background: var(--panel); overflow: hidden; }
+.rports label:focus-within { border-color: var(--blue); box-shadow: 0 0 0 3px color-mix(in srgb, var(--blue) 22%, transparent); }
+.rports label span { padding: 0 8px; height: 100%; display: inline-flex; align-items: center; border-right: 1px solid var(--line); color: var(--muted); font: 500 var(--fs-small) var(--ui-font); background: color-mix(in srgb, var(--line) 35%, transparent); }
+.rports input { width: 58px; height: 100%; border: 0; padding: 0 8px; background: transparent; color: var(--text); font: var(--fs-mono) var(--mono-font); outline: none; -moz-appearance: textfield; }
+.rports input::-webkit-outer-spin-button, .rports input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+.rports input:disabled { color: var(--faint); }
+.rports .btn { height: 32px; }
+.pref + .rp-notes { margin-top: -6px; }
 /* Chinese and Japanese break between any two characters: a short choice (关闭, 开启)
    stays on one line, as an English word does; Korean's too. Only in a CJK window,
    so English lays out as it did. */
@@ -2259,7 +2270,7 @@ const VM = LINUX ? "Engine" : "Linux VM";
 const shareOn = () => !!(ui.status?.share ?? ui.status?.dev);
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 
-const ui = { running: new Set(), launched: new Map(), runWatch: new Map(), need: null, probed: new Map(), probing: new Set(), why: new Map(), startErr: {}, fixed: null, openTab: null, listening: new Map(), starting: new Map(), scans: new Map(), scanf: { sev: "", fix: false, own: false }, view: "containers", vm: "stopped", containers: [], images: [], volumes: [], networks: [], sort: { images: { key: "pulled", desc: true } }, filter: "", suffix: "kiri.localhost", collapsed: new Set(), res: null, resDraft: {}, proxy: null, pxDraft: {},
+const ui = { running: new Set(), launched: new Map(), runWatch: new Map(), need: null, probed: new Map(), probing: new Set(), why: new Map(), startErr: {}, fixed: null, openTab: null, listening: new Map(), starting: new Map(), scans: new Map(), scanf: { sev: "", fix: false, own: false }, view: "containers", vm: "stopped", containers: [], images: [], volumes: [], networks: [], sort: { images: { key: "pulled", desc: true } }, filter: "", suffix: "kiri.localhost", collapsed: new Set(), res: null, resDraft: {}, proxy: null, pxDraft: {}, rports: null, rpDraft: {}, rpAt: 0,
   imp: { sources: null, source: null, inv: null, picked: { images: new Set(), volumes: new Set(), containers: new Set() }, steps: {}, running: false, summary: "" },
   upd: null, engineStale: null, staleHidden: false,
   // The Builds view: the list, the picked build and its detail, and how its steps show.
@@ -2893,7 +2904,9 @@ function filesView(d) {
 function localUrl(c, name) {
   const chosen = (c.Labels?.["dev.kiri.domain"] || "").split(",")[0].trim().replace(/\.kiri\.local(host)?$/, "");
   const project = c.Labels?.["com.docker.compose.project"];
-  return `${ui.https ? "https" : "http"}://${chosen || (project ? `${c.Labels["com.docker.compose.service"]}.${project}` : name)}.${ui.suffix}`;
+  const scheme = ui.https ? "https" : "http", r = ui.rports?.[scheme];
+  const port = r && r.port !== r.default ? `:${r.port}` : "";
+  return `${scheme}://${chosen || (project ? `${c.Labels["com.docker.compose.service"]}.${project}` : name)}.${ui.suffix}${port}`;
 }
 
 /* The tiny Kiri: the mark's body, lid and eyes. */
@@ -3504,6 +3517,26 @@ function networkPane() {
   </div>`;
 }
 
+/* Settings → Domains: the ports the name routers listen on. Moving them
+   needs no restart; a port that's taken changes nothing and says so. */
+const rpChanged = () => ui.rports && !ui.rports.error && ["http", "https"].some((k) => ui.rpDraft[k] !== undefined && +ui.rpDraft[k] !== ui.rports[k].port);
+function routerPortsPref() {
+  const r = ui.rports;
+  if (!r) return "";
+  if (r.error) return `<div class="pref"><span class="t">${tr("Ports")}</span><span class="d">${tr("Start Kiri to change the ports names answer on.")}</span></div>`;
+  const mono = (t) => `<span class="mono">${esc(String(t))}</span>`;
+  const field = (k, label) => `<label title="${label}"><span>${label}</span><input id="rp-${k}" type="number" min="1" max="65535" inputmode="numeric" aria-label="${label}" value="${esc(String(ui.rpDraft[k] ?? r[k].port))}"${r[k].env ? " disabled" : ""}></label>`;
+  const notes = ["http", "https"].flatMap((k) => [
+    r[k].env ? tr("{var} sets the {kind} port, so it can't be changed here.", { var: mono(r[k].env), kind: k.toUpperCase() }) : "",
+    r[k].running === false ? tr("{kind} names are off: port {port} is in use. Pick another.", { kind: k.toUpperCase(), port: mono(r[k].port) })
+      : !r[k].serving ? tr("{kind} names are paused: a container has port {port}.", { kind: k.toUpperCase(), port: mono(r[k].port) }) : "",
+  ]).filter(Boolean);
+  const url = `http://web.${ui.suffix}:${r.http.port === 8080 ? 8081 : 8080}`;
+  return `<div class="pref"><span class="t">${tr("Ports")}</span><span class="d">${tr("Names answer on {http} and {https}. Pick other ports when another app needs these; links then carry the port, like {url}.", { http: mono(r.http.port), https: mono(r.https.port), url: mono(url) })}</span>
+      <div class="rports">${field("http", "HTTP")}${field("https", "HTTPS")}<button class="btn primary" data-saverp${rpChanged() ? "" : " disabled"}>${tr("Change ports")}</button></div></div>
+    <p class="muted rp-notes">${notes.length ? notes.join(" ") + " " : ""}${tr("A container that publishes one of these ports gets it; names on that port pause until it lets go.")}</p>`;
+}
+
 /* Settings → Resources: the most the Linux VM may use. */
 const gb = (mib) => `${Math.round(mib / 1024)} GB`;
 const cpuText = (n) => trn(n, "{n} CPU", "{n} CPUs");
@@ -3586,9 +3619,11 @@ function renderSettings() {
       <div class="seg" role="group" aria-label="${tr("Log text")}">${LOG_SIZES.map(([px, l]) => `<button data-logsize="${px}" aria-pressed="${prefs.logSize === px}">${tr(l)}</button>`).join("")}</div></div>
     <div class="preview"><div class="p-title">web · nginx:alpine</div><div>Up 3 minutes · 26.3 MB · localhost:8080 → 80</div><div class="p-mono">ef9a6e2b45c2  docker run -p 8080:80 nginx</div></div>
   </div>`;
+  const portsPref = routerPortsPref();
   // On Linux: kiri.localhost only, for now; nothing to switch.
   const domainsPane = LINUX ? `<div class="pane"><h3>${tr("Domains")}</h3>
     <div class="pref"><span class="t">${tr("Local names")}</span><span class="d">${tr("Running containers answer at <span class=mono>&lt;name&gt;.kiri.localhost</span>, which needs no setup.")}</span></div>
+    ${portsPref}
     <p class="muted">${tr("Compose services answer at {addr}.", { addr: `<span class="mono">&lt;service&gt;.&lt;project&gt;.kiri.localhost</span>` })} ${tr("{local} names and HTTPS aren't on Linux yet.", { local: `<span class="mono">.kiri.local</span>` })}</p>
   </div>`
   // On Windows: a DNS rule instead of /etc/resolver, and no HTTPS.
@@ -3597,6 +3632,7 @@ function renderSettings() {
       ? tr("On: running containers answer at <span class=mono>&lt;name&gt;.kiri.local</span>.")
       : tr("Off: containers answer at <span class=mono>&lt;name&gt;.kiri.localhost</span>, which needs no setup.")}</span>
       <div class="seg" role="group" aria-label="${tr("Local names")}"><button data-domains="0" aria-pressed="${!ui.domainsOn}">kiri.localhost</button><button data-domains="1" aria-pressed="${!!ui.domainsOn}">kiri.local</button></div></div>
+    ${portsPref}
     <p class="muted">${tr("Compose services answer at {addr}.", { addr: `<span class="mono">&lt;service&gt;.&lt;project&gt;.${ui.suffix}</span>` })} ${tr("Changing this asks Windows for an administrator's approval, since it adds or removes a DNS rule for {local}.", { local: `<span class="mono">.kiri.local</span>` })}</p>
   </div>` : `<div class="pane"><h3>${tr("Domains")}</h3>
     <div class="pref"><span class="t">${tr("Local names")}</span><span class="d">${ui.domainsOn
@@ -3607,6 +3643,7 @@ function renderSettings() {
       ? tr("On: containers open at <span class=mono>https://</span> with Kiri's own certificate, which only vouches for <span class=mono>.kiri.local</span> and <span class=mono>.kiri.localhost</span> names.")
       : tr("Trust Kiri's certificate so {url} works. macOS asks for your password. The certificate can only vouch for Kiri's own names.", { url: `<span class=mono>https://myapp.${ui.suffix}</span>` })}</span>
       <div class="seg" role="group" aria-label="HTTPS"><button data-https="0" aria-pressed="${!ui.https}">${tr("Off")}</button><button data-https="1" aria-pressed="${!!ui.https}">${tr("On")}</button></div></div>
+    ${portsPref}
     <p class="muted">${tr("Compose services answer at {addr}.", { addr: `<span class="mono">&lt;service&gt;.&lt;project&gt;.${ui.suffix}</span>` })} ${tr("Changing this needs admin rights (an administrator password), since it adds or removes {path}.", { path: `<span class="mono">/etc/resolver/kiri.local</span>` })}</p>
   </div>`;
   const a = about;
@@ -3641,6 +3678,11 @@ function renderSettings() {
   settingsShown.html = html; settingsShown.el = $("content").firstElementChild;
   diagDrawn();
   for (const k of ["http", "https", "no_proxy"]) $(`px-${k}`)?.addEventListener("input", (ev) => { ui.pxDraft[k] = ev.target.value; });
+  for (const k of ["http", "https"]) $(`rp-${k}`)?.addEventListener("input", (ev) => {
+    ui.rpDraft[k] = ev.target.value;
+    const save = document.querySelector("#content [data-saverp]");
+    if (save) save.disabled = !rpChanged();
+  });
   $("reg-server")?.addEventListener("input", (ev) => { ui.reg.server = ev.target.value; regHintShow(); });
   document.querySelectorAll("#content [data-imp]").forEach((cb) => cb.addEventListener("change", (ev) => {
     pickChange(ev.target);
@@ -3668,7 +3710,7 @@ function show(view) {
   if (view === "builds") send("builds");
   if (view === "usb") usbPoll();
   if (view === "share") { send("shares"); send("shareusage"); shPoll(); }
-  if (view === "settings") { if (!fontLists.families.length) send("fonts"); send("about"); send("logins"); send("resources"); send("proxy"); if (!ui.imp.sources) send("importsources"); if (prefs.tab === "diagnostics") diagOpen(); }
+  if (view === "settings") { if (!fontLists.families.length) send("fonts"); send("about"); send("logins"); send("resources"); send("proxy"); send("routerports"); if (!ui.imp.sources) send("importsources"); if (prefs.tab === "diagnostics") diagOpen(); }
   render();
   // From the top, as a container's or pod's page opens: leaving a page scrolled
   // down (a long Terminal or Logs tab) otherwise opened the next view below its rows.
@@ -6209,6 +6251,8 @@ window.kiri = {
         if ($("vm-meter").style.width !== meter) $("vm-meter").style.width = meter;
         break;
       case "lists":
+        // Links need the routers' ports: ask once the engine answers.
+        if ((!ui.rports || ui.rports.error) && Date.now() - ui.rpAt > 5000) { ui.rpAt = Date.now(); send("routerports"); }
         // Run's look at an image's start script makes a container it never starts; and
         // docker build's BuildKit workers (buildx names them buildx_buildkit_<builder>N) are
         // the build machinery, not containers anyone ran: neither is listed. Nor is the
@@ -6328,6 +6372,7 @@ window.kiri = {
       case "inventory": ui.imp.inv = e; if (ui.view === "settings") render(); renderImportStrip(); drawImportModal(); break;
       case "importstep": ctxStep(e); ui.imp.steps[`${e.kind}/${e.name}`] = e; if (e.state !== "running") ui.imp.picked[e.kind].delete(e.name); if (ui.view === "settings") render(); drawImportModal(); break;
       case "importdone": if (ctx.card?.total) { ctx.card.finished = true; drawCtxCard(); } ui.imp.running = false; ui.imp.summary = e.failed ? tr("Imported {done}; {failed} failed (hover “Failed” for why).", { done: e.done, failed: e.failed }) : trn(e.done, "Imported {n} item.", "Imported {n} items."); send("inventory", { name: ui.imp.source }); toast(e.failed ? "error" : "ok", ui.imp.summary); drawImportModal(); break;
+      case "routerports": ui.rports = e; ui.rpDraft = {}; render(); break;
       case "proxy": ui.proxy = e; ui.pxDraft = { ...(e.settings || {}) }; if (ui.view === "settings") render(); break;
       case "resources": ui.res = e; ui.resDraft = { cpus: e.cpus, memory_mib: e.memory_mib }; if (ui.view === "settings") render(); break;
       case "detail": if (ui.view !== "containers") show("containers"); openDetail(e.id); break;
@@ -6437,6 +6482,7 @@ $("content").addEventListener("click", (ev) => {
   else if ((el = t("[data-pxmode]"))) { ui.pxDraft.mode = el.dataset.pxmode; render(); }
   else if ((el = t("[data-pxc]"))) { ui.pxDraft.containers = !!+el.dataset.pxc; render(); }
   else if ((el = t("[data-savepx]"))) send("setproxy", { value: ui.pxDraft });
+  else if ((el = t("[data-saverp]")) && ui.rports && !ui.rports.error) send("setrouterports", { value: { http: +(ui.rpDraft.http ?? ui.rports.http.port), https: +(ui.rpDraft.https ?? ui.rports.https.port) } });
   else if ((el = t("[data-saveres]"))) send("setresources", { value: ui.resDraft });
   else if ((el = t("[data-vmpower]"))) { el.disabled = true; powerEngine(el.dataset.vmpower); }
   else if ((el = t("[data-restartvm]"))) { el.disabled = true; el.textContent = tr("Restarting…"); send("restartvm"); }

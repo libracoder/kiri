@@ -542,6 +542,20 @@ fn proxy(save: Option<serde_json::Value>) {
     }
 }
 
+/// Settings → Domains: reads (or moves, then reads) the routers' ports.
+fn router_ports(set: Option<serde_json::Value>) {
+    if let Some(body) = set {
+        match client::request("POST", "/kiri/domains", Some(&body)) {
+            Ok(r) if r.ok() => emit(notice("ok", &tr("Ports changed"))),
+            Ok(r) => emit(notice("error", &trf("Could not change the ports: {error}", &[("error", &r.error())]))),
+            Err(e) => emit(notice("error", &trf("Could not change the ports: {error}", &[("error", &e)]))),
+        }
+    }
+    let mut v = client::get("/kiri/domains").unwrap_or_else(|e| serde_json::json!({"error": e.to_string()}));
+    v["type"] = "routerports".into();
+    emit(v.to_string());
+}
+
 /// Reads (or saves, then reads) the VM's CPUs and memory for Settings.
 fn resources(save: Option<serde_json::Value>) {
     let saved = save.map(|body| client::request("POST", "/kiri/resources", Some(&body)));
@@ -1835,6 +1849,16 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
         "setproxy" => {
             let body = msg.value;
             std::thread::spawn(move || proxy(Some(body)));
+            Ok(())
+        }
+        // Settings → Domains: the routers' ports.
+        "routerports" => {
+            std::thread::spawn(|| router_ports(None));
+            Ok(())
+        }
+        "setrouterports" => {
+            let body = msg.value;
+            std::thread::spawn(move || router_ports(Some(body)));
             Ok(())
         }
         // Settings → Resources.
