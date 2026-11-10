@@ -202,6 +202,12 @@ t on-failure "2" bash -c "$D run -d --name flaky --restart on-failure:2 alpine s
 t always "true" bash -c "$D run -d --name alw --restart always alpine sh -c 'sleep 0.2' >/dev/null; sleep 1.5; $D inspect -f '{{gt .RestartCount 0}}' alw"
 t stop-ends-always "Exited" bash -c "$D stop alw >/dev/null; sleep 1; $D ps -a --filter name=alw --format '{{.Status}}'"
 code rm-with-restart-refused 125 $D run --rm --restart always alpine true
+# A stopped container whose image layer the guest lost (it deletes an
+# unpacked layer that isn't whole at boot) starts again with its own data
+# (the file it wrote on the first run is still there on the second):
+# the layer is sent again, not "layer ... is not unpacked". busybox's single
+# layer is the one with bin/busybox and no alpine-release.
+t start-restores-layer "KEPT AGAIN" bash -c "$D rm -f relayer >/dev/null 2>&1; $D run --name relayer busybox:1.36 sh -c '[ -e /kept ] && echo AGAIN >> /kept || echo KEPT > /kept' && $D run --rm --privileged alpine sh -c 'mkdir -p /m && mount -t ext4 /dev/vda /m && for d in /m/layers/*/; do [ -e \$d/bin/busybox ] && [ ! -e \$d/etc/alpine-release ] && rm -rf \$d \${d%/}.done; done; umount /m' && $D start -a relayer >/dev/null && $D cp relayer:/kept - | tar -xO | tr '\\n' ' '; $D rm -f relayer >/dev/null"
 
 section "networking"
 t default-ip "172.17." $D run --rm alpine sh -c 'ip -4 addr show eth0'

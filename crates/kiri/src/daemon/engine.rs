@@ -1417,17 +1417,51 @@ impl Engine {
         Ok(image_named(self.store.images()?, name))
     }
 
+    /// Sends the guest every layer of these (digest, media type) it doesn't
+    /// have unpacked, from the blob store.
+    fn ensure_layers<'a>(&self, layers: impl Iterator<Item = (&'a str, &'a str)>) -> io::Result<()> {
+        let _one_at_a_time = self.layers.lock().unwrap_or_else(|e| e.into_inner());
+        for (digest, media_type) in layers {
+            if !self.vm()?.has_layer(digest)? {
+                self.vm()?.send_layer(digest, media_type, &self.store.blob_path(digest)?)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// A container's layers back in the guest before it runs again: the
+    /// guest deletes an unpacked layer at boot when it isn't whole (an unpack
+    /// cut short, or one from before layers were marked whole), and a
+    /// container created before that would otherwise fail to start with
+    /// "layer ... is not unpacked". The media type comes from any image with
+    /// the layer; a layer no image has any more can't be sent again.
+    fn restore_layers(&self, layers: &[String]) -> Result<(), Error> {
+        let vm = self.vm()?;
+        let mut missing = Vec::new();
+        for digest in layers {
+            if !vm.has_layer(digest)? {
+                missing.push(digest);
+            }
+        }
+        // The usual case: nothing to send, and no need to read the image index.
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let images = self.store.images()?;
+        let mut wanted = Vec::with_capacity(missing.len());
+        for digest in missing {
+            let Some(l) = images.iter().flat_map(|i| &i.layers).find(|l| &l.digest == digest) else {
+                return Err(Error::Conflict(format!("layer {digest} is gone from the engine and no image has it any more: remove this container and create it again")));
+            };
+            wanted.push((l.digest.as_str(), l.media_type.as_str()));
+        }
+        Ok(self.ensure_layers(wanted.into_iter())?)
+    }
+
     /// Records a container and makes sure its layers are in the guest, so
     /// `start` has nothing left to do but run it.
     pub fn create(&self, name: Option<String>, spec: Spec, image: &Image) -> Result<String, Error> {
-        {
-            let _one_at_a_time = self.layers.lock().unwrap_or_else(|e| e.into_inner());
-            for layer in &image.layers {
-                if !self.vm()?.has_layer(&layer.digest)? {
-                    self.vm()?.send_layer(&layer.digest, &layer.media_type, &self.store.blob_path(&layer.digest)?)?;
-                }
-            }
-        }
+        self.ensure_layers(image.layers.iter().map(|l| (l.digest.as_str(), l.media_type.as_str())))?;
         let id = random_hex(32);
         let persist = !spec.auto_remove;
         let (log_dir, log_config) = (super::logfile::dir(self.store.root(), &id), spec.log_config.clone());
@@ -1677,6 +1711,10 @@ impl Engine {
                 return Err(Error::Io(e));
             }
         };
+        if let Err(e) = self.restore_layers(&layers) {
+            self.fail_start(&id, &spec);
+            return Err(e);
+        }
         match vm.run(&id, &layers, &argv, &spec.env, &spec.cwd, &spec.user, &hostname, flags, net_args, &spec.mounts, &spec.limits.wire(), spec.caps, &host_opts) {
             Ok(pid) => {
                 if let Some(c) = self.lock().containers.get_mut(&id).filter(|c| c.status == Status::Running) {
