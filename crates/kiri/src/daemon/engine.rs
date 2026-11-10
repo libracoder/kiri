@@ -480,7 +480,7 @@ struct HealthRun {
 struct State {
     vm_recovery_at: Option<std::time::Instant>,
     vm_recovery_running: bool,
-    vm_losses: u64,
+    vm_recovery_generation: u64,
     containers: HashMap<String, Container>,
     execs: HashMap<String, Exec>,
     /// Exit codes of recently removed containers, for `wait?condition=removed`
@@ -737,9 +737,13 @@ impl Engine {
     fn recover_vm(&self) {
         let Some(me) = self.me.get().and_then(Weak::upgrade) else { return };
         let mut st = self.lock();
-        if st.vm_recovery_running || self.is_stopped() || SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst)
+        if self.is_stopped() || SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst)
             || !st.containers.values().any(recover_after_vm_loss)
         {
+            return;
+        }
+        st.vm_recovery_generation = st.vm_recovery_generation.saturating_add(1);
+        if st.vm_recovery_running {
             return;
         }
         st.vm_recovery_running = true;
@@ -767,7 +771,7 @@ impl Engine {
                 drop(self.changed.wait_timeout(st, delay).unwrap_or_else(|e| e.into_inner()));
                 continue;
             }
-            let generation = st.vm_losses;
+            let generation = st.vm_recovery_generation;
             drop(st);
             let mut failed = false;
             for id in self.vm_restart_candidates() {
@@ -780,9 +784,9 @@ impl Engine {
                 }
             }
             let mut st = self.lock();
-            // A boot failure waits for a later request. A new loss during
-            // recovery belongs to this worker and must not miss its retry.
-            if failed && st.vm_losses == generation {
+            // A boot failure waits for a later request. A new loss or a
+            // successful request-driven boot must leave this worker a retry.
+            if failed && st.vm_recovery_generation == generation {
                 st.vm_recovery_running = false;
                 return;
             }
@@ -1344,7 +1348,6 @@ impl Engine {
                 let delay = st.containers.values().filter(|c| recover_after_vm_loss(c))
                     .map(|c| restart_backoff(c.restart_count.saturating_sub(1))).max();
                 st.vm_recovery_at = delay.map(|delay| std::time::Instant::now() + delay);
-                st.vm_losses = st.vm_losses.saturating_add(1);
                 for e in st.execs.values_mut() {
                     e.running = false;
                     e.attached.clear();
@@ -3631,6 +3634,21 @@ mod vm_recovery_tests {
             assert_eq!(st.containers[&ids["always-live"]].restart_count, 2);
             let at = st.vm_recovery_at.unwrap();
             assert!(at >= before + Duration::from_millis(200) && at <= after + Duration::from_millis(200));
+        }
+        // A successful request-driven boot while the worker is still
+        // unwinding a failure must leave a retry for that worker to see.
+        let generation = {
+            let mut st = engine.lock();
+            st.vm_recovery_running = true;
+            st.vm_recovery_generation
+        };
+        engine.stopped.store(false, std::sync::atomic::Ordering::SeqCst);
+        engine.recover_vm();
+        engine.stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+        {
+            let mut st = engine.lock();
+            assert!(st.vm_recovery_generation > generation, "a boot racing an active recovery must not lose its retry");
+            st.vm_recovery_running = false;
         }
         for (previous, delay) in [(1, Duration::from_millis(200)), (2, Duration::from_millis(400)), (10, Duration::from_secs(60)), (u32::MAX, Duration::from_secs(60))] {
             {
