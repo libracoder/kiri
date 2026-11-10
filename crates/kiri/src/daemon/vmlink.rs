@@ -107,6 +107,7 @@ struct Credits {
     by_id: HashMap<String, usize>,
     /// The link is gone; nothing will ever be consumed.
     lost: bool,
+    loss_handled: bool,
 }
 
 impl Windows {
@@ -132,6 +133,20 @@ impl Windows {
         g.by_id.clear();
         drop(g);
         self.changed.notify_all();
+    }
+    fn finish_loss(&self) {
+        self.lock().loss_handled = true;
+        self.changed.notify_all();
+    }
+
+    /// Wait for exit accounting before replacing the VM. The caller must
+    /// hold no state lock needed by Lost, and Lost must not wait for link.
+    fn is_lost(&self) -> bool {
+        let mut g = self.lock();
+        while g.lost && !g.loss_handled {
+            g = self.changed.wait(g).unwrap_or_else(|e| e.into_inner());
+        }
+        g.lost
     }
     /// Waits until `n` bytes may be sent to `id` and takes them. `Ok(false)`:
     /// the process is not running, the bytes should be dropped.
@@ -160,6 +175,10 @@ struct UsageSlot {
 }
 
 impl VmLink {
+    pub fn is_lost(&self) -> bool {
+        self.windows.is_lost()
+    }
+
     /// Starts the reader thread. `on_event` runs on that thread, so it must
     /// not block for long: it holds up every reply behind it.
     pub fn new(vm: Vm, conn: File, on_event: impl Fn(Event<'_>) + Send + 'static) -> io::Result<VmLink> {
@@ -227,12 +246,14 @@ impl VmLink {
                     let _ = slot.send(reply);
                 }
             }
-            // Wake everyone still waiting, then tell the engine.
+            // Publish loss before waking callers: a retry must not borrow
+            // this dead link while the engine is still accounting exits.
+            wins.lose();
             for slot in queue.lock().unwrap_or_else(|e| e.into_inner()).drain(..) {
                 let _ = slot.send(Reply::Error("the VM stopped".into()));
             }
-            wins.lose();
             on_event(Event::Lost);
+            wins.finish_loss();
         })?;
         Ok(VmLink {
             writer: Mutex::new(Writer { conn, out: Vec::with_capacity(4096), blob: vec![0; 256 * 1024] }),
@@ -253,7 +274,13 @@ impl VmLink {
             out.clear();
             encode(out);
             // Queue the slot before writing, so the reply can never arrive first.
-            self.pending.lock().unwrap_or_else(|e| e.into_inner()).push_back(tx);
+            {
+                let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+                if self.windows.lock().lost {
+                    return Err(io::Error::other("the VM stopped"));
+                }
+                pending.push_back(tx);
+            }
             conn.write_all(out)?;
             if let Some((path, size)) = body {
                 let mut file = File::open(path)?;
