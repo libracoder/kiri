@@ -399,10 +399,17 @@ if [ -z "$FEATURE" ]; then
   $D run -d --name dom nginx:alpine >/dev/null; ready http://dom.kiri.localhost
   t domain-http "Welcome to nginx" curl -s -m 5 http://dom.kiri.localhost
   t domain-unknown "No running container" curl -s -m 5 http://nope.kiri.localhost
+  # A container that publishes the router's port gets it (Laravel Sail's
+  # 80:80); the router takes it back once the container is gone.
+  t domain-port-yield "Welcome to nginx" bash -c "$D run -d --name p80 -p 80:80 nginx:alpine >/dev/null && sleep 1 && curl -s -m 5 http://127.0.0.1/"
+  $D rm -f p80 >/dev/null
+  t domain-port-back "Welcome to nginx" bash -c "for i in \$(seq 20); do curl -s -m 2 http://dom.kiri.localhost | grep -q nginx && break; sleep 0.5; done; curl -s -m 5 http://dom.kiri.localhost"
   $D rm -f dom >/dev/null
 else
   skip domain-http "only the installed Kiri serves *.kiri.localhost"
   skip domain-unknown "only the installed Kiri serves *.kiri.localhost"
+  skip domain-port-yield "only the installed Kiri has the router on port 80"
+  skip domain-port-back "only the installed Kiri has the router on port 80"
 fi
 
 section "container files in Finder ($KF)"

@@ -8,13 +8,18 @@
 
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
-use std::os::fd::AsRawFd;
-use std::sync::Arc;
+use std::os::fd::{AsRawFd, OwnedFd};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 use super::engine::Engine;
 
 /// Largest request head read before routing.
 const MAX_HEAD: usize = 64 * 1024;
+
+/// How often a router that stepped aside tries its port again.
+const RECLAIM_EVERY: Duration = Duration::from_secs(3);
 
 /// Where the domain routers listen: only macOS needs the wildcard (the VM
 /// reaches the router over its own network); on a Linux host or in WSL the
@@ -27,55 +32,144 @@ fn router_addrs(port: u16) -> [String; 2] {
     }
 }
 
+/// One router: plain HTTP, or HTTPS with tls.rs's certificates.
+struct Router {
+    port: u16,
+    engine: Arc<Engine>,
+    tls: Option<Arc<rustls::ServerConfig>>,
+    /// How many addresses it listened on at start (IPv4, and IPv6 where
+    /// the host has it): taking the port back needs them all again.
+    want: std::sync::atomic::AtomicUsize,
+    /// While serving: one wake pipe and accept thread per listener. Empty
+    /// while it has stepped aside for a container.
+    serving: Mutex<Vec<(OwnedFd, JoinHandle<()>)>>,
+}
+
+/// The routers, for a container that publishes their port (`step_aside`).
+static ROUTERS: Mutex<Vec<Arc<Router>>> = Mutex::new(Vec::new());
+
+impl Router {
+    /// Binds the router's addresses and starts their accept threads; an
+    /// error when fewer than `min` (at least one) could be bound, so a
+    /// router never comes back on IPv6 alone while a container has IPv4.
+    fn listen(self: &Arc<Self>, min: usize) -> io::Result<Vec<(OwnedFd, JoinHandle<()>)>> {
+        let listeners: Vec<TcpListener> = router_addrs(self.port).iter().filter_map(|a| TcpListener::bind(a).ok()).collect();
+        if listeners.len() < min.max(1) {
+            return Err(io::Error::new(io::ErrorKind::AddrInUse, format!("port {} is taken", self.port)));
+        }
+        let mut out = Vec::new();
+        for listener in listeners {
+            listener.set_nonblocking(true)?;
+            let (wake_r, wake_w) = super::ports::pipe()?;
+            let me = self.clone();
+            let name = if self.tls.is_some() { "kiri-domains-tls" } else { "kiri-domains" };
+            out.push((wake_w, std::thread::Builder::new().name(name.into()).spawn(move || me.accept(&listener, &wake_r))?));
+        }
+        Ok(out)
+    }
+
+    /// Serves `listener` until its wake pipe closes; the listener closes with it.
+    fn accept(&self, listener: &TcpListener, wake: &OwnedFd) {
+        loop {
+            let mut fds = [
+                libc::pollfd { fd: listener.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+                libc::pollfd { fd: wake.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+            ];
+            // SAFETY: polling two descriptors we own.
+            if unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) } < 0 {
+                if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return;
+            }
+            if fds[1].revents != 0 {
+                return; // stepped aside
+            }
+            while let Ok((conn, _)) = listener.accept() {
+                let _ = conn.set_nonblocking(false);
+                // A client that never finishes its request must not hold a thread forever.
+                let _ = conn.set_read_timeout(Some(Duration::from_secs(30)));
+                let (engine, tls) = (self.engine.clone(), self.tls.clone());
+                let _ = std::thread::Builder::new().name("kiri-domain-conn".into()).spawn(move || {
+                    let _ = match tls {
+                        Some(config) => serve_tls(conn, &engine, config),
+                        None => serve(conn, &engine),
+                    };
+                });
+            }
+        }
+    }
+
+    /// Stops serving; returns once every listener is closed.
+    fn stop(&self) -> bool {
+        let threads = std::mem::take(&mut *self.serving.lock().unwrap_or_else(PoisonError::into_inner));
+        let stopped = !threads.is_empty();
+        for (wake, thread) in threads {
+            drop(wake);
+            let _ = thread.join();
+        }
+        stopped
+    }
+}
+
+/// A container is publishing host `port` and found it taken: when a router
+/// holds it, the router lets it go, so the container gets the port (Laravel
+/// Sail's `80:80`, say), and `true` says to bind again. Container names on
+/// that port pause meanwhile; the router takes the port back once it is
+/// free (`reclaim`). Other routers, and other ports, are left alone.
+pub fn step_aside(port: u16) -> bool {
+    let routers: Vec<Arc<Router>> = ROUTERS.lock().unwrap_or_else(PoisonError::into_inner).iter().filter(|r| r.port == port).cloned().collect();
+    let mut stepped = false;
+    for r in routers {
+        if r.stop() {
+            crate::diag::info!("a container publishes the container-domain router's port: the router lets it go until it is free", port = port);
+            stepped = true;
+        }
+    }
+    stepped
+}
+
+/// Every few seconds, a router that stepped aside tries its port again.
+fn reclaim() {
+    loop {
+        std::thread::sleep(RECLAIM_EVERY);
+        let idle: Vec<Arc<Router>> = ROUTERS.lock().unwrap_or_else(PoisonError::into_inner).iter().filter(|r| r.serving.lock().unwrap_or_else(PoisonError::into_inner).is_empty()).cloned().collect();
+        for r in idle {
+            let mut serving = r.serving.lock().unwrap_or_else(PoisonError::into_inner);
+            if serving.is_empty()
+                && let Ok(threads) = r.listen(r.want.load(std::sync::atomic::Ordering::Relaxed))
+            {
+                *serving = threads;
+                crate::diag::info!("the container-domain router has its port again", port = r.port);
+            }
+        }
+    }
+}
+
+fn start_router(engine: Arc<Engine>, port: u16, tls: Option<Arc<rustls::ServerConfig>>, var: &str) -> io::Result<u16> {
+    let router = Arc::new(Router { port, engine, tls, want: 0.into(), serving: Mutex::new(Vec::new()) });
+    let threads = router.listen(1).map_err(|_| io::Error::new(io::ErrorKind::AddrInUse, format!("port {port} is taken; set {var}")))?;
+    router.want.store(threads.len(), std::sync::atomic::Ordering::Relaxed);
+    *router.serving.lock().unwrap_or_else(PoisonError::into_inner) = threads;
+    let mut routers = ROUTERS.lock().unwrap_or_else(PoisonError::into_inner);
+    if routers.is_empty() {
+        std::thread::Builder::new().name("kiri-domains-reclaim".into()).spawn(reclaim)?;
+    }
+    routers.push(router);
+    Ok(port)
+}
+
 /// Starts the HTTPS router on port 443 (or `KIRI_HTTPS_PORT`): the same
 /// routing, behind TLS with certificates from tls.rs. Returns the port.
 pub fn start_tls(engine: Arc<Engine>) -> io::Result<u16> {
     let port: u16 = std::env::var("KIRI_HTTPS_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(443);
-    let config = super::tls::server_config()?;
-    let mut bound = false;
-    for addr in router_addrs(port) {
-        let Ok(listener) = TcpListener::bind(&addr) else { continue };
-        bound = true;
-        let (engine, config) = (engine.clone(), config.clone());
-        std::thread::Builder::new().name("kiri-domains-tls".into()).spawn(move || {
-            for conn in listener.incoming().flatten() {
-                // A client that never finishes its request must not hold a thread forever.
-                let _ = conn.set_read_timeout(Some(std::time::Duration::from_secs(30)));
-                let (engine, config) = (engine.clone(), config.clone());
-                let _ = std::thread::Builder::new().name("kiri-domain-tls".into()).spawn(move || {
-                    let _ = serve_tls(conn, &engine, config);
-                });
-            }
-        })?;
-    }
-    if !bound {
-        return Err(io::Error::new(io::ErrorKind::AddrInUse, format!("port {port} is taken; set KIRI_HTTPS_PORT")));
-    }
-    Ok(port)
+    start_router(engine, port, Some(super::tls::server_config()?), "KIRI_HTTPS_PORT")
 }
 
 /// Starts the router on port 80 (or `KIRI_HTTP_PORT`). Returns the port.
 pub fn start(engine: Arc<Engine>) -> io::Result<u16> {
     let port: u16 = std::env::var("KIRI_HTTP_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(80);
-    let mut bound = false;
-    for addr in router_addrs(port) {
-        let Ok(listener) = TcpListener::bind(&addr) else { continue };
-        bound = true;
-        let engine = engine.clone();
-        std::thread::Builder::new().name("kiri-domains".into()).spawn(move || {
-            for conn in listener.incoming().flatten() {
-                let _ = conn.set_read_timeout(Some(std::time::Duration::from_secs(30)));
-                let engine = engine.clone();
-                let _ = std::thread::Builder::new().name("kiri-domain-conn".into()).spawn(move || {
-                    let _ = serve(conn, &engine);
-                });
-            }
-        })?;
-    }
-    if !bound {
-        return Err(io::Error::new(io::ErrorKind::AddrInUse, format!("port {port} is taken; set KIRI_HTTP_PORT")));
-    }
-    Ok(port)
+    start_router(engine, port, None, "KIRI_HTTP_PORT")
 }
 
 fn serve(mut client: TcpStream, engine: &Engine) -> io::Result<()> {
