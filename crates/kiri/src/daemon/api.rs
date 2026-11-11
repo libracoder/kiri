@@ -943,10 +943,47 @@ fn mac_shared(src: &str) -> bool {
     MAC_SHARES.iter().any(|s| src.strip_prefix(s).is_some_and(|rest| rest.is_empty() || rest.starts_with('/')))
 }
 
+/// A bind source that is the Mac's, as the path the Mac really keeps it at;
+/// None for one that is the VM's own.
+///
+/// Links are followed here, on the Mac, as Docker follows a bind source's:
+/// the guest sees the Mac under /mnt/mac, where a link to an absolute path
+/// (/private/etc/localtime, a project folder linked from elsewhere) leads
+/// nowhere. A path whose links leave the shares is left as given.
+///
+/// /etc is the Mac's link to /private/etc, and Compose files written for a
+/// Linux host mount paths in it:
+/// - /etc/passwd, /etc/os-release and the others in `hostetc::FILES` are
+///   expected to be Linux's, so they are the ones Kiri keeps; and /etc
+///   itself is the folder of them.
+/// - anything else the Mac has there (/etc/hosts, /etc/localtime) is the
+///   Mac's.
+/// - what the Mac lacks stays the VM's.
+fn mac_source(src: &str) -> Option<String> {
+    let real = std::fs::canonicalize(src).ok().and_then(|p| p.into_os_string().into_string().ok()).filter(|p| mac_shared(p));
+    if mac_shared(src) {
+        return Some(real.unwrap_or_else(|| src.to_owned()));
+    }
+    let kept = match src.strip_prefix("/etc/") {
+        Some(name) if super::hostetc::FILES.contains(&name) => Some(super::hostetc::file(name)),
+        None if src == "/etc" => Some(super::hostetc::all()),
+        _ => None,
+    };
+    if let Some(kept) = kept {
+        // Kiri's data folder is in the person's home, which is shared. If
+        // it cannot be written, the path is the VM's, as it was.
+        return kept.ok().and_then(|p| p.into_os_string().into_string().ok()).filter(|p| mac_shared(p));
+    }
+    if src.strip_prefix("/etc").is_some_and(|rest| rest.is_empty() || rest.starts_with('/')) { real } else { None }
+}
+
 /// Where the guest finds a host path given for a bind: the Mac's own under
 /// the shares, else the VM's (on Linux, the host's).
 fn guest_bind_source(src: &str) -> String {
-    if cfg!(target_os = "macos") && !mac_shared(src) { src.to_owned() } else { format!("{MAC_ROOT}{src}") }
+    if !cfg!(target_os = "macos") {
+        return src.to_owned();
+    }
+    mac_source(src).map_or_else(|| src.to_owned(), |real| format!("{MAC_ROOT}{real}"))
 }
 
 /// An NFS or CIFS server name as an address the guest kernel can use.
@@ -997,20 +1034,24 @@ fn mounts(body: &Value, engine: &Engine, image: &kiri_image::Image) -> Result<Mo
                 if !src.starts_with('/') {
                     return Err(Error::BadRequest(format!("invalid mount source {src}: must be an absolute path")));
                 }
-                if cfg!(target_os = "macos") && !mac_shared(src) {
+                // Where the source is on this machine: itself, or on a Mac
+                // the path it leads to (a file Kiri keeps for /etc/passwd).
+                let here = if cfg!(target_os = "macos") { mac_source(src) } else { Some(src.to_owned()) };
+                let Some(here) = here else {
                     // The guest makes a missing source itself, as Docker does on Linux.
                     out.guest.push(format!("{src}\t{dst}\t{}", flag(if create_missing { "create" } else { "" })));
                     out.info.push(json!({"Type": "bind", "Source": src, "Destination": dst, "Mode": "", "RW": !ro, "Propagation": "rprivate"}));
                     return Ok(());
-                }
-                let p = std::path::Path::new(src);
+                };
+                let p = std::path::Path::new(&here);
                 if !p.exists() {
                     if !create_missing {
                         return Err(Error::BadRequest(format!("invalid mount config for type \"bind\": bind source path does not exist: {src}")));
                     }
                     std::fs::create_dir_all(p).map_err(Error::Io)?;
                 }
-                out.guest.push(format!("{MAC_ROOT}{src}\t{dst}\t{}", flag("")));
+                // After a missing source was made, so its links are followed too.
+                out.guest.push(format!("{}\t{dst}\t{}", guest_bind_source(src), flag("")));
                 out.info.push(json!({"Type": "bind", "Source": src, "Destination": dst, "Mode": "", "RW": !ro, "Propagation": "rprivate"}));
             }
             "volume" => {
@@ -2688,6 +2729,35 @@ mod tests {
         for p in ["/lib/modules", "/etc/hostname", "/var/lib/x", "/var", "/run/foo", "/Users2", "/tmpx", "/privatefoo", "/var/folders2", "/"] {
             assert!(!mac_shared(p), "{p} should be the VM's");
         }
+    }
+
+    /// Bind sources are followed through the Mac's links before the guest
+    /// gets them, and the Mac's /etc files are the Mac's (issue 170).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_sources_follow_links_and_etc_is_the_macs() {
+        // /etc -> private/etc: -v /etc/hosts:/etc/hosts is the Mac's hosts file.
+        assert_eq!(mac_source("/etc/hosts").as_deref(), Some("/private/etc/hosts"));
+        assert_eq!(guest_bind_source("/etc/hosts"), "/mnt/mac/private/etc/hosts");
+        // /etc/localtime links to an absolute path, which the guest could not follow.
+        let tz = mac_source("/etc/localtime").expect("the Mac has a time zone");
+        assert!(tz.starts_with("/private/var/db/timezone/"), "{tz}");
+        assert_eq!(mac_source("/private/etc/localtime").as_deref(), Some(tz.as_str()));
+        // What the Mac lacks, and paths outside the shares, stay the VM's.
+        for p in ["/etc/fstab", "/etc/kiri-no-such-file", "/lib/modules", "/var/lib/docker", "/var/run", "/etcetera"] {
+            assert_eq!(mac_source(p), None, "{p} should be the VM's");
+            assert_eq!(guest_bind_source(p), p);
+        }
+        // A link inside a share to another place in the shares is followed;
+        // a missing path under a share is passed as given.
+        let dir = std::env::temp_dir().join(format!("kiri-mac-source-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("real")).unwrap();
+        std::os::unix::fs::symlink(dir.join("real"), dir.join("link")).unwrap();
+        let real = std::fs::canonicalize(dir.join("real")).unwrap();
+        assert_eq!(mac_source(dir.join("link").to_str().unwrap()).as_deref(), real.to_str());
+        assert_eq!(mac_source("/tmp/kiri-no-such-path").as_deref(), Some("/tmp/kiri-no-such-path"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
