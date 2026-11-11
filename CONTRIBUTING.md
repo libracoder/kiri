@@ -5,8 +5,19 @@ Thanks for helping. Issues and pull requests are welcome.
 ## Before you start
 
 For anything larger than a small fix, open an issue first so we can agree on
-the approach. Kiri aims to be small and fast: changes that add a dependency, a
-background process or startup time need a good reason.
+the approach, and wait for that before you write the code. Kiri aims to be
+small and fast: changes that add a dependency, a background process or
+startup time need a good reason.
+
+Bug reports need the Kiri version and system, the exact commands you ran and
+the output you got, as the issue form asks. A report we can't reproduce, or a
+problem found only by reading the code, may be closed until it can be shown
+on a real machine.
+
+Keep at most 3 pull requests open at a time. Each one takes a maintainer's
+time to review, and a few at a time get reviewed sooner. Pull requests beyond
+that, or larger changes without an agreed issue, are closed; you're welcome
+to reopen them one at a time later.
 
 ## Building and testing
 
