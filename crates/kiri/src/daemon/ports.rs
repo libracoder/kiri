@@ -66,6 +66,8 @@ const NAT_CONNECT: Duration = Duration::from_millis(300);
 const NAT_RETRY: Duration = Duration::from_secs(30);
 static NAT_DOWN_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
 static NAT_TIMEOUTS: AtomicUsize = AtomicUsize::new(0);
+/// Set once this run has warned that the NAT network is unreachable.
+static NAT_WARNED: AtomicBool = AtomicBool::new(false);
 /// New connections over the NAT network: a burst of `NAT_BURST`, then
 /// `NAT_RATE` a second; the rest go over vsock, which takes thousands a
 /// second (bulk transfers are what the NAT network is for). Each connection
@@ -692,7 +694,13 @@ fn relay(client: TcpStream, vm: &VmLink, ip: [u8; 4], port: u16, nat: Option<Soc
                 if !timed_out || NAT_TIMEOUTS.fetch_add(1, Ordering::Relaxed) >= 1 {
                     NAT_TIMEOUTS.store(0, Ordering::Relaxed);
                     *NAT_DOWN_UNTIL.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now() + NAT_RETRY);
-                    crate::diag::warn!("the VM's NAT network is unreachable; relaying published ports over vsock for now", to = addr, error = e);
+                    // Once a run as a warning, with what usually causes it;
+                    // each retry after that only notes it.
+                    if NAT_WARNED.swap(true, Ordering::Relaxed) {
+                        crate::diag::info!("the VM's NAT network is still unreachable; published ports keep going over vsock", to = addr, error = e);
+                    } else {
+                        crate::diag::warn!("the VM's NAT network is unreachable, so published ports go over vsock (they still work); a VPN, or Kiri not allowed under Local Network in Privacy & Security, usually causes this", to = addr, error = e);
+                    }
                 }
             }
             Err(_) => {}
