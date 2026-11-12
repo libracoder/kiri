@@ -28,6 +28,8 @@ struct Session {
     input: Sender<Vec<u8>>,
     /// Set once the shell has exited and been reaped.
     done: Arc<AtomicBool>,
+    /// The size the page last asked for (columns, rows).
+    size: (u16, u16),
 }
 
 static SESSIONS: Mutex<Option<HashMap<String, Session>>> = Mutex::new(None);
@@ -60,7 +62,16 @@ pub fn handle(action: &str, id: &str, value: &Value, emit: fn(String)) {
         }
         "resize" => {
             let (cols, rows) = termwire::size(value);
-            with(|s| s.get(id).map(|s| set_size(&s.master, cols, rows)));
+            let master = with(|s| {
+                s.get_mut(id).map(|s| {
+                    s.size = (cols, rows);
+                    s.master.clone()
+                })
+            });
+            if let Some(master) = master {
+                set_size(&master, cols, rows);
+                keep_size(id.to_owned(), master, cols, rows);
+            }
         }
         "close" => {
             if let Some(s) = with(|s| s.remove(id)) {
@@ -217,6 +228,28 @@ fn set_size(master: &File, cols: u16, rows: u16) {
     unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &ws) };
 }
 
+/// Sees that a resize stays. On macOS a size set in the moment a shell
+/// finishes a command is accepted and then put back to the old one: the
+/// terminal kept its old size after the window was resized, about one time
+/// in seven when the two met. So the size is looked at again over the next
+/// 60 ms and set again if it went back, unless a newer resize has come.
+fn keep_size(id: String, master: Arc<File>, cols: u16, rows: u16) {
+    std::thread::spawn(move || {
+        for ms in [1, 2, 4, 8, 16, 32] {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+            if with(|s| s.get(&id).map(|s| s.size)) != Some((cols, rows)) {
+                return;
+            }
+            let mut now: libc::winsize = unsafe { std::mem::zeroed() };
+            // SAFETY: TIOCGWINSZ writes one winsize.
+            let read = unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCGWINSZ, &mut now) } == 0;
+            if read && (now.ws_col, now.ws_row) != (cols, rows) {
+                set_size(&master, cols, rows);
+            }
+        }
+    });
+}
+
 fn open(id: &str, shell: &Path, cols: u16, rows: u16, emit: fn(String)) -> std::io::Result<()> {
     // A tab the page reopens under the same name replaces the old one.
     if let Some(old) = with(|s| s.remove(id)) {
@@ -264,7 +297,7 @@ fn open(id: &str, shell: &Path, cols: u16, rows: u16, emit: fn(String)) -> std::
 
     let (input, typed) = channel::<Vec<u8>>();
     let done = Arc::new(AtomicBool::new(false));
-    with(|s| s.insert(id.to_owned(), Session { master: master.clone(), pid, input, done: done.clone() }));
+    with(|s| s.insert(id.to_owned(), Session { master: master.clone(), pid, input, done: done.clone(), size: (cols, rows) }));
 
     // Writes go through their own thread: a shell that stops reading can't
     // hold up the window.
