@@ -5,18 +5,22 @@
 //! the English keys and the one language it opens in ([`strings_js`]), with
 //! the system's languages and the saved pick from [`boot_js`]. A language the
 //! page doesn't have yet it asks for (`langwords`), and the host answers with
-//! [`words_js`]: fourteen languages in the page would pass WebView2's limit
+//! [`words_js`]: fifteen languages in the page would pass WebView2's limit
 //! (assemble.rs). The few words drawn natively (the Mac's menus, the Windows
 //! tray menu) come from [`tr`], out of the same files, all compiled in.
 //! English is the key, so a word missing from a file stays English. The Mac
 //! and Linux window and kiri-win (by `#[path]`) share this file.
+//!
+//! Arabic reads right to left ([`rtl`]). The page mirrors itself; the words
+//! drawn or sent from here are made ready for it by [`tr`] and [`fill`], so a
+//! name or a size keeps its own order inside an Arabic sentence.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
 /// Every translation Kiri ships, by language tag, as lang/<tag>.json maps
 /// English to it. English itself has no file.
-pub const FILES: [(&str, &str); 14] = [
+pub const FILES: [(&str, &str); 15] = [
     ("zh-Hans", include_str!("lang/zh-Hans.json")),
     ("zh-Hant", include_str!("lang/zh-Hant.json")),
     ("de", include_str!("lang/de.json")),
@@ -26,6 +30,7 @@ pub const FILES: [(&str, &str); 14] = [
     ("it", include_str!("lang/it.json")),
     ("pl", include_str!("lang/pl.json")),
     ("ru", include_str!("lang/ru.json")),
+    ("ar", include_str!("lang/ar.json")),
     ("tr", include_str!("lang/tr.json")),
     ("ja", include_str!("lang/ja.json")),
     ("ko", include_str!("lang/ko.json")),
@@ -131,14 +136,57 @@ pub fn boot_js(pick: Option<&str>) -> String {
     format!("window.KIRI_LANG = {v};")
 }
 
+/// Whether the language `tag` (one of [`FILES`]' or "en") is written right to left.
+pub fn rtl(tag: &str) -> bool {
+    tag == "ar"
+}
+
+/// A letter of a right-to-left script (Hebrew, Arabic and their presentation forms).
+fn rtl_letter(c: char) -> bool {
+    matches!(c, '\u{0590}'..='\u{08FF}' | '\u{FB1D}'..='\u{FDFF}' | '\u{FE70}'..='\u{FEFC}')
+}
+
+/// Right-to-left words that open with a Latin name ("docker يستخدم Kiri")
+/// would be laid out left to right wherever the text's direction comes from
+/// its first letter (the page, a menu, a notification). A right-to-left mark
+/// (U+200F, no width) in front says which way the sentence runs. A
+/// `{placeholder}` doesn't count as a first letter: [`fill`] makes it an
+/// island of its own. The page's rtlReady does the same for its words.
+fn rtl_ready(s: String) -> String {
+    if !s.chars().any(rtl_letter) {
+        return s;
+    }
+    let mut hole = false;
+    let first = s.chars().find(|&c| {
+        match c {
+            '{' => hole = true,
+            '}' => hole = false,
+            _ => {}
+        }
+        !hole && (c.is_alphabetic() || rtl_letter(c))
+    });
+    match first {
+        Some(c) if !rtl_letter(c) => format!("\u{200F}{s}"),
+        _ => s,
+    }
+}
+
 /// `en` in `lang`, for words drawn natively; English when there's no translation.
 pub fn tr(lang: &str, en: &str) -> String {
-    maps().get(lang).and_then(|m| m.get(en)).cloned().unwrap_or_else(|| en.to_owned())
+    match maps().get(lang).and_then(|m| m.get(en)) {
+        Some(w) if rtl(lang) => rtl_ready(w.clone()),
+        Some(w) => w.clone(),
+        None => en.to_owned(),
+    }
 }
 
 /// `{name}` placeholders in `s` filled from `vars`, as the page's tr() does:
 /// in one pass, so a value that holds braces (an error's text) stays as it is.
+/// In right-to-left words each value is an island (U+2068 … U+2069, a
+/// first-strong isolate), so "5.0 GB" or "postgres (localhost:5432)" keeps its
+/// own order inside the Arabic around it; a bare number needs none.
 pub fn fill(s: String, vars: &[(&str, &dyn std::fmt::Display)]) -> String {
+    let islands = s.chars().any(rtl_letter);
     let mut out = String::with_capacity(s.len());
     let mut rest = s.as_str();
     while let Some(open) = rest.find('{') {
@@ -147,7 +195,14 @@ pub fn fill(s: String, vars: &[(&str, &dyn std::fmt::Display)]) -> String {
         let name = after.find('}').map(|close| &after[..close]).filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'));
         match name.and_then(|n| vars.iter().find(|(k, _)| *k == n)) {
             Some((k, v)) => {
-                out.push_str(&v.to_string());
+                let v = v.to_string();
+                if islands && !v.chars().all(|c| c.is_ascii_digit() || matches!(c, '.' | ',' | ' ')) {
+                    out.push('\u{2068}');
+                    out.push_str(&v);
+                    out.push('\u{2069}');
+                } else {
+                    out.push_str(&v);
+                }
                 rest = &after[k.len() + 1..];
             }
             None => {
@@ -243,7 +298,9 @@ mod tests {
         assert!(should_ask(false, &none, &os(&["nl-NL", "de-DE"])));
         // An English computer, or one Kiri can't speak yet, sees nothing new.
         assert!(!should_ask(false, &none, &os(&["en-GB"])));
-        assert!(!should_ask(false, &none, &os(&["nl-NL", "ar"])));
+        assert!(!should_ask(false, &none, &os(&["nl-NL", "he"])));
+        // An Arabic computer asks: the window turned right to left under its owner.
+        assert!(should_ask(false, &none, &os(&["ar-EG"])));
         assert!(!should_ask(false, &none, &os(&[])));
         // A language picked in Settings, or the step answered, is never asked again.
         assert!(!should_ask(false, &serde_json::json!({"lang": "fr"}), &os(&["es-ES"])));
@@ -286,6 +343,11 @@ mod tests {
             ("pl-PL", Some("pl")),
             ("ru-RU", Some("ru")),
             ("ru", Some("ru")),
+            ("ar", Some("ar")),
+            ("ar-SA", Some("ar")),
+            ("ar-EG", Some("ar")),
+            ("ar_AE", Some("ar")),
+            ("arz", None),
             ("tr-TR", Some("tr")),
             ("ja", Some("ja")),
             ("ja-JP", Some("ja")),
@@ -358,5 +420,25 @@ mod tests {
         assert_eq!(fill("Couldn't stop {name}: {error}".into(), &[("name", &"{error}"), ("error", &"no {such} thing")]), "Couldn't stop {error}: no {such} thing");
         assert_eq!(fill("{missing} and {} and {".into(), &[("n", &1)]), "{missing} and {} and {");
         assert_eq!(fill("宽 {w}，高 {h}".into(), &[("w", &"中"), ("h", &2)]), "宽 中，高 2");
+    }
+
+    #[test]
+    fn right_to_left_words_keep_names_and_sizes_whole() {
+        assert!(rtl("ar"));
+        for (tag, _) in FILES {
+            assert_eq!(rtl(tag), tag == "ar", "{tag}");
+        }
+        assert!(!rtl("en"));
+        // Arabic first: nothing to add. A Latin name first: a right-to-left mark in front.
+        assert_eq!(rtl_ready("الإعدادات…".into()), "الإعدادات…");
+        assert_eq!(rtl_ready("Kiri يعمل".into()), "\u{200F}Kiri يعمل");
+        // A placeholder isn't the first letter (it's filled as an island), and words with no Arabic stay as they are.
+        assert_eq!(rtl_ready("{name} توقف".into()), "{name} توقف");
+        assert_eq!(rtl_ready("Kubernetes".into()), "Kubernetes");
+        assert_eq!(tr("ar", "Settings…"), "الإعدادات…");
+        // Values in an Arabic sentence are islands; bare numbers and other languages' values aren't.
+        assert_eq!(fill("تم بدء {name} على {ports}".into(), &[("name", &"web"), ("ports", &8080)]), "تم بدء \u{2068}web\u{2069} على 8080");
+        assert_eq!(fill("من {cap}".into(), &[("cap", &"5.0 GB")]), "من \u{2068}5.0 GB\u{2069}");
+        assert_eq!(fill("Started {name}".into(), &[("name", &"web")]), "Started web");
     }
 }

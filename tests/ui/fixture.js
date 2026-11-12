@@ -19,7 +19,7 @@ kiri.on({type:"share",id:3,source:"postgres",target:"postgres (localhost:5432)",
 const sent = [];
 window.webkit = { messageHandlers: { kiri: { postMessage: (m) => { const o = JSON.parse(m); sent.push({ type: o.cmd, ...o }); } } } };
 
-// For the tests in other languages (zh.js, langswitch.js): English left on screen.
+// For the tests in other languages (zh.js, ar.js, langswitch.js): English left on screen.
 // Words that are fine in a Chinese window: products, systems, Kubernetes
 // kinds, units and the fixture's own names.
 const KEEP = new Set(("kiri dev share cloud docker hub desktop compose kubernetes kubectl macos windows linux wsl mac pc ubuntu " +
@@ -43,7 +43,7 @@ function english(root) {
     }
     for (const a of ["title", "aria-label", "placeholder"]) {
       const v = el.getAttribute?.(a);
-      if (v && /[a-z]{2,} [a-z]{2,}/.test(v) && v.toLowerCase().split(/\W+/).filter((w) => w.length > 1 && !KEEP.has(w)).length >= 2 && !/[一-鿿]/.test(v)) out.push(`${a}="${v}"`);
+      if (v && /[a-z]{2,} [a-z]{2,}/.test(v) && v.toLowerCase().split(/\W+/).filter((w) => w.length > 1 && !KEEP.has(w)).length >= 2 && !/[一-鿿\u0600-\u06FF]/.test(v)) out.push(`${a}="${v}"`);
     }
   };
   walk(root);

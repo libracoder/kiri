@@ -14,7 +14,11 @@
   --f-display:"Segoe UI Variable Display","Segoe UI",sans-serif;
   --f-mono:"Cascadia Mono",Consolas,monospace;
   color-scheme:dark;
+  /* Reading direction, as in the main window: rules say start and end, and
+     text-align (see the right to left section) takes these. */
+  --start:left;--end:right;
 }
+:root[dir=rtl]{--start:right;--end:left}
 /* Chinese, Japanese and Korean in Windows' own fonts for each, after Segoe UI
    (which has none), so a Japanese or Traditional Chinese page doesn't draw its
    Han characters in Simplified Chinese shapes. On the page and on each tile. */
@@ -37,7 +41,7 @@ h1[tabindex="-1"]:focus{outline:none}
 .app{display:flex;height:100vh;min-height:0}
 
 /* rail */
-.rail{width:280px;flex:none;padding:32px 28px;background:var(--rail);border-right:1px solid var(--line-2);display:flex;flex-direction:column;gap:28px;overflow-y:auto}
+.rail{width:280px;flex:none;padding:32px 28px;background:var(--rail);border-inline-end:1px solid var(--line-2);display:flex;flex-direction:column;gap:28px;overflow-y:auto}
 .brand{display:flex;align-items:center;gap:10px;font:700 24px/1 var(--f-display)}
 .steps{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:22px;font-size:14px}
 .steps li{display:flex;gap:14px}
@@ -75,7 +79,7 @@ h1.l{font-size:36px}
 .card.tight{gap:18px}
 .foot{display:flex;align-items:center;justify-content:flex-end;gap:12px;margin-top:auto;padding-top:4px}
 /* The language step: a header that says hello in the language picked, over a
-   faint cloud of the others; then fifteen tiles, five across, each its
+   faint cloud of the others; then sixteen tiles, four across, each its
    greeting in its own script over its name. A short window scrolls them under
    the header, with Continue kept in view (main.choose's foot). */
 .lhead{position:relative;overflow:hidden;max-width:720px;padding:22px 24px 20px;border-radius:16px;border:1px solid var(--line);
@@ -87,7 +91,7 @@ h1.l{font-size:36px}
 @media (prefers-reduced-motion:reduce){.lhello{animation:none}}
 .lhead h1{position:relative;margin-top:6px;font:600 20px/1.25 var(--f-display);color:var(--ink)}
 .lhead .lede{position:relative;margin-top:4px}
-.langs{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px;max-width:720px}
+.langs{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;max-width:720px}
 .lang{position:relative;display:flex;flex-direction:column;align-items:flex-start;justify-content:space-between;gap:4px;padding:10px 12px 9px;min-height:70px;border-radius:12px;background:var(--surface);border:2px solid var(--line);color:var(--text-2);font:inherit;font-family:var(--f-text);text-align:left;cursor:pointer;transition:border-color .15s,transform .15s}
 .lang:hover{border-color:var(--stroke);transform:translateY(-1px)}
 .lang b{font:650 18px/1.2 var(--f-display);color:var(--ink);overflow-wrap:anywhere}
@@ -131,7 +135,7 @@ h1.l{font-size:36px}
 .tasks{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:14px;font-size:15px}
 .tasks li{display:flex;align-items:center;gap:12px}
 .t-label{flex:1;min-width:0}
-.t-detail{font:13px var(--f-mono);color:var(--muted);text-align:right}
+.t-detail{font:13px var(--f-mono);color:var(--muted);text-align:var(--end)}
 .tasks .todo .t-label{color:var(--text-2)}
 .tasks .active .t-label{font-weight:600}
 .tasks .active .t-detail{color:var(--ember-text)}
@@ -149,7 +153,7 @@ h1.l{font-size:36px}
 @keyframes blink{50%{opacity:0}}
 
 /* error */
-.err{display:flex;align-items:center;gap:14px;padding:14px 16px 14px 18px;border-radius:12px;border:1px solid rgba(242,139,130,.45);background:rgba(242,139,130,.08);text-align:left;max-width:100%}
+.err{display:flex;align-items:center;gap:14px;padding-block:14px;padding-inline:18px 16px;border-radius:12px;border:1px solid rgba(242,139,130,.45);background:rgba(242,139,130,.08);text-align:var(--start);max-width:100%}
 .err-i{width:22px;height:22px;flex:none;border-radius:9999px;border:2px solid var(--bad);color:var(--bad);display:flex;align-items:center;justify-content:center;font:700 12px/1 var(--f-text)}
 .err-t{flex:1;font-size:14px;line-height:1.45;color:var(--ink);min-width:0}
 main.center .err{width:min(640px,100%)}
@@ -168,7 +172,7 @@ main.center .err{width:min(640px,100%)}
 .opt-h input{width:18px;height:18px;margin:0;accent-color:var(--ember);flex:none}
 .opt-h input:focus-visible{outline:none}
 .opt-n{font:700 22px/1.2 var(--f-display)}
-.badge{margin-left:auto;padding:3px 10px;border-radius:9999px;background:var(--ember);color:#1A1400;font-size:12px;font-weight:600}
+.badge{margin-inline-start:auto;padding:3px 10px;border-radius:9999px;background:var(--ember);color:#1A1400;font-size:12px;font-weight:600}
 .opt-p{margin:0;font-size:14px;line-height:1.5;color:var(--text-2)}
 .facts{margin:0;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px 16px}
 .facts dt{font-size:12px;color:var(--muted)}
@@ -200,7 +204,7 @@ main.choose .foot{position:sticky;bottom:-24px;margin-bottom:-24px;padding:14px 
 .check.inline input{margin:0}
 
 /* ready */
-.cmd{display:flex;align-items:center;gap:12px;padding:14px 16px 14px 20px;border-radius:12px;background:var(--surface);border:1px solid var(--line);font:15px var(--f-mono);max-width:100%}
+.cmd{display:flex;align-items:center;gap:12px;padding-block:14px;padding-inline:20px 16px;border-radius:12px;background:var(--surface);border:1px solid var(--line);font:15px var(--f-mono);max-width:100%}
 .cmd .p{color:var(--muted)}
 .cmd code{font:inherit;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 
@@ -223,6 +227,21 @@ main.choose .foot{position:sticky;bottom:-24px;margin-bottom:-24px;padding:14px 
 .copied-tip.out{opacity:0;transform:translate(-50%,calc(-100% - 4px));transition:opacity .2s,transform .2s}
 @keyframes copied-rise{from{opacity:0;transform:translate(-50%,calc(-100% + 4px))}}
 @media (prefers-reduced-motion:reduce){.copied-tip{animation:none}}
+/* Right to left (Arabic), as in the main window (index.html says why): the
+   page mirrors by itself; every element takes the direction of its own first
+   letter, so Windows, WSL and Ubuntu read as written inside Arabic; alignment
+   is said outright; commands and the drawing behind the hello stay left to
+   right; and Arabic's joined letters are never spaced apart. */
+[dir=rtl] body{text-align:right}
+[dir=rtl] body :not(svg,svg *){unicode-bidi:plaintext;letter-spacing:0!important}
+[dir=rtl] :is(.cmd,pre,.lcloud,svg){direction:ltr}
+[dir=rtl] pre{text-align:left}
+/* Values are set in the monospace face, and some are words ("optional",
+   "included"): Arabic letters there come from the text face, since a
+   monospace one stretches every letter to one width. Latin and digits keep it. */
+@font-face{font-family:"Kiri Arabic";src:local("Segoe UI"),local("GeezaPro");unicode-range:U+0600-06FF,U+0750-077F,U+08A0-08FF,U+FB50-FDFF,U+FE70-FEFF}
+@font-face{font-family:"Kiri Arabic";font-weight:600 900;src:local("Segoe UI Semibold"),local("Segoe UI Bold"),local("GeezaPro-Bold");unicode-range:U+0600-06FF,U+0750-077F,U+08A0-08FF,U+FB50-FDFF,U+FE70-FEFF}
+[lang|=ar]{--f-mono:"Kiri Arabic","Cascadia Mono",Consolas,monospace}
 </style>
 </head>
 <body>
@@ -254,15 +273,29 @@ function addWords(p) {
   for (var t in p) {
     if (t === 'en' || !p[t]) continue;
     var m = {};
-    for (var i = 0; i < KEYS.length; i++) if (p[t][i] != null) m[KEYS[i]] = p[t][i];
+    for (var i = 0; i < KEYS.length; i++) if (p[t][i] != null) m[KEYS[i]] = RTL.test(t) ? rtlReady(p[t][i]) : p[t][i];
     STRINGS[t] = m;
   }
 }
+/* Written right to left. As the main window's rtlReady and island: an Arabic
+   sentence that opens with a Latin name gets a right-to-left mark in front
+   (every element takes its first letter's direction), and each value filled
+   into Arabic words is an island that keeps its own order. */
+var RTL = /^ar/, RTL_CH = /[\u0590-\u08FF\uFB1D-\uFDFF\uFE70-\uFEFC]/, STRONG_CH = /[A-Za-z\u00C0-\u024F\u0590-\u08FF\uFB1D-\uFDFF\uFE70-\uFEFC]/;
+function rtlReady(s) {
+  if (!RTL_CH.test(s)) return s;
+  /* The sentence's own first letter: a {placeholder}'s name and a tag's aren't its words, so they are stepped over. */
+  var first = function (t) { for (var i = 0; i < t.length; i++) { var skip = (t[i] === '{' || t[i] === '<') && /^(?:\{\w+\}|<[^>]*>)/.exec(t.slice(i)); if (skip) i += skip[0].length - 1; else if (STRONG_CH.test(t[i])) return t[i]; } return ''; };
+  var latinFirst = function (t) { var c = first(t); return !!c && !RTL_CH.test(c); };
+  s = s.replace(/(<(\w+)[^>]*>)([^<]*)(?=<\/\2>)/g, function (m, open, tag, inner) { return RTL_CH.test(inner) && latinFirst(inner) ? open + '\u200F' + inner : m; });
+  return latinFirst(s) ? '\u200F' + s : s;
+}
+function island(v) { return /^[\d.,\s]*$/.test(v) ? v : '\u2068' + v + '\u2069'; }
 addWords(/*STRINGS*/{});
 /* As the main window's langFor: the first of the system's languages Kiri has
    (zh-TW, zh-HK, zh-MO and zh-Hant… read Traditional Chinese, any other Chinese
    Simplified, any Portuguese Brazilian, "in" Indonesian), else English. */
-var LANG_IDS = ['en', 'id', 'de', 'es', 'fr', 'it', 'pl', 'pt-BR', 'vi', 'tr', 'ru', 'ja', 'ko', 'zh-Hans', 'zh-Hant'];
+var LANG_IDS = ['en', 'id', 'de', 'es', 'fr', 'it', 'pl', 'pt-BR', 'vi', 'tr', 'ru', 'ar', 'ja', 'ko', 'zh-Hans', 'zh-Hant'];
 function langFor(tag) {
   var t = String(tag || '').toLowerCase().replace(/_/g, '-');
   var is = function (id) { return t === id || t.indexOf(id + '-') === 0; };
@@ -289,6 +322,7 @@ function pickLang(pick) {
   }
   LANG = id; DICT = id === 'en' ? null : STRINGS[id];
   document.documentElement.lang = id;
+  document.documentElement.dir = RTL.test(id) ? 'rtl' : 'ltr';
 }
 window.kiriWords = function (p) {
   addWords(p);
@@ -297,9 +331,9 @@ window.kiriWords = function (p) {
 };
 pickLang(PICK);
 function isOne(n) { try { return new Intl.PluralRules(LANG).select(n) === 'one'; } catch (e) { return n === 1; } }
-function fillWords(s, vars) { return vars ? s.replace(/\{(\w+)\}/g, function (m, k) { return k in vars ? String(vars[k]) : m; }) : s; }
-function tr(s, vars) { return fillWords((DICT && DICT[s]) || s, vars); }
-function trn(n, one, other, vars) { var s = isOne(n) ? one : other, v = { n: n }; for (var k in vars || {}) v[k] = vars[k]; return fillWords((DICT && DICT[s]) || s, v); }
+function fillWords(s, vars, islands) { return vars ? s.replace(/\{(\w+)\}/g, function (m, k) { return k in vars ? (islands ? island(String(vars[k])) : String(vars[k])) : m; }) : s; }
+function tr(s, vars) { var w = DICT && DICT[s]; return fillWords(w || s, vars, w && RTL.test(LANG)); }
+function trn(n, one, other, vars) { var s = isOne(n) ? one : other, v = { n: n }, w = DICT && DICT[s]; for (var k in vars || {}) v[k] = vars[k]; return fillWords(w || s, v, w && RTL.test(LANG)); }
 </script>
 <script>
 (function () {
@@ -412,7 +446,7 @@ function trn(n, one, other, vars) { var s = isOne(n) ? one : other, v = { n: n }
      language, the system's picked and marked; a pick redraws the page at once. */
   var LANGS = [['en', 'English', 'Hello'], ['id', 'Bahasa Indonesia', 'Halo'], ['de', 'Deutsch', 'Hallo'], ['es', 'Español', 'Hola'], ['fr', 'Français', 'Bonjour'],
     ['it', 'Italiano', 'Ciao'], ['pl', 'Polski', 'Cześć'], ['pt-BR', 'Português (Brasil)', 'Olá'], ['vi', 'Tiếng Việt', 'Xin chào'], ['tr', 'Türkçe', 'Merhaba'],
-    ['ru', 'Русский', 'Привет'], ['ja', '日本語', 'こんにちは'], ['ko', '한국어', '안녕하세요'], ['zh-Hans', '简体中文', '你好'], ['zh-Hant', '繁體中文', '你好']];
+    ['ru', 'Русский', 'Привет'], ['ar', 'العربية', 'مرحبًا'], ['ja', '日本語', 'こんにちは'], ['ko', '한국어', '안녕하세요'], ['zh-Hans', '简体中文', '你好'], ['zh-Hant', '繁體中文', '你好']];
   var langDone = false, sysLang = langId('system');
   // Every hello, faint and scattered behind the header, in fixed places.
   var LANG_CLOUD = LANGS.concat(LANGS).slice(0, 22).map(function (l, i) {

@@ -127,6 +127,7 @@ fn make_window(mtm: MainThreadMarker, tx: Sender<Cmd>, autostart: bool, view: Op
         webview
     };
     window.setContentView(Some(&webview));
+    read_direction();
     place_lights(&window);
     WEBVIEW.with(|w| *w.borrow_mut() = Some(webview));
     WINDOW.with(|w| *w.borrow_mut() = Some(window.clone()));
@@ -136,10 +137,23 @@ fn make_window(mtm: MainThreadMarker, tx: Sender<Cmd>, autostart: bool, view: Op
 /// The page's strip across the top (index.html's `.strip`), in points.
 const STRIP: f64 = 44.0;
 
+/// Whether the window's language reads right to left. Kept here, read from
+/// the settings when the window opens and when the language changes
+/// ([`read_direction`]): the traffic lights are placed on every resize, and
+/// that mustn't read a file each time.
+static RTL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn read_direction() {
+    RTL.store(super::lang::rtl(super::lang::resolve(prefs()["lang"].as_str())), std::sync::atomic::Ordering::Relaxed);
+}
+
 /// The traffic lights, moved into the page's strip: 20 points in, centred
 /// in its height. AppKit lays them out again when the window resizes or
-/// leaves full screen, so the delegate calls this then too.
+/// leaves full screen, so the delegate calls this then too. In a
+/// right-to-left language the page's strip starts on the right, and so do
+/// they: close outermost, as macOS itself draws them in Arabic.
 fn place_lights(window: &NSWindow) {
+    let rtl = RTL.load(std::sync::atomic::Ordering::Relaxed);
     // SAFETY: AppKit's own window buttons and their superviews, read and
     // moved on the main thread; every object is retained while it's used.
     unsafe {
@@ -156,7 +170,8 @@ fn place_lights(window: &NSWindow) {
         let _: () = msg_send![&*bar, setFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(frame.size.width, STRIP))];
         for (i, b) in buttons.iter().enumerate() {
             let f: NSRect = msg_send![&**b, frame];
-            let _: () = msg_send![&**b, setFrameOrigin: NSPoint::new(20.0 + 20.0 * i as f64, ((STRIP - f.size.height) / 2.0).round())];
+            let x = if rtl { frame.size.width - 20.0 - f.size.width - 20.0 * i as f64 } else { 20.0 + 20.0 * i as f64 };
+            let _: () = msg_send![&**b, setFrameOrigin: NSPoint::new(x, ((STRIP - f.size.height) / 2.0).round())];
         }
     }
 }
@@ -284,13 +299,21 @@ fn main_menu(mtm: MainThreadMarker) -> Retained<NSMenu> {
     bar
 }
 
-/// The language setting changed: the menu bar's words follow. The page does
-/// its own, and the menu bar icon's menu is drawn fresh each time it opens.
+/// The language setting changed: the menu bar's words follow, and the traffic
+/// lights go to the side the page now starts on. The page does its own, and
+/// the menu bar icon's menu is drawn fresh each time it opens.
 pub(super) fn relang() {
     DispatchQueue::main().exec_async(|| {
         if let Some(mtm) = MainThreadMarker::new() {
             NSApplication::sharedApplication(mtm).setMainMenu(Some(&main_menu(mtm)));
         }
+        // The traffic lights change sides with the reading direction.
+        read_direction();
+        WINDOW.with(|w| {
+            if let Some(w) = w.borrow().as_ref() {
+                place_lights(w);
+            }
+        });
     });
 }
 

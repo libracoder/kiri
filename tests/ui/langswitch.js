@@ -4,6 +4,10 @@
 // the English it switched from; and nothing breaks on the way.
 const R = [];
 const t = (name, fn) => { try { fn(); R.push("PASS " + name); } catch (e) { R.push("FAIL " + name + ": " + e.message); } };
+// The clock stands still here: Share says how long a link has been live, and
+// on a slow machine the round trips below take long enough for "live 0 s" to
+// become "live 1 s", which is no difference between the languages.
+{ const now = Date.now(); Date.now = () => now; }
 ui.images.push({ Id: "sha256:" + "ab".repeat(32), RepoTags: ["nginx:alpine"], Size: 5e7, Created: Date.now() / 1000 - 86400 });
 const pick = (lang) => { show("settings"); document.querySelector('[data-stab="appearance"]').click(); const sel = document.getElementById("pref-lang"); sel.value = lang; sel.dispatchEvent(new Event("change")); };
 // What a person reads: the text and the words in attributes, of the whole window.
@@ -51,6 +55,9 @@ t("every language comes from the host when picked, and shows", () => {
     const nav = document.querySelector("nav [data-view=containers] .lbl").textContent;
     if (nav !== STRINGS[id]["Containers"]) throw new Error(`${id}: the sidebar says ${nav}`);
     if (document.documentElement.classList.contains("cjk") !== /^(zh|ja|ko)/.test(id)) throw new Error(`${id}: cjk is ${document.documentElement.classList.contains("cjk")}`);
+    // Arabic alone turns the window right to left, with its own fonts first.
+    if (document.documentElement.dir !== (id === "ar" ? "rtl" : "ltr")) throw new Error(`${id}: dir is ${document.documentElement.dir}`);
+    if (getComputedStyle(document.documentElement).getPropertyValue("--ui-font").includes("Geeza Pro") !== (id === "ar")) throw new Error(`${id}: Arabic's fonts`);
     const font = getComputedStyle(document.documentElement).getPropertyValue("--ui-font");
     const want = { ja: "Hiragino Sans", ko: "Malgun Gothic", "zh-Hant": "PingFang TC", "zh-Hans": "PingFang SC" }[id] || "PingFang SC";
     if (!font.includes(want)) throw new Error(`${id}: the font is ${font}`);
@@ -58,6 +65,7 @@ t("every language comes from the host when picked, and shows", () => {
   pick("en");
   const now = (visit(PLACES[0]), words());
   if (now !== before.get(PLACES[0][0])) throw new Error("containers differ after every language");
+  if (document.documentElement.dir !== "ltr") throw new Error("still right to left in English");
 });
 t("an answer for a language no longer picked changes nothing", () => {
   hostHold = true;
@@ -67,7 +75,7 @@ t("an answer for a language no longer picked changes nothing", () => {
 });
 t("tags map to the languages Kiri has, as lang.rs maps them", () => {
   const want = { zh: "zh-Hans", "zh-CN": "zh-Hans", "zh-SG": "zh-Hans", "zh-Hans-HK": "zh-Hans", zh_TW: "zh-Hant", "zh-TW": "zh-Hant", "zh-HK": "zh-Hant", "zh-MO": "zh-Hant", "zh-Hant": "zh-Hant", "zh-Hant-CN": "zh-Hant",
-    zhx: "", in: "id", "in-ID": "id", "id-ID": "id", iw: "", "iw-IL": "", "ja-JP": "ja", "ko-KR": "ko", "ru-RU": "ru", "pl-PL": "pl", "tr-TR": "tr", "vi-VN": "vi", "it-CH": "it", "pt-PT": "pt-BR", "fr-CA": "fr", "en-GB": "en", nl: "" };
+    zhx: "", in: "id", "in-ID": "id", "id-ID": "id", iw: "", "iw-IL": "", "ja-JP": "ja", "ko-KR": "ko", "ru-RU": "ru", "pl-PL": "pl", "tr-TR": "tr", "vi-VN": "vi", "it-CH": "it", "pt-PT": "pt-BR", "fr-CA": "fr", "en-GB": "en", nl: "", ar: "ar", "ar-SA": "ar", "ar-EG": "ar", ar_AE: "ar", arz: "", he: "" };
   const bad = Object.entries(want).filter(([tag, id]) => langFor(tag) !== id).map(([tag, id]) => `${tag} → ${langFor(tag)}, not ${id}`);
   if (bad.length) throw new Error(bad.join("; "));
 });
