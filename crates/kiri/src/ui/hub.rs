@@ -99,8 +99,22 @@ fn fetch(kind: Kind, key: &str) -> Result<Value, String> {
                 })
                 .collect())
         }
+        // A name with a registry in front (`ghcr.io/o/r`, `public.ecr.aws/o/r`)
+        // is asked of that registry; a plain one of Docker Hub.
+        Kind::Tags if on_registry(key) => {
+            let r = kiri_image::Reference::parse(key).map_err(|e| e.to_string())?;
+            let mut tags = order_tags(client.tags(&r, 2000).map_err(|e| e.to_string())?);
+            tags.truncate(100);
+            Ok(json!(tags))
+        }
         Kind::Tags => client.hub_tags(key, 100).map(|t| json!(order_tags(t))).map_err(|e| e.to_string()),
     }
+}
+
+/// Whether `name` starts with a registry's host, as `ghcr.io/o/r` does,
+/// rather than naming a Docker Hub repository.
+fn on_registry(name: &str) -> bool {
+    name.split_once('/').is_some_and(|(first, _)| first.contains('.') || first.contains(':') || first == "localhost")
 }
 
 /// `latest` first, then the newest tags, with pre-releases (`19rc1`,
@@ -117,6 +131,15 @@ fn order_tags(mut tags: Vec<String>) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_name_with_a_host_is_asked_of_that_registry() {
+        assert!(super::on_registry("ghcr.io/home-assistant/home-assistant"));
+        assert!(super::on_registry("public.ecr.aws/nginx/nginx"));
+        assert!(super::on_registry("localhost:5000/app"));
+        assert!(!super::on_registry("bitnami/nginx"));
+        assert!(!super::on_registry("nginx"));
+    }
+
     #[test]
     fn latest_first_prereleases_last() {
         let tags = ["19rc1", "17-alpine", "unstable", "latest", "16"].map(String::from).to_vec();

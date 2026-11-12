@@ -269,13 +269,13 @@ tr[data-pick] { scroll-margin: 34px 0 4px; }
 .pp-field input { flex: 1; min-width: 0; height: 100%; border: 0; background: none; outline: none; color: var(--text); font: var(--fs-head) var(--ui-font); -webkit-user-select: text; user-select: text; }
 .pp-field input::placeholder { color: var(--faint); }
 .pp .reg { flex: none; display: inline-flex; align-items: center; gap: 5px; height: 22px; padding: 0 8px; border-radius: 6px; background: var(--raised); color: var(--text); font: 500 var(--fs-small) var(--ui-font); white-space: nowrap; }
-/* Where it pulls from: Docker Hub works today, the rest are listed as Soon. */
+/* Where it pulls from: Docker Hub, GitHub and Amazon ECR work today, the rest are listed as Soon. */
 .pp .reg { border: 0; cursor: pointer; }
 .pp .reg:hover, .pp .reg[aria-expanded=true] { background: var(--row-hover); box-shadow: inset 0 0 0 1px var(--line); }
 .pp .reg .car { width: 9px; height: 9px; color: var(--muted); }
 .pp .reg.other svg.lg { display: none; }
 .pp .reg svg.lg, .regmenu svg.lg { width: 14px; height: 14px; flex: none; color: inherit; }
-.regmenu { position: absolute; top: 40px; inset-inline-end: 8px; width: 240px; z-index: 8; padding: 5px; display: grid; gap: 1px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 14px 40px rgba(0, 0, 0, .4); }
+.regmenu { position: absolute; top: 40px; inset-inline-end: 8px; width: 300px; max-height: calc(100% - 48px); overflow: auto; z-index: 8; padding: 5px; display: grid; gap: 1px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 14px 40px rgba(0, 0, 0, .4); }
 .regmenu .hd { font-size: var(--fs-small); font-weight: 600; color: var(--faint); text-transform: uppercase; letter-spacing: .05em; padding: 6px 9px 3px; }
 .regmenu button { display: flex; align-items: center; gap: 9px; height: 30px; padding: 0 9px; border: 0; border-radius: 7px; background: none; color: var(--text); font: var(--fs) var(--ui-font); text-align: var(--start); cursor: pointer; }
 .regmenu button[aria-checked=true] { background: var(--raised); }
@@ -284,7 +284,45 @@ tr[data-pick] { scroll-margin: 34px 0 4px; }
 .regmenu .ck { margin-inline-start: auto; width: 13px; height: 13px; fill: var(--blue-light); }
 .regmenu .soon { margin-inline-start: auto; font-size: var(--fs-small); font-weight: 600; padding: 1px 6px; border-radius: 5px; color: var(--muted); background: var(--raised); }
 .regmenu hr { border: 0; border-top: 1px solid var(--line); margin: 4px 2px; }
-.regmenu .mono-lg { width: 14px; height: 14px; flex: none; display: grid; place-items: center; border-radius: 4px; color: #fff; font: 700 8.5px var(--ui-font); }
+/* Each registry that works says whether it's signed in, with Sign in beside it; the
+   sign-in opens under its row, through the registry's own page (ui/weblogin.rs). */
+.regmenu .rrow { display: flex; align-items: center; gap: 4px; border-radius: 7px; }
+.regmenu .rrow > button[data-reg] { flex: 1; min-width: 0; height: auto; min-height: 30px; padding-block: 4px; }
+.regmenu .rn { flex: 1; min-width: 0; display: grid; }
+.regmenu .rsub { display: flex; align-items: center; gap: 4px; min-width: 0; font-size: var(--fs-small); color: var(--faint); white-space: nowrap; overflow: hidden; }
+.regmenu .wout { flex: none; width: 24px; height: 24px; margin-inline-end: 4px; display: grid; place-items: center; border: 0; border-radius: 6px; background: none; color: var(--faint); cursor: pointer; }
+.regmenu .wout svg { width: 14px; height: 14px; fill: currentColor; }
+.regmenu .wout:hover, .regmenu .wout[aria-expanded=true] { color: var(--text); background: var(--raised); }
+.regmenu .wpanel p b { color: var(--text); font-weight: 500; }
+.regmenu .wpanel .btn.danger.solid { background: #DA3633; border-color: #DA3633; color: #fff; }
+.regmenu .wpanel .btn.danger.solid:hover { background: #C42B28; }
+.regmenu .rsub .gd { width: 6px; height: 6px; border-radius: 50%; background: var(--green, #3FB950); flex: none; }
+.regmenu .wpill { flex: none; height: 20px; padding: 0 8px; margin-inline-end: 5px; border: 1px solid var(--line); border-radius: 5px; background: none; color: var(--blue-light); font: 500 var(--fs-small) var(--ui-font); cursor: pointer; white-space: nowrap; }
+.regmenu .wpill:hover { background: rgba(110, 168, 254, .1); border-color: rgba(110, 168, 254, .4); }
+.regmenu .wpanel { margin: 2px 2px 4px; padding: 10px 11px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); display: grid; gap: 8px; cursor: default; }
+.regmenu .wpanel .wt { display: flex; align-items: center; gap: 7px; font-weight: 600; }
+.regmenu .wpanel p { margin: 0; color: var(--muted); font-size: var(--fs-small); line-height: 1.45; }
+.regmenu .wpanel p.werr { color: var(--text); }
+.regmenu .wpanel code { font: var(--fs-small) var(--mono-font, ui-monospace, monospace); color: var(--text); }
+.regmenu .wpanel .wft { display: flex; align-items: center; justify-content: flex-end; gap: 6px; }
+.regmenu .wpanel .wft .sp { flex: 1; }
+.regmenu .wpanel .btn { height: 24px; }
+.regmenu .wpanel .btn svg { width: 11px; height: 11px; fill: currentColor; }
+.regmenu .wcode { display: flex; align-items: center; gap: 8px; padding: 6px 6px 6px 10px; border: 1px solid var(--line); border-radius: 7px; background: var(--panel); }
+.regmenu .wcode b { flex: 1; font: 600 16px var(--mono-font, ui-monospace, monospace); letter-spacing: .12em; -webkit-user-select: text; user-select: text; }
+.regmenu .wwait { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: var(--fs-small); }
+.regmenu .wspin { width: 12px; height: 12px; border-radius: 50%; border: 2px solid var(--line); border-top-color: var(--blue-light); animation: wspin .8s linear infinite; flex: none; }
+@keyframes wspin { to { transform: rotate(360deg); } }
+.regmenu .wsafe { display: flex; align-items: flex-start; gap: 6px; color: var(--faint); font-size: var(--fs-small); line-height: 1.4; }
+.regmenu .wsafe svg { width: 11px; height: 11px; flex: none; margin-top: 1px; fill: var(--green, #3FB950); }
+.regmenu .wpanel select { height: 26px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--text); padding: 0 6px; font: var(--fs) var(--ui-font); }
+.regmenu .wotp { display: flex; justify-content: center; gap: 6px; }
+.regmenu .wotp input { width: 32px; height: 32px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--text); text-align: center; font: 600 var(--fs-head) var(--mono-font, ui-monospace, monospace); outline: none; caret-color: var(--blue-light); }
+.regmenu .wotp input:focus { border-color: var(--blue-light); box-shadow: 0 0 0 3px rgba(110, 168, 254, .15); }
+.regmenu .wotp.bad input { border-color: var(--red); }
+.regmenu .wotp .dash { align-self: center; color: var(--faint); }
+.regmenu .wpanel .wbad { color: var(--red); font-size: var(--fs-small); }
+.regmenu .wpanel label { display: grid; gap: 3px; color: var(--muted); font-size: var(--fs-small); }
 .pp-list, .pp-body { flex: 1 1 auto; overflow: auto; min-height: 0; padding: 2px 6px 6px; }
 .pp .sec { display: flex; align-items: center; gap: 7px; padding: 9px 8px 4px; color: var(--faint); font: 600 var(--fs-small) var(--ui-font); text-transform: uppercase; letter-spacing: .05em; }
 .pp .sec .r { margin-inline-start: auto; text-transform: none; letter-spacing: 0; font-weight: 500; }
@@ -6609,7 +6647,9 @@ window.kiri = {
         }
         break;
       case "needs": gotNeeds(e); break;
-      case "logins": ui.logins = { items: e.items || [], store: e.store || "", stores: e.stores || {} }; signinRedraw(); break;
+      case "logins": ui.logins = { items: e.items || [], store: e.store || "", stores: e.stores || {} }; signinRedraw(); webRedraw(); break;
+      case "weblogin": webEvent(e); break;
+      case "awsprofiles": ui.web.profiles = e.items || []; if (!e.tool && ui.web.open === "ecr") { ui.web.state = "notool"; ui.web.tool = "aws"; } webRedraw(); break;
       case "login": loginDone(e); break;
       case "usage": ui.usage = e; renderStatus(); break;
       case "lastlogs": {
@@ -8840,7 +8880,7 @@ const batchHas = (v, key) => ui.batches.some((b) => b.view === v && b.keys.has(k
    row at the top of the Images list with its progress, several at once; a
    failed one says why in its row. The status bar counts them. */
 const PP_KEY = WIN ? "Ctrl+Shift+P" : "⌘⇧P", HUB = "Docker Hub";
-const pp = { open: false, mode: "search", q: "", sel: 0, items: [], status: "", repo: "", tag: "", hub: null, tagList: [], search: new Map(), tags: new Map(), asked: new Set(), timer: 0, signin: false };
+const pp = { open: false, mode: "search", reg: "docker", q: "", sel: 0, items: [], status: "", repo: "", tag: "", hub: null, tagList: [], search: new Map(), tags: new Map(), asked: new Set(), timer: 0, signin: false };
 const SEARCH_SVG = `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="7" cy="7" r="4.8"/><path d="M10.6 10.6L14 14"/></svg>`;
 function hubAsk(kind, key) {
   if (pp.asked.has(kind + key)) return;
@@ -8885,6 +8925,13 @@ function ppItems() {
   const q = pp.q.trim(), v = q.toLowerCase();
   pp.status = "";
   if (!q) return ui.images.filter((i) => i.Pulled && !untagged(i)).sort((a, b) => b.Pulled - a.Pulled).slice(0, 5).map((i) => ({ kind: "recent", ref: imgKey(i), when: ago(i.Pulled) }));
+  // On GitHub or ECR, owner/image is on that registry; a reference with its
+  // own host is still pulled as typed.
+  if (regCur().host && hostOf(q) === HUB) {
+    const n = regTyped(q);
+    if (!n) { pp.status = "regname"; return []; }
+    return [{ kind: "reg", ...n }];
+  }
   const r = parseRef(q), items = r ? [{ kind: "exact", ...r }] : [];
   if (r && r.host !== HUB) return items;
   const base = r ? r.repo.toLowerCase() : v;
@@ -8899,6 +8946,11 @@ function ppItems() {
 function ppRow(it, i) {
   const sel = `role="option" data-ppi="${i}" aria-selected="${i === pp.sel}"`;
   if (it.kind === "recent") return `<button class="pp-it one" ${sel}><span class="tile">${svgOf("clock")}</span><span class="m"><b class="mono">${esc(it.ref)}</b></span><span class="meta">${esc(it.when)}</span></button>`;
+  if (it.kind === "reg") {
+    const cur = regOf(it.repo.split("/")[0]) || regCur(), hv = haveOf(it.repo);
+    return `<button class="pp-it reg" ${sel}><span class="tile">${cur.logo}</span><span class="m"><b class="mono">${esc(it.repo.slice(it.repo.indexOf("/") + 1))}</b><small class="mono">${esc(it.repo)}${it.tag === "latest" ? "" : `:${esc(it.tag)}`}</small></span>
+      <span class="meta"><span>${esc(cur.name)}</span>${hv.length ? `<span class="have">${tr("Have")} · ${esc(hv.map((x) => x.tag).join(", "))}</span>` : `<span class="faint">↵ ${tr("choose tag")}</span>`}</span></button>`;
+  }
   if (it.kind === "exact") {
     const ref = normRef(it.ref), have = ui.images.find((x) => x.RepoTags?.includes(ref));
     return `<button class="pp-it exact" ${sel}><span class="tile blue">${svgOf("pull")}</span><span class="m"><b>${tr("Pull exactly this")}</b><small class="mono">${esc(ref)}</small></span>
@@ -8908,29 +8960,174 @@ function ppRow(it, i) {
   return `<button class="pp-it" ${sel}>${tile(h.icon)}<span class="m"><b>${esc(h.name)}${h.official ? `<span class="pp-badge">${tr("Official")}</span>` : ""}</b><small>${esc(h.description || "")}</small></span>
     <span class="meta"><span>${stars(h.stars)}</span>${hv.length ? `<span class="have" title="${tr("You have {tags}", { tags: esc(hv.map((x) => x.tag).join(", ")) })}">${when ? tr("Pulled {when}", { when: ago(when) }) : tr("Have")} · ${esc(hv.map((x) => x.tag).join(", "))}</span>` : ""}</span></button>`;
 }
-/* Registries Pull can pull from. Docker Hub works today; the others are listed so you can see they're coming. */
+/* Registries Pull can pull from. Docker Hub is searched; on GitHub and Amazon
+   ECR (its public gallery) you type owner/image and choose a tag, read from the
+   registry itself. The others are listed so you can see they're coming. */
 const regLogo = (c, d) => `<svg class="lg" viewBox="0 0 24 24" style="color:#${c}" aria-hidden="true"><path fill="currentColor" d="${d}"/></svg>`;
-const regMono = (t, bg) => `<span class="mono-lg" style="background:${bg}" aria-hidden="true">${t}</span>`;
+const regSvg = (vb, inner) => `<svg class="lg" viewBox="${vb}" aria-hidden="true">${inner}</svg>`;
 const REGISTRIES = [
   { id: "docker", name: "Docker Hub", short: "Hub", logo: regLogo("2496ED", "M14 11.1h2.1a.2.2 0 0 0 .2-.2V9a.2.2 0 0 0-.2-.2h-2.1a.2.2 0 0 0-.2.2v1.9c0 .1.1.2.2.2m-3-5.4h2.1a.2.2 0 0 0 .2-.2V3.6a.2.2 0 0 0-.2-.2h-2.1a.2.2 0 0 0-.2.2v1.9c0 .1.1.2.2.2m0 2.7h2.1a.2.2 0 0 0 .2-.2V6.3a.2.2 0 0 0-.2-.2h-2.1a.2.2 0 0 0-.2.2v1.9c0 .1.1.2.2.2m-2.9 0h2.1a.2.2 0 0 0 .2-.2V6.3a.2.2 0 0 0-.2-.2H8.1a.2.2 0 0 0-.2.2v1.9c0 .1.1.2.2.2m-3 0h2.1a.2.2 0 0 0 .2-.2V6.3a.2.2 0 0 0-.2-.2H5.1a.2.2 0 0 0-.2.2v1.9c0 .1.1.2.2.2m5.9 2.7h2.1a.2.2 0 0 0 .2-.2V9a.2.2 0 0 0-.2-.2h-2.1a.2.2 0 0 0-.2.2v1.9c0 .1.1.2.2.2m-2.9 0h2.1a.2.2 0 0 0 .2-.2V9a.2.2 0 0 0-.2-.2h-2.1a.2.2 0 0 0-.2.2v1.9c0 .1.1.2.2.2m-3 0h2.1a.2.2 0 0 0 .2-.2V9a.2.2 0 0 0-.2-.2h-2.1a.2.2 0 0 0-.2.2v1.9c0 .1.1.2.2.2m-2.9 0h2.1a.2.2 0 0 0 .2-.2V9a.2.2 0 0 0-.2-.2h-2.1a.2.2 0 0 0-.2.2v1.9c0 .1.1.2.2.2M23.8 9.9c-.1-.1-.7-.5-2-.5-.3 0-.7 0-1 .1-.2-1.7-1.7-2.5-1.7-2.6l-.3-.2-.2.3c-.3.4-.5.9-.6 1.4-.2 1-.1 1.9.4 2.7-.6.3-1.6.4-1.7.4H.8a.8.8 0 0 0-.8.7 11.4 11.4 0 0 0 .7 4.1c.5 1.4 1.4 2.5 2.4 3.1 1.2.7 3.1 1.1 5.3 1.1 1 0 2-.1 2.9-.3a12.2 12.2 0 0 0 3.8-1.4c1-.6 1.9-1.3 2.6-2.1 1.3-1.4 2-3 2.6-4.4h.2c1.4 0 2.2-.5 2.7-1 .3-.3.6-.7.7-1l.1-.3Z"), works: true },
-  { id: "ghcr", name: "GitHub (ghcr.io)", logo: `<svg class="lg" viewBox="0 0 256 256" aria-hidden="true"><path fill="currentColor" d="${PH.github}"/></svg>` },
-  { id: "quay", name: "Quay.io", logo: regMono("Q", "#40B4E5") },
-  { id: "ecr", name: "Amazon ECR", logo: regMono("A", "#FF9900") },
-  { id: "gar", name: "Google Artifact Registry", logo: regMono("G", "#4285F4") },
+  { id: "ghcr", name: "GitHub (ghcr.io)", host: "ghcr.io", example: "home-assistant/home-assistant", logo: `<svg class="lg" viewBox="0 0 256 256" aria-hidden="true"><path fill="currentColor" d="${PH.github}"/></svg>`, works: true },
+  { id: "ecr", name: "Amazon ECR", host: "public.ecr.aws", example: "nginx/nginx", logo: regSvg("0 0 256 153", `<path fill="currentColor" d="M72.392 55.438c0 3.137.34 5.68.933 7.545a45.4 45.4 0 0 0 2.712 6.103c.424.678.593 1.356.593 1.95c0 .847-.508 1.695-1.61 2.543l-5.34 3.56c-.763.509-1.526.763-2.205.763c-.847 0-1.695-.424-2.543-1.187a26 26 0 0 1-3.051-3.984c-.848-1.44-1.696-3.052-2.628-5.001q-9.919 11.697-24.922 11.698c-7.12 0-12.8-2.035-16.954-6.103c-4.153-4.07-6.272-9.495-6.272-16.276c0-7.205 2.543-13.054 7.714-17.462c5.17-4.408 12.037-6.612 20.768-6.612c2.882 0 5.849.254 8.985.678c3.137.424 6.358 1.102 9.749 1.865V29.33c0-6.443-1.357-10.935-3.985-13.563c-2.712-2.628-7.29-3.9-13.817-3.9c-2.967 0-6.018.34-9.155 1.103s-6.188 1.695-9.155 2.882c-1.356.593-2.373.932-2.967 1.102s-1.017.254-1.356.254c-1.187 0-1.78-.848-1.78-2.628v-4.154c0-1.356.17-2.373.593-2.966c.424-.594 1.187-1.187 2.374-1.78q4.45-2.29 10.68-3.815C33.908.763 38.316.255 42.978.255c10.088 0 17.463 2.288 22.21 6.866c4.662 4.577 7.036 11.528 7.036 20.853v27.464zM37.976 68.323c2.798 0 5.68-.508 8.731-1.526c3.052-1.017 5.765-2.882 8.053-5.425c1.357-1.61 2.374-3.39 2.882-5.425c.509-2.034.848-4.493.848-7.375v-3.56a71 71 0 0 0-7.799-1.441a64 64 0 0 0-7.968-.509c-5.68 0-9.833 1.102-12.63 3.391s-4.154 5.51-4.154 9.748c0 3.984 1.017 6.951 3.136 8.986c2.035 2.119 5.002 3.136 8.901 3.136m68.069 9.155c-1.526 0-2.543-.254-3.221-.848c-.678-.508-1.272-1.695-1.78-3.305L81.124 7.799c-.51-1.696-.764-2.798-.764-3.391c0-1.356.678-2.12 2.035-2.12h8.307c1.61 0 2.713.255 3.306.848c.678.509 1.187 1.696 1.695 3.306l14.241 56.117l13.224-56.117c.424-1.695.933-2.797 1.61-3.306c.679-.508 1.866-.847 3.392-.847h6.781c1.61 0 2.713.254 3.39.847c.679.509 1.272 1.696 1.611 3.306l13.394 56.795L168.01 6.442c.508-1.695 1.102-2.797 1.695-3.306c.678-.508 1.78-.847 3.306-.847h7.883c1.357 0 2.12.678 2.12 2.119c0 .424-.085.848-.17 1.356s-.254 1.187-.593 2.12l-20.43 65.525q-.762 2.544-1.78 3.306c-.678.509-1.78.848-3.22.848h-7.29c-1.611 0-2.713-.254-3.392-.848c-.678-.593-1.271-1.695-1.61-3.39l-13.14-54.676l-13.054 54.59c-.423 1.696-.932 2.798-1.61 3.391c-.678.594-1.865.848-3.39.848zm108.927 2.289c-4.408 0-8.816-.509-13.054-1.526c-4.239-1.017-7.544-2.12-9.748-3.39c-1.357-.764-2.29-1.611-2.628-2.374a6 6 0 0 1-.509-2.374V65.78c0-1.78.678-2.628 1.95-2.628a4.8 4.8 0 0 1 1.526.255c.508.17 1.271.508 2.119.847a46 46 0 0 0 9.324 2.967a51 51 0 0 0 10.088 1.017c5.34 0 9.494-.932 12.376-2.797s4.408-4.577 4.408-8.053c0-2.373-.763-4.323-2.289-5.934s-4.408-3.051-8.561-4.408l-12.292-3.814c-6.188-1.95-10.765-4.832-13.563-8.647c-2.797-3.73-4.238-7.883-4.238-12.291q0-5.34 2.289-9.41c1.525-2.712 3.56-5.085 6.103-6.95c2.543-1.95 5.425-3.391 8.816-4.408c3.39-1.017 6.95-1.441 10.68-1.441c1.865 0 3.815.085 5.68.339c1.95.254 3.73.593 5.51.932c1.695.424 3.306.848 4.832 1.357q2.288.762 3.56 1.525c1.187.679 2.034 1.357 2.543 2.12q.763 1.017.763 2.797v3.984c0 1.78-.678 2.713-1.95 2.713c-.678 0-1.78-.34-3.22-1.018q-7.25-3.306-16.276-3.306c-4.832 0-8.647.763-11.275 2.374c-2.627 1.61-3.984 4.069-3.984 7.544c0 2.374.848 4.408 2.543 6.019s4.832 3.221 9.325 4.662l12.037 3.815c6.103 1.95 10.511 4.662 13.139 8.137s3.9 7.46 3.9 11.868c0 3.645-.764 6.951-2.205 9.833c-1.525 2.882-3.56 5.425-6.188 7.46c-2.628 2.119-5.764 3.645-9.409 4.747c-3.815 1.187-7.799 1.78-12.122 1.78"/><path fill="#f90" d="M230.993 120.964c-27.888 20.599-68.408 31.534-103.247 31.534c-48.827 0-92.821-18.056-126.05-48.064c-2.628-2.373-.255-5.594 2.881-3.73c35.942 20.854 80.276 33.484 126.136 33.484c30.94 0 64.932-6.442 96.212-19.666c4.662-2.12 8.646 3.052 4.068 6.442m11.614-13.224c-3.56-4.577-23.566-2.204-32.636-1.102c-2.713.34-3.137-2.034-.678-3.814c15.936-11.19 42.13-7.968 45.181-4.239c3.052 3.815-.848 30.008-15.767 42.554c-2.288 1.95-4.492.933-3.475-1.61c3.39-8.393 10.935-27.296 7.375-31.789"/>`), works: true },
+  { id: "quay", name: "Quay.io", logo: regSvg("0 0 256 236", `<path fill="#40b4e5" d="m200.134 0l55.555 117.514l-55.555 117.518h-47.295l55.555-117.518L152.84 0zM110.08 99.836l20.056-38.092l-2.29-8.868L102.847 0H55.552l48.647 102.898zm17.766 74.433l-17.333-39.034l-6.314-3.101l-48.647 102.898h47.295l25-52.88z"/><path fill="currentColor" d="M152.842 235.032L97.287 117.514L152.842 0h47.295l-55.555 117.514l55.555 117.518zm-97.287 0L0 117.514L55.555 0h47.296L47.295 117.514l55.556 117.518z"/>`) },
+  { id: "gar", name: "Google Artifact Registry", logo: regSvg("0 0 256 206", `<path fill="#ea4335" d="m170.252 56.819l22.253-22.253l1.483-9.37C153.437-11.677 88.976-7.496 52.42 33.92C42.267 45.423 34.734 59.764 30.717 74.573l7.97-1.123l44.505-7.34l3.436-3.513c19.797-21.742 53.27-24.667 76.128-6.168z"/><path fill="#4285f4" d="M224.205 73.918a100.25 100.25 0 0 0-30.217-48.722l-31.232 31.232a55.52 55.52 0 0 1 20.379 44.037v5.544c15.35 0 27.797 12.445 27.797 27.796c0 15.352-12.446 27.485-27.797 27.485h-55.671l-5.466 5.934v33.34l5.466 5.231h55.67c39.93.311 72.553-31.494 72.864-71.424a72.3 72.3 0 0 0-31.793-60.453"/><path fill="#34a853" d="M71.87 205.796h55.593V161.29H71.87a27.3 27.3 0 0 1-11.399-2.498l-7.887 2.42l-22.409 22.253l-1.952 7.574c12.567 9.489 27.9 14.825 43.647 14.757"/><path fill="#fbbc05" d="M71.87 61.426C31.94 61.663-.237 94.227.001 134.158a72.3 72.3 0 0 0 28.222 56.88l32.248-32.246c-13.99-6.322-20.208-22.786-13.887-36.776s22.786-20.208 36.775-13.888a27.8 27.8 0 0 1 13.887 13.888l32.248-32.248A72.22 72.22 0 0 0 71.87 61.427"/>`) },
   { id: "gitlab", name: "GitLab", logo: regLogo("FC6D26", "m23.6 9.6 0-.1L20.3 1a.9.9 0 0 0-.3-.4.9.9 0 0 0-1 .1.9.9 0 0 0-.3.4l-2.2 6.7H7.5l-2.2-6.7a.9.9 0 0 0-.3-.4.9.9 0 0 0-1-.1.9.9 0 0 0-.3.4L.4 9.5l0 .1a6.1 6.1 0 0 0 2 7l0 0 0 0 5 3.7 2.5 1.9 1.5 1.1a1 1 0 0 0 1.2 0l1.5-1.1 2.5-1.9 5-3.7 0 0a6.1 6.1 0 0 0 2-7z") },
   { id: "own", name: "Your own registry…", logo: `<svg class="lg" viewBox="0 0 256 256" aria-hidden="true"><path fill="currentColor" d="${PH.link}"/></svg>` },
 ];
+/* The registry chosen in the chip's menu, and the one a host belongs to. */
+const regCur = () => REGISTRIES.find((r) => r.id === pp.reg) || REGISTRIES[0];
+const regOf = (host) => REGISTRIES.find((r) => r.host === host || (r.id === "ecr" && /\.dkr\.ecr\.[^.]+\.amazonaws\.com$/.test(host)));
+/* On GitHub or ECR, what's typed without a host: owner/image, maybe a tag. */
+function regTyped(q) {
+  const m = /^([a-z0-9][a-z0-9._-]*\/[a-z0-9][a-z0-9._/-]*?)(?::([A-Za-z0-9_][A-Za-z0-9._-]*))?$/.exec(q.trim());
+  return m ? { repo: `${regCur().host}/${m[1].toLowerCase()}`, tag: m[2] || "latest" } : null;
+}
 const REG_CARET = `<svg class="car" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M2 3.5 5 6.5 8 3.5"/></svg>`;
+/* Signing in through the registry's own page (ui/weblogin.rs), never a password typed
+   here: Docker Hub and GitHub show their one-time code and open their page; ECR uses
+   an AWS profile already set up. The sign-in opens under its row in the menu. */
+const WEB_REGS = new Set(["docker", "ghcr", "ecr"]);
+const ECR_KEY = /\.dkr\.ecr\.[^.]+\.amazonaws\.com$/;
+ui.web = { open: "", state: "", code: "", url: "", error: "", tool: "", profile: "", profiles: null, ask: "" };
+/* Phosphor sign-out (MIT), as icons.js draws the others. */
+const SIGN_OUT = "M120 216a8 8 0 0 1-8 8H48a8 8 0 0 1-8-8V40a8 8 0 0 1 8-8h64a8 8 0 0 1 0 16H56v160h56a8 8 0 0 1 8 8Zm109.66-93.66-40-40a8 8 0 0 0-11.32 11.32L204.69 120H112a8 8 0 0 0 0 16h92.69l-26.35 26.34a8 8 0 0 0 11.32 11.32l40-40a8 8 0 0 0 0-11.32Z";
+const webLogin = (id) => (id === "docker" ? loginFor(HUB) : id === "ghcr" ? loginFor("ghcr.io") : id === "ecr" ? ui.logins?.items.find((i) => ECR_KEY.test(i.server)) : null);
+function regRow(r, i) {
+  const sel = r.id === pp.reg, web = r.works && WEB_REGS.has(r.id), li = web ? webLogin(r.id) : null;
+  const sub = !web ? "" : li ? `<small class="rsub"><i class="gd"></i>${esc(r.id === "ecr" ? `AWS · ${li.server.replace(/\.amazonaws\.com$/, "")}` : li.username || tr("Signed in"))}</small>`
+    : r.id === "ecr" ? `<small class="rsub">${tr("Public images need no sign-in")}</small>` : "";
+  const name = r.id === "ghcr" ? "GitHub" : r.name;
+  const act = !web ? "" : li ? `<button type="button" class="wout" data-webask="${r.id}" aria-expanded="${ui.web.ask === r.id}" title="${tr("Sign out of {registry}", { registry: name })}" aria-label="${tr("Sign out of {registry}", { registry: name })}"><svg viewBox="0 0 256 256" aria-hidden="true"><path d="${SIGN_OUT}"/></svg></button>`
+    : ui.web.open !== r.id ? `<button type="button" class="wpill" data-websign="${r.id}">${r.id === "ecr" ? tr("Use AWS profile") : tr("Sign in")}</button>` : "";
+  const mark = r.works ? (sel ? `<svg class="ck" viewBox="0 0 256 256" aria-hidden="true"><path d="${PH.check}"/></svg>` : "") : `<span class="soon">${tr("Soon")}</span>`;
+  const row = `<div class="rrow"><button type="button" role="menuitemradio" aria-checked="${sel}"${r.works ? "" : " disabled"} data-reg="${r.id}">${r.logo}<span class="rn">${esc(r.id === "own" ? tr("Your own registry…") : r.name)}${sub}</span>${mark}</button>${act}</div>`;
+  return `${i === 1 || i === 3 ? "<hr>" : ""}${row}${ui.web.open === r.id ? webPanel(r) : li && ui.web.ask === r.id ? outPanel(r, li, name) : ""}`;
+}
+/* Asks before signing out: what's forgotten, and what that means for the CLI. */
+function outPanel(r, li, name) {
+  const who = `<b>${esc(r.id === "ecr" ? "AWS" : li.username || name)}</b>`;
+  const note = r.id === "docker" ? tr("The docker command is signed out too.") : r.id === "ghcr" ? tr("The GitHub CLI stays signed in.") : tr("Signing in again uses your AWS profile.");
+  return `<div class="wpanel"><div class="wt">${r.logo}${tr("Sign out of {registry}?", { registry: name })}</div>
+    <p>${tr("{user}'s sign-in is forgotten on this computer.", { user: who })} ${note} ${tr("Private images won't pull until you sign in again.")}</p>
+    <div class="wft"><button type="button" class="btn" data-webask="">${tr("Cancel")}</button><button type="button" class="btn danger solid" data-webout="${esc(li.server)}">${tr("Sign out")}</button></div></div>`;
+}
+function webPanel(r) {
+  const w = ui.web, gh = r.id === "ghcr", aws = r.id === "ecr";
+  const title = (t) => `<div class="wt">${r.logo}${t}</div>`;
+  const safe = (t) => `<div class="wsafe">${svgOf("lock")}<span>${t}</span></div>`;
+  const cancel = (label = tr("Cancel")) => `<button type="button" class="btn" data-webcancel>${label}</button>`;
+  const wait = (t) => `<div class="wwait"><span class="wspin"></span><span>${t}</span></div>`;
+  const head = aws ? title(tr("Use your AWS profile")) : gh ? title(tr("Sign in with GitHub")) : title(tr("Sign in to {registry}", { registry: "Docker Hub" }));
+  let body;
+  if (w.state === "notool") {
+    body = `<p>${w.tool === "gh" ? tr("Kiri signs in to GitHub with the GitHub CLI (gh), which isn't installed. Install it, then try again.")
+      : w.tool === "aws" ? tr("Kiri uses your AWS profile through the AWS CLI, which isn't installed. Public images still pull.")
+      : tr("Kiri signs in to Docker Hub with the docker command, which isn't installed. Install it, then try again.")}</p><div class="wft">${cancel(tr("Close"))}</div>`;
+  } else if (w.state === "failed") {
+    body = `<p class="werr">${esc(w.error)}</p><div class="wft">${cancel(tr("Close"))}<button type="button" class="btn primary" data-websign="${r.id}">${tr("Try again")}</button></div>`;
+  } else if (w.state === "code") {
+    body = `<p>${gh ? tr("GitHub's page asks you to let Kiri read your packages. Check that it shows this code:") : tr("Docker's own page signs you in. Check that it shows this code:")}</p>
+      <div class="wcode"><b>${esc(w.code)}</b><button type="button" class="btn" data-webcopy>${svgOf("copy")}${tr("Copy")}</button></div>
+      <div class="wft">${cancel()}<button type="button" class="btn primary" data-webopen>${tr("Open {site}", { site: gh ? "GitHub" : "Docker Hub" })} ${svgOf("open")}</button></div>
+      ${safe(gh ? tr("You sign in on github.com. Kiri gets a token that can only read packages.") : tr("Your password and two-step code go to Docker, not Kiri."))}`;
+  } else if (w.state === "waiting") {
+    body = `${wait(w.code ? tr("Waiting for you to approve {code} in the browser…", { code: `<b>${esc(w.code)}</b>` }) : tr("Waiting for you to sign in in the browser…"))}
+      <div class="wft">${w.url && !aws ? `<button type="button" class="linkish" data-webagain>${tr("Open the page again")}</button><span class="sp"></span>` : ""}${cancel()}</div>`;
+  } else if (w.state === "sso") {
+    body = `${title(tr("Your AWS sign-in expired"))}<p>${tr("The profile {profile} signs in through AWS IAM Identity Center. Kiri runs {cmd}, which opens AWS's page.", { profile: `<b>${esc(w.profile)}</b>`, cmd: "<code>aws sso login</code>" })}</p>
+      <div class="wft">${cancel()}<button type="button" class="btn primary" data-websso>${tr("Sign in with AWS")} ${svgOf("open")}</button></div>`;
+    return `<div class="wpanel">${body}</div>`;
+  } else if (aws && (w.state === "mfa" || w.state === "mfacheck")) {
+    const who = { profile: `<b>${esc(w.profile)}</b>`, device: `<b>${esc(w.device || "")}</b>` };
+    body = `<div class="wt">${r.logo}${tr("Enter your MFA code")}</div>
+      <p>${w.device ? tr("The profile {profile} asks for a code from your MFA device {device}.", who) : tr("The profile {profile} asks for a code from your MFA device.", who)}</p>
+      ${w.state === "mfacheck" ? wait(tr("Checking the code with AWS…"))
+        : `<div class="wotp${w.bad ? " bad" : ""}" role="group" aria-label="${tr("MFA code")}">${[0, 1, 2, 3, 4, 5].map((i) => `${i === 3 ? '<span class="dash">–</span>' : ""}<input inputmode="numeric" autocomplete="one-time-code" maxlength="6" data-mfa="${i}" aria-label="${i + 1}">`).join("")}</div>
+      ${w.bad ? `<div class="wbad">${tr("AWS didn't accept that code. Wait for the next one and try again.")}</div>` : ""}`}
+      <div class="wft">${cancel()}</div>
+      ${safe(tr("The code goes straight to the AWS CLI; Kiri doesn't keep it."))}`;
+    return `<div class="wpanel">${body}</div>`;
+  } else if (aws && w.state === "profiles") {
+    const list = w.profiles;
+    body = `<p>${tr("Public images on public.ecr.aws need nothing. For your own account's registry, Kiri runs {cmd} with this profile.", { cmd: "<code>aws ecr get-login-password</code>" })}</p>
+      ${list == null ? wait(tr("Starting…")) : !list.length ? `<p>${tr("The AWS CLI has no profiles yet. Set one up with {cmd}.", { cmd: "<code>aws configure</code>" })}</p>`
+        : `<label>${tr("AWS profile")}<select data-webprof>${list.map((p) => `<option${p === w.profile ? " selected" : ""}>${esc(p)}</option>`).join("")}</select></label>`}
+      <div class="wft">${cancel()}${list?.length ? `<button type="button" class="btn primary" data-webprofile>${tr("Use this profile")}</button>` : ""}</div>
+      ${safe(tr("Nothing to type: it uses the AWS sign-in already on this computer."))}`;
+  } else {
+    body = `${wait(tr("Starting…"))}<div class="wft">${cancel()}</div>`;
+  }
+  return `<div class="wpanel">${head}${body}</div>`;
+}
+const webRedraw = () => {
+  const m = $("ppregmenu");
+  if (!m || m.hidden) return;
+  regMenu(true);
+  m.querySelector("[data-mfa]")?.focus({ preventScroll: true });
+};
+/* The MFA boxes: a digit moves on, a paste fills them all, the sixth sends it. */
+$("pp").addEventListener("input", (ev) => {
+  const box = ev.target.closest("#ppregmenu [data-mfa]");
+  if (!box) return;
+  const boxes = [...$("ppregmenu").querySelectorAll("[data-mfa]")];
+  const digits = box.value.replace(/\D/g, "");
+  if (digits.length > 1) digits.slice(0, 6 - +box.dataset.mfa).split("").forEach((d, i) => { boxes[+box.dataset.mfa + i].value = d; });
+  else box.value = digits;
+  (boxes.find((b) => !b.value) || boxes[5]).focus();
+  const code = boxes.map((b) => b.value).join("");
+  if (code.length === 6) { ui.web.state = "mfacheck"; send("webloginmfa", { name: "ecr", value: { code } }); webRedraw(); }
+});
+$("pp").addEventListener("keydown", (ev) => {
+  const box = ev.target.closest("#ppregmenu [data-mfa]");
+  if (box && ev.key === "Backspace" && !box.value && +box.dataset.mfa > 0) { ev.preventDefault(); $("ppregmenu").querySelector(`[data-mfa="${+box.dataset.mfa - 1}"]`).focus(); }
+});
+function webStart(id) {
+  ui.web = { open: id, state: id === "ecr" ? "profiles" : "", code: "", url: "", error: "", tool: "", profile: ui.web.profile, profiles: id === "ecr" ? ui.web.profiles : null };
+  if (id === "ecr") send("awsprofiles"); else send("weblogin", { name: id });
+  webRedraw();
+}
+function webEvent(e) {
+  const w = ui.web;
+  if (e.reg !== w.open) return;
+  if (e.state === "done") w.open = "";
+  else {
+    w.state = e.state;
+    if (e.code) w.code = e.code;
+    if (e.url) w.url = e.url;
+    if (e.error) w.error = e.error;
+    if (e.tool) w.tool = e.tool;
+    if (e.profile) w.profile = e.profile;
+    if (e.state === "mfa") { w.device = e.device || ""; w.bad = !!e.bad; }
+  }
+  webRedraw();
+}
 function regMenu(open) {
   const m = $("ppregmenu"), b = $("ppreg");
   if (!m) return;
   if (open == null) open = m.hidden;
   m.hidden = !open; b.setAttribute("aria-expanded", String(open));
-  if (open) m.innerHTML = `<div class="hd">${tr("Pull from")}</div>` + REGISTRIES.map((r, i) => `${i === 1 ? "<hr>" : ""}<button type="button" role="menuitemradio" aria-checked="${i === 0}"${r.works ? "" : " disabled"} data-reg="${r.id}">${r.logo}${esc(r.id === "own" ? tr("Your own registry…") : r.name)}${r.works ? `<svg class="ck" viewBox="0 0 256 256" aria-hidden="true"><path d="${PH.check}"/></svg>` : `<span class="soon">${tr("Soon")}</span>`}</button>`).join("");
+  if (open) m.innerHTML = `<div class="hd">${tr("Pull from")}</div>` + REGISTRIES.map(regRow).join("");
 }
 $("pp").addEventListener("click", (ev) => {
+  const wb = (q) => ev.target.closest(`#ppregmenu ${q}`);
   if (ev.target.closest("#ppreg")) { ev.preventDefault(); regMenu(); }
-  else if (ev.target.closest("#ppregmenu [data-reg]:not(:disabled)")) { regMenu(false); $("ppq")?.focus(); }
+  else if (wb("[data-websign]")) { ui.web.ask = ""; webStart(wb("[data-websign]").dataset.websign); }
+  else if (wb("[data-webask]")) { const id = wb("[data-webask]").dataset.webask; ui.web.ask = ui.web.ask === id ? "" : id; if (id) ui.web.open = ""; webRedraw(); }
+  else if (wb("[data-webout]")) { send("logout", { name: wb("[data-webout]").dataset.webout }); ui.web.ask = ""; webRedraw(); }
+  else if (wb("[data-webopen]")) { send("webloginopen"); ui.web.state = "waiting"; webRedraw(); }
+  else if (wb("[data-webagain]")) send("open", { name: ui.web.url });
+  else if (wb("[data-webcopy]")) { send("copy", { name: ui.web.code }); copiedBtn(wb("[data-webcopy]")); }
+  else if (wb("[data-webcancel]")) { send("weblogincancel"); ui.web.open = ""; webRedraw(); }
+  else if (wb("[data-webprofile]")) {
+    ui.web.profile = $("ppregmenu").querySelector("[data-webprof]").value; ui.web.state = "";
+    send("weblogin", { name: "ecr", value: { profile: ui.web.profile } }); webRedraw();
+  }
+  else if (wb("[data-websso]")) { ui.web.state = "waiting"; ui.web.code = ""; send("webloginsso", { name: "ecr", value: { profile: ui.web.profile } }); webRedraw(); }
+  else if (wb(".wpanel")) {}
+  else if (ev.target.closest("#ppregmenu [data-reg]:not(:disabled)")) {
+    pp.reg = ev.target.closest("[data-reg]").dataset.reg; pp.sel = 0;
+    regMenu(false); ppSearch();
+  }
   else if (!ev.target.closest("#ppregmenu")) regMenu(false);
 });
 /* Signing in to registries from the window is held for a later release:
@@ -8941,11 +9138,15 @@ function ppList() {
   pp.sel = Math.max(0, Math.min(pp.sel, items.length - 1));
   const q = pp.q.trim(), r = parseRef(q), other = r && r.host !== HUB;
   const reg = $("ppreg");
-  reg.className = `reg${other ? " other" : ""}`; reg.innerHTML = `${REGISTRIES[0].logo}${esc(r ? r.host : HUB)}${REG_CARET}`;
+  const rc = regCur(), typedHost = hostOf(q) !== HUB ? hostOf(q) : "";
+  reg.className = `reg${typedHost && typedHost !== rc.host ? " other" : ""}`;
+  reg.innerHTML = typedHost ? `${(regOf(typedHost) || REGISTRIES[0]).logo}${esc(typedHost)}${REG_CARET}` : `${rc.logo}${esc(rc.host || HUB)}${REG_CARET}`;
   const rows = (kind) => items.map((it, i) => (it.kind === kind ? ppRow(it, i) : "")).join("");
   let html;
+  const regHint = () => `<div class="pp-hint">${tr("On {registry} an image is named owner/image, such as {example}. Type one to choose its tag, or paste a full reference.", { registry: esc(rc.name), example: `<code>${esc(rc.example)}</code>` })}${rc.id === "ecr" ? ` ${tr("Amazon ECR takes a token, not a password: the username is {user} and the token comes from {cmd}. It lasts 12 hours.", { user: '<span class="mono">AWS</span>', cmd: '<span class="mono">aws ecr get-login-password</span>' })}` : ""}</div>`;
   if (!q) html = (items.length ? `<div class="sec">${tr("Recent pulls")}</div>${rows("recent")}` : "")
-    + `<div class="pp-hint">${tr("Type to search Docker Hub, or paste a full reference such as {a} or {b} to pull exactly that.", { a: "<code>ghcr.io/org/app:1.2</code>", b: "<code>image@sha256:…</code>" })}</div>`;
+    + (rc.host ? regHint() : `<div class="pp-hint">${tr("Type to search Docker Hub, or paste a full reference such as {a} or {b} to pull exactly that.", { a: "<code>ghcr.io/org/app:1.2</code>", b: "<code>image@sha256:…</code>" })}</div>`);
+  else if (rc.host && !typedHost) html = items.length ? rows("reg") : regHint();
   else {
     const hub = rows("hub"), n = items.filter((x) => x.kind === "hub").length, exact = rows("exact");
     html = pp.status === "error" ? "" : exact;
@@ -8970,7 +9171,8 @@ function ppList() {
 }
 function ppSearch() {
   pp.mode = "search";
-  $("pp").innerHTML = `<div class="pp-field">${SEARCH_SVG}<input id="ppq" placeholder="${tr("Search Docker Hub, or paste an image reference")}" spellcheck="false" autocomplete="off"
+  const cur = regCur();
+  $("pp").innerHTML = `<div class="pp-field">${SEARCH_SVG}<input id="ppq" placeholder="${cur.host ? tr("owner/image on {registry}, such as {example}", { registry: cur.name, example: cur.example }) : tr("Search Docker Hub, or paste an image reference")}" spellcheck="false" autocomplete="off"
       role="combobox" aria-controls="pplist" aria-expanded="true" aria-label="${tr("Image to pull")}"><button type="button" class="reg" id="ppreg" aria-haspopup="menu" aria-expanded="false"></button></div><div class="regmenu" id="ppregmenu" role="menu" hidden></div>
     <div class="pp-list" id="pplist" role="listbox" aria-label="${tr("Images")}"></div><div class="pp-foot" id="ppfoot"></div>`;
   const input = $("ppq");
@@ -8986,12 +9188,13 @@ function ppTags() {
   const tags = [...new Set([...(got?.items || []), ...have.map((x) => x.tag)])];
   if (!tags.includes(pp.tag)) tags.unshift(pp.tag);
   pp.tagList = tags;
-  const hv = have.find((x) => x.tag === pp.tag), icon = h?.icon || have[0]?.img.icon;
+  const hv = have.find((x) => x.tag === pp.tag), icon = h?.icon || have[0]?.img.icon, rg = regOf(hostOf(repo));
   const pulled = (x) => (x.img.Pulled ? tr("pulled {when}", { when: ago(x.img.Pulled) }) : "");
-  $("pp").innerHTML = `<div class="pp-head"><button class="sb" data-ppback title="${tr("Back (Esc)")}" aria-label="${tr("Back")}">${svgOf("caret")}</button>${tile(icon)}
+  $("pp").innerHTML = `<div class="pp-head"><button class="sb" data-ppback title="${tr("Back (Esc)")}" aria-label="${tr("Back")}">${svgOf("caret")}</button>${rg && !icon ? `<span class="tile">${rg.logo}</span>` : tile(icon)}
       <span class="m"><b>${esc(repo)}${h?.official ? `<span class="pp-badge">${tr("Official")}</span>` : ""}</b>${h?.description ? `<small>${esc(h.description)}</small>` : ""}</span>${h ? `<span class="meta">${stars(h.stars)}</span>` : ""}</div>
-    <div class="pp-body" role="radiogroup" aria-label="${tr("Tag")}"><div class="sec">${tr("Tag")}${!got ? `<span class="r">${tr("Loading tags…")}</span>` : got.error ? `<span class="r">${tr("Docker Hub can't be reached")}</span>` : ""}</div>
+    <div class="pp-body" role="radiogroup" aria-label="${tr("Tag")}"><div class="sec">${tr("Tag")}${!got ? `<span class="r">${tr("Loading tags…")}</span>` : got.error ? `<span class="r">${hostOf(repo) === HUB ? tr("Docker Hub can't be reached") : tr("Couldn't list the tags")}</span>` : ""}</div>
       ${tags.map((t) => { const x = have.find((y) => y.tag === t); return `<button class="tagr" role="radio" data-pptag="${esc(t)}" aria-checked="${t === pp.tag}"><span class="rd"></span><span class="mono">${esc(t)}</span>${x ? `<span class="have">${tr("Have")}${x.img.Pulled ? ` · ${pulled(x)}` : ""}</span>` : "<span></span>"}</button>`; }).join("")}
+      ${got?.error && hostOf(repo) !== HUB ? `<div class="pp-note">${tr("If it's private, run {cmd} first.", { cmd: `<code>docker login ${esc(hostOf(repo))}</code>` })}</div>` : ""}
       ${hv ? `<div class="pp-note">${hv.img.Pulled ? tr("You have {ref}, {when}. Pull again to get any updates; only changed layers download.", { ref: `<b>${esc(repo)}:${esc(pp.tag)}</b>`, when: pulled(hv) }) : tr("You have {ref}. Pull again to get any updates; only changed layers download.", { ref: `<b>${esc(repo)}:${esc(pp.tag)}</b>` })}</div>` : ""}</div>
     <div class="pp-foot"><span><kbd class="key">↑</kbd><kbd class="key">↓</kbd> ${tr("tag")}</span><span><kbd class="key">↵</kbd> ${tr("pull")}</span><span><kbd class="key">esc</kbd> ${tr("back")}</span>
       <button class="btn primary" data-ppgo>${svgOf("pull")}${hv ? tr("Pull again") : tr("Pull {tag}", { tag: esc(pp.tag) })}</button></div>`;
@@ -9003,6 +9206,7 @@ function ppPick(it) {
   if (!it) return;
   if (it.kind === "exact") return pullRef(it.ref);
   if (it.kind === "hub") return ppTo(it.h.name, "latest", it.h);
+  if (it.kind === "reg") return ppTo(it.repo, it.tag, null);
   const [repo, tag] = split(it.ref);
   return hostOf(repo) === HUB && !it.ref.includes("@") ? ppTo(repo, tag) : pullRef(it.ref);
 }
@@ -9058,6 +9262,8 @@ window.addEventListener("keydown", (ev) => {
     return;
   }
   if (!pp.open || document.querySelector(".scrim")) return;
+  // Keys in Pull from's sign-in panel (the MFA code, the profile) stay there.
+  if (ev.target.closest?.("#ppregmenu .wpanel")) return;
   const stop = () => { ev.preventDefault(); ev.stopImmediatePropagation(); };
   if (pp.mode === "search") {
     const n = pp.items.length;

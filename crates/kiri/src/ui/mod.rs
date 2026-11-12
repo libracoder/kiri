@@ -42,6 +42,7 @@ mod hub;
 mod k8s;
 mod lastlogs;
 mod logins;
+mod weblogin;
 mod needs;
 mod sharing;
 mod usage;
@@ -1911,6 +1912,11 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
             logins::handle(&msg.cmd, msg.name, &msg.value, emit, ensure_daemon);
             Ok(())
         }
+        // Signing in through the registry's own page (Pull from's Sign in).
+        "weblogin" | "webloginopen" | "webloginmfa" | "webloginsso" | "weblogincancel" | "awsprofiles" => {
+            weblogin::handle(&msg.cmd, msg.name, &msg.value, emit, ensure_daemon, term::captured);
+            Ok(())
+        }
         // Before Run: what the image's start script won't start without.
         "needs" => {
             let image = msg.name;
@@ -1969,7 +1975,7 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
             let local = msg.name.strip_prefix("http://").or_else(|| msg.name.strip_prefix("https://")).and_then(|r| r.split(['/', ':']).next()).is_some_and(|h| h == "localhost" || h.ends_with(".kiri.localhost") || h.ends_with(".kiri.local"));
             // A build warning's rule page (docs.docker.com/go/dockerfile/rule/…).
             let docs = msg.name.strip_prefix("https://docs.docker.com/go/").is_some_and(|rest| rest.bytes().all(|b| b.is_ascii_alphanumeric() || b"-/".contains(&b)));
-            if local || docs || msg.name == "https://runkiri.com" || msg.name == "https://runkiri.com/share/notice" || msg.name == "https://canestack.com" || msg.name == "https://github.com/libracoder/kiri/issues/new" || msg.name == "https://github.com/libracoder/kiri" || msg.name == "https://github.com/anchore/grype" {
+            if local || docs || msg.name == "https://runkiri.com" || msg.name == "https://runkiri.com/share/notice" || msg.name == "https://canestack.com" || msg.name == "https://github.com/libracoder/kiri/issues/new" || msg.name == "https://github.com/libracoder/kiri" || msg.name == "https://github.com/anchore/grype" || msg.name == "https://login.docker.com/activate" || msg.name == "https://github.com/login/device" {
                 open(&msg.name);
             }
             Ok(())

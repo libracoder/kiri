@@ -169,7 +169,7 @@ fn helper_path(name: &str) -> Option<PathBuf> {
 }
 
 #[cfg(not(windows))]
-fn helper_dirs() -> Vec<PathBuf> {
+pub(super) fn helper_dirs() -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = ["/usr/local/bin", "/opt/homebrew/bin", "/Applications/Docker.app/Contents/Resources/bin"].map(PathBuf::from).into();
     if let Some(h) = std::env::var_os("HOME").map(PathBuf::from) {
         v.push(h.join(".docker/bin"));
@@ -184,7 +184,7 @@ fn helper_dirs() -> Vec<PathBuf> {
 }
 
 #[cfg(windows)]
-fn helper_dirs() -> Vec<PathBuf> {
+pub(super) fn helper_dirs() -> Vec<PathBuf> {
     let env = |k: &str| std::env::var_os(k).map(PathBuf::from);
     let mut v = Vec::new();
     for pf in [env("ProgramFiles"), env("ProgramW6432")].into_iter().flatten() {

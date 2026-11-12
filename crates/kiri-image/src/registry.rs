@@ -10,6 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::Deserialize;
 
 use crate::cancel::Cancel;
+use crate::tags::{next_link, version_order};
 use crate::reference::Reference;
 use crate::store::{Image, Layer, RunConfig, Store, sha256_digest};
 
@@ -896,6 +897,33 @@ impl Client {
         Ok(body["results"].as_array().into_iter().flatten().filter_map(|t| t["name"].as_str().map(str::to_owned)).collect())
     }
 
+    /// A repository's tags from the registry itself (`/v2/<repo>/tags/list`),
+    /// for registries other than Docker Hub: GitHub's, ECR's. The list has
+    /// no dates, so they are put newest version first by their names, and
+    /// the signature and attestation tags (`sha256-….sig`) are left out.
+    pub fn tags(&self, r: &Reference, limit: usize) -> Result<Vec<String>, Error> {
+        // The list comes a page at a time, in name order: all of it is read
+        // (up to `TAG_PAGES` pages) before the newest can be picked out.
+        const TAG_PAGES: usize = 20;
+        let base = r.api_base();
+        let mut url = format!("{base}/v2/{}/tags/list?n=1000", r.repository);
+        let mut tags: Vec<String> = Vec::new();
+        for _ in 0..TAG_PAGES {
+            let mut resp = self.get(r, &url, None)?;
+            let next = resp.headers().get("link").and_then(|v| v.to_str().ok()).and_then(next_link).map(str::to_owned);
+            let body: serde_json::Value = serde_json::from_slice(&resp.body_mut().with_config().limit(4 << 20).read_to_vec()?).map_err(|e| Error::Http(e.to_string()))?;
+            tags.extend(body["tags"].as_array().into_iter().flatten().filter_map(|t| t.as_str()).filter(|t| !t.starts_with("sha256-")).map(str::to_owned));
+            // Only a next page on the same registry is followed.
+            match next {
+                Some(n) if n.starts_with("/v2/") => url = format!("{base}{n}"),
+                _ => break,
+            }
+        }
+        tags.sort_by(|a, b| version_order(b, a));
+        tags.truncate(limit);
+        Ok(tags)
+    }
+
     /// `docker login`: checks the credentials against the registry at
     /// `server` (`https://index.docker.io/v1/`, `ghcr.io`, `localhost:5000`).
     pub fn login(&self, server: &str) -> Result<(), Error> {
@@ -1361,6 +1389,19 @@ mod tests {
         quit(&host);
         assert_eq!(served.join().unwrap(), [0]);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_next_page_of_tags_comes_from_the_link_header() {
+        assert_eq!(next_link(r#"</v2/o/r/tags/list?last=1.9&n=1000>; rel="next""#), Some("/v2/o/r/tags/list?last=1.9&n=1000"));
+        assert_eq!(next_link(r#"<https://elsewhere.example/x>; rel="prev""#), None);
+    }
+
+    #[test]
+    fn registry_tags_are_newest_version_first() {
+        let mut tags = ["1.9", "1.10", "1.2-rc1", "latest", "1.2", "1.2.1", "main"].map(String::from).to_vec();
+        tags.sort_by(|a, b| version_order(b, a));
+        assert_eq!(tags, ["1.10", "1.9", "1.2.1", "1.2", "1.2-rc1", "main", "latest"]);
     }
 
     #[test]

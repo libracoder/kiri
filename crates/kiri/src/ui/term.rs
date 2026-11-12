@@ -104,6 +104,90 @@ fn end(s: &Session) {
     });
 }
 
+/// A program on its own pseudo-terminal, for a sign-in that wants one
+/// (weblogin.rs): what it prints, what to type to it, a way to stop it, and
+/// its exit code. Kiri's tools first on the PATH, as for a shell.
+pub fn captured(program: &Path, args: &[&str]) -> std::io::Result<super::weblogin::Run> {
+    let (master, slave_path) = new_pty()?;
+    let master = Arc::new(File::from(master));
+    let slave = std::fs::OpenOptions::new().read(true).write(true).custom_flags_noctty().open(&slave_path)?;
+    // Wide, so a long line (a code and its page) isn't wrapped.
+    set_size(&master, 240, 40);
+    let mut cmd = Command::new(program);
+    cmd.args(args);
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let dirs = program.parent().map(Path::to_path_buf).into_iter().chain(tool_dirs()).chain(std::env::split_paths(&path));
+    let path = std::env::join_paths(dirs).unwrap_or(path);
+    cmd.env("PATH", path).env("TERM", "xterm-256color");
+    if let Some(home) = std::env::var_os("HOME") {
+        cmd.current_dir(home);
+    }
+    cmd.stdin(Stdio::from(slave.try_clone()?)).stdout(Stdio::from(slave.try_clone()?)).stderr(Stdio::from(slave));
+    // SAFETY: as in open: async-signal-safe calls in the child.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn()?;
+    drop(cmd);
+    let pid = child.id() as i32;
+    let done = Arc::new(AtomicBool::new(false));
+
+    let (input, typed) = channel::<Vec<u8>>();
+    let writer = master.clone();
+    std::thread::spawn(move || {
+        for bytes in typed {
+            if (&*writer).write_all(&bytes).is_err() {
+                break;
+            }
+        }
+    });
+    let (exit_tx, exit) = channel();
+    {
+        let done = done.clone();
+        std::thread::spawn(move || {
+            let code = child.wait().ok().and_then(|s| s.code());
+            hang_up(pid);
+            done.store(true, Ordering::SeqCst);
+            let _ = exit_tx.send(code);
+        });
+    }
+    let (out_tx, output) = channel();
+    std::thread::spawn(move || {
+        let mut buf = vec![0u8; 16 * 1024];
+        loop {
+            match (&*master).read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if out_tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+    });
+    let stop = Box::new(move || {
+        if !done.load(Ordering::SeqCst) {
+            hang_up(pid);
+            let done = done.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                if !done.load(Ordering::SeqCst) {
+                    // SAFETY: kill only sends a signal, to a group not yet reaped.
+                    unsafe { libc::kill(-pid, libc::SIGKILL) };
+                }
+            });
+        }
+    });
+    Ok((output, input, stop, exit))
+}
+
 /// SIGHUP to a shell's process group, so what it started in the background goes too.
 fn hang_up(pid: i32) {
     // SAFETY: kill only sends a signal.
@@ -407,6 +491,47 @@ mod tests {
             }
         }
         panic!("no {want:?} in {:?}", String::from_utf8_lossy(&out));
+    }
+
+    #[test]
+    fn a_captured_program_has_a_terminal_reads_what_is_typed_and_says_its_exit_code() {
+        let script = "test -t 0 && echo tty; printf 'code: ABCD-EFGH\\n'; read x; echo got:$x; exit 3";
+        let (output, input, _stop, exit) = captured(Path::new("/bin/sh"), &["-c", script]).unwrap();
+        input.send(b"yes\r".to_vec()).unwrap();
+        let text: String = output.iter().map(|b| String::from_utf8_lossy(&b).into_owned()).collect();
+        assert!(text.contains("tty") && text.contains("code: ABCD-EFGH") && text.contains("got:yes"), "{text:?}");
+        assert_eq!(exit.recv().unwrap(), Some(3));
+    }
+
+    #[test]
+    #[ignore = "runs the real docker login, which reaches Docker's sign-in service"]
+    fn live_docker_login_shows_its_device_code_on_a_captured_terminal() {
+        let dir = std::env::temp_dir().join(format!("kiri-weblogin-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.json"), "{}").unwrap();
+        // SAFETY: an ignored test, run on its own.
+        unsafe { std::env::set_var("DOCKER_CONFIG", &dir) };
+        let (output, _input, stop, _exit) = captured(Path::new("docker"), &["login"]).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let mut seen = String::new();
+        while let Ok(b) = output.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
+            seen.push_str(&String::from_utf8_lossy(&b));
+            if seen.contains("login.docker.com/activate") || seen.contains("Login Succeeded") {
+                break;
+            }
+        }
+        stop();
+        let _ = std::fs::remove_dir_all(&dir);
+        // Signed in already (a credential helper on PATH answers), or the browser sign-in's code and page.
+        assert!(seen.contains("Login Succeeded") || (seen.contains("device confirmation code") && seen.contains("login.docker.com/activate")), "{seen:?}");
+    }
+
+    #[test]
+    fn a_captured_program_stops_when_asked() {
+        let (output, _input, stop, exit) = captured(Path::new("/bin/sleep"), &["30"]).unwrap();
+        stop();
+        assert!(exit.recv_timeout(std::time::Duration::from_secs(5)).is_ok());
+        drop(output);
     }
 
     #[test]
