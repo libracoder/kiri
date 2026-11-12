@@ -202,7 +202,7 @@ impl Vm {
                         let _ = tx.try_send(result);
                     });
                     inner.0.vm.stopWithCompletionHandler(&done);
-                } else if inner.0.vm.state() == VZVirtualMachineState::Stopped {
+                } else if matches!(inner.0.vm.state(), VZVirtualMachineState::Stopped | VZVirtualMachineState::Error) {
                     let _ = tx.try_send(Ok(()));
                 } else {
                     let _ = tx.try_send(Err("the VM cannot be stopped in its current state".into()));
@@ -224,7 +224,9 @@ impl Vm {
         self.queue.exec_sync(move || {
             let (inner, out) = (inner, out);
             // SAFETY: on the VM's queue, as the framework requires.
-            *out.0 = unsafe { inner.0.vm.state() } == VZVirtualMachineState::Stopped;
+            // Error is where a VM ends up when its process dies: it is not
+            // running and never will again, so it has let go of its disk.
+            *out.0 = matches!(unsafe { inner.0.vm.state() }, VZVirtualMachineState::Stopped | VZVirtualMachineState::Error);
         });
         stopped
     }
