@@ -1580,7 +1580,7 @@ impl Engine {
                     Some(target)
                 }
                 Err(e) => {
-                    self.fail_start(&id, &spec);
+                    self.fail_start(&id, &spec, &e);
                     return Err(e);
                 }
             },
@@ -1591,7 +1591,7 @@ impl Engine {
         let links = match net.as_ref().map(|n| self.link_hosts(&id, &spec, n)).transpose() {
             Ok(l) => l.unwrap_or_default(),
             Err(e) => {
-                self.fail_start(&id, &spec);
+                self.fail_start(&id, &spec, &e);
                 return Err(e);
             }
         };
@@ -1614,7 +1614,7 @@ impl Engine {
                 let ip = match ip {
                     Ok(ip) => ip,
                     Err(e) => {
-                        self.fail_start(&id, &spec);
+                        self.fail_start(&id, &spec, &e);
                         return Err(e);
                     }
                 };
@@ -1637,7 +1637,7 @@ impl Engine {
                     }
                     Err(e) => {
                         self.lock_networks().release(&n.name, ip);
-                        self.fail_start(&id, &spec);
+                        self.fail_start(&id, &spec, &e);
                         return Err(e);
                     }
                 }
@@ -1658,8 +1658,9 @@ impl Engine {
             }
             None if joined.is_some() => (String::new(), [0; 4], 0, [0; 4]),
             None => {
-                self.fail_start(&id, &spec);
-                return Err(Error::NotFound(format!("network {} not found", spec.network_mode)));
+                let e = Error::NotFound(format!("network {} not found", spec.network_mode));
+                self.fail_start(&id, &spec, &e);
+                return Err(e);
             }
         };
         if ip != [0; 4] {
@@ -1700,19 +1701,19 @@ impl Engine {
         let host_opts = match spec.guest_opts(flags & run_flags::NET_HOST != 0 || joined_host) {
             Ok(o) => o,
             Err(e) => {
-                self.fail_start(&id, &spec);
+                self.fail_start(&id, &spec, &e);
                 return Err(e);
             }
         };
         let vm = match self.vm() {
             Ok(vm) => vm,
             Err(e) => {
-                self.fail_start(&id, &spec);
+                self.fail_start(&id, &spec, &e);
                 return Err(Error::Io(e));
             }
         };
         if let Err(e) = self.restore_layers(&layers) {
-            self.fail_start(&id, &spec);
+            self.fail_start(&id, &spec, &e);
             return Err(e);
         }
         match vm.run(&id, &layers, &argv, &spec.env, &spec.cwd, &spec.user, &hostname, flags, net_args, &spec.mounts, &spec.limits.wire(), spec.caps, &host_opts) {
@@ -1723,7 +1724,7 @@ impl Engine {
             }
             Err(e) => {
                 crate::diag::warn!("container did not start", id = &id[..12], image = spec.image, error = e);
-                self.fail_start(&id, &spec);
+                self.fail_start(&id, &spec, &e);
                 return Err(Error::Io(e));
             }
         }
@@ -1933,14 +1934,16 @@ impl Engine {
         Ok(out)
     }
 
-    /// Records a start that never reached the guest as an immediate exit.
-    fn fail_start(&self, id: &str, spec: &Spec) {
+    /// Records a start that never reached the guest as an immediate exit,
+    /// with the exit code Docker gives that failure (see `start_exit_code`).
+    fn fail_start(&self, id: &str, spec: &Spec, err: &dyn std::fmt::Debug) {
+        let code = start_exit_code(&format!("{err:?}"));
         let mut st = self.lock();
         let actor = st.containers.get(id).map(|c| (c.spec.image.clone(), container_attrs(c)));
         if let Some(c) = st.containers.get_mut(id) {
             c.status = Status::Exited;
             c.exits += 1;
-            c.exit_code = 127;
+            c.exit_code = code;
             c.finished = Some(SystemTime::now());
             c.attached.clear();
             lock_log(&c.log).end_follow();
@@ -1957,7 +1960,7 @@ impl Engine {
         // "removed") before it reports the error; without it, it hung.
         let removed = if spec.auto_remove { st.containers.remove(id) } else { None };
         if removed.is_some() {
-            note_removed(&mut st, id, 127);
+            note_removed(&mut st, id, code);
         }
         drop(st);
         self.changed.notify_all();
@@ -2989,6 +2992,21 @@ fn container_attrs(c: &Container) -> serde_json::Map<String, serde_json::Value> 
     attrs
 }
 
+/// The exit code Docker records for a container that never started: 127
+/// when the command (or a file it needs) is missing, or a mount puts a
+/// directory on a file; 126 when it may not be run; and 128 for anything
+/// else, such as a network that could not be set up.
+fn start_exit_code(err: &str) -> i32 {
+    let err = err.to_lowercase();
+    if ["executable file not found", "no such file or directory", "system cannot find the file specified", "not a directory"].iter().any(|m| err.contains(m)) {
+        127
+    } else if err.contains("permission denied") {
+        126
+    } else {
+        128
+    }
+}
+
 fn note_removed(st: &mut State, id: &str, code: i32) {
     // A removed container's monitor sees its record gone and quits.
     st.health.remove(id);
@@ -3398,3 +3416,17 @@ fn detach_usb() {
 
 #[cfg(not(target_os = "macos"))]
 fn detach_usb() {}
+
+#[cfg(test)]
+mod start_exit_tests {
+    #[test]
+    fn a_failed_start_gets_dockers_exit_code() {
+        let io = |m: &str| format!("{:?}", super::Error::Io(std::io::Error::other(m.to_owned())));
+        assert_eq!(super::start_exit_code(&io("dns: No such file or directory (os error 2)")), 127);
+        assert_eq!(super::start_exit_code(&io("exec: \"nope\": executable file not found in $PATH")), 127);
+        assert_eq!(super::start_exit_code(&io("mount etc/hosts: mount /proc/self/fd/28: Not a directory (os error 20)")), 127);
+        assert_eq!(super::start_exit_code(&io("exec /app: Permission denied (os error 13)")), 126);
+        assert_eq!(super::start_exit_code(&format!("{:?}", super::Error::Conflict("no free address left on network n".into()))), 128);
+        assert_eq!(super::start_exit_code(&format!("{:?}", super::Error::NotFound("network x not found".into()))), 128);
+    }
+}
