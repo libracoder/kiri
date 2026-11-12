@@ -11,7 +11,8 @@ use std::io;
 use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::time::Duration;
+use std::sync::{Arc, RwLock, TryLockError, Weak, atomic::{AtomicBool, Ordering}};
+use std::time::{Duration, Instant};
 
 use block2::RcBlock;
 use dispatch2::{DispatchQueue, DispatchQueueAttr, DispatchRetained};
@@ -58,6 +59,8 @@ pub struct Vm {
     queue: DispatchRetained<DispatchQueue>,
     inner: Option<OnQueue<Inner>>,
     events: Receiver<Event>,
+    closing: Arc<AtomicBool>,
+    connection: Option<Arc<ConnectionOwner>>,
 }
 
 /// Virtualization.framework objects, kept alive for as long as the VM runs.
@@ -84,6 +87,53 @@ unsafe impl<T> Send for OnQueue<T> {}
 impl std::fmt::Debug for OnQueue<Inner> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("OnQueue<Inner>")
+    }
+}
+
+struct ConnectionOwner {
+    queue: DispatchRetained<DispatchQueue>,
+    vm: RwLock<Option<OnQueue<Retained<VZVirtualMachine>>>>,
+}
+
+// SAFETY: the VM is accessed and released only on its owning queue.
+unsafe impl Sync for ConnectionOwner {}
+
+impl std::fmt::Debug for ConnectionOwner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ConnectionOwner")
+    }
+}
+
+impl Drop for ConnectionOwner {
+    fn drop(&mut self) {
+        if let Some(vm) = self.vm.get_mut().unwrap_or_else(|e| e.into_inner()).take() {
+            self.queue.exec_sync(move || drop(vm));
+        }
+    }
+}
+
+impl ConnectionOwner {
+    fn retire(&self, deadline: Instant) -> io::Result<()> {
+        loop {
+            let mut vm = match self.vm.try_write() {
+                Ok(vm) => vm,
+                Err(TryLockError::Poisoned(e)) => e.into_inner(),
+                Err(TryLockError::WouldBlock) => {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return Err(io::Error::new(io::ErrorKind::TimedOut, "VM connections did not finish retiring"));
+                    }
+                    std::thread::sleep(left.min(Duration::from_millis(10)));
+                    continue;
+                }
+            };
+            let old = vm.take();
+            drop(vm);
+            if let Some(old) = old {
+                self.queue.exec_sync(move || drop(old));
+            }
+            return Ok(());
+        }
     }
 }
 
@@ -118,7 +168,8 @@ impl Vm {
             }
         });
         let inner = built.expect("build ran synchronously")?;
-        let vm = Vm { queue, inner: Some(inner), events };
+        let connection = Arc::new(ConnectionOwner { queue: queue.clone(), vm: RwLock::new(Some(OnQueue(inner.0.vm.clone()))) });
+        let vm = Vm { queue, inner: Some(inner), events, closing: Arc::new(AtomicBool::new(false)), connection: Some(connection) };
         match started_rx.recv_timeout(Duration::from_secs(30)) {
             Ok(Ok(())) => Ok(vm),
             Ok(Err(e)) => Err(io::Error::other(format!("VM failed to start: {e}"))),
@@ -134,24 +185,65 @@ impl Vm {
     /// Stops the VM immediately, like pulling the power cord. Prefer asking the
     /// guest to power off; this is the fallback.
     pub fn force_stop(&self) {
-        let Some(inner) = self.inner.as_ref() else { return };
+        let _ = self.force_stop_checked(Duration::from_secs(10));
+    }
+
+    fn force_stop_checked(&self, timeout: Duration) -> io::Result<()> {
+        let Some(inner) = self.inner.as_ref() else { return Ok(()) };
         let inner = OnQueue(&inner.0);
-        let (tx, rx) = mpsc::sync_channel::<()>(1);
+        let (tx, rx) = mpsc::sync_channel::<Result<(), String>>(1);
         self.queue.exec_sync(move || {
             let inner = inner;
             // SAFETY: on the VM's queue.
             unsafe {
                 if inner.0.vm.canStop() {
-                    let done = RcBlock::new(move |_err: *mut NSError| {
-                        let _ = tx.try_send(());
+                    let done = RcBlock::new(move |err: *mut NSError| {
+                        let result = err.as_ref().map_or(Ok(()), |e| Err(describe(e)));
+                        let _ = tx.try_send(result);
                     });
                     inner.0.vm.stopWithCompletionHandler(&done);
+                } else if matches!(inner.0.vm.state(), VZVirtualMachineState::Stopped | VZVirtualMachineState::Error) {
+                    let _ = tx.try_send(Ok(()));
                 } else {
-                    let _ = tx.try_send(());
+                    let _ = tx.try_send(Err("the VM cannot be stopped in its current state".into()));
                 }
             }
         });
-        let _ = rx.recv_timeout(Duration::from_secs(10));
+        match rx.recv_timeout(timeout) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(io::Error::other(format!("VM did not stop: {e}"))),
+            Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "VM stop did not complete")),
+        }
+    }
+
+    fn is_stopped(&self) -> bool {
+        let Some(inner) = self.inner.as_ref() else { return true };
+        let inner = OnQueue(&inner.0);
+        let mut stopped = false;
+        let out = OnQueue(&mut stopped);
+        self.queue.exec_sync(move || {
+            let (inner, out) = (inner, out);
+            // SAFETY: on the VM's queue, as the framework requires.
+            // Error is where a VM ends up when its process dies: it is not
+            // running and never will again, so it has let go of its disk.
+            *out.0 = matches!(unsafe { inner.0.vm.state() }, VZVirtualMachineState::Stopped | VZVirtualMachineState::Error);
+        });
+        stopped
+    }
+
+    /// Confirms shutdown and releases resources before a successor opens its disk.
+    pub fn retire(&mut self, graceful: Duration, forced: Duration) -> io::Result<()> {
+        let deadline = Instant::now() + graceful + forced;
+        self.closing.store(true, Ordering::Release);
+        super::stop::retire(|| Ok(self.is_stopped()), |timeout| self.force_stop_checked(timeout), graceful, forced)?;
+        if let Some(connection) = &self.connection {
+            connection.retire(deadline)?;
+        }
+        self.connection.take();
+        if let Some(inner) = self.inner.take() {
+            self.queue.exec_sync(move || drop(inner));
+        }
+        Ok(())
     }
 
     pub fn is_running(&self) -> bool {
@@ -218,6 +310,9 @@ impl Vm {
     /// Accepts guest-initiated connections on `port`, passing each one to
     /// `handler` as a stream that releases its connection when dropped.
     pub fn listen(&self, port: u32, handler: Handler) -> io::Result<()> {
+        if self.closing.load(Ordering::Acquire) {
+            return Err(io::Error::new(io::ErrorKind::NotConnected, "the VM is retiring"));
+        }
         let Some(inner) = self.inner.as_ref() else { return Err(io::Error::other("VM is gone")) };
         let inner = OnQueue(&inner.0);
         let handler = OnQueue(handler);
@@ -250,19 +345,15 @@ impl Vm {
     /// `Vm` itself is kept elsewhere: a connect waits on the guest, so
     /// holding the `Vm` meanwhile would make connects take turns.
     pub fn connector(&self) -> Connector {
-        // Retaining is thread-safe; the VM is otherwise touched only on its queue.
-        Connector { queue: self.queue.clone(), vm: self.inner.as_ref().map(|i| OnQueue(i.0.vm.clone())) }
+        Connector { owner: self.connection.as_ref().map(Arc::downgrade).unwrap_or_default(), closing: self.closing.clone() }
     }
 }
 
 /// Opens streams to a VM's guest ports (`Vm::connector`).
 pub struct Connector {
-    queue: DispatchRetained<DispatchQueue>,
-    vm: Option<OnQueue<Retained<VZVirtualMachine>>>,
+    owner: Weak<ConnectionOwner>,
+    closing: Arc<AtomicBool>,
 }
-
-// SAFETY: the VM inside is only touched in closures run on its queue.
-unsafe impl Sync for Connector {}
 
 impl std::fmt::Debug for Connector {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -273,10 +364,18 @@ impl std::fmt::Debug for Connector {
 impl Connector {
     /// Opens a stream to a port the guest listens on.
     pub fn connect(&self, port: u32) -> io::Result<VsockStream> {
-        let Some(vm) = self.vm.as_ref() else { return Err(io::Error::other("VM is gone")) };
+        if self.closing.load(Ordering::Acquire) {
+            return Err(io::Error::new(io::ErrorKind::NotConnected, "the VM is retiring"));
+        }
+        let Some(owner) = self.owner.upgrade() else { return Err(io::Error::other("VM is gone")) };
+        let vm = owner.vm.read().unwrap_or_else(|e| e.into_inner());
+        if self.closing.load(Ordering::Acquire) {
+            return Err(io::Error::new(io::ErrorKind::NotConnected, "the VM is retiring"));
+        }
+        let Some(vm) = vm.as_ref() else { return Err(io::Error::other("VM is gone")) };
         let vm = OnQueue(&vm.0);
         let (tx, rx) = mpsc::sync_channel::<Result<OnQueue<Retained<VZVirtioSocketConnection>>, String>>(1);
-        self.queue.exec_sync(move || {
+        owner.queue.exec_sync(move || {
             let vm = vm;
             // SAFETY: on the VM's queue, as the framework requires.
             unsafe {
@@ -309,12 +408,13 @@ impl Connector {
         }
         // SAFETY: `fd` is a fresh descriptor that nothing else owns.
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-        Ok(VsockStream { fd, conn: Some(conn), queue: self.queue.clone() })
+        Ok(VsockStream { fd, conn: Some(conn), queue: owner.queue.clone() })
     }
 }
 
 impl Drop for Vm {
     fn drop(&mut self) {
+        self.closing.store(true, Ordering::Release);
         if self.is_running() {
             self.force_stop();
         }

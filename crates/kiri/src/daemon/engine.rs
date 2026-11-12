@@ -105,6 +105,18 @@ fn physical_memory() -> u64 {
 const RESTART_BASE: Duration = Duration::from_millis(100);
 const RESTART_CAP: Duration = Duration::from_secs(60);
 
+fn restart_backoff(attempt: u32) -> Duration {
+    RESTART_BASE.saturating_mul(1 << attempt.min(10)).min(RESTART_CAP)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Start {
+    User,
+    Restart,
+    DaemonRestart,
+    VmRecovery,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Status {
@@ -335,6 +347,8 @@ pub struct ExtraNetwork {
 
 #[derive(Debug)]
 pub struct Container {
+    /// Serializes start with stop/kill/remove through guest creation.
+    lifecycle: Arc<Mutex<u64>>,
     pub id: String,
     pub name: String,
     pub spec: Spec,
@@ -464,6 +478,9 @@ struct HealthRun {
 
 #[derive(Default)]
 struct State {
+    vm_recovery_at: Option<std::time::Instant>,
+    vm_recovery_running: bool,
+    vm_recovery_generation: u64,
     containers: HashMap<String, Container>,
     execs: HashMap<String, Exec>,
     /// Exit codes of recently removed containers, for `wait?condition=removed`
@@ -489,6 +506,10 @@ pub struct Engine {
     /// The VM, while it is awake. It sleeps (powers off, freeing all its
     /// memory) when idle, and boots again on the next request.
     link: Mutex<Option<Arc<VmLink>>>,
+    /// Serialises retirement and boot without blocking access to the link.
+    waking: Mutex<()>,
+    #[cfg(test)]
+    boot_attempts: std::sync::atomic::AtomicUsize,
     /// Unix seconds of the last API request; drives the idle sleep.
     last_activity: std::sync::atomic::AtomicU64,
     /// Set while the VM is being put to sleep, so its stop is not an error.
@@ -585,6 +606,11 @@ fn ns(t: SystemTime) -> u64 {
     t.duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0)
 }
 
+fn recover_after_vm_loss(c: &Container) -> bool {
+    c.vm_stopped && c.status == Status::Exited && !c.stopped_by_user && !c.spec.auto_remove
+        && matches!(c.spec.restart.name.as_str(), "always" | "unless-stopped")
+}
+
 fn from_ns(n: u64) -> SystemTime {
     UNIX_EPOCH + Duration::from_nanos(n)
 }
@@ -600,6 +626,9 @@ impl Engine {
         let engine = Arc::new(Engine {
             volumes,
             link: Mutex::new(None),
+            waking: Mutex::new(()),
+            #[cfg(test)]
+            boot_attempts: std::sync::atomic::AtomicUsize::new(0),
             last_activity: std::sync::atomic::AtomicU64::new(now_secs()),
             sleeping: std::sync::atomic::AtomicBool::new(false),
             stopped: std::sync::atomic::AtomicBool::new(stopped_marker().is_some_and(|f| f.exists())),
@@ -635,19 +664,54 @@ impl Engine {
 
     /// The running VM, booting it first if it is asleep (about 0.1 s).
     pub fn vm(&self) -> io::Result<Arc<VmLink>> {
-        let mut link = self.link.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(vm) = link.as_ref() {
+        self.vm_inner(false)
+    }
+
+    fn vm_inner(&self, recovery: bool) -> io::Result<Arc<VmLink>> {
+        let waking = self.waking.lock().unwrap_or_else(|e| e.into_inner());
+        let old = self.link.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(vm) = old.as_ref().filter(|vm| !vm.is_lost()) {
             return Ok(vm.clone());
         }
-        if self.is_stopped() {
+        if self.is_stopped() || SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(io::Error::other(STOPPED));
+        }
+        if recovery {
+            let mut st = self.lock();
+            if !st.containers.values().any(recover_after_vm_loss)
+                || st.vm_recovery_at.is_some_and(|at| at > std::time::Instant::now()) {
+                // A deferred boot is still pending recovery work.
+                st.vm_recovery_generation = st.vm_recovery_generation.saturating_add(1);
+                return Err(io::Error::new(io::ErrorKind::WouldBlock, "VM recovery is backing off"));
+            }
+        }
+        if let Some(vm) = old && let Err(e) = vm.retire() {
+            let mut st = self.lock();
+            let delay = st.containers.values().filter(|c| recover_after_vm_loss(c))
+                .map(|c| restart_backoff(c.restart_count.saturating_sub(1))).max();
+            st.vm_recovery_at = delay.map(|delay| std::time::Instant::now() + delay);
+            drop(st);
+            self.recover_vm();
+            return Err(e);
+        }
+        // Retained old links are inert; successful retirement has released
+        // their VM and completed cleanup before the replacement opens disk.
+        *self.link.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        if self.is_stopped() || SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(io::Error::other(STOPPED));
+        }
+        if recovery && !self.lock().containers.values().any(recover_after_vm_loss) {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "VM recovery was canceled"));
         }
         let (ceiling, cpus) = (memory_ceiling(), vm_cpus());
         self.ceiling.store(ceiling, std::sync::atomic::Ordering::Relaxed);
         self.cpus.store(cpus, std::sync::atomic::Ordering::Relaxed);
         let t0 = std::time::Instant::now();
+        #[cfg(test)]
+        self.boot_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let guest = crate::guest::Guest::boot(&crate::guest::BootOptions {
             data_disk: true,
+            console_log: Some(crate::diag::console::path()?),
             memory_mib: Some(ceiling >> 20),
             cpus: Some(cpus),
             ..Default::default()
@@ -689,14 +753,90 @@ impl Engine {
         }
         *self.memory_target.lock().unwrap_or_else(|e| e.into_inner()) = ceiling;
         self.sleeping.store(false, std::sync::atomic::Ordering::SeqCst);
-        *link = Some(vm.clone());
+        *self.link.lock().unwrap_or_else(|e| e.into_inner()) = Some(vm.clone());
         crate::diag::info!("VM booted", ms = t0.elapsed().as_millis(), cpus = cpus, memory_mib = ceiling >> 20);
+        drop(waking);
+        self.recover_vm();
         Ok(vm)
     }
 
     /// The VM if it is awake; never boots it.
     fn awake(&self) -> Option<Arc<VmLink>> {
-        self.link.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.link.lock().unwrap_or_else(|e| e.into_inner()).as_ref().filter(|vm| !vm.is_disconnected()).cloned()
+    }
+
+    fn vm_restart_candidates(&self) -> Vec<String> {
+        let st = self.lock();
+        let mut ids: Vec<String> = st.containers.values().filter(|c| recover_after_vm_loss(c)).map(|c| c.id.clone()).collect();
+        ids.sort_by_key(|id| st.containers.get(id).is_some_and(|c| c.spec.network_mode.starts_with("container:") || !c.spec.links.is_empty()));
+        ids
+    }
+
+    fn recover_vm(&self) {
+        let Some(me) = self.me.get().and_then(Weak::upgrade) else { return };
+        let mut st = self.lock();
+        if self.is_stopped() || SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst)
+            || !st.containers.values().any(recover_after_vm_loss)
+        {
+            return;
+        }
+        st.vm_recovery_generation = st.vm_recovery_generation.saturating_add(1);
+        if st.vm_recovery_running {
+            return;
+        }
+        st.vm_recovery_running = true;
+        drop(st);
+        // vm() also serves start requests. Recover on another thread so
+        // it cannot recursively start the caller's own container.
+        let worker = std::thread::Builder::new().name("kiri-vm-recovery".into()).spawn(move || me.run_vm_recovery());
+        if let Err(e) = worker {
+            self.lock().vm_recovery_running = false;
+            crate::diag::error!("VM recovery worker did not start", error = e);
+        }
+    }
+
+    fn run_vm_recovery(&self) {
+        loop {
+            let mut st = self.lock();
+            if self.is_stopped() || SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst)
+                || !st.containers.values().any(recover_after_vm_loss)
+            {
+                st.vm_recovery_running = false;
+                return;
+            }
+            let delay = st.vm_recovery_at.map_or(Duration::ZERO, |at| at.saturating_duration_since(std::time::Instant::now()));
+            if !delay.is_zero() {
+                drop(self.changed.wait_timeout(st, delay).unwrap_or_else(|e| e.into_inner()));
+                continue;
+            }
+            let generation = st.vm_recovery_generation;
+            drop(st);
+            let mut failed = false;
+            for id in self.vm_restart_candidates() {
+                if self.lock().vm_recovery_generation != generation {
+                    break;
+                }
+                if SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) || self.is_stopped() {
+                    break;
+                }
+                if let Err(e) = self.start_inner(&id, Start::VmRecovery) {
+                    failed = true;
+                    if !matches!(&e, Error::Io(e) if e.kind() == io::ErrorKind::WouldBlock) {
+                        crate::diag::warn!("container did not restart after VM stop", id = &id[..12], error = format!("{e:?}"));
+                    }
+                    if self.awake().is_none() {
+                        break;
+                    }
+                }
+            }
+            let mut st = self.lock();
+            // A boot failure waits for a later request. A new loss or a
+            // successful request-driven boot must leave this worker a retry.
+            if failed && st.vm_recovery_generation == generation {
+                st.vm_recovery_running = false;
+                return;
+            }
+        }
     }
 
     pub fn touch(&self) {
@@ -770,6 +910,9 @@ impl Engine {
             let Some(vm) = engine.awake() else { continue };
             let host_ip = if crate::k8s::config().lan { "0.0.0.0" } else { "127.0.0.1" };
             let mut lb = engine.k8s_lb.lock().unwrap_or_else(|e| e.into_inner());
+            if vm.is_disconnected() {
+                continue;
+            }
             if bound_on != host_ip {
                 lb.clear();
                 bound_on = host_ip.to_owned();
@@ -825,10 +968,15 @@ impl Engine {
         self.route_k8s(node);
         let vm = self.vm()?;
         let b = super::ports::Binding { container_port: port, proto: "tcp".into(), host_ip: "127.0.0.1".into(), host_port: 0 };
-        let fw = super::ports::start(vm, &format!("k8s-share-{port}"), &[b], ip)?;
+        let fw = super::ports::start(vm.clone(), &format!("k8s-share-{port}"), &[b], ip)?;
         let mac = fw.bound.first().map(|(_, _, p)| *p).unwrap_or(0);
         crate::diag::info!("Kubernetes address forwarded for sharing", to = format!("{}:{port}", std::net::Ipv4Addr::from(ip)), at = format!("127.0.0.1:{mac}"));
-        self.k8s_fwd.lock().unwrap_or_else(|e| e.into_inner()).insert(mac, fw);
+        let mut forwards = self.k8s_fwd.lock().unwrap_or_else(|e| e.into_inner());
+        if vm.is_disconnected() {
+            drop(forwards);
+            return Err(Error::Io(io::Error::other("the VM stopped")));
+        }
+        forwards.insert(mac, fw);
         Ok(mac)
     }
 
@@ -892,7 +1040,7 @@ impl Engine {
 
     /// Powers the VM off if nothing runs in it. True if it went to sleep.
     fn sleep_if_idle(&self) -> bool {
-        let mut link = self.link.lock().unwrap_or_else(|e| e.into_inner());
+        let _waking = self.waking.lock().unwrap_or_else(|e| e.into_inner());
         // Check under the lock: a request may have woken it.
         let idle = !self.lock().containers.values().any(|c| c.status == Status::Running) && !usb_attached();
         // Not `link.take().filter(..)`: that takes the VM first and drops it
@@ -900,18 +1048,18 @@ impl Engine {
         if !idle {
             return false;
         }
-        let Some(vm) = link.take() else { return false };
+        let Some(vm) = self.link.lock().unwrap_or_else(|e| e.into_inner()).clone() else { return false };
         self.sleeping.store(true, std::sync::atomic::Ordering::SeqCst);
         self.memory_used.store(0, std::sync::atomic::Ordering::Relaxed);
         self.memory_stall.store(0, std::sync::atomic::Ordering::Relaxed);
         vm.shutdown();
         // Let the guest flush its disk and power off before the VM is dropped.
-        if !vm.wait_stopped(Duration::from_secs(10)) {
-            crate::diag::warn!("the VM did not power off in 10 s; stopped it");
+        if let Err(e) = vm.retire() {
+            self.sleeping.store(false, std::sync::atomic::Ordering::SeqCst);
+            crate::diag::warn!("the VM did not finish stopping", error = e);
+            return false;
         }
-        // Dropping the last reference stops the VM and frees the data disk
-        // before anyone may boot a new one (they wait on `link`).
-        drop(vm);
+        *self.link.lock().unwrap_or_else(|e| e.into_inner()) = None;
         true
     }
 
@@ -993,6 +1141,7 @@ impl Engine {
             for s in saved {
                 let was_running = s.status == Status::Running;
                 let c = Container {
+                    lifecycle: Arc::new(Mutex::new(0)),
                     id: s.id.clone(),
                     name: s.name,
                     layers: s.layers,
@@ -1055,7 +1204,7 @@ impl Engine {
             }
         }
         for id in restart {
-            if let Err(e) = self.start_inner(&id, false) {
+            if let Err(e) = self.start_inner(&id, Start::DaemonRestart) {
                 crate::diag::warn!("container did not restart", id = &id[..12], error = format!("{e:?}"));
             }
         }
@@ -1170,8 +1319,8 @@ impl Engine {
                             _ => false,
                         };
                         if wants && !c.spec.auto_remove && !SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
-                            let backoff = RESTART_BASE.saturating_mul(1 << c.restart_count.min(10)).min(RESTART_CAP);
-                            c.restart_count += 1;
+                            let backoff = restart_backoff(c.restart_count);
+                            c.restart_count = c.restart_count.saturating_add(1);
                             restart_in = Some(backoff);
                         }
                         c.spec.auto_remove
@@ -1215,7 +1364,7 @@ impl Engine {
                         let still_wanted =
                             me.lock().containers.get(&id).is_some_and(|c| c.status == Status::Exited && !c.stopped_by_user);
                         if still_wanted {
-                            if let Err(e) = me.start_inner(&id, false) {
+                            if let Err(e) = me.start_inner(&id, Start::Restart) {
                                 crate::diag::warn!("container did not restart", id = &id[..12], error = format!("{e:?}"));
                             }
                         }
@@ -1246,7 +1395,13 @@ impl Engine {
                         c.attached.clear();
                         lock_log(&c.log).end_follow();
                     }
+                    if recover_after_vm_loss(c) {
+                        c.restart_count = c.restart_count.saturating_add(1);
+                    }
                 }
+                let delay = st.containers.values().filter(|c| recover_after_vm_loss(c))
+                    .map(|c| restart_backoff(c.restart_count.saturating_sub(1))).max();
+                st.vm_recovery_at = delay.map(|delay| std::time::Instant::now() + delay);
                 for e in st.execs.values_mut() {
                     e.running = false;
                     e.attached.clear();
@@ -1256,14 +1411,16 @@ impl Engine {
                 }
                 drop(st);
                 drop(closed);
+                self.k8s_lb.lock().unwrap_or_else(|e| e.into_inner()).clear();
+                self.k8s_fwd.lock().unwrap_or_else(|e| e.into_inner()).clear();
+                self.k8s_routes.lock().unwrap_or_else(|e| e.into_inner()).take();
                 self.changed.notify_all();
-                if !self.sleeping.load(std::sync::atomic::Ordering::SeqCst) {
+                if !self.sleeping.load(std::sync::atomic::Ordering::SeqCst) && !SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
                     self.save();
-                    crate::diag::error!("the VM stopped unexpectedly; the next request boots a new one");
-                    // A crashed VM: forget it, so the next request boots a fresh one.
-                    if let Ok(mut link) = self.link.try_lock() {
-                        *link = None;
-                    }
+                    crate::diag::error!("the VM stopped unexpectedly", console = crate::diag::console::path().map(|p| p.display().to_string()).unwrap_or_default());
+                    // vm() releases this dead link after the reader has
+                    // finished exit accounting. Never wait for it here.
+                    self.recover_vm();
                 }
             }
         }
@@ -1419,11 +1576,11 @@ impl Engine {
 
     /// Sends the guest every layer of these (digest, media type) it doesn't
     /// have unpacked, from the blob store.
-    fn ensure_layers<'a>(&self, layers: impl Iterator<Item = (&'a str, &'a str)>) -> io::Result<()> {
+    fn ensure_layers<'a>(&self, vm: &VmLink, layers: impl Iterator<Item = (&'a str, &'a str)>) -> io::Result<()> {
         let _one_at_a_time = self.layers.lock().unwrap_or_else(|e| e.into_inner());
         for (digest, media_type) in layers {
-            if !self.vm()?.has_layer(digest)? {
-                self.vm()?.send_layer(digest, media_type, &self.store.blob_path(digest)?)?;
+            if !vm.has_layer(digest)? {
+                vm.send_layer(digest, media_type, &self.store.blob_path(digest)?)?;
             }
         }
         Ok(())
@@ -1435,8 +1592,7 @@ impl Engine {
     /// container created before that would otherwise fail to start with
     /// "layer ... is not unpacked". The media type comes from any image with
     /// the layer; a layer no image has any more can't be sent again.
-    fn restore_layers(&self, layers: &[String]) -> Result<(), Error> {
-        let vm = self.vm()?;
+    fn restore_layers(&self, vm: &VmLink, layers: &[String]) -> Result<(), Error> {
         let mut missing = Vec::new();
         for digest in layers {
             if !vm.has_layer(digest)? {
@@ -1455,13 +1611,16 @@ impl Engine {
             };
             wanted.push((l.digest.as_str(), l.media_type.as_str()));
         }
-        Ok(self.ensure_layers(wanted.into_iter())?)
+        Ok(self.ensure_layers(vm, wanted.into_iter())?)
     }
 
     /// Records a container and makes sure its layers are in the guest, so
     /// `start` has nothing left to do but run it.
     pub fn create(&self, name: Option<String>, spec: Spec, image: &Image) -> Result<String, Error> {
-        self.ensure_layers(image.layers.iter().map(|l| (l.digest.as_str(), l.media_type.as_str())))?;
+        if !image.layers.is_empty() {
+            let vm = self.vm()?;
+            self.ensure_layers(&vm, image.layers.iter().map(|l| (l.digest.as_str(), l.media_type.as_str())))?;
+        }
         let id = random_hex(32);
         let persist = !spec.auto_remove;
         let (log_dir, log_config) = (super::logfile::dir(self.store.root(), &id), spec.log_config.clone());
@@ -1489,6 +1648,7 @@ impl Engine {
         st.containers.insert(
             id.clone(),
             Container {
+                lifecycle: Arc::new(Mutex::new(0)),
                 id: id.clone(),
                 name,
                 layers: image.layers.iter().rev().map(|l| l.digest.clone()).collect(),
@@ -1532,16 +1692,75 @@ impl Engine {
         resolve(&st, key)
     }
 
-    /// `docker start`: also clears a previous `stop`, as Docker does.
-    pub fn start(&self, key: &str) -> Result<(), Error> {
-        self.start_inner(key, true)
+    fn lifecycle(&self, key: &str) -> Result<Arc<Mutex<u64>>, Error> {
+        let st = self.lock();
+        let id = resolve(&st, key)?;
+        Ok(st.containers[&id].lifecycle.clone())
     }
 
-    fn start_inner(&self, key: &str, by_user: bool) -> Result<(), Error> {
+    /// `docker start`: also clears a previous `stop`, as Docker does.
+    pub fn start(&self, key: &str) -> Result<(), Error> {
+        self.start_inner(key, Start::User)
+    }
+
+    fn start_inner(&self, key: &str, reason: Start) -> Result<(), Error> {
+        let lifecycle = self.lifecycle(key)?;
+        let _starting = lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+        let generation = *_starting;
+        {
+            let st = self.lock();
+            let id = resolve(&st, key)?;
+            let c = &st.containers[&id];
+            if c.status == Status::Running || (reason == Start::VmRecovery && !recover_after_vm_loss(c))
+                || (reason == Start::Restart && c.stopped_by_user)
+            {
+                return Ok(());
+            }
+            if c.spec.entrypoint.is_empty() && c.spec.cmd.is_empty() {
+                return Err(Error::BadRequest("no command specified".into()));
+            }
+        }
+        drop(_starting);
+        // Retirement and boot own no container lock. A manual action can
+        // invalidate this attempt while the previous VM is stopping.
+        let prepared = self.vm_inner(reason == Start::VmRecovery);
+        let _starting = lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+        if *_starting != generation {
+            return Err(Error::Conflict("container start was canceled".into()));
+        }
+        let vm = match prepared {
+            Ok(vm) => vm,
+            Err(e) => {
+                if reason != Start::VmRecovery {
+                    let (id, spec) = self.with(key, |c| (c.id.clone(), c.spec.clone()))?;
+                    self.fail_start(&id, &spec);
+                }
+                return Err(Error::Io(e));
+            }
+        };
+        self.start_on_vm(key, reason, vm)
+    }
+
+    /// The lifecycle lock is held by start_inner for this entire attempt.
+    fn start_on_vm(&self, key: &str, reason: Start, vm: Arc<VmLink>) -> Result<(), Error> {
         let (id, layers, argv, spec, size) = {
             let mut st = self.lock();
             let id = resolve(&st, key)?;
+            // Under the same lock as Lost: either this claim belongs to
+            // the live VM, or Lost will observe it as Running and end it.
+            if vm.is_disconnected() {
+                let spec = st.containers[&id].spec.clone();
+                drop(st);
+                let _ = vm.is_lost();
+                if reason != Start::VmRecovery {
+                    self.fail_start(&id, &spec);
+                }
+                return Err(Error::Io(io::Error::other("the VM stopped")));
+            }
             let c = st.containers.get_mut(&id).expect("resolved");
+            if (reason == Start::VmRecovery && !recover_after_vm_loss(c)) || (reason == Start::Restart && c.stopped_by_user) {
+                return Ok(());
+            }
             match c.status {
                 Status::Running => return Ok(()),
                 Status::Exited if c.spec.auto_remove => return Err(Error::Conflict("container is being removed".into())),
@@ -1561,7 +1780,7 @@ impl Engine {
             if c.spec.auto_remove && !c.attached.is_empty() {
                 lock_log(&c.log).keep_in_memory();
             }
-            if by_user {
+            if reason == Start::User {
                 c.stopped_by_user = false;
                 c.restart_count = 0;
             }
@@ -1704,14 +1923,7 @@ impl Engine {
                 return Err(e);
             }
         };
-        let vm = match self.vm() {
-            Ok(vm) => vm,
-            Err(e) => {
-                self.fail_start(&id, &spec);
-                return Err(Error::Io(e));
-            }
-        };
-        if let Err(e) = self.restore_layers(&layers) {
+        if let Err(e) = self.restore_layers(&vm, &layers) {
             self.fail_start(&id, &spec);
             return Err(e);
         }
@@ -1741,17 +1953,25 @@ impl Engine {
             let target = if flags & run_flags::NET_HOST != 0 { [127, 0, 0, 1] } else { ip };
             match super::ports::start(vm.clone(), &id, &spec.ports, target) {
                 Ok(fw) => {
-                    if let Some(c) = self.lock().containers.get_mut(&id) {
+                    let mut st = self.lock();
+                    if let Some(c) = st.containers.get_mut(&id).filter(|c| c.status == Status::Running && !vm.is_disconnected()) {
                         c.forwards = Some(fw);
+                    } else {
+                        drop(st);
+                        drop(fw);
                     }
                 }
                 Err(e) => {
                     crate::diag::warn!("ports not published; container stopped", id = &id[..12], error = e);
                     // Docker refuses to run a container whose ports clash.
-                    let _ = self.vm()?.kill(&id, libc::SIGKILL as u32);
+                    let _ = vm.kill(&id, libc::SIGKILL as u32);
                     return Err(Error::Conflict(e.to_string()));
                 }
             }
+        }
+        if vm.is_disconnected() {
+            self.fail_start(&id, &spec);
+            return Err(Error::Io(io::Error::other("the VM stopped")));
         }
         // The guest has the process now: deliver input that arrived early.
         // It is drained before the container goes live, so input still
@@ -1771,11 +1991,11 @@ impl Engine {
             };
             if early.is_empty() {
                 if close {
-                    let _ = self.vm()?.close_stdin(&id);
+                    let _ = vm.close_stdin(&id);
                 }
                 break;
             }
-            let _ = self.vm()?.input(&id, &early);
+            let _ = vm.input(&id, &early);
         }
         self.health_start(&id);
         if !spec.auto_remove {
@@ -1935,7 +2155,25 @@ impl Engine {
 
     /// Records a start that never reached the guest as an immediate exit.
     fn fail_start(&self, id: &str, spec: &Spec) {
+        let vm = self.link.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(vm) = vm {
+            let _ = vm.is_lost();
+        }
         let mut st = self.lock();
+        // Lost may have run before this start finished allocating addresses.
+        // Reclaim those even when preserving the crash's exit accounting.
+        if let Some(c) = st.containers.get_mut(id) {
+            if let Some(ip) = c.ip.take() {
+                self.release_ip(&c.spec.network_mode, ip);
+            }
+            for (net, ip) in std::mem::take(&mut c.extra_ips) {
+                self.release_ip(&net, ip);
+            }
+            self.release_ip6s(c);
+        }
+        if !spec.auto_remove && st.containers.get(id).is_some_and(|c| c.vm_stopped) {
+            return;
+        }
         let actor = st.containers.get(id).map(|c| (c.spec.image.clone(), container_attrs(c)));
         if let Some(c) = st.containers.get_mut(id) {
             c.status = Status::Exited;
@@ -1944,10 +2182,6 @@ impl Engine {
             c.finished = Some(SystemTime::now());
             c.attached.clear();
             lock_log(&c.log).end_follow();
-            if let Some(ip) = c.ip.take() {
-                self.release_ip(&c.spec.network_mode, ip);
-            }
-            self.release_ip6s(c);
         }
         if let Some(h) = st.health.get_mut(id) {
             close_monitor(h);
@@ -2566,7 +2800,10 @@ impl Engine {
     }
 
     pub fn stop(&self, key: &str, timeout: Duration) -> Result<(), Error> {
+        let lifecycle = self.lifecycle(key)?;
+        let mut stopping = lifecycle.lock().unwrap_or_else(|e| e.into_inner());
         let id = self.resolve(key)?;
+        *stopping = stopping.wrapping_add(1);
         self.thaw_for_signal(&id);
         self.mark_stopped(&id);
         if !self.is_running(&id) {
@@ -2574,14 +2811,18 @@ impl Engine {
         }
         self.emit_container("kill", &id, &[("signal", (libc::SIGTERM).to_string())]);
         let sig = self.lock().containers.get(&id).and_then(|c| c.spec.stop_signal).unwrap_or(libc::SIGTERM as u32);
-        self.vm()?.kill(&id, sig)?;
+        if let Some(vm) = self.awake() {
+            vm.kill(&id, sig)?;
+        }
         let deadline = std::time::Instant::now() + timeout;
         let mut st = self.lock();
         while st.containers.get(&id).is_some_and(|c| c.status == Status::Running) {
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             if left.is_zero() {
                 drop(st);
-                self.vm()?.kill(&id, libc::SIGKILL as u32)?;
+                if let Some(vm) = self.awake() {
+                    vm.kill(&id, libc::SIGKILL as u32)?;
+                }
                 self.emit_container("stop", &id, &[]);
                 return Ok(());
             }
@@ -2595,7 +2836,7 @@ impl Engine {
     /// A frozen process cannot handle a signal; Docker thaws it first.
     fn thaw_for_signal(&self, id: &str) {
         if self.is_paused(id) {
-            if let Ok(vm) = self.vm() {
+            if let Some(vm) = self.awake() {
                 if vm.freeze(id, false).is_ok() {
                     if let Some(c) = self.lock().containers.get_mut(id) {
                         c.paused = false;
@@ -2607,16 +2848,29 @@ impl Engine {
     }
 
     pub fn kill(&self, key: &str, signal: u32) -> Result<(), Error> {
+        let lifecycle = self.lifecycle(key)?;
+        let mut killing = lifecycle.lock().unwrap_or_else(|e| e.into_inner());
         let id = self.resolve(key)?;
         self.thaw_for_signal(&id);
         if !self.is_running(&id) {
+            if (signal == libc::SIGKILL as u32 || signal == libc::SIGTERM as u32)
+                && self.with(&id, recover_after_vm_loss)?
+            {
+                *killing = killing.wrapping_add(1);
+                self.mark_stopped(&id);
+                self.save();
+                return Ok(());
+            }
             return Err(Error::Conflict(format!("Container {} is not running", &id[..12])));
         }
         if signal == libc::SIGKILL as u32 || signal == libc::SIGTERM as u32 {
+            *killing = killing.wrapping_add(1);
             self.mark_stopped(&id);
         }
         self.emit_container("kill", &id, &[("signal", signal.to_string())]);
-        self.vm()?.kill(&id, signal)?;
+        if let Some(vm) = self.awake() {
+            vm.kill(&id, signal)?;
+        }
         // Like Docker: a SIGKILL returns only once the exit is recorded, so
         // an immediate inspect, start or rm sees the container stopped.
         if signal == libc::SIGKILL as u32 {
@@ -2634,6 +2888,8 @@ impl Engine {
     }
 
     pub fn remove(&self, key: &str, force: bool, with_volumes: bool) -> Result<(), Error> {
+        let lifecycle = self.lifecycle(key)?;
+        let mut removing = lifecycle.lock().unwrap_or_else(|e| e.into_inner());
         let id = self.resolve(key)?;
         if self.is_running(&id) {
             if !force {
@@ -2643,12 +2899,15 @@ impl Engine {
                 )));
             }
             self.mark_stopped(&id);
-            self.vm()?.kill(&id, libc::SIGKILL as u32)?;
+            if let Some(vm) = self.awake() {
+                vm.kill(&id, libc::SIGKILL as u32)?;
+            }
             let mut st = self.lock();
             while st.containers.get(&id).is_some_and(|c| c.status == Status::Running) {
                 st = self.changed.wait_timeout(st, Duration::from_secs(5)).unwrap_or_else(|e| e.into_inner()).0;
             }
         }
+        *removing = removing.wrapping_add(1);
         self.emit_container("destroy", &id, &[]);
         let mut st = self.lock();
         let removed = st.containers.remove(&id);
@@ -2661,11 +2920,16 @@ impl Engine {
         if let Some(c) = &removed {
             lock_log(&c.log).remove();
         }
-        if removed.is_some_and(|c| !c.spec.auto_remove) {
+        if removed.as_ref().is_some_and(|c| !c.spec.auto_remove) {
             self.save();
         }
-        // Its writable layer is still on the guest's disk.
-        self.vm()?.remove(&id)?;
+        // Lost containers are pruned by retain() on the next boot. Removal
+        // must not boot a replacement or wait for a retiring VM.
+        if removed.as_ref().is_some_and(|c| c.started.is_some() && !c.vm_stopped)
+            && let Some(vm) = self.awake()
+        {
+            vm.remove(&id)?;
+        }
         if with_volumes {
             for v in anon {
                 self.delete_volume_data(&v);
@@ -2882,6 +3146,7 @@ impl Engine {
                 None => false,
             }
         };
+        self.changed.notify_all();
         if persist {
             self.save();
         }
@@ -3353,6 +3618,328 @@ impl Engine {
             return (-1, format!("Health check exceeded timeout ({})", go_duration(timeout)));
         }
         (code.map_or(-1, i64::from), cap_output(&out))
+    }
+}
+
+#[cfg(test)]
+mod vm_recovery_tests {
+    use super::*;
+
+    /// Run only in an isolated HOME and KIRI_DATA_DIR containing an Alpine
+    /// image and no containers, with a signed test binary and guest assets.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires an isolated store, signed binary and a real VM"]
+    fn vm_loss_live_recovers_without_a_request() {
+        assert_eq!(std::env::var("KIRI_LIVE_VM_RECOVERY").as_deref(), Ok("1"));
+        let root = PathBuf::from(std::env::var_os("KIRI_DATA_DIR").expect("isolated KIRI_DATA_DIR"));
+        let records = root.join("containers.json");
+        if records.exists() {
+            let saved: Vec<Saved> = serde_json::from_slice(&std::fs::read(records).unwrap()).unwrap();
+            assert!(saved.is_empty(), "the live test requires an empty container store");
+        }
+        let store = Store::open(&root).unwrap();
+        let image = store.images().unwrap().into_iter().find(|i| i.name == "alpine:latest").expect("pull alpine:latest into the isolated store first");
+        let engine = Engine::boot(store).unwrap();
+        let mut ids = Vec::new();
+        for (name, policy) in [("live-always", "always"), ("live-unless", "unless-stopped"), ("live-no", "no"), ("live-stopped", "unless-stopped"), ("live-failure", "on-failure")] {
+            let spec: Spec = serde_json::from_value(serde_json::json!({
+                "image": image.name, "image_id": image.digest, "entrypoint": [], "cmd": ["sleep", "600"],
+                "env": [], "cwd": "/", "user": "", "auto_remove": false,
+                "network_mode": if name == "live-always" { "bridge" } else { "none" },
+                "labels": if name == "live-always" { serde_json::json!({"dev.kiri.k8s": "true"}) } else { serde_json::json!({}) },
+                "restart": {"name": policy, "max_retries": 0}
+            })).unwrap();
+            let id = engine.create(Some(name.into()), spec, &image).unwrap();
+            engine.start(&id).unwrap();
+            ids.push(id);
+        }
+        engine.stop(&ids[3], Duration::ZERO).unwrap();
+        for count in 1..=2 {
+            let shared = engine.k8s_forward([10, 42, 0, 2], 8080).unwrap();
+            let vm = engine.awake().unwrap();
+            assert!(!vm.wait_stopped(Duration::ZERO), "force-stop this test's VM");
+            drop(vm);
+            let until = std::time::Instant::now() + Duration::from_secs(10);
+            let mut st = engine.lock();
+            while !ids[..2].iter().all(|id| st.containers[id].status == Status::Running && st.containers[id].restart_count == count) {
+                let left = until.saturating_duration_since(std::time::Instant::now());
+                assert!(!left.is_zero(), "policy containers stayed down without a new VM request");
+                st = engine.changed.wait_timeout(st, left.min(Duration::from_millis(100))).unwrap().0;
+            }
+            for id in &ids[2..] {
+                assert_eq!(st.containers[id].status, Status::Exited);
+                assert_eq!(st.containers[id].restart_count, 0);
+            }
+            assert!(engine.k8s_fwd.lock().unwrap().is_empty(), "VM loss must release old Kubernetes shares");
+            let _rebound = std::net::TcpListener::bind(("127.0.0.1", shared)).expect("the old share's listening socket must be released");
+            println!("PASS: actual VM loss {count} recovered without a boot request; RestartCount={count}; excluded policies stayed down");
+        }
+        for (fault, count) in [("missing", 3), ("truncated", 4)] {
+            let mut canceled = Vec::new();
+            for action in ["stop", "kill", "remove"] {
+                let mut spec = engine.with(&ids[1], |c| c.spec.clone()).unwrap();
+                spec.restart.name = "always".into();
+                let id = engine.create(Some(format!("retire-{fault}-{action}")), spec, &image).unwrap();
+                engine.start(&id).unwrap();
+                canceled.push(id);
+            }
+            let old = engine.awake().unwrap();
+            let held = old.hold_retirement();
+            let attempts = engine.boot_attempts.load(std::sync::atomic::Ordering::SeqCst);
+            let blob = root.join(format!("retirement-{fault}.blob"));
+            if fault == "truncated" {
+                std::fs::write(&blob, b"").unwrap();
+            }
+            assert!(old.interrupted_layer(&blob).is_err());
+            let _ = old.is_lost();
+            let requested_engine = engine.clone();
+            let (sent, received) = std::sync::mpsc::channel();
+            let request = std::thread::spawn(move || sent.send(requested_engine.vm()).unwrap());
+            assert!(received.recv_timeout(Duration::from_millis(200)).is_err(), "fallback must wait for retirement");
+            assert_eq!(engine.boot_attempts.load(std::sync::atomic::Ordering::SeqCst), attempts, "neither recovery nor fallback may open replacement storage before retirement");
+            let stopping = std::time::Instant::now();
+            engine.stop(&canceled[0], Duration::ZERO).unwrap();
+            engine.kill(&canceled[1], libc::SIGKILL as u32).unwrap();
+            engine.remove(&canceled[2], false, false).unwrap();
+            assert!(stopping.elapsed() < Duration::from_secs(2), "retirement must not hold container lifecycle locks");
+            drop(held);
+            let replacement = received.recv_timeout(Duration::from_secs(15)).unwrap().unwrap();
+            request.join().unwrap();
+            let until = std::time::Instant::now() + Duration::from_secs(15);
+            let mut st = engine.lock();
+            while !ids[..2].iter().all(|id| st.containers[id].status == Status::Running && st.containers[id].restart_count == count) {
+                let left = until.saturating_duration_since(std::time::Instant::now());
+                assert!(!left.is_zero(), "retirement must allow recovery after confirmed stop");
+                st = engine.changed.wait_timeout(st, left.min(Duration::from_millis(100))).unwrap().0;
+            }
+            assert!(st.containers[&canceled[0]].stopped_by_user);
+            assert_eq!(st.containers[&canceled[0]].status, Status::Exited);
+            assert_eq!(st.containers[&canceled[1]].status, Status::Exited);
+            assert!(!st.containers.contains_key(&canceled[2]));
+            drop(st);
+            old.retire().unwrap();
+            drop(old);
+            assert!(replacement.stats().is_ok(), "late destruction of the old generation must not affect its successor");
+            if blob.exists() { std::fs::remove_file(blob).unwrap(); }
+            println!("PASS: {fault} layer after header; no replacement before retirement; retained old handle inert; stop/kill/remove cancel");
+        }
+        {
+            let mut st = engine.lock();
+            for id in &ids[..2] {
+                st.containers.get_mut(id).unwrap().restart_count = 10;
+            }
+        }
+        let vm = engine.awake().unwrap();
+        assert!(!vm.wait_stopped(Duration::ZERO));
+        let lost_vm = vm;
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        let mut st = engine.lock();
+        while ids[..2].iter().any(|id| st.containers[id].status == Status::Running) {
+            let left = until.saturating_duration_since(std::time::Instant::now());
+            assert!(!left.is_zero(), "the lost VM must finish exit accounting");
+            st = engine.changed.wait_timeout(st, left).unwrap().0;
+        }
+        assert!(st.vm_recovery_at.unwrap() > std::time::Instant::now() + Duration::from_secs(50));
+        let spec = st.containers[&ids[0]].spec.clone();
+        drop(st);
+        assert!(engine.start_on_vm(&ids[0], Start::VmRecovery, lost_vm).is_err(), "a start borrowing the old VM cannot claim Running after Lost");
+        assert_eq!(engine.with(&ids[0], |c| (c.status, c.vm_stopped, c.exit_code)).unwrap(), (Status::Exited, true, 255));
+        engine.fail_start(&ids[0], &spec);
+        assert_eq!(engine.with(&ids[0], |c| c.exit_code).unwrap(), 255, "a late start failure must preserve VM-loss accounting");
+        assert!(!engine.is_awake(), "a disconnected VM must not be reported as awake");
+        assert!(matches!(engine.start_inner(&ids[1], Start::VmRecovery), Err(Error::Io(e)) if e.kind() == io::ErrorKind::WouldBlock), "a remaining candidate must not reboot during backoff");
+        let stopping = std::time::Instant::now();
+        for id in &ids[..2] {
+            engine.stop(id, Duration::ZERO).unwrap();
+        }
+        assert!(stopping.elapsed() < Duration::from_secs(2), "backoff must not hold a lifecycle lock");
+        let mut st = engine.lock();
+        while st.vm_recovery_running {
+            let left = until.saturating_duration_since(std::time::Instant::now());
+            assert!(!left.is_zero(), "stopping the candidates cancels the recovery worker");
+            st = engine.changed.wait_timeout(st, left.min(Duration::from_millis(100))).unwrap().0;
+        }
+        drop(st);
+        assert!(!engine.is_awake(), "no eligible containers means the VM stays down");
+        println!("PASS: a crash loop backs off for 60 s; manual stops cancel recovery without waiting for the delay");
+        engine.shutdown();
+    }
+
+    #[test]
+    fn vm_loss_recovers_running_policies_but_preserves_user_stops() {
+        let dir = std::env::temp_dir().join(format!("kiri-vm-recovery-{}", std::process::id()));
+        let store = Store::open(&dir).unwrap();
+        let engine = Engine::boot(store).unwrap();
+        // Prevent any real VM boot: this test supplies the guest events.
+        engine.stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+        let image = Image {
+            name: "test:local".into(), digest: "sha256:test".into(), index_digest: None, config_digest: "sha256:test".into(),
+            layers: Vec::new(), size: 0, platform: "linux/arm64".into(), created: String::new(), pulled_at: 0, config: Default::default(),
+        };
+        let cases = [
+            ("always-live", "always", Status::Running, false),
+            ("unless-live", "unless-stopped", Status::Running, false),
+            ("always-stopped", "always", Status::Exited, true),
+            ("unless-stopped", "unless-stopped", Status::Exited, true),
+            ("always-created", "always", Status::Created, false),
+            ("unless-created", "unless-stopped", Status::Created, false),
+            ("no-live", "no", Status::Running, false),
+            ("failure-live", "on-failure", Status::Running, false),
+        ];
+        let mut ids = HashMap::new();
+        for (name, policy, status, stopped_by_user) in cases {
+            let spec: Spec = serde_json::from_value(serde_json::json!({
+                "image": "test:local", "image_id": "sha256:test", "entrypoint": [], "cmd": ["sleep", "60"],
+                "env": [], "cwd": "/", "user": "", "auto_remove": false, "network_mode": "none", "labels": {},
+                "restart": {"name": policy, "max_retries": 0}
+            })).unwrap();
+            let id = engine.create(Some(name.into()), spec, &image).unwrap();
+            let mut st = engine.lock();
+            let c = st.containers.get_mut(&id).unwrap();
+            c.status = status;
+            c.stopped_by_user = stopped_by_user;
+            c.started = (status != Status::Created).then(SystemTime::now);
+            ids.insert(name, id);
+        }
+        let lost_at = std::time::Instant::now();
+        *engine.k8s_routes.lock().unwrap() = Some((1, [10, 99, 0, 2]));
+        engine.on_event(Event::Lost);
+        let accounted_at = std::time::Instant::now();
+        assert!(engine.k8s_routes.lock().unwrap().is_none(), "the replacement VM must install fresh Kubernetes routes");
+        // A VM preparation wait must not own a container's lifecycle.
+        // The stopped engine prevents this synthetic test booting a VM.
+        let link = engine.link.lock().unwrap();
+        let starting_engine = engine.clone();
+        let starting_id = ids["always-live"].clone();
+        let start = std::thread::spawn(move || starting_engine.start(&starting_id));
+        std::thread::sleep(Duration::from_millis(50));
+        let stopping_engine = engine.clone();
+        let stopping_id = ids["always-live"].clone();
+        let (sent, received) = std::sync::mpsc::channel();
+        let stop = std::thread::spawn(move || sent.send(stopping_engine.stop(&stopping_id, Duration::ZERO)).unwrap());
+        let canceled_during_preparation = received.recv_timeout(Duration::from_millis(200)).is_ok();
+        drop(link);
+        let started = start.join().unwrap();
+        stop.join().unwrap();
+        assert!(canceled_during_preparation, "stop must finish while VM preparation is blocked");
+        assert!(matches!(started, Err(Error::Conflict(_))), "a newer manual stop invalidates the prepared user start");
+        engine.lock().containers.get_mut(&ids["always-live"]).unwrap().stopped_by_user = false;
+        // A start can finish reserving its address after Lost has already
+        // reclaimed the previous run. Its failure must reclaim that too.
+        let ipam = super::super::network::parse_ipam(&serde_json::json!({"Config": [{"Subnet": "10.99.0.0/24"}]})).unwrap();
+        let net = engine.lock_networks().create("late-start", super::super::network::Settings { ipam, ..Default::default() }).unwrap();
+        let mut late_ip = net.subnet;
+        late_ip[3] = 42;
+        engine.lock_networks().reserve("late-start", late_ip).unwrap();
+        let late_spec = {
+            let mut st = engine.lock();
+            let c = st.containers.get_mut(&ids["always-live"]).unwrap();
+            c.spec.network_mode = "late-start".into();
+            c.ip = Some(late_ip);
+            c.spec.clone()
+        };
+        engine.fail_start(&ids["always-live"], &late_spec);
+        assert_eq!(engine.with(&ids["always-live"], |c| c.exit_code).unwrap(), 255);
+        engine.lock_networks().reserve("late-start", late_ip).expect("failed recovery must release a late fixed-IP reservation");
+        engine.lock_networks().release("late-start", late_ip);
+        let retry_at = engine.lock().vm_recovery_at.expect("a VM loss schedules recovery with backoff");
+        assert!(retry_at >= lost_at + RESTART_BASE);
+        assert!(retry_at <= accounted_at + RESTART_BASE);
+        let mut wanted = engine.vm_restart_candidates();
+        wanted.sort();
+        let mut expected = vec![ids["always-live"].clone(), ids["unless-live"].clone()];
+        expected.sort();
+        assert_eq!(wanted, expected);
+        let saved: Vec<Saved> = serde_json::from_slice(&std::fs::read(&engine.records).unwrap()).unwrap();
+        let live = saved.iter().find(|c| c.name == "always-live").unwrap();
+        assert_eq!(live.status, Status::Exited);
+        assert_eq!(live.exit_code, 255);
+        assert!(live.vm_stopped);
+        assert_eq!(live.restart_count, 1, "a VM recovery counts as a restart");
+        assert_eq!(saved.iter().find(|c| c.name == "unless-live").unwrap().restart_count, 1);
+        for name in ["always-stopped", "unless-stopped", "always-created", "unless-created", "no-live", "failure-live"] {
+            assert_eq!(saved.iter().find(|c| c.name == name).unwrap().restart_count, 0, "{name} must not restart");
+        }
+        // A replacement VM can die before any container has started.
+        let before = std::time::Instant::now();
+        engine.on_event(Event::Lost);
+        let after = std::time::Instant::now();
+        {
+            let st = engine.lock();
+            assert_eq!(st.containers[&ids["always-live"]].restart_count, 2);
+            let at = st.vm_recovery_at.unwrap();
+            assert!(at >= before + Duration::from_millis(200) && at <= after + Duration::from_millis(200));
+        }
+        // A successful request-driven boot while the worker is still
+        // unwinding a failure must leave a retry for that worker to see.
+        let generation = {
+            let mut st = engine.lock();
+            st.vm_recovery_running = true;
+            st.vm_recovery_generation
+        };
+        engine.stopped.store(false, std::sync::atomic::Ordering::SeqCst);
+        engine.recover_vm();
+        engine.stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+        {
+            let mut st = engine.lock();
+            assert!(st.vm_recovery_generation > generation, "a boot racing an active recovery must not lose its retry");
+            st.vm_recovery_running = false;
+        }
+        for (previous, delay) in [(1, Duration::from_millis(200)), (2, Duration::from_millis(400)), (10, Duration::from_secs(60)), (u32::MAX, Duration::from_secs(60))] {
+            {
+                let mut st = engine.lock();
+                for name in ["always-live", "unless-live"] {
+                    let c = st.containers.get_mut(&ids[name]).unwrap();
+                    c.status = Status::Running;
+                    c.restart_count = previous;
+                }
+            }
+            let before = std::time::Instant::now();
+            engine.on_event(Event::Lost);
+            let after = std::time::Instant::now();
+            let st = engine.lock();
+            let at = st.vm_recovery_at.unwrap();
+            assert!(at >= before + delay && at <= after + delay);
+            assert_eq!(st.containers[&ids["always-live"]].restart_count, previous.saturating_add(1));
+        }
+        // A stop that arrives between the crash and the next boot wins.
+        let lifecycle = engine.lifecycle(&ids["unless-live"]).unwrap();
+        let starting = lifecycle.lock().unwrap();
+        let stop_engine = engine.clone();
+        let stop_id = ids["unless-live"].clone();
+        let (sent, received) = std::sync::mpsc::channel();
+        let stop = std::thread::spawn(move || {
+            sent.send(stop_engine.stop(&stop_id, Duration::ZERO)).unwrap();
+        });
+        assert!(received.recv_timeout(Duration::from_millis(50)).is_err(), "stop must wait for an in-flight start");
+        drop(starting);
+        received.recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
+        stop.join().unwrap();
+        assert_eq!(engine.vm_restart_candidates(), vec![ids["always-live"].clone()]);
+        engine.start_inner(&ids["unless-live"], Start::VmRecovery).unwrap();
+        engine.start_inner(&ids["unless-live"], Start::Restart).unwrap();
+        assert_eq!(engine.lock().containers[&ids["unless-live"]].status, Status::Exited);
+        assert!(engine.lock().containers[&ids["unless-live"]].stopped_by_user);
+        assert!(matches!(engine.kill(&ids["always-live"], libc::SIGUSR1 as u32), Err(Error::Conflict(_))));
+        engine.kill(&ids["always-live"], libc::SIGTERM as u32).expect("a terminal kill cancels a pending VM recovery");
+        engine.on_event(Event::Lost);
+        assert!(engine.vm_restart_candidates().is_empty());
+        assert!(engine.lock().vm_recovery_at.is_none(), "no eligible containers means no automatic boot");
+        let mut spec = engine.lock().containers[&ids["always-live"]].spec.clone();
+        spec.auto_remove = true;
+        spec.restart.name = "no".into();
+        let failed = engine.create(Some("failed-auto-remove".into()), spec, &image).unwrap();
+        let waiting = engine.clone();
+        let waiting_id = failed.clone();
+        let (sent, received) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || sent.send(waiting.wait(&waiting_id, "removed")).unwrap());
+        assert!(matches!(engine.start(&failed), Err(Error::Io(_))));
+        assert!(engine.resolve(&failed).is_err(), "a failed boot must remove a --rm container and wake its waiter");
+        assert!(matches!(received.recv_timeout(Duration::from_secs(2)).unwrap(), Ok(127) | Err(Error::NotFound(_))));
+        waiter.join().unwrap();
+        drop(engine);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
 
