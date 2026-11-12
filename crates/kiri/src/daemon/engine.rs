@@ -509,6 +509,10 @@ pub struct Engine {
     /// Serialises writes of `containers.json`.
     saving: Mutex<()>,
     me: OnceLock<Weak<Engine>>,
+    /// Containers whose restart policy would have started them when the
+    /// daemon came up, held because Kiri was stopped (Start starts them) or
+    /// because the VM did not boot (`retry_held` tries it again).
+    held_restarts: Mutex<Vec<String>>,
     /// Memory ceiling and the balloon's current target, in bytes. The
     /// ceiling is read again at each boot, so Settings applies on restart.
     ceiling: std::sync::atomic::AtomicU64,
@@ -611,6 +615,7 @@ impl Engine {
             records,
             saving: Mutex::new(()),
             me: OnceLock::new(),
+            held_restarts: Mutex::new(Vec::new()),
             ceiling: std::sync::atomic::AtomicU64::new(ceiling),
             cpus: std::sync::atomic::AtomicUsize::new(vm_cpus()),
             memory_target: Mutex::new(ceiling),
@@ -936,6 +941,45 @@ impl Engine {
         if let Some(f) = stopped_marker() {
             let _ = std::fs::remove_file(f);
         }
+        // What the daemon would have restarted when it came up, had Kiri
+        // not been stopped then. Off this thread: the caller boots the VM.
+        if let Some(me) = self.me.get().and_then(Weak::upgrade) {
+            std::thread::spawn(move || me.start_held());
+        }
+    }
+
+    /// Starts the containers held since the daemon came up. Whoever calls
+    /// first takes them: Start, or `retry_held` once the VM boots.
+    fn start_held(&self) {
+        let held = std::mem::take(&mut *self.held_restarts.lock().unwrap_or_else(|e| e.into_inner()));
+        for id in held {
+            if let Err(e) = self.start_inner(&id, false) {
+                crate::diag::warn!("container did not restart", id = &id[..12], error = format!("{e:?}"));
+            }
+        }
+    }
+
+    /// The VM did not boot when the daemon came up, and containers wait for
+    /// it. Tries again after 10 s, then twice as long each time, up to every
+    /// 5 minutes: what launchd and systemd did by starting a daemon that
+    /// exited, without the exits. Ends when the containers have started, when
+    /// Start took them, or when Kiri is stopped (then Start starts them).
+    fn retry_held(&self) {
+        let Some(me) = self.me.get().and_then(Weak::upgrade) else { return };
+        std::thread::spawn(move || {
+            let mut delay = Duration::from_secs(10);
+            loop {
+                std::thread::sleep(delay);
+                let none = me.held_restarts.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
+                if none || me.is_stopped() || SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
+                    return;
+                }
+                if me.vm().is_ok() {
+                    return me.start_held();
+                }
+                delay = (delay * 2).min(Duration::from_secs(300));
+            }
+        });
     }
 
     pub fn is_stopped(&self) -> bool {
@@ -1050,8 +1094,18 @@ impl Engine {
             // starts asleep (Ready · Sleeping) and the first request boots
             // the VM in about 0.1 s. Every boot tells the guest which
             // stopped containers to keep (vm()).
-            if !restart.is_empty() {
-                self.vm()?;
+            if self.is_stopped() {
+                // Stopped (the window's Stop, kept across restarts): the
+                // daemon still comes up, so Start has something to talk to
+                // and launchd has nothing to start again and again.
+                *self.held_restarts.lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut restart);
+            } else if !restart.is_empty() && self.vm().is_err() {
+                // vm() has said why. The daemon stays up, since exiting only
+                // had launchd start one that failed the same way every 10 s;
+                // the containers wait and the VM is tried again (retry_held).
+                crate::diag::warn!("the VM did not boot: the containers that restart wait while it is tried again", containers = restart.len());
+                *self.held_restarts.lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut restart);
+                self.retry_held();
             }
         }
         for id in restart {
