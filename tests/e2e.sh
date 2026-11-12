@@ -118,6 +118,14 @@ t entrypoint-image "nginx version" $D run --rm nginx:alpine nginx -v
 t hostname-is-id "" $D run --rm alpine hostname
 t hostname-file "" $D run --rm alpine cat /etc/hostname
 t pid1 "1" $D run --rm alpine sh -c 'echo $$'
+t container-marker "regular empty file 755 0:0" $D run --rm alpine stat -c '%F %a %u:%g' /.dockerenv
+t container-marker-nonroot "marker-ok" $D run --rm -u 1000 alpine sh -c 'test -f /.dockerenv && test -r /.dockerenv && test ! -s /.dockerenv && echo marker-ok'
+t container-marker-readonly "marker-ok" $D run --rm --read-only alpine sh -c 'test -f /.dockerenv && test ! -s /.dockerenv && echo marker-ok'
+t container-marker-readonly-nonroot "marker-ok" $D run --rm --read-only -u 1000 alpine sh -c 'test -f /.dockerenv && test -r /.dockerenv && test ! -s /.dockerenv && echo marker-ok'
+# The second start finds the marker the first one made.
+t container-marker-restart "marker-ok" bash -c "$D run --name e2e-marker alpine sh -c 'test -f /.dockerenv && test ! -s /.dockerenv && echo marker-ok' >/dev/null && $D start -a e2e-marker; $D rm -f e2e-marker >/dev/null"
+# An image with a link there starts, and nothing is made where the link points.
+t container-marker-link "link-ok" bash -c "$D run --name e2e-marker alpine sh -c 'rm /.dockerenv && ln -s /outside/marker /.dockerenv' && $D commit e2e-marker kiri-test/marker-link >/dev/null && $D run --rm kiri-test/marker-link sh -c 'test ! -e /outside && echo link-ok'; $D rm -f e2e-marker >/dev/null; $D rmi kiri-test/marker-link >/dev/null"
 t proc "PID" $D run --rm alpine ps
 t dev-null "ok" $D run --rm alpine sh -c 'echo x > /dev/null && echo ok'
 t dev-null-nonroot "ok" $D run --rm -u 1000 alpine sh -c 'echo x > /dev/null && head -c 1 /dev/urandom >/dev/null && echo ok'
@@ -719,7 +727,20 @@ t diff-deleted "D /etc/motd" $D diff ren2
 t diff-changed "C /etc/profile" $D diff ren2
 t export "bin/busybox" bash -c "$D export ren2 | tar -t | grep -x bin/busybox"
 t export-has-change "added" bash -c "$D export ren2 | tar -t | grep -x added"
+# The marker is the engine's, not a change: exported with the rest, but in
+# neither the diff nor a committed layer.
+t diff-no-marker "marker lines: 0" bash -c "echo marker lines: \$($D diff ren2 | grep -c dockerenv)"
+t export-has-marker ".dockerenv" bash -c "$D export ren2 | tar -t | grep -Fx .dockerenv"
 t commit "sha256:" $D commit -c 'CMD ["cat","/added"]' -c 'ENV KIRI=1' ren2 kiri-test/committed:1
+t commit-no-marker "clean" bash -c "$D save kiri-test/committed:1 | python3 -c 'import io, sys, tarfile
+names = []
+image = tarfile.open(fileobj=io.BytesIO(sys.stdin.buffer.read()))
+for blob in filter(tarfile.TarInfo.isfile, image):
+    try:
+        names += tarfile.open(fileobj=image.extractfile(blob)).getnames()
+    except tarfile.TarError:
+        pass
+print(\"clean\" if \"added\" in names and not {\".dockerenv\", \"./.dockerenv\"} & set(names) else names)'"
 t commit-runs "hi" $D run --rm kiri-test/committed:1
 t commit-env "KIRI=1" $D run --rm kiri-test/committed:1 env
 t commit-whiteout "gone" bash -c "$D run --rm kiri-test/committed:1 sh -c 'test -e /etc/motd || echo gone'"

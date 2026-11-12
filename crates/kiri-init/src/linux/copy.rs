@@ -313,6 +313,13 @@ fn is_opaque(path: &std::path::Path) -> bool {
     n == 1 && v[0] == b'y'
 }
 
+/// The marker as the agent made it at start: not a change the container
+/// made, so Docker shows it in neither `docker diff` nor a committed layer.
+/// Once the container has written to it, it is a change like any other.
+fn is_marker(rel: &std::path::Path, m: &fs::Metadata) -> bool {
+    rel.as_os_str().as_encoded_bytes() == container::MARKER.to_bytes() && m.is_file() && m.len() == 0
+}
+
 /// `docker diff` and `docker commit`, from the writable layer.
 fn layer_job(conn: &mut fs::File, spec: &CopySpec<'_>, paths: &Paths) -> io::Result<()> {
     if spec.layers.is_empty() {
@@ -354,6 +361,9 @@ fn layer_job(conn: &mut fs::File, spec: &CopySpec<'_>, paths: &Paths) -> io::Res
         for e in names.into_iter().rev() {
             let r = rel.join(e.file_name());
             let Ok(m) = fs::symlink_metadata(e.path()) else { continue };
+            if is_marker(&r, &m) {
+                continue;
+            }
             if m.is_dir() {
                 stack.push(r.clone());
             }
