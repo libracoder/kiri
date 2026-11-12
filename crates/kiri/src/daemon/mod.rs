@@ -80,6 +80,21 @@ fn raise_open_files() {
 pub fn run(_args: &[String]) -> io::Result<()> {
     let t0 = Instant::now();
     raise_open_files();
+    // SIGINT/SIGTERM shut down cleanly: power the guest off, remove the socket.
+    // Blocked before anything else starts a thread, so every thread inherits
+    // it and one thread waits for them. A thread started before this (the
+    // socket group's watcher, on a Linux host) took the signal instead, and
+    // the daemon died without a shutdown: the agent was killed with its
+    // bridges and nftables table still in place.
+    // SAFETY: plain signal-mask calls on a local set.
+    let set = unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGINT);
+        libc::sigaddset(&mut set, libc::SIGTERM);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+        set
+    };
     let socket = socket_path()?;
     if UnixStream::connect(&socket).is_ok() {
         // Not an error: launchd (KeepAlive on failure) must not retry it.
@@ -113,18 +128,6 @@ pub fn run(_args: &[String]) -> io::Result<()> {
             Some(gate)
         }
         None => None,
-    };
-
-    // SIGINT/SIGTERM shut down cleanly: power the guest off, remove the socket.
-    // Blocked here so every thread inherits it; one thread waits for them.
-    // SAFETY: plain signal-mask calls on a local set.
-    let set = unsafe {
-        let mut set: libc::sigset_t = std::mem::zeroed();
-        libc::sigemptyset(&mut set);
-        libc::sigaddset(&mut set, libc::SIGINT);
-        libc::sigaddset(&mut set, libc::SIGTERM);
-        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
-        set
     };
 
     let store = kiri_image::Store::open(kiri_image::Store::default_root()?)?;
