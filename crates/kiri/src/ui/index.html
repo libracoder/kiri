@@ -175,6 +175,9 @@ nav .count { margin-inline-start: auto; font-size: var(--fs); color: var(--faint
 [data-vm=asleep] .dot { background: transparent; box-shadow: inset 0 0 0 2px var(--moss); }
 .vm-sub { color: var(--faint); font-size: var(--fs-small); margin-top: -6px; }
 .vm-head span:last-child { margin-inline-start: auto; font-weight: 500; color: var(--muted); font-size: var(--fs); }
+/* The engine's name stays on one line; a long state (Tamil's, in a wide font) gives way first. */
+#vm-name { white-space: nowrap; }
+#vm-state { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .vm dl { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 3px 10px; font-size: var(--fs); }
 .vm dt { color: var(--muted); }
 .vm dd .pct { color: var(--muted); font-size: var(--fs-small); font-variant-numeric: tabular-nums; }
@@ -762,8 +765,8 @@ tr[data-rowopen] .sel, .sel { cursor: text; -webkit-user-select: text; user-sele
 .choice .t { font-weight: 600; }
 .choice .d { color: var(--muted); font-size: var(--fs); }
 /* The language step: a header that says hello in the language picked, over a
-   faint cloud of the others, with Kiri's mark; then fifteen tiles, five
-   across, each its greeting in its own script over its name. On a short
+   faint cloud of the others, with Kiri's mark; then a tile for each
+   language, four across, each its greeting in its own script over its name. On a short
    window the tiles scroll and the header and Continue stay. */
 .dialog.langdlg { width: min(660px, calc(100% - 32px)); max-height: calc(100vh - 32px); padding: 0; gap: 0; overflow: hidden; grid-template-rows: auto minmax(0, 1fr) auto; }
 .langdlg .lhero { position: relative; overflow: hidden; padding: 20px 22px 18px; border-bottom: 1px solid var(--line);
@@ -2311,7 +2314,7 @@ function addWords(p) {
   for (const t of Object.keys(p)) if (t !== "en" && Array.isArray(p[t])) STRINGS[t] = Object.fromEntries(KEYS.flatMap((k, i) => (p[t][i] == null ? [] : [[k, RTL.test(t) ? rtlReady(p[t][i]) : p[t][i]]])));
 }
 /* Written right to left. */
-const RTL = /^ar/;
+const RTL = /^(ar|fa|ckb)$/;
 const rtl = () => document.documentElement.dir === "rtl";
 /* For a line the page joins itself (a Latin label, then Arabic words): the
    mark rtlReady puts before a sentence, and nothing left to right. */
@@ -2339,8 +2342,9 @@ function rtlReady(s) {
 }
 addWords(/*STRINGS*/{});
 /* The languages Settings offers, by their own names: English, then the Latin
-   alphabets, Cyrillic, Arabic, then Japanese, Korean and Chinese. */
-const LANGS = [["en", "English"], ["id", "Bahasa Indonesia"], ["de", "Deutsch"], ["es", "Español"], ["fr", "Français"], ["it", "Italiano"], ["pl", "Polski"], ["pt-BR", "Português (Brasil)"], ["vi", "Tiếng Việt"], ["tr", "Türkçe"], ["ru", "Русский"], ["ar", "العربية"], ["ja", "日本語"], ["ko", "한국어"], ["zh-Hans", "简体中文"], ["zh-Hant", "繁體中文"]];
+   alphabets, Greek, Cyrillic, the Arabic script, the Indian scripts, Thai and
+   Lao, then Japanese, Korean and Chinese. */
+const LANGS = [["en", "English"], ["id", "Bahasa Indonesia"], ["ca", "Català"], ["cs", "Čeština"], ["de", "Deutsch"], ["es", "Español"], ["fr", "Français"], ["it", "Italiano"], ["lt", "Lietuvių"], ["hu", "Magyar"], ["nb", "Norsk bokmål"], ["pl", "Polski"], ["pt-BR", "Português (Brasil)"], ["ro", "Română"], ["sq", "Shqip"], ["sl", "Slovenščina"], ["fi", "Suomi"], ["vi", "Tiếng Việt"], ["tr", "Türkçe"], ["el", "Ελληνικά"], ["bg", "Български"], ["ru", "Русский"], ["uk", "Українська"], ["kk", "Қазақша"], ["ar", "العربية"], ["fa", "فارسی"], ["ckb", "کوردیی ناوەندی"], ["hi", "हिन्दी"], ["bn", "বাংলা"], ["ta", "தமிழ்"], ["te", "తెలుగు"], ["th", "ไทย"], ["lo", "ລາວ"], ["ja", "日本語"], ["ko", "한국어"], ["zh-Hans", "简体中文"], ["zh-Hant", "繁體中文"]];
 /* The system's languages in order (the host passes them; a browser has its own). */
 const sysLangs = () => (window.KIRI_LANG?.os?.length ? window.KIRI_LANG.os : navigator.languages || [navigator.language || "en"]);
 /* A language tag to one Kiri has, as lang.rs's lang_for: Chinese written in
@@ -2354,6 +2358,8 @@ function langFor(tag) {
   if (is("zh")) return !t.startsWith("zh-hans") && (t.startsWith("zh-hant") || ["zh-tw", "zh-hk", "zh-mo"].some(is)) ? "zh-Hant" : "zh-Hans";
   if (is("pt")) return "pt-BR";
   if (is("in")) return "id";
+  if (is("no") || is("nn")) return "nb";
+  if (is("ku-arab")) return "ckb";
   return LANGS.find(([id]) => is(id.toLowerCase()))?.[0] || "";
 }
 function resolveLang(pick) {
@@ -2451,10 +2457,21 @@ const CJK_FONTS = {
    Windows, then Linux's Noto), so its letters don't fall to a serif or to a
    Chinese font's Latin. */
 const AR_FONTS = '"SF Arabic", "Geeza Pro", "Segoe UI", "Noto Sans Arabic", "Noto Naskh Arabic", ';
-const cjkFonts = () => (RTL.test(LANG) ? AR_FONTS : "") + (CJK_FONTS[LANG] || CJK_FONTS["zh-Hans"]);
+/* India's scripts, Thai and Lao the same way: macOS's faces for each script,
+   Windows' (Nirmala UI for India's, Leelawadee UI for Thai and Lao), then
+   Linux's Noto. */
+const SCRIPT_FONTS = {
+  hi: '"Kohinoor Devanagari", "Devanagari Sangam MN", "Nirmala UI", "Noto Sans Devanagari", ',
+  bn: '"Kohinoor Bangla", "Bangla Sangam MN", "Nirmala UI", "Noto Sans Bengali", ',
+  ta: '"Tamil Sangam MN", "InaiMathi", "Nirmala UI", "Noto Sans Tamil", ',
+  te: '"Kohinoor Telugu", "Telugu Sangam MN", "Nirmala UI", "Noto Sans Telugu", ',
+  th: '"Thonburi", "Leelawadee UI", "Noto Sans Thai", ',
+  lo: '"Lao Sangam MN", "Leelawadee UI", "Noto Sans Lao", ',
+};
+const cjkFonts = () => (RTL.test(LANG) ? AR_FONTS : "") + (SCRIPT_FONTS[LANG] || "") + (CJK_FONTS[LANG] || CJK_FONTS["zh-Hans"]);
 /* A word in a language of its own (the language step's tiles, Settings' list)
    in that language's fonts, whatever the window's language. */
-document.head.insertAdjacentHTML("beforeend", `<style>${Object.entries({ ...CJK_FONTS, ar: AR_FONTS }).map(([id, f]) => `[lang|=${id}]:not(html) { font-family: var(--ui-base), ${f}sans-serif; }`).join("\n")}</style>`);
+document.head.insertAdjacentHTML("beforeend", `<style>${Object.entries({ ...CJK_FONTS, ar: AR_FONTS, fa: AR_FONTS, ckb: AR_FONTS, ...SCRIPT_FONTS }).map(([id, f]) => `[lang|=${id}]:not(html) { font-family: var(--ui-base), ${f}sans-serif; }`).join("\n")}</style>`);
 /* A count's words: `one` or `other` by the language's own plural rule (French
    and Portuguese say "0 conteneur", English "0 containers"); {n} is the count
    unless vars say. */
@@ -3219,7 +3236,7 @@ function onbClick(ev) {
 /* The first start: which language, before anything else. Each tile is in its
    own language; the system's is picked and marked. A pick shows at once and is
    saved; Continue lets the welcome (or the build question) waiting behind it go. */
-const HELLO = { en: "Hello", id: "Halo", de: "Hallo", es: "Hola", fr: "Bonjour", it: "Ciao", pl: "Cześć", "pt-BR": "Olá", vi: "Xin chào", tr: "Merhaba", ru: "Привет", ar: "مرحبًا", ja: "こんにちは", ko: "안녕하세요", "zh-Hans": "你好", "zh-Hant": "你好" };
+const HELLO = { en: "Hello", id: "Halo", ca: "Hola", cs: "Ahoj", de: "Hallo", es: "Hola", fr: "Bonjour", it: "Ciao", lt: "Labas", hu: "Szia", nb: "Hei", pl: "Cześć", "pt-BR": "Olá", ro: "Salut", sq: "Përshëndetje", sl: "Živjo", fi: "Hei", vi: "Xin chào", tr: "Merhaba", el: "Γεια σου", bg: "Здравей", ru: "Привет", uk: "Привіт", kk: "Сәлем", ar: "مرحبًا", fa: "سلام", ckb: "سڵاو", hi: "नमस्ते", bn: "নমস্কার", ta: "வணக்கம்", te: "నమస్కారం", th: "สวัสดี", lo: "ສະບາຍດີ", ja: "こんにちは", ko: "안녕하세요", "zh-Hans": "你好", "zh-Hant": "你好" };
 /* The language step's header: every hello, faint and scattered (fixed places,
    so a redraw doesn't move them), and Kiri's mark with its own gradient ids. */
 const LANG_CLOUD = Object.values(HELLO).concat(Object.values(HELLO)).slice(0, 22).map((w, i) =>

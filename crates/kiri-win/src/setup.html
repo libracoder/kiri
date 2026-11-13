@@ -27,6 +27,9 @@
 [lang|=ja]{--f-text:"Segoe UI Variable Text","Segoe UI","Yu Gothic UI","Meiryo UI",sans-serif;--f-display:"Segoe UI Variable Display","Segoe UI","Yu Gothic UI","Meiryo UI",sans-serif}
 [lang|=ko]{--f-text:"Segoe UI Variable Text","Segoe UI","Malgun Gothic",sans-serif;--f-display:"Segoe UI Variable Display","Segoe UI","Malgun Gothic",sans-serif}
 [lang|=ko]{word-break:keep-all}
+/* India's scripts in Nirmala UI, Windows' face for them; Thai and Lao in Leelawadee UI. */
+[lang|=th],[lang|=lo]{--f-text:"Segoe UI Variable Text","Segoe UI","Leelawadee UI",sans-serif;--f-display:"Segoe UI Variable Display","Segoe UI","Leelawadee UI",sans-serif}
+[lang|=hi],[lang|=bn],[lang|=ta],[lang|=te]{--f-text:"Segoe UI Variable Text","Segoe UI","Nirmala UI",sans-serif;--f-display:"Segoe UI Variable Display","Segoe UI","Nirmala UI",sans-serif}
 *{box-sizing:border-box}
 html,body{margin:0;height:100%;background:var(--bg)}
 body{color:var(--ink);font:15px/1.4 var(--f-text);overflow:hidden;-webkit-font-smoothing:antialiased}
@@ -79,10 +82,11 @@ h1.l{font-size:36px}
 .card.tight{gap:18px}
 .foot{display:flex;align-items:center;justify-content:flex-end;gap:12px;margin-top:auto;padding-top:4px}
 /* The language step: a header that says hello in the language picked, over a
-   faint cloud of the others; then sixteen tiles, four across, each its
-   greeting in its own script over its name. A short window scrolls them under
-   the header, with Continue kept in view (main.choose's foot). */
-.lhead{position:relative;overflow:hidden;max-width:720px;padding:22px 24px 20px;border-radius:16px;border:1px solid var(--line);
+   faint cloud of the others; then a tile for each language, four across, each its
+   greeting in its own script over its name. The page scrolls; neither the header nor
+   the tiles shrink to fit (37 tiles would crush the header), and Continue stays
+   in view (main.choose's foot). */
+.lhead{position:relative;overflow:hidden;flex:none;max-width:720px;padding:22px 24px 20px;border-radius:16px;border:1px solid var(--line);
   background:radial-gradient(120% 140% at 0% 0%,color-mix(in srgb,var(--ember) 16%,transparent),transparent 55%),radial-gradient(120% 140% at 100% 100%,rgba(59,130,246,.16),transparent 60%),var(--rail)}
 .lcloud{position:absolute;inset:0;pointer-events:none;opacity:.06}
 .lcloud span{position:absolute;white-space:nowrap;font:700 1em var(--f-display);color:var(--ink)}
@@ -91,7 +95,7 @@ h1.l{font-size:36px}
 @media (prefers-reduced-motion:reduce){.lhello{animation:none}}
 .lhead h1{position:relative;margin-top:6px;font:600 20px/1.25 var(--f-display);color:var(--ink)}
 .lhead .lede{position:relative;margin-top:4px}
-.langs{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;max-width:720px}
+.langs{display:grid;flex:none;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;max-width:720px}
 .lang{position:relative;display:flex;flex-direction:column;align-items:flex-start;justify-content:space-between;gap:4px;padding:10px 12px 9px;min-height:70px;border-radius:12px;background:var(--surface);border:2px solid var(--line);color:var(--text-2);font:inherit;font-family:var(--f-text);text-align:left;cursor:pointer;transition:border-color .15s,transform .15s}
 .lang:hover{border-color:var(--stroke);transform:translateY(-1px)}
 .lang b{font:650 18px/1.2 var(--f-display);color:var(--ink);overflow-wrap:anywhere}
@@ -281,7 +285,7 @@ function addWords(p) {
    sentence that opens with a Latin name gets a right-to-left mark in front
    (every element takes its first letter's direction), and each value filled
    into Arabic words is an island that keeps its own order. */
-var RTL = /^ar/, RTL_CH = /[\u0590-\u08FF\uFB1D-\uFDFF\uFE70-\uFEFC]/, STRONG_CH = /[A-Za-z\u00C0-\u024F\u0590-\u08FF\uFB1D-\uFDFF\uFE70-\uFEFC]/;
+var RTL = /^(ar|fa|ckb)$/, RTL_CH = /[\u0590-\u08FF\uFB1D-\uFDFF\uFE70-\uFEFC]/, STRONG_CH = /[A-Za-z\u00C0-\u024F\u0590-\u08FF\uFB1D-\uFDFF\uFE70-\uFEFC]/;
 function rtlReady(s) {
   if (!RTL_CH.test(s)) return s;
   /* The sentence's own first letter: a {placeholder}'s name and a tag's aren't its words, so they are stepped over. */
@@ -295,13 +299,15 @@ addWords(/*STRINGS*/{});
 /* As the main window's langFor: the first of the system's languages Kiri has
    (zh-TW, zh-HK, zh-MO and zh-Hant… read Traditional Chinese, any other Chinese
    Simplified, any Portuguese Brazilian, "in" Indonesian), else English. */
-var LANG_IDS = ['en', 'id', 'de', 'es', 'fr', 'it', 'pl', 'pt-BR', 'vi', 'tr', 'ru', 'ar', 'ja', 'ko', 'zh-Hans', 'zh-Hant'];
+var LANG_IDS = ['en', 'id', 'ca', 'cs', 'de', 'es', 'fr', 'it', 'lt', 'hu', 'nb', 'pl', 'pt-BR', 'ro', 'sq', 'sl', 'fi', 'vi', 'tr', 'el', 'bg', 'ru', 'uk', 'kk', 'ar', 'fa', 'ckb', 'hi', 'bn', 'ta', 'te', 'th', 'lo', 'ja', 'ko', 'zh-Hans', 'zh-Hant'];
 function langFor(tag) {
   var t = String(tag || '').toLowerCase().replace(/_/g, '-');
   var is = function (id) { return t === id || t.indexOf(id + '-') === 0; };
   if (is('zh')) return t.indexOf('zh-hans') !== 0 && (t.indexOf('zh-hant') === 0 || is('zh-tw') || is('zh-hk') || is('zh-mo')) ? 'zh-Hant' : 'zh-Hans';
   if (is('pt')) return 'pt-BR';
   if (is('in')) return 'id';
+  if (is('no') || is('nn')) return 'nb';
+  if (is('ku-arab')) return 'ckb';
   for (var j = 0; j < LANG_IDS.length; j++) if (is(LANG_IDS[j].toLowerCase())) return LANG_IDS[j];
   return '';
 }
@@ -444,9 +450,14 @@ function trn(n, one, other, vars) { var s = isOne(n) ? one : other, v = { n: n }
   /* ---------- screens (structure; live values are filled by update()) ---------- */
   /* The first start: the language, before Welcome. Each tile in its own
      language, the system's picked and marked; a pick redraws the page at once. */
-  var LANGS = [['en', 'English', 'Hello'], ['id', 'Bahasa Indonesia', 'Halo'], ['de', 'Deutsch', 'Hallo'], ['es', 'Español', 'Hola'], ['fr', 'Français', 'Bonjour'],
-    ['it', 'Italiano', 'Ciao'], ['pl', 'Polski', 'Cześć'], ['pt-BR', 'Português (Brasil)', 'Olá'], ['vi', 'Tiếng Việt', 'Xin chào'], ['tr', 'Türkçe', 'Merhaba'],
-    ['ru', 'Русский', 'Привет'], ['ar', 'العربية', 'مرحبًا'], ['ja', '日本語', 'こんにちは'], ['ko', '한국어', '안녕하세요'], ['zh-Hans', '简体中文', '你好'], ['zh-Hant', '繁體中文', '你好']];
+  var LANGS = [['en', 'English', 'Hello'], ['id', 'Bahasa Indonesia', 'Halo'], ['ca', 'Català', 'Hola'], ['cs', 'Čeština', 'Ahoj'], ['de', 'Deutsch', 'Hallo'],
+    ['es', 'Español', 'Hola'], ['fr', 'Français', 'Bonjour'], ['it', 'Italiano', 'Ciao'], ['lt', 'Lietuvių', 'Labas'], ['hu', 'Magyar', 'Szia'],
+    ['nb', 'Norsk bokmål', 'Hei'], ['pl', 'Polski', 'Cześć'], ['pt-BR', 'Português (Brasil)', 'Olá'], ['ro', 'Română', 'Salut'], ['sq', 'Shqip', 'Përshëndetje'],
+    ['sl', 'Slovenščina', 'Živjo'], ['fi', 'Suomi', 'Hei'], ['vi', 'Tiếng Việt', 'Xin chào'], ['tr', 'Türkçe', 'Merhaba'], ['el', 'Ελληνικά', 'Γεια σου'],
+    ['bg', 'Български', 'Здравей'], ['ru', 'Русский', 'Привет'], ['uk', 'Українська', 'Привіт'], ['kk', 'Қазақша', 'Сәлем'], ['ar', 'العربية', 'مرحبًا'],
+    ['fa', 'فارسی', 'سلام'], ['ckb', 'کوردیی ناوەندی', 'سڵاو'], ['hi', 'हिन्दी', 'नमस्ते'], ['bn', 'বাংলা', 'নমস্কার'], ['ta', 'தமிழ்', 'வணக்கம்'],
+    ['te', 'తెలుగు', 'నమస్కారం'], ['th', 'ไทย', 'สวัสดี'], ['lo', 'ລາວ', 'ສະບາຍດີ'], ['ja', '日本語', 'こんにちは'], ['ko', '한국어', '안녕하세요'],
+    ['zh-Hans', '简体中文', '你好'], ['zh-Hant', '繁體中文', '你好']];
   var langDone = false, sysLang = langId('system');
   // Every hello, faint and scattered behind the header, in fixed places.
   var LANG_CLOUD = LANGS.concat(LANGS).slice(0, 22).map(function (l, i) {

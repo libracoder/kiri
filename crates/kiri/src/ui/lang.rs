@@ -5,37 +5,59 @@
 //! the English keys and the one language it opens in ([`strings_js`]), with
 //! the system's languages and the saved pick from [`boot_js`]. A language the
 //! page doesn't have yet it asks for (`langwords`), and the host answers with
-//! [`words_js`]: fifteen languages in the page would pass WebView2's limit
+//! [`words_js`]: every language in the page would pass WebView2's limit
 //! (assemble.rs). The few words drawn natively (the Mac's menus, the Windows
 //! tray menu) come from [`tr`], out of the same files, all compiled in.
 //! English is the key, so a word missing from a file stays English. The Mac
 //! and Linux window and kiri-win (by `#[path]`) share this file.
 //!
-//! Arabic reads right to left ([`rtl`]). The page mirrors itself; the words
-//! drawn or sent from here are made ready for it by [`tr`] and [`fill`], so a
-//! name or a size keeps its own order inside an Arabic sentence.
+//! Arabic, Persian and Central Kurdish read right to left ([`rtl`]). The page
+//! mirrors itself; the words drawn or sent from here are made ready for it by
+//! [`tr`] and [`fill`], so a name or a size keeps its own order inside a
+//! right-to-left sentence.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
 /// Every translation Kiri ships, by language tag, as lang/<tag>.json maps
 /// English to it. English itself has no file.
-pub const FILES: [(&str, &str); 15] = [
-    ("zh-Hans", include_str!("lang/zh-Hans.json")),
-    ("zh-Hant", include_str!("lang/zh-Hant.json")),
+pub const FILES: [(&str, &str); 36] = [
+    ("id", include_str!("lang/id.json")),
+    ("ca", include_str!("lang/ca.json")),
+    ("cs", include_str!("lang/cs.json")),
     ("de", include_str!("lang/de.json")),
     ("es", include_str!("lang/es.json")),
     ("fr", include_str!("lang/fr.json")),
-    ("pt-BR", include_str!("lang/pt-BR.json")),
     ("it", include_str!("lang/it.json")),
+    ("lt", include_str!("lang/lt.json")),
+    ("hu", include_str!("lang/hu.json")),
+    ("nb", include_str!("lang/nb.json")),
     ("pl", include_str!("lang/pl.json")),
-    ("ru", include_str!("lang/ru.json")),
-    ("ar", include_str!("lang/ar.json")),
+    ("pt-BR", include_str!("lang/pt-BR.json")),
+    ("ro", include_str!("lang/ro.json")),
+    ("sq", include_str!("lang/sq.json")),
+    ("sl", include_str!("lang/sl.json")),
+    ("fi", include_str!("lang/fi.json")),
+    ("vi", include_str!("lang/vi.json")),
     ("tr", include_str!("lang/tr.json")),
+    ("el", include_str!("lang/el.json")),
+    ("bg", include_str!("lang/bg.json")),
+    ("ru", include_str!("lang/ru.json")),
+    ("uk", include_str!("lang/uk.json")),
+    ("kk", include_str!("lang/kk.json")),
+    ("ar", include_str!("lang/ar.json")),
+    ("fa", include_str!("lang/fa.json")),
+    ("ckb", include_str!("lang/ckb.json")),
+    ("hi", include_str!("lang/hi.json")),
+    ("bn", include_str!("lang/bn.json")),
+    ("ta", include_str!("lang/ta.json")),
+    ("te", include_str!("lang/te.json")),
+    ("th", include_str!("lang/th.json")),
+    ("lo", include_str!("lang/lo.json")),
     ("ja", include_str!("lang/ja.json")),
     ("ko", include_str!("lang/ko.json")),
-    ("vi", include_str!("lang/vi.json")),
-    ("id", include_str!("lang/id.json")),
+    ("zh-Hans", include_str!("lang/zh-Hans.json")),
+    ("zh-Hant", include_str!("lang/zh-Hant.json")),
 ];
 
 /// Every English key of every file, in one order (the pages line each
@@ -84,7 +106,9 @@ fn maps() -> &'static HashMap<&'static str, HashMap<String, String>> {
 /// A language tag to one Kiri has, as the pages' `langFor` does: Chinese
 /// written in Taiwan, Hong Kong and Macao (zh-TW, zh-HK, zh-MO, zh-Hant…)
 /// reads Traditional, any other Chinese Simplified; any Portuguese reads
-/// Brazilian; `in` is Indonesian's old tag (Java, older Android).
+/// Brazilian; `in` is Indonesian's old tag (Java, older Android); any
+/// Norwegian (no, nn) reads Bokmål; Kurdish in Arabic letters (Windows'
+/// ku-Arab) is Central Kurdish.
 fn lang_for(tag: &str) -> Option<&'static str> {
     let t = tag.to_ascii_lowercase().replace('_', "-");
     let is = |id: &str| t == id || t.starts_with(&format!("{id}-"));
@@ -97,6 +121,12 @@ fn lang_for(tag: &str) -> Option<&'static str> {
     }
     if is("in") {
         return Some("id");
+    }
+    if is("no") || is("nn") {
+        return Some("nb");
+    }
+    if is("ku-arab") {
+        return Some("ckb");
     }
     if is("en") {
         return Some("en");
@@ -138,7 +168,7 @@ pub fn boot_js(pick: Option<&str>) -> String {
 
 /// Whether the language `tag` (one of [`FILES`]' or "en") is written right to left.
 pub fn rtl(tag: &str) -> bool {
-    tag == "ar"
+    matches!(tag, "ar" | "fa" | "ckb")
 }
 
 /// A letter of a right-to-left script (Hebrew, Arabic and their presentation forms).
@@ -343,11 +373,45 @@ mod tests {
             ("pl-PL", Some("pl")),
             ("ru-RU", Some("ru")),
             ("ru", Some("ru")),
+            ("uk", Some("uk")),
+            ("uk-UA", Some("uk")),
+            ("uk_UA", Some("uk")),
             ("ar", Some("ar")),
             ("ar-SA", Some("ar")),
             ("ar-EG", Some("ar")),
             ("ar_AE", Some("ar")),
             ("arz", None),
+            ("hi", Some("hi")),
+            ("hi-IN", Some("hi")),
+            ("bn-IN", Some("bn")),
+            ("bn-BD", Some("bn")),
+            ("ta-IN", Some("ta")),
+            ("ta-LK", Some("ta")),
+            ("ta_IN", Some("ta")),
+            ("ca-ES", Some("ca")),
+            ("cs-CZ", Some("cs")),
+            ("lt-LT", Some("lt")),
+            ("hu-HU", Some("hu")),
+            ("nb-NO", Some("nb")),
+            ("no", Some("nb")),
+            ("nn-NO", Some("nb")),
+            ("ro-RO", Some("ro")),
+            ("sq-AL", Some("sq")),
+            ("sl-SI", Some("sl")),
+            ("fi-FI", Some("fi")),
+            ("el-GR", Some("el")),
+            ("bg-BG", Some("bg")),
+            ("kk-KZ", Some("kk")),
+            ("fa-IR", Some("fa")),
+            ("fa", Some("fa")),
+            ("ckb", Some("ckb")),
+            ("ckb-IQ", Some("ckb")),
+            ("ku-Arab-IQ", Some("ckb")),
+            ("ku", None),
+            ("ku-TR", None),
+            ("te-IN", Some("te")),
+            ("th-TH", Some("th")),
+            ("lo-LA", Some("lo")),
             ("tr-TR", Some("tr")),
             ("ja", Some("ja")),
             ("ja-JP", Some("ja")),
@@ -426,7 +490,7 @@ mod tests {
     fn right_to_left_words_keep_names_and_sizes_whole() {
         assert!(rtl("ar"));
         for (tag, _) in FILES {
-            assert_eq!(rtl(tag), tag == "ar", "{tag}");
+            assert_eq!(rtl(tag), ["ar", "fa", "ckb"].contains(&tag), "{tag}");
         }
         assert!(!rtl("en"));
         // Arabic first: nothing to add. A Latin name first: a right-to-left mark in front.

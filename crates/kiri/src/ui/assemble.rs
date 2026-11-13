@@ -12,8 +12,8 @@
 //!
 //! The page is loaded as a string, and WebView2's NavigateToString takes at
 //! most 2 MB. With xterm.js and the keys it is about 1.4 M UTF-16 units, and
-//! a language adds its words: 40 to 60 K units. All fifteen would be about
-//! 2.2 M, past the limit, which is why the page carries only one.
+//! a language adds its words: 40 to 60 K units. All of them would be well
+//! past the limit, which is why the page carries only one.
 
 const ICONS_JS: &str = include_str!("icons.js");
 const XTERM_CSS: &str = include_str!("xterm/xterm.css");

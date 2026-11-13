@@ -1,4 +1,4 @@
-// The first start's language step: sixteen tiles, each in its own language, the
+// The first start's language step: a tile for each language, each in its own language, the
 // system's marked; a tile switches the whole window at once and is saved
 // ("system" for the system's own); Continue (or Escape) saves that it was
 // asked, and the welcome that arrived meanwhile waits until then.
@@ -12,20 +12,20 @@ const saved = (name) => sent.filter((m) => m.type === "setpref" && m.name === na
 const rail = () => document.querySelector("nav [data-view=containers] .lbl").textContent;
 
 kiri.on({ type: "langpick" });
-t("a langpick event opens the language step with sixteen tiles", () => {
+t("a langpick event opens the language step with a tile for each of the 37 languages", () => {
   if (!dlg()) throw new Error("no dialog");
   const ids = tilesNow().map((b) => b.dataset.lang).join(" ");
-  if (ids !== "en id de es fr it pl pt-BR vi tr ru ar ja ko zh-Hans zh-Hant") throw new Error("tiles: " + ids);
+  if (ids !== "en id ca cs de es fr it lt hu nb pl pt-BR ro sq sl fi vi tr el bg ru uk kk ar fa ckb hi bn ta te th lo ja ko zh-Hans zh-Hant") throw new Error("tiles: " + ids);
 });
-t("four across, four down", () => {
+t("four across, ten down", () => {
   const tops = new Set(tilesNow().map((b) => Math.round(b.getBoundingClientRect().top)));
   const lefts = new Set(tilesNow().map((b) => Math.round(b.getBoundingClientRect().left)));
-  if (lefts.size !== 4 || tops.size !== 4) throw new Error(`${lefts.size} columns, ${tops.size} rows`);
+  if (lefts.size !== 4 || tops.size !== 10) throw new Error(`${lefts.size} columns, ${tops.size} rows`);
 });
 t("each tile is in its own language, with its own Hello", () => {
   if (pickTile("de").getAttribute("lang") !== "de" || !pickTile("de").textContent.includes("Deutsch") || !pickTile("de").textContent.includes("Hallo")) throw new Error(pickTile("de").textContent);
   if (!pickTile("zh-Hans").textContent.includes("简体中文") || !pickTile("zh-Hans").textContent.includes("你好")) throw new Error(pickTile("zh-Hans").textContent);
-  for (const [id, name, hello] of [["ja", "日本語", "こんにちは"], ["ko", "한국어", "안녕하세요"], ["zh-Hant", "繁體中文", "你好"], ["ru", "Русский", "Привет"], ["ar", "العربية", "مرحبًا"], ["vi", "Tiếng Việt", "Xin chào"], ["id", "Bahasa Indonesia", "Halo"]])
+  for (const [id, name, hello] of [["ja", "日本語", "こんにちは"], ["ko", "한국어", "안녕하세요"], ["zh-Hant", "繁體中文", "你好"], ["ru", "Русский", "Привет"], ["uk", "Українська", "Привіт"], ["hi", "हिन्दी", "नमस्ते"], ["fa", "فارسی", "سلام"], ["ckb", "کوردیی ناوەندی", "سڵاو"], ["el", "Ελληνικά", "Γεια σου"], ["kk", "Қазақша", "Сәлем"], ["te", "తెలుగు", "నమస్కారం"], ["th", "ไทย", "สวัสดี"], ["lo", "ລາວ", "ສະບາຍດີ"], ["nb", "Norsk bokmål", "Hei"], ["bn", "বাংলা", "নমস্কার"], ["ta", "தமிழ்", "வணக்கம்"], ["ar", "العربية", "مرحبًا"], ["vi", "Tiếng Việt", "Xin chào"], ["id", "Bahasa Indonesia", "Halo"]])
     if (pickTile(id).getAttribute("lang") !== id || !pickTile(id).textContent.includes(name) || !pickTile(id).textContent.includes(hello)) throw new Error(pickTile(id).textContent);
 });
 t("the system's language is marked and picked", () => {
