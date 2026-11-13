@@ -10,3 +10,15 @@ allow = [
   "Unlicense",
   "Zlib",
 ]
+
+# RUSTSEC advisories: a known vulnerability or a yanked release fails the
+# check; a crate unmaintained upstream warns. Run with `cargo deny check`.
+[advisories]
+vulnerability = "deny"
+unmaintained = "warn"
+yanked = "deny"
+
+# Duplicate dependencies cost compile time and can drift versions apart;
+# warn until the tree is clean enough to raise to "deny".
+[bans]
+multiple-versions = "warn"
