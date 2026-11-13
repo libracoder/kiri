@@ -33,6 +33,7 @@ pub fn serve(stream: UnixStream, engine: Arc<Engine>) -> io::Result<()> {
             engine.touch();
         }
         match route(&req, &engine, &mut w, &mut r) {
+            Ok(Next::KeepAlive) if req.wants_close() => return Ok(()),
             Ok(Next::KeepAlive) => {}
             Ok(Next::Close) => return Ok(()),
             Err(e) => {
@@ -1270,6 +1271,22 @@ fn console_size(v: &Value) -> Option<(u16, u16)> {
     (h > 0 && w > 0).then_some((h, w))
 }
 
+/// Entrypoint and Cmd of a new container, by Docker's rules (moby's
+/// `daemon/create.go`, `merge`): an empty Cmd counts as none, so `"Cmd": []`
+/// takes the image's Cmd like a missing one does (Testcontainers sends `[]`
+/// for its Ryuk container). Only a non-empty Entrypoint drops the image's
+/// Cmd; a missing one keeps the image's Entrypoint, an empty one clears it.
+fn command(entrypoint: Option<Vec<String>>, cmd: Option<Vec<String>>, image_entrypoint: &[String], image_cmd: &[String]) -> (Vec<String>, Vec<String>) {
+    let cmd = cmd.unwrap_or_default();
+    match entrypoint {
+        Some(e) if !e.is_empty() => (e, cmd),
+        e => {
+            let cmd = if cmd.is_empty() { image_cmd.to_vec() } else { cmd };
+            (e.unwrap_or_else(|| image_entrypoint.to_vec()), cmd)
+        }
+    }
+}
+
 fn strings(v: &Value) -> Option<Vec<String>> {
     match v {
         Value::Array(a) => Some(a.iter().filter_map(|s| s.as_str().map(str::to_owned)).collect()),
@@ -1446,11 +1463,7 @@ pub(super) fn create(req: &Request, engine: &Engine) -> Result<Value, Error> {
     if !ports.is_empty() && network_mode == "none" {
         return Err(Error::BadRequest("a container with --network none cannot publish ports".into()));
     }
-    // Docker's rules: an explicit Entrypoint drops the image's Cmd; an
-    // explicit Cmd replaces the image's Cmd but keeps its Entrypoint.
-    let entry_override = strings(&body["Entrypoint"]);
-    let entrypoint = entry_override.clone().unwrap_or_else(|| image.config.entrypoint.clone());
-    let cmd = strings(&body["Cmd"]).unwrap_or_else(|| if entry_override.is_some() { Vec::new() } else { image.config.cmd.clone() });
+    let (entrypoint, cmd) = command(strings(&body["Entrypoint"]), strings(&body["Cmd"]), &image.config.entrypoint, &image.config.cmd);
     let mut env = image.config.env.clone();
     // Settings → Network → "Pass to containers": the proxy, unless set here.
     let given = strings(&body["Env"]).unwrap_or_default();
@@ -2615,6 +2628,42 @@ mod tests {
     #[test]
     fn vm_platforms_report_the_guest_kernel() {
         assert_eq!(version()["KernelVersion"], GUEST_KERNEL);
+    }
+
+    fn v(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    /// Testcontainers creates Ryuk with `"Cmd": []` and no Entrypoint; Docker
+    /// runs the image's Cmd then, so must Kiri.
+    #[test]
+    fn an_empty_cmd_takes_the_images_cmd() {
+        let (entrypoint, cmd) = command(None, Some(Vec::new()), &[], &v(&["/bin/ryuk"]));
+        assert_eq!((entrypoint, cmd), (Vec::new(), v(&["/bin/ryuk"])));
+    }
+
+    #[test]
+    fn a_missing_cmd_takes_the_images_cmd_and_entrypoint() {
+        let (entrypoint, cmd) = command(None, None, &v(&["docker-entrypoint.sh"]), &v(&["postgres"]));
+        assert_eq!((entrypoint, cmd), (v(&["docker-entrypoint.sh"]), v(&["postgres"])));
+    }
+
+    #[test]
+    fn a_given_cmd_replaces_the_images_cmd_and_keeps_its_entrypoint() {
+        let (entrypoint, cmd) = command(None, Some(v(&["postgres", "-c", "fsync=off"])), &v(&["docker-entrypoint.sh"]), &v(&["postgres"]));
+        assert_eq!((entrypoint, cmd), (v(&["docker-entrypoint.sh"]), v(&["postgres", "-c", "fsync=off"])));
+    }
+
+    #[test]
+    fn a_given_entrypoint_drops_the_images_cmd() {
+        let (entrypoint, cmd) = command(Some(v(&["/bin/sh"])), None, &v(&["docker-entrypoint.sh"]), &v(&["postgres"]));
+        assert_eq!((entrypoint, cmd), (v(&["/bin/sh"]), Vec::new()));
+    }
+
+    #[test]
+    fn an_empty_entrypoint_clears_the_images_entrypoint_but_keeps_its_cmd() {
+        let (entrypoint, cmd) = command(Some(Vec::new()), None, &v(&["docker-entrypoint.sh"]), &v(&["postgres"]));
+        assert_eq!((entrypoint, cmd), (Vec::new(), v(&["postgres"])));
     }
 
     #[test]
