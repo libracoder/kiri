@@ -1180,6 +1180,12 @@ fn finish_child(p: &Prepared, io: &ChildStdio, console: bool) -> ! {
         ChildStdio::Pipes { stdin, stdout, stderr } => {
             // SAFETY: plain descriptor operations on descriptors we own.
             unsafe {
+                // A session of its own, as runc gives every container and
+                // exec. Otherwise it stays in the agent's process group, which
+                // on a Linux host is the daemon's too: Apache's prefork stop
+                // (killpg(getpgrp(), SIGTERM)) then reached `kiri daemon`, and
+                // systemd took the whole engine down with it (#191).
+                libc::setsid();
                 let input = match stdin {
                     Some(fd) => fd.as_raw_fd(),
                     None => libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY),

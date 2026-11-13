@@ -184,6 +184,11 @@ t exec-workdir "/etc" $D exec -w /etc web pwd
 t exec-stdin "into exec" bash -c "echo 'into exec' | $D exec -i web cat"
 t exec-tty "/dev/pts" bash -c "script -q /dev/null $D exec -it web tty < /dev/null"
 t exec-sees-pid1 "nginx" $D exec web sh -c 'cat /proc/1/comm'
+# Each container and each exec leads a session of its own, as with runc, so a
+# program that signals its whole process group (Apache prefork's stop does)
+# can't reach the engine's own processes (#191).
+t session-own "SID=1" $D run --rm alpine sh -c 'echo SID=$(cut -d" " -f6 /proc/1/stat)'
+t exec-session-own "own" $D exec web sh -c 's=$(cut -d" " -f6 /proc/$$/stat); [ "$s" = "$$" ] && echo own || echo "session $s, pid $$"'
 t exec-same-fs "shared" bash -c "$D exec web sh -c 'echo shared > /tmp/x' && $D exec web cat /tmp/x"
 t stop "web" $D stop web
 t stopped-status "Exited" $D ps -a --format '{{.Status}}' --filter name=web
