@@ -577,7 +577,8 @@ define_class!(
 
         #[unsafe(method(toggleVm:))]
         fn toggle_vm(&self, _sender: Option<&AnyObject>) {
-            let running = menu_state().vm == "Running";
+            // Asleep is on (the next docker command wakes it): its switch is Stop, as in the window.
+            let running = matches!(menu_state().vm, "Running" | "Asleep");
             let _ = self.ivars().tx.send(if running { Cmd::Stop } else { Cmd::Start });
         }
 
@@ -646,7 +647,7 @@ impl AppDelegate {
         menu.addItem(&NSMenuItem::separatorItem(mtm));
         add(&tr("Open Kiri"), Some(sel!(openWindow:)), "o", 0);
         add(&tr("Settings…"), Some(sel!(openSettings:)), ",", 0);
-        add(&if state.vm == "Running" { tr("Stop Linux VM") } else { tr("Start Linux VM") }, Some(sel!(toggleVm:)), "", 0);
+        add(&if matches!(state.vm, "Running" | "Asleep") { tr("Stop Linux VM") } else { tr("Start Linux VM") }, Some(sel!(toggleVm:)), "", 0);
         menu.addItem(&NSMenuItem::separatorItem(mtm));
         // SAFETY: standard menu item construction; terminate: goes to the app.
         let quit = unsafe { NSMenuItem::initWithTitle_action_keyEquivalent(NSMenuItem::alloc(mtm), &NSString::from_str(&tr("Quit Kiri")), Some(sel!(terminate:)), &NSString::from_str("q")) };

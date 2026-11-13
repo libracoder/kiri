@@ -3935,7 +3935,7 @@ function renderEmpty(view) {
   const action = view === "stopped" ? `<button class="btn primary" id="empty-start">${tr("Start Kiri")}</button>` : "";
   $("content").innerHTML = `<div class="empty"><div><svg class="i art" viewBox="0 0 256 256"><path d="${PH[e.art]}"/></svg>
     <h3>${tr(e.title)}</h3><p>${tr(e.body, e.vars)}</p>${action}</div></div>`;
-  $("empty-start")?.addEventListener("click", () => send("start"));
+  $("empty-start")?.addEventListener("click", (ev) => { ev.currentTarget.disabled = true; powerEngine("start"); });
 }
 
 /* A column given a sort key ([label, class, key]) sorts on click, and again
@@ -5425,54 +5425,40 @@ function setVm(state, error) {
     const was = ui.vm;
     ui.vm = state;
     // Booting from asleep is waking (milliseconds); from stopped, starting.
-    ui.vmLook = state === "booting" && was === "asleep" ? "waking" : state;
+    ui.vmLook = state === "booting" && (was === "asleep" || was === "running") ? "waking" : state;
     renderStatus();
     paintEngine();
     if (ui.view === "settings" && prefs.tab === "resources") render();
-    if (state !== "running") ["vm-mem"].forEach((id) => ($(id).textContent = "—")), ($("vm-meter").style.width = "0");
+    // Asleep, the VM holds no memory and the vm event says so (0 MB); off, there's nothing to read.
+    if (state === "stopped" || state === "stopping") ["vm-mem"].forEach((id) => ($(id).textContent = "—")), ($("vm-meter").style.width = "0");
     if (state === "stopped" || was === "stopped") render();
   }
   if (error) toast("error", error);
 }
-/* Your running containers: Kiri's own (its builder, Run's look at an image)
-   are already left out of ui.containers. */
-const mineRunning = () => ui.containers.filter((c) => c.State === "running").length;
-/* The Engine card is your switch: Running after you press Start, Off after
-   you press Stop, whatever the engine does inside (setting up, fetching
-   BuildKit, sleeping, waking). A fresh Kiri reads Off until you press Start.
-   A container of yours running (say docker run in a terminal) turns it on.
-   Kept in ~/.kiri/ui.json as engineOn; a Kiri from before that has
-   containers counts as on. */
-function engineOn() {
-  if (ui.vm === "stopped") return false;
-  if (mineRunning()) return true;
-  if (typeof prefs.engineOn === "boolean") return prefs.engineOn;
-  return ui.containers.length > 0;
-}
-function setEngineOn(v) {
-  if (prefs.engineOn === v) return;
-  prefs.engineOn = v;
-  send("setpref", { name: "engineOn", value: v });
-}
+/* The Linux VM card, the status bar, Settings › Resources and the main area
+   all show the engine's real state, ui.vm, whichever control started or
+   stopped it: the card, the main area's Start Kiri, Settings, or the menu
+   bar and tray, which reach the engine without the page. Asleep is on: the
+   VM rests to save memory and the next docker command wakes it, so it reads
+   Running, and waking does too. Off is only Stop (or no engine at all). */
 function engineShown() {
   const look = ui.vmLook || ui.vm;
-  const shown = ui.vm === "stopping" ? "stopping"
-    : ui.vm === "booting" && ui.wantStart ? "booting"
-    : engineOn() ? "running" : "stopped";
+  const shown = ui.vm === "stopped" ? "stopped"
+    : ui.vm === "stopping" ? "stopping"
+    : ui.vm === "booting" && look !== "waking" ? "booting"
+    : "running";
   return { look, on: shown === "running", shown };
 }
-/* Start and Stop, from the card or Settings › Resources. */
+/* Start and Stop, from the card, the main area or Settings › Resources. The
+   engine itself remembers a Stop and stays off, even across restarts, until
+   Start: the window keeps no switch of its own. */
 function powerEngine(action) {
-  ui.wantStart = action === "start";
-  setEngineOn(action === "start");
   send(action);
   paintEngine(); renderStatus();
   if (ui.view === "settings" && prefs.tab === "resources") render();
 }
 function paintEngine() {
   const { shown } = engineShown();
-  if (shown === "running" && mineRunning()) setEngineOn(true);
-  if (ui.vm === "running" || ui.vm === "stopped") ui.wantStart = false;
   document.body.dataset.vm = shown;
   const label = tr(vmLabels[shown] ?? shown);
   /* i18n */ void [tr("Off"), tr("Starting…"), tr("Running"), tr("Stopping…")];
