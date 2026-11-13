@@ -11,11 +11,11 @@ allow = [
   "Zlib",
 ]
 
-# RUSTSEC advisories: a known vulnerability or a yanked release fails the
-# check; a crate unmaintained upstream warns. Run with `cargo deny check`.
+# RUSTSEC advisories. In cargo-deny's current config a vulnerability always
+# fails the check; `unmaintained` picks how far from the workspace a warning
+# reaches; yanked releases fail. Run with `cargo deny check`.
 [advisories]
-vulnerability = "deny"
-unmaintained = "warn"
+unmaintained = "all"
 yanked = "deny"
 
 # Duplicate dependencies cost compile time and can drift versions apart;
