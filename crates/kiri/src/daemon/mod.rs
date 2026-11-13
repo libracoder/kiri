@@ -189,12 +189,29 @@ pub fn run(_args: &[String]) -> io::Result<()> {
         std::process::exit(0);
     })?;
 
+    // One thread per connection, and a connection costs nothing to open:
+    // cap the open ones, so a local flood cannot pile up threads without
+    // bound. Reads are bounded in `api::serve` too.
+    static OPEN_CONNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    const MAX_OPEN_CONNS: usize = 256;
+    struct ReleaseOpenConn;
+    impl Drop for ReleaseOpenConn {
+        fn drop(&mut self) {
+            OPEN_CONNS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
     for conn in listener.incoming() {
         let Ok(conn) = conn else { continue };
+        if OPEN_CONNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= MAX_OPEN_CONNS {
+            OPEN_CONNS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            diag::warn!("too many open connections; the new one was not served", limit = MAX_OPEN_CONNS);
+            continue;
+        }
         let engine = engine.clone();
         #[cfg(target_os = "linux")]
         let gate = gate.clone();
         let spawned = std::thread::Builder::new().name("kiri-api".into()).spawn(move || {
+            let _open = ReleaseOpenConn;
             // Checked here, not in the accept loop: a slow user lookup holds up
             // this connection only.
             #[cfg(target_os = "linux")]

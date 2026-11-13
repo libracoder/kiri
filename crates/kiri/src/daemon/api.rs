@@ -22,7 +22,15 @@ use super::time;
 pub fn serve(stream: UnixStream, engine: Arc<Engine>) -> io::Result<()> {
     let mut w = stream.try_clone()?;
     let mut r = BufReader::new(stream);
+    // A connection that sends nothing holds its thread: bound that wait.
+    // The read of the next request's head is timed out — five minutes for a
+    // new or idle keep-alive connection — and every served request clears
+    // the timeout again, so streams, hijacked execs and uploads are never
+    // cut short by it. The loop's end re-arms it.
+    const HEADER_TIMEOUT: Duration = Duration::from_secs(300);
+    let _ = r.get_ref().set_read_timeout(Some(HEADER_TIMEOUT));
     while let Some(req) = http::read_request(&mut r, streams_body)? {
+        let _ = r.get_ref().set_read_timeout(None);
         // The window's action this request is part of: the engine's lines
         // for it carry the same op.
         let _op = req.header("X-Kiri-Op").filter(|o| crate::diag::valid_op(o)).map(|o| crate::diag::enter_op(o.to_owned()));
@@ -45,6 +53,8 @@ pub fn serve(stream: UnixStream, engine: Arc<Engine>) -> io::Result<()> {
                 return Ok(());
             }
         }
+        // Re-arm the idle timeout for the next request on this connection.
+        let _ = r.get_ref().set_read_timeout(Some(HEADER_TIMEOUT));
     }
     Ok(())
 }
