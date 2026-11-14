@@ -529,7 +529,7 @@
   "Lets {user} run containers without sudo": "Antaa käyttäjän {user} ajaa kontteja ilman sudoa",
   "Level": "Taso",
   "Light": "Vaalea",
-  "Linux VM": "Linux-virtuaalikone",
+  "Linux VM": "Linux-VM",
   "Linux VM: {state}": "Linux-virtuaalikone: {state}",
   "Linux account": "Linux-tili",
   "Linux for Kiri": "Linux Kirille",

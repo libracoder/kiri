@@ -529,7 +529,7 @@
   "Lets {user} run containers without sudo": "Позволява на {user} да изпълнява контейнери без sudo",
   "Level": "Ниво",
   "Light": "Светла",
-  "Linux VM": "Linux виртуална машина",
+  "Linux VM": "Linux VM",
   "Linux VM: {state}": "Linux виртуална машина: {state}",
   "Linux account": "Акаунт в Linux",
   "Linux for Kiri": "Linux за Kiri",

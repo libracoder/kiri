@@ -529,7 +529,7 @@
   "Lets {user} run containers without sudo": "Pozwala użytkownikowi {user} uruchamiać kontenery bez sudo",
   "Level": "Poziom",
   "Light": "Jasny",
-  "Linux VM": "Maszyna wirtualna Linux",
+  "Linux VM": "Linux VM",
   "Linux VM: {state}": "Maszyna wirtualna Linux: {state}",
   "Linux account": "Konto Linux",
   "Linux for Kiri": "Linux dla Kiri",
