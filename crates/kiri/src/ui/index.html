@@ -765,10 +765,11 @@ tr[data-rowopen] .sel, .sel { cursor: text; -webkit-user-select: text; user-sele
 .choice .t { font-weight: 600; }
 .choice .d { color: var(--muted); font-size: var(--fs); }
 /* The language step: a header that says hello in the language picked, over a
-   faint cloud of the others, with Kiri's mark; then a tile for each
-   language, four across, each its greeting in its own script over its name. On a short
-   window the tiles scroll and the header and Continue stay. */
-.dialog.langdlg { width: min(660px, calc(100% - 32px)); max-height: calc(100vh - 32px); padding: 0; gap: 0; overflow: hidden; grid-template-rows: auto minmax(0, 1fr) auto; }
+   faint cloud of the others, with Kiri's mark; then a search field and one
+   list, a line for each language: its own name, its English name, its hello.
+   The dialog keeps its height while a search narrows the list; on a short
+   window the list scrolls and the header and Continue stay. */
+.dialog.langdlg { width: min(540px, calc(100% - 32px)); height: min(620px, calc(100vh - 32px)); padding: 0; gap: 0; overflow: hidden; grid-template-rows: auto minmax(0, 1fr); }
 .langdlg .lhero { position: relative; overflow: hidden; padding: 20px 22px 18px; border-bottom: 1px solid var(--line);
   background: radial-gradient(120% 140% at 0% 0%, color-mix(in srgb, #E0B420 15%, transparent), transparent 55%),
               radial-gradient(120% 140% at 100% 100%, color-mix(in srgb, var(--blue) 17%, transparent), transparent 60%), var(--side); }
@@ -779,17 +780,29 @@ tr[data-rowopen] .sel, .sel { cursor: text; -webkit-user-select: text; user-sele
 @keyframes lhello { from { opacity: .2; transform: translateY(3px); } to { opacity: 1; transform: none; } }
 @media (prefers-reduced-motion: reduce) { .langdlg .lhello { animation: none; } }
 .langdlg .lhero h3 { position: relative; margin-top: 4px; font-size: var(--fs); font-weight: 500; color: var(--muted); }
-.langdlg .lbody { display: grid; grid-template-rows: minmax(0, 1fr) auto; gap: 14px; min-height: 0; padding: 16px 22px 18px; }
-.choices.langs { grid-template-columns: repeat(4, minmax(0, 1fr)); grid-auto-rows: max-content; gap: 6px; overflow-y: auto; min-height: 0; padding: 1px; margin: -1px; }
-.choices.langs .choice { position: relative; gap: 3px; padding: 8px 9px 7px; text-align: var(--start); min-height: 58px; align-content: space-between; border-radius: 9px; transition: border-color .12s, transform .12s; }
-.choices.langs .choice:hover { transform: translateY(-1px); }
-.choices.langs .choice[aria-pressed=true] { background: color-mix(in srgb, var(--blue) 10%, var(--raised)); }
-.choices.langs .choice .h { font-size: var(--fs-head); font-weight: 650; line-height: 1.2; overflow-wrap: anywhere; }
-.choices.langs .choice .t { font-weight: 400; color: var(--muted); font-size: var(--fs-small); overflow-wrap: anywhere; }
-.choices.langs .sys { color: var(--moss); font-size: var(--fs-small); }
+.langdlg .lbody { display: grid; grid-template-rows: auto minmax(0, 1fr) auto; gap: 10px; min-height: 0; padding: 14px 22px 16px; }
+.langdlg .lfind { display: flex; align-items: center; gap: 7px; height: 30px; padding: 0 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--raised); color: var(--faint); cursor: text; }
+.langdlg .lfind:focus-within { border-color: var(--blue); }
+.langdlg .lfind svg { width: 13px; height: 13px; flex: none; }
+.langdlg .lfind input { flex: 1; min-width: 0; height: 100%; padding: 0; border: 0; outline: 0; background: none; color: var(--text); font: var(--fs) var(--ui-font); }
+.langdlg .lfind input::placeholder { color: var(--faint); }
+.langdlg .llist { position: relative; overflow-y: auto; overscroll-behavior: contain; min-height: 0; border: 1px solid var(--line); border-radius: 9px; background: var(--raised); }
+.langdlg .lsect { position: sticky; top: 0; z-index: 1; padding: 7px 12px 4px; font-size: var(--fs-small); font-weight: 600; letter-spacing: .04em; color: var(--faint); background: var(--panel); border-bottom: 1px solid var(--line); }
+.langdlg .lrow { display: grid; grid-template-columns: minmax(0, 1fr) auto 14px; align-items: center; gap: 10px; padding: 6px 12px; cursor: pointer; border-top: 1px solid color-mix(in srgb, var(--line) 45%, transparent); }
+.langdlg .lsect + .lrow { border-top: 0; }
+.langdlg .lrow:hover { background: var(--row-hover); }
+.langdlg .lrow.act { background: color-mix(in srgb, var(--blue) 9%, transparent); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--blue) 55%, transparent); }
+.langdlg .lrow[aria-selected=true] { background: color-mix(in srgb, var(--blue) 20%, transparent); }
+.langdlg .lnm { display: flex; flex-wrap: wrap; align-items: baseline; column-gap: 6px; min-width: 0; overflow-wrap: anywhere; }
+.langdlg .ln { font-weight: 550; }
+.langdlg .le { color: var(--muted); }
+.langdlg .lrow .sys { margin-inline-start: 2px; color: var(--moss); font-size: var(--fs-small); white-space: nowrap; }
+.langdlg .lh { color: var(--muted); white-space: nowrap; }
+.langdlg .lck { width: 14px; height: 14px; color: var(--blue); visibility: hidden; }
+.langdlg .lrow[aria-selected=true] .lck { visibility: visible; }
+.langdlg .lnone { padding: 16px 12px; color: var(--muted); }
 .langdlg .lfoot { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .langdlg .lfoot p { margin: 0; }
-@media (max-width: 620px) { .choices.langs { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 @media (max-height: 520px) { .langdlg .lhero { padding: 12px 22px; } .langdlg .lhello { font-size: calc(var(--fs-title) * 1.35); } .langdlg .lcloud { display: none; } }
 .admin-note { display: grid; grid-template-columns: auto 1fr; gap: 10px; padding: 11px 12px; border-radius: 10px; background: var(--raised); border: 1px solid var(--line); font-size: var(--fs); color: var(--muted); }
 .admin-note b { color: var(--text); font-weight: 600; }
@@ -2193,6 +2206,9 @@ tr.usb-more > td { padding: 0; background: var(--panel); }
 [dir=rtl] ::placeholder { unicode-bidi: plaintext; }
 /* A page's title is one line: USB and its Beta mark keep the reading order. */
 [dir=rtl] .toolbar h2 { unicode-bidi: normal; }
+/* A language's line in the language step: its own name, its English name and
+   Same as macOS run the way the window does, each kept whole. */
+[dir=rtl] .langdlg .lnm { unicode-bidi: isolate; }
 [dir=rtl] :is(.console, .xterm) :not(svg, svg *) { unicode-bidi: normal; }
 [dir=rtl] :is(.console, .term, .term input, pre) { text-align: left; }
 /* Two buttons with only a space between them (a dialog's Cancel and its
@@ -2345,6 +2361,9 @@ addWords(/*STRINGS*/{});
    alphabets, Greek, Cyrillic, the Arabic script, Ethiopic, the Indian scripts,
    Thai and Lao, then Japanese, Korean and Chinese. */
 const LANGS = [["en", "English"], ["id", "Bahasa Indonesia"], ["ca", "Català"], ["cs", "Čeština"], ["de", "Deutsch"], ["es", "Español"], ["fr", "Français"], ["it", "Italiano"], ["lt", "Lietuvių"], ["hu", "Magyar"], ["nb", "Norsk bokmål"], ["pl", "Polski"], ["pt-BR", "Português (Brasil)"], ["ro", "Română"], ["sq", "Shqip"], ["sl", "Slovenščina"], ["fi", "Suomi"], ["vi", "Tiếng Việt"], ["tr", "Türkçe"], ["el", "Ελληνικά"], ["bg", "Български"], ["ru", "Русский"], ["uk", "Українська"], ["kk", "Қазақша"], ["ar", "العربية"], ["fa", "فارسی"], ["ckb", "کوردیی ناوەندی"], ["am", "አማርኛ"], ["hi", "हिन्दी"], ["bn", "বাংলা"], ["ta", "தமிழ்"], ["te", "తెలుగు"], ["th", "ไทย"], ["lo", "ລາວ"], ["ja", "日本語"], ["ko", "한국어"], ["zh-Hans", "简体中文"], ["zh-Hant", "繁體中文"]];
+/* Each language's English name: the language step shows it beside the own
+   name and finds a language by it ("German" for Deutsch). One for each in LANGS. */
+const LANG_EN = { en: "English", id: "Indonesian", ca: "Catalan", cs: "Czech", de: "German", es: "Spanish", fr: "French", it: "Italian", lt: "Lithuanian", hu: "Hungarian", nb: "Norwegian Bokmål", pl: "Polish", "pt-BR": "Portuguese (Brazil)", ro: "Romanian", sq: "Albanian", sl: "Slovenian", fi: "Finnish", vi: "Vietnamese", tr: "Turkish", el: "Greek", bg: "Bulgarian", ru: "Russian", uk: "Ukrainian", kk: "Kazakh", ar: "Arabic", fa: "Persian", ckb: "Kurdish (Sorani)", am: "Amharic", hi: "Hindi", bn: "Bengali", ta: "Tamil", te: "Telugu", th: "Thai", lo: "Lao", ja: "Japanese", ko: "Korean", "zh-Hans": "Chinese (Simplified)", "zh-Hant": "Chinese (Traditional)" };
 /* The system's languages in order (the host passes them; a browser has its own). */
 const sysLangs = () => (window.KIRI_LANG?.os?.length ? window.KIRI_LANG.os : navigator.languages || [navigator.language || "en"]);
 /* A language tag to one Kiri has, as lang.rs's lang_for: Chinese written in
@@ -3245,38 +3264,116 @@ function onbClick(ev) {
   else if (b.dataset.onb === "restart") send("onbrestart");
 }
 
-/* The first start: which language, before anything else. Each tile is in its
-   own language; the system's is picked and marked. A pick shows at once and is
-   saved; Continue lets the welcome (or the build question) waiting behind it go. */
+/* The first start: which language, before anything else. A search field and
+   one list: Suggested (the system's language, picked and marked, then its
+   other languages and a few common ones), then every language by its English
+   name. A pick shows at once and is saved; Continue lets the welcome (or the
+   build question) waiting behind it go. */
 const HELLO = { en: "Hello", id: "Halo", ca: "Hola", cs: "Ahoj", de: "Hallo", es: "Hola", fr: "Bonjour", it: "Ciao", lt: "Labas", hu: "Szia", nb: "Hei", pl: "Cześć", "pt-BR": "Olá", ro: "Salut", sq: "Përshëndetje", sl: "Živjo", fi: "Hei", vi: "Xin chào", tr: "Merhaba", el: "Γεια σου", bg: "Здравей", ru: "Привет", uk: "Привіт", kk: "Сәлем", ar: "مرحبًا", fa: "سلام", ckb: "سڵاو", am: "ሰላም", hi: "नमस्ते", bn: "নমস্কার", ta: "வணக்கம்", te: "నమస్కారం", th: "สวัสดี", lo: "ສະບາຍດີ", ja: "こんにちは", ko: "안녕하세요", "zh-Hans": "你好", "zh-Hant": "你好" };
 /* The language step's header: every hello, faint and scattered (fixed places,
    so a redraw doesn't move them), and Kiri's mark with its own gradient ids. */
 const LANG_CLOUD = Object.values(HELLO).concat(Object.values(HELLO)).slice(0, 22).map((w, i) =>
   `<span style="left:${(i * 37) % 100}%;top:${(i * 53) % 100}%;font-size:${((14 + (i * 7) % 22) / 12).toFixed(2)}em;transform:rotate(${((i * 13) % 14) - 7}deg)">${w}</span>`).join("");
 const LANG_LOGO = ONB_LOGO.replace(/onb-/g, "lng-");
+/* Languages offered after the system's own, until Suggested holds five. */
+const LANG_SUGGEST = ["en", "es", "fr", "pt-BR", "ar", "zh-Hans"];
+function langSuggested(sysId) {
+  const out = [sysId];
+  for (const l of sysLangs()) { const id = langFor(l); if (id && !out.includes(id)) out.push(id); }
+  for (const id of LANG_SUGGEST) if (out.length < 5 && !out.includes(id)) out.push(id);
+  return out;
+}
+/* For a search: case and accents dropped ("Portugués" finds Português). */
+const langFold = (s) => String(s).normalize("NFD").replace(/\p{M}/gu, "").toLowerCase();
+/* The languages a search finds, by own name, English name or code: the code
+   itself first ("de"), then names that start with it, then a word in them
+   that does, then any that hold it; each step by English name. */
+function langFind(query) {
+  const f = langFold(query.trim());
+  const rank = ([id, name]) => {
+    const names = [langFold(name), langFold(LANG_EN[id])];
+    if (langFold(id) === f) return 0;
+    if (names.some((n) => n.startsWith(f))) return 1;
+    if (names.some((n) => n.split(/[\s(),]+/).some((w) => w.startsWith(f)))) return 2;
+    return names.concat(langFold(id)).some((n) => n.includes(f)) ? 3 : -1;
+  };
+  return LANGS.map((l) => [rank(l), l]).filter(([r]) => r >= 0)
+    .sort((a, b) => a[0] - b[0] || LANG_EN[a[1][0]].localeCompare(LANG_EN[b[1][0]], "en")).map(([, l]) => l);
+}
+const LANG_FIND_ICON = `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="7" cy="7" r="4.8"/><path d="M10.6 10.6L14 14"/></svg>`;
+const LANG_CHECK = `<svg class="lck" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3.5 8.5l3 3 6-7"/></svg>`;
 function langPick() {
   const sysId = resolveLang("system");
+  const suggested = langSuggested(sysId);
+  const byEnglish = [...LANGS].sort((a, b) => LANG_EN[a[0]].localeCompare(LANG_EN[b[0]], "en"));
   const scrim = document.createElement("div");
   // Above everything, Linux's setup checklist too: it's the first thing to answer.
   scrim.className = "scrim langstep";
-  const draw = () => {
-    const cur = prefs.lang && prefs.lang !== "system" ? resolveLang(prefs.lang) : sysId;
-    const top = scrim.querySelector(".choices")?.scrollTop || 0;
-    const cjk = /^(ja|ko|zh)/.test(cur);
-    scrim.innerHTML = `<div class="dialog langdlg" role="dialog" aria-modal="true" aria-labelledby="lang-title">
+  scrim.innerHTML = `<div class="dialog langdlg" role="dialog" aria-modal="true" aria-labelledby="lang-title">
       <div class="lhero"><div class="lcloud" aria-hidden="true">${LANG_CLOUD}</div>${LANG_LOGO}
-        <div class="lhello" lang="${cur}" aria-hidden="true">${HELLO[cur]}${cjk ? "" : "!"}</div>
-        <h3 id="lang-title">${tr("Choose your language")}</h3></div>
-      <div class="lbody"><div class="choices langs" role="radiogroup" aria-labelledby="lang-title">${LANGS.map(([id, name]) => `<button class="choice" role="radio" data-lang="${id}" lang="${id}" aria-checked="${id === cur}" aria-pressed="${id === cur}">
-        <span class="h">${HELLO[id]}</span><span class="t">${name}</span>${id === sysId ? `<span class="sys">${tr("Same as {os}", { os: OS })}</span>` : ""}</button>`).join("")}</div>
-      <div class="lfoot"><p>${tr("You can change it later in Settings → Appearance.")}</p><button class="btn primary" id="lang-go">${tr("Continue")}</button></div></div>
-    </div>`;
-    scrim.querySelector(".choices").scrollTop = top;
-    scrim.querySelector(`[data-lang="${cur}"]`)?.focus({ preventScroll: true });
-    scrim.querySelector(`[data-lang="${cur}"]`)?.scrollIntoView({ block: "nearest" });
+        <div class="lhello" aria-hidden="true"></div><h3 id="lang-title"></h3></div>
+      <div class="lbody"><label class="lfind">${LANG_FIND_ICON}<input id="lang-q" spellcheck="false" autocomplete="off" role="combobox" aria-controls="lang-list" aria-expanded="true" aria-autocomplete="list"></label>
+        <div class="llist" id="lang-list" role="listbox" aria-labelledby="lang-title"></div>
+        <div class="lfoot"><p></p><button class="btn primary" id="lang-go"></button></div></div></div>`;
+  const q = scrim.querySelector("#lang-q"), list = scrim.querySelector("#lang-list");
+  let shown = "", act = "";
+  const current = () => (prefs.lang && prefs.lang !== "system" ? resolveLang(prefs.lang) : sysId);
+  const row = (key, [id, name], cur) => `<div class="lrow" role="option" id="lo-${key}-${id}" data-lang="${id}" aria-selected="${id === cur}">
+    <span class="lnm"><bdi class="ln" lang="${id}">${name}</bdi>${LANG_EN[id] !== name ? `<bdi class="le" lang="en">${LANG_EN[id]}</bdi>` : ""}${id === sysId ? `<bdi class="sys">${tr("Same as {os}", { os: OS })}</bdi>` : ""}</span>
+    <bdi class="lh" lang="${id}">${HELLO[id]}</bdi>${LANG_CHECK}</div>`;
+  const group = (key, title, langs, cur) => `<div role="group" id="lg-${key}" aria-labelledby="lgh-${key}"><div class="lsect" id="lgh-${key}">${title}</div>${langs.map((l) => row(key, l, cur)).join("")}</div>`;
+  // The row Up, Down and Enter work on: the search field keeps focus, and
+  // aria-activedescendant says which row that is.
+  const setAct = (el, scroll) => {
+    list.querySelector(".lrow.act")?.classList.remove("act");
+    act = el?.id || "";
+    if (!el) { q.removeAttribute("aria-activedescendant"); return; }
+    el.classList.add("act");
+    q.setAttribute("aria-activedescendant", act);
+    if (!scroll) return;
+    const head = el.parentElement.querySelector(".lsect")?.offsetHeight || 0;
+    if (el.offsetTop - head < list.scrollTop) list.scrollTop = el.offsetTop - head;
+    else if (el.offsetTop + el.offsetHeight > list.scrollTop + list.clientHeight) list.scrollTop = el.offsetTop + el.offsetHeight - list.clientHeight;
+  };
+  const drawList = (cur) => {
+    const top = list.scrollTop;
+    const query = q.value.trim();
+    if (query) {
+      const found = langFind(query);
+      list.innerHTML = found.length ? found.map((l) => row("f", l, cur)).join("") : `<div class="lnone" role="presentation">${tr("No language matches. Try its English name.")}</div>`;
+    } else {
+      list.innerHTML = group("s", tr("Suggested"), suggested.map((id) => LANGS.find(([l]) => l === id)), cur)
+        + group("a", tr("All languages · {n}", { n: LANGS.length }), byEnglish, cur);
+    }
+    list.scrollTop = top;
+  };
+  const draw = () => {
+    const cur = current();
+    if (shown !== cur) {
+      // A new element, so the hello comes in again.
+      const cjk = /^(ja|ko|zh)/.test(cur);
+      scrim.querySelector(".lhello").outerHTML = `<div class="lhello" lang="${cur}" aria-hidden="true">${HELLO[cur]}${cjk ? "" : "!"}</div>`;
+      shown = cur;
+    }
+    scrim.querySelector("#lang-title").textContent = tr("Choose your language");
+    q.placeholder = tr("Search languages");
+    q.setAttribute("aria-label", tr("Search languages"));
+    scrim.querySelector(".lfoot p").textContent = tr("You can change it later in Settings → Appearance.");
+    scrim.querySelector("#lang-go").textContent = tr("Continue");
+    drawList(cur);
+    setAct(document.getElementById(act) || list.querySelector(".lrow"), false);
+  };
+  const pick = (el) => {
+    setPref("lang", el.dataset.lang === sysId ? "system" : el.dataset.lang);
+    act = el.id;
+    draw();
   };
   draw();
   document.body.append(scrim);
+  q.focus();
+  // Open on the language picked, in view.
+  const on = list.querySelector(`[data-lang="${current()}"]`);
+  if (on) { setAct(on, false); list.scrollTop = Math.max(0, on.offsetTop - (list.clientHeight - on.offsetHeight) / 2); }
   // A language the page fetches from the host redraws the step when it comes.
   ui.langDraw = draw;
   const done = () => {
@@ -3289,13 +3386,29 @@ function langPick() {
   };
   // Escape keeps the language shown, as Continue does (before the window's
   // own Escape, which would drop the dialog and leave the welcome waiting).
-  const onKey = (ev) => { if (ev.key === "Escape") { ev.stopPropagation(); done(); } };
+  // Typing while the focus is elsewhere (Continue) goes to the search.
+  const onKey = (ev) => {
+    if (ev.key === "Escape") { ev.stopPropagation(); done(); return; }
+    if (ev.key.length === 1 && !ev.metaKey && !ev.ctrlKey && !ev.altKey && document.activeElement !== q) q.focus();
+  };
   document.addEventListener("keydown", onKey, true);
-  scrim.addEventListener("click", (ev) => {
-    const c = ev.target.closest("[data-lang]");
-    if (c) { setPref("lang", c.dataset.lang === sysId ? "system" : c.dataset.lang); draw(); return; }
-    if (ev.target.id === "lang-go") done();
+  q.addEventListener("input", () => { drawList(current()); list.scrollTop = 0; setAct(list.querySelector(".lrow"), false); });
+  q.addEventListener("keydown", (ev) => {
+    const rows = [...list.querySelectorAll(".lrow")];
+    const i = rows.findIndex((r) => r.id === act);
+    if (ev.key === "ArrowDown" || ev.key === "ArrowUp") {
+      ev.preventDefault(); ev.stopPropagation();
+      const next = rows[Math.min(rows.length - 1, Math.max(0, i + (ev.key === "ArrowDown" ? 1 : -1)))];
+      if (next) setAct(next, true);
+    } else if (ev.key === "Enter" && !ev.isComposing) {
+      ev.preventDefault(); ev.stopPropagation();
+      if (rows[i]) pick(rows[i]);
+    }
   });
+  // A click picks and leaves the focus in the search field.
+  list.addEventListener("mousedown", (ev) => ev.preventDefault());
+  list.addEventListener("click", (ev) => { const r = ev.target.closest(".lrow"); if (r) pick(r); });
+  scrim.querySelector("#lang-go").addEventListener("click", done);
 }
 
 function welcome() {
