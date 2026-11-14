@@ -11,6 +11,10 @@
 </p>
 
 <p align="center">
+  <b>English</b> · <a href="README.pt-BR.md">Português (Brasil)</a>
+</p>
+
+<p align="center">
   <a href="https://runkiri.com/releases/">Download</a> ·
   <a href="docs/features.md">Features</a> ·
   <a href="docs/development.md">Build from source</a> ·
