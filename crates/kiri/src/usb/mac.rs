@@ -395,7 +395,7 @@ impl HostDevice {
                         Ok(i) => {
                             ifs.insert(n as u8, i);
                         }
-                        Err(e) => eprintln!("kiri usb: interface {n}: {e}"),
+                        Err(e) => log(&format!("interface {n}: {e}")),
                     }
                 }
             }
@@ -618,7 +618,7 @@ fn capture_and_serve(location: &str, stream: UnixStream, status: &mut UnixStream
         }
         let _ = writeln!(status, "ok");
         let _ = status.shutdown(std::net::Shutdown::Both);
-        eprintln!("kiri usb: {} attached", info.name);
+        log(&format!("{} ({:04x}:{:04x}) attached", info.name, info.vendor, info.product));
         let reader = std::io::BufReader::new(stream.try_clone()?);
         let r = usbip::serve(host.clone(), reader, stream);
         SESSION_FD.store(-1, Ordering::SeqCst);
@@ -637,9 +637,15 @@ fn capture_and_serve(location: &str, stream: UnixStream, status: &mut UnixStream
         let _: () = msg_send![&*device.0, destroy];
     }
     if gone.load(Ordering::SeqCst) {
-        eprintln!("kiri usb: {} was unplugged", info.name);
+        log(&format!("{} left the bus (unplugged, or it reset and enumerated again)", info.name));
     } else {
-        eprintln!("kiri usb: {} given back to macOS", info.name);
+        log(&format!("{} given back to macOS", info.name));
     }
     result
+}
+
+/// A line in the helper's log, with the time: when a device left matters
+/// as much as that it did.
+pub(super) fn log(msg: &str) {
+    eprintln!("{} kiri usb: {msg}", crate::daemon::time::rfc3339(std::time::SystemTime::now()));
 }
