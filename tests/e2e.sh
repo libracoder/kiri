@@ -92,6 +92,27 @@ code pull-missing 1 $D pull kiri-does-not-exist/nope:none
 t rmi "Untagged" $D rmi alpine:3.21
 code rmi-missing 1 $D rmi alpine:3.21
 
+section "data disk trim"
+# The VM trims its data disk 15 s after boot, in a process of its own: the
+# agent clones containers without CLONE_VM and must stay single-threaded, or
+# setuid in a new container fails or hangs (#122). Containers must still start
+# once that first trim has run; 30 s of uptime (/proc/uptime is the VM's)
+# leaves it time to finish. The docker CLI ignores t's SIGALRM, so these runs
+# are killed after 20 s, and the suite stops if they fail: every container
+# after them would hang the same way.
+W20=(perl -e '$p = fork // die; exec @ARGV unless $p; $SIG{ALRM} = sub { kill 9, $p }; alarm 20; waitpid $p, 0; exit($? >> 8 || ($? & 127 ? 124 : 0))')
+up=$("${W20[@]}" $D run --rm alpine cut -d. -f1 /proc/uptime 2>/dev/null)
+[[ "$up" =~ ^[0-9]+$ ]] && [ "$up" -lt 30 ] && sleep $((30 - up))
+before=$FAIL
+t after-trim-run "after trim" "${W20[@]}" $D run --rm alpine echo after trim
+t after-trim-user "uid=1000" "${W20[@]}" $D run --rm -u 1000 alpine id
+t after-trim-exec "trimmed" "${W20[@]}" bash -c "$D run -d --name trimmed alpine sleep 30 >/dev/null && $D exec trimmed hostname -s >/dev/null && $D inspect -f '{{.Name}}' trimmed"
+"${W20[@]}" $D rm -f trimmed >/dev/null 2>&1
+if [ "$FAIL" -gt "$before" ]; then
+  printf '\ncontainers no longer start after the data disk trim; stopping here\n'
+  exit 1
+fi
+
 section "run: output and exit codes"
 t echo "hello" $D run --rm alpine echo hello
 t args "a b c" $D run --rm alpine echo a b c
