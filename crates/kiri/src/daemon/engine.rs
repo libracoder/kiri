@@ -371,8 +371,12 @@ pub struct Container {
     /// networks as (network, ip). Only networks with IPv6 give one.
     pub ip6: Option<[u8; 16]>,
     pub extra_ip6s: Vec<(String, [u8; 16])>,
-    /// True while the guest has the process. Until then, input is held here:
-    /// `docker run -i` attaches and sends stdin before it starts the container.
+    /// True while the guest has the process: from then on a signal has
+    /// something to reach.
+    in_guest: bool,
+    /// True once the guest has the process and the input held here until
+    /// then: `docker run -i` attaches and sends stdin before it starts the
+    /// container.
     live: bool,
     early_input: Vec<u8>,
     early_close: bool,
@@ -1054,6 +1058,7 @@ impl Engine {
                 ip: None,
                 pid: 0,
                 forwards: None,
+                in_guest: false,
                 live: false,
                 early_input: Vec::new(),
                 early_close: false,
@@ -1202,6 +1207,7 @@ impl Engine {
                             crate::diag::warn!("container killed for memory", name = c.name.clone(), exit_code = code);
                         }
                         c.exits += 1;
+                        c.in_guest = false;
                         c.live = false;
                         if let Some(ip) = c.ip.take() {
                             self.release_ip(&c.spec.network_mode, ip);
@@ -1561,6 +1567,7 @@ impl Engine {
                 ip: None,
                 pid: 0,
                 forwards: None,
+                in_guest: false,
                 live: false,
                 early_input: Vec::new(),
                 early_close: false,
@@ -1610,6 +1617,9 @@ impl Engine {
             c.finished = None;
             c.oom_killed = false;
             c.vm_stopped = false;
+            // Not until the guest has the process, however the last run ended.
+            c.in_guest = false;
+            c.live = false;
             // `docker run --rm` without -d: its client is reading the output
             // and the log goes with the container, so it stays in memory.
             if c.spec.auto_remove && !c.attached.is_empty() {
@@ -1808,7 +1818,14 @@ impl Engine {
                 }
             }
         }
-        // The guest has the process now: deliver input that arrived early.
+        // The guest has the process now. A stop or kill that came in meanwhile
+        // waits for this, and not for the input below: handing that over
+        // takes as long as the program takes to read it.
+        if let Some(c) = self.lock().containers.get_mut(&id).filter(|c| c.status == Status::Running) {
+            c.in_guest = true;
+        }
+        self.changed.notify_all();
+        // Deliver input that arrived early.
         // It is drained before the container goes live, so input still
         // arriving meanwhile (and its CloseStdin) queues behind it rather
         // than overtaking it.
@@ -2626,9 +2643,12 @@ impl Engine {
         let id = self.resolve(key)?;
         self.thaw_for_signal(&id);
         self.mark_stopped(&id);
-        if !self.is_running(&id) {
+        if !self.wait_started(&id) {
             return Ok(());
         }
+        // A start accepted since the mark above took it away again, and the
+        // restart policy would bring back what this stop is about to end.
+        self.mark_stopped(&id);
         self.emit_container("kill", &id, &[("signal", (libc::SIGTERM).to_string())]);
         let sig = self.lock().containers.get(&id).and_then(|c| c.spec.stop_signal).unwrap_or(libc::SIGTERM as u32);
         self.vm()?.kill(&id, sig)?;
@@ -2663,10 +2683,32 @@ impl Engine {
         }
     }
 
+    /// Waits for a start that is under way to finish, and says whether the
+    /// container is running then. Until the guest has the process there is
+    /// nothing to signal: a stop or kill sent now would be dropped, and
+    /// would report success while the container kept running. A start that
+    /// never finishes is not waited for forever.
+    ///
+    /// The answer is the one to act on. Asking whether the container is
+    /// running in a second look would let a start that is accepted between
+    /// the two through, with the guest still without its process.
+    fn wait_started(&self, id: &str) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let mut st = self.lock();
+        while st.containers.get(id).is_some_and(|c| c.status == Status::Running && !c.in_guest) {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            st = self.changed.wait_timeout(st, left).unwrap_or_else(|e| e.into_inner()).0;
+        }
+        st.containers.get(id).is_some_and(|c| c.status == Status::Running)
+    }
+
     pub fn kill(&self, key: &str, signal: u32) -> Result<(), Error> {
         let id = self.resolve(key)?;
         self.thaw_for_signal(&id);
-        if !self.is_running(&id) {
+        if !self.wait_started(&id) {
             return Err(Error::Conflict(format!("Container {} is not running", &id[..12])));
         }
         if signal == libc::SIGKILL as u32 || signal == libc::SIGTERM as u32 {
@@ -2699,6 +2741,7 @@ impl Engine {
                     &id[..12]
                 )));
             }
+            self.wait_started(&id);
             self.mark_stopped(&id);
             self.vm()?.kill(&id, libc::SIGKILL as u32)?;
             let mut st = self.lock();
