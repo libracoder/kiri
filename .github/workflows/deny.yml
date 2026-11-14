@@ -1,9 +1,11 @@
 # Dependency policy: RUSTSEC advisories, duplicate crates, license names —
 # the rules live in deny.toml and run with `cargo deny check`.
 #
-# Safe for pull requests from forks: it runs on GitHub's machines with a
-# read-only token and no secrets, and builds nothing (the check is on
-# crates.io metadata), so no fork code executes.
+# Same shape as the other workflows: first-party actions only, pinned to the
+# same checkout SHA, safe for pull requests from forks, no secrets, and it
+# builds nothing (the check is on crates.io metadata). cargo-deny itself is
+# installed from the lockfile with plain cargo so no third-party action is
+# needed.
 name: Deny
 
 on:
@@ -17,7 +19,8 @@ permissions:
 jobs:
   deny:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - run: cargo install --locked cargo-deny
+      - run: cargo deny check
