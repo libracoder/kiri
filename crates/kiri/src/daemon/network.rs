@@ -5,6 +5,8 @@
 //! 172.18.0.0 up, as Docker picks them, and are saved to `networks.json`.
 //! `IPAM.Config` (`--subnet`, `--gateway`, `--ip-range`, `--aux-address`)
 //! picks them instead, and containers may then ask for fixed addresses.
+//! Settings → Network → Container addresses may give them a pool of their
+//! own instead of Docker's (pool.rs).
 //!
 //! `--ipv6` (Compose `enable_ipv6`) adds an IPv6 subnet beside the IPv4 one:
 //! an IPv6 `IPAM.Config` entry, or a /64 from Kiri's own ULA pool (a /48
@@ -549,8 +551,18 @@ impl Networks {
         // 172.17.0.0/16 as Docker uses, unless the host already routes it
         // (Kiri on a Linux host inside another engine's container) or a
         // saved network has it.
+        // With a pool of its own (Settings → Network → Container addresses),
+        // the pool's first free block: nothing runs on the bridge yet, so a
+        // changed pool moves it here. A pool with no room leaves it on
+        // Docker's, so the engine still starts.
         let taken: Vec<([u8; 4], u8)> = saved.iter().map(|n| (n.subnet, n.prefix)).collect();
-        let (subnet, prefix) = free_subnet(&taken, true).unwrap_or(([172, 17, 0, 0], 16));
+        let (subnet, prefix) = free_subnet(&taken, true)
+            .or_else(|| {
+                let pool = super::pool::custom()?;
+                crate::diag::warn!("no room for the default bridge in the container address pool: it keeps Docker's addresses", pool = super::pool::cidr(pool));
+                pick(None, &taken, true, &avoided())
+            })
+            .unwrap_or(([172, 17, 0, 0], 16));
         let mut bridge = builtin("bridge", "bridge", "kiri0", subnet, [subnet[0], subnet[1], subnet[2], 1]);
         bridge.prefix = prefix;
         // `KIRI_BRIDGE_IPV6=1`, as Docker's daemon.json `"ipv6": true`: the
@@ -619,7 +631,10 @@ impl Networks {
                 ((ipam.subnet, ipam.prefix), ipam.gateway.unwrap_or(first))
             }
             None => {
-                let subnet = free_subnet(&taken, false).ok_or("no free subnet left")?;
+                let subnet = free_subnet(&taken, false).ok_or_else(|| match super::pool::custom() {
+                    Some(pool) => format!("no free subnet left in the container address pool {} (Settings → Network → Container addresses)", super::pool::cidr(pool)),
+                    None => "no free subnet left".to_owned(),
+                })?;
                 let mut gateway = subnet.0;
                 gateway[3] = 1;
                 (subnet, gateway)
@@ -740,19 +755,40 @@ impl Networks {
     }
 }
 
-/// The first free subnet: 172.17.0.0/16 (only for the default bridge), then
-/// 172.18.0.0/16 … 172.31.0.0/16, then 10.89.N.0/24, skipping ones Kiri
-/// already uses and ones the host routes.
+/// The first free subnet from the pool in Settings, skipping ones Kiri
+/// already uses, ones the host routes and this computer's own networks.
 fn free_subnet(taken: &[([u8; 4], u8)], default_bridge: bool) -> Option<([u8; 4], u8)> {
-    let routes = host_routes();
-    let first = if default_bridge { 17 } else { 18 };
-    (first..=31u8)
-        .map(|b| ([172, b, 0, 0], 16u8))
-        .chain((0..=255u8).map(|c| ([10, 89, c, 0], 24u8)))
-        .find(|(s, p)| {
-            let (net, mask) = (u32::from_be_bytes(*s), u32::MAX << (32 - p));
-            !taken.iter().any(|t| overlaps(*t, (*s, *p))) && !routes.iter().any(|(rn, rm)| (net & rm) == *rn || (rn & mask) == net)
-        })
+    pick(super::pool::custom(), taken, default_bridge, &avoided())
+}
+
+/// What new subnets keep clear of: the host's routes (a Linux host's) and
+/// this computer's networks and VPNs (pool.rs).
+fn avoided() -> Vec<(u32, u32)> {
+    let mut routes = host_routes();
+    routes.extend(super::pool::avoid());
+    routes
+}
+
+/// The first free subnet. With the default pool, as Docker hands them out:
+/// 172.17.0.0/16 (only for the default bridge), then 172.18.0.0/16 …
+/// 172.31.0.0/16, then 10.89.N.0/24. With a pool of its own, its blocks in
+/// order (a /16 each from a /15 or larger, else a /24): the first is the
+/// default bridge's, which other networks take only when nothing else is
+/// free.
+fn pick(pool: Option<([u8; 4], u8)>, taken: &[([u8; 4], u8)], default_bridge: bool, routes: &[(u32, u32)]) -> Option<([u8; 4], u8)> {
+    let free = |(s, p): &([u8; 4], u8)| {
+        let (net, mask) = (u32::from_be_bytes(*s), u32::MAX << (32 - p));
+        !taken.iter().any(|t| overlaps(*t, (*s, *p))) && !routes.iter().any(|(rn, rm)| (net & rm) == *rn || (rn & mask) == net)
+    };
+    let Some(pool) = pool else {
+        let first = if default_bridge { 17 } else { 18 };
+        return (first..=31u8).map(|b| ([172, b, 0, 0], 16u8)).chain((0..=255u8).map(|c| ([10, 89, c, 0], 24u8))).find(free);
+    };
+    let block = super::pool::block(pool);
+    let n = super::pool::room(pool);
+    let at = |i: u32| ((u32::from_be_bytes(pool.0) + (i << (32 - block as u32))).to_be_bytes(), block);
+    let order: Box<dyn Iterator<Item = u32>> = if default_bridge { Box::new(0..n) } else { Box::new((1..n).chain(std::iter::once(0))) };
+    order.map(at).find(free)
 }
 
 /// The host's own IPv6 routes, outside Kiri's bridges, the default route
@@ -971,6 +1007,67 @@ mod tests {
         // A user's 172.18.0.0/24 keeps the automatic choice off 172.18.0.0/16.
         let free = free_subnet(&[([172, 17, 0, 0], 16), ([172, 18, 0, 0], 24)], false).unwrap();
         assert!(!overlaps(free, ([172, 18, 0, 0], 24)) && !overlaps(free, ([172, 17, 0, 0], 16)));
+    }
+
+    #[test]
+    fn the_default_pool_hands_out_dockers_subnets() {
+        assert_eq!(pick(None, &[], true, &[]), Some(([172, 17, 0, 0], 16)));
+        assert_eq!(pick(None, &[], false, &[]), Some(([172, 18, 0, 0], 16)));
+        let bridge = [([172, 17, 0, 0], 16u8), ([172, 18, 0, 0], 16)];
+        assert_eq!(pick(None, &bridge, false, &[]), Some(([172, 19, 0, 0], 16)));
+        // A routed 172.19.0.0/16 is skipped; once 172.18–31 are gone, 10.89.N.0/24.
+        assert_eq!(pick(None, &bridge, false, &[(u32::from_be_bytes([172, 19, 0, 0]), u32::MAX << 16)]), Some(([172, 20, 0, 0], 16)));
+        let all: Vec<([u8; 4], u8)> = (17..=31u8).map(|b| ([172, b, 0, 0], 16)).collect();
+        assert_eq!(pick(None, &all, false, &[]), Some(([10, 89, 0, 0], 24)));
+        // The bridge falls back the same way when 172.17 is taken.
+        assert_eq!(pick(None, &all[..1], true, &[]), Some(([172, 18, 0, 0], 16)));
+    }
+
+    #[test]
+    fn a_pool_of_its_own_hands_out_its_blocks() {
+        // A /12 gives /16s: the bridge the first, networks the next.
+        let p12 = Some(([10, 96, 0, 0], 12u8));
+        assert_eq!(pick(p12, &[], true, &[]), Some(([10, 96, 0, 0], 16)));
+        assert_eq!(pick(p12, &[([10, 96, 0, 0], 16)], false, &[]), Some(([10, 97, 0, 0], 16)));
+        // Before the bridge has moved (172.17, until the next start), the
+        // pool's first block stays free for it.
+        assert_eq!(pick(p12, &[([172, 17, 0, 0], 16)], false, &[]), Some(([10, 97, 0, 0], 16)));
+        // A /16 gives /24s.
+        let p16 = Some(([10, 200, 0, 0], 16u8));
+        assert_eq!(pick(p16, &[], true, &[]), Some(([10, 200, 0, 0], 24)));
+        assert_eq!(pick(p16, &[([10, 200, 0, 0], 24)], false, &[]), Some(([10, 200, 1, 0], 24)));
+        // A /20 gives sixteen /24s.
+        let p20 = Some(([192, 168, 16, 0], 20u8));
+        assert_eq!(pick(p20, &[([192, 168, 16, 0], 24)], false, &[]), Some(([192, 168, 17, 0], 24)));
+        let most: Vec<([u8; 4], u8)> = (16..31u8).map(|c| ([192, 168, c, 0], 24)).collect();
+        assert_eq!(pick(p20, &most, false, &[]), Some(([192, 168, 31, 0], 24)));
+    }
+
+    #[test]
+    fn a_pool_skips_taken_routed_and_user_subnets() {
+        let p16 = Some(([10, 200, 0, 0], 16u8));
+        // A user's --subnet inside the pool, and a VPN's route.
+        let taken = [([10, 200, 0, 0], 24u8), ([10, 200, 1, 128], 25)];
+        let vpn = [(u32::from_be_bytes([10, 200, 2, 0]), u32::MAX << 8)];
+        assert_eq!(pick(p16, &taken, false, &vpn), Some(([10, 200, 3, 0], 24)));
+        // A route over the whole pool leaves nothing.
+        assert_eq!(pick(p16, &[], false, &[(u32::from_be_bytes([10, 0, 0, 0]), u32::MAX << 24)]), None);
+        // A pool inside a host route that covers it.
+        assert_eq!(pick(Some(([10, 200, 0, 0], 20)), &[], false, &[(u32::from_be_bytes([10, 0, 0, 0]), u32::MAX << 24)]), None);
+    }
+
+    #[test]
+    fn a_full_pool_has_no_subnet_left() {
+        let p15 = Some(([10, 200, 0, 0], 15u8));
+        let both = [([10, 200, 0, 0], 16u8), ([10, 201, 0, 0], 16)];
+        assert_eq!(pick(p15, &both[..1], false, &[]), Some(([10, 201, 0, 0], 16)));
+        assert_eq!(pick(p15, &both, false, &[]), None);
+        assert_eq!(pick(p15, &both, true, &[]), None);
+        // A /24 pool is one network: the bridge's, or another's if the
+        // bridge is elsewhere.
+        let p24 = Some(([192, 168, 5, 0], 24u8));
+        assert_eq!(pick(p24, &[], false, &[]), Some(([192, 168, 5, 0], 24)));
+        assert_eq!(pick(p24, &[([192, 168, 5, 0], 24)], false, &[]), None);
     }
 
     #[test]

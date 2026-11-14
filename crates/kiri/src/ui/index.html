@@ -527,6 +527,15 @@ table.sized .name[data-detail] > div:last-child { max-width: none; }
 .pxf { display: grid; grid-template-columns: 120px 1fr; align-items: center; gap: 12px; font-size: var(--fs); color: var(--muted); }
 .pxf .field { width: 100%; }
 .res-foot { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+/* Settings → Network → Container addresses: the pool, and a line under it
+   that checks it as it's typed (red, amber or green dot). */
+.pref .pool { grid-row: 1 / span 2; grid-column: 2; width: 170px; }
+input.field.bad { border-color: var(--red); box-shadow: 0 0 0 3px color-mix(in srgb, var(--red) 20%, transparent); }
+.pool-hint { grid-column: 1 / -1; display: flex; align-items: flex-start; gap: 7px; font-size: var(--fs-small); color: var(--muted); }
+.pool-hint::before { content: ""; width: 7px; height: 7px; margin-top: calc(.7em - 3.5px); border-radius: 50%; flex: none; background: var(--moss); }
+.pool-hint.warn { color: var(--sun-text); } .pool-hint.warn::before { background: var(--sun); }
+.pool-hint.err { color: var(--red-text); } .pool-hint.err::before { background: var(--red); }
+.pool-hint .linkish { font-size: var(--fs-small); }
 /* Compose projects: a header row, its containers indented under it. */
 tr.group { cursor: pointer; }
 tr.group td { background: color-mix(in srgb, var(--raised) 55%, transparent); }
@@ -3744,8 +3753,54 @@ function networkPane() {
     ${d.mode === "custom" ? `<div class="pxgrid">${field("http", tr("HTTP proxy"), "proxy.example.com:3128")}${field("https", tr("HTTPS proxy"), "proxy.example.com:3128")}${field("no_proxy", tr("Bypass for"), "*.internal, registry.corp")}</div>` : ""}
     <div class="pref"><span class="t">${tr("Pass to containers")}</span><span class="d">${tr("New containers get {http}, {https} and {no}.", { http: `<span class="mono">HTTP_PROXY</span>`, https: `<span class="mono">HTTPS_PROXY</span>`, no: `<span class="mono">NO_PROXY</span>` })}${WIN ? "" : ` ${tr("A proxy on this Mac is reached as {host}.", { host: `<span class="mono">host.docker.internal</span>` })}`}</span>
       <div class="seg" role="group" aria-label="${tr("Pass to containers")}"><button data-pxc="0" aria-pressed="${!d.containers}">${tr("Off")}</button><button data-pxc="1" aria-pressed="${!!d.containers}">${tr("On")}</button></div></div>
-    <div class="res-foot"><span class="muted">${WIN ? tr("Container traffic leaves through WSL's network.") : tr("VPNs need no setting: container traffic leaves through macOS.")}</span><span style="flex:1"></span><button class="btn primary" data-savepx>${tr("Save")}</button></div>
+    ${p.pool ? `<div class="pref"><span class="t">${tr("Container addresses")}</span><span class="d">${tr("The pool Kiri takes each network's addresses from. Change it if your network or VPN uses the same range.")}</span>
+      <input class="field pool" id="px-pool" value="${esc(d.pool || "")}" aria-label="${tr("Container addresses")}" spellcheck="false" autocomplete="off">
+      <div class="pool-hint" id="pool-hint"></div></div>` : ""}
+    <div class="res-foot"><span class="muted">${WIN ? tr("VPNs need no other setting: container traffic leaves through WSL's network.") : tr("VPNs need no other setting: container traffic leaves through {os}.", { os: OS })}</span><span style="flex:1"></span><button class="btn primary" data-savepx>${tr("Save")}</button></div>
   </div>`;
+}
+
+/* Container addresses: a pool is a private range from /8 to /24, and it
+   shouldn't overlap this computer's own networks and VPNs (the engine sends
+   them). The engine checks it again on Save. */
+const ipNum = (s) => s.split(".").reduce((a, b) => a * 256 + +b, 0);
+function poolParse(s) {
+  const m = String(s).trim().match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\/(\d{1,2})$/);
+  if (!m || m.slice(1, 5).some((o) => +o > 255) || +m[5] < 8 || +m[5] > 24) return null;
+  const bits = +m[5], size = 2 ** (32 - bits);
+  return { base: Math.floor(ipNum(m.slice(1, 5).join(".")) / size) * size, size, bits };
+}
+const netParse = (s) => { const m = String(s).match(/^([\d.]+)\/(\d{1,2})$/); if (!m) return null; const size = 2 ** (32 - +m[2]); return { base: Math.floor(ipNum(m[1]) / size) * size, size }; };
+const poolOverlap = (a, b) => a.base < b.base + b.size && b.base < a.base + a.size;
+const poolInside = (a, b) => a.base >= b.base && a.base + a.size <= b.base + b.size;
+function poolCheck(value, info) {
+  const p = poolParse(value);
+  if (!p) return { cls: "err", text: tr("Not a range Kiri can use. Write it like {example} (from /8 to /24).", { example: "10.200.0.0/16" }) };
+  if (!["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"].some((r) => poolInside(p, netParse(r))))
+    return { cls: "err", text: tr("Use a private range (inside {a}, {b} or {c}).", { a: "10.0.0.0/8", b: "172.16.0.0/12", c: "192.168.0.0/16" }) };
+  const hit = (info.host || []).find((h) => netParse(h.net) && poolOverlap(p, netParse(h.net)));
+  if (hit) return { cls: "warn", text: tr("Overlaps {name}, {net}: Kiri leaves those addresses out of new networks.", { name: esc(hit.name), net: esc(hit.net) }) };
+  const n = p.bits <= 15 ? p.size / 65536 : p.size / 256, of = p.bits <= 15 ? "/16" : "/24";
+  return { cls: "ok", text: `${tr("No clash with this computer's networks.")} ${trn(n, "Room for {n} network of {size}.", "Room for {n} networks of {size}.", { size: of })}` };
+}
+/* Draws the line under the field and blocks Save on a red one. Networks
+   keep their addresses; the default bridge moves at the next start. */
+function poolDraw() {
+  const info = ui.proxy?.pool, el = $("pool-hint"), field = $("px-pool");
+  if (!info || !el || !field) return;
+  const v = field.value.trim(), c = poolCheck(v, info), p = poolParse(v);
+  let text = c.text;
+  if (c.cls !== "err") {
+    const bridge = info.bridge && netParse(info.bridge);
+    if (v !== info.pool) text += " " + tr("Networks you have keep their addresses.");
+    if (bridge && !poolInside(bridge, p)) text += " " + tr("The default network moves into it when Kiri next starts.");
+  }
+  if (v !== info.default) text += ` <button class="linkish" data-poolreset>${tr("Back to {pool}", { pool: esc(info.default) })}</button>`;
+  el.className = "pool-hint " + c.cls;
+  el.innerHTML = `<span>${text}</span>`;
+  field.classList.toggle("bad", c.cls === "err");
+  const save = document.querySelector("#content [data-savepx]");
+  if (save) save.disabled = c.cls === "err";
 }
 
 /* Settings → Domains: the ports the name routers listen on. Moving them
@@ -3909,6 +3964,8 @@ function renderSettings() {
   settingsShown.html = html; settingsShown.el = $("content").firstElementChild;
   diagDrawn();
   for (const k of ["http", "https", "no_proxy"]) $(`px-${k}`)?.addEventListener("input", (ev) => { ui.pxDraft[k] = ev.target.value; });
+  $("px-pool")?.addEventListener("input", (ev) => { ui.pxDraft.pool = ev.target.value.trim(); poolDraw(); });
+  poolDraw();
   for (const k of ["http", "https"]) $(`rp-${k}`)?.addEventListener("input", (ev) => {
     ui.rpDraft[k] = ev.target.value;
     const save = document.querySelector("#content [data-saverp]");
@@ -6649,7 +6706,7 @@ window.kiri = {
       case "importstep": ctxStep(e); ui.imp.steps[`${e.kind}/${e.name}`] = e; if (e.state !== "running") ui.imp.picked[e.kind].delete(e.name); if (ui.view === "settings") render(); drawImportModal(); break;
       case "importdone": if (ctx.card?.total) { ctx.card.finished = true; drawCtxCard(); } ui.imp.running = false; ui.imp.summary = e.failed ? tr("Imported {done}; {failed} failed (hover “Failed” for why).", { done: e.done, failed: e.failed }) : trn(e.done, "Imported {n} item.", "Imported {n} items."); send("inventory", { name: ui.imp.source }); toast(e.failed ? "error" : "ok", ui.imp.summary); drawImportModal(); break;
       case "routerports": ui.rports = e; ui.rpDraft = {}; render(); break;
-      case "proxy": ui.proxy = e; ui.pxDraft = { ...(e.settings || {}) }; if (ui.view === "settings") render(); break;
+      case "proxy": ui.proxy = e; ui.pxDraft = { ...(e.settings || {}), ...(e.pool ? { pool: e.pool.pool } : {}) }; if (ui.view === "settings") render(); break;
       case "resources": ui.res = e; ui.resDraft = { cpus: e.cpus, memory_mib: e.memory_mib }; if (ui.view === "settings") render(); break;
       case "detail": if (ui.view !== "containers") show("containers"); openDetail(e.id); break;
       case "inspect":
@@ -6765,7 +6822,8 @@ $("content").addEventListener("click", (ev) => {
   else if (importClick(ev.target)) render();
   else if ((el = t("[data-pxmode]"))) { ui.pxDraft.mode = el.dataset.pxmode; render(); }
   else if ((el = t("[data-pxc]"))) { ui.pxDraft.containers = !!+el.dataset.pxc; render(); }
-  else if ((el = t("[data-savepx]"))) send("setproxy", { value: ui.pxDraft });
+  else if ((el = t("[data-poolreset]"))) { const f = $("px-pool"); if (f && ui.proxy?.pool) { f.value = ui.pxDraft.pool = ui.proxy.pool.default; poolDraw(); } }
+  else if ((el = t("[data-savepx]"))) { if (!el.disabled && !(ui.proxy?.pool && poolCheck(ui.pxDraft.pool, ui.proxy.pool).cls === "err")) send("setproxy", { value: ui.pxDraft }); }
   else if ((el = t("[data-saverp]")) && ui.rports && !ui.rports.error) send("setrouterports", { value: { http: +(ui.rpDraft.http ?? ui.rports.http.port), https: +(ui.rpDraft.https ?? ui.rports.https.port) } });
   else if ((el = t("[data-saveres]"))) send("setresources", { value: ui.resDraft });
   else if ((el = t("[data-vmpower]"))) { el.disabled = true; powerEngine(el.dataset.vmpower); }

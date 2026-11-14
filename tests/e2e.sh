@@ -271,6 +271,19 @@ code network-dup 1 $D network create appnet
 $D rm -f db svc >/dev/null
 t network-rm "appnet" $D network rm appnet
 code network-rm-builtin 1 $D network rm bridge
+# Settings → Network → Container addresses: with a pool of its own, a new
+# network's subnet comes from it (a /24 from a /16). The pool is put back after.
+POOL_API="http://d/kiri/addresses"
+OLD_POOL=$(curl -s --unix-socket "$SOCK" "$POOL_API" | python3 -c 'import json,sys; print(json.load(sys.stdin)["pool"])')
+t pool-default-shown '"default":"172.16.0.0/12"' curl -s --unix-socket "$SOCK" "$POOL_API"
+t pool-not-private "not a private range" curl -s --unix-socket "$SOCK" -X PUT -d '{"pool":"8.8.0.0/16"}' "$POOL_API"
+t pool-not-a-range "Write it like 10.200.0.0/16" curl -s --unix-socket "$SOCK" -X PUT -d '{"pool":"10.213.0.0/25"}' "$POOL_API"
+t pool-set '"pool":"10.213.0.0/16"' curl -s --unix-socket "$SOCK" -X PUT -d '{"pool":"10.213.0.0/16"}' "$POOL_API"
+t pool-network-inside "inside" bash -c "$D network create poolnet >/dev/null && $D network inspect poolnet -f '{{range .IPAM.Config}}{{.Subnet}}{{end}}' | python3 -c 'import ipaddress,sys; n=ipaddress.ip_network(sys.stdin.read().strip()); print(\"inside\" if n.prefixlen == 24 and n.subnet_of(ipaddress.ip_network(\"10.213.0.0/16\")) else n)'"
+t pool-network-runs "10.213." $D run --rm --network poolnet alpine ip -4 addr show eth0
+t pool-user-subnet "10.234.0.0/24" bash -c "$D network create --subnet 10.234.0.0/24 poolnet2 >/dev/null && $D network inspect poolnet2 -f '{{range .IPAM.Config}}{{.Subnet}}{{end}}'"
+$D network rm poolnet poolnet2 >/dev/null 2>&1
+t pool-restore "\"pool\":\"$OLD_POOL\"" curl -s --unix-socket "$SOCK" -X PUT -d "{\"pool\":\"$OLD_POOL\"}" "$POOL_API"
 # --internal: no default route, so anything beyond the network fails at once
 # (as with Docker), while the network itself still works.
 $D network create --internal intnet >/dev/null

@@ -104,9 +104,12 @@ fn route(req: &Request, engine: &Arc<Engine>, w: &mut UnixStream, r: &mut BufRea
         // The window's Stop: off until Start, whatever asks for the VM meanwhile.
         ("POST", "/kiri/stop") => return reply(w, engine.stop_all().map(|()| Value::Null), 204),
         ("POST", "/kiri/sleep") => return reply(w, engine.sleep_now().map(|()| Value::Null), 204),
-        ("GET", "/kiri/proxy") => return reply(w, Ok(super::proxy::report()), 200),
-        ("POST", "/kiri/proxy") => return reply(w, set_proxy(req), 200),
+        ("GET", "/kiri/proxy") => return reply(w, Ok(network_report(engine)), 200),
+        ("POST", "/kiri/proxy") => return reply(w, set_proxy(req).map(|_| network_report(engine)), 200),
         ("PUT", "/kiri/proxy/system") => return reply(w, set_host_proxy(req), 200),
+        // Settings → Network → Container addresses: the pool new networks' subnets come from.
+        ("GET", "/kiri/addresses") => return reply(w, Ok(addresses(engine)), 200),
+        ("PUT", "/kiri/addresses") => return reply(w, set_addresses(req).map(|()| addresses(engine)), 200),
         ("GET", "/kiri/resources") => return reply(w, Ok(resources(engine)), 200),
         // Settings → Domains: the container-domain routers' ports.
         ("GET", "/kiri/domains") => return reply(w, Ok(super::domains::report()), 200),
@@ -606,8 +609,34 @@ fn resources(engine: &Engine) -> Value {
 
 /// The host's system proxy, from kiri-win on Windows: `{http, https,
 /// no_proxy: [..], pac}`, used while the mode is "system".
+/// Settings → Network: the proxy, and the container address pool.
+fn network_report(engine: &Arc<Engine>) -> Value {
+    let mut v = super::proxy::report();
+    v["pool"] = addresses(engine);
+    v
+}
+
+/// The pool, where the default bridge is now and this computer's networks.
+fn addresses(engine: &Arc<Engine>) -> Value {
+    let bridge = engine.lock_net().find("bridge").map(|n| (n.subnet, n.prefix));
+    super::pool::report(bridge)
+}
+
+/// `{"pool": "10.200.0.0/16"}`; new networks take theirs from it.
+fn set_addresses(req: &Request) -> Result<(), Error> {
+    let body: Value = serde_json::from_slice(&req.body).map_err(|e| Error::BadRequest(format!("invalid JSON: {e}")))?;
+    let pool = body["pool"].as_str().ok_or_else(|| Error::BadRequest("pool must be a range, like 10.200.0.0/16".into()))?;
+    let pool = super::pool::parse(pool).map_err(Error::BadRequest)?;
+    super::pool::save(pool).map_err(Error::Io)
+}
+
 fn set_host_proxy(req: &Request) -> Result<Value, Error> {
     let body: Value = serde_json::from_slice(&req.body).map_err(|e| Error::BadRequest(format!("invalid JSON: {e}")))?;
+    // Windows' own networks and VPNs, for Container addresses: a kiri-win
+    // without them sends none, and the distro's own are used.
+    if body["networks"].is_array() {
+        super::pool::set_windows(super::pool::read_list(&body["networks"]));
+    }
     let url = |k: &str| body[k].as_str().map(str::trim).filter(|v| !v.is_empty()).map(|v| if v.contains("://") { v.to_owned() } else { format!("http://{v}") });
     let no_proxy = body["no_proxy"].as_array().into_iter().flatten().filter_map(|v| v.as_str()).map(str::to_owned).collect();
     super::proxy::set_host(super::proxy::Effective { http: url("http"), https: url("https"), no_proxy, pac: body["pac"].as_bool().unwrap_or(false) });
@@ -629,8 +658,17 @@ fn set_proxy(req: &Request) -> Result<Value, Error> {
             return Err(Error::BadRequest(format!("{k} proxy: not a proxy address: {v}")));
         }
     }
+    // The container address pool is saved by the same Save. Checked first,
+    // so a bad one saves nothing; a window that doesn't send one keeps it.
+    let pool = match body["pool"].as_str() {
+        Some(p) => Some(super::pool::parse(p).map_err(Error::BadRequest)?),
+        None => None,
+    };
     super::proxy::save(&json!({"mode": mode, "http": field("http"), "https": field("https"), "no_proxy": field("no_proxy"), "containers": body["containers"].as_bool().unwrap_or(false)}))
         .map_err(Error::Io)?;
+    if let Some(pool) = pool {
+        super::pool::save(pool).map_err(Error::Io)?;
+    }
     Ok(super::proxy::report())
 }
 
