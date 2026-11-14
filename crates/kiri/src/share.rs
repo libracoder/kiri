@@ -135,9 +135,23 @@ impl TrafficFile {
 
     fn write(&self) {
         let [r, i, o] = &self.counts;
-        let v = json!({"url": *self.url.lock().unwrap(), "requests": r.load(Ordering::Relaxed), "in": i.load(Ordering::Relaxed), "out": o.load(Ordering::Relaxed)});
+        let v = json!({"url": *self.url.lock().unwrap_or_else(|e| e.into_inner()), "requests": r.load(Ordering::Relaxed), "in": i.load(Ordering::Relaxed), "out": o.load(Ordering::Relaxed)});
         let tmp = self.path.with_extension("tmp");
-        if std::fs::write(&tmp, v.to_string()).is_ok() {
+        // The file holds a shared URL's traffic; readable only by this user.
+        #[cfg(unix)]
+        let written = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)
+                .and_then(|mut f| f.write_all(v.to_string().as_bytes()))
+        };
+        #[cfg(not(unix))]
+        let written = std::fs::write(&tmp, v.to_string());
+        if written.is_ok() {
             let _ = std::fs::rename(&tmp, &self.path);
         }
     }
@@ -145,7 +159,7 @@ impl TrafficFile {
     fn on(&self, e: &Event) {
         match e {
             Event::Live { url, .. } => {
-                *self.url.lock().unwrap() = url.clone();
+                *self.url.lock().unwrap_or_else(|e| e.into_inner()) = url.clone();
                 self.write();
             }
             Event::Request(r) => {
@@ -752,6 +766,15 @@ pub fn is_shorthand(arg: &str) -> bool {
     port_or_addr(arg).is_some()
 }
 
+/// A target that isn't one of this machine's own names or addresses.
+/// Sharing it puts a public URL in front of a service that lives elsewhere
+/// on the machine's network, so [`start`] says so.
+fn target_is_global(t: &Target) -> bool {
+    let Some((host, _)) = t.addr.rsplit_once(':') else { return false };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    !matches!(host, "localhost" | "127.0.0.1" | "::1" | "0.0.0.0")
+}
+
 fn port_or_addr(arg: &str) -> Option<Target> {
     if !arg.is_empty() && arg.len() <= 5 && arg.bytes().all(|b| b.is_ascii_digit()) {
         let port: u16 = arg.parse().ok().filter(|p| *p > 0)?;
@@ -936,13 +959,15 @@ struct Stopper {
 
 impl Stopper {
     fn is_stopped(&self) -> bool {
-        *self.stopped.lock().unwrap()
+        *self.stopped.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Sleeps up to `d`; returns true if stopped meanwhile.
     fn sleep(&self, d: Duration) -> bool {
-        let g = self.stopped.lock().unwrap();
-        let (g, _) = self.cv.wait_timeout_while(g, d, |s| !*s).unwrap();
+        let g = self.stopped.lock().unwrap_or_else(|e| e.into_inner());
+        let (g, _) = self.cv
+            .wait_timeout_while(g, d, |s| !*s)
+            .unwrap_or_else(|e| e.into_inner());
         *g
     }
 }
@@ -958,9 +983,9 @@ impl Handle {
     }
 
     fn signal(&self) {
-        *self.stop.stopped.lock().unwrap() = true;
+        *self.stop.stopped.lock().unwrap_or_else(|e| e.into_inner()) = true;
         self.stop.cv.notify_all();
-        if let Some(s) = self.stop.sock.lock().unwrap().as_ref() {
+        if let Some(s) = self.stop.sock.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
             let _ = s.shutdown(Shutdown::Both);
         }
     }
@@ -986,6 +1011,14 @@ pub fn start(opts: Options, on_event: impl Fn(Event) + Send + Sync + 'static) ->
     let token = cfg.token.clone().ok_or_else(|| io::Error::other("not signed in; run `kiri share login`"))?;
     let srv = server(&cfg);
     let stop = Arc::new(Stopper::default());
+    // A target away from localhost is someone else's service going public:
+    // say so in the events, which the CLI and the window both show.
+    if target_is_global(&opts.target) {
+        on_event(Event::Notice(format!(
+            "`{}` is not localhost: the public URL reaches it, whoever has the link.",
+            opts.target.display
+        )));
+    }
     let on_event: OnEvent = Arc::new(move |e: Event| {
         log_event(&e);
         on_event(e)
@@ -1142,7 +1175,7 @@ impl Lanes {
 
     /// The lane with the least queued, or None when streams send `Data`.
     fn pick(&self) -> Option<Arc<Lane>> {
-        let list = self.list.lock().unwrap();
+        let list = self.list.lock().unwrap_or_else(|e| e.into_inner());
         if list.is_empty() {
             return None;
         }
@@ -1152,8 +1185,8 @@ impl Lanes {
 
     fn end(&self) {
         self.over.store(true, Ordering::Release);
-        self.list.lock().unwrap().clear();
-        for s in self.socks.lock().unwrap().drain(..) {
+        self.list.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        for s in self.socks.lock().unwrap_or_else(|e| e.into_inner()).drain(..) {
             let _ = s.shutdown(Shutdown::Both);
         }
     }
@@ -1169,7 +1202,7 @@ impl Lane {
 
 /// Writes `bytes` to a TLS connection, whole.
 fn write_all_tls(tls: &Mutex<rustls::ClientConnection>, sock: &TcpStream, mut bytes: &[u8]) -> io::Result<()> {
-    let mut c = tls.lock().unwrap();
+    let mut c = tls.lock().unwrap_or_else(|e| e.into_inner());
     let mut sock = sock;
     while !bytes.is_empty() {
         let n = c.writer().write(bytes)?;
@@ -1200,7 +1233,7 @@ impl Stream {
     fn kill(&self) {
         self.reset.store(true, Ordering::Release);
         self.cv.notify_all();
-        if let Some(s) = self.local.lock().unwrap().as_ref() {
+        if let Some(s) = self.local.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
             let _ = s.shutdown(Shutdown::Both);
         }
     }
@@ -1241,7 +1274,7 @@ impl Session {
             }
         });
         if spawned.is_ok() && !self.lanes.over.load(Ordering::Acquire) {
-            self.lanes.list.lock().unwrap().push(lane);
+            self.lanes.list.lock().unwrap_or_else(|e| e.into_inner()).push(lane);
         }
     }
 
@@ -1267,7 +1300,7 @@ impl Session {
         if self.lanes.over.load(Ordering::Acquire) {
             return;
         }
-        self.lanes.socks.lock().unwrap().push(keep);
+        self.lanes.socks.lock().unwrap_or_else(|e| e.into_inner()).push(keep);
         let _ = reader.set_read_timeout(Some(IDLE));
         let conn = Arc::new((Mutex::new(conn), sock));
         let mut join = Vec::new();
@@ -1284,7 +1317,7 @@ impl Session {
                 _ => break,
             };
             {
-                let mut c = conn.0.lock().unwrap();
+                let mut c = conn.0.lock().unwrap_or_else(|e| e.into_inner());
                 let mut input = &raw[..n];
                 while !input.is_empty() {
                     if c.read_tls(&mut input).is_err() || c.process_new_packets().is_err() {
@@ -1337,7 +1370,7 @@ impl Session {
 
     fn end_all(&self) {
         self.lanes.end();
-        for (_, s) in self.streams.lock().unwrap().drain() {
+        for (_, s) in self.streams.lock().unwrap_or_else(|e| e.into_inner()).drain() {
             s.kill();
             let _ = s.to_local.send(None);
         }
@@ -1364,30 +1397,30 @@ impl Session {
             Msg::Refused(r) => return Some(End::Final(r.to_owned())),
             Msg::Open { stream, .. } => self.open(stream),
             Msg::Data { stream, data } => {
-                let s = self.streams.lock().unwrap().get(&stream).cloned();
+                let s = self.streams.lock().unwrap_or_else(|e| e.into_inner()).get(&stream).cloned();
                 if let Some(s) = s {
                     s.bytes_in.fetch_add(data.len() as u64, Ordering::Relaxed);
                     if s.to_local.send(Some(data.to_vec())).is_err() {
-                        self.streams.lock().unwrap().remove(&stream);
+                        self.streams.lock().unwrap_or_else(|e| e.into_inner()).remove(&stream);
                         s.kill();
                         let _ = self.send(Msg::Reset { stream });
                     }
                 }
             }
             Msg::Window { stream, credit } => {
-                if let Some(s) = self.streams.lock().unwrap().get(&stream) {
-                    let mut c = s.credit.lock().unwrap();
+                if let Some(s) = self.streams.lock().unwrap_or_else(|e| e.into_inner()).get(&stream) {
+                    let mut c = s.credit.lock().unwrap_or_else(|e| e.into_inner());
                     *c = c.saturating_add(credit).min(self.lanes.window());
                     s.cv.notify_all();
                 }
             }
             Msg::Close { stream } => {
-                if let Some(s) = self.streams.lock().unwrap().get(&stream) {
+                if let Some(s) = self.streams.lock().unwrap_or_else(|e| e.into_inner()).get(&stream) {
                     let _ = s.to_local.send(None);
                 }
             }
             Msg::Reset { stream } => {
-                if let Some(s) = self.streams.lock().unwrap().remove(&stream) {
+                if let Some(s) = self.streams.lock().unwrap_or_else(|e| e.into_inner()).remove(&stream) {
                     s.kill();
                     let _ = s.to_local.send(None);
                 }
@@ -1433,11 +1466,11 @@ impl Session {
             request: Mutex::new(None),
             status: Mutex::new(0),
         });
-        self.streams.lock().unwrap().insert(id, stream.clone());
+        self.streams.lock().unwrap_or_else(|e| e.into_inner()).insert(id, stream.clone());
         let sess = self.clone();
         let spawned = std::thread::Builder::new().name("share-stream".into()).spawn(move || sess.carry(id, stream, rx));
         if spawned.is_err() {
-            self.streams.lock().unwrap().remove(&id);
+            self.streams.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
             let _ = self.send(Msg::Reset { stream: id });
         }
     }
@@ -1461,7 +1494,7 @@ impl Session {
         let local = match self.connect_local() {
             Ok(s) => s,
             Err(e) => {
-                self.streams.lock().unwrap().remove(&id);
+                self.streams.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
                 let _ = self.send(Msg::Reset { stream: id });
                 // The request line has usually arrived by now; log it as unanswered.
                 if let Ok(Some(first)) = rx.recv_timeout(Duration::from_millis(200))
@@ -1469,7 +1502,7 @@ impl Session {
                 {
                     (self.on_event)(Event::Request(Request { method, path, status: 0, ms: started.elapsed().as_millis() as u64, bytes_in: first.len() as u64, bytes_out: 0, at }));
                 }
-                let mut last = self.offline_notice.lock().unwrap();
+                let mut last = self.offline_notice.lock().unwrap_or_else(|e| e.into_inner());
                 if last.is_none_or(|t| t.elapsed() > Duration::from_secs(5)) {
                     *last = Some(Instant::now());
                     (self.on_event)(Event::Notice(format!("nothing is answering on {} ({e})", self.target.addr)));
@@ -1479,11 +1512,11 @@ impl Session {
         };
         let _ = local.set_nodelay(true);
         let (Ok(writer_sock), Ok(handle)) = (local.try_clone(), local.try_clone()) else {
-            self.streams.lock().unwrap().remove(&id);
+            self.streams.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
             let _ = self.send(Msg::Reset { stream: id });
             return;
         };
-        *stream.local.lock().unwrap() = Some(handle);
+        *stream.local.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
         if stream.reset.load(Ordering::Acquire) {
             let _ = local.shutdown(Shutdown::Both);
         }
@@ -1499,9 +1532,9 @@ impl Session {
         let mut seq = 0u32;
         loop {
             let allow = {
-                let mut c = stream.credit.lock().unwrap();
+                let mut c = stream.credit.lock().unwrap_or_else(|e| e.into_inner());
                 while *c == 0 && !stream.reset.load(Ordering::Acquire) {
-                    c = stream.cv.wait(c).unwrap();
+                    c = stream.cv.wait(c).unwrap_or_else(|e| e.into_inner());
                 }
                 if stream.reset.load(Ordering::Acquire) {
                     break;
@@ -1525,7 +1558,7 @@ impl Session {
                 Ok(n) => n,
                 Err(_) => {
                     if !stream.reset.swap(true, Ordering::AcqRel) {
-                        self.streams.lock().unwrap().remove(&id);
+                        self.streams.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
                         let _ = self.send(Msg::Reset { stream: id });
                     }
                     break;
@@ -1534,10 +1567,10 @@ impl Session {
             if first {
                 first = false;
                 if let Some(code) = parse_status_line(&buf[..n]) {
-                    *stream.status.lock().unwrap() = code;
+                    *stream.status.lock().unwrap_or_else(|e| e.into_inner()) = code;
                 }
             }
-            *stream.credit.lock().unwrap() -= n as u32;
+            *stream.credit.lock().unwrap_or_else(|e| e.into_inner()) -= n as u32;
             let sent = match self.lanes.pick() {
                 Some(lane) => {
                     let mut frame = Vec::with_capacity(proto::CHUNK_HEADER + n);
@@ -1562,13 +1595,13 @@ impl Session {
         if let Ok(w) = writer {
             let _ = w.join();
         }
-        self.streams.lock().unwrap().remove(&id);
-        let request = stream.request.lock().unwrap().take();
+        self.streams.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+        let request = stream.request.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some((method, path)) = request {
             (self.on_event)(Event::Request(Request {
                 method,
                 path,
-                status: *stream.status.lock().unwrap(),
+                status: *stream.status.lock().unwrap_or_else(|e| e.into_inner()),
                 ms: started.elapsed().as_millis() as u64,
                 bytes_in: stream.bytes_in.load(Ordering::Relaxed),
                 bytes_out: stream.bytes_out.load(Ordering::Relaxed),
@@ -1588,11 +1621,11 @@ impl Session {
             };
             if first {
                 first = false;
-                *stream.request.lock().unwrap() = parse_request_line(&data);
+                *stream.request.lock().unwrap_or_else(|e| e.into_inner()) = parse_request_line(&data);
             }
             if local.write_all(&data).is_err() {
                 if !stream.reset.swap(true, Ordering::AcqRel) {
-                    self.streams.lock().unwrap().remove(&id);
+                    self.streams.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
                     let _ = self.send(Msg::Reset { stream: id });
                 }
                 stream.kill();
@@ -1623,7 +1656,7 @@ fn session(srv: &Server, token: &str, who: &Who, name: &str, target: &Target, st
     }
     let mut reader = sock.try_clone()?;
     reader.set_read_timeout(Some(IDLE))?;
-    *stop.sock.lock().unwrap() = Some(sock.try_clone()?);
+    *stop.sock.lock().unwrap_or_else(|e| e.into_inner()) = Some(sock.try_clone()?);
     if stop.is_stopped() {
         let _ = sock.shutdown(Shutdown::Both);
     }
@@ -1656,7 +1689,7 @@ fn session(srv: &Server, token: &str, who: &Who, name: &str, target: &Target, st
     let end = read_loop(&sess, &mut reader, &mut welcomed);
     sess.end_all();
     let _ = sess.sock.shutdown(Shutdown::Both);
-    *stop.sock.lock().unwrap() = None;
+    *stop.sock.lock().unwrap_or_else(|e| e.into_inner()) = None;
     Ok((end, welcomed))
 }
 
@@ -1672,7 +1705,7 @@ fn read_loop(sess: &Arc<Session>, reader: &mut TcpStream, welcomed: &mut Option<
         };
         let mut closed = false;
         {
-            let mut c = sess.tls.lock().unwrap();
+            let mut c = sess.tls.lock().unwrap_or_else(|e| e.into_inner());
             let mut input = &raw[..n];
             while !input.is_empty() {
                 if let Err(e) = c.read_tls(&mut input) {
@@ -1831,7 +1864,7 @@ fn printer(target: String) -> impl Fn(Event) + Send + Sync + 'static {
             }
         }
         Event::Live { url, rate, remaining, warning, domains } => {
-            let mut shown = shown_url.lock().unwrap();
+            let mut shown = shown_url.lock().unwrap_or_else(|e| e.into_inner());
             if shown.as_deref() == Some(url.as_str()) {
                 println!("  {}  {}", p.accent("●"), p.dim("back online"));
                 return;
@@ -1966,7 +1999,7 @@ pub fn run(args: &[String]) -> io::Result<()> {
             let traffic = TrafficFile::start();
             let handle = start(Options { target, name, app: false }, move |e| {
                 if let Event::Ended { reason, error: true } = &e {
-                    *f.lock().unwrap() = Some(reason.clone());
+                    *f.lock().unwrap_or_else(|e| e.into_inner()) = Some(reason.clone());
                 }
                 if let Some(t) = &traffic {
                     t.on(&e);
@@ -1982,7 +2015,7 @@ pub fn run(args: &[String]) -> io::Result<()> {
                 Err(e) => return Err(e),
             };
             handle.wait();
-            match failed.lock().unwrap().take() {
+            match failed.lock().unwrap_or_else(|e| e.into_inner()).take() {
                 Some(_) => Err(io::Error::other("the tunnel closed")),
                 None => Ok(()),
             }
@@ -2198,6 +2231,35 @@ mod tests {
         assert_eq!(port_or_addr("127.0.0.1:5173").unwrap().label, "");
         assert_eq!(port_or_addr("[::1]:3000").unwrap().addr, "[::1]:3000");
         assert!(port_or_addr("web").is_none());
+    }
+
+    #[test]
+    fn remote_share_targets_are_flagged() {
+        assert!(target_is_global(&port_or_addr("10.0.0.5:6379").unwrap()));
+        assert!(target_is_global(&port_or_addr("nas.home.arpa:445").unwrap()));
+        assert!(!target_is_global(&port_or_addr("3000").unwrap()));
+        assert!(!target_is_global(&port_or_addr("127.0.0.1:5173").unwrap()));
+        assert!(!target_is_global(&port_or_addr("[::1]:3000").unwrap()));
+    }
+
+    #[test]
+    fn traffic_files_are_user_only() {
+        let dir = std::env::temp_dir().join(format!("kiri-traffic-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let f = TrafficFile {
+            path: dir.join("t.json"),
+            url: Mutex::new(String::new()),
+            counts: [AtomicU64::new(1), AtomicU64::new(2), AtomicU64::new(3)],
+            dirty: AtomicBool::new(false),
+            done: AtomicBool::new(false),
+        };
+        f.write();
+        let mode = {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::metadata(&f.path).unwrap().permissions().mode() & 0o777
+        };
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(mode, 0o600);
     }
 
     #[test]

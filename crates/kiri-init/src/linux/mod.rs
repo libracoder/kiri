@@ -32,6 +32,7 @@ use sys::{boottime_ns, check, mount};
 const DATA: &str = "/var/lib/kiri";
 
 pub fn main() {
+    install_panic_hook();
     let init_start_ns = boottime_ns();
     let result = run(init_start_ns);
     if let Err(e) = &result {
@@ -42,6 +43,26 @@ pub fn main() {
         std::process::exit(i32::from(result.is_err()));
     }
     power_off();
+}
+
+/// `panic = "abort"` means a panic in the agent unwinds nothing and leaves
+/// nothing behind but a dead vsock: say what happened and where, on the
+/// console (fd 2, what `run` uses), while it still can.
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let what = if let Some(s) = info.payload().downcast_ref::<&'static str>() {
+            (*s).to_owned()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "a panic payload that is not a string".to_owned()
+        };
+        let at = info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_else(|| "<unknown location>".to_owned());
+        eprintln!("kiri-init: panic at {at}: {what}");
+    }));
 }
 
 fn run(init_start_ns: u64) -> io::Result<()> {
