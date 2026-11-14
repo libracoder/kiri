@@ -353,6 +353,10 @@ fn data_dirs() -> io::Result<container::Paths> {
     // An x86-64 guest (Intel Macs, WSL2) runs amd64 binaries natively.
     #[cfg(target_arch = "aarch64")]
     rosetta();
+    // An x86-64 guest has no Rosetta for Linux: arm64 images run through
+    // qemu-user, when the Mac shares it in.
+    #[cfg(target_arch = "x86_64")]
+    arm64_emulator();
     std::fs::create_dir_all(format!("{DATA}/volumes"))?;
     let root = PathBuf::from(DATA);
     let paths = container::Paths {
@@ -400,6 +404,34 @@ fn rosetta() {
     );
     if let Err(e) = sys::write_file("/proc/sys/fs/binfmt_misc/register", X86_64) {
         eprintln!("kiri-init: registering Rosetta: {e}");
+    }
+}
+
+/// arm64 Linux binaries through qemu-user, when the Mac shares it in: arm64
+/// images then run as amd64 ones do on Apple silicon. Rosetta for Linux
+/// exists only on Apple silicon, so an Intel Mac ships qemu-aarch64 with the
+/// app and shares it over virtiofs, mounted here at `/run/qemu`. The `F` flag
+/// opens the interpreter now, so it works inside every container's mounts.
+#[cfg(target_arch = "x86_64")]
+fn arm64_emulator() {
+    sys::mkdir(c"/run/qemu", 0o755);
+    if mount(c"qemu", c"/run/qemu", c"virtiofs", libc::MS_RDONLY, None).is_err() {
+        return;
+    }
+    if let Err(e) = mount(c"binfmt_misc", c"/proc/sys/fs/binfmt_misc", c"binfmt_misc", 0, None) {
+        eprintln!("kiri-init: no binfmt_misc ({e}); arm64 images will not run");
+        return;
+    }
+    // AArch64: e_machine 0xB7 at offset 18, ET_EXEC or ET_DYN in e_type.
+    const AARCH64: &str = concat!(
+        ":qemu-aarch64:M::",
+        r"\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\xb7\x00",
+        ":",
+        r"\xff\xff\xff\xff\xff\xff\xff\x00\x00\x00\x00\x00\x00\x00\x00\x00\xfe\xff\xff\xff",
+        ":/run/qemu/qemu-aarch64:CF",
+    );
+    if let Err(e) = sys::write_file("/proc/sys/fs/binfmt_misc/register", AARCH64) {
+        eprintln!("kiri-init: registering qemu-aarch64: {e}");
     }
 }
 

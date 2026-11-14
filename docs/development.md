@@ -11,6 +11,7 @@ build its own kernel: `DOCKER_CONTEXT=kiri cargo xtask kernel`.
 cargo xtask kernel    # guest/out/Image
 cargo xtask disk      # guest/out/data.img (sparse 64 GiB ext4 template)
 cargo xtask guest     # guest/out/initramfs.cpio
+cargo xtask qemu      # guest/out/qemu/qemu-aarch64 (Intel: arm64 images)
 cargo xtask host      # target/release/kiri, signed with the virtualization entitlement
 ```
 
@@ -22,8 +23,11 @@ cross-compiled on Apple Silicon), the host for `x86_64-apple-darwin`
 buildx, released as `Kiri-<version>-x86_64.dmg`/`.tar.gz` with its own feed,
 `latest-mac-x86_64.json`. Each Mac gets its own app rather than one universal
 app, which would carry both builds of the docker tools. On Intel there is
-no Rosetta for Linux: amd64 images run natively, and images with no amd64
-build are refused.
+no Rosetta for Linux: amd64 images run natively, and arm64 ones through the
+static qemu `cargo xtask qemu` fetches, which the app bundles as
+`Resources/qemu` and the daemon shares into the guest (`KIRI_QEMU_DIR` points
+a checkout elsewhere). Without it, images with no amd64 build are refused
+with that reason rather than failing later with `exec format error`.
 
 On Windows, `cargo xtask windows-dev` builds the Linux engine, Kiri Linux and
 Docker tools into `target/kiri-windows-x86_64` with a debug `kiri-win.exe`.
@@ -74,8 +78,9 @@ kiri UI ────┘
   patch that cuts virtio-pci reset waits from a scheduler tick to
   microseconds, one that hands big TCP to the host as GSO, one that keeps
   newly created FUSE files owner-readable, and an upstream GRO fix that keeps
-  forwarded packets segmentable. Rosetta is shared in over virtiofs and registered with
-  binfmt_misc.
+  forwarded packets segmentable. Rosetta is shared in over virtiofs and
+  registered with binfmt_misc; an Intel guest has no Rosetta, so a static
+  qemu-aarch64 is shared in and registered the same way, for arm64 images.
 - **Guest agent**: a ~900 KB static Rust binary that is PID 1. One `poll()`
   loop serves the host, reaps children, forwards container output, relays
   ports, answers DNS and runs DHCP. `docker cp` and friends run in forked

@@ -26,6 +26,8 @@ pub struct Config {
     pub agent_port: u32,
     pub disk: Option<PathBuf>,
     pub share: Option<(PathBuf, String)>,
+    /// macOS only: the Intel guest's arm64 emulator (see `apple::Config`).
+    pub emulator: Option<(PathBuf, String)>,
     pub rosetta_tag: Option<String>,
     pub nat_mac: Option<String>,
 }

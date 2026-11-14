@@ -131,6 +131,7 @@ fn main() -> ExitCode {
     let arch = Arch::from_args();
     let result = match task.as_str() {
         "guest" => guest(&root, arch),
+        "qemu" => qemu(&root, arch),
         "kernel" => kernel(&root, arch),
         "disk" => disk(&root),
         "host" => host(&root, arch),
@@ -164,7 +165,7 @@ fn main() -> ExitCode {
         "pack" => release(&root, &root.join(arch.app_dir(false)), arch),
         "all" => guest(&root, arch).and_then(|()| host(&root, arch)),
         _ => {
-            eprintln!("usage: cargo xtask <guest|kernel|disk|host|linux|windows|windows-dev|msi|msi-pack|docker-win-arm64|app|app-lite|app-dev|release|sign|pack|all> [--arch arm64]");
+            eprintln!("usage: cargo xtask <guest|qemu|kernel|disk|host|linux|windows|windows-dev|msi|msi-pack|docker-win-arm64|app|app-lite|app-dev|release|sign|pack|all> [--arch arm64]");
             return ExitCode::FAILURE;
         }
     };
@@ -207,6 +208,28 @@ fn guest(root: &Path, arch: Arch) -> io::Result<()> {
     let path = arch.guest_out(root)?.join("initramfs.cpio");
     fs::write(&path, cpio.finish())?;
     println!("{} ({} KiB)", path.display(), fs::metadata(&path)?.len() / 1024);
+    Ok(())
+}
+
+/// The arm64 emulator an Intel Mac's guest needs: `guest/out/qemu/qemu-aarch64`
+/// from there on, which `xtask app` bundles as `Resources/qemu`. Static, so
+/// the guest needs nothing else. Apple silicon runs arm64 natively, so this
+/// does nothing there.
+fn qemu(root: &Path, arch: Arch) -> io::Result<()> {
+    if arch != Arch::X86_64 {
+        println!("arm64 is native on Apple silicon: no emulator needed");
+        return Ok(());
+    }
+    let (v, sum) = cli_pins::QEMU_AARCH64;
+    let cache = root.join("target/qemu-cache/x86_64");
+    let download = fetch(&cache, &format!("qemu-aarch64-{v}"), &cli_pins::qemu_aarch64_url(v))?;
+    verify(&download, sum)?;
+    let out = root.join("guest/out/qemu");
+    fs::create_dir_all(&out)?;
+    let bin = out.join("qemu-aarch64");
+    fs::copy(&download, &bin)?;
+    run(Command::new("chmod").arg("755").arg(&bin))?;
+    println!("{} ({} KiB)", bin.display(), fs::metadata(&bin)?.len() / 1024);
     Ok(())
 }
 
@@ -730,6 +753,17 @@ fn app(root: &Path, arch: Arch, lite: bool) -> io::Result<PathBuf> {
     let out = arch.guest_out(root)?;
     for f in [arch.kernel(), "initramfs.cpio"] {
         fs::copy(out.join(f), res.join("guest").join(f))?;
+    }
+    // The Intel guest's arm64 emulator (`xtask qemu`): shared into the VM, so
+    // arm64 images run on Intel Macs, which have no Rosetta for Linux.
+    if arch == Arch::X86_64 {
+        let bin = root.join("guest/out/qemu/qemu-aarch64");
+        if bin.is_file() {
+            fs::create_dir_all(res.join("qemu"))?;
+            fs::copy(&bin, res.join("qemu/qemu-aarch64"))?;
+        } else {
+            eprintln!("xtask app: no guest/out/qemu/qemu-aarch64: run `cargo xtask qemu` to run arm64 images");
+        }
     }
     // The disk template is 64 GiB sparse. Packed as a sparse tarball it is a
     // few hundred KB, and zips, notarization and downloads never see the

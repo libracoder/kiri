@@ -109,6 +109,7 @@ impl Guest {
             agent_port: kiri_proto::HOST_PORT,
             disk: None,
             share: None,
+            emulator: None,
             rosetta_tag: None,
             nat_mac: None,
         };
@@ -139,6 +140,8 @@ impl Guest {
             nat_mac: if opts.data_disk { Some(mac_address()?) } else { None },
             // The Mac's filesystem, for bind mounts: /mnt/mac in the guest.
             share: opts.data_disk.then(|| (PathBuf::from("/"), "kiri-mac".to_owned())),
+            // arm64 images on an Intel Mac: qemu-user, shared in as Rosetta is.
+            emulator: emulator_dir().map(|d| (d, EMULATOR_TAG.to_owned())),
             rosetta_tag: opts.data_disk.then(|| "rosetta".to_owned()),
         };
         if !cfg.kernel.is_file() {
@@ -395,6 +398,32 @@ fn mac_address() -> io::Result<String> {
 pub const KERNEL: &str = "bzImage";
 #[cfg(not(target_arch = "x86_64"))]
 pub const KERNEL: &str = "Image";
+
+/// The virtiofs tag the guest mounts as `/run/qemu`. `kiri-init` looks for it
+/// on x86-64, where arm64 images need qemu-user.
+pub const EMULATOR_TAG: &str = "qemu";
+
+/// Where the arm64 emulator lives, on a Mac that needs one: an Intel Mac's
+/// guest is x86-64 and Rosetta for Linux is Apple silicon only, so arm64
+/// images run through qemu-user shared in over virtiofs. `None` on Apple
+/// silicon (arm64 is native there) and where qemu-aarch64 is not installed.
+///
+/// Looked for in `KIRI_QEMU_DIR`, then `Resources/qemu` in the app, then
+/// `guest/out/qemu` in a checkout.
+pub fn emulator_dir() -> Option<PathBuf> {
+    if !cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        return None;
+    }
+    if let Some(d) = std::env::var_os("KIRI_QEMU_DIR") {
+        return Some(PathBuf::from(d)).filter(|d| d.join("qemu-aarch64").is_file());
+    }
+    // Through its links, as in `guest_dir`: `kiri` on the PATH is one
+    // (~/.kiri/bin/kiri), and the emulator is beside the binary it leads to.
+    let exe = std::env::current_exe().ok().map(|e| e.canonicalize().unwrap_or(e));
+    let bundled = exe.as_ref().and_then(|e| e.parent().map(|d| d.join("../Resources/qemu"))).filter(|d| d.join("qemu-aarch64").is_file());
+    let guest = guest_dir();
+    bundled.or_else(|| guest.parent().map(|d| d.join("qemu")).filter(|d| d.join("qemu-aarch64").is_file()))
+}
 
 /// Whether this process runs under Rosetta (`sysctl.proc_translated`).
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
