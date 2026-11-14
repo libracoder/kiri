@@ -5,7 +5,7 @@
 
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -35,6 +35,8 @@ pub struct Latency {
 pub struct BootOptions {
     /// Send the guest console to stdout.
     pub console: bool,
+    /// Keep a bounded, redacted guest console in this file.
+    pub console_log: Option<PathBuf>,
     /// Attach the persistent data disk (layers and containers). Without it
     /// the guest keeps them in memory, which is fine for a quick boot test.
     pub data_disk: bool,
@@ -43,6 +45,16 @@ pub struct BootOptions {
     pub memory_mib: Option<u64>,
     /// The VM's CPUs; 2 if not set.
     pub cpus: Option<usize>,
+}
+
+fn console_output(opts: &BootOptions) -> io::Result<Option<OwnedFd>> {
+    if let Some(path) = &opts.console_log {
+        crate::diag::console::capture(path).map(Some)
+    } else if opts.console {
+        io::stdout().as_fd().try_clone_to_owned().map(Some)
+    } else {
+        Ok(None)
+    }
 }
 
 /// One container run, as the host asks for it.
@@ -105,7 +117,7 @@ impl Guest {
             kernel: PathBuf::new(),
             initrd: agent_binary(),
             cmdline: String::new(),
-            console: if opts.console { Some(io::stdout().as_fd().try_clone_to_owned()?) } else { None },
+            console: console_output(opts)?,
             agent_port: kiri_proto::HOST_PORT,
             disk: None,
             share: None,
@@ -124,8 +136,11 @@ impl Guest {
         // swiotlb=noforce: the VM's virtio devices address all of memory, so
         // the kernel's 64 MB bounce buffer would sit there unused.
         let mut cmdline = String::from("console=hvc0 rdinit=/init panic=-1 rcupdate.rcu_expedited=1 swiotlb=noforce");
-        if !opts.console {
+        if !opts.console && opts.console_log.is_none() {
             cmdline.push_str(" quiet loglevel=0");
+        } else if !opts.console {
+            // Keep warnings and oopses even in release builds.
+            cmdline.push_str(" quiet loglevel=4");
         }
         let cfg = Config {
             cpus: opts.cpus.unwrap_or(2),
@@ -133,7 +148,7 @@ impl Guest {
             kernel: dir.join(KERNEL),
             initrd: dir.join("initramfs.cpio"),
             cmdline,
-            console: if opts.console { Some(io::stdout().as_fd().try_clone_to_owned()?) } else { None },
+            console: console_output(opts)?,
             agent_port: kiri_proto::HOST_PORT,
             disk: if opts.data_disk { Some(data_disk(&dir)?) } else { None },
             nat_mac: if opts.data_disk { Some(mac_address()?) } else { None },
