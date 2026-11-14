@@ -19,6 +19,7 @@ Source2:        kiri.service
 Source3:        LICENSE
 Source4:        NOTICE
 Source18:       dev.kiri.host-access.policy
+Source20:       kiri-nm.conf
 %if 0%{?with_cli}
 Source5:        docker
 Source6:        docker-compose
@@ -83,6 +84,7 @@ install -D -m 644 %{SOURCE2} %{buildroot}%{_unitdir}/kiri.service
 install -D -m 644 %{SOURCE3} %{buildroot}%{_licensedir}/%{name}/LICENSE
 install -D -m 644 %{SOURCE4} %{buildroot}%{_licensedir}/%{name}/NOTICE
 install -D -m 644 %{SOURCE18} %{buildroot}%{_datadir}/polkit-1/actions/dev.kiri.host-access.policy
+install -D -m 644 %{SOURCE20} %{buildroot}%{_prefix}/lib/NetworkManager/conf.d/kiri.conf
 %if 0%{?with_cli}
 install -D -m 755 %{SOURCE5} %{buildroot}/usr/libexec/kiri/bin/docker
 install -D -m 755 %{SOURCE8} %{buildroot}/usr/libexec/kiri/docker
@@ -104,6 +106,9 @@ getent group kiri >/dev/null || groupadd --system kiri
 exit 0
 
 %post
+# NetworkManager reads conf.d when it starts or is told to: without this,
+# kiri.conf there would wait for the next boot. Nothing to do without it.
+nmcli general reload conf >/dev/null 2>&1 || :
 if [ -d /run/systemd/system ]; then
   systemctl daemon-reload >/dev/null 2>&1 || :
   # Not started or enabled: it starts when someone sets Kiri up (the window's
@@ -225,6 +230,10 @@ exit 0
 if [ -d /run/systemd/system ]; then
   systemctl daemon-reload >/dev/null 2>&1 || :
 fi
+# On removal, NetworkManager forgets kiri.conf now rather than at the next boot.
+if [ "$1" -eq 0 ]; then
+  nmcli general reload conf >/dev/null 2>&1 || :
+fi
 if [ "$1" -eq 0 ]; then
   echo "Kiri is removed; its images, containers and volumes stay in /var/lib/kiri"
 fi
@@ -237,6 +246,7 @@ exit 0
 %{_bindir}/kiri-init
 %{_unitdir}/kiri.service
 %{_datadir}/polkit-1/actions/dev.kiri.host-access.policy
+%{_prefix}/lib/NetworkManager/conf.d/kiri.conf
 %if 0%{?with_cli}
 %dir /usr/libexec/kiri
 %dir /usr/libexec/kiri/bin

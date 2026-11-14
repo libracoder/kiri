@@ -56,6 +56,10 @@ case "$1" in
     ;;
   configure)
     getent group kiri >/dev/null || groupadd --system kiri
+    # NetworkManager reads conf.d when it starts or is told to: without
+    # this, kiri.conf there would wait for the next boot. Nothing to do
+    # without it.
+    nmcli general reload conf >/dev/null 2>&1 || true
     # The engine isn't started or enabled here: it starts when someone sets
     # Kiri up (the window's Allow access, or `kiri host-access`, which runs
     # `systemctl enable --now kiri`). Installing alone runs nothing.

@@ -5,6 +5,8 @@ set -e
 case "$1" in
   remove)
     [ -d /run/systemd/system ] && systemctl daemon-reload || true
+    # NetworkManager forgets kiri.conf now rather than at the next boot.
+    nmcli general reload conf >/dev/null 2>&1 || true
     echo "Kiri is removed; its images, containers and volumes stay in /var/lib/kiri (apt purge kiri deletes them)"
     ;;
   purge)
