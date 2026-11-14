@@ -155,7 +155,20 @@ fn connect() -> io::Result<UnixStream> {
 /// here and handed to the helper, which captures the device and serves it.
 /// Returns once the device is captured, or with why it couldn't be.
 pub fn attach(location: &str, name: &str, speed: u32, devid: u32) -> io::Result<()> {
-    let helper = connect()?;
+    attach_through(connect()?, location, name, speed, devid)
+}
+
+/// The same, for the daemon attaching a device again when it comes back:
+/// never the administrator prompt, so only through a helper that is
+/// already this Kiri's.
+pub fn reattach(location: &str, name: &str, speed: u32, devid: u32) -> io::Result<()> {
+    if !current() {
+        return Err(io::Error::other("the USB helper is not this Kiri's (attach it once from the window to update it)"));
+    }
+    attach_through(UnixStream::connect(socket())?, location, name, speed, devid)
+}
+
+fn attach_through(helper: UnixStream, location: &str, name: &str, speed: u32, devid: u32) -> io::Result<()> {
     let (stream, _reader) = super::usbip::connect(&crate::client::socket()?, location, name, speed, devid)?;
     send_fd(&helper, format!("attach {location}\n").as_bytes(), stream.as_raw_fd())?;
     // The helper and its server hold the connection now.
@@ -192,7 +205,7 @@ pub fn serve(label: &str, uid: &str) -> io::Result<()> {
     // already gone back to macOS.
     let exe = std::env::current_exe()?;
     let sessions = Arc::new(AtomicUsize::new(0));
-    eprintln!("kiri usb helper: listening for uid {uid}");
+    super::mac::log(&format!("helper listening for uid {uid}"));
     for conn in listener.incoming() {
         let Ok(conn) = conn else { continue };
         let (exe, sessions) = (exe.clone(), sessions.clone());
