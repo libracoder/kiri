@@ -27,7 +27,8 @@
 [lang|=ja]{--f-text:"Segoe UI Variable Text","Segoe UI","Yu Gothic UI","Meiryo UI",sans-serif;--f-display:"Segoe UI Variable Display","Segoe UI","Yu Gothic UI","Meiryo UI",sans-serif}
 [lang|=ko]{--f-text:"Segoe UI Variable Text","Segoe UI","Malgun Gothic",sans-serif;--f-display:"Segoe UI Variable Display","Segoe UI","Malgun Gothic",sans-serif}
 [lang|=ko]{word-break:keep-all}
-/* India's scripts in Nirmala UI, Windows' face for them; Thai and Lao in Leelawadee UI. */
+/* India's scripts in Nirmala UI, Windows' face for them; Thai and Lao in Leelawadee UI; Ethiopic in Ebrima. */
+[lang|=am]{--f-text:"Segoe UI Variable Text","Segoe UI","Ebrima","Nyala",sans-serif;--f-display:"Segoe UI Variable Display","Segoe UI","Ebrima","Nyala",sans-serif}
 [lang|=th],[lang|=lo]{--f-text:"Segoe UI Variable Text","Segoe UI","Leelawadee UI",sans-serif;--f-display:"Segoe UI Variable Display","Segoe UI","Leelawadee UI",sans-serif}
 [lang|=hi],[lang|=bn],[lang|=ta],[lang|=te]{--f-text:"Segoe UI Variable Text","Segoe UI","Nirmala UI",sans-serif;--f-display:"Segoe UI Variable Display","Segoe UI","Nirmala UI",sans-serif}
 *{box-sizing:border-box}
@@ -299,7 +300,7 @@ addWords(/*STRINGS*/{});
 /* As the main window's langFor: the first of the system's languages Kiri has
    (zh-TW, zh-HK, zh-MO and zh-Hant… read Traditional Chinese, any other Chinese
    Simplified, any Portuguese Brazilian, "in" Indonesian), else English. */
-var LANG_IDS = ['en', 'id', 'ca', 'cs', 'de', 'es', 'fr', 'it', 'lt', 'hu', 'nb', 'pl', 'pt-BR', 'ro', 'sq', 'sl', 'fi', 'vi', 'tr', 'el', 'bg', 'ru', 'uk', 'kk', 'ar', 'fa', 'ckb', 'hi', 'bn', 'ta', 'te', 'th', 'lo', 'ja', 'ko', 'zh-Hans', 'zh-Hant'];
+var LANG_IDS = ['en', 'id', 'ca', 'cs', 'de', 'es', 'fr', 'it', 'lt', 'hu', 'nb', 'pl', 'pt-BR', 'ro', 'sq', 'sl', 'fi', 'vi', 'tr', 'el', 'bg', 'ru', 'uk', 'kk', 'ar', 'fa', 'ckb', 'am', 'hi', 'bn', 'ta', 'te', 'th', 'lo', 'ja', 'ko', 'zh-Hans', 'zh-Hant'];
 function langFor(tag) {
   var t = String(tag || '').toLowerCase().replace(/_/g, '-');
   var is = function (id) { return t === id || t.indexOf(id + '-') === 0; };
@@ -455,7 +456,7 @@ function trn(n, one, other, vars) { var s = isOne(n) ? one : other, v = { n: n }
     ['nb', 'Norsk bokmål', 'Hei'], ['pl', 'Polski', 'Cześć'], ['pt-BR', 'Português (Brasil)', 'Olá'], ['ro', 'Română', 'Salut'], ['sq', 'Shqip', 'Përshëndetje'],
     ['sl', 'Slovenščina', 'Živjo'], ['fi', 'Suomi', 'Hei'], ['vi', 'Tiếng Việt', 'Xin chào'], ['tr', 'Türkçe', 'Merhaba'], ['el', 'Ελληνικά', 'Γεια σου'],
     ['bg', 'Български', 'Здравей'], ['ru', 'Русский', 'Привет'], ['uk', 'Українська', 'Привіт'], ['kk', 'Қазақша', 'Сәлем'], ['ar', 'العربية', 'مرحبًا'],
-    ['fa', 'فارسی', 'سلام'], ['ckb', 'کوردیی ناوەندی', 'سڵاو'], ['hi', 'हिन्दी', 'नमस्ते'], ['bn', 'বাংলা', 'নমস্কার'], ['ta', 'தமிழ்', 'வணக்கம்'],
+    ['fa', 'فارسی', 'سلام'], ['ckb', 'کوردیی ناوەندی', 'سڵاو'], ['am', 'አማርኛ', 'ሰላም'], ['hi', 'हिन्दी', 'नमस्ते'], ['bn', 'বাংলা', 'নমস্কার'], ['ta', 'தமிழ்', 'வணக்கம்'],
     ['te', 'తెలుగు', 'నమస్కారం'], ['th', 'ไทย', 'สวัสดี'], ['lo', 'ລາວ', 'ສະບາຍດີ'], ['ja', '日本語', 'こんにちは'], ['ko', '한국어', '안녕하세요'],
     ['zh-Hans', '简体中文', '你好'], ['zh-Hant', '繁體中文', '你好']];
   var langDone = false, sysLang = langId('system');

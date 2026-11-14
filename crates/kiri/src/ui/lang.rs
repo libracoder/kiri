@@ -21,7 +21,7 @@ use std::sync::OnceLock;
 
 /// Every translation Kiri ships, by language tag, as lang/<tag>.json maps
 /// English to it. English itself has no file.
-pub const FILES: [(&str, &str); 36] = [
+pub const FILES: [(&str, &str); 37] = [
     ("id", include_str!("lang/id.json")),
     ("ca", include_str!("lang/ca.json")),
     ("cs", include_str!("lang/cs.json")),
@@ -48,6 +48,7 @@ pub const FILES: [(&str, &str); 36] = [
     ("ar", include_str!("lang/ar.json")),
     ("fa", include_str!("lang/fa.json")),
     ("ckb", include_str!("lang/ckb.json")),
+    ("am", include_str!("lang/am.json")),
     ("hi", include_str!("lang/hi.json")),
     ("bn", include_str!("lang/bn.json")),
     ("ta", include_str!("lang/ta.json")),
@@ -410,6 +411,8 @@ mod tests {
             ("ku", None),
             ("ku-TR", None),
             ("te-IN", Some("te")),
+            ("am", Some("am")),
+            ("am-ET", Some("am")),
             ("th-TH", Some("th")),
             ("lo-LA", Some("lo")),
             ("tr-TR", Some("tr")),

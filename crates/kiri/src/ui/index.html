@@ -2342,9 +2342,9 @@ function rtlReady(s) {
 }
 addWords(/*STRINGS*/{});
 /* The languages Settings offers, by their own names: English, then the Latin
-   alphabets, Greek, Cyrillic, the Arabic script, the Indian scripts, Thai and
-   Lao, then Japanese, Korean and Chinese. */
-const LANGS = [["en", "English"], ["id", "Bahasa Indonesia"], ["ca", "Català"], ["cs", "Čeština"], ["de", "Deutsch"], ["es", "Español"], ["fr", "Français"], ["it", "Italiano"], ["lt", "Lietuvių"], ["hu", "Magyar"], ["nb", "Norsk bokmål"], ["pl", "Polski"], ["pt-BR", "Português (Brasil)"], ["ro", "Română"], ["sq", "Shqip"], ["sl", "Slovenščina"], ["fi", "Suomi"], ["vi", "Tiếng Việt"], ["tr", "Türkçe"], ["el", "Ελληνικά"], ["bg", "Български"], ["ru", "Русский"], ["uk", "Українська"], ["kk", "Қазақша"], ["ar", "العربية"], ["fa", "فارسی"], ["ckb", "کوردیی ناوەندی"], ["hi", "हिन्दी"], ["bn", "বাংলা"], ["ta", "தமிழ்"], ["te", "తెలుగు"], ["th", "ไทย"], ["lo", "ລາວ"], ["ja", "日本語"], ["ko", "한국어"], ["zh-Hans", "简体中文"], ["zh-Hant", "繁體中文"]];
+   alphabets, Greek, Cyrillic, the Arabic script, Ethiopic, the Indian scripts,
+   Thai and Lao, then Japanese, Korean and Chinese. */
+const LANGS = [["en", "English"], ["id", "Bahasa Indonesia"], ["ca", "Català"], ["cs", "Čeština"], ["de", "Deutsch"], ["es", "Español"], ["fr", "Français"], ["it", "Italiano"], ["lt", "Lietuvių"], ["hu", "Magyar"], ["nb", "Norsk bokmål"], ["pl", "Polski"], ["pt-BR", "Português (Brasil)"], ["ro", "Română"], ["sq", "Shqip"], ["sl", "Slovenščina"], ["fi", "Suomi"], ["vi", "Tiếng Việt"], ["tr", "Türkçe"], ["el", "Ελληνικά"], ["bg", "Български"], ["ru", "Русский"], ["uk", "Українська"], ["kk", "Қазақша"], ["ar", "العربية"], ["fa", "فارسی"], ["ckb", "کوردیی ناوەندی"], ["am", "አማርኛ"], ["hi", "हिन्दी"], ["bn", "বাংলা"], ["ta", "தமிழ்"], ["te", "తెలుగు"], ["th", "ไทย"], ["lo", "ລາວ"], ["ja", "日本語"], ["ko", "한국어"], ["zh-Hans", "简体中文"], ["zh-Hant", "繁體中文"]];
 /* The system's languages in order (the host passes them; a browser has its own). */
 const sysLangs = () => (window.KIRI_LANG?.os?.length ? window.KIRI_LANG.os : navigator.languages || [navigator.language || "en"]);
 /* A language tag to one Kiri has, as lang.rs's lang_for: Chinese written in
@@ -2457,10 +2457,11 @@ const CJK_FONTS = {
    Windows, then Linux's Noto), so its letters don't fall to a serif or to a
    Chinese font's Latin. */
 const AR_FONTS = '"SF Arabic", "Geeza Pro", "Segoe UI", "Noto Sans Arabic", "Noto Naskh Arabic", ';
-/* India's scripts, Thai and Lao the same way: macOS's faces for each script,
-   Windows' (Nirmala UI for India's, Leelawadee UI for Thai and Lao), then
-   Linux's Noto. */
+/* Ethiopic, India's scripts, Thai and Lao the same way: macOS's faces for
+   each script, Windows' (Ebrima and Nyala for Ethiopic, Nirmala UI for India's,
+   Leelawadee UI for Thai and Lao), then Linux's Noto. */
 const SCRIPT_FONTS = {
+  am: '"Kefa", "Ebrima", "Nyala", "Noto Sans Ethiopic", ',
   hi: '"Kohinoor Devanagari", "Devanagari Sangam MN", "Nirmala UI", "Noto Sans Devanagari", ',
   bn: '"Kohinoor Bangla", "Bangla Sangam MN", "Nirmala UI", "Noto Sans Bengali", ',
   ta: '"Tamil Sangam MN", "InaiMathi", "Nirmala UI", "Noto Sans Tamil", ',
@@ -3236,7 +3237,7 @@ function onbClick(ev) {
 /* The first start: which language, before anything else. Each tile is in its
    own language; the system's is picked and marked. A pick shows at once and is
    saved; Continue lets the welcome (or the build question) waiting behind it go. */
-const HELLO = { en: "Hello", id: "Halo", ca: "Hola", cs: "Ahoj", de: "Hallo", es: "Hola", fr: "Bonjour", it: "Ciao", lt: "Labas", hu: "Szia", nb: "Hei", pl: "Cześć", "pt-BR": "Olá", ro: "Salut", sq: "Përshëndetje", sl: "Živjo", fi: "Hei", vi: "Xin chào", tr: "Merhaba", el: "Γεια σου", bg: "Здравей", ru: "Привет", uk: "Привіт", kk: "Сәлем", ar: "مرحبًا", fa: "سلام", ckb: "سڵاو", hi: "नमस्ते", bn: "নমস্কার", ta: "வணக்கம்", te: "నమస్కారం", th: "สวัสดี", lo: "ສະບາຍດີ", ja: "こんにちは", ko: "안녕하세요", "zh-Hans": "你好", "zh-Hant": "你好" };
+const HELLO = { en: "Hello", id: "Halo", ca: "Hola", cs: "Ahoj", de: "Hallo", es: "Hola", fr: "Bonjour", it: "Ciao", lt: "Labas", hu: "Szia", nb: "Hei", pl: "Cześć", "pt-BR": "Olá", ro: "Salut", sq: "Përshëndetje", sl: "Živjo", fi: "Hei", vi: "Xin chào", tr: "Merhaba", el: "Γεια σου", bg: "Здравей", ru: "Привет", uk: "Привіт", kk: "Сәлем", ar: "مرحبًا", fa: "سلام", ckb: "سڵاو", am: "ሰላም", hi: "नमस्ते", bn: "নমস্কার", ta: "வணக்கம்", te: "నమస్కారం", th: "สวัสดี", lo: "ສະບາຍດີ", ja: "こんにちは", ko: "안녕하세요", "zh-Hans": "你好", "zh-Hant": "你好" };
 /* The language step's header: every hello, faint and scattered (fixed places,
    so a redraw doesn't move them), and Kiri's mark with its own gradient ids. */
 const LANG_CLOUD = Object.values(HELLO).concat(Object.values(HELLO)).slice(0, 22).map((w, i) =>

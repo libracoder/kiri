@@ -20,12 +20,12 @@
 <p align="center">
   <a href="https://github.com/libracoder/kiri/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/libracoder/kiri?label=release&color=2f6feb"></a>
   <a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-555"></a>
-  <a href="#in-your-language"><img alt="37 languages" src="https://img.shields.io/badge/languages-37-2ea043"></a>
+  <a href="#in-your-language"><img alt="38 languages" src="https://img.shields.io/badge/languages-38-2ea043"></a>
 </p>
 
 <p align="center">
   🇬🇧 🇮🇩 🇩🇪 🇪🇸 🇫🇷 🇮🇹 🇵🇱 🇧🇷 🇻🇳 🇹🇷 🇷🇺 🇸🇦 🇯🇵 🇰🇷 🇨🇳 🇹🇼<br>
-  <sub>Kiri speaks 37 languages. <a href="#in-your-language">Is yours one?</a></sub>
+  <sub>Kiri speaks 38 languages. <a href="#in-your-language">Is yours one?</a></sub>
 </p>
 
 <p align="center">
@@ -48,7 +48,7 @@ The name comes from the Igbo word *ntakịrị*, "small".
 - **Local domains**: `http://<name>.kiri.local`, with HTTPS from Kiri's own certificate authority.
 - **More than containers**: a one-command Kubernetes cluster and Linux machines.
 - **A native window** for containers, images, volumes and networks, plus a menu bar item.
-- **In your language**: 37 languages, on macOS, Windows and Linux alike.
+- **In your language**: 38 languages, on macOS, Windows and Linux alike.
 
 ### In your language
 
@@ -63,7 +63,7 @@ Kiri's window and setup come in these languages. It follows your system's langua
 | 🇩🇪 | Deutsch | 🇦🇱 | Shqip | 🇸🇦 | العربية | 🇰🇷 | 한국어 |
 | 🇪🇸 | Español | 🇸🇮 | Slovenščina | 🇮🇷 | فارسی | 🇨🇳 | 简体中文 |
 | 🇫🇷 | Français | 🇫🇮 | Suomi | 🇮🇶 | کوردیی ناوەندی | 🇹🇼 | 繁體中文 |
-| 🇮🇹 | Italiano | 🇻🇳 | Tiếng Việt | 🇮🇳 | हिन्दी |  |  |
+| 🇮🇹 | Italiano | 🇻🇳 | Tiếng Việt | 🇮🇳 | हिन्दी | 🇪🇹 | አማርኛ |
 | 🇱🇹 | Lietuvių | 🇹🇷 | Türkçe | 🇧🇩 | বাংলা |  |  |
 | 🇭🇺 | Magyar | 🇬🇷 | Ελληνικά | 🇮🇳 | தமிழ் |  |  |
 
