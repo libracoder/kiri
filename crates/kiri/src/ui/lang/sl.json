@@ -529,7 +529,7 @@
   "Lets {user} run containers without sudo": "Uporabniku {user} omogoči poganjanje kontejnerjev brez sudo",
   "Level": "Raven",
   "Light": "Svetla",
-  "Linux VM": "Navidezni računalnik Linux",
+  "Linux VM": "Linux VM",
   "Linux VM: {state}": "Navidezni računalnik Linux: {state}",
   "Linux account": "Račun Linux",
   "Linux for Kiri": "Linux za Kiri",

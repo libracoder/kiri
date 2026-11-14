@@ -529,7 +529,7 @@
   "Lets {user} run containers without sudo": "Umožní uživateli {user} spouštět kontejnery bez sudo",
   "Level": "Úroveň",
   "Light": "Světlý",
-  "Linux VM": "Linuxový virtuální počítač",
+  "Linux VM": "Linux VM",
   "Linux VM: {state}": "Linuxový virtuální počítač: {state}",
   "Linux account": "Linuxový účet",
   "Linux for Kiri": "Linux pro Kiri",

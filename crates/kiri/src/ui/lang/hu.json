@@ -529,7 +529,7 @@
   "Lets {user} run containers without sudo": "Lehetővé teszi, hogy {user} sudo nélkül futtasson konténereket",
   "Level": "Szint",
   "Light": "Világos",
-  "Linux VM": "Linuxos virtuális gép",
+  "Linux VM": "Linux VM",
   "Linux VM: {state}": "Linuxos virtuális gép: {state}",
   "Linux account": "Linux-fiók",
   "Linux for Kiri": "Linux a Kirihez",

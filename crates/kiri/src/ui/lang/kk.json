@@ -529,7 +529,7 @@
   "Lets {user} run containers without sudo": "{user} пайдаланушысына контейнерлерді sudo-сыз іске қосуға мүмкіндік береді",
   "Level": "Деңгей",
   "Light": "Ашық",
-  "Linux VM": "Linux виртуалды машинасы",
+  "Linux VM": "Linux VM",
   "Linux VM: {state}": "Linux виртуалды машинасы: {state}",
   "Linux account": "Linux тіркелгісі",
   "Linux for Kiri": "Kiri үшін Linux",
