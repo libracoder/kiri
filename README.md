@@ -13,7 +13,7 @@
 <p align="center">
   <a href="https://runkiri.com/releases/">Download</a> ·
   <a href="docs/features.md">Features</a> ·
-  <a href="docs/development.md">Build from source</a> ·
+  <a href="#build-from-source">Build from source</a> ·
   <a href="https://github.com/libracoder/kiri/releases">Releases</a>
 </p>
 
@@ -78,6 +78,45 @@ Missing yours? Translations live in [`crates/kiri/src/ui/lang`](crates/kiri/src/
 | Linux (Ubuntu, Fedora and others) | `.deb` or `.rpm` from [runkiri.com/releases](https://runkiri.com/releases/) |
 
 The first time you open Kiri, it sets up a `kiri` Docker context. Kiri updates itself, and checks each new release's signature first.
+
+## Build from source
+
+Building needs [Rust](https://rustup.rs) and, for the kernel, the data disk
+and the Linux container build, a Docker engine.
+
+**macOS**
+
+```sh
+rustup target add aarch64-unknown-linux-musl
+cargo xtask kernel   # guest kernel, guest/out/Image
+cargo xtask disk     # sparse 64 GiB ext4 data disk, guest/out/data.img
+cargo xtask guest    # guest initramfs, guest/out/initramfs.cpio
+cargo xtask host     # target/release/kiri, signed with the virtualization entitlement
+```
+
+On Intel Macs add `--arch x86_64` to each command (and install the
+`x86_64-apple-darwin` and `x86_64-unknown-linux-musl` targets instead).
+
+**Linux**
+
+```sh
+cargo xtask linux    # kiri and kiri-init in target/linux/release, built in a Rust container
+```
+
+Or build on the host itself: `cargo build --release -p kiri -p kiri-init`.
+The window (`kiri ui`) is a separate build: `cargo build --release -p kiri
+--features window`, which links GTK 3 and WebKitGTK 4.1.
+
+**Windows**
+
+On Windows, with Rust installed for Windows and in WSL:
+
+```powershell
+cargo xtask windows-dev   # bundle in target/kiri-windows-x86_64; cargo run -p kiri-win runs it
+```
+
+More, including Windows on Arm and packaging, is in
+[docs/development.md](docs/development.md#build).
 
 ## Quick start
 
