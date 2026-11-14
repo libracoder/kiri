@@ -165,10 +165,11 @@ for (const id of [...document.querySelectorAll("[data-stab]")].map((b) => b.data
   document.querySelector(`[data-stab="${id}"]`).click();
   check(`Settings → ${id}`);
 }
-t("the language step's tiles read from the right", () => {
+t("the language step's rows read from the right", () => {
   kiri.on({ type: "langpick" });
-  const tile = (id) => box(`[aria-labelledby="lang-title"] [data-lang="${id}"]`);
-  if (!(tile("en").left > tile("id").left)) throw new Error("English isn't first");
+  const part = (id, c) => box(`#lang-list [data-lang="${id}"] .${c}`);
+  if (!(part("en", "ln").left > part("en", "lh").right)) throw new Error("English's hello isn't on the left");
+  if (!(part("de", "ln").left > part("de", "lh").right)) throw new Error("German's hello isn't on the left");
   document.getElementById("lang-go").click();
 });
 t("English again from Settings: left to right, as before", () => {
