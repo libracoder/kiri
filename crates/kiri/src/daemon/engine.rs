@@ -1038,7 +1038,7 @@ impl Engine {
             let mut st = self.lock();
             for s in saved {
                 let was_running = s.status == Status::Running;
-                let c = Container {
+                let mut c = Container {
                     id: s.id.clone(),
                     name: s.name,
                     layers: s.layers,
@@ -1077,6 +1077,8 @@ impl Engine {
                 }
                 let policy = c.spec.restart.name.as_str();
                 if (policy == "always" || (policy == "unless-stopped" && !c.stopped_by_user)) && !c.spec.auto_remove {
+                    // Pending until it starts, also while held: a stop in the meantime cancels it.
+                    c.restart_pending = true;
                     restart.push(c.id.clone());
                 }
                 st.containers.insert(s.id, c);
@@ -1270,10 +1272,10 @@ impl Engine {
                     let _ = std::thread::Builder::new().name("kiri-restart".into()).spawn(move || {
                         std::thread::sleep(delay);
                         // Only if nobody stopped or removed it in the meantime.
-                        let still_wanted = me.lock().containers.get_mut(&id).is_some_and(|c| {
-                            c.restart_pending = false;
-                            c.status == Status::Exited && !c.stopped_by_user
-                        });
+                        // start_inner checks again, under its lock, that the
+                        // restart is still pending: a stop between here and
+                        // there cancels it.
+                        let still_wanted = me.lock().containers.get(&id).is_some_and(|c| c.status == Status::Exited && !c.stopped_by_user);
                         if still_wanted {
                             if let Err(e) = me.start_inner(&id, false) {
                                 crate::diag::warn!("container did not restart", id = &id[..12], error = format!("{e:?}"));
@@ -1607,6 +1609,12 @@ impl Engine {
                 Status::Running => return Ok(()),
                 Status::Exited if c.spec.auto_remove => return Err(Error::Conflict("container is being removed".into())),
                 _ => {}
+            }
+            // A start by the restart policy: only while it is still pending.
+            // A `stop` takes that away (mark_stopped) and answered as if it
+            // ended the container, so it must not start after all.
+            if !by_user && !std::mem::take(&mut c.restart_pending) {
+                return Ok(());
             }
             let argv = c.argv();
             if argv.is_empty() {
