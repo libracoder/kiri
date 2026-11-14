@@ -45,6 +45,14 @@ impl Request {
         self.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)).map(|(_, v)| v.as_str())
     }
 
+    /// The client asked to close the connection after this response
+    /// (`Connection: close`), as Docker.DotNet does on every request. Docker
+    /// closes then; a client that reads a 204 to the end of the stream waits
+    /// for that close and times out if it never comes.
+    pub fn wants_close(&self) -> bool {
+        self.header("Connection").is_some_and(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case("close")))
+    }
+
     /// A request the daemon makes of itself (the managed builder's
     /// container create), so it goes through the same code as a client's.
     pub fn internal(method: &str, path: &str, query: &[(&str, &str)], body: Vec<u8>) -> Request {
@@ -354,6 +362,27 @@ pub fn mux_frame(w: &mut impl Write, stream: u8, data: &[u8]) -> io::Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn with_connection(value: Option<&str>) -> Request {
+        let headers = value.map(|v| vec![("connection".to_owned(), v.to_owned())]).unwrap_or_default();
+        Request { method: "POST".to_owned(), path: "/containers/x/start".to_owned(), query: Vec::new(), headers, body: Vec::new() }
+    }
+
+    /// Docker.DotNet sends `Connection: close` on every request and reads a
+    /// 204 to the end of the stream: the connection must close after it.
+    #[test]
+    fn connection_close_is_asked_for_in_any_case_and_list() {
+        assert!(with_connection(Some("close")).wants_close());
+        assert!(with_connection(Some("Close")).wants_close());
+        assert!(with_connection(Some("keep-alive, close")).wants_close());
+    }
+
+    #[test]
+    fn keep_alive_or_no_header_keeps_the_connection() {
+        assert!(!with_connection(Some("keep-alive")).wants_close());
+        assert!(!with_connection(Some("Upgrade")).wants_close());
+        assert!(!with_connection(None).wants_close());
+    }
 
     #[test]
     fn strips_api_version() {
