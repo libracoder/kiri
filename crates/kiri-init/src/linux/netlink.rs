@@ -303,7 +303,9 @@ pub fn add_default_route6(nl: &mut Netlink, index: i32, gateway: [u8; 16]) -> io
 }
 
 pub fn add_default_route(nl: &mut Netlink, index: i32, gateway: [u8; 4]) -> io::Result<()> {
-    let mut m = Msg::new(RTM_NEWROUTE, NLM_F_ACK | NLM_F_CREATE);
+    // Keep the first eligible network's route, as the IPv6 helper does.
+    // Without EXCL, Linux accepts another equal-priority IPv4 default.
+    let mut m = Msg::new(RTM_NEWROUTE, NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL);
     // struct rtmsg: family, dst_len, src_len, tos, table, protocol, scope, type, flags.
     let mut rt = [0u8; 12];
     rt[0] = libc::AF_INET as u8;

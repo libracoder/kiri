@@ -737,7 +737,9 @@ $D rm -f ren2 >/dev/null; $D rmi kiri-test/committed:1 kiri-test/committed:2 >/d
 section "network connect and disconnect"
 $D network create na >/dev/null; $D network create nb >/dev/null
 $D run -d --name multi --network na nginx:alpine >/dev/null; sleep 0.3
+FIRST_DEFAULT=$($D exec multi ip -4 route show default)
 t connect "eth1" bash -c "$D network connect --alias web2 nb multi && $D exec multi ip -o link"
+t connect-keeps-default "$FIRST_DEFAULT" $D exec multi ip -4 route show default
 t connect-dns-alias "Welcome" $D run --rm --network nb alpine wget -qO- -T 3 http://web2
 t connect-dns-name "Welcome" $D run --rm --network nb alpine wget -qO- -T 3 http://multi
 t connect-inspect "na nb" bash -c "$D inspect -f '{{range \$k, \$v := .NetworkSettings.Networks}}{{\$k}} {{end}}' multi"
@@ -747,6 +749,17 @@ code connect-twice 1 $D network connect nb multi
 t disconnect "no-eth1" bash -c "$D network disconnect nb multi && ($D exec multi ip -o link | grep -q eth1 && echo still || echo no-eth1)"
 t disconnect-dns-gone "bad address" $D run --rm --network nb alpine wget -qO- -T 2 http://web2
 t compose-multi-net "PONG" bash -c "d=\$(mktemp -d); printf 'services:\n  db:\n    image: redis:7-alpine\n    networks: [back]\n  app:\n    image: redis:7-alpine\n    command: sh -c \"sleep 1; redis-cli -h db ping; sleep 30\"\n    networks: [front, back]\nnetworks:\n  front: {}\n  back: {}\n' > \$d/compose.yaml; cd \$d && $D compose -p kirinet up -d >/dev/null 2>&1; sleep 3; $D compose -p kirinet logs app; $D compose -p kirinet down >/dev/null 2>&1; rm -rf \$d"
+# An internal primary network must not prevent a later external network
+# from supplying IPv4 egress, including when all attachments are restored.
+$D network create --internal ni >/dev/null
+$D run -d --name late-egress --network ni alpine sleep 60 >/dev/null
+t internal-first-no-default "none" $D exec late-egress sh -c 'ip -4 route show default | grep -q default && echo default || echo none'
+$D network connect na late-egress
+EXTERNAL_GATEWAY=$($D network inspect na -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}')
+t internal-first-external-default "default via $EXTERNAL_GATEWAY dev eth1" $D exec late-egress ip -4 route show default
+$D restart -t 1 late-egress >/dev/null
+t internal-first-external-restart "default via $EXTERNAL_GATEWAY dev eth1" $D exec late-egress ip -4 route show default
+$D rm -f late-egress >/dev/null; $D network rm ni >/dev/null
 $D rm -f multi >/dev/null; $D network rm na nb >/dev/null
 
 section "events, prune, system df, search"

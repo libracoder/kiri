@@ -648,11 +648,11 @@ pub fn attach_container(
     attach(bridges, bridge, host_ifname, pid, 0, ip, prefix, gateway, mac, v6, plug)
 }
 
-/// Plugs the container into `bridge` as `eth{n}`. Only `eth0` gets the
-/// default route; more networks add their subnets, as with Docker. The
-/// first network with IPv6 gives the IPv6 default route. An `internal`
-/// network gives no default route at all, so traffic beyond it fails at
-/// once (unreachable), as with Docker. On a network without IPv6 the
+/// Plugs the container into `bridge` as `eth{n}`. The first non-internal
+/// network with IPv4 gives the IPv4 default route; later ones keep it.
+/// The first network with IPv6 gives the IPv6 default route. An `internal`
+/// attachment never gives a default route, so a container on internal-only
+/// networks fails fast beyond their subnets. On a network without IPv6 the
 /// interface has IPv6 off (no link-local address), as Docker does. On an
 /// IPv6-only network `ip` is only the name the container is kept by (its
 /// MAC is made from it): neither the interface nor the bridge gets it.
@@ -683,7 +683,7 @@ pub fn attach(bridges: &mut Bridges, bridge: &str, host_ifname: &str, pid: libc:
         netlink::add_address6(&mut inner, index, v.ip, v.prefix)?;
     }
     netlink::set_up(&mut inner, index)?;
-    if n == 0 && !internal && !no_ipv4 {
+    if !internal && !no_ipv4 {
         netlink::add_default_route(&mut inner, index, gateway)?;
     }
     if let Some(v) = v6.filter(|_| !internal) {
