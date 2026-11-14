@@ -613,7 +613,7 @@ tr[data-rowopen] .sel, .sel { cursor: text; -webkit-user-select: text; user-sele
 .logbar .field { width: 240px; }
 .toggle { display: inline-flex; gap: 6px; align-items: center; color: var(--muted); font-size: var(--fs); cursor: pointer; }
 .console { background: #0A0E12; border: 1px solid var(--line); border-radius: 10px; font: var(--fs-log)/1.5 var(--mono-font); color: #D9DEE4;
-           height: calc(100vh - 260px); min-height: 220px; overflow: auto; padding: 10px 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
+           height: calc(100vh - 260px); min-height: 220px; overflow: auto; padding: 10px 12px; white-space: pre-wrap; overflow-wrap: anywhere; -webkit-user-select: text; user-select: text; cursor: text; }
 .console .err { color: #FF8C8C; }
 /* Each log line's number in a gutter; a wrapped line's rest stays clear of it.
    The numbers are generated content, so copying the log leaves them out. */
@@ -2705,6 +2705,17 @@ function applyPrefs() {
 document.addEventListener("contextmenu", (ev) => {
   const editable = ev.target.closest?.("input, textarea, [contenteditable]");
   if (!editable && !String(getSelection()).trim()) ev.preventDefault();
+});
+/* Copy with the keyboard. The window has no Edit menu, which is where the
+   Mac gets Copy's key from, so selected text (a log, a row's value) goes to
+   the clipboard the way the terminal's does. Text fields and the terminal
+   keep their own handling. */
+document.addEventListener("keydown", (ev) => {
+  const mod = WIN || LINUX ? ev.ctrlKey && !ev.metaKey : ev.metaKey && !ev.ctrlKey;
+  if (!mod || ev.altKey || ev.shiftKey || ev.key.toLowerCase() !== "c") return;
+  if (ev.target.closest?.("input, textarea, [contenteditable], .xterm")) return;
+  const text = String(getSelection());
+  if (text) send("term", { name: "copy", value: text });
 });
 /* A new language: the markup's words now, the rest as each part draws again
    (render, the status bar and the engine card follow in the callers). */
