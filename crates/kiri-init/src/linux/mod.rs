@@ -15,6 +15,7 @@ mod relay;
 mod seccomp;
 mod sys;
 mod transport;
+mod trim;
 mod usb;
 mod usage;
 mod volmount;
@@ -340,7 +341,7 @@ fn data_dirs() -> io::Result<container::Paths> {
     // noinit_itable: the disk is made with lazy inode tables; zeroing them in
     // the background would only write gigabytes of zeros to the host.
     let disk = mount(c"/dev/vda", c"/var/lib/kiri", c"ext4", libc::MS_NOATIME, Some(c"noinit_itable"));
-    if let Err(e) = disk {
+    if let Err(ref e) = disk {
         eprintln!("kiri-init: no data disk ({e}); keeping images in memory");
         mount(c"kiri", c"/var/lib/kiri", c"tmpfs", libc::MS_NOATIME, Some(c"mode=0755"))?;
     }
@@ -375,6 +376,9 @@ fn data_dirs() -> io::Result<container::Paths> {
     }
     // Overlay lower dirs are given relative to the layer store.
     std::env::set_current_dir(&paths.layers)?;
+    if disk.is_ok() {
+        trim::start(DATA);
+    }
     Ok(paths)
 }
 
