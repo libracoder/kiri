@@ -1469,7 +1469,7 @@ pub(super) fn create(req: &Request, engine: &Engine) -> Result<Value, Error> {
     // explicit Cmd replaces the image's Cmd but keeps its Entrypoint.
     let entry_override = strings(&body["Entrypoint"]);
     let entrypoint = entry_override.clone().unwrap_or_else(|| image.config.entrypoint.clone());
-    let cmd = strings(&body["Cmd"]).unwrap_or_else(|| if entry_override.is_some() { Vec::new() } else { image.config.cmd.clone() });
+    let cmd = strings(&body["Cmd"]).filter(|cmd| !cmd.is_empty()).unwrap_or_else(|| if entry_override.is_some() { Vec::new() } else { image.config.cmd.clone() });
     let mut env = image.config.env.clone();
     // Settings → Network → "Pass to containers": the proxy, unless set here.
     let given = strings(&body["Env"]).unwrap_or_default();
