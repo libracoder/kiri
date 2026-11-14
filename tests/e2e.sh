@@ -93,6 +93,7 @@ t rmi "Untagged" $D rmi alpine:3.21
 code rmi-missing 1 $D rmi alpine:3.21
 
 section "run: output and exit codes"
+code lifecycle-response-status 0 python3 "$(dirname "$0")/lifecycle-status.py" "$SOCK" alpine
 t echo "hello" $D run --rm alpine echo hello
 t args "a b c" $D run --rm alpine echo a b c
 code exit-0 0 $D run --rm alpine true

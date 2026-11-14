@@ -352,6 +352,8 @@ pub struct Container {
     /// Set by `stop`/`kill`: no automatic restart until started again.
     pub stopped_by_user: bool,
     pub restart_count: u32,
+    /// Exited, with its restart policy about to start it again.
+    restart_pending: bool,
     /// How many times it has exited; `wait?condition=next-exit` waits for this to grow.
     exits: u64,
     /// Terminal size asked for before the process existed.
@@ -1049,6 +1051,7 @@ impl Engine {
                     vm_stopped: was_running || s.vm_stopped,
                     stopped_by_user: s.stopped_by_user,
                     restart_count: s.restart_count,
+                    restart_pending: false,
                     exits: 0,
                     size: None,
                 ip: None,
@@ -1226,6 +1229,7 @@ impl Engine {
                         if wants && !c.spec.auto_remove && !SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
                             let backoff = RESTART_BASE.saturating_mul(1 << c.restart_count.min(10)).min(RESTART_CAP);
                             c.restart_count += 1;
+                            c.restart_pending = true;
                             restart_in = Some(backoff);
                         }
                         c.spec.auto_remove
@@ -1266,8 +1270,10 @@ impl Engine {
                     let _ = std::thread::Builder::new().name("kiri-restart".into()).spawn(move || {
                         std::thread::sleep(delay);
                         // Only if nobody stopped or removed it in the meantime.
-                        let still_wanted =
-                            me.lock().containers.get(&id).is_some_and(|c| c.status == Status::Exited && !c.stopped_by_user);
+                        let still_wanted = me.lock().containers.get_mut(&id).is_some_and(|c| {
+                            c.restart_pending = false;
+                            c.status == Status::Exited && !c.stopped_by_user
+                        });
                         if still_wanted {
                             if let Err(e) = me.start_inner(&id, false) {
                                 crate::diag::warn!("container did not restart", id = &id[..12], error = format!("{e:?}"));
@@ -1556,6 +1562,7 @@ impl Engine {
                 vm_stopped: false,
                 stopped_by_user: false,
                 restart_count: 0,
+                restart_pending: false,
                 exits: 0,
                 size: None,
                 ip: None,
@@ -1606,6 +1613,7 @@ impl Engine {
                 return Err(Error::BadRequest("no command specified".into()));
             }
             c.status = Status::Running;
+            c.restart_pending = false;
             c.started = Some(SystemTime::now());
             c.finished = None;
             c.oom_killed = false;
@@ -2622,12 +2630,14 @@ impl Engine {
         self.lock().containers.get(id).is_some_and(|c| c.paused)
     }
 
-    pub fn stop(&self, key: &str, timeout: Duration) -> Result<(), Error> {
+    /// `docker stop`. False when there was nothing to stop: the container
+    /// was not running and its restart policy was not about to start it.
+    pub fn stop(&self, key: &str, timeout: Duration) -> Result<bool, Error> {
         let id = self.resolve(key)?;
         self.thaw_for_signal(&id);
-        self.mark_stopped(&id);
+        let cancelled = self.mark_stopped(&id);
         if !self.is_running(&id) {
-            return Ok(());
+            return Ok(cancelled);
         }
         self.emit_container("kill", &id, &[("signal", (libc::SIGTERM).to_string())]);
         let sig = self.lock().containers.get(&id).and_then(|c| c.spec.stop_signal).unwrap_or(libc::SIGTERM as u32);
@@ -2639,14 +2649,27 @@ impl Engine {
             if left.is_zero() {
                 drop(st);
                 self.vm()?.kill(&id, libc::SIGKILL as u32)?;
+                // Docker's stop response means the process has exited, even
+                // with t=0. Wait for its exit (or auto-removal) to be recorded,
+                // as long as `kill` does: the exit may never be reported.
+                let killed = std::time::Instant::now() + Duration::from_secs(10);
+                let mut exited = self.lock();
+                while exited.containers.get(&id).is_some_and(|c| c.status == Status::Running) {
+                    let left = killed.saturating_duration_since(std::time::Instant::now());
+                    if left.is_zero() {
+                        return Err(Error::Io(io::Error::other(format!("cannot stop container: {}: it did not exit after SIGKILL", &id[..12]))));
+                    }
+                    exited = self.changed.wait_timeout(exited, left).unwrap_or_else(|e| e.into_inner()).0;
+                }
+                drop(exited);
                 self.emit_container("stop", &id, &[]);
-                return Ok(());
+                return Ok(true);
             }
             st = self.changed.wait_timeout(st, left).unwrap_or_else(|e| e.into_inner()).0;
         }
         drop(st);
         self.emit_container("stop", &id, &[]);
-        Ok(())
+        Ok(true)
     }
 
     /// A frozen process cannot handle a signal; Docker thaws it first.
@@ -2928,20 +2951,23 @@ impl Engine {
         self.lock().containers.get(id).is_some_and(|c| c.status == Status::Running)
     }
 
-    fn mark_stopped(&self, id: &str) {
-        let persist = {
+    /// Records a stop asked for by the user. True when that cancelled a
+    /// restart its policy had pending.
+    fn mark_stopped(&self, id: &str) -> bool {
+        let (persist, cancelled) = {
             let mut st = self.lock();
             match st.containers.get_mut(id) {
                 Some(c) => {
                     c.stopped_by_user = true;
-                    !c.spec.auto_remove
+                    (!c.spec.auto_remove, std::mem::take(&mut c.restart_pending))
                 }
-                None => false,
+                None => (false, false),
             }
         };
         if persist {
             self.save();
         }
+        cancelled
     }
 
     /// Runs `f` over every container, under the lock.
@@ -3071,7 +3097,7 @@ fn note_removed(st: &mut State, id: &str, code: i32) {
 }
 
 /// A BuildKit daemon that buildx runs for its docker-container driver.
-fn is_builder(c: &Container) -> bool {
+pub fn is_builder(c: &Container) -> bool {
     c.name.starts_with("buildx_buildkit_")
 }
 
