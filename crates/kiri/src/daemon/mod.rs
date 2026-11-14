@@ -26,6 +26,7 @@ pub(crate) mod nfs;
 mod ops;
 pub(crate) mod ports;
 mod pulls;
+mod registry_mirrors;
 pub mod time;
 #[cfg(target_os = "macos")]
 mod usb;
@@ -141,6 +142,8 @@ pub fn run(_args: &[String]) -> io::Result<()> {
     #[cfg(target_os = "macos")]
     finder(&engine);
     kiri_image::set_proxy_source(proxy::for_registry);
+    // Settings → Registry mirrors: Docker Hub pulls try these first.
+    kiri_image::set_mirror_source(registry_mirrors::list);
     // The managed BuildKit stops itself when builds have been idle a while.
     builder::watch(engine.clone());
     // A Kubernetes node the engine restarted gets its kubectl context.

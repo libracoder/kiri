@@ -559,7 +559,10 @@ function trn(n, one, other, vars) { var s = isOne(n) ? one : other, v = { n: n }
 
       case 'ready': return { cls: 'center', html:
         ART.ready + '<h1 class="xl" tabindex="-1">' + tr("Kiri is ready") + '</h1>' +
-        '<p class="lede lg" style="max-width:540px">' + tr("Your test container said hello. Open a new terminal and try it yourself:") + '</p>' +
+        (s.testError
+          ? '<p class="lede lg" style="max-width:540px">' + tr("Kiri is ready, but the test container couldn’t run: {error}", { error: esc(s.testError) }) + '</p>' +
+            '<p class="lede" style="max-width:540px">' + tr("If Docker Hub is blocked here, add a mirror in Settings → Registry mirrors, then run this in a new terminal:") + '</p>'
+          : '<p class="lede lg" style="max-width:540px">' + tr("Your test container said hello. Open a new terminal and try it yourself:") + '</p>') +
         '<div class="cmd"><span class="p" aria-hidden="true">$</span><code>docker run --rm alpine echo hello</code><button type="button" class="btn sm" data-act="copy" aria-live="polite">' + tr("Copy") + '</button></div>' +
         '<label class="check inline"><input type="checkbox" id="auto">' + tr("Start Kiri when I sign in (in the tray)") + '</label>' +
         ERR + '<button type="button" class="btn primary xl" data-cmd="setup-open">' + tr("Open Kiri") + '</button>' };

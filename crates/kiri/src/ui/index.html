@@ -2490,7 +2490,7 @@ const VM = LINUX ? "Engine" : "Linux VM";
 const shareOn = () => !!(ui.status?.share ?? ui.status?.dev);
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 
-const ui = { running: new Set(), launched: new Map(), runWatch: new Map(), need: null, probed: new Map(), probing: new Set(), why: new Map(), startErr: {}, fixed: null, openTab: null, listening: new Map(), starting: new Map(), scans: new Map(), scanf: { sev: "", fix: false, own: false }, view: "containers", vm: "stopped", containers: [], images: [], volumes: [], networks: [], sort: { images: { key: "pulled", desc: true } }, filter: "", suffix: "kiri.localhost", collapsed: new Set(), res: null, resDraft: {}, proxy: null, pxDraft: {}, rports: null, rpDraft: {}, rpAt: 0,
+const ui = { running: new Set(), launched: new Map(), runWatch: new Map(), need: null, probed: new Map(), probing: new Set(), why: new Map(), startErr: {}, fixed: null, openTab: null, listening: new Map(), starting: new Map(), scans: new Map(), scanf: { sev: "", fix: false, own: false }, view: "containers", vm: "stopped", containers: [], images: [], volumes: [], networks: [], sort: { images: { key: "pulled", desc: true } }, filter: "", suffix: "kiri.localhost", collapsed: new Set(), res: null, resDraft: {}, proxy: null, pxDraft: {}, rports: null, rpDraft: {}, rpAt: 0, mirrors: null, mirrorDraft: [], mirrorUrl: "",
   imp: { sources: null, source: null, inv: null, picked: { images: new Set(), volumes: new Set(), containers: new Set() }, steps: {}, running: false, summary: "" },
   upd: null, engineStale: null, staleHidden: false,
   // The Builds view: the list, the picked build and its detail, and how its steps show.
@@ -3748,6 +3748,34 @@ function networkPane() {
   </div>`;
 }
 
+/* Settings → Registry mirrors: the Docker Hub pull-through mirrors, in the
+   order a pull tries them. docker build reads them too (buildkitd.toml);
+   pushes never go through them. */
+function mirrorsPane() {
+  const m = ui.mirrors;
+  if (!m) return `<div class="pane"><h3>${tr("Registry mirrors")}</h3><p class="muted">${tr("Loading…")}</p></div>`;
+  if (m.error) return `<div class="pane"><h3>${tr("Registry mirrors")}</h3><p class="muted">${tr("Start Kiri to change its registry mirrors. ({error})", { error: esc(m.error) })}</p></div>`;
+  const draft = ui.mirrorDraft;
+  const rows = draft.length
+    ? draft.map((url, i) => `<div class="pref"><span class="t mono">${esc(url)}</span><button class="btn" data-mirrordel="${i}">${tr("Remove")}</button></div>`).join("")
+    : `<p class="muted">${tr("No mirrors yet: Docker Hub images come from Docker Hub itself.")}</p>`;
+  const changed = JSON.stringify(draft) !== JSON.stringify(m.mirrors || []);
+  return `<div class="pane"><h3>${tr("Registry mirrors")}</h3>
+    <p class="muted">${tr("Docker Hub images pull through these in order; the first that has the image answers, and Docker Hub itself is the fallback. Other registries are pulled directly.")}</p>
+    ${rows}
+    <div class="res-foot" style="margin-top:14px"><input class="field" id="mirror-url" style="flex:1;max-width:420px" aria-label="${tr("Mirror address")}" value="${esc(ui.mirrorUrl)}" placeholder="https://mirror.example.com" spellcheck="false" autocomplete="off"><button class="btn" data-mirroradd>${tr("Add mirror")}</button></div>
+    <div class="res-foot" style="margin-top:14px"><span class="muted">${tr("These apply to docker pull and docker build; pushes never go through them.")}</span><span style="flex:1"></span><button class="btn primary" data-savemirrors${changed ? "" : " disabled"}>${tr("Save")}</button></div>
+  </div>`;
+}
+
+function mirrorAdd() {
+  const url = ui.mirrorUrl.trim();
+  if (!url) return;
+  if (!ui.mirrorDraft.includes(url)) ui.mirrorDraft.push(url);
+  ui.mirrorUrl = "";
+  render();
+}
+
 /* Settings → Domains: the ports the name routers listen on. Moving them
    needs no restart; a port that's taken changes nothing and says so. */
 const rpChanged = () => ui.rports && !ui.rports.error && ["http", "https"].some((k) => ui.rpDraft[k] !== undefined && +ui.rpDraft[k] !== ui.rports[k].port);
@@ -3895,8 +3923,8 @@ function renderSettings() {
       <dt>${tr("Made by")}</dt><dd><a data-open-site="https://canestack.com">Canestack Labs</a></dd>
     </dl>
     <p class="muted">${tr("The name comes from the Igbo word ntakịrị, “small”.")}</p></div>`;
-  const html = `<div class="settings"><div class="tabs">${tab("appearance", "textaa", tr("Appearance"))}${tab("resources", "stack", tr("Resources"))}${tab("network", "globe", tr("Network"))}${tab("builds", "hammer", tr("Builds"))}${loginsOn() ? tab("registries", "lock", tr("Registries")) : ""}${tab("kubernetes", "pods", "Kubernetes")}${tab("import", "stack", tr("Import"))}${tab("domains", "network", tr("Domains"))}${tab("diagnostics", "bug", tr("Diagnostics"))}${tab("about", "info", tr("About"))}</div>
-    ${prefs.tab === "diagnostics" ? diagPane() : prefs.tab === "about" ? aboutPane : prefs.tab === "domains" ? domainsPane : prefs.tab === "resources" ? `<div class="panes">${enginePane()}${resourcesPane()}</div>` : prefs.tab === "network" ? networkPane() : prefs.tab === "builds" ? buildsPane() : prefs.tab === "registries" && loginsOn() ? registriesPane() : prefs.tab === "kubernetes" ? kubernetesPane() : prefs.tab === "import" ? importPane() : appearance}</div>`;
+  const html = `<div class="settings"><div class="tabs">${tab("appearance", "textaa", tr("Appearance"))}${tab("resources", "stack", tr("Resources"))}${tab("network", "globe", tr("Network"))}${tab("builds", "hammer", tr("Builds"))}${tab("mirrors", "pull", tr("Registry mirrors"))}${loginsOn() ? tab("registries", "lock", tr("Registries")) : ""}${tab("kubernetes", "pods", "Kubernetes")}${tab("import", "stack", tr("Import"))}${tab("domains", "network", tr("Domains"))}${tab("diagnostics", "bug", tr("Diagnostics"))}${tab("about", "info", tr("About"))}</div>
+    ${prefs.tab === "diagnostics" ? diagPane() : prefs.tab === "about" ? aboutPane : prefs.tab === "domains" ? domainsPane : prefs.tab === "resources" ? `<div class="panes">${enginePane()}${resourcesPane()}</div>` : prefs.tab === "network" ? networkPane() : prefs.tab === "builds" ? buildsPane() : prefs.tab === "mirrors" ? mirrorsPane() : prefs.tab === "registries" && loginsOn() ? registriesPane() : prefs.tab === "kubernetes" ? kubernetesPane() : prefs.tab === "import" ? importPane() : appearance}</div>`;
   // The container lists arrive every few seconds; rebuilding an unchanged page
   // closes an open menu. The font menus list names in the interface font: an
   // option in its own font made WebKit load every installed font (438 here)
@@ -3909,6 +3937,8 @@ function renderSettings() {
   settingsShown.html = html; settingsShown.el = $("content").firstElementChild;
   diagDrawn();
   for (const k of ["http", "https", "no_proxy"]) $(`px-${k}`)?.addEventListener("input", (ev) => { ui.pxDraft[k] = ev.target.value; });
+  $("mirror-url")?.addEventListener("input", (ev) => { ui.mirrorUrl = ev.target.value; });
+  $("mirror-url")?.addEventListener("keydown", (ev) => { if (ev.key === "Enter") { ev.preventDefault(); mirrorAdd(); } });
   for (const k of ["http", "https"]) $(`rp-${k}`)?.addEventListener("input", (ev) => {
     ui.rpDraft[k] = ev.target.value;
     const save = document.querySelector("#content [data-saverp]");
@@ -3941,7 +3971,7 @@ function show(view) {
   if (view === "builds") send("builds");
   if (view === "usb") usbPoll();
   if (view === "share") { send("shares"); send("shareusage"); shPoll(); }
-  if (view === "settings") { if (!fontLists.families.length) send("fonts"); send("about"); send("logins"); send("resources"); send("proxy"); send("routerports"); if (!ui.imp.sources) send("importsources"); if (prefs.tab === "diagnostics") diagOpen(); }
+  if (view === "settings") { if (!fontLists.families.length) send("fonts"); send("about"); send("logins"); send("resources"); send("proxy"); send("mirrors"); send("routerports"); if (!ui.imp.sources) send("importsources"); if (prefs.tab === "diagnostics") diagOpen(); }
   render();
   // From the top, as a container's or pod's page opens: leaving a page scrolled
   // down (a long Terminal or Logs tab) otherwise opened the next view below its rows.
@@ -6650,6 +6680,7 @@ window.kiri = {
       case "importdone": if (ctx.card?.total) { ctx.card.finished = true; drawCtxCard(); } ui.imp.running = false; ui.imp.summary = e.failed ? tr("Imported {done}; {failed} failed (hover “Failed” for why).", { done: e.done, failed: e.failed }) : trn(e.done, "Imported {n} item.", "Imported {n} items."); send("inventory", { name: ui.imp.source }); toast(e.failed ? "error" : "ok", ui.imp.summary); drawImportModal(); break;
       case "routerports": ui.rports = e; ui.rpDraft = {}; render(); break;
       case "proxy": ui.proxy = e; ui.pxDraft = { ...(e.settings || {}) }; if (ui.view === "settings") render(); break;
+      case "mirrors": ui.mirrors = e; ui.mirrorDraft = [...(e.mirrors || [])]; ui.mirrorUrl = ""; if (ui.view === "settings") render(); break;
       case "resources": ui.res = e; ui.resDraft = { cpus: e.cpus, memory_mib: e.memory_mib }; if (ui.view === "settings") render(); break;
       case "detail": if (ui.view !== "containers") show("containers"); openDetail(e.id); break;
       case "inspect":
@@ -6747,7 +6778,7 @@ $("content").addEventListener("click", (ev) => {
   else if ((el = t("[data-gmore]"))) openMenu(el, null, el.dataset.gmore);
   else if ((el = t("[data-g]"))) projectAsk(el.dataset.project, el.dataset.g);
   else if ((el = t("[data-group]"))) { const g = el.dataset.group; ui.collapsed.has(g) ? ui.collapsed.delete(g) : ui.collapsed.add(g); render(); }
-  else if ((el = t("[data-stab]"))) { prefs.tab = el.dataset.stab; if (prefs.tab === "about") send("about"); if (prefs.tab === "builds") send("buildwith"); if (prefs.tab === "registries") send("logins"); if (prefs.tab === "diagnostics") diagOpen(); render(); }
+  else if ((el = t("[data-stab]"))) { prefs.tab = el.dataset.stab; if (prefs.tab === "about") send("about"); if (prefs.tab === "builds") send("buildwith"); if (prefs.tab === "mirrors") send("mirrors"); if (prefs.tab === "registries") send("logins"); if (prefs.tab === "diagnostics") diagOpen(); render(); }
   else if (diagClick(t)) {}
   else if ((el = t("[data-scale]"))) setPref("scale", +el.dataset.scale);
   else if ((el = t("[data-logsize]"))) setPref("logSize", +el.dataset.logsize);
@@ -6766,6 +6797,9 @@ $("content").addEventListener("click", (ev) => {
   else if ((el = t("[data-pxmode]"))) { ui.pxDraft.mode = el.dataset.pxmode; render(); }
   else if ((el = t("[data-pxc]"))) { ui.pxDraft.containers = !!+el.dataset.pxc; render(); }
   else if ((el = t("[data-savepx]"))) send("setproxy", { value: ui.pxDraft });
+  else if (t("[data-mirroradd]")) mirrorAdd();
+  else if ((el = t("[data-mirrordel]"))) { ui.mirrorDraft.splice(+el.dataset.mirrordel, 1); render(); }
+  else if (t("[data-savemirrors]")) send("setmirrors", { value: { mirrors: ui.mirrorDraft } });
   else if ((el = t("[data-saverp]")) && ui.rports && !ui.rports.error) send("setrouterports", { value: { http: +(ui.rpDraft.http ?? ui.rports.http.port), https: +(ui.rpDraft.https ?? ui.rports.https.port) } });
   else if ((el = t("[data-saveres]"))) send("setresources", { value: ui.resDraft });
   else if ((el = t("[data-vmpower]"))) { el.disabled = true; powerEngine(el.dataset.vmpower); }

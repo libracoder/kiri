@@ -41,7 +41,10 @@ Apple silicon and Intel Macs (macOS 14+), Windows 10 and 11 (x86-64 and Arm, thr
   (virtiofs), `--tmpfs`, `--mount`, `volume` commands
 - **Images**: `pull` (with `docker login` credentials), `push`, `tag`,
   `save`, `load`, `history`, `search`, `image prune`, `system df`;
-  **amd64 images run through Rosetta**, `--platform` honoured
+  **amd64 images run through Rosetta**, `--platform` honoured. Docker Hub
+  pulls (and Dockerfile `FROM`s) can go through pull-through mirrors, in
+  order, from Settings → Registry mirrors or `kiri registry-mirror`; other
+  registries are pulled directly
 - **Builds**: `docker build` / `buildx build` through BuildKit running in a
   Kiri container (buildx's docker-container driver), stopped when idle;
   on Apple silicon, amd64 build steps run through Rosetta too

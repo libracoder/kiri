@@ -1072,6 +1072,14 @@ pub fn on_message(msg: &str) {
             let body = c.value;
             std::thread::spawn(move || proxy(Some(body)));
         }
+        // Settings → Registry mirrors.
+        "mirrors" => {
+            std::thread::spawn(|| registry_mirrors(None));
+        }
+        "setmirrors" => {
+            let body = c.value;
+            std::thread::spawn(move || registry_mirrors(Some(body)));
+        }
         // Settings → Resources: WSL's CPUs and memory, in .wslconfig.
         "resources" => crate::wslconfig::resources(None),
         "setresources" => crate::wslconfig::resources(Some(c.value)),
@@ -1282,6 +1290,24 @@ fn proxy(set: Option<Value>) {
             v
         }
         Err(e) => json!({"type": "proxy", "error": e.to_string()}),
+    };
+    emit(ev.to_string());
+}
+
+/// Settings → Registry mirrors: the daemon's Docker Hub mirrors.
+fn registry_mirrors(set: Option<Value>) {
+    if let Some(body) = set {
+        match expect_ok(client::request("POST", "/kiri/registry-mirrors", Some(&body))) {
+            Ok(()) => emit(notice("ok", &tr("Registry mirrors saved"))),
+            Err(e) => emit(notice("error", &trf("Could not save the registry mirrors: {error}", &[("error", &e)]))),
+        }
+    }
+    let ev = match client::get("/kiri/registry-mirrors") {
+        Ok(mut v) => {
+            v["type"] = json!("mirrors");
+            v
+        }
+        Err(e) => json!({"type": "mirrors", "error": e.to_string()}),
     };
     emit(ev.to_string());
 }

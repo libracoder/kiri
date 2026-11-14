@@ -10,6 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::Deserialize;
 
 use crate::cancel::Cancel;
+use crate::mirror::Mirror;
 use crate::tags::{next_link, version_order};
 use crate::reference::Reference;
 use crate::store::{Image, Layer, RunConfig, Store, sha256_digest};
@@ -149,6 +150,9 @@ pub enum Progress {
     /// Bytes of a layer so far, every half MB or so.
     Downloading { digest: String, got: u64, size: u64 },
     LayerDone { digest: String, bytes: u64, cached: bool },
+    /// A mirror that did not have the image (or did not answer): the pull
+    /// tries the next mirror, then Docker Hub itself.
+    MirrorFallback { mirror: String, reason: String },
 }
 
 /// What `docker login` saved, as the CLI sends it in `X-Registry-Auth`
@@ -199,6 +203,9 @@ impl Credentials {
 pub struct Client {
     agent: ureq::Agent,
     credentials: Option<Credentials>,
+    /// `Some` overrides the process's mirror source: what tests set, and
+    /// `Vec::new()` for the client a mirror is asked with.
+    mirrors: Option<Vec<Mirror>>,
 }
 
 impl Default for Client {
@@ -216,6 +223,17 @@ static PROXY_SOURCE: std::sync::OnceLock<ProxySource> = std::sync::OnceLock::new
 /// Called once by the daemon, so every client follows its proxy settings.
 pub fn set_proxy_source(f: ProxySource) {
     let _ = PROXY_SOURCE.set(f);
+}
+
+/// Where the program reads its Docker Hub mirrors from: the daemon's
+/// Settings, installed once at startup as the proxy source is. They apply
+/// to pulls only, and to `docker.io` only.
+pub type MirrorSource = fn() -> Vec<Mirror>;
+static MIRROR_SOURCE: std::sync::OnceLock<MirrorSource> = std::sync::OnceLock::new();
+
+/// Called once by the daemon, so every pull tries the configured mirrors.
+pub fn set_mirror_source(f: MirrorSource) {
+    let _ = MIRROR_SOURCE.set(f);
 }
 
 type ProxyChoice = Option<Option<(String, Vec<String>)>>;
@@ -401,7 +419,7 @@ fn stale(e: &ureq::Error) -> bool {
 
 impl Client {
     pub fn new() -> Client {
-        Client { agent: shared_agent(), credentials: None }
+        Client { agent: shared_agent(), credentials: None, mirrors: None }
     }
 
     /// Who the tokens are for: a fingerprint of the credentials, so one
@@ -481,6 +499,45 @@ impl Client {
         self
     }
 
+    /// This client tries `mirrors` before Docker Hub, whatever the daemon's
+    /// settings say; `with_mirrors(Vec::new())` turns them off for it.
+    pub fn with_mirrors(mut self, mirrors: Vec<Mirror>) -> Client {
+        self.mirrors = Some(mirrors);
+        self
+    }
+
+    fn mirrors(&self) -> Vec<Mirror> {
+        match &self.mirrors {
+            Some(mirrors) => mirrors.clone(),
+            None => MIRROR_SOURCE.get().map(|f| f()).unwrap_or_default(),
+        }
+    }
+
+    /// The same connection pool and no credentials: what a mirror is asked
+    /// with, so a Docker Hub sign-in never leaves for a third party's
+    /// registry. Mirrors serve public images; one that needs a login is not
+    /// supported.
+    fn anonymous(&self) -> Client {
+        Client { agent: self.agent.clone(), credentials: None, mirrors: Some(Vec::new()) }
+    }
+
+    /// The references a pull of `name` tries, in order: the configured
+    /// mirrors of Docker Hub, then Docker Hub itself. Only Hub is mirrored,
+    /// as with Docker's `registry-mirrors`.
+    fn targets(&self, name: &Reference) -> Vec<Reference> {
+        let mut targets: Vec<Reference> = Vec::new();
+        if name.registry == "docker.io" {
+            for mirror in self.mirrors() {
+                let target = name.via(&mirror.host, mirror.prefix.as_deref());
+                if !targets.contains(&target) {
+                    targets.push(target);
+                }
+            }
+        }
+        targets.push(name.clone());
+        targets
+    }
+
     /// Pulls `reference` for `platform` into `store` and records it in the
     /// image index. Layers already in the store are not downloaded again.
     pub fn pull(
@@ -496,6 +553,8 @@ impl Client {
     /// [`Client::pull`] that `cancel` can stop from another thread: it then
     /// ends with [`Error::Cancelled`], its downloads stopped and no image
     /// recorded. Layers it finished stay in the store, for the next pull.
+    /// Docker Hub is asked through the configured mirrors first, in order;
+    /// the image keeps the name it was asked for.
     pub fn pull_with(
         &self,
         store: &Store,
@@ -504,14 +563,69 @@ impl Client {
         progress: &(dyn Fn(Progress) + Sync),
         cancel: &Cancel,
     ) -> Result<Image, Error> {
+        let targets = self.targets(reference);
+        self.pull_from(store, reference, &targets, platform, progress, cancel)
+    }
+
+    /// [`Client::pull_with`] over an explicit list of references: the first
+    /// that resolves the image is where its layers come from. `name` is the
+    /// reference the image is recorded as.
+    fn pull_from(
+        &self,
+        store: &Store,
+        name: &Reference,
+        targets: &[Reference],
+        platform: &Platform,
+        progress: &(dyn Fn(Progress) + Sync),
+        cancel: &Cancel,
+    ) -> Result<Image, Error> {
+        let _on = cancel.enter();
+        let mut last: Option<Error> = None;
+        let mut resolved: Option<Resolved> = None;
+        for target in targets {
+            if cancel.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
+            // A mirror is asked without the user's Docker Hub credentials;
+            // the official registry is asked with them.
+            let anonymous = (target.registry != name.registry).then(|| self.anonymous());
+            let client = anonymous.as_ref().unwrap_or(self);
+            match client.resolve(target, platform, cancel) {
+                Ok(r) => {
+                    resolved = Some(r);
+                    break;
+                }
+                Err(Error::Cancelled) => return Err(Error::Cancelled),
+                Err(e) => {
+                    if target.registry != name.registry {
+                        progress(Progress::MirrorFallback { mirror: target.registry.clone(), reason: e.to_string() });
+                    }
+                    last = Some(e);
+                }
+            }
+        }
+        let Some(resolved) = resolved else {
+            let e = last.unwrap_or_else(|| Error::Manifest("no registry to pull from".into()));
+            return Err(not_found(e, name));
+        };
+        // The layers come from where the manifest did, asked the same way: a
+        // mirror without the user's credentials, Docker Hub with them.
+        let anonymous = (resolved.target.registry != name.registry).then(|| self.anonymous());
+        anonymous.as_ref().unwrap_or(self).download_layers(store, name, &resolved, platform, progress, cancel)
+    }
+
+    /// Reads the manifest for `r` and picks this platform's: the first half
+    /// of a pull, before anything is downloaded. Errors are raw registry
+    /// replies; the caller turns the last one into `docker pull`'s wording.
+    fn resolve(&self, r: &Reference, platform: &Platform, cancel: &Cancel) -> Result<Resolved, Error> {
         let _on = cancel.enter();
         let stopped = |e: Error| if cancel.is_cancelled() { Error::Cancelled } else { e };
-        self.warm_up(reference, "pull").map_err(stopped)?;
-        let (bytes, media_type) = self.manifest(reference, &reference.reference).map_err(|e| not_found(stopped(e), reference))?;
+        self.warm_up(r, "pull").map_err(stopped)?;
+        let (bytes, media_type) = self.manifest(r, &r.reference).map_err(stopped)?;
         // A pull by digest must get exactly that content, whether it is a
         // single manifest or a multi-arch index. Without this, a registry
         // could answer a pinned digest with any index naming any children.
-        if reference.is_digest() && sha256_digest(&bytes) != reference.reference {
+        if r.is_digest() && sha256_digest(&bytes) != r.reference {
             return Err(Error::Manifest("manifest failed digest check".into()));
         }
         let manifest: Manifest = serde_json::from_slice(&bytes).map_err(|e| Error::Manifest(e.to_string()))?;
@@ -533,25 +647,41 @@ impl Client {
                         .collect(),
                 });
             };
-            let (bytes, _) = self.manifest(reference, &entry.digest).map_err(stopped)?;
+            let (bytes, _) = self.manifest(r, &entry.digest).map_err(stopped)?;
             if sha256_digest(&bytes) != entry.digest {
                 return Err(Error::Manifest(format!("manifest {} failed digest check", entry.digest)));
             }
             let m: Manifest = serde_json::from_slice(&bytes).map_err(|e| Error::Manifest(e.to_string()))?;
             (m, entry.digest.clone())
         } else {
-            if reference.is_digest() && sha256_digest(&bytes) != reference.reference {
+            if r.is_digest() && sha256_digest(&bytes) != r.reference {
                 return Err(Error::Manifest("manifest failed digest check".into()));
             }
             (manifest, sha256_digest(&bytes))
         };
-        let (Some(config), Some(layers)) = (manifest.config, manifest.layers) else {
+        Ok(Resolved { target: r.clone(), index_digest, digest, manifest, media_type })
+    }
+
+    /// The second half of a pull: the config and layers of `resolved`,
+    /// downloaded from the registry that resolved it, and recorded under
+    /// `name`, the reference the user asked for.
+    fn download_layers(
+        &self,
+        store: &Store,
+        name: &Reference,
+        resolved: &Resolved,
+        platform: &Platform,
+        progress: &(dyn Fn(Progress) + Sync),
+        cancel: &Cancel,
+    ) -> Result<Image, Error> {
+        let Resolved { target, index_digest, digest, manifest, media_type } = resolved;
+        let (Some(config), Some(layers)) = (manifest.config.as_ref(), manifest.layers.as_ref()) else {
             return Err(Error::Manifest(format!("{media_type} has no config or layers")));
         };
 
         let layers: Vec<Layer> = layers
-            .into_iter()
-            .map(|l| Layer { digest: l.digest, size: l.size, media_type: l.media_type })
+            .iter()
+            .map(|l| Layer { digest: l.digest.clone(), size: l.size, media_type: l.media_type.clone() })
             .collect();
         let cached = layers.iter().filter(|l| store.has_blob(&l.digest, l.size)).count();
         progress(Progress::Resolved { layers: layers.len(), bytes: layers.iter().map(|l| l.size).sum(), cached });
@@ -576,7 +706,7 @@ impl Client {
                     return;
                 }
                 // Bounded: the manifest declares the size, and a config is small.
-                let result = self.download_with(store, reference, &config.digest, crate::store::MAX_CONFIG, &|_| {}, cancel).and_then(|got| {
+                let result = self.download_with(store, target, &config.digest, crate::store::MAX_CONFIG, &|_| {}, cancel).and_then(|got| {
                     if got != config.size {
                         return Err(Error::Manifest(format!("config {} is {got} bytes, the manifest says {}", config.digest, config.size)));
                     }
@@ -599,7 +729,7 @@ impl Client {
                             Ok(layer.size)
                         } else {
                             let on_bytes = |got| progress(Progress::Downloading { digest: layer.digest.clone(), got, size: layer.size });
-                            self.download_with(store, reference, &layer.digest, u64::MAX, &on_bytes, cancel)
+                            self.download_with(store, target, &layer.digest, u64::MAX, &on_bytes, cancel)
                         };
                         match result {
                             Ok(bytes) => progress(Progress::LayerDone { digest: layer.digest.clone(), bytes, cached }),
@@ -624,10 +754,10 @@ impl Client {
 
         let run = cfg.config.unwrap_or_default();
         let image = Image {
-            name: reference.short(),
-            digest,
-            index_digest,
-            config_digest: config.digest,
+            name: name.short(),
+            digest: digest.clone(),
+            index_digest: index_digest.clone(),
+            config_digest: config.digest.clone(),
             size: layers.iter().map(|l| l.size).sum(),
             layers,
             platform: platform.to_string(),
@@ -1050,6 +1180,16 @@ struct Token {
     expires_in: Option<u64>,
 }
 
+/// A manifest resolved for one platform, and the registry that answered:
+/// a mirror or Docker Hub itself. Its layers are downloaded from `target`.
+struct Resolved {
+    target: Reference,
+    index_digest: Option<String>,
+    digest: String,
+    manifest: Manifest,
+    media_type: String,
+}
+
 /// Either an index (has `manifests`) or an image manifest (has `config` and `layers`).
 #[derive(Deserialize)]
 struct Manifest {
@@ -1164,9 +1304,9 @@ mod tests {
     #[test]
     fn tokens_are_kept_apart_by_who_asked() {
         let r = Reference::parse("alpine").unwrap();
-        let anon = Client { agent: shared_agent(), credentials: None };
-        let alice = Client { agent: shared_agent(), credentials: Some(Credentials { username: "alice".into(), password: "a".into(), ..Default::default() }) };
-        let other = Client { agent: shared_agent(), credentials: Some(Credentials { username: "alice".into(), password: "b".into(), ..Default::default() }) };
+        let anon = Client { agent: shared_agent(), credentials: None, mirrors: None };
+        let alice = Client { agent: shared_agent(), credentials: Some(Credentials { username: "alice".into(), password: "a".into(), ..Default::default() }), mirrors: None };
+        let other = Client { agent: shared_agent(), credentials: Some(Credentials { username: "alice".into(), password: "b".into(), ..Default::default() }), mirrors: None };
         let keys = [anon.token_key(&r, "pull"), alice.token_key(&r, "pull"), other.token_key(&r, "pull"), alice.token_key(&r, "pull,push")];
         for (i, a) in keys.iter().enumerate() {
             for b in &keys[i + 1..] {
@@ -1272,7 +1412,7 @@ mod tests {
     fn test_client() -> Client {
         let cfg = ureq::Agent::config_builder().http_status_as_error(false).build();
         let agent = ureq::Agent::with_parts(cfg, crate::connect::connector_with(Duration::from_millis(300)), ureq::unversioned::resolver::DefaultResolver::default());
-        Client { agent, credentials: None }
+        Client { agent, credentials: None, mirrors: None }
     }
 
     fn blob() -> (Vec<u8>, String) {
@@ -1370,7 +1510,7 @@ mod tests {
         // Stalls only give up after 10 s: the cancel must not wait for that.
         let cfg = ureq::Agent::config_builder().http_status_as_error(false).build();
         let agent = ureq::Agent::with_parts(cfg, crate::connect::connector_with(Duration::from_secs(10)), ureq::unversioned::resolver::DefaultResolver::default());
-        let client = Client { agent, credentials: None };
+        let client = Client { agent, credentials: None, mirrors: None };
         let cancel = Cancel::new();
         let c = cancel.clone();
         std::thread::spawn(move || {
@@ -1412,5 +1552,186 @@ mod tests {
         assert!(!transient(&Error::Status { url: String::new(), status: 404, body: String::new() }));
         assert!(!transient(&Error::Io(io::Error::new(io::ErrorKind::InvalidData, "digest mismatch"))));
         assert!(!transient(&Error::Io(io::Error::other(ureq::Error::BodyExceedsLimit(10)))));
+    }
+
+    #[test]
+    fn mirrors_are_tried_in_order_and_only_for_docker_hub() {
+        let hub = Reference::parse("nginx:1.27").unwrap();
+        let client = Client::new().with_mirrors(vec![
+            Mirror::parse("mirror.example.com").unwrap(),
+            Mirror::parse("mirror.example.net/docker.io").unwrap(),
+        ]);
+        let targets = client.targets(&hub);
+        let hosts: Vec<&str> = targets.iter().map(|r| r.registry.as_str()).collect();
+        assert_eq!(hosts, ["mirror.example.com", "mirror.example.net", "docker.io"]);
+        assert_eq!(targets[1].repository, "docker.io/library/nginx");
+        assert_eq!(targets[2].repository, "library/nginx");
+        assert_eq!(targets[2].reference, "1.27");
+
+        let ghcr = Reference::parse("ghcr.io/o/r:v1").unwrap();
+        assert_eq!(client.targets(&ghcr), vec![ghcr.clone()]);
+    }
+
+    #[test]
+    fn a_mirror_serves_the_image_under_the_original_name() {
+        let (mirror, mirror_seen) = image_server(200);
+        let (origin, origin_seen) = image_server(200);
+        let root = std::env::temp_dir().join(format!("kiri-mirror-hit-{}", std::process::id()));
+        let store = Store::open(&root).unwrap();
+        let name = Reference::parse("alpine:3.22").unwrap();
+        let targets = vec![name.via(&mirror, None), name.via(&origin, None)];
+        let platform = Platform { os: "linux".into(), architecture: "amd64".into() };
+        let image = test_client().pull_from(&store, &name, &targets, &platform, &|_| {}, &Cancel::new()).unwrap();
+        assert_eq!(image.name, "alpine:3.22", "the mirror's name never shows");
+        assert_eq!(image.layers.len(), 1);
+        quit(&mirror);
+        quit(&origin);
+        assert!(mirror_seen.join().unwrap().iter().any(|p| p.contains("/manifests/")));
+        assert!(origin_seen.join().unwrap().is_empty(), "the origin is not asked when the mirror has it");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_mirror_is_never_sent_the_docker_hub_sign_in() {
+        let (mirror, mirror_seen) = image_server(200);
+        let root = std::env::temp_dir().join(format!("kiri-mirror-creds-{}", std::process::id()));
+        let store = Store::open(&root).unwrap();
+        let name = Reference::parse("alpine:3.22").unwrap();
+        let targets = vec![name.via(&mirror, None), name.clone()];
+        let platform = Platform { os: "linux".into(), architecture: "amd64".into() };
+        let signed_in = test_client().with_credentials(Some(Credentials { username: "alice".into(), password: "hub-password".into(), registry_token: "hub-token".into(), ..Default::default() }));
+        let image = signed_in.pull_from(&store, &name, &targets, &platform, &|_| {}, &Cancel::new()).unwrap();
+        assert_eq!(image.name, "alpine:3.22");
+        quit(&mirror);
+        let seen = mirror_seen.join().unwrap();
+        assert!(seen.iter().any(|p| p.contains("/blobs/")), "the layers came from the mirror: {seen:?}");
+        let sent: Vec<&String> = seen.iter().filter(|p| p.ends_with("(with credentials)")).collect();
+        assert!(sent.is_empty(), "the mirror was sent the Docker Hub sign-in: {sent:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_mirror_without_the_image_falls_back_to_the_registry() {
+        let (mirror, mirror_seen) = image_server(404);
+        let (origin, origin_seen) = image_server(200);
+        let root = std::env::temp_dir().join(format!("kiri-mirror-miss-{}", std::process::id()));
+        let store = Store::open(&root).unwrap();
+        let name = Reference::parse("alpine:3.22").unwrap();
+        let targets = vec![name.via(&mirror, None), name.via(&origin, None)];
+        let platform = Platform { os: "linux".into(), architecture: "amd64".into() };
+        let image = test_client().pull_from(&store, &name, &targets, &platform, &|_| {}, &Cancel::new()).unwrap();
+        assert_eq!(image.name, "alpine:3.22");
+        quit(&mirror);
+        quit(&origin);
+        assert!(mirror_seen.join().unwrap().iter().any(|p| p.contains("/manifests/")));
+        assert!(origin_seen.join().unwrap().iter().any(|p| p.contains("/manifests/")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_cancelled_pull_does_not_try_the_next_registry() {
+        let (mirror, mirror_seen) = image_server(200);
+        let (origin, origin_seen) = image_server(200);
+        let root = std::env::temp_dir().join(format!("kiri-mirror-cancel-{}", std::process::id()));
+        let store = Store::open(&root).unwrap();
+        let name = Reference::parse("alpine:3.22").unwrap();
+        let targets = vec![name.via(&mirror, None), name.via(&origin, None)];
+        let platform = Platform { os: "linux".into(), architecture: "amd64".into() };
+        let cancel = Cancel::new();
+        cancel.cancel();
+        let result = test_client().pull_from(&store, &name, &targets, &platform, &|_| {}, &cancel);
+        assert!(matches!(result, Err(Error::Cancelled)), "{result:?}");
+        quit(&mirror);
+        quit(&origin);
+        assert!(mirror_seen.join().unwrap().is_empty());
+        assert!(origin_seen.join().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A registry that serves one image under any repository name: an index
+    /// with one linux/amd64 manifest, its config and one layer.
+    /// `manifest_status` answers a manifest request instead of the image
+    /// when it is not 200, for a mirror that does not have it.
+    fn image_server(manifest_status: u16) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        let layer: Vec<u8> = b"kiri registry mirror test layer".to_vec();
+        let layer_digest = sha256_digest(&layer);
+        let config: Vec<u8> = br#"{"architecture":"amd64","os":"linux","config":{}}"#.to_vec();
+        let config_digest = sha256_digest(&config);
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+            "config": {"mediaType": "application/vnd.docker.container.image.v1+json", "size": config.len(), "digest": config_digest},
+            "layers": [{"mediaType": "application/vnd.docker.image.rootfs.diff.tar.gzip", "size": layer.len(), "digest": layer_digest}],
+        })
+        .to_string();
+        let manifest_digest = sha256_digest(manifest.as_bytes());
+        let index = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.docker.distribution.manifest.list.v2+json",
+            "manifests": [{
+                "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+                "size": manifest.len(),
+                "digest": manifest_digest,
+                "platform": {"architecture": "amd64", "os": "linux"},
+            }],
+        })
+        .to_string();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let host = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let served = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            listener.set_nonblocking(true).unwrap();
+            let end = Instant::now() + Duration::from_secs(20);
+            while Instant::now() < end {
+                let Ok((mut c, _)) = listener.accept() else {
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                };
+                c.set_nonblocking(false).unwrap();
+                let mut head = Vec::new();
+                let mut b = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") && c.read(&mut b).unwrap_or(0) == 1 {
+                    head.push(b[0]);
+                }
+                let head = String::from_utf8_lossy(&head).to_string();
+                if head.is_empty() {
+                    break;
+                }
+                if head.starts_with("QUIT") {
+                    break;
+                }
+                let path = head.lines().next().and_then(|l| l.split_whitespace().nth(1)).unwrap_or("").to_string();
+                // A request that carried credentials is marked, so a test can
+                // tell what a mirror was sent.
+                let authed = head.to_ascii_lowercase().contains("\nauthorization:");
+                seen.push(if authed { format!("{path} (with credentials)") } else { path.clone() });
+                let (status, body, kind): (u16, Vec<u8>, &str) = if path == "/v2/" {
+                    (200, b"{}".to_vec(), "application/json")
+                } else if let Some(reference) = path.split_once("/manifests/").map(|(_, r)| r) {
+                    if manifest_status != 200 {
+                        (manifest_status, Vec::new(), "application/json")
+                    } else if reference.starts_with("sha256:") {
+                        (200, manifest.clone().into_bytes(), "application/vnd.docker.distribution.manifest.v2+json")
+                    } else {
+                        (200, index.clone().into_bytes(), "application/vnd.oci.image.index.v1+json")
+                    }
+                } else if let Some(digest) = path.split_once("/blobs/").map(|(_, d)| d) {
+                    if digest == config_digest {
+                        (200, config.clone(), "application/octet-stream")
+                    } else if digest == layer_digest {
+                        (200, layer.clone(), "application/octet-stream")
+                    } else {
+                        (404, Vec::new(), "application/json")
+                    }
+                } else {
+                    (404, Vec::new(), "application/json")
+                };
+                let head = format!("HTTP/1.1 {status} X\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                let _ = c.write_all(head.as_bytes());
+                let _ = c.write_all(&body);
+            }
+            seen
+        });
+        (host, served)
     }
 }

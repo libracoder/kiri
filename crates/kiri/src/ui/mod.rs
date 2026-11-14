@@ -543,6 +543,24 @@ fn proxy(save: Option<serde_json::Value>) {
     }
 }
 
+/// Reads (or saves, then reads) the Docker Hub registry mirrors.
+fn registry_mirrors(save: Option<serde_json::Value>) {
+    if let Some(body) = save {
+        match client::request("POST", "/kiri/registry-mirrors", Some(&body)) {
+            Ok(r) if r.ok() => emit(notice("ok", &tr("Registry mirrors saved"))),
+            Ok(r) => emit(notice("error", &r.error())),
+            Err(e) => emit(notice("error", &e.to_string())),
+        }
+    }
+    match client::get("/kiri/registry-mirrors") {
+        Ok(mut v) => {
+            v["type"] = "mirrors".into();
+            emit(v.to_string());
+        }
+        Err(e) => emit(serde_json::json!({"type": "mirrors", "error": e.to_string()}).to_string()),
+    }
+}
+
 /// Settings → Domains: reads (or moves, then reads) the routers' ports.
 fn router_ports(set: Option<serde_json::Value>) {
     if let Some(body) = set {
@@ -1850,6 +1868,16 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
         "setproxy" => {
             let body = msg.value;
             std::thread::spawn(move || proxy(Some(body)));
+            Ok(())
+        }
+        // Settings → Registry mirrors.
+        "mirrors" => {
+            std::thread::spawn(|| registry_mirrors(None));
+            Ok(())
+        }
+        "setmirrors" => {
+            let body = msg.value;
+            std::thread::spawn(move || registry_mirrors(Some(body)));
             Ok(())
         }
         // Settings → Domains: the routers' ports.

@@ -142,24 +142,57 @@ pub fn host_addr(engine: &Engine) -> String {
     mirror_host(&engine.lock_net())
 }
 
+/// Adds `mirror` to `registry`'s list, in order, once.
+fn add_mirror(registries: &mut Vec<(String, Vec<String>)>, registry: &str, mirror: String) {
+    match registries.iter_mut().find(|(r, _)| r == registry) {
+        Some((_, mirrors)) => {
+            if !mirrors.contains(&mirror) {
+                mirrors.push(mirror);
+            }
+        }
+        None => registries.push((registry.to_owned(), vec![mirror])),
+    }
+}
+
 pub fn config(engine: &Engine) -> String {
-    let Some(port) = LISTENING.get().copied().flatten() else { return String::new() };
-    let host = format!("{}:{port}", mirror_host(&engine.lock_net()));
-    let mut registries = vec!["docker.io".to_owned()];
-    for i in engine.store.images().unwrap_or_default() {
-        if let Ok(r) = Reference::parse(&i.name)
-            && !registries.contains(&r.registry)
-            && !kiri_image::reference::is_local(&r.registry)
-        {
-            registries.push(r.registry);
+    // One table per registry: BuildKit refuses a buildkitd.toml that names
+    // one twice, and Kiri's own mirror and Settings' may both cover Hub.
+    let mut registries: Vec<(String, Vec<String>)> = Vec::new();
+    let mut http: Vec<String> = Vec::new();
+    if let Some(port) = LISTENING.get().copied().flatten() {
+        let host = format!("{}:{port}", mirror_host(&engine.lock_net()));
+        let token = token();
+        let mut names = vec!["docker.io".to_owned()];
+        for i in engine.store.images().unwrap_or_default() {
+            if let Ok(r) = Reference::parse(&i.name)
+                && !names.contains(&r.registry)
+                && !kiri_image::reference::is_local(&r.registry)
+            {
+                names.push(r.registry);
+            }
+        }
+        for name in names {
+            add_mirror(&mut registries, &name, format!("{host}/{token}/{name}"));
+        }
+        http.push(host);
+    }
+    // Settings → Registry mirrors: Docker Hub only, as Docker's are. They
+    // come after Kiri's own mirror, which serves images built or loaded
+    // here and answers 404 for everything else.
+    for mirror in super::registry_mirrors::list() {
+        add_mirror(&mut registries, "docker.io", mirror.buildkit());
+        if mirror.is_local() && !http.contains(&mirror.host) {
+            http.push(mirror.host.clone());
         }
     }
-    let token = token();
     let mut out = String::new();
-    for r in registries {
-        out.push_str(&format!("[registry.\"{r}\"]\n  mirrors = [\"{host}/{token}/{r}\"]\n"));
+    for (registry, mirrors) in registries {
+        let list = mirrors.iter().map(|m| format!("\"{m}\"")).collect::<Vec<_>>().join(", ");
+        out.push_str(&format!("[registry.\"{registry}\"]\n  mirrors = [{list}]\n"));
     }
-    out.push_str(&format!("[registry.\"{host}\"]\n  http = true\n"));
+    for host in http {
+        out.push_str(&format!("[registry.\"{host}\"]\n  http = true\n"));
+    }
     out
 }
 

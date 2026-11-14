@@ -245,6 +245,27 @@ fn write_config(engine: &Engine, id: &str) {
     }
 }
 
+/// Applies a changed setting that buildkitd reads from its config (the
+/// registry mirrors): writes the file, and when the builder is running with
+/// no build under way, stops it, so the next build starts it with the new
+/// file. A build in flight keeps the old config until its next start.
+pub fn refresh(engine: &Engine) {
+    // The same lock making, starting and stopping the builder take: a build
+    // cannot start while its config is being replaced.
+    let _g = ENSURE.lock().unwrap_or_else(|e| e.into_inner());
+    let Some((id, status)) = find(engine) else { return };
+    write_config(engine, &id);
+    if status != Status::Running || BUILDS.load(Ordering::Relaxed) > 0 {
+        return;
+    }
+    if engine.is_paused(&id) {
+        let _ = engine.pause(&id, false);
+    }
+    if let Err(e) = engine.stop(&id, Duration::from_secs(10)) {
+        crate::diag::warn!("builder not stopped after a settings change", error = format!("{e:?}"));
+    }
+}
+
 /// BuildKit's x86-64 emulator, which it runs amd64 build steps under when it
 /// thinks the machine can't run them itself.
 const AMD64_QEMU: &str = "buildkit-qemu-x86_64";

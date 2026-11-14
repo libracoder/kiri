@@ -107,6 +107,9 @@ fn route(req: &Request, engine: &Arc<Engine>, w: &mut UnixStream, r: &mut BufRea
         ("GET", "/kiri/proxy") => return reply(w, Ok(super::proxy::report()), 200),
         ("POST", "/kiri/proxy") => return reply(w, set_proxy(req), 200),
         ("PUT", "/kiri/proxy/system") => return reply(w, set_host_proxy(req), 200),
+        // Settings → Registry mirrors, and `kiri registry-mirror`.
+        ("GET", "/kiri/registry-mirrors") => return reply(w, Ok(super::registry_mirrors::report()), 200),
+        ("POST", "/kiri/registry-mirrors") => return reply(w, set_registry_mirrors(req, engine), 200),
         ("GET", "/kiri/resources") => return reply(w, Ok(resources(engine)), 200),
         // Settings → Domains: the container-domain routers' ports.
         ("GET", "/kiri/domains") => return reply(w, Ok(super::domains::report()), 200),
@@ -634,6 +637,18 @@ fn set_proxy(req: &Request) -> Result<Value, Error> {
     Ok(super::proxy::report())
 }
 
+fn set_registry_mirrors(req: &Request, engine: &Arc<Engine>) -> Result<Value, Error> {
+    let body: Value = serde_json::from_slice(&req.body).map_err(|e| Error::BadRequest(format!("invalid JSON: {e}")))?;
+    let before = super::registry_mirrors::list();
+    let report = super::registry_mirrors::set(&body).map_err(Error::BadRequest)?;
+    // BuildKit reads its mirrors from buildkitd.toml at each start; an
+    // unchanged save leaves a running builder alone.
+    if super::registry_mirrors::list() != before {
+        super::builder::refresh(engine);
+    }
+    Ok(report)
+}
+
 fn set_domain_ports(req: &Request, engine: &Arc<Engine>) -> Result<Value, Error> {
     let body: Value = serde_json::from_slice(&req.body).map_err(|e| Error::BadRequest(format!("invalid JSON: {e}")))?;
     let port = |k: &str| body[k].as_u64().and_then(|p| u16::try_from(p).ok()).filter(|&p| p != 0).ok_or_else(|| Error::BadRequest(format!("{k} must be a port from 1 to 65535")));
@@ -799,6 +814,11 @@ fn run_pull(req: &Request, engine: &Engine, reference: &Reference, job: &super::
     let client = client_for(req);
     let on_progress = |p: Progress| match p {
         Progress::Resolved { .. } | Progress::Layer { cached: true, .. } => {}
+        // A mirror that did not have the image: say which, and carry on.
+        Progress::MirrorFallback { mirror, reason } => {
+            let reason: String = reason.chars().take(120).collect();
+            line(json!({"status": format!("{mirror}: {reason}; trying the next registry")}));
+        }
         // Docker's own lines, so `docker pull` draws its bars; `size` is
         // extra, for the window's overall bar, and the CLI ignores it.
         Progress::Layer { digest, size, .. } => line(json!({"status": "Pulling fs layer", "progressDetail": {}, "id": short(&digest), "size": size})),

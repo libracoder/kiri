@@ -81,6 +81,10 @@ struct Saved {
     restart_after: Option<u64>,
     /// Why setup last stopped, kept so a restart of Kiri doesn't lose it.
     last_error: Option<String>,
+    /// Why the first-run test container did not answer, if it didn't. Setup
+    /// carries on without it — a blocked Docker Hub must not trap a first
+    /// run — and the ready page says how to add a mirror and try again.
+    test_error: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -112,6 +116,8 @@ struct State {
     tasks: Vec<Task>,
     log: Vec<String>,
     error: Option<String>,
+    /// The test container that did not run, for the ready page.
+    test_error: Option<String>,
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
@@ -277,6 +283,7 @@ fn fresh_state(step: &'static str, s: &Saved) -> State {
         tasks: Vec::new(),
         log: Vec::new(),
         error: None,
+        test_error: s.test_error.clone(),
     }
 }
 
@@ -659,9 +666,24 @@ fn engine() -> io::Result<()> {
         for l in text.lines().map(str::trim).filter(|l| !l.is_empty()).take(20) {
             crate::serve::log(&format!("setup engine: docker: {l}"));
         }
-        return Err(io::Error::other(test_failure(&text)));
+        // A test container that cannot pull is not a broken install: the
+        // engine answered and the pipe works, and Docker Hub may simply be
+        // blocked here. Carry on, and let the ready page say how to add a
+        // registry mirror and try again.
+        let why = test_failure(&text);
+        log_line(&why);
+        task(2, "error", &why);
+        update(|s| s.test_error = Some(why.clone()));
+        let mut s = saved();
+        s.test_error = Some(why);
+        save(&s);
+    } else {
+        task(2, "done", "hello");
+        update(|s| s.test_error = None);
+        let mut s = saved();
+        s.test_error = None;
+        save(&s);
     }
-    task(2, "done", "hello");
     tools()
 }
 
