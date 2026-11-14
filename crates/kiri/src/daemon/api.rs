@@ -952,11 +952,12 @@ const MAC_ROOT: &str = "/mnt/mac";
 const MAC_ROOT: &str = "";
 
 /// Bind sources under these come from the Mac (Docker Desktop's default file
-/// shares; /tmp and /var/folders are the Mac's links into /private). Any
+/// shares, plus /opt and /usr/local for workspace and Homebrew paths;
+/// /tmp and /var/folders are the Mac's links into /private). Any
 /// other path is the VM's own, as on Docker Desktop and OrbStack: kind's
 /// `-v /lib/modules:/lib/modules:ro` must not try to make /lib/modules on
 /// the Mac's read-only root.
-const MAC_SHARES: &[&str] = &["/Users", "/Volumes", "/private", "/tmp", "/var/folders"];
+const MAC_SHARES: &[&str] = &["/Users", "/Volumes", "/private", "/tmp", "/var/folders", "/opt", "/usr/local"];
 
 fn mac_shared(src: &str) -> bool {
     MAC_SHARES.iter().any(|s| src.strip_prefix(s).is_some_and(|rest| rest.is_empty() || rest.starts_with('/')))
@@ -2742,10 +2743,10 @@ mod tests {
 
     #[test]
     fn mac_shares_and_vm_paths() {
-        for p in ["/Users", "/Users/me/src", "/Volumes/ext", "/private/tmp/x", "/private/etc/hosts", "/tmp", "/tmp/kind", "/var/folders/ab/T"] {
+        for p in ["/Users", "/Users/me/src", "/Volumes/ext", "/private/tmp/x", "/private/etc/hosts", "/tmp", "/tmp/kind", "/var/folders/ab/T", "/opt", "/opt/homebrew", "/opt/workspaces/app", "/usr/local", "/usr/local/src/app"] {
             assert!(mac_shared(p), "{p} should come from the Mac");
         }
-        for p in ["/lib/modules", "/etc/hostname", "/var/lib/x", "/var", "/run/foo", "/Users2", "/tmpx", "/privatefoo", "/var/folders2", "/"] {
+        for p in ["/lib/modules", "/etc/hostname", "/var/lib/x", "/var", "/run/foo", "/Users2", "/tmpx", "/privatefoo", "/var/folders2", "/optical", "/usr/locality", "/usr", "/"] {
             assert!(!mac_shared(p), "{p} should be the VM's");
         }
     }

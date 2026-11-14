@@ -38,7 +38,11 @@ Apple silicon and Intel Macs (macOS 14+), Windows 10 and 11 (x86-64 and Arm, thr
   `~/.kiri/tls`, whose name constraints allow only `*.kiri.local` and
   `*.kiri.localhost` (Settings → Domains → HTTPS asks macOS to trust it)
 - **Storage**: named and anonymous volumes, bind mounts of Mac paths
-  (virtiofs), `--tmpfs`, `--mount`, `volume` commands
+  (virtiofs), `--tmpfs`, `--mount`, `volume` commands. Mac bind sources in
+  `/Users`, `/Volumes`, `/private`, `/tmp`, `/var/folders`, `/opt` and
+  `/usr/local` use the Mac's files. Other paths stay in the Linux VM.
+  The Mac share uses 1 MiB read-ahead for sequential reads; cache coherence
+  and read-only mounts are unchanged. Other filesystems keep their settings.
 - **Images**: `pull` (with `docker login` credentials), `push`, `tag`,
   `save`, `load`, `history`, `search`, `image prune`, `system df`;
   **amd64 images run through Rosetta**, `--platform` honoured
