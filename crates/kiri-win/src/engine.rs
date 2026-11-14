@@ -1230,7 +1230,79 @@ fn windows_proxy() -> Value {
     json!({"http": http, "https": https, "no_proxy": no_proxy, "pac": field("AutoConfigURL").is_some()})
 }
 
-/// Tells the daemon what Windows' proxy is. A proxy on Windows' own
+/// Windows' own IPv4 networks and VPNs, for Settings → Network → Container
+/// addresses (the daemon in WSL2 sees only the distro's): each connected
+/// adapter's network, but loopback, link-local and WSL's own adapter, whose
+/// network the daemon keeps clear of already. `[{"name": "Wi-Fi", "net":
+/// "192.168.1.0/24"}]`; a VPN's adapter is named `VPN (…)`.
+fn windows_networks() -> Value {
+    use windows_sys::Win32::NetworkManagement::IpHelper::{GetAdaptersAddresses, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST, IF_TYPE_PPP, IF_TYPE_SOFTWARE_LOOPBACK, IF_TYPE_TUNNEL, IP_ADAPTER_ADDRESSES_LH};
+    use windows_sys::Win32::NetworkManagement::Ndis::IfOperStatusUp;
+    use windows_sys::Win32::Networking::WinSock::{AF_INET, SOCKADDR_IN};
+    let flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+    // Asked again with the size it says, as the adapters may change between calls.
+    let mut size: u32 = 16 * 1024;
+    let mut buf: Vec<u64> = Vec::new();
+    for _ in 0..3 {
+        buf = vec![0u64; (size as usize).div_ceil(8)];
+        // SAFETY: buf is `size` bytes, 8-aligned, as GetAdaptersAddresses wants.
+        let r = unsafe { GetAdaptersAddresses(u32::from(AF_INET), flags, std::ptr::null(), buf.as_mut_ptr().cast(), &mut size) };
+        match r {
+            0 => break,
+            111 => continue, // ERROR_BUFFER_OVERFLOW: size is the size needed
+            _ => return json!([]),
+        }
+    }
+    let mut out: Vec<Value> = Vec::new();
+    let mut seen: Vec<(u32, u8)> = Vec::new();
+    let mut p = buf.as_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>();
+    while !p.is_null() {
+        // SAFETY: `p` is an entry of the list GetAdaptersAddresses wrote into buf.
+        let a = unsafe { &*p };
+        p = a.Next;
+        if a.OperStatus != IfOperStatusUp || a.IfType == IF_TYPE_SOFTWARE_LOOPBACK {
+            continue;
+        }
+        let name = if a.FriendlyName.is_null() {
+            String::new()
+        } else {
+            // SAFETY: FriendlyName is a NUL-terminated UTF-16 string in buf.
+            let len = (0..).take_while(|&i| unsafe { *a.FriendlyName.add(i) } != 0).count();
+            String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(a.FriendlyName, len) })
+        };
+        if name.starts_with("vEthernet (WSL") {
+            continue;
+        }
+        let name = if a.IfType == IF_TYPE_PPP || a.IfType == IF_TYPE_TUNNEL { format!("VPN ({name})") } else { name };
+        let mut u = a.FirstUnicastAddress;
+        while !u.is_null() {
+            // SAFETY: `u` is an entry of the adapter's address list in buf.
+            let ua = unsafe { &*u };
+            u = ua.Next;
+            let sa = ua.Address.lpSockaddr;
+            // SAFETY: a non-null sockaddr; an AF_INET one is a SOCKADDR_IN.
+            if sa.is_null() || unsafe { (*sa).sa_family } != AF_INET {
+                continue;
+            }
+            let addr = u32::from_be(unsafe { (*sa.cast::<SOCKADDR_IN>()).sin_addr.S_un.S_addr });
+            let bits = ua.OnLinkPrefixLength.min(32);
+            let first = addr.to_be_bytes();
+            if first[0] == 127 || (first[0] == 169 && first[1] == 254) {
+                continue;
+            }
+            let net = if bits == 0 { 0 } else { addr & (u32::MAX << (32 - u32::from(bits))) };
+            if seen.contains(&(net, bits)) {
+                continue;
+            }
+            seen.push((net, bits));
+            let n = net.to_be_bytes();
+            out.push(json!({"name": name, "net": format!("{}.{}.{}.{}/{bits}", n[0], n[1], n[2], n[3])}));
+        }
+    }
+    Value::Array(out)
+}
+
+/// Tells the daemon what Windows' proxy is, and Windows' networks. A proxy on Windows' own
 /// 127.0.0.1 (Windows' or one set in Settings → Network) is reached through
 /// the relay (relay.rs), and the daemon gets its ports too.
 pub(crate) fn send_windows_proxy() {
@@ -1245,6 +1317,7 @@ pub(crate) fn send_windows_proxy() {
     targets.dedup();
     let relay = crate::relay::ports(&targets);
     body["relay"] = relay.iter().map(|(t, l)| (t.to_string(), json!(l))).collect::<serde_json::Map<_, _>>().into();
+    body["networks"] = windows_networks();
     let _ = client::request("PUT", "/kiri/proxy/system", Some(&body));
 }
 
@@ -1270,7 +1343,7 @@ fn proxy(set: Option<Value>) {
             Ok(()) => {
                 // A custom proxy on Windows' loopback needs the relay too.
                 send_windows_proxy();
-                emit(notice("ok", &tr("Proxy settings saved")));
+                emit(notice("ok", &tr("Network settings saved")));
             }
             Err(e) => emit(notice("error", &trf("Could not save the proxy settings: {error}", &[("error", &e)]))),
         }

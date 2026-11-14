@@ -529,7 +529,7 @@ fn set_pref(name: &str, value: serde_json::Value) {
 fn proxy(save: Option<serde_json::Value>) {
     if let Some(body) = save {
         match client::request("POST", "/kiri/proxy", Some(&body)) {
-            Ok(r) if r.ok() => emit(notice("ok", &tr("Proxy settings saved"))),
+            Ok(r) if r.ok() => emit(notice("ok", &tr("Network settings saved"))),
             Ok(r) => emit(notice("error", &r.error())),
             Err(e) => emit(notice("error", &e.to_string())),
         }
