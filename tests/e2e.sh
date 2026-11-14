@@ -107,6 +107,7 @@ t output-bytes "5488895" bash -c "$D run --rm alpine sh -c 'seq 1 800000' | wc -
 t killed-by-signal "137" $D run --rm alpine sh -c 'sh -c "kill -9 \$\$"; echo $?'
 
 section "run: config"
+code archive-directory-contents 0 python3 "$(dirname "$0")/archive-directory-contents.py" "$SOCK"
 t env "bar" $D run --rm -e FOO=bar alpine sh -c 'echo $FOO'
 t env-image "PATH=/usr/local/sbin" $D run --rm alpine env
 t workdir "/tmp" $D run --rm -w /tmp alpine pwd
