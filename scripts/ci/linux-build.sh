@@ -11,6 +11,7 @@
 #   and WebKitGTK) for this machine's own architecture, when
 #   libwebkit2gtk-4.1-dev is installed; it goes in the full kiri package
 # - kiri and kiri-lite as .deb and .rpm for each (packaging/linux/build.sh)
+# - Kiri as an AppImage, when the GTK/WebKitGTK window binary was built (packaging/linux/appimage.sh)
 #
 #   scripts/ci/linux-build.sh
 #
@@ -46,6 +47,10 @@ for arch in x86_64 aarch64; do
   w=; [ "$arch" = "$(uname -m)" ] && w=$window
   bash packaging/linux/build.sh "$bins/$arch" target/packages "$arch" "target/linux-cli-$arch" $w
 done
+if [ -n "$window" ]; then
+  bash packaging/linux/appimage.sh "$bins/$(uname -m)" "$window" target/packages
+fi
 cd target/packages
-sha256sum *.deb *.rpm > SHA256SUMS-linux
+appimages=$(ls *.AppImage 2>/dev/null || true)
+sha256sum *.deb *.rpm $appimages > SHA256SUMS-linux
 cat SHA256SUMS-linux

@@ -158,10 +158,36 @@ pub fn run(args: &[String]) -> io::Result<u8> {
             must_output(tool_cmd(&groupadd).args(["--system", group]), "groupadd")
         },
         |member, group| add_member_with(member, group, find_tool("usermod").as_deref(), find_tool("gpasswd").as_deref()),
-        || engine(restart),
+        || install_from_appimage().and_then(|()| engine(restart)),
         |group| crate::daemon::access::grant(Path::new(SOCKET), group),
         |line| println!("{line}"),
     )
+}
+
+fn install_from_appimage() -> io::Result<()> {
+    let Some(appdir) = appdir() else { return Ok(()) };
+    if ["/lib/systemd/system/kiri.service", "/usr/lib/systemd/system/kiri.service"].iter().any(|p| Path::new(p).exists()) {
+        return Ok(());
+    }
+    let bin = Path::new("/usr/local/bin");
+    std::fs::create_dir_all(bin)?;
+    for name in ["kiri", "kiri-init"] {
+        let to = bin.join(name);
+        // Copy, then rename over the old file: a running engine keeps its own binary.
+        let part = to.with_extension("part");
+        std::fs::copy(appdir.join("usr/bin").join(name), &part).and_then(|_| std::fs::rename(&part, &to)).map_err(|e| io::Error::other(format!("{}: {e}", to.display())))?;
+    }
+    let unit = include_str!("../../../packaging/linux/kiri.service").replace("/usr/bin/kiri", "/usr/local/bin/kiri");
+    std::fs::write("/etc/systemd/system/kiri.service", unit)?;
+    println!("Kiri's engine is installed in /usr/local/bin");
+    let systemctl = find_tool("systemctl").ok_or_else(|| io::Error::other("systemctl not found in system directories"))?;
+    must(tool_cmd(&systemctl).arg("daemon-reload"), "systemctl daemon-reload")
+}
+
+/// APPDIR, only when this program is inside it: programs started from another AppImage inherit APPDIR too.
+pub fn appdir() -> Option<std::path::PathBuf> {
+    let dir = std::path::PathBuf::from(std::env::var_os("APPDIR")?);
+    std::env::current_exe().ok()?.starts_with(&dir).then_some(dir)
 }
 
 /// The engine running and answering on its socket; with `restart`, a
