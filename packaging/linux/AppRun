@@ -1,0 +1,6 @@
+#!/bin/sh
+# No arguments, or `ui`: the window. Anything else goes to the static kiri.
+here=$(dirname "$(readlink -f "$0")")
+[ $# -eq 0 ] && set -- ui
+[ "$1" = ui ] && exec "$here/usr/bin/kiri-window" "$@"
+exec "$here/usr/bin/kiri" "$@"
