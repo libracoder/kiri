@@ -278,6 +278,9 @@ fn commit(req: &Request, engine: &Engine) -> Result<Value, Error> {
     cfg["config"]["Env"] = json!(spec.env);
     cfg["config"]["WorkingDir"] = spec.cwd.clone().into();
     cfg["config"]["User"] = spec.user.clone().into();
+    if spec.labels.is_object() {
+        cfg["config"]["Labels"] = spec.labels.clone();
+    }
     if let Some(h) = &spec.healthcheck {
         cfg["config"]["Healthcheck"] = h.to_json();
     }
@@ -477,7 +480,7 @@ fn system_df(engine: &Engine) -> Result<Value, Error> {
                 "Size": size,
                 "SharedSize": shared,
                 "VirtualSize": size,
-                "Labels": null,
+                "Labels": super::api::image_labels(engine, i),
                 "Containers": used.iter().filter(|u| **u == i.config_digest).count(),
             })
         })

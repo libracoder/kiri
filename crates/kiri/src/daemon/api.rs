@@ -474,8 +474,42 @@ pub(super) fn reference_matches(pattern: &str, name: &str) -> bool {
     }
 }
 
+pub(super) fn image_config_json(engine: &Engine, digest: &str) -> Value {
+    engine.store.read_config(digest).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null)
+}
+
+pub(super) fn image_labels_from(cfg: &Value) -> Value {
+    match &cfg["config"]["Labels"] {
+        Value::Object(m) if !m.is_empty() => Value::Object(m.clone()),
+        _ => Value::Null,
+    }
+}
+
+pub(super) fn image_labels(engine: &Engine, i: &kiri_image::Image) -> Value {
+    image_labels_from(&image_config_json(engine, &i.config_digest))
+}
+
+fn merge_labels(image_cfg: &Value, body_labels: &Value) -> Value {
+    let mut merged = serde_json::Map::new();
+    if let Value::Object(img) = &image_cfg["config"]["Labels"] {
+        for (k, v) in img {
+            merged.insert(k.clone(), v.clone());
+        }
+    }
+    if let Value::Object(req) = body_labels {
+        for (k, v) in req {
+            merged.insert(k.clone(), v.clone());
+        }
+    }
+    if merged.is_empty() && !body_labels.is_object() {
+        Value::Null
+    } else {
+        Value::Object(merged)
+    }
+}
+
 fn images(req: &Request, engine: &Engine) -> Result<Value, Error> {
-    let f = filters(req, &["reference", "dangling", "label"])?;
+    let f = filters(req, &["reference", "dangling", "label", "label!"])?;
     let mut list = engine.store.images()?;
     // Newest first, as Docker lists them (#364).
     list.sort_by_key(|i| std::cmp::Reverse(time::parse_unix(&i.created)));
@@ -485,9 +519,15 @@ fn images(req: &Request, engine: &Engine) -> Result<Value, Error> {
     }
     Ok(Value::Array(
         list.iter()
-            .filter(|i| f.any("reference", |p| reference_matches(p, &i.name)) && f.labels(&Value::Null))
-            .map(|i| {
-                json!({
+            .filter_map(|i| {
+                if !f.any("reference", |p| reference_matches(p, &i.name)) {
+                    return None;
+                }
+                let labels = image_labels(engine, i);
+                if !f.labels(&labels) {
+                    return None;
+                }
+                Some(json!({
                     "Id": i.config_digest,
                     "ParentId": "",
                     "RepoTags": [i.name],
@@ -496,11 +536,11 @@ fn images(req: &Request, engine: &Engine) -> Result<Value, Error> {
                     "Size": i.size,
                     "SharedSize": -1,
                     "VirtualSize": i.size,
-                    "Labels": null,
+                    "Labels": labels,
                     "Containers": -1,
                     // Not Docker's: when this image arrived here, for the window.
                     "Pulled": i.pulled_at,
-                })
+                }))
             })
             .collect(),
     ))
@@ -508,6 +548,7 @@ fn images(req: &Request, engine: &Engine) -> Result<Value, Error> {
 
 fn image_inspect(engine: &Engine, name: &str) -> Result<Value, Error> {
     let i = engine.image(name)?.ok_or_else(|| Error::NotFound(format!("No such image: {name}")))?;
+    let cfg = image_config_json(engine, &i.config_digest);
     Ok(json!({
         "Id": i.config_digest,
         "RepoTags": [i.name],
@@ -522,7 +563,8 @@ fn image_inspect(engine: &Engine, name: &str) -> Result<Value, Error> {
             "Entrypoint": if i.config.entrypoint.is_empty() { Value::Null } else { json!(i.config.entrypoint) },
             "WorkingDir": i.config.working_dir,
             "User": i.config.user,
-            "Healthcheck": image_healthcheck(engine, &i),
+            "Labels": image_labels_from(&cfg),
+            "Healthcheck": cfg["config"]["Healthcheck"].clone(),
         },
         "RootFS": {"Type": "layers", "Layers": i.layers.iter().map(|l| &l.digest).collect::<Vec<_>>()},
     }))
@@ -1607,7 +1649,7 @@ pub(super) fn create(req: &Request, engine: &Engine) -> Result<Value, Error> {
         }
     }
     // The image's own config, for what Kiri's image model does not keep.
-    let image_cfg: Value = engine.store.read_config(&image.config_digest).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null);
+    let image_cfg = image_config_json(engine, &image.config_digest);
     // Checked before mounts, which may create volumes.
     let healthcheck = healthcheck_from(&body, &image_cfg)?;
     let mounts = mounts(&body, engine, &image)?;
@@ -1652,9 +1694,7 @@ pub(super) fn create(req: &Request, engine: &Engine) -> Result<Value, Error> {
         readonly_rootfs: host["ReadonlyRootfs"].as_bool().unwrap_or(false),
         hostname: body["Hostname"].as_str().unwrap_or_default().to_owned(),
         stop_signal: body["StopSignal"].as_str().filter(|s| !s.is_empty()).map(signal).or_else(|| {
-            // The image's STOPSIGNAL.
-            let cfg: Value = serde_json::from_slice(&engine.store.read_config(&image.config_digest).ok()?).ok()?;
-            cfg["config"]["StopSignal"].as_str().filter(|s| !s.is_empty()).map(signal)
+            image_cfg["config"]["StopSignal"].as_str().filter(|s| !s.is_empty()).map(signal)
         }),
         stop_timeout: body["StopTimeout"].as_i64(),
         healthcheck,
@@ -1671,7 +1711,7 @@ pub(super) fn create(req: &Request, engine: &Engine) -> Result<Value, Error> {
         dns_options: strings(&host["DnsOptions"]).unwrap_or_default(),
         domainname: body["Domainname"].as_str().unwrap_or_default().to_owned(),
         links,
-        labels: body["Labels"].clone(),
+        labels: merge_labels(&image_cfg, &body["Labels"]),
         tty: body["Tty"].as_bool().unwrap_or(false),
         open_stdin: body["OpenStdin"].as_bool().unwrap_or(false),
         console_size: console_size(&host["ConsoleSize"]),
@@ -1819,12 +1859,6 @@ fn healthcheck_from(body: &Value, image_cfg: &Value) -> Result<Option<super::hea
         h.validate().map_err(Error::BadRequest)?;
     }
     Ok(super::health::merge(mine, Healthcheck::from_json(&image_cfg["config"]["Healthcheck"])))
-}
-
-/// The image's HEALTHCHECK, which Kiri's image model does not keep.
-fn image_healthcheck(engine: &Engine, i: &kiri_image::Image) -> Value {
-    let cfg: Value = engine.store.read_config(&i.config_digest).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null);
-    cfg["config"]["Healthcheck"].clone()
 }
 
 /// `docker ps`'s Status: "Up 2 minutes (healthy)" while running unpaused
@@ -3264,5 +3298,90 @@ mod network_option_tests {
         assert_eq!(super::pull_hint(&status(401), "docker.io", None).unwrap(), "Docker Hub asked for a login: docker login");
         assert_eq!(super::pull_hint(&status(500), "docker.io", None), None);
         assert_eq!(super::pull_hint(&Error::NotFound("no such image".into()), "docker.io", p), None);
+    }
+
+    #[test]
+    fn image_and_container_labels_follow_docker() {
+        let dir = std::env::temp_dir().join(format!("kiri-labels-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = kiri_image::Store::open(&dir).unwrap();
+        let put = |name: &str, cfg: Value| {
+            let bytes = serde_json::to_vec(&cfg).unwrap();
+            let mut w = store.ingest().unwrap();
+            io::Write::write_all(&mut w, &bytes).unwrap();
+            let (digest, _) = w.finish().unwrap();
+            let img = kiri_image::archive::from_config(name.into(), &digest, &cfg, Vec::new());
+            store.put_image(img).unwrap();
+        };
+        put(
+            "demo:labeled",
+            json!({
+                "created": "2026-11-16T00:00:00Z",
+                "architecture": "arm64",
+                "os": "linux",
+                "config": {
+                    "Labels": {
+                        "cn.shopcider.safeguards.revision": "0a5b41cadacdafe94742fc8401d682347a392739",
+                        "keep": "image"
+                    }
+                }
+            }),
+        );
+        put(
+            "demo:plain",
+            json!({"created": "2026-11-16T00:00:00Z", "architecture": "arm64", "os": "linux", "config": {}}),
+        );
+
+        let engine = Engine::boot(store).unwrap();
+        let labeled = super::image_inspect(&engine, "demo:labeled").unwrap();
+        assert_eq!(
+            labeled["Config"]["Labels"],
+            json!({"cn.shopcider.safeguards.revision": "0a5b41cadacdafe94742fc8401d682347a392739", "keep": "image"})
+        );
+        let plain = super::image_inspect(&engine, "demo:plain").unwrap();
+        assert!(plain["Config"].as_object().unwrap().contains_key("Labels"));
+        assert!(plain["Config"]["Labels"].is_null());
+
+        let filtered = super::images(
+            &Request::internal("GET", "/images/json", &[("filters", r#"{"label":["keep=image"]}"#)], Vec::new()),
+            &engine,
+        )
+        .unwrap();
+        let rows = filtered.as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["RepoTags"], json!(["demo:labeled"]));
+        assert_eq!(rows[0]["Labels"]["keep"], "image");
+
+        let negated = super::images(
+            &Request::internal("GET", "/images/json", &[("filters", r#"{"label!":["keep=image"]}"#)], Vec::new()),
+            &engine,
+        )
+        .unwrap();
+        assert_eq!(negated.as_array().unwrap().len(), 1);
+        assert_eq!(negated[0]["RepoTags"], json!(["demo:plain"]));
+
+        let body = json!({
+            "Image": "demo:labeled",
+            "Labels": {"keep": "container", "extra": "1"},
+            "HostConfig": {"NetworkMode": "none"}
+        });
+        let created = super::create(
+            &Request::internal("POST", "/containers/create", &[("name", "c1")], serde_json::to_vec(&body).unwrap()),
+            &engine,
+        )
+        .unwrap();
+        let id = created["Id"].as_str().unwrap();
+        let ctr = super::container_inspect(&engine, id).unwrap();
+        assert_eq!(
+            ctr["Config"]["Labels"],
+            json!({
+                "cn.shopcider.safeguards.revision": "0a5b41cadacdafe94742fc8401d682347a392739",
+                "keep": "container",
+                "extra": "1"
+            })
+        );
+
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
