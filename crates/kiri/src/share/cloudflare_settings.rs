@@ -16,11 +16,11 @@ pub struct RouteInput {
     pub credentials_file: PathBuf,
 }
 
-fn draft(cfg: &Config) -> Draft {
+pub(super) fn draft(cfg: &Config) -> Draft {
     Draft { base_domain: cfg.base_domain.clone(), routes: cfg.tunnels.iter().map(|(name, t)| RouteInput { name: name.clone(), credentials_file: t.credentials_file.clone() }).collect() }
 }
 
-fn credentials(path: &Path) -> io::Result<NamedTunnel> {
+pub(super) fn credentials(path: &Path) -> io::Result<NamedTunnel> {
     let expanded = if let Ok(rest) = path.strip_prefix("~") { PathBuf::from(std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).ok_or_else(|| io::Error::other("HOME is not set"))?).join(rest) } else { path.to_owned() };
     let credentials_file = expanded.canonicalize().map_err(|e| io::Error::other(format!("cannot read Cloudflare credentials file: {e}")))?;
     let value: Value = serde_json::from_reader(File::open(&credentials_file)?.take(64 * 1024)).map_err(|_| io::Error::other("choose the tunnel credentials JSON created by cloudflared tunnel create, not cert.pem or a tunnel token"))?;
@@ -84,17 +84,23 @@ pub fn update(input: Draft) -> io::Result<Value> {
 }
 
 const USAGE: &str = "usage: kiri share domain add BASE_DOMAIN NAME CREDENTIALS_FILE
+       kiri share domain connect BASE_DOMAIN [--json]
+       kiri share domain create BASE_DOMAIN NAME [--json]
        kiri share domain list [--json]
        kiri share domain remove NAME
        kiri share domain clear
 
-Add uses an existing locally managed tunnel. Create it with cloudflared
-tunnel create, then route its DNS hostname. Kiri does not provision DNS.
+Connect opens Cloudflare's browser authorization. Create provisions the
+tunnel and DNS record automatically. Add imports an existing locally
+managed tunnel; configure its DNS separately.
 Clear removes local domain mappings and returns to temporary links;
 credentials and Cloudflare resources are kept. Existing links stay open.";
 
 pub fn cli(args: &[String]) -> io::Result<()> {
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    if matches!(args.first(), Some(&"connect" | &"create")) {
+        return super::setup::cli(&args);
+    }
     let result = match args.as_slice() {
         [] | ["list"] | ["list", "--json"] => current()?,
         ["add", base, name, file] => {

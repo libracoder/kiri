@@ -1017,6 +1017,7 @@ pub fn on_message(msg: &str) {
         }
         "shareusage" => sharing::usage(),
         "shareconfig" => sharing::cloudflare_settings(c.id, (!c.value.is_null()).then_some(c.value)),
+        "sharecloudflare" => sharing::cloudflare_setup(c.id, c.action, c.value),
         // The account's live tunnels from every computer, and closing one this window didn't open.
         "sharetunnels" => sharing::tunnels(),
         "sharetraffic" => sharing::traffic(),

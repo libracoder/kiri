@@ -16,12 +16,35 @@ import time
 
 BINARY = str(Path(sys.argv[1]).resolve())
 FAKE = r'''
-import http.server, json, os, pathlib, sys, time
+import http.server, json, os, pathlib, sys, time, uuid
 args = sys.argv[1:]
 arg = lambda name: args[args.index(name) + 1]
 root = pathlib.Path(os.environ["KIRI_CF_TEST"])
 config = pathlib.Path(arg("--config"))
 runtime = config.parent
+if "--origincert" in args:
+    command = args[args.index("--origincert") + 2:]
+    cert = pathlib.Path(arg("--origincert"))
+    assert cert == pathlib.Path(os.environ["HOME"]) / ".cloudflared/cert.pem"
+    (root / ("setup-" + str(os.getpid()) + ".json")).write_text(json.dumps({"pid":os.getpid(), "command":command, "runtime":str(runtime), "home":os.environ["HOME"], "token":os.environ.get("TUNNEL_TOKEN"), "force_dns":os.environ.get("TUNNEL_FORCE_PROVISIONING_DNS")}))
+    if command[0] == "login":
+        print("https://dash.cloudflare.com.evil.example/argotunnel?callback=wrong", file=sys.stderr, flush=True)
+        print("https://dash.cloudflare.com/argotunnel?aud=&callback=https%3A%2F%2Flogin.cloudflareaccess.org%2Ftest", file=sys.stderr, flush=True)
+        while (root / "hold_login").exists(): time.sleep(.05)
+        cert.write_text("fake-account-secret-must-not-leak")
+    elif command[0] == "list":
+        assert cert.is_file()
+    elif command[0] == "create":
+        pathlib.Path(arg("--credentials-file")).write_text(json.dumps({"TunnelID":str(uuid.uuid4()), "TunnelSecret":"fake-tunnel-secret-must-not-leak"}))
+    elif command[:2] == ["route", "dns"]:
+        assert "--overwrite-dns" not in args
+        if (root / "fail_dns").exists():
+            print("fake-account-secret-must-not-leak", file=sys.stderr, flush=True)
+            sys.exit(7)
+        hostname = command[-1] + (".other.net" if (root / "wrong_zone").exists() else "")
+        print(json.dumps({"message":f"Added CNAME {hostname} which will route to this tunnel"}), file=sys.stderr, flush=True)
+    else: raise AssertionError(command)
+    sys.exit(0)
 (root / (str(os.getpid()) + ".json")).write_text(json.dumps({"pid":os.getpid(), "args":args, "config":json.loads(config.read_text()), "token":os.environ.get("TUNNEL_TOKEN"), "runtime":str(runtime)}))
 if (root / "fail").exists():
     print(json.dumps({"message":"private-token-must-not-leak"}), file=sys.stderr, flush=True)
@@ -96,7 +119,7 @@ def main():
         fake.chmod(0o700)
         config = root / "share.json"
         env = {**os.environ, "KIRI_SHARE_CONFIG": str(config), "KIRI_CF_TEST": temp,
-               "TUNNEL_TOKEN": "unrelated-token-must-be-removed"}
+               "TUNNEL_TOKEN": "unrelated-token-must-be-removed", "TUNNEL_FORCE_PROVISIONING_DNS": "true"}
         children = []
 
         def save(extra=None):
@@ -252,6 +275,58 @@ def main():
             assert credentials.exists() and other.exists()
             assert json.loads(config.read_text())["cloudflare"]["executable"] == str(fake)
             print("PASS multiple custom hosts, route removal and returning to temporary links")
+
+            def setups():
+                return [json.loads(p.read_text()) for p in root.glob("setup-*.json")]
+
+            connected = cli("domain", "connect", "example.com", "--json")
+            assert "https://dash.cloudflare.com/argotunnel?" in connected.stdout
+            assert "evil.example" not in connected.stdout
+            assert "secret-must-not-leak" not in connected.stdout + connected.stderr
+            first = cli("domain", "create", "example.com", "auto", "--json")
+            assert json.loads(first.stdout.splitlines()[-1])["result"]["hostname"] == "auto.example.com"
+            saved = json.loads(config.read_text())
+            auto = saved["cloudflare"]["tunnels"]["auto"]
+            assert "cloudflare-managed" in auto["credentials_file"]
+            creation_count = sum(s["command"][0] == "create" for s in setups())
+            cli("domain", "create", "example.com", "auto", "--json")
+            assert sum(s["command"][0] == "create" for s in setups()) == creation_count
+            assert json.loads(config.read_text())["cloudflare"]["tunnels"]["auto"] == auto
+            before_config = config.read_bytes()
+            (root / "wrong_zone").touch()
+            assert cli("domain", "create", "example.com", "wrong-zone", "--json", ok=False).returncode != 0
+            assert config.read_bytes() == before_config
+            (root / "wrong_zone").unlink()
+            before_config = config.read_bytes()
+            (root / "fail_dns").touch()
+            failed = cli("domain", "create", "example.com", "retry", "--json", ok=False)
+            assert failed.returncode != 0
+            assert "Existing records were not replaced" in failed.stderr
+            assert "secret-must-not-leak" not in failed.stdout + failed.stderr
+            assert config.read_bytes() == before_config
+            creation_count = sum(s["command"][0] == "create" for s in setups())
+            (root / "fail_dns").unlink()
+            cli("domain", "create", "example.com", "retry", "--json")
+            assert sum(s["command"][0] == "create" for s in setups()) == creation_count
+            for s in setups():
+                assert str(root.resolve()) in s["home"] and "cloudflare-managed" in s["home"]
+                assert s["token"] is None and s["force_dns"] is None
+            assert "secret-must-not-leak" not in config.read_text()
+            print("PASS browser authorization, isolated credentials, automated DNS and idempotent retries")
+
+            (root / "hold_login").touch()
+            before = {s["pid"] for s in setups()}
+            login = subprocess.Popen([BINARY, "share", "domain", "connect", "cancel.example.com", "--json"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            children.append(login)
+            eventually(lambda: any(s["pid"] not in before for s in setups()))
+            capture = next(s for s in setups() if s["pid"] not in before)
+            blocked = cli("domain", "create", "example.com", "blocked", ok=False)
+            assert blocked.returncode != 0 and "another Cloudflare setup" in blocked.stderr
+            login.kill(); login.wait(timeout=5)
+            closed(capture)
+            assert not (Path(capture["home"]) / ".cloudflared/cert.pem").exists()
+            (root / "hold_login").unlink()
+            print("PASS interrupted browser authorization reaps the setup process")
 
             save()
             (root / "fail").touch()

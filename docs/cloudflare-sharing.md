@@ -41,7 +41,50 @@ On Windows use an escaped absolute path, for example
 
 ## Use your domain later
 
-Choose a domain on Cloudflare, then provision one **locally managed** tunnel
+Choose a domain already managed in your Cloudflare account. In the app:
+
+1. Open **Share → Custom domain** and select **Custom domain** as the link type.
+2. Enter your base domain and a share name. A container named `web` uses
+   `web.example.com` when the base domain is `example.com`.
+3. Select **Connect Cloudflare**. Approve the domain in the Cloudflare browser
+   page that opens; Kiri receives the authorization automatically. If the
+   browser did not open, use **Open Cloudflare** in the dialog.
+4. Select **Create public address**. Kiri creates a locally managed tunnel,
+   stores its credentials privately, creates its proxied DNS record, and saves
+   the route. There is no JSON file to copy or DNS record to enter by hand.
+5. Press **Share** on the container to start serving that address.
+
+**Create public address** also starts browser authorization if needed, so
+the separate Connect step is optional. Reconnect to authorize the domain
+again if permission has expired or you selected the wrong zone. Signing in
+uses Cloudflare's [browser authorization](https://developers.cloudflare.com/tunnel/features/locally-managed-tunnels/create-local-tunnel/).
+Kiri does not receive your password. It runs cloudflared with a separate
+per-domain home under `cloudflare-managed`, beside its sharing config, so
+your existing cloudflared login and configuration are not overwritten.
+
+The equivalent CLI flow is:
+
+```sh
+kiri share domain connect example.com
+kiri share domain create example.com web
+kiri share 3000 --name web
+```
+
+`connect` and `create` accept `--json` for progress and completion events.
+Closing the dialog or pressing **Cancel setup** stops the active operation.
+If DNS creation fails, Kiri keeps the tunnel credentials and reuses that
+tunnel on retry. It does not overwrite a conflicting DNS record. Any tunnel
+created before a cancellation remains in your Cloudflare account; retrying
+the same domain and share name reuses it when its credentials were saved.
+The Cloudflare dashboard can remove resources you no longer want.
+
+The preview app uses its own settings. For that app's CLI, use
+`~/.kiri-cloudflare/bin/kiri`; the normal `kiri` command configures the
+installed app instead.
+
+### Advanced: import an existing tunnel
+
+Manual import remains available for tunnels you manage yourself. Provision one **locally managed** tunnel
 for each share name. For example, after replacing `example.com` with your
 domain:
 
@@ -80,20 +123,17 @@ and Cloudflare resources. Existing links retain their routing until stopped;
 saved settings apply to new shares. To change the base domain in the CLI,
 clear it first, then add the new routes.
 
-### Set up the domain in the app
+### Import in the app
 
-In **Share → Custom domain**, choose **Custom domain**, enter the base domain
-and select **Add tunnel**. Enter the share name (the container's name for the
+In **Share → Custom domain**, enter the base domain, expand
+**Advanced: import or edit tunnel routes**, and select **Add tunnel**.
+Enter the share name (the container's name for the
 app's Share button) and the path to its credentials JSON. Absolute paths and
 `~/.cloudflared/...` paths are supported. Add each tunnel, then select
-**Save sharing settings**. The dialog shows the proxied CNAME records to
+**Save imported routes**. Advanced shows the proxied CNAME records to
 create in Cloudflare. It also lets you edit/remove routes or return to
 temporary links. Validation errors leave your edits visible and the saved
 configuration intact.
-
-The preview app uses its own settings. For that app's CLI, use
-`~/.kiri-cloudflare/bin/kiri`; the normal `kiri` command configures the
-installed app instead.
 
 ### Configure the file directly
 
@@ -123,10 +163,10 @@ Kiri does not fall back to Kiri Cloud or a temporary URL when a base domain
 is configured.
 
 Kiri generates an isolated ingress configuration for the selected origin,
-with that exact hostname followed by a 404 catch-all. It does not change
-existing cloudflared configuration, create DNS records, or provision/delete
-Cloudflare resources. DNS and tunnel provisioning remain separate and persist
-when a share stops. Follow Cloudflare's
+with that exact hostname followed by a 404 catch-all. Automatic setup creates
+the tunnel and DNS record; importing an existing tunnel leaves those steps
+to you. Stopping a share or removing a local mapping does not delete the
+Cloudflare tunnel or DNS record. Follow Cloudflare's
 [local tunnel setup](https://developers.cloudflare.com/tunnel/features/locally-managed-tunnels/create-local-tunnel/)
 for the account and DNS steps. If you choose a nested base such as
 `apps.example.com`, ensure Cloudflare has an edge certificate covering
@@ -171,5 +211,6 @@ python3 scripts/ui-test.py
 ```
 
 The lifecycle integration test uses a local fake cloudflared; it creates no
-public tunnel and needs no account. A real custom-domain test requires the
-domain, DNS record and tunnel credentials configured above.
+public tunnel and needs no account. It covers browser authorization, tunnel
+and DNS creation, retries, cancellation, and sharing. A real custom-domain
+test requires authorizing a domain in your Cloudflare account.

@@ -1016,6 +1016,7 @@ td.actions .acts-row { margin-inline-start: auto; width: max-content; padding-in
 .cf-route { display: grid; grid-template-columns: minmax(100px, 1fr) minmax(180px, 2fr) auto; gap: 8px; align-items: end; }
 .cf-settings .cf-dns { display: grid; gap: 6px; overflow-wrap: anywhere; user-select: text; }
 .cf-settings [role=alert] { color: var(--red-text); }
+.cf-settings details > :not(summary) { margin-top: 10px; }
 @media (max-width: 560px) { .cf-route { grid-template-columns: minmax(0, 1fr); } }
 .dialog p { color: var(--muted); font-size: var(--fs); }
 /* An alert: what kind it is as a symbol on the left, in its colour, centred on
@@ -6791,6 +6792,7 @@ window.kiri = {
       case "tools": toolsBar(e); break;
       case "share": case "shares": case "shareaccount": case "sharelogin": case "shareusage": case "sharetunnels": case "sharetraffic": shEvent(e); break;
       case "shareconfig": shDomainResult(e); break;
+      case "sharecloudflare": shCloudflareResult(e); break;
       case "builds": {
         const b = ui.bl;
         b.items = e.builds || b.items || []; b.error = e.error || "";
@@ -8425,6 +8427,7 @@ function shPaneRows(id) {
 let shDomain = null, shDomainSeq = 0;
 function shDomainClose() {
   const focus = shDomain?.focus;
+  if (shDomain?.setupBusy) send("sharecloudflare", { id: shDomain.setupId, action: "cancel" });
   if (shDomain?.onKey) document.removeEventListener("keydown", shDomain.onKey);
   $("sh-domain")?.remove(); shDomain = null;
   if (focus?.isConnected) focus.focus();
@@ -8444,6 +8447,7 @@ function shDomainOpen() {
   scrim.innerHTML = `<div class="dialog cf-settings" role="dialog" aria-modal="true" aria-labelledby="cf-title">
     <h3 id="cf-title">${tr("Cloudflare custom domain")}</h3><div id="cf-body"><p>${tr("Loading…")}</p></div>
     <p id="cf-error" role="alert"></p><p id="cf-status" role="status"></p>
+    <div id="cf-progress" hidden><button class="btn" data-cf-browser hidden>${tr("Open Cloudflare")}</button> <button class="btn" data-cf-cancel>${tr("Cancel setup")}</button></div>
     <div class="row-end"><span></span><button class="btn" data-cf-close>${tr("Done")}</button></div></div>`;
   document.body.append(scrim);
   shDomain.onKey = (ev) => {
@@ -8457,24 +8461,71 @@ function shDomainOpen() {
   };
   document.addEventListener("keydown", shDomain.onKey);
   scrim.addEventListener("click", ev => {
-    if (ev.target === scrim || ev.target.closest("[data-cf-close]")) return shDomainClose();
+    // Returning from browser authorization can click the backdrop. Only an
+    // explicit close or cancel should stop an active setup.
+    if ((ev.target === scrim && !shDomain.setupBusy) || ev.target.closest("[data-cf-close]")) return shDomainClose();
+    if (ev.target.closest("[data-cf-browser]")) return send("sharecloudflare", { id: shDomain.setupId, action: "open" });
+    if (ev.target.closest("[data-cf-cancel]")) { send("sharecloudflare", { id: shDomain.setupId, action: "cancel" }); $("cf-status").textContent = tr("Cancelling…"); return; }
     if (shDomain.busy) return;
+    if (ev.target.closest("[data-cf-connect]")) return shCloudflareStart("connect");
+    if (ev.target.closest("[data-cf-create]")) return shCloudflareStart("create");
+    if (ev.target.closest("[data-cf-save], [data-cf-quick]")) return shDomainSave();
     if (ev.target.closest("[data-cf-add]")) {
       $("cf-routes").insertAdjacentHTML("beforeend", shDomainRow({}));
       $("cf-routes").lastElementChild.querySelector("input").focus();
     } else ev.target.closest("[data-cf-remove]")?.closest(".cf-route")?.remove();
   });
-  scrim.addEventListener("change", ev => { if (ev.target.id === "cf-mode") shDomainMode(); });
+  scrim.addEventListener("change", ev => {
+    if (ev.target.id === "cf-mode") shDomainMode();
+    if (ev.target.id === "cf-base") shCloudflareStatus();
+  });
   scrim.addEventListener("submit", ev => {
     ev.preventDefault();
-    if (shDomain.busy) return;
-    const custom = $("cf-mode").value === "custom";
-    const routes = custom ? [...scrim.querySelectorAll(".cf-route")].map(row => ({ name: row.querySelector("[data-cf-name]").value.trim(), credentials_file: row.querySelector("[data-cf-file]").value.trim() })) : [];
-    $("cf-error").textContent = ""; $("cf-status").textContent = tr("Saving…");
-    shDomainRequest({ base_domain: custom ? $("cf-base").value.trim() : null, routes });
+    if ($("cf-mode").value === "custom") shCloudflareStart("create"); else shDomainSave();
   });
   scrim.querySelector("[data-cf-close]").focus();
   shDomainRequest();
+}
+function shDomainSave() {
+  if (!shDomain || shDomain.busy) return;
+  const custom = $("cf-mode").value === "custom", scrim = $("sh-domain");
+  if (custom && (!$("cf-base").reportValidity() || [...scrim.querySelectorAll(".cf-route input")].some(x => !x.reportValidity()))) return;
+  const routes = custom ? [...scrim.querySelectorAll(".cf-route")].map(row => ({ name: row.querySelector("[data-cf-name]").value.trim(), credentials_file: row.querySelector("[data-cf-file]").value.trim() })) : [];
+  $("cf-error").textContent = ""; $("cf-status").textContent = tr("Saving…");
+  shDomainRequest({ base_domain: custom ? $("cf-base").value.trim() : null, routes });
+}
+function shCloudflareStatus() {
+  if (!shDomain || !$("cf-base")) return;
+  shDomain.statusId = String(++shDomainSeq);
+  send("sharecloudflare", { id: shDomain.statusId, action: "status", value: { base_domain: $("cf-base").value.trim() } });
+}
+function shCloudflareStart(action) {
+  if (!shDomain || shDomain.busy || !$("cf-base").reportValidity() || (action === "create" && !$("cf-name").reportValidity())) return;
+  shDomain.setupId = String(++shDomainSeq); shDomain.busy = true; shDomain.setupBusy = true;
+  $("sh-domain").querySelector("[data-cf-form]").disabled = true;
+  $("cf-error").textContent = ""; $("cf-status").textContent = tr("Connecting to Cloudflare…");
+  $("cf-progress").hidden = false; $("sh-domain").querySelector("[data-cf-browser]").hidden = true;
+  send("sharecloudflare", { id: shDomain.setupId, action, value: { base_domain: $("cf-base").value.trim(), name: $("cf-name").value.trim() } });
+}
+function shCloudflareResult(e) {
+  if (!shDomain) return;
+  if (e.state === "status" && e.id === shDomain.statusId) {
+    if ($("cf-auth-note")) $("cf-auth-note").textContent = e.result.certificate_available ? tr("Authorization saved for this domain. Reconnect if you need to authorize it again.") : tr("Connect in your browser and authorize this domain. Kiri will handle the tunnel and DNS.");
+    return;
+  }
+  if (e.id !== shDomain.setupId) return;
+  if (["done", "error", "cancelled"].includes(e.state)) {
+    shDomain.busy = false; shDomain.setupBusy = false; $("cf-progress").hidden = true;
+    $("sh-domain").querySelector("[data-cf-form]").disabled = false;
+    if (e.state === "done") {
+      if (e.result.settings) shDomainResult({ id: shDomain.id, settings: e.result.settings });
+      $("cf-status").textContent = e.result.hostname ? tr("Ready: https://{hostname}. Press Share on the container to open its public link.", { hostname: e.result.hostname }) : tr("Connected. Choose a share name and create its public address.");
+      shCloudflareStatus(); send("shares");
+    } else { $("cf-error").textContent = e.error || tr("Cloudflare setup failed. Try again."); $("cf-status").textContent = ""; }
+  } else {
+    $("cf-status").textContent = e.message || "";
+    if (e.auth_url) $("sh-domain").querySelector("[data-cf-browser]").hidden = false;
+  }
 }
 function shDomainRow(r) {
   return `<div class="cf-route"><label>${tr("Share name")}<input class="field" data-cf-name required placeholder="web" value="${esc(r.name || "")}" autocapitalize="none" spellcheck="false"></label>
@@ -8485,6 +8536,7 @@ function shDomainMode() {
   const custom = $("cf-mode").value === "custom";
   $("cf-named").hidden = !custom; $("cf-named").disabled = !custom;
   $("cf-quick-note").hidden = custom;
+  $("sh-domain").querySelector("[data-cf-quick]").hidden = custom;
 }
 function shDomainResult(e) {
   if (!shDomain || e.id !== shDomain.id) return;
@@ -8494,20 +8546,32 @@ function shDomainResult(e) {
   $("cf-error").textContent = e.error || ""; $("cf-status").textContent = "";
   if (e.error) return;
   const s = e.settings, routes = s.routes || [], custom = s.base_domain != null;
-  $("cf-body").innerHTML = `<form><fieldset data-cf-form>
-    <p>${tr("Use a domain in your Cloudflare account. Create one locally managed tunnel per share, then add its credentials file below.")}</p>
+  const running = ui.containers.find(c => c.State === "running");
+  const suggested = routes[0]?.name || (running ? cname(running) : "web");
+  $("cf-body").innerHTML = `<form novalidate><fieldset data-cf-form>
+    <p>${tr("Connect your Cloudflare account, choose a public address, and Kiri creates the tunnel and DNS record for you.")}</p>
     <label>${tr("Link type")}<select class="field" id="cf-mode"><option value="quick"${custom ? "" : " selected"}>${tr("Temporary links")}</option><option value="custom"${custom ? " selected" : ""}>${tr("Custom domain")}</option></select></label>
     <p id="cf-quick-note">${tr("Saving temporary links removes Kiri's saved domain routes. Your credentials and Cloudflare resources are kept.")}</p>
     <fieldset id="cf-named"><label>${tr("Base domain")}<input class="field" id="cf-base" required placeholder="example.com" value="${esc(s.base_domain || "")}" autocapitalize="none" spellcheck="false"></label>
+      <label>${tr("Share name")}<input class="field" id="cf-name" required placeholder="web" value="${esc(suggested)}" autocapitalize="none" spellcheck="false"></label>
       <p>${tr("A share named web uses web.example.com. Use the container's name to share it from the app.")}</p>
-      <div id="cf-routes">${routes.map(shDomainRow).join("")}</div><button class="btn" type="button" data-cf-add>${tr("Add tunnel")}</button>
-      <p>${tr("Create credentials with cloudflared tunnel login, then cloudflared tunnel create NAME. Use its JSON file, not cert.pem or a tunnel token.")}</p>
+      <p id="cf-auth-note">${tr("Connect in your browser and authorize this domain. Kiri will handle the tunnel and DNS.")}</p>
+      <div><button class="btn" type="button" data-cf-connect>${tr("Connect Cloudflare")}</button> <button class="btn primary" type="button" data-cf-create>${tr("Create public address")}</button></div>
+      <p>${tr("Creating an address adds a tunnel and DNS record to your Cloudflare account. It becomes public when you press Share on the container.")}</p>
       <p>${tr("Nested subdomains may need an additional Cloudflare edge certificate.")}</p>
-    </fieldset><button class="btn primary" type="submit">${tr("Save sharing settings")}</button>
-    </fieldset></form>${custom && routes.length ? `<div class="cf-dns"><p>${tr("In Cloudflare DNS, create a proxied CNAME for each hostname:")}</p>${routes.map(r => `<code>${esc(r.hostname || "")} → ${esc(r.dns_target || "")}</code>`).join("")}</div>` : ""}`;
+      ${routes.length ? `<div class="cf-dns"><p>${tr("Configured addresses")}</p>${routes.map(r => `<code>https://${esc(r.hostname || "")}</code>`).join("")}</div>` : ""}
+      <details id="cf-advanced"><summary>${tr("Advanced: import or edit tunnel routes")}</summary>
+        <p>${tr("For tunnels you manage yourself. Removing a local route keeps its Cloudflare tunnel and DNS record.")}</p>
+        <div id="cf-routes">${routes.map(shDomainRow).join("")}</div><button class="btn" type="button" data-cf-add>${tr("Add tunnel")}</button>
+        <button class="btn" type="button" data-cf-save>${tr("Save imported routes")}</button>
+        ${routes.length ? `<div class="cf-dns"><p>${tr("Imported tunnels need a proxied CNAME for each hostname:")}</p>${routes.map(r => `<code>${esc(r.hostname || "")} → ${esc(r.dns_target || "")}</code>`).join("")}</div>` : ""}
+      </details>
+    </fieldset><button class="btn" type="button" data-cf-quick>${tr("Use temporary links")}</button>
+    </fieldset></form>`;
   shDomainMode();
   if (e.saved) { $("cf-status").textContent = tr("Saved. Settings apply to new shares. DNS records must be configured separately."); send("shares"); }
   $("cf-mode").focus();
+  shCloudflareStatus();
 }
 
 /* Signing in, when Share is pressed without an account: GitHub's device code. */

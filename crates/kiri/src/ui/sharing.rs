@@ -99,6 +99,58 @@ pub fn cloudflare_settings(id: String, input: Option<Value>) {
     });
 }
 
+struct CloudflareSetup {
+    id: String,
+    cancel: std::sync::Arc<AtomicBool>,
+    auth_url: Option<String>,
+}
+static CLOUDFLARE_SETUP: Mutex<Option<CloudflareSetup>> = Mutex::new(None);
+
+pub fn cloudflare_setup(id: String, action: String, value: Value) {
+    let event = |value: Value| {
+        let mut value = value;
+        value["type"] = "sharecloudflare".into(); value["id"] = id.clone().into();
+        emit(value.to_string());
+    };
+    if action == "status" {
+        match share::cloudflare::setup::status(value["base_domain"].as_str().unwrap_or_default()) {
+            Ok(status) => event(json!({"state":"status", "result":status})),
+            Err(e) => event(json!({"state":"error", "error":e.to_string()})),
+        }
+        return;
+    }
+    if action == "cancel" || action == "open" {
+        let mut job = CLOUDFLARE_SETUP.lock().unwrap();
+        if let Some(job) = job.as_mut().filter(|j| j.id == id) {
+            if action == "cancel" { job.cancel.store(true, Ordering::SeqCst); }
+            else if let Some(url) = &job.auth_url { browser(url); }
+        }
+        return;
+    }
+    let cancel = std::sync::Arc::new(AtomicBool::new(false));
+    {
+        let mut job = CLOUDFLARE_SETUP.lock().unwrap();
+        if job.is_some() { event(json!({"state":"error", "error":"Cloudflare setup is already running."})); return; }
+        *job = Some(CloudflareSetup { id: id.clone(), cancel: cancel.clone(), auth_url: None });
+    }
+    std::thread::spawn(move || {
+        let emit_setup = |mut value: Value| { value["type"] = "sharecloudflare".into(); value["id"] = id.clone().into(); emit(value.to_string()); };
+        let result = share::cloudflare::setup::run(&action, &value, &cancel, &mut |event| {
+            if let Some(url) = event["auth_url"].as_str()
+                && let Some(job) = CLOUDFLARE_SETUP.lock().unwrap().as_mut()
+            {
+                job.auth_url = Some(url.to_owned());
+            }
+            emit_setup(event);
+        });
+        *CLOUDFLARE_SETUP.lock().unwrap() = None;
+        match result {
+            Ok(result) => { emit_setup(json!({"state":"done", "result":result})); list(); }
+            Err(e) => emit_setup(json!({"state":if cancel.load(Ordering::SeqCst) {"cancelled"} else {"error"}, "error":e.to_string()})),
+        }
+    });
+}
+
 /// The account's plan and what it has used this month, from the edge.
 pub fn usage() {
     std::thread::spawn(|| {
@@ -280,6 +332,7 @@ pub fn close(id: u64) {
 /// `kiri share` on this computer (the account's tunnels with this machine's
 /// id), so nothing stays public while Kiri is off.
 pub fn close_all() {
+    if let Some(job) = CLOUDFLARE_SETUP.lock().unwrap().as_ref() { job.cancel.store(true, Ordering::SeqCst); }
     share::cloudflare::close_all();
     let handles: Vec<share::Handle> = with_links(|m| {
         m.values_mut()

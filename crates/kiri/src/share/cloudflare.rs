@@ -13,6 +13,8 @@ use std::process::{Child, Command, ExitCode, Stdio};
 
 #[path = "cloudflare_settings.rs"]
 pub mod settings;
+#[path = "cloudflare_setup.rs"]
+pub mod setup;
 
 const POLL: Duration = Duration::from_millis(200);
 const STARTUP: Duration = Duration::from_secs(90);
@@ -134,6 +136,10 @@ struct Plan {
     executable: String,
     args: Vec<String>,
     lock: Option<PathBuf>,
+    #[serde(default)]
+    allow_exit: bool,
+    #[serde(default)]
+    cloudflared_home: Option<PathBuf>,
 }
 
 fn prepare(cfg: &Config, opts: &Options, route: &Route, dir: &Path) -> io::Result<Plan> {
@@ -168,7 +174,7 @@ fn prepare(cfg: &Config, opts: &Options, route: &Route, dir: &Path) -> io::Resul
     // JSON is a YAML subset. An explicit file also isolates Quick Tunnels
     // from any unrelated ~/.cloudflared/config.yml the person already has.
     std::fs::write(config, serde_json::to_vec(&content)?)?;
-    Ok(Plan { executable: cfg.executable.clone(), args, lock })
+    Ok(Plan { executable: cfg.executable.clone(), args, lock, allow_exit: false, cloudflared_home: None })
 }
 
 /// Private entry point, dispatched before normal CLI/UI startup on every OS.
@@ -194,6 +200,11 @@ pub fn helper(args: &[String]) -> ExitCode {
                 command.env_remove(key);
             }
         }
+        // Login writes to its own home directory. Scope that home to this
+        // child only, keeping the person's cloudflared authorization intact.
+        if let Some(home) = &plan.cloudflared_home {
+            command.env("HOME", home).env("USERPROFILE", home);
+        }
         hidden(&mut command);
         if dir.join("stop").exists() {
             return Ok(());
@@ -209,6 +220,9 @@ pub fn helper(args: &[String]) -> ExitCode {
                 return Ok(()); // Process drops before Directory, closing the public link.
             }
             if let Some(status) = child.0.try_wait()? {
+                if plan.allow_exit && status.success() {
+                    return Ok(());
+                }
                 return Err(io::Error::other(format!("cloudflared exited ({status}); check its installation, tunnel credentials and network connectivity")));
             }
             std::thread::sleep(POLL);

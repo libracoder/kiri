@@ -1761,6 +1761,8 @@ usage: kiri share PORT | HOST:PORT | CONTAINER [NAME | --name NAME] [--no-reserv
        kiri share logout
        kiri share status [--json]
        kiri share provider [kiri | cloudflare]
+       kiri share domain connect BASE_DOMAIN
+       kiri share domain create BASE_DOMAIN NAME
        kiri share domain add BASE_DOMAIN NAME CREDENTIALS_FILE
        kiri share domain list [--json] | remove NAME | clear
        kiri share list [--json]
@@ -1768,8 +1770,9 @@ usage: kiri share PORT | HOST:PORT | CONTAINER [NAME | --name NAME] [--no-reserv
 
 Cloudflare: select it with `kiri share provider cloudflare`. Without a base
 domain, shares get temporary trycloudflare.com links. For your own domain,
-use `kiri share domain add BASE_DOMAIN NAME CREDENTIALS_FILE` with an
-existing locally managed tunnel, or configure share.json directly.
+use `kiri share domain create BASE_DOMAIN NAME`: approve Cloudflare in
+your browser and Kiri creates the tunnel and DNS record automatically.
+Existing tunnels can be imported with `kiri share domain add`.
 See docs/cloudflare-sharing.md. Requires cloudflared on this computer.
 
 `kiri 3000` shares port 3000 at a random address; `kiri 3000 myapp` (or
