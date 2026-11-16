@@ -122,6 +122,7 @@ cgroup. There's no runc, no shim and no dockerd. More detail is in
 
 - [Features](docs/features.md): everything supported today, release files and known issues
 - [Development](docs/development.md): building, running from source, architecture and repository layout
+- [Cloudflare sharing](docs/cloudflare-sharing.md): temporary public links and sharing on your own domain through Cloudflare Tunnel
 - [Release notes](docs/releases)
 
 ## Roadmap

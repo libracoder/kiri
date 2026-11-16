@@ -98,6 +98,10 @@ usage: kiri COMMAND          docker's commands, on Kiri: kiri run, ps, exec,
        kiri raw pull <image> | raw images | raw rmi <image>...";
 
 fn main() -> ExitCode {
+    let helper_args: Vec<String> = std::env::args().skip(1).collect();
+    if helper_args.first().is_some_and(|s| s == share::cloudflare::HELPER) {
+        return share::cloudflare::helper(&helper_args[1..]);
+    }
     flavor::init();
     let args: Vec<String> = std::env::args().skip(1).collect();
     // Which process this is, for its log and crash reports.

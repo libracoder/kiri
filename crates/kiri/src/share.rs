@@ -40,6 +40,9 @@ use rustls::pki_types::pem::PemObject;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+#[path = "share/cloudflare.rs"]
+pub mod cloudflare;
+
 #[cfg(unix)]
 use crate::client;
 
@@ -66,9 +69,21 @@ fn build_key() -> Option<(&'static str, [u8; proto::attest::KEY_LEN])> {
 
 // ---------------------------------------------------------------- config
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Provider {
+    #[default]
+    Kiri,
+    Cloudflare,
+}
+
 /// `~/.kiri/share.json`.
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Config {
+    #[serde(default)]
+    pub provider: Provider,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloudflare: Option<cloudflare::Config>,
     /// Edge to use instead of edge.runkiri.com, as `host[:port]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server: Option<String>,
@@ -81,12 +96,20 @@ pub struct Config {
     pub device: String,
 }
 
+fn kiri_config() -> io::Result<Config> {
+    let cfg = load()?;
+    if cfg.provider != Provider::Kiri {
+        return Err(io::Error::new(io::ErrorKind::Unsupported, "this command uses Kiri Cloud; Cloudflare sharing is configured in share.json (see docs/cloudflare-sharing.md)"));
+    }
+    Ok(cfg)
+}
+
 fn config_path() -> io::Result<PathBuf> {
     if let Some(p) = std::env::var_os("KIRI_SHARE_CONFIG") {
         return Ok(PathBuf::from(p));
     }
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from).ok_or_else(|| io::Error::other("HOME is not set"))?;
-    Ok(home.join(".kiri/share.json"))
+    Ok(home.join(crate::flavor::STATE.get()).join("share.json"))
 }
 
 // ---------------------------------------------------------------- traffic file
@@ -443,7 +466,7 @@ pub fn post_report(body: &Value, signed: bool) -> io::Result<(u16, Value)> {
 
 /// Signs in without GitHub. Only edges started with `--dev` allow it.
 pub fn login_dev(login: &str) -> io::Result<String> {
-    let mut cfg = load()?;
+    let mut cfg = kiri_config()?;
     let (status, v) = api(&server(&cfg), "POST", "/v1/login/dev", Some(&json!({ "login": login, "device": cfg.device })), None)?;
     finish_login(&mut cfg, status, &v)
 }
@@ -469,7 +492,7 @@ pub struct DeviceCode {
 }
 
 pub fn login_start() -> io::Result<DeviceCode> {
-    let cfg = load()?;
+    let cfg = kiri_config()?;
     let (status, v) = api(&server(&cfg), "POST", "/v1/login/start", Some(&json!({})), None)?;
     let (Some(device_code), Some(user_code), Some(uri)) = (v["device_code"].as_str(), v["user_code"].as_str(), v["verification_uri"].as_str()) else {
         return Err(api_error(&v, status));
@@ -506,7 +529,7 @@ pub fn login_poll(code: &DeviceCode) -> io::Result<LoginPoll> {
     if Instant::now() > code.expires {
         return Err(io::Error::other("the sign-in code expired; run `kiri share login` again"));
     }
-    let mut cfg = load()?;
+    let mut cfg = kiri_config()?;
     let (status, v) = api(&server(&cfg), "POST", "/v1/login/poll", Some(&json!({ "device_code": code.device_code, "device": cfg.device })), None)?;
     if status == 202 {
         let extra = if v["slow_down"].as_bool() == Some(true) { Duration::from_secs(5) } else { Duration::ZERO };
@@ -524,7 +547,7 @@ pub fn logout() -> io::Result<()> {
 
 /// The account and its limits, as the edge reports them.
 pub fn whoami() -> io::Result<Value> {
-    let cfg = load()?;
+    let cfg = kiri_config()?;
     let token = cfg.token.as_deref().ok_or_else(|| io::Error::other("not signed in; run `kiri share login`"))?;
     let (status, v) = api(&server(&cfg), "GET", "/v1/whoami", None, Some(token))?;
     if status == 401 {
@@ -540,7 +563,7 @@ pub fn whoami() -> io::Result<Value> {
 
 /// A signed-in API call: the saved token, and a plain message when it has expired.
 fn signed_in(method: &str, path: &str, body: Option<&Value>) -> io::Result<(u16, Value)> {
-    let cfg = load()?;
+    let cfg = kiri_config()?;
     let token = cfg.token.as_deref().ok_or_else(|| io::Error::other("not signed in; run `kiri share login`"))?;
     let (status, v) = api(&server(&cfg), method, path, body, Some(token))?;
     if status == 401 {
@@ -628,7 +651,7 @@ pub fn release(name: &str) -> io::Result<()> {
 // ---------------------------------------------------------------- the account's tunnels
 
 /// A live tunnel on the account, from any of its computers.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct LiveTunnel {
     pub name: String,
     /// The name without the suffix the edge added: `flower-demo`.
@@ -672,6 +695,9 @@ fn live_tunnel(v: &Value) -> LiveTunnel {
 
 /// Every live tunnel on the account, whichever computer opened it.
 pub fn tunnels() -> io::Result<LiveTunnels> {
+    if load()?.provider == Provider::Cloudflare {
+        return cloudflare::tunnels();
+    }
     let (status, v) = signed_in("GET", "/v1/tunnels/live", None)?;
     match status {
         200 => Ok(LiveTunnels { items: v["items"].as_array().into_iter().flatten().map(live_tunnel).collect(), limit: v["limit"].as_u64() }),
@@ -683,6 +709,9 @@ pub fn tunnels() -> io::Result<LiveTunnels> {
 /// Closes one of the account's tunnels, wherever it runs. The edge tells
 /// the computer running it that it was stopped from this one.
 pub fn close_tunnel(name: &str) -> io::Result<()> {
+    if load()?.provider == Provider::Cloudflare {
+        return cloudflare::close_tunnel(name);
+    }
     let (status, v) = signed_in("DELETE", &format!("/v1/tunnels/{name}"), Some(&json!({ "host": host_name() })))?;
     match status {
         200 | 204 => Ok(()),
@@ -983,6 +1012,9 @@ type OnEvent = Arc<dyn Fn(Event) + Send + Sync>;
 /// that, including the first connection, is reported through `on_event`.
 pub fn start(opts: Options, on_event: impl Fn(Event) + Send + Sync + 'static) -> io::Result<Handle> {
     let cfg = load()?;
+    if cfg.provider == Provider::Cloudflare {
+        return cloudflare::start(cfg, opts, on_event);
+    }
     let token = cfg.token.clone().ok_or_else(|| io::Error::other("not signed in; run `kiri share login`"))?;
     let srv = server(&cfg);
     let stop = Arc::new(Stopper::default());
@@ -1728,6 +1760,14 @@ usage: kiri share PORT | HOST:PORT | CONTAINER [NAME | --name NAME] [--no-reserv
        kiri share login [--dev LOGIN]
        kiri share logout
        kiri share status [--json]
+       kiri share provider [kiri | cloudflare]
+       kiri share list [--json]
+       kiri share stop ID
+
+Cloudflare: select it with `kiri share provider cloudflare`. Without a base
+domain, shares get temporary trycloudflare.com links. For your own domain,
+configure cloudflare.base_domain and cloudflare.tunnels in share.json;
+see docs/cloudflare-sharing.md. Requires cloudflared on this computer.
 
 `kiri 3000` shares port 3000 at a random address; `kiri 3000 myapp` (or
 --name myapp) at myapp.runkiri.cloud once it's reserved. Kiri Cloud checks each name before it's
@@ -1821,6 +1861,7 @@ fn shorten(path: &str, max: usize) -> String {
 /// Prints events the way `kiri share` shows them.
 fn printer(target: String) -> impl Fn(Event) + Send + Sync + 'static {
     let p = Paint::new();
+    let cloudflare = read_config().provider == Provider::Cloudflare;
     let shown_url = Mutex::new(None::<String>);
     let header_done = AtomicBool::new(false);
     move |e| match e {
@@ -1847,9 +1888,9 @@ fn printer(target: String) -> impl Fn(Event) + Send + Sync + 'static {
             for d in &domains {
                 println!("  {}  {:<9}{}", p.accent("●"), "domain", p.accent(&p.bold(d)));
             }
-            println!("     {:<9}{}", "", p.dim(&limits_line(rate, remaining, warning)));
+            println!("     {:<9}{}", "", p.dim(&if cloudflare { "Cloudflare Tunnel".to_owned() } else { limits_line(rate, remaining, warning) }));
             println!();
-            println!("  {}", p.dim("Requests show up below. Press Ctrl+C to stop sharing."));
+            println!("  {}", p.dim(if cloudflare { "Press Ctrl+C to stop sharing." } else { "Requests show up below. Press Ctrl+C to stop sharing." }));
             println!();
         }
         Event::Request(r) => {
@@ -1885,6 +1926,30 @@ pub fn run(args: &[String]) -> io::Result<()> {
             Ok(())
         }
         Some("status") => status_cli(args.iter().any(|a| a == "--json")),
+        Some("list") => {
+            let list = tunnels()?;
+            if args.iter().any(|a| a == "--json") {
+                println!("{}", json!({"items": list.items, "limit": list.limit}));
+            } else {
+                for t in list.items { println!("{}  {}  {}", t.name, t.url, t.target); }
+            }
+            Ok(())
+        }
+        Some("stop") => close_tunnel(args.get(1).ok_or_else(|| io::Error::other("usage: kiri share stop ID"))?),
+        Some("provider") => {
+            let mut cfg = load()?;
+            match args.get(1).map(String::as_str) {
+                Some("kiri") if args.len() == 2 => cfg.provider = Provider::Kiri,
+                Some("cloudflare") if args.len() == 2 => cfg.provider = Provider::Cloudflare,
+                None => return status_cli(false),
+                _ => {
+                    return Err(io::Error::other("usage: kiri share provider [kiri | cloudflare]"));
+                }
+            }
+            save(&cfg)?;
+            println!("Sharing provider: {}", if cfg.provider == Provider::Cloudflare { "Cloudflare Tunnel" } else { "Kiri Cloud" });
+            Ok(())
+        }
         Some("names") => names_cli(),
         Some("reserve") => {
             let p = Paint::new();
@@ -1932,7 +1997,7 @@ pub fn run(args: &[String]) -> io::Result<()> {
                 }
                 Err(e) => return Err(e),
             };
-            if let Some(n) = name.as_ref().filter(|_| !args.iter().any(|a| a == "--no-reserve")) {
+            if let Some(n) = name.as_ref().filter(|_| !args.iter().any(|a| a == "--no-reserve") && load().is_ok_and(|c| c.provider == Provider::Kiri)) {
                 let p = Paint::new();
                 match auto_reserve(n) {
                     Ok(AutoReserve::Reserved(_) | AutoReserve::Requested(_) | AutoReserve::Waiting | AutoReserve::Full(_)) if json => {}
@@ -2071,6 +2136,16 @@ fn event_json(e: &Event) -> serde_json::Value {
 fn status_cli(json: bool) -> io::Result<()> {
     let p = Paint::new();
     let cfg = load()?;
+    if cfg.provider == Provider::Cloudflare {
+        let c = cfg.cloudflare.unwrap_or_default();
+        if json {
+            println!("{}", serde_json::json!({"provider": "cloudflare", "base_domain": c.base_domain, "cloudflared": c.executable}));
+        } else {
+            println!("Cloudflare Tunnel: {}", c.base_domain.as_deref().unwrap_or("temporary trycloudflare.com links"));
+            println!("cloudflared: {}", c.executable);
+        }
+        return Ok(());
+    }
     let srv = server(&cfg);
     if json {
         // Signed in or not, for programs: `{"signed_in", "server", "login"}`.
@@ -2274,7 +2349,7 @@ mod tests {
         unsafe { std::env::set_var("KIRI_SHARE_CONFIG", &path) };
         let cfg = load().unwrap();
         assert_eq!(cfg.device.len(), 32, "a device id is made on first load");
-        let saved = Config { server: Some("edge.example:8443".into()), token: Some("ks_x".into()), login: Some("ada".into()), device: cfg.device.clone() };
+        let saved = Config { server: Some("edge.example:8443".into()), token: Some("ks_x".into()), login: Some("ada".into()), device: cfg.device.clone(), ..Default::default() };
         save(&saved).unwrap();
         assert_eq!(load().unwrap(), saved);
         #[cfg(unix)]

@@ -55,7 +55,12 @@ fn session_id(token: &str) -> String {
 
 fn account() -> Value {
     match share::load() {
-        Ok(c) => json!({"type": "shareaccount", "signedIn": c.token.is_some(), "login": c.login, "server": c.server, "session": c.token.as_deref().map(session_id)}),
+        Ok(c) if c.provider == share::Provider::Cloudflare => {
+            json!({"type": "shareaccount", "provider": "cloudflare", "signedIn": false, "baseDomain": c.cloudflare.as_ref().and_then(|c| c.base_domain.as_deref())})
+        }
+        Ok(c) => {
+            json!({"type": "shareaccount", "signedIn": c.token.is_some(), "login": c.login, "server": c.server, "session": c.token.as_deref().map(session_id)})
+        }
         Err(e) => json!({"type": "shareaccount", "signedIn": false, "error": e.to_string()}),
     }
 }
@@ -79,6 +84,10 @@ pub fn list() {
 /// The account's plan and what it has used this month, from the edge.
 pub fn usage() {
     std::thread::spawn(|| {
+        if share::load().is_ok_and(|c| c.provider == share::Provider::Cloudflare) {
+            emit(json!({"type": "shareusage", "unsupported": true}).to_string());
+            return;
+        }
         let v = match share::whoami() {
             Ok(w) => json!({
                 "type": "shareusage", "login": w["login"], "used": w["usage"]["used"], "cap": w["usage"]["cap"],
@@ -199,7 +208,7 @@ fn start(source: String, name: String, resolve: impl FnOnce() -> std::io::Result
                     unforward(m.remove(&id).and_then(|l| l.forward));
                 }
                 Some(s) => {
-                    if let Some(l) = m.get_mut(&id) {
+                    if let Some(l) = m.get_mut(&id).filter(|l| l.state != "stopping") {
                         l.state = match s {
                             "live" => "live",
                             "reconnecting" => "reconnecting",
@@ -218,11 +227,11 @@ fn start(source: String, name: String, resolve: impl FnOnce() -> std::io::Result
             // Unless it already ended, keep the tunnel so Stop can close it.
             Ok(h) => {
                 let leftover = with_links(|m| match m.get_mut(&id) {
-                    Some(l) => {
+                    Some(l) if l.state != "stopping" => {
                         l.handle = Some(h);
                         None
                     }
-                    None => Some(h),
+                    _ => Some(h),
                 });
                 if let Some(h) = leftover {
                     h.stop();
@@ -238,7 +247,12 @@ fn start(source: String, name: String, resolve: impl FnOnce() -> std::io::Result
 
 /// Closes a link; its last event is `ended`.
 pub fn close(id: u64) {
-    let handle = with_links(|m| m.get_mut(&id).and_then(|l| l.handle.take()));
+    let handle = with_links(|m| {
+        m.get_mut(&id).and_then(|l| {
+            l.state = "stopping";
+            l.handle.take()
+        })
+    });
     if let Some(h) = handle {
         std::thread::spawn(move || h.stop());
     }
@@ -248,7 +262,15 @@ pub fn close(id: u64) {
 /// `kiri share` on this computer (the account's tunnels with this machine's
 /// id), so nothing stays public while Kiri is off.
 pub fn close_all() {
-    let handles: Vec<share::Handle> = with_links(|m| m.values_mut().filter_map(|l| l.handle.take()).collect());
+    share::cloudflare::close_all();
+    let handles: Vec<share::Handle> = with_links(|m| {
+        m.values_mut()
+            .filter_map(|l| {
+                l.state = "stopping";
+                l.handle.take()
+            })
+            .collect()
+    });
     std::thread::spawn(move || {
         for h in handles {
             h.stop();

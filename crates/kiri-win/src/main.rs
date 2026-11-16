@@ -115,6 +115,10 @@ mod import;
 
 #[cfg(windows)]
 fn main() -> std::process::ExitCode {
+    let helper_args: Vec<String> = std::env::args().skip(1).collect();
+    if helper_args.first().is_some_and(|s| s == share::cloudflare::HELPER) {
+        return share::cloudflare::helper(&helper_args[1..]);
+    }
     // There is no console to print a panic to.
     std::panic::set_hook(Box::new(|info| serve::log(&format!("panic: {info}"))));
     // Load DLLs only from System32, not from the folder kiri-win runs from.

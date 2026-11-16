@@ -7588,7 +7588,7 @@ function kStart(key) {
   if (K8S_VIEWS.has(ui.view)) render();
 }
 function kShare(key) {
-  if (sh.account?.signedIn) return kStart(key);
+  if (shAvailable()) return kStart(key);
   sh.pending = key;
   shSignin();
 }
@@ -7917,13 +7917,15 @@ const shWhere = (x) => tr("{program} on {host}", { program: x.program || (x.kind
 const shTag = (x) => `<span class="cli-tag">${x.kind === "cli" ? "CLI" : esc(x.program || "Kiri")}</span>`;
 const shExtTag = { toString: () => `<span class="ext-tag">${tr("External")}</span>` };
 
-function shPoll() { if (sh.account?.signedIn && !sh.remoteOff) send("sharetunnels"); }
+const shCloudflare = () => sh.account?.provider === "cloudflare";
+const shAvailable = () => shCloudflare() || !!sh.account?.signedIn;
+function shPoll() { if (shAvailable() && !sh.remoteOff) send("sharetunnels"); }
 /* Polls while signed in; signed out, there's nothing to show. */
 function shPolling() {
-  const on = !!sh.account?.signedIn && !sh.remoteOff;
+  const on = shAvailable() && !sh.remoteOff;
   if (on && !sh.poll) { sh.poll = setInterval(shPoll, SH_POLL); shPoll(); }
   else if (!on && sh.poll) { clearInterval(sh.poll); sh.poll = 0; }
-  if (!sh.account?.signedIn) sh.remote = null;
+  if (!shAvailable()) sh.remote = null;
 }
 /* The list arrived. Returns whether anything shown changed. */
 function shRemote(e) {
@@ -8035,16 +8037,17 @@ function shStopExt(name) {
 function shEvent(e) {
   let remote = false;
   if (e.type === "shareaccount") {
+    if (sh.account?.provider !== e.provider) { sh.remoteOff = false; sh.remote = null; sh.usage = null; }
     sh.account = e;
     shPolling();
-    if (e.signedIn) {
+    if (shAvailable()) {
       sh.login = null; $("sh-signin")?.remove();
       if (sh.pending) { (kParse(sh.pending) ? kStart : shStart)(sh.pending); sh.pending = null; }
       send("shareusage");
     }
   } else if (e.type === "sharelogin") {
     if (e.error) { sh.login = null; $("sh-signin")?.remove(); toast("error", tr("Sign-in failed: {error}", { error: e.error })); } else { sh.login = { code: e.code, uri: e.uri }; shSignin(); }
-  } else if (e.type === "shareusage") { if (!e.error) sh.usage = e; }
+  } else if (e.type === "shareusage") { if (e.unsupported) sh.usage = null; else if (!e.error) sh.usage = e; }
   /* What each `kiri share` here has served, from its traffic file: the
      bars take what's new since the last look. */
   else if (e.type === "sharetraffic") {
@@ -8274,10 +8277,10 @@ function renderShare() {
   const stat = (icon, k, v, s, extra = "") => `<div class="sh-stat"><div class="k"><svg class="i" viewBox="0 0 256 256"><path d="${PH[icon]}"/></svg>${k}</div><div class="v">${v}</div><div class="s">${s}</div>${extra}</div>`;
   const stats = `<div class="sh-stats">
     ${stat("globe", tr("Shared now"), now.v, now.s, now.slots)}
-    ${stat("updown", tr("Traffic served"), size(served.out),
+    ${shCloudflare() ? stat("updown", tr("Traffic served"), "—", tr("Cloudflare does not provide request logs in Kiri")) : stat("updown", tr("Traffic served"), size(served.out),
       served.requests ? `${trn(served.requests, "{n} request", "{n} requests")} · ${tr("{size} received", { size: size(served.in) })}` : tr("No requests yet"),
       shWave(sh.wave, 34, `aria-label="${tr("Traffic over the last two minutes")}"`, tr("No visitors in the last 2 minutes")))}
-    ${u ? shMonth(u, capped, pct) : stat("clock", tr("This month"), "—", a?.signedIn ? tr("Checking your plan…") : tr("Sign in to see your plan"))}
+    ${shCloudflare() ? stat("globe", tr("Base domain"), esc(a.baseDomain || "trycloudflare.com"), a.baseDomain ? tr("Named tunnels") : tr("Temporary links")) : u ? shMonth(u, capped, pct) : stat("clock", tr("This month"), "—", a?.signedIn ? tr("Checking your plan…") : tr("Sign in to see your plan"))}
   </div>`;
   const ext = shExt();
   const rows = items.map(shRow).join("") + shCli().map(shCliRow).join("")
@@ -8285,12 +8288,12 @@ function renderShare() {
   const list = rows ? `<div class="sh-list">${rows}</div>`
     : `<div class="sh-empty">${shGlobe}<h3>${tr("Nothing shared yet")}</h3><p>${tr("Press <b>Share</b> on a running container to give it a public https link anyone can open.")}</p>
         <button class="btn" data-shcontainers>${tr("Go to Containers")}</button></div>`;
-  const foot = !a ? "" : a.signedIn
+  const foot = !a ? "" : shCloudflare() ? `<div class="sh-foot">Cloudflare Tunnel · ${tr("Links on this computer")}</div>` : a.signedIn
     ? `<div class="sh-foot"><span class="sh-ghmark" title="${tr("Signed in with GitHub")}">${shSvg("github")}</span>${tr("Signed in to Kiri Cloud with GitHub as {login}", { login: `<b>${esc(a.login || tr("you"))}</b>` })}
         ${a.session ? `<span class="sep">·</span><span title="${tr("This sign-in's ID: a hash of its token, safe to quote when asking for help")}">${tr("Session")} <code class="sh-sess">${esc(a.session)}</code></span>` : ""}
         <span class="sep">·</span><button class="linkish" data-shlogout>${tr("Sign out")}</button></div>`
     : `<div class="sh-foot">${tr("Not signed in")}<button class="linkish" data-shlogin>${tr("Sign in with GitHub")}</button></div>`;
-  const intro = `<p class="sh-intro">${tr("Share gives a container or a Kubernetes service a public https link through a secure tunnel to Kiri Cloud.")} ${a?.signedIn && !sh.remoteOff ? tr("This lists every link on your account, on any computer.") : tr("It stays up while Kiri is running.")}</p>`;
+  const intro = shCloudflare() ? `<p class="sh-intro">${tr("Share gives a container or a Kubernetes service a public https link through Cloudflare Tunnel.")} ${tr("It stays up while Kiri is running.")}</p>` : `<p class="sh-intro">${tr("Share gives a container or a Kubernetes service a public https link through a secure tunnel to Kiri Cloud.")} ${a?.signedIn && !sh.remoteOff ? tr("This lists every link on your account, on any computer.") : tr("It stays up while Kiri is running.")}</p>`;
   morph($("content"), `<div class="sh">${intro}${stats}${list}${foot}</div>`);
 }
 /* Puts `html` in `el` changing only what differs, so a redraw doesn't restart
@@ -8338,7 +8341,7 @@ function shHealth(it) {
   else if (it.state === "live") bits.push(tr("{live} for {time}", { live: `<span class="ok">● ${tr("Live")}</span>`, time: shFor2(Date.now() - (it.liveAt || Date.now())) }));
   else if (it.state === "reconnecting") bits.push(`<span class="warn">${tr("Reconnecting")}</span>${it.reason ? `: ${esc(it.reason)}` : ""}`);
   if (it.reconnects) bits.push(tr("reconnected {n}×", { n: it.reconnects }));
-  if (it.rate) bits.push(tr("{rate}/s limit", { rate: size(it.rate) })); else if (it.state === "live") bits.push(tr("no speed limit"));
+  if (it.rate) bits.push(tr("{rate}/s limit", { rate: size(it.rate) })); else if (it.state === "live" && !shCloudflare()) bits.push(tr("no speed limit"));
   if (it.remaining != null && it.remaining < 2 ** 53) bits.push(tr("{size} left this month", { size: size(it.remaining) }));
   const addr = (it.target || "").match(/\(([^)]+)\)/)?.[1];
   const notes = [];
@@ -8399,11 +8402,11 @@ function shPaneRows(id) {
   const all = it.recent || [], q = (sh.q || "").trim().toLowerCase(), st = sh.st || "";
   const rows = all.filter((r) => (!st || String(r.status).startsWith(st)) && (!q || `${r.status} ${r.method} ${r.path}`.toLowerCase().includes(q)));
   const errs = all.filter((r) => r.status >= 400).length, avg = all.length ? Math.round(all.reduce((a, r) => a + r.ms, 0) / all.length) : 0;
-  $("sh-onestats").innerHTML = `<span>${tr("{size} served", { size: `<b>${size(it.out || 0)}</b>` })}</span><span>${tr("{ms} average", { ms: `<b>${avg} ms</b>` })}</span><span>${trn(errs, "{n} error", "{n} errors", { n: `<b>${errs}</b>` })}</span>`;
+  $("sh-onestats").innerHTML = shCloudflare() ? esc(tr("Cloudflare does not provide request logs in Kiri")) : `<span>${tr("{size} served", { size: `<b>${size(it.out || 0)}</b>` })}</span><span>${tr("{ms} average", { ms: `<b>${avg} ms</b>` })}</span><span>${trn(errs, "{n} error", "{n} errors", { n: `<b>${errs}</b>` })}</span>`;
   $("sh-count").textContent = q || st ? tr("{n} of {total}", { n: rows.length, total: all.length }) : trn(all.length, "{n} request", "{n} requests");
   $("sh-rows").innerHTML = rows.length ? rows.slice(0, 500).map((r) => `<tr><td class="muted mono">${shClock(r.at)}</td><td class="mono ${shCode(r.status)}">${r.status || "—"}</td><td class="mono"><b>${esc(r.method)}</b></td>
       <td class="mono sh-path" title="${esc(r.path)}">${esc(r.path)}</td><td class="r num muted">${size(r.out)}</td><td class="r num">${r.ms} ms</td></tr>`).join("")
-    : `<tr><td colspan="6" class="muted sh-noreq">${it.paused ? tr("Paused: nobody can open the link until you resume.") : all.length ? tr("No requests match.") : tr("Waiting for the first visitor…")}</td></tr>`;
+    : `<tr><td colspan="6" class="muted sh-noreq">${it.paused ? tr("Paused: nobody can open the link until you resume.") : shCloudflare() ? tr("Cloudflare does not provide request logs in Kiri") : all.length ? tr("No requests match.") : tr("Waiting for the first visitor…")}</td></tr>`;
 }
 
 /* Signing in, when Share is pressed without an account: GitHub's device code. */
@@ -8517,7 +8520,7 @@ function shCardOne(it) {
   // Visitors → Kiri Cloud → the container: a dot travels along for each request.
   const flow = `<div class="sh-flow" aria-hidden="true">
       ${node(shSvg("globe"), tr("Visitors"))}
-      <div class="sh-lane"></div>${node(KIRI_MARK, "Kiri Cloud", "kiri")}<div class="sh-lane"></div>
+      <div class="sh-lane"></div>${shCloudflare() ? node(shSvg("globe"), "Cloudflare") : node(KIRI_MARK, "Kiri Cloud", "kiri")}<div class="sh-lane"></div>
       ${node(kShTile(it) || (c ? tile(c.icon, "cube") : `<div class="tile">${shGlobe}</div>`), `${esc(kShName(it))}${port ? `<em>:${port}</em>` : ""}`)}</div>`;
   return `<div class="dialog sh-dlg" role="dialog" aria-modal="false" aria-labelledby="sh-dlg-t">
     <button class="sh-x" data-close aria-label="${tr("Hide")}">×</button>
@@ -8527,7 +8530,7 @@ function shCardOne(it) {
     ${host ? `<div class="sh-linkbox">${shSvg("link")}<span title="${esc(it.url)}">${esc(host)}</span>
       <button class="btn sm" data-mcopy>${tr("Copy")}</button><button class="btn sm" data-mopen>${tr("Open")}</button></div>` : ""}
     ${live && it.warning ? `<p class="sh-popnote">${shSvg("info")}${tr("Browsers see a short Kiri Cloud notice page first.")}<button class="linkish" data-mnotice title="${SH_NOTICE_URL}">${tr("See it ↗")}</button></p>` : ""}
-    ${live ? `<div class="sh-feed" id="sh-feed">${shFeed(it, 4)}</div>` : ""}
+    ${live && !shCloudflare() ? `<div class="sh-feed" id="sh-feed">${shFeed(it, 4)}</div>` : ""}
     <div class="sh-dlg-foot"><button class="linkish danger" data-mstop>${tr("Stop sharing")}</button><span class="spacer"></span>
       <button class="linkish" data-mall>${tr("Details")}</button><button class="btn primary sm" data-close>${tr("Done")}</button></div></div>`;
 }
@@ -8589,7 +8592,7 @@ function shStart(name) {
 }
 
 function shShare(name) {
-  if (sh.account?.signedIn) return shStart(name);
+  if (shAvailable()) return shStart(name);
   sh.pending = name;
   shSignin();
 }
