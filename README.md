@@ -16,7 +16,7 @@
   <a href="https://github.com/libracoder/kiri/releases/latest"><img src="https://img.shields.io/github/v/release/libracoder/kiri?style=for-the-badge&label=release&color=2f6feb" alt="Latest release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg?style=for-the-badge" alt="Apache 2.0 License"></a>
   <a href="https://discord.gg/K5A8wuqcC"><img src="https://img.shields.io/badge/Discord-Join%20Us-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Discord"></a>
-  <a href="crates/kiri/src/ui/lang"><img src="https://img.shields.io/badge/languages-38-2ea043?style=for-the-badge" alt="38 languages"></a>
+  <a href="crates/kiri/src/ui/lang"><img src="https://img.shields.io/badge/languages-39-2ea043?style=for-the-badge" alt="39 languages"></a>
 </p>
 
 <p align="center">
@@ -102,7 +102,7 @@ comes from the Igbo word *ntakịrị*, "small".
 - **Local domains**: `http://<name>.kiri.local`, with HTTPS from Kiri's own certificate authority.
 - **More than containers**: a one-command Kubernetes cluster and Linux machines.
 - **A native window** for containers, images, volumes and networks, plus a menu bar item.
-- **In your language**: the window comes in 38 languages, on macOS, Windows and Linux alike.
+- **In your language**: the window comes in 39 languages, on macOS, Windows and Linux alike.
 
 ---
 
