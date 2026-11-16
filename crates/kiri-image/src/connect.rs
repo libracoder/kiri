@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 use std::{fmt, thread};
 
 use ureq::unversioned::transport::{
-    Buffers, ConnectProxyConnector, ConnectionDetails, Connector, Either, LazyBuffers, NextTimeout, RustlsConnector, ShutdownHandle,
-    Transport,
+    Buffers, ConnectProxyConnector, ConnectionDetails, Connector, Either, LazyBuffers, NextTimeout,
+    RustlsConnector, ShutdownHandle, Transport,
 };
 use ureq::{Error, Timeout};
 
@@ -46,7 +46,9 @@ pub(crate) fn connector() -> impl Connector<(), Out = impl Transport> {
 
 /// [`connector`], with reads and writes giving up after `stall` of silence.
 pub(crate) fn connector_with(stall: Duration) -> impl Connector<(), Out = impl Transport> {
-    ().chain(ConnectProxyConnector::default()).chain(HappyConnector { stall }).chain(RustlsConnector::default())
+    ().chain(ConnectProxyConnector::default())
+        .chain(HappyConnector { stall })
+        .chain(RustlsConnector::default())
 }
 
 /// The addresses in the order to try them: the family the resolver put
@@ -56,7 +58,8 @@ pub(crate) fn interleave(addrs: &[SocketAddr]) -> Vec<SocketAddr> {
     let Some(first) = addrs.first() else {
         return Vec::new();
     };
-    let (mut lead, mut other): (Vec<SocketAddr>, Vec<SocketAddr>) = addrs.iter().partition(|a| a.is_ipv6() == first.is_ipv6());
+    let (mut lead, mut other): (Vec<SocketAddr>, Vec<SocketAddr>) =
+        addrs.iter().partition(|a| a.is_ipv6() == first.is_ipv6());
     lead.reverse();
     other.reverse();
     let mut out = Vec::with_capacity(addrs.len());
@@ -75,10 +78,18 @@ type Attempt<T> = dyn Fn(SocketAddr, Duration) -> io::Result<T> + Send + Sync;
 /// fails, and the first to succeed is returned. Attempts still running
 /// carry on in their threads and close what they open; each is bounded by
 /// its own timeout. `budget` bounds the whole race, if there is one.
-pub(crate) fn race<T: Send + 'static>(addrs: &[SocketAddr], delay: Duration, budget: Option<Duration>, attempt: Arc<Attempt<T>>) -> io::Result<T> {
+pub(crate) fn race<T: Send + 'static>(
+    addrs: &[SocketAddr],
+    delay: Duration,
+    budget: Option<Duration>,
+    attempt: Arc<Attempt<T>>,
+) -> io::Result<T> {
     let order = interleave(addrs);
     if order.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::AddrNotAvailable, "no addresses to connect to"));
+        return Err(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "no addresses to connect to",
+        ));
     }
     let start = Instant::now();
     let end = budget.map(|b| start + b);
@@ -96,11 +107,13 @@ pub(crate) fn race<T: Send + 'static>(addrs: &[SocketAddr], delay: Duration, bud
             let addr = order[next];
             let limit = end.map_or(ATTEMPT_TIMEOUT, |e| (e - now).min(ATTEMPT_TIMEOUT));
             let (tx, attempt) = (tx.clone(), attempt.clone());
-            let spawned = thread::Builder::new().name("kiri-connect".into()).spawn(move || {
-                // Nobody listens once another attempt has won; what this
-                // one opened is then dropped, and so closed.
-                let _ = tx.send(attempt(addr, limit));
-            });
+            let spawned = thread::Builder::new()
+                .name("kiri-connect".into())
+                .spawn(move || {
+                    // Nobody listens once another attempt has won; what this
+                    // one opened is then dropped, and so closed.
+                    let _ = tx.send(attempt(addr, limit));
+                });
             next += 1;
             next_start = now + delay;
             match spawned {
@@ -110,10 +123,16 @@ pub(crate) fn race<T: Send + 'static>(addrs: &[SocketAddr], delay: Duration, bud
             continue;
         }
         if running == 0 {
-            return Err(last_err.unwrap_or_else(|| io::Error::new(io::ErrorKind::ConnectionRefused, "connection refused")));
+            return Err(last_err.unwrap_or_else(|| {
+                io::Error::new(io::ErrorKind::ConnectionRefused, "connection refused")
+            }));
         }
         // Wake for the next attempt's turn, or the end of the budget.
-        let wake = if next < order.len() { Some(next_start) } else { end };
+        let wake = if next < order.len() {
+            Some(next_start)
+        } else {
+            end
+        };
         let got = match wake {
             Some(w) => rx.recv_timeout(w.saturating_duration_since(now)),
             None => rx.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected),
@@ -150,7 +169,11 @@ struct HappyConnector {
 impl<In: Transport> Connector<In> for HappyConnector {
     type Out = Either<In, TcpTransport>;
 
-    fn connect(&self, details: &ConnectionDetails, chained: Option<In>) -> Result<Option<Self::Out>, Error> {
+    fn connect(
+        &self,
+        details: &ConnectionDetails,
+        chained: Option<In>,
+    ) -> Result<Option<Self::Out>, Error> {
         // A proxy connector already made the connection.
         if chained.is_some() {
             return Ok(chained.map(Either::A));
@@ -158,8 +181,19 @@ impl<In: Transport> Connector<In> for HappyConnector {
         let config = details.config;
         let no_delay = config.no_delay();
         let budget = details.timeout.not_zero().map(|t| *t);
-        let stream = race(&details.addrs, ATTEMPT_DELAY, budget, Arc::new(move |addr, limit| connect_one(addr, limit, no_delay)))
-            .map_err(|e| if e.kind() == io::ErrorKind::TimedOut { Error::Timeout(Timeout::Connect) } else { Error::Io(e) })?;
+        let stream = race(
+            &details.addrs,
+            ATTEMPT_DELAY,
+            budget,
+            Arc::new(move |addr, limit| connect_one(addr, limit, no_delay)),
+        )
+        .map_err(|e| {
+            if e.kind() == io::ErrorKind::TimedOut {
+                Error::Timeout(Timeout::Connect)
+            } else {
+                Error::Io(e)
+            }
+        })?;
         let transport = TcpTransport {
             stream: Arc::new(stream),
             buffers: LazyBuffers::new(config.input_buffer_size(), config.output_buffer_size()),
@@ -186,7 +220,9 @@ struct TcpTransport {
 
 impl fmt::Debug for TcpTransport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("TcpTransport").field("addr", &self.stream.peer_addr().ok()).finish()
+        f.debug_struct("TcpTransport")
+            .field("addr", &self.stream.peer_addr().ok())
+            .finish()
     }
 }
 
@@ -226,7 +262,9 @@ impl Transport for TcpTransport {
         }
         crate::cancel::watch(&self.stream)?;
         let output = &self.buffers.output()[..amount];
-        (&*self.stream).write_all(output).map_err(|e| io_error(e, timeout.reason))
+        (&*self.stream)
+            .write_all(output)
+            .map_err(|e| io_error(e, timeout.reason))
     }
 
     fn await_input(&mut self, timeout: NextTimeout) -> Result<bool, Error> {
@@ -240,6 +278,51 @@ impl Transport for TcpTransport {
         crate::cancel::watch(&self.stream)?;
         let started = Instant::now();
         let input = self.buffers.input_append_buf();
+        // Windows inside a cancellable pull: a cross-thread `shutdown` may
+        // leave the blocking recv asleep (verified: it waited out its whole
+        // timeout past the shutdown), so read nonblocking and check the
+        // cancel switch at most every POLL. `limit` stays the one full
+        // budget for this call: a poll that finds nothing loops on, it does
+        // not end the read; only `limit` running out does. Everywhere else
+        // the plain blocking read below keeps the socket timeout semantics
+        // unchanged.
+        if crate::cancel::polling() {
+            self.stream.set_nonblocking(true)?;
+            let amount = loop {
+                if crate::cancel::cancelled() {
+                    self.stream.set_nonblocking(false)?;
+                    return Err(Error::Io(io::Error::other("pull cancelled")));
+                }
+                match (&*self.stream).read(input) {
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    // Nothing yet: wait one poll, then check the switch again.
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        if let Some(limit) = limit
+                            && limit.saturating_sub(started.elapsed()).is_zero()
+                        {
+                            self.stream.set_nonblocking(false)?;
+                            return Err(Error::Timeout(timeout.reason));
+                        }
+                        std::thread::sleep(crate::cancel::POLL);
+                    }
+                    // EOF, or a real error (a shutdown from the cancel side
+                    // reads as ConnectionAborted/Reset): restore the mode,
+                    // and report a cancelled pull as its own error.
+                    result => {
+                        self.stream.set_nonblocking(false)?;
+                        break result.map_err(|e| {
+                            if crate::cancel::cancelled() {
+                                Error::Io(io::Error::other("pull cancelled"))
+                            } else {
+                                io_error(e, timeout.reason)
+                            }
+                        })?;
+                    }
+                }
+            };
+            self.buffers.input_appended(amount);
+            return Ok(amount > 0);
+        }
         let amount = loop {
             match (&*self.stream).read(input) {
                 // A signal: Linux does not restart a socket read that has a
@@ -255,7 +338,24 @@ impl Transport for TcpTransport {
                     self.stream.set_read_timeout(Some(left))?;
                     self.timeout_read = Some(left);
                 }
-                result => break result.map_err(|e| io_error(e, timeout.reason))?,
+                result => {
+                    break result.map_err(|e| {
+                        if crate::cancel::cancelled()
+                            && matches!(
+                                e.kind(),
+                                io::ErrorKind::TimedOut
+                                    | io::ErrorKind::WouldBlock
+                                    | io::ErrorKind::ConnectionReset
+                                    | io::ErrorKind::ConnectionAborted
+                                    | io::ErrorKind::BrokenPipe
+                            )
+                        {
+                            Error::Io(io::Error::other("pull cancelled"))
+                        } else {
+                            io_error(e, timeout.reason)
+                        }
+                    })?;
+                }
             }
         };
         self.buffers.input_appended(amount);
@@ -285,13 +385,39 @@ mod tests {
 
     #[test]
     fn families_take_turns_led_by_the_first() {
-        let got = interleave(&[addr("[2001:db8::1]:443"), addr("[2001:db8::2]:443"), addr("[2001:db8::3]:443"), addr("192.0.2.1:443"), addr("192.0.2.2:443")]);
-        let want = [addr("[2001:db8::1]:443"), addr("192.0.2.1:443"), addr("[2001:db8::2]:443"), addr("192.0.2.2:443"), addr("[2001:db8::3]:443")];
+        let got = interleave(&[
+            addr("[2001:db8::1]:443"),
+            addr("[2001:db8::2]:443"),
+            addr("[2001:db8::3]:443"),
+            addr("192.0.2.1:443"),
+            addr("192.0.2.2:443"),
+        ]);
+        let want = [
+            addr("[2001:db8::1]:443"),
+            addr("192.0.2.1:443"),
+            addr("[2001:db8::2]:443"),
+            addr("192.0.2.2:443"),
+            addr("[2001:db8::3]:443"),
+        ];
         assert_eq!(got, want);
         // The resolver put IPv4 first: it leads.
-        let got = interleave(&[addr("192.0.2.1:443"), addr("[2001:db8::1]:443"), addr("[2001:db8::2]:443")]);
-        assert_eq!(got, [addr("192.0.2.1:443"), addr("[2001:db8::1]:443"), addr("[2001:db8::2]:443")]);
-        assert_eq!(interleave(&[addr("192.0.2.1:443")]), [addr("192.0.2.1:443")]);
+        let got = interleave(&[
+            addr("192.0.2.1:443"),
+            addr("[2001:db8::1]:443"),
+            addr("[2001:db8::2]:443"),
+        ]);
+        assert_eq!(
+            got,
+            [
+                addr("192.0.2.1:443"),
+                addr("[2001:db8::1]:443"),
+                addr("[2001:db8::2]:443")
+            ]
+        );
+        assert_eq!(
+            interleave(&[addr("192.0.2.1:443")]),
+            [addr("192.0.2.1:443")]
+        );
         assert!(interleave(&[]).is_empty());
     }
 
@@ -309,12 +435,26 @@ mod tests {
 
     #[test]
     fn an_unreachable_ipv6_hands_over_to_ipv4_at_once() {
-        let addrs = [addr("[2001:db8::1]:443"), addr("[2001:db8::2]:443"), addr("192.0.2.1:443")];
+        let addrs = [
+            addr("[2001:db8::1]:443"),
+            addr("[2001:db8::2]:443"),
+            addr("192.0.2.1:443"),
+        ];
         let start = Instant::now();
-        let won = race(&addrs, ATTEMPT_DELAY, Some(Duration::from_secs(15)), fake(|_| Err(io::ErrorKind::NetworkUnreachable.into()))).unwrap();
+        let won = race(
+            &addrs,
+            ATTEMPT_DELAY,
+            Some(Duration::from_secs(15)),
+            fake(|_| Err(io::ErrorKind::NetworkUnreachable.into())),
+        )
+        .unwrap();
         assert_eq!(won, addr("192.0.2.1:443"));
         // No 250 ms wait: the failure started the next attempt.
-        assert!(start.elapsed() < Duration::from_millis(200), "{:?}", start.elapsed());
+        assert!(
+            start.elapsed() < Duration::from_millis(200),
+            "{:?}",
+            start.elapsed()
+        );
     }
 
     #[test]
@@ -334,7 +474,10 @@ mod tests {
         .unwrap();
         assert_eq!(won, addr("192.0.2.1:443"));
         let took = start.elapsed();
-        assert!(took >= ATTEMPT_DELAY && took < Duration::from_secs(1), "{took:?}");
+        assert!(
+            took >= ATTEMPT_DELAY && took < Duration::from_secs(1),
+            "{took:?}"
+        );
     }
 
     #[test]
@@ -359,7 +502,13 @@ mod tests {
     #[test]
     fn every_address_failing_reports_the_last_error() {
         let addrs = [addr("[2001:db8::1]:443"), addr("192.0.2.1:443")];
-        let err = race(&addrs, ATTEMPT_DELAY, None, Arc::new(|_, _| Err::<(), _>(io::ErrorKind::ConnectionRefused.into()))).unwrap_err();
+        let err = race(
+            &addrs,
+            ATTEMPT_DELAY,
+            None,
+            Arc::new(|_, _| Err::<(), _>(io::ErrorKind::ConnectionRefused.into())),
+        )
+        .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused);
     }
 
@@ -378,7 +527,11 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
-        assert!(start.elapsed() < Duration::from_secs(1), "{:?}", start.elapsed());
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            start.elapsed()
+        );
     }
 
     #[test]
@@ -387,8 +540,17 @@ mod tests {
         let open = listener.local_addr().unwrap();
         // A port just freed: nothing listens there, so it is refused (or,
         // without IPv6 on loopback, unavailable); either way, move on.
-        let closed = TcpListener::bind("[::1]:0").ok().map(|l| l.local_addr().unwrap()).unwrap_or(addr("[::1]:9"));
-        let stream = race(&[closed, open], ATTEMPT_DELAY, Some(Duration::from_secs(5)), Arc::new(|a, limit| connect_one(a, limit, true))).unwrap();
+        let closed = TcpListener::bind("[::1]:0")
+            .ok()
+            .map(|l| l.local_addr().unwrap())
+            .unwrap_or(addr("[::1]:9"));
+        let stream = race(
+            &[closed, open],
+            ATTEMPT_DELAY,
+            Some(Duration::from_secs(5)),
+            Arc::new(|a, limit| connect_one(a, limit, true)),
+        )
+        .unwrap();
         assert_eq!(stream.peer_addr().unwrap(), open);
     }
 }
