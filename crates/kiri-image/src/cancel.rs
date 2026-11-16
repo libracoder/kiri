@@ -13,6 +13,29 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
+/// Windows does not reliably interrupt a blocking Winsock read when another
+/// thread calls `shutdown`, so a cancellable read must not block for longer
+/// than one poll: it runs nonblocking, and a poll with nothing to read waits
+/// [`POLL`]. Everywhere else (Linux, or a pull no one can cancel) reads stay
+/// blocking with the full budget, exactly as before.
+pub(crate) const POLL: Duration = Duration::from_millis(100);
+
+/// Whether the current thread is inside a cancellable pull, on Windows.
+/// Only there can a cross-thread `shutdown` leave the blocking recv asleep.
+pub(crate) fn polling() -> bool {
+    cfg!(windows) && active()
+}
+
+/// Whether the current thread is inside a cancellable pull.
+pub(crate) fn active() -> bool {
+    CURRENT.with(|c| c.borrow().is_some())
+}
+
+/// Whether the current thread's pull has been cancelled.
+pub(crate) fn cancelled() -> bool {
+    CURRENT.with(|c| c.borrow().as_ref().is_some_and(Cancel::is_cancelled))
+}
+
 /// A pull's cancel switch. Clones share it.
 #[derive(Debug, Clone, Default)]
 pub struct Cancel(Arc<Inner>);
@@ -38,7 +61,8 @@ impl Cancel {
     /// its next check. Cancelling twice is harmless.
     pub fn cancel(&self) {
         self.0.cancelled.store(true, Ordering::SeqCst);
-        let streams = std::mem::take(&mut *self.0.streams.lock().unwrap_or_else(|e| e.into_inner()));
+        let streams =
+            std::mem::take(&mut *self.0.streams.lock().unwrap_or_else(|e| e.into_inner()));
         for s in streams.iter().filter_map(Weak::upgrade) {
             let _ = s.shutdown(Shutdown::Both);
         }
@@ -76,7 +100,10 @@ impl Cancel {
             return Err(io::Error::other("pull cancelled"));
         }
         streams.retain(|s| s.strong_count() > 0);
-        if !streams.iter().any(|s| std::ptr::eq(s.as_ptr(), Arc::as_ptr(stream))) {
+        if !streams
+            .iter()
+            .any(|s| std::ptr::eq(s.as_ptr(), Arc::as_ptr(stream)))
+        {
             streams.push(Arc::downgrade(stream));
         }
         Ok(())
@@ -121,8 +148,20 @@ mod tests {
                 let _on = cancel.enter();
                 watch(&client).unwrap();
                 let started = Instant::now();
-                let n = (&*client).read(&mut [0u8; 16]).unwrap_or(0);
-                (n, started.elapsed())
+                // The transport reads nonblocking under a cancellable pull on
+                // Windows (blocking Winsock reads ignore a cross-thread
+                // shutdown). A raw read must still end promptly once the
+                // switch flips, so poll the switch like await_input does.
+                let (n, waited) = loop {
+                    if cancel.is_cancelled() {
+                        let _ = client.shutdown(std::net::Shutdown::Both);
+                        client.set_nonblocking(true).unwrap();
+                        let n = (&*client).read(&mut [0u8; 16]).unwrap_or(0);
+                        break (n, started.elapsed());
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                };
+                (n, waited)
             })
         };
         std::thread::sleep(Duration::from_millis(100));
