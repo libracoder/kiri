@@ -1,13 +1,30 @@
 //! HostConfig settings the guest applies when a container starts:
-//! `--ulimit`, `--sysctl`, `--device`, `--device-cgroup-rule` and
-//! `--group-add`. They are kept as the API gave them (for inspect), checked
+//! `--ulimit`, `--sysctl`, `--device`, `--device-cgroup-rule`,
+//! `--group-add`, `MaskedPaths` and `ReadonlyPaths`. They are kept as the API gave them (for inspect), checked
 //! at create with Docker's errors, and handed to the guest at every start as
 //! the `opts` lines of `Run` and `Exec` (see [`kiri_proto::RunSpec::opts`]).
 
 use serde_json::{Value, json};
 
 /// The HostConfig keys kept with a container.
-const KEYS: [&str; 5] = ["Ulimits", "Sysctls", "Devices", "DeviceCgroupRules", "GroupAdd"];
+const KEYS: [&str; 7] = ["Ulimits", "Sysctls", "Devices", "DeviceCgroupRules", "GroupAdd", "MaskedPaths", "ReadonlyPaths"];
+
+/// Docker's default `MaskedPaths` and `ReadonlyPaths`, as inspect shows them.
+const MASKED: [&str; 12] = [
+    "/proc/acpi",
+    "/proc/asound",
+    "/proc/interrupts",
+    "/proc/kcore",
+    "/proc/keys",
+    "/proc/latency_stats",
+    "/proc/sched_debug",
+    "/proc/scsi",
+    "/proc/timer_list",
+    "/proc/timer_stats",
+    "/sys/devices/virtual/powercap",
+    "/sys/firmware",
+];
+const READONLY: [&str; 5] = ["/proc/bus", "/proc/fs", "/proc/irq", "/proc/sys", "/proc/sysrq-trigger"];
 
 /// `nofile` when the run sets none: what containers get on Docker Desktop
 /// and on Docker Engine under containerd's `LimitNOFILE=infinity`. Without
@@ -55,6 +72,16 @@ pub fn inspect(opts: &Value, key: &str) -> Value {
         (Value::Null, "Ulimits" | "Devices") => json!([]),
         (Value::Null, _) => Value::Null,
         (v, _) => v.clone(),
+    }
+}
+
+/// `MaskedPaths` or `ReadonlyPaths` for inspect: as given, else Docker's
+/// defaults, or null for a privileged container.
+pub fn system_paths(opts: &Value, key: &str, privileged: bool) -> Value {
+    match &opts[key] {
+        Value::Null if privileged => Value::Null,
+        Value::Null => json!(if key == "MaskedPaths" { &MASKED[..] } else { &READONLY[..] }),
+        v => v.clone(),
     }
 }
 
@@ -130,6 +157,16 @@ pub fn guest_lines(opts: &Value, net_host: bool) -> Result<Vec<String>, String> 
             return Err(format!("invalid group {g:?}"));
         }
         out.push(format!("group\t{g}"));
+    }
+    // `--security-opt systempaths=unconfined` arrives as both set to [].
+    for (key, kind) in [("MaskedPaths", "masked"), ("ReadonlyPaths", "readonly")] {
+        let paths = match &opts[key] {
+            Value::Null => continue,
+            Value::Array(a) => a.iter().map(|p| p.as_str().filter(|p| p.starts_with('/') && !p.contains(['\t', '\n']))).collect::<Option<Vec<_>>>(),
+            _ => None,
+        };
+        let paths = paths.ok_or_else(|| format!("invalid {key}: each entry must be an absolute path"))?;
+        out.push(std::iter::once(kind).chain(paths).collect::<Vec<_>>().join("\t"));
     }
     Ok(out)
 }
@@ -306,5 +343,21 @@ mod tests {
         assert_eq!(inspect(&kept, "Devices"), json!([]));
         assert_eq!(inspect(&kept, "GroupAdd"), Value::Null);
         assert_eq!(inspect(&Value::Null, "Ulimits"), json!([]));
+    }
+
+    #[test]
+    fn masked_and_readonly_paths() {
+        // Not set: no line, so the guest keeps its defaults.
+        assert_eq!(guest_lines(&json!({}), false).unwrap().len(), 1);
+        let kept = from_host(&json!({"MaskedPaths": [], "ReadonlyPaths": []}));
+        assert_eq!(guest_lines(&kept, false).unwrap()[1..], ["masked", "readonly"]);
+        let kept = from_host(&json!({"MaskedPaths": ["/proc/kcore", "/etc/secret"]}));
+        assert_eq!(guest_lines(&kept, false).unwrap()[1..], ["masked\t/proc/kcore\t/etc/secret"]);
+        for bad in [json!(["proc/kcore"]), json!(["/a\tb"]), json!([1]), json!("/proc/kcore")] {
+            assert!(guest_lines(&json!({"MaskedPaths": bad}), false).is_err(), "{bad}");
+        }
+        assert_eq!(system_paths(&json!({}), "ReadonlyPaths", false), json!(READONLY));
+        assert_eq!(system_paths(&json!({}), "MaskedPaths", true), Value::Null);
+        assert_eq!(system_paths(&kept, "MaskedPaths", true), json!(["/proc/kcore", "/etc/secret"]));
     }
 }

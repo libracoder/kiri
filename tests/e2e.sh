@@ -1605,6 +1605,20 @@ t read-only-volume "ok" bash -c "$D run --rm --read-only -v rovol:/data alpine s
 t shm-size "256.0M" $D run --rm --shm-size 256m alpine df -h /dev/shm
 t shm-default "64.0M" $D run --rm alpine df -h /dev/shm
 t no-new-privs "NoNewPrivs:	1" $D run --rm --security-opt no-new-privileges alpine grep NoNewPrivs /proc/self/status
+# Docker's masked and read-only paths: on by default, off with systempaths=unconfined or --privileged.
+P='echo covered:[$(grep -oE " /proc/(kcore|sys) " /proc/self/mountinfo | sort -u | xargs)]'
+t systempaths-default "covered:[/proc/kcore /proc/sys]" $D run --rm alpine sh -c "$P"
+t systempaths-unconfined "covered:[]" $D run --rm --security-opt systempaths=unconfined alpine sh -c "$P"
+t systempaths-privileged "covered:[]" $D run --rm --privileged alpine sh -c "$P"
+t systempaths-inspect "[] []" bash -c "$D create --name spi --security-opt systempaths=unconfined alpine >/dev/null; $D inspect -f '{{json .HostConfig.MaskedPaths}} {{json .HostConfig.ReadonlyPaths}}' spi; $D rm spi >/dev/null"
+SPD=$(mktemp -d)
+cat > "$SPD/lists.json" <<'EOF'
+{"Image":"alpine","Cmd":["sh","-c","echo os:[$(cat /etc/os-release)]; touch /tmp/x 2>/dev/null && echo tmp-rw || echo tmp-ro; echo covered:[$(grep -oE ' /proc/(kcore|sys) ' /proc/self/mountinfo | sort -u | xargs)]"],"HostConfig":{"MaskedPaths":["/etc/os-release","/nope"],"ReadonlyPaths":["/tmp","/proc/sys"]}}
+EOF
+t systempaths-api-lists "os:[] tmp-ro covered:[/proc/sys]" bash -c "id=\$(curl -s --unix-socket $SQ -H 'Content-Type: application/json' -d @$SPD/lists.json http://d/containers/create | sed 's/.*\"Id\":\"\([0-9a-f]*\)\".*/\1/'); $D start -a \$id | tr '\n' ' '; $D rm -f \$id >/dev/null"
+rm -rf "$SPD"
+# bubblewrap mounts a fresh /proc, which Linux refuses while parts of /proc are covered (#378).
+t systempaths-bwrap "bwrap-ok" $D run --rm --security-opt no-new-privileges --security-opt seccomp=unconfined --security-opt systempaths=unconfined alpine sh -c 'timeout 40 apk add -q bubblewrap >/dev/null 2>&1; timeout 10 su nobody -s /bin/sh -c "bwrap --die-with-parent --unshare-user --unshare-pid --ro-bind / / --proc /proc --dev /dev echo bwrap-ok" 2>&1'
 
 section "UDP ports"
 $D run -d --name dns -p 15354:53/udp -p 15354:53/tcp alpine sh -c 'apk add -q dnsmasq >/dev/null 2>&1; dnsmasq -k --address=/kiri.test/10.9.8.7' >/dev/null
