@@ -147,6 +147,9 @@ fn fetch_and_check(release: &Release, app: &Path, dir: &Path, progress: &mut dyn
     if !sum.eq_ignore_ascii_case(release.sha256.trim()) {
         return Err(io::Error::new(io::ErrorKind::InvalidData, format!("download does not match its SHA-256 (got {sum})")));
     }
+    // The feed's SHA-256 is all that vouches for the archive until the app
+    // inside is checked, so its names are checked before anything is written.
+    check_archive(&tgz)?;
     let unpacked = dir.join("unpacked");
     std::fs::create_dir_all(&unpacked)?;
     // A sparse-aware tar: the VM's disk template inside is mostly holes.
@@ -160,6 +163,101 @@ fn fetch_and_check(release: &Release, app: &Path, dir: &Path, progress: &mut dyn
     let _ = std::fs::remove_dir_all(&unpacked);
     std::fs::write(dir.join("version"), &release.version)?;
     Ok(())
+}
+
+/// Lists the update tarball before it is unpacked, and refuses anything that
+/// could be written outside the stage: entries outside `Kiri.app/`, absolute
+/// or `..` names, links whose target leaves the bundle, and anything that is
+/// not a file, a directory or a link. macOS's `/usr/bin/tar` (bsdtar) refuses
+/// most of these itself today, but the archive is checked only against a
+/// hash from the same feed as its URL, and the app's signature only after it
+/// is unpacked: this states the "nothing outside" invariant itself instead of
+/// leaving it to tar's defaults, across versions and flags.
+fn check_archive(tgz: &Path) -> io::Result<()> {
+    let bad = |why: String| io::Error::new(io::ErrorKind::InvalidData, format!("the update archive {why}"));
+    let file = std::fs::File::open(tgz)?;
+    let gz = flate2::read::MultiGzDecoder::new(std::io::BufReader::new(file));
+    let mut archive = tar::Archive::new(gz);
+    let mut top = false;
+    for entry in archive.entries().map_err(|e| bad(format!("cannot be read: {e}")))? {
+        let entry = entry.map_err(|e| bad(format!("cannot be read: {e}")))?;
+        let kind = entry.header().entry_type();
+        // PAX and GNU long-name records are metadata, not files.
+        if matches!(kind, tar::EntryType::XHeader | tar::EntryType::XGlobalHeader | tar::EntryType::GNULongName | tar::EntryType::GNULongLink) {
+            continue;
+        }
+        let path = entry.path().map_err(|e| bad(format!("has a bad path: {e}")))?.into_owned();
+        let Some(inside) = bundle_path(&path) else {
+            // AppleDouble files (`._Kiri.app`, for extended attributes) sit
+            // beside the app but inside the stage, where they are removed
+            // with it. Anything else beside it could be planted elsewhere.
+            if beside_the_app(&path) {
+                if kind.is_file() || kind.is_dir() {
+                    continue;
+                }
+                return Err(bad(format!("has a {kind:?} entry at {}", path.display())));
+            }
+            return Err(bad(format!("has an entry outside Kiri.app: {}", path.display())));
+        };
+        // Any entry under the app is enough: tar makes the folder for it.
+        top = true;
+        if kind == tar::EntryType::Symlink || kind == tar::EntryType::Link {
+            let target = entry.link_name().map_err(|e| bad(format!("has a bad link: {e}")))?.ok_or_else(|| bad(format!("has a link with no target at {}", inside.display())))?;
+            if bundle_link(&inside, &target).is_none() {
+                return Err(bad(format!("has a link leaving Kiri.app: {} -> {}", inside.display(), target.display())));
+            }
+        } else if !(kind.is_file() || kind.is_dir() || kind == tar::EntryType::GNUSparse) {
+            return Err(bad(format!("has a {kind:?} entry at {}", inside.display())));
+        }
+    }
+    if !top {
+        return Err(bad("has no Kiri.app".to_owned()));
+    }
+    Ok(())
+}
+
+/// A path in the update tarball with `.` dropped, when it is relative and
+/// under `Kiri.app`: `./Kiri.app/x` → `Kiri.app/x`. Absolute paths and `..`
+/// are not.
+fn bundle_path(path: &Path) -> Option<PathBuf> {
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            std::path::Component::Normal(n) => out.push(n),
+            std::path::Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    (out.components().next().is_some_and(|c| c.as_os_str() == "Kiri.app")).then_some(out)
+}
+
+/// AppleDouble files sit beside the app in the stage: `._Kiri.app` and the
+/// like, one name, no folder. They are unpacked next to it and removed with
+/// the stage folder, so they cannot plant anything anywhere else.
+fn beside_the_app(path: &Path) -> bool {
+    let mut parts = path.components();
+    parts.next().is_some_and(|c| matches!(c, std::path::Component::Normal(_))) && parts.next().is_none() && path.as_os_str().as_encoded_bytes().starts_with(b"._")
+}
+
+/// Where the relative link `target` at `from` leads, lexically, when that
+/// stays inside `Kiri.app`. A target that is absolute, empty or climbs past
+/// the app leaves the stage the archive is unpacked into, so it is not.
+fn bundle_link(from: &Path, target: &Path) -> Option<PathBuf> {
+    if target.is_absolute() || target.as_os_str().is_empty() {
+        return None;
+    }
+    let mut parts: Vec<std::ffi::OsString> = from.parent()?.components().map(|c| c.as_os_str().to_owned()).collect();
+    for c in target.components() {
+        match c {
+            std::path::Component::Normal(n) => parts.push(n.to_owned()),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                parts.pop()?;
+            }
+            _ => return None,
+        }
+    }
+    (parts.first().is_some_and(|p| p.as_os_str() == "Kiri.app")).then(|| parts.iter().collect())
 }
 
 /// The staged update's version, when there is one newer than this build.
@@ -472,5 +570,110 @@ mod tests {
         assert_eq!(r.notes_url, "https://runkiri.com/");
         let r: Release = serde_json::from_str(r###"{"version":"0.1.5","url":"u","sha256":"ab","notes":"## New\n- a line"}"###).unwrap();
         assert_eq!(r.notes, "## New\n- a line");
+    }
+
+    fn update_entry(kind: tar::EntryType) -> tar::Header {
+        let mut h = tar::Header::new_gnu();
+        h.set_size(0);
+        h.set_mode(0o644);
+        h.set_uid(0);
+        h.set_gid(0);
+        h.set_mtime(0);
+        h.set_entry_type(kind);
+        h
+    }
+
+    fn gzip(tar: Vec<u8>) -> Vec<u8> {
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gz.write_all(&tar).unwrap();
+        gz.finish().unwrap()
+    }
+
+    /// An archive as a release makes it: the app, its binary and a framework
+    /// link, plus whatever `extra` adds.
+    fn update_tar(extra: impl FnOnce(&mut tar::Builder<Vec<u8>>)) -> Vec<u8> {
+        let mut b = tar::Builder::new(Vec::new());
+        b.append_data(&mut update_entry(tar::EntryType::Directory), "Kiri.app/", &[][..]).unwrap();
+        let mut file = update_entry(tar::EntryType::Regular);
+        file.set_size(6);
+        b.append_data(&mut file, "Kiri.app/Contents/MacOS/kiri", &b"binary"[..]).unwrap();
+        b.append_link(&mut update_entry(tar::EntryType::Symlink), "Kiri.app/Contents/Frameworks/F.framework/Versions/Current", "A").unwrap();
+        extra(&mut b);
+        gzip(b.into_inner().unwrap())
+    }
+
+    /// `check_archive` on `bytes`, with the file it reads cleaned up.
+    fn check_bytes(bytes: &[u8]) -> io::Result<()> {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("kiri-update-check-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("Kiri.tar.gz");
+        std::fs::write(&path, bytes).unwrap();
+        let result = check_archive(&path);
+        std::fs::remove_dir_all(&dir).unwrap();
+        result
+    }
+
+    #[test]
+    fn a_well_formed_update_archive_passes() {
+        check_bytes(&update_tar(|_| {})).unwrap();
+        // macOS's AppleDouble files sit beside the app, inside the stage.
+        let bytes = update_tar(|b| {
+            let mut h = update_entry(tar::EntryType::Regular);
+            h.set_size(1);
+            b.append_data(&mut h, "._Kiri.app", &b"x"[..]).unwrap();
+        });
+        check_bytes(&bytes).unwrap();
+    }
+
+    /// A header whose name is `name` as the tar bytes carry it, `..` and a
+    /// leading `/` included: the builder's own setters refuse both.
+    fn named(name: &str, kind: tar::EntryType) -> tar::Header {
+        let mut h = update_entry(kind);
+        h.set_size(1);
+        let b = h.as_mut_bytes();
+        b[..100].fill(0);
+        b[..name.len()].copy_from_slice(name.as_bytes());
+        h.set_cksum();
+        h
+    }
+
+    /// Names that climb out of the stage, or sit beside the app, are refused
+    /// before /usr/bin/tar writes anything.
+    #[test]
+    fn archive_names_must_stay_under_the_app() {
+        let entry = |b: &mut tar::Builder<Vec<u8>>, name: &str| b.append(&named(name, tar::EntryType::Regular), &b"x"[..]).unwrap();
+        for name in ["../evil", "Kiri.app/../../evil", "Other/x", "./evil", "/tmp/evil"] {
+            let err = check_bytes(&update_tar(|b| entry(b, name))).expect_err(name);
+            assert!(err.to_string().contains("Kiri.app"), "{name}: {err}");
+        }
+    }
+
+    /// A link may rise with `..` as bundles do, but not leave the bundle.
+    #[test]
+    fn links_must_stay_inside_the_bundle() {
+        fn link_tar(kind: tar::EntryType, target: &str) -> Vec<u8> {
+            update_tar(|b| b.append_link(&mut update_entry(kind), "Kiri.app/Contents/link", target).unwrap())
+        }
+        for target in ["../../evil", "/tmp/evil", "../../../.."] {
+            assert!(check_bytes(&link_tar(tar::EntryType::Symlink, target)).is_err(), "symlink -> {target}");
+        }
+        check_bytes(&link_tar(tar::EntryType::Symlink, "../MacOS/kiri")).unwrap();
+        // A hard link names another entry from the archive root.
+        assert!(check_bytes(&link_tar(tar::EntryType::Link, "../../evil")).is_err(), "hardlink outside");
+        check_bytes(&link_tar(tar::EntryType::Link, "Kiri.app/Contents/MacOS/kiri")).unwrap();
+    }
+
+    #[test]
+    fn special_files_and_a_missing_app_are_refused() {
+        let fifo = update_tar(|b| b.append_data(&mut update_entry(tar::EntryType::Fifo), "Kiri.app/pipe", &[][..]).unwrap());
+        assert!(check_bytes(&fifo).is_err(), "fifo");
+        let mut b = tar::Builder::new(Vec::new());
+        let mut h = update_entry(tar::EntryType::Regular);
+        h.set_size(1);
+        b.append_data(&mut h, "x", &b"x"[..]).unwrap();
+        let no_app = gzip(b.into_inner().unwrap());
+        assert!(check_bytes(&no_app).unwrap_err().to_string().contains("Kiri.app"));
     }
 }

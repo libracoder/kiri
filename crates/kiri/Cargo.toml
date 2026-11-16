@@ -32,6 +32,8 @@ libc = "0.2"
 kiri-vmm = { path = "../kiri-vmm" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+# Listing the update tarball before it is unpacked (update.rs).
+tar = "0.4"
 block2 = "0.6.2"
 dispatch2 = "0.3.1"
 objc2 = "0.6.5"
