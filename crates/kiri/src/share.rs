@@ -1761,13 +1761,16 @@ usage: kiri share PORT | HOST:PORT | CONTAINER [NAME | --name NAME] [--no-reserv
        kiri share logout
        kiri share status [--json]
        kiri share provider [kiri | cloudflare]
+       kiri share domain add BASE_DOMAIN NAME CREDENTIALS_FILE
+       kiri share domain list [--json] | remove NAME | clear
        kiri share list [--json]
        kiri share stop ID
 
 Cloudflare: select it with `kiri share provider cloudflare`. Without a base
 domain, shares get temporary trycloudflare.com links. For your own domain,
-configure cloudflare.base_domain and cloudflare.tunnels in share.json;
-see docs/cloudflare-sharing.md. Requires cloudflared on this computer.
+use `kiri share domain add BASE_DOMAIN NAME CREDENTIALS_FILE` with an
+existing locally managed tunnel, or configure share.json directly.
+See docs/cloudflare-sharing.md. Requires cloudflared on this computer.
 
 `kiri 3000` shares port 3000 at a random address; `kiri 3000 myapp` (or
 --name myapp) at myapp.runkiri.cloud once it's reserved. Kiri Cloud checks each name before it's
@@ -1926,6 +1929,7 @@ pub fn run(args: &[String]) -> io::Result<()> {
             Ok(())
         }
         Some("status") => status_cli(args.iter().any(|a| a == "--json")),
+        Some("domain") => cloudflare::settings::cli(&args[1..]),
         Some("list") => {
             let list = tunnels()?;
             if args.iter().any(|a| a == "--json") {

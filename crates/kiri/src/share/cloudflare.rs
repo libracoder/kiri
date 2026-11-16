@@ -11,6 +11,9 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::process::{Child, Command, ExitCode, Stdio};
 
+#[path = "cloudflare_settings.rs"]
+pub mod settings;
+
 const POLL: Duration = Duration::from_millis(200);
 const STARTUP: Duration = Duration::from_secs(90);
 pub const HELPER: &str = "__share-cloudflared";

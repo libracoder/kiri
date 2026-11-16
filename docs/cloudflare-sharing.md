@@ -52,7 +52,52 @@ cloudflared tunnel route dns kiri-web web.example.com
 ```
 
 The create command prints a tunnel UUID and creates its credentials JSON.
-Add that UUID and the absolute credentials path to Kiri's config:
+Kiri can import that file without editing `share.json`:
+
+```sh
+kiri share domain add example.com web ~/.cloudflared/<TUNNEL-UUID>.json
+kiri share 3000 --name web
+```
+
+Replace `<TUNNEL-UUID>` with the ID printed by `cloudflared`. The command
+selects Cloudflare, reads the tunnel ID from its credentials, and prints the
+hostname and proxied CNAME target to configure in Cloudflare DNS. It validates
+the domain, share name, credential file and duplicate tunnel IDs before
+saving. Existing settings, including the cloudflared executable path, are
+preserved. Each additional share needs its own tunnel and DNS record:
+
+```sh
+kiri share domain add example.com api ~/.cloudflared/<OTHER-TUNNEL-UUID>.json
+kiri share domain list --json
+kiri share domain remove api
+kiri share domain clear   # return to temporary links
+```
+
+`remove` removes one local mapping; it keeps the base domain, so a missing
+mapping cannot silently create a temporary public URL. `clear` removes all
+local domain mappings and returns to temporary links. Both keep credentials
+and Cloudflare resources. Existing links retain their routing until stopped;
+saved settings apply to new shares. To change the base domain in the CLI,
+clear it first, then add the new routes.
+
+### Set up the domain in the app
+
+In **Share → Custom domain**, choose **Custom domain**, enter the base domain
+and select **Add tunnel**. Enter the share name (the container's name for the
+app's Share button) and the path to its credentials JSON. Absolute paths and
+`~/.cloudflared/...` paths are supported. Add each tunnel, then select
+**Save sharing settings**. The dialog shows the proxied CNAME records to
+create in Cloudflare. It also lets you edit/remove routes or return to
+temporary links. Validation errors leave your edits visible and the saved
+configuration intact.
+
+The preview app uses its own settings. For that app's CLI, use
+`~/.kiri-cloudflare/bin/kiri`; the normal `kiri` command configures the
+installed app instead.
+
+### Configure the file directly
+
+You can also add the UUID and absolute credentials path to Kiri's config:
 
 ```json
 {

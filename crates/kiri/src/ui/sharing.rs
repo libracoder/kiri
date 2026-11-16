@@ -81,6 +81,24 @@ pub fn list() {
     emit(json!({"type": "shares", "shares": links, "served": served}).to_string());
 }
 
+/// Domain setup never returns credential contents to the page.
+pub fn cloudflare_settings(id: String, input: Option<Value>) {
+    std::thread::spawn(move || {
+        let saved = input.is_some();
+        let result = match input {
+            Some(value) => serde_json::from_value(value).map_err(std::io::Error::other).and_then(share::cloudflare::settings::update),
+            None => share::cloudflare::settings::current(),
+        };
+        match result {
+            Ok(settings) => {
+                emit(json!({"type": "shareconfig", "id": id, "settings": settings, "saved": saved}).to_string());
+                if saved { list(); }
+            }
+            Err(e) => emit(json!({"type": "shareconfig", "id": id, "error": e.to_string()}).to_string()),
+        }
+    });
+}
+
 /// The account's plan and what it has used this month, from the edge.
 pub fn usage() {
     std::thread::spawn(|| {

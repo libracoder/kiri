@@ -39,6 +39,50 @@ t("the live dialog identifies Cloudflare and stops the share", () => {
   sent.length = 0; $("sh-modal").querySelector("[data-mstop]").click();
   eq(sent.some(x => x.type === "unshare" && x.id === "501"), true, "stop sent");
 });
+t("custom-domain setup is accessible from Share", () => {
+  show("share"); sh.open = null; renderShare(); sent.length = 0;
+  document.querySelector("[data-shdomain]").click();
+  eq(sent.at(-1).type, "shareconfig", "load settings");
+  kiri.on({ type: "shareconfig", id: sent.at(-1).id, settings: { base_domain: null, routes: [] } });
+  eq($("cf-mode").value, "quick", "temporary mode");
+  eq($("cf-named").disabled, true, "hidden custom fields do not block validation");
+  $("cf-mode").value = "custom"; $("cf-mode").dispatchEvent(new Event("change", { bubbles: true }));
+  $("cf-base").value = "example.com";
+  $("sh-domain").querySelector("[data-cf-add]").click();
+  $("sh-domain").querySelector("[data-cf-name]").value = "web";
+  $("sh-domain").querySelector("[data-cf-file]").value = "/credentials with spaces/web.json";
+});
+t("custom-domain setup saves routes and displays the DNS records", () => {
+  sent.length = 0;
+  $("sh-domain").querySelector("button[type=submit]").click();
+  const request = sent.find(x => x.type === "shareconfig");
+  eq(request.value, { base_domain: "example.com", routes: [{ name: "web", credentials_file: "/credentials with spaces/web.json" }] }, "setup payload");
+  eq($("sh-domain").querySelector("[data-cf-form]").disabled, true, "prevents duplicate saves");
+  kiri.on({ type: "shareconfig", id: request.id, saved: true, settings: { base_domain: "example.com", routes: [{ name: "web", credentials_file: "/credentials with spaces/web.json", hostname: "web.example.com", dns_target: "tunnel-uuid.cfargotunnel.com" }] } });
+  eq($("sh-domain").textContent.includes("web.example.com → tunnel-uuid.cfargotunnel.com"), true, "DNS route");
+  eq($("cf-status").textContent.includes("Settings apply to new shares"), true, "save acknowledged");
+});
+t("invalid domain setup keeps edits and allows correction", () => {
+  $("cf-base").value = "https://example.com";
+  $("sh-domain").querySelector("button[type=submit]").click();
+  kiri.on({ type: "shareconfig", id: shDomain.id, error: "Use a DNS name without a scheme" });
+  eq($("cf-base").value, "https://example.com", "preserves edit");
+  eq($("cf-error").textContent, "Use a DNS name without a scheme", "visible validation error");
+  eq($("sh-domain").querySelector("[data-cf-form]").disabled, false, "can retry");
+  kiri.on({ type: "shareconfig", id: "outdated-request", settings: { base_domain: null, routes: [] } });
+  eq($("cf-base").value, "https://example.com", "ignores stale response");
+});
+t("temporary mode explicitly clears the local named routes", () => {
+  $("cf-mode").value = "quick"; $("cf-mode").dispatchEvent(new Event("change", { bubbles: true }));
+  sent.length = 0; $("sh-domain").querySelector("button[type=submit]").click();
+  eq(sent.at(-1).value, { base_domain: null, routes: [] }, "clears domain mappings");
+  eq($("cf-quick-note").hidden, false, "explains clearing routes");
+  const oldId = shDomain.id;
+  $("sh-domain").querySelector("[data-cf-close]").click();
+  eq(!!$("sh-domain"), false, "dialog closed");
+  kiri.on({ type: "shareconfig", id: oldId, saved: true, settings: { base_domain: null, routes: [] } });
+  eq(!!$("sh-domain"), false, "late save does not reopen dialog");
+});
 t("returning to Kiri restores sign-in", () => {
   kiri.on({ type: "shareaccount", signedIn: false });
   show("share"); sh.open = null; renderShare();

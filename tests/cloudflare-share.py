@@ -172,9 +172,48 @@ def main():
             print("PASS cancellation before readiness and helper directory validation")
 
             tunnel = "01234567-89ab-cdef-0123-456789abcdef"
-            credentials = root / "credentials.json"
+            credentials = root / "credentials with spaces.json"
             credentials.write_text(json.dumps({"TunnelID": tunnel, "TunnelSecret": "not-a-real-secret"}))
-            save({"base_domain": "example.com", "tunnels": {"web": {"id": tunnel, "credentials_file": str(credentials)}}})
+            original = json.loads(config.read_text())
+            original.update(provider="kiri", token="ks_preserved", login="test-user")
+            config.write_text(json.dumps(original))
+            added = cli("domain", "add", " Example.COM. ", "WEB", str(credentials))
+            assert "https://web.example.com" in added.stdout
+            assert f"{tunnel}.cfargotunnel.com" in added.stdout
+            saved = json.loads(config.read_text())
+            assert saved["provider"] == "cloudflare"
+            assert saved["cloudflare"]["executable"] == str(fake)
+            assert saved["cloudflare"]["base_domain"] == "example.com"
+            assert saved["cloudflare"]["tunnels"]["web"]["credentials_file"] == str(credentials.resolve())
+            assert (saved["token"], saved["login"], saved["device"]) == (original["token"], original["login"], original["device"])
+            invalid = root / "invalid.json"
+            invalid.write_text('{"TunnelID":"bad-id","TunnelSecret":"private-token-must-not-leak"}')
+            malformed = root / "malformed.json"
+            malformed.write_text("private-token-must-not-leak")
+            before_config = config.read_bytes()
+            for base, name, path in [
+                ("https://example.com", "web", credentials),
+                ("*.example.com", "web", credentials),
+                ("other.example.com", "web", credentials),
+                ("example.com", "bad/name", credentials),
+                ("example.com", "duplicate", credentials),
+                ("example.com", "web", invalid),
+                ("example.com", "web", malformed),
+                ("example.com", "web", root / "missing.json"),
+            ]:
+                failed = cli("domain", "add", base, name, str(path), ok=False)
+                assert failed.returncode != 0, (base, name, path)
+                assert "private-token-must-not-leak" not in failed.stdout + failed.stderr
+                assert config.read_bytes() == before_config, "invalid setup changed the saved config"
+            other = root / "api.json"
+            other_id = "11234567-89ab-cdef-0123-456789abcdef"
+            other.write_text(json.dumps({"TunnelID": other_id.upper(), "TunnelSecret": "not-a-real-secret"}))
+            cli("domain", "add", "example.com", "api", str(other))
+            configured = json.loads(cli("domain", "list", "--json").stdout)
+            assert [r["hostname"] for r in configured["routes"]] == ["api.example.com", "web.example.com"]
+            assert configured["routes"][0]["id"] == other_id
+            assert "not-a-real-secret" not in config.read_text() + json.dumps(configured)
+            print("PASS custom-domain setup, normalization, preservation, DNS instructions and invalid-input rollback")
             before = {c["pid"] for c in captures()}
             share = start("--name", "web")
             assert share.event("live")["url"] == "https://web.example.com"
@@ -193,6 +232,26 @@ def main():
             share.process.wait(timeout=5)
             closed(capture)
             print("PASS named ingress, credential isolation, duplicate lock and missing-name errors")
+
+            cli("domain", "remove", "WEB")
+            configured = json.loads(cli("domain", "list", "--json").stdout)
+            assert [r["name"] for r in configured["routes"]] == ["api"]
+            before = {c["pid"] for c in captures()}
+            share = start("--name", "api")
+            assert share.event("live")["url"] == "https://api.example.com"
+            capture = next(c for c in captures() if c["pid"] not in before)
+            # Editing the saved routes must not interrupt an already live link.
+            cli("domain", "clear")
+            assert alive(capture["pid"])
+            assert json.loads(cli("domain", "list", "--json").stdout) == {"base_domain": None, "routes": []}
+            entry = json.loads(cli("list", "--json").stdout)["items"][0]
+            cli("stop", entry["name"])
+            assert share.event("ended")["error"] is False
+            share.process.wait(timeout=5)
+            closed(capture)
+            assert credentials.exists() and other.exists()
+            assert json.loads(config.read_text())["cloudflare"]["executable"] == str(fake)
+            print("PASS multiple custom hosts, route removal and returning to temporary links")
 
             save()
             (root / "fail").touch()

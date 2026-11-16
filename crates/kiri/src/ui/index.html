@@ -1007,6 +1007,16 @@ td.actions .acts-row { margin-inline-start: auto; width: max-content; padding-in
 .scrim.langstep { z-index: 40; grid-template: minmax(0, 1fr) / minmax(0, 1fr); }
 .dialog { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 20px; width: min(460px, calc(100% - 32px)); display: grid; gap: 14px; }
 .dialog h3 { font-size: var(--fs-head); }
+.dialog.cf-settings { width: min(680px, calc(100% - 32px)); max-height: calc(100% - 32px); overflow: auto; }
+.cf-settings fieldset { border: 0; min-width: 0; display: grid; gap: 12px; }
+.cf-settings label { display: grid; gap: 5px; }
+.cf-settings .field { width: 100%; min-width: 0; }
+.cf-settings select.field { height: 32px; border: 1px solid var(--line); border-radius: 9px; background: var(--panel); color: var(--text); }
+.cf-settings [hidden] { display: none; }
+.cf-route { display: grid; grid-template-columns: minmax(100px, 1fr) minmax(180px, 2fr) auto; gap: 8px; align-items: end; }
+.cf-settings .cf-dns { display: grid; gap: 6px; overflow-wrap: anywhere; user-select: text; }
+.cf-settings [role=alert] { color: var(--red-text); }
+@media (max-width: 560px) { .cf-route { grid-template-columns: minmax(0, 1fr); } }
 .dialog p { color: var(--muted); font-size: var(--fs); }
 /* An alert: what kind it is as a symbol on the left, in its colour, centred on
    the title's first line; the words and buttons line up beside it. */
@@ -6780,6 +6790,7 @@ window.kiri = {
       case "enginestale": ui.engineStale = e.version; ui.staleHidden = false; renderUpdate(); break;
       case "tools": toolsBar(e); break;
       case "share": case "shares": case "shareaccount": case "sharelogin": case "shareusage": case "sharetunnels": case "sharetraffic": shEvent(e); break;
+      case "shareconfig": shDomainResult(e); break;
       case "builds": {
         const b = ui.bl;
         b.items = e.builds || b.items || []; b.error = e.error || "";
@@ -8288,7 +8299,7 @@ function renderShare() {
   const list = rows ? `<div class="sh-list">${rows}</div>`
     : `<div class="sh-empty">${shGlobe}<h3>${tr("Nothing shared yet")}</h3><p>${tr("Press <b>Share</b> on a running container to give it a public https link anyone can open.")}</p>
         <button class="btn" data-shcontainers>${tr("Go to Containers")}</button></div>`;
-  const foot = !a ? "" : shCloudflare() ? `<div class="sh-foot">Cloudflare Tunnel · ${tr("Links on this computer")}</div>` : a.signedIn
+  const foot = !a ? "" : shCloudflare() ? `<div class="sh-foot">Cloudflare Tunnel · ${tr("Links on this computer")}<button class="linkish" data-shdomain>${tr("Custom domain")}</button></div>` : a.signedIn
     ? `<div class="sh-foot"><span class="sh-ghmark" title="${tr("Signed in with GitHub")}">${shSvg("github")}</span>${tr("Signed in to Kiri Cloud with GitHub as {login}", { login: `<b>${esc(a.login || tr("you"))}</b>` })}
         ${a.session ? `<span class="sep">·</span><span title="${tr("This sign-in's ID: a hash of its token, safe to quote when asking for help")}">${tr("Session")} <code class="sh-sess">${esc(a.session)}</code></span>` : ""}
         <span class="sep">·</span><button class="linkish" data-shlogout>${tr("Sign out")}</button></div>`
@@ -8407,6 +8418,96 @@ function shPaneRows(id) {
   $("sh-rows").innerHTML = rows.length ? rows.slice(0, 500).map((r) => `<tr><td class="muted mono">${shClock(r.at)}</td><td class="mono ${shCode(r.status)}">${r.status || "—"}</td><td class="mono"><b>${esc(r.method)}</b></td>
       <td class="mono sh-path" title="${esc(r.path)}">${esc(r.path)}</td><td class="r num muted">${size(r.out)}</td><td class="r num">${r.ms} ms</td></tr>`).join("")
     : `<tr><td colspan="6" class="muted sh-noreq">${it.paused ? tr("Paused: nobody can open the link until you resume.") : shCloudflare() ? tr("Cloudflare does not provide request logs in Kiri") : all.length ? tr("No requests match.") : tr("Waiting for the first visitor…")}</td></tr>`;
+}
+
+/* Cloudflare domain setup. The host imports credentials and returns only
+   their path and tunnel ID; the page never reads their secret contents. */
+let shDomain = null, shDomainSeq = 0;
+function shDomainClose() {
+  const focus = shDomain?.focus;
+  if (shDomain?.onKey) document.removeEventListener("keydown", shDomain.onKey);
+  $("sh-domain")?.remove(); shDomain = null;
+  if (focus?.isConnected) focus.focus();
+}
+function shDomainRequest(value) {
+  if (!shDomain || shDomain.busy) return;
+  shDomain.id = String(++shDomainSeq); shDomain.busy = true;
+  const fields = $("sh-domain")?.querySelector("[data-cf-form]");
+  if (fields) fields.disabled = true;
+  send("shareconfig", { id: shDomain.id, ...(value === undefined ? {} : { value }) });
+}
+function shDomainOpen() {
+  shDomainClose();
+  shDomain = { focus: document.activeElement, busy: false };
+  const scrim = document.createElement("div");
+  scrim.id = "sh-domain"; scrim.className = "scrim sh-scrim";
+  scrim.innerHTML = `<div class="dialog cf-settings" role="dialog" aria-modal="true" aria-labelledby="cf-title">
+    <h3 id="cf-title">${tr("Cloudflare custom domain")}</h3><div id="cf-body"><p>${tr("Loading…")}</p></div>
+    <p id="cf-error" role="alert"></p><p id="cf-status" role="status"></p>
+    <div class="row-end"><span></span><button class="btn" data-cf-close>${tr("Done")}</button></div></div>`;
+  document.body.append(scrim);
+  shDomain.onKey = (ev) => {
+    if (ev.key === "Escape") { ev.preventDefault(); shDomainClose(); }
+    else if (ev.key === "Tab") {
+      const focusable = [...scrim.querySelectorAll("button, input, select")].filter(x => !x.matches(":disabled") && x.getClientRects().length);
+      const first = focusable[0], last = focusable.at(-1);
+      if (ev.shiftKey && document.activeElement === first) { ev.preventDefault(); last?.focus(); }
+      else if (!ev.shiftKey && document.activeElement === last) { ev.preventDefault(); first?.focus(); }
+    }
+  };
+  document.addEventListener("keydown", shDomain.onKey);
+  scrim.addEventListener("click", ev => {
+    if (ev.target === scrim || ev.target.closest("[data-cf-close]")) return shDomainClose();
+    if (shDomain.busy) return;
+    if (ev.target.closest("[data-cf-add]")) {
+      $("cf-routes").insertAdjacentHTML("beforeend", shDomainRow({}));
+      $("cf-routes").lastElementChild.querySelector("input").focus();
+    } else ev.target.closest("[data-cf-remove]")?.closest(".cf-route")?.remove();
+  });
+  scrim.addEventListener("change", ev => { if (ev.target.id === "cf-mode") shDomainMode(); });
+  scrim.addEventListener("submit", ev => {
+    ev.preventDefault();
+    if (shDomain.busy) return;
+    const custom = $("cf-mode").value === "custom";
+    const routes = custom ? [...scrim.querySelectorAll(".cf-route")].map(row => ({ name: row.querySelector("[data-cf-name]").value.trim(), credentials_file: row.querySelector("[data-cf-file]").value.trim() })) : [];
+    $("cf-error").textContent = ""; $("cf-status").textContent = tr("Saving…");
+    shDomainRequest({ base_domain: custom ? $("cf-base").value.trim() : null, routes });
+  });
+  scrim.querySelector("[data-cf-close]").focus();
+  shDomainRequest();
+}
+function shDomainRow(r) {
+  return `<div class="cf-route"><label>${tr("Share name")}<input class="field" data-cf-name required placeholder="web" value="${esc(r.name || "")}" autocapitalize="none" spellcheck="false"></label>
+    <label>${tr("Credentials file")}<input class="field" data-cf-file required placeholder="~/.cloudflared/tunnel-uuid.json" value="${esc(r.credentials_file || "")}" spellcheck="false"></label>
+    <button class="btn" type="button" data-cf-remove aria-label="${tr("Remove tunnel route")}">${tr("Remove")}</button></div>`;
+}
+function shDomainMode() {
+  const custom = $("cf-mode").value === "custom";
+  $("cf-named").hidden = !custom; $("cf-named").disabled = !custom;
+  $("cf-quick-note").hidden = custom;
+}
+function shDomainResult(e) {
+  if (!shDomain || e.id !== shDomain.id) return;
+  shDomain.busy = false;
+  const fields = $("sh-domain").querySelector("[data-cf-form]");
+  if (fields) fields.disabled = false;
+  $("cf-error").textContent = e.error || ""; $("cf-status").textContent = "";
+  if (e.error) return;
+  const s = e.settings, routes = s.routes || [], custom = s.base_domain != null;
+  $("cf-body").innerHTML = `<form><fieldset data-cf-form>
+    <p>${tr("Use a domain in your Cloudflare account. Create one locally managed tunnel per share, then add its credentials file below.")}</p>
+    <label>${tr("Link type")}<select class="field" id="cf-mode"><option value="quick"${custom ? "" : " selected"}>${tr("Temporary links")}</option><option value="custom"${custom ? " selected" : ""}>${tr("Custom domain")}</option></select></label>
+    <p id="cf-quick-note">${tr("Saving temporary links removes Kiri's saved domain routes. Your credentials and Cloudflare resources are kept.")}</p>
+    <fieldset id="cf-named"><label>${tr("Base domain")}<input class="field" id="cf-base" required placeholder="example.com" value="${esc(s.base_domain || "")}" autocapitalize="none" spellcheck="false"></label>
+      <p>${tr("A share named web uses web.example.com. Use the container's name to share it from the app.")}</p>
+      <div id="cf-routes">${routes.map(shDomainRow).join("")}</div><button class="btn" type="button" data-cf-add>${tr("Add tunnel")}</button>
+      <p>${tr("Create credentials with cloudflared tunnel login, then cloudflared tunnel create NAME. Use its JSON file, not cert.pem or a tunnel token.")}</p>
+      <p>${tr("Nested subdomains may need an additional Cloudflare edge certificate.")}</p>
+    </fieldset><button class="btn primary" type="submit">${tr("Save sharing settings")}</button>
+    </fieldset></form>${custom && routes.length ? `<div class="cf-dns"><p>${tr("In Cloudflare DNS, create a proxied CNAME for each hostname:")}</p>${routes.map(r => `<code>${esc(r.hostname || "")} → ${esc(r.dns_target || "")}</code>`).join("")}</div>` : ""}`;
+  shDomainMode();
+  if (e.saved) { $("cf-status").textContent = tr("Saved. Settings apply to new shares. DNS records must be configured separately."); send("shares"); }
+  $("cf-mode").focus();
 }
 
 /* Signing in, when Share is pressed without an account: GitHub's device code. */
@@ -8692,6 +8793,7 @@ function shClicks(ev) {
   else if ((el = t("[data-kgoto]"))) { const k = kParse(el.dataset.kgoto); sh.open = null; show(k.kind === "service" ? "services" : "pods"); (k.kind === "service" ? openSvc : openPod)(`${k.ns}/${k.name}`); }
   else if ((el = t("[data-shcli]"))) shCard("list");
   else if (ui.view !== "share") return;
+  else if (t("[data-shdomain]")) shDomainOpen();
   else if ((el = t("[data-shbrowse]"))) send("sharebrowse", { name: el.dataset.shbrowse });
   else if ((el = t("[data-shkill]"))) shKill(el.dataset.shkill);
   else if ((el = t("[data-shext]"))) shStopExt(el.dataset.shext);
