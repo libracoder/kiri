@@ -1,0 +1,355 @@
+{
+  "date": "2026-11-12",
+  "hardware": "Apple M4 Max,128GiB",
+  "hostOS": "macOS15.8.2",
+  "tools": {
+    "hyperfine": "2.0.0",
+    "colima": "0.10.3",
+    "dockerColima": "29.5.2",
+    "compiler": "zig0.17.1 -target aarch64-linux-musl -static -O3"
+  },
+  "resources": {
+    "vcpus": 2,
+    "ceilingGiB": 8,
+    "mount": "virtiofs",
+    "network": "none",
+    "kiriDynamicBalloon": true,
+    "colimaFixedCeiling": true
+  },
+  "kernels": {
+    "kiri": "6.18.58",
+    "colima": "6.8.0-117-generic"
+  },
+  "source": {
+    "installedCommit": "496e7ed4a1c64cdb3162a7f747d7aedcf7f517bf",
+    "filesystemCommit": "6d60e28b145a218e5cb1ee7b8ca0fd6662fa8fc8",
+    "networkCommit": "8d6368bdcc2c1eca05f2ab696131b60eb20ceb83",
+    "sourceHash": "236e18f4bf680e7285d938c1f1322a57cf0c00401ce9a3559ea53c121f605f39",
+    "binaryHash": "55b8a5d60d89cb2e3c2ef0ea599cc75d6073277a77c948d5eae238f0f5d74f78",
+    "fixtureHash": "9acca8e8c22201155389f65abbf6bc9723edc7384ead80503839f49dcc56d767"
+  },
+  "imageConfig": "sha256:062964a69725bb96611dae2ac911a5a1ab3f8d32fe6f096f267d77f09e55a99c",
+  "method": {
+    "runsPerArm": 20,
+    "blocks": 2,
+    "order": "AB then BA; ten runs/arm/block, two warmups",
+    "warmHost": true,
+    "sequentialBytes": 536870912,
+    "guestCache": "seq-cold uses POSIX_FADV_DONTNEED for only the fixture",
+    "smallFiles": 4096,
+    "bytesPerSmallFile": 256,
+    "durableWrites": "64x4096 bytes; fdatasync each file, fsync directory",
+    "cpu": "20million xorshift iterations; end-to-end includes Dockerexec",
+    "imageIdentity": "Both exported configs and compressed layers byte-compared; engine display IDs use different config/manifest conventions",
+    "percentiles": "Nearest-rank ceil(p*n)-1; with20 samples p99 is the maximum"
+  },
+  "baseline": [
+    {
+      "mode": "metadata",
+      "arms": {
+        "kiri": {
+          "n": 20,
+          "medianMs": 20.492708,
+          "p95Ms": 21.742666,
+          "p99Ms": 21.918375,
+          "hostCpuMedianMs": 20.1545,
+          "clientPeakRssMiB": 43.671875
+        },
+        "colima": {
+          "n": 20,
+          "medianMs": 38.418479000000005,
+          "p95Ms": 41.572416000000004,
+          "p99Ms": 42.870208,
+          "hostCpuMedianMs": 20.706,
+          "clientPeakRssMiB": 43.59375
+        }
+      },
+      "ratio": 1.8747390047230459,
+      "bootstrap95": [
+        1.7719718448191817,
+        1.9392274452029203
+      ],
+      "limits": "20 samples/arm across AB then BA blocks; p99 is empirical maximum, not a stable production-tail estimate; bootstrap is exploratory under shared-host load"
+    },
+    {
+      "mode": "api",
+      "arms": {
+        "kiri": {
+          "n": 20,
+          "medianMs": 4.905792000000001,
+          "p95Ms": 5.42825,
+          "p99Ms": 5.520959,
+          "hostCpuMedianMs": 3.2005,
+          "clientPeakRssMiB": 5.8125
+        },
+        "colima": {
+          "n": 20,
+          "medianMs": 5.558312000000001,
+          "p95Ms": 6.571875,
+          "p99Ms": 6.8666670000000005,
+          "hostCpuMedianMs": 3.3539999999999996,
+          "clientPeakRssMiB": 6.140625
+        }
+      },
+      "ratio": 1.1330101235437622,
+      "bootstrap95": [
+        1.0486481935825276,
+        1.1950109100276936
+      ],
+      "limits": "20 samples/arm across AB then BA blocks; p99 is empirical maximum, not a stable production-tail estimate; bootstrap is exploratory under shared-host load"
+    },
+    {
+      "mode": "run",
+      "arms": {
+        "kiri": {
+          "n": 20,
+          "medianMs": 23.386250000000004,
+          "p95Ms": 32.753333000000005,
+          "p99Ms": 33.547042,
+          "hostCpuMedianMs": 22.198,
+          "clientPeakRssMiB": 44.890625
+        },
+        "colima": {
+          "n": 20,
+          "medianMs": 77.50095800000001,
+          "p95Ms": 83.9055,
+          "p99Ms": 91.972334,
+          "hostCpuMedianMs": 23.4015,
+          "clientPeakRssMiB": 44.484375
+        }
+      },
+      "ratio": 3.313954054198514,
+      "bootstrap95": [
+        2.9814567890225234,
+        3.614744024010149
+      ],
+      "limits": "20 samples/arm across AB then BA blocks; p99 is empirical maximum, not a stable production-tail estimate; bootstrap is exploratory under shared-host load"
+    },
+    {
+      "mode": "durable-write",
+      "arms": {
+        "kiri": {
+          "n": 20,
+          "medianMs": 36.533896,
+          "p95Ms": 48.014041,
+          "p99Ms": 54.83879100000001,
+          "hostCpuMedianMs": 20.8185,
+          "clientPeakRssMiB": 43.796875
+        },
+        "colima": {
+          "n": 20,
+          "medianMs": 48.2904995,
+          "p95Ms": 54.585792,
+          "p99Ms": 55.073958000000005,
+          "hostCpuMedianMs": 21.6115,
+          "clientPeakRssMiB": 43.875
+        }
+      },
+      "ratio": 1.3217998841404708,
+      "bootstrap95": [
+        1.2155075149234722,
+        1.3945455898969281
+      ],
+      "limits": "20 samples/arm across AB then BA blocks; p99 is empirical maximum, not a stable production-tail estimate; bootstrap is exploratory under shared-host load"
+    },
+    {
+      "mode": "exec",
+      "arms": {
+        "kiri": {
+          "n": 20,
+          "medianMs": 19.968833500000002,
+          "p95Ms": 21.034792,
+          "p99Ms": 21.308084,
+          "hostCpuMedianMs": 20.4605,
+          "clientPeakRssMiB": 43.734375
+        },
+        "colima": {
+          "n": 20,
+          "medianMs": 33.4796035,
+          "p95Ms": 37.71791700000001,
+          "p99Ms": 38.287542,
+          "hostCpuMedianMs": 21.2705,
+          "clientPeakRssMiB": 43.625
+        }
+      },
+      "ratio": 1.6765928515554,
+      "bootstrap95": [
+        1.6376469068804294,
+        1.7419319228144194
+      ],
+      "limits": "20 samples/arm across AB then BA blocks; p99 is empirical maximum, not a stable production-tail estimate; bootstrap is exploratory under shared-host load"
+    },
+    {
+      "mode": "seq-cold",
+      "arms": {
+        "kiri": {
+          "n": 20,
+          "medianMs": 109.4682705,
+          "p95Ms": 114.02754100000001,
+          "p99Ms": 118.868458,
+          "hostCpuMedianMs": 20.4825,
+          "clientPeakRssMiB": 43.609375
+        },
+        "colima": {
+          "n": 20,
+          "medianMs": 164.80125,
+          "p95Ms": 174.054709,
+          "p99Ms": 182.69291700000002,
+          "hostCpuMedianMs": 21.385499999999997,
+          "clientPeakRssMiB": 43.9375
+        }
+      },
+      "ratio": 1.5054704824262297,
+      "bootstrap95": [
+        1.379439686989194,
+        1.5380906416515767
+      ],
+      "limits": "20 samples/arm across AB then BA blocks; p99 is empirical maximum, not a stable production-tail estimate; bootstrap is exploratory under shared-host load"
+    },
+    {
+      "mode": "small-read",
+      "arms": {
+        "kiri": {
+          "n": 20,
+          "medianMs": 693.5617915,
+          "p95Ms": 1631.226667,
+          "p99Ms": 2232.295167,
+          "hostCpuMedianMs": 21.5775,
+          "clientPeakRssMiB": 43.734375
+        },
+        "colima": {
+          "n": 20,
+          "medianMs": 554.7113750000001,
+          "p95Ms": 648.417625,
+          "p99Ms": 727.441208,
+          "hostCpuMedianMs": 20.712500000000002,
+          "clientPeakRssMiB": 44.265625
+        }
+      },
+      "ratio": 0.7998009431867615,
+      "bootstrap95": [
+        0.5993498360124123,
+        0.8849260346191683
+      ],
+      "limits": "20 samples/arm across AB then BA blocks; p99 is empirical maximum, not a stable production-tail estimate; bootstrap is exploratory under shared-host load"
+    },
+    {
+      "mode": "seq-warm",
+      "arms": {
+        "kiri": {
+          "n": 20,
+          "medianMs": 110.615125,
+          "p95Ms": 121.93220900000001,
+          "p99Ms": 125.806583,
+          "hostCpuMedianMs": 20.2605,
+          "clientPeakRssMiB": 43.9375
+        },
+        "colima": {
+          "n": 20,
+          "medianMs": 159.1025205,
+          "p95Ms": 170.81183300000004,
+          "p99Ms": 170.817833,
+          "hostCpuMedianMs": 20.566000000000003,
+          "clientPeakRssMiB": 43.65625
+        }
+      },
+      "ratio": 1.438343269060176,
+      "bootstrap95": [
+        1.2575888436108895,
+        1.4850416212790614
+      ],
+      "limits": "20 samples/arm across AB then BA blocks; p99 is empirical maximum, not a stable production-tail estimate; bootstrap is exploratory under shared-host load"
+    },
+    {
+      "mode": "cpu",
+      "arms": {
+        "kiri": {
+          "n": 20,
+          "medianMs": 49.4575835,
+          "p95Ms": 53.924959,
+          "p99Ms": 86.15637500000001,
+          "hostCpuMedianMs": 20.078,
+          "clientPeakRssMiB": 43.734375
+        },
+        "colima": {
+          "n": 20,
+          "medianMs": 66.180104,
+          "p95Ms": 70.95066600000001,
+          "p99Ms": 72.161208,
+          "hostCpuMedianMs": 20.6005,
+          "clientPeakRssMiB": 43.65625
+        }
+      },
+      "ratio": 1.338118430311097,
+      "bootstrap95": [
+        1.30739683689849,
+        1.3709144154588533
+      ],
+      "limits": "20 samples/arm across AB then BA blocks; p99 is empirical maximum, not a stable production-tail estimate; bootstrap is exploratory under shared-host load"
+    }
+  ],
+  "layout": {
+    "arms": {
+      "kiri-bind": {
+        "n": 20,
+        "medianMs": 698.7170835000001,
+        "p95Ms": 816.4741250000001,
+        "p99Ms": 971.0762500000001,
+        "hostCpuMedianMs": 21.054499999999997,
+        "clientPeakRssMiB": 43.734375
+      },
+      "kiri-volume": {
+        "n": 20,
+        "medianMs": 22.427395500000003,
+        "p95Ms": 23.724084,
+        "p99Ms": 26.463625,
+        "hostCpuMedianMs": 19.803,
+        "clientPeakRssMiB": 44.046875
+      },
+      "colima-bind": {
+        "n": 20,
+        "medianMs": 603.8517915000001,
+        "p95Ms": 705.177709,
+        "p99Ms": 712.663166,
+        "hostCpuMedianMs": 19.469,
+        "clientPeakRssMiB": 43.765625
+      },
+      "colima-volume": {
+        "n": 20,
+        "medianMs": 41.1369795,
+        "p95Ms": 47.180458,
+        "p99Ms": 50.78775000000001,
+        "hostCpuMedianMs": 19.0275,
+        "clientPeakRssMiB": 43.65625
+      }
+    },
+    "kiriLayoutRatio": 31.15462441905035,
+    "sameVolumeLayoutColimaOverKiri": 1.834229012459338,
+    "scope": "Same 4096 immutable dependency files and identical reader. Named volumes are separate Linux storage, not coherent host binds; source files must remain in binds."
+  },
+  "trials": [
+    {
+      "id": "no-balloon",
+      "decision": "reject",
+      "reason": "Small-read gain below1%; 1.9-3.4% sequential difference does not justify disabling memory return"
+    },
+    {
+      "id": "readahead-4096",
+      "decision": "reject",
+      "reason": "Sequential read latency about29%worse"
+    },
+    {
+      "id": "readahead-512",
+      "decision": "reject",
+      "reason": "Sequential gain3-3.8% below predeclared5%adoption threshold; no small-file gain"
+    }
+  ],
+  "limits": [
+    "Synthetic local DockerCLI workloads, not application or model-quality benchmarks",
+    "Different guest kernels; no blanket engine ranking",
+    "Host cache warm; no cold-SSD claim",
+    "p99 from20 samples is an empirical maximum, not stable production p99",
+    "Exploratory bootstrap intervals under shared-host load",
+    "Dependency-volume results use immutable copies; they do not preserve host-bind change visibility"
+  ]
+}
