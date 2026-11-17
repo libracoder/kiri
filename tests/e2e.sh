@@ -632,6 +632,10 @@ $D network create --label team=a fnet >/dev/null
 t filter-network-label "fnet" $D network ls --filter label=team=a --format '{{.Name}}'
 t filter-network-type "fnet" $D network ls --filter type=custom --format '{{.Name}}'
 t filter-network-builtin "bridge" $D network ls --filter type=builtin --format '{{.Name}}'
+# A network's id filter is a regular expression, as in Docker: k3d finds its
+# cluster network with `^/?<id>$` together with its name.
+t filter-network-id-regex "fnet" bash -c "id=\$($D network inspect -f '{{.Id}}' fnet); $D network ls --filter \"id=^/?\$id\$\" --filter 'name=^/?fnet$' --format '{{.Name}}'"
+t filter-network-id-short "fnet" bash -c "$D network ls --filter id=\$($D network inspect -f '{{.Id}}' fnet | cut -c1-12) --format '{{.Name}}'"
 $D network rm fnet >/dev/null
 $D volume create --label team=a fvol >/dev/null
 $D volume create fvol2 >/dev/null

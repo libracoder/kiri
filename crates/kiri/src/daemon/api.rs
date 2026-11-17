@@ -2160,7 +2160,7 @@ fn network_json(engine: &Engine, n: &super::network::Network, with_members: bool
 fn network_matches(f: &Filters, engine: &Engine, n: &super::network::Network) -> bool {
     let labels = if n.labels.is_object() { n.labels.clone() } else { json!({}) };
     f.name(&n.name)
-        && f.any("id", |v| n.id.starts_with(v))
+        && f.network_id(&n.id)
         && f.any("driver", |v| v == n.driver)
         && f.labels(&labels)
         && f.any("scope", |v| v == "local")
