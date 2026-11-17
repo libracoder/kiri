@@ -10,10 +10,9 @@
 //! comes when the page switches to it: the page sends `langwords` and the
 //! host evaluates `lang::words_js`.
 //!
-//! The page is loaded as a string, and WebView2's NavigateToString takes at
-//! most 2 MB. With xterm.js and the keys it is about 1.4 M UTF-16 units, and
-//! a language adds its words: 40 to 60 K units. All of them would be well
-//! past the limit, which is why the page carries only one.
+//! The page was previously loaded via WebView2's NavigateToString, which takes at
+//! most 2 MB (in bytes). On Windows, kiri-win now maps the page via a virtual host
+//! mapping (https://kiri.ui) to accommodate the full page and locale bundle.
 
 const ICONS_JS: &str = include_str!("icons.js");
 /// The languages and the first start's language step, which both pages show.

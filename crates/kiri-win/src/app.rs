@@ -14,6 +14,7 @@ use std::sync::{Mutex, PoisonError};
 
 use webview2_com::Microsoft::Web::WebView2::Win32::{
     CreateCoreWebView2EnvironmentWithOptions, ICoreWebView2, ICoreWebView2Controller, ICoreWebView2Environment, ICoreWebView2NavigationStartingEventArgs, ICoreWebView2NewWindowRequestedEventArgs, ICoreWebView2WebMessageReceivedEventArgs,
+    ICoreWebView2_3, COREWEBVIEW2_HOST_RESOURCE_ACCESS_KIND_ALLOW,
 };
 use webview2_com::{
     AddScriptToExecuteOnDocumentCreatedCompletedHandler, CoTaskMemPWSTR, CreateCoreWebView2ControllerCompletedHandler,
@@ -58,6 +59,22 @@ pub fn in_setup() -> bool {
 
 fn page_html() -> String {
     if SETUP.load(Ordering::SeqCst) { crate::assemble::words(SETUP_PAGE, crate::engine::prefs()["lang"].as_str()) } else { crate::assemble::page(PAGE, crate::engine::prefs()["lang"].as_str()) }
+}
+
+/// The local directory mapped to `https://kiri.ui` for the window's pages.
+/// Avoids WebView2's NavigateToString 2 MB buffer limit.
+fn ui_dir() -> std::path::PathBuf {
+    std::env::var_os("LOCALAPPDATA")
+        .map(|d| std::path::PathBuf::from(d).join("Kiri").join("ui"))
+        .unwrap_or_else(|| std::env::temp_dir().join("kiri-ui"))
+}
+
+fn write_page() -> std::io::Result<()> {
+    let dir = ui_dir();
+    std::fs::create_dir_all(&dir)?;
+    let name = if in_setup() { "setup.html" } else { "index.html" };
+    std::fs::write(dir.join(name), page_html())?;
+    Ok(())
 }
 /// Kiri's icon cropped to its artwork for Windows (brand/windows-icons.ps1),
 /// by size: the Mac's has Apple's margin and looks small in the taskbar.
@@ -263,9 +280,9 @@ impl Ui {
         self.loaded = false;
         self.pending.clear();
         if let Some(w) = &self.webview {
-            let page = CoTaskMemPWSTR::from(page_html().as_str());
+            let _ = write_page();
             // SAFETY: a live webview, on its own thread.
-            let _ = unsafe { w.NavigateToString(*page.as_ref().as_pcwstr()) };
+            let _ = unsafe { w.Navigate(w!("https://kiri.ui/index.html")) };
         }
     }
 
@@ -613,7 +630,7 @@ fn webview_ready(hwnd: HWND, ctl: ICoreWebView2Controller) -> windows::core::Res
                     let mut uri = PWSTR::null();
                     let ours = a.Uri(&mut uri).is_ok() && {
                         let u = CoTaskMemPWSTR::from(uri).to_string();
-                        u.is_empty() || u.starts_with("about:") || u.starts_with("data:")
+                        u.is_empty() || u.starts_with("https://kiri.ui/") || u.starts_with("about:") || u.starts_with("data:")
                     };
                     if !ours {
                         let _ = a.SetCancel(true);
@@ -637,9 +654,13 @@ fn webview_ready(hwnd: HWND, ctl: ICoreWebView2Controller) -> windows::core::Res
         )?;
         let shim = CoTaskMemPWSTR::from(SHIM);
         wv.AddScriptToExecuteOnDocumentCreated(*shim.as_ref().as_pcwstr(), &AddScriptToExecuteOnDocumentCreatedCompletedHandler::create(Box::new(|_, _| Ok(()))))?;
-        let page = page_html();
-        let page = CoTaskMemPWSTR::from(page.as_str());
-        wv.NavigateToString(*page.as_ref().as_pcwstr())?;
+        let _ = write_page();
+        if let Ok(w3) = wv.cast::<ICoreWebView2_3>() {
+            let path = HSTRING::from(ui_dir().as_os_str());
+            let _ = w3.SetVirtualHostNameToFolderMapping(w!("kiri.ui"), &path, COREWEBVIEW2_HOST_RESOURCE_ACCESS_KIND_ALLOW);
+        }
+        let url = if in_setup() { w!("https://kiri.ui/setup.html") } else { w!("https://kiri.ui/index.html") };
+        wv.Navigate(url)?;
         let theme = crate::engine::prefs()["theme"].as_str().unwrap_or("").to_owned();
         with_ui(|ui| {
             ui.controller = Some(ctl.clone());
