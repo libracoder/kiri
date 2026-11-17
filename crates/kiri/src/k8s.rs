@@ -194,6 +194,10 @@ fn ok(r: io::Result<client::Response>) -> io::Result<client::Response> {
 pub fn run(args: &[String]) -> io::Result<()> {
     let what = args.first().map(String::as_str).unwrap_or("");
     let logged = matches!(what, "start" | "stop" | "delete" | "set");
+    // A recreate from the command line (`kiri k8s set`) is attributed to this
+    // op, so the node's stop is logged as `k8s set`, not as a memory kill. A
+    // child the window started already has its own op (KIRI_OP).
+    let _op = (logged && crate::diag::op().is_none()).then(|| crate::diag::enter_op(crate::diag::new_op(&format!("k8s{what}"))));
     if logged {
         crate::diag::info!(format!("Kubernetes {what}"));
     }
