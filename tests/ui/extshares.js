@@ -194,13 +194,18 @@ t("an unchanged list doesn't redraw", () => {
   list([WEB, FLOWER, API]);
   eq(document.querySelector("#content table") === before, true, "same table");
 });
-t("an edge without the list: own shares only, and no more asking", () => {
+t("an edge without the list stops remote polling but keeps local discovery", () => {
+  show("share"); sh.open = null; list([]); renderShare();
+  eq(text($("content")).includes("This lists every link on your account"), true, "remote inventory supported initially");
   kiri.on({ type: "sharetunnels", unsupported: true });
-  eq([sh.remoteOff, sh.poll, sh.remote], [true, 0, null], "stopped");
+  eq([sh.remoteOff, !!sh.poll, sh.remote.items], [true, true, []], "only remote discovery stopped");
   renderStatus();
   eq(text(document.querySelector("[data-shstatus]")), "1 shared", "own only");
+  eq(!!document.querySelector("#content .err"), false, "unsupported is not an error");
+  eq(text($("content")).includes("This lists every link on your account"), false, "no complete-account claim");
   sent.length = 0; shPoll();
-  eq(sent.filter((x) => x.type === "sharetunnels").length, 0, "doesn't ask");
+  eq(sent.filter((x) => x.type === "sharetunnels").length, 0, "doesn't ask the edge again");
+  eq(sent.filter((x) => x.type === "sharelocaltunnels").length, 1, "still discovers local tunnels");
   sh.remoteOff = false; shPolling();
 });
 t("signing out forgets account tunnels but keeps polling local links", () => {

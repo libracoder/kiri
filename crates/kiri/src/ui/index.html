@@ -7933,23 +7933,24 @@ const shExtTag = { toString: () => `<span class="ext-tag">${tr("External")}</spa
 
 const shCloudflare = () => sh.account?.provider === "cloudflare";
 const shAvailable = () => shCloudflare() || !!sh.account?.signedIn;
-function shPoll() { if (!sh.remoteOff) send("sharetunnels"); }
+function shPoll() { send(sh.remoteOff ? "sharelocaltunnels" : "sharetunnels"); }
 /* Local Cloudflare links remain discoverable without a Kiri Cloud sign-in. */
 function shPolling() {
-  const on = !!sh.account && !sh.remoteOff;
+  const on = !!sh.account;
   if (on && !sh.poll) { sh.poll = setInterval(shPoll, SH_POLL); shPoll(); }
   else if (!on && sh.poll) { clearInterval(sh.poll); sh.poll = 0; }
 }
 /* The list arrived. Returns whether anything shown changed. */
 function shRemote(e) {
-  const was = JSON.stringify(sh.remote);
-  if (e.unsupported) { sh.remoteOff = true; sh.remote = null; shPolling(); }
-  else if (!e.error) {
-    sh.remote = { items: e.items || [], limit: e.limit ?? null, warning: e.warning || null };
+  const was = JSON.stringify([sh.remote, sh.remoteOff]);
+  if (!e.error) {
+    sh.remoteOff = !!e.unsupported;
+    // A poll started before a provider switch may carry a stale Kiri warning.
+    sh.remote = { items: e.items || [], limit: e.limit ?? null, warning: shCloudflare() ? null : e.warning || null };
     for (const n of sh.stopping) if (!sh.remote.items.some((x) => x.name === n)) sh.stopping.delete(n);
   }
   if (sh.cap) shCapToast();
-  return JSON.stringify(sh.remote) !== was;
+  return JSON.stringify([sh.remote, sh.remoteOff]) !== was;
 }
 /* `kiri share` on this computer sharing one of this container's published ports, or the container by name. */
 function shCliFor(c, name) {
@@ -8050,7 +8051,7 @@ function shStopExt(name) {
 function shEvent(e) {
   let remote = false;
   if (e.type === "shareaccount") {
-    if (sh.account?.provider !== e.provider || sh.account?.signedIn !== e.signedIn || sh.account?.session !== e.session) { sh.remoteOff = false; sh.remote = null; sh.usage = null; }
+    if (sh.account?.provider !== e.provider || sh.account?.signedIn !== e.signedIn || sh.account?.session !== e.session || sh.account?.server !== e.server) { sh.remoteOff = false; sh.remote = null; sh.usage = null; }
     sh.account = e;
     shPolling();
     if (shAvailable()) {

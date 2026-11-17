@@ -358,7 +358,7 @@ pub fn close_all() {
                 emit(super::notice("error", &super::trf("Couldn't stop {name}: {error}", &[("name", &t.name), ("error", &e)])));
             }
         }
-        tunnels();
+        tunnels(true);
         list();
     });
 }
@@ -375,13 +375,16 @@ pub fn browse(id: u64) {
 /// for while one was on its way, so a change just made shows.
 static POLLING: AtomicBool = AtomicBool::new(false);
 static AGAIN: AtomicBool = AtomicBool::new(false);
+/// The latest queued poll decides whether to query the remote edge.
+static INCLUDE_EDGE: AtomicBool = AtomicBool::new(true);
 /// The last list's links by tunnel name, the only ones `browse_tunnel` opens.
 static LISTED: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
 
-/// Every live tunnel on the account, whichever computer runs it, as
+/// Live links, optionally including the account's remote edge, as
 /// `{"type":"sharetunnels", "items", "limit"}`. Each item says where it
 /// runs (see [`tagged`]); the page colours it by that.
-pub fn tunnels() {
+pub fn tunnels(include_edge: bool) {
+    INCLUDE_EDGE.store(include_edge, Ordering::SeqCst);
     AGAIN.store(true, Ordering::SeqCst);
     if POLLING.swap(true, Ordering::SeqCst) {
         return;
@@ -389,7 +392,8 @@ pub fn tunnels() {
     std::thread::spawn(|| {
         loop {
             AGAIN.store(false, Ordering::SeqCst);
-            emit(tunnels_event(share::tunnels()).to_string());
+            let result = if INCLUDE_EDGE.load(Ordering::SeqCst) { share::tunnels() } else { share::local_tunnels() };
+            emit(tunnels_event(result).to_string());
             POLLING.store(false, Ordering::SeqCst);
             if !AGAIN.load(Ordering::SeqCst) || POLLING.swap(true, Ordering::SeqCst) {
                 break;
@@ -413,13 +417,15 @@ fn tunnels_event(r: std::io::Result<share::LiveTunnels>) -> Value {
             let device = share::load().map(|c| c.device).unwrap_or_default();
             let machine = share::machine_id(&device);
             let own: Vec<String> = with_links(|m| m.values().filter_map(|l| l.url.clone()).collect());
-            let items: Vec<Value> = list.items.iter().map(|t| tagged(t, &machine, &device, &own)).collect();
-            json!({"type": "sharetunnels", "items": items, "limit": list.limit, "warning": list.warning})
+            tunnels_payload(&list, &machine, &device, &own)
         }
-        // An edge from before the list: the page shows its own shares only.
-        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => json!({"type": "sharetunnels", "unsupported": true}),
         Err(e) => json!({"type": "sharetunnels", "error": e.to_string()}),
     }
+}
+
+fn tunnels_payload(list: &share::LiveTunnels, machine: &str, device: &str, own: &[String]) -> Value {
+    let items: Vec<Value> = list.items.iter().map(|t| tagged(t, machine, device, own)).collect();
+    json!({"type": "sharetunnels", "items": items, "limit": list.limit, "unsupported": list.unsupported, "warning": list.warning})
 }
 
 /// A tunnel as the page shows it. `mine`: one of this window's links.
@@ -463,7 +469,7 @@ pub fn stop_tunnel(name: String) {
         if let Err(e) = share::close_tunnel(&name) {
             emit(super::notice("error", &super::trf("Couldn't stop {name}: {error}", &[("name", &name), ("error", &e)])));
         }
-        tunnels();
+        tunnels(true);
     });
 }
 
@@ -555,8 +561,14 @@ mod tests {
 
     #[test]
     fn an_edge_without_the_list_says_so() {
-        let v = tunnels_event(Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "no")));
+        let local = t("https://web.example.com", "mac1", "dev1", "cli", "kiri");
+        let list = share::LiveTunnels { items: vec![local], unsupported: true, ..Default::default() };
+        let v = tunnels_payload(&list, "mac1", "dev1", &[]);
         assert_eq!(v["unsupported"], true);
+        assert_eq!(v["items"][0]["url"], "https://web.example.com");
+        assert_eq!(v["items"][0]["where"], "here");
+        assert!(v["warning"].is_null());
+        assert!(v["error"].is_null());
         let v = tunnels_event(Err(std::io::Error::other("offline")));
         assert_eq!(v["error"], "offline");
     }

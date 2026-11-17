@@ -197,8 +197,12 @@ config directory, and its Stop action closes those shares on this computer.
 Switching providers only changes new shares. Existing links from either
 provider remain listed and can be stopped; Cloudflare IDs in the list use
 a `cloudflare:` prefix. Local Cloudflare links remain available even when
-signed out of Kiri Cloud or when its API fails; a partial list reports a
-warning. Other computers' Cloudflare tunnels are not listed. Cloudflare's
+signed out of Kiri Cloud or when its API fails. With Cloudflare selected,
+an expired Kiri login or an unreachable Kiri edge does not produce an error;
+reachable Kiri links are still included for cleanup. With Kiri selected,
+authentication and network failures report a warning. Older edges without
+tunnel discovery disable remote polling without an error, while local
+Cloudflare discovery continues. Other computers' Cloudflare tunnels are not listed. Cloudflare's
 own reconnect logic handles transient network failures; Kiri observes its readiness endpoint. Startup times out
 after 90 seconds. No background tunnel is installed as a system service.
 Terminal Ctrl+C closes the tunnel and removes its private runtime directory.

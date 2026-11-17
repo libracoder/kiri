@@ -1019,7 +1019,7 @@ pub fn on_message(msg: &str) {
         "shareconfig" => sharing::cloudflare_settings(c.id, (!c.value.is_null()).then_some(c.value)),
         "sharecloudflare" => sharing::cloudflare_setup(c.id, c.action, c.value),
         // The account's live tunnels from every computer, and closing one this window didn't open.
-        "sharetunnels" => sharing::tunnels(),
+        "sharetunnels" | "sharelocaltunnels" => sharing::tunnels(c.cmd == "sharetunnels"),
         "sharetraffic" => sharing::traffic(),
         "usage" => {
             std::thread::spawn(|| emit(usage::event()));

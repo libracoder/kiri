@@ -132,10 +132,20 @@ def main():
         class Edge(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
                 edge_tokens.append(self.headers.get("Authorization"))
+                if edge_status is None:
+                    self.close_connection = True
+                    return
                 self.send_response(edge_status)
                 self.end_headers()
                 self.wfile.write(json.dumps({"items": edge_items, "limit": 3}).encode())
             def do_DELETE(self):
+                # Consume the host metadata before closing the TLS connection;
+                # unread request bytes can make the socket close with a reset.
+                self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                if edge_status == 401:
+                    self.send_response(401)
+                    self.end_headers()
+                    return
                 name = self.path.rsplit("/", 1)[-1]
                 edge_items[:] = [item for item in edge_items if item["name"] != name]
                 self.send_response(204)
@@ -216,6 +226,27 @@ def main():
             edge_status = 401
             entries = json.loads(cli("list", "--json").stdout)
             assert len(entries["items"]) == 1 and entries["warning"]
+            for provider in ("kiri", "cloudflare"):
+                cli("provider", provider)
+                for status in (404, 401, 503, None):
+                    edge_status = status
+                    before_requests = len(edge_tokens)
+                    result = cli("list", "--json")
+                    entries = json.loads(result.stdout)
+                    assert len(edge_tokens) > before_requests, "existing Kiri links must still be queried"
+                    assert [e["name"] for e in entries["items"]] == [cloudflare_id]
+                    assert entries["unsupported"] == (status == 404)
+                    assert bool(entries["warning"]) == (provider == "kiri" and status != 404), (provider, status, entries)
+                    if provider == "cloudflare" or status == 404:
+                        assert not result.stderr and "run `kiri share login`" not in result.stdout
+                        assert not cli("list").stderr, "background failures must not become CLI warnings"
+                    if provider == "cloudflare" and status == 401:
+                        stopped = cli("stop", "expired-edge-link", ok=False)
+                        assert stopped.returncode != 0
+                        assert "switch to Kiri Cloud" in stopped.stderr
+                        assert "run `kiri share login`" not in stopped.stderr
+            print("PASS unsupported edges stay silent; stale logins and network failures do not interrupt Cloudflare")
+            cli("provider", "kiri")
             env.pop("KIRI_SHARE_TOKEN")
             assert len(json.loads(cli("list", "--json").stdout)["items"]) == 1
             cli("stop", cloudflare_id)

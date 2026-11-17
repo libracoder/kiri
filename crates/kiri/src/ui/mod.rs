@@ -1667,8 +1667,8 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
             sharing::traffic();
             Ok(())
         }
-        "sharetunnels" => {
-            sharing::tunnels();
+        "sharetunnels" | "sharelocaltunnels" => {
+            sharing::tunnels(msg.cmd == "sharetunnels");
             Ok(())
         }
         "sharestop" => {

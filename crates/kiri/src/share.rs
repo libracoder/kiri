@@ -576,7 +576,12 @@ fn signed_in_with(cfg: &Config, method: &str, path: &str, body: Option<&Value>) 
     let token = cfg.token.as_deref().ok_or_else(|| io::Error::other("not signed in; run `kiri share login`"))?;
     let (status, v) = api(&server(cfg), method, path, body, Some(token))?;
     if status == 401 {
-        return Err(io::Error::other("your sign-in is no longer valid; run `kiri share login`"));
+        let message = if cfg.provider == Provider::Kiri {
+            "your sign-in is no longer valid; run `kiri share login`"
+        } else {
+            "your Kiri Cloud sign-in is no longer valid; switch to Kiri Cloud to sign in again"
+        };
+        return Err(io::Error::other(message));
     }
     Ok((status, v))
 }
@@ -684,6 +689,8 @@ pub struct LiveTunnel {
 pub struct LiveTunnels {
     pub items: Vec<LiveTunnel>,
     pub limit: Option<u64>,
+    /// The Kiri Cloud edge does not support remote tunnel discovery.
+    pub unsupported: bool,
     /// A provider could not be queried; the other provider's links remain manageable.
     pub warning: Option<String>,
 }
@@ -715,11 +722,21 @@ pub fn tunnels() -> io::Result<LiveTunnels> {
                 list.items.extend(v["items"].as_array().into_iter().flatten().map(live_tunnel));
                 list.limit = v["limit"].as_u64();
             }
-            Ok((404, _)) => list.warning = Some("this Kiri Cloud can't list tunnels".into()),
-            Ok((status, v)) => list.warning = Some(api_error(&v, status).to_string()),
-            Err(e) => list.warning = Some(e.to_string()),
+            Ok((404, _)) => list.unsupported = true,
+            Ok((status, v)) if cfg.provider == Provider::Kiri => list.warning = Some(api_error(&v, status).to_string()),
+            Err(e) if cfg.provider == Provider::Kiri => list.warning = Some(e.to_string()),
+            // A previous Kiri login must not interrupt Cloudflare sharing.
+            // Still attempt discovery above so any reachable Kiri links can be stopped.
+            _ => {}
         }
     }
+    Ok(list)
+}
+
+/// Keep discovering local links after an older edge disables remote polling.
+pub fn local_tunnels() -> io::Result<LiveTunnels> {
+    let mut list = cloudflare::tunnels()?;
+    list.unsupported = true;
     Ok(list)
 }
 
@@ -1952,7 +1969,7 @@ pub fn run(args: &[String]) -> io::Result<()> {
         Some("list") => {
             let list = tunnels()?;
             if args.iter().any(|a| a == "--json") {
-                println!("{}", json!({"items": list.items, "limit": list.limit, "warning": list.warning}));
+                println!("{}", json!({"items": list.items, "limit": list.limit, "unsupported": list.unsupported, "warning": list.warning}));
             } else {
                 if let Some(warning) = list.warning { eprintln!("Kiri Cloud: {warning}"); }
                 for t in list.items { println!("{}  {}  {}", t.name, t.url, t.target); }
