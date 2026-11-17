@@ -785,7 +785,7 @@ fn app(root: &Path, arch: Arch, lite: bool) -> io::Result<PathBuf> {
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>{plain}</string>
   <key>CFBundleVersion</key><string>{plain}</string>
-  <key>LSMinimumSystemVersion</key><string>14.0</string>
+  <key>LSMinimumSystemVersion</key><string>12.0</string>
   <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSLocalNetworkUsageDescription</key><string>Kiri lets containers reach devices and services on your network, and serves the ports they publish.</string>
