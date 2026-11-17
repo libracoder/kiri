@@ -408,6 +408,8 @@ t ipv6-pool-ula " fd" $D network inspect v6net -f '{{range .IPAM.Config}} {{.Sub
 # A chosen subnet and gateway, as kind and Compose's ipam ask.
 t ipv6-subnet "fd00:db8:7::/64 fd00:db8:7::fe" bash -c "$D network create --ipv6 --subnet fd00:db8:7::/64 --gateway fd00:db8:7::fe v6sub >/dev/null && $D network inspect v6sub -f '{{range .IPAM.Config}}{{.Subnet}} {{.Gateway}} {{end}}'"
 t ipv6-overlap "Pool overlaps" $D network create --ipv6 --subnet fd00:db8:7::/80 v6dup
+# An IPv6 subnet without --ipv6 is ignored, as Docker does (#433).
+t ipv6-subnet-off "false" bash -c "$D network create --subnet 10.234.0.0/24 --subnet fd00:db8:8::/64 v6off >/dev/null && $D network inspect v6off -f '{{.EnableIPv6}}'; $D network rm v6off >/dev/null"
 # IPv6-only (--ipv4=false), as Docker 28 has: no IPv4 address on eth0.
 t ipv6-only-create "false" bash -c "$D network create --ipv6 --ipv4=false v6only >/dev/null && $D network inspect v6only -f '{{.EnableIPv4}}'"
 t ipv6-only-no-v4 "inet6 0" $D run --rm --network v6only alpine sh -c 'echo $(ip -6 addr show eth0 scope global | grep -o inet6 | head -1) $(ip -4 addr show eth0 | grep -c inet)'
