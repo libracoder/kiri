@@ -50,9 +50,10 @@ pub fn serve(stream: UnixStream, engine: Arc<Engine>) -> io::Result<()> {
     Ok(())
 }
 
-/// Requests whose bodies can be any size: archives and image tarballs.
+/// Requests whose bodies can be any size: archives and image tarballs
+/// (`/images/create` is `docker import`'s, a pull sends none).
 fn streams_body(method: &str, path: &str) -> bool {
-    matches!((method, path), ("PUT", p) if p.starts_with("/containers/") && p.ends_with("/archive")) || (method == "POST" && (path == "/images/load" || path == "/build"))
+    matches!((method, path), ("PUT", p) if p.starts_with("/containers/") && p.ends_with("/archive")) || (method == "POST" && matches!(path, "/images/load" | "/images/create" | "/build"))
 }
 
 pub(super) enum Next {
@@ -183,6 +184,7 @@ fn route(req: &Request, engine: &Arc<Engine>, w: &mut UnixStream, r: &mut BufRea
         ("GET", "/kiri/builder") => return reply(w, Ok(super::builder::settings_report(engine)), 200),
         ("POST", "/kiri/builder") => return reply(w, super::builder::set_settings(req).map(|()| super::builder::settings_report(engine)), 200),
         ("GET", "/images/json") => return reply(w, images(req, engine), 200),
+        ("POST", "/images/create") if req.query("fromSrc").is_some_and(|s| !s.is_empty()) => return image_import(req, engine, w, r),
         ("POST", "/images/create") => return pull(req, engine, w),
         ("POST", "/images/load") => return image_load(req, engine, w, r),
         ("GET", "/images/get") => {
@@ -577,6 +579,111 @@ fn image_load(req: &Request, engine: &Engine, w: &mut UnixStream, r: &mut BufRea
     }
     // A load may leave part of the body unread (padding after the archive's end).
     Ok(Next::Close)
+}
+
+/// `docker import`: a root filesystem tarball, the body (`fromSrc=-`) or a
+/// URL, plain or gzip, becomes a one-layer image as Docker makes it.
+fn image_import(req: &Request, engine: &Engine, w: &mut UnixStream, r: &mut BufReader<UnixStream>) -> io::Result<Next> {
+    let mut body = http::Body::new(req, r);
+    match import(req, engine, &mut body) {
+        Ok(id) => {
+            http::begin_stream_with(w, 200, "application/json", http::CLOSE)?;
+            http::chunk(w, format!("{}\n", json!({"status": id})).as_bytes())?;
+            http::end(w)?;
+        }
+        Err(e) => {
+            // The CLI is still sending the archive: read it out, or it gets
+            // a broken pipe instead of the message.
+            let _ = io::copy(&mut body, &mut io::sink());
+            error_closing(w, e)?;
+        }
+    }
+    Ok(Next::Close)
+}
+
+fn import(req: &Request, engine: &Engine, stdin: &mut dyn io::Read) -> Result<String, Error> {
+    use std::io::Read;
+    let name = import_name(req.query("repo").unwrap_or_default(), req.query("tag").unwrap_or_default())?;
+    let platform = match req.query("platform").filter(|p| !p.is_empty()) {
+        Some(p) => Platform::parse(p).ok_or_else(|| Error::BadRequest(format!("invalid platform: {p}")))?,
+        None => Platform::host_linux(),
+    };
+    let src = req.query("fromSrc").unwrap_or_default();
+    let now = time::rfc3339(std::time::SystemTime::now());
+    let comment = req.query("message").filter(|m| !m.is_empty()).map_or_else(|| format!("Imported from {src}"), str::to_owned);
+    let mut cfg = json!({
+        "architecture": platform.architecture,
+        "os": platform.os,
+        "created": now,
+        "config": {},
+        "rootfs": {"type": "layers", "diff_ids": []},
+        "history": [{"created": now, "comment": comment}],
+    });
+    // Checked before the body is read, so a bad change costs no upload.
+    for change in req.queries("changes") {
+        for line in change.lines().filter(|l| !l.trim().is_empty()) {
+            super::ops::apply_change(&mut cfg, line)?;
+        }
+    }
+    let mut body: Box<dyn Read + '_> = if src == "-" {
+        Box::new(stdin)
+    } else {
+        // Docker takes `host/path` as http.
+        let url = if src.contains("://") { src.to_owned() } else { format!("http://{src}") };
+        let resp = crate::tools::agent().get(&url).call().map_err(|e| Error::BadRequest(format!("{url}: {e}")))?;
+        Box::new(resp.into_body().into_reader())
+    };
+    let mut head = Vec::with_capacity(6);
+    (&mut body).take(6).read_to_end(&mut head)?;
+    let gzip = upload_compression(&head) == Upload::Gzip;
+    let mut tar = upload_reader(head, body)?;
+    let mut block = Vec::with_capacity(512);
+    (&mut tar).take(512).read_to_end(&mut block).map_err(|e| upload_error(gzip, e))?;
+    if !tar_header(&block) {
+        return Err(Error::BadRequest("the archive isn't a tar archive (plain or gzip)".into()));
+    }
+    // An uncompressed layer: its digest is its diff id.
+    let mut layer = engine.store.ingest()?;
+    io::copy(&mut io::Cursor::new(block).chain(tar), &mut layer).map_err(|e| upload_error(gzip, e))?;
+    let (digest, size) = layer.finish()?;
+    cfg["rootfs"]["diff_ids"] = json!([digest]);
+    let bytes = serde_json::to_vec(&cfg).map_err(|e| Error::Io(io::Error::other(e)))?;
+    let mut w = engine.store.ingest()?;
+    io::Write::write_all(&mut w, &bytes)?;
+    let (config_digest, _) = w.finish()?;
+    let layers = vec![kiri_image::Layer { digest, size, media_type: "application/vnd.oci.image.layer.v1.tar".into() }];
+    let name = name.unwrap_or_else(|| config_digest.clone());
+    engine.store.put_image(kiri_image::archive::from_config(name.clone(), &config_digest, &cfg, layers))?;
+    engine.emit_image("import", &config_digest, &name);
+    Ok(config_digest)
+}
+
+/// The name `docker import` gives its image. The CLI sends the tag in
+/// `repo` (`repo=my/rootfs:1`, no `tag`); no `repo` is an untagged image.
+fn import_name(repo: &str, tag: &str) -> Result<Option<String>, Error> {
+    if repo.is_empty() {
+        return Ok(None);
+    }
+    let name = if tag.is_empty() { repo.to_owned() } else { format!("{repo}:{tag}") };
+    if name.contains('@') {
+        return Err(Error::BadRequest(format!("cannot import digest reference: {name}")));
+    }
+    Reference::parse(&name).map(|r| Some(r.short())).map_err(|e| Error::BadRequest(format!("invalid reference format: {e}")))
+}
+
+/// Whether `block` begins a tar archive: a header whose checksum adds up,
+/// or the zero block that ends an empty archive.
+fn tar_header(block: &[u8]) -> bool {
+    if block.len() < 512 {
+        return false;
+    }
+    if block.iter().all(|&b| b == 0) {
+        return true;
+    }
+    let want = std::str::from_utf8(&block[148..156]).ok().and_then(|s| u32::from_str_radix(s.trim_matches([' ', '\0']), 8).ok());
+    // The checksum is taken with its own field as spaces.
+    let sum: u32 = block[..512].iter().enumerate().map(|(i, &b)| if (148..156).contains(&i) { 32 } else { u32::from(b) }).sum();
+    want == Some(sum)
 }
 
 /// `docker save`: the named images as one archive.
@@ -2815,6 +2922,38 @@ mod tests {
         assert_eq!(command(Some(s(&["sh"])), Some(s(&["-c", "x"])), &ie, &ic), (s(&["sh"]), s(&["-c", "x"])));
         // "Entrypoint": [] clears the image's and keeps its Cmd.
         assert_eq!(command(Some(vec![]), None, &ie, &ic), (vec![], ic.clone()));
+    }
+
+    // #461: the CLI sends `docker import - my/rootfs:1` as `repo=my/rootfs:1`.
+    #[test]
+    fn import_names_take_the_tag_from_repo_or_tag() {
+        let name = |repo, tag| import_name(repo, tag).ok().flatten();
+        assert_eq!(name("my/rootfs:1", ""), Some("my/rootfs:1".into()));
+        assert_eq!(name("my/rootfs", "1"), Some("my/rootfs:1".into()));
+        assert_eq!(name("rootfs", ""), Some("rootfs:latest".into()));
+        assert_eq!(name("", ""), None);
+        for bad in ["My/Rootfs", "my/rootfs@sha256:0000000000000000000000000000000000000000000000000000000000000000", "a b"] {
+            assert!(matches!(import_name(bad, ""), Err(Error::BadRequest(_))), "{bad}");
+        }
+    }
+
+    #[test]
+    fn import_takes_only_tar_archives() {
+        let mut b = tar::Builder::new(Vec::new());
+        let mut h = tar::Header::new_ustar();
+        h.set_path("etc/hostname").unwrap();
+        h.set_size(4);
+        h.set_cksum();
+        b.append(&h, &b"kiri"[..]).unwrap();
+        let archive = b.into_inner().unwrap();
+        assert!(tar_header(&archive[..512]));
+        // An empty archive is its end blocks.
+        assert!(tar_header(&[0; 512]));
+        let mut broken = archive[..512].to_vec();
+        broken[0] ^= 1;
+        assert!(!tar_header(&broken));
+        assert!(!tar_header(b"not a tar archive"));
+        assert!(!tar_header(&[b'x'; 512]));
     }
 
     #[test]

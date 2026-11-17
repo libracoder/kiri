@@ -804,6 +804,16 @@ t diff-deleted "D /etc/motd" $D diff ren2
 t diff-changed "C /etc/profile" $D diff ren2
 t export "bin/busybox" bash -c "$D export ren2 | tar -t | grep -x bin/busybox"
 t export-has-change "added" bash -c "$D export ren2 | tar -t | grep -x added"
+# docker import (#461): the export back as a one-layer image, plain or gzip.
+t import "sha256:" bash -c "$D export ren2 | $D import -c 'CMD [\"cat\",\"/added\"]' -c 'ENV KIRI=1' -m 'from ren2' - kiri-test/imported:1"
+t import-runs "hi" $D run --rm kiri-test/imported:1
+t import-env "KIRI=1" $D run --rm kiri-test/imported:1 env
+t import-history "from ren2" $D history kiri-test/imported:1
+t import-gzip "hi" bash -c "$D export ren2 | gzip | $D import - kiri-test/imported:2 >/dev/null && $D run --rm kiri-test/imported:2 cat /added"
+t import-platform "linux/amd64" bash -c "$D export ren2 | $D import --platform linux/amd64 - kiri-test/imported:3 >/dev/null && $D image inspect -f '{{.Os}}/{{.Architecture}}' kiri-test/imported:3"
+t import-not-tar "isn't a tar archive" bash -c "echo nope | $D import - kiri-test/imported:4"
+t import-bad-change "not a valid change command" bash -c "$D export ren2 | $D import -c 'FROM alpine' - kiri-test/imported:4"
+$D rmi kiri-test/imported:1 kiri-test/imported:2 kiri-test/imported:3 >/dev/null 2>&1
 t commit "sha256:" $D commit -c 'CMD ["cat","/added"]' -c 'ENV KIRI=1' ren2 kiri-test/committed:1
 t commit-runs "hi" $D run --rm kiri-test/committed:1
 t commit-env "KIRI=1" $D run --rm kiri-test/committed:1 env

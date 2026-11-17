@@ -209,7 +209,7 @@ fn export(engine: &Engine, key: &str, w: &mut UnixStream) -> io::Result<Next> {
 }
 
 /// Applies one `--change` line (a Dockerfile instruction) to a config.
-fn apply_change(cfg: &mut Value, line: &str) -> Result<(), Error> {
+pub(super) fn apply_change(cfg: &mut Value, line: &str) -> Result<(), Error> {
     let (instr, arg) = line.trim().split_once(char::is_whitespace).unwrap_or((line.trim(), ""));
     let arg = arg.trim();
     // JSON form, or shell form run by /bin/sh -c.
