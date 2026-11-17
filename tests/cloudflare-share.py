@@ -4,6 +4,8 @@
 python3 tests/cloudflare-share.py target/debug/kiri
 """
 import json
+import http.server
+import ssl
 import os
 from pathlib import Path
 import queue
@@ -84,7 +86,7 @@ def alive(pid):
 class Share:
     def __init__(self, env, *args):
         self.process = subprocess.Popen([BINARY, "share", "3000", *args, "--json"], env=env,
-                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
         self.events = queue.Queue()
         self.seen = []
 
@@ -120,6 +122,31 @@ def main():
         config = root / "share.json"
         env = {**os.environ, "KIRI_SHARE_CONFIG": str(config), "KIRI_CF_TEST": temp,
                "TUNNEL_TOKEN": "unrelated-token-must-be-removed", "TUNNEL_FORCE_PROVISIONING_DNS": "true"}
+        # A local TLS edge exercises Kiri management without contacting Kiri Cloud.
+        cert, key = root / "edge.pem", root / "edge.key"
+        openssl_config = root / "openssl.cnf"
+        openssl_config.write_text("[req]\ndistinguished_name=dn\nx509_extensions=ext\n[dn]\n[ext]\nsubjectAltName=DNS:localhost\nbasicConstraints=critical,CA:FALSE\n")
+        subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-subj", "/CN=localhost", "-config", str(openssl_config), "-keyout", str(key), "-out", str(cert)], check=True, capture_output=True)
+        edge_items, edge_tokens = [], []
+        edge_status = 200
+        class Edge(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                edge_tokens.append(self.headers.get("Authorization"))
+                self.send_response(edge_status)
+                self.end_headers()
+                self.wfile.write(json.dumps({"items": edge_items, "limit": 3}).encode())
+            def do_DELETE(self):
+                name = self.path.rsplit("/", 1)[-1]
+                edge_items[:] = [item for item in edge_items if item["name"] != name]
+                self.send_response(204)
+                self.end_headers()
+            def log_message(self, *args): pass
+        edge = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Edge)
+        tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        tls.load_cert_chain(cert, key)
+        edge.socket = tls.wrap_socket(edge.socket, server_side=True)
+        threading.Thread(target=edge.serve_forever, daemon=True).start()
+        env.update(KIRI_SHARE_SERVER=f"localhost:{edge.server_port}", KIRI_SHARE_CONNECT=f"127.0.0.1:{edge.server_port}", KIRI_SHARE_CA=str(cert), KIRI_SHARE_TOKEN="ks_ephemeral_never_save")
         children = []
 
         def save(extra=None):
@@ -127,6 +154,7 @@ def main():
 
         def cli(*args, ok=True):
             p = subprocess.run([BINARY, "share", *args], env=env, capture_output=True, text=True, timeout=10)
+            assert "ks_ephemeral_never_save" not in config.read_text(), "environment credential was persisted"
             if ok:
                 assert p.returncode == 0, (p.stdout, p.stderr)
             return p
@@ -170,6 +198,44 @@ def main():
             closed(capture)
             assert json.loads(cli("list", "--json").stdout)["items"] == []
             print("PASS temporary URL, readiness/reconnect, list and stop")
+
+            before = {c["pid"] for c in captures()}
+            share = start()
+            share.event("live")
+            capture = next(c for c in captures() if c["pid"] not in before)
+            edge_items.append({"name": "edge-link", "url": "https://edge-link.example.test", "kind": "cli"})
+            for provider in ("kiri", "cloudflare"):
+                cli("provider", provider)
+                entries = json.loads(cli("list", "--json").stdout)["items"]
+                assert len(entries) == 2, cli("list", "--json").stdout
+                cloudflare_id = next(e["name"] for e in entries if e["name"].startswith("cloudflare:"))
+            cli("stop", "edge-link")
+            assert not edge_items, "Kiri link was not closed while Cloudflare was selected"
+            assert edge_tokens and set(edge_tokens) == {"Bearer ks_ephemeral_never_save"}
+            cli("provider", "kiri")
+            edge_status = 401
+            entries = json.loads(cli("list", "--json").stdout)
+            assert len(entries["items"]) == 1 and entries["warning"]
+            env.pop("KIRI_SHARE_TOKEN")
+            assert len(json.loads(cli("list", "--json").stdout)["items"]) == 1
+            cli("stop", cloudflare_id)
+            assert share.event("ended")["error"] is False
+            share.process.wait(timeout=5)
+            closed(capture)
+            edge_status = 200
+            env["KIRI_SHARE_TOKEN"] = "ks_ephemeral_never_save"
+            cli("provider", "cloudflare")
+            assert "token" not in json.loads(config.read_text())
+            print("PASS provider-independent listing/stopping, expired and absent Kiri credentials")
+
+            before = {c["pid"] for c in captures()}
+            share = start()
+            share.event("live")
+            capture = next(c for c in captures() if c["pid"] not in before)
+            os.killpg(share.process.pid, signal.SIGINT)
+            share.process.wait(timeout=5)
+            closed(capture)
+            print("PASS terminal Ctrl+C reaps cloudflared and removes runtime files")
 
             before = {c["pid"] for c in captures()}
             share = start()
@@ -316,17 +382,34 @@ def main():
 
             (root / "hold_login").touch()
             before = {s["pid"] for s in setups()}
-            login = subprocess.Popen([BINARY, "share", "domain", "connect", "cancel.example.com", "--json"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            login = subprocess.Popen([BINARY, "share", "domain", "connect", "cancel.example.com", "--json"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
             children.append(login)
             eventually(lambda: any(s["pid"] not in before for s in setups()))
             capture = next(s for s in setups() if s["pid"] not in before)
             blocked = cli("domain", "create", "example.com", "blocked", ok=False)
             assert blocked.returncode != 0 and "another Cloudflare setup" in blocked.stderr
-            login.kill(); login.wait(timeout=5)
+            os.killpg(login.pid, signal.SIGINT); login.wait(timeout=5)
             closed(capture)
             assert not (Path(capture["home"]) / ".cloudflared/cert.pem").exists()
             (root / "hold_login").unlink()
             print("PASS interrupted browser authorization reaps the setup process")
+
+            assert json.loads(config.read_text())["token"] == "ks_preserved"
+            print("PASS domain edits and automated setup preserve saved login under an environment override")
+
+            save({"executable": "cloudflared"})
+            env["PATH"] = str(root)
+            before = {c["pid"] for c in captures()}
+            share = start()
+            share.event("live")
+            capture = next(c for c in captures() if c["pid"] not in before)
+            assert json.loads((Path(capture["runtime"]) / "plan.json").read_text())["executable"] == str(fake.resolve())
+            os.killpg(share.process.pid, signal.SIGINT)
+            share.process.wait(timeout=5)
+            closed(capture)
+            cli("domain", "connect", "path.example.com", "--json")
+            env["PATH"] = os.environ.get("PATH", "")
+            print("PASS bare executable discovery for sharing and browser setup")
 
             save()
             (root / "fail").touch()
@@ -340,6 +423,8 @@ def main():
             assert json.loads(config.read_text())["provider"] == "kiri"
             print("PASS child failure, log redaction and switching providers")
         finally:
+            edge.shutdown()
+            edge.server_close()
             for child in children:
                 if child.poll() is None:
                     child.kill()

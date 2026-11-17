@@ -134,4 +134,17 @@ t("returning to Kiri restores sign-in", () => {
   eq(!!document.querySelector("[data-shlogin]"), true, "Kiri login");
   eq(shAvailable(), false, "requires sign-in");
 });
+t("switching to signed-out Kiri still discovers and stops Cloudflare shares", () => {
+  kiri.on({ type: "shareaccount", provider: "kiri", signedIn: false });
+  sent.length = 0; shPoll();
+  eq(sent.some(x => x.type === "sharetunnels"), true, "local discovery continues");
+  const name = "cloudflare:0123456789abcdef0123456789abcdef";
+  kiri.on({ type: "sharetunnels", items: [{ name, label: "retained", url: "https://retained.example.com", where: "here", kind: "cli", mine: false }], limit: 1, warning: "Kiri Cloud is offline" });
+  show("share"); sh.open = null; renderShare();
+  eq($("content").textContent.includes("retained"), true, "old provider link is visible");
+  eq($("content").textContent.includes("Kiri Cloud is offline"), true, "partial-list warning is visible");
+  eq(shLimit(), null, "Cloudflare shares do not consume Kiri plan slots");
+  sent.length = 0; shKill(name);
+  eq(sent.some(x => x.type === "sharestop" && x.name === name), true, "stop keeps owning provider ID");
+});
 report(R);

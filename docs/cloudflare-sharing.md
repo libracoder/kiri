@@ -15,6 +15,10 @@ kiri share provider cloudflare
 kiri share 3000
 ```
 
+On macOS, Kiri also discovers Homebrew installations in `/opt/homebrew/bin`
+and `/usr/local/bin` when launched from Finder. An explicitly configured
+`cloudflare.executable` path takes precedence.
+
 With no base domain configured, each share gets a temporary
 `https://<random>.trycloudflare.com` URL. A requested name is ignored in this
 mode. A Cloudflare account and domain are not required. These are
@@ -190,10 +194,14 @@ kiri share provider kiri          # return to Kiri Cloud for new shares
 
 The app shows Cloudflare shares opened by the CLI and app using the same
 config directory, and its Stop action closes those shares on this computer.
-Close existing shares before switching providers. Other computers' Cloudflare
-tunnels are not listed. Cloudflare's own reconnect logic handles transient
-network failures; Kiri observes its readiness endpoint. Startup times out
+Switching providers only changes new shares. Existing links from either
+provider remain listed and can be stopped; Cloudflare IDs in the list use
+a `cloudflare:` prefix. Local Cloudflare links remain available even when
+signed out of Kiri Cloud or when its API fails; a partial list reports a
+warning. Other computers' Cloudflare tunnels are not listed. Cloudflare's
+own reconnect logic handles transient network failures; Kiri observes its readiness endpoint. Startup times out
 after 90 seconds. No background tunnel is installed as a system service.
+Terminal Ctrl+C closes the tunnel and removes its private runtime directory.
 
 Cloudflare forwards HTTP and WebSocket traffic. This integration does not
 provide Kiri's per-request logs, traffic counters, Cloudflare account quotas,
@@ -212,5 +220,9 @@ python3 scripts/ui-test.py
 
 The lifecycle integration test uses a local fake cloudflared; it creates no
 public tunnel and needs no account. It covers browser authorization, tunnel
-and DNS creation, retries, cancellation, and sharing. A real custom-domain
-test requires authorizing a domain in your Cloudflare account.
+and DNS creation, retries, cancellation, sharing, provider switches,
+environment-token isolation, executable discovery, and terminal Ctrl+C.
+Settings changes preserve the saved Kiri login; `KIRI_SHARE_TOKEN` overrides
+authentication only for the current process and is never saved by those
+changes. A real custom-domain test requires authorizing a domain in your
+Cloudflare account.

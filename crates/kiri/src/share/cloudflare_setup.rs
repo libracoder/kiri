@@ -65,11 +65,11 @@ fn command(cfg: &Config, cert: &Path, args: &[String], cancel: &AtomicBool, noti
     std::fs::write(dir.join("config.yml"), b"{}")?;
     let mut flags = vec!["tunnel".into(), "--config".into(), dir.join("config.yml").to_string_lossy().into_owned(), "--no-autoupdate".into(), "--output".into(), "json".into(), "--origincert".into(), cert.to_string_lossy().into_owned()];
     flags.extend_from_slice(args);
-    let plan = Plan { executable: cfg.executable.clone(), args: flags, lock: None, allow_exit: true, cloudflared_home: cert.parent().and_then(Path::parent).map(Path::to_owned) };
+    let plan = Plan { executable: executable(&cfg.executable), args: flags, lock: None, allow_exit: true, cloudflared_home: cert.parent().and_then(Path::parent).map(Path::to_owned) };
     std::fs::write(dir.join("plan.json"), serde_json::to_vec(&plan)?)?;
     let mut helper = Command::new(std::env::current_exe()?);
     helper.arg(HELPER).arg(&dir).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped());
-    hidden(&mut helper);
+    isolate_helper(&mut helper);
     let mut child = helper.spawn()?;
     let owner = child.stdin.take();
     let stderr = child.stderr.take().unwrap();
@@ -194,7 +194,7 @@ fn provision(file: &Path, tunnel_name: &str, hostname: &str, run: &mut dyn FnMut
 }
 
 pub fn run(action: &str, value: &Value, cancel: &AtomicBool, notify: &mut dyn FnMut(Value)) -> io::Result<Value> {
-    let mut cfg = load()?;
+    let mut cfg = load_saved()?;
     let cloudflare = cfg.cloudflare.clone().unwrap_or_default();
     let base = domain(value["base_domain"].as_str().unwrap_or_default())?;
     let requested = match action {
@@ -229,7 +229,7 @@ pub fn run(action: &str, value: &Value, cancel: &AtomicBool, notify: &mut dyn Fn
         let tunnel = provision(&file, &tunnel_name, &hostname, &mut |args| command(&cloudflare, &cert, args, cancel, notify))?;
         check_cancel(cancel)?;
         // Browser approval can take minutes: merge into the latest settings.
-        cfg = load()?;
+        cfg = load_saved()?;
         let current = cfg.cloudflare.get_or_insert_with(Config::default);
         compatible(current, &base, &name, &file)?;
         if current.tunnels.iter().any(|(key, t)| key != &name && t.id.eq_ignore_ascii_case(&tunnel.id)) {

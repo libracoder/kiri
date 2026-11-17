@@ -203,10 +203,10 @@ t("an edge without the list: own shares only, and no more asking", () => {
   eq(sent.filter((x) => x.type === "sharetunnels").length, 0, "doesn't ask");
   sh.remoteOff = false; shPolling();
 });
-t("signing out stops polling and forgets the account's tunnels", () => {
+t("signing out forgets account tunnels but keeps polling local links", () => {
   list([WEB, FLOWER, API]);
   kiri.on({ type: "shareaccount", signedIn: false });
-  eq([sh.poll, sh.remote, shOthers().length], [0, null, 0], "forgotten");
+  eq([!!sh.poll, sh.remote, shOthers().length], [true, null, 0], "forgotten; local discovery remains active");
   kiri.on({ type: "shareaccount", signedIn: true, login: "octo" });
   eq(!!sh.poll, true, "polls again");
 });

@@ -73,7 +73,7 @@ pub fn current() -> io::Result<Value> {
 /// Validate everything before saving. Existing links retain their routing;
 /// changes apply when the user next starts a share.
 pub fn update(input: Draft) -> io::Result<Value> {
-    let mut cfg = load()?;
+    let mut cfg = load_saved()?;
     let executable = cfg.cloudflare.as_ref().map(|c| c.executable.clone()).unwrap_or_else(|| Config::default().executable);
     let cloudflare = validate(input, executable)?;
     let result = snapshot(&cloudflare);

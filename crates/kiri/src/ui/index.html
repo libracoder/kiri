@@ -7919,7 +7919,8 @@ const shOthers = () => (sh.remote?.items || []).filter((x) => !x.mine && !sh.sto
 const shCli = () => shOthers().filter((x) => x.where === "here");
 const shExt = () => shOthers().filter((x) => x.where !== "here");
 const shInUse = () => shLive().length + shOthers().length;
-const shLimit = () => sh.remote?.limit ?? sh.usage?.tunnels ?? null;
+// A mixed list is not a Kiri Cloud plan total.
+const shLimit = () => shCloudflare() || (sh.remote?.items || []).some((x) => x.name.startsWith("cloudflare:")) ? null : sh.remote?.limit ?? sh.usage?.tunnels ?? null;
 const shUp = (x) => shFor2(Date.now() - (x.started || 0) * 1000);
 const shBare = (url) => (url || "").replace(/^https:\/\//, "");
 const shPortOf = (target) => (target || "").match(/:(\d+)\)?$/)?.[1] || "";
@@ -7932,20 +7933,19 @@ const shExtTag = { toString: () => `<span class="ext-tag">${tr("External")}</spa
 
 const shCloudflare = () => sh.account?.provider === "cloudflare";
 const shAvailable = () => shCloudflare() || !!sh.account?.signedIn;
-function shPoll() { if (shAvailable() && !sh.remoteOff) send("sharetunnels"); }
-/* Polls while signed in; signed out, there's nothing to show. */
+function shPoll() { if (!sh.remoteOff) send("sharetunnels"); }
+/* Local Cloudflare links remain discoverable without a Kiri Cloud sign-in. */
 function shPolling() {
-  const on = shAvailable() && !sh.remoteOff;
+  const on = !!sh.account && !sh.remoteOff;
   if (on && !sh.poll) { sh.poll = setInterval(shPoll, SH_POLL); shPoll(); }
   else if (!on && sh.poll) { clearInterval(sh.poll); sh.poll = 0; }
-  if (!shAvailable()) sh.remote = null;
 }
 /* The list arrived. Returns whether anything shown changed. */
 function shRemote(e) {
   const was = JSON.stringify(sh.remote);
   if (e.unsupported) { sh.remoteOff = true; sh.remote = null; shPolling(); }
   else if (!e.error) {
-    sh.remote = { items: e.items || [], limit: e.limit ?? null };
+    sh.remote = { items: e.items || [], limit: e.limit ?? null, warning: e.warning || null };
     for (const n of sh.stopping) if (!sh.remote.items.some((x) => x.name === n)) sh.stopping.delete(n);
   }
   if (sh.cap) shCapToast();
@@ -8050,7 +8050,7 @@ function shStopExt(name) {
 function shEvent(e) {
   let remote = false;
   if (e.type === "shareaccount") {
-    if (sh.account?.provider !== e.provider) { sh.remoteOff = false; sh.remote = null; sh.usage = null; }
+    if (sh.account?.provider !== e.provider || sh.account?.signedIn !== e.signedIn || sh.account?.session !== e.session) { sh.remoteOff = false; sh.remote = null; sh.usage = null; }
     sh.account = e;
     shPolling();
     if (shAvailable()) {
@@ -8301,13 +8301,13 @@ function renderShare() {
   const list = rows ? `<div class="sh-list">${rows}</div>`
     : `<div class="sh-empty">${shGlobe}<h3>${tr("Nothing shared yet")}</h3><p>${tr("Press <b>Share</b> on a running container to give it a public https link anyone can open.")}</p>
         <button class="btn" data-shcontainers>${tr("Go to Containers")}</button></div>`;
-  const foot = !a ? "" : shCloudflare() ? `<div class="sh-foot">Cloudflare Tunnel · ${tr("Links on this computer")}<button class="linkish" data-shdomain>${tr("Custom domain")}</button></div>` : a.signedIn
+  const foot = !a ? "" : shCloudflare() ? `<div class="sh-foot">${tr("Cloudflare Tunnel")} · ${tr("Links on this computer")}<button class="linkish" data-shdomain>${tr("Custom domain")}</button></div>` : a.signedIn
     ? `<div class="sh-foot"><span class="sh-ghmark" title="${tr("Signed in with GitHub")}">${shSvg("github")}</span>${tr("Signed in to Kiri Cloud with GitHub as {login}", { login: `<b>${esc(a.login || tr("you"))}</b>` })}
         ${a.session ? `<span class="sep">·</span><span title="${tr("This sign-in's ID: a hash of its token, safe to quote when asking for help")}">${tr("Session")} <code class="sh-sess">${esc(a.session)}</code></span>` : ""}
         <span class="sep">·</span><button class="linkish" data-shlogout>${tr("Sign out")}</button></div>`
     : `<div class="sh-foot">${tr("Not signed in")}<button class="linkish" data-shlogin>${tr("Sign in with GitHub")}</button></div>`;
   const intro = shCloudflare() ? `<p class="sh-intro">${tr("Share gives a container or a Kubernetes service a public https link through Cloudflare Tunnel.")} ${tr("It stays up while Kiri is running.")}</p>` : `<p class="sh-intro">${tr("Share gives a container or a Kubernetes service a public https link through a secure tunnel to Kiri Cloud.")} ${a?.signedIn && !sh.remoteOff ? tr("This lists every link on your account, on any computer.") : tr("It stays up while Kiri is running.")}</p>`;
-  morph($("content"), `<div class="sh">${intro}${stats}${list}${foot}</div>`);
+  morph($("content"), `<div class="sh">${intro}${sh.remote?.warning ? `<p class="err">${esc(sh.remote.warning)}</p>` : ""}${stats}${list}${foot}</div>`);
 }
 /* Puts `html` in `el` changing only what differs, so a redraw doesn't restart
    animations, repaint icons or flash a hover. Rows are matched by what they

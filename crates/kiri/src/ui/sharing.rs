@@ -346,7 +346,11 @@ pub fn close_all() {
         for h in handles {
             h.stop();
         }
-        let Ok(live) = share::tunnels() else { return };
+        let live = match share::tunnels() {
+            Ok(live) => live,
+            Err(e) => { emit(super::notice("error", &e.to_string())); return; }
+        };
+        if let Some(warning) = &live.warning { emit(super::notice("error", warning)); }
         let device = share::load().map(|c| c.device).unwrap_or_default();
         let machine = share::machine_id(&device);
         for t in live.items.iter().filter(|t| (!t.machine.is_empty() && t.machine == machine) || (!t.device.is_empty() && t.device == device)) {
@@ -410,7 +414,7 @@ fn tunnels_event(r: std::io::Result<share::LiveTunnels>) -> Value {
             let machine = share::machine_id(&device);
             let own: Vec<String> = with_links(|m| m.values().filter_map(|l| l.url.clone()).collect());
             let items: Vec<Value> = list.items.iter().map(|t| tagged(t, &machine, &device, &own)).collect();
-            json!({"type": "sharetunnels", "items": items, "limit": list.limit})
+            json!({"type": "sharetunnels", "items": items, "limit": list.limit, "warning": list.warning})
         }
         // An edge from before the list: the page shows its own shares only.
         Err(e) if e.kind() == std::io::ErrorKind::Unsupported => json!({"type": "sharetunnels", "unsupported": true}),

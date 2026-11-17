@@ -131,6 +131,55 @@ fn hidden(command: &mut Command) {
     let _ = command;
 }
 
+/// Keep terminal Ctrl+C away from the supervisor so it can reap cloudflared
+/// and remove its private runtime directory when the owner's pipe closes.
+fn isolate_helper(command: &mut Command) {
+    hidden(command);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+}
+
+/// Finder does not inherit the shell's Homebrew PATH. Explicit paths always win.
+fn executable(name: &str) -> String {
+    let paths: Vec<PathBuf> = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect()).unwrap_or_default();
+    #[cfg(target_os = "macos")]
+    let paths = {
+        let mut paths = paths;
+        paths.extend([PathBuf::from("/opt/homebrew/bin"), PathBuf::from("/usr/local/bin")]);
+        paths
+    };
+    resolve_executable(name, &paths).unwrap_or_else(|| name.to_owned())
+}
+
+fn resolve_executable(name: &str, paths: &[PathBuf]) -> Option<String> {
+    if Path::new(name).components().count() != 1 || !matches!(Path::new(name).components().next(), Some(std::path::Component::Normal(_))) {
+        return Some(name.to_owned());
+    }
+    for dir in paths {
+        let candidate = dir.join(name);
+        #[cfg(windows)]
+        let candidate = if candidate.extension().is_none() { candidate.with_extension("exe") } else { candidate };
+        let Ok(metadata) = candidate.metadata() else { continue };
+        if !metadata.is_file() {
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o111 == 0 {
+                continue;
+            }
+        }
+        if let Ok(path) = candidate.canonicalize() {
+            return Some(path.to_string_lossy().into_owned());
+        }
+    }
+    None
+}
+
 #[derive(Serialize, Deserialize)]
 struct Plan {
     executable: String,
@@ -174,7 +223,7 @@ fn prepare(cfg: &Config, opts: &Options, route: &Route, dir: &Path) -> io::Resul
     // JSON is a YAML subset. An explicit file also isolates Quick Tunnels
     // from any unrelated ~/.cloudflared/config.yml the person already has.
     std::fs::write(config, serde_json::to_vec(&content)?)?;
-    Ok(Plan { executable: cfg.executable.clone(), args, lock, allow_exit: false, cloudflared_home: None })
+    Ok(Plan { executable: executable(&cfg.executable), args, lock, allow_exit: false, cloudflared_home: None })
 }
 
 /// Private entry point, dispatched before normal CLI/UI startup on every OS.
@@ -303,7 +352,7 @@ pub(super) fn start(cfg: super::Config, opts: Options, on_event: impl Fn(Event) 
     std::fs::write(dir.join("plan.json"), serde_json::to_vec(&plan)?)?;
     let mut command = Command::new(std::env::current_exe()?);
     command.arg(HELPER).arg(&dir).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped());
-    hidden(&mut command);
+    isolate_helper(&mut command);
     let mut child = command.spawn()?;
     let owner = child.stdin.take();
     let stderr = child.stderr.take().unwrap();
@@ -416,13 +465,21 @@ pub(super) fn tunnels() -> io::Result<LiveTunnels> {
             continue;
         }
         if let Ok(v) = std::fs::read(dir.join("live.json")).and_then(|b| serde_json::from_slice::<Value>(&b).map_err(io::Error::other)) {
-            list.items.push(live_tunnel(&v));
+            let mut tunnel = live_tunnel(&v);
+            tunnel.name = format!("cloudflare:{}", tunnel.name);
+            list.items.push(tunnel);
         }
     }
     Ok(list)
 }
 
+// Accept raw IDs from older clients while new listings use an unambiguous prefix.
+pub(super) fn owns(name: &str) -> io::Result<bool> {
+    Ok(share_id(name) && active(&root()?.join(name)))
+}
+
 pub(super) fn close_tunnel(name: &str) -> io::Result<()> {
+    let name = name.strip_prefix("cloudflare:").unwrap_or(name);
     if !share_id(name) {
         return Err(io::Error::other("invalid Cloudflare share ID"));
     }
@@ -457,6 +514,27 @@ mod tests {
     fn named() -> Config {
         serde_json::from_value(json!({"base_domain":"Example.com.", "tunnels":{"web":{"id":"01234567-89ab-cdef-0123-456789abcdef","credentials_file":std::env::temp_dir().join("credentials.json")}}})).unwrap()
     }
+    #[test]
+    fn executable_resolution_respects_paths_permissions_and_search_order() {
+        let dir = Directory(std::env::temp_dir().join(format!("kiri-executable-{}", random_hex(8))));
+        private_dir(&dir.0).unwrap();
+        let bin = dir.0.join("cloudflared");
+        #[cfg(windows)]
+        let bin = bin.with_extension("exe");
+        std::fs::write(&bin, "fixture").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o600)).unwrap();
+            assert!(resolve_executable("cloudflared", std::slice::from_ref(&dir.0)).is_none());
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        // The fallback directory is searched when a desktop PATH lacks it.
+        assert_eq!(resolve_executable("cloudflared", &[dir.0.join("missing"), dir.0.clone()]), Some(bin.canonicalize().unwrap().to_string_lossy().into_owned()));
+        assert_eq!(resolve_executable("./chosen/cloudflared", std::slice::from_ref(&dir.0)), Some("./chosen/cloudflared".into()));
+        assert!(resolve_executable("missing", std::slice::from_ref(&dir.0)).is_none());
+    }
+
     #[test]
     fn routes_require_explicit_named_configuration() {
         assert!(route(&Config::default(), &opts(None)).unwrap().url.is_none());

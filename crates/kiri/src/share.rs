@@ -271,8 +271,8 @@ fn clean_host(s: &str) -> String {
     s.trim().chars().filter(|c| !c.is_control()).take(64).collect()
 }
 
-/// Reads the config, creating the device id on first use.
-pub fn load() -> io::Result<Config> {
+/// Reads only persisted settings, never an environment credential.
+fn load_saved() -> io::Result<Config> {
     let path = config_path()?;
     let mut cfg: Config = match std::fs::read(&path) {
         Ok(b) => serde_json::from_slice(&b).map_err(|e| io::Error::other(format!("{}: {e}", path.display())))?,
@@ -283,6 +283,12 @@ pub fn load() -> io::Result<Config> {
         cfg.device = random_hex(16);
         save(&cfg)?;
     }
+    Ok(cfg)
+}
+
+/// Reads effective settings for authentication, including an ephemeral CI token.
+pub fn load() -> io::Result<Config> {
+    let mut cfg = load_saved()?;
     // For CI: a token from the dashboard, without signing in.
     if let Ok(t) = std::env::var("KIRI_SHARE_TOKEN")
         && !t.is_empty()
@@ -563,9 +569,12 @@ pub fn whoami() -> io::Result<Value> {
 
 /// A signed-in API call: the saved token, and a plain message when it has expired.
 fn signed_in(method: &str, path: &str, body: Option<&Value>) -> io::Result<(u16, Value)> {
-    let cfg = kiri_config()?;
+    signed_in_with(&kiri_config()?, method, path, body)
+}
+
+fn signed_in_with(cfg: &Config, method: &str, path: &str, body: Option<&Value>) -> io::Result<(u16, Value)> {
     let token = cfg.token.as_deref().ok_or_else(|| io::Error::other("not signed in; run `kiri share login`"))?;
-    let (status, v) = api(&server(&cfg), method, path, body, Some(token))?;
+    let (status, v) = api(&server(cfg), method, path, body, Some(token))?;
     if status == 401 {
         return Err(io::Error::other("your sign-in is no longer valid; run `kiri share login`"));
     }
@@ -675,6 +684,8 @@ pub struct LiveTunnel {
 pub struct LiveTunnels {
     pub items: Vec<LiveTunnel>,
     pub limit: Option<u64>,
+    /// A provider could not be queried; the other provider's links remain manageable.
+    pub warning: Option<String>,
 }
 
 fn live_tunnel(v: &Value) -> LiveTunnel {
@@ -693,26 +704,31 @@ fn live_tunnel(v: &Value) -> LiveTunnel {
     }
 }
 
-/// Every live tunnel on the account, whichever computer opened it.
+/// Live Cloudflare links on this computer plus Kiri Cloud links on the account.
+/// The selected provider controls new shares, never ownership of existing ones.
 pub fn tunnels() -> io::Result<LiveTunnels> {
-    if load()?.provider == Provider::Cloudflare {
-        return cloudflare::tunnels();
+    let cfg = load()?;
+    let mut list = cloudflare::tunnels()?;
+    if cfg.token.is_some() {
+        match signed_in_with(&cfg, "GET", "/v1/tunnels/live", None) {
+            Ok((200, v)) => {
+                list.items.extend(v["items"].as_array().into_iter().flatten().map(live_tunnel));
+                list.limit = v["limit"].as_u64();
+            }
+            Ok((404, _)) => list.warning = Some("this Kiri Cloud can't list tunnels".into()),
+            Ok((status, v)) => list.warning = Some(api_error(&v, status).to_string()),
+            Err(e) => list.warning = Some(e.to_string()),
+        }
     }
-    let (status, v) = signed_in("GET", "/v1/tunnels/live", None)?;
-    match status {
-        200 => Ok(LiveTunnels { items: v["items"].as_array().into_iter().flatten().map(live_tunnel).collect(), limit: v["limit"].as_u64() }),
-        404 => Err(io::Error::new(io::ErrorKind::Unsupported, "this Kiri Cloud can't list tunnels")),
-        _ => Err(api_error(&v, status)),
-    }
+    Ok(list)
 }
 
-/// Closes one of the account's tunnels, wherever it runs. The edge tells
-/// the computer running it that it was stopped from this one.
+/// Stop through the owning provider, even after changing the default provider.
 pub fn close_tunnel(name: &str) -> io::Result<()> {
-    if load()?.provider == Provider::Cloudflare {
+    if name.starts_with("cloudflare:") || cloudflare::owns(name)? {
         return cloudflare::close_tunnel(name);
     }
-    let (status, v) = signed_in("DELETE", &format!("/v1/tunnels/{name}"), Some(&json!({ "host": host_name() })))?;
+    let (status, v) = signed_in_with(&load()?, "DELETE", &format!("/v1/tunnels/{name}"), Some(&json!({ "host": host_name() })))?;
     match status {
         200 | 204 => Ok(()),
         404 => Err(io::Error::other(format!("{name} isn't live any more"))),
@@ -1936,15 +1952,16 @@ pub fn run(args: &[String]) -> io::Result<()> {
         Some("list") => {
             let list = tunnels()?;
             if args.iter().any(|a| a == "--json") {
-                println!("{}", json!({"items": list.items, "limit": list.limit}));
+                println!("{}", json!({"items": list.items, "limit": list.limit, "warning": list.warning}));
             } else {
+                if let Some(warning) = list.warning { eprintln!("Kiri Cloud: {warning}"); }
                 for t in list.items { println!("{}  {}  {}", t.name, t.url, t.target); }
             }
             Ok(())
         }
         Some("stop") => close_tunnel(args.get(1).ok_or_else(|| io::Error::other("usage: kiri share stop ID"))?),
         Some("provider") => {
-            let mut cfg = load()?;
+            let mut cfg = load_saved()?;
             match args.get(1).map(String::as_str) {
                 Some("kiri") if args.len() == 2 => cfg.provider = Provider::Kiri,
                 Some("cloudflare") if args.len() == 2 => cfg.provider = Provider::Cloudflare,
