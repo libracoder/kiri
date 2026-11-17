@@ -62,8 +62,9 @@ pub enum Event<'a> {
     Output { id: &'a str, stream: Stream, data: &'a [u8] },
     /// `oom` when the kernel killed a process in it for memory.
     Exited { id: &'a str, code: i32, oom: bool },
-    /// The guest is short of memory right now.
-    Pressure,
+    /// The guest is short of memory right now, and what it can see: the
+    /// readings that go with a memory kill.
+    Pressure { mem_available_kib: u64, mem_stall: u64 },
     /// The connection is gone: the VM stopped.
     Lost,
 }
@@ -255,8 +256,8 @@ impl VmLink {
                         wins.add(id, bytes as usize);
                         continue;
                     }
-                    Ok(Msg::MemoryPressure) => {
-                        on_event(Event::Pressure);
+                    Ok(Msg::MemoryPressure(p)) => {
+                        on_event(Event::Pressure { mem_available_kib: p.mem_available_kib, mem_stall: p.mem_stall });
                         continue;
                     }
                     Ok(Msg::LayerStatus(have)) => Reply::LayerStatus(have),
