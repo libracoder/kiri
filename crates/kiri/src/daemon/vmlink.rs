@@ -524,6 +524,13 @@ impl VmLink {
         self.ack(|o| Msg::NetDetach { id, ifname: &ifname, bridge, ip }.encode(o))
     }
 
+    /// Replaces the DNS names the guest resolves for a container's address
+    /// on a bridge after `docker rename`. No reply: an older agent ignores
+    /// the frame, and a rename must still succeed if the VM is asleep.
+    pub fn dns_rename(&self, bridge: &str, ip: [u8; 4], ip6: Option<[u8; 16]>, names: &[String]) -> io::Result<()> {
+        self.send(|o| kiri_proto::encode_dns_rename(o, bridge, ip, ip6, names))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn exec(&self, container_id: &str, exec_id: &str, argv: &[String], env: &[String], cwd: &str, user: &str, flags: u32, caps: u64, opts: &[String]) -> io::Result<u32> {
         self.windows.open(exec_id);
