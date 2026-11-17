@@ -607,6 +607,8 @@ section "filters"
 $D run -d --name fa --label team=a --label tier=web alpine sleep 60 >/dev/null
 $D run -d --name fb --label team=b alpine sleep 60 >/dev/null
 $D run --name fx alpine sh -c 'exit 3' >/dev/null 2>&1
+# Another tag of alpine: `ancestor=alpine` is alpine:latest only (#442).
+$D run -d --name fo alpine:3.22 sleep 60 >/dev/null
 t filter-label "fa" $D ps --filter label=team=a --format '{{.Names}}'
 t filter-label-none "0" bash -c "$D ps -q --filter label=team=zzz | wc -l | tr -d ' '"
 t filter-label-and "1" bash -c "$D ps -q --filter label=team=a --filter label=tier=web | wc -l | tr -d ' '"
@@ -621,6 +623,9 @@ t filter-name-regex-anchored "0" bash -c "$D ps -q --filter 'name=^[/]?f$' | wc 
 t filter-status-exited "fx" $D ps --filter status=exited --format '{{.Names}}'
 t filter-exited-code "fx" $D ps -a --filter exited=3 --format '{{.Names}}'
 t filter-ancestor "2" bash -c "$D ps -q --filter ancestor=alpine | wc -l | tr -d ' '"
+t filter-ancestor-tag "fo" $D ps --filter ancestor=alpine:3.22 --format '{{.Names}}'
+t filter-ancestor-id "fa" bash -c "$D ps --filter ancestor=\$($D image inspect -f '{{.Id}}' alpine | cut -c8-19) --filter name=fa --format '{{.Names}}'"
+t filter-ancestor-no-glob "0" bash -c "$D ps -q --filter 'ancestor=alp*' | wc -l | tr -d ' '"
 t filter-network "2" bash -c "$D ps -q --filter network=bridge --filter label=team | wc -l | tr -d ' '"
 t filter-network-other "0" bash -c "$D ps -q --filter network=none --filter label=team | wc -l | tr -d ' '"
 t filter-id "fa" bash -c "$D ps --filter id=\$($D inspect -f '{{.Id}}' fa | cut -c1-12) --format '{{.Names}}'"
@@ -641,7 +646,7 @@ t filter-volume-dangling "fvol2" $D volume ls --filter dangling=true --format '{
 t filter-volume-prune-all "fvol" $D volume prune -af --filter label=team=a
 t filter-volume-prune-label-only "fvol2" $D volume ls --format '{{.Name}}'
 $D volume rm fvol2 >/dev/null
-$D rm -f fa fb fx >/dev/null
+$D rm -f fa fb fx fo >/dev/null
 
 section "compose"
 # A container outside the project must not confuse Compose.
