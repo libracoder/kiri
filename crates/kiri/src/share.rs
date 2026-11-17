@@ -328,9 +328,24 @@ fn server(cfg: &Config) -> Server {
     Server { host, port, dial }
 }
 
+/// Adds the merged roots (webpki's plus the platform's) to `roots`,
+/// skipping any certificate rustls refuses to add — the same quiet skip
+/// as `platform_certs()` skipping load errors. The merged list comes from
+/// places the user doesn't curate (the keychain, `/etc/ssl`), so one
+/// anchor rustls won't take shouldn't take every tunnel down.
+fn add_merged_roots(roots: &mut rustls::RootCertStore, certs: &[ureq::tls::Certificate<'static>]) {
+    for cert in certs {
+        let _ = roots.add(rustls::pki_types::CertificateDer::from(cert.der().to_vec()));
+    }
+}
+
 fn tls_config(alpn: &[u8]) -> io::Result<Arc<rustls::ClientConfig>> {
     let mut roots = rustls::RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    // The system's roots merged with webpki's, like the registry client
+    // (#303); KIRI_SHARE_CA, if set, is added on top, last.
+    add_merged_roots(&mut roots, &kiri_image::roots::root_certs());
+    // KIRI_SHARE_CA, unlike the merged roots, is chosen on purpose: an
+    // explicit CA that doesn't parse is a misconfiguration worth reporting.
     if let Some(ca) = std::env::var_os("KIRI_SHARE_CA") {
         let certs = rustls::pki_types::CertificateDer::pem_file_iter(&ca).map_err(|e| io::Error::other(format!("KIRI_SHARE_CA: {e}")))?;
         for c in certs {
@@ -2186,6 +2201,53 @@ mod tests {
         assert_eq!(parse_server("edge.runkiri.com"), ("edge.runkiri.com".into(), 443));
         assert_eq!(parse_server("https://Edge.Example:8443/"), ("edge.example".into(), 8443));
         assert_eq!(parse_server("localhost:"), ("localhost:".into(), 443));
+    }
+
+    /// A malformed anchor in the merged list is skipped, not fatal: the
+    /// store still holds every certificate that parses.
+    #[test]
+    fn merged_roots_skip_a_cert_that_fails_to_add() {
+        let certs = kiri_image::roots::root_certs();
+        let mut with_bad = certs.clone();
+        let good = certs[0].der();
+        with_bad.push(ureq::tls::Certificate::from_der(&good[..good.len() / 2]).to_owned());
+        let mut roots = rustls::RootCertStore::empty();
+        add_merged_roots(&mut roots, &with_bad);
+        assert_eq!(
+            roots.len(),
+            certs.len(),
+            "the truncated cert is skipped, the rest land"
+        );
+        assert_eq!(roots.len(), with_bad.len() - 1);
+    }
+
+    /// KIRI_SHARE_CA stays loud: a PEM section that doesn't decode fails
+    /// `tls_config`, a parseable CA is added and passes. (A file with no
+    /// PEM sections at all iterates as empty upstream, pki-types 1.15.)
+    #[test]
+    fn kiri_share_ca_fails_loud_but_a_valid_ca_is_added() {
+        let dir = std::env::temp_dir();
+        let bad = dir.join(format!("kiri-share-ca-bad-{}.pem", std::process::id()));
+        std::fs::write(
+            &bad,
+            "-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+        let ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let ca = ca_params.self_signed(&key).unwrap();
+        let good = dir.join(format!("kiri-share-ca-good-{}.pem", std::process::id()));
+        std::fs::write(&good, ca.pem()).unwrap();
+        // SAFETY: this is the only test that reads KIRI_SHARE_CA.
+        unsafe { std::env::set_var("KIRI_SHARE_CA", &bad) };
+        let loud = tls_config(b"http/1.1").is_err();
+        unsafe { std::env::set_var("KIRI_SHARE_CA", &good) };
+        let added = tls_config(b"http/1.1").is_ok();
+        unsafe { std::env::remove_var("KIRI_SHARE_CA") };
+        let _ = std::fs::remove_file(&bad);
+        let _ = std::fs::remove_file(&good);
+        assert!(loud, "an undecodable KIRI_SHARE_CA fails loudly");
+        assert!(added, "a parseable KIRI_SHARE_CA is added");
     }
 
     #[test]

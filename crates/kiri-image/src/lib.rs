@@ -9,6 +9,7 @@ mod connect;
 pub mod jsonfile;
 pub mod reference;
 pub mod registry;
+pub mod roots;
 pub mod store;
 pub mod tags;
 

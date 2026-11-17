@@ -20,8 +20,6 @@ ruzstd = "0.9"
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 # HTTPS for container names: the same rustls and ring ureq already brings in.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-# Roots for `kiri share`'s connection to the edge.
-webpki-roots = "1"
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem", "crypto"] }
 # The `name` filter is a regular expression in Docker (k3d sends `^[/]?name$`).
 # regex-lite: RE2 syntax like Go's regexp, without the Unicode tables' size.

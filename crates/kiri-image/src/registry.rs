@@ -270,7 +270,16 @@ fn shared_agent() -> ureq::Agent {
         // and one to its CDN; keep them all for the next pull.
         .max_idle_connections(32)
         .max_idle_connections_per_host(PARALLEL_LAYERS * 2)
-        .user_agent(concat!("kiri/", env!("CARGO_PKG_VERSION")));
+        .user_agent(concat!("kiri/", env!("CARGO_PKG_VERSION")))
+        // Registries sit behind corporate proxies whose CA the platform
+        // trusts; without it every pull fails UnknownIssuer (#303).
+        .tls_config(
+            ureq::tls::TlsConfig::builder()
+                .root_certs(ureq::tls::RootCerts::Specific(
+                    crate::roots::root_certs().into(),
+                ))
+                .build(),
+        );
     if let Some(p) = proxy(chosen.clone()) {
         cfg = cfg.proxy(p);
     }

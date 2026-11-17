@@ -65,6 +65,15 @@ fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_connect(Some(std::time::Duration::from_secs(10)))
         .user_agent(concat!("kiri/", env!("CARGO_PKG_VERSION")))
+        // The system's roots merged with webpki's, like the registry client
+        // (#303); the feed often sits behind a corporate proxy's CA.
+        .tls_config(
+            ureq::tls::TlsConfig::builder()
+                .root_certs(ureq::tls::RootCerts::Specific(
+                    kiri_image::roots::root_certs().into(),
+                ))
+                .build(),
+        )
         .build()
         .into()
 }

@@ -36,7 +36,16 @@ pub fn lite() -> bool {
 pub(crate) fn agent() -> ureq::Agent {
     let mut cfg = ureq::Agent::config_builder()
         .timeout_connect(Some(Duration::from_secs(15)))
-        .user_agent(concat!("kiri/", env!("CARGO_PKG_VERSION")));
+        .user_agent(concat!("kiri/", env!("CARGO_PKG_VERSION")))
+        // The system's roots merged with webpki's, like the registry client
+        // (#303); downloads run behind the same corporate proxies.
+        .tls_config(
+            ureq::tls::TlsConfig::builder()
+                .root_certs(ureq::tls::RootCerts::Specific(
+                    kiri_image::roots::root_certs().into(),
+                ))
+                .build(),
+        );
     let e = crate::daemon::proxy::effective();
     if let Some(p) = e.https.or(e.http).and_then(|u| ureq::Proxy::new(&u).ok()) {
         cfg = cfg.proxy(Some(p));
