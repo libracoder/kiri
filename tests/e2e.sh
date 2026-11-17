@@ -613,6 +613,10 @@ t vol-rm "tvol" $D volume rm tvol thtml tempty
 t vol-create "made-vol" $D volume create made-vol
 t tmpfs "size=10240k" $D run --rm --tmpfs /scratch:size=10m alpine sh -c 'mount | grep scratch'
 t tmpfs-mount "tmpfs on /t" $D run --rm --mount type=tmpfs,target=/t alpine sh -c 'mount | grep " /t "'
+# The guest kernel registers the nfs filesystem type (guest/kernel/kiri.config),
+# which a type=nfs volume mount needs; this check needs no NFS server and
+# cannot hang, and --rm cleans up after itself.
+t nfs-filesystem "nfs" $D run --rm alpine sh -c 'grep -qw nfs /proc/filesystems && echo nfs'
 t anon-from-image "volume:/var/lib/postgresql/data" bash -c "$D run -d --name pgv -e POSTGRES_PASSWORD=x postgres:17-alpine >/dev/null; $D inspect -f '{{range .Mounts}}{{.Type}}:{{.Destination}}{{end}}' pgv"
 # Waits for the entrypoint's "init process complete" and then a working query,
 # not for pg_isready: on first start Postgres runs a temporary server to
