@@ -1089,6 +1089,42 @@ fn parse_mounts(list: StrList<'_>) -> io::Result<Vec<Mount>> {
     Ok(out)
 }
 
+/// Puts a container's volumes and binds over `root`, its root mounted for a
+/// copy while it is not running, as a start puts them in place: Docker's
+/// archive endpoint resolves a path through them whatever the container's
+/// state (moby's `openContainerFS`). Parents go first, so the longest
+/// target wins. A tmpfs is left out, as Docker leaves it: it went with the
+/// container. A new volume is filled from the image as a start fills it;
+/// Docker has filled it when the container was created. Call it in a mount
+/// namespace of the copy's own.
+pub(super) fn mount_for_copy(root: &Path, list: StrList<'_>) -> io::Result<()> {
+    let mut mounts = parse_mounts(list)?;
+    mounts.retain(|m| m.tmpfs_opts.is_none());
+    if mounts.is_empty() {
+        return Ok(());
+    }
+    let fd = inroot::open_root(root)?;
+    let image = if mounts.iter().any(|m| m.copy_up) { image_tree(&sys::cstr(root)?) } else { None };
+    for m in &mounts {
+        apply_mount(fd.as_fd(), image.as_ref().map(|f| f.as_fd()), m).map_err(|e| io::Error::new(e.kind(), format!("mount {}: {e}", m.target.to_string_lossy())))?;
+    }
+    Ok(())
+}
+
+/// Each mount's target and whether it is read-only, from the lines
+/// `parse_mounts` takes, without looking at their sources.
+pub(super) fn mount_points(list: StrList<'_>) -> Vec<(PathBuf, bool)> {
+    list.iter()
+        .filter_map(|m| {
+            let mut parts = m.split('\t');
+            let (_, target) = (parts.next()?, parts.next()?);
+            let flags: Vec<&str> = parts.next().unwrap_or("").split(',').filter(|f| !f.is_empty()).collect();
+            let ro = if flags.contains(&"tmpfs") { tmpfs_flags(&flags) & libc::MS_RDONLY != 0 } else { flags.contains(&"ro") };
+            Some((PathBuf::from(target), ro))
+        })
+        .collect()
+}
+
 /// How deep a mount target is: `.` is 0, `app` 1, `app/node_modules` 2.
 fn depth(target: &CStr) -> usize {
     let t = target.to_bytes();
@@ -1199,14 +1235,14 @@ fn same_dir(a: &inroot::Found, b: &inroot::Found) -> bool {
     matches!((meta(a), meta(b)), (Ok(x), Ok(y)) if x.dev() == y.dev() && x.ino() == y.ino())
 }
 
-/// A detached copy of the current directory's mount (the container's
-/// root) without the mounts on it: the image as it is under any bind.
+/// A detached copy of the mount at `root` (the container's root) without
+/// the mounts on it: the image as it is under any bind.
 /// None where the kernel has no open_tree (before Linux 5.2); volumes are
 /// then filled from what the path shows, as before.
-fn image_tree() -> Option<OwnedFd> {
+fn image_tree(root: &CStr) -> Option<OwnedFd> {
     const OPEN_TREE_CLONE: libc::c_uint = 1;
     // SAFETY: a valid NUL-terminated path; the result is a new descriptor or -1.
-    let fd = unsafe { libc::syscall(libc::SYS_open_tree, libc::AT_FDCWD, c".".as_ptr(), OPEN_TREE_CLONE | libc::O_CLOEXEC as libc::c_uint) };
+    let fd = unsafe { libc::syscall(libc::SYS_open_tree, libc::AT_FDCWD, root.as_ptr(), OPEN_TREE_CLONE | libc::O_CLOEXEC as libc::c_uint) };
     // SAFETY: a descriptor the kernel just returned, owned only here.
     (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
 }
@@ -1294,7 +1330,7 @@ fn container_child(p: &Prepared, rootfs: &CStr, io: &ChildStdio) -> ! {
     }
     // The image's tree without the mounts made on it, for filling new
     // volumes; closed (and so unmounted) once they are all in place.
-    let image = if p.mounts.iter().any(|m| m.copy_up) { image_tree() } else { None };
+    let image = if p.mounts.iter().any(|m| m.copy_up) { image_tree(c".") } else { None };
     for m in &p.mounts {
         apply_mount(root, image.as_ref().map(|f| f.as_fd()), m).unwrap_or_else(|e| fail(&format!("mount {}", m.target.to_string_lossy()), e));
     }

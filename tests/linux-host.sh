@@ -68,6 +68,19 @@ t commit-renamed-dir "kept" "docker rm -f kiri-rename >/dev/null 2>&1; docker ru
 t session-own "SID=1" "docker run --rm alpine sh -c 'echo SID=\$(cut -d\" \" -f6 /proc/1/stat)'"
 t exec-session-own "own" "docker exec web sh -c 's=\$(cut -d\" \" -f6 /proc/\$\$/stat); [ \"\$s\" = \"\$\$\" ] && echo own || echo \"session \$s\"'"
 t cp "copied" "echo copied > /tmp/x && docker cp /tmp/x web:/tmp/x && docker exec web cat /tmp/x"
+# A copy into or out of a container that is not running goes through its
+# volumes and binds, as Docker's archive endpoint does: a file staged into a
+# created container's volume is there when it starts, a read-only mount or
+# root is refused in Docker's words, the innermost of nested mounts wins,
+# and an export still leaves the mounts out.
+t cp-created-volume-in "staged" "docker volume rm -f lhcp >/dev/null 2>&1; docker volume create lhcp >/dev/null; echo staged > /tmp/f; id=\$(docker create -v lhcp:/fixture alpine cat /fixture/f); docker cp /tmp/f \$id:/fixture/f && docker start -a \$id; docker rm \$id >/dev/null"
+t cp-created-volume-out "staged" "id=\$(docker create -v lhcp:/fixture alpine true); docker cp \$id:/fixture/f - | tar -xO; docker rm \$id >/dev/null"
+t cp-stopped-volume-out "ran" "id=\$(docker run -d -v lhcp:/fixture alpine sh -c 'echo ran > /fixture/r'); docker wait \$id >/dev/null; docker cp \$id:/fixture/r - | tar -xO; docker rm \$id >/dev/null"
+t cp-created-bind "bound" "mkdir -p /lhb && echo bound > /lhb/b; id=\$(docker create -v /lhb:/b alpine true); docker cp \$id:/b/b - | tar -xO; docker rm \$id >/dev/null"
+t cp-created-read-only "mounted volume is marked read-only" "id=\$(docker create -v lhcp:/fixture:ro alpine true); docker cp /tmp/f \$id:/fixture/g; docker rm \$id >/dev/null"
+t cp-created-read-only-root "container rootfs is marked read-only" "id=\$(docker create --read-only alpine true); docker cp /tmp/f \$id:/etc/f; docker rm \$id >/dev/null"
+t cp-created-nested "inner refused" "mkdir -p /lhn && echo inner > /lhn/x; id=\$(docker create -v lhcp:/app -v /lhn:/app/conf:ro alpine true); a=\$(docker cp \$id:/app/conf/x - | tar -xO); b=\$(docker cp /tmp/f \$id:/app/conf/ 2>&1 | grep -q 'marked read-only' && echo refused); echo \"\$a \$b\"; docker rm \$id >/dev/null"
+t cp-export-leaves-volumes-out "absent" "id=\$(docker create -v lhcp:/fixture alpine true); docker export \$id | tar -t | grep -q '^fixture/f' && echo present || echo absent; docker rm \$id >/dev/null; docker volume rm lhcp >/dev/null"
 # What Testcontainers needs (#222, #121); see tests/testcontainers-api.py.
 for c in version cmd keepalive follow follow-created timestamps; do
   t "testcontainers-$c" "ok $c" "for i in \$(seq 60); do command -v python3 >/dev/null && break; sleep 1; done; python3 /testcontainers-api.py /root/.kiri/run/docker.sock $c"
