@@ -29,6 +29,11 @@ thread_local! {
     static WINDOW: RefCell<Option<Retained<NSWindow>>> = const { RefCell::new(None) };
     /// The menu bar item; AppKit removes it once it is released.
     static STATUS_ITEM: RefCell<Option<Retained<AnyObject>>> = const { RefCell::new(None) };
+    /// The last left mouse-down the app received (`watch_presses`), so a
+    /// drag the page asks for starts where the button went down.
+    static PRESS: RefCell<Option<Retained<objc2_app_kit::NSEvent>>> = const { RefCell::new(None) };
+    /// The event monitor that keeps `PRESS`; kept for as long as the app runs.
+    static PRESS_MONITOR: RefCell<Option<Retained<AnyObject>>> = const { RefCell::new(None) };
 }
 
 /// `autostart` boots the VM as soon as the page has loaded; `view` picks the
@@ -131,7 +136,26 @@ fn make_window(mtm: MainThreadMarker, tx: Sender<Cmd>, autostart: bool, view: Op
     place_lights(&window);
     WEBVIEW.with(|w| *w.borrow_mut() = Some(webview));
     WINDOW.with(|w| *w.borrow_mut() = Some(window.clone()));
+    watch_presses();
     Ok(window)
+}
+
+/// Keeps each left mouse-down AppKit delivers, before the window gets it,
+/// for `drag`. The monitor hands every event on unchanged.
+fn watch_presses() {
+    use std::ptr::NonNull;
+    use objc2_app_kit::{NSEvent, NSEventMask};
+    let handler = block2::RcBlock::new(|event: NonNull<NSEvent>| -> *mut NSEvent {
+        // SAFETY: AppKit calls a local monitor on the main thread with a valid event.
+        let press = unsafe { Retained::retain(event.as_ptr()) };
+        PRESS.with(|p| *p.borrow_mut() = press);
+        event.as_ptr()
+    });
+    // SAFETY: an NSEvent class method on the main thread; the handler
+    // returns the event it was given, so delivery is as before.
+    let monitor: Option<Retained<AnyObject>> =
+        unsafe { msg_send![objc2::class!(NSEvent), addLocalMonitorForEventsMatchingMask: NSEventMask::LeftMouseDown, handler: &*handler] };
+    PRESS_MONITOR.with(|m| *m.borrow_mut() = monitor);
 }
 
 /// The page's strip across the top (index.html's `.strip`), in points.
@@ -372,17 +396,27 @@ pub(super) fn quit() {
 
 /// The page covers the title bar, and WebKit ignores CSS drag regions, so
 /// the page asks for the drag itself on mouse-down over empty chrome. The
-/// message lands after the mouse-down: if the button is already up (a quick
-/// click), AppKit's current event is the mouse-up, and a drag started then
-/// waits for a release that already happened, holding the window until the
-/// next click.
+/// message lands after the mouse-down, when AppKit's current event is often
+/// no longer it (a hand already moving sends mouse-dragged events, a Force
+/// Touch trackpad pressure ones), so nothing moved (#337). The drag starts
+/// from the real press `watch_presses` kept instead: its place and time,
+/// so the window follows the pointer from where the button went down. Only
+/// while the button is held: after a quick click the current event is the
+/// mouse-up, and a drag started then waits for a release that already
+/// happened, holding the window until the next click.
 pub(super) fn drag() {
+    use objc2_app_kit::{NSEvent, NSEventType};
     let Some(mtm) = MainThreadMarker::new() else { return };
+    if NSEvent::pressedMouseButtons() & 1 == 0 {
+        return;
+    }
     WINDOW.with(|w| {
-        if let (Some(window), Some(event)) = (w.borrow().as_ref(), NSApplication::sharedApplication(mtm).currentEvent()) {
-            if event.r#type() == objc2_app_kit::NSEventType::LeftMouseDown && objc2_app_kit::NSEvent::pressedMouseButtons() & 1 != 0 {
-                window.performWindowDragWithEvent(&event);
-            }
+        let Some(window) = w.borrow().clone() else { return };
+        // This window's press; without one (none seen yet), the current event if it is a press.
+        let press = PRESS.with(|p| p.borrow().clone()).filter(|e| e.windowNumber() == window.windowNumber());
+        let down = press.or_else(|| NSApplication::sharedApplication(mtm).currentEvent().filter(|e| e.r#type() == NSEventType::LeftMouseDown));
+        if let Some(down) = down {
+            window.performWindowDragWithEvent(&down);
         }
     });
 }
