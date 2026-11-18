@@ -2,7 +2,7 @@
 """What Testcontainers (docker-java, .NET, Go) needs of the engine API, asked
 the way those clients ask: raw HTTP/1.1 on one kept-alive connection.
 
-    tests/testcontainers-api.py SOCKET [version|cmd|keepalive|follow|follow-created|timestamps|exec|endpoints ...]
+    tests/testcontainers-api.py SOCKET [version|cmd|keepalive|follow|follow-created|timestamps|exec|endpoints|copy-after-start ...]
 
 Prints one line per check, "ok <name>" or "FAIL <name>: why", and exits 1 if
 any failed. The containers it makes (tc-api-*) are left running.
@@ -299,10 +299,60 @@ def check_endpoints():
     return "joins only the networks named in EndpointsConfig, its alias resolves, and an internal one doesn't take the default route"
 
 
+def check_copy_after_start():
+    # Testcontainers' LocalStack (Java) starts a container that waits for a
+    # script, then uploads it with PUT /archive straight after /start. An
+    # image VOLUME with content is copied into the new volume while the
+    # container sets up its root; an upload in that window answered 200 and
+    # went into the wrong root, so the file never appeared (#527, #311).
+    c = Conn(timeout=300)
+    image = "tc-api-bigvol:latest"
+    status, _, _ = c.request("GET", f"/images/{image}/json")
+    if status != 200:
+        src = fresh(c, "tc-api-bigvol-src", ["sh", "-c", "mkdir -p /data && i=0; while [ $i -lt 4000 ]; do head -c 50000 /dev/urandom > /data/f$i; i=$((i+1)); done"])
+        status, _, data = c.request("POST", f"/containers/{src}/start")
+        assert status == 204, f"start {status} {data[:200]!r}"
+        status, _, data = c.request("POST", f"/containers/{src}/wait")
+        assert status == 200 and json.loads(data)["StatusCode"] == 0, f"filling /data: {status} {data[:200]!r}"
+        status, _, data = c.request("POST", "/commit?container=tc-api-bigvol-src&repo=tc-api-bigvol&tag=latest", {"Volumes": {"/data": {}}})
+        assert status == 201, f"commit {status} {data[:200]!r}"
+        c.request("DELETE", "/containers/tc-api-bigvol-src?force=1")
+    script = b"#!/bin/sh\necho Ready.\nsleep 600\n"
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        entry = tarfile.TarInfo("tc_start.sh")
+        entry.size, entry.mode = len(script), 0o755
+        tar.addfile(entry, io.BytesIO(script))
+    lost = []
+    for run in range(3):
+        name = f"tc-api-copy-{run}"
+        c.request("DELETE", f"/containers/{name}?force=1&v=1")
+        status, _, data = c.request("POST", f"/containers/create?name={name}", {
+            "Image": image, "Cmd": [],
+            "Entrypoint": ["sh", "-c", "while [ ! -f /tc_start.sh ]; do sleep 0.1; done; /tc_start.sh"]})
+        assert status == 201, f"create {status} {data[:200]!r}"
+        cid = json.loads(data)["Id"]
+        status, _, data = c.request("POST", f"/containers/{cid}/start")
+        assert status == 204, f"start {status} {data[:200]!r}"
+        status, _, data = c.request("PUT", f"/containers/{cid}/archive?path=/", buf.getvalue(), "application/x-tar")
+        assert status == 200, f"archive {status} {data[:200]!r}"
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            _, _, logs = c.request("GET", f"/containers/{cid}/logs?stdout=1&stderr=1")
+            if b"Ready." in logs:
+                break
+            time.sleep(0.25)
+        else:
+            lost.append(run + 1)
+        c.request("DELETE", f"/containers/{cid}?force=1&v=1")
+    assert not lost, f"PUT /archive answered 200 but the file never appeared in run(s) {lost} of 3"
+    return "a file uploaded straight after /start is there, 3 of 3"
+
+
 CHECKS = {
     "version": check_version, "cmd": check_cmd, "keepalive": check_keepalive,
     "follow": check_follow, "follow-created": check_follow_created, "timestamps": check_timestamps,
-    "exec": check_exec, "endpoints": check_endpoints,
+    "exec": check_exec, "endpoints": check_endpoints, "copy-after-start": check_copy_after_start,
 }
 
 if __name__ == "__main__":

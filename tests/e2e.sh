@@ -82,7 +82,7 @@ t version-api "1.47" $D version --format '{{.Server.APIVersion}}'
 # Engine version (Kiri's own beside it), the image's CMD for "Cmd": [], the
 # connection kept after a copy, log follow, one timestamp a line.
 t version-kiri-component "Kiri=" $D version --format '{{range .Server.Components}}{{.Name}}={{.Version}} {{end}}'
-for c in version cmd keepalive follow follow-created timestamps exec endpoints; do
+for c in version cmd keepalive follow follow-created timestamps exec endpoints copy-after-start; do
   t "testcontainers-$c" "ok $c" python3 "$(dirname "$0")/testcontainers-api.py" "$SOCK" "$c"
 done
 # Ryuk mounts the engine's socket and talks to it from inside.
