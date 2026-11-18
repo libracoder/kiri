@@ -903,6 +903,12 @@ fn finish(conn: &mut File, dns: &mut super::dns::Dns, procs: &HashMap<libc::pid_
     Ok(())
 }
 
+/// The most `admit` forwards of an exited process's leftover output, per
+/// stream. More than a pipe holds (64 KiB by default, 1 MiB at most for a
+/// process without privileges), so nothing written before is lost; and an
+/// end to it, since a process the old one left behind can write for ever.
+const LAST_OUTPUT_MAX: usize = 1 << 20;
+
 /// Adds a started process. An exited one whose output is still being read
 /// can hold the same pid, which `reap` freed and a new clone just took:
 /// replaced silently, its exit was never reported (a `docker wait` or exec
@@ -917,17 +923,20 @@ fn admit(conn: &mut File, dns: &mut super::dns::Dns, procs: &mut HashMap<libc::p
             let Some(fd) = fd else { continue };
             // Only what is in the pipe already. A process the old one left
             // behind in a session of its own can still hold the write end:
-            // a read that waited for it would hold up every container.
+            // a read that waited for it would hold up every container, and
+            // so would following one that never stops writing.
             if sys::set_nonblocking(fd.as_raw_fd()).is_err() {
                 continue;
             }
-            loop {
+            let mut left = LAST_OUTPUT_MAX;
+            while left > 0 {
                 // SAFETY: reading into a buffer we own from a descriptor we
                 // own, made non-blocking just above.
-                let got = unsafe { libc::read(fd.as_raw_fd(), chunk.as_mut_ptr().cast(), chunk.len()) };
+                let got = unsafe { libc::read(fd.as_raw_fd(), chunk.as_mut_ptr().cast(), chunk.len().min(left)) };
                 if got <= 0 {
                     break;
                 }
+                left -= got as usize;
                 out.clear();
                 Msg::Output { id: &old.run.id, stream, data: &chunk[..got as usize] }.encode(&mut out);
                 conn.write_all(&out)?;
@@ -1066,6 +1075,58 @@ mod running_tests {
         drop(held);
         thread.join().unwrap();
         assert_eq!(got, Ok((true, true, "new".to_owned())), "the old one's last output and exit go out, and nothing waits for the pipe to close");
+    }
+
+    /// The process left behind may also never stop writing. The agent has
+    /// one thread: following that output held up every container.
+    #[test]
+    fn a_new_process_on_a_freed_pid_does_not_follow_a_writer_that_never_stops() {
+        use kiri_proto::Msg;
+        use std::io::Write;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (out_r, out_w) = super::super::sys::pipe().unwrap();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let writer = {
+            let stop = stop.clone();
+            let mut w = std::fs::File::from(out_w);
+            let block = [b'x'; 4096];
+            // Some of it is in the pipe before the new process arrives.
+            w.write_all(&block).unwrap();
+            std::thread::spawn(move || while !stop.load(Ordering::SeqCst) && w.write_all(&block).is_ok() {})
+        };
+        let (mut host, mut conn) = pipe();
+        // The daemon's end: it reads what the agent sends, as it always does.
+        let reader = std::thread::spawn(move || {
+            let (mut frame, mut output, mut exited) = (Vec::new(), 0usize, false);
+            while super::read_frame(&mut host, &mut frame).unwrap_or(false) {
+                match kiri_proto::decode(&frame) {
+                    Ok(Msg::Output { id: "old", data, .. }) => output += data.len(),
+                    Ok(Msg::Exited(e)) if e.id == "old" => exited = true,
+                    _ => {}
+                }
+            }
+            (output, exited)
+        });
+        let (done, waited) = std::sync::mpsc::channel();
+        let agent = std::thread::spawn(move || {
+            let mut dns = super::super::dns::Dns::default();
+            let mut procs = HashMap::new();
+            let mut old = new_proc(Process::for_test("old", 100), 0, 0);
+            old.run.stdout = Some(out_r);
+            old.exited = Some((0, 0));
+            procs.insert(100, old);
+            super::admit(&mut conn, &mut dns, &mut procs, new_proc(Process::for_test("new", 100), 0, 0)).unwrap();
+            let _ = done.send(procs[&100].run.id.clone());
+        });
+        let got = waited.recv_timeout(std::time::Duration::from_secs(10));
+        // Whatever happened, the writer stops now, so every thread ends.
+        stop.store(true, Ordering::SeqCst);
+        agent.join().unwrap();
+        writer.join().unwrap();
+        let (output, exited) = reader.join().unwrap();
+        assert_eq!(got, Ok("new".to_owned()), "the new process is taken in while the writer is still writing");
+        assert!(exited, "the old one's exit goes out");
+        assert!(output > 0 && output <= super::LAST_OUTPUT_MAX, "its buffered output goes out, up to the limit: {output}");
     }
 }
 
