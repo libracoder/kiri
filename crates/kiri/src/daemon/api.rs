@@ -1385,19 +1385,41 @@ fn inspect_exposed(ports: &[super::ports::Binding], exposed: &[u16]) -> Value {
     if m.is_empty() { Value::Null } else { Value::Object(m) }
 }
 
-/// Docker's `NetworkSettings.Ports` map for inspect and `docker port`.
+/// Docker's `NetworkSettings.Ports` map for inspect and `docker port`. A
+/// port the image exposes that is not published is a key with a null value,
+/// as Docker lists it: Traefik's docker provider finds its port there (#492).
 fn ports_map(c: &Container) -> Value {
+    ports_json(c.forwards.as_ref().map_or(&[][..], |f| &f.bound), &c.spec.exposed)
+}
+
+fn ports_json(bound: &[(super::ports::Binding, String, u16)], exposed: &[u16]) -> Value {
     let mut m = serde_json::Map::new();
-    if let Some(fw) = &c.forwards {
-        for (b, ip, port) in &fw.bound {
-            let key = format!("{}/{}", b.container_port, b.proto);
-            let entry = m.entry(key).or_insert_with(|| json!([]));
-            if let Some(a) = entry.as_array_mut() {
-                a.push(json!({"HostIp": ip, "HostPort": port.to_string()}));
-            }
+    for (b, ip, port) in bound {
+        let key = format!("{}/{}", b.container_port, b.proto);
+        let entry = m.entry(key).or_insert_with(|| json!([]));
+        if let Some(a) = entry.as_array_mut() {
+            a.push(json!({"HostIp": ip, "HostPort": port.to_string()}));
         }
     }
+    for p in exposed {
+        m.entry(format!("{p}/tcp")).or_insert(Value::Null);
+    }
     Value::Object(m)
+}
+
+/// `--filter ancestor=<value>` against one container's image (`image` its
+/// reference, `image_id` its config digest), where `resolved` is the config
+/// digest the store knows `value` by (the value itself when the image is no
+/// longer in the store). A resolved value matches by image identity, so
+/// `ancestor=alpine` lists alpine:latest's containers and not alpine:3.20's
+/// (#442); an unresolved one keeps the exact reference, plus the image-id
+/// prefix a digest filter gives.
+fn same_image(image: &str, image_id: &str, value: &str, resolved: &str) -> bool {
+    if resolved != value {
+        image_id == resolved
+    } else {
+        image == value || image_id.trim_start_matches("sha256:").starts_with(value.trim_start_matches("sha256:"))
+    }
 }
 
 /// `[rows, cols]`, as Docker sends `ConsoleSize`; zeros mean unknown.
@@ -1410,12 +1432,15 @@ fn console_size(v: &Value) -> Option<(u16, u16)> {
 /// A create's Entrypoint and Cmd with the image's, by Docker's rules: a
 /// non-empty Entrypoint drops the image's Cmd; otherwise an empty or missing
 /// Cmd takes the image's (Testcontainers sends `"Cmd": []`), and a missing
-/// Entrypoint the image's (`[]` clears it).
+/// Entrypoint the image's (`[]` clears it). An entrypoint of only empty
+/// strings (`--entrypoint=` sends `[""]`) clears it too, as Docker resets
+/// the image's entrypoint then (#445).
 fn command(entry: Option<Vec<String>>, cmd: Option<Vec<String>>, image_entry: &[String], image_cmd: &[String]) -> (Vec<String>, Vec<String>) {
     let cmd = cmd.unwrap_or_default();
     match entry {
-        Some(e) if !e.is_empty() => (e, cmd),
-        e => (e.unwrap_or_else(|| image_entry.to_vec()), if cmd.is_empty() { image_cmd.to_vec() } else { cmd }),
+        Some(e) if e.iter().any(|s| !s.is_empty()) => (e, cmd),
+        Some(_) => (Vec::new(), if cmd.is_empty() { image_cmd.to_vec() } else { cmd }),
+        None => (image_entry.to_vec(), if cmd.is_empty() { image_cmd.to_vec() } else { cmd }),
     }
 }
 
@@ -1943,6 +1968,14 @@ fn list(req: &Request, engine: &Engine) -> Result<Value, Error> {
     // A status filter lists stopped containers without --all, as Docker does.
     let all = req.flag("all") || f.values("status").is_some() || f.values("exited").is_some();
     let networks: Vec<super::network::Network> = engine.lock_net().all().to_vec();
+    // `ancestor` names one image, not a pattern over its tags: `alpine` is
+    // alpine:latest, never alpine:3.20 (#442). Each value resolves through
+    // the store to the image's config digest once, up front; a value the
+    // store no longer knows stays as it is, matched by [`same_image`].
+    let ancestors: Vec<String> = f
+        .values("ancestor")
+        .map(|vs| vs.iter().map(|v| engine.store.find(v).ok().flatten().map_or_else(|| v.clone(), |i| i.config_digest)).collect())
+        .unwrap_or_default();
     let mut rows = engine.each(|c| {
         if !all && c.status != Status::Running {
             return None;
@@ -1954,7 +1987,7 @@ fn list(req: &Request, engine: &Engine) -> Result<Value, Error> {
             && f.labels(&labels)
             && f.any("status", |v| v == state_word(c))
             && f.any("exited", |v| c.status == Status::Exited && v.parse() == Ok(c.exit_code))
-            && f.any("ancestor", |v| reference_matches(v, &c.spec.image) || c.spec.image == v || c.spec.image_id.trim_start_matches("sha256:").starts_with(v.trim_start_matches("sha256:")))
+            && f.values("ancestor").is_none_or(|vs| vs.iter().zip(&ancestors).any(|(v, r)| same_image(&c.spec.image, &c.spec.image_id, v, r)))
             && f.any("network", |v| net.is_some_and(|n| n.name == v || n.id.starts_with(v)))
             && f.any("volume", |v| c.spec.volumes.iter().chain(&c.spec.anon_volumes).any(|n| n == v) || c.spec.mount_info.iter().any(|m| m["Destination"] == v || m["Source"] == v))
             && f.any("health", |v| v == health.get(&c.id).map_or("none", |h| h.status.as_str()));
@@ -2940,6 +2973,40 @@ mod tests {
         assert_eq!(command(Some(s(&["sh"])), Some(s(&["-c", "x"])), &ie, &ic), (s(&["sh"]), s(&["-c", "x"])));
         // "Entrypoint": [] clears the image's and keeps its Cmd.
         assert_eq!(command(Some(vec![]), None, &ie, &ic), (vec![], ic.clone()));
+        // --entrypoint= ([""], or only empty strings) resets it too, so Cmd
+        // runs on its own (#445): mailcow's backup and Docker's own docs do it.
+        assert_eq!(command(Some(s(&[""])), Some(s(&["/bin/sh", "-c"])), &ie, &ic), (vec![], s(&["/bin/sh", "-c"])));
+        assert_eq!(command(Some(s(&["", ""])), None, &ie, &ic), (vec![], ic.clone()));
+    }
+
+    /// `--filter ancestor=` matches by image, not by a pattern over its
+    /// tags (#442).
+    #[test]
+    fn ancestor_filter_matches_one_image_not_its_other_tags() {
+        let latest = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+        let three20 = "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+        // Resolved to alpine:latest's digest: only that image's containers.
+        assert!(same_image("alpine:latest", latest, "alpine", latest));
+        assert!(!same_image("alpine:3.20", three20, "alpine", latest));
+        assert!(!same_image("alpine:3.20", three20, "alpine:latest", latest));
+        // The exact reference the container was made with still matches.
+        assert!(same_image("alpine:3.20", three20, "alpine:3.20", "alpine:3.20"));
+        assert!(!same_image("alpine:3.20", three20, "alpine", "alpine"));
+        // A digest filter is an id (prefix).
+        assert!(same_image("alpine:latest", latest, "sha256:1111", "sha256:1111"));
+        assert!(!same_image("alpine:3.20", three20, "sha256:1111", "sha256:1111"));
+    }
+
+    /// Exposed-but-unpublished ports are null entries, as Docker lists
+    /// them in `NetworkSettings.Ports` (#492).
+    #[test]
+    fn ports_map_lists_exposed_unpublished_as_null() {
+        let binding = |p: u16| super::super::ports::Binding { container_port: p, proto: "tcp".into(), host_ip: String::new(), host_port: 0 };
+        let bound = vec![(binding(443), "127.0.0.1".to_owned(), 8443u16)];
+        // 80 exposed by the image, not published: null. 443 published: its
+        // binding. A published port is not repeated as null.
+        assert_eq!(ports_json(&bound, &[80]), json!({"443/tcp": [{"HostIp": "127.0.0.1", "HostPort": "8443"}], "80/tcp": null}));
+        assert_eq!(ports_json(&[], &[]), json!({}));
     }
 
     #[test]

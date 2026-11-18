@@ -122,6 +122,11 @@ impl Image {
 #[derive(Debug)]
 pub struct Store {
     root: PathBuf,
+    /// Copies of damaged indexes beside `images.json`, oldest first, and
+    /// the ones made while this store was open: an image missing from the
+    /// repaired list can still be in them, so the layers it unpacked are
+    /// not deleted while a copy is kept (#440).
+    damaged: std::sync::Mutex<Vec<PathBuf>>,
 }
 
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -197,7 +202,10 @@ impl Store {
         let root = root.into();
         fs::create_dir_all(root.join("blobs/sha256"))?;
         fs::create_dir_all(root.join("tmp"))?;
-        Ok(Store { root })
+        // Copies of an index damaged by an earlier run: still someone's
+        // images. A folder `open` could create can be listed.
+        let damaged = crate::jsonfile::kept_copies(&root.join("images.json")).unwrap_or_default();
+        Ok(Store { root, damaged: std::sync::Mutex::new(damaged) })
     }
 
     pub fn root(&self) -> &Path {
@@ -326,7 +334,17 @@ impl Store {
             "image index unreadable ({error}): {kept}, {} image(s) recovered{wrote}",
             images.len()
         ));
+        if let Ok(aside) = &moved {
+            self.damaged.lock().unwrap_or_else(|e| e.into_inner()).push(aside.clone());
+        }
         images
+    }
+
+    /// The copies of damaged indexes kept beside `images.json`, oldest
+    /// first: while one is there, an image missing from the repaired list
+    /// may still be in it, so what it left behind is not deleted (#440).
+    pub fn damage_copies(&self) -> Vec<PathBuf> {
+        self.damaged.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     pub fn find(&self, name: &str) -> io::Result<Option<Image>> {
@@ -669,6 +687,34 @@ mod tests {
         store.put_image(named("after:1")).unwrap();
         assert_eq!(names(&store).len(), 8);
         assert_eq!(corrupt_files(&root).len(), 1);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A damaged index is remembered while a copy of it is kept: the engine
+    /// says so in `docker info` and deletes no unpacked layer for it (#440).
+    #[test]
+    fn damage_is_reported_until_no_copy_is_left() {
+        let root = scratch("damage-reported");
+        let _ = fs::remove_dir_all(&root);
+        let store = Store::open(&root).unwrap();
+        assert!(store.damage_copies().is_empty());
+        store.put_image(named("kept:1")).unwrap();
+        store.put_image(named("lost:1")).unwrap();
+        let path = root.join("images.json");
+        let bytes = fs::read(&path).unwrap();
+        let cut = bytes.len() - 20;
+        fs::write(&path, &bytes[..cut]).unwrap();
+        // The repair runs on the next read; the copy it keeps is reported…
+        let _ = store.images().unwrap();
+        let copies = store.damage_copies();
+        assert_eq!(copies.len(), 1);
+        assert_eq!(copies[0], corrupt_files(&root)[0]);
+        // …also to the next engine start, which finds the copy beside the file.
+        let reopened = Store::open(&root).unwrap();
+        assert_eq!(reopened.damage_copies(), copies);
+        // Removing the copy (its images put back, or given up on) ends it.
+        fs::remove_file(&copies[0]).unwrap();
+        assert!(Store::open(&root).unwrap().damage_copies().is_empty());
         fs::remove_dir_all(&root).unwrap();
     }
 

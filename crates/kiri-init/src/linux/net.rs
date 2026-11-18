@@ -588,7 +588,7 @@ fn ipv6_forwarding(on: bool) -> io::Result<()> {
         let mut raised = Vec::new();
         for entry in std::fs::read_dir(conf)?.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
-            if matches!(name.as_str(), "all" | "default" | "lo") || name.starts_with("kiri") || name.starts_with("kv") {
+            if matches!(name.as_str(), "all" | "default" | "lo") || name.starts_with("kiri") || name.starts_with("kv") || made(&name) {
                 continue;
             }
             let path = format!("{conf}/{name}/accept_ra");
@@ -611,6 +611,13 @@ fn ipv6_forwarding(on: bool) -> io::Result<()> {
 
 /// Every bridge this agent brought up, for `remove_bridges`.
 static MADE_BRIDGES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Whether this agent brought up the bridge `name` — also when the person
+/// named it themselves with `com.docker.network.bridge.name` (#423), which
+/// is why a `kiri` prefix can't say it.
+pub fn made(name: &str) -> bool {
+    MADE_BRIDGES.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|m| m == name)
+}
 
 /// Linux host, stopping: removes the bridges this agent brought up (only
 /// those: another engine's may share the network namespace) and Kiri's

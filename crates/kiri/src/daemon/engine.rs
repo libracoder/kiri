@@ -511,6 +511,25 @@ fn fingerprint(bytes: &[u8]) -> (usize, u64) {
     (bytes.len(), h.finish())
 }
 
+/// The container's /etc/hosts lines: Kiri's own names for reaching the host
+/// (as with Docker Desktop and OrbStack), then the person's `--add-host`
+/// ones (already `ip\tname`), then links. A name the person mapped is left
+/// out of Kiri's line, so their mapping is the first for it in /etc/hosts —
+/// and lookups take the first match — rather than Kiri's own address (#425).
+fn hosts_lines(extra: &[String], links: &[String]) -> Vec<String> {
+    let mapped = |name: &str| extra.iter().any(|h| h.split_once('\t').is_some_and(|(_, names)| names.split_whitespace().any(|n| n == name)));
+    let mut hosts = Vec::new();
+    for names in [&["host.docker.internal", "host.kiri.internal"][..], &["gateway.docker.internal"][..]] {
+        let kept: Vec<&str> = names.iter().copied().filter(|n| !mapped(n)).collect();
+        if !kept.is_empty() {
+            hosts.push(format!("{}\t{}", super::ports::HOST_ADDR, kept.join(" ")));
+        }
+    }
+    hosts.extend(extra.iter().cloned());
+    hosts.extend(links.iter().cloned());
+    hosts
+}
+
 /// How to restart the engine itself on this system, for the warning: the
 /// window's Stop and Quit leave it running.
 fn restart_hint() -> String {
@@ -899,9 +918,18 @@ impl Engine {
         Ok(engine)
     }
 
-    /// Why the container list may be missing containers, for `docker info`.
+    /// Why the container or image list may be missing records, for
+    /// `docker info`.
     pub fn records_damage(&self) -> Vec<String> {
-        self.records_damage.lock().unwrap_or_else(|e| e.into_inner()).message(&self.records).into_iter().collect()
+        let mut out = self.records_damage.lock().unwrap_or_else(|e| e.into_inner()).message(&self.records).into_iter().collect::<Vec<_>>();
+        let copies = self.store.damage_copies();
+        if !copies.is_empty() {
+            let dir = self.store.root().display().to_string();
+            let all = copies.iter().map(|c| c.display().to_string()).collect::<Vec<_>>().join(", ");
+            let (what, is, it) = if copies.len() == 1 { ("a copy is", "is", "it") } else { ("copies are", "are", "they") };
+            out.push(format!("The image list in {dir} was damaged; {what} kept at {all}. Images missing from `docker images` can be read back from the copy, and their unpacked layers are kept while {it} {is} there."));
+        }
+        out
     }
 
     /// Whether nothing is deleted for not being in the container list.
@@ -1012,9 +1040,12 @@ impl Engine {
             None => crate::diag::warn!("kept every container's files and layers: the container list was damaged"),
         }
         // And every unpacked layer no image or container uses. Skipped if
-        // the image list can't be read, rather than deleting everything.
+        // the image list can't be read, or was damaged and a copy of it is
+        // kept beside the file (an image the repair dropped may still be in
+        // there), rather than deleting everything (#440).
         match self.store.images() {
             _ if keep.is_none() => {}
+            _ if !self.store.damage_copies().is_empty() => crate::diag::warn!("kept every unpacked layer: the image list was damaged and a copy is kept beside it"),
             Ok(images) => {
                 let mut layers: std::collections::BTreeSet<String> = images.iter().flat_map(|i| i.layers.iter().map(|l| l.digest.clone())).collect();
                 layers.extend(self.lock().containers.values().flat_map(|c| c.layers.iter().cloned()));
@@ -2499,13 +2530,10 @@ impl Engine {
             flags |= run_flags::INIT;
         }
         flags |= spec.security_flags();
-        // Every container can reach the Mac, as with Docker Desktop and OrbStack.
-        let mut hosts = vec![
-            format!("{}\thost.docker.internal host.kiri.internal", super::ports::HOST_ADDR),
-            format!("{}\tgateway.docker.internal", super::ports::HOST_ADDR),
-        ];
-        hosts.extend(spec.extra_hosts.iter().cloned());
-        hosts.extend(links);
+        // Every container can reach the Mac, as with Docker Desktop and
+        // OrbStack — except a name mapped with `--add-host`, see
+        // [`hosts_lines`] (#425).
+        let hosts = hosts_lines(&spec.extra_hosts, &links);
         let mut opts = net_opts(&spec, joined.as_deref(), &domainname);
         opts.extend(net6_opts);
         let net_args = kiri_proto::Net { bridge: &bridge, ip, prefix, gateway, extra_hosts: &hosts, dns_names: &dns_names, opts: &opts };
@@ -5225,5 +5253,38 @@ mod save_speed_tests {
         assert!(saves < unsynced * 8 + Duration::from_millis(500), "{saves:?} for saves against {unsynced:?} unsynced");
         drop(engine);
         let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+mod hosts_lines_tests {
+    use super::hosts_lines;
+
+    /// `--add-host` for one of Kiri's own names wins over Kiri's line, and
+    /// the names Kiri still owns keep their line (#425).
+    #[test]
+    fn add_host_beats_kiris_own_line_per_name() {
+        let s = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        let addr = crate::daemon::ports::HOST_ADDR;
+        // Nothing mapped: the builtin lines, then the person's, then links.
+        assert_eq!(hosts_lines(&s(&["10.9.8.7\twinhost"]), &s(&["172.17.0.3\tdb"])), s(&[
+            &format!("{addr}\thost.docker.internal host.kiri.internal"),
+            &format!("{addr}\tgateway.docker.internal"),
+            "10.9.8.7\twinhost",
+            "172.17.0.3\tdb",
+        ]));
+        // host.docker.internal mapped: Kiri's line keeps only
+        // host.kiri.internal, and the person's mapping is the only line for
+        // the name it maps.
+        assert_eq!(hosts_lines(&s(&["10.9.8.7\thost.docker.internal"]), &[]), s(&[
+            &format!("{addr}\thost.kiri.internal"),
+            &format!("{addr}\tgateway.docker.internal"),
+            "10.9.8.7\thost.docker.internal",
+        ]));
+        // All of Kiri's names mapped: no builtin line at all.
+        assert_eq!(
+            hosts_lines(&s(&["10.9.8.7\thost.docker.internal", "10.9.8.8\thost.kiri.internal", "10.9.8.9\tgateway.docker.internal"]), &[]),
+            s(&["10.9.8.7\thost.docker.internal", "10.9.8.8\thost.kiri.internal", "10.9.8.9\tgateway.docker.internal"])
+        );
     }
 }

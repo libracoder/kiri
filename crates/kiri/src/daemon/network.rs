@@ -650,17 +650,38 @@ impl Networks {
                 used: BTreeSet::new(),
             })
         } else {
+            // Docker creates the network IPv4-only and ignores an IPv6
+            // subnet when IPv6 is off — Compose writes one into every
+            // dual-stack file, and mailcow ships `enable_ipv6: false` beside
+            // it — so Kiri does too, with a note in the log (#433).
             if s.ipam6.is_some() {
-                return Err("invalid network config: an IPv6 subnet needs IPv6 enabled (--ipv6, Compose enable_ipv6: true)".into());
+                crate::diag::warn!("network {name}: an IPv6 subnet was given but IPv6 is disabled; the subnet is ignored, as Docker does");
             }
             None
         };
-        let index = (1..).find(|i| !self.list.iter().any(|n| n.bridge == format!("kiri{i}"))).expect("unbounded");
+        // `com.docker.network.bridge.name`: the interface in the guest, as
+        // the person asked for it — firewall rules are written against that
+        // name — instead of the next `kiri<n>` (#423). Linux caps an
+        // interface name at 15 bytes; Kiri's own bridges are refused, as
+        // another network's bridge or the default bridge would be taken.
+        let bridge = match s.options.get("com.docker.network.bridge.name").and_then(|v| v.as_str()) {
+            Some("") | None => {
+                let index = (1..).find(|i| !self.list.iter().any(|n| n.bridge == format!("kiri{i}"))).expect("unbounded");
+                format!("kiri{index}")
+            }
+            Some(want) if want.len() <= 15 && want.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)) => {
+                if self.list.iter().any(|n| n.bridge == want) {
+                    return Err(format!("invalid network config: bridge name {want} is already in use"));
+                }
+                want.to_owned()
+            }
+            Some(want) => return Err(format!("invalid network config: com.docker.network.bridge.name must be at most 15 letters, digits, dots, dashes or underscores: {want:?}")),
+        };
         let n = Network {
             id: super::engine::random_hex(32),
             name: name.into(),
             driver: "bridge".into(),
-            bridge: format!("kiri{index}"),
+            bridge,
             subnet: subnet.0,
             prefix: subnet.1,
             gateway,
@@ -894,6 +915,49 @@ mod tests {
         Settings { labels: serde_json::json!({}), ipv6: true, ipam6, ..Default::default() }
     }
 
+    /// An IPv6 subnet with IPv6 off is ignored, as Docker does: Compose
+    /// writes one into every dual-stack file and mailcow ships
+    /// `enable_ipv6: false` beside it (#433).
+    #[test]
+    fn ipv6_subnet_with_ipv6_off_is_ignored() {
+        let (mut n, dir) = nets();
+        let (ipam, ipam6) = parse_ipam_both(&serde_json::json!({"Config": [
+            {"Subnet": "172.22.1.0/24"},
+            {"Subnet": "fd4d:6169:6c63:6f77::/64"},
+        ]})).unwrap();
+        let made = n.create("app", Settings { ipv6: false, ipam, ipam6, ..Default::default() }).unwrap();
+        assert_eq!(made.subnet, [172, 22, 1, 0]);
+        assert!(made.v6.is_none());
+        drop(n);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `com.docker.network.bridge.name` names the guest's interface (#423).
+    #[test]
+    fn custom_bridge_name_is_used_and_checked() {
+        let (mut n, dir) = nets();
+        let opts = |name: &str, subnet: &str| Settings {
+            options: serde_json::json!({"com.docker.network.bridge.name": name}),
+            ipam: parse_ipam(&serde_json::json!({"Config": [{"Subnet": subnet}]})).unwrap(),
+            ..Default::default()
+        };
+        let made = n.create("isolated-check", opts("cp-isolated", "172.19.0.0/16")).unwrap();
+        assert_eq!(made.bridge, "cp-isolated");
+        // A second network can't take the same interface, and Kiri's own
+        // (kiri0, the default bridge) is as taken as any other.
+        assert!(n.create("again", opts("cp-isolated", "172.20.0.0/16")).unwrap_err().contains("already in use"));
+        assert!(n.create("mine", opts("kiri0", "172.21.0.0/16")).unwrap_err().contains("already in use"));
+        // Linux caps an interface name at 15 bytes, and only takes these.
+        assert!(n.create("long", opts("a-bridge-name-too-long", "172.22.0.0/16")).unwrap_err().contains("at most 15"));
+        assert!(n.create("odd", opts("bad/name", "172.23.0.0/16")).unwrap_err().contains("at most 15"));
+        // Saved and loaded back with its name.
+        let saved = n.find("isolated-check").unwrap().bridge.clone();
+        drop(n);
+        let re = Networks::load(&dir).unwrap();
+        assert_eq!(re.find("isolated-check").unwrap().bridge, saved);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn ipv6_networks_get_a_ula_subnet_and_addresses() {
         let (mut n, dir) = nets();
@@ -936,9 +1000,10 @@ mod tests {
         assert_eq!(kv.subnet_str(), "fc00:f853:ccd:e793::/64");
         assert_eq!(ip6_str(kv.gateway), "fc00:f853:ccd:e793::1");
         assert!(n.create("again", v6(ipam("fc00:f853:ccd:e793::/80"))).unwrap_err().contains("Pool overlaps"));
-        // A subnet without --ipv6 is refused, not dropped.
+        // A subnet without --ipv6 is ignored, as Docker does (#433).
         let no = Settings { ipam6: ipam("fd00:9::/64"), ..Default::default() };
-        assert!(n.create("no", no).unwrap_err().contains("IPv6 enabled"));
+        let made = n.create("no", no).unwrap();
+        assert!(made.v6.is_none() && made.subnet == [172, 19, 0, 0]);
         // Fixed addresses: in the subnet, free, not the gateway.
         let want = parse_ip6("fc00:f853:ccd:e793::10");
         assert_eq!(n.allocate6("kind", want, &[]), Ok(want));

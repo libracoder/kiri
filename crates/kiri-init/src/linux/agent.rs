@@ -499,8 +499,10 @@ pub fn serve(mut conn: File, paths: &Paths) -> io::Result<()> {
                     continue;
                 }
                 Ok(Msg::RemoveBridge { bridge }) => {
-                    // Only Kiri's own bridges, never another interface.
-                    if bridge.starts_with("kiri") && bridge != "kiri0" {
+                    // Only bridges this agent brought up — a person's own
+                    // `com.docker.network.bridge.name` included (#423) —
+                    // never another interface.
+                    if bridge != "kiri0" && net::made(bridge) {
                         dns.forget_bridge(bridge);
                         bridges.remove(bridge);
                     }
