@@ -508,6 +508,14 @@ fn images(req: &Request, engine: &Engine) -> Result<Value, Error> {
 
 fn image_inspect(engine: &Engine, name: &str) -> Result<Value, Error> {
     let i = engine.image(name)?.ok_or_else(|| Error::NotFound(format!("No such image: {name}")))?;
+    let cfg: Value = engine.store.read_config(&i.config_digest).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null);
+    // Docker's RootFS.Layers are the image config's uncompressed diff_ids,
+    // not the manifest's compressed blob digests (scanners like Trivy match
+    // them against the tar layers from `docker save`).
+    let rootfs_layers: Vec<Value> = match cfg["rootfs"]["diff_ids"].as_array() {
+        Some(ids) => ids.clone(),
+        None => i.layers.iter().map(|l| Value::String(l.digest.clone())).collect(),
+    };
     Ok(json!({
         "Id": i.config_digest,
         "RepoTags": [i.name],
@@ -522,9 +530,9 @@ fn image_inspect(engine: &Engine, name: &str) -> Result<Value, Error> {
             "Entrypoint": if i.config.entrypoint.is_empty() { Value::Null } else { json!(i.config.entrypoint) },
             "WorkingDir": i.config.working_dir,
             "User": i.config.user,
-            "Healthcheck": image_healthcheck(engine, &i),
+            "Healthcheck": cfg["config"]["Healthcheck"].clone(),
         },
-        "RootFS": {"Type": "layers", "Layers": i.layers.iter().map(|l| &l.digest).collect::<Vec<_>>()},
+        "RootFS": {"Type": cfg["rootfs"]["type"].as_str().unwrap_or("layers"), "Layers": rootfs_layers},
     }))
 }
 
@@ -1819,12 +1827,6 @@ fn healthcheck_from(body: &Value, image_cfg: &Value) -> Result<Option<super::hea
         h.validate().map_err(Error::BadRequest)?;
     }
     Ok(super::health::merge(mine, Healthcheck::from_json(&image_cfg["config"]["Healthcheck"])))
-}
-
-/// The image's HEALTHCHECK, which Kiri's image model does not keep.
-fn image_healthcheck(engine: &Engine, i: &kiri_image::Image) -> Value {
-    let cfg: Value = engine.store.read_config(&i.config_digest).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null);
-    cfg["config"]["Healthcheck"].clone()
 }
 
 /// `docker ps`'s Status: "Up 2 minutes (healthy)" while running unpaused
@@ -3193,6 +3195,78 @@ mod tests {
         assert!(rx.recv_timeout(Duration::from_millis(300)).is_err());
         io::Write::write_all(&mut client, b"in").unwrap();
         assert!(rx.recv_timeout(Duration::from_secs(10)).is_ok());
+    }
+
+    /// Docker's `RootFS.Layers` are the image config's uncompressed `diff_ids`,
+    /// not the manifest's compressed layer digests (scanners like Trivy look
+    /// up layers by `DiffID` against the tar from `docker save`).
+    #[test]
+    fn image_inspect_reports_uncompressed_diff_ids_in_rootfs() {
+        use std::io::Write;
+        let (root, engine) = engine_in("inspect-diff-ids", false);
+        let cfg = json!({
+            "architecture": "amd64",
+            "os": "linux",
+            "created": "2026-11-18T00:00:00Z",
+            "config": {
+                "Env": ["PATH=/usr/local/bin:/usr/bin"],
+                "Healthcheck": {"Test": ["CMD-SHELL", "true"]}
+            },
+            "rootfs": {
+                "type": "layers",
+                "diff_ids": [
+                    "sha256:9bd858237f92a7b58be7f21bc17a45578f2ba486be6968fe4bd975a312142db1",
+                    "sha256:af695414f7353af49c3ce40f3084457fe507c665b297ecfa2fe791eeac451dbb"
+                ]
+            }
+        });
+        let mut w = engine.store.ingest().unwrap();
+        w.write_all(&serde_json::to_vec(&cfg).unwrap()).unwrap();
+        let (cfg_digest, _) = w.finish().unwrap();
+
+        let layers = vec![
+            kiri_image::Layer {
+                digest: "sha256:7a48b8f0c8f6814ce77ef58a6d6e23c948fd30a793ce9d03c2a8b136c1317a49".into(),
+                size: 1024,
+                media_type: "application/vnd.oci.image.layer.v1.tar+gzip".into(),
+            },
+            kiri_image::Layer {
+                digest: "sha256:aa57db58390911503d469fd9510d6f16ab424c25a8322d669a030e44ef73d421".into(),
+                size: 2048,
+                media_type: "application/vnd.oci.image.layer.v1.tar+gzip".into(),
+            },
+        ];
+        let image = kiri_image::archive::from_config("demo:diffids".into(), &cfg_digest, &cfg, layers.clone());
+        engine.store.put_image(image).unwrap();
+
+        let inspected = image_inspect(&engine, "demo:diffids").unwrap();
+        assert_eq!(
+            inspected["RootFS"],
+            json!({
+                "Type": "layers",
+                "Layers": [
+                    "sha256:9bd858237f92a7b58be7f21bc17a45578f2ba486be6968fe4bd975a312142db1",
+                    "sha256:af695414f7353af49c3ce40f3084457fe507c665b297ecfa2fe791eeac451dbb"
+                ]
+            })
+        );
+        assert_eq!(inspected["Config"]["Healthcheck"]["Test"], json!(["CMD-SHELL", "true"]));
+
+        // When the config blob is absent, fall back to the manifest's layer digests.
+        let mut fallback = test_image("demo:no-cfg");
+        fallback.layers = layers;
+        engine.store.put_image(fallback).unwrap();
+        let fallback_inspected = image_inspect(&engine, "demo:no-cfg").unwrap();
+        assert_eq!(
+            fallback_inspected["RootFS"]["Layers"],
+            json!([
+                "sha256:7a48b8f0c8f6814ce77ef58a6d6e23c948fd30a793ce9d03c2a8b136c1317a49",
+                "sha256:aa57db58390911503d469fd9510d6f16ab424c25a8322d669a030e44ef73d421"
+            ])
+        );
+
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
     }
 }
 

@@ -101,6 +101,8 @@ t images-list "alpine" $D images
 t images-newest-first "sorted" bash -c "$D images --format '{{.CreatedAt}}' | sort -rc && echo sorted"
 t image-inspect-arch "$($D version -f '{{.Server.Arch}}')" $D image inspect -f '{{.Architecture}}' alpine
 t image-inspect-cmd "/bin/sh" $D image inspect -f '{{.Config.Cmd}}' alpine
+# RootFS.Layers are the config's uncompressed diff_ids, not the manifest's compressed blob digests.
+t image-inspect-rootfs-diffid "same" bash -c "cfg=blobs/sha256/\$($D image inspect -f '{{.Id}}' alpine | sed 's/^sha256://'); want=\$($D save alpine | tar -xOf - \"\$cfg\" | tr -d '\n\r ' | sed -n 's/.*\"diff_ids\":\[\"\(sha256:[0-9a-f]*\)\".*/\1/p'); [ -n \"\$want\" ] && [ \"\$($D image inspect -f '{{index .RootFS.Layers 0}}' alpine)\" = \"\$want\" ] && echo same"
 code pull-missing 1 $D pull kiri-does-not-exist/nope:none
 t rmi "Untagged" $D rmi alpine:3.21
 code rmi-missing 1 $D rmi alpine:3.21
