@@ -1262,6 +1262,57 @@ fn mounts(body: &Value, engine: &Engine, image: &kiri_image::Image) -> Result<Mo
             add("volume", "", &dst, false, "", false, &mut out)?;
         }
     }
+    // `--volumes-from src[:ro]`: every mount of that container — its binds,
+    // its named and its anonymous volumes — at the same paths in this one,
+    // running or stopped, as Docker does. Until now the option was accepted
+    // and ignored, so the backup recipe from Docker's own docs wrote an
+    // empty archive (#450). This container's own mounts win where both name
+    // a path, as its own `-v` came first.
+    for v in strings(&host["VolumesFrom"]).unwrap_or_default() {
+        let (key, forced_ro) = match v.as_str() {
+            s if s.ends_with(":ro") => (&s[..s.len() - 3], true),
+            s if s.ends_with(":rw") => (&s[..s.len() - 3], false),
+            s => (s, false),
+        };
+        let (lines, infos) = engine.with(key, |c| (c.spec.mounts.clone(), c.spec.mount_info.clone()))?;
+        for (line, info) in lines.iter().zip(&infos) {
+            let dest = info["Destination"].as_str().unwrap_or_else(|| line.split('\t').nth(1).unwrap_or_default()).to_owned();
+            if out.info.iter().any(|i| i["Destination"].as_str().map(|d| d.trim_end_matches('/')) == Some(dest.trim_end_matches('/'))) {
+                continue;
+            }
+            let mut source = String::new();
+            let mut flags = String::new();
+            for (i, part) in line.split('\t').enumerate() {
+                match i {
+                    0 => source = part.to_owned(),
+                    2 => flags = part.to_owned(),
+                    _ => {}
+                }
+            }
+            let ro = forced_ro || info["RW"] == json!(false);
+            if ro && !flags.split(',').any(|f| f == "ro") {
+                flags = if flags.is_empty() { "ro".to_owned() } else { format!("{flags},ro") };
+            }
+            let mut copied = info.clone();
+            copied["RW"] = json!(!ro);
+            if info["Type"] == json!("volume") {
+                // The volume already exists (the source mounts it); this
+                // container keeps it alive too, anonymous ones included:
+                // `out.volumes`, not `out.anon`, so its data goes when the
+                // last user goes, not with this one.
+                let name = info["Name"].as_str().unwrap_or_default().to_owned();
+                engine.volume_ensure(&name, json!({}), false)?;
+                out.guest.push(format!("{}\t{dest}\t{flags}", super::volumes::guest_path(&name)));
+                out.volumes.push(name);
+            } else {
+                // A bind, or a tmpfs: the guest line stands as it is (its
+                // bind source is resolved afresh at start, as the source's
+                // own is).
+                out.guest.push(format!("{source}\t{dest}\t{flags}"));
+            }
+            out.info.push(copied);
+        }
+    }
     Ok(out)
 }
 
@@ -1709,6 +1760,7 @@ pub(super) fn create(req: &Request, engine: &Engine) -> Result<Value, Error> {
         mount_info: mounts.info,
         volumes: mounts.volumes,
         anon_volumes: mounts.anon,
+        volumes_from: strings(&host["VolumesFrom"]).unwrap_or_default(),
         restart: RestartPolicy {
             name: match host["RestartPolicy"]["Name"].as_str() {
                 Some("") | None => "no".to_owned(),
@@ -2083,6 +2135,7 @@ fn inspect(c: &Container, nets: &[super::network::Network]) -> Value {
             "CpuShares": if c.spec.limits.cpu_weight > 0 { 2 + (u64::from(c.spec.limits.cpu_weight) - 1) * 262_142 / 9999 } else { 0 },
             "PidsLimit": if c.spec.limits.pids_max > 0 { Value::from(c.spec.limits.pids_max) } else { Value::Null },
             "NetworkMode": c.spec.network_mode,
+            "VolumesFrom": if c.spec.volumes_from.is_empty() { Value::Null } else { json!(c.spec.volumes_from) },
             "Dns": c.spec.dns,
             "DnsSearch": c.spec.dns_search,
             "DnsOptions": c.spec.dns_options,
@@ -2867,6 +2920,55 @@ mod tests {
             "restart": {"name": "no", "max_retries": 0}, "volumes": [volume]
         })).unwrap();
         engine.create(Some("user".into()), spec, image).unwrap();
+    }
+
+    /// `--volumes-from` copies the source's mounts into the new container:
+    /// its named and anonymous volumes and its binds, at the same paths,
+    /// `:ro` read-only, the container's own mounts winning on a path both
+    /// name (#450).
+    #[test]
+    fn volumes_from_copies_the_sources_mounts() {
+        let (root, engine) = engine_in("volumes-from", false);
+        let image = test_image("src:1");
+        engine.store.put_image(image.clone()).unwrap();
+        engine.volume_ensure_with("named", json!({}), Default::default()).unwrap();
+        engine.volume_ensure_with("anon", json!({}), Default::default()).unwrap();
+        let spec: super::super::engine::Spec = serde_json::from_value(json!({
+            "image": image.name, "image_id": image.config_digest, "entrypoint": [], "cmd": ["true"],
+            "env": [], "cwd": "/", "user": "", "auto_remove": false, "network_mode": "none", "labels": {},
+            "restart": {"name": "no", "max_retries": 0},
+            "mounts": ["/volumes/named\t/vol\tcreate,copyup", "/volumes/anon\t/anon\tcreate,copyup", "tmpfs\t/cache\ttmpfs,noexec,nosuid"],
+            "mount_info": [
+                {"Type": "volume", "Name": "named", "Source": "/volumes/named", "Destination": "/vol", "RW": true},
+                {"Type": "volume", "Name": "anon", "Source": "/volumes/anon", "Destination": "/anon", "RW": true},
+                {"Type": "tmpfs", "Source": "", "Destination": "/cache", "RW": true}
+            ],
+            "volumes": ["named"], "anon_volumes": ["anon"]
+        })).unwrap();
+        engine.create(Some("src".into()), spec, &image).unwrap();
+        let body = json!({"Image": "src:1", "HostConfig": {"VolumesFrom": ["src:ro"], "Binds": ["/tmp:/vol"]}});
+        let req = Request::internal("POST", "/containers/create", &[], serde_json::to_vec(&body).unwrap());
+        let made = create(&req, &engine).unwrap();
+        let id = made["Id"].as_str().unwrap().to_owned();
+        engine.with(&id, |c| {
+            let line = |dest: &str| c.spec.mounts.iter().find(|m| m.split('\t').nth(1) == Some(dest)).expect(dest).clone();
+            // The named volume at /vol is the container's own bind, not the
+            // source's volume copy; the anonymous one and the tmpfs come
+            // across, read-only.
+            assert!(line("/anon").ends_with("create,copyup,ro"), "{}", line("/anon"));
+            assert!(line("/cache").ends_with("tmpfs,noexec,nosuid,ro"), "{}", line("/cache"));
+            assert!(!line("/vol").contains("create"), "{}", line("/vol"));
+            // The volume that came across keeps the source's data alive
+            // from here too — the anonymous one outlives the source, as its
+            // data goes with the last user. The named one was skipped with
+            // its path.
+            assert_eq!(c.spec.volumes, ["anon".to_owned()]);
+            assert_eq!(c.spec.volumes_from, ["src:ro".to_owned()]);
+            let inspected = inspect(c, &[]);
+            assert_eq!(inspected["HostConfig"]["VolumesFrom"], json!(["src:ro"]));
+        }).unwrap();
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// On a good list removal by name is as before: one a listed container

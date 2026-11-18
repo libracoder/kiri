@@ -194,6 +194,10 @@ pub struct Spec {
     pub volumes: Vec<String>,
     #[serde(default)]
     pub anon_volumes: Vec<String>,
+    /// `--volumes-from` as given, for inspect; its mounts were copied into
+    /// `mounts`/`volumes` at create (#450).
+    #[serde(default)]
+    pub volumes_from: Vec<String>,
     /// `--privileged`.
     #[serde(default)]
     pub privileged: bool,
@@ -2835,7 +2839,12 @@ impl Engine {
             }
             lock_log(&c.log).remove();
             for v in c.spec.anon_volumes {
-                self.delete_volume_data(&v);
+                // Another container may mount it through `--volumes-from`:
+                // its data goes when the last user goes, not with this one,
+                // as Docker keeps it (#450).
+                if self.volume_users(&v).is_empty() {
+                    self.delete_volume_data(&v);
+                }
             }
             if let Some((image, attrs)) = actor {
                 self.emit_container_with("destroy", id, &image, attrs, &[]);
@@ -3222,24 +3231,61 @@ impl Engine {
     pub fn disconnect(&self, network: &str, key: &str) -> Result<(), Error> {
         let id = self.resolve(key)?;
         let net = self.lock_networks().find(network).cloned().ok_or_else(|| Error::NotFound(format!("network {network} not found")))?;
-        let (n, ip) = {
+        let (n, ip, promoted) = {
             let mut st = self.lock();
             let c = st.containers.get_mut(&id).expect("resolved");
             if c.spec.network_mode == net.name {
-                return Err(Error::BadRequest(format!("Kiri cannot disconnect a container from its first network ({})", net.name)));
+                if c.status == Status::Running {
+                    // Its first interface is plumbed at start; moving a
+                    // running container between networks is not something
+                    // Kiri does (yet).
+                    return Err(Error::BadRequest(format!(
+                        "Kiri cannot move a running container off its first network ({}); stop it first, then disconnect",
+                        net.name
+                    )));
+                }
+                // Not started: the next network it joined becomes its first,
+                // as Docker re-plumbs it there; with none left it is on no
+                // network, as Docker leaves it (#418 — .NET Aspire's DCP
+                // creates on bridge, joins its session network, disconnects
+                // bridge, all before the start).
+                match c.spec.extra_networks.first().cloned() {
+                    Some(x) => {
+                        c.spec.network_mode = x.name;
+                        c.spec.aliases = x.aliases;
+                        c.spec.ipv4_address = x.ipv4_address;
+                        c.spec.ipv6_address = x.ipv6_address;
+                        c.spec.mac_address = x.mac_address;
+                        c.spec.extra_networks.remove(0);
+                    }
+                    None => {
+                        c.spec.network_mode = "none".into();
+                        c.spec.aliases.clear();
+                        c.spec.ipv4_address.clear();
+                        c.spec.ipv6_address.clear();
+                        c.spec.mac_address.clear();
+                    }
+                }
+                (None, None, true)
+            } else {
+                let Some(pos) = c.spec.extra_networks.iter().position(|x| x.name == net.name) else {
+                    return Err(Error::NotFound(format!("container {} is not connected to network {}", &id[..12], net.name)));
+                };
+                c.spec.extra_networks.remove(pos);
+                let ip = c.extra_ips.iter().position(|(x, _)| *x == net.name).map(|i| c.extra_ips.remove(i).1);
+                if let Some(i) = c.extra_ip6s.iter().position(|(x, _)| *x == net.name) {
+                    let (_, a) = c.extra_ip6s.remove(i);
+                    self.lock_networks().release6(&net.name, a);
+                }
+                let n = c.extra_ifs.iter().position(|(x, _)| *x == net.name).map(|i| c.extra_ifs.remove(i).1);
+                (n, ip, false)
             }
-            let Some(pos) = c.spec.extra_networks.iter().position(|x| x.name == net.name) else {
-                return Err(Error::NotFound(format!("container {} is not connected to network {}", &id[..12], net.name)));
-            };
-            c.spec.extra_networks.remove(pos);
-            let ip = c.extra_ips.iter().position(|(x, _)| *x == net.name).map(|i| c.extra_ips.remove(i).1);
-            if let Some(i) = c.extra_ip6s.iter().position(|(x, _)| *x == net.name) {
-                let (_, a) = c.extra_ip6s.remove(i);
-                self.lock_networks().release6(&net.name, a);
-            }
-            let n = c.extra_ifs.iter().position(|(x, _)| *x == net.name).map(|i| c.extra_ifs.remove(i).1);
-            (n, ip)
         };
+        if promoted {
+            self.save();
+            self.emit_network("disconnect", &net, &id);
+            return Ok(());
+        }
         self.save();
         if let Some(ip) = ip {
             let unplugged = match (self.awake(), n) {
@@ -3603,7 +3649,10 @@ impl Engine {
         }
         if with_volumes {
             for v in anon {
-                self.delete_volume_data(&v);
+                // A `--volumes-from` container may still mount it (#450).
+                if self.volume_users(&v).is_empty() {
+                    self.delete_volume_data(&v);
+                }
             }
         }
         Ok(())
@@ -5286,5 +5335,66 @@ mod hosts_lines_tests {
             hosts_lines(&s(&["10.9.8.7\thost.docker.internal", "10.9.8.8\thost.kiri.internal", "10.9.8.9\tgateway.docker.internal"]), &[]),
             s(&["10.9.8.7\thost.docker.internal", "10.9.8.8\thost.kiri.internal", "10.9.8.9\tgateway.docker.internal"])
         );
+    }
+}
+
+#[cfg(test)]
+mod first_network_tests {
+    use super::Engine;
+
+    fn made(name: &str) -> (std::path::PathBuf, std::sync::Arc<Engine>, String) {
+        let root = std::env::temp_dir().join(format!("kiri-firstnet-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let engine = super::boot_without_vm(&root);
+        engine.lock_net().create("probe-net", Default::default()).unwrap();
+        let image = kiri_image::Image {
+            name: "test:local".into(), digest: "sha256:test".into(), index_digest: None, config_digest: "sha256:test".into(),
+            layers: Vec::new(), size: 0, platform: "linux/arm64".into(), created: String::new(), pulled_at: 0, config: Default::default(),
+        };
+        let spec: super::Spec = serde_json::from_value(serde_json::json!({
+            "image": image.name, "image_id": image.config_digest, "entrypoint": [], "cmd": ["true"],
+            "env": [], "cwd": "/", "user": "", "auto_remove": false, "network_mode": "bridge", "labels": {},
+            "restart": {"name": "no", "max_retries": 0}
+        })).unwrap();
+        let id = engine.create(Some("probe".into()), spec, &image).unwrap();
+        (root, engine, id)
+    }
+
+    /// A container not started may leave its first network: the next one it
+    /// joined becomes its first, and the last disconnect leaves it on none,
+    /// as Docker does (#418 — .NET Aspire's DCP create/connect/disconnect
+    /// before the start).
+    #[test]
+    fn disconnect_from_the_first_network_promotes_the_next() {
+        let (root, engine, _) = made("promote");
+        engine.connect("probe-net", "probe", vec!["alias".into()], String::new(), String::new(), String::new()).unwrap();
+        engine.disconnect("bridge", "probe").unwrap();
+        engine.with("probe", |c| {
+            assert_eq!(c.spec.network_mode, "probe-net");
+            assert_eq!(c.spec.aliases, ["alias".to_owned()]);
+            assert!(c.spec.extra_networks.is_empty());
+        }).unwrap();
+        engine.disconnect("probe-net", "probe").unwrap();
+        engine.with("probe", |c| assert_eq!(c.spec.network_mode, "none")).unwrap();
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A running container keeps its first interface: the disconnect says so
+    /// instead of silently succeeding.
+    #[test]
+    fn disconnect_from_the_first_network_of_a_running_one_is_refused() {
+        let (root, engine, id) = made("running");
+        {
+            let mut st = engine.lock();
+            st.containers.get_mut(&id).unwrap().status = super::Status::Running;
+        }
+        match engine.disconnect("bridge", "probe") {
+            Err(super::Error::BadRequest(m)) => assert!(m.contains("stop it first"), "{m}"),
+            other => panic!("running first-network disconnect: {other:?}"),
+        }
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
     }
 }
