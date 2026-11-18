@@ -52,7 +52,9 @@ impl Arch {
     /// `--arch x86_64` (`amd64`, `intel`) anywhere after the task; arm64 otherwise.
     fn from_args() -> Arch {
         let args = std::env::args().skip(2).collect::<Vec<_>>();
-        let intel = args.windows(2).any(|w| w[0] == "--arch" && matches!(w[1].as_str(), "x86_64" | "amd64" | "intel"));
+        let intel = args
+            .windows(2)
+            .any(|w| w[0] == "--arch" && matches!(w[1].as_str(), "x86_64" | "amd64" | "intel"));
         if intel { Arch::X86_64 } else { Arch::Arm64 }
     }
 
@@ -92,7 +94,13 @@ impl Arch {
     /// architecture (so `cargo run` and the Apple Silicon build stay as they
     /// were), target/<triple>/release when cross-built.
     fn host_bin(self, root: &Path) -> PathBuf {
-        if self.native() { root.join("target/release/kiri") } else { root.join("target").join(self.host_target()).join("release/kiri") }
+        if self.native() {
+            root.join("target/release/kiri")
+        } else {
+            root.join("target")
+                .join(self.host_target())
+                .join("release/kiri")
+        }
     }
 
     fn native(self) -> bool {
@@ -127,7 +135,10 @@ impl Arch {
 
 fn main() -> ExitCode {
     let task = std::env::args().nth(1).unwrap_or_default();
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
     let arch = Arch::from_args();
     let result = match task.as_str() {
         "guest" => guest(&root, arch),
@@ -144,19 +155,30 @@ fn main() -> ExitCode {
             },
             Err(e) => Err(e),
         },
-        "docker-win-arm64" => docker_cli_arm64(&root.join("target/cli-cache")).map(|p| println!("{}", p.display())),
+        "docker-win-arm64" => {
+            docker_cli_arm64(&root.join("target/cli-cache")).map(|p| println!("{}", p.display()))
+        }
         "app" => app(&root, arch, false).map(drop),
         "app-lite" => app(&root, arch, true).map(drop),
         // `app-dev builds`: Kiri Builds.app, a Kiri Dev of its own for one feature.
         "app-dev" => match std::env::args().nth(2) {
-            Some(f) if f.is_empty() || !f.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()) || f == "dev" => {
+            Some(f)
+                if f.is_empty()
+                    || !f
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+                    || f == "dev" =>
+            {
                 eprintln!("a feature name is lower-case letters and digits, not `dev`");
                 return ExitCode::FAILURE;
             }
-            feature => app(&root, Arch::Arm64, false).and_then(|a| app_dev(&root, &a, feature.as_deref())),
+            feature => {
+                app(&root, Arch::Arm64, false).and_then(|a| app_dev(&root, &a, feature.as_deref()))
+            }
         },
         // The disk image of the app already built, signed but not notarized (to look at it).
-        "dmg" => dmg(&root, &root.join(arch.app_dir(false)), arch, false).map(|d| println!("{}", d.display())),
+        "dmg" => dmg(&root, &root.join(arch.app_dir(false)), arch, false)
+            .map(|d| println!("{}", d.display())),
         "release" => app(&root, arch, false).and_then(|a| release(&root, &a, arch)),
         // Signs the app already built (on a Mac without the identity).
         "sign" => sign_app(&root, &root.join(arch.app_dir(false)), arch, false),
@@ -164,7 +186,9 @@ fn main() -> ExitCode {
         "pack" => release(&root, &root.join(arch.app_dir(false)), arch),
         "all" => guest(&root, arch).and_then(|()| host(&root, arch)),
         _ => {
-            eprintln!("usage: cargo xtask <guest|kernel|disk|host|linux|windows|windows-dev|msi|msi-pack|docker-win-arm64|app|app-lite|app-dev|release|sign|pack|all> [--arch arm64]");
+            eprintln!(
+                "usage: cargo xtask <guest|kernel|disk|host|linux|windows|windows-dev|msi|msi-pack|docker-win-arm64|app|app-lite|app-dev|release|sign|pack|all> [--arch arm64]"
+            );
             return ExitCode::FAILURE;
         }
     };
@@ -183,6 +207,70 @@ fn run(cmd: &mut Command) -> io::Result<()> {
         return Err(io::Error::other(format!("{cmd:?} failed: {status}")));
     }
     Ok(())
+}
+
+/// Decode the output of `wsl.exe -l -q`. WSL emits UTF-16LE on Windows but
+/// some environments return UTF-8, so accept both forms.
+fn decode_wsl_list(bytes: &[u8]) -> Vec<String> {
+    let utf16 = bytes.len() >= 2 && bytes.iter().skip(1).step_by(2).take(16).all(|&b| b == 0);
+    let text = if utf16 {
+        let units = bytes
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect::<Vec<_>>();
+        String::from_utf16_lossy(&units)
+    } else {
+        String::from_utf8_lossy(bytes).into_owned()
+    };
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Pick a real Linux user distro. Docker Desktop's internal distros cannot
+/// execute the build scripts and may reject `bash` with exit 127. Kiri's own
+/// runtime distro (`kiri`) is a busybox-like image without bash: skip it too.
+fn choose_wsl_distro(distros: &[String], explicit: Option<&str>) -> Option<String> {
+    let usable = |d: &str| {
+        let lower = d.to_ascii_lowercase();
+        !lower.starts_with("docker-desktop") && lower != "kiri"
+    };
+    explicit
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+        .map(str::to_owned)
+        .or_else(|| distros.iter().find(|d| usable(d)).cloned())
+}
+
+/// The distro used for Windows' Linux-side build. Set `KIRI_WSL_DISTRO` when
+/// more than one user distro is installed and the first one is not desired.
+fn wsl_distro() -> io::Result<String> {
+    let explicit = std::env::var("KIRI_WSL_DISTRO").ok();
+    if let Some(distro) = choose_wsl_distro(&[], explicit.as_deref()) {
+        return Ok(distro);
+    }
+    let output = Command::new("wsl.exe").args(["-l", "-q"]).output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "wsl.exe -l -q failed: {}",
+            output.status
+        )));
+    }
+    choose_wsl_distro(&decode_wsl_list(&output.stdout), None).ok_or_else(|| {
+        io::Error::other("no Linux user distro found; install one with `wsl --install Ubuntu` or set KIRI_WSL_DISTRO")
+    })
+}
+
+fn wslpath_args(distro: &str, path: &str) -> [String; 5] {
+    [
+        "-d".into(),
+        distro.into(),
+        "wslpath".into(),
+        "-a".into(),
+        path.into(),
+    ]
 }
 
 fn guest(root: &Path, arch: Arch) -> io::Result<()> {
@@ -206,7 +294,11 @@ fn guest(root: &Path, arch: Arch) -> io::Result<()> {
     cpio.file("init", 0o755, &init);
     let path = arch.guest_out(root)?.join("initramfs.cpio");
     fs::write(&path, cpio.finish())?;
-    println!("{} ({} KiB)", path.display(), fs::metadata(&path)?.len() / 1024);
+    println!(
+        "{} ({} KiB)",
+        path.display(),
+        fs::metadata(&path)?.len() / 1024
+    );
     Ok(())
 }
 
@@ -258,13 +350,19 @@ fn disk(root: &Path) -> io::Result<()> {
          mkfs.ext4 -q -F -m 0 -L kiri-data -E lazy_itable_init=1,lazy_journal_init=1 /out/data.img",
     ]))?;
     let meta = fs::metadata(out.join("data.img"))?;
-    println!("{} ({} GiB sparse)", out.join("data.img").display(), meta.len() >> 30);
+    println!(
+        "{} ({} GiB sparse)",
+        out.join("data.img").display(),
+        meta.len() >> 30
+    );
     Ok(())
 }
 
 fn host(root: &Path, arch: Arch) -> io::Result<()> {
     let mut build = Command::new(env!("CARGO"));
-    build.current_dir(root).args(["build", "--release", "-p", "kiri"]);
+    build
+        .current_dir(root)
+        .args(["build", "--release", "-p", "kiri"]);
     if !arch.native() {
         build.args(["--target", arch.host_target()]);
     }
@@ -272,11 +370,16 @@ fn host(root: &Path, arch: Arch) -> io::Result<()> {
     let bin = arch.host_bin(root);
     if cfg!(target_os = "macos") {
         // Virtualization.framework refuses to start a VM without this entitlement.
-        run(Command::new("codesign").args(["--force", "--sign", "-", "--entitlements"])
+        run(Command::new("codesign")
+            .args(["--force", "--sign", "-", "--entitlements"])
             .arg(root.join("crates/kiri/kiri.entitlements"))
             .arg(&bin))?;
     }
-    println!("{} ({} KiB)", bin.display(), fs::metadata(&bin)?.len() / 1024);
+    println!(
+        "{} ({} KiB)",
+        bin.display(),
+        fs::metadata(&bin)?.len() / 1024
+    );
     Ok(())
 }
 
@@ -285,27 +388,38 @@ fn host(root: &Path, arch: Arch) -> io::Result<()> {
 /// `--arch amd64` builds x86-64 binaries (on Apple silicon the container
 /// runs under Rosetta), for Linux PCs and WSL2 on Windows.
 fn linux(root: &Path) -> io::Result<()> {
-    let amd64 = std::env::args().skip(2).collect::<Vec<_>>().windows(2).any(|w| w[0] == "--arch" && (w[1] == "amd64" || w[1] == "x86_64"));
+    let amd64 = std::env::args()
+        .skip(2)
+        .collect::<Vec<_>>()
+        .windows(2)
+        .any(|w| w[0] == "--arch" && (w[1] == "amd64" || w[1] == "x86_64"));
     linux_build(root, amd64)
 }
 
 fn linux_build(root: &Path, amd64: bool) -> io::Result<()> {
-    let (platform, out, cache) = if amd64 { ("linux/amd64", "linux-x86_64", "kiri-cargo-amd64") } else { ("linux/arm64", "linux", "kiri-cargo") };
-    run(Command::new("docker").args(["run", "--rm", "--platform", platform, "-v"]).arg(format!("{}:/src", root.display())).args([
-        "-v",
-        &format!("{cache}:/usr/local/cargo/registry"),
-        "-w",
-        "/src",
-        "-e",
-        &format!("CARGO_TARGET_DIR=/src/target/{out}"),
-        // The repo's cross-linking setting is for the guest build from macOS.
-        "-e",
-        "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=cc",
-        "rust:1-alpine",
-        "sh",
-        "-c",
-        "apk add -q musl-dev && cargo build --release -p kiri -p kiri-init",
-    ]))?;
+    let (platform, out, cache) = if amd64 {
+        ("linux/amd64", "linux-x86_64", "kiri-cargo-amd64")
+    } else {
+        ("linux/arm64", "linux", "kiri-cargo")
+    };
+    run(Command::new("docker")
+        .args(["run", "--rm", "--platform", platform, "-v"])
+        .arg(format!("{}:/src", root.display()))
+        .args([
+            "-v",
+            &format!("{cache}:/usr/local/cargo/registry"),
+            "-w",
+            "/src",
+            "-e",
+            &format!("CARGO_TARGET_DIR=/src/target/{out}"),
+            // The repo's cross-linking setting is for the guest build from macOS.
+            "-e",
+            "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=cc",
+            "rust:1-alpine",
+            "sh",
+            "-c",
+            "apk add -q musl-dev && cargo build --release -p kiri -p kiri-init",
+        ]))?;
     for b in ["kiri", "kiri-init"] {
         let p = root.join("target").join(out).join("release").join(b);
         println!("{} ({} KiB)", p.display(), fs::metadata(&p)?.len() / 1024);
@@ -325,16 +439,26 @@ impl WinArch {
     /// `--arch arm64` (or aarch64) after the task; x86-64 without one.
     fn from_args() -> io::Result<WinArch> {
         let args: Vec<String> = std::env::args().skip(2).collect();
-        match args.windows(2).find(|w| w[0] == "--arch").map(|w| w[1].as_str()) {
+        match args
+            .windows(2)
+            .find(|w| w[0] == "--arch")
+            .map(|w| w[1].as_str())
+        {
             None | Some("x86_64" | "x64" | "amd64") => Ok(WinArch::X64),
             Some("arm64" | "aarch64") => Ok(WinArch::Arm64),
-            Some(a) => Err(io::Error::other(format!("--arch {a}: Windows builds are x86_64 or arm64"))),
+            Some(a) => Err(io::Error::other(format!(
+                "--arch {a}: Windows builds are x86_64 or arm64"
+            ))),
         }
     }
 
     /// The machine this xtask runs on, which builds kiri-win without --target.
     fn host() -> WinArch {
-        if cfg!(target_arch = "aarch64") { WinArch::Arm64 } else { WinArch::X64 }
+        if cfg!(target_arch = "aarch64") {
+            WinArch::Arm64
+        } else {
+            WinArch::X64
+        }
     }
 
     /// The Linux engine's architecture: target/kiri-windows-<this>, the musl
@@ -390,16 +514,49 @@ fn windows(root: &Path, debug: bool, arch: WinArch) -> io::Result<()> {
     // either architecture builds in either WSL.
     let linux = root.join(format!("target/linux-{}-musl", arch.linux()));
     if !cfg!(windows) {
-        return Err(io::Error::other("the Windows bundle is built on Windows, in WSL"));
+        return Err(io::Error::other(
+            "the Windows bundle is built on Windows, in WSL",
+        ));
     }
     fs::create_dir_all(&linux)?;
+    let distro = wsl_distro()?;
     let wsl = |path: &Path| -> io::Result<String> {
-        let out = Command::new("wsl.exe").args(["wslpath", "-a"]).arg(path.to_string_lossy().replace('\\', "/")).output()?;
+        let out = Command::new("wsl.exe")
+            .args(wslpath_args(
+                &distro,
+                &path.to_string_lossy().replace('\\', "/"),
+            ))
+            .output()?;
+        if !out.status.success() {
+            return Err(io::Error::other(format!(
+                "wslpath in {distro} failed: {}",
+                out.status
+            )));
+        }
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
     };
     let (src, out_dir) = (wsl(root)?, wsl(&linux)?);
-    run(Command::new("wsl.exe").args(["--", "bash", &format!("{src}/scripts/windows-engine.sh"), &src, &out_dir, arch.linux()]))?;
-    run(Command::new("wsl.exe").args(["--", "sh", &format!("{src}/scripts/kiri-linux.sh"), &src, &out_dir, &format!("{out_dir}/kiri-linux.tar.gz"), arch.linux()]))?;
+    run(Command::new("wsl.exe").args([
+        "-d",
+        &distro,
+        "--",
+        "bash",
+        &format!("{src}/scripts/windows-engine.sh"),
+        &src,
+        &out_dir,
+        arch.linux(),
+    ]))?;
+    run(Command::new("wsl.exe").args([
+        "-d",
+        &distro,
+        "--",
+        "sh",
+        &format!("{src}/scripts/kiri-linux.sh"),
+        &src,
+        &out_dir,
+        &format!("{out_dir}/kiri-linux.tar.gz"),
+        arch.linux(),
+    ]))?;
     // Assemble the bundle first: the engine, Kiri Linux, the docker CLI,
     // Compose and buildx (pinned, checked, as Kiri.app bundles them) and the
     // install scripts. kiri-win is built last, with the SHA-256 of each of
@@ -415,23 +572,48 @@ fn windows(root: &Path, debug: bool, arch: WinArch) -> io::Result<()> {
         windows_arm64_cli(&cache, &out)?;
     } else {
         let (docker_v, docker_sum) = WIN_DOCKER_CLI;
-        let zip = fetch(&cache, &format!("docker-{docker_v}-windows.zip"), &cli_pins::win_docker_url(docker_v))?;
+        let zip = fetch(
+            &cache,
+            &format!("docker-{docker_v}-windows.zip"),
+            &cli_pins::win_docker_url(docker_v),
+        )?;
         verify(&zip, docker_sum)?;
         let unzip_dir = cache.join("docker-windows");
         fs::create_dir_all(&unzip_dir)?;
         // bsdtar reads zips (Windows and macOS have it as tar); GNU tar does not.
         if cfg!(target_os = "linux") {
-            run(Command::new("unzip").args(["-o", "-q"]).arg(&zip).arg("docker/docker.exe").arg("-d").arg(&unzip_dir))?;
+            run(Command::new("unzip")
+                .args(["-o", "-q"])
+                .arg(&zip)
+                .arg("docker/docker.exe")
+                .arg("-d")
+                .arg(&unzip_dir))?;
         } else {
-            run(Command::new("tar").args(["-xf"]).arg(&zip).arg("-C").arg(&unzip_dir).arg("docker/docker.exe"))?;
+            run(Command::new("tar")
+                .args(["-xf"])
+                .arg(&zip)
+                .arg("-C")
+                .arg(&unzip_dir)
+                .arg("docker/docker.exe"))?;
         }
-        fs::copy(unzip_dir.join("docker/docker.exe"), out.join("bin/docker.exe"))?;
+        fs::copy(
+            unzip_dir.join("docker/docker.exe"),
+            out.join("bin/docker.exe"),
+        )?;
         let (compose_v, compose_sum) = WIN_COMPOSE;
-        let compose = fetch(&cache, &format!("docker-compose-windows-x86_64-{compose_v}.exe"), &cli_pins::win_compose_url(compose_v))?;
+        let compose = fetch(
+            &cache,
+            &format!("docker-compose-windows-x86_64-{compose_v}.exe"),
+            &cli_pins::win_compose_url(compose_v),
+        )?;
         verify(&compose, compose_sum)?;
         fs::copy(&compose, out.join("bin/cli-plugins/docker-compose.exe"))?;
         let (buildx_v, buildx_sum) = WIN_BUILDX;
-        let buildx = fetch(&cache, &format!("buildx-{buildx_v}.windows-amd64.exe"), &cli_pins::win_buildx_url(buildx_v))?;
+        let buildx = fetch(
+            &cache,
+            &format!("buildx-{buildx_v}.windows-amd64.exe"),
+            &cli_pins::win_buildx_url(buildx_v),
+        )?;
         verify(&buildx, buildx_sum)?;
         fs::copy(&buildx, out.join("bin/cli-plugins/docker-buildx.exe"))?;
     }
@@ -450,10 +632,25 @@ fn windows(root: &Path, debug: bool, arch: WinArch) -> io::Result<()> {
     // commands through docker.exe, the engine's own by the `kiri` in WSL
     // (crates/kiri/src/wsl.rs). Built before kiri-win, so its hash goes in
     // the manifest too.
-    fs::copy(windows_exe(root, debug, arch, "kiri", None)?, out.join("bin/kiri.exe"))?;
+    fs::copy(
+        windows_exe(root, debug, arch, "kiri", None)?,
+        out.join("bin/kiri.exe"),
+    )?;
 
     // `name=sha256;…` for every file setup uses or kiri-win runs, embedded in kiri-win.exe.
-    let hashed = ["kiri", "kiri-init", "kiri-linux.tar.gz", "install.sh", "kiri.ps1", "setup-tools.ps1", "kiri-admin.ps1", "bin/docker.exe", "bin/kiri.exe", "bin/cli-plugins/docker-compose.exe", "bin/cli-plugins/docker-buildx.exe"];
+    let hashed = [
+        "kiri",
+        "kiri-init",
+        "kiri-linux.tar.gz",
+        "install.sh",
+        "kiri.ps1",
+        "setup-tools.ps1",
+        "kiri-admin.ps1",
+        "bin/docker.exe",
+        "bin/kiri.exe",
+        "bin/cli-plugins/docker-compose.exe",
+        "bin/cli-plugins/docker-buildx.exe",
+    ];
     let mut manifest = Vec::new();
     for f in hashed {
         manifest.push(format!("{f}={}", sha256(&out.join(f))?));
@@ -471,11 +668,19 @@ fn windows_arm64_cli(cache: &Path, out: &Path) -> io::Result<()> {
     let docker = docker_cli_arm64(cache)?;
     fs::copy(&docker, out.join("bin/docker.exe"))?;
     let (compose_v, compose_sum) = WIN_ARM64_COMPOSE;
-    let compose = fetch(cache, &format!("docker-compose-windows-aarch64-{compose_v}.exe"), &cli_pins::win_arm64_compose_url(compose_v))?;
+    let compose = fetch(
+        cache,
+        &format!("docker-compose-windows-aarch64-{compose_v}.exe"),
+        &cli_pins::win_arm64_compose_url(compose_v),
+    )?;
     verify(&compose, compose_sum)?;
     fs::copy(&compose, out.join("bin/cli-plugins/docker-compose.exe"))?;
     let (buildx_v, buildx_sum) = WIN_ARM64_BUILDX;
-    let buildx = fetch(cache, &format!("buildx-{buildx_v}.windows-arm64.exe"), &cli_pins::win_arm64_buildx_url(buildx_v))?;
+    let buildx = fetch(
+        cache,
+        &format!("buildx-{buildx_v}.windows-arm64.exe"),
+        &cli_pins::win_arm64_buildx_url(buildx_v),
+    )?;
     verify(&buildx, buildx_sum)?;
     fs::copy(&buildx, out.join("bin/cli-plugins/docker-buildx.exe"))?;
     Ok(())
@@ -500,22 +705,58 @@ fn docker_cli_arm64(cache: &Path) -> io::Result<PathBuf> {
     // Checked out byte for byte: Git for Windows' core.autocrlf would turn the
     // sources' LF into CRLF, and Go builds other bytes from them. A clone made
     // without this setting is made again.
-    let lf = Command::new("git").arg("-C").arg(&src).args(["config", "--local", "core.autocrlf"]).output().map(|o| String::from_utf8_lossy(&o.stdout).trim() == "false").unwrap_or(false);
+    let lf = Command::new("git")
+        .arg("-C")
+        .arg(&src)
+        .args(["config", "--local", "core.autocrlf"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "false")
+        .unwrap_or(false);
     if !src.join(".git").is_dir() || !lf {
         let _ = fs::remove_dir_all(&src);
         fs::create_dir_all(cache)?;
-        run(Command::new("git").args(["-c", "advice.detachedHead=false", "clone", "-q", "--config", "core.autocrlf=false", "--config", "core.eol=lf", "--depth", "1", "--branch", &format!("v{}", pin.version), cli_pins::DOCKER_CLI_GIT]).arg(&src))?;
+        run(Command::new("git")
+            .args([
+                "-c",
+                "advice.detachedHead=false",
+                "clone",
+                "-q",
+                "--config",
+                "core.autocrlf=false",
+                "--config",
+                "core.eol=lf",
+                "--depth",
+                "1",
+                "--branch",
+                &format!("v{}", pin.version),
+                cli_pins::DOCKER_CLI_GIT,
+            ])
+            .arg(&src))?;
     }
     let git = |args: &[&str]| -> io::Result<String> {
-        let o = Command::new("git").arg("-C").arg(&src).args(args).output()?;
+        let o = Command::new("git")
+            .arg("-C")
+            .arg(&src)
+            .args(args)
+            .output()?;
         if !o.status.success() {
-            return Err(io::Error::other(format!("git {}: {}", args.join(" "), String::from_utf8_lossy(&o.stderr).trim())));
+            return Err(io::Error::other(format!(
+                "git {}: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&o.stderr).trim()
+            )));
         }
         Ok(String::from_utf8_lossy(&o.stdout).into_owned())
     };
     let head = git(&["rev-parse", "HEAD"])?;
     if head.trim() != pin.commit {
-        return Err(io::Error::other(format!("{}: at {}, not docker/cli v{}'s {}; delete it and run again", src.display(), head.trim(), pin.version, pin.commit)));
+        return Err(io::Error::other(format!(
+            "{}: at {}, not docker/cli v{}'s {}; delete it and run again",
+            src.display(),
+            head.trim(),
+            pin.version,
+            pin.commit
+        )));
     }
     // docker/cli is not a Go module yet: its scripts link go.mod and go.sum
     // to vendor.mod and vendor.sum. Copies here (a symlink on Windows needs
@@ -524,8 +765,14 @@ fn docker_cli_arm64(cache: &Path) -> io::Result<PathBuf> {
     fs::copy(src.join("vendor.mod"), src.join("go.mod"))?;
     fs::copy(src.join("vendor.sum"), src.join("go.sum"))?;
     let status = git(&["status", "--porcelain", "--ignored"])?;
-    if let Some(l) = status.lines().find(|l| *l != "?? go.mod" && *l != "?? go.sum" && *l != "!! go.mod" && *l != "!! go.sum") {
-        return Err(io::Error::other(format!("{}: `{l}` is not docker/cli's commit; delete the folder and run again", src.display())));
+    if let Some(l) = status
+        .lines()
+        .find(|l| *l != "?? go.mod" && *l != "?? go.sum" && *l != "!! go.mod" && *l != "!! go.sum")
+    {
+        return Err(io::Error::other(format!(
+            "{}: `{l}` is not docker/cli's commit; delete the folder and run again",
+            src.display()
+        )));
     }
     let short = &pin.commit[..7];
     let ldflags = format!(
@@ -544,14 +791,26 @@ fn docker_cli_arm64(cache: &Path) -> io::Result<PathBuf> {
         .env("GOFLAGS", "-mod=vendor")
         .env("GOWORK", "off")
         .env("GOEXPERIMENT", "")
-        .args(["build", "-trimpath", "-buildvcs=false", "-tags", "grpcnotrace", "-ldflags", &ldflags, "-o"])
+        .args([
+            "build",
+            "-trimpath",
+            "-buildvcs=false",
+            "-tags",
+            "grpcnotrace",
+            "-ldflags",
+            &ldflags,
+            "-o",
+        ])
         .arg(&part)
         .arg("./cmd/docker");
     run(&mut go)?;
     let got = sha256(&part)?;
     if got != pin.sha256 {
         let _ = fs::remove_file(&part);
-        return Err(io::Error::other(format!("docker.exe for arm64 built from {} has SHA-256 {got}, expected {}", pin.commit, pin.sha256)));
+        return Err(io::Error::other(format!(
+            "docker.exe for arm64 built from {} has SHA-256 {got}, expected {}",
+            pin.commit, pin.sha256
+        )));
     }
     fs::rename(&part, &exe)?;
     Ok(exe)
@@ -563,7 +822,11 @@ fn dir_size(dir: &Path) -> io::Result<u64> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let meta = entry.metadata()?;
-        total += if meta.is_dir() { dir_size(&entry.path())? } else { meta.len() };
+        total += if meta.is_dir() {
+            dir_size(&entry.path())?
+        } else {
+            meta.len()
+        };
     }
     Ok(total)
 }
@@ -579,9 +842,17 @@ fn dir_size(dir: &Path) -> io::Result<u64> {
 /// `arch` and returns its exe: natively on Windows, or the x86-64 one with
 /// MinGW elsewhere. `manifest` is the bundle's hashes, embedded in a
 /// release kiri-win.exe.
-fn windows_exe(root: &Path, debug: bool, arch: WinArch, package: &str, manifest: Option<&str>) -> io::Result<PathBuf> {
+fn windows_exe(
+    root: &Path,
+    debug: bool,
+    arch: WinArch,
+    package: &str,
+    manifest: Option<&str>,
+) -> io::Result<PathBuf> {
     let mut build = Command::new(env!("CARGO"));
-    build.current_dir(root).args(["build", "-p", package, "--bin", package]);
+    build
+        .current_dir(root)
+        .args(["build", "-p", package, "--bin", package]);
     if let Some(m) = manifest.filter(|_| !debug) {
         build.env("KIRI_BUNDLE_SHA256", m);
     }
@@ -598,19 +869,26 @@ fn windows_exe(root: &Path, debug: bool, arch: WinArch, package: &str, manifest:
             dir = dir.join(arch.msvc());
         }
     } else if arch == WinArch::Arm64 {
-        return Err(io::Error::other("the arm64 kiri-win.exe is built on Windows (or checked from here with cargo xwin)"));
+        return Err(io::Error::other(
+            "the arm64 kiri-win.exe is built on Windows (or checked from here with cargo xwin)",
+        ));
     } else {
         build.args(["--target", "x86_64-pc-windows-gnu"]);
         dir = dir.join("x86_64-pc-windows-gnu");
     }
     run(&mut build)?;
-    Ok(dir.join(if debug { "debug" } else { "release" }).join(format!("{package}.exe")))
+    Ok(dir
+        .join(if debug { "debug" } else { "release" })
+        .join(format!("{package}.exe")))
 }
 
 fn msi(root: &Path, arch: WinArch) -> io::Result<()> {
     let bundle = root.join(format!("target/kiri-windows-{}", arch.linux()));
     if !bundle.join("kiri-win.exe").is_file() {
-        return Err(io::Error::other(format!("no bundle in {}: run cargo xtask windows (or msi) first", bundle.display())));
+        return Err(io::Error::other(format!(
+            "no bundle in {}: run cargo xtask windows (or msi) first",
+            bundle.display()
+        )));
     }
     let version = env!("CARGO_PKG_VERSION");
     let name = format!("Kiri-{version}-{}.msi", arch.msi());
@@ -631,17 +909,30 @@ fn msi(root: &Path, arch: WinArch) -> io::Result<()> {
         .status()
         .is_ok_and(|s| s.success());
     if !drawn {
-        eprintln!("xtask: make-bitmaps.ps1 -Stamp failed; using the committed installer bitmaps as they are");
+        eprintln!(
+            "xtask: make-bitmaps.ps1 -Stamp failed; using the committed installer bitmaps as they are"
+        );
     }
     // The ready page says what the install takes: the bundle's files, in
     // the MB Apps & features uses (1024 by 1024).
     let on_disk = dir_size(&bundle)? as f64 / (1024.0 * 1024.0);
     let mut wix = Command::new("wix");
     wix.current_dir(root.join("installer/windows"))
-        .args(["build", "-arch", arch.wix(), "-ext", "WixToolset.UI.wixext", "-ext", "WixToolset.Util.wixext"])
+        .args([
+            "build",
+            "-arch",
+            arch.wix(),
+            "-ext",
+            "WixToolset.UI.wixext",
+            "-ext",
+            "WixToolset.Util.wixext",
+        ])
         .arg("-d")
         // Windows Installer takes numbers only: a test build's 0.1.8-dev.42 is 0.1.8.
-        .arg(format!("Version={}", version.split('-').next().unwrap_or(version)))
+        .arg(format!(
+            "Version={}",
+            version.split('-').next().unwrap_or(version)
+        ))
         .arg("-d")
         .arg(format!("Bundle={}", bundle.display()))
         .arg("-d")
@@ -649,17 +940,28 @@ fn msi(root: &Path, arch: WinArch) -> io::Result<()> {
     if drawn {
         wix.arg("-d").arg(format!("Assets={}", assets.display()));
     }
-    run(wix.args(["-loc", "kiri.wxl", "-o"]).arg(&out).arg("kiri.wxs"))?;
+    run(wix
+        .args(["-loc", "kiri.wxl", "-o"])
+        .arg(&out)
+        .arg("kiri.wxs"))?;
     // The update feed entry kiri-win reads (crates/kiri-win/src/update.rs),
     // as `release` writes the Mac's.
     let size = fs::metadata(&out)?.len();
     let sum = sha256(&out)?;
-    let base = std::env::var("KIRI_RELEASE_BASE").unwrap_or_else(|_| "https://download.runkiri.com".to_owned());
+    let base = std::env::var("KIRI_RELEASE_BASE")
+        .unwrap_or_else(|_| "https://download.runkiri.com".to_owned());
     let extra = feed_notes()?;
-    let feed = format!("{{\"version\":\"{version}\",\"url\":\"{base}/{name}\",\"sha256\":\"{sum}\",\"size\":{size}{extra}}}\n");
+    let feed = format!(
+        "{{\"version\":\"{version}\",\"url\":\"{base}/{name}\",\"sha256\":\"{sum}\",\"size\":{size}{extra}}}\n"
+    );
     let feed_path = root.join("target").join(arch.feed());
     fs::write(&feed_path, &feed)?;
-    println!("{} ({} KiB)\n{}", out.display(), size / 1024, feed_path.display());
+    println!(
+        "{} ({} KiB)\n{}",
+        out.display(),
+        size / 1024,
+        feed_path.display()
+    );
     Ok(())
 }
 
@@ -668,7 +970,10 @@ fn msi(root: &Path, arch: WinArch) -> io::Result<()> {
 /// as download.docker.com served it), checked before anything is bundled.
 #[path = "../../crates/kiri/src/cli_pins.rs"]
 mod cli_pins;
-use cli_pins::{WIN_ARM64_BUILDX, WIN_ARM64_COMPOSE, WIN_ARM64_DOCKER_SRC, WIN_BUILDX, WIN_COMPOSE, WIN_DOCKER_CLI};
+use cli_pins::{
+    WIN_ARM64_BUILDX, WIN_ARM64_COMPOSE, WIN_ARM64_DOCKER_SRC, WIN_BUILDX, WIN_COMPOSE,
+    WIN_DOCKER_CLI,
+};
 
 /// Downloads `url` into the cache once; returns the cached path.
 fn fetch(cache: &Path, name: &str, url: &str) -> io::Result<PathBuf> {
@@ -676,7 +981,10 @@ fn fetch(cache: &Path, name: &str, url: &str) -> io::Result<PathBuf> {
     if !path.is_file() {
         fs::create_dir_all(cache)?;
         let tmp = cache.join(format!("{name}.part"));
-        run(Command::new("curl").args(["-fsSL", "--retry", "3", "-o"]).arg(&tmp).arg(url))?;
+        run(Command::new("curl")
+            .args(["-fsSL", "--retry", "3", "-o"])
+            .arg(&tmp)
+            .arg(url))?;
         fs::rename(&tmp, &path)?;
     }
     Ok(path)
@@ -685,12 +993,28 @@ fn fetch(cache: &Path, name: &str, url: &str) -> io::Result<PathBuf> {
 fn sha256(path: &Path) -> io::Result<String> {
     if cfg!(windows) {
         // certutil prints a header line, the hash, then a footer.
-        let out = Command::new("certutil").args(["-hashfile"]).arg(path).arg("SHA256").output()?;
+        let out = Command::new("certutil")
+            .args(["-hashfile"])
+            .arg(path)
+            .arg("SHA256")
+            .output()?;
         let text = String::from_utf8_lossy(&out.stdout).into_owned();
-        return Ok(text.lines().nth(1).unwrap_or_default().replace(' ', "").to_ascii_lowercase());
+        return Ok(text
+            .lines()
+            .nth(1)
+            .unwrap_or_default()
+            .replace(' ', "")
+            .to_ascii_lowercase());
     }
-    let out = Command::new("shasum").args(["-a", "256"]).arg(path).output()?;
-    Ok(String::from_utf8_lossy(&out.stdout).split_whitespace().next().unwrap_or_default().to_owned())
+    let out = Command::new("shasum")
+        .args(["-a", "256"])
+        .arg(path)
+        .output()?;
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_owned())
 }
 
 /// Checks a download against its pinned SHA-256; a mismatch deletes it.
@@ -698,7 +1022,10 @@ fn verify(file: &Path, want: &str) -> io::Result<()> {
     let got = sha256(file)?;
     if got != want {
         let _ = fs::remove_file(file);
-        return Err(io::Error::other(format!("{}: SHA-256 {got}, expected {want}", file.display())));
+        return Err(io::Error::other(format!(
+            "{}: SHA-256 {got}, expected {want}",
+            file.display()
+        )));
     }
     Ok(())
 }
@@ -726,7 +1053,10 @@ fn app(root: &Path, arch: Arch, lite: bool) -> io::Result<PathBuf> {
     // ("code object is not signed at all ... In subcomponent: Contents/LICENSE").
     fs::copy(root.join("LICENSE"), res.join("LICENSE"))?;
     fs::copy(root.join("NOTICE"), res.join("NOTICE"))?;
-    fs::copy(root.join("guest/kernel/SOURCE_OFFER.md"), res.join("KERNEL_SOURCE_OFFER.md"))?;
+    fs::copy(
+        root.join("guest/kernel/SOURCE_OFFER.md"),
+        res.join("KERNEL_SOURCE_OFFER.md"),
+    )?;
     let out = arch.guest_out(root)?;
     for f in [arch.kernel(), "initramfs.cpio"] {
         fs::copy(out.join(f), res.join("guest").join(f))?;
@@ -734,25 +1064,59 @@ fn app(root: &Path, arch: Arch, lite: bool) -> io::Result<PathBuf> {
     // The disk template is 64 GiB sparse. Packed as a sparse tarball it is a
     // few hundred KB, and zips, notarization and downloads never see the
     // 64 GiB; Kiri unpacks it on first boot.
-    run(Command::new("tar").args(["-cSzf"]).arg(res.join("guest/data.img.tgz")).arg("-C").arg(Arch::Arm64.guest_out(root)?).arg("data.img"))?;
+    run(Command::new("tar")
+        .args(["-cSzf"])
+        .arg(res.join("guest/data.img.tgz"))
+        .arg("-C")
+        .arg(Arch::Arm64.guest_out(root)?)
+        .arg("data.img"))?;
 
     if !lite {
         // Intel downloads in their own folder: the docker tarball has the
         // same name for both architectures.
-        let cache = root.join(if arch == Arch::X86_64 { "target/cli-cache/x86_64" } else { "target/cli-cache" });
+        let cache = root.join(if arch == Arch::X86_64 {
+            "target/cli-cache/x86_64"
+        } else {
+            "target/cli-cache"
+        });
         let mac = arch.cli();
-        let [(docker_v, docker_sum), (compose_v, compose_sum), (buildx_v, buildx_sum)] = mac.tools();
-        let tgz = fetch(&cache, &format!("docker-{docker_v}.tgz"), &mac.docker_url(docker_v))?;
+        let [
+            (docker_v, docker_sum),
+            (compose_v, compose_sum),
+            (buildx_v, buildx_sum),
+        ] = mac.tools();
+        let tgz = fetch(
+            &cache,
+            &format!("docker-{docker_v}.tgz"),
+            &mac.docker_url(docker_v),
+        )?;
         verify(&tgz, docker_sum)?;
-        run(Command::new("tar").args(["-xzf"]).arg(&tgz).arg("-C").arg(&cache).arg("docker/docker"))?;
+        run(Command::new("tar")
+            .args(["-xzf"])
+            .arg(&tgz)
+            .arg("-C")
+            .arg(&cache)
+            .arg("docker/docker"))?;
         fs::copy(cache.join("docker/docker"), res.join("bin/docker"))?;
-        let compose = fetch(&cache, &format!("docker-compose-darwin-{}-{compose_v}", mac.compose_arch()), &mac.compose_url(compose_v))?;
+        let compose = fetch(
+            &cache,
+            &format!("docker-compose-darwin-{}-{compose_v}", mac.compose_arch()),
+            &mac.compose_url(compose_v),
+        )?;
         verify(&compose, compose_sum)?;
         fs::copy(&compose, res.join("bin/cli-plugins/docker-compose"))?;
-        let buildx = fetch(&cache, &mac.buildx_name(buildx_v), &mac.buildx_url(buildx_v))?;
+        let buildx = fetch(
+            &cache,
+            &mac.buildx_name(buildx_v),
+            &mac.buildx_url(buildx_v),
+        )?;
         verify(&buildx, buildx_sum)?;
         fs::copy(&buildx, res.join("bin/cli-plugins/docker-buildx"))?;
-        for f in ["bin/docker", "bin/cli-plugins/docker-compose", "bin/cli-plugins/docker-buildx"] {
+        for f in [
+            "bin/docker",
+            "bin/cli-plugins/docker-compose",
+            "bin/cli-plugins/docker-buildx",
+        ] {
             run(Command::new("chmod").arg("755").arg(res.join(f)))?;
         }
     }
@@ -762,12 +1126,33 @@ fn app(root: &Path, arch: Arch, lite: bool) -> io::Result<PathBuf> {
     let _ = fs::remove_dir_all(&iconset);
     fs::create_dir_all(&iconset)?;
     let png = root.join("brand/icon/png");
-    for (size, scale) in [(16, 1), (16, 2), (32, 1), (32, 2), (128, 1), (128, 2), (256, 1), (256, 2), (512, 1), (512, 2)] {
+    for (size, scale) in [
+        (16, 1),
+        (16, 2),
+        (32, 1),
+        (32, 2),
+        (128, 1),
+        (128, 2),
+        (256, 1),
+        (256, 2),
+        (512, 1),
+        (512, 2),
+    ] {
         let px = size * scale;
-        let name = if scale == 1 { format!("icon_{size}x{size}.png") } else { format!("icon_{size}x{size}@2x.png") };
-        fs::copy(png.join(format!("kiri-app-icon-{px}.png")), iconset.join(name))?;
+        let name = if scale == 1 {
+            format!("icon_{size}x{size}.png")
+        } else {
+            format!("icon_{size}x{size}@2x.png")
+        };
+        fs::copy(
+            png.join(format!("kiri-app-icon-{px}.png")),
+            iconset.join(name),
+        )?;
     }
-    run(Command::new("iconutil").args(["-c", "icns", "-o"]).arg(res.join("Kiri.icns")).arg(&iconset))?;
+    run(Command::new("iconutil")
+        .args(["-c", "icns", "-o"])
+        .arg(res.join("Kiri.icns"))
+        .arg(&iconset))?;
     fs::remove_dir_all(&iconset)?;
 
     fs::write(
@@ -801,7 +1186,14 @@ fn app(root: &Path, arch: Arch, lite: bool) -> io::Result<PathBuf> {
     )?;
     sign_app(root, &app, arch, lite)?;
     let size = Command::new("du").args(["-sh"]).arg(&app).output()?;
-    println!("{} ({})", app.display(), String::from_utf8_lossy(&size.stdout).split_whitespace().next().unwrap_or("?"));
+    println!(
+        "{} ({})",
+        app.display(),
+        String::from_utf8_lossy(&size.stdout)
+            .split_whitespace()
+            .next()
+            .unwrap_or("?")
+    );
     Ok(app)
 }
 
@@ -813,8 +1205,18 @@ fn app(root: &Path, arch: Arch, lite: bool) -> io::Result<PathBuf> {
 /// a BUILDS band, and its own engine beside Kiri's and Kiri Dev's.
 fn app_dev(root: &Path, built: &Path, feature: Option<&str>) -> io::Result<()> {
     let (name, id, band, state) = match feature {
-        None => ("Kiri Dev".to_owned(), "dev.kiri.app.dev".to_owned(), "DEV".to_owned(), "kiri-dev".to_owned()),
-        Some(f) => (format!("Kiri {}{}", f[..1].to_ascii_uppercase(), &f[1..]), format!("dev.kiri.app.{f}"), f.to_ascii_uppercase(), format!("kiri-{f}")),
+        None => (
+            "Kiri Dev".to_owned(),
+            "dev.kiri.app.dev".to_owned(),
+            "DEV".to_owned(),
+            "kiri-dev".to_owned(),
+        ),
+        Some(f) => (
+            format!("Kiri {}{}", f[..1].to_ascii_uppercase(), &f[1..]),
+            format!("dev.kiri.app.{f}"),
+            f.to_ascii_uppercase(),
+            format!("kiri-{f}"),
+        ),
     };
     let dir = root.join("target/dev");
     let app = dir.join(format!("{name}.app"));
@@ -823,31 +1225,75 @@ fn app_dev(root: &Path, built: &Path, feature: Option<&str>) -> io::Result<()> {
     run(Command::new("ditto").arg(built).arg(&app))?;
     let contents = app.join("Contents");
     let plist = fs::read_to_string(contents.join("Info.plist"))?
-        .replace("<key>CFBundleName</key><string>Kiri</string>", &format!("<key>CFBundleName</key><string>{name}</string>"))
-        .replace("<key>CFBundleDisplayName</key><string>Kiri</string>", &format!("<key>CFBundleDisplayName</key><string>{name}</string>"))
-        .replace("<string>dev.kiri.app</string>", &format!("<string>{id}</string>"));
+        .replace(
+            "<key>CFBundleName</key><string>Kiri</string>",
+            &format!("<key>CFBundleName</key><string>{name}</string>"),
+        )
+        .replace(
+            "<key>CFBundleDisplayName</key><string>Kiri</string>",
+            &format!("<key>CFBundleDisplayName</key><string>{name}</string>"),
+        )
+        .replace(
+            "<string>dev.kiri.app</string>",
+            &format!("<string>{id}</string>"),
+        );
     fs::write(contents.join("Info.plist"), plist)?;
 
     let png = root.join("target/kiri-dev-icon.png");
-    run(Command::new("swift").arg(root.join("xtask/dev-icon.swift")).arg(root.join("brand/icon/png/kiri-app-icon-1024.png")).arg(&png).arg(&band))?;
+    run(Command::new("swift")
+        .arg(root.join("xtask/dev-icon.swift"))
+        .arg(root.join("brand/icon/png/kiri-app-icon-1024.png"))
+        .arg(&png)
+        .arg(&band))?;
     let iconset = root.join("target/KiriDev.iconset");
     let _ = fs::remove_dir_all(&iconset);
     fs::create_dir_all(&iconset)?;
-    for (size, scale) in [(16, 1), (16, 2), (32, 1), (32, 2), (128, 1), (128, 2), (256, 1), (256, 2), (512, 1), (512, 2)] {
-        let name = if scale == 1 { format!("icon_{size}x{size}.png") } else { format!("icon_{size}x{size}@2x.png") };
+    for (size, scale) in [
+        (16, 1),
+        (16, 2),
+        (32, 1),
+        (32, 2),
+        (128, 1),
+        (128, 2),
+        (256, 1),
+        (256, 2),
+        (512, 1),
+        (512, 2),
+    ] {
+        let name = if scale == 1 {
+            format!("icon_{size}x{size}.png")
+        } else {
+            format!("icon_{size}x{size}@2x.png")
+        };
         let px = (size * scale).to_string();
-        run(Command::new("sips").args(["-z", &px, &px]).arg(&png).arg("--out").arg(iconset.join(name)).stdout(std::process::Stdio::null()))?;
+        run(Command::new("sips")
+            .args(["-z", &px, &px])
+            .arg(&png)
+            .arg("--out")
+            .arg(iconset.join(name))
+            .stdout(std::process::Stdio::null()))?;
     }
-    run(Command::new("iconutil").args(["-c", "icns", "-o"]).arg(contents.join("Resources/Kiri.icns")).arg(&iconset))?;
+    run(Command::new("iconutil")
+        .args(["-c", "icns", "-o"])
+        .arg(contents.join("Resources/Kiri.icns"))
+        .arg(&iconset))?;
     fs::remove_dir_all(&iconset)?;
 
     let identity = signing_identity();
     let entitlements = root.join("crates/kiri/kiri.entitlements");
     for target in [contents.join("MacOS/kiri"), app.clone()] {
-        run(Command::new("codesign").args(["--force", "--sign", &identity, "--entitlements"]).arg(&entitlements).arg(target))?;
+        run(Command::new("codesign")
+            .args(["--force", "--sign", &identity, "--entitlements"])
+            .arg(&entitlements)
+            .arg(target))?;
     }
-    run(Command::new("codesign").args(["--verify", "--deep", "--strict"]).arg(&app))?;
-    println!("{}: its own engine (~/.{state}, docker context {state}); open it from there or copy it to /Applications", app.display());
+    run(Command::new("codesign")
+        .args(["--verify", "--deep", "--strict"])
+        .arg(&app))?;
+    println!(
+        "{}: its own engine (~/.{state}, docker context {state}); open it from there or copy it to /Applications",
+        app.display()
+    );
     Ok(())
 }
 
@@ -857,9 +1303,18 @@ fn signing_identity() -> String {
     if let Ok(id) = std::env::var("KIRI_SIGN_IDENTITY") {
         return id;
     }
-    let out = Command::new("security").args(["find-identity", "-v", "-p", "codesigning"]).output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+    let out = Command::new("security")
+        .args(["find-identity", "-v", "-p", "codesigning"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
     out.lines()
-        .find_map(|l| l.split('"').nth(1).filter(|n| n.starts_with("Developer ID Application:")).map(str::to_owned))
+        .find_map(|l| {
+            l.split('"')
+                .nth(1)
+                .filter(|n| n.starts_with("Developer ID Application:"))
+                .map(str::to_owned)
+        })
         .unwrap_or_else(|| "-".to_owned())
 }
 
@@ -897,15 +1352,33 @@ fn sign_app(root: &Path, app: &Path, arch: Arch, lite: bool) -> io::Result<()> {
     // entitlement Virtualization.framework requires.
     let identity = signing_identity();
     if !lite {
-        for f in ["bin/docker", "bin/cli-plugins/docker-compose", "bin/cli-plugins/docker-buildx"] {
+        for f in [
+            "bin/docker",
+            "bin/cli-plugins/docker-compose",
+            "bin/cli-plugins/docker-buildx",
+        ] {
             run(sign(&identity, None).arg(res.join(f)))?;
         }
     }
-    run(sign(&identity, Some(&root.join("crates/kiri/kiri.entitlements"))).arg(macos.join("kiri")))?;
+    run(
+        sign(&identity, Some(&root.join("crates/kiri/kiri.entitlements"))).arg(macos.join("kiri")),
+    )?;
     run(sign(&identity, Some(&root.join("crates/kiri/kiri.entitlements"))).arg(app))?;
-    run(Command::new("codesign").args(["--verify", "--deep", "--strict"]).arg(app))?;
-    println!("signed: {}", if identity == "-" { "ad hoc (no Developer ID identity found)" } else { identity.as_str() });
-    if let Some(profile) = std::env::var("KIRI_NOTARY_PROFILE").ok().filter(|p| !p.is_empty()) {
+    run(Command::new("codesign")
+        .args(["--verify", "--deep", "--strict"])
+        .arg(app))?;
+    println!(
+        "signed: {}",
+        if identity == "-" {
+            "ad hoc (no Developer ID identity found)"
+        } else {
+            identity.as_str()
+        }
+    );
+    if let Some(profile) = std::env::var("KIRI_NOTARY_PROFILE")
+        .ok()
+        .filter(|p| !p.is_empty())
+    {
         notarize(root, app, &profile, arch, lite)?;
     }
     Ok(())
@@ -916,15 +1389,32 @@ fn dmg(root: &Path, app: &Path, arch: Arch, lite: bool) -> io::Result<PathBuf> {
     let version = env!("CARGO_PKG_VERSION");
     let venv = root.join(format!("target/dmgbuild-venv-{DMGBUILD}"));
     let dmgbuild = venv.join("bin/dmgbuild");
-    if !Command::new(&dmgbuild).arg("--help").stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().is_ok_and(|s| s.success()) {
+    if !Command::new(&dmgbuild)
+        .arg("--help")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+    {
         let _ = fs::remove_dir_all(&venv);
         run(Command::new("python3").args(["-m", "venv"]).arg(&venv))?;
-        run(Command::new(venv.join("bin/pip")).args(["install", "--quiet", "--disable-pip-version-check", &format!("dmgbuild=={DMGBUILD}")]))?;
+        run(Command::new(venv.join("bin/pip")).args([
+            "install",
+            "--quiet",
+            "--disable-pip-version-check",
+            &format!("dmgbuild=={DMGBUILD}"),
+        ]))?;
     }
     let bg = root.join("target/dmg-background");
     fs::create_dir_all(&bg)?;
-    run(Command::new("swift").arg(root.join("scripts/dmg-background.swift")).arg(bg.join("background")))?;
-    let dmg = root.join(format!("target/Kiri-{}{version}{}.dmg", if lite { "Lite-" } else { "" }, arch.suffix()));
+    run(Command::new("swift")
+        .arg(root.join("scripts/dmg-background.swift"))
+        .arg(bg.join("background")))?;
+    let dmg = root.join(format!(
+        "target/Kiri-{}{version}{}.dmg",
+        if lite { "Lite-" } else { "" },
+        arch.suffix()
+    ));
     let _ = fs::remove_file(&dmg);
     run(Command::new(&dmgbuild)
         .arg("-s")
@@ -932,7 +1422,10 @@ fn dmg(root: &Path, app: &Path, arch: Arch, lite: bool) -> io::Result<PathBuf> {
         .arg("-D")
         .arg(format!("app={}", app.display()))
         .arg("-D")
-        .arg(format!("background={}", bg.join("background.png").display()))
+        .arg(format!(
+            "background={}",
+            bg.join("background.png").display()
+        ))
         .arg(match (lite, arch) {
             (false, Arch::Arm64) => "Kiri",
             (true, Arch::Arm64) => "Kiri Lite",
@@ -946,7 +1439,10 @@ fn dmg(root: &Path, app: &Path, arch: Arch, lite: bool) -> io::Result<PathBuf> {
 
 fn notarize(root: &Path, app: &Path, profile: &str, arch: Arch, lite: bool) -> io::Result<()> {
     let dmg = dmg(root, app, arch, lite)?;
-    run(Command::new("xcrun").args(["notarytool", "submit"]).arg(&dmg).args(["--keychain-profile", profile, "--wait"]))?;
+    run(Command::new("xcrun")
+        .args(["notarytool", "submit"])
+        .arg(&dmg)
+        .args(["--keychain-profile", profile, "--wait"]))?;
     run(Command::new("xcrun").args(["stapler", "staple"]).arg(&dmg))?;
     run(Command::new("xcrun").args(["stapler", "staple"]).arg(app))?;
     println!("notarized and stapled: {}", dmg.display());
@@ -976,7 +1472,10 @@ fn json_escape(s: &str) -> String {
 fn feed_notes() -> io::Result<String> {
     let mut extra = String::new();
     if let Ok(path) = std::env::var("KIRI_RELEASE_NOTES") {
-        extra += &format!(",\"notes\":\"{}\"", json_escape(&fs::read_to_string(&path)?));
+        extra += &format!(
+            ",\"notes\":\"{}\"",
+            json_escape(&fs::read_to_string(&path)?)
+        );
     }
     if let Ok(url) = std::env::var("KIRI_RELEASE_NOTES_URL") {
         extra += &format!(",\"notes_url\":\"{}\"", json_escape(&url));
@@ -991,14 +1490,27 @@ fn release(root: &Path, app: &Path, arch: Arch) -> io::Result<()> {
     let version = env!("CARGO_PKG_VERSION");
     let suffix = arch.suffix();
     let tarball = root.join(format!("target/Kiri-{version}{suffix}.tar.gz"));
-    run(Command::new("tar").args(["-cSzf"]).arg(&tarball).arg("-C").arg(app.parent().unwrap_or(root)).arg("Kiri.app"))?;
+    run(Command::new("tar")
+        .args(["-cSzf"])
+        .arg(&tarball)
+        .arg("-C")
+        .arg(app.parent().unwrap_or(root))
+        .arg("Kiri.app"))?;
     let sum = sha256(&tarball)?;
-    let base = std::env::var("KIRI_RELEASE_BASE").unwrap_or_else(|_| "https://download.runkiri.com".to_owned());
+    let base = std::env::var("KIRI_RELEASE_BASE")
+        .unwrap_or_else(|_| "https://download.runkiri.com".to_owned());
     let extra = feed_notes()?;
-    let feed = format!("{{\"version\":\"{version}\",\"url\":\"{base}/Kiri-{version}{suffix}.tar.gz\",\"sha256\":\"{sum}\"{extra}}}\n");
+    let feed = format!(
+        "{{\"version\":\"{version}\",\"url\":\"{base}/Kiri-{version}{suffix}.tar.gz\",\"sha256\":\"{sum}\"{extra}}}\n"
+    );
     let feed_path = root.join(format!("target/latest-mac{suffix}.json"));
     fs::write(&feed_path, &feed)?;
-    println!("{} ({} KiB)\n{}", tarball.display(), fs::metadata(&tarball)?.len() / 1024, feed_path.display());
+    println!(
+        "{} ({} KiB)\n{}",
+        tarball.display(),
+        fs::metadata(&tarball)?.len() / 1024,
+        feed_path.display()
+    );
     Ok(())
 }
 
@@ -1060,5 +1572,82 @@ impl Cpio {
         self.ino = 0;
         self.entry("TRAILER!!!", 0, 1, (0, 0), &[]);
         self.buf
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chooses_a_linux_user_distro_when_docker_desktop_is_default() {
+        let list = b"docker-desktop
+\nUbuntu-24.04
+\n";
+        assert_eq!(
+            choose_wsl_distro(&decode_wsl_list(list), None).as_deref(),
+            Some("Ubuntu-24.04")
+        );
+    }
+
+    #[test]
+    fn kiris_own_runtime_distro_is_not_a_build_host() {
+        // Kiri's WSL distro runs the engine's busybox-like init, without bash.
+        let list = b"docker-desktop
+\nkiri
+\nUbuntu-24.04
+\n";
+        assert_eq!(
+            choose_wsl_distro(&decode_wsl_list(list), None).as_deref(),
+            Some("Ubuntu-24.04")
+        );
+    }
+
+    #[test]
+    fn explicit_distro_override_wins() {
+        let list = b"docker-desktop
+\nUbuntu-24.04
+\n";
+        assert_eq!(
+            choose_wsl_distro(&decode_wsl_list(list), Some("Fedora")).as_deref(),
+            Some("Fedora")
+        );
+    }
+
+    #[test]
+    fn utf16_wsl_output_is_decoded_and_internal_distros_are_skipped() {
+        let list: Vec<u8> = "docker-desktop
+\ndocker-desktop-data
+\nUbuntu
+\n"
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+        assert_eq!(
+            choose_wsl_distro(&decode_wsl_list(&list), None).as_deref(),
+            Some("Ubuntu")
+        );
+    }
+
+    #[test]
+    fn wsl_path_arguments_are_scoped_to_the_selected_distro() {
+        assert_eq!(
+            wslpath_args("Ubuntu-24.04", "C:/work/repo"),
+            ["-d", "Ubuntu-24.04", "wslpath", "-a", "C:/work/repo"]
+        );
+    }
+
+    #[test]
+    fn no_user_distro_is_an_error_case() {
+        assert_eq!(
+            choose_wsl_distro(
+                &decode_wsl_list(
+                    b"docker-desktop
+\n"
+                ),
+                None
+            ),
+            None
+        );
     }
 }
