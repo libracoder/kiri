@@ -10,10 +10,12 @@
 //! comes when the page switches to it: the page sends `langwords` and the
 //! host evaluates `lang::words_js`.
 //!
-//! The page is loaded as a string, and WebView2's NavigateToString takes at
-//! most 2 MB. With xterm.js and the keys it is about 1.4 M UTF-16 units, and
-//! a language adds its words: 40 to 60 K units. All of them would be well
-//! past the limit, which is why the page carries only one.
+//! WKWebView and WebKitGTK load the page from memory as a string, and
+//! WebView2 from memory at an address of its own (kiri-win's page.rs), so no
+//! system limits its size. With xterm.js and the keys it is about 1.5 M
+//! UTF-16 units, and a language adds its words: 40 to 60 K units. All of
+//! them would add some 2 M units to every start, which is why the page
+//! carries only one.
 
 const ICONS_JS: &str = include_str!("icons.js");
 /// The languages and the first start's language step, which both pages show.
@@ -53,7 +55,7 @@ mod tests {
     use super::super::lang;
 
     #[test]
-    fn every_placeholder_is_filled_once_and_the_page_fits_webview2() {
+    fn every_placeholder_is_filled_once_and_the_page_stays_a_sane_size() {
         let units = |s: &str| s.encode_utf16().count();
         let page = super::page(include_str!("index.html"), None);
         for p in ["/*ICONS*/", "/*LANGSTEP*/", "/*XTERM_CSS*/", "/*XTERM_JS*/", "/*LANG*/", "/*STRINGS*/"] {
@@ -68,8 +70,7 @@ mod tests {
         assert!(setup.contains("function langStep("), "langstep.js missing from the setup page");
         assert!(page.contains("window.KIRI_LANG = {") && page.contains(&lang::strings_js(lang::resolve(None))), "words missing");
         // Each language the page can open in carries the keys and that language
-        // alone: the largest must stay well inside NavigateToString's 2 MB, with
-        // room for the page to grow.
+        // alone.
         let (mut worst, mut biggest) = (0, "");
         for (tag, _) in lang::FILES {
             let p = super::page(include_str!("index.html"), Some(tag));
@@ -81,9 +82,12 @@ mod tests {
                 (worst, biggest) = (units(&p), tag);
             }
         }
-        // NavigateToString's limit is 2 MB; 1.8 M keeps a margin, and the worst
-        // case stays 200 K under that (a language's words are about 60 K).
-        assert!(worst + 200_000 < 1_800_000, "the page in {biggest} is {worst} UTF-16 units");
+        // No system has a hard limit on it now, so this is a sanity ceiling
+        // only. Windows no longer loads it with NavigateToString, which on
+        // WebView2 157 refused pages past about 1.57 MB of UTF-8 and left
+        // the window blank (#495); only kiri-win's small error page goes
+        // through that now.
+        assert!(worst < 8_000_000, "the page in {biggest} is {worst} UTF-16 units");
         assert!(units(&page) <= worst);
         // Setup's page too.
         assert!(units(&super::words("/*LANG*/ /*STRINGS*/{}", Some(biggest))) < 200_000);

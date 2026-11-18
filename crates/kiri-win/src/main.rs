@@ -13,6 +13,10 @@
 
 #[cfg(windows)]
 mod app;
+// The address the window's page is served at, from memory: plain code,
+// tested on any host.
+#[cfg(any(windows, test))]
+mod page;
 // The window's page, put together as on the Mac and Linux.
 #[cfg(windows)]
 #[path = "../../kiri/src/ui/assemble.rs"]
