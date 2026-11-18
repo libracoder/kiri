@@ -38,8 +38,10 @@ pub const INPUT_WINDOW: usize = 4 << 20;
 /// `UsageQuery`, which has no reply: an older agent's "unexpected" error
 /// would be taken as the reply to the next request. 5 added `RunSpec::seccomp`,
 /// the container's own seccomp program: an older agent would ignore it and
-/// run the container under the default filter instead of its profile.
-pub const PROTOCOL: u16 = 5;
+/// run the container under the default filter instead of its profile. 6 added
+/// a payload on `MemoryPressure` (MemAvailable and PSI full avg10): an older
+/// agent's bare `MemoryPressure` would be read as the start of the next frame.
+pub const PROTOCOL: u16 = 6;
 
 // `Run` is the one big message and is built and read once per container.
 #[allow(clippy::large_enum_variant)]
@@ -122,8 +124,9 @@ pub enum Msg<'a> {
     FsRead { id: &'a str, path: &'a str, offset: u64, len: u32 },
     FsData(&'a [u8]),
     /// Guest → host: memory is tight right now (a PSI trigger fired); grow
-    /// the VM's memory. No reply.
-    MemoryPressure,
+    /// the VM's memory, and carry the readings that go with a memory kill.
+    /// No reply.
+    MemoryPressure(MemoryPressure),
     /// Host → guest: delete a named volume's data. No reply.
     RemoveVolume { name: &'a str },
     /// Host → guest, first frame on a connection to [`COPY_PORT`]: copy
@@ -593,6 +596,16 @@ pub struct Exited<'a> {
     pub oom_killed: bool,
 }
 
+/// What the guest sends with [`Msg::MemoryPressure`]: the readings behind a
+/// memory kill, so the host can log the numbers in the same event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryPressure {
+    /// MemAvailable from /proc/meminfo, in KiB.
+    pub mem_available_kib: u64,
+    /// PSI "full avg10" in hundredths of a percent (see `Stats::mem_stall`).
+    pub mem_stall: u64,
+}
+
 /// A list of strings borrowed from a frame. Iterate it; it never allocates.
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub struct StrList<'a> {
@@ -989,7 +1002,10 @@ impl Msg<'_> {
                 put_u32(o, len);
             }),
             Msg::FsData(d) => frame(out, kind::FS_DATA, |o| put_bytes(o, d)),
-            Msg::MemoryPressure => frame(out, kind::MEMORY_PRESSURE, |_| {}),
+            Msg::MemoryPressure(p) => frame(out, kind::MEMORY_PRESSURE, |o| {
+                put_u64(o, p.mem_available_kib);
+                put_u64(o, p.mem_stall);
+            }),
             Msg::RemoveVolume { name } => frame(out, kind::REMOVE_VOLUME, |o| put_str(o, name)),
             Msg::RemoveBridge { bridge } => frame(out, kind::REMOVE_BRIDGE, |o| put_str(o, bridge)),
             Msg::Copy(c) => frame(out, kind::COPY, |o| {
@@ -1277,7 +1293,10 @@ pub fn decode(frame: &[u8]) -> Result<Msg<'_>, DecodeError> {
         }
         kind::FS_READ => Msg::FsRead { id: r.str()?, path: r.str()?, offset: r.u64()?, len: r.u32()? },
         kind::FS_DATA => Msg::FsData(r.bytes()?),
-        kind::MEMORY_PRESSURE => Msg::MemoryPressure,
+        kind::MEMORY_PRESSURE => Msg::MemoryPressure(MemoryPressure {
+            mem_available_kib: r.u64()?,
+            mem_stall: r.u64()?,
+        }),
         kind::REMOVE_VOLUME => Msg::RemoveVolume { name: r.str()? },
         kind::REMOVE_BRIDGE => Msg::RemoveBridge { bridge: r.str()? },
         kind::COPY => Msg::Copy(CopySpec { op: r.u8()?, id: r.str()?, path: r.str()?, flags: r.u32()?, layers: r.list()? }),
@@ -1471,7 +1490,7 @@ mod tests {
         round(Msg::FsStat(FsEntry { name: "etc", mode: 0o40755, size: 4096, mtime: 1_700_000_000, mtime_nsec: 5, ino: 77 }));
         round(Msg::FsRead { id: "c1", path: "/etc/os-release", offset: 10, len: 4096 });
         round(Msg::FsData(b"NAME=Alpine"));
-        round(Msg::MemoryPressure);
+        round(Msg::MemoryPressure(MemoryPressure { mem_available_kib: 1, mem_stall: 2 }));
         round(Msg::RemoveVolume { name: "pgdata" });
         round(Msg::RemoveBridge { bridge: "kiri3" });
         round(Msg::CopyStat { entry: FsEntry { name: "hosts", mode: 0o100644, size: 9, mtime: 3, mtime_nsec: 4, ino: 5 }, link: "" });
