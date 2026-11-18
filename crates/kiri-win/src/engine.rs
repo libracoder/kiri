@@ -25,6 +25,12 @@ pub(crate) mod sharing;
 // What an image won't start without, the Mac's own file: it needs only crate::client.
 #[path = "../../kiri/src/ui/needs.rs"]
 mod needs;
+// Compose in the window and what each service is made of, the Mac's own files:
+// they need only crate::client, brands and needs, and a docker CLI (compose_cli).
+#[path = "../../kiri/src/ui/compose.rs"]
+mod compose;
+#[path = "../../kiri/src/ui/composetech.rs"]
+mod composetech;
 // What the window costs, the Mac's own file.
 #[path = "../../kiri/src/ui/usage.rs"]
 mod usage;
@@ -735,6 +741,20 @@ fn status_event() -> String {
     json!({"type": "status", "version": env!("CARGO_PKG_VERSION"), "share": true, "app": "Kiri", "ours": "kiri", "context": context.unwrap_or_else(|| "default".into())}).to_string()
 }
 
+/// The docker CLI on Kiri's context, without a console window, for Compose
+/// in the window.
+fn compose_cli() -> io::Result<std::process::Command> {
+    let mut cmd = crate::win::tool(&crate::detail::docker_cli());
+    std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x0800_0000);
+    cmd.args(["--context", crate::flavor::CONTEXT.get()]).env_remove("DOCKER_HOST").env_remove("DOCKER_CONTEXT");
+    Ok(cmd)
+}
+
+/// The compose files opened in the window: %LOCALAPPDATA%\Kiri\compose.json.
+fn compose_store() -> Option<std::path::PathBuf> {
+    prefs_path().map(|p| p.with_file_name("compose.json"))
+}
+
 /// Runs the docker CLI without a console window: its output, or why it failed.
 fn docker(args: &[&str]) -> io::Result<String> {
     let mut cmd = crate::win::tool(&crate::detail::docker_cli());
@@ -1115,6 +1135,11 @@ pub fn on_message(msg: &str) {
         // Registries signed in to, signing in (checked by the engine first) and out.
         "logins" | "login" | "logout" => logins::handle(&c.cmd, c.name, &c.value, emit, || Ok(())),
         "weblogin" | "webloginopen" | "webloginmfa" | "webloginsso" | "weblogincancel" | "awsprofiles" => weblogin::handle(&c.cmd, c.name, &c.value, emit, || Ok(()), crate::term::captured),
+        // Compose: projects, a project's file, what Apply would do, Apply, logs.
+        "composeprojects" | "composefile" | "composeplan" | "composeapply" | "composelogs" | "composeforget" | "composecancel" | "composerestore" | "composeaction" => compose::handle(&c.cmd, c.name, &c.value, compose_cli, compose_store, emit),
+        // Open a compose file…: Windows' own dialog, on the window's thread;
+        // the path it gives stays here, the page gets the project.
+        "composeopen" => crate::app::pick_file(&tr("Open a compose file"), &[(tr("Compose files"), compose::FILE_NAMES.join(";")), (tr("YAML files"), "*.yaml;*.yml".to_owned())], |path| compose::picked(path, compose_cli, compose_store, emit)),
         // Before Run: what the image's start script won't start without.
         "needs" => {
             let image = c.name;

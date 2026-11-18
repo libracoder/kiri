@@ -422,6 +422,36 @@ pub(super) fn paste(done: impl FnOnce(String) + Send + 'static) {
     });
 }
 
+/// Open a compose file…: AppKit's own open panel, on the main thread, for
+/// .yaml and .yml files (an open panel can't offer file names, only kinds).
+/// `done` gets the path, or None when cancelled.
+pub(super) fn pick_compose_file(title: &str, _filters: &[String; 2], done: impl FnOnce(Option<std::path::PathBuf>) + Send + 'static) {
+    let title = title.to_owned();
+    DispatchQueue::main().exec_async(move || {
+        // SAFETY: on the main thread (main queue); NSOpenPanel's documented
+        // messages, with the argument types AppKit declares.
+        let picked = (|| unsafe {
+            let panel: Retained<AnyObject> = msg_send![objc2::class!(NSOpenPanel), openPanel];
+            let _: () = msg_send![&*panel, setCanChooseFiles: true];
+            let _: () = msg_send![&*panel, setCanChooseDirectories: false];
+            let _: () = msg_send![&*panel, setAllowsMultipleSelection: false];
+            let words = NSString::from_str(&title);
+            let _: () = msg_send![&*panel, setTitle: &*words];
+            let _: () = msg_send![&*panel, setMessage: &*words];
+            let kinds = objc2_foundation::NSArray::from_retained_slice(&[NSString::from_str("yaml"), NSString::from_str("yml")]);
+            let _: () = msg_send![&*panel, setAllowedFileTypes: &*kinds];
+            let answer: isize = msg_send![&*panel, runModal];
+            if answer != 1 {
+                return None;
+            }
+            let url: Option<Retained<AnyObject>> = msg_send![&*panel, URL];
+            let path: Option<Retained<NSString>> = msg_send![&*url?, path];
+            Some(std::path::PathBuf::from(path?.to_string()))
+        })();
+        done(picked);
+    });
+}
+
 /// The installed font families, sorted; `mono` keeps the fixed-pitch ones.
 pub(super) fn font_families(mono: bool) -> Vec<String> {
     use objc2_core_foundation::{CFArray, CFDictionary, CFNumber, CFString, CFType};

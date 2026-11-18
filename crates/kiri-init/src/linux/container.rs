@@ -1898,6 +1898,11 @@ mod tests {
         assert_eq!(super::start_failure("noise\nkiri: cannot start container: mount: boom\nmore"), Some("mount: boom"));
         assert_eq!(super::start_failure("hello from the program\n"), None);
         assert_eq!(super::start_failure("kiri: cannot start container: \n"), None);
+        // As the child writes it: a backslash as it is, line breaks as spaces.
+        let said = format!("kiri: cannot start container: {}\n", super::sys::one_line("user: unknown user DOM\\bob"));
+        assert_eq!(super::start_failure(&said), Some("user: unknown user DOM\\bob"));
+        let said = format!("kiri: cannot start container: {}\n", super::sys::one_line("user: unknown user a\nb"));
+        assert_eq!(super::start_failure(&said), Some("user: unknown user a b"));
         assert_eq!(super::start_failure(""), None);
     }
 

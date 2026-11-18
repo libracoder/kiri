@@ -130,10 +130,19 @@ pub unsafe fn clone3(args: &CloneArgs) -> io::Result<libc::pid_t> {
     check(ret, "clone3").map(|p| p as libc::pid_t)
 }
 
+/// The engine's own message as one line of the container's log: a value
+/// over several lines (a key a `user:` named) never goes on, unhidden, over
+/// the lines after it.
+/// Each line break is one space; every other character stays as it is, so
+/// what Kiri hides in Logs finds the value as it is.
+pub fn one_line(s: &str) -> String {
+    s.replace("\r\n", " ").replace(['\n', '\r'], " ")
+}
+
 /// Writes `msg` straight to `fd` and exits without unwinding or running any
 /// destructors. Only for the child between clone and exec.
 pub fn child_fail(fd: RawFd, what: &str, err: io::Error) -> ! {
-    let msg = format!("kiri: cannot start container: {what}: {err}\n");
+    let msg = format!("kiri: cannot start container: {}\n", one_line(&format!("{what}: {err}")));
     // SAFETY: writing a valid buffer to a descriptor we hold, then exiting.
     unsafe {
         libc::write(fd, msg.as_ptr().cast(), msg.len());
@@ -153,7 +162,7 @@ pub fn exec_fail(fd: RawFd, exe: &CStr, err: io::Error, init: bool) -> ! {
     let (code, why) = exec_failure(&exe, &err, found, init);
     // runc reports what it refuses before the start as the daemon's error,
     // and a failed exec after it on the container's stderr, as is.
-    let msg = if code == 255 { format!("{why}\n") } else { format!("kiri: cannot start container: {why}\n") };
+    let msg = if code == 255 { format!("{why}\n") } else { format!("kiri: cannot start container: {}\n", one_line(&why)) };
     // SAFETY: writing a valid buffer to a descriptor we hold, then exiting.
     unsafe {
         libc::write(fd, msg.as_ptr().cast(), msg.len());
@@ -294,6 +303,16 @@ pub fn resize_pty(fd: RawFd, rows: u16, cols: u16) {
 #[cfg(test)]
 mod tests {
     use std::io;
+
+    /// A value over several lines never starts a line of its own in the log.
+    #[test]
+    fn the_engines_message_is_one_line() {
+        assert_eq!(super::one_line("user: unknown user -----BEGIN KEY-----\nAAA\r\n-----END KEY-----"), "user: unknown user -----BEGIN KEY----- AAA -----END KEY-----");
+        // A backslash or a quote stays as the value has it.
+        assert_eq!(super::one_line("user: unknown user Bs-x\\yy\"4dd4"), "user: unknown user Bs-x\\yy\"4dd4");
+        assert_eq!(super::one_line("DOM\\bob\\n"), "DOM\\bob\\n");
+        assert_eq!(super::one_line("x\ny\rz"), "x y z");
+    }
 
     /// A command that may not be run ends 126 and one that is missing 127,
     /// as with Docker (`docker run alpine /etc/passwd` is 126).

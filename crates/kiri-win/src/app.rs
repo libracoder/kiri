@@ -163,6 +163,57 @@ fn with_ui<R>(f: impl FnOnce(&mut Ui) -> R) -> Option<R> {
     UI.with(|u| u.try_borrow_mut().ok()?.as_mut().map(f))
 }
 
+/// Open a compose file…: Windows' own Open dialog over the window, on its
+/// thread, after the page's message is handled. `filters` are (name,
+/// patterns) pairs, the first one shown first. `done` gets the path, or None
+/// when cancelled, on a thread of its own.
+pub fn pick_file(title: &str, filters: &[(String, String)], done: impl FnOnce(Option<std::path::PathBuf>) + Send + 'static) {
+    let title = HSTRING::from(title);
+    let filters: Vec<(HSTRING, HSTRING)> = filters.iter().map(|(n, p)| (HSTRING::from(n.as_str()), HSTRING::from(p.as_str()))).collect();
+    // The dialog's own message loop runs while it is open: it must not run
+    // inside with_ui (the window's state borrowed), or every job posted
+    // meanwhile finds the window busy and posts itself again, round and
+    // round. Like tray_menu, it needs only the window's handle.
+    BARE.lock().unwrap_or_else(PoisonError::into_inner).push(Box::new(move |hwnd| {
+        // SAFETY: on the window's thread, where COM is initialised (run).
+        let path = unsafe { open_dialog(hwnd, &title, &filters) }.ok().flatten();
+        std::thread::spawn(move || done(path));
+    }));
+    let hwnd = WINDOW.load(Ordering::SeqCst);
+    if hwnd != 0 {
+        // SAFETY: posting to our own window; a closed one just drops it.
+        let _ = unsafe { PostMessageW(Some(HWND(hwnd as _)), WM_RUN, WPARAM(0), LPARAM(0)) };
+    }
+}
+
+/// Jobs that need only the window's handle and run outside with_ui (a modal
+/// dialog), on the window's thread.
+type BareJob = Box<dyn FnOnce(HWND) + Send>;
+static BARE: Mutex<Vec<BareJob>> = Mutex::new(Vec::new());
+
+/// IFileOpenDialog: one existing file on disk, or None when cancelled.
+unsafe fn open_dialog(owner: HWND, title: &HSTRING, filters: &[(HSTRING, HSTRING)]) -> windows::core::Result<Option<std::path::PathBuf>> {
+    use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_INPROC_SERVER};
+    use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
+    use windows::Win32::UI::Shell::{FileOpenDialog, IFileOpenDialog, FOS_FILEMUSTEXIST, FOS_FORCEFILESYSTEM, SIGDN_FILESYSPATH};
+    // SAFETY: COM calls on this thread's apartment; the filter strings outlive the dialog.
+    unsafe {
+        let d: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)?;
+        let specs: Vec<COMDLG_FILTERSPEC> = filters.iter().map(|(n, p)| COMDLG_FILTERSPEC { pszName: PCWSTR(n.as_ptr()), pszSpec: PCWSTR(p.as_ptr()) }).collect();
+        d.SetFileTypes(&specs)?;
+        d.SetTitle(title)?;
+        d.SetOptions(d.GetOptions()? | FOS_FILEMUSTEXIST | FOS_FORCEFILESYSTEM)?;
+        // Cancel comes back as an error.
+        if d.Show(Some(owner)).is_err() {
+            return Ok(None);
+        }
+        let name = d.GetResult()?.GetDisplayName(SIGDN_FILESYSPATH)?;
+        let path = name.to_string().ok();
+        CoTaskMemFree(Some(name.0 as *const _));
+        Ok(path.map(std::path::PathBuf::from))
+    }
+}
+
 /// As with_ui, but if the window is busy the job runs once it is not.
 fn with_ui_soon(f: impl FnOnce(&mut Ui) + Send + 'static) {
     let busy = UI.with(|u| u.try_borrow_mut().is_err());
@@ -403,6 +454,12 @@ thread_local! {
 /// Runs queued jobs; if the window is busy (a modal loop inside a call on
 /// it), they wait for the next WM_RUN.
 fn run_jobs() {
+    // Taken out of the queue before each runs: a dialog's own loop that
+    // calls this again finds them gone.
+    loop {
+        let Some(bare) = BARE.lock().unwrap_or_else(PoisonError::into_inner).pop() else { break };
+        bare(HWND(WINDOW.load(Ordering::SeqCst) as _));
+    }
     let jobs = std::mem::take(&mut *JOBS.lock().unwrap_or_else(PoisonError::into_inner));
     let mut jobs = jobs.into_iter();
     while let Some(job) = jobs.next() {
