@@ -570,11 +570,19 @@ fn image_tag(req: &Request, engine: &Engine, source: &str) -> Result<(), Error> 
     Ok(())
 }
 
+/// Most of a load's body read after the archive's end (the second zero
+/// block and any padding).
+const LOAD_TRAILER_MAX: u64 = 1 << 20;
+
 /// `docker load`: an image archive, streamed into the store.
 fn image_load(req: &Request, engine: &Engine, w: &mut UnixStream, r: &mut BufReader<UnixStream>) -> io::Result<Next> {
-    let loaded = kiri_image::archive::load(&engine.store, http::Body::new(req, r));
+    let mut body = http::Body::new(req, r);
+    let loaded = kiri_image::archive::load(&engine.store, &mut body);
     match loaded {
         Ok(images) => {
+            // The loader stops at the first zero block. Read the rest before
+            // closing, or the client gets a broken pipe.
+            let _ = io::copy(&mut io::Read::take(&mut body, LOAD_TRAILER_MAX), &mut io::sink());
             http::begin_stream_with(w, 200, "application/json", http::CLOSE)?;
             for i in &images {
                 engine.emit_image("load", &i.config_digest, &i.name);
@@ -583,9 +591,13 @@ fn image_load(req: &Request, engine: &Engine, w: &mut UnixStream, r: &mut BufRea
             }
             http::end(w)?;
         }
-        Err(e) => error_closing(w, Error::BadRequest(e.to_string()))?,
+        Err(e) => {
+            // Read the rest so the client gets the error, not a broken pipe.
+            let _ = io::copy(&mut body, &mut io::sink());
+            error_closing(w, Error::BadRequest(e.to_string()))?
+        }
     }
-    // A load may leave part of the body unread (padding after the archive's end).
+    // Past LOAD_TRAILER_MAX, part of the body may be unread.
     Ok(Next::Close)
 }
 

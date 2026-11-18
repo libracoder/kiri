@@ -810,6 +810,7 @@ t load "Loaded image: kiri-test/alp:v1" $D load -i "$IMD/a.tar"
 t load-runs "3." $D run --rm kiri-test/alp:v1 cat /etc/alpine-release
 t load-stdin "Loaded image" bash -c "$D rmi kiri-test/alp:v1 >/dev/null; $D load < $IMD/a.tar"
 code load-garbage 1 bash -c "echo nope | $D load"
+t load-archive-end-later "ok" python3 "$(dirname "$0")/load-trailer.py" "$SOCK" "$IMD/a.tar"
 $D rmi kiri-test/alp:v1 >/dev/null 2>&1; rm -rf "$IMD"
 
 section "docker build (BuildKit in the VM)"
