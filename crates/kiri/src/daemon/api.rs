@@ -1419,6 +1419,28 @@ fn command(entry: Option<Vec<String>>, cmd: Option<Vec<String>>, image_entry: &[
     }
 }
 
+/// The primary network when NetworkMode is empty or `default`: the first
+/// resolved endpoint's name, unless bridge is listed. No match keeps bridge.
+/// Unknown endpoints are left for create to reject. `keys` come from the
+/// request's JSON map, so they are sorted and "first" is the same every time.
+/// `resolve` gives a key's network name and whether it is internal. Only the
+/// primary network gets the default route, so a network that reaches outside
+/// is preferred, as Docker picks its gateway: an internal one is primary only
+/// when every listed network is internal.
+fn endpoints_primary<'a>(keys: impl Iterator<Item = &'a str>, resolve: impl Fn(&str) -> Option<(String, bool)>) -> Option<String> {
+    let (mut outside, mut internal) = (None, None);
+    for (name, is_internal) in keys.filter(|key| !key.starts_with("container:")).filter_map(resolve) {
+        if name == "bridge" {
+            return None;
+        }
+        let slot = if is_internal { &mut internal } else { &mut outside };
+        if slot.is_none() {
+            *slot = Some(name);
+        }
+    }
+    outside.or(internal)
+}
+
 fn strings(v: &Value) -> Option<Vec<String>> {
     match v {
         Value::Array(a) => Some(a.iter().filter_map(|s| s.as_str().map(str::to_owned)).collect()),
@@ -1520,7 +1542,9 @@ pub(super) fn create(req: &Request, engine: &Engine) -> Result<Value, Error> {
         super::seccomp::compile(json, profile_caps(caps_from(host)?, host["Privileged"].as_bool().unwrap_or(false))).map_err(Error::BadRequest)?;
     }
     let network_mode = match host["NetworkMode"].as_str().unwrap_or("default") {
-        "" | "default" => "bridge".to_owned(),
+        "" | "default" => body["NetworkingConfig"]["EndpointsConfig"].as_object()
+            .and_then(|eps| endpoints_primary(eps.keys().map(String::as_str), |key| engine.lock_net().find(key).map(|n| (n.name.clone(), n.internal))))
+            .unwrap_or_else(|| "bridge".to_owned()),
         m => m.to_owned(),
     };
     let network = match network_mode.strip_prefix("container:") {
@@ -1531,7 +1555,7 @@ pub(super) fn create(req: &Request, engine: &Engine) -> Result<Value, Error> {
         return Err(Error::NotFound(format!("network {network_mode} not found")));
     };
     // One endpoint per network (API 1.44+ allows several at create, which
-    // Compose uses); the one named by NetworkMode is the primary.
+    // Compose uses); NetworkMode or the endpoints above pick the primary.
     let mut aliases = Vec::new();
     let mut extra_networks = Vec::new();
     // `--ip`, `--mac-address` (Config.MacAddress before API 1.44).
@@ -2940,6 +2964,49 @@ mod tests {
         assert_eq!(command(Some(s(&["sh"])), Some(s(&["-c", "x"])), &ie, &ic), (s(&["sh"]), s(&["-c", "x"])));
         // "Entrypoint": [] clears the image's and keeps its Cmd.
         assert_eq!(command(Some(vec![]), None, &ie, &ic), (vec![], ic.clone()));
+    }
+
+    #[test]
+    fn endpoints_alone_choose_the_primary_network() {
+        let asked = std::cell::RefCell::new(Vec::new());
+        let resolve = |key: &str| {
+            asked.borrow_mut().push(key.to_owned());
+            match key {
+                "a" | "b" | "n" | "bridge" => Some((key.to_owned(), false)),
+                // Internal networks (`network create --internal`).
+                "back" | "inner" => Some((key.to_owned(), true)),
+                "0123abc" => Some(("n".to_owned(), false)),
+                "4567def" => Some(("bridge".to_owned(), false)),
+                _ => None,
+            }
+        };
+        let cases: &[(&[&str], Option<&str>)] = &[
+            (&[], None),
+            (&["n"], Some("n")),
+            (&["0123abc"], Some("n")),
+            (&["a", "b"], Some("a")),
+            (&["bridge"], None),
+            (&["n", "bridge"], None),
+            (&["bridge", "n"], None),
+            (&["4567def"], None),
+            (&["n", "4567def"], None),
+            (&["container:x"], None),
+            (&["container:x", "n"], Some("n")),
+            (&["n", "container:x"], Some("n")),
+            (&["missing"], None),
+            (&["missing", "n"], Some("n")),
+            // An internal network sorted first doesn't take the default
+            // route from one that reaches outside.
+            (&["back", "n"], Some("n")),
+            (&["back", "inner", "n"], Some("n")),
+            (&["back"], Some("back")),
+            (&["back", "inner"], Some("back")),
+            (&["back", "bridge"], None),
+        ];
+        for (keys, expected) in cases {
+            assert_eq!(endpoints_primary(keys.iter().copied(), resolve).as_deref(), *expected, "{keys:?}");
+        }
+        assert!(asked.borrow().iter().all(|k| !k.starts_with("container:")), "a container: key was looked up as a network");
     }
 
     #[test]
