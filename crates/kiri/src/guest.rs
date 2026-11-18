@@ -12,6 +12,9 @@ use std::time::{Duration, Instant};
 use kiri_proto::{HEADER, Hello, LayerBegin, Msg, Stream};
 use kiri_vmm::{Config, Event, Vm};
 
+#[cfg(target_os = "macos")]
+mod disk;
+
 /// How long each boot stage took, measured from the host.
 #[derive(Debug, Clone, Copy)]
 pub struct BootTimings {
@@ -359,6 +362,7 @@ fn agent_binary() -> PathBuf {
 /// The guest's data disk, copied from the empty template on first use. On
 /// APFS the copy is a clone: instant, and it takes no space until written.
 fn data_disk(guest_dir: &std::path::Path) -> io::Result<PathBuf> {
+    let requested = disk::requested_size()?;
     let vm = kiri_image::Store::default_root()?.join("vm");
     std::fs::create_dir_all(&vm)?;
     let disk = vm.join("data.img");
@@ -386,6 +390,7 @@ fn data_disk(guest_dir: &std::path::Path) -> io::Result<PathBuf> {
         }
         std::fs::rename(tmp, &disk)?;
     }
+    disk::grow(&disk, requested)?;
     Ok(disk)
 }
 
