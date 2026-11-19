@@ -4766,6 +4766,8 @@ function sortBy(items, view, keys) {
   });
 }
 const match = (...fields) => !ui.filter || fields.some((f) => String(f || "").toLowerCase().includes(ui.filter.toLowerCase()));
+const matchContainer = (c) => match(c.Names[0], c.Image) ||
+  (c.Ports || []).some((p) => match(p.PublicPort, p.PrivatePort));
 // The tab is said too, when it narrows the list as well.
 function noMatch() {
   const tab = LISTS[ui.view]?.tabs?.find(([k]) => k === tabOf(ui.view))?.[1];
@@ -10093,7 +10095,7 @@ const BUILTIN_NETS = new Set(["bridge", "host", "none"]);
 const LISTS = {
   containers: {
     // The containers of no Compose project: a project's are in Compose, where its file says what runs.
-    all: () => ui.containers.filter((c) => !c.Labels?.["com.docker.compose.project"]), key: (c) => c.Id, name: cname, hit: (c) => match(c.Names[0], c.Image), noun: "containers",
+    all: () => ui.containers.filter((c) => !c.Labels?.["com.docker.compose.project"]), key: (c) => c.Id, name: cname, hit: matchContainer, noun: "containers",
     state: ctrState,
     tabs: [["running", "Running", "moss"], ["stopped", "Stopped", ""], ["failed", "Failed", "red", true]],
     junk: { state: "failed", label: (n) => tr("Clear {n} failed", { n }), what: "failed containers",
@@ -10137,7 +10139,7 @@ const LISTS = {
   services: { all: () => k8s.services, key: (s) => `${s.ns}/${s.name}`, name: (s) => s.name, hit: (s) => match(s.name, s.ns, s.type), noun: "services" },
   // Compose: its projects' containers, as Containers has them, with no boxes (no Delete: the file says what runs).
   compose: {
-    all: () => ui.containers.filter(cmpOf), key: (c) => c.Id, name: cname, hit: (c) => match(c.Names[0], c.Image, cmpOf(c)), noun: "containers",
+    all: () => ui.containers.filter(cmpOf), key: (c) => c.Id, name: cname, hit: (c) => matchContainer(c) || match(cmpOf(c)), noun: "containers",
     state: ctrState, tabs: [["running", "Running", "moss"], ["stopped", "Stopped", ""], ["failed", "Failed", "red", true]],
     shown: (c) => !ui.collapsed.has(cmpOf(c)),
     // Open project first; one opened from its file and never started is only taken off the list.
