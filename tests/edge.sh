@@ -20,8 +20,10 @@
 # (/var/lib/kiri): unset, it is found by itself (here on a Linux host; inside
 # the VM, through a privileged container, on a Mac or Windows).
 #
-# Extra images come from EDGE_MIRROR (default mirror.gcr.io/library, the same
-# images as Docker Hub's), so a run does not use up Docker Hub's pull limit.
+# Images never come from Docker Hub, so a run does not use up its pull limit:
+# the ones the checks run from KIRI_TEST_REGISTRY (tests/lib/images.sh, then
+# EDGE_MIRROR), the ones the checks pull from EDGE_MIRROR (default
+# mirror.gcr.io/library, the same images as Docker Hub's).
 #
 # Exits non-zero if any check fails.
 set -u
@@ -51,12 +53,12 @@ alive() { limit 30 $D version --format '{{.Server.Version}}' >/dev/null 2>&1; }
 sum256() { if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi | cut -d' ' -f1; }
 export -f sum256
 M=${EDGE_MIRROR:-mirror.gcr.io/library}
-get() {
-  $D image inspect "$1" >/dev/null 2>&1 && return 0
-  $D pull -q "$1" >/dev/null 2>&1 && return 0
-  $D pull -q "$M/$1" >/dev/null 2>&1 && $D tag "$M/$1" "$1" && $D rmi "$M/$1" >/dev/null 2>&1
-  $D image inspect "$1" >/dev/null 2>&1
-}
+# shellcheck disable=SC2034 # read by lib/images.sh
+KIRI_REG_FALLBACK=$M
+# shellcheck source=SCRIPTDIR/lib/images.sh
+. "$(dirname "$0")/lib/images.sh"
+# An image that is here already, or fetched without Docker Hub.
+get() { kiri_seed_images "$1"; }
 export D BIND T M
 
 # The engine's socket, for requests the docker CLI would never send.
@@ -83,7 +85,7 @@ alive || { echo "edge: the engine does not answer"; exit 1; }
 PARTS=${*:-storage net api limits crash}
 cleanup
 mkdir -p "$BIND"
-for i in alpine:3.21 busybox:1.36 nginx:alpine; do get $i || { echo "edge: cannot get $i"; exit 1; }; done
+for i in $KIRI_IMAGES_EDGE; do get $i || { echo "edge: cannot get $i"; exit 1; }; done
 echo "engine: $($D version --format '{{.Server.Version}} {{range .Server.Components}}{{.Name}}={{.Version}} {{end}}' 2>&1)"
 BASE=$(counts); LEFT0=$(left); VOLS0=$($D volume ls -q | sort)
 

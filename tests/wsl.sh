@@ -20,6 +20,12 @@ SOCK=/var/lib/kiri-daemon/.kiri/run
 W=${W:-kiri-wsl}
 $D rm -f $W $W-cli >/dev/null 2>&1
 $D volume rm $W-run $W-lib $W-store >/dev/null 2>&1
+# Images come from KIRI_TEST_REGISTRY (tests/lib/images.sh), never from Docker
+# Hub: here ubuntu (for $PLATFORM) and alpine, in the engine under test once it answers.
+# shellcheck source=SCRIPTDIR/lib/images.sh
+. "$(dirname "$0")/lib/images.sh"
+kiri_seed_images --platform $PLATFORM ubuntu:24.04 || echo "wsl: ubuntu:24.04 ($PLATFORM) could not be fetched"
+kiri_seed_images alpine:latest || echo "wsl: alpine could not be fetched"
 # WSL's disk is ext4; this container's own root is overlayfs, which can't be
 # an overlay's upper layer, so Kiri's state goes on volumes, as in
 # linux-host.sh.
@@ -32,6 +38,9 @@ $D cp "$DIR/install.sh" $W:/tmp/kiri-windows/install.sh >/dev/null
 $D exec $W sh -c 'cd /tmp/kiri-windows && sh ./install.sh'
 $D run -d --name $W-cli --network container:$W -v $W-run:/kiri alpine sh -c 'apk add -q docker-cli curl >/dev/null 2>&1; sleep infinity' >/dev/null
 for _ in $(seq 90); do $D exec $W-cli docker -H unix:///kiri/docker.sock version >/dev/null 2>&1 && break; sleep 1; done
+$D cp "$(dirname "$0")/lib/images.sh" $W-cli:/images.sh >/dev/null
+$D exec -e KIRI_TEST_REGISTRY="$KIRI_REG" $W-cli sh -c '. /images.sh; export DOCKER_HOST=unix:///kiri/docker.sock; kiri_seed_images $KIRI_IMAGES_WSL' ||
+  echo "wsl: an image could not be fetched; the checks that run it will fail"
 PASS=0; FAIL=0
 t() {
   local name=$1 want=$2; shift 2
@@ -47,9 +56,10 @@ t internet "Example Domain" "docker run --rm alpine wget -qO- -T 10 http://examp
 t port "Welcome to nginx" "docker run -d --name web -p 18082:80 nginx:alpine >/dev/null; for i in \$(seq 40); do curl -s localhost:18082 && break; sleep 0.5; done"
 t exec "nginx version" "docker exec web nginx -v"
 t port-inspect '{"80/tcp":[{"HostIp":"","HostPort":"18082"}]}' "docker inspect -f '{{json .HostConfig.PortBindings}}' web"
-# What the registry serves now, for update checkers (#257).
-t distribution '"mediaType":"application/vnd.oci.image.index.v1+json"' "curl -s --unix-socket /kiri/docker.sock http://d/v1.47/distribution/library/alpine:3.21/json"
-t distribution-missing "404" "curl -s -o /dev/null -w '%{http_code}' --unix-socket /kiri/docker.sock http://d/v1.47/distribution/library/no-such-image-kiri-test/json"
+# What the registry serves now, for update checkers (#257). Asked of
+# KIRI_TEST_REGISTRY, which serves Docker Hub's official images as they are.
+t distribution '"mediaType":"application/vnd.oci.image.index.v1+json"' "curl -s --unix-socket /kiri/docker.sock http://d/v1.47/distribution/$KIRI_REG/alpine:3.21/json"
+t distribution-missing "404" "curl -s -o /dev/null -w '%{http_code}' --unix-socket /kiri/docker.sock http://d/v1.47/distribution/$KIRI_REG/no-such-image-kiri-test/json"
 # A copy into a created container, then its start, mounts the same upper
 # dir twice in a row: kernels with overlayfs index on (Arch) refused the
 # second with EBUSY (#227). A renamed directory must survive a commit.
@@ -69,7 +79,7 @@ t volume-user-ready "passed passed passed" "docker run --name ready-seed alpine 
 # container joining its network sent meanwhile all finish, and a start that
 # fails during the fill is still a start error with a whole volume
 # (tests/start-stall.sh).
-$D cp "$(dirname "$0")/start-stall.sh" kiri-wsl-cli:/start-stall.sh >/dev/null
+$D cp "$(dirname "$0")/start-stall.sh" $W-cli:/start-stall.sh >/dev/null
 t start-stall-exec "pass:" "sh /start-stall.sh"
 t seccomp "Seccomp:	2" "docker run --rm alpine grep Seccomp: /proc/self/status"
 t cleanup "web" "docker rm -f web db"

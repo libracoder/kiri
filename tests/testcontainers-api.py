@@ -9,6 +9,7 @@ any failed. The containers it makes (tc-api-*) are left running.
 """
 import io
 import json
+import os
 import re
 import socket
 import sys
@@ -411,7 +412,18 @@ CHECKS = {
 
 if __name__ == "__main__":
     c = Conn(timeout=300)
-    status, _, _ = c.request("POST", "/images/create?fromImage=alpine&tag=latest")
+    # Pulled only when missing, as Testcontainers' default pull policy does,
+    # and then from KIRI_TEST_REGISTRY (tests/lib/images.sh), not Docker Hub:
+    # this script runs once a check, and every pull of plain alpine counted
+    # against Docker Hub's hourly limit.
+    status, _, _ = c.request("GET", f"/images/{IMAGE}/json")
+    if status != 200:
+        reg = os.environ.get("KIRI_TEST_REGISTRY") or "public.ecr.aws/docker/library"
+        repo, tag = IMAGE.split(":")
+        status, _, _ = c.request("POST", f"/images/create?fromImage={reg}/{repo}&tag={tag}")
+        if status == 200:
+            c.request("POST", f"/images/{reg}/{IMAGE}/tag?repo={repo}&tag={tag}")
+            c.request("DELETE", f"/images/{reg}/{IMAGE}")
     failed = 0
     for name in sys.argv[2:] or CHECKS:
         try:

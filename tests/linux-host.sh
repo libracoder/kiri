@@ -9,12 +9,20 @@ BIN=${BIN:-$(cd "$(dirname "$0")/.." && pwd)/target/linux/release}
 # The engine's container (and its volumes): another name runs a second copy beside this one.
 N=${N:-kiri-linux-host}
 [ -x "$BIN/kiri" ] || { echo "build first: cargo xtask linux"; exit 1; }
+# Images come from KIRI_TEST_REGISTRY (tests/lib/images.sh), never from Docker
+# Hub: this engine's alpine here, the inner engine's once it answers.
+# shellcheck source=SCRIPTDIR/lib/images.sh
+. "$(dirname "$0")/lib/images.sh"
+kiri_seed_images alpine:latest || echo "linux-host: alpine could not be fetched"
 $D rm -f "$N" >/dev/null 2>&1
 $D run -d --name "$N" --privileged --tmpfs /run -v "$N":/var/lib/kiri -v "$N"-store:/root/.local/share/kiri \
   -v "$BIN:/opt/kiri:ro" alpine sh -c 'apk add -q docker-cli curl python3 >/dev/null 2>&1; exec /opt/kiri/kiri daemon' >/dev/null
 up() { for _ in $(seq 60); do $D exec "$N" sh -c 'DOCKER_HOST=unix:///root/.kiri/run/docker.sock docker version' >/dev/null 2>&1 && break; sleep 1; done; }
 up
 $D cp "$(dirname "$0")/testcontainers-api.py" "$N":/testcontainers-api.py >/dev/null
+$D cp "$(dirname "$0")/lib/images.sh" "$N":/images.sh >/dev/null
+$D exec -e KIRI_TEST_REGISTRY="$KIRI_REG" "$N" sh -c '. /images.sh; export DOCKER_HOST=unix:///root/.kiri/run/docker.sock; kiri_seed_images $KIRI_IMAGES_LINUX_HOST' ||
+  echo "linux-host: an image could not be fetched; the checks that run it will fail"
 PASS=0; FAIL=0
 t() {
   local name=$1 want=$2; shift 2
@@ -28,9 +36,10 @@ t internet "Example Domain" "docker run --rm alpine wget -qO- -T 10 http://examp
 t port "Welcome to nginx" "docker run -d --name web -p 18081:80 nginx:alpine >/dev/null; for i in \$(seq 30); do curl -s localhost:18081 && break; sleep 0.3; done"
 t exec "nginx version" "docker exec web nginx -v"
 t port-inspect '{"80/tcp":[{"HostIp":"","HostPort":"18081"}]}' "docker inspect -f '{{json .HostConfig.PortBindings}}' web"
-# What the registry serves now, for update checkers (#257).
-t distribution '"mediaType":"application/vnd.oci.image.index.v1+json"' "curl -s --unix-socket /root/.kiri/run/docker.sock http://d/v1.47/distribution/library/alpine:3.21/json"
-t distribution-missing "404" "curl -s -o /dev/null -w '%{http_code}' --unix-socket /root/.kiri/run/docker.sock http://d/v1.47/distribution/library/no-such-image-kiri-test/json"
+# What the registry serves now, for update checkers (#257). Asked of
+# KIRI_TEST_REGISTRY, which serves Docker Hub's official images as they are.
+t distribution '"mediaType":"application/vnd.oci.image.index.v1+json"' "curl -s --unix-socket /root/.kiri/run/docker.sock http://d/v1.47/distribution/$KIRI_REG/alpine:3.21/json"
+t distribution-missing "404" "curl -s -o /dev/null -w '%{http_code}' --unix-socket /root/.kiri/run/docker.sock http://d/v1.47/distribution/$KIRI_REG/no-such-image-kiri-test/json"
 # A copy into a created container, then its start, mounts the same upper
 # dir twice in a row: kernels with overlayfs index on (Arch) refused the
 # second with EBUSY (#227). A renamed directory must survive a commit.
@@ -106,7 +115,7 @@ t ipv6-port "Welcome to nginx" "docker run -d --name web6 -p 18082:80 nginx:alpi
 t ipv6-cleanup "gone" "docker rm -f v6a web6 >/dev/null; docker network rm lh6 >/dev/null; for i in \$(seq 20); do nft list table ip6 kiri >/dev/null 2>&1 || { echo gone; break; }; sleep 0.1; done"
 t ipv6-forwarding-restored "0" "cat /proc/sys/net/ipv6/conf/all/forwarding"
 # A build's --add-host host-gateway is the bridge gateway, as for docker run (not the Mac VM's 198.19.248.254).
-t build-host-gateway "GW-OK" "gw=\$(docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}'); mkdir -p /bhg && printf 'FROM alpine:3.21\\nRUN grep -w hgw /etc/hosts\\n' > /bhg/Dockerfile && DOCKER_BUILDKIT=0 docker build --no-cache --add-host hgw:host-gateway /bhg 2>&1 | grep -q \"\$gw\" && echo GW-OK"
+t build-host-gateway "GW-OK" "gw=\$(docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}'); mkdir -p /bhg && printf 'FROM $KIRI_REG/alpine:3.21\\nRUN grep -w hgw /etc/hosts\\n' > /bhg/Dockerfile && DOCKER_BUILDKIT=0 docker build --no-cache --add-host hgw:host-gateway /bhg 2>&1 | grep -q \"\$gw\" && echo GW-OK"
 # A privileged container must not touch the host's /dev. The kernel has one
 # devtmpfs, so mount it, put ptmx back as the device it should be, run a
 # privileged container and look again: once, ptmx became a link into the

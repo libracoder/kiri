@@ -18,8 +18,9 @@
 #   GATE_SWITCHED=0   verify without an engine restart in between (a dry
 #                     run): skips the checks of what comes back by itself.
 #   GATE_BIG_MB=200   size of the large file in the data volume.
-#   GATE_MIRROR=...   where an image comes from when Docker Hub refuses the
-#                     pull (its hourly limit): default mirror.gcr.io/library.
+#   GATE_MIRROR=...   where an image comes from when KIRI_TEST_REGISTRY
+#                     (tests/lib/images.sh) fails: default mirror.gcr.io/library.
+#                     Never from Docker Hub, whose hourly limit runs out.
 #
 # Exits non-zero if any check fails.
 set -u
@@ -28,7 +29,10 @@ STATE=${GATE_STATE:-$HOME/.cache/kiri-upgrade-test}
 X=$STATE/expect
 BIG=${GATE_BIG_MB:-200}
 PORT=${GATE_PORT:-18431}
-MIRROR=${GATE_MIRROR:-mirror.gcr.io/library}
+# shellcheck disable=SC2034 # read by lib/images.sh
+KIRI_REG_FALLBACK=${GATE_MIRROR:-mirror.gcr.io/library}
+# shellcheck source=SCRIPTDIR/lib/images.sh
+. "$(dirname "$0")/lib/images.sh"
 PASS=0; FAIL=0; SKIP=0; FAILED=()
 
 ok() { PASS=$((PASS + 1)); }
@@ -47,13 +51,8 @@ has() {
   local got; got=$(limit "$@" 2>&1 | tr -d '\r')
   if [[ "$got" == *"$want"* ]]; then ok; else bad "$name" "want: $want" "got:  $(echo "$got" | head -6)"; fi
 }
-# An image that is here already, or from Docker Hub, or the same image from the mirror.
-get() {
-  $D image inspect "$1" >/dev/null 2>&1 && return 0
-  $D pull -q "$1" >/dev/null 2>&1 && return 0
-  $D pull -q "$MIRROR/$1" >/dev/null 2>&1 && $D tag "$MIRROR/$1" "$1" && $D rmi "$MIRROR/$1" >/dev/null 2>&1
-  $D image inspect "$1" >/dev/null 2>&1
-}
+# An image that is here already, or fetched without Docker Hub (tests/lib/images.sh).
+get() { kiri_seed_images "$1"; }
 # build TAG FOLDER: docker build, and the image must be there afterwards. A builder that runs in
 # a container keeps its result in the build cache unless it is asked to load it.
 build() {
@@ -88,12 +87,16 @@ populate() {
   engine > "$X/populated-by"
   echo "populating on: $(cat "$X/populated-by")"
   section "images"
-  for i in alpine:3.21 busybox:1.36 nginx:alpine redis:7-alpine postgres:17-alpine; do
-    get "$i" || bad "pull $i" "$($D pull "$i" 2>&1 | tail -2 | cut -c1-200)"
+  for i in $KIRI_IMAGES_UPGRADE; do
+    err=$(get "$i" 2>&1) || bad "pull $i" "$(echo "$err" | tail -2 | cut -c1-200)"
   done
+  # The builder's own image, for the build below (its absence is a note there, not a failure).
+  get moby/buildkit:buildx-stable-1 >/dev/null 2>&1
   $D tag alpine:3.21 upg/alias:a && $D tag alpine:3.21 upg/alias:b
   head -c 262144 /dev/urandom > "$STATE/build/payload.bin"
-  printf 'FROM alpine:3.21\nRUN adduser -D app && mkdir -p /srv/app\nWORKDIR /srv/app\nCOPY payload.bin .\nRUN echo layer-two > two.txt && ln two.txt two-hard.txt && ln -s two.txt two-sym.txt\nUSER app\nCMD ["sh", "-c", "id -un; pwd; sha256sum payload.bin two-hard.txt; readlink two-sym.txt"]\n' > "$STATE/build/Dockerfile"
+  # FROM a registry-qualified alpine: BuildKit asks the registry for a FROM
+  # image's metadata even when the engine has it, and plain alpine is Docker Hub.
+  printf 'FROM %s\nRUN adduser -D app && mkdir -p /srv/app\nWORKDIR /srv/app\nCOPY payload.bin .\nRUN echo layer-two > two.txt && ln two.txt two-hard.txt && ln -s two.txt two-sym.txt\nUSER app\nCMD ["sh", "-c", "id -un; pwd; sha256sum payload.bin two-hard.txt; readlink two-sym.txt"]\n' "$KIRI_REG/alpine:3.21" > "$STATE/build/Dockerfile"
   if build upg/built:1 "$STATE/build"; then
     $D run --rm --pull never upg/built:1 > "$X/built.out" 2>&1
   else

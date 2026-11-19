@@ -34,6 +34,16 @@ once; see the README.
 
 `tests/e2e.sh` only removes containers, networks and volumes it created.
 
+The test suites never pull from Docker Hub, which allows only 100 anonymous
+pulls an hour for a whole network. Each image they run comes from
+`KIRI_TEST_REGISTRY` (default `public.ecr.aws/docker/library`, the same
+official images; `mirror.gcr.io/library` is tried when it fails) and is tagged
+with its plain name, so a second run fetches nothing. The list and the
+fetching are in `tests/lib/images.sh`; `python3 tests/lib/check-images.py`
+fails when a script names an image the list lacks. `tests/e2e.sh` ends with
+`Docker Hub allowance used during the run (whole network): N`, which should
+be 0; other machines on the same network count against it too.
+
 ## Every feature ships on macOS, Windows and Linux together
 
 - A feature comes in one pull request, for all three systems, built and
