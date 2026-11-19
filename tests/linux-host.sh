@@ -81,7 +81,21 @@ t volume "kept" "docker run --rm -v lhv:/d alpine sh -c 'echo kept > /d/f' && do
 # `docker run -d` must not return before the container's root is in place, or
 # an immediate exec resolves users against the host's /etc/passwd (#311).
 t volume-user-ready "passed passed passed" "docker run --name ready-seed alpine sh -c 'adduser -D dev && mkdir /payload && dd if=/dev/zero of=/payload/blob bs=1M count=64' >/dev/null && docker commit -c 'USER dev' ready-seed kiri-test/ready:1 >/dev/null && docker rm -f ready-seed >/dev/null; for i in 1 2 3; do v=ready-vol-\$i; c=\$(docker run -d --mount type=volume,source=\$v,target=/payload kiri-test/ready:1 sleep 60); if docker exec --user dev \$c id >/dev/null 2>&1; then printf 'passed '; else printf 'failed '; fi; docker rm -f \$c >/dev/null; docker volume rm \$v >/dev/null 2>&1; done; docker rmi kiri-test/ready:1 >/dev/null; echo"
+# A start that fills a new volume from a big image folder still waits for the
+# fill (#311), but the engine keeps serving every other container meanwhile;
+# an exec sent to it meanwhile waits for it, a pause, a commit and a
+# container joining its network sent meanwhile all finish, and a start that
+# fails during the fill is still a start error with a whole volume
+# (tests/start-stall.sh).
+$D cp "$(dirname "$0")/start-stall.sh" "$N":/start-stall.sh >/dev/null
+# Here the engine's own root is the test's: a copy into the container while
+# it is still starting must not land in it.
+t start-stall-exec "pass:" "sh /start-stall.sh cp"
 t memory-limit "67108864" "docker run --rm --memory 64m alpine cat /sys/fs/cgroup/memory.max"
+# A working directory through one of the agent's descriptors is refused, and
+# before that nothing is made outside the container: the missing directory
+# was created as root while the container's cgroup directory was still open.
+t workdir-made-inside-root "outside 0" "find /sys/fs/cgroup /var/lib/kiri /run -name kiri-wd-probe -exec rmdir {} + 2>/dev/null; for n in \$(seq 3 25); do for p in kiri-wd-probe ../kiri-wd-probe; do docker run --rm -w /proc/self/fd/\$n/\$p alpine true >/dev/null 2>&1; done; done; echo outside \$(find /sys/fs/cgroup /var/lib/kiri /run -name kiri-wd-probe 2>/dev/null | wc -l)"
 t seccomp "Seccomp:	2" "docker run --rm alpine grep Seccomp: /proc/self/status"
 t udp "10.9.8.7" "docker run -d --name dns -p 15354:53/udp alpine sh -c 'apk add -q dnsmasq >/dev/null 2>&1; dnsmasq -k --address=/kiri.test/10.9.8.7' >/dev/null; for i in \$(seq 40); do out=\$(nslookup -port=15354 kiri.test 127.0.0.1 2>/dev/null) && break; sleep 0.5; done; echo \"\$out\" | grep -o 10.9.8.7"
 t ipv6-network "true" "docker network create --ipv6 --subnet fd00:4c:1::/64 lh6 >/dev/null && docker network inspect lh6 -f '{{.EnableIPv6}}'"

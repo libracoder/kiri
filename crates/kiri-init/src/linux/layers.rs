@@ -452,6 +452,37 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 
+    /// A hard link to `/bin/tool` links the layer's `bin/tool`, as with Docker
+    /// (issue 302). `..` is refused; `root` → `/` is followed inside the layer,
+    /// where `etc/hostname` doesn't exist; nothing is linked in either case.
+    #[test]
+    fn absolute_hard_link_is_read_from_the_layer_root() {
+        let layer = |to: &str| {
+            let mut b = tar::Builder::new(Vec::new());
+            b.append_data(&mut header(3, 0o755), "bin/tool", &b"hi\n"[..]).unwrap();
+            let mut h = header(0, 0o777);
+            h.set_entry_type(tar::EntryType::Symlink);
+            b.append_link(&mut h, "root", "/").unwrap();
+            let mut h = header(0, 0o755);
+            h.set_entry_type(tar::EntryType::Link);
+            b.append_link(&mut h, "bin/tool-1.0", to).unwrap();
+            b.into_inner().unwrap()
+        };
+        let dest = scratch("abs-link");
+        untar(Capped { inner: &layer("/bin/tool")[..], left: u64::MAX }, &dest).unwrap();
+        let (tool, link) = (fs::metadata(dest.join("bin/tool")).unwrap(), fs::metadata(dest.join("bin/tool-1.0")).unwrap());
+        assert_eq!(std::os::unix::fs::MetadataExt::ino(&link), std::os::unix::fs::MetadataExt::ino(&tool), "not a hard link");
+        let _ = fs::remove_dir_all(&dest);
+
+        for (to, why) in [("/../../etc/hostname", "escapes"), ("/root/etc/hostname", "No such file"), ("/bin/nope", "No such file")] {
+            let dest = scratch("abs-link-bad");
+            let err = untar(Capped { inner: &layer(to)[..], left: u64::MAX }, &dest).expect_err(to);
+            assert!(err.to_string().contains(why), "{to}: unexpected error: {err}");
+            assert!(!dest.join("bin/tool-1.0").exists(), "{to}: linked");
+            let _ = fs::remove_dir_all(&dest);
+        }
+    }
+
     /// An ordinary whiteout becomes overlayfs's 0:0 character device and
     /// leaves no `.wh.` file behind. mknod needs root, as in the guest.
     #[test]

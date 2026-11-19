@@ -82,7 +82,7 @@ t version-api "1.47" $D version --format '{{.Server.APIVersion}}'
 # Engine version (Kiri's own beside it), the image's CMD for "Cmd": [], the
 # connection kept after a copy, log follow, one timestamp a line.
 t version-kiri-component "Kiri=" $D version --format '{{range .Server.Components}}{{.Name}}={{.Version}} {{end}}'
-for c in version cmd keepalive follow follow-created timestamps exec; do
+for c in version cmd keepalive follow follow-created timestamps exec endpoints copy-after-start; do
   t "testcontainers-$c" "ok $c" python3 "$(dirname "$0")/testcontainers-api.py" "$SOCK" "$c"
 done
 # Ryuk mounts the engine's socket and talks to it from inside.
@@ -140,6 +140,13 @@ t workdir-created-nonroot-mode "755 root" $D run --rm -u 1000:1000 -w /made/x al
 # ... and with a read-only root, made before the root goes read-only, as in Docker.
 t workdir-created-readonly "/made/ro" $D run --rm --read-only -w /made/ro alpine pwd
 t workdir-created-readonly-nonroot "/made/ro/1000" $D run --rm --read-only -u 1000:1000 -w /made/ro/1000 alpine pwd
+# ... and inside the container, through the image's own links: alpine's
+# /var/run is a link to /run.
+t workdir-created-through-link "at /run/made" $D run --rm -w /var/run/made alpine sh -c 'echo "at $(pwd -P)"'
+# The agent's descriptors (the container's cgroup directory among them) must
+# not be a way out: a working directory of /proc/self/fd/N must never start
+# (CVE-2024-21626 in runc).
+t workdir-leaked-fd "started 0" bash -c "s=0; for n in \$(seq 3 25); do $D run --rm -w /proc/self/fd/\$n alpine true >/dev/null 2>&1 && s=\$((s+1)); done; echo started \$s"
 t user-numeric "uid=1000" $D run --rm -u 1000 alpine id
 t user-name "uid=70(postgres)" $D run --rm -u postgres postgres:17-alpine id
 t user-group "gid=0(root)" $D run --rm -u 1000:0 alpine id
@@ -147,6 +154,11 @@ t entrypoint "x" $D run --rm --entrypoint echo alpine x
 t entrypoint-image "nginx version" $D run --rm nginx:alpine nginx -v
 t hostname-is-id "" $D run --rm alpine hostname
 t hostname-file "" $D run --rm alpine cat /etc/hostname
+# Docker takes almost any --hostname (Compose files use underscores); only a
+# control character, which would add a line to /etc/hosts, is refused.
+t hostname-underscore "db_master" $D run --rm --hostname db_master alpine hostname
+t hostname-newline-refused "invalid hostname" $D run --rm --hostname $'db\n10.0.0.9 evil' alpine cat /etc/hosts
+t add-host-underscore "10.1.2.3" $D run --rm --add-host my_app.local:10.1.2.3 alpine getent hosts my_app.local
 t pid1 "1" $D run --rm alpine sh -c 'echo $$'
 t proc "PID" $D run --rm alpine ps
 t dev-null "ok" $D run --rm alpine sh -c 'echo x > /dev/null && echo ok'
@@ -211,6 +223,7 @@ code exec-exit 3 $D exec web sh -c 'exit 3'
 t exec-env "e-val" $D exec -e E=e-val web sh -c 'echo $E'
 t exec-user "nginx" $D exec -u nginx web id -un
 t exec-workdir "/etc" $D exec -w /etc web pwd
+t exec-workdir-leaked-fd "started 0" bash -c "s=0; for n in \$(seq 3 25); do $D exec -w /proc/self/fd/\$n web true >/dev/null 2>&1 && s=\$((s+1)); done; echo started \$s"
 t exec-stdin "into exec" bash -c "echo 'into exec' | $D exec -i web cat"
 t exec-tty "/dev/pts" bash -c "script -q /dev/null $D exec -it web tty < /dev/null"
 t exec-sees-pid1 "nginx" $D exec web sh -c 'cat /proc/1/comm'
@@ -522,6 +535,11 @@ t domain-ports-unchanged "$OLD_HTTP" bash -c "curl -s --unix-socket '$SOCK' http
 t domain-ports-move '"port":18780' curl -s --unix-socket "$SOCK" -X POST -d '{"http":18780,"https":18743}' http://d/kiri/domains
 t domain-ports-http "Welcome to nginx" bash -c "for i in \$(seq 20); do curl -s -m 2 http://dmv.kiri.localhost:18780 | grep -q nginx && break; sleep 0.5; done; curl -s -m 5 http://dmv.kiri.localhost:18780"
 t domain-ports-https "Welcome to nginx" curl -sk -m 5 https://dmv.kiri.localhost:18743
+# The "no such container" page lists the running containers only when asked
+# by one of this machine's own names: a page reached through DNS rebinding
+# asks with its own domain as the Host and could otherwise read the list.
+t domain-list-local "dmv.kiri.local" curl -s -m 5 -H 'Host: nope.kiri.localhost' http://127.0.0.1:18780
+t domain-list-foreign-host "listed 0" bash -c "curl -s -m 5 -H 'Host: rebind.example.com' http://127.0.0.1:18780 | grep -c dmv | sed 's/^/listed /'"
 # The old port is free afterwards: only the installed Kiri's (Kiri Dev's
 # old port 80 is the installed Kiri's own router).
 if [ -z "$FEATURE" ]; then
@@ -603,6 +621,13 @@ t redis-volume "PONG OK running" bash -c "$D run -d --name rv -v tredis:/data re
 # `docker run -d` must not return before the container's root is in place, or
 # an immediate exec resolves users against the host's /etc/passwd (#311).
 t volume-user-ready "passed passed passed" bash -c "$D run --name ready-seed alpine sh -c 'adduser -D dev && mkdir /payload && dd if=/dev/zero of=/payload/blob bs=1M count=64' >/dev/null && $D commit -c 'USER dev' ready-seed kiri-test/ready:1 >/dev/null && $D rm -f ready-seed >/dev/null; for i in 1 2 3; do v=ready-vol-\$i; c=\$($D run -d --mount type=volume,source=\$v,target=/payload kiri-test/ready:1 sleep 60); if $D exec --user dev \$c id >/dev/null 2>&1; then printf 'passed '; else printf 'failed '; fi; $D rm -f \$c >/dev/null; $D volume rm \$v >/dev/null 2>&1; done; $D rmi kiri-test/ready:1 >/dev/null; echo"
+# A start that fills a new volume from a big image folder still waits for the
+# fill (#311), but the engine keeps serving every other container meanwhile;
+# an exec sent to it meanwhile waits for it, a pause, a commit and a
+# container joining its network sent meanwhile all finish, and a start that
+# fails during the fill is still a start error with a whole volume
+# (tests/start-stall.sh).
+t start-stall-exec "pass:" sh "$(dirname "$0")/start-stall.sh"
 # A volume over part of a bind (`./:/app` and `/app/node_modules`) is filled
 # from the image, as Docker does, never from the host's folder under it.
 t vol-copyup-under-bind "index.html" bash -c "h=\$(mktemp -d); mkdir \$h/html; echo mac > \$h/html/from-host.txt; $D run --rm -v \$h:/usr/share/nginx -v /usr/share/nginx/html nginx:alpine sh -c 'cd /usr/share/nginx/html; [ -e from-host.txt ] && echo from the host || ls'; rm -rf \$h"
@@ -810,7 +835,13 @@ t load "Loaded image: kiri-test/alp:v1" $D load -i "$IMD/a.tar"
 t load-runs "3." $D run --rm kiri-test/alp:v1 cat /etc/alpine-release
 t load-stdin "Loaded image" bash -c "$D rmi kiri-test/alp:v1 >/dev/null; $D load < $IMD/a.tar"
 code load-garbage 1 bash -c "echo nope | $D load"
-$D rmi kiri-test/alp:v1 >/dev/null 2>&1; rm -rf "$IMD"
+# A hard link's target is read from the layer's root, so a leading / is the
+# layer's, as with Docker (issue 302); `..` still can't leave the layer.
+python3 "$(dirname "$0")/hardlink-image.py" "$IMD/hl.tar" kiri-test/hl:abs /bin/tool
+python3 "$(dirname "$0")/hardlink-image.py" "$IMD/hl-esc.tar" kiri-test/hl:esc /../../etc/hostname
+t load-hardlink-absolute "hello from tool" bash -c "$D load -q -i $IMD/hl.tar >/dev/null && id=\$($D create kiri-test/hl:abs) && $D cp \$id:/bin/tool-1.0 - | tar -xO; $D rm \$id >/dev/null"
+t load-hardlink-escape "escapes the layer" bash -c "$D load -q -i $IMD/hl-esc.tar >/dev/null && $D create kiri-test/hl:esc"
+$D rmi kiri-test/alp:v1 kiri-test/hl:abs kiri-test/hl:esc >/dev/null 2>&1; rm -rf "$IMD"
 
 section "docker build (BuildKit in the VM)"
 BD=$(mktemp -d)

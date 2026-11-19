@@ -126,10 +126,9 @@ cgroup. There's no runc, no shim and no dockerd. More detail is in
 
 ## Roadmap
 
-Next is a built-in builder. Kiri will serve Docker's own build endpoints, so
-buildx uses its docker driver against Kiri as it does against Docker
-Desktop. This brings `host-gateway` support to BuildKit builds, and images
-load straight into Kiri.
+Next are more ways to share (Tailscale and Cloudflare Tunnel, in 0.3.0) and
+Coolify support (0.4.0). See [ROADMAP.md](ROADMAP.md) for what's in each
+release.
 
 ## Contributing
 

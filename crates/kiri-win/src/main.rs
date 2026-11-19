@@ -13,6 +13,10 @@
 
 #[cfg(windows)]
 mod app;
+// The address the window's page is served at, from memory: plain code,
+// tested on any host.
+#[cfg(any(windows, test))]
+mod page;
 // The window's page, put together as on the Mac and Linux.
 #[cfg(windows)]
 #[path = "../../kiri/src/ui/assemble.rs"]
@@ -197,11 +201,13 @@ fn main() -> std::process::ExitCode {
     // The engine starts when the page says `ready`, and with the window
     // hidden (--background, as from the login shortcut) no page loads: after
     // kiri-win restarted, docker got no answer until Start was pressed.
-    // Start it now. ensure_daemon runs kiri-start only when the daemon does
-    // not answer, and kiri-start does nothing while one runs, so a daemon
-    // already up is left alone and never doubled.
+    // Bring it up now. ensure_daemon runs kiri-start only when the daemon
+    // does not answer, and kiri-start does nothing while one runs, so a
+    // daemon already up is left alone and never doubled. An engine the
+    // person stopped stays stopped: that waits for Start, as when the
+    // window opens.
     if background && !setup {
-        engine::send(engine::Cmd::Start);
+        engine::send(engine::Cmd::Launch);
     }
     let result = app::run(
         !background || setup,

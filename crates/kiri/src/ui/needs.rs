@@ -117,13 +117,13 @@ fn read_script(id: &str, path: &str, env: &[String], workdir: &str) -> Option<St
     None
 }
 
-enum Entry {
+pub(super) enum Entry {
     File(Vec<u8>),
     Link(String),
 }
 
 /// The first file or symlink in a tar stream, past pax and GNU long-name headers.
-fn first_entry(tar: &[u8]) -> Option<Entry> {
+pub(super) fn first_entry(tar: &[u8]) -> Option<Entry> {
     let mut at = 0;
     while at + 512 <= tar.len() {
         let h = &tar[at..at + 512];
@@ -144,7 +144,7 @@ fn first_entry(tar: &[u8]) -> Option<Entry> {
 
 /// For a URL path or query; `:` and `@` stay as they are, since Kiri's engine
 /// matches an image name without decoding them.
-fn esc(s: &str) -> String {
+pub(super) fn esc(s: &str) -> String {
     s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"/-._:@".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
 }
 

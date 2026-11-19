@@ -20,8 +20,10 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::runtime::Bool;
 use objc2::{AllocAnyThread, DefinedClass, Message, define_class, msg_send};
-use objc2_foundation::{NSArray, NSError, NSFileHandle, NSObject, NSObjectProtocol, NSString, NSURL};
+use objc2_foundation::{NSArray, NSDictionary, NSError, NSFileHandle, NSObject, NSObjectProtocol, NSString, NSURL};
 use objc2_virtualization::*;
+
+use crate::Share;
 
 #[derive(Debug)]
 pub struct Config {
@@ -36,8 +38,8 @@ pub struct Config {
     pub agent_port: u32,
     /// Raw disk image for the guest's data (layers and containers): `/dev/vda`.
     pub disk: Option<PathBuf>,
-    /// Share a host directory with the guest over virtiofs: (directory, tag).
-    pub share: Option<(PathBuf, String)>,
+    /// The host folders a bind mount may name, shared over virtiofs.
+    pub share: Option<Share>,
     /// Share Rosetta with the guest over virtiofs under this tag, so it can
     /// run x86-64 Linux binaries. Ignored if Rosetta is not installed.
     pub rosetta_tag: Option<String>,
@@ -514,11 +516,20 @@ fn build(cfg: Config, queue: &DispatchQueue, events: Sender<Event>) -> io::Resul
         }
 
         let mut shares = Vec::new();
-        if let Some((dir, tag)) = &cfg.share {
-            let dir_url = url(dir)?;
-            let shared = VZSharedDirectory::initWithURL_readOnly(VZSharedDirectory::alloc(), &dir_url, false);
-            let share = VZSingleDirectoryShare::initWithDirectory(VZSingleDirectoryShare::alloc(), &shared);
-            let fs = VZVirtioFileSystemDeviceConfiguration::initWithTag(VZVirtioFileSystemDeviceConfiguration::alloc(), &NSString::from_str(tag));
+        if let Some(s) = &cfg.share {
+            // Named directories under one tag: the guest gets /Users,
+            // /Volumes and /private, not the disk they sit on.
+            let mut names: Vec<Retained<NSString>> = Vec::with_capacity(s.dirs.len());
+            let mut dirs: Vec<Retained<VZSharedDirectory>> = Vec::with_capacity(s.dirs.len());
+            for d in &s.dirs {
+                let dir_url = url(&d.dir)?;
+                names.push(NSString::from_str(&d.name));
+                dirs.push(VZSharedDirectory::initWithURL_readOnly(VZSharedDirectory::alloc(), &dir_url, false));
+            }
+            let (keys, values): (Vec<&NSString>, Vec<&VZSharedDirectory>) = (names.iter().map(|n| &**n).collect(), dirs.iter().map(|d| &**d).collect());
+            let directories = NSDictionary::from_slices(&keys, &values);
+            let share = VZMultipleDirectoryShare::initWithDirectories(VZMultipleDirectoryShare::alloc(), &directories);
+            let fs = VZVirtioFileSystemDeviceConfiguration::initWithTag(VZVirtioFileSystemDeviceConfiguration::alloc(), &NSString::from_str(&s.tag));
             fs.setShare(Some(&share));
             shares.push(Retained::into_super(fs));
         }

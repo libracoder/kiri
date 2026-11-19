@@ -75,7 +75,12 @@ kiri_rm() {
   done
 }
 OURS_C="imp-digest imp-net-joiner imp-net-target imp-vol-user imp-vol-writer imp-vol-idle imp-vol-cutter imp-vol-kiri-user imp-vol-kiri-paused imp-vol-kiri-again imp-vol-kiri-stopped"
-OURS_V="imp-vol-data imp-vol-named imp-vol-keep imp-vol-busy imp-vol-huge imp-vol-cut imp-probe"
+# An image named like an official one, with a creation date ahead: its
+# sh, tar, rm and find leave a mark and refuse the work. Never to be run.
+LOOKALIKE=localhost/imp-x/library/busybox:9
+UNTAGGED_ID=
+LA_DIR=
+OURS_V="imp-vol-la imp-vol-la-new imp-vol-data imp-vol-named imp-vol-keep imp-vol-busy imp-vol-huge imp-vol-cut imp-probe"
 cleanup() {
   kiri_rm $OURS_C
   "${S[@]}" rm -fv $OURS_C >/dev/null 2>&1
@@ -85,6 +90,11 @@ cleanup() {
     docker --context "$ctx" volume rm -f $OURS_V ${ANON[@]+"${ANON[@]}"} >/dev/null 2>&1
   done
   [ -n "$PINNED_KIRI_OURS" ] && "${K[@]}" rmi "$PINNED" >/dev/null 2>&1
+  "${S[@]}" rm -fv imp-la-base >/dev/null 2>&1
+  for ctx in "$SRC" "$DOCKER_CONTEXT"; do docker --context "$ctx" rmi "$LOOKALIKE" >/dev/null 2>&1; done
+  [ -n "$UNTAGGED_ID" ] && "${K[@]}" rmi "$UNTAGGED_ID" >/dev/null 2>&1
+  [ -n "$LA_DIR" ] && rm -rf "$LA_DIR"
+  rm -f /tmp/imp-cut-seen.$$
   [ -n "$PINNED_OURS" ] && "${S[@]}" rmi "$PINNED" >/dev/null 2>&1
   for i in ${FETCHED_SRC[@]+"${FETCHED_SRC[@]}"}; do "${S[@]}" rmi "$i" >/dev/null 2>&1; done
   for i in ${FETCHED_KIRI[@]+"${FETCHED_KIRI[@]}"}; do "${K[@]}" rmi "$i" >/dev/null 2>&1; done
@@ -110,6 +120,12 @@ if ! "$KIRI" volume ls -q 2>/dev/null | grep -qx imp-probe; then
 fi
 "${K[@]}" volume rm imp-probe >/dev/null
 fetch "$SRC" "$TOOL" || { echo "import: could not get $TOOL on $SRC"; exit 1; }
+# Kiri's half of a volume copy runs only an image Kiri pulled from an
+# official repository: the mirror's alpine is one, kept while this runs.
+if ! "${K[@]}" image inspect mirror.gcr.io/library/alpine >/dev/null 2>&1; then
+  "${K[@]}" pull -q mirror.gcr.io/library/alpine >/dev/null || { echo "import: could not get alpine on Kiri"; exit 1; }
+  FETCHED_KIRI+=(mirror.gcr.io/library/alpine)
+fi
 fetch "$DOCKER_CONTEXT" alpine || { echo "import: could not get alpine on Kiri"; exit 1; }
 src_sh() { "${S[@]}" run --rm --network none --entrypoint sh "$@"; }
 # A volume's files as text: name, owner, mode, type, and for what is not a
@@ -117,6 +133,69 @@ src_sh() { "${S[@]}" run --rm --network none --entrypoint sh "$@"; }
 # target. (Directory link counts and symlink times differ between file
 # systems and tar programs, not between copies.)
 LIST='cd /d && find . | sort | while read -r f; do printf "%s" "$(stat -c "%n %u:%g %a %F" "$f")"; [ -d "$f" ] || printf " %s" "$(stat -c "%h %s" "$f")"; if [ -L "$f" ]; then printf " -> %s" "$(readlink "$f")"; elif [ -f "$f" ]; then printf " %s %s" "$(stat -c %Y "$f")" "$(md5sum < "$f" | cut -c1-32)"; fi; echo; done'
+
+section "import helper: an image only named like an official one is never run"
+# The look-alike, made from the source's test image: its files, then a layer
+# whose sh, tar, rm and find mark any folder they are given and fail.
+LA_DIR=$(mktemp -d /tmp/imp-la.XXXXXX)
+sha() { { sha256sum "$1" 2>/dev/null || shasum -a 256 "$1"; } | command cut -c1-64; }
+"${S[@]}" create --name imp-la-base "$TOOL" >/dev/null && "${S[@]}" export imp-la-base > "$LA_DIR/base.tar" && "${S[@]}" rm -v imp-la-base >/dev/null
+mkdir -p "$LA_DIR/top/bin" "$LA_DIR/top/usr/bin"
+printf '#!/bin/busybox sh\nfor d in /to /d /v/* /kiri-import*; do [ -d "$d" ] && /bin/busybox touch "$d/look-alike-ran" 2>/dev/null; done\necho "the look-alike ran" >&2\nexit 3\n' > "$LA_DIR/top/bin/sh"
+chmod 755 "$LA_DIR/top/bin/sh"
+for f in bin/tar bin/rm usr/bin/find; do cp "$LA_DIR/top/bin/sh" "$LA_DIR/top/$f"; done
+(cd "$LA_DIR/top" && COPYFILE_DISABLE=1 tar -cf ../top.tar bin usr)
+arch=$("${S[@]}" image inspect -f '{{.Architecture}}' "$TOOL")
+printf '{"architecture":"%s","os":"linux","created":"2099-01-01T00:00:00Z","config":{"Entrypoint":["/bin/sh"],"Env":["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"]},"rootfs":{"type":"layers","diff_ids":["sha256:%s","sha256:%s"]}}' \
+  "$arch" "$(sha "$LA_DIR/base.tar")" "$(sha "$LA_DIR/top.tar")" > "$LA_DIR/config.json"
+printf '[{"Config":"config.json","RepoTags":["%s"],"Layers":["base.tar","top.tar"]}]' "$LOOKALIKE" > "$LA_DIR/manifest.json"
+(cd "$LA_DIR" && COPYFILE_DISABLE=1 tar -cf look-alike.tar manifest.json config.json base.tar top.tar)
+"${K[@]}" load -i "$LA_DIR/look-alike.tar" >/dev/null && "${S[@]}" load -i "$LA_DIR/look-alike.tar" >/dev/null
+t la-in-kiri "2099" "${K[@]}" image inspect -f '{{.Created}}' "$LOOKALIKE"
+t la-on-source "2099" "${S[@]}" image inspect -f '{{.Created}}' "$LOOKALIKE"
+# An image with no name at all in Kiri (as a build without -t leaves one).
+sed 's/2099-01-01/2098-01-01/' "$LA_DIR/config.json" > "$LA_DIR/untagged.json"
+printf '[{"Config":"untagged.json","RepoTags":null,"Layers":["base.tar","top.tar"]}]' > "$LA_DIR/manifest.json"
+(cd "$LA_DIR" && COPYFILE_DISABLE=1 tar -cf untagged.tar manifest.json untagged.json base.tar top.tar)
+"${K[@]}" load -i "$LA_DIR/untagged.tar" >/dev/null && UNTAGGED_ID=sha256:$(sha "$LA_DIR/untagged.json")
+t la-untagged-in-kiri "2098" "${K[@]}" image inspect -f '{{.Created}}' "${UNTAGGED_ID:-none}"
+# The names in Kiri whose own record was pulled from an official repository.
+official_names() {
+  local n
+  for n in $("${K[@]}" image ls --format '{{.Repository}}:{{.Tag}}'); do
+    grep -qxE '((docker\.io/)?(library/)?|mirror\.gcr\.io/library/|public\.ecr\.aws/docker/library/)(alpine|busybox|debian|ubuntu)' <<<"${n%:*}" &&
+      "${K[@]}" image inspect -f '{{json .RepoDigests}}' "$n" 2>/dev/null | grep -qF "\"${n%:*}@sha256:" && echo "$n"
+  done
+}
+# helpers SINCE: the image each import helper Kiri made since then was given.
+helpers() { "${K[@]}" events --since "$1" --until "$(($(date +%s) + 1))" --filter event=create --filter label=dev.kiri.import-helper=1 --format '{{index .Actor.Attributes "image"}}' 2>&1; }
+# by_name SINCE: each helper since then was given an official image's name.
+by_name() {
+  local from names f
+  from=$(helpers "$1"); names=$(official_names)
+  [ -n "$from" ] || { echo "no helper was made"; return; }
+  for f in $from; do grep -qxF "$f" <<<"$names" || { echo "made from $f (official: $(echo $names))"; return; }; done
+  echo "all by the name of an official image"
+}
+"${S[@]}" volume create imp-vol-la >/dev/null
+src_sh -v imp-vol-la:/d "$TOOL" -c 'echo real > /d/f && mkdir /d/sub && echo deep > /d/sub/g && chown -R 1234:5678 /d/sub'
+# Shared by both engines, empty in Kiri: the list looks into it.
+"${K[@]}" volume create imp-vol-la >/dev/null
+since=$(date +%s); sleep 1
+t la-list-works "imp-vol-la" "$KIRI" import "$SRC" --list
+res=$(by_name "$since")
+t la-list-ran-no-look-alike "all by the name of an official image" echo "$res"
+since=$(date +%s); sleep 1
+t la-volume-imports "volume imp-vol-la: done" "$KIRI" import "$SRC" volume imp-vol-la
+t la-volume-exact "real deep 1234:5678" "${K[@]}" run --rm --network none -v imp-vol-la:/d:ro alpine sh -c 'echo "$(cat /d/f) $(cat /d/sub/g) $(stat -c %u:%g /d/sub/g)"'
+t la-volume-no-mark "no mark" "${K[@]}" run --rm --network none -v imp-vol-la:/d:ro alpine sh -c 'find /d -name look-alike-ran | grep -q . && echo marked || echo "no mark"'
+res=$(by_name "$since")
+t la-volume-ran-no-look-alike "all by the name of an official image" echo "$res"
+# Not in Kiri yet: the first helper to run is the one that writes it.
+"${S[@]}" volume create imp-vol-la-new >/dev/null
+src_sh -v imp-vol-la-new:/d "$TOOL" -c 'echo new > /d/f'
+t la-new-volume-imports "volume imp-vol-la-new: done" "$KIRI" import "$SRC" volume imp-vol-la-new
+t la-new-volume-no-mark "new no mark" "${K[@]}" run --rm --network none -v imp-vol-la-new:/d:ro alpine sh -c 'echo "$(cat /d/f 2>/dev/null) $(find /d -name look-alike-ran | grep -q . && echo marked || echo "no mark")"'
 
 section "#376 volumes need none of five particular images on the source"
 helpers=$(for i in alpine:latest busybox:latest alpine:3.22 debian:trixie ubuntu:24.04; do "${S[@]}" image inspect "$i" >/dev/null 2>&1 && echo "$i"; done | tr '\n' ' ')
@@ -144,6 +223,7 @@ ANON=($("${S[@]}" inspect imp-vol-user --format '{{range .Mounts}}{{if eq .Desti
 "${K[@]}" volume create imp-vol-named >/dev/null
 t vol-empty-offered-again "offered" bash -c '"$1" import "$2" --list | grep -q "imp-vol-named  (already in Kiri)" && echo "listed as already in Kiri" || echo offered' _ "$KIRI" "$SRC"
 t vol-user-imports "container imp-vol-user: done" "$KIRI" import "$SRC" container imp-vol-user
+note "$TOOL is $("${S[@]}" image inspect -f '{{.Id}}' "$TOOL" | cut -c1-19) on $SRC, $("${K[@]}" image inspect -f '{{.Id}}' "$TOOL" 2>/dev/null | cut -c1-19) in Kiri"
 t vol-named-has-data "named" "${K[@]}" run --rm --network none -v imp-vol-named:/n alpine cat /n/f
 t vol-anon-has-data "anon" "${K[@]}" run --rm --network none -v "${ANON[0]:-none}:/a" alpine cat /a/f
 t vol-anon-same-name "${ANON[0]:-none}" "${K[@]}" inspect imp-vol-user --format '{{range .Mounts}}{{.Name}} {{end}}'
@@ -176,6 +256,10 @@ else
     local pid=$! i
     for i in $(seq 300); do pgrep -f "kiri-import-imp-vol-cut:|imp-vol-cut:/from" >/dev/null && break; sleep 0.1; done
     sleep 1
+    # Kiri's helpers while the copy runs: what each was given and runs.
+    for c in $("${K[@]}" ps -q --filter label=dev.kiri.import-helper=1); do
+      "${K[@]}" inspect -f '{{.Config.Image}} {{.Image}} {{json .Config.Entrypoint}}' "$c"
+    done > /tmp/imp-cut-seen.$$ 2>&1
     pkill -f "kiri-import-imp-vol-cut:|imp-vol-cut:/from"
     wait $pid
     cat /tmp/imp-cut.$$; rm -f /tmp/imp-cut.$$
@@ -185,6 +269,8 @@ else
   "${S[@]}" create --name imp-vol-cutter --network none -v imp-vol-cut:/d "$TOOL" >/dev/null
   out=$(cut "$KIRI" import "$SRC" volume imp-vol-cut)
   t cut-said "unfinished in Kiri" echo "$out"
+  seen=$(cat /tmp/imp-cut-seen.$$ 2>/dev/null); rm -f /tmp/imp-cut-seen.$$
+  t cut-helper-by-name-with-entrypoint "by name, entrypoint sh" bash -c 'read -r given ran ep <<<"$1"; grep -qxF "$given" <<<"$2" && [ "$ep" = "[\"sh\"]" ] && echo "by name, entrypoint sh" || echo "seen: $1 (official: $2)"' _ "$seen" "$(official_names)"
   t cut-marked "kiri-import-unfinished" "${K[@]}" run --rm --network none -v imp-vol-cut:/d:ro alpine ls -A /d
   t cut-offered-again "offered" bash -c '"$1" import "$2" --list | grep -q "imp-vol-cut  (already in Kiri)" && echo "listed as already in Kiri" || echo offered' _ "$KIRI" "$SRC"
   # Used in Kiri since, by a container in any state: what it wrote there

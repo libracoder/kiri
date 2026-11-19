@@ -977,11 +977,9 @@ fn host_bound(stream: kiri_vmm::VsockStream) -> io::Result<()> {
     from_guest.read_exact(&mut header)?;
     let ip = std::net::Ipv4Addr::new(header[0], header[1], header[2], header[3]);
     let port = u16::from_be_bytes([header[4], header[5]]);
-    // The guest's relay only ever asks for the Mac's loopback; anything else
-    // is a guest process speaking the protocol itself, which gets nothing.
-    if ip != std::net::Ipv4Addr::LOCALHOST {
-        crate::diag::warn!("refused a host-bound connection; only 127.0.0.1 is relayed", to = format!("{ip}:{port}"));
-        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "not loopback"));
+    if !host_bound_allowed(ip, port, super::domains::routes) {
+        crate::diag::warn!("refused a host-bound connection; only 127.0.0.1 is relayed, and never to a container-domain router", to = format!("{ip}:{port}"));
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "not relayed"));
     }
     // Refused or unreachable: dropping closes the container's connection,
     // which is what it would see from a real host too.
@@ -1000,6 +998,13 @@ fn host_bound(stream: kiri_vmm::VsockStream) -> io::Result<()> {
     let _ = down.join();
     drop(stream);
     Ok(())
+}
+
+/// The guest's relay only ever asks for the Mac's loopback; anything else is
+/// a guest process speaking the protocol itself. A router's port is refused
+/// too: it serves this Mac, and would take a container to any container.
+fn host_bound_allowed(ip: std::net::Ipv4Addr, port: u16, router: impl Fn(u16) -> bool) -> bool {
+    ip == std::net::Ipv4Addr::LOCALHOST && !router(port)
 }
 
 /// vsock port the guest dials for SSH agent connections.
@@ -1107,9 +1112,22 @@ pub fn listening<S: AsRef<str>>(lines: &[S], host_network: bool) -> (Vec<u16>, V
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_PEER_SESSIONS, MAX_REMOTE_SESSIONS, MAX_TCP_SESSIONS, NAT_PORTS, REMOTE_SESSIONS, TCP_SESSIONS, kernel_forwards, kernel_host_ip, listening, nat_port, relays_too, tcp_permit};
+    use super::{MAX_PEER_SESSIONS, MAX_REMOTE_SESSIONS, MAX_TCP_SESSIONS, NAT_PORTS, REMOTE_SESSIONS, TCP_SESSIONS, host_bound_allowed, kernel_forwards, kernel_host_ip, listening, nat_port, relays_too, tcp_permit};
     use std::net::IpAddr;
     use std::sync::atomic::Ordering;
+
+    /// host.docker.internal reaches the Mac's loopback, but never the
+    /// container-domain router there: its Host header would take a container
+    /// to any other container, past the networks that keep them apart.
+    #[test]
+    fn containers_never_reach_the_domain_routers() {
+        let local = std::net::Ipv4Addr::LOCALHOST;
+        let router = |p: u16| p == 80 || p == 443;
+        assert!(!host_bound_allowed(local, 80, router));
+        assert!(!host_bound_allowed(local, 443, router));
+        assert!(host_bound_allowed(local, 5432, router), "other loopback services stay reachable");
+        assert!(!host_bound_allowed(std::net::Ipv4Addr::new(10, 0, 0, 1), 5432, router), "loopback only");
+    }
 
     /// A clash names the other program holding the port, never Kiri itself.
     #[test]

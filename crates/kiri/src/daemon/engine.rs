@@ -363,10 +363,72 @@ pub struct ExtraNetwork {
     pub mac_address: String,
 }
 
+/// Shut while a container's start is under way: from when it is marked
+/// Running until the guest has answered the start, which waits until the
+/// container's root is in place (a new volume filled). An exec or a copy
+/// sent meanwhile waits here, then reaches a container that can be
+/// entered, as it did when the guest answered nothing else meanwhile.
+///
+/// Every start has a gate of its own (`Container::begin_start` replaces the
+/// container's gate with a new one), so a gate is shut once in its life and
+/// opened once, by its start's guard. Whoever holds a gate waits for the
+/// one start that was under way when it took it, never for a later start
+/// of the same container: else two starts could wait for each other (A
+/// took B's gate; B starts again, and its new start takes A's).
+///
+/// Only those wait, and they hold no lock while they do. A start waits
+/// only for the gates that were already shut when it shut its own, each of
+/// a start that began earlier, which itself waits only for still earlier
+/// ones: no wait can be part of a cycle. The start holds its gate across
+/// the waits and `VmLink::run`, which waits for nothing but the guest.
+#[derive(Debug, Default)]
+struct StartGate {
+    shut: Mutex<bool>,
+    opened: Condvar,
+}
+
+impl StartGate {
+    fn shut(self: &Arc<Self>) -> StartGuard {
+        *self.shut.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        StartGuard(self.clone())
+    }
+
+    fn is_shut(&self) -> bool {
+        *self.shut.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn wait(&self) {
+        let mut shut = self.shut.lock().unwrap_or_else(|e| e.into_inner());
+        while *shut {
+            shut = self.opened.wait(shut).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+/// See `Engine::take_early`.
+#[derive(Debug, PartialEq, Eq)]
+enum Early {
+    Input(Vec<u8>),
+    Live { close: bool },
+    Gone,
+}
+
+/// Opens the gate again when dropped, whichever way the start ends.
+struct StartGuard(Arc<StartGate>);
+
+impl Drop for StartGuard {
+    fn drop(&mut self) {
+        *self.0.shut.lock().unwrap_or_else(|e| e.into_inner()) = false;
+        self.0.opened.notify_all();
+    }
+}
+
 #[derive(Debug)]
 pub struct Container {
     /// Serializes start with stop/kill/remove through guest creation.
     lifecycle: Arc<Mutex<u64>>,
+    /// See `StartGate`.
+    start_gate: Arc<StartGate>,
     pub id: String,
     pub name: String,
     pub spec: Spec,
@@ -414,12 +476,26 @@ pub struct Container {
     live: bool,
     early_input: Vec<u8>,
     early_close: bool,
+    /// This run's `start` event is still to be sent: by the start once it
+    /// makes the container live, or by its exit, if that came first (a
+    /// start that waited for a new volume to fill can be overtaken by its
+    /// exit), so `start` always comes before `die`.
+    start_owed: bool,
     /// `docker logs`: its output on disk, and who follows it.
     log: Arc<Mutex<super::logfile::Log>>,
     attached: Vec<Sender<(Stream, Vec<u8>)>>,
 }
 
 impl Container {
+    /// Begins a start: a new gate (see `StartGate`), shut. Under the engine
+    /// lock, with the container's lifecycle lock held, which serialises the
+    /// starts of one container: the old gate is open by then, its start's
+    /// guard having dropped before that start returned.
+    fn begin_start(&mut self) -> StartGuard {
+        self.start_gate = Arc::default();
+        self.start_gate.shut()
+    }
+
     pub fn argv(&self) -> Vec<String> {
         self.spec.entrypoint.iter().chain(&self.spec.cmd).cloned().collect()
     }
@@ -1438,6 +1514,12 @@ impl Engine {
         });
     }
 
+    /// Kiri is stopped, parking the VM or shutting down: every one of
+    /// them is set before the running containers are signalled.
+    fn halting(&self) -> bool {
+        self.is_stopped() || self.parking.load(std::sync::atomic::Ordering::SeqCst) || SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     pub fn is_stopped(&self) -> bool {
         self.stopped.load(std::sync::atomic::Ordering::SeqCst)
     }
@@ -1543,6 +1625,7 @@ impl Engine {
                 let was_running = s.status == Status::Running;
                 let mut c = Container {
                     lifecycle: Arc::new(Mutex::new(0)),
+                    start_gate: Arc::default(),
                     id: s.id.clone(),
                     name: s.name,
                     layers: s.layers,
@@ -1564,6 +1647,7 @@ impl Engine {
                 live: false,
                 early_input: Vec::new(),
                 early_close: false,
+                start_owed: false,
                 paused: false,
                 extra_ips: Vec::new(),
                 extra_ifs: Vec::new(),
@@ -1807,6 +1891,8 @@ impl Engine {
                 let mut persist = false;
                 let mut closed_ports = None;
                 let actor = st.containers.get(id).map(|c| (c.spec.image.clone(), container_attrs(c)));
+                // Exited before its start made it live: its `start` first.
+                let start_owed = st.containers.get_mut(id).is_some_and(|c| std::mem::take(&mut c.start_owed));
                 // Docker stops a container's healthcheck when it exits.
                 if let Some(h) = st.health.get_mut(id) {
                     close_monitor(h);
@@ -1869,6 +1955,9 @@ impl Engine {
                 }
                 drop(st);
                 if let Some((image, attrs)) = actor {
+                    if start_owed {
+                        self.emit_container_with("start", id, &image, attrs.clone(), &[]);
+                    }
                     self.emit_container_with("die", id, &image, attrs.clone(), &[("exitCode", code.to_string())]);
                     if remove {
                         self.emit_container_with("destroy", id, &image, attrs, &[]);
@@ -2219,6 +2308,7 @@ impl Engine {
             id.clone(),
             Container {
                 lifecycle: Arc::new(Mutex::new(0)),
+                start_gate: Arc::default(),
                 id: id.clone(),
                 name,
                 layers: image.layers.iter().rev().map(|l| l.digest.clone()).collect(),
@@ -2241,6 +2331,7 @@ impl Engine {
                 live: false,
                 early_input: Vec::new(),
                 early_close: false,
+                start_owed: false,
                 paused: false,
                 extra_ips: Vec::new(),
                 extra_ifs: Vec::new(),
@@ -2322,7 +2413,7 @@ impl Engine {
 
     /// The lifecycle lock is held by start_inner for this entire attempt.
     fn start_on_vm(&self, key: &str, reason: Start, vm: Arc<VmLink>) -> Result<(), Error> {
-        let (id, layers, argv, mut spec, size) = {
+        let (id, layers, argv, mut spec, size, gate) = {
             let mut st = self.lock();
             let id = resolve(&st, key)?;
             // Under the same lock as Lost: either this claim belongs to
@@ -2375,8 +2466,26 @@ impl Engine {
                 c.stopped_by_user = false;
                 c.restart_count = 0;
             }
-            (id, c.layers.clone(), argv, c.spec.clone(), c.size.or(c.spec.console_size))
+            // Shut under the same lock that marks it Running: an exec or
+            // copy that sees Running also finds the gate shut.
+            let gate = c.begin_start();
+            // This run's exit, once reported, counts one more.
+            let exits = c.exits;
+            c.start_owed = true;
+            let out = (id.clone(), c.layers.clone(), argv, c.spec.clone(), c.size.or(c.spec.console_size), (gate, exits));
+            // A volume is filled from the image by the first start that
+            // finds it empty, while that start is under way. Collected
+            // here, under the lock that shut the gate just above, and only
+            // of gates shut already by other containers: every wait below
+            // is for a start that began earlier than this one, and each of
+            // those gates belongs to that one start alone (see `StartGate`),
+            // so no two starts can wait for each other. (A container that
+            // shares nothing with an earlier start has no wait at all.)
+            let earlier = shared_volume_gates(&st, &id, &out.3);
+            let halted = self.halting();
+            (out.0, out.1, out.2, out.3, out.4, (out.5.0, out.5.1, earlier, halted))
         };
+        let (gate, exits, earlier, halted_at_claim) = gate;
         // A bind source that is a link is followed again at every start, as
         // Docker does: re-pointing it between runs (a `current` release
         // link) mounts the new target.
@@ -2530,18 +2639,44 @@ impl Engine {
                 return Err(e);
             }
         };
-        match vm.run(&id, &layers, &argv, &spec.env, &spec.cwd, &spec.user, &hostname, flags, net_args, &spec.mounts, &spec.limits.wire(), spec.caps, &host_opts, &seccomp) {
-            Ok(pid) => {
-                if let Some(c) = self.lock().containers.get_mut(&id).filter(|c| c.status == Status::Running) {
-                    c.pid = pid;
-                }
-            }
-            Err(e) => {
-                crate::diag::warn!("container did not start", id = &id[..12], image = spec.image, error = e);
-                self.fail_start(&id, &spec, &e);
-                return Err(Error::Io(e));
-            }
+        // Waits for the fill of a volume this container shares with a start
+        // still under way, as it did when the guest's one thread did the
+        // fill: else it would run on a half-filled volume. No lock is held.
+        // If that start failed, its gate is open too and this one finds the
+        // volume still empty and fills it; if that container was removed,
+        // its gate (an Arc kept here) was opened by its start's guard all
+        // the same.
+        for g in &earlier {
+            g.wait();
         }
+        // The guest knows nothing of this container while it waits, so a
+        // stop signal sent meanwhile (Kiri's Stop, the VM's sleep, the
+        // daemon's shutdown: each sets its flag before it signals) was
+        // dropped there. Looked at again under the lock Stop reads the
+        // containers with: running it now would leave it running after Stop.
+        // It ends as a start that failed, which Stop sees as no longer Running.
+        if !earlier.is_empty()
+            && let Some(e) = self.refuse_waited_start(&id, &spec, reason, halted_at_claim, || vm.is_disconnected())
+        {
+            return Err(e);
+        }
+        let started = vm.run(&id, &layers, &argv, &spec.env, &spec.cwd, &spec.user, &hostname, flags, net_args, &spec.mounts, &spec.limits.wire(), spec.caps, &host_opts, &seccomp);
+        if let Ok(pid) = started
+            && let Some(c) = self.lock().containers.get_mut(&id).filter(|c| c.status == Status::Running)
+        {
+            c.pid = pid;
+        }
+        // A failed start is cleaned up before the gate opens, as on every
+        // earlier failure above: an exec or a copy waiting on it then finds
+        // the container as the failure left it, not half-way there.
+        if let Err(e) = started {
+            crate::diag::warn!("container did not start", id = &id[..12], image = spec.image, error = e);
+            self.fail_start(&id, &spec, &e);
+            return Err(Error::Io(e));
+        }
+        // Before anything below, which may itself exec (a health probe),
+        // and after the pid is set.
+        drop(gate);
         if let (true, Some((rows, cols))) = (spec.tty, size) {
             let _ = vm.resize(&id, rows, cols);
         }
@@ -2566,7 +2701,11 @@ impl Engine {
                 }
                 Err(e) => {
                     crate::diag::warn!("ports not published; container stopped", id = &id[..12], error = e);
-                    // Docker refuses to run a container whose ports clash.
+                    // Docker refuses to run a container whose ports clash:
+                    // no `start` for it.
+                    if let Some(c) = self.lock().containers.get_mut(&id) {
+                        c.start_owed = false;
+                    }
                     let _ = vm.kill(&id, libc::SIGKILL as u32);
                     return Err(Error::Conflict(e.to_string()));
                 }
@@ -2581,16 +2720,13 @@ impl Engine {
         // arriving meanwhile (and its CloseStdin) queues behind it rather
         // than overtaking it.
         loop {
-            let (early, close) = {
-                let mut st = self.lock();
-                let Some(c) = st.containers.get_mut(&id) else { break };
-                let early = std::mem::take(&mut c.early_input);
-                if !early.is_empty() {
-                    (early, false)
-                } else {
-                    c.live = true;
-                    (early, std::mem::take(&mut c.early_close))
-                }
+            let (early, close) = match self.take_early(&id, exits) {
+                Early::Input(early) => (early, false),
+                Early::Live { close } => (Vec::new(), close),
+                // Exited already (its exit overtook the end of a start that
+                // waited for its root): not live, and no `start` after its
+                // `die`.
+                Early::Gone => return Ok(()),
             };
             if early.is_empty() {
                 if close {
@@ -2604,8 +2740,39 @@ impl Engine {
         if !spec.auto_remove {
             self.save();
         }
-        self.emit_container("start", &id, &[]);
         Ok(())
+    }
+
+    /// The next step in making a started container live (see
+    /// `start_on_vm`), under the lock: input that arrived early to deliver
+    /// first, or live now (and whether its stdin closed early), its `start`
+    /// sent, or nothing, when this run (`exits`: its count of exits when it
+    /// started) has already exited. Its exit is reported apart from the
+    /// start, and with a start that waits for a new volume to fill it can
+    /// come first: the container is then not made live again, which would
+    /// send the next run's early input straight to a guest that has no
+    /// process for it; what was early for this run goes with it, and its
+    /// exit sent the `start` before its `die`.
+    fn take_early(&self, id: &str, exits: u64) -> Early {
+        let mut st = self.lock();
+        let Some(c) = st.containers.get_mut(id) else { return Early::Gone };
+        if c.status != Status::Running || c.exits != exits {
+            c.early_input.clear();
+            c.early_close = false;
+            return Early::Gone;
+        }
+        let early = std::mem::take(&mut c.early_input);
+        if !early.is_empty() {
+            return Early::Input(early);
+        }
+        c.live = true;
+        if std::mem::take(&mut c.start_owed) {
+            // Under the lock, so its exit, reported under it too, sends its
+            // `die` only after this.
+            let (image, attrs) = (c.spec.image.clone(), container_attrs(c));
+            self.emit_container_with("start", id, &image, attrs, &[]);
+        }
+        Early::Live { close: std::mem::take(&mut c.early_close) }
     }
 
     /// Sends an event to every listener and keeps it for `--since`.
@@ -2756,6 +2923,35 @@ impl Engine {
         Ok(out)
     }
 
+    /// The look after a start's wait (see the call): `Some(error)` when the
+    /// start must end instead of running, already failed (`fail_start`).
+    /// `vm_gone` is read under the engine lock. A start by the restart
+    /// policy or recovery took `restart_pending` at its claim; refused
+    /// because Kiri began to stop, it puts it back under that same lock, so
+    /// Stop's hold keeps the container (Exited, pending) whether its loop
+    /// ran before or after this, and Start brings it back, as the same error
+    /// at the top of `start_on_vm` leaves it. Not when the VM is gone
+    /// (recovery and Lost own that) and not for `--rm` (`comes_back`).
+    fn refuse_waited_start(&self, id: &str, spec: &Spec, reason: Start, halted_at_claim: bool, vm_gone: impl FnOnce() -> bool) -> Option<Error> {
+        let (gone, refuse) = {
+            let mut st = self.lock();
+            let gone = vm_gone();
+            let refuse = refuse_after_wait(halted_at_claim, self.halting(), gone);
+            if refuse && !gone && reason != Start::User
+                && let Some(c) = st.containers.get_mut(id)
+            {
+                c.restart_pending = true;
+            }
+            (gone, refuse)
+        };
+        if !refuse {
+            return None;
+        }
+        let e = if gone { Error::Io(io::Error::other("the VM stopped")) } else { Error::Io(io::Error::new(io::ErrorKind::WouldBlock, STOPPED)) };
+        self.fail_start(id, spec, &e);
+        Some(e)
+    }
+
     /// Records a start that never reached the guest as an immediate exit,
     /// with the exit code Docker gives that failure (see `start_exit_code`).
     /// A start the VM's crash ended keeps the crash's exit (255).
@@ -2769,6 +2965,8 @@ impl Engine {
         // Lost may have run before this start finished allocating addresses.
         // Reclaim those even when preserving the crash's exit accounting.
         if let Some(c) = st.containers.get_mut(id) {
+            // A start that failed sends no `start`.
+            c.start_owed = false;
             if let Some(ip) = c.ip.take() {
                 self.release_ip(&c.spec.network_mode, ip);
             }
@@ -2921,9 +3119,31 @@ impl Engine {
         super::ports::open_relay(&vm, ip, port)
     }
 
+    /// Waits for a start of the container (see `StartGate`) and gives its
+    /// id, or the not-found error when it is gone by then: a `--rm`
+    /// container whose start failed, or that exited, while the call waited.
+    fn resolve_after_start(&self, key: &str) -> Result<String, Error> {
+        let id = self.resolve(key)?;
+        self.wait_for_start(&id);
+        resolve(&self.lock(), &id)
+    }
+
+    /// Waits for a start of this container still under way (see
+    /// `StartGate`). Holds no lock while it waits.
+    fn wait_for_start(&self, id: &str) {
+        let gate = self.lock().containers.get(id).map(|c| c.start_gate.clone());
+        if let Some(gate) = gate {
+            gate.wait();
+        }
+    }
+
     /// Opens a `docker cp` session with the guest for a container, running
     /// or not: the request frame is sent, the caller does the rest.
     pub fn copy(&self, key: &str, op: u8, path: &str, flags: u32) -> Result<kiri_vmm::VsockStream, Error> {
+        self.wait_for_start(&self.resolve(key)?);
+        // Looked up after the wait: a `--rm` start that failed meanwhile has
+        // removed the container, and a copy must not then write into a
+        // folder made again for a container that no longer exists.
         let (id, layers) = {
             let st = self.lock();
             let id = resolve(&st, key)?;
@@ -3149,7 +3369,9 @@ impl Engine {
 
     /// `docker network connect`.
     pub fn connect(&self, network: &str, key: &str, aliases: Vec<String>, ipv4_address: String, ipv6_address: String, mac_address: String) -> Result<(), Error> {
-        let id = self.resolve(key)?;
+        // After the start, as when the guest answered nothing else during
+        // it, so this and the start's own networks are numbered in turn.
+        let id = self.resolve_after_start(key)?;
         let net = self.lock_networks().find(network).cloned().ok_or_else(|| Error::NotFound(format!("network {network} not found")))?;
         if let Some(ip) = super::network::parse_ip(&ipv4_address) {
             net.check_static(ip).map_err(Error::BadRequest)?;
@@ -3159,7 +3381,7 @@ impl Engine {
         }
         let (n, running) = {
             let mut st = self.lock();
-            let c = st.containers.get_mut(&id).expect("resolved");
+            let c = st.containers.get_mut(&id).ok_or_else(|| gone(&id))?;
             if c.spec.network_mode == net.name || c.spec.extra_networks.iter().any(|x| x.name == net.name) {
                 return Err(Error::Conflict(format!("endpoint with name {} already exists in network {}", c.name, net.name)));
             }
@@ -3177,7 +3399,7 @@ impl Engine {
         };
         self.save();
         if running {
-            let extra = self.lock().containers.get(&id).and_then(|c| c.spec.extra_networks.last().cloned()).expect("just added");
+            let extra = self.lock().containers.get(&id).and_then(|c| c.spec.extra_networks.last().cloned()).ok_or_else(|| gone(&id))?;
             let vm = self.vm()?;
             if let Err(e) = self.attach_extra(&vm, &id, n, &extra) {
                 if let Some(c) = self.lock().containers.get_mut(&id) {
@@ -3192,11 +3414,12 @@ impl Engine {
 
     /// `docker network disconnect`.
     pub fn disconnect(&self, network: &str, key: &str) -> Result<(), Error> {
-        let id = self.resolve(key)?;
+        // As for connect.
+        let id = self.resolve_after_start(key)?;
         let net = self.lock_networks().find(network).cloned().ok_or_else(|| Error::NotFound(format!("network {network} not found")))?;
         let (n, ip) = {
             let mut st = self.lock();
-            let c = st.containers.get_mut(&id).expect("resolved");
+            let c = st.containers.get_mut(&id).ok_or_else(|| gone(&id))?;
             if c.spec.network_mode == net.name {
                 return Err(Error::BadRequest(format!("Kiri cannot disconnect a container from its first network ({})", net.name)));
             }
@@ -3229,10 +3452,15 @@ impl Engine {
 
     /// `docker pause` / `docker unpause`.
     pub fn pause(&self, key: &str, paused: bool) -> Result<(), Error> {
-        let id = self.resolve(key)?;
+        // A container still filling a new volume is not frozen: its start
+        // waits for the fill, which a frozen child never finishes, and a
+        // `docker commit` (which pauses first) would wait for that start
+        // forever, and stop, kill and rm behind it. So pause and unpause
+        // wait for the start, as exec and copy do.
+        let id = self.resolve_after_start(key)?;
         {
             let st = self.lock();
-            let c = st.containers.get(&id).expect("resolved");
+            let c = st.containers.get(&id).ok_or_else(|| gone(&id))?;
             if c.status != Status::Running {
                 return Err(Error::Conflict(format!("Container {} is not running", &id[..12])));
             }
@@ -3259,10 +3487,13 @@ impl Engine {
 
     /// `docker update`: new limits now, and at every later start.
     pub fn update(&self, key: &str, limits: Limits, restart: Option<RestartPolicy>) -> Result<(), Error> {
-        let id = self.resolve(key)?;
+        // New limits reach the container once its start is done, as when
+        // the guest answered nothing else during a start: a memory limit
+        // cut while a new volume fills could end the fill half way.
+        let id = self.resolve_after_start(key)?;
         let running = {
             let mut st = self.lock();
-            let c = st.containers.get_mut(&id).expect("resolved");
+            let c = st.containers.get_mut(&id).ok_or_else(|| gone(&id))?;
             c.spec.limits = limits;
             if let Some(r) = restart {
                 c.spec.restart = r;
@@ -3321,7 +3552,7 @@ impl Engine {
         let id = self.resolve(key)?;
         let (old_ports, old_fw, running, target) = {
             let mut st = self.lock();
-            let c = st.containers.get_mut(&id).expect("resolved");
+            let c = st.containers.get_mut(&id).ok_or_else(|| gone(&id))?;
             if c.spec.network_mode == "none" && !ports.is_empty() {
                 return Err(Error::BadRequest("a container with --network none cannot publish ports".into()));
             }
@@ -3365,7 +3596,7 @@ impl Engine {
         let id = self.resolve(key)?;
         let running = {
             let mut st = self.lock();
-            let c = st.containers.get_mut(&id).expect("resolved");
+            let c = st.containers.get_mut(&id).ok_or_else(|| gone(&id))?;
             c.spec.env = env;
             c.status == Status::Running
         };
@@ -3737,6 +3968,7 @@ impl Engine {
         }
         flags |= exec_security.0;
         let console = config.console_size;
+        self.wait_for_start(&container_id);
         let started = self.vm()?.exec(&container_id, exec_id, &config.argv, &env, &config.cwd, &config.user, flags, exec_security.1, &exec_security.2);
         if let Ok(pid) = started {
             if let Some(x) = self.lock().execs.get_mut(exec_id).filter(|x| x.exit_code.is_none()) {
@@ -3982,6 +4214,40 @@ fn note_removed(st: &mut State, id: &str, code: i32) {
 /// A BuildKit daemon that buildx runs for its docker-container driver.
 pub fn is_builder(c: &Container) -> bool {
     c.name.starts_with("buildx_buildkit_")
+}
+
+/// Every volume (named, anonymous or `--mount`) a spec uses.
+fn volume_names(spec: &Spec) -> Vec<&str> {
+    let mut v: Vec<&str> = spec.volumes.iter().chain(&spec.anon_volumes).map(String::as_str).collect();
+    v.extend(spec.mount_info.iter().filter(|m| m["Type"] == "volume").filter_map(|m| m["Name"].as_str()));
+    v
+}
+
+/// The start gates already shut of other containers that share a volume
+/// with `spec` (of container `id`). Bind and tmpfs mounts are not volumes.
+fn shared_volume_gates(st: &State, id: &str, spec: &Spec) -> Vec<Arc<StartGate>> {
+    let mine = volume_names(spec);
+    if mine.is_empty() {
+        return Vec::new();
+    }
+    st.containers
+        .values()
+        .filter(|c| c.id != id && c.start_gate.is_shut() && volume_names(&c.spec).iter().any(|v| mine.contains(v)))
+        .map(|c| c.start_gate.clone())
+        .collect()
+}
+
+/// Whether a start that waited for other starts must not run its container
+/// after all: Kiri began to stop meanwhile (not already when the start was
+/// claimed: Stop's signals reach the guest only for containers it knows,
+/// which this one was not), or the VM is gone.
+fn refuse_after_wait(halted_at_claim: bool, halting: bool, vm_gone: bool) -> bool {
+    (halting && !halted_at_claim) || vm_gone
+}
+
+/// The error for a container removed while a call waited for its start.
+fn gone(id: &str) -> Error {
+    Error::NotFound(format!("No such container: {id}"))
 }
 
 fn resolve(st: &State, key: &str) -> Result<String, Error> {
@@ -5225,5 +5491,418 @@ mod save_speed_tests {
         assert!(saves < unsynced * 8 + Duration::from_millis(500), "{saves:?} for saves against {unsynced:?} unsynced");
         drop(engine);
         let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+mod start_gate_tests {
+    use super::StartGate;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn an_exec_during_a_start_waits_for_it_and_no_longer() {
+        let gate = Arc::new(StartGate::default());
+        // Open: no wait at all.
+        let t = Instant::now();
+        gate.wait();
+        assert!(t.elapsed() < Duration::from_millis(50));
+        // Shut by a start: a waiter goes on only once the start is done,
+        // however it ended (the guard opens it when dropped).
+        let guard = gate.shut();
+        let waiter = {
+            let gate = gate.clone();
+            std::thread::spawn(move || {
+                let t = Instant::now();
+                gate.wait();
+                t.elapsed()
+            })
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!waiter.is_finished(), "an exec waits while the start is under way");
+        drop(guard);
+        let waited = waiter.join().unwrap();
+        assert!(waited >= Duration::from_millis(90) && waited < Duration::from_secs(5), "waited {waited:?}");
+        let t = Instant::now();
+        gate.wait();
+        assert!(t.elapsed() < Duration::from_millis(50), "open again");
+    }
+}
+
+#[cfg(test)]
+mod start_wait_tests {
+    use super::*;
+
+    /// An engine that never boots a VM, with one container that reads as
+    /// Running, as during its start.
+    fn engine(name: &str) -> (Arc<Engine>, String, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("kiri-start-wait-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let engine = Engine::boot(Store::open(&dir).unwrap()).unwrap();
+        engine.stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+        let image = Image {
+            name: "test:local".into(), digest: "sha256:test".into(), index_digest: None, config_digest: "sha256:test".into(),
+            layers: Vec::new(), size: 0, platform: "linux/arm64".into(), created: String::new(), pulled_at: 0, config: Default::default(),
+        };
+        let spec: Spec = serde_json::from_value(serde_json::json!({
+            "image": "test:local", "image_id": "sha256:test", "entrypoint": [], "cmd": ["sleep", "60"],
+            "env": [], "cwd": "/", "user": "", "auto_remove": false, "network_mode": "none", "labels": {},
+            "restart": {"name": "no", "max_retries": 0}
+        })).unwrap();
+        let id = engine.create(Some(name.into()), spec, &image).unwrap();
+        engine.lock().containers.get_mut(&id).unwrap().status = Status::Running;
+        (engine, id, dir)
+    }
+
+    fn shut(engine: &Engine, id: &str) -> StartGuard {
+        engine.lock().containers.get_mut(id).unwrap().begin_start()
+    }
+
+    /// `docker pause` (and the pause `docker commit` makes first) during a
+    /// start waits for it: a child frozen while it fills a new volume never
+    /// finishes, and the start, the commit and every stop behind them would
+    /// wait forever.
+    #[test]
+    fn a_pause_during_a_start_waits_for_it() {
+        let (engine, id, dir) = engine("pause");
+        for paused in [true, false] {
+            let guard = shut(&engine, &id);
+            let pausing = {
+                let (engine, id) = (engine.clone(), id.clone());
+                std::thread::spawn(move || engine.pause(&id, paused))
+            };
+            std::thread::sleep(Duration::from_millis(150));
+            assert!(!pausing.is_finished(), "pause({paused}) went ahead during a start");
+            drop(guard);
+            // No VM here: it fails then, but only once the start is done.
+            let _ = pausing.join().unwrap();
+        }
+        for (what, call) in [
+            ("update", Box::new(|e: &Engine, id: &str| e.update(id, Limits::default(), None).map(|_| ())) as Box<dyn Fn(&Engine, &str) -> Result<(), Error> + Send>),
+            ("connect", Box::new(|e: &Engine, id: &str| e.connect("bridge", id, Vec::new(), String::new(), String::new(), String::new()))),
+            ("disconnect", Box::new(|e: &Engine, id: &str| e.disconnect("bridge", id))),
+        ] {
+            let guard = shut(&engine, &id);
+            let calling = {
+                let (engine, id) = (engine.clone(), id.clone());
+                std::thread::spawn(move || call(&engine, &id))
+            };
+            std::thread::sleep(Duration::from_millis(150));
+            assert!(!calling.is_finished(), "{what} went ahead during a start");
+            drop(guard);
+            let _ = calling.join().unwrap();
+        }
+        drop(engine);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A copy sent while a start is under way looks the container up once
+    /// the start is done: a `--rm` one whose start failed meanwhile is gone,
+    /// and the copy must fail rather than write into a folder made again
+    /// for a container that no longer exists.
+    #[test]
+    fn a_copy_during_a_start_looks_again_once_it_is_done() {
+        let (engine, id, dir) = engine("copy");
+        let guard = shut(&engine, &id);
+        let copying = {
+            let (engine, id) = (engine.clone(), id.clone());
+            std::thread::spawn(move || engine.copy(&id, kiri_proto::copy_op::IN, "/", 0).map(|_| ()))
+        };
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(!copying.is_finished(), "a copy went ahead during a start");
+        // The start fails and takes the `--rm` container with it.
+        engine.lock().containers.remove(&id);
+        drop(guard);
+        let r = copying.join().unwrap();
+        assert!(matches!(r, Err(Error::NotFound(_))), "{r:?}");
+        drop(engine);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The exit of a container whose start waited for its root can be
+    /// reported before the start ends: it is then not made live (the next
+    /// run's early input would go straight to a guest with no process for
+    /// it), and its `start` still comes before its `die`, once.
+    #[test]
+    fn an_exit_that_overtakes_its_start() {
+        let (engine, id, dir) = engine("overtaken");
+        let (_, events) = engine.subscribe();
+        let actions = || events.try_iter().filter(|e| e["Actor"]["ID"] == id.as_str()).map(|e| e["Action"].as_str().unwrap_or("").to_owned()).collect::<Vec<_>>();
+        // In order: live, and its `start` sent.
+        engine.lock().containers.get_mut(&id).unwrap().start_owed = true;
+        assert_eq!(engine.take_early(&id, 0), Early::Live { close: false });
+        assert!(engine.lock().containers[&id].live);
+        assert_eq!(actions(), ["start"]);
+        // Its exit first, then the end of the start: no second `start`.
+        {
+            let mut st = engine.lock();
+            let c = st.containers.get_mut(&id).unwrap();
+            c.live = false;
+            c.start_owed = true;
+            c.early_input = b"early".to_vec();
+            c.early_close = true;
+        }
+        let exits = engine.lock().containers[&id].exits;
+        engine.on_event(Event::Exited { id: &id, code: 0, oom: false });
+        assert_eq!(engine.take_early(&id, exits), Early::Gone);
+        let st = engine.lock();
+        let c = &st.containers[&id];
+        assert!(!c.live, "an exited run is not made live again");
+        assert!(c.early_input.is_empty() && !c.early_close, "its early input went with it");
+        drop(st);
+        assert_eq!(actions(), ["start", "die"]);
+        drop(engine);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A container removed while a call waited for its start (a `--rm` one
+    /// whose start failed, or that exited before the start returned) is
+    /// not found by that call. It must not abort the daemon.
+    #[test]
+    fn a_container_removed_while_a_call_waited_for_its_start_is_not_found() {
+        for what in ["pause", "update", "connect", "disconnect"] {
+            let (engine, id, dir) = engine(&format!("removed-{what}"));
+            let guard = shut(&engine, &id);
+            let calling = {
+                let (engine, id) = (engine.clone(), id.clone());
+                std::thread::spawn(move || match what {
+                    "pause" => engine.pause(&id, true),
+                    "update" => engine.update(&id, Limits::default(), None),
+                    "connect" => engine.connect("bridge", &id, Vec::new(), String::new(), String::new(), String::new()),
+                    _ => engine.disconnect("bridge", &id),
+                })
+            };
+            std::thread::sleep(Duration::from_millis(150));
+            assert!(!calling.is_finished(), "{what} went ahead during a start");
+            engine.lock().containers.remove(&id);
+            drop(guard);
+            let r = calling.join().unwrap_or_else(|_| panic!("{what} panicked"));
+            assert!(matches!(r, Err(Error::NotFound(_))), "{what}: {r:?}");
+            drop(engine);
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// A second container made with a volume (named or anonymous) that a
+    /// start under way also uses waits for that start before it reaches the
+    /// guest; one sharing no volume, or only a bind or tmpfs mount, does not.
+    #[test]
+    fn a_start_sharing_a_volume_waits_for_the_earlier_one() {
+        let (engine, first, dir) = engine("shared-volume");
+        let spec = |v: serde_json::Value| -> Spec {
+            let mut s = engine.lock().containers[&first].spec.clone();
+            s.volumes = v["named"].as_array().into_iter().flatten().map(|x| x.as_str().unwrap().to_owned()).collect();
+            s.anon_volumes = v["anon"].as_array().into_iter().flatten().map(|x| x.as_str().unwrap().to_owned()).collect();
+            s.mount_info = v["info"].as_array().cloned().unwrap_or_default();
+            s
+        };
+        {
+            let mut st = engine.lock();
+            let c = st.containers.get_mut(&first).unwrap();
+            c.spec.volumes = vec!["data".into()];
+            c.spec.anon_volumes = vec!["anon1".into()];
+        }
+        let guard = shut(&engine, &first);
+        let gates = |spec: &Spec| shared_volume_gates(&engine.lock(), "other", spec);
+        // Named, anonymous and `--mount` volumes are all found.
+        for s in [spec(serde_json::json!({"anon": ["anon1"]})), spec(serde_json::json!({"info": [{"Type": "volume", "Name": "data"}]}))] {
+            assert_eq!(gates(&s).len(), 1);
+        }
+        let found = gates(&spec(serde_json::json!({"named": ["data"]})));
+        assert_eq!(found.len(), 1);
+        let waiting = {
+            let g = found[0].clone();
+            std::thread::spawn(move || g.wait())
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!waiting.is_finished(), "a start sharing a volume goes ahead during the fill");
+        drop(guard);
+        waiting.join().unwrap();
+        let guard = shut(&engine, &first);
+        // No volume shared: nothing to wait for.
+        assert!(gates(&spec(serde_json::json!({"named": ["other"]}))).is_empty());
+        assert!(gates(&spec(serde_json::json!({}))).is_empty());
+        // A bind or tmpfs mount is not a volume, even at the same place.
+        assert!(gates(&spec(serde_json::json!({"info": [{"Type": "bind", "Name": "data", "Source": "data"}, {"Type": "tmpfs", "Destination": "/data"}]}))).is_empty());
+        // The container itself is not collected, and an open gate is not.
+        let own = spec(serde_json::json!({"named": ["data"]}));
+        assert!(shared_volume_gates(&engine.lock(), &first, &own).is_empty());
+        drop(guard);
+        assert!(gates(&spec(serde_json::json!({"named": ["data"]}))).is_empty());
+        drop(engine);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// What `start_on_vm` does under the engine lock for container `id`:
+    /// begin its start, then collect the shut gates of others sharing a volume.
+    fn begin(engine: &Engine, id: &str) -> (StartGuard, Vec<Arc<StartGate>>) {
+        let mut st = engine.lock();
+        let guard = st.containers.get_mut(id).unwrap().begin_start();
+        let spec = st.containers[id].spec.clone();
+        let earlier = shared_volume_gates(&st, id, &spec);
+        (guard, earlier)
+    }
+
+    /// C fills v1 for a long time; B uses v2; A uses both.
+    fn three(name: &str) -> (Arc<Engine>, [String; 3], PathBuf) {
+        let (engine, c, dir) = engine(name);
+        let image = Image {
+            name: "test:local".into(), digest: "sha256:test".into(), index_digest: None, config_digest: "sha256:test".into(),
+            layers: Vec::new(), size: 0, platform: "linux/arm64".into(), created: String::new(), pulled_at: 0, config: Default::default(),
+        };
+        let base = engine.lock().containers[&c].spec.clone();
+        let with = |vols: &[&str]| {
+            let mut s = base.clone();
+            s.volumes = vols.iter().map(|v| (*v).to_owned()).collect();
+            s
+        };
+        engine.lock().containers.get_mut(&c).unwrap().spec = with(&["v1"]);
+        let b = engine.create(Some(format!("{name}-b")), with(&["v2"]), &image).unwrap();
+        let a = engine.create(Some(format!("{name}-a")), with(&["v1", "v2"]), &image).unwrap();
+        (engine, [c, b, a], dir)
+    }
+
+    /// A waits for C's fill and for B's first start; B's first start ends
+    /// and B starts again (restart policy, `docker restart`) while A still
+    /// waits: B's second start waits for A, which began before it. Each
+    /// start has a gate of its own, so A is not held by B's second start,
+    /// and both end once C's fill is done. Waits are bounded: a hang shows
+    /// as a failed assertion, not a stuck test.
+    #[test]
+    fn a_restarted_container_and_one_waiting_for_it_do_not_wait_for_each_other() {
+        let (engine, [c, b, a], dir) = three("restart-cycle");
+        let (guard_c, earlier_c) = begin(&engine, &c);
+        assert!(earlier_c.is_empty());
+        let (guard_b1, earlier_b1) = begin(&engine, &b);
+        assert!(earlier_b1.is_empty(), "B shares nothing with C");
+        let gate_c = engine.lock().containers[&c].start_gate.clone();
+        let (guard_a, mut earlier_a) = begin(&engine, &a);
+        assert_eq!(earlier_a.len(), 2, "A waits for C and for B");
+        // The map's order is arbitrary: C's first, as in the hang.
+        earlier_a.sort_by_key(|g| !Arc::ptr_eq(g, &gate_c));
+        let start_a = std::thread::spawn(move || {
+            for g in &earlier_a {
+                g.wait();
+            }
+            drop(guard_a);
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        drop(guard_b1);
+        let (guard_b2, earlier_b2) = begin(&engine, &b);
+        assert_eq!(earlier_b2.len(), 1, "B's second start waits for A, which began before it");
+        let start_b2 = std::thread::spawn(move || {
+            for g in &earlier_b2 {
+                g.wait();
+            }
+            drop(guard_b2);
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        drop(guard_c);
+        let t0 = std::time::Instant::now();
+        while !(start_a.is_finished() && start_b2.is_finished()) && t0.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let (a_done, b_done) = (start_a.is_finished(), start_b2.is_finished());
+        drop(engine);
+        let _ = std::fs::remove_dir_all(dir);
+        assert!(a_done && b_done, "after C's fill ended: A's start finished: {a_done}, B's second start finished: {b_done}");
+    }
+
+    /// A gate opened by an older start stays open when the container starts
+    /// again: waiters that took it are not held by the new start.
+    #[test]
+    fn a_new_start_does_not_shut_the_gate_an_older_start_opened() {
+        let (engine, id, dir) = engine("own-gate");
+        let guard = shut(&engine, &id);
+        let old = engine.lock().containers[&id].start_gate.clone();
+        drop(guard);
+        let guard = shut(&engine, &id);
+        assert!(!old.is_shut() && engine.lock().containers[&id].start_gate.is_shut());
+        drop(guard);
+        drop(engine);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A start that waited ends instead of running when Kiri began to stop
+    /// meanwhile or the VM went; not when it was stopping already at the
+    /// claim (its signals did not reach it, as before), and not when it had
+    /// nothing to wait for (the caller does not look).
+    #[test]
+    fn a_start_that_waited_does_not_run_after_a_stop() {
+        // (halted at claim, halting now, vm gone) -> refuse
+        assert!(refuse_after_wait(false, true, false), "Kiri began to stop while it waited");
+        assert!(refuse_after_wait(false, false, true), "the VM went");
+        assert!(refuse_after_wait(true, true, true));
+        assert!(!refuse_after_wait(false, false, false));
+        assert!(!refuse_after_wait(true, true, false), "stopping before the claim: as it was");
+        assert!(!refuse_after_wait(true, false, false));
+        // The flags it reads.
+        let (engine, _id, dir) = engine("halting");
+        engine.stopped.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(!engine.halting());
+        engine.parking.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(engine.halting());
+        engine.parking.store(false, std::sync::atomic::Ordering::SeqCst);
+        engine.stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(engine.halting());
+        drop(engine);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A start by the restart policy that waited and is refused because Kiri
+    /// began to stop stays pending, so Stop's hold keeps it and Start
+    /// brings it back; a user start is not made pending; nothing is refused
+    /// when Kiri was stopping at the claim, or is not stopping.
+    #[test]
+    fn a_refused_policy_start_stays_pending_for_stop_to_hold() {
+        let (engine, id, dir) = engine("refused");
+        let spec = {
+            let mut st = engine.lock();
+            let c = st.containers.get_mut(&id).unwrap();
+            c.spec.restart.name = "always".into();
+            c.spec.clone()
+        };
+        // As after the claim: Running, pending taken, gate shut.
+        let claimed = |engine: &Engine, pending: bool| {
+            let mut st = engine.lock();
+            let c = st.containers.get_mut(&id).unwrap();
+            c.status = Status::Running;
+            c.restart_pending = pending;
+        };
+        let holds = |engine: &Engine| {
+            let st = engine.lock();
+            let c = &st.containers[&id];
+            (c.status == Status::Running || c.restart_pending) && comes_back(c)
+        };
+        // (1) Kiri began to stop during the wait (the engine's stopped flag is set).
+        for reason in [Start::Restart, Start::DaemonRestart, Start::Held] {
+            claimed(&engine, false);
+            let guard = shut(&engine, &id);
+            let e = engine.refuse_waited_start(&id, &spec, reason, false, || false);
+            drop(guard);
+            assert!(matches!(&e, Some(Error::Io(e)) if e.kind() == io::ErrorKind::WouldBlock), "refused");
+            let st = engine.lock();
+            let c = &st.containers[&id];
+            assert!(c.status != Status::Running && c.restart_pending, "still pending, not running");
+            drop(st);
+            assert!(holds(&engine), "Stop holds it");
+        }
+        // (2) A user start is not made pending.
+        claimed(&engine, false);
+        assert!(engine.refuse_waited_start(&id, &spec, Start::User, false, || false).is_some());
+        assert!(!engine.lock().containers[&id].restart_pending);
+        // The VM gone: not put back (recovery's own path).
+        claimed(&engine, false);
+        assert!(engine.refuse_waited_start(&id, &spec, Start::Restart, false, || true).is_some());
+        assert!(!engine.lock().containers[&id].restart_pending);
+        // (3) Stopping at the claim: as it was. Not stopping: not refused.
+        claimed(&engine, false);
+        assert!(engine.refuse_waited_start(&id, &spec, Start::Restart, true, || false).is_none());
+        assert!(engine.lock().containers[&id].status == Status::Running);
+        engine.stopped.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(engine.refuse_waited_start(&id, &spec, Start::Restart, false, || false).is_none());
+        assert!(engine.lock().containers[&id].status == Status::Running);
+        drop(engine);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

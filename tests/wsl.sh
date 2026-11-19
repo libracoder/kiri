@@ -63,6 +63,14 @@ t volume "kept" "docker run --rm -v wv:/d alpine sh -c 'echo kept > /d/f' && doc
 # `docker run -d` must not return before the container's root is in place, or
 # an immediate exec resolves users against the host's /etc/passwd (#311).
 t volume-user-ready "passed passed passed" "docker run --name ready-seed alpine sh -c 'adduser -D dev && mkdir /payload && dd if=/dev/zero of=/payload/blob bs=1M count=64' >/dev/null && docker commit -c 'USER dev' ready-seed kiri-test/ready:1 >/dev/null && docker rm -f ready-seed >/dev/null; for i in 1 2 3; do v=ready-vol-\$i; c=\$(docker run -d --mount type=volume,source=\$v,target=/payload kiri-test/ready:1 sleep 60); if docker exec --user dev \$c id >/dev/null 2>&1; then printf 'passed '; else printf 'failed '; fi; docker rm -f \$c >/dev/null; docker volume rm \$v >/dev/null 2>&1; done; docker rmi kiri-test/ready:1 >/dev/null; echo"
+# A start that fills a new volume from a big image folder still waits for the
+# fill (#311), but the engine keeps serving every other container meanwhile;
+# an exec sent to it meanwhile waits for it, a pause, a commit and a
+# container joining its network sent meanwhile all finish, and a start that
+# fails during the fill is still a start error with a whole volume
+# (tests/start-stall.sh).
+$D cp "$(dirname "$0")/start-stall.sh" kiri-wsl-cli:/start-stall.sh >/dev/null
+t start-stall-exec "pass:" "sh /start-stall.sh"
 t seccomp "Seccomp:	2" "docker run --rm alpine grep Seccomp: /proc/self/status"
 t cleanup "web" "docker rm -f web db"
 # The agent (kiri-init under the daemon) dies with nobody asking (#50):

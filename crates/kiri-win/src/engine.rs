@@ -25,6 +25,12 @@ pub(crate) mod sharing;
 // What an image won't start without, the Mac's own file: it needs only crate::client.
 #[path = "../../kiri/src/ui/needs.rs"]
 mod needs;
+// Compose in the window and what each service is made of, the Mac's own files:
+// they need only crate::client, brands and needs, and a docker CLI (compose_cli).
+#[path = "../../kiri/src/ui/compose.rs"]
+mod compose;
+#[path = "../../kiri/src/ui/composetech.rs"]
+mod composetech;
 // What the window costs, the Mac's own file.
 #[path = "../../kiri/src/ui/usage.rs"]
 mod usage;
@@ -46,6 +52,9 @@ static LISTED: std::sync::LazyLock<std::sync::Mutex<std::time::Instant>> = std::
 #[derive(Debug, Clone)]
 pub(crate) enum Cmd {
     Start,
+    /// Kiri came up: the window opened, or the hidden launch at login.
+    /// Start, except that an engine the person stopped stays stopped.
+    Launch,
     Stop,
     Refresh,
     Pull(String),
@@ -147,16 +156,8 @@ fn engine(rx: &Receiver<Cmd>, tx: Sender<Cmd>) {
             None => rx.recv_timeout(TICK),
         };
         match cmd {
-            Ok(Cmd::Start) => {
-                emit(state("booting", None));
-                match ensure_daemon().and_then(|()| wake()) {
-                    Ok(()) => {
-                        std::thread::spawn(ensure_builder);
-                        refresh();
-                    }
-                    Err(e) => emit(state("stopped", Some(&e.to_string()))),
-                }
-            }
+            Ok(Cmd::Start) => bring_up(false),
+            Ok(Cmd::Launch) => bring_up(true),
             // Stop means off: every container stopped, the engine off until
             // Start (nothing wakes it meanwhile), and this window's shares closed.
             Ok(Cmd::Stop) => {
@@ -261,6 +262,43 @@ fn act(result: io::Result<()>) {
 
 pub(crate) fn path_escape(s: &str) -> String {
     s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-._~:/@".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
+}
+
+/// Start, or a launch: the daemon is made to answer (so `docker` gets an
+/// answer after a restart of Windows) and the engine is woken. A launch
+/// leaves an engine the person stopped as it is: only Start ends a Stop.
+/// Before, the hidden launch at login, and the window opening before the
+/// daemon was up, sent Start and so undid it (#394).
+fn bring_up(launch: bool) {
+    // Up and stopped already: nothing to bring up, and no "booting" shown.
+    if launch && client::alive_quick() && stopped() {
+        return refresh();
+    }
+    emit(state("booting", None));
+    // Asked again once the daemon answers: one that has only just started
+    // has read the saved Stop by then.
+    let woken = ensure_daemon().and_then(|()| if wakes(launch, stopped()) { wake().map(|()| true) } else { Ok(false) });
+    match woken {
+        Ok(woken) => {
+            if woken {
+                std::thread::spawn(ensure_builder);
+            }
+            refresh();
+        }
+        Err(e) => emit(state("stopped", Some(&e.to_string()))),
+    }
+}
+
+/// Whether bringing Kiri up wakes the engine: Start always does, a launch
+/// only when the person had not stopped it.
+fn wakes(launch: bool, stopped: bool) -> bool {
+    !(launch && stopped)
+}
+
+/// Whether Kiri was stopped (Stop in the window or the tray): then it stays
+/// off until Start.
+fn stopped() -> bool {
+    client::get("/info").is_ok_and(|i| i["KiriStopped"] == true)
 }
 
 /// The daemon's wake; a Linux host has no VM to wake, which is fine.
@@ -703,6 +741,20 @@ fn status_event() -> String {
     json!({"type": "status", "version": env!("CARGO_PKG_VERSION"), "share": true, "app": "Kiri", "ours": "kiri", "context": context.unwrap_or_else(|| "default".into())}).to_string()
 }
 
+/// The docker CLI on Kiri's context, without a console window, for Compose
+/// in the window.
+fn compose_cli() -> io::Result<std::process::Command> {
+    let mut cmd = crate::win::tool(&crate::detail::docker_cli());
+    std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x0800_0000);
+    cmd.args(["--context", crate::flavor::CONTEXT.get()]).env_remove("DOCKER_HOST").env_remove("DOCKER_CONTEXT");
+    Ok(cmd)
+}
+
+/// The compose files opened in the window: %LOCALAPPDATA%\Kiri\compose.json.
+fn compose_store() -> Option<std::path::PathBuf> {
+    prefs_path().map(|p| p.with_file_name("compose.json"))
+}
+
 /// Runs the docker CLI without a console window: its output, or why it failed.
 fn docker(args: &[&str]) -> io::Result<String> {
     let mut cmd = crate::win::tool(&crate::detail::docker_cli());
@@ -879,8 +931,18 @@ fn allowed_url(url: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{allowed_url, unanswered};
+    use super::{allowed_url, unanswered, wakes};
     use std::io::ErrorKind;
+
+    /// Only Start ends a Stop: Kiri coming up (the window, or hidden at
+    /// login) starts the engine unless the person stopped it.
+    #[test]
+    fn a_launch_does_not_undo_a_stop() {
+        assert!(wakes(false, true), "Start wakes a stopped engine");
+        assert!(wakes(false, false));
+        assert!(wakes(true, false), "a launch starts an engine that was not stopped");
+        assert!(!wakes(true, true), "a launch leaves a stopped engine stopped");
+    }
 
     /// Only a refused or absent engine shows as stopped; a slow answer
     /// keeps what the window shows, or shows booting at first.
@@ -946,11 +1008,7 @@ pub fn on_message(msg: &str) {
             });
             send(Cmd::Refresh);
             // Opening the window starts Kiri, unless it was stopped: that waits for Start.
-            std::thread::spawn(|| {
-                if !client::get("/info").is_ok_and(|i| i["KiriStopped"] == true) {
-                    send(Cmd::Start);
-                }
-            });
+            send(Cmd::Launch);
             // Anything newer than this build, and a staged update not yet in.
             crate::update::check_now(false);
             // For checking the page by hand in a debug build.
@@ -1077,6 +1135,11 @@ pub fn on_message(msg: &str) {
         // Registries signed in to, signing in (checked by the engine first) and out.
         "logins" | "login" | "logout" => logins::handle(&c.cmd, c.name, &c.value, emit, || Ok(())),
         "weblogin" | "webloginopen" | "webloginmfa" | "webloginsso" | "weblogincancel" | "awsprofiles" => weblogin::handle(&c.cmd, c.name, &c.value, emit, || Ok(()), crate::term::captured),
+        // Compose: projects, a project's file, what Apply would do, Apply, logs.
+        "composeprojects" | "composefile" | "composeplan" | "composeapply" | "composelogs" | "composeforget" | "composecancel" | "composerestore" | "composeaction" => compose::handle(&c.cmd, c.name, &c.value, compose_cli, compose_store, emit),
+        // Open a compose file…: Windows' own dialog, on the window's thread;
+        // the path it gives stays here, the page gets the project.
+        "composeopen" => crate::app::pick_file(&tr("Open a compose file"), &[(tr("Compose files"), compose::FILE_NAMES.join(";")), (tr("YAML files"), "*.yaml;*.yml".to_owned())], |path| compose::picked(path, compose_cli, compose_store, emit)),
         // Before Run: what the image's start script won't start without.
         "needs" => {
             let image = c.name;

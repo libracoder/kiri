@@ -14,6 +14,19 @@ cargo xtask guest     # guest/out/initramfs.cpio
 cargo xtask host      # target/release/kiri, signed with the virtualization entitlement
 ```
 
+`cargo xtask app-dev <feature>` makes `target/dev/Kiri <Feature>.app`, a second
+Kiri with its own engine, for trying a change. It builds the host with
+`[profile.fast]`: optimized, but on every core and incremental, so the first
+build takes about half a minute and a rebuild after an edit a few seconds.
+The binary is bigger and a little slower than a release one; `app`, `release`
+and speed checks keep `[profile.release]`. The docker CLI, Compose and buildx
+downloads are cached once for every checkout, in `~/Library/Caches/kiri-build/cli`
+(`KIRI_CLI_CACHE` to move it), and checked against their pinned SHA-256 each time.
+
+`cargo xtask linux` builds the static Linux engine (`kiri`, `kiri-init`) in a
+Rust container into `target/linux/release`; `cargo xtask linux-dev` builds the
+same with `[profile.fast]` into `target/linux/fast`, for testing a change.
+
 For Intel Macs add `--arch x86_64` to `kernel`, `guest`, `host`, `app`,
 `dmg` and `release`: an x86-64 guest in `guest/out/x86_64` (a `bzImage`,
 cross-compiled on Apple Silicon), the host for `x86_64-apple-darwin`
@@ -26,7 +39,8 @@ no Rosetta for Linux: amd64 images run natively, and images with no amd64
 build are refused.
 
 On Windows, `cargo xtask windows-dev` builds the Linux engine, Kiri Linux and
-Docker tools into `target/kiri-windows-x86_64` with a debug `kiri-win.exe`.
+Docker tools into `target/kiri-windows-x86_64` with a debug `kiri-win.exe`,
+and the engine with `[profile.fast]`.
 `cargo run -p kiri-win` uses that bundle automatically. Use `cargo xtask
 windows` for the release bundle and `cargo xtask msi` for the installer.
 Add `--arch arm64` to any of the three for Windows on Arm

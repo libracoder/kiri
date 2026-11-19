@@ -122,9 +122,12 @@ pub fn inventory(source: &str) -> io::Result<Value> {
     // half-way in, is offered again. Without an image to look with, none is
     // taken as there.
     let both: Vec<String> = names.iter().filter(|n| kiri_volumes.contains(n)).cloned().collect();
-    let states = match tar_image(&kiri_images) {
-        Some(img) if !both.is_empty() => kiri_states(&both, img).unwrap_or_default(),
-        _ => Vec::new(),
+    let states = match both.is_empty() {
+        true => Vec::new(),
+        false => match helper_in_kiri() {
+            Ok(Some(img)) => kiri_states(&both, &img).unwrap_or_default(),
+            _ => Vec::new(),
+        },
     };
     let volumes: Vec<Value> = names
         .into_iter()
@@ -356,40 +359,73 @@ fn retar(mut from: impl Read, mut to: impl Write, name: Option<&str>) -> io::Res
     }
 }
 
-/// Official images with `tar` and `sh`: any tag of one does Kiri's half of
-/// a volume copy.
+/// Official images with `tar` and `sh`: one of these does Kiri's half of a
+/// volume copy.
 const TAR_IMAGES: [&str; 4] = ["alpine", "busybox", "debian", "ubuntu"];
 
-/// The first of `names` (`repo:tag`) that is one of [`TAR_IMAGES`]: any tag,
-/// `alpine:3.19` as well as `alpine`, and from a mirror's `library/` too.
-fn tar_image(names: &[String]) -> Option<&String> {
-    names.iter().find(|n| {
-        let Some((repo, tag)) = n.rsplit_once(':').filter(|(_, t)| !t.contains('/')) else { return false };
-        let base = match repo.rsplit_once("library/") {
-            Some((before, base)) if before.is_empty() || before.ends_with('/') => base,
-            _ => repo,
-        };
-        tag != "<none>" && TAR_IMAGES.contains(&base)
+/// Whether a `RepoDigests` entry shows the engine pulled the image from an
+/// official repository of [`TAR_IMAGES`]: Docker Hub's, or one of its two
+/// public mirrors, by digest. A name or a tag says nothing (anyone can give
+/// an image one), and neither does any other registry or path.
+fn official(repo_digest: &str) -> bool {
+    let Some((repo, digest)) = repo_digest.split_once('@') else { return false };
+    let hex = digest.strip_prefix("sha256:").unwrap_or_default();
+    if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+        return false;
+    }
+    let homes = ["", "library/", "docker.io/library/", "mirror.gcr.io/library/", "public.ecr.aws/docker/library/"];
+    homes.iter().any(|home| repo.strip_prefix(home).is_some_and(|base| TAR_IMAGES.contains(&base)))
+}
+
+/// The name to run Kiri's half of a volume copy by: a `repo:tag` of the
+/// first of `images` (Kiri's image list: `RepoTags`, `RepoDigests`) whose
+/// own record shows it was pulled under that name from an official
+/// repository ([`official`]). Run by that name, it is that record.
+fn pick_helper(images: &[Value]) -> Option<String> {
+    let strings = |v: &Value| v.as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect::<Vec<_>>();
+    images.iter().find_map(|i| {
+        let digests = strings(&i["RepoDigests"]);
+        strings(&i["RepoTags"]).into_iter().find(|name| {
+            let Some((repo, _)) = name.rsplit_once(':').filter(|(_, tag)| !tag.is_empty() && !tag.contains('/')) else { return false };
+            digests.iter().any(|d| official(d) && d.split_once('@').is_some_and(|(r, _)| r == repo))
+        })
     })
 }
 
-/// Kiri's half of a volume copy, an image with `tar` in Kiri: one Kiri has,
-/// else one the source has (brought over), else busybox fetched by Kiri.
-/// Nothing is pulled on the source.
-fn helper_image(ctx: &str) -> io::Result<String> {
+/// [`pick_helper`] of the images Kiri has, read once from its API.
+fn helper_in_kiri() -> io::Result<Option<String>> {
+    let r = client::request("GET", "/images/json", None)?;
+    if !r.ok() {
+        return Err(io::Error::other(format!("kiri: {}", r.error())));
+    }
+    Ok(r.json().as_array().and_then(|images| pick_helper(images)))
+}
+
+/// When Kiri last failed to fetch a helper: tried once per import, not
+/// once per volume.
+static PULL_FAILED: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+/// [`helper_in_kiri`], else busybox fetched by Kiri: from the public mirror,
+/// else from Docker Hub when no image of the person's is called that.
+/// Nothing is taken from the source.
+fn helper() -> io::Result<String> {
+    if let Some(name) = helper_in_kiri()? {
+        return Ok(name);
+    }
+    let none = || io::Error::other("Kiri needs one small official image to unpack volumes with: pull alpine or busybox in Kiri (docker pull alpine) and import again. A re-tagged or loaded copy does not count");
+    let mut failed = PULL_FAILED.lock().unwrap_or_else(|e| e.into_inner());
+    if failed.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(60)) {
+        return Err(none());
+    }
     let kiri = crate::flavor::CONTEXT.get();
-    if let Some(img) = tar_image(&image_names(kiri)?) {
-        return Ok(img.clone());
+    let pull = |name: &str| cli().is_ok_and(|mut c| c.args(["--context", kiri, "pull", "-q", name]).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success()));
+    if (pull("mirror.gcr.io/library/busybox") || (!has(kiri, "image", "busybox:latest") && pull("busybox")))
+        && let Some(name) = helper_in_kiri()?
+    {
+        return Ok(name);
     }
-    if let Some(img) = tar_image(&image_names(ctx)?) {
-        image(ctx, img)?;
-        return Ok(img.clone());
-    }
-    let out = cli()?.args(["--context", kiri, "pull", "-q", "busybox"]).stdout(Stdio::null()).stderr(Stdio::piped()).output()?;
-    if !out.status.success() {
-        return Err(io::Error::other(format!("kiri: no image with tar to write volumes with, and busybox could not be pulled: {}", String::from_utf8_lossy(&out.stderr).trim())));
-    }
-    Ok("busybox".to_owned())
+    *failed = Some(std::time::Instant::now());
+    Err(none())
 }
 
 /// The label on the containers an import makes for itself.
@@ -418,7 +454,7 @@ fn kiri_states(names: &[String], img: &str) -> io::Result<Vec<(String, Filled)>>
         cmd.arg("-v").arg(format!("{n}:/v/{i}:ro"));
     }
     let script = format!(r#"for d in /v/*; do if [ -e "$d/{UNFINISHED}" ]; then echo "${{d#/v/}} u"; elif [ -n "$(ls -A "$d")" ]; then echo "${{d#/v/}} y"; fi; done; true"#);
-    let out = cmd.args([img, "sh", "-c", &script]).stderr(Stdio::piped()).output()?;
+    let out = cmd.args(["--pull", "never", "--entrypoint", "sh", img, "-c", &script]).stderr(Stdio::piped()).output()?;
     if !out.status.success() {
         return Err(io::Error::other(format!("kiri: {}", String::from_utf8_lossy(&out.stderr).trim())));
     }
@@ -495,7 +531,7 @@ pub fn volume_with(source: &str, name: &str, force: bool) -> io::Result<()> {
     let there = has(kiri, "volume", name);
     let already = || io::Error::new(io::ErrorKind::AlreadyExists, format!("Kiri already has {name} with files in it, and it is left as it is"));
     // Asked first with an image Kiri has, before anything is fetched.
-    let kiri_img = tar_image(&image_names(kiri)?).cloned();
+    let kiri_img = helper_in_kiri()?;
     let mut state = match (&kiri_img, there) {
         (_, false) => Some(Filled::No),
         (Some(img), true) => Some(kiri_states(&[name.to_owned()], img)?[0].1),
@@ -509,7 +545,7 @@ pub fn volume_with(source: &str, name: &str, force: bool) -> io::Result<()> {
     }
     let img = match kiri_img {
         Some(img) => img,
-        None => helper_image(ctx)?,
+        None => helper()?,
     };
     if state.is_none() {
         state = Some(kiri_states(&[name.to_owned()], &img)?[0].1);
@@ -540,7 +576,7 @@ pub fn volume_with(source: &str, name: &str, force: bool) -> io::Result<()> {
     // they are. It goes after, with any anonymous volume its image made;
     // one an import that was stopped left behind goes first.
     let names = image_names(ctx)?;
-    let reader_image = match tar_image(&names).or(names.first()) {
+    let reader_image = match names.first() {
         Some(n) => n.clone(),
         None => json_lines(ctx, &["image", "ls", "--format", "{{json .ID}}"])?
             .first()
@@ -552,16 +588,19 @@ pub fn volume_with(source: &str, name: &str, force: bool) -> io::Result<()> {
     if leftover.first().is_some_and(|l| l["dev.kiri.import-helper"] == "1") {
         let _ = cli()?.args(["--context", ctx, "rm", "-fv", &reader]).stdout(Stdio::null()).stderr(Stdio::null()).status();
     }
-    let mount = format!("type=volume,src={name},dst=/kiri-import,readonly,volume-nocopy");
+    // At a path no image can have a VOLUME of its own at or under.
+    use std::hash::BuildHasher;
+    let at = format!("/kiri-import-{:016x}", std::collections::hash_map::RandomState::new().hash_one(name));
+    let mount = format!("type=volume,src={name},dst={at},readonly,volume-nocopy");
     let made = cli()?
-        .args(["--context", ctx, "create", "--name", &reader, "--pull", "never", "--network", "none", "--label", HELPER, "--entrypoint", "/kiri-import", "--mount", &mount, &reader_image])
+        .args(["--context", ctx, "create", "--name", &reader, "--pull", "never", "--network", "none", "--label", HELPER, "--entrypoint", &at, "--mount", &mount, &reader_image])
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .output()?;
     if !made.status.success() {
         return Err(io::Error::other(format!("{ctx}: {}", String::from_utf8_lossy(&made.stderr).trim())));
     }
-    let copied = copy_volume(ctx, &reader, name, &img);
+    let copied = copy_volume(ctx, &format!("{reader}:{at}/."), name, &img);
     let _ = cli()?.args(["--context", ctx, "rm", "-v", &reader]).stdout(Stdio::null()).stderr(Stdio::null()).status();
     copied.map_err(|e| io::Error::other(format!("{e}; {name} is unfinished in Kiri: the next import empties it and copies it again, replacing what is in it then")))
 }
@@ -570,11 +609,11 @@ pub fn volume_with(source: &str, name: &str, force: bool) -> io::Result<()> {
 /// into the volume by a helper on Kiri that removes itself. The helper
 /// marks the volume unfinished first (emptying what an unfinished copy
 /// left), and the mark goes only once every part of the copy succeeded.
-fn copy_volume(ctx: &str, reader: &str, name: &str, img: &str) -> io::Result<()> {
+fn copy_volume(ctx: &str, from: &str, name: &str, img: &str) -> io::Result<()> {
     let kiri = crate::flavor::CONTEXT.get();
     let dst_mount = format!("{name}:/to");
     let mut read = cli()?;
-    read.args(["--context", ctx, "cp", &format!("{reader}:/kiri-import/."), "-"]);
+    read.args(["--context", ctx, "cp", from, "-"]);
     let mut write = cli()?;
     // Emptied in one pass, all but the mark (a folder by that name counts as
     // it); anything still there after, hidden names too, stops the copy with
@@ -583,9 +622,9 @@ fn copy_volume(ctx: &str, reader: &str, name: &str, img: &str) -> io::Result<()>
         r#"set -e; cd /to; if [ -e {m} ]; then find . -mindepth 1 -maxdepth 1 ! -name {m} -exec rm -rf -- {{}} + || true; for f in .[!.]* ..?* *; do if [ "$f" != {m} ] && {{ [ -e "$f" ] || [ -L "$f" ]; }}; then echo "could not empty the volume: $f is left" >&2; exit 1; fi; done; fi; touch {m}; tar -xpf -"#,
         m = UNFINISHED
     );
-    write.args(["--context", kiri, "run", "--rm", "-i", "--network", "none", "--label", HELPER, "-v", &dst_mount, img, "sh", "-c", &script]);
+    write.args(["--context", kiri, "run", "--rm", "-i", "--network", "none", "--label", HELPER, "-v", &dst_mount, "--pull", "never", "--entrypoint", "sh", img, "-c", &script]);
     pipe(read, write, ctx, |from, to| retar(from, to, None))?;
-    let done = cli()?.args(["--context", kiri, "run", "--rm", "--network", "none", "--label", HELPER, "-v", &dst_mount, img, "rm", "-rf", "--", &format!("/to/{UNFINISHED}")]).stdout(Stdio::null()).stderr(Stdio::piped()).output()?;
+    let done = cli()?.args(["--context", kiri, "run", "--rm", "--network", "none", "--label", HELPER, "-v", &dst_mount, "--pull", "never", "--entrypoint", "rm", img, "-rf", "--", &format!("/to/{UNFINISHED}")]).stdout(Stdio::null()).stderr(Stdio::piped()).output()?;
     if !done.status.success() {
         return Err(io::Error::other(format!("kiri: {}", String::from_utf8_lossy(&done.stderr).trim())));
     }
@@ -935,18 +974,55 @@ mod tests {
         assert_eq!(parse(&["podman"]).unwrap(), (Some("podman"), Ask::Everything, false));
     }
 
-    // #376: any tag of an official image with tar does Kiri's half of a
-    // volume copy, not only five exact ones.
+    // Kiri's half of a volume copy runs only an image the engine pulled
+    // from an official repository, as its repo digests show: never one
+    // that only has a name like one, wherever it came from.
     #[test]
-    fn picks_an_image_with_tar() {
-        let pick = |names: &[&str]| super::tar_image(&names.iter().map(|n| n.to_string()).collect::<Vec<_>>()).cloned();
-        assert_eq!(pick(&["nginx:latest", "alpine:3.19"]), Some("alpine:3.19".into()));
-        assert_eq!(pick(&["busybox:1.36"]), Some("busybox:1.36".into()));
-        assert_eq!(pick(&["mirror.gcr.io/library/debian:trixie"]), Some("mirror.gcr.io/library/debian:trixie".into()));
-        assert_eq!(pick(&["docker.io/library/ubuntu:24.04"]), Some("docker.io/library/ubuntu:24.04".into()));
-        for none in [&["nginx:latest", "postgres:17"][..], &["myorg/alpine:1"], &["localhost:5000/alpine:1"], &["alpinelinux:3"], &[]] {
-            assert_eq!(pick(none), None, "{none:?}");
+    fn only_an_official_image_helps() {
+        use super::{official, pick_helper};
+        use serde_json::json;
+        let d = format!("@sha256:{}", "ab12".repeat(16));
+        for good in ["busybox", "library/alpine", "docker.io/library/debian", "mirror.gcr.io/library/ubuntu", "public.ecr.aws/docker/library/busybox"] {
+            assert!(official(&format!("{good}{d}")), "{good}");
         }
+        let look_alikes = [
+            "ghcr.io/x/library/busybox",
+            "localhost:5000/library/alpine",
+            "localhost/x/library/busybox",
+            "evil/alpine",
+            "docker.io/evil/alpine",
+            "mirror.gcr.io/evil/library/alpine",
+            "public.ecr.aws/x/library/alpine",
+            "alpinelinux",
+            "nginx",
+            "busybox:1",
+        ];
+        for bad in look_alikes {
+            assert!(!official(&format!("{bad}{d}")), "{bad}");
+        }
+        for bad in ["busybox", "busybox:1", "busybox@sha256:abc", &format!("busybox@sha512:{}", "a".repeat(64)), &format!("busybox@sha256:{}", "A".repeat(64))] {
+            assert!(!official(bad), "{bad}");
+        }
+        // Kiri's image list: one record per name, each with its own digests.
+        let rec = |name: &str, digests: &[String]| json!({"Id": format!("sha256:{}", "c".repeat(64)), "RepoTags": [name], "RepoDigests": digests});
+        let records = [
+            // Untagged: a load or build without a name.
+            rec(&format!("sha256:{}", "c".repeat(64)), &[]),
+            rec("localhost/imp-x/library/busybox:9", &[]),
+            // Re-tagged from the official one: no digest of its own.
+            rec("alpine:latest", &[]),
+            // Called busybox, its digest another repository's.
+            rec("busybox:1", &[format!("evil/tools{d}")]),
+            // An official digest under a name of another repository.
+            rec("evil/alpine:1", &[format!("alpine{d}")]),
+            rec("ghcr.io/x/library/busybox:1", &[format!("ghcr.io/x/library/busybox{d}")]),
+            rec("mirror.gcr.io/library/alpine:latest", &[format!("mirror.gcr.io/library/alpine{d}")]),
+            rec("busybox:latest", &[format!("busybox{d}")]),
+        ];
+        assert_eq!(pick_helper(&records), Some("mirror.gcr.io/library/alpine:latest".into()));
+        assert_eq!(pick_helper(&records[..6]), None);
+        assert_eq!(pick_helper(&records[7..]), Some("busybox:latest".into()));
+        assert_eq!(pick_helper(&[json!({"RepoTags": null, "RepoDigests": [format!("busybox{d}")]})]), None);
     }
 
     // #377: an image only pinned by digest is listed by that reference.
