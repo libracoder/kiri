@@ -577,6 +577,9 @@ fn parse_question(q: &[u8]) -> Option<(String, u16, usize)> {
         i += 1 + len;
     }
     let qtype = u16::from_be_bytes([*q.get(i)?, *q.get(i + 1)?]);
+    // QCLASS must be there too: both callers copy q[12..end], and a slice
+    // past the packet would abort PID 1 (panic = "abort"), and with it the VM.
+    q.get(12..i + 4)?;
     Some((name, qtype, i + 4))
 }
 
@@ -860,6 +863,25 @@ mod tests {
         let n = client.recv(&mut buf).unwrap();
         assert_eq!(&buf[..2], &[0, 7], "the client's own ID");
         assert_eq!(&buf[2..n], &reply[2..]);
+    }
+
+    /// A question cut off after QTYPE (no QCLASS) is not a question: one
+    /// such 36-byte packet to 127.0.0.11 used to abort kiri-init and the VM.
+    #[test]
+    fn a_question_without_its_class_is_refused() {
+        let mut q = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+        for label in ["host", "docker", "internal"] {
+            q.push(label.len() as u8);
+            q.extend_from_slice(label.as_bytes());
+        }
+        q.extend_from_slice(&[0, 0, 1]);
+        assert_eq!(q.len(), 36);
+        assert!(super::parse_question(&q).is_none(), "QCLASS missing");
+        q.extend_from_slice(&[0]);
+        assert!(super::parse_question(&q).is_none(), "half a QCLASS");
+        q.extend_from_slice(&[1]);
+        let (name, qtype, end) = super::parse_question(&q).expect("a whole question parses");
+        assert_eq!((name.as_str(), qtype, end), ("host.docker.internal", 1, 38));
     }
 
     #[test]

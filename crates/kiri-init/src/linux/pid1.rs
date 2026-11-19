@@ -68,6 +68,8 @@ pub fn run(exe: &CStr, argv: *const *const libc::c_char, envp: *const *const lib
             }
             super::sys::exec_fail(2, exe, err, true);
         }
+        // The agent's descriptors (DNS sockets, other containers' pipes) stay out of PID 1.
+        libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32);
 
         let wake = libc::timespec { tv_sec: 1, tv_nsec: 0 };
         loop {

@@ -1,3 +1,4 @@
+// parity: macos windows linux
 // A container's log can be selected and copied, without the line numbers.
 kiri.on({ type: "status", version: "0.1.4", dev: true, app: "Kiri Dev", ours: "kiri-dev", context: "kiri-dev" });
 const R = [];
@@ -10,22 +11,28 @@ t("selecting the log copies its lines, without the numbers", () => {
   getSelection().selectAllChildren(log);
   eq(getSelection().toString().trim().split("\n"), ["[INFO] Started worker-1", "ERROR: engine failed"], "copied");
 });
-t("the copy key sends the selected log to the clipboard", () => {
+const MAC = !WIN && !LINUX;
+const copyKey = (el) => el.dispatchEvent(new KeyboardEvent("keydown", { key: "c", metaKey: MAC, ctrlKey: !MAC, bubbles: true }));
+t("the copy key sends the selected log to the clipboard, or leaves it to the Mac's Edit menu", () => {
   const log = document.querySelector(".console.numbered");
   getSelection().selectAllChildren(log);
   sent.length = 0;
-  log.dispatchEvent(new KeyboardEvent("keydown", { key: "c", metaKey: true, bubbles: true }));
+  copyKey(log);
   const copies = sent.filter((m) => m.cmd === "term" && m.name === "copy");
-  eq(copies.length, 1, "copies sent");
-  eq(copies[0].value.trim().split("\n"), ["[INFO] Started worker-1", "ERROR: engine failed"], "text");
+  eq(copies.length, MAC ? 0 : 1, "copies sent");
+  if (!MAC) eq(copies[0].value.trim().split("\n"), ["[INFO] Started worker-1", "ERROR: engine failed"], "text");
 });
 t("the copy key leaves text fields and an empty selection alone", () => {
   sent.length = 0;
   getSelection().removeAllRanges();
-  document.body.dispatchEvent(new KeyboardEvent("keydown", { key: "c", metaKey: true, bubbles: true }));
+  copyKey(document.body);
   const field = document.querySelector("input");
   getSelection().selectAllChildren(document.querySelector(".console.numbered"));
-  field.dispatchEvent(new KeyboardEvent("keydown", { key: "c", metaKey: true, bubbles: true }));
+  copyKey(field);
   eq(sent.filter((m) => m.cmd === "term" && m.name === "copy").length, 0, "copies sent");
+});
+t("the search field's text can be selected, though the window's can't", () => {
+  const style = getComputedStyle(document.querySelector(".gfind input"));
+  eq(style.userSelect || style.webkitUserSelect, "text", "user-select");
 });
 report(R);

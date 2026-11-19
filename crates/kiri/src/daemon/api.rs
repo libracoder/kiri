@@ -230,7 +230,7 @@ fn route(req: &Request, engine: &Arc<Engine>, w: &mut UnixStream, r: &mut BufRea
                 return reply(w, image_tag(req, engine, name).map(|()| Value::Null), 201);
             }
         } else if m == "DELETE" {
-            return reply(w, image_remove(engine, rest), 200);
+            return reply(w, image_remove(engine, rest, req.flag("force")), 200);
         }
     }
     if let Some(rest) = p.strip_prefix("/containers/") {
@@ -440,6 +440,8 @@ fn info(engine: &Engine) -> Value {
         "DefaultRuntime": "kiri",
         "Runtimes": {"kiri": {"path": "kiri-init"}},
         "SecurityOptions": ["name=seccomp,profile=builtin", "name=cgroupns"],
+        // Compose needs it to attach in `up` and `logs -f` (#346).
+        "SystemTime": time::rfc3339(std::time::SystemTime::now()),
         // Not in Docker's /info (the ping's Builder-Version header is), but
         // tools print it: the classic builder API, served by builder.rs.
         "BuilderVersion": "1",
@@ -452,7 +454,7 @@ fn info(engine: &Engine) -> Value {
         "KiriMemoryStall": engine.memory_trouble().0,
         "KiriOomKills": engine.memory_trouble().1,
         "KiriCpuPercent": engine.cpu_percent(),
-        "Warnings": [],
+        "Warnings": engine.records_damage(),
     })
 }
 
@@ -529,7 +531,7 @@ fn image_inspect(engine: &Engine, name: &str) -> Result<Value, Error> {
     }))
 }
 
-fn image_remove(engine: &Engine, name: &str) -> Result<Value, Error> {
+fn image_remove(engine: &Engine, name: &str, force: bool) -> Result<Value, Error> {
     let i = engine.image(name)?.ok_or_else(|| Error::NotFound(format!("No such image: {name}")))?;
     // With another tag on the same image, removing this one only untags it.
     let other_tags = engine.store.images()?.iter().any(|o| o.config_digest == i.config_digest && o.name != i.name);
@@ -538,6 +540,14 @@ fn image_remove(engine: &Engine, name: &str) -> Result<Value, Error> {
         return Err(Error::Conflict(format!(
             "conflict: unable to remove repository reference \"{name}\" (must force) - container {c} is using its referenced image"
         )));
+    }
+    // The last tag takes the image: no listed container uses it, but while
+    // the list may be missing some, only a forced removal goes ahead.
+    if !other_tags
+        && !force
+        && let Some(why) = engine.refusal(&format!("Image {name} was not removed, because the container list may be missing a container that uses it; `docker rmi --force` removes it anyway"))
+    {
+        return Err(Error::Conflict(why));
     }
     engine.store.remove_image(&i.name)?;
     engine.emit_image("untag", &i.config_digest, &i.name);
@@ -1025,10 +1035,13 @@ const MAC_ROOT: &str = "/mnt/mac";
 const MAC_ROOT: &str = "";
 
 /// Bind sources under these come from the Mac (Docker Desktop's default file
-/// shares; /tmp and /var/folders are the Mac's links into /private). Any
-/// other path is the VM's own, as on Docker Desktop and OrbStack: kind's
-/// `-v /lib/modules:/lib/modules:ro` must not try to make /lib/modules on
-/// the Mac's read-only root.
+/// shares; /tmp and /var/folders are the Mac's links into /private, so they
+/// resolve to a path under it). Any other path is the VM's own, as on Docker
+/// Desktop and OrbStack: kind's `-v /lib/modules:/lib/modules:ro` must not
+/// try to make /lib/modules on the Mac's read-only root.
+///
+/// Only the folders these resolve to are shared with the guest — see
+/// `crate::guest::mac_share_dirs` — so this list cannot widen the share.
 const MAC_SHARES: &[&str] = &["/Users", "/Volumes", "/private", "/tmp", "/var/folders"];
 
 fn mac_shared(src: &str) -> bool {
@@ -1111,6 +1124,86 @@ fn resolve_server(host: &str) -> Option<String> {
     addrs.iter().find(|a| a.is_ipv4()).or(addrs.first()).map(|a| a.ip().to_string())
 }
 
+/// Whether `src` names the mount point the guest keeps the Mac's folders at.
+///
+/// `root` is empty on a Linux host, where the agent sees the host's own
+/// paths and there is no share to name.
+fn guest_share_path(src: &str, root: &str) -> bool {
+    // Compared as the guest kernel will read it: `/mnt//mac`, `/mnt/./mac`
+    // and `/mnt/x/../mac` all name the share.
+    let src = lexical_path(src);
+    root.starts_with('/') && (src == root || src.strip_prefix(root).is_some_and(|rest| rest.starts_with('/')))
+}
+
+/// An absolute path with empty and `.` components dropped and `..` applied.
+fn lexical_path(p: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    for c in p.split('/') {
+        match c {
+            "" | "." => {}
+            ".." => {
+                out.pop();
+            }
+            c => out.push(c),
+        }
+    }
+    format!("/{}", out.join("/"))
+}
+
+/// Refuses volume driver options that would mount the VM's own shares.
+///
+/// The guest mounts a volume's `device` itself, as root, before the container
+/// starts, so a `type=virtiofs` volume (`device=kiri-mac`) or a bind of
+/// `/mnt/mac` would hand the container the share without `-v` naming it.
+fn check_volume_device(options: &std::collections::BTreeMap<String, String>) -> Result<(), Error> {
+    let kind = options.get("type").map_or("", String::as_str);
+    if kind.eq_ignore_ascii_case("virtiofs") {
+        return Err(Error::BadRequest("invalid volume option type=virtiofs: the VM's shares cannot be mounted as a volume".into()));
+    }
+    let device = options.get("device").map_or("", String::as_str);
+    let (flags, _) = super::volumes::mount_options(options.get("o").map_or("", String::as_str));
+    if flags & 4096 != 0 && guest_share_path(device, MAC_ROOT) {
+        return Err(Error::BadRequest(format!(
+            "invalid volume option device={device}: {MAC_ROOT} exists only inside the VM; name the Mac's own path, such as /Users/…"
+        )));
+    }
+    Ok(())
+}
+
+/// Refuses text that would forge a field in the tab-separated mount line the
+/// guest parses.
+///
+/// Each mount reaches the guest as `source\ttarget\tflags`, and a volume with
+/// driver options adds `\tkind\tdevice\tflags\tdata`. Targets come from the
+/// image's `VOLUME` lines and volume options from its driver config, so a tab
+/// (or a newline, or NUL) in one is an untrusted field separator: the fields
+/// after it would be read as a mount type, device and flags instead.
+fn wire_text(what: &str, s: &str) -> Result<(), Error> {
+    let Some(b) = s.bytes().find(|b| matches!(b, b'\t' | b'\n' | b'\r' | 0)) else { return Ok(()) };
+    let named = match b {
+        b'\t' => "a tab",
+        b'\n' => "a newline",
+        b'\r' => "a carriage return",
+        _ => "NUL",
+    };
+    Err(Error::BadRequest(format!("invalid {what} {s:?}: {named} is not allowed")))
+}
+
+/// A hostname as the guest writes it into `/etc/hostname` and `/etc/hosts`.
+/// Docker takes nearly anything here (`my_app`, `-db`, `a..b`), and Compose
+/// files rely on it, so only what would add a line or a field of its own is
+/// refused: a newline, carriage return, tab, NUL or other control character.
+fn valid_hostname(name: &str) -> bool {
+    !name.is_empty() && !name.bytes().any(|b| b.is_ascii_control())
+}
+
+/// A `--add-host` name, one field of a hosts line. Docker takes any name
+/// here too (`my_app.local`, even `a b`), so, as for a hostname, only a
+/// control character, which would add a line or a field of its own, is refused.
+fn valid_hosts_name(name: &str) -> bool {
+    !name.is_empty() && !name.bytes().any(|b| b.is_ascii_control())
+}
+
 /// `-v`, `--mount`, `--tmpfs`, `-v /path` and the image's VOLUME lines.
 fn mounts(body: &Value, engine: &Engine, image: &kiri_image::Image) -> Result<Mounts, Error> {
     let host = &body["HostConfig"];
@@ -1119,12 +1212,24 @@ fn mounts(body: &Value, engine: &Engine, image: &kiri_image::Image) -> Result<Mo
         if !t.starts_with('/') {
             return Err(Error::BadRequest(format!("invalid mount target {t}: must be an absolute path")));
         }
+        wire_text("mount target", t)?;
         Ok(())
     };
     // One entry: kind is "bind" | "volume" | "tmpfs"; for binds `create_missing`
     // says whether a missing source directory is made (-v) or an error (--mount).
     let add = |kind: &str, src: &str, dst: &str, ro: bool, extra: &str, create_missing: bool, out: &mut Mounts| -> Result<(), Error> {
         check_target(dst)?;
+        // A source and a target are joined with tabs for the guest; so are
+        // tmpfs options. Reject a separator or NUL inside any of them.
+        wire_text("mount source", src)?;
+        wire_text("tmpfs option", extra)?;
+        // `/mnt/mac` is the guest's view of the Mac's folders, not a path on
+        // the Mac: a bind of it would hand the container the share itself.
+        if guest_share_path(src, MAC_ROOT) {
+            return Err(Error::BadRequest(format!(
+                "invalid mount source {src}: {MAC_ROOT} exists only inside the VM; name the Mac's own path, such as /Users/…"
+            )));
+        }
         let flag = |more: &str| {
             let mut f: Vec<&str> = more.split(',').filter(|x| !x.is_empty()).collect();
             if ro {
@@ -1171,6 +1276,15 @@ fn mounts(body: &Value, engine: &Engine, image: &kiri_image::Image) -> Result<Mo
             "volume" => {
                 let (name, anonymous) = if src.is_empty() { (super::engine::random_hex(32), true) } else { (src.to_owned(), false) };
                 let v = engine.volume_ensure(&name, json!({}), anonymous)?;
+                // `type`, `device` and `o` reach the guest in the same
+                // tab-separated line, so neither may carry a separator.
+                for (k, val) in &v.options {
+                    wire_text(&format!("volume option {k}"), val)?;
+                }
+                // The guest mounts a volume's device as root, so the share
+                // must not be reachable this way either: not as a virtiofs
+                // tag, and not as a bind of /mnt/mac.
+                check_volume_device(&v.options)?;
                 let path = super::volumes::guest_path(&name);
                 let copy = if extra.contains("nocopy") { "create" } else { "create,copyup" };
                 // A volume with driver options (`type=nfs`, `o=bind` …) is
@@ -1305,6 +1419,11 @@ fn volume_create(req: &Request, engine: &Engine) -> Result<Value, Error> {
 /// Docker's default prune: anonymous volumes no container uses.
 /// `all=true` takes named ones too.
 fn volume_prune(req: &Request, engine: &Engine) -> Result<Value, Error> {
+    // While the container list may be missing containers, "unused" can't
+    // be told; say so rather than quietly pruning less.
+    if let Some(why) = engine.refusal("Volumes were not pruned, because the container list may be missing containers that use them") {
+        return Err(Error::Conflict(why));
+    }
     let f = filters(req, &["label", "label!", "all"])?;
     let all = f.bool("all") == Some(true);
     let unused: Vec<String> = engine
@@ -1424,6 +1543,28 @@ fn command(entry: Option<Vec<String>>, cmd: Option<Vec<String>>, image_entry: &[
     }
 }
 
+/// The primary network when NetworkMode is empty or `default`: the first
+/// resolved endpoint's name, unless bridge is listed. No match keeps bridge.
+/// Unknown endpoints are left for create to reject. `keys` come from the
+/// request's JSON map, so they are sorted and "first" is the same every time.
+/// `resolve` gives a key's network name and whether it is internal. Only the
+/// primary network gets the default route, so a network that reaches outside
+/// is preferred, as Docker picks its gateway: an internal one is primary only
+/// when every listed network is internal.
+fn endpoints_primary<'a>(keys: impl Iterator<Item = &'a str>, resolve: impl Fn(&str) -> Option<(String, bool)>) -> Option<String> {
+    let (mut outside, mut internal) = (None, None);
+    for (name, is_internal) in keys.filter(|key| !key.starts_with("container:")).filter_map(resolve) {
+        if name == "bridge" {
+            return None;
+        }
+        let slot = if is_internal { &mut internal } else { &mut outside };
+        if slot.is_none() {
+            *slot = Some(name);
+        }
+    }
+    outside.or(internal)
+}
+
 fn strings(v: &Value) -> Option<Vec<String>> {
     match v {
         Value::Array(a) => Some(a.iter().filter_map(|s| s.as_str().map(str::to_owned)).collect()),
@@ -1525,7 +1666,9 @@ pub(super) fn create(req: &Request, engine: &Engine) -> Result<Value, Error> {
         super::seccomp::compile(json, profile_caps(caps_from(host)?, host["Privileged"].as_bool().unwrap_or(false))).map_err(Error::BadRequest)?;
     }
     let network_mode = match host["NetworkMode"].as_str().unwrap_or("default") {
-        "" | "default" => "bridge".to_owned(),
+        "" | "default" => body["NetworkingConfig"]["EndpointsConfig"].as_object()
+            .and_then(|eps| endpoints_primary(eps.keys().map(String::as_str), |key| engine.lock_net().find(key).map(|n| (n.name.clone(), n.internal))))
+            .unwrap_or_else(|| "bridge".to_owned()),
         m => m.to_owned(),
     };
     let network = match network_mode.strip_prefix("container:") {
@@ -1536,7 +1679,7 @@ pub(super) fn create(req: &Request, engine: &Engine) -> Result<Value, Error> {
         return Err(Error::NotFound(format!("network {network_mode} not found")));
     };
     // One endpoint per network (API 1.44+ allows several at create, which
-    // Compose uses); the one named by NetworkMode is the primary.
+    // Compose uses); NetworkMode or the endpoints above pick the primary.
     let mut aliases = Vec::new();
     let mut extra_networks = Vec::new();
     // `--ip`, `--mac-address` (Config.MacAddress before API 1.44).
@@ -1584,10 +1727,18 @@ pub(super) fn create(req: &Request, engine: &Engine) -> Result<Value, Error> {
         return Err(Error::BadRequest("conflicting options: host type networking can't be used with links. This would result in undefined behavior".into()));
     }
     // `--add-host name:ip` arrives as "name:ip"; /etc/hosts wants "ip name".
+    // Both are written into the container's /etc/hosts by the guest, so a
+    // newline in either would add lines of its own.
     let mut extra_hosts = Vec::new();
     for h in strings(&host["ExtraHosts"]).unwrap_or_default() {
         let Some((name, ip)) = h.split_once(':') else { continue };
         let ip = if ip == "host-gateway" { super::ports::HOST_ADDR } else { ip };
+        if ip.parse::<std::net::IpAddr>().is_err() {
+            return Err(Error::BadRequest(format!("invalid IP address: {ip}")));
+        }
+        if !valid_hosts_name(name) {
+            return Err(Error::BadRequest(format!("invalid host name ({name})")));
+        }
         extra_hosts.push(format!("{ip}\t{name}"));
     }
     let warnings: Vec<&str> = Vec::new();
@@ -1639,6 +1790,11 @@ pub(super) fn create(req: &Request, engine: &Engine) -> Result<Value, Error> {
         Some(s) if !s.is_empty() => s.to_owned(),
         _ => fallback.to_owned(),
     };
+    // The guest writes it to the container's /etc/hostname and /etc/hosts.
+    let hostname = pick("Hostname", "");
+    if !hostname.is_empty() && !valid_hostname(&hostname) {
+        return Err(Error::BadRequest(format!("invalid hostname ({hostname})")));
+    }
     let spec = Spec {
         image: image_name.to_owned(),
         image_id: image.config_digest.clone(),
@@ -1655,7 +1811,7 @@ pub(super) fn create(req: &Request, engine: &Engine) -> Result<Value, Error> {
         cap_drop: strings(&host["CapDrop"]).unwrap_or_default(),
         security_opt: strings(&host["SecurityOpt"]).unwrap_or_default(),
         readonly_rootfs: host["ReadonlyRootfs"].as_bool().unwrap_or(false),
-        hostname: body["Hostname"].as_str().unwrap_or_default().to_owned(),
+        hostname,
         stop_signal: body["StopSignal"].as_str().filter(|s| !s.is_empty()).map(signal).or_else(|| {
             // The image's STOPSIGNAL.
             let cfg: Value = serde_json::from_slice(&engine.store.read_config(&image.config_digest).ok()?).ok()?;
@@ -2225,6 +2381,11 @@ fn network_create(req: &Request, engine: &Engine) -> Result<Value, Error> {
 }
 
 fn network_prune(req: &Request, engine: &Engine) -> Result<Value, Error> {
+    // While the container list may be missing containers, "unused" can't
+    // be told; say so rather than quietly pruning less.
+    if let Some(why) = engine.refusal("Networks were not pruned, because the container list may be missing containers that use them") {
+        return Err(Error::Conflict(why));
+    }
     let f = filters(req, &["label", "label!"])?;
     let nets = engine.lock_net();
     let unused: Vec<String> = nets
@@ -2781,6 +2942,111 @@ pub(super) fn parse_signal(raw: &str) -> Result<u32, Error> {
 mod tests {
     use super::*;
 
+    /// An engine whose container list was damaged (a kept copy is there),
+    /// with a named volume and a network no listed container uses: they may
+    /// be a lost container's, so prune removes neither and says why.
+    #[test]
+    fn prune_removes_nothing_while_the_container_list_is_damaged() {
+        let root = std::env::temp_dir().join(format!("kiri-prune-damaged-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("containers.json.corrupt-1-0"), b"[{\"id\":").unwrap();
+        let engine = super::super::engine::boot_without_vm(&root);
+        engine.volume_ensure_with("lost-data", json!({}), Default::default()).unwrap();
+        engine.lock_net().create("lost-net", Default::default()).unwrap();
+        let req = Request::internal("POST", "/volumes/prune", &[("filters", r#"{"all":["true"]}"#)], Vec::new());
+        match volume_prune(&req, &engine) {
+            Err(Error::Conflict(why)) => assert!(why.starts_with("Volumes were not pruned") && why.contains("containers.json.corrupt-1-0"), "{why}"),
+            other => panic!("volume prune: {other:?}"),
+        }
+        assert!(engine.volume_get("lost-data").is_some(), "the volume is kept");
+        match network_prune(&Request::internal("POST", "/networks/prune", &[], Vec::new()), &engine) {
+            Err(Error::Conflict(why)) => assert!(why.starts_with("Networks were not pruned") && why.contains("containers.json.corrupt-1-0"), "{why}"),
+            other => panic!("network prune: {other:?}"),
+        }
+        assert!(engine.lock_net().find("lost-net").is_some(), "the network is kept");
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn engine_in(name: &str, damaged: bool) -> (std::path::PathBuf, std::sync::Arc<Engine>) {
+        let root = std::env::temp_dir().join(format!("kiri-rm-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        if damaged {
+            std::fs::write(root.join("containers.json.corrupt-1-0"), b"[{\"id\":").unwrap();
+        }
+        let engine = super::super::engine::boot_without_vm(&root);
+        (root, engine)
+    }
+
+    fn test_image(name: &str) -> kiri_image::Image {
+        kiri_image::Image {
+            name: name.into(), digest: "sha256:0123".into(), index_digest: None, config_digest: "sha256:0123".into(),
+            layers: Vec::new(), size: 0, platform: "linux/arm64".into(), created: String::new(), pulled_at: 0, config: Default::default(),
+        }
+    }
+
+    /// A container using `volume` and `image`, in the list.
+    fn listed_user(engine: &Engine, volume: &str, image: &kiri_image::Image) {
+        let spec: super::super::engine::Spec = serde_json::from_value(json!({
+            "image": image.name, "image_id": image.config_digest, "entrypoint": [], "cmd": ["true"],
+            "env": [], "cwd": "/", "user": "", "auto_remove": false, "network_mode": "none", "labels": {},
+            "restart": {"name": "no", "max_retries": 0}, "volumes": [volume]
+        })).unwrap();
+        engine.create(Some("user".into()), spec, image).unwrap();
+    }
+
+    /// On a good list removal by name is as before: one a listed container
+    /// uses is refused, one none uses goes.
+    #[test]
+    fn removal_by_name_on_a_good_list_is_unchanged() {
+        let (root, engine) = engine_in("good", false);
+        let image = test_image("used:1");
+        engine.store.put_image(image.clone()).unwrap();
+        engine.volume_ensure_with("used", json!({}), Default::default()).unwrap();
+        engine.volume_ensure_with("free", json!({}), Default::default()).unwrap();
+        listed_user(&engine, "used", &image);
+        assert!(matches!(engine.volume_remove("used", false), Err(Error::Conflict(m)) if m.contains("volume is in use")));
+        engine.volume_remove("free", false).unwrap();
+        assert!(engine.volume_get("free").is_none());
+        assert!(matches!(image_remove(&engine, "used:1", false), Err(Error::Conflict(m)) if m.contains("is using its referenced image")));
+        engine.store.put_image(test_image("free:1")).unwrap();
+        engine.store.put_image(kiri_image::Image { config_digest: "sha256:4567".into(), ..test_image("other:1") }).unwrap();
+        image_remove(&engine, "other:1", false).unwrap();
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// On a damaged list a volume or image no listed container uses may be
+    /// a lost container's (the window's Delete sends exactly this request):
+    /// refused unless forced, and still there. Forced, it goes.
+    #[test]
+    fn removal_by_name_on_a_damaged_list_needs_force() {
+        let (root, engine) = engine_in("damaged", true);
+        engine.volume_ensure_with("lost-data", json!({}), Default::default()).unwrap();
+        match engine.volume_remove("lost-data", false) {
+            Err(Error::Conflict(why)) => assert!(why.starts_with("Volume lost-data was not removed") && why.contains("containers.json.corrupt-1-0"), "{why}"),
+            other => panic!("volume rm: {other:?}"),
+        }
+        assert!(engine.volume_get("lost-data").is_some(), "the volume is kept");
+        engine.volume_remove("lost-data", true).unwrap();
+        assert!(engine.volume_get("lost-data").is_none(), "forced, it goes");
+        engine.store.put_image(test_image("lost:1")).unwrap();
+        match image_remove(&engine, "lost:1", false) {
+            Err(Error::Conflict(why)) => assert!(why.starts_with("Image lost:1 was not removed") && why.contains("containers.json.corrupt-1-0"), "{why}"),
+            other => panic!("rmi: {other:?}"),
+        }
+        assert_eq!(engine.store.images().unwrap().len(), 1, "the image is kept");
+        // Untagging, with another tag left, deletes nothing: allowed.
+        engine.store.put_image(test_image("lost:2")).unwrap();
+        image_remove(&engine, "lost:2", false).unwrap();
+        image_remove(&engine, "lost:1", true).unwrap();
+        assert!(engine.store.images().unwrap().is_empty(), "forced, it goes");
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn kernel_release_is_trimmed_and_empty_is_none() {
         assert_eq!(parse_release("7.0.0-38-generic\n").as_deref(), Some("7.0.0-38-generic"));
@@ -2835,6 +3101,49 @@ mod tests {
         assert_eq!(command(Some(s(&["sh"])), Some(s(&["-c", "x"])), &ie, &ic), (s(&["sh"]), s(&["-c", "x"])));
         // "Entrypoint": [] clears the image's and keeps its Cmd.
         assert_eq!(command(Some(vec![]), None, &ie, &ic), (vec![], ic.clone()));
+    }
+
+    #[test]
+    fn endpoints_alone_choose_the_primary_network() {
+        let asked = std::cell::RefCell::new(Vec::new());
+        let resolve = |key: &str| {
+            asked.borrow_mut().push(key.to_owned());
+            match key {
+                "a" | "b" | "n" | "bridge" => Some((key.to_owned(), false)),
+                // Internal networks (`network create --internal`).
+                "back" | "inner" => Some((key.to_owned(), true)),
+                "0123abc" => Some(("n".to_owned(), false)),
+                "4567def" => Some(("bridge".to_owned(), false)),
+                _ => None,
+            }
+        };
+        let cases: &[(&[&str], Option<&str>)] = &[
+            (&[], None),
+            (&["n"], Some("n")),
+            (&["0123abc"], Some("n")),
+            (&["a", "b"], Some("a")),
+            (&["bridge"], None),
+            (&["n", "bridge"], None),
+            (&["bridge", "n"], None),
+            (&["4567def"], None),
+            (&["n", "4567def"], None),
+            (&["container:x"], None),
+            (&["container:x", "n"], Some("n")),
+            (&["n", "container:x"], Some("n")),
+            (&["missing"], None),
+            (&["missing", "n"], Some("n")),
+            // An internal network sorted first doesn't take the default
+            // route from one that reaches outside.
+            (&["back", "n"], Some("n")),
+            (&["back", "inner", "n"], Some("n")),
+            (&["back"], Some("back")),
+            (&["back", "inner"], Some("back")),
+            (&["back", "bridge"], None),
+        ];
+        for (keys, expected) in cases {
+            assert_eq!(endpoints_primary(keys.iter().copied(), resolve).as_deref(), *expected, "{keys:?}");
+        }
+        assert!(asked.borrow().iter().all(|k| !k.starts_with("container:")), "a container: key was looked up as a network");
     }
 
     #[test]
@@ -3159,5 +3468,72 @@ mod network_option_tests {
         assert_eq!(super::pull_hint(&status(401), "docker.io", None).unwrap(), "Docker Hub asked for a login: docker login");
         assert_eq!(super::pull_hint(&status(500), "docker.io", None), None);
         assert_eq!(super::pull_hint(&Error::NotFound("no such image".into()), "docker.io", p), None);
+    }
+
+    /// A mount target reaches the guest in a tab-separated line; a tab inside
+    /// it would be read as the start of the volume's driver options, and the
+    /// fields after it as a mount type, device and flags.
+    #[test]
+    fn mount_fields_cannot_carry_a_separator() {
+        assert!(super::wire_text("mount target", "/app").is_ok());
+        for bad in ["/app\tx", "/app\nx", "/app\rx", "/app\0x"] {
+            let e = super::wire_text("mount target", bad).expect_err("refused");
+            assert!(matches!(e, super::Error::BadRequest(m) if m.contains("is not allowed")), "{bad:?}");
+        }
+    }
+
+    /// `/mnt/mac` is the guest's own name for the Mac's folders, not a path
+    /// on the Mac; a bind of it would be a bind of the share.
+    #[test]
+    fn the_guest_share_cannot_be_named_as_a_bind_source() {
+        assert!(super::guest_share_path("/mnt/mac", "/mnt/mac"));
+        assert!(super::guest_share_path("/mnt/mac/Users/me", "/mnt/mac"));
+        assert!(!super::guest_share_path("/mnt/macintosh/x", "/mnt/mac"));
+        assert!(!super::guest_share_path("/Users/me", "/mnt/mac"));
+        assert!(!super::guest_share_path("/mnt/mac", ""), "a Linux host has no share");
+        // Other spellings of the same path name the share too.
+        for p in ["/mnt//mac", "/mnt/./mac", "/mnt/x/../mac/Users", "//mnt/mac/", "/mnt/mac/."] {
+            assert!(super::guest_share_path(p, "/mnt/mac"), "{p}");
+        }
+        assert!(!super::guest_share_path("/mnt/mac/../macintosh", "/mnt/mac"));
+    }
+
+    /// A volume's device is mounted by the guest as root, so it must not
+    /// reach the share either.
+    #[test]
+    fn a_volume_cannot_mount_the_share() {
+        let opts = |kv: &[(&str, &str)]| kv.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect::<std::collections::BTreeMap<_, _>>();
+        assert!(super::check_volume_device(&opts(&[("type", "virtiofs"), ("device", "kiri-mac")])).is_err());
+        assert!(super::check_volume_device(&opts(&[("type", "VirtioFS"), ("device", "rosetta")])).is_err());
+        if cfg!(target_os = "macos") {
+            assert!(super::check_volume_device(&opts(&[("type", "none"), ("o", "bind"), ("device", "/mnt/mac")])).is_err());
+            assert!(super::check_volume_device(&opts(&[("type", "none"), ("o", "bind"), ("device", "/mnt//mac/Users")])).is_err());
+        }
+        // Ordinary volumes are untouched.
+        assert!(super::check_volume_device(&opts(&[("type", "none"), ("o", "bind"), ("device", "/Users/me/data")])).is_ok());
+        assert!(super::check_volume_device(&opts(&[("type", "nfs"), ("o", "addr=10.0.0.1"), ("device", ":/export")])).is_ok());
+        assert!(super::check_volume_device(&opts(&[("type", "tmpfs"), ("device", "tmpfs")])).is_ok());
+        assert!(super::check_volume_device(&opts(&[])).is_ok());
+    }
+
+    /// `--add-host name:ip` and `--hostname` are written into the container's
+    /// /etc/hosts by the guest, so neither may add a line of its own.
+    #[test]
+    fn host_names_are_checked_before_they_are_written() {
+        assert!(super::valid_hostname("db"));
+        assert!(super::valid_hostname("host.docker.internal"));
+        // What Docker takes, Kiri takes: Compose files name hosts like these.
+        for ok in ["my_app", "My.Host_1", "-db", "db-", "a..b", "db."] {
+            assert!(super::valid_hostname(ok), "{ok}");
+        }
+        for bad in ["db\n1.2.3.4 evil", "db\r", "db\tx", "db\0", ""] {
+            assert!(!super::valid_hostname(bad), "{bad:?}");
+        }
+        // A hosts name is as free as Docker leaves it, short of a control character.
+        assert!(super::valid_hosts_name("my_app.local"));
+        assert!(super::valid_hosts_name("a b"), "Docker takes it: two names for one address");
+        for bad in ["db\t1.2.3.4 evil", "db\n", "db\r", "db\0", ""] {
+            assert!(!super::valid_hosts_name(bad), "{bad:?}");
+        }
     }
 }

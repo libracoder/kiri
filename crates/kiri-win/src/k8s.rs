@@ -516,7 +516,13 @@ fn stop(say: &dyn Fn(&str)) -> io::Result<()> {
 /// `kiri k8s delete`: the node, its volume, the kubeconfig and the context.
 fn delete_cluster(say: &dyn Fn(&str)) -> io::Result<()> {
     let _ = client::request("DELETE", &format!("/containers/{NAME}?force=1"), None)?;
-    let _ = client::request("DELETE", &format!("/volumes/{VOLUME}"), None)?;
+    // An explicit delete: forced, so a damaged container list (which makes
+    // the engine refuse removals it can't vouch for) doesn't keep it; any
+    // other refusal is said, not reported as deleted.
+    let r = client::request("DELETE", &format!("/volumes/{VOLUME}?force=1"), None)?;
+    if !r.ok() && r.status != 404 {
+        return Err(io::Error::other(format!("Kubernetes' state (volume {VOLUME}) was not deleted: {}", r.error())));
+    }
     let _ = std::fs::remove_file(state_dir()?.join("kubeconfig"));
     if let Err(e) = forget() {
         say(&format!("could not remove kubectl context `{}` ({e})", context()));

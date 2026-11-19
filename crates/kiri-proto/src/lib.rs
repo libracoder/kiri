@@ -38,8 +38,11 @@ pub const INPUT_WINDOW: usize = 4 << 20;
 /// `UsageQuery`, which has no reply: an older agent's "unexpected" error
 /// would be taken as the reply to the next request. 5 added `RunSpec::seccomp`,
 /// the container's own seccomp program: an older agent would ignore it and
-/// run the container under the default filter instead of its profile.
-pub const PROTOCOL: u16 = 5;
+/// run the container under the default filter instead of its profile. 6
+/// added `Started::starting` and `AwaitStart`: an older host would read a
+/// start still filling a new volume as started, and let an exec in before
+/// the container's root is in place.
+pub const PROTOCOL: u16 = 6;
 
 // `Run` is the one big message and is built and read once per container.
 #[allow(clippy::large_enum_variant)]
@@ -68,7 +71,14 @@ pub enum Msg<'a> {
     /// Host → guest: start a container. Answered by `Started` (or `Error`),
     /// then any number of `Output`, then `Exited`.
     Run(RunSpec<'a>),
-    Started { id: &'a str, pid: u32 },
+    /// `starting`: the container's process is running but its root is not
+    /// in place yet (a new volume is still being filled); ask `AwaitStart`
+    /// until it is. Always false for an exec, and from older agents.
+    Started { id: &'a str, pid: u32, starting: bool },
+    /// Host → guest: is the root of a container that started `starting` in
+    /// place now? Answered by `Started` for that container (`starting`
+    /// false once it is), or `Error` when it is not running.
+    AwaitStart { id: &'a str },
     Output { id: &'a str, stream: Stream, data: &'a [u8] },
     Exited(Exited<'a>),
     /// Host → guest: send `signal` to the container's process. No reply;
@@ -689,6 +699,7 @@ mod kind {
     pub const USB_NODES_QUERY: u16 = 76;
     pub const USB_NODES: u16 = 77;
     pub const FS_EVENTS: u16 = 78;
+    pub const AWAIT_START: u16 = 79;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -917,10 +928,15 @@ impl Msg<'_> {
                 o.extend_from_slice(r.opts.raw);
                 put_bytes(o, r.seccomp);
             }),
-            Msg::Started { id, pid } => frame(out, kind::STARTED, |o| {
+            Msg::Started { id, pid, starting } => frame(out, kind::STARTED, |o| {
                 put_str(o, id);
                 put_u32(o, pid);
+                // Only when set: a normal start's frame stays as it was.
+                if starting {
+                    o.push(1);
+                }
             }),
+            Msg::AwaitStart { id } => frame(out, kind::AWAIT_START, |o| put_str(o, id)),
             Msg::Output { id, stream, data } => frame(out, kind::OUTPUT, |o| {
                 put_str(o, id);
                 o.push(stream as u8);
@@ -1226,7 +1242,13 @@ pub fn decode(frame: &[u8]) -> Result<Msg<'_>, DecodeError> {
             }
             run
         }),
-        kind::STARTED => Msg::Started { id: r.str()?, pid: r.u32()? },
+        kind::STARTED => Msg::Started {
+            id: r.str()?,
+            pid: r.u32()?,
+            // An older agent doesn't say: its root was in place.
+            starting: r.remaining() >= 1 && r.u8()? != 0,
+        },
+        kind::AWAIT_START => Msg::AwaitStart { id: r.str()? },
         kind::OUTPUT => {
             let id = r.str()?;
             let stream = match r.u8()? {
@@ -1362,7 +1384,20 @@ mod tests {
         round(Msg::LayerStatus(true));
         round(Msg::LayerBegin(LayerBegin { digest: "sha256:ab", media_type: "x+gzip", size: 9 }));
         round(Msg::LayerStored(LayerStored { unpacked_bytes: 1, elapsed_ns: 2 }));
-        round(Msg::Started { id: "c1", pid: 42 });
+        round(Msg::Started { id: "c1", pid: 42, starting: false });
+        round(Msg::Started { id: "c1", pid: 42, starting: true });
+        // A normal start's frame is the one older agents send; and an older
+        // agent's Started, without the flag, reads as root in place.
+        let mut buf = Vec::new();
+        Msg::Started { id: "c1", pid: 42, starting: true }.encode(&mut buf);
+        let mut old = buf[..buf.len() - 1].to_vec();
+        let len = (old.len() - 4) as u32;
+        old[..4].copy_from_slice(&len.to_le_bytes());
+        assert_eq!(decode(&old).unwrap(), Msg::Started { id: "c1", pid: 42, starting: false });
+        let mut normal = Vec::new();
+        Msg::Started { id: "c1", pid: 42, starting: false }.encode(&mut normal);
+        assert_eq!(normal, old, "a normal start's frame is unchanged");
+        round(Msg::AwaitStart { id: "c1" });
         round(Msg::Output { id: "c1", stream: Stream::Stderr, data: b"hi\n" });
         round(Msg::Exited(Exited { id: "c1", code: -1, setup_ns: 3, run_ns: 4, oom_killed: false }));
         round(Msg::Exited(Exited { id: "c1", code: 137, setup_ns: 3, run_ns: 4, oom_killed: true }));
@@ -1404,6 +1439,19 @@ mod tests {
         let mut again = Vec::new();
         Msg::Run(r).encode(&mut again);
         assert_eq!(buf, again);
+    }
+
+    #[test]
+    fn the_protocol_version_covers_starting() {
+        // A host from before `Started::starting` would take a start still
+        // filling a new volume for started and never ask `AwaitStart`; it
+        // speaks 5, and refuses this agent (and this host refuses an agent
+        // that speaks 5, which never answers `starting`).
+        const { assert!(PROTOCOL >= 6) };
+        let mut buf = Vec::new();
+        Msg::Hello(Hello { protocol: PROTOCOL, init_start_ns: 1, ready_ns: 2, mem_total_kib: 3, mem_available_kib: 4 }).encode(&mut buf);
+        let Msg::Hello(h) = decode(&buf).unwrap() else { panic!() };
+        assert_eq!(h.protocol, 6);
     }
 
     #[test]

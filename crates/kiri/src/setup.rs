@@ -101,7 +101,8 @@ pub fn launched_from_app() -> bool {
 /// The first time the app opens: the same as `kiri setup`, quietly, except
 /// `*.kiri.local`, which the window offers and the user chooses.
 pub fn first_launch() -> io::Result<()> {
-    if agent_plist()?.is_file() && agent_runs_this()? {
+    let set_up = agent_plist().and_then(|p| Ok(p.is_file() && agent_runs_this()?)).map_err(step("checking how Kiri starts at login"))?;
+    if set_up {
         // Set up by an older Kiri: make sure the commands are there too.
         if let Some(contents) = bundle_contents() {
             let _ = bundled_cli(&contents);
@@ -113,6 +114,12 @@ pub fn first_launch() -> io::Result<()> {
         return Ok(());
     }
     run(&["--no-domains".to_owned()])
+}
+
+/// Each step's error says which step it was: on first launch it is all the
+/// log has to go on (#250).
+fn step(what: &'static str) -> impl Fn(io::Error) -> io::Error {
+    move |e| io::Error::new(e.kind(), format!("{what}: {e}"))
 }
 
 pub fn run(args: &[String]) -> io::Result<()> {
@@ -131,20 +138,15 @@ pub fn run(args: &[String]) -> io::Result<()> {
         println!("{}", docker_socket_fallback(&crate::daemon::socket_path()?));
         return result;
     }
-    let socket = crate::daemon::socket_path()?;
-    context(&socket)?;
+    let socket = crate::daemon::socket_path().map_err(step("finding the engine's socket"))?;
+    context(&socket).map_err(step("adding the kiri docker context"))?;
     println!("docker context `{CONTEXT}` → unix://{}", socket.display());
     if flag("--use") && !dev() {
-        let path = docker_dir()?.join("config.json");
-        let mut cfg = read_json(&path)?;
+        let path = docker_dir().map(|d| d.join("config.json")).map_err(step("making kiri docker's current context"))?;
+        let mut cfg = read_json(&path).map_err(step("making kiri docker's current context"))?;
         cfg["currentContext"] = CONTEXT.get().into();
-        write_json(&path, &cfg)?;
+        write_json(&path, &cfg).map_err(step("making kiri docker's current context"))?;
         println!("docker now uses Kiri by default (`docker context use default` to switch back)");
-    }
-    // Each step's error says which step it was: on first launch it is all
-    // the log has to go on (#250).
-    fn step(what: &'static str) -> impl Fn(io::Error) -> io::Error {
-        move |e| io::Error::new(e.kind(), format!("{what}: {e}"))
     }
     if let Some(contents) = bundle_contents() {
         bundled_cli(&contents).map_err(step("setting up the kiri and docker commands"))?;
@@ -985,6 +987,33 @@ mod tests {
         assert!(std::fs::read_to_string(h.join(".zprofile")).unwrap().contains(super::PROFILE_MARK), "the other profiles still get the line");
         super::remove_shell_path(&h, &h).unwrap();
         let _ = std::fs::remove_dir_all(&h);
+    }
+
+    // #250, as Nix home-manager sets a Mac up: a profile Kiri can read but
+    // not write (a link into a read-only store) is passed over, whether or
+    // not Kiri's line is in it already, and the other profiles get the line.
+    #[test]
+    fn a_read_only_profile_does_not_stop_setup() {
+        use std::os::unix::fs::PermissionsExt;
+        let with_line = format!("# managed elsewhere\n\n{}\n{}\n", super::PROFILE_MARK, super::SH_LINE);
+        for (round, text) in ["# managed elsewhere\n", with_line.as_str()].into_iter().enumerate() {
+            let h = scratch(&format!("readonly{round}"));
+            let managed = h.join("store/zshrc");
+            std::fs::create_dir_all(h.join("store")).unwrap();
+            std::fs::write(&managed, text).unwrap();
+            std::fs::set_permissions(&managed, std::fs::Permissions::from_mode(0o444)).unwrap();
+            // root writes through the mode: nothing read-only to try then.
+            if std::fs::OpenOptions::new().append(true).open(&managed).is_ok() {
+                let _ = std::fs::remove_dir_all(&h);
+                return;
+            }
+            std::os::unix::fs::symlink(&managed, h.join(".zshrc")).unwrap();
+            super::shell_path(&h, &h).unwrap();
+            assert_eq!(std::fs::read_to_string(&managed).unwrap(), text, "the read-only profile is as it was");
+            assert!(std::fs::read_link(h.join(".zshrc")).is_ok(), "the user's link stays a link");
+            assert!(std::fs::read_to_string(h.join(".zprofile")).unwrap().contains(super::PROFILE_MARK), "the other profiles still get the line");
+            let _ = std::fs::remove_dir_all(&h);
+        }
     }
 
     // A profile Kiri can't read as text is left exactly as it was, never

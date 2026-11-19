@@ -129,6 +129,14 @@ pub fn step_aside(port: u16) -> bool {
     stepped
 }
 
+/// Whether a router serves `port` now. Containers reach the Mac's loopback
+/// through host.docker.internal (ports::host_bound), and the router routes
+/// by Host header alone: through it a container would reach every other
+/// container, whatever network it is on.
+pub fn routes(port: u16) -> bool {
+    ROUTERS.lock().unwrap_or_else(PoisonError::into_inner).iter().any(|r| r.port == port && !r.serving.lock().unwrap_or_else(PoisonError::into_inner).is_empty())
+}
+
 /// Every few seconds, a router that stepped aside tries its port again.
 fn reclaim() {
     loop {
@@ -370,12 +378,19 @@ fn route(client: &mut impl ReadWrite, engine: &Engine, scheme: &str) -> io::Resu
         .find_map(|l| l.split_once(':').filter(|(k, _)| k.eq_ignore_ascii_case("host")).map(|(_, v)| v.trim().to_owned()))
         .unwrap_or_default();
     let Some(target) = engine.route(&host) else {
-        let list: String = engine.domains().iter().map(|d| { let d = escape(d); format!("<li><a href=\"{scheme}://{d}\">{d}</a></li>") }).collect();
+        // The running containers are listed only for this machine's own
+        // names. A page reached through DNS rebinding asks with its own
+        // domain as the Host, and could read the list from this answer.
+        let running = if local_host(&host) {
+            let list: String = engine.domains().iter().map(|d| { let d = escape(d); format!("<li><a href=\"{scheme}://{d}\">{d}</a></li>") }).collect();
+            format!("<p>Running containers:</p><ul>{}</ul>", if list.is_empty() { "<li>none</li>".to_owned() } else { list })
+        } else {
+            String::new()
+        };
         let body = format!(
             "<!doctype html><meta charset=utf-8><title>Kiri</title><body style=\"font:15px -apple-system,sans-serif;margin:40px\">\
-             <h1>No running container for {}</h1><p>Running containers:</p><ul>{}</ul>",
+             <h1>No running container for {}</h1>{running}",
             escape(&host),
-            if list.is_empty() { "<li>none</li>".to_owned() } else { list }
         );
         respond(client, 404, "Not Found", &body)?;
         return Ok(None);
@@ -568,6 +583,24 @@ fn respond(client: &mut impl Write, status: u16, reason: &str, body: &str) -> io
     )
 }
 
+/// Whether a request's Host is a name for this machine itself: `localhost`,
+/// anything under `.localhost` (which always resolves to loopback), a
+/// `.kiri.local` name, or a loopback address. Another site's domain is not,
+/// even when its DNS answers with 127.0.0.1.
+fn local_host(host: &str) -> bool {
+    let host = host.trim();
+    // Without the port: `[::1]:80`, `127.0.0.1:80`, `web.kiri.localhost:8080`.
+    let name = match host.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or(""),
+        None => match host.rsplit_once(':') {
+            Some((name, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => name,
+            _ => host,
+        },
+    };
+    let name = name.trim_end_matches('.').to_ascii_lowercase();
+    name == "localhost" || name.ends_with(".localhost") || name.ends_with(".kiri.local") || name.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
 fn escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
@@ -575,6 +608,18 @@ fn escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{candidates, choose, Target};
+
+    /// The "no such container" page lists the running containers for this
+    /// machine's own names only: a rebinding page's Host is its own domain.
+    #[test]
+    fn only_this_machines_names_get_the_container_list() {
+        for local in ["localhost", "localhost:80", "nope.kiri.localhost", "NOPE.Kiri.Localhost:8080", "web.shop.kiri.local", "api.kiri.local:18780", "127.0.0.1", "127.0.0.1:80", "[::1]", "[::1]:443", "anything.localhost."] {
+            assert!(super::local_host(local), "{local}");
+        }
+        for foreign in ["", "rebind.example.com", "rebind.example.com:80", "kiri.localhost.example.com", "localhost.example.com", "192.168.1.10", "10.0.0.1:80", "[2001:db8::1]:80", "notlocalhost", "kiri.local.evil.io"] {
+            assert!(!super::local_host(foreign), "{foreign}");
+        }
+    }
 
     fn t(label: Option<u16>, published: &[u16], exposed: &[u16]) -> Target {
         Target { ip: [0; 4], id: String::new(), label, published: published.to_vec(), exposed: exposed.to_vec() }

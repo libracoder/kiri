@@ -23,8 +23,9 @@ use kiri_vmm::Vm;
 pub enum Reply {
     LayerStatus(bool),
     LayerStored,
-    /// The process's PID, as the agent's kernel numbers it.
-    Started(u32),
+    /// The process's PID, as the agent's kernel numbers it, and whether
+    /// its root is still being made (see `VmLink::run`).
+    Started(u32, bool),
     Stats(Stats),
     Pong,
     FsStat(FileInfo),
@@ -261,7 +262,7 @@ impl VmLink {
                     }
                     Ok(Msg::LayerStatus(have)) => Reply::LayerStatus(have),
                     Ok(Msg::LayerStored(_)) => Reply::LayerStored,
-                    Ok(Msg::Started { pid, .. }) => Reply::Started(pid),
+                    Ok(Msg::Started { pid, starting, .. }) => Reply::Started(pid, starting),
                     Ok(Msg::Stats(s)) => Reply::Stats(s),
                     Ok(Msg::Pong(_)) => Reply::Pong,
                     Ok(Msg::FsStat(e)) => Reply::FsStat(FileInfo::from(e)),
@@ -385,7 +386,19 @@ impl VmLink {
         seccomp: &[u8],
     ) -> io::Result<u32> {
         self.windows.open(id);
-        let r = self.call(|o| kiri_proto::encode_run(o, id, layers, argv, env, cwd, user, hostname, flags, net, mounts, limits, caps, opts, seccomp), None).and_then(started);
+        // Its process runs, but its root may not be in place yet (a new
+        // volume is being filled): the agent answered at once rather than
+        // stall every other container meanwhile. The start is reported only
+        // once an exec can enter it (#311), or fails as a start.
+        let r = self
+            .call(|o| kiri_proto::encode_run(o, id, layers, argv, env, cwd, user, hostname, flags, net, mounts, limits, caps, opts, seccomp), None)
+            .and_then(started)
+            .and_then(|(pid, starting)| {
+                if starting {
+                    wait_started(|| self.call(|o| Msg::AwaitStart { id }.encode(o), None), std::thread::sleep)?;
+                }
+                Ok(pid)
+            });
         if r.is_err() {
             self.windows.close(id);
         }
@@ -458,7 +471,7 @@ impl VmLink {
     #[allow(clippy::too_many_arguments)]
     pub fn exec(&self, container_id: &str, exec_id: &str, argv: &[String], env: &[String], cwd: &str, user: &str, flags: u32, caps: u64, opts: &[String]) -> io::Result<u32> {
         self.windows.open(exec_id);
-        let r = self.call(|o| kiri_proto::encode_exec(o, container_id, exec_id, argv, env, cwd, user, flags, caps, opts), None).and_then(started);
+        let r = self.call(|o| kiri_proto::encode_exec(o, container_id, exec_id, argv, env, cwd, user, flags, caps, opts), None).and_then(started).map(|(pid, _)| pid);
         if r.is_err() {
             self.windows.close(exec_id);
         }
@@ -644,12 +657,40 @@ impl VmLink {
     }
 }
 
-/// The PID a `Run` or `Exec` was answered with.
-fn started(r: Reply) -> io::Result<u32> {
+/// The PID a `Run` or `Exec` was answered with, and whether its root is
+/// still being made.
+fn started(r: Reply) -> io::Result<(u32, bool)> {
     match r {
-        Reply::Started(pid) => Ok(pid),
+        Reply::Started(pid, starting) => Ok((pid, starting)),
         other => Err(io::Error::other(format!("expected Started, got {other:?}"))),
     }
+}
+
+/// The pauses between `AwaitStart` asks: the first at once, then 1, 2, 4,
+/// 8, 16 ms, then every 25 ms. Most volumes fill within the first few; a
+/// big one is noticed within 25 ms of being done.
+fn await_backoff() -> impl Iterator<Item = std::time::Duration> {
+    [0, 1, 2, 4, 8, 16].into_iter().chain(std::iter::repeat(25)).map(std::time::Duration::from_millis)
+}
+
+/// Asks (`ask` sends `AwaitStart`) until the agent says the root is in
+/// place. An error fails the start, as it would have failed the `Run`
+/// itself: the child ended before its root was ready (the agent answers
+/// with the child's own reason, and sends no `Exited`), or the VM stopped.
+/// No lock is held while it sleeps: `call` takes and lets go of its own for
+/// each ask.
+fn wait_started(mut ask: impl FnMut() -> io::Result<Reply>, mut sleep: impl FnMut(std::time::Duration)) -> io::Result<()> {
+    for pause in await_backoff() {
+        if !pause.is_zero() {
+            sleep(pause);
+        }
+        match ask()? {
+            Reply::Started(_, true) => {}
+            Reply::Started(_, false) => return Ok(()),
+            other => return Err(io::Error::other(format!("expected Started, got {other:?}"))),
+        }
+    }
+    unreachable!("the backoff never ends")
 }
 
 fn read_frame(conn: &mut File, buf: &mut Vec<u8>) -> io::Result<()> {
@@ -665,6 +706,24 @@ fn read_frame(conn: &mut File, buf: &mut Vec<u8>) -> io::Result<()> {
 mod tests {
     use super::*;
     use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn a_starting_container_is_asked_about_until_its_root_is_in_place() {
+        use std::time::Duration;
+        let ms = |v: &[u64]| v.iter().map(|&m| Duration::from_millis(m)).collect::<Vec<_>>();
+        assert_eq!(await_backoff().take(9).collect::<Vec<_>>(), ms(&[0, 1, 2, 4, 8, 16, 25, 25, 25]));
+        // Starting twice, then in place: three asks, the first at once.
+        let mut answers = vec![Reply::Started(7, false), Reply::Started(7, true), Reply::Started(7, true)];
+        let (mut asks, mut slept) = (0, Vec::new());
+        assert!(wait_started(|| { asks += 1; Ok(answers.pop().unwrap()) }, |d| slept.push(d)).is_ok());
+        assert_eq!((asks, slept), (3, ms(&[1, 2])));
+        // An error (the child failed before its root was ready, the VM
+        // stopped) ends the wait and fails the start with it.
+        let mut answers = vec![Err(io::Error::other("run c1: mount /payload: No space left on device")), Ok(Reply::Started(7, true))];
+        let mut asks = 0;
+        let e = wait_started(|| { asks += 1; answers.pop().unwrap() }, |_| {}).unwrap_err();
+        assert_eq!((asks, e.to_string().as_str()), (2, "run c1: mount /payload: No space left on device"));
+    }
 
     #[test]
     fn a_failed_write_disconnects_before_the_reader_accounts_loss() {

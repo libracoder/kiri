@@ -286,6 +286,11 @@ pub fn rotated(path: &Path, n: usize) -> PathBuf {
 }
 
 fn append(part: Part, line: &str) -> io::Result<()> {
+    // Unit tests log too (a setup step that fails on purpose): never into
+    // the real ~/.kiri/logs of whoever runs them.
+    if cfg!(test) {
+        return Ok(());
+    }
     let path = log_path(part).ok_or_else(|| io::Error::other("HOME is not set"))?;
     append_to(&path, line, MAX_LOG)
 }

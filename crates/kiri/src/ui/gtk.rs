@@ -197,6 +197,31 @@ pub(super) fn paste(done: impl FnOnce(String) + Send + 'static) {
     });
 }
 
+/// Open a compose file…: GTK's own file chooser (the desktop's portal when
+/// there is one), on GTK's main thread. Compose's file names first, any
+/// YAML file second. `done` gets the path, or None when cancelled.
+pub(super) fn pick_compose_file(title: &str, filters: &[String; 2], done: impl FnOnce(Option<std::path::PathBuf>) + Send + 'static) {
+    let (title, filters) = (title.to_owned(), filters.clone());
+    glib::MainContext::default().invoke(move || {
+        let parent = WINDOW.with(|v| v.borrow().clone());
+        let dialog = gtk::FileChooserNative::new(Some(&title), parent.as_ref(), gtk::FileChooserAction::Open, None, None);
+        let names = gtk::FileFilter::new();
+        names.set_name(Some(&filters[0]));
+        for p in super::compose::FILE_NAMES {
+            names.add_pattern(p);
+        }
+        let yaml = gtk::FileFilter::new();
+        yaml.set_name(Some(&filters[1]));
+        yaml.add_pattern("*.yaml");
+        yaml.add_pattern("*.yml");
+        dialog.add_filter(names);
+        dialog.add_filter(yaml);
+        let picked = if dialog.run() == gtk::ResponseType::Accept { dialog.filename() } else { None };
+        dialog.destroy();
+        done(picked);
+    });
+}
+
 /// The installed font families, sorted; `mono` keeps the fixed-pitch ones.
 pub(super) fn font_families(mono: bool) -> Vec<String> {
     let spacing = if mono { ":spacing=mono" } else { ":" };

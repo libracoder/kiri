@@ -81,7 +81,21 @@ t volume "kept" "docker run --rm -v lhv:/d alpine sh -c 'echo kept > /d/f' && do
 # `docker run -d` must not return before the container's root is in place, or
 # an immediate exec resolves users against the host's /etc/passwd (#311).
 t volume-user-ready "passed passed passed" "docker run --name ready-seed alpine sh -c 'adduser -D dev && mkdir /payload && dd if=/dev/zero of=/payload/blob bs=1M count=64' >/dev/null && docker commit -c 'USER dev' ready-seed kiri-test/ready:1 >/dev/null && docker rm -f ready-seed >/dev/null; for i in 1 2 3; do v=ready-vol-\$i; c=\$(docker run -d --mount type=volume,source=\$v,target=/payload kiri-test/ready:1 sleep 60); if docker exec --user dev \$c id >/dev/null 2>&1; then printf 'passed '; else printf 'failed '; fi; docker rm -f \$c >/dev/null; docker volume rm \$v >/dev/null 2>&1; done; docker rmi kiri-test/ready:1 >/dev/null; echo"
+# A start that fills a new volume from a big image folder still waits for the
+# fill (#311), but the engine keeps serving every other container meanwhile;
+# an exec sent to it meanwhile waits for it, a pause, a commit and a
+# container joining its network sent meanwhile all finish, and a start that
+# fails during the fill is still a start error with a whole volume
+# (tests/start-stall.sh).
+$D cp "$(dirname "$0")/start-stall.sh" "$N":/start-stall.sh >/dev/null
+# Here the engine's own root is the test's: a copy into the container while
+# it is still starting must not land in it.
+t start-stall-exec "pass:" "sh /start-stall.sh cp"
 t memory-limit "67108864" "docker run --rm --memory 64m alpine cat /sys/fs/cgroup/memory.max"
+# A working directory through one of the agent's descriptors is refused, and
+# before that nothing is made outside the container: the missing directory
+# was created as root while the container's cgroup directory was still open.
+t workdir-made-inside-root "outside 0" "find /sys/fs/cgroup /var/lib/kiri /run -name kiri-wd-probe -exec rmdir {} + 2>/dev/null; for n in \$(seq 3 25); do for p in kiri-wd-probe ../kiri-wd-probe; do docker run --rm -w /proc/self/fd/\$n/\$p alpine true >/dev/null 2>&1; done; done; echo outside \$(find /sys/fs/cgroup /var/lib/kiri /run -name kiri-wd-probe 2>/dev/null | wc -l)"
 t seccomp "Seccomp:	2" "docker run --rm alpine grep Seccomp: /proc/self/status"
 t udp "10.9.8.7" "docker run -d --name dns -p 15354:53/udp alpine sh -c 'apk add -q dnsmasq >/dev/null 2>&1; dnsmasq -k --address=/kiri.test/10.9.8.7' >/dev/null; for i in \$(seq 40); do out=\$(nslookup -port=15354 kiri.test 127.0.0.1 2>/dev/null) && break; sleep 0.5; done; echo \"\$out\" | grep -o 10.9.8.7"
 t ipv6-network "true" "docker network create --ipv6 --subnet fd00:4c:1::/64 lh6 >/dev/null && docker network inspect lh6 -f '{{.EnableIPv6}}'"
@@ -158,7 +172,51 @@ t crash-setup "ok" "for p in always unless-stopped no; do docker run -d --name c
 t crash-kill "killed" "kill -9 \$(ps -o pid,ppid,comm | awk '\$2 == 1 && \$3 == \"kiri-init\" {print \$1}') && echo killed"
 t crash-recovers "cr-always=true cr-unless-stopped=true cr-no=false cr-user=false" "sleep 4; for c in cr-always cr-unless-stopped cr-no cr-user; do printf '%s=%s ' \$c \$(docker inspect -f '{{.State.Running}}' \$c); done"
 t crash-restart-count "1 1" "echo \$(docker inspect -f '{{.RestartCount}}' cr-always cr-unless-stopped)"
-t crash-cleanup "cr-always" "docker rm -f cr-always cr-unless-stopped cr-no cr-user"
+# Removing a container the crash stopped, or one never started, deletes its
+# writable layer from the engine's disk.
+t crash-rm-frees-layer "gone" "id=\$(docker inspect -f '{{.Id}}' cr-no); docker rm cr-no >/dev/null; for i in \$(seq 20); do test -e /var/lib/kiri/containers/\$id || break; sleep 0.1; done; test -e /var/lib/kiri/containers/\$id && echo kept || echo gone"
+t created-rm-frees-layer "gone" "id=\$(docker create alpine true); docker cp /etc/hostname \$id:/f >/dev/null; docker rm \$id >/dev/null; for i in \$(seq 20); do test -e /var/lib/kiri/containers/\$id || break; sleep 0.1; done; test -e /var/lib/kiri/containers/\$id && echo kept || echo gone"
+t crash-cleanup "cr-always" "docker rm -f cr-always cr-unless-stopped cr-user"
+# A containers.json cut short (a crash, a full disk) is kept aside as
+# containers.json.corrupt-*, the records still readable are loaded, and
+# nothing is deleted because of the damaged list: no log folder and no
+# writable layer, also once another container has started and after the
+# next start, which finds a readable but shorter list (#438).
+ST=/root/.local/share/kiri
+CJ="export DOCKER_HOST=unix:///root/.kiri/run/docker.sock"
+t cj-setup "ok" "docker run --name cj1 -v cjv1:/v alpine sh -c 'echo line-one; echo precious > /data' >/dev/null && docker run --name cj2 -v cjv2:/v alpine sh -c 'echo line-two; echo precious > /data' >/dev/null && echo ok"
+CJ_IDS=$($D exec "$N" sh -c "$CJ; docker inspect -f '{{.Id}}' cj1 cj2" | tr '\n' ' ')
+$D stop -t 20 "$N" >/dev/null
+# Cut inside the record of whichever of the two comes later in the file, so
+# the other one can still be read; print that one's id.
+CJ_READ=$($D run --rm -i --name "$N-edit" -e "IDS=$CJ_IDS" -v "$N"-store:/s alpine sh <<'SH'
+f=/s/containers.json
+set -- $IDS
+a=$(awk -v id="$1" '{print index($0, "{\"id\":\"" id "\"")}' $f)
+b=$(awk -v id="$2" '{print index($0, "{\"id\":\"" id "\"")}' $f)
+[ "$a" -gt 0 ] && [ "$b" -gt 0 ] || exit
+if [ "$a" -lt "$b" ]; then cut=$b read=$1; else cut=$a read=$2; fi
+truncate -s $((cut + 20)) $f && echo "$read"
+SH
+)
+$D start "$N" >/dev/null; up
+CJ_KEPT="n=0; for id in $CJ_IDS; do test -d $ST/containers/\$id && test -d /var/lib/kiri/containers/\$id && n=\$((n+1)); done; echo kept \$n"
+t cj-copy-kept "containers.json.corrupt-" "ls $ST"
+t cj-info-warns "containers.json.corrupt-" "docker info --format '{{json .Warnings}}'"
+t cj-readable-listed "${CJ_READ:-no id read}" "docker ps -a -q --no-trunc"
+t cj-nothing-deleted "kept 2" "$CJ_KEPT"
+t cj-nothing-deleted-after-run "kept 2" "docker run --rm alpine true; $CJ_KEPT"
+t cj-readable-logs "line-" "docker logs ${CJ_READ:-none}"
+t cj-readable-files "precious" "docker cp ${CJ_READ:-none}:/data - | tar -xO"
+# The cut container's volume is used by no listed container: neither a
+# prune nor a removal without --force takes it while the list is damaged.
+t cj-prune-refused "were not pruned" "docker volume prune -af 2>&1"
+t cj-prune-kept-volumes "volumes 2" "echo volumes \$(docker volume ls -q | grep -c '^cjv')"
+t cj-volume-rm-refused "was not removed" "docker volume rm cjv1 cjv2 2>&1"
+t cj-volume-rm-kept-volumes "volumes 2" "echo volumes \$(docker volume ls -q | grep -c '^cjv')"
+$D restart -t 20 "$N" >/dev/null; up
+t cj-next-start-deletes-nothing "kept 2" "docker run --rm alpine true; $CJ_KEPT"
+t cj-cleanup "done" "docker rm -f cj1 cj2 >/dev/null 2>&1; docker volume rm -f cjv1 cjv2 >/dev/null 2>&1; for id in $CJ_IDS; do rm -rf $ST/containers/\$id /var/lib/kiri/containers/\$id; done; rm -f $ST/containers.json.corrupt-*; echo done"
 $D rm -f "$N" >/dev/null
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" = 0 ]

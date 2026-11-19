@@ -379,6 +379,11 @@ fn container_prune(req: &Request, engine: &Engine) -> Result<Value, Error> {
 }
 
 fn image_prune(req: &Request, engine: &Engine) -> Result<Value, Error> {
+    // While the container list may be missing containers, "unused" can't
+    // be told; say so rather than quietly pruning less.
+    if let Some(why) = engine.refusal("Images were not pruned, because the container list may be missing containers that use them") {
+        return Err(Error::Conflict(why));
+    }
     let f = filters(req, &["dangling", "until", "label", "label!"])?;
     // Without `-a` only untagged images go; Kiri keeps none of those around.
     let dangling_only = f.bool("dangling").unwrap_or(true);
@@ -667,6 +672,30 @@ fn events(req: &Request, engine: &Engine, w: &mut UnixStream) -> io::Result<Next
 #[cfg(test)]
 mod disk_usage_tests {
     use super::DiskUsage;
+
+    /// While the container list is damaged an image no listed container
+    /// uses may be a lost container's: image prune removes none.
+    #[test]
+    fn image_prune_removes_nothing_while_the_container_list_is_damaged() {
+        use super::{Error, Request};
+        let root = std::env::temp_dir().join(format!("kiri-image-prune-damaged-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("containers.json.corrupt-1-0"), b"[{\"id\":").unwrap();
+        let engine = super::super::engine::boot_without_vm(&root);
+        let image = kiri_image::Image {
+            name: "sha256:0123".into(), digest: "sha256:0123".into(), index_digest: None, config_digest: "sha256:0123".into(),
+            layers: Vec::new(), size: 0, platform: "linux/arm64".into(), created: String::new(), pulled_at: 0, config: Default::default(),
+        };
+        engine.store.put_image(image).unwrap();
+        match super::image_prune(&Request::internal("POST", "/images/prune", &[], Vec::new()), &engine) {
+            Err(Error::Conflict(why)) => assert!(why.starts_with("Images were not pruned") && why.contains("containers.json.corrupt-1-0"), "{why}"),
+            other => panic!("image prune: {other:?}"),
+        }
+        assert_eq!(engine.store.images().unwrap().len(), 1, "the image is kept");
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn reads_each_kind_and_skips_bad_lines() {

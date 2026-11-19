@@ -160,27 +160,10 @@ enum Index {
     Corrupt(Vec<u8>, serde_json::Error),
 }
 
-/// The images that can still be read from a damaged index: its complete
-/// leading records. That is everything when a shorter rewrite left old bytes
-/// after a complete array (the document ends early, the records are whole),
-/// and the records before the cut when the file was truncated.
+/// The images that can still be read from a damaged index, see
+/// [`crate::jsonfile::salvage`].
 fn salvage(bytes: &[u8]) -> Vec<Image> {
-    let Some(mut rest) = bytes.trim_ascii_start().strip_prefix(b"[") else {
-        return Vec::new();
-    };
-    let mut images = Vec::new();
-    loop {
-        rest = rest.trim_ascii_start();
-        rest = rest.strip_prefix(b",").unwrap_or(rest);
-        let mut records = serde_json::Deserializer::from_slice(rest).into_iter::<Image>();
-        match records.next() {
-            Some(Ok(image)) => {
-                images.push(image);
-                rest = &rest[records.byte_offset()..];
-            }
-            _ => return images,
-        }
-    }
+    crate::jsonfile::salvage(bytes)
 }
 
 /// The filesystem-safe hexadecimal part of a SHA-256 digest.
@@ -324,14 +307,7 @@ impl Store {
     /// layer lists, are not kept on the host: only the index itself can say
     /// which image a blob belongs to.
     fn recover(&self, bytes: &[u8], error: &serde_json::Error) -> Vec<Image> {
-        let secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
-        let aside = self.root.join(format!(
-            "images.json.corrupt-{secs}-{}",
-            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        let moved = fs::rename(self.root.join("images.json"), &aside);
+        let moved = crate::jsonfile::move_aside(&self.root.join("images.json"));
         let images = salvage(bytes);
         let written = if images.is_empty() {
             Ok(())
@@ -339,7 +315,7 @@ impl Store {
             self.write_index(&images)
         };
         let kept = match &moved {
-            Ok(()) => format!("moved to {}", aside.display()),
+            Ok(aside) => format!("moved to {}", aside.display()),
             Err(e) => format!("not moved aside: {e}"),
         };
         let wrote = match &written {
@@ -400,26 +376,11 @@ impl Store {
         Ok(Some(removed))
     }
 
-    /// Replaces the index with `images`: written whole to a temporary file
-    /// of its own beside it, then renamed over it. The old file is replaced,
-    /// not overwritten in place, so no bytes of it can trail the new one.
+    /// Replaces the index with `images`, see [`crate::jsonfile::replace`].
     /// Callers hold the index lock.
     fn write_index(&self, images: &[Image]) -> io::Result<()> {
-        let tmp = self.root.join(format!(
-            "images.json.{}.{}.tmp",
-            std::process::id(),
-            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
         let bytes = serde_json::to_vec_pretty(images).map_err(io::Error::other)?;
-        let result = File::create(&tmp).and_then(|mut f| {
-            f.write_all(&bytes)?;
-            f.sync_all()?;
-            fs::rename(&tmp, self.root.join("images.json"))
-        });
-        if result.is_err() {
-            let _ = fs::remove_file(&tmp);
-        }
-        result
+        crate::jsonfile::replace(&self.root.join("images.json"), &bytes, crate::jsonfile::Durable::Now)
     }
 }
 

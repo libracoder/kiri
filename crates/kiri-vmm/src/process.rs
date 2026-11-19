@@ -26,7 +26,7 @@ pub struct Config {
     pub console: Option<OwnedFd>,
     pub agent_port: u32,
     pub disk: Option<PathBuf>,
-    pub share: Option<(PathBuf, String)>,
+    pub share: Option<crate::Share>,
     pub rosetta_tag: Option<String>,
     pub nat_mac: Option<String>,
 }
