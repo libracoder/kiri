@@ -1825,5 +1825,17 @@
   "{n} more in <a>Compose projects</a>": "另有 {n} 个在 <a>Compose 项目</a>中",
   "Your only container is in a <a>Compose project</a>": "你唯一的容器在 <a>Compose 项目</a>中",
   "All {n} containers are in <a>Compose projects</a>": "全部 {n} 个容器都在 <a>Compose 项目</a>中",
+  "Skipped until Kiri next opens": "已跳过，下次打开 Kiri 时再询问",
+  "Couldn't add the kiri docker context": "无法添加 kiri docker 上下文",
+  "The kiri and docker commands": "kiri 和 docker 命令",
+  "Ready in any new terminal": "在任何新终端中都可使用",
+  "Couldn't add them to your shell": "无法将它们添加到你的 shell",
+  "Starts at login": "登录时启动",
+  "The engine starts when you log in": "登录时启动引擎",
+  "The engine runs from the app for now": "目前引擎从应用中运行",
+  "Show log": "显示日志",
+  "Continue anyway": "仍然继续",
+  "One step didn't work. Everything else is ready.": "有一个步骤未成功，其余均已就绪。",
+  "Some steps didn't work. Everything else is ready.": "有些步骤未成功，其余均已就绪。",
   "No matches": "没有匹配项"
 }

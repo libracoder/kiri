@@ -1825,5 +1825,17 @@
   "{n} more in <a>Compose projects</a>": "{n} til i <a>Compose-prosjekter</a>",
   "Your only container is in a <a>Compose project</a>": "Den eneste containeren din er i et <a>Compose-prosjekt</a>",
   "All {n} containers are in <a>Compose projects</a>": "Alle {n} containerne er i <a>Compose-prosjekter</a>",
+  "Skipped until Kiri next opens": "Hoppet over til Kiri åpnes neste gang",
+  "Couldn't add the kiri docker context": "Kunne ikke legge til kiri-konteksten i docker",
+  "The kiri and docker commands": "Kommandoene kiri og docker",
+  "Ready in any new terminal": "Klare i alle nye terminaler",
+  "Couldn't add them to your shell": "Kunne ikke legge dem til i skallet ditt",
+  "Starts at login": "Starter ved pålogging",
+  "The engine starts when you log in": "Motoren starter når du logger inn",
+  "The engine runs from the app for now": "Motoren kjører foreløpig fra appen",
+  "Show log": "Vis logg",
+  "Continue anyway": "Fortsett likevel",
+  "One step didn't work. Everything else is ready.": "Ett trinn fungerte ikke. Alt annet er klart.",
+  "Some steps didn't work. Everything else is ready.": "Noen trinn fungerte ikke. Alt annet er klart.",
   "No matches": "Ingen treff"
 }

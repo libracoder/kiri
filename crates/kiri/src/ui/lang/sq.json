@@ -1825,5 +1825,17 @@
   "{n} more in <a>Compose projects</a>": "Edhe {n} në <a>projekte Compose</a>",
   "Your only container is in a <a>Compose project</a>": "Kontejneri juaj i vetëm është në një <a>projekt Compose</a>",
   "All {n} containers are in <a>Compose projects</a>": "Të gjithë {n} kontejnerët janë në <a>projekte Compose</a>",
+  "Skipped until Kiri next opens": "Anashkaluar deri sa të hapet Kiri herën tjetër",
+  "Couldn't add the kiri docker context": "Konteksti kiri për docker nuk u shtua dot",
+  "The kiri and docker commands": "Komandat kiri dhe docker",
+  "Ready in any new terminal": "Gati në çdo terminal të ri",
+  "Couldn't add them to your shell": "Nuk u shtuan dot në shell-in tuaj",
+  "Starts at login": "Niset kur hyni",
+  "The engine starts when you log in": "Motori niset kur hyni në llogari",
+  "The engine runs from the app for now": "Për momentin motori punon nga aplikacioni",
+  "Show log": "Shfaq regjistrin",
+  "Continue anyway": "Vazhdo prapë",
+  "One step didn't work. Everything else is ready.": "Një hap nuk funksionoi. Gjithçka tjetër është gati.",
+  "Some steps didn't work. Everything else is ready.": "Disa hapa nuk funksionuan. Gjithçka tjetër është gati.",
   "No matches": "Asnjë përputhje"
 }

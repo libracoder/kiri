@@ -1825,5 +1825,17 @@
   "{n} more in <a>Compose projects</a>": "మరో {n} <a>Compose ప్రాజెక్ట్‌లలో</a>",
   "Your only container is in a <a>Compose project</a>": "మీ ఏకైక కంటైనర్ ఒక <a>Compose ప్రాజెక్ట్‌లో</a> ఉంది",
   "All {n} containers are in <a>Compose projects</a>": "మొత్తం {n} కంటైనర్‌లు <a>Compose ప్రాజెక్ట్‌లలో</a> ఉన్నాయి",
+  "Skipped until Kiri next opens": "Kiri తదుపరి తెరిచే వరకు దాటవేయబడింది",
+  "Couldn't add the kiri docker context": "kiri docker కాంటెక్స్ట్‌ను జోడించలేకపోయాం",
+  "The kiri and docker commands": "kiri మరియు docker కమాండ్‌లు",
+  "Ready in any new terminal": "ఏ కొత్త టెర్మినల్‌లోనైనా సిద్ధం",
+  "Couldn't add them to your shell": "వాటిని మీ షెల్‌కు జోడించలేకపోయాం",
+  "Starts at login": "లాగిన్ అయినప్పుడు ప్రారంభమవుతుంది",
+  "The engine starts when you log in": "మీరు లాగిన్ అయినప్పుడు ఇంజిన్ ప్రారంభమవుతుంది",
+  "The engine runs from the app for now": "ప్రస్తుతానికి ఇంజిన్ యాప్ నుండి నడుస్తోంది",
+  "Show log": "లాగ్ చూపించు",
+  "Continue anyway": "ఏదేమైనా కొనసాగించు",
+  "One step didn't work. Everything else is ready.": "ఒక దశ పని చేయలేదు. మిగతావన్నీ సిద్ధంగా ఉన్నాయి.",
+  "Some steps didn't work. Everything else is ready.": "కొన్ని దశలు పని చేయలేదు. మిగతావన్నీ సిద్ధంగా ఉన్నాయి.",
   "No matches": "సరిపోలికలు లేవు"
 }

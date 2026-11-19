@@ -1825,5 +1825,17 @@
   "{n} more in <a>Compose projects</a>": "{n} lisää <a>Compose-projekteissa</a>",
   "Your only container is in a <a>Compose project</a>": "Ainoa konttisi on <a>Compose-projektissa</a>",
   "All {n} containers are in <a>Compose projects</a>": "Kaikki {n} konttia ovat <a>Compose-projekteissa</a>",
+  "Skipped until Kiri next opens": "Ohitettu, kunnes Kiri avataan seuraavan kerran",
+  "Couldn't add the kiri docker context": "Dockerin kiri-kontekstia ei voitu lisätä",
+  "The kiri and docker commands": "Komennot kiri ja docker",
+  "Ready in any new terminal": "Valmiina jokaisessa uudessa päätteessä",
+  "Couldn't add them to your shell": "Niitä ei voitu lisätä komentotulkkiisi",
+  "Starts at login": "Käynnistyy kirjautuessa",
+  "The engine starts when you log in": "Moottori käynnistyy, kun kirjaudut sisään",
+  "The engine runs from the app for now": "Moottori toimii toistaiseksi sovelluksesta",
+  "Show log": "Näytä loki",
+  "Continue anyway": "Jatka silti",
+  "One step didn't work. Everything else is ready.": "Yksi vaihe ei onnistunut. Kaikki muu on valmista.",
+  "Some steps didn't work. Everything else is ready.": "Jotkin vaiheet eivät onnistuneet. Kaikki muu on valmista.",
   "No matches": "Ei osumia"
 }

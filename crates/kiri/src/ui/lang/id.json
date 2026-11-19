@@ -1825,5 +1825,17 @@
   "{n} more in <a>Compose projects</a>": "{n} lagi di <a>proyek Compose</a>",
   "Your only container is in a <a>Compose project</a>": "Satu-satunya kontainer Anda ada di <a>proyek Compose</a>",
   "All {n} containers are in <a>Compose projects</a>": "Semua {n} kontainer ada di <a>proyek Compose</a>",
+  "Skipped until Kiri next opens": "Dilewati sampai Kiri dibuka lagi",
+  "Couldn't add the kiri docker context": "Tidak bisa menambahkan konteks kiri untuk docker",
+  "The kiri and docker commands": "Perintah kiri dan docker",
+  "Ready in any new terminal": "Siap di terminal baru mana pun",
+  "Couldn't add them to your shell": "Tidak bisa menambahkannya ke shell Anda",
+  "Starts at login": "Mulai saat login",
+  "The engine starts when you log in": "Engine mulai saat Anda login",
+  "The engine runs from the app for now": "Untuk sementara engine berjalan dari aplikasi",
+  "Show log": "Tampilkan log",
+  "Continue anyway": "Tetap lanjutkan",
+  "One step didn't work. Everything else is ready.": "Satu langkah tidak berhasil. Yang lainnya sudah siap.",
+  "Some steps didn't work. Everything else is ready.": "Beberapa langkah tidak berhasil. Yang lainnya sudah siap.",
   "No matches": "Tidak ada yang cocok"
 }

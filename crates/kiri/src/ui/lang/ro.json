@@ -1825,5 +1825,17 @@
   "{n} more in <a>Compose projects</a>": "Încă {n} în <a>proiecte Compose</a>",
   "Your only container is in a <a>Compose project</a>": "Singurul container este într-un <a>proiect Compose</a>",
   "All {n} containers are in <a>Compose projects</a>": "Toate cele {n} containere sunt în <a>proiecte Compose</a>",
+  "Skipped until Kiri next opens": "Omis până la următoarea deschidere a Kiri",
+  "Couldn't add the kiri docker context": "Nu s-a putut adăuga contextul kiri pentru docker",
+  "The kiri and docker commands": "Comenzile kiri și docker",
+  "Ready in any new terminal": "Gata în orice terminal nou",
+  "Couldn't add them to your shell": "Nu s-au putut adăuga în shell-ul tău",
+  "Starts at login": "Pornește la autentificare",
+  "The engine starts when you log in": "Motorul pornește când te autentifici",
+  "The engine runs from the app for now": "Deocamdată motorul rulează din aplicație",
+  "Show log": "Arată jurnalul",
+  "Continue anyway": "Continuă oricum",
+  "One step didn't work. Everything else is ready.": "Un pas nu a funcționat. Restul este gata.",
+  "Some steps didn't work. Everything else is ready.": "Unii pași nu au funcționat. Restul este gata.",
   "No matches": "Nicio potrivire"
 }

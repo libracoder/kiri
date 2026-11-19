@@ -1825,5 +1825,17 @@
   "{n} more in <a>Compose projects</a>": "আরও {n}টি <a>Compose প্রজেক্টে</a>",
   "Your only container is in a <a>Compose project</a>": "আপনার একমাত্র কন্টেইনারটি একটি <a>Compose প্রজেক্টে</a>",
   "All {n} containers are in <a>Compose projects</a>": "সব {n}টি কন্টেইনার <a>Compose প্রজেক্টে</a>",
+  "Skipped until Kiri next opens": "Kiri পরেরবার খোলা পর্যন্ত এড়িয়ে যাওয়া হয়েছে",
+  "Couldn't add the kiri docker context": "kiri docker কনটেক্সট যোগ করা যায়নি",
+  "The kiri and docker commands": "kiri ও docker কমান্ড",
+  "Ready in any new terminal": "যেকোনো নতুন টার্মিনালে প্রস্তুত",
+  "Couldn't add them to your shell": "এগুলো আপনার শেলে যোগ করা যায়নি",
+  "Starts at login": "লগইনের সময় চালু হয়",
+  "The engine starts when you log in": "আপনি লগইন করলে ইঞ্জিন চালু হয়",
+  "The engine runs from the app for now": "আপাতত ইঞ্জিন অ্যাপ থেকে চলছে",
+  "Show log": "লগ দেখান",
+  "Continue anyway": "তবুও চালিয়ে যান",
+  "One step didn't work. Everything else is ready.": "একটি ধাপ কাজ করেনি। বাকি সব প্রস্তুত।",
+  "Some steps didn't work. Everything else is ready.": "কিছু ধাপ কাজ করেনি। বাকি সব প্রস্তুত।",
   "No matches": "কোনো মিল নেই"
 }

@@ -1825,5 +1825,17 @@
   "{n} more in <a>Compose projects</a>": "{n} ακόμη σε <a>έργα Compose</a>",
   "Your only container is in a <a>Compose project</a>": "Το μοναδικό σας container είναι σε <a>έργο Compose</a>",
   "All {n} containers are in <a>Compose projects</a>": "Και τα {n} containers είναι σε <a>έργα Compose</a>",
+  "Skipped until Kiri next opens": "Παραλείφθηκε μέχρι να ανοίξει ξανά το Kiri",
+  "Couldn't add the kiri docker context": "Δεν ήταν δυνατή η προσθήκη του περιβάλλοντος kiri του docker",
+  "The kiri and docker commands": "Οι εντολές kiri και docker",
+  "Ready in any new terminal": "Έτοιμες σε κάθε νέο τερματικό",
+  "Couldn't add them to your shell": "Δεν ήταν δυνατή η προσθήκη τους στο shell σας",
+  "Starts at login": "Ξεκινά κατά τη σύνδεση",
+  "The engine starts when you log in": "Η μηχανή ξεκινά όταν συνδέεστε",
+  "The engine runs from the app for now": "Προς το παρόν η μηχανή εκτελείται από την εφαρμογή",
+  "Show log": "Εμφάνιση αρχείου καταγραφής",
+  "Continue anyway": "Συνέχεια παρ' όλα αυτά",
+  "One step didn't work. Everything else is ready.": "Ένα βήμα δεν πέτυχε. Όλα τα υπόλοιπα είναι έτοιμα.",
+  "Some steps didn't work. Everything else is ready.": "Ορισμένα βήματα δεν πέτυχαν. Όλα τα υπόλοιπα είναι έτοιμα.",
   "No matches": "Δεν βρέθηκαν αντιστοιχίες"
 }

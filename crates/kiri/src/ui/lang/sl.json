@@ -1825,5 +1825,17 @@
   "{n} more in <a>Compose projects</a>": "Še {n} v <a>projektih Compose</a>",
   "Your only container is in a <a>Compose project</a>": "Vaš edini vsebnik je v <a>projektu Compose</a>",
   "All {n} containers are in <a>Compose projects</a>": "Vseh {n} vsebnikov je v <a>projektih Compose</a>",
+  "Skipped until Kiri next opens": "Preskočeno do naslednjega odprtja Kiri",
+  "Couldn't add the kiri docker context": "Konteksta kiri za docker ni bilo mogoče dodati",
+  "The kiri and docker commands": "Ukaza kiri in docker",
+  "Ready in any new terminal": "Pripravljena v vsakem novem terminalu",
+  "Couldn't add them to your shell": "Ni ju bilo mogoče dodati v vašo lupino",
+  "Starts at login": "Zažene se ob prijavi",
+  "The engine starts when you log in": "Pogon se zažene ob prijavi",
+  "The engine runs from the app for now": "Pogon zaenkrat teče iz aplikacije",
+  "Show log": "Pokaži dnevnik",
+  "Continue anyway": "Vseeno nadaljuj",
+  "One step didn't work. Everything else is ready.": "En korak ni uspel. Vse drugo je pripravljeno.",
+  "Some steps didn't work. Everything else is ready.": "Nekateri koraki niso uspeli. Vse drugo je pripravljeno.",
   "No matches": "Ni zadetkov"
 }

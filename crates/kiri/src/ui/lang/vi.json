@@ -1825,5 +1825,17 @@
   "{n} more in <a>Compose projects</a>": "Thêm {n} trong các <a>dự án Compose</a>",
   "Your only container is in a <a>Compose project</a>": "Container duy nhất của bạn nằm trong một <a>dự án Compose</a>",
   "All {n} containers are in <a>Compose projects</a>": "Cả {n} container đều nằm trong các <a>dự án Compose</a>",
+  "Skipped until Kiri next opens": "Đã bỏ qua cho đến lần mở Kiri tiếp theo",
+  "Couldn't add the kiri docker context": "Không thể thêm ngữ cảnh kiri cho docker",
+  "The kiri and docker commands": "Các lệnh kiri và docker",
+  "Ready in any new terminal": "Sẵn sàng trong mọi terminal mới",
+  "Couldn't add them to your shell": "Không thể thêm chúng vào shell của bạn",
+  "Starts at login": "Chạy khi đăng nhập",
+  "The engine starts when you log in": "Engine khởi động khi bạn đăng nhập",
+  "The engine runs from the app for now": "Hiện engine đang chạy từ ứng dụng",
+  "Show log": "Hiện nhật ký",
+  "Continue anyway": "Vẫn tiếp tục",
+  "One step didn't work. Everything else is ready.": "Một bước không thành công. Mọi thứ khác đã sẵn sàng.",
+  "Some steps didn't work. Everything else is ready.": "Một số bước không thành công. Mọi thứ khác đã sẵn sàng.",
   "No matches": "Không có kết quả phù hợp"
 }

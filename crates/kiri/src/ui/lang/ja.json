@@ -1825,5 +1825,17 @@
   "{n} more in <a>Compose projects</a>": "ほかに {n} 個が<a>Compose プロジェクト</a>にあります",
   "Your only container is in a <a>Compose project</a>": "唯一のコンテナは<a>Compose プロジェクト</a>にあります",
   "All {n} containers are in <a>Compose projects</a>": "{n} 個のコンテナはすべて<a>Compose プロジェクト</a>にあります",
+  "Skipped until Kiri next opens": "Kiri を次に開くまでスキップ",
+  "Couldn't add the kiri docker context": "docker に kiri コンテキストを追加できませんでした",
+  "The kiri and docker commands": "kiri と docker のコマンド",
+  "Ready in any new terminal": "新しいターミナルですぐ使えます",
+  "Couldn't add them to your shell": "シェルに追加できませんでした",
+  "Starts at login": "ログイン時に開始",
+  "The engine starts when you log in": "ログインするとエンジンが起動します",
+  "The engine runs from the app for now": "当面はアプリからエンジンを実行しています",
+  "Show log": "ログを表示",
+  "Continue anyway": "このまま続ける",
+  "One step didn't work. Everything else is ready.": "1 つの手順がうまくいきませんでした。ほかはすべて準備できています。",
+  "Some steps didn't work. Everything else is ready.": "いくつかの手順がうまくいきませんでした。ほかはすべて準備できています。",
   "No matches": "一致するものはありません"
 }

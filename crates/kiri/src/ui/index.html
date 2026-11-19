@@ -1175,7 +1175,8 @@ tr.row:hover td.actions .acts-row { background: linear-gradient(var(--fwd), tran
 .about dt { color: var(--muted); }
 .about dd { font-variant-numeric: tabular-nums; }
 .about a { color: var(--blue-light); cursor: pointer; text-decoration: none; }
-/* Linux: the setup checklist the window opens on until Kiri can run containers (onboarding()). */
+/* The setup checklist: Linux opens on it until Kiri can run containers; the Mac shows it over a working window
+   when a first-launch step failed (onboarding()). */
 #onb { position: fixed; inset: 0; z-index: 30; background: var(--bg); overflow: auto; display: grid; place-items: start center; }
 #onb .onb-in { width: min(460px, calc(100% - 32px)); padding: 44px 0 28px; }
 #onb .onb-hd { display: flex; gap: 12px; align-items: center; margin-bottom: 16px; }
@@ -1189,6 +1190,8 @@ tr.row:hover td.actions .acts-row { background: linear-gradient(var(--fwd), tran
 #onb .onb-row .t > div { font-weight: 500; }
 #onb .onb-row .linkish { align-self: center; color: var(--muted); font-size: var(--fs-small); padding: 0 4px; }
 #onb .onb-row .linkish:hover { color: var(--text); text-decoration: underline; text-underline-offset: 3px; }
+/* Under an error the row is tall: Skip stays on the button's line, not half way down. */
+#onb .onb-row:has(.e) .linkish { align-self: flex-start; line-height: 24px; }
 #onb .onb-row.skipped .t > div { color: var(--muted); }
 #onb .onb-row .btn { height: 28px; margin-top: -2px; }
 #onb .st { width: 18px; height: 18px; border-radius: 50%; display: grid; place-items: center; flex: none; margin-top: 1px; }
@@ -1203,6 +1206,9 @@ tr.row:hover td.actions .acts-row { background: linear-gradient(var(--fwd), tran
 #onb .onb-ft { display: flex; align-items: center; gap: 8px; margin-top: 14px; }
 #onb .onb-ft .m { flex: 1; display: flex; align-items: center; gap: 5px; color: var(--faint); font-size: var(--fs-small); }
 #onb .onb-ft .m svg.i { width: 12px; height: 12px; }
+#onb .onb-row .e { display: block; margin-top: 5px; padding: 5px 7px; border-radius: 5px; background: var(--bg); color: var(--text); font: var(--fs-small)/1.4 var(--mono-font); white-space: pre-wrap; overflow-wrap: anywhere; }
+#onb .onb-ft .linkish { color: var(--muted); font-size: var(--fs-small); padding: 0 4px; }
+#onb .onb-ft .linkish:hover { color: var(--text); text-decoration: underline; text-underline-offset: 3px; }
 #onb .onb-err { margin-top: 12px; color: var(--red-text); font-size: var(--fs-small); }
 #onb .onb-rs { margin-top: 12px; border: 1px solid rgba(255, 194, 61, .35); background: rgba(255, 194, 61, .06); border-radius: 8px; padding: 10px 12px; }
 #onb .onb-rs b { color: var(--sun-text); font-weight: 600; }
@@ -3785,6 +3791,17 @@ const ONB = [
   tr("docker uses Kiri"), tr("docker, Compose and Docker-socket tools reach Kiri"), tr("docker talks to another engine now"), tr("Checked once your account can use Kiri"), tr("Use Kiri"),
   tr("Builds"), tr("docker build runs on Kiri's builder"), tr("Set up Kiri's builder so docker build runs here. Nothing downloads until your first build"), tr("Set up")];
 const ONB_LOGO = `<svg class="logo" viewBox="100 100 824 824" aria-hidden="true"><defs><linearGradient id="onb-bg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#1B232C"/><stop offset="1" stop-color="#0F1419"/></linearGradient><radialGradient id="onb-gl" cx="0.62" cy="0.46" r="0.55"><stop offset="0" stop-color="#E0B420" stop-opacity="0.28"/><stop offset="1" stop-color="#E0B420" stop-opacity="0"/></radialGradient><linearGradient id="onb-bx" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#EDC23A"/><stop offset="1" stop-color="#CC9A0C"/></linearGradient><clipPath id="onb-ic"><rect x="22" y="12" width="34" height="40" rx="10"/></clipPath></defs><rect x="100" y="100" width="824" height="824" rx="185" fill="url(#onb-bg)"/><rect x="100" y="100" width="824" height="824" rx="185" fill="url(#onb-gl)"/><g transform="translate(154.2 136.6) scale(11.732)"><g transform="translate(6 0) skewX(-10)"><rect x="22" y="12" width="34" height="40" rx="10" fill="url(#onb-bx)"/><g clip-path="url(#onb-ic)" fill="#F2CF5B"><rect x="10" y="0" width="60" height="21.5"/></g><g fill="#0F1419"><ellipse cx="41.5" cy="29" rx="3.1" ry="3.6"/><ellipse cx="50.5" cy="29" rx="3.1" ry="3.6"/></g></g><g fill="#F6F2EA"><rect x="5" y="21.5" width="13" height="5" rx="2.5"/><rect x="1" y="32" width="15" height="5" rx="2.5"/><rect x="7" y="42.5" width="7" height="5" rx="2.5"/></g></g></svg>`;
+/* The Mac: the first launch's steps that failed (crates/kiri/src/ui/macsetup.rs), each with Try again and its
+   error as the log has it. Skip, for the ones Kiri works without, lasts until Kiri next opens (#250). */
+const ONB_MAC_SKIP = { commands: "Skipped until Kiri next opens", login: "Skipped until Kiri next opens" };
+const ONB_MAC = [
+  ["context", "docker uses Kiri", { ok: "docker, Compose and Docker-socket tools reach Kiri", no: "Couldn't add the kiri docker context" }, { no: "Try again" }],
+  ["commands", "The kiri and docker commands", { ok: "Ready in any new terminal", no: "Couldn't add them to your shell" }, { no: "Try again" }],
+  ["login", "Starts at login", { ok: "The engine starts when you log in", no: "The engine runs from the app for now" }, { no: "Try again" }],
+];
+/* i18n */ void [tr("Skipped until Kiri next opens"), tr("Couldn't add the kiri docker context"), tr("The kiri and docker commands"),
+  tr("Ready in any new terminal"), tr("Couldn't add them to your shell"), tr("Starts at login"), tr("The engine starts when you log in"),
+  tr("The engine runs from the app for now"), tr("Show log"), tr("Continue anyway"), tr("One step didn't work. Everything else is ready."), tr("Some steps didn't work. Everything else is ready.")];
 const onbIcon = (name) => `<svg class="i" viewBox="0 0 256 256" aria-hidden="true"><path d="${PH[name]}"/></svg>`;
 function onboarding(e) {
   ui.onb = { ...e, busy: null };
@@ -3802,10 +3819,11 @@ function onboarding(e) {
 function drawOnb() {
   const o = ui.onb, el = $("onb");
   if (!o || !el) return;
-  const c = o.checks || {}, busy = o.busy, skipped = new Set(o.skipped || []);
+  const c = o.checks || {}, busy = o.busy, skipped = new Set(o.skipped || []), errors = o.errors || {};
+  const mac = o.os === "mac", LIST = mac ? ONB_MAC : ONB, SKIPS = mac ? ONB_MAC_SKIP : ONB_SKIP;
   const isSkipped = (k) => skipped.has(k) && c[k] !== "ok";
   const fixable = ([k, , , fix]) => fix && fix[c[k]];
-  const pending = ONB.filter((row) => fixable(row) && !isSkipped(row[0]));
+  const pending = LIST.filter((row) => fixable(row) && !isSkipped(row[0]));
   const restart = c.access === "restart";
   // What a fix in progress covers: all of them, or one; the engine and access are one step as root.
   const asRoot = (k) => k === "running" || k === "access";
@@ -3813,21 +3831,22 @@ function drawOnb() {
   const stateOf = (k) => (busy && covers(k) && c[k] !== "ok" ? "wait" : c[k]);
   const icon = (st) => st === "ok" ? onbIcon("check") : st === "bad" ? onbIcon("warning") : st === "restart" ? onbIcon("restart") : st === "wait" ? "" : onbIcon("dot");
   const say = (v) => (typeof v === "function" ? v(esc(o.user || tr("your account"))) : v ? tr(v) : "");
-  const rows = ONB.map((row) => {
+  const rows = LIST.map((row) => {
     const [k, title, words, fix, root] = row, st = stateOf(k), label = fixable(row), skip = isSkipped(k);
     const first = pending[0]?.[0] === k;
-    const canSkip = ONB_SKIP[k] && label && !skip && o.ready;
-    const text = skip ? tr(ONB_SKIP[k]) : say(words[c[k]]);
+    const canSkip = SKIPS[k] && label && !skip && o.ready;
+    const err = !skip && c[k] !== "ok" && errors[k] ? `<span class="e">${esc(errors[k])}</span>` : "";
+    const text = (skip ? tr(SKIPS[k]) : say(words[c[k]])) + err;
     const extra = skip ? `<button class="linkish" data-onbskip="${k}" data-undo="1"${busy ? " disabled" : ""}>${tr("Undo")}</button>`
       : canSkip ? `<button class="linkish" data-onbskip="${k}"${busy ? " disabled" : ""}>${tr("Skip")}</button>` : "";
     return `<div class="onb-row${skip ? " skipped" : ""}" data-check="${k}"><div class="st ${skip ? "no" : st}">${icon(skip ? "no" : st)}</div><div class="t"><div>${tr(title)}</div><p>${text}</p></div>${extra}${label && !skip ? `<button class="btn${first ? " primary" : ""}" data-onbfix="${k}"${busy ? " disabled" : ""}>${root ? onbIcon("lock") : ""}${tr(label)}</button>` : ""}</div>`;
   }).join("");
   const rootPending = pending.some(([, , , , root]) => root);
-  el.innerHTML = `<div class="onb-in"><div class="onb-hd">${ONB_LOGO}<div><h2 id="onb-title">${tr("Set up Kiri")}</h2><p>${o.complete ? tr("Kiri is set up.") : o.ready ? (pending.length === 1 ? tr("One more step: set it up, or skip.") : tr("A couple more steps: set them up, or skip.")) : restart ? tr("One more step: log out and back in.") : tr("A few things need fixing before Kiri can run containers.")}</p></div></div>
+  el.innerHTML = `<div class="onb-in"><div class="onb-hd">${ONB_LOGO}<div><h2 id="onb-title">${tr("Set up Kiri")}</h2><p>${o.complete ? tr("Kiri is set up.") : mac ? (pending.length > 1 ? tr("Some steps didn't work. Everything else is ready.") : tr("One step didn't work. Everything else is ready.")) : o.ready ? (pending.length === 1 ? tr("One more step: set it up, or skip.") : tr("A couple more steps: set them up, or skip.")) : restart ? tr("One more step: log out and back in.") : tr("A few things need fixing before Kiri can run containers.")}</p></div></div>
     <div class="onb-rows">${rows}</div>
     ${o.error ? `<div class="onb-err">${esc(o.error)}</div>` : ""}
     ${restart ? `<div class="onb-rs"><b>${tr("Log out to finish")}</b><p>${tr("This system applies your new access when you sign in again. Kiri opens ready after that.")}</p><div class="a"><button class="btn primary" data-onb="logout">${tr("Log out now")}</button><button class="btn" data-onb="restart">${tr("Restart")}</button></div></div>` : ""}
-    <div class="onb-ft"><span class="m">${rootPending && !o.ready ? `${onbIcon("lock")}${tr("Asks for your password once")}` : ""}</span>${pending.length > 1 ? `<button class="btn" data-onbfix="all"${busy ? " disabled" : ""}>${tr("Fix all")}</button>` : ""}<button class="btn primary" data-onb="open"${o.complete && !busy ? "" : " disabled"}>${tr("Open Kiri")}</button></div></div>`;
+    <div class="onb-ft"><span class="m">${rootPending && !o.ready ? `${onbIcon("lock")}${tr("Asks for your password once")}` : ""}</span>${Object.keys(errors).length || o.error ? `<button class="linkish" data-onb="log">${tr("Show log")}</button>` : ""}${pending.length > 1 ? `<button class="btn" data-onbfix="all"${busy ? " disabled" : ""}>${tr("Fix all")}</button>` : ""}<button class="btn primary" data-onb="open"${(o.complete || mac) && !busy ? "" : " disabled"}>${tr(o.complete || !mac ? "Open Kiri" : "Continue anyway")}</button></div></div>`;
 }
 function onbClick(ev) {
   const o = ui.onb, b = ev.target.closest("button");
@@ -3844,7 +3863,8 @@ function onbClick(ev) {
     $("onb")?.remove();
     ui.onb = null;
     send("onbopen");
-  } else if (b.dataset.onb === "logout") send("onblogout");
+  } else if (b.dataset.onb === "log") send("diagfolder");
+  else if (b.dataset.onb === "logout") send("onblogout");
   else if (b.dataset.onb === "restart") send("onbrestart");
 }
 

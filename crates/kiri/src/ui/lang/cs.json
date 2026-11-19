@@ -1825,5 +1825,17 @@
   "{n} more in <a>Compose projects</a>": "Dalších {n} v <a>projektech Compose</a>",
   "Your only container is in a <a>Compose project</a>": "Váš jediný kontejner je v <a>projektu Compose</a>",
   "All {n} containers are in <a>Compose projects</a>": "Všech {n} kontejnerů je v <a>projektech Compose</a>",
+  "Skipped until Kiri next opens": "Přeskočeno, dokud se Kiri znovu neotevře",
+  "Couldn't add the kiri docker context": "Kontext kiri pro docker se nepodařilo přidat",
+  "The kiri and docker commands": "Příkazy kiri a docker",
+  "Ready in any new terminal": "Připraveno v každém novém terminálu",
+  "Couldn't add them to your shell": "Nepodařilo se je přidat do vašeho shellu",
+  "Starts at login": "Spouští se při přihlášení",
+  "The engine starts when you log in": "Engine se spustí, když se přihlásíte",
+  "The engine runs from the app for now": "Engine zatím běží z aplikace",
+  "Show log": "Zobrazit protokol",
+  "Continue anyway": "Přesto pokračovat",
+  "One step didn't work. Everything else is ready.": "Jeden krok se nezdařil. Vše ostatní je připraveno.",
+  "Some steps didn't work. Everything else is ready.": "Některé kroky se nezdařily. Vše ostatní je připraveno.",
   "No matches": "Žádné shody"
 }

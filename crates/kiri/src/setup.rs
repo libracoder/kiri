@@ -99,9 +99,18 @@ pub fn launched_from_app() -> bool {
 }
 
 /// The first time the app opens: the same as `kiri setup`, quietly, except
-/// `*.kiri.local`, which the window offers and the user chooses.
-pub fn first_launch() -> io::Result<()> {
-    let set_up = agent_plist().and_then(|p| Ok(p.is_file() && agent_runs_this()?)).map_err(step("checking how Kiri starts at login"))?;
+/// `*.kiri.local`, which the window offers and the user chooses. It never
+/// stops the window opening (#250): each step runs on its own, and the ones
+/// that fail wait in the window's setup checklist (`undone`) with their
+/// errors. Without the login item, the window starts the engine itself
+/// (update::start_engine).
+pub fn first_launch() {
+    let set_up = agent_plist().and_then(|p| Ok(p.is_file() && agent_runs_this()?)).map_err(step("checking how Kiri starts at login"));
+    // Not knowing is not set up: the steps run, and say what failed.
+    let set_up = set_up.unwrap_or_else(|e| {
+        crate::diag::warn!("setup step failed", step = "check", error = e);
+        false
+    });
     if set_up {
         // Set up by an older Kiri: make sure the commands are there too.
         if let Some(contents) = bundle_contents() {
@@ -111,9 +120,60 @@ pub fn first_launch() -> io::Result<()> {
         if !dev() {
             let _ = crate::daemon::socket_path().map(|s| docker_socket_fallback(&s));
         }
-        return Ok(());
+        // Nothing else is touched: a docker context this person removed
+        // later stays removed.
+        return;
     }
-    run(&["--no-domains".to_owned()])
+    let mut undone = Vec::new();
+    for s in FIRST_STEPS {
+        if let Err(e) = first_step(s) {
+            crate::diag::warn!("setup step failed", step = s, error = e);
+            undone.push((s, e.to_string()));
+        }
+    }
+    // The builder needs the engine, which the login item has just started;
+    // without it the window makes the builder once it starts the engine.
+    if !undone.iter().any(|(s, _)| *s == "login") {
+        let _ = builder();
+    }
+    if !dev() {
+        let _ = crate::daemon::socket_path().map(|s| docker_socket_fallback(&s));
+    }
+    *UNDONE.lock().unwrap_or_else(|e| e.into_inner()) = undone;
+}
+
+/// The first launch's steps, as the window's checklist names them: the
+/// docker context (docker reaches Kiri), the kiri and docker commands, and
+/// starting the engine at login.
+pub const FIRST_STEPS: [&str; 3] = ["context", "commands", "login"];
+
+/// The first launch's steps that failed, with their errors.
+static UNDONE: std::sync::Mutex<Vec<(&'static str, String)>> = std::sync::Mutex::new(Vec::new());
+
+pub fn undone() -> Vec<(&'static str, String)> {
+    UNDONE.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// One of the steps, the same for `kiri setup` and the first launch, its
+/// error saying which step it was (`step`).
+fn first_step(name: &str) -> io::Result<()> {
+    match name {
+        "context" => crate::daemon::socket_path().map_err(step("finding the engine's socket")).and_then(|s| context(&s).map_err(step("adding the kiri docker context"))),
+        "commands" => bundle_contents().map_or(Ok(()), |c| bundled_cli(&c).map_err(step("setting up the kiri and docker commands"))),
+        "login" => agent().map(drop).map_err(step("starting the engine at login")),
+        _ => Err(io::Error::new(io::ErrorKind::InvalidInput, format!("no setup step {name}"))),
+    }
+}
+
+/// The checklist's Try again for one step.
+pub fn retry(name: &str) -> io::Result<()> {
+    let result = first_step(name);
+    let mut undone = UNDONE.lock().unwrap_or_else(|e| e.into_inner());
+    undone.retain(|(s, _)| *s != name);
+    if let (Err(e), Some(s)) = (&result, FIRST_STEPS.iter().find(|s| **s == name)) {
+        undone.push((s, e.to_string()));
+    }
+    result
 }
 
 /// Each step's error says which step it was: on first launch it is all the
@@ -139,7 +199,7 @@ pub fn run(args: &[String]) -> io::Result<()> {
         return result;
     }
     let socket = crate::daemon::socket_path().map_err(step("finding the engine's socket"))?;
-    context(&socket).map_err(step("adding the kiri docker context"))?;
+    first_step("context")?;
     println!("docker context `{CONTEXT}` → unix://{}", socket.display());
     if flag("--use") && !dev() {
         let path = docker_dir().map(|d| d.join("config.json")).map_err(step("making kiri docker's current context"))?;
@@ -148,12 +208,10 @@ pub fn run(args: &[String]) -> io::Result<()> {
         write_json(&path, &cfg).map_err(step("making kiri docker's current context"))?;
         println!("docker now uses Kiri by default (`docker context use default` to switch back)");
     }
-    if let Some(contents) = bundle_contents() {
-        bundled_cli(&contents).map_err(step("setting up the kiri and docker commands"))?;
-    }
+    first_step("commands")?;
     if !flag("--no-agent") {
-        let plist = agent().map_err(step("starting the engine at login"))?;
-        println!("kiri daemon starts at login ({})", plist.display());
+        first_step("login")?;
+        println!("kiri daemon starts at login ({})", agent_plist()?.display());
     }
     match builder() {
         Ok(true) => match crate::buildwith::places().map(|p| p.saved()) {

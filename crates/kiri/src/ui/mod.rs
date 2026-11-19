@@ -17,6 +17,8 @@ use std::time::Duration;
 #[cfg(target_os = "macos")]
 mod mac;
 #[cfg(target_os = "macos")]
+mod macsetup;
+#[cfg(target_os = "macos")]
 use mac as window;
 #[cfg(target_os = "linux")]
 mod gtk;
@@ -2200,6 +2202,15 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
                     return;
                 }
             }
+            // The Mac: the first launch's steps that failed wait in the same
+            // checklist, over a window that works (the engine starts anyway).
+            #[cfg(target_os = "macos")]
+            {
+                let checks = macsetup::checks();
+                if macsetup::needed(&checks) {
+                    emit(checks.to_string());
+                }
+            }
             let _ = tx.send(Cmd::Refresh);
             // Opening the window reaches the engine (starting its service if it
             // isn't running) but doesn't wake it: asleep, it reads Ready, and the
@@ -2236,6 +2247,39 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
             emit(linux::onboarding::checks().to_string());
             Ok(())
         }
+        // The Mac's checklist: Try again for one step, Skip for an optional
+        // one; Open Kiri only closes it, the engine is already reached.
+        #[cfg(target_os = "macos")]
+        "onbcheck" => {
+            emit(macsetup::checks().to_string());
+            Ok(())
+        }
+        #[cfg(target_os = "macos")]
+        "onbfix" => {
+            let what = msg.name;
+            std::thread::spawn(move || {
+                // Fix all: every step still undone, in order.
+                let steps: Vec<String> = if what == "all" { crate::setup::undone().into_iter().map(|(s, _)| s.to_owned()).collect() } else { vec![what.clone()] };
+                // Every step is tried, even after one fails (not try_fold).
+                #[allow(clippy::manual_try_fold)]
+                let result = steps.iter().map(|s| crate::setup::retry(s)).fold(Ok(()), |acc, r| acc.and(r));
+                let mut checks = macsetup::checks();
+                if let Err(e) = result {
+                    diag::warn!("action failed", action = "setup step", target = what, error = e);
+                    checks["error"] = e.to_string().into();
+                }
+                emit(checks.to_string());
+            });
+            Ok(())
+        }
+        #[cfg(target_os = "macos")]
+        "onbskip" => {
+            macsetup::skip(&msg.name, msg.value.as_bool() == Some(false));
+            emit(macsetup::checks().to_string());
+            Ok(())
+        }
+        #[cfg(target_os = "macos")]
+        "onbopen" => tx.send(Cmd::Refresh),
         #[cfg(target_os = "linux")]
         "onbopen" => {
             let _ = tx.send(Cmd::Refresh);

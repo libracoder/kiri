@@ -1825,5 +1825,17 @@
   "{n} more in <a>Compose projects</a>": "{n} مورد دیگر در <a>پروژه‌های Compose</a>",
   "Your only container is in a <a>Compose project</a>": "تنها کانتینر شما در یک <a>پروژهٔ Compose</a> است",
   "All {n} containers are in <a>Compose projects</a>": "همهٔ {n} کانتینر در <a>پروژه‌های Compose</a> هستند",
+  "Skipped until Kiri next opens": "تا باز شدن بعدی Kiri رد شد",
+  "Couldn't add the kiri docker context": "افزودن زمینه kiri برای docker ممکن نشد",
+  "The kiri and docker commands": "فرمان‌های kiri و docker",
+  "Ready in any new terminal": "در هر ترمینال جدید آماده است",
+  "Couldn't add them to your shell": "افزودن آن‌ها به شل شما ممکن نشد",
+  "Starts at login": "هنگام ورود شروع می‌شود",
+  "The engine starts when you log in": "موتور هنگام ورود شما شروع می‌شود",
+  "The engine runs from the app for now": "فعلاً موتور از داخل برنامه اجرا می‌شود",
+  "Show log": "نمایش لاگ",
+  "Continue anyway": "به هر حال ادامه بده",
+  "One step didn't work. Everything else is ready.": "یک مرحله انجام نشد. بقیه چیزها آماده است.",
+  "Some steps didn't work. Everything else is ready.": "چند مرحله انجام نشد. بقیه چیزها آماده است.",
   "No matches": "موردی پیدا نشد"
 }
