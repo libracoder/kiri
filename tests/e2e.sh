@@ -862,7 +862,12 @@ $D run -d --name cpc alpine sleep 120 >/dev/null
 t cp-in-file "one" bash -c "$D cp $CPD/a.txt cpc:/tmp/ && $D exec cpc cat /tmp/a.txt"
 t cp-in-dir "two" bash -c "$D cp $CPD/dir cpc:/tmp/ && $D exec cpc cat /tmp/dir/sub/b.txt"
 t cp-in-rename "one" bash -c "$D cp $CPD/a.txt cpc:/tmp/renamed.txt && $D exec cpc cat /tmp/renamed.txt"
-t cp-in-root-owner "0 0" bash -c "$D exec cpc stat -c '%u %g' /tmp/a.txt"
+# The archive's owners are kept, as Docker keeps them without -a: DDEV puts
+# its mkcert key (mode 0600) in a container this way for the web user.
+OWNED='import io,sys,tarfile
+b=io.BytesIO(); t=tarfile.open(fileobj=b,mode="w"); f=tarfile.TarInfo("owned.pem"); f.size=3; f.mode=0o600; f.uid=1234; f.gid=1235
+t.addfile(f,io.BytesIO(b"key")); t.close(); sys.stdout.buffer.write(b.getvalue())'
+t cp-in-keeps-owner "1234 1235 600 key" bash -c "python3 -c '$OWNED' | $D cp - cpc:/tmp/ && echo \$($D exec cpc stat -c '%u %g %a' /tmp/owned.pem) \$($D exec -u 1234 cpc cat /tmp/owned.pem)"
 t cp-out-file "fromctr" bash -c "$D exec cpc sh -c 'echo fromctr > /etc/motd2' && $D cp cpc:/etc/motd2 $CPD/ && cat $CPD/motd2"
 t cp-out-dir "deep" bash -c "$D exec cpc sh -c 'mkdir -p /opt/x/y; echo deep > /opt/x/y/z' && $D cp cpc:/opt/x $CPD/xx && cat $CPD/xx/y/z"
 t cp-out-stdout "alpine-release" bash -c "$D cp cpc:/etc/alpine-release - | tar -t"
