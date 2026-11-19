@@ -2562,6 +2562,7 @@ impl Engine {
                         if n.no_ipv4 {
                             net6_opts.push(format!("{}=1", kiri_proto::net_opts::NO_IPV4));
                         }
+                        net6_opts.push(format!("{}={}", kiri_proto::net_opts::NETWORK, n.name));
                     }
                     Err(e) => {
                         self.lock_networks().release(&n.name, ip);
@@ -3374,6 +3375,7 @@ impl Engine {
         if net.no_ipv4 {
             opts.push(format!("{}=1", kiri_proto::net_opts::NO_IPV4));
         }
+        opts.push(format!("{}={}", kiri_proto::net_opts::NETWORK, net.name));
         if let Err(e) = vm.net_attach(id, n, &net.bridge, ip, net.prefix, net.gateway, &names, &opts) {
             let mut nets = self.lock_networks();
             nets.release(&net.name, ip);

@@ -452,6 +452,10 @@ pub mod net_opts {
     /// network's names from the start, as Docker's does with every network
     /// joined before the program runs.
     pub const DNS_BRIDGE: &str = "dnsbridge";
+    /// `network=frontend`: the Docker network's name. The guest only knows
+    /// bridges (`kiri3`); a container's embedded DNS searches its networks
+    /// in this name's order, as Docker does, not in the order it joined.
+    pub const NETWORK: &str = "network";
 
     /// The values given for `key`, in order.
     pub fn values<'a>(opts: super::StrList<'a>, key: &'a str) -> impl Iterator<Item = &'a str> + 'a {

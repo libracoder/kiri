@@ -609,6 +609,9 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
             .map_err(|e| kill_child(io::Error::new(e.kind(), format!("network: {e}"))))?;
         veths.push(host_if);
         if embedded_dns {
+            if let Some(name) = net_opts::values(spec.net.opts, net_opts::NETWORK).next() {
+                net.dns.name_network(spec.net.bridge, name);
+            }
             // An IPv6-only network's bridge has no IPv4 address to serve on,
             // and its containers no A records.
             if !plug.no_ipv4 {

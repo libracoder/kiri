@@ -995,6 +995,13 @@ t connect-running-dns "Name:" $D exec ndr-a nslookup ndr-srv
 t connect-before-start-dns "Name:" bash -c "$D create --name ndr-c alpine sh -c 'nslookup ndr-srv; sleep 300' >/dev/null && $D network connect ndr ndr-c && $D start ndr-c >/dev/null && sleep 1 && $D logs ndr-c"
 t connect-dns-internet "Address" $D exec ndr-a nslookup example.com
 $D rm -f ndr-srv ndr-a ndr-c >/dev/null; $D network rm ndr >/dev/null
+# Two projects on a shared network, each with a `db` on its own network too
+# (Compose and DDEV do this): `db` is the project's own, as on Docker, which
+# searches a container's networks by network name, not in the order joined (#294).
+$D network create dno_shared >/dev/null; for p in a b; do $D network create dno-${p}_own >/dev/null; for s in web db; do $D create --name dno-$p-$s --network dno_shared --network-alias $s alpine sleep 300 >/dev/null; $D network connect --alias $s dno-${p}_own dno-$p-$s; $D start dno-$p-$s >/dev/null; done; done
+t dns-own-project-first "own" bash -c "want=\$($D inspect -f '{{(index .NetworkSettings.Networks \"dno-a_own\").IPAddress}}' dno-a-db); got=\$($D exec dno-a-web nslookup -type=a db 2>/dev/null | grep '^Address' | grep -v ':53' | cut -d' ' -f2 | tr '\n' ' '); [ \"\$got\" = \"\$want \" ] && echo own || echo \"got \$got want \$want\""
+t dns-shared-still-searched "Name:" $D exec dno-a-web nslookup -type=a dno-b-db
+$D rm -f dno-a-web dno-a-db dno-b-web dno-b-db >/dev/null; $D network rm dno_shared dno-a_own dno-b_own >/dev/null
 
 section "events, prune, system df, search"
 t events "start" bash -c "($D events --filter container=evt --format '{{.Action}}' & p=\$!; sleep 0.5; $D run --name evt alpine true >/dev/null; sleep 0.5; kill \$p) 2>/dev/null"
