@@ -480,7 +480,6 @@ pub fn accept_ssh_agent(listener: &OwnedFd) -> Option<Relay> {
 /// host containers mount the daemon's socket itself.
 pub const ENGINE_SOCK: &str = "/run/host-services/docker.sock";
 pub const ENGINE_VSOCK_PORT: u32 = 1036;
-
 pub fn listen_engine() -> io::Result<OwnedFd> {
     std::fs::create_dir_all("/run/host-services")?;
     let _ = std::fs::remove_file(ENGINE_SOCK);
@@ -515,6 +514,53 @@ pub fn accept_engine(listener: &OwnedFd) -> Option<Relay> {
         return Some(Relay::dead_one(client));
     }
     Some(Relay { host, target: Some(client), connected: true, header: Vec::new(), up: Pipe::new(), down: Pipe::new(), dead: false, udp: false, framed: false })
+}
+
+/// Kiri's BuildKit (crates/kiri/src/daemon/grpc.rs): the daemon's gRPC proxy
+/// opens a vsock stream per buildx connection, and the agent relays bytes to
+/// buildkitd's own unix socket, which it spawns on demand (buildkit.rs). VM
+/// only: on a Linux host, the daemon reaches the buildkitd it runs there
+/// itself.
+pub const BUILDKIT_SOCK: &str = "/run/kiri/buildkitd.sock";
+pub const BUILDKIT_PORT: u32 = 1041;
+
+pub fn listen_buildkit() -> io::Result<OwnedFd> {
+    listen_vsock(BUILDKIT_PORT)
+}
+
+/// A connected stream to buildkitd, or `Some(dead relay)` if buildkitd is not
+/// listening yet: the caller spawns it, and the client (a gRPC one) redials.
+pub fn accept_buildkit(listener: &OwnedFd) -> Option<Relay> {
+    // SAFETY: accept4 on a listening socket we own; the fd is owned immediately.
+    let fd = unsafe { libc::accept4(listener.as_raw_fd(), std::ptr::null_mut(), std::ptr::null_mut(), libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC) };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: fresh descriptor.
+    let client = unsafe { OwnedFd::from_raw_fd(fd) };
+    // Unix connects complete at once unless the backlog is full; unlike
+    // accept_host_bound there is no open‒then‒write ordering to preserve, so
+    // a blocking call is safe and simple here.
+    let Ok(target) = connect_buildkit() else { return Some(Relay::dead_one(client)) };
+    if sys::set_nonblocking(target.as_raw_fd()).is_err() {
+        return Some(Relay::dead_one(client));
+    }
+    Some(Relay { host: client, target: Some(target), connected: true, header: Vec::new(), up: Pipe::new(), down: Pipe::new(), dead: false, udp: false, framed: false })
+}
+
+fn connect_buildkit() -> io::Result<OwnedFd> {
+    // SAFETY: plain unix socket setup; the fd is owned immediately.
+    unsafe {
+        let fd = sys::check(libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) as _, "socket")?;
+        let sock = OwnedFd::from_raw_fd(fd as RawFd);
+        let mut a: libc::sockaddr_un = std::mem::zeroed();
+        a.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        for (d, s) in a.sun_path.iter_mut().zip(BUILDKIT_SOCK.bytes()) {
+            *d = s as libc::c_char;
+        }
+        sys::check(libc::connect(sock.as_raw_fd(), (&a as *const libc::sockaddr_un).cast(), std::mem::size_of::<libc::sockaddr_un>() as u32) as _, "connect buildkitd")?;
+        Ok(sock)
+    }
 }
 
 #[cfg(test)]

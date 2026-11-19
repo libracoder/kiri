@@ -129,6 +129,20 @@ fn config_toml(limit: u64, registries: &str) -> String {
     )
 }
 
+/// buildkitd.toml for the built-in builder (grpc.rs): the same content the
+/// builder container gets at each start, so both builders share the cache
+/// limits and the `FROM` mirror.
+pub(crate) fn guest_config(engine: &Engine) -> String {
+    config_toml(cache_limit(), &super::mirror::config(engine))
+}
+
+/// The pinned BuildKit image's layers, newest first, for `BuildkitStart`;
+/// pulling it first if it is not here yet.
+pub(crate) fn guest_layers(engine: &Engine, say: &mut dyn FnMut(&str)) -> Result<Vec<String>, Error> {
+    let image = ensure_image(engine, say)?;
+    Ok(image.layers.iter().rev().map(|l| l.digest.clone()).collect())
+}
+
 /// `GET /kiri/builder`: the settings and the builder's state.
 pub fn settings_report(engine: &Engine) -> Value {
     let s = settings();
@@ -167,7 +181,7 @@ pub fn set_settings(req: &Request) -> Result<(), Error> {
 // --- The container -------------------------------------------------------
 
 /// The BuildKit image, pulled (by [`PINNED`]) if it isn't here yet.
-fn ensure_image(engine: &Engine, say: &mut dyn FnMut(&str)) -> Result<kiri_image::Image, Error> {
+pub(crate) fn ensure_image(engine: &Engine, say: &mut dyn FnMut(&str)) -> Result<kiri_image::Image, Error> {
     if let Some(i) = engine.image(IMAGE)? {
         return Ok(i);
     }

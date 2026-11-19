@@ -20,6 +20,13 @@ use super::time;
 
 /// Serves one client connection until it closes.
 pub fn serve(stream: UnixStream, engine: Arc<Engine>) -> io::Result<()> {
+    // A gRPC client may open with the h2 preface instead of an HTTP/1.1
+    // request line (prior knowledge). Peek without consuming so the relay
+    // gets to read the preface itself.
+    if h2_preface(&stream)? {
+        super::grpc::serve(stream, engine);
+        return Ok(());
+    }
     let mut w = stream.try_clone()?;
     let mut r = BufReader::new(stream);
     while let Some(req) = http::read_request(&mut r, streams_body)? {
@@ -27,6 +34,16 @@ pub fn serve(stream: UnixStream, engine: Arc<Engine>) -> io::Result<()> {
         // for it carry the same op.
         let _op = req.header("X-Kiri-Op").filter(|o| crate::diag::valid_op(o)).map(|o| crate::diag::enter_op(o.to_owned()));
         http::serving(&req);
+        // buildx dials the engine socket with `Upgrade: h2c` on /grpc (control)
+        // and /session (its own services). It waits for the 101 before writing
+        // the h2 preface, so nothing is buffered yet: hand the inner stream to
+        // the BuildKit relay, which speaks h2 from here on.
+        if h2c_buildkit(&req) {
+            http::h2c_upgrade(&mut w)?;
+            drop(w);
+            super::grpc::serve(r.into_inner(), engine);
+            return Ok(());
+        }
         // Kiri's own window checks in every few seconds; that isn't use, and
         // counting it would keep the VM from ever sleeping while it's open.
         if req.header("X-Kiri-Background").is_none() {
@@ -61,6 +78,26 @@ pub fn serve(stream: UnixStream, engine: Arc<Engine>) -> io::Result<()> {
 /// (`/images/create` is `docker import`'s, a pull sends none).
 fn streams_body(method: &str, path: &str) -> bool {
     matches!((method, path), ("PUT", p) if p.starts_with("/containers/") && p.ends_with("/archive")) || (method == "POST" && matches!(path, "/images/load" | "/images/create" | "/build"))
+}
+
+/// Whether the connection opens with HTTP/2's `PRI * HTTP/2.0` preface
+/// (prior knowledge), without consuming any of it.
+fn h2_preface(stream: &UnixStream) -> io::Result<bool> {
+    let mut buf = [0u8; 4];
+    // SAFETY: MSG_PEEK leaves the bytes on the socket; the buffer is ours and
+    // the descriptor is the connection's, which we still own.
+    let n = unsafe { libc::recv(stream.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), libc::MSG_PEEK) };
+    if n < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(n as usize == buf.len() && &buf == b"PRI ")
+}
+
+/// buildx's h2c upgrade onto the engine socket's BuildKit endpoints.
+fn h2c_buildkit(req: &Request) -> bool {
+    req.method == "POST"
+        && matches!(req.path.as_str(), "/grpc" | "/session")
+        && req.header("upgrade").is_some_and(|v| v.eq_ignore_ascii_case("h2c"))
 }
 
 pub(super) enum Next {
@@ -108,8 +145,8 @@ fn route(req: &Request, engine: &Arc<Engine>, w: &mut UnixStream, r: &mut BufRea
         ("GET" | "HEAD", "/_ping") => {
             // Builder-Version 1: the classic POST /build, which Kiri serves
             // with its managed BuildKit (builder.rs). "2" would tell older
-            // CLIs and Compose to use BuildKit inside the engine (/session,
-            // /grpc), which Kiri doesn't have.
+            // CLIs and Compose to use BuildKit inside the engine; buildx
+            // reaches that through the /session and /grpc upgrades directly.
             http::respond_with(w, 200, "text/plain; charset=utf-8", "Builder-Version: 1\r\n", if m == "HEAD" { b"" } else { b"OK" })?;
             return Ok(Next::KeepAlive);
         }
@@ -3998,6 +4035,62 @@ mod tests {
         assert!(rx.recv_timeout(Duration::from_millis(300)).is_err());
         io::Write::write_all(&mut client, b"in").unwrap();
         assert!(rx.recv_timeout(Duration::from_secs(10)).is_ok());
+    }
+
+    /// Replays buildx's first requests against the engine socket (as the PR
+    /// review did) at the API layer, with a VM-less engine: the upgrade routes
+    /// must answer 101 instead of 404, prior knowledge must be handed to the
+    /// relay rather than answered with an HTTP status, and /_ping is unchanged.
+    #[test]
+    fn buildx_first_requests_are_answered_by_the_relay() {
+        use std::io::{Read, Write};
+        let root = std::env::temp_dir().join(format!("kiri-buildx-socket-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let engine = super::super::engine::boot_without_vm(&root);
+        // The relay asks for the pinned image's layers; a record keeps the
+        // test from pulling it, and stopped=true keeps it from booting a VM.
+        engine.store.put_image(kiri_image::Image {
+            name: super::super::builder::IMAGE.into(),
+            digest: "sha256:test".into(), index_digest: None, config_digest: "sha256:test".into(),
+            layers: Vec::new(), size: 0, platform: "linux/arm64".into(), created: String::new(), pulled_at: 0, config: Default::default(),
+        }).unwrap();
+
+        let raw = |bytes: &[u8]| -> String {
+            let e = engine.clone();
+            let (mut client, server) = UnixStream::pair().unwrap();
+            std::thread::spawn(move || { let _ = super::serve(server, e); });
+            client.write_all(bytes).unwrap();
+            client.set_read_timeout(Some(std::time::Duration::from_millis(300))).unwrap();
+            let mut out = Vec::new();
+            let mut buf = [0u8; 1024];
+            loop {
+                match client.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => out.extend_from_slice(&buf[..n]),
+                    Err(e) if matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock) => {
+                        if !out.is_empty() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            String::from_utf8_lossy(&out).into_owned()
+        };
+
+        let ping = raw(b"GET /_ping HTTP/1.1\r\nHost: docker\r\n\r\n");
+        assert!(ping.contains("Builder-Version: 1"), "{ping}");
+        for path in ["/grpc", "/session"] {
+            let req = format!("POST {path} HTTP/1.1\r\nHost: docker\r\nConnection: Upgrade\r\nUpgrade: h2c\r\n\r\n");
+            let response = raw(req.as_bytes());
+            assert!(response.starts_with("HTTP/1.1 101"), "{path}: {response}");
+        }
+        // Prior knowledge goes straight to the relay: no HTTP answer at all,
+        // certainly not the 404 an unrecognised route would produce.
+        let response = raw(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+        assert!(!response.starts_with("HTTP/1.1"), "prior knowledge: {response}");
+        let _ = std::fs::remove_dir_all(root);
     }
 }
 

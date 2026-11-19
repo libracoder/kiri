@@ -940,6 +940,19 @@ t build-dns "Address" bash -c "cd $BD && printf 'FROM alpine\nRUN nslookup examp
 t build-fails "exit code: 3" bash -c "cd $BD && printf 'FROM alpine\nRUN exit 3\n' > Dockerfile.bad && BUILDX_BUILDER=$BX $D build -f Dockerfile.bad . 2>&1"
 $D rmi kiri-test/built kiri-test/net >/dev/null 2>&1; rm -rf "$BD"
 
+section "built-in builder: buildx docker driver over Kiri's gRPC relay"
+BD2=$(mktemp -d)
+printf 'FROM alpine\nRUN echo built-in-ok > /built\n' > "$BD2/Dockerfile"
+# The `default` builder's docker driver dials the engine socket's /grpc and
+# /session: Kiri answers 101 and relays both to buildkitd in the guest, which
+# it starts on demand. This slice exports the result as files (no image load
+# into the local store yet), so check the file rather than running the image.
+t build-builtin-grpc "built-in-ok" bash -c "cd $BD2 && BUILDX_BUILDER=default perl -e 'alarm 300; exec @ARGV' $D buildx build --progress plain --output type=local,dest=$BD2/out . 2>&1 && cat $BD2/out/built"
+# A second build after the first connection closed must reach a buildkitd
+# that the idle watcher has stopped (or is still running): no manual setup.
+t build-builtin-grpc-again "built-in-ok" bash -c "cd $BD2 && BUILDX_BUILDER=default perl -e 'alarm 300; exec @ARGV' $D buildx build --progress plain --no-cache --output type=local,dest=$BD2/out2 . 2>&1 && cat $BD2/out2/built"
+rm -rf "$BD2"
+
 section "registry: login, push, pull"
 REG=$(mktemp -d); export DOCKER_CONFIG_SAVED=${DOCKER_CONFIG:-}
 # A throwaway client config: no keychain, nothing of the user's touched.

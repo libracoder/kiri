@@ -406,6 +406,13 @@ pub fn upgrade_if_asked(req: &Request, w: &mut impl Write) -> io::Result<()> {
     w.flush()
 }
 
+/// Answers buildx's `Upgrade: h2c` on `/grpc` or `/session` with `101`. After
+/// this the connection is HTTP/2 cleartext and belongs to the BuildKit relay.
+pub fn h2c_upgrade(w: &mut impl Write) -> io::Result<()> {
+    head(w, 101, "Connection: Upgrade\r\nUpgrade: h2c\r\n")?;
+    w.flush()
+}
+
 /// Docker's multiplexed stream framing: `[stream, 0, 0, 0, len u32 BE] data`.
 pub fn mux_frame(w: &mut impl Write, stream: u8, data: &[u8]) -> io::Result<()> {
     let mut header = [0u8; 8];

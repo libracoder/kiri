@@ -41,8 +41,10 @@ pub const INPUT_WINDOW: usize = 4 << 20;
 /// run the container under the default filter instead of its profile. 6
 /// added `Started::starting` and `AwaitStart`: an older host would read a
 /// start still filling a new volume as started, and let an exec in before
-/// the container's root is in place.
-pub const PROTOCOL: u16 = 6;
+/// the container's root is in place. 7 added `BuildkitStart`/`BuildkitStop`,
+/// which the daemon's built-in builder needs, so an older agent would
+/// answer every build session with an error.
+pub const PROTOCOL: u16 = 7;
 
 // `Run` is the one big message and is built and read once per container.
 #[allow(clippy::large_enum_variant)]
@@ -120,6 +122,16 @@ pub enum Msg<'a> {
     /// unpacked layer, by blob hex), `c` (a container's writable layer, by
     /// id) or `v` (a volume, by name). BYTES is what it takes on disk.
     Usage(StrList<'a>),
+    /// Host → guest: make sure buildkitd is running as a guest root process,
+    /// for the daemon's gRPC proxy (buildx's docker driver). `layers` are the
+    /// pinned BuildKit image's layer digests, latest first, so the agent
+    /// execs `/usr/bin/buildkitd` out of the newest layer that has it;
+    /// `config` replaces `/run/kiri/buildkitd.toml`. Answered by `Ack` or
+    /// `Error`.
+    BuildkitStart { layers: StrList<'a>, config: &'a str },
+    /// Host → guest: stop buildkitd (it has been idle). Answered by `Ack`
+    /// (or `Error`), even though stopped is what was there before.
+    BuildkitStop,
     /// Host → guest: metadata of a path inside a running container's root
     /// (symlinks are not followed). Answered by `FsStat` or `Error`.
     FsStatRequest { id: &'a str, path: &'a str },
@@ -216,6 +228,11 @@ pub const DNS_RELAY_PORT: u32 = 1037;
 /// vsock port of the guest's USB passthrough: one connection per device,
 /// `speed u32 | devid u32` then USB/IP (crates/kiri-init/src/linux/usb.rs).
 pub const USB_PORT: u32 = 1040;
+/// vsock port the agent accepts BuildKit connections on (VM only): the
+/// daemon's gRPC proxy (`/session`, `/grpc`) opens one stream per client
+/// connection, and the agent relays bytes to buildkitd's unix socket
+/// (`/run/kiri/buildkitd.sock`), spawning it on demand.
+pub const BUILDKIT_PORT: u32 = 1041;
 
 pub mod copy_op {
     pub const IN: u8 = 1;
@@ -717,6 +734,8 @@ mod kind {
     pub const USB_NODES: u16 = 77;
     pub const FS_EVENTS: u16 = 78;
     pub const AWAIT_START: u16 = 79;
+    pub const BUILDKIT_START: u16 = 80;
+    pub const BUILDKIT_STOP: u16 = 81;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -818,6 +837,15 @@ pub fn encode_retain<S: AsRef<str>>(out: &mut Vec<u8>, ids: &[S]) {
 /// Encodes a `RetainLayers` frame from the sender's layer digests.
 pub fn encode_retain_layers<S: AsRef<str>>(out: &mut Vec<u8>, digests: &[S]) {
     frame(out, kind::RETAIN_LAYERS, |out| StrList::put(out, digests));
+}
+
+/// Encodes a `BuildkitStart` frame from the sender's slices. The host needs
+/// the slice form: it holds the image's layer digests and the built config.
+pub fn encode_buildkit_start<S: AsRef<str>>(out: &mut Vec<u8>, layers: &[S], config: &str) {
+    frame(out, kind::BUILDKIT_START, |o| {
+        StrList::put(o, layers);
+        put_str(o, config);
+    });
 }
 
 /// A container's network, from the sender's side.
@@ -1002,6 +1030,12 @@ impl Msg<'_> {
                 put_u32(o, ids.count);
                 o.extend_from_slice(ids.raw);
             }),
+            Msg::BuildkitStart { layers, config } => frame(out, kind::BUILDKIT_START, |o| {
+                put_u32(o, layers.count);
+                o.extend_from_slice(layers.raw);
+                put_str(o, config);
+            }),
+            Msg::BuildkitStop => frame(out, kind::BUILDKIT_STOP, |_| {}),
             Msg::FsStatRequest { id, path } => frame(out, kind::FS_STAT_REQUEST, |o| {
                 put_str(o, id);
                 put_str(o, path);
@@ -1303,6 +1337,13 @@ pub fn decode(frame: &[u8]) -> Result<Msg<'_>, DecodeError> {
         kind::RETAIN_LAYERS => Msg::RetainLayers(r.list()?),
         kind::USAGE_QUERY => Msg::UsageQuery,
         kind::USAGE => Msg::Usage(r.list()?),
+        kind::BUILDKIT_START => Msg::BuildkitStart { layers: r.list()?, config: r.str()? },
+        kind::BUILDKIT_STOP => {
+            if r.remaining() != 0 {
+                return Err(DecodeError::Truncated);
+            }
+            Msg::BuildkitStop
+        }
         kind::FS_STAT_REQUEST => Msg::FsStatRequest { id: r.str()?, path: r.str()? },
         kind::FS_STAT => Msg::FsStat(read_entry(&mut r)?),
         kind::FS_LIST_REQUEST => Msg::FsListRequest { id: r.str()?, path: r.str()? },
@@ -1462,13 +1503,13 @@ mod tests {
     fn the_protocol_version_covers_starting() {
         // A host from before `Started::starting` would take a start still
         // filling a new volume for started and never ask `AwaitStart`; it
-        // speaks 5, and refuses this agent (and this host refuses an agent
-        // that speaks 5, which never answers `starting`).
-        const { assert!(PROTOCOL >= 6) };
+        // speaks 5, and refuses this agent. 7 also carries the BuildKit
+        // messages, so an older agent would refuse every build session.
+        const { assert!(PROTOCOL >= 7) };
         let mut buf = Vec::new();
         Msg::Hello(Hello { protocol: PROTOCOL, init_start_ns: 1, ready_ns: 2, mem_total_kib: 3, mem_available_kib: 4 }).encode(&mut buf);
         let Msg::Hello(h) = decode(&buf).unwrap() else { panic!() };
-        assert_eq!(h.protocol, 6);
+        assert_eq!(h.protocol, 7);
     }
 
     #[test]
@@ -1585,6 +1626,21 @@ mod tests {
         round(Msg::UplinkQuery);
         round(Msg::Uplink { ip: [192, 168, 64, 18], gateway: [192, 168, 64, 1] });
         round(Msg::Ack);
+        round(Msg::BuildkitStop);
+        let mut buf = Vec::new();
+        encode_buildkit_start(&mut buf, &["sha256:top", "sha256:base"], "[worker.oci]\ncap = \"4G\"");
+        let Msg::BuildkitStart { layers, config } = decode(&buf).unwrap() else { panic!() };
+        assert_eq!(layers.iter().collect::<Vec<_>>(), ["sha256:top", "sha256:base"]);
+        assert_eq!(config, "[worker.oci]\ncap = \"4G\"");
+        let mut again = Vec::new();
+        Msg::BuildkitStart { layers, config }.encode(&mut again);
+        assert_eq!(buf, again);
+        // An older agent rejects the new kinds rather than misreading frames:
+        // the protocol version check is what keeps them apart.
+        let mut old_kind = Vec::new();
+        Msg::BuildkitStop.encode(&mut old_kind);
+        old_kind[4] = 0xff;
+        assert_eq!(decode(&old_kind), Err(DecodeError::UnknownKind(0x00ff)));
         let mut buf = Vec::new();
         encode_copy(&mut buf, copy_op::IN, "c1", "/etc", copy_flags::KEEP_OWNERS, &["sha256:a", "sha256:b"]);
         let Msg::Copy(c) = decode(&buf).unwrap() else { panic!() };
