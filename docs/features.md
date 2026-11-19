@@ -4,7 +4,7 @@ What Kiri supports today, through the `kiri` Docker context.
 
 ## Platforms
 
-Apple silicon and Intel Macs (macOS 14+), Windows 10 and 11 (x86-64 and Arm, through WSL 2), and Linux (.deb and .rpm, tested on Ubuntu and Fedora). 
+Apple silicon and Intel Macs (macOS 12+), Windows 10 and 11 (x86-64 and Arm, through WSL 2), and Linux (.deb and .rpm, tested on Ubuntu and Fedora). 
 ## What works
 
 - **Containers**: `run` (`--rm`, `-d`, `-it`, `-e`, `-u`, `-w`, `--name`,
