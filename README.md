@@ -102,7 +102,7 @@ Docker's commands also work as `kiri` commands (`kiri run`, `kiri ps`,
 | Docker Desktop | 213 ms            | 243 ms       |
 | OrbStack       | 380 ms            | 442 ms       |
 
-Method and every other figure are in [`bench/results.json`](bench/results.json). Rerun with `kiri bench`.
+Method and every other figure are in [`bench/results.json`](bench/results.json). Rerun with `kiri bench --network bridge --runs 30` while all three engines are running.
 
 ## How it works
 
