@@ -548,9 +548,12 @@ impl Networks {
         };
         // 172.17.0.0/16 as Docker uses, unless the host already routes it
         // (Kiri on a Linux host inside another engine's container) or a
-        // saved network has it.
+        // saved network has it. A subnet an interface already has an
+        // address on counts too: a bridge with no carrier (Docker's
+        // docker0 with no containers) keeps its address while its route
+        // is linkdown, so routes alone would miss it (#489).
         let taken: Vec<([u8; 4], u8)> = saved.iter().map(|n| (n.subnet, n.prefix)).collect();
-        let (subnet, prefix) = free_subnet(&taken, true).unwrap_or(([172, 17, 0, 0], 16));
+        let (subnet, prefix) = default_bridge_subnet(&taken, &host_networks())?;
         let mut bridge = builtin("bridge", "bridge", "kiri0", subnet, [subnet[0], subnet[1], subnet[2], 1]);
         bridge.prefix = prefix;
         // `KIRI_BRIDGE_IPV6=1`, as Docker's daemon.json `"ipv6": true`: the
@@ -740,19 +743,92 @@ impl Networks {
     }
 }
 
+/// The default bridge's subnet, or an error when the whole pool is taken:
+/// falling back to 172.17.0.0/16 anyway would hand out a subnet the host
+/// already routes (#489), so the daemon fails to start loudly instead.
+fn default_bridge_subnet(taken: &[([u8; 4], u8)], host: &[(u32, u32)]) -> io::Result<([u8; 4], u8)> {
+    free_subnet_with(taken, true, host).ok_or_else(|| io::Error::other("no free subnet for the default bridge: 172.17.0.0/16 … 172.31.0.0/16 and 10.89.0.0/24 … 10.89.255.0/24 are all routed on this host or used by another network"))
+}
+
 /// The first free subnet: 172.17.0.0/16 (only for the default bridge), then
 /// 172.18.0.0/16 … 172.31.0.0/16, then 10.89.N.0/24, skipping ones Kiri
-/// already uses and ones the host routes.
+/// already uses and ones on the host's own links and interfaces.
 fn free_subnet(taken: &[([u8; 4], u8)], default_bridge: bool) -> Option<([u8; 4], u8)> {
-    let routes = host_routes();
+    free_subnet_with(taken, default_bridge, &host_networks())
+}
+
+/// The first free subnet against `host`'s networks, as `free_subnet` does
+/// against the live host's. Split out so tests can feed it a host.
+fn free_subnet_with(taken: &[([u8; 4], u8)], default_bridge: bool, host: &[(u32, u32)]) -> Option<([u8; 4], u8)> {
     let first = if default_bridge { 17 } else { 18 };
     (first..=31u8)
         .map(|b| ([172, b, 0, 0], 16u8))
         .chain((0..=255u8).map(|c| ([10, 89, c, 0], 24u8)))
         .find(|(s, p)| {
             let (net, mask) = (u32::from_be_bytes(*s), u32::MAX << (32 - p));
-            !taken.iter().any(|t| overlaps(*t, (*s, *p))) && !routes.iter().any(|(rn, rm)| (net & rm) == *rn || (rn & mask) == net)
+            !taken.iter().any(|t| overlaps(*t, (*s, *p))) && !host.iter().any(|(rn, rm)| (net & rm) == *rn || (rn & mask) == net)
         })
+}
+
+/// The host's own networks as (network, mask): its routes plus the subnets
+/// its interfaces have addresses on, outside Kiri's bridges. Only a Linux
+/// host shares its routing table and interfaces with Kiri.
+#[cfg(target_os = "linux")]
+fn host_networks() -> Vec<(u32, u32)> {
+    let mut out = host_routes();
+    out.extend(host_addrs());
+    out
+}
+
+#[cfg(not(target_os = "linux"))]
+fn host_networks() -> Vec<(u32, u32)> {
+    Vec::new()
+}
+
+/// The subnets this machine's interfaces have addresses on, as (network,
+/// mask), outside Kiri's bridges and loopback. An address stays configured
+/// on an interface whose route is linkdown, so this catches what the
+/// routing table misses.
+#[cfg(target_os = "linux")]
+fn host_addrs() -> Vec<(u32, u32)> {
+    let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs fills `list`, freed below; entries are read only while it lives.
+    if unsafe { libc::getifaddrs(&mut list) } != 0 {
+        return Vec::new();
+    }
+    let mut entries = Vec::new();
+    let mut p = list;
+    while !p.is_null() {
+        // SAFETY: `p` is an entry of the list getifaddrs returned.
+        let ifa = unsafe { &*p };
+        if !ifa.ifa_addr.is_null() && !ifa.ifa_netmask.is_null() && i32::from(unsafe { (*ifa.ifa_addr).sa_family }) == libc::AF_INET {
+            // SAFETY: an AF_INET address and netmask are sockaddr_in.
+            let a = unsafe { (*(ifa.ifa_addr as *const libc::sockaddr_in)).sin_addr.s_addr }.to_ne_bytes();
+            let m = unsafe { (*(ifa.ifa_netmask as *const libc::sockaddr_in)).sin_addr.s_addr }.to_ne_bytes();
+            // SAFETY: the interface name is NUL-terminated by getifaddrs.
+            let name = unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) }.to_string_lossy().into_owned();
+            entries.push((name, a, m));
+        }
+        p = ifa.ifa_next;
+    }
+    // SAFETY: the list getifaddrs returned, freed once.
+    unsafe { libc::freeifaddrs(list) };
+    interface_networks(entries)
+}
+
+/// The (network, mask) of each interface address, skipping Kiri's own
+/// bridges and loopback: a bridge Kiri made earlier is its own business,
+/// and 127.0.0.0/8 never overlaps the pool.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn interface_networks(entries: Vec<(String, [u8; 4], [u8; 4])>) -> Vec<(u32, u32)> {
+    entries
+        .into_iter()
+        .filter(|(name, a, _)| !name.starts_with("kiri") && a[0] != 127)
+        .map(|(_, a, m)| {
+            let (net, mask) = (u32::from_be_bytes(a) & u32::from_be_bytes(m), u32::from_be_bytes(m));
+            (net, mask)
+        })
+        .collect()
 }
 
 /// The host's own IPv6 routes, outside Kiri's bridges, the default route
@@ -802,6 +878,7 @@ fn host_routes() -> Vec<(u32, u32)> {
 }
 
 #[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
 fn host_routes() -> Vec<(u32, u32)> {
     Vec::new()
 }
@@ -961,6 +1038,32 @@ mod tests {
         assert_eq!(got, ["fd00:7::40", "fd00:7::41", "fd00:7::42", "fd00:7::43"]);
         assert!(n.allocate6("ranged", None, &[]).unwrap_err().contains("no free IPv6 address"));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn default_bridge_skips_a_subnet_an_interface_address_uses() {
+        // docker0 with 172.17.0.1/16 and no carrier, as in #489: its route
+        // is linkdown, but the address is still configured.
+        let host = interface_networks(vec![
+            ("docker0".into(), [172, 17, 0, 1], [255, 255, 0, 0]),
+            ("lo".into(), [127, 0, 0, 1], [255, 0, 0, 0]),
+            ("kiri0".into(), [172, 18, 0, 1], [255, 255, 0, 0]),
+        ]);
+        assert_eq!(host, [(u32::from_be_bytes([172, 17, 0, 0]), 0xffff0000)]);
+        assert_eq!(default_bridge_subnet(&[], &host).unwrap(), ([172, 18, 0, 0], 16));
+        // Nothing on the host: 172.17.0.0/16, as Docker uses.
+        assert_eq!(default_bridge_subnet(&[], &[]).unwrap(), ([172, 17, 0, 0], 16));
+    }
+
+    #[test]
+    fn default_bridge_errors_when_the_pool_is_full() {
+        // Every candidate blocked: 172.17-31 by one /12 route, the 10.89
+        // /24s by one /16. No silent fallback to 172.17.0.0/16 (#489).
+        let host = [
+            (u32::from_be_bytes([172, 16, 0, 0]), 0xfff00000u32),
+            (u32::from_be_bytes([10, 89, 0, 0]), 0xffff0000u32),
+        ];
+        assert!(default_bridge_subnet(&[], &host).is_err());
     }
 
     #[test]
