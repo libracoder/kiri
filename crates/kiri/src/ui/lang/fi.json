@@ -1824,5 +1824,6 @@
   "{n} more in a <a>Compose project</a>": "{n} lisää <a>Compose-projektissa</a>",
   "{n} more in <a>Compose projects</a>": "{n} lisää <a>Compose-projekteissa</a>",
   "Your only container is in a <a>Compose project</a>": "Ainoa konttisi on <a>Compose-projektissa</a>",
-  "All {n} containers are in <a>Compose projects</a>": "Kaikki {n} konttia ovat <a>Compose-projekteissa</a>"
+  "All {n} containers are in <a>Compose projects</a>": "Kaikki {n} konttia ovat <a>Compose-projekteissa</a>",
+  "No matches": "Ei osumia"
 }

@@ -1824,5 +1824,6 @@
   "{n} more in a <a>Compose project</a>": "另有 {n} 个在 <a>Compose 项目</a>中",
   "{n} more in <a>Compose projects</a>": "另有 {n} 个在 <a>Compose 项目</a>中",
   "Your only container is in a <a>Compose project</a>": "你唯一的容器在 <a>Compose 项目</a>中",
-  "All {n} containers are in <a>Compose projects</a>": "全部 {n} 个容器都在 <a>Compose 项目</a>中"
+  "All {n} containers are in <a>Compose projects</a>": "全部 {n} 个容器都在 <a>Compose 项目</a>中",
+  "No matches": "没有匹配项"
 }

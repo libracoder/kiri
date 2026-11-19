@@ -1824,5 +1824,6 @@
   "{n} more in a <a>Compose project</a>": "আরও {n}টি একটি <a>Compose প্রজেক্টে</a>",
   "{n} more in <a>Compose projects</a>": "আরও {n}টি <a>Compose প্রজেক্টে</a>",
   "Your only container is in a <a>Compose project</a>": "আপনার একমাত্র কন্টেইনারটি একটি <a>Compose প্রজেক্টে</a>",
-  "All {n} containers are in <a>Compose projects</a>": "সব {n}টি কন্টেইনার <a>Compose প্রজেক্টে</a>"
+  "All {n} containers are in <a>Compose projects</a>": "সব {n}টি কন্টেইনার <a>Compose প্রজেক্টে</a>",
+  "No matches": "কোনো মিল নেই"
 }

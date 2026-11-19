@@ -1824,5 +1824,6 @@
   "{n} more in a <a>Compose project</a>": "{n} til i et <a>Compose-prosjekt</a>",
   "{n} more in <a>Compose projects</a>": "{n} til i <a>Compose-prosjekter</a>",
   "Your only container is in a <a>Compose project</a>": "Den eneste containeren din er i et <a>Compose-prosjekt</a>",
-  "All {n} containers are in <a>Compose projects</a>": "Alle {n} containerne er i <a>Compose-prosjekter</a>"
+  "All {n} containers are in <a>Compose projects</a>": "Alle {n} containerne er i <a>Compose-prosjekter</a>",
+  "No matches": "Ingen treff"
 }

@@ -1824,5 +1824,6 @@
   "{n} more in a <a>Compose project</a>": "Dar {n} <a>Compose projekte</a>",
   "{n} more in <a>Compose projects</a>": "Dar {n} <a>Compose projektuose</a>",
   "Your only container is in a <a>Compose project</a>": "Vienintelis jūsų konteineris yra <a>Compose projekte</a>",
-  "All {n} containers are in <a>Compose projects</a>": "Visi {n} konteineriai yra <a>Compose projektuose</a>"
+  "All {n} containers are in <a>Compose projects</a>": "Visi {n} konteineriai yra <a>Compose projektuose</a>",
+  "No matches": "Atitikmenų nėra"
 }

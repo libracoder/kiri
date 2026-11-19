@@ -1824,5 +1824,6 @@
   "{n} more in a <a>Compose project</a>": "Thêm {n} trong một <a>dự án Compose</a>",
   "{n} more in <a>Compose projects</a>": "Thêm {n} trong các <a>dự án Compose</a>",
   "Your only container is in a <a>Compose project</a>": "Container duy nhất của bạn nằm trong một <a>dự án Compose</a>",
-  "All {n} containers are in <a>Compose projects</a>": "Cả {n} container đều nằm trong các <a>dự án Compose</a>"
+  "All {n} containers are in <a>Compose projects</a>": "Cả {n} container đều nằm trong các <a>dự án Compose</a>",
+  "No matches": "Không có kết quả phù hợp"
 }

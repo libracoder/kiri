@@ -1086,6 +1086,36 @@ tr.row:hover td.actions .acts-row { background: linear-gradient(var(--fwd), tran
 .pref .d { color: var(--muted); font-size: var(--fs); grid-column: 1; }
 .pref select { grid-row: 1 / span 2; grid-column: 2; height: 32px; width: 240px; padding: 0 10px; border-radius: 7px; border: 1px solid var(--line);
                background: var(--panel); color: var(--text); font: var(--fs) var(--ui-font); }
+/* Every other <select>: a button and its list (ssOpen); the select stays, hidden. */
+.ssb + select { display: none !important; }
+.ssb { display: inline-flex; align-items: center; gap: 6px; min-width: 0; max-width: 100%; height: 32px; padding: 0; padding-inline: 10px 8px; border: 1px solid var(--line); border-radius: 7px;
+       background: var(--panel); color: var(--text); font: var(--fs) var(--ui-font); text-align: start; vertical-align: middle; cursor: pointer; }
+.ssb:hover:not(:disabled) { border-color: color-mix(in srgb, var(--text) 25%, var(--line)); }
+.ssb[aria-expanded=true] { border-color: var(--blue); }
+.ssb:disabled { opacity: .55; cursor: default; }
+.ssc { display: grid; flex: 1; min-width: 0; }
+.ssc > * { grid-area: 1 / 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ssc .ssz { white-space: pre; height: 0; visibility: hidden; }
+.ssb .lchev { width: 12px; height: 12px; flex: none; color: var(--muted); }
+.pref .ssb { grid-row: 1 / span 2; grid-column: 2; width: 240px; }
+.logbar .ssb, .port-row .ssb { height: 30px; }
+.port-row .ssb { background: var(--bg); font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+.bl-bar .ssb { height: 28px; }
+.regmenu .wpanel .ssb, .htpop .ssb { height: 26px; border-radius: 6px; padding-inline: 8px 6px; }
+.regmenu .wpanel .ssb { border: 1px solid var(--line); background: var(--panel); }
+.htpop .ssb { width: 100%; }
+.sspop { position: fixed; z-index: 1000; display: grid; gap: 4px; min-width: 120px; max-width: calc(100vw - 16px); padding: 4px; box-sizing: border-box; background: var(--panel); color: var(--text);
+         border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 8px 24px rgba(0, 0, 0, .28); font: var(--fs) var(--ui-font); }
+.sslist { position: relative; overflow-y: auto; overscroll-behavior: contain; max-height: calc(9 * 26px); outline: 0; }
+.ssin { position: relative; }
+.ssrow { position: absolute; inset-inline: 0; height: 26px; display: grid; grid-template-columns: minmax(0, 1fr) 12px; align-items: center; gap: 8px; padding: 0 8px; border-radius: 5px; box-sizing: border-box; white-space: nowrap; cursor: pointer; }
+.ssrow bdi { overflow: hidden; text-overflow: ellipsis; }
+.ssrow.act { background: color-mix(in srgb, var(--blue) 14%, transparent); }
+.ssrow .lck { width: 12px; height: 12px; color: var(--blue); visibility: hidden; }
+.ssrow[aria-selected=true] .lck { visibility: visible; }
+.ssrow[aria-disabled=true] { opacity: .5; cursor: default; }
+.ssnone { padding: 10px 8px; color: var(--muted); }
+.ssnone:empty { display: none; }
 /* Settings → Appearance → Language: the button and its list (langPop). */
 .pref select.lsrc { position: absolute; width: 1px; height: 1px; min-width: 0; min-height: 0; max-width: 1px; max-height: 1px; padding: 0; border: 0; -webkit-appearance: none; appearance: none; opacity: 0; pointer-events: none; overflow: hidden; clip-path: inset(50%); }
 .lpick { grid-row: 1 / span 2; grid-column: 2; display: flex; align-items: center; gap: 6px; width: 220px; max-width: 100%; height: 28px; padding: 0; padding-inline: 10px 8px;
@@ -1096,11 +1126,11 @@ tr.row:hover td.actions .acts-row { background: linear-gradient(var(--fwd), tran
 .lpick[aria-expanded=true] { border-color: var(--blue); }
 .langpop { position: fixed; z-index: 8; width: 260px; max-width: calc(100vw - 16px); display: grid; gap: 4px; padding: 4px; background: var(--panel);
            border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 8px 24px rgba(0, 0, 0, .28); font-size: var(--fs); }
-.langpop .lfind { display: flex; align-items: center; gap: 6px; height: 26px; padding: 0 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--raised); color: var(--faint); cursor: text; }
-.langpop .lfind:focus-within { border-color: var(--blue); }
-.langpop .lfind svg { width: 12px; height: 12px; flex: none; }
-.langpop .lfind input { flex: 1; min-width: 0; height: 100%; padding: 0; border: 0; outline: 0; background: none; color: var(--text); font: var(--fs) var(--ui-font); }
-.langpop .lfind input::placeholder { color: var(--faint); }
+:is(.langpop, .sspop) .lfind { display: flex; align-items: center; gap: 6px; height: 26px; padding: 0 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--raised); color: var(--faint); cursor: text; }
+:is(.langpop, .sspop) .lfind:focus-within { border-color: var(--blue); }
+:is(.langpop, .sspop) .lfind svg { width: 12px; height: 12px; flex: none; }
+:is(.langpop, .sspop) .lfind input { flex: 1; min-width: 0; height: 100%; padding: 0; border: 0; outline: 0; background: none; color: var(--text); font: var(--fs) var(--ui-font); }
+:is(.langpop, .sspop) .lfind input::placeholder { color: var(--faint); }
 .langpop .llist { position: relative; overflow-y: auto; overscroll-behavior: contain; max-height: calc(8 * 25px); }
 .langpop .lrow { display: grid; grid-template-columns: minmax(0, 1fr) 12px; align-items: center; gap: 8px; min-height: 25px; padding: 3px 8px; border-radius: 5px; cursor: pointer; box-sizing: border-box; }
 .langpop .lrow:hover { background: var(--row-hover); }
@@ -3075,6 +3105,223 @@ function langPop(btn) {
   place();
   draw();
 }
+/* Every other <select> in the window shows as a button that opens a list
+   (ssOpen): a search above it once there are more than SS_FIND choices (case
+   and accents dropped, as you type); Up, Down, Page Up, Page Down, Home and
+   End move, Enter picks, Escape closes, Tab moves on, a click outside closes.
+   The <select> stays the choice, hidden behind its button: a pick sets its
+   value and sends it a change, so the code around it is unchanged. The list
+   draws only the rows in view, so 1,000 fonts open at once; a font menu
+   (data-ssfont) shows the rows in view in their own fonts once scrolling
+   stops: every option in its own font made WebKit load every installed font
+   (438 here) and froze the window for about 3 s. */
+const SS_H = 26, SS_FIND = 8;
+const ss = { open: null, btns: new Set(), n: 0 };
+const ssSels = document.getElementsByTagName("select");
+function ssSync(s) {
+  const b = s.ssb, v = s.options[s.selectedIndex]?.textContent ?? "", c = b.firstChild;
+  if (c.firstChild.textContent !== v) c.firstChild.textContent = v;
+  // A short menu is as wide as its widest choice, as a <select> is.
+  const z = s.options.length <= 30 ? [...s.options].map((o) => o.textContent).join("\n") : "";
+  if (c.lastChild.textContent !== z) c.lastChild.textContent = z;
+  if (b.disabled !== s.disabled) b.disabled = s.disabled;
+  // Its name: the select's, or the words of the label around it.
+  const l = s.getAttribute("aria-label") || (s.parentElement?.tagName === "LABEL" ? s.parentElement.firstChild?.textContent.trim() : "");
+  if (l && b.getAttribute("aria-label") !== l) b.setAttribute("aria-label", l);
+}
+function ssWrap(s) {
+  const b = document.createElement("button");
+  b.type = "button"; b.className = "ssb"; b.ssOf = s; s.ssb = b;
+  b.setAttribute("role", "combobox"); b.setAttribute("aria-haspopup", "listbox"); b.setAttribute("aria-expanded", "false");
+  b.innerHTML = `<span class="ssc"><span class="ssv"></span><span class="ssz" aria-hidden="true"></span></span>${LANG_CHEV}`;
+  b.addEventListener("click", () => ssOpen(b));
+  b.addEventListener("keydown", (ev) => {
+    if (ss.open || ev.metaKey || ev.ctrlKey) return;
+    if (["ArrowDown", "ArrowUp", "F4"].includes(ev.key)) { ev.preventDefault(); ssOpen(b); }
+    // A letter opens the search with it (the key lands in the field focused now).
+    else if (ev.key.length === 1 && ev.key !== " " && !ev.altKey && s.options.length > SS_FIND) ssOpen(b);
+  });
+  s.before(b); ss.btns.add(b);
+  ssSync(s);
+}
+// What finds a select again once its section is drawn anew (ssOpen's check).
+const ssKey = (s) => s.id ? `#${s.id}` : [s.className, s.getAttribute("aria-label") || "", ...[...s.attributes].filter((a) => a.name.startsWith("data-")).map((a) => a.name)].join("|");
+function ssScan() {
+  for (const b of ss.btns) if (!b.isConnected || b.nextSibling !== b.ssOf) { b.remove(); ss.btns.delete(b); b.ssOf.ssb = null; }
+  for (const s of ssSels) if (s.ssb) ssSync(s); else if (!s.classList.contains("lsrc")) ssWrap(s);
+  ss.open?.check();
+}
+// A value set from code shows on the button too.
+for (const p of ["value", "selectedIndex"]) {
+  const d = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, p);
+  Object.defineProperty(HTMLSelectElement.prototype, p, { ...d, set(v) { d.set.call(this, v); if (this.ssb) ssSync(this); } });
+}
+new MutationObserver(ssScan).observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ["disabled", "selected", "aria-label"] });
+ssScan();
+function ssOpen(b) {
+  if (ss.open) { const was = ss.open.b; ss.open.close(true); if (was === b) return; }
+  let s = b.ssOf;
+  const font = s.hasAttribute("data-ssfont"), id = `ss${++ss.n}`;
+  let opts = [...s.options];
+  const read = () => opts.map((o) => ({ v: o.value, t: o.textContent, k: langFold(o.textContent), off: o.disabled }));
+  let items = read();
+  const find = items.length > SS_FIND;
+  const pop = document.createElement("div");
+  pop.className = "sspop";
+  pop.innerHTML = (find ? `<label class="lfind">${LANG_FIND_ICON}<input type="text" spellcheck="false" autocomplete="off" role="combobox" aria-expanded="true" aria-autocomplete="list" aria-controls="${id}" aria-label="${esc(tr("Search"))}" placeholder="${esc(tr("Search"))}"></label>` : "")
+    + `<div class="sslist" id="${id}" role="listbox" tabindex="-1"><div class="ssin"></div></div><div class="ssnone" role="status" aria-live="polite"></div>`;
+  const q = pop.querySelector("input"), list = pop.querySelector(".sslist"), inner = list.firstChild, none = pop.lastChild, focus = q || list;
+  list.setAttribute("aria-label", b.getAttribute("aria-label") || "");
+  const ime = q ? langIme(q) : () => false;
+  let shown = items.map((_, i) => i), act = Math.max(0, s.selectedIndex), drawn = "", fontT = 0, findT = 0, ahead = "", aheadT = 0;
+  const row = (i) => list.querySelector(`[data-i="${i}"]`);
+  const draw = () => {
+    inner.style.height = `${shown.length * SS_H}px`;
+    const top = list.scrollTop, h = list.clientHeight || SS_H * 9;
+    const from = Math.max(0, Math.floor(top / SS_H) - 3), to = Math.min(shown.length, Math.ceil((top + h) / SS_H) + 3), cur = s.value;
+    let html = "";
+    for (let i = from; i < to; i++) {
+      const it = items[shown[i]];
+      html += `<div class="ssrow" role="option" id="${id}-${i}" data-i="${i}" aria-posinset="${i + 1}" aria-setsize="${shown.length}" aria-selected="${it.v === cur}"${it.off ? ' aria-disabled="true"' : ""} style="top:${i * SS_H}px"><bdi${it.ff ? ` style="font-family:${esc(it.ff)}"` : ""}>${esc(it.t)}</bdi>${LANG_CHECK}</div>`;
+    }
+    if (html !== drawn) { inner.innerHTML = html; drawn = html; }
+    mark();
+    none.textContent = shown.length ? "" : tr("No matches");
+    if (font) { clearTimeout(fontT); fontT = setTimeout(fonts, 90); }
+  };
+  // Only the rows on screen, once scrolling stops: a font is loaded the first time it shows.
+  const fonts = () => {
+    const top = list.scrollTop, h = list.clientHeight;
+    for (const r of inner.children) {
+      const it = items[shown[+r.dataset.i]], y = +r.dataset.i * SS_H;
+      if (it.ff || y + SS_H <= top || y >= top + h || !it.v || /^System( Mono)?$/.test(it.v)) continue;
+      it.ff = `"${it.v.replace(/["\\]/g, "\\$&")}", var(--ui-font)`;
+      r.firstChild.style.fontFamily = it.ff;
+    }
+  };
+  // The highlighted row (aria-activedescendant), without redrawing the rows.
+  const mark = () => {
+    inner.querySelector(".act")?.classList.remove("act");
+    row(act)?.classList.add("act");
+    focus.setAttribute("aria-activedescendant", shown.length ? `${id}-${act}` : "");
+  };
+  const show = (i) => {
+    if (!shown.length) return draw();
+    act = Math.min(shown.length - 1, Math.max(0, i));
+    if (act * SS_H < list.scrollTop) list.scrollTop = act * SS_H;
+    else if ((act + 1) * SS_H > list.scrollTop + list.clientHeight) list.scrollTop = (act + 1) * SS_H - list.clientHeight;
+    draw();
+  };
+  const filter = () => {
+    clearTimeout(findT); findT = 0;
+    const f = langFold(q.value.trim());
+    shown = []; for (let i = 0; i < items.length; i++) if (!f || items[i].k.includes(f)) shown.push(i);
+    const at = shown.indexOf(s.selectedIndex);
+    act = f || at < 0 ? 0 : at;
+    list.scrollTop = 0; show(act);
+  };
+  const choose = (i) => {
+    const it = items[shown[i]];
+    if (!it || it.off) return;
+    close(true);
+    if (s.value !== it.v) { s.value = it.v; s.dispatchEvent(new Event("change", { bubbles: true })); }
+  };
+  // Under the button, or above it when there's more room there; the list shrinks to fit.
+  // Sizes on screen over sizes in CSS (k) is Text size.
+  const place = () => {
+    const r = b.getBoundingClientRect(), k = (pop.getBoundingClientRect().width / pop.offsetWidth) || 1, gap = 4 * k, edge = 8;
+    pop.style.width = `${Math.max(r.width / k, Math.min(items.length > 30 ? 280 : 0, innerWidth / k - 16))}px`;
+    list.style.maxHeight = "";
+    const want = pop.getBoundingClientRect().height, below = innerHeight - r.bottom - gap - edge, above = r.top - gap - edge;
+    const up = want > below && above > below, room = up ? above : below;
+    if (want > room) list.style.maxHeight = `${Math.max(SS_H * 2, (list.getBoundingClientRect().height - (want - room)) / k)}px`;
+    const w = pop.getBoundingClientRect().width, h = pop.getBoundingClientRect().height;
+    pop.style.left = `${Math.max(edge, Math.min(rtl() ? r.right - w : r.left, innerWidth - w - edge)) / k}px`;
+    pop.style.top = `${(up ? r.top - gap - h : r.bottom + gap) / k}px`;
+    pop.classList.toggle("up", up);
+  };
+  const close = (back) => {
+    if (ss.open?.close !== close) return;
+    ss.open = null;
+    pop.remove(); clearTimeout(fontT); clearTimeout(findT);
+    removeEventListener("keydown", key, true);
+    removeEventListener("pointerdown", away, true);
+    removeEventListener("scroll", scrolled, true);
+    removeEventListener("resize", resized);
+    b.setAttribute("aria-expanded", "false");
+    if (back && b.isConnected) b.focus();
+  };
+  const key = (ev) => {
+    if (ime(ev)) return;
+    const k = ev.key, mod = ev.altKey || ev.metaKey || ev.ctrlKey;
+    if (k === "Escape") { ev.preventDefault(); ev.stopPropagation(); if (q?.value) { q.value = ""; filter(); } else close(true); return; }
+    // Tab moves on from the button, as it would from a <select>.
+    if (langTab(ev)) { close(true); return; }
+    if (k === "Enter" || (k === " " && !q)) { ev.preventDefault(); ev.stopPropagation(); choose(act); return; }
+    const page = Math.max(1, Math.floor(list.clientHeight / SS_H) - 1);
+    const to = { ArrowDown: act + 1, ArrowUp: act - 1, PageDown: act + page, PageUp: act - page, Home: 0, End: shown.length - 1 }[k];
+    if (to !== undefined && !mod && !(q && (k === "Home" || k === "End") && q.value)) { ev.preventDefault(); ev.stopPropagation(); if (findT) filter(); show(to); return; }
+    // No search field: letters jump to the first choice that starts with them.
+    if (!q && k.length === 1 && !mod) {
+      clearTimeout(aheadT); ahead += langFold(k); aheadT = setTimeout(() => { ahead = ""; }, 700);
+      const i = shown.findIndex((n) => items[n].k.startsWith(ahead));
+      if (i >= 0) show(i);
+    }
+  };
+  const away = (ev) => { if (!pop.contains(ev.target) && !b.contains(ev.target)) close(false); };
+  // A scroll elsewhere (a log that follows its lines) or a resize moves the
+  // list with its button; it closes when the button leaves the window.
+  const scrolled = (ev) => {
+    if (ev.target === list) return;
+    const r = b.getBoundingClientRect();
+    if (r.bottom < 0 || r.top > innerHeight || !r.width) close(false); else place();
+  };
+  const resized = scrolled;
+  ss.open = {
+    b, close, pop, flush: () => findT && filter(),
+    check: () => {
+      // Redrawn under the list (a refresh, a running build's next step): the same select drawn again
+      // takes over, found by its id, or else as the one select with the same data attributes, class
+      // and label (Builds' Which steps has no id). Two such, or none: the list closes.
+      if (!b.isConnected) {
+        const key = ssKey(s), same = s.id ? [document.getElementById(s.id)] : [...ssSels].filter((x) => x.ssb && ssKey(x) === key);
+        const to = same.length === 1 ? same[0] : null;
+        if (!to?.ssb) return close(false);
+        ss.open.b = b = to.ssb; s = to;
+        b.setAttribute("aria-expanded", "true"); b.setAttribute("aria-controls", id);
+        place();
+      }
+      // Its choices changed under it (drawn again, or options set from code): the list shows the new
+      // ones, the highlight staying on the same choice where it still is.
+      if (s.options.length !== opts.length || opts.some((o, i) => s.options[i] !== o)) {
+        const was = items[shown[act]]?.v;
+        opts = [...s.options]; items = read();
+        if (q) filter(); else shown = items.map((_, i) => i);
+        const at = shown.findIndex((n) => items[n].v === was);
+        show(at >= 0 ? at : Math.min(act, shown.length - 1));
+      }
+    },
+  };
+  for (const t of ["pointerdown", "mousedown", "click"]) pop.addEventListener(t, (ev) => ev.stopPropagation());
+  list.addEventListener("mousedown", (ev) => ev.preventDefault());
+  list.addEventListener("click", (ev) => { const r = ev.target.closest(".ssrow"); if (r) choose(+r.dataset.i); });
+  list.addEventListener("pointermove", (ev) => { const r = ev.target.closest(".ssrow"); if (r && +r.dataset.i !== act) { act = +r.dataset.i; mark(); } });
+  // Scroll events come at most once a frame: the rows in view are drawn then.
+  list.addEventListener("scroll", draw, { passive: true });
+  q?.addEventListener("input", () => { clearTimeout(findT); if (items.length > 300) findT = setTimeout(filter, 60); else filter(); });
+  addEventListener("keydown", key, true);
+  addEventListener("pointerdown", away, true);
+  addEventListener("scroll", scrolled, true);
+  addEventListener("resize", resized);
+  document.body.append(pop);
+  b.setAttribute("aria-expanded", "true");
+  b.setAttribute("aria-controls", id);
+  focus.focus();
+  draw();
+  place();
+  list.scrollTop = Math.max(0, act * SS_H - (list.clientHeight - SS_H) / 2);
+  draw();
+}
 /* The host's answer to langwords: a language's words, shown at once if it's
    still the one picked (another pick may have come meanwhile). */
 window.kiriWords = (p) => {
@@ -4181,9 +4428,9 @@ function renderSettings() {
     <div class="pref"><span class="t">${tr("Accent")}</span><span class="d">${tr("Selection, focus rings and primary buttons.")}</span>
       <div class="swatches" role="radiogroup" aria-label="${tr("Accent")}">${ACCENTS.map(([id, l, hex]) => `<button role="radio" aria-checked="${prefs.accent === id}" aria-label="${tr(l)}" title="${tr(l)}" data-accent="${id}" style="--sw:${hex}"></button>`).join("")}</div></div>
     <div class="pref"><span class="t">${tr("Interface font")}</span><span class="d">${tr("Tables, the sidebar and headings.")}</span>
-      <select id="pref-font" aria-label="${tr("Interface font")}">${opts(fontLists.families, prefs.font, "System")}</select></div>
+      <select id="pref-font" data-ssfont aria-label="${tr("Interface font")}">${opts(fontLists.families, prefs.font, "System")}</select></div>
     <div class="pref"><span class="t">${tr("Monospace font")}</span><span class="d">${tr("IDs, commands and code.")}</span>
-      <select id="pref-mono" aria-label="${tr("Monospace font")}">${opts(fontLists.mono, prefs.mono, "System Mono")}</select></div>
+      <select id="pref-mono" data-ssfont aria-label="${tr("Monospace font")}">${opts(fontLists.mono, prefs.mono, "System Mono")}</select></div>
     <div class="pref"><span class="t">${tr("Text size")}</span><span class="d">${tr("Everything in the window.")}</span>
       <div class="seg" role="group" aria-label="${tr("Text size")}">${SIZES.map((z) => `<button data-scale="${z}" aria-pressed="${Math.abs((prefs.scale || 1) - z) < 0.01}">${Math.round(z * 100)}%</button>`).join("")}</div></div>
     <div class="pref"><span class="t">${tr("Log text")}</span><span class="d">${tr("Container, Kubernetes and diagnostics logs.")}</span>
@@ -9370,6 +9617,15 @@ function morph(el, html) {
 }
 const morphKey = (n) => n.nodeType === 1 ? n.dataset.shrow ?? n.dataset.shname ?? n.dataset.key ?? "" : "";
 function morphKids(a, b) {
+  // A select's button (ssWrap) isn't in the markup: it goes back before its select, focus and all.
+  const bs = [...a.children].filter((x) => x.ssOf);
+  if (bs.length) {
+    const on = document.activeElement;
+    bs.forEach((x) => x.remove());
+    morphKids(a, b);
+    for (const x of bs) if (x.ssOf.parentNode === a) { x.ssOf.before(x); if (x === on) x.focus(); }
+    return;
+  }
   const keyed = new Map();
   for (const x of a.childNodes) { const k = morphKey(x); if (k) keyed.set(k, x); }
   const bn = [...b.childNodes];
@@ -10505,7 +10761,7 @@ $("pp").addEventListener("click", (ev) => {
   else if (t("[data-ppsignin]")) { pp.signin = true; ppList(); $("pplist").querySelector('[data-signin] [name="u"]')?.focus(); }
   else if ((el = t("[data-signin-go]"))) signinGo(el.closest("[data-signin]"));
 });
-document.addEventListener("pointerdown", (ev) => { if (pp.open && !ev.target.closest("#pp, [data-ppopen]")) closePull(); }, true);
+document.addEventListener("pointerdown", (ev) => { if (pp.open && !ev.target.closest("#pp, [data-ppopen], .sspop")) closePull(); }, true);
 window.addEventListener("keydown", (ev) => {
   const k = ev.key;
   if ((WIN ? ev.ctrlKey : ev.metaKey) && ev.shiftKey && !ev.altKey && k.toLowerCase() === "p") {
@@ -10812,7 +11068,7 @@ htEl.innerHTML = `<div class="htgrip" title="${tr("Drag to resize")}" data-i18n-
         <div class="row"><button class="st" data-ht="zout" aria-label="${tr("Smaller")}" data-i18n-label="Smaller">−</button><input type="range" min="${HT_FS.min}" max="${HT_FS.max}" step="1" aria-label="${tr("Text size")}" data-i18n-label="Text size"><button class="st" data-ht="zin" aria-label="${tr("Bigger")}" data-i18n-label="Bigger">+</button></div>
         <hr>
         <div class="lbl" data-i18n="Font">${tr("Font")}</div>
-        <select class="htfont" aria-label="${tr("Font")}" data-i18n-label="Font"></select>
+        <select class="htfont" data-ssfont aria-label="${tr("Font")}" data-i18n-label="Font"></select>
         <div class="keys"><span data-i18n="{zout} smaller · {zin} bigger · {z0} reset" data-i18n-vars='${esc(JSON.stringify({ zout: HT_KEYS.zout, zin: HT_KEYS.zin, z0: HT_KEYS.z0 }))}'>${tr("{zout} smaller · {zin} bigger · {z0} reset", { zout: esc(HT_KEYS.zout), zin: esc(HT_KEYS.zin), z0: esc(HT_KEYS.z0) })}</span><br><span data-i18n="or hold {mod} and scroll" data-i18n-vars='${esc(JSON.stringify({ mod: HT_KEYS.mod }))}'>${tr("or hold {mod} and scroll", { mod: esc(HT_KEYS.mod) })}</span></div>
       </div></div>
     <button class="sb" data-ht="max" title="${tr("Maximise")}" data-i18n-title="Maximise" aria-label="${tr("Maximise")}" data-i18n-label="Maximise">${HT_ICON.max}</button>

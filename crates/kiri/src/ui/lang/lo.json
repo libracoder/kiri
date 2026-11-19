@@ -1824,5 +1824,6 @@
   "{n} more in a <a>Compose project</a>": "ອີກ {n} ຢູ່ໃນ <a>ໂປຣເຈັກ Compose</a>",
   "{n} more in <a>Compose projects</a>": "ອີກ {n} ຢູ່ໃນ <a>ໂປຣເຈັກ Compose</a>",
   "Your only container is in a <a>Compose project</a>": "ຄອນເທນເນີດຽວຂອງທ່ານຢູ່ໃນ <a>ໂປຣເຈັກ Compose</a>",
-  "All {n} containers are in <a>Compose projects</a>": "ຄອນເທນເນີທັງໝົດ {n} ຢູ່ໃນ <a>ໂປຣເຈັກ Compose</a>"
+  "All {n} containers are in <a>Compose projects</a>": "ຄອນເທນເນີທັງໝົດ {n} ຢູ່ໃນ <a>ໂປຣເຈັກ Compose</a>",
+  "No matches": "ບໍ່ມີລາຍການທີ່ກົງກັນ"
 }

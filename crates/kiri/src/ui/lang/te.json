@@ -1824,5 +1824,6 @@
   "{n} more in a <a>Compose project</a>": "మరో {n} ఒక <a>Compose ప్రాజెక్ట్‌లో</a>",
   "{n} more in <a>Compose projects</a>": "మరో {n} <a>Compose ప్రాజెక్ట్‌లలో</a>",
   "Your only container is in a <a>Compose project</a>": "మీ ఏకైక కంటైనర్ ఒక <a>Compose ప్రాజెక్ట్‌లో</a> ఉంది",
-  "All {n} containers are in <a>Compose projects</a>": "మొత్తం {n} కంటైనర్‌లు <a>Compose ప్రాజెక్ట్‌లలో</a> ఉన్నాయి"
+  "All {n} containers are in <a>Compose projects</a>": "మొత్తం {n} కంటైనర్‌లు <a>Compose ప్రాజెక్ట్‌లలో</a> ఉన్నాయి",
+  "No matches": "సరిపోలికలు లేవు"
 }

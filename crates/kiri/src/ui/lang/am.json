@@ -1824,5 +1824,6 @@
   "{n} more in a <a>Compose project</a>": "{n} ተጨማሪ በ<a>Compose ፕሮጀክት</a> ውስጥ",
   "{n} more in <a>Compose projects</a>": "{n} ተጨማሪ በ<a>Compose ፕሮጀክቶች</a> ውስጥ",
   "Your only container is in a <a>Compose project</a>": "ብቸኛው ኮንቴይነርዎ በ<a>Compose ፕሮጀክት</a> ውስጥ ነው",
-  "All {n} containers are in <a>Compose projects</a>": "ሁሉም {n} ኮንቴይነሮች በ<a>Compose ፕሮጀክቶች</a> ውስጥ ናቸው"
+  "All {n} containers are in <a>Compose projects</a>": "ሁሉም {n} ኮንቴይነሮች በ<a>Compose ፕሮጀክቶች</a> ውስጥ ናቸው",
+  "No matches": "ምንም የሚዛመድ የለም"
 }

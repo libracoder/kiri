@@ -1824,5 +1824,6 @@
   "{n} more in a <a>Compose project</a>": "Ещё {n} в <a>проекте Compose</a>",
   "{n} more in <a>Compose projects</a>": "Ещё {n} в <a>проектах Compose</a>",
   "Your only container is in a <a>Compose project</a>": "Ваш единственный контейнер в <a>проекте Compose</a>",
-  "All {n} containers are in <a>Compose projects</a>": "Все контейнеры ({n}) в <a>проектах Compose</a>"
+  "All {n} containers are in <a>Compose projects</a>": "Все контейнеры ({n}) в <a>проектах Compose</a>",
+  "No matches": "Совпадений нет"
 }

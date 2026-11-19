@@ -1824,5 +1824,6 @@
   "{n} more in a <a>Compose project</a>": "Še {n} v <a>projektu Compose</a>",
   "{n} more in <a>Compose projects</a>": "Še {n} v <a>projektih Compose</a>",
   "Your only container is in a <a>Compose project</a>": "Vaš edini vsebnik je v <a>projektu Compose</a>",
-  "All {n} containers are in <a>Compose projects</a>": "Vseh {n} vsebnikov je v <a>projektih Compose</a>"
+  "All {n} containers are in <a>Compose projects</a>": "Vseh {n} vsebnikov je v <a>projektih Compose</a>",
+  "No matches": "Ni zadetkov"
 }

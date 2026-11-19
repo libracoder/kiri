@@ -1824,5 +1824,6 @@
   "{n} more in a <a>Compose project</a>": "{n}개 더 <a>Compose 프로젝트</a>에 있음",
   "{n} more in <a>Compose projects</a>": "{n}개 더 <a>Compose 프로젝트</a>에 있음",
   "Your only container is in a <a>Compose project</a>": "하나뿐인 컨테이너가 <a>Compose 프로젝트</a>에 있습니다",
-  "All {n} containers are in <a>Compose projects</a>": "컨테이너 {n}개가 모두 <a>Compose 프로젝트</a>에 있습니다"
+  "All {n} containers are in <a>Compose projects</a>": "컨테이너 {n}개가 모두 <a>Compose 프로젝트</a>에 있습니다",
+  "No matches": "일치하는 항목 없음"
 }

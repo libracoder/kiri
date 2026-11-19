@@ -1824,5 +1824,6 @@
   "{n} more in a <a>Compose project</a>": "Edhe {n} në një <a>projekt Compose</a>",
   "{n} more in <a>Compose projects</a>": "Edhe {n} në <a>projekte Compose</a>",
   "Your only container is in a <a>Compose project</a>": "Kontejneri juaj i vetëm është në një <a>projekt Compose</a>",
-  "All {n} containers are in <a>Compose projects</a>": "Të gjithë {n} kontejnerët janë në <a>projekte Compose</a>"
+  "All {n} containers are in <a>Compose projects</a>": "Të gjithë {n} kontejnerët janë në <a>projekte Compose</a>",
+  "No matches": "Asnjë përputhje"
 }

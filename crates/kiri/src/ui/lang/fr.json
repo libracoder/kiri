@@ -1824,5 +1824,6 @@
   "{n} more in a <a>Compose project</a>": "{n} de plus dans un <a>projet Compose</a>",
   "{n} more in <a>Compose projects</a>": "{n} de plus dans des <a>projets Compose</a>",
   "Your only container is in a <a>Compose project</a>": "Votre seul conteneur est dans un <a>projet Compose</a>",
-  "All {n} containers are in <a>Compose projects</a>": "Les {n} conteneurs sont dans des <a>projets Compose</a>"
+  "All {n} containers are in <a>Compose projects</a>": "Les {n} conteneurs sont dans des <a>projets Compose</a>",
+  "No matches": "Aucun résultat"
 }

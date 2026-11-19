@@ -1824,5 +1824,6 @@
   "{n} more in a <a>Compose project</a>": "Încă {n} într-un <a>proiect Compose</a>",
   "{n} more in <a>Compose projects</a>": "Încă {n} în <a>proiecte Compose</a>",
   "Your only container is in a <a>Compose project</a>": "Singurul container este într-un <a>proiect Compose</a>",
-  "All {n} containers are in <a>Compose projects</a>": "Toate cele {n} containere sunt în <a>proiecte Compose</a>"
+  "All {n} containers are in <a>Compose projects</a>": "Toate cele {n} containere sunt în <a>proiecte Compose</a>",
+  "No matches": "Nicio potrivire"
 }

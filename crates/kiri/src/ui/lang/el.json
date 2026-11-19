@@ -1824,5 +1824,6 @@
   "{n} more in a <a>Compose project</a>": "{n} ακόμη σε <a>έργο Compose</a>",
   "{n} more in <a>Compose projects</a>": "{n} ακόμη σε <a>έργα Compose</a>",
   "Your only container is in a <a>Compose project</a>": "Το μοναδικό σας container είναι σε <a>έργο Compose</a>",
-  "All {n} containers are in <a>Compose projects</a>": "Και τα {n} containers είναι σε <a>έργα Compose</a>"
+  "All {n} containers are in <a>Compose projects</a>": "Και τα {n} containers είναι σε <a>έργα Compose</a>",
+  "No matches": "Δεν βρέθηκαν αντιστοιχίες"
 }

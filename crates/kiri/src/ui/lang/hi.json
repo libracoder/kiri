@@ -1824,5 +1824,6 @@
   "{n} more in a <a>Compose project</a>": "{n} और एक <a>Compose प्रोजेक्ट</a> में",
   "{n} more in <a>Compose projects</a>": "{n} और <a>Compose प्रोजेक्ट</a> में",
   "Your only container is in a <a>Compose project</a>": "आपका इकलौता कंटेनर एक <a>Compose प्रोजेक्ट</a> में है",
-  "All {n} containers are in <a>Compose projects</a>": "सभी {n} कंटेनर <a>Compose प्रोजेक्ट</a> में हैं"
+  "All {n} containers are in <a>Compose projects</a>": "सभी {n} कंटेनर <a>Compose प्रोजेक्ट</a> में हैं",
+  "No matches": "कोई मेल नहीं"
 }

@@ -1824,5 +1824,6 @@
   "{n} more in a <a>Compose project</a>": "மேலும் {n} ஒரு <a>Compose திட்டத்தில்</a>",
   "{n} more in <a>Compose projects</a>": "மேலும் {n} <a>Compose திட்டங்களில்</a>",
   "Your only container is in a <a>Compose project</a>": "உங்கள் ஒரே கன்டெய்னர் ஒரு <a>Compose திட்டத்தில்</a> உள்ளது",
-  "All {n} containers are in <a>Compose projects</a>": "அனைத்து {n} கன்டெய்னர்களும் <a>Compose திட்டங்களில்</a> உள்ளன"
+  "All {n} containers are in <a>Compose projects</a>": "அனைத்து {n} கன்டெய்னர்களும் <a>Compose திட்டங்களில்</a> உள்ளன",
+  "No matches": "பொருத்தம் இல்லை"
 }

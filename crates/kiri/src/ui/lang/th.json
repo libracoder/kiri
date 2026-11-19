@@ -1824,5 +1824,6 @@
   "{n} more in a <a>Compose project</a>": "อีก {n} รายการใน<a>โปรเจกต์ Compose</a>",
   "{n} more in <a>Compose projects</a>": "อีก {n} รายการใน<a>โปรเจกต์ Compose</a>",
   "Your only container is in a <a>Compose project</a>": "คอนเทนเนอร์เดียวของคุณอยู่ใน<a>โปรเจกต์ Compose</a>",
-  "All {n} containers are in <a>Compose projects</a>": "คอนเทนเนอร์ทั้ง {n} รายการอยู่ใน<a>โปรเจกต์ Compose</a>"
+  "All {n} containers are in <a>Compose projects</a>": "คอนเทนเนอร์ทั้ง {n} รายการอยู่ใน<a>โปรเจกต์ Compose</a>",
+  "No matches": "ไม่พบรายการที่ตรงกัน"
 }

@@ -970,6 +970,13 @@ mod tests {
     }
 }
 
+/// The page's "fonts" event, made once (the window asks each time Settings
+/// opens without them). Fonts installed later show after a restart.
+fn fonts_event() -> &'static str {
+    static EVENT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    EVENT.get_or_init(|| json!({"type": "fonts", "families": crate::app::font_families(false), "mono": crate::app::font_families(true)}).to_string())
+}
+
 /// Handles one message from the page, on the window's thread: quick things
 /// here, the rest on the engine thread or a thread of their own.
 pub fn on_message(msg: &str) {
@@ -984,6 +991,12 @@ pub fn on_message(msg: &str) {
         // An uncaught error in the page (the shim in app.rs reports it).
         "jserror" => crate::serve::log(&format!("page: {}", c.name.chars().take(300).collect::<String>())),
         "ready" => {
+            // Listing the fonts is slow the first time: done now, off the
+            // window's thread, so Settings has them at once.
+            std::thread::spawn(|| {
+                std::thread::sleep(Duration::from_secs(3));
+                fonts_event();
+            });
             emit(json!({"type": "prefs", "prefs": prefs()}).to_string());
             // KIRI_STAR_PROMPT=1 shows the star card now, as on the Mac.
             if std::env::var_os("KIRI_STAR_PROMPT").is_some() {
@@ -1175,7 +1188,10 @@ pub fn on_message(msg: &str) {
                 Handle.eval(js);
             }
         }
-        "fonts" => emit(json!({"type": "fonts", "families": crate::app::font_families(false), "mono": crate::app::font_families(true)}).to_string()),
+        // Off the window's thread: GDI lists every installed face, twice.
+        "fonts" => {
+            std::thread::spawn(|| emit(fonts_event().to_owned()));
+        }
         "proxy" => {
             std::thread::spawn(|| proxy(None));
         }

@@ -1824,5 +1824,6 @@
   "{n} more in a <a>Compose project</a>": "További {n} egy <a>Compose-projektben</a>",
   "{n} more in <a>Compose projects</a>": "További {n} <a>Compose-projektekben</a>",
   "Your only container is in a <a>Compose project</a>": "Az egyetlen konténere egy <a>Compose-projektben</a> van",
-  "All {n} containers are in <a>Compose projects</a>": "Mind a(z) {n} konténer <a>Compose-projektekben</a> van"
+  "All {n} containers are in <a>Compose projects</a>": "Mind a(z) {n} konténer <a>Compose-projektekben</a> van",
+  "No matches": "Nincs találat"
 }

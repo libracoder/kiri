@@ -1824,5 +1824,6 @@
   "{n} more in a <a>Compose project</a>": "{n} lagi di <a>proyek Compose</a>",
   "{n} more in <a>Compose projects</a>": "{n} lagi di <a>proyek Compose</a>",
   "Your only container is in a <a>Compose project</a>": "Satu-satunya kontainer Anda ada di <a>proyek Compose</a>",
-  "All {n} containers are in <a>Compose projects</a>": "Semua {n} kontainer ada di <a>proyek Compose</a>"
+  "All {n} containers are in <a>Compose projects</a>": "Semua {n} kontainer ada di <a>proyek Compose</a>",
+  "No matches": "Tidak ada yang cocok"
 }

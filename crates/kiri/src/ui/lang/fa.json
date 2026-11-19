@@ -1824,5 +1824,6 @@
   "{n} more in a <a>Compose project</a>": "{n} مورد دیگر در یک <a>پروژهٔ Compose</a>",
   "{n} more in <a>Compose projects</a>": "{n} مورد دیگر در <a>پروژه‌های Compose</a>",
   "Your only container is in a <a>Compose project</a>": "تنها کانتینر شما در یک <a>پروژهٔ Compose</a> است",
-  "All {n} containers are in <a>Compose projects</a>": "همهٔ {n} کانتینر در <a>پروژه‌های Compose</a> هستند"
+  "All {n} containers are in <a>Compose projects</a>": "همهٔ {n} کانتینر در <a>پروژه‌های Compose</a> هستند",
+  "No matches": "موردی پیدا نشد"
 }
