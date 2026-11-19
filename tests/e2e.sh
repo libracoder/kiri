@@ -1007,6 +1007,21 @@ $D network create dno_shared >/dev/null; for p in a b; do $D network create dno-
 t dns-own-project-first "own" bash -c "want=\$($D inspect -f '{{(index .NetworkSettings.Networks \"dno-a_own\").IPAddress}}' dno-a-db); got=\$($D exec dno-a-web nslookup -type=a db 2>/dev/null | grep '^Address' | grep -v ':53' | cut -d' ' -f2 | tr '\n' ' '); [ \"\$got\" = \"\$want \" ] && echo own || echo \"got \$got want \$want\""
 t dns-shared-still-searched "Name:" $D exec dno-a-web nslookup -type=a dno-b-db
 $D rm -f dno-a-web dno-a-db dno-b-web dno-b-db >/dev/null; $D network rm dno_shared dno-a_own dno-b_own >/dev/null
+# A container that is not running leaves its first network, as on Docker:
+# .NET Aspire creates every container on bridge, connects it to a session
+# network, disconnects it from bridge, then starts it (#418). It then runs
+# on the session network only, with its default route and DNS there.
+$D rm -f probe probe-peer >/dev/null 2>&1; $D network rm probe-net >/dev/null 2>&1
+$D network create probe-net >/dev/null; $D run -d --name probe-peer --network probe-net alpine sleep 300 >/dev/null
+t leave-first-network "ok" bash -c "$D create --name probe alpine sleep 300 >/dev/null && $D network connect probe-net probe && $D network disconnect bridge probe && $D start probe >/dev/null && echo ok"
+t leave-first-inspect "[probe-net ]" bash -c "echo \"[\$($D inspect -f '{{range \$k, \$v := .NetworkSettings.Networks}}{{\$k}} {{end}}' probe)]\""
+t leave-first-default-route "default via" $D exec probe ip route
+t leave-first-dns "Name:" $D exec probe nslookup probe-peer
+t leave-first-no-eth1 "eth0 only" bash -c "$D exec probe ip -o link | grep -q eth1 && echo also-eth1 || echo eth0 only"
+t leave-first-running-refused "stop the container first" bash -c "$D network connect bridge probe && $D network disconnect probe-net probe 2>&1"
+t leave-last-network "lo only" bash -c "$D rm -f probe >/dev/null; $D create --name probe alpine sleep 300 >/dev/null && $D network disconnect bridge probe && $D start probe >/dev/null && ($D exec probe ip -o link | grep -q eth0 && echo has-eth0 || echo lo only)"
+t leave-last-reconnect "Name:" bash -c "$D stop -t 0 probe >/dev/null && $D network connect probe-net probe && $D start probe >/dev/null && $D exec probe nslookup probe-peer"
+$D rm -f probe probe-peer >/dev/null; t leave-first-network-rm "removed" bash -c "$D network rm probe-net >/dev/null && echo removed"
 
 section "events, prune, system df, search"
 t events "start" bash -c "($D events --filter container=evt --format '{{.Action}}' & p=\$!; sleep 0.5; $D run --name evt alpine true >/dev/null; sleep 0.5; kill \$p) 2>/dev/null"

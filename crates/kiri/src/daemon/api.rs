@@ -1939,6 +1939,7 @@ pub(super) fn create(req: &Request, engine: &Engine) -> Result<Value, Error> {
         ipv4_address,
         ipv6_address,
         mac_address,
+        left_all_networks: false,
         dns: strings(&host["Dns"]).unwrap_or_default(),
         dns_search: strings(&host["DnsSearch"]).unwrap_or_default(),
         dns_options: strings(&host["DnsOptions"]).unwrap_or_default(),
@@ -2117,7 +2118,9 @@ fn ps_status(c: &Container, health: Option<&super::health::Health>) -> String {
 fn endpoints(c: &Container, networks: &[super::network::Network]) -> Value {
     // Another container's namespace: no endpoints of its own, as Docker
     // shows it (`{}`), not an entry named `container:<id>`.
-    if c.spec.network_mode.starts_with("container:") {
+    // It left every network it had: none at all, as Docker shows it, not
+    // the `none` it is kept on.
+    if c.spec.network_mode.starts_with("container:") || c.spec.left_all_networks {
         return json!({});
     }
     let running = c.status == Status::Running;
@@ -2344,7 +2347,7 @@ fn inspect(c: &Container, nets: &[super::network::Network]) -> Value {
 
 fn network_settings(c: &Container, nets: &[super::network::Network]) -> Value {
     // Another container's namespace: nothing of its own, as Docker shows it.
-    if c.spec.network_mode.starts_with("container:") {
+    if c.spec.network_mode.starts_with("container:") || c.spec.left_all_networks {
         return json!({"IPAddress": "", "IPPrefixLen": 0, "MacAddress": "", "Ports": {}, "Networks": {}});
     }
     let prefix_of = |name: &str, has_ip: bool| if has_ip { nets.iter().find(|n| n.name == name).map_or(16, |n| n.prefix) } else { 0 };
@@ -3831,5 +3834,44 @@ mod network_option_tests {
         for bad in ["db\t1.2.3.4 evil", "db\n", "db\r", "db\0", ""] {
             assert!(!super::valid_hosts_name(bad), "{bad:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod leave_first_network_tests {
+    use super::*;
+
+    /// After the .NET Aspire sequence (created on bridge, connected to a
+    /// session network, disconnected from bridge) inspect and the list show
+    /// only the session network; after leaving that too, no network at all,
+    /// as Docker shows it, not the `none` Kiri keeps it on.
+    #[test]
+    fn inspect_shows_only_the_networks_it_still_has() {
+        let root = std::env::temp_dir().join(format!("kiri-leave-first-api-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let engine = super::super::engine::boot_without_vm(&root);
+        engine.lock_net().create("probe-net", Default::default()).unwrap();
+        let image = kiri_image::Image {
+            name: "test:1".into(), digest: "sha256:0123".into(), index_digest: None, config_digest: "sha256:0123".into(),
+            layers: Vec::new(), size: 0, platform: "linux/arm64".into(), created: String::new(), pulled_at: 0, config: Default::default(),
+        };
+        let spec: super::super::engine::Spec = serde_json::from_value(json!({
+            "image": "test:1", "image_id": "sha256:0123", "entrypoint": [], "cmd": ["true"],
+            "env": [], "cwd": "/", "user": "", "auto_remove": false, "network_mode": "bridge", "labels": {},
+            "restart": {"name": "no", "max_retries": 0}
+        })).unwrap();
+        let id = engine.create(Some("probe".into()), spec, &image).unwrap();
+        engine.connect("probe-net", &id, Vec::new(), String::new(), String::new(), String::new()).unwrap();
+        engine.disconnect("bridge", &id).unwrap();
+        let names = |v: &Value| v.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+        let networks: Vec<super::super::network::Network> = engine.lock_net().all().to_vec();
+        assert_eq!(names(&container_inspect(&engine, &id).unwrap()["NetworkSettings"]["Networks"]), ["probe-net"]);
+        assert_eq!(names(&engine.with(&id, |c| network_settings(c, &networks)).unwrap()["Networks"]), ["probe-net"]);
+        engine.disconnect("probe-net", &id).unwrap();
+        assert!(names(&container_inspect(&engine, &id).unwrap()["NetworkSettings"]["Networks"]).is_empty());
+        assert!(names(&engine.with(&id, |c| network_settings(c, &networks)).unwrap()["Networks"]).is_empty());
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -250,6 +250,13 @@ pub struct Spec {
     /// `--mac-address` on `network_mode`; empty for the kernel's choice.
     #[serde(default)]
     pub mac_address: String,
+    /// `network_mode` is `none` because the container left every network it
+    /// had (`docker network disconnect`), not because it was made with
+    /// `--network none`: it starts with no network as such a one does, but
+    /// unlike it can be connected again, and the network it is connected to
+    /// then becomes its first. Records from before it read false.
+    #[serde(default)]
+    pub left_all_networks: bool,
     /// `--dns`, `--dns-search`, `--dns-option`.
     #[serde(default)]
     pub dns: Vec<String>,
@@ -304,6 +311,55 @@ impl Limits {
 }
 
 impl Spec {
+    /// Whether `network` (a network's name) is the first network, kept in
+    /// `network_mode`; the API stores the name, but `default` is bridge.
+    pub fn first_network_is(&self, network: &str) -> bool {
+        self.network_mode == network || (network == "bridge" && matches!(self.network_mode.as_str(), "default" | ""))
+    }
+
+    /// Leaves the first network of a container that is not running, as
+    /// `docker network disconnect` does on Docker for any of its networks.
+    /// Kiri keeps the first network apart (`network_mode`, `aliases`,
+    /// `ipv4_address`, `ipv6_address`, `mac_address`) because only it gives
+    /// the default route and the main address, so one of the others takes
+    /// its place, with its own aliases, fixed addresses and MAC: none of the
+    /// left network's settings follow, or a fixed `--ip` would be asked for
+    /// on a network it does not belong to. The one picked is the one Docker
+    /// gives the default route to: a network that reaches outside before an
+    /// `internal` one (which gives no default route), then by name, as
+    /// libnetwork orders a container's endpoints when none has a gateway
+    /// priority (Kiri keeps none), and as create picks the primary of
+    /// several endpoints. `internal` says whether a network is internal.
+    /// With no other network it is left with none, as with `--network none`.
+    pub fn leave_first_network(&mut self, internal: impl Fn(&str) -> bool) {
+        let next = self.extra_networks.iter().enumerate().min_by(|(_, a), (_, b)| internal(&a.name).cmp(&internal(&b.name)).then_with(|| a.name.cmp(&b.name))).map(|(i, _)| i);
+        match next {
+            Some(i) => {
+                let x = self.extra_networks.remove(i);
+                self.join_first_network(x);
+            }
+            None => {
+                self.network_mode = "none".into();
+                self.left_all_networks = true;
+                self.aliases.clear();
+                self.ipv4_address.clear();
+                self.ipv6_address.clear();
+                self.mac_address.clear();
+            }
+        }
+    }
+
+    /// Makes `x` the first network, with its settings in place of the old
+    /// first network's.
+    fn join_first_network(&mut self, x: ExtraNetwork) {
+        self.network_mode = x.name;
+        self.left_all_networks = false;
+        self.aliases = x.aliases;
+        self.ipv4_address = x.ipv4_address;
+        self.ipv6_address = x.ipv6_address;
+        self.mac_address = x.mac_address;
+    }
+
     /// The guest's `opts` lines for a start or an exec. `net_host`: it runs
     /// in the VM's (or host's) network namespace.
     pub fn guest_opts(&self, net_host: bool) -> Result<Vec<String>, Error> {
@@ -2706,7 +2762,9 @@ impl Engine {
                 }
             }
         }
-        if !spec.ports.is_empty() {
+        // A container that left all its networks keeps its `-p` bindings
+        // but has no address for them, as on Docker, where it publishes none.
+        if !spec.ports.is_empty() && flags & run_flags::NET_NONE == 0 {
             let target = if flags & run_flags::NET_HOST != 0 { [127, 0, 0, 1] } else { ip };
             match super::ports::start(vm.clone(), &id, &spec.ports, target) {
                 Ok(fw) => {
@@ -3409,8 +3467,22 @@ impl Engine {
         let (n, running) = {
             let mut st = self.lock();
             let c = st.containers.get_mut(&id).ok_or_else(|| gone(&id))?;
-            if c.spec.network_mode == net.name || c.spec.extra_networks.iter().any(|x| x.name == net.name) {
+            if c.spec.first_network_is(&net.name) || c.spec.extra_networks.iter().any(|x| x.name == net.name) {
                 return Err(Error::Conflict(format!("endpoint with name {} already exists in network {}", c.name, net.name)));
+            }
+            // It left every network it had: the one it joins becomes its
+            // first, which a start sets up as such. A running one has only
+            // loopback and its resolver set for no network, which a plug-in
+            // alone would not change.
+            if c.spec.left_all_networks {
+                if c.status == Status::Running {
+                    return Err(Error::Conflict(format!("Kiri cannot connect a running container that left all its networks to {}; stop the container first", net.name)));
+                }
+                c.spec.join_first_network(ExtraNetwork { name: net.name.clone(), aliases, ipv4_address, ipv6_address, mac_address });
+                drop(st);
+                self.save();
+                self.emit_network("connect", &net, &id);
+                return Ok(());
             }
             if matches!(c.spec.network_mode.as_str(), "host" | "none") {
                 return Err(Error::BadRequest(format!("container cannot be connected to {} while on {}", net.name, c.spec.network_mode)));
@@ -3447,8 +3519,36 @@ impl Engine {
         let (n, ip) = {
             let mut st = self.lock();
             let c = st.containers.get_mut(&id).ok_or_else(|| gone(&id))?;
-            if c.spec.network_mode == net.name {
-                return Err(Error::BadRequest(format!("Kiri cannot disconnect a container from its first network ({})", net.name)));
+            if c.spec.first_network_is(&net.name) && matches!(net.name.as_str(), "host" | "none") {
+                if c.spec.left_all_networks {
+                    return Err(Error::NotFound(format!("container {} is not connected to network {}", &id[..12], net.name)));
+                }
+                return Err(Error::BadRequest(format!("container cannot be disconnected from {} network", net.name)));
+            }
+            if c.spec.first_network_is(&net.name) {
+                // A running container's first network holds its default
+                // route, its main address (which published ports go to) and
+                // its resolver: moving those to another network while it
+                // runs needs the guest to do more than unplug it.
+                if c.status == Status::Running {
+                    return Err(Error::Conflict(format!("Kiri cannot disconnect a running container from its first network ({}); stop the container first", net.name)));
+                }
+                let left = (c.ip.take(), c.ip6.take());
+                let nets = self.lock_networks();
+                c.spec.leave_first_network(|name| nets.find(name).is_some_and(|n| n.internal));
+                drop(nets);
+                drop(st);
+                // Not running, it holds no address; one left from a run that
+                // did not hand it back goes back to the pool all the same.
+                if let Some(ip) = left.0 {
+                    self.release_ip(&net.name, ip);
+                }
+                if let Some(a) = left.1 {
+                    self.lock_networks().release6(&net.name, a);
+                }
+                self.save();
+                self.emit_network("disconnect", &net, &id);
+                return Ok(());
             }
             let Some(pos) = c.spec.extra_networks.iter().position(|x| x.name == net.name) else {
                 return Err(Error::NotFound(format!("container {} is not connected to network {}", &id[..12], net.name)));
@@ -5964,5 +6064,208 @@ mod start_wait_tests {
         assert!(engine.lock().containers[&id].status == Status::Running);
         drop(engine);
         let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod leave_first_network_tests {
+    use super::*;
+    use super::super::network::{parse_ipam, Settings};
+
+    /// An engine that never boots a VM, with one created (not running)
+    /// container on the default bridge, and user networks `names`
+    /// (`internal` ones as such), each on its own /24.
+    fn engine(name: &str, nets: &[(&str, bool)]) -> (Arc<Engine>, String, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("kiri-leave-first-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let engine = Engine::boot(Store::open(&dir).unwrap()).unwrap();
+        engine.stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+        for (i, (net, internal)) in nets.iter().enumerate() {
+            let ipam = parse_ipam(&serde_json::json!({"Config": [{"Subnet": format!("10.98.{i}.0/24")}]})).unwrap();
+            engine.lock_networks().create(net, Settings { ipam, internal: *internal, ..Default::default() }).unwrap();
+        }
+        let image = Image {
+            name: "test:local".into(), digest: "sha256:test".into(), index_digest: None, config_digest: "sha256:test".into(),
+            layers: Vec::new(), size: 0, platform: "linux/arm64".into(), created: String::new(), pulled_at: 0, config: Default::default(),
+        };
+        let spec: Spec = serde_json::from_value(serde_json::json!({
+            "image": "test:local", "image_id": "sha256:test", "entrypoint": [], "cmd": ["sleep", "30"],
+            "env": [], "cwd": "/", "user": "", "auto_remove": false, "network_mode": "bridge", "labels": {},
+            "restart": {"name": "no", "max_retries": 0}
+        })).unwrap();
+        let id = engine.create(Some("probe".into()), spec, &image).unwrap();
+        (engine, id, dir)
+    }
+
+    fn spec(engine: &Engine, id: &str) -> Spec {
+        engine.lock().containers[id].spec.clone()
+    }
+
+    fn connect(engine: &Engine, net: &str, id: &str, aliases: &[&str], ip: &str) {
+        engine.connect(net, id, aliases.iter().map(|a| (*a).to_owned()).collect(), ip.into(), String::new(), String::new()).unwrap();
+    }
+
+    fn done(engine: Arc<Engine>, dir: PathBuf) {
+        drop(engine);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The .NET Aspire sequence: created on bridge, connected to a session
+    /// network, disconnected from bridge. The session network becomes its
+    /// first, with its own aliases, and the record on disk agrees.
+    #[test]
+    fn leaving_the_first_network_makes_the_other_one_first() {
+        let (engine, id, dir) = engine("one", &[("probe-net", false)]);
+        connect(&engine, "probe-net", &id, &["web"], "");
+        let (_, events) = engine.subscribe();
+        engine.disconnect("bridge", &id).unwrap();
+        let s = spec(&engine, &id);
+        assert_eq!(s.network_mode, "probe-net");
+        assert_eq!(s.aliases, ["web"]);
+        assert!(s.extra_networks.is_empty(), "{:?}", s.extra_networks);
+        assert!(!s.left_all_networks);
+        let sent: Vec<_> = events.try_iter().filter(|e| e["Type"] == "network").map(|e| (e["Action"].as_str().unwrap().to_owned(), e["Actor"]["Attributes"]["name"].as_str().unwrap().to_owned())).collect();
+        assert_eq!(sent, [("disconnect".to_owned(), "bridge".to_owned())]);
+        let saved: Vec<Saved> = serde_json::from_slice(&std::fs::read(&engine.records).unwrap()).unwrap();
+        assert_eq!(saved.iter().find(|c| c.id == id).unwrap().spec.network_mode, "probe-net");
+        // It is no longer on bridge.
+        assert!(matches!(engine.disconnect("bridge", &id), Err(Error::NotFound(_))));
+        done(engine, dir);
+    }
+
+    /// With two others, the next first is the one Docker gives the default
+    /// route to: one that reaches outside before an internal one, then by
+    /// name, whatever the order they were connected in. The other stays an
+    /// extra network with its settings.
+    #[test]
+    fn with_two_others_the_first_by_name_that_reaches_outside_takes_its_place() {
+        let (engine, id, dir) = engine("two", &[("zeta", false), ("alpha", true), ("beta", false)]);
+        connect(&engine, "zeta", &id, &["z"], "10.98.0.7");
+        connect(&engine, "alpha", &id, &["a"], "");
+        connect(&engine, "beta", &id, &["b"], "10.98.2.9");
+        engine.disconnect("bridge", &id).unwrap();
+        let s = spec(&engine, &id);
+        assert_eq!(s.network_mode, "beta", "alpha is internal; beta comes before zeta");
+        assert_eq!((s.aliases.as_slice(), s.ipv4_address.as_str()), (&["b".to_owned()][..], "10.98.2.9"));
+        assert_eq!(s.extra_networks.iter().map(|x| (x.name.as_str(), x.ipv4_address.as_str())).collect::<Vec<_>>(), [("zeta", "10.98.0.7"), ("alpha", "")]);
+        // Leaving that one too: zeta reaches outside, alpha does not.
+        engine.disconnect("beta", &id).unwrap();
+        assert_eq!(spec(&engine, &id).network_mode, "zeta");
+        engine.disconnect("zeta", &id).unwrap();
+        assert_eq!(spec(&engine, &id).network_mode, "alpha", "an internal network when it is the only one left");
+        done(engine, dir);
+    }
+
+    /// Leaving the only network leaves none, as `--network none`: inspect
+    /// shows no networks, a start gives it no network, and it can be
+    /// connected again, to what then becomes its first network.
+    #[test]
+    fn leaving_the_only_network_leaves_none_and_it_can_join_again() {
+        let (engine, id, dir) = engine("only", &[("probe-net", false)]);
+        engine.disconnect("bridge", &id).unwrap();
+        let s = spec(&engine, &id);
+        assert_eq!(s.network_mode, "none");
+        assert!(s.left_all_networks && s.extra_networks.is_empty());
+        assert!(matches!(engine.disconnect("bridge", &id), Err(Error::NotFound(_))));
+        assert!(matches!(engine.disconnect("none", &id), Err(Error::NotFound(_))), "it is on no network, not on none");
+        connect(&engine, "probe-net", &id, &["web"], "10.98.0.5");
+        let s = spec(&engine, &id);
+        assert_eq!((s.network_mode.as_str(), s.ipv4_address.as_str(), s.aliases.as_slice()), ("probe-net", "10.98.0.5", &["web".to_owned()][..]));
+        assert!(!s.left_all_networks && s.extra_networks.is_empty());
+        // And back on the bridge it left, as an extra network.
+        connect(&engine, "bridge", &id, &[], "");
+        let s = spec(&engine, &id);
+        assert_eq!(s.network_mode, "probe-net");
+        assert_eq!(s.extra_networks.iter().map(|x| x.name.as_str()).collect::<Vec<_>>(), ["bridge"]);
+        done(engine, dir);
+    }
+
+    /// `--network none` stays as it was: no disconnect from none, no connect.
+    #[test]
+    fn a_none_container_is_unchanged() {
+        let (engine, id, dir) = engine("none", &[("probe-net", false)]);
+        engine.lock().containers.get_mut(&id).unwrap().spec.network_mode = "none".into();
+        assert!(matches!(engine.disconnect("none", &id), Err(Error::BadRequest(_))));
+        assert!(matches!(engine.connect("probe-net", &id, Vec::new(), String::new(), String::new(), String::new()), Err(Error::BadRequest(_))));
+        assert_eq!(spec(&engine, &id).network_mode, "none");
+        done(engine, dir);
+    }
+
+    /// A fixed `--ip`, `--ip6` and `--mac-address` belong to the network
+    /// they were given for: none of them follows the container to the
+    /// next one, the address is no longer kept free for it, and an address
+    /// a run left behind goes back to the pool, so the network can go.
+    #[test]
+    fn a_fixed_address_on_the_left_network_is_released_and_not_carried_over() {
+        let (engine, id, dir) = engine("fixed", &[("left", false), ("kept", false)]);
+        {
+            let mut st = engine.lock();
+            let c = st.containers.get_mut(&id).unwrap();
+            c.spec.network_mode = "left".into();
+            c.spec.ipv4_address = "10.98.0.50".into();
+            c.spec.ipv6_address = "fd00::50".into();
+            c.spec.mac_address = "02:42:0a:62:00:32".into();
+            c.spec.aliases = vec!["old".into()];
+            // As if a run had not handed it back.
+            c.ip = Some([10, 98, 0, 50]);
+        }
+        engine.lock_networks().reserve("left", [10, 98, 0, 50]).unwrap();
+        assert_eq!(engine.wanted_addresses("left"), [[10, 98, 0, 50]]);
+        connect(&engine, "kept", &id, &[], "");
+        engine.disconnect("left", &id).unwrap();
+        let s = spec(&engine, &id);
+        assert_eq!(s.network_mode, "kept");
+        assert_eq!((s.ipv4_address.as_str(), s.ipv6_address.as_str(), s.mac_address.as_str()), ("", "", ""));
+        assert!(s.aliases.is_empty());
+        assert!(engine.wanted_addresses("left").is_empty());
+        assert!(engine.wanted_addresses("kept").is_empty());
+        assert_eq!(engine.lock().containers[&id].ip, None);
+        engine.lock_networks().reserve("left", [10, 98, 0, 50]).expect("the address went back to the pool");
+        engine.lock_networks().release("left", [10, 98, 0, 50]);
+        engine.lock_networks().remove("left").expect("the left network can be removed");
+        done(engine, dir);
+    }
+
+    /// Reconnecting to the network it left puts it back as an extra
+    /// network: the one that took its place stays first.
+    #[test]
+    fn reconnecting_to_the_left_network() {
+        let (engine, id, dir) = engine("again", &[("probe-net", false)]);
+        connect(&engine, "probe-net", &id, &[], "");
+        engine.disconnect("bridge", &id).unwrap();
+        connect(&engine, "bridge", &id, &[], "");
+        let s = spec(&engine, &id);
+        assert_eq!(s.network_mode, "probe-net");
+        assert_eq!(s.extra_networks.iter().map(|x| x.name.as_str()).collect::<Vec<_>>(), ["bridge"]);
+        assert!(matches!(engine.connect("bridge", &id, Vec::new(), String::new(), String::new(), String::new()), Err(Error::Conflict(_))));
+        done(engine, dir);
+    }
+
+    /// A running container is refused, with what to do instead, and
+    /// nothing changes: moving its default route, address and resolver to
+    /// another network while it runs is more than an unplug.
+    #[test]
+    fn a_running_container_must_be_stopped_first() {
+        let (engine, id, dir) = engine("running", &[("probe-net", false)]);
+        connect(&engine, "probe-net", &id, &[], "");
+        engine.lock().containers.get_mut(&id).unwrap().status = Status::Running;
+        let r = engine.disconnect("bridge", &id);
+        assert!(matches!(&r, Err(Error::Conflict(m)) if m.contains("stop the container first")), "{r:?}");
+        let s = spec(&engine, &id);
+        assert_eq!(s.network_mode, "bridge");
+        assert_eq!(s.extra_networks.len(), 1);
+        done(engine, dir);
+    }
+
+    /// Records saved before a container could leave all its networks load,
+    /// as on a network.
+    #[test]
+    fn old_records_load() {
+        let s: Spec = serde_json::from_value(serde_json::json!({
+            "image": "alpine", "image_id": "sha256:x", "entrypoint": [], "cmd": ["sh"], "env": [], "cwd": "", "user": "",
+            "auto_remove": false, "network_mode": "bridge", "labels": {},
+        }))
+        .unwrap();
+        assert!(!s.left_all_networks);
     }
 }
