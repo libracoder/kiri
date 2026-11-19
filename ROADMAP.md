@@ -12,19 +12,18 @@ Plans are tied to versions, not dates. They move when people report problems,
 and reported problems usually come first. To push something up the list, add a
 👍 to its issue, or [open one](https://github.com/libracoder/kiri/issues/new/choose).
 
-## Now: 0.2.2
+## Now: 0.2.3
 
-Fixes and engine work, most of it already merged
-([milestone](https://github.com/libracoder/kiri/milestone/5)):
+Friday's release
+([milestone](https://github.com/libracoder/kiri/milestone/6)):
 
-- Seccomp profiles are applied, and the default filter matches Docker's.
-- Saves made on the Mac reach file watchers in containers.
-- Containers set to `always` or `unless-stopped` come back after the VM
-  restarts.
-- On Windows, Docker works again after WSL restarts, and Settings › Import
-  brings images, volumes and containers over from Docker Desktop.
-- Image update checks (Watchtower, Arcane) work on Kiri.
-- Compose gets its own section in the window.
+- On Windows, the leftovers from the WSL restart fix
+  ([#395](https://github.com/libracoder/kiri/issues/395)).
+- Settings › Network lets you choose the addresses containers get
+  ([#217](https://github.com/libracoder/kiri/pull/217)).
+
+0.2.2 is out: security fixes, a Compose section in the window, searchable
+menus and a Homebrew tap ([release notes](docs/releases/0.2.2.md)).
 
 ## 0.3.0: share your way
 
