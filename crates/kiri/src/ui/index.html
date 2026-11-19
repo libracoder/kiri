@@ -4334,8 +4334,14 @@ function table(head, rows, view, last = `<th class="r">${tr("Actions")}</th>`, a
   // In place: a refresh or a button's change doesn't redraw the rows that stay.
   // A list whose rows can be picked starts with their boxes' column, and takes
   // focus for its keys (⌘A, arrows, Space, Delete).
+  const el = $("content");
+  const html = `<table data-view="${view}"${LISTS[view]?.bulk ? ' tabindex="0"' : ""}><thead><tr>${LISTS[view]?.bulk ? pickHead(view) : ""}${heads(head, view)}${last}</tr></thead><tbody>${rows.join("")}</tbody></table>${after}`;
+  // The same list again (each refresh sends it, whatever changed elsewhere): nothing to do. Drawing it
+  // again cost a full layout of every row (76 ms for 500 images).
+  if (html === el._list && el.firstElementChild === el._listEl) return;
   const keep = rowSlot();
-  morph($("content"), `<table data-view="${view}"${LISTS[view]?.bulk ? ' tabindex="0"' : ""}><thead><tr>${LISTS[view]?.bulk ? pickHead(view) : ""}${heads(head, view)}${last}</tr></thead><tbody>${rows.join("")}</tbody></table>${after}`);
+  morph(el, html);
+  el._list = html; el._listEl = el.firstElementChild;
   rowSlot(keep);
   spanRows();
   fitColumns();
@@ -4372,8 +4378,8 @@ function fitColumns() {
   // Laid out when columns declare a share or a fixed width, or after the
   // person has resized once (saved widths). Share-only tables (Images,
   // Containers) must not wait for a drag — otherwise a long tag pushes Actions off.
-  if (!w && !cells.some((th) => fixed(th) || th.dataset.share)) return;
-  tbl.classList.add("sized");
+  if (!w && !cells.some((th) => fixed(th) || th.dataset.share)) { for (const th of [...cells, last]) th.style.removeProperty("width"); return; }
+  if (!tbl.classList.contains("sized")) tbl.classList.add("sized"); // add() rewrites the attribute even when it's there
   const box = getComputedStyle(tbl.parentElement);
   // Actions take what their buttons need, not a saved width: a saved one can be stale or inflated.
   const lastW = actionsWidth(tbl) || w?.last || 0;
@@ -4401,10 +4407,10 @@ function fitColumns() {
   const left = Math.floor(room) - fits.reduce((a, v) => a + v, 0), widest = fits.indexOf(Math.max(...fits));
   if (left > 0 && left < fits.length && widest >= 0 && !fixed(cells[widest])) fits[widest] += left;
   cells.forEach((th, i) => {
-    if (fixed(th)) { th.style.width = `${fixedPx(th)}px`; return; }
-    th.style.width = `${fits[i]}px`;
+    const px = `${fixed(th) ? fixedPx(th) : fits[i]}px`;
+    if (th.style.width !== px) th.style.width = px;
   });
-  last.style.width = `${lastW}px`;
+  if (last.style.width !== `${lastW}px`) last.style.width = `${lastW}px`;
 }
 // How wide a text is in a row's cell (or in a heading, with its capitals and spacing).
 function textWidth(tbl, text, inside) {
@@ -4439,10 +4445,13 @@ function spanRows() {
   const n = [...tbl.tHead.rows[0].cells].filter(visible).length;
   for (const td of tbl.querySelectorAll("td[data-fill]")) {
     const rest = [...td.parentElement.cells].reduce((a, c) => a + (c === td || !visible(c) ? 0 : c.colSpan), 0);
-    td.colSpan = Math.max(1, n - rest);
+    const span = Math.max(1, n - rest);
+    if (td.colSpan !== span) td.colSpan = span;
   }
 }
-window.addEventListener("resize", () => { spanRows(); fitColumns(); });
+// The list's own width, not only the window's: a panel beside it can change it, and an unchanged
+// list is no longer drawn (and fitted) again on each refresh.
+{ let w0 = 0; new ResizeObserver(([e]) => { const w = Math.round(e.contentRect.width); if (w !== w0) { w0 = w; spanRows(); fitColumns(); } }).observe($("content")); }
 $("content").addEventListener("pointerdown", (ev) => {
   const grip = ev.target.closest(".col-resize");
   if (!grip || ev.button !== 0) return;
@@ -9333,6 +9342,10 @@ function morphKids(a, b) {
   const keyed = new Map();
   for (const x of a.childNodes) { const k = morphKey(x); if (k) keyed.set(k, x); }
   const bn = [...b.childNodes];
+  // Rows that are gone go first: left in place, each row after them was moved up one by one (a
+  // folded project's members, a removed container), every move a layout of the list.
+  const kept = new Set(bn.map(morphKey));
+  for (const [k, x] of keyed) if (!kept.has(k)) { x.remove(); keyed.delete(k); }
   bn.forEach((y, i) => {
     const at = a.childNodes[i] || null, k = morphKey(y), x = k && keyed.get(k);
     if (x) { keyed.delete(k); if (x !== at) a.insertBefore(x, at); morphNode(x, y); }
@@ -9346,6 +9359,14 @@ function morphNode(x, y) {
   if (x.nodeType !== 1) { if (x.nodeValue !== y.nodeValue) x.nodeValue = y.nodeValue; return; }
   // The direction the page gave an element from its own text (ownDirection) isn't in the new markup: it stays.
   if (x.dir === "auto" && x.className === y.className && !y.hasAttribute("dir")) y.setAttribute("dir", "auto");
+  // Nor the columns' sizing (fitColumns: the table's "sized", its headings' widths) or a wide cell's span
+  // (spanRows): taken off, the table fell back to laying out every row by its contents, then was measured
+  // and sized again, three full layouts on each refresh. Both are set again after the morph.
+  // Another list's table is drawn new: its sizing isn't this one's.
+  if (x.nodeName === "TABLE" && x.dataset.view !== y.dataset.view) return x.replaceWith(y);
+  if (x.nodeName === "TABLE" && x.classList.contains("sized")) y.classList.add("sized");
+  else if (x.nodeName === "TH" && x.style.width && !y.hasAttribute("style")) y.style.width = x.style.width;
+  else if (x.nodeName === "TD" && x.hasAttribute("data-fill") && y.hasAttribute("data-fill")) y.colSpan = x.colSpan;
   if (x.isEqualNode(y)) return;
   for (const { name } of [...x.attributes]) if (!y.hasAttribute(name)) x.removeAttribute(name);
   for (const { name, value } of [...y.attributes]) if (x.getAttribute(name) !== value) x.setAttribute(name, value);
