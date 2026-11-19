@@ -6355,9 +6355,15 @@ send("usage");
 
 /* Replaces an element's content only when it would change: the VM's figures
    (every 2 s) and the window's usage (every 5 s) mostly come back the same,
-   and rewriting the same markup still lays out and repaints it. */
+   and rewriting the same markup still lays out and repaints it. "The same"
+   holds only while what this put there is still in the element: a list
+   written straight into it (another section's table) replaces it, and the
+   same markup then has to go in again. What is still inside counts, also
+   when something has since been wrapped around it. */
 function setHTML(el, html) {
-  if (el && el._html !== html) { el.innerHTML = html; el._html = html; }
+  if (!el) return;
+  const still = el._html === html && (el._first ? el.contains(el._first) : !el.firstChild);
+  if (!still) { el.innerHTML = html; el._html = html; el._first = el.firstChild; }
 }
 const setText = (el, text) => { if (el && el.textContent !== text) el.textContent = text; };
 

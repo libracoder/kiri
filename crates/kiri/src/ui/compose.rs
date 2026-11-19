@@ -4424,8 +4424,16 @@ pub fn handle(cmd: &str, name: String, value: &Value, cli: Cli, store: Store, em
                     .put(&mut ev);
                     send(ev.to_string());
                 }
-                // Removed: the page says so (the project may stay, as a file opened).
-                Ok(()) if what == "remove" => send(json!({"type": "composeaction", "name": name, "removed": true}).to_string()),
+                // Removed: its containers and network are gone, and so is its
+                // place in the list, also when it came from a file opened
+                // here. The compose file stays where it is, and opening it
+                // again lists the project again.
+                Ok(()) if what == "remove" => {
+                    if let Err(e) = save_opened(store, |n, _| n != name, None) {
+                        send(own_event(json!({"type": "composeopened"}), e.to_string()));
+                    }
+                    send(json!({"type": "composeaction", "name": name, "removed": true}).to_string())
+                }
                 // Done: the page's button stops rolling.
                 Ok(()) => send(json!({"type": "composeaction", "name": name, "done": true}).to_string()),
             }
@@ -7878,6 +7886,46 @@ mod tests {
             seen.insert(dir);
         }
         assert_eq!(seen.len(), 3, "a fresh one each call: {got}");
+    }
+    /// Remove project takes a project opened from its file off the list too:
+    /// its containers go, and so does its row. The file itself isn't touched.
+    #[cfg(unix)]
+    #[test]
+    fn removing_a_project_opened_from_its_file_takes_it_off_the_list() {
+        static SAID: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        fn dir() -> PathBuf {
+            std::env::temp_dir().join(format!("kiri-rm-opened-{}", std::process::id()))
+        }
+        fn store() -> Option<PathBuf> {
+            Some(dir().join("compose.json"))
+        }
+        fn passes() -> io::Result<Command> {
+            let mut c = Command::new("sh");
+            c.args(["-c", "exit 0", "sh"]);
+            Ok(c)
+        }
+        fn emit(s: String) {
+            SAID.lock().unwrap().push(s)
+        }
+        std::fs::create_dir_all(dir()).unwrap();
+        let file = dir().join("compose.yaml");
+        std::fs::write(&file, "services:\n  web:\n    image: alpine\n").unwrap();
+        save_opened(store, |_, _| true, Some(("shop", file.to_str().unwrap()))).unwrap();
+        assert_eq!(opened(store).len(), 1, "listed once opened");
+        handle("composeaction", "shop".into(), &json!({"action": "remove"}), passes, store, emit);
+        // handle() answers from a thread of its own: the list comes last.
+        for _ in 0..400 {
+            if SAID.lock().unwrap().iter().any(|s| s.contains("composeprojects")) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let said = SAID.lock().unwrap().clone();
+        assert!(said.iter().any(|s| s.contains("\"removed\":true")), "said removed: {said:?}");
+        assert!(said.iter().any(|s| s.contains("composeprojects")), "and the list again: {said:?}");
+        assert!(opened(store).is_empty(), "off the list");
+        assert!(file.exists(), "the compose file stays");
+        let _ = std::fs::remove_dir_all(dir());
     }
     /// The include forms Kiri's own reader may not follow, each top file
     /// with the included project's secret in `sub/.env` (or its env file).
