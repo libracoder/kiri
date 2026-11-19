@@ -82,9 +82,29 @@ t version-api "1.47" $D version --format '{{.Server.APIVersion}}'
 # Engine version (Kiri's own beside it), the image's CMD for "Cmd": [], the
 # connection kept after a copy, log follow, one timestamp a line.
 t version-kiri-component "Kiri=" $D version --format '{{range .Server.Components}}{{.Name}}={{.Version}} {{end}}'
-for c in version cmd keepalive follow follow-created timestamps exec endpoints copy-after-start; do
+for c in version cmd keepalive close follow follow-created timestamps exec endpoints copy-after-start; do
   t "testcontainers-$c" "ok $c" python3 "$(dirname "$0")/testcontainers-api.py" "$SOCK" "$c"
 done
+# A request that asks for the close is answered, then closed: Docker.DotNet
+# reads a 204 to the end of the stream and hung until its timeout (#520, #479).
+# curl knows a 204 has no body and would not notice, so the probe sends the
+# raw request and reads to the end: "STATUS closed", or "open" after 3 s.
+PROBE='import socket, sys, time
+s = socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); s.sendall(sys.argv[2].encode().decode("unicode_escape").encode())
+s.settimeout(0.5); got, end, closed = b"", time.time() + 3, False
+while time.time() < end and not closed:
+    try:
+        d = s.recv(65536); closed = not d; got += d
+    except socket.timeout:
+        pass
+print(got.split(b" ")[1].decode() if got.startswith(b"HTTP/") else "no-answer", "closed" if closed else "open")'
+$D rm -f e2e-close >/dev/null 2>&1; $D create --name e2e-close alpine sleep 600 >/dev/null 2>&1
+t connection-close-start "204 closed" python3 -c "$PROBE" "$SOCK" 'POST /v1.44/containers/e2e-close/start HTTP/1.1\r\nHost: d\r\nConnection: close\r\n\r\n'
+t http10-start-closes "304 closed" python3 -c "$PROBE" "$SOCK" 'POST /v1.44/containers/e2e-close/start HTTP/1.0\r\n\r\n'
+t keep-alive-start-stays "304 open" python3 -c "$PROBE" "$SOCK" 'POST /v1.44/containers/e2e-close/start HTTP/1.1\r\nHost: d\r\n\r\n'
+t connection-close-said "Connection: close" curl -s -m 5 -o /dev/null -D - --unix-socket "$SOCK" -H 'Connection: close' http://d/_ping
+t http10-ping-closes "200 closed" python3 -c "$PROBE" "$SOCK" 'GET /_ping HTTP/1.0\r\n\r\n'
+$D rm -f e2e-close >/dev/null 2>&1
 # Ryuk mounts the engine's socket and talks to it from inside.
 t socket-mount-reaches-kiri "Kiri" $D run --rm -v "$SOCK:/var/run/docker.sock" docker:cli docker version --format '{{.Server.Platform.Name}}'
 t info-os "Kiri" $D info --format '{{.OperatingSystem}}'
@@ -180,6 +200,20 @@ t caps-dropped "Operation not permitted" $D run --rm alpine sh -c 'hostname newn
 t caps-chown "ok" $D run --rm alpine sh -c 'touch /f && chown 1:1 /f && echo ok'
 t cgroup-view "cgroup2" $D run --rm alpine sh -c 'mount | grep cgroup2'
 t name "named-one" $D run --rm --name named-one alpine sh -c 'echo named-one'
+# `--pid container:` joins the other container's PID namespace and `--pid
+# host` the VM's (a Linux host's own); inspect keeps PidMode (#347).
+$D rm -f pid-a pid-b pid-h >/dev/null 2>&1
+$D run -d -i --name pid-a busybox:1.37 cat >/dev/null
+$D run -d -i --name pid-b --pid container:pid-a busybox:1.37 cat >/dev/null
+$D run -d -i --name pid-h --pid host busybox:1.37 cat >/dev/null
+t pid-mode-inspect "pid-b=container:$($D inspect -f '{{.Id}}' pid-a) pid-h=host" bash -c "echo pid-b=\$($D inspect -f '{{.HostConfig.PidMode}}' pid-b) pid-h=\$($D inspect -f '{{.HostConfig.PidMode}}' pid-h)"
+t pid-container-sees "2" bash -c "$D exec pid-b ps -o comm | grep -cx cat"
+t pid-container-pid1 "cat" bash -c "$D exec pid-b cat /proc/1/comm"
+t pid-host-sees-more "many" bash -c "n=\$($D exec pid-h ps -o pid | wc -l); [ \$n -gt 5 ] && echo many || echo \$n"
+t pid-own-default "1 cat" bash -c "$D exec pid-a sh -c 'echo \$(ps -o pid,comm | grep -w cat)'"
+t pid-container-stopped "cannot join PID of a non running container" bash -c "$D stop -t 0 pid-a >/dev/null; $D run --rm --pid container:pid-a busybox:1.37 true"
+t pid-container-unknown "No such container: pid-nosuch" $D run --rm --pid container:pid-nosuch busybox:1.37 true
+$D rm -f pid-a pid-b pid-h >/dev/null 2>&1
 t python "3.13" $D run --rm python:3.13-alpine python -c 'import sys;print(sys.version)'
 t node "v22" $D run --rm node:22-alpine node -v
 t debian-image "Valkey server" $D run --rm valkey/valkey valkey-server --version
@@ -385,6 +419,11 @@ t ipam-from-range "10.231.0.128" $D run --rm --network ipamnet alpine ip -4 addr
 t ipam-route "default via 10.231.0.254" $D run --rm --network ipamnet alpine ip route
 t ipam-overlap "Pool overlaps with other one on this address space" $D network create --subnet 10.231.0.0/16 ipamnet2
 t ipam-bad-gateway "no matching subnet for gateway" $D network create --subnet 10.232.0.0/24 --gateway 10.9.0.1 ipamnet3
+# A bridge name of one's own is refused, not reported and left unapplied:
+# Kiri's firewall knows its bridges by name (#423). Empty is Docker's unset.
+t bridge-name-refused "does not support the network option com.docker.network.bridge.name" $D network create -o com.docker.network.bridge.name=cp-isolated --subnet 10.234.0.0/24 bridgename
+code bridge-name-nothing-made 1 $D network inspect bridgename
+t bridge-name-empty "map[]" bash -c "$D network create -o com.docker.network.bridge.name= bridgename >/dev/null && $D network inspect -f '{{.Options}}' bridgename; $D network rm bridgename >/dev/null"
 # Fixed addresses (--ip, Compose ipv4_address) and MAC addresses.
 $D run -d --name fixed --network ipamnet --ip 10.231.0.10 --mac-address 02:42:0a:e7:00:0a nginx:alpine >/dev/null
 t static-ip "10.231.0.10" $D inspect -f '{{.NetworkSettings.Networks.ipamnet.IPAddress}}' fixed
@@ -496,7 +535,11 @@ t port-ipv6-curl "Welcome to nginx" curl -sg -m 5 'http://[::1]:18180'
 t port-ipv6-only "[::1]:18183" bash -c "$D run -d --name pub6 -p '[::1]:18183:80' nginx:alpine >/dev/null; $D port pub6"
 t port-ipv6-only-curl "Welcome to nginx" bash -c "for i in \$(seq 50); do curl -sg -m 1 'http://[::1]:18183' && break; sleep 0.2; done"
 code port-ipv6-only-not-v4 7 curl -s -m 2 http://127.0.0.1:18183
-$D rm -f pub pub2 puball pub6 >/dev/null
+# An exposed port that is not published is a null key, as Docker shows it;
+# Traefik's docker provider picks the port from these keys (#492).
+t port-exposed-null '{"80/tcp":null,"9000/tcp":null}' bash -c "$D run -d --name pubx --expose 9000 nginx:alpine >/dev/null; $D inspect -f '{{json .NetworkSettings.Ports}}' pubx"
+t port-exposed-stopped '{}' bash -c "$D stop -t 1 pubx >/dev/null; $D inspect -f '{{json .NetworkSettings.Ports}}' pubx"
+$D rm -f pub pub2 puball pub6 pubx >/dev/null
 code port-closed-after-stop 7 curl -s -m 2 http://localhost:18180
 
 section "host.docker.internal"
@@ -644,6 +687,20 @@ t vol-rm "tvol" $D volume rm tvol thtml tempty
 t vol-create "made-vol" $D volume create made-vol
 t tmpfs "size=10240k" $D run --rm --tmpfs /scratch:size=10m alpine sh -c 'mount | grep scratch'
 t tmpfs-mount "tmpfs on /t" $D run --rm --mount type=tmpfs,target=/t alpine sh -c 'mount | grep " /t "'
+# `--volumes-from` lends another container's volumes and binds at the same
+# paths, from a running or a stopped one, read-only with `:ro` (#450).
+$D rm -f vfsrc vfdst >/dev/null 2>&1
+$D run -d --name vfsrc -v tvfrom:/vol -v /anon -v "$BIND:/bind" alpine sh -c 'echo n > /vol/f; echo a > /anon/f; sleep 300' >/dev/null; sleep 1
+VFANON=$($D inspect -f '{{range .Mounts}}{{if eq .Destination "/anon"}}{{.Name}}{{end}}{{end}}' vfsrc 2>/dev/null)
+t volumes-from-running "n a from the mac" bash -c "$D run --rm --volumes-from vfsrc alpine sh -c 'echo \$(cat /vol/f /anon/f /bind/hello.txt)'"
+t volumes-from-ro "Read-only file system" $D run --rm --volumes-from vfsrc:ro alpine sh -c 'echo x > /vol/f'
+t volumes-from-inspect "/anon /bind /vol [vfsrc]" bash -c "$D create --name vfdst --volumes-from vfsrc alpine true >/dev/null && $D inspect -f '{{range .Mounts}}{{.Destination}} {{end}}{{.HostConfig.VolumesFrom}}' vfdst | tr ' ' '\n' | LC_ALL=C sort | tr '\n' ' ' | sed 's/^ *//'"
+$D stop -t 0 vfsrc >/dev/null
+t volumes-from-stopped "got:n a" bash -c "$D run --rm --volumes-from vfsrc alpine sh -c 'echo got:\$(cat /vol/f /anon/f)'"
+t volumes-from-unknown "No such container: vfnosuch" $D run --rm --volumes-from vfnosuch alpine true
+# The anonymous volume stays while another container still uses it.
+t volumes-from-anon-kept "got:a" bash -c "$D rm -v vfsrc >/dev/null; $D run --rm --volumes-from vfdst alpine sh -c 'echo got:\$(cat /anon/f)'"
+$D rm -f -v vfsrc vfdst >/dev/null 2>&1; $D volume rm tvfrom $VFANON >/dev/null 2>&1
 t anon-from-image "volume:/var/lib/postgresql/data" bash -c "$D run -d --name pgv -e POSTGRES_PASSWORD=x postgres:17-alpine >/dev/null; $D inspect -f '{{range .Mounts}}{{.Type}}:{{.Destination}}{{end}}' pgv"
 # Waits for the entrypoint's "init process complete" and then a working query,
 # not for pg_isready: on first start Postgres runs a temporary server to
@@ -918,6 +975,12 @@ t stats-pids "PIDS" $D stats --no-stream lim
 t stats-stream "lim" bash -c "perl -e 'alarm 3; exec @ARGV' $D stats --format '{{.Name}}' lim 2>/dev/null | head -1"
 t top "nginx: master process" $D top lim
 t top-ps-titles "PPID" $D top lim
+# ps_args picks ps's columns, as Docker runs ps with them (#348).
+t top-aux "%MEM" bash -c "$D top lim aux | head -1"
+t top-aux-master "nginx: master process" $D top lim aux
+t top-eo '["PID","RSS","COMMAND"]' curl -s --unix-socket "$SOCK" 'http://d/v1.47/containers/lim/top?ps_args=-eo+pid%2Crss%2Cargs'
+t top-eo-rss "ok" bash -c "$D top lim -eo pid,rss,args | awk 'NR>1 && \$2 ~ /^[0-9]+\$/ && \$2 > 0 {print \"ok\"; exit}'"
+t top-ps-args-refused "not supported" $D top lim -l
 t pause "paused" bash -c "$D pause lim >/dev/null && $D inspect -f '{{.State.Status}}' lim"
 t pause-ps "(Paused)" $D ps --filter name=lim --format '{{.Status}}'
 t pause-exec-refused "is paused" $D exec lim true

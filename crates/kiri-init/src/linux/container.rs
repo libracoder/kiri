@@ -49,6 +49,8 @@ pub struct NetCtx<'a> {
     pub upstream_dns: &'a [[u8; 4]],
     /// For `--network container:<id>`: that container's PID 1, if running.
     pub join_pid: Option<libc::pid_t>,
+    /// For `--pid container:<id>`: that container's PID 1, if running.
+    pub pid_join_pid: Option<libc::pid_t>,
 }
 
 /// Where containers live under the data directory.
@@ -476,6 +478,13 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
         netns = netns_inode(&joined);
         prepared.net_join = Some(joined);
     }
+    // `--pid container:`: entered by the agent just around the clone (see
+    // below); the fd is the agent's alone, the child closes its copy.
+    let mut pid_join = None;
+    if let Some(target) = net_opts::values(spec.net.opts, net_opts::PIDNS).next() {
+        let pid = net.pid_join_pid.ok_or_else(|| cleanup(io::Error::other(format!("cannot join PID of a non running container: {target}"))))?;
+        pid_join = Some(fs::File::open(format!("/proc/{pid}/ns/pid")).map_err(cleanup)?);
+    }
     prepared.host = HostApplied { rlimits: host.rlimits.clone(), groups: host.groups.clone(), nodes };
     // Small, short-lived files: kept in memory (/run is tmpfs), not on the data disk.
     let etc_dir = PathBuf::from("/run/kiri").join(spec.id);
@@ -506,18 +515,45 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
     let (parent_io, child_io) = stdio(&prepared).map_err(cleanup)?;
     let rootfs_c = sys::cstr(&rootfs).map_err(cleanup)?;
 
-    let mut flags = (libc::CLONE_NEWNS | libc::CLONE_NEWPID | libc::CLONE_NEWUTS | libc::CLONE_NEWIPC | libc::CLONE_NEWCGROUP)
-        as u64
-        | CLONE_INTO_CGROUP;
+    let mut flags = (libc::CLONE_NEWNS | libc::CLONE_NEWUTS | libc::CLONE_NEWIPC | libc::CLONE_NEWCGROUP) as u64 | CLONE_INTO_CGROUP;
     if spec.flags & run_flags::NET_HOST == 0 && prepared.net_join.is_none() {
         flags |= libc::CLONE_NEWNET as u64;
     }
+    // `--pid host` keeps the agent's PID namespace, `--pid container:` takes
+    // the other container's; otherwise the container gets its own.
+    if spec.flags & run_flags::PID_HOST == 0 && pid_join.is_none() {
+        flags |= libc::CLONE_NEWPID as u64;
+    }
     let args = CloneArgs { flags, exit_signal: libc::SIGCHLD as u64, cgroup: cgroup_fd.as_raw_fd() as u64, ..Default::default() };
 
+    // setns(CLONE_NEWPID) only changes where the agent's children go, so the
+    // child is cloned straight into the other container's PID namespace, as
+    // an exec is, and the agent's own is put back right after.
+    let own_pid_ns = match &pid_join {
+        Some(ns) => {
+            let own = fs::File::open("/proc/self/ns/pid").map_err(cleanup)?;
+            sys::setns(ns.as_raw_fd(), libc::CLONE_NEWPID).map_err(cleanup)?;
+            Some(own)
+        }
+        None => None,
+    };
     // SAFETY: the agent is single-threaded, as clone3 without CLONE_VM needs.
-    let pid = unsafe { sys::clone3(&args) }.map_err(cleanup)?;
-    if pid == 0 {
+    let cloned = unsafe { sys::clone3(&args) };
+    if let Ok(0) = cloned {
         container_child(&prepared, &rootfs_c, &child_io);
+    }
+    let restored = own_pid_ns.map_or(Ok(()), |own| sys::setns(own.as_raw_fd(), libc::CLONE_NEWPID));
+    drop(pid_join);
+    let pid = cloned.map_err(cleanup)?;
+    if let Err(e) = restored {
+        // The agent's next children would land in the other container: a
+        // start that cannot undo that is not one to go on with.
+        // SAFETY: killing and reaping the child we just cloned.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+            libc::waitpid(pid, std::ptr::null_mut(), 0);
+        }
+        return Err(cleanup(e));
     }
     // The child holds its own copy of the write end: only then does closing
     // it (the child exiting early) read as EOF here.

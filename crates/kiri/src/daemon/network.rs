@@ -338,6 +338,43 @@ fn builtin(name: &str, driver: &str, bridge: &str, subnet: [u8; 4], gateway: [u8
     }
 }
 
+/// `--opt com.docker.network.bridge.name=…`. Kiri names each bridge itself
+/// (`kiri0`, `kiri1`, …) and the guest's firewall recognises its bridges by
+/// that prefix (the forward filter, masquerading, the host.docker.internal
+/// and DNS redirects, the loopback guard), so another name is refused rather
+/// than reported and not applied.
+pub const BRIDGE_NAME_OPT: &str = "com.docker.network.bridge.name";
+
+/// The options a network keeps, or why one of them cannot be applied. An
+/// empty bridge name is Docker's "unset" and is dropped.
+fn checked_options(options: serde_json::Value) -> Result<serde_json::Value, String> {
+    let serde_json::Value::Object(mut map) = options else { return Ok(serde_json::json!({})) };
+    match map.get(BRIDGE_NAME_OPT).map(|v| v.as_str().unwrap_or("?")) {
+        None => {}
+        Some("") => {
+            map.remove(BRIDGE_NAME_OPT);
+        }
+        Some(name) => {
+            return Err(format!(
+                "Kiri does not support the network option {BRIDGE_NAME_OPT} ({name}): Kiri names each network's bridge itself (kiri1, kiri2, …), and its firewall rules depend on those names. Create the network without it"
+            ));
+        }
+    }
+    Ok(serde_json::Value::Object(map))
+}
+
+/// A network's options as inspect shows them: a bridge name that is not the
+/// bridge's own (kept by a Kiri that did not refuse it) is left out.
+pub fn shown_options(n: &Network) -> serde_json::Value {
+    let mut o = if n.options.is_object() { n.options.clone() } else { serde_json::json!({}) };
+    if let Some(map) = o.as_object_mut()
+        && map.get(BRIDGE_NAME_OPT).is_some_and(|v| v.as_str() != Some(n.bridge.as_str()))
+    {
+        map.remove(BRIDGE_NAME_OPT);
+    }
+    o
+}
+
 /// What `POST /networks/create` asks for beyond the name.
 #[derive(Debug, Default)]
 pub struct Settings {
@@ -605,6 +642,7 @@ impl Networks {
         if s.no_ipv4 && !s.ipv6 {
             return Err("invalid network config: IPv4 or IPv6 must be enabled".into());
         }
+        let options = checked_options(s.options.clone())?;
         if s.no_ipv4 && s.ipam.is_some() {
             return Err("invalid network config: an IPv4 subnet was given, but IPv4 is disabled (--ipv4=false)".into());
         }
@@ -670,7 +708,7 @@ impl Networks {
             user_subnet: s.ipam.is_some(),
             ip_range: s.ipam.as_ref().and_then(|i| i.ip_range),
             aux: s.ipam.map(|i| i.aux).unwrap_or_default(),
-            options: if s.options.is_object() { s.options } else { serde_json::json!({}) },
+            options,
             ipam_options: s.ipam_options,
             attachable: s.attachable,
             no_ipv4: s.no_ipv4,
@@ -897,6 +935,26 @@ mod tests {
         assert!(n.create("neither", Settings { no_ipv4: true, ..Default::default() }).unwrap_err().contains("IPv4 or IPv6 must be enabled"));
         let ipam = parse_ipam(&serde_json::json!({"Config": [{"Subnet": "10.77.0.0/24"}]})).unwrap();
         assert!(n.create("both", Settings { no_ipv4: true, ipam, ..v6(None) }).unwrap_err().contains("IPv4 is disabled"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A bridge name of the user's own is refused: Kiri's firewall knows
+    /// its bridges by their `kiri` prefix. An empty one is Docker's unset;
+    /// one kept by an older Kiri is not shown in inspect.
+    #[test]
+    fn a_bridge_name_of_ones_own_is_refused_not_reported() {
+        let (mut n, dir) = nets();
+        let opts = |v: &str| Settings { options: serde_json::json!({BRIDGE_NAME_OPT: v, "com.docker.network.bridge.enable_ip_masquerade": "false"}), ..Default::default() };
+        let e = n.create("isolated", opts("cp-isolated")).unwrap_err();
+        assert!(e.starts_with("Kiri does not support the network option com.docker.network.bridge.name (cp-isolated)"), "{e}");
+        assert!(n.find("isolated").is_none(), "nothing made");
+        let made = n.create("isolated", opts("")).unwrap();
+        assert_eq!(made.options, serde_json::json!({"com.docker.network.bridge.enable_ip_masquerade": "false"}));
+        let mut old = made.clone();
+        old.options[BRIDGE_NAME_OPT] = "cp-isolated".into();
+        assert_eq!(shown_options(&old), made.options);
+        old.options[BRIDGE_NAME_OPT] = old.bridge.clone().into();
+        assert_eq!(shown_options(&old)[BRIDGE_NAME_OPT], old.bridge.as_str(), "its own name is true");
         let _ = std::fs::remove_dir_all(dir);
     }
 

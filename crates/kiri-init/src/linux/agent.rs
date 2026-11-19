@@ -432,11 +432,13 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
                     // Only its network namespace is joined, which exists from
                     // clone: a container still filling a volume will do.
                     let join_pid = kiri_proto::net_opts::values(spec.net.opts, kiri_proto::net_opts::NETNS).next().and_then(|t| netns_pid(procs, t));
+                    // A PID namespace exists from clone too.
+                    let pid_join_pid = kiri_proto::net_opts::values(spec.net.opts, kiri_proto::net_opts::PIDNS).next().and_then(|t| live_pid(procs, t));
                     failed_starts.remove(spec.id);
                     container::spawn(
                     &spec,
                     paths,
-                    NetCtx { bridges: &mut bridges, dns: &mut dns, upstream_dns: dhcp.as_ref().and_then(|d| d.lease.as_ref()).map_or(&host_dns[..], |l| &l.dns), join_pid },
+                    NetCtx { bridges: &mut bridges, dns: &mut dns, upstream_dns: dhcp.as_ref().and_then(|d| d.lease.as_ref()).map_or(&host_dns[..], |l| &l.dns), join_pid, pid_join_pid },
                 )
                 } {
                     Ok(run) => {

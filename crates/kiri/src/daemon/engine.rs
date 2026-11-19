@@ -274,6 +274,14 @@ pub struct Spec {
     /// GroupAdd as given; see [`super::hostopts`].
     #[serde(default)]
     pub host_opts: serde_json::Value,
+    /// `--volumes-from` as given, for inspect; the mounts it brought are in
+    /// `mounts` and `mount_info` with the others.
+    #[serde(default)]
+    pub volumes_from: Vec<String>,
+    /// `--pid`: empty for a PID namespace of its own, `host`, or
+    /// `container:<full id>`.
+    #[serde(default)]
+    pub pid_mode: String,
 }
 
 /// One `--link name:alias`.
@@ -589,6 +597,22 @@ pub struct Exec {
     attached: Vec<Sender<(Stream, Vec<u8>)>>,
 }
 
+impl Exec {
+    /// The VM stopped under it. A running exec gets an exit code (255, as its
+    /// container does) before its output stream closes: docker-java
+    /// (Testcontainers' `execInContainer`) inspects the exec as soon as the
+    /// stream ends and fails on a finished exec with a null `ExitCode` (#551).
+    /// One never started keeps none, as in Docker.
+    fn end_with_vm(&mut self) {
+        if self.running && self.exit_code.is_none() {
+            self.exit_code = Some(255);
+        }
+        self.running = false;
+        self.pid = 0;
+        self.attached.clear();
+    }
+}
+
 /// What `docker logs` reads: the stored part, then (with `follow`) what comes after it.
 pub struct Logs {
     pub tty: bool,
@@ -727,6 +751,25 @@ impl Damage {
         }
         Some(m.join(" "))
     }
+}
+
+/// The `docker info` warning for a repaired image list (#440): where the
+/// damaged copy is, which images it names that the list lost, and that
+/// their unpacked layers are kept until the copy is removed. `Err`: the
+/// list or its folder could not be read, so lost images cannot be ruled out.
+fn image_damage_message(damage: &io::Result<Option<kiri_image::store::IndexDamage>>, root: &std::path::Path) -> Option<String> {
+    let d = match damage {
+        Ok(None) => return None,
+        Ok(Some(d)) => d,
+        Err(e) => return Some(format!("Kiri cannot read the image list in {} ({e}), so it cannot tell whether images are missing from it; it keeps every unpacked layer meanwhile.", root.display())),
+    };
+    let copies = d.copies.iter().map(|c| c.display().to_string()).collect::<Vec<_>>().join(", ");
+    let (one, kept) = if d.copies.len() == 1 { ("a copy of it is", "the copy is") } else { ("copies are", "the copies are") };
+    let missing = match d.missing.len() {
+        0 => "Every image it names is listed again.".to_owned(),
+        n => format!("{n} image(s) it names are missing from `docker images`: {}. Pulled ones can be pulled again; built or committed ones are in the copy.", d.missing.join(", ")),
+    };
+    Some(format!("The image list was damaged and repaired; {one} kept at {copies}. {missing} Kiri keeps every unpacked layer until {kept} removed."))
 }
 
 /// Reads `containers.json`. One that does not parse is kept as a
@@ -1036,6 +1079,12 @@ impl Engine {
         self.records_damage.lock().unwrap_or_else(|e| e.into_inner()).message(&self.records).into_iter().collect()
     }
 
+    /// Why unpacked layers may belong to images the image list lost, for
+    /// `docker info`.
+    pub fn image_damage(&self) -> Option<String> {
+        image_damage_message(&self.store.index_damage(), self.store.root())
+    }
+
     /// Whether nothing is deleted for not being in the container list.
     fn keeps_everything(&self) -> bool {
         self.records_damage.lock().unwrap_or_else(|e| e.into_inner()).any()
@@ -1144,9 +1193,15 @@ impl Engine {
             None => crate::diag::warn!("kept every container's files and layers: the container list was damaged"),
         }
         // And every unpacked layer no image or container uses. Skipped if
-        // the image list can't be read, rather than deleting everything.
+        // the image list can't be read, rather than deleting everything, and
+        // while a damaged copy of it is kept: images cut from the list may
+        // still be someone's (#440).
+        let image_damage = self.store.index_damage();
         match self.store.images() {
             _ if keep.is_none() => {}
+            _ if !matches!(image_damage, Ok(None)) => {
+                crate::diag::warn!("kept every unpacked layer: the image list was damaged", detail = image_damage_message(&image_damage, self.store.root()).unwrap_or_default());
+            }
             Ok(images) => {
                 let mut layers: std::collections::BTreeSet<String> = images.iter().flat_map(|i| i.layers.iter().map(|l| l.digest.clone())).collect();
                 layers.extend(self.lock().containers.values().flat_map(|c| c.layers.iter().cloned()));
@@ -1172,7 +1227,7 @@ impl Engine {
     fn vm_restart_candidates(&self) -> Vec<String> {
         let st = self.lock();
         let mut ids: Vec<String> = st.containers.values().filter(|c| recover_after_vm_loss(c)).map(|c| c.id.clone()).collect();
-        ids.sort_by_key(|id| st.containers.get(id).is_some_and(|c| c.spec.network_mode.starts_with("container:") || !c.spec.links.is_empty()));
+        ids.sort_by_key(|id| st.containers.get(id).is_some_and(joins_others));
         ids
     }
 
@@ -2028,7 +2083,7 @@ impl Engine {
                 // from the list now, their data off this thread (the VM's
                 // reader), since that asks the VM, and vm() waits for this
                 // reader when the VM was just lost.
-                let forgotten: Vec<String> = anon.into_iter().filter(|v| self.forget_volume(v)).collect();
+                let forgotten: Vec<String> = self.unshared(anon).into_iter().filter(|v| self.forget_volume(v)).collect();
                 if !forgotten.is_empty() && let Some(me) = self.me.get().and_then(Weak::upgrade) {
                     let _ = std::thread::Builder::new().name("kiri-volume-rm".into()).spawn(move || {
                         if let Ok(vm) = me.vm() {
@@ -2109,8 +2164,7 @@ impl Engine {
                 let delay = restart_backoff(st.vm_crashes.saturating_sub(1));
                 st.vm_recovery_at = st.containers.values().any(recover_after_vm_loss).then(|| std::time::Instant::now() + delay);
                 for e in st.execs.values_mut() {
-                    e.running = false;
-                    e.attached.clear();
+                    e.end_with_vm();
                 }
                 for h in st.health.values_mut() {
                     close_monitor(h);
@@ -2570,7 +2624,20 @@ impl Engine {
             },
             None => None,
         };
+        // `--pid container:<id>`: that container's PID namespace; it has to
+        // be running, as with Docker.
+        let pid_joined = match spec.pid_mode.strip_prefix("container:").map(|t| self.pid_container(&id, t)) {
+            Some(Ok(target)) => Some(target),
+            Some(Err(e)) => {
+                self.fail_start(&id, &spec, &e);
+                return Err(e);
+            }
+            None => None,
+        };
         let mut flags = 0;
+        if spec.pid_mode == "host" {
+            flags |= run_flags::PID_HOST;
+        }
         let net = self.lock_networks().find(&spec.network_mode).cloned();
         let links = match net.as_ref().map(|n| self.link_hosts(&id, &spec, n)).transpose() {
             Ok(l) => l.unwrap_or_default(),
@@ -2692,6 +2759,7 @@ impl Engine {
         hosts.push(format!("{}\tgateway.docker.internal", super::ports::HOST_ADDR));
         let mut opts = net_opts(&spec, joined.as_deref(), &domainname);
         opts.extend(net6_opts);
+        opts.extend(pid_joined.map(|t| format!("{}={t}", kiri_proto::net_opts::PIDNS)));
         let net_args = kiri_proto::Net { bridge: &bridge, ip, prefix, gateway, extra_hosts: &hosts, dns_names: &dns_names, opts: &opts };
         // Joining a host-network container is the host's namespace too: its
         // net.* sysctls would change the whole VM (or Linux host).
@@ -2966,6 +3034,20 @@ impl Engine {
         Ok((target, hostname, c.spec.domainname.clone(), mode))
     }
 
+    /// For `--pid container:<target>`: the target's id. It has to be
+    /// running, as with Docker.
+    fn pid_container(&self, id: &str, target: &str) -> Result<String, Error> {
+        let st = self.lock();
+        let target = resolve(&st, target)?;
+        if target == id {
+            return Err(Error::BadRequest("cannot join own PID namespace".into()));
+        }
+        if st.containers.get(&target).is_none_or(|c| c.status != Status::Running) {
+            return Err(Error::Conflict(format!("cannot join PID of a non running container: {target}")));
+        }
+        Ok(target)
+    }
+
     /// `--link` lines for /etc/hosts, as Docker writes them: `ip alias
     /// hostname name`. Linked containers must be running; on the default
     /// bridge (which has no DNS) they must be on it too. The lines are fixed
@@ -3088,7 +3170,7 @@ impl Engine {
                 let _ = vm.remove(id);
             }
             lock_log(&c.log).remove();
-            for v in c.spec.anon_volumes {
+            for v in self.unshared(c.spec.anon_volumes) {
                 self.delete_volume_data(&v);
             }
             if let Some((image, attrs)) = actor {
@@ -3912,7 +3994,7 @@ impl Engine {
         st.execs.retain(|_, e| e.container_id != id);
         drop(st);
         self.changed.notify_all();
-        let anon = removed.as_ref().map(|c| c.spec.anon_volumes.clone()).unwrap_or_default();
+        let anon = self.unshared(removed.as_ref().map(|c| c.spec.anon_volumes.clone()).unwrap_or_default());
         if let Some(c) = &removed {
             lock_log(&c.log).remove();
         }
@@ -3994,6 +4076,15 @@ impl Engine {
     }
 
     /// Forgets a volume and deletes its data in the guest.
+    /// The anonymous volumes of a removed container that no other container
+    /// uses: one made with `--volumes-from` keeps them, as in Docker.
+    fn unshared(&self, anon: Vec<String>) -> Vec<String> {
+        if anon.is_empty() {
+            return anon;
+        }
+        anon.into_iter().filter(|v| self.volume_users(v).is_empty()).collect()
+    }
+
     fn delete_volume_data(&self, name: &str) {
         if self.forget_volume(name) {
             if let Ok(vm) = self.vm() {
@@ -4300,10 +4391,10 @@ fn comes_back(c: &Container) -> bool {
     (policy == "always" || (policy == "unless-stopped" && !c.stopped_by_user)) && !c.spec.auto_remove
 }
 
-/// Containers that join another's network or link to others start after
-/// those, as Docker orders them.
+/// Containers that join another's network or PID namespace, or link to
+/// others, start after those, as Docker orders them.
 fn joins_others(c: &Container) -> bool {
-    c.spec.network_mode.starts_with("container:") || !c.spec.links.is_empty()
+    c.spec.network_mode.starts_with("container:") || c.spec.pid_mode.starts_with("container:") || !c.spec.links.is_empty()
 }
 
 /// What a container event carries: labels, then name and image.
@@ -5353,6 +5444,25 @@ mod records_tests {
     /// One message, true in each state, listing the copies once, never
     /// advising to put a list back, and saying how the engine itself is
     /// restarted here.
+    /// A repaired image list is shown in `docker info` with its copy and the
+    /// images it lost (#440).
+    #[test]
+    fn a_repaired_image_list_is_a_warning() {
+        use kiri_image::store::IndexDamage;
+        let root = std::path::Path::new("/s");
+        assert_eq!(image_damage_message(&Ok(None), root), None);
+        let one = Ok(Some(IndexDamage { copies: vec!["/s/images.json.corrupt-1-0".into()], missing: vec!["local/img:1".into(), "web:2".into()] }));
+        let m = image_damage_message(&one, root).unwrap();
+        for want in ["image list was damaged", "a copy of it is kept at /s/images.json.corrupt-1-0", "2 image(s)", "local/img:1, web:2", "keeps every unpacked layer until the copy is removed"] {
+            assert!(m.contains(want), "{want:?} in {m}");
+        }
+        let back = Ok(Some(IndexDamage { copies: vec!["/s/a".into(), "/s/b".into()], missing: Vec::new() }));
+        let m = image_damage_message(&back, root).unwrap();
+        assert!(m.contains("copies are kept at /s/a, /s/b") && m.contains("listed again") && m.contains("until the copies are removed"), "{m}");
+        let unlistable = Err(io::Error::other("denied"));
+        assert!(image_damage_message(&unlistable, root).unwrap().contains("cannot read the image list in /s (denied)"));
+    }
+
     #[test]
     fn the_warning_says_what_happened_and_what_ends_it() {
         let records = Path::new("/s/containers.json");
@@ -5714,6 +5824,26 @@ mod start_wait_tests {
         (engine, id, dir)
     }
 
+    /// `--pid container:` needs a running target other than itself, as
+    /// with Docker, and such a container starts after the others.
+    #[test]
+    fn pid_container_must_be_another_running_one() {
+        let (engine, target, dir) = engine("pid-target");
+        assert_eq!(engine.pid_container("me", "pid-target").unwrap(), target);
+        assert!(matches!(engine.pid_container(&target, &target), Err(Error::BadRequest(m)) if m == "cannot join own PID namespace"));
+        assert!(matches!(engine.pid_container("me", "nosuch"), Err(Error::NotFound(_))));
+        let mut st = engine.lock();
+        let c = st.containers.get_mut(&target).unwrap();
+        assert!(!joins_others(c));
+        c.spec.pid_mode = "container:x".into();
+        assert!(joins_others(c), "starts after the one it joins");
+        c.status = Status::Exited;
+        drop(st);
+        assert!(matches!(engine.pid_container("me", &target), Err(Error::Conflict(m)) if m == format!("cannot join PID of a non running container: {target}")));
+        drop(engine);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     fn shut(engine: &Engine, id: &str) -> StartGuard {
         engine.lock().containers.get_mut(id).unwrap().begin_start()
     }
@@ -5811,6 +5941,38 @@ mod start_wait_tests {
         assert!(c.early_input.is_empty() && !c.early_close, "its early input went with it");
         drop(st);
         assert_eq!(actions(), ["start", "die"]);
+        drop(engine);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// An exec's output stream ends only once its exit code is recorded: on
+    /// its exit, and when the VM stops under it. docker-java inspects the exec
+    /// as soon as the stream closes and needs `ExitCode` then (#551).
+    #[test]
+    fn an_exec_has_its_exit_code_when_its_stream_ends() {
+        let (engine, id, dir) = engine("exec-exit");
+        let exec = |argv: &str| engine.exec_create(&id, ExecConfig { console_size: None, argv: vec![argv.into()], env: Vec::new(), cwd: "/".into(), user: String::new(), tty: false, stdin: false, privileged: false, internal: true }).unwrap();
+        let attach = |exec_id: &str| {
+            let (tx, rx) = mpsc::channel();
+            let mut st = engine.lock();
+            let e = st.execs.get_mut(exec_id).unwrap();
+            e.running = true;
+            e.attached.push(tx);
+            rx
+        };
+        let state = |exec_id: &str| engine.with_exec(exec_id, |e| (e.running, e.exit_code)).unwrap();
+        let (exited, lost, never) = (exec("exited"), exec("lost"), exec("never"));
+        assert_eq!(state(&never), (false, None), "an exec not started has no exit code, as in Docker");
+        let rx = attach(&exited);
+        engine.on_event(Event::Exited { id: &exited, code: 3, oom: false });
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Disconnected)), "its stream ended");
+        assert_eq!(state(&exited), (false, Some(3)));
+        let rx = attach(&lost);
+        engine.on_event(Event::Lost);
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Disconnected)), "its stream ended with the VM");
+        assert_eq!(state(&lost), (false, Some(255)));
+        assert_eq!(state(&exited), (false, Some(3)), "a finished exec keeps its own code");
+        assert_eq!(state(&never), (false, None));
         drop(engine);
         let _ = std::fs::remove_dir_all(dir);
     }

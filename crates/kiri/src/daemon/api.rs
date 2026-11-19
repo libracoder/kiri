@@ -26,14 +26,21 @@ pub fn serve(stream: UnixStream, engine: Arc<Engine>) -> io::Result<()> {
         // The window's action this request is part of: the engine's lines
         // for it carry the same op.
         let _op = req.header("X-Kiri-Op").filter(|o| crate::diag::valid_op(o)).map(|o| crate::diag::enter_op(o.to_owned()));
-        http::serving(&req.method, &req.path);
+        http::serving(&req);
         // Kiri's own window checks in every few seconds; that isn't use, and
         // counting it would keep the VM from ever sleeping while it's open.
         if req.header("X-Kiri-Background").is_none() {
             engine.touch();
         }
         match route(&req, &engine, &mut w, &mut r) {
-            Ok(Next::KeepAlive) if req.wants_close() => return Ok(()),
+            // `Connection: close` or HTTP/1.0: the client reads to the end of
+            // the stream (a 204 has no length to read by). The write side is
+            // shut, not only dropped, so the end reaches it even while
+            // anything else still holds a copy of the socket.
+            Ok(Next::KeepAlive) if req.wants_close() => {
+                let _ = w.shutdown(std::net::Shutdown::Write);
+                return Ok(());
+            }
             Ok(Next::KeepAlive) => {}
             Ok(Next::Close) => return Ok(()),
             Err(e) => {
@@ -453,7 +460,7 @@ fn info(engine: &Engine) -> Value {
         "KiriMemoryStall": engine.memory_trouble().0,
         "KiriOomKills": engine.memory_trouble().1,
         "KiriCpuPercent": engine.cpu_percent(),
-        "Warnings": engine.records_damage(),
+        "Warnings": engine.records_damage().into_iter().chain(engine.image_damage()).collect::<Vec<_>>(),
     })
 }
 
@@ -1306,7 +1313,52 @@ fn valid_hosts_name(name: &str) -> bool {
     !name.is_empty() && !name.bytes().any(|b| b.is_ascii_control())
 }
 
-/// `-v`, `--mount`, `--tmpfs`, `-v /path` and the image's VOLUME lines.
+/// One `--volumes-from` entry, `container[:mode]`, as the container and
+/// whether the mounts are made read-only. Docker's modes: `ro` or `rw`, with
+/// `z`, `Z` or `nocopy` beside them.
+fn parse_volumes_from(spec: &str) -> Result<(&str, bool), Error> {
+    if spec.is_empty() {
+        return Err(Error::BadRequest("volumes-from specification cannot be an empty string".into()));
+    }
+    let (name, mode) = spec.split_once(':').unwrap_or((spec, ""));
+    let parts: Vec<&str> = mode.split(',').filter(|m| !m.is_empty()).collect();
+    let rw_modes = parts.iter().filter(|m| matches!(**m, "ro" | "rw")).count();
+    if name.is_empty() || rw_modes > 1 || parts.iter().any(|m| !matches!(*m, "ro" | "rw" | "z" | "Z" | "nocopy")) || (!mode.is_empty() && parts.is_empty()) {
+        return Err(Error::BadRequest(format!("invalid mode: {mode}")));
+    }
+    Ok((name, parts.contains(&"ro")))
+}
+
+/// The mounts `--volumes-from` takes from a container: its guest lines and
+/// inspect entries (one per line), without tmpfs mounts, which Docker does
+/// not share either. With `ro` each becomes read-only; otherwise each keeps
+/// its own mode, so `:rw` does not make a read-only mount writable.
+fn volumes_from_mounts(guest: &[String], info: &[Value], ro: bool) -> Vec<(String, Value)> {
+    guest
+        .iter()
+        .zip(info)
+        .filter(|(_, i)| i["Type"] != "tmpfs")
+        .map(|(line, i)| {
+            let mut i = i.clone();
+            if !ro {
+                return (line.clone(), i);
+            }
+            // `source\ttarget\tflags[\t…]`: "ro" joins the flags.
+            let mut fields: Vec<String> = line.split('\t').map(str::to_owned).collect();
+            if fields.len() < 3 {
+                fields.resize(3, String::new());
+            }
+            if !fields[2].split(',').any(|f| f == "ro") {
+                fields[2] = if fields[2].is_empty() { "ro".to_owned() } else { format!("{},ro", fields[2]) };
+            }
+            i["RW"] = json!(false);
+            (fields.join("\t"), i)
+        })
+        .collect()
+}
+
+/// `-v`, `--mount`, `--tmpfs`, `--volumes-from`, `-v /path` and the image's
+/// VOLUME lines.
 fn mounts(body: &Value, engine: &Engine, image: &kiri_image::Image) -> Result<Mounts, Error> {
     let host = &body["HostConfig"];
     let mut out = Mounts { guest: Vec::new(), info: Vec::new(), volumes: Vec::new(), anon: Vec::new() };
@@ -1471,6 +1523,29 @@ fn mounts(body: &Value, engine: &Engine, image: &kiri_image::Image) -> Result<Mo
             add("tmpfs", "", dst, false, &opts, false, &mut out)?;
         }
     }
+    // `--volumes-from other[:ro]`: every volume and bind of the other
+    // container (running or not) at the same path. A mount given here at
+    // the same path wins, as in Docker.
+    for spec in strings(&host["VolumesFrom"]).unwrap_or_default() {
+        let (name, ro) = parse_volumes_from(&spec)?;
+        let id = engine.resolve(name)?;
+        let (guest, info) = engine.with(&id, |c| (c.spec.mounts.clone(), c.spec.mount_info.clone()))?;
+        for (line, i) in volumes_from_mounts(&guest, &info, ro) {
+            let dst = i["Destination"].as_str().unwrap_or_default().trim_end_matches('/').to_owned();
+            if out.info.iter().any(|m| m["Destination"].as_str().map(|d| d.trim_end_matches('/')) == Some(dst.as_str())) {
+                continue;
+            }
+            // The volume is the other container's too: kept, never taken
+            // with this one on `--rm`.
+            if let Some(v) = i["Name"].as_str().filter(|_| i["Type"] == "volume")
+                && !out.volumes.iter().any(|x| x == v)
+            {
+                out.volumes.push(v.to_owned());
+            }
+            out.guest.push(line);
+            out.info.push(i);
+        }
+    }
     // `-v /path` (no source) arrives in `Volumes`; the image's VOLUME lines
     // are in its config. Each becomes an anonymous volume, unless something
     // else is already mounted there.
@@ -1613,14 +1688,33 @@ fn inspect_exposed(ports: &[super::ports::Binding], exposed: &[u16]) -> Value {
 
 /// Docker's `NetworkSettings.Ports` map for inspect and `docker port`.
 fn ports_map(c: &Container) -> Value {
+    let bound: &[(super::ports::Binding, String, u16)] = c.forwards.as_ref().map_or(&[], |fw| &fw.bound);
+    // Docker lists the exposed ports only while the container has its own
+    // network endpoint: running, and not on host, none or another's network.
+    let mode = c.spec.network_mode.as_str();
+    let endpoint = c.status == Status::Running && mode != "host" && mode != "none" && !mode.starts_with("container:");
+    ports_map_of(bound, if endpoint { Some((&c.spec.ports, &c.spec.exposed)) } else { None })
+}
+
+/// The published ports with their host addresses, then (when `exposed` is
+/// given) every exposed or `-p` port that has none as a key with a null value
+/// (`"80/tcp": null`), as Docker shows them. Traefik's docker provider picks
+/// a container's port from these keys alone.
+fn ports_map_of(bound: &[(super::ports::Binding, String, u16)], exposed: Option<(&[super::ports::Binding], &[u16])>) -> Value {
     let mut m = serde_json::Map::new();
-    if let Some(fw) = &c.forwards {
-        for (b, ip, port) in &fw.bound {
-            let key = format!("{}/{}", b.container_port, b.proto);
-            let entry = m.entry(key).or_insert_with(|| json!([]));
-            if let Some(a) = entry.as_array_mut() {
-                a.push(json!({"HostIp": ip, "HostPort": port.to_string()}));
-            }
+    for (b, ip, port) in bound {
+        let key = format!("{}/{}", b.container_port, b.proto);
+        let entry = m.entry(key).or_insert_with(|| json!([]));
+        if let Some(a) = entry.as_array_mut() {
+            a.push(json!({"HostIp": ip, "HostPort": port.to_string()}));
+        }
+    }
+    if let Some((asked, exposed)) = exposed {
+        for b in asked {
+            m.entry(format!("{}/{}", b.container_port, b.proto)).or_insert(Value::Null);
+        }
+        for p in exposed {
+            m.entry(format!("{p}/tcp")).or_insert(Value::Null);
         }
     }
     Value::Object(m)
@@ -1834,6 +1928,7 @@ pub(super) fn create(req: &Request, engine: &Engine) -> Result<Value, Error> {
     if !mac_address.is_empty() && network_mode == "host" {
         return Err(Error::BadRequest("conflicting options: mac-address and the network mode".into()));
     }
+    let pid_mode = pid_mode(host["PidMode"].as_str().unwrap_or(""), engine)?;
     let links = links_from(&strings(&host["Links"]).unwrap_or_default(), engine)?;
     if !links.is_empty() && network_mode == "host" {
         return Err(Error::BadRequest("conflicting options: host type networking can't be used with links. This would result in undefined behavior".into()));
@@ -1954,6 +2049,8 @@ pub(super) fn create(req: &Request, engine: &Engine) -> Result<Value, Error> {
         ports,
         exposed: exposed_ports(&body, engine, &image),
         host_opts,
+        volumes_from: strings(&host["VolumesFrom"]).unwrap_or_default(),
+        pid_mode,
         mounts: mounts.guest,
         mount_info: mounts.info,
         volumes: mounts.volumes,
@@ -1974,6 +2071,17 @@ pub(super) fn create(req: &Request, engine: &Engine) -> Result<Value, Error> {
     }
     let id = engine.create(req.query("name").map(str::to_owned), spec, &image)?;
     Ok(json!({"Id": id, "Warnings": warnings}))
+}
+
+/// `--pid`: empty, `host`, or `container:<target>`, kept as
+/// `container:<full id>` as Docker does. The target must exist now and run
+/// at start.
+fn pid_mode(mode: &str, engine: &Engine) -> Result<String, Error> {
+    match mode.split_once(':') {
+        None if mode.is_empty() || mode == "host" => Ok(mode.to_owned()),
+        Some(("container", target)) if !target.is_empty() => Ok(format!("container:{}", engine.resolve(target)?)),
+        _ => Err(Error::BadRequest(format!("invalid PID mode: {mode}"))),
+    }
 }
 
 /// `--network container:<target>`: Docker's checks, then the mode as it is
@@ -2328,6 +2436,8 @@ fn inspect(c: &Container, nets: &[super::network::Network]) -> Value {
             "CpuShares": if c.spec.limits.cpu_weight > 0 { 2 + (u64::from(c.spec.limits.cpu_weight) - 1) * 262_142 / 9999 } else { 0 },
             "PidsLimit": if c.spec.limits.pids_max > 0 { Value::from(c.spec.limits.pids_max) } else { Value::Null },
             "NetworkMode": c.spec.network_mode,
+            "PidMode": c.spec.pid_mode,
+            "VolumesFrom": if c.spec.volumes_from.is_empty() { Value::Null } else { json!(c.spec.volumes_from) },
             "Dns": c.spec.dns,
             "DnsSearch": c.spec.dns_search,
             "DnsOptions": c.spec.dns_options,
@@ -2445,7 +2555,7 @@ fn network_json(engine: &Engine, n: &super::network::Network, with_members: bool
         "Ingress": false,
         "ConfigOnly": false,
         "Containers": containers,
-        "Options": if n.options.is_object() { n.options.clone() } else { json!({}) },
+        "Options": super::network::shown_options(n),
         "Labels": if n.labels.is_object() { n.labels.clone() } else { json!({}) },
     })
 }
@@ -3226,6 +3336,117 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// `--volumes-from` entries: the container and its mode, as Docker parses them.
+    #[test]
+    fn volumes_from_takes_a_container_and_a_mode() {
+        assert_eq!(parse_volumes_from("db").unwrap(), ("db", false));
+        assert_eq!(parse_volumes_from("db:ro").unwrap(), ("db", true));
+        assert_eq!(parse_volumes_from("db:rw").unwrap(), ("db", false));
+        assert_eq!(parse_volumes_from("db:").unwrap(), ("db", false), "an empty mode is rw, as in Docker");
+        assert_eq!(parse_volumes_from("db:ro,z").unwrap(), ("db", true));
+        for bad in ["", "db:rx", "db:ro,rw", ":ro", "db:,"] {
+            assert!(matches!(parse_volumes_from(bad), Err(Error::BadRequest(_))), "{bad:?}");
+        }
+        assert!(matches!(parse_volumes_from("db:rx"), Err(Error::BadRequest(m)) if m == "invalid mode: rx"));
+    }
+
+    /// The other container's volumes and binds come at their paths, tmpfs
+    /// mounts do not; `ro` makes each read-only, and without it a read-only
+    /// mount stays read-only.
+    #[test]
+    fn volumes_from_copies_volumes_and_binds() {
+        let guest = vec![
+            "/var/lib/kiri/volumes/named\t/vol\tcreate,copyup".to_owned(),
+            "/host/dir\t/data\tro".to_owned(),
+            "tmpfs\t/scratch\ttmpfs,noexec".to_owned(),
+            "/var/lib/kiri/volumes/x\t/nfs\tcreate\tnfs\t:/export\t0\taddr=1".to_owned(),
+        ];
+        let info = vec![
+            json!({"Type": "volume", "Name": "named", "Destination": "/vol", "RW": true}),
+            json!({"Type": "bind", "Source": "/host/dir", "Destination": "/data", "RW": false}),
+            json!({"Type": "tmpfs", "Destination": "/scratch", "RW": true}),
+            json!({"Type": "volume", "Name": "x", "Destination": "/nfs", "RW": true}),
+        ];
+        let rw = volumes_from_mounts(&guest, &info, false);
+        assert_eq!(rw.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>(), [guest[0].as_str(), guest[1].as_str(), guest[3].as_str()]);
+        assert_eq!(rw[1].1["RW"], false, "a read-only mount stays so");
+        let ro = volumes_from_mounts(&guest, &info, true);
+        assert_eq!(ro[0].0, "/var/lib/kiri/volumes/named\t/vol\tcreate,copyup,ro");
+        assert_eq!(ro[1].0, "/host/dir\t/data\tro", "not twice");
+        assert_eq!(ro[2].0, "/var/lib/kiri/volumes/x\t/nfs\tcreate,ro\tnfs\t:/export\t0\taddr=1", "the volume's own fields stay");
+        assert!(ro.iter().all(|(_, i)| i["RW"] == false));
+    }
+
+    /// Through `mounts`: an unknown container is Docker's error; a known one
+    /// (never started) lends its volumes, and a mount given at the same path
+    /// wins. Its anonymous volume outlives it while the new one uses it.
+    #[test]
+    fn volumes_from_mounts_another_containers_volumes() {
+        let (root, engine) = engine_in("volumes-from", false);
+        let image = test_image("vf:1");
+        engine.store.put_image(image.clone()).unwrap();
+        engine.volume_ensure("named", json!({}), false).unwrap();
+        engine.volume_ensure("anon1", json!({}), true).unwrap();
+        let spec: super::super::engine::Spec = serde_json::from_value(json!({
+            "image": image.name, "image_id": image.config_digest, "entrypoint": [], "cmd": ["true"],
+            "env": [], "cwd": "/", "user": "", "auto_remove": false, "network_mode": "none", "labels": {},
+            "restart": {"name": "no", "max_retries": 0}, "volumes": ["named"], "anon_volumes": ["anon1"],
+            "mounts": ["/v/named\t/vol\tcreate,copyup", "/v/anon1\t/anon\tcreate,copyup", "/v/named\t/other\tcreate"],
+            "mount_info": [
+                {"Type": "volume", "Name": "named", "Destination": "/vol", "RW": true},
+                {"Type": "volume", "Name": "anon1", "Destination": "/anon", "RW": true},
+                {"Type": "volume", "Name": "named", "Destination": "/other", "RW": true},
+            ],
+        })).unwrap();
+        engine.create(Some("src".into()), spec, &image).unwrap();
+
+        let body = json!({"HostConfig": {"VolumesFrom": ["nosuch"]}});
+        assert!(matches!(mounts(&body, &engine, &image), Err(Error::NotFound(m)) if m == "No such container: nosuch"));
+
+        let body = json!({"HostConfig": {"VolumesFrom": ["src:ro"], "Tmpfs": {"/other": ""}}});
+        let m = mounts(&body, &engine, &image).unwrap();
+        let dsts: Vec<&str> = m.info.iter().filter_map(|i| i["Destination"].as_str()).collect();
+        assert_eq!(dsts, ["/other", "/vol", "/anon"]);
+        assert_eq!(m.info[0]["Type"], "tmpfs", "the mount given here wins");
+        assert_eq!(m.guest[1], "/v/named\t/vol\tcreate,copyup,ro");
+        assert_eq!(m.volumes, ["named", "anon1"]);
+        assert!(m.anon.is_empty(), "nothing of the other's is removed with this one");
+
+        let user: super::super::engine::Spec = serde_json::from_value(json!({
+            "image": image.name, "image_id": image.config_digest, "entrypoint": [], "cmd": ["true"],
+            "env": [], "cwd": "/", "user": "", "auto_remove": false, "network_mode": "none", "labels": {},
+            "restart": {"name": "no", "max_retries": 0}, "volumes": m.volumes, "mounts": m.guest, "mount_info": m.info,
+            "volumes_from": ["src:ro"],
+        })).unwrap();
+        engine.create(Some("dst".into()), user, &image).unwrap();
+        engine.remove("src", true, true).unwrap();
+        assert!(engine.volume_get("anon1").is_some(), "dst still uses it");
+        engine.remove("dst", true, true).unwrap();
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// `--pid`: empty and `host` as given, `container:<name>` kept with the
+    /// full id; anything else, or an unknown container, refused.
+    #[test]
+    fn pid_mode_is_kept_or_refused() {
+        let (root, engine) = engine_in("pid-mode", false);
+        let image = test_image("pid:1");
+        engine.store.put_image(image.clone()).unwrap();
+        listed_user(&engine, "v", &image);
+        let id = engine.resolve("user").unwrap();
+        assert_eq!(pid_mode("", &engine).unwrap(), "");
+        assert_eq!(pid_mode("host", &engine).unwrap(), "host");
+        assert_eq!(pid_mode("container:user", &engine).unwrap(), format!("container:{id}"));
+        assert_eq!(pid_mode(&format!("container:{}", &id[..12]), &engine).unwrap(), format!("container:{id}"));
+        assert!(matches!(pid_mode("container:nosuch", &engine), Err(Error::NotFound(m)) if m == "No such container: nosuch"));
+        for bad in ["private", "container:", "container", "hostx", "ns:/proc/1/ns/pid"] {
+            assert!(matches!(pid_mode(bad, &engine), Err(Error::BadRequest(m)) if m == format!("invalid PID mode: {bad}")), "{bad}");
+        }
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn kernel_release_is_trimmed_and_empty_is_none() {
         assert_eq!(parse_release("7.0.0-38-generic\n").as_deref(), Some("7.0.0-38-generic"));
@@ -3419,6 +3640,53 @@ mod tests {
             assert_eq!(got, plain);
         }
         assert!(matches!(upload_reader(b"BZh91A".to_vec(), &b""[..]), Err(Error::BadRequest(m)) if m.contains("bzip2")));
+    }
+
+    /// A request that asks for the close (`Connection: close`, or HTTP/1.0
+    /// without keep-alive) is answered and then the client reads the end of
+    /// the stream, as Docker.DotNet waits to; one that does not keeps the
+    /// connection for the next request.
+    #[test]
+    fn the_connection_closes_when_the_request_asks() {
+        use std::io::{Read, Write};
+        let (root, engine) = engine_in("conn-close", false);
+        // What the client reads within two seconds, and whether that ended
+        // with the stream's end.
+        let exchange = |requests: &str| {
+            let (mut client, server) = UnixStream::pair().unwrap();
+            let served = std::thread::spawn({
+                let engine = engine.clone();
+                move || serve(server, engine)
+            });
+            client.write_all(requests.as_bytes()).unwrap();
+            client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let (mut got, mut buf) = (Vec::new(), [0u8; 4096]);
+            let ended = loop {
+                match client.read(&mut buf) {
+                    Ok(0) => break true,
+                    Ok(n) => got.extend_from_slice(&buf[..n]),
+                    Err(_) => break false,
+                }
+            };
+            drop(client);
+            served.join().unwrap().unwrap();
+            (String::from_utf8_lossy(&got).into_owned(), ended)
+        };
+        let (got, ended) = exchange("GET /v1.44/_ping HTTP/1.1\r\nHost: d\r\nConnection: close\r\n\r\n");
+        assert!(ended && got.starts_with("HTTP/1.1 200 ") && got.contains("Connection: close\r\n") && got.ends_with("OK"), "{got}");
+        let (got, ended) = exchange("GET /_ping HTTP/1.0\r\n\r\n");
+        assert!(ended && got.starts_with("HTTP/1.1 200 ") && got.contains("Connection: close\r\n"), "{got}");
+        // An error answer (with a body) closes the same way.
+        let (got, ended) = exchange("POST /v1.44/containers/nothing-here/start HTTP/1.1\r\nHost: d\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+        assert!(ended && got.starts_with("HTTP/1.1 404 ") && got.contains("Connection: close\r\n"), "{got}");
+        // Kept alive: both answered, neither says close, and the connection waits for a third.
+        let (got, ended) = exchange("GET /_ping HTTP/1.1\r\nHost: d\r\n\r\nGET /_ping HTTP/1.0\r\nConnection: keep-alive\r\n\r\n");
+        assert!(!ended && got.matches("HTTP/1.1 200 ").count() == 2 && !got.contains("Connection:"), "{got}");
+        // A close asked for on the second request ends it after that one.
+        let (got, ended) = exchange("GET /_ping HTTP/1.1\r\nHost: d\r\n\r\nGET /_ping HTTP/1.1\r\nHost: d\r\nConnection: close\r\n\r\n");
+        assert!(ended && got.matches("HTTP/1.1 200 ").count() == 2 && got.matches("Connection: close\r\n").count() == 1, "{got}");
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// `docker save | gzip | docker load` loads, as on Docker (issue 528):
@@ -3720,6 +3988,15 @@ mod network_option_tests {
         assert_eq!(inspect_bindings(&[]), json!({}));
         assert_eq!(inspect_exposed(&[], &[]), Value::Null);
         assert_eq!(inspect_exposed(&ports, &[80, 9000]), json!({"80/tcp": {}, "53/udp": {}, "9000/tcp": {}}));
+        // NetworkSettings.Ports: published ports with their addresses, exposed
+        // ones without as null keys (#492); none at all while not running.
+        let bound = [(b(80, "tcp", "", 8080), "0.0.0.0".to_string(), 8080)];
+        assert_eq!(ports_map_of(&[], Some((&[], &[80]))), json!({"80/tcp": null}));
+        assert_eq!(
+            ports_map_of(&bound, Some((&ports, &[80, 9000]))),
+            json!({"80/tcp": [{"HostIp": "0.0.0.0", "HostPort": "8080"}], "53/udp": null, "9000/tcp": null})
+        );
+        assert_eq!(ports_map_of(&[], None), json!({}));
         // Compose sends empty lists and maps for what a service leaves out.
         assert!(container_mode_allowed(&json!({"Hostname": "", "ExposedPorts": {}, "HostConfig": {"PortBindings": {}, "Dns": [], "Links": null}}), "web").is_ok());
         assert!(container_mode_allowed(&json!({}), "").is_err());

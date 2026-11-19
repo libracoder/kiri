@@ -2,7 +2,7 @@
 """What Testcontainers (docker-java, .NET, Go) needs of the engine API, asked
 the way those clients ask: raw HTTP/1.1 on one kept-alive connection.
 
-    tests/testcontainers-api.py SOCKET [version|cmd|keepalive|follow|follow-created|timestamps|exec|endpoints|copy-after-start ...]
+    tests/testcontainers-api.py SOCKET [version|cmd|keepalive|close|follow|follow-created|timestamps|exec|endpoints|copy-after-start ...]
 
 Prints one line per check, "ok <name>" or "FAIL <name>: why", and exits 1 if
 any failed. The containers it makes (tc-api-*) are left running.
@@ -156,6 +156,51 @@ def check_keepalive():
     return "start after a copy on one connection"
 
 
+def ends_soon(c, within=3):
+    """Whether the engine closes the connection within `within` seconds,
+    with nothing more sent."""
+    c.s.settimeout(within)
+    try:
+        while True:
+            d = c.s.recv(65536)
+            if not d:
+                return not c.buf
+            c.buf += d
+    except socket.timeout:
+        return False
+
+
+def check_close():
+    # Testcontainers for .NET (Docker.DotNet) sends Connection: close on every
+    # request and reads a 204, which has no length, to the end of the stream:
+    # the engine must close, or the start hangs until the client's timeout
+    # (#520, #479). An HTTP/1.0 request closes the same way unless it asks
+    # to keep the connection.
+    c = Conn()
+    fresh(c, "tc-api-close", ["sleep", "600"])
+    t0 = time.time()
+    c.send("POST", "/containers/tc-api-close/start", extra="Connection: close\r\n")
+    status, headers = c.head()
+    assert status == 204, f"start {status}"
+    assert headers.get("connection", "").lower() == "close", f"start answered without Connection: close ({headers})"
+    assert ends_soon(c), "the connection stayed open after a 204 to a Connection: close request"
+    took = time.time() - t0
+    # The container is running now: a second start answers 304, also bodiless.
+    c = Conn()
+    c.s.sendall(b"POST /v1.44/containers/tc-api-close/start HTTP/1.0\r\nContent-Length: 0\r\n\r\n")
+    status, _ = c.head()
+    assert status == 304, f"second start {status}"
+    assert ends_soon(c), "the connection stayed open after a 304 to an HTTP/1.0 request"
+    # Without the header the connection stays for the next request.
+    c = Conn()
+    status, headers, _ = c.request("POST", "/containers/tc-api-close/start")
+    assert status == 304 and "connection" not in headers, f"kept-alive start {status} {headers}"
+    assert not ends_soon(c, 1), "a kept-alive connection was closed"
+    status, _, _ = c.request("GET", "/containers/tc-api-close/json")
+    assert status == 200, f"inspect after it {status}"
+    return f"closed {took:.2f} s after a Connection: close start; HTTP/1.0 closes, keep-alive stays"
+
+
 def wait_lines(c, cid, pattern, times, timeout):
     """LogMessageWaitStrategy: follow=true since=0, count frames matching."""
     rx = re.compile(r"(?s).*" + pattern + r".*\s")
@@ -251,6 +296,15 @@ def check_exec():
     _, _, reply = c2.request("GET", f"/exec/{eid}/json")
     info = json.loads(reply)
     assert info["Running"] is False and info["ExitCode"] == 3, f"after the stream closed: {info}"
+    # While it runs, Docker reports Running and a null ExitCode (#551).
+    status, _, reply = c2.request("POST", f"/containers/{cid}/exec", {"Cmd": ["sleep", "5"]})
+    assert status == 201, f"exec create {status} {reply[:200]!r}"
+    running = json.loads(reply)["Id"]
+    status, _, reply = c2.request("POST", f"/exec/{running}/start", {"Detach": True})
+    assert status in (200, 204), f"detached exec start {status} {reply[:200]!r}"
+    _, _, reply = c2.request("GET", f"/exec/{running}/json")
+    info = json.loads(reply)
+    assert info["Running"] is True and info["ExitCode"] is None, f"while running: {info}"
     _, status, headers, _ = exec_start(Conn(), cid, ["true"], extra="Connection: Upgrade\r\nUpgrade: tcp\r\n")
     assert status == 101 and headers.get("upgrade") == "tcp", f"with Upgrade: tcp: {status} {headers}"
     return "200 without Upgrade, ExitCode set at EOF; 101 with it"
@@ -350,7 +404,7 @@ def check_copy_after_start():
 
 
 CHECKS = {
-    "version": check_version, "cmd": check_cmd, "keepalive": check_keepalive,
+    "version": check_version, "cmd": check_cmd, "keepalive": check_keepalive, "close": check_close,
     "follow": check_follow, "follow-created": check_follow_created, "timestamps": check_timestamps,
     "exec": check_exec, "endpoints": check_endpoints, "copy-after-start": check_copy_after_start,
 }

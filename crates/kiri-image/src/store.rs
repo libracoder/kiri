@@ -166,6 +166,43 @@ fn salvage(bytes: &[u8]) -> Vec<Image> {
     crate::jsonfile::salvage(bytes)
 }
 
+/// The name of every image record in an index, damaged or not, including a
+/// record cut short after its name: what a person needs to know was lost.
+/// A record's `name` is its first field, so only a `"name"` right after a
+/// record's `{` (itself after `[` or `,`) counts, not a label called name.
+fn record_names(bytes: &[u8]) -> Vec<String> {
+    let text = String::from_utf8_lossy(bytes);
+    let before = |end: usize| text[..end].trim_end().chars().next_back();
+    let mut names = Vec::new();
+    for (at, _) in text.match_indices("\"name\"") {
+        let brace = text[..at].trim_end().len();
+        if before(brace) != Some('{') || !matches!(before(brace - 1), Some('[' | ',')) {
+            continue;
+        }
+        let Some(value) = text[at + 6..].trim_start().strip_prefix(':') else { continue };
+        if let Some(Ok(name)) = serde_json::Deserializer::from_str(value).into_iter::<String>().next() {
+            names.push(name);
+        }
+    }
+    names
+}
+
+/// The images a damaged index held that are not in `images`.
+fn missing(bytes: &[u8], images: &[Image]) -> Vec<String> {
+    let mut names = record_names(bytes);
+    names.retain(|n| !images.iter().any(|i| &i.name == n));
+    names.dedup();
+    names
+}
+
+/// The copies of damaged indexes kept beside `images.json`, and the images
+/// they name that the index no longer has. See [`Store::index_damage`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexDamage {
+    pub copies: Vec<PathBuf>,
+    pub missing: Vec<String>,
+}
+
 /// The filesystem-safe hexadecimal part of a SHA-256 digest.
 pub fn digest_hex(digest: &str) -> io::Result<&str> {
     let h = digest.strip_prefix("sha256:").unwrap_or_default();
@@ -322,11 +359,40 @@ impl Store {
             Ok(()) => String::new(),
             Err(e) => format!("; the repaired index was not written: {e}"),
         };
+        let lost = missing(bytes, &images);
+        let lost = if lost.is_empty() {
+            String::new()
+        } else {
+            format!("; dropped from the list: {} (their layers are kept while the copy is)", lost.join(", "))
+        };
         log_error(&format!(
-            "image index unreadable ({error}): {kept}, {} image(s) recovered{wrote}",
+            "image index unreadable ({error}): {kept}, {} image(s) recovered{lost}{wrote}",
             images.len()
         ));
         images
+    }
+
+    /// The `images.json.corrupt-*` copies kept beside the index, and the
+    /// images they name that it no longer lists; `None` with no copy. While
+    /// a copy is kept, the layers of the images it may still hold are not
+    /// someone else's to delete: the daemon keeps every unpacked layer and
+    /// says so in `docker info`. Removing the copies ends it.
+    pub fn index_damage(&self) -> io::Result<Option<IndexDamage>> {
+        // Read first: a damaged index is moved aside by this very read.
+        let images = self.images()?;
+        let copies = crate::jsonfile::kept_copies(&self.root.join("images.json"))?;
+        if copies.is_empty() {
+            return Ok(None);
+        }
+        let mut names = Vec::new();
+        for c in &copies {
+            for n in missing(&fs::read(c).unwrap_or_default(), &images) {
+                if !names.contains(&n) {
+                    names.push(n);
+                }
+            }
+        }
+        Ok(Some(IndexDamage { copies, missing: names }))
     }
 
     pub fn find(&self, name: &str) -> io::Result<Option<Image>> {
@@ -682,10 +748,38 @@ mod tests {
         }
         let path = root.join("images.json");
         let bytes = fs::read(&path).unwrap();
+        assert_eq!(store.index_damage().unwrap(), None, "no copy, no damage");
         fs::write(&path, &bytes[..bytes.len() - 40]).unwrap();
+        // The image cut off is named while the copy is kept (#440), the
+        // first time the index is read too, and is no longer missing once it
+        // is back in the list.
+        let damage = store.index_damage().unwrap().unwrap();
         assert_eq!(names(&store), ["a:1", "b:1"]);
         assert_eq!(corrupt_files(&root).len(), 1);
+        assert_eq!((damage.copies, damage.missing), (corrupt_files(&root), vec!["c:1".to_owned()]));
+        store.put_image(named("c:1")).unwrap();
+        assert!(store.index_damage().unwrap().unwrap().missing.is_empty());
+        for c in corrupt_files(&root) {
+            fs::remove_file(c).unwrap();
+        }
+        assert_eq!(store.index_damage().unwrap(), None, "removing the copy ends it");
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn record_names_are_the_records_own() {
+        let bytes = serde_json::to_vec_pretty(&vec![named("a:1"), named("b:1"), named("c:1")]).unwrap();
+        assert_eq!(record_names(&bytes), ["a:1", "b:1", "c:1"]);
+        // A field inside a record that is called name too is not a record.
+        assert_eq!(record_names(br#"[{"name": "a:1", "config": {"name": "no"}, "x": [1, {"y": 2}]}, {"name":"b:1"}]"#), ["a:1", "b:1"]);
+        let compact = serde_json::to_vec(&vec![named("a:1"), named("b:1")]).unwrap();
+        assert_eq!(record_names(&compact), ["a:1", "b:1"]);
+        // Cut inside the last record, after its name: still named.
+        let at = bytes.windows(9).rposition(|w| w == b"\"digest\":").unwrap();
+        assert_eq!(missing(&bytes[..at], &[named("a:1")]), ["b:1", "c:1"]);
+        // Cut inside the name itself: no half name.
+        let at = bytes.windows(5).rposition(|w| w == b"c:1\",").unwrap() + 1;
+        assert_eq!(record_names(&bytes[..at]), ["a:1", "b:1"]);
     }
 
     #[test]

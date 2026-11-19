@@ -35,7 +35,7 @@ pub fn route(req: &Request, engine: &Arc<Engine>, w: &mut UnixStream) -> Option<
                 let (id, action) = rest.split_once('/')?;
                 return Some(match (m, action) {
                     ("GET", "stats") => stats(req, engine, id, w),
-                    ("GET", "top") => reply(w, top(engine, id), 200),
+                    ("GET", "top") => reply(w, top(req, engine, id), 200),
                     ("POST", "pause") => reply(w, engine.pause(id, true).map(|()| Value::Null), 204),
                     ("POST", "unpause") => reply(w, engine.pause(id, false).map(|()| Value::Null), 204),
                     ("POST", "rename") => reply(w, engine.rename(id, req.query("name").unwrap_or_default()).map(|()| Value::Null), 204),
@@ -138,10 +138,10 @@ fn stats(req: &Request, engine: &Engine, key: &str, w: &mut UnixStream) -> io::R
     Ok(Next::KeepAlive)
 }
 
-fn top(engine: &Engine, key: &str) -> Result<Value, Error> {
-    let lines = engine.top(key)?;
-    let procs: Vec<Vec<&str>> = lines.iter().map(|l| l.splitn(8, '\t').collect()).collect();
-    Ok(json!({"Titles": ["UID", "PID", "PPID", "C", "STIME", "TTY", "TIME", "CMD"], "Processes": procs}))
+fn top(req: &Request, engine: &Engine, key: &str) -> Result<Value, Error> {
+    let ps_args = req.query("ps_args").unwrap_or_default();
+    super::top::check(ps_args)?;
+    super::top::answer(ps_args, &engine.top(key)?)
 }
 
 fn update(req: &Request, engine: &Engine, key: &str) -> Result<Value, Error> {

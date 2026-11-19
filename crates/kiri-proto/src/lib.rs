@@ -155,7 +155,9 @@ pub enum Msg<'a> {
     ContainerStats(ContainerStats),
     /// Host → guest: the container's processes. Answered by `Top` or `Error`.
     TopQuery { id: &'a str },
-    /// Tab-separated `uid pid ppid c stime tty time cmd`, one process each.
+    /// Tab-separated `user pid ppid c stime tty time comm stat rss vsz %cpu
+    /// %mem etime-secs time-secs uid cmd`, one process each (cmd last; an
+    /// older agent sent only the first seven and cmd).
     Top(StrList<'a>),
     /// Host → guest: plug a running container into another bridge network
     /// as `ifname`. Answered by `Ack` or `Error`.
@@ -398,6 +400,9 @@ pub mod run_flags {
     /// program as its child, forwards signals to it, reaps orphans and exits
     /// with the program's status, as tini does for Docker.
     pub const INIT: u32 = 1 << 16;
+    /// `--pid host`: no PID namespace of its own; the container sees the
+    /// VM's processes (on a Linux host, the host's).
+    pub const PID_HOST: u32 = 1 << 17;
 }
 
 /// A container's network, as `Run` carries it.
@@ -423,6 +428,9 @@ pub mod net_opts {
     /// `netns=<container id>`: join that running container's network
     /// namespace instead of getting one (`--network container:<id>`).
     pub const NETNS: &str = "netns";
+    /// `pidns=<container id>`: join that running container's PID namespace
+    /// instead of getting one (`--pid container:<id>`).
+    pub const PIDNS: &str = "pidns";
     /// `mac=02:42:ac:11:00:02`: the container side's MAC address.
     pub const MAC: &str = "mac";
     /// `nameserver=1.1.1.1` (`--dns`): with `DNS_GATEWAY` the gateway's DNS
