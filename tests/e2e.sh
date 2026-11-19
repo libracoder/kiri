@@ -845,6 +845,10 @@ t load "Loaded image: kiri-test/alp:v1" $D load -i "$IMD/a.tar"
 t load-runs "3." $D run --rm kiri-test/alp:v1 cat /etc/alpine-release
 t load-stdin "Loaded image" bash -c "$D rmi kiri-test/alp:v1 >/dev/null; $D load < $IMD/a.tar"
 t load-gzip "Loaded image: kiri-test/alp:v1" bash -c "$D rmi kiri-test/alp:v1 >/dev/null; gzip -c $IMD/a.tar | $D load"
+# zstd too, as Docker takes it (skipped where the zstd tool is not installed).
+if command -v zstd >/dev/null; then
+  t load-zstd "Loaded image: kiri-test/alp:v1" bash -c "$D rmi kiri-test/alp:v1 >/dev/null; zstd -q -c $IMD/a.tar | $D load"
+fi
 code load-garbage 1 bash -c "echo nope | $D load"
 # A hard link's target is read from the layer's root, so a leading / is the
 # layer's, as with Docker (issue 302); `..` still can't leave the layer.
@@ -938,6 +942,9 @@ t import-runs "hi" $D run --rm kiri-test/imported:1
 t import-env "KIRI=1" $D run --rm kiri-test/imported:1 env
 t import-history "from ren2" $D history kiri-test/imported:1
 t import-gzip "hi" bash -c "$D export ren2 | gzip | $D import - kiri-test/imported:2 >/dev/null && $D run --rm kiri-test/imported:2 cat /added"
+if command -v zstd >/dev/null; then
+  t import-zstd "hi" bash -c "$D export ren2 | zstd -q | $D import - kiri-test/imported:5 >/dev/null && $D run --rm kiri-test/imported:5 cat /added"
+fi
 t import-platform "linux/amd64" bash -c "$D export ren2 | $D import --platform linux/amd64 - kiri-test/imported:3 >/dev/null && $D image inspect -f '{{.Os}}/{{.Architecture}}' kiri-test/imported:3"
 t import-not-tar "isn't a tar archive" bash -c "echo nope | $D import - kiri-test/imported:4"
 t import-bad-change "not a valid change command" bash -c "$D export ren2 | $D import -c 'FROM alpine' - kiri-test/imported:4"

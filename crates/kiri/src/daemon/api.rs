@@ -572,7 +572,7 @@ fn image_tag(req: &Request, engine: &Engine, source: &str) -> Result<(), Error> 
     Ok(())
 }
 
-/// `docker load`: an image archive, plain or gzip-compressed as Docker
+/// `docker load`: an image archive, plain or gzip- or zstd-compressed as Docker
 /// accepts it, streamed into the store.
 fn image_load(req: &Request, engine: &Engine, w: &mut UnixStream, r: &mut BufReader<UnixStream>) -> io::Result<Next> {
     use std::io::Read;
@@ -607,7 +607,7 @@ fn image_load(req: &Request, engine: &Engine, w: &mut UnixStream, r: &mut BufRea
 }
 
 /// `docker import`: a root filesystem tarball, the body (`fromSrc=-`) or a
-/// URL, plain or gzip, becomes a one-layer image as Docker makes it.
+/// URL, plain, gzip or zstd, becomes a one-layer image as Docker makes it.
 fn image_import(req: &Request, engine: &Engine, w: &mut UnixStream, r: &mut BufReader<UnixStream>) -> io::Result<Next> {
     let mut body = http::Body::new(req, r);
     match import(req, engine, &mut body) {
@@ -665,7 +665,7 @@ fn import(req: &Request, engine: &Engine, stdin: &mut dyn io::Read) -> Result<St
     let mut block = Vec::with_capacity(512);
     (&mut tar).take(512).read_to_end(&mut block).map_err(|e| upload_error(gzip, e))?;
     if !tar_header(&block) {
-        return Err(Error::BadRequest("the archive isn't a tar archive (plain or gzip)".into()));
+        return Err(Error::BadRequest("the archive isn't a tar archive (plain, gzip or zstd)".into()));
     }
     // An uncompressed layer: its digest is its diff id.
     let mut layer = engine.store.ingest()?;
@@ -2894,6 +2894,7 @@ fn archive_get(req: &Request, engine: &Engine, id: &str, w: &mut UnixStream) -> 
 enum Upload {
     Tar,
     Gzip,
+    Zstd,
     Unsupported(&'static str),
 }
 
@@ -2905,15 +2906,74 @@ fn upload_compression(head: &[u8]) -> Upload {
         [0x1f, 0x8b, ..] => Upload::Gzip,
         [b'B', b'Z', b'h', ..] => Upload::Unsupported("bzip2"),
         [0xfd, b'7', b'z', b'X', b'Z', 0, ..] => Upload::Unsupported("xz"),
-        [0x28, 0xb5, 0x2f, 0xfd, ..] => Upload::Unsupported("zstd"),
+        [0x28, 0xb5, 0x2f, 0xfd, ..] => Upload::Zstd,
         _ => Upload::Tar,
     }
 }
 
-/// A read of the upload failed. A damaged gzip archive is the client's
-/// input, as a damaged tar is (the guest refuses that one with 400).
+/// A read of the upload failed. A damaged gzip or zstd archive is the
+/// client's input, as a damaged tar is (the guest refuses that one with 400).
 fn upload_error(gzip: bool, e: io::Error) -> Error {
-    if gzip { Error::BadRequest(format!("the gzip archive is damaged or cut short: {e}")) } else { Error::Io(e) }
+    if gzip {
+        Error::BadRequest(format!("the gzip archive is damaged or cut short: {e}"))
+    } else if e.get_ref().is_some_and(|inner| inner.is::<ZstdDamaged>()) {
+        Error::BadRequest(e.to_string())
+    } else {
+        Error::Io(e)
+    }
+}
+
+/// What `ZstdFrames` fails a read with, so `upload_error` knows the archive
+/// and not the connection was at fault.
+#[derive(Debug)]
+struct ZstdDamaged(String);
+
+impl std::fmt::Display for ZstdDamaged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the zstd archive is damaged or cut short: {}", self.0)
+    }
+}
+
+impl std::error::Error for ZstdDamaged {}
+
+/// A zstd upload, decompressed: every frame of it, one after the other, as
+/// `zstd -d` reads a file (`pzstd` and `zstd` on several inputs write more
+/// than one frame). The decoder reads one frame and stops.
+struct ZstdFrames<R: io::BufRead> {
+    /// None between frames and at the end.
+    frame: Option<ruzstd::decoding::StreamingDecoder<R, ruzstd::decoding::FrameDecoder>>,
+    /// The source, while no frame holds it.
+    source: Option<R>,
+}
+
+impl<R: io::BufRead> ZstdFrames<R> {
+    fn new(source: R) -> ZstdFrames<R> {
+        ZstdFrames { frame: None, source: Some(source) }
+    }
+}
+
+impl<R: io::BufRead> io::Read for ZstdFrames<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let damaged = |e: String| io::Error::new(io::ErrorKind::InvalidData, ZstdDamaged(e));
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            if let Some(frame) = &mut self.frame {
+                let n = frame.read(buf).map_err(|e| damaged(e.to_string()))?;
+                if n > 0 {
+                    return Ok(n);
+                }
+                // This frame is done: the source goes back for the next one.
+                self.source = self.frame.take().map(ruzstd::decoding::StreamingDecoder::into_inner);
+            }
+            let Some(mut source) = self.source.take() else { return Ok(0) };
+            if source.fill_buf()?.is_empty() {
+                return Ok(0);
+            }
+            self.frame = Some(ruzstd::decoding::StreamingDecoder::new(source).map_err(|e| damaged(e.to_string()))?);
+        }
+    }
 }
 
 /// The upload as tar: `head` (its first bytes, already read) then `rest`.
@@ -2922,7 +2982,8 @@ fn upload_reader<'a>(head: Vec<u8>, rest: impl io::Read + 'a) -> Result<Box<dyn 
     match upload_compression(&head) {
         Upload::Tar => Ok(Box::new(io::Cursor::new(head).chain(rest))),
         Upload::Gzip => Ok(Box::new(flate2::read::MultiGzDecoder::new(io::Cursor::new(head).chain(rest)))),
-        Upload::Unsupported(kind) => Err(Error::BadRequest(format!("a {kind}-compressed archive isn't supported yet: send it as tar or gzip"))),
+        Upload::Zstd => Ok(Box::new(ZstdFrames::new(io::BufReader::new(io::Cursor::new(head).chain(rest))))),
+        Upload::Unsupported(kind) => Err(Error::BadRequest(format!("a {kind}-compressed archive isn't supported yet: send it as tar, gzip or zstd"))),
     }
 }
 
@@ -3288,9 +3349,36 @@ mod tests {
         assert_eq!(upload_compression(&[0x1f, 0x8b, 8, 0, 0, 0]), Upload::Gzip);
         assert_eq!(upload_compression(b"BZh91A"), Upload::Unsupported("bzip2"));
         assert_eq!(upload_compression(&[0xfd, b'7', b'z', b'X', b'Z', 0]), Upload::Unsupported("xz"));
-        assert_eq!(upload_compression(&[0x28, 0xb5, 0x2f, 0xfd, 0, 0]), Upload::Unsupported("zstd"));
+        assert_eq!(upload_compression(&[0x28, 0xb5, 0x2f, 0xfd, 0, 0]), Upload::Zstd);
         assert_eq!(upload_compression(b"etc/ho"), Upload::Tar);
         assert_eq!(upload_compression(b""), Upload::Tar);
+    }
+
+    /// A zstd upload comes out as the tar it holds: one frame, several
+    /// frames one after the other (`pzstd`), wherever the bytes already
+    /// read (enough to know it by) end and the rest begins.
+    #[test]
+    fn zstd_uploads_are_decompressed_frame_after_frame() {
+        use std::io::Read;
+        let zstd = |data: &[u8]| ruzstd::encoding::compress_to_vec(data, ruzstd::encoding::CompressionLevel::Fastest);
+        let first: Vec<u8> = (0..200_000u32).flat_map(|i| i.to_le_bytes()).collect();
+        let second = b"the second frame".to_vec();
+        let one = zstd(&first);
+        let two = [one.clone(), zstd(&second)].concat();
+        for (what, sent, want) in [("one frame", &one, first.clone()), ("two frames", &two, [first.clone(), second].concat())] {
+            for split in [4, 6, sent.len()] {
+                let mut got = Vec::new();
+                upload_reader(sent[..split].to_vec(), &sent[split..]).unwrap().read_to_end(&mut got).unwrap();
+                assert!(got == want, "{what}, split at {split}");
+            }
+        }
+        // Cut short, and not zstd after its first four bytes: the client's
+        // input, a 400 that says so.
+        for (what, sent) in [("cut short", &one[..one.len() / 2]), ("damaged", &[&one[..4], &[0xffu8; 64][..]].concat()[..])] {
+            let mut got = Vec::new();
+            let e = upload_reader(sent[..6].to_vec(), &sent[6..]).unwrap().read_to_end(&mut got).expect_err(what);
+            assert!(matches!(upload_error(false, e), Error::BadRequest(m) if m.starts_with("the zstd archive is damaged")), "{what}");
+        }
     }
 
     /// DDEV's CopyIntoVolume sends a gzipped tar: the guest gets the tar.
