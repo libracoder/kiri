@@ -964,7 +964,8 @@ pub const HOST_ADDR: &str = "198.19.248.254";
 pub const HOST_BOUND_PORT: u32 = 1026;
 
 /// One host-bound connection from a container: the guest sends
-/// `ip[4] port[2]` (always 127.0.0.1 today), and we connect there on the Mac.
+/// `ip[4] port[2]` (always 127.0.0.1 today), and we connect to the Mac's
+/// loopback at that port.
 pub fn serve_host_bound(stream: kiri_vmm::VsockStream) {
     let _ = std::thread::Builder::new().name("kiri-host-bound".into()).spawn(move || {
         let _ = host_bound(stream);
@@ -983,7 +984,7 @@ fn host_bound(stream: kiri_vmm::VsockStream) -> io::Result<()> {
     }
     // Refused or unreachable: dropping closes the container's connection,
     // which is what it would see from a real host too.
-    let target = TcpStream::connect((ip, port))?;
+    let target = dial_loopback(port)?;
     target.set_nodelay(true)?;
     let mut to_guest = std::fs::File::from(stream.fd.try_clone()?);
     let mut target_read = target.try_clone()?;
@@ -998,6 +999,11 @@ fn host_bound(stream: kiri_vmm::VsockStream) -> io::Result<()> {
     let _ = down.join();
     drop(stream);
     Ok(())
+}
+
+/// The Mac's loopback at `port`: IPv4, then IPv6 for a server on `::1` only (#258).
+fn dial_loopback(port: u16) -> io::Result<TcpStream> {
+    TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).or_else(|e| TcpStream::connect((std::net::Ipv6Addr::LOCALHOST, port)).map_err(|_| e))
 }
 
 /// The guest's relay only ever asks for the Mac's loopback; anything else is
@@ -1112,7 +1118,7 @@ pub fn listening<S: AsRef<str>>(lines: &[S], host_network: bool) -> (Vec<u16>, V
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_PEER_SESSIONS, MAX_REMOTE_SESSIONS, MAX_TCP_SESSIONS, NAT_PORTS, REMOTE_SESSIONS, TCP_SESSIONS, host_bound_allowed, kernel_forwards, kernel_host_ip, listening, nat_port, relays_too, tcp_permit};
+    use super::{MAX_PEER_SESSIONS, MAX_REMOTE_SESSIONS, MAX_TCP_SESSIONS, NAT_PORTS, REMOTE_SESSIONS, TCP_SESSIONS, dial_loopback, host_bound_allowed, kernel_forwards, kernel_host_ip, listening, nat_port, relays_too, tcp_permit};
     use std::net::IpAddr;
     use std::sync::atomic::Ordering;
 
@@ -1127,6 +1133,19 @@ mod tests {
         assert!(!host_bound_allowed(local, 443, router));
         assert!(host_bound_allowed(local, 5432, router), "other loopback services stay reachable");
         assert!(!host_bound_allowed(std::net::Ipv4Addr::new(10, 0, 0, 1), 5432, router), "loopback only");
+    }
+
+    /// A Mac server on `::1` only (Node's `localhost`) is reached; one on
+    /// both loopbacks is reached on 127.0.0.1, as before (#258).
+    #[test]
+    fn host_docker_internal_reaches_a_server_on_either_loopback() {
+        let v6 = std::net::TcpListener::bind("[::1]:0").unwrap();
+        let port = v6.local_addr().unwrap().port();
+        assert_eq!(dial_loopback(port).unwrap().peer_addr().unwrap().ip(), IpAddr::from(std::net::Ipv6Addr::LOCALHOST));
+        let v4 = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+        assert_eq!(dial_loopback(port).unwrap().peer_addr().unwrap().ip(), IpAddr::from(std::net::Ipv4Addr::LOCALHOST));
+        drop((v4, v6));
+        assert_eq!(dial_loopback(port).unwrap_err().kind(), std::io::ErrorKind::ConnectionRefused);
     }
 
     /// A clash names the other program holding the port, never Kiri itself.
