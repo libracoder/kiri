@@ -425,7 +425,7 @@ tr.prow .btn svg { width: 12px; height: 12px; fill: currentColor; flex: none; }
 .toast.removed.undo .life { animation-duration: var(--life, 6s); }
 .toast.removed .linkish { font-weight: 600; }
 
-.content { flex: 1; overflow: auto; overflow-x: hidden; padding-block: 4px 20px; padding-inline: 20px 24px; }
+.content { flex: 1; overflow: auto; overflow-x: hidden; padding-block: 4px calc(20px + var(--hold, 0px)); padding-inline: 20px 24px; }
 table { width: 100%; border-collapse: separate; border-spacing: 0; }
 th { white-space: nowrap; text-align: var(--start); font-size: var(--fs-small); font-weight: 600; color: var(--faint); text-transform: uppercase; letter-spacing: .05em;
      padding: 6px 10px; border-bottom: 1px solid var(--line); position: sticky; top: 0; background: var(--bg); }
@@ -5396,6 +5396,36 @@ document.addEventListener("keydown", (ev) => {
   ev.preventDefault(); bs[ev.key === "Home" ? 0 : ev.key === "End" ? bs.length - 1 : (i + d + bs.length) % bs.length].focus();
 });
 $("content").addEventListener("scroll", closeMenu);
+/* Opening or closing a group keeps its header row where it was, under the
+   pointer. Closing one near the end of the list leaves less to scroll, so the
+   browser would pull the list down and the header away from the pointer;
+   instead a gap holds the bottom, gone once the list is scrolled back up past it. */
+function toggleGroup(el) {
+  const g = el.dataset.group, c = $("content"), before = el.getBoundingClientRect().top;
+  ui.collapsed.has(g) ? ui.collapsed.delete(g) : ui.collapsed.add(g);
+  render();
+  const now = c.querySelector(`tr.group[data-group="${CSS.escape(g)}"]`);
+  if (!now) return;
+  const shift = now.getBoundingClientRect().top - before;
+  if (Math.abs(shift) < 1) return;
+  const want = c.scrollTop + shift;
+  // Twice: a list shorter than the window measures as the window, so the first gap can fall short.
+  for (let i = 0; i < 2; i++) {
+    const room = c.scrollHeight - c.clientHeight;
+    if (want <= room) break;
+    c.style.setProperty("--hold", `${(parseFloat(c.style.getPropertyValue("--hold")) || 0) + want - room}px`);
+    c.dataset.hold = ui.view;
+  }
+  c.scrollTop = Math.max(0, want);
+}
+$("content").addEventListener("scroll", () => {
+  const c = $("content"), hold = parseFloat(c.style.getPropertyValue("--hold")) || 0;
+  if (!hold) return;
+  const need = Math.max(0, c.scrollTop + c.clientHeight - Math.max(c.scrollHeight - hold, c.clientHeight));
+  if (!need) dropHold(); // once, when scrolled clear of it: resizing it on every scroll would lay the list out each frame
+});
+/* The gap belongs to the list it was made for: gone on any other page. */
+function dropHold() { const c = $("content"); c.style.removeProperty("--hold"); delete c.dataset.hold; }
 // A project's name that opens its page is a link to the keys too: Enter opens it.
 $("content").addEventListener("keydown", (ev) => { const g = ev.key === "Enter" && ev.target.closest?.("[data-gopen]"); if (g) { ev.preventDefault(); ev.stopPropagation(); cmpOpen(g.dataset.gopen); } });
 
@@ -6566,6 +6596,7 @@ function render() {
   renderImportStrip();
   navNote();
   const v = ui.view;
+  if ($("content").dataset.hold && ($("content").dataset.hold !== v || ui.detail || k8s.detail || k8s.svc)) dropHold();
   document.querySelectorAll("nav button").forEach((b) => (b.dataset.view === v ? b.setAttribute("aria-current", "page") : b.removeAttribute("aria-current")));
   // Always through setHTML: a title written another way leaves its cache stale, and the Beta tag lost at the next refresh.
   setHTML($("title"), v === "usb" ? `USB<span class="beta" title="${esc(tr("USB passthrough is new: tell us how it works with your devices"))}">${tr("Beta")}</span>`
@@ -7925,7 +7956,7 @@ $("content").addEventListener("click", (ev) => {
   else if ((el = t("[data-smore]"))) closeMenu() || showMenu(el, [[tr("Open project"), `data-gopen="${esc(el.dataset.smore)}"`], [tr("Show in compose file"), `data-mfile="${esc(el.dataset.smore)}" data-svc="${esc(el.dataset.svc)}"`]]);
   else if ((el = t("[data-gopen]"))) cmpOpen(el.dataset.gopen);
   else if ((el = t("[data-g]"))) projectAsk(el.dataset.project, el.dataset.g);
-  else if ((el = t("[data-group]"))) { const g = el.dataset.group; ui.collapsed.has(g) ? ui.collapsed.delete(g) : ui.collapsed.add(g); render(); }
+  else if ((el = t("[data-group]"))) toggleGroup(el);
   else if (composeClick(t)) {}
   else if ((el = t("[data-stab]"))) { prefs.tab = el.dataset.stab; if (prefs.tab === "about") send("about"); if (prefs.tab === "builds") send("buildwith"); if (prefs.tab === "registries") send("logins"); if (prefs.tab === "diagnostics") diagOpen(); render(); }
   else if (diagClick(t)) {}
