@@ -152,6 +152,11 @@ t user-name "uid=70(postgres)" $D run --rm -u postgres postgres:17-alpine id
 t user-group "gid=0(root)" $D run --rm -u 1000:0 alpine id
 t entrypoint "x" $D run --rm --entrypoint echo alpine x
 t entrypoint-image "nginx version" $D run --rm nginx:alpine nginx -v
+# An empty --entrypoint clears the image's (the CLI sends [""]) and runs the
+# command alone; with no command there is nothing to run, as on Docker.
+t entrypoint-empty-eq "ok" $D run --rm --entrypoint= alpine /bin/sh -c 'echo ok'
+t entrypoint-empty-arg "ok" $D run --rm --entrypoint "" alpine /bin/sh -c 'echo ok'
+t entrypoint-empty-no-cmd "no command specified" $D run --rm --entrypoint= alpine
 t hostname-is-id "" $D run --rm alpine hostname
 t hostname-file "" $D run --rm alpine cat /etc/hostname
 # Docker takes almost any --hostname (Compose files use underscores); only a

@@ -1636,13 +1636,23 @@ fn console_size(v: &Value) -> Option<(u16, u16)> {
 /// A create's Entrypoint and Cmd with the image's, by Docker's rules: a
 /// non-empty Entrypoint drops the image's Cmd; otherwise an empty or missing
 /// Cmd takes the image's (Testcontainers sends `"Cmd": []`), and a missing
-/// Entrypoint the image's (`[]` clears it).
-fn command(entry: Option<Vec<String>>, cmd: Option<Vec<String>>, image_entry: &[String], image_cmd: &[String]) -> (Vec<String>, Vec<String>) {
+/// Entrypoint the image's (`[]` clears it). `--entrypoint=` and
+/// `--entrypoint ""` reach here as `[""]`: Docker counts that as given, so the
+/// image's Cmd is dropped, then clears it, so only the request's Cmd runs, and
+/// with none there is nothing to run. Kept as `[""]`, the empty name was looked
+/// up on PATH and came back as the first PATH directory.
+fn command(entry: Option<Vec<String>>, cmd: Option<Vec<String>>, image_entry: &[String], image_cmd: &[String]) -> Result<(Vec<String>, Vec<String>), Error> {
     let cmd = cmd.unwrap_or_default();
-    match entry {
+    Ok(match entry {
+        Some(e) if e.len() == 1 && e[0].is_empty() => {
+            if cmd.is_empty() {
+                return Err(Error::BadRequest("no command specified".into()));
+            }
+            (vec![], cmd)
+        }
         Some(e) if !e.is_empty() => (e, cmd),
         e => (e.unwrap_or_else(|| image_entry.to_vec()), if cmd.is_empty() { image_cmd.to_vec() } else { cmd }),
-    }
+    })
 }
 
 /// The primary network when NetworkMode is empty or `default`: the first
@@ -1868,12 +1878,12 @@ pub(super) fn create(req: &Request, engine: &Engine) -> Result<Value, Error> {
     let image_cfg: Value = engine.store.read_config(&image.config_digest).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null);
     // Checked before mounts, which may create volumes.
     let healthcheck = healthcheck_from(&body, &image_cfg)?;
+    let (entrypoint, cmd) = command(strings(&body["Entrypoint"]), strings(&body["Cmd"]), &image.config.entrypoint, &image.config.cmd)?;
     let mounts = mounts(&body, engine, &image)?;
     let ports = port_bindings(&body, engine, &image)?;
     if !ports.is_empty() && network_mode == "none" {
         return Err(Error::BadRequest("a container with --network none cannot publish ports".into()));
     }
-    let (entrypoint, cmd) = command(strings(&body["Entrypoint"]), strings(&body["Cmd"]), &image.config.entrypoint, &image.config.cmd);
     let mut env = image.config.env.clone();
     // Settings → Network → "Pass to containers": the proxy, unless set here.
     let given = strings(&body["Env"]).unwrap_or_default();
@@ -3258,15 +3268,19 @@ mod tests {
         let s = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
         let (ie, ic) = (s(&["/entry"]), s(&["/bin/ryuk"]));
         // Testcontainers (Java, .NET): "Cmd": [] means the image's Cmd.
-        assert_eq!(command(None, Some(vec![]), &ie, &ic), (ie.clone(), ic.clone()));
-        assert_eq!(command(None, None, &ie, &ic), (ie.clone(), ic.clone()));
-        assert_eq!(command(None, Some(s(&["x"])), &ie, &ic), (ie.clone(), s(&["x"])));
+        assert_eq!(command(None, Some(vec![]), &ie, &ic).ok(), Some((ie.clone(), ic.clone())));
+        assert_eq!(command(None, None, &ie, &ic).ok(), Some((ie.clone(), ic.clone())));
+        assert_eq!(command(None, Some(s(&["x"])), &ie, &ic).ok(), Some((ie.clone(), s(&["x"]))));
         // A non-empty Entrypoint drops the image's Cmd.
-        assert_eq!(command(Some(s(&["sh"])), None, &ie, &ic), (s(&["sh"]), vec![]));
-        assert_eq!(command(Some(s(&["sh"])), Some(vec![]), &ie, &ic), (s(&["sh"]), vec![]));
-        assert_eq!(command(Some(s(&["sh"])), Some(s(&["-c", "x"])), &ie, &ic), (s(&["sh"]), s(&["-c", "x"])));
+        assert_eq!(command(Some(s(&["sh"])), None, &ie, &ic).ok(), Some((s(&["sh"]), vec![])));
+        assert_eq!(command(Some(s(&["sh"])), Some(vec![]), &ie, &ic).ok(), Some((s(&["sh"]), vec![])));
+        assert_eq!(command(Some(s(&["sh"])), Some(s(&["-c", "x"])), &ie, &ic).ok(), Some((s(&["sh"]), s(&["-c", "x"]))));
         // "Entrypoint": [] clears the image's and keeps its Cmd.
-        assert_eq!(command(Some(vec![]), None, &ie, &ic), (vec![], ic.clone()));
+        assert_eq!(command(Some(vec![]), None, &ie, &ic).ok(), Some((vec![], ic.clone())));
+        // `--entrypoint=` sends [""]: no entrypoint, and the image's Cmd is dropped too.
+        assert_eq!(command(Some(s(&[""])), Some(s(&["/bin/sh", "-c", "echo ok"])), &ie, &ic).ok(), Some((vec![], s(&["/bin/sh", "-c", "echo ok"]))));
+        assert!(matches!(command(Some(s(&[""])), None, &ie, &ic), Err(Error::BadRequest(m)) if m == "no command specified"));
+        assert!(matches!(command(Some(s(&[""])), Some(vec![]), &ie, &ic), Err(Error::BadRequest(_))));
     }
 
     // #461: the CLI sends `docker import - my/rootfs:1` as `repo=my/rootfs:1`.

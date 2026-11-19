@@ -2162,6 +2162,11 @@ fn lookup_gid_for_uid(uid: u32) -> Option<u32> {
 
 fn find_executable(p: &Prepared) -> Option<CString> {
     let name = p.argv[0].as_bytes();
+    // An empty name is no program: joined to a PATH directory it would name
+    // the directory itself and fail with a misleading "is a directory".
+    if name.is_empty() {
+        return None;
+    }
     if name.contains(&b'/') {
         return Some(p.argv[0].clone());
     }
