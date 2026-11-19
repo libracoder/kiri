@@ -1726,7 +1726,7 @@
   "Kiri can't check this file with {name} hidden. Compose accepts it, so Apply still works.": "{name}을(를) 숨긴 채로는 Kiri가 이 파일을 확인할 수 없습니다. Compose는 받아들이므로 「적용」은 계속 됩니다.",
   "Compose rejects this file with its real values. Kiri can't show why with secrets hidden.": "Compose가 실제 값으로 이 파일을 거부합니다. 비밀 값을 숨긴 채로는 Kiri가 이유를 보여 줄 수 없습니다.",
   "docker compose took longer than {secs} seconds": "docker compose가 {secs}초보다 오래 걸렸습니다",
-  "Discard": "취소",
+  "Discard": "변경 사항 버리기",
   "Refresh": "새로 고침",
   "Names Docker shows may contain secret values.": "Docker가 보여 주는 이름에 비밀 값이 들어 있을 수 있습니다.",
   "a newer image": "더 새로운 이미지",
