@@ -38,7 +38,10 @@ Apple silicon and Intel Macs (macOS 14+), Windows 10 and 11 (x86-64 and Arm, thr
   `~/.kiri/tls`, whose name constraints allow only `*.kiri.local` and
   `*.kiri.localhost` (Settings → Domains → HTTPS asks macOS to trust it)
 - **Storage**: named and anonymous volumes, bind mounts of Mac paths
-  (virtiofs), `--tmpfs`, `--mount`, `volume` commands
+  (virtiofs), `--tmpfs`, `--mount`, `volume` commands; local-driver
+  volumes with `driver_opts` `type=nfs` mount a remote NFS export — NFSv4
+  (minorversion 4.0 and 4.1) and NFSv3, honouring `addr=`, `nfsvers=`,
+  `hard`/`soft`, `timeo`, `retrans`, `ro`/`rw` and `noatime`
 - **Images**: `pull` (with `docker login` credentials), `push`, `tag`,
   `save`, `load`, `history`, `search`, `image prune`, `system df`;
   **amd64 images run through Rosetta**, `--platform` honoured
@@ -127,3 +130,8 @@ unless the Mac already has a docker CLI.
   (`--add-host name:172.18.0.1` on Windows and Linux, the default bridge's
   gateway; `198.19.248.254` on a Mac) or `DOCKER_BUILDKIT=0`, where Kiri
   maps `host-gateway` itself.
+
+- **`type=cifs` (SMB) volumes don't mount yet.** Kiri's guest kernel has no
+  CIFS client, so a local-driver volume with `driver_opts: {type: cifs}`
+  fails the same way NFS-backed volumes did before NFS support landed.
+  SMB support is a separate change.
