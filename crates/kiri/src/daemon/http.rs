@@ -3,6 +3,7 @@
 //! `attach`. Docker clients keep a few connections open, so the server runs
 //! one thread per connection and never parses more than it needs.
 
+use std::cell::Cell;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 
@@ -15,6 +16,10 @@ const MAX_BODY: usize = 8 << 20;
 /// The request line and headers together may not exceed this: an endless
 /// header line must not grow memory without bound.
 const MAX_HEAD: u64 = 64 << 10;
+/// Most of a streamed body its handler left unread that is read out so the
+/// connection can serve the next request; past this it closes. Go's
+/// net/http server, so Docker's, reads out as much.
+const MAX_UNREAD: u64 = 256 << 10;
 
 #[derive(Debug)]
 pub struct Request {
@@ -28,6 +33,19 @@ pub struct Request {
     /// Sent as HTTP/1.0: its connection closes after the response unless it
     /// asks to keep it.
     http10: bool,
+    /// How much of a streamed body has been read, through [`Body`].
+    streamed: Cell<Streamed>,
+}
+
+/// A streamed request body's progress: whether the connection can serve
+/// another request after it ([`finish_body`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Streamed {
+    /// The body was read with the head (or there is none to stream).
+    No,
+    Unread,
+    Started,
+    Done,
 }
 
 impl Request {
@@ -63,7 +81,7 @@ impl Request {
     /// container create), so it goes through the same code as a client's.
     pub fn internal(method: &str, path: &str, query: &[(&str, &str)], body: Vec<u8>) -> Request {
         let query = query.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect();
-        Request { method: method.to_owned(), path: path.to_owned(), query, headers: Vec::new(), body, http10: false }
+        Request { method: method.to_owned(), path: path.to_owned(), query, headers: Vec::new(), body, http10: false, streamed: Cell::new(Streamed::No) }
     }
 }
 
@@ -115,8 +133,9 @@ pub fn read_request(r: &mut BufReader<UnixStream>, stream: impl Fn(&str, &str) -
         (method, path, query, headers, http10)
     };
     let streamed = stream(&method, &path);
-    let mut req = Request { method, path, query, headers, body: Vec::new(), http10 };
+    let mut req = Request { method, path, query, headers, body: Vec::new(), http10, streamed: Cell::new(Streamed::No) };
     if streamed {
+        req.streamed.set(Streamed::Unread);
         return Ok(Some(req));
     }
     if req.header("transfer-encoding").is_some_and(|v| v.eq_ignore_ascii_case("chunked")) {
@@ -150,6 +169,24 @@ pub fn read_request(r: &mut BufReader<UnixStream>, stream: impl Fn(&str, &str) -
     Ok(Some(req))
 }
 
+/// After a streamed request's response: whether the connection can serve
+/// the client's next request. A body its handler left unread (a pull sent
+/// with one, as docker-modem sends its options) is read out first, up to
+/// [`MAX_UNREAD`], or its bytes would be taken for the next request's head.
+/// One read partly, too large, or held back for a `100 Continue` the daemon
+/// never sends cannot be; the connection closes.
+pub fn finish_body(req: &Request, r: &mut BufReader<UnixStream>) -> bool {
+    match req.streamed.get() {
+        Streamed::No | Streamed::Done => true,
+        Streamed::Started => false,
+        Streamed::Unread if req.header("expect").is_some_and(|v| v.eq_ignore_ascii_case("100-continue")) => false,
+        Streamed::Unread => {
+            let mut body = Body::new(req, r);
+            io::copy(&mut (&mut body).take(MAX_UNREAD), &mut io::sink()).is_ok() && body.read(&mut [0; 1]).is_ok_and(|n| n == 0)
+        }
+    }
+}
+
 /// A streamed request body: Content-Length or chunked, read as it arrives.
 pub struct Body<'a> {
     r: &'a mut BufReader<UnixStream>,
@@ -157,13 +194,17 @@ pub struct Body<'a> {
     /// Bytes left in the body (or in the current chunk).
     left: u64,
     done: bool,
+    /// The request's record of how far its body was read.
+    progress: &'a Cell<Streamed>,
 }
 
 impl<'a> Body<'a> {
-    pub fn new(req: &Request, r: &'a mut BufReader<UnixStream>) -> Body<'a> {
+    pub fn new(req: &'a Request, r: &'a mut BufReader<UnixStream>) -> Body<'a> {
         let chunked = req.header("transfer-encoding").is_some_and(|v| v.eq_ignore_ascii_case("chunked"));
         let left = if chunked { 0 } else { req.header("content-length").and_then(|v| v.parse().ok()).unwrap_or(0) };
-        Body { r, chunked, left, done: !chunked && left == 0 }
+        let done = !chunked && left == 0;
+        req.streamed.set(if done { Streamed::Done } else { Streamed::Started });
+        Body { r, chunked, left, done, progress: &req.streamed }
     }
 }
 
@@ -187,6 +228,7 @@ impl Read for Body<'_> {
                     }
                 }
                 self.done = true;
+                self.progress.set(Streamed::Done);
                 return Ok(0);
             }
         }
@@ -202,6 +244,7 @@ impl Read for Body<'_> {
                 self.r.read_exact(&mut crlf)?;
             } else {
                 self.done = true;
+                self.progress.set(Streamed::Done);
             }
         }
         Ok(n)
@@ -422,7 +465,7 @@ mod tests {
 
     fn with_connection(value: Option<&str>) -> Request {
         let headers = value.map(|v| vec![("connection".to_owned(), v.to_owned())]).unwrap_or_default();
-        Request { method: "POST".to_owned(), path: "/containers/x/start".to_owned(), query: Vec::new(), headers, body: Vec::new(), http10: false }
+        Request { method: "POST".to_owned(), path: "/containers/x/start".to_owned(), query: Vec::new(), headers, body: Vec::new(), http10: false, streamed: Cell::new(Streamed::No) }
     }
 
     /// A request as `read_request` reads it off the wire.
@@ -559,7 +602,7 @@ mod tests {
     #[test]
     fn upgrades_only_when_asked() {
         let reply = |headers: Vec<(String, String)>| {
-            let req = Request { method: "POST".into(), path: "/exec/x/start".into(), query: Vec::new(), headers, body: Vec::new(), http10: false };
+            let req = Request { method: "POST".into(), path: "/exec/x/start".into(), query: Vec::new(), headers, body: Vec::new(), http10: false, streamed: Cell::new(Streamed::No) };
             let mut out = Vec::new();
             upgrade_if_asked(&req, &mut out).unwrap();
             String::from_utf8(out).unwrap()

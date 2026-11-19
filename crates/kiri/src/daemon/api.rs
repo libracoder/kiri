@@ -41,6 +41,12 @@ pub fn serve(stream: UnixStream, engine: Arc<Engine>) -> io::Result<()> {
                 let _ = w.shutdown(std::net::Shutdown::Write);
                 return Ok(());
             }
+            // A body its handler left unread that can't be read out would be
+            // taken for the next request: the connection ends here instead.
+            Ok(Next::KeepAlive) if !http::finish_body(&req, &mut r) => {
+                let _ = w.shutdown(std::net::Shutdown::Write);
+                return Ok(());
+            }
             Ok(Next::KeepAlive) => {}
             Ok(Next::Close) => return Ok(()),
             Err(e) => {
@@ -58,7 +64,8 @@ pub fn serve(stream: UnixStream, engine: Arc<Engine>) -> io::Result<()> {
 }
 
 /// Requests whose bodies can be any size: archives and image tarballs
-/// (`/images/create` is `docker import`'s, a pull sends none).
+/// (`/images/create` is `docker import`'s; a pull's, when a client sends
+/// one, is read out after it, by `http::finish_body`).
 fn streams_body(method: &str, path: &str) -> bool {
     matches!((method, path), ("PUT", p) if p.starts_with("/containers/") && p.ends_with("/archive")) || (method == "POST" && matches!(path, "/images/load" | "/images/create" | "/build"))
 }
@@ -3719,6 +3726,61 @@ mod tests {
         // A close asked for on the second request ends it after that one.
         let (got, ended) = exchange("GET /_ping HTTP/1.1\r\nHost: d\r\n\r\nGET /_ping HTTP/1.1\r\nHost: d\r\nConnection: close\r\n\r\n");
         assert!(ended && got.matches("HTTP/1.1 200 ").count() == 2 && got.matches("Connection: close\r\n").count() == 1, "{got}");
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A pull sent with a body, as docker-modem (so Testcontainers for Node)
+    /// sends its options as JSON, doesn't leave that body to be read as the
+    /// start of the next request on the connection: it used to answer
+    /// `Kiri does not support {"fromImage":...}GET /containers/json yet`.
+    /// A body too large to read out closes the connection after the answer.
+    #[test]
+    fn a_body_the_handler_leaves_unread_is_not_the_next_request() {
+        use std::io::{Read, Write};
+        let (root, engine) = engine_in("unread-body", false);
+        let exchange = |requests: &[u8]| {
+            let (mut client, server) = UnixStream::pair().unwrap();
+            let served = std::thread::spawn({
+                let engine = engine.clone();
+                move || serve(server, engine)
+            });
+            client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            // Written from a thread: a body larger than the socket buffer
+            // would otherwise stop the test before it reads anything.
+            let sent = std::thread::spawn({
+                let (mut client, requests) = (client.try_clone().unwrap(), requests.to_vec());
+                move || client.write_all(&requests)
+            });
+            let (mut got, mut buf) = (Vec::new(), [0u8; 4096]);
+            let ended = loop {
+                match client.read(&mut buf) {
+                    Ok(0) => break true,
+                    Ok(n) => got.extend_from_slice(&buf[..n]),
+                    Err(_) => break false,
+                }
+            };
+            drop(client);
+            let _ = sent.join();
+            served.join().unwrap().unwrap();
+            (String::from_utf8_lossy(&got).into_owned(), ended)
+        };
+        // No image name, so the pull is refused before it reaches a registry.
+        let json = r#"{"fromImage":"","tag":"1.36.1"}"#;
+        let ping = "GET /_ping HTTP/1.1\r\nHost: d\r\n\r\n";
+        let sized = format!("POST /v1.44/images/create?fromImage=&tag=1.36.1 HTTP/1.1\r\nHost: d\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{json}{ping}", json.len());
+        let chunked = format!("POST /images/create?fromImage= HTTP/1.1\r\nHost: d\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{json}\r\n0\r\n\r\n{ping}", json.len());
+        for requests in [sized, chunked] {
+            let (got, ended) = exchange(requests.as_bytes());
+            assert!(!ended && got.starts_with("HTTP/1.1 400 ") && got.contains("HTTP/1.1 200 OK") && !got.contains("does not support"), "{got}");
+        }
+        // Past what is read out (256 KB, as Go's server reads): answered, then closed.
+        let big = vec![b' '; 300 << 10];
+        let mut requests = format!("POST /images/create?fromImage= HTTP/1.1\r\nHost: d\r\nContent-Length: {}\r\n\r\n", big.len()).into_bytes();
+        requests.extend_from_slice(&big);
+        requests.extend_from_slice(ping.as_bytes());
+        let (got, ended) = exchange(&requests);
+        assert!(ended && got.starts_with("HTTP/1.1 400 ") && got.matches("HTTP/1.1 ").count() == 1, "{got}");
         drop(engine);
         let _ = std::fs::remove_dir_all(root);
     }
