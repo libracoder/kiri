@@ -38,8 +38,10 @@ pub const INPUT_WINDOW: usize = 4 << 20;
 /// `UsageQuery`, which has no reply: an older agent's "unexpected" error
 /// would be taken as the reply to the next request. 5 added `RunSpec::seccomp`,
 /// the container's own seccomp program: an older agent would ignore it and
-/// run the container under the default filter instead of its profile.
-pub const PROTOCOL: u16 = 5;
+/// run the container under the default filter instead of its profile. 6
+/// added `Limits::swap_max`: an older agent would read the limits one field
+/// short.
+pub const PROTOCOL: u16 = 6;
 
 // `Run` is the one big message and is built and read once per container.
 #[allow(clippy::large_enum_variant)]
@@ -490,7 +492,12 @@ pub struct Limits {
     pub pids_max: u32,
     /// `--shm-size` in bytes; 0 means 64 MiB.
     pub shm_size: u64,
+    /// cgroup v2 `memory.swap.max` in bytes, [`NO_LIMIT`] for `max`.
+    pub swap_max: u64,
 }
+
+/// A limit of `max`.
+pub const NO_LIMIT: u64 = u64::MAX;
 
 fn put_limits(out: &mut Vec<u8>, l: &Limits) {
     put_u64(out, l.memory_max);
@@ -499,10 +506,11 @@ fn put_limits(out: &mut Vec<u8>, l: &Limits) {
     put_u32(out, l.cpu_weight);
     put_u32(out, l.pids_max);
     put_u64(out, l.shm_size);
+    put_u64(out, l.swap_max);
 }
 
 fn read_limits(r: &mut Reader<'_>) -> Result<Limits, DecodeError> {
-    Ok(Limits { memory_max: r.u64()?, cpu_quota: r.u64()?, cpu_period: r.u32()?, cpu_weight: r.u32()?, pids_max: r.u32()?, shm_size: r.u64()? })
+    Ok(Limits { memory_max: r.u64()?, cpu_quota: r.u64()?, cpu_period: r.u32()?, cpu_weight: r.u32()?, pids_max: r.u32()?, shm_size: r.u64()?, swap_max: r.u64()? })
 }
 
 /// One container's resource use, read from its cgroup and network namespace.
@@ -1385,7 +1393,7 @@ mod tests {
     fn run_spec_lists_survive_encoding() {
         let mut buf = Vec::new();
         let net = Net { bridge: "kiri0", ip: [172, 17, 0, 2], prefix: 16, gateway: [172, 17, 0, 1], extra_hosts: &["1.2.3.4 x"], dns_names: &["web"], opts: &["netns=c0", "nameserver=8.8.8.8"] };
-        let limits = Limits { memory_max: 256 << 20, cpu_quota: 150_000, cpu_period: 100_000, cpu_weight: 100, pids_max: 64, shm_size: 1 << 20 };
+        let limits = Limits { memory_max: 256 << 20, cpu_quota: 150_000, cpu_period: 100_000, cpu_weight: 100, pids_max: 64, shm_size: 1 << 20, swap_max: 512 << 20 };
         encode_run(&mut buf, "c1", &["sha256:top", "sha256:base"], &["echo", "hi"], &["A=1"], "/", "", "c1", 3, net, &["/a\t/b\tro"], &limits, 0b101, &["rlimit\t7\t1024\t2048"], &[]);
         let Msg::Run(r) = decode(&buf).unwrap() else { panic!() };
         assert_eq!(r.id, "c1");
@@ -1476,7 +1484,7 @@ mod tests {
         round(Msg::RemoveBridge { bridge: "kiri3" });
         round(Msg::CopyStat { entry: FsEntry { name: "hosts", mode: 0o100644, size: 9, mtime: 3, mtime_nsec: 4, ino: 5 }, link: "" });
         round(Msg::CopyDone);
-        round(Msg::Update { id: "c1", limits: Limits { memory_max: 1, cpu_quota: 2, cpu_period: 3, cpu_weight: 4, pids_max: 5, shm_size: 6 } });
+        round(Msg::Update { id: "c1", limits: Limits { memory_max: 1, cpu_quota: 2, cpu_period: 3, cpu_weight: 4, pids_max: 5, shm_size: 6, swap_max: NO_LIMIT } });
         round(Msg::Freeze { id: "c1", frozen: true });
         round(Msg::StatsQuery { id: "c1" });
         round(Msg::ContainerStats(ContainerStats { read_ns: 1, mem_current: 2, online_cpus: 4, rx_bytes: 9, io_write_bytes: 11, ..Default::default() }));

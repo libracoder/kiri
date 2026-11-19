@@ -288,9 +288,33 @@ pub struct Limits {
     pub pids_max: u32,
     #[serde(default)]
     pub shm_size: u64,
+    /// `--memory-swap`, as Docker's `HostConfig.MemorySwap`: memory plus
+    /// swap in bytes, -1 for no swap limit, 0 for none given.
+    #[serde(default)]
+    pub memory_swap: i64,
 }
 
 impl Limits {
+    /// `HostConfig.MemorySwap` as Docker reports it: twice the memory limit
+    /// when only that was given (containers saved before `memory_swap` too).
+    pub fn memory_swap(&self) -> i64 {
+        if self.memory_max > 0 && self.memory_swap == 0 {
+            i64::try_from(self.memory_max).unwrap_or(i64::MAX).saturating_mul(2)
+        } else {
+            self.memory_swap
+        }
+    }
+
+    /// The cgroup's `memory.swap.max`: what `memory_swap` allows beyond the
+    /// memory limit. No memory limit, no swap limit, as with Docker.
+    fn swap_max(&self) -> u64 {
+        match self.memory_swap() {
+            _ if self.memory_max == 0 => kiri_proto::NO_LIMIT,
+            s if s < 0 => kiri_proto::NO_LIMIT,
+            s => (s as u64).saturating_sub(self.memory_max),
+        }
+    }
+
     pub fn wire(&self) -> kiri_proto::Limits {
         kiri_proto::Limits {
             memory_max: self.memory_max,
@@ -299,6 +323,7 @@ impl Limits {
             cpu_weight: self.cpu_weight,
             pids_max: self.pids_max,
             shm_size: self.shm_size,
+            swap_max: self.swap_max(),
         }
     }
 }
