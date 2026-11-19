@@ -25,6 +25,18 @@ t server-os "linux" "docker version --format '{{.Server.Os}}'"
 t run "3." "docker run --rm alpine cat /etc/alpine-release"
 t home "/root" "docker run --rm alpine sh -c 'echo \$HOME'"
 t internet "Example Domain" "docker run --rm alpine wget -qO- -T 10 http://example.com"
+# A host whose FORWARD policy is DROP (Docker that turned forwarding on
+# itself, ufw) dropped every packet Kiri forwards, whatever Kiri's own table
+# accepts: no internet, and DNS to the host's resolver timed out, as for a
+# BuildKit builder on a GitHub runner (#247). The engine adds its rules to
+# FORWARD, or to Docker's DOCKER-USER when there is one, as a network comes.
+t forward-drop-policy "-P FORWARD DROP" "apk add -q iptables >/dev/null 2>&1; iptables -P FORWARD DROP && iptables -S FORWARD | head -1"
+t forward-drop-network "Example Domain" "docker network create lhfw >/dev/null; docker run --rm --network lhfw alpine wget -qO- -T 10 http://example.com"
+t forward-drop-rules "-A FORWARD -o kiri+ -j ACCEPT" "iptables -S FORWARD"
+t forward-drop-bridge-dns "DNS-OK" "docker run --rm alpine sh -c 'nslookup -timeout=5 example.com >/dev/null && echo DNS-OK'"
+t forward-drop-docker-user "Example Domain" "iptables -N DOCKER-USER && iptables -I FORWARD -j DOCKER-USER && docker network create lhfw2 >/dev/null && docker run --rm --network lhfw2 alpine wget -qO- -T 10 http://example.com"
+t forward-drop-docker-user-rules "-A DOCKER-USER -o kiri+ -j ACCEPT" "iptables -S DOCKER-USER"
+t forward-drop-cleanup "-P FORWARD ACCEPT" "docker network rm lhfw lhfw2 >/dev/null; iptables -F FORWARD; iptables -F DOCKER-USER; iptables -X DOCKER-USER; iptables -P FORWARD ACCEPT; iptables -S FORWARD"
 t port "Welcome to nginx" "docker run -d --name web -p 18081:80 nginx:alpine >/dev/null; for i in \$(seq 30); do curl -s localhost:18081 && break; sleep 0.3; done"
 t exec "nginx version" "docker exec web nginx -v"
 t port-inspect '{"80/tcp":[{"HostIp":"","HostPort":"18081"}]}' "docker inspect -f '{{json .HostConfig.PortBindings}}' web"

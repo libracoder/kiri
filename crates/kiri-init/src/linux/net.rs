@@ -125,8 +125,16 @@ pub fn host_uplink() -> io::Result<()> {
     // let containers reach the real machine's 127.0.0.1 services. host.docker
     // .internal maps to the bridge gateway instead (write_etc_files).
     let _ = HOST_UPLINK_INDEX.set(index);
-    install_nat(Nat { uplink: index, redirect: false, dnat: Vec::new(), gateway: [0; 4] })
+    install_nat(Nat { uplink: index, redirect: false, dnat: Vec::new(), gateway: [0; 4] })?;
+    // A FORWARD policy of DROP (Docker's, ufw's) would drop what the table
+    // above lets through: the host's firewall gets Kiri's rules too.
+    super::hostfw::sync(&iface);
+    let _ = HOST_UPLINK_NAME.set(iface);
+    Ok(())
 }
+
+/// The Linux host's uplink interface by name, for the host's firewall.
+static HOST_UPLINK_NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 /// What Kiri's IPv4 table was last built from, so it can be rebuilt when a
 /// bridge comes or goes (the forward filter has a rule per bridge).
@@ -176,6 +184,11 @@ fn refresh_nat() -> io::Result<()> {
             let r = install_nat(n);
             if r.is_err() {
                 *NAT.lock().unwrap_or_else(|e| e.into_inner()) = Some(keep);
+            }
+            // As a network comes or goes: Docker or ufw may have turned the
+            // host's FORWARD policy to DROP since the engine started.
+            if let Some(uplink) = HOST_UPLINK_NAME.get() {
+                super::hostfw::sync(uplink);
             }
             r
         }
@@ -625,6 +638,7 @@ pub fn remove_host_network() {
     if let Err(e) = netlink::remove_nat() {
         eprintln!("kiri-init: removing the nftables table: {e}");
     }
+    super::hostfw::remove();
     let _ = netlink::install_nat6(&[], &[]);
     let _ = ipv6_forwarding(false);
 }

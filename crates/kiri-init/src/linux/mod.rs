@@ -6,6 +6,7 @@ mod copy;
 mod dns;
 mod fsnotify;
 mod fsview;
+mod hostfw;
 mod hostopts;
 mod inroot;
 mod layers;
