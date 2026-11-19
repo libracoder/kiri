@@ -1217,7 +1217,7 @@ if [ -z "${KIRI:-}" ]; then
   KIRI=$(cd "$(dirname "$0")/.." && pwd)/target/release/kiri
   [ -x "$KIRI" ] || KIRI=$(lsof -a -d txt -Fn -p "$(lsof -t "$SOCK" 2>/dev/null | head -1)" 2>/dev/null | sed -n 's/^n//p' | head -1)
 fi
-MACHINE_TESTS="machine-create machine-list machine-user machine-mac-files machine-cwd machine-hostname machine-sudo machine-stop machine-start machine-delete machine-bad-name"
+MACHINE_TESTS="machine-create machine-list machine-user machine-mac-files machine-cwd machine-hostname machine-sudo machine-stop machine-stop-again machine-start machine-start-again machine-delete machine-bad-name"
 # The binary as one shell word, for commands passed to bash -c (app paths have spaces).
 KQ=$(printf %q "$KIRI")
 if [ -x "$KIRI" ]; then
@@ -1232,7 +1232,10 @@ rm -rf "$MD"
 t machine-hostname "e2e-m" bash -c "$KQ machine shell e2e-m -- hostname < /dev/null"
 t machine-sudo "root" bash -c "for i in \$(seq 30); do out=\$($KQ machine shell e2e-m -- sudo -n whoami < /dev/null 2>/dev/null); [ \"\$out\" = root ] && break; sleep 1; done; echo \$out"
 t machine-stop "Exited" bash -c "$KQ machine stop e2e-m && $KQ machine list"
+# Stopped already, or running already: done, not an empty `kiri: ` and a failure.
+code machine-stop-again 0 "$KIRI" machine stop e2e-m
 t machine-start "Up" bash -c "$KQ machine start e2e-m && $KQ machine list"
+code machine-start-again 0 "$KIRI" machine start e2e-m
 t machine-delete "deleted" "$KIRI" machine delete e2e-m
 code machine-bad-name 1 "$KIRI" machine create 'bad_name!'
 else

@@ -55,7 +55,12 @@ pub fn run(args: &[String]) -> io::Result<()> {
         }
         Some(verb @ ("start" | "stop" | "restart")) => {
             need_name()?;
-            ok(client::request("POST", &format!("/containers/{}/{verb}", container(name)), None))?;
+            // Already running, or already stopped: Docker's 304, with no
+            // body, is done (it printed an empty `kiri: ` and failed).
+            let r = client::request("POST", &format!("/containers/{}/{verb}", container(name)), None)?;
+            if !r.ok() && r.status != 304 {
+                return Err(io::Error::other(r.error()));
+            }
             Ok(())
         }
         Some("delete" | "rm") => {

@@ -210,7 +210,7 @@ fn engine(rx: &Receiver<Cmd>, tx: Sender<Cmd>) {
                     a @ ("start" | "stop" | "restart" | "pause" | "unpause") => ("POST", format!("/containers/{id}/{a}")),
                     _ => continue,
                 };
-                let result = expect_ok(client::request(method, &path, None));
+                let result = expect_done(client::request(method, &path, None));
                 // Refused to start (a port taken): the container's page says why.
                 if let (Err(e), "start") = (&result, action.as_str()) {
                     emit(json!({"type": "startfailed", "id": id, "error": e.to_string()}).to_string());
@@ -252,6 +252,14 @@ fn watch(tx: Sender<Cmd>) {
 pub fn expect_ok(r: io::Result<client::Response>) -> io::Result<()> {
     let r = r?;
     if r.ok() { Ok(()) } else { Err(io::Error::other(r.error())) }
+}
+
+/// A container action's answer, as on the Mac and Linux: Docker's 304 is
+/// "already so" (Stop on a stopped container, Start on a running one), so
+/// done, not an empty red toast.
+fn expect_done(r: io::Result<client::Response>) -> io::Result<()> {
+    let r = r?;
+    if r.ok() || r.status == 304 { Ok(()) } else { Err(io::Error::other(r.error())) }
 }
 
 fn act(result: io::Result<()>) {
@@ -933,6 +941,19 @@ fn allowed_url(url: &str) -> bool {
 mod tests {
     use super::{allowed_url, unanswered, wakes};
     use std::io::ErrorKind;
+
+    /// As on the Mac and Linux: Stop on a stopped container, or Start on a
+    /// running one, is done (Docker's 304, with no body), not an empty error.
+    #[test]
+    fn a_container_already_so_is_done_not_an_empty_error() {
+        use super::{client::Response, expect_done};
+        let answer = |status: u16, body: &str| Ok(Response { status, body: body.as_bytes().to_vec() });
+        assert!(expect_done(answer(304, "")).is_ok(), "already stopped, or already running");
+        assert!(expect_done(answer(204, "")).is_ok());
+        let refused = expect_done(answer(409, r#"{"message":"cannot start a paused container, try unpause instead"}"#));
+        assert_eq!(refused.unwrap_err().to_string(), "cannot start a paused container, try unpause instead");
+        assert!(expect_done(Err(std::io::Error::other("no engine"))).is_err());
+    }
 
     /// Only Start ends a Stop: Kiri coming up (the window, or hidden at
     /// login) starts the engine unless the person stopped it.

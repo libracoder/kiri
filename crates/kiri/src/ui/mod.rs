@@ -318,7 +318,7 @@ fn engine(rx: Receiver<Cmd>, tx: Sender<Cmd>) {
                     a @ ("start" | "stop" | "restart" | "pause" | "unpause") => ("POST", format!("/containers/{id}/{a}")),
                     _ => continue,
                 };
-                let result = expect_ok(client::request(method, &path, None));
+                let result = expect_done(client::request(method, &path, None));
                 // Refused to start (a port taken): the container's page says why.
                 if let (Err(e), "start") = (&result, action.as_str()) {
                     emit(serde_json::json!({"type": "startfailed", "id": id, "error": e.to_string()}).to_string());
@@ -374,6 +374,15 @@ fn watch(tx: Sender<Cmd>) {
 fn expect_ok(r: io::Result<client::Response>) -> io::Result<()> {
     let r = r?;
     if r.ok() { Ok(()) } else { Err(io::Error::other(r.error())) }
+}
+
+/// A container action's answer. Docker's 304 is "already so": Stop on a
+/// stopped container, or Start on a running one, as a second click while a
+/// stop waits its turn, or `docker` getting there first. That's what was
+/// asked for; it has no body, so it showed as an empty red toast.
+fn expect_done(r: io::Result<client::Response>) -> io::Result<()> {
+    let r = r?;
+    if r.ok() || r.status == 304 { Ok(()) } else { Err(io::Error::other(r.error())) }
 }
 
 /// An action's outcome: errors become a toast, and a log line saying what
@@ -1357,6 +1366,20 @@ fn fonts_event() -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    /// Stop on a stopped container, or Start on a running one (a second
+    /// click while a stop is queued, or `docker` getting there first): the
+    /// engine answers 304 with no body. That's done, not an empty red toast.
+    #[test]
+    fn a_container_already_so_is_done_not_an_empty_error() {
+        use super::{client::Response, expect_done};
+        let answer = |status: u16, body: &str| Ok(Response { status, body: body.as_bytes().to_vec() });
+        assert!(expect_done(answer(304, "")).is_ok(), "already stopped, or already running");
+        assert!(expect_done(answer(204, "")).is_ok());
+        let refused = expect_done(answer(409, r#"{"message":"cannot start a paused container, try unpause instead"}"#));
+        assert_eq!(refused.unwrap_err().to_string(), "cannot start a paused container, try unpause instead");
+        assert!(expect_done(Err(std::io::Error::other("no engine"))).is_err());
+    }
+
     #[test]
     fn a_name_that_isnt_there_says_so() {
         use super::pull_error;
