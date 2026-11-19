@@ -3205,6 +3205,10 @@ fn archive_put(req: &Request, engine: &Engine, id: &str, w: &mut UnixStream, r: 
             Ok(Next::Close)
         }
         Err(e) => {
+            // A refused copy leaves the rest of the upload unread; reading
+            // it keeps the client from a broken pipe on what is left of its
+            // body, as Go's server drains for it (256 KiB at most).
+            let _ = (&mut archive).take(256 << 10).read_to_end(&mut Vec::new());
             error_closing(w, e)?;
             Ok(Next::Close)
         }

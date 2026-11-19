@@ -3305,21 +3305,39 @@ impl Engine {
 
     /// Opens a `docker cp` session with the guest for a container, running
     /// or not: the request frame is sent, the caller does the rest.
-    pub fn copy(&self, key: &str, op: u8, path: &str, flags: u32) -> Result<kiri_vmm::VsockStream, Error> {
+    pub fn copy(
+        &self,
+        key: &str,
+        op: u8,
+        path: &str,
+        mut flags: u32,
+    ) -> Result<kiri_vmm::VsockStream, Error> {
         self.wait_for_start(&self.resolve(key)?);
         // Looked up after the wait: a `--rm` start that failed meanwhile has
         // removed the container, and a copy must not then write into a
         // folder made again for a container that no longer exists.
-        let (id, layers) = {
+        let (id, layers, mounts) = {
             let st = self.lock();
             let id = resolve(&st, key)?;
-            let layers = st.containers.get(&id).map(|c| c.layers.clone()).unwrap_or_default();
-            (id, layers)
+            let c = st.containers.get(&id);
+            // A `--read-only` container refuses a copy onto its root, the
+            // guest checks it with the mounts (moby's `checkWritablePath`).
+            if c.is_some_and(|c| c.spec.readonly_rootfs) {
+                flags |= kiri_proto::copy_flags::READONLY_ROOTFS;
+            }
+            let layers = c.map(|c| c.layers.clone()).unwrap_or_default();
+            // Its mounts as a start would put them in, so a path under a
+            // named volume or a bind resolves as Docker's archive endpoint
+            // resolves it, the container running or not (#245).
+            let mounts = c
+                .map(|c| super::api::fresh_bind_sources(&c.spec.mounts, &c.spec.mount_info))
+                .unwrap_or_default();
+            (id, layers, mounts)
         };
         let vm = self.vm()?;
         let stream = vm.connect(kiri_proto::COPY_PORT)?;
         let mut out = Vec::new();
-        kiri_proto::encode_copy(&mut out, op, &id, path, flags, &layers);
+        kiri_proto::encode_copy(&mut out, op, &id, path, flags, &layers, &mounts);
         std::io::Write::write_all(&mut std::fs::File::from(stream.fd.try_clone()?), &out)?;
         Ok(stream)
     }

@@ -6,19 +6,27 @@
 //!
 //! A stopped container's root is mounted by the agent, not the child: the
 //! child asks for it over a socket pair of its own, so a copy and a start at
-//! the same moment share one mount (see `roots`, #227).
+//! the same moment share one mount (see `roots`, #227). The container's own
+//! mounts — named volumes, binds, tmpfs — go into that root in a namespace
+//! of the child's own, as a start puts them in its container's (#245).
+//!
+//! A copy into a read-only mount, or onto a read-only root outside every
+//! mount, is refused before anything is written, in Docker's own words
+//! (moby's `checkWritablePath`): a volume "is marked read-only", the root
+//! "is marked read-only". A new volume is filled from the image as a start
+//! fills it, as Docker has filled it when the container was created.
 
 use std::fs;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 
-use kiri_proto::{COPY_PORT, CopySpec, FsEntry, Msg, copy_flags, copy_op};
+use kiri_proto::{COPY_PORT, CopySpec, FsEntry, Msg, StrList, copy_flags, copy_op};
 
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use super::container::Paths;
+use super::container::{self, Paths};
 use super::sys;
 
 /// A copy child as the agent sees it: its end of the child's socket pair
@@ -207,8 +215,22 @@ fn job(sock: OwnedFd, chan: OwnedFd, running: &[(&str, libc::pid_t)], paths: &Pa
     }
 }
 
-/// Makes the container's root this process's `/`.
-fn enter(spec: &CopySpec<'_>, running: &[(&str, libc::pid_t)], paths: &Paths, chan: &OwnedFd) -> io::Result<()> {
+/// Makes the container's root this process's `/`, with the container's own
+/// mounts in place when it is not running: Docker's archive endpoint resolves
+/// a path through a container's mounts — a file in a named volume is read and
+/// written whether the container is created, running or stopped — and so does
+/// this one (#245). A read-only destination is refused before anything is
+/// written, as Docker refuses it (moby's `checkWritablePath`).
+fn enter(
+    spec: &CopySpec<'_>,
+    running: &[(&str, libc::pid_t)],
+    paths: &Paths,
+    chan: &OwnedFd,
+) -> io::Result<()> {
+    // Docker refuses a read-only destination before anything is written,
+    // whatever state the container is in (moby's checkWritablePath); the
+    // check reads the mounts alone, so it needs no root mounted first.
+    readonly_check(spec)?;
     let root = match running.iter().find(|(id, _)| *id == spec.id) {
         // An export is the container's own filesystem, without its mounts:
         // the overlay the agent mounted for it.
@@ -234,7 +256,11 @@ fn enter(spec: &CopySpec<'_>, running: &[(&str, libc::pid_t)], paths: &Paths, ch
                 return Err(io::Error::new(io::ErrorKind::NotFound, "no such container"));
             }
             ask(chan, 'm', spec)?;
-            paths.containers.join(spec.id).join("rootfs")
+            let rootfs = paths.containers.join(spec.id).join("rootfs");
+            if sees_mounts(spec.op) {
+                mount_container_mounts(&rootfs, spec.mounts)?;
+            }
+            rootfs
         }
     };
     let c = sys::cstr(&root)?;
@@ -244,6 +270,87 @@ fn enter(spec: &CopySpec<'_>, running: &[(&str, libc::pid_t)], paths: &Paths, ch
         sys::check(libc::chdir(c"/".as_ptr()) as _, "chdir")?;
     }
     Ok(())
+}
+
+/// Whether a copy resolves its path through the container's own mounts.
+/// Every copy but an export does, as Docker's archive endpoint does: an
+/// export is the container's filesystem without them, as `docker export` is.
+fn sees_mounts(op: u8) -> bool {
+    op != copy_op::EXPORT
+}
+
+/// Refuses a copy-in whose destination is read-only, as Docker does before
+/// anything is written (moby's `checkWritablePath`): the innermost mount
+/// holding the destination when it is read-only — "mounted volume is marked
+/// read-only" — else a `--read-only` container's own root when the
+/// destination is outside every mount — "container rootfs is marked
+/// read-only". Only a copy in: a copy out of a read-only container reads as
+/// ever. A path a mount's target would reach through a link resolves
+/// inside the container, or not at all: no mount matches through one, and
+/// the unpack fails on the link when the check passes.
+fn readonly_check(spec: &CopySpec<'_>) -> io::Result<()> {
+    // Only a copy in: a copy out or a stat of a read-only container reads
+    // as ever.
+    if spec.op != copy_op::IN {
+        return Ok(());
+    }
+    let clean = clean_path(Path::new(spec.path));
+    let ro = container::mount_points(spec.mounts)
+        .iter()
+        .filter(|(t, _)| clean.starts_with(t))
+        .max_by_key(|(t, _)| t.components().count())
+        .map(|(_, ro)| *ro);
+    match ro {
+        Some(true) => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "mounted volume is marked read-only",
+        )),
+        Some(false) => Ok(()),
+        // Outside every mount the destination hits the container's own root,
+        // which `--read-only` makes read-only. A tmpfs with `ro` counts as a
+        // read-only mount, as Docker counts it; a writable volume or bind of
+        // a `--read-only` container still takes a copy.
+        None if spec.flags & copy_flags::READONLY_ROOTFS != 0 => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "container rootfs is marked read-only",
+        )),
+        None => Ok(()),
+    }
+}
+
+/// The path without `.` and `..` segments (as the lookup inside the root
+/// resolves them), links left as they are.
+fn clean_path(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    if out.as_os_str().is_empty() {
+        out.push("/");
+    }
+    out
+}
+
+/// Puts a stopped container's mounts in its root, in a mount namespace of
+/// this child's own, as a start puts them in its container's. A path in a
+/// named volume, or under a bind, then resolves as the container sees it.
+fn mount_container_mounts(rootfs: &std::path::Path, mounts: StrList<'_>) -> io::Result<()> {
+    if container::mount_points(mounts).is_empty() {
+        return Ok(());
+    }
+    // The mounts belong to this copy alone: in the agent's namespace they
+    // would outlive it, and a second copy of the same container would see
+    // them.
+    // SAFETY: unshare with a valid flag.
+    sys::check(unsafe { libc::unshare(libc::CLONE_NEWNS) } as _, "unshare")?;
+    sys::remount(c"/", libc::MS_REC | libc::MS_PRIVATE)?;
+    container::mount_for_copy(rootfs, mounts)
 }
 
 /// Asks the agent for the container's root (`m`: mounted, or shared with
@@ -270,9 +377,11 @@ fn ask(chan: &OwnedFd, kind: char, spec: &CopySpec<'_>) -> io::Result<()> {
     }
 }
 
-/// Unpacks the archive that follows into `spec.path`, a directory.
+/// Unpacks the archive that follows into `spec.path`, a directory. Docker
+/// has refused a read-only destination already (`enter`, moby's
+/// `checkWritablePath`), before a byte of the archive is read.
 fn copy_in(conn: &mut fs::File, spec: &CopySpec<'_>) -> io::Result<()> {
-    let dest = std::path::Path::new(spec.path);
+    let dest = Path::new(spec.path);
     match fs::metadata(dest) {
         Ok(m) if m.is_dir() => {}
         Ok(_) => return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("notdir: extraction point is not a directory: {}", spec.path))),
@@ -349,7 +458,7 @@ impl<R: Read> Read for Chunks<R> {
 
 /// Answers with the path's metadata; for `OUT` an archive of it follows.
 fn copy_out(conn: &mut fs::File, spec: &CopySpec<'_>) -> io::Result<()> {
-    let path = std::path::Path::new(spec.path);
+    let path = Path::new(spec.path);
     let meta = fs::symlink_metadata(path)
         .map_err(|_| io::Error::new(io::ErrorKind::NotFound, format!("notfound: Could not find the file {} in container {}", spec.path, spec.id)))?;
     let link = if meta.file_type().is_symlink() { fs::read_link(path)?.to_string_lossy().into_owned() } else { String::new() };
@@ -375,9 +484,9 @@ fn copy_out(conn: &mut fs::File, spec: &CopySpec<'_>) -> io::Result<()> {
         // The root itself archives as its contents under ".".
         let top = if name == "/" { "." } else { name.as_str() };
         if meta.is_dir() {
-            append_tree(&mut b, path, std::path::Path::new(top))?;
+            append_tree(&mut b, path, Path::new(top))?;
         } else {
-            append_one(&mut b, path, std::path::Path::new(top), &meta)?;
+            append_one(&mut b, path, Path::new(top), &meta)?;
         }
         b.finish()?;
     }
@@ -386,12 +495,12 @@ fn copy_out(conn: &mut fs::File, spec: &CopySpec<'_>) -> io::Result<()> {
 
 /// Like `append_dir_all`, but sockets (which tar cannot hold) are skipped,
 /// and the kernel's /proc and /sys archive as empty directories.
-fn append_tree(b: &mut tar::Builder<impl Write>, src: &std::path::Path, name: &std::path::Path) -> io::Result<()> {
+fn append_tree(b: &mut tar::Builder<impl Write>, src: &Path, name: &Path) -> io::Result<()> {
     let mut stack = vec![(src.to_path_buf(), name.to_path_buf())];
     while let Some((src, name)) = stack.pop() {
         let meta = fs::symlink_metadata(&src)?;
         append_one(b, &src, &name, &meta)?;
-        if meta.is_dir() && src != std::path::Path::new("/proc") && src != std::path::Path::new("/sys") {
+        if meta.is_dir() && src != Path::new("/proc") && src != Path::new("/sys") {
             let mut children: Vec<_> = fs::read_dir(&src)?.flatten().collect();
             children.sort_by_key(|e| e.file_name());
             for e in children.into_iter().rev() {
@@ -402,7 +511,12 @@ fn append_tree(b: &mut tar::Builder<impl Write>, src: &std::path::Path, name: &s
     Ok(())
 }
 
-fn append_one(b: &mut tar::Builder<impl Write>, src: &std::path::Path, name: &std::path::Path, meta: &fs::Metadata) -> io::Result<()> {
+fn append_one(
+    b: &mut tar::Builder<impl Write>,
+    src: &Path,
+    name: &Path,
+    meta: &fs::Metadata,
+) -> io::Result<()> {
     let ft = meta.file_type();
     if ft.is_socket() {
         return Ok(());
@@ -447,7 +561,7 @@ fn export(conn: &mut fs::File) -> io::Result<()> {
         let mut children: Vec<_> = fs::read_dir("/")?.flatten().collect();
         children.sort_by_key(|e| e.file_name());
         for e in children {
-            append_tree(&mut b, &e.path(), std::path::Path::new(&e.file_name()))?;
+            append_tree(&mut b, &e.path(), Path::new(&e.file_name()))?;
         }
         b.finish()?;
     }
@@ -459,7 +573,7 @@ fn is_whiteout(m: &fs::Metadata) -> bool {
     m.file_type().is_char_device() && m.rdev() == 0
 }
 
-fn is_opaque(path: &std::path::Path) -> bool {
+fn is_opaque(path: &Path) -> bool {
     let Ok(c) = sys::cstr(path) else { return false };
     let mut v = [0u8; 2];
     // SAFETY: valid path and name; reads at most 2 bytes into `v`.
@@ -496,10 +610,10 @@ fn layer_job(conn: &mut fs::File, spec: &CopySpec<'_>, paths: &Paths) -> io::Res
         sys::check(libc::chroot(c.as_ptr()) as _, "chroot")?;
         sys::check(libc::chdir(c"/".as_ptr()) as _, "chdir")?;
     }
-    let upper = std::path::PathBuf::from("/");
+    let upper = PathBuf::from("/");
     // Every path in the writable layer, parents first.
-    let mut entries: Vec<(std::path::PathBuf, fs::Metadata)> = Vec::new();
-    let mut stack = vec![std::path::PathBuf::new()];
+    let mut entries: Vec<(PathBuf, fs::Metadata)> = Vec::new();
+    let mut stack = vec![PathBuf::new()];
     while let Some(rel) = stack.pop() {
         let dir = upper.join(&rel);
         let Ok(list) = fs::read_dir(&dir) else { continue };
@@ -517,7 +631,7 @@ fn layer_job(conn: &mut fs::File, spec: &CopySpec<'_>, paths: &Paths) -> io::Res
     entries.sort_by(|a, b| a.0.cmp(&b.0));
     done(conn)?;
     if spec.op == copy_op::DIFF {
-        let in_lower = |rel: &std::path::Path| {
+        let in_lower = |rel: &Path| {
             for l in &lowers {
                 let Some(rel) = rel.to_str() else { continue };
                 let Ok(fd) = super::fsview::open_in(l.as_raw_fd(), rel, libc::O_PATH | libc::O_NOFOLLOW) else { continue };
@@ -549,7 +663,7 @@ fn layer_job(conn: &mut fs::File, spec: &CopySpec<'_>, paths: &Paths) -> io::Res
     {
         let mut b = tar::Builder::new(&mut w);
         b.follow_symlinks(false);
-        let empty = |b: &mut tar::Builder<_>, name: std::path::PathBuf| -> io::Result<()> {
+        let empty = |b: &mut tar::Builder<_>, name: PathBuf| -> io::Result<()> {
             let mut h = tar::Header::new_gnu();
             h.set_entry_type(tar::EntryType::Regular);
             h.set_size(0);
@@ -589,10 +703,19 @@ fn read_frame(conn: &mut impl Read, buf: &mut Vec<u8>) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Seek;
 
     #[test]
     fn chunks_end_at_the_empty_chunk_and_leave_the_rest() {
-        let wire = [&3u32.to_le_bytes()[..], b"abc", &2u32.to_le_bytes(), b"de", &0u32.to_le_bytes(), b"after"].concat();
+        let wire = [
+            &3u32.to_le_bytes()[..],
+            b"abc",
+            &2u32.to_le_bytes(),
+            b"de",
+            &0u32.to_le_bytes(),
+            b"after",
+        ]
+        .concat();
         let mut conn = &wire[..];
         let mut got = Vec::new();
         Chunks::new(&mut conn).read_to_end(&mut got).unwrap();
@@ -603,7 +726,617 @@ mod tests {
     #[test]
     fn chunks_cut_short_are_an_error() {
         let wire = [&5u32.to_le_bytes()[..], b"ab"].concat();
-        let err = Chunks::new(&wire[..]).read_to_end(&mut Vec::new()).unwrap_err();
+        let err = Chunks::new(&wire[..])
+            .read_to_end(&mut Vec::new())
+            .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    /// Every copy but an export resolves its path through the container's
+    /// mounts, as Docker's archive endpoint does; `docker export` is the
+    /// container's own filesystem without them.
+    #[test]
+    fn every_copy_but_an_export_resolves_through_the_containers_mounts() {
+        for op in [copy_op::IN, copy_op::OUT, copy_op::STAT] {
+            assert!(sees_mounts(op), "op {op}");
+        }
+        assert!(
+            !sees_mounts(copy_op::EXPORT),
+            "an export leaves the mounts out"
+        );
+    }
+
+    /// A tmpfs is not part of a copy: it went with the container, and the
+    /// image's own directory is there instead.
+
+    /// The lines' targets and read-only flags, sources untouched: the
+    /// read-only check reads them without mounting anything.
+    #[test]
+    fn mount_points_read_targets_and_read_only() {
+        with_copy_spec(
+            copy_op::IN,
+            "/",
+            &[
+                "/no/such/vol\t/data\tcreate,copyup",
+                "/srv\t/srv/ro\tro",
+                "tmpfs\t/t\ttmpfs,noexec,ro",
+                "tmpfs\t/w\ttmpfs,ro,rw",
+            ],
+            |spec| {
+                let got = container::mount_points(spec.mounts);
+                let want = [
+                    ("/data", false),
+                    ("/srv/ro", true),
+                    ("/t", true),
+                    ("/w", false),
+                ];
+                assert_eq!(
+                    got,
+                    want.iter()
+                        .map(|(t, ro)| (PathBuf::from(t), *ro))
+                        .collect::<Vec<_>>()
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn clean_path_drops_dot_segments_and_keeps_the_root() {
+        assert_eq!(clean_path(Path::new("/a/./b/../c")), PathBuf::from("/a/c"));
+        assert_eq!(clean_path(Path::new("/")), PathBuf::from("/"));
+        assert_eq!(clean_path(Path::new("/a/..")), PathBuf::from("/"));
+    }
+
+    /// Runs `f` with a copy request as the daemon sends it, decoded as the
+    /// guest sees it: the frame lives as long as the call.
+    fn with_copy_spec<T>(
+        op: u8,
+        path: &str,
+        mounts: &[&str],
+        f: impl FnOnce(&CopySpec<'_>) -> T,
+    ) -> T {
+        let mut wire = Vec::new();
+        kiri_proto::encode_copy(&mut wire, op, "c1", path, 0, &[] as &[&str], mounts);
+        match kiri_proto::decode(&wire) {
+            Ok(Msg::Copy(spec)) => f(&spec),
+            _ => panic!("copy request"),
+        }
+    }
+
+    /// A container that is not running, in a temp directory: its root (the
+    /// image's files) and the volumes and bind sources beside it.
+    struct Stopped(PathBuf);
+
+    impl Stopped {
+        fn new(name: &str) -> Stopped {
+            let base =
+                std::env::temp_dir().join(format!("kiri-copy-{name}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&base);
+            fs::create_dir_all(base.join("root/etc")).unwrap();
+            fs::write(base.join("root/etc/os-release"), "image\n").unwrap();
+            Stopped(base)
+        }
+
+        fn root(&self) -> PathBuf {
+            self.0.join("root")
+        }
+
+        /// A directory beside the root holding `files`.
+        fn dir(&self, rel: &str, files: &[(&str, &str)]) -> PathBuf {
+            let d = self.0.join(rel);
+            fs::create_dir_all(&d).unwrap();
+            for (name, body) in files {
+                let f = d.join(name);
+                fs::create_dir_all(f.parent().unwrap()).unwrap();
+                fs::write(f, body).unwrap();
+            }
+            d
+        }
+
+        /// A file beside the root, for the copy's connection.
+        fn conn(&self, name: &str, body: &[u8]) -> fs::File {
+            let p = self.0.join(name);
+            fs::write(&p, body).unwrap();
+            fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(p)
+                .unwrap()
+        }
+    }
+
+    impl Drop for Stopped {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn mount_line(source: &Path, target: &str, flags: &str) -> String {
+        format!("{}\t{target}\t{flags}", source.display())
+    }
+
+    /// Runs `f` as a copy child runs once `enter` has put a stopped
+    /// container's mounts over its root and made it `/`: on a thread with a
+    /// mount namespace and root of its own, both gone with it. None where
+    /// this can't mount (not root, or not Linux), and the test then skips.
+    fn in_copy_root<T: Send + 'static>(
+        root: PathBuf,
+        op: u8,
+        path: &'static str,
+        flags: u32,
+        mounts: Vec<String>,
+        f: impl FnOnce(&CopySpec<'_>) -> io::Result<T> + Send + 'static,
+    ) -> Option<io::Result<T>> {
+        std::thread::spawn(move || {
+            // SAFETY: unshare with a valid flag; it applies to this thread alone.
+            if unsafe { libc::unshare(libc::CLONE_NEWNS) } != 0 {
+                eprintln!(
+                    "skipped: cannot unshare a mount namespace here: {}",
+                    io::Error::last_os_error()
+                );
+                return None;
+            }
+            sys::remount(c"/", libc::MS_REC | libc::MS_PRIVATE).ok()?;
+            let mounts_ref: Vec<&str> = mounts.iter().map(|s| s.as_str()).collect();
+            let mut wire = Vec::new();
+            kiri_proto::encode_copy(&mut wire, op, "c1", path, flags, &["sha256:a"], &mounts_ref);
+            let Ok(Msg::Copy(spec)) = kiri_proto::decode(&wire) else {
+                panic!("copy request")
+            };
+            // `enter` refuses a read-only destination before the mounts go
+            // in; a test that feeds `copy_in` directly gets the same gate.
+            if let Err(e) = readonly_check(&spec) {
+                return Some(Err(e));
+            }
+            container::mount_for_copy(&root, spec.mounts).ok()?;
+            let c = sys::cstr(&root).ok()?;
+            // SAFETY: valid NUL-terminated paths; this thread's root only.
+            unsafe {
+                assert_eq!(libc::chroot(c.as_ptr()), 0);
+                assert_eq!(libc::chdir(c"/".as_ptr()), 0);
+            }
+            Some(f(&spec))
+        })
+        .join()
+        .unwrap()
+    }
+
+    /// A tar holding one file, as the docker CLI sends a `docker cp` in.
+    fn tar_of(name: &str, body: &str) -> Vec<u8> {
+        let mut b = tar::Builder::new(Vec::new());
+        let mut h = tar::Header::new_gnu();
+        h.set_size(body.len() as u64);
+        h.set_mode(0o644);
+        b.append_data(&mut h, name, body.as_bytes()).unwrap();
+        b.into_inner().unwrap()
+    }
+
+    /// What a `copy_out` wrote: its `CopyStat` frame, then a tar with one file.
+    fn copied_file(mut conn: fs::File) -> String {
+        conn.rewind().unwrap();
+        let mut all = Vec::new();
+        conn.read_to_end(&mut all).unwrap();
+        let len = kiri_proto::frame_len(all[..4].try_into().unwrap()).unwrap();
+        assert!(matches!(
+            kiri_proto::decode(&all[..len]),
+            Ok(Msg::CopyStat { .. })
+        ));
+        let mut archive = tar::Archive::new(&all[len..]);
+        let mut entry = archive.entries().unwrap().next().unwrap().unwrap();
+        let mut body = String::new();
+        entry.read_to_string(&mut body).unwrap();
+        body
+    }
+
+    fn root_or_skip() -> bool {
+        // SAFETY: geteuid cannot fail.
+        let root = unsafe { libc::geteuid() } == 0;
+        if !root {
+            eprintln!("skipped: needs root to mount");
+        }
+        root
+    }
+
+    /// The issue's own case (#245): a created, never-started container whose
+    /// file is in a named volume. Docker filled the volume from the image
+    /// when the container was created, so a copy out sees that file, not the
+    /// image's file under the mount point.
+    #[test]
+    fn copy_out_of_a_created_containers_volume() {
+        if !root_or_skip() {
+            return;
+        }
+        let c = Stopped::new("vol-out");
+        c.dir("root/data", &[("PG_VERSION", "image\n")]);
+        let vol = c.dir("volumes/pg/_data", &[("PG_VERSION", "17\n")]);
+        let mounts = vec![mount_line(&vol, "/data", "create,copyup")];
+        let conn = c.conn("conn", b"");
+        let mut out = conn.try_clone().unwrap();
+        let Some(r) = in_copy_root(
+            c.root(),
+            copy_op::OUT,
+            "/data/PG_VERSION",
+            0,
+            mounts.clone(),
+            move |s| copy_out(&mut out, s),
+        ) else {
+            return;
+        };
+        r.unwrap();
+        assert_eq!(copied_file(conn), "17\n");
+        // A path outside the volume is the image's own.
+        let conn = c.conn("conn2", b"");
+        let mut out = conn.try_clone().unwrap();
+        let Some(r) = in_copy_root(
+            c.root(),
+            copy_op::OUT,
+            "/etc/os-release",
+            0,
+            mounts,
+            move |s| copy_out(&mut out, s),
+        ) else {
+            return;
+        };
+        r.unwrap();
+        assert_eq!(copied_file(conn), "image\n");
+    }
+
+    /// `docker cp <created>:/fixture` on a container that never ran: the
+    /// file lands in the volume, not in the container's own layer, and the
+    /// mount point itself holds nothing.
+    #[test]
+    fn copy_into_a_created_containers_volume() {
+        if !root_or_skip() {
+            return;
+        }
+        let c = Stopped::new("vol-in");
+        let vol = c.dir("volumes/v/_data", &[]);
+        let mounts = vec![mount_line(&vol, "/fixture", "create,copyup")];
+        let mut conn = c.conn("conn", &tar_of("hello.txt", "hello\n"));
+        let Some(r) = in_copy_root(c.root(), copy_op::IN, "/fixture", 0, mounts, move |s| {
+            copy_in(&mut conn, s)
+        }) else {
+            return;
+        };
+        r.unwrap();
+        assert_eq!(
+            fs::read_to_string(vol.join("hello.txt")).unwrap(),
+            "hello\n"
+        );
+        assert!(
+            !c.root().join("fixture/hello.txt").exists(),
+            "nothing written under the volume's mount point"
+        );
+    }
+
+    /// A new volume is filled from the image as a start fills it, as Docker
+    /// has filled it when the container was created: the copy out sees the
+    /// image's file, and it is in the volume for the later start.
+    #[test]
+    fn a_new_volume_is_filled_from_the_image() {
+        if !root_or_skip() {
+            return;
+        }
+        let c = Stopped::new("copyup");
+        c.dir("root/conf", &[("app.conf", "from image\n")]);
+        let vol = c.dir("volumes/conf/_data", &[]);
+        let mounts = vec![mount_line(&vol, "/conf", "create,copyup")];
+        let conn = c.conn("conn", b"");
+        let mut out = conn.try_clone().unwrap();
+        let Some(r) = in_copy_root(
+            c.root(),
+            copy_op::OUT,
+            "/conf/app.conf",
+            0,
+            mounts,
+            move |s| copy_out(&mut out, s),
+        ) else {
+            return;
+        };
+        r.unwrap();
+        assert_eq!(copied_file(conn), "from image\n");
+        assert_eq!(
+            fs::read_to_string(vol.join("app.conf")).unwrap(),
+            "from image\n"
+        );
+    }
+
+    /// A bound directory and a bound file read and write through the root.
+    #[test]
+    fn copy_through_bind_mounts() {
+        if !root_or_skip() {
+            return;
+        }
+        let c = Stopped::new("bind");
+        let src = c.dir("host/src", &[("main.rs", "fn main() {}\n")]);
+        let file = c.dir("host/etc", &[("motd", "hi\n")]).join("motd");
+        let mounts = vec![
+            mount_line(&src, "/src", ""),
+            mount_line(&file, "/etc/motd", ""),
+        ];
+        let conn = c.conn("conn", b"");
+        let mut out = conn.try_clone().unwrap();
+        let Some(r) = in_copy_root(
+            c.root(),
+            copy_op::OUT,
+            "/src/main.rs",
+            0,
+            mounts.clone(),
+            move |s| copy_out(&mut out, s),
+        ) else {
+            return;
+        };
+        r.unwrap();
+        assert_eq!(copied_file(conn), "fn main() {}\n");
+        let conn = c.conn("conn2", b"");
+        let mut out = conn.try_clone().unwrap();
+        let Some(r) = in_copy_root(
+            c.root(),
+            copy_op::OUT,
+            "/etc/motd",
+            0,
+            mounts.clone(),
+            move |s| copy_out(&mut out, s),
+        ) else {
+            return;
+        };
+        r.unwrap();
+        assert_eq!(copied_file(conn), "hi\n");
+        let mut conn = c.conn("conn3", &tar_of("lib.rs", "pub fn f() {}\n"));
+        let Some(r) = in_copy_root(c.root(), copy_op::IN, "/src", 0, mounts, move |s| {
+            copy_in(&mut conn, s)
+        }) else {
+            return;
+        };
+        r.unwrap();
+        assert_eq!(
+            fs::read_to_string(src.join("lib.rs")).unwrap(),
+            "pub fn f() {}\n"
+        );
+    }
+
+    /// A tmpfs is not part of a copy: the image's own directory is there.
+    #[test]
+    fn a_copy_sees_the_image_where_a_tmpfs_would_be() {
+        if !root_or_skip() {
+            return;
+        }
+        let c = Stopped::new("tmpfs");
+        c.dir("root/tmp", &[("PG_VERSION", "image\n")]);
+        let mounts = vec!["/nonexistent\t/tmp\tcreate,tmpfs".to_owned()];
+        let conn = c.conn("conn", b"");
+        let mut out = conn.try_clone().unwrap();
+        let Some(r) = in_copy_root(
+            c.root(),
+            copy_op::OUT,
+            "/tmp/PG_VERSION",
+            0,
+            mounts,
+            move |s| copy_out(&mut out, s),
+        ) else {
+            return;
+        };
+        r.unwrap();
+        assert_eq!(copied_file(conn), "image\n");
+    }
+
+    /// Mounts inside mounts, listed inner first as the CLI may send them:
+    /// the parent goes in first and the longest target wins, for reads,
+    /// writes and the read-only check alike.
+    #[test]
+    fn nested_mounts_resolve_to_the_innermost() {
+        if !root_or_skip() {
+            return;
+        }
+        let c = Stopped::new("nested");
+        let app = c.dir("volumes/app/_data", &[("conf/app.conf", "outer\n")]);
+        let conf = c.dir("host/conf", &[("app.conf", "inner\n")]);
+        // A mount point inside a read-only mount has to be there already.
+        fs::create_dir(conf.join("logs")).unwrap();
+        let logs = c.dir("volumes/logs/_data", &[]);
+        let mounts = vec![
+            mount_line(&logs, "/app/conf/logs", "create"),
+            mount_line(&conf, "/app/conf", "ro"),
+            mount_line(&app, "/app", "create"),
+        ];
+        let conn = c.conn("conn", b"");
+        let mut out = conn.try_clone().unwrap();
+        let Some(r) = in_copy_root(
+            c.root(),
+            copy_op::OUT,
+            "/app/conf/app.conf",
+            0,
+            mounts.clone(),
+            move |s| copy_out(&mut out, s),
+        ) else {
+            return;
+        };
+        r.unwrap();
+        assert_eq!(copied_file(conn), "inner\n");
+        // The innermost mount is read-only, so a copy into it is refused and
+        // writes nothing; the writable one under it still takes a file.
+        let mut conn = c.conn("conn2", &tar_of("x", "x"));
+        let Some(r) = in_copy_root(
+            c.root(),
+            copy_op::IN,
+            "/app/conf",
+            0,
+            mounts.clone(),
+            move |s| copy_in(&mut conn, s),
+        ) else {
+            return;
+        };
+        assert_eq!(
+            r.unwrap_err().to_string(),
+            "mounted volume is marked read-only"
+        );
+        let mut conn = c.conn("conn3", &tar_of("today.log", "log\n"));
+        let Some(r) = in_copy_root(
+            c.root(),
+            copy_op::IN,
+            "/app/conf/logs",
+            0,
+            mounts.clone(),
+            move |s| copy_in(&mut conn, s),
+        ) else {
+            return;
+        };
+        r.unwrap();
+        assert_eq!(fs::read_to_string(logs.join("today.log")).unwrap(), "log\n");
+        let mut conn = c.conn("conn4", &tar_of("top.txt", "top\n"));
+        let Some(r) = in_copy_root(c.root(), copy_op::IN, "/app", 0, mounts, move |s| {
+            copy_in(&mut conn, s)
+        }) else {
+            return;
+        };
+        r.unwrap();
+        assert_eq!(fs::read_to_string(app.join("top.txt")).unwrap(), "top\n");
+    }
+
+    /// The read-only refusal, at the layer Docker refuses at: nothing is
+    /// written, and a copy out is never refused.
+    #[test]
+    fn copy_into_a_read_only_mount_is_refused() {
+        if !root_or_skip() {
+            return;
+        }
+        let c = Stopped::new("ro");
+        let ro = c.dir("host/certs", &[]);
+        let vol = c.dir("volumes/data/_data", &[]);
+        let mounts = vec![
+            mount_line(&ro, "/certs", "ro"),
+            mount_line(&vol, "/data", "create"),
+        ];
+        let mut conn = c.conn("conn", &tar_of("x.pem", "x"));
+        let Some(r) = in_copy_root(
+            c.root(),
+            copy_op::IN,
+            "/certs",
+            0,
+            mounts.clone(),
+            move |s| copy_in(&mut conn, s),
+        ) else {
+            return;
+        };
+        assert_eq!(
+            r.unwrap_err().to_string(),
+            "mounted volume is marked read-only"
+        );
+        assert_eq!(fs::read_dir(&ro).unwrap().count(), 0, "nothing written");
+        // A read-only root refuses outside every mount, but not in a volume.
+        let mut conn = c.conn("conn2", &tar_of("x.pem", "x"));
+        let Some(r) = in_copy_root(
+            c.root(),
+            copy_op::IN,
+            "/etc",
+            copy_flags::READONLY_ROOTFS,
+            mounts.clone(),
+            move |s| copy_in(&mut conn, s),
+        ) else {
+            return;
+        };
+        assert_eq!(
+            r.unwrap_err().to_string(),
+            "container rootfs is marked read-only"
+        );
+        assert!(!c.root().join("etc/x.pem").exists());
+        let mut conn = c.conn("conn3", &tar_of("x.pem", "x"));
+        let Some(r) = in_copy_root(
+            c.root(),
+            copy_op::IN,
+            "/data",
+            copy_flags::READONLY_ROOTFS,
+            mounts,
+            move |s| copy_in(&mut conn, s),
+        ) else {
+            return;
+        };
+        r.unwrap();
+        assert_eq!(fs::read_to_string(vol.join("x.pem")).unwrap(), "x");
+    }
+
+    /// The refusal, at the layer Docker refuses at and without mounting
+    /// anything: a read-only mount vetoes its paths, a tmpfs with `ro` its
+    /// own, and outside every mount only a `--read-only` container is
+    /// refused — never a copy out or a stat.
+    #[test]
+    fn the_read_only_refusal_is_dockers() {
+        let mounts = vec![
+            "/host/certs\t/certs\tro",
+            "/vol/conf\t/conf\tcreate,copyup",
+            "tmpfs\t/secrets\ttmpfs,ro",
+        ];
+        let mounts_ref: Vec<&str> = mounts.iter().copied().collect();
+        let check = |op, path, flags| {
+            let mut wire = Vec::new();
+            kiri_proto::encode_copy(
+                &mut wire,
+                op,
+                "c1",
+                path,
+                flags,
+                &[] as &[&str],
+                &mounts_ref,
+            );
+            match kiri_proto::decode(&wire) {
+                Ok(Msg::Copy(spec)) => readonly_check(&spec),
+                _ => unreachable!(),
+            }
+        };
+        assert_eq!(
+            check(copy_op::IN, "/certs", 0).unwrap_err().to_string(),
+            "mounted volume is marked read-only"
+        );
+        assert_eq!(
+            check(copy_op::IN, "/certs/sub/key", 0)
+                .unwrap_err()
+                .to_string(),
+            "mounted volume is marked read-only"
+        );
+        assert_eq!(
+            check(copy_op::IN, "/secrets/passwd", 0)
+                .unwrap_err()
+                .to_string(),
+            "mounted volume is marked read-only"
+        );
+        check(copy_op::IN, "/conf/app.conf", 0).unwrap();
+        check(copy_op::IN, "/conf", 0).unwrap();
+        // A writable volume of a --read-only container still takes a copy.
+        check(copy_op::IN, "/conf", copy_flags::READONLY_ROOTFS).unwrap();
+        // Outside every mount, a --read-only container refuses, in Docker's
+        // own words.
+        assert_eq!(
+            check(copy_op::IN, "/usr/bin/ls", copy_flags::READONLY_ROOTFS)
+                .unwrap_err()
+                .to_string(),
+            "container rootfs is marked read-only"
+        );
+        assert_eq!(
+            check(copy_op::IN, "/etc", copy_flags::READONLY_ROOTFS)
+                .unwrap_err()
+                .to_string(),
+            "container rootfs is marked read-only"
+        );
+        // The same paths read and stat without a refusal, and a copy into a
+        // writable root is never refused.
+        check(copy_op::OUT, "/usr/bin/ls", copy_flags::READONLY_ROOTFS).unwrap();
+        check(copy_op::STAT, "/etc", copy_flags::READONLY_ROOTFS).unwrap();
+        check(copy_op::IN, "/usr/bin/ls", 0).unwrap();
+    }
+
+    /// A container with no mounts, and a request from a daemon that sends
+    /// none, leave the root alone: nothing is mounted, and no mount
+    /// namespace is made.
+    #[test]
+    fn a_copy_with_no_mounts_leaves_the_root_alone() {
+        let c = Stopped::new("nomounts");
+        c.dir("root/data", &[("PG_VERSION", "image\n")]);
+        with_copy_spec(copy_op::OUT, "/data/PG_VERSION", &[], |spec| {
+            mount_container_mounts(&c.root(), spec.mounts).unwrap();
+        });
+        assert_eq!(
+            fs::read(c.root().join("data/PG_VERSION")).unwrap(),
+            b"image\n"
+        );
     }
 }

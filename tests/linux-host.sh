@@ -62,6 +62,32 @@ t failed-start-frees-root "gone mounts=0" "docker rm -f kiri-badsysctl >/dev/nul
 # ...and leaves no name in the network's DNS (#325).
 t failed-start-no-dns "none" "docker network create kiri-dnsfail >/dev/null 2>&1; docker rm -f kiri-dnsbad >/dev/null 2>&1; docker run -d --name kiri-dnsbad --network kiri-dnsfail --sysctl net.ipv4.kiri_no_such_key=1 alpine sleep 60 >/dev/null 2>&1; docker run --rm --network kiri-dnsfail alpine sh -c 'nslookup kiri-dnsbad 2>&1 | grep -qE \"^Address: [0-9.]+\$\" && echo answered || echo none'; docker rm -f kiri-dnsbad >/dev/null 2>&1; docker network rm kiri-dnsfail >/dev/null"
 t cp-stopped-unmounts "after=0" "id=\$(docker create alpine true); docker cp /etc/hostname \$id:/f >/dev/null; for i in \$(seq 20); do [ \$($mounts) = 0 ] && break; sleep 0.1; done; echo after=\$($mounts); docker rm \$id >/dev/null"
+# A named volume is the container's own filesystem: a copy reaches a file in
+# one on a created and a stopped container, as Docker's archive endpoint
+# does (a running container already resolved through /proc), and a copy in
+# writes to the volume. An export is the container's filesystem without its
+# mounts, so the volume stays out (#245).
+t cp-volume-created "17" "docker volume rm kiri-cp-vol >/dev/null 2>&1; docker volume create kiri-cp-vol >/dev/null; docker run --rm -v kiri-cp-vol:/data alpine sh -c 'echo 17 > /data/PG_VERSION' >/dev/null; id=\$(docker create -v kiri-cp-vol:/data alpine true); docker cp \$id:/data/PG_VERSION - | tar -xO; docker rm \$id >/dev/null; echo"
+t cp-volume-stopped "17" "id=\$(docker run -d -v kiri-cp-vol:/data alpine sh -c 'echo 17 > /data/PG_VERSION; sleep 5'); for i in \$(seq 20); do test \$(docker inspect -f '{{.State.Running}}' \$id) = false && break; sleep 0.2; done; docker cp \$id:/data/PG_VERSION - | tar -xO; docker rm -f \$id >/dev/null; echo"
+t cp-volume-in "written" "id=\$(docker create -v kiri-cp-vol:/data alpine true); echo -n written > /tmp/w; docker cp /tmp/w \$id:/data/w; docker rm \$id >/dev/null; docker run --rm -v kiri-cp-vol:/data alpine cat /data/w; echo"
+t cp-volume-export "absent" "id=\$(docker create -v kiri-cp-vol:/data alpine true); docker export \$id | tar -t | grep -q '^data/' && printf present || printf absent; docker rm \$id >/dev/null; docker volume rm kiri-cp-vol >/dev/null; echo"
+# A copy into a read-only destination is refused in Docker's words before
+# anything is written, a created container as much as a running one (moby's
+# checkWritablePath): the innermost mount holding the path when it is
+# read-only, else a --read-only container's own root. The writable volume of
+# a --read-only container still takes a copy, and a copy out is never
+# refused (#525).
+t cp-ro-volume-refused "marked read-only clean=0" "docker volume create kiri-cp-ro >/dev/null; id=\$(docker create -v kiri-cp-ro:/certs:ro alpine true); m=\$(docker cp /etc/hostname \$id:/certs/x 2>&1); docker rm \$id >/dev/null; out=\$(docker run --rm -v kiri-cp-ro:/certs alpine sh -c 'ls /certs | wc -l'); echo \"\$m clean=\$out\"; docker volume rm kiri-cp-ro >/dev/null"
+t cp-ro-root-refused "marked read-only" "id=\$(docker create --read-only alpine true); docker cp /etc/hostname \$id:/etc/x 2>&1; echo rc=\$?; docker rm \$id >/dev/null"
+t cp-ro-root-running "container rootfs is marked read-only" "id=\$(docker run -d --read-only alpine sleep 30); m=\$(docker cp /etc/hostname \$id:/etc/x 2>&1); docker rm -f \$id >/dev/null; echo \"\$m\""
+t cp-ro-volume-running "mounted volume is marked read-only" "docker volume create kiri-cp-rr >/dev/null; id=\$(docker run -d -v kiri-cp-rr:/certs:ro alpine sleep 30); m=\$(docker cp /etc/hostname \$id:/certs/x 2>&1); docker rm -f \$id >/dev/null; echo \"\$m\"; docker volume rm kiri-cp-rr >/dev/null"
+t cp-ro-root-volume-in "copied" "docker volume create kiri-cp-rw >/dev/null; id=\$(docker create --read-only -v kiri-cp-rw:/data alpine true); echo copied > /tmp/rox; docker cp /tmp/rox \$id:/data/x >/dev/null && docker rm \$id >/dev/null; docker run --rm -v kiri-cp-rw:/data alpine cat /data/x; docker volume rm kiri-cp-rw >/dev/null; echo"
+t cp-ro-root-out-ok "os-release" "id=\$(docker create --read-only alpine true); docker cp \$id:/etc/os-release - | tar -t; docker rm \$id >/dev/null"
+# A copy into a new empty named volume fills it from the image, as the
+# create did (copy_up), so a copy out sees the image's file and a later
+# start finds both it and the copied one (#525).
+t cp-volume-copyup-out "hosts" "docker volume create kiri-cp-new >/dev/null; id=\$(docker create -v kiri-cp-new:/etc alpine true); docker cp \$id:/etc/hosts - | tar -t; docker rm \$id >/dev/null; docker volume rm kiri-cp-new >/dev/null"
+t cp-volume-copyup-start "start=ok" "docker volume create kiri-cp-new >/dev/null; id=\$(docker create -v kiri-cp-new:/etc alpine sleep 5); docker cp /etc/hostname \$id:/etc/x >/dev/null; docker start \$id >/dev/null; docker exec \$id sh -c 'test -f /etc/hosts -a -f /etc/x && echo start=ok'; docker rm -f \$id >/dev/null; docker volume rm kiri-cp-new >/dev/null"
 t commit-renamed-dir "kept" "docker rm -f kiri-rename >/dev/null 2>&1; docker run --name kiri-rename alpine mv /etc/apk /etc/apk2; docker commit kiri-rename kiri-rename-test >/dev/null; docker rm -f kiri-rename >/dev/null; docker run --rm kiri-rename-test sh -c 'test -f /etc/apk2/repositories && echo kept'; docker rmi kiri-rename-test >/dev/null"
 # A container and an exec each lead their own session, so killpg from inside
 # never reaches the daemon (#191).

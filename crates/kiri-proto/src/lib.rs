@@ -138,7 +138,11 @@ pub enum Msg<'a> {
     RemoveVolume { name: &'a str },
     /// Host → guest, first frame on a connection to [`COPY_PORT`]: copy
     /// files into or out of a container (`docker cp`). `layers` lets the
-    /// guest mount a container that is not running. For `copy_op::IN` raw
+    /// guest mount a container that is not running, and `mounts` (the same
+    /// `source\ttarget\tflags` lines a start takes) are what it binds in
+    /// place there: Docker's archive endpoint resolves a path through the
+    /// container's mounts, so a file in a named volume is readable whether
+    /// the container is created, running or stopped. For `copy_op::IN` raw
     /// tar bytes follow until the host shuts its side, then the guest answers
     /// `CopyDone` or `Error`. For `OUT` and `STAT` the guest answers
     /// `CopyStat` or `Error`; for `OUT` raw tar bytes follow until it closes.
@@ -243,6 +247,11 @@ pub mod copy_flags {
     /// Intel Mac with macOS 14 passes a half-close on as a full one, and the
     /// guest's answer fails with EPIPE.
     pub const CHUNKED: u32 = 4;
+    /// The container runs with `--read-only`: a copy-in onto its root, where
+    /// no mount holds the destination, is refused (moby's
+    /// `checkWritablePath`). Older daemons never send it, so an old guest
+    /// ignores it.
+    pub const READONLY_ROOTFS: u32 = 8;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -252,16 +261,28 @@ pub struct CopySpec<'a> {
     pub path: &'a str,
     pub flags: u32,
     pub layers: StrList<'a>,
+    /// The container's mounts as a start takes them: `source\ttarget\tflags`.
+    /// Empty from an older daemon.
+    pub mounts: StrList<'a>,
 }
 
 /// Encodes a `Copy` frame from the sender's side.
-pub fn encode_copy<S: AsRef<str>>(out: &mut Vec<u8>, op: u8, id: &str, path: &str, flags: u32, layers: &[S]) {
+pub fn encode_copy<S: AsRef<str>>(
+    out: &mut Vec<u8>,
+    op: u8,
+    id: &str,
+    path: &str,
+    flags: u32,
+    layers: &[S],
+    mounts: &[S],
+) {
     frame(out, kind::COPY, |o| {
         o.push(op);
         put_str(o, id);
         put_str(o, path);
         put_u32(o, flags);
         StrList::put(o, layers);
+        StrList::put(o, mounts);
     });
 }
 
@@ -1032,6 +1053,8 @@ impl Msg<'_> {
                 put_u32(o, c.flags);
                 put_u32(o, c.layers.count);
                 o.extend_from_slice(c.layers.raw);
+                put_u32(o, c.mounts.count);
+                o.extend_from_slice(c.mounts.raw);
             }),
             Msg::CopyStat { entry, link } => frame(out, kind::COPY_STAT, |o| {
                 put_entry(o, &entry);
@@ -1319,7 +1342,18 @@ pub fn decode(frame: &[u8]) -> Result<Msg<'_>, DecodeError> {
         kind::MEMORY_PRESSURE => Msg::MemoryPressure,
         kind::REMOVE_VOLUME => Msg::RemoveVolume { name: r.str()? },
         kind::REMOVE_BRIDGE => Msg::RemoveBridge { bridge: r.str()? },
-        kind::COPY => Msg::Copy(CopySpec { op: r.u8()?, id: r.str()?, path: r.str()?, flags: r.u32()?, layers: r.list()? }),
+        kind::COPY => Msg::Copy(CopySpec {
+            op: r.u8()?,
+            id: r.str()?,
+            path: r.str()?,
+            flags: r.u32()?,
+            layers: r.list()?,
+            mounts: if r.remaining() >= 4 {
+                r.list()?
+            } else {
+                StrList::default()
+            },
+        }),
         kind::COPY_STAT => Msg::CopyStat { entry: read_entry(&mut r)?, link: r.str()? },
         kind::COPY_DONE => Msg::CopyDone,
         kind::UPDATE => Msg::Update { id: r.str()?, limits: read_limits(&mut r)? },
@@ -1380,6 +1414,9 @@ mod tests {
         assert_eq!(frame_len(buf[..4].try_into().unwrap()).unwrap(), buf.len());
         assert_eq!(decode(&buf).unwrap(), m);
     }
+
+    /// A volume as the daemon writes it into a copy request.
+    const VOL: &str = "/var/lib/kiri/volumes/pg/_data\t/data\tcreate,copyup";
 
     #[test]
     fn round_trip() {
@@ -1586,13 +1623,45 @@ mod tests {
         round(Msg::Uplink { ip: [192, 168, 64, 18], gateway: [192, 168, 64, 1] });
         round(Msg::Ack);
         let mut buf = Vec::new();
-        encode_copy(&mut buf, copy_op::IN, "c1", "/etc", copy_flags::KEEP_OWNERS, &["sha256:a", "sha256:b"]);
-        let Msg::Copy(c) = decode(&buf).unwrap() else { panic!() };
-        assert_eq!((c.op, c.id, c.path, c.flags), (copy_op::IN, "c1", "/etc", copy_flags::KEEP_OWNERS));
-        assert_eq!(c.layers.iter().collect::<Vec<_>>(), ["sha256:a", "sha256:b"]);
+        encode_copy(
+            &mut buf,
+            copy_op::IN,
+            "c1",
+            "/etc",
+            copy_flags::KEEP_OWNERS,
+            &["sha256:a", "sha256:b"],
+            &[VOL],
+        );
+        let Msg::Copy(c) = decode(&buf).unwrap() else {
+            panic!()
+        };
+        assert_eq!(
+            (c.op, c.id, c.path, c.flags),
+            (copy_op::IN, "c1", "/etc", copy_flags::KEEP_OWNERS)
+        );
+        assert_eq!(
+            c.layers.iter().collect::<Vec<_>>(),
+            ["sha256:a", "sha256:b"]
+        );
+        // The container's mounts come with it, so a path in a volume resolves.
+        assert_eq!(c.mounts.iter().collect::<Vec<_>>(), [VOL]);
         let mut again = Vec::new();
         Msg::Copy(c).encode(&mut again);
         assert_eq!(buf, again);
+        // An older daemon sends no mounts: the guest then enters the root as
+        // it did before, with nothing bound into it.
+        let mut old = buf.clone();
+        old.truncate(old.len() - (8 + VOL.len()));
+        let len = (old.len() - 4) as u32;
+        old[..4].copy_from_slice(&len.to_le_bytes());
+        let Msg::Copy(c) = decode(&old).unwrap() else {
+            panic!()
+        };
+        assert!(c.mounts.is_empty());
+        assert_eq!(
+            c.layers.iter().collect::<Vec<_>>(),
+            ["sha256:a", "sha256:b"]
+        );
         let mut buf = Vec::new();
         let entries = [
             FsEntry { name: "a", mode: 0o100644, size: 1, mtime: 2, mtime_nsec: 9, ino: 1 },

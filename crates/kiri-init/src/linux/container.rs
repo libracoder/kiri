@@ -1269,7 +1269,7 @@ pub(super) fn use_embedded_dns(id: &str, is_kiri: impl Fn([u8; 4]) -> bool) -> i
 }
 
 /// One mount, resolved before clone.
-struct Mount {
+pub(super) struct Mount {
     /// A guest path, or None for a tmpfs.
     source: Option<CString>,
     /// Relative to the container root (the child mounts before pivot_root).
@@ -1290,7 +1290,7 @@ struct Mount {
 /// flags (`noexec`, `exec`, `nosuid`, …; later ones win). A volume with
 /// driver options adds `\ttype\tdevice\tflags(hex)\tdata`, and is mounted
 /// at its source first.
-fn parse_mounts(list: StrList<'_>) -> io::Result<Vec<Mount>> {
+pub(super) fn parse_mounts(list: StrList<'_>) -> io::Result<Vec<Mount>> {
     let mut out = Vec::with_capacity(list.len());
     for m in list.iter() {
         let bad = || io::Error::new(io::ErrorKind::InvalidInput, format!("bad mount {m:?}"));
@@ -1376,11 +1376,21 @@ fn tmpfs_flags(words: &[&str]) -> libc::c_ulong {
 /// pivot_root), creating the target as a directory or an empty file. The
 /// target is looked up inside `root`, so an image's symlink cannot point
 /// the mount, the copy-up or the new directory outside the container.
-fn apply_mount(root: BorrowedFd<'_>, image: Option<BorrowedFd<'_>>, m: &Mount) -> io::Result<()> {
+pub(super) fn apply_mount(
+    root: BorrowedFd<'_>,
+    image: Option<BorrowedFd<'_>>,
+    m: &Mount,
+) -> io::Result<()> {
     let t = Path::new(std::ffi::OsStr::from_bytes(m.target.to_bytes()));
     if let Some(opts) = &m.tmpfs_opts {
         let at = inroot::open(root, t, Last::Dir)?;
-        return sys::mount(c"tmpfs", &at.proc_path(), c"tmpfs", m.tmpfs_flags, Some(opts));
+        return sys::mount(
+            c"tmpfs",
+            &at.proc_path(),
+            c"tmpfs",
+            m.tmpfs_flags,
+            Some(opts),
+        );
     }
     let src = m.source.as_ref().expect("bind mounts have a source");
     let at = inroot::open(root, t, if m.dir { Last::Dir } else { Last::File })?;
@@ -1454,14 +1464,71 @@ fn same_dir(a: &inroot::Found, b: &inroot::Found) -> bool {
     matches!((meta(a), meta(b)), (Ok(x), Ok(y)) if x.dev() == y.dev() && x.ino() == y.ino())
 }
 
-/// A detached copy of the current directory's mount (the container's
-/// root) without the mounts on it: the image as it is under any bind.
-/// None where the kernel has no open_tree (before Linux 5.2); volumes are
-/// then filled from what the path shows, as before.
-fn image_tree() -> Option<OwnedFd> {
+/// Puts a container's volumes and binds over `root`, its root mounted for a
+/// copy while it is not running, as a start puts them in place: Docker's
+/// archive endpoint resolves a path through them whatever the container's
+/// state (moby's `openContainerFS`). Parents go first, so the longest target
+/// wins. A tmpfs is left out, as Docker leaves it: it went with the
+/// container. A new volume is filled from the image as a start fills it;
+/// Docker has filled it when the container was created. Call it in a mount
+/// namespace of the copy's own.
+pub fn mount_for_copy(root: &std::path::Path, list: StrList<'_>) -> io::Result<()> {
+    let mut mounts = parse_mounts(list)?;
+    mounts.retain(|m| m.source.is_some());
+    if mounts.is_empty() {
+        return Ok(());
+    }
+    let fd = inroot::open_root(root)?;
+    let image = if mounts.iter().any(|m| m.copy_up) {
+        image_tree(root)
+    } else {
+        None
+    };
+    for m in &mounts {
+        apply_mount(fd.as_fd(), image.as_ref().map(|f| f.as_fd()), m)?;
+    }
+    Ok(())
+}
+
+/// Each mount's target and whether it is read-only, from the lines
+/// `parse_mounts` takes, without looking at their sources.
+pub fn mount_points(list: StrList<'_>) -> Vec<(PathBuf, bool)> {
+    list.iter()
+        .filter_map(|m| {
+            let mut parts = m.split('\t');
+            let (_, target) = (parts.next()?, parts.next()?);
+            let flags: Vec<&str> = parts
+                .next()
+                .unwrap_or("")
+                .split(',')
+                .filter(|f| !f.is_empty())
+                .collect();
+            let ro = if flags.contains(&"tmpfs") {
+                tmpfs_flags(&flags) & libc::MS_RDONLY != 0
+            } else {
+                flags.contains(&"ro")
+            };
+            Some((PathBuf::from(target), ro))
+        })
+        .collect()
+}
+
+/// A detached copy of the mount at `root` (the container's root) without
+/// the mounts on it: the image as it is under any bind. None where the
+/// kernel has no open_tree (before Linux 5.2); volumes are then filled from
+/// what the path shows, as before.
+fn image_tree(root: &std::path::Path) -> Option<OwnedFd> {
     const OPEN_TREE_CLONE: libc::c_uint = 1;
+    let c = sys::cstr(root).ok()?;
     // SAFETY: a valid NUL-terminated path; the result is a new descriptor or -1.
-    let fd = unsafe { libc::syscall(libc::SYS_open_tree, libc::AT_FDCWD, c".".as_ptr(), OPEN_TREE_CLONE | libc::O_CLOEXEC as libc::c_uint) };
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_open_tree,
+            libc::AT_FDCWD,
+            c.as_ptr(),
+            OPEN_TREE_CLONE | libc::O_CLOEXEC as libc::c_uint,
+        )
+    };
     // SAFETY: a descriptor the kernel just returned, owned only here.
     (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
 }
@@ -1717,7 +1784,11 @@ fn container_child(p: &Prepared, rootfs: &CStr, io: &ChildStdio) -> ! {
     }
     // The image's tree without the mounts made on it, for filling new
     // volumes; closed (and so unmounted) once they are all in place.
-    let image = if p.mounts.iter().any(|m| m.copy_up) { image_tree() } else { None };
+    let image = if p.mounts.iter().any(|m| m.copy_up) {
+        image_tree(Path::new("."))
+    } else {
+        None
+    };
     for m in &p.mounts {
         apply_mount(root, image.as_ref().map(|f| f.as_fd()), m).unwrap_or_else(|e| fail(&format!("mount {}", m.target.to_string_lossy()), e));
     }
