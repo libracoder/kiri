@@ -60,6 +60,9 @@ mod run;
 #[cfg(unix)]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod scan;
+#[cfg(unix)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod cliscan;
 #[cfg(target_os = "macos")]
 mod setup;
 #[cfg(unix)]
@@ -98,8 +101,10 @@ usage: kiri COMMAND          docker's commands, on Kiri: kiri run, ps, exec,
        kiri import [orbstack | desktop-linux] [--list | [--force] [image|volume|container NAME]]
        kiri bench [--runs N] [--image IMAGE] [--network none|bridge]
        kiri boot [--console] [--pings N]
-       kiri raw run [--rm] [-e KEY=VALUE]... IMAGE [COMMAND...]   (its own guest, no daemon)
-       kiri raw pull <image> | raw images | raw rmi <image>...";
+        kiri raw run [--rm] [-e KEY=VALUE]... IMAGE [COMMAND...]   (its own guest, no daemon)
+        kiri raw pull <image> | raw images | raw rmi <image>...
+        kiri scan [--json] [--history] <image>   known vulnerabilities, found by Grype
+";
 
 fn main() -> ExitCode {
     flavor::init();
@@ -165,6 +170,9 @@ fn main() -> ExitCode {
         Some("import") => import::run(&args[1..]),
         #[cfg(target_os = "macos")]
         Some("update") if !docker::is_container_update(&args[1..]) => update::run(&args[1..]),
+        #[cfg(unix)]
+        #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+        Some("scan") => cliscan::run(&args[1..]),
         #[cfg(unix)]
         Some("diag") => diag::run(&args[1..]),
         // Opening Kiri.app: set up on first launch, then the window.

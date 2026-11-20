@@ -52,6 +52,13 @@ Apple silicon and Intel Macs (macOS 14+), Windows 10 and 11 (x86-64 and Arm, thr
 - **Builds**: `docker build` / `buildx build` through BuildKit running in a
   Kiri container (buildx's docker-container driver), stopped when idle;
   on Apple silicon, amd64 build steps run through Rosetta too
+- **Vulnerability scanning**: `kiri scan <image>` (or an image's
+  Vulnerabilities tab in the window) finds known CVEs in an image with
+  Grype — also what every build's page shows. Nothing leaves the Mac:
+  Grype reads the image through an OCI layout of Kiri's own store, and the
+  first scan downloads Grype and its database (about 230 MB, 3 GB unpacked),
+  kept for every scan after. The last scans of an image are kept, with
+  `--history` and `--json`, and finding descriptions link their advisories
 - **Compose**: `up`, `down`, `ps`, `logs`, `exec`, multiple networks, events
 - **USB devices (beta)**: the USB tab hands a device (a serial adapter, a
   Zigbee stick, a development board) to your containers on Mac, Windows and
