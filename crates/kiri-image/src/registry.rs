@@ -273,13 +273,7 @@ fn shared_agent() -> ureq::Agent {
         .user_agent(concat!("kiri/", env!("CARGO_PKG_VERSION")))
         // Registries sit behind corporate proxies whose CA the platform
         // trusts; without it every pull fails UnknownIssuer (#303).
-        .tls_config(
-            ureq::tls::TlsConfig::builder()
-                .root_certs(ureq::tls::RootCerts::Specific(
-                    crate::roots::root_certs().into(),
-                ))
-                .build(),
-        );
+        .tls_config(crate::tls_config(crate::roots::trusted()));
     if let Some(p) = proxy(chosen.clone()) {
         cfg = cfg.proxy(p);
     }
@@ -1189,6 +1183,16 @@ fn not_found(e: Error, r: &Reference) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The shared pull agent verifies against the merged roots
+    /// ([`ureq::tls::RootCerts::Specific`]), not the bundled set only (#303).
+    #[test]
+    fn the_shared_agent_trusts_the_merged_roots() {
+        assert!(matches!(
+            shared_agent().config().tls_config().root_certs(),
+            ureq::tls::RootCerts::Specific(_)
+        ));
+    }
 
     #[test]
     fn a_missing_image_reads_as_docker_says_it() {

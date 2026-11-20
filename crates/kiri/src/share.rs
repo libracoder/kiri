@@ -328,30 +328,37 @@ fn server(cfg: &Config) -> Server {
     Server { host, port, dial }
 }
 
-/// Adds the merged roots (webpki's plus the platform's) to `roots`,
-/// skipping any certificate rustls refuses to add — the same quiet skip
-/// as `platform_certs()` skipping load errors. The merged list comes from
-/// places the user doesn't curate (the keychain, `/etc/ssl`), so one
-/// anchor rustls won't take shouldn't take every tunnel down.
-fn add_merged_roots(roots: &mut rustls::RootCertStore, certs: &[ureq::tls::Certificate<'static>]) {
-    for cert in certs {
-        let _ = roots.add(rustls::pki_types::CertificateDer::from(cert.der().to_vec()));
+/// The roots a Share tunnel verifies against: the system's roots merged
+/// with webpki's (like the registry client, #303), plus `share_ca`
+/// (`KIRI_SHARE_CA`), skipping any certificate rustls refuses to add —
+/// the same quiet skip as `platform_certs()` skipping load errors. The
+/// merged list comes from places the user doesn't curate (the keychain,
+/// `/etc/ssl`), so one anchor rustls won't take shouldn't take every
+/// tunnel down. `share_ca`, unlike the merged roots, is chosen on
+/// purpose: an explicit CA that doesn't parse is a misconfiguration
+/// worth reporting.
+fn root_store(
+    trusted: &[rustls::pki_types::CertificateDer<'static>],
+    share_ca: Option<&std::path::Path>,
+) -> io::Result<rustls::RootCertStore> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add_parsable_certificates(trusted.to_vec());
+    if let Some(ca) = share_ca {
+        let certs = rustls::pki_types::CertificateDer::pem_file_iter(ca)
+            .map_err(|e| io::Error::other(format!("KIRI_SHARE_CA: {e}")))?;
+        for c in certs {
+            roots
+                .add(c.map_err(|e| io::Error::other(format!("KIRI_SHARE_CA: {e}")))?)
+                .map_err(|e| io::Error::other(format!("KIRI_SHARE_CA: {e}")))?;
+        }
     }
+    Ok(roots)
 }
 
 fn tls_config(alpn: &[u8]) -> io::Result<Arc<rustls::ClientConfig>> {
-    let mut roots = rustls::RootCertStore::empty();
-    // The system's roots merged with webpki's, like the registry client
-    // (#303); KIRI_SHARE_CA, if set, is added on top, last.
-    add_merged_roots(&mut roots, &kiri_image::roots::root_certs());
-    // KIRI_SHARE_CA, unlike the merged roots, is chosen on purpose: an
-    // explicit CA that doesn't parse is a misconfiguration worth reporting.
-    if let Some(ca) = std::env::var_os("KIRI_SHARE_CA") {
-        let certs = rustls::pki_types::CertificateDer::pem_file_iter(&ca).map_err(|e| io::Error::other(format!("KIRI_SHARE_CA: {e}")))?;
-        for c in certs {
-            roots.add(c.map_err(|e| io::Error::other(format!("KIRI_SHARE_CA: {e}")))?).map_err(|e| io::Error::other(format!("KIRI_SHARE_CA: {e}")))?;
-        }
-    }
+    // KIRI_SHARE_CA, if set, is added on top of the merged roots, last.
+    let share_ca = std::env::var_os("KIRI_SHARE_CA").map(std::path::PathBuf::from);
+    let roots = root_store(crate::roots::trusted(), share_ca.as_deref())?;
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut c = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
@@ -2203,16 +2210,17 @@ mod tests {
         assert_eq!(parse_server("localhost:"), ("localhost:".into(), 443));
     }
 
-    /// A malformed anchor in the merged list is skipped, not fatal: the
+    /// A malformed anchor in the trusted list is skipped, not fatal: the
     /// store still holds every certificate that parses.
     #[test]
     fn merged_roots_skip_a_cert_that_fails_to_add() {
-        let certs = kiri_image::roots::root_certs();
+        let certs = crate::roots::trusted().to_vec();
         let mut with_bad = certs.clone();
-        let good = certs[0].der();
-        with_bad.push(ureq::tls::Certificate::from_der(&good[..good.len() / 2]).to_owned());
-        let mut roots = rustls::RootCertStore::empty();
-        add_merged_roots(&mut roots, &with_bad);
+        let good: &[u8] = certs[0].as_ref();
+        let bad = rustls::pki_types::CertificateDer::from(good[..good.len() / 2].to_vec());
+        with_bad.push(bad);
+        let no_ca = None;
+        let roots = root_store(&with_bad, no_ca).unwrap();
         assert_eq!(
             roots.len(),
             certs.len(),
@@ -2222,8 +2230,9 @@ mod tests {
     }
 
     /// KIRI_SHARE_CA stays loud: a PEM section that doesn't decode fails
-    /// `tls_config`, a parseable CA is added and passes. (A file with no
-    /// PEM sections at all iterates as empty upstream, pki-types 1.15.)
+    /// `root_store` (and so `tls_config`), a parseable CA is added and
+    /// passes. (A file with no PEM sections at all iterates as empty
+    /// upstream, pki-types 1.15.)
     #[test]
     fn kiri_share_ca_fails_loud_but_a_valid_ca_is_added() {
         let dir = std::env::temp_dir();

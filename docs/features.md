@@ -113,6 +113,23 @@ bundles the docker CLI, Compose and buildx; `Kiri-Lite-<version>-arm64.dmg`
 versions on first launch (`crates/kiri/src/cli_pins.rs`, checked by SHA-256)
 unless the Mac already has a docker CLI.
 
+## Company certificates
+
+Kiri trusts the root certificates of the operating system and the Mozilla set that Kiri bundles. This applies to pulls, pushes, `docker login`, the update check, CLI and grype downloads, and Kiri Share. A registry signed by a company root certificate works when the system trusts that certificate.
+
+- **macOS**: Kiri reads the trust settings of the user, admin and system keychains. Mark the root certificate as trusted, for example: `sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain ca.pem`
+- **Linux**: Kiri reads the system CA bundle, for example in `/etc/ssl/certs`.
+- **Windows**: pulls run in the WSL 2 distro, so they use the root certificates of that distro. Kiri Share uses the Windows certificate store of the current user. To trust a company root certificate in the distro, copy it to `/usr/local/share/ca-certificates/` and run `sudo update-ca-certificates` in the distro.
+
+NOTE: If `SSL_CERT_FILE` or `SSL_CERT_DIR` is set, Kiri reads the root certificates there instead of the system store, as OpenSSL does. The bundled Mozilla set stays in use. Kiri writes a warning when this occurs, and a company CA trusted in the keychain or system store is then not trusted.
+
+If the system store causes a problem, set `KIRI_TLS_ROOTS=webpki`. Kiri then trusts only the bundled Mozilla set, as before. The Kiri app and the daemon do not read your shell environment; set the variable for them and restart Kiri:
+
+- **macOS**: `launchctl setenv KIRI_TLS_ROOTS webpki`
+- **Linux**: `sudo systemctl edit kiri`, add `Environment=KIRI_TLS_ROOTS=webpki` under `[Service]`, then `sudo systemctl restart kiri`.
+
+To trust a private certificate authority at a Kiri Share edge only, set `KIRI_SHARE_CA` to a PEM file of extra root certificates. Kiri adds them to the trusted roots for that edge only; a file that does not parse is an error, not a silent skip.
+
 ## Known issues
 
 - **Mac: an attached USB device leaves your containers while the Mac

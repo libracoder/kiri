@@ -4,10 +4,10 @@
 //! certificates come out. This lives outside the crate because the crate
 //! forbids unsafe code and setting an environment variable is unsafe.
 
-use kiri_image::roots::root_certs;
+use kiri_image::roots::trusted;
 
-/// The file's certificates replace the platform store, and webpki's roots
-/// stay merged in.
+/// The file's certificates replace the platform store, and the bundled
+/// roots stay merged in.
 #[test]
 fn ssl_cert_file_replaces_the_platform_roots() {
     let ca = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
@@ -20,11 +20,20 @@ fn ssl_cert_file_replaces_the_platform_roots() {
     std::fs::write(&file, cert.pem()).unwrap();
     // SAFETY: no other test in this binary reads or writes the variable.
     unsafe { std::env::set_var("SSL_CERT_FILE", &file) };
-    let certs = root_certs();
+    let certs = trusted();
     unsafe { std::env::remove_var("SSL_CERT_FILE") };
     let _ = std::fs::remove_file(&file);
-    assert_eq!(certs.len(), webpki_roots::TLS_SERVER_ROOTS.len() + 1);
-    // The file's certificate is the last of the merged list, after
-    // webpki's; the platform store contributed none.
-    assert_eq!(certs.last().unwrap().der(), cert.der().as_ref());
+    assert_eq!(
+        certs.len(),
+        webpki_root_certs::TLS_SERVER_ROOT_CERTS.len() + 1
+    );
+    // The file's certificate replaces the platform store at the front of
+    // the merged list, the bundled roots unchanged after it.
+    assert_eq!(certs.first().unwrap().as_ref(), cert.der().as_ref());
+    assert!(
+        certs[1..]
+            .iter()
+            .zip(webpki_root_certs::TLS_SERVER_ROOT_CERTS)
+            .all(|(a, b)| a.as_ref() == b.as_ref())
+    );
 }

@@ -773,12 +773,13 @@ dependencies = [
  "rcgen",
  "rustls",
  "rustls-native-certs",
+ "rustls-pki-types",
  "serde",
  "serde_json",
  "sha2",
  "tar",
  "ureq",
- "webpki-roots",
+ "webpki-root-certs",
 ]
 
 [[package]]
@@ -824,10 +825,12 @@ dependencies = [
  "kiri-share-proto",
  "libc",
  "rustls",
+ "rustls-native-certs",
+ "rustls-pki-types",
  "serde",
  "serde_json",
  "sha2",
- "webpki-roots",
+ "webpki-root-certs",
  "webview2-com",
  "windows",
  "windows-sys 0.52.0",
@@ -1709,7 +1712,6 @@ dependencies = [
  "rustls-pki-types",
  "ureq-proto",
  "utf8-zero",
- "webpki-roots",
 ]
 
 [[package]]
@@ -1813,10 +1815,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "webpki-roots"
-version = "1.0.11"
+name = "webpki-root-certs"
+version = "1.0.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f5f280bbb2b287bc8e7de7e3852945a0ff50d1bbcb5ed42b6c7a568c546df171"
+checksum = "293198dcebfb821155b5092ab94b5a82ff180eddd7241df3bd6e66a4ffd1a585"
 dependencies = [
  "rustls-pki-types",
 ]

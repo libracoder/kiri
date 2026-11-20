@@ -94,10 +94,13 @@ mod daemon {
 #[cfg(windows)]
 mod wslconfig;
 // Kiri Dev's names (the window on Windows is always Kiri) and Share, the
-// Mac's own files: crates/kiri/src/flavor.rs and share.rs.
+// Mac's own files: crates/kiri/src/flavor.rs and share.rs. Share's roots
+// come from crates/kiri-image/src/roots.rs, the same file kiri uses.
 #[cfg(windows)]
 #[path = "../../kiri/src/flavor.rs"]
 mod flavor;
+#[cfg(windows)]
+mod roots;
 #[cfg(windows)]
 #[path = "../../kiri/src/share.rs"]
 #[allow(dead_code)]

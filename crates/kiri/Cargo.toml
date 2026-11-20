@@ -17,7 +17,7 @@ sha2 = "0.11"
 flate2 = "1"
 # zstd uploads to the same endpoints: the decoder the guest unpacks layers with.
 ruzstd = "0.9"
-ureq = { version = "3", default-features = false, features = ["rustls"] }
+ureq = { version = "3", default-features = false, features = ["rustls-no-provider"] }
 # HTTPS for container names: the same rustls and ring ureq already brings in.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem", "crypto"] }

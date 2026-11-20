@@ -69,6 +69,8 @@ mod stale;
 #[cfg(windows)]
 mod wsl;
 #[cfg(any(unix, windows))]
+use kiri_image::roots;
+#[cfg(any(unix, windows))]
 mod share;
 #[cfg(any(target_os = "macos", all(target_os = "linux", feature = "window")))]
 mod ui;
