@@ -3578,14 +3578,15 @@ function runCommand(cmd) {
   const d = ui.detail, out = $("term-out");
   d.term.history.push(cmd);
   d.term.at = d.term.history.length;
-  const block = document.createElement("div");
-  block.dataset.pending = "1";
+  const block = document.createElement("div"), path = wrapped(d.term, cmd);
+  // The reply names the command it ran, so it finds its own block even when a later one finished first.
+  block.dataset.pending = path;
   block.innerHTML = `<div class="cmd"><span class="ps1"></span><span class="typed"></span></div><div class="body quiet">${tr("running…")}</div>`;
   block.querySelector(".ps1").textContent = ps1(d.term, d.info);
   block.querySelector(".typed").textContent = cmd;
   out.append(block);
   termEl.scrollTop = termEl.scrollHeight;
-  send("exec", { id: d.id, path: wrapped(d.term, cmd) });
+  send("exec", { id: d.id, path });
 }
 
 function finishExec(e) {
@@ -3599,7 +3600,7 @@ function finishExec(e) {
     setPrompt();
   }
   const out = $("term-out") ?? termEl.querySelector("#term-out");
-  const block = out.querySelector("[data-pending]");
+  const block = [...out.querySelectorAll("[data-pending]")].find((b) => b.dataset.pending === e.cmd);
   // The opening probe has no block of its own.
   if (!block || e.cmd === ui.detail.term.probed) return;
   block.removeAttribute("data-pending");
