@@ -10,9 +10,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::Deserialize;
 
 use crate::cancel::Cancel;
-use crate::tags::{next_link, version_order};
 use crate::reference::Reference;
 use crate::store::{Image, Layer, RunConfig, Store, sha256_digest};
+use crate::tags::{next_link, version_order};
 
 const ACCEPT: &str = "application/vnd.oci.image.index.v1+json, \
     application/vnd.docker.distribution.manifest.list.v2+json, \
@@ -26,8 +26,15 @@ const PARALLEL_LAYERS: usize = 4;
 #[derive(Debug)]
 pub enum Error {
     Http(String),
-    Status { url: String, status: u16, body: String },
-    NoPlatform { wanted: String, available: Vec<String> },
+    Status {
+        url: String,
+        status: u16,
+        body: String,
+    },
+    NoPlatform {
+        wanted: String,
+        available: Vec<String>,
+    },
     Manifest(String),
     /// No such image or tag, in the words `docker pull` uses.
     NotFound(String),
@@ -93,7 +100,10 @@ impl Platform {
             "aarch64" => "arm64",
             a => a,
         };
-        (!os.is_empty() && !arch.is_empty()).then(|| Platform { os: os.to_owned(), architecture: arch.to_owned() })
+        (!os.is_empty() && !arch.is_empty()).then(|| Platform {
+            os: os.to_owned(),
+            architecture: arch.to_owned(),
+        })
     }
 
     /// Linux on this machine's CPU architecture, which is what the guest runs.
@@ -103,7 +113,10 @@ impl Platform {
             "x86_64" => "amd64",
             other => other,
         };
-        Platform { os: "linux".into(), architecture: architecture.into() }
+        Platform {
+            os: "linux".into(),
+            architecture: architecture.into(),
+        }
     }
 }
 
@@ -125,30 +138,56 @@ const OCI_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
 /// Docker layer media types, spelled the OCI way for an OCI manifest.
 fn oci_layer_type(media_type: &str) -> &str {
     match media_type {
-        "application/vnd.docker.image.rootfs.diff.tar.gzip" => "application/vnd.oci.image.layer.v1.tar+gzip",
+        "application/vnd.docker.image.rootfs.diff.tar.gzip" => {
+            "application/vnd.oci.image.layer.v1.tar+gzip"
+        }
         "application/vnd.docker.image.rootfs.diff.tar" => "application/vnd.oci.image.layer.v1.tar",
         other => other,
     }
 }
 
 /// The response if it is a success, else its status and body as an error.
-fn ok(mut resp: ureq::http::Response<ureq::Body>, url: &str) -> Result<ureq::http::Response<ureq::Body>, Error> {
+fn ok(
+    mut resp: ureq::http::Response<ureq::Body>,
+    url: &str,
+) -> Result<ureq::http::Response<ureq::Body>, Error> {
     let status = resp.status().as_u16();
     if (200..300).contains(&status) {
         return Ok(resp);
     }
-    let body = resp.body_mut().with_config().limit(64 << 10).read_to_string().unwrap_or_default();
-    Err(Error::Status { url: url.to_owned(), status, body })
+    let body = resp
+        .body_mut()
+        .with_config()
+        .limit(64 << 10)
+        .read_to_string()
+        .unwrap_or_default();
+    Err(Error::Status {
+        url: url.to_owned(),
+        status,
+        body,
+    })
 }
 
 #[derive(Debug, Clone)]
 pub enum Progress {
-    Resolved { layers: usize, bytes: u64, cached: usize },
+    Resolved {
+        layers: usize,
+        bytes: u64,
+        cached: usize,
+    },
     /// Each layer, once the manifest is read and before any downloads.
-    Layer { digest: String, size: u64, cached: bool },
+    Layer {
+        digest: String,
+        size: u64,
+        cached: bool,
+    },
     /// Bytes of a layer so far, every half MB or so.
     Downloading { digest: String, got: u64, size: u64 },
-    LayerDone { digest: String, bytes: u64, cached: bool },
+    LayerDone {
+        digest: String,
+        bytes: u64,
+        cached: bool,
+    },
 }
 
 /// What `docker login` saved, as the CLI sends it in `X-Registry-Auth`
@@ -178,17 +217,25 @@ impl Credentials {
         let json = crate::b64::decode(header.trim())?;
         let mut c: Credentials = serde_json::from_slice(&json).ok()?;
         if c.username.is_empty() && !c.auth.is_empty() {
-            let pair = crate::b64::decode(&c.auth).and_then(|b| String::from_utf8(b).ok()).unwrap_or_default();
+            let pair = crate::b64::decode(&c.auth)
+                .and_then(|b| String::from_utf8(b).ok())
+                .unwrap_or_default();
             if let Some((u, p)) = pair.split_once(':') {
                 c.username = u.to_owned();
                 c.password = p.to_owned();
             }
         }
-        (!c.username.is_empty() || !c.identity_token.is_empty() || !c.registry_token.is_empty()).then_some(c)
+        (!c.username.is_empty() || !c.identity_token.is_empty() || !c.registry_token.is_empty())
+            .then_some(c)
     }
 
     fn basic(&self) -> Option<String> {
-        (!self.username.is_empty()).then(|| format!("Basic {}", crate::b64::encode(format!("{}:{}", self.username, self.password).as_bytes())))
+        (!self.username.is_empty()).then(|| {
+            format!(
+                "Basic {}",
+                crate::b64::encode(format!("{}:{}", self.username, self.password).as_bytes())
+            )
+        })
     }
 }
 
@@ -221,9 +268,13 @@ pub fn set_proxy_source(f: ProxySource) {
 type ProxyChoice = Option<Option<(String, Vec<String>)>>;
 
 fn proxy(chosen: ProxyChoice) -> Option<Option<ureq::Proxy>> {
-    let Some((url, skip)) = chosen? else { return Some(None) };
+    let Some((url, skip)) = chosen? else {
+        return Some(None);
+    };
     let parsed = ureq::Proxy::new(&url).ok()?;
-    let mut b = ureq::Proxy::builder(parsed.protocol()).host(parsed.host()).port(parsed.port());
+    let mut b = ureq::Proxy::builder(parsed.protocol())
+        .host(parsed.host())
+        .port(parsed.port());
     if let Some(u) = parsed.username() {
         b = b.username(u);
     }
@@ -237,12 +288,21 @@ fn proxy(chosen: ProxyChoice) -> Option<Option<ureq::Proxy>> {
 }
 
 fn realm_is_secure(realm: &str, registry: &str) -> bool {
-    if realm.get(..8).is_some_and(|s| s.eq_ignore_ascii_case("https://")) {
+    if realm
+        .get(..8)
+        .is_some_and(|s| s.eq_ignore_ascii_case("https://"))
+    {
         return true;
     }
-    realm.get(..7).is_some_and(|s| s.eq_ignore_ascii_case("http://"))
+    realm
+        .get(..7)
+        .is_some_and(|s| s.eq_ignore_ascii_case("http://"))
         && crate::reference::is_local(registry)
-        && realm.parse::<ureq::http::Uri>().ok().and_then(|u| u.authority().map(|a| a.host().to_owned())).is_some_and(|h| crate::reference::is_local(&h))
+        && realm
+            .parse::<ureq::http::Uri>()
+            .ok()
+            .and_then(|u| u.authority().map(|a| a.host().to_owned()))
+            .is_some_and(|h| crate::reference::is_local(&h))
 }
 
 /// How long an idle connection waits in the pool for the next request.
@@ -276,7 +336,11 @@ fn shared_agent() -> ureq::Agent {
     }
     // Happy Eyeballs rather than ureq's one address after another, so an
     // IPv6 address without a working route does not stall the pull.
-    let agent = ureq::Agent::with_parts(cfg.build(), crate::connect::connector(), ureq::unversioned::resolver::DefaultResolver::default());
+    let agent = ureq::Agent::with_parts(
+        cfg.build(),
+        crate::connect::connector(),
+        ureq::unversioned::resolver::DefaultResolver::default(),
+    );
     *slot = Some((chosen, agent.clone()));
     agent
 }
@@ -284,24 +348,28 @@ fn shared_agent() -> ureq::Agent {
 /// Bearer tokens (and Basic answers) by registry, repository, actions and
 /// who asked, with when each stops being used. A registry says how long a
 /// token lasts (`expires_in`, 60 s if it doesn't; Docker Hub gives 300 s).
-static TOKENS: std::sync::LazyLock<Mutex<HashMap<String, (String, Instant)>>> = std::sync::LazyLock::new(Default::default);
+static TOKENS: std::sync::LazyLock<Mutex<HashMap<String, (String, Instant)>>> =
+    std::sync::LazyLock::new(Default::default);
 
 /// Each registry's last bearer challenge without its scope, so a pull from
 /// a registry seen before asks for its token straight away instead of
 /// first sending a request only to be told where the token server is.
-static CHALLENGES: std::sync::LazyLock<Mutex<HashMap<String, String>>> = std::sync::LazyLock::new(Default::default);
+static CHALLENGES: std::sync::LazyLock<Mutex<HashMap<String, String>>> =
+    std::sync::LazyLock::new(Default::default);
 
 /// What Docker Hub answers every anonymous request with, so even the first
 /// pull from it can fetch the token while it connects to the registry. If
 /// Hub ever changes it, the registry's own challenge takes over.
-const DOCKER_HUB_CHALLENGE: &str = r#"Bearer realm="https://auth.docker.io/token",service="registry.docker.io""#;
+const DOCKER_HUB_CHALLENGE: &str =
+    r#"Bearer realm="https://auth.docker.io/token",service="registry.docker.io""#;
 
 /// Manifests fetched by digest, which never change: re-pulling an image
 /// (after `rmi`, or the same image under another tag) skips that round trip.
 /// Kept per repository and per who asked (`manifest_key`), so a manifest
 /// read with one repository's access, or with credentials, is not handed
 /// out for another repository or to an anonymous pull.
-static MANIFESTS: std::sync::LazyLock<Mutex<ManifestCache>> = std::sync::LazyLock::new(Default::default);
+static MANIFESTS: std::sync::LazyLock<Mutex<ManifestCache>> =
+    std::sync::LazyLock::new(Default::default);
 
 #[derive(Default)]
 struct ManifestCache {
@@ -326,7 +394,11 @@ impl ManifestCache {
             self.by_digest.clear();
             self.bytes = 0;
         }
-        if self.by_digest.insert(key.to_owned(), (bytes.to_vec(), media_type.to_owned())).is_none() {
+        if self
+            .by_digest
+            .insert(key.to_owned(), (bytes.to_vec(), media_type.to_owned()))
+            .is_none()
+        {
             self.bytes += bytes.len();
         }
     }
@@ -347,7 +419,10 @@ fn token_lifetime(ttl: Duration) -> Duration {
 /// A bearer challenge reduced to its realm and service: the scope it named
 /// was for the repository that request was about.
 fn without_scope(challenge: &str) -> Option<String> {
-    if !challenge.get(..7).is_some_and(|s| s.eq_ignore_ascii_case("bearer ")) {
+    if !challenge
+        .get(..7)
+        .is_some_and(|s| s.eq_ignore_ascii_case("bearer "))
+    {
         return None;
     }
     let p = parse_challenge(&challenge[7..]);
@@ -371,7 +446,13 @@ fn transient(e: &Error) -> bool {
         Error::Io(e) => {
             // ureq's own errors (a timeout among them) come wrapped.
             if let Some(u) = e.get_ref().and_then(|i| i.downcast_ref::<ureq::Error>()) {
-                return matches!(u, ureq::Error::Timeout(_) | ureq::Error::Io(_) | ureq::Error::ConnectionFailed | ureq::Error::HostNotFound);
+                return matches!(
+                    u,
+                    ureq::Error::Timeout(_)
+                        | ureq::Error::Io(_)
+                        | ureq::Error::ConnectionFailed
+                        | ureq::Error::HostNotFound
+                );
             }
             matches!(
                 e.kind(),
@@ -401,7 +482,10 @@ fn stale(e: &ureq::Error) -> bool {
 
 impl Client {
     pub fn new() -> Client {
-        Client { agent: shared_agent(), credentials: None }
+        Client {
+            agent: shared_agent(),
+            credentials: None,
+        }
     }
 
     /// Who the tokens are for: a fingerprint of the credentials, so one
@@ -409,7 +493,13 @@ impl Client {
     fn who(&self) -> String {
         match &self.credentials {
             None => "-".into(),
-            Some(c) => sha256_digest(format!("{}\0{}\0{}\0{}", c.username, c.password, c.identity_token, c.registry_token).as_bytes()),
+            Some(c) => sha256_digest(
+                format!(
+                    "{}\0{}\0{}\0{}",
+                    c.username, c.password, c.identity_token, c.registry_token
+                )
+                .as_bytes(),
+            ),
         }
     }
 
@@ -437,7 +527,9 @@ impl Client {
         let mut tokens = TOKENS.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
         tokens.retain(|_, (_, until)| now < *until);
-        let Some(until) = now.checked_add(token_lifetime(ttl)) else { return };
+        let Some(until) = now.checked_add(token_lifetime(ttl)) else {
+            return;
+        };
         tokens.insert(key, (header, until));
     }
 
@@ -450,17 +542,36 @@ impl Client {
     /// rather than waiting out the connect timeout a second time.
     fn warm_up(&self, r: &Reference, actions: &str) -> Result<(), Error> {
         let key = self.token_key(r, actions);
-        if self.credentials.as_ref().is_some_and(|c| !c.registry_token.is_empty()) || Self::cached_token(&key).is_some() {
+        if self
+            .credentials
+            .as_ref()
+            .is_some_and(|c| !c.registry_token.is_empty())
+            || Self::cached_token(&key).is_some()
+        {
             return Ok(());
         }
-        let known = CHALLENGES.lock().unwrap_or_else(|e| e.into_inner()).get(&r.registry).cloned();
-        let Some(challenge) = known.or_else(|| (r.registry == "docker.io").then(|| DOCKER_HUB_CHALLENGE.to_owned())) else { return Ok(()) };
+        let known = CHALLENGES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&r.registry)
+            .cloned();
+        let Some(challenge) =
+            known.or_else(|| (r.registry == "docker.io").then(|| DOCKER_HUB_CHALLENGE.to_owned()))
+        else {
+            return Ok(());
+        };
         let url = format!("{}/v2/", r.api_base());
         std::thread::scope(|s| {
             // Two connections: after the manifests, the config and the first
             // layer are fetched at once.
-            let connections: Vec<_> = (0..2).map(|_| s.spawn(|| self.agent.get(&url).call().map(drain))).collect();
-            if let Ok((header, ttl)) = self.answer(&challenge, &format!("repository:{}:{actions}", r.repository), &r.registry) {
+            let connections: Vec<_> = (0..2)
+                .map(|_| s.spawn(|| self.agent.get(&url).call().map(drain)))
+                .collect();
+            if let Ok((header, ttl)) = self.answer(
+                &challenge,
+                &format!("repository:{}:{actions}", r.repository),
+                &r.registry,
+            ) {
                 Self::remember_token(key, header, ttl);
             }
             let mut failed = None;
@@ -505,22 +616,33 @@ impl Client {
         cancel: &Cancel,
     ) -> Result<Image, Error> {
         let _on = cancel.enter();
-        let stopped = |e: Error| if cancel.is_cancelled() { Error::Cancelled } else { e };
+        let stopped = |e: Error| {
+            if cancel.is_cancelled() {
+                Error::Cancelled
+            } else {
+                e
+            }
+        };
         self.warm_up(reference, "pull").map_err(stopped)?;
-        let (bytes, media_type) = self.manifest(reference, &reference.reference).map_err(|e| not_found(stopped(e), reference))?;
+        let (bytes, media_type) = self
+            .manifest(reference, &reference.reference)
+            .map_err(|e| not_found(stopped(e), reference))?;
         // A pull by digest must get exactly that content, whether it is a
         // single manifest or a multi-arch index. Without this, a registry
         // could answer a pinned digest with any index naming any children.
         if reference.is_digest() && sha256_digest(&bytes) != reference.reference {
             return Err(Error::Manifest("manifest failed digest check".into()));
         }
-        let manifest: Manifest = serde_json::from_slice(&bytes).map_err(|e| Error::Manifest(e.to_string()))?;
+        let manifest: Manifest =
+            serde_json::from_slice(&bytes).map_err(|e| Error::Manifest(e.to_string()))?;
 
         // An index lists one manifest per platform; pick ours and fetch it.
         let index_digest = manifest.manifests.is_some().then(|| sha256_digest(&bytes));
         let (manifest, digest) = if let Some(entries) = manifest.manifests {
             let wanted = entries.iter().find(|m| {
-                m.platform.as_ref().is_some_and(|p| p.os == platform.os && p.architecture == platform.architecture)
+                m.platform
+                    .as_ref()
+                    .is_some_and(|p| p.os == platform.os && p.architecture == platform.architecture)
             });
             let Some(entry) = wanted else {
                 return Err(Error::NoPlatform {
@@ -535,9 +657,13 @@ impl Client {
             };
             let (bytes, _) = self.manifest(reference, &entry.digest).map_err(stopped)?;
             if sha256_digest(&bytes) != entry.digest {
-                return Err(Error::Manifest(format!("manifest {} failed digest check", entry.digest)));
+                return Err(Error::Manifest(format!(
+                    "manifest {} failed digest check",
+                    entry.digest
+                )));
             }
-            let m: Manifest = serde_json::from_slice(&bytes).map_err(|e| Error::Manifest(e.to_string()))?;
+            let m: Manifest =
+                serde_json::from_slice(&bytes).map_err(|e| Error::Manifest(e.to_string()))?;
             (m, entry.digest.clone())
         } else {
             if reference.is_digest() && sha256_digest(&bytes) != reference.reference {
@@ -546,17 +672,34 @@ impl Client {
             (manifest, sha256_digest(&bytes))
         };
         let (Some(config), Some(layers)) = (manifest.config, manifest.layers) else {
-            return Err(Error::Manifest(format!("{media_type} has no config or layers")));
+            return Err(Error::Manifest(format!(
+                "{media_type} has no config or layers"
+            )));
         };
 
         let layers: Vec<Layer> = layers
             .into_iter()
-            .map(|l| Layer { digest: l.digest, size: l.size, media_type: l.media_type })
+            .map(|l| Layer {
+                digest: l.digest,
+                size: l.size,
+                media_type: l.media_type,
+            })
             .collect();
-        let cached = layers.iter().filter(|l| store.has_blob(&l.digest, l.size)).count();
-        progress(Progress::Resolved { layers: layers.len(), bytes: layers.iter().map(|l| l.size).sum(), cached });
+        let cached = layers
+            .iter()
+            .filter(|l| store.has_blob(&l.digest, l.size))
+            .count();
+        progress(Progress::Resolved {
+            layers: layers.len(),
+            bytes: layers.iter().map(|l| l.size).sum(),
+            cached,
+        });
         for l in &layers {
-            progress(Progress::Layer { digest: l.digest.clone(), size: l.size, cached: store.has_blob(&l.digest, l.size) });
+            progress(Progress::Layer {
+                digest: l.digest.clone(),
+                size: l.size,
+                cached: store.has_blob(&l.digest, l.size),
+            });
         }
 
         // Download missing layers in parallel, with a fixed number of workers
@@ -576,35 +719,78 @@ impl Client {
                     return;
                 }
                 // Bounded: the manifest declares the size, and a config is small.
-                let result = self.download_with(store, reference, &config.digest, crate::store::MAX_CONFIG, &|_| {}, cancel).and_then(|got| {
-                    if got != config.size {
-                        return Err(Error::Manifest(format!("config {} is {got} bytes, the manifest says {}", config.digest, config.size)));
-                    }
-                    Ok(())
-                });
+                let result = self
+                    .download_with(
+                        store,
+                        reference,
+                        &config.digest,
+                        crate::store::MAX_CONFIG,
+                        &|_| {},
+                        cancel,
+                    )
+                    .and_then(|got| {
+                        if got != config.size {
+                            return Err(Error::Manifest(format!(
+                                "config {} is {got} bytes, the manifest says {}",
+                                config.digest, config.size
+                            )));
+                        }
+                        Ok(())
+                    });
                 if let Err(e) = result {
-                    first_error.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert(e);
+                    first_error
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get_or_insert(e);
                 }
             });
             for _ in 0..PARALLEL_LAYERS.min(layers.len()) {
                 s.spawn(|| {
                     let _on = cancel.enter();
                     loop {
-                        let Some(layer) = queue.lock().unwrap_or_else(|e| e.into_inner()).pop() else { return };
-                        if cancel.is_cancelled() || first_error.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
+                        let Some(layer) = queue.lock().unwrap_or_else(|e| e.into_inner()).pop()
+                        else {
+                            return;
+                        };
+                        if cancel.is_cancelled()
+                            || first_error
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .is_some()
+                        {
                             return;
                         }
                         let cached = store.has_blob(&layer.digest, layer.size);
                         let result = if cached {
                             Ok(layer.size)
                         } else {
-                            let on_bytes = |got| progress(Progress::Downloading { digest: layer.digest.clone(), got, size: layer.size });
-                            self.download_with(store, reference, &layer.digest, u64::MAX, &on_bytes, cancel)
+                            let on_bytes = |got| {
+                                progress(Progress::Downloading {
+                                    digest: layer.digest.clone(),
+                                    got,
+                                    size: layer.size,
+                                })
+                            };
+                            self.download_with(
+                                store,
+                                reference,
+                                &layer.digest,
+                                u64::MAX,
+                                &on_bytes,
+                                cancel,
+                            )
                         };
                         match result {
-                            Ok(bytes) => progress(Progress::LayerDone { digest: layer.digest.clone(), bytes, cached }),
+                            Ok(bytes) => progress(Progress::LayerDone {
+                                digest: layer.digest.clone(),
+                                bytes,
+                                cached,
+                            }),
                             Err(e) => {
-                                first_error.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert(e);
+                                first_error
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .get_or_insert(e);
                                 return;
                             }
                         }
@@ -620,7 +806,8 @@ impl Client {
             return Err(e);
         }
         let cfg_bytes = store.read_config(&config.digest)?;
-        let cfg: ImageConfig = serde_json::from_slice(&cfg_bytes).map_err(|e| Error::Manifest(e.to_string()))?;
+        let cfg: ImageConfig =
+            serde_json::from_slice(&cfg_bytes).map_err(|e| Error::Manifest(e.to_string()))?;
 
         let run = cfg.config.unwrap_or_default();
         let image = Image {
@@ -632,7 +819,10 @@ impl Client {
             layers,
             platform: platform.to_string(),
             created: cfg.created.unwrap_or_default(),
-            pulled_at: SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+            pulled_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
             config: RunConfig {
                 env: run.env.unwrap_or_default(),
                 entrypoint: run.entrypoint.unwrap_or_default(),
@@ -652,7 +842,12 @@ impl Client {
     fn manifest(&self, r: &Reference, reference: &str) -> Result<(Vec<u8>, String), Error> {
         let by_digest = reference.starts_with("sha256:");
         let key = self.manifest_key(r, reference);
-        if by_digest && let Some(hit) = MANIFESTS.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        if by_digest
+            && let Some(hit) = MANIFESTS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&key)
+        {
             return Ok(hit);
         }
         let url = format!("{}/v2/{}/manifests/{reference}", r.api_base(), r.repository);
@@ -665,14 +860,25 @@ impl Client {
             .to_owned();
         let bytes = resp.body_mut().with_config().limit(4 << 20).read_to_vec()?;
         if by_digest {
-            MANIFESTS.lock().unwrap_or_else(|e| e.into_inner()).put(&key, reference, &bytes, &media_type);
+            MANIFESTS.lock().unwrap_or_else(|e| e.into_inner()).put(
+                &key,
+                reference,
+                &bytes,
+                &media_type,
+            );
         }
         Ok((bytes, media_type))
     }
 
     /// Streams one blob into the store, verifying its digest. Returns its size.
     #[cfg(test)]
-    fn download(&self, store: &Store, r: &Reference, digest: &str, on_bytes: &dyn Fn(u64)) -> Result<u64, Error> {
+    fn download(
+        &self,
+        store: &Store,
+        r: &Reference,
+        digest: &str,
+        on_bytes: &dyn Fn(u64),
+    ) -> Result<u64, Error> {
         self.download_with(store, r, digest, u64::MAX, on_bytes, &Cancel::new())
     }
 
@@ -683,7 +889,15 @@ impl Client {
     /// Docker retries a layer, up to [`BLOB_TRIES`] times in a row without
     /// progress. Refuses bodies over `max` bytes, and stops (removing what
     /// it wrote) once `cancel` is.
-    fn download_with(&self, store: &Store, r: &Reference, digest: &str, max: u64, on_bytes: &dyn Fn(u64), cancel: &Cancel) -> Result<u64, Error> {
+    fn download_with(
+        &self,
+        store: &Store,
+        r: &Reference,
+        digest: &str,
+        max: u64,
+        on_bytes: &dyn Fn(u64),
+        cancel: &Cancel,
+    ) -> Result<u64, Error> {
         let url = format!("{}/v2/{}/blobs/{digest}", r.api_base(), r.repository);
         let mut out = store.blob_writer(digest)?;
         let mut buf = vec![0u8; 256 * 1024];
@@ -701,7 +915,11 @@ impl Client {
                     out = store.blob_writer(digest)?;
                     (got, told) = (0, 0);
                 }
-                let mut body = resp.body_mut().with_config().limit(max.saturating_sub(got)).reader();
+                let mut body = resp
+                    .body_mut()
+                    .with_config()
+                    .limit(max.saturating_sub(got))
+                    .reader();
                 loop {
                     let n = body.read(&mut buf)?;
                     // A shut-down connection reads as an early end.
@@ -735,12 +953,20 @@ impl Client {
     }
 
     /// GET a blob from byte `from` on (all of it from 0).
-    fn get_from(&self, r: &Reference, url: &str, from: u64) -> Result<ureq::http::Response<ureq::Body>, Error> {
+    fn get_from(
+        &self,
+        r: &Reference,
+        url: &str,
+        from: u64,
+    ) -> Result<ureq::http::Response<ureq::Body>, Error> {
         if from == 0 {
             return self.get(r, url, None);
         }
         let resp = self.authed(r, "pull", |auth| {
-            let mut req = self.agent.get(url).header("Range", format!("bytes={from}-"));
+            let mut req = self
+                .agent
+                .get(url)
+                .header("Range", format!("bytes={from}-"));
             if let Some(a) = auth {
                 req = req.header("Authorization", a);
             }
@@ -750,7 +976,12 @@ impl Client {
     }
 
     /// GET with registry auth.
-    fn get(&self, r: &Reference, url: &str, accept: Option<&str>) -> Result<ureq::http::Response<ureq::Body>, Error> {
+    fn get(
+        &self,
+        r: &Reference,
+        url: &str,
+        accept: Option<&str>,
+    ) -> Result<ureq::http::Response<ureq::Body>, Error> {
         let resp = self.authed(r, "pull", |auth| {
             let send = || {
                 let mut req = self.agent.get(url);
@@ -783,18 +1014,39 @@ impl Client {
         let mut resp = None;
         for attempt in 0..2 {
             let header = Self::cached_token(&key).or_else(|| {
-                self.credentials.as_ref().filter(|c| !c.registry_token.is_empty()).map(|c| format!("Bearer {}", c.registry_token))
+                self.credentials
+                    .as_ref()
+                    .filter(|c| !c.registry_token.is_empty())
+                    .map(|c| format!("Bearer {}", c.registry_token))
             });
             let rsp = call(header.as_deref())?;
             if rsp.status().as_u16() == 401 && attempt == 0 {
-                let challenge = rsp.headers().get("www-authenticate").and_then(|v| v.to_str().ok()).unwrap_or_default().to_owned();
+                let challenge = rsp
+                    .headers()
+                    .get("www-authenticate")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default()
+                    .to_owned();
                 drain(rsp);
-                let (answer, ttl) = self.answer(&challenge, &format!("repository:{}:{actions}", r.repository), &r.registry).map_err(|e| match e {
-                    Error::Status { url, status, body } if url.is_empty() => Error::Status { url: r.api_base(), status, body },
-                    e => e,
-                })?;
+                let (answer, ttl) = self
+                    .answer(
+                        &challenge,
+                        &format!("repository:{}:{actions}", r.repository),
+                        &r.registry,
+                    )
+                    .map_err(|e| match e {
+                        Error::Status { url, status, body } if url.is_empty() => Error::Status {
+                            url: r.api_base(),
+                            status,
+                            body,
+                        },
+                        e => e,
+                    })?;
                 if let Some(c) = without_scope(&challenge) {
-                    CHALLENGES.lock().unwrap_or_else(|e| e.into_inner()).insert(r.registry.clone(), c);
+                    CHALLENGES
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(r.registry.clone(), c);
                 }
                 Self::remember_token(key.clone(), answer, ttl);
                 continue;
@@ -802,31 +1054,60 @@ impl Client {
             resp = Some(rsp);
             break;
         }
-        resp.ok_or_else(|| Error::Status { url: r.api_base(), status: 401, body: "unauthorized after token refresh".into() })
+        resp.ok_or_else(|| Error::Status {
+            url: r.api_base(),
+            status: 401,
+            body: "unauthorized after token refresh".into(),
+        })
     }
 
     /// The `Authorization` header that answers a `WWW-Authenticate` challenge
     /// from `registry`, and how long it lasts.
-    fn answer(&self, challenge: &str, default_scope: &str, registry: &str) -> Result<(String, Duration), Error> {
-        if challenge.get(..5).is_some_and(|s| s.eq_ignore_ascii_case("basic")) {
-            let basic = self.credentials.as_ref().and_then(Credentials::basic).ok_or_else(|| Error::Status {
-                url: String::new(),
-                status: 401,
-                body: "unauthorized: authentication required (docker login)".into(),
-            })?;
+    fn answer(
+        &self,
+        challenge: &str,
+        default_scope: &str,
+        registry: &str,
+    ) -> Result<(String, Duration), Error> {
+        if challenge
+            .get(..5)
+            .is_some_and(|s| s.eq_ignore_ascii_case("basic"))
+        {
+            let basic = self
+                .credentials
+                .as_ref()
+                .and_then(Credentials::basic)
+                .ok_or_else(|| Error::Status {
+                    url: String::new(),
+                    status: 401,
+                    body: "unauthorized: authentication required (docker login)".into(),
+                })?;
             return Ok((basic, Duration::from_secs(300)));
         }
         let params = parse_challenge(challenge);
-        let scope = params.get("scope").cloned().unwrap_or_else(|| default_scope.to_owned());
+        let scope = params
+            .get("scope")
+            .cloned()
+            .unwrap_or_else(|| default_scope.to_owned());
         let (token, ttl) = self.token(&params, Some(&scope), registry)?;
         Ok((format!("Bearer {token}"), ttl))
     }
 
     /// A bearer token from the challenge's realm, as the logged-in user if
     /// any, and how long it lasts.
-    fn token(&self, params: &HashMap<String, String>, scope: Option<&str>, registry: &str) -> Result<(String, Duration), Error> {
-        let realm = params.get("realm").ok_or_else(|| Error::Http("registry sent no token realm".into()))?;
-        let service = params.get("service").map(String::as_str).unwrap_or_default();
+    fn token(
+        &self,
+        params: &HashMap<String, String>,
+        scope: Option<&str>,
+        registry: &str,
+    ) -> Result<(String, Duration), Error> {
+        let realm = params
+            .get("realm")
+            .ok_or_else(|| Error::Http("registry sent no token realm".into()))?;
+        let service = params
+            .get("service")
+            .map(String::as_str)
+            .unwrap_or_default();
         // The registry names the realm, so a registry (or whoever answers for
         // it) could send the credentials anywhere, in the clear: only an https
         // realm gets them, or a loopback realm for a loopback registry.
@@ -838,7 +1119,12 @@ impl Client {
         let creds = self.credentials.as_ref().filter(|_| secure);
         let mut resp = if let Some(c) = creds.filter(|c| !c.identity_token.is_empty()) {
             // An identity token is an OAuth refresh token.
-            let mut form = vec![("grant_type", "refresh_token"), ("refresh_token", c.identity_token.as_str()), ("service", service), ("client_id", "kiri")];
+            let mut form = vec![
+                ("grant_type", "refresh_token"),
+                ("refresh_token", c.identity_token.as_str()),
+                ("service", service),
+                ("client_id", "kiri"),
+            ];
             if let Some(s) = scope {
                 form.push(("scope", s));
             }
@@ -861,25 +1147,50 @@ impl Client {
         };
         let status = resp.status().as_u16();
         if status == 401 || status == 403 {
-            return Err(Error::Status { url: realm.clone(), status, body: "unauthorized: incorrect username or password".into() });
+            return Err(Error::Status {
+                url: realm.clone(),
+                status,
+                body: "unauthorized: incorrect username or password".into(),
+            });
         }
         if status != 200 {
-            return Err(Error::Status { url: realm.clone(), status, body: String::new() });
+            return Err(Error::Status {
+                url: realm.clone(),
+                status,
+                body: String::new(),
+            });
         }
-        let t: Token = serde_json::from_slice(&resp.body_mut().read_to_vec()?).map_err(|e| Error::Http(e.to_string()))?;
+        let t: Token = serde_json::from_slice(&resp.body_mut().read_to_vec()?)
+            .map_err(|e| Error::Http(e.to_string()))?;
         // The distribution spec: 60 seconds when the server does not say.
         let ttl = Duration::from_secs(t.expires_in.filter(|&s| s > 0).unwrap_or(60));
-        Ok((t.token.or(t.access_token).ok_or_else(|| Error::Http("token response had no token".into()))?, ttl))
+        Ok((
+            t.token
+                .or(t.access_token)
+                .ok_or_else(|| Error::Http("token response had no token".into()))?,
+            ttl,
+        ))
     }
 
     /// `docker search`, against Docker Hub's search API.
     pub fn search(&self, term: &str, limit: u32) -> Result<Vec<serde_json::Value>, Error> {
         let url = "https://index.docker.io/v1/search";
-        let mut resp = self.agent.get(url).query("q", term).query("n", &limit.to_string()).call()?;
+        let mut resp = self
+            .agent
+            .get(url)
+            .query("q", term)
+            .query("n", &limit.to_string())
+            .call()?;
         if resp.status().as_u16() != 200 {
-            return Err(Error::Status { url: url.to_owned(), status: resp.status().as_u16(), body: String::new() });
+            return Err(Error::Status {
+                url: url.to_owned(),
+                status: resp.status().as_u16(),
+                body: String::new(),
+            });
         }
-        let body: serde_json::Value = serde_json::from_slice(&resp.body_mut().with_config().limit(4 << 20).read_to_vec()?).map_err(|e| Error::Http(e.to_string()))?;
+        let body: serde_json::Value =
+            serde_json::from_slice(&resp.body_mut().with_config().limit(4 << 20).read_to_vec()?)
+                .map_err(|e| Error::Http(e.to_string()))?;
         Ok(body["results"].as_array().cloned().unwrap_or_default())
     }
 
@@ -887,14 +1198,34 @@ impl Client {
     /// `postgres` gives `latest`, `17-alpine`, `17`… Hub's own API, since
     /// the registry's tag list is unordered and has no dates.
     pub fn hub_tags(&self, repo: &str, limit: u32) -> Result<Vec<String>, Error> {
-        let repo = if repo.contains('/') { repo.to_owned() } else { format!("library/{repo}") };
+        let repo = if repo.contains('/') {
+            repo.to_owned()
+        } else {
+            format!("library/{repo}")
+        };
         let url = format!("https://hub.docker.com/v2/repositories/{repo}/tags");
-        let mut resp = self.agent.get(&url).query("page_size", &limit.to_string()).query("ordering", "last_updated").call()?;
+        let mut resp = self
+            .agent
+            .get(&url)
+            .query("page_size", &limit.to_string())
+            .query("ordering", "last_updated")
+            .call()?;
         if resp.status().as_u16() != 200 {
-            return Err(Error::Status { url, status: resp.status().as_u16(), body: String::new() });
+            return Err(Error::Status {
+                url,
+                status: resp.status().as_u16(),
+                body: String::new(),
+            });
         }
-        let body: serde_json::Value = serde_json::from_slice(&resp.body_mut().with_config().limit(4 << 20).read_to_vec()?).map_err(|e| Error::Http(e.to_string()))?;
-        Ok(body["results"].as_array().into_iter().flatten().filter_map(|t| t["name"].as_str().map(str::to_owned)).collect())
+        let body: serde_json::Value =
+            serde_json::from_slice(&resp.body_mut().with_config().limit(4 << 20).read_to_vec()?)
+                .map_err(|e| Error::Http(e.to_string()))?;
+        Ok(body["results"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|t| t["name"].as_str().map(str::to_owned))
+            .collect())
     }
 
     /// A repository's tags from the registry itself (`/v2/<repo>/tags/list`),
@@ -910,9 +1241,25 @@ impl Client {
         let mut tags: Vec<String> = Vec::new();
         for _ in 0..TAG_PAGES {
             let mut resp = self.get(r, &url, None)?;
-            let next = resp.headers().get("link").and_then(|v| v.to_str().ok()).and_then(next_link).map(str::to_owned);
-            let body: serde_json::Value = serde_json::from_slice(&resp.body_mut().with_config().limit(4 << 20).read_to_vec()?).map_err(|e| Error::Http(e.to_string()))?;
-            tags.extend(body["tags"].as_array().into_iter().flatten().filter_map(|t| t.as_str()).filter(|t| !t.starts_with("sha256-")).map(str::to_owned));
+            let next = resp
+                .headers()
+                .get("link")
+                .and_then(|v| v.to_str().ok())
+                .and_then(next_link)
+                .map(str::to_owned);
+            let body: serde_json::Value = serde_json::from_slice(
+                &resp.body_mut().with_config().limit(4 << 20).read_to_vec()?,
+            )
+            .map_err(|e| Error::Http(e.to_string()))?;
+            tags.extend(
+                body["tags"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|t| t.as_str())
+                    .filter(|t| !t.starts_with("sha256-"))
+                    .map(str::to_owned),
+            );
             // Only a next page on the same registry is followed.
             match next {
                 Some(n) if n.starts_with("/v2/") => url = format!("{base}{n}"),
@@ -957,38 +1304,81 @@ impl Client {
     /// `docker login`: checks the credentials against the registry at
     /// `server` (`https://index.docker.io/v1/`, `ghcr.io`, `localhost:5000`).
     pub fn login(&self, server: &str) -> Result<(), Error> {
-        let host = server.trim_start_matches("https://").trim_start_matches("http://").split('/').next().unwrap_or_default();
-        let host = if host.is_empty() || host == "index.docker.io" || host == "docker.io" { "registry-1.docker.io" } else { host };
-        let base = format!("{}://{host}", if crate::reference::is_local(host) { "http" } else { "https" });
+        let host = server
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .split('/')
+            .next()
+            .unwrap_or_default();
+        let host = if host.is_empty() || host == "index.docker.io" || host == "docker.io" {
+            "registry-1.docker.io"
+        } else {
+            host
+        };
+        let base = format!(
+            "{}://{host}",
+            if crate::reference::is_local(host) {
+                "http"
+            } else {
+                "https"
+            }
+        );
         let url = format!("{base}/v2/");
         let resp = self.agent.get(&url).call()?;
         match resp.status().as_u16() {
             200 => Ok(()),
             401 => {
-                let challenge = resp.headers().get("www-authenticate").and_then(|v| v.to_str().ok()).unwrap_or_default().to_owned();
-                if challenge.get(..5).is_some_and(|s| s.eq_ignore_ascii_case("basic")) {
+                let challenge = resp
+                    .headers()
+                    .get("www-authenticate")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default()
+                    .to_owned();
+                if challenge
+                    .get(..5)
+                    .is_some_and(|s| s.eq_ignore_ascii_case("basic"))
+                {
                     let (auth, _) = self.answer(&challenge, "", host)?;
                     let again = self.agent.get(&url).header("Authorization", &auth).call()?;
                     return match again.status().as_u16() {
                         200 => Ok(()),
-                        s => Err(Error::Status { url, status: s, body: "unauthorized: incorrect username or password".into() }),
+                        s => Err(Error::Status {
+                            url,
+                            status: s,
+                            body: "unauthorized: incorrect username or password".into(),
+                        }),
                     };
                 }
                 // A token for no particular repository proves the password.
-                self.token(&parse_challenge(&challenge), None, host).map(|_| ())
+                self.token(&parse_challenge(&challenge), None, host)
+                    .map(|_| ())
             }
-            s => Err(Error::Status { url, status: s, body: String::new() }),
+            s => Err(Error::Status {
+                url,
+                status: s,
+                body: String::new(),
+            }),
         }
     }
 
     /// Uploads `image` as `target` (`docker push`): blobs the registry
     /// lacks, then a manifest. Returns the manifest's digest and size.
-    pub fn push(&self, store: &Store, image: &Image, target: &Reference, progress: &dyn Fn(PushProgress)) -> Result<(String, u64), Error> {
+    pub fn push(
+        &self,
+        store: &Store,
+        image: &Image,
+        target: &Reference,
+        progress: &dyn Fn(PushProgress),
+    ) -> Result<(String, u64), Error> {
         let base = target.api_base();
         let repo = &target.repository;
         let config_size = std::fs::metadata(store.blob_path(&image.config_digest)?)?.len();
-        let blobs: Vec<(String, u64)> =
-            image.layers.iter().map(|l| (l.digest.clone(), l.size)).chain(std::iter::once((image.config_digest.clone(), config_size))).collect();
+        let blobs: Vec<(String, u64)> = image
+            .layers
+            .iter()
+            .map(|l| (l.digest.clone(), l.size))
+            .chain(std::iter::once((image.config_digest.clone(), config_size)))
+            .collect();
         for (digest, size) in &blobs {
             let url = format!("{base}/v2/{repo}/blobs/{digest}");
             let head = self.authed(target, "pull,push", |auth| {
@@ -999,10 +1389,15 @@ impl Client {
                 req.call()
             })?;
             if head.status().as_u16() == 200 {
-                progress(PushProgress::Exists { digest: digest.clone() });
+                progress(PushProgress::Exists {
+                    digest: digest.clone(),
+                });
                 continue;
             }
-            progress(PushProgress::Uploading { digest: digest.clone(), size: *size });
+            progress(PushProgress::Uploading {
+                digest: digest.clone(),
+                size: *size,
+            });
             // Start an upload session, then send the blob in one PUT.
             let start_url = format!("{base}/v2/{repo}/blobs/uploads/");
             let started = self.authed(target, "pull,push", |auth| {
@@ -1013,20 +1408,38 @@ impl Client {
                 req.send_empty()
             })?;
             let started = ok(started, &start_url)?;
-            let location = started.headers().get("location").and_then(|v| v.to_str().ok()).unwrap_or_default().to_owned();
-            let location = if location.starts_with('/') { format!("{base}{location}") } else { location };
-            let put_url = format!("{location}{}digest={digest}", if location.contains('?') { '&' } else { '?' });
+            let location = started
+                .headers()
+                .get("location")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_owned();
+            let location = if location.starts_with('/') {
+                format!("{base}{location}")
+            } else {
+                location
+            };
+            let put_url = format!(
+                "{location}{}digest={digest}",
+                if location.contains('?') { '&' } else { '?' }
+            );
             let path = store.blob_path(digest)?;
             let put = self.authed(target, "pull,push", |auth| {
                 let mut f = std::fs::File::open(&path).map_err(ureq::Error::Io)?;
-                let mut req = self.agent.put(&put_url).header("Content-Type", "application/octet-stream").header("Content-Length", &size.to_string());
+                let mut req = self
+                    .agent
+                    .put(&put_url)
+                    .header("Content-Type", "application/octet-stream")
+                    .header("Content-Length", &size.to_string());
                 if let Some(a) = auth {
                     req = req.header("Authorization", a);
                 }
                 req.send(ureq::SendBody::from_reader(&mut f))
             })?;
             ok(put, &put_url)?;
-            progress(PushProgress::Pushed { digest: digest.clone() });
+            progress(PushProgress::Pushed {
+                digest: digest.clone(),
+            });
         }
         let manifest = serde_json::json!({
             "schemaVersion": 2,
@@ -1054,7 +1467,11 @@ fn parse_challenge(header: &str) -> HashMap<String, String> {
     let mut out = HashMap::new();
     let mut s = rest;
     while let Some(eq) = s.find('=') {
-        let key = s[..eq].trim().trim_start_matches(',').trim().to_ascii_lowercase();
+        let key = s[..eq]
+            .trim()
+            .trim_start_matches(',')
+            .trim()
+            .to_ascii_lowercase();
         let after = &s[eq + 1..];
         let (value, next) = if let Some(quoted) = after.strip_prefix('"') {
             match quoted.find('"') {
@@ -1164,12 +1581,23 @@ fn distribution_json(bytes: &[u8], content_type: &str, manifest: &serde_json::Va
 /// `docker pull` does, not as the raw registry reply; a wrong password stays as it is.
 fn not_found(e: Error, r: &Reference) -> Error {
     match e {
-        Error::Status { status: 401 | 403, ref body, .. } if !body.contains("incorrect username or password") => {
+        Error::Status {
+            status: 401 | 403,
+            ref body,
+            ..
+        } if !body.contains("incorrect username or password") => {
             let short = r.short();
-            let repo = short.rsplit_once(if r.is_digest() { '@' } else { ':' }).map_or(short.as_str(), |(n, _)| n);
-            Error::NotFound(format!("pull access denied for {repo}, repository does not exist or may require 'docker login'"))
+            let repo = short
+                .rsplit_once(if r.is_digest() { '@' } else { ':' })
+                .map_or(short.as_str(), |(n, _)| n);
+            Error::NotFound(format!(
+                "pull access denied for {repo}, repository does not exist or may require 'docker login'"
+            ))
         }
-        Error::Status { status: 404, .. } => Error::NotFound(format!("manifest for {} not found: manifest unknown", r.short())),
+        Error::Status { status: 404, .. } => Error::NotFound(format!(
+            "manifest for {} not found: manifest unknown",
+            r.short()
+        )),
         e => e,
     }
 }
@@ -1181,13 +1609,48 @@ mod tests {
     #[test]
     fn a_missing_image_reads_as_docker_says_it() {
         let r = Reference::parse("gall").unwrap();
-        let denied = Error::Status { url: "https://registry-1.docker.io/v2/library/gall/manifests/latest".into(), status: 401, body: r#"{"errors":[{"code":"UNAUTHORIZED"}]}"#.into() };
-        assert_eq!(not_found(denied, &r).to_string(), "pull access denied for gall, repository does not exist or may require 'docker login'");
+        let denied = Error::Status {
+            url: "https://registry-1.docker.io/v2/library/gall/manifests/latest".into(),
+            status: 401,
+            body: r#"{"errors":[{"code":"UNAUTHORIZED"}]}"#.into(),
+        };
+        assert_eq!(
+            not_found(denied, &r).to_string(),
+            "pull access denied for gall, repository does not exist or may require 'docker login'"
+        );
         let tag = Reference::parse("alpine:nope").unwrap();
-        assert_eq!(not_found(Error::Status { url: String::new(), status: 404, body: String::new() }, &tag).to_string(), "manifest for alpine:nope not found: manifest unknown");
-        let wrong = Error::Status { url: String::new(), status: 401, body: "unauthorized: incorrect username or password".into() };
-        assert!(matches!(not_found(wrong, &r), Error::Status { status: 401, .. }));
-        assert!(matches!(not_found(Error::Status { url: String::new(), status: 500, body: String::new() }, &r), Error::Status { status: 500, .. }));
+        assert_eq!(
+            not_found(
+                Error::Status {
+                    url: String::new(),
+                    status: 404,
+                    body: String::new()
+                },
+                &tag
+            )
+            .to_string(),
+            "manifest for alpine:nope not found: manifest unknown"
+        );
+        let wrong = Error::Status {
+            url: String::new(),
+            status: 401,
+            body: "unauthorized: incorrect username or password".into(),
+        };
+        assert!(matches!(
+            not_found(wrong, &r),
+            Error::Status { status: 401, .. }
+        ));
+        assert!(matches!(
+            not_found(
+                Error::Status {
+                    url: String::new(),
+                    status: 500,
+                    body: String::new()
+                },
+                &r
+            ),
+            Error::Status { status: 500, .. }
+        ));
     }
 
     #[test]
@@ -1285,45 +1748,101 @@ mod tests {
     fn a_remembered_challenge_drops_the_scope() {
         let hub = r#"Bearer realm="https://auth.docker.io/token",service="registry.docker.io",scope="repository:library/alpine:pull""#;
         assert_eq!(without_scope(hub).as_deref(), Some(DOCKER_HUB_CHALLENGE));
-        assert_eq!(without_scope(r#"bearer realm="https://ghcr.io/token""#).as_deref(), Some(r#"Bearer realm="https://ghcr.io/token""#));
+        assert_eq!(
+            without_scope(r#"bearer realm="https://ghcr.io/token""#).as_deref(),
+            Some(r#"Bearer realm="https://ghcr.io/token""#)
+        );
         assert_eq!(without_scope(r#"Basic realm="registry""#), None);
         assert_eq!(without_scope(r#"Bearer service="x""#), None);
     }
 
     #[test]
     fn tokens_are_used_a_little_less_long_than_they_last() {
-        assert_eq!(token_lifetime(Duration::from_secs(300)), Duration::from_secs(270));
-        assert_eq!(token_lifetime(Duration::from_secs(60)), Duration::from_secs(54));
+        assert_eq!(
+            token_lifetime(Duration::from_secs(300)),
+            Duration::from_secs(270)
+        );
+        assert_eq!(
+            token_lifetime(Duration::from_secs(60)),
+            Duration::from_secs(54)
+        );
         // A hostile expires_in is clamped, and remembering it cannot panic.
-        assert_eq!(token_lifetime(Duration::from_secs(u64::MAX)), Duration::from_secs(3240));
+        assert_eq!(
+            token_lifetime(Duration::from_secs(u64::MAX)),
+            Duration::from_secs(3240)
+        );
         assert_eq!(token_lifetime(Duration::MAX), Duration::from_secs(3240));
-        Client::remember_token("sec-test".into(), "Bearer x".into(), Duration::from_secs(u64::MAX));
-        assert!(TOKENS.lock().unwrap().get("sec-test").is_some_and(|(_, until)| *until <= Instant::now() + MAX_TOKEN_TTL));
-        let t: Token = serde_json::from_str(r#"{"token":"a","expires_in":300,"issued_at":"2026-10-30T06:00:00Z"}"#).unwrap();
+        Client::remember_token(
+            "sec-test".into(),
+            "Bearer x".into(),
+            Duration::from_secs(u64::MAX),
+        );
+        assert!(
+            TOKENS
+                .lock()
+                .unwrap()
+                .get("sec-test")
+                .is_some_and(|(_, until)| *until <= Instant::now() + MAX_TOKEN_TTL)
+        );
+        let t: Token = serde_json::from_str(
+            r#"{"token":"a","expires_in":300,"issued_at":"2026-10-30T06:00:00Z"}"#,
+        )
+        .unwrap();
         assert_eq!(t.expires_in, Some(300));
     }
 
     #[test]
     fn tokens_are_kept_apart_by_who_asked() {
         let r = Reference::parse("alpine").unwrap();
-        let anon = Client { agent: shared_agent(), credentials: None };
-        let alice = Client { agent: shared_agent(), credentials: Some(Credentials { username: "alice".into(), password: "a".into(), ..Default::default() }) };
-        let other = Client { agent: shared_agent(), credentials: Some(Credentials { username: "alice".into(), password: "b".into(), ..Default::default() }) };
-        let keys = [anon.token_key(&r, "pull"), alice.token_key(&r, "pull"), other.token_key(&r, "pull"), alice.token_key(&r, "pull,push")];
+        let anon = Client {
+            agent: shared_agent(),
+            credentials: None,
+        };
+        let alice = Client {
+            agent: shared_agent(),
+            credentials: Some(Credentials {
+                username: "alice".into(),
+                password: "a".into(),
+                ..Default::default()
+            }),
+        };
+        let other = Client {
+            agent: shared_agent(),
+            credentials: Some(Credentials {
+                username: "alice".into(),
+                password: "b".into(),
+                ..Default::default()
+            }),
+        };
+        let keys = [
+            anon.token_key(&r, "pull"),
+            alice.token_key(&r, "pull"),
+            other.token_key(&r, "pull"),
+            alice.token_key(&r, "pull,push"),
+        ];
         for (i, a) in keys.iter().enumerate() {
             for b in &keys[i + 1..] {
                 assert_ne!(a, b);
             }
         }
-        assert!(!alice.token_key(&r, "pull").contains("alice"), "the key holds a fingerprint, not the name");
-        assert_eq!(anon.token_key(&r, "pull"), Client::new().token_key(&r, "pull"));
+        assert!(
+            !alice.token_key(&r, "pull").contains("alice"),
+            "the key holds a fingerprint, not the name"
+        );
+        assert_eq!(
+            anon.token_key(&r, "pull"),
+            Client::new().token_key(&r, "pull")
+        );
         // Cached manifests too: one fetched with credentials is not an
         // anonymous pull's, nor another account's.
         let d = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
         assert_ne!(anon.manifest_key(&r, d), alice.manifest_key(&r, d));
         assert_ne!(alice.manifest_key(&r, d), other.manifest_key(&r, d));
         assert_eq!(anon.manifest_key(&r, d), Client::new().manifest_key(&r, d));
-        assert_ne!(anon.manifest_key(&r, d), anon.manifest_key(&Reference::parse("busybox").unwrap(), d));
+        assert_ne!(
+            anon.manifest_key(&r, d),
+            anon.manifest_key(&Reference::parse("busybox").unwrap(), d)
+        );
     }
 
     #[test]
@@ -1345,7 +1864,10 @@ mod tests {
         assert!(c.get(&key).is_none());
         c.put(&key, &digest, body, OCI_MANIFEST);
         assert_eq!(c.get(&key), Some((body.to_vec(), OCI_MANIFEST.to_owned())));
-        assert!(c.get(&format!("docker.io/library/other@{digest}")).is_none());
+        assert!(
+            c.get(&format!("docker.io/library/other@{digest}"))
+                .is_none()
+        );
         c.put(&key, &digest, body, OCI_MANIFEST);
         assert_eq!(c.bytes, body.len());
         // Over the limit, it starts again rather than growing.
@@ -1358,8 +1880,14 @@ mod tests {
 
     #[test]
     fn credentials_only_use_https_or_a_loopback_realm() {
-        assert!(realm_is_secure("https://auth.example.com/token", "registry.example.com"));
-        assert!(realm_is_secure("http://127.0.0.1:5000/token", "localhost:5000"));
+        assert!(realm_is_secure(
+            "https://auth.example.com/token",
+            "registry.example.com"
+        ));
+        assert!(realm_is_secure(
+            "http://127.0.0.1:5000/token",
+            "localhost:5000"
+        ));
         assert!(realm_is_secure("http://[::1]:5000/token", "localhost:5000"));
         for (realm, registry) in [
             ("http://auth.example.com/token", "registry.example.com"),
@@ -1373,7 +1901,9 @@ mod tests {
 
     /// A registry on loopback serving one blob: `answer` gets each request's
     /// `Range` start (0 without one) and the connection, and writes the reply.
-    fn blob_server(answer: impl Fn(u64, &mut std::net::TcpStream) + Send + Sync + 'static) -> (String, std::thread::JoinHandle<Vec<u64>>) {
+    fn blob_server(
+        answer: impl Fn(u64, &mut std::net::TcpStream) + Send + Sync + 'static,
+    ) -> (String, std::thread::JoinHandle<Vec<u64>>) {
         let answer = std::sync::Arc::new(answer);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let host = listener.local_addr().unwrap().to_string();
@@ -1396,7 +1926,11 @@ mod tests {
                 if head.starts_with("quit") || head.is_empty() {
                     break;
                 }
-                let from = head.lines().find_map(|l| l.strip_prefix("range: bytes=")).and_then(|r| r.trim_end_matches('-').parse().ok()).unwrap_or(0);
+                let from = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("range: bytes="))
+                    .and_then(|r| r.trim_end_matches('-').parse().ok())
+                    .unwrap_or(0);
                 seen.push(from);
                 // Each on its own, so a stalled answer does not hold up the next.
                 let answer = answer.clone();
@@ -1412,9 +1946,18 @@ mod tests {
     }
 
     fn test_client() -> Client {
-        let cfg = ureq::Agent::config_builder().http_status_as_error(false).build();
-        let agent = ureq::Agent::with_parts(cfg, crate::connect::connector_with(Duration::from_millis(300)), ureq::unversioned::resolver::DefaultResolver::default());
-        Client { agent, credentials: None }
+        let cfg = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .build();
+        let agent = ureq::Agent::with_parts(
+            cfg,
+            crate::connect::connector_with(Duration::from_millis(300)),
+            ureq::unversioned::resolver::DefaultResolver::default(),
+        );
+        Client {
+            agent,
+            credentials: None,
+        }
     }
 
     fn blob() -> (Vec<u8>, String) {
@@ -1431,12 +1974,22 @@ mod tests {
         let (host, served) = blob_server(move |from, c| {
             if from == 0 {
                 // Half the blob, then silence with the connection open.
-                let _ = write!(c, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+                let _ = write!(
+                    c,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                );
                 let _ = c.write_all(&body[..half]);
                 std::thread::sleep(Duration::from_secs(2));
             } else {
                 let rest = &body[from as usize..];
-                let _ = write!(c, "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {from}-{}/{}\r\n\r\n", rest.len(), body.len() - 1, body.len());
+                let _ = write!(
+                    c,
+                    "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {from}-{}/{}\r\n\r\n",
+                    rest.len(),
+                    body.len() - 1,
+                    body.len()
+                );
                 let _ = c.write_all(rest);
             }
         });
@@ -1444,10 +1997,16 @@ mod tests {
         let store = Store::open(&root).unwrap();
         let r = Reference::parse(&format!("{host}/test/blob:1")).unwrap();
         let started = Instant::now();
-        let got = test_client().download(&store, &r, &digest, &|_| {}).unwrap();
+        let got = test_client()
+            .download(&store, &r, &digest, &|_| {})
+            .unwrap();
         assert_eq!(got, data.len() as u64);
         assert!(store.has_blob(&digest, data.len() as u64));
-        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
         quit(&host);
         assert_eq!(served.join().unwrap(), [0, half as u64]);
         let _ = std::fs::remove_dir_all(&root);
@@ -1459,7 +2018,14 @@ mod tests {
         let body = data.clone();
         let tries = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (host, served) = blob_server(move |_, c| {
-            let _ = write!(c, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+            let _ = write!(
+                c,
+                "HTTP/1.1 200 OK
+Content-Length: {}
+
+",
+                body.len()
+            );
             // The first connection drops a third of the way in.
             if tries.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
                 let _ = c.write_all(&body[..body.len() / 3]);
@@ -1471,7 +2037,12 @@ mod tests {
         let root = std::env::temp_dir().join(format!("kiri-norange-test-{}", std::process::id()));
         let store = Store::open(&root).unwrap();
         let r = Reference::parse(&format!("{host}/test/blob:1")).unwrap();
-        assert_eq!(test_client().download(&store, &r, &digest, &|_| {}).unwrap(), data.len() as u64);
+        assert_eq!(
+            test_client()
+                .download(&store, &r, &digest, &|_| {})
+                .unwrap(),
+            data.len() as u64
+        );
         assert!(store.has_blob(&digest, data.len() as u64));
         quit(&host);
         let seen = served.join().unwrap();
@@ -1484,16 +2055,76 @@ mod tests {
     fn a_blob_that_never_arrives_gives_up() {
         let (_, digest) = blob();
         let (host, served) = blob_server(|_, c| {
-            let _ = write!(c, "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n");
+            let _ = write!(
+                c,
+                "HTTP/1.1 200 OK
+Content-Length: 10
+
+"
+            );
             std::thread::sleep(Duration::from_millis(400));
         });
         let root = std::env::temp_dir().join(format!("kiri-dead-test-{}", std::process::id()));
         let store = Store::open(&root).unwrap();
         let r = Reference::parse(&format!("{host}/test/blob:1")).unwrap();
-        assert!(test_client().download(&store, &r, &digest, &|_| {}).is_err());
+        assert!(
+            test_client()
+                .download(&store, &r, &digest, &|_| {})
+                .is_err()
+        );
         quit(&host);
         assert_eq!(served.join().unwrap().len(), BLOB_TRIES as usize);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_cancellable_download_keeps_its_read_budget_for_slow_data() {
+        let (data, digest) = blob();
+        let body = data.clone();
+        let (host, served) = blob_server(move |_, c| {
+            // Both response headers and body data may take longer than a
+            // cancellation poll. Neither is a stall within the 2 s budget.
+            std::thread::sleep(Duration::from_millis(400));
+            let _ = write!(
+                c,
+                "HTTP/1.1 200 OK
+Content-Length: {}
+
+",
+                body.len()
+            );
+            let _ = c.write_all(&body[..body.len() / 2]);
+            std::thread::sleep(Duration::from_millis(400));
+            let _ = c.write_all(&body[body.len() / 2..]);
+        });
+        let root =
+            std::env::temp_dir().join(format!("kiri-slow-cancel-test-{}", std::process::id()));
+        let store = Store::open(&root).unwrap();
+        let reference = Reference::parse(&format!("{host}/test/blob:1")).unwrap();
+        let config = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .build();
+        let agent = ureq::Agent::with_parts(
+            config,
+            crate::connect::connector_with(Duration::from_secs(2)),
+            ureq::unversioned::resolver::DefaultResolver::default(),
+        );
+        let client = Client {
+            agent,
+            credentials: None,
+        };
+        let cancel = Cancel::new();
+        let result = {
+            let _on = cancel.enter();
+            client.download_with(&store, &reference, &digest, u64::MAX, &|_| {}, &cancel)
+        };
+        quit(&host);
+        let requests = served.join().unwrap();
+        let saved = store.has_blob(&digest, data.len() as u64);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(result.unwrap(), data.len() as u64);
+        assert!(saved);
+        assert_eq!(requests, [0], "slow data must not start a retry");
     }
 
     #[test]
@@ -1502,7 +2133,14 @@ mod tests {
         let body = data.clone();
         let (host, served) = blob_server(move |_, c| {
             // Half the blob, then silence with the connection open.
-            let _ = write!(c, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+            let _ = write!(
+                c,
+                "HTTP/1.1 200 OK
+Content-Length: {}
+
+",
+                body.len()
+            );
             let _ = c.write_all(&body[..body.len() / 2]);
             std::thread::sleep(Duration::from_secs(5));
         });
@@ -1510,9 +2148,18 @@ mod tests {
         let store = Store::open(&root).unwrap();
         let r = Reference::parse(&format!("{host}/test/blob:1")).unwrap();
         // Stalls only give up after 10 s: the cancel must not wait for that.
-        let cfg = ureq::Agent::config_builder().http_status_as_error(false).build();
-        let agent = ureq::Agent::with_parts(cfg, crate::connect::connector_with(Duration::from_secs(10)), ureq::unversioned::resolver::DefaultResolver::default());
-        let client = Client { agent, credentials: None };
+        let cfg = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .build();
+        let agent = ureq::Agent::with_parts(
+            cfg,
+            crate::connect::connector_with(Duration::from_secs(10)),
+            ureq::unversioned::resolver::DefaultResolver::default(),
+        );
+        let client = Client {
+            agent,
+            credentials: None,
+        };
         let cancel = Cancel::new();
         let c = cancel.clone();
         std::thread::spawn(move || {
@@ -1525,9 +2172,17 @@ mod tests {
             client.download_with(&store, &r, &digest, u64::MAX, &|_| {}, &cancel)
         };
         assert!(matches!(result, Err(Error::Cancelled)), "{result:?}");
-        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
         assert!(!store.has_blob(&digest, data.len() as u64));
-        assert_eq!(std::fs::read_dir(root.join("tmp")).unwrap().count(), 0, "the partial blob is removed");
+        assert_eq!(
+            std::fs::read_dir(root.join("tmp")).unwrap().count(),
+            0,
+            "the partial blob is removed"
+        );
         quit(&host);
         assert_eq!(served.join().unwrap(), [0]);
         let _ = std::fs::remove_dir_all(&root);
@@ -1535,24 +2190,50 @@ mod tests {
 
     #[test]
     fn the_next_page_of_tags_comes_from_the_link_header() {
-        assert_eq!(next_link(r#"</v2/o/r/tags/list?last=1.9&n=1000>; rel="next""#), Some("/v2/o/r/tags/list?last=1.9&n=1000"));
-        assert_eq!(next_link(r#"<https://elsewhere.example/x>; rel="prev""#), None);
+        assert_eq!(
+            next_link(r#"</v2/o/r/tags/list?last=1.9&n=1000>; rel="next""#),
+            Some("/v2/o/r/tags/list?last=1.9&n=1000")
+        );
+        assert_eq!(
+            next_link(r#"<https://elsewhere.example/x>; rel="prev""#),
+            None
+        );
     }
 
     #[test]
     fn registry_tags_are_newest_version_first() {
-        let mut tags = ["1.9", "1.10", "1.2-rc1", "latest", "1.2", "1.2.1", "main"].map(String::from).to_vec();
+        let mut tags = ["1.9", "1.10", "1.2-rc1", "latest", "1.2", "1.2.1", "main"]
+            .map(String::from)
+            .to_vec();
         tags.sort_by(|a, b| version_order(b, a));
-        assert_eq!(tags, ["1.10", "1.9", "1.2.1", "1.2", "1.2-rc1", "main", "latest"]);
+        assert_eq!(
+            tags,
+            ["1.10", "1.9", "1.2.1", "1.2", "1.2-rc1", "main", "latest"]
+        );
     }
 
     #[test]
     fn transient_failures_are_the_network_and_5xx() {
-        assert!(transient(&Error::Io(io::Error::other(ureq::Error::Timeout(ureq::Timeout::RecvBody)))));
+        assert!(transient(&Error::Io(io::Error::other(
+            ureq::Error::Timeout(ureq::Timeout::RecvBody)
+        ))));
         assert!(transient(&Error::Io(io::ErrorKind::ConnectionReset.into())));
-        assert!(transient(&Error::Status { url: String::new(), status: 503, body: String::new() }));
-        assert!(!transient(&Error::Status { url: String::new(), status: 404, body: String::new() }));
-        assert!(!transient(&Error::Io(io::Error::new(io::ErrorKind::InvalidData, "digest mismatch"))));
-        assert!(!transient(&Error::Io(io::Error::other(ureq::Error::BodyExceedsLimit(10)))));
+        assert!(transient(&Error::Status {
+            url: String::new(),
+            status: 503,
+            body: String::new()
+        }));
+        assert!(!transient(&Error::Status {
+            url: String::new(),
+            status: 404,
+            body: String::new()
+        }));
+        assert!(!transient(&Error::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "digest mismatch"
+        ))));
+        assert!(!transient(&Error::Io(io::Error::other(
+            ureq::Error::BodyExceedsLimit(10)
+        ))));
     }
 }

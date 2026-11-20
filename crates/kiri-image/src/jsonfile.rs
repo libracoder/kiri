@@ -60,7 +60,15 @@ pub fn replace(path: &Path, bytes: &[u8], durable: Durable) -> io::Result<()> {
 /// folder, so the rename itself is on disk. Nothing to do if there is no
 /// file (yet).
 pub fn sync(path: &Path) -> io::Result<()> {
-    match File::open(path) {
+    // Windows refuses FlushFileBuffers on a read-only handle (a Linux fsync
+    // of one is fine), so ask for write access and fall back for a file the
+    // reader may not write.
+    let opened = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .or_else(|e| if e.kind() == io::ErrorKind::PermissionDenied { File::open(path) } else { Err(e) });
+    match opened {
         Ok(f) => f.sync_all()?,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e),
