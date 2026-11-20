@@ -1093,6 +1093,16 @@ t disconnect "no-eth1" bash -c "$D network disconnect nb multi && ($D exec multi
 t disconnect-dns-gone "bad address" $D run --rm --network nb alpine wget -qO- -T 2 http://web2
 t compose-multi-net "PONG" bash -c "d=\$(mktemp -d); printf 'services:\n  db:\n    image: redis:7-alpine\n    networks: [back]\n  app:\n    image: redis:7-alpine\n    command: sh -c \"sleep 1; redis-cli -h db ping; sleep 30\"\n    networks: [front, back]\nnetworks:\n  front: {}\n  back: {}\n' > \$d/compose.yaml; cd \$d && $D compose -p kirinet up -d >/dev/null 2>&1; sleep 3; $D compose -p kirinet logs app; $D compose -p kirinet down >/dev/null 2>&1; rm -rf \$d"
 $D rm -f multi >/dev/null; $D network rm na nb >/dev/null
+# A rename has to replace the guest's DNS names too: the new name resolves
+# and the old one stops, as with Docker's embedded DNS.
+$D network create rndns >/dev/null
+$D run -d --name rndns-old --network rndns --network-alias rndns-alias alpine sleep 300 >/dev/null; sleep 0.2
+t rename-dns-before "172." $D run --rm --network rndns alpine getent hosts rndns-old
+$D rename rndns-old rndns-new
+t rename-dns-new "172." $D run --rm --network rndns alpine getent hosts rndns-new
+t rename-dns-alias "172." $D run --rm --network rndns alpine getent hosts rndns-alias
+t rename-dns-old-gone "OLD-NAME-STILL-RESOLVES" bash -c "$D run --rm --network rndns alpine sh -c 'getent hosts rndns-old || echo OLD-NAME-STILL-RESOLVES'"
+$D rm -f rndns-new >/dev/null; $D network rm rndns >/dev/null
 # Disconnecting leaves a gap in the eth numbers: each network keeps its own
 # interface, a later one takes the free number, and every address goes back.
 $D network create nc1 >/dev/null; $D network create nc2 >/dev/null; $D network create nc3 >/dev/null

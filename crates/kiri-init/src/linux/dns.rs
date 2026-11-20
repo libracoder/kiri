@@ -812,6 +812,23 @@ mod tests {
         assert!(dns.servers.is_empty() && dns.names.is_empty() && dns.names6.is_empty());
     }
 
+    /// The agent handles a rename by dropping every name registered for the
+    /// container's address and putting back the new set (aliases kept).
+    #[test]
+    fn renaming_replaces_names_but_keeps_aliases() {
+        let mut dns = Dns::default();
+        dns.servers.push(super::Server { bridges: vec!["kiri1".into()], sock: super::udp_socket().unwrap(), container: None });
+        let ip = [10, 5, 0, 2];
+        dns.register("kiri1", ["old", "keep-alias"].iter(), ip);
+        dns.unregister("kiri1", ip);
+        dns.register("kiri1", ["new", "keep-alias"].iter().copied(), ip);
+        let q = query("new", 1);
+        assert_eq!(answers(&dns.answer(0, &q).unwrap(), q.len()), [(1, ip.to_vec())]);
+        let q = query("keep-alias", 1);
+        assert_eq!(answers(&dns.answer(0, &q).unwrap(), q.len()), [(1, ip.to_vec())]);
+        assert!(dns.answer(0, &query("old", 1)).is_none());
+    }
+
     fn pending() -> Pending {
         Pending {
             sock: udp_socket().unwrap(),

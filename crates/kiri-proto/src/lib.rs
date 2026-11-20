@@ -41,8 +41,10 @@ pub const INPUT_WINDOW: usize = 4 << 20;
 /// run the container under the default filter instead of its profile. 6
 /// added `Started::starting` and `AwaitStart`: an older host would read a
 /// start still filling a new volume as started, and let an exec in before
-/// the container's root is in place.
-pub const PROTOCOL: u16 = 6;
+/// the container's root is in place. 7 added `DnsRename`, another no-reply
+/// message, for the same reason: an older agent's "unexpected" error would
+/// be read as the reply to the next request.
+pub const PROTOCOL: u16 = 7;
 
 // `Run` is the one big message and is built and read once per container.
 #[allow(clippy::large_enum_variant)]
@@ -188,6 +190,11 @@ pub enum Msg<'a> {
     /// or `Error` with no lease yet; an older agent answers `Error`.
     UplinkQuery,
     Uplink { ip: [u8; 4], gateway: [u8; 4] },
+    /// Host → guest: a container on `bridge` was renamed. Its old DNS names
+    /// are dropped and `names` registered to the same address. `ip6` is
+    /// either empty or 16 bytes. No reply, hence the protocol bump to 6:
+    /// an older agent's "unexpected" error would be read as the next reply.
+    DnsRename { bridge: &'a str, ip: [u8; 4], ip6: &'a [u8], names: StrList<'a> },
     /// Host → guest: a network was removed; delete its bridge, and with it
     /// the bridge's addresses and routes, its DNS server and, with the last
     /// IPv6 network, the IPv6 NAT table. No reply; an older agent ignores it.
@@ -717,6 +724,7 @@ mod kind {
     pub const USB_NODES: u16 = 77;
     pub const FS_EVENTS: u16 = 78;
     pub const AWAIT_START: u16 = 79;
+    pub const DNS_RENAME: u16 = 80;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -782,6 +790,17 @@ pub fn encode_net_attach<S: AsRef<str>>(out: &mut Vec<u8>, id: &str, ifname: &st
         StrList::put::<&str>(o, &[]);
         StrList::put(o, dns_names);
         StrList::put(o, opts);
+    });
+}
+
+/// Encodes a `DnsRename` frame from the sender's slices.
+pub fn encode_dns_rename<S: AsRef<str>>(out: &mut Vec<u8>, bridge: &str, ip: [u8; 4], ip6: Option<[u8; 16]>, names: &[S]) {
+    frame(out, kind::DNS_RENAME, |o| {
+        put_str(o, bridge);
+        o.extend_from_slice(&ip);
+        let ip6 = ip6.map(|a| a.to_vec()).unwrap_or_default();
+        put_bytes(o, &ip6);
+        StrList::put(o, names);
     });
 }
 
@@ -1025,6 +1044,13 @@ impl Msg<'_> {
             Msg::MemoryPressure => frame(out, kind::MEMORY_PRESSURE, |_| {}),
             Msg::RemoveVolume { name } => frame(out, kind::REMOVE_VOLUME, |o| put_str(o, name)),
             Msg::RemoveBridge { bridge } => frame(out, kind::REMOVE_BRIDGE, |o| put_str(o, bridge)),
+            Msg::DnsRename { bridge, ip, ip6, names } => frame(out, kind::DNS_RENAME, |o| {
+                put_str(o, bridge);
+                o.extend_from_slice(&ip);
+                put_bytes(o, ip6);
+                put_u32(o, names.count);
+                o.extend_from_slice(names.raw);
+            }),
             Msg::Copy(c) => frame(out, kind::COPY, |o| {
                 o.push(c.op);
                 put_str(o, c.id);
@@ -1319,6 +1345,12 @@ pub fn decode(frame: &[u8]) -> Result<Msg<'_>, DecodeError> {
         kind::MEMORY_PRESSURE => Msg::MemoryPressure,
         kind::REMOVE_VOLUME => Msg::RemoveVolume { name: r.str()? },
         kind::REMOVE_BRIDGE => Msg::RemoveBridge { bridge: r.str()? },
+        kind::DNS_RENAME => Msg::DnsRename {
+            bridge: r.str()?,
+            ip: r.take(4)?.try_into().map_err(|_| DecodeError::Truncated)?,
+            ip6: r.bytes()?,
+            names: r.list()?,
+        },
         kind::COPY => Msg::Copy(CopySpec { op: r.u8()?, id: r.str()?, path: r.str()?, flags: r.u32()?, layers: r.list()? }),
         kind::COPY_STAT => Msg::CopyStat { entry: read_entry(&mut r)?, link: r.str()? },
         kind::COPY_DONE => Msg::CopyDone,
@@ -1468,7 +1500,7 @@ mod tests {
         let mut buf = Vec::new();
         Msg::Hello(Hello { protocol: PROTOCOL, init_start_ns: 1, ready_ns: 2, mem_total_kib: 3, mem_available_kib: 4 }).encode(&mut buf);
         let Msg::Hello(h) = decode(&buf).unwrap() else { panic!() };
-        assert_eq!(h.protocol, 6);
+        assert_eq!(h.protocol, PROTOCOL);
     }
 
     #[test]
@@ -1527,6 +1559,20 @@ mod tests {
         assert_eq!(ids.iter().collect::<Vec<_>>(), ["sha256:aa"]);
         let mut again = Vec::new();
         Msg::RetainLayers(ids).encode(&mut again);
+        assert_eq!(buf, again);
+    }
+
+    #[test]
+    fn dns_rename_survives_encoding() {
+        let mut buf = Vec::new();
+        encode_dns_rename(&mut buf, "br0", [10, 5, 0, 2], Some([0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]), &["web", "alias"]);
+        let Msg::DnsRename { bridge, ip, ip6, names } = decode(&buf).unwrap() else { panic!("not a dns rename") };
+        assert_eq!(bridge, "br0");
+        assert_eq!(ip, [10, 5, 0, 2]);
+        assert_eq!(ip6.len(), 16);
+        assert_eq!(names.iter().collect::<Vec<_>>(), ["web", "alias"]);
+        let mut again = Vec::new();
+        Msg::DnsRename { bridge, ip, ip6, names }.encode(&mut again);
         assert_eq!(buf, again);
     }
 
