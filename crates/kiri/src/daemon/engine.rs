@@ -3508,7 +3508,8 @@ impl Engine {
         loop {
             match st.containers.get(&id) {
                 None => {
-                    let code = st.removed.iter().rev().find(|(r, _)| *r == id).map_or(0, |(_, c)| *c);
+                    // Its first exit is the real one: ids are never reused.
+                    let code = st.removed.iter().find(|(r, _)| *r == id).map_or(0, |(_, c)| *c);
                     return Ok(code);
                 }
                 Some(c) => match condition {
@@ -4033,8 +4034,12 @@ impl Engine {
         self.emit_container("destroy", &id, &[]);
         let mut st = self.lock();
         let removed = st.containers.remove(&id);
-        let code = removed.as_ref().map_or(0, |c| c.exit_code);
-        note_removed(&mut st, &id, code);
+        // A `--rm` container that exited while the kill above waited has
+        // removed itself and noted its code (137 when this kill ended it);
+        // noting it again, with no record to read, told its waiters 0.
+        if let Some(c) = &removed {
+            note_removed(&mut st, &id, c.exit_code);
+        }
         st.execs.retain(|_, e| e.container_id != id);
         drop(st);
         self.changed.notify_all();
@@ -6111,6 +6116,44 @@ mod start_wait_tests {
             drop(guard);
             let r = calling.join().unwrap_or_else(|_| panic!("{what} panicked"));
             assert!(matches!(r, Err(Error::NotFound(_))), "{what}: {r:?}");
+            drop(engine);
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// `docker rm -f` of a running `--rm` container: its exit, reported while
+    /// the rm waits for the kill, removes it and notes its code. The rm must
+    /// not note a second one (0, with no container left to read), or a
+    /// `docker run --rm` waiting on it exits 0, not 137. A code the container
+    /// exited with by itself as the kill landed (3) is kept the same way; a
+    /// container without `--rm` is removed by the rm, with its code.
+    #[test]
+    fn a_force_remove_keeps_the_exit_code_of_a_container_that_removed_itself() {
+        for (auto_remove, code) in [(true, 137), (true, 3), (false, 137)] {
+            let (engine, id, dir) = engine(&format!("rm-code-{auto_remove}-{code}"));
+            engine.lock().containers.get_mut(&id).unwrap().spec.auto_remove = auto_remove;
+            let waiters: Vec<_> = ["removed", "next-exit", "not-running"]
+                .into_iter()
+                .map(|cond| {
+                    let (engine, id) = (engine.clone(), id.clone());
+                    (cond, std::thread::spawn(move || engine.wait(&id, cond)))
+                })
+                .collect();
+            let removing = {
+                let (engine, id) = (engine.clone(), id.clone());
+                std::thread::spawn(move || engine.remove(&id, true, false))
+            };
+            // The rm now waits for the exit of what it killed.
+            std::thread::sleep(Duration::from_millis(150));
+            assert!(!removing.is_finished(), "the rm did not wait for the exit");
+            engine.on_event(Event::Exited { id: &id, code, oom: false });
+            let r = removing.join().unwrap();
+            assert!(r.is_ok(), "rm -f: {r:?}");
+            let notes: Vec<i32> = engine.lock().removed.iter().filter(|(r, _)| *r == id).map(|(_, c)| *c).collect();
+            assert_eq!(notes, [code], "--rm {auto_remove}: one removal, with its real exit code");
+            for (cond, w) in waiters {
+                assert_eq!(w.join().unwrap().unwrap(), code, "wait {cond}, --rm {auto_remove}");
+            }
             drop(engine);
             let _ = std::fs::remove_dir_all(dir);
         }
