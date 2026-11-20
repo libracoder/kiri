@@ -187,13 +187,15 @@ fn refresh_nat() -> io::Result<()> {
 /// DNS forwarder is (10.255.255.254, on `lo`). Containers on a bridge can't
 /// count on such a resolver: under WSL a third of the queries from a
 /// container's namespace go unanswered, while the host's own are fine. Their
-/// queries then go through the agent's resolver (127.0.0.11), which asks it
-/// from the host's side.
+/// queries then go through the agent's resolver, at the bridge's gateway
+/// (container.rs embedded_address), which asks it from the host's side.
 pub fn local_resolver(servers: &[[u8; 4]]) -> bool {
-    !servers.is_empty() && {
-        let local = local_addrs();
-        servers.iter().any(|s| local.contains(s))
-    }
+    !servers.is_empty() && local_resolver_among(servers, &local_addrs())
+}
+
+/// `local_resolver`, given this machine's addresses.
+pub fn local_resolver_among(servers: &[[u8; 4]], local: &[[u8; 4]]) -> bool {
+    servers.iter().any(|s| local.contains(s))
 }
 
 /// This machine's IPv4 addresses but loopback, what `fib daddr type local`

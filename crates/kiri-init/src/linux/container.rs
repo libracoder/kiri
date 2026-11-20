@@ -489,7 +489,7 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
     // Small, short-lived files: kept in memory (/run is tmpfs), not on the data disk.
     let etc_dir = PathBuf::from("/run/kiri").join(spec.id);
     let embedded_dns = embedded_dns(spec, net.upstream_dns, net.dns.relay);
-    let nameserver = embedded_dns.then(|| embedded_address(spec, net.dns.relay));
+    let nameserver = embedded_dns.then(|| embedded_address(spec));
     prepared.etc_files = write_etc_files(spec, &etc_dir, net.upstream_dns, nameserver).map_err(cleanup)?;
     prepared.mounts = parse_mounts(spec.mounts).map_err(cleanup)?;
     // A network namespace of its own gets Docker's two defaults: any port
@@ -1182,32 +1182,41 @@ fn write_etc_files(spec: &RunSpec<'_>, base: &std::path::Path, upstream: &[[u8; 
 /// at 127.0.0.11 is the only nameserver, as with Docker (it forwards to
 /// `--dns` servers); elsewhere `--dns` servers replace the VM's.
 /// `--dns-search` and `--dns-option` apply either way.
-/// Whether the container's DNS goes to the agent's resolver (127.0.0.11):
+/// Whether the container's DNS goes to the agent's resolver (see embedded_address):
 /// on a user network, as Docker's embedded DNS; and on the default bridge
 /// when the host's resolver is one of its own addresses (net::local_resolver)
 /// or, in the VM (`relay`), so that lookups the Mac's gateway resolver fails
 /// can go through the host (dns.rs), unless the container names its own
 /// servers (`--dns`).
 fn embedded_dns(spec: &RunSpec<'_>, upstream: &[[u8; 4]], relay: bool) -> bool {
+    embedded_dns_if(spec, || relay || net::local_resolver(upstream))
+}
+
+/// `embedded_dns`, with `through_agent` saying whether the default bridge's
+/// lookups go through the agent (asked only when it matters).
+fn embedded_dns_if(spec: &RunSpec<'_>, through_agent: impl FnOnce() -> bool) -> bool {
     if spec.flags & run_flags::DNS_GATEWAY != 0 {
         return true;
     }
     let bridged = !spec.net.bridge.is_empty()
         && spec.flags & (run_flags::NET_HOST | run_flags::NET_NONE) == 0
         && net_opts::values(spec.net.opts, net_opts::NETNS).next().is_none();
-    bridged && net_opts::values(spec.net.opts, net_opts::NAMESERVER).next().is_none() && (relay || net::local_resolver(upstream))
+    bridged && net_opts::values(spec.net.opts, net_opts::NAMESERVER).next().is_none() && through_agent()
 }
 
 /// The address a container that uses the agent's resolver names in its
 /// resolv.conf: 127.0.0.11 on a user network, as Docker's embedded DNS;
-/// on the default bridge in the VM, the bridge's gateway, where the agent
-/// answers too. Not a loopback address there, because what runs builds
-/// in a container takes loopback nameservers out of the copy it gives
-/// each step and puts Google's in their place (BuildKit does, for every
-/// step that isn't `--network=host`): those steps would ask 8.8.8.8, not
-/// the Mac's resolver, and VPN and company names would stop resolving.
-fn embedded_address(spec: &RunSpec<'_>, relay: bool) -> [u8; 4] {
-    if relay && spec.flags & run_flags::DNS_GATEWAY == 0 && spec.net.gateway != [0; 4] { spec.net.gateway } else { super::dns::EMBEDDED }
+/// on the default bridge (in the VM, and on a host whose resolver is one
+/// of its own addresses, as WSL's 10.255.255.254 on `lo`), the bridge's
+/// gateway, where the agent answers too. Not a loopback address there,
+/// because what runs builds in a container takes loopback nameservers out
+/// of the copy it gives each step and puts Google's in their place
+/// (BuildKit does, for every step that isn't `--network=host`): those
+/// steps would ask 8.8.8.8, not the host's resolver, and VPN and company
+/// names would stop resolving. Nor does the agent then hold anything in
+/// the container's namespace.
+fn embedded_address(spec: &RunSpec<'_>) -> [u8; 4] {
+    if spec.flags & run_flags::DNS_GATEWAY == 0 && spec.net.gateway != [0; 4] { spec.net.gateway } else { super::dns::EMBEDDED }
 }
 
 fn resolv_conf(spec: &RunSpec<'_>, upstream: &[[u8; 4]], embedded: Option<[u8; 4]>) -> String {
@@ -2941,11 +2950,32 @@ mod tests {
         spec_with(run_flags::NET_HOST, &[], &|s| assert!(!super::embedded_dns(s, &gateway, true), "host networking keeps the VM's resolv.conf"));
         // Named by the bridge's gateway, not 127.0.0.11: builders keep it
         // for their steps rather than swapping in 8.8.8.8.
-        spec_with(0, &[], &|s| assert_eq!(super::embedded_address(s, true), [172, 17, 0, 1]));
-        spec_with(0, &[], &|s| assert_eq!(super::resolv_conf(s, &gateway, Some(super::embedded_address(s, true))), "nameserver 172.17.0.1\n"));
+        spec_with(0, &[], &|s| assert_eq!(super::embedded_address(s), [172, 17, 0, 1]));
+        spec_with(0, &[], &|s| assert_eq!(super::resolv_conf(s, &gateway, Some(super::embedded_address(s))), "nameserver 172.17.0.1\n"));
         // A user network keeps Docker's 127.0.0.11, as does a Linux host.
-        spec_with(run_flags::DNS_GATEWAY, &[], &|s| assert_eq!(super::embedded_address(s, true), super::super::dns::EMBEDDED));
-        spec_with(0, &[], &|s| assert_eq!(super::embedded_address(s, false), super::super::dns::EMBEDDED));
+        spec_with(run_flags::DNS_GATEWAY, &[], &|s| assert_eq!(super::embedded_address(s), super::super::dns::EMBEDDED));
+    }
+
+    /// WSL 2: the host's resolver is 10.255.255.254, an address on `lo`.
+    /// The default bridge's lookups go through the agent, which the
+    /// container finds at the bridge's gateway, as in the VM: a loopback
+    /// nameserver (127.0.0.11) was swapped for 8.8.8.8 in build steps, and
+    /// its socket held port 53 in the container, so a DNS server there
+    /// could not start.
+    #[test]
+    fn a_resolver_on_the_hosts_loopback_interface_is_named_by_the_gateway() {
+        let wsl = [[10, 255, 255, 254]];
+        assert!(super::net::local_resolver_among(&wsl, &[[192, 168, 5, 15], [10, 255, 255, 254]]), "an address of this machine's");
+        assert!(!super::net::local_resolver_among(&[[192, 168, 5, 2]], &[[192, 168, 5, 15], [10, 255, 255, 254]]), "a LAN resolver is asked directly");
+        let mut buf = Vec::new();
+        let net = Net { bridge: "kiri0", ip: [172, 17, 0, 2], prefix: 16, gateway: [172, 17, 0, 1], extra_hosts: &[], dns_names: &[], opts: &[] };
+        encode_run(&mut buf, "c1", &[], &["sh"], &[], "/", "", "c1", 0, net, &[], &Limits::default(), 0, &[] as &[&str], &[]);
+        let Ok(Msg::Run(spec)) = decode(&buf) else { panic!() };
+        assert!(super::embedded_dns_if(&spec, || true));
+        assert_eq!(super::embedded_address(&spec), [172, 17, 0, 1]);
+        assert_eq!(super::resolv_conf(&spec, &wsl, Some(super::embedded_address(&spec))), "nameserver 172.17.0.1\n");
+        assert!(!super::embedded_dns_if(&spec, || false), "a resolver elsewhere is named itself");
+        assert_eq!(super::resolv_conf(&spec, &[[192, 168, 5, 2]], None), "nameserver 192.168.5.2\n");
     }
 
     #[test]

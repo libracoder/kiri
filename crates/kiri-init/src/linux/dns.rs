@@ -1,6 +1,8 @@
 //! The embedded DNS server for user-defined networks, as Docker has: at
 //! 127.0.0.11:53 inside each container's network namespace (what its
-//! resolv.conf names, as with Docker), and on each bridge's gateway address,
+//! resolv.conf names, as with Docker; the socket is on a high port there,
+//! with port 53 redirected to it, so the container can bind port 53
+//! itself: see `embedded_socket`), and on each bridge's gateway address,
 //! port 53. Container names and aliases on the container's networks resolve
 //! to their addresses (A, and AAAA on an IPv6 network); everything else is
 //! forwarded to the VM's upstream resolver (or the container's own `--dns`
@@ -151,7 +153,7 @@ impl Dns {
         if self.servers.iter().any(|s| s.container.is_none() && s.bridges.iter().any(|b| b == bridge)) {
             return Ok(());
         }
-        let sock = bound(gateway)?;
+        let sock = bound(gateway, 53)?;
         self.servers.push(Server { bridges: vec![bridge.to_owned()], sock, container: None });
         Ok(())
     }
@@ -167,7 +169,7 @@ impl Dns {
             }
             return Ok(());
         }
-        let sock = super::netlink::in_netns(netns, || bound(EMBEDDED))?;
+        let sock = super::netlink::in_netns(netns, embedded_socket)?;
         self.servers.push(Server { bridges: vec![bridge.to_owned()], sock, container: Some((pid, owner)) });
         Ok(())
     }
@@ -565,9 +567,41 @@ fn framed_reply(got: &[u8]) -> Option<&[u8]> {
 }
 
 /// A UDP socket bound to `ip`:53.
-fn bound(ip: [u8; 4]) -> io::Result<OwnedFd> {
+/// The embedded DNS's socket in a container's network namespace, which
+/// the calling thread is in: on a free high port of 127.0.0.11, with
+/// 127.0.0.11:53 redirected to it, as Docker does, so that a DNS server of
+/// the container's own (dnsmasq, Pi-hole, CoreDNS, AdGuard) can bind
+/// 0.0.0.0:53 while the container's lookups still reach this one. Where the
+/// redirect can't be made (a kernel without nf_nat), port 53 itself.
+fn embedded_socket() -> io::Result<OwnedFd> {
+    let sock = bound(EMBEDDED, 0)?;
+    match local_port(&sock).and_then(|port| super::netlink::redirect_embedded_dns(EMBEDDED, port)) {
+        Ok(()) => Ok(sock),
+        Err(e) => {
+            static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!("kiri-init: dns: no redirect to the embedded DNS ({e}); it takes port 53 in each container");
+            }
+            drop(sock);
+            bound(EMBEDDED, 53)
+        }
+    }
+}
+
+/// The port socket `sock` is bound to.
+fn local_port(sock: &OwnedFd) -> io::Result<u16> {
+    // SAFETY: sockaddr_in is plain data; getsockname fills at most `len` bytes.
+    let mut a: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+    // SAFETY: a socket we own and a buffer of `len` bytes.
+    sys::check(unsafe { libc::getsockname(sock.as_raw_fd(), (&mut a as *mut libc::sockaddr_in).cast(), &mut len) } as _, "dns getsockname")?;
+    Ok(u16::from_be(a.sin_port))
+}
+
+/// A UDP socket bound to `ip`:`port` (0: a free one).
+fn bound(ip: [u8; 4], port: u16) -> io::Result<OwnedFd> {
     let sock = udp_socket()?;
-    let addr = sockaddr(ip, 53);
+    let addr = sockaddr(ip, port);
     // SAFETY: binding to a valid sockaddr_in.
     sys::check(
         unsafe { libc::bind(sock.as_raw_fd(), (&addr as *const libc::sockaddr_in).cast(), std::mem::size_of::<libc::sockaddr_in>() as u32) } as _,

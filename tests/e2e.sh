@@ -161,11 +161,13 @@ if [ "$SYS" != mac ]; then
   # The default bridge names the host's resolvers, as the agent reads them
   # (kiri-init transport.rs host_dns): /etc/resolv.conf's but loopback, else
   # systemd-resolved's upstreams; a resolver at one of the host's own
-  # addresses (WSL's forwarder) is asked through the agent at 127.0.0.11
-  # (container.rs embedded_dns). Docker on Linux also names the host's.
+  # addresses (WSL's forwarder, 10.255.255.254 on lo) is asked through the
+  # agent, at the bridge's gateway as in the VM, never at a loopback address
+  # (container.rs embedded_dns, embedded_address). Docker on Linux also
+  # names the host's.
   ns() { sed -n 's/^nameserver[[:space:]]*\([0-9.]*\).*/\1/p' "$1" 2>/dev/null | grep -v '^127\.' | head -1; }
   HOST_NS=$(ns /etc/resolv.conf); [ -n "$HOST_NS" ] || HOST_NS=$(ns /run/systemd/resolve/resolv.conf)
-  if [ -n "$HOST_NS" ] && ip -4 -o addr 2>/dev/null | grep -qF " inet $HOST_NS/"; then DEFAULT_NS=127.0.0.11; elif [ -n "$HOST_NS" ]; then DEFAULT_NS=$HOST_NS; fi
+  if [ -n "$HOST_NS" ] && ip -4 -o addr 2>/dev/null | grep -qF " inet $HOST_NS/"; then DEFAULT_NS=$BRIDGE_GW; elif [ -n "$HOST_NS" ]; then DEFAULT_NS=$HOST_NS; fi
   # --network host is the host's own network: its address towards the internet.
   HOSTNET_ADDR="inet $(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p')/" HOSTNET_IF=
   HOST_UPS=$(cat /proc/sys/net/ipv4/ip_unprivileged_port_start 2>/dev/null)
@@ -501,7 +503,8 @@ t internet-http "Example Domain" $D run --rm alpine wget -qO- http://example.com
 t internet-dns "Address" $D run --rm alpine nslookup example.com
 # The default bridge in the VM names its gateway, not 127.0.0.11: BuildKit
 # drops loopback nameservers from build steps and puts 8.8.8.8 in their place.
-# On a Linux host it names the host's resolvers (DEFAULT_NS, at the top).
+# On a Linux host it names the host's resolvers, or the gateway when the
+# host's resolver is one of its own addresses, as in WSL (DEFAULT_NS, at the top).
 t dns-default-bridge-gateway "nameserver $DEFAULT_NS" $D run --rm alpine cat /etc/resolv.conf
 code dns-default-bridge-no-loopback 1 $D run --rm alpine grep -q 127.0.0.11 /etc/resolv.conf
 t internet-https "200" $D run --rm curlimages/curl:latest -s -o /dev/null -w '%{http_code}' https://www.google.com
@@ -1427,6 +1430,19 @@ t udp-many "20" bash -c "n=0; for i in \$(seq 20); do dig +short +time=2 +tries=
 t udp-port-listed "53/udp -> 0.0.0.0:15354" $D port dns
 t udp-inspect "53/udp" $D inspect -f '{{json .NetworkSettings.Ports}}' dns
 $D rm -f dns >/dev/null
+# A DNS server of the container's own on a user network (dnsmasq, Pi-hole,
+# CoreDNS bind 0.0.0.0:53; here busybox's dnsd) starts, and the container's
+# own lookups still go to the embedded DNS at 127.0.0.11:53: it listens on
+# another port there, with port 53 redirected to it, as Docker's does. It
+# used to hold port 53 in every container on a user network, so the
+# server could not bind it and exited at once.
+$D network create ownnsnet >/dev/null
+$D run -d --name ownns --network ownnsnet busybox:1.37 sh -c 'echo "kiri.test 10.9.8.7" > /etc/dnsd.conf && exec dnsd -c /etc/dnsd.conf' >/dev/null
+for _ in $(seq 50); do $D exec ownns nslookup -type=a kiri.test 127.0.0.1 2>/dev/null | grep -q 10.9.8.7 && break; sleep 0.2; done
+t user-net-own-dns-server "10.9.8.7" $D exec ownns nslookup -type=a kiri.test 127.0.0.1
+t user-net-own-dns-names "Name:" $D exec ownns nslookup -type=a ownns
+t user-net-own-dns-upstream "Name:" $D exec ownns nslookup -type=a example.com
+$D rm -f ownns >/dev/null; $D network rm ownnsnet >/dev/null
 code udp-port-free-after 0 bash -c "python3 -c 'import socket; s=socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind((\"0.0.0.0\", 15354))'"
 
 section "Linux machines"

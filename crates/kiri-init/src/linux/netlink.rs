@@ -371,6 +371,7 @@ const NFT_MSG_NEWTABLE: u16 = 0;
 const NFT_MSG_DELTABLE: u16 = 2;
 const NFT_MSG_NEWCHAIN: u16 = 3;
 const NFT_MSG_NEWRULE: u16 = 6;
+const NFT_MSG_DELRULE: u16 = 8;
 
 /// The start of a batch that replaces Kiri's table of `family`: add it
 /// (nothing happens when it is there already), then delete it, so the rest
@@ -492,8 +493,13 @@ fn dnat_rule(chain: &str, d: &Dnat) -> Msg {
 /// `dnat_rule`, matching only packets that arrive on interface `from.0`
 /// from address `from.1` (`iif <uplink> ip saddr <gateway> ...`).
 fn dnat_rule_from(chain: &str, d: &Dnat, from: Option<(i32, [u8; 4])>) -> Msg {
+    dnat_rule_in("kiri", chain, d, from)
+}
+
+/// `dnat_rule_from` in table `table`.
+fn dnat_rule_in(table: &str, chain: &str, d: &Dnat, from: Option<(i32, [u8; 4])>) -> Msg {
     let mut rule = nft(NFT_MSG_NEWRULE, NLM_F_ACK | NLM_F_CREATE | 0x800);
-    rule.attr_str(1, "kiri").attr_str(2, chain);
+    rule.attr_str(1, table).attr_str(2, chain);
     rule.nest(4);
     if let Some((iif, saddr)) = from {
         // meta iif (NFT_META_IIF is 4) => reg 1; cmp eq the interface index
@@ -803,6 +809,54 @@ pub fn install_nat6(subnets: &[([u8; 16], u8)], bridges: &[String]) -> io::Resul
     nl.request(&mut msgs)
 }
 
+/// The table, in a container's own network namespace, that sends its DNS
+/// for 127.0.0.11:53 to the embedded DNS's socket there. Not `kiri`: an
+/// engine inside the container (Kiri on a "Linux host" in a privileged
+/// container) replaces its own `kiri` table.
+const EMBEDDED_DNS_TABLE: &str = "kiri_dns";
+
+/// In the calling thread's network namespace (a container's), as Docker's
+/// embedded DNS sets it up:
+///
+/// ```text
+/// table ip kiri_dns {
+///   chain output { type nat hook output priority -100;
+///     ip daddr 127.0.0.11 udp dport 53 dnat to 127.0.0.11:<port> }
+/// }
+/// ```
+///
+/// The embedded DNS listens on 127.0.0.11:`port`, a free high port, so port
+/// 53 stays free for a DNS server of the container's own (dnsmasq, Pi-hole,
+/// CoreDNS bind 0.0.0.0:53), while the container's lookups at 127.0.0.11:53
+/// still reach Kiri's. Replies are mapped back to port 53 by conntrack. TCP
+/// is not redirected: the embedded DNS answers over UDP only.
+pub fn redirect_embedded_dns(addr: [u8; 4], port: u16) -> io::Result<()> {
+    let mut nl = Netlink::open(libc::NETLINK_NETFILTER)?;
+    nl.request(&mut embedded_dns_batch(addr, port))
+}
+
+fn embedded_dns_batch(addr: [u8; 4], port: u16) -> Vec<Msg> {
+    let mut begin = Msg::new(NFNL_MSG_BATCH_BEGIN, 0);
+    begin.raw(&nfgen(libc::AF_UNSPEC as u8, NFNL_SUBSYS_NFTABLES));
+    let mut table = nft(NFT_MSG_NEWTABLE, NLM_F_ACK | NLM_F_CREATE);
+    table.attr_str(1, EMBEDDED_DNS_TABLE);
+    let mut chain = nft(NFT_MSG_NEWCHAIN, NLM_F_ACK | NLM_F_CREATE);
+    chain.attr_str(1, EMBEDDED_DNS_TABLE).attr_str(3, "output");
+    chain.nest(4).attr_be32(1, 3).attr_be32(2, -100i32 as u32).end(); // NF_INET_LOCAL_OUT
+    chain.attr_be32(5, 1).attr_str(7, "nat");
+    // The chain's rules go first (a rule without a handle deletes them
+    // all): a server made again in the same namespace has another port.
+    // Not the table deleted and made again, as clear_table does: deleting
+    // it unregisters its hook, which waits for an RCU grace period, and
+    // that took 15-30 ms of every container start.
+    let mut flush = nft(NFT_MSG_DELRULE, NLM_F_ACK);
+    flush.attr_str(1, EMBEDDED_DNS_TABLE).attr_str(2, "output");
+    let rule = dnat_rule_in(EMBEDDED_DNS_TABLE, "output", &Dnat { udp: true, host_ip: addr, host_port: 53, to_ip: addr, to_port: port }, None);
+    let mut end = Msg::new(NFNL_MSG_BATCH_END, 0);
+    end.raw(&nfgen(libc::AF_UNSPEC as u8, NFNL_SUBSYS_NFTABLES));
+    vec![begin, table, chain, flush, rule, end]
+}
+
 /// Removes Kiri's table (a Linux host's engine stopping), if there is one.
 pub fn remove_nat() -> io::Result<()> {
     let mut nl = Netlink::open(libc::NETLINK_NETFILTER)?;
@@ -924,6 +978,30 @@ mod tests {
 
     fn be32(d: &[u8]) -> u32 {
         u32::from_be_bytes(d.try_into().unwrap())
+    }
+
+    /// The embedded DNS's redirect in a container's namespace: its own
+    /// table (an engine inside the container replaces `kiri`), one output
+    /// nat chain emptied first, one rule that sends UDP for 127.0.0.11:53 to
+    /// the server's port.
+    #[test]
+    fn the_embedded_dns_redirect_is_one_rule_in_a_table_of_its_own() {
+        let mut msgs = embedded_dns_batch([127, 0, 0, 11], 40123);
+        let types: Vec<u16> = msgs.iter().map(|m| u16::from_ne_bytes([m.buf[4], m.buf[5]])).collect();
+        let t = |m: u16| (NFNL_SUBSYS_NFTABLES << 8) | m;
+        // No DELTABLE: unregistering a hook waits for an RCU grace period.
+        assert_eq!(types, [NFNL_MSG_BATCH_BEGIN, t(NFT_MSG_NEWTABLE), t(NFT_MSG_NEWCHAIN), t(NFT_MSG_DELRULE), t(NFT_MSG_NEWRULE), NFNL_MSG_BATCH_END]);
+        for m in &msgs[1..5] {
+            assert_eq!(get(&attrs(&m.buf[20..]), 1), b"kiri_dns\0");
+        }
+        assert_eq!(get(&attrs(&msgs[3].buf[20..]), 2), b"output\0", "the chain's rules, no handle: all of them");
+        let chain = attrs(&msgs[2].buf[20..]);
+        let hook = attrs(get(&chain, 4));
+        assert_eq!((be32(get(&hook, 1)), be32(get(&hook, 2)) as i32), (3, -100), "the output hook, at nat priority");
+        assert_eq!(get(&chain, 7), b"nat\0");
+        let rule = msgs[4].finish(1).to_vec();
+        let has = |needle: &[u8]| rule.windows(needle.len()).any(|w| w == needle);
+        assert!(has(&[127, 0, 0, 11]) && has(&53u16.to_be_bytes()) && has(&40123u16.to_be_bytes()) && has(b"nat\0"));
     }
 
     /// The table is replaced with messages every kernel since 3.13 knows:
