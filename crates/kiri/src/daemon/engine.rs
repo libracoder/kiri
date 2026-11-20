@@ -453,9 +453,50 @@ pub struct ExtraNetwork {
 struct StartGate {
     shut: Mutex<bool>,
     opened: Condvar,
-    /// Set by `Engine::cancel_start`: a stop, `kill -9` or `rm -f` came
-    /// while this start was under way.
+    /// Set by `Engine::await_start`: a stop, kill or `rm -f` found this start
+    /// stuck (`START_GRACE`, `REMOVE_GRACE`), or Kiri itself is stopping.
+    /// `VmLink::run` reads it.
     cancel: std::sync::atomic::AtomicBool,
+    /// Why it was cancelled (`Cancel`), for the start's answer.
+    cancel_by: std::sync::atomic::AtomicU8,
+}
+
+/// Why a start was cancelled (`StartGate::cancel_by`); the larger wins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum Cancel {
+    /// A stop or kill that waited `START_GRACE` for it, or Kiri's own
+    /// stop (Stop, the VM's sleep).
+    Stopped = 1,
+    /// `rm -f`, after `REMOVE_GRACE`.
+    Removed = 2,
+}
+
+/// How long a `docker stop` or `kill` that comes while the container is
+/// starting waits for that start, before it takes the start as stuck and
+/// cancels it (see `Engine::await_start`). Docker's waits for as long as
+/// the start takes (its start holds the container's lock throughout); a
+/// healthy start here takes milliseconds, a queue of them a few seconds, and
+/// a start filling a new volume is let finish the fill even when cancelled.
+#[cfg(not(test))]
+const START_GRACE: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const START_GRACE: Duration = Duration::from_millis(400);
+/// The same for `rm -f`, which is expected to be prompt: a stuck start it
+/// cancels sooner, and that start answers with Docker's words for a start
+/// a removal got to first ("marked for removal").
+#[cfg(not(test))]
+const REMOVE_GRACE: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const REMOVE_GRACE: Duration = Duration::from_millis(300);
+
+/// What a cancelled start answers (see `Cancel`), as a 409 each time.
+fn cancelled_start_error(by: Option<Cancel>, id: &str) -> Option<Error> {
+    match by? {
+        // Docker's answer to a start that a removal got to first.
+        Cancel::Removed => Some(Error::Conflict("container is marked for removal and cannot be started".into())),
+        Cancel::Stopped => Some(Error::Conflict(format!("container {} was stopped before it finished starting", &id[..12.min(id.len())]))),
+    }
 }
 
 impl StartGate {
@@ -472,6 +513,28 @@ impl StartGate {
         let mut shut = self.shut.lock().unwrap_or_else(|e| e.into_inner());
         while *shut {
             shut = self.opened.wait(shut).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// Waits at most `limit` for the gate to open. True when it is open.
+    fn wait_for(&self, limit: Duration) -> bool {
+        let deadline = std::time::Instant::now() + limit;
+        let mut shut = self.shut.lock().unwrap_or_else(|e| e.into_inner());
+        while *shut {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            shut = self.opened.wait_timeout(shut, left).unwrap_or_else(|e| e.into_inner()).0;
+        }
+        true
+    }
+
+    fn cancelled_by(&self) -> Option<Cancel> {
+        match self.cancel_by.load(std::sync::atomic::Ordering::SeqCst) {
+            0 => None,
+            1 => Some(Cancel::Stopped),
+            _ => Some(Cancel::Removed),
         }
     }
 }
@@ -2556,8 +2619,10 @@ impl Engine {
         // Retirement and boot own no container lock. A manual action can
         // invalidate this attempt while the previous VM is stopping.
         let prepared = self.vm_inner(reason == Start::VmRecovery);
-        let _starting = lifecycle.lock().unwrap_or_else(|e| e.into_inner());
-        if *_starting != generation {
+        let starting = lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+        if *starting != generation {
+            // Removed meanwhile: "No such container", as on Docker.
+            self.resolve(key)?;
             return Err(Error::Conflict("container start was canceled".into()));
         }
         let vm = match prepared {
@@ -2570,11 +2635,15 @@ impl Engine {
                 return Err(Error::Io(e));
             }
         };
-        self.start_on_vm(key, reason, vm)
+        self.start_on_vm(key, reason, vm, starting)
     }
 
-    /// The lifecycle lock is held by start_inner for this entire attempt.
-    fn start_on_vm(&self, key: &str, reason: Start, vm: Arc<VmLink>) -> Result<(), Error> {
+    /// `starting` is the container's lifecycle lock, held by start_inner:
+    /// this attempt keeps it until the guest has the process, so a stop,
+    /// kill or remove acts on it only then, and lets go before handing
+    /// over input sent ahead of the start (see below).
+    fn start_on_vm(&self, key: &str, reason: Start, vm: Arc<VmLink>, starting: MutexGuard<'_, u64>) -> Result<(), Error> {
+        let mut starting = Some(starting);
         let (id, layers, argv, mut spec, size, gate) = {
             let mut st = self.lock();
             let id = resolve(&st, key)?;
@@ -2866,11 +2935,17 @@ impl Engine {
         // the container as the failure left it, not half-way there.
         if let Err(e) = started {
             crate::diag::warn!("container did not start", id = &id[..12], image = spec.image, error = e);
-            self.fail_start(&id, &spec, &e);
-            if cancelled() {
-                return Err(Error::Conflict(format!("container {} was stopped or removed before it finished starting", &id[..12])));
+            match gate.0.cancelled_by() {
+                // Docker refuses a start that a removal got to first before
+                // the start touches the container: its exit code stays 0,
+                // which is what a waiter on the removed container gets.
+                Some(Cancel::Removed) => self.fail_start_code(&id, &spec, 0),
+                // A stuck start that a stop or kill ended: its first process
+                // was killed, as the stop or kill would have killed it.
+                Some(Cancel::Stopped) => self.fail_start_code(&id, &spec, 128 + libc::SIGKILL),
+                None => self.fail_start(&id, &spec, &e),
             }
-            return Err(Error::Io(e));
+            return Err(cancelled_start_error(gate.0.cancelled_by(), &id).unwrap_or(Error::Io(e)));
         }
         // Before anything below, which may itself exec (a health probe),
         // and after the pid is set.
@@ -2934,6 +3009,11 @@ impl Engine {
                 }
                 break;
             }
+            // The guest takes no more of this than the program reads, which
+            // may be never: a stop or kill must not wait behind it for the
+            // container's lock. The process is there to signal now, and its
+            // exit ends this hand-over (its window closes) and the loop.
+            drop(starting.take());
             let _ = vm.input(&id, &early);
         }
         self.health_start(&id);
@@ -3177,11 +3257,15 @@ impl Engine {
     /// with the exit code Docker gives that failure (see `start_exit_code`).
     /// A start the VM's crash ended keeps the crash's exit (255).
     fn fail_start(&self, id: &str, spec: &Spec, err: &dyn std::fmt::Debug) {
+        self.fail_start_code(id, spec, start_exit_code(&format!("{err:?}")));
+    }
+
+    /// `fail_start` with the exit code given.
+    fn fail_start_code(&self, id: &str, spec: &Spec, code: i32) {
         let vm = self.link.lock().unwrap_or_else(|e| e.into_inner()).clone();
         if let Some(vm) = vm {
             let _ = vm.is_lost();
         }
-        let code = start_exit_code(&format!("{err:?}"));
         let mut st = self.lock();
         // Lost may have run before this start finished allocating addresses.
         // Reclaim those even when preserving the crash's exit accounting.
@@ -3920,7 +4004,13 @@ impl Engine {
     /// (Stop, the VM's sleep on request), which is not recorded as the
     /// user's: `unless-stopped` brings it back on Start.
     fn stop_as(&self, key: &str, timeout: Duration, by_user: bool) -> Result<bool, Error> {
-        self.cancel_start(key);
+        let ended_start = if by_user {
+            self.await_start(key, START_GRACE, Cancel::Stopped)
+        } else {
+            // Kiri stopping, or its VM going to sleep: not held up by a
+            // start, as before.
+            self.cancel_start(key, Cancel::Stopped)
+        };
         let lifecycle = self.lifecycle(key)?;
         let mut stopping = lifecycle.lock().unwrap_or_else(|e| e.into_inner());
         let id = self.resolve(key)?;
@@ -3928,7 +4018,9 @@ impl Engine {
         self.thaw_for_signal(&id);
         let cancelled = by_user && self.mark_stopped(&id);
         if !self.is_running(&id) {
-            return Ok(cancelled);
+            // A start this stop ended is something it stopped: 204, not
+            // "already stopped" (304).
+            return Ok(cancelled || ended_start);
         }
         self.emit_container("kill", &id, &[("signal", (libc::SIGTERM).to_string())]);
         let sig = self.lock().containers.get(&id).and_then(|c| c.spec.stop_signal).unwrap_or(libc::SIGTERM as u32);
@@ -3982,35 +4074,65 @@ impl Engine {
         }
     }
 
-    /// A stop, `kill -9` or `rm -f` of a container whose start is still
-    /// under way. That start holds the container's lifecycle lock until the
-    /// guest says its root is in place, which a child stuck before then
-    /// never does; so before waiting for that lock, the start is told
+    /// A `docker stop`, `kill` or `rm -f` that comes while the container is
+    /// starting waits for that start, as Docker's does (its start holds the
+    /// container's lock throughout, and its stop, kill and removal take it):
+    /// the start answers as it would have (204 once the process runs), and
+    /// the signal then reaches the process. Before, a kill sent now found no
+    /// process in the guest and was dropped; then (#621) the three cancelled
+    /// the start, which answered 409 where Docker answers 204, after inspect
+    /// had already shown the container running.
+    ///
+    /// A start that has not finished after `limit` is taken as stuck (its
+    /// first process never got its root in place) and cancelled
+    /// (`cancel_gate`): it holds the container's lifecycle lock until the
+    /// guest says the root is in place, so without this the stop, kill or
+    /// removal would queue behind it for good. True when it was cancelled.
+    fn await_start(&self, key: &str, limit: Duration, by: Cancel) -> bool {
+        let (id, gate) = {
+            let st = self.lock();
+            let Ok(id) = resolve(&st, key) else { return false };
+            let gate = st.containers[&id].start_gate.clone();
+            (id, gate)
+        };
+        if gate.wait_for(limit) {
+            return false;
+        }
+        crate::diag::warn!("start not finished; cancelled", id = &id[..12], by = format!("{by:?}"), waited_ms = limit.as_millis());
+        self.cancel_gate(&id, &gate, by)
+    }
+
+    /// Kiri's own stop of a container whose start is still under way: the
+    /// start is cancelled at once (see `cancel_gate`). True when a start was
+    /// under way.
+    fn cancel_start(&self, key: &str, by: Cancel) -> bool {
+        self.await_start(key, Duration::ZERO, by)
+    }
+
+    /// Cancels the start that shut `gate`, if it is still under way. That
+    /// start holds the container's lifecycle lock until the guest says its
+    /// root is in place, which a child stuck before then never does; so
+    /// before waiting for that lock, the start is told
     /// (`StartGate::cancel`, which its wait reads) and so is the guest
     /// (`Msg::CancelStart`): a child still making its root is killed, the
     /// start fails, and the lock is free. A child filling a volume is left
-    /// to finish (a slow fill is no reason to fail), then killed. True when
-    /// a start was under way.
-    fn cancel_start(&self, key: &str) -> bool {
-        let id = {
-            let st = self.lock();
-            let Ok(id) = resolve(&st, key) else { return false };
-            let gate = &st.containers[&id].start_gate;
-            if !gate.is_shut() {
-                return false;
-            }
-            gate.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
-            id
-        };
+    /// to finish (a slow fill is no reason to fail), then killed; a child
+    /// whose root is in place is not touched, and its start goes on.
+    fn cancel_gate(&self, id: &str, gate: &StartGate, by: Cancel) -> bool {
+        if !gate.is_shut() {
+            return false;
+        }
+        gate.cancel_by.fetch_max(by as u8, std::sync::atomic::Ordering::SeqCst);
+        gate.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
         // Never boots a VM: a start under way has one.
         if let Some(vm) = self.awake() {
-            let _ = vm.cancel_start(&id);
+            let _ = vm.cancel_start(id);
         }
         true
     }
 
     pub fn kill(&self, key: &str, signal: u32) -> Result<(), Error> {
-        let cancelled = signal == libc::SIGKILL as u32 && self.cancel_start(key);
+        let cancelled = self.await_start(key, START_GRACE, Cancel::Stopped);
         let lifecycle = self.lifecycle(key)?;
         let mut killing = lifecycle.lock().unwrap_or_else(|e| e.into_inner());
         let id = self.resolve(key)?;
@@ -4056,7 +4178,7 @@ impl Engine {
 
     pub fn remove(&self, key: &str, force: bool, with_volumes: bool) -> Result<(), Error> {
         if force {
-            self.cancel_start(key);
+            self.await_start(key, REMOVE_GRACE, Cancel::Removed);
         }
         let lifecycle = self.lifecycle(key)?;
         let mut removing = lifecycle.lock().unwrap_or_else(|e| e.into_inner());
@@ -5137,7 +5259,9 @@ mod vm_recovery_tests {
         assert!(st.vm_recovery_at.unwrap() > std::time::Instant::now() + Duration::from_secs(50));
         let spec = st.containers[&ids[0]].spec.clone();
         drop(st);
-        assert!(engine.start_on_vm(&ids[0], Start::VmRecovery, lost_vm).is_err(), "a start borrowing the old VM cannot claim Running after Lost");
+        let lifecycle = engine.lifecycle(&ids[0]).unwrap();
+        let held = lifecycle.lock().unwrap();
+        assert!(engine.start_on_vm(&ids[0], Start::VmRecovery, lost_vm, held).is_err(), "a start borrowing the old VM cannot claim Running after Lost");
         assert_eq!(engine.with(&ids[0], |c| (c.status, c.vm_stopped, c.exit_code)).unwrap(), (Status::Exited, true, 255));
         engine.fail_start(&ids[0], &spec, &"the VM stopped");
         assert_eq!(engine.with(&ids[0], |c| c.exit_code).unwrap(), 255, "a late start failure must preserve VM-loss accounting");
@@ -5161,10 +5285,11 @@ mod vm_recovery_tests {
     }
 
     /// A start whose child never says its root is in place holds the
-    /// container's lifecycle lock for as long as it waits. `rm -f`, `kill`
-    /// and `stop` cancel it first (`cancel_start`) instead of queueing
-    /// behind it for good. The start here is modelled as `VmLink::run`'s
-    /// wait: it ends, failed, once it sees the cancel.
+    /// container's lifecycle lock for as long as it waits. `kill` and
+    /// `stop` wait `START_GRACE` for it, `rm -f` `REMOVE_GRACE`
+    /// (`await_start`), then cancel it, instead of queueing behind it for
+    /// good. The start here is modelled as `VmLink::run`'s wait: it ends,
+    /// failed, once it sees the cancel.
     #[test]
     fn rm_kill_and_stop_cancel_a_start_that_never_finishes() {
         let dir = std::env::temp_dir().join(format!("kiri-cancel-start-{}", std::process::id()));
@@ -5176,12 +5301,13 @@ mod vm_recovery_tests {
             name: "test:local".into(), digest: "sha256:test".into(), index_digest: None, config_digest: "sha256:test".into(),
             layers: Vec::new(), size: 0, platform: "linux/arm64".into(), created: String::new(), pulled_at: 0, config: Default::default(),
         };
-        for op in ["rm -f", "kill", "stop"] {
+        for op in ["rm -f", "kill", "kill TERM", "stop"] {
             let spec: Spec = serde_json::from_value(serde_json::json!({
                 "image": "test:local", "image_id": "sha256:test", "entrypoint": [], "cmd": ["sleep", "60"],
                 "env": [], "cwd": "/", "user": "", "auto_remove": false, "network_mode": "none", "labels": {},
             })).unwrap();
             let id = engine.create(Some(format!("stuck-{}", op.replace(' ', ""))), spec.clone(), &image).unwrap();
+            let (why, reason) = std::sync::mpsc::channel();
             // Claimed as start_on_vm claims it: Running, gate shut, the
             // lifecycle lock held across the wait.
             let lifecycle = engine.lifecycle(&id).unwrap();
@@ -5205,11 +5331,13 @@ mod vm_recovery_tests {
                         assert!(std::time::Instant::now() < deadline, "{op}: never cancelled");
                         std::thread::sleep(Duration::from_millis(5));
                     }
+                    why.send(gate.cancelled_by()).unwrap();
                     engine.fail_start(&id, &spec, &"cancelled");
                     drop(guard);
                 })
             };
             holding.recv().unwrap();
+            let t = std::time::Instant::now();
             let (done, finished) = std::sync::mpsc::channel();
             let worker = {
                 let (engine, id) = (engine.clone(), id.clone());
@@ -5217,15 +5345,28 @@ mod vm_recovery_tests {
                     let r = match op {
                         "rm -f" => engine.remove(&id, true, false),
                         "kill" => engine.kill(&id, libc::SIGKILL as u32),
-                        _ => engine.stop(&id, Duration::from_secs(1)).map(drop),
+                        "kill TERM" => engine.kill(&id, libc::SIGTERM as u32),
+                        // The stop ended the start: 204, not 304.
+                        _ => engine.stop(&id, Duration::from_secs(1)).and_then(|stopped| if stopped { Ok(()) } else { Err(Error::Conflict("answered 304".into())) }),
                     };
                     done.send(r.map_err(|e| format!("{e:?}"))).unwrap();
                 })
             };
             let got = finished.recv_timeout(Duration::from_secs(3));
+            let took = t.elapsed();
             start.join().unwrap();
             worker.join().unwrap();
             assert_eq!(got, Ok(Ok(())), "{op} of a container whose start never finishes");
+            match op {
+                "rm -f" => {
+                    assert!(took >= REMOVE_GRACE && took < START_GRACE, "rm -f waits for the start, briefly: {took:?}");
+                    assert_eq!(reason.recv().unwrap(), Some(Cancel::Removed));
+                }
+                _ => {
+                    assert!(took >= START_GRACE, "{op} waits for the start first: {took:?}");
+                    assert_eq!(reason.recv().unwrap(), Some(Cancel::Stopped), "{op}");
+                }
+            }
             let st = engine.lock();
             match op {
                 "rm -f" => assert!(!st.containers.contains_key(&id), "removed"),
@@ -5234,6 +5375,130 @@ mod vm_recovery_tests {
         }
         drop(engine);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A `kill` (any signal), `stop` or `rm -f` that comes while a healthy
+    /// start is under way waits for it, as Docker's does: the start is not
+    /// cancelled (it answers 204), and the signal goes to the process once
+    /// the guest has it. Before, the kill was dropped (no process yet), then
+    /// (#621) all three cancelled the start, which answered 409. The start is modelled:
+    /// the guest has the process after 150 ms (gate opened, pid set), and
+    /// the process exits once a stop or kill reaches it.
+    #[test]
+    fn a_stop_or_kill_during_a_healthy_start_waits_for_it() {
+        let dir = std::env::temp_dir().join(format!("kiri-signal-during-start-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let engine = Engine::boot(Store::open(&dir).unwrap()).unwrap();
+        // No real VM: the threads below stand in for the guest.
+        engine.stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+        let image = Image {
+            name: "test:local".into(), digest: "sha256:test".into(), index_digest: None, config_digest: "sha256:test".into(),
+            layers: Vec::new(), size: 0, platform: "linux/arm64".into(), created: String::new(), pulled_at: 0, config: Default::default(),
+        };
+        let start_takes = Duration::from_millis(150);
+        assert!(start_takes < REMOVE_GRACE && REMOVE_GRACE < START_GRACE);
+        for op in ["kill", "kill TERM", "kill USR1", "stop", "rm -f"] {
+            let spec: Spec = serde_json::from_value(serde_json::json!({
+                "image": "test:local", "image_id": "sha256:test", "entrypoint": [], "cmd": ["sleep", "60"],
+                "env": [], "cwd": "/", "user": "", "auto_remove": false, "network_mode": "none", "labels": {},
+            })).unwrap();
+            let id = engine.create(Some(format!("healthy-{}", op.replace(' ', ""))), spec, &image).unwrap();
+            let lifecycle = engine.lifecycle(&id).unwrap();
+            let (held, holding) = std::sync::mpsc::channel();
+            let start = {
+                let (engine, id) = (engine.clone(), id.clone());
+                std::thread::spawn(move || {
+                    let starting = lifecycle.lock().unwrap();
+                    let (gate, guard) = {
+                        let mut st = engine.lock();
+                        let c = st.containers.get_mut(&id).unwrap();
+                        c.status = Status::Running;
+                        let guard = c.begin_start();
+                        (c.start_gate.clone(), guard)
+                    };
+                    held.send(()).unwrap();
+                    std::thread::sleep(start_takes);
+                    let cancelled = gate.cancel.load(std::sync::atomic::Ordering::SeqCst);
+                    // The guest has the process: the pid is set, the gate
+                    // opens, the lifecycle lock goes.
+                    engine.lock().containers.get_mut(&id).unwrap().pid = 42;
+                    let started_at = std::time::Instant::now();
+                    drop(guard);
+                    drop(starting);
+                    (cancelled, started_at)
+                })
+            };
+            holding.recv().unwrap();
+            // The process: it exits once a stop or a kill that ends it is
+            // recorded (both mark the container stopped by the user).
+            let exits = op != "kill USR1";
+            let process = {
+                let (engine, id) = (engine.clone(), id.clone());
+                std::thread::spawn(move || {
+                    let deadline = std::time::Instant::now() + if exits { Duration::from_secs(5) } else { Duration::from_millis(500) };
+                    let mut st = engine.lock();
+                    while !st.containers[&id].stopped_by_user {
+                        let left = deadline.saturating_duration_since(std::time::Instant::now());
+                        if left.is_zero() {
+                            return;
+                        }
+                        st = engine.changed.wait_timeout(st, left).unwrap().0;
+                    }
+                    let c = st.containers.get_mut(&id).unwrap();
+                    c.status = Status::Exited;
+                    c.exit_code = 137;
+                    c.exits += 1;
+                    drop(st);
+                    engine.changed.notify_all();
+                })
+            };
+            let r = match op {
+                "kill" => engine.kill(&id, libc::SIGKILL as u32),
+                "kill TERM" => engine.kill(&id, libc::SIGTERM as u32),
+                "kill USR1" => engine.kill(&id, libc::SIGUSR1 as u32),
+                "rm -f" => engine.remove(&id, true, false),
+                _ => engine.stop(&id, Duration::from_secs(1)).map(drop),
+            };
+            let answered = std::time::Instant::now();
+            let (cancelled, started_at) = start.join().unwrap();
+            process.join().unwrap();
+            assert!(r.is_ok(), "{op}: {r:?}");
+            assert!(!cancelled, "{op} must not cancel a start that finishes");
+            assert!(answered >= started_at, "{op} answered before the start finished");
+            let st = engine.lock();
+            if op == "rm -f" {
+                assert!(!st.containers.contains_key(&id), "removed once it had started");
+                continue;
+            }
+            let c = &st.containers[&id];
+            match exits {
+                true => assert_eq!((c.status, c.exit_code), (Status::Exited, 137), "{op}: delivered once the process existed"),
+                false => assert_eq!(c.status, Status::Running, "{op}: a signal that does not end it"),
+            }
+        }
+        drop(engine);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// What a cancelled start answers: Docker's own words for a start that
+    /// a removal got to first; a 409 for a stuck start that a stop or kill
+    /// ended; nothing special for a start that was not cancelled.
+    #[test]
+    fn a_cancelled_start_answers_as_docker_does() {
+        let id = "0123456789abcdef0123";
+        let msg = |by| match cancelled_start_error(by, id) {
+            Some(Error::Conflict(m)) => Some(m),
+            other => other.map(|e| format!("not a 409: {e:?}")),
+        };
+        assert_eq!(msg(Some(Cancel::Removed)).as_deref(), Some("container is marked for removal and cannot be started"));
+        assert_eq!(msg(Some(Cancel::Stopped)).as_deref(), Some("container 0123456789ab was stopped before it finished starting"));
+        assert_eq!(msg(None), None);
+        // A removal and a stop both cancelling: the removal's answer.
+        let gate = StartGate::default();
+        gate.cancel_by.fetch_max(Cancel::Stopped as u8, std::sync::atomic::Ordering::SeqCst);
+        gate.cancel_by.fetch_max(Cancel::Removed as u8, std::sync::atomic::Ordering::SeqCst);
+        gate.cancel_by.fetch_max(Cancel::Stopped as u8, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(gate.cancelled_by(), Some(Cancel::Removed));
     }
 
     #[test]

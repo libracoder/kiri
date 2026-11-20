@@ -339,6 +339,9 @@ fi
 
 section "run: output and exit codes"
 code lifecycle-response-status 0 python3 "$(dirname "$0")/lifecycle-status.py" "$SOCK" alpine
+# A kill, stop or rm -f sent while containers start: the start answers as
+# Docker's does and the signal reaches the process once it runs (#149).
+code kill-during-start 0 python3 "$(dirname "$0")/kill-during-start.py" "$SOCK" alpine
 t echo "hello" $D run --rm alpine echo hello
 t args "a b c" $D run --rm alpine echo a b c
 code exit-0 0 $D run --rm alpine true

@@ -73,8 +73,10 @@ run-missing-network-removed	#612	docker run --rm on a missing network left the c
 starts-beside-df	#621	a container start hung for ever when it ran beside docker system df
 rm-f-stuck-start	#621	a stuck start could not be removed: rm -f, kill and stop never answered
 agent-dies-beside-stuck-start	#621	an agent that died beside a stuck start went unnoticed and every request hung
-rm-f-during-start	#621	rm -f sent while containers start must answer and leave nothing behind
-stop-during-start	#621	stop sent while containers start must answer and leave nothing behind
+rm-f-during-start	#621	rm -f sent while containers start must answer and leave nothing behind; the racing start succeeds or says Docker's "marked for removal"
+stop-during-start	#621	stop sent while containers start must answer and leave nothing behind; the racing start must succeed, as on Docker (#621 answered it 409)
+kill-during-start	#149	a kill, stop or rm -f sent while a container started was dropped (it kept running), then (#621) cancelled the start, which answered 409 where Docker answers 204
+kill-stuck-start	#149	a kill must not wait for ever behind a start that never finishes: after 10 s it cancels it
 churn-beside-df	#621	create, start, exec and rm beside docker system df must each answer within its limit
 rm-f-exit-code	#622	docker run --rm exited 0, not 137, when docker rm -f raced it
 image-ls-untagged-row	#623	the image list hid untagged images

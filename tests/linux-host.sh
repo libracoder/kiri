@@ -199,9 +199,16 @@ t starts-beside-df "stuck 0" "docker run --rm -v dfwalk:/d alpine sh -c 'cd /d; 
 # A start whose first process never gets its root in place (here frozen by
 # the cgroup freezer from its first instruction, as a child that hung there
 # was) held the container's lifecycle lock for good: rm -f, kill and stop
-# never answered. rm -f cancels the start instead (the child is killed, the
-# start fails) and leaves no cgroup, mount or container behind.
+# never answered. rm -f waits 2 s for it, then cancels it (the child is
+# killed, the start fails) and leaves no cgroup, mount or container behind.
 t rm-f-stuck-start "removed, leftovers: none" "cg=\$(docker run -d alpine sleep 60); p=\$(docker inspect -f '{{.State.Pid}}' \$cg); K=/sys/fs/cgroup\$(sed -n 's/^0:://p' /proc/\$p/cgroup); K=\${K%/*}; docker rm -f \$cg >/dev/null; id=\$(docker create alpine true); echo 1 > \$K/cgroup.freeze; (timeout -s KILL 30 docker start \$id >/dev/null 2>&1 &); sleep 2; t0=\$(date +%s); timeout -s KILL 15 docker rm -f \$id >/dev/null 2>&1; rc=\$?; t=\$(( \$(date +%s) - t0 )); echo 0 > \$K/cgroup.freeze; sleep 1; left=; [ -d \$K/\$id ] && left=\"\$left cgroup\"; grep -q \$id /proc/mounts && left=\"\$left mount\"; docker ps -aq --no-trunc | grep -q \$id && left=\"\$left container\"; [ \$rc = 0 ] && [ \$t -le 5 ] && echo \"removed, leftovers:\${left:- none}\" || echo \"rm -f rc=\$rc after \$t s\""
+# The same stuck start met by a kill: a kill (or stop) that comes while a
+# container starts waits for the start, as Docker's does, so a healthy start
+# answers 204 and the signal then reaches the process. One still unfinished
+# after 10 s is taken as stuck and cancelled as rm -f cancels it: the kill
+# answers, the start answers 409, the exit code is a kill's (137), and
+# nothing is left behind.
+t kill-stuck-start "killed after the wait, start refused, exited 137, leftovers: none" "cg=\$(docker run -d alpine sleep 60); p=\$(docker inspect -f '{{.State.Pid}}' \$cg); K=/sys/fs/cgroup\$(sed -n 's/^0:://p' /proc/\$p/cgroup); K=\${K%/*}; docker rm -f \$cg >/dev/null; id=\$(docker create alpine true); echo 1 > \$K/cgroup.freeze; (timeout -s KILL 40 docker start \$id > /tmp/kss.out 2>&1 &); sleep 2; t0=\$(date +%s); timeout -s KILL 30 docker kill \$id >/dev/null 2>&1; rc=\$?; t=\$(( \$(date +%s) - t0 )); echo 0 > \$K/cgroup.freeze; sleep 1; left=; [ -d \$K/\$id ] && left=\"\$left cgroup\"; grep -q \$id /proc/mounts && left=\"\$left mount\"; st=\$(docker inspect -f '{{.State.Status}} {{.State.ExitCode}}' \$id); grep -q 'stopped before it finished starting' /tmp/kss.out && s='start refused' || s=\"start said: \$(head -1 /tmp/kss.out)\"; docker rm -f \$id >/dev/null; [ \$rc = 0 ] && [ \$t -ge 9 ] && [ \$t -le 15 ] && echo \"killed after the wait, \$s, \$st, leftovers:\${left:- none}\" || echo \"kill rc=\$rc after \$t s\""
 # The agent dies while a container's first process it cloned is stuck
 # before closing what it inherited (frozen from its first instruction):
 # that child held the agent's end of the daemon's connection, so nothing

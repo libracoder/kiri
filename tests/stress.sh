@@ -17,7 +17,10 @@
 #                       exits 137, never 0; and four waiters on one rm -f (#622)
 #   rm-f-during-start   rm -f sent while several containers start at once
 #   stop-during-start   stop sent while several containers start at once:
-#                       each answers within its limit and nothing is left
+#                       each answers within its limit and nothing is left;
+#                       each racing start answers as Docker's does (it
+#                       succeeds beside a stop; beside rm -f it succeeds or
+#                       says "marked for removal")
 #                       (on a Linux host or WSL, no cgroup or interface either)
 #                       That part only sees what this shell can see: run from
 #                       a container beside the engine, give the container the
@@ -247,11 +250,15 @@ fi
 
 # (c) rm -f or stop sent while several containers start at once, beside
 # system df so that a start can hang as in (a). A start that hung held its
-# container's lock, so neither answered (#621). What the
-# racing start answers is not judged, only that every command answers and
-# nothing is left behind.
+# container's lock, so neither answered (#621). Every command must answer
+# and nothing may be left behind. The racing start answers as Docker's
+# does: beside a stop, it succeeds (the stop waits for it, then stops the
+# container); beside rm -f, it succeeds, or the removal got there first and
+# it fails with Docker's "marked for removal" (or "No such container").
 during_start() { # NAME VERB
-  local name=$1 verb=$2 K=6 R=$((3 * ROUNDS)) r i d pids slow=0 left=0 cmds=0
+  local name=$1 verb=$2 K=6 R=$((3 * ROUNDS)) r i d pids slow=0 left=0 cmds=0 rc msg
+  local s_ok=0 s_removal=0 s_gone=0 s_bad=0
+  : > "$WORK/s.bad"
   case_start "$name" "$R rounds of $K starts at once beside 4 system df loops, $verb sent meanwhile; 20 s a create, 30 s a start, 15 s a $verb"
   : > "$WORK/c.ids"; : > "$WORK/c.log"
   fill_dfwalk
@@ -263,7 +270,15 @@ during_start() { # NAME VERB
       tr -d '\r' < "$WORK/c.id" | grep -E '^[0-9a-f]{12,}$' >> "$WORK/c.ids"
     done
     pids=
-    for i in $(seq $K); do (echo "start $(tm 30 "$D" start "$P-c-$i")" >> "$WORK/c.log") & pids="$pids $!"; done
+    for i in $(seq $K); do
+      (
+        : > "$WORK/s.$i"
+        res=$(TM_OUT=$WORK/s.$i tm 30 "$D" start "$P-c-$i")
+        echo "start $res" >> "$WORK/c.log"
+        echo "${res%% *} $(tr -d '\r' < "$WORK/s.$i" | paste -sd ' ' -)" > "$WORK/s.$i.res"
+      ) &
+      pids="$pids $!"
+    done
     # Into the start at a different moment each round.
     d=$(awk -v r="$r" 'BEGIN {printf "%.2f", (r % 4) * 0.05}')
     sleep "$d"
@@ -276,6 +291,14 @@ during_start() { # NAME VERB
     # Not a bare wait: the df loops run on until df_stop.
     # shellcheck disable=SC2086
     wait $pids
+    for i in $(seq $K); do
+      read -r rc msg < "$WORK/s.$i.res"
+      if [ "$rc" = 0 ]; then s_ok=$((s_ok + 1))
+      elif [ "$verb" = rm ] && [[ $msg == *"marked for removal"* ]]; then s_removal=$((s_removal + 1))
+      elif [ "$verb" = rm ] && [[ $msg == *"No such container"* ]]; then s_gone=$((s_gone + 1))
+      else s_bad=$((s_bad + 1)); echo "exit $rc: ${msg//$P-c-[0-9]/NAME}" >> "$WORK/s.bad"
+      fi
+    done
     # A stopped container is then removed, which must also answer.
     if [ "$verb" = stop ]; then
       for i in $(seq $K); do echo "rm $(tm 15 "$D" rm -f "$P-c-$i")" >> "$WORK/c.log"; done
@@ -296,8 +319,9 @@ during_start() { # NAME VERB
   cmds=$(wc -l < "$WORK/c.log" | tr -d ' ')
   slow=$(awk '$4 == 1' "$WORK/c.log" | wc -l | tr -d ' ')
   local slows; slows=$(awk '$4 == 1 {print $1}' "$WORK/c.log" | sort | uniq -c | awk '{printf "%s%s x%d", s, $2, $1; s=", "}')
-  check "$name" "$([ "$slow" = 0 ] && [ "$left" = 0 ] && { [ "$SYS" = mac ] || [ "$hleft" = 0 ]; } && echo 1)" \
-    "$cmds commands, $slow over their limit${slows:+ ($slows)}; start $(awk '$1 == "start"' "$WORK/c.log" | stats /dev/stdin 3), $verb $(awk -v v="$verb" '$1 == v' "$WORK/c.log" | stats /dev/stdin 3); left: $left containers, $host (given 10 s to go); $dfm"
+  local sfirst; sfirst=$(sed 's/[0-9a-f]\{12,64\}/ID/g' "$WORK/s.bad" | sort | uniq -c | sort -rn | head -3 | sed 's/^ *//' | paste -sd ';' -)
+  check "$name" "$([ "$slow" = 0 ] && [ "$left" = 0 ] && [ "$s_bad" = 0 ] && { [ "$SYS" = mac ] || [ "$hleft" = 0 ]; } && echo 1)" \
+    "$cmds commands, $slow over their limit${slows:+ ($slows)}; start $(awk '$1 == "start"' "$WORK/c.log" | stats /dev/stdin 3), $verb $(awk -v v="$verb" '$1 == v' "$WORK/c.log" | stats /dev/stdin 3); racing starts: $s_ok started$([ "$verb" = rm ] && echo ", $s_removal marked for removal, $s_gone gone"), $s_bad otherwise${sfirst:+ ($sfirst)}; left: $left containers, $host (given 10 s to go); $dfm"
 }
 selected rm-f-during-start && during_start rm-f-during-start rm
 selected stop-during-start && during_start stop-during-start stop
