@@ -922,7 +922,8 @@ t filter-id "fa" bash -c "$D ps --filter id=\$($D inspect -f '{{.Id}}' fa | cut 
 code filter-invalid 1 $D ps --filter bogus=1
 t filter-images-ref "alpine" $D images --filter reference=alpine --format '{{.Repository}}'
 t filter-images-ref-miss "0" bash -c "$D images -q --filter reference=nosuchimage | wc -l | tr -d ' '"
-t filter-images-dangling "0" bash -c "$D images -q --filter dangling=true | wc -l | tr -d ' '"
+# Whatever untagged images an earlier build left, dangling=true lists nothing that has a name.
+t filter-images-dangling "named 0" bash -c "echo named \$($D images -a --filter dangling=true --format '{{.Repository}}' | grep -v '<none>' | wc -l | tr -d ' ')"
 $D network create --label team=a fnet >/dev/null
 t filter-network-label "fnet" $D network ls --filter label=team=a --format '{{.Name}}'
 t filter-network-type "fnet" $D network ls --filter type=custom --format '{{.Name}}'
@@ -1297,6 +1298,35 @@ t events-json "timeNano" bash -c "$D events --since 30s --until=-1s --format '{{
 # Prune only what this suite labels: never the user's stopped containers.
 t container-prune "Total reclaimed space" bash -c "$D create --name prunable --label kiri-e2e=1 alpine >/dev/null; $D container prune -f --filter label=kiri-e2e=1"
 code pruned-gone 1 $D inspect prunable
+# The suite's own untagged image ($i), made from alpine and labelled
+# kiri-e2e-own=1, so every check below can name it. Docker lists it as
+# <none>:<none>, picks it with dangling=true and leaves it out with
+# dangling=false (Kiri once listed it as "sha256:<hex>" and never as dangling).
+OWN_UNTAGGED="c=\$($D create alpine true) && i=\$($D export \$c | $D import -c 'LABEL kiri-e2e-own=1' -) && $D rm \$c >/dev/null && trap '$D rmi \$i >/dev/null 2>&1' EXIT"
+t image-ls-untagged-row "<none>:<none>" bash -c "$OWN_UNTAGGED && $D image ls -a --filter label=kiri-e2e-own=1 --format '{{.Repository}}:{{.Tag}}'"
+t image-ls-dangling "<none>:<none>" bash -c "$OWN_UNTAGGED && $D image ls --filter dangling=true --filter label=kiri-e2e-own=1 --format '{{.Repository}}:{{.Tag}}'"
+t image-ls-dangling-false "NOT-LISTED" bash -c "$OWN_UNTAGGED && ($D image ls -q --no-trunc --filter dangling=false | grep -q \$i && echo LISTED || echo NOT-LISTED)"
+t image-ls-until "UNTIL-OK" bash -c "$OWN_UNTAGGED && out=\$($D image ls -q --filter until=1h --filter label=kiri-e2e-own=1) && [ -z \"\$out\" ] && echo UNTIL-OK"
+# Prunes with label filters. An engine that ignores them (Kiri before this
+# check) would remove every untagged image, so these first make sure the
+# engine lists the suite's own image as dangling, and prune nothing if not.
+# Two label filters that no object carries together keep everything in
+# Docker; system prune adds an until in the past so the build-cache prune,
+# which ignores label as Docker's does, keeps its cache too.
+OWN_SAFE="{ $D image ls -q --no-trunc --filter dangling=true --filter label=kiri-e2e-own=1 | grep -q \$i || { echo 'not pruned: this engine does not list dangling images'; exit 0; }; }"
+NOTHING="--filter label=kiri-e2e-own=1 --filter label=kiri-e2e-nothing=1"
+# The CLI sends a system prune's filters to the build-cache prune as well;
+# Docker's daemon takes label there and ignores it (it once answered
+# "invalid filter 'label'" after pruning the containers).
+t system-prune-label "Total reclaimed space" bash -c "$OWN_UNTAGGED && $OWN_SAFE && $D system prune -f $NOTHING --filter until=2000-01-01T00:00:00Z"
+# Every prune follows the labels, as Docker's: an untagged image, an unused
+# tagged one (-a) and a volume made with driver options all stay; networks
+# take until; the build-cache prune takes until as a date.
+t image-prune-label-keeps "KEPT" bash -c "$OWN_UNTAGGED && $OWN_SAFE && $D image prune -f $NOTHING >/dev/null && $D image inspect \$i >/dev/null && echo KEPT"
+t image-prune-all-label-keeps "KEPT" bash -c "$OWN_UNTAGGED && $OWN_SAFE && $D tag \$i kiri-e2e-unused:1 && $D image prune -af $NOTHING >/dev/null && $D image inspect kiri-e2e-unused:1 >/dev/null && echo KEPT; $D rmi kiri-e2e-unused:1 >/dev/null 2>&1"
+t network-prune-until "KEPT" bash -c "$D network create --label kiri-e2e=1 kiri-e2e-new >/dev/null && $D network prune -f --filter until=1h --filter label=kiri-e2e=1 && $D network inspect kiri-e2e-new >/dev/null && echo KEPT; $D network rm kiri-e2e-new >/dev/null 2>&1"
+t volume-prune-keeps-opts "KEPT" bash -c "$D volume create --label kiri-e2e-opts=1 -o type=tmpfs -o device=tmpfs kiri-e2e-opts >/dev/null && $D volume prune -af --filter label=kiri-e2e-opts=1 >/dev/null; $D volume inspect kiri-e2e-opts >/dev/null && echo KEPT; $D volume rm kiri-e2e-opts >/dev/null 2>&1"
+t build-prune-until-date "CachesDeleted" bash -c "curl -s -X POST --unix-socket $(printf %q "$SOCK") 'http://kiri/build/prune?filters=%7B%22until%22%3A%5B%222000-01-01%22%5D%7D'"
 t system-df "Images" $D system df
 t system-df-v "VOLUME NAME" $D system df -v
 # Real sizes, measured on the engine's disk: a volume and a container that

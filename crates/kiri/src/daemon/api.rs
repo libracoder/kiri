@@ -534,30 +534,69 @@ fn merge_labels(image_cfg: &Value, body_labels: &Value) -> Value {
 }
 
 fn images(req: &Request, engine: &Engine) -> Result<Value, Error> {
-    let f = filters(req, &["reference", "dangling", "label", "label!"])?;
+    let f = filters(req, &["reference", "dangling", "label", "label!", "before", "since", "until"])?;
     let mut list = engine.store.images()?;
     // Newest first, as Docker lists them (#364).
     list.sort_by_key(|i| std::cmp::Reverse(time::parse_unix(&i.created)));
-    // Every stored image is tagged, so there are no dangling ones.
-    if f.bool("dangling") == Some(true) {
-        return Ok(json!([]));
+    let now = std::time::SystemTime::now();
+    let created = |i: &kiri_image::Image| time::docker_timestamp(&i.created, now);
+    // Docker's rules (moby daemon/images/image_list.go): `dangling` is a
+    // strict boolean; `before`/`since` name images (the oldest `before`,
+    // the newest `since`, an unknown name is an error); `until` is a time
+    // and narrows `before`; `reference` never lists an untagged image.
+    let dangling = image_list_dangling(&f)?;
+    let mut before: Option<f64> = None;
+    let mut since: Option<f64> = None;
+    for (key, slot) in [("before", &mut before), ("since", &mut since)] {
+        for name in f.values(key).unwrap_or_default() {
+            let i = engine.image(name)?.ok_or_else(|| Error::NotFound(format!("No such image: {name}")))?;
+            if let Some(t) = created(&i) {
+                *slot = Some(match (*slot, key) {
+                    (None, _) => t,
+                    (Some(s), "before") => s.min(t),
+                    (Some(s), _) => s.max(t),
+                });
+            }
+        }
+    }
+    for v in f.values("until").unwrap_or_default() {
+        let t = time::docker_timestamp(v, now).ok_or_else(|| Error::BadRequest(format!("failed to parse value as time or duration: {v:?}")))?;
+        before = Some(before.map_or(t, |b| b.min(t)));
     }
     let labels = engine.image_labels(&list);
     Ok(Value::Array(
         list.iter()
             .zip(labels)
             .filter_map(|(i, labels)| {
-                if !f.any("reference", |p| reference_matches(p, &i.name)) {
+                // Kiri keeps an untagged image under its ID.
+                let untagged = i.name.starts_with("sha256:") && !list.iter().any(|o| o.config_digest == i.config_digest && !o.name.starts_with("sha256:"));
+                if i.name.starts_with("sha256:") && !untagged {
+                    return None;
+                }
+                if dangling.is_some_and(|d| d != untagged) {
+                    return None;
+                }
+                if (untagged && f.values("reference").is_some()) || (!untagged && !f.any("reference", |p| reference_matches(p, &i.name))) {
                     return None;
                 }
                 if !f.labels(&labels) {
                     return None;
                 }
+                let t = created(i);
+                if before.is_some_and(|b| !t.is_some_and(|t| t < b)) || since.is_some_and(|s| !t.is_some_and(|t| t > s)) {
+                    return None;
+                }
+                // Untagged: no names; before API 1.43 Docker wrote `<none>` ones.
+                let (tags, digests) = match (untagged, req.api_version.is_some_and(|v| v < (1, 43))) {
+                    (false, _) => (json!([i.name]), json!(i.repo_digest().into_iter().collect::<Vec<_>>())),
+                    (true, false) => (json!([]), json!([])),
+                    (true, true) => (json!(["<none>:<none>"]), json!(["<none>@<none>"])),
+                };
                 Some(json!({
                     "Id": i.config_digest,
                     "ParentId": "",
-                    "RepoTags": [i.name],
-                    "RepoDigests": i.repo_digest().into_iter().collect::<Vec<_>>(),
+                    "RepoTags": tags,
+                    "RepoDigests": digests,
                     "Created": time::parse_unix(&i.created),
                     "Size": i.size,
                     "SharedSize": -1,
@@ -572,6 +611,18 @@ fn images(req: &Request, engine: &Engine) -> Result<Value, Error> {
     ))
 }
 
+/// The image list's `dangling` filter as Docker's `GetBoolOrDefault` reads
+/// it: `true`/`1` or `false`/`0`; both, or anything else, is refused.
+fn image_list_dangling(f: &Filters) -> Result<Option<bool>, Error> {
+    let Some(v) = f.values("dangling") else { return Ok(None) };
+    let yes = v.iter().any(|s| s == "1" || s == "true");
+    let no = v.iter().any(|s| s == "0" || s == "false");
+    if yes == no {
+        return Err(Error::BadRequest(format!("invalid filter 'dangling=[{}]'", v.join(" "))));
+    }
+    Ok(Some(yes))
+}
+
 fn image_inspect(engine: &Engine, name: &str) -> Result<Value, Error> {
     let i = engine.image(name)?.ok_or_else(|| Error::NotFound(format!("No such image: {name}")))?;
     let cfg = image_config_json(engine, &i.config_digest);
@@ -582,10 +633,12 @@ fn image_inspect(engine: &Engine, name: &str) -> Result<Value, Error> {
         Some(ids) => ids.clone(),
         None => i.layers.iter().map(|l| Value::String(l.digest.clone())).collect(),
     };
+    // An untagged image (kept under its ID) has no names, as in Docker.
+    let untagged = i.name.starts_with("sha256:");
     Ok(json!({
         "Id": i.config_digest,
-        "RepoTags": [i.name],
-        "RepoDigests": i.repo_digest().into_iter().collect::<Vec<_>>(),
+        "RepoTags": if untagged { json!([]) } else { json!([i.name]) },
+        "RepoDigests": if untagged { json!([]) } else { json!(i.repo_digest().into_iter().collect::<Vec<_>>()) },
         "Created": i.created,
         "Size": i.size,
         "Architecture": i.platform.rsplit('/').next().unwrap_or(go_arch()),
@@ -1668,11 +1721,22 @@ fn volume_prune(req: &Request, engine: &Engine) -> Result<Value, Error> {
         return Err(Error::Conflict(why));
     }
     let f = filters(req, &["label", "label!", "all"])?;
-    let all = f.bool("all") == Some(true);
+    // `all` as Docker's withPrune reads it (strconv.ParseBool, one value).
+    let all = match f.values("all") {
+        None => false,
+        Some([v]) => match v.as_str() {
+            "1" | "t" | "T" | "TRUE" | "true" | "True" => true,
+            "0" | "f" | "F" | "FALSE" | "false" | "False" => false,
+            _ => return Err(Error::BadRequest(format!("invalid filter 'all': strconv.ParseBool: parsing {v:?}: invalid syntax"))),
+        },
+        Some(v) => return Err(Error::BadRequest(format!("invalid filter 'all=[{}]': only one value is expected", v.join(" ")))),
+    };
+    // Docker never prunes a volume made with driver options (a bind or
+    // tmpfs `--opt`): its prune takes only those with none.
     let unused: Vec<String> = engine
         .volume_list()
         .into_iter()
-        .filter(|v| (all || v.anonymous) && f.labels(&v.labels) && engine.volume_users(&v.name).is_empty())
+        .filter(|v| (all || v.anonymous) && v.options.is_empty() && f.labels(&v.labels) && engine.volume_users(&v.name).is_empty())
         .map(|v| v.name)
         .collect();
     for n in &unused {
@@ -2733,12 +2797,20 @@ fn network_prune(req: &Request, engine: &Engine) -> Result<Value, Error> {
     if let Some(why) = engine.refusal("Networks were not pruned, because the container list may be missing containers that use them") {
         return Err(Error::Conflict(why));
     }
-    let f = filters(req, &["label", "label!"])?;
+    // Docker takes `until` here too (moby daemon/prune.go); `docker system
+    // prune --filter until=…` sends it.
+    let f = filters(req, &["label", "label!", "until"])?;
+    let until = super::ops::prune_until(&f, "until")?;
     let nets = engine.lock_net();
     let unused: Vec<String> = nets
         .all()
         .iter()
-        .filter(|n| !n.builtin() && !nets.in_use(&n.name) && f.labels(if n.labels.is_object() { &n.labels } else { &Value::Null }))
+        .filter(|n| {
+            !n.builtin()
+                && !nets.in_use(&n.name)
+                && f.labels(if n.labels.is_object() { &n.labels } else { &Value::Null })
+                && super::ops::before(until, n.created_ns as f64 / 1e9)
+        })
         .map(|n| n.name.clone())
         .collect();
     drop(nets);
@@ -3351,6 +3423,39 @@ pub(super) fn parse_signal(raw: &str) -> Result<u32, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One prune command sends its filters to every prune: volumes and
+    /// networks go only when their labels match, as in Docker; a volume
+    /// with driver options is never pruned; networks take `until`.
+    #[test]
+    fn volume_and_network_prune_follow_labels() {
+        let root = std::env::temp_dir().join(format!("kiri-prune-labels-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let engine = super::super::engine::boot_without_vm(&root);
+        engine.volume_ensure_with("v-keep", json!({"keep": "1"}), Default::default()).unwrap();
+        engine.volume_ensure_with("v-plain", json!({}), Default::default()).unwrap();
+        engine.volume_ensure_with("v-opts", json!({}), [("type".to_owned(), "tmpfs".to_owned()), ("device".to_owned(), "tmpfs".to_owned())].into()).unwrap();
+        let vp = |f: &str| volume_prune(&Request::internal("POST", "/volumes/prune", &[("filters", f)], Vec::new()), &engine);
+        let names = |v: Result<Value, Error>, key: &str| -> Vec<String> { serde_json::from_value(v.unwrap()[key].clone()).unwrap() };
+        assert!(names(vp(r#"{"all":["true"],"label":["nope=1"]}"#), "VolumesDeleted").is_empty());
+        assert!(names(vp(r#"{"label!":["keep=1"]}"#), "VolumesDeleted").is_empty(), "named volumes need all");
+        assert!(matches!(vp(r#"{"all":["yes"]}"#), Err(Error::BadRequest(_))));
+        assert_eq!(names(vp(r#"{"all":["True"],"label!":["keep=1"]}"#), "VolumesDeleted"), ["v-plain"]);
+        assert!(engine.volume_get("v-opts").is_some() && engine.volume_get("v-keep").is_some());
+
+        let settings = |labels: Value| super::super::network::Settings { labels, ..Default::default() };
+        engine.lock_net().create("n-keep", settings(json!({"keep": "1"}))).unwrap();
+        engine.lock_net().create("n-plain", settings(Value::Null)).unwrap();
+        let np = |f: &str| network_prune(&Request::internal("POST", "/networks/prune", &[("filters", f)], Vec::new()), &engine);
+        assert!(names(np(r#"{"label":["nope=1"]}"#), "NetworksDeleted").is_empty());
+        assert!(names(np(r#"{"until":["2000-01-01T00:00:00Z"]}"#), "NetworksDeleted").is_empty(), "made after the cut-off");
+        assert!(matches!(np(r#"{"until":["soon"]}"#), Err(Error::BadRequest(_))));
+        assert!(matches!(np(r#"{"until":["1h","2h"]}"#), Err(Error::BadRequest(_))));
+        assert_eq!(names(np(r#"{"until":["2999-01-01"],"label":["keep=1"]}"#), "NetworksDeleted"), ["n-keep"]);
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     /// An engine whose container list was damaged (a kept copy is there),
     /// with a named volume and a network no listed container uses: they may
@@ -4077,6 +4182,63 @@ mod tests {
         }
         // A stop signal Docker would not parse stops with SIGTERM.
         assert_eq!(signal("BOGUS"), 15);
+    }
+
+    /// The image list's filters as Docker's: an untagged image is listed
+    /// with no names (`<none>:<none>` in the CLI), `dangling` picks it or
+    /// leaves it out, and `before`, `since` and `until` work by creation time.
+    #[test]
+    fn image_list_filters_follow_docker() {
+        let root = std::env::temp_dir().join(format!("kiri-image-list-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let engine = super::super::engine::boot_without_vm(&root);
+        let mut untagged = String::new();
+        for (tag, created, labels) in [(Some("demo:new"), "2026-11-16T00:00:00Z", json!({"keep": "1"})), (None, "2020-01-01T00:00:00Z", json!({"keep": "1"})), (Some("demo:old"), "2019-01-01T00:00:00Z", Value::Null)] {
+            let cfg = json!({"created": created, "architecture": "arm64", "os": "linux", "config": {"Labels": labels}});
+            let mut w = engine.store.ingest().unwrap();
+            std::io::Write::write_all(&mut w, &serde_json::to_vec(&cfg).unwrap()).unwrap();
+            let (digest, _) = w.finish().unwrap();
+            if tag.is_none() {
+                untagged = digest.clone();
+            }
+            engine.store.put_image(kiri_image::archive::from_config(tag.map_or(digest.clone(), str::to_owned), &digest, &cfg, Vec::new())).unwrap();
+        }
+        let list = |f: &str, v: Option<(u32, u32)>| {
+            let mut r = Request::internal("GET", "/images/json", &[("filters", f)], Vec::new());
+            r.api_version = v;
+            super::images(&r, &engine)
+        };
+        // Rows by name, the untagged one as its ID.
+        let rows = |f: &str| -> Vec<String> {
+            list(f, None).unwrap().as_array().unwrap().iter().map(|r| r["RepoTags"][0].as_str().map_or_else(|| r["Id"].as_str().unwrap().to_owned(), str::to_owned)).collect()
+        };
+        let u = untagged.as_str();
+        assert_eq!(rows(""), ["demo:new", u, "demo:old"]);
+        let all = list("", None).unwrap();
+        let row = all.as_array().unwrap().iter().find(|r| r["Id"] == u).unwrap();
+        assert_eq!((row["RepoTags"].clone(), row["RepoDigests"].clone()), (json!([]), json!([])));
+        let old = list("", Some((1, 41))).unwrap();
+        let row = old.as_array().unwrap().iter().find(|r| r["Id"] == u).unwrap();
+        assert_eq!((row["RepoTags"].clone(), row["RepoDigests"].clone()), (json!(["<none>:<none>"]), json!(["<none>@<none>"])));
+        assert_eq!(rows(r#"{"dangling":["true"]}"#), [u]);
+        assert_eq!(rows(r#"{"dangling":{"1":true}}"#), [u]);
+        assert_eq!(rows(r#"{"dangling":["false"]}"#), ["demo:new", "demo:old"]);
+        assert_eq!(rows(r#"{"dangling":["true"],"label":["keep=1"]}"#), [u]);
+        assert!(matches!(list(r#"{"dangling":["yes"]}"#, None), Err(Error::BadRequest(m)) if m == "invalid filter 'dangling=[yes]'"));
+        assert!(matches!(list(r#"{"dangling":["true","false"]}"#, None), Err(Error::BadRequest(_))));
+        assert_eq!(rows(r#"{"reference":["demo*"]}"#), ["demo:new", "demo:old"]);
+        assert_eq!(rows(r#"{"label":["keep=1"]}"#), ["demo:new", u]);
+        assert_eq!(rows(r#"{"before":["demo:new"]}"#), [u, "demo:old"]);
+        assert_eq!(rows(r#"{"since":["demo:old"]}"#), ["demo:new", u]);
+        assert_eq!(rows(r#"{"since":["demo:old"],"before":["demo:new"]}"#), [u]);
+        assert!(matches!(list(r#"{"before":["nope:1"]}"#, None), Err(Error::NotFound(_))));
+        assert_eq!(rows(r#"{"until":["2021-01-01T00:00:00Z"]}"#), [u, "demo:old"]);
+        assert!(matches!(list(r#"{"until":["someday"]}"#, None), Err(Error::BadRequest(_))));
+        let inspected = super::image_inspect(&engine, u).unwrap();
+        assert_eq!((inspected["RepoTags"].clone(), inspected["RepoDigests"].clone()), (json!([]), json!([])));
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// `docker images REPO` sends `{"reference":{"REPO":true}}`; a registry
