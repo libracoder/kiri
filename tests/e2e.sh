@@ -254,7 +254,8 @@ t pull-alpine "alpine:latest" $D pull "$KIRI_REG/alpine:latest"
 as_plain alpine:latest
 t pull-busybox "busybox" $D pull "$KIRI_REG/busybox"
 as_plain busybox:latest
-t pull-tag "3.21" $D pull "$KIRI_REG/alpine:3.21"
+# "Status:" and not the tag: a refused pull names the tag too, and would pass.
+t pull-tag "Status:" $D pull "$KIRI_REG/alpine:3.21"
 t images-list "alpine" $D images
 # Newest first, as Docker lists them (#364).
 t images-newest-first "sorted" bash -c "$D images --format '{{.CreatedAt}}' | sort -rc && echo sorted"
@@ -693,7 +694,9 @@ t port-ps "0.0.0.0:18180->80/tcp" $D ps --filter name=pub --format '{{.Ports}}'
 t port-cmd "18180" $D port pub
 t port-inspect '{"80/tcp":[{"HostIp":"","HostPort":"18180"}]} {"80/tcp":{}}' $D inspect -f '{{json .HostConfig.PortBindings}} {{json .Config.ExposedPorts}}' pub
 t distribution '"Platforms":[{"architecture":' curl -s --unix-socket "$SOCK" "http://d/v1.47/distribution/$KIRI_REG/alpine:3.21/json"
-t distribution-missing "404" curl -s -o /dev/null -w '%{http_code}' --unix-socket "$SOCK" "http://d/v1.47/distribution/$KIRI_REG/no-such-image-kiri-test/json"
+# The body is printed too: a registry's "too many requests" comes back as a
+# 500 that says so.
+t distribution-missing " 404" curl -s -w ' %{http_code}' --unix-socket "$SOCK" "http://d/v1.47/distribution/$KIRI_REG/no-such-image-kiri-test/json"
 t port-many "50" bash -c "for i in \$(seq 50); do curl -s -m 5 -o /dev/null -w '%{http_code}\n' http://localhost:18180; done | grep -c 200"
 t port-parallel "20" bash -c "for i in \$(seq 20); do curl -s -m 10 -o /dev/null -w '%{http_code}\n' http://localhost:18180 & done; wait"
 t port-big "10485760" bash -c "$D exec pub sh -c 'head -c 10485760 /dev/urandom > /usr/share/nginx/html/big.bin' && curl -s -m 30 -o /dev/null -w '%{size_download}' http://localhost:18180/big.bin"
