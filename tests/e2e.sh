@@ -154,6 +154,8 @@ t images-list "alpine" $D images
 t images-newest-first "sorted" bash -c "$D images --format '{{.CreatedAt}}' | sort -rc && echo sorted"
 t image-inspect-arch "$($D version -f '{{.Server.Arch}}')" $D image inspect -f '{{.Architecture}}' alpine
 t image-inspect-cmd "/bin/sh" $D image inspect -f '{{.Config.Cmd}}' alpine
+# RootFS.Layers are the config's uncompressed diff_ids, not the manifest's compressed blob digests.
+t image-inspect-rootfs-diffid "same" bash -c "cfg=blobs/sha256/\$($D image inspect -f '{{.Id}}' alpine | sed 's/^sha256://'); want=\$($D save alpine | tar -xOf - \"\$cfg\" | tr -d '\n\r ' | sed -n 's/.*\"diff_ids\":\[\"\(sha256:[0-9a-f]*\)\".*/\1/p'); [ -n \"\$want\" ] && [ \"\$($D image inspect -f '{{index .RootFS.Layers 0}}' alpine)\" = \"\$want\" ] && echo same"
 code pull-missing 1 $D pull "$KIRI_REG/kiri-does-not-exist/nope:none"
 t rmi "Untagged" $D rmi "$KIRI_REG/alpine:3.21"
 code rmi-missing 1 $D rmi "$KIRI_REG/alpine:3.21"
@@ -208,6 +210,15 @@ t user-groups-primary "1000 2000" $D run --rm -u 1000:1000 --group-add 2000 alpi
 t user-groups-exec "65534" bash -c "$D run -d --name groupsexec alpine sleep 60 >/dev/null && $D exec -u nobody groupsexec sh -c 'grep Groups /proc/self/status | cut -f2'; $D rm -f groupsexec >/dev/null"
 t entrypoint "x" $D run --rm --entrypoint echo alpine x
 t entrypoint-image "nginx version" $D run --rm nginx:alpine nginx -v
+# Image labels (#393): shown by inspect and the list, filtered on, inherited
+# by a container (its own --label wins) and kept by commit, as on Docker.
+t image-labels-inspect "docker-maint@nginx.com" $D image inspect -f '{{index .Config.Labels "maintainer"}}' nginx:alpine
+t image-labels-filter "nginx only" bash -c "r=\$($D images --filter label=maintainer --format '{{.Repository}}'); grep -qx nginx <<<\"\$r\" && ! grep -qx alpine <<<\"\$r\" && echo nginx only"
+t image-labels-filter-not "alpine only" bash -c "r=\$($D images --filter 'label!=maintainer' --format '{{.Repository}}'); grep -qx alpine <<<\"\$r\" && ! grep -qx nginx <<<\"\$r\" && echo alpine only"
+t image-labels-api-empty '"Labels":{}' bash -c "curl -s --unix-socket \"$SOCK\" 'http://d/images/json?filters=%7B%22reference%22%3A%5B%22alpine%22%5D%7D'"
+t container-labels-inherited "docker-maint@nginx.com" bash -c "$D create --name lbl-inherit nginx:alpine >/dev/null && $D inspect -f '{{index .Config.Labels \"maintainer\"}}' lbl-inherit; $D rm -f lbl-inherit >/dev/null"
+t container-labels-override "me 1" bash -c "$D create --name lbl-own --label maintainer=me --label x=1 nginx:alpine >/dev/null && $D inspect -f '{{index .Config.Labels \"maintainer\"}} {{index .Config.Labels \"x\"}}' lbl-own; $D rm -f lbl-own >/dev/null"
+t commit-keeps-labels "docker-maint@nginx.com> 1" bash -c "$D rm -f lbl-commit >/dev/null 2>&1; $D run --name lbl-commit --label x=1 nginx:alpine true >/dev/null && $D commit lbl-commit kiri-test/labels:1 >/dev/null && $D image inspect -f '{{index .Config.Labels \"maintainer\"}} {{index .Config.Labels \"x\"}}' kiri-test/labels:1; $D rm -f lbl-commit >/dev/null; $D rmi kiri-test/labels:1 >/dev/null 2>&1"
 # An empty --entrypoint clears the image's (the CLI sends [""]) and runs the
 # command alone; with no command there is nothing to run, as on Docker.
 t entrypoint-empty-eq "ok" $D run --rm --entrypoint= alpine /bin/sh -c 'echo ok'

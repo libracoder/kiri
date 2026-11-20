@@ -506,10 +506,6 @@ pub(super) fn image_labels_from(cfg: &Value) -> Value {
     }
 }
 
-pub(super) fn image_labels(engine: &Engine, i: &kiri_image::Image) -> Value {
-    image_labels_from(&image_config_json(engine, &i.config_digest))
-}
-
 fn merge_labels(image_cfg: &Value, body_labels: &Value) -> Value {
     let mut merged = serde_json::Map::new();
     if let Value::Object(img) = &image_cfg["config"]["Labels"] {
@@ -538,13 +534,14 @@ fn images(req: &Request, engine: &Engine) -> Result<Value, Error> {
     if f.bool("dangling") == Some(true) {
         return Ok(json!([]));
     }
+    let labels = engine.image_labels(&list);
     Ok(Value::Array(
         list.iter()
-            .filter_map(|i| {
+            .zip(labels)
+            .filter_map(|(i, labels)| {
                 if !f.any("reference", |p| reference_matches(p, &i.name)) {
                     return None;
                 }
-                let labels = image_labels(engine, i);
                 if !f.labels(&labels) {
                     return None;
                 }
@@ -570,6 +567,13 @@ fn images(req: &Request, engine: &Engine) -> Result<Value, Error> {
 fn image_inspect(engine: &Engine, name: &str) -> Result<Value, Error> {
     let i = engine.image(name)?.ok_or_else(|| Error::NotFound(format!("No such image: {name}")))?;
     let cfg = image_config_json(engine, &i.config_digest);
+    // Docker's RootFS.Layers are the image config's uncompressed diff_ids,
+    // not the manifest's compressed blob digests (scanners like Trivy match
+    // them against the tar layers from `docker save`).
+    let rootfs_layers: Vec<Value> = match cfg["rootfs"]["diff_ids"].as_array() {
+        Some(ids) => ids.clone(),
+        None => i.layers.iter().map(|l| Value::String(l.digest.clone())).collect(),
+    };
     Ok(json!({
         "Id": i.config_digest,
         "RepoTags": [i.name],
@@ -587,7 +591,7 @@ fn image_inspect(engine: &Engine, name: &str) -> Result<Value, Error> {
             "Labels": image_labels_from(&cfg),
             "Healthcheck": cfg["config"]["Healthcheck"].clone(),
         },
-        "RootFS": {"Type": "layers", "Layers": i.layers.iter().map(|l| &l.digest).collect::<Vec<_>>()},
+        "RootFS": {"Type": cfg["rootfs"]["type"].as_str().unwrap_or("layers"), "Layers": rootfs_layers},
     }))
 }
 
@@ -4093,6 +4097,78 @@ mod tests {
         io::Write::write_all(&mut client, b"in").unwrap();
         assert!(rx.recv_timeout(Duration::from_secs(10)).is_ok());
     }
+
+    /// Docker's `RootFS.Layers` are the image config's uncompressed `diff_ids`,
+    /// not the manifest's compressed layer digests (scanners like Trivy look
+    /// up layers by `DiffID` against the tar from `docker save`).
+    #[test]
+    fn image_inspect_reports_uncompressed_diff_ids_in_rootfs() {
+        use std::io::Write;
+        let (root, engine) = engine_in("inspect-diff-ids", false);
+        let cfg = json!({
+            "architecture": "amd64",
+            "os": "linux",
+            "created": "2026-11-18T00:00:00Z",
+            "config": {
+                "Env": ["PATH=/usr/local/bin:/usr/bin"],
+                "Healthcheck": {"Test": ["CMD-SHELL", "true"]}
+            },
+            "rootfs": {
+                "type": "layers",
+                "diff_ids": [
+                    "sha256:9bd858237f92a7b58be7f21bc17a45578f2ba486be6968fe4bd975a312142db1",
+                    "sha256:af695414f7353af49c3ce40f3084457fe507c665b297ecfa2fe791eeac451dbb"
+                ]
+            }
+        });
+        let mut w = engine.store.ingest().unwrap();
+        w.write_all(&serde_json::to_vec(&cfg).unwrap()).unwrap();
+        let (cfg_digest, _) = w.finish().unwrap();
+
+        let layers = vec![
+            kiri_image::Layer {
+                digest: "sha256:7a48b8f0c8f6814ce77ef58a6d6e23c948fd30a793ce9d03c2a8b136c1317a49".into(),
+                size: 1024,
+                media_type: "application/vnd.oci.image.layer.v1.tar+gzip".into(),
+            },
+            kiri_image::Layer {
+                digest: "sha256:aa57db58390911503d469fd9510d6f16ab424c25a8322d669a030e44ef73d421".into(),
+                size: 2048,
+                media_type: "application/vnd.oci.image.layer.v1.tar+gzip".into(),
+            },
+        ];
+        let image = kiri_image::archive::from_config("demo:diffids".into(), &cfg_digest, &cfg, layers.clone());
+        engine.store.put_image(image).unwrap();
+
+        let inspected = image_inspect(&engine, "demo:diffids").unwrap();
+        assert_eq!(
+            inspected["RootFS"],
+            json!({
+                "Type": "layers",
+                "Layers": [
+                    "sha256:9bd858237f92a7b58be7f21bc17a45578f2ba486be6968fe4bd975a312142db1",
+                    "sha256:af695414f7353af49c3ce40f3084457fe507c665b297ecfa2fe791eeac451dbb"
+                ]
+            })
+        );
+        assert_eq!(inspected["Config"]["Healthcheck"]["Test"], json!(["CMD-SHELL", "true"]));
+
+        // When the config blob is absent, fall back to the manifest's layer digests.
+        let mut fallback = test_image("demo:no-cfg");
+        fallback.layers = layers;
+        engine.store.put_image(fallback).unwrap();
+        let fallback_inspected = image_inspect(&engine, "demo:no-cfg").unwrap();
+        assert_eq!(
+            fallback_inspected["RootFS"]["Layers"],
+            json!([
+                "sha256:7a48b8f0c8f6814ce77ef58a6d6e23c948fd30a793ce9d03c2a8b136c1317a49",
+                "sha256:aa57db58390911503d469fd9510d6f16ab424c25a8322d669a030e44ef73d421"
+            ])
+        );
+
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
 
 #[cfg(test)]
@@ -4216,6 +4292,13 @@ mod network_option_tests {
         assert!(plain["Config"].as_object().unwrap().contains_key("Labels"));
         assert!(plain["Config"]["Labels"].is_null());
 
+        // The list shows `{}` for an image without labels, where inspect
+        // shows `null`, as Docker does.
+        let all = super::images(&Request::internal("GET", "/images/json", &[], Vec::new()), &engine).unwrap();
+        let row = |name: &str| all.as_array().unwrap().iter().find(|r| r["RepoTags"][0] == name).unwrap()["Labels"].clone();
+        assert_eq!(row("demo:plain"), json!({}));
+        assert_eq!(row("demo:labeled")["keep"], "image");
+
         let filtered = super::images(
             &Request::internal("GET", "/images/json", &[("filters", r#"{"label":["keep=image"]}"#)], Vec::new()),
             &engine,
@@ -4255,6 +4338,42 @@ mod network_option_tests {
             })
         );
 
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `docker images` with 200 labelled images, 50 times: prints the median.
+    /// A measure, not a check (cargo test -p kiri images_listing_speed --
+    /// --ignored --nocapture).
+    #[test]
+    #[ignore]
+    fn images_listing_speed() {
+        let dir = std::env::temp_dir().join(format!("kiri-images-speed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = kiri_image::Store::open(&dir).unwrap();
+        for n in 0..200 {
+            let cfg = json!({
+                "created": "2026-11-16T00:00:00Z", "architecture": "arm64", "os": "linux",
+                "config": {"Env": ["PATH=/usr/bin"], "Cmd": ["sh"], "Labels": {"maintainer": "someone", "n": n.to_string(), "org.opencontainers.image.source": "https://example.com/r"}}
+            });
+            let bytes = serde_json::to_vec(&cfg).unwrap();
+            let mut w = store.ingest().unwrap();
+            io::Write::write_all(&mut w, &bytes).unwrap();
+            let (digest, _) = w.finish().unwrap();
+            store.put_image(kiri_image::archive::from_config(format!("speed/img{n}:latest"), &digest, &cfg, Vec::new())).unwrap();
+        }
+        let engine = Engine::boot(store).unwrap();
+        let req = Request::internal("GET", "/images/json", &[], Vec::new());
+        assert_eq!(super::images(&req, &engine).unwrap().as_array().unwrap().len(), 200);
+        let mut times: Vec<_> = (0..50)
+            .map(|_| {
+                let t = std::time::Instant::now();
+                std::hint::black_box(super::images(&req, &engine).unwrap());
+                t.elapsed()
+            })
+            .collect();
+        times.sort();
+        eprintln!("images() with 200 images: median {:?}, min {:?}, max {:?}", times[25], times[0], times[49]);
         drop(engine);
         let _ = std::fs::remove_dir_all(&dir);
     }

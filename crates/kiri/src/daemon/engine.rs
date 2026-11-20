@@ -957,6 +957,11 @@ pub struct Engine {
     /// Shares of Kubernetes services and pods: the Mac port → its forward
     /// to a cluster address. They go when the cluster does.
     k8s_fwd: Mutex<HashMap<u16, super::ports::Forwards>>,
+    /// Each image's config Labels by config digest, for `docker images` and
+    /// `system df`, so a listing does not read every config from disk.
+    /// Configs are content-addressed, so an entry never goes stale; entries
+    /// of images no longer stored are dropped on the next listing.
+    image_labels: Mutex<HashMap<String, serde_json::Value>>,
 }
 
 /// k3s's pod and service ranges, which `kiri k8s` leaves at their defaults.
@@ -1060,6 +1065,7 @@ impl Engine {
             k8s_lb: Mutex::new(HashMap::new()),
             k8s_routes: Mutex::new(None),
             k8s_fwd: Mutex::new(HashMap::new()),
+            image_labels: Mutex::new(HashMap::new()),
         });
         let _ = engine.me.set(Arc::downgrade(&engine));
         engine.start_syncer();
@@ -2341,6 +2347,42 @@ impl Engine {
     /// Finds an image by the name a client used.
     pub fn image(&self, name: &str) -> io::Result<Option<Image>> {
         Ok(image_named(self.store.images()?, name))
+    }
+
+    /// The config Labels of each of `images`, which must be the whole image
+    /// list (`store.images()`): a config is read from disk only the first
+    /// time it is seen, and entries for images not in the list are dropped.
+    /// An image without labels has `{}`, as Docker's image list and
+    /// `system df` rows show it (image inspect shows `null`).
+    pub fn image_labels(&self, images: &[Image]) -> Vec<serde_json::Value> {
+        let mut cache = self.image_labels.lock().unwrap_or_else(|e| e.into_inner());
+        // Rebuilt from the list each time, which drops removed images.
+        let mut old = std::mem::take(&mut *cache);
+        images
+            .iter()
+            .map(|i| {
+                let digest = &i.config_digest;
+                if let Some(labels) = cache.get(digest) {
+                    return labels.clone();
+                }
+                let labels = match old.remove(digest) {
+                    Some(labels) => labels,
+                    None => {
+                        // Not kept when the config could not be read, so a
+                        // passing read error does not stick.
+                        let Some(cfg) = self.store.read_config(digest).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()) else {
+                            return serde_json::json!({});
+                        };
+                        match super::api::image_labels_from(&cfg) {
+                            serde_json::Value::Null => serde_json::json!({}),
+                            labels => labels,
+                        }
+                    }
+                };
+                cache.insert(digest.clone(), labels.clone());
+                labels
+            })
+            .collect()
     }
 
     /// The IDs of the images that `docker ps --filter ancestor=` values name.
@@ -5728,6 +5770,48 @@ mod records_tests {
         let engine = boot(&root);
         assert!(!engine.keeps_everything());
         assert!(!super::super::logfile::dir(&root, "orphan").exists());
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+mod image_labels_cache_tests {
+    use super::*;
+
+    fn put(store: &Store, name: &str, labels: serde_json::Value) -> String {
+        let cfg = serde_json::json!({"created": "2026-11-16T00:00:00Z", "architecture": "arm64", "os": "linux", "config": {"Labels": labels}});
+        let mut w = store.ingest().unwrap();
+        io::Write::write_all(&mut w, &serde_json::to_vec(&cfg).unwrap()).unwrap();
+        let (digest, _) = w.finish().unwrap();
+        store.put_image(kiri_image::archive::from_config(name.into(), &digest, &cfg, Vec::new())).unwrap();
+        digest
+    }
+
+    /// A listing reads each image's config once; later ones use what was
+    /// read, a removed image's entry goes, and a new image is read.
+    #[test]
+    fn image_labels_are_read_once_and_follow_the_image_list() {
+        let root = std::env::temp_dir().join(format!("kiri-label-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Store::open(&root).unwrap();
+        let a = put(&store, "demo:a", serde_json::json!({"k": "a"}));
+        put(&store, "demo:b", serde_json::json!({}));
+        let engine = Engine::boot(store).unwrap();
+        let labels = |e: &Engine| e.image_labels(&e.store.images().unwrap());
+        assert_eq!(labels(&engine), vec![serde_json::json!({"k": "a"}), serde_json::json!({})]);
+
+        // Read from memory now: gone from disk, the labels are still there.
+        std::fs::remove_file(engine.store.blob_path(&a).unwrap()).unwrap();
+        assert_eq!(labels(&engine)[0], serde_json::json!({"k": "a"}));
+
+        engine.store.remove_image("demo:a").unwrap();
+        let c = put(&engine.store, "demo:c", serde_json::json!({"k": "c"}));
+        assert_eq!(labels(&engine), vec![serde_json::json!({}), serde_json::json!({"k": "c"})]);
+        let cache = engine.image_labels.lock().unwrap();
+        assert!(!cache.contains_key(&a), "a removed image's labels are dropped");
+        assert!(cache.contains_key(&c));
+        drop(cache);
         drop(engine);
         let _ = std::fs::remove_dir_all(root);
     }

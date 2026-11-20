@@ -466,9 +466,11 @@ fn system_df(engine: &Engine) -> Result<Value, Error> {
         layers_size += d.layers.iter().filter(|(hex, _)| !seen.contains(hex.as_str())).map(|(_, b)| b).sum::<u64>();
     }
     let image_size = |i: &kiri_image::Image| -> u64 { i.layers.iter().map(layer_size).sum() };
+    let labels = engine.image_labels(&images);
     let image_rows: Vec<Value> = images
         .iter()
-        .map(|i| {
+        .zip(labels)
+        .map(|(i, labels)| {
             let size = image_size(i);
             let shared: u64 = i.layers.iter().filter(|l| users.get(l.digest.as_str()).is_some_and(|n| *n > 1)).map(layer_size).sum();
             json!({
@@ -480,7 +482,7 @@ fn system_df(engine: &Engine) -> Result<Value, Error> {
                 "Size": size,
                 "SharedSize": shared,
                 "VirtualSize": size,
-                "Labels": super::api::image_labels(engine, i),
+                "Labels": labels,
                 "Containers": used.iter().filter(|u| **u == i.config_digest).count(),
             })
         })
@@ -696,6 +698,30 @@ mod disk_usage_tests {
             other => panic!("image prune: {other:?}"),
         }
         assert_eq!(engine.store.images().unwrap().len(), 1, "the image is kept");
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// `system df` image rows carry the image's labels, and `{}` (not
+    /// `null`) for an image without any, as Docker's do.
+    #[test]
+    fn system_df_image_rows_carry_labels() {
+        use serde_json::{Value, json};
+        let root = std::env::temp_dir().join(format!("kiri-df-labels-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let engine = super::super::engine::boot_without_vm(&root);
+        for (name, labels) in [("demo:labeled", json!({"maintainer": "someone"})), ("demo:plain", Value::Null)] {
+            let cfg = json!({"created": "2026-11-16T00:00:00Z", "architecture": "arm64", "os": "linux", "config": {"Labels": labels}});
+            let mut w = engine.store.ingest().unwrap();
+            std::io::Write::write_all(&mut w, &serde_json::to_vec(&cfg).unwrap()).unwrap();
+            let (digest, _) = w.finish().unwrap();
+            engine.store.put_image(kiri_image::archive::from_config(name.into(), &digest, &cfg, Vec::new())).unwrap();
+        }
+        let df = super::system_df(&engine).unwrap();
+        let row = |name: &str| df["Images"].as_array().unwrap().iter().find(|r| r["RepoTags"][0] == name).unwrap()["Labels"].clone();
+        assert_eq!(row("demo:labeled"), json!({"maintainer": "someone"}));
+        assert_eq!(row("demo:plain"), json!({}));
         drop(engine);
         let _ = std::fs::remove_dir_all(root);
     }
