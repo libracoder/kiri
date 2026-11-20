@@ -69,7 +69,7 @@ t session-own "SID=1" "docker run --rm alpine sh -c 'echo SID=\$(cut -d\" \" -f6
 t exec-session-own "own" "docker exec web sh -c 's=\$(cut -d\" \" -f6 /proc/\$\$/stat); [ \"\$s\" = \"\$\$\" ] && echo own || echo \"session \$s\"'"
 t cp "copied" "echo copied > /tmp/x && docker cp /tmp/x web:/tmp/x && docker exec web cat /tmp/x"
 # What Testcontainers needs (#222, #121); see tests/testcontainers-api.py.
-for c in version cmd keepalive follow follow-created timestamps; do
+for c in version cmd keepalive close follow follow-created timestamps; do
   t "testcontainers-$c" "ok $c" "for i in \$(seq 60); do command -v python3 >/dev/null && break; sleep 1; done; python3 /testcontainers-api.py /root/.kiri/run/docker.sock $c"
 done
 t socket-mount-reaches-kiri "Kiri" "docker run --rm -v /root/.kiri/run/docker.sock:/var/run/docker.sock docker:cli docker version --format '{{.Server.Platform.Name}}'"
@@ -217,6 +217,21 @@ t cj-volume-rm-kept-volumes "volumes 2" "echo volumes \$(docker volume ls -q | g
 $D restart -t 20 "$N" >/dev/null; up
 t cj-next-start-deletes-nothing "kept 2" "docker run --rm alpine true; $CJ_KEPT"
 t cj-cleanup "done" "docker rm -f cj1 cj2 >/dev/null 2>&1; docker volume rm -f cjv1 cjv2 >/dev/null 2>&1; for id in $CJ_IDS; do rm -rf $ST/containers/\$id /var/lib/kiri/containers/\$id; done; rm -f $ST/containers.json.corrupt-*; echo done"
+# An images.json cut short loses its newest image (a commit here). The
+# repair is a docker info warning naming the copy and the lost image, and
+# the lost image's unpacked layers are kept, also at the next start (#440).
+t ij-setup "ok" "docker run --name ij alpine:3.21 sh -c 'echo local > /local' >/dev/null && docker commit ij local/ij:1 >/dev/null && docker rm ij >/dev/null && echo ok"
+IJ_LAYERS=$($D exec "$N" sh -c 'ls /var/lib/kiri/layers | wc -l' | tr -d ' ')
+$D stop -t 20 "$N" >/dev/null
+$D run --rm --name "$N-edit" -v "$N"-store:/s alpine sh -c 'f=/s/images.json; truncate -s $(( $(stat -c %s $f) - 40 )) $f' >/dev/null
+$D start "$N" >/dev/null; up
+t ij-info-warns "images.json.corrupt-" "docker images -q >/dev/null; docker info --format '{{json .Warnings}}'"
+t ij-info-names-lost "local/ij:1" "docker info --format '{{json .Warnings}}'"
+t ij-layers-kept "layers $IJ_LAYERS" "docker run --rm alpine:3.21 true; echo layers \$(ls /var/lib/kiri/layers | wc -l)"
+$D restart -t 20 "$N" >/dev/null; up
+t ij-layers-kept-next-start "layers $IJ_LAYERS" "docker run --rm alpine:3.21 true; echo layers \$(ls /var/lib/kiri/layers | wc -l)"
+t ij-cleanup "done" "rm -f $ST/images.json.corrupt-*; echo done"
+t ij-warning-gone "[]" "docker info --format '{{json .Warnings}}'"
 $D rm -f "$N" >/dev/null
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" = 0 ]

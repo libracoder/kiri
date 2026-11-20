@@ -1835,5 +1835,18 @@
   "{n} more in a <a>Compose project</a>": "{n} ተጨማሪ በ<a>Compose ፕሮጀክት</a> ውስጥ",
   "{n} more in <a>Compose projects</a>": "{n} ተጨማሪ በ<a>Compose ፕሮጀክቶች</a> ውስጥ",
   "Your only container is in a <a>Compose project</a>": "ብቸኛው ኮንቴይነርዎ በ<a>Compose ፕሮጀክት</a> ውስጥ ነው",
-  "All {n} containers are in <a>Compose projects</a>": "ሁሉም {n} ኮንቴይነሮች በ<a>Compose ፕሮጀክቶች</a> ውስጥ ናቸው"
+  "All {n} containers are in <a>Compose projects</a>": "ሁሉም {n} ኮንቴይነሮች በ<a>Compose ፕሮጀክቶች</a> ውስጥ ናቸው",
+  "Skipped until Kiri next opens": "Kiri በሚቀጥለው ጊዜ እስኪከፈት ድረስ ተዘሏል",
+  "Couldn't add the kiri docker context": "የkiri docker አውድ መጨመር አልተቻለም",
+  "The kiri and docker commands": "የkiri እና docker ትዕዛዞች",
+  "Ready in any new terminal": "በማንኛውም አዲስ ተርሚናል ዝግጁ ነው",
+  "Couldn't add them to your shell": "ወደ shell ማከል አልተቻለም",
+  "Starts at login": "ሲገቡ ይጀምራል",
+  "The engine starts when you log in": "ሞተሩ ሲገቡ ይጀምራል",
+  "The engine runs from the app for now": "ሞተሩ ለጊዜው ከመተግበሪያው እየሠራ ነው",
+  "Show log": "ምዝግብ ማስታወሻ አሳይ",
+  "Continue anyway": "ቢሆንም ቀጥል",
+  "One step didn't work. Everything else is ready.": "አንድ ደረጃ አልሠራም። ሌላው ሁሉ ዝግጁ ነው።",
+  "Some steps didn't work. Everything else is ready.": "አንዳንድ ደረጃዎች አልሠሩም። ሌላው ሁሉ ዝግጁ ነው።",
+  "No matches": "ምንም የሚዛመድ የለም"
 }

@@ -1835,5 +1835,18 @@
   "{n} more in a <a>Compose project</a>": "Още {n} в <a>Compose проект</a>",
   "{n} more in <a>Compose projects</a>": "Още {n} в <a>Compose проекти</a>",
   "Your only container is in a <a>Compose project</a>": "Единственият ви контейнер е в <a>Compose проект</a>",
-  "All {n} containers are in <a>Compose projects</a>": "Всички {n} контейнера са в <a>Compose проекти</a>"
+  "All {n} containers are in <a>Compose projects</a>": "Всички {n} контейнера са в <a>Compose проекти</a>",
+  "Skipped until Kiri next opens": "Пропуснато до следващото отваряне на Kiri",
+  "Couldn't add the kiri docker context": "Контекстът kiri за docker не можа да се добави",
+  "The kiri and docker commands": "Командите kiri и docker",
+  "Ready in any new terminal": "Готови във всеки нов терминал",
+  "Couldn't add them to your shell": "Не можаха да се добавят към обвивката ви",
+  "Starts at login": "Стартира при вход",
+  "The engine starts when you log in": "Двигателят стартира, когато влезете",
+  "The engine runs from the app for now": "Засега двигателят работи от приложението",
+  "Show log": "Показване на журнала",
+  "Continue anyway": "Продължи въпреки това",
+  "One step didn't work. Everything else is ready.": "Една стъпка не се получи. Всичко останало е готово.",
+  "Some steps didn't work. Everything else is ready.": "Някои стъпки не се получиха. Всичко останало е готово.",
+  "No matches": "Няма съвпадения"
 }

@@ -1835,5 +1835,18 @@
   "{n} more in a <a>Compose project</a>": "{n} أخرى في <a>مشروع Compose</a>",
   "{n} more in <a>Compose projects</a>": "{n} أخرى في <a>مشاريع Compose</a>",
   "Your only container is in a <a>Compose project</a>": "حاويتك الوحيدة في <a>مشروع Compose</a>",
-  "All {n} containers are in <a>Compose projects</a>": "كل الحاويات الـ {n} في <a>مشاريع Compose</a>"
+  "All {n} containers are in <a>Compose projects</a>": "كل الحاويات الـ {n} في <a>مشاريع Compose</a>",
+  "Skipped until Kiri next opens": "تم التخطي حتى يُفتح Kiri في المرة القادمة",
+  "Couldn't add the kiri docker context": "تعذّرت إضافة سياق kiri في docker",
+  "The kiri and docker commands": "أوامر kiri وdocker",
+  "Ready in any new terminal": "جاهزة في أي نافذة طرفية جديدة",
+  "Couldn't add them to your shell": "تعذّرت إضافتها إلى الصدفة",
+  "Starts at login": "يبدأ عند تسجيل الدخول",
+  "The engine starts when you log in": "يبدأ المحرّك عند تسجيل الدخول",
+  "The engine runs from the app for now": "يعمل المحرّك من التطبيق حاليًا",
+  "Show log": "عرض السجل",
+  "Continue anyway": "المتابعة على أي حال",
+  "One step didn't work. Everything else is ready.": "لم تنجح خطوة واحدة. كل شيء آخر جاهز.",
+  "Some steps didn't work. Everything else is ready.": "لم تنجح بعض الخطوات. كل شيء آخر جاهز.",
+  "No matches": "لا توجد نتائج مطابقة"
 }

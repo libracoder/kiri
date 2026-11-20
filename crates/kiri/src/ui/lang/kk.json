@@ -1835,5 +1835,18 @@
   "{n} more in a <a>Compose project</a>": "Тағы {n} <a>Compose жобасында</a>",
   "{n} more in <a>Compose projects</a>": "Тағы {n} <a>Compose жобаларында</a>",
   "Your only container is in a <a>Compose project</a>": "Жалғыз контейнеріңіз <a>Compose жобасында</a>",
-  "All {n} containers are in <a>Compose projects</a>": "Барлық {n} контейнер <a>Compose жобаларында</a>"
+  "All {n} containers are in <a>Compose projects</a>": "Барлық {n} контейнер <a>Compose жобаларында</a>",
+  "Skipped until Kiri next opens": "Kiri келесі рет ашылғанша өткізіп жіберілді",
+  "Couldn't add the kiri docker context": "docker үшін kiri контекстін қосу мүмкін болмады",
+  "The kiri and docker commands": "kiri және docker пәрмендері",
+  "Ready in any new terminal": "Кез келген жаңа терминалда дайын",
+  "Couldn't add them to your shell": "Оларды shell-ге қосу мүмкін болмады",
+  "Starts at login": "Жүйеге кіргенде іске қосылады",
+  "The engine starts when you log in": "Жүйеге кірген кезде қозғалтқыш іске қосылады",
+  "The engine runs from the app for now": "Қозғалтқыш әзірге қолданбадан жұмыс істеп тұр",
+  "Show log": "Журналды көрсету",
+  "Continue anyway": "Бәрібір жалғастыру",
+  "One step didn't work. Everything else is ready.": "Бір қадам орындалмады. Қалғанының бәрі дайын.",
+  "Some steps didn't work. Everything else is ready.": "Кейбір қадамдар орындалмады. Қалғанының бәрі дайын.",
+  "No matches": "Сәйкестік жоқ"
 }

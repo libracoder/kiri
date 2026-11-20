@@ -210,7 +210,7 @@ fn engine(rx: &Receiver<Cmd>, tx: Sender<Cmd>) {
                     a @ ("start" | "stop" | "restart" | "pause" | "unpause") => ("POST", format!("/containers/{id}/{a}")),
                     _ => continue,
                 };
-                let result = expect_ok(client::request(method, &path, None));
+                let result = expect_done(client::request(method, &path, None));
                 // Refused to start (a port taken): the container's page says why.
                 if let (Err(e), "start") = (&result, action.as_str()) {
                     emit(json!({"type": "startfailed", "id": id, "error": e.to_string()}).to_string());
@@ -252,6 +252,14 @@ fn watch(tx: Sender<Cmd>) {
 pub fn expect_ok(r: io::Result<client::Response>) -> io::Result<()> {
     let r = r?;
     if r.ok() { Ok(()) } else { Err(io::Error::other(r.error())) }
+}
+
+/// A container action's answer, as on the Mac and Linux: Docker's 304 is
+/// "already so" (Stop on a stopped container, Start on a running one), so
+/// done, not an empty red toast.
+fn expect_done(r: io::Result<client::Response>) -> io::Result<()> {
+    let r = r?;
+    if r.ok() || r.status == 304 { Ok(()) } else { Err(io::Error::other(r.error())) }
 }
 
 fn act(result: io::Result<()>) {
@@ -934,6 +942,19 @@ mod tests {
     use super::{allowed_url, unanswered, wakes};
     use std::io::ErrorKind;
 
+    /// As on the Mac and Linux: Stop on a stopped container, or Start on a
+    /// running one, is done (Docker's 304, with no body), not an empty error.
+    #[test]
+    fn a_container_already_so_is_done_not_an_empty_error() {
+        use super::{client::Response, expect_done};
+        let answer = |status: u16, body: &str| Ok(Response { status, body: body.as_bytes().to_vec() });
+        assert!(expect_done(answer(304, "")).is_ok(), "already stopped, or already running");
+        assert!(expect_done(answer(204, "")).is_ok());
+        let refused = expect_done(answer(409, r#"{"message":"cannot start a paused container, try unpause instead"}"#));
+        assert_eq!(refused.unwrap_err().to_string(), "cannot start a paused container, try unpause instead");
+        assert!(expect_done(Err(std::io::Error::other("no engine"))).is_err());
+    }
+
     /// Only Start ends a Stop: Kiri coming up (the window, or hidden at
     /// login) starts the engine unless the person stopped it.
     #[test]
@@ -970,6 +991,13 @@ mod tests {
     }
 }
 
+/// The page's "fonts" event, made once (the window asks each time Settings
+/// opens without them). Fonts installed later show after a restart.
+fn fonts_event() -> &'static str {
+    static EVENT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    EVENT.get_or_init(|| json!({"type": "fonts", "families": crate::app::font_families(false), "mono": crate::app::font_families(true)}).to_string())
+}
+
 /// Handles one message from the page, on the window's thread: quick things
 /// here, the rest on the engine thread or a thread of their own.
 pub fn on_message(msg: &str) {
@@ -984,6 +1012,12 @@ pub fn on_message(msg: &str) {
         // An uncaught error in the page (the shim in app.rs reports it).
         "jserror" => crate::serve::log(&format!("page: {}", c.name.chars().take(300).collect::<String>())),
         "ready" => {
+            // Listing the fonts is slow the first time: done now, off the
+            // window's thread, so Settings has them at once.
+            std::thread::spawn(|| {
+                std::thread::sleep(Duration::from_secs(3));
+                fonts_event();
+            });
             emit(json!({"type": "prefs", "prefs": prefs()}).to_string());
             // KIRI_STAR_PROMPT=1 shows the star card now, as on the Mac.
             if std::env::var_os("KIRI_STAR_PROMPT").is_some() {
@@ -1175,7 +1209,10 @@ pub fn on_message(msg: &str) {
                 Handle.eval(js);
             }
         }
-        "fonts" => emit(json!({"type": "fonts", "families": crate::app::font_families(false), "mono": crate::app::font_families(true)}).to_string()),
+        // Off the window's thread: GDI lists every installed face, twice.
+        "fonts" => {
+            std::thread::spawn(|| emit(fonts_event().to_owned()));
+        }
         "proxy" => {
             std::thread::spawn(|| proxy(None));
         }

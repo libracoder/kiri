@@ -508,7 +508,11 @@ fn pull(repo: &str, tag: &str) -> io::Result<()> {
 
 /// `kiri k8s stop`: the node stops; its state is kept.
 fn stop(say: &dyn Fn(&str)) -> io::Result<()> {
-    ok(client::request("POST", &format!("/containers/{NAME}/stop"), None))?;
+    // Stopped already: Docker's 304, with no body, is done (as Start's is).
+    let stopped = client::request("POST", &format!("/containers/{NAME}/stop"), None)?;
+    if !stopped.ok() && stopped.status != 304 {
+        return Err(io::Error::other(stopped.error()));
+    }
     say("Kubernetes stopped (its state is kept; Start resumes it)");
     Ok(())
 }

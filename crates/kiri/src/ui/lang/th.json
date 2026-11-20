@@ -1835,5 +1835,18 @@
   "{n} more in a <a>Compose project</a>": "อีก {n} รายการใน<a>โปรเจกต์ Compose</a>",
   "{n} more in <a>Compose projects</a>": "อีก {n} รายการใน<a>โปรเจกต์ Compose</a>",
   "Your only container is in a <a>Compose project</a>": "คอนเทนเนอร์เดียวของคุณอยู่ใน<a>โปรเจกต์ Compose</a>",
-  "All {n} containers are in <a>Compose projects</a>": "คอนเทนเนอร์ทั้ง {n} รายการอยู่ใน<a>โปรเจกต์ Compose</a>"
+  "All {n} containers are in <a>Compose projects</a>": "คอนเทนเนอร์ทั้ง {n} รายการอยู่ใน<a>โปรเจกต์ Compose</a>",
+  "Skipped until Kiri next opens": "ข้ามไว้จนกว่าจะเปิด Kiri ครั้งถัดไป",
+  "Couldn't add the kiri docker context": "เพิ่ม kiri docker context ไม่สำเร็จ",
+  "The kiri and docker commands": "คำสั่ง kiri และ docker",
+  "Ready in any new terminal": "พร้อมใช้ในเทอร์มินัลใหม่ทุกหน้าต่าง",
+  "Couldn't add them to your shell": "เพิ่มลงใน shell ของคุณไม่สำเร็จ",
+  "Starts at login": "เริ่มเมื่อเข้าสู่ระบบ",
+  "The engine starts when you log in": "เอนจินจะเริ่มเมื่อคุณเข้าสู่ระบบ",
+  "The engine runs from the app for now": "ตอนนี้เอนจินทำงานจากแอปไปก่อน",
+  "Show log": "แสดงบันทึก",
+  "Continue anyway": "ดำเนินการต่อ",
+  "One step didn't work. Everything else is ready.": "ขั้นตอนหนึ่งไม่สำเร็จ ส่วนอื่นพร้อมทั้งหมด",
+  "Some steps didn't work. Everything else is ready.": "บางขั้นตอนไม่สำเร็จ ส่วนอื่นพร้อมทั้งหมด",
+  "No matches": "ไม่พบรายการที่ตรงกัน"
 }

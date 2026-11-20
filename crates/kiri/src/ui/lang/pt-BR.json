@@ -1835,5 +1835,18 @@
   "{n} more in a <a>Compose project</a>": "Mais {n} em um <a>projeto do Compose</a>",
   "{n} more in <a>Compose projects</a>": "Mais {n} em <a>projetos do Compose</a>",
   "Your only container is in a <a>Compose project</a>": "Seu único contêiner está em um <a>projeto do Compose</a>",
-  "All {n} containers are in <a>Compose projects</a>": "Todos os {n} contêineres estão em <a>projetos do Compose</a>"
+  "All {n} containers are in <a>Compose projects</a>": "Todos os {n} contêineres estão em <a>projetos do Compose</a>",
+  "Skipped until Kiri next opens": "Ignorado até o Kiri ser aberto de novo",
+  "Couldn't add the kiri docker context": "Não foi possível adicionar o contexto kiri ao docker",
+  "The kiri and docker commands": "Os comandos kiri e docker",
+  "Ready in any new terminal": "Prontos em qualquer novo terminal",
+  "Couldn't add them to your shell": "Não foi possível adicioná-los ao seu shell",
+  "Starts at login": "Inicia no login",
+  "The engine starts when you log in": "O engine inicia quando você faz login",
+  "The engine runs from the app for now": "Por enquanto, o engine roda pelo app",
+  "Show log": "Mostrar log",
+  "Continue anyway": "Continuar mesmo assim",
+  "One step didn't work. Everything else is ready.": "Uma etapa não funcionou. Todo o resto está pronto.",
+  "Some steps didn't work. Everything else is ready.": "Algumas etapas não funcionaram. Todo o resto está pronto.",
+  "No matches": "Nenhum resultado"
 }

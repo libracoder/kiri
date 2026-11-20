@@ -1737,7 +1737,7 @@
   "Kiri can't check this file with {name} hidden. Compose accepts it, so Apply still works.": "{name}을(를) 숨긴 채로는 Kiri가 이 파일을 확인할 수 없습니다. Compose는 받아들이므로 「적용」은 계속 됩니다.",
   "Compose rejects this file with its real values. Kiri can't show why with secrets hidden.": "Compose가 실제 값으로 이 파일을 거부합니다. 비밀 값을 숨긴 채로는 Kiri가 이유를 보여 줄 수 없습니다.",
   "docker compose took longer than {secs} seconds": "docker compose가 {secs}초보다 오래 걸렸습니다",
-  "Discard": "취소",
+  "Discard": "변경 사항 버리기",
   "Refresh": "새로 고침",
   "Names Docker shows may contain secret values.": "Docker가 보여 주는 이름에 비밀 값이 들어 있을 수 있습니다.",
   "a newer image": "더 새로운 이미지",
@@ -1835,5 +1835,18 @@
   "{n} more in a <a>Compose project</a>": "{n}개 더 <a>Compose 프로젝트</a>에 있음",
   "{n} more in <a>Compose projects</a>": "{n}개 더 <a>Compose 프로젝트</a>에 있음",
   "Your only container is in a <a>Compose project</a>": "하나뿐인 컨테이너가 <a>Compose 프로젝트</a>에 있습니다",
-  "All {n} containers are in <a>Compose projects</a>": "컨테이너 {n}개가 모두 <a>Compose 프로젝트</a>에 있습니다"
+  "All {n} containers are in <a>Compose projects</a>": "컨테이너 {n}개가 모두 <a>Compose 프로젝트</a>에 있습니다",
+  "Skipped until Kiri next opens": "Kiri를 다음에 열 때까지 건너뜀",
+  "Couldn't add the kiri docker context": "docker에 kiri 컨텍스트를 추가하지 못했습니다",
+  "The kiri and docker commands": "kiri 및 docker 명령",
+  "Ready in any new terminal": "새 터미널에서 바로 사용 가능",
+  "Couldn't add them to your shell": "셸에 추가하지 못했습니다",
+  "Starts at login": "로그인 시 시작",
+  "The engine starts when you log in": "로그인하면 엔진이 시작됩니다",
+  "The engine runs from the app for now": "지금은 앱에서 엔진을 실행하고 있습니다",
+  "Show log": "로그 보기",
+  "Continue anyway": "그래도 계속",
+  "One step didn't work. Everything else is ready.": "한 단계가 실패했습니다. 나머지는 모두 준비되었습니다.",
+  "Some steps didn't work. Everything else is ready.": "일부 단계가 실패했습니다. 나머지는 모두 준비되었습니다.",
+  "No matches": "일치하는 항목 없음"
 }

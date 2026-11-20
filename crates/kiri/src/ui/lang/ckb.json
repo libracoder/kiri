@@ -1835,5 +1835,18 @@
   "{n} more in a <a>Compose project</a>": "{n} ی تر لە <a>پڕۆژەیەکی Compose</a>دا",
   "{n} more in <a>Compose projects</a>": "{n} ی تر لە <a>پڕۆژەکانی Compose</a>دا",
   "Your only container is in a <a>Compose project</a>": "تاکە کۆنتەینەرەکەت لە <a>پڕۆژەیەکی Compose</a>دایە",
-  "All {n} containers are in <a>Compose projects</a>": "هەموو {n} کۆنتەینەرەکە لە <a>پڕۆژەکانی Compose</a>دان"
+  "All {n} containers are in <a>Compose projects</a>": "هەموو {n} کۆنتەینەرەکە لە <a>پڕۆژەکانی Compose</a>دان",
+  "Skipped until Kiri next opens": "تێپەڕێندرا تا جاری داهاتوو کە Kiri دەکرێتەوە",
+  "Couldn't add the kiri docker context": "نەتوانرا چوارچێوەی docker ی kiri زیاد بکرێت",
+  "The kiri and docker commands": "فەرمانەکانی kiri و docker",
+  "Ready in any new terminal": "لە هەر تێرمیناڵێکی نوێدا ئامادەیە",
+  "Couldn't add them to your shell": "نەتوانرا بخرێنە شێڵەکەتەوە",
+  "Starts at login": "لە کاتی چوونەژوورەوە دەست پێدەکات",
+  "The engine starts when you log in": "بزوێنەر کاتێک دەچیتە ژوورەوە دەست پێدەکات",
+  "The engine runs from the app for now": "بزوێنەر لە ئێستادا لە ئەپەکەوە کاردەکات",
+  "Show log": "پیشاندانی لۆگ",
+  "Continue anyway": "هەر بەردەوام بە",
+  "One step didn't work. Everything else is ready.": "یەک هەنگاو سەرکەوتوو نەبوو. هەموو شتێکی تر ئامادەیە.",
+  "Some steps didn't work. Everything else is ready.": "هەندێک هەنگاو سەرکەوتوو نەبوون. هەموو شتێکی تر ئامادەیە.",
+  "No matches": "هیچ شتێکی هاوتا نییە"
 }

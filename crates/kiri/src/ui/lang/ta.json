@@ -1835,5 +1835,18 @@
   "{n} more in a <a>Compose project</a>": "மேலும் {n} ஒரு <a>Compose திட்டத்தில்</a>",
   "{n} more in <a>Compose projects</a>": "மேலும் {n} <a>Compose திட்டங்களில்</a>",
   "Your only container is in a <a>Compose project</a>": "உங்கள் ஒரே கன்டெய்னர் ஒரு <a>Compose திட்டத்தில்</a> உள்ளது",
-  "All {n} containers are in <a>Compose projects</a>": "அனைத்து {n} கன்டெய்னர்களும் <a>Compose திட்டங்களில்</a> உள்ளன"
+  "All {n} containers are in <a>Compose projects</a>": "அனைத்து {n} கன்டெய்னர்களும் <a>Compose திட்டங்களில்</a> உள்ளன",
+  "Skipped until Kiri next opens": "Kiri அடுத்து திறக்கும் வரை தவிர்க்கப்பட்டது",
+  "Couldn't add the kiri docker context": "kiri docker சூழலைச் சேர்க்க முடியவில்லை",
+  "The kiri and docker commands": "kiri மற்றும் docker கட்டளைகள்",
+  "Ready in any new terminal": "எந்தப் புதிய டெர்மினலிலும் தயார்",
+  "Couldn't add them to your shell": "அவற்றை உங்கள் ஷெல்லில் சேர்க்க முடியவில்லை",
+  "Starts at login": "உள்நுழையும்போது தொடங்கும்",
+  "The engine starts when you log in": "நீங்கள் உள்நுழையும்போது இன்ஜின் தொடங்கும்",
+  "The engine runs from the app for now": "இப்போதைக்கு இன்ஜின் ஆப்பிலிருந்து இயங்குகிறது",
+  "Show log": "லாக்கைக் காட்டு",
+  "Continue anyway": "இருந்தாலும் தொடர்",
+  "One step didn't work. Everything else is ready.": "ஒரு படி வேலை செய்யவில்லை. மற்ற அனைத்தும் தயார்.",
+  "Some steps didn't work. Everything else is ready.": "சில படிகள் வேலை செய்யவில்லை. மற்ற அனைத்தும் தயார்.",
+  "No matches": "பொருத்தம் இல்லை"
 }

@@ -1835,5 +1835,18 @@
   "{n} more in a <a>Compose project</a>": "További {n} egy <a>Compose-projektben</a>",
   "{n} more in <a>Compose projects</a>": "További {n} <a>Compose-projektekben</a>",
   "Your only container is in a <a>Compose project</a>": "Az egyetlen konténere egy <a>Compose-projektben</a> van",
-  "All {n} containers are in <a>Compose projects</a>": "Mind a(z) {n} konténer <a>Compose-projektekben</a> van"
+  "All {n} containers are in <a>Compose projects</a>": "Mind a(z) {n} konténer <a>Compose-projektekben</a> van",
+  "Skipped until Kiri next opens": "Kihagyva, amíg a Kiri legközelebb meg nem nyílik",
+  "Couldn't add the kiri docker context": "Nem sikerült hozzáadni a docker kiri kontextusát",
+  "The kiri and docker commands": "A kiri és a docker parancs",
+  "Ready in any new terminal": "Minden új terminálban kész",
+  "Couldn't add them to your shell": "Nem sikerült hozzáadni őket a shellhez",
+  "Starts at login": "Bejelentkezéskor indul",
+  "The engine starts when you log in": "A motor bejelentkezéskor elindul",
+  "The engine runs from the app for now": "A motor egyelőre az alkalmazásból fut",
+  "Show log": "Napló megjelenítése",
+  "Continue anyway": "Folytatás mindenképp",
+  "One step didn't work. Everything else is ready.": "Egy lépés nem sikerült. Minden más készen áll.",
+  "Some steps didn't work. Everything else is ready.": "Néhány lépés nem sikerült. Minden más készen áll.",
+  "No matches": "Nincs találat"
 }

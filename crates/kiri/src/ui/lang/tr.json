@@ -1835,5 +1835,18 @@
   "{n} more in a <a>Compose project</a>": "Bir <a>Compose projesinde</a> {n} tane daha",
   "{n} more in <a>Compose projects</a>": "<a>Compose projelerinde</a> {n} tane daha",
   "Your only container is in a <a>Compose project</a>": "Tek kapsayıcınız bir <a>Compose projesinde</a>",
-  "All {n} containers are in <a>Compose projects</a>": "{n} kapsayıcının tümü <a>Compose projelerinde</a>"
+  "All {n} containers are in <a>Compose projects</a>": "{n} kapsayıcının tümü <a>Compose projelerinde</a>",
+  "Skipped until Kiri next opens": "Kiri bir sonraki açılışına kadar atlandı",
+  "Couldn't add the kiri docker context": "docker için kiri bağlamı eklenemedi",
+  "The kiri and docker commands": "kiri ve docker komutları",
+  "Ready in any new terminal": "Her yeni terminalde hazır",
+  "Couldn't add them to your shell": "Kabuğunuza eklenemedi",
+  "Starts at login": "Oturum açılınca başlar",
+  "The engine starts when you log in": "Oturum açtığınızda motor başlar",
+  "The engine runs from the app for now": "Motor şimdilik uygulamadan çalışıyor",
+  "Show log": "Günlüğü göster",
+  "Continue anyway": "Yine de devam et",
+  "One step didn't work. Everything else is ready.": "Bir adım çalışmadı. Geri kalan her şey hazır.",
+  "Some steps didn't work. Everything else is ready.": "Bazı adımlar çalışmadı. Geri kalan her şey hazır.",
+  "No matches": "Eşleşme yok"
 }

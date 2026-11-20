@@ -30,6 +30,7 @@ mod registry_mirrors;
 mod seccomp;
 mod seccomp_names;
 pub mod time;
+mod top;
 #[cfg(target_os = "macos")]
 mod usb;
 mod vmcpu;

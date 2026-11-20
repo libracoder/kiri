@@ -73,7 +73,7 @@ Missing yours? Translations live in [`crates/kiri/src/ui/lang`](crates/kiri/src/
 
 | Platform | Get it |
 |----------|--------|
-| macOS 14+ (Apple silicon or Intel) | `.dmg` from [runkiri.com/releases](https://runkiri.com/releases/) |
+| macOS 14+ (Apple silicon or Intel) | `.dmg` from [runkiri.com/releases](https://runkiri.com/releases/), or `brew install --cask libracoder/kiri/kiri` |
 | Windows 10 and 11 (x86-64 or Arm, through WSL 2) | `.msi` from [runkiri.com/releases](https://runkiri.com/releases/) |
 | Linux (Ubuntu, Fedora and others) | `.deb` or `.rpm` from [runkiri.com/releases](https://runkiri.com/releases/) |
 
@@ -102,7 +102,7 @@ Docker's commands also work as `kiri` commands (`kiri run`, `kiri ps`,
 | Docker Desktop | 213 ms            | 243 ms       |
 | OrbStack       | 380 ms            | 442 ms       |
 
-Method and every other figure are in [`bench/results.json`](bench/results.json). Rerun with `kiri bench`.
+Method and every other figure are in [`bench/results.json`](bench/results.json). Rerun with `kiri bench --network bridge --runs 30` while all three engines are running.
 
 ## How it works
 

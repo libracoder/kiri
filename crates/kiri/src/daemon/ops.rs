@@ -35,7 +35,7 @@ pub fn route(req: &Request, engine: &Arc<Engine>, w: &mut UnixStream) -> Option<
                 let (id, action) = rest.split_once('/')?;
                 return Some(match (m, action) {
                     ("GET", "stats") => stats(req, engine, id, w),
-                    ("GET", "top") => reply(w, top(engine, id), 200),
+                    ("GET", "top") => reply(w, top(req, engine, id), 200),
                     ("POST", "pause") => reply(w, engine.pause(id, true).map(|()| Value::Null), 204),
                     ("POST", "unpause") => reply(w, engine.pause(id, false).map(|()| Value::Null), 204),
                     ("POST", "rename") => reply(w, engine.rename(id, req.query("name").unwrap_or_default()).map(|()| Value::Null), 204),
@@ -138,10 +138,10 @@ fn stats(req: &Request, engine: &Engine, key: &str, w: &mut UnixStream) -> io::R
     Ok(Next::KeepAlive)
 }
 
-fn top(engine: &Engine, key: &str) -> Result<Value, Error> {
-    let lines = engine.top(key)?;
-    let procs: Vec<Vec<&str>> = lines.iter().map(|l| l.splitn(8, '\t').collect()).collect();
-    Ok(json!({"Titles": ["UID", "PID", "PPID", "C", "STIME", "TTY", "TIME", "CMD"], "Processes": procs}))
+fn top(req: &Request, engine: &Engine, key: &str) -> Result<Value, Error> {
+    let ps_args = req.query("ps_args").unwrap_or_default();
+    super::top::check(ps_args)?;
+    super::top::answer(ps_args, &engine.top(key)?)
 }
 
 fn update(req: &Request, engine: &Engine, key: &str) -> Result<Value, Error> {
@@ -209,7 +209,7 @@ fn export(engine: &Engine, key: &str, w: &mut UnixStream) -> io::Result<Next> {
 }
 
 /// Applies one `--change` line (a Dockerfile instruction) to a config.
-fn apply_change(cfg: &mut Value, line: &str) -> Result<(), Error> {
+pub(super) fn apply_change(cfg: &mut Value, line: &str) -> Result<(), Error> {
     let (instr, arg) = line.trim().split_once(char::is_whitespace).unwrap_or((line.trim(), ""));
     let arg = arg.trim();
     // JSON form, or shell form run by /bin/sh -c.
@@ -278,6 +278,9 @@ fn commit(req: &Request, engine: &Engine) -> Result<Value, Error> {
     cfg["config"]["Env"] = json!(spec.env);
     cfg["config"]["WorkingDir"] = spec.cwd.clone().into();
     cfg["config"]["User"] = spec.user.clone().into();
+    if spec.labels.is_object() {
+        cfg["config"]["Labels"] = spec.labels.clone();
+    }
     if let Some(h) = &spec.healthcheck {
         cfg["config"]["Healthcheck"] = h.to_json();
     }
@@ -477,7 +480,7 @@ fn system_df(engine: &Engine) -> Result<Value, Error> {
                 "Size": size,
                 "SharedSize": shared,
                 "VirtualSize": size,
-                "Labels": null,
+                "Labels": super::api::image_labels(engine, i),
                 "Containers": used.iter().filter(|u| **u == i.config_digest).count(),
             })
         })

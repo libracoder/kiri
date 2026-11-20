@@ -1835,5 +1835,18 @@
   "{n} more in a <a>Compose project</a>": "{n} और एक <a>Compose प्रोजेक्ट</a> में",
   "{n} more in <a>Compose projects</a>": "{n} और <a>Compose प्रोजेक्ट</a> में",
   "Your only container is in a <a>Compose project</a>": "आपका इकलौता कंटेनर एक <a>Compose प्रोजेक्ट</a> में है",
-  "All {n} containers are in <a>Compose projects</a>": "सभी {n} कंटेनर <a>Compose प्रोजेक्ट</a> में हैं"
+  "All {n} containers are in <a>Compose projects</a>": "सभी {n} कंटेनर <a>Compose प्रोजेक्ट</a> में हैं",
+  "Skipped until Kiri next opens": "Kiri अगली बार खुलने तक छोड़ा गया",
+  "Couldn't add the kiri docker context": "kiri docker कॉन्टेक्स्ट जोड़ा नहीं जा सका",
+  "The kiri and docker commands": "kiri और docker कमांड",
+  "Ready in any new terminal": "किसी भी नए टर्मिनल में तैयार",
+  "Couldn't add them to your shell": "इन्हें आपके शेल में जोड़ा नहीं जा सका",
+  "Starts at login": "लॉगिन पर शुरू होता है",
+  "The engine starts when you log in": "लॉग इन करने पर इंजन शुरू होता है",
+  "The engine runs from the app for now": "फ़िलहाल इंजन ऐप से चल रहा है",
+  "Show log": "लॉग दिखाएँ",
+  "Continue anyway": "फिर भी जारी रखें",
+  "One step didn't work. Everything else is ready.": "एक चरण काम नहीं किया। बाकी सब तैयार है।",
+  "Some steps didn't work. Everything else is ready.": "कुछ चरण काम नहीं किए। बाकी सब तैयार है।",
+  "No matches": "कोई मेल नहीं"
 }

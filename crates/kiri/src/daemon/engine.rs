@@ -250,6 +250,13 @@ pub struct Spec {
     /// `--mac-address` on `network_mode`; empty for the kernel's choice.
     #[serde(default)]
     pub mac_address: String,
+    /// `network_mode` is `none` because the container left every network it
+    /// had (`docker network disconnect`), not because it was made with
+    /// `--network none`: it starts with no network as such a one does, but
+    /// unlike it can be connected again, and the network it is connected to
+    /// then becomes its first. Records from before it read false.
+    #[serde(default)]
+    pub left_all_networks: bool,
     /// `--dns`, `--dns-search`, `--dns-option`.
     #[serde(default)]
     pub dns: Vec<String>,
@@ -267,6 +274,14 @@ pub struct Spec {
     /// GroupAdd as given; see [`super::hostopts`].
     #[serde(default)]
     pub host_opts: serde_json::Value,
+    /// `--volumes-from` as given, for inspect; the mounts it brought are in
+    /// `mounts` and `mount_info` with the others.
+    #[serde(default)]
+    pub volumes_from: Vec<String>,
+    /// `--pid`: empty for a PID namespace of its own, `host`, or
+    /// `container:<full id>`.
+    #[serde(default)]
+    pub pid_mode: String,
 }
 
 /// One `--link name:alias`.
@@ -304,6 +319,55 @@ impl Limits {
 }
 
 impl Spec {
+    /// Whether `network` (a network's name) is the first network, kept in
+    /// `network_mode`; the API stores the name, but `default` is bridge.
+    pub fn first_network_is(&self, network: &str) -> bool {
+        self.network_mode == network || (network == "bridge" && matches!(self.network_mode.as_str(), "default" | ""))
+    }
+
+    /// Leaves the first network of a container that is not running, as
+    /// `docker network disconnect` does on Docker for any of its networks.
+    /// Kiri keeps the first network apart (`network_mode`, `aliases`,
+    /// `ipv4_address`, `ipv6_address`, `mac_address`) because only it gives
+    /// the default route and the main address, so one of the others takes
+    /// its place, with its own aliases, fixed addresses and MAC: none of the
+    /// left network's settings follow, or a fixed `--ip` would be asked for
+    /// on a network it does not belong to. The one picked is the one Docker
+    /// gives the default route to: a network that reaches outside before an
+    /// `internal` one (which gives no default route), then by name, as
+    /// libnetwork orders a container's endpoints when none has a gateway
+    /// priority (Kiri keeps none), and as create picks the primary of
+    /// several endpoints. `internal` says whether a network is internal.
+    /// With no other network it is left with none, as with `--network none`.
+    pub fn leave_first_network(&mut self, internal: impl Fn(&str) -> bool) {
+        let next = self.extra_networks.iter().enumerate().min_by(|(_, a), (_, b)| internal(&a.name).cmp(&internal(&b.name)).then_with(|| a.name.cmp(&b.name))).map(|(i, _)| i);
+        match next {
+            Some(i) => {
+                let x = self.extra_networks.remove(i);
+                self.join_first_network(x);
+            }
+            None => {
+                self.network_mode = "none".into();
+                self.left_all_networks = true;
+                self.aliases.clear();
+                self.ipv4_address.clear();
+                self.ipv6_address.clear();
+                self.mac_address.clear();
+            }
+        }
+    }
+
+    /// Makes `x` the first network, with its settings in place of the old
+    /// first network's.
+    fn join_first_network(&mut self, x: ExtraNetwork) {
+        self.network_mode = x.name;
+        self.left_all_networks = false;
+        self.aliases = x.aliases;
+        self.ipv4_address = x.ipv4_address;
+        self.ipv6_address = x.ipv6_address;
+        self.mac_address = x.mac_address;
+    }
+
     /// The guest's `opts` lines for a start or an exec. `net_host`: it runs
     /// in the VM's (or host's) network namespace.
     pub fn guest_opts(&self, net_host: bool) -> Result<Vec<String>, Error> {
@@ -533,6 +597,22 @@ pub struct Exec {
     attached: Vec<Sender<(Stream, Vec<u8>)>>,
 }
 
+impl Exec {
+    /// The VM stopped under it. A running exec gets an exit code (255, as its
+    /// container does) before its output stream closes: docker-java
+    /// (Testcontainers' `execInContainer`) inspects the exec as soon as the
+    /// stream ends and fails on a finished exec with a null `ExitCode` (#551).
+    /// One never started keeps none, as in Docker.
+    fn end_with_vm(&mut self) {
+        if self.running && self.exit_code.is_none() {
+            self.exit_code = Some(255);
+        }
+        self.running = false;
+        self.pid = 0;
+        self.attached.clear();
+    }
+}
+
 /// What `docker logs` reads: the stored part, then (with `follow`) what comes after it.
 pub struct Logs {
     pub tty: bool,
@@ -671,6 +751,25 @@ impl Damage {
         }
         Some(m.join(" "))
     }
+}
+
+/// The `docker info` warning for a repaired image list (#440): where the
+/// damaged copy is, which images it names that the list lost, and that
+/// their unpacked layers are kept until the copy is removed. `Err`: the
+/// list or its folder could not be read, so lost images cannot be ruled out.
+fn image_damage_message(damage: &io::Result<Option<kiri_image::store::IndexDamage>>, root: &std::path::Path) -> Option<String> {
+    let d = match damage {
+        Ok(None) => return None,
+        Ok(Some(d)) => d,
+        Err(e) => return Some(format!("Kiri cannot read the image list in {} ({e}), so it cannot tell whether images are missing from it; it keeps every unpacked layer meanwhile.", root.display())),
+    };
+    let copies = d.copies.iter().map(|c| c.display().to_string()).collect::<Vec<_>>().join(", ");
+    let (one, kept) = if d.copies.len() == 1 { ("a copy of it is", "the copy is") } else { ("copies are", "the copies are") };
+    let missing = match d.missing.len() {
+        0 => "Every image it names is listed again.".to_owned(),
+        n => format!("{n} image(s) it names are missing from `docker images`: {}. Pulled ones can be pulled again; built or committed ones are in the copy.", d.missing.join(", ")),
+    };
+    Some(format!("The image list was damaged and repaired; {one} kept at {copies}. {missing} Kiri keeps every unpacked layer until {kept} removed."))
 }
 
 /// Reads `containers.json`. One that does not parse is kept as a
@@ -980,6 +1079,12 @@ impl Engine {
         self.records_damage.lock().unwrap_or_else(|e| e.into_inner()).message(&self.records).into_iter().collect()
     }
 
+    /// Why unpacked layers may belong to images the image list lost, for
+    /// `docker info`.
+    pub fn image_damage(&self) -> Option<String> {
+        image_damage_message(&self.store.index_damage(), self.store.root())
+    }
+
     /// Whether nothing is deleted for not being in the container list.
     fn keeps_everything(&self) -> bool {
         self.records_damage.lock().unwrap_or_else(|e| e.into_inner()).any()
@@ -1088,9 +1193,15 @@ impl Engine {
             None => crate::diag::warn!("kept every container's files and layers: the container list was damaged"),
         }
         // And every unpacked layer no image or container uses. Skipped if
-        // the image list can't be read, rather than deleting everything.
+        // the image list can't be read, rather than deleting everything, and
+        // while a damaged copy of it is kept: images cut from the list may
+        // still be someone's (#440).
+        let image_damage = self.store.index_damage();
         match self.store.images() {
             _ if keep.is_none() => {}
+            _ if !matches!(image_damage, Ok(None)) => {
+                crate::diag::warn!("kept every unpacked layer: the image list was damaged", detail = image_damage_message(&image_damage, self.store.root()).unwrap_or_default());
+            }
             Ok(images) => {
                 let mut layers: std::collections::BTreeSet<String> = images.iter().flat_map(|i| i.layers.iter().map(|l| l.digest.clone())).collect();
                 layers.extend(self.lock().containers.values().flat_map(|c| c.layers.iter().cloned()));
@@ -1116,7 +1227,7 @@ impl Engine {
     fn vm_restart_candidates(&self) -> Vec<String> {
         let st = self.lock();
         let mut ids: Vec<String> = st.containers.values().filter(|c| recover_after_vm_loss(c)).map(|c| c.id.clone()).collect();
-        ids.sort_by_key(|id| st.containers.get(id).is_some_and(|c| c.spec.network_mode.starts_with("container:") || !c.spec.links.is_empty()));
+        ids.sort_by_key(|id| st.containers.get(id).is_some_and(joins_others));
         ids
     }
 
@@ -1972,7 +2083,7 @@ impl Engine {
                 // from the list now, their data off this thread (the VM's
                 // reader), since that asks the VM, and vm() waits for this
                 // reader when the VM was just lost.
-                let forgotten: Vec<String> = anon.into_iter().filter(|v| self.forget_volume(v)).collect();
+                let forgotten: Vec<String> = self.unshared(anon).into_iter().filter(|v| self.forget_volume(v)).collect();
                 if !forgotten.is_empty() && let Some(me) = self.me.get().and_then(Weak::upgrade) {
                     let _ = std::thread::Builder::new().name("kiri-volume-rm".into()).spawn(move || {
                         if let Ok(vm) = me.vm() {
@@ -2053,8 +2164,7 @@ impl Engine {
                 let delay = restart_backoff(st.vm_crashes.saturating_sub(1));
                 st.vm_recovery_at = st.containers.values().any(recover_after_vm_loss).then(|| std::time::Instant::now() + delay);
                 for e in st.execs.values_mut() {
-                    e.running = false;
-                    e.attached.clear();
+                    e.end_with_vm();
                 }
                 for h in st.health.values_mut() {
                     close_monitor(h);
@@ -2231,6 +2341,11 @@ impl Engine {
     /// Finds an image by the name a client used.
     pub fn image(&self, name: &str) -> io::Result<Option<Image>> {
         Ok(image_named(self.store.images()?, name))
+    }
+
+    /// The IDs of the images that `docker ps --filter ancestor=` values name.
+    pub fn ancestor_ids(&self, values: &[String]) -> io::Result<Vec<String>> {
+        Ok(ancestor_ids(&self.store.images()?, values))
     }
 
     /// Sends the guest every layer of these (digest, media type) it doesn't
@@ -2509,7 +2624,20 @@ impl Engine {
             },
             None => None,
         };
+        // `--pid container:<id>`: that container's PID namespace; it has to
+        // be running, as with Docker.
+        let pid_joined = match spec.pid_mode.strip_prefix("container:").map(|t| self.pid_container(&id, t)) {
+            Some(Ok(target)) => Some(target),
+            Some(Err(e)) => {
+                self.fail_start(&id, &spec, &e);
+                return Err(e);
+            }
+            None => None,
+        };
         let mut flags = 0;
+        if spec.pid_mode == "host" {
+            flags |= run_flags::PID_HOST;
+        }
         let net = self.lock_networks().find(&spec.network_mode).cloned();
         let links = match net.as_ref().map(|n| self.link_hosts(&id, &spec, n)).transpose() {
             Ok(l) => l.unwrap_or_default(),
@@ -2557,6 +2685,7 @@ impl Engine {
                         if n.no_ipv4 {
                             net6_opts.push(format!("{}=1", kiri_proto::net_opts::NO_IPV4));
                         }
+                        net6_opts.push(format!("{}={}", kiri_proto::net_opts::NETWORK, n.name));
                     }
                     Err(e) => {
                         self.lock_networks().release(&n.name, ip);
@@ -2572,6 +2701,19 @@ impl Engine {
                     dns_names.push(name);
                     dns_names.extend(spec.aliases.iter().cloned());
                     dns_names.push(hostname.clone());
+                } else {
+                    // On the default bridge and connected to a user network
+                    // before it started (k3d's load balancer): its other
+                    // networks are plugged in only once it runs, so the
+                    // embedded DNS is its resolver from the start, and answers
+                    // their names from the start, as on Docker, not after the
+                    // program has looked them up (#449). Its own name is not
+                    // registered on the bridge.
+                    let user = self.user_network_bridges(&spec);
+                    if !user.is_empty() {
+                        flags |= run_flags::DNS_GATEWAY;
+                        net6_opts.extend(user.iter().map(|b| format!("{}={b}", kiri_proto::net_opts::DNS_BRIDGE)));
+                    }
                 }
                 (n.bridge.clone(), ip, n.prefix, n.gateway)
             }
@@ -2609,14 +2751,15 @@ impl Engine {
         }
         flags |= spec.security_flags();
         // Every container can reach the Mac, as with Docker Desktop and OrbStack.
-        let mut hosts = vec![
-            format!("{}\thost.docker.internal host.kiri.internal", super::ports::HOST_ADDR),
-            format!("{}\tgateway.docker.internal", super::ports::HOST_ADDR),
-        ];
-        hosts.extend(spec.extra_hosts.iter().cloned());
+        // --add-host and links come first: /etc/hosts takes the first match,
+        // so `--add-host host.docker.internal:IP` overrides Kiri's, as on Docker.
+        let mut hosts = spec.extra_hosts.clone();
         hosts.extend(links);
+        hosts.push(format!("{}\thost.docker.internal host.kiri.internal", super::ports::HOST_ADDR));
+        hosts.push(format!("{}\tgateway.docker.internal", super::ports::HOST_ADDR));
         let mut opts = net_opts(&spec, joined.as_deref(), &domainname);
         opts.extend(net6_opts);
+        opts.extend(pid_joined.map(|t| format!("{}={t}", kiri_proto::net_opts::PIDNS)));
         let net_args = kiri_proto::Net { bridge: &bridge, ip, prefix, gateway, extra_hosts: &hosts, dns_names: &dns_names, opts: &opts };
         // Joining a host-network container is the host's namespace too: its
         // net.* sysctls would change the whole VM (or Linux host).
@@ -2687,7 +2830,9 @@ impl Engine {
                 }
             }
         }
-        if !spec.ports.is_empty() {
+        // A container that left all its networks keeps its `-p` bindings
+        // but has no address for them, as on Docker, where it publishes none.
+        if !spec.ports.is_empty() && flags & run_flags::NET_NONE == 0 {
             let target = if flags & run_flags::NET_HOST != 0 { [127, 0, 0, 1] } else { ip };
             match super::ports::start(vm.clone(), &id, &spec.ports, target) {
                 Ok(fw) => {
@@ -2845,6 +2990,13 @@ impl Engine {
         self.emit("network", action, &net.id, attrs, None);
     }
 
+    /// The guest bridges of the container's other networks that are
+    /// user-defined, whose names its embedded DNS resolves.
+    fn user_network_bridges(&self, spec: &Spec) -> Vec<String> {
+        let nets = self.lock_networks();
+        spec.extra_networks.iter().filter_map(|x| nets.find(&x.name).filter(|n| n.driver == "bridge" && !n.builtin() && !n.bridge.is_empty()).map(|n| n.bridge.clone())).collect()
+    }
+
     /// Fixed addresses containers not running ask for on a network: an
     /// automatic address passes over them, so they are free when those start.
     fn wanted_addresses(&self, network: &str) -> Vec<[u8; 4]> {
@@ -2880,6 +3032,20 @@ impl Engine {
             mode = next.spec.network_mode.clone();
         }
         Ok((target, hostname, c.spec.domainname.clone(), mode))
+    }
+
+    /// For `--pid container:<target>`: the target's id. It has to be
+    /// running, as with Docker.
+    fn pid_container(&self, id: &str, target: &str) -> Result<String, Error> {
+        let st = self.lock();
+        let target = resolve(&st, target)?;
+        if target == id {
+            return Err(Error::BadRequest("cannot join own PID namespace".into()));
+        }
+        if st.containers.get(&target).is_none_or(|c| c.status != Status::Running) {
+            return Err(Error::Conflict(format!("cannot join PID of a non running container: {target}")));
+        }
+        Ok(target)
     }
 
     /// `--link` lines for /etc/hosts, as Docker writes them: `ip alias
@@ -3004,7 +3170,7 @@ impl Engine {
                 let _ = vm.remove(id);
             }
             lock_log(&c.log).remove();
-            for v in c.spec.anon_volumes {
+            for v in self.unshared(c.spec.anon_volumes) {
                 self.delete_volume_data(&v);
             }
             if let Some((image, attrs)) = actor {
@@ -3349,6 +3515,7 @@ impl Engine {
         if net.no_ipv4 {
             opts.push(format!("{}=1", kiri_proto::net_opts::NO_IPV4));
         }
+        opts.push(format!("{}={}", kiri_proto::net_opts::NETWORK, net.name));
         if let Err(e) = vm.net_attach(id, n, &net.bridge, ip, net.prefix, net.gateway, &names, &opts) {
             let mut nets = self.lock_networks();
             nets.release(&net.name, ip);
@@ -3382,8 +3549,22 @@ impl Engine {
         let (n, running) = {
             let mut st = self.lock();
             let c = st.containers.get_mut(&id).ok_or_else(|| gone(&id))?;
-            if c.spec.network_mode == net.name || c.spec.extra_networks.iter().any(|x| x.name == net.name) {
+            if c.spec.first_network_is(&net.name) || c.spec.extra_networks.iter().any(|x| x.name == net.name) {
                 return Err(Error::Conflict(format!("endpoint with name {} already exists in network {}", c.name, net.name)));
+            }
+            // It left every network it had: the one it joins becomes its
+            // first, which a start sets up as such. A running one has only
+            // loopback and its resolver set for no network, which a plug-in
+            // alone would not change.
+            if c.spec.left_all_networks {
+                if c.status == Status::Running {
+                    return Err(Error::Conflict(format!("Kiri cannot connect a running container that left all its networks to {}; stop the container first", net.name)));
+                }
+                c.spec.join_first_network(ExtraNetwork { name: net.name.clone(), aliases, ipv4_address, ipv6_address, mac_address });
+                drop(st);
+                self.save();
+                self.emit_network("connect", &net, &id);
+                return Ok(());
             }
             if matches!(c.spec.network_mode.as_str(), "host" | "none") {
                 return Err(Error::BadRequest(format!("container cannot be connected to {} while on {}", net.name, c.spec.network_mode)));
@@ -3420,8 +3601,36 @@ impl Engine {
         let (n, ip) = {
             let mut st = self.lock();
             let c = st.containers.get_mut(&id).ok_or_else(|| gone(&id))?;
-            if c.spec.network_mode == net.name {
-                return Err(Error::BadRequest(format!("Kiri cannot disconnect a container from its first network ({})", net.name)));
+            if c.spec.first_network_is(&net.name) && matches!(net.name.as_str(), "host" | "none") {
+                if c.spec.left_all_networks {
+                    return Err(Error::NotFound(format!("container {} is not connected to network {}", &id[..12], net.name)));
+                }
+                return Err(Error::BadRequest(format!("container cannot be disconnected from {} network", net.name)));
+            }
+            if c.spec.first_network_is(&net.name) {
+                // A running container's first network holds its default
+                // route, its main address (which published ports go to) and
+                // its resolver: moving those to another network while it
+                // runs needs the guest to do more than unplug it.
+                if c.status == Status::Running {
+                    return Err(Error::Conflict(format!("Kiri cannot disconnect a running container from its first network ({}); stop the container first", net.name)));
+                }
+                let left = (c.ip.take(), c.ip6.take());
+                let nets = self.lock_networks();
+                c.spec.leave_first_network(|name| nets.find(name).is_some_and(|n| n.internal));
+                drop(nets);
+                drop(st);
+                // Not running, it holds no address; one left from a run that
+                // did not hand it back goes back to the pool all the same.
+                if let Some(ip) = left.0 {
+                    self.release_ip(&net.name, ip);
+                }
+                if let Some(a) = left.1 {
+                    self.lock_networks().release6(&net.name, a);
+                }
+                self.save();
+                self.emit_network("disconnect", &net, &id);
+                return Ok(());
             }
             let Some(pos) = c.spec.extra_networks.iter().position(|x| x.name == net.name) else {
                 return Err(Error::NotFound(format!("container {} is not connected to network {}", &id[..12], net.name)));
@@ -3785,7 +3994,7 @@ impl Engine {
         st.execs.retain(|_, e| e.container_id != id);
         drop(st);
         self.changed.notify_all();
-        let anon = removed.as_ref().map(|c| c.spec.anon_volumes.clone()).unwrap_or_default();
+        let anon = self.unshared(removed.as_ref().map(|c| c.spec.anon_volumes.clone()).unwrap_or_default());
         if let Some(c) = &removed {
             lock_log(&c.log).remove();
         }
@@ -3867,6 +4076,15 @@ impl Engine {
     }
 
     /// Forgets a volume and deletes its data in the guest.
+    /// The anonymous volumes of a removed container that no other container
+    /// uses: one made with `--volumes-from` keeps them, as in Docker.
+    fn unshared(&self, anon: Vec<String>) -> Vec<String> {
+        if anon.is_empty() {
+            return anon;
+        }
+        anon.into_iter().filter(|v| self.volume_users(v).is_empty()).collect()
+    }
+
     fn delete_volume_data(&self, name: &str) {
         if self.forget_volume(name) {
             if let Ok(vm) = self.vm() {
@@ -4173,10 +4391,10 @@ fn comes_back(c: &Container) -> bool {
     (policy == "always" || (policy == "unless-stopped" && !c.stopped_by_user)) && !c.spec.auto_remove
 }
 
-/// Containers that join another's network or link to others start after
-/// those, as Docker orders them.
+/// Containers that join another's network or PID namespace, or link to
+/// others, start after those, as Docker orders them.
 fn joins_others(c: &Container) -> bool {
-    c.spec.network_mode.starts_with("container:") || !c.spec.links.is_empty()
+    c.spec.network_mode.starts_with("container:") || c.spec.pid_mode.starts_with("container:") || !c.spec.links.is_empty()
 }
 
 /// What a container event carries: labels, then name and image.
@@ -4308,6 +4526,20 @@ fn image_named(images: Vec<Image>, name: &str) -> Option<Image> {
     })
 }
 
+/// The image each `ancestor` filter value names, as Docker resolves it: a
+/// name (`alpine` is `alpine:latest`, not every tag of it), a reference, or
+/// an ID or ID prefix of any length, with or without `sha256:`. A value that
+/// names no image adds nothing, so it matches no container, as in Docker
+/// (#442).
+fn ancestor_ids(images: &[Image], values: &[String]) -> Vec<String> {
+    let by_id = |v: &str| {
+        let hex = v.strip_prefix("sha256:").unwrap_or(v);
+        let is_id = !hex.is_empty() && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+        images.iter().find(|i| is_id && i.config_digest.strip_prefix("sha256:").is_some_and(|h| h.starts_with(hex))).cloned()
+    };
+    values.iter().filter_map(|v| image_named(images.to_vec(), v).or_else(|| by_id(v))).map(|i| i.config_digest).collect()
+}
+
 #[cfg(test)]
 mod image_lookup_tests {
     use kiri_image::{Image, RunConfig};
@@ -4366,6 +4598,25 @@ mod image_lookup_tests {
         let pulled = image("alpine:latest", None);
         assert_eq!(pulled.repo_digest(), Some(format!("alpine@{ARM64}")));
         assert!(found(&[pulled], &format!("alpine:3@{ARM64}")));
+    }
+
+    #[test]
+    fn the_ancestor_filter_names_one_image_like_docker() {
+        // #442: `alpine` is `alpine:latest`, not every tag of alpine.
+        let with_id = |name: &str, c: char| Image { config_digest: format!("sha256:{}", c.to_string().repeat(64)), ..image(name, None) };
+        let images = [with_id("alpine:latest", 'a'), with_id("alpine:3.21", 'b'), with_id("web:1", 'c')];
+        let ids = |v: &str| super::ancestor_ids(&images, &[v.to_owned()]);
+        let latest = vec![format!("sha256:{}", "a".repeat(64))];
+        for v in ["alpine", "alpine:latest", "library/alpine", "docker.io/library/alpine:latest", "aaaa", "sha256:aaaaaaaaaaaa", &latest[0]] {
+            assert_eq!(ids(v), latest, "{v}");
+        }
+        assert_eq!(ids("alpine:3.21"), vec![format!("sha256:{}", "b".repeat(64))]);
+        // Not a pattern, and nothing for a name no image has.
+        for v in ["alp*", "alpine:*", "nosuchimage", "AAAA", ""] {
+            assert!(ids(v).is_empty(), "{v}");
+        }
+        // Values OR together.
+        assert_eq!(super::ancestor_ids(&images, &["web:1".into(), "alpine:3.21".into()]).len(), 2);
     }
 }
 
@@ -5193,6 +5444,25 @@ mod records_tests {
     /// One message, true in each state, listing the copies once, never
     /// advising to put a list back, and saying how the engine itself is
     /// restarted here.
+    /// A repaired image list is shown in `docker info` with its copy and the
+    /// images it lost (#440).
+    #[test]
+    fn a_repaired_image_list_is_a_warning() {
+        use kiri_image::store::IndexDamage;
+        let root = std::path::Path::new("/s");
+        assert_eq!(image_damage_message(&Ok(None), root), None);
+        let one = Ok(Some(IndexDamage { copies: vec!["/s/images.json.corrupt-1-0".into()], missing: vec!["local/img:1".into(), "web:2".into()] }));
+        let m = image_damage_message(&one, root).unwrap();
+        for want in ["image list was damaged", "a copy of it is kept at /s/images.json.corrupt-1-0", "2 image(s)", "local/img:1, web:2", "keeps every unpacked layer until the copy is removed"] {
+            assert!(m.contains(want), "{want:?} in {m}");
+        }
+        let back = Ok(Some(IndexDamage { copies: vec!["/s/a".into(), "/s/b".into()], missing: Vec::new() }));
+        let m = image_damage_message(&back, root).unwrap();
+        assert!(m.contains("copies are kept at /s/a, /s/b") && m.contains("listed again") && m.contains("until the copies are removed"), "{m}");
+        let unlistable = Err(io::Error::other("denied"));
+        assert!(image_damage_message(&unlistable, root).unwrap().contains("cannot read the image list in /s (denied)"));
+    }
+
     #[test]
     fn the_warning_says_what_happened_and_what_ends_it() {
         let records = Path::new("/s/containers.json");
@@ -5554,6 +5824,26 @@ mod start_wait_tests {
         (engine, id, dir)
     }
 
+    /// `--pid container:` needs a running target other than itself, as
+    /// with Docker, and such a container starts after the others.
+    #[test]
+    fn pid_container_must_be_another_running_one() {
+        let (engine, target, dir) = engine("pid-target");
+        assert_eq!(engine.pid_container("me", "pid-target").unwrap(), target);
+        assert!(matches!(engine.pid_container(&target, &target), Err(Error::BadRequest(m)) if m == "cannot join own PID namespace"));
+        assert!(matches!(engine.pid_container("me", "nosuch"), Err(Error::NotFound(_))));
+        let mut st = engine.lock();
+        let c = st.containers.get_mut(&target).unwrap();
+        assert!(!joins_others(c));
+        c.spec.pid_mode = "container:x".into();
+        assert!(joins_others(c), "starts after the one it joins");
+        c.status = Status::Exited;
+        drop(st);
+        assert!(matches!(engine.pid_container("me", &target), Err(Error::Conflict(m)) if m == format!("cannot join PID of a non running container: {target}")));
+        drop(engine);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     fn shut(engine: &Engine, id: &str) -> StartGuard {
         engine.lock().containers.get_mut(id).unwrap().begin_start()
     }
@@ -5651,6 +5941,38 @@ mod start_wait_tests {
         assert!(c.early_input.is_empty() && !c.early_close, "its early input went with it");
         drop(st);
         assert_eq!(actions(), ["start", "die"]);
+        drop(engine);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// An exec's output stream ends only once its exit code is recorded: on
+    /// its exit, and when the VM stops under it. docker-java inspects the exec
+    /// as soon as the stream closes and needs `ExitCode` then (#551).
+    #[test]
+    fn an_exec_has_its_exit_code_when_its_stream_ends() {
+        let (engine, id, dir) = engine("exec-exit");
+        let exec = |argv: &str| engine.exec_create(&id, ExecConfig { console_size: None, argv: vec![argv.into()], env: Vec::new(), cwd: "/".into(), user: String::new(), tty: false, stdin: false, privileged: false, internal: true }).unwrap();
+        let attach = |exec_id: &str| {
+            let (tx, rx) = mpsc::channel();
+            let mut st = engine.lock();
+            let e = st.execs.get_mut(exec_id).unwrap();
+            e.running = true;
+            e.attached.push(tx);
+            rx
+        };
+        let state = |exec_id: &str| engine.with_exec(exec_id, |e| (e.running, e.exit_code)).unwrap();
+        let (exited, lost, never) = (exec("exited"), exec("lost"), exec("never"));
+        assert_eq!(state(&never), (false, None), "an exec not started has no exit code, as in Docker");
+        let rx = attach(&exited);
+        engine.on_event(Event::Exited { id: &exited, code: 3, oom: false });
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Disconnected)), "its stream ended");
+        assert_eq!(state(&exited), (false, Some(3)));
+        let rx = attach(&lost);
+        engine.on_event(Event::Lost);
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Disconnected)), "its stream ended with the VM");
+        assert_eq!(state(&lost), (false, Some(255)));
+        assert_eq!(state(&exited), (false, Some(3)), "a finished exec keeps its own code");
+        assert_eq!(state(&never), (false, None));
         drop(engine);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -5904,5 +6226,208 @@ mod start_wait_tests {
         assert!(engine.lock().containers[&id].status == Status::Running);
         drop(engine);
         let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod leave_first_network_tests {
+    use super::*;
+    use super::super::network::{parse_ipam, Settings};
+
+    /// An engine that never boots a VM, with one created (not running)
+    /// container on the default bridge, and user networks `names`
+    /// (`internal` ones as such), each on its own /24.
+    fn engine(name: &str, nets: &[(&str, bool)]) -> (Arc<Engine>, String, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("kiri-leave-first-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let engine = Engine::boot(Store::open(&dir).unwrap()).unwrap();
+        engine.stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+        for (i, (net, internal)) in nets.iter().enumerate() {
+            let ipam = parse_ipam(&serde_json::json!({"Config": [{"Subnet": format!("10.98.{i}.0/24")}]})).unwrap();
+            engine.lock_networks().create(net, Settings { ipam, internal: *internal, ..Default::default() }).unwrap();
+        }
+        let image = Image {
+            name: "test:local".into(), digest: "sha256:test".into(), index_digest: None, config_digest: "sha256:test".into(),
+            layers: Vec::new(), size: 0, platform: "linux/arm64".into(), created: String::new(), pulled_at: 0, config: Default::default(),
+        };
+        let spec: Spec = serde_json::from_value(serde_json::json!({
+            "image": "test:local", "image_id": "sha256:test", "entrypoint": [], "cmd": ["sleep", "30"],
+            "env": [], "cwd": "/", "user": "", "auto_remove": false, "network_mode": "bridge", "labels": {},
+            "restart": {"name": "no", "max_retries": 0}
+        })).unwrap();
+        let id = engine.create(Some("probe".into()), spec, &image).unwrap();
+        (engine, id, dir)
+    }
+
+    fn spec(engine: &Engine, id: &str) -> Spec {
+        engine.lock().containers[id].spec.clone()
+    }
+
+    fn connect(engine: &Engine, net: &str, id: &str, aliases: &[&str], ip: &str) {
+        engine.connect(net, id, aliases.iter().map(|a| (*a).to_owned()).collect(), ip.into(), String::new(), String::new()).unwrap();
+    }
+
+    fn done(engine: Arc<Engine>, dir: PathBuf) {
+        drop(engine);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The .NET Aspire sequence: created on bridge, connected to a session
+    /// network, disconnected from bridge. The session network becomes its
+    /// first, with its own aliases, and the record on disk agrees.
+    #[test]
+    fn leaving_the_first_network_makes_the_other_one_first() {
+        let (engine, id, dir) = engine("one", &[("probe-net", false)]);
+        connect(&engine, "probe-net", &id, &["web"], "");
+        let (_, events) = engine.subscribe();
+        engine.disconnect("bridge", &id).unwrap();
+        let s = spec(&engine, &id);
+        assert_eq!(s.network_mode, "probe-net");
+        assert_eq!(s.aliases, ["web"]);
+        assert!(s.extra_networks.is_empty(), "{:?}", s.extra_networks);
+        assert!(!s.left_all_networks);
+        let sent: Vec<_> = events.try_iter().filter(|e| e["Type"] == "network").map(|e| (e["Action"].as_str().unwrap().to_owned(), e["Actor"]["Attributes"]["name"].as_str().unwrap().to_owned())).collect();
+        assert_eq!(sent, [("disconnect".to_owned(), "bridge".to_owned())]);
+        let saved: Vec<Saved> = serde_json::from_slice(&std::fs::read(&engine.records).unwrap()).unwrap();
+        assert_eq!(saved.iter().find(|c| c.id == id).unwrap().spec.network_mode, "probe-net");
+        // It is no longer on bridge.
+        assert!(matches!(engine.disconnect("bridge", &id), Err(Error::NotFound(_))));
+        done(engine, dir);
+    }
+
+    /// With two others, the next first is the one Docker gives the default
+    /// route to: one that reaches outside before an internal one, then by
+    /// name, whatever the order they were connected in. The other stays an
+    /// extra network with its settings.
+    #[test]
+    fn with_two_others_the_first_by_name_that_reaches_outside_takes_its_place() {
+        let (engine, id, dir) = engine("two", &[("zeta", false), ("alpha", true), ("beta", false)]);
+        connect(&engine, "zeta", &id, &["z"], "10.98.0.7");
+        connect(&engine, "alpha", &id, &["a"], "");
+        connect(&engine, "beta", &id, &["b"], "10.98.2.9");
+        engine.disconnect("bridge", &id).unwrap();
+        let s = spec(&engine, &id);
+        assert_eq!(s.network_mode, "beta", "alpha is internal; beta comes before zeta");
+        assert_eq!((s.aliases.as_slice(), s.ipv4_address.as_str()), (&["b".to_owned()][..], "10.98.2.9"));
+        assert_eq!(s.extra_networks.iter().map(|x| (x.name.as_str(), x.ipv4_address.as_str())).collect::<Vec<_>>(), [("zeta", "10.98.0.7"), ("alpha", "")]);
+        // Leaving that one too: zeta reaches outside, alpha does not.
+        engine.disconnect("beta", &id).unwrap();
+        assert_eq!(spec(&engine, &id).network_mode, "zeta");
+        engine.disconnect("zeta", &id).unwrap();
+        assert_eq!(spec(&engine, &id).network_mode, "alpha", "an internal network when it is the only one left");
+        done(engine, dir);
+    }
+
+    /// Leaving the only network leaves none, as `--network none`: inspect
+    /// shows no networks, a start gives it no network, and it can be
+    /// connected again, to what then becomes its first network.
+    #[test]
+    fn leaving_the_only_network_leaves_none_and_it_can_join_again() {
+        let (engine, id, dir) = engine("only", &[("probe-net", false)]);
+        engine.disconnect("bridge", &id).unwrap();
+        let s = spec(&engine, &id);
+        assert_eq!(s.network_mode, "none");
+        assert!(s.left_all_networks && s.extra_networks.is_empty());
+        assert!(matches!(engine.disconnect("bridge", &id), Err(Error::NotFound(_))));
+        assert!(matches!(engine.disconnect("none", &id), Err(Error::NotFound(_))), "it is on no network, not on none");
+        connect(&engine, "probe-net", &id, &["web"], "10.98.0.5");
+        let s = spec(&engine, &id);
+        assert_eq!((s.network_mode.as_str(), s.ipv4_address.as_str(), s.aliases.as_slice()), ("probe-net", "10.98.0.5", &["web".to_owned()][..]));
+        assert!(!s.left_all_networks && s.extra_networks.is_empty());
+        // And back on the bridge it left, as an extra network.
+        connect(&engine, "bridge", &id, &[], "");
+        let s = spec(&engine, &id);
+        assert_eq!(s.network_mode, "probe-net");
+        assert_eq!(s.extra_networks.iter().map(|x| x.name.as_str()).collect::<Vec<_>>(), ["bridge"]);
+        done(engine, dir);
+    }
+
+    /// `--network none` stays as it was: no disconnect from none, no connect.
+    #[test]
+    fn a_none_container_is_unchanged() {
+        let (engine, id, dir) = engine("none", &[("probe-net", false)]);
+        engine.lock().containers.get_mut(&id).unwrap().spec.network_mode = "none".into();
+        assert!(matches!(engine.disconnect("none", &id), Err(Error::BadRequest(_))));
+        assert!(matches!(engine.connect("probe-net", &id, Vec::new(), String::new(), String::new(), String::new()), Err(Error::BadRequest(_))));
+        assert_eq!(spec(&engine, &id).network_mode, "none");
+        done(engine, dir);
+    }
+
+    /// A fixed `--ip`, `--ip6` and `--mac-address` belong to the network
+    /// they were given for: none of them follows the container to the
+    /// next one, the address is no longer kept free for it, and an address
+    /// a run left behind goes back to the pool, so the network can go.
+    #[test]
+    fn a_fixed_address_on_the_left_network_is_released_and_not_carried_over() {
+        let (engine, id, dir) = engine("fixed", &[("left", false), ("kept", false)]);
+        {
+            let mut st = engine.lock();
+            let c = st.containers.get_mut(&id).unwrap();
+            c.spec.network_mode = "left".into();
+            c.spec.ipv4_address = "10.98.0.50".into();
+            c.spec.ipv6_address = "fd00::50".into();
+            c.spec.mac_address = "02:42:0a:62:00:32".into();
+            c.spec.aliases = vec!["old".into()];
+            // As if a run had not handed it back.
+            c.ip = Some([10, 98, 0, 50]);
+        }
+        engine.lock_networks().reserve("left", [10, 98, 0, 50]).unwrap();
+        assert_eq!(engine.wanted_addresses("left"), [[10, 98, 0, 50]]);
+        connect(&engine, "kept", &id, &[], "");
+        engine.disconnect("left", &id).unwrap();
+        let s = spec(&engine, &id);
+        assert_eq!(s.network_mode, "kept");
+        assert_eq!((s.ipv4_address.as_str(), s.ipv6_address.as_str(), s.mac_address.as_str()), ("", "", ""));
+        assert!(s.aliases.is_empty());
+        assert!(engine.wanted_addresses("left").is_empty());
+        assert!(engine.wanted_addresses("kept").is_empty());
+        assert_eq!(engine.lock().containers[&id].ip, None);
+        engine.lock_networks().reserve("left", [10, 98, 0, 50]).expect("the address went back to the pool");
+        engine.lock_networks().release("left", [10, 98, 0, 50]);
+        engine.lock_networks().remove("left").expect("the left network can be removed");
+        done(engine, dir);
+    }
+
+    /// Reconnecting to the network it left puts it back as an extra
+    /// network: the one that took its place stays first.
+    #[test]
+    fn reconnecting_to_the_left_network() {
+        let (engine, id, dir) = engine("again", &[("probe-net", false)]);
+        connect(&engine, "probe-net", &id, &[], "");
+        engine.disconnect("bridge", &id).unwrap();
+        connect(&engine, "bridge", &id, &[], "");
+        let s = spec(&engine, &id);
+        assert_eq!(s.network_mode, "probe-net");
+        assert_eq!(s.extra_networks.iter().map(|x| x.name.as_str()).collect::<Vec<_>>(), ["bridge"]);
+        assert!(matches!(engine.connect("bridge", &id, Vec::new(), String::new(), String::new(), String::new()), Err(Error::Conflict(_))));
+        done(engine, dir);
+    }
+
+    /// A running container is refused, with what to do instead, and
+    /// nothing changes: moving its default route, address and resolver to
+    /// another network while it runs is more than an unplug.
+    #[test]
+    fn a_running_container_must_be_stopped_first() {
+        let (engine, id, dir) = engine("running", &[("probe-net", false)]);
+        connect(&engine, "probe-net", &id, &[], "");
+        engine.lock().containers.get_mut(&id).unwrap().status = Status::Running;
+        let r = engine.disconnect("bridge", &id);
+        assert!(matches!(&r, Err(Error::Conflict(m)) if m.contains("stop the container first")), "{r:?}");
+        let s = spec(&engine, &id);
+        assert_eq!(s.network_mode, "bridge");
+        assert_eq!(s.extra_networks.len(), 1);
+        done(engine, dir);
+    }
+
+    /// Records saved before a container could leave all its networks load,
+    /// as on a network.
+    #[test]
+    fn old_records_load() {
+        let s: Spec = serde_json::from_value(serde_json::json!({
+            "image": "alpine", "image_id": "sha256:x", "entrypoint": [], "cmd": ["sh"], "env": [], "cwd": "", "user": "",
+            "auto_remove": false, "network_mode": "bridge", "labels": {},
+        }))
+        .unwrap();
+        assert!(!s.left_all_networks);
     }
 }

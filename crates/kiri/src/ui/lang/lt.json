@@ -1835,5 +1835,18 @@
   "{n} more in a <a>Compose project</a>": "Dar {n} <a>Compose projekte</a>",
   "{n} more in <a>Compose projects</a>": "Dar {n} <a>Compose projektuose</a>",
   "Your only container is in a <a>Compose project</a>": "Vienintelis jūsų konteineris yra <a>Compose projekte</a>",
-  "All {n} containers are in <a>Compose projects</a>": "Visi {n} konteineriai yra <a>Compose projektuose</a>"
+  "All {n} containers are in <a>Compose projects</a>": "Visi {n} konteineriai yra <a>Compose projektuose</a>",
+  "Skipped until Kiri next opens": "Praleista, kol Kiri bus atidaryta kitą kartą",
+  "Couldn't add the kiri docker context": "Nepavyko pridėti docker konteksto kiri",
+  "The kiri and docker commands": "Komandos kiri ir docker",
+  "Ready in any new terminal": "Paruoštos kiekviename naujame terminale",
+  "Couldn't add them to your shell": "Nepavyko jų pridėti prie jūsų apvalkalo",
+  "Starts at login": "Paleidžiama prisijungus",
+  "The engine starts when you log in": "Variklis paleidžiamas, kai prisijungiate",
+  "The engine runs from the app for now": "Kol kas variklis veikia iš programos",
+  "Show log": "Rodyti žurnalą",
+  "Continue anyway": "Vis tiek tęsti",
+  "One step didn't work. Everything else is ready.": "Vienas veiksmas nepavyko. Visa kita paruošta.",
+  "Some steps didn't work. Everything else is ready.": "Keli veiksmai nepavyko. Visa kita paruošta.",
+  "No matches": "Atitikmenų nėra"
 }

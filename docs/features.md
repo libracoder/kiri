@@ -19,7 +19,11 @@ Apple silicon and Intel Macs (macOS 14+), Windows 10 and 11 (x86-64 and Arm, thr
   privileged and unconfined containers keep the host boundary: no vsock
   sockets (the way to the Mac) and no io_uring
 - **Networking**: a default bridge, user networks with DNS by name and
-  alias, `network connect`/`disconnect`, `--network host|none`, `-p`/`-P`
+  alias, `network connect`/`disconnect` (as with Docker, a container can
+  leave any of its networks, its first one too: another of its networks
+  then gives its default route, and with none left it has no network, as
+  with `--network none`; to leave its first network a running container is
+  stopped first), `--network host|none`, `-p`/`-P`
   (TCP and UDP) on all interfaces (as Docker does; `-p 127.0.0.1:8080:80`
   keeps a port local), `--add-host`, `host.docker.internal`,
   `--network container:<name>` (Compose `network_mode: service:x`; as with

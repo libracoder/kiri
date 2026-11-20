@@ -1835,5 +1835,18 @@
   "{n} more in a <a>Compose project</a>": "{n} més en un <a>projecte de Compose</a>",
   "{n} more in <a>Compose projects</a>": "{n} més en <a>projectes de Compose</a>",
   "Your only container is in a <a>Compose project</a>": "L'únic contenidor és en un <a>projecte de Compose</a>",
-  "All {n} containers are in <a>Compose projects</a>": "Els {n} contenidors són en <a>projectes de Compose</a>"
+  "All {n} containers are in <a>Compose projects</a>": "Els {n} contenidors són en <a>projectes de Compose</a>",
+  "Skipped until Kiri next opens": "Ometut fins que Kiri s'obri de nou",
+  "Couldn't add the kiri docker context": "No s'ha pogut afegir el context kiri de docker",
+  "The kiri and docker commands": "Les ordres kiri i docker",
+  "Ready in any new terminal": "A punt en qualsevol terminal nou",
+  "Couldn't add them to your shell": "No s'han pogut afegir al teu shell",
+  "Starts at login": "S'inicia en iniciar sessió",
+  "The engine starts when you log in": "El motor s'inicia quan inicies sessió",
+  "The engine runs from the app for now": "De moment, el motor s'executa des de l'aplicació",
+  "Show log": "Mostra el registre",
+  "Continue anyway": "Continua igualment",
+  "One step didn't work. Everything else is ready.": "Un pas no ha funcionat. Tota la resta està a punt.",
+  "Some steps didn't work. Everything else is ready.": "Alguns passos no han funcionat. Tota la resta està a punt.",
+  "No matches": "Cap coincidència"
 }

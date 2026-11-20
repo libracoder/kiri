@@ -25,6 +25,9 @@ pub struct Request {
     query: Vec<(String, String)>,
     headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+    /// Sent as HTTP/1.0: its connection closes after the response unless it
+    /// asks to keep it.
+    http10: bool,
 }
 
 impl Request {
@@ -46,19 +49,21 @@ impl Request {
         self.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)).map(|(_, v)| v.as_str())
     }
 
-    /// The client asked to close the connection after this response
-    /// (`Connection: close`), as Docker.DotNet does on every request. Docker
-    /// closes then; a client that reads a 204 to the end of the stream waits
-    /// for that close and times out if it never comes.
+    /// The connection closes after this request's response: the client
+    /// sent `Connection: close` (Docker.DotNet does on every request), or
+    /// spoke HTTP/1.0 without `Connection: keep-alive` (RFC 9112 §9.3), as
+    /// Go's net/http in dockerd decides it. A client that reads a 204 to the
+    /// end of the stream waits for that close and times out if it never comes.
     pub fn wants_close(&self) -> bool {
-        self.header("Connection").is_some_and(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case("close")))
+        let has = |token: &str| self.header("Connection").is_some_and(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case(token)));
+        has("close") || (self.http10 && !has("keep-alive"))
     }
 
     /// A request the daemon makes of itself (the managed builder's
     /// container create), so it goes through the same code as a client's.
     pub fn internal(method: &str, path: &str, query: &[(&str, &str)], body: Vec<u8>) -> Request {
         let query = query.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect();
-        Request { method: method.to_owned(), path: path.to_owned(), query, headers: Vec::new(), body }
+        Request { method: method.to_owned(), path: path.to_owned(), query, headers: Vec::new(), body, http10: false }
     }
 }
 
@@ -68,7 +73,7 @@ impl Request {
 pub fn read_request(r: &mut BufReader<UnixStream>, stream: impl Fn(&str, &str) -> bool) -> io::Result<Option<Request>> {
     // The request line and headers are read through a cap, so a client
     // cannot exhaust memory with an endless line. The body is read after.
-    let (method, path, query, headers) = {
+    let (method, path, query, headers, http10) = {
         let mut head = (&mut *r).take(MAX_HEAD);
         let mut line = String::new();
         if head.read_line(&mut line)? == 0 {
@@ -78,6 +83,7 @@ pub fn read_request(r: &mut BufReader<UnixStream>, stream: impl Fn(&str, &str) -
         let (Some(method), Some(target)) = (parts.next(), parts.next()) else {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "bad request line"));
         };
+        let http10 = parts.next().is_some_and(|v| v.eq_ignore_ascii_case("HTTP/1.0"));
         let method = method.to_owned();
         let (raw_path, raw_query) = target.split_once('?').unwrap_or((target, ""));
         // Decoded once, here, so every route that reads a name from the
@@ -106,10 +112,10 @@ pub fn read_request(r: &mut BufReader<UnixStream>, stream: impl Fn(&str, &str) -
                 headers.push((k.trim().to_owned(), v.trim().to_owned()));
             }
         }
-        (method, path, query, headers)
+        (method, path, query, headers, http10)
     };
     let streamed = stream(&method, &path);
-    let mut req = Request { method, path, query, headers, body: Vec::new() };
+    let mut req = Request { method, path, query, headers, body: Vec::new(), http10 };
     if streamed {
         return Ok(Some(req));
     }
@@ -263,12 +269,17 @@ fn reason(status: u16) -> &'static str {
 thread_local! {
     /// The request this connection thread is answering, for the log.
     static SERVING: std::cell::RefCell<(String, String)> = const { std::cell::RefCell::new((String::new(), String::new())) };
+    /// Whether the connection closes after the request being answered: its
+    /// response then says so (`Connection: close`), as Docker's does.
+    static CLOSING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Notes the request being answered: a failure status written for it is
-/// logged with its method and path (never its query or body).
-pub fn serving(method: &str, path: &str) {
-    SERVING.with(|s| *s.borrow_mut() = (method.to_owned(), path.to_owned()));
+/// logged with its method and path (never its query or body), and its
+/// response carries `Connection: close` when the connection ends after it.
+pub fn serving(req: &Request) {
+    SERVING.with(|s| *s.borrow_mut() = (req.method.clone(), req.path.clone()));
+    CLOSING.with(|c| c.set(req.wants_close()));
 }
 
 /// Engine API failures in the log: 5xx as errors, 4xx as warnings, except
@@ -288,9 +299,11 @@ fn head(w: &mut impl Write, status: u16, extra: &str) -> io::Result<()> {
     if status >= 400 {
         note_failure(status);
     }
+    // A response that names its own Connection (an upgrade, `CLOSE`) keeps it.
+    let closing = if CLOSING.with(std::cell::Cell::get) && !extra.contains("Connection:") { CLOSE } else { "" };
     write!(
         w,
-        "HTTP/1.1 {status} {}\r\nApi-Version: {API_VERSION}\r\nDocker-Experimental: false\r\nOstype: linux\r\nServer: Kiri/{} (linux)\r\n{extra}\r\n",
+        "HTTP/1.1 {status} {}\r\nApi-Version: {API_VERSION}\r\nDocker-Experimental: false\r\nOstype: linux\r\nServer: Kiri/{} (linux)\r\n{extra}{closing}\r\n",
         reason(status),
         env!("CARGO_PKG_VERSION")
     )
@@ -409,7 +422,16 @@ mod tests {
 
     fn with_connection(value: Option<&str>) -> Request {
         let headers = value.map(|v| vec![("connection".to_owned(), v.to_owned())]).unwrap_or_default();
-        Request { method: "POST".to_owned(), path: "/containers/x/start".to_owned(), query: Vec::new(), headers, body: Vec::new() }
+        Request { method: "POST".to_owned(), path: "/containers/x/start".to_owned(), query: Vec::new(), headers, body: Vec::new(), http10: false }
+    }
+
+    /// A request as `read_request` reads it off the wire.
+    fn parsed(raw: &str) -> Request {
+        use std::io::Write;
+        let (mut a, b) = UnixStream::pair().unwrap();
+        a.write_all(raw.as_bytes()).unwrap();
+        drop(a);
+        read_request(&mut BufReader::new(b), |_, _| false).unwrap().unwrap()
     }
 
     /// Docker.DotNet sends `Connection: close` on every request and reads a
@@ -426,6 +448,58 @@ mod tests {
         assert!(!with_connection(Some("keep-alive")).wants_close());
         assert!(!with_connection(Some("Upgrade")).wants_close());
         assert!(!with_connection(None).wants_close());
+    }
+
+    /// HTTP/1.0 closes after each response unless it asks to keep the
+    /// connection; HTTP/1.1 keeps it unless it asks to close.
+    #[test]
+    fn the_close_follows_the_http_version_and_header() {
+        let closes = |raw: &str| parsed(raw).wants_close();
+        assert!(closes("POST /v1.44/containers/x/start HTTP/1.1\r\nHost: d\r\nConnection: close\r\n\r\n"));
+        assert!(closes("GET /_ping HTTP/1.1\r\nHost: d\r\nconnection: Upgrade, Close\r\n\r\n"));
+        assert!(closes("POST /containers/x/start HTTP/1.0\r\nHost: d\r\n\r\n"));
+        assert!(closes("GET /_ping HTTP/1.0\r\n\r\n"));
+        assert!(closes("GET /_ping HTTP/1.0\r\nConnection: keep-alive, close\r\n\r\n"));
+        assert!(!closes("GET /_ping HTTP/1.0\r\nConnection: Keep-Alive\r\n\r\n"));
+        assert!(!closes("GET /_ping HTTP/1.1\r\nHost: d\r\n\r\n"));
+        assert!(!closes("GET /_ping HTTP/1.1\r\nHost: d\r\nConnection: keep-alive\r\n\r\n"));
+        assert!(!closes("POST /containers/x/attach HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n"));
+        // The daemon's own requests keep nothing open, but never ask to close.
+        assert!(!Request::internal("POST", "/containers/create", &[], Vec::new()).wants_close());
+    }
+
+    /// The response to a request whose connection closes says so, as
+    /// Docker's does; a kept-alive one says nothing, and an upgrade or a
+    /// response that already names its Connection is not given a second.
+    #[test]
+    fn a_closing_response_says_connection_close() {
+        let answer = |raw: &str, write: &dyn Fn(&mut Vec<u8>) -> io::Result<()>| {
+            serving(&parsed(raw));
+            let mut out = Vec::new();
+            write(&mut out).unwrap();
+            String::from_utf8(out).unwrap()
+        };
+        let close11 = "POST /containers/x/start HTTP/1.1\r\nHost: d\r\nConnection: close\r\n\r\n";
+        let start10 = "POST /containers/x/start HTTP/1.0\r\n\r\n";
+        let kept = "POST /containers/x/start HTTP/1.1\r\nHost: d\r\n\r\n";
+
+        let r = answer(close11, &|w| no_content(w));
+        assert!(r.starts_with("HTTP/1.1 204 No Content\r\n") && r.ends_with("Connection: close\r\n\r\n"), "{r}");
+        let r = answer(start10, &|w| no_content(w));
+        assert_eq!(r.matches("Connection: close\r\n").count(), 1, "{r}");
+        let r = answer(close11, &|w| json(w, 200, "{}"));
+        assert!(r.contains("Content-Length: 2\r\nConnection: close\r\n\r\n{}"), "{r}");
+        let r = answer(close11, &|w| begin_stream(w, 200, "application/json"));
+        assert!(r.contains("Transfer-Encoding: chunked\r\nConnection: close\r\n"), "{r}");
+        let r = answer(close11, &|w| error_closing(w, 409, "busy"));
+        assert_eq!(r.matches("Connection:").count(), 1, "{r}");
+        let r = answer(close11, &|w| upgrade(w));
+        assert!(r.contains("Connection: Upgrade\r\n") && !r.contains("Connection: close"), "{r}");
+
+        let r = answer(kept, &|w| no_content(w));
+        assert!(!r.contains("Connection:"), "{r}");
+        let r = answer(kept, &|w| json(w, 200, "{}"));
+        assert!(!r.contains("Connection:"), "{r}");
     }
 
     #[test]
@@ -485,7 +559,7 @@ mod tests {
     #[test]
     fn upgrades_only_when_asked() {
         let reply = |headers: Vec<(String, String)>| {
-            let req = Request { method: "POST".into(), path: "/exec/x/start".into(), query: Vec::new(), headers, body: Vec::new() };
+            let req = Request { method: "POST".into(), path: "/exec/x/start".into(), query: Vec::new(), headers, body: Vec::new(), http10: false };
             let mut out = Vec::new();
             upgrade_if_asked(&req, &mut out).unwrap();
             String::from_utf8(out).unwrap()

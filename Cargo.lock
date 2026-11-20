@@ -741,6 +741,7 @@ dependencies = [
  "rcgen",
  "regex-lite",
  "rustls",
+ "ruzstd",
  "serde",
  "serde_json",
  "sha2",

@@ -1835,5 +1835,18 @@
   "{n} more in a <a>Compose project</a>": "ອີກ {n} ຢູ່ໃນ <a>ໂປຣເຈັກ Compose</a>",
   "{n} more in <a>Compose projects</a>": "ອີກ {n} ຢູ່ໃນ <a>ໂປຣເຈັກ Compose</a>",
   "Your only container is in a <a>Compose project</a>": "ຄອນເທນເນີດຽວຂອງທ່ານຢູ່ໃນ <a>ໂປຣເຈັກ Compose</a>",
-  "All {n} containers are in <a>Compose projects</a>": "ຄອນເທນເນີທັງໝົດ {n} ຢູ່ໃນ <a>ໂປຣເຈັກ Compose</a>"
+  "All {n} containers are in <a>Compose projects</a>": "ຄອນເທນເນີທັງໝົດ {n} ຢູ່ໃນ <a>ໂປຣເຈັກ Compose</a>",
+  "Skipped until Kiri next opens": "ຂ້າມໄວ້ຈົນກວ່າຈະເປີດ Kiri ຄັ້ງຕໍ່ໄປ",
+  "Couldn't add the kiri docker context": "ເພີ່ມ kiri docker context ບໍ່ໄດ້",
+  "The kiri and docker commands": "ຄຳສັ່ງ kiri ແລະ docker",
+  "Ready in any new terminal": "ພ້ອມໃຊ້ໃນທຸກ terminal ໃໝ່",
+  "Couldn't add them to your shell": "ເພີ່ມເຂົ້າ shell ຂອງທ່ານບໍ່ໄດ້",
+  "Starts at login": "ເລີ່ມເມື່ອເຂົ້າສູ່ລະບົບ",
+  "The engine starts when you log in": "ເອນຈິນຈະເລີ່ມເມື່ອທ່ານເຂົ້າສູ່ລະບົບ",
+  "The engine runs from the app for now": "ຕອນນີ້ເອນຈິນແລ່ນຈາກແອັບ",
+  "Show log": "ສະແດງບັນທຶກ",
+  "Continue anyway": "ສືບຕໍ່ຕໍ່ໄປ",
+  "One step didn't work. Everything else is ready.": "ມີ 1 ຂັ້ນຕອນບໍ່ສຳເລັດ. ສ່ວນອື່ນພ້ອມທັງໝົດ.",
+  "Some steps didn't work. Everything else is ready.": "ບາງຂັ້ນຕອນບໍ່ສຳເລັດ. ສ່ວນອື່ນພ້ອມທັງໝົດ.",
+  "No matches": "ບໍ່ມີລາຍການທີ່ກົງກັນ"
 }

@@ -432,11 +432,13 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
                     // Only its network namespace is joined, which exists from
                     // clone: a container still filling a volume will do.
                     let join_pid = kiri_proto::net_opts::values(spec.net.opts, kiri_proto::net_opts::NETNS).next().and_then(|t| netns_pid(procs, t));
+                    // A PID namespace exists from clone too.
+                    let pid_join_pid = kiri_proto::net_opts::values(spec.net.opts, kiri_proto::net_opts::PIDNS).next().and_then(|t| live_pid(procs, t));
                     failed_starts.remove(spec.id);
                     container::spawn(
                     &spec,
                     paths,
-                    NetCtx { bridges: &mut bridges, dns: &mut dns, upstream_dns: dhcp.as_ref().and_then(|d| d.lease.as_ref()).map_or(&host_dns[..], |l| &l.dns), join_pid },
+                    NetCtx { bridges: &mut bridges, dns: &mut dns, upstream_dns: dhcp.as_ref().and_then(|d| d.lease.as_ref()).map_or(&host_dns[..], |l| &l.dns), join_pid, pid_join_pid },
                 )
                 } {
                     Ok(run) => {
@@ -652,6 +654,9 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
                             .and_then(|()| std::fs::File::open(format!("/proc/{pid}/ns/net")).and_then(|ns| dns.serve_in(&ns, pid, n.ip, n.bridge)));
                         match attached {
                             Ok(()) => {
+                                if let Some(name) = kiri_proto::net_opts::values(n.opts, kiri_proto::net_opts::NETWORK).next() {
+                                    dns.name_network(n.bridge, name);
+                                }
                                 if !plug.no_ipv4 {
                                     dns.register(n.bridge, n.dns_names.iter(), n.ip);
                                 }
@@ -661,6 +666,22 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
                                 if let Some(p) = procs.get_mut(&pid) {
                                     p.run.dns_entries.push((n.bridge.to_owned(), n.ip));
                                     p.run.veths.push(host_if.clone());
+                                }
+                                // A user network's names come from the embedded
+                                // DNS, which now answers in the container: its
+                                // resolv.conf names it from here on (#449).
+                                if n.bridge != "kiri0" && !plug.no_ipv4 {
+                                    let upstream = dhcp.as_ref().and_then(|d| d.lease.as_ref()).map_or(&host_dns[..], |l| &l.dns);
+                                    let is_kiri = |a: [u8; 4]| upstream.contains(&a) || dns.serves_at(a) || a == [1, 1, 1, 1];
+                                    match container::use_embedded_dns(id, is_kiri) {
+                                        Ok(Some(servers)) if !servers.is_empty() => {
+                                            if let Some(owner) = dns.owner_of(pid) {
+                                                dns.set_upstream(owner, servers);
+                                            }
+                                        }
+                                        Ok(_) => {}
+                                        Err(e) => eprintln!("kiri-init: {id}: resolv.conf: {e}"),
+                                    }
                                 }
                                 Msg::Ack.encode(&mut out)
                             }

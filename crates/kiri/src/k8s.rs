@@ -211,7 +211,11 @@ fn run_inner(args: &[String]) -> io::Result<()> {
         Some("start") => start(flag("--use")),
         Some("stop") => {
             ensure_daemon()?;
-            ok(client::request("POST", &format!("/containers/{NAME}/stop"), None))?;
+            // Stopped already: Docker's 304, with no body, is done (as Start's is).
+            let stopped = client::request("POST", &format!("/containers/{NAME}/stop"), None)?;
+            if !stopped.ok() && stopped.status != 304 {
+                return Err(io::Error::other(stopped.error()));
+            }
             println!("Kubernetes stopped (its state is kept; `kiri k8s start` resumes it)");
             Ok(())
         }
