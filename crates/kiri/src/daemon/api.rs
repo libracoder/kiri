@@ -1099,10 +1099,54 @@ fn run_pull(req: &Request, engine: &Engine, reference: &Reference, job: &super::
                     message = why;
                 }
             }
-            if let Some(why) = pull_hint(&e, &reference.registry, super::proxy::shown().as_deref()) {
+            let proxy = super::proxy::shown();
+            if let Some(why) = local_network_hint(&e, &reference.registry, proxy.is_some(), &crate::flavor::APP.to_string()) {
+                message = format!("{message}. {why}");
+            } else if let Some(why) = pull_hint(&e, &reference.registry, proxy.as_deref()) {
                 message = format!("{why} ({message})");
             }
             line(json!({"errorDetail": {"message": message}, "error": message}))
+        }
+    }
+}
+
+/// macOS answers "No route to host" (EHOSTUNREACH, os error 65) to an app
+/// that may not use the local network, though the Mac itself reaches it:
+/// for a pull from a registry at a private or link-local address, the
+/// sentence that says where that is allowed. None anywhere else, for
+/// another error, a public registry, or a pull through a proxy.
+fn local_network_hint(e: &kiri_image::registry::Error, registry: &str, proxied: bool, app: &str) -> Option<String> {
+    let kiri_image::registry::Error::Http(m) = e else { return None };
+    if !cfg!(target_os = "macos") || proxied || !m.contains("os error 65") {
+        return None;
+    }
+    // Looked up only now, on this one error: the address the pull failed to reach.
+    registry_addrs(registry).iter().any(|a| private_addr(*a)).then(|| {
+        format!("{registry} is on the local network: {app} not allowed under Local Network in Privacy & Security (System Settings) usually causes this")
+    })
+}
+
+/// The registry host's addresses: `host`, `host:port`, an IP or `[v6]:port`.
+fn registry_addrs(registry: &str) -> Vec<std::net::IpAddr> {
+    use std::net::ToSocketAddrs;
+    if let Ok(ip) = registry.parse::<std::net::IpAddr>() {
+        return vec![ip];
+    }
+    let with_port = if registry.parse::<std::net::SocketAddr>().is_ok() || registry.rsplit_once(':').is_some_and(|(_, p)| p.parse::<u16>().is_ok()) {
+        registry.to_owned()
+    } else {
+        format!("{registry}:443")
+    };
+    with_port.to_socket_addrs().map(|a| a.map(|s| s.ip()).collect()).unwrap_or_default()
+}
+
+/// RFC 1918 and IPv4 link-local, IPv6 unique-local (fc00::/7) and link-local (fe80::/10).
+fn private_addr(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_private() || v4.is_link_local(),
+        std::net::IpAddr::V6(v6) => {
+            let s = v6.segments()[0];
+            (s & 0xfe00) == 0xfc00 || (s & 0xffc0) == 0xfe80 || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_private() || v4.is_link_local())
         }
     }
 }
@@ -4347,6 +4391,27 @@ mod network_option_tests {
         assert_eq!(super::pull_hint(&status(401), "docker.io", None).unwrap(), "Docker Hub asked for a login: docker login");
         assert_eq!(super::pull_hint(&status(500), "docker.io", None), None);
         assert_eq!(super::pull_hint(&Error::NotFound("no such image".into()), "docker.io", p), None);
+    }
+
+    /// macOS's "No route to host" from a registry on the local network says
+    /// where Local Network is allowed; nothing for anything else.
+    #[test]
+    fn no_route_to_a_registry_on_the_local_network_points_at_local_network() {
+        use kiri_image::registry::Error;
+        let e65 = Error::Http("io: No route to host (os error 65)".into());
+        let hint = |e: &Error, reg: &str, proxied: bool| super::local_network_hint(e, reg, proxied, "Kiri Repro");
+        let want = |reg: &str| format!("{reg} is on the local network: Kiri Repro not allowed under Local Network in Privacy & Security (System Settings) usually causes this");
+        for reg in ["192.168.1.20", "10.1.2.3:5000", "172.20.0.9", "169.254.10.1", "fd12::1", "[fe80::1]:5000"] {
+            assert_eq!(hint(&e65, reg, false), cfg!(target_os = "macos").then(|| want(reg)), "{reg}");
+        }
+        // A public registry, another error, a pull through a proxy: as before.
+        assert_eq!(hint(&e65, "8.8.8.8", false), None);
+        assert_eq!(hint(&e65, "[2001:4860::8888]:443", false), None);
+        assert_eq!(hint(&Error::Http("io: Connection refused (os error 61)".into()), "192.168.1.20", false), None);
+        assert_eq!(hint(&Error::NotFound("no such image".into()), "192.168.1.20", false), None);
+        assert_eq!(hint(&e65, "192.168.1.20", true), None);
+        assert!(super::private_addr("::ffff:192.168.1.1".parse().unwrap()));
+        assert!(!super::private_addr("172.32.0.1".parse().unwrap()));
     }
 
     /// A container named in create's options that does not exist is a 400

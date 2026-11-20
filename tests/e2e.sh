@@ -28,12 +28,14 @@ FEATURE=${DOCKER_CONTEXT#kiri}; FEATURE=${FEATURE#-}
 SOCK=$(docker context inspect "$DOCKER_CONTEXT" --format '{{.Endpoints.docker.Host}}' 2>/dev/null); SOCK=${SOCK#unix://}
 [ -S "$SOCK" ] || { echo "e2e: no engine socket for context $DOCKER_CONTEXT ($SOCK)"; exit 1; }
 export KIRI_SOCKET=$SOCK
-# The `kiri` CLI: $KIRI, else a source build next to these tests, else the
-# binary of the engine under test (the process holding its socket), as on a
-# Mac that only has the app. Absolute: machine-cwd runs it from another folder.
+# The `kiri` CLI: $KIRI, else the binary of the engine under test (the
+# process holding its socket), else a source build next to these tests.
+# The engine's own first: a target/release/kiri left from an older build
+# is not what is being tested (it failed machine-stop-again, fixed since).
+# Absolute: machine-cwd runs it from another folder.
 if [ -z "${KIRI:-}" ]; then
-  KIRI=$(cd "$(dirname "$0")/.." && pwd)/target/release/kiri
-  [ -x "$KIRI" ] || KIRI=$(lsof -a -d txt -Fn -p "$(lsof -t "$SOCK" 2>/dev/null | head -1)" 2>/dev/null | sed -n 's/^n//p' | head -1)
+  KIRI=$(for p in $(lsof -t "$SOCK" 2>/dev/null); do lsof -a -d txt -Fn -p "$p" 2>/dev/null; done | sed -n 's/^n//p' | grep '/kiri$' | head -1)
+  [ -x "$KIRI" ] || KIRI=$(cd "$(dirname "$0")/.." && pwd)/target/release/kiri
 fi
 # KIRI_TEST_CLI=kiri: every check goes through Kiri's own commands (`kiri
 # run`, `kiri build`, `kiri compose`...) and not through `docker`. They are
