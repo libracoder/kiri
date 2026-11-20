@@ -24,6 +24,27 @@ FEATURE=${DOCKER_CONTEXT#kiri}; FEATURE=${FEATURE#-}
 SOCK=$(docker context inspect "$DOCKER_CONTEXT" --format '{{.Endpoints.docker.Host}}' 2>/dev/null); SOCK=${SOCK#unix://}
 [ -S "$SOCK" ] || { echo "e2e: no engine socket for context $DOCKER_CONTEXT ($SOCK)"; exit 1; }
 export KIRI_SOCKET=$SOCK
+# The `kiri` CLI: $KIRI, else a source build next to these tests, else the
+# binary of the engine under test (the process holding its socket), as on a
+# Mac that only has the app. Absolute: machine-cwd runs it from another folder.
+if [ -z "${KIRI:-}" ]; then
+  KIRI=$(cd "$(dirname "$0")/.." && pwd)/target/release/kiri
+  [ -x "$KIRI" ] || KIRI=$(lsof -a -d txt -Fn -p "$(lsof -t "$SOCK" 2>/dev/null | head -1)" 2>/dev/null | sed -n 's/^n//p' | head -1)
+fi
+# KIRI_TEST_CLI=kiri: every check goes through Kiri's own commands (`kiri
+# run`, `kiri build`, `kiri compose`...) and not through `docker`. They are
+# what people are told to use, so they must pass everything `docker` does.
+# One word with no spaces, as $D is used unquoted. `docker import` is
+# `kiri image import` there: `kiri import` brings things over from other tools.
+if [ "${KIRI_TEST_CLI:-docker}" = kiri ]; then
+  [ -x "$KIRI" ] || { echo "e2e: KIRI_TEST_CLI=kiri, but no kiri binary found (set KIRI)"; exit 1; }
+  KIRI_AS_D=$(mktemp -d)/kiri
+  printf '#!/bin/sh\n[ "$1" = import ] && { shift; set -- image import "$@"; }\nexec %s "$@"\n' "$(printf %q "$KIRI")" > "$KIRI_AS_D"
+  chmod +x "$KIRI_AS_D"
+  D=$KIRI_AS_D
+  trap 'rm -rf "$(dirname "$KIRI_AS_D")"' EXIT
+  echo "e2e: commands go through $KIRI"
+fi
 if [ -z "$FEATURE" ]; then KF="$HOME/Kiri"; else KF="$HOME/Kiri $(printf %s "${FEATURE:0:1}" | tr a-z A-Z)${FEATURE:1}"; fi
 KFQ=$(printf %q "$KF")
 
@@ -294,6 +315,8 @@ $D run -d --name web nginx:alpine >/dev/null
 t ps-running "web" $D ps --format '{{.Names}} {{.Status}}'
 t ps-up "Up" $D ps --format '{{.Status}}'
 t inspect-running "true" $D inspect -f '{{.State.Running}}' web
+# nginx prints its start-up lines a moment after run -d returns.
+nginx_up web
 t logs "Configuration complete" $D logs web
 t exec "nginx version" $D exec web nginx -v
 code exec-exit 3 $D exec web sh -c 'exit 3'
@@ -1266,13 +1289,7 @@ $D rm -f dns >/dev/null
 code udp-port-free-after 0 bash -c "python3 -c 'import socket; s=socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind((\"0.0.0.0\", 15354))'"
 
 section "Linux machines"
-# The `kiri` CLI: $KIRI, else a source build next to these tests, else the
-# binary of the engine under test (the process holding its socket), as on a
-# Mac that only has the app. Absolute: machine-cwd runs it from another folder.
-if [ -z "${KIRI:-}" ]; then
-  KIRI=$(cd "$(dirname "$0")/.." && pwd)/target/release/kiri
-  [ -x "$KIRI" ] || KIRI=$(lsof -a -d txt -Fn -p "$(lsof -t "$SOCK" 2>/dev/null | head -1)" 2>/dev/null | sed -n 's/^n//p' | head -1)
-fi
+# The `kiri` CLI is $KIRI, found at the top.
 MACHINE_TESTS="machine-create machine-list machine-user machine-mac-files machine-cwd machine-hostname machine-sudo machine-stop machine-stop-again machine-start machine-start-again machine-delete machine-bad-name"
 # The binary as one shell word, for commands passed to bash -c (app paths have spaces).
 KQ=$(printf %q "$KIRI")
