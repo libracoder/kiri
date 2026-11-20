@@ -10,6 +10,9 @@ const open = () => { prefs.tab = "mirrors"; show("settings"); };
 const put = (id, v) => { const el = document.getElementById(id); el.value = v; el.dispatchEvent(new Event("input", { bubbles: true })); };
 const save = () => document.querySelector("#content [data-savemirrors]");
 const sentList = () => { const m = sent.find((x) => x.type === "setmirrors"); return m ? m.value.mirrors : null; };
+// The address each row shows, whole, so a check cannot match a host inside
+// another one (CodeQL's URL substring rule, and the point of the test).
+const rowUrls = () => [...document.querySelectorAll("#content [data-mirrordel]")].map((b) => b.previousElementSibling?.textContent ?? "");
 const items = [];
 
 kiri.on(mirrors([]));
@@ -32,7 +35,7 @@ t("opening Settings asks for the mirrors", () => {
 t("adding an address shows it, and Save sends the whole list", () => {
   put("mirror-url", "https://mirror.example.com");
   document.querySelector("#content [data-mirroradd]").click();
-  if (!pane().textContent.includes("mirror.example.com")) throw new Error("no row");
+  if (!rowUrls().some((u) => u === "https://mirror.example.com")) throw new Error("no row");
   sent.length = 0;
   save().click();
   if (JSON.stringify(sentList()) !== JSON.stringify(["https://mirror.example.com"])) throw new Error("sent " + JSON.stringify(sent));
@@ -40,7 +43,7 @@ t("adding an address shows it, and Save sends the whole list", () => {
 t("the daemon's answer resets the page to the saved list", () => {
   kiri.on(mirrors(["https://mirror.example.com", "https://mirror.example.net"]));
   open();
-  if (!pane().textContent.includes("mirror.example.net")) throw new Error("no second mirror");
+  if (!rowUrls().some((u) => u === "https://mirror.example.net")) throw new Error("no second mirror");
   if (!save().disabled) throw new Error("save enabled");
 });
 t("removing a mirror takes it out of the list Save sends", () => {
