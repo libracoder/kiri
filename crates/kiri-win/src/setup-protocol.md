@@ -45,7 +45,8 @@ One event type, sent whenever anything changes (at most ~10 a second):
   "progress": {"pct": 58, "done": 224395264, "total": 367575040, "rate": 19084083, "eta": 9, "label": "Downloading WSL 3.0.3 from Microsoft"} | null,
   "tasks": [{"label": "Download WSL", "state": "done" | "active" | "todo" | "error", "detail": "214 / 368 MB"}],
   "log": ["kiri daemon: ready in 33 ms"],
-  "error": null | "text"
+  "error": null | "text",
+  "testError": null | "text"
 }
 ```
 
@@ -56,4 +57,7 @@ One event type, sent whenever anything changes (at most ~10 a second):
   rate as MB/s, eta in seconds); `total` null means an unsized step (show
   the percentage only, or an indeterminate bar when `pct` is null).
 - `error`: shown on the current step's screen with "Try again" (`setup-retry`).
+- `testError`: the first-run test container that did not run. Setup carries
+  on without it (a blocked Docker Hub must not trap a first run); the ready
+  screen shows it and points at Settings → Registry mirrors.
 - The left rail derives from `step`: steps before it done, it current, after it to do.

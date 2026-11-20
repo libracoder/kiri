@@ -94,6 +94,18 @@ impl Reference {
         self.reference.starts_with("sha256:")
     }
 
+    /// The same image, served by `host`: a mirror of this reference's
+    /// registry. `prefix` goes before the repository for mirrors that keep
+    /// the upstream registry in the path (`mirror.example.com/docker.io`); the
+    /// tag or digest is kept as it is.
+    pub fn via(&self, host: &str, prefix: Option<&str>) -> Reference {
+        let repository = match prefix.map(str::trim).filter(|p| !p.is_empty()) {
+            Some(prefix) => format!("{}/{}", prefix.trim_matches('/'), self.repository),
+            None => self.repository.clone(),
+        };
+        Reference { registry: host.to_owned(), repository, reference: self.reference.clone() }
+    }
+
     /// The short form people type and `docker images` shows: `alpine:latest`,
     /// `owner/app:1`, `ghcr.io/o/r:tag`.
     pub fn short(&self) -> String {
@@ -171,6 +183,23 @@ mod tests {
         for s in ["", "a b", "alpine:", "alpine@sha256:short", "/x", "Alpine", &non_hex, &traversal] {
             assert!(Reference::parse(s).is_err(), "{s}");
         }
+    }
+
+    #[test]
+    fn a_mirror_keeps_the_image_and_its_tag() {
+        let nginx = Reference::parse("nginx:1.27").unwrap();
+        let mirrored = nginx.via("mirror.example.com", None);
+        assert_eq!(mirrored.registry, "mirror.example.com");
+        assert_eq!(mirrored.repository, "library/nginx");
+        assert_eq!(mirrored.reference, "1.27");
+        assert_eq!(nginx.short(), "nginx:1.27", "the name people see is unchanged");
+
+        let prefixed = nginx.via("mirror.example.net", Some("docker.io"));
+        assert_eq!(prefixed.repository, "docker.io/library/nginx");
+
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let pinned = Reference::parse(&format!("alpine@{digest}")).unwrap();
+        assert_eq!(pinned.via("127.0.0.1:5000", None).reference, digest);
     }
 
     #[test]
