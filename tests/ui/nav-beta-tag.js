@@ -1,5 +1,5 @@
 // parity: macos windows linux
-// The sidebar's Compose and USB entries, each with a two-digit count, in each of the 38 languages: both carry
+// The sidebar's Compose and USB entries, each with a two-digit count, in each of the 39 languages: both carry
 // the plain outlined Beta tag in the language's word; the name is never cut by it; the tag is whole or hidden,
 // never clipped; no New tag is left.
 const R = [];
