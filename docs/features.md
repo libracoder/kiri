@@ -40,7 +40,10 @@ Apple silicon and Intel Macs (macOS 14+), Windows 10 and 11 (x86-64 and Arm, thr
   `dev.kiri.domain=api.myapp` label picks a container's own names; HTTPS too
   (`https://<name>.kiri.local`), with Kiri's own certificate authority in
   `~/.kiri/tls`, whose name constraints allow only `*.kiri.local` and
-  `*.kiri.localhost` (Settings → Domains → HTTPS asks macOS to trust it)
+  `*.kiri.localhost` (Settings → Domains → HTTPS asks macOS to trust it).
+  The routers' ports from the terminal: `kiri domains` shows them,
+  `kiri domains set --http 8080 --https 8443` moves them with no restart,
+  `kiri domains reset` puts back 80 and 443
 - **Storage**: named and anonymous volumes, bind mounts of Mac paths
   (virtiofs), `--tmpfs`, `--mount`, `volume` commands
 - **Images**: `pull` (with `docker login` credentials), `push`, `tag`,

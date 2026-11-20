@@ -37,6 +37,9 @@ mod daemon;
 mod diag;
 #[cfg(any(unix, windows))]
 mod docker;
+// `kiri domains`: the container-domain routers' ports (Windows: in WSL).
+#[cfg(unix)]
+mod domains_cli;
 mod flavor;
 mod images;
 #[cfg(unix)]
@@ -83,6 +86,7 @@ usage: kiri COMMAND          docker's commands, on Kiri: kiri run, ps, exec,
        kiri ui [--start] [--view containers|images|volumes|networks]
        kiri setup [--use] [--no-agent] | kiri setup --uninstall
        kiri build-with [docker|kiri]   which builder docker build uses
+       kiri domains [set [--http N] [--https N] | reset]   the *.kiri.local routers' ports
        kiri update [--check]      update Kiri (with a container: docker's update)
        kiri diag logs [-f] [--ui|--engine|--cli] [--errors] [-n N]
        kiri diag report [--out PATH] [--send]   (a file to send us, tokens taken out)
@@ -149,6 +153,8 @@ fn main() -> ExitCode {
         Some(a) if share::is_shorthand(a) => share::run(&args),
         #[cfg(unix)]
         Some("build-with") => buildwith::cli(&args[1..]),
+        #[cfg(unix)]
+        Some("domains") => domains_cli::run(&args[1..]),
         #[cfg(unix)]
         Some("k8s") => k8s::run(&args[1..]),
         #[cfg(unix)]

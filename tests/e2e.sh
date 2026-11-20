@@ -752,6 +752,9 @@ fi
 section "domain router ports"
 dport() { curl -s --unix-socket "$SOCK" http://d/kiri/domains | python3 -c "import json,sys; print(json.load(sys.stdin)['$1']['port'])"; }
 OLD_HTTP=$(dport http) OLD_HTTPS=$(dport https)
+# A test copy (Kiri Repro, Kiri Dev) starts with no routers unless given
+# ports of its own (domains.json): then OLD_HTTP is 80, the installed Kiri's.
+OWN_PORTS=; [ -n "$FEATURE" ] && [ -f "$HOME/.kiri-$FEATURE/domains.json" ] && OWN_PORTS=1
 $D run -d --name dmv nginx:alpine >/dev/null
 $D run -d --name dhold -p 18799:80 nginx:alpine >/dev/null
 t domain-ports-same "different ports" curl -s --unix-socket "$SOCK" -X POST -d '{"http":18780,"https":18780}' http://d/kiri/domains
@@ -781,8 +784,22 @@ if [ -z "$FEATURE" ]; then
   # t execs its command, so this is curl itself: a shell function there would never run.
   t domain-ports-restore "\"port\":$OLD_HTTP" curl -s --unix-socket "$SOCK" -X POST -H 'Content-Type: application/json' -d "{\"http\":$OLD_HTTP,\"https\":$OLD_HTTPS}" http://d/kiri/domains
   t domain-ports-restored "Welcome to nginx" bash -c "for i in \$(seq 20); do curl -s -m 2 http://dmv.kiri.localhost:$OLD_HTTP | grep -q nginx && break; sleep 0.5; done; curl -s -m 5 http://dmv.kiri.localhost:$OLD_HTTP"
+elif [ -n "$OWN_PORTS" ]; then
+  # Ports of its own at the start: back to them.
+  t domain-ports-restore "\"port\":$OLD_HTTP" curl -s --unix-socket "$SOCK" -X POST -H 'Content-Type: application/json' -d "{\"http\":$OLD_HTTP,\"https\":$OLD_HTTPS}" http://d/kiri/domains
 else
-  rm -f "$HOME/.kiri-$FEATURE/domains.json"
+  # No routers at the start: back to none, which frees 18780 and 18743 now,
+  # not at its next restart, and never takes 80 and 443 from the installed Kiri.
+  # Through `kiri domains reset` (CLI first); the API itself when $KIRI is
+  # missing or older than that command.
+  if [ -x "$KIRI" ] && "$KIRI" domains >/dev/null 2>&1; then
+    t domain-ports-reset "HTTP 80 off HTTPS 443 off" bash -c "$(printf %q "$KIRI") domains reset | tr -s ' \n' ' ' | sed 's/ \$//'"
+  else
+    t domain-ports-reset '"running":false' curl -s --unix-socket "$SOCK" -X DELETE http://d/kiri/domains
+  fi
+  # This engine (the process on its socket) no longer listens there; another
+  # test copy on this Mac may, so the ports themselves are not asked.
+  t domain-ports-reset-free "free free" bash -c "pid=\$(lsof -t '$SOCK' 2>/dev/null | head -1); [ -n \"\$pid\" ] || { echo 'no engine process'; exit; }; for p in 18780 18743; do lsof -nP -a -p \"\$pid\" -iTCP:\$p -sTCP:LISTEN >/dev/null 2>&1 && echo -n 'held ' || echo -n 'free '; done"
 fi
 $D rm -f dmv dhold >/dev/null
 

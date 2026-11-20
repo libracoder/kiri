@@ -146,6 +146,8 @@ fn route(req: &Request, engine: &Arc<Engine>, w: &mut UnixStream, r: &mut BufRea
         // Settings → Domains: the container-domain routers' ports.
         ("GET", "/kiri/domains") => return reply(w, Ok(super::domains::report()), 200),
         ("POST", "/kiri/domains") => return reply(w, set_domain_ports(req, engine), 200),
+        // Back to the ports a start gives (a test copy's routers stop).
+        ("DELETE", "/kiri/domains") => return reply(w, super::domains::reset(engine).map_err(Error::Conflict), 200),
         // USB passthrough (macOS: the root helper `kiri usb serve` connects here).
         #[cfg(target_os = "macos")]
         ("POST", "/kiri/usb") => return super::usb::attach(req, engine, w, r),
