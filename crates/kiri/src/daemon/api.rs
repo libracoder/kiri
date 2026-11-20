@@ -1582,7 +1582,7 @@ fn mounts(body: &Value, engine: &Engine, image: &kiri_image::Image) -> Result<Mo
     // the same path wins, as in Docker.
     for spec in strings(&host["VolumesFrom"]).unwrap_or_default() {
         let (name, ro) = parse_volumes_from(&spec)?;
-        let id = engine.resolve(name)?;
+        let id = engine.resolve(name).map_err(|e| missing_container(e, ""))?;
         let (guest, info) = engine.with(&id, |c| (c.spec.mounts.clone(), c.spec.mount_info.clone()))?;
         for (line, i) in volumes_from_mounts(&guest, &info, ro) {
             let dst = i["Destination"].as_str().unwrap_or_default().trim_end_matches('/').to_owned();
@@ -2125,13 +2125,24 @@ pub(super) fn create(req: &Request, engine: &Engine) -> Result<Value, Error> {
     Ok(json!({"Id": id, "Warnings": warnings}))
 }
 
+/// A container that create's options name (`--volumes-from`, `--pid
+/// container:`, `--link`, `--network container:`) and that does not exist:
+/// a 400, as Docker answers. A 404 at create tells the docker CLI the image
+/// is missing, so it pulled the image and tried again before showing this.
+fn missing_container(e: Error, context: &str) -> Error {
+    match e {
+        Error::NotFound(m) => Error::BadRequest(format!("{context}{m}")),
+        e => e,
+    }
+}
+
 /// `--pid`: empty, `host`, or `container:<target>`, kept as
 /// `container:<full id>` as Docker does. The target must exist now and run
 /// at start.
 fn pid_mode(mode: &str, engine: &Engine) -> Result<String, Error> {
     match mode.split_once(':') {
         None if mode.is_empty() || mode == "host" => Ok(mode.to_owned()),
-        Some(("container", target)) if !target.is_empty() => Ok(format!("container:{}", engine.resolve(target)?)),
+        Some(("container", target)) if !target.is_empty() => Ok(format!("container:{}", engine.resolve(target).map_err(|e| missing_container(e, ""))?)),
         _ => Err(Error::BadRequest(format!("invalid PID mode: {mode}"))),
     }
 }
@@ -2140,7 +2151,7 @@ fn pid_mode(mode: &str, engine: &Engine) -> Result<String, Error> {
 /// kept, `container:<full id>`. The target must exist now and run at start.
 fn container_network_mode(body: &Value, engine: &Engine, target: &str) -> Result<String, Error> {
     container_mode_allowed(body, target)?;
-    let id = engine.resolve(target)?;
+    let id = engine.resolve(target).map_err(|e| missing_container(e, "joining network namespace of container: "))?;
     Ok(format!("container:{id}"))
 }
 
@@ -2211,7 +2222,7 @@ fn links_from(list: &[String], engine: &Engine) -> Result<Vec<super::engine::Lin
     let mut out = Vec::new();
     for l in list {
         let (name, alias) = parse_link(l).ok_or_else(|| Error::BadRequest(format!("invalid link: {l}")))?;
-        let id = engine.resolve(name).map_err(|_| Error::NotFound(format!("could not get container for {name}")))?;
+        let id = engine.resolve(name).map_err(|e| missing_container(e, &format!("could not get container for {name}: ")))?;
         let name = engine.with(&id, |c| c.name.clone())?;
         out.push(super::engine::Link { id, name, alias: alias.to_owned() });
     }
@@ -3447,7 +3458,7 @@ mod tests {
         engine.create(Some("src".into()), spec, &image).unwrap();
 
         let body = json!({"HostConfig": {"VolumesFrom": ["nosuch"]}});
-        assert!(matches!(mounts(&body, &engine, &image), Err(Error::NotFound(m)) if m == "No such container: nosuch"));
+        assert!(matches!(mounts(&body, &engine, &image), Err(Error::BadRequest(m)) if m == "No such container: nosuch"));
 
         let body = json!({"HostConfig": {"VolumesFrom": ["src:ro"], "Tmpfs": {"/other": ""}}});
         let m = mounts(&body, &engine, &image).unwrap();
@@ -3485,7 +3496,7 @@ mod tests {
         assert_eq!(pid_mode("host", &engine).unwrap(), "host");
         assert_eq!(pid_mode("container:user", &engine).unwrap(), format!("container:{id}"));
         assert_eq!(pid_mode(&format!("container:{}", &id[..12]), &engine).unwrap(), format!("container:{id}"));
-        assert!(matches!(pid_mode("container:nosuch", &engine), Err(Error::NotFound(m)) if m == "No such container: nosuch"));
+        assert!(matches!(pid_mode("container:nosuch", &engine), Err(Error::BadRequest(m)) if m == "No such container: nosuch"));
         for bad in ["private", "container:", "container", "hostx", "ns:/proc/1/ns/pid"] {
             assert!(matches!(pid_mode(bad, &engine), Err(Error::BadRequest(m)) if m == format!("invalid PID mode: {bad}")), "{bad}");
         }
@@ -4172,6 +4183,41 @@ mod network_option_tests {
         assert_eq!(super::pull_hint(&status(401), "docker.io", None).unwrap(), "Docker Hub asked for a login: docker login");
         assert_eq!(super::pull_hint(&status(500), "docker.io", None), None);
         assert_eq!(super::pull_hint(&Error::NotFound("no such image".into()), "docker.io", p), None);
+    }
+
+    /// A container named in create's options that does not exist is a 400
+    /// with Docker's words, so the docker CLI does not take it for a missing
+    /// image (a 404) and pull. A missing image is still a 404.
+    #[test]
+    fn a_missing_container_at_create_is_a_400_and_a_missing_image_a_404() {
+        let dir = std::env::temp_dir().join(format!("kiri-missing-ctr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = super::super::engine::boot_without_vm(&dir);
+        let cfg = json!({"created": "2026-11-16T00:00:00Z", "architecture": "arm64", "os": "linux", "config": {"Cmd": ["true"]}});
+        let mut w = engine.store.ingest().unwrap();
+        io::Write::write_all(&mut w, &serde_json::to_vec(&cfg).unwrap()).unwrap();
+        let (digest, _) = w.finish().unwrap();
+        engine.store.put_image(kiri_image::archive::from_config("demo:local".into(), &digest, &cfg, Vec::new())).unwrap();
+        let create = |host: Value, image: &str| {
+            let body = json!({"Image": image, "HostConfig": host});
+            match super::create(&Request::internal("POST", "/containers/create", &[], serde_json::to_vec(&body).unwrap()), &engine) {
+                Ok(_) => panic!("the create was not refused"),
+                Err(e) => super::status_of(e),
+            }
+        };
+        assert_eq!(create(json!({"VolumesFrom": ["nope"]}), "demo:local"), (400, "No such container: nope".to_owned()));
+        assert_eq!(create(json!({"PidMode": "container:nope"}), "demo:local"), (400, "No such container: nope".to_owned()));
+        assert_eq!(create(json!({"Links": ["nope:db"]}), "demo:local"), (400, "could not get container for nope: No such container: nope".to_owned()));
+        assert_eq!(
+            create(json!({"NetworkMode": "container:nope"}), "demo:local"),
+            (400, "joining network namespace of container: No such container: nope".to_owned())
+        );
+        let (status, message) = create(json!({}), "demo:nosuch");
+        assert_eq!(status, 404);
+        assert!(message.starts_with("No such image: demo:nosuch"));
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -96,12 +96,6 @@ BXC=buildx_buildkit_${BX}0
 if ! $D container inspect "$BXC" >/dev/null 2>&1 && [ "$(curl -s --unix-socket "$SOCK" http://d/kiri/builder | python3 -c 'import json,sys; print(json.load(sys.stdin).get("container", ""))' 2>/dev/null)" = "$BXC" ]; then
   curl -s -o /dev/null --unix-socket "$SOCK" -X POST -H 'Content-Type: application/json' -d '{}' "http://d/v1.47/containers/create?name=$BXC"
 fi
-# A registry-qualified copy of a local image, for a check whose docker CLI
-# pulls the image again although it is here: the CLI reads any 404 at create
-# ("No such container" too) as a missing image, and the pull then goes to
-# KIRI_TEST_REGISTRY instead of Docker Hub. unqual removes it again.
-qual() { $D tag "$1" "$KIRI_REG/$1" >/dev/null 2>&1; }
-unqual() { $D rmi "$KIRI_REG/$1" >/dev/null 2>&1; }
 # After a check pulled KIRI_TEST_REGISTRY's IMAGE: tagged IMAGE, the qualified tag removed.
 as_plain() { $D tag "$KIRI_REG/$1" "$1" >/dev/null 2>&1 && $D rmi "$KIRI_REG/$1" >/dev/null 2>&1; }
 
@@ -248,9 +242,9 @@ t pid-container-pid1 "cat" bash -c "$D exec pid-b cat /proc/1/comm"
 t pid-host-sees-more "many" bash -c "n=\$($D exec pid-h ps -o pid | wc -l); [ \$n -gt 5 ] && echo many || echo \$n"
 t pid-own-default "1 cat" bash -c "$D exec pid-a sh -c 'echo \$(ps -o pid,comm | grep -w cat)'"
 t pid-container-stopped "cannot join PID of a non running container" bash -c "$D stop -t 0 pid-a >/dev/null; $D run --rm --pid container:pid-a busybox:1.37 true"
-qual busybox:1.37
-t pid-container-unknown "No such container: pid-nosuch" $D run --rm --pid container:pid-nosuch "$KIRI_REG/busybox:1.37" true
-unqual busybox:1.37
+# A missing container at create is a 400, not a 404 the CLI takes for a
+# missing image and pulls for: the output is shown only when no pull was.
+t pid-container-unknown "No such container: pid-nosuch" bash -c "o=\$($D run --rm --pid container:pid-nosuch busybox:1.37 true 2>&1); grep -q 'Unable to find image' <<<\"\$o\" || echo \"\$o\""
 $D rm -f pid-a pid-b pid-h >/dev/null 2>&1
 t python "3.13" $D run --rm python:3.13-alpine python -c 'import sys;print(sys.version)'
 t node "v22" $D run --rm node:22-alpine node -v
@@ -484,9 +478,7 @@ t netns-mode "container:$FIXED_ID" bash -c "$D create --name side --network cont
 t netns-settings "map[]" $D inspect -f '{{.NetworkSettings.Networks}}' side
 t netns-ports "conflicting options: port publishing and the container type network mode" $D run --rm -p 18190:80 --network container:fixed alpine true
 t netns-hostname-refused "conflicting options: hostname and the network mode" $D run --rm -h x --network container:fixed alpine true
-qual alpine:latest
-t netns-missing "No such container" $D run --rm --network container:nope "$KIRI_REG/alpine:latest" true
-unqual alpine:latest
+t netns-missing "joining network namespace of container: No such container: nope" bash -c "o=\$($D run --rm --network container:nope alpine true 2>&1); grep -q 'Unable to find image' <<<\"\$o\" || echo \"\$o\""
 $D stop fixed >/dev/null
 t netns-not-running "cannot join network of a non running container" $D start side
 $D rm -f side >/dev/null
@@ -509,9 +501,7 @@ t link-alias "Welcome to nginx" $D run --rm --link linked:webby alpine wget -qO-
 t link-name "Welcome to nginx" $D run --rm --link linked alpine wget -qO- http://linked
 t link-hosts "webby" $D run --rm --link linked:webby alpine cat /etc/hosts
 t link-inspect "/linked:/" bash -c "$D create --name linker --link linked:webby alpine true >/dev/null; $D inspect -f '{{.HostConfig.Links}}' linker; $D rm linker >/dev/null"
-qual alpine:latest
-t link-missing "could not get container for nope" $D run --rm --link nope:x "$KIRI_REG/alpine:latest" true
-unqual alpine:latest
+t link-missing "could not get container for nope: No such container: nope" bash -c "o=\$($D run --rm --link nope:x alpine true 2>&1); grep -q 'Unable to find image' <<<\"\$o\" || echo \"\$o\""
 $D rm -f fixed linked >/dev/null
 $D network rm ipamnet ipamnet4 >/dev/null
 
@@ -739,9 +729,7 @@ t volumes-from-ro "Read-only file system" $D run --rm --volumes-from vfsrc:ro al
 t volumes-from-inspect "/anon /bind /vol [vfsrc]" bash -c "$D create --name vfdst --volumes-from vfsrc alpine true >/dev/null && $D inspect -f '{{range .Mounts}}{{.Destination}} {{end}}{{.HostConfig.VolumesFrom}}' vfdst | tr ' ' '\n' | LC_ALL=C sort | tr '\n' ' ' | sed 's/^ *//'"
 $D stop -t 0 vfsrc >/dev/null
 t volumes-from-stopped "got:n a" bash -c "$D run --rm --volumes-from vfsrc alpine sh -c 'echo got:\$(cat /vol/f /anon/f)'"
-qual alpine:latest
-t volumes-from-unknown "No such container: vfnosuch" $D run --rm --volumes-from vfnosuch "$KIRI_REG/alpine:latest" true
-unqual alpine:latest
+t volumes-from-unknown "No such container: vfnosuch" bash -c "o=\$($D run --rm --volumes-from vfnosuch alpine true 2>&1); grep -q 'Unable to find image' <<<\"\$o\" || echo \"\$o\""
 # The anonymous volume stays while another container still uses it.
 t volumes-from-anon-kept "got:a" bash -c "$D rm -v vfsrc >/dev/null; $D run --rm --volumes-from vfdst alpine sh -c 'echo got:\$(cat /anon/f)'"
 $D rm -f -v vfsrc vfdst >/dev/null 2>&1; $D volume rm tvfrom $VFANON >/dev/null 2>&1
