@@ -13,10 +13,10 @@ const saved = (name) => sent.filter((m) => m.type === "setpref" && m.name === na
 const rail = () => document.querySelector("nav [data-view=containers] .lbl").textContent;
 
 kiri.on({ type: "langpick" });
-t("a langpick event opens the language step with a row for each of the 38 languages", () => {
+t("a langpick event opens the language step with a row for each of the 39 languages", () => {
   if (!dlg()) throw new Error("no dialog");
   const ids = tilesNow().map((b) => b.dataset.lang).sort().join(" ");
-  if (ids !== LANGS.map(([id]) => id).sort().join(" ") || tilesNow().length !== 38) throw new Error("rows: " + ids);
+  if (ids !== LANGS.map(([id]) => id).sort().join(" ") || tilesNow().length !== 39) throw new Error("rows: " + ids);
 });
 t("one column, a line each", () => {
   const lefts = new Set(tilesNow().map((b) => Math.round(b.getBoundingClientRect().left)));

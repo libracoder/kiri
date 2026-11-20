@@ -21,7 +21,7 @@ use std::sync::OnceLock;
 
 /// Every translation Kiri ships, by language tag, as lang/<tag>.json maps
 /// English to it. English itself has no file.
-pub const FILES: [(&str, &str); 37] = [
+pub const FILES: [(&str, &str); 38] = [
     ("id", include_str!("lang/id.json")),
     ("ca", include_str!("lang/ca.json")),
     ("cs", include_str!("lang/cs.json")),
@@ -37,6 +37,7 @@ pub const FILES: [(&str, &str); 37] = [
     ("ro", include_str!("lang/ro.json")),
     ("sq", include_str!("lang/sq.json")),
     ("sl", include_str!("lang/sl.json")),
+    ("sr-Latn", include_str!("lang/sr-Latn.json")),
     ("fi", include_str!("lang/fi.json")),
     ("vi", include_str!("lang/vi.json")),
     ("tr", include_str!("lang/tr.json")),
@@ -128,6 +129,11 @@ fn lang_for(tag: &str) -> Option<&'static str> {
     }
     if is("ku-arab") {
         return Some("ckb");
+    }
+    // Serbian in the Latin alphabet: sr-Latn… (found below), and Montenegro's
+    // Serbian, which is written in Latin by default. Plain sr is Cyrillic.
+    if is("sr-me") {
+        return Some("sr-Latn");
     }
     if is("en") {
         return Some("en");
@@ -297,8 +303,15 @@ pub fn os_languages() -> Vec<String> {
 fn from_env(var: impl Fn(&str) -> Option<String>) -> Vec<String> {
     let mut out = Vec::new();
     let mut add = |raw: &str| {
-        // zh_CN.UTF-8@pinyin → zh-CN; C and POSIX name no language.
-        let tag = raw.split(['.', '@']).next().unwrap_or("").replace('_', "-");
+        // zh_CN.UTF-8@pinyin → zh-CN; C and POSIX name no language. The
+        // @latin modifier names the alphabet: sr_RS@latin → sr-Latn-RS.
+        let base = raw.split(['.', '@']).next().unwrap_or("");
+        let latin = raw.split_once('@').is_some_and(|(_, m)| m.eq_ignore_ascii_case("latin"));
+        let tag = match base.split_once('_') {
+            Some((l, r)) if latin => format!("{l}-Latn-{r}"),
+            None if latin && !base.is_empty() => format!("{base}-Latn"),
+            _ => base.replace('_', "-"),
+        };
         if !tag.is_empty() && tag != "C" && tag != "POSIX" && !out.contains(&tag) {
             out.push(tag);
         }
@@ -399,6 +412,14 @@ mod tests {
             ("ro-RO", Some("ro")),
             ("sq-AL", Some("sq")),
             ("sl-SI", Some("sl")),
+            ("sr-Latn", Some("sr-Latn")),
+            ("sr-Latn-RS", Some("sr-Latn")),
+            ("sr_Latn_RS", Some("sr-Latn")),
+            ("sr-Latn-ME", Some("sr-Latn")),
+            ("sr-ME", Some("sr-Latn")),
+            ("sr", None),
+            ("sr-RS", None),
+            ("sr-Cyrl-RS", None),
             ("fi-FI", Some("fi")),
             ("el-GR", Some("el")),
             ("bg-BG", Some("bg")),
@@ -447,6 +468,8 @@ mod tests {
         assert_eq!(from_env(env(&[("LANG", "zh_CN.UTF-8")])), ["zh-CN"]);
         assert_eq!(from_env(env(&[("LANGUAGE", "fr:zh_CN"), ("LANG", "en_US.UTF-8")])), ["fr", "zh-CN", "en-US"]);
         assert_eq!(from_env(env(&[("LC_ALL", "C"), ("LANG", "de_DE")])), Vec::<String>::new());
+        assert_eq!(from_env(env(&[("LANG", "sr_RS.UTF-8@latin")])), ["sr-Latn-RS"]);
+        assert_eq!(from_env(env(&[("LANGUAGE", "sr@latin:sr_RS"), ("LANG", "sr_RS.UTF-8")])), ["sr-Latn", "sr-RS"]);
         assert_eq!(from_env(env(&[])), Vec::<String>::new());
     }
 

@@ -2635,6 +2635,7 @@ function langFor(tag) {
   if (is("in")) return "id";
   if (is("no") || is("nn")) return "nb";
   if (is("ku-arab")) return "ckb";
+  if (is("sr-me")) return "sr-Latn";
   return LANGS.find(([id]) => is(id.toLowerCase()))?.[0] || "";
 }
 function resolveLang(pick) {
