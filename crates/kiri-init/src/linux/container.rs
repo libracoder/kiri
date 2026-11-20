@@ -104,6 +104,12 @@ pub struct Process {
     /// daemon's `AwaitStart` with it and tears the container down, with no
     /// `Exited`, as a start that fails within `ROOT_READY_WAIT` is.
     ended_before_ready: Option<String>,
+    /// Its child said it is filling a new volume (`FILLING`): from then on
+    /// until its root is in place it is never killed (see `wait_root`).
+    filling: bool,
+    /// Its start was cancelled while it was filling a volume (see `cancel`):
+    /// killed as soon as its root is in place.
+    cancelled: bool,
 }
 
 /// Where a container's root stands (see [`Process::root`]).
@@ -125,12 +131,51 @@ impl Process {
         self.settle(Some(std::time::Duration::ZERO))
     }
 
-    /// Waits, as long as it takes, for the child to say its root is in
-    /// place or to end. Called before the agent kills a container: a child
-    /// still filling a new volume must finish first, or the volume is left
-    /// half full and, no longer empty, is never filled again.
+    /// Called before the agent kills a container: a child filling a new
+    /// volume must finish first, or the volume is left half full and, no
+    /// longer empty, is never filled again; so it waits, as long as it
+    /// takes, for that child's root. A child that has not begun filling
+    /// (it says so first, see `FILLING`) is not waited for: nothing it does
+    /// before is left half done, and one stuck there would hold up the
+    /// agent's loop for good.
     pub fn wait_root(&mut self) -> Root {
-        self.settle(None)
+        match self.root() {
+            Root::Starting if self.filling => self.settle(None),
+            r => r,
+        }
+    }
+
+    /// `CancelStart`: a container stopped or removed before its root is in
+    /// place. A child still making its root is killed now (its start then
+    /// fails, see `settle_roots`); one filling a volume is marked, and
+    /// killed once the fill is done (`take_cancel`). Frozen while it is
+    /// looked at, so it cannot begin a fill between the look and the kill.
+    /// Nothing happens to a process whose root is in place, or an exec.
+    pub fn cancel(&mut self) {
+        if self.container.is_some() || self.root() != Root::Starting {
+            return;
+        }
+        let cgroup = self.teardown.as_ref().map(|t| t.cgroup.clone());
+        let frozen = cgroup.as_ref().is_some_and(|c| super::cgroup::freeze(c, true).is_ok());
+        match self.root() {
+            Root::Starting if self.filling => self.cancelled = true,
+            Root::Starting => {
+                // SAFETY: SIGKILL to our own unreaped child (`Ended` is not
+                // settled yet, so it has not been reaped).
+                unsafe { libc::kill(self.pid, libc::SIGKILL) };
+            }
+            _ => {}
+        }
+        if frozen && let Some(c) = &cgroup {
+            // Not waited for: a fill goes on as soon as the kernel lets it.
+            let _ = fs::write(c.join("cgroup.freeze"), "0");
+        }
+    }
+
+    /// Whether its start was cancelled during a fill that is now done: the
+    /// caller kills it. True once.
+    pub fn take_cancel(&mut self) -> bool {
+        self.entered() && std::mem::take(&mut self.cancelled)
     }
 
     fn settle(&mut self, wait: Option<std::time::Duration>) -> Root {
@@ -138,7 +183,7 @@ impl Process {
             return Root::Ended;
         }
         let Some(fd) = &self.starting else { return Root::Ready };
-        match root_word(fd.as_raw_fd(), wait) {
+        match root_word(fd.as_raw_fd(), wait, &mut self.filling) {
             Ok(RootWord::NotYet) => Root::Starting,
             Ok(RootWord::Ready) => {
                 self.starting = None;
@@ -206,6 +251,8 @@ impl Process {
             teardown: None,
             starting: None,
             ended_before_ready: None,
+            filling: false,
+            cancelled: false,
         }
     }
 
@@ -301,6 +348,11 @@ enum ParentStdio {
 /// this, the start is answered `starting` and the daemon asks again.
 const ROOT_READY_WAIT: std::time::Duration = std::time::Duration::from_millis(20);
 
+/// What a child writes on its "root ready" pipe before it begins filling a
+/// new volume; `READY` follows once its root is in place.
+const FILLING: u8 = b'f';
+const READY: u8 = b'r';
+
 /// What the child's "root ready" pipe says.
 #[derive(Debug, PartialEq, Eq)]
 enum RootWord {
@@ -311,8 +363,8 @@ enum RootWord {
 }
 
 /// Reads the child's word on its root, waiting at most `wait` (None: as long
-/// as it takes).
-fn root_word(fd: RawFd, wait: Option<std::time::Duration>) -> io::Result<RootWord> {
+/// as it takes). Sets `filling` when the child says it began a fill.
+fn root_word(fd: RawFd, wait: Option<std::time::Duration>, filling: &mut bool) -> io::Result<RootWord> {
     let deadline = wait.map(|w| std::time::Instant::now() + w);
     loop {
         let timeout = deadline.map_or(-1, |d| {
@@ -325,26 +377,26 @@ fn root_word(fd: RawFd, wait: Option<std::time::Duration>) -> io::Result<RootWor
         if n == 0 {
             return Ok(RootWord::NotYet);
         }
-        if n > 0 {
-            break;
+        if n < 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() != io::ErrorKind::Interrupted {
+                return Err(e);
+            }
+            continue;
         }
-        let e = io::Error::last_os_error();
-        if e.kind() != io::ErrorKind::Interrupted {
-            return Err(e);
-        }
-    }
-    let mut ready = [0u8; 1];
-    loop {
+        let mut word = [0u8; 1];
         // SAFETY: reading one byte into a local buffer from a pipe that has
         // data or is closed, so this does not wait.
-        let n = unsafe { libc::read(fd, ready.as_mut_ptr().cast(), 1) };
+        let n = unsafe { libc::read(fd, word.as_mut_ptr().cast(), 1) };
         match n {
+            // Then the wait goes on for `READY`, or the end.
+            1 if word[0] == FILLING => *filling = true,
             1 => return Ok(RootWord::Ready),
             0 => return Ok(RootWord::Ended),
             _ => {
                 let e = io::Error::last_os_error();
                 match e.kind() {
-                    io::ErrorKind::Interrupted => continue,
+                    io::ErrorKind::Interrupted => {}
                     io::ErrorKind::WouldBlock => return Ok(RootWord::NotYet),
                     _ => return Err(e),
                 }
@@ -537,10 +589,12 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
         }
         None => None,
     };
+    // Worked out here, so the child's first step allocates nothing.
+    let close_first = sys::close_ranges(&child_fds(&prepared, &child_io));
     // SAFETY: the agent is single-threaded, as clone3 without CLONE_VM needs.
     let cloned = unsafe { sys::clone3(&args) };
     if let Ok(0) = cloned {
-        container_child(&prepared, &rootfs_c, &child_io);
+        container_child(&prepared, &rootfs_c, &child_io, &close_first);
     }
     let restored = own_pid_ns.map_or(Ok(()), |own| sys::setns(own.as_raw_fd(), libc::CLONE_NEWPID));
     drop(pid_join);
@@ -573,14 +627,21 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
     };
     // Set once the start goes on without the child's root (see below).
     let starting = std::cell::Cell::new(false);
+    // Set once the child says it began filling a volume (`FILLING`).
+    let filling = std::cell::Cell::new(false);
     // The child never becomes a Process, so nothing else tears it down:
     // its root goes back here, with its cgroup and runtime files.
     let kill_child = |e: io::Error| {
-        // A child still filling a new volume finishes first, as it did when
-        // the start always waited for it: killed half-way, the volume would
-        // stay half full and, no longer empty, never be filled again.
+        // A child filling a new volume finishes first, as it did when the
+        // start always waited for it: killed half-way, the volume would stay
+        // half full and, no longer empty, never be filled again. One that
+        // has not begun a fill is not waited for (see `Process::wait_root`).
         if starting.get() {
-            let _ = root_word(root_ready.as_raw_fd(), None);
+            let mut f = filling.get();
+            let word = root_word(root_ready.as_raw_fd(), Some(std::time::Duration::ZERO), &mut f);
+            if f && matches!(word, Ok(RootWord::NotYet)) {
+                let _ = root_word(root_ready.as_raw_fd(), None, &mut f);
+            }
         }
         let own = child_report(report);
         // SAFETY: killing the child we just cloned.
@@ -606,10 +667,13 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
     // A start with a terminal (`-t`) is the exception: its master comes from
     // the child only once its root and network are in place
     // (`finish_stdio` waits for it), so it waits for the root as before.
-    match root_word(root_ready.as_raw_fd(), Some(ROOT_READY_WAIT)) {
+    let mut began_fill = false;
+    let word = root_word(root_ready.as_raw_fd(), Some(ROOT_READY_WAIT), &mut began_fill);
+    filling.set(began_fill);
+    match word {
         Ok(RootWord::Ready) => {}
         Ok(RootWord::Ended) => return Err(kill_child(io::Error::other(NOT_READY))),
-        Ok(RootWord::NotYet) if prepared.tty => match root_word(root_ready.as_raw_fd(), None) {
+        Ok(RootWord::NotYet) if prepared.tty => match root_word(root_ready.as_raw_fd(), None, &mut began_fill) {
             Ok(RootWord::Ready) => {}
             Ok(_) => return Err(kill_child(io::Error::other(NOT_READY))),
             Err(e) => return Err(kill_child(e)),
@@ -716,6 +780,8 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
         teardown: Some(Teardown { base, cgroup, remove }),
         starting: starting.get().then_some(root_ready),
         ended_before_ready: None,
+        filling: filling.get(),
+        cancelled: false,
     })
 }
 
@@ -878,6 +944,8 @@ pub fn exec(spec: &ExecSpec<'_>, target_pid: libc::pid_t, paths: &Paths, profile
         teardown: None,
         starting: None,
         ended_before_ready: None,
+        filling: false,
+        cancelled: false,
     })
 }
 
@@ -1691,14 +1759,18 @@ fn child_fds(p: &Prepared, io: &ChildStdio) -> Vec<RawFd> {
 
 /// Runs in the cloned child: PID 1 of the container, in its own namespaces
 /// and cgroup. Never returns: it execs or exits 127 with a message.
-fn container_child(p: &Prepared, rootfs: &CStr, io: &ChildStdio) -> ! {
+fn container_child(p: &Prepared, rootfs: &CStr, io: &ChildStdio, close_first: &[(libc::c_uint, libc::c_uint)]) -> ! {
     // First of all: the clone gave this child a copy of every descriptor
     // the agent had open, and filling a new volume can take seconds while
     // the agent goes on. Held here, a network's DNS socket keeps its
     // address bound after the network is removed (created again, it cannot
     // bind it), and other containers' stdin and relayed connections never
-    // see their end. Only what this child uses is kept.
-    sys::close_now(&sys::close_ranges(&child_fds(p, io)));
+    // see their end; nor does the daemon see the end of its connection to
+    // an agent that is gone, and the agent's lock on the data directory
+    // stays taken, so no agent can start after it. Only what this child
+    // uses is kept, before it does anything else (the ranges were worked
+    // out before the clone): a child that hangs later holds none of them.
+    sys::close_now(close_first);
     let err = report_fd(io);
     let fail = |what: &str, e: io::Error| -> ! { child_fail(err, what, e) };
 
@@ -1721,6 +1793,15 @@ fn container_child(p: &Prepared, rootfs: &CStr, io: &ChildStdio) -> ! {
     // The image's tree without the mounts made on it, for filling new
     // volumes; closed (and so unmounted) once they are all in place.
     let image = if p.mounts.iter().any(|m| m.copy_up) { image_tree() } else { None };
+    if p.mounts.iter().any(|m| m.copy_up)
+        && let Some(done) = &p.root_ready
+    {
+        // SAFETY: one byte to a pipe we own: a fill may begin now, and from
+        // here on this child is not killed until its root is in place.
+        if unsafe { libc::write(done.as_raw_fd(), [FILLING].as_ptr().cast(), 1) } != 1 {
+            fail("ready", io::Error::last_os_error());
+        }
+    }
     for m in &p.mounts {
         apply_mount(root, image.as_ref().map(|f| f.as_fd()), m).unwrap_or_else(|e| fail(&format!("mount {}", m.target.to_string_lossy()), e));
     }
@@ -1757,7 +1838,7 @@ fn container_child(p: &Prepared, rootfs: &CStr, io: &ChildStdio) -> ! {
     if let Some(done) = &p.root_ready {
         // SAFETY: one byte to a pipe we own: root, mounts and namespaces
         // are in place, so an exec can join them now.
-        if unsafe { libc::write(done.as_raw_fd(), b"r".as_ptr().cast(), 1) } != 1 {
+        if unsafe { libc::write(done.as_raw_fd(), [READY].as_ptr().cast(), 1) } != 1 {
             fail("ready", io::Error::last_os_error());
         }
     }
@@ -2356,10 +2437,12 @@ mod tests {
         use std::os::fd::AsRawFd;
         let (r, w) = super::sys::pipe().unwrap();
         let mut p = Process::starting_for_test("c1", 100, r, None);
+        // SAFETY: one byte to a pipe we own: a fill begins.
+        unsafe { libc::write(w.as_raw_fd(), [super::FILLING].as_ptr().cast(), 1) };
         let writer = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(100));
             // SAFETY: one byte to a pipe we own.
-            unsafe { libc::write(w.as_raw_fd(), b"r".as_ptr().cast(), 1) };
+            unsafe { libc::write(w.as_raw_fd(), [super::READY].as_ptr().cast(), 1) };
             w
         });
         let t = std::time::Instant::now();
@@ -2369,6 +2452,8 @@ mod tests {
         // Ended while waited for.
         let (r, w) = super::sys::pipe().unwrap();
         let mut p = Process::starting_for_test("c2", 101, r, None);
+        // SAFETY: as above.
+        unsafe { libc::write(w.as_raw_fd(), [super::FILLING].as_ptr().cast(), 1) };
         let closer = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(50));
             drop(w);
@@ -2377,20 +2462,79 @@ mod tests {
         closer.join().unwrap();
     }
 
+    /// A child that has not said it began a fill is not waited for: one
+    /// stuck before its root is in place (it never says anything) held up
+    /// the agent's loop for good when it was killed or stopped.
+    #[test]
+    fn a_child_not_filling_is_not_waited_for() {
+        use super::{Process, Root};
+        let (r, w) = super::sys::pipe().unwrap();
+        let mut p = Process::starting_for_test("c1", 100, r, None);
+        let t = std::time::Instant::now();
+        assert_eq!(p.wait_root(), Root::Starting);
+        assert!(t.elapsed() < std::time::Duration::from_secs(1), "waited {:?}", t.elapsed());
+        drop(w);
+    }
+
+    /// `CancelStart`: a child still making its root is killed at once; one
+    /// filling a volume is left to finish, and killed once its root is in
+    /// place (`take_cancel`).
+    #[test]
+    fn a_cancelled_start_kills_a_child_not_filling_and_waits_for_a_fill() {
+        use super::{Process, Root};
+        use std::os::fd::AsRawFd;
+        // A real child that never says anything, as one stuck before its
+        // root is in place. It only waits: nothing to allocate after fork.
+        let (r, w) = super::sys::pipe().unwrap();
+        // SAFETY: the child only pauses until it is killed.
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            loop {
+                // SAFETY: plain pause in the child.
+                unsafe { libc::pause() };
+            }
+        }
+        assert!(pid > 0);
+        let mut p = Process::starting_for_test("c1", pid, r, None);
+        p.cancel();
+        let mut status = 0;
+        // SAFETY: reaping the child forked above.
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGKILL, "status {status:#x}");
+        assert!(!p.take_cancel());
+        drop(w);
+
+        // Filling: marked, not killed (the pid is a stand-in); the caller
+        // kills it once its root is in place.
+        let (r, w) = super::sys::pipe().unwrap();
+        let mut p = Process::starting_for_test("c2", i32::MAX, r, None);
+        // SAFETY: one byte to a pipe we own.
+        unsafe { libc::write(w.as_raw_fd(), [super::FILLING].as_ptr().cast(), 1) };
+        p.cancel();
+        assert_eq!(p.root(), Root::Starting);
+        assert!(!p.take_cancel(), "not before the fill is done");
+        // SAFETY: as above.
+        unsafe { libc::write(w.as_raw_fd(), [super::READY].as_ptr().cast(), 1) };
+        assert_eq!(p.root(), Root::Ready);
+        assert!(p.take_cancel(), "killed once its root is in place");
+        assert!(!p.take_cancel(), "once");
+        drop(w);
+    }
+
     #[test]
     fn a_start_waits_for_the_root_only_briefly() {
         use std::os::fd::AsRawFd;
         let (r, w) = super::sys::pipe().unwrap();
         let t = std::time::Instant::now();
-        assert_eq!(super::root_word(r.as_raw_fd(), Some(super::ROOT_READY_WAIT)).unwrap(), super::RootWord::NotYet);
+        assert_eq!(super::root_word(r.as_raw_fd(), Some(super::ROOT_READY_WAIT), &mut false).unwrap(), super::RootWord::NotYet);
         let waited = t.elapsed();
         assert!(waited >= super::ROOT_READY_WAIT && waited < super::ROOT_READY_WAIT * 10, "waited {waited:?}");
         // SAFETY: one byte to a pipe we own.
         assert_eq!(unsafe { libc::write(w.as_raw_fd(), b"r".as_ptr().cast(), 1) }, 1);
-        assert_eq!(super::root_word(r.as_raw_fd(), Some(super::ROOT_READY_WAIT)).unwrap(), super::RootWord::Ready);
+        assert_eq!(super::root_word(r.as_raw_fd(), Some(super::ROOT_READY_WAIT), &mut false).unwrap(), super::RootWord::Ready);
         drop(w);
         wait_all_writers_gone(r.as_raw_fd());
-        assert_eq!(super::root_word(r.as_raw_fd(), Some(super::ROOT_READY_WAIT)).unwrap(), super::RootWord::Ended);
+        assert_eq!(super::root_word(r.as_raw_fd(), Some(super::ROOT_READY_WAIT), &mut false).unwrap(), super::RootWord::Ended);
     }
 
     use kiri_proto::{Limits, Msg, Net, decode, encode_run, run_flags};

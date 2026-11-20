@@ -119,12 +119,10 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
     let udp = super::relay::listen_udp()?;
     let pressure = memory_pressure_trigger();
     let mut last_pressure = std::time::Instant::now() - std::time::Duration::from_secs(1);
-    // `docker system df`: measured on a thread, which wakes the loop through
-    // this pipe; the loop sends the `Usage` lines (it is the only writer).
-    let (usage_wake, usage_ring) = usage_pipe()?;
-    let usage_ring = std::sync::Arc::new(usage_ring);
-    let (usage_tx, usage_rx) = std::sync::mpsc::channel::<Vec<String>>();
-    let mut measuring = false;
+    // `docker system df`: measured in a child process (never a thread: see
+    // `usage`), whose pipe the loop polls; the loop sends the `Usage` lines
+    // (it is the only writer).
+    let mut measuring: Option<super::usage::Job> = None;
     let mut relays: Vec<super::relay::Relay> = Vec::new();
     // Starts that failed after they were answered `starting`: the error the
     // daemon's next `AwaitStart` for that id gets.
@@ -159,7 +157,7 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
         fds.push(libc::pollfd { fd: udp.as_raw_fd(), events: libc::POLLIN, revents: 0 });
         fds.push(libc::pollfd { fd: pressure.as_ref().map_or(-1, |f| f.as_raw_fd()), events: libc::POLLPRI, revents: 0 });
         fds.push(libc::pollfd { fd: term.as_ref().map_or(-1, |f| f.as_raw_fd()), events: libc::POLLIN, revents: 0 });
-        fds.push(libc::pollfd { fd: usage_wake.as_raw_fd(), events: libc::POLLIN, revents: 0 });
+        fds.push(libc::pollfd { fd: measuring.as_ref().map_or(-1, super::usage::Job::fd), events: libc::POLLIN, revents: 0 });
         super::copy::interest(&mut fds);
         for r in &relays {
             r.interest(&mut fds);
@@ -241,12 +239,10 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
                 stop_containers(procs);
                 return Ok(());
             }
-            if pfd.fd == usage_wake.as_raw_fd() {
-                let mut sink = [0u8; 16];
-                // SAFETY: reading into a buffer we own from a descriptor we own.
-                while unsafe { libc::read(usage_wake.as_raw_fd(), sink.as_mut_ptr().cast(), sink.len()) } > 0 {}
-                while let Ok(lines) = usage_rx.try_recv() {
-                    measuring = false;
+            if measuring.as_ref().is_some_and(|j| j.fd() == pfd.fd) {
+                // The child is reaped like any other (`reap`).
+                if let Some(lines) = measuring.as_mut().and_then(super::usage::Job::read) {
+                    measuring = None;
                     out.clear();
                     kiri_proto::encode_usage(&mut out, &lines);
                     conn.write_all(&out)?;
@@ -519,6 +515,14 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
                     }
                     continue; // no reply: the exit, if any, is reported as Exited
                 }
+                Ok(Msg::CancelStart { id }) => {
+                    // Never waits: a child still making its root is killed
+                    // now, one filling a volume once the fill is done.
+                    if let Some(p) = procs.values_mut().find(|p| p.run.id == id && p.run.container.is_none() && p.exited.is_none()) {
+                        p.run.cancel();
+                    }
+                    continue; // no reply: the start's next `AwaitStart` says how it ended
+                }
                 Ok(Msg::Remove { id }) => {
                     if !procs.values().any(|p| p.run.id == id) {
                         container::remove(paths, id);
@@ -558,14 +562,18 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
                 Ok(Msg::UsageQuery) => {
                     // No reply here: replies go in order, and this can take
                     // seconds. The lines follow as a `Usage` message.
-                    if !measuring {
-                        measuring = true;
-                        let (layers, containers, tx, ring) = (paths.layers.clone(), paths.containers.clone(), usage_tx.clone(), usage_ring.clone());
-                        let _ = std::thread::Builder::new().name("usage".into()).spawn(move || {
-                            let _ = tx.send(super::usage::measure(&layers, &containers, Path::new(container::VOLUMES)));
-                            // SAFETY: writing one byte from a buffer we own to a descriptor we own.
-                            unsafe { libc::write(ring.as_raw_fd(), [1u8].as_ptr().cast(), 1) };
-                        });
+                    // One at a time: a query while one runs gets its answer.
+                    if measuring.is_none() {
+                        match super::usage::Job::start(&paths.layers, &paths.containers, Path::new(container::VOLUMES)) {
+                            Ok(job) => measuring = Some(job),
+                            Err(e) => {
+                                // Answered at once, unmeasured, rather than
+                                // left to the daemon's wait.
+                                eprintln!("kiri-init: system df: {e}");
+                                kiri_proto::encode_usage(&mut out, &[] as &[String]);
+                                conn.write_all(&out)?;
+                            }
+                        }
                     }
                     continue;
                 }
@@ -821,8 +829,15 @@ fn freeze_target(procs: &HashMap<libc::pid_t, Proc>, id: &str, frozen: bool) -> 
 fn settle_roots(procs: &mut HashMap<libc::pid_t, Proc>, dns: &mut super::dns::Dns, failed: &mut HashMap<String, String>) {
     let mut ended = Vec::new();
     for (pid, p) in procs.iter_mut().filter(|(_, p)| !p.run.entered()) {
-        if p.run.root() == Root::Ended {
-            ended.push(*pid);
+        match p.run.root() {
+            Root::Ended => ended.push(*pid),
+            // Its start was cancelled while it filled a volume: the fill is
+            // done, so it goes now (see `Process::cancel`).
+            Root::Ready if p.run.take_cancel() && p.exited.is_none() => {
+                // SAFETY: SIGKILL to our own child, not reaped yet.
+                unsafe { libc::kill(p.run.pid, libc::SIGKILL) };
+            }
+            _ => {}
         }
     }
     for pid in ended {
@@ -1474,6 +1489,9 @@ mod running_tests {
         let (r, w) = pipe();
         let mut procs = HashMap::new();
         procs.insert(pid, new_proc(Process::starting_for_test("c1", pid, r.into(), None), 0, 0));
+        // It says it began a fill (`container::FILLING`).
+        let mut w = w;
+        std::io::Write::write_all(&mut w, b"f").unwrap();
         let speaker = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(150));
             // SAFETY: signal 0 only asks whether the process exists.
@@ -1510,11 +1528,3 @@ mod clock_tests {
     }
 }
 
-/// A non-blocking pipe: (read end the loop polls, write end the thread rings).
-fn usage_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
-    let mut fds = [0; 2];
-    // SAFETY: `fds` has room for the two descriptors pipe2 writes.
-    sys::check(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } as _, "pipe")?;
-    // SAFETY: pipe2 just opened both; nothing else owns them.
-    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
-}

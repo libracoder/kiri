@@ -81,6 +81,10 @@ pub struct VmLink {
     _vm: Mutex<Vm>,
     /// Opens vsock streams without that mutex, so connects run side by side.
     connector: kiri_vmm::Connector,
+    /// A copy of the connection, shut down when the agent process exits
+    /// (see `new`); only while the link lives.
+    #[cfg(target_os = "linux")]
+    _stop_conn: Arc<File>,
 }
 
 impl std::fmt::Debug for VmLink {
@@ -295,7 +299,28 @@ impl VmLink {
             on_event(Event::Lost);
             wins.finish_loss();
         })?;
+        // On a Linux host the connection is a socket the agent process
+        // shares with its children: one that hung before closing its copy
+        // kept it open after the agent was gone, so the reader never saw
+        // the end, nothing waiting for a reply ever got one, and the agent
+        // was never restarted. Its exit ends the connection here instead.
+        // (A VM's vsock ends with the VM.)
+        #[cfg(target_os = "linux")]
+        let stop_conn = {
+            let stop_conn = Arc::new(conn.try_clone()?);
+            let weak = Arc::downgrade(&stop_conn);
+            vm.on_stop(Box::new(move || {
+                if let Some(c) = weak.upgrade() {
+                    use std::os::fd::AsRawFd;
+                    // SAFETY: shutdown on a socket this link still owns.
+                    unsafe { libc::shutdown(c.as_raw_fd(), libc::SHUT_RDWR) };
+                }
+            }));
+            stop_conn
+        };
         Ok(VmLink {
+            #[cfg(target_os = "linux")]
+            _stop_conn: stop_conn,
             writer: Mutex::new(Writer { conn, out: Vec::with_capacity(4096), blob: vec![0; 256 * 1024] }),
             pending,
             windows,
@@ -384,6 +409,7 @@ impl VmLink {
         caps: u64,
         opts: &[String],
         seccomp: &[u8],
+        cancel: &std::sync::atomic::AtomicBool,
     ) -> io::Result<u32> {
         self.windows.open(id);
         // Its process runs, but its root may not be in place yet (a new
@@ -395,7 +421,18 @@ impl VmLink {
             .and_then(started)
             .and_then(|(pid, starting)| {
                 if starting {
-                    wait_started(|| self.call(|o| Msg::AwaitStart { id }.encode(o), None), std::thread::sleep)?;
+                    // Stopped or removed meanwhile (`Engine::cancel_start`):
+                    // told again once the guest surely knows the container,
+                    // so a cancel sent before its `Run` arrived still counts.
+                    let mut told = false;
+                    let ask = || {
+                        if !told && cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                            told = true;
+                            self.cancel_start(id)?;
+                        }
+                        self.call(|o| Msg::AwaitStart { id }.encode(o), None)
+                    };
+                    wait_started(ask, std::thread::sleep)?;
                 }
                 Ok(pid)
             });
@@ -560,6 +597,12 @@ impl VmLink {
 
     pub fn kill(&self, id: &str, signal: u32) -> io::Result<()> {
         self.send(|o| Msg::Kill { id, signal }.encode(o))
+    }
+
+    /// See `Msg::CancelStart`. No reply: the start's own `AwaitStart` hears
+    /// how it ended.
+    pub fn cancel_start(&self, id: &str) -> io::Result<()> {
+        self.send(|o| Msg::CancelStart { id }.encode(o))
     }
 
     pub fn remove(&self, id: &str) -> io::Result<()> {

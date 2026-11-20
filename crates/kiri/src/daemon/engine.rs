@@ -453,6 +453,9 @@ pub struct ExtraNetwork {
 struct StartGate {
     shut: Mutex<bool>,
     opened: Condvar,
+    /// Set by `Engine::cancel_start`: a stop, `kill -9` or `rm -f` came
+    /// while this start was under way.
+    cancel: std::sync::atomic::AtomicBool,
 }
 
 impl StartGate {
@@ -2847,7 +2850,12 @@ impl Engine {
         {
             return Err(e);
         }
-        let started = vm.run(&id, &layers, &argv, &spec.env, &spec.cwd, &spec.user, &hostname, flags, net_args, &spec.mounts, &spec.limits.wire(), spec.caps, &host_opts, &seccomp);
+        let cancelled = || gate.0.cancel.load(std::sync::atomic::Ordering::SeqCst);
+        let started = if cancelled() {
+            Err(io::Error::other("cancelled before it reached the guest"))
+        } else {
+            vm.run(&id, &layers, &argv, &spec.env, &spec.cwd, &spec.user, &hostname, flags, net_args, &spec.mounts, &spec.limits.wire(), spec.caps, &host_opts, &seccomp, &gate.0.cancel)
+        };
         if let Ok(pid) = started
             && let Some(c) = self.lock().containers.get_mut(&id).filter(|c| c.status == Status::Running)
         {
@@ -2859,6 +2867,9 @@ impl Engine {
         if let Err(e) = started {
             crate::diag::warn!("container did not start", id = &id[..12], image = spec.image, error = e);
             self.fail_start(&id, &spec, &e);
+            if cancelled() {
+                return Err(Error::Conflict(format!("container {} was stopped or removed before it finished starting", &id[..12])));
+            }
             return Err(Error::Io(e));
         }
         // Before anything below, which may itself exec (a health probe),
@@ -3908,6 +3919,7 @@ impl Engine {
     /// (Stop, the VM's sleep on request), which is not recorded as the
     /// user's: `unless-stopped` brings it back on Start.
     fn stop_as(&self, key: &str, timeout: Duration, by_user: bool) -> Result<bool, Error> {
+        self.cancel_start(key);
         let lifecycle = self.lifecycle(key)?;
         let mut stopping = lifecycle.lock().unwrap_or_else(|e| e.into_inner());
         let id = self.resolve(key)?;
@@ -3969,7 +3981,35 @@ impl Engine {
         }
     }
 
+    /// A stop, `kill -9` or `rm -f` of a container whose start is still
+    /// under way. That start holds the container's lifecycle lock until the
+    /// guest says its root is in place, which a child stuck before then
+    /// never does; so before waiting for that lock, the start is told
+    /// (`StartGate::cancel`, which its wait reads) and so is the guest
+    /// (`Msg::CancelStart`): a child still making its root is killed, the
+    /// start fails, and the lock is free. A child filling a volume is left
+    /// to finish (a slow fill is no reason to fail), then killed. True when
+    /// a start was under way.
+    fn cancel_start(&self, key: &str) -> bool {
+        let id = {
+            let st = self.lock();
+            let Ok(id) = resolve(&st, key) else { return false };
+            let gate = &st.containers[&id].start_gate;
+            if !gate.is_shut() {
+                return false;
+            }
+            gate.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            id
+        };
+        // Never boots a VM: a start under way has one.
+        if let Some(vm) = self.awake() {
+            let _ = vm.cancel_start(&id);
+        }
+        true
+    }
+
     pub fn kill(&self, key: &str, signal: u32) -> Result<(), Error> {
+        let cancelled = signal == libc::SIGKILL as u32 && self.cancel_start(key);
         let lifecycle = self.lifecycle(key)?;
         let mut killing = lifecycle.lock().unwrap_or_else(|e| e.into_inner());
         let id = self.resolve(key)?;
@@ -3981,6 +4021,10 @@ impl Engine {
                 *killing = killing.wrapping_add(1);
                 self.mark_stopped(&id);
                 self.save();
+                return Ok(());
+            }
+            if cancelled {
+                // Its start was under way, and ended because of this kill.
                 return Ok(());
             }
             return Err(Error::Conflict(format!("Container {} is not running", &id[..12])));
@@ -4010,6 +4054,9 @@ impl Engine {
     }
 
     pub fn remove(&self, key: &str, force: bool, with_volumes: bool) -> Result<(), Error> {
+        if force {
+            self.cancel_start(key);
+        }
         let lifecycle = self.lifecycle(key)?;
         let mut removing = lifecycle.lock().unwrap_or_else(|e| e.into_inner());
         let id = self.resolve(key)?;
@@ -5106,6 +5153,82 @@ mod vm_recovery_tests {
         assert!(!engine.is_awake(), "no eligible containers means the VM stays down");
         println!("PASS: a crash loop backs off for 60 s; manual stops cancel recovery without waiting for the delay");
         engine.shutdown();
+    }
+
+    /// A start whose child never says its root is in place holds the
+    /// container's lifecycle lock for as long as it waits. `rm -f`, `kill`
+    /// and `stop` cancel it first (`cancel_start`) instead of queueing
+    /// behind it for good. The start here is modelled as `VmLink::run`'s
+    /// wait: it ends, failed, once it sees the cancel.
+    #[test]
+    fn rm_kill_and_stop_cancel_a_start_that_never_finishes() {
+        let dir = std::env::temp_dir().join(format!("kiri-cancel-start-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let engine = Engine::boot(Store::open(&dir).unwrap()).unwrap();
+        // No real VM: the start below stands in for the guest's answers.
+        engine.stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+        let image = Image {
+            name: "test:local".into(), digest: "sha256:test".into(), index_digest: None, config_digest: "sha256:test".into(),
+            layers: Vec::new(), size: 0, platform: "linux/arm64".into(), created: String::new(), pulled_at: 0, config: Default::default(),
+        };
+        for op in ["rm -f", "kill", "stop"] {
+            let spec: Spec = serde_json::from_value(serde_json::json!({
+                "image": "test:local", "image_id": "sha256:test", "entrypoint": [], "cmd": ["sleep", "60"],
+                "env": [], "cwd": "/", "user": "", "auto_remove": false, "network_mode": "none", "labels": {},
+            })).unwrap();
+            let id = engine.create(Some(format!("stuck-{}", op.replace(' ', ""))), spec.clone(), &image).unwrap();
+            // Claimed as start_on_vm claims it: Running, gate shut, the
+            // lifecycle lock held across the wait.
+            let lifecycle = engine.lifecycle(&id).unwrap();
+            let (held, holding) = std::sync::mpsc::channel();
+            let start = {
+                let (engine, id) = (engine.clone(), id.clone());
+                std::thread::spawn(move || {
+                    let _starting = lifecycle.lock().unwrap();
+                    let (gate, guard) = {
+                        let mut st = engine.lock();
+                        let c = st.containers.get_mut(&id).unwrap();
+                        c.status = Status::Running;
+                        let guard = c.begin_start();
+                        (c.start_gate.clone(), guard)
+                    };
+                    held.send(()).unwrap();
+                    // The guest never says the root is in place; only a
+                    // cancel ends the wait, as a failed start.
+                    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                    while !gate.cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                        assert!(std::time::Instant::now() < deadline, "{op}: never cancelled");
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    engine.fail_start(&id, &spec, &"cancelled");
+                    drop(guard);
+                })
+            };
+            holding.recv().unwrap();
+            let (done, finished) = std::sync::mpsc::channel();
+            let worker = {
+                let (engine, id) = (engine.clone(), id.clone());
+                std::thread::spawn(move || {
+                    let r = match op {
+                        "rm -f" => engine.remove(&id, true, false),
+                        "kill" => engine.kill(&id, libc::SIGKILL as u32),
+                        _ => engine.stop(&id, Duration::from_secs(1)).map(drop),
+                    };
+                    done.send(r.map_err(|e| format!("{e:?}"))).unwrap();
+                })
+            };
+            let got = finished.recv_timeout(Duration::from_secs(3));
+            start.join().unwrap();
+            worker.join().unwrap();
+            assert_eq!(got, Ok(Ok(())), "{op} of a container whose start never finishes");
+            let st = engine.lock();
+            match op {
+                "rm -f" => assert!(!st.containers.contains_key(&id), "removed"),
+                _ => assert_eq!(st.containers[&id].status, Status::Exited, "{op}: no longer running"),
+            }
+        }
+        drop(engine);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

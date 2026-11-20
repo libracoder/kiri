@@ -186,6 +186,26 @@ t crash-restart-count "1 1" "echo \$(docker inspect -f '{{.RestartCount}}' cr-al
 t crash-rm-frees-layer "gone" "id=\$(docker inspect -f '{{.Id}}' cr-no); docker rm cr-no >/dev/null; for i in \$(seq 20); do test -e /var/lib/kiri/containers/\$id || break; sleep 0.1; done; test -e /var/lib/kiri/containers/\$id && echo kept || echo gone"
 t created-rm-frees-layer "gone" "id=\$(docker create alpine true); docker cp /etc/hostname \$id:/f >/dev/null; docker rm \$id >/dev/null; for i in \$(seq 20); do test -e /var/lib/kiri/containers/\$id || break; sleep 0.1; done; test -e /var/lib/kiri/containers/\$id && echo kept || echo gone"
 t crash-cleanup "cr-always" "docker rm -f cr-always cr-unless-stopped cr-user"
+# `docker system df` measures the engine's disk in a child process of the
+# agent, never on a thread: the agent starts containers with clone3, and a
+# start that raced a measuring thread hung for good (its first process
+# inherited the allocator's lock held by that thread), and so did its stop,
+# exec and rm. A volume of 20,000 files makes each measurement take a while;
+# 100 starts run beside four loops of system df, each start given 15 s.
+t starts-beside-df "stuck 0" "docker run --rm -v dfwalk:/d alpine sh -c 'cd /d; for i in \$(seq 200); do mkdir \$i; for j in \$(seq 100); do : > \$i/\$j; done; done'; S=/root/.kiri/run/docker.sock; rm -f /tmp/dfstop; l() { while [ ! -e /tmp/dfstop ]; do curl -s -m 30 -o /dev/null --unix-socket \$S http://d/system/df; done; }; l & l & l & l & s=0; for i in \$(seq 100); do timeout -s KILL 15 docker run -d --name dfs\$i alpine true >/dev/null 2>&1; [ \$? = 137 ] && s=\$((s+1)); done; touch /tmp/dfstop; wait; for i in \$(seq 100); do timeout -s KILL 5 docker rm -f dfs\$i >/dev/null 2>&1; done; docker volume rm dfwalk >/dev/null; echo stuck \$s"
+# A start whose first process never gets its root in place (here frozen by
+# the cgroup freezer from its first instruction, as a child that hung there
+# was) held the container's lifecycle lock for good: rm -f, kill and stop
+# never answered. rm -f cancels the start instead (the child is killed, the
+# start fails) and leaves no cgroup, mount or container behind.
+t rm-f-stuck-start "removed, leftovers: none" "cg=\$(docker run -d alpine sleep 60); p=\$(docker inspect -f '{{.State.Pid}}' \$cg); K=/sys/fs/cgroup\$(sed -n 's/^0:://p' /proc/\$p/cgroup); K=\${K%/*}; docker rm -f \$cg >/dev/null; id=\$(docker create alpine true); echo 1 > \$K/cgroup.freeze; (timeout -s KILL 30 docker start \$id >/dev/null 2>&1 &); sleep 2; t0=\$(date +%s); timeout -s KILL 15 docker rm -f \$id >/dev/null 2>&1; rc=\$?; t=\$(( \$(date +%s) - t0 )); echo 0 > \$K/cgroup.freeze; sleep 1; left=; [ -d \$K/\$id ] && left=\"\$left cgroup\"; grep -q \$id /proc/mounts && left=\"\$left mount\"; docker ps -aq --no-trunc | grep -q \$id && left=\"\$left container\"; [ \$rc = 0 ] && [ \$t -le 5 ] && echo \"removed, leftovers:\${left:- none}\" || echo \"rm -f rc=\$rc after \$t s\""
+# The agent dies while a container's first process it cloned is stuck
+# before closing what it inherited (frozen from its first instruction):
+# that child held the agent's end of the daemon's connection, so nothing
+# heard the agent was gone and every request hung, and its lock, so no new
+# agent could start. Its exit now ends the connection, and the next agent
+# stops what the old one left and takes the lock: a run answers again.
+t agent-dies-beside-stuck-start "answered, leftovers: none" "cg=\$(docker run -d alpine sleep 60); p=\$(docker inspect -f '{{.State.Pid}}' \$cg); K=/sys/fs/cgroup\$(sed -n 's/^0:://p' /proc/\$p/cgroup); K=\${K%/*}; docker rm -f \$cg >/dev/null; id=\$(docker create alpine true); echo 1 > \$K/cgroup.freeze; (timeout -s KILL 60 docker start \$id >/dev/null 2>&1 &); for i in \$(seq 50); do [ -s \$K/\$id/cgroup.procs ] && break; sleep 0.1; done; c=\$(cat \$K/\$id/cgroup.procs); echo 1 > \$K/\$id/cgroup.freeze; echo 0 > \$K/cgroup.freeze; kill -9 \$(pgrep kiri-init | grep -vx \"\$c\" | head -1); t0=\$(date +%s); rc=1; while [ \$(( \$(date +%s) - t0 )) -lt 30 ]; do timeout -s KILL 30 docker run --rm alpine true >/dev/null 2>&1 && { rc=0; break; }; sleep 0.5; done; t=\$(( \$(date +%s) - t0 )); left=; [ -d \$K/\$id ] && { left=\"\$left cgroup\"; echo 0 > \$K/\$id/cgroup.freeze; }; docker rm -f \$id >/dev/null 2>&1; [ \$rc = 0 ] && [ \$t -le 10 ] && echo \"answered, leftovers:\${left:- none}\" || echo \"no answer after \$t s, leftovers:\$left\""
 # A containers.json cut short (a crash, a full disk) is kept aside as
 # containers.json.corrupt-*, the records still readable are loaded, and
 # nothing is deleted because of the damaged list: no log folder and no

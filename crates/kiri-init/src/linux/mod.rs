@@ -145,7 +145,16 @@ fn host_dirs() -> io::Result<container::Paths> {
     };
     mkdir(&root, 0o710)?;
     mkdir(&root.join("volumes"), 0o700)?;
-    take_over(&root)?;
+    // What a dead agent left running can hold its lock (see `take_over`).
+    let leftovers = || {
+        let Ok(old) = std::fs::read_to_string(root.join("agent.cgroup")) else { return };
+        let old = PathBuf::from(old.trim());
+        if old.starts_with("/sys/fs/cgroup") {
+            let paths = container::Paths { layers: root.join("layers"), containers: root.join("containers"), cgroup: old.clone() };
+            container::sweep(&paths, &old);
+        }
+    };
+    take_over(&root, leftovers)?;
     let paths = container::Paths { layers: root.join("layers"), containers: root.join("containers"), cgroup: host_cgroup()? };
     mkdir(&paths.layers, 0o700)?;
     mkdir(&paths.containers, 0o700)?;
@@ -173,7 +182,15 @@ static AGENT_LOCK: std::sync::OnceLock<File> = std::sync::OnceLock::new();
 /// it cleans up, then SIGKILL), and waited for a few seconds otherwise (a
 /// daemon still shutting down); if it stays, starting fails and says why
 /// rather than failing later on its sockets and ports.
-fn take_over(root: &std::path::Path) -> io::Result<()> {
+///
+/// The lock can outlive the agent that took it: a child it cloned holds a
+/// copy of the descriptor until it closes it, and one that hung before
+/// then (a container's first process stuck before its root was in place)
+/// kept it for good, so every later agent gave up here. Once the holder is
+/// gone, `leftovers` stops what this data directory's containers left
+/// running (the old agent's containers, which the start-up sweep stops
+/// anyway), once, and the lock is tried again.
+fn take_over(root: &std::path::Path, leftovers: impl Fn()) -> io::Result<()> {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::OpenOptionsExt;
     let path = root.join("agent.lock");
@@ -184,6 +201,7 @@ fn take_over(root: &std::path::Path) -> io::Result<()> {
     };
     let start = std::time::Instant::now();
     let mut signalled = None;
+    let mut swept = false;
     while !locked(&file) {
         let mut text = String::new();
         let _ = (&file).read_to_string(&mut text);
@@ -192,6 +210,13 @@ fn take_over(root: &std::path::Path) -> io::Result<()> {
         let daemon = parent_of(old);
         let orphan = old > 0 && !daemon.is_some_and(is_daemon);
         let waited = start.elapsed();
+        // Gone: whatever holds the lock now is something it left running.
+        if orphan && !swept && daemon.is_none() {
+            eprintln!("kiri-init: agent {old} is gone but its lock is held: stopping the containers it left");
+            leftovers();
+            swept = true;
+            continue;
+        }
         if orphan && signalled.is_none() {
             eprintln!("kiri-init: stopping agent {old}, left running by a daemon that is gone");
             // SAFETY: signalling the process that holds our data directory's lock.
@@ -447,5 +472,53 @@ fn power_off() -> ! {
     loop {
         // SAFETY: pause takes no arguments.
         unsafe { libc::pause() };
+    }
+}
+
+#[cfg(test)]
+mod take_over_tests {
+    /// The agent that took the lock is gone but something it left (here a
+    /// child that inherited the locked descriptor and only waits) still
+    /// holds it: the leftovers are stopped once and the lock is taken,
+    /// where every new agent used to give up after 8 s.
+    #[test]
+    fn a_lock_held_by_what_a_dead_agent_left_is_taken_over() {
+        use std::os::fd::AsRawFd;
+        let root = std::env::temp_dir().join(format!("kiri-take-over-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        // The old agent: a process that has exited.
+        let mut dead = std::process::Command::new("true").spawn().unwrap();
+        let old = dead.id();
+        dead.wait().unwrap();
+        let lock = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(root.join("agent.lock")).unwrap();
+        std::io::Write::write_all(&mut &lock, format!("{old}\n").as_bytes()).unwrap();
+        // SAFETY: flock on a descriptor we own.
+        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
+        // SAFETY: the child only waits to be killed.
+        let left = unsafe { libc::fork() };
+        if left == 0 {
+            loop {
+                // SAFETY: plain pause in the child.
+                unsafe { libc::pause() };
+            }
+        }
+        drop(lock);
+        let swept = std::cell::Cell::new(0);
+        let t = std::time::Instant::now();
+        super::take_over(&root, || {
+            swept.set(swept.get() + 1);
+            // SAFETY: killing and reaping the child forked above.
+            unsafe {
+                libc::kill(left, libc::SIGKILL);
+                libc::waitpid(left, std::ptr::null_mut(), 0);
+            }
+        })
+        .unwrap();
+        assert!(t.elapsed() < std::time::Duration::from_secs(2), "took {:?}", t.elapsed());
+        assert_eq!(swept.get(), 1);
+        let text = std::fs::read_to_string(root.join("agent.lock")).unwrap();
+        assert_eq!(text.trim(), std::process::id().to_string());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
