@@ -112,6 +112,9 @@ pub struct Dns {
     pub relay: bool,
     /// The host didn't take a relayed lookup: none are tried until then.
     relay_down_until: Option<Instant>,
+    /// Bridges whose gateway wouldn't take the listener (`serve_or_warn`):
+    /// the warning is said once for each.
+    refused: std::collections::HashSet<String>,
 }
 
 fn udp_socket() -> io::Result<OwnedFd> {
@@ -156,6 +159,29 @@ impl Dns {
         let sock = bound(gateway, 53)?;
         self.servers.push(Server { bridges: vec![bridge.to_owned()], sock, container: None });
         Ok(())
+    }
+
+    /// `serve`, for a container start that can go on without it: false
+    /// when the gateway's listener can't be made, said once per bridge.
+    /// The container then asks the resolver in its own namespace, at
+    /// 127.0.0.11 (container.rs `settle_resolver`). A WSL 2 host under
+    /// `networkingMode=Consomme` answers EINVAL to every fixed-port bind on
+    /// a bridge address in its own namespace (#477), and a gateway can be
+    /// held by another program; binds in a container's namespace are not
+    /// affected.
+    pub fn serve_or_warn(&mut self, bridge: &str, gateway: [u8; 4]) -> bool {
+        match self.serve(bridge, gateway) {
+            Ok(()) => true,
+            Err(e) => {
+                if self.refused.insert(bridge.to_owned()) {
+                    eprintln!(
+                        "kiri-init: dns: cannot listen on {bridge}'s gateway {}:53 ({e}); its containers ask Kiri's resolver at 127.0.0.11 in their own network instead",
+                        super::net::ip_str(gateway)
+                    );
+                }
+                false
+            }
+        }
     }
 
     /// Starts answering at 127.0.0.11:53 in container `pid`'s network
@@ -248,6 +274,7 @@ impl Dns {
         self.names.remove(bridge);
         self.names6.remove(bridge);
         self.networks.remove(bridge);
+        self.refused.remove(bridge);
         self.forget_pending();
     }
 
@@ -566,7 +593,6 @@ fn framed_reply(got: &[u8]) -> Option<&[u8]> {
     got.get(2..2 + len)
 }
 
-/// A UDP socket bound to `ip`:53.
 /// The embedded DNS's socket in a container's network namespace, which
 /// the calling thread is in: on a free high port of 127.0.0.11, with
 /// 127.0.0.11:53 redirected to it, as Docker does, so that a DNS server of

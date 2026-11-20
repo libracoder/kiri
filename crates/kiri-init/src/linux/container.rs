@@ -714,30 +714,46 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
             }
             // An IPv6-only network's bridge has no IPv4 address to serve on,
             // and its containers no A records.
-            if !plug.no_ipv4 {
-                net.dns.serve(spec.net.bridge, spec.net.gateway).map_err(|e| kill_child(io::Error::new(e.kind(), format!("dns: {e}"))))?;
-            }
-            // 127.0.0.11 in the container, when its resolv.conf names it. Not
-            // when it names the gateway (the default bridge in the VM): the
-            // listener would only hold port 53, and a DNS server in the
-            // container could not bind it.
-            if nameserver == Some(super::dns::EMBEDDED) {
+            // A gateway that won't take the listener doesn't stop the start
+            // (dns.rs `serve_or_warn`, #477).
+            let gateway = (!plug.no_ipv4 && net.dns.serve_or_warn(spec.net.bridge, spec.net.gateway)).then_some(spec.net.gateway);
+            // 127.0.0.11 in the container, when it is the resolver. Not when
+            // the gateway is (the default bridge in the VM, or on a host
+            // whose resolver is one of its own addresses): the listener would
+            // only hold port 53, and a DNS server in the container could not
+            // bind it.
+            let wanted = nameserver.unwrap_or(super::dns::EMBEDDED);
+            let (resolver, in_err) = settle_resolver(wanted, gateway, || {
                 // `pid` is this new child's, so a server already kept under
                 // it belonged to a process that exited and was reaped, still
                 // waiting for its output to be read (see `admit`): it must
                 // not stand in for this container's own.
                 net.dns.drop_container(pid);
-                std::fs::File::open(format!("/proc/{pid}/ns/net"))
-                    .and_then(|ns| {
-                        net.dns.serve_in(&ns, pid, spec.net.ip, spec.net.bridge)?;
-                        // User networks it joins once it runs: their names
-                        // answer from its first lookup (#449).
-                        for b in net_opts::values(spec.net.opts, net_opts::DNS_BRIDGE) {
-                            net.dns.serve_in(&ns, pid, spec.net.ip, b)?;
-                        }
-                        Ok(())
-                    })
-                    .map_err(|e| kill_child(io::Error::new(e.kind(), format!("dns: {e}"))))?;
+                std::fs::File::open(format!("/proc/{pid}/ns/net")).and_then(|ns| {
+                    net.dns.serve_in(&ns, pid, spec.net.ip, spec.net.bridge)?;
+                    // User networks it joins once it runs: their names
+                    // answer from its first lookup (#449).
+                    for b in net_opts::values(spec.net.opts, net_opts::DNS_BRIDGE) {
+                        net.dns.serve_in(&ns, pid, spec.net.ip, b)?;
+                    }
+                    Ok(())
+                })
+            });
+            if let Some(e) = in_err {
+                net.dns.drop_container(pid);
+                match resolver {
+                    Some(at) => eprintln!("kiri-init: dns: {}: no resolver in its own network ({e}); it asks Kiri's at the gateway, {}", spec.id, net::ip_str(at)),
+                    None => eprintln!(
+                        "kiri-init: dns: {}: no resolver of Kiri's could listen for it ({e}); it asks the host's resolvers directly, so names of other containers on its network will not resolve",
+                        spec.id
+                    ),
+                }
+            }
+            // Not what resolv.conf was written with: written again, in place
+            // (the child hasn't run anything yet, and binds this inode).
+            if resolver != nameserver {
+                fs::write(etc_dir.join("resolv.conf"), resolv_conf(spec, net.upstream_dns, resolver))
+                    .map_err(|e| kill_child(io::Error::new(e.kind(), format!("dns: resolv.conf: {e}"))))?;
             }
             // `--dns`: names the network does not know go to these instead.
             let servers: Vec<[u8; 4]> = net_opts::values(spec.net.opts, net_opts::NAMESERVER).filter_map(net::parse_ip).collect();
@@ -1285,6 +1301,33 @@ fn embedded_dns_if(spec: &RunSpec<'_>, through_agent: impl FnOnce() -> bool) -> 
 /// the container's namespace.
 fn embedded_address(spec: &RunSpec<'_>) -> [u8; 4] {
     if spec.flags & run_flags::DNS_GATEWAY == 0 && spec.net.gateway != [0; 4] { spec.net.gateway } else { super::dns::EMBEDDED }
+}
+
+/// Where a container that uses the agent's resolver sends its lookups,
+/// once the agent has tried to listen for it: `wanted` (embedded_address),
+/// unless that listener could not be made. `gateway` is the bridge's
+/// gateway when the agent listens there; `serve_in` makes the listener at
+/// 127.0.0.11 in the container's own network, and is called only when
+/// that is the one needed.
+///
+/// - The default bridge names the gateway. When the gateway refused (WSL 2
+///   under Consomme, #477), 127.0.0.11 in the container instead, as that
+///   bridge had on such a host before the gateway was named (#624): binds
+///   in a container's own namespace are not refused there.
+/// - A user network names 127.0.0.11, and a refused gateway changes
+///   nothing: its names answer there.
+/// - When 127.0.0.11 can't be made either: the gateway if the agent listens
+///   there, else None, the host's resolvers as on a plain Linux host, so
+///   the container still starts (names of other containers then don't
+///   resolve). Also the error, for the log.
+fn settle_resolver(wanted: [u8; 4], gateway: Option<[u8; 4]>, serve_in: impl FnOnce() -> io::Result<()>) -> (Option<[u8; 4]>, Option<io::Error>) {
+    if wanted != super::dns::EMBEDDED && gateway == Some(wanted) {
+        return (Some(wanted), None);
+    }
+    match serve_in() {
+        Ok(()) => (Some(super::dns::EMBEDDED), None),
+        Err(e) => (gateway, Some(e)),
+    }
 }
 
 fn resolv_conf(spec: &RunSpec<'_>, upstream: &[[u8; 4]], embedded: Option<[u8; 4]>) -> String {
@@ -3120,6 +3163,66 @@ mod tests {
         assert_eq!(super::resolv_conf(&spec, &wsl, Some(super::embedded_address(&spec))), "nameserver 172.17.0.1\n");
         assert!(!super::embedded_dns_if(&spec, || false), "a resolver elsewhere is named itself");
         assert_eq!(super::resolv_conf(&spec, &[[192, 168, 5, 2]], None), "nameserver 192.168.5.2\n");
+    }
+
+    /// #477: a WSL 2 host under Consomme answers EINVAL to a fixed-port bind
+    /// on a bridge's gateway. The start goes on: the default bridge falls
+    /// back to 127.0.0.11 in the container (what it named on such a host
+    /// before #624), a user network keeps 127.0.0.11, and only with no
+    /// listener at all does a container ask the host's resolvers.
+    #[test]
+    fn a_gateway_that_refuses_the_dns_listener_does_not_stop_the_start() {
+        use super::super::dns::{Dns, EMBEDDED};
+        let gw = [172, 17, 0, 1];
+        let refused = || Err::<(), _>(std::io::Error::from_raw_os_error(libc::EINVAL));
+        let wsl = [[10, 255, 255, 254]];
+        // The real listener, at a gateway no interface has: the bind fails
+        // (EADDRNOTAVAIL, before any port check, so also without root),
+        // as #477's EINVAL does, and the start does not.
+        let mut dns = Dns::default();
+        let doc = [192, 0, 2, 1];
+        assert!(!dns.serve_or_warn("kiri0", doc));
+        assert!(!dns.serves_at(doc));
+        assert!(!dns.serve_or_warn("kiri0", doc), "asked again by the next container; warned once");
+        let gateway = dns.serves_at(doc).then_some(doc);
+
+        let mut buf = Vec::new();
+        let net = Net { bridge: "kiri0", ip: [172, 17, 0, 2], prefix: 16, gateway: gw, extra_hosts: &[], dns_names: &[], opts: &[] };
+        encode_run(&mut buf, "c1", &[], &["sh"], &[], "/", "", "c1", 0, net, &[], &Limits::default(), 0, &[] as &[&str], &[]);
+        let Ok(Msg::Run(bridge)) = decode(&buf) else { panic!() };
+        // Default bridge, WSL shape: wanted the gateway; it refused.
+        let wanted = super::embedded_address(&bridge);
+        assert_eq!(wanted, gw);
+        let mut asked = false;
+        let (at, err) = super::settle_resolver(wanted, gateway, || {
+            asked = true;
+            Ok(())
+        });
+        assert!(asked && err.is_none());
+        assert_eq!(at, Some(EMBEDDED), "the resolver in the container, as before #624");
+        assert_eq!(super::resolv_conf(&bridge, &wsl, at), "nameserver 127.0.0.11\n");
+        // Where the gateway listens: unchanged, and nothing in the container.
+        let (at, err) = super::settle_resolver(gw, Some(gw), || panic!("no listener in the container"));
+        assert_eq!((at, err.is_none()), (Some(gw), true));
+
+        // A user network: 127.0.0.11, refused gateway or not.
+        let mut buf = Vec::new();
+        let net = Net { bridge: "kiri1", ip: [172, 18, 0, 2], prefix: 16, gateway: [172, 18, 0, 1], extra_hosts: &[], dns_names: &[], opts: &[] };
+        encode_run(&mut buf, "c2", &[], &["sh"], &[], "/", "", "c2", run_flags::DNS_GATEWAY, net, &[], &Limits::default(), 0, &[] as &[&str], &[]);
+        let Ok(Msg::Run(user)) = decode(&buf) else { panic!() };
+        let wanted = super::embedded_address(&user);
+        assert_eq!(wanted, EMBEDDED);
+        assert_eq!(super::settle_resolver(wanted, None, || Ok(())).0, Some(EMBEDDED));
+        assert_eq!(super::settle_resolver(wanted, Some([172, 18, 0, 1]), || Ok(())).0, Some(EMBEDDED));
+        // No listener in the container either: the gateway's if there is
+        // one, else the host's resolvers, and the container still starts.
+        let (at, err) = super::settle_resolver(wanted, Some([172, 18, 0, 1]), refused);
+        assert_eq!((at, err.map(|e| e.raw_os_error())), (Some([172, 18, 0, 1]), Some(Some(libc::EINVAL))));
+        let (at, err) = super::settle_resolver(wanted, None, refused);
+        assert_eq!((at, err.is_some()), (None, true));
+        assert_eq!(super::resolv_conf(&user, &[[192, 0, 2, 53]], at), "nameserver 192.0.2.53\n");
+        // The same on the default bridge with both refused.
+        assert_eq!(super::settle_resolver(gw, None, refused).0, None);
     }
 
     #[test]
