@@ -72,6 +72,7 @@ pub fn run(autostart: bool, view: Option<String>) -> io::Result<()> {
         // animation, which cost 26% of a core idle where there is no GPU
         // (a VM; software GL), against under 1.5% without it.
         settings.set_hardware_acceleration_policy(webkit2gtk::HardwareAccelerationPolicy::Never);
+        whole_frames(&settings);
         settings.set_enable_write_console_messages_to_stdout(cfg!(debug_assertions));
     }
     webview.load_html(&super::assemble::page(PAGE, super::prefs()["lang"].as_str()), None);
@@ -91,6 +92,68 @@ pub fn run(autostart: bool, view: Option<String>) -> io::Result<()> {
     gtk::main();
     let _ = engine.join();
     Ok(())
+}
+
+/// Turns off WebKit's `PropagateDamagingInformation`. With it on and no GPU
+/// compositing (see `run`), WebKitGTK 2.54 hands GTK only each frame's
+/// repainted rectangles, and GTK 3 clears the rest of the view to the
+/// window's own background: hover a row and the main pane goes blank,
+/// leaving only the strip and the status bar. An opaque view background
+/// (`page_background`) did not stop it. With propagation off WebKit marks the
+/// whole view as changed in every frame, which costs next to nothing here
+/// since the CPU is already drawing the frame.
+///
+/// The feature API is WebKitGTK 2.42 and the bindings stop at 2.40, so it is
+/// looked up at run time: on an older WebKit, or one without the feature,
+/// this does nothing.
+fn whole_frames(settings: &webkit2gtk::Settings) {
+    use std::ffi::{CStr, c_char, c_int, c_void};
+    type AllFeatures = unsafe extern "C" fn() -> *mut c_void;
+    type ListLen = unsafe extern "C" fn(*mut c_void) -> usize;
+    type ListGet = unsafe extern "C" fn(*mut c_void, usize) -> *mut c_void;
+    type Identifier = unsafe extern "C" fn(*mut c_void) -> *const c_char;
+    type SetEnabled = unsafe extern "C" fn(*mut c_void, *mut c_void, c_int);
+    type Unref = unsafe extern "C" fn(*mut c_void);
+
+    fn sym(name: &CStr) -> Option<*mut c_void> {
+        // SAFETY: a lookup by name in the already-loaded WebKit.
+        let p = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
+        (!p.is_null()).then_some(p)
+    }
+    let (Some(all), Some(len), Some(get), Some(id), Some(set), Some(unref)) = (
+        sym(c"webkit_settings_get_all_features"),
+        sym(c"webkit_feature_list_get_length"),
+        sym(c"webkit_feature_list_get"),
+        sym(c"webkit_feature_get_identifier"),
+        sym(c"webkit_settings_set_feature_enabled"),
+        sym(c"webkit_feature_list_unref"),
+    ) else {
+        return;
+    };
+    // SAFETY: the symbols have the signatures WebKitGTK 2.42 documents; the
+    // list is ours until unref, and its features live as long as it does.
+    unsafe {
+        let (all, len, get, id, set, unref) = (
+            std::mem::transmute::<*mut c_void, AllFeatures>(all),
+            std::mem::transmute::<*mut c_void, ListLen>(len),
+            std::mem::transmute::<*mut c_void, ListGet>(get),
+            std::mem::transmute::<*mut c_void, Identifier>(id),
+            std::mem::transmute::<*mut c_void, SetEnabled>(set),
+            std::mem::transmute::<*mut c_void, Unref>(unref),
+        );
+        let list = all();
+        if list.is_null() {
+            return;
+        }
+        for i in 0..len(list) {
+            let feature = get(list, i);
+            let name = id(feature);
+            if !name.is_null() && CStr::from_ptr(name) == c"PropagateDamagingInformation" {
+                set(settings.as_ptr().cast(), feature, 0);
+            }
+        }
+        unref(list);
+    }
 }
 
 fn icon() -> Option<Pixbuf> {
