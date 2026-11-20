@@ -53,6 +53,7 @@ host_test() { # name full(0|1)
   # access list, without it signing in again. Checked as that user with no
   # groups at all, as a session started before the change would be.
   check "polkit action for the password prompt" "test -f /usr/share/polkit-1/actions/dev.kiri.host-access.policy"
+  check "NetworkManager leaves Kiri's interfaces alone" "grep -q 'interface-name:kiri\*;interface-name:kv\*;interface-name:kx\*' /usr/lib/NetworkManager/conf.d/kiri.conf"
   userdel kiri-acl-test >/dev/null 2>&1; useradd --system --no-create-home kiri-acl-test
   userdel kiri-acl-other >/dev/null 2>&1; useradd --system --no-create-home kiri-acl-other
   check "kiri host-access starts the engine and adds the account to the kiri group" "/usr/bin/kiri host-access kiri-acl-test && systemctl is-enabled -q kiri && systemctl is-active -q kiri && id -nG kiri-acl-test | grep -qw kiri"
