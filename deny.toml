@@ -10,3 +10,15 @@ allow = [
   "Unlicense",
   "Zlib",
 ]
+
+# RUSTSEC advisories. In cargo-deny's current config a vulnerability always
+# fails the check; `unmaintained` picks how far from the workspace a warning
+# reaches; yanked releases fail. Run with `cargo deny check`.
+[advisories]
+unmaintained = "all"
+yanked = "deny"
+
+# Duplicate dependencies cost compile time and can drift versions apart;
+# warn until the tree is clean enough to raise to "deny".
+[bans]
+multiple-versions = "warn"
