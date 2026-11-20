@@ -5,6 +5,16 @@
 #   tests/e2e.sh            # functional tests (DOCKER_CONTEXT=kiri-dev for another Kiri)
 #   SOAK=500 tests/e2e.sh   # plus a leak soak of 500 container runs
 #   KIRI_TEST_STRICT=1 tests/e2e.sh   # what the setup lacks fails, not skipped
+#   KIRI_TEST_ONLY='^udp-|^build-dns$' tests/e2e.sh   # only the checks named
+#
+# KIRI_TEST_ONLY is an extended regular expression matched against each
+# check's name: the others are neither run nor counted, but the lines that
+# set up for them (containers, networks, files) still run, so a check picked
+# alone sees what it would in a full run (so a check must not be what undoes
+# a set-up line's change). Its summary says how many it left out.
+#
+# A failing check that guards a known bug (tests/regressions.tsv) prints a
+# "guards: #N" line under its FAIL with what broke.
 #
 # Checks for another system's feature are skipped, as are those needing what
 # this setup lacks; the summary counts them by reason (`only`, `needs` below).
@@ -78,6 +88,7 @@ t() {
     FAIL=$((FAIL + 1))
     FAILED+=("$name")
     printf '  FAIL %s\n    want: %s\n    got:  %s\n' "$name" "$want" "$(echo "$got" | head -5)"
+    kiri_guard "$name"
   fi
 }
 
@@ -94,13 +105,29 @@ code() {
     FAIL=$((FAIL + 1))
     FAILED+=("$name")
     printf '  FAIL %s: exit %s, want %s\n' "$name" "$got" "$want"
+    kiri_guard "$name"
   fi
 }
+
+# selected NAME: whether KIRI_TEST_ONLY (unset: every check) picks check NAME.
+UNSELECTED=0
+selected() {
+  [ -z "${KIRI_TEST_ONLY:-}" ] && return 0
+  [[ $1 =~ $KIRI_TEST_ONLY ]] && return 0
+  UNSELECTED=$((UNSELECTED + 1))
+  return 1
+}
+# Which bug a failing check guards (tests/regressions.tsv): kiri_guard NAME.
+# shellcheck source=SCRIPTDIR/lib/regressions.sh
+. "$(dirname "$0")/lib/regressions.sh"
+# A listed check that no longer exists would never print its line: say so.
+command -v python3 >/dev/null && ! python3 "$(dirname "$0")/lib/check-regressions.py" >/dev/null 2>&1 &&
+  echo "e2e: tests/regressions.tsv names a check that is gone; see python3 tests/lib/check-regressions.py"
 
 section() { printf '\n== %s\n' "$1"; SEC_ONLY=; SEC_NEEDS=; }
 # skip NAME REASON: not run here, counted by reason in the summary.
 SKIP_WHY=()
-skip() { SKIP=$((SKIP + 1)); SKIP_WHY+=("$2"); printf '  SKIP %s (%s)\n' "$1" "$2"; }
+skip() { selected "$1" || return 0; SKIP=$((SKIP + 1)); SKIP_WHY+=("$2"); printf '  SKIP %s (%s)\n' "$1" "$2"; }
 
 # Where each check runs. Kiri runs containers in its own Linux VM on macOS
 # (SYS=mac), and on the host's own kernel on Linux (linux) and in WSL 2
@@ -147,12 +174,14 @@ needs() {
 }
 # skip_setup NAME REASON: missing in this setup, a failure under KIRI_TEST_STRICT=1.
 skip_setup() {
+  selected "$1" || return 0
   if [ "${KIRI_TEST_STRICT:-0}" = 1 ]; then
-    FAIL=$((FAIL + 1)); FAILED+=("$1"); printf '  FAIL %s (strict: %s)\n' "$1" "$2"
+    FAIL=$((FAIL + 1)); FAILED+=("$1"); printf '  FAIL %s (strict: %s)\n' "$1" "$2"; kiri_guard "$1"
   else skip "$@"; fi
 }
 # Whether check $1 runs in this section: called first by t and code.
 gate() {
+  selected "$1" || return 1
   if [ -n "${SEC_ONLY:-}" ] && ! on "$SEC_ONLY"; then skip "$1" "$(sys_names "$SEC_ONLY") only"; return 1; fi
   if [ -n "${SEC_NEEDS:-}" ] && [ -n "$(missing "$SEC_NEEDS")" ]; then skip_setup "$1" "$(missing "$SEC_NEEDS")"; return 1; fi
 }
@@ -1448,7 +1477,10 @@ needs amd64 t rosetta-node "v22" $D run --rm --platform linux/amd64 node:22-alpi
 only mac t rosetta-no-auxv-29 "no type 29" $D run --rm alpine sh -c 'od -An -v -tu8 -w16 /proc/self/auxv | awk "\$1 == 29 { n++ } END { print n ? \"type 29 given\" : \"no type 29\" }"'
 # Back to the engine's own architecture for the rest (an Intel Mac's is amd64).
 ARCH=$($D version -f '{{.Server.Arch}}' 2>/dev/null)
-t native-again "$([ "$ARCH" = amd64 ] && echo x86_64 || echo aarch64)" bash -c ". '$IMAGES_SH'; kiri_fetch alpine:latest linux/$ARCH && kiri_fetch node:22-alpine linux/$ARCH && $D run --rm alpine uname -m"
+# A set-up line, not part of the check: with KIRI_TEST_ONLY the checks after
+# this need the native alpine back whether native-again runs or not.
+kiri_fetch alpine:latest "linux/$ARCH"; kiri_fetch node:22-alpine "linux/$ARCH"
+t native-again "$([ "$ARCH" = amd64 ] && echo x86_64 || echo aarch64)" $D run --rm alpine uname -m
 $D rmi "$AMD64_ONLY" >/dev/null 2>&1
 
 section "security: seccomp, capabilities, read-only"
@@ -1724,6 +1756,7 @@ if [ -n "$HUB_LEFT0" ] && [ -n "$HUB_LEFT1" ]; then
   else echo "$HUB_MSG: $((HUB_LEFT0 - HUB_LEFT1))"; fi
 fi
 printf '\n%d passed, %d failed, %d skipped\n' "$PASS" "$FAIL" "$SKIP"
+[ -n "${KIRI_TEST_ONLY:-}" ] && echo "not selected by KIRI_TEST_ONLY: $UNSELECTED"
 # Skips by reason, so they show and can't quietly grow.
 [ "$SKIP" -gt 0 ] && echo "skipped: $(printf '%s\n' "${SKIP_WHY[@]}" | sort | uniq -c | sort -rn | sed 's/^ *\([0-9]*\) /\1 /' | paste -sd, - | sed 's/,/, /g')"
 for f in "${FAILED[@]+"${FAILED[@]}"}"; do echo "  failed: $f"; done

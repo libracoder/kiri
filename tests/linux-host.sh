@@ -24,10 +24,13 @@ $D cp "$(dirname "$0")/lib/images.sh" "$N":/images.sh >/dev/null
 $D exec -e KIRI_TEST_REGISTRY="$KIRI_REG" "$N" sh -c '. /images.sh; export DOCKER_HOST=unix:///root/.kiri/run/docker.sock; kiri_seed_images $KIRI_IMAGES_LINUX_HOST' ||
   echo "linux-host: an image could not be fetched; the checks that run it will fail"
 PASS=0; FAIL=0
+# A failing check that guards a known bug prints which (tests/regressions.tsv).
+# shellcheck source=SCRIPTDIR/lib/regressions.sh
+. "$(dirname "$0")/lib/regressions.sh"
 t() {
   local name=$1 want=$2; shift 2
   local got; got=$($D exec "$N" sh -c "export DOCKER_HOST=unix:///root/.kiri/run/docker.sock; $*" 2>&1 | tr -d '\r')
-  if [[ "$got" == *"$want"* ]]; then PASS=$((PASS + 1)); else FAIL=$((FAIL + 1)); printf '  FAIL %s\n    want: %s\n    got:  %s\n' "$name" "$want" "$(echo "$got" | head -3)"; fi
+  if [[ "$got" == *"$want"* ]]; then PASS=$((PASS + 1)); else FAIL=$((FAIL + 1)); printf '  FAIL %s\n    want: %s\n    got:  %s\n' "$name" "$want" "$(echo "$got" | head -3)"; kiri_guard "$name"; fi
 }
 t server-os "linux" "docker version --format '{{.Server.Os}}'"
 t run "3." "docker run --rm alpine cat /etc/alpine-release"
