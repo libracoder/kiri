@@ -767,24 +767,43 @@ mod os {
     }
 }
 
-/// Elsewhere there's no store of the system's to keep a sign-in in.
+/// On Linux without a credential helper, keep credentials in ~/.docker/config.json
+/// (`auths`) with mode 0600, matching standard `docker login` fallback behavior.
 #[cfg(not(any(target_os = "macos", windows)))]
 mod os {
     use std::io;
+    use serde_json::json;
 
-    use super::Login;
+    use super::{Login, TOKEN_USER, auths_entry, b64, config_dir, edit_auths, inline, read_config, server_key};
 
-    pub const NAME: &str = "a credential helper";
+    pub const NAME: &str = "~/.docker/config.json";
 
-    pub fn get(_key: &str) -> Option<Login> {
-        None
+    pub fn get(key: &str) -> Option<Login> {
+        let cfg = read_config();
+        auths_entry(&cfg, key).and_then(inline)
     }
 
-    pub fn set(_key: &str, _login: &Login) -> io::Result<()> {
-        Err(io::Error::other("set credsStore in ~/.docker/config.json to a credential helper"))
+    pub fn set(key: &str, login: &Login) -> io::Result<()> {
+        edit_auths(|a| {
+            let k = a.keys().find(|k| server_key(k) == key).cloned().unwrap_or_else(|| key.to_owned());
+            let entry = if login.username == TOKEN_USER {
+                json!({"identitytoken": login.secret})
+            } else {
+                let auth = b64::encode(format!("{}:{}", login.username, login.secret).as_bytes());
+                json!({"auth": auth})
+            };
+            a.insert(k, entry);
+        })?;
+        if let Some(path) = config_dir().map(|d| d.join("config.json")) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
+        Ok(())
     }
 
-    pub fn delete(_key: &str) {}
+    pub fn delete(key: &str) {
+        let _ = edit_auths(|a| a.retain(|k, _| server_key(k) != key));
+    }
 
     pub fn list() -> Vec<(String, String)> {
         Vec::new()
