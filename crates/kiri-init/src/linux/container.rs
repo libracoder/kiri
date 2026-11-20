@@ -1153,9 +1153,12 @@ fn write_etc_files(spec: &RunSpec<'_>, base: &std::path::Path, upstream: &[[u8; 
     // On a Linux host there is no loopback redirect; host.docker.internal
     // points at the bridge gateway, like Docker's host-gateway, so it reaches
     // host services on 0.0.0.0 but not ones bound only to 127.0.0.1.
+    // A host-network container is on the host already, loopback included,
+    // so there the name is the loopback address.
     let host_addr = net::ip_str(net::HOST_ADDR);
-    let gateway = net::ip_str(spec.net.gateway);
-    let map_host = super::transport::is_host_process() && spec.net.gateway != [0; 4];
+    let host_net = spec.flags & run_flags::NET_HOST != 0;
+    let gateway = if host_net { "127.0.0.1".to_owned() } else { net::ip_str(spec.net.gateway) };
+    let map_host = super::transport::is_host_process() && (host_net || spec.net.gateway != [0; 4]);
     for line in spec.net.extra_hosts.iter() {
         if map_host {
             hosts.push_str(&line.replace(&host_addr, &gateway));

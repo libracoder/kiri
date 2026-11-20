@@ -9,6 +9,11 @@ use std::os::unix::net::UnixStream;
 
 /// API version this daemon speaks. The Docker CLI negotiates down to it.
 pub const API_VERSION: &str = "1.47";
+/// The oldest API version served; a request path naming an older one is
+/// refused, as Docker does. A newer one than [`API_VERSION`] is still
+/// served: clients built against a newer Docker that don't negotiate work
+/// today, and refusing them would gain nothing.
+pub const MIN_API_VERSION: (u32, u32) = (1, 24);
 
 /// Largest request body read into memory (container create, etc.). Archives
 /// and image loads are streamed with [`Body`] instead, at any size.
@@ -27,6 +32,8 @@ pub struct Request {
     /// Path without the `/v1.xx` prefix or the query string, percent-decoded
     /// (`%2F` in an image name is the `/` the router must resolve).
     pub path: String,
+    /// The `/v1.xx` prefix, when the path had one.
+    pub api_version: Option<(u32, u32)>,
     query: Vec<(String, String)>,
     headers: Vec<(String, String)>,
     pub body: Vec<u8>,
@@ -81,7 +88,7 @@ impl Request {
     /// container create), so it goes through the same code as a client's.
     pub fn internal(method: &str, path: &str, query: &[(&str, &str)], body: Vec<u8>) -> Request {
         let query = query.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect();
-        Request { method: method.to_owned(), path: path.to_owned(), query, headers: Vec::new(), body, http10: false, streamed: Cell::new(Streamed::No) }
+        Request { method: method.to_owned(), path: path.to_owned(), api_version: None, query, headers: Vec::new(), body, http10: false, streamed: Cell::new(Streamed::No) }
     }
 }
 
@@ -91,7 +98,7 @@ impl Request {
 pub fn read_request(r: &mut BufReader<UnixStream>, stream: impl Fn(&str, &str) -> bool) -> io::Result<Option<Request>> {
     // The request line and headers are read through a cap, so a client
     // cannot exhaust memory with an endless line. The body is read after.
-    let (method, path, query, headers, http10) = {
+    let (method, path, api_version, query, headers, http10) = {
         let mut head = (&mut *r).take(MAX_HEAD);
         let mut line = String::new();
         if head.read_line(&mut line)? == 0 {
@@ -107,7 +114,9 @@ pub fn read_request(r: &mut BufReader<UnixStream>, stream: impl Fn(&str, &str) -
         // Decoded once, here, so every route that reads a name from the
         // path — an image's `%2F` repository slash above all — resolves the
         // name, not its encoding, as Docker's router does.
-        let path = percent_decode_path(strip_version(raw_path));
+        let unversioned = strip_version(raw_path);
+        let api_version = version_of(&raw_path[..raw_path.len() - unversioned.len()]);
+        let path = percent_decode_path(unversioned);
         let query: Vec<(String, String)> = raw_query
             .split('&')
             .filter(|kv| !kv.is_empty())
@@ -130,10 +139,10 @@ pub fn read_request(r: &mut BufReader<UnixStream>, stream: impl Fn(&str, &str) -
                 headers.push((k.trim().to_owned(), v.trim().to_owned()));
             }
         }
-        (method, path, query, headers, http10)
+        (method, path, api_version, query, headers, http10)
     };
     let streamed = stream(&method, &path);
-    let mut req = Request { method, path, query, headers, body: Vec::new(), http10, streamed: Cell::new(Streamed::No) };
+    let mut req = Request { method, path, api_version, query, headers, body: Vec::new(), http10, streamed: Cell::new(Streamed::No) };
     if streamed {
         req.streamed.set(Streamed::Unread);
         return Ok(Some(req));
@@ -261,6 +270,12 @@ fn strip_version(path: &str) -> &str {
     path
 }
 
+/// `/v1.47` → (1, 47). None for no prefix, or one that isn't two numbers.
+fn version_of(prefix: &str) -> Option<(u32, u32)> {
+    let (major, minor) = prefix.strip_prefix("/v")?.split_once('.')?;
+    Some((major.parse().ok()?, minor.parse().ok()?))
+}
+
 /// Percent-decodes a query value, where `+` means a space.
 fn percent_decode(s: &str) -> String {
     unescape(s, true)
@@ -374,8 +389,9 @@ pub fn json(w: &mut impl Write, status: u16, body: &str) -> io::Result<()> {
     respond(w, status, "application/json", body.as_bytes())
 }
 
-pub fn no_content(w: &mut impl Write) -> io::Result<()> {
-    respond(w, 204, "", b"")
+/// A success with no body, under the status the route names.
+pub fn empty(w: &mut impl Write, status: u16) -> io::Result<()> {
+    respond(w, status, "", b"")
 }
 
 /// Docker's error shape: `{"message": "..."}`.
@@ -465,7 +481,7 @@ mod tests {
 
     fn with_connection(value: Option<&str>) -> Request {
         let headers = value.map(|v| vec![("connection".to_owned(), v.to_owned())]).unwrap_or_default();
-        Request { method: "POST".to_owned(), path: "/containers/x/start".to_owned(), query: Vec::new(), headers, body: Vec::new(), http10: false, streamed: Cell::new(Streamed::No) }
+        Request { method: "POST".to_owned(), path: "/containers/x/start".to_owned(), api_version: None, query: Vec::new(), headers, body: Vec::new(), http10: false, streamed: Cell::new(Streamed::No) }
     }
 
     /// A request as `read_request` reads it off the wire.
@@ -526,9 +542,9 @@ mod tests {
         let start10 = "POST /containers/x/start HTTP/1.0\r\n\r\n";
         let kept = "POST /containers/x/start HTTP/1.1\r\nHost: d\r\n\r\n";
 
-        let r = answer(close11, &|w| no_content(w));
+        let r = answer(close11, &|w| empty(w, 204));
         assert!(r.starts_with("HTTP/1.1 204 No Content\r\n") && r.ends_with("Connection: close\r\n\r\n"), "{r}");
-        let r = answer(start10, &|w| no_content(w));
+        let r = answer(start10, &|w| empty(w, 204));
         assert_eq!(r.matches("Connection: close\r\n").count(), 1, "{r}");
         let r = answer(close11, &|w| json(w, 200, "{}"));
         assert!(r.contains("Content-Length: 2\r\nConnection: close\r\n\r\n{}"), "{r}");
@@ -539,7 +555,7 @@ mod tests {
         let r = answer(close11, &|w| upgrade(w));
         assert!(r.contains("Connection: Upgrade\r\n") && !r.contains("Connection: close"), "{r}");
 
-        let r = answer(kept, &|w| no_content(w));
+        let r = answer(kept, &|w| empty(w, 204));
         assert!(!r.contains("Connection:"), "{r}");
         let r = answer(kept, &|w| json(w, 200, "{}"));
         assert!(!r.contains("Connection:"), "{r}");
@@ -549,6 +565,11 @@ mod tests {
     fn strips_api_version() {
         assert_eq!(strip_version("/v1.47/containers/json"), "/containers/json");
         assert_eq!(strip_version("/_ping"), "/_ping");
+        assert_eq!(version_of("/v1.47"), Some((1, 47)));
+        assert_eq!(version_of("/v1.12"), Some((1, 12)));
+        assert_eq!(version_of(""), None);
+        assert_eq!(version_of("/v2"), None);
+        assert!((1, 12) < MIN_API_VERSION && (1, 24) >= MIN_API_VERSION && (1, 99) > MIN_API_VERSION);
         assert_eq!(strip_version("/volumes"), "/volumes");
     }
 
@@ -602,7 +623,7 @@ mod tests {
     #[test]
     fn upgrades_only_when_asked() {
         let reply = |headers: Vec<(String, String)>| {
-            let req = Request { method: "POST".into(), path: "/exec/x/start".into(), query: Vec::new(), headers, body: Vec::new(), http10: false, streamed: Cell::new(Streamed::No) };
+            let req = Request { method: "POST".into(), path: "/exec/x/start".into(), api_version: None, query: Vec::new(), headers, body: Vec::new(), http10: false, streamed: Cell::new(Streamed::No) };
             let mut out = Vec::new();
             upgrade_if_asked(&req, &mut out).unwrap();
             String::from_utf8(out).unwrap()

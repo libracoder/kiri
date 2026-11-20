@@ -1016,7 +1016,11 @@ $D run -d --name lim --memory 128m --cpus 0.5 --pids-limit 50 --cpu-shares 512 n
 t limit-memory "134217728" $D exec lim cat /sys/fs/cgroup/memory.max
 t limit-cpus "50000 100000" $D exec lim cat /sys/fs/cgroup/cpu.max
 t limit-pids "50" $D exec lim cat /sys/fs/cgroup/pids.max
-t limit-shares "20" $D exec lim cat /sys/fs/cgroup/cpu.weight
+t limit-shares "59" $D exec lim cat /sys/fs/cgroup/cpu.weight
+# 1024 shares, Docker's default, is the kernel's default weight (not less
+# than a container that set nothing), and inspect gives the shares back.
+t limit-shares-default "100 100" bash -c "echo \$($D run --rm --cpu-shares 1024 alpine cat /sys/fs/cgroup/cpu.weight) \$($D run --rm alpine cat /sys/fs/cgroup/cpu.weight)"
+t limit-shares-inspect "512" $D inspect -f '{{.HostConfig.CpuShares}}' lim
 t limit-inspect "134217728 500000000 50" $D inspect -f '{{.HostConfig.Memory}} {{.HostConfig.NanoCpus}} {{.HostConfig.PidsLimit}}' lim
 t oom-kill "137" bash -c "$D run --rm --memory 32m alpine sh -c 'tail /dev/zero' >/dev/null 2>&1; echo \$?"
 t stats "128MiB" $D stats --no-stream --format '{{.MemUsage}}' lim
@@ -1331,6 +1335,42 @@ if [ "${K8S:-0}" = 1 ]; then
   t k8s-context-gone "0" bash -c "env HOME=$KH kubectl config get-contexts -o name | grep -c kiri"
   rm -rf "$KH"
 fi
+
+section "the API's answers, as Docker gives them"
+API="curl -s -m 20 --unix-socket $SOCK"
+$D rm -f ans ans0 ans-n >/dev/null 2>&1; $D network rm ansnet >/dev/null 2>&1
+$D run -d --name ans alpine sh -c 'mkdir /data; ln -s / /data/root; echo hi > /f.txt; chmod 644 /f.txt; sleep 300' >/dev/null; sleep 0.5
+$D network create ansnet >/dev/null
+# An empty success keeps Docker's status; client libraries check it.
+t status-tag "201" $API -o /dev/null -w '%{http_code}' -X POST "http://d/images/alpine/tag?repo=anstag&tag=x"
+t status-connect "200" $API -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' -d '{"Container":"ans"}' http://d/networks/ansnet/connect
+t status-disconnect "200" $API -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' -d '{"Container":"ans"}' http://d/networks/ansnet/disconnect
+t status-exec-detached "200" bash -c "id=\$(curl -s --unix-socket $SOCK -X POST -H 'Content-Type: application/json' -d '{\"Cmd\":[\"true\"]}' http://d/containers/ans/exec | sed 's/.*\"Id\":\"\([^\"]*\)\".*/\1/'); curl -s -o /dev/null -w '%{http_code}' --unix-socket $SOCK -X POST -H 'Content-Type: application/json' -d '{\"Detach\":true}' http://d/exec/\$id/start"
+t status-start-still-204 "204" bash -c "$D create --name ans0 alpine true >/dev/null; curl -s -o /dev/null -w '%{http_code}' --unix-socket $SOCK -X POST http://d/containers/ans0/start"
+# An API version older than the minimum is refused; a newer one is served.
+t api-too-old "client version 1.12 is too old. Minimum supported API version is 1.24" $API http://d/v1.12/version
+t api-too-old-status "400" $API -o /dev/null -w '%{http_code}' http://d/v1.12/containers/json
+t api-min-served "200" $API -o /dev/null -w '%{http_code}' http://d/v1.24/version
+t api-newer-served "200" $API -o /dev/null -w '%{http_code}' http://d/v1.99/version
+# docker cp: /proc and /sys stay empty however they are reached, and the
+# archive's mode field holds permission bits only.
+t cp-proc-by-link "1" bash -c "$D cp ans:/data/root/proc - | tar -t | wc -l | tr -d ' '"
+t cp-sys-by-link "1" bash -c "$D cp ans:/data/root/sys - | tar -t | wc -l | tr -d ' '"
+t cp-link-still-copies "hi" bash -c "$D cp ans:/data/root/f.txt - | tar -xO"
+t cp-tar-mode "0000644" bash -c "$D cp ans:/f.txt - | dd bs=1 skip=100 count=7 2>/dev/null"
+# A container that never started: nothing changed yet, and it commits.
+t diff-never-started "0" bash -c "$D rm -f ans0 >/dev/null; $D create --name ans0 alpine true >/dev/null; $D diff ans0 | wc -l | tr -d ' '"
+t commit-never-started "committed" bash -c "$D commit ans0 anstag:c >/dev/null && $D run --rm anstag:c echo committed"
+# A network that doesn't exist: created, refused at start, and the CLI
+# does not read it as a missing image and pull.
+t create-missing-network "201" $API -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' -d '{"Image":"alpine","HostConfig":{"NetworkMode":"ans-nosuch"}}' 'http://d/containers/create?name=ans-n'
+t missing-network-inspect "ans-nosuch created" $D inspect -f '{{.HostConfig.NetworkMode}} {{.State.Status}}' ans-n
+t start-missing-network "network ans-nosuch not found" $API -X POST http://d/containers/ans-n/start
+t start-missing-network-status "404" $API -o /dev/null -w '%{http_code}' -X POST http://d/containers/ans-n/start
+t run-missing-network "network ans-nosuch not found" $D run --rm --name ans-r --network ans-nosuch alpine true
+t run-missing-network-no-pull "0" bash -c "$D run --rm --name ans-r --network ans-nosuch alpine true 2>&1 | grep -ci 'pull\|unable to find image'"
+t run-missing-network-removed "0" bash -c "$D ps -aq --filter name=ans-r | wc -l | tr -d ' '"
+$D rm -f ans ans0 ans-n ans-r >/dev/null 2>&1; $D network rm ansnet >/dev/null 2>&1; $D rmi anstag:x anstag:c >/dev/null 2>&1
 
 section "errors"
 t bad-image-name "invalid" $D run --rm 'UPPER/case' true

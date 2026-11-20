@@ -303,6 +303,10 @@ pub struct Limits {
     pub pids_max: u32,
     #[serde(default)]
     pub shm_size: u64,
+    /// `--cpu-shares` as asked for, which `inspect` reports back; the
+    /// kernel gets `cpu_weight`. 0 when not set, or saved before 0.2.3.
+    #[serde(default)]
+    pub cpu_shares: u64,
 }
 
 impl Limits {

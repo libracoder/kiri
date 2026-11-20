@@ -391,7 +391,7 @@ fn append_tree(b: &mut tar::Builder<impl Write>, src: &std::path::Path, name: &s
     while let Some((src, name)) = stack.pop() {
         let meta = fs::symlink_metadata(&src)?;
         append_one(b, &src, &name, &meta)?;
-        if meta.is_dir() && src != std::path::Path::new("/proc") && src != std::path::Path::new("/sys") {
+        if meta.is_dir() && !is_kernel_fs(&src) {
             let mut children: Vec<_> = fs::read_dir(&src)?.flatten().collect();
             children.sort_by_key(|e| e.file_name());
             for e in children.into_iter().rev() {
@@ -402,6 +402,27 @@ fn append_tree(b: &mut tar::Builder<impl Write>, src: &std::path::Path, name: &s
     Ok(())
 }
 
+/// Whether `dir` is on procfs or sysfs. Asked of the filesystem, not of the
+/// path: a link to `/` inside the container leads to them by any name.
+fn is_kernel_fs(dir: &std::path::Path) -> bool {
+    let Ok(c) = sys::cstr(dir) else { return false };
+    // SAFETY: statfs into a zeroed struct, on a valid NUL-terminated path.
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(c.as_ptr(), &mut st) } != 0 {
+        return false;
+    }
+    matches!(st.f_type as i64, PROC_MAGIC | SYSFS_MAGIC)
+}
+
+const PROC_MAGIC: i64 = 0x9fa0;
+const SYSFS_MAGIC: i64 = 0x6265_6572;
+
+/// What a tar header's mode holds: the permission bits. The file type has
+/// its own field, and Docker's archives leave it out of the mode.
+fn mode_bits(meta: &fs::Metadata) -> u32 {
+    meta.mode() & 0o7777
+}
+
 fn append_one(b: &mut tar::Builder<impl Write>, src: &std::path::Path, name: &std::path::Path, meta: &fs::Metadata) -> io::Result<()> {
     let ft = meta.file_type();
     if ft.is_socket() {
@@ -410,12 +431,14 @@ fn append_one(b: &mut tar::Builder<impl Write>, src: &std::path::Path, name: &st
     if ft.is_file() {
         let mut h = tar::Header::new_gnu();
         h.set_metadata(meta);
+        h.set_mode(mode_bits(meta));
         let mut f = fs::File::open(src)?;
         return b.append_data(&mut h, name, &mut f);
     }
     if ft.is_dir() || ft.is_symlink() || ft.is_fifo() || ft.is_char_device() || ft.is_block_device() {
         let mut h = tar::Header::new_gnu();
         h.set_metadata(meta);
+        h.set_mode(mode_bits(meta));
         h.set_size(0);
         if ft.is_symlink() {
             return b.append_link(&mut h, name, fs::read_link(src)?);
@@ -490,16 +513,23 @@ fn layer_job(conn: &mut fs::File, spec: &CopySpec<'_>, paths: &Paths) -> io::Res
     // swap a directory for a link to `/` between our look and our read
     // (`docker diff`, `commit --pause=false`). Inside a chroot of the layer
     // that link leads back into the layer, as `enter` does for the others.
-    let c = sys::cstr(&paths.containers.join(spec.id).join("upper"))?;
-    // SAFETY: valid NUL-terminated paths.
-    unsafe {
-        sys::check(libc::chroot(c.as_ptr()) as _, "chroot")?;
-        sys::check(libc::chdir(c"/".as_ptr()) as _, "chdir")?;
+    let layer = paths.containers.join(spec.id).join("upper");
+    // A container that never started has no writable layer yet: nothing
+    // changed, and there is nothing to enter (the walk below must not run
+    // on this process's own root).
+    let fresh = matches!(fs::symlink_metadata(&layer), Err(e) if e.kind() == io::ErrorKind::NotFound);
+    if !fresh {
+        let c = sys::cstr(&layer)?;
+        // SAFETY: valid NUL-terminated paths.
+        unsafe {
+            sys::check(libc::chroot(c.as_ptr()) as _, "chroot")?;
+            sys::check(libc::chdir(c"/".as_ptr()) as _, "chdir")?;
+        }
     }
     let upper = std::path::PathBuf::from("/");
     // Every path in the writable layer, parents first.
     let mut entries: Vec<(std::path::PathBuf, fs::Metadata)> = Vec::new();
-    let mut stack = vec![std::path::PathBuf::new()];
+    let mut stack = if fresh { Vec::new() } else { vec![std::path::PathBuf::new()] };
     while let Some(rel) = stack.pop() {
         let dir = upper.join(&rel);
         let Ok(list) = fs::read_dir(&dir) else { continue };

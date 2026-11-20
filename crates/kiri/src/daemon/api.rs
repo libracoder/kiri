@@ -77,7 +77,10 @@ pub(super) enum Next {
 
 pub(super) fn reply(w: &mut UnixStream, result: Result<Value, Error>, ok: u16) -> io::Result<Next> {
     match result {
-        Ok(Value::Null) => http::no_content(w)?,
+        // An empty answer keeps the status Docker gives it: 204 for most,
+        // 201 for a tag, 200 for a network connect or disconnect. Client
+        // libraries that check the exact status need it.
+        Ok(Value::Null) => http::empty(w, ok)?,
         Ok(v) => http::json(w, ok, &v.to_string())?,
         Err(e) => error(w, e)?,
     }
@@ -106,6 +109,11 @@ fn status_of(e: Error) -> (u16, String) {
 }
 
 fn route(req: &Request, engine: &Arc<Engine>, w: &mut UnixStream, r: &mut BufReader<UnixStream>) -> io::Result<Next> {
+    if req.api_version.is_some_and(|v| v < http::MIN_API_VERSION) {
+        let (major, minor) = req.api_version.unwrap_or_default();
+        let (min_major, min_minor) = http::MIN_API_VERSION;
+        return reply(w, Err(Error::BadRequest(format!("client version {major}.{minor} is too old. Minimum supported API version is {min_major}.{min_minor}, please upgrade your client to a newer version"))), 200);
+    }
     if let Some(done) = super::ops::route(req, engine, w) {
         return done;
     }
@@ -1062,7 +1070,7 @@ fn run_pull(req: &Request, engine: &Engine, reference: &Reference, job: &super::
     // An image built only for amd64 runs through Rosetta, as on Docker Desktop.
     if let Err(kiri_image::registry::Error::NoPlatform { available, .. }) = &result {
         let amd64 = Platform { os: "linux".into(), architecture: "amd64".into() };
-        if req.query("platform").is_none_or(str::is_empty) && wanted != amd64 && available.iter().any(|a| a == "linux/amd64") && kiri_vmm::rosetta_installed() {
+        if req.query("platform").is_none_or(str::is_empty) && wanted != amd64 && available.iter().any(|a| a == "linux/amd64") && amd64_runs() {
             line(json!({"status": format!("{} has no {wanted} image; using linux/amd64 through Rosetta", reference.short())}));
             result = client.pull_with(&engine.store, reference, &amd64, &on_progress, &job.cancel);
         }
@@ -1888,6 +1896,42 @@ fn caps_from(host: &Value) -> Result<u64, Error> {
     Ok(if mask == 0 { 1u64 << 63 } else { mask })
 }
 
+/// Whether this machine runs amd64 programs: Rosetta on a Mac; on a Linux
+/// host (and Windows' engine in WSL 2) an emulator the kernel has been told
+/// to use for them. Then a repository with no image for this machine gives
+/// its amd64 one, as on the Mac.
+fn amd64_runs() -> bool {
+    if cfg!(target_os = "linux") {
+        let Ok(entries) = std::fs::read_dir("/proc/sys/fs/binfmt_misc") else { return false };
+        return entries.flatten().filter_map(|e| std::fs::read_to_string(e.path()).ok()).any(|rule| binfmt_runs_amd64(&rule));
+    }
+    kiri_vmm::rosetta_installed()
+}
+
+/// One binfmt_misc rule, as the kernel prints it: enabled, and its magic is
+/// an x86-64 ELF header (class 64, little-endian, machine 0x3e).
+fn binfmt_runs_amd64(rule: &str) -> bool {
+    rule.lines().next() == Some("enabled") && rule.lines().any(|l| l.strip_prefix("magic ").is_some_and(|m| m.starts_with("7f454c460201") && m.get(36..40) == Some("3e00")))
+}
+
+/// cgroup v1 CPU shares (2–262144) as a v2 weight (1–10000), on the curve
+/// runc and crun use since 2025: 1024, Docker's default, is 100, the
+/// kernel's default weight. The older straight line made it 39, less than
+/// a container that asked for nothing.
+pub(super) fn cpu_weight(shares: u64) -> u32 {
+    if shares <= 2 {
+        return 1;
+    }
+    if shares >= 262_144 {
+        return 10_000;
+    }
+    let l = (shares as f64).log2();
+    // Rounded to 9 places first: the exact powers of ten (1024 → 100) must
+    // not be pushed over by the last bit of the float.
+    let w = 10f64.powf((l * l + 125.0 * l) / 612.0 - 7.0 / 34.0);
+    ((w * 1e9).round() / 1e9).ceil() as u32
+}
+
 pub(super) fn limits_from(h: &Value, base: super::engine::Limits) -> super::engine::Limits {
     let mut l = base;
     if let Some(m) = h["Memory"].as_u64().filter(|m| *m > 0) {
@@ -1903,9 +1947,8 @@ pub(super) fn limits_from(h: &Value, base: super::engine::Limits) -> super::engi
         l.cpu_period = h["CpuPeriod"].as_u64().filter(|p| *p > 0).unwrap_or(100_000) as u32;
     }
     if let Some(shares) = h["CpuShares"].as_u64().filter(|s| *s > 0) {
-        // runc's conversion from v1 shares (2–262144) to v2 weight (1–10000).
-        let shares = shares.clamp(2, 262_144);
-        l.cpu_weight = (1 + (shares - 2) * 9999 / 262_142) as u32;
+        l.cpu_shares = shares;
+        l.cpu_weight = cpu_weight(shares);
     }
     if let Some(p) = h["PidsLimit"].as_i64().filter(|p| *p > 0) {
         l.pids_max = p as u32;
@@ -1935,9 +1978,10 @@ pub(super) fn create(req: &Request, engine: &Engine) -> Result<Value, Error> {
         Some(target) => Some(container_network_mode(&body, engine, target)?),
         None => engine.lock_net().find(&network_mode).map(|n| n.name.clone()),
     };
-    let Some(network_mode) = network else {
-        return Err(Error::NotFound(format!("network {network_mode} not found")));
-    };
+    // A network that doesn't exist is refused at start, as Docker does. A
+    // 404 here would be read by the docker CLI as a missing image, which it
+    // then pulls before trying again.
+    let network_mode = network.unwrap_or(network_mode);
     // One endpoint per network (API 1.44+ allows several at create, which
     // Compose uses); NetworkMode or the endpoints above pick the primary.
     let mut aliases = Vec::new();
@@ -1955,7 +1999,14 @@ pub(super) fn create(req: &Request, engine: &Engine) -> Result<Value, Error> {
                 return Err(Error::BadRequest("container sharing network namespace with another container or host cannot be connected to any other network".into()));
             }
             let names = strings(&ep["Aliases"]).unwrap_or_default();
-            let found = engine.lock_net().find(net).cloned().ok_or_else(|| Error::NotFound(format!("network {net} not found")))?;
+            let Some(found) = engine.lock_net().find(net).cloned() else {
+                if *net == network_mode {
+                    // The missing primary network: start refuses it.
+                    aliases.extend(names);
+                    continue;
+                }
+                return Err(Error::NotFound(format!("network {net} not found")));
+            };
             let canonical = found.name.clone();
             let (ip, ip6, mac) = endpoint_address(ep)?;
             if let Some(a) = super::network::parse_ip(&ip) {
@@ -2479,7 +2530,15 @@ fn inspect(c: &Container, nets: &[super::network::Network]) -> Value {
             "NanoCpus": if c.spec.limits.cpu_period > 0 { c.spec.limits.cpu_quota * 1_000_000_000 / u64::from(c.spec.limits.cpu_period) } else { 0 },
             "CpuQuota": c.spec.limits.cpu_quota,
             "CpuPeriod": c.spec.limits.cpu_period,
-            "CpuShares": if c.spec.limits.cpu_weight > 0 { 2 + (u64::from(c.spec.limits.cpu_weight) - 1) * 262_142 / 9999 } else { 0 },
+            // Containers saved before the shares were kept have only the
+            // weight, from the old straight-line conversion.
+            "CpuShares": if c.spec.limits.cpu_shares > 0 {
+                c.spec.limits.cpu_shares
+            } else if c.spec.limits.cpu_weight > 0 {
+                2 + (u64::from(c.spec.limits.cpu_weight) - 1) * 262_142 / 9999
+            } else {
+                0
+            },
             "PidsLimit": if c.spec.limits.pids_max > 0 { Value::from(c.spec.limits.pids_max) } else { Value::Null },
             "NetworkMode": c.spec.network_mode,
             "PidMode": c.spec.pid_mode,
@@ -2822,7 +2881,8 @@ fn exec_start(req: &Request, engine: &Arc<Engine>, id: &str, w: &mut UnixStream,
     if detach {
         // Nobody will read the output; let it drain on its own thread.
         std::thread::spawn(move || for _ in rx {});
-        http::no_content(w)?;
+        // 200 with no body, as Docker answers a detached start.
+        http::empty(w, 200)?;
         return Ok(Next::KeepAlive);
     }
     http::upgrade_if_asked(req, w)?;
@@ -4103,6 +4163,34 @@ mod network_option_tests {
         match container_mode_allowed(&body, "web") {
             Err(Error::BadRequest(m)) => m,
             other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_enabled_x86_64_binfmt_rule_means_amd64_runs() {
+        let qemu = "enabled\ninterpreter /usr/libexec/qemu-binfmt/x86_64-binfmt-P\nflags: POCF\noffset 0\nmagic 7f454c4602010100000000000000000002003e00\nmask fffffffffffefefcfffffffffffffffffeffffff\n";
+        assert!(super::binfmt_runs_amd64(qemu));
+        assert!(!super::binfmt_runs_amd64(&qemu.replace("enabled", "disabled")));
+        // aarch64 (machine b7) and 32-bit x86 (class 01, machine 03) are not it.
+        assert!(!super::binfmt_runs_amd64(&qemu.replace("02003e00", "0200b700")));
+        assert!(!super::binfmt_runs_amd64("enabled\nmagic 7f454c4601010100000000000000000002000300\n"));
+        assert!(!super::binfmt_runs_amd64("enabled\nextension .exe\n"));
+    }
+
+    #[test]
+    fn cpu_shares_become_the_weight_runc_gives() {
+        // Docker 29 / runc 1.3.2: 1024 is the kernel's default weight.
+        for (shares, weight) in [(2, 1), (512, 59), (1024, 100), (4096, 303), (262_144, 10_000), (1, 1), (999_999, 10_000)] {
+            assert_eq!(super::cpu_weight(shares), weight, "{shares}");
+        }
+        let l = super::limits_from(&json!({"CpuShares": 1024}), Default::default());
+        assert_eq!((l.cpu_shares, l.cpu_weight), (1024, 100));
+        // Rises with the shares, never backwards.
+        let mut last = 0;
+        for s in 2..5000 {
+            let w = super::cpu_weight(s);
+            assert!(w >= last, "{s}");
+            last = w;
         }
     }
 
