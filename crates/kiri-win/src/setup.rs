@@ -201,8 +201,35 @@ fn wsl_text(bytes: &[u8]) -> String {
     }
 }
 
-fn wsl_installed() -> bool {
-    quiet("wsl.exe").arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success())
+/// What `wsl.exe --version` said.
+#[derive(Debug, PartialEq)]
+enum Wsl {
+    /// It answered: WSL is installed.
+    There,
+    /// It failed, or there is no wsl.exe: WSL is not installed.
+    Missing,
+    /// It ran past its limit (killed): WSL is there, only not answering;
+    /// the text says so.
+    Silent(String),
+}
+
+/// The most `wsl.exe --version` may take when setup works out its step.
+/// It reads WSL's installed version and answers in well under a second;
+/// right after Windows starts or wakes the WSL service can take a few
+/// seconds more. WSL_LIMIT (60 s) is sized for calls that start the VM and
+/// run something in it: too long for a first-run window to sit empty.
+const WSL_ANSWER_LIMIT: Duration = Duration::from_secs(15);
+
+fn wsl_check(cmd: &mut Command, limit: Duration) -> Wsl {
+    match crate::update::output_within(cmd, limit) {
+        Ok(o) if o.status.success() => Wsl::There,
+        Err(e) if e.kind() == io::ErrorKind::TimedOut => Wsl::Silent(e.to_string()),
+        _ => Wsl::Missing,
+    }
+}
+
+fn wsl_answer() -> Wsl {
+    wsl_check(quiet("wsl.exe").arg("--version"), WSL_ANSWER_LIMIT)
 }
 
 pub(crate) fn distros() -> Vec<String> {
@@ -238,17 +265,25 @@ pub fn needed() -> bool {
     !s.done || s.distro.as_deref().is_none_or(|d| !distros().iter().any(|x| x == d))
 }
 
-/// The step to show now, from what is on this PC.
-fn current_step(s: &Saved) -> &'static str {
-    if !wsl_installed() {
-        return "welcome";
-    }
+/// The step to show now, from what is on this PC, and why WSL did not
+/// answer when it didn't.
+fn current_step(s: &Saved) -> (&'static str, Option<String>) {
+    let silent = match wsl_answer() {
+        Wsl::Missing => return ("welcome", None),
+        Wsl::There => None,
+        Wsl::Silent(why) => Some(why),
+    };
     if let Some(at) = s.restart_after {
         if !restarted_since(at) {
-            return "restart";
+            return ("restart", None);
         }
     }
-    match &s.distro {
+    // Not answering is not missing: Choose a Linux, saying why, rather than
+    // Install WSL (or asking for its distros, which would hang too).
+    if silent.is_some() {
+        return ("choose", silent);
+    }
+    let step = match &s.distro {
         Some(d) if distros().iter().any(|x| x == d) => {
             if crate::client::alive() {
                 "tools"
@@ -257,16 +292,18 @@ fn current_step(s: &Saved) -> &'static str {
             }
         }
         _ => "choose",
-    }
+    };
+    (step, None)
 }
 
-fn fresh_state(step: &'static str, s: &Saved) -> State {
+/// `existing_ubuntu`: whether WSL lists an Ubuntu, asked only of a WSL that answered.
+fn fresh_state(step: &'static str, s: &Saved, existing_ubuntu: bool) -> State {
     let other = other_docker();
     State {
         step,
         linux: s.linux.clone(),
         sizes: json!({"wsl": WSL_MSI.size, "ubuntu": UBUNTU.size, "kiri": std::fs::metadata(bundle().join("kiri-linux.tar.gz")).map_or(0, |m| m.len())}),
-        existing_ubuntu: existing_ubuntu().is_some(),
+        existing_ubuntu,
         other_docker: other,
         other_engine: crate::buildwith::other_engine(),
         make_default: !other,
@@ -496,7 +533,8 @@ fn install_wsl() -> io::Result<()> {
     }
     task(2, "done", "");
     task(3, "done", "");
-    if code == 3010 || !wsl_installed() {
+    // Just installed and not answering yet: most likely waiting for the restart too.
+    if code == 3010 || wsl_answer() != Wsl::There {
         let mut s = saved();
         s.restart_after = Some(now_secs());
         save(&s);
@@ -811,9 +849,12 @@ pub fn on_message(msg: &str) {
         "setup-ready" => {
             std::thread::spawn(|| {
                 let s = saved();
-                let step = current_step(&s);
-                let mut fresh = fresh_state(step, &s);
-                if let Some(e) = &s.last_error {
+                let (step, silent) = current_step(&s);
+                let mut fresh = fresh_state(step, &s, silent.is_none() && existing_ubuntu().is_some());
+                if let Some(why) = silent {
+                    crate::serve::log(&format!("setup: {why}; showing {step}"));
+                    fresh.error = Some(why);
+                } else if let Some(e) = &s.last_error {
                     crate::serve::log(&format!("setup: carrying on at {step}; last time it stopped with: {e}"));
                     // A step that carries on by itself shows its own result;
                     // one waiting for a choice shows why setup stopped.
@@ -886,5 +927,22 @@ mod tests {
         assert_eq!(super::test_failure(run), "the test container did not run: no space left on device");
         assert_eq!(super::test_failure("something odd\n"), "the test container did not run: something odd");
         assert_eq!(super::test_failure(""), "the test container did not run");
+    }
+
+    #[test]
+    fn a_wsl_that_never_answers_is_silent_within_its_limit() {
+        use super::{quiet, wsl_check, Wsl};
+        use std::time::{Duration, Instant};
+        // Stands in for a hung wsl.exe: about ten minutes of pings, killed at the limit.
+        let t = Instant::now();
+        let got = wsl_check(quiet("ping.exe").args(["-n", "600", "127.0.0.1"]), Duration::from_millis(300));
+        assert!(t.elapsed() < Duration::from_secs(10), "waited {:?}", t.elapsed());
+        assert!(matches!(&got, Wsl::Silent(why) if why.starts_with("WSL did not finish")), "{got:?}");
+        // One that answers is there; one that fails, or isn't there at all, is missing.
+        assert_eq!(wsl_check(quiet("cmd.exe").args(["/c", "exit 0"]), Duration::from_secs(10)), Wsl::There);
+        assert_eq!(wsl_check(quiet("cmd.exe").args(["/c", "exit 1"]), Duration::from_secs(10)), Wsl::Missing);
+        assert_eq!(wsl_check(&mut std::process::Command::new("kiri-no-such-wsl.exe"), Duration::from_secs(10)), Wsl::Missing);
+        // The limit a first-run window waits: well under WSL_LIMIT.
+        assert!(super::WSL_ANSWER_LIMIT < crate::update::WSL_LIMIT);
     }
 }

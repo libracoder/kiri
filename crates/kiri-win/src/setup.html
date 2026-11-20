@@ -738,7 +738,11 @@ function trn(n, one, other, vars) { var s = isOne(n) ? one : other, v = { n: n }
   /* ---------- render ---------- */
   var S = null, hadState = false, builtKey = null, choice = 'kiri', main = document.getElementById('main');
   function render() {
-    var s = Object.assign({ step: 'welcome' }, S || {});
+    // Until the host says where this PC is (its first state needs wsl.exe,
+    // which takes a moment), the window is the frame only: Welcome asks to
+    // install WSL, which must not flash by on a PC that has it.
+    if (!S) return;
+    var s = Object.assign({ step: 'welcome' }, S);
     if (STEPS.indexOf(s.step) < 0) s.step = 'welcome';
     var asking = !!s.askLang && !langDone;
     // The language step stays as it is built; a new language redraws it in place.
@@ -828,7 +832,6 @@ function trn(n, one, other, vars) { var s = isOne(n) ? one : other, v = { n: n }
     }
   });
 
-  render();
   send('setup-ready');
 })();
 </script>
