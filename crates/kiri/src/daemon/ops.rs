@@ -360,8 +360,8 @@ fn parse_duration(s: &str) -> Option<Duration> {
     let n: u64 = n.parse().ok()?;
     Some(Duration::from_secs(match unit {
         "s" => n,
-        "m" => n * 60,
-        "h" => n * 3600,
+        "m" => n.checked_mul(60)?,
+        "h" => n.checked_mul(3600)?,
         _ => return None,
     }))
 }
@@ -388,14 +388,32 @@ fn image_prune(req: &Request, engine: &Engine) -> Result<Value, Error> {
         return Err(Error::Conflict(why));
     }
     let f = filters(req, &["dangling", "until", "label", "label!"])?;
+    let until = f.values("until");
+    for value in until.unwrap_or_default() {
+        if !value.parse::<f64>().is_ok_and(f64::is_finite) && parse_duration(value).is_none() {
+            return Err(Error::BadRequest(format!("invalid until filter: {value}")));
+        }
+    }
     // Without `-a` only untagged images go; Kiri keeps none of those around.
     let dangling_only = f.bool("dangling").unwrap_or(true);
     let used: Vec<String> = engine.each(|c| Some(c.spec.image_id.clone()));
     let mut deleted = Vec::new();
     let mut reclaimed = 0u64;
-    for i in engine.store.images()? {
+    let images = engine.store.images()?;
+    let labels = engine.image_labels(&images);
+    for (i, labels) in images.iter().zip(labels) {
         if used.contains(&i.config_digest) || (dangling_only && !i.name.starts_with("sha256:")) {
             continue;
+        }
+        if !f.labels(&labels) {
+            continue;
+        }
+        if until.is_some() {
+            let secs = time::try_parse_unix(&i.created).map_or(i.pulled_at, |s| s.max(0) as u64);
+            let t = std::time::UNIX_EPOCH.checked_add(Duration::from_secs(secs));
+            if !t.is_some_and(|t| until_ok(&f, t)) {
+                continue;
+            }
         }
         if engine.store.remove_image(&i.name)?.is_some() {
             reclaimed += i.size;
@@ -698,6 +716,113 @@ mod disk_usage_tests {
             other => panic!("image prune: {other:?}"),
         }
         assert_eq!(engine.store.images().unwrap().len(), 1, "the image is kept");
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn image_prune_honors_label_and_until_filters() {
+        use super::{Error, Request};
+        use serde_json::json;
+
+        let root =
+            std::env::temp_dir().join(format!("kiri-image-prune-filters-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let engine = super::super::engine::boot_without_vm(&root);
+        let image = |name: &str, disposable: &str, created: &str, size| {
+            let cfg = json!({"created": created, "config": {"Labels": {"disposable": disposable}}});
+            let mut w = engine.store.ingest().unwrap();
+            serde_json::to_writer(&mut w, &cfg).unwrap();
+            let (digest, _) = w.finish().unwrap();
+            let mut image =
+                kiri_image::archive::from_config(name.into(), &digest, &cfg, Vec::new());
+            image.size = size;
+            image
+        };
+        // All three were just pulled. The image without a creation date uses its pull time.
+        let old = image("demo:old", "yes", "1970-01-01T00:00:00Z", 10);
+        let new = image("demo:new", "no", "", 20);
+        let used = image("demo:used", "yes", "2000-01-02T00:00:00Z", 0);
+        engine.store.put_image(used.clone()).unwrap();
+        let body = json!({"Image": used.name, "Cmd": ["true"]});
+        super::super::api::create(
+            &Request::internal(
+                "POST",
+                "/containers/create",
+                &[],
+                body.to_string().into_bytes(),
+            ),
+            &engine,
+        )
+        .unwrap();
+
+        let prune = |filters: serde_json::Value| {
+            let req = Request::internal(
+                "POST",
+                "/images/prune",
+                &[("filters", &filters.to_string())],
+                Vec::new(),
+            );
+            super::image_prune(&req, &engine)
+        };
+        let names = || {
+            let mut names: Vec<_> = engine
+                .store
+                .images()
+                .unwrap()
+                .into_iter()
+                .map(|i| i.name)
+                .collect();
+            names.sort();
+            names
+        };
+        for (filters, deleted, kept) in [
+            (
+                json!({"dangling": ["false"], "label": ["disposable=yes"]}),
+                &old,
+                &new,
+            ),
+            (
+                json!({"dangling": ["false"], "label!": ["disposable=yes"]}),
+                &new,
+                &old,
+            ),
+            (json!({"dangling": ["false"], "until": ["24h"]}), &old, &new),
+            (
+                json!({"dangling": ["false"], "until": ["1000000000"]}),
+                &old,
+                &new,
+            ),
+        ] {
+            engine.store.put_image(old.clone()).unwrap();
+            engine.store.put_image(new.clone()).unwrap();
+            let response = prune(filters).unwrap();
+            assert_eq!(
+                response,
+                json!({"ImagesDeleted": [{"Untagged": deleted.name}, {"Deleted": deleted.config_digest}], "SpaceReclaimed": deleted.size})
+            );
+            assert_eq!(names(), [kept.name.as_str(), used.name.as_str()]);
+        }
+
+        engine.store.put_image(old).unwrap();
+        for filters in [
+            json!({}),
+            json!({"dangling": ["true"]}),
+            json!({"dangling": ["false"], "label": ["disposable=no"], "until": ["24h"]}),
+        ] {
+            assert_eq!(
+                prune(filters).unwrap(),
+                json!({"ImagesDeleted": null, "SpaceReclaimed": 0})
+            );
+            assert_eq!(names(), ["demo:new", "demo:old", "demo:used"]);
+        }
+        for bad in ["yesterday", "18446744073709551615h", "NaN"] {
+            let result = prune(json!({"dangling": ["false"], "until": ["24h", bad]}));
+            assert!(
+                matches!(result, Err(Error::BadRequest(m)) if m == format!("invalid until filter: {bad}"))
+            );
+            assert_eq!(names(), ["demo:new", "demo:old", "demo:used"]);
+        }
         drop(engine);
         let _ = std::fs::remove_dir_all(root);
     }
