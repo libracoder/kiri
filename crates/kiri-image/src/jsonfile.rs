@@ -60,13 +60,27 @@ pub fn replace(path: &Path, bytes: &[u8], durable: Durable) -> io::Result<()> {
 /// folder, so the rename itself is on disk. Nothing to do if there is no
 /// file (yet).
 pub fn sync(path: &Path) -> io::Result<()> {
-    match File::open(path) {
+    match open_for_sync(path) {
         Ok(f) => f.sync_all()?,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e),
     }
     sync_dir(parent(path));
     Ok(())
+}
+
+/// Opens `path` so that [`File::sync_all`] can flush it. Windows'
+/// `FlushFileBuffers` rejects handles without the GENERIC_WRITE access
+/// right, so there the file is opened for writing too (without creating,
+/// truncating or modifying anything); elsewhere a read handle is enough.
+#[cfg(windows)]
+fn open_for_sync(path: &Path) -> io::Result<File> {
+    fs::OpenOptions::new().read(true).write(true).open(path)
+}
+
+#[cfg(not(windows))]
+fn open_for_sync(path: &Path) -> io::Result<File> {
+    File::open(path)
 }
 
 fn parent(path: &Path) -> &Path {
