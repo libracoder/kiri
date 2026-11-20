@@ -3674,7 +3674,9 @@ function renderDetail() {
   const content = $("content");
   let body = $("dbody");
   const keepTerminal = d.tab === "terminal" && running && body?.parentNode === content && termEl.parentNode === body;
-  if (keepTerminal) {
+  // The same container's Logs tab, already drawn: its bar stays, so Find in logs keeps its focus and caret.
+  const keepLogs = d.tab === "logs" && body?.parentNode === content && body.dataset.logs === c.Id && logEl.parentNode === body;
+  if (keepTerminal || keepLogs) {
     // Replacing the detail body disconnects the prompt and drops its focus.
     while (content.firstChild !== body) content.firstChild.remove();
     body.insertAdjacentHTML("beforebegin", heading);
@@ -3688,7 +3690,9 @@ function renderDetail() {
     body.innerHTML = overview(c, d.info);
     if (running) { body.prepend(statsEl); if (!statsEl.childElementCount) drawStats(); }
   }
+  else if (d.tab === "logs" && keepLogs) logCount();
   else if (d.tab === "logs") {
+    body.dataset.logs = c.Id;
     const levels = [["", tr("All levels")], ["error", tr("Error")], ["warn", tr("Warn")], ["info", tr("Info")], ["debug", tr("Debug")]];
     body.innerHTML = `<div class="logbar"><input class="field" id="log-filter" placeholder="${tr("Find in logs")}" spellcheck="false" value="${esc(d.logFilter)}">
       <select id="log-level" aria-label="${tr("Level")}">${levels.map(([v, l]) => `<option value="${v}"${d.logLevel === v ? " selected" : ""}>${l}</option>`).join("")}</select>
