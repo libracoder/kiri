@@ -1112,6 +1112,20 @@ python3 "$(dirname "$0")/hardlink-image.py" "$IMD/hl.tar" kiri-test/hl:abs /bin/
 python3 "$(dirname "$0")/hardlink-image.py" "$IMD/hl-esc.tar" kiri-test/hl:esc /../../etc/hostname
 t load-hardlink-absolute "hello from tool" bash -c "$D load -q -i $IMD/hl.tar >/dev/null && id=\$($D create kiri-test/hl:abs) && $D cp \$id:/bin/tool-1.0 - | tar -xO; $D rm \$id >/dev/null"
 t load-hardlink-escape "escapes the layer" bash -c "$D load -q -i $IMD/hl-esc.tar >/dev/null && $D create kiri-test/hl:esc"
+# An OCI image layout (buildx --output type=oci) has index.json and blobs,
+# but no manifest.json. The CLI names such an image from the ref annotation.
+BXOCI=$DOCKER_CONTEXT-build
+docker buildx inspect "$BXOCI" >/dev/null 2>&1 || docker buildx create --name "$BXOCI" --driver docker-container --driver-opt default-load=true "$DOCKER_CONTEXT" >/dev/null
+printf 'FROM alpine\nRUN echo oci-works > /msg\nCMD ["cat","/msg"]\n' > "$IMD/Dockerfile"
+t load-oci "Loaded image" bash -c "cd $IMD && BUILDX_BUILDER=$BXOCI perl -e 'alarm 300; exec @ARGV' $D buildx build --output type=oci,dest=$IMD/oci.tar -t kiri-test/oci:1 . >/dev/null 2>&1 && $D load -i $IMD/oci.tar"
+t load-oci-runs "oci-works" $D run --rm 1:latest
+$D rmi 1:latest >/dev/null 2>&1
+# A multi-platform layout is a nested index. Docker 28 needs API 1.48 for
+# `docker load --platform`, Kiri speaks 1.47, so use the API the CLI would.
+t load-oci-multi-build "index.json" bash -c "cd $IMD && BUILDX_BUILDER=$BXOCI perl -e 'alarm 300; exec @ARGV' $D buildx build --platform linux/amd64,linux/arm64 --output type=oci,dest=$IMD/multi.tar . >/dev/null 2>&1 && tar -tf $IMD/multi.tar | grep index.json"
+t load-oci-native "Loaded image ID" bash -c "curl -s -X POST --unix-socket $SOCK http://localhost/v1.47/images/load --data-binary @$IMD/multi.tar"
+t load-oci-platform "Loaded image ID" bash -c "curl -s -X POST --unix-socket $SOCK 'http://localhost/v1.47/images/load?platform=linux%2Famd64' --data-binary @$IMD/multi.tar"
+t load-oci-no-platform "not found" bash -c "curl -s -X POST --unix-socket $SOCK 'http://localhost/v1.47/images/load?platform=linux%2Fs390x' --data-binary @$IMD/multi.tar"
 $D rmi kiri-test/alp:v1 kiri-test/hl:abs kiri-test/hl:esc >/dev/null 2>&1; rm -rf "$IMD"
 
 section "docker build (BuildKit in the VM)"

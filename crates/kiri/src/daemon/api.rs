@@ -652,7 +652,8 @@ fn image_load(req: &Request, engine: &Engine, w: &mut UnixStream, r: &mut BufRea
     let mut body = http::Body::new(req, r);
     let mut head = Vec::with_capacity(6);
     (&mut body).take(6).read_to_end(&mut head)?;
-    let loaded = upload_reader(head, &mut body).map(|archive| kiri_image::archive::load(&engine.store, archive));
+    let platform = req.query("platform").filter(|p| !p.is_empty()).and_then(Platform::parse);
+    let loaded = upload_reader(head, &mut body).map(|archive| kiri_image::archive::load_with_platform(&engine.store, archive, platform.as_ref()));
     let loaded = match loaded {
         Ok(loaded) => loaded,
         Err(e) => {
