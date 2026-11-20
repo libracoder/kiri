@@ -1182,7 +1182,16 @@ t top-aux "%MEM" bash -c "$D top lim aux | head -1"
 t top-aux-master "nginx: master process" $D top lim aux
 t top-eo '["PID","RSS","COMMAND"]' curl -s --unix-socket "$SOCK" 'http://d/v1.47/containers/lim/top?ps_args=-eo+pid%2Crss%2Cargs'
 t top-eo-rss "ok" bash -c "$D top lim -eo pid,rss,args | awk 'NR>1 && \$2 ~ /^[0-9]+\$/ && \$2 > 0 {print \"ok\"; exit}'"
-t top-ps-args-refused "not supported" $D top lim -l
+# -l, --sort/k, column widths and moby's PID-title rule, as Docker's ps gives them.
+t top-l '["F","S","UID","PID","PPID","C","PRI","NI","ADDR","SZ","WCHAN","TTY","TIME","CMD"]' curl -s --unix-socket "$SOCK" 'http://d/v1.47/containers/lim/top?ps_args=-l'
+t top-l-values "80 0 - nginx" bash -c "$D top lim -el --sort pid | awk 'NR == 2 {print \$7, \$8, \$9, \$14}'"
+t top-efl-cmd "nginx: master process" bash -c "$D top lim -efl --sort pid | awk 'NR == 2'"
+t top-sort "desc" bash -c "$D top lim -eo pid,comm --sort -pid | awk 'NR>1 {if (p && \$1 > p) bad=1; p=\$1; n++} END {if (n > 1 && !bad) print \"desc\"}'"
+t top-sort-k "desc" bash -c "$D top lim ax k -pid | awk 'NR>1 {if (p && \$1 > p) bad=1; p=\$1; n++} END {if (n > 1 && !bad) print \"desc\"}'"
+t top-width '"ngi","root"]' curl -s --unix-socket "$SOCK" 'http://d/v1.47/containers/lim/top?ps_args=-o+pid:8,comm:3,user+--sort+pid'
+t top-title-refused 'specifying \"ppid=PID\" is not allowed' curl -s --unix-socket "$SOCK" 'http://d/v1.47/containers/lim/top?ps_args=-o+ppid%3DPID'
+t top-title-no-pid "Couldn't find PID field" curl -s --unix-socket "$SOCK" 'http://d/v1.47/containers/lim/top?ps_args=-o+pid%3DID'
+t top-ps-args-refused "not supported" $D top lim -F
 t pause "paused" bash -c "$D pause lim >/dev/null && $D inspect -f '{{.State.Status}}' lim"
 t pause-ps "(Paused)" $D ps --filter name=lim --format '{{.Status}}'
 t pause-exec-refused "is paused" $D exec lim true

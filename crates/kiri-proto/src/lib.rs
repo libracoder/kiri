@@ -156,8 +156,8 @@ pub enum Msg<'a> {
     /// Host → guest: the container's processes. Answered by `Top` or `Error`.
     TopQuery { id: &'a str },
     /// Tab-separated `user pid ppid c stime tty time comm stat rss vsz %cpu
-    /// %mem etime-secs time-secs uid cmd`, one process each (cmd last; an
-    /// older agent sent only the first seven and cmd).
+    /// %mem etime-secs time-secs uid f priority nice sz cmd`, one process
+    /// each (cmd last; an older agent sent fewer fields before cmd).
     Top(StrList<'a>),
     /// Host → guest: plug a running container into another bridge network
     /// as `ifname`. Answered by `Ack` or `Error`.
