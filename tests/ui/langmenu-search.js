@@ -2,7 +2,7 @@
 // window: 760x480
 // Settings › Appearance › Language: a button showing the choice that opens a
 // short searchable list (the language step's search, other names and keys),
-// not a 39-row menu. The hidden <select id="pref-lang"> stays the choice.
+// not a 40-row menu. The hidden <select id="pref-lang"> stays the choice.
 {
 const R = [];
 const t = (name, fn) => { try { fn(); R.push("PASS " + name); } catch (e) { R.push("FAIL " + name + ": " + e.message); } };
