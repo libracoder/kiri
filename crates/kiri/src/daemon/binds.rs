@@ -222,9 +222,102 @@ fn engine_socket_for(src: &str, own: &str, exists: impl Fn(&str) -> bool) -> Opt
     }
 }
 
+/// Makes a bind mount's missing source (`-v ./missing:/x`) as Docker does
+/// (`MkdirAllAndChownNew(source, 0755, root)`): each folder not there yet is
+/// 0755 whatever this process's umask, keeps a set-group-ID bit its parent
+/// hands down, and is root's when the engine runs as root, not the group
+/// such a parent would give it. The Linux unit runs the daemon with
+/// UMask=0027, which protects its state, logs and keys but would make these
+/// folders 0750 and shut out the user whose mount it is. Folders already
+/// there are left as they are.
+pub fn make_source(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let missing: Vec<&Path> = path.ancestors().take_while(|a| std::fs::symlink_metadata(a).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)).collect();
+    if missing.is_empty() {
+        // There but not a folder (a link to nowhere): refused as before.
+        return std::fs::create_dir_all(path);
+    }
+    // SAFETY: geteuid only reads this process's effective user.
+    let root = unsafe { libc::geteuid() } == 0;
+    for dir in missing.into_iter().rev() {
+        match std::fs::DirBuilder::new().mode(0o755).create(dir) {
+            Ok(()) => {}
+            // Made at the same moment by another container's start: its own.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && dir.is_dir() => continue,
+            Err(e) => return Err(e),
+        }
+        if root {
+            std::os::unix::fs::chown(dir, Some(0), Some(0))?;
+        }
+        let mode = std::fs::metadata(dir)?.permissions().mode() & 0o7777;
+        let want = 0o755 | (mode & 0o2000);
+        if mode != want {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(want))?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A missing source is made 0755 under the Linux unit's umask (0027),
+    /// each folder on the way too, and folders already there keep their
+    /// mode. The umask is the whole process's, so the check runs in a child
+    /// test process of its own, where nothing else runs.
+    #[test]
+    fn a_missing_bind_source_is_made_0755_whatever_the_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        const CHILD: &str = "KIRI_TEST_BIND_SOURCE_DIR";
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        if let Some(base) = std::env::var_os(CHILD) {
+            let base = Path::new(&base);
+            // SAFETY: umask only changes this process's file-creation mask,
+            // and this process runs this test alone.
+            unsafe { libc::umask(0o027) };
+            make_source(&base.join("new/dir")).unwrap();
+            make_source(&base.join("new/dir")).unwrap();
+            make_source(&base.join("sgid/new/dir")).unwrap();
+            std::fs::create_dir(base.join("plain")).unwrap();
+            return;
+        }
+        let base = std::env::temp_dir().join(format!("kiri-bind-source-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir(&base).unwrap();
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // A set-group-ID parent of another group, as a shared project folder
+        // can be: on Linux the bit is handed down, and so is the group,
+        // which Docker (as root) puts back to root's.
+        let sgid = base.join("sgid");
+        std::fs::create_dir(&sgid).unwrap();
+        // SAFETY: geteuid only reads this process's effective user.
+        let root = unsafe { libc::geteuid() } == 0;
+        if root {
+            std::os::unix::fs::chown(&sgid, None, Some(1)).unwrap();
+        }
+        std::fs::set_permissions(&sgid, std::fs::Permissions::from_mode(0o2775)).unwrap();
+        let name = "daemon::binds::tests::a_missing_bind_source_is_made_0755_whatever_the_umask";
+        let child = std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact", name, "--test-threads=1"]).env(CHILD, &base).output().unwrap();
+        assert!(child.status.success(), "{}", String::from_utf8_lossy(&child.stdout));
+        // The umask did apply in the child: a folder made without the fix.
+        assert_eq!(mode(&base.join("plain")), 0o750, "the child ran under umask 0027");
+        let made = (mode(&base.join("new")), mode(&base.join("new/dir")));
+        assert_eq!(made, (0o755, 0o755), "made {:o} and {:o}", made.0, made.1);
+        assert_eq!(mode(&base), 0o700, "a folder already there is left as it is");
+        let handed_down = if cfg!(target_os = "linux") { 0o2755 } else { 0o755 };
+        let made = (mode(&sgid.join("new")), mode(&sgid.join("new/dir")));
+        assert_eq!(made, (handed_down, handed_down), "made {:o} and {:o}", made.0, made.1);
+        if root {
+            use std::os::unix::fs::MetadataExt;
+            let owner = |p: &Path| std::fs::metadata(p).map(|m| (m.uid(), m.gid())).unwrap();
+            assert_eq!((owner(&sgid.join("new")), owner(&sgid.join("new/dir"))), ((0, 0), (0, 0)), "root:root, as Docker makes it");
+        }
+        // A link to nowhere is refused, as before.
+        std::os::unix::fs::symlink(base.join("gone"), base.join("dangling")).unwrap();
+        assert!(make_source(&base.join("dangling")).is_err());
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     fn wsl() -> Wsl {
         Wsl { root: "/mnt/".into(), distro: Some("kiri".into()) }

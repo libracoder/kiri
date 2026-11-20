@@ -23,6 +23,10 @@ pub fn serve(stream: UnixStream, engine: Arc<Engine>) -> io::Result<()> {
     let mut w = stream.try_clone()?;
     let mut r = BufReader::new(stream);
     while let Some(req) = http::read_request(&mut r, streams_body)? {
+        // A body too large to hold: answered and ended, never routed.
+        if req.too_large() {
+            return http::refuse_too_large(&req, &mut w, &mut r).or(Ok(()));
+        }
         // The window's action this request is part of: the engine's lines
         // for it carry the same op.
         let _op = req.header("X-Kiri-Op").filter(|o| crate::diag::valid_op(o)).map(|o| crate::diag::enter_op(o.to_owned()));
@@ -34,20 +38,25 @@ pub fn serve(stream: UnixStream, engine: Arc<Engine>) -> io::Result<()> {
         }
         match route(&req, &engine, &mut w, &mut r) {
             // `Connection: close` or HTTP/1.0: the client reads to the end of
-            // the stream (a 204 has no length to read by). The write side is
-            // shut, not only dropped, so the end reaches it even while
-            // anything else still holds a copy of the socket.
+            // the stream (a 204 has no length to read by), which `close`
+            // gives it cleanly.
             Ok(Next::KeepAlive) if req.wants_close() => {
-                let _ = w.shutdown(std::net::Shutdown::Write);
+                http::close(&w, &mut r);
                 return Ok(());
             }
             // A body its handler left unread that can't be read out would be
             // taken for the next request: the connection ends here instead.
             Ok(Next::KeepAlive) if !http::finish_body(&req, &mut r) => {
-                let _ = w.shutdown(std::net::Shutdown::Write);
+                http::close(&w, &mut r);
                 return Ok(());
             }
             Ok(Next::KeepAlive) => {}
+            // An upload answered before its body was read to the end (a
+            // refusal, an archive's padding): the client may still be sending.
+            Ok(Next::Close) if req.body_left() => {
+                http::close(&w, &mut r);
+                return Ok(());
+            }
             Ok(Next::Close) => return Ok(()),
             Err(e) => {
                 // The response may be half written; closing is the only safe
@@ -1586,7 +1595,7 @@ fn mounts(body: &Value, engine: &Engine, image: &kiri_image::Image) -> Result<Mo
                     if !create_missing {
                         return Err(Error::BadRequest(format!("invalid mount config for type \"bind\": bind source path does not exist: {src}")));
                     }
-                    std::fs::create_dir_all(p).map_err(Error::Io)?;
+                    super::binds::make_source(p).map_err(Error::Io)?;
                 }
                 // After a missing source was made, so its links are followed too.
                 out.guest.push(format!("{}\t{dst}\t{}", guest_bind_source(src), flag("")));
@@ -3992,9 +4001,9 @@ mod tests {
                 }
             };
             drop(client);
-            let _ = sent.join();
+            let sent = sent.join().unwrap().is_ok();
             served.join().unwrap().unwrap();
-            (String::from_utf8_lossy(&got).into_owned(), ended)
+            (String::from_utf8_lossy(&got).into_owned(), ended, sent)
         };
         // No image name, so the pull is refused before it reaches a registry.
         let json = r#"{"fromImage":"","tag":"1.36.1"}"#;
@@ -4002,16 +4011,94 @@ mod tests {
         let sized = format!("POST /v1.44/images/create?fromImage=&tag=1.36.1 HTTP/1.1\r\nHost: d\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{json}{ping}", json.len());
         let chunked = format!("POST /images/create?fromImage= HTTP/1.1\r\nHost: d\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{json}\r\n0\r\n\r\n{ping}", json.len());
         for requests in [sized, chunked] {
-            let (got, ended) = exchange(requests.as_bytes());
+            let (got, ended, _) = exchange(requests.as_bytes());
             assert!(!ended && got.starts_with("HTTP/1.1 400 ") && got.contains("HTTP/1.1 200 OK") && !got.contains("does not support"), "{got}");
         }
-        // Past what is read out (256 KB, as Go's server reads): answered, then closed.
-        let big = vec![b' '; 300 << 10];
-        let mut requests = format!("POST /images/create?fromImage= HTTP/1.1\r\nHost: d\r\nContent-Length: {}\r\n\r\n", big.len()).into_bytes();
-        requests.extend_from_slice(&big);
-        requests.extend_from_slice(ping.as_bytes());
-        let (got, ended) = exchange(&requests);
-        assert!(ended && got.starts_with("HTTP/1.1 400 ") && got.matches("HTTP/1.1 ").count() == 1, "{got}");
+        // Past what is read out (256 KB, as Go's server reads): answered, then
+        // closed cleanly. The client's read ends, not "connection reset" (what
+        // Linux gives when a socket closes with unread data in it), and a
+        // client still sending its body is not cut off with a broken pipe.
+        for size in [300 << 10, 8 << 20] {
+            let mut requests = format!("POST /images/create?fromImage= HTTP/1.1\r\nHost: d\r\nContent-Length: {size}\r\n\r\n").into_bytes();
+            requests.resize(requests.len() + size, b' ');
+            requests.extend_from_slice(ping.as_bytes());
+            let (got, ended, sent) = exchange(&requests);
+            assert!(ended && sent && got.starts_with("HTTP/1.1 400 ") && got.matches("HTTP/1.1 ").count() == 1, "{size}: ended {ended}, sent {sent}: {got}");
+        }
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A body past what a request read whole may send (8 MiB) gets a real
+    /// answer, 413 in Docker's error shape, and a clean end: before, the
+    /// connection was dropped unanswered and the client, still sending, got
+    /// a broken pipe. Content-Length and chunked; a client that never stops
+    /// sending is cut off after the drain's bounds.
+    #[test]
+    fn a_body_too_large_to_hold_is_answered_and_the_connection_ends() {
+        use std::io::{Read, Write};
+        let (root, engine) = engine_in("too-large-body", false);
+        let ping = "GET /_ping HTTP/1.1\r\nHost: d\r\n\r\n";
+        // What the client got, whether its read ended cleanly, whether its
+        // write went through, and how long the server took to let go.
+        type Writes = Box<dyn FnOnce(&mut UnixStream) -> std::io::Result<()> + Send>;
+        let exchange = |send: Writes| {
+            let (mut client, server) = UnixStream::pair().unwrap();
+            let t = std::time::Instant::now();
+            let served = std::thread::spawn({
+                let engine = engine.clone();
+                move || (serve(server, engine), t.elapsed())
+            });
+            client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let sent = std::thread::spawn({
+                let mut client = client.try_clone().unwrap();
+                move || send(&mut client).is_ok()
+            });
+            let (mut got, mut buf) = (Vec::new(), [0u8; 4096]);
+            let ended = loop {
+                match client.read(&mut buf) {
+                    Ok(0) => break true,
+                    Ok(n) => got.extend_from_slice(&buf[..n]),
+                    Err(_) => break false,
+                }
+            };
+            drop(client);
+            let sent = sent.join().unwrap();
+            let (result, took) = served.join().unwrap();
+            result.unwrap();
+            (String::from_utf8_lossy(&got).into_owned(), ended, sent, took)
+        };
+        let answered = |got: &str| got.starts_with("HTTP/1.1 413 ") && got.contains("Connection: close\r\n") && got.contains("request body too large") && got.matches("HTTP/1.1 ").count() == 1;
+        let size = 9usize << 20;
+        let sized = Box::new(move |c: &mut UnixStream| {
+            write!(c, "POST /v1.44/containers/no-such-container/kill HTTP/1.1\r\nHost: d\r\nContent-Length: {size}\r\n\r\n")?;
+            c.write_all(&vec![b'x'; size])?;
+            c.write_all(ping.as_bytes())
+        });
+        let chunked = Box::new(move |c: &mut UnixStream| {
+            write!(c, "POST /no/such/endpoint HTTP/1.1\r\nHost: d\r\nTransfer-Encoding: chunked\r\n\r\n")?;
+            let chunk = vec![b'x'; 1 << 20];
+            for _ in 0..9 {
+                write!(c, "{:x}\r\n", chunk.len())?;
+                c.write_all(&chunk)?;
+                c.write_all(b"\r\n")?;
+            }
+            write!(c, "0\r\n\r\n{ping}")
+        });
+        for (what, send) in [("sized", sized as Writes), ("chunked", chunked)] {
+            let (got, ended, sent, _) = exchange(send);
+            assert!(answered(&got) && ended && sent, "{what}: ended {ended}, sent {sent}: {got}");
+        }
+        // Never stops sending: answered all the same, and the connection is
+        // closed once the drain's bounds (16 MiB, 1 s) are reached.
+        let (got, _, sent, took) = exchange(Box::new(|c: &mut UnixStream| {
+            write!(c, "POST /containers/x/kill HTTP/1.1\r\nHost: d\r\nContent-Length: {}\r\n\r\n", 1u64 << 40)?;
+            let block = vec![b'x'; 64 << 10];
+            loop {
+                c.write_all(&block)?;
+            }
+        }));
+        assert!(answered(&got) && !sent && took < Duration::from_secs(4), "endless: sent {sent}, took {took:?}: {got}");
         drop(engine);
         let _ = std::fs::remove_dir_all(root);
     }

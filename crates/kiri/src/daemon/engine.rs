@@ -908,6 +908,8 @@ pub struct Engine {
     /// Wakes the thread that syncs `containers.json` to disk after a save
     /// (`start_syncer`); none once `shutdown` has stopped it.
     syncer: Mutex<Option<Sender<()>>>,
+    /// Syncs of `containers.json` the syncer thread has made.
+    syncer_syncs: Arc<std::sync::atomic::AtomicU64>,
     /// Why the container list may be missing containers, found by `load`
     /// (or by a save that kept a copy later): what `docker info` warns
     /// about. While any of it holds nothing is deleted for not being in the
@@ -1057,6 +1059,7 @@ impl Engine {
             pending_copy: Mutex::new(None),
             on_disk: Mutex::new(None),
             syncer: Mutex::new(None),
+            syncer_syncs: Arc::default(),
             me: OnceLock::new(),
             held_restarts: Mutex::new(Vec::new()),
             power: Mutex::new(()),
@@ -1960,6 +1963,7 @@ impl Engine {
         const SYNC_AT_MOST: Duration = Duration::from_secs(1);
         let (tx, rx) = mpsc::channel::<()>();
         let path = self.records.clone();
+        let syncs = self.syncer_syncs.clone();
         let spawned = std::thread::Builder::new().name("kiri-sync".into()).spawn(move || {
             while rx.recv().is_ok() {
                 let first = std::time::Instant::now();
@@ -1972,6 +1976,7 @@ impl Engine {
                 if let Err(e) = kiri_image::jsonfile::sync(&path) {
                     crate::diag::error!("syncing containers to disk failed", error = e);
                 }
+                syncs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         });
         // Without the thread, save() syncs on the caller's thread.
@@ -5952,18 +5957,21 @@ mod image_labels_cache_tests {
 #[cfg(test)]
 mod save_speed_tests {
     use super::*;
+    use std::sync::atomic::Ordering;
 
     /// Many saves back to back from several threads (a compose up, a burst
-    /// of exits) cost about what writing the file costs: syncing it to disk
-    /// must not make each save wait. On a Mac's disk a sync takes 5 ms or
-    /// more, so a save that waits for one is many times slower than the
-    /// write itself.
+    /// of exits) never wait for the disk: no save syncs the file itself
+    /// (an fsync, 5 ms or more on a Mac's disk, so a save that waits for one
+    /// is many times slower than the write), and the syncer thread syncs
+    /// once per quiet moment, at most once a second during the burst, not
+    /// once per save. Counted, not timed, so neither a busy machine nor a
+    /// disk where syncing is free (tmpfs) changes the answer.
     #[test]
-    fn back_to_back_saves_stay_close_to_the_unsynced_write() {
+    fn back_to_back_saves_leave_syncing_to_the_syncer() {
         let root = std::env::temp_dir().join(format!("kiri-save-speed-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let engine = Engine::boot(Store::open(&root).unwrap()).unwrap();
-        engine.stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+        engine.stopped.store(true, Ordering::SeqCst);
         let image = Image {
             name: "test:local".into(), digest: "sha256:test".into(), index_digest: None, config_digest: "sha256:test".into(),
             layers: Vec::new(), size: 0, platform: "linux/arm64".into(), created: String::new(), pulled_at: 0, config: Default::default(),
@@ -5976,28 +5984,38 @@ mod save_speed_tests {
             })).unwrap();
             engine.create(Some(format!("speed{i}")), spec, &image).unwrap();
         }
-        let (threads, each) = (8, 100);
-        // The same number of plain writes of the same file: temp file, rename.
-        let bytes = std::fs::read(root.join("containers.json")).unwrap();
-        let plain = root.join("plain.json");
-        let t = std::time::Instant::now();
-        for _ in 0..threads * each {
-            let tmp = root.join("plain.json.tmp");
-            std::fs::write(&tmp, &bytes).unwrap();
-            std::fs::rename(&tmp, &plain).unwrap();
-        }
-        let unsynced = t.elapsed();
-        let t = std::time::Instant::now();
-        std::thread::scope(|s| {
-            for _ in 0..threads {
-                s.spawn(|| (0..each).for_each(|_| engine.save()));
+        // The creates' own sync, once it has happened: the burst starts quiet.
+        let quiet = |n: u64| {
+            let t = std::time::Instant::now();
+            while engine.syncer_syncs.load(Ordering::SeqCst) == n && t.elapsed() < Duration::from_secs(30) {
+                std::thread::sleep(Duration::from_millis(10));
             }
+            engine.syncer_syncs.load(Ordering::SeqCst)
+        };
+        let before = quiet(0);
+        let (threads, each) = (8, 100);
+        let t = std::time::Instant::now();
+        let inline: Vec<u64> = std::thread::scope(|s| {
+            let saving: Vec<_> = (0..threads)
+                .map(|_| {
+                    s.spawn(|| {
+                        let start = kiri_image::jsonfile::syncs_here();
+                        (0..each).for_each(|_| engine.save());
+                        kiri_image::jsonfile::syncs_here() - start
+                    })
+                })
+                .collect();
+            saving.into_iter().map(|h| h.join().unwrap()).collect()
         });
-        let saves = t.elapsed();
-        eprintln!("{} saves from {threads} threads: {saves:?}; the same writes unsynced: {unsynced:?}", threads * each);
-        // Loose, for other tests' disk work running alongside: waiting for
-        // a sync per save is 30 to 40 times the unsynced write on a Mac.
-        assert!(saves < unsynced * 8 + Duration::from_millis(500), "{saves:?} for saves against {unsynced:?} unsynced");
+        let took = t.elapsed();
+        let during = engine.syncer_syncs.load(Ordering::SeqCst) - before;
+        eprintln!("{} saves from {threads} threads in {took:?}: synced by the saves {inline:?}, by the syncer {during}", threads * each);
+        assert!(inline.iter().all(|&n| n == 0), "saves synced the file themselves: {inline:?} syncs per thread");
+        // At most one a second while saves keep coming (`SYNC_AT_MOST`), one
+        // more for a gap, however slow a busy machine makes the burst.
+        assert!(during <= took.as_secs() + 2, "the syncer synced {during} times during {} saves in {took:?}", threads * each);
+        // And the last save is made durable soon after the burst.
+        assert!(quiet(before + during) > before + during, "the syncer never synced after the burst");
         drop(engine);
         let _ = std::fs::remove_dir_all(root);
     }

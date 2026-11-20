@@ -283,6 +283,13 @@ t http10-start-closes "304 closed" python3 -c "$PROBE" "$SOCK" 'POST /v1.44/cont
 t keep-alive-start-stays "304 open" python3 -c "$PROBE" "$SOCK" 'POST /v1.44/containers/e2e-close/start HTTP/1.1\r\nHost: d\r\n\r\n'
 t connection-close-said "Connection: close" curl -s -m 5 -o /dev/null -D - --unix-socket "$SOCK" -H 'Connection: close' http://d/_ping
 t http10-ping-closes "200 closed" python3 -c "$PROBE" "$SOCK" 'GET /_ping HTTP/1.0\r\n\r\n'
+# A body past the 8 MiB a request read whole may send is answered (413, in
+# Docker's error shape) and the connection ends cleanly: it was dropped with
+# no answer, and curl, still sending, failed with "Send failure" (exit 55).
+BIGBODY=$(mktemp); head -c $(((8 << 20) + 1024)) /dev/zero > "$BIGBODY"
+t body-too-large-answered "413 exit 0" bash -c "curl -s -m 20 -o /dev/null -w '%{http_code}' -H 'Expect:' --unix-socket '$SOCK' -X POST --data-binary @$BIGBODY http://d/v1.44/containers/no-such-container/kill; echo \" exit \$?\""
+t body-too-large-chunked "413 exit 0" bash -c "curl -s -m 20 -o /dev/null -w '%{http_code}' -H 'Expect:' -H 'Transfer-Encoding: chunked' --unix-socket '$SOCK' -X POST --data-binary @$BIGBODY http://d/no/such/endpoint; echo \" exit \$?\""
+rm -f "$BIGBODY"
 $D rm -f e2e-close >/dev/null 2>&1
 # Ryuk mounts the engine's socket and talks to it from inside.
 t socket-mount-reaches-kiri "Kiri" $D run --rm -v "$SOCK:/var/run/docker.sock" docker:cli docker version --format '{{.Server.Platform.Name}}'
@@ -904,12 +911,17 @@ BIND=$(mktemp -d); echo "from the mac" > "$BIND/hello.txt"
 t bind-read "from the mac" $D run --rm -v "$BIND:/data" alpine cat /data/hello.txt
 t bind-write "from the container" bash -c "$D run --rm -v $BIND:/data alpine sh -c 'echo from the container > /data/out.txt' && cat $BIND/out.txt"
 # A new file without owner read (Node's fs.cpSync creates with 0200) is made
-# and ends with that mode (guest/kernel/patches/0003).
-t bind-create-0200 "200 hi" bash -c "$D run --rm -v $BIND:/data alpine sh -c 'umask 577; echo hi > /data/w0200' && perl -e 'printf q(%o ), (stat shift)[2] & 07777' $BIND/w0200 && chmod u+r $BIND/w0200 && cat $BIND/w0200"
+# and ends with that mode (guest/kernel/patches/0003). Run as a plain user on
+# a Linux host, a file the container's root makes is root's there, as on
+# Docker, and only root could chmod it: the container writes as that user.
+B0200_USER=$([ "$SYS" != mac ] && [ "$(id -u)" != 0 ] && echo "--user $(id -u):$(id -g)")
+t bind-create-0200 "200 hi" bash -c "$D run --rm $B0200_USER -v $BIND:/data alpine sh -c 'umask 577; echo hi > /data/w0200' && perl -e 'printf q(%o ), (stat shift)[2] & 07777' $BIND/w0200 && chmod u+r $BIND/w0200 && cat $BIND/w0200"
 t bind-ro "Read-only file system" $D run --rm -v "$BIND:/data:ro" alpine sh -c 'echo x > /data/nope'
 t bind-mount-flag "from the mac" $D run --rm --mount "type=bind,source=$BIND,target=/m" alpine cat /m/hello.txt
 code bind-mount-missing 125 $D run --rm --mount type=bind,source=/kiri/does/not/exist,target=/m alpine true
-t bind-v-creates "made" bash -c "$D run --rm -v $BIND/new/dir:/n alpine true && [ -d $BIND/new/dir ] && echo made"
+# Made 0755, each folder on the way too, as Docker makes them: on a Linux
+# host the daemon's umask (0027) must not shut out the user whose mount it is.
+t bind-v-creates "made 755 755" bash -c "$D run --rm -v $BIND/new/dir:/n alpine true && [ -d $BIND/new/dir ] && perl -e 'print q(made); printf q( %o), (stat)[2] & 07777 for @ARGV' $BIND/new $BIND/new/dir"
 t bind-file "from the mac" $D run --rm -v "$BIND/hello.txt:/etc/greeting" alpine cat /etc/greeting
 # A file made, changed and deleted on the Mac raises inotify events in the
 # container, as one made there does: file watchers (Vite, webpack, nodemon)
