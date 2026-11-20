@@ -4,6 +4,10 @@
 #
 #   tests/e2e.sh            # functional tests (DOCKER_CONTEXT=kiri-dev for another Kiri)
 #   SOAK=500 tests/e2e.sh   # plus a leak soak of 500 container runs
+#   KIRI_TEST_STRICT=1 tests/e2e.sh   # what the setup lacks fails, not skipped
+#
+# Checks for another system's feature are skipped, as are those needing what
+# this setup lacks; the summary counts them by reason (`only`, `needs` below).
 #
 # Exits non-zero if any check fails.
 
@@ -30,6 +34,7 @@ KFQ=$(printf %q "$KF")
 # t NAME EXPECTED COMMAND... : passes when the command's output (stdout+stderr,
 # trimmed) contains EXPECTED.
 t() {
+  gate "$1" || return 0
   local name=$1 want=$2
   shift 2
   local got
@@ -45,6 +50,7 @@ t() {
 
 # code NAME EXPECTED_EXIT COMMAND... : passes when the exit code matches.
 code() {
+  gate "$1" || return 0
   local name=$1 want=$2
   shift 2
   perl -e 'alarm 60; exec @ARGV' "$@" >/dev/null 2>&1
@@ -58,8 +64,93 @@ code() {
   fi
 }
 
-section() { printf '\n== %s\n' "$1"; }
-skip() { SKIP=$((SKIP + 1)); printf '  SKIP %s (%s)\n' "$1" "$2"; }
+section() { printf '\n== %s\n' "$1"; SEC_ONLY=; SEC_NEEDS=; }
+# skip NAME REASON: not run here, counted by reason in the summary.
+SKIP_WHY=()
+skip() { SKIP=$((SKIP + 1)); SKIP_WHY+=("$2"); printf '  SKIP %s (%s)\n' "$1" "$2"; }
+
+# Where each check runs. Kiri runs containers in its own Linux VM on macOS
+# (SYS=mac), and on the host's own kernel on Linux (linux) and in WSL 2
+# (wsl). The engine says which: the VM's kernel is Kiri's ("6.18-kiri"),
+# WSL 2's is Microsoft's. KIRI_TEST_SYSTEM=mac|linux|wsl says it instead.
+KVER=$($D version --format '{{.Server.KernelVersion}}' 2>/dev/null)
+case ${KIRI_TEST_SYSTEM:-} in
+  mac | linux | wsl) SYS=$KIRI_TEST_SYSTEM ;;
+  *) case $KVER in *-kiri) SYS=mac ;; *[Mm]icrosoft*) SYS=wsl ;; *) SYS=linux ;; esac ;;
+esac
+sys_name() { case $1 in mac) echo macOS ;; linux) echo "Linux host" ;; wsl) echo WSL ;; *) echo "$1" ;; esac; }
+sys_names() { local out='' s; for s in ${1//,/ }; do out="${out:+$out and }$(sys_name "$s")"; done; echo "$out"; }
+# What this setup lacks for some checks: NO_<WHAT> is empty when it is
+# there, else the reason. `needs WHAT` skips a check while it is missing;
+# KIRI_TEST_STRICT=1 (for runs meant to have everything) fails it instead.
+# shellcheck disable=SC2034 # read through `missing`
+NO_TTY='' NO_BUILDX='' NO_FINDER='' NO_AMD64='' NO_HOMES_DIR=''
+# A terminal: macOS's BSD script (util-linux's takes other arguments), else
+# a small pty helper in Python.
+if [ "$(uname -s)" = Darwin ] && command -v script >/dev/null; then PTY="script -q /dev/null"
+elif python3 -c 'import pty' >/dev/null 2>&1; then PTY="python3 $(printf %q "$(cd "$(dirname "$0")" && pwd)/lib/pty-run.py")"
+else PTY=false; NO_TTY="no terminal (neither BSD script nor python3)"; fi
+docker buildx version >/dev/null 2>&1 || NO_BUILDX="buildx not installed"
+# A session without the Mac's disk access (SSH, a fresh terminal) is refused ~/Kiri.
+[ "$SYS" = mac ] && case $(ls "$KF" 2>&1 >/dev/null) in *'Operation not permitted'*) true ;; *) false ;; esac && NO_FINDER="no access to $KF from this session (Full Disk Access)"
+# A file's SHA-256, whichever tool the system has.
+if command -v shasum >/dev/null; then SHA="shasum -a 256"; else SHA=sha256sum; fi
+
+# only SYSTEMS [CHECK...]: the check (t NAME ... or code NAME ...) runs on
+# SYSTEMS (mac, linux, wsl, or a comma list), and elsewhere is skipped as not
+# there by design. Without a check: the rest of the section.
+# needs WHAT [CHECK...]: the same for what the setup lacks (NO_<WHAT> above).
+on() { [[ ",$1," == *",$SYS,"* ]]; }
+only() {
+  [ $# -eq 1 ] && { SEC_ONLY=$1; return; }
+  local systems=$1; shift
+  if on "$systems"; then "$@"; else skip "$2" "$(sys_names "$systems") only"; fi
+}
+missing() { local v; v=NO_$(printf %s "$1" | tr a-z- A-Z_); printf %s "${!v:-}"; }
+needs() {
+  [ $# -eq 1 ] && { SEC_NEEDS=$1; return; }
+  local why; why=$(missing "$1"); shift
+  if [ -z "$why" ]; then "$@"; else skip_setup "$2" "$why"; fi
+}
+# skip_setup NAME REASON: missing in this setup, a failure under KIRI_TEST_STRICT=1.
+skip_setup() {
+  if [ "${KIRI_TEST_STRICT:-0}" = 1 ]; then
+    FAIL=$((FAIL + 1)); FAILED+=("$1"); printf '  FAIL %s (strict: %s)\n' "$1" "$2"
+  else skip "$@"; fi
+}
+# Whether check $1 runs in this section: called first by t and code.
+gate() {
+  if [ -n "${SEC_ONLY:-}" ] && ! on "$SEC_ONLY"; then skip "$1" "$(sys_names "$SEC_ONLY") only"; return 1; fi
+  if [ -n "${SEC_NEEDS:-}" ] && [ -n "$(missing "$SEC_NEEDS")" ]; then skip_setup "$1" "$(missing "$SEC_NEEDS")"; return 1; fi
+}
+# What a check expects where it differs by system. In the VM: the default
+# bridge's gateway is 172.17.0.1 and is also its nameserver (the agent
+# answers there); the VM's eth0 is on Apple's NAT (192.168.64.x); the VM's
+# own network has the kernel's ip_unprivileged_port_start, 1024. On a Linux
+# host or in WSL these are the host's, read from this shell, which runs on
+# that host (the engine's socket is local) and shares its network and its
+# /etc/resolv.conf.
+BRIDGE_GW=172.17.0.1 DEFAULT_NS=172.17.0.1 HOSTNET_ADDR=192.168.64. HOSTNET_IF=eth0 HOST_UPS=1024
+if [ "$SYS" != mac ]; then
+  # Docker's 172.17.0.0/16 unless the host already routes it (Kiri in another
+  # engine's container): then the first free subnet (daemon/network.rs).
+  if ip -4 route 2>/dev/null | grep -v ' dev kiri0 ' | grep -q '^172\.17\.'; then
+    BRIDGE_GW=$($D network inspect bridge -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}' 2>/dev/null)
+  fi
+  # The default bridge names the host's resolvers, as the agent reads them
+  # (kiri-init transport.rs host_dns): /etc/resolv.conf's but loopback, else
+  # systemd-resolved's upstreams; a resolver at one of the host's own
+  # addresses (WSL's forwarder) is asked through the agent at 127.0.0.11
+  # (container.rs embedded_dns). Docker on Linux also names the host's.
+  ns() { sed -n 's/^nameserver[[:space:]]*\([0-9.]*\).*/\1/p' "$1" 2>/dev/null | grep -v '^127\.' | head -1; }
+  HOST_NS=$(ns /etc/resolv.conf); [ -n "$HOST_NS" ] || HOST_NS=$(ns /run/systemd/resolve/resolv.conf)
+  if [ -n "$HOST_NS" ] && ip -4 -o addr 2>/dev/null | grep -qF " inet $HOST_NS/"; then DEFAULT_NS=127.0.0.11; elif [ -n "$HOST_NS" ]; then DEFAULT_NS=$HOST_NS; fi
+  # --network host is the host's own network: its address towards the internet.
+  HOSTNET_ADDR="inet $(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p')/" HOSTNET_IF=
+  HOST_UPS=$(cat /proc/sys/net/ipv4/ip_unprivileged_port_start 2>/dev/null)
+fi
+BRIDGE_NET=$(echo "$BRIDGE_GW" | cut -d. -f1-2)
+echo "e2e: $(sys_name "$SYS") (kernel $KVER); terminal: ${NO_TTY:-yes}; buildx: ${NO_BUILDX:-yes}$([ "$SYS" = mac ] && echo "; Finder: ${NO_FINDER:-yes}")"
 # Waits up to 10 s for a URL to answer, as you would for any freshly started server.
 ready() { for _ in $(seq 50); do curl -s -m 1 -o /dev/null "$1" && return 0; sleep 0.2; done; return 1; }
 # Waits until the nginx in container $1 serves (it starts a moment after run -d returns).
@@ -260,11 +351,11 @@ section "stdin and terminals"
 t stdin-pipe "3" bash -c "printf 'a\nb\nc\n' | $D run -i --rm alpine wc -l"
 t stdin-cat "round trip" bash -c "echo 'round trip' | $D run -i --rm alpine cat"
 t stdin-large "1000000" bash -c "head -c 1000000 /dev/zero | $D run -i --rm alpine wc -c"
-t tty-is-pty "/dev/pts/0" bash -c "script -q /dev/null $D run -it --rm alpine tty < /dev/null"
-t tty-term "xterm" bash -c "script -q /dev/null $D run -it --rm alpine sh -c 'echo \$TERM' < /dev/null"
+needs tty t tty-is-pty "/dev/pts/0" bash -c "$PTY $D run -it --rm alpine tty < /dev/null"
+needs tty t tty-term "xterm" bash -c "$PTY $D run -it --rm alpine sh -c 'echo \$TERM' < /dev/null"
 # Type after the shell is up: an interactive shell discards input typed before its first prompt.
-t tty-shell "typed-42" bash -c "(sleep 1; printf 'echo typed-\$((6*7))\nexit\n') | script -q /dev/null $D run -it --rm alpine sh"
-code tty-exit-code 5 bash -c "(sleep 1; printf 'exit 5\n') | script -q /dev/null $D run -it --rm alpine sh"
+needs tty t tty-shell "typed-42" bash -c "(sleep 1; printf 'echo typed-\$((6*7))\nexit\n') | $PTY $D run -it --rm alpine sh"
+needs tty code tty-exit-code 5 bash -c "(sleep 1; printf 'exit 5\n') | $PTY $D run -it --rm alpine sh"
 # The client half-closes right behind its input, and the process must see the end.
 # A Mac can lose that on the daemon's socket, 1 to 5 runs in 100, hence the many
 # runs. The hang is timed here: an alarm does not stop a docker client. Each run
@@ -302,7 +393,7 @@ t exec-user "nginx" $D exec -u nginx web id -un
 t exec-workdir "/etc" $D exec -w /etc web pwd
 t exec-workdir-leaked-fd "started 0" bash -c "s=0; for n in \$(seq 3 25); do $D exec -w /proc/self/fd/\$n web true >/dev/null 2>&1 && s=\$((s+1)); done; echo started \$s"
 t exec-stdin "into exec" bash -c "echo 'into exec' | $D exec -i web cat"
-t exec-tty "/dev/pts" bash -c "script -q /dev/null $D exec -it web tty < /dev/null"
+needs tty t exec-tty "/dev/pts" bash -c "$PTY $D exec -it web tty < /dev/null"
 t exec-sees-pid1 "nginx" $D exec web sh -c 'cat /proc/1/comm'
 # Each container and each exec leads a session of its own, as with runc, so a
 # program that signals its whole process group (Apache prefork's stop does)
@@ -338,7 +429,13 @@ code rm-with-restart-refused 125 $D run --rm --restart always alpine true
 # (the file it wrote on the first run is still there on the second):
 # the layer is sent again, not "layer ... is not unpacked". busybox's single
 # layer is the one with bin/busybox and no alpine-release.
-t start-restores-layer "KEPT AGAIN" bash -c "$D rm -f relayer >/dev/null 2>&1; $D run --name relayer busybox:1.36 sh -c '[ -e /kept ] && echo AGAIN >> /kept || echo KEPT > /kept' && $D run --rm --privileged alpine sh -c 'mkdir -p /m && mount -t ext4 /dev/vda /m && for d in /m/layers/*/; do [ -e \$d/bin/busybox ] && [ ! -e \$d/etc/alpine-release ] && rm -rf \$d \${d%/}.done; done; umount /m' && $D start -a relayer >/dev/null && $D cp relayer:/kept - | tar -xO | tr '\\n' ' '; $D rm -f relayer >/dev/null"
+# The layers are on the VM's disk (/dev/vda); on a Linux host or in WSL, in
+# /var/lib/kiri/layers on the host's, reached through its first process.
+if [ "$SYS" = mac ]; then
+  t start-restores-layer "KEPT AGAIN" bash -c "$D rm -f relayer >/dev/null 2>&1; $D run --name relayer busybox:1.36 sh -c '[ -e /kept ] && echo AGAIN >> /kept || echo KEPT > /kept' && $D run --rm --privileged alpine sh -c 'mkdir -p /m && mount -t ext4 /dev/vda /m && for d in /m/layers/*/; do [ -e \$d/bin/busybox ] && [ ! -e \$d/etc/alpine-release ] && rm -rf \$d \${d%/}.done; done; umount /m' && $D start -a relayer >/dev/null && $D cp relayer:/kept - | tar -xO | tr '\\n' ' '; $D rm -f relayer >/dev/null"
+else
+  t start-restores-layer "KEPT AGAIN" bash -c "$D rm -f relayer >/dev/null 2>&1; $D run --name relayer busybox:1.36 sh -c '[ -e /kept ] && echo AGAIN >> /kept || echo KEPT > /kept' && $D run --rm --privileged --pid host alpine nsenter -t 1 -m -- sh -c 'for d in /var/lib/kiri/layers/*/; do [ -e \$d/bin/busybox ] && [ ! -e \$d/etc/alpine-release ] && rm -rf \$d \${d%/}.done; done; true' && $D start -a relayer >/dev/null && $D cp relayer:/kept - | tar -xO | tr '\\n' ' '; $D rm -f relayer >/dev/null"
+fi
 
 section "engine Stop and Start"
 # Kiri's Stop is the engine's stop, not the user's, as stopping Docker's
@@ -369,14 +466,15 @@ t engine-start-again-brings-back "6" bash -c "for i in \$(seq 100); do n=\$($D p
 $D rm -f ss-us ss-al ss-user ss-no ss-al1 ss-al2 ss-al3 ss-al4 >/dev/null 2>&1
 
 section "networking"
-t default-ip "172.17." $D run --rm alpine sh -c 'ip -4 addr show eth0'
-t default-route "default via 172.17.0.1" $D run --rm alpine ip route
+t default-ip "$BRIDGE_NET." $D run --rm alpine sh -c 'ip -4 addr show eth0'
+t default-route "default via $BRIDGE_GW" $D run --rm alpine ip route
 t lo "127.0.0.1" $D run --rm alpine sh -c 'ip -4 addr show lo'
 t internet-http "Example Domain" $D run --rm alpine wget -qO- http://example.com
 t internet-dns "Address" $D run --rm alpine nslookup example.com
 # The default bridge in the VM names its gateway, not 127.0.0.11: BuildKit
 # drops loopback nameservers from build steps and puts 8.8.8.8 in their place.
-t dns-default-bridge-gateway "nameserver 172.17.0.1" $D run --rm alpine cat /etc/resolv.conf
+# On a Linux host it names the host's resolvers (DEFAULT_NS, at the top).
+t dns-default-bridge-gateway "nameserver $DEFAULT_NS" $D run --rm alpine cat /etc/resolv.conf
 code dns-default-bridge-no-loopback 1 $D run --rm alpine grep -q 127.0.0.11 /etc/resolv.conf
 t internet-https "200" $D run --rm curlimages/curl:latest -s -o /dev/null -w '%{http_code}' https://www.google.com
 # Each container gets the last one's address and MAC: its first download
@@ -390,7 +488,7 @@ code download-while-others-start 1 bash -c "$D logs dl 2>&1 | grep -qE '(^| )[1-
 $D rm -f dl >/dev/null
 t none-net "lo" $D run --rm --network none alpine ip link
 code none-no-internet 1 $D run --rm --network none alpine wget -qO- -T 2 http://example.com
-t host-net "192.168.64." $D run --rm --network host alpine ip -4 addr show eth0
+t host-net "$HOSTNET_ADDR" $D run --rm --network host alpine ip -4 addr show ${HOSTNET_IF:+"$HOSTNET_IF"}
 t hosts-file "localhost" $D run --rm alpine cat /etc/hosts
 t add-host "1.2.3.4" $D run --rm --add-host foo:1.2.3.4 alpine getent hosts foo
 t add-host-override "10.9.8.7" $D run --rm --add-host host.docker.internal:10.9.8.7 alpine getent hosts host.docker.internal
@@ -411,8 +509,13 @@ t dns-alias "PONG" $D run --rm --network appnet redis:7-alpine redis-cli -h data
 t dns-other "Welcome to nginx" $D run --rm --network appnet alpine wget -qO- http://svc
 t dns-upstream "Address" $D run --rm --network appnet alpine nslookup example.com
 t dns-resolvconf "nameserver 127.0.0.11" $D run --rm --network appnet alpine cat /etc/resolv.conf
-# What a kind node's pods are given instead: host.docker.internal's address.
-t dns-via-host-addr "Address" $D run --rm --network appnet alpine nslookup svc 198.19.248.254
+# What a kind node's pods are given instead: host.docker.internal's address
+# (198.19.248.254 in the VM; on a Linux host the network's gateway, #229).
+if [ "$SYS" = mac ]; then
+  t dns-via-host-addr "Address" $D run --rm --network appnet alpine nslookup svc 198.19.248.254
+else
+  t dns-via-host-addr "Address" $D run --rm --network appnet alpine sh -c 'nslookup svc $(getent hosts host.docker.internal | cut -d" " -f1)'
+fi
 t network-members "db" $D network inspect appnet -f '{{range .Containers}}{{.Name}} {{end}}'
 # A start that fails once its network is up leaves no name behind (#325).
 $D run -d --name dnsbad --network appnet --sysctl net.ipv4.kiri_no_such_key=1 alpine sleep 60 >/dev/null 2>&1
@@ -585,13 +688,21 @@ $D rm -f pub pub2 puball pub6 pubx >/dev/null
 code port-closed-after-stop 7 curl -s -m 2 http://localhost:18180
 
 section "host.docker.internal"
-python3 -m http.server 18999 --bind 127.0.0.1 >/dev/null 2>&1 &
+# In the VM, host.docker.internal is relayed to the Mac's 127.0.0.1. On a
+# Linux host it is the bridge's gateway, as Docker's host-gateway: it reaches
+# the host's services on 0.0.0.0 and, by design, not those on 127.0.0.1
+# alone (kiri-init container.rs write_etc_files, net.rs host_uplink).
+if [ "$SYS" = mac ]; then HTTP_BIND=127.0.0.1; else HTTP_BIND=0.0.0.0; fi
+HTTP_DIR=$(mktemp -d)
+python3 -m http.server 18999 --bind $HTTP_BIND --directory "$HTTP_DIR" >/dev/null 2>&1 &
 HTTP_PID=$!
+[ "$SYS" = mac ] || { python3 -m http.server 18998 --bind 127.0.0.1 --directory "$HTTP_DIR" >/dev/null 2>&1 & HTTP_LO_PID=$!; }
 sleep 0.7
 t host-internal "Directory listing" $D run --rm alpine wget -qO- http://host.docker.internal:18999/
 t host-gateway "Directory listing" $D run --rm --add-host mac:host-gateway alpine wget -qO- http://mac:18999/
 t host-internal-hostnet "Directory listing" $D run --rm --network host alpine wget -qO- http://host.docker.internal:18999/
-kill $HTTP_PID
+only linux,wsl t host-internal-not-loopback "Connection refused" $D run --rm alpine wget -qO- -T 3 http://host.docker.internal:18998/
+kill "$HTTP_PID" ${HTTP_LO_PID:+"$HTTP_LO_PID"}; rm -rf "$HTTP_DIR"
 
 section "container domains"
 if [ -z "$FEATURE" ]; then
@@ -652,30 +763,32 @@ fi
 $D rm -f dmv dhold >/dev/null
 
 section "container files in Finder ($KF)"
+# The Mac's own: the engine serves them over NFS and mounts them (daemon/mod.rs, macOS only).
+only mac
 $D run -d --name fsv nginx:alpine >/dev/null; sleep 0.7
-t finder-lists "fsv" ls "$KF"
-t finder-root "docker-entrypoint.sh" ls "$KF/fsv"
-t finder-read "Alpine Linux" cat "$KF/fsv/etc/os-release"
-t finder-hash "match" bash -c "$D exec fsv sh -c 'head -c 3000000 /dev/urandom > /tmp/r.bin'; a=\$($D exec fsv sha256sum /tmp/r.bin | cut -c1-64); b=\$(shasum -a 256 $KFQ/fsv/tmp/r.bin | cut -c1-64); [ \"\$a\" = \"\$b\" ] && echo match"
-t finder-symlink-inside "docker-entrypoint.sh" bash -c "$D exec fsv ln -s / /loop && ls $KFQ/fsv/loop/"
-code finder-readonly 1 bash -c "echo x > $KFQ/fsv/tmp/written"
+needs finder t finder-lists "fsv" ls "$KF"
+needs finder t finder-root "docker-entrypoint.sh" ls "$KF/fsv"
+needs finder t finder-read "Alpine Linux" cat "$KF/fsv/etc/os-release"
+needs finder t finder-hash "match" bash -c "$D exec fsv sh -c 'head -c 3000000 /dev/urandom > /tmp/r.bin'; a=\$($D exec fsv sha256sum /tmp/r.bin | cut -c1-64); b=\$($SHA $KFQ/fsv/tmp/r.bin | cut -c1-64); [ \"\$a\" = \"\$b\" ] && echo match"
+needs finder t finder-symlink-inside "docker-entrypoint.sh" bash -c "$D exec fsv ln -s / /loop && ls $KFQ/fsv/loop/"
+needs finder code finder-readonly 1 bash -c "echo x > $KFQ/fsv/tmp/written"
 t finder-mounted "nfs" bash -c "mount | grep -F \" on $KF \""
 # A file rewritten in place (same path, same size) must never read stale.
-t finder-fresh "match match match" bash -c "for i in 1 2 3; do $D exec fsv sh -c 'head -c 100000 /dev/urandom > /tmp/same.bin'; a=\$($D exec fsv sha256sum /tmp/same.bin | cut -c1-64); b=\$(shasum -a 256 $KFQ/fsv/tmp/same.bin | cut -c1-64); [ \"\$a\" = \"\$b\" ] && printf 'match '; done"
-t finder-new-file "late" bash -c "$D exec fsv sh -c 'echo late > /tmp/late.txt'; cat $KFQ/fsv/tmp/late.txt"
-t finder-deleted "No such file" bash -c "$D exec fsv rm /tmp/late.txt; cat $KFQ/fsv/tmp/late.txt"
-t finder-big "match" bash -c "$D exec fsv sh -c 'head -c 50000000 /dev/urandom > /tmp/big.bin'; a=\$($D exec fsv sha256sum /tmp/big.bin | cut -c1-64); b=\$(shasum -a 256 $KFQ/fsv/tmp/big.bin | cut -c1-64); [ \"\$a\" = \"\$b\" ] && echo match"
-t finder-perms-readable "ok" bash -c "$D exec fsv sh -c 'echo s > /tmp/secret; chmod 600 /tmp/secret'; [ \"\$(cat $KFQ/fsv/tmp/secret)\" = s ] && echo ok"
-code finder-no-mkdir 1 mkdir "$KF/fsv/tmp/newdir"
+needs finder t finder-fresh "match match match" bash -c "for i in 1 2 3; do $D exec fsv sh -c 'head -c 100000 /dev/urandom > /tmp/same.bin'; a=\$($D exec fsv sha256sum /tmp/same.bin | cut -c1-64); b=\$($SHA $KFQ/fsv/tmp/same.bin | cut -c1-64); [ \"\$a\" = \"\$b\" ] && printf 'match '; done"
+needs finder t finder-new-file "late" bash -c "$D exec fsv sh -c 'echo late > /tmp/late.txt'; cat $KFQ/fsv/tmp/late.txt"
+needs finder t finder-deleted "No such file" bash -c "$D exec fsv rm /tmp/late.txt; cat $KFQ/fsv/tmp/late.txt"
+needs finder t finder-big "match" bash -c "$D exec fsv sh -c 'head -c 50000000 /dev/urandom > /tmp/big.bin'; a=\$($D exec fsv sha256sum /tmp/big.bin | cut -c1-64); b=\$($SHA $KFQ/fsv/tmp/big.bin | cut -c1-64); [ \"\$a\" = \"\$b\" ] && echo match"
+needs finder t finder-perms-readable "ok" bash -c "$D exec fsv sh -c 'echo s > /tmp/secret; chmod 600 /tmp/secret'; [ \"\$(cat $KFQ/fsv/tmp/secret)\" = s ] && echo ok"
+needs finder code finder-no-mkdir 1 mkdir "$KF/fsv/tmp/newdir"
 $D rm -f fsv >/dev/null
 # A volume and a bind mount list their own files, not the empty folders
 # under them in the container's layer (#317).
 FSB=$(mktemp -d); echo from-mac > "$FSB/mac.txt"
 $D run -d --name fsm -v kiri-e2e-fsm:/data -v "$FSB":/bind:ro alpine sh -c 'echo hello > /data/hello.txt; sleep 300' >/dev/null; sleep 0.7
-t finder-volume "hello.txt" ls "$KF/fsm/data"
-t finder-bind "from-mac" cat "$KF/fsm/bind/mac.txt"
+needs finder t finder-volume "hello.txt" ls "$KF/fsm/data"
+needs finder t finder-bind "from-mac" cat "$KF/fsm/bind/mac.txt"
 $D rm -f fsm >/dev/null; $D volume rm kiri-e2e-fsm >/dev/null; rm -rf "$FSB"
-t finder-gone "gone" bash -c "ls $KFQ | grep -qx fsv || echo gone"
+needs finder t finder-gone "gone" bash -c "ls $KFQ | grep -qx fsv || echo gone"
 
 section "volumes and bind mounts"
 BIND=$(mktemp -d); echo "from the mac" > "$BIND/hello.txt"
@@ -916,7 +1029,7 @@ t cp-out-file "fromctr" bash -c "$D exec cpc sh -c 'echo fromctr > /etc/motd2' &
 t cp-out-dir "deep" bash -c "$D exec cpc sh -c 'mkdir -p /opt/x/y; echo deep > /opt/x/y/z' && $D cp cpc:/opt/x $CPD/xx && cat $CPD/xx/y/z"
 t cp-out-stdout "alpine-release" bash -c "$D cp cpc:/etc/alpine-release - | tar -t"
 t cp-out-symlink "-> " bash -c "$D exec cpc ln -sf /etc/alpine-release /tmp/rel && $D cp cpc:/tmp/rel - | tar -tv"
-t cp-big "match" bash -c "head -c 30000000 /dev/urandom > $CPD/big && $D cp $CPD/big cpc:/tmp/big && a=\$(shasum -a 256 $CPD/big | cut -c1-64); b=\$($D exec cpc sha256sum /tmp/big | cut -c1-64); [ \$a = \$b ] && echo match"
+t cp-big "match" bash -c "head -c 30000000 /dev/urandom > $CPD/big && $D cp $CPD/big cpc:/tmp/big && a=\$($SHA $CPD/big | cut -c1-64); b=\$($D exec cpc sha256sum /tmp/big | cut -c1-64); [ \$a = \$b ] && echo match"
 code cp-missing 1 $D cp cpc:/nope "$CPD/"
 code cp-into-missing-dir 1 $D cp "$CPD/a.txt" cpc:/nodir/
 $D create --name cpcreated alpine cat /tmp/a.txt >/dev/null
@@ -940,7 +1053,17 @@ section "kernel: netfilter, tc and interfaces"
 # one check: Kiri's guest kernel builds them all in, as it loads no modules.
 KFEAT=$(perl -e 'alarm 180; exec @ARGV' $D run --rm --privileged -v "$(cd "$(dirname "$0")" && pwd)/kernel-features.sh:/k.sh:ro" alpine:3.22 sh /k.sh 2>&1 | tr -d '\r')
 # One check per line; the line itself is what shows when it fails.
+# On a Linux host or in WSL the kernel is the host's, and a feature its
+# kernel lacks (not built, module not loaded: what a container can't load)
+# is the host's, not Kiri's; Docker there would fail it the same way.
+kernel_lacks() { printf '%s' "$1" | grep -qE 'FAIL: .*(Unknown device type|Not supported|not supported|Protocol not available|Could not process rule: No such file or directory|Can.t initialize ipvs|RTNETLINK answers: Operation not supported)'; }
 for name in $(printf '%s\n' "$KFEAT" | grep -E '^[a-z0-9-]+ (ok|FAIL)' | cut -d' ' -f1); do
+  line=$(printf '%s\n' "$KFEAT" | grep -E "^$name (ok|FAIL)" | head -1)
+  if [ "$SYS" != mac ] && kernel_lacks "$line"; then
+    skip_setup "kernel-$name" "the host's kernel lacks it"
+    printf '    %s\n' "$(printf %s "$line" | cut -c1-160)"
+    continue
+  fi
   t "kernel-$name" "$name ok" bash -c 'printf "%s\n" "$1" | grep -E "^$2 (ok|FAIL)"' _ "$KFEAT" "$name"
 done
 printf '%s\n' "$KFEAT" | grep -qE '^[a-z0-9-]+ (ok|FAIL)' || t kernel-features "ok" printf '%s\n' "$KFEAT"
@@ -977,15 +1100,19 @@ BD=$(mktemp -d)
 FA=$KIRI_REG/alpine:latest
 printf 'FROM %s\nRUN echo built > /built\nARG MSG=default\nRUN echo "$MSG" > /msg\nCOPY data.txt /data.txt\nCMD ["cat","/built","/msg","/data.txt"]\n' "$FA" > "$BD/Dockerfile"
 echo "from context" > "$BD/data.txt"
-t build "importing to docker" bash -c "cd $BD && BUILDX_BUILDER=$BX perl -e 'alarm 300; exec @ARGV' $D build --build-arg MSG=hello -t kiri-test/built . 2>&1"
+# Without buildx the CLI's classic builder still makes the image the next
+# two checks run, as before; only BuildKit's own output is skipped.
+[ -n "$NO_BUILDX" ] && (cd "$BD" && perl -e 'alarm 300; exec @ARGV' $D build --build-arg MSG=hello -t kiri-test/built . >/dev/null 2>&1)
+needs buildx t build "importing to docker" bash -c "cd $BD && BUILDX_BUILDER=$BX perl -e 'alarm 300; exec @ARGV' $D build --build-arg MSG=hello -t kiri-test/built . 2>&1"
 t build-runs "from context" $D run --rm kiri-test/built
 t build-arg "hello" $D run --rm kiri-test/built
-t build-cached "CACHED" bash -c "cd $BD && BUILDX_BUILDER=$BX $D build --progress plain --build-arg MSG=hello -t kiri-test/built . 2>&1"
+needs buildx t build-cached "CACHED" bash -c "cd $BD && BUILDX_BUILDER=$BX $D build --progress plain --build-arg MSG=hello -t kiri-test/built . 2>&1"
 t build-network "curl" bash -c "cd $BD && printf 'FROM $FA\nRUN apk add --no-cache curl\n' > Dockerfile.net && BUILDX_BUILDER=$BX perl -e 'alarm 300; exec @ARGV' $D build -f Dockerfile.net -t kiri-test/net . >/dev/null 2>&1 && $D run --rm kiri-test/net curl --version"
-# Build steps keep Kiri's resolver (and with it the Mac's): no 8.8.8.8.
-t build-resolvconf "nameserver 172.17.0.1" bash -c "cd $BD && printf 'FROM $FA\nRUN cat /etc/resolv.conf\n' > Dockerfile.dns && BUILDX_BUILDER=$BX perl -e 'alarm 300; exec @ARGV' $D build --no-cache --progress plain -f Dockerfile.dns . 2>&1"
-code build-no-public-resolver 1 bash -c "cd $BD && BUILDX_BUILDER=$BX perl -e 'alarm 300; exec @ARGV' $D build --no-cache --progress plain -f Dockerfile.dns . 2>&1 | grep -q 'nameserver 8.8.8.8'"
-t build-dns "Address" bash -c "cd $BD && printf 'FROM $FA\nRUN nslookup example.com\n' > Dockerfile.lookup && BUILDX_BUILDER=$BX perl -e 'alarm 300; exec @ARGV' $D build --no-cache --progress plain -f Dockerfile.lookup . 2>&1"
+# Build steps keep Kiri's resolver (and with it the Mac's): no 8.8.8.8. On a
+# Linux host, the default bridge's, the host's resolvers (DEFAULT_NS).
+needs buildx t build-resolvconf "nameserver $DEFAULT_NS" bash -c "cd $BD && printf 'FROM $FA\nRUN cat /etc/resolv.conf\n' > Dockerfile.dns && BUILDX_BUILDER=$BX perl -e 'alarm 300; exec @ARGV' $D build --no-cache --progress plain -f Dockerfile.dns . 2>&1"
+needs buildx code build-no-public-resolver 1 bash -c "cd $BD && BUILDX_BUILDER=$BX perl -e 'alarm 300; exec @ARGV' $D build --no-cache --progress plain -f Dockerfile.dns . 2>&1 | grep -q 'nameserver 8.8.8.8'"
+needs buildx t build-dns "Address" bash -c "cd $BD && printf 'FROM $FA\nRUN nslookup example.com\n' > Dockerfile.lookup && BUILDX_BUILDER=$BX perl -e 'alarm 300; exec @ARGV' $D build --no-cache --progress plain -f Dockerfile.lookup . 2>&1"
 t build-fails "exit code: 3" bash -c "cd $BD && printf 'FROM $FA\nRUN exit 3\n' > Dockerfile.bad && BUILDX_BUILDER=$BX $D build -f Dockerfile.bad . 2>&1"
 $D rmi kiri-test/built kiri-test/net >/dev/null 2>&1; rm -rf "$BD"
 
@@ -1158,19 +1285,29 @@ section "amd64 images (Rosetta)"
 # their plain names, as a --platform run would pull them from Docker Hub.
 kiri_fetch alpine:latest linux/amd64
 kiri_fetch node:22-alpine linux/amd64
-t rosetta-uname "x86_64" $D run --rm --platform linux/amd64 alpine uname -m
-t rosetta-binary "x86-64" bash -c "$D run --rm --platform linux/amd64 alpine sh -c 'apk add -q --no-cache file >/dev/null 2>&1; file /bin/busybox'"
+# On a Mac, Kiri's VM runs them with Rosetta. On a Linux host or in WSL the
+# host's kernel runs them: natively on an amd64 machine, elsewhere only with
+# an emulator registered for them (binfmt_misc, qemu-user-static), as with
+# Docker; without one the kernel answers "exec format error".
+if [ "$SYS" != mac ] && [ "$($D version -f '{{.Server.Arch}}' 2>/dev/null)" != amd64 ] &&
+  $D run --rm --platform linux/amd64 alpine true 2>&1 | grep -q 'exec format error'; then
+  # shellcheck disable=SC2034 # read through `missing`
+  NO_AMD64="no amd64 emulator on this host (binfmt_misc)"
+fi
+needs amd64 t rosetta-uname "x86_64" $D run --rm --platform linux/amd64 alpine uname -m
+needs amd64 t rosetta-binary "x86-64" bash -c "$D run --rm --platform linux/amd64 alpine sh -c 'apk add -q --no-cache file >/dev/null 2>&1; file /bin/busybox'"
 t rosetta-inspect "linux/amd64" $D image inspect -f '{{.Os}}/{{.Architecture}}' alpine
 # A repository with an amd64 image only, run with no --platform: the run's own
 # pull finds no arm64 image and takes the amd64 one.
 AMD64_ONLY=$(kiri_image_remote amd64/alpine:3.22)
-t rosetta-amd64-only-repo "x86_64" $D run --rm "$AMD64_ONLY" uname -m
-t rosetta-node "v22" $D run --rm --platform linux/amd64 node:22-alpine node --version
+needs amd64 t rosetta-amd64-only-repo "x86_64" $D run --rm "$AMD64_ONLY" uname -m
+needs amd64 t rosetta-node "v22" $D run --rm --platform linux/amd64 node:22-alpine node --version
 # Rosetta on macOS 15 stops on startup entries it doesn't know ("unhandled
 # auxillary vector type 29", #199): the kernel gives AT_HWCAP3 (29) only when
 # it says something, which it never does in Kiri's VM. alpine is the amd64
-# image here, so on Apple silicon this reads what Rosetta was handed.
-t rosetta-no-auxv-29 "no type 29" $D run --rm alpine sh -c 'od -An -v -tu8 -w16 /proc/self/auxv | awk "\$1 == 29 { n++ } END { print n ? \"type 29 given\" : \"no type 29\" }"'
+# image here, so on Apple silicon this reads what Rosetta was handed. On a
+# Linux host the kernel is the host's, not Kiri's.
+only mac t rosetta-no-auxv-29 "no type 29" $D run --rm alpine sh -c 'od -An -v -tu8 -w16 /proc/self/auxv | awk "\$1 == 29 { n++ } END { print n ? \"type 29 given\" : \"no type 29\" }"'
 # Back to the engine's own architecture for the rest (an Intel Mac's is amd64).
 ARCH=$($D version -f '{{.Server.Arch}}' 2>/dev/null)
 t native-again "$([ "$ARCH" = amd64 ] && echo x86_64 || echo aarch64)" bash -c ". '$IMAGES_SH'; kiri_fetch alpine:latest linux/$ARCH && kiri_fetch node:22-alpine linux/$ARCH && $D run --rm alpine uname -m"
@@ -1178,12 +1315,13 @@ $D rmi "$AMD64_ONLY" >/dev/null 2>&1
 
 section "security: seccomp, capabilities, read-only"
 # Docker's two defaults in a container's own network: any port and ping
-# without root. --sysctl wins; host networking keeps the VM's own.
+# without root. --sysctl wins; host networking keeps the VM's own (the
+# host's own on a Linux host: HOST_UPS, at the top).
 t unpriv-port-start "0" $D run --rm alpine cat /proc/sys/net/ipv4/ip_unprivileged_port_start
 t unpriv-ping-range "0	2147483647" $D run --rm alpine cat /proc/sys/net/ipv4/ping_group_range
 t unpriv-listen-80 "listening" $D run --rm -u 1000 alpine sh -c 'nc -lk -p 80 >/dev/null 2>&1 & sleep 0.5; netstat -ltn | grep -q ":80 " && echo listening'
 t unpriv-sysctl-wins "1024" $D run --rm --sysctl net.ipv4.ip_unprivileged_port_start=1024 alpine cat /proc/sys/net/ipv4/ip_unprivileged_port_start
-t unpriv-port-host-net "1024" $D run --rm --network host alpine cat /proc/sys/net/ipv4/ip_unprivileged_port_start
+t unpriv-port-host-net "$HOST_UPS" $D run --rm --network host alpine cat /proc/sys/net/ipv4/ip_unprivileged_port_start
 t seccomp-on "Seccomp:	2" $D run --rm alpine grep Seccomp: /proc/self/status
 t seccomp-userns "not permitted" $D run --rm alpine unshare -U true
 t seccomp-keyctl "not permitted" bash -c "$D run --rm alpine sh -c 'apk add -q keyutils >/dev/null 2>&1; keyctl show 2>&1'"
@@ -1283,11 +1421,15 @@ MACHINE_IMG=$KIRI_REG/alpine:3.22
 t machine-create "is running" "$KIRI" machine create e2e-m --image "$MACHINE_IMG"
 t machine-list "e2e-m" "$KIRI" machine list
 t machine-user "$(whoami) $(id -u)" bash -c "$KQ machine shell e2e-m -- sh -c 'echo \$(whoami) \$(id -u)' < /dev/null"
-# Machines see the Mac's home folder, not /private/tmp, so these use a folder under it.
-MD=$(mktemp -d "$HOME/.kiri-e2e-machine.XXXXXX"); touch "$MD/kiri-e2e-marker"
-t machine-mac-files "kiri-e2e-marker" bash -c "$KQ machine shell e2e-m -- ls $MD < /dev/null"
-t machine-cwd "$MD" bash -c "cd $MD && $KQ machine shell e2e-m -- pwd < /dev/null"
-rm -rf "$MD"
+# Machines see the homes folder (/Users on a Mac, /home on Linux: machine.rs
+# HOMES), not /private/tmp, so these use a folder under it: under $HOME, or
+# under /home itself for root, whose home (/root) is not shared.
+case $SYS:$HOME in mac:/Users/* | linux:/home/* | wsl:/home/*) MD=$(mktemp -d "$HOME/.kiri-e2e-machine.XXXXXX") ;; mac:*) MD= ;; *) MD=$(mktemp -d /home/.kiri-e2e-machine.XXXXXX 2>/dev/null) ;; esac
+# shellcheck disable=SC2034 # read through `missing`
+[ -n "$MD" ] && touch "$MD/kiri-e2e-marker" || NO_HOMES_DIR="no folder of this user's under the homes folder machines share"
+needs homes-dir t machine-mac-files "kiri-e2e-marker" bash -c "$KQ machine shell e2e-m -- ls $MD < /dev/null"
+needs homes-dir t machine-cwd "$MD" bash -c "cd $MD && $KQ machine shell e2e-m -- pwd < /dev/null"
+[ -n "$MD" ] && rm -rf "$MD"
 t machine-hostname "e2e-m" bash -c "$KQ machine shell e2e-m -- hostname < /dev/null"
 t machine-sudo "root" bash -c "for i in \$(seq 30); do out=\$($KQ machine shell e2e-m -- sudo -n whoami < /dev/null 2>/dev/null); [ \"\$out\" = root ] && break; sleep 1; done; echo \$out"
 t machine-stop "Exited" bash -c "$KQ machine stop e2e-m && $KQ machine list"
@@ -1299,7 +1441,7 @@ t machine-delete "deleted" "$KIRI" machine delete e2e-m
 $D rmi "$MACHINE_IMG" >/dev/null 2>&1
 code machine-bad-name 1 "$KIRI" machine create 'bad_name!'
 else
-  for n in $MACHINE_TESTS; do skip "$n" "no kiri CLI found: set KIRI=/path/to/kiri"; done
+  for n in $MACHINE_TESTS; do skip_setup "$n" "no kiri CLI found: set KIRI=/path/to/kiri"; done
 fi
 t stop-signal "got USR1" bash -c "$D run -d --name sig --stop-signal USR1 alpine sh -c 'trap \"echo got USR1; exit 0\" USR1; while :; do sleep 0.1; done' >/dev/null; sleep 0.5; $D stop -t 5 sig >/dev/null; $D logs sig; $D rm -f sig >/dev/null"
 t stop-signal-inspect "exited (0)" bash -c "$D run -d --name sig2 --stop-signal SIGRTMIN+3 alpine sh -c 'trap \"exit 0\" 37; while :; do sleep 0.1; done' >/dev/null; sleep 0.5; $D stop -t 5 sig2 >/dev/null; $D ps -a --filter name=sig2 --format '{{.Status}}' | tr A-Z a-z | cut -c1-10; $D rm -f sig2 >/dev/null"
@@ -1401,5 +1543,7 @@ if [ -n "$HUB_LEFT0" ] && [ -n "$HUB_LEFT1" ]; then
   else echo "$HUB_MSG: $((HUB_LEFT0 - HUB_LEFT1))"; fi
 fi
 printf '\n%d passed, %d failed, %d skipped\n' "$PASS" "$FAIL" "$SKIP"
+# Skips by reason, so they show and can't quietly grow.
+[ "$SKIP" -gt 0 ] && echo "skipped: $(printf '%s\n' "${SKIP_WHY[@]}" | sort | uniq -c | sort -rn | sed 's/^ *\([0-9]*\) /\1 /' | paste -sd, - | sed 's/,/, /g')"
 for f in "${FAILED[@]+"${FAILED[@]}"}"; do echo "  failed: $f"; done
 [ "$FAIL" -eq 0 ]

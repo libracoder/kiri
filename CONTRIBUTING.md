@@ -34,6 +34,17 @@ once; see the README.
 
 `tests/e2e.sh` only removes containers, networks and volumes it created.
 
+`tests/e2e.sh` runs on macOS, on a Linux host and in WSL 2, and asks the
+engine which one it is talking to. A check for a feature another system has
+alone (Finder, Rosetta) is marked `only mac` and skipped elsewhere; one that
+needs something the setup may lack (a terminal, buildx, Finder access from
+this session, an amd64 emulator, a kernel module on a Linux host) is marked
+`needs ...` and skipped while it is missing. Where the right answer differs
+by system (the default bridge's nameserver, `--network host`'s address), the
+check expects each system's. The summary counts the skips by reason. Set
+`KIRI_TEST_STRICT=1` for a run that should have everything: what the setup
+lacks then fails instead of being skipped.
+
 The test suites never pull from Docker Hub, which allows only 100 anonymous
 pulls an hour for a whole network. Each image they run comes from
 `KIRI_TEST_REGISTRY` (default `public.ecr.aws/docker/library`, the same
