@@ -1697,17 +1697,26 @@ fn volumes(req: &Request, engine: &Engine) -> Result<Value, Error> {
     Ok(json!({"Volumes": list, "Warnings": []}))
 }
 
-/// The TCP ports an image declares (EXPOSE) plus `--expose`.
-fn exposed_ports(body: &Value, engine: &Engine, image: &kiri_image::Image) -> Vec<u16> {
-    let mut keys: Vec<String> = body["ExposedPorts"].as_object().map(|m| m.keys().cloned().collect()).unwrap_or_default();
-    if let Ok(bytes) = engine.store.read_config(&image.config_digest) {
-        if let Ok(cfg) = serde_json::from_slice::<Value>(&bytes) {
-            if let Some(m) = cfg["config"]["ExposedPorts"].as_object() {
-                keys.extend(m.keys().cloned());
+/// The image's and create request's ExposedPorts keys; a bare port means TCP.
+fn exposed_ports(body: &Value, image_cfg: &Value) -> Vec<String> {
+    let mut ports = Vec::new();
+    for map in [
+        body["ExposedPorts"].as_object(),
+        image_cfg["config"]["ExposedPorts"].as_object(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        for key in map.keys() {
+            let (port, proto) = key.split_once('/').unwrap_or((key, "tcp"));
+            let Ok(port) = port.parse::<u16>() else {
+                continue;
+            };
+            if !proto.is_empty() && !proto.contains('/') {
+                ports.push(format!("{port}/{proto}"));
             }
         }
     }
-    let mut ports: Vec<u16> = keys.iter().filter(|k| k.ends_with("/tcp") || !k.contains('/')).filter_map(|k| k.split('/').next()?.parse().ok()).collect();
     ports.sort_unstable();
     ports.dedup();
     ports
@@ -1741,13 +1750,13 @@ fn inspect_bindings(ports: &[super::ports::Binding]) -> Value {
 /// Config.ExposedPorts: the image's and `--expose`'s ports, and every
 /// published one, as Docker lists them (`"80/tcp": {}`); null with none,
 /// as Docker leaves it out.
-fn inspect_exposed(ports: &[super::ports::Binding], exposed: &[u16]) -> Value {
+fn inspect_exposed(ports: &[super::ports::Binding], exposed: &[String]) -> Value {
     let mut m = serde_json::Map::new();
     for b in ports {
         m.insert(format!("{}/{}", b.container_port, b.proto), json!({}));
     }
-    for p in exposed {
-        m.entry(format!("{p}/tcp")).or_insert_with(|| json!({}));
+    for key in exposed {
+        m.entry(key.clone()).or_insert_with(|| json!({}));
     }
     if m.is_empty() { Value::Null } else { Value::Object(m) }
 }
@@ -1766,7 +1775,7 @@ fn ports_map(c: &Container) -> Value {
 /// given) every exposed or `-p` port that has none as a key with a null value
 /// (`"80/tcp": null`), as Docker shows them. Traefik's docker provider picks
 /// a container's port from these keys alone.
-fn ports_map_of(bound: &[(super::ports::Binding, String, u16)], exposed: Option<(&[super::ports::Binding], &[u16])>) -> Value {
+fn ports_map_of(bound: &[(super::ports::Binding, String, u16)], exposed: Option<(&[super::ports::Binding], &[String])>) -> Value {
     let mut m = serde_json::Map::new();
     for (b, ip, port) in bound {
         let key = format!("{}/{}", b.container_port, b.proto);
@@ -1779,8 +1788,8 @@ fn ports_map_of(bound: &[(super::ports::Binding, String, u16)], exposed: Option<
         for b in asked {
             m.entry(format!("{}/{}", b.container_port, b.proto)).or_insert(Value::Null);
         }
-        for p in exposed {
-            m.entry(format!("{p}/tcp")).or_insert(Value::Null);
+        for key in exposed {
+            m.entry(key.clone()).or_insert(Value::Null);
         }
     }
     Value::Object(m)
@@ -2154,7 +2163,7 @@ pub(super) fn create(req: &Request, engine: &Engine) -> Result<Value, Error> {
         aliases,
         extra_hosts,
         ports,
-        exposed: exposed_ports(&body, engine, &image),
+        exposed: exposed_ports(&body, &image_cfg),
         host_opts,
         volumes_from: strings(&host["VolumesFrom"]).unwrap_or_default(),
         pid_mode,
@@ -4282,6 +4291,97 @@ mod network_option_tests {
     }
 
     #[test]
+    fn inspect_keeps_exposed_protocols_from_the_image_and_create() {
+        let dir = std::env::temp_dir().join(format!("kiri-exposed-{}", std::process::id()));
+        let engine = super::super::engine::boot_without_vm(&dir);
+        let cfg = json!({"architecture": "arm64", "os": "linux", "config": {"Cmd": ["true"], "ExposedPorts": {"53/udp": {}}}});
+        let mut w = engine.store.ingest().unwrap();
+        io::Write::write_all(&mut w, &serde_json::to_vec(&cfg).unwrap()).unwrap();
+        let (digest, _) = w.finish().unwrap();
+        engine
+            .store
+            .put_image(kiri_image::archive::from_config(
+                "demo:dns".into(),
+                &digest,
+                &cfg,
+                Vec::new(),
+            ))
+            .unwrap();
+
+        let udp = json!({"53/udp": [{"HostIp": "127.0.0.1", "HostPort": "5353"}]});
+        for bindings in [json!({}), udp.clone()] {
+            let body = json!({"Image": "demo:dns", "ExposedPorts": {"53": {}, "5353/udp": {}}, "HostConfig": {"PortBindings": bindings}});
+            let created = create(
+                &Request::internal(
+                    "POST",
+                    "/containers/create",
+                    &[],
+                    serde_json::to_vec(&body).unwrap(),
+                ),
+                &engine,
+            )
+            .unwrap();
+            let id = created["Id"].as_str().unwrap();
+            let inspected = container_inspect(&engine, id).unwrap();
+            assert_eq!(
+                inspected["Config"]["ExposedPorts"],
+                json!({"53/tcp": {}, "53/udp": {}, "5353/udp": {}})
+            );
+            assert_eq!(inspected["HostConfig"]["PortBindings"], bindings);
+            engine
+                .with(id, |c| {
+                    let bound: Vec<_> = c
+                        .spec
+                        .ports
+                        .iter()
+                        .map(|b| (b.clone(), b.host_ip.clone(), b.host_port))
+                        .collect();
+                    assert_eq!(
+                        ports_map_of(&bound, Some((&c.spec.ports, &c.spec.exposed))),
+                        json!({"53/tcp": null, "53/udp": bindings["53/udp"], "5353/udp": null})
+                    );
+                })
+                .unwrap();
+        }
+        drop(engine);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn exposed_ports_in_old_and_new_specs_round_trip() {
+        let mut record = json!({
+            "image": "demo:dns", "image_id": "sha256:0123", "entrypoint": [], "cmd": ["true"], "env": [],
+            "cwd": "/", "user": "", "auto_remove": false, "network_mode": "bridge", "labels": {}, "exposed": [53]
+        });
+        let old: Spec = serde_json::from_value(record.clone()).unwrap();
+        assert_eq!(
+            inspect_exposed(&old.ports, &old.exposed),
+            json!({"53/tcp": {}})
+        );
+        assert_eq!(
+            ports_map_of(&[], Some((&old.ports, &old.exposed))),
+            json!({"53/tcp": null})
+        );
+        assert_eq!(
+            serde_json::to_value(&old).unwrap()["exposed"],
+            json!(["53/tcp"])
+        );
+
+        record["exposed"] = json!(["53/tcp", "53/udp"]);
+        let new: Spec = serde_json::from_value(record.clone()).unwrap();
+        let saved = serde_json::to_vec(&new).unwrap();
+        let loaded: Spec = serde_json::from_slice(&saved).unwrap();
+        assert_eq!(
+            serde_json::to_value(&loaded).unwrap()["exposed"],
+            record["exposed"]
+        );
+        assert_eq!(
+            inspect_exposed(&loaded.ports, &loaded.exposed),
+            json!({"53/tcp": {}, "53/udp": {}})
+        );
+    }
+
+    #[test]
     fn container_network_mode_refuses_what_docker_refuses() {
         assert!(container_mode_allowed(&json!({"HostConfig": {"NetworkMode": "container:web"}}), "web").is_ok());
         // inspect reports the bindings asked for, as Docker does.
@@ -4290,13 +4390,13 @@ mod network_option_tests {
         assert_eq!(inspect_bindings(&ports), json!({"80/tcp": [{"HostIp": "", "HostPort": "8080"}, {"HostIp": "127.0.0.1", "HostPort": ""}], "53/udp": [{"HostIp": "", "HostPort": "5353"}]}));
         assert_eq!(inspect_bindings(&[]), json!({}));
         assert_eq!(inspect_exposed(&[], &[]), Value::Null);
-        assert_eq!(inspect_exposed(&ports, &[80, 9000]), json!({"80/tcp": {}, "53/udp": {}, "9000/tcp": {}}));
+        assert_eq!(inspect_exposed(&ports, &["80/tcp".into(), "9000/tcp".into()]), json!({"80/tcp": {}, "53/udp": {}, "9000/tcp": {}}));
         // NetworkSettings.Ports: published ports with their addresses, exposed
         // ones without as null keys (#492); none at all while not running.
         let bound = [(b(80, "tcp", "", 8080), "0.0.0.0".to_string(), 8080)];
-        assert_eq!(ports_map_of(&[], Some((&[], &[80]))), json!({"80/tcp": null}));
+        assert_eq!(ports_map_of(&[], Some((&[], &["80/tcp".into()]))), json!({"80/tcp": null}));
         assert_eq!(
-            ports_map_of(&bound, Some((&ports, &[80, 9000]))),
+            ports_map_of(&bound, Some((&ports, &["80/tcp".into(), "9000/tcp".into()]))),
             json!({"80/tcp": [{"HostIp": "0.0.0.0", "HostPort": "8080"}], "53/udp": null, "9000/tcp": null})
         );
         assert_eq!(ports_map_of(&[], None), json!({}));
