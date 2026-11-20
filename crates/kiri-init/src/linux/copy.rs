@@ -353,7 +353,7 @@ fn copy_out(conn: &mut fs::File, spec: &CopySpec<'_>) -> io::Result<()> {
     let meta = fs::symlink_metadata(path)
         .map_err(|_| io::Error::new(io::ErrorKind::NotFound, format!("notfound: Could not find the file {} in container {}", spec.path, spec.id)))?;
     let link = if meta.file_type().is_symlink() { fs::read_link(path)?.to_string_lossy().into_owned() } else { String::new() };
-    let name = path.file_name().map_or_else(|| "/".to_owned(), |n| n.to_string_lossy().into_owned());
+    let name = entry_name(spec.path);
     let entry = FsEntry {
         name: &name,
         mode: meta.mode(),
@@ -382,6 +382,16 @@ fn copy_out(conn: &mut fs::File, spec: &CopySpec<'_>) -> io::Result<()> {
         b.finish()?;
     }
     w.flush()
+}
+
+/// The name a copied path's archive starts from. A path ending in `/.` is
+/// named `.`, as in Docker, so `docker cp c:/dir/. dst` copies the contents;
+/// `Path::file_name` would drop the `.` and name it after the folder.
+fn entry_name(path: &str) -> String {
+    if path == "." || path.ends_with("/.") {
+        return ".".to_owned();
+    }
+    std::path::Path::new(path).file_name().map_or_else(|| "/".to_owned(), |n| n.to_string_lossy().into_owned())
 }
 
 /// Like `append_dir_all`, but sockets (which tar cannot hold) are skipped,
@@ -628,6 +638,17 @@ mod tests {
         Chunks::new(&mut conn).read_to_end(&mut got).unwrap();
         assert_eq!(got, b"abcde");
         assert_eq!(conn, b"after");
+    }
+
+    #[test]
+    fn a_path_ending_in_dot_is_named_dot_so_its_contents_are_copied() {
+        assert_eq!(entry_name("/out/."), ".");
+        assert_eq!(entry_name("/."), ".");
+        assert_eq!(entry_name("."), ".");
+        assert_eq!(entry_name("/out"), "out");
+        assert_eq!(entry_name("/out/"), "out");
+        assert_eq!(entry_name("/out/a.txt"), "a.txt");
+        assert_eq!(entry_name("/"), "/");
     }
 
     #[test]
