@@ -58,8 +58,18 @@ t() {
   gate "$1" || return 0
   local name=$1 want=$2
   shift 2
-  local got
-  got=$(perl -e 'alarm 60; exec @ARGV' "$@" 2>&1 | tr -d '\r')
+  local got try
+  # A registry that answers "too many requests" (429) is not the engine
+  # failing: such a check is run again, twice at most, a little later. One
+  # that still fails then is reported as any other.
+  for try in 1 2 3; do
+    got=$(perl -e 'alarm 60; exec @ARGV' "$@" 2>&1 | tr -d '\r')
+    [[ "$got" == *"$want"* ]] && break
+    [[ $try -lt 3 && "$got" =~ (HTTP\ 429|TOO_MANY_REQUEST|TOOMANYREQUESTS|toomanyrequests|Rate\ exceeded) ]] || break
+    RETRIED=$((${RETRIED:-0} + 1))
+    printf '  again %s (the registry answered 429)\n' "$name"
+    sleep $((try * 10))
+  done
   if [[ "$got" == *"$want"* ]]; then
     PASS=$((PASS + 1))
   else
@@ -1079,8 +1089,25 @@ KFEAT=$(perl -e 'alarm 180; exec @ARGV' $D run --rm --privileged -v "$(cd "$(dir
 # kernel lacks (not built, module not loaded: what a container can't load)
 # is the host's, not Kiri's; Docker there would fail it the same way.
 kernel_lacks() { printf '%s' "$1" | grep -qE 'FAIL: .*(Unknown device type|Not supported|not supported|Protocol not available|Could not process rule: No such file or directory|Can.t initialize ipvs|RTNETLINK answers: Operation not supported)'; }
+# Microsoft's WSL kernel is built without a few of them, as its own
+# /proc/config.gz says ("# CONFIG_X is not set"): no setup can add those, so
+# they are skipped as not there by design, also under KIRI_TEST_STRICT=1. One
+# that is only a module not loaded stays a setup matter.
+wsl_kernel_without() {
+  local opt
+  case $1 in
+    nft-socket) opt=NFT_SOCKET ;; nft-synproxy) opt=NFT_SYNPROXY ;; nft-osf) opt=NFT_OSF ;;
+    nft-bridge) opt=NF_TABLES_BRIDGE ;; nft-flowtable) opt=NF_FLOW_TABLE ;; *) return 1 ;;
+  esac
+  zcat /proc/config.gz 2>/dev/null | grep -qx "# CONFIG_$opt is not set"
+}
 for name in $(printf '%s\n' "$KFEAT" | grep -E '^[a-z0-9-]+ (ok|FAIL)' | cut -d' ' -f1); do
   line=$(printf '%s\n' "$KFEAT" | grep -E "^$name (ok|FAIL)" | head -1)
+  if [ "$SYS" = wsl ] && kernel_lacks "$line" && wsl_kernel_without "$name"; then
+    skip "kernel-$name" "WSL's kernel is built without it"
+    printf '    %s\n' "$(printf %s "$line" | cut -c1-160)"
+    continue
+  fi
   if [ "$SYS" != mac ] && kernel_lacks "$line"; then
     skip_setup "kernel-$name" "the host's kernel lacks it"
     printf '    %s\n' "$(printf %s "$line" | cut -c1-160)"
