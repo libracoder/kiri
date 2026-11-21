@@ -4,6 +4,9 @@
 /guest/out/
 .wrangler/
 
+# Nix
+result/
+
 # Built binaries and downloaded installers: never in the repo. The Windows
 # bundle (cargo xtask windows) lands under /target and is shared from there.
 *.exe
