@@ -372,8 +372,10 @@ fn copy_out(conn: &mut fs::File, spec: &CopySpec<'_>) -> io::Result<()> {
     {
         let mut b = tar::Builder::new(&mut w);
         b.follow_symlinks(false);
-        // The root itself archives as its contents under ".".
-        let top = if name == "/" { "." } else { name.as_str() };
+        // The root itself archives as its contents under "." — and so does
+        // `/dir/.`, Docker's copy-the-contents form: `Path::file_name`
+        // skips the `.`, which would name the folder itself (#617).
+        let top = if name == "/" || spec.path.ends_with("/.") { "." } else { name.as_str() };
         if meta.is_dir() {
             append_tree(&mut b, path, std::path::Path::new(top))?;
         } else {
