@@ -70,6 +70,85 @@ pub fn check_device_requests(host: &Value) -> Result<(), String> {
     ))
 }
 
+/// Settings that change what a container is, which Kiri can't give, with
+/// the values that are what it does anyway: every container has its own
+/// PID, UTS, IPC and cgroup namespace, no user namespace, one runtime.
+const REFUSED: [(&str, &str, &[&str]); 7] = [
+    ("PidMode", "--pid", &[]),
+    ("IpcMode", "--ipc", &["private", "shareable"]),
+    ("UTSMode", "--uts", &[]),
+    ("UsernsMode", "--userns", &["host"]),
+    ("CgroupnsMode", "--cgroupns", &["private"]),
+    // runc: what a Compose file pinning Docker's default runtime means.
+    ("Runtime", "--runtime", &["kiri", "runc"]),
+    ("Isolation", "--isolation", &["default"]),
+];
+
+/// Resource tuning Kiri doesn't apply. Dropped with a warning, as Docker
+/// drops one its kernel can't apply: a hard error would break Compose files
+/// that run elsewhere, and buildx sets CgroupParent on every builder.
+const DISCARDED: [(&str, &str); 16] = [
+    ("MemoryReservation", "--memory-reservation"),
+    ("MemorySwap", "--memory-swap"),
+    ("MemorySwappiness", "--memory-swappiness"),
+    ("OomKillDisable", "--oom-kill-disable"),
+    ("OomScoreAdj", "--oom-score-adj"),
+    ("CpusetCpus", "--cpuset-cpus"),
+    ("CpusetMems", "--cpuset-mems"),
+    ("CpuRealtimePeriod", "--cpu-rt-period"),
+    ("CpuRealtimeRuntime", "--cpu-rt-runtime"),
+    ("BlkioWeight", "--blkio-weight"),
+    ("BlkioWeightDevice", "--blkio-weight-device"),
+    ("BlkioDeviceReadBps", "--device-read-bps"),
+    ("BlkioDeviceWriteBps", "--device-write-bps"),
+    ("BlkioDeviceReadIOps", "--device-read-iops"),
+    ("BlkioDeviceWriteIOps", "--device-write-iops"),
+    ("CgroupParent", "--cgroup-parent"),
+];
+
+/// Whether a client set `v`: clients send zero values for what they didn't.
+fn given(v: &Value) -> bool {
+    match v {
+        Value::Null | Value::Bool(false) => false,
+        Value::Bool(true) => true,
+        Value::Number(n) => n.as_i64() != Some(0),
+        Value::String(s) => !s.is_empty(),
+        Value::Array(a) => !a.is_empty(),
+        Value::Object(o) => !o.is_empty(),
+    }
+}
+
+/// HostConfig settings Kiri would otherwise accept and ignore: an error for
+/// the first one that changes what runs, else a warning for each resource
+/// setting dropped and for a log driver that ships logs (the CLI prints them).
+pub fn check_unsupported(host: &Value) -> Result<Vec<String>, String> {
+    for (key, flag, same) in REFUSED {
+        if let Some(v) = host[key].as_str().filter(|v| !v.is_empty() && !same.contains(v)) {
+            return Err(format!("Kiri does not support {flag}={v}"));
+        }
+    }
+    if given(&host["VolumesFrom"]) {
+        return Err("Kiri does not support --volumes-from (Compose volumes_from) yet; mount the volumes by name instead".into());
+    }
+    if given(&host["StorageOpt"]) {
+        return Err("Kiri does not support --storage-opt".into());
+    }
+    let mut warnings = Vec::new();
+    for (key, flag) in DISCARDED {
+        let v = &host[key];
+        // -1: unlimited swap, the kernel's own swappiness; Kiri's anyway.
+        let default = matches!(key, "MemorySwap" | "MemorySwappiness") && v.as_i64() == Some(-1);
+        if given(v) && !default {
+            warnings.push(format!("Kiri does not support {flag}; it was ignored"));
+        }
+    }
+    // logfile.rs keeps every driver's lines as json-file does; none go on.
+    if let Some(t) = host["LogConfig"]["Type"].as_str().filter(|t| !["", "json-file", "local", "none"].contains(t)) {
+        warnings.push(format!("Kiri does not support the {t} log driver; logs are kept locally and not sent anywhere"));
+    }
+    Ok(warnings)
+}
+
 /// The guest's lines for `opts` (from [`from_host`]), or Docker's error for
 /// the first bad setting. `net_host`: the container shares the host's (the
 /// VM's) network namespace, so `net.*` sysctls are not its own.
@@ -219,6 +298,39 @@ mod tests {
         );
         // -1 soft under a finite hard is above it.
         assert!(guest_lines(&json!({"Ulimits": [{"Name": "core", "Soft": -1, "Hard": 5}]}), false).is_err());
+    }
+
+    #[test]
+    fn unsupported_settings() {
+        // What the docker CLI sends when none of them is set.
+        let unset = json!({
+            "PidMode": "", "IpcMode": "", "UTSMode": "", "UsernsMode": "", "CgroupnsMode": "", "Runtime": "", "Isolation": "",
+            "VolumesFrom": null, "StorageOpt": {}, "CgroupParent": "", "MemoryReservation": 0, "MemorySwap": 0,
+            "MemorySwappiness": null, "OomKillDisable": false, "OomScoreAdj": 0, "CpusetCpus": "", "BlkioWeight": 0, "BlkioDeviceReadBps": [],
+            "LogConfig": {"Type": "", "Config": {}}
+        });
+        assert_eq!(check_unsupported(&unset).unwrap(), Vec::<String>::new());
+        // What Kiri does anyway.
+        let same = json!({"IpcMode": "shareable", "UsernsMode": "host", "CgroupnsMode": "private", "Runtime": "runc", "Isolation": "default", "MemorySwap": -1, "MemorySwappiness": -1});
+        assert_eq!(check_unsupported(&same).unwrap(), Vec::<String>::new());
+
+        assert_eq!(check_unsupported(&json!({"PidMode": "host"})).unwrap_err(), "Kiri does not support --pid=host");
+        assert_eq!(check_unsupported(&json!({"IpcMode": "container:db"})).unwrap_err(), "Kiri does not support --ipc=container:db");
+        assert_eq!(check_unsupported(&json!({"Runtime": "nvidia"})).unwrap_err(), "Kiri does not support --runtime=nvidia");
+        assert!(check_unsupported(&json!({"VolumesFrom": ["data:ro"]})).unwrap_err().contains("--volumes-from"));
+        assert!(check_unsupported(&json!({"StorageOpt": {"size": "10G"}})).unwrap_err().contains("--storage-opt"));
+
+        // buildx's docker-container driver, against an engine on cgroupfs.
+        let w = check_unsupported(&json!({"CgroupParent": "/docker/buildx", "OomScoreAdj": -1, "MemorySwap": 1 << 30})).unwrap();
+        let flags: Vec<&str> = w.iter().map(|m| m.trim_start_matches("Kiri does not support ").trim_end_matches("; it was ignored")).collect();
+        assert_eq!(flags, ["--memory-swap", "--oom-score-adj", "--cgroup-parent"]);
+
+        // Kept locally whatever the driver; only a shipping one is worth saying.
+        assert_eq!(check_unsupported(&json!({"LogConfig": {"Type": "local"}})).unwrap(), Vec::<String>::new());
+        assert_eq!(
+            check_unsupported(&json!({"LogConfig": {"Type": "fluentd"}})).unwrap(),
+            ["Kiri does not support the fluentd log driver; logs are kept locally and not sent anywhere"]
+        );
     }
 
     #[test]

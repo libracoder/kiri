@@ -2182,12 +2182,15 @@ pub(super) fn create(req: &Request, engine: &Engine) -> Result<Value, Error> {
         }
         extra_hosts.push(format!("{ip}\t{name}"));
     }
-    let warnings: Vec<&str> = Vec::new();
     // --ulimit, --sysctl, --device, --device-cgroup-rule, --group-add:
     // refused now with Docker's error rather than at start.
     let host_opts = super::hostopts::from_host(host);
     super::hostopts::guest_lines(&host_opts, network_mode == "host").map_err(Error::BadRequest)?;
     super::hostopts::check_device_requests(host).map_err(Error::BadRequest)?;
+    // --pid, --volumes-from and the like refused; resource tuning Kiri
+    // doesn't apply dropped with a warning. Before mounts, which may
+    // create volumes.
+    let warnings = super::hostopts::check_unsupported(host).map_err(Error::BadRequest)?;
     if let Some(s) = body["StopSignal"].as_str().filter(|s| !s.is_empty()) {
         parse_signal(s)?;
     }
