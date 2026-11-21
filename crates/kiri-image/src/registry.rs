@@ -254,11 +254,15 @@ const IDLE: Duration = Duration::from_secs(90);
 /// The process's one agent, so its connection pool outlives a pull. It is
 /// built again only when the proxy settings change.
 fn shared_agent() -> ureq::Agent {
-    static AGENT: Mutex<Option<(ProxyChoice, ureq::Agent)>> = Mutex::new(None);
+    static AGENT: Mutex<Option<(ProxyChoice, u64, ureq::Agent)>> = Mutex::new(None);
     let chosen = PROXY_SOURCE.get().and_then(|f| f());
+    // A host's roots arriving (kiri-win, from the Windows store) builds the
+    // agent again too.
+    let roots = crate::roots::generation();
     let mut slot = AGENT.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((c, agent)) = slot.as_ref()
+    if let Some((c, g, agent)) = slot.as_ref()
         && *c == chosen
+        && *g == roots
     {
         return agent.clone();
     }
@@ -273,14 +277,14 @@ fn shared_agent() -> ureq::Agent {
         .user_agent(concat!("kiri/", env!("CARGO_PKG_VERSION")))
         // Registries sit behind corporate proxies whose CA the platform
         // trusts; without it every pull fails UnknownIssuer (#303).
-        .tls_config(crate::tls_config(crate::roots::trusted()));
+        .tls_config(crate::tls_config(&crate::roots::trusted()));
     if let Some(p) = proxy(chosen.clone()) {
         cfg = cfg.proxy(p);
     }
     // Happy Eyeballs rather than ureq's one address after another, so an
     // IPv6 address without a working route does not stall the pull.
     let agent = ureq::Agent::with_parts(cfg.build(), crate::connect::connector(), ureq::unversioned::resolver::DefaultResolver::default());
-    *slot = Some((chosen, agent.clone()));
+    *slot = Some((chosen, roots, agent.clone()));
     agent
 }
 
@@ -1184,14 +1188,17 @@ fn not_found(e: Error, r: &Reference) -> Error {
 mod tests {
     use super::*;
 
-    /// The shared pull agent verifies against the merged roots
-    /// ([`ureq::tls::RootCerts::Specific`]), not the bundled set only (#303).
+    /// The shared pull agent verifies against the merged roots, every one
+    /// of them and in order, not the bundled set only (#303).
     #[test]
     fn the_shared_agent_trusts_the_merged_roots() {
-        assert!(matches!(
-            shared_agent().config().tls_config().root_certs(),
-            ureq::tls::RootCerts::Specific(_)
-        ));
+        let agent = shared_agent();
+        let ureq::tls::RootCerts::Specific(certs) = agent.config().tls_config().root_certs() else {
+            panic!("the shared agent must trust a list of roots of its own");
+        };
+        let roots = crate::roots::trusted();
+        assert_eq!(certs.len(), roots.len());
+        assert!(certs.iter().zip(roots.iter()).all(|(a, b)| a.der() == b.as_ref()));
     }
 
     #[test]

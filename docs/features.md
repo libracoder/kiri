@@ -119,9 +119,17 @@ Kiri trusts the root certificates of the operating system and the Mozilla set th
 
 - **macOS**: Kiri reads the trust settings of the user, admin and system keychains. Mark the root certificate as trusted, for example: `sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain ca.pem`
 - **Linux**: Kiri reads the system CA bundle, for example in `/etc/ssl/certs`.
-- **Windows**: pulls run in the WSL 2 distro, so they use the root certificates of that distro. Kiri Share uses the Windows certificate store of the current user. To trust a company root certificate in the distro, copy it to `/usr/local/share/ca-certificates/` and run `sudo update-ca-certificates` in the distro.
+- **Windows**: pulls run in the engine in WSL 2, away from the Windows certificate store, so the Kiri window copies the store into the engine: the root certificates of the current user (which include the machine's and those Group Policy adds) that the bundled set lacks, and the certificates in the Disallowed store. It sends them when the engine starts and every minute while Kiri runs, and the engine keeps them for its next start. Kiri Share uses the Windows certificate store of the current user. Trust the company root certificate in Windows, for example `certutil -user -addstore Root ca.cer`; pulls trust it within a minute.
 
-NOTE: If `SSL_CERT_FILE` or `SSL_CERT_DIR` is set, Kiri reads the root certificates there instead of the system store, as OpenSSL does. The bundled Mozilla set stays in use. Kiri writes a warning when this occurs, and a company CA trusted in the keychain or system store is then not trusted.
+A root certificate that an administrator distrusts stays distrusted, even though the bundled Mozilla set has it:
+
+- **macOS**: "Never Trust" in the user or admin trust settings. Settings in the system domain are not read.
+- **Windows**: the certificates in the Disallowed store, for Kiri Share and for pulls in the engine.
+- **Linux**: there is no list of distrusted certificates to read. A Mozilla root certificate that you remove from the system bundle (for example with `!` in `/etc/ca-certificates.conf`) is still trusted through the bundled set.
+
+Kiri compares the exact certificate, and does not check revocation (CRL or OCSP).
+
+NOTE: If `SSL_CERT_FILE` or `SSL_CERT_DIR` is set, Kiri reads the root certificates there instead of the system store, as OpenSSL does. The bundled Mozilla set stays in use, so these variables add root certificates and cannot limit trust to a private CA only. Kiri writes a warning when this occurs, and a company CA trusted in the keychain or system store is then not trusted.
 
 If the system store causes a problem, set `KIRI_TLS_ROOTS=webpki`. Kiri then trusts only the bundled Mozilla set, as before. The Kiri app and the daemon do not read your shell environment; set the variable for them and restart Kiri:
 

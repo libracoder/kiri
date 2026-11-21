@@ -50,7 +50,7 @@ fn self_signed_localhost_is_rejected_by_default_and_accepted_once_added() {
         Vec::new,
         webpki_root_certs::TLS_SERVER_ROOT_CERTS,
     )));
-    rejected(agent_on(trusted()));
+    rejected(agent_on(&trusted()));
 
     // With the CA among the merged roots.
     let mut certs = trusted().to_vec();

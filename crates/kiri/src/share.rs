@@ -358,7 +358,7 @@ fn root_store(
 fn tls_config(alpn: &[u8]) -> io::Result<Arc<rustls::ClientConfig>> {
     // KIRI_SHARE_CA, if set, is added on top of the merged roots, last.
     let share_ca = std::env::var_os("KIRI_SHARE_CA").map(std::path::PathBuf::from);
-    let roots = root_store(crate::roots::trusted(), share_ca.as_deref())?;
+    let roots = root_store(&crate::roots::trusted(), share_ca.as_deref())?;
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut c = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
@@ -2214,7 +2214,9 @@ mod tests {
     /// store still holds every certificate that parses.
     #[test]
     fn merged_roots_skip_a_cert_that_fails_to_add() {
-        let certs = crate::roots::trusted().to_vec();
+        // The bundled set, not this machine's store: every one of them
+        // parses, where a store may hold one rustls skips already.
+        let certs = crate::roots::bundled().to_vec();
         let mut with_bad = certs.clone();
         let good: &[u8] = certs[0].as_ref();
         let bad = rustls::pki_types::CertificateDer::from(good[..good.len() / 2].to_vec());
@@ -2230,9 +2232,11 @@ mod tests {
     }
 
     /// KIRI_SHARE_CA stays loud: a PEM section that doesn't decode fails
-    /// `root_store` (and so `tls_config`), a parseable CA is added and
-    /// passes. (A file with no PEM sections at all iterates as empty
-    /// upstream, pki-types 1.15.)
+    /// `root_store` (what `tls_config` builds from the variable), a
+    /// parseable CA is added and passes. (A file with no PEM sections at
+    /// all iterates as empty upstream, pki-types 1.15.) `root_store` is
+    /// called with the file, not through the variable: setting one races
+    /// every other test reading the environment.
     #[test]
     fn kiri_share_ca_fails_loud_but_a_valid_ca_is_added() {
         let dir = std::env::temp_dir();
@@ -2247,12 +2251,8 @@ mod tests {
         let ca = ca_params.self_signed(&key).unwrap();
         let good = dir.join(format!("kiri-share-ca-good-{}.pem", std::process::id()));
         std::fs::write(&good, ca.pem()).unwrap();
-        // SAFETY: this is the only test that reads KIRI_SHARE_CA.
-        unsafe { std::env::set_var("KIRI_SHARE_CA", &bad) };
-        let loud = tls_config(b"http/1.1").is_err();
-        unsafe { std::env::set_var("KIRI_SHARE_CA", &good) };
-        let added = tls_config(b"http/1.1").is_ok();
-        unsafe { std::env::remove_var("KIRI_SHARE_CA") };
+        let loud = root_store(&[], Some(&bad)).is_err();
+        let added = root_store(&[], Some(&good)).is_ok_and(|r| r.len() == 1);
         let _ = std::fs::remove_file(&bad);
         let _ = std::fs::remove_file(&good);
         assert!(loud, "an undecodable KIRI_SHARE_CA fails loudly");

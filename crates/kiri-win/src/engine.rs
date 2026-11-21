@@ -144,9 +144,11 @@ fn state(name: &str, error: Option<&str>) -> String {
 
 fn engine(rx: &Receiver<Cmd>, tx: Sender<Cmd>) {
     watch(tx);
-    // Windows' proxy for the daemon, now and every minute.
+    // Windows' proxy and root certificates for the daemon, now and every
+    // minute.
     std::thread::spawn(|| loop {
         send_windows_proxy();
+        send_windows_roots();
         std::thread::sleep(Duration::from_secs(60));
     });
     let mut pending: Option<Cmd> = None;
@@ -288,6 +290,8 @@ fn bring_up(launch: bool) {
     let woken = ensure_daemon().and_then(|()| if wakes(launch, stopped()) { wake().map(|()| true) } else { Ok(false) });
     match woken {
         Ok(woken) => {
+            // Before the first pull, not up to a minute after.
+            std::thread::spawn(send_windows_roots);
             if woken {
                 std::thread::spawn(ensure_builder);
             }
@@ -1439,6 +1443,17 @@ pub(crate) fn send_windows_proxy() {
     let relay = crate::relay::ports(&targets);
     body["relay"] = relay.iter().map(|(t, l)| (t.to_string(), json!(l))).collect::<serde_json::Map<_, _>>().into();
     let _ = client::request("PUT", "/kiri/proxy/system", Some(&body));
+}
+
+/// The Windows store's root certificates for the daemon in WSL (#303): the
+/// ones the bundled set lacks (a company root, Group Policy's) and the
+/// Disallowed ones, so pulls trust what Windows trusts, as on the Mac.
+/// The daemon keeps them, and only acts on a change.
+pub(crate) fn send_windows_roots() {
+    let host = crate::roots::host_export();
+    let list = |l: &[rustls_pki_types::CertificateDer<'static>]| l.iter().map(|c| crate::roots::hex(c)).collect::<Vec<_>>();
+    let body = json!({"certs": list(&host.certs), "distrusted": list(&host.distrusted)});
+    let _ = client::request("PUT", "/kiri/roots/host", Some(&body));
 }
 
 /// Settings → Domains: reads (or moves, then reads) the routers' ports. The

@@ -67,7 +67,7 @@ fn agent() -> ureq::Agent {
         .user_agent(concat!("kiri/", env!("CARGO_PKG_VERSION")))
         // The system's roots merged with webpki's, like the registry client
         // (#303); the feed often sits behind a corporate proxy's CA.
-        .tls_config(kiri_image::tls_config(kiri_image::roots::trusted()))
+        .tls_config(kiri_image::tls_config(&kiri_image::roots::trusted()))
         .build()
         .into()
 }
@@ -431,14 +431,17 @@ fn bundle_version(plist: &str) -> Option<String> {
 mod tests {
     use super::{Release, bundle_version, has_cpu, newer, runs_here};
 
-    /// The update agent verifies against the merged roots
-    /// ([`ureq::tls::RootCerts::Specific`]), not the bundled set only (#303).
+    /// The update agent verifies against the merged roots, every one of
+    /// them and in order, not the bundled set only (#303).
     #[test]
     fn the_update_agent_trusts_the_merged_roots() {
-        assert!(matches!(
-            super::agent().config().tls_config().root_certs(),
-            ureq::tls::RootCerts::Specific(_)
-        ));
+        let agent = super::agent();
+        let ureq::tls::RootCerts::Specific(certs) = agent.config().tls_config().root_certs() else {
+            panic!("the update agent must trust a list of roots of its own");
+        };
+        let roots = kiri_image::roots::trusted();
+        assert_eq!(certs.len(), roots.len());
+        assert!(certs.iter().zip(roots.iter()).all(|(a, b)| a.der() == b.as_ref()));
     }
 
     #[test]

@@ -15,6 +15,9 @@ mod engine;
 mod filters;
 mod health;
 mod hostetc;
+// A Windows host's roots, for the engine in WSL.
+#[cfg(target_os = "linux")]
+mod hostroots;
 mod hostopts;
 mod mirror;
 mod http;
@@ -151,6 +154,9 @@ pub fn run(_args: &[String]) -> io::Result<()> {
     // waits for them, and not by the first pull: asking the macOS keychain
     // about each of its certificates takes a moment (#303).
     let _ = std::thread::Builder::new().name("kiri-tls-roots".into()).spawn(|| {
+        // In WSL, the Windows roots kiri-win sent last time (#303).
+        #[cfg(target_os = "linux")]
+        hostroots::load();
         let _ = kiri_image::roots::trusted();
     });
     // The managed BuildKit stops itself when builds have been idle a while.

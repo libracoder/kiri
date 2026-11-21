@@ -12,7 +12,8 @@ serde_json = "1"
 sha2 = "0.11"
 tar = "0.4"
 ureq = { version = "3", default-features = false, features = ["rustls-no-provider"] }
-# HTTPS for container names: the same rustls and ring ureq already brings in.
+# The rustls and ring crypto provider ureq is built without
+# ("rustls-no-provider"): connect.rs's tls_config hands ring to every agent.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 # The system's root certificates (macOS keychain, Windows store, /etc/ssl),
 # merged with the bundled Mozilla set for registries, updates and Share (#303).
@@ -21,6 +22,15 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustls-native-certs = "0.8"
 rustls-pki-types = "1"
 webpki-root-certs = "1"
+
+# The roots an administrator distrusted (roots.rs): "Never Trust" in the
+# macOS trust settings, the Windows Disallowed store. Both already come in
+# with rustls-native-certs.
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"
+
+[target.'cfg(windows)'.dependencies]
+schannel = "0.1"
 
 [dev-dependencies]
 # Tests build a self-signed CA and serve TLS on localhost to prove the store

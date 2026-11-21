@@ -18,8 +18,14 @@ fn ssl_cert_file_replaces_the_platform_roots() {
         std::process::id()
     ));
     std::fs::write(&file, cert.pem()).unwrap();
-    // SAFETY: no other test in this binary reads or writes the variable.
-    unsafe { std::env::set_var("SSL_CERT_FILE", &file) };
+    // SAFETY: the only test in this binary, so nothing else reads the
+    // environment meanwhile. KIRI_TLS_ROOTS=webpki would leave the file
+    // out, and SSL_CERT_DIR would add its certificates to the file's.
+    unsafe {
+        std::env::remove_var("KIRI_TLS_ROOTS");
+        std::env::remove_var("SSL_CERT_DIR");
+        std::env::set_var("SSL_CERT_FILE", &file);
+    }
     let certs = trusted();
     unsafe { std::env::remove_var("SSL_CERT_FILE") };
     let _ = std::fs::remove_file(&file);
@@ -28,7 +34,8 @@ fn ssl_cert_file_replaces_the_platform_roots() {
         webpki_root_certs::TLS_SERVER_ROOT_CERTS.len() + 1
     );
     // The file's certificate replaces the platform store at the front of
-    // the merged list, the bundled roots unchanged after it.
+    // the merged list, the bundled roots unchanged after it. (No root the
+    // administrator distrusted is in the bundled set on a test machine.)
     assert_eq!(certs.first().unwrap().as_ref(), cert.der().as_ref());
     assert!(
         certs[1..]
