@@ -807,6 +807,13 @@ pub fn encode_net_attach<S: AsRef<str>>(out: &mut Vec<u8>, id: &str, ifname: &st
     });
 }
 
+/// Whether `frame` is of a kind the guest answers with no reply
+/// (`DnsRename`): one that doesn't decode is then dropped, not answered
+/// with an `Error` the host would read as the next request's reply.
+pub fn takes_no_reply(frame: &[u8]) -> bool {
+    frame.len() >= HEADER && u16::from_le_bytes([frame[4], frame[5]]) == kind::DNS_RENAME
+}
+
 /// Encodes a `DnsRename` frame from the sender's slices.
 pub fn encode_dns_rename<S: AsRef<str>>(out: &mut Vec<u8>, id: &str, bridge: &str, ip: [u8; 4], ip6: Option<[u8; 16]>, v4: bool, names: &[S]) {
     frame(out, kind::DNS_RENAME, |o| {
@@ -1630,6 +1637,21 @@ mod tests {
         let mut buf = Vec::new();
         encode_dns_rename(&mut buf, "c1", "kiri1", [10, 5, 0, 2], None, true, &names[..MAX_DNS_NAMES]);
         assert!(decode(&buf).is_ok());
+    }
+
+    /// A `DnsRename` the guest can't decode is still one it answers with
+    /// nothing; frames that get replies are answered as before.
+    #[test]
+    fn a_bad_dns_rename_is_known_to_take_no_reply() {
+        let names: Vec<String> = (0..=MAX_DNS_NAMES).map(|i| format!("n{i}")).collect();
+        let mut buf = Vec::new();
+        encode_dns_rename(&mut buf, "c1", "kiri1", [10, 5, 0, 2], None, true, &names);
+        assert!(decode(&buf).is_err());
+        assert!(takes_no_reply(&buf));
+        let mut ping = Vec::new();
+        Msg::Ping(1).encode(&mut ping);
+        assert!(!takes_no_reply(&ping));
+        assert!(!takes_no_reply(&buf[..3]));
     }
 
     #[test]

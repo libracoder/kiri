@@ -779,6 +779,12 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
                     None => Msg::Error(&format!("container {id} is not running")).encode(&mut out),
                 },
                 Ok(other) => Msg::Error(&format!("unexpected {other:?}")).encode(&mut out),
+                // A frame the host expects no reply to gets none, decoded
+                // or not: an answer would be read as the next one's reply.
+                Err(e) if kiri_proto::takes_no_reply(&frame) => {
+                    eprintln!("kiri-init: dropped a bad no-reply frame: {e:?}");
+                    continue;
+                }
                 Err(e) => Msg::Error(&format!("bad frame: {e:?}")).encode(&mut out),
             }
             conn.write_all(&out)?;
