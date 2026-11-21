@@ -4122,9 +4122,8 @@ impl Engine {
             && !n.builtin()
         {
             let hostname = if c.spec.hostname.is_empty() { c.short_id() } else { c.spec.hostname.as_str() };
-            let mut names = vec![c.name.clone()];
+            let mut names = vec![c.name.clone(), hostname.to_owned()];
             names.extend(c.spec.aliases.iter().cloned());
-            names.push(hostname.to_owned());
             out.push((n.bridge.clone(), ip, c.ip6, !n.no_ipv4, rename_names(names)));
         }
         for (network, ip) in &c.extra_ips {
@@ -7057,10 +7056,10 @@ mod leave_first_network_tests {
             c.spec.aliases = vec!["db".into()];
         }
         engine.rename(&id, "first").unwrap();
-        assert_eq!(engine.dns_names_after_rename(&id), [(bridge.clone(), [10, 98, 0, 7], None, true, vec!["first".to_owned(), "db".to_owned(), short])]);
+        assert_eq!(engine.dns_names_after_rename(&id), [(bridge.clone(), [10, 98, 0, 7], None, true, vec!["first".to_owned(), short, "db".to_owned()])]);
         engine.lock().containers.get_mut(&id).unwrap().spec.hostname = "box".into();
         engine.rename(&id, "second").unwrap();
-        assert_eq!(engine.dns_names_after_rename(&id), [(bridge, [10, 98, 0, 7], None, true, vec!["second".to_owned(), "db".to_owned(), "box".to_owned()])]);
+        assert_eq!(engine.dns_names_after_rename(&id), [(bridge, [10, 98, 0, 7], None, true, vec!["second".to_owned(), "box".to_owned(), "db".to_owned()])]);
         engine.lock().containers.get_mut(&id).unwrap().spec.network_mode = "bridge".into();
         assert!(engine.dns_names_after_rename(&id).is_empty(), "nothing for the default bridge");
         done(engine, dir);
@@ -7091,6 +7090,8 @@ mod leave_first_network_tests {
         let sent = engine.dns_names_after_rename(&id);
         assert_eq!(sent[0].4.len(), kiri_proto::MAX_DNS_NAMES);
         assert_eq!(sent[0].4[0], "many");
+        let short = engine.lock().containers[&id].short_id().to_owned();
+        assert_eq!(sent[0].4[1], short, "the hostname survives the cap");
         // The frame the guest gets decodes.
         let mut buf = Vec::new();
         kiri_proto::encode_dns_rename(&mut buf, &id, &sent[0].0, sent[0].1, sent[0].2, sent[0].3, &sent[0].4);
