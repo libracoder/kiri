@@ -47,14 +47,32 @@ pub fn memory_ceiling() -> u64 {
     (physical_memory() / 2).clamp(2 << 30, 8 << 30)
 }
 
-/// The VM's CPUs: `KIRI_CPUS`, else Settings → Resources, else 2.
+/// The VM's CPUs: `KIRI_CPUS`, else Settings → Resources, else 2. On
+/// Linux there is no VM: containers run on the host's kernel, on every CPU
+/// the engine may use, and that is the count (`docker info` NCPU).
 pub fn vm_cpus() -> usize {
     let max = max_cpus();
+    if cfg!(target_os = "linux") {
+        return max;
+    }
     std::env::var("KIRI_CPUS").ok().and_then(|v| v.parse().ok()).or_else(|| resources()["cpus"].as_u64().map(|c| c as usize)).unwrap_or(2).clamp(1, max)
 }
 
-/// The Mac's CPUs, the most the VM can have.
+/// The Mac's CPUs, the most the VM can have. On Linux the CPUs the engine
+/// may run on, counted as dockerd counts them for NCPU (Go's
+/// runtime.NumCPU: the affinity mask, not a cgroup's CPU quota).
 pub fn max_cpus() -> usize {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: cpu_set_t is plain data; sched_getaffinity fills it.
+        let n = unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) == 0 { libc::CPU_COUNT(&set) } else { 0 }
+        };
+        if n > 0 {
+            return n as usize;
+        }
+    }
     std::thread::available_parallelism().map_or(2, std::num::NonZero::get)
 }
 
@@ -6989,5 +7007,28 @@ mod leave_first_network_tests {
         }))
         .unwrap();
         assert!(!s.left_all_networks);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod cpu_tests {
+    /// The CPUs `Cpus_allowed_list` of /proc/self/status lists.
+    fn allowed() -> usize {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let list = status.lines().find_map(|l| l.strip_prefix("Cpus_allowed_list:")).unwrap().trim().to_owned();
+        list.split(',')
+            .map(|r| match r.split_once('-') {
+                Some((a, b)) => b.parse::<usize>().unwrap() - a.parse::<usize>().unwrap() + 1,
+                None => 1,
+            })
+            .sum()
+    }
+
+    /// On Linux there is no VM: `docker info`'s NCPU is the CPUs the engine
+    /// may run on, as dockerd counts them (Go's runtime.NumCPU, the affinity
+    /// mask), not the Mac VM's default of 2.
+    #[test]
+    fn on_linux_the_engine_has_the_cpus_it_may_run_on() {
+        assert_eq!(super::vm_cpus(), allowed());
     }
 }
