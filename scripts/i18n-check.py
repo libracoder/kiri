@@ -9,10 +9,17 @@ notices the app sends the page). Each language file must have every key, no
 key nothing uses, the same {placeholders} and tags as its key, and no ASCII
 double quote (the words go into HTML attributes).
 
-    python3 scripts/i18n-check.py            # check
-    python3 scripts/i18n-check.py --missing  # print the keys a file lacks, as JSON
+    python3 scripts/i18n-check.py              # check
+    python3 scripts/i18n-check.py --missing    # print the keys a file lacks, as JSON
+    python3 scripts/i18n-check.py --since REF  # check, with notes against REF rather than main
+
+It also notes, without failing, the short words where a language you added or
+changed is longer than every other language: those are the ones most likely
+to be cut off in a button, a badge or a column header. "Changed" means
+differs from where the branch left origin/main (or from --since REF), new
+files not yet committed included.
 """
-import json, os, re, sys
+import json, os, re, subprocess, sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 UI = os.path.join(ROOT, "crates/kiri/src/ui")
@@ -64,6 +71,43 @@ def tags(s):
     return sorted(re.findall(r"</?([a-zA-Z][\w-]*)", s))
 
 
+# Words up to this long sit in buttons, badges and headers; longer ones wrap.
+SHORT = 20
+
+
+def changed_files():
+    """The language files that differ from main (or --since REF), by name; none if git can't say."""
+    lang = os.path.relpath(os.path.join(UI, "lang"), ROOT)
+    git = lambda *a: subprocess.run(["git", "-C", ROOT, *a], capture_output=True, text=True, check=True).stdout.split()
+    try:
+        since = sys.argv[sys.argv.index("--since") + 1] if "--since" in sys.argv else git("merge-base", "HEAD", "origin/main")[0]
+        names = git("diff", "--name-only", since, "--", lang) + git("ls-files", "--others", "--exclude-standard", "--", lang)
+    except (OSError, IndexError, subprocess.CalledProcessError):
+        return []
+    return sorted({os.path.basename(n) for n in names if n.endswith(".json")})
+
+
+def length_notes(files, langs):
+    """Each changed file's short words that are longer than in English and every other language, with their lines."""
+    notes = []
+    for f in files:
+        if f not in langs:
+            continue
+        path = os.path.relpath(os.path.join(UI, "lang", f), ROOT)
+        lines = open(os.path.join(ROOT, path)).read().split("\n")
+        for key, text in langs[f].items():
+            if not isinstance(text, str) or len(text) > SHORT:
+                continue
+            others = [(len(key), "en")] + [(len(m[key]), o[:-5]) for o, m in langs.items() if o != f and isinstance(m.get(key), str)]
+            longest, who = max(others)
+            if len(text) > longest:
+                quoted = json.dumps(key, ensure_ascii=False)
+                line = next((i + 1 for i, l in enumerate(lines) if l.lstrip().startswith(quoted + ":")), 1)
+                notes.append((path, line, f"{json.dumps(text, ensure_ascii=False)} ({quoted}) is longer than in every other language "
+                                          f"(next: {longest} characters, {who}), so it may be cut off; a shorter word fits better if there is one"))
+    return notes
+
+
 def main():
     keys = {}
     for page in PAGES:
@@ -77,7 +121,7 @@ def main():
             have = json.load(open(os.path.join(UI, "lang", f)))
             print(json.dumps({k: "" for k in keys if k not in have}, ensure_ascii=False, indent=2))
         return 0
-    bad = []
+    bad, langs = [], {}
     for f in files:
         path = os.path.join(UI, "lang", f)
         try:
@@ -85,6 +129,7 @@ def main():
         except ValueError as e:
             bad.append(f"{f}: not JSON ({e})")
             continue
+        langs[f] = have
         for k, (where, line) in sorted(keys.items(), key=lambda x: x[1]):
             if k not in have:
                 bad.append(f"{f}: no translation for {json.dumps(k, ensure_ascii=False)} ({where}:{line})")
@@ -103,6 +148,11 @@ def main():
     for line in bad:
         print("FAIL " + line)
     print(f"{'FAIL' if bad else 'PASS'} {len(keys)} keys, {len(files)} language file(s), {len(bad)} problem(s)")
+    # Advice only: never changes the result. On GitHub it also shows on the pull request.
+    for path, line, text in length_notes(changed_files(), langs):
+        print(f"NOTE {path}:{line}: {text}")
+        if os.environ.get("GITHUB_ACTIONS"):
+            print(f"::notice file={path},line={line},title=May be cut off::{text}")
     return 1 if bad else 0
 
 
