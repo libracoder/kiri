@@ -302,6 +302,9 @@ struct Prepared {
     profile: Vec<u8>,
     no_new_privs: bool,
     readonly_rootfs: bool,
+    /// The root is remounted `nodev`: the device filter could not be
+    /// attached, so a device node an image's layers bring must not open.
+    nodev_root: bool,
     shm_size: u64,
     /// `--init`: PID 1 supervises the program instead of being it.
     init: bool,
@@ -512,6 +515,9 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
     let mut prepared = prepare(spec.argv, spec.env, spec.cwd, spec.user, Some(spec.hostname), spec.flags, spec.caps).map_err(cleanup)?;
     if !device_filtered {
         prepared.caps &= !(1 << super::devices::CAP_MKNOD);
+        // Nodes an image's layers bring (unpacked as devices) are not
+        // filtered either: the root's are made unusable.
+        prepared.nodev_root = true;
     }
     // Looked at now, so a program the kernel would refuse fails the start
     // with a message rather than the child.
@@ -1192,6 +1198,7 @@ fn prepare(argv: StrList<'_>, env: StrList<'_>, cwd: &str, user: &str, hostname:
         profile: Vec::new(),
         no_new_privs: flags & run_flags::NO_NEW_PRIVS != 0,
         readonly_rootfs: flags & run_flags::READONLY_ROOTFS != 0,
+        nodev_root: false,
         shm_size: 64 << 20,
         init: flags & run_flags::INIT != 0,
         host: HostApplied::default(),
@@ -1789,6 +1796,7 @@ fn child_fds(p: &Prepared, io: &ChildStdio) -> Vec<RawFd> {
         profile: _,
         no_new_privs: _,
         readonly_rootfs: _,
+        nodev_root: _,
         shm_size: _,
         init: _,
         // Paths, numbers and names only.
@@ -1874,9 +1882,9 @@ fn container_child(p: &Prepared, rootfs: &CStr, io: &ChildStdio, close_first: &[
     // before it switches user and before the root goes read-only, so both
     // `-u 1000 -w /missing` and `--read-only -w /missing` start (#370).
     make_workdir(root, &p.cwd);
-    if p.readonly_rootfs {
+    if let Some(flags) = root_remount_flags(p.readonly_rootfs, p.nodev_root) {
         // Only the root itself: volumes, tmpfs and /dev stay as they are.
-        sys::mount(c"none", c"/", c"none", libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY, None).unwrap_or_else(|e| fail("read-only root", e));
+        sys::mount(c"none", c"/", c"none", flags, None).unwrap_or_else(|e| fail(if p.readonly_rootfs { "read-only root" } else { "nodev root" }, e));
     }
     if let Some(h) = &p.hostname {
         sys::sethostname(h).unwrap_or_else(|e| fail("hostname", e));
@@ -2087,6 +2095,26 @@ fn finish_child(p: &Prepared, io: &ChildStdio, console: bool) -> ! {
     // SAFETY: NULL-terminated arrays of valid C strings that outlive the call.
     unsafe { libc::execve(exe.as_ptr(), argv.as_ptr(), envp.as_ptr()) };
     sys::exec_fail(2, &exe, io::Error::last_os_error(), false)
+}
+
+/// How the container's root is remounted once it is `/`, if at all:
+/// read-only for `--read-only`, and `nodev` when the device filter could not
+/// be attached. Without the filter, a block or character device node that an
+/// image's layers bring would open (CAP_MKNOD is dropped, but the node is
+/// already there), so the root's nodes are made unusable. The container's
+/// /dev is its own tmpfs and keeps its nodes.
+fn root_remount_flags(readonly: bool, nodev: bool) -> Option<libc::c_ulong> {
+    if !readonly && !nodev {
+        return None;
+    }
+    let mut flags = libc::MS_REMOUNT | libc::MS_BIND;
+    if readonly {
+        flags |= libc::MS_RDONLY;
+    }
+    if nodev {
+        flags |= libc::MS_NODEV;
+    }
+    Some(flags)
 }
 
 /// The container's /proc, /sys, /dev (with the standard device nodes),
@@ -3260,5 +3288,20 @@ mod tests {
         assert!(mounts[0].ro);
         assert_eq!(mounts[0].target.to_bytes(), b"scratch");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Without the device filter a device node an image's layers bring
+    /// (now unpacked as a device) would open, so the root is remounted
+    /// nodev; with the filter, it is left alone unless it is read-only.
+    #[test]
+    fn the_root_is_nodev_when_the_device_filter_is_missing() {
+        assert_eq!(super::root_remount_flags(false, false), None);
+        let nodev = super::root_remount_flags(false, true).expect("remounted");
+        assert_eq!(nodev & (libc::MS_REMOUNT | libc::MS_BIND | libc::MS_NODEV), libc::MS_REMOUNT | libc::MS_BIND | libc::MS_NODEV);
+        assert_eq!(nodev & libc::MS_RDONLY, 0, "not read-only");
+        let ro = super::root_remount_flags(true, false).expect("remounted");
+        assert_eq!((ro & libc::MS_RDONLY, ro & libc::MS_NODEV), (libc::MS_RDONLY, 0));
+        let both = super::root_remount_flags(true, true).expect("remounted");
+        assert_eq!(both & (libc::MS_RDONLY | libc::MS_NODEV), libc::MS_RDONLY | libc::MS_NODEV);
     }
 }

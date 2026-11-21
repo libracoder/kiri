@@ -272,5 +272,52 @@ t ij-layers-kept-next-start "layers $IJ_LAYERS" "docker run --rm alpine:3.21 tru
 t ij-cleanup "done" "rm -f $ST/images.json.corrupt-*; echo done"
 t ij-warning-gone "[]" "docker info --format '{{json .Warnings}}'"
 $D rm -f "$N" >/dev/null
+# An engine in a user namespace (nested Docker, Sysbox, Coder, CI; #597),
+# where the kernel refuses mknod of a device: an image layer with a
+# character and a block device, a fifo and a file still unpacks, the devices
+# left out as Docker leaves them out and the fifo made. Before, the whole
+# layer failed ("mknod: Operation not permitted"). That engine runs alone in
+# its own container, in a new user namespace (root mapped to root, 65536
+# ids, so /proc/self/uid_map is not "0 0 4294967295") with its own mount
+# and network namespaces, and only unpacks: docker load, then docker create.
+U="$N-userns"
+# t, for output got elsewhere than the engine's container.
+check() {
+  if [[ "$3" == *"$2"* ]]; then PASS=$((PASS + 1)); else FAIL=$((FAIL + 1)); printf '  FAIL %s\n    want: %s\n    got:  %s\n' "$1" "$2" "$(echo "$3" | head -3)"; kiri_guard "$1"; fi
+}
+$D rm -f "$U" >/dev/null 2>&1
+$D run -d --name "$U" --privileged --tmpfs /run -v "$BIN:/opt/kiri:ro" alpine sleep 1d >/dev/null
+$D exec "$U" sh -c 'apk add -q util-linux-misc python3 docker-cli >/dev/null 2>&1'
+$D exec -i "$U" sh -c 'cat > /mkimage.py' <<'PY'
+import hashlib, io, json, tarfile
+layer = io.BytesIO()
+with tarfile.open(fileobj=layer, mode="w", format=tarfile.GNU_FORMAT) as t:
+    for name, typ, mode, major, minor in [("dev/", tarfile.DIRTYPE, 0o755, 0, 0), ("dev/kiri-null", tarfile.CHRTYPE, 0o666, 1, 3),
+                                          ("dev/kiri-loop", tarfile.BLKTYPE, 0o660, 7, 9), ("pipe", tarfile.FIFOTYPE, 0o640, 0, 0)]:
+        i = tarfile.TarInfo(name); i.type, i.mode, i.devmajor, i.devminor = typ, mode, major, minor; t.addfile(i)
+    i = tarfile.TarInfo("after"); i.size = 3; t.addfile(i, io.BytesIO(b"ok\n"))
+lb = layer.getvalue()
+cfg = json.dumps({"os": "linux", "config": {"Cmd": ["/x"]}, "rootfs": {"type": "layers", "diff_ids": ["sha256:" + hashlib.sha256(lb).hexdigest()]}}).encode()
+c = hashlib.sha256(cfg).hexdigest() + ".json"
+man = json.dumps([{"Config": c, "RepoTags": ["kiri-nodes:1"], "Layers": ["layer.tar"]}]).encode()
+with tarfile.open("/devices.tar", "w") as t:
+    for n, d in [("layer.tar", lb), (c, cfg), ("manifest.json", man)]:
+        i = tarfile.TarInfo(n); i.size = len(d); t.addfile(i, io.BytesIO(d))
+PY
+if ! $D exec "$U" unshare -U -r true 2>/dev/null; then
+  echo "  SKIP userns-layer-devices: no user namespace can be made on this host"
+else
+  got=$($D exec "$U" unshare --user --map-users=0:0:65536 --map-groups=0:0:65536 --setuid=0 --setgid=0 --mount --propagation private --net --fork sh -c '
+    python3 /mkimage.py
+    mkdir -p /var/lib/kiri && mount -t tmpfs t /var/lib/kiri && mount -t tmpfs t /root && ip link set lo up
+    /opt/kiri/kiri daemon > /tmp/engine.log 2>&1 &
+    export DOCKER_HOST=unix:///root/.kiri/run/docker.sock
+    for i in $(seq 120); do docker version >/dev/null 2>&1 && break; sleep 0.25; done
+    docker load -i /devices.tar >/dev/null && docker create kiri-nodes:1 >/dev/null || exit
+    cd /var/lib/kiri/layers/*/ && for f in dev/kiri-null dev/kiri-loop pipe after; do printf "%s=" $f; stat -c %F $f 2>/dev/null || echo none; done | tr "\n" " "
+    kill %1' 2>&1 | tr -d '\r')
+  check userns-layer-devices "dev/kiri-null=none dev/kiri-loop=none pipe=fifo after=regular file" "$got"
+fi
+$D rm -f "$U" >/dev/null
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" = 0 ]

@@ -157,6 +157,14 @@ fn unpack(blob: &mut impl Read, media_type: &str, dest: &Path, compressed: u64) 
 /// reads: `.wh.name` becomes a 0:0 character device `name`, and
 /// `.wh..wh..opq` marks its directory opaque.
 fn untar(reader: impl Read, dest: &Path) -> io::Result<u64> {
+    untar_in(reader, dest, in_user_namespace)
+}
+
+/// [`untar`], with how a user namespace is detected passed in, so tests can
+/// say "in one" without making one.
+fn untar_in(reader: impl Read, dest: &Path, detect_userns: fn() -> bool) -> io::Result<u64> {
+    // Only looked at once a device or fifo entry turns up.
+    let mut userns = None;
     let mut archive = tar::Archive::new(reader);
     archive.set_preserve_permissions(true);
     archive.set_preserve_ownerships(true);
@@ -199,11 +207,97 @@ fn untar(reader: impl Read, dest: &Path) -> io::Result<u64> {
             // Flags 0 links the symlink itself, without following its absolute target.
             let ret = unsafe { libc::linkat(from.as_raw_fd(), source.as_ptr(), to.as_raw_fd(), name.as_ptr(), 0) };
             sys::check(ret as _, "hard link")?;
+        } else if let Some(kind) = special_kind(entry.header().entry_type()) {
+            // In a user namespace (nested Docker, Sysbox, rootless, CI) the
+            // kernel refuses mknod of a device, so the entry is left out, as
+            // Docker leaves it out; a fifo is still made, and left out only
+            // if refused.
+            let userns = *userns.get_or_insert_with(detect_userns);
+            if userns && kind != libc::S_IFIFO {
+                continue;
+            }
+            make_special(dest, &path, entry.header(), kind, userns)?;
         } else {
             entry.unpack_in(dest)?;
         }
     }
     Ok(total)
+}
+
+/// The file type of a device or fifo entry, which the tar crate would
+/// unpack as an empty regular file.
+fn special_kind(t: tar::EntryType) -> Option<libc::mode_t> {
+    if t.is_character_special() {
+        Some(libc::S_IFCHR)
+    } else if t.is_block_special() {
+        Some(libc::S_IFBLK)
+    } else if t.is_fifo() {
+        Some(libc::S_IFIFO)
+    } else {
+        None
+    }
+}
+
+/// Makes a device node or fifo at `path` inside `dest` with the entry's
+/// numbers, owner, mode and time, replacing what is there. The parent is
+/// looked up inside the layer, as a hard link's is. With `may_be_refused`
+/// (a user namespace), a mknod the kernel refuses leaves the entry out.
+fn make_special(dest: &Path, path: &Path, h: &tar::Header, kind: libc::mode_t, may_be_refused: bool) -> io::Result<()> {
+    let root = inroot::open_root(dest)?;
+    let (parent, name) = hardlink_parent(root.as_fd(), path)?;
+    let mode = (h.mode()? & 0o7777) as libc::mode_t;
+    // A fifo has no device number, and archive writers leave its device
+    // fields blank (Python's tarfile does), which is not a number: they are
+    // not read for one. Docker unpacks such a fifo.
+    let dev = if kind == libc::S_IFIFO {
+        0
+    } else {
+        libc::makedev(h.device_major()?.unwrap_or(0), h.device_minor()?.unwrap_or(0))
+    };
+    let (uid, gid) = (h.uid()? as libc::uid_t, h.gid()? as libc::gid_t);
+    let mtime = h.mtime()? as i64;
+    let p = parent.as_raw_fd();
+    let t = [libc::timespec { tv_sec: mtime, tv_nsec: 0 }, libc::timespec { tv_sec: mtime, tv_nsec: 0 }];
+    // SAFETY: a confined parent descriptor and a single NUL-terminated name.
+    unsafe {
+        libc::unlinkat(p, name.as_ptr(), 0);
+        if libc::mknodat(p, name.as_ptr(), kind | mode, dev) != 0 {
+            let e = io::Error::last_os_error();
+            if may_be_refused && e.raw_os_error() == Some(libc::EPERM) {
+                return Ok(());
+            }
+            return Err(io::Error::new(e.kind(), format!("mknod: {e}")));
+        }
+        sys::check(libc::fchownat(p, name.as_ptr(), uid, gid, libc::AT_SYMLINK_NOFOLLOW) as _, "chown")?;
+        // mknod applies the umask.
+        sys::check(libc::fchmodat(p, name.as_ptr(), mode, 0) as _, "chmod")?;
+        sys::check(libc::utimensat(p, name.as_ptr(), t.as_ptr(), libc::AT_SYMLINK_NOFOLLOW) as _, "set time")?;
+    }
+    Ok(())
+}
+
+/// Whether this process runs in a user namespace other than the first, read
+/// as Docker reads it (moby/sys/userns): the first user namespace's
+/// /proc/self/uid_map is `0 0 4294967295`. No such file means a kernel
+/// without user namespaces.
+fn in_user_namespace() -> bool {
+    match fs::read_to_string("/proc/self/uid_map") {
+        Ok(map) => uid_map_in_user_namespace(map.lines().next().unwrap_or("")),
+        Err(_) => false,
+    }
+}
+
+fn uid_map_in_user_namespace(first_line: &str) -> bool {
+    // Empty: a namespace just made, its map not written yet.
+    if first_line.is_empty() {
+        return true;
+    }
+    let mut fields = first_line.split_whitespace().map(|f| f.parse::<u64>());
+    match (fields.next(), fields.next(), fields.next()) {
+        (Some(Ok(inside)), Some(Ok(outside)), Some(Ok(count))) => (inside, outside, count) != (0, 0, 4294967295),
+        // Not a map: taken as the first namespace, as Docker takes it.
+        _ => false,
+    }
 }
 
 fn escapes() -> io::Error {
@@ -575,6 +669,176 @@ mod tests {
         assert!(!root.join(format!(".stale-{broken}-1")).exists() && !root.join(format!(".tmp-{broken}")).exists());
         assert!(root.join("other").is_file());
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Device nodes and fifos come out as such, numbers, owner and mode kept,
+    /// not as the empty files the tar crate would make of them.
+    #[test]
+    fn devices_and_fifos_are_unpacked_as_themselves() {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        // SAFETY: a plain getter.
+        if unsafe { libc::geteuid() } != 0 || in_user_namespace() {
+            eprintln!("skipped: needs root outside a user namespace for mknod");
+            return;
+        }
+        let mut b = tar::Builder::new(Vec::new());
+        for (name, kind, major, minor, mode) in [("dev/null", tar::EntryType::Char, 1, 3, 0o666), ("dev/loop9", tar::EntryType::Block, 7, 9, 0o660), ("pipe", tar::EntryType::Fifo, 0, 0, 0o640)] {
+            let mut h = header(0, mode);
+            h.set_entry_type(kind);
+            h.set_device_major(major).unwrap();
+            h.set_device_minor(minor).unwrap();
+            h.set_uid(12);
+            h.set_mtime(1_600_000_000);
+            h.set_cksum();
+            b.append_data(&mut h, name, &[][..]).unwrap();
+        }
+        // A fifo whose device fields are blank, as other archive writers
+        // leave them.
+        let mut h = header(0, 0o600);
+        h.set_entry_type(tar::EntryType::Fifo);
+        h.as_gnu_mut().unwrap().dev_major = [b' '; 8];
+        h.as_gnu_mut().unwrap().dev_minor = [b' '; 8];
+        h.set_cksum();
+        b.append_data(&mut h, "blankpipe", &[][..]).unwrap();
+        let bytes = b.into_inner().unwrap();
+        let dest = scratch("special");
+        untar(Capped { inner: &bytes[..], left: u64::MAX }, &dest).unwrap();
+        let m = |p: &str| fs::symlink_metadata(dest.join(p)).unwrap();
+        let null = m("dev/null");
+        assert!(null.file_type().is_char_device());
+        assert_eq!((libc::major(null.rdev()), libc::minor(null.rdev()), null.mode() & 0o7777, null.uid(), null.mtime()), (1, 3, 0o666, 12, 1_600_000_000));
+        let lp = m("dev/loop9");
+        assert!(lp.file_type().is_block_device());
+        assert_eq!((libc::major(lp.rdev()), libc::minor(lp.rdev()), lp.mode() & 0o7777), (7, 9, 0o660));
+        let pipe = m("pipe");
+        assert!(pipe.file_type().is_fifo());
+        assert_eq!(pipe.mode() & 0o7777, 0o640);
+        assert!(m("blankpipe").file_type().is_fifo());
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    /// A layer with a character device, a block device, a fifo and a file
+    /// after them, all owned by root.
+    fn layer_with_devices() -> Vec<u8> {
+        let mut b = tar::Builder::new(Vec::new());
+        let mut h = header(0, 0o755);
+        h.set_entry_type(tar::EntryType::Directory);
+        h.set_cksum();
+        b.append_data(&mut h, "dev/", &[][..]).unwrap();
+        for (name, kind, major, minor) in [("dev/null", tar::EntryType::Char, 1, 3), ("dev/loop9", tar::EntryType::Block, 7, 9), ("pipe", tar::EntryType::Fifo, 0, 0)] {
+            let mut h = header(0, 0o640);
+            h.set_entry_type(kind);
+            h.set_device_major(major).unwrap();
+            h.set_device_minor(minor).unwrap();
+            h.set_cksum();
+            b.append_data(&mut h, name, &[][..]).unwrap();
+        }
+        b.append_data(&mut header(2, 0o644), "after", &b"ok"[..]).unwrap();
+        b.into_inner().unwrap()
+    }
+
+    /// What a user namespace gets of [`layer_with_devices`], as Docker
+    /// unpacks it there: no file for either device, the fifo, and the rest
+    /// of the layer.
+    fn assert_unpacked_as_in_a_user_namespace(dest: &Path) {
+        use std::os::unix::fs::FileTypeExt;
+        for dev in ["dev/null", "dev/loop9"] {
+            assert!(fs::symlink_metadata(dest.join(dev)).is_err(), "{dev}: a device is left out in a user namespace");
+        }
+        assert!(fs::symlink_metadata(dest.join("pipe")).unwrap().file_type().is_fifo(), "a fifo is still made");
+        assert_eq!(fs::read(dest.join("after")).unwrap(), b"ok", "the rest of the layer unpacks");
+    }
+
+    /// Docker's test of /proc/self/uid_map: only the first namespace's own
+    /// map is outside a user namespace.
+    #[test]
+    fn a_user_namespace_is_told_from_uid_map_as_docker_tells_it() {
+        for (line, userns) in [
+            ("         0          0 4294967295", false),
+            ("0 0 4294967295", false),
+            ("0 165536 65536", true),
+            ("0 1000 1", true),
+            ("0 0 1", true),
+            ("0 0 65536", true),
+            ("", true),
+            ("not a map", false),
+        ] {
+            assert_eq!(uid_map_in_user_namespace(line), userns, "{line:?}");
+        }
+    }
+
+    /// The detection seam: told it is in a user namespace, the unpack leaves
+    /// out the devices (mknod would fail there and, before, failed the whole
+    /// layer) and keeps the rest. Needs no privilege: a fifo is made by
+    /// anyone.
+    #[test]
+    fn devices_are_left_out_when_told_of_a_user_namespace() {
+        let bytes = layer_with_devices();
+        let dest = scratch("userns-seam");
+        untar_in(Capped { inner: &bytes[..], left: u64::MAX }, &dest, || true).expect("a layer with devices unpacks in a user namespace");
+        assert_unpacked_as_in_a_user_namespace(&dest);
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    /// The same in a real user namespace: the test binary runs this test
+    /// again in a new one, root inside mapped to the caller outside, where
+    /// the kernel refuses mknod of a device with EPERM. Skipped where no
+    /// user namespace can be made (a container's seccomp profile, a
+    /// sysctl).
+    #[test]
+    fn a_layer_with_devices_unpacks_in_a_real_user_namespace() {
+        use std::os::unix::process::CommandExt;
+        const INSIDE: &str = "KIRI_TEST_IN_USER_NAMESPACE";
+        if std::env::var_os(INSIDE).is_some() {
+            assert!(in_user_namespace(), "uid_map: {:?}", fs::read_to_string("/proc/self/uid_map"));
+            let bytes = layer_with_devices();
+            let dest = scratch("userns-real");
+            untar(Capped { inner: &bytes[..], left: u64::MAX }, &dest).expect("a layer with devices unpacks in a user namespace");
+            assert_unpacked_as_in_a_user_namespace(&dest);
+            let _ = fs::remove_dir_all(&dest);
+            return;
+        }
+        // Built before the fork: the child only makes system calls.
+        // SAFETY: plain getters.
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        let uid_map = format!("0 {uid} 1");
+        let gid_map = format!("0 {gid} 1");
+        let module = module_path!();
+        let name = format!("{}::a_layer_with_devices_unpacks_in_a_real_user_namespace", &module[module.find("::").unwrap() + 2..]);
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.args([name.as_str(), "--exact", "--nocapture", "--test-threads=1"]).env(INSIDE, "1");
+        // SAFETY: between fork and exec only unshare, open, write and close.
+        unsafe {
+            cmd.pre_exec(move || {
+                let write = |path: &std::ffi::CStr, data: &[u8]| -> io::Result<()> {
+                    let fd = libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
+                    if fd < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    let n = libc::write(fd, data.as_ptr().cast(), data.len());
+                    let e = io::Error::last_os_error();
+                    libc::close(fd);
+                    if n != data.len() as isize {
+                        return Err(e);
+                    }
+                    Ok(())
+                };
+                if libc::unshare(libc::CLONE_NEWUSER) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                write(c"/proc/self/setgroups", b"deny")?;
+                write(c"/proc/self/uid_map", uid_map.as_bytes())?;
+                write(c"/proc/self/gid_map", gid_map.as_bytes())
+            });
+        }
+        let status = match cmd.status() {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("skipped: no user namespace can be made here: {e}");
+                return;
+            }
+        };
+        assert!(status.success(), "unpacking in a user namespace failed: {status}");
     }
 
     /// A layer that expands past its cap is refused.

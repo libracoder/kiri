@@ -36,6 +36,7 @@ ij-info-names-lost	#588	the repair warning did not name the images it lost (#440
 ij-layers-kept	#588	a lost image's unpacked layers were deleted by the repair (#440)
 ij-layers-kept-next-start	#588	a lost image's unpacked layers were deleted at the next start (#440)
 ij-warning-gone	#588	the repair warning stayed after the kept copy was removed (#440)
+userns-layer-devices	#665	an image layer with a device node failed to unpack when the engine ran in a user namespace (nested Docker, Sysbox, CI), where mknod is refused
 image-inspect-rootfs-diffid	#596	image inspect gave compressed blob digests as RootFS.Layers, not the uncompressed diff IDs
 image-labels-inspect	#596	image labels were missing from inspect
 image-labels-filter	#596	the label filter on the image list did not match image labels
