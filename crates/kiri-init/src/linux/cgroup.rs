@@ -91,6 +91,9 @@ pub fn stats(dir: &Path, pid: libc::pid_t) -> io::Result<ContainerStats> {
         cpu_usage_usec: keyed(&cpu, "usage_usec"),
         cpu_user_usec: keyed(&cpu, "user_usec"),
         cpu_system_usec: keyed(&cpu, "system_usec"),
+        cpu_periods: keyed(&cpu, "nr_periods"),
+        cpu_throttled_periods: keyed(&cpu, "nr_throttled"),
+        cpu_throttled_usec: keyed(&cpu, "throttled_usec"),
         pids: read("pids.current").trim().parse().unwrap_or(0),
         // SAFETY: sysconf has no preconditions.
         online_cpus: unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) }.max(1) as u32,
