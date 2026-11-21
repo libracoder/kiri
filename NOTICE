@@ -3315,7 +3315,6 @@ Used by:
 - rustls 0.23.46 (https://github.com/rustls/rustls)
 - rustls-native-certs 0.8.5 (https://github.com/rustls/rustls-native-certs)
 - rustls-pki-types 1.15.1 (https://github.com/rustls/pki-types)
-- webpki-root-certs 1.0.12 (https://github.com/rustls/webpki-roots)
 - smallvec 1.16.4 (https://github.com/servo/rust-smallvec)
 - syn 1.0.109 (https://github.com/dtolnay/syn)
 - system-deps 6.2.2 (https://github.com/gdesmott/system-deps)
@@ -4736,6 +4735,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 Community Data License Agreement Permissive 2.0
 ----------------------------------------------------------------------
 Used by:
+- webpki-root-certs 1.0.12 (https://github.com/rustls/webpki-roots)
 
 # Community Data License Agreement - Permissive - Version 2.0
 
