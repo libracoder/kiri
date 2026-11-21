@@ -1,3 +1,4 @@
 # Items the window may show on some systems and not others, one per line:
 #   <item exactly as parity.js reports it> | <why>
 # Anything not listed here must ship on macOS, Windows and Linux together.
+setting appearance: Closing the window | Linux has no tray icon to open a hidden window from: closing it always ends the window there (gtk.rs), and the engine, a system service, keeps running

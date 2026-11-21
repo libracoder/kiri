@@ -29,6 +29,12 @@ thread_local! {
     static WINDOW: RefCell<Option<Retained<NSWindow>>> = const { RefCell::new(None) };
     /// The menu bar item; AppKit removes it once it is released.
     static STATUS_ITEM: RefCell<Option<Retained<AnyObject>>> = const { RefCell::new(None) };
+    /// Where a page made again (after the window let go of its own) sends
+    /// its messages.
+    static PAGE_TX: RefCell<Option<Sender<Cmd>>> = const { RefCell::new(None) };
+    /// Scripts for a page made again, kept until it says `ready`: the menu
+    /// bar's Settings… or a container shows the window and sends at once.
+    static QUEUED: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
 }
 
 /// `autostart` boots the VM as soon as the page has loaded; `view` picks the
@@ -66,6 +72,7 @@ pub fn run(autostart: bool, view: Option<String>) -> io::Result<()> {
         for name in ["NSWindowDidResizeNotification", "NSWindowDidExitFullScreenNotification", "NSWindowDidBecomeKeyNotification", "NSWindowDidResignKeyNotification"] {
             let _: () = msg_send![&*centre, addObserver: &*delegate, selector: sel!(windowLaidOut:), name: &*NSString::from_str(name), object: &*window];
         }
+        let _: () = msg_send![&*centre, addObserver: &*delegate, selector: sel!(windowWillClose:), name: &*NSString::from_str("NSWindowWillCloseNotification"), object: &*window];
     }
     window.center();
     window.makeKeyAndOrderFront(None);
@@ -109,8 +116,20 @@ fn make_window(mtm: MainThreadMarker, tx: Sender<Cmd>, autostart: bool, view: Op
     window.setTitleVisibility(NSWindowTitleVisibility::Hidden);
     window.setMinSize(NSSize::new(760.0, 480.0));
 
+    PAGE_TX.with(|t| *t.borrow_mut() = Some(tx.clone()));
+    let webview = make_webview(mtm, frame, tx, autostart, view);
+    window.setContentView(Some(&webview));
+    read_direction();
+    place_lights(&window);
+    WEBVIEW.with(|w| *w.borrow_mut() = Some(webview));
+    WINDOW.with(|w| *w.borrow_mut() = Some(window.clone()));
+    Ok(window)
+}
+
+/// The page, in a new WebKit view of `frame`'s size.
+fn make_webview(mtm: MainThreadMarker, frame: NSRect, tx: Sender<Cmd>, autostart: bool, view: Option<String>) -> Retained<WKWebView> {
     // SAFETY: WebKit objects created and configured on the main thread.
-    let webview = unsafe {
+    unsafe {
         let config = WKWebViewConfiguration::new(mtm);
         let handler = MessageHandler::new(mtm, tx, autostart, view);
         config
@@ -125,13 +144,28 @@ fn make_window(mtm: MainThreadMarker, tx: Sender<Cmd>, autostart: bool, view: Op
         let _: () = msg_send![&webview, setValue: &*no, forKey: &*NSString::from_str("drawsBackground")];
         webview.loadHTMLString_baseURL(&NSString::from_str(&super::assemble::page(PAGE, prefs()["lang"].as_str())), None);
         webview
-    };
-    window.setContentView(Some(&webview));
-    read_direction();
-    place_lights(&window);
-    WEBVIEW.with(|w| *w.borrow_mut() = Some(webview));
-    WINDOW.with(|w| *w.borrow_mut() = Some(window.clone()));
-    Ok(window)
+    }
+}
+
+/// The window closed with Settings → Closing the window → Close: it lets go
+/// of its page, which ends WebKit's processes for it. The menu bar item and
+/// the engine stay; [`show_window`] makes the page again.
+fn release_page() {
+    if prefs()["closeButton"] != "close" {
+        return;
+    }
+    let Some(webview) = WEBVIEW.with(|w| w.borrow_mut().take()) else { return };
+    QUEUED.with(|q| *q.borrow_mut() = None);
+    // SAFETY: main thread; the content controller holds the message
+    // handler, which goes with the name it was added under.
+    unsafe { webview.configuration().userContentController().removeScriptMessageHandlerForName(&NSString::from_str("kiri")) };
+    WINDOW.with(|w| {
+        if let Some(window) = w.borrow().as_ref() {
+            window.setContentView(None);
+        }
+    });
+    drop(webview);
+    super::page_gone();
 }
 
 /// The page's strip across the top (index.html's `.strip`), in points.
@@ -266,6 +300,18 @@ fn show_window(mtm: MainThreadMarker) {
     NSApplication::sharedApplication(mtm).setActivationPolicy(NSApplicationActivationPolicy::Regular);
     WINDOW.with(|w| {
         if let Some(window) = w.borrow().as_ref() {
+            // The page was let go of when the window closed: a new one,
+            // which opens on its first section, as at launch.
+            if WEBVIEW.with(|v| v.borrow().is_none())
+                && let Some(tx) = PAGE_TX.with(|t| t.borrow().clone())
+            {
+                let frame = NSRect::new(NSPoint::new(0.0, 0.0), window.frame().size);
+                let webview = make_webview(mtm, frame, tx, false, None);
+                QUEUED.with(|q| *q.borrow_mut() = Some(Vec::new()));
+                window.setContentView(Some(&webview));
+                WEBVIEW.with(|v| *v.borrow_mut() = Some(webview));
+                place_lights(window);
+            }
             window.makeKeyAndOrderFront(None);
         }
     });
@@ -351,6 +397,14 @@ pub(super) fn relang() {
 /// Runs JavaScript in the page. Callable from any thread.
 pub(super) fn eval(js: String) {
     DispatchQueue::main().exec_async(move || {
+        let js = QUEUED.with(|q| match q.borrow_mut().as_mut() {
+            Some(queued) => {
+                queued.push(js);
+                None
+            }
+            None => Some(js),
+        });
+        let Some(js) = js else { return };
         WEBVIEW.with(|w| {
             if let Some(webview) = w.borrow().as_ref() {
                 let js = NSString::from_str(&js);
@@ -510,7 +564,14 @@ define_class!(
             let body = unsafe { message.body() };
             let Ok(text) = body.downcast::<NSString>() else { return };
             let ivars = self.ivars();
-            super::handle(&text.to_string(), &ivars.tx, ivars.autostart, ivars.view.as_deref());
+            let text = text.to_string();
+            // A page made again has loaded: what was sent meanwhile goes in now.
+            if serde_json::from_str::<serde_json::Value>(&text).is_ok_and(|m| m["cmd"] == "ready") {
+                for js in QUEUED.with(|q| q.borrow_mut().take()).unwrap_or_default() {
+                    eval(js);
+                }
+            }
+            super::handle(&text, &ivars.tx, ivars.autostart, ivars.view.as_deref());
         }
     }
 );
@@ -597,6 +658,12 @@ define_class!(
                     place_lights(w);
                 }
             });
+        }
+
+        /// The window is closing (its button, ⌘W or Close Window).
+        #[unsafe(method(windowWillClose:))]
+        fn window_will_close(&self, _note: &NSNotification) {
+            release_page();
         }
 
         #[unsafe(method(openWindow:))]
