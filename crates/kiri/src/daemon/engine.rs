@@ -978,6 +978,14 @@ pub fn stop_wait(secs: i64) -> Duration {
 /// whether the network has IPv4 addresses, names).
 type RenamedDns = (String, [u8; 4], Option<[u8; 16]>, bool, Vec<String>);
 
+/// The names a `DnsRename` carries: each once (the guest's DNS names are
+/// lowercase), none empty, in order (the container's name first) and no
+/// more than the frame takes (`kiri_proto::MAX_DNS_NAMES`).
+fn rename_names(names: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    names.into_iter().filter(|n| !n.is_empty() && seen.insert(n.to_ascii_lowercase())).take(kiri_proto::MAX_DNS_NAMES).collect()
+}
+
 pub struct Engine {
     pub volumes: Mutex<super::volumes::Volumes>,
     /// The VM, while it is awake. It sleeps (powers off, freeing all its
@@ -4109,14 +4117,14 @@ impl Engine {
             let mut names = vec![c.name.clone()];
             names.extend(c.spec.aliases.iter().cloned());
             names.push(hostname.to_owned());
-            out.push((n.bridge.clone(), ip, c.ip6, !n.no_ipv4, names));
+            out.push((n.bridge.clone(), ip, c.ip6, !n.no_ipv4, rename_names(names)));
         }
         for (network, ip) in &c.extra_ips {
             let Some(n) = networks.find(network).filter(|n| !n.builtin()) else { continue };
             let ip6 = c.extra_ip6s.iter().find(|(name, _)| name == network).map(|(_, ip)| *ip);
             let mut names = vec![c.name.clone(), c.short_id().to_owned()];
             names.extend(c.spec.extra_networks.iter().find(|x| &x.name == network).into_iter().flat_map(|x| x.aliases.iter().cloned()));
-            out.push((n.bridge.clone(), *ip, ip6, !n.no_ipv4, names));
+            out.push((n.bridge.clone(), *ip, ip6, !n.no_ipv4, rename_names(names)));
         }
         out
     }
@@ -7020,6 +7028,65 @@ mod leave_first_network_tests {
         assert_eq!((front.1, front.3, front.4.clone()), ([10, 98, 0, 5], true, vec!["second".to_owned(), short.clone(), "web".to_owned()]));
         let back = sent.iter().find(|u| u.0 == bridge_of("back6")).unwrap();
         assert_eq!((back.1, back.2.is_some(), back.3, back.4.clone()), ([10, 98, 1, 5], true, false, vec!["second".to_owned(), short, "api".to_owned()]));
+        done(engine, dir);
+    }
+
+    /// On its first network a rename names the container as its start did:
+    /// its name, aliases and hostname (its short ID when it has none). The
+    /// default bridge has no embedded DNS and gets nothing.
+    #[test]
+    fn a_rename_names_the_first_network_with_aliases_and_hostname() {
+        let (engine, id, dir) = engine("rename-first", &[("front", false)]);
+        let short = engine.lock().containers[&id].short_id().to_owned();
+        let bridge = engine.lock_networks().find("front").unwrap().bridge.clone();
+        {
+            let mut st = engine.lock();
+            let c = st.containers.get_mut(&id).unwrap();
+            c.pid = 4242;
+            c.status = Status::Running;
+            c.ip = Some([10, 98, 0, 7]);
+            c.spec.network_mode = "front".into();
+            c.spec.aliases = vec!["db".into()];
+        }
+        engine.rename(&id, "first").unwrap();
+        assert_eq!(engine.dns_names_after_rename(&id), [(bridge.clone(), [10, 98, 0, 7], None, true, vec!["first".to_owned(), "db".to_owned(), short])]);
+        engine.lock().containers.get_mut(&id).unwrap().spec.hostname = "box".into();
+        engine.rename(&id, "second").unwrap();
+        assert_eq!(engine.dns_names_after_rename(&id), [(bridge, [10, 98, 0, 7], None, true, vec!["second".to_owned(), "db".to_owned(), "box".to_owned()])]);
+        engine.lock().containers.get_mut(&id).unwrap().spec.network_mode = "bridge".into();
+        assert!(engine.dns_names_after_rename(&id).is_empty(), "nothing for the default bridge");
+        done(engine, dir);
+    }
+
+    /// The names sent with a rename are each there once, and never more than
+    /// the guest takes in one frame: the container's own name stays first.
+    #[test]
+    fn a_renames_names_are_deduplicated_and_bounded() {
+        let mut names = vec!["web".to_owned(), "abc123".to_owned(), "WEB".to_owned(), String::new()];
+        names.extend((0..400).map(|i| format!("alias{}", i % 300)));
+        let sent = super::rename_names(names);
+        assert_eq!(sent.len(), kiri_proto::MAX_DNS_NAMES);
+        assert_eq!(sent[..3], ["web", "abc123", "alias0"]);
+        let unique: std::collections::HashSet<_> = sent.iter().map(|n| n.to_ascii_lowercase()).collect();
+        assert_eq!(unique.len(), sent.len());
+        let (engine, id, dir) = engine("rename-many", &[("front", false)]);
+        {
+            let mut st = engine.lock();
+            let c = st.containers.get_mut(&id).unwrap();
+            c.pid = 4242;
+            c.status = Status::Running;
+            c.ip = Some([10, 98, 0, 8]);
+            c.spec.network_mode = "front".into();
+            c.spec.aliases = (0..300).map(|i| format!("a{i}")).collect();
+        }
+        engine.rename(&id, "many").unwrap();
+        let sent = engine.dns_names_after_rename(&id);
+        assert_eq!(sent[0].4.len(), kiri_proto::MAX_DNS_NAMES);
+        assert_eq!(sent[0].4[0], "many");
+        // The frame the guest gets decodes.
+        let mut buf = Vec::new();
+        kiri_proto::encode_dns_rename(&mut buf, &id, &sent[0].0, sent[0].1, sent[0].2, sent[0].3, &sent[0].4);
+        assert!(kiri_proto::decode(&buf).is_ok());
         done(engine, dir);
     }
 
