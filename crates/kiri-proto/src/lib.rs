@@ -25,6 +25,13 @@ pub const MAX_FRAME: usize = 1 << 20;
 /// Bytes before the payload: length plus kind.
 pub const HEADER: usize = 6;
 
+/// Largest frame body a sender may emit so the whole frame stays within
+/// `MAX_FRAME`. A reply built from guest- or container-controlled content (a
+/// directory listing, a `top` table) is capped to this; otherwise one huge
+/// reply overflows `MAX_FRAME`, the peer rejects the frame, and the whole VM
+/// is declared lost and restarted.
+pub const MAX_BODY: usize = MAX_FRAME - HEADER;
+
 /// Largest `Output` chunk; keeps frames well under `MAX_FRAME`.
 pub const MAX_OUTPUT_CHUNK: usize = 64 * 1024;
 /// Stdin bytes the host may have sent a process beyond what the guest has
@@ -300,10 +307,22 @@ fn put_entry(out: &mut Vec<u8>, e: &FsEntry<'_>) {
 /// Encodes an `FsList` reply from entries.
 pub fn encode_fs_list(out: &mut Vec<u8>, entries: &[FsEntry<'_>]) {
     frame(out, kind::FS_LIST, |o| {
-        put_u32(o, entries.len() as u32);
+        // Cap the reply at MAX_BODY, dropping trailing entries: a directory
+        // with thousands of long names would otherwise overflow MAX_FRAME and
+        // make the peer lose the whole VM.
+        let start = o.len();
+        put_u32(o, 0);
+        let mut n: u32 = 0;
         for e in entries {
+            // Encoded entry: 4+name | mode u32 | size u64 | mtime u64 | nsec u32 | ino u64.
+            let entry_len = 4 + e.name.len() + 4 + 8 + 8 + 4 + 8;
+            if o.len() - start + entry_len > MAX_BODY {
+                break;
+            }
             put_entry(o, e);
+            n += 1;
         }
+        o[start..start + 4].copy_from_slice(&n.to_le_bytes());
     });
 }
 
@@ -663,6 +682,29 @@ impl<'a> StrList<'a> {
             put_str(out, s.as_ref());
         }
     }
+
+    /// Like `put`, but keeps the encoded list within `budget` bytes, dropping
+    /// trailing items (and truncating a single over-long item on a char
+    /// boundary) so the frame cannot exceed `MAX_FRAME`. The count written is
+    /// the number actually encoded. Use for replies whose size the sender does
+    /// not control, such as `top` or a directory listing.
+    pub fn put_capped<S: AsRef<str>>(out: &mut Vec<u8>, items: &[S], budget: usize) {
+        let start = out.len();
+        out.extend_from_slice(&0u32.to_le_bytes());
+        let mut n: u32 = 0;
+        for s in items {
+            // Leave headroom so at least a truncated first item fits: the
+            // 4-byte count already written plus a 4-byte length prefix.
+            let s = s.as_ref();
+            let s = &s[..s.floor_char_boundary(budget.saturating_sub(8))];
+            if out.len() - start + 4 + s.len() > budget {
+                break;
+            }
+            put_str(out, s);
+            n += 1;
+        }
+        out[start..start + 4].copy_from_slice(&n.to_le_bytes());
+    }
 }
 
 mod kind {
@@ -796,27 +838,27 @@ pub fn encode_net_attach<S: AsRef<str>>(out: &mut Vec<u8>, id: &str, ifname: &st
 
 /// Encodes a `Usage` reply from the sender's lines.
 pub fn encode_usage<S: AsRef<str>>(out: &mut Vec<u8>, lines: &[S]) {
-    frame(out, kind::USAGE, |out| StrList::put(out, lines));
+    frame(out, kind::USAGE, |out| StrList::put_capped(out, lines, MAX_BODY));
 }
 
 /// Encodes a `Top` reply from the sender's lines.
 pub fn encode_top<S: AsRef<str>>(out: &mut Vec<u8>, lines: &[S]) {
-    frame(out, kind::TOP, |out| StrList::put(out, lines));
+    frame(out, kind::TOP, |out| StrList::put_capped(out, lines, MAX_BODY));
 }
 
 /// Encodes a `UsbNodes` reply from the sender's lines.
 pub fn encode_usb_nodes<S: AsRef<str>>(out: &mut Vec<u8>, lines: &[S]) {
-    frame(out, kind::USB_NODES, |out| StrList::put(out, lines));
+    frame(out, kind::USB_NODES, |out| StrList::put_capped(out, lines, MAX_BODY));
 }
 
 /// Encodes an `FsEvents` frame from the sender's `OP\tPATH` lines.
 pub fn encode_fs_events<S: AsRef<str>>(out: &mut Vec<u8>, lines: &[S]) {
-    frame(out, kind::FS_EVENTS, |out| StrList::put(out, lines));
+    frame(out, kind::FS_EVENTS, |out| StrList::put_capped(out, lines, MAX_BODY));
 }
 
 /// Encodes a `Listening` reply from the sender's lines.
 pub fn encode_listening<S: AsRef<str>>(out: &mut Vec<u8>, lines: &[S]) {
-    frame(out, kind::LISTENING, |out| StrList::put(out, lines));
+    frame(out, kind::LISTENING, |out| StrList::put_capped(out, lines, MAX_BODY));
 }
 
 /// Encodes a `Retain` frame from the sender's ids.
@@ -1633,5 +1675,42 @@ mod tests {
         Msg::LayerQuery("sha256:ab").encode(&mut buf);
         buf.truncate(buf.len() - 1);
         assert_eq!(decode(&buf), Err(DecodeError::Truncated));
+    }
+
+    #[test]
+    fn oversized_replies_stay_within_max_frame() {
+        // A single `top` line far larger than MAX_FRAME (a container process
+        // with a huge cmdline): the frame must stay decodable, not overflow.
+        let huge = "x".repeat(MAX_FRAME * 2);
+        let mut buf = Vec::new();
+        encode_top(&mut buf, &[huge.clone()]);
+        assert!(buf.len() <= MAX_FRAME, "top frame {} > MAX_FRAME", buf.len());
+        assert!(frame_len(&buf[..4].try_into().unwrap()).is_ok());
+        let Msg::Top(lines) = decode(&buf).unwrap() else { panic!() };
+        let got: Vec<_> = lines.iter().collect();
+        assert_eq!(got.len(), 1);
+        assert!(got[0].len() < huge.len()); // truncated to fit
+
+        // Many long lines: trailing ones are dropped, the frame still fits.
+        let many: Vec<String> = (0..5000).map(|_| "y".repeat(500)).collect();
+        buf.clear();
+        encode_top(&mut buf, &many);
+        assert!(buf.len() <= MAX_FRAME);
+        let Msg::Top(lines) = decode(&buf).unwrap() else { panic!() };
+        let kept = lines.iter().count();
+        assert!(kept > 0 && kept < many.len());
+
+        // Same for a directory listing with thousands of max-length names.
+        let names: Vec<String> = (0..5000).map(|_| "n".repeat(255)).collect();
+        let entries: Vec<FsEntry<'_>> = names
+            .iter()
+            .map(|n| FsEntry { name: n, mode: 0o100644, size: 0, mtime: 0, mtime_nsec: 0, ino: 1 })
+            .collect();
+        buf.clear();
+        encode_fs_list(&mut buf, &entries);
+        assert!(buf.len() <= MAX_FRAME, "fs_list frame {} > MAX_FRAME", buf.len());
+        let Msg::FsList { count, raw } = decode(&buf).unwrap() else { panic!() };
+        let kept = fs_entries(count, raw).count();
+        assert!(kept > 0 && kept < entries.len());
     }
 }
