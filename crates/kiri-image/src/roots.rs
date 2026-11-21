@@ -348,13 +348,10 @@ fn system() -> Vec<CertificateDer<'static>> {
         );
     }
     let found = rustls_native_certs::load_native_certs();
-    // Only the count: an error's text can carry certificate data, which
+    // A fixed message: an error's text can carry certificate data, which
     // doesn't belong in a log.
     if !found.errors.is_empty() {
-        eprintln!(
-            "kiri: {} part(s) of the system certificate store could not be read; the rest is trusted",
-            found.errors.len()
-        );
+        eprintln!("kiri: part of the system certificate store could not be read; the rest is trusted");
     }
     found.certs
 }
