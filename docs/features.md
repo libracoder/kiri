@@ -17,7 +17,11 @@ Apple silicon and Intel Macs (macOS 14+), Windows 10 and 11 (x86-64 and Arm, thr
   seccomp filter; `--cap-add`/`--cap-drop`, `--privileged`, `--read-only`,
   `--security-opt seccomp=unconfined` and `no-new-privileges`. Even
   privileged and unconfined containers keep the host boundary: no vsock
-  sockets (the way to the Mac) and no io_uring
+  sockets (the way to the Mac) and no io_uring — io_uring's socket
+  operation could make a socket the filter never sees, so it cannot be
+  let back in without opening the boundary; a workload that needs it
+  (Iggy, other io_uring servers) fails with EPERM, and Kiri says so in
+  the log when the container is made unconfined (#516)
 - **Networking**: a default bridge, user networks with DNS by name and
   alias, `network connect`/`disconnect` (as with Docker, a container can
   leave any of its networks, its first one too: another of its networks
