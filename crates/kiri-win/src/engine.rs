@@ -337,7 +337,11 @@ fn start_daemon() -> io::Result<()> {
     crate::serve::log("engine: not answering; starting it in WSL");
     // The engine this app installed, not one an update left behind.
     match crate::update::sync_engine() {
-        Ok(true) => crate::serve::log("engine: copied this version's engine into WSL"),
+        Ok(true) => {
+            crate::serve::log("engine: copied this version's engine into WSL");
+            // The bridge was started from the engine that was there before.
+            crate::serve::renew_bridge();
+        }
         Ok(false) => {}
         Err(e) => crate::serve::log(&format!("engine: could not copy the engine into WSL ({e}); starting the one there")),
     }

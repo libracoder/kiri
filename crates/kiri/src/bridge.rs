@@ -13,7 +13,11 @@
 //! says it does this with an ACK for connection 0 when it starts, and
 //! kiri-win asks for it per connection by sending 1 with OPEN; a kiri-win
 //! from before this ignores the first and never sends the second, and its
-//! connections get the old bounded queue.
+//! connections get the old bounded queue. The hello's data, 1, says this
+//! bridge answers a PING on connection 0 with one: how kiri-win tells a
+//! wsl.exe that runs and relays nothing (as after Windows wakes) from a
+//! bridge with nothing to say. An older kiri-win ignores the data and
+//! never sends one.
 //!
 //! A daemon that is not there (its socket missing or refusing: WSL
 //! restarted and nothing started it, or it crashed) is started here, by
@@ -53,6 +57,8 @@ const ACK: u8 = 5;
 /// a wake shows in kiri-win.log and not only in /var/log/kiri.log. A
 /// kiri-win from before this drops it: it has no connection 0.
 const NOTE: u8 = 6;
+/// On connection 0, from kiri-win: answered with the same, at once.
+const PING: u8 = 7;
 
 /// The largest frame either side accepts. Both send at most 64 KiB of
 /// data per frame; without a bound, a length of up to 4 GiB was allocated
@@ -126,8 +132,8 @@ struct Conn {
 /// Relays the frames on `input` until it ends (kiri-win has gone; its
 /// connections go too).
 fn serve(mut input: impl Read, out: &Out, starter: &Arc<Starter>) -> io::Result<()> {
-    // Hello: this bridge does flow control.
-    send(out, ACK, 0, &[])?;
+    // Hello: this bridge does flow control, and (1) answers PING.
+    send(out, ACK, 0, &[1])?;
     let mut conns: HashMap<u32, Conn> = HashMap::new();
     while let Some((kind, id, data)) = read_frame(&mut input)? {
         match kind {
@@ -143,6 +149,7 @@ fn serve(mut input: impl Read, out: &Out, starter: &Arc<Starter>) -> io::Result<
                 let (out, starter) = (out.clone(), starter.clone());
                 std::thread::Builder::new().name("kiri-bridge-w".into()).spawn(move || writer(id, &starter, &rx, &queued, &out, credit, window))?;
             }
+            PING => send(out, PING, 0, &[])?,
             ACK => {
                 if let (Some(w), Some(n)) = (conns.get(&id).and_then(|c| c.window.as_ref()), ack_count(&data)) {
                     w.ack(n);
@@ -737,6 +744,22 @@ mod tests {
             notes.push(String::from_utf8(data).unwrap());
         }
         assert_eq!(notes, ["engine not answering on its socket; starting it", "engine started"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The hello says this bridge answers PING, and it does, while a
+    /// connection waits on a daemon that says nothing.
+    #[test]
+    fn a_ping_is_answered() {
+        let (mut to_bridge, mut from_bridge, dir) = bridge("ping", |s| {
+            std::thread::sleep(Duration::from_secs(2));
+            drop(s);
+        });
+        assert_eq!(read_frame(&mut from_bridge).unwrap(), Some((ACK, 0, vec![1])));
+        frame(&mut to_bridge, OPEN, 1, &[1]);
+        frame(&mut to_bridge, DATA, 1, b"GET /events HTTP/1.1\r\n\r\n");
+        frame(&mut to_bridge, PING, 0, &[]);
+        assert_eq!(read_frame(&mut from_bridge).unwrap(), Some((PING, 0, vec![])));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
