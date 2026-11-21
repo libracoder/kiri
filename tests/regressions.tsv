@@ -109,3 +109,5 @@ bind-v-creates	#651	on a Linux host a folder made for a missing bind-mount sourc
 bind-create-0200	#651	a file a container makes with mode 0200 in a bind mount must be readable from the host by its owner; the check also runs as a plain user now
 body-too-large-answered	#651	a request body over 8 MiB to an endpoint that does not stream it got no answer: the connection was dropped
 body-too-large-chunked	#651	the same with a chunked body: an empty reply where a 413 belongs
+build-65-layers-run	#253	an image of 60 or more layers failed to start: the overlay options naming every layer did not fit in one page
+build-65-layers-lowest	#253	the lowest layer of a 65-layer image must be in its container

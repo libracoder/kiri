@@ -1254,7 +1254,14 @@ needs buildx t build-resolvconf "nameserver $DEFAULT_NS" bash -c "cd $BD && prin
 needs buildx code build-no-public-resolver 1 bash -c "cd $BD && BUILDX_BUILDER=$BX perl -e 'alarm 300; exec @ARGV' $D build --no-cache --progress plain -f Dockerfile.dns . 2>&1 | grep -q 'nameserver 8.8.8.8'"
 needs buildx t build-dns "Address" bash -c "cd $BD && printf 'FROM $FA\nRUN nslookup example.com\n' > Dockerfile.lookup && BUILDX_BUILDER=$BX perl -e 'alarm 300; exec @ARGV' $D build --no-cache --progress plain -f Dockerfile.lookup . 2>&1"
 t build-fails "exit code: 3" bash -c "cd $BD && printf 'FROM $FA\nRUN exit 3\n' > Dockerfile.bad && BUILDX_BUILDER=$BX $D build -f Dockerfile.bad . 2>&1"
-$D rmi kiri-test/built kiri-test/net >/dev/null 2>&1; rm -rf "$BD"
+# An image of 65 layers (alpine and 64 RUN lines) starts (#253): the
+# overlay's options naming each layer by digest no longer fit in one page.
+{ echo "FROM $FA"; for i in $(seq 1 64); do echo "RUN echo $i > /layer-$i"; done; } > "$BD/Dockerfile.layers"
+if [ -n "$NO_BUILDX" ]; then (cd "$BD" && perl -e 'alarm 600; exec @ARGV' $D build -f Dockerfile.layers -t kiri-test/layers65 . >/dev/null 2>&1)
+else (cd "$BD" && BUILDX_BUILDER=$BX perl -e 'alarm 600; exec @ARGV' $D build -f Dockerfile.layers -t kiri-test/layers65 . >/dev/null 2>&1); fi
+t build-65-layers-run "64" $D run --rm kiri-test/layers65 cat /layer-64
+t build-65-layers-lowest "alpine" $D run --rm kiri-test/layers65 cat /etc/os-release
+$D rmi kiri-test/built kiri-test/net kiri-test/layers65 >/dev/null 2>&1; rm -rf "$BD"
 
 section "registry: login, push, pull"
 REG=$(mktemp -d); export DOCKER_CONFIG_SAVED=${DOCKER_CONFIG:-}

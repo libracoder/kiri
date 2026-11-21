@@ -851,7 +851,7 @@ pub(super) fn mount_rootfs(paths: &Paths, id: &str, image_layers: &[&str]) -> io
     }
     // Lower dirs are relative to the agent's working directory (the layer
     // store), which keeps the option string short enough for many layers.
-    let mut lower = String::with_capacity(image_layers.len() * 65);
+    let mut lower = Vec::with_capacity(image_layers.len());
     let mut seen = Vec::new();
     for digest in image_layers.iter() {
         if !layers::present(&paths.layers, digest) {
@@ -865,13 +865,10 @@ pub(super) fn mount_rootfs(paths: &Paths, id: &str, image_layers: &[&str]) -> io
             continue;
         }
         seen.push(digest);
-        if !lower.is_empty() {
-            lower.push(':');
-        }
-        lower.push_str(layers::hex(digest)?);
+        lower.push(layers::hex(digest)?.to_owned());
     }
-    let opts = format!("lowerdir={lower},upperdir={},workdir={},{}", upper.display(), work.display(), overlay_features(plain_upper(&base)?));
-    sys::mount(c"overlay", &sys::cstr(&rootfs)?, c"overlay", 0, Some(&CString::new(opts)?))?;
+    let rest = format!(",upperdir={},workdir={},{}", upper.display(), work.display(), overlay_features(plain_upper(&base)?));
+    sys::mount_overlay(&rootfs, &lower, &rest, 0)?;
     Ok(rootfs)
 }
 
