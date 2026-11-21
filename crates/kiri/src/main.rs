@@ -1,5 +1,9 @@
 //! The `kiri` command.
 
+// Share's roots, aliased at the crate root so its crate::roots::trusted()
+// resolves; kiri-win mounts the same file by #[path] instead.
+#[cfg(any(unix, windows))]
+use kiri_image::roots;
 use std::process::ExitCode;
 
 #[cfg(target_os = "macos")]
@@ -68,8 +72,6 @@ mod usb;
 mod stale;
 #[cfg(windows)]
 mod wsl;
-#[cfg(any(unix, windows))]
-use kiri_image::roots;
 #[cfg(any(unix, windows))]
 mod share;
 #[cfg(any(target_os = "macos", all(target_os = "linux", feature = "window")))]
