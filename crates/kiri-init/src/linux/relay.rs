@@ -437,11 +437,15 @@ pub fn listen_ssh_agent() -> io::Result<OwnedFd> {
     let _ = std::fs::remove_file(SSH_AGENT_SOCK);
     // SAFETY: plain unix socket setup; the fd is owned immediately.
     unsafe {
-        // The socket below is 0777 for any user in a container. On a Linux
-        // host this directory is the host's own, so only root, which
-        // bind-mounts the socket into containers, may reach it by path.
-        let dir = std::ffi::CString::new("/run/host-services").expect("no NUL");
-        sys::check(libc::chmod(dir.as_ptr(), 0o700) as _, "chmod /run/host-services")?;
+        // The socket below is 0777 for any user in a container, and the
+        // directory is Kiri's own in the VM: root-only. On a Linux host
+        // /run/host-services is a shared convention (Docker Desktop writes
+        // its docker.proxy.sock beside ours), so it stays as it is there
+        // (#420).
+        if !super::transport::is_host_process() {
+            let dir = std::ffi::CString::new("/run/host-services").expect("no NUL");
+            sys::check(libc::chmod(dir.as_ptr(), 0o700) as _, "chmod /run/host-services")?;
+        }
         let fd = sys::check(libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK, 0) as _, "socket")?;
         let sock = OwnedFd::from_raw_fd(fd as RawFd);
         let mut a: libc::sockaddr_un = std::mem::zeroed();
