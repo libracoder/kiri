@@ -282,6 +282,10 @@ struct Prepared {
     /// `--network container:<id>`: that container's network namespace, joined
     /// instead of a new one.
     net_join: Option<fs::File>,
+    /// The fallback clone (a host sandbox without clone3) cannot spawn the
+    /// child straight into its cgroup: it moves itself here first thing,
+    /// by writing 0 to this cgroup's cgroup.procs (#529).
+    self_cgroup: Option<std::path::PathBuf>,
     /// Generated /etc files to bind over the image's: (source, target relative to the root).
     etc_files: Vec<(CString, CString)>,
     mounts: Vec<Mount>,
@@ -597,8 +601,9 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
     };
     // Worked out here, so the child's first step allocates nothing.
     let close_first = sys::close_ranges(&child_fds(&prepared, &child_io));
-    // SAFETY: the agent is single-threaded, as clone3 without CLONE_VM needs.
-    let cloned = unsafe { sys::clone3(&args) };
+    // SAFETY: the agent is single-threaded, as clone3 (and the old clone
+    // it falls back to) without CLONE_VM needs.
+    let cloned = unsafe { clone_or_old(&args, flags & !CLONE_INTO_CGROUP, &cgroup, &mut prepared) };
     if let Ok(0) = cloned {
         container_child(&prepared, &rootfs_c, &child_io, &close_first);
     }
@@ -919,8 +924,9 @@ pub fn exec(spec: &ExecSpec<'_>, target_pid: libc::pid_t, paths: &Paths, profile
     // stays the agent's direct child. The agent's own namespace is put back
     // right after.
     sys::setns(target_pid_ns.as_raw_fd(), libc::CLONE_NEWPID)?;
-    // SAFETY: the agent is single-threaded, as clone3 without CLONE_VM needs.
-    let mut cloned = unsafe { sys::clone3(&args) };
+    // SAFETY: the agent is single-threaded, as clone3 (and the old clone
+    // it falls back to) without CLONE_VM needs.
+    let mut cloned = unsafe { clone_or_old(&args, 0, &paths.cgroup.join(spec.container_id), &mut prepared) };
     // A container that manages its own cgroups (Docker in Docker, BuildKit)
     // moves its processes into sub-cgroups, after which its own cgroup takes
     // no processes. Join the one its init lives in, as runc does.
@@ -1184,6 +1190,7 @@ fn prepare(argv: StrList<'_>, env: StrList<'_>, cwd: &str, user: &str, hostname:
         hostname: hostname.map(|h| h.as_bytes().to_vec()),
         domainname: None,
         net_join: None,
+        self_cgroup: None,
         etc_files: Vec::new(),
         mounts: Vec::new(),
         net_ready: None,
@@ -1782,6 +1789,7 @@ fn child_fds(p: &Prepared, io: &ChildStdio) -> Vec<RawFd> {
         hostname: _,
         domainname: _,
         net_join,
+        self_cgroup: _,
         etc_files: _,
         mounts: _,
         net_ready,
@@ -1819,6 +1827,24 @@ fn child_fds(p: &Prepared, io: &ChildStdio) -> Vec<RawFd> {
 
 /// Runs in the cloned child: PID 1 of the container, in its own namespaces
 /// and cgroup. Never returns: it execs or exits 127 with a message.
+/// clone3 into the namespaces and the cgroup; where a host sandbox blocks
+/// clone3 with ENOSYS (Android's Droidspaces and the like), the old clone
+/// carries the same namespaces, and the child moves itself into `cgroup`
+/// first thing (recorded on `p`) as `CLONE_INTO_CGROUP` is clone3's alone
+/// (#529). `ns_flags` are the flags the fallback passes on.
+unsafe fn clone_or_old(args: &CloneArgs, ns_flags: u64, cgroup: &std::path::Path, p: &mut Prepared) -> io::Result<libc::pid_t> {
+    // SAFETY: the caller upholds the single-thread requirement of both.
+    unsafe {
+        match sys::clone3(args) {
+            Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => {
+                p.self_cgroup = Some(cgroup.to_path_buf());
+                sys::clone_old(ns_flags | libc::SIGCHLD as u64)
+            }
+            other => other,
+        }
+    }
+}
+
 fn container_child(p: &Prepared, rootfs: &CStr, io: &ChildStdio, close_first: &[(libc::c_uint, libc::c_uint)]) -> ! {
     // First of all: the clone gave this child a copy of every descriptor
     // the agent had open, and filling a new volume can take seconds while
@@ -1833,6 +1859,12 @@ fn container_child(p: &Prepared, rootfs: &CStr, io: &ChildStdio, close_first: &[
     sys::close_now(close_first);
     let err = report_fd(io);
     let fail = |what: &str, e: io::Error| -> ! { child_fail(err, what, e) };
+
+    // The fallback clone could not spawn straight into the cgroup: this
+    // child moves itself in first thing (#529), before its limits apply.
+    if let Some(dir) = &p.self_cgroup {
+        fs::write(std::path::Path::new(dir).join("cgroup.procs"), b"0").unwrap_or_else(|e| fail("join cgroup", e));
+    }
 
     // Mount events must not leak back into the agent's namespace.
     sys::remount(c"/", libc::MS_REC | libc::MS_PRIVATE).unwrap_or_else(|e| fail("make mounts private", e));
@@ -1916,6 +1948,11 @@ fn container_child(p: &Prepared, rootfs: &CStr, io: &ChildStdio, close_first: &[
 /// namespaces (the PID namespace was set before clone), then execs.
 fn exec_child(p: &Prepared, namespaces: &[(fs::File, libc::c_int)], io: &ChildStdio) -> ! {
     let err = report_fd(io);
+    // The fallback clone's self-move into the container's cgroup (#529),
+    // before any namespace is joined: the path is the agent's own still.
+    if let Some(dir) = &p.self_cgroup {
+        let _ = fs::write(std::path::Path::new(dir).join("cgroup.procs"), b"0");
+    }
     for (fd, kind) in namespaces {
         sys::setns(fd.as_raw_fd(), *kind).unwrap_or_else(|e| child_fail(err, "join container", e));
     }

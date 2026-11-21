@@ -130,6 +130,28 @@ pub unsafe fn clone3(args: &CloneArgs) -> io::Result<libc::pid_t> {
     check(ret, "clone3").map(|p| p as libc::pid_t)
 }
 
+/// The old `clone`, for a host sandbox that blocks `clone3` with ENOSYS
+/// (Android's Droidspaces and the like; #529). Without `CLONE_VM` it works
+/// as fork does: 0 in the new process, the pid in this one. The flags carry
+/// the namespaces; `CLONE_INTO_CGROUP` is clone3's alone, so a caller moves
+/// the child into its cgroup another way.
+pub unsafe fn clone_old(flags: libc::c_ulong) -> io::Result<libc::pid_t> {
+    // SAFETY: a plain clone with a null stack (the child keeps a copy of
+    // this one) and no tls or tid pointers, as fork-style clone takes; the
+    // caller upholds the single-thread requirement.
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_clone,
+            flags,
+            std::ptr::null::<libc::c_void>(),
+            std::ptr::null::<libc::c_int>(),
+            std::ptr::null::<libc::c_void>(),
+            std::ptr::null::<libc::c_void>(),
+        )
+    };
+    check(ret, "clone").map(|p| p as libc::pid_t)
+}
+
 /// The engine's own message as one line of the container's log: a value
 /// over several lines (a key a `user:` named) never goes on, unhidden, over
 /// the lines after it.
