@@ -8,7 +8,7 @@
 use std::ffi::CString;
 use std::fs;
 use std::io::{self, BufReader, Read};
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -172,6 +172,9 @@ fn untar_in(reader: impl Read, dest: &Path, detect_userns: fn() -> bool) -> io::
     archive.set_unpack_xattrs(true);
     archive.set_overwrite(true);
     let mut total = 0u64;
+    // Each directory's time, set once the layer is unpacked: tar-rs gives a
+    // directory none, and what is unpacked into it later would move it.
+    let mut dir_times = std::collections::BTreeMap::new();
     for entry in archive.entries()? {
         let mut entry = entry?;
         let path = entry.path()?.into_owned();
@@ -219,7 +222,18 @@ fn untar_in(reader: impl Read, dest: &Path, detect_userns: fn() -> bool) -> io::
             make_special(dest, &path, entry.header(), kind, userns)?;
         } else if entry.unpack_in(dest)? {
             keep_zero_time(dest, &path, entry.header())?;
+            if entry.header().entry_type().is_dir()
+                && let Ok(mtime) = entry.header().mtime()
+            {
+                dir_times.insert(path, mtime);
+            }
         }
+    }
+    let root = inroot::open_root(dest)?;
+    // Deepest first, as Docker sets them (#676). A directory a later entry
+    // removed, or made something else, is skipped.
+    for (dir, mtime) in dir_times.iter().rev() {
+        let _ = set_dir_time(root.as_fd(), dir, *mtime);
     }
     Ok(total)
 }
@@ -316,6 +330,32 @@ pub(crate) fn keep_zero_time(dest: &Path, path: &Path, h: &tar::Header) -> io::R
     Ok(())
 }
 
+/// Sets directory `rel`'s access and modification times to `mtime`, opening
+/// each part of its path with O_NOFOLLOW: a symlink on the way, which a
+/// later entry may have put there, is not followed, and nothing is made.
+fn set_dir_time(root: BorrowedFd<'_>, rel: &Path, mtime: u64) -> io::Result<()> {
+    let mut dir = root.try_clone_to_owned()?;
+    for part in rel.components() {
+        let name = match part {
+            std::path::Component::Normal(name) => name,
+            std::path::Component::CurDir | std::path::Component::RootDir => continue,
+            _ => return Err(escapes()),
+        };
+        let name = sys::cstr(Path::new(name))?;
+        // SAFETY: a valid directory descriptor and a NUL-terminated name.
+        let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+        sys::check(fd as _, "open directory")?;
+        // SAFETY: a fresh descriptor nothing else owns.
+        dir = unsafe { OwnedFd::from_raw_fd(fd) };
+    }
+    let secs = i64::try_from(mtime).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "directory time out of range"))?;
+    let time = libc::timespec { tv_sec: secs, tv_nsec: 0 };
+    // SAFETY: a valid descriptor and two timespecs.
+    let ret = unsafe { libc::futimens(dir.as_raw_fd(), [time, time].as_ptr()) };
+    sys::check(ret as _, "set directory time")?;
+    Ok(())
+}
+
 fn escapes() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "archive path escapes the layer")
 }
@@ -377,6 +417,49 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn directories_keep_the_layers_time() {
+        use std::os::unix::fs::MetadataExt;
+
+        // #676: a directory, an empty one, and one whose files come after it.
+        let dir = |path: &str, mtime: u64| {
+            let mut h = header(0, 0o755);
+            h.set_entry_type(tar::EntryType::Directory);
+            h.set_mtime(mtime);
+            h.set_cksum();
+            (h, path.to_owned())
+        };
+        let mut b = tar::Builder::new(Vec::new());
+        for (mut h, p) in [dir("usr", 1_000_000), dir("usr/bin", 2_000_000), dir("mnt", 3_000_000)] {
+            b.append_data(&mut h, p, io::empty()).unwrap();
+        }
+        let mut h = header(2, 0o755);
+        h.set_mtime(4_000_000);
+        h.set_cksum();
+        b.append_data(&mut h, "usr/bin/tool", &b"#!"[..]).unwrap();
+        let bytes = b.into_inner().unwrap();
+
+        let dest = scratch("dir-times");
+        untar(Capped { inner: &bytes[..], left: u64::MAX }, &dest).unwrap();
+        let mtime = |p: &str| fs::symlink_metadata(dest.join(p)).unwrap().mtime();
+        assert_eq!(mtime("usr"), 1_000_000);
+        assert_eq!(mtime("usr/bin"), 2_000_000, "after its file was unpacked into it");
+        assert_eq!(mtime("mnt"), 3_000_000, "an empty one");
+        assert_eq!(mtime("usr/bin/tool"), 4_000_000);
+
+        // A directory a later entry turned into a symlink (after a whiteout
+        // removed it): its time is not set through the link, nor through a
+        // link on the way.
+        std::os::unix::fs::symlink("/mnt", dest.join("swapped")).unwrap();
+        let root = inroot::open_root(&dest).unwrap();
+        assert!(set_dir_time(root.as_fd(), Path::new("swapped"), 9).is_err());
+        assert!(set_dir_time(root.as_fd(), Path::new("swapped/x"), 9).is_err());
+        assert!(set_dir_time(root.as_fd(), Path::new("gone"), 9).is_err(), "nothing is made");
+        assert!(!dest.join("gone").exists());
+        assert_eq!(mtime("mnt"), 3_000_000, "the link's target keeps its own time");
+        fs::remove_dir_all(dest).unwrap();
     }
 
     #[test]

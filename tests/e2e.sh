@@ -1371,7 +1371,10 @@ fi
 t import-platform "linux/amd64" bash -c "$D export ren2 | $D import --platform linux/amd64 - kiri-test/imported:3 >/dev/null && $D image inspect -f '{{.Os}}/{{.Architecture}}' kiri-test/imported:3"
 t import-not-tar "isn't a tar archive" bash -c "echo nope | $D import - kiri-test/imported:4"
 t import-bad-change "not a valid change command" bash -c "$D export ren2 | $D import -c 'FROM alpine' - kiri-test/imported:4"
-$D rmi kiri-test/imported:1 kiri-test/imported:2 kiri-test/imported:3 >/dev/null 2>&1
+# A directory keeps its time from the layer, after files are unpacked into
+# it too, as on Docker (#676).
+t import-dir-mtime "1000000000" bash -c "$D export ren2 | python3 -c 'import io,sys,tarfile; s=tarfile.open(fileobj=sys.stdin.buffer,mode=\"r|*\"); o=tarfile.open(fileobj=sys.stdout.buffer,mode=\"w|\"); [o.addfile(m,s.extractfile(m) if m.isreg() else None) for m in s]; d=tarfile.TarInfo(\"dated\"); d.type,d.mode,d.mtime=tarfile.DIRTYPE,0o755,1000000000; o.addfile(d); f=tarfile.TarInfo(\"dated/f\"); f.mtime=1000000000; o.addfile(f,io.BytesIO()); o.close()' | $D import - kiri-test/imported:7 >/dev/null && $D run --rm kiri-test/imported:7 stat -c %Y /dated"
+$D rmi kiri-test/imported:1 kiri-test/imported:2 kiri-test/imported:3 kiri-test/imported:7 >/dev/null 2>&1
 t commit "sha256:" $D commit -c 'CMD ["cat","/added"]' -c 'ENV KIRI=1' ren2 kiri-test/committed:1
 t commit-runs "hi" $D run --rm kiri-test/committed:1
 t commit-env "KIRI=1" $D run --rm kiri-test/committed:1 env
