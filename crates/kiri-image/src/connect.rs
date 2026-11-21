@@ -232,28 +232,62 @@ impl Transport for TcpTransport {
     fn await_input(&mut self, timeout: NextTimeout) -> Result<bool, Error> {
         let timeout = timeout.for_read();
         let limit = capped(remaining(timeout)?, self.stall);
-        if limit != self.timeout_read {
-            self.stream.set_read_timeout(limit)?;
-            self.timeout_read = limit;
-        }
         // A cancelled pull's reads end here, or at once if already waiting.
         crate::cancel::watch(&self.stream)?;
+        let interruptible = crate::cancel::active();
         let started = Instant::now();
         let input = self.buffers.input_append_buf();
         let amount = loop {
+            if crate::cancel::is_cancelled() {
+                return Err(Error::Io(io::Error::other("pull cancelled")));
+            }
+            let left = limit.map(|l| l.saturating_sub(started.elapsed()));
+            if left.is_some_and(|l| l.is_zero()) {
+                return Err(Error::Timeout(timeout.reason));
+            }
+            // Only cancel-scoped reads poll; other connections keep the full stall timeout.
+            let read_timeout = if interruptible {
+                Some(left.map_or(crate::cancel::INTERRUPT, |l| {
+                    l.min(crate::cancel::INTERRUPT)
+                }))
+            } else {
+                left
+            };
+            if read_timeout != self.timeout_read {
+                self.stream.set_read_timeout(read_timeout)?;
+                self.timeout_read = read_timeout;
+            }
             match (&*self.stream).read(input) {
                 // A signal: Linux does not restart a socket read that has a
                 // timeout, so go again with what is left of it.
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {
-                    let Some(limit) = limit else {
+                    if !interruptible && limit.is_none() {
                         return Err(Error::Io(e));
-                    };
-                    let left = limit.saturating_sub(started.elapsed());
-                    if left.is_zero() {
+                    }
+                    if limit.is_some_and(|l| l <= started.elapsed()) {
                         return Err(Error::Timeout(timeout.reason));
                     }
-                    self.stream.set_read_timeout(Some(left))?;
-                    self.timeout_read = Some(left);
+                }
+                Err(e)
+                    if interruptible
+                        && matches!(
+                            e.kind(),
+                            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                        )
+                        && crate::cancel::is_cancelled() =>
+                {
+                    return Err(Error::Io(io::Error::other("pull cancelled")));
+                }
+                Err(e)
+                    if interruptible
+                        && matches!(
+                            e.kind(),
+                            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                        ) =>
+                {
+                    if limit.is_some_and(|l| l <= started.elapsed()) {
+                        return Err(Error::Timeout(timeout.reason));
+                    }
                 }
                 result => break result.map_err(|e| io_error(e, timeout.reason))?,
             }

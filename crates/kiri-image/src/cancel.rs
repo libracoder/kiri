@@ -17,6 +17,8 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone, Default)]
 pub struct Cancel(Arc<Inner>);
 
+pub(crate) const INTERRUPT: Duration = Duration::from_millis(50);
+
 #[derive(Debug, Default)]
 struct Inner {
     cancelled: AtomicBool,
@@ -73,6 +75,7 @@ impl Cancel {
     fn watch(&self, stream: &Arc<TcpStream>) -> io::Result<()> {
         let mut streams = self.0.streams.lock().unwrap_or_else(|e| e.into_inner());
         if self.is_cancelled() {
+            let _ = stream.shutdown(Shutdown::Both);
             return Err(io::Error::other("pull cancelled"));
         }
         streams.retain(|s| s.strong_count() > 0);
@@ -102,6 +105,14 @@ pub(crate) fn watch(stream: &Arc<TcpStream>) -> io::Result<()> {
     })
 }
 
+pub(crate) fn active() -> bool {
+    CURRENT.with(|c| c.borrow().is_some())
+}
+
+pub(crate) fn is_cancelled() -> bool {
+    CURRENT.with(|c| c.borrow().as_ref().is_some_and(Cancel::is_cancelled))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,9 +131,32 @@ mod tests {
             std::thread::spawn(move || {
                 let _on = cancel.enter();
                 watch(&client).unwrap();
+                client.set_read_timeout(Some(INTERRUPT)).unwrap();
                 let started = Instant::now();
-                let n = (&*client).read(&mut [0u8; 16]).unwrap_or(0);
-                (n, started.elapsed())
+                let mut buf = [0u8; 16];
+                loop {
+                    match (&*client).read(&mut buf) {
+                        Ok(n) => break (n, started.elapsed()),
+                        Err(e)
+                            if matches!(
+                                e.kind(),
+                                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                            ) && cancel.is_cancelled() =>
+                        {
+                            break (0, started.elapsed());
+                        }
+                        Err(e)
+                            if matches!(
+                                e.kind(),
+                                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                            ) =>
+                        {
+                            continue;
+                        }
+                        Err(_) if cancel.is_cancelled() => break (0, started.elapsed()),
+                        Err(e) => panic!("read failed: {e}"),
+                    }
+                }
             })
         };
         std::thread::sleep(Duration::from_millis(100));
