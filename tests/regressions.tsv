@@ -143,3 +143,6 @@ frame-limit-request-alone	#658	a request over the agent's frame limit ended the 
 user-boundaries	#664	a numeric user not in /etc/passwd did not get group 0
 ncpu-engine-cpus	#659	on a Linux host docker info's NCPU was the Mac VM's default of 2, not the CPUs the engine may run on
 ncpu-affinity	#659	an engine under a three-CPU affinity mask must say NCPU 3 (the old count said 2)
+tls-company-root-pull	#303	a registry signed by a root the system trusts failed UnknownIssuer: only the bundled roots were trusted
+tls-company-root-login	#303	docker login to a registry signed by a root the system trusts failed UnknownIssuer
+tls-unknown-root-refused	#303	a root the system does not trust must still be refused

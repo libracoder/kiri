@@ -16,7 +16,8 @@ N=${N:-kiri-linux-host}
 kiri_seed_images alpine:latest || echo "linux-host: alpine could not be fetched"
 $D rm -f "$N" >/dev/null 2>&1
 $D run -d --name "$N" --privileged --tmpfs /run -v "$N":/var/lib/kiri -v "$N"-store:/root/.local/share/kiri \
-  -v "$BIN:/opt/kiri:ro" alpine sh -c 'apk add -q docker-cli curl python3 >/dev/null 2>&1; exec /opt/kiri/kiri daemon' >/dev/null
+  -v "$BIN:/opt/kiri:ro" -v "$(cd "$(dirname "$0")" && pwd)/lib/registry-certs.sh:/registry-certs.sh:ro" \
+  alpine sh -c 'apk add -q docker-cli curl python3 openssl >/dev/null 2>&1; sh /registry-certs.sh; exec /opt/kiri/kiri daemon' >/dev/null
 # Up to 3 minutes: the container installs its tools with apk first, which can take over a minute.
 up() { for _ in $(seq 180); do $D exec "$N" sh -c 'DOCKER_HOST=unix:///root/.kiri/run/docker.sock docker version' >/dev/null 2>&1 && break; sleep 1; done; }
 up
@@ -303,6 +304,21 @@ $D restart -t 20 "$N" >/dev/null; up
 t ij-layers-kept-next-start "layers $IJ_LAYERS" "docker run --rm alpine:3.21 true; echo layers \$(ls /var/lib/kiri/layers | wc -l)"
 t ij-cleanup "done" "rm -f $ST/images.json.corrupt-*; echo done"
 t ij-warning-gone "[]" "docker info --format '{{json .Warnings}}'"
+# Registries whose certificate a company root signs (#303). The root went
+# into the system's store before the engine started (lib/registry-certs.sh);
+# the engine trusts that store as well as its bundled roots, for pulls and
+# for docker login, and still refuses a root the system doesn't have. The
+# registries serve one image store: pushed to over plain HTTP on loopback,
+# read over TLS at names for the container's own address.
+$D exec "$N" sh -c 'grep -q kiri-trusted.test /etc/hosts || echo "$(hostname -i | cut -d" " -f1) kiri-trusted.test kiri-other.test" >> /etc/hosts'
+REGS="docker rm -f kiri-reg-http kiri-reg-trusted kiri-reg-other >/dev/null 2>&1
+docker run -d --name kiri-reg-http -p 5055:5000 -v kiri-regdata:/var/lib/registry registry:2 >/dev/null
+for ca in trusted:5443 other:5444; do docker run -d --name kiri-reg-\${ca%:*} -p \${ca#*:}:5000 -v kiri-regdata:/var/lib/registry -v /tls:/tls:ro -e REGISTRY_HTTP_TLS_CERTIFICATE=/tls/\${ca%:*}.pem -e REGISTRY_HTTP_TLS_KEY=/tls/\${ca%:*}.key registry:2 >/dev/null; done
+for i in \$(seq 60); do curl -s -o /dev/null localhost:5055/v2/ && break; sleep 0.25; done"
+t registry-setup "pushed" "$REGS; docker tag alpine:3.21 localhost:5055/team/alp:1 && docker push -q localhost:5055/team/alp:1 >/dev/null && docker rmi localhost:5055/team/alp:1 >/dev/null && echo pushed"
+t tls-company-root-pull "Downloaded newer image" "docker pull kiri-trusted.test:5443/team/alp:1 2>&1"
+t tls-company-root-login "Login Succeeded" "echo kiri | docker login kiri-trusted.test:5443 -u kiri --password-stdin 2>&1"
+t tls-unknown-root-refused "UnknownIssuer" "docker pull kiri-other.test:5444/team/alp:1 2>&1"
 # Docker on the same host (#247): its firewall makes iptables' FORWARD
 # policy drop, and a forwarded packet must pass every chain on the hook, so
 # Kiri's own table accepting it was not enough and containers had no
