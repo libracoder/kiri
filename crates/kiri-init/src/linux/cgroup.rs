@@ -14,8 +14,10 @@ use super::sys;
 pub fn apply_limits(dir: &Path, l: &Limits) -> io::Result<()> {
     let write = |file: &str, value: String| fs::write(dir.join(file), value).map_err(|e| io::Error::new(e.kind(), format!("{file}: {e}")));
     write("memory.max", if l.memory_max == 0 { "max".into() } else { l.memory_max.to_string() })?;
-    // No swap in the VM: a limit is a limit.
-    let _ = fs::write(dir.join("memory.swap.max"), "0");
+    // Docker's default `--memory-swap` (twice `--memory`): a limited
+    // container gets its limit again as swap, an unlimited one all of it
+    // (#523).
+    let _ = fs::write(dir.join("memory.swap.max"), if l.memory_max == 0 { "max".to_owned() } else { l.memory_max.to_string() });
     let period = if l.cpu_period == 0 { 100_000 } else { l.cpu_period };
     write("cpu.max", if l.cpu_quota == 0 { format!("max {period}") } else { format!("{} {period}", l.cpu_quota) })?;
     write("cpu.weight", if l.cpu_weight == 0 { "100".into() } else { l.cpu_weight.clamp(1, 10_000).to_string() })?;
