@@ -520,8 +520,9 @@ mod tests {
         EVENTS.lock().unwrap().push(tx);
         handle("open", "w1", &serde_json::json!({"shell": "cmd", "cols": 100, "rows": 20}), record);
         let typed = |s: &str| handle("input", "w1", &Value::String(termwire::b64(s.as_bytes())), record);
-        // cmd prints its prompt once it's ready for input.
-        output_until(&rx, "w1", ">");
+        // cmd's banner: its prompt is the user's own (Clink's AutoRun draws `❯`, not `>`),
+        // and what is typed before it shows waits in the console's input.
+        output_until(&rx, "w1", "Microsoft Corporation");
         typed("set /a 40+2 & echo. & echo DONE\r");
         let (out, _) = output_until(&rx, "w1", "DONE");
         assert!(out.contains("42"), "{out}");

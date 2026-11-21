@@ -2321,7 +2321,8 @@ fn yaml_at(e: &str, p: &Project, full: bool) -> Option<YamlAt> {
 
 /// `path` relative to `dir` (`../x/compose.yaml` outside it).
 fn relative(dir: &Path, path: &Path) -> String {
-    let (d, f) = (std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_owned()), std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned()));
+    // Plain on both sides: on Windows a canonical path is `\\?\C:\…`, one that isn't there stays `C:\…`.
+    let (d, f) = (real_path(dir).unwrap_or_else(|_| dir.to_owned()), real_path(path).unwrap_or_else(|_| path.to_owned()));
     let (a, b): (Vec<_>, Vec<_>) = (d.components().collect(), f.components().collect());
     let same = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
     let mut out = PathBuf::new();
@@ -5563,12 +5564,24 @@ mod tests {
     /// The docker CLI with no engine to reach (`config --environment` needs
     /// none) and an environment of its own, so a test sees only its `.env`.
     fn dcli() -> io::Result<Command> {
-        let mut c = Command::new(client::docker_cli().expect("a docker CLI"));
+        Ok(bare(Command::new(client::docker_cli().expect("a docker CLI"))))
+    }
+
+    /// `c` with only what the docker CLI needs of this environment, and no
+    /// engine to reach.
+    fn bare(mut c: Command) -> Command {
         c.env_clear().env("PATH", std::env::var_os("PATH").unwrap_or_default()).env("HOME", std::env::var_os("HOME").unwrap_or_default()).env("DOCKER_HOST", "unix:///nonexistent/kiri-test.sock");
-        if let Some(d) = std::env::var_os("DOCKER_CONFIG") {
-            c.env("DOCKER_CONFIG", d);
+        // On Windows the CLI finds its plugins (compose) under USERPROFILE, and
+        // its network needs SystemRoot; HOME is not set there.
+        for k in ["DOCKER_CONFIG", "USERPROFILE", "SystemRoot"] {
+            if let Some(v) = std::env::var_os(k) {
+                c.env(k, v);
+            }
         }
-        Ok(c)
+        // As the app's own CLI: no console window for each of the tests' many runs.
+        #[cfg(windows)]
+        std::os::windows::process::CommandExt::creation_flags(&mut c, 0x0800_0000);
+        c
     }
 
     fn dproj(d: &Path) -> Project {
@@ -5832,7 +5845,7 @@ mod tests {
         let d = std::env::temp_dir().join(format!("kiri-compose-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
-        std::fs::canonicalize(&d).unwrap()
+        real_path(&d).unwrap()
     }
 
     #[test]
@@ -5976,7 +5989,7 @@ mod tests {
         fn outside(p: &Path) {
             std::fs::write(p, "services: {}\n# theirs\n").unwrap();
         }
-        *BETWEEN.lock().unwrap() = Some((std::fs::canonicalize(&f).unwrap(), outside));
+        *BETWEEN.lock().unwrap() = Some((real_path(&f).unwrap(), outside));
         let r = save(&f, "services:\n  a: {}\n", &base);
         *BETWEEN.lock().unwrap() = None;
         assert!(r.as_ref().is_err_and(changed), "{r:?}");
@@ -6868,7 +6881,7 @@ mod tests {
         let m = config(dcli, &p, Some(draft), &[]).unwrap();
         let v = service_view("x", &m["services"]["x"]);
         assert_eq!(v["ports"], json!(["8080:80"]));
-        assert!(v["volumes"][0].as_str().unwrap().ends_with("certs/server.key:/k"), "{v}");
+        assert!(v["volumes"][0].as_str().unwrap().replace('\\', "/").ends_with("certs/server.key:/k"), "{v}");
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -7228,7 +7241,8 @@ mod tests {
         assert_eq!(m["services"]["inc"]["image"], "reg/app:${DB_PASSWORD}");
         assert_eq!(m["services"]["deep"]["image"], "reg/deep:${DEEP_TOKEN}");
         assert_eq!(m["services"]["long"]["image"], "reg/long:${API_SECRET}");
-        assert!(text.contains("/sub/data/${DB_PASSWORD}"), "{text}");
+        // On Windows a JSON string's `\` is `\\`.
+        assert!(text.replace(r"\\", "/").contains("/sub/data/${DB_PASSWORD}"), "{text}");
         // An error that quotes the value names the variable.
         std::fs::write(d.join("sub/compose.yaml"), "services:\n  inc:\n    image: alpine\n    ports: [\"${DB_PASSWORD}:80\"]\n").unwrap();
         let e = config(dcli, &p, None, &[]).unwrap_err();
@@ -8055,8 +8069,8 @@ mod tests {
         fn hangs() -> io::Result<Command> {
             let docker = client::docker_cli().expect("a docker CLI");
             let script = format!("case \"$*\" in *'config --quiet'*) sleep 5; exit 1;; esac; exec '{}' \"$@\"", std::path::Path::new(&docker).display());
-            let mut c = Command::new("sh");
-            c.env_clear().env("PATH", std::env::var_os("PATH").unwrap_or_default()).env("HOME", std::env::var_os("HOME").unwrap_or_default()).env("DOCKER_HOST", "unix:///nonexistent/kiri-test.sock").args(["-c", &script, "sh"]);
+            let mut c = bare(Command::new("sh"));
+            c.args(["-c", &script, "sh"]);
             Ok(c)
         }
         let d = tdir("realslow");
@@ -8311,8 +8325,8 @@ mod tests {
         let docker = client::docker_cli().expect("a docker CLI");
         let log = std::env::temp_dir().join(format!("kiri-compose-count-{}", std::process::id()));
         let script = format!("echo \"$*\" >> '{}'; exec '{}' \"$@\"", log.display(), std::path::Path::new(&docker).display());
-        let mut c = Command::new("sh");
-        c.env_clear().env("PATH", std::env::var_os("PATH").unwrap_or_default()).env("HOME", std::env::var_os("HOME").unwrap_or_default()).env("DOCKER_HOST", "unix:///nonexistent/kiri-test.sock").args(["-c", &script, "sh"]);
+        let mut c = bare(Command::new("sh"));
+        c.args(["-c", &script, "sh"]);
         Ok(c)
     }
 
