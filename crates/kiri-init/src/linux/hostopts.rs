@@ -240,6 +240,43 @@ fn same_namespace(a: &fs::File, b: &fs::File) -> io::Result<bool> {
     Ok((a.dev(), a.ino()) == (b.dev(), b.ino()))
 }
 
+/// The open-files limit (soft and hard) for the VM's engine, from
+/// `/proc/sys/fs/nr_open`: what dockerd and containerd run with on Linux
+/// (`LimitNOFILE=infinity`) and on Docker Desktop, and so what a container
+/// or a BuildKit RUN inherits there (`ulimit -n` 1048576). The
+/// kernel starts PID 1 at 1024, which every step and container in the VM
+/// inherited.
+pub fn engine_nofile(nr_open: &str) -> u64 {
+    nr_open.trim().parse().ok().filter(|n| *n >= 1 << 20).unwrap_or(1 << 20)
+}
+
+/// The limits the engine's agent sets on itself as it starts, before it
+/// starts anything, so that every container and build step inherits them
+/// (a run's own `--ulimit` still replaces them in the child). In the VM the
+/// agent is PID 1 and has the kernel's defaults; in a WSL distro or a
+/// container it has whatever started it. `nr_open` is
+/// `/proc/sys/fs/nr_open`, read in the VM only (`None` elsewhere: a Linux
+/// host's unit sets the open-files limit, `LimitNOFILE` in kiri.service).
+///
+/// No process and no core-size limit, soft or hard: dockerd and containerd
+/// run with `LimitNPROC=infinity` and `LimitCORE=infinity`, so a container
+/// or a BuildKit RUN says unlimited to `ulimit -u` and `ulimit -c`. The
+/// kernel gives PID 1 a process limit from the memory (32142 in an 8 GiB
+/// VM) and a soft core size of 0. The process limit counts a user's
+/// processes in the whole VM, never root's; what holds a fork bomb back is
+/// a container's pids limit (`--pids-limit`), unset by default as with
+/// Docker.
+pub fn agent_rlimits(nr_open: Option<&str>) -> Vec<(u32, u64, u64)> {
+    let mut v = Vec::with_capacity(3);
+    if let Some(nr_open) = nr_open {
+        let n = engine_nofile(nr_open);
+        v.push((libc::RLIMIT_NOFILE as u32, n, n));
+    }
+    v.push((libc::RLIMIT_NPROC as u32, u64::MAX, u64::MAX));
+    v.push((libc::RLIMIT_CORE as u32, u64::MAX, u64::MAX));
+    v
+}
+
 /// Sets the resource limits in the child, before it drops capabilities
 /// (raising a hard limit needs CAP_SYS_RESOURCE). runc's error on failure.
 pub fn set_rlimits(rlimits: &[(u32, u64, u64)]) -> io::Result<()> {
@@ -322,6 +359,27 @@ fn user_name(uid: u32) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn steps_and_containers_get_the_open_files_limit_docker_gives() {
+        assert_eq!(engine_nofile("1048576\n"), 1_048_576);
+        assert_eq!(engine_nofile("2097152\n"), 2_097_152, "the kernel's own ceiling, as LimitNOFILE=infinity gives");
+        assert_eq!(engine_nofile(""), 1_048_576, "unreadable: the kernel's default ceiling");
+        assert_eq!(engine_nofile("12"), 1_048_576, "never below the boot default");
+    }
+
+    #[test]
+    fn steps_and_containers_get_no_process_or_core_size_limit_as_with_docker() {
+        // dockerd and containerd run with LimitNPROC=infinity and
+        // LimitCORE=infinity, and a container or a BuildKit RUN inherits
+        // them: `ulimit -u` and `ulimit -c` say unlimited. The kernel gives
+        // PID 1 a process limit from the memory (32142 in an 8 GiB VM) and a
+        // soft core size of 0.
+        const INF: u64 = u64::MAX;
+        let (nproc, core, nofile) = (libc::RLIMIT_NPROC as u32, libc::RLIMIT_CORE as u32, libc::RLIMIT_NOFILE as u32);
+        assert_eq!(agent_rlimits(Some("1048576\n")), [(nofile, 1_048_576, 1_048_576), (nproc, INF, INF), (core, INF, INF)], "in the VM");
+        assert_eq!(agent_rlimits(None), [(nproc, INF, INF), (core, INF, INF)], "a host process: open files from the unit");
+    }
 
     #[test]
     fn the_users_own_group_is_a_supplementary_group_as_with_docker() {

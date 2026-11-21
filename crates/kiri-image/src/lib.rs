@@ -1,14 +1,21 @@
 //! Images on the host: references, registry pulls and the blob store.
 
-#![forbid(unsafe_code)]
+// Unsafe only in `proc`: two plain system calls with no pointers.
+#![deny(unsafe_code)]
 
 pub mod archive;
 pub mod b64;
 pub mod cancel;
+pub mod compress;
+pub mod goflate;
 mod connect;
+#[doc(hidden)]
+pub mod fault;
 pub mod jsonfile;
+mod proc;
 pub mod reference;
 pub mod registry;
+mod stamps;
 pub mod store;
 pub mod tags;
 

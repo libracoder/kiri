@@ -59,8 +59,62 @@ pub fn open_root(root: &Path) -> io::Result<OwnedFd> {
 }
 
 /// Looks `path` up inside `root` the way the container will see it once
-/// root is `/`: absolute symlinks and `..` never leave `root`.
+/// root is `/`: absolute symlinks and `..` never leave `root`. Missing
+/// directories on the way are made, and the last component as `last` says.
 pub fn open(root: BorrowedFd<'_>, path: &Path, last: Last) -> io::Result<Found> {
+    walk(root, path, last, true)
+}
+
+/// Finds what `path` names inside `root`, as [`open`] resolves it (every
+/// symlink, absolute or relative, and every `..` stay inside `root`), and
+/// makes nothing: a missing component is an error. The result is an
+/// `O_PATH` descriptor of the object itself (a link at the end is
+/// followed), for mounting or reading it through `/proc/self/fd/N`, so
+/// nothing can be swapped in between this lookup and that use.
+///
+/// openat2(RESOLVE_IN_ROOT) does it in one call (Linux 5.6); where the
+/// kernel lacks it, a seccomp filter refuses it, or a rename raced it
+/// (EAGAIN), the same walk as [`open`]'s does it a component at a time.
+pub fn lookup(root: BorrowedFd<'_>, path: &Path) -> io::Result<OwnedFd> {
+    match lookup_openat2(root, path) {
+        Err(e) if matches!(e.raw_os_error(), Some(libc::ENOSYS | libc::EPERM | libc::EAGAIN | libc::E2BIG | libc::EINVAL)) => lookup_walk(root, path),
+        Err(e) => Err(with_path(e, path)),
+        ok => ok,
+    }
+}
+
+/// [`lookup`] by the component walk alone.
+pub(super) fn lookup_walk(root: BorrowedFd<'_>, path: &Path) -> io::Result<OwnedFd> {
+    walk(root, path, Last::Exists, false).map(|f| f.fd)
+}
+
+const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+const RESOLVE_IN_ROOT: u64 = 0x10;
+
+#[repr(C)]
+struct OpenHow {
+    flags: u64,
+    mode: u64,
+    resolve: u64,
+}
+
+/// [`lookup`] by openat2(RESOLVE_IN_ROOT). Magic links (`/proc/self/...`)
+/// are refused: inside a tree being mounted they can only lead out of it.
+pub(super) fn lookup_openat2(root: BorrowedFd<'_>, path: &Path) -> io::Result<OwnedFd> {
+    let rel: std::path::PathBuf = components(path.as_os_str()).into_iter().collect();
+    let c = if rel.as_os_str().is_empty() { CString::from(c".") } else { name_c(rel.as_os_str())? };
+    let how = OpenHow { flags: (libc::O_PATH | libc::O_CLOEXEC) as u64, mode: 0, resolve: RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS };
+    // SAFETY: openat2 with a valid dirfd, a NUL-terminated path and an
+    // open_how of the stated size; the result is owned right away.
+    let fd = unsafe { libc::syscall(libc::SYS_openat2, root.as_raw_fd(), c.as_ptr(), &how as *const OpenHow, std::mem::size_of::<OpenHow>()) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a fresh descriptor nothing else owns.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd as libc::c_int) })
+}
+
+fn walk(root: BorrowedFd<'_>, path: &Path, last: Last, make_missing: bool) -> io::Result<Found> {
     let mut todo: VecDeque<OsString> = components(path.as_os_str());
     // Directories walked so far; [0] is the root, which `..` never pops.
     let mut dirs: Vec<OwnedFd> = vec![root.try_clone_to_owned()?];
@@ -77,7 +131,7 @@ pub fn open(root: BorrowedFd<'_>, path: &Path, last: Last) -> io::Result<Found> 
         let dir = dirs.last().expect("root stays").as_fd();
         let fd = match open_nofollow(dir, &name) {
             Ok(fd) => fd,
-            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
+            Err(e) if make_missing && e.raw_os_error() == Some(libc::ENOENT) => {
                 let kind = if is_last { last } else { Last::Dir };
                 make(dir, &name, kind).map_err(|e| with_path(e, path))?;
                 created = is_last;
@@ -111,6 +165,47 @@ pub fn open(root: BorrowedFd<'_>, path: &Path, last: Last) -> io::Result<Found> 
     // The path was the root itself, or ended in `..`/a symlink to a directory.
     let fd = dirs.pop().expect("root stays");
     Ok(Found { fd, created })
+}
+
+/// The folder an archive or step path names its last component in, and
+/// that last name, found inside `root` strictly: `/` and `.` are dropped,
+/// `..` is refused, and no component on the way may be a symlink (each is
+/// opened with O_NOFOLLOW | O_DIRECTORY), so the pair always names
+/// something under `root`. For changing what was just written there
+/// (`*at` calls on the descriptor, or `/proc/self/fd/N/name` with a call
+/// that does not follow the last component). An empty path or one that
+/// is only `/` has no last name: InvalidInput.
+pub fn parent_strict(root: BorrowedFd<'_>, path: &Path) -> io::Result<(OwnedFd, CString)> {
+    let mut names = Vec::new();
+    for c in path.components() {
+        match c {
+            Component::Normal(n) => names.push(n),
+            Component::RootDir | Component::CurDir => {}
+            Component::ParentDir | Component::Prefix(_) => return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{}: `..` in a path", path.display()))),
+        }
+    }
+    let last = names.pop().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("{}: no name", path.display())))?;
+    let mut dir = root.try_clone_to_owned()?;
+    for n in names {
+        let c = name_c(n)?;
+        // SAFETY: valid directory fd and NUL-terminated name; owned right away.
+        let fd = unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+        if fd < 0 {
+            return Err(with_path(io::Error::last_os_error(), path));
+        }
+        // SAFETY: a fresh descriptor nothing else owns.
+        dir = unsafe { OwnedFd::from_raw_fd(fd) };
+    }
+    Ok((dir, name_c(last)?))
+}
+
+/// `/proc/self/fd/N/name`: `name` in the folder `dir` is open as, for calls
+/// that take a path and do not follow its last component (lsetxattr,
+/// lchown, `utimensat(.., AT_SYMLINK_NOFOLLOW)`, rmtree::remove_all).
+pub fn at_path(dir: BorrowedFd<'_>, name: &std::ffi::CStr) -> CString {
+    let mut b = format!("/proc/self/fd/{}/", dir.as_raw_fd()).into_bytes();
+    b.extend_from_slice(name.to_bytes());
+    CString::new(b).expect("a CStr has no NUL")
 }
 
 /// The lexical form of what `open` reaches, for tests and messages.
@@ -296,6 +391,106 @@ mod tests {
         let r = open_root(&root).unwrap();
         assert!(open(r.as_fd(), Path::new("/f/x"), Last::Dir).is_err());
         assert!(open(r.as_fd(), Path::new("/missing"), Last::Exists).is_err());
+    }
+
+    type Lookup = fn(BorrowedFd<'_>, &Path) -> io::Result<OwnedFd>;
+
+    /// Both ways `lookup` resolves: openat2 and the component walk.
+    fn lookups() -> [(&'static str, Lookup); 3] {
+        [("lookup", lookup), ("openat2", lookup_openat2), ("walk", lookup_walk)]
+    }
+
+    fn rel_fd(root: &Path, fd: &OwnedFd) -> std::path::PathBuf {
+        real_path(fd.as_fd()).unwrap().strip_prefix(root.canonicalize().unwrap()).unwrap().to_owned()
+    }
+
+    /// A stage's tree as a bind's `source=` sees it: links that point out
+    /// of it, by an absolute path, by `..`, through a chain or through a
+    /// folder on the way, all land inside it; nothing outside is reached.
+    #[test]
+    fn a_lookup_never_leaves_the_root() {
+        let (_t, root, outside) = setup("lookup-out");
+        let depth = outside.components().count();
+        fs::create_dir_all(root.join("opt/data")).unwrap();
+        fs::write(root.join("opt/data/f"), "in").unwrap();
+        symlink("/", root.join("esc")).unwrap();
+        symlink("../".repeat(depth + 4) + outside.strip_prefix("/").unwrap().to_str().unwrap(), root.join("up")).unwrap();
+        symlink(&outside, root.join("abs")).unwrap();
+        fs::create_dir_all(root.join("a/b")).unwrap();
+        symlink(&outside, root.join("a/b/c")).unwrap();
+        symlink("/a/b", root.join("chain1")).unwrap();
+        symlink("chain1/c", root.join("chain2")).unwrap();
+        symlink("/opt", root.join("optlink")).unwrap();
+        for (how, f) in lookups() {
+            let r = open_root(&root).unwrap();
+            let got = f(r.as_fd(), Path::new("/esc")).unwrap();
+            assert_eq!(rel_fd(&root, &got), Path::new(""), "{how}: a link to / is the root");
+            for p in ["/up", "/abs", "/chain2", "/a/b/c/secret", "chain1/c/../../../../secret"] {
+                match f(r.as_fd(), Path::new(p)) {
+                    Ok(fd) => {
+                        let real = real_path(fd.as_fd()).unwrap();
+                        assert!(real.starts_with(root.canonicalize().unwrap()), "{how}: {p} reached {}", real.display());
+                    }
+                    Err(e) => assert_eq!(e.raw_os_error().or_else(|| e.to_string().contains("os error 2").then_some(libc::ENOENT)), Some(libc::ENOENT), "{how}: {p}: {e}"),
+                }
+            }
+            // A link that stays inside is followed, as BuildKit follows it.
+            assert_eq!(rel_fd(&root, &f(r.as_fd(), Path::new("/optlink/data")).unwrap()), Path::new("opt/data"), "{how}");
+            assert_eq!(rel_fd(&root, &f(r.as_fd(), Path::new("/optlink/data/f")).unwrap()), Path::new("opt/data/f"), "{how}");
+            assert_eq!(rel_fd(&root, &f(r.as_fd(), Path::new("/esc/opt/../opt/data")).unwrap()), Path::new("opt/data"), "{how}");
+        }
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 1, "nothing made outside");
+    }
+
+    /// A lookup makes nothing: not the last component, not a folder on
+    /// the way (a read-only stage would refuse it, a writable one would
+    /// keep it).
+    #[test]
+    fn a_lookup_makes_nothing() {
+        let (_t, root, _o) = setup("lookup-make");
+        for (how, f) in lookups() {
+            let r = open_root(&root).unwrap();
+            assert!(f(r.as_fd(), Path::new("/no/such/thing")).is_err(), "{how}");
+            assert!(!root.join("no").exists(), "{how}");
+        }
+    }
+
+    /// A component swapped between a folder and a link out of the root
+    /// while lookups run: every lookup that succeeds names something
+    /// inside the root. Bounded by count, not by time.
+    #[test]
+    fn a_link_swapped_in_during_lookups_never_leads_out() {
+        let (_t, root, outside) = setup("lookup-race");
+        fs::create_dir_all(outside.join("x")).unwrap();
+        let canon = root.canonicalize().unwrap();
+        for (how, f) in lookups() {
+            fs::create_dir_all(root.join("real/x")).unwrap();
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (s, rt, out) = (stop.clone(), root.clone(), outside.clone());
+            let racer = std::thread::spawn(move || {
+                let mut flips = 0u32;
+                while !s.load(std::sync::atomic::Ordering::Relaxed) && flips < 200_000 {
+                    let _ = fs::remove_file(rt.join("a"));
+                    let _ = symlink("real", rt.join("a"));
+                    let _ = fs::remove_file(rt.join("a"));
+                    let _ = symlink(&out, rt.join("a"));
+                    flips += 1;
+                }
+            });
+            let r = open_root(&root).unwrap();
+            let mut inside = 0;
+            for _ in 0..20_000 {
+                if let Ok(fd) = f(r.as_fd(), Path::new("a/x")) {
+                    let real = real_path(fd.as_fd()).unwrap();
+                    assert!(real.starts_with(&canon), "{how}: reached {}", real.display());
+                    inside += 1;
+                }
+            }
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            racer.join().unwrap();
+            let _ = fs::remove_file(root.join("a"));
+            eprintln!("{how}: {inside} of 20000 lookups found a/x, all inside");
+        }
     }
 
     #[test]

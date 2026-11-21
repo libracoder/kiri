@@ -504,6 +504,22 @@ impl Client {
         progress: &(dyn Fn(Progress) + Sync),
         cancel: &Cancel,
     ) -> Result<Image, Error> {
+        self.pull_tee(store, reference, platform, progress, cancel, None)
+    }
+
+    /// [`Client::pull_with`], each layer's blob also given to `tee` as it
+    /// downloads (see [`LayerTee`]). The sinks are settled once the image's
+    /// config is in and every blob checked, in parallel; the pull returns
+    /// when they are.
+    pub fn pull_tee(
+        &self,
+        store: &Store,
+        reference: &Reference,
+        platform: &Platform,
+        progress: &(dyn Fn(Progress) + Sync),
+        cancel: &Cancel,
+        tee: Option<&dyn LayerTee>,
+    ) -> Result<Image, Error> {
         let _on = cancel.enter();
         let stopped = |e: Error| if cancel.is_cancelled() { Error::Cancelled } else { e };
         self.warm_up(reference, "pull").map_err(stopped)?;
@@ -566,6 +582,7 @@ impl Client {
         queue.sort_by_key(|l| l.size);
         let queue = Mutex::new(queue);
         let first_error: Mutex<Option<Error>> = Mutex::new(None);
+        let sinks: Mutex<Vec<(String, Box<dyn LayerSink>)>> = Mutex::new(Vec::new());
         std::thread::scope(|s| {
             // The config, alongside the layers rather than before them: it is
             // small, and fetching it first cost a round trip to the registry
@@ -599,7 +616,13 @@ impl Client {
                             Ok(layer.size)
                         } else {
                             let on_bytes = |got| progress(Progress::Downloading { digest: layer.digest.clone(), got, size: layer.size });
-                            self.download_with(store, reference, &layer.digest, u64::MAX, &on_bytes, cancel)
+                            let mut sink = tee.and_then(|t| t.open(layer));
+                            // The size the manifest declares is the size the blob must be.
+                            let r = self.download_tee(store, reference, &layer.digest, Size::Exactly(layer.size), &on_bytes, cancel, &mut sink);
+                            if let (Ok(_), Some(s)) = (&r, sink) {
+                                sinks.lock().unwrap_or_else(|e| e.into_inner()).push((layer.digest.clone(), s));
+                            }
+                            r
                         };
                         match result {
                             Ok(bytes) => progress(Progress::LayerDone { digest: layer.digest.clone(), bytes, cached }),
@@ -621,6 +644,23 @@ impl Client {
         }
         let cfg_bytes = store.read_config(&config.digest)?;
         let cfg: ImageConfig = serde_json::from_slice(&cfg_bytes).map_err(|e| Error::Manifest(e.to_string()))?;
+        // Only for the native builder, which relies on diff_ids; with it
+        // switched off a pull takes what it took before.
+        if store.native_checks() {
+            check_layer_count(&layers, &cfg_bytes)?;
+        }
+        // Each layer unpacked on the way is kept only with the config's
+        // diff_id; one the config does not name is given up.
+        let diff_ids = cfg.rootfs.as_ref().and_then(|r| r.diff_ids.clone()).unwrap_or_default();
+        let sinks = sinks.into_inner().unwrap_or_else(|e| e.into_inner());
+        std::thread::scope(|s| {
+            for (digest, sink) in sinks {
+                let named = layers.iter().position(|l| l.digest == digest).and_then(|i| diff_ids.get(i)).filter(|_| diff_ids.len() == layers.len());
+                if let Some(diff_id) = named {
+                    s.spawn(move || sink.finish(diff_id));
+                }
+            }
+        });
 
         let run = cfg.config.unwrap_or_default();
         let image = Image {
@@ -645,6 +685,8 @@ impl Client {
         if cancel.is_cancelled() {
             return Err(Error::Cancelled);
         }
+        // The blobs' renames on disk before the record that names them.
+        store.sync_blobs()?;
         store.put_image(image.clone())?;
         Ok(image)
     }
@@ -684,6 +726,24 @@ impl Client {
     /// progress. Refuses bodies over `max` bytes, and stops (removing what
     /// it wrote) once `cancel` is.
     fn download_with(&self, store: &Store, r: &Reference, digest: &str, max: u64, on_bytes: &dyn Fn(u64), cancel: &Cancel) -> Result<u64, Error> {
+        self.download_tee(store, r, digest, Size::AtMost(max), on_bytes, cancel, &mut None)
+    }
+
+    /// [`Client::download_with`], every byte also written to `sink` while it
+    /// takes them. A sink that fails, or a blob that has to start over, is
+    /// dropped (it gives up) and the download goes on without it.
+    #[allow(clippy::too_many_arguments)]
+    fn download_tee(&self, store: &Store, r: &Reference, digest: &str, size: Size, on_bytes: &dyn Fn(u64), cancel: &Cancel, sink: &mut Option<Box<dyn LayerSink>>) -> Result<u64, Error> {
+        // A blob of a declared size is read to past it at most by one read,
+        // so a longer one is refused as such; one that ends short is
+        // refused too. Neither is put in the store.
+        let (max, exact) = match size {
+            Size::AtMost(m) => (m, None),
+            // Counted here rather than by the body's limit, whose error
+            // would not say what was wrong.
+            Size::Exactly(n) => (u64::MAX, Some(n)),
+        };
+        let wrong_size = |got: u64, n: u64| Error::Manifest(format!("layer {digest} is {}{got} bytes, the manifest says {n}", if got > n { "more than " } else { "" }));
         let url = format!("{}/v2/{}/blobs/{digest}", r.api_base(), r.repository);
         let mut out = store.blob_writer(digest)?;
         let mut buf = vec![0u8; 256 * 1024];
@@ -700,6 +760,7 @@ impl Client {
                     // The whole blob again: start over.
                     out = store.blob_writer(digest)?;
                     (got, told) = (0, 0);
+                    *sink = None;
                 }
                 let mut body = resp.body_mut().with_config().limit(max.saturating_sub(got)).reader();
                 loop {
@@ -712,7 +773,13 @@ impl Client {
                         return Ok(());
                     }
                     out.write_all(&buf[..n])?;
+                    if sink.as_mut().is_some_and(|s| s.write_all(&buf[..n]).is_err()) {
+                        *sink = None;
+                    }
                     got += n as u64;
+                    if let Some(e) = exact.filter(|e| got > *e) {
+                        return Err(wrong_size(got - 1, e));
+                    }
                     if got - told >= 512 * 1024 {
                         on_bytes(got);
                         told = got;
@@ -720,6 +787,7 @@ impl Client {
                 }
             })();
             match result {
+                Ok(()) if exact.is_some_and(|e| e != got) => return Err(wrong_size(got, exact.unwrap_or(0))),
                 Ok(()) => return Ok(out.finish()?),
                 Err(_) if cancel.is_cancelled() => return Err(Error::Cancelled),
                 Err(e) if transient(&e) => {
@@ -875,7 +943,7 @@ impl Client {
     /// `docker search`, against Docker Hub's search API.
     pub fn search(&self, term: &str, limit: u32) -> Result<Vec<serde_json::Value>, Error> {
         let url = "https://index.docker.io/v1/search";
-        let mut resp = self.agent.get(url).query("q", term).query("n", &limit.to_string()).call()?;
+        let mut resp = self.agent.get(url).query("q", term).query("n", limit.to_string()).call()?;
         if resp.status().as_u16() != 200 {
             return Err(Error::Status { url: url.to_owned(), status: resp.status().as_u16(), body: String::new() });
         }
@@ -889,7 +957,7 @@ impl Client {
     pub fn hub_tags(&self, repo: &str, limit: u32) -> Result<Vec<String>, Error> {
         let repo = if repo.contains('/') { repo.to_owned() } else { format!("library/{repo}") };
         let url = format!("https://hub.docker.com/v2/repositories/{repo}/tags");
-        let mut resp = self.agent.get(&url).query("page_size", &limit.to_string()).query("ordering", "last_updated").call()?;
+        let mut resp = self.agent.get(&url).query("page_size", limit.to_string()).query("ordering", "last_updated").call()?;
         if resp.status().as_u16() != 200 {
             return Err(Error::Status { url, status: resp.status().as_u16(), body: String::new() });
         }
@@ -986,10 +1054,20 @@ impl Client {
     pub fn push(&self, store: &Store, image: &Image, target: &Reference, progress: &dyn Fn(PushProgress)) -> Result<(String, u64), Error> {
         let base = target.api_base();
         let repo = &target.repository;
-        let config_size = std::fs::metadata(store.blob_path(&image.config_digest)?)?.len();
-        let blobs: Vec<(String, u64)> =
-            image.layers.iter().map(|l| (l.digest.clone(), l.size)).chain(std::iter::once((image.config_digest.clone(), config_size))).collect();
-        for (digest, size) in &blobs {
+        // Every blob held until the manifest is up: the image removed
+        // meanwhile must not take a blob away mid-push (archive::hold).
+        let _held = crate::archive::hold(store, std::slice::from_ref(image))?;
+        let config_path = store.verified_blob_path(&image.config_digest)?;
+        let config_size = std::fs::metadata(&config_path)?.len();
+        // Layers go out as BuildKit pushes them: plain-tar ones gzipped
+        // (compress.rs); the temporary copies go when `out` does.
+        let out: Vec<crate::compress::Outgoing> = image.layers.iter().map(|l| crate::compress::outgoing(store, l)).collect::<io::Result<_>>()?;
+        let blobs: Vec<(String, u64, std::path::PathBuf)> = out
+            .iter()
+            .map(|o| (o.layer.digest.clone(), o.layer.size, o.path.clone()))
+            .chain(std::iter::once((image.config_digest.clone(), config_size, config_path)))
+            .collect();
+        for (digest, size, path) in &blobs {
             let url = format!("{base}/v2/{repo}/blobs/{digest}");
             let head = self.authed(target, "pull,push", |auth| {
                 let mut req = self.agent.head(&url);
@@ -1016,9 +1094,8 @@ impl Client {
             let location = started.headers().get("location").and_then(|v| v.to_str().ok()).unwrap_or_default().to_owned();
             let location = if location.starts_with('/') { format!("{base}{location}") } else { location };
             let put_url = format!("{location}{}digest={digest}", if location.contains('?') { '&' } else { '?' });
-            let path = store.blob_path(digest)?;
             let put = self.authed(target, "pull,push", |auth| {
-                let mut f = std::fs::File::open(&path).map_err(ureq::Error::Io)?;
+                let mut f = std::fs::File::open(path).map_err(ureq::Error::Io)?;
                 let mut req = self.agent.put(&put_url).header("Content-Type", "application/octet-stream").header("Content-Length", &size.to_string());
                 if let Some(a) = auth {
                     req = req.header("Authorization", a);
@@ -1032,7 +1109,7 @@ impl Client {
             "schemaVersion": 2,
             "mediaType": OCI_MANIFEST,
             "config": {"mediaType": "application/vnd.oci.image.config.v1+json", "digest": image.config_digest, "size": config_size},
-            "layers": image.layers.iter().map(|l| serde_json::json!({"mediaType": oci_layer_type(&l.media_type), "digest": l.digest, "size": l.size})).collect::<Vec<_>>(),
+            "layers": out.iter().map(|o| serde_json::json!({"mediaType": oci_layer_type(&o.layer.media_type), "digest": o.layer.digest, "size": o.layer.size})).collect::<Vec<_>>(),
         });
         let bytes = serde_json::to_vec(&manifest).map_err(|e| Error::Manifest(e.to_string()))?;
         let url = format!("{base}/v2/{repo}/manifests/{}", target.reference);
@@ -1108,10 +1185,57 @@ struct Descriptor {
     size: u64,
 }
 
+/// The config names one diff_id per layer of the manifest, or the image is
+/// refused, as Docker refuses it. Costs nothing: no layer is read. Whether
+/// each layer unpacks to its diff_id is checked where the diff_id is relied
+/// on, when the builder unpacks a layer by it (`Store::layer_tar`), and not
+/// at pull: decompressing every layer as it downloads made a pull from a
+/// fast registry several times slower.
+fn check_layer_count(layers: &[Layer], cfg_bytes: &[u8]) -> Result<(), Error> {
+    let cfg: serde_json::Value = serde_json::from_slice(cfg_bytes).map_err(|e| Error::Manifest(e.to_string()))?;
+    let named = cfg["rootfs"]["diff_ids"].as_array().map_or(0, Vec::len);
+    if named != layers.len() {
+        return Err(Error::Manifest(format!("the image config names {named} layers, the manifest {}", layers.len())));
+    }
+    Ok(())
+}
+
 #[derive(Deserialize)]
 struct ImageConfig {
     created: Option<String>,
     config: Option<ContainerConfig>,
+    rootfs: Option<RootFs>,
+}
+
+#[derive(Deserialize, Default)]
+struct RootFs {
+    diff_ids: Option<Vec<String>>,
+}
+
+/// How long a blob being downloaded may be.
+#[derive(Debug, Clone, Copy)]
+enum Size {
+    /// No more than this many bytes.
+    AtMost(u64),
+    /// Exactly the size a manifest declares for it.
+    Exactly(u64),
+}
+
+/// Where a pull also sends each layer's blob as it arrives: an engine that
+/// unpacks layers during the pull rather than at their first use, so the
+/// unpack overlaps the download instead of following it.
+pub trait LayerTee: Sync {
+    /// A sink for this layer's bytes; None to leave this one to its first use.
+    fn open(&self, layer: &Layer) -> Option<Box<dyn LayerSink>>;
+}
+
+/// One layer's bytes on their way to an unpack. Dropped without
+/// [`LayerSink::finish`] (the pull failed, or the blob had to start over),
+/// it gives up and nothing of it is kept.
+pub trait LayerSink: Write + Send {
+    /// Every byte of the blob was given and checked; `diff_id` is the one
+    /// the image's config names for it, which the unpacked tar must have.
+    fn finish(self: Box<Self>, diff_id: &str);
 }
 
 #[derive(Deserialize, Default)]
@@ -1294,7 +1418,7 @@ mod tests {
     fn tokens_are_used_a_little_less_long_than_they_last() {
         assert_eq!(token_lifetime(Duration::from_secs(300)), Duration::from_secs(270));
         assert_eq!(token_lifetime(Duration::from_secs(60)), Duration::from_secs(54));
-        // A hostile expires_in is clamped, and remembering it cannot panic.
+        // An out-of-range expires_in is clamped, and remembering it cannot panic.
         assert_eq!(token_lifetime(Duration::from_secs(u64::MAX)), Duration::from_secs(3240));
         assert_eq!(token_lifetime(Duration::MAX), Duration::from_secs(3240));
         Client::remember_token("sec-test".into(), "Bearer x".into(), Duration::from_secs(u64::MAX));
@@ -1423,6 +1547,124 @@ mod tests {
         (data, digest)
     }
 
+    /// A registry on loopback that takes pushes: every blob 404s on HEAD,
+    /// uploads are one POST and one PUT. Returns the blobs and the manifest
+    /// it got.
+    /// Blobs by digest, and the manifest, as a push sent them.
+    type Pushed = (HashMap<String, Vec<u8>>, Vec<u8>);
+
+    fn push_server() -> (String, std::thread::JoinHandle<Pushed>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let host = listener.local_addr().unwrap().to_string();
+        let served = std::thread::spawn(move || {
+            let mut blobs = HashMap::new();
+            let mut manifest = Vec::new();
+            'conns: for c in listener.incoming() {
+                let mut c = std::io::BufReader::new(c.unwrap());
+                loop {
+                    let mut head = String::new();
+                    let mut line = String::new();
+                    while line != "\r\n" {
+                        line.clear();
+                        if std::io::BufRead::read_line(&mut c, &mut line).unwrap_or(0) == 0 {
+                            continue 'conns;
+                        }
+                        head.push_str(&line);
+                    }
+                    let first = head.lines().next().unwrap_or_default().to_owned();
+                    if first.starts_with("QUIT") {
+                        break 'conns;
+                    }
+                    let len: usize = head.lines().find_map(|l| l.to_lowercase().strip_prefix("content-length: ").map(|v| v.trim().parse().unwrap())).unwrap_or(0);
+                    let mut body = vec![0u8; len];
+                    c.read_exact(&mut body).unwrap();
+                    let path = first.split(' ').nth(1).unwrap_or_default().to_owned();
+                    let reply = if first.starts_with("HEAD") {
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_owned()
+                    } else if first.starts_with("POST") {
+                        "HTTP/1.1 202 Accepted\r\nLocation: /v2/t/blobs/uploads/1\r\nContent-Length: 0\r\n\r\n".to_owned()
+                    } else if path.contains("/manifests/") {
+                        manifest = body;
+                        "HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n".to_owned()
+                    } else {
+                        let digest = path.split("digest=").nth(1).unwrap_or_default().to_owned();
+                        blobs.insert(digest, body);
+                        "HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n".to_owned()
+                    };
+                    c.get_mut().write_all(reply.as_bytes()).unwrap();
+                }
+            }
+            (blobs, manifest)
+        });
+        (host, served)
+    }
+
+    /// A layer kept as a plain tar (built here) is pushed gzipped under the
+    /// gzip media type, as BuildKit pushes it.
+    #[test]
+    fn push_sends_plain_tar_layers_gzipped() {
+        let root = std::env::temp_dir().join(format!("kiri-push-test-{}", std::process::id()));
+        let store = Store::open(&root).unwrap();
+        store.use_native_checks();
+        let put = |bytes: &[u8]| {
+            let mut w = store.ingest().unwrap();
+            w.write_all(bytes).unwrap();
+            w.finish().unwrap()
+        };
+        let tar: Vec<u8> = (0..20000).flat_map(|i| format!("line {i}\n").into_bytes()).chain(std::iter::repeat_n(0, 1024)).collect();
+        let (layer, size) = put(&tar);
+        let config = serde_json::json!({"os": "linux", "architecture": "amd64", "config": {}});
+        let (cfg, _) = put(&serde_json::to_vec(&config).unwrap());
+        let image = crate::archive::from_config("built:1".into(), &cfg, &config, vec![Layer { digest: layer.clone(), size, media_type: "application/vnd.oci.image.layer.v1.tar".into() }]);
+        let (host, served) = push_server();
+        let target = Reference::parse(&format!("{host}/t:1")).unwrap();
+        test_client().push(&store, &image, &target, &|_| {}).unwrap();
+        quit(&host);
+        let (blobs, manifest) = served.join().unwrap();
+        let manifest: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
+        let l = &manifest["layers"][0];
+        assert_eq!(l["mediaType"], "application/vnd.oci.image.layer.v1.tar+gzip");
+        let sent = &blobs[l["digest"].as_str().unwrap()];
+        assert_eq!(sha256_digest(sent), l["digest"].as_str().unwrap());
+        assert_eq!(l["size"].as_u64().unwrap(), sent.len() as u64);
+        assert_eq!(sent[..10], [0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 0xff]);
+        assert!(sent.len() < tar.len() / 4);
+        assert!(!blobs.contains_key(&layer), "the plain tar was pushed");
+        assert_eq!(std::fs::read_dir(root.join("tmp")).unwrap().count(), 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The image removed while it is being pushed (its tag deleted by
+    /// another client): the push still sends every blob it began with.
+    #[test]
+    fn a_push_keeps_its_blobs_while_the_image_is_removed() {
+        let root = std::env::temp_dir().join(format!("kiri-push-rm-test-{}", std::process::id()));
+        let store = Store::open(&root).unwrap();
+        let put = |bytes: &[u8]| {
+            let mut w = store.ingest().unwrap();
+            w.write_all(bytes).unwrap();
+            w.finish().unwrap()
+        };
+        let (layer, size) = put(b"\x1f\x8bnot really gzip");
+        let config = serde_json::json!({"os": "linux", "architecture": "amd64", "config": {}});
+        let (cfg, _) = put(&serde_json::to_vec(&config).unwrap());
+        let image = crate::archive::from_config("gone:1".into(), &cfg, &config, vec![Layer { digest: layer, size, media_type: "application/vnd.oci.image.layer.v1.tar+gzip".into() }]);
+        store.put_image(image.clone()).unwrap();
+        let (host, served) = push_server();
+        let target = Reference::parse(&format!("{host}/t:1")).unwrap();
+        let removed = std::sync::atomic::AtomicBool::new(false);
+        let pushed = test_client().push(&store, &image, &target, &|_| {
+            if !removed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                store.remove_image("gone:1").unwrap();
+            }
+        });
+        quit(&host);
+        let (blobs, _) = served.join().unwrap();
+        pushed.unwrap();
+        assert!(blobs.contains_key(&cfg), "the config went up");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn a_stalled_blob_resumes_where_it_stopped() {
         let (data, digest) = blob();
@@ -1477,6 +1719,89 @@ mod tests {
         let seen = served.join().unwrap();
         assert_eq!(seen.len(), 2);
         assert_eq!(seen[0], 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A sink that keeps what it is given, and says when it was dropped.
+    struct Kept {
+        bytes: std::sync::Arc<Mutex<Vec<u8>>>,
+        dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl Write for Kept {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.bytes.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    impl LayerSink for Kept {
+        fn finish(self: Box<Self>, _: &str) {}
+    }
+    impl Drop for Kept {
+        fn drop(&mut self) {
+            self.dropped.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// The unpack on the way gets every byte, once, in order, even when the
+    /// download resumes part way (a `Range` request).
+    #[test]
+    fn a_tee_gets_the_whole_blob_across_a_resume() {
+        let (data, digest) = blob();
+        let half = data.len() / 2;
+        let body = data.clone();
+        let (host, served) = blob_server(move |from, c| {
+            if from == 0 {
+                let _ = write!(c, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+                let _ = c.write_all(&body[..half]);
+                let _ = c.shutdown(std::net::Shutdown::Both);
+            } else {
+                let rest = &body[from as usize..];
+                let _ = write!(c, "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {from}-{}/{}\r\n\r\n", rest.len(), body.len() - 1, body.len());
+                let _ = c.write_all(rest);
+            }
+        });
+        let root = std::env::temp_dir().join(format!("kiri-tee-test-{}", std::process::id()));
+        let store = Store::open(&root).unwrap();
+        let r = Reference::parse(&format!("{host}/test/blob:1")).unwrap();
+        let (bytes, dropped) = (std::sync::Arc::new(Mutex::new(Vec::new())), std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        let mut sink: Option<Box<dyn LayerSink>> = Some(Box::new(Kept { bytes: bytes.clone(), dropped: dropped.clone() }));
+        test_client().download_tee(&store, &r, &digest, Size::AtMost(u64::MAX), &|_| {}, &Cancel::new(), &mut sink).unwrap();
+        assert!(sink.is_some(), "kept for its finish");
+        assert_eq!(*bytes.lock().unwrap(), data);
+        quit(&host);
+        let _ = served.join();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A blob that has to start over (no ranges) gives up its tee: it would
+    /// otherwise get the first bytes twice.
+    #[test]
+    fn a_tee_is_dropped_when_the_blob_starts_over() {
+        let (data, digest) = blob();
+        let body = data.clone();
+        let tries = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (host, served) = blob_server(move |_, c| {
+            let _ = write!(c, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+            if tries.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                let _ = c.write_all(&body[..body.len() / 3]);
+                let _ = c.shutdown(std::net::Shutdown::Both);
+            } else {
+                let _ = c.write_all(&body);
+            }
+        });
+        let root = std::env::temp_dir().join(format!("kiri-tee-over-test-{}", std::process::id()));
+        let store = Store::open(&root).unwrap();
+        let r = Reference::parse(&format!("{host}/test/blob:1")).unwrap();
+        let (bytes, dropped) = (std::sync::Arc::new(Mutex::new(Vec::new())), std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        let mut sink: Option<Box<dyn LayerSink>> = Some(Box::new(Kept { bytes, dropped: dropped.clone() }));
+        assert_eq!(test_client().download_tee(&store, &r, &digest, Size::AtMost(u64::MAX), &|_| {}, &Cancel::new(), &mut sink).unwrap(), data.len() as u64);
+        assert!(sink.is_none() && dropped.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(store.has_blob(&digest, data.len() as u64), "the pull itself goes on");
+        quit(&host);
+        let _ = served.join();
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1554,5 +1879,244 @@ mod tests {
         assert!(!transient(&Error::Status { url: String::new(), status: 404, body: String::new() }));
         assert!(!transient(&Error::Io(io::Error::new(io::ErrorKind::InvalidData, "digest mismatch"))));
         assert!(!transient(&Error::Io(io::Error::other(ureq::Error::BodyExceedsLimit(10)))));
+    }
+
+    /// A tar of a few files, the `stargz.index.json` entry eStargz carries
+    /// when `toc` is set.
+    fn fixture_tar(toc: bool) -> Vec<u8> {
+        let mut t = tar::Builder::new(Vec::new());
+        let mut files: Vec<(&str, Vec<u8>)> = vec![("etc/a", vec![b'a'; 3000]), ("etc/b", (0..70_000u32).map(|i| (i * 31 % 253) as u8).collect()), ("c", b"c".to_vec())];
+        if toc {
+            files.push(("stargz.index.json", br#"{"version":1,"entries":[]}"#.to_vec()));
+        }
+        for (name, body) in files {
+            let mut h = tar::Header::new_ustar();
+            h.set_size(body.len() as u64);
+            h.set_mode(0o644);
+            t.append_data(&mut h, name, &body[..]).unwrap();
+        }
+        t.into_inner().unwrap()
+    }
+
+    fn gzip(bytes: &[u8]) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(bytes).unwrap();
+        gz.finish().unwrap()
+    }
+
+    fn zstd(bytes: &[u8]) -> Vec<u8> {
+        ruzstd::encoding::compress_to_vec(bytes, ruzstd::encoding::CompressionLevel::Fastest)
+    }
+
+    /// A zstd skippable frame holding `payload`.
+    fn skippable(magic: u32, payload: &[u8]) -> Vec<u8> {
+        let mut f = magic.to_le_bytes().to_vec();
+        f.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        f.extend_from_slice(payload);
+        f
+    }
+
+    /// The layer blobs real registries serve, each with its media type and
+    /// the tar it unpacks to.
+    fn layer_kinds() -> Vec<(&'static str, &'static str, Vec<u8>, Vec<u8>)> {
+        let tar = fixture_tar(false);
+        let mut kinds = Vec::new();
+        kinds.push(("gzip", "application/vnd.oci.image.layer.v1.tar+gzip", gzip(&tar), tar.clone()));
+        kinds.push(("docker gzip", "application/vnd.docker.image.rootfs.diff.tar.gzip", gzip(&tar), tar.clone()));
+        kinds.push(("zstd", "application/vnd.oci.image.layer.v1.tar+zstd", zstd(&tar), tar.clone()));
+        // Several frames, as `zstd -T0`, pzstd and zstd:chunked write.
+        let mut frames = Vec::new();
+        for part in tar.chunks(5000) {
+            frames.extend(zstd(part));
+        }
+        kinds.push(("zstd, several frames", "application/vnd.oci.image.layer.v1.tar+zstd", frames.clone(), tar.clone()));
+        // zstd:chunked: one frame per stretch of the tar, then the TOC and
+        // the tar-split data in skippable frames, then the footer in one.
+        let mut chunked = frames;
+        chunked.extend(skippable(0x184D_2A50, &zstd(br#"{"version":1,"entries":[]}"#)));
+        chunked.extend(skippable(0x184D_2A50, &zstd(b"tar-split data")));
+        let mut footer = vec![0u8; 56];
+        footer.extend_from_slice(b"GNUlInUx");
+        chunked.extend(skippable(0x184D_2A50, &footer));
+        kinds.push(("zstd:chunked", "application/vnd.oci.image.layer.v1.tar+zstd", chunked, tar.clone()));
+        // A skippable frame first, too.
+        let mut lead = skippable(0x184D_2A5F, b"before");
+        lead.extend(zstd(&tar));
+        kinds.push(("zstd, skippable frame first", "application/vnd.oci.image.layer.v1.tar+zstd", lead, tar.clone()));
+        // eStargz: gzip members (one per stretch), the TOC entry in the tar,
+        // and a footer member with an extra field and nothing inside.
+        let stargz_tar = fixture_tar(true);
+        let mut stargz = Vec::new();
+        for part in stargz_tar.chunks(4096) {
+            stargz.extend(gzip(part));
+        }
+        let mut footer = flate2::GzBuilder::new().extra(format!("{:016x}STARGZ", stargz.len()).into_bytes()).write(Vec::new(), flate2::Compression::default());
+        std::io::Write::flush(&mut footer).unwrap();
+        stargz.extend(footer.finish().unwrap());
+        kinds.push(("eStargz", "application/vnd.oci.image.layer.v1.tar+gzip", stargz, stargz_tar));
+        kinds.push(("uncompressed", "application/vnd.oci.image.layer.v1.tar", tar.clone(), tar.clone()));
+        kinds.push(("docker uncompressed", "application/vnd.docker.image.rootfs.diff.tar", tar.clone(), tar.clone()));
+        kinds.push(("foreign", "application/vnd.docker.image.rootfs.foreign.diff.tar.gzip", gzip(&tar), tar.clone()));
+        kinds.push(("non-distributable", "application/vnd.oci.image.layer.nondistributable.v1.tar+gzip", gzip(&tar), tar));
+        kinds
+    }
+
+    /// A registry of one image of `layers` (media type, blob), its config
+    /// naming `diff_ids`; behind an index with an attestation manifest
+    /// beside it when `index` is set. Foreign layers carry `urls`.
+    fn image_registry(layers: &[(&str, Vec<u8>)], diff_ids: &[String], index: bool) -> String {
+        let config = serde_json::to_vec(&serde_json::json!({"architecture": "amd64", "os": "linux", "rootfs": {"type": "layers", "diff_ids": diff_ids}})).unwrap();
+        let cfg_digest = sha256_digest(&config);
+        let descs: Vec<serde_json::Value> = layers
+            .iter()
+            .map(|(mt, b)| {
+                let mut d = serde_json::json!({"mediaType": mt, "digest": sha256_digest(b), "size": b.len()});
+                if mt.contains("foreign") || mt.contains("nondistributable") {
+                    d["urls"] = serde_json::json!(["https://example.invalid/layer"]);
+                }
+                d
+            })
+            .collect();
+        let manifest = serde_json::to_vec(&serde_json::json!({"schemaVersion": 2, "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+            "config": {"mediaType": "application/vnd.docker.container.image.v1+json", "digest": cfg_digest, "size": config.len()},
+            "layers": descs})).unwrap();
+        let m_digest = sha256_digest(&manifest);
+        let att = serde_json::to_vec(&serde_json::json!({"schemaVersion": 2, "mediaType": OCI_MANIFEST,
+            "config": {"mediaType": "application/vnd.oci.image.config.v1+json", "digest": sha256_digest(b"{}"), "size": 2},
+            "layers": [{"mediaType": "application/vnd.in-toto+json", "digest": sha256_digest(b"att"), "size": 3}]})).unwrap();
+        let att_digest = sha256_digest(&att);
+        let idx = serde_json::to_vec(&serde_json::json!({"schemaVersion": 2, "mediaType": "application/vnd.oci.image.index.v1+json", "manifests": [
+            {"mediaType": OCI_MANIFEST, "digest": att_digest, "size": att.len(), "platform": {"architecture": "unknown", "os": "unknown"},
+             "annotations": {"vnd.docker.reference.digest": m_digest, "vnd.docker.reference.type": "attestation-manifest"}},
+            {"mediaType": "application/vnd.docker.distribution.manifest.v2+json", "digest": m_digest, "size": manifest.len(), "platform": {"architecture": "amd64", "os": "linux"}}]})).unwrap();
+        let mut blobs: Vec<(String, Vec<u8>)> = layers.iter().map(|(_, b)| (sha256_digest(b), b.clone())).collect();
+        blobs.push((cfg_digest, config));
+        let (host, _) = path_server(move |path| {
+            if path.contains("/manifests/") {
+                if path.ends_with(&m_digest) || !index {
+                    return (200, "application/vnd.docker.distribution.manifest.v2+json", manifest.clone());
+                }
+                if path.ends_with(&att_digest) {
+                    return (200, OCI_MANIFEST, att.clone());
+                }
+                return (200, "application/vnd.oci.image.index.v1+json", idx.clone());
+            }
+            match blobs.iter().find(|(d, _)| path.ends_with(d.as_str())) {
+                Some((_, b)) => (200, "application/octet-stream", b.clone()),
+                None => (404, "application/json", b"{}".to_vec()),
+            }
+        });
+        host
+    }
+
+    /// Every kind of layer a registry serves pulls, alone, after a layer of
+    /// another kind, and behind an index with an attestation manifest; a
+    /// config naming another number of layers than the manifest is refused.
+    #[test]
+    fn a_pull_takes_every_kind_of_layer_and_refuses_a_wrong_layer_count() {
+        let root = std::env::temp_dir().join(format!("kiri-layer-kinds-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let platform = Platform { os: "linux".into(), architecture: "amd64".into() };
+        let base = fixture_tar(false)[..512].to_vec();
+        let (base_blob, base_tar) = (gzip(&base), base);
+        for (n, (kind, mt, blob, tar)) in layer_kinds().into_iter().enumerate() {
+            for index in [false, true] {
+                let store = Store::open(root.join(format!("{n}-{index}"))).unwrap();
+                store.use_native_checks();
+                let layers = [("application/vnd.oci.image.layer.v1.tar+gzip", base_blob.clone()), (mt, blob.clone())];
+                let good = [sha256_digest(&base_tar), sha256_digest(&tar)];
+                let host = image_registry(&layers, &good, index);
+                let r = Reference::parse(&format!("{host}/kind:1")).unwrap();
+                let image = test_client().pull(&store, &r, &platform, &|_| {}).unwrap_or_else(|e| panic!("{kind} (index {index}): {e}"));
+                assert_eq!(image.layers.len(), 2, "{kind}");
+                assert!(store.has_blob(&sha256_digest(&blob), blob.len() as u64), "{kind}");
+                // The tar the blob holds is the one its config names.
+                let mut out = Vec::new();
+                if mt.ends_with("zstd") {
+                    crate::compress::ZstdFrames::new(&blob[..]).read_to_end(&mut out).unwrap();
+                } else if mt.ends_with("gzip") {
+                    flate2::read::MultiGzDecoder::new(&blob[..]).read_to_end(&mut out).unwrap();
+                } else {
+                    out.clone_from(&blob);
+                }
+                assert_eq!(sha256_digest(&out), good[1], "{kind}");
+
+                // A config that names fewer layers than the manifest.
+                let store = Store::open(root.join(format!("{n}-{index}-count"))).unwrap();
+                store.use_native_checks();
+                let host = image_registry(&layers, &good[..1], index);
+                let r = Reference::parse(&format!("{host}/kind:3")).unwrap();
+                let err = test_client().pull(&store, &r, &platform, &|_| {}).expect_err(kind);
+                assert!(err.to_string().contains("names 1 layers, the manifest 2"), "{kind}: {err}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A registry of one image whose manifest declares each layer with the
+    /// size given, whatever the blob's length.
+    fn sized_registry(layers: &[(&str, Vec<u8>, u64)], diff_ids: &[String]) -> String {
+        let config = serde_json::to_vec(&serde_json::json!({"architecture": "amd64", "os": "linux", "rootfs": {"type": "layers", "diff_ids": diff_ids}})).unwrap();
+        let cfg_digest = sha256_digest(&config);
+        let descs: Vec<serde_json::Value> = layers.iter().map(|(mt, b, size)| serde_json::json!({"mediaType": mt, "digest": sha256_digest(b), "size": size})).collect();
+        let manifest = serde_json::to_vec(&serde_json::json!({"schemaVersion": 2, "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+            "config": {"mediaType": "application/vnd.docker.container.image.v1+json", "digest": cfg_digest, "size": config.len()},
+            "layers": descs})).unwrap();
+        let mut blobs: Vec<(String, Vec<u8>)> = layers.iter().map(|(_, b, _)| (sha256_digest(b), b.clone())).collect();
+        blobs.push((cfg_digest, config));
+        let (host, _) = path_server(move |path| {
+            if path.contains("/manifests/") {
+                return (200, "application/vnd.docker.distribution.manifest.v2+json", manifest.clone());
+            }
+            match blobs.iter().find(|(d, _)| path.ends_with(d.as_str())) {
+                Some((_, b)) => (200, "application/octet-stream", b.clone()),
+                None => (404, "application/json", b"{}".to_vec()),
+            }
+        });
+        host
+    }
+
+    /// Two images share a layer. The second's manifest names it by its
+    /// right digest but with a wrong size, larger or smaller: that pull
+    /// fails, as the registry protocol requires (the bytes received must be
+    /// the size declared), and the blob the first image uses stays whole and
+    /// in place, through the store's start-up check too. Nothing of the
+    /// lying manifest is recorded.
+    #[test]
+    fn a_wrong_layer_size_fails_its_pull_and_harms_no_image_sharing_the_blob() {
+        let root = std::env::temp_dir().join(format!("kiri-lying-size-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let platform = Platform { os: "linux".into(), architecture: "amd64".into() };
+        let tar = fixture_tar(false);
+        let blob = gzip(&tar);
+        let real = blob.len() as u64;
+        let diff = [sha256_digest(&tar)];
+        let gz = "application/vnd.oci.image.layer.v1.tar+gzip";
+        for (n, lie) in [real + 1, real - 1, real * 2, 1].into_iter().enumerate() {
+            for native in [false, true] {
+                let dir = root.join(format!("{n}-{native}"));
+                let store = Store::open(&dir).unwrap();
+                if native {
+                    store.use_native_checks();
+                }
+                let good = sized_registry(&[(gz, blob.clone(), real)], &diff);
+                test_client().pull(&store, &Reference::parse(&format!("{good}/good:1")).unwrap(), &platform, &|_| {}).unwrap();
+                let liar = sized_registry(&[(gz, blob.clone(), lie)], &diff);
+                let err = test_client().pull(&store, &Reference::parse(&format!("{liar}/liar:1")).unwrap(), &platform, &|_| {}).expect_err("a wrong size must fail the pull");
+                assert!(err.to_string().contains("bytes"), "size {lie}: {err}");
+                let names: Vec<String> = store.images().unwrap().into_iter().map(|i| i.name).collect();
+                assert_eq!(names.len(), 1, "size {lie}: only the good image is recorded: {names:?}");
+                assert!(store.has_blob(&sha256_digest(&blob), real), "size {lie}: the shared blob is whole");
+                // The next engine start.
+                let again = Store::open(&dir).unwrap();
+                again.use_native_checks();
+                let repairs = again.check().unwrap();
+                assert!(repairs.is_empty(), "size {lie}: {repairs:?}");
+                assert_eq!(again.images().unwrap().len(), 1, "size {lie}");
+                assert!(again.has_blob(&sha256_digest(&blob), real), "size {lie}: the shared blob survives the start-up check");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

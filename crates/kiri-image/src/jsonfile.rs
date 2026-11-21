@@ -55,6 +55,12 @@ pub enum Durable {
 /// overwritten in place, so no bytes of it can trail the new one. With
 /// [`Durable::Now`], synced as [`sync`] does, the file before the rename.
 pub fn replace(path: &Path, bytes: &[u8], durable: Durable) -> io::Result<()> {
+    replace_at(path, bytes, durable, "")
+}
+
+/// [`replace`], with kill points `<point>-tmp` and `<point>-renamed` for the
+/// crash tests (see [`crate::fault`]); none for an empty name.
+pub fn replace_at(path: &Path, bytes: &[u8], durable: Durable, point: &str) -> io::Result<()> {
     let dir = parent(path);
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
     let tmp = dir.join(format!("{name}.{}.{}.tmp", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
@@ -63,7 +69,14 @@ pub fn replace(path: &Path, bytes: &[u8], durable: Durable) -> io::Result<()> {
         if durable == Durable::Now {
             synced(&f)?;
         }
-        fs::rename(&tmp, path)
+        if !point.is_empty() {
+            crate::fault::point(&format!("{point}-tmp"));
+        }
+        fs::rename(&tmp, path)?;
+        if !point.is_empty() {
+            crate::fault::point(&format!("{point}-renamed"));
+        }
+        Ok(())
     });
     if result.is_err() {
         let _ = fs::remove_file(&tmp);

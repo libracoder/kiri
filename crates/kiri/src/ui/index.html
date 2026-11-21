@@ -4345,6 +4345,16 @@ function builderPref() {
     <button class="btn sm" data-buildprune${ui.bwPruning ? " disabled" : ""}>${ui.bwPruning ? tr("Clearing…") : tr("Clear build cache")}</button></div>`;
 }
 
+/* Settings → Builds: Forge, Kiri's own build engine, for `kiri build`, off
+   unless switched on (`kiri builder use forge`); BuildKit stays for what it
+   can't do yet. */
+function nativePref() {
+  const n = ui.nb, on = !!n?.native, off = !n || n.error ? " disabled" : "";
+  const l = tr("Build with Forge");
+  return `<div class="pref"><span class="t">${l}</span><span class="d">${tr("{cmd} makes images with Forge, Kiri's own build engine, instead of BuildKit. BuildKit stays available and takes any build Forge can't do yet.", { cmd: `<span class="mono">kiri build</span>` })}</span>
+      <div class="seg" role="group" aria-label="${l}"><button data-nb="0" aria-pressed="${!on}"${off}>${tr("Off")}</button><button data-nb="1" aria-pressed="${on}"${off}>${tr("On")}</button></div></div>`;
+}
+
 /* Settings → Builds: Docker's builder or Kiri's for plain `docker build`, at once. */
 function buildsPane() {
   const b = ui.bw;
@@ -4363,6 +4373,7 @@ function buildsPane() {
       <div class="seg" role="group" aria-label="${tr("Build with")}"><button data-bw="docker" aria-pressed="${!kiri}">Docker</button><button data-bw="kiri" aria-pressed="${kiri}">Kiri</button></div></div>
     ${note}
     ${builderPref()}
+    ${nativePref()}
     <p class="muted">${tr("{cmd} always builds on Kiri. A switch applies at once, in terminals already open too. Switching back to Docker puts docker's build settings back as they were before Kiri changed them.", { cmd: cmd("kiri build") })}</p>
   </div>`;
 }
@@ -4586,7 +4597,7 @@ function show(view) {
   if (view === "compose") { cmp.open = null; cmp.asked = 0; cmpAsk(); }
   if (view === "usb") usbPoll();
   if (view === "share") { send("shares"); send("shareusage"); shPoll(); }
-  if (view === "settings") { if (!fontLists.families.length) send("fonts"); send("about"); send("logins"); send("resources"); send("proxy"); send("routerports"); if (!ui.imp.sources) send("importsources"); if (prefs.tab === "diagnostics") diagOpen(); }
+  if (view === "settings") { if (!fontLists.families.length) send("fonts"); send("about"); send("logins"); send("resources"); send("proxy"); send("routerports"); send("nativebuild"); if (!ui.imp.sources) send("importsources"); if (prefs.tab === "diagnostics") diagOpen(); }
   render();
   // From the top, as a container's or pod's page opens: leaving a page scrolled
   // down (a long Terminal or Logs tab) otherwise opened the next view below its rows.
@@ -8117,6 +8128,7 @@ window.kiri = {
       case "onboarding": onboarding(e); break;
       case "buildask": buildAsk(e.engine); break;
       case "buildwith": ui.bw = e; if (ui.view === "settings") render(); break;
+      case "nativebuild": ui.nb = e; if (ui.view === "settings") render(); break;
       case "status":
         ui.status = e;
         document.body.classList.toggle("dev", !!e.dev);
@@ -8277,13 +8289,14 @@ $("content").addEventListener("click", (ev) => {
   else if ((el = t("[data-g]"))) projectAsk(el.dataset.project, el.dataset.g);
   else if ((el = t("[data-group]"))) toggleGroup(el);
   else if (composeClick(t)) {}
-  else if ((el = t("[data-stab]"))) { prefs.tab = el.dataset.stab; if (prefs.tab === "about") send("about"); if (prefs.tab === "builds") send("buildwith"); if (prefs.tab === "registries") send("logins"); if (prefs.tab === "diagnostics") diagOpen(); render(); }
+  else if ((el = t("[data-stab]"))) { prefs.tab = el.dataset.stab; if (prefs.tab === "about") send("about"); if (prefs.tab === "builds") { send("buildwith"); send("nativebuild"); } if (prefs.tab === "registries") send("logins"); if (prefs.tab === "diagnostics") diagOpen(); render(); }
   else if (diagClick(t)) {}
   else if ((el = t("[data-scale]"))) setPref("scale", +el.dataset.scale);
   else if ((el = t("[data-logsize]"))) setPref("logSize", +el.dataset.logsize);
   else if ((el = t("[data-theme-pick]"))) setPref("theme", el.dataset.themePick);
   else if ((el = t("[data-accent]"))) setPref("accent", el.dataset.accent);
   else if (t("[data-buildprune]")) { ui.bwPruning = true; send("buildprune"); render(); }
+  else if ((el = t("[data-nb]"))) { const v = el.dataset.nb === "1"; if (ui.nb && !ui.nb.error && v !== !!ui.nb.native) { ui.nb = { ...ui.nb, native: v }; send("nativebuild", { value: v }); render(); } }
   else if ((el = t("[data-bw]"))) { const v = el.dataset.bw; if (ui.bw && !ui.bw.error && (v !== ui.bw.with || (v === "kiri" && !ui.bw.taken))) { ui.bw = { ...ui.bw, with: v }; send("buildwith", { value: v }); render(); } }
   else if ((el = t("[data-domains]"))) { if (!!+el.dataset.domains !== !!ui.domainsOn) send("domains", { value: !!+el.dataset.domains }); }
   else if ((el = t("[data-open-site]"))) send("open", { name: el.dataset.openSite });

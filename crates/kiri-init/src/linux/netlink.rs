@@ -155,7 +155,7 @@ impl Netlink {
                 if len < 16 || off + len > n {
                     break;
                 }
-                if ty == NLMSG_ERROR && seq >= first && seq < self.seq {
+                if ty == NLMSG_ERROR && len >= 20 && seq >= first && seq < self.seq {
                     let code = i32::from_ne_bytes(self.buf[off + 16..off + 20].try_into().expect("4"));
                     acked += 1;
                     if code != 0 {

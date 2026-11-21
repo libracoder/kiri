@@ -20,6 +20,15 @@ mod appwatch;
 #[cfg(unix)]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod buildwith;
+#[cfg(unix)]
+mod kiribuild;
+// `kiri build --ssh`: the client's agents, handed to the engine one
+// connection at a time.
+#[cfg(unix)]
+mod sshfwd;
+// `kiri builder`: which builder `kiri build` uses (Kiri's own or BuildKit).
+#[cfg(any(unix, windows))]
+mod builderswitch;
 // Linux only, but its tests run anywhere with unix sockets.
 #[cfg(any(target_os = "linux", all(test, unix)))]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -86,6 +95,7 @@ usage: kiri COMMAND          docker's commands, on Kiri: kiri run, ps, exec,
        kiri ui [--start] [--view containers|images|volumes|networks]
        kiri setup [--use] [--no-agent] | kiri setup --uninstall
        kiri build-with [docker|kiri]   which builder docker build uses
+       kiri builder [use kiri|buildkit]   which builder kiri build uses (Kiri's own is off by default)
        kiri domains [set [--http N] [--https N] | reset]   the *.kiri.local routers' ports
        kiri update [--check]      update Kiri (with a container: docker's update)
        kiri diag logs [-f] [--ui|--engine|--cli] [--errors] [-n N]
@@ -102,8 +112,15 @@ usage: kiri COMMAND          docker's commands, on Kiri: kiri run, ps, exec,
        kiri raw pull <image> | raw images | raw rmi <image>...";
 
 fn main() -> ExitCode {
-    flavor::init();
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // The engine's Dockerfile planner (kiri_forge::isolate): a child of the
+    // engine that confines itself before it reads anything, and touches
+    // no setting, log or file of Kiri's.
+    #[cfg(unix)]
+    if args.first().map(String::as_str) == Some(kiri_forge::isolate::SERVE_ARG) {
+        kiri_forge::isolate::serve();
+    }
+    flavor::init();
     // Which process this is, for its log and crash reports.
     #[cfg(unix)]
     diag::init(match args.first().map(String::as_str) {
@@ -181,6 +198,22 @@ fn main() -> ExitCode {
         // The static engine has no window: the package's own build of it.
         #[cfg(all(target_os = "linux", not(feature = "window")))]
         Some("ui") => window(&args),
+        // The native builder first, BuildKit for what it does not cover.
+        #[cfg(unix)]
+        Some("build") => {
+            engine_version_check();
+            kiribuild::run(&args)
+        }
+        // `kiri builder`, `kiri builder use kiri|buildkit`; any other
+        // `kiri builder ...` is docker's, below.
+        #[cfg(unix)]
+        Some("builder") if builderswitch::parse(&args[1..]).is_some() => builderswitch::run(&args[1..]),
+        // Windows: docker.exe's build (BuildKit); Kiri's own builder is
+        // not there, and the `kiri builder` forms say so (builderswitch.rs).
+        #[cfg(windows)]
+        Some("build") => builderswitch::build_windows(&args),
+        #[cfg(windows)]
+        Some("builder") if builderswitch::parse(&args[1..]).is_some() => builderswitch::run_windows(&args[1..]),
         #[cfg(any(unix, windows))]
         Some(c) if docker::handles(c) => {
             engine_version_check();

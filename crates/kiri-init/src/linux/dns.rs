@@ -649,7 +649,8 @@ fn random_id() -> Option<u16> {
 /// The first question: (lowercase name without the trailing dot, qtype,
 /// offset just past the question).
 fn parse_question(q: &[u8]) -> Option<(String, u16, usize)> {
-    if u16::from_be_bytes([q[4], q[5]]) != 1 {
+    // One question, read without trusting the caller to have checked the length.
+    if q.get(4..6)? != [0, 1] {
         return None;
     }
     let mut i = 12;

@@ -1,4 +1,8 @@
 /target
+# The builder test data, fetched by scripts/fetch-test-data.sh (not in this repository).
+/tests/data-cache/
+# Where the builder test data repository is (tests/test-data.local.example).
+/tests/test-data.local
 # Raw benchmark output: kept outside this repository.
 /bench/results/
 /guest/out/
@@ -18,3 +22,4 @@
 CLAUDE.md
 CLAUDE.local.md
 .claude/
+__pycache__/

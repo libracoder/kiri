@@ -1,0 +1,7 @@
+# The builder test data (golden vectors, wire captures) this commit is tested
+# with: scripts/fetch-test-data.sh fetches exactly this commit into
+# tests/data-cache. Change both lines together, to a signed tag's commit.
+# Where the data repository is comes from KIRI_TEST_DATA_URL or the
+# untracked tests/test-data.local (see tests/test-data.local.example).
+commit=f0359315e90a7c00421685c1245bf13c1451e87c
+tag=v2

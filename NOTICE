@@ -448,6 +448,7 @@ Used by:
 Apache License 2.0
 ----------------------------------------------------------------------
 Used by:
+- kiri-forge 0.0.0 (https://github.com/libracoder/kiri-forge)
 - cmov 0.5.4 (https://github.com/RustCrypto/utils)
 - ctutils 0.4.6 (https://github.com/RustCrypto/utils)
 - ureq-proto 0.6.5 (https://github.com/algesten/ureq-proto)
@@ -4583,6 +4584,7 @@ Used by:
 - kiri-share-proto 0.0.0
 - kiri-vmm 0.0.0
 - kiri-win 0.0.0
+- kiri-zstd 0.0.0
 - xtask 0.0.0
 - dispatch2 0.3.1 (https://github.com/madsmtm/objc2)
 - field-offset 0.3.6 (https://github.com/Diggsey/rust-field-offset)
@@ -7465,3 +7467,303 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
+
+Code ported into Kiri
+=====================
+
+Parts of Kiri's image builder are translations into Rust of other projects'
+code, made so that a build gives the same result, byte for byte, as the
+reference builder. Each such file says at its top which upstream files it
+came from; where only one function of a file was translated (Ulimit::parse
+in kiri-forge/src/ports/mod.rs, the function same in
+crates/kiri-init/src/linux/stepdiff.rs), the notice is on that function
+instead. They are changed versions of that code, not the originals.
+
+The image builder, Forge (Kiri's own build engine), is a library of its
+own, kiri-forge (https://github.com/libracoder/kiri-forge, Apache-2.0),
+which Kiri compiles in; paths below that start with kiri-forge/ are files
+of that repository, whose NOTICE carries the same credits.
+
+This section is kept by hand in docs/licensing/notices/ and added to NOTICE
+by scripts/ci/notices.sh.
+
+BuildKit — Apache License 2.0
+----------------------------------------------------------------------
+Source: https://github.com/moby/buildkit (v0.33.1)
+Copyright The BuildKit Authors. BuildKit ships no NOTICE file. The text of
+the Apache License 2.0 is given above, under "Rust workspace and locked
+dependencies".
+
+Translated from it:
+- kiri-forge/src/dockerfile/ (parser.rs, directives.rs,
+  instructions.rs, shell.rs, linter.rs, suggest.rs): frontend/dockerfile
+  parser, instructions, shell and linter packages, util/suggest
+- kiri-forge/src/convert/ (mod.rs, dispatch.rs, expose.rs, git.rs,
+  util.rs): frontend/dockerfile/dockerfile2llb, frontend/dockerfile/dfgitutil,
+  util/system/path.go, util/gitutil/git_url.go, util/sshutil/scpurl.go
+- kiri-forge/src/copy/ (checksum.rs, fsutil.rs, unpack.rs, user.rs):
+  cache/contenthash, solver/llbsolver/file, solver/llbsolver/ops/user_linux.go
+- kiri-forge/src/build/progress.rs (source_snippet):
+  solver/errdefs/source.go
+- crates/kiri-init/src/linux/stepdiff.rs, the function same: the order of
+  decisions of sameDirent in util/overlay/overlay_linux.go
+Followed for behaviour, written independently: the rest of
+crates/kiri-init/src/linux/stepdiff.rs (util/overlay/overlay_linux.go),
+crates/kiri/src/daemon/buildfetch.rs (source/http/source.go).
+
+moby/patternmatcher 0.6.1 — Apache License 2.0
+----------------------------------------------------------------------
+Source: https://github.com/moby/patternmatcher
+Translated from it: kiri-forge/src/context/pattern.rs and
+ignorefile.rs (patternmatcher.go, ignorefile/ignorefile.go).
+Copyright 2013-2018 Docker, Inc. Its NOTICE file:
+
+  Docker
+  Copyright 2012-2017 Docker, Inc.
+
+  This product includes software developed at Docker, Inc. (https://www.docker.com).
+
+  The following is courtesy of our legal counsel:
+
+
+  Use and transfer of Docker may be subject to certain restrictions by the
+  United States and other governments.
+  It is your responsibility to ensure that your use and/or transfer does not
+  violate applicable laws.
+
+  For more information, please see https://www.bis.doc.gov
+
+  See also https://www.apache.org/dev/crypto.html and/or seek legal counsel.
+
+containerd/continuity 0.5.0 and containerd/platforms 1.0.0-rc.5 — Apache License 2.0
+----------------------------------------------------------------------
+Source: https://github.com/containerd/continuity,
+https://github.com/containerd/platforms
+Copyright The containerd Authors. Neither ships a NOTICE file.
+Translated from them: kiri-forge/src/copy/rootpath.rs (fs/path.go)
+and kiri-forge/src/convert/platform.rs (platforms.go, database.go).
+
+distribution/reference 0.6.0 — Apache License 2.0
+----------------------------------------------------------------------
+Source: https://github.com/distribution/reference
+No NOTICE file and no copyright line upstream.
+Translated from it: kiri-forge/src/convert/reference.rs (normalize.go,
+reference.go, regexp.go, helpers.go).
+
+opencontainers/go-digest 1.0.0 — Apache License 2.0
+----------------------------------------------------------------------
+Source: https://github.com/opencontainers/go-digest
+The digest checks in kiri-forge/src/convert/reference.rs follow
+digest.go. Its NOTICE file:
+
+  opencontainers/go-digest
+
+  Copyright The OCI Contributors.
+  Copyright 2016 Docker, Inc.
+
+  Source code is licensed under the Apache License, Version 2.0.
+  See LICENSE for details.
+
+  Documentation files, including README.md and CONTRIBUTING.md,
+  are licensed under the Creative Commons Attribution-ShareAlike
+  4.0 International License (CC BY-SA 4.0). See LICENSE.docs
+  for details.
+
+moby/go-archive 0.2.0, moby/sys (user 0.4.1, signal 0.7.1) — Apache License 2.0
+----------------------------------------------------------------------
+Source: https://github.com/moby/go-archive, https://github.com/moby/sys
+No NOTICE file and no copyright line upstream.
+Translated from them: kiri-forge/src/copy/unpack.rs (archive.go,
+archive_unix.go, compression/), kiri-forge/src/copy/user.rs (passwd
+and group parsing), kiri-forge/src/convert/util.rs (signal.go,
+signal_linux.go).
+
+docker/go-units 0.5.0 — Apache License 2.0
+----------------------------------------------------------------------
+Source: https://github.com/docker/go-units
+Copyright 2015 Docker, Inc. No NOTICE file.
+Translated from it: the size parsing in
+kiri-forge/src/dockerfile/instructions.rs (size.go), and
+Ulimit::parse in kiri-forge/src/ports/mod.rs (ulimit.go,
+ParseUlimit).
+
+agext/levenshtein 1.2.3 — Apache License 2.0
+----------------------------------------------------------------------
+Source: https://github.com/agext/levenshtein
+Translated from it: the edit distance in
+kiri-forge/src/dockerfile/suggest.rs. Its NOTICE file:
+
+  Alrux Go EXTensions (AGExt) - package levenshtein
+  Copyright 2016 ALRUX Inc.
+
+  This product includes software developed at ALRUX Inc.
+  (http://www.alrux.com/).
+
+tonistiigi/fsutil (83cac42c1c52) and tonistiigi/go-csvvalue — MIT
+----------------------------------------------------------------------
+Source: https://github.com/tonistiigi/fsutil,
+https://github.com/tonistiigi/go-csvvalue
+Translated from fsutil: kiri-forge/src/context/walk.rs (filter.go,
+fs.go, followlinks.go, stat.go, stat_unix.go, hardlinks.go) and
+kiri-forge/src/copy/fsutil.rs (copy/). The CSV field reader in
+kiri-forge/src/dockerfile/instructions.rs follows go-csvvalue.
+
+  MIT
+
+  Copyright 2017 Tõnis Tiigi <tonistiigi@gmail.com>
+
+  Permission is hereby granted, free of charge, to any person obtaining
+  a copy of this software and associated documentation files (the
+  "Software"), to deal in the Software without restriction, including
+  without limitation the rights to use, copy, modify, merge, publish,
+  distribute, sublicense, and/or sell copies of the Software, and to
+  permit persons to whom the Software is furnished to do so, subject to
+  the following conditions:
+
+  The above copyright notice and this permission notice shall be
+  included in all copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+  EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+  MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+  NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+  LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+  OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+  WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+go-csvvalue carries the same licence text with "Copyright 2024 Tõnis Tiigi
+<tonistiigi@gmail.com>".
+
+tonistiigi/dchapes-mode (73d941a28323) — BSD 2-Clause, and BSD libc setmode.c — BSD 3-Clause
+----------------------------------------------------------------------
+Source: https://github.com/tonistiigi/dchapes-mode
+Translated from it: kiri-forge/src/copy/mode.rs (mode.go, bits.go);
+the symbolic mode check in kiri-forge/src/convert/dispatch.rs
+follows it.
+
+  Copyright © 2016-2018, Dave Chapeskie
+  All rights reserved.
+
+  Redistribution and use in source and binary forms, with or without
+  modification, are permitted provided that the following conditions are met:
+
+  1. Redistributions of source code must retain the above copyright notice, this
+     list of conditions and the following disclaimer.
+  2. Redistributions in binary form must reproduce the above copyright notice,
+     this list of conditions and the following disclaimer in the documentation
+     and/or other materials provided with the distribution.
+
+  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+  ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+  WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+  DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+  ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+  (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+  LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+  ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+  SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+mode.go is itself a translation of BSD's lib/libc/gen/setmode.c, which
+carries this notice:
+
+  Copyright (c) 1989, 1993, 1994
+  	The Regents of the University of California.  All rights reserved.
+
+  This code is derived from software contributed to Berkeley by
+  Dave Borman at Cray Research, Inc.
+
+  Redistribution and use in source and binary forms, with or without
+  modification, are permitted provided that the following conditions
+  are met:
+  1. Redistributions of source code must retain the above copyright
+     notice, this list of conditions and the following disclaimer.
+  2. Redistributions in binary form must reproduce the above copyright
+     notice, this list of conditions and the following disclaimer in the
+     documentation and/or other materials provided with the distribution.
+  4. Neither the name of the University nor the names of its contributors
+     may be used to endorse or promote products derived from this software
+     without specific prior written permission.
+
+  THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
+  ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+  IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+  ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
+  FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+  DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+  OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+  HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+  LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+  OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+  SUCH DAMAGE.
+
+The Go standard library (Go 1.26) — BSD 3-Clause
+----------------------------------------------------------------------
+Source: https://go.dev (https://github.com/golang/go, go1.26.5)
+Translated from it:
+- crates/kiri-image/src/goflate.rs: compress/flate (deflate.go,
+  huffman_bit_writer.go, huffman_code.go, token.go) and compress/gzip
+- kiri-forge/src/copy/tar.rs: archive/tar (reader.go, format.go,
+  strconv.go)
+- crates/kiri-proto/src/layertar.rs: written from archive/tar's writer
+  (writer.go, common.go, format.go) to give the same bytes
+- kiri-forge/src/copy/gopath.rs, kiri-forge/src/context/gostr.rs
+  and pattern.rs: path/filepath (Clean, Split, Rel, Match), strings, unicode/utf8
+- kiri-forge/src/convert/gofmt.rs: time.Duration.String
+- kiri-forge/src/context/ignorefile.rs: the line splitting of
+  bufio.Scanner
+
+  Copyright 2009 The Go Authors.
+
+  Redistribution and use in source and binary forms, with or without
+  modification, are permitted provided that the following conditions are
+  met:
+
+     * Redistributions of source code must retain the above copyright
+  notice, this list of conditions and the following disclaimer.
+     * Redistributions in binary form must reproduce the above
+  copyright notice, this list of conditions and the following disclaimer
+  in the documentation and/or other materials provided with the
+  distribution.
+     * Neither the name of Google LLC nor the names of its
+  contributors may be used to endorse or promote products derived from
+  this software without specific prior written permission.
+
+  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+  A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+  OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+  SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+  LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+  DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+  THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+Formats and protocols implemented from their specifications
+----------------------------------------------------------------------
+No code was taken for these; they are named so that nobody has to wonder.
+- The ssh-agent protocol and private key file formats
+  (crates/kiri/src/sshfwd.rs), from draft-miller-ssh-agent, OpenSSH's
+  PROTOCOL.key document and RFC 5915; signing is done by the ring crate. It
+  is tested against OpenSSH's own programs and contains no OpenSSH code. Its
+  key-parsing error texts are those of Go's x/crypto/ssh, which buildx
+  prints for the same key files.
+- Error and warning texts match the reference builder's word for word
+  wherever a build prints them, so that scripts reading them keep working.
+
+Test material from other projects
+=================================
+
+None of this is part of any Kiri binary. It is test input. The golden
+vectors and recorded protocol traffic the builder's tests also read are not
+in this repository; they are kept, with their own notices, in the builder
+test data that scripts/fetch-test-data.sh fetches.
+
+Test inputs of the image builder
+----------------------------------------------------------------------
+The image builder's own tests, and the test inputs they take from BuildKit,
+containerd/platforms, moby/patternmatcher and Go, are in the kiri-forge
+repository (https://github.com/libracoder/kiri-forge) and credited in its
+NOTICE.

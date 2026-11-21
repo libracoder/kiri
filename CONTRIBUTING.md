@@ -69,6 +69,40 @@ test host, `sudo KIRI_TEST_ALLOW_HOST_CHANGES=1 KIRI_ENGINE_RESTART='...'
 tests/wsl-shape.sh` runs the DNS checks with the host shaped like WSL 2 (its
 resolver an address of its own on `lo`) and puts the host back afterwards.
 
+### The image builder's test data
+
+The image builder, Forge (Kiri's own build engine), is a library of its own,
+[kiri-forge](https://github.com/libracoder/kiri-forge), which Kiri takes at
+a pinned tag (`crates/kiri/Cargo.toml`); its tests, and how they find the
+data below, are in that repository. A change to the builder goes there
+first, as a new tag, and Kiri's pin moves to it.
+
+Some tests of the image builder compare it with BuildKit through large
+recorded data: the golden vectors (kiri-forge's `convert`, `copy_golden`,
+`dockerfile_instructions`, `dockerfile_parser`, `dockerfile_shell` and
+`golden_context` tests; here, `crates/kiri/tests/golden_run.rs`).
+That data is kept in a separate repository, the builder test data
+repository, which needs access to fetch. Without it
+those tests print `SKIPPED: needs the builder test data (run
+scripts/fetch-test-data.sh)` and pass; every other test runs as usual.
+`golden_run.rs` also needs a running engine built with
+`cargo build --features build-test-routes` and started with
+`KIRI_BUILD_PORTS_TEST=1`: release builds have no test routes.
+
+Maintainers with access fetch it with `scripts/fetch-test-data.sh`, which
+uses their own git sign-in and checks out exactly the commit pinned in
+`tests/test-data.pin` into `tests/data-cache/` (ignored by git). The pin holds
+only the commit; the repository's address is set by each maintainer, in
+`KIRI_TEST_DATA_URL` or in `tests/test-data.local` (ignored by git; copy
+`tests/test-data.local.example`). The tests
+look in `KIRI_TEST_DATA` first (a folder holding `golden/` and `wire/`, such
+as a clone of the data repository), then in `tests/data-cache/`. Set
+`KIRI_TEST_DATA_REQUIRED=1` to make missing data a failure instead of a
+skip (nothing in this repository's CI sets it; a maintainer's check that
+must cover these tests should). A change that needs new data updates the
+data repository first (a new signed tag) and the pin in the same pull request
+as the code.
+
 ## Every feature ships on macOS, Windows and Linux together
 
 - A feature comes in one pull request, for all three systems, built and

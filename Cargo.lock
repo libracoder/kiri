@@ -727,6 +727,7 @@ dependencies = [
  "flate2",
  "gtk",
  "javascriptcore-rs",
+ "kiri-forge",
  "kiri-image",
  "kiri-proto",
  "kiri-share-proto",
@@ -740,6 +741,7 @@ dependencies = [
  "objc2-web-kit",
  "rcgen",
  "regex-lite",
+ "ring",
  "rustls",
  "ruzstd",
  "serde",
@@ -752,9 +754,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "kiri-forge"
+version = "0.0.0"
+source = "git+https://github.com/libracoder/kiri-forge?tag=v0.1.0#850c881c768816a7ff73128c64e199a2d56c3424"
+dependencies = [
+ "flate2",
+ "libc",
+ "regex-lite",
+ "ruzstd",
+ "serde_json",
+ "sha2",
+ "tar",
+]
+
+[[package]]
 name = "kiri-image"
 version = "0.0.0"
 dependencies = [
+ "flate2",
+ "libc",
+ "ruzstd",
  "serde",
  "serde_json",
  "sha2",
@@ -768,8 +787,10 @@ version = "0.0.0"
 dependencies = [
  "flate2",
  "kiri-proto",
+ "kiri-zstd",
  "libc",
  "ruzstd",
+ "sha2",
  "tar",
 ]
 
@@ -812,6 +833,13 @@ dependencies = [
  "webview2-com",
  "windows",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "kiri-zstd"
+version = "0.0.0"
+dependencies = [
+ "ruzstd",
 ]
 
 [[package]]

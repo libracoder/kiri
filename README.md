@@ -186,7 +186,8 @@ Kiri's own commands:
 | `kiri import [orbstack \| desktop-linux]` | Bring images, volumes and containers over |
 | `kiri domains [set --http N --https N \| reset]` | The ports local domains answer on |
 | `kiri usb [list] \| attach DEVICE \| detach DEVICE` | USB devices for containers (beta) |
-| `kiri build-with [docker \| kiri]` | Which builder `docker build` uses |
+| `kiri build-with [docker \| kiri]` | Where plain `docker build` (and `docker compose build`) runs: the other engine's BuildKit (`docker`), or Kiri's BuildKit, loading into Kiri (`kiri`). It does not switch on Kiri's own builder |
+| `kiri builder use [kiri \| buildkit]` | Which builder `kiri build` uses: Kiri's own builder in the engine (`kiri`, off by default; a build it cannot do yet goes to BuildKit), or Kiri's BuildKit (`buildkit`). `kiri build --builder kiri\|buildkit` picks for one build. It does not change `docker build` |
 | `kiri update [--check]` | Install the newest release |
 | `kiri diag logs \| report` | Logs, and a report file to send with a bug |
 | `kiri bench [--runs N] [--network none\|bridge]` | Measure container start on your machine |

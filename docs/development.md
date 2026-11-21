@@ -111,10 +111,12 @@ kiri UI ────┘
 | `crates/kiri-init` | guest PID 1, agent and container runtime |
 | `crates/kiri-proto` | host ↔ guest wire protocol (no_std, no allocation per message) |
 | `crates/kiri-image` | image references, registry client, blob store, archives |
+| [kiri-forge](https://github.com/libracoder/kiri-forge) | Forge, Kiri's own build engine (Dockerfile parser, planner, build context, COPY/ADD, layers, build driver), a library in its own repository, taken at a pinned tag (`crates/kiri/Cargo.toml`); the engine implements its plug-in points (`crates/kiri/src/daemon/buildports.rs`) |
 | `guest/kernel` | kernel config and patches |
 | `tests/e2e.sh` | ~350 checks through the real `docker` CLI, plus a leak soak (`K8S=1` adds Kubernetes) |
 | `tests/linux-host.sh` | the Linux host build, driven in a privileged container |
 | `tests/finder-mount.sh` | the Mac's Finder mount at `~/Kiri`: covers only an empty folder or its own old mount, never your files or another mount |
+| `tests/test-data.pin` | the commit of the image builder's test data (golden vectors and recorded traffic, kept in the builder test data repository, which needs access to fetch) the tests use; `scripts/fetch-test-data.sh` fetches it into `tests/data-cache/` from the address in `KIRI_TEST_DATA_URL` or the untracked `tests/test-data.local` (CONTRIBUTING.md, "The image builder's test data") |
 | `contrib/` | systemd unit, WSL2 and Windows install scripts |
 | `installer/windows` | the Windows MSI (WiX 5): `kiri.wxs`, licence, dialog bitmaps |
 | `packaging/` | Linux `.deb` and `.rpm` (`kiri` with the docker CLI, `kiri-lite` engine only), the Homebrew plan |

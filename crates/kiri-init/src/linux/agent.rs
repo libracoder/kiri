@@ -1183,6 +1183,8 @@ fn reap(procs: &mut HashMap<libc::pid_t, Proc>) {
         };
         super::copy::exited(pid);
         if let Some(p) = procs.get_mut(&pid) {
+            // A build step's ssh agent relays last as long as its process.
+            super::stepssh::forget(&p.run.id);
             p.exited = Some((code, sys::boottime_ns()));
             // Nobody will read input any more.
             p.input.clear();

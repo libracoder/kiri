@@ -225,13 +225,7 @@ impl Guest {
         };
         // The agent comes from the same install, so another version means the
         // files changed under a running Kiri: stop rather than misread it.
-        if guest.hello.protocol != kiri_proto::PROTOCOL {
-            return Err(io::Error::other(format!(
-                "the VM agent speaks protocol {}, this Kiri speaks {}: quit Kiri and open it again",
-                guest.hello.protocol,
-                kiri_proto::PROTOCOL
-            )));
-        }
+        kiri_proto::check_protocol(guest.hello.protocol).map_err(|e| io::Error::other(e.to_string()))?;
         guest.timings.agent_ready = t0.elapsed();
         // The guest has no real-time clock source of its own.
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();

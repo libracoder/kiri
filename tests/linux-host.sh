@@ -216,6 +216,73 @@ t kill-stuck-start "killed after the wait, start refused, exited 137, leftovers:
 # agent could start. Its exit now ends the connection, and the next agent
 # stops what the old one left and takes the lock: a run answers again.
 t agent-dies-beside-stuck-start "answered, leftovers: none" "cg=\$(docker run -d alpine sleep 60); p=\$(docker inspect -f '{{.State.Pid}}' \$cg); K=/sys/fs/cgroup\$(sed -n 's/^0:://p' /proc/\$p/cgroup); K=\${K%/*}; docker rm -f \$cg >/dev/null; id=\$(docker create alpine true); echo 1 > \$K/cgroup.freeze; (timeout -s KILL 60 docker start \$id >/dev/null 2>&1 &); for i in \$(seq 50); do [ -s \$K/\$id/cgroup.procs ] && break; sleep 0.1; done; c=\$(cat \$K/\$id/cgroup.procs); echo 1 > \$K/\$id/cgroup.freeze; echo 0 > \$K/cgroup.freeze; kill -9 \$(pgrep kiri-init | grep -vx \"\$c\" | head -1); t0=\$(date +%s); rc=1; while [ \$(( \$(date +%s) - t0 )) -lt 30 ]; do timeout -s KILL 30 docker run --rm alpine true >/dev/null 2>&1 && { rc=0; break; }; sleep 0.5; done; t=\$(( \$(date +%s) - t0 )); left=; [ -d \$K/\$id ] && { left=\"\$left cgroup\"; echo 0 > \$K/\$id/cgroup.freeze; }; docker rm -f \$id >/dev/null 2>&1; [ \$rc = 0 ] && [ \$t -le 10 ] && echo \"answered, leftovers:\${left:- none}\" || echo \"no answer after \$t s, leftovers:\$left\""
+# A zstd layer in several frames, with skippable frames between and after
+# them (zstd:chunked keeps its table of contents in them, Podman and
+# skopeo push such layers): every file of every frame is in the container.
+# The agent read the first frame only, and the files of the others were
+# silently missing. Bytes after the last frame that are not one are refused,
+# as Docker refuses them. zstd-image.py writes the frames itself (raw blocks).
+$D exec -i "$N" sh -c 'cat > /zstd-image.py' <<'PY'
+import hashlib, io, json, struct, subprocess, sys, tarfile
+tag, tail = sys.argv[1], sys.argv[2].encode()
+def sha(b): return hashlib.sha256(b).hexdigest()
+def frame(b):
+    out = struct.pack("<IBB", 0xFD2FB528, 0, 7 << 3)  # no size, no checksum, window 128 KiB
+    blocks = [b[i:i + 65536] for i in range(0, len(b), 65536)] or [b""]
+    for i, x in enumerate(blocks):
+        out += struct.pack("<I", int(i + 1 == len(blocks)) | len(x) << 3)[:3] + x  # raw block
+    return out
+def skip(p): return struct.pack("<II", 0x184D2A5A, len(p)) + p
+buf, at = io.BytesIO(), []
+with tarfile.open(fileobj=buf, mode="w", format=tarfile.GNU_FORMAT) as t:
+    for i in range(31):
+        n = "zt/f%03d" % i; d = (n * 100).encode()
+        ti = tarfile.TarInfo(n); ti.size = len(d); at.append(buf.tell()); t.addfile(ti, io.BytesIO(d))
+tar = buf.getvalue()
+a, b = at[10], at[20]
+# It starts with a data frame: for a layer that starts with a skippable
+# frame, the engine's archive sniffing (kiri-image's media_type_of) must know
+# skippable frames too, and it does not yet; that is not checked here.
+layer = frame(tar[:a]) + skip(b"x" * 99) + frame(tar[a:b]) + frame(b"") + frame(tar[b:]) + skip(b"toc") + tail
+save = tarfile.open(fileobj=io.BytesIO(subprocess.run(["docker", "save", "alpine"], stdout=subprocess.PIPE, check=True).stdout))
+m = json.load(save.extractfile("manifest.json"))[0]
+cfg = json.load(save.extractfile(m["Config"])); base = save.extractfile(m["Layers"][0]).read()
+cfg["rootfs"]["diff_ids"] = cfg["rootfs"]["diff_ids"][:1] + ["sha256:" + sha(tar)]
+cb = json.dumps(cfg).encode()
+out = io.BytesIO()
+with tarfile.open(fileobj=out, mode="w") as t:
+    for name, data in [(sha(cb) + ".json", cb), (sha(base) + ".tar", base), (sha(layer) + ".tar", layer),
+                       ("manifest.json", json.dumps([{"Config": sha(cb) + ".json", "RepoTags": [tag], "Layers": [sha(base) + ".tar", sha(layer) + ".tar"]}]).encode())]:
+        ti = tarfile.TarInfo(name); ti.size = len(data); t.addfile(ti, io.BytesIO(data))
+subprocess.run(["docker", "load", "-q"], input=out.getvalue(), stdout=subprocess.DEVNULL, check=True)
+PY
+t zstd-layer-every-frame "files 31" "python3 /zstd-image.py zstd-frames:1 '' && docker run --rm zstd-frames:1 sh -c 'echo files \$(ls /zt | wc -l)'"
+t zstd-layer-trailing-garbage-refused "zstd" "python3 /zstd-image.py zstd-frames:2 'not a frame' && docker run --rm zstd-frames:2 true 2>&1; docker rmi zstd-frames:1 zstd-frames:2 >/dev/null 2>&1"
+# A layer entry whose name is absolute (here a PAX path record) is written
+# inside the layer, and so are its extended attributes. They went on that
+# path outside the layer, on the engine's own files, before.
+$D exec -i "$N" sh -c 'cat > /xattr-image.py' <<'PY'
+import hashlib, io, json, subprocess, sys, tarfile
+victim = sys.argv[1]
+def sha(b): return hashlib.sha256(b).hexdigest()
+buf = io.BytesIO()
+with tarfile.open(fileobj=buf, mode="w", format=tarfile.PAX_FORMAT) as t:
+    ti = tarfile.TarInfo("x"); ti.size = 2; ti.pax_headers = {"path": victim, "SCHILY.xattr.user.kiri": "pax"}
+    t.addfile(ti, io.BytesIO(b"x\n"))
+layer = buf.getvalue()
+save = tarfile.open(fileobj=io.BytesIO(subprocess.run(["docker", "save", "alpine"], stdout=subprocess.PIPE, check=True).stdout))
+m = json.load(save.extractfile("manifest.json"))[0]
+cfg = json.load(save.extractfile(m["Config"])); base = save.extractfile(m["Layers"][0]).read()
+cfg["rootfs"]["diff_ids"] = cfg["rootfs"]["diff_ids"][:1] + ["sha256:" + sha(layer)]
+cb = json.dumps(cfg).encode()
+out = io.BytesIO()
+with tarfile.open(fileobj=out, mode="w") as t:
+    for name, data in [(sha(cb) + ".json", cb), (sha(base) + ".tar", base), (sha(layer) + ".tar", layer),
+                       ("manifest.json", json.dumps([{"Config": sha(cb) + ".json", "RepoTags": ["xattr-out:1"], "Layers": [sha(base) + ".tar", sha(layer) + ".tar"]}]).encode())]:
+        ti = tarfile.TarInfo(name); ti.size = len(data); t.addfile(ti, io.BytesIO(data))
+subprocess.run(["docker", "load", "-q"], input=out.getvalue(), stdout=subprocess.DEVNULL, check=True)
+PY
+t layer-xattr-stays-inside "outside [], inside b'pax'" "echo v > /tmp/xattr-victim && python3 /xattr-image.py /tmp/xattr-victim && docker run --rm xattr-out:1 true && python3 -c \"import os,glob; print('outside', os.listxattr('/tmp/xattr-victim'), end=', '); print('inside', [os.getxattr(p, 'user.kiri') for p in glob.glob('/var/lib/kiri/layers/*/tmp/xattr-victim')][0])\"; docker rmi xattr-out:1 >/dev/null 2>&1; rm -f /tmp/xattr-victim"
 # A containers.json cut short (a crash, a full disk) is kept aside as
 # containers.json.corrupt-*, the records still readable are loaded, and
 # nothing is deleted because of the damaged list: no log folder and no

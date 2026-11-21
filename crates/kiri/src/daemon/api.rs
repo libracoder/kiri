@@ -146,6 +146,15 @@ fn route(req: &Request, engine: &Arc<Engine>, w: &mut UnixStream, r: &mut BufRea
             return reply(w, engine.vm().map(|_| Value::Null).map_err(Error::Io), 204);
         }
         // The window's Stop: off until Start, whatever asks for the VM meanwhile.
+        // Test-only routes: built only with the `build-test-routes` feature,
+        // never in a release.
+        #[cfg(feature = "build-test-routes")]
+        ("POST", "/kiri/build/steps") => return reply(w, super::buildports::try_steps(&req.body, engine), 200),
+        #[cfg(feature = "build-test-routes")]
+        ("POST", "/kiri/build/golden") => {
+            let _awake = engine.hold_awake();
+            return reply(w, super::buildports::golden_build(&req.body, engine, super::nativebuild::peer_cred(w)), 200);
+        }
         ("POST", "/kiri/stop") => return reply(w, engine.stop_all().map(|()| Value::Null), 204),
         ("POST", "/kiri/sleep") => return reply(w, engine.sleep_now().map(|()| Value::Null), 204),
         ("GET", "/kiri/proxy") => return reply(w, Ok(super::proxy::report()), 200),
@@ -212,6 +221,14 @@ fn route(req: &Request, engine: &Arc<Engine>, w: &mut UnixStream, r: &mut BufRea
         }
         ("GET", "/info") => return reply(w, Ok(info(engine)), 200),
         ("POST", "/build") => return super::builder::build(req, engine, w, r),
+        ("POST", "/kiri/build") => return super::nativebuild::build(req, engine, w, r),
+        // `kiri build --ssh`: the client's agents for its build (buildssh.rs).
+        ("POST", "/kiri/build/ssh") => {
+            let uid = super::nativebuild::peer_cred(w).map(|c| c.uid);
+            return super::buildssh::open_session(req, w, uid);
+        }
+        ("GET", "/kiri/build-path") => return super::nativebuild::get_path(req, engine, w),
+        ("POST", "/kiri/build-path") => return reply(w, super::nativebuild::post_path(req), 204),
         ("POST", "/build/cancel") => return reply(w, super::builder::cancel(req, engine), 200),
         ("POST", "/build/prune") => return reply(w, super::builder::prune(req, engine), 200),
         ("GET", "/kiri/builder") => return reply(w, Ok(super::builder::settings_report(engine)), 200),
@@ -637,6 +654,17 @@ fn image_list_dangling(f: &Filters) -> Result<Option<bool>, Error> {
 fn image_inspect(engine: &Engine, name: &str) -> Result<Value, Error> {
     let i = engine.image(name)?.ok_or_else(|| Error::NotFound(format!("No such image: {name}")))?;
     let cfg = image_config_json(engine, &i.config_digest);
+    // The config as Docker shows it: every field the image's config has
+    // (ports, volumes, stop signal, shell, onbuild, ...), not only the ones
+    // Kiri runs with.
+    let mut config = cfg["config"].as_object().cloned().unwrap_or_default();
+    config.insert("Env".into(), json!(i.config.env));
+    config.insert("Cmd".into(), json!(i.config.cmd));
+    config.insert("Entrypoint".into(), if i.config.entrypoint.is_empty() { Value::Null } else { json!(i.config.entrypoint) });
+    config.insert("WorkingDir".into(), json!(i.config.working_dir));
+    config.insert("User".into(), json!(i.config.user));
+    config.insert("Labels".into(), image_labels_from(&cfg));
+    config.insert("Healthcheck".into(), cfg["config"]["Healthcheck"].clone());
     // Docker's RootFS.Layers are the image config's uncompressed diff_ids,
     // not the manifest's compressed blob digests (scanners like Trivy match
     // them against the tar layers from `docker save`).
@@ -654,15 +682,7 @@ fn image_inspect(engine: &Engine, name: &str) -> Result<Value, Error> {
         "Size": i.size,
         "Architecture": i.platform.rsplit('/').next().unwrap_or(go_arch()),
         "Os": "linux",
-        "Config": {
-            "Env": i.config.env,
-            "Cmd": i.config.cmd,
-            "Entrypoint": if i.config.entrypoint.is_empty() { Value::Null } else { json!(i.config.entrypoint) },
-            "WorkingDir": i.config.working_dir,
-            "User": i.config.user,
-            "Labels": image_labels_from(&cfg),
-            "Healthcheck": cfg["config"]["Healthcheck"].clone(),
-        },
+        "Config": Value::Object(config),
         "RootFS": {"Type": cfg["rootfs"]["type"].as_str().unwrap_or("layers"), "Layers": rootfs_layers},
     }))
 }
@@ -858,6 +878,12 @@ fn image_save(engine: &Engine, names: &[String], w: &mut UnixStream) -> io::Resu
             Err(e) => return reply(w, Err(Error::Io(e)), 200),
         }
     }
+    // Held from here to the end of the stream; a blob already gone is an
+    // error reply, not an archive cut short.
+    let _held = match kiri_image::archive::hold(&engine.store, &images) {
+        Ok(p) => p,
+        Err(e) => return reply(w, Err(Error::Io(e)), 200),
+    };
     http::begin_stream(w, 200, "application/x-tar")?;
     struct Chunked<'a>(&'a mut UnixStream);
     impl io::Write for Chunked<'_> {
@@ -1134,13 +1160,24 @@ fn run_pull(req: &Request, engine: &Engine, reference: &Reference, job: &super::
     };
     let began = std::time::Instant::now();
     crate::diag::info!("image pull started", image = reference.short(), platform = wanted);
-    let mut result = client.pull_with(&engine.store, reference, &wanted, &on_progress, &job.cancel);
+    // With the native builder in use, layers unpack in the guest as they
+    // arrive, when the VM is up. On a Linux host the guest is a process of
+    // this machine, cheap to start, so a pull starts it; a Mac's VM is not
+    // booted for a pull.
+    // Only for the native builder: with it switched off a pull starts
+    // nothing and unpacks nothing, as before the builder.
+    if cfg!(target_os = "linux") && engine.store.native_checks() {
+        let _ = engine.vm();
+    }
+    let tee = engine.layer_tee();
+    let tee = tee.as_ref().map(|t| t as &dyn kiri_image::registry::LayerTee);
+    let mut result = client.pull_tee(&engine.store, reference, &wanted, &on_progress, &job.cancel, tee);
     // An image built only for amd64 runs through Rosetta, as on Docker Desktop.
     if let Err(kiri_image::registry::Error::NoPlatform { available, .. }) = &result {
         let amd64 = Platform { os: "linux".into(), architecture: "amd64".into() };
         if req.query("platform").is_none_or(str::is_empty) && wanted != amd64 && available.iter().any(|a| a == "linux/amd64") && amd64_runs() {
             line(json!({"status": format!("{} has no {wanted} image; using linux/amd64 through Rosetta", reference.short())}));
-            result = client.pull_with(&engine.store, reference, &amd64, &on_progress, &job.cancel);
+            result = client.pull_tee(&engine.store, reference, &amd64, &on_progress, &job.cancel, tee);
         }
     }
     match result {
@@ -1367,7 +1404,7 @@ fn mac_source(src: &str) -> Option<String> {
 
 /// Where the guest finds a host path given for a bind: the Mac's own under
 /// the shares, else the VM's (on Linux, the host's).
-fn guest_bind_source(src: &str) -> String {
+pub(super) fn guest_bind_source(src: &str) -> String {
     if !cfg!(target_os = "macos") {
         return src.to_owned();
     }
@@ -3479,6 +3516,45 @@ pub(super) fn parse_signal(raw: &str) -> Result<u32, Error> {
 mod tests {
     use super::*;
 
+    /// The builder's test-only routes are not in a build without the
+    /// `build-test-routes` feature, whatever the environment says: they
+    /// answer as any unknown route. Run in a child process of this test
+    /// binary, so the variable is set for it alone.
+    #[test]
+    fn test_only_build_routes_are_absent_from_a_default_build() {
+        if cfg!(feature = "build-test-routes") {
+            return;
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "daemon::api::tests::test_only_build_routes_child", "--include-ignored", "--nocapture"])
+            .env("KIRI_BUILD_PORTS_TEST", "1")
+            .env("KIRI_TEST_ROUTES_CHILD", "1")
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success() && text.contains("1 passed"), "{text}");
+    }
+
+    #[test]
+    #[ignore = "run by test_only_build_routes_are_absent_from_a_default_build"]
+    fn test_only_build_routes_child() {
+        assert_eq!(std::env::var("KIRI_TEST_ROUTES_CHILD").as_deref(), Ok("1"));
+        let root = std::env::temp_dir().join(format!("kiri-test-routes-{}", super::super::engine::random_hex(8)));
+        let engine = super::super::engine::boot_without_vm(&root);
+        for path in ["/kiri/build/steps", "/kiri/build/golden"] {
+            let (mut w, client) = UnixStream::pair().unwrap();
+            let mut r = BufReader::new(w.try_clone().unwrap());
+            let req = Request::internal("POST", path, &[], br#"{"context":"/","dockerfile":"FROM scratch"}"#.to_vec());
+            route(&req, &engine, &mut w, &mut r).unwrap();
+            drop(w);
+            drop(r);
+            let mut got = String::new();
+            io::Read::read_to_string(&mut &client, &mut got).unwrap();
+            assert!(got.starts_with("HTTP/1.1 404") && got.contains("does not support"), "{path}: {got}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// One prune command sends its filters to every prune: volumes and
     /// networks go only when their labels match, as in Docker; a volume
     /// with driver options is never pruned; networks take `until`.
@@ -4106,6 +4182,49 @@ mod tests {
     /// `docker save | gzip | docker load` loads, as on Docker (issue 528):
     /// the body goes through the same detection as `docker cp` uploads.
     /// Each archive is sent to `POST /images/load` as the CLI sends it.
+    /// `docker image inspect` lists the diff ids, as Docker does, for an
+    /// image loaded from an archive with compressed layers (`docker load`,
+    /// a fallback build's docker exporter) as for the same image made here
+    /// with plain tar layers.
+    #[test]
+    fn inspect_lists_diff_ids_for_loaded_and_built_images_alike() {
+        use std::io::Write;
+        let (root, engine) = engine_in("inspect-rootfs", false);
+        let put = |bytes: &[u8]| {
+            let mut w = engine.store.ingest().unwrap();
+            w.write_all(bytes).unwrap();
+            w.finish().unwrap()
+        };
+        let tar_bytes = {
+            let mut b = tar::Builder::new(Vec::new());
+            let mut h = tar::Header::new_ustar();
+            h.set_size(2);
+            h.set_mode(0o644);
+            b.append_data(&mut h, "f", &b"hi"[..]).unwrap();
+            b.into_inner().unwrap()
+        };
+        let diff_id = kiri_image::store::sha256_digest(&tar_bytes);
+        let config = json!({"os": "linux", "architecture": "amd64", "config": {}, "rootfs": {"type": "layers", "diff_ids": [diff_id]}});
+        let (cfg, _) = put(&serde_json::to_vec(&config).unwrap());
+        // Built here: the layer is its plain tar, its digest the diff id.
+        let (plain, size) = put(&tar_bytes);
+        let built = kiri_image::archive::from_config("built:1".into(), &cfg, &config, vec![kiri_image::Layer { digest: plain, size, media_type: "application/vnd.oci.image.layer.v1.tar".into() }]);
+        // Loaded: the same image with its layer gzipped, as BuildKit sends it.
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(&tar_bytes).unwrap();
+        let (blob, size) = put(&gz.finish().unwrap());
+        let src = kiri_image::archive::from_config("loaded:1".into(), &cfg, &config, vec![kiri_image::Layer { digest: blob.clone(), size, media_type: "application/vnd.docker.image.rootfs.diff.tar.gzip".into() }]);
+        let mut archive = Vec::new();
+        kiri_image::archive::save(&engine.store, &[src], &mut archive).unwrap();
+        engine.store.put_image(built).unwrap();
+        kiri_image::archive::load(&engine.store, archive.as_slice()).unwrap();
+        let layers = |name: &str| image_inspect(&engine, name).unwrap()["RootFS"]["Layers"].clone();
+        assert_eq!(layers("built:1"), json!([diff_id]));
+        assert_eq!(layers("loaded:1"), json!([diff_id]), "not the blob {blob}");
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn image_load_takes_gzip_archives() {
         use std::io::{Read, Write};

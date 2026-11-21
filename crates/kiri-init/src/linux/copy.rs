@@ -10,8 +10,8 @@
 
 use std::fs;
 use std::io::{self, BufReader, BufWriter, Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 
 use kiri_proto::{COPY_PORT, CopySpec, FsEntry, Msg, copy_flags, copy_op};
 
@@ -189,6 +189,11 @@ fn job(sock: OwnedFd, chan: OwnedFd, running: &[(&str, libc::pid_t)], paths: &Pa
     let result = match spec.op {
         // These read the writable layer itself, next to the image's layers.
         copy_op::DIFF | copy_op::COMMIT => layer_job(&mut conn, &spec, paths),
+        copy_op::STEP_LAYER => step_layer(&mut conn, &spec, paths),
+        copy_op::STEP_ADOPT => step_adopt(&mut conn, &spec, paths),
+        copy_op::LAYER_DELTA => layer_delta(&mut conn, &spec, paths),
+        copy_op::LAYER_UNPACK => layer_unpack(&mut conn, &spec, paths),
+        copy_op::LAYER_XATTRS => layer_xattrs(&mut conn, &spec, paths),
         _ => {
             if let Err(e) = enter(&spec, running, paths, &chan) {
                 return reply_error(&mut conn, &format!("container {}: {e}", spec.id));
@@ -290,17 +295,25 @@ fn copy_in(conn: &mut fs::File, spec: &CopySpec<'_>) -> io::Result<()> {
         for entry in archive.entries()? {
             let mut entry = entry?;
             if spec.flags & copy_flags::NO_OVERWRITE_DIR_NON_DIR != 0 {
-                let target = dest.join(entry.path()?);
-                if let Ok(m) = fs::symlink_metadata(&target) {
-                    if m.is_dir() != entry.header().entry_type().is_dir() {
+                // What is there now, looked up inside `dest` as the tar crate
+                // places the entry (a leading `/` dropped, no link followed on
+                // the way), never `dest.join(name)`: an absolute name would be
+                // a path outside it.
+                let target = dest.join(entry.path()?.components().filter(|c| matches!(c, std::path::Component::Normal(_))).collect::<std::path::PathBuf>());
+                if let Some(is_dir) = existing_is_dir(dest, &entry.path()?) {
+                    if is_dir != entry.header().entry_type().is_dir() {
                         return Err(io::Error::new(
                             io::ErrorKind::AlreadyExists,
-                            format!("cannot overwrite {} {} with {}", if m.is_dir() { "directory" } else { "non-directory" }, target.display(), if m.is_dir() { "non-directory" } else { "directory" }),
+                            format!("cannot overwrite {} {} with {}", if is_dir { "directory" } else { "non-directory" }, target.display(), if is_dir { "non-directory" } else { "directory" }),
                         ));
                     }
                 }
             }
-            entry.unpack_in(dest)?;
+            let path = entry.path()?.into_owned();
+            // `docker cp` and the classic build's context keep a time of 0.
+            if entry.unpack_in(dest)? {
+                super::layers::keep_zero_time(dest, &path, entry.header())?;
+            }
         }
     }
     // The archive's trailing padding: read it so the host's writes complete.
@@ -309,6 +322,17 @@ fn copy_in(conn: &mut fs::File, spec: &CopySpec<'_>) -> io::Result<()> {
     let mut out = Vec::new();
     Msg::CopyDone.encode(&mut out);
     conn.write_all(&out)
+}
+
+/// Whether what an archive entry named `path` would replace inside `dest`
+/// is a folder: None when nothing is there, or the way there is not plain
+/// folders (a link, `..`: the tar crate's unpack refuses those itself).
+fn existing_is_dir(dest: &std::path::Path, path: &std::path::Path) -> Option<bool> {
+    let root = super::inroot::open_root(dest).ok()?;
+    let (dir, name) = super::inroot::parent_strict(root.as_fd(), path).ok()?;
+    // SAFETY: fstatat of one name under a valid descriptor, not following it, into a zeroed stat.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    (unsafe { libc::fstatat(dir.as_raw_fd(), name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) } == 0).then_some(st.st_mode & libc::S_IFMT == libc::S_IFDIR)
 }
 
 /// A `copy_flags::CHUNKED` archive: chunks of `len: u32 LE | bytes`, read
@@ -432,7 +456,12 @@ fn append_one(b: &mut tar::Builder<impl Write>, src: &std::path::Path, name: &st
         let mut h = tar::Header::new_gnu();
         h.set_metadata(meta);
         h.set_mode(mode_bits(meta));
-        let mut f = fs::File::open(src)?;
+        // Not followed and never waited on: a running container can swap
+        // the file for a link or a FIFO between the look above and here.
+        let mut f = fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY).open(src)?;
+        if !f.metadata()?.is_file() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, format!("{} changed while it was copied", src.display())));
+        }
         return b.append_data(&mut h, name, &mut f);
     }
     if ft.is_dir() || ft.is_symlink() || ft.is_fifo() || ft.is_char_device() || ft.is_block_device() {
@@ -602,6 +631,224 @@ fn layer_job(conn: &mut fs::File, spec: &CopySpec<'_>, paths: &Paths) -> io::Res
     w.flush()
 }
 
+/// A build step's layer (`copy_op::STEP_LAYER`), from its upper folder.
+/// The layers below are seen as one tree: the layer itself when there is
+/// one, else a read-only overlay of them mounted in this child's own mount
+/// namespace, gone with the child.
+fn step_layer(conn: &mut fs::File, spec: &CopySpec<'_>, paths: &Paths) -> io::Result<()> {
+    super::container::valid_id(spec.id)?;
+    let base_dir = paths.containers.join(spec.id);
+    let upper = base_dir.join("upper");
+    if !upper.is_dir() {
+        return reply_error(conn, &format!("step {} has no writable layer", spec.id));
+    }
+    let mut lowers: Vec<&str> = Vec::new();
+    for d in spec.layers.iter() {
+        if !super::layers::present(&paths.layers, d) {
+            return reply_error(conn, &format!("layer {d} is not unpacked"));
+        }
+        let h = super::layers::hex(d)?;
+        // As mount_rootfs: overlayfs refuses a folder listed twice.
+        if !lowers.contains(&h) {
+            lowers.push(h);
+        }
+    }
+    let base = match lowers.len() {
+        0 => None,
+        1 => Some(super::stepdiff::Base::open(&paths.layers.join(lowers[0]))?),
+        _ => {
+            let below = base_dir.join("below");
+            fs::create_dir_all(&below)?;
+            // SAFETY: plain syscalls on this child alone.
+            unsafe {
+                sys::check(libc::unshare(libc::CLONE_NEWNS) as _, "unshare")?;
+            }
+            sys::mount(c"none", c"/", c"", libc::MS_REC | libc::MS_PRIVATE, None)?;
+            // Relative to the layer store, as mount_rootfs keeps the option short.
+            std::env::set_current_dir(&paths.layers)?;
+            let lowers: Vec<String> = lowers.iter().map(|l| l.to_string()).collect();
+            sys::mount_overlay(&below, &lowers, ",index=off,redirect_dir=nofollow,metacopy=off", libc::MS_RDONLY)?;
+            Some(super::stepdiff::Base::open(&below)?)
+        }
+    };
+    done(conn)?;
+    let written = {
+        let mut out = BufWriter::with_capacity(256 * 1024, ChunkWriter(&mut *conn));
+        // The step's mount targets, one per line (see copy_op::STEP_LAYER).
+        let mounts: Vec<&[u8]> = spec.path.as_bytes().split(|b| *b == b'\n').filter(|m| !m.is_empty() && *m != b"/").collect();
+        // And what Rosetta made, when it ran the step's program.
+        let rosetta = super::rosetta::marked(&base_dir);
+        super::stepdiff::write_step(&upper, base.as_ref(), &mounts, rosetta, &mut out).and_then(|stubs| {
+            out.flush()?;
+            // The upper may become the layer itself (STEP_ADOPT): it must
+            // hold what the tar holds, so the runtime's stubs go from it too.
+            stubs.clean(&upper)?;
+            stubs.folder_times(&upper)
+        })
+    };
+    // The tar's last chunk, then the folder times as chunks of their own.
+    conn.write_all(&0u32.to_le_bytes())?;
+    match written {
+        Ok(times) => {
+            ChunkWriter(&mut *conn).write_all(&times)?;
+            conn.write_all(&0u32.to_le_bytes())?;
+            done(conn)
+        }
+        Err(e) => {
+            conn.write_all(&0u32.to_le_bytes())?;
+            reply_error(conn, &e.to_string())
+        }
+    }
+}
+
+/// A finished step's writable folder becomes the unpacked layer `spec.path`
+/// (its digest) in place, so the next step on it needs no unpack
+/// (`copy_op::STEP_ADOPT`). The layer store's own install: its files reach
+/// the disk, then it is renamed in, then marked whole.
+fn step_adopt(conn: &mut fs::File, spec: &CopySpec<'_>, paths: &Paths) -> io::Result<()> {
+    super::container::valid_id(spec.id)?;
+    let upper = paths.containers.join(spec.id).join("upper");
+    if !upper.is_dir() {
+        return reply_error(conn, &format!("step {} has no writable layer", spec.id));
+    }
+    super::layers::adopt(&paths.layers, spec.path, &upper)?;
+    done(conn)
+}
+
+/// `copy_op::LAYER_XATTRS`: xattrs on the unpacked layer's files, each
+/// looked up inside the layer, a link never followed.
+fn layer_xattrs(conn: &mut fs::File, spec: &CopySpec<'_>, paths: &Paths) -> io::Result<()> {
+    if !super::layers::present(&paths.layers, spec.path) {
+        return reply_error(conn, &format!("layer {} is not unpacked", spec.path));
+    }
+    match set_layer_xattrs(&super::layers::dir(&paths.layers, spec.path)?, spec.layers.iter()) {
+        Ok(()) => done(conn),
+        Err(e) => reply_error(conn, &e),
+    }
+}
+
+/// `path\tname\thex value` lines onto the tree at `dir`. A name the layer
+/// unpacker would not set from an archive (`layers::xattr_from_input`:
+/// `trusted.*`) is left out here too.
+fn set_layer_xattrs<'a>(dir: &std::path::Path, lines: impl Iterator<Item = &'a str>) -> Result<(), String> {
+    let root = super::inroot::open_root(dir).map_err(|e| e.to_string())?;
+    for line in lines {
+        let mut f = line.splitn(3, '\t');
+        let (Some(rel), Some(name), Some(hex)) = (f.next(), f.next(), f.next()) else {
+            return Err("bad xattr line".into());
+        };
+        let value: Option<Vec<u8>> = (0..hex.len()).step_by(2).map(|i| hex.get(i..i + 2).and_then(|h| u8::from_str_radix(h, 16).ok())).collect();
+        let (Some(value), Ok(cname)) = (value, std::ffi::CString::new(name)) else {
+            return Err("bad xattr line".into());
+        };
+        if !super::layers::xattr_from_input(name.as_bytes()) {
+            continue;
+        }
+        let at = match super::inroot::lookup(root.as_fd(), std::path::Path::new(rel)) {
+            Ok(fd) => super::inroot::Found { fd, created: false },
+            Err(e) => return Err(format!("{rel}: {e}")),
+        };
+        // SAFETY: a valid NUL-terminated path (the descriptor's magic link), name and value.
+        if unsafe { libc::setxattr(at.proc_path().as_ptr(), cname.as_ptr(), value.as_ptr().cast(), value.len(), 0) } != 0 {
+            return Err(format!("{rel}: {}", io::Error::last_os_error()));
+        }
+    }
+    Ok(())
+}
+
+/// `copy_op::LAYER_UNPACK`: a layer unpacked as its blob arrives, kept
+/// only once the host has checked its diff_id.
+fn layer_unpack(conn: &mut fs::File, spec: &CopySpec<'_>, paths: &Paths) -> io::Result<()> {
+    let Some((digest, media_type)) = spec.path.split_once('\n') else {
+        return reply_error(conn, "a layer unpack names its digest and media type");
+    };
+    let mut chunks = Chunks::new(&mut *conn);
+    if super::layers::present(&paths.layers, digest) {
+        // Kept only once the host has compared the layer's identity with the
+        // image's config, as for a fresh unpack: the diff_id its marker
+        // records, or (an older marker records none) the blob's, read whole.
+        let diff_id = match super::layers::recorded_diff_id(&paths.layers, digest) {
+            Some(d) => io::copy(&mut chunks, &mut io::sink()).map(|_| d),
+            None => super::layers::diff_id_of(&mut chunks, digest, media_type),
+        };
+        io::copy(&mut chunks, &mut io::sink())?;
+        let diff_id = match diff_id {
+            Ok(d) => d,
+            Err(e) => return reply_error(conn, &e.to_string()),
+        };
+        done(conn)?;
+        conn.write_all(format!("{diff_id}\n").as_bytes())?;
+        let mut answer = [0u8; 1];
+        if conn.read_exact(&mut answer).is_ok() && answer[0] == b'y' {
+            let _ = super::layers::record_diff_id(&paths.layers, digest, &diff_id);
+            return done(conn);
+        }
+        return reply_error(conn, "dropped: the layer's diff_id is not the image's");
+    }
+    let unpacked = super::layers::unpack_streamed(&mut chunks, digest, media_type, &paths.layers);
+    // Whatever happened, the rest of the blob is read, so the answer lines
+    // up; a host that went away leaves nothing behind.
+    if let Err(e) = io::copy(&mut chunks, &mut io::sink()) {
+        if let Ok((_, folder, _)) = &unpacked {
+            let _ = super::rmtree::remove_all(folder);
+        }
+        return Err(e);
+    }
+    let (diff_id, folder) = match unpacked {
+        Ok((d, f, _)) => (d, f),
+        Err(e) => return reply_error(conn, &e.to_string()),
+    };
+    done(conn)?;
+    conn.write_all(format!("{diff_id}\n").as_bytes())?;
+    let mut answer = [0u8; 1];
+    let keep = conn.read_exact(&mut answer).is_ok() && answer[0] == b'y';
+    if !keep {
+        let _ = super::rmtree::remove_all(&folder);
+        return reply_error(conn, "dropped: the layer's diff_id is not the image's");
+    }
+    match super::layers::keep(&paths.layers, digest, &folder, &diff_id) {
+        Ok(()) => done(conn),
+        Err(e) => {
+            let _ = super::rmtree::remove_all(&folder);
+            reply_error(conn, &e.to_string())
+        }
+    }
+}
+
+/// `copy_op::LAYER_DELTA`: the new layer from the base the guest has and
+/// the delta that follows.
+fn layer_delta(conn: &mut fs::File, spec: &CopySpec<'_>, paths: &Paths) -> io::Result<()> {
+    let Some((base, new)) = spec.path.split_once('\n') else {
+        return reply_error(conn, "a layer delta names its base and its new layer");
+    };
+    let removed: Vec<&str> = spec.layers.iter().collect();
+    let mut chunks = Chunks::new(&mut *conn);
+    let made = super::layers::receive_delta(&mut chunks, base, new, &removed, &paths.layers);
+    match made {
+        Ok(_) => done(conn),
+        Err(e) => reply_error(conn, &e.to_string()),
+    }
+}
+
+/// Writes each buffer as one `len: u32 LE | bytes` chunk (see `Chunks`).
+struct ChunkWriter<'a>(&'a mut fs::File);
+
+impl Write for ChunkWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let n = buf.len().min(u32::MAX as usize);
+        self.0.write_all(&(n as u32).to_le_bytes())?;
+        self.0.write_all(&buf[..n])?;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
+}
+
 fn reply_error(conn: &mut fs::File, msg: &str) -> io::Result<()> {
     let mut out = Vec::new();
     Msg::Error(msg).encode(&mut out);
@@ -628,6 +875,32 @@ mod tests {
         Chunks::new(&mut conn).read_to_end(&mut got).unwrap();
         assert_eq!(got, b"abcde");
         assert_eq!(conn, b"after");
+    }
+
+    /// A COPY's xattrs set on a layer (`LAYER_XATTRS`) follow the layer
+    /// unpacker's rule: `trusted.*` (an overlay opaque mark, a redirect) is
+    /// never set from input; `user.*` is. Run as root (trusted.* needs it),
+    /// or it checks nothing about them.
+    #[test]
+    fn layer_xattrs_never_set_trusted_names() {
+        let d = std::env::temp_dir().join(format!("kiri-copy-xattrs-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(d.join("dir")).unwrap();
+        fs::write(d.join("f"), "").unwrap();
+        let lines = ["dir\ttrusted.overlay.opaque\t79", "f\ttrusted.overlay.metacopy\t", "dir\ttrusted.overlay.redirect\t2f657463", "f\tuser.kept\t31"];
+        set_layer_xattrs(&d, lines.iter().copied()).unwrap();
+        let get = |p: &str, n: &std::ffi::CStr| {
+            let c = std::ffi::CString::new(d.join(p).as_os_str().as_encoded_bytes()).unwrap();
+            let mut v = [0u8; 16];
+            // SAFETY: valid strings, a buffer of that length.
+            let n = unsafe { libc::lgetxattr(c.as_ptr(), n.as_ptr(), v.as_mut_ptr().cast(), v.len()) };
+            (n >= 0).then(|| v[..n as usize].to_vec())
+        };
+        assert_eq!(get("dir", c"trusted.overlay.opaque"), None);
+        assert_eq!(get("dir", c"trusted.overlay.redirect"), None);
+        assert_eq!(get("f", c"trusted.overlay.metacopy"), None);
+        assert_eq!(get("f", c"user.kept"), Some(b"1".to_vec()));
+        let _ = fs::remove_dir_all(&d);
     }
 
     #[test]

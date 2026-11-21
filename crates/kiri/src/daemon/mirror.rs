@@ -260,7 +260,7 @@ fn lookup(engine: &Engine, path: &str, token: &str) -> Option<Found> {
     }
     // Only blobs of that repository's images.
     let owned = images.iter().filter(in_repo).any(|i| i.config_digest == reference || i.layers.iter().any(|l| l.digest == reference));
-    let path = engine.store.blob_path(&reference).ok()?;
+    let path = engine.store.verified_blob_path(&reference).ok()?;
     (owned && path.is_file()).then_some(Found::Blob(path, reference))
 }
 

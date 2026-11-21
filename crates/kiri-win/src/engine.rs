@@ -1092,6 +1092,11 @@ pub fn on_message(msg: &str) {
                 emit(crate::buildwith::event());
             });
         }
+        // Settings → Builds: Forge, Kiri's own build engine, for `kiri build`, on or off.
+        "nativebuild" => {
+            let set = c.value.as_bool();
+            std::thread::spawn(move || native_build(set));
+        }
         // The docker CLI can take a moment: off the window's thread.
         "usecontext" => {
             std::thread::spawn(move || use_context(&c.name));
@@ -1446,6 +1451,20 @@ fn router_ports(set: Option<Value>) {
     }
     let mut v = client::get("/kiri/domains").unwrap_or_else(|e| json!({"error": e.to_string()}));
     v["type"] = json!("routerports");
+    emit(v.to_string());
+}
+
+/// Settings → Builds: whether `kiri build` uses Forge, Kiri's own build engine (the
+/// engine's setting, as `kiri builder use` sets it); with a value, switches
+/// it first.
+fn native_build(set: Option<bool>) {
+    if let Some(on) = set
+        && let Err(e) = expect_ok(client::request("POST", "/kiri/builder", Some(&json!({"native": on}))))
+    {
+        emit(notice("error", &trf("Couldn't change the builder kiri build uses: {error}", &[("error", &e)])));
+    }
+    let mut v = client::get("/kiri/builder").unwrap_or_else(|e| json!({"error": e.to_string()}));
+    v["type"] = json!("nativebuild");
     emit(v.to_string());
 }
 

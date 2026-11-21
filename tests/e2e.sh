@@ -1233,6 +1233,8 @@ t load-hardlink-escape "escapes the layer" bash -c "$D load -q -i $IMD/hl-esc.ta
 $D rmi kiri-test/alp:v1 kiri-test/hl:abs kiri-test/hl:esc >/dev/null 2>&1; rm -rf "$IMD"
 
 section "docker build (BuildKit in the VM)"
+# A process's core-size and process limits, soft and hard, on one line.
+LIMS="grep -E '^Max (core file size|processes) ' /proc/self/limits | tr '\\n' ' ' | tr -s ' '"
 BD=$(mktemp -d)
 # BX, the builder, is set up at the top (beside the images).
 # FROM lines name alpine at KIRI_TEST_REGISTRY: BuildKit asks the registry for
@@ -1253,6 +1255,8 @@ t build-network "curl" bash -c "cd $BD && printf 'FROM $FA\nRUN apk add --no-cac
 needs buildx t build-resolvconf "nameserver $DEFAULT_NS" bash -c "cd $BD && printf 'FROM $FA\nRUN cat /etc/resolv.conf\n' > Dockerfile.dns && BUILDX_BUILDER=$BX perl -e 'alarm 300; exec @ARGV' $D build --no-cache --progress plain -f Dockerfile.dns . 2>&1"
 needs buildx code build-no-public-resolver 1 bash -c "cd $BD && BUILDX_BUILDER=$BX perl -e 'alarm 300; exec @ARGV' $D build --no-cache --progress plain -f Dockerfile.dns . 2>&1 | grep -q 'nameserver 8.8.8.8'"
 needs buildx t build-dns "Address" bash -c "cd $BD && printf 'FROM $FA\nRUN nslookup example.com\n' > Dockerfile.lookup && BUILDX_BUILDER=$BX perl -e 'alarm 300; exec @ARGV' $D build --no-cache --progress plain -f Dockerfile.lookup . 2>&1"
+# A step has no process or core-size limit either, as on Docker Engine.
+needs buildx t build-ulimits "Max core file size unlimited unlimited bytes Max processes unlimited unlimited processes" bash -c "cd $BD && printf 'FROM $FA\nRUN %s\n' \"$LIMS\" > Dockerfile.lim && BUILDX_BUILDER=$BX perl -e 'alarm 300; exec @ARGV' $D build --no-cache --progress plain -f Dockerfile.lim . 2>&1"
 t build-fails "exit code: 3" bash -c "cd $BD && printf 'FROM $FA\nRUN exit 3\n' > Dockerfile.bad && BUILDX_BUILDER=$BX $D build -f Dockerfile.bad . 2>&1"
 $D rmi kiri-test/built kiri-test/net >/dev/null 2>&1; rm -rf "$BD"
 
@@ -1284,6 +1288,13 @@ t limit-memory "134217728" $D exec lim cat /sys/fs/cgroup/memory.max
 t limit-cpus "50000 100000" $D exec lim cat /sys/fs/cgroup/cpu.max
 t limit-pids "50" $D exec lim cat /sys/fs/cgroup/pids.max
 t limit-shares "59" $D exec lim cat /sys/fs/cgroup/cpu.weight
+# No process or core-size limit, soft or hard, as on Docker Engine (dockerd
+# and containerd run with LimitNPROC and LimitCORE infinity); in the VM the
+# agent had the kernel's (a process limit from the memory, core size 0).
+# --ulimit still sets them, and inspect keeps what it was given.
+t ulimit-default "Max core file size unlimited unlimited bytes Max processes unlimited unlimited processes" bash -c "$D run --rm alpine sh -c \"$LIMS\""
+t ulimit-set "Max core file size 0 0 bytes Max processes 100 200 processes" bash -c "$D run --rm --ulimit core=0 --ulimit nproc=100:200 alpine sh -c \"$LIMS\""
+t ulimit-set-inspect '[{"Name":"nproc","Hard":200,"Soft":100}]' bash -c "$D create --name ulim --ulimit nproc=100:200 alpine >/dev/null && $D inspect -f '{{json .HostConfig.Ulimits}}' ulim; $D rm ulim >/dev/null"
 # 1024 shares, Docker's default, is the kernel's default weight (not less
 # than a container that set nothing), and inspect gives the shares back.
 t limit-shares-default "100 100" bash -c "echo \$($D run --rm --cpu-shares 1024 alpine cat /sys/fs/cgroup/cpu.weight) \$($D run --rm alpine cat /sys/fs/cgroup/cpu.weight)"
@@ -1463,6 +1474,8 @@ t search "alpine" $D search alpine --limit 3
 t search-official "[OK]" $D search --filter is-official=true alpine --limit 3
 
 section "amd64 images (Rosetta)"
+# The binary as one shell word, for commands passed to bash -c (app paths have spaces).
+KQ=$(printf %q "$KIRI")
 # The amd64 alpine and node, fetched from KIRI_TEST_REGISTRY and tagged with
 # their plain names, as a --platform run would pull them from Docker Hub.
 kiri_fetch alpine:latest linux/amd64
@@ -1490,6 +1503,21 @@ needs amd64 t rosetta-node "v22" $D run --rm --platform linux/amd64 node:22-alpi
 # image here, so on Apple silicon this reads what Rosetta was handed. On a
 # Linux host the kernel is the host's, not Kiri's.
 only mac t rosetta-no-auxv-29 "no type 29" $D run --rm alpine sh -c 'od -An -v -tu8 -w16 /proc/self/auxv | awk "\$1 == 29 { n++ } END { print n ? \"type 29 given\" : \"no type 29\" }"'
+# Rosetta's runtime makes $HOME/.cache/rosetta in every step it translates;
+# an amd64 machine never has it, so an amd64 build's layers must not either
+# (root and a USER with its own home). docker run containers keep it, as on
+# Docker Desktop. Only Kiri's own builder leaves it out: plain `docker build`
+# is BuildKit (the fallback), which is never changed, so its layers do carry
+# the folder and it is not checked here. A build that fell back to BuildKit
+# fails the check. The image's layers are read (docker save), never a
+# container of it: an amd64 container runs under Rosetta, which makes
+# $HOME/.cache/rosetta before anything in it can look (rosetta-layers.py).
+RL=$(printf %q "$(cd "$(dirname "$0")" && pwd)/rosetta-layers.py")
+if [ -x "$KIRI" ]; then
+only mac t rosetta-cache-build "BUILD-CLEAN" bash -c "d=\$(mktemp -d) && e=\$(mktemp) && printf 'FROM alpine\nRUN echo hi > /hi\nRUN adduser -D app\nUSER app\nRUN echo x > /tmp/x\n' > \"\$d/Dockerfile\" && $KQ build -q --builder kiri --platform linux/amd64 -t kiri-test/rosetta-build \"\$d\" >/dev/null 2>\"\$e\" && n=\$($D image inspect -f '{{len .RootFS.Layers}}' alpine) && r=\$($D save kiri-test/rosetta-build | python3 $RL \"\$n\") && { [ \"\$r\" = BUILD-CLEAN ] && ! grep -q 'falling back' \"\$e\" && echo BUILD-CLEAN || echo \"\${r/BUILD-CLEAN/layers clean}; \$(cat \"\$e\")\"; }; rm -rf \"\$d\" \"\$e\"; $D rmi kiri-test/rosetta-build >/dev/null 2>&1"
+else
+  only mac skip_setup rosetta-cache-build "no kiri CLI found: set KIRI=/path/to/kiri"
+fi
 # Back to the engine's own architecture for the rest (an Intel Mac's is amd64).
 ARCH=$($D version -f '{{.Server.Arch}}' 2>/dev/null)
 # A set-up line, not part of the check: with KIRI_TEST_ONLY the checks after
@@ -1497,6 +1525,20 @@ ARCH=$($D version -f '{{.Server.Arch}}' 2>/dev/null)
 kiri_fetch alpine:latest "linux/$ARCH"; kiri_fetch node:22-alpine "linux/$ARCH"
 t native-again "$([ "$ARCH" = amd64 ] && echo x86_64 || echo aarch64)" $D run --rm alpine uname -m
 $D rmi "$AMD64_ONLY" >/dev/null 2>&1
+# arm64 on Apple silicon gets nothing of Rosetta: no folder, no process.
+# The diff is not asked to be empty: Kiri on a Mac shows C /etc and
+# A /etc/resolv.conf for any container (it did before Rosetta's clean-up too).
+only mac t native-no-rosetta "NATIVE-CLEAN" bash -c "$D rm -f e2e-nat >/dev/null 2>&1; ok=0; $D run --name e2e-nat alpine true && d=\$($D diff e2e-nat) && ok=1; r=\$(printf '%s\n' \"\$d\" | grep -E '/\\.cache(/|\$)|rosetta'); p=\$($D run --rm --pid host alpine ps -o comm | grep -ci rosetta); $D rm -f e2e-nat >/dev/null; [ \$ok = 1 ] && [ -z \"\$r\" ] && [ \"\$p\" = 0 ] && echo NATIVE-CLEAN || echo \"diff: \$d; rosetta processes: \$p\""
+# A native build, by Kiri's own builder and by plain docker build (on Kiri's
+# BuildKit builder, which loads its image, as the docker build checks above):
+# no Rosetta process, and nothing in /root. An arm64 container may be looked
+# into by running it: Rosetta is not in it.
+if [ -x "$KIRI" ]; then
+only mac t native-build-no-rosetta "NATIVE-BUILD-CLEAN" bash -c "d=\$(mktemp -d) && e=\$(mktemp) && printf 'FROM alpine\nRUN echo hi > /hi\n' > \"\$d/Dockerfile\" && $KQ build -q --builder kiri -t kiri-test/native-build \"\$d\" >/dev/null 2>\"\$e\" && b=\$($D run --rm kiri-test/native-build ls -A /root) && p=\$($D run --rm --pid host alpine ps -o comm | grep -ci rosetta); f=\$(grep 'falling back' \"\$e\"); rm -rf \"\$d\" \"\$e\"; $D rmi kiri-test/native-build >/dev/null 2>&1; [ -z \"\$b\" ] && [ \"\$p\" = 0 ] && [ -z \"\$f\" ] && echo NATIVE-BUILD-CLEAN || echo \"root: \$b; rosetta processes: \$p; \$f\""
+else
+  only mac skip_setup native-build-no-rosetta "no kiri CLI found: set KIRI=/path/to/kiri"
+fi
+only mac t native-docker-build-no-rosetta "NATIVE-BUILD-CLEAN" bash -c "d=\$(mktemp -d) && printf 'FROM alpine\nRUN echo hi > /hi\n' > \"\$d/Dockerfile\" && BUILDX_BUILDER=$BX $D build -q -t kiri-test/native-docker-build \"\$d\" >/dev/null && b=\$($D run --rm kiri-test/native-docker-build ls -A /root) && p=\$($D run --rm --pid host alpine ps -o comm | grep -ci rosetta); rm -rf \"\$d\"; $D rmi kiri-test/native-docker-build >/dev/null 2>&1; [ -z \"\$b\" ] && [ \"\$p\" = 0 ] && echo NATIVE-BUILD-CLEAN || echo \"root: \$b; rosetta processes: \$p\""
 
 section "security: seccomp, capabilities, read-only"
 # Docker's two defaults in a container's own network: any port and ping
@@ -1602,10 +1644,8 @@ $D rm -f ownns >/dev/null; $D network rm ownnsnet >/dev/null
 code udp-port-free-after 0 bash -c "python3 -c 'import socket; s=socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind((\"0.0.0.0\", 15354))'"
 
 section "Linux machines"
-# The `kiri` CLI is $KIRI, found at the top.
+# The `kiri` CLI is $KIRI, found at the top ($KQ: as one shell word).
 MACHINE_TESTS="machine-create machine-list machine-user machine-mac-files machine-cwd machine-hostname machine-sudo machine-stop machine-stop-again machine-start machine-start-again machine-delete machine-bad-name"
-# The binary as one shell word, for commands passed to bash -c (app paths have spaces).
-KQ=$(printf %q "$KIRI")
 if [ -x "$KIRI" ]; then
 # The image a machine is made from, by its registry-qualified name: `--distro
 # alpine` pulls alpine:3.22 from Docker Hub every time.

@@ -556,6 +556,20 @@ fn proxy(save: Option<serde_json::Value>) {
     }
 }
 
+/// Settings → Builds: whether `kiri build` uses Forge, Kiri's own build engine (the
+/// engine's setting, as `kiri builder use` sets it); with a value, switches
+/// it first.
+fn native_build(set: Option<bool>) {
+    if let Some(on) = set
+        && let Err(e) = expect_ok(client::request("POST", "/kiri/builder", Some(&serde_json::json!({"native": on}))))
+    {
+        emit(notice("error", &trf("Couldn't change the builder kiri build uses: {error}", &[("error", &e)])));
+    }
+    let mut v = client::get("/kiri/builder").unwrap_or_else(|e| serde_json::json!({"error": e.to_string()}));
+    v["type"] = "nativebuild".into();
+    emit(v.to_string());
+}
+
 /// Settings → Domains: reads (or moves, then reads) the routers' ports.
 fn router_ports(set: Option<serde_json::Value>) {
     if let Some(body) = set {
@@ -1877,6 +1891,12 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
                 }
                 emit(crate::buildwith::event());
             });
+            Ok(())
+        }
+        // Settings → Builds: Forge, Kiri's own build engine, for `kiri build`, on or off.
+        "nativebuild" => {
+            let set = msg.value.as_bool();
+            std::thread::spawn(move || native_build(set));
             Ok(())
         }
         // Settings → Import, from OrbStack or Docker Desktop.

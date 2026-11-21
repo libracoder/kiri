@@ -118,6 +118,25 @@ pub fn idle_secs() -> u64 {
     std::env::var("KIRI_BUILDER_IDLE_SECS").ok().and_then(|v| v.parse().ok()).or_else(|| settings()["idle_secs"].as_u64()).unwrap_or(300)
 }
 
+/// Entitlements a build may be granted beyond `network.host` (Settings
+/// `entitlements`, as dockerd's `builder.entitlements`): none by default,
+/// so `--allow security.insecure` is refused unless the user turned it on.
+pub fn entitlements_setting() -> Vec<String> {
+    settings()["entitlements"].as_array().into_iter().flatten().filter_map(|e| e.as_str().map(str::to_owned)).collect()
+}
+
+/// Whether `kiri build` tries Kiri's own builder first (Settings `native`,
+/// `kiri builder use kiri`): off unless switched on. Off, `kiri build` is
+/// the docker CLI's build on this builder, as it always was. A build's
+/// `--builder` and `KIRI_NATIVE_BUILD` come first (nativebuild.rs).
+pub fn native_setting() -> bool {
+    native_of(&settings())
+}
+
+fn native_of(settings: &Value) -> bool {
+    settings["native"].as_bool().unwrap_or(false)
+}
+
 /// buildkitd.toml, written at each start: the garbage collector's limits.
 /// BuildKit 0.17+ keys: the cache may use up to `maxUsedSpace`, and GC never
 /// takes it below `reservedSpace`.
@@ -135,13 +154,14 @@ pub fn settings_report(engine: &Engine) -> Value {
     let state = find(engine).map(|(_, st)| st.as_str()).unwrap_or("none");
     json!({
         "cache_gb": s["cache_gb"], "default_cache_gb": default_cache(disk_total()) / GB, "cache_limit": cache_limit(),
-        "idle_secs": idle_secs(), "image": IMAGE, "container": container_name(), "volume": volume_name(), "state": state,
+        "idle_secs": idle_secs(), "native": native_setting(), "native_env": std::env::var("KIRI_NATIVE_BUILD").ok(), "image": IMAGE, "container": container_name(), "volume": volume_name(), "state": state,
         "overridden": std::env::var_os("KIRI_BUILD_CACHE_GB").is_some() || std::env::var_os("KIRI_BUILDER_IDLE_SECS").is_some(),
     })
 }
 
-/// `POST /kiri/builder` `{"cache_gb": 20 | null, "idle_secs": 300}`: null or
-/// 0 is the default cap. Used from the builder's next start.
+/// `POST /kiri/builder` `{"cache_gb": 20 | null, "idle_secs": 300, "native":
+/// true}`: null or 0 is the default cap, used from the builder's next start;
+/// `native` from the next `kiri build`.
 pub fn set_settings(req: &Request) -> Result<(), Error> {
     let body: Value = serde_json::from_slice(&req.body).map_err(|e| Error::BadRequest(format!("invalid JSON: {e}")))?;
     let mut s = settings();
@@ -155,6 +175,11 @@ pub fn set_settings(req: &Request) -> Result<(), Error> {
             let gb = v.as_u64().filter(|g| *g <= 100_000).ok_or_else(|| Error::BadRequest("cache_gb must be a whole number of GB".into()))?;
             s["cache_gb"] = if gb == 0 { Value::Null } else { gb.into() };
         }
+    }
+    match &body["native"] {
+        Value::Null => {}
+        Value::Bool(b) => s["native"] = (*b).into(),
+        _ => return Err(Error::BadRequest("native must be true or false".into())),
     }
     if !body["idle_secs"].is_null() {
         s["idle_secs"] = body["idle_secs"].as_u64().filter(|v| *v <= 7 * 86400).ok_or_else(|| Error::BadRequest("idle_secs must be 0 to 604800".into()))?.into();
@@ -742,6 +767,8 @@ pub fn build(req: &Request, engine: &Arc<Engine>, w: &mut UnixStream, r: &mut Bu
     match result {
         Ok(images) => {
             let id = images[0].config_digest.clone();
+            // For the builder test data's runs: who built it (nativebuild.rs).
+            let _ = super::nativebuild::record_path(&id, "fallback docker build (classic API)");
             let short: String = id.trim_start_matches("sha256:").chars().take(12).collect();
             out.line(json!({"aux": {"ID": id}}));
             if o.quiet {
@@ -929,16 +956,18 @@ fn failure(tail: &[String], code: i32) -> String {
 
 // --- Build cache -------------------------------------------------------------
 
-/// `POST /build/prune`: BuildKit's prune, if the builder exists (started
-/// for it if stopped). `{CachesDeleted, SpaceReclaimed}`.
+/// `POST /build/prune`: Kiri's own builder's caches, then BuildKit's prune
+/// if the builder exists (started for it if stopped).
+/// `{CachesDeleted, SpaceReclaimed}`, of both.
 pub fn prune(req: &Request, engine: &Engine) -> Result<Value, Error> {
     // Docker's daemon puts this before every prune error.
     let argv = prune_filters(req).and_then(|f| prune_argv(req, &f)).map_err(|e| match e {
         Error::BadRequest(m) => Error::BadRequest(format!("failed to prune build cache: {m}")),
         e => e,
     })?;
+    let (mut ids, mut space) = native_prune(req, engine)?;
     if find(engine).is_none() {
-        return Ok(json!({"CachesDeleted": [], "SpaceReclaimed": 0}));
+        return Ok(json!({"CachesDeleted": ids, "SpaceReclaimed": space}));
     }
     let _busy = Busy::new();
     let id = ensure_running(engine, &mut |_| {})?;
@@ -948,8 +977,26 @@ pub fn prune(req: &Request, engine: &Engine) -> Result<Value, Error> {
         let last = text.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("buildctl prune failed");
         return Err(Error::Io(io::Error::other(last.trim_start_matches("error: ").to_owned())));
     }
-    let (ids, space) = parse_prune(&text);
+    let (bk_ids, bk_space) = parse_prune(&text);
+    ids.extend(bk_ids);
+    space += bk_space;
     Ok(json!({"CachesDeleted": ids, "SpaceReclaimed": space}))
+}
+
+/// The caches of Kiri's own builder, as [`super::buildcache`] sees them.
+fn native_caches<T>(engine: &Engine, f: impl FnOnce(&super::buildcache::Caches) -> T) -> Option<T> {
+    let steps = super::nativebuild::step_cache().ok()?;
+    // A Linux host's guest is a process of this machine: its cache folders
+    // are on this disk. A VM's are not reachable from here.
+    let mounts = cfg!(target_os = "linux").then(|| super::buildcache::Mounts { root: super::buildports::CACHE_ROOT.into(), gate: &super::buildports::cache_folders_in_use });
+    Some(f(&super::buildcache::Caches { steps, store: &engine.store, mounts }))
+}
+
+/// Prunes Kiri's own builder's caches as the request asks: (ids, bytes).
+fn native_prune(req: &Request, engine: &Engine) -> Result<(Vec<String>, u64), Error> {
+    let f = prune_filters(req)?;
+    let sel = super::buildcache::Selection::of(req, &f)?;
+    Ok(native_caches(engine, |c| super::buildcache::prune(c, &sel)).unwrap_or_default())
 }
 
 /// The `filters` of `/build/prune`, read as Docker's daemon reads them
@@ -1025,15 +1072,18 @@ fn parse_prune(text: &str) -> (Vec<String>, u64) {
     (ids, space)
 }
 
-/// `system df`'s BuildCache: BuildKit's records while the builder runs
-/// (asking a stopped one would start it); none otherwise.
+/// `system df`'s BuildCache: Kiri's own builder's caches, and BuildKit's
+/// records while the builder runs (asking a stopped one would start it).
 pub fn cache(engine: &Engine) -> Value {
-    let Some((id, Status::Running)) = find(engine) else { return json!([]) };
+    let mut rows = native_caches(engine, super::buildcache::rows).unwrap_or_default();
+    let Some((id, Status::Running)) = find(engine) else { return Value::Array(rows) };
     let _busy = Busy::new();
-    match engine.exec_capture(&id, &["buildctl", "du", "--format", "{{json .}}"]) {
-        Ok((0, text)) => du_rows(&text),
-        _ => json!([]),
+    if let Ok((0, text)) = engine.exec_capture(&id, &["buildctl", "du", "--format", "{{json .}}"])
+        && let Value::Array(bk) = du_rows(&text)
+    {
+        rows.extend(bk);
     }
+    Value::Array(rows)
 }
 
 /// buildctl's usage records as Docker's BuildCache entries.
@@ -1204,6 +1254,17 @@ mod tests {
         assert_eq!(rows[0]["Type"], "regular");
         assert_eq!(rows[0]["Size"], 42);
         assert_eq!(rows[0]["InUse"], true);
+    }
+
+    /// Kiri's own builder is off until someone switches it on.
+    #[test]
+    fn kiris_own_builder_is_off_by_default() {
+        assert!(!native_of(&Value::Null));
+        assert!(!native_of(&json!({})));
+        assert!(!native_of(&json!({"cache_gb": 20})));
+        assert!(!native_of(&json!({"native": "yes"})), "only a boolean switches it");
+        assert!(native_of(&json!({"native": true})));
+        assert!(!native_of(&json!({"native": false})));
     }
 
     #[test]

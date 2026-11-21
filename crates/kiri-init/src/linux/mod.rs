@@ -13,8 +13,13 @@ mod net;
 mod netlink;
 mod pid1;
 mod relay;
+mod rmtree;
 mod roots;
+mod rosetta;
 mod seccomp;
+mod stepdiff;
+mod stepmounts;
+mod stepssh;
 mod sys;
 mod transport;
 mod trim;
@@ -49,11 +54,14 @@ pub fn main() {
 
 fn run(init_start_ns: u64) -> io::Result<()> {
     let paths = if transport::is_host_process() {
+        // Before anything starts: every container and step inherits them.
+        engine_rlimits(None);
         // On a Linux host: the host's kernel filesystems, network and clock.
         host_dirs()?
     } else {
         leave_initramfs()?;
         mount_kernel_filesystems()?;
+        engine_rlimits(Some(&std::fs::read_to_string("/proc/sys/fs/nr_open").unwrap_or_default()));
         sys::sethostname(b"kiri")?;
         // Containers may bind the VM's /etc/hostname, as on a Linux host.
         let _ = std::fs::write("/etc/hostname", "kiri\n");
@@ -69,6 +77,16 @@ fn run(init_start_ns: u64) -> io::Result<()> {
         net::remove_host_network();
     }
     served
+}
+
+/// Sets the limits containers and build steps inherit (hostopts::agent_rlimits),
+/// each on its own: one refused is said and the others are still set.
+fn engine_rlimits(nr_open: Option<&str>) {
+    for lim in hostopts::agent_rlimits(nr_open) {
+        if let Err(e) = hostopts::set_rlimits(&[lim]) {
+            eprintln!("kiri-init: resource limits: {e}");
+        }
+    }
 }
 
 fn serve(paths: &container::Paths, init_start_ns: u64) -> io::Result<()> {
@@ -410,8 +428,7 @@ fn data_dirs() -> io::Result<container::Paths> {
 }
 
 /// x86-64 Linux binaries through Rosetta, when the Mac shares it: amd64
-/// images then run as they do on Docker Desktop and OrbStack. The `F` flag
-/// opens the interpreter now, so it works inside every container's mounts.
+/// images then run as they do on Docker Desktop and OrbStack.
 #[cfg(target_arch = "aarch64")]
 fn rosetta() {
     sys::mkdir(c"/run/rosetta", 0o755);
@@ -422,15 +439,9 @@ fn rosetta() {
         eprintln!("kiri-init: no binfmt_misc ({e}); amd64 images will not run");
         return;
     }
-    const X86_64: &str = concat!(
-        ":rosetta:M::",
-        r"\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00",
-        ":",
-        r"\xff\xff\xff\xff\xff\xfe\xfe\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff",
-        ":/run/rosetta/rosetta:CF",
-    );
-    if let Err(e) = sys::write_file("/proc/sys/fs/binfmt_misc/register", X86_64) {
-        eprintln!("kiri-init: registering Rosetta: {e}");
+    match sys::write_file("/proc/sys/fs/binfmt_misc/register", &rosetta::binfmt_line("/run/rosetta/rosetta")) {
+        Ok(()) => rosetta::set_registered(),
+        Err(e) => eprintln!("kiri-init: registering Rosetta: {e}"),
     }
 }
 

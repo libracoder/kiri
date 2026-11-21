@@ -52,6 +52,29 @@ Apple silicon and Intel Macs (macOS 14+), Windows 10 and 11 (x86-64 and Arm, thr
 - **Builds**: `docker build` / `buildx build` through BuildKit running in a
   Kiri container (buildx's docker-container driver), stopped when idle;
   on Apple silicon, amd64 build steps run through Rosetta too
+  - **Forge, Kiri's own build engine** (`kiri build`): builds the image
+    inside Kiri's engine, reading the folder in place, with no BuildKit.
+    Forge is a library of its own,
+    [kiri-forge](https://github.com/libracoder/kiri-forge). A build it can't
+    do yet goes to BuildKit, with a line saying why. It is **off by
+    default**: `kiri build` uses BuildKit, as before. Three ways to turn it
+    on: `kiri builder use forge` (or Settings → Builds → "Build with
+    Forge"), which stays on; `KIRI_NATIVE_BUILD=1` in a terminal; or
+    `kiri build --builder forge` for one build (`kiri`, its name before,
+    is still taken in both places). The first one given wins:
+    `--builder`, then `KIRI_NATIVE_BUILD`, then the setting, so
+    `--builder buildkit` or `KIRI_NATIVE_BUILD=0` picks BuildKit even when
+    it is on. `kiri builder` shows which one builds. Plain `docker build`
+    is unchanged: `kiri build-with docker|kiri` only chooses which engine's
+    BuildKit `docker build` runs on (another engine's, or Kiri's), and
+    never turns on Forge. Its limits, each an error that names
+    it: a Dockerfile is read and planned first in a separate process with
+    no network, no file access and at most 1 GiB of memory and 5 minutes;
+    up to 10,000 stages, 100,000 instructions, 512 image lookups, 16 rounds
+    of ONBUILD triggers and 256 MiB of expanded text per build; at most 8
+    stages build at once, and as many builds at once as the engine has
+    CPUs (2 to 8; `KIRI_NATIVE_BUILDS` changes it), the rest waiting in
+    line
 - **Compose**: `up`, `down`, `ps`, `logs`, `exec`, multiple networks, events
 - **USB devices (beta)**: the USB tab hands a device (a serial adapter, a
   Zigbee stick, a development board) to your containers on Mac, Windows and
@@ -134,3 +157,10 @@ unless the Mac already has a docker CLI.
   (`--add-host name:172.18.0.1` on Windows and Linux, the default bridge's
   gateway; `198.19.248.254` on a Mac) or `DOCKER_BUILDKIT=0`, where Kiri
   maps `host-gateway` itself.
+
+- **`kiri build` from a git address is built by BuildKit, not by
+  Forge.** A build whose context is a git address (`kiri build
+  https://…/project.git`) or whose Dockerfile has `ADD <git address>` goes
+  to BuildKit for now, with a line saying why. Everything else is built
+  by Forge as before. Forge will fetch git addresses itself in a later
+  release.

@@ -43,8 +43,34 @@ pub const INPUT_WINDOW: usize = 4 << 20;
 /// start still filling a new volume as started, and let an exec in before
 /// the container's root is in place. 7 added `CancelStart`, which has no
 /// reply: an older agent's "unexpected" error would be taken as the reply
-/// to the next request.
-pub const PROTOCOL: u16 = 7;
+/// to the next request. 8 added the build step's run flag
+/// (`run_flags::STEP`), copy ops 7 to 11 (`STEP_LAYER` to `LAYER_XATTRS`)
+/// and the step mount words (`layers=`, `lower`, `mkdir=`, `seed=`,
+/// `secret=`, `ssh=`, `within=`): an older agent would take a `layers=`
+/// line for a plain bind of the path it names and mount that path of its
+/// own root into the step.
+pub const PROTOCOL: u16 = 8;
+
+/// The host's check of the agent's `Hello`: the same version or nothing.
+/// Every older version misreads something a newer host sends (see
+/// [`PROTOCOL`]), and a newer agent's host would misread its replies, so
+/// the connection ends here with a message rather than running containers
+/// on a misunderstanding.
+pub fn check_protocol(agent: u16) -> Result<(), ProtocolMismatch> {
+    if agent == PROTOCOL { Ok(()) } else { Err(ProtocolMismatch { agent }) }
+}
+
+/// An agent of another protocol version (see [`check_protocol`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProtocolMismatch {
+    pub agent: u16,
+}
+
+impl core::fmt::Display for ProtocolMismatch {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "the VM agent speaks protocol {}, this Kiri speaks {PROTOCOL}: quit Kiri and open it again", self.agent)
+    }
+}
 
 // `Run` is the one big message and is built and read once per container.
 #[allow(clippy::large_enum_variant)]
@@ -225,6 +251,13 @@ pub const DNS_RELAY_PORT: u32 = 1037;
 /// `speed u32 | devid u32` then USB/IP (crates/kiri-init/src/linux/usb.rs).
 pub const USB_PORT: u32 = 1040;
 
+/// vsock port of the host's relay for a build step's ssh agent socket
+/// (`RUN --mount=type=ssh`): one connection per connection the step makes,
+/// `<step token, 32 hex digits>\n`, then the agent protocol both ways.
+pub const BUILD_SSH_PORT: u32 = 1041;
+
+pub mod layertar;
+
 pub mod copy_op {
     pub const IN: u8 = 1;
     pub const OUT: u8 = 2;
@@ -238,6 +271,45 @@ pub mod copy_op {
     /// `docker commit`: the writable layer as an OCI layer tar (whiteouts as
     /// `.wh.` files).
     pub const COMMIT: u8 = 6;
+    /// A build step's layer: the stopped step container's writable layer
+    /// on `layers` (top first), as the tar BuildKit writes for the same
+    /// change; `path` lists the step's mount targets, one per line, whose
+    /// empty stubs stay out of the layer. Answers `CopyDone` (or `Error`), then the tar as chunks of
+    /// `len: u32 LE | bytes`, the empty chunk, then in chunks the same way
+    /// the folders the tar leaves out whose mtime the step changed (records
+    /// of `len: u32 LE | path | sec: i64 LE | nsec: u32 LE`), the empty
+    /// chunk, and `CopyDone` once the whole layer was written or `Error` if
+    /// it could not be: a tar cut short is never taken for a layer. An
+    /// `Error` text that starts `refused: ` is content the step must not
+    /// put in a layer.
+    pub const STEP_LAYER: u8 = 7;
+    /// A build step's writable folder, its layer sent already with
+    /// `STEP_LAYER`, kept as the unpacked layer whose digest is `path`: the
+    /// next step on it needs no copy of it from the host. Answers
+    /// `CopyDone` or `Error`.
+    pub const STEP_ADOPT: u8 = 8;
+    /// A layer made in the guest from one it has: `path` is
+    /// `<base digest>\n<new digest>`, `layers` the paths of `base` that
+    /// `new` does not have, and the delta tar (every folder entry, every new
+    /// or changed entry, in tar order) follows as `copy_flags::CHUNKED`
+    /// chunks. The guest hard-links every other file of `base` and unpacks
+    /// the delta over it, then answers `CopyDone` or `Error`.
+    pub const LAYER_DELTA: u8 = 9;
+    /// A layer unpacked while it is pulled: `path` is `<blob digest>\n<media
+    /// type>`, the blob follows as `copy_flags::CHUNKED` chunks. The guest
+    /// checks the blob's digest and unpacks it in the same pass, then
+    /// answers `CopyDone` and one line: the tar's digest (diff_id), or
+    /// `present` when it had the layer already. The host then sends one
+    /// byte, `y` to keep the layer (its diff_id is the config's) or `n` to
+    /// drop it, and the guest answers `CopyDone` or `Error`. A layer is
+    /// never there unless both digests were right.
+    pub const LAYER_UNPACK: u8 = 10;
+    /// Extended attributes the layer tar does not carry (BuildKit's keeps
+    /// only `security.capability`), set on the guest's unpacked copy of
+    /// the layer `path`, as BuildKit's snapshot keeps them: `layers` holds
+    /// `<path in the layer>\t<name>\t<value, hex>` lines. Answers
+    /// `CopyDone` or `Error`.
+    pub const LAYER_XATTRS: u8 = 11;
 }
 
 pub mod copy_flags {
@@ -411,6 +483,14 @@ pub mod run_flags {
     /// `--pid host`: no PID namespace of its own; the container sees the
     /// VM's processes (on a Linux host, the host's).
     pub const PID_HOST: u32 = 1 << 17;
+    /// A build step, run as BuildKit runs a RUN rather than as `docker run`:
+    /// no `HOSTNAME` variable, /etc/hosts and /etc/resolv.conf read-only,
+    /// /etc/hosts as BuildKit writes it (`localhost <hostname>`, the
+    /// IPv6 line, no address of its own), and a program that cannot start
+    /// ends with exit code 1 (golden run vectors). A step that cannot be
+    /// started at all (an unknown USER) says why on a stderr line starting
+    /// `kiri: cannot start step: ` and ends with 127.
+    pub const STEP: u32 = 1 << 18;
 }
 
 /// A container's network, as `Run` carries it.
@@ -1468,6 +1548,23 @@ mod tests {
         let mut again = Vec::new();
         Msg::Run(r).encode(&mut again);
         assert_eq!(buf, again);
+    }
+
+    /// An agent from before the build steps (7, as on main before them)
+    /// is refused at its Hello, before any step is sent, with a message;
+    /// one that speaks this version is taken. 8 is above every version
+    /// main has used.
+    #[test]
+    fn an_agent_of_another_protocol_is_refused_at_its_hello() {
+        const { assert!(PROTOCOL >= 8) };
+        for old in [0, 6, 7, PROTOCOL + 1] {
+            let mut buf = Vec::new();
+            Msg::Hello(Hello { protocol: old, init_start_ns: 1, ready_ns: 2, mem_total_kib: 3, mem_available_kib: 4 }).encode(&mut buf);
+            let Msg::Hello(h) = decode(&buf).unwrap() else { panic!() };
+            let e = check_protocol(h.protocol).unwrap_err().to_string();
+            assert!(e.contains(&format!("protocol {old}")) && e.contains(&format!("speaks {PROTOCOL}")), "{e}");
+        }
+        assert_eq!(check_protocol(PROTOCOL), Ok(()));
     }
 
     #[test]

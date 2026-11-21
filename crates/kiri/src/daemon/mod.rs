@@ -6,7 +6,13 @@
 pub mod access;
 mod api;
 mod binds;
+#[cfg(target_os = "linux")]
+mod bindstage;
+mod buildcache;
 mod builder;
+mod buildfetch;
+mod buildports;
+mod buildssh;
 pub mod dns;
 pub mod tls;
 pub mod proxy;
@@ -20,6 +26,7 @@ mod mirror;
 mod http;
 mod logfile;
 mod names;
+mod nativebuild;
 mod network;
 #[cfg(target_os = "macos")]
 pub(crate) mod nfs;
@@ -138,6 +145,18 @@ pub fn run(_args: &[String]) -> io::Result<()> {
 
     kiri_image::store::set_error_log(|message| diag::error!("image store", detail = message));
     let store = kiri_image::Store::open(kiri_image::Store::default_root()?)?;
+    // With the native builder switched on, the store's checks are on from
+    // the start, and what a crash, a kill or a full disk left half-written
+    // goes before anything can use it (`Store::check` says exactly what it
+    // deletes). Switched off, start-up is what it was before the builder.
+    if nativebuild::enabled(None) {
+        store.use_native_checks();
+        let checked = Instant::now();
+        match store.check() {
+            Ok(repairs) => diag::info!("image store checked", ms = checked.elapsed().as_millis(), repairs = repairs.len()),
+            Err(e) => diag::warn!("image store not checked", error = e),
+        }
+    }
     let engine = engine::Engine::boot(store).inspect_err(|e| diag::error!("engine did not start", error = e))?;
     diag::info!("engine ready", version = env!("CARGO_PKG_VERSION"), ms = t0.elapsed().as_millis(), socket = format!("unix://{}", socket.display()));
     // Crash files from earlier runs, if the person said they may go.
@@ -149,6 +168,9 @@ pub fn run(_args: &[String]) -> io::Result<()> {
     kiri_image::set_proxy_source(proxy::for_registry);
     // The managed BuildKit stops itself when builds have been idle a while.
     builder::watch(engine.clone());
+    // What builds of an engine that stopped mid-build left (spools, staged
+    // binds, downloads), before anything else is built.
+    nativebuild::sweep_at_start();
     // A Kubernetes node the engine restarted gets its kubectl context.
     crate::k8s::sync_at_start();
     // Kiri Dev leaves *.kiri.local and ports 80 and 443 to the installed

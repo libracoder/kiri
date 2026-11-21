@@ -47,14 +47,32 @@ pub fn memory_ceiling() -> u64 {
     (physical_memory() / 2).clamp(2 << 30, 8 << 30)
 }
 
-/// The VM's CPUs: `KIRI_CPUS`, else Settings → Resources, else 2.
+/// The VM's CPUs: `KIRI_CPUS`, else Settings → Resources, else 2. On
+/// Linux there is no VM: containers run on the host's kernel, on every CPU
+/// the engine may use, and that is the count (`docker info` NCPU).
 pub fn vm_cpus() -> usize {
     let max = max_cpus();
+    if cfg!(target_os = "linux") {
+        return max;
+    }
     std::env::var("KIRI_CPUS").ok().and_then(|v| v.parse().ok()).or_else(|| resources()["cpus"].as_u64().map(|c| c as usize)).unwrap_or(2).clamp(1, max)
 }
 
-/// The Mac's CPUs, the most the VM can have.
+/// The Mac's CPUs, the most the VM can have. On Linux the CPUs the engine
+/// may run on, counted as dockerd counts them for NCPU (Go's
+/// runtime.NumCPU: the affinity mask, not a cgroup's CPU quota).
 pub fn max_cpus() -> usize {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: cpu_set_t is plain data; sched_getaffinity fills it.
+        let n = unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) == 0 { libc::CPU_COUNT(&set) } else { 0 }
+        };
+        if n > 0 {
+            return n as usize;
+        }
+    }
     std::thread::available_parallelism().map_or(2, std::num::NonZero::get)
 }
 
@@ -926,6 +944,147 @@ struct State {
     removed: VecDeque<(String, i32)>,
     /// `State.Health` of containers with a healthcheck, by id.
     health: HashMap<String, HealthRun>,
+    /// Build steps running now, by id: where their output and exit go.
+    /// Not containers: `docker ps` never lists them.
+    steps: HashMap<String, Sender<StepEvent>>,
+}
+
+/// Unpacks pulled layers in the guest as they download (see
+/// [`Engine::layer_tee`]).
+pub struct GuestUnpack {
+    vm: Arc<VmLink>,
+    diff_ids: kiri_image::store::DiffIds,
+}
+
+impl kiri_image::registry::LayerTee for GuestUnpack {
+    fn open(&self, layer: &kiri_image::Layer) -> Option<Box<dyn kiri_image::registry::LayerSink>> {
+        let stream = self.vm.connect(kiri_proto::COPY_PORT).ok()?;
+        let mut f = std::fs::File::from(stream.fd.try_clone().ok()?);
+        let mut out = Vec::new();
+        kiri_proto::encode_copy::<&str>(&mut out, kiri_proto::copy_op::LAYER_UNPACK, "-", &format!("{}\n{}", layer.digest, layer.media_type), kiri_proto::copy_flags::CHUNKED, &[]);
+        std::io::Write::write_all(&mut f, &out).ok()?;
+        Some(Box::new(UnpackSink { _stream: stream, f, digest: layer.digest.clone(), diff_ids: self.diff_ids.clone() }))
+    }
+}
+
+/// Whether the guest's answer to a layer unpack matches the diff_id the
+/// image's config names. `present` (the guest had the layer already, and
+/// unpacked nothing now) matches only when this store has itself seen the
+/// blob unpack to that diff_id: the guest's word that it has the blob
+/// says nothing about what the config claims.
+fn unpack_matches(line: &str, diff_id: &str, known: Option<&str>) -> bool {
+    match line {
+        "present" => known == Some(diff_id),
+        computed => computed == diff_id,
+    }
+}
+
+/// One layer on its way to the guest's unpack, as `len: u32 LE | bytes`
+/// chunks. Dropped unfinished, the connection closes and the guest keeps
+/// nothing of it.
+struct UnpackSink {
+    _stream: kiri_vmm::VsockStream,
+    f: std::fs::File,
+    digest: String,
+    diff_ids: kiri_image::store::DiffIds,
+}
+
+impl std::io::Write for UnpackSink {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = buf.len().min(u32::MAX as usize);
+        self.f.write_all(&(n as u32).to_le_bytes())?;
+        self.f.write_all(&buf[..n])?;
+        Ok(n)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl kiri_image::registry::LayerSink for UnpackSink {
+    fn finish(mut self: Box<Self>, diff_id: &str) {
+        use std::io::{BufRead, Write};
+        let result = (|| -> io::Result<()> {
+            self.f.write_all(&0u32.to_le_bytes())?;
+            let frame = super::api::guest_frame(&mut self.f)?;
+            match kiri_proto::decode(&frame) {
+                Ok(kiri_proto::Msg::CopyDone) => {}
+                Ok(kiri_proto::Msg::Error(m)) => return Err(io::Error::other(m.to_owned())),
+                other => return Err(io::Error::other(format!("unexpected answer: {other:?}"))),
+            }
+            let mut line = String::new();
+            let mut r = io::BufReader::new(&self.f);
+            r.read_line(&mut line)?;
+            drop(r);
+            let line = line.trim_end();
+            // The unpacked tar must be the one the config names.
+            let known = self.diff_ids.get(&self.digest);
+            let keep = unpack_matches(line, diff_id, known.as_deref());
+            self.f.write_all(if keep { b"y" } else { b"n" })?;
+            let frame = super::api::guest_frame(&mut self.f)?;
+            let answer = kiri_proto::decode(&frame);
+            if keep && line != "present" {
+                // Computed by the guest from the blob's bytes as they came.
+                self.diff_ids.record(&self.digest, line);
+            }
+            match answer {
+                Ok(kiri_proto::Msg::CopyDone) if keep => Ok(()),
+                Ok(kiri_proto::Msg::Error(m)) => Err(io::Error::other(m.to_owned())),
+                _ if !keep && line == "present" => Err(io::Error::other(format!("the guest had the layer already; that it unpacks to {diff_id}, as the image's config says, is not known here"))),
+                _ if !keep => Err(io::Error::other(format!("unpacks to {line}, the image's config says {diff_id}"))),
+                other => Err(io::Error::other(format!("unexpected answer: {other:?}"))),
+            }
+        })();
+        if let Err(e) = result {
+            crate::diag::warn!("a pulled layer was not unpacked on the way; it is sent at first use", layer = self.digest, error = e);
+        }
+    }
+}
+
+/// Where a Linux host's guest (the agent, a process of this machine) keeps
+/// its containers (kiri-init's data folder).
+#[cfg(target_os = "linux")]
+const LINUX_GUEST_CONTAINERS: &str = "/var/lib/kiri/containers";
+
+/// Every build step's container id starts with this.
+pub const STEP_ID_PREFIX: &str = "step-";
+
+/// What a running build step reports.
+pub enum StepEvent {
+    Output(Stream, Vec<u8>),
+    Exited { code: i32, oom: bool },
+}
+
+/// The network a build step runs on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepNetwork {
+    /// The default bridge, as `docker run` without `--network`.
+    Bridge,
+    None,
+    Host,
+}
+
+/// A build step to run: argv, env, user and working directory resolved,
+/// its root the layers given (blob digest, media type), top first.
+pub struct StepSpec<'a> {
+    pub id: &'a str,
+    pub layers: &'a [(String, String)],
+    pub argv: &'a [String],
+    pub env: &'a [String],
+    pub cwd: &'a str,
+    pub user: &'a str,
+    pub hostname: &'a str,
+    pub network: StepNetwork,
+    /// Guest mount lines (`source\ttarget\tflags`, see kiri-init
+    /// `stepmounts` for a step's own flags).
+    pub mounts: &'a [String],
+    /// Layers the mounts read (blob digest, media type), sent to the guest
+    /// with the root's.
+    pub mount_layers: &'a [(String, String)],
+    /// Guest host-option lines (`rlimit` only, for `--ulimit`).
+    pub opts: &'a [String],
+    /// `RUN --security=insecure` with its entitlement: a privileged step.
+    pub privileged: bool,
 }
 
 /// Set while the daemon shuts down: exits then are not restarts.
@@ -939,6 +1098,25 @@ pub fn stop_wait(secs: i64) -> Duration {
     if secs < 0 { Duration::from_secs(365 * 86_400) } else { Duration::from_secs(secs as u64) }
 }
 
+/// A native build's hold on the VM ([`Engine::hold_awake`]): while any
+/// is held the VM does not sleep as idle. Released when dropped, on every
+/// way out of the build.
+#[must_use = "the VM is held awake only while the hold is kept"]
+pub struct AwakeHold(Arc<Engine>);
+
+impl Drop for AwakeHold {
+    fn drop(&mut self) {
+        self.0.touch();
+        self.0.awake_holds.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl std::fmt::Debug for AwakeHold {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AwakeHold")
+    }
+}
+
 pub struct Engine {
     pub volumes: Mutex<super::volumes::Volumes>,
     /// The VM, while it is awake. It sleeps (powers off, freeing all its
@@ -950,6 +1128,9 @@ pub struct Engine {
     boot_attempts: std::sync::atomic::AtomicUsize,
     /// Unix seconds of the last API request; drives the idle sleep.
     last_activity: std::sync::atomic::AtomicU64,
+    /// Native builds in progress, each holding the VM awake
+    /// ([`Engine::hold_awake`]).
+    awake_holds: std::sync::atomic::AtomicUsize,
     /// Set while the VM is being put to sleep, so its stop is not an error.
     sleeping: std::sync::atomic::AtomicBool,
     /// Stopped from the window: the VM stays off, whatever asks for it
@@ -1109,6 +1290,7 @@ impl Engine {
             #[cfg(test)]
             boot_attempts: std::sync::atomic::AtomicUsize::new(0),
             last_activity: std::sync::atomic::AtomicU64::new(now_secs()),
+            awake_holds: std::sync::atomic::AtomicUsize::new(0),
             sleeping: std::sync::atomic::AtomicBool::new(false),
             stopped: std::sync::atomic::AtomicBool::new(stopped_marker().is_some_and(|f| f.exists())),
             networks,
@@ -1150,7 +1332,34 @@ impl Engine {
         engine.start_k8s_lb();
         #[cfg(target_os = "macos")]
         super::watch::start(Arc::downgrade(&engine));
+        #[cfg(target_os = "linux")]
+        engine.clean_left_steps();
         Ok(engine)
+    }
+
+    /// On a Linux host the guest is started only for the first container,
+    /// and its start is what clears a killed engine's leftovers (its sweep,
+    /// then `Retain`). Build steps a killed daemon left behind (their
+    /// folders, mounts and cgroups) would then stay until a container ran:
+    /// when there are any, the guest is started now, in the background.
+    /// Only with the native builder in use: switched off, start-up does
+    /// what it did before the builder (a step's leftovers then go with the
+    /// guest's own sweep, at the first container).
+    #[cfg(target_os = "linux")]
+    fn clean_left_steps(self: &Arc<Self>) {
+        if !self.store.native_checks() {
+            return;
+        }
+        let left = std::fs::read_dir(LINUX_GUEST_CONTAINERS).map(|d| d.flatten().any(|e| e.file_name().to_string_lossy().starts_with(STEP_ID_PREFIX))).unwrap_or(false);
+        if !left {
+            return;
+        }
+        let me = Arc::downgrade(self);
+        let _ = std::thread::Builder::new().name("kiri-clean-steps".into()).spawn(move || {
+            if let Some(engine) = me.upgrade() {
+                let _ = engine.vm();
+            }
+        });
     }
 
     /// Why the container list may be missing containers, for `docker info`.
@@ -1252,6 +1461,9 @@ impl Engine {
         vm.listen(super::ports::HOST_BOUND_PORT, Box::new(super::ports::serve_host_bound))?;
         // SSH agent forwarding, for containers that mount /run/host-services/ssh-auth.sock.
         vm.listen(super::ports::SSH_AGENT_PORT, Box::new(super::ports::serve_ssh_agent))?;
+        // A build step's `RUN --mount=type=ssh`: relayed to the agent the
+        // build's client hands over (buildssh.rs).
+        vm.listen(super::buildssh::BUILD_SSH_PORT, Box::new(super::buildssh::serve_step))?;
         // The engine's API, for containers that mount /var/run/docker.sock
         // (a Linux host's containers mount the daemon's socket itself).
         if cfg!(target_os = "macos") {
@@ -1398,6 +1610,25 @@ impl Engine {
 
     pub fn touch(&self) {
         self.last_activity.store(now_secs(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Holds the VM awake until the hold is dropped. A native build takes
+    /// one when its request comes in and keeps it until it has answered:
+    /// between its steps (a context read, a layer streamed from the guest
+    /// or written to the store, a fetch, an export) no container, exec or
+    /// step runs, and a build with no progress shown (`-q`) makes no
+    /// request, so nothing else says the engine is in use. Its end counts
+    /// as activity: the idle time starts when the build ends.
+    pub fn hold_awake(self: &Arc<Self>) -> AwakeHold {
+        self.awake_holds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.touch();
+        AwakeHold(Arc::clone(self))
+    }
+
+    /// What keeps the VM awake however long it has been quiet: a native
+    /// build in progress, a build step, an attached USB device.
+    fn awake_needed(&self, st: &State) -> bool {
+        self.awake_holds.load(std::sync::atomic::Ordering::SeqCst) > 0 || !st.steps.is_empty() || usb_attached()
     }
 
     /// Powers the VM off after `KIRI_IDLE_SECS` (default 60; 0 = never)
@@ -1575,7 +1806,7 @@ impl Engine {
             let (busy, parked) = {
                 let st = engine.lock();
                 let parked: Vec<String> = st.containers.values().filter(|c| c.status == Status::Running && c.paused && is_builder(c)).map(|c| c.id.clone()).collect();
-                let busy = st.containers.values().any(|c| c.status == Status::Running && !(c.paused && is_builder(c))) || st.execs.values().any(|e| e.running) || usb_attached();
+                let busy = st.containers.values().any(|c| c.status == Status::Running && !(c.paused && is_builder(c))) || st.execs.values().any(|e| e.running) || engine.awake_needed(&st);
                 (busy, parked)
             };
             let quiet = quiet_for >= idle;
@@ -1599,7 +1830,10 @@ impl Engine {
     fn sleep_if_idle(&self) -> bool {
         let _waking = self.waking.lock().unwrap_or_else(|e| e.into_inner());
         // Check under the lock: a request may have woken it.
-        let idle = !self.lock().containers.values().any(|c| c.status == Status::Running) && !usb_attached();
+        let idle = {
+            let st = self.lock();
+            !st.containers.values().any(|c| c.status == Status::Running) && !self.awake_needed(&st)
+        };
         // Not `link.take().filter(..)`: that takes the VM first and drops it
         // when busy, which powers it off under whatever just started.
         if !idle {
@@ -2062,10 +2296,16 @@ impl Engine {
                     log.append(stream, ns(SystemTime::now()), data);
                 } else if let Some(e) = st.execs.get_mut(id) {
                     e.attached.retain(|tx| tx.send((stream, data.to_vec())).is_ok());
+                } else if let Some(tx) = st.steps.get(id) {
+                    let _ = tx.send(StepEvent::Output(stream, data.to_vec()));
                 }
             }
             Event::Exited { id, code, oom } => {
                 let mut st = self.lock();
+                if let Some(tx) = st.steps.remove(id) {
+                    let _ = tx.send(StepEvent::Exited { code, oom });
+                    return;
+                }
                 if let Some(e) = st.execs.get_mut(id) {
                     e.running = false;
                     e.exit_code = Some(code);
@@ -2203,6 +2443,8 @@ impl Engine {
                 let end = vm_end(self.sleeping.load(std::sync::atomic::Ordering::SeqCst), SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst));
                 let crashed = end == VmEnd::Crashed;
                 let mut st = self.lock();
+                // A step waiting on the VM hears it went: its channel closes.
+                st.steps.clear();
                 let mut closed = Vec::new();
                 for c in st.containers.values_mut() {
                     closed.extend(c.forwards.take());
@@ -2471,7 +2713,9 @@ impl Engine {
         let _one_at_a_time = self.layers.lock().unwrap_or_else(|e| e.into_inner());
         for (digest, media_type) in layers {
             if !vm.has_layer(digest)? {
-                vm.send_layer(digest, media_type, &self.store.blob_path(digest)?)?;
+                // Checked first: a blob changed on disk since it was
+                // verified is hashed again, and a damaged one is never sent.
+                vm.send_layer(digest, media_type, &self.store.verified_blob_path(digest)?)?;
             }
         }
         Ok(())
@@ -3466,6 +3710,187 @@ impl Engine {
         kiri_proto::encode_copy(&mut out, op, &id, path, flags, &layers);
         std::io::Write::write_all(&mut std::fs::File::from(stream.fd.try_clone()?), &out)?;
         Ok(stream)
+    }
+
+    /// Runs a build step to its end and returns its exit code, its output
+    /// passed to `output` as it comes. A container on the normal runtime
+    /// (the same start as `docker run`, Docker's default capabilities and
+    /// seccomp filter, hostname `buildkitsandbox`), but not in the container
+    /// list. Its writable layer stays until [`Engine::step_remove`], for
+    /// [`Engine::step_layer`].
+    pub fn step_run(&self, step: &StepSpec<'_>, cancelled: &dyn Fn() -> bool, output: &mut dyn FnMut(Stream, &[u8])) -> Result<(i32, bool), Error> {
+        let vm = self.vm()?;
+        self.ensure_layers(&vm, step.layers.iter().chain(step.mount_layers).map(|(d, m)| (d.as_str(), m.as_str())))?;
+        // stdin is a pipe closed at once, as BuildKit gives a RUN (a fifo
+        // that reads end of file), not /dev/null.
+        let mut flags = run_flags::STEP | run_flags::STDIN;
+        if step.privileged {
+            // BuildKit's insecure mode: every capability, no seccomp filter,
+            // the host's devices, /sys and the cgroups writable, as runc's
+            // privileged spec, which is what `docker run --privileged` gets.
+            flags |= run_flags::PRIVILEGED;
+        }
+        let mut lease = None;
+        let (bridge, ip, prefix, gateway) = match step.network {
+            StepNetwork::Host => {
+                flags |= run_flags::NET_HOST;
+                (String::new(), [0; 4], 0, [0; 4])
+            }
+            StepNetwork::None => {
+                flags |= run_flags::NET_NONE;
+                (String::new(), [0; 4], 0, [0; 4])
+            }
+            StepNetwork::Bridge => {
+                let n = self.lock_networks().find("bridge").cloned().ok_or_else(|| Error::NotFound("network bridge not found".into()))?;
+                let avoid = self.wanted_addresses(&n.name);
+                let ip = self.lock_networks().allocate_avoiding(&n.name, &avoid).ok_or_else(|| Error::Conflict(format!("no free address left on network {}", n.name)))?;
+                lease = Some((n.name.clone(), ip));
+                (n.bridge.clone(), ip, n.prefix, n.gateway)
+            }
+        };
+        let opts: Vec<String> = lease.iter().map(|(n, _)| format!("{}={n}", kiri_proto::net_opts::NETWORK)).collect();
+        let net = kiri_proto::Net { bridge: &bridge, ip, prefix, gateway, extra_hosts: &[], dns_names: &[], opts: &opts };
+        let layers: Vec<String> = step.layers.iter().map(|(d, _)| d.clone()).collect();
+        let (tx, rx) = mpsc::channel();
+        self.lock().steps.insert(step.id.to_owned(), tx);
+        // A step fills no volume, so its start is never held back
+        // (`Engine::cancel_start` is for containers): nothing sets this.
+        let no_cancel = std::sync::atomic::AtomicBool::new(false);
+        let started = vm.run(step.id, &layers, step.argv, step.env, step.cwd, step.user, step.hostname, flags, net, step.mounts, &kiri_proto::Limits::default(), 0, step.opts, &[], &no_cancel);
+        let result = match started {
+            Err(e) => {
+                self.lock().steps.remove(step.id);
+                Err(Error::Io(e))
+            }
+            Ok(_) => {
+                // A cancelled build kills the step (its init, so the whole
+                // pid namespace goes) and waits for its exit, as BuildKit
+                // kills a step's process on cancel; a step that does not
+                // exit within 10 s of the kill is left to the VM.
+                let mut killed: Option<std::time::Instant> = None;
+                loop {
+                    if std::mem::take(&mut flags) != 0 {
+                        let _ = vm.close_stdin(step.id);
+                    }
+                    match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                        Ok(StepEvent::Output(stream, data)) => output(stream, &data),
+                        Ok(StepEvent::Exited { code, oom }) => break Ok((code, oom)),
+                        Err(mpsc::RecvTimeoutError::Timeout) => match killed {
+                            None if cancelled() => {
+                                let _ = vm.kill(step.id, libc::SIGKILL as u32);
+                                killed = Some(std::time::Instant::now());
+                            }
+                            Some(t) if t.elapsed() > std::time::Duration::from_secs(10) => {
+                                self.lock().steps.remove(step.id);
+                                break Err(Error::Io(io::Error::other("the cancelled step did not exit")));
+                            }
+                            _ => {}
+                        },
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break Err(Error::Io(io::Error::other("the VM stopped while the step ran"))),
+                    }
+                }
+            }
+        };
+        if let Some((net, ip)) = lease {
+            self.release_ip(&net, ip);
+        }
+        result
+    }
+
+    /// Opens the stream of a finished step's layer (`copy_op::STEP_LAYER`);
+    /// `mount_targets` are where the step had mounts, one per line.
+    pub fn step_layer(&self, id: &str, layers: &[String], mount_targets: &str) -> Result<kiri_vmm::VsockStream, Error> {
+        let vm = self.vm()?;
+        let stream = vm.connect(kiri_proto::COPY_PORT)?;
+        let mut out = Vec::new();
+        kiri_proto::encode_copy(&mut out, kiri_proto::copy_op::STEP_LAYER, id, mount_targets, 0, layers);
+        std::io::Write::write_all(&mut std::fs::File::from(stream.fd.try_clone()?), &out)?;
+        Ok(stream)
+    }
+
+    /// Keeps a finished step's writable folder in the guest as the unpacked
+    /// layer `digest` (`copy_op::STEP_ADOPT`), so the next step on it needs
+    /// no copy of the layer from the host. Its tar is in the store already.
+    pub fn step_adopt(&self, id: &str, digest: &str) -> Result<(), Error> {
+        let vm = self.vm()?;
+        let stream = vm.connect(kiri_proto::COPY_PORT)?;
+        let mut out = Vec::new();
+        kiri_proto::encode_copy::<&str>(&mut out, kiri_proto::copy_op::STEP_ADOPT, id, digest, 0, &[]);
+        let mut f = std::fs::File::from(stream.fd.try_clone()?);
+        std::io::Write::write_all(&mut f, &out)?;
+        let frame = super::api::guest_frame(&mut f)?;
+        match kiri_proto::decode(&frame) {
+            Ok(kiri_proto::Msg::CopyDone) => Ok(()),
+            Ok(kiri_proto::Msg::Error(m)) => Err(Error::Io(io::Error::other(m.to_owned()))),
+            other => Err(Error::Io(io::Error::other(format!("unexpected answer from the guest: {other:?}")))),
+        }
+    }
+
+    /// Makes the guest's unpacked layer `new` from its layer `base`
+    /// (`copy_op::LAYER_DELTA`): every file of `base` not in `removed` is
+    /// hard-linked, then `delta` (every folder entry and every new or
+    /// changed entry of `new`'s tar, in tar order) is unpacked over it. Only
+    /// the delta's bytes cross to the guest. The layer's full tar must be in
+    /// the store as well, for push, save and a guest that lost the layer.
+    // The large-context COPY (take_copy_layer_from) is its caller; until it
+    // lands only the guest side is used, by its own test.
+    #[allow(dead_code)]
+    pub fn layer_delta(&self, base: &str, new: &str, removed: &[String], delta: &mut dyn io::Read) -> Result<(), Error> {
+        let vm = self.vm()?;
+        let stream = vm.connect(kiri_proto::COPY_PORT)?;
+        let mut out = Vec::new();
+        kiri_proto::encode_copy(&mut out, kiri_proto::copy_op::LAYER_DELTA, "-", &format!("{base}\n{new}"), kiri_proto::copy_flags::CHUNKED, removed);
+        let mut f = std::fs::File::from(stream.fd.try_clone()?);
+        std::io::Write::write_all(&mut f, &out)?;
+        super::api::send_chunks(delta, &mut f)?;
+        let frame = super::api::guest_frame(&mut f)?;
+        match kiri_proto::decode(&frame) {
+            Ok(kiri_proto::Msg::CopyDone) => Ok(()),
+            Ok(kiri_proto::Msg::Error(m)) => Err(Error::Io(io::Error::other(m.to_owned()))),
+            other => Err(Error::Io(io::Error::other(format!("unexpected answer from the guest: {other:?}")))),
+        }
+    }
+
+    /// What a pull gives each layer's blob to, so the guest unpacks the
+    /// layer while it downloads (`copy_op::LAYER_UNPACK`); None when there
+    /// is no VM up to take them (a `docker pull` does not wake it: the
+    /// layers are sent at first use then, as before).
+    ///
+    /// Only for the native builder ([`kiri_image::Store::use_native_checks`]):
+    /// with it switched off a pull does what it did before the builder,
+    /// with no guest involved.
+    pub fn layer_tee(&self) -> Option<GuestUnpack> {
+        if !self.store.native_checks() {
+            return None;
+        }
+        self.awake().map(|vm| GuestUnpack { vm, diff_ids: self.store.diff_ids() })
+    }
+
+    /// Sends the guest the layer (blob digest, media type) if it lacks it,
+    /// then sets these xattrs on its unpacked copy (`copy_op::LAYER_XATTRS`,
+    /// lines `path\tname\thex`): what a COPY's files carry beyond what the
+    /// layer tar keeps, for the later steps that see the layer in place.
+    pub fn layer_xattrs(&self, digest: &str, media_type: &str, lines: &[String]) -> Result<(), Error> {
+        let vm = self.vm()?;
+        self.ensure_layers(&vm, std::iter::once((digest, media_type)))?;
+        let stream = vm.connect(kiri_proto::COPY_PORT)?;
+        let mut out = Vec::new();
+        kiri_proto::encode_copy(&mut out, kiri_proto::copy_op::LAYER_XATTRS, "-", digest, 0, lines);
+        let mut f = std::fs::File::from(stream.fd.try_clone()?);
+        std::io::Write::write_all(&mut f, &out)?;
+        let frame = super::api::guest_frame(&mut f)?;
+        match kiri_proto::decode(&frame) {
+            Ok(kiri_proto::Msg::CopyDone) => Ok(()),
+            Ok(kiri_proto::Msg::Error(m)) => Err(Error::Io(io::Error::other(m.to_owned()))),
+            other => Err(Error::Io(io::Error::other(format!("unexpected answer from the guest: {other:?}")))),
+        }
+    }
+
+    /// Deletes a step's files in the guest.
+    pub fn step_remove(&self, id: &str) {
+        if let Some(vm) = self.awake() {
+            let _ = vm.remove(id);
+        }
     }
 
     /// Running containers' domains, for the router's "not found" page.
@@ -5954,7 +6379,7 @@ mod records_tests {
         }
     }
 
-    /// The reviewer's sequence: damage, start, a person moves another list
+    /// Damage, start, a person moves another list
     /// onto containers.json while the engine runs, a save happens, the
     /// engine starts again. The person's file is kept as a copy, everything
     /// is still kept, and nothing is swept.
@@ -6989,5 +7414,100 @@ mod leave_first_network_tests {
         }))
         .unwrap();
         assert!(!s.left_all_networks);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod cpu_tests {
+    /// The CPUs `Cpus_allowed_list` of /proc/self/status lists.
+    fn allowed() -> usize {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let list = status.lines().find_map(|l| l.strip_prefix("Cpus_allowed_list:")).unwrap().trim().to_owned();
+        list.split(',')
+            .map(|r| match r.split_once('-') {
+                Some((a, b)) => b.parse::<usize>().unwrap() - a.parse::<usize>().unwrap() + 1,
+                None => 1,
+            })
+            .sum()
+    }
+
+    /// On Linux there is no VM: `docker info`'s NCPU is the CPUs the engine
+    /// may run on, as dockerd counts them (Go's runtime.NumCPU, the affinity
+    /// mask), not the Mac VM's default of 2.
+    #[test]
+    fn on_linux_the_engine_has_the_cpus_it_may_run_on() {
+        assert_eq!(super::vm_cpus(), allowed());
+    }
+}
+
+#[cfg(test)]
+mod awake_hold_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    fn quiet_for(engine: &Engine) -> u64 {
+        now_secs().saturating_sub(engine.last_activity.load(Ordering::Relaxed))
+    }
+
+    /// A native build holds the VM awake from its request to its answer,
+    /// whatever it is doing (no container, exec or step running, no request
+    /// for minutes, as with `kiri build -q`); the hold's end counts as
+    /// activity, and with no hold left nothing keeps it awake.
+    #[test]
+    fn a_native_build_keeps_the_vm_awake_until_it_ends() {
+        let root = std::env::temp_dir().join(format!("kiri-awake-hold-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let engine = boot_without_vm(&root);
+        // Quiet for longer than any idle time.
+        engine.last_activity.store(0, Ordering::Relaxed);
+        assert!(!engine.awake_needed(&engine.lock()), "nothing runs");
+        let a = engine.hold_awake();
+        let b = engine.hold_awake();
+        engine.last_activity.store(0, Ordering::Relaxed);
+        assert!(engine.awake_needed(&engine.lock()), "two builds");
+        drop(a);
+        engine.last_activity.store(0, Ordering::Relaxed);
+        assert!(engine.awake_needed(&engine.lock()), "one build left");
+        drop(b);
+        assert!(!engine.awake_needed(&engine.lock()), "no build left");
+        assert!(quiet_for(&engine) <= 1, "the end of a build is activity: the idle time starts there");
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The hold goes on every way out of a build, a panic too: it is a
+    /// guard, not a pair of calls.
+    #[test]
+    fn a_build_that_panics_lets_the_vm_sleep() {
+        let root = std::env::temp_dir().join(format!("kiri-awake-panic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let engine = boot_without_vm(&root);
+        let e = Arc::clone(&engine);
+        let r = std::thread::spawn(move || {
+            let _hold = e.hold_awake();
+            assert!(e.awake_needed(&e.lock()));
+            panic!("a build that panics");
+        })
+        .join();
+        assert!(r.is_err());
+        assert!(!engine.awake_needed(&engine.lock()), "the hold went with the panic");
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+mod unpack_answer_tests {
+    /// A layer the guest computed is kept only with the config's diff_id;
+    /// one it reports `present` only when this store saw the blob unpack
+    /// to that diff_id itself.
+    #[test]
+    fn present_is_not_a_match_by_itself() {
+        let (d, other) = ("sha256:aa", "sha256:bb");
+        assert!(super::unpack_matches(d, d, None));
+        assert!(!super::unpack_matches(other, d, Some(d)));
+        assert!(!super::unpack_matches("present", d, None), "unknown: not kept as a match");
+        assert!(!super::unpack_matches("present", d, Some(other)), "seen to unpack to another");
+        assert!(super::unpack_matches("present", d, Some(d)));
     }
 }

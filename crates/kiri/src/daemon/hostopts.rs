@@ -70,6 +70,36 @@ pub fn check_device_requests(host: &Value) -> Result<(), String> {
     ))
 }
 
+enum RlimitError {
+    Name,
+    Order,
+}
+
+/// The guest's `rlimit` line for one ulimit (RLIM_INFINITY as u64::MAX),
+/// with its RLIMIT_* number.
+fn rlimit_line(name: &str, soft: u64, hard: u64) -> Result<(u32, String), RlimitError> {
+    let res = RLIMITS.iter().find(|(n, _)| *n == name).map(|(_, r)| *r).ok_or(RlimitError::Name)?;
+    if soft > hard {
+        return Err(RlimitError::Order);
+    }
+    Ok((res, format!("rlimit\t{res}\t{soft}\t{hard}")))
+}
+
+/// A build step's lines for its `--ulimit` values (-1 unlimited): only
+/// those, as BuildKit replaces the limits it was given and no others.
+pub fn step_rlimit_lines(ulimits: &[kiri_forge::ports::Ulimit]) -> Result<Vec<String>, String> {
+    let n = |v: i64| if v < 0 { UNLIMITED } else { v as u64 };
+    ulimits
+        .iter()
+        .map(|u| {
+            rlimit_line(&u.name, n(u.soft), n(u.hard)).map(|(_, l)| l).map_err(|e| match e {
+                RlimitError::Name => format!("invalid ulimit type: {}", u.name),
+                RlimitError::Order => format!("ulimit soft limit must be less than or equal to hard limit: {} > {}", u.soft, u.hard),
+            })
+        })
+        .collect()
+}
+
 /// The guest's lines for `opts` (from [`from_host`]), or Docker's error for
 /// the first bad setting. `net_host`: the container shares the host's (the
 /// VM's) network namespace, so `net.*` sysctls are not its own.
@@ -78,18 +108,17 @@ pub fn guest_lines(opts: &Value, net_host: bool) -> Result<Vec<String>, String> 
     let mut nofile = false;
     for u in opts["Ulimits"].as_array().into_iter().flatten() {
         let name = u["Name"].as_str().unwrap_or("");
-        let res = RLIMITS.iter().find(|(n, _)| *n == name).map(|(_, r)| *r).ok_or_else(|| format!("invalid ulimit type: {name}"))?;
         let value = |k: &str| match u[k].as_i64() {
             Some(v) if v < 0 => UNLIMITED,
             Some(v) => v as u64,
             None => u[k].as_u64().unwrap_or(0),
         };
-        let (soft, hard) = (value("Soft"), value("Hard"));
-        if soft > hard {
-            return Err(format!("ulimit soft limit must be less than or equal to hard limit: {} > {}", u["Soft"], u["Hard"]));
-        }
+        let (res, line) = rlimit_line(name, value("Soft"), value("Hard")).map_err(|e| match e {
+            RlimitError::Name => format!("invalid ulimit type: {name}"),
+            RlimitError::Order => format!("ulimit soft limit must be less than or equal to hard limit: {} > {}", u["Soft"], u["Hard"]),
+        })?;
         nofile |= res == 7;
-        out.push(format!("rlimit\t{res}\t{soft}\t{hard}"));
+        out.push(line);
     }
     if !nofile {
         out.push(format!("rlimit\t7\t{DEFAULT_NOFILE}\t{DEFAULT_NOFILE}"));
@@ -203,6 +232,15 @@ fn sysctl(key: &str, net_host: bool) -> Result<(&'static str, String), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_build_steps_ulimits_and_nothing_else() {
+        let u = |name: &str, soft, hard| kiri_forge::ports::Ulimit { name: name.into(), soft, hard };
+        assert_eq!(step_rlimit_lines(&[]).unwrap(), Vec::<String>::new());
+        assert_eq!(step_rlimit_lines(&[u("nofile", 1062, 1062), u("memlock", -1, -1)]).unwrap(), ["rlimit\t7\t1062\t1062", &format!("rlimit\t8\t{UNLIMITED}\t{UNLIMITED}")]);
+        assert_eq!(step_rlimit_lines(&[u("bogus", 1, 1)]).unwrap_err(), "invalid ulimit type: bogus");
+        assert!(step_rlimit_lines(&[u("nproc", 5, 4)]).is_err());
+    }
 
     #[test]
     fn ulimits_and_the_nofile_default() {

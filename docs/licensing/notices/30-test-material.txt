@@ -1,0 +1,14 @@
+Test material from other projects
+=================================
+
+None of this is part of any Kiri binary. It is test input. The golden
+vectors and recorded protocol traffic the builder's tests also read are not
+in this repository; they are kept, with their own notices, in the builder
+test data that scripts/fetch-test-data.sh fetches.
+
+Test inputs of the image builder
+----------------------------------------------------------------------
+The image builder's own tests, and the test inputs they take from BuildKit,
+containerd/platforms, moby/patternmatcher and Go, are in the kiri-forge
+repository (https://github.com/libracoder/kiri-forge) and credited in its
+NOTICE.

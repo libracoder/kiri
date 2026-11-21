@@ -16,6 +16,19 @@ Environment=KIRI_SOCKET_GROUP=kiri
 Environment=HOME=/var/lib/kiri-daemon
 # The daemon creates the cgroups its containers run in.
 Delegate=yes
+# What containers and build steps inherit, as under Docker: open files
+# 1048576 (what Docker Desktop, the old docker.service's
+# LimitNOFILE=infinity and Kiri's VM give, and BuildKit's RUN sees there;
+# systemd's default is 1024:524288),
+# no process or core-size limit, and no task limit on the unit, whose cgroup
+# holds every container.
+LimitNOFILE=1048576
+LimitNPROC=infinity
+LimitCORE=infinity
+TasksMax=infinity
+# Not docker.service's KillMode=process: nothing of the engine outlives it
+# (containers stop with it). Nor its OOMScoreAdjust=-500: containers and
+# steps would inherit it, where Docker gives a container 0.
 KillMode=mixed
 Restart=on-failure
 # Tools that ignore docker contexts (docker-py, Go's client.FromEnv,

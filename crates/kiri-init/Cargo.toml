@@ -11,9 +11,16 @@ kiri-proto = { path = "../kiri-proto" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 flate2 = "1"
+kiri-zstd = { path = "../kiri-zstd" }
 libc = "0.2"
-ruzstd = "0.9"
+# A layer unpacked as it is pulled checks both digests in the same pass:
+# the blob's and the tar's (diff_id). The same sha2 the image store uses.
+sha2 = "0.11"
 tar = "0.4"
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# The frames the zstd layer tests unpack.
+ruzstd = "0.9"
 
 [lints]
 workspace = true

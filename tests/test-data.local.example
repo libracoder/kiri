@@ -1,0 +1,4 @@
+# Copy to tests/test-data.local (ignored by git) and set the address of the
+# builder test data repository you have access to; KIRI_TEST_DATA_URL, when
+# set, is used instead. The commit comes from tests/test-data.pin.
+url=https://git.example.invalid/your/builder-test-data.git

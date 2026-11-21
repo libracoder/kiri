@@ -203,6 +203,41 @@ pub fn post_lines_closable(path: &str, auth: Option<&str>, opened: impl FnOnce(&
     Ok(status)
 }
 
+/// A POST of a JSON body whose answer is JSON lines arriving over time,
+/// with no read timeout: a build can be quiet for as long as a step is.
+/// Returns the HTTP status; a body that is not lines (an error) comes to
+/// `on_line` as one value if it is JSON.
+pub fn post_json_lines(path: &str, body: &Value, mut on_line: impl FnMut(Value)) -> io::Result<u16> {
+    let mut s = connect(None)?;
+    let payload = body.to_string();
+    write!(s, "POST {path} HTTP/1.1\r\nHost: kiri\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}", payload.len())?;
+    let mut r = BufReader::new(s);
+    let (status, len, chunked) = head(&mut r)?;
+    let mut pending = Vec::new();
+    let mut lines = |pending: &mut Vec<u8>| {
+        while let Some(i) = pending.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = pending.drain(..=i).collect();
+            if let Ok(v) = serde_json::from_slice::<Value>(&line) {
+                on_line(v);
+            }
+        }
+    };
+    if chunked {
+        while let Some(c) = chunk(&mut r)? {
+            pending.extend_from_slice(&c);
+            lines(&mut pending);
+        }
+    } else if let Some(n) = len {
+        pending.resize(n, 0);
+        r.read_exact(&mut pending)?;
+    } else if status != 204 {
+        r.read_to_end(&mut pending)?;
+    }
+    pending.push(b'\n');
+    lines(&mut pending);
+    Ok(status)
+}
+
 /// Calls `on_event` for each event until the connection ends or it returns false.
 pub fn events(mut on_event: impl FnMut(Value) -> bool) -> io::Result<()> {
     let mut s = connect(None)?;

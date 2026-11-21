@@ -409,8 +409,11 @@ fn image_prune(req: &Request, engine: &Engine) -> Result<Value, Error> {
         if !f.labels(&super::api::image_labels_from(&cfg)) || (until.is_some() && !created.is_some_and(|c| before(until, c))) {
             continue;
         }
+        // The kept uncompressed copies of its layers go with their blobs.
+        let tars: Vec<(&str, u64)> = i.layers.iter().map(|l| (l.digest.as_str(), engine.store.layer_tar_size(&l.digest))).filter(|t| t.1 > 0).collect();
         if engine.store.remove_image(&i.name)?.is_some() {
             reclaimed += i.size;
+            reclaimed += tars.iter().filter(|(d, _)| engine.store.layer_tar_size(d) == 0).map(|t| t.1).sum::<u64>();
             deleted.push(json!({"Untagged": i.name}));
             engine.emit_image("untag", &i.config_digest, &i.name);
             if !engine.store.images()?.iter().any(|o| o.config_digest == i.config_digest) {
@@ -459,7 +462,9 @@ fn system_df(engine: &Engine) -> Result<Value, Error> {
     let used: Vec<String> = engine.each(|c| Some(c.spec.image_id.clone()));
     let measured = engine.vm().ok().and_then(|vm| vm.usage(std::time::Duration::from_secs(120)));
     let du = measured.as_deref().map(DiskUsage::parse);
-    let layer_size = |l: &kiri_image::Layer| du.as_ref().and_then(|d| d.layers.get(l.digest.trim_start_matches("sha256:")).copied()).unwrap_or(l.size);
+    // With the uncompressed copy the native builder keeps of a pulled
+    // layer, as Docker counts an image's unpacked snapshots in its size.
+    let layer_size = |l: &kiri_image::Layer| du.as_ref().and_then(|d| d.layers.get(l.digest.trim_start_matches("sha256:")).copied()).unwrap_or(l.size) + engine.store.layer_tar_size(&l.digest);
     // How many images use each layer, for each image's shared size.
     let mut users: HashMap<&str, usize> = HashMap::new();
     for i in &images {
@@ -710,6 +715,63 @@ mod disk_usage_tests {
             other => panic!("image prune: {other:?}"),
         }
         assert_eq!(engine.store.images().unwrap().len(), 1, "the image is kept");
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The uncompressed copy of a pulled layer the native builder keeps
+    /// (`Store::layer_tar`) is part of its image, as Docker counts an
+    /// image's unpacked snapshots in its size: `system df` shows it, and
+    /// prune (so `docker system prune -a` and `kiri image prune -a`) frees
+    /// it with the image.
+    #[test]
+    fn a_kept_layer_tar_counts_in_system_df_and_goes_with_its_image_on_prune() {
+        use std::io::Write as _;
+        let root = std::env::temp_dir().join(format!("kiri-df-layer-tar-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let engine = super::super::engine::boot_without_vm(&root);
+        let tar = {
+            let mut b = tar::Builder::new(Vec::new());
+            let body = vec![7u8; 100_000];
+            let mut h = tar::Header::new_ustar();
+            h.set_size(body.len() as u64);
+            h.set_mode(0o644);
+            b.append_data(&mut h, "f", body.as_slice()).unwrap();
+            b.into_inner().unwrap()
+        };
+        let gz = {
+            let mut z = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+            z.write_all(&tar).unwrap();
+            z.finish().unwrap()
+        };
+        let put = |bytes: &[u8]| {
+            let mut w = engine.store.ingest().unwrap();
+            w.write_all(bytes).unwrap();
+            w.finish().unwrap()
+        };
+        let diff_id = kiri_image::store::sha256_digest(&tar);
+        let config = serde_json::json!({"os": "linux", "architecture": kiri_image::Platform::host_linux().architecture, "config": {}, "rootfs": {"type": "layers", "diff_ids": [diff_id]}});
+        let (cfg, _) = put(&serde_json::to_vec(&config).unwrap());
+        let (layer, size) = put(&gz);
+        let mut image = kiri_image::archive::from_config("pulled:1".into(), &cfg, &config, vec![kiri_image::Layer { digest: layer.clone(), size, media_type: "application/vnd.oci.image.layer.v1.tar+gzip".into() }]);
+        image.digest = cfg.clone();
+        engine.store.put_image(image).unwrap();
+        let df = |e: &super::Engine| super::system_df(e).unwrap();
+        let before = df(&engine);
+        assert_eq!(before["LayersSize"], size);
+        let (path, pin) = engine.store.layer_tar(&layer, &diff_id, &mut |w| w.write_all(&tar)).unwrap();
+        drop(pin);
+        let kept = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(engine.store.layer_tar_size(&layer), kept);
+        let after = df(&engine);
+        assert_eq!(after["LayersSize"], size + kept, "system df counts the kept tar");
+        assert_eq!(after["Images"][0]["Size"], size + kept, "as part of its image");
+        let r = super::image_prune(&super::Request::internal("POST", "/images/prune", &[("filters", r#"{"dangling":["false"]}"#)], Vec::new()), &engine).unwrap();
+        assert!(!path.exists(), "prune left the kept tar");
+        assert_eq!(engine.store.layer_tar_size(&layer), 0);
+        assert_eq!(r["SpaceReclaimed"], size + kept, "{r}");
+        assert_eq!(df(&engine)["LayersSize"], 0);
         drop(engine);
         let _ = std::fs::remove_dir_all(root);
     }

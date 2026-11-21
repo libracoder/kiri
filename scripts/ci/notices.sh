@@ -23,6 +23,12 @@ notice 'Simple Icons 16.35.0 — CC0' 'https://unpkg.com/simple-icons@16.35.0/LI
 notice 'Linux guest kernel — GPL-2.0-only' 'https://www.gnu.org/licenses/old-licenses/gpl-2.0.txt'
 printf '\nGuest kernel source offer\n----------------------------------------------------------------------\n\n' >> "$tmp"
 cat guest/kernel/SOURCE_OFFER.md >> "$tmp"
+# Notices kept by hand, in name order: bundled files that are not Rust
+# crates, code ported into Kiri from other projects, and test material.
+for f in docs/licensing/notices/*.txt; do
+  printf '\n' >> "$tmp"
+  cat "$f" >> "$tmp"
+done
 sed -e 's/\r$//' -e 's/[[:blank:]]*$//' "$tmp" > "$tmp.clean"
 mv "$tmp.clean" "$tmp"
 mv "$tmp" NOTICE

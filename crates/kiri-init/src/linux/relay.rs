@@ -280,6 +280,13 @@ fn udp_step(host: RawFd, target: RawFd, up: &mut Pipe, down: &mut Pipe) -> io::R
     }
     while up.buf.len() >= 2 {
         let len = u16::from_be_bytes([up.buf[0], up.buf[1]]) as usize;
+        // A frame that can never fit the buffer would stop the relay for
+        // good: it ends the session instead.
+        if 2 + len > BUF {
+            up.shut = true;
+            down.shut = true;
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "a datagram frame longer than the relay's buffer"));
+        }
         if up.buf.len() < 2 + len {
             break;
         }
@@ -538,5 +545,35 @@ mod tests {
         // No room for a frame: not read, and not taken for EOF.
         let full = buf.len() + 4;
         assert_eq!(super::read_frame_into(r.as_raw_fd(), &mut buf, full).unwrap(), 1);
+    }
+
+    /// A datagram frame whose length can never fit the relay's buffer ends
+    /// the session with an error; before, the relay waited for it for good.
+    #[test]
+    fn a_datagram_frame_too_long_for_the_buffer_ends_the_relay() {
+        let mut fds = [0; 2];
+        // SAFETY: `fds` has room for the two descriptors socketpair writes.
+        assert_eq!(unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_NONBLOCK, 0, fds.as_mut_ptr()) }, 0);
+        // SAFETY: socketpair succeeded, so both are fresh and ours.
+        let (host, peer) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        let mut frame = vec![0xffu8, 0xff];
+        frame.resize(super::BUF + 8, 0);
+        // SAFETY: writing a local buffer to a socket we own.
+        let n = unsafe { libc::write(peer.as_raw_fd(), frame.as_ptr().cast(), frame.len()) };
+        assert!(n > super::BUF as isize / 2, "{n}");
+        let mut t = [0; 2];
+        // SAFETY: as above, a datagram pair for the relay's target side.
+        assert_eq!(unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM | libc::SOCK_NONBLOCK, 0, t.as_mut_ptr()) }, 0);
+        // SAFETY: socketpair succeeded, so both are fresh and ours.
+        let (target, _far) = unsafe { (OwnedFd::from_raw_fd(t[0]), OwnedFd::from_raw_fd(t[1])) };
+        let (mut up, mut down) = (super::Pipe::new(), super::Pipe::new());
+        let mut ended = false;
+        for _ in 0..8 {
+            if super::udp_step(host.as_raw_fd(), target.as_raw_fd(), &mut up, &mut down).is_err() {
+                ended = true;
+                break;
+            }
+        }
+        assert!(ended && up.shut && down.shut, "the relay waits for a frame that cannot fit");
     }
 }

@@ -17,12 +17,17 @@ sha2 = "0.11"
 flate2 = "1"
 # zstd uploads to the same endpoints: the decoder the guest unpacks layers with.
 ruzstd = "0.9"
+# HTTP(S) client of the update check, and of the native builder's `ADD <url>`
+# (daemon/buildfetch.rs): one GET, redirects, proxies from the environment.
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 # HTTPS for container names: the same rustls and ring ureq already brings in.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 # Roots for `kiri share`'s connection to the edge.
 webpki-roots = "1"
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem", "crypto"] }
+# `kiri build --ssh id=<key file>`: the keys are served by an agent in the
+# client, as buildx serves them (sshfwd.rs); the same ring rustls brings in.
+ring = "0.17"
 # The `name` filter is a regular expression in Docker (k3d sends `^[/]?name$`).
 # regex-lite: RE2 syntax like Go's regexp, without the Unicode tables' size.
 regex-lite = "0.1"
@@ -31,6 +36,12 @@ regex-lite = "0.1"
 libc = "0.2"
 
 [target.'cfg(unix)'.dependencies]
+# Kiri Forge, Kiri's build engine; Kiri implements its plug-in points (buildports).
+# Unix only: it reads build folders with Unix file calls, and on Windows
+# kiri.exe is a client (the engine, and its builder, run in WSL). A library
+# in its own repository, taken at a tag: a builder change is tagged there
+# first, then this tag moves (CONTRIBUTING.md).
+kiri-forge = { git = "https://github.com/libracoder/kiri-forge", tag = "v0.1.0" }
 kiri-vmm = { path = "../kiri-vmm" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -57,6 +68,13 @@ tar = "0.4"
 
 [features]
 window = ["dep:gtk", "dep:webkit2gtk", "dep:javascriptcore-rs"]
+# The store's and the step cache's kill points, for the crash tests of a
+# disposable engine. Never on in a release build.
+fault-inject = ["kiri-image/fault-inject", "kiri-forge/fault-inject"]
+# The builder's test-only routes (`POST /kiri/build/steps`, `/kiri/build/golden`,
+# with KIRI_BUILD_PORTS_TEST=1 on the engine) for tests/golden_run.rs. Never on in
+# a release build.
+build-test-routes = []
 
 [lints]
 workspace = true
