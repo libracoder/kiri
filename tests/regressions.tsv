@@ -197,3 +197,4 @@ rename-dns-reused-name	#467	a container renamed to a name an earlier container h
 rename-dns-reused-name-extra-net	#467	the same on a network the container was connected to
 dns-user-net-three-refused-servfail-at-once	#455	with three refusing --dns servers on a user network the lookup was not answered until the client gave up
 dns-user-net-three-silent-servfail-in-time	#455	with three silent --dns servers on a user network the lookup was not answered at all, instead of within their waits
+import-empty-numbers	#618	a layer whose header left size, uid or gid empty did not unpack: "numeric field was not a number" (servicebus-emulator)
