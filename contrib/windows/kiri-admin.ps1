@@ -20,11 +20,20 @@ param(
   [switch]$Off
 )
 $ErrorActionPreference = "Stop"
+# One mode per run: two switches given at once is a caller's mistake, not a
+# choice between them.
+if (@(@($Wsl.IsPresent, $Components.IsPresent, $Dns.IsPresent) -eq $true).Count -ne 1) { throw "kiri-admin.ps1 needs exactly one of -Wsl, -Components or -Dns" }
 # Both WSL optional components in one dism.exe call: they share the Windows
 # Foundation parent package, so it is one servicing transaction. /all brings
 # their parent features, /norestart leaves the restart to setup, and exit
 # 3010 says one is needed.
 $featureArgs = '/online', '/enable-feature', '/featurename:Microsoft-Windows-Subsystem-Linux', '/featurename:VirtualMachinePlatform', '/all', '/norestart'
+# dism.exe's own exit code when it fails, so setup can show it. The codes
+# this script gives a meaning of its own (1 a PowerShell error, 21-24, 1223
+# which kiri-win reads as a declined approval) and no code at all read as 24.
+function DismFailed($code) {
+  if ($null -eq $code -or $code -in 1, 21, 22, 23, 24, 1223) { 24 } else { $code }
+}
 
 # -Wsl: setup step 1, in one elevated run: both optional components on, and
 # WSL installed from the MSI kiri-win downloaded. That MSI lives in a
@@ -32,9 +41,9 @@ $featureArgs = '/online', '/enable-feature', '/featurename:Microsoft-Windows-Sub
 # it between kiri-win's SHA-256 check and this run: it is checked again
 # here, as admin, on a copy the user cannot touch, and must be signed by
 # Microsoft. setup.rs reads the exit code: 22 the copy does not match
-# -Sha256, 23 not validly signed by Microsoft, 24 the components could not
-# be turned on, 21 the WSL installer failed, 3010 done but Windows must
-# restart.
+# -Sha256, 23 not validly signed by Microsoft, 21 the WSL installer failed,
+# 3010 done but Windows must restart; when the components could not be
+# turned on, dism.exe's own code (DismFailed).
 if ($Wsl) {
   if (-not $Msi -or -not $Sha256) { throw "-Wsl needs -Msi and -Sha256" }
   $dst = Join-Path $env:windir ('Temp\kiri-wsl-' + [guid]::NewGuid().ToString('N') + '.msi')
@@ -43,7 +52,7 @@ if ($Wsl) {
   $sig = Get-AuthenticodeSignature -LiteralPath $dst
   if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notlike '*Microsoft*') { Remove-Item -LiteralPath $dst -Force; exit 23 }
   $features = (Start-Process "$env:SystemRoot\System32\dism.exe" -ArgumentList $featureArgs -Wait -PassThru -WindowStyle Hidden).ExitCode
-  if ($features -ne 0 -and $features -ne 3010) { Remove-Item -LiteralPath $dst -Force; exit 24 }
+  if ($features -ne 0 -and $features -ne 3010) { Remove-Item -LiteralPath $dst -Force; exit (DismFailed $features) }
   $msiexec = (Start-Process "$env:SystemRoot\System32\msiexec.exe" -ArgumentList '/i', ('"' + $dst + '"'), '/qn', '/norestart' -Wait -PassThru -WindowStyle Hidden).ExitCode
   Remove-Item -LiteralPath $dst -Force
   if ($msiexec -ne 0 -and $msiexec -ne 3010) { exit 21 }
@@ -52,11 +61,11 @@ if ($Wsl) {
 
 # -Components: the two optional components only, for a PC whose WSL is
 # installed (wsl.exe answers) but says WSL_E_WSL_OPTIONAL_COMPONENT_REQUIRED:
-# an earlier setup turned on Virtual Machine Platform alone. Exit 24 they
-# could not be turned on, 3010 done but Windows must restart.
+# an earlier setup turned on Virtual Machine Platform alone. Exit 0 done,
+# 3010 done but Windows must restart, otherwise dism.exe's code (DismFailed).
 if ($Components) {
   $features = (Start-Process "$env:SystemRoot\System32\dism.exe" -ArgumentList $featureArgs -Wait -PassThru -WindowStyle Hidden).ExitCode
-  if ($features -eq 0 -or $features -eq 3010) { exit $features } else { exit 24 }
+  if ($features -eq 0 -or $features -eq 3010) { exit $features } else { exit (DismFailed $features) }
 }
 
 # -Dns: the name-resolution policy (NRPT) rule that sends `.<suffix>`

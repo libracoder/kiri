@@ -79,6 +79,9 @@ struct Saved {
     distro: Option<String>,
     /// Unix seconds of the WSL install that needs a restart.
     restart_after: Option<u64>,
+    /// Unix seconds of the last time setup turned WSL's optional components
+    /// on and went to the restart step for them.
+    components_on_at: Option<u64>,
     /// Why setup last stopped, kept so a restart of Kiri doesn't lose it.
     last_error: Option<String>,
 }
@@ -191,20 +194,40 @@ fn quiet(program: &str) -> Command {
     c
 }
 
-/// WSL's own output is UTF-16, in the language of the Windows it runs on.
-/// Checking only the first units' high bytes misses every non-ASCII letter:
-/// `Д` is U+0414, so its high byte is 0x04, not zero. A UTF-8 reading of
-/// UTF-16 has NULs, invalid bytes or control characters in it; when it has
-/// none, the bytes really were UTF-8.
+/// WSL's own messages are UTF-16LE, in the language of the Windows it runs
+/// on; what a Linux program prints through wsl.exe is UTF-8. WSL's UTF-16
+/// always has ASCII in it (its `Wsl/...` error codes, CRLFs, spaces), whose
+/// units carry a NUL high byte at an odd offset; UTF-8 text has none. So a
+/// byte-order mark, or such NULs in at least a quarter of the units, reads
+/// as UTF-16LE, and anything else as UTF-8. UTF-16 with no ASCII and no BOM
+/// at all is the one thing this cannot tell from UTF-8. NULs and a leading
+/// BOM are dropped either way.
 fn wsl_text(bytes: &[u8]) -> String {
-    let utf8 = String::from_utf8_lossy(bytes);
-    // UTF-16 is whole units; an ESC is a Linux program's colour code.
-    let looks_utf16 = bytes.len().is_multiple_of(2) && (utf8.contains('\0') || utf8.contains('\u{fffd}') || utf8.chars().any(|c| c.is_control() && !c.is_whitespace() && c != '\x1b'));
-    if !looks_utf16 {
-        return utf8.into_owned();
-    }
-    let units: Vec<u16> = bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
-    String::from_utf16_lossy(&units).replace('\0', "")
+    let (bytes, bom) = bytes.strip_prefix(&[0xFF, 0xFE]).map_or((bytes, false), |rest| (rest, true));
+    let text = if bom || looks_utf16(bytes) {
+        let (pairs, rest) = bytes.as_chunks::<2>();
+        let units: Vec<u16> = pairs.iter().map(|&p| u16::from_le_bytes(p)).collect();
+        let mut text = String::from_utf16_lossy(&units);
+        // Output cut short mid-unit: an ASCII low byte is still its letter.
+        if let [last] = rest
+            && last.is_ascii()
+        {
+            text.push(char::from(*last));
+        }
+        text
+    } else {
+        String::from_utf8_lossy(bytes).into_owned()
+    };
+    text.trim_start_matches('\u{feff}').replace('\0', "")
+}
+
+/// Whether `bytes` (no BOM) has the odd-offset NULs of UTF-16LE ASCII units
+/// in at least a quarter of its units. Two at least: a stray NUL in short
+/// UTF-8 is not UTF-16.
+fn looks_utf16(bytes: &[u8]) -> bool {
+    let units = bytes.len() / 2;
+    let ascii = bytes.as_chunks::<2>().0.iter().filter(|&&[lo, hi]| lo != 0 && hi == 0).count();
+    ascii >= 2 && ascii * 4 >= units
 }
 
 /// What `wsl.exe --version` said.
@@ -261,18 +284,24 @@ fn listed_by(cmd: &mut Command, limit: Duration) -> Option<Vec<String>> {
     Some(wsl_text(&o.stdout).lines().map(|l| l.trim().to_owned()).filter(|l| !l.is_empty()).collect())
 }
 
-/// Whether a failed `wsl.exe -l` said there is nothing to list, rather than
-/// that WSL did not answer. Its error codes read the same in every language;
-/// the NULs go so they match in UTF-16 too, whatever wsl_text makes of the
-/// translated text around them.
-fn nothing_listed(out: &[u8]) -> bool {
+/// Whether WSL's output carries one of its error codes. They are ASCII and
+/// read the same in every language: with the NULs gone they match in UTF-16
+/// at any length or offset, and in UTF-8, whatever the translated text
+/// around them.
+fn wsl_says(out: &[u8], codes: &[&str]) -> bool {
     let text = String::from_utf8_lossy(out).replace('\0', "");
-    ["WSL_E_DEFAULT_DISTRO_NOT_FOUND", "WSL_E_WSL_OPTIONAL_COMPONENT_REQUIRED"].iter().any(|code| text.contains(code))
+    codes.iter().any(|code| text.contains(code))
+}
+
+/// Whether a failed `wsl.exe -l` said there is nothing to list, rather than
+/// that WSL did not answer.
+fn nothing_listed(out: &[u8]) -> bool {
+    wsl_says(out, &["WSL_E_DEFAULT_DISTRO_NOT_FOUND", "WSL_E_WSL_OPTIONAL_COMPONENT_REQUIRED"])
 }
 
 /// Whether WSL's output says its optional component is off.
 fn component_required(out: &[u8]) -> bool {
-    String::from_utf8_lossy(out).replace('\0', "").contains("WSL_E_WSL_OPTIONAL_COMPONENT_REQUIRED")
+    wsl_says(out, &["WSL_E_WSL_OPTIONAL_COMPONENT_REQUIRED"])
 }
 
 /// Whether `wsl.exe -l -q` failed because WSL's optional component is off.
@@ -319,28 +348,7 @@ fn needs_setup(done: bool, distro: Option<&str>, listed: impl FnOnce() -> Option
 /// The step to show now, from what is on this PC, and why WSL did not
 /// answer when it didn't.
 fn current_step(s: &Saved) -> (&'static str, Option<String>) {
-    let silent = match wsl_answer() {
-        Wsl::Missing => return ("welcome", None),
-        Wsl::There => None,
-        Wsl::Silent(why) => Some(why),
-    };
-    if let Some(at) = s.restart_after {
-        if !restarted_since(at) {
-            return ("restart", None);
-        }
-    }
-    // Not answering is not missing: Choose a Linux, saying why, rather than
-    // Install WSL (or asking for its distros, which would hang too).
-    if silent.is_some() {
-        return ("choose", silent);
-    }
-    // wsl.exe answers, but WSL's optional component is off (a setup before
-    // this one turned on Virtual Machine Platform alone): no distro would
-    // import, so step 1 again, which turns the components on.
-    if components_off() {
-        return ("welcome", None);
-    }
-    let step = match &s.distro {
+    step_from(wsl_answer(), s, restarted_since, components_off, || match &s.distro {
         Some(d) if distros().is_some_and(|l| l.iter().any(|x| x == d)) => {
             if crate::client::alive() {
                 "tools"
@@ -349,8 +357,41 @@ fn current_step(s: &Saved) -> (&'static str, Option<String>) {
             }
         }
         _ => "choose",
+    })
+}
+
+/// What setup turned on and a restart did not bring.
+const COMPONENTS_STILL_OFF: &str = "WSL's optional components are still off after Windows restarted. Check that Windows Subsystem for Linux and Virtual Machine Platform are on in Windows Features, then try again";
+
+/// current_step from what WSL answered, with the PC's checks passed in:
+/// `restarted` (since a time), `components_off`, and `installed`, the step
+/// for a WSL that is ready.
+fn step_from(answer: Wsl, s: &Saved, restarted: impl Fn(u64) -> bool, components_off: impl FnOnce() -> bool, installed: impl FnOnce() -> &'static str) -> (&'static str, Option<String>) {
+    let silent = match answer {
+        Wsl::Missing => return ("welcome", None),
+        Wsl::There => None,
+        Wsl::Silent(why) => Some(why),
     };
-    (step, None)
+    if let Some(at) = s.restart_after
+        && !restarted(at)
+    {
+        return ("restart", None);
+    }
+    // Not answering is not missing: Choose a Linux, saying why, rather than
+    // Install WSL (or asking for its distros, which would hang too).
+    if silent.is_some() {
+        return ("choose", silent);
+    }
+    // wsl.exe answers, but WSL's optional component is off (a setup before
+    // this one turned on Virtual Machine Platform alone): no distro would
+    // import, so step 1 again, which turns the components on. When setup
+    // turned them on already and Windows has restarted since, step 1 says
+    // so rather than only asking again.
+    if components_off() {
+        let why = s.components_on_at.is_some_and(&restarted).then(|| COMPONENTS_STILL_OFF.to_owned());
+        return ("welcome", why);
+    }
+    (installed(), None)
 }
 
 /// `existing_ubuntu`: whether WSL lists an Ubuntu, asked only of a WSL that answered.
@@ -556,64 +597,93 @@ fn elevated(args: &[&str]) -> io::Result<i32> {
 }
 
 /// What a `kiri-admin.ps1 -Wsl` or `-Components` exit code says went
-/// wrong; None when it succeeded (0, or 3010: Windows must restart).
+/// wrong; None when it succeeded (0, or 3010: Windows must restart). Codes
+/// the script does not give a meaning of its own are dism.exe's, passed
+/// through.
 fn admin_wsl_failed(code: i32) -> Option<String> {
     Some(match code {
         0 | 3010 => return None,
         22 => "the downloaded WSL installer changed on disk; try again".into(),
         23 => "the WSL installer is not validly signed by Microsoft".into(),
-        24 => "Windows could not turn on WSL's optional components (is virtualization on in the BIOS?)".into(),
+        24 => "Windows could not turn on WSL's optional components (dism.exe failed)".into(),
         21 => "the WSL installer failed".into(),
-        other => format!("the administrator step failed (exit code {other})"),
+        1 => "the administrator step failed (exit code 1)".into(),
+        // An HRESULT (0x800F...) reads as one; a Win32 code as a number.
+        dism if dism < 0 => format!("Windows could not turn on WSL's optional components (dism.exe exit code {dism:#010X})"),
+        dism => format!("Windows could not turn on WSL's optional components (dism.exe exit code {dism})"),
     })
+}
+
+/// Step 1's elevated run: with WSL's installer when WSL is not installed,
+/// or, when wsl.exe answers already, its optional components alone.
+fn admin_args(msi: Option<&str>) -> Vec<&str> {
+    match msi {
+        Some(msi) => vec!["-Wsl", "-Msi", msi, "-Sha256", WSL_MSI.sha256],
+        None => vec!["-Components"],
+    }
+}
+
+/// Whether step 1 ends at the restart rather than at Choose a Linux, once
+/// the elevated run succeeded: Windows asked for one (3010), WSL does not
+/// answer yet, or its optional components still read as off (they take
+/// effect at the restart).
+fn restart_after_admin(code: i32, answers: impl FnOnce() -> bool, components_off: impl FnOnce() -> bool) -> bool {
+    code == 3010 || !answers() || components_off()
 }
 
 /// Step 1: download WSL, then in one elevated run turn on WSL's optional
 /// components and install WSL; or, when WSL is installed already, turn on
 /// the components alone. Exit 3010 means a restart.
 fn install_wsl() -> io::Result<()> {
-    update(|s| s.tasks = tasks(&[tr("Download WSL"), tr("Administrator approval"), tr("Turn on Virtual Machine Platform"), tr("Install WSL")]));
+    // WSL already answers, so only its optional components are off (see
+    // current_step): turn them on, with no installer to download or run.
+    let components_only = wsl_answer() == Wsl::There;
+    // Task indexes: Download WSL and Install WSL only with the installer.
+    let (approval, components, install) = if components_only {
+        update(|s| s.tasks = tasks(&[tr("Administrator approval"), tr("Turn on Virtual Machine Platform")]));
+        (0, 1, None)
+    } else {
+        update(|s| s.tasks = tasks(&[tr("Download WSL"), tr("Administrator approval"), tr("Turn on Virtual Machine Platform"), tr("Install WSL")]));
+        (1, 2, Some(3))
+    };
     // WSL_MSI is this build's architecture's; on another PC it would not install.
     if let Some(e) = crate::win::arch_mismatch() {
         return Err(io::Error::other(e));
     }
-    // WSL already answers, so only its optional components are off (see
-    // current_step): turn them on, with no installer to download or run.
-    let msi = if wsl_answer() == Wsl::There {
-        task(0, "done", "");
-        None
-    } else {
-        Some(download(&WSL_MSI, 0)?)
-    };
+    let msi = if components_only { None } else { Some(download(&WSL_MSI, 0)?) };
     update(|s| s.progress = Some(json!({"pct": null, "done": null, "total": null, "rate": null, "eta": null, "label": tr("Waiting for Windows' approval")})));
-    task(1, "active", &tr("Windows is asking"));
+    task(approval, "active", &tr("Windows is asking"));
     // The downloaded MSI lives in a user-writable folder, so a process at
     // the user's own integrity could swap it between its SHA-256 check above
     // and the elevated install. kiri-admin.ps1 -Wsl re-verifies it, as admin,
     // on a copy the user cannot touch, and requires it to be Microsoft-signed,
     // before running it; its exit codes are read below.
-    let code = match &msi {
-        Some(msi) => elevated(&["-Wsl", "-Msi", &msi.to_string_lossy(), "-Sha256", WSL_MSI.sha256])?,
-        None => elevated(&["-Components"])?,
-    };
-    task(1, "done", &tr("approved"));
+    let msi_path = msi.as_ref().map(|m| m.to_string_lossy().into_owned());
+    let code = elevated(&admin_args(msi_path.as_deref()))?;
+    task(approval, "done", &tr("approved"));
     match code {
-        24 => task(2, "error", ""),
+        0 | 3010 | 1 | 22 | 23 => {}
         21 => {
-            task(2, "done", "");
-            task(3, "error", "");
+            task(components, "done", "");
+            if let Some(i) = install {
+                task(i, "error", "");
+            }
         }
-        _ => {}
+        _ => task(components, "error", ""),
     }
     if let Some(why) = admin_wsl_failed(code) {
         return Err(io::Error::other(why));
     }
-    task(2, "done", "");
-    task(3, "done", "");
-    // Just installed and not answering yet: most likely waiting for the restart too.
-    if code == 3010 || wsl_answer() != Wsl::There {
+    task(components, "done", "");
+    if let Some(i) = install {
+        task(i, "done", "");
+    }
+    // Just installed and not answering yet, or the components not on until
+    // Windows restarts: the restart step.
+    if restart_after_admin(code, || wsl_answer() == Wsl::There, components_off) {
         let mut s = saved();
         s.restart_after = Some(now_secs());
+        s.components_on_at = s.restart_after;
         save(&s);
         // After the restart, Kiri opens once by itself and carries on.
         if let Ok(exe) = std::env::current_exe() {
@@ -1016,16 +1086,53 @@ mod tests {
         for m in &messages {
             assert_eq!(super::wsl_text(&utf16(m)), *m, "UTF-16: {m}");
             assert_eq!(super::wsl_text(m.as_bytes()), *m, "UTF-8: {m}");
+            // With a byte-order mark: the mark goes.
+            assert_eq!(super::wsl_text(&[&[0xFF, 0xFE][..], &utf16(m)].concat()), *m, "UTF-16 BOM: {m}");
+            // Cut short at an odd byte (killed at its limit): no NULs left,
+            // and the code still reads.
+            let mut cut = utf16(m);
+            cut.truncate(cut.len() - 3);
+            let got = super::wsl_text(&cut);
+            assert!(!got.contains('\0') && m.starts_with(&got) && got.len() + 2 >= m.len(), "odd UTF-16: {got:?}");
+            assert!(super::nothing_listed(&cut) && super::component_required(&cut), "{m}");
+            assert!(super::nothing_listed(&utf16(m)) && super::component_required(&utf16(m)), "{m}");
         }
+        // A distro list cut short at an odd byte keeps its last letter.
+        assert_eq!(super::wsl_text(&utf16("kiri\r\nUbuntu")[..23]), "kiri\r\nUbuntu");
+        // UTF-16 with no ASCII and no BOM is byte for byte valid UTF-8: only
+        // the mark tells it apart.
+        assert_eq!(super::wsl_text(&[&[0xFF, 0xFE][..], &utf16("ぁぃぅ")].concat()), "ぁぃぅ");
     }
 
     #[test]
     fn linux_output_stays_utf8() {
         // What a Linux command run through wsl.exe prints is UTF-8, colour
         // codes and all, whatever its length.
-        for m in ["\x1b[31merror:\x1b[0m kiri-start: no such file\n", "\x1b[1mok\x1b[0m\r\n", "Für\n", "Für\r\n", "Для\r\n"] {
-            assert_eq!(super::wsl_text(m.as_bytes()), m);
+        for m in [
+            "\x1b[31merror:\x1b[0m kiri-start: no such file\n",
+            "\x1b[1mok\x1b[0m\r\n",
+            "Für\n",
+            "Für\r\n",
+            "Для\r\n",
+            // Even lengths with a terminal title (BEL), a spinner (BS), DEL,
+            // a C1 control and a literal replacement character.
+            "\x1b]0;kiri\x07ok\n",
+            "\x1b]8;;https://x\x07link\x1b]8;;\x07\n",
+            "|\x08/\x08-ok\n",
+            "a\x7fb\n",
+            "\u{9b}31mred\n",
+            "\u{fffd} ok\n",
+        ] {
+            assert_eq!(super::wsl_text(m.as_bytes()), m, "{m:?}");
         }
+        // An invalid byte, even length: the rest stays as it was.
+        assert_eq!(super::wsl_text(b"ok \xff done\n"), "ok \u{fffd} done\n");
+        // A stray NUL in UTF-8, at an odd offset or not, even length or odd: dropped.
+        assert_eq!(super::wsl_text(b"o\0k\n"), "ok\n");
+        assert_eq!(super::wsl_text(b"error: \0 at the end\n"), "error:  at the end\n");
+        assert_eq!(super::wsl_text(b"error: \0at the end\n"), "error: at the end\n");
+        // A UTF-8 BOM goes too.
+        assert_eq!(super::wsl_text("\u{feff}ok\n".as_bytes()), "ok\n");
     }
 
     #[test]
@@ -1044,24 +1151,109 @@ mod tests {
         ADMIN_SCRIPT.lines().filter(|l| !l.trim_start().starts_with('#'))
     }
 
+    /// The code of the script's `if (<mode>) { ... }` block, up to the
+    /// next blank line.
+    fn admin_block(mode: &str) -> String {
+        let open = format!("if (${mode}) {{");
+        admin_code().skip_while(|l| !l.starts_with(&open)).take_while(|l| !l.trim().is_empty()).collect::<Vec<_>>().join("\n")
+    }
+
     #[test]
     fn the_admin_script_turns_on_both_wsl_components() {
         let feature = |name: &str| admin_code().any(|l| l.contains(&format!("'/featurename:{name}'")));
         assert!(feature("Microsoft-Windows-Subsystem-Linux"), "kiri-admin.ps1 must turn on the Subsystem for Linux component");
         assert!(feature("VirtualMachinePlatform"), "kiri-admin.ps1 must turn on Virtual Machine Platform");
+        let args = admin_code().find(|l| l.starts_with("$featureArgs = ")).unwrap_or_default();
+        for a in ["'/online'", "'/enable-feature'", "'/all'", "'/norestart'"] {
+            assert!(args.contains(a), "$featureArgs lacks {a}");
+        }
+        assert!(admin_code().any(|l| l.contains("[switch]$Components")), "kiri-admin.ps1 has no -Components");
+        // Both modes run dism.exe with those arguments, and pass its code on.
+        for mode in ["Wsl", "Components"] {
+            let block = admin_block(mode);
+            assert!(block.contains(r#"System32\dism.exe" -ArgumentList $featureArgs"#), "-{mode} does not run dism.exe with $featureArgs:\n{block}");
+            assert!(block.contains("exit (DismFailed $features)"), "-{mode} does not pass dism.exe's code on:\n{block}");
+        }
+        assert!(admin_block("Components").contains("if ($features -eq 0 -or $features -eq 3010) { exit $features }"));
+    }
+
+    #[test]
+    fn the_admin_script_takes_one_mode_per_run() {
+        let check = admin_code().position(|l| l.contains("@($Wsl.IsPresent, $Components.IsPresent, $Dns.IsPresent) -eq $true).Count -ne 1) { throw"));
+        let first_mode = admin_code().position(|l| l.starts_with("if ($Wsl) {"));
+        assert!(check.is_some() && check < first_mode, "kiri-admin.ps1 must refuse two modes before running either");
     }
 
     #[test]
     fn every_admin_script_exit_code_is_read() {
         assert_eq!(super::admin_wsl_failed(0), None);
         assert_eq!(super::admin_wsl_failed(3010), None);
-        let codes: Vec<i32> = admin_code().flat_map(|l| l.split("exit ").skip(1)).filter_map(|rest| rest.split(|c: char| !c.is_ascii_digit()).next()?.parse().ok()).collect();
-        assert!(codes.contains(&24), "{codes:?}");
-        for code in codes.into_iter().filter(|c| *c != 0 && *c != 3010) {
+        // Every `exit` in the script's code, any case, inline comments and
+        // strings aside: a number, or dism.exe's own code passed on.
+        let mut codes = Vec::new();
+        for line in admin_code() {
+            let mut quote = None;
+            let code: String = line.chars().take_while(|&c| {
+                match (quote, c) {
+                    (None, '#') => return false,
+                    (None, '\'' | '"') => quote = Some(c),
+                    (Some(q), c) if c == q => quote = None,
+                    _ => {}
+                }
+                true
+            }).collect();
+            let lower = code.to_ascii_lowercase();
+            let words: Vec<&str> = lower.split(|c: char| c.is_whitespace() || c == ';' || c == '{' || c == '}').filter(|w| !w.is_empty()).collect();
+            for pair in words.windows(2).filter(|w| w[0] == "exit") {
+                match pair[1].parse::<i32>() {
+                    Ok(n) => codes.push(n),
+                    Err(_) => assert!(matches!(pair[1], "$features" | "(dismfailed"), "kiri-admin.ps1 exits with {:?}: {line}", pair[1]),
+                }
+            }
+            assert!(!words.last().is_some_and(|w| *w == "exit"), "a bare exit: {line}");
+        }
+        assert!(codes.contains(&21) && codes.contains(&22) && codes.contains(&23), "{codes:?}");
+        for code in codes.into_iter().chain([24]).filter(|c| *c != 0 && *c != 3010) {
             let why = super::admin_wsl_failed(code).unwrap_or_default();
             assert!(!why.is_empty() && !why.contains("administrator step"), "exit {code} from kiri-admin.ps1 has no message of its own");
         }
         assert!(super::admin_wsl_failed(1).is_some_and(|w| w.contains("exit code 1")));
+        // dism.exe's code, passed on, is shown, and does not blame the BIOS.
+        assert_eq!(super::admin_wsl_failed(0x800F_081Fu32 as i32).as_deref(), Some("Windows could not turn on WSL's optional components (dism.exe exit code 0x800F081F)"));
+        assert_eq!(super::admin_wsl_failed(50).as_deref(), Some("Windows could not turn on WSL's optional components (dism.exe exit code 50)"));
+        assert!(!super::admin_wsl_failed(24).unwrap_or_default().contains("BIOS"));
+    }
+
+    #[test]
+    fn step_one_turns_on_the_components_alone_for_an_installed_wsl() {
+        use super::{admin_args, restart_after_admin, step_from, Saved, Wsl, COMPONENTS_STILL_OFF};
+        assert_eq!(admin_args(None), ["-Components"]);
+        assert_eq!(admin_args(Some(r"C:\wsl.msi")), ["-Wsl", "-Msi", r"C:\wsl.msi", "-Sha256", super::WSL_MSI.sha256]);
+
+        let ready = || "engine";
+        let never = |_: u64| false;
+        let always = |_: u64| true;
+        let fresh = Saved::default();
+        // No WSL: step 1, without asking about components.
+        assert_eq!(step_from(Wsl::Missing, &fresh, always, || panic!("asked"), ready), ("welcome", None));
+        // WSL answers but its component is off: step 1 again.
+        assert_eq!(step_from(Wsl::There, &fresh, always, || true, ready), ("welcome", None));
+        assert_eq!(step_from(Wsl::There, &fresh, always, || false, ready), ("engine", None));
+        // Turned on, and waiting for the restart: the restart step.
+        let waiting = Saved { restart_after: Some(5), components_on_at: Some(5), ..Saved::default() };
+        assert_eq!(step_from(Wsl::There, &waiting, never, || panic!("asked"), ready), ("restart", None));
+        // Restarted and still off: step 1, saying so.
+        assert_eq!(step_from(Wsl::There, &waiting, always, || true, ready), ("welcome", Some(COMPONENTS_STILL_OFF.to_owned())));
+        assert_eq!(step_from(Wsl::There, &waiting, always, || false, ready), ("engine", None));
+        // Silent: Choose a Linux, saying why.
+        assert_eq!(step_from(Wsl::Silent("slow".into()), &fresh, always, || panic!("asked"), ready), ("choose", Some("slow".into())));
+
+        // After the elevated run: restart on 3010, on a WSL that does not
+        // answer, or when the components still read as off.
+        assert!(restart_after_admin(3010, || panic!("asked"), || panic!("asked")));
+        assert!(restart_after_admin(0, || false, || panic!("asked")));
+        assert!(restart_after_admin(0, || true, || true));
+        assert!(!restart_after_admin(0, || true, || false));
     }
 
     #[test]
