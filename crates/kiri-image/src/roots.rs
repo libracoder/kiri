@@ -12,7 +12,10 @@
 //! set has it: "Never Trust" in the user or admin trust settings on macOS,
 //! the Disallowed store on Windows. Linux has no such list to read (a root
 //! is distrusted there by taking it out of the bundle), so a Mozilla root
-//! removed from `/etc/ssl` is still trusted through the bundled set.
+//! removed from `/etc/ssl` is still trusted through the bundled set. A
+//! distrusted root is matched by subject and public key, so a re-issued
+//! copy of it goes too. With `KIRI_TLS_ROOTS=webpki` nothing is read from
+//! the system, distrusted roots included: the bundled set is used as it is.
 //!
 //! On Windows the engine runs in WSL, away from the Windows store: kiri-win
 //! sends the daemon the Windows roots the bundled set lacks and the
@@ -70,13 +73,61 @@ pub fn bundled() -> &'static [CertificateDer<'static>] {
     webpki_root_certs::TLS_SERVER_ROOT_CERTS
 }
 
-/// `roots` without any certificate in `distrusted` (the same DER).
+/// The subject and public key of a certificate (their DER, as written in
+/// it): what names a root, as opposed to one issue of it. None when `der`
+/// is not a certificate this can read.
+fn identity(der: &[u8]) -> Option<(&[u8], &[u8])> {
+    // One DER element: (tag, content, what follows).
+    fn element(b: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+        let (&tag, rest) = b.split_first()?;
+        let (&first, rest) = rest.split_first()?;
+        let (len, rest) = if first < 0x80 {
+            (usize::from(first), rest)
+        } else {
+            let n = usize::from(first & 0x7f);
+            if n == 0 || n > 4 || rest.len() < n {
+                return None;
+            }
+            (rest[..n].iter().fold(0usize, |a, &x| a << 8 | usize::from(x)), &rest[n..])
+        };
+        (rest.len() >= len).then(|| (tag, &rest[..len], &rest[len..]))
+    }
+    // Certificate ::= SEQUENCE { tbsCertificate SEQUENCE { [0] version
+    // OPTIONAL, serial, signature, issuer, validity, subject, spki, ... } }
+    let (_, cert, _) = element(der)?;
+    let (_, tbs, _) = element(cert)?;
+    let mut rest = tbs;
+    if element(rest)?.0 == 0xa0 {
+        rest = element(rest)?.2;
+    }
+    // Serial number, signature algorithm, issuer, validity.
+    for _ in 0..4 {
+        rest = element(rest)?.2;
+    }
+    let subject = &rest[..rest.len() - element(rest)?.2.len()];
+    rest = element(rest)?.2;
+    let spki = &rest[..rest.len() - element(rest)?.2.len()];
+    Some((subject, spki))
+}
+
+/// Whether `a` and `b` are the same root: the same subject and public key,
+/// so a re-issued copy of a distrusted root (new dates, same key) is it
+/// too. Certificates this cannot read are compared whole.
+fn same_root(a: &CertificateDer<'_>, b: &CertificateDer<'_>) -> bool {
+    match (identity(a), identity(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => a == b,
+    }
+}
+
+/// `roots` without any certificate that is one of `distrusted`: the same
+/// root by subject and public key, whichever issue of it.
 pub fn without(
     mut roots: Vec<CertificateDer<'static>>,
     distrusted: &[CertificateDer<'static>],
 ) -> Vec<CertificateDer<'static>> {
     if !distrusted.is_empty() {
-        roots.retain(|c| !distrusted.contains(c));
+        roots.retain(|c| !distrusted.iter().any(|d| same_root(c, d)));
     }
     roots
 }
@@ -371,6 +422,21 @@ mod tests {
         let got = guarded(|| vec![cert(1)]);
 
         assert_eq!(got, vec![cert(1)]);
+    }
+
+    #[test]
+    fn a_reissued_copy_of_a_distrusted_root_is_removed_too() {
+        let root = bundled()[0].clone();
+        // Same subject and key, different bytes: another issue of the root.
+        let mut other = root.as_ref().to_vec();
+        *other.last_mut().unwrap() ^= 0xff;
+        let reissued = CertificateDer::from(other);
+        assert_ne!(reissued, root);
+        assert!(identity(&root).is_some(), "the bundled roots are readable");
+        let kept = without(vec![reissued.clone(), bundled()[1].clone()], &[root.clone()]);
+        assert_eq!(kept, vec![bundled()[1].clone()]);
+        // Unreadable entries fall back to whole-certificate comparison.
+        assert_eq!(without(vec![cert(1), cert(2)], &[cert(2)]), vec![cert(1)]);
     }
 
     #[test]

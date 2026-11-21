@@ -148,7 +148,7 @@ fn engine(rx: &Receiver<Cmd>, tx: Sender<Cmd>) {
     // minute.
     std::thread::spawn(|| loop {
         send_windows_proxy();
-        send_windows_roots();
+        send_windows_roots(false);
         std::thread::sleep(Duration::from_secs(60));
     });
     let mut pending: Option<Cmd> = None;
@@ -291,7 +291,7 @@ fn bring_up(launch: bool) {
     match woken {
         Ok(woken) => {
             // Before the first pull, not up to a minute after.
-            std::thread::spawn(send_windows_roots);
+            std::thread::spawn(|| send_windows_roots(true));
             if woken {
                 std::thread::spawn(ensure_builder);
             }
@@ -946,6 +946,14 @@ fn allowed_url(url: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn roots_are_sent_when_they_change_or_the_engine_is_new() {
+        assert!(super::roots_need_sending(None, "a", false));
+        assert!(!super::roots_need_sending(Some("a"), "a", false));
+        assert!(super::roots_need_sending(Some("a"), "b", false));
+        assert!(super::roots_need_sending(Some("a"), "a", true));
+    }
+
     use super::{allowed_url, unanswered, wakes};
     use std::io::ErrorKind;
 
@@ -1448,12 +1456,32 @@ pub(crate) fn send_windows_proxy() {
 /// The Windows store's root certificates for the daemon in WSL (#303): the
 /// ones the bundled set lacks (a company root, Group Policy's) and the
 /// Disallowed ones, so pulls trust what Windows trusts, as on the Mac.
-/// The daemon keeps them, and only acts on a change.
-pub(crate) fn send_windows_roots() {
+/// The daemon keeps them and only acts on a change, so they are sent when
+/// they differ from what was last sent, or when `force` (the engine has just
+/// started, and may be a new one).
+pub(crate) fn send_windows_roots(force: bool) {
+    static SENT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
     let host = crate::roots::host_export();
     let list = |l: &[rustls_pki_types::CertificateDer<'static>]| l.iter().map(|c| crate::roots::hex(c)).collect::<Vec<_>>();
     let body = json!({"certs": list(&host.certs), "distrusted": list(&host.distrusted)});
-    let _ = client::request("PUT", "/kiri/roots/host", Some(&body));
+    let digest = {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(body.to_string().as_bytes()).iter().map(|b| format!("{b:02x}")).collect::<String>()
+    };
+    let mut last = SENT.lock().unwrap_or_else(|e| e.into_inner());
+    if !roots_need_sending(last.as_deref(), &digest, force) {
+        return;
+    }
+    // Kept only once the daemon took them, so a failed send is tried again.
+    if client::request("PUT", "/kiri/roots/host", Some(&body)).is_ok_and(|r| r.ok()) {
+        *last = Some(digest);
+    }
+}
+
+/// Whether the roots with `digest` go to the daemon: they changed since
+/// `last` was sent, nothing was sent yet, or `force`.
+fn roots_need_sending(last: Option<&str>, digest: &str, force: bool) -> bool {
+    force || last != Some(digest)
 }
 
 /// Settings → Domains: reads (or moves, then reads) the routers' ports. The

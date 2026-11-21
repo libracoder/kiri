@@ -124,14 +124,14 @@ Kiri trusts the root certificates of the operating system and the Mozilla set th
 A root certificate that an administrator distrusts stays distrusted, even though the bundled Mozilla set has it:
 
 - **macOS**: "Never Trust" in the user or admin trust settings. Settings in the system domain are not read.
-- **Windows**: the certificates in the Disallowed store, for Kiri Share and for pulls in the engine.
+- **Windows**: the certificates in the Disallowed store, for Kiri Share and for pulls in the engine (only the engine in WSL takes the Windows roots; a native Linux engine refuses them). A re-issued copy of a distrusted root, with the same subject and public key, is distrusted too.
 - **Linux**: there is no list of distrusted certificates to read. A Mozilla root certificate that you remove from the system bundle (for example with `!` in `/etc/ca-certificates.conf`) is still trusted through the bundled set.
 
 Kiri compares the exact certificate, and does not check revocation (CRL or OCSP).
 
 NOTE: If `SSL_CERT_FILE` or `SSL_CERT_DIR` is set, Kiri reads the root certificates there instead of the system store, as OpenSSL does. The bundled Mozilla set stays in use, so these variables add root certificates and cannot limit trust to a private CA only. Kiri writes a warning when this occurs, and a company CA trusted in the keychain or system store is then not trusted.
 
-If the system store causes a problem, set `KIRI_TLS_ROOTS=webpki`. Kiri then trusts only the bundled Mozilla set, as before. The Kiri app and the daemon do not read your shell environment; set the variable for them and restart Kiri:
+If the system store causes a problem, set `KIRI_TLS_ROOTS=webpki`. Kiri then trusts only the bundled Mozilla set, as before: nothing is read from the system, so the roots an administrator distrusted are trusted again too. The Kiri app and the daemon do not read your shell environment; set the variable for them and restart Kiri:
 
 - **macOS**: `launchctl setenv KIRI_TLS_ROOTS webpki`
 - **Linux**: `sudo systemctl edit kiri`, add `Environment=KIRI_TLS_ROOTS=webpki` under `[Service]`, then `sudo systemctl restart kiri`.

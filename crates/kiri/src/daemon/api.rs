@@ -154,6 +154,11 @@ fn route(req: &Request, engine: &Arc<Engine>, w: &mut UnixStream, r: &mut BufRea
         // kiri-win's Windows roots, for the engine in WSL (#303).
         #[cfg(target_os = "linux")]
         ("PUT", "/kiri/roots/host") => {
+            // Only the engine in WSL takes them: a native Linux daemon has
+            // its own store.
+            if !super::hostroots::in_wsl() {
+                return reply(w, Err(Error::BadRequest("the Windows roots are for the engine in WSL".into())), 200);
+            }
             let set = serde_json::from_slice(&req.body).map_err(|e| Error::BadRequest(format!("invalid JSON: {e}"))).and_then(|b| super::hostroots::set(&b).map_err(Error::Io));
             return reply(w, set, 200);
         }
