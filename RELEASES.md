@@ -27,7 +27,7 @@ maker's own build machines.
      (the VM's guest, the signed app, the disk image; all in `xtask/`), then
      Apple's notarization (`xcrun notarytool`)
    - Windows: `cargo xtask msi` (the installer, from `installer/windows`)
-   - Linux: `scripts/ci/linux-build.sh` (all `.deb` and `.rpm` packages),
+   - Linux: `scripts/ci/linux-build.sh` (all `.deb` and `.rpm` packages, and the AppImage),
      then `packaging/linux/test-host.sh`, which installs them on Ubuntu and
      Fedora and runs containers through them. A build that doesn't install
      and run isn't released.

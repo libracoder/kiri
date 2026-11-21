@@ -158,8 +158,6 @@ pub mod onboarding {
     use std::process::{Command, Stdio};
 
     const SOCKET: &str = crate::client::SERVICE_SOCKET;
-    /// The package's command; pkexec wants a full path.
-    const KIRI: &str = "/usr/bin/kiri";
 
     /// Each check's state for the page: "ok", "no" (fix it), "bad" (broken:
     /// fix it), "off" (can't tell until an earlier one passes) or "restart"
@@ -169,7 +167,9 @@ pub mod onboarding {
     pub fn checks() -> serde_json::Value {
         let installed = ["/lib/systemd/system/kiri.service", "/usr/lib/systemd/system/kiri.service", "/etc/systemd/system/kiri.service"]
             .iter()
-            .any(|p| Path::new(p).exists());
+            .any(|p| Path::new(p).exists())
+            // The AppImage carries the engine; "Start engine" installs it.
+            || crate::hostaccess::appdir().is_some();
         let (running, access) = match std::os::unix::net::UnixStream::connect(SOCKET) {
             Ok(_) => ("ok", "ok"),
             // The engine is there; this session may not use it. In the group
@@ -252,7 +252,20 @@ pub mod onboarding {
         if which("pkexec").is_none() {
             return Err(io::Error::other(format!("this system has no pkexec to ask for your password: in a terminal, run  sudo kiri host-access {}{user}", flags.iter().map(|f| format!("{f} ")).collect::<String>())));
         }
-        let out = Command::new("pkexec").arg(KIRI).arg("host-access").args(flags).arg(&user).stdin(Stdio::null()).output()?;
+        // Root can't read the AppImage's mount, so pkexec runs the AppImage file itself.
+        let mut cmd = Command::new("pkexec");
+        match std::env::var_os("APPIMAGE").filter(|_| crate::hostaccess::appdir().is_some()) {
+            Some(appimage) => {
+                cmd.arg(appimage);
+                if std::env::var_os("APPIMAGE_EXTRACT_AND_RUN").is_some() {
+                    cmd.arg("--appimage-extract-and-run");
+                }
+            }
+            None => {
+                cmd.arg("/usr/bin/kiri");
+            }
+        }
+        let out = cmd.arg("host-access").args(flags).arg(&user).stdin(Stdio::null()).output()?;
         match out.status.code() {
             Some(0) | Some(10) => Ok(()),
             // pkexec: 126 the dialog was dismissed or the password refused, 127 not allowed.
