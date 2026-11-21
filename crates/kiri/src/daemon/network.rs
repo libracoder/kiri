@@ -688,9 +688,7 @@ impl Networks {
                 used: BTreeSet::new(),
             })
         } else {
-            if s.ipam6.is_some() {
-                return Err("invalid network config: an IPv6 subnet needs IPv6 enabled (--ipv6, Compose enable_ipv6: true)".into());
-            }
+            // An IPv6 IPAM entry without --ipv6 is ignored, as Docker does (#433).
             None
         };
         let index = (1..).find(|i| !self.list.iter().any(|n| n.bridge == format!("kiri{i}"))).expect("unbounded");
@@ -1004,9 +1002,9 @@ mod tests {
         assert_eq!(kv.subnet_str(), "fc00:f853:ccd:e793::/64");
         assert_eq!(ip6_str(kv.gateway), "fc00:f853:ccd:e793::1");
         assert!(n.create("again", v6(ipam("fc00:f853:ccd:e793::/80"))).unwrap_err().contains("Pool overlaps"));
-        // A subnet without --ipv6 is refused, not dropped.
-        let no = Settings { ipam6: ipam("fd00:9::/64"), ..Default::default() };
-        assert!(n.create("no", no).unwrap_err().contains("IPv6 enabled"));
+        // A subnet without --ipv6 is ignored, not refused (#433).
+        let no = n.create("no", Settings { ipam6: ipam("fd00:9::/64"), ..Default::default() }).unwrap();
+        assert!(no.v6.is_none());
         // Fixed addresses: in the subnet, free, not the gateway.
         let want = parse_ip6("fc00:f853:ccd:e793::10");
         assert_eq!(n.allocate6("kind", want, &[]), Ok(want));
