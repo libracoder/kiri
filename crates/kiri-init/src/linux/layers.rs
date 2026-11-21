@@ -174,7 +174,7 @@ fn untar_in(reader: impl Read, dest: &Path, detect_userns: fn() -> bool) -> io::
     let mut total = 0u64;
     // Each directory's time, set once the layer is unpacked: tar-rs gives a
     // directory none, and what is unpacked into it later would move it.
-    let mut dir_times = std::collections::BTreeMap::new();
+    let mut dir_times = Vec::new();
     for entry in archive.entries()? {
         let mut entry = entry?;
         let path = entry.path()?.into_owned();
@@ -225,17 +225,125 @@ fn untar_in(reader: impl Read, dest: &Path, detect_userns: fn() -> bool) -> io::
             if entry.header().entry_type().is_dir()
                 && let Ok(mtime) = entry.header().mtime()
             {
-                dir_times.insert(path, mtime);
+                // By its plain names: `./usr` and `usr` are one directory.
+                let plain = path.components().filter(|c| matches!(c, std::path::Component::Normal(_))).collect();
+                dir_times.push((plain, mtime));
             }
         }
     }
     let root = inroot::open_root(dest)?;
-    // Deepest first, as Docker sets them (#676). A directory a later entry
-    // removed, or made something else, is skipped.
-    for (dir, mtime) in dir_times.iter().rev() {
-        let _ = set_dir_time(root.as_fd(), dir, *mtime);
-    }
+    set_dir_times(root.as_fd(), dir_times);
     Ok(total)
+}
+
+/// Sets each directory's time once the layer is unpacked (#676): deepest
+/// first, as Docker sets them, and the last entry's time for a directory
+/// named twice. One a later entry removed, or made something else, is
+/// skipped, and a time that can't be set doesn't fail the layer.
+fn set_dir_times(root: BorrowedFd<'_>, mut dirs: Vec<(PathBuf, u64)>) {
+    // By path, component by component, so a directory's subtree sits right
+    // after it, and stable, so a path named twice keeps its entries in
+    // archive order. Layers list their paths in this order already, which
+    // makes the sort a single pass.
+    dirs.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut walk = DirWalk::default();
+    let mut last: Option<&Path> = None;
+    // Backwards, every directory comes before its parent, and consecutive
+    // directories share most of their path, which `walk` opens only once.
+    for (dir, mtime) in dirs.iter().rev() {
+        if last == Some(dir.as_path()) {
+            continue;
+        }
+        last = Some(dir);
+        let _ = walk.set_time(root, dir, *mtime);
+    }
+}
+
+/// The most directories a [`DirWalk`] keeps open, so a layer nested deeper
+/// than this can't run the agent out of descriptors; deeper ones are opened
+/// for each path on their own.
+const DIR_WALK_KEEP: usize = 64;
+
+/// Finds directories inside a layer one name at a time, as the kernel walks
+/// a path but never through a symlink (one a later entry may have put
+/// there) and making nothing. The parents of the last directory stay open
+/// for the next one, which mostly shares them, so setting a time costs two
+/// lookups of one name each.
+#[derive(Default)]
+struct DirWalk {
+    /// The open parents of the last directory, from the layer root down.
+    open: Vec<(std::ffi::OsString, OwnedFd)>,
+}
+
+impl DirWalk {
+    /// Sets directory `rel`'s access and modification times to `mtime`.
+    fn set_time(&mut self, root: BorrowedFd<'_>, rel: &Path, mtime: u64) -> io::Result<()> {
+        let secs = i64::try_from(mtime).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "directory time out of range"))?;
+        let mut names = Vec::new();
+        for part in rel.components() {
+            match part {
+                std::path::Component::Normal(name) => names.push(name),
+                std::path::Component::CurDir | std::path::Component::RootDir => {}
+                _ => return Err(escapes()),
+            }
+        }
+        // The layer root itself keeps its time, as before.
+        let Some((name, parents)) = names.split_last() else {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "the layer root"));
+        };
+        let shared = self.open.iter().zip(parents).take_while(|((open, _), name)| open.as_os_str() == **name).count();
+        self.open.truncate(shared);
+        // Past the cap, the rest of the parents are walked with one
+        // descriptor at a time, kept only until the next step.
+        let mut deep: Option<OwnedFd> = None;
+        for part in &parents[shared..] {
+            let parent = match &deep {
+                Some(fd) => fd.as_fd(),
+                None => self.open.last().map_or(root, |(_, fd)| fd.as_fd()),
+            };
+            let fd = open_dir_nofollow(parent, part)?;
+            if deep.is_none() && self.open.len() < DIR_WALK_KEEP {
+                self.open.push((part.to_os_string(), fd));
+            } else {
+                deep = Some(fd);
+            }
+        }
+        let parent = match &deep {
+            Some(fd) => fd.as_fd(),
+            None => self.open.last().map_or(root, |(_, fd)| fd.as_fd()),
+        };
+        let name = sys::cstr(Path::new(name))?;
+        // Only a directory: not a symlink, which AT_SYMLINK_NOFOLLOW would
+        // give the time instead of its target, nor anything else a later
+        // entry put in the directory's place. Nothing else changes the layer
+        // while it unpacks.
+        // SAFETY: stat is plain data (all-zero is valid); a valid directory
+        // descriptor and a NUL-terminated name.
+        let st = unsafe {
+            let mut st: libc::stat = std::mem::zeroed();
+            sys::check(libc::fstatat(parent.as_raw_fd(), name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) as _, "stat directory")?;
+            st
+        };
+        if st.st_mode & libc::S_IFMT != libc::S_IFDIR {
+            return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
+        }
+        let time = libc::timespec { tv_sec: secs, tv_nsec: 0 };
+        // SAFETY: a valid directory descriptor, a NUL-terminated name and two timespecs.
+        let ret = unsafe { libc::utimensat(parent.as_raw_fd(), name.as_ptr(), [time, time].as_ptr(), libc::AT_SYMLINK_NOFOLLOW) };
+        sys::check(ret as _, "set directory time")?;
+        Ok(())
+    }
+}
+
+/// Opens directory `name` in `parent` with O_NOFOLLOW; a symlink, anything
+/// else that isn't a directory, and a name that isn't there are errors.
+fn open_dir_nofollow(parent: BorrowedFd<'_>, name: &std::ffi::OsStr) -> io::Result<OwnedFd> {
+    let name = sys::cstr(Path::new(name))?;
+    // SAFETY: a valid directory descriptor and a NUL-terminated name.
+    let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+    sys::check(fd as _, "open directory")?;
+    // SAFETY: a fresh descriptor nothing else owns.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 /// The file type of a device or fifo entry, which the tar crate would
@@ -327,32 +435,6 @@ pub(crate) fn keep_zero_time(dest: &Path, path: &Path, h: &tar::Header) -> io::R
     let t = [libc::timespec { tv_sec: 0, tv_nsec: 0 }, libc::timespec { tv_sec: 0, tv_nsec: 0 }];
     // SAFETY: a confined parent descriptor, a NUL-terminated name and two timespecs.
     sys::check(unsafe { libc::utimensat(parent.as_raw_fd(), name.as_ptr(), t.as_ptr(), libc::AT_SYMLINK_NOFOLLOW) } as _, "set time")?;
-    Ok(())
-}
-
-/// Sets directory `rel`'s access and modification times to `mtime`, opening
-/// each part of its path with O_NOFOLLOW: a symlink on the way, which a
-/// later entry may have put there, is not followed, and nothing is made.
-fn set_dir_time(root: BorrowedFd<'_>, rel: &Path, mtime: u64) -> io::Result<()> {
-    let mut dir = root.try_clone_to_owned()?;
-    for part in rel.components() {
-        let name = match part {
-            std::path::Component::Normal(name) => name,
-            std::path::Component::CurDir | std::path::Component::RootDir => continue,
-            _ => return Err(escapes()),
-        };
-        let name = sys::cstr(Path::new(name))?;
-        // SAFETY: a valid directory descriptor and a NUL-terminated name.
-        let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
-        sys::check(fd as _, "open directory")?;
-        // SAFETY: a fresh descriptor nothing else owns.
-        dir = unsafe { OwnedFd::from_raw_fd(fd) };
-    }
-    let secs = i64::try_from(mtime).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "directory time out of range"))?;
-    let time = libc::timespec { tv_sec: secs, tv_nsec: 0 };
-    // SAFETY: a valid descriptor and two timespecs.
-    let ret = unsafe { libc::futimens(dir.as_raw_fd(), [time, time].as_ptr()) };
-    sys::check(ret as _, "set directory time")?;
     Ok(())
 }
 
@@ -454,11 +536,92 @@ mod tests {
         // link on the way.
         std::os::unix::fs::symlink("/mnt", dest.join("swapped")).unwrap();
         let root = inroot::open_root(&dest).unwrap();
-        assert!(set_dir_time(root.as_fd(), Path::new("swapped"), 9).is_err());
-        assert!(set_dir_time(root.as_fd(), Path::new("swapped/x"), 9).is_err());
-        assert!(set_dir_time(root.as_fd(), Path::new("gone"), 9).is_err(), "nothing is made");
-        assert!(!dest.join("gone").exists());
+        // A walk that has the directories of the last path open, and one
+        // that starts fresh.
+        let mut walk = DirWalk::default();
+        walk.set_time(root.as_fd(), Path::new("usr/bin"), 2_000_000).unwrap();
+        for walk in [&mut walk, &mut DirWalk::default()] {
+            assert!(walk.set_time(root.as_fd(), Path::new("swapped"), 9).is_err());
+            assert!(walk.set_time(root.as_fd(), Path::new("swapped/x"), 9).is_err());
+            assert!(walk.set_time(root.as_fd(), Path::new("usr/bin/tool"), 9).is_err(), "a file");
+            assert!(walk.set_time(root.as_fd(), Path::new("gone"), 9).is_err(), "nothing is made");
+            assert!(walk.set_time(root.as_fd(), Path::new("usr/gone/x"), 9).is_err(), "nothing is made");
+            assert!(walk.set_time(root.as_fd(), Path::new("usr/../mnt"), 9).is_err());
+        }
+        assert!(!dest.join("gone").exists() && !dest.join("usr/gone").exists());
         assert_eq!(mtime("mnt"), 3_000_000, "the link's target keeps its own time");
+        assert_eq!(mtime("usr/bin/tool"), 4_000_000);
+        fs::remove_dir_all(dest).unwrap();
+    }
+
+    #[test]
+    fn directory_times_in_any_order_depth_and_kind() {
+        use std::os::unix::fs::MetadataExt;
+
+        let mut b = tar::Builder::new(Vec::new());
+        // `./dot`, then `dot/` further on (the tar crate's builder drops a
+        // leading `./`, so it is written by hand).
+        let mut h = header(0, 0o755);
+        h.as_gnu_mut().unwrap().name[..5].copy_from_slice(b"./dot");
+        h.set_entry_type(tar::EntryType::Directory);
+        h.set_mtime(7_000_000);
+        h.set_cksum();
+        b.append(&h, io::empty()).unwrap();
+        let mut add = |path: &str, kind: tar::EntryType, mtime: u64, link: Option<&str>| {
+            let mut h = header(0, if kind.is_symlink() { 0o777 } else { 0o755 });
+            h.set_entry_type(kind);
+            h.set_mtime(mtime);
+            match link {
+                Some(to) => b.append_link(&mut h, path, to).unwrap(),
+                None => {
+                    h.set_cksum();
+                    b.append_data(&mut h, path, io::empty()).unwrap();
+                }
+            }
+        };
+        let dir = tar::EntryType::Directory;
+        // Out of order, with names that sort between a directory and its
+        // children byte by byte ("a-c", "a.d" before "a/b").
+        add("a/b", dir, 2_000_000, None);
+        add("a-c", dir, 3_000_000, None);
+        add("a", dir, 1_000_000, None);
+        add("a.d", dir, 4_000_000, None);
+        add("a/b/c", dir, 5_000_000, None);
+        // Named twice: the later entry's time, also when spelt another way
+        // (`./dot` came first).
+        add("dup", dir, 6_000_000, None);
+        add("dup", dir, 7_000_000, None);
+        add("dot/", dir, 6_000_000, None);
+        // Deeper than a walk keeps open, then a sibling at each end.
+        let mut deep = String::from("deep");
+        let mut deeps = vec![deep.clone()];
+        for i in 0..(DIR_WALK_KEEP + 20) {
+            deep.push_str(&format!("/{i}"));
+            deeps.push(deep.clone());
+        }
+        for (i, p) in deeps.iter().enumerate() {
+            add(p, dir, 10_000_000 + i as u64, None);
+        }
+        add(&format!("{deep}-sib"), dir, 8_000_000, None);
+        add("deep/0-sib", dir, 9_000_000, None);
+        // A symlink to a directory keeps its own time, and so does the directory.
+        add("real", dir, 11_000_000, None);
+        add("sw", tar::EntryType::Symlink, 14_000_000, Some("real"));
+        let bytes = b.into_inner().unwrap();
+
+        let dest = scratch("dir-times-order");
+        untar(Capped { inner: &bytes[..], left: u64::MAX }, &dest).unwrap();
+        let mtime = |p: &str| fs::symlink_metadata(dest.join(p)).unwrap().mtime();
+        for (p, t) in [("a", 1_000_000), ("a/b", 2_000_000), ("a-c", 3_000_000), ("a.d", 4_000_000), ("a/b/c", 5_000_000), ("dup", 7_000_000), ("dot", 6_000_000)] {
+            assert_eq!(mtime(p), t, "{p}");
+        }
+        for (i, p) in deeps.iter().enumerate() {
+            assert_eq!(mtime(p), 10_000_000 + i as i64, "{p}");
+        }
+        assert_eq!(mtime(&format!("{deep}-sib")), 8_000_000);
+        assert_eq!(mtime("deep/0-sib"), 9_000_000);
+        assert_eq!(mtime("real"), 11_000_000);
+        assert_eq!(mtime("sw"), 14_000_000, "the symlink's own time");
         fs::remove_dir_all(dest).unwrap();
     }
 
