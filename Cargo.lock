@@ -824,6 +824,7 @@ dependencies = [
  "embed-resource",
  "kiri-share-proto",
  "libc",
+ "rcgen",
  "rustls",
  "rustls-native-certs",
  "rustls-pki-types",

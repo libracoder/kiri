@@ -28,6 +28,8 @@ windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Dw
 [dev-dependencies]
 # crates/kiri-win/src/refuse.rs's tests, on any host.
 serde_json = "1"
+# share.rs's tests (compiled here by path) make a certificate authority.
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem", "crypto"] }
 
 [build-dependencies]
 # The icon resource in kiri-win.exe (build.rs).
