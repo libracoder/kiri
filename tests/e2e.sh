@@ -1267,7 +1267,9 @@ if [ -n "$NO_BUILDX" ]; then (cd "$BD" && perl -e 'alarm 600; exec @ARGV' $D bui
 else (cd "$BD" && BUILDX_BUILDER=$BX perl -e 'alarm 600; exec @ARGV' $D build -f Dockerfile.layers -t kiri-test/layers65 . >/dev/null 2>&1); fi
 t build-65-layers-run "64" $D run --rm kiri-test/layers65 cat /layer-64
 t build-65-layers-lowest "alpine" $D run --rm kiri-test/layers65 cat /etc/os-release
-$D rmi kiri-test/built kiri-test/net kiri-test/layers65 >/dev/null 2>&1; rm -rf "$BD"
+# An image with no layers starts and fails at exec, as on Docker, not at mount.
+t build-no-layers-run "no such file" bash -c "cd $BD && printf 'FROM scratch\nLABEL empty=1\nCMD [\"/nothing\"]\n' > Dockerfile.empty && BUILDX_BUILDER=$BX perl -e 'alarm 50; exec @ARGV' $D build -q -f Dockerfile.empty -t kiri-test/nolayers . >/dev/null 2>&1; $D run --rm kiri-test/nolayers 2>&1 | tr A-Z a-z"
+$D rmi kiri-test/built kiri-test/net kiri-test/layers65 kiri-test/nolayers >/dev/null 2>&1; rm -rf "$BD"
 
 section "registry: login, push, pull"
 REG=$(mktemp -d); export DOCKER_CONFIG_SAVED=${DOCKER_CONFIG:-}

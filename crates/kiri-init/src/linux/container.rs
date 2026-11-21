@@ -873,6 +873,14 @@ pub(super) fn mount_rootfs(paths: &Paths, id: &str, image_layers: &[&str]) -> io
         seen.push(digest);
         lower.push(layers::hex(digest)?.to_owned());
     }
+    // An image with no layers (FROM scratch and only settings): an empty
+    // folder stands in, as an overlay needs a lower; the container then
+    // fails at exec, as Docker's does, instead of failing to mount.
+    if lower.is_empty() {
+        let empty = base.join("empty");
+        fs::create_dir_all(&empty)?;
+        lower.push(empty.to_str().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "container folder is not UTF-8"))?.to_owned());
+    }
     let rest = format!(",upperdir={},workdir={},{}", upper.display(), work.display(), overlay_features(plain_upper(&base)?));
     sys::mount_overlay(&rootfs, &lower, &rest, 0)?;
     Ok(rootfs)
