@@ -1241,6 +1241,68 @@ t load-hardlink-absolute "hello from tool" bash -c "$D load -q -i $IMD/hl.tar >/
 t load-hardlink-escape "escapes the layer" bash -c "$D load -q -i $IMD/hl-esc.tar >/dev/null && $D create kiri-test/hl:esc"
 $D rmi kiri-test/alp:v1 kiri-test/hl:abs kiri-test/hl:esc >/dev/null 2>&1; rm -rf "$IMD"
 
+section "image layers: times, many layers, links, special files"
+# Images made by tests/layer-image.py: alpine's layers and crafted ones, all
+# new each run (a file in each holds the time), so the engine unpacks them
+# with the code under test, not a copy it kept from before. Tags are per run.
+LI="python3 $(cd "$(dirname "$0")" && pwd)/layer-image.py"
+LT=kiri-test/layers-$$-$RANDOM
+LA=$($D version --format '{{.Server.Arch}}')
+li() { $D save alpine | $LI "$@" | $D load -q >/dev/null; }
+# The reporter's command, on alpine's own layer unpacked anew: each
+# directory has the layer's time, as with Docker, not the time it was
+# unpacked (#676).
+li fresh $LT:fresh
+t layer-dir-times-alpine "same" bash -c "want=\$($D save alpine | $LI --times /mnt /srv /usr/bin /lib /etc/apk /bin/sh /sbin/apk); got=\$($D run --rm $LT:fresh stat -c '%Y %n' /mnt /srv /usr/bin /lib /etc/apk /bin/sh /sbin/apk); [ \"\$want\" = \"\$got\" ] && echo same || printf 'want %s got %s' \"\$want\" \"\$got\""
+# Times Docker gives the same image: nested 25 deep, a directory in two
+# layers (the upper one's), under an opaque marker, with a whiteout made in
+# it, 0 and after 2038, a directory whose entry follows its files, one a
+# symlink points to (its own time, nothing set through the link), and one a
+# later layer removed.
+li dirtimes $LT:dirs
+t layer-dir-times-edges "deep=1000000000 n1=1000000001 n24=1000000024 two=1000300000 op=1000300000 p=1000300000 future=4102444800 zero=0 target=1000100000 lnk=1000200000 empty=1000100000 after=1000200000 late=1000300000 rep=1000300000 op:new two:f1,f2 gone:none" \
+  $D run --rm $LT:dirs sh -c 'n24=deep/n1/n2/n3/n4/n5/n6/n7/n8/n9/n10/n11/n12/n13/n14/n15/n16/n17/n18/n19/n20/n21/n22/n23/n24; cd / && printf "%s " deep=$(stat -c %Y deep) n1=$(stat -c %Y deep/n1) n24=$(stat -c %Y $n24); for p in two op p future zero target lnk empty after late rep; do printf "%s=%s " $p $(stat -c %Y $p); done; echo "op:$(ls -A op | tr "\n" " " | xargs) two:$(ls -A two | tr "\n" , | sed "s/,$//") gone:$(ls -d gone 2>/dev/null || echo none)"'
+# The times stay through docker cp out, docker commit and a run of the commit.
+t layer-dir-times-cp-out "1000300000 two 1000100000 two/f1" bash -c "id=\$($D create $LT:dirs) && $D cp \$id:/two - | python3 -c 'import sys,tarfile; [print(int(m.mtime), m.name) for m in tarfile.open(fileobj=sys.stdin.buffer,mode=\"r|\")]' | sort -k2 | tr '\n' ' '; $D rm \$id >/dev/null"
+t layer-dir-times-commit "1000000000 /cd 1100000000 /two 1000000001 /deep/n1" bash -c "$D rm -f e2e-ltc >/dev/null 2>&1; $D run --name e2e-ltc $LT:dirs sh -c 'mkdir /cd && touch -d @1000000000 /cd && echo x > /two/f3 && touch -d @1100000000 /two' && $D commit e2e-ltc $LT:dirs-committed >/dev/null && $D run --rm $LT:dirs-committed stat -c '%Y %n' /cd /two /deep/n1 | tr '\n' ' '; $D rm -f e2e-ltc >/dev/null"
+# Images of 59 to 125 layers start, with their top and lowest layers in the
+# container (#253: from 60 the overlay's options did not fit in a page). The
+# 125-layer one is also the next check's.
+li layers $LT:n125 125
+for n in 59 60 65 120; do li layers $LT:n$n $n; done
+t layers-59-to-125 "59:ok 60:ok 65:ok 120:ok 125:ok" bash -c "for n in 59 60 65 120 125; do printf '%s:%s ' \$n \"\$($D run --rm $LT:n\$n sh -c \"[ \\\$(cat /layer-1)\\\$(cat /layer-\$((n - 1))) = 1\$((n - 1)) ] && grep -q alpine /etc/os-release && echo ok\" 2>&1 | head -c 120)\"; done"
+# ...and a 125-layer container takes exec, restart, stop and start, and a
+# commit on top (126 layers) runs too.
+t layers-125-lifecycle "exec=124 restart=1 start=124 commit=126 committed=top1" bash -c "$D rm -f e2e-l125 >/dev/null 2>&1; $D run -d --name e2e-l125 $LT:n125 sleep 300 >/dev/null; printf 'exec=%s ' \$($D exec e2e-l125 cat /layer-124); $D restart -t 0 e2e-l125 >/dev/null; printf 'restart=%s ' \$($D exec e2e-l125 cat /layer-1); $D stop -t 0 e2e-l125 >/dev/null; $D start e2e-l125 >/dev/null; printf 'start=%s ' \$($D exec e2e-l125 cat /layer-124); $D exec e2e-l125 sh -c 'echo top > /top'; $D commit e2e-l125 $LT:n126 >/dev/null; printf 'commit=%s ' \$($D image inspect -f '{{len .RootFS.Layers}}' $LT:n126); echo committed=\$($D run --rm $LT:n126 cat /top /layer-1 | tr -d '\n'); $D rm -f e2e-l125 >/dev/null"
+# Hard links to symlinks are links to the symlink itself, as Docker makes
+# them (#409, Nix images): to a dangling one, from another directory, to a
+# relative one, chained, to a symlink to a symlink and to one to a directory.
+li hardlinks $LT:hl
+t layer-hardlink-symlinks "bin/hl=link:5:/bin/real bin/hl-dangling=link:2:/no/such/file other/hl-sym=link:5:/bin/real other/hl-rel=link:2:real other/chain2=link:5:/bin/real bin/hl-symsym=link:2:sym hl-dirlink=link:2:dir same-inode ok" \
+  $D run --rm $LT:hl sh -c 'cd / && for p in bin/hl bin/hl-dangling other/hl-sym other/hl-rel other/chain2 bin/hl-symsym hl-dirlink; do [ -L $p ] && printf "%s=link:%s:%s " $p $(stat -c %h $p) $(readlink $p); done; [ $(stat -c %i bin/hl) = $(stat -c %i bin/sym) ] && printf "same-inode "; /bin/hl'
+# Devices and fifos in a layer are unpacked as themselves, with their times;
+# a time of 0 stays 0 on a file, a directory and a symlink (#679, #684).
+li special $LT:special
+t layer-special-files "character special file 1:3 1000000000 block special file 7:0 1000000000 fifo 0:0 1000000000 regular file 0:0 0 directory 0:0 0 symbolic link 0:0 0" \
+  $D run --rm $LT:special sh -c 'stat -c "%F %t:%T %Y" /spec/null /spec/blk /spec/fifo /spec/zero /zdir /zlink | tr "\n" " "'
+# An image with no layers at all starts, and fails as Docker's does, on the
+# missing command (#685); no buildx needed.
+t load-no-layers-run "stat /nothing: no such file" bash -c "$LI nolayers $LT:none --no-base --arch $LA | $D load -q >/dev/null && $D image inspect -f 'layers={{len .RootFS.Layers}}' $LT:none && $D run --rm $LT:none 2>&1 | tr A-Z a-z"
+# A docker rmi once a save of the image has sent its first byte, while the
+# rest waits for a slow reader: the save finishes whole and loads back (#661:
+# the removal deleted a layer the save was still sending).
+li big $LT:big
+t rmi-during-save "complete runs" bash -c "f=\$(mktemp); rm -f \$f.go; ( $D save $LT:big | python3 -c 'import sys, time; i, o = sys.stdin.buffer, open(sys.argv[1], \"wb\"); o.write(i.read(1)); o.flush(); open(sys.argv[1] + \".go\", \"w\").close(); time.sleep(2); o.write(i.read()); o.close()' \$f ) & until [ -e \$f.go ]; do sleep 0.1; done; $D rmi $LT:big >/dev/null; wait; $D load -q -i \$f >/dev/null 2>&1 && $D run --rm $LT:big sh -c 'test \$(stat -c %s /big) = 4194304' && echo complete runs; rm -f \$f \$f.go"
+# A request over the agent's frame limit (a 1.2 MB environment) fails on
+# its own: other containers and later runs carry on (#658).
+$D rm -f e2e-frame e2e-frame-big >/dev/null 2>&1; $D run -d --name e2e-frame alpine sleep 300 >/dev/null
+t frame-limit-request-alone "refused alive=yes next=ok" bash -c "python3 -c 'import json; print(json.dumps({\"Image\":\"alpine\",\"Cmd\":[\"true\"],\"Env\":[\"BIG=\"+\"a\"*1200000]}))' | curl -s -o /dev/null --unix-socket '$SOCK' -H 'Content-Type: application/json' -X POST --data-binary @- 'http://d/v1.47/containers/create?name=e2e-frame-big'; c=\$(curl -s -o /dev/null -w '%{http_code}' --unix-socket '$SOCK' -X POST http://d/v1.47/containers/e2e-frame-big/start); case \$c in 2*) printf 'started ' ;; *) printf 'refused ' ;; esac; echo alive=\$($D exec e2e-frame echo yes) next=\$($D run --rm alpine echo ok)"
+$D rm -f e2e-frame e2e-frame-big >/dev/null 2>&1
+# Users as Docker resolves them (#664): a numeric one in /etc/passwd gets
+# its group, one not listed group 0, a name its own.
+t user-boundaries "0:0 65534:65534 99999:0 nobody:65534 guest:100 1234:5678" bash -c "for u in 0 65534 99999 nobody guest 1234:5678; do printf '%s:%s ' \"\${u%%:*}\" \"\$($D run --rm -u \$u alpine id -g)\"; done"
+$D rmi $LT:fresh $LT:dirs $LT:dirs-committed $LT:n59 $LT:n60 $LT:n65 $LT:n120 $LT:n125 $LT:n126 $LT:hl $LT:special $LT:none $LT:big >/dev/null 2>&1
+
 section "docker build (BuildKit in the VM)"
 # A process's core-size and process limits, soft and hard, on one line.
 LIMS="grep -E '^Max (core file size|processes) ' /proc/self/limits | tr '\\n' ' ' | tr -s ' '"

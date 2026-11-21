@@ -33,6 +33,17 @@ t() {
   if [[ "$got" == *"$want"* ]]; then PASS=$((PASS + 1)); else FAIL=$((FAIL + 1)); printf '  FAIL %s\n    want: %s\n    got:  %s\n' "$name" "$want" "$(echo "$got" | head -3)"; kiri_guard "$name"; fi
 }
 t server-os "linux" "docker version --format '{{.Server.Os}}'"
+# NCPU is the CPUs the engine may run on, as dockerd counts them (#659): it
+# was the Mac VM's default of 2. The engine runs in this container, with its
+# CPUs. A second engine started under taskset with three CPUs (in mount and
+# network namespaces of its own, so it shares nothing with the first) says 3,
+# where the old count said 2; a host with fewer than three CPUs can't tell.
+t ncpu-engine-cpus "same" "[ \"\$(docker info --format '{{.NCPU}}')\" = \"\$(nproc)\" ] && echo same || echo \"NCPU \$(docker info --format '{{.NCPU}}') nproc \$(nproc)\""
+if [ "$($D exec "$N" nproc)" -ge 3 ]; then
+  t ncpu-affinity "NCPU=3" "apk add -q util-linux util-linux-misc iproute2 >/dev/null 2>&1; unshare --mount --propagation private --net --fork sh -c 'mount -t tmpfs t /var/lib/kiri && mount -t tmpfs t /root && ip link set lo up; taskset -c 0-2 /opt/kiri/kiri daemon >/dev/null 2>&1 & p=\$!; for i in \$(seq 80); do docker version >/dev/null 2>&1 && break; sleep 0.25; done; echo NCPU=\$(docker info --format {{.NCPU}}); kill \$p; wait \$p'"
+else
+  echo "  SKIP ncpu-affinity: the engine's container has fewer than 3 CPUs"
+fi
 t run "3." "docker run --rm alpine cat /etc/alpine-release"
 t home "/root" "docker run --rm alpine sh -c 'echo \$HOME'"
 t internet "Example Domain" "docker run --rm alpine wget -qO- -T 10 http://example.com"
