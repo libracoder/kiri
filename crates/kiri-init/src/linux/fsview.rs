@@ -96,20 +96,20 @@ pub fn list(rootfs: &Path, path: &str) -> io::Result<Vec<(String, Meta)>> {
         let Ok(c) = CString::new(name.as_str()) else { continue };
         // SAFETY: fstatat relative to the resolved directory, not following links.
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // The kernel's own filesystems are not the container's files, and
+        // over NFS they are cycles that walk for ever (#648): left out of
+        // the root's listing, so nothing can descend into them.
+        if path.trim_matches('/').is_empty() && matches!(name.as_str(), "proc" | "sys" | "dev") {
+            continue;
+        }
         if unsafe { libc::fstatat(dir.as_raw_fd(), c.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
             continue;
         }
-        if st.st_mode & libc::S_IFMT == libc::S_IFLNK {
-            // Show what the link points at, resolved inside the container.
-            let target = format!("{}/{}", path.trim_end_matches('/'), name);
-            if let Ok(meta) = stat(rootfs, &target) {
-                out.push((name, meta));
-                if out.len() >= MAX_ENTRIES {
-                    break;
-                }
-                continue;
-            }
-        }
+        // A symlink is served as itself. What it points at, resolved,
+        // made /sys's self-referential links (subsystem, drivers) into
+        // directories that walk back into themselves, which Finder,
+        // Spotlight and backups followed until the path no longer fit
+        // (#648); the agent answered stat after stat for them.
         out.push((name, Meta::from(&st)));
         if out.len() >= MAX_ENTRIES {
             break;
