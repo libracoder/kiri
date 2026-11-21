@@ -194,11 +194,11 @@ gate() {
 # /etc/resolv.conf.
 BRIDGE_GW=172.17.0.1 DEFAULT_NS=172.17.0.1 HOSTNET_ADDR=192.168.64. HOSTNET_IF=eth0 HOST_UPS=1024
 if [ "$SYS" != mac ]; then
-  # Docker's 172.17.0.0/16 unless the host already routes it (Kiri in another
-  # engine's container): then the first free subnet (daemon/network.rs).
-  if ip -4 route 2>/dev/null | grep -v ' dev kiri0 ' | grep -q '^172\.17\.'; then
-    BRIDGE_GW=$($D network inspect bridge -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}' 2>/dev/null)
-  fi
+  # Docker's 172.17.0.0/16 unless the host is already on it (Docker's
+  # docker0, Kiri in another engine's container): then the first free
+  # subnet (daemon/network.rs). As the engine says.
+  BRIDGE_GW=$($D network inspect bridge -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}' 2>/dev/null)
+  BRIDGE_GW=${BRIDGE_GW:-172.17.0.1}
   # The default bridge names the host's resolvers, as the agent reads them
   # (kiri-init transport.rs host_dns): /etc/resolv.conf's but loopback, else
   # systemd-resolved's upstreams; a resolver at one of the host's own

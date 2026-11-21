@@ -118,3 +118,6 @@ dockerfw-docker-kept-apart	#247	letting Kiri's containers through Docker's firew
 import-dir-mtime	#676	every directory of an image layer had the time Kiri unpacked it, not the layer's
 buildx-copy-then-start	#83	buildx's bootstrap failed with "connection reset by peer": the engine answered the copy into the new BuildKit container, then closed the connection without saying so, and the start sent next on it was lost
 buildx-bootstrap-loop	#83	about one buildx docker-container bootstrap in six failed at the BuildKit container's start with "connection reset by peer", leaving it created
+taken-default-bridge-moves	#489	the default bridge kept a subnet Docker's docker0 had taken while Kiri was stopped, so its containers could not reach their gateway
+taken-pool-network-moves	#489	a network made without --subnet kept a subnet another engine's bridge had taken since, so its containers could not reach their gateway
+taken-user-subnet-refused	#489	a network whose --subnet another engine's bridge holds started containers that could not reach their gateway, with no word why

@@ -152,9 +152,17 @@ fn send_to(fd: RawFd, data: &[u8], to: &libc::sockaddr_in) {
 
 impl Dns {
     /// Starts answering on a bridge's gateway address (once per bridge).
+    /// A bridge made again with another gateway (its network's subnet moved
+    /// off one the host took, #489) gets a listener there in place of the
+    /// old one, which no address of the bridge's reaches any more.
     pub fn serve(&mut self, bridge: &str, gateway: [u8; 4]) -> io::Result<()> {
-        if self.servers.iter().any(|s| s.container.is_none() && s.bridges.iter().any(|b| b == bridge)) {
-            return Ok(());
+        let at_gateway = |s: &Server| s.container.is_none() && s.bridges.iter().any(|b| b == bridge);
+        if let Some(s) = self.servers.iter().find(|s| at_gateway(s)) {
+            if local_addr(&s.sock) == Some(gateway) {
+                return Ok(());
+            }
+            self.servers.retain(|s| !at_gateway(s));
+            self.forget_pending();
         }
         let sock = bound(gateway, 53)?;
         self.servers.push(Server { bridges: vec![bridge.to_owned()], sock, container: None });
@@ -215,13 +223,7 @@ impl Dns {
 
     /// Whether the agent answers DNS at `ip` on a bridge (its gateway).
     pub fn serves_at(&self, ip: [u8; 4]) -> bool {
-        self.servers.iter().filter(|s| s.container.is_none()).any(|s| {
-            // SAFETY: sockaddr_in is plain data; getsockname fills at most `len` bytes.
-            let mut a: libc::sockaddr_in = unsafe { std::mem::zeroed() };
-            let mut len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
-            let named = unsafe { libc::getsockname(s.sock.as_raw_fd(), (&mut a as *mut libc::sockaddr_in).cast(), &mut len) } == 0;
-            named && a.sin_addr.s_addr.to_ne_bytes() == ip
-        })
+        self.servers.iter().filter(|s| s.container.is_none()).any(|s| local_addr(&s.sock) == Some(ip))
     }
 
     /// Container `pid` is gone: its 127.0.0.11 server goes.
@@ -614,6 +616,16 @@ fn embedded_socket() -> io::Result<OwnedFd> {
     }
 }
 
+/// The address socket `sock` is bound to.
+fn local_addr(sock: &OwnedFd) -> Option<[u8; 4]> {
+    // SAFETY: sockaddr_in is plain data; getsockname fills at most `len` bytes.
+    let mut a: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+    // SAFETY: a socket we own and a buffer of `len` bytes.
+    let named = unsafe { libc::getsockname(sock.as_raw_fd(), (&mut a as *mut libc::sockaddr_in).cast(), &mut len) } == 0;
+    named.then(|| a.sin_addr.s_addr.to_ne_bytes())
+}
+
 /// The port socket `sock` is bound to.
 fn local_port(sock: &OwnedFd) -> io::Result<u16> {
     // SAFETY: sockaddr_in is plain data; getsockname fills at most `len` bytes.
@@ -886,6 +898,22 @@ mod tests {
             may_relay: false,
             relayed: None,
         }
+    }
+
+    /// The default bridge moved off a subnet the host took (#489): its
+    /// bridge is made again with another gateway, and the gateway's
+    /// listener follows it rather than staying on the old address.
+    #[test]
+    fn a_gateway_listener_follows_its_bridges_new_gateway() {
+        let mut dns = Dns::default();
+        dns.servers.push(Server { bridges: vec!["kiri0".into()], sock: super::bound([127, 0, 0, 2], 0).unwrap(), container: None });
+        dns.serve("kiri0", [127, 0, 0, 2]).unwrap();
+        assert_eq!(dns.servers.len(), 1, "the same gateway keeps its listener");
+        // Port 53 may need privileges this test lacks: either way the old
+        // listener is gone.
+        let made = dns.serve("kiri0", [127, 0, 0, 3]).is_ok();
+        assert!(!dns.serves_at([127, 0, 0, 2]));
+        assert_eq!(dns.serves_at([127, 0, 0, 3]), made);
     }
 
     #[test]

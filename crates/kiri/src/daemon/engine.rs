@@ -2779,7 +2779,20 @@ impl Engine {
         if spec.pid_mode == "host" {
             flags |= run_flags::PID_HOST;
         }
-        let net = self.lock_networks().find(&spec.network_mode).cloned();
+        // The network's subnet, checked against the host's once more before
+        // its first container (#489).
+        let net = {
+            let mut nets = self.lock_networks();
+            match nets.settle(&spec.network_mode) {
+                Ok(()) => nets.find(&spec.network_mode).cloned(),
+                Err(e) => {
+                    drop(nets);
+                    let e = Error::Conflict(e);
+                    self.fail_start(&id, &spec, &e);
+                    return Err(e);
+                }
+            }
+        };
         let links = match net.as_ref().map(|n| self.link_hosts(&id, &spec, n)).transpose() {
             Ok(l) => l.unwrap_or_default(),
             Err(e) => {
@@ -3647,7 +3660,11 @@ impl Engine {
     /// SIGTERM, then SIGKILL after `timeout` if it is still running.
     /// Plugs a running container into one more network as `eth{n}`.
     fn attach_extra(&self, vm: &VmLink, id: &str, n: u32, extra: &ExtraNetwork) -> Result<(), Error> {
-        let net = self.lock_networks().find(&extra.name).cloned().ok_or_else(|| Error::NotFound(format!("network {} not found", extra.name)))?;
+        let net = {
+            let mut nets = self.lock_networks();
+            nets.settle(&extra.name).map_err(Error::Conflict)?;
+            nets.find(&extra.name).cloned().ok_or_else(|| Error::NotFound(format!("network {} not found", extra.name)))?
+        };
         if net.driver != "bridge" {
             return Err(Error::BadRequest(format!("only bridge networks can be connected, not {}", net.driver)));
         }

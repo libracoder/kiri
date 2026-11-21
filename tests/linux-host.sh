@@ -154,6 +154,26 @@ t ss-restarted-start "204" "$POST http://d/kiri/wake"
 t ss-restarted-brings-back "ss-us=true ss-al=true ss-user=false ss-no=false" "$BACK"
 t ss-restarted-all-always "running: 7" "for i in \$(seq 100); do [ \$(docker ps -q | wc -l) -ge 7 ] && break; sleep 0.2; done; echo running: \$(docker ps -q | wc -l)"
 t ss-cleanup "ss-us" "docker rm -f $ALL"
+# Docker took a subnet Kiri had chosen while Kiri was stopped (or before a
+# network's first container, when Kiri makes its bridge): its docker0 or
+# br-… holds the address, with no carrier yet. Kiri's network moves to a
+# free subnet, and its containers reach their gateway, DNS and the internet,
+# not the other engine's bridge; one whose --subnet the user gave is refused
+# with the reason (#489). The default bridge's subnet is read, not assumed:
+# this engine's container is itself on a 172.17 bridge.
+GW="docker network inspect -f '{{(index .IPAM.Config 0).Gateway}}'"
+t taken-setup "ok" "docker network create lh489 >/dev/null && docker network create --subnet 10.89.240.0/24 lh489u >/dev/null && echo ok"
+OLD_BRIDGE=$($D exec "$N" sh -c "DOCKER_HOST=unix:///root/.kiri/run/docker.sock $GW bridge")
+OLD_POOL=$($D exec "$N" sh -c "DOCKER_HOST=unix:///root/.kiri/run/docker.sock $GW lh489")
+t taken-stop "204" "$POST http://d/kiri/stop"
+t taken-by-other-bridges "ok" "apk add -q iproute2 >/dev/null 2>&1; for b in docker489:$OLD_BRIDGE/16 br489:$OLD_POOL/16 br489u:10.89.240.1/24; do ip link add \${b%%:*} type bridge && ip addr add \${b#*:} dev \${b%%:*} && ip link set \${b%%:*} up || exit; done; echo ok"
+t taken-wake "204" "$POST http://d/kiri/wake"
+REACH="gw=\\\$(ip route | awk '/^default/ {print \\\$3}'); ping -c1 -W2 \\\$gw >/dev/null && r=gateway-ok || r=gateway-unreachable; echo \\\$r \\\$gw"
+t taken-default-bridge-moves "gateway-ok" "docker run --rm alpine sh -c \"$REACH\" | grep -v ' $OLD_BRIDGE\$'"
+t taken-default-bridge-internet "Example Domain" "docker run --rm alpine wget -qO- -T 10 http://example.com"
+t taken-pool-network-moves "gateway-ok" "docker run --rm --network lh489 alpine sh -c \"$REACH\" | grep -v ' $OLD_POOL\$'"
+t taken-user-subnet-refused "is also on this host's interface br489u" "docker run --rm --network lh489u alpine true"
+t taken-cleanup "ok" "docker network rm lh489 lh489u >/dev/null; ip link del docker489; ip link del br489; ip link del br489u; echo ok"
 # A command that may not be run is 126, a missing one 127, as with Docker (#183).
 t exit-126-not-executable "126" "docker run --rm alpine /etc/passwd; echo \$?"
 t not-executable-msg 'exec: "/etc/passwd": permission denied' "docker run --rm alpine /etc/passwd"
