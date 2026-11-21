@@ -688,7 +688,7 @@ impl Networks {
             .or_else(|| self.list.iter().find(|n| key.len() >= 6 && n.id.starts_with(key)))
     }
 
-    fn find_mut(&mut self, name: &str) -> Option<&mut Network> {
+    pub(super) fn find_mut(&mut self, name: &str) -> Option<&mut Network> {
         self.list.iter_mut().find(|n| n.name == name)
     }
 

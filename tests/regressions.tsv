@@ -57,6 +57,11 @@ rename-dns-new-extra-net	#467	after docker rename the new name did not resolve o
 rename-dns-old-gone	#467	after docker rename the old name still resolved to the container
 rename-dns-old-gone-extra-net	#467	after docker rename the old name still resolved on a connected network
 rename-dns-keeps-own-servers	#467	a rename that dropped the container's names also dropped its own --dns servers, so its lookups went to Kiri's resolver
+rename-dns-alias-extra-net	#467	after docker rename an alias on a connected network no longer resolved
+rename-dns-ipv6-only-aaaa	#467	after docker rename on an IPv6-only network the new name had no AAAA record
+rename-dns-ipv6-only-no-a	#467	after docker rename on an IPv6-only network the new name got an A record for an address the container does not have
+rename-dns-host-name-stays-host	#467	a container renamed to host.docker.internal took that name from the host for every container on its network
+rename-name-starts-with-letter	#467	a container could be renamed to a name starting with an underscore, dot or dash, which Docker refuses
 status-exec-detached	#612	a detached exec start answered 204, not Docker's 200
 status-start-still-204	#612	the status fix must keep a container start at 204
 api-too-old	#612	an API version older than 1.24 was served instead of refused

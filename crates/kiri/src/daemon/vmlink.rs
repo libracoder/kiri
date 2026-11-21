@@ -525,10 +525,13 @@ impl VmLink {
     }
 
     /// Replaces the DNS names the guest resolves for a container's address
-    /// on a bridge after `docker rename`. No reply: an older agent ignores
-    /// the frame, and a rename must still succeed if the VM is asleep.
-    pub fn dns_rename(&self, bridge: &str, ip: [u8; 4], ip6: Option<[u8; 16]>, names: &[String]) -> io::Result<()> {
-        self.send(|o| kiri_proto::encode_dns_rename(o, bridge, ip, ip6, names))
+    /// on a bridge after `docker rename`; `v4` is whether the network has
+    /// IPv4 addresses. No reply, which is why the protocol is 8: an older
+    /// agent would answer an unknown frame with an error, and the next
+    /// request would take it for its own reply. The guest refuses a frame
+    /// that names no running container's address.
+    pub fn dns_rename(&self, id: &str, bridge: &str, ip: [u8; 4], ip6: Option<[u8; 16]>, v4: bool, names: &[String]) -> io::Result<()> {
+        self.send(|o| kiri_proto::encode_dns_rename(o, id, bridge, ip, ip6, v4, names))
     }
 
     #[allow(clippy::too_many_arguments)]

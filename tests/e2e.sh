@@ -1471,20 +1471,43 @@ t compose-multi-net "PONG" bash -c "d=\$(mktemp -d); printf 'services:\n  db:\n 
 $D rm -f multi >/dev/null; $D network rm na nb >/dev/null
 # A rename has to replace the guest's DNS names too: the new name resolves
 # and the old one stops, as with Docker's embedded DNS, on every network the
-# container is on (#467). Its own --dns servers stay: 192.0.2.1 never answers,
-# so a lookup that does was sent to Kiri's resolver instead.
+# container is on (#467), aliases kept. Its own --dns servers stay: 192.0.2.1
+# never answers, so a lookup that does was sent to Kiri's resolver instead.
 $D network create rndns >/dev/null; $D network create rndns2 >/dev/null
 $D run -d --name rndns-old --network rndns --network-alias rndns-alias --dns 192.0.2.1 alpine sleep 300 >/dev/null
-$D network connect rndns2 rndns-old; sleep 0.2
-t rename-dns-before "172." $D run --rm --network rndns alpine getent hosts rndns-old
+$D network connect --alias rndns2-alias rndns2 rndns-old; sleep 0.2
+RN_IP=$($D inspect -f '{{.NetworkSettings.Networks.rndns.IPAddress}}' rndns-old)
+RN_IP2=$($D inspect -f '{{.NetworkSettings.Networks.rndns2.IPAddress}}' rndns-old)
+t rename-dns-before "$RN_IP" $D run --rm --network rndns alpine getent hosts rndns-old
 $D rename rndns-old rndns-new
-t rename-dns-new "172." $D run --rm --network rndns alpine getent hosts rndns-new
-t rename-dns-new-extra-net "172." $D run --rm --network rndns2 alpine getent hosts rndns-new
-t rename-dns-alias "172." $D run --rm --network rndns alpine getent hosts rndns-alias
+t rename-dns-new "$RN_IP rndns-new" $D run --rm --network rndns alpine getent hosts rndns-new
+t rename-dns-new-extra-net "$RN_IP2 rndns-new" $D run --rm --network rndns2 alpine getent hosts rndns-new
+t rename-dns-alias "$RN_IP" $D run --rm --network rndns alpine getent hosts rndns-alias
+t rename-dns-alias-extra-net "$RN_IP2" $D run --rm --network rndns2 alpine getent hosts rndns2-alias
 t rename-dns-old-gone "old name gone" bash -c "$D run --rm --network rndns alpine sh -c 'getent hosts rndns-old || echo old name gone'"
 t rename-dns-old-gone-extra-net "old name gone" bash -c "$D run --rm --network rndns2 alpine sh -c 'getent hosts rndns-old || echo old name gone'"
-t rename-dns-keeps-own-servers "no answer" $D exec rndns-new sh -c 'nslookup -timeout=2 example.com >/dev/null 2>&1 && echo answered || echo no answer'
-$D rm -f rndns-new >/dev/null; $D network rm rndns rndns2 >/dev/null
+# A host this machine can't resolve from would pass the next check anyway:
+# only run it where a container with no --dns of its own resolves.
+if $D run --rm alpine nslookup -timeout=3 example.com >/dev/null 2>&1; then
+  t rename-dns-keeps-own-servers "no answer" $D exec rndns-new sh -c 'nslookup -timeout=2 example.com >/dev/null 2>&1 && echo answered || echo no answer'
+else
+  skip rename-dns-keeps-own-servers "no name can be resolved from here"
+fi
+# A name of a host stays the host's: the container is not given it.
+$D rename rndns-new host.docker.internal
+t rename-dns-host-name-stays-host "198." bash -c "$D run --rm --network rndns alpine nslookup host.docker.internal 127.0.0.11 | grep -A1 '^Name:' | tail -1"
+code rename-name-starts-with-letter 1 $D rename host.docker.internal _rndns
+$D rm -f rndns-new host.docker.internal >/dev/null 2>&1; $D rm -f rndns-old >/dev/null 2>&1; $D network rm rndns rndns2 >/dev/null
+# On an IPv6-only network the address Kiri keeps for the container is not an
+# address: a rename gives the new name AAAA records and no A.
+$D network create --ipv6 --ipv4=false rndns6 >/dev/null
+$D run -d --name rndns6-old --network rndns6 alpine sleep 300 >/dev/null
+RN_IP6=$($D inspect -f '{{.NetworkSettings.Networks.rndns6.GlobalIPv6Address}}' rndns6-old)
+$D rename rndns6-old rndns6-new
+t rename-dns-ipv6-only-aaaa "$RN_IP6" $D run --rm --network rndns6 alpine nslookup -type=AAAA rndns6-new
+t rename-dns-ipv6-only-no-a "no a records" $D run --rm --network rndns6 alpine sh -c "nslookup -type=A rndns6-new 2>&1 | sed -n '/^Name:/,\$p' | grep -qE 'Address.*[0-9]+[.][0-9]+[.][0-9]+[.][0-9]+' && echo a records || echo no a records"
+t rename-dns-ipv6-only-old-gone "old name gone" bash -c "$D run --rm --network rndns6 alpine sh -c 'nslookup -type=AAAA rndns6-old >/dev/null 2>&1 && echo still there || echo old name gone'"
+$D rm -f rndns6-new >/dev/null; $D network rm rndns6 >/dev/null
 # Disconnecting leaves a gap in the eth numbers: each network keeps its own
 # interface, a later one takes the free number, and every address goes back.
 $D network create nc1 >/dev/null; $D network create nc2 >/dev/null; $D network create nc3 >/dev/null

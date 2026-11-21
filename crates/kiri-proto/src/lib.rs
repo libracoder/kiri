@@ -47,6 +47,9 @@ pub const INPUT_WINDOW: usize = 4 << 20;
 /// the same reason.
 pub const PROTOCOL: u16 = 8;
 
+/// Most names a `DnsRename` may carry: a name, its aliases and a hostname.
+pub const MAX_DNS_NAMES: usize = 256;
+
 // `Run` is the one big message and is built and read once per container.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -197,11 +200,14 @@ pub enum Msg<'a> {
     /// or `Error` with no lease yet; an older agent answers `Error`.
     UplinkQuery,
     Uplink { ip: [u8; 4], gateway: [u8; 4] },
-    /// Host → guest: a container on `bridge` was renamed. Its old DNS names
-    /// are dropped and `names` registered to the same address. `ip6` is
-    /// either empty or 16 bytes. No reply, hence the protocol bump to 8:
-    /// an older agent's "unexpected" error would be read as the next reply.
-    DnsRename { bridge: &'a str, ip: [u8; 4], ip6: &'a [u8], names: StrList<'a> },
+    /// Host → guest: container `id` on `bridge` was renamed. Its old DNS
+    /// names are dropped and `names` registered to the same address (A
+    /// records only when `v4`: a network without IPv4 addresses keeps the
+    /// address only as the container's key). `ip6` is either empty or 16
+    /// bytes, and `names` has at most `MAX_DNS_NAMES`. No reply, hence the
+    /// protocol bump to 8: an older agent answers an unknown frame with an
+    /// error, which would be read as the next request's reply.
+    DnsRename { id: &'a str, bridge: &'a str, ip: [u8; 4], ip6: &'a [u8], v4: bool, names: StrList<'a> },
     /// Host → guest: a network was removed; delete its bridge, and with it
     /// the bridge's addresses and routes, its DNS server and, with the last
     /// IPv6 network, the IPv6 NAT table. No reply; an older agent ignores it.
@@ -802,12 +808,13 @@ pub fn encode_net_attach<S: AsRef<str>>(out: &mut Vec<u8>, id: &str, ifname: &st
 }
 
 /// Encodes a `DnsRename` frame from the sender's slices.
-pub fn encode_dns_rename<S: AsRef<str>>(out: &mut Vec<u8>, bridge: &str, ip: [u8; 4], ip6: Option<[u8; 16]>, names: &[S]) {
+pub fn encode_dns_rename<S: AsRef<str>>(out: &mut Vec<u8>, id: &str, bridge: &str, ip: [u8; 4], ip6: Option<[u8; 16]>, v4: bool, names: &[S]) {
     frame(out, kind::DNS_RENAME, |o| {
+        put_str(o, id);
         put_str(o, bridge);
         o.extend_from_slice(&ip);
-        let ip6 = ip6.map(|a| a.to_vec()).unwrap_or_default();
-        put_bytes(o, &ip6);
+        put_bytes(o, ip6.as_ref().map_or(&[][..], |a| &a[..]));
+        o.push(v4 as u8);
         StrList::put(o, names);
     });
 }
@@ -1053,10 +1060,12 @@ impl Msg<'_> {
             Msg::MemoryPressure => frame(out, kind::MEMORY_PRESSURE, |_| {}),
             Msg::RemoveVolume { name } => frame(out, kind::REMOVE_VOLUME, |o| put_str(o, name)),
             Msg::RemoveBridge { bridge } => frame(out, kind::REMOVE_BRIDGE, |o| put_str(o, bridge)),
-            Msg::DnsRename { bridge, ip, ip6, names } => frame(out, kind::DNS_RENAME, |o| {
+            Msg::DnsRename { id, bridge, ip, ip6, v4, names } => frame(out, kind::DNS_RENAME, |o| {
+                put_str(o, id);
                 put_str(o, bridge);
                 o.extend_from_slice(&ip);
                 put_bytes(o, ip6);
+                o.push(v4 as u8);
                 put_u32(o, names.count);
                 o.extend_from_slice(names.raw);
             }),
@@ -1355,12 +1364,21 @@ pub fn decode(frame: &[u8]) -> Result<Msg<'_>, DecodeError> {
         kind::MEMORY_PRESSURE => Msg::MemoryPressure,
         kind::REMOVE_VOLUME => Msg::RemoveVolume { name: r.str()? },
         kind::REMOVE_BRIDGE => Msg::RemoveBridge { bridge: r.str()? },
-        kind::DNS_RENAME => Msg::DnsRename {
-            bridge: r.str()?,
-            ip: r.take(4)?.try_into().map_err(|_| DecodeError::Truncated)?,
-            ip6: r.bytes()?,
-            names: r.list()?,
-        },
+        kind::DNS_RENAME => {
+            let id = r.str()?;
+            let bridge = r.str()?;
+            let ip = r.take(4)?.try_into().map_err(|_| DecodeError::Truncated)?;
+            let ip6 = r.bytes()?;
+            let v4 = r.u8()? != 0;
+            let names = r.list()?;
+            // The address is empty or a whole IPv6 address, and the list is
+            // bounded, so the guest never reads a half address or a frame of
+            // endless names.
+            if !(ip6.is_empty() || ip6.len() == 16) || names.len() > MAX_DNS_NAMES {
+                return Err(DecodeError::Truncated);
+            }
+            Msg::DnsRename { id, bridge, ip, ip6, v4, names }
+        }
         kind::COPY => Msg::Copy(CopySpec { op: r.u8()?, id: r.str()?, path: r.str()?, flags: r.u32()?, layers: r.list()? }),
         kind::COPY_STAT => Msg::CopyStat { entry: read_entry(&mut r)?, link: r.str()? },
         kind::COPY_DONE => Msg::CopyDone,
@@ -1583,15 +1601,42 @@ mod tests {
     #[test]
     fn dns_rename_survives_encoding() {
         let mut buf = Vec::new();
-        encode_dns_rename(&mut buf, "br0", [10, 5, 0, 2], Some([0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]), &["web", "alias"]);
-        let Msg::DnsRename { bridge, ip, ip6, names } = decode(&buf).unwrap() else { panic!("not a dns rename") };
-        assert_eq!(bridge, "br0");
-        assert_eq!(ip, [10, 5, 0, 2]);
+        encode_dns_rename(&mut buf, "c1", "br0", [10, 5, 0, 2], Some([0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]), false, &["web", "alias"]);
+        let Msg::DnsRename { id, bridge, ip, ip6, v4, names } = decode(&buf).unwrap() else { panic!("not a dns rename") };
+        assert_eq!((id, bridge, ip, v4), ("c1", "br0", [10, 5, 0, 2], false));
         assert_eq!(ip6.len(), 16);
         assert_eq!(names.iter().collect::<Vec<_>>(), ["web", "alias"]);
         let mut again = Vec::new();
-        Msg::DnsRename { bridge, ip, ip6, names }.encode(&mut again);
+        Msg::DnsRename { id, bridge, ip, ip6, v4, names }.encode(&mut again);
         assert_eq!(buf, again);
+    }
+
+    #[test]
+    fn dns_rename_with_a_bad_address_or_too_many_names_is_refused() {
+        let mut buf = Vec::new();
+        frame(&mut buf, kind::DNS_RENAME, |o| {
+            put_str(o, "c1");
+            put_str(o, "kiri1");
+            o.extend_from_slice(&[10, 5, 0, 2]);
+            put_bytes(o, &[1, 2, 3]); // neither none nor a whole address
+            o.push(1);
+            StrList::put(o, &["web"]);
+        });
+        assert!(decode(&buf).is_err());
+        let names: Vec<String> = (0..=MAX_DNS_NAMES).map(|i| format!("n{i}")).collect();
+        let mut buf = Vec::new();
+        encode_dns_rename(&mut buf, "c1", "kiri1", [10, 5, 0, 2], None, true, &names);
+        assert!(decode(&buf).is_err());
+        let mut buf = Vec::new();
+        encode_dns_rename(&mut buf, "c1", "kiri1", [10, 5, 0, 2], None, true, &names[..MAX_DNS_NAMES]);
+        assert!(decode(&buf).is_ok());
+    }
+
+    #[test]
+    fn the_protocol_version_covers_dns_rename() {
+        // An agent from before `DnsRename` answers it with an error that the
+        // host would take as the reply to its next request.
+        const { assert!(PROTOCOL >= 8) };
     }
 
     #[test]

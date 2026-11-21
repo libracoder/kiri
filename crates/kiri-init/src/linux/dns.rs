@@ -29,6 +29,13 @@ const TTL: u32 = 600;
 /// Names every container's /etc/hosts has for the host. They're answered here
 /// too, as Docker Desktop's DNS does, for what reads DNS rather than
 /// /etc/hosts: a kind or k3s node's CoreDNS forwards its pods' lookups here.
+/// Whether `n` can be a name in the network's DNS: non-empty, at most 253
+/// bytes, labels of 1 to 63 of letters, digits, `-` and `_` joined by dots
+/// (no leading, trailing or doubled dot, so never the root).
+fn dns_name(n: &str) -> bool {
+    n.len() <= 253 && n.split('.').all(|l| (1..=63).contains(&l.len()) && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'))
+}
+
 const HOST_NAMES: &[&str] = &["host.docker.internal", "host.kiri.internal", "gateway.docker.internal"];
 /// Forwarded queries not answered within this are dropped.
 const FORWARD_TIMEOUT: Duration = Duration::from_secs(5);
@@ -296,13 +303,18 @@ impl Dns {
     }
 
     /// `docker rename`: the names the container at `ip` answers to on
-    /// `bridge` become `names`. Unlike `unregister`, its own `--dns`
-    /// servers (kept under its address) stay.
-    pub fn rename(&mut self, bridge: &str, ip: [u8; 4], ip6: Option<[u8; 16]>, names: &[impl AsRef<str>]) {
+    /// `bridge` become `names`, those that are DNS names (see `dns_name`).
+    /// Unlike `unregister`, its own `--dns` servers (kept under its address)
+    /// stay. `ip` keys the container whether or not the network has IPv4
+    /// addresses: `v4` false (an IPv6-only network) registers no A record.
+    pub fn rename(&mut self, bridge: &str, ip: [u8; 4], ip6: Option<[u8; 16]>, v4: bool, names: &[impl AsRef<str>]) {
         self.drop_names(bridge, ip);
-        self.register(bridge, names.iter(), ip);
+        let names = || names.iter().filter(|n| dns_name(n.as_ref()));
+        if v4 {
+            self.register(bridge, names(), ip);
+        }
         if let Some(v6) = ip6 {
-            self.register6(bridge, names.iter(), ip, v6);
+            self.register6(bridge, names(), ip, v6);
         }
     }
 
@@ -389,17 +401,20 @@ impl Dns {
         // name Compose gives a service on every network it joins then
         // answers from the project's own network rather than a shared one
         // where another project's service has it too (#294).
+        // The host's names are the host's whatever a container is called:
+        // a name registered for one of them is never answered.
+        let is_host = HOST_NAMES.contains(&name.as_str());
         let bridge = self.servers[server]
             .bridges
             .iter()
-            .filter(|b| self.names.get(*b).is_some_and(|t| t.contains_key(&name)) || self.names6.get(*b).is_some_and(|t| t.contains_key(&name)))
+            .filter(|b| !is_host && (self.names.get(*b).is_some_and(|t| t.contains_key(&name)) || self.names6.get(*b).is_some_and(|t| t.contains_key(&name))))
             .min_by_key(|b| self.networks.get(*b).map_or(b.as_str(), String::as_str));
         let addrs = bridge.and_then(|b| self.names.get(b)).and_then(|t| t.get(&name));
         let addrs6 = bridge.and_then(|b| self.names6.get(b)).and_then(|t| t.get(&name));
         // The host's names answer A with the host's address, and AAAA with
         // no records: the host relay is IPv4 only.
         let addrs = match addrs {
-            None if addrs6.is_none() && HOST_NAMES.contains(&name.as_str()) => Some(&host),
+            None if is_host => Some(&host),
             a => a,
         };
         // A container name with no address of the asked type is NODATA, not
@@ -913,7 +928,7 @@ mod tests {
         // Another container's name on the same network is left alone.
         dns.register("kiri1", ["other"].iter(), [10, 5, 0, 3]);
         dns.set_upstream(ip, vec![[8, 8, 8, 8]]);
-        dns.rename("kiri1", ip, Some(v6), &["new", "keep-alias"]);
+        dns.rename("kiri1", ip, Some(v6), true, &["new", "keep-alias"]);
         let q = query("new", 1);
         assert_eq!(answers(&dns.answer(0, &q).unwrap(), q.len()), [(1, ip.to_vec())]);
         let q = query("new", 28);
@@ -926,6 +941,50 @@ mod tests {
         assert_eq!(answers(&dns.answer(0, &q).unwrap(), q.len()), [(1, vec![10, 5, 0, 3])]);
         // Its own --dns servers are kept under its address: a rename keeps them.
         assert_eq!(dns.clients.get(&ip), Some(&vec![[8, 8, 8, 8]]));
+    }
+
+    /// On a network with no IPv4 addresses the container's address is only
+    /// its key: a rename gives AAAA records and no A.
+    #[test]
+    fn renaming_on_an_ipv6_only_network_makes_no_a_records() {
+        let mut dns = Dns::default();
+        dns.servers.push(super::Server { bridges: vec!["kiri1".into()], sock: super::udp_socket().unwrap(), container: None });
+        let key = [10, 5, 0, 2];
+        let v6 = [0xfd, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+        dns.register6("kiri1", ["old"].iter(), key, v6);
+        dns.rename("kiri1", key, Some(v6), false, &["new"]);
+        let q = query("new", 28);
+        assert_eq!(answers(&dns.answer(0, &q).unwrap(), q.len()), [(28, v6.to_vec())]);
+        let q = query("new", 1);
+        assert!(answers(&dns.answer(0, &q).unwrap(), q.len()).is_empty(), "NODATA, not the internal key");
+        assert!(dns.answer(0, &query("old", 28)).is_none());
+    }
+
+    /// Names that are not DNS names, and a name taken from the host, change
+    /// nothing a container or the host is reached by.
+    #[test]
+    fn a_rename_never_registers_an_empty_name_or_takes_a_host_name() {
+        let mut dns = Dns::default();
+        dns.servers.push(super::Server { bridges: vec!["kiri1".into()], sock: super::udp_socket().unwrap(), container: None });
+        let ip = [10, 5, 0, 2];
+        dns.rename("kiri1", ip, None, true, &["", ".", "a..b", "web", "host.docker.internal", "gateway.docker.internal"]);
+        assert!(dns.names["kiri1"].keys().all(|n| !n.is_empty() && n != "." && n != "a..b"));
+        let q = query("web", 1);
+        assert_eq!(answers(&dns.answer(0, &q).unwrap(), q.len()), [(1, ip.to_vec())]);
+        for host in ["host.docker.internal", "gateway.docker.internal"] {
+            let q = query(host, 1);
+            assert_eq!(answers(&dns.answer(0, &q).unwrap(), q.len()), [(1, super::super::net::HOST_ADDR.to_vec())], "{host} stays the host's");
+        }
+    }
+
+    #[test]
+    fn dns_names_are_labels_of_letters_digits_dashes_and_underscores() {
+        for ok in ["web", "a.b", "my_db-1", "a".repeat(63).as_str()] {
+            assert!(super::dns_name(ok), "{ok}");
+        }
+        for bad in ["", ".", "a.", ".a", "a..b", "a b", "a/b", &"a".repeat(64), &format!("{}.{}.{}.{}.{}", "a".repeat(60), "a".repeat(60), "a".repeat(60), "a".repeat(60), "a".repeat(60))] {
+            assert!(!super::dns_name(bad), "{bad}");
+        }
     }
 
     fn pending() -> Pending {

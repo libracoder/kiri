@@ -586,6 +586,10 @@ impl Drop for StartGuard {
 pub struct Container {
     /// Serializes start with stop/kill/remove through guest creation.
     lifecycle: Arc<Mutex<u64>>,
+    /// Orders the changes to the container's DNS names in the guest: a
+    /// rename, a network joined and one left each read the names and tell
+    /// the guest under it, so none is applied over another's.
+    names_sync: Arc<Mutex<()>>,
     /// See `StartGate`.
     start_gate: Arc<StartGate>,
     pub id: String,
@@ -970,8 +974,9 @@ pub fn stop_wait(secs: i64) -> Duration {
     if secs < 0 { Duration::from_secs(365 * 86_400) } else { Duration::from_secs(secs as u64) }
 }
 
-/// One network's DNS names for a renamed container: (bridge, IPv4, IPv6, names).
-type RenamedDns = (String, [u8; 4], Option<[u8; 16]>, Vec<String>);
+/// One network's DNS names for a renamed container: (bridge, IPv4 key, IPv6,
+/// whether the network has IPv4 addresses, names).
+type RenamedDns = (String, [u8; 4], Option<[u8; 16]>, bool, Vec<String>);
 
 pub struct Engine {
     pub volumes: Mutex<super::volumes::Volumes>,
@@ -1861,6 +1866,7 @@ impl Engine {
                 let was_running = s.status == Status::Running;
                 let mut c = Container {
                     lifecycle: Arc::new(Mutex::new(0)),
+                    names_sync: Arc::default(),
                     start_gate: Arc::default(),
                     id: s.id.clone(),
                     name: s.name,
@@ -2584,6 +2590,7 @@ impl Engine {
             id.clone(),
             Container {
                 lifecycle: Arc::new(Mutex::new(0)),
+                names_sync: Arc::default(),
                 start_gate: Arc::default(),
                 id: id.clone(),
                 name,
@@ -2629,6 +2636,11 @@ impl Engine {
     pub fn resolve(&self, key: &str) -> Result<String, Error> {
         let st = self.lock();
         resolve(&st, key)
+    }
+
+    /// The lock that orders a container's DNS name changes (see `names_sync`).
+    fn names_sync(&self, id: &str) -> Option<Arc<Mutex<()>>> {
+        self.lock().containers.get(id).map(|c| c.names_sync.clone())
     }
 
     fn lifecycle(&self, key: &str) -> Result<Arc<Mutex<u64>>, Error> {
@@ -3686,6 +3698,11 @@ impl Engine {
     /// SIGTERM, then SIGKILL after `timeout` if it is still running.
     /// Plugs a running container into one more network as `eth{n}`.
     fn attach_extra(&self, vm: &VmLink, id: &str, n: u32, extra: &ExtraNetwork) -> Result<(), Error> {
+        // Held from the name read to the network being recorded, so a rename
+        // lands before (and the guest then has the new name) or after (and
+        // renames this network too).
+        let sync = self.names_sync(id);
+        let _order = sync.as_ref().map(|m| m.lock().unwrap_or_else(|e| e.into_inner()));
         let net = {
             let mut nets = self.lock_networks();
             nets.settle(&extra.name).map_err(Error::Conflict)?;
@@ -3805,6 +3822,10 @@ impl Engine {
     pub fn disconnect(&self, network: &str, key: &str) -> Result<(), Error> {
         // As for connect.
         let id = self.resolve_after_start(key)?;
+        // A rename sees the network gone, or is done before it goes: never
+        // names put back on an address the container has left.
+        let sync = self.names_sync(&id);
+        let _order = sync.as_ref().map(|m| m.lock().unwrap_or_else(|e| e.into_inner()));
         let net = self.lock_networks().find(network).cloned().ok_or_else(|| Error::NotFound(format!("network {network} not found")))?;
         let (n, ip) = {
             let mut st = self.lock();
@@ -4027,9 +4048,17 @@ impl Engine {
         if !valid_container_name(new) {
             return Err(Error::BadRequest(format!("Invalid container name ({new}), only [a-zA-Z0-9][a-zA-Z0-9_.-] are allowed")));
         }
+        // After a start under way: its names are registered in the guest
+        // only once it is done, so a rename in between would be undone by it.
+        let key = self.resolve_after_start(key)?;
+        // One change of this container's guest names at a time (a network
+        // joined or left, another rename), each told to the guest in the
+        // order it was made.
+        let sync = self.names_sync(&key).ok_or_else(|| gone(&key))?;
+        let _order = sync.lock().unwrap_or_else(|e| e.into_inner());
         let id = {
             let mut st = self.lock();
-            let id = resolve(&st, key)?;
+            let id = resolve(&st, &key)?;
             if let Some(c) = st.containers.values().find(|c| c.name == new && c.id != id) {
                 return Err(name_in_use(new, &c.id));
             }
@@ -4049,8 +4078,10 @@ impl Engine {
         if !updates.is_empty()
             && let Some(vm) = self.awake()
         {
-            for (bridge, ip, ip6, names) in updates {
-                let _ = vm.dns_rename(&bridge, ip, ip6, &names);
+            for (bridge, ip, ip6, v4, names) in updates {
+                if let Err(e) = vm.dns_rename(&id, &bridge, ip, ip6, v4, &names) {
+                    crate::diag::warn!("the guest's DNS names were not renamed", id = &id[..12], network = bridge, error = e);
+                }
             }
         }
         self.emit_container("rename", &id, &[]);
@@ -4078,14 +4109,14 @@ impl Engine {
             let mut names = vec![c.name.clone()];
             names.extend(c.spec.aliases.iter().cloned());
             names.push(hostname.to_owned());
-            out.push((n.bridge.clone(), ip, c.ip6, names));
+            out.push((n.bridge.clone(), ip, c.ip6, !n.no_ipv4, names));
         }
         for (network, ip) in &c.extra_ips {
             let Some(n) = networks.find(network).filter(|n| !n.builtin()) else { continue };
             let ip6 = c.extra_ip6s.iter().find(|(name, _)| name == network).map(|(_, ip)| *ip);
             let mut names = vec![c.name.clone(), c.short_id().to_owned()];
             names.extend(c.spec.extra_networks.iter().find(|x| &x.name == network).into_iter().flat_map(|x| x.aliases.iter().cloned()));
-            out.push((n.bridge.clone(), *ip, ip6, names));
+            out.push((n.bridge.clone(), *ip, ip6, !n.no_ipv4, names));
         }
         out
     }
@@ -4835,11 +4866,12 @@ fn own_name(d: &str) -> &str {
     d.strip_suffix(".kiri.localhost").or_else(|| d.strip_suffix(".kiri.local")).unwrap_or(d)
 }
 
-/// Docker's container-name rule: non-empty, `[a-zA-Z0-9_.-]` only. A name
-/// is a DNS label on user networks and part of `<name>.kiri.localhost`, so
-/// it must not carry spaces, slashes or control characters.
+/// Docker's container-name rule: `[a-zA-Z0-9][a-zA-Z0-9_.-]*`. A name is a
+/// DNS label on user networks and part of `<name>.kiri.localhost`, so it
+/// must not carry spaces, slashes or control characters, nor start with a
+/// dot, dash or underscore.
 fn valid_container_name(n: &str) -> bool {
-    !n.is_empty() && n.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+    n.bytes().next().is_some_and(|b| b.is_ascii_alphanumeric()) && n.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
 }
 
 /// Docker's words for a name another container has, on create and rename,
@@ -6955,6 +6987,77 @@ mod leave_first_network_tests {
     fn done(engine: Arc<Engine>, dir: PathBuf) {
         drop(engine);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The names a rename puts in the guest: the container's own, its
+    /// aliases on each network, whether a network has IPv4 addresses, and
+    /// nothing for a stopped container or the default bridge.
+    #[test]
+    fn a_rename_names_each_network_with_its_aliases_and_address_kind() {
+        let (engine, id, dir) = engine("rename", &[("front", false), ("back6", false)]);
+        connect(&engine, "front", &id, &["web"], "");
+        connect(&engine, "back6", &id, &["api"], "");
+        // Stopped: nothing to tell the guest.
+        engine.rename(&id, "first").unwrap();
+        assert!(engine.dns_names_after_rename(&id).is_empty());
+        {
+            let mut st = engine.lock();
+            let c = st.containers.get_mut(&id).unwrap();
+            c.pid = 4242;
+            c.status = Status::Running;
+            c.ip = None;
+            c.extra_ips = vec![("front".to_owned(), [10, 98, 0, 5]), ("back6".to_owned(), [10, 98, 1, 5])];
+            c.extra_ip6s = vec![("back6".to_owned(), [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5])];
+        }
+        engine.lock_networks().find_mut("back6").unwrap().no_ipv4 = true;
+        engine.rename(&id, "second").unwrap();
+        let mut sent = engine.dns_names_after_rename(&id);
+        sent.sort_by(|a, b| a.0.cmp(&b.0));
+        let short = engine.lock().containers[&id].short_id().to_owned();
+        let bridge_of = |n: &str| engine.lock_networks().find(n).unwrap().bridge.clone();
+        assert_eq!(sent.len(), 2);
+        let front = sent.iter().find(|u| u.0 == bridge_of("front")).unwrap();
+        assert_eq!((front.1, front.3, front.4.clone()), ([10, 98, 0, 5], true, vec!["second".to_owned(), short.clone(), "web".to_owned()]));
+        let back = sent.iter().find(|u| u.0 == bridge_of("back6")).unwrap();
+        assert_eq!((back.1, back.2.is_some(), back.3, back.4.clone()), ([10, 98, 1, 5], true, false, vec!["second".to_owned(), short, "api".to_owned()]));
+        done(engine, dir);
+    }
+
+    /// A rename waits for a change of the same container's guest names under
+    /// way (a network joined or left), and for a start: it is never told to
+    /// the guest in the middle of one, or over it.
+    #[test]
+    fn a_rename_waits_for_the_names_change_under_way() {
+        let (engine, id, dir) = engine("order", &[]);
+        let sync = engine.names_sync(&id).unwrap();
+        let held = sync.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (e2, id2) = (engine.clone(), id.clone());
+        let t = std::thread::spawn(move || {
+            e2.rename(&id2, "later").unwrap();
+            tx.send(()).unwrap();
+        });
+        assert!(rx.recv_timeout(Duration::from_millis(300)).is_err(), "renamed while a names change held the order");
+        assert_eq!(engine.lock().containers[&id].name, "probe");
+        drop(held);
+        rx.recv_timeout(Duration::from_secs(5)).expect("renamed once the change was done");
+        t.join().unwrap();
+        assert_eq!(engine.lock().containers[&id].name, "later");
+        done(engine, dir);
+    }
+
+    /// A container name starts with a letter or digit, as Docker's does.
+    #[test]
+    fn a_container_name_starts_with_a_letter_or_digit() {
+        for ok in ["a", "db", "0db", "my_db-1.x", "DB"] {
+            assert!(valid_container_name(ok), "{ok}");
+        }
+        for bad in ["", ".db", "-db", "_db", "d b", "d/b", "dé"] {
+            assert!(!valid_container_name(bad), "{bad}");
+        }
+        let (engine, id, dir) = engine("badname", &[]);
+        assert!(matches!(engine.rename(&id, "_x"), Err(Error::BadRequest(_))));
+        done(engine, dir);
     }
 
     /// The .NET Aspire sequence: created on bridge, connected to a session

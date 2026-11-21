@@ -712,11 +712,18 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
                     }
                     None => Msg::Error(&format!("container {id} is not running")).encode(&mut out),
                 },
-                Ok(Msg::DnsRename { bridge, ip, ip6, names }) => {
+                Ok(Msg::DnsRename { id, bridge, ip, ip6, v4, names }) => {
                     // The names registered at start are keyed by address, so
                     // they are replaced as a set; its `--dns` servers stay. A
                     // stopped container sends no such frame. No reply.
-                    dns.rename(bridge, ip, <[u8; 16]>::try_from(ip6).ok(), &names.iter().collect::<Vec<_>>());
+                    // Only a live container's own address on one of Kiri's
+                    // bridges: a frame that raced the container's exit or its
+                    // leaving the network, or that names another's address,
+                    // changes nothing.
+                    if rename_allowed(procs, id, bridge, ip) {
+                        let ip6 = <[u8; 16]>::try_from(ip6).ok();
+                        dns.rename(bridge, ip, ip6, v4, &names.iter().collect::<Vec<_>>());
+                    }
                     continue;
                 }
                 Ok(Msg::UplinkQuery) => match dhcp.as_ref().and_then(|d| d.lease.as_ref()) {
@@ -826,6 +833,15 @@ fn live_pid(procs: &HashMap<libc::pid_t, Proc>, id: &str) -> Option<libc::pid_t>
 /// and is not yet entered: its child has perhaps not joined it, and
 /// `/proc/<pid>/ns/net` could still be the host's. Answered as for a
 /// container that is not running.
+/// Whether a `DnsRename` may change names: `ip` on `bridge` is a live
+/// container's own entry, and the bridge is one of Kiri's user networks.
+fn rename_allowed(procs: &HashMap<libc::pid_t, Proc>, id: &str, bridge: &str, ip: [u8; 4]) -> bool {
+    bridge.starts_with("kiri")
+        && bridge != "kiri0"
+        && ip != [0; 4]
+        && procs.values().any(|p| p.run.container.is_none() && p.exited.is_none() && p.run.id == id && p.run.dns_entries.iter().any(|(b, a)| b == bridge && *a == ip))
+}
+
 fn netns_pid(procs: &HashMap<libc::pid_t, Proc>, id: &str) -> Option<libc::pid_t> {
     procs.iter().find(|(_, p)| p.run.container.is_none() && p.run.id == id && p.exited.is_none() && (!p.run.joins_netns || p.enterable())).map(|(pid, _)| *pid)
 }
@@ -1207,8 +1223,31 @@ fn reap(procs: &mut HashMap<libc::pid_t, Proc>) {
 
 #[cfg(test)]
 mod running_tests {
-    use super::{Process, await_start, live_pid, netns_pid, new_proc, running, running_pid, settle_roots};
+    use super::{Process, await_start, live_pid, netns_pid, new_proc, rename_allowed, running, running_pid, settle_roots};
     use std::collections::HashMap;
+
+    #[test]
+    fn a_dns_rename_changes_only_a_live_containers_own_address() {
+        let ip = [10, 5, 0, 2];
+        let mut procs = HashMap::new();
+        let mut run = Process::for_test("c1", 100);
+        run.dns_entries.push(("kiri1".to_owned(), ip));
+        procs.insert(100, new_proc(run, 0, 0));
+        assert!(rename_allowed(&procs, "c1", "kiri1", ip));
+        assert!(!rename_allowed(&procs, "c2", "kiri1", ip), "another container's id");
+        assert!(!rename_allowed(&procs, "c1", "kiri1", [10, 5, 0, 3]), "another address");
+        assert!(!rename_allowed(&procs, "c1", "kiri2", ip), "a network it is not on");
+        assert!(!rename_allowed(&procs, "c1", "kiri0", ip), "the default bridge");
+        assert!(!rename_allowed(&procs, "c1", "eth0", ip), "not one of Kiri's bridges");
+        let mut run = Process::for_test("c3", 300);
+        run.dns_entries.push(("kiri1".to_owned(), [0; 4]));
+        procs.insert(300, new_proc(run, 0, 0));
+        assert!(!rename_allowed(&procs, "c3", "kiri1", [0; 4]), "no address");
+        // Once it has exited its names are gone with it: a late frame
+        // must not put them back.
+        procs.get_mut(&100).unwrap().exited = Some((0, 0));
+        assert!(!rename_allowed(&procs, "c1", "kiri1", ip));
+    }
 
     #[test]
     fn a_restarted_container_is_found_never_its_exited_run() {
