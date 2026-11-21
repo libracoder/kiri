@@ -217,8 +217,8 @@ fn untar_in(reader: impl Read, dest: &Path, detect_userns: fn() -> bool) -> io::
                 continue;
             }
             make_special(dest, &path, entry.header(), kind, userns)?;
-        } else {
-            entry.unpack_in(dest)?;
+        } else if entry.unpack_in(dest)? {
+            keep_zero_time(dest, &path, entry.header())?;
         }
     }
     Ok(total)
@@ -298,6 +298,22 @@ fn uid_map_in_user_namespace(first_line: &str) -> bool {
         // Not a map: taken as the first namespace, as Docker takes it.
         _ => false,
     }
+}
+
+/// Puts back a time of 0 the tar crate made 1 (it does so for every 0, so
+/// that tools which take 0 for "no time" see one). Docker keeps the 0, and
+/// what a container reads must be what the archive says. Folders are left
+/// alone: what is unpacked into one changes its time afterwards anyway.
+pub(crate) fn keep_zero_time(dest: &Path, path: &Path, h: &tar::Header) -> io::Result<()> {
+    if h.mtime()? != 0 || h.entry_type().is_dir() || h.entry_type().is_hard_link() {
+        return Ok(());
+    }
+    let root = inroot::open_root(dest)?;
+    let (parent, name) = hardlink_parent(root.as_fd(), path)?;
+    let t = [libc::timespec { tv_sec: 0, tv_nsec: 0 }, libc::timespec { tv_sec: 0, tv_nsec: 0 }];
+    // SAFETY: a confined parent descriptor, a NUL-terminated name and two timespecs.
+    sys::check(unsafe { libc::utimensat(parent.as_raw_fd(), name.as_ptr(), t.as_ptr(), libc::AT_SYMLINK_NOFOLLOW) } as _, "set time")?;
+    Ok(())
 }
 
 fn escapes() -> io::Error {
@@ -839,6 +855,35 @@ mod tests {
             }
         };
         assert!(status.success(), "unpacking in a user namespace failed: {status}");
+    }
+
+    /// A time of 0 in the archive is 0 on disk, as Docker unpacks it. The
+    /// tar crate makes it 1 ("0-mtime files ... some tools don't ingest them
+    /// well"), which a container then sees.
+    #[test]
+    fn a_zero_time_stays_zero() {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: a plain getter.
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipped: needs root to keep owners");
+            return;
+        }
+        let mut b = tar::Builder::new(Vec::new());
+        let mut f = header(1, 0o644);
+        b.append_data(&mut f, "f", &b"x"[..]).unwrap();
+        let mut l = header(0, 0o777);
+        l.set_entry_type(tar::EntryType::Symlink);
+        b.append_link(&mut l, "l", "f").unwrap();
+        let mut g = header(1, 0o644);
+        g.set_mtime(5);
+        g.set_cksum();
+        b.append_data(&mut g, "g", &b"y"[..]).unwrap();
+        let bytes = b.into_inner().unwrap();
+        let dest = scratch("zero-time");
+        untar(Capped { inner: &bytes[..], left: u64::MAX }, &dest).unwrap();
+        let t = |p: &str| fs::symlink_metadata(dest.join(p)).unwrap().mtime();
+        assert_eq!((t("f"), t("l"), t("g")), (0, 0, 5));
+        let _ = fs::remove_dir_all(&dest);
     }
 
     /// A layer that expands past its cap is refused.
