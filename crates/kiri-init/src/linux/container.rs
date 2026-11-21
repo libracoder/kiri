@@ -2163,13 +2163,8 @@ fn mount_container_filesystems(privileged: bool, shm_size: u64) -> io::Result<()
         // SAFETY: valid NUL-terminated path.
         unsafe { libc::chmod(name.as_ptr(), 0o666) };
     }
-    for (target, link) in [
-        (c"/proc/self/fd", c"dev/fd"),
-        (c"/proc/self/fd/0", c"dev/stdin"),
-        (c"/proc/self/fd/1", c"dev/stdout"),
-        (c"/proc/self/fd/2", c"dev/stderr"),
-        (c"pts/ptmx", c"dev/ptmx"),
-    ] {
+    // The host's /proc still, before the pivot.
+    for (target, link) in dev_links(Path::new("/proc/kcore").exists()) {
         // SAFETY: valid NUL-terminated strings; the host copy may have some.
         unsafe {
             libc::unlink(link.as_ptr());
@@ -2189,6 +2184,22 @@ fn mount_container_filesystems(privileged: bool, shm_size: u64) -> io::Result<()
         harden_proc()?;
     }
     Ok(())
+}
+
+/// The links runc makes in a container's /dev (relative to its root):
+/// /dev/core only when the host has /proc/kcore, as runc checks.
+fn dev_links(kcore: bool) -> Vec<(&'static CStr, &'static CStr)> {
+    let mut links = vec![
+        (c"/proc/self/fd", c"dev/fd"),
+        (c"/proc/self/fd/0", c"dev/stdin"),
+        (c"/proc/self/fd/1", c"dev/stdout"),
+        (c"/proc/self/fd/2", c"dev/stderr"),
+        (c"pts/ptmx", c"dev/ptmx"),
+    ];
+    if kcore {
+        links.push((c"/proc/kcore", c"dev/core"));
+    }
+    links
 }
 
 /// Recreates the host's character and block devices under `to` (the
@@ -3271,6 +3282,15 @@ mod tests {
             assert_eq!(super::resolve_user("48213").unwrap(), (48_213, 0));
         }
         assert_eq!(super::resolve_user("48213:7").unwrap(), (48_213, 7), "a group given is kept");
+    }
+
+    /// runc's /dev links, /dev/core with them when the host has /proc/kcore
+    /// (Docker's containers have it).
+    #[test]
+    fn dev_has_runcs_links_and_core_when_the_host_has_kcore() {
+        let names = |kcore| super::dev_links(kcore).iter().map(|(t, l)| format!("{} -> {}", l.to_str().unwrap(), t.to_str().unwrap())).collect::<Vec<_>>();
+        assert_eq!(names(false), ["dev/fd -> /proc/self/fd", "dev/stdin -> /proc/self/fd/0", "dev/stdout -> /proc/self/fd/1", "dev/stderr -> /proc/self/fd/2", "dev/ptmx -> pts/ptmx"]);
+        assert_eq!(names(true).last().unwrap(), "dev/core -> /proc/kcore");
     }
 
     /// A mount line is three fields, or seven with a volume's driver options.

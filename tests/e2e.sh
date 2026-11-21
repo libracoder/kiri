@@ -386,6 +386,8 @@ t workdir-leaked-fd "started 0" bash -c "s=0; for n in \$(seq 3 25); do $D run -
 t user-numeric "uid=1000" $D run --rm -u 1000 alpine id
 # A uid /etc/passwd does not list runs with group 0, as Docker gives it.
 t user-numeric-unlisted-gid "uid=1000 gid=0(root)" $D run --rm -u 1000 alpine id
+# runc's /dev/core link, made when the kernel has /proc/kcore, as Docker's containers have it.
+t dev-core-link "dev-core ok" $D run --rm alpine sh -c 'if [ -e /proc/kcore ]; then [ "$(readlink /dev/core)" = /proc/kcore ] && echo dev-core ok; else [ ! -e /dev/core ] && echo dev-core ok; fi'
 t user-name "uid=70(postgres)" $D run --rm -u postgres postgres:17-alpine id
 t user-group "gid=0(root)" $D run --rm -u 1000:0 alpine id
 # The user's own group is one of its supplementary groups, as Docker sets them.
