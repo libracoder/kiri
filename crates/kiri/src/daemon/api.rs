@@ -3367,10 +3367,10 @@ fn upload_reader<'a>(head: Vec<u8>, rest: impl io::Read + 'a) -> Result<Box<dyn 
 fn archive_put(req: &Request, engine: &Engine, id: &str, w: &mut UnixStream, r: &mut BufReader<UnixStream>) -> io::Result<Next> {
     use kiri_proto::copy_flags;
     let path = req.query("path").unwrap_or("/");
-    let mut flags = copy_flags::CHUNKED;
-    if req.flag("copyUIDGID") {
-        flags |= copy_flags::KEEP_OWNERS;
-    }
+    // The archive's owners are kept, as Docker does on a copy in: the files
+    // belong to whoever the tar says, not to root (#594). `copyUIDGID` (the
+    // CLI's `-a`) asks for the same.
+    let mut flags = copy_flags::CHUNKED | copy_flags::KEEP_OWNERS;
     if req.flag("noOverwriteDirNonDir") {
         flags |= copy_flags::NO_OVERWRITE_DIR_NON_DIR;
     }
