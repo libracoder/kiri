@@ -4059,6 +4059,14 @@ impl Engine {
         // After a start under way: its names are registered in the guest
         // only once it is done, so a rename in between would be undone by it.
         let key = self.resolve_after_start(key)?;
+        // A start reads the name and sets the pid under the container's
+        // lifecycle lock, as a stop+start does: held from the name change to
+        // the guest being told, so a start that comes meanwhile registers the
+        // new name, and one under way is done (its pid set) when the names
+        // are read below. Taken before `names_sync`, in the order a start's
+        // `attach_extra` takes them.
+        let lifecycle = self.lifecycle(&key)?;
+        let _life = lifecycle.lock().unwrap_or_else(|e| e.into_inner());
         // One change of this container's guest names at a time (a network
         // joined or left, another rename), each told to the guest in the
         // order it was made.
@@ -7087,6 +7095,29 @@ mod leave_first_network_tests {
         let mut buf = Vec::new();
         kiri_proto::encode_dns_rename(&mut buf, &id, &sent[0].0, sent[0].1, sent[0].2, sent[0].3, &sent[0].4);
         assert!(kiri_proto::decode(&buf).is_ok());
+        done(engine, dir);
+    }
+
+    /// A rename waits for the container's lifecycle lock, which a start holds
+    /// from reading the name until its pid is set (and a stop, kill or
+    /// remove holds too): a start never registers the name a rename replaced.
+    #[test]
+    fn a_rename_waits_for_a_start_or_stop_under_way() {
+        let (engine, id, dir) = engine("order-life", &[]);
+        let lifecycle = engine.lifecycle(&id).unwrap();
+        let held = lifecycle.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (e2, id2) = (engine.clone(), id.clone());
+        let t = std::thread::spawn(move || {
+            e2.rename(&id2, "later").unwrap();
+            tx.send(()).unwrap();
+        });
+        assert!(rx.recv_timeout(Duration::from_millis(300)).is_err(), "renamed while a start held the lifecycle");
+        assert_eq!(engine.lock().containers[&id].name, "probe");
+        drop(held);
+        rx.recv_timeout(Duration::from_secs(5)).expect("renamed once the start was done");
+        t.join().unwrap();
+        assert_eq!(engine.lock().containers[&id].name, "later");
         done(engine, dir);
     }
 
