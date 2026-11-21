@@ -65,14 +65,68 @@ unsafe fn nss<T>(mut call: impl FnMut(*mut T, *mut c_char, usize, *mut *mut T) -
     }
 }
 
-fn account_by_uid(uid: u32) -> io::Result<Option<Rec<libc::passwd>>> {
-    // SAFETY: getpwuid_r with a passwd record and a buffer of the stated size.
-    unsafe { nss(|rec, buf, len, out| libc::getpwuid_r(uid, rec, buf, len, out)) }
+/// An account: its name, uid and primary group.
+#[derive(Debug, PartialEq, Eq)]
+struct Account {
+    name: CString,
+    uid: u32,
+    gid: u32,
 }
 
-fn account_by_name(name: &CStr) -> io::Result<Option<Rec<libc::passwd>>> {
+impl Account {
+    fn from_rec(a: &Rec<libc::passwd>) -> Option<Account> {
+        if a.rec.pw_name.is_null() {
+            return None;
+        }
+        // SAFETY: pw_name is a NUL-terminated string in the record's buffer.
+        let name = unsafe { CStr::from_ptr(a.rec.pw_name) }.to_owned();
+        Some(Account { name, uid: a.rec.pw_uid, gid: a.rec.pw_gid })
+    }
+}
+
+fn account_by_uid(uid: u32) -> io::Result<Option<Account>> {
+    // SAFETY: getpwuid_r with a passwd record and a buffer of the stated size.
+    match unsafe { nss(|rec, buf, len, out| libc::getpwuid_r(uid, rec, buf, len, out)) }? {
+        Some(a) => Ok(Account::from_rec(&a)),
+        None => Ok(getent(&uid.to_string())?.filter(|a| a.uid == uid)),
+    }
+}
+
+fn account_by_name(name: &CStr) -> io::Result<Option<Account>> {
     // SAFETY: getpwnam_r with a valid C string, a passwd record and a buffer of the stated size.
-    unsafe { nss(|rec, buf, len, out| libc::getpwnam_r(name.as_ptr(), rec, buf, len, out)) }
+    match unsafe { nss(|rec, buf, len, out| libc::getpwnam_r(name.as_ptr(), rec, buf, len, out)) }? {
+        Some(a) => Ok(Account::from_rec(&a)),
+        None => Ok(getent(&name.to_string_lossy())?.filter(|a| a.name.as_c_str() == name)),
+    }
+}
+
+/// An account the system knows from another source than /etc/passwd (SSSD,
+/// LDAP, winbind, Entra ID, systemd-homed): this binary is static, so its own
+/// lookups read /etc/passwd alone and can't load the system's NSS modules
+/// (#349). `getent` uses them. Ok(None): no such account, or no getent.
+fn getent(key: &str) -> io::Result<Option<Account>> {
+    if key.is_empty() || key.starts_with('-') {
+        return Ok(None);
+    }
+    let out = match std::process::Command::new("getent").args(["passwd", key]).stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null()).output() {
+        Ok(out) => out,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    match out.status.code() {
+        Some(0) => Ok(passwd_line(&String::from_utf8_lossy(&out.stdout))),
+        // 2: no such key.
+        Some(2) => Ok(None),
+        _ => Err(io::Error::other(format!("getent passwd {key}: {}", out.status))),
+    }
+}
+
+/// `name:password:uid:gid:…`, the first line of getent's answer.
+fn passwd_line(text: &str) -> Option<Account> {
+    let mut f = text.lines().next()?.split(':');
+    let name = CString::new(f.next().filter(|n| !n.is_empty())?).ok()?;
+    let _password = f.next()?;
+    Some(Account { name, uid: f.next()?.parse().ok()?, gid: f.next()?.parse().ok()? })
 }
 
 fn group_by_name(name: &CStr) -> io::Result<Rec<libc::group>> {
@@ -111,8 +165,7 @@ pub fn members(group: &str) -> io::Result<Vec<String>> {
 
 /// A user's numeric id, if the account exists.
 pub fn uid(user: &str) -> Option<u32> {
-    let a = account_by_name(&c_name(user).ok()?).ok()??;
-    Some(a.rec.pw_uid)
+    Some(account_by_name(&c_name(user).ok()?).ok()??.uid)
 }
 
 /// The uids of the names in a group record, sorted. A name with no account
@@ -122,7 +175,7 @@ fn uids_of(group: &libc::group) -> io::Result<Vec<u32>> {
     let mut out = Vec::new();
     for name in names(group) {
         if let Some(a) = account_by_name(name)? {
-            out.push(a.rec.pw_uid);
+            out.push(a.uid);
         }
     }
     out.sort_unstable();
@@ -174,12 +227,7 @@ fn current(group: &CStr) -> io::Result<Option<Rec<libc::group>>> {
 fn member_of(uid: u32, group: Option<&libc::group>) -> io::Result<bool> {
     let Some(group) = group else { return Ok(false) };
     let Some(a) = account_by_uid(uid)? else { return Ok(false) };
-    if a.rec.pw_name.is_null() {
-        return Ok(false);
-    }
-    // SAFETY: pw_name is a NUL-terminated string in the record's buffer.
-    let user = unsafe { CStr::from_ptr(a.rec.pw_name) };
-    Ok(group_member(user, a.rec.pw_gid, group))
+    Ok(group_member(&a.name, a.gid, group))
 }
 
 fn member(uid: u32, group: &CStr) -> io::Result<bool> {
@@ -467,7 +515,7 @@ mod tests {
         let Some(a) = account_by_uid(uid).unwrap() else { return };
         let g = {
             // SAFETY: getgrgid_r with a group record and a buffer of the stated size.
-            let gid = a.rec.pw_gid;
+            let gid = a.gid;
             unsafe { nss(|rec, buf, len, out| libc::getgrgid_r(gid, rec, buf, len, out)) }.unwrap()
         };
         let Some(g) = g else { return };
@@ -482,17 +530,14 @@ mod tests {
     fn lookups_from_many_threads_agree() {
         // SAFETY: getuid cannot fail.
         let uid = unsafe { libc::getuid() };
-        let Some(a) = account_by_uid(uid).unwrap() else { return };
-        // SAFETY: pw_name is a NUL-terminated string in the record's buffer.
-        let me = unsafe { CStr::from_ptr(a.rec.pw_name) }.to_owned();
+        let Some(me) = account_by_uid(uid).unwrap() else { return };
+        // Asked of getent too, so once rather than in the loop.
+        assert!(account_by_uid(u32::MAX - 7).unwrap().is_none());
         std::thread::scope(|s| {
             for _ in 0..8 {
                 s.spawn(|| {
                     for _ in 0..200 {
-                        let b = account_by_uid(uid).unwrap().unwrap();
-                        // SAFETY: as above.
-                        assert_eq!(unsafe { CStr::from_ptr(b.rec.pw_name) }, me.as_c_str());
-                        assert!(account_by_uid(u32::MAX - 7).unwrap().is_none());
+                        assert_eq!(account_by_uid(uid).unwrap().unwrap(), me);
                     }
                 });
             }
@@ -671,5 +716,19 @@ mod tests {
     #[test]
     fn acl_without_users_is_the_plain_mode() {
         assert_eq!(acl(&[]).len(), 4 + 4 * 8);
+    }
+
+    /// Accounts only NSS knows (#349) come from getent's passwd line.
+    #[test]
+    fn getent_lines_read_as_accounts() {
+        let alice = Account { name: c"alice".to_owned(), uid: 5001, gid: 5001 };
+        assert_eq!(passwd_line("alice:x:5001:5001:Directory user:/home/alice:/bin/bash\n"), Some(alice));
+        assert_eq!(passwd_line("alice@corp.example:*:1916400001:1916400001::/home/alice:/bin/sh").map(|a| a.uid), Some(1_916_400_001));
+        for bad in ["", "\n", ":x:1:1::/:/bin/sh", "alice:x:one:1::/:/bin/sh", "alice:x:1"] {
+            assert_eq!(passwd_line(bad), None, "{bad:?}");
+        }
+        // Never an option to getent.
+        assert_eq!(getent("--help").unwrap(), None);
+        assert_eq!(getent("").unwrap(), None);
     }
 }
