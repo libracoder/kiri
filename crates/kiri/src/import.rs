@@ -1,10 +1,10 @@
 //! Moving to Kiri from OrbStack or Docker Desktop: images, volumes and
 //! containers, copied through the docker CLI so each engine speaks its own
 //! API. The source is only read: `docker save` for images, `inspect` for
-//! containers, and for a volume `docker cp` out of a container that mounts
-//! it read-only, is never started and is removed after (that keeps file
-//! owners, which a copy through the Finder would lose). Containers arrive
-//! stopped.
+//! containers, and for a volume a short-lived GNU tar helper that mounts it
+//! read-only and is removed after (that keeps file owners and extended
+//! attributes, which `docker cp` or a copy through the Finder would lose).
+//! Containers arrive stopped.
 
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
@@ -359,9 +359,30 @@ fn retar(mut from: impl Read, mut to: impl Write, name: Option<&str>) -> io::Res
     }
 }
 
-/// Official images with `tar` and `sh`: one of these does Kiri's half of a
-/// volume copy.
+/// Official images with `tar` and `sh`, of which the GNU tar ones
+/// ([`GNU_TAR_IMAGES`]) do either half of a volume copy.
 const TAR_IMAGES: [&str; 4] = ["alpine", "busybox", "debian", "ubuntu"];
+
+/// BusyBox tar (alpine, busybox) silently drops `user.*` xattrs, which is
+/// where Supabase Storage keeps object metadata: reads then fail with
+/// ENODATA. Both ends of a volume copy need an image with GNU tar (#485).
+const GNU_TAR_IMAGES: [&str; 2] = ["debian", "ubuntu"];
+
+/// xattrs travel as pax records: the format and `--xattrs` are both needed
+/// when writing them. Passed as argv, so `*` is literal, not shell-globbed.
+const STORE_XATTRS: [&str; 3] = ["--format=pax", "--xattrs", "--xattrs-include=*"];
+
+/// Only `user.*` is portable to apply on the other engine; system-defined
+/// namespaces (security, trusted) are not (GNU tar's extraction default).
+const RESTORE_XATTRS: &str = "--xattrs '--xattrs-include=user.*'";
+
+/// Whether an official image name is one of [`GNU_TAR_IMAGES`]. An
+/// official digest for the very same repository is checked separately in
+/// [`pick_helper`], so a look-alike still cannot be run.
+fn gnu_tar(name: &str) -> bool {
+    let repo = name.rsplit_once(':').map_or(name, |(r, _)| r);
+    GNU_TAR_IMAGES.iter().any(|base| repo == *base || repo.ends_with(&format!("/{base}")))
+}
 
 /// Whether a `RepoDigests` entry shows the engine pulled the image from an
 /// official repository of [`TAR_IMAGES`]: Docker Hub's, or one of its two
@@ -387,7 +408,7 @@ fn pick_helper(images: &[Value]) -> Option<String> {
         let digests = strings(&i["RepoDigests"]);
         strings(&i["RepoTags"]).into_iter().find(|name| {
             let Some((repo, _)) = name.rsplit_once(':').filter(|(_, tag)| !tag.is_empty() && !tag.contains('/')) else { return false };
-            digests.iter().any(|d| official(d) && d.split_once('@').is_some_and(|(r, _)| r == repo))
+            gnu_tar(name) && digests.iter().any(|d| official(d) && d.split_once('@').is_some_and(|(r, _)| r == repo))
         })
     })
 }
@@ -405,27 +426,41 @@ fn helper_in_kiri() -> io::Result<Option<String>> {
 /// once per volume.
 static PULL_FAILED: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
 
-/// [`helper_in_kiri`], else busybox fetched by Kiri: from the public mirror,
+/// [`helper_in_kiri`], else Debian fetched by Kiri: from the public mirror,
 /// else from Docker Hub when no image of the person's is called that.
 /// Nothing is taken from the source.
 fn helper() -> io::Result<String> {
     if let Some(name) = helper_in_kiri()? {
         return Ok(name);
     }
-    let none = || io::Error::other("Kiri needs one small official image to unpack volumes with: pull alpine or busybox in Kiri (docker pull alpine) and import again. A re-tagged or loaded copy does not count");
+    let none = || io::Error::other("Kiri needs one small official GNU tar image to unpack volumes with: pull debian in Kiri (docker pull debian:trixie) and import again. A re-tagged or loaded copy does not count");
     let mut failed = PULL_FAILED.lock().unwrap_or_else(|e| e.into_inner());
     if failed.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(60)) {
         return Err(none());
     }
     let kiri = crate::flavor::CONTEXT.get();
     let pull = |name: &str| cli().is_ok_and(|mut c| c.args(["--context", kiri, "pull", "-q", name]).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success()));
-    if (pull("mirror.gcr.io/library/busybox") || (!has(kiri, "image", "busybox:latest") && pull("busybox")))
+    if (pull("mirror.gcr.io/library/debian:trixie") || (!has(kiri, "image", "debian:trixie") && pull("debian:trixie")))
         && let Some(name) = helper_in_kiri()?
     {
         return Ok(name);
     }
     *failed = Some(std::time::Instant::now());
     Err(none())
+}
+
+/// The same GNU tar image the destination uses, available on the source:
+/// `docker cp` cannot carry `user.*` xattrs, so a helper has to read them
+/// there. Pull it if the source has not got it (#485).
+fn source_helper(ctx: &str, img: &str) -> io::Result<String> {
+    if has(ctx, "image", img) {
+        return Ok(img.to_owned());
+    }
+    let pulled = cli().is_ok_and(|mut c| c.args(["--context", ctx, "pull", "-q", img]).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success()));
+    if pulled {
+        return Ok(img.to_owned());
+    }
+    Err(io::Error::other(format!("{ctx} has no GNU tar image to read volumes with; pull {img} there, or import the volume by hand (BusyBox tar would lose extended attributes)")))
 }
 
 /// The label on the containers an import makes for itself.
@@ -569,57 +604,44 @@ pub fn volume_with(source: &str, name: &str, force: bool) -> io::Result<()> {
             return Err(io::Error::other(why));
         }
     }
-    // Nothing runs on the source: a container that is made and never
-    // started mounts the volume read-only (`volume-nocopy`: its image's
-    // files don't go in), from any image there and never pulled, and
-    // `docker cp` reads it as an archive with owners, modes and links as
-    // they are. It goes after, with any anonymous volume its image made;
-    // one an import that was stopped left behind goes first.
-    let names = image_names(ctx)?;
-    let reader_image = match names.first() {
-        Some(n) => n.clone(),
-        None => json_lines(ctx, &["image", "ls", "--format", "{{json .ID}}"])?
-            .first()
-            .and_then(|v| v.as_str().map(str::to_owned))
-            .ok_or_else(|| io::Error::other(format!("{ctx} has no image to read volumes through; pull any image there and import again")))?,
-    };
+    // GNU tar on the source reads the volume read-only (`volume-nocopy`:
+    // no image files go in) and puts owners and xattrs in the stream;
+    // `docker cp` leaves the xattrs out (#485). A helper an import that was
+    // stopped left behind goes first.
+    let src_img = source_helper(ctx, &img)?;
     let reader = format!("kiri-import-{name}");
     let leftover = json_lines(ctx, &["inspect", "--type", "container", "--format", "{{json .Config.Labels}}", &reader]).unwrap_or_default();
     if leftover.first().is_some_and(|l| l["dev.kiri.import-helper"] == "1") {
         let _ = cli()?.args(["--context", ctx, "rm", "-fv", &reader]).stdout(Stdio::null()).stderr(Stdio::null()).status();
     }
-    // At a path no image can have a VOLUME of its own at or under.
-    use std::hash::BuildHasher;
-    let at = format!("/kiri-import-{:016x}", std::collections::hash_map::RandomState::new().hash_one(name));
-    let mount = format!("type=volume,src={name},dst={at},readonly,volume-nocopy");
-    let made = cli()?
-        .args(["--context", ctx, "create", "--name", &reader, "--pull", "never", "--network", "none", "--label", HELPER, "--entrypoint", &at, "--mount", &mount, &reader_image])
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()?;
-    if !made.status.success() {
-        return Err(io::Error::other(format!("{ctx}: {}", String::from_utf8_lossy(&made.stderr).trim())));
-    }
-    let copied = copy_volume(ctx, &format!("{reader}:{at}/."), name, &img);
-    let _ = cli()?.args(["--context", ctx, "rm", "-v", &reader]).stdout(Stdio::null()).stderr(Stdio::null()).status();
-    copied.map_err(|e| io::Error::other(format!("{e}; {name} is unfinished in Kiri: the next import empties it and copies it again, replacing what is in it then")))
+    let mount = format!("type=volume,src={name},dst=/from,readonly,volume-nocopy");
+    let mut read = cli()?;
+    read.args(volume_reader_args(ctx, &reader, &mount, &src_img));
+    copy_volume(read, ctx, name, &img).map_err(|e| io::Error::other(format!("{e}; {name} is unfinished in Kiri: the next import empties it and copies it again, replacing what is in it then")))
 }
 
-/// `docker cp` out of the reader on the source, through [`retar`], untarred
-/// into the volume by a helper on Kiri that removes itself. The helper
-/// marks the volume unfinished first (emptying what an unfinished copy
-/// left), and the mark goes only once every part of the copy succeeded.
-fn copy_volume(ctx: &str, from: &str, name: &str, img: &str) -> io::Result<()> {
+/// GNU tar in a helper on the source, with the xattrs in the stream.
+fn volume_reader_args<'a>(ctx: &'a str, reader: &'a str, mount: &'a str, img: &'a str) -> Vec<&'a str> {
+    let mut args = vec!["--context", ctx, "run", "--rm", "--name", reader, "--network", "none", "--label", HELPER, "--pull", "never", "--mount", mount, img, "tar"];
+    args.extend(STORE_XATTRS);
+    args.extend(["-C", "/from", "-cf", "-", "."]);
+    args
+}
+
+/// A GNU tar stream out of the reader on the source, through [`retar`],
+/// untarred into the volume by a helper on Kiri that removes itself. The
+/// helper marks the volume unfinished first (emptying what an unfinished
+/// copy left), and the mark goes only once every part of the copy succeeded.
+fn copy_volume(read: Command, ctx: &str, name: &str, img: &str) -> io::Result<()> {
     let kiri = crate::flavor::CONTEXT.get();
     let dst_mount = format!("{name}:/to");
-    let mut read = cli()?;
-    read.args(["--context", ctx, "cp", from, "-"]);
     let mut write = cli()?;
     // Emptied in one pass, all but the mark (a folder by that name counts as
     // it); anything still there after, hidden names too, stops the copy with
     // the mark left on.
     let script = format!(
-        r#"set -e; cd /to; if [ -e {m} ]; then find . -mindepth 1 -maxdepth 1 ! -name {m} -exec rm -rf -- {{}} + || true; for f in .[!.]* ..?* *; do if [ "$f" != {m} ] && {{ [ -e "$f" ] || [ -L "$f" ]; }}; then echo "could not empty the volume: $f is left" >&2; exit 1; fi; done; fi; touch {m}; tar -xpf -"#,
+        r#"set -e; cd /to; if [ -e {m} ]; then find . -mindepth 1 -maxdepth 1 ! -name {m} -exec rm -rf -- {{}} + || true; for f in .[!.]* ..?* *; do if [ "$f" != {m} ] && {{ [ -e "$f" ] || [ -L "$f" ]; }}; then echo "could not empty the volume: $f is left" >&2; exit 1; fi; done; fi; touch {m}; tar {xattrs} -xpf -"#,
+        xattrs = RESTORE_XATTRS,
         m = UNFINISHED
     );
     write.args(["--context", kiri, "run", "--rm", "-i", "--network", "none", "--label", HELPER, "-v", &dst_mount, "--pull", "never", "--entrypoint", "sh", img, "-c", &script]);
@@ -974,9 +996,9 @@ mod tests {
         assert_eq!(parse(&["podman"]).unwrap(), (Some("podman"), Ask::Everything, false));
     }
 
-    // Kiri's half of a volume copy runs only an image the engine pulled
-    // from an official repository, as its repo digests show: never one
-    // that only has a name like one, wherever it came from.
+    // Kiri's half of a volume copy runs only an official GNU tar image the
+    // engine pulled, as its repo digests show: never one that only has a
+    // name like one, wherever it came from.
     #[test]
     fn only_an_official_image_helps() {
         use super::{official, pick_helper};
@@ -1018,11 +1040,31 @@ mod tests {
             rec("ghcr.io/x/library/busybox:1", &[format!("ghcr.io/x/library/busybox{d}")]),
             rec("mirror.gcr.io/library/alpine:latest", &[format!("mirror.gcr.io/library/alpine{d}")]),
             rec("busybox:latest", &[format!("busybox{d}")]),
+            // Only GNU tar carries xattrs, so only Debian or Ubuntu helps.
+            rec("mirror.gcr.io/library/debian:latest", &[format!("mirror.gcr.io/library/debian{d}")]),
+            rec("ubuntu:latest", &[format!("ubuntu{d}")]),
+            rec("evil/debian:1", &[format!("debian{d}")]),
         ];
-        assert_eq!(pick_helper(&records), Some("mirror.gcr.io/library/alpine:latest".into()));
-        assert_eq!(pick_helper(&records[..6]), None);
-        assert_eq!(pick_helper(&records[7..]), Some("busybox:latest".into()));
+        assert_eq!(pick_helper(&records), Some("mirror.gcr.io/library/debian:latest".into()));
+        assert_eq!(pick_helper(&records[..8]), None);
+        assert_eq!(pick_helper(&records[8..]), Some("mirror.gcr.io/library/debian:latest".into()));
         assert_eq!(pick_helper(&[json!({"RepoTags": null, "RepoDigests": [format!("busybox{d}")]})]), None);
+    }
+
+    // #485: both ends of a volume copy carry xattrs, and the helper images
+    // are GNU tar ones, not alpine or busybox.
+    #[test]
+    fn volume_copy_keeps_xattrs() {
+        assert!(super::gnu_tar("debian:trixie"));
+        assert!(super::gnu_tar("mirror.gcr.io/library/ubuntu:24.04"));
+        assert!(!super::gnu_tar("alpine:latest"));
+        assert!(!super::gnu_tar("busybox:latest"));
+        let args = super::volume_reader_args("desktop-linux", "kiri-import-pg", "type=volume,src=pg,dst=/from,readonly,volume-nocopy", "debian:trixie");
+        for flag in super::STORE_XATTRS {
+            assert!(args.contains(&flag), "missing {flag}");
+        }
+        assert!(super::RESTORE_XATTRS.contains("--xattrs"));
+        assert!(super::RESTORE_XATTRS.contains("--xattrs-include=user.*"));
     }
 
     // #377: an image only pinned by digest is listed by that reference.
