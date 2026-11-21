@@ -279,7 +279,7 @@ pub(crate) fn path_escape(s: &str) -> String {
 /// daemon was up, sent Start and so undid it (#394).
 fn bring_up(launch: bool) {
     // Up and stopped already: nothing to bring up, and no "booting" shown.
-    if launch && client::alive_quick() && stopped() {
+    if launch && client::alive_quick() && stopped() == Some(true) {
         return refresh();
     }
     emit(state("booting", None));
@@ -298,15 +298,18 @@ fn bring_up(launch: bool) {
 }
 
 /// Whether bringing Kiri up wakes the engine: Start always does, a launch
-/// only when the person had not stopped it.
-fn wakes(launch: bool, stopped: bool) -> bool {
-    !(launch && stopped)
+/// only when the engine said it was not stopped. Not knowing (its /info
+/// did not answer: an engine just started, or a wsl.exe slow after Windows
+/// woke) is no reason to wake it: that ended a person's Stop. A docker
+/// command wakes an engine that was only asleep anyway.
+fn wakes(launch: bool, stopped: Option<bool>) -> bool {
+    !launch || stopped == Some(false)
 }
 
 /// Whether Kiri was stopped (Stop in the window or the tray): then it stays
-/// off until Start.
-fn stopped() -> bool {
-    client::get("/info").is_ok_and(|i| i["KiriStopped"] == true)
+/// off until Start. None when the engine's /info did not answer.
+fn stopped() -> Option<bool> {
+    client::get("/info").ok().map(|i| i["KiriStopped"] == true)
 }
 
 /// The daemon's wake; a Linux host has no VM to wake, which is fine.
@@ -959,10 +962,13 @@ mod tests {
     /// login) starts the engine unless the person stopped it.
     #[test]
     fn a_launch_does_not_undo_a_stop() {
-        assert!(wakes(false, true), "Start wakes a stopped engine");
-        assert!(wakes(false, false));
-        assert!(wakes(true, false), "a launch starts an engine that was not stopped");
-        assert!(!wakes(true, true), "a launch leaves a stopped engine stopped");
+        assert!(wakes(false, Some(true)), "Start wakes a stopped engine");
+        assert!(wakes(false, Some(false)));
+        assert!(wakes(false, None), "Start wakes an engine whatever it said");
+        assert!(wakes(true, Some(false)), "a launch starts an engine that was not stopped");
+        assert!(!wakes(true, Some(true)), "a launch leaves a stopped engine stopped");
+        // #93: an /info that did not answer at launch is not "not stopped".
+        assert!(!wakes(true, None), "a launch that could not ask leaves a Stop alone");
     }
 
     /// Only a refused or absent engine shows as stopped; a slow answer

@@ -7009,6 +7009,9 @@ function paintEngine() {
   if (document.body.classList.contains("rail")) document.querySelector(".vm").title = `${tr(VM)}: ${label}`;
   const b = $("vm-toggle");
   b.hidden = false;
+  /* When it last turned into a Stop button: see the press guard below. */
+  const act = shown === "running" ? "stop" : "start";
+  if (b.dataset.act !== act) { b.dataset.act = act; b.dataset.flipped = String(Date.now()); }
   b.textContent = shown === "running" ? tr("Stop") : shown === "booting" ? tr("Starting…") : shown === "stopping" ? tr("Stopping…") : tr("Start");
   b.classList.toggle("primary", shown !== "running");
   b.disabled = shown === "booting" || shown === "stopping";
@@ -8370,7 +8373,23 @@ document.addEventListener("keydown", (ev) => {
     f.focus(); f.select();
   }
 });
-$("vm-toggle").addEventListener("click", () => powerEngine(engineShown().shown === "running" ? "stop" : "start"));
+/* The card's one button reads Start or Stop and turns over when the engine's
+   state changes, often just as the engine comes back while someone reaches
+   for Start. A press that began on Start, or within half a second of it
+   turning to Stop, is not a Stop: that recorded a Stop nobody asked for,
+   and docker then said "Kiri is stopped" until Start (#93). */
+$("vm-toggle").addEventListener("pointerdown", (ev) => {
+  const b = ev.currentTarget;
+  b.dataset.pressed = b.dataset.act === "stop" && Date.now() - Number(b.dataset.flipped || 0) < 500 ? "start" : b.dataset.act || "";
+});
+/* A press dragged off the button is over: a later press by keyboard is its own. */
+$("vm-toggle").addEventListener("pointerleave", (ev) => { delete ev.currentTarget.dataset.pressed; });
+$("vm-toggle").addEventListener("click", (ev) => {
+  const b = ev.currentTarget, act = engineShown().shown === "running" ? "stop" : "start", pressed = b.dataset.pressed;
+  delete b.dataset.pressed;
+  if (pressed && pressed !== act) return;
+  powerEngine(act);
+});
 
 /* Window chrome: a mouse-down on empty header or sidebar space drags the
    window, and a double-click zooms it, like a native title bar. */

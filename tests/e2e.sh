@@ -571,6 +571,8 @@ for i in 1 2 3 4; do $D run -d --name ss-al$i --restart always alpine sleep 1d >
 t engine-start-then-stop "204 204 204" bash -c "echo \$($POST http://d/kiri/stop) \$($POST http://d/kiri/wake) \$($POST http://d/kiri/stop)"
 t engine-start-then-stop-none-run "running: 0" bash -c "sleep 5; echo running: \$($D ps -q --filter name=ss- | wc -l | tr -d ' ')"
 t engine-start-then-stop-refused "Kiri is stopped" $D run --rm alpine true
+# And says what ends it, from the command line too (#93).
+t engine-stopped-says-kiri-start "kiri start" $D run --rm alpine true
 t engine-start-again "204" $POST http://d/kiri/wake
 t engine-start-again-brings-back "6" bash -c "for i in \$(seq 100); do n=\$($D ps -q --filter name=ss-al | wc -l | tr -d ' '); [ \$n = 5 ] && [ \"\$($D inspect -f '{{.State.Running}}' ss-us)\" = true ] && break; sleep 0.2; done; echo \$((n + 1))"
 $D rm -f ss-us ss-al ss-user ss-no ss-al1 ss-al2 ss-al3 ss-al4 >/dev/null 2>&1

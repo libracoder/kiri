@@ -81,6 +81,7 @@ mod update;
 const USAGE: &str = "\
 usage: kiri COMMAND          docker's commands, on Kiri: kiri run, ps, exec,
                              logs, stop, rm, images, pull, build, compose…
+       kiri start                 start Kiri after a Stop (the window's Start)
        kiri daemon
        kiri bridge [--socket PATH]   (WSL2: the end of kiri-win.exe)
        kiri ui [--start] [--view containers|images|volumes|networks]
@@ -151,6 +152,12 @@ fn main() -> ExitCode {
         // `kiri 3000`: share a port straight away.
         #[cfg(any(unix, windows))]
         Some(a) if share::is_shorthand(a) => share::run(&args),
+        // Bare: the window's Start (`kiri start NAME` is docker's start).
+        #[cfg(unix)]
+        Some("start") if args.len() == 1 => engine_start(),
+        // On Windows, by the `kiri` in WSL, once kiri-start has the daemon up.
+        #[cfg(windows)]
+        Some("start") if args.len() == 1 => wsl::run(&args),
         #[cfg(unix)]
         Some("build-with") => buildwith::cli(&args[1..]),
         #[cfg(unix)]
@@ -226,6 +233,23 @@ fn window(args: &[String]) -> std::io::Result<()> {
     }
     // exec returns only when it failed.
     Err(std::process::Command::new(WINDOW).args(args).exec())
+}
+
+/// `kiri start`: Kiri on again after a Stop (the window's, the tray's or
+/// the menu bar's), as the window's Start does; the containers Stop held
+/// come back. On an engine that wasn't stopped it only wakes the VM.
+#[cfg(unix)]
+fn engine_start() -> std::io::Result<()> {
+    if !client::alive() {
+        return Err(std::io::Error::other("Kiri's engine isn't running. Open Kiri, or start it with `kiri daemon`"));
+    }
+    let r = client::request("POST", "/kiri/wake", None)?;
+    // 404: a Linux host's engine, which has no VM to wake and no Stop.
+    if !r.ok() && r.status != 404 {
+        return Err(std::io::Error::other(r.error()));
+    }
+    println!("Kiri is started");
+    Ok(())
 }
 
 #[cfg(not(unix))]

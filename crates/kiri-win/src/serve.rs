@@ -26,6 +26,9 @@ const CLOSE: u8 = 4;
 /// handed on (u32 BE). For connection 0, the bridge's hello: it does flow
 /// control (crates/kiri/src/bridge.rs says how).
 const ACK: u8 = 5;
+/// From the bridge, on connection 0: a line of what it did to reach the
+/// engine (started it, and how that went), for this side's log.
+const NOTE: u8 = 6;
 
 /// Bytes of one connection one way that may be unacknowledged; the same
 /// as the bridge's.
@@ -38,6 +41,11 @@ const LIMIT_NO_CREDIT: usize = 256 * 64 * 1024;
 /// How long a new connection waits for a bridge just started to say it
 /// does flow control; an older one never does.
 const HELLO_WAIT: Duration = Duration::from_secs(5);
+/// How long a new connection keeps starting a bridge that dies at once
+/// (wsl.exe right after Windows wakes, while WSL itself starts again)
+/// before the client is told why; one try every BRIDGE_RETRY.
+const BRIDGE_WAIT: Duration = Duration::from_secs(10);
+const BRIDGE_RETRY: Duration = Duration::from_millis(500);
 
 /// wsl.exe without a console window flashing up.
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -366,6 +374,12 @@ impl Hub {
         if cfg.distro.is_none() {
             return Err(io::Error::new(io::ErrorKind::NotConnected, "Kiri is not set up yet"));
         }
+        // The last one has gone (WSL restarted, Windows slept): a docker
+        // client is waiting, so a new one starts now, and the log says why;
+        // once, not again for each try while new ones die as they start.
+        if current.as_ref().is_some_and(|b| b.started.elapsed() > 2 * BRIDGE_RETRY) {
+            log("bridge: the last one has gone; starting a new one for a docker client");
+        }
         let b = Bridge::start(&cfg)?;
         *current = Some(b.clone());
         Ok(b)
@@ -410,6 +424,12 @@ impl Bridge {
     fn replies(&self, output: impl Read, mut child: Child) {
         let mut r = BufReader::with_capacity(64 * 1024, output);
         while let Ok(Some((kind, id, data))) = read_frame(&mut r) {
+            if kind == NOTE {
+                if id == 0 {
+                    log(&format!("engine in WSL: {}", String::from_utf8_lossy(&data)));
+                }
+                continue;
+            }
             if kind == ACK {
                 if id == 0 {
                     self.credit.store(true, Ordering::SeqCst);
@@ -502,7 +522,7 @@ fn serve_shared(hub: &Hub, pipe: Arc<Pipe>) {
     // with the window's engine thread (and every Start click) behind it.
     // So the insert checks `dead` under the lock the sweep takes, and a
     // bridge found dead is left for the next one.
-    let mut tries = 0;
+    let began = Instant::now();
     let (bridge, id, window, rx, queued) = loop {
         let bridge = match hub.bridge() {
             Ok(b) => b,
@@ -539,14 +559,14 @@ fn serve_shared(hub: &Hub, pipe: Arc<Pipe>) {
             break (bridge, id, window, rx, queued);
         }
         bridge.conns.lock().unwrap_or_else(PoisonError::into_inner).remove(&id);
-        tries += 1;
-        if tries == 3 {
-            log("bridge: died three times while a connection opened; giving up on it");
-            if refuse_new(&pipe, &message(Some("Kiri's Linux in WSL stopped three times as the command came in"))) {
+        if gave_up(began.elapsed()) {
+            log(&format!("bridge: kept stopping as soon as it started, for {} s; told the docker client", BRIDGE_WAIT.as_secs()));
+            if refuse_new(&pipe, &message(Some("Kiri's Linux in WSL kept stopping as the command came in"))) {
                 linger(&pipe);
             }
             return;
         }
+        thread::sleep(BRIDGE_RETRY);
     };
     // Whether the client's request has come, and is a HEAD: a refusal
     // waits for it (see `refuse_new`).
@@ -582,6 +602,13 @@ fn serve_shared(hub: &Hub, pipe: Arc<Pipe>) {
     if let Some(c) = bridge.conns.lock().unwrap_or_else(PoisonError::into_inner).remove(&id) {
         c.close();
     }
+}
+
+/// Whether a connection whose bridge keeps dying as it starts has waited
+/// long enough (`waited`) to be told why: about BRIDGE_WAIT, rather than
+/// three tries within milliseconds while WSL was still coming back.
+fn gave_up(waited: Duration) -> bool {
+    waited + BRIDGE_RETRY > BRIDGE_WAIT
 }
 
 /// Writes the bridge's replies to the client, acknowledging them to the
@@ -712,6 +739,19 @@ mod tests {
         let mut r = &wire[..];
         assert_eq!(super::read_frame(&mut r).unwrap(), Some((super::DATA, 7, b"abc".to_vec())));
         assert_eq!(super::read_frame(&mut r).unwrap(), None);
+    }
+
+    /// A bridge that dies as it starts (WSL coming back after Windows
+    /// slept) is started again for about BRIDGE_WAIT, not given up on
+    /// after three tries within milliseconds (#93).
+    #[test]
+    fn a_dying_bridge_is_retried_for_a_bounded_while() {
+        use std::time::Duration;
+        assert!(!super::gave_up(Duration::from_millis(30)));
+        assert!(!super::gave_up(super::BRIDGE_WAIT / 2));
+        assert!(super::gave_up(super::BRIDGE_WAIT));
+        // About twenty tries, not three.
+        assert!(super::BRIDGE_WAIT.as_millis() / super::BRIDGE_RETRY.as_millis() >= 10);
     }
 
     #[test]

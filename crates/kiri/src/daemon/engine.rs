@@ -27,8 +27,13 @@ const MEMORY_FLOOR: u64 = 256 << 20;
 /// How much more the guest gets at once when it reports pressure.
 const MEMORY_GROW: u64 = 1 << 30;
 
-/// What a request that needs the VM gets while Kiri is stopped.
-pub const STOPPED: &str = "Kiri is stopped: press Start in the Kiri window to run containers again";
+/// What a request that needs the VM gets while Kiri is stopped (Stop in
+/// the window, the tray or the menu bar): only Start ends that.
+pub const STOPPED: &str = "Kiri is stopped: run `kiri start`, or press Start in the Kiri window, to run containers again";
+/// What one gets while the daemon shuts down (WSL or Windows stopping it,
+/// a restart, an update): not a Stop, so nothing to press; the next
+/// command reaches the engine that comes up after it (#93).
+pub const SHUTTING: &str = "Kiri's engine is shutting down: run the command again in a moment";
 
 /// The file that keeps "stopped" across engine restarts.
 fn stopped_marker() -> Option<std::path::PathBuf> {
@@ -951,6 +956,12 @@ struct State {
 /// Set while the daemon shuts down: exits then are not restarts.
 static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// What a request that would boot the VM is told, if anything: a Stop
+/// says so, and wins; a shutdown says to try again.
+fn boot_refusal(stopped: bool, shutting_down: bool) -> Option<&'static str> {
+    if stopped { Some(STOPPED) } else if shutting_down { Some(SHUTTING) } else { None }
+}
+
 /// `docker stop`'s default wait, when neither the request nor the container sets one.
 pub const DEFAULT_STOP_TIMEOUT: i64 = 10;
 
@@ -1218,8 +1229,8 @@ impl Engine {
         if let Some(vm) = old.as_ref().filter(|vm| !vm.is_lost()) {
             return Ok(vm.clone());
         }
-        if self.is_stopped() || SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
-            return Err(io::Error::other(STOPPED));
+        if let Some(why) = self.boot_refused() {
+            return Err(io::Error::other(why));
         }
         if recovery {
             let mut st = self.lock();
@@ -1241,8 +1252,8 @@ impl Engine {
         // Retained old links are inert; successful retirement has released
         // their VM and completed cleanup before the replacement opens disk.
         *self.link.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        if self.is_stopped() || SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
-            return Err(io::Error::other(STOPPED));
+        if let Some(why) = self.boot_refused() {
+            return Err(io::Error::other(why));
         }
         if recovery && !self.lock().containers.values().any(recover_after_vm_loss) {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "VM recovery was canceled"));
@@ -1732,6 +1743,12 @@ impl Engine {
 
     pub fn is_stopped(&self) -> bool {
         self.stopped.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Why the VM may not boot now: Kiri stopped (STOPPED), or the daemon
+    /// shutting down (SHUTTING). Only a Stop says to press Start.
+    fn boot_refused(&self) -> Option<&'static str> {
+        boot_refusal(self.is_stopped(), SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst))
     }
 
     /// Stop every container, then let the VM sleep (it wakes on the next
@@ -4791,6 +4808,23 @@ fn ancestor_ids(images: &[Image], values: &[String]) -> Vec<String> {
         images.iter().find(|i| is_id && i.config_digest.strip_prefix("sha256:").is_some_and(|h| h.starts_with(hex))).cloned()
     };
     values.iter().filter_map(|v| image_named(images.to_vec(), v).or_else(|| by_id(v))).map(|i| i.config_digest).collect()
+}
+
+#[cfg(test)]
+mod refusal_tests {
+    /// A daemon shutting down (WSL or Windows stopping it, a restart) is
+    /// not a Stop: it says to try again, never to press Start (#93). A
+    /// Stop says what ends it, from the command line too.
+    #[test]
+    fn only_a_stop_says_to_start() {
+        assert_eq!(super::boot_refusal(false, false), None);
+        let shutting = super::boot_refusal(false, true).unwrap();
+        assert!(!shutting.contains("Start") && !shutting.contains("stopped"), "{shutting}");
+        assert!(shutting.contains("again"), "{shutting}");
+        assert_eq!(super::boot_refusal(true, false), Some(super::STOPPED));
+        assert_eq!(super::boot_refusal(true, true), Some(super::STOPPED));
+        assert!(super::STOPPED.starts_with("Kiri is stopped") && super::STOPPED.contains("`kiri start`"), "{}", super::STOPPED);
+    }
 }
 
 #[cfg(test)]
