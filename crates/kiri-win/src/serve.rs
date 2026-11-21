@@ -6,7 +6,7 @@ use std::os::windows::process::CommandExt;
 use std::process::{Child, ChildStdin, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, PoisonError, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -200,28 +200,100 @@ fn docker_engine(hub: &Arc<Hub>) {
             }
         };
         say(format!("serving {DOCKER_ENGINE} as well (no other engine has it)"));
-        serve_while_free(hub, first);
+        let (h, mut new) = (hub.clone(), NewEngines::default());
+        serve_while_free(DOCKER_ENGINE, first, move || new.find(), move |p| serve_shared(&h, p));
     }
 }
 
-/// Accepts clients on docker_engine until another engine starts. The
-/// clients connected then keep their connections until they close.
-fn serve_while_free(hub: &Arc<Hub>, first: Pipe) {
+/// How often Kiri looks for another engine while it serves docker_engine.
+/// Docker Desktop's backend creates the pipe about 0.4 s after Docker
+/// Desktop starts, and gives up if an instance of Kiri's is open then.
+const ENGINE_CHECK: Duration = Duration::from_millis(100);
+
+/// Finds another engine among the processes started since it last looked.
+/// A process snapshot (`other_engine`) takes about 13 ms with 500 processes
+/// running, listing their ids about 0.06 ms: so the watcher can look often,
+/// and names only the new ones.
+#[derive(Default)]
+struct NewEngines {
+    seen: std::collections::HashSet<u32>,
+}
+
+impl NewEngines {
+    fn find(&mut self) -> Option<&'static str> {
+        use windows_sys::Win32::System::ProcessStatus::K32EnumProcesses;
+        let mut pids = vec![0u32; 4096];
+        let mut bytes = 0u32;
+        // SAFETY: a buffer of pids.len() u32s, and its size in bytes.
+        let listed = unsafe { K32EnumProcesses(pids.as_mut_ptr(), (pids.len() * 4) as u32, &mut bytes) } != 0;
+        // A full buffer may have left some out.
+        if !listed || bytes as usize >= pids.len() * 4 {
+            return other_engine();
+        }
+        pids.truncate(bytes as usize / 4);
+        // shortcut: an engine started under an id that another process gave up
+        // within the same ENGINE_CHECK is missed; look with other_engine() now
+        // and then if that is ever seen.
+        let found = pids.iter().filter(|p| !self.seen.contains(p)).find_map(|&p| engine_named(image_name(p)?.rsplit('\\').next()?));
+        self.seen = pids.into_iter().collect();
+        found
+    }
+}
+
+/// The path of process `pid`'s executable, when it may be read.
+fn image_name(pid: u32) -> Option<String> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION};
+    // SAFETY: a handle opened, read and closed here, and a buffer whose
+    // length goes in and comes back in `len`.
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h == 0 {
+            return None;
+        }
+        let mut buf = [0u16; 1024];
+        let mut len = buf.len() as u32;
+        let read = QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut len) != 0;
+        CloseHandle(h);
+        read.then(|| String::from_utf16_lossy(&buf[..len as usize]))
+    }
+}
+
+/// The one of OTHER_ENGINES an executable's file name is.
+fn engine_named(file: &str) -> Option<&'static str> {
+    OTHER_ENGINES.iter().copied().find(|o| o.eq_ignore_ascii_case(file))
+}
+
+/// How long the handover waits for the connected clients' instances to close.
+const HANG_UP: Duration = Duration::from_secs(5);
+
+/// Accepts clients on `name` until `other` finds another engine running,
+/// then closes every instance, the connected ones too: Docker Desktop cannot
+/// create the pipe while any is open. Its clients reconnect, to it.
+fn serve_while_free<O, F>(name: &str, first: Pipe, mut other: O, serve: F)
+where
+    O: FnMut() -> Option<&'static str> + Send + 'static,
+    F: Fn(Arc<Pipe>) + Clone + Send + 'static,
+{
     let stop = Arc::new(AtomicBool::new(false));
     // The instance waiting for a client, for the watcher to cancel.
     let waiting: Arc<Mutex<Option<Arc<Pipe>>>> = Arc::new(Mutex::new(None));
-    let (st, w) = (stop.clone(), waiting.clone());
+    // The connected ones, for the watcher to end; each closes as its client's
+    // threads let go of it.
+    let clients: Arc<Mutex<Vec<Weak<Pipe>>>> = Arc::new(Mutex::new(Vec::new()));
+    let (st, w, c, n) = (stop.clone(), waiting.clone(), clients.clone(), name.to_owned());
     let watcher = thread::spawn(move || {
         while !st.load(Ordering::SeqCst) {
-            if let Some(other) = other_engine() {
-                log(&format!("{other} started: handing {DOCKER_ENGINE} back"));
+            if let Some(engine) = other() {
+                log(&format!("{engine} started: handing {n} back"));
                 st.store(true, Ordering::SeqCst);
                 if let Some(p) = w.lock().unwrap_or_else(PoisonError::into_inner).take() {
                     p.cancel();
                 }
+                hang_up(&n, &c);
                 return;
             }
-            thread::sleep(std::time::Duration::from_secs(2));
+            thread::sleep(ENGINE_CHECK);
         }
     });
     let mut pipe = Arc::new(first);
@@ -229,29 +301,57 @@ fn serve_while_free(hub: &Arc<Hub>, first: Pipe) {
         *waiting.lock().unwrap_or_else(PoisonError::into_inner) = Some(pipe.clone());
         let connected = pipe.connect();
         waiting.lock().unwrap_or_else(PoisonError::into_inner).take();
+        // Listed before `stop` is read: a handover from now on ends it.
+        if connected.is_ok() {
+            let mut c = clients.lock().unwrap_or_else(PoisonError::into_inner);
+            c.retain(|p| p.strong_count() > 0);
+            c.push(Arc::downgrade(&pipe));
+        }
         if stop.load(Ordering::SeqCst) {
             break;
         }
         match connected {
             Ok(()) => {
-                let hub = hub.clone();
-                let p = pipe.clone();
-                thread::spawn(move || serve_shared(&hub, p));
+                let (serve, p) = (serve.clone(), pipe.clone());
+                thread::spawn(move || serve(p));
             }
-            Err(e) => log(&format!("{DOCKER_ENGINE} connect: {e}")),
+            Err(e) => log(&format!("{name} connect: {e}")),
         }
         // Every instance in use: wait for a client to go, as for Kiri's pipe.
         pipe = loop {
             if stop.load(Ordering::SeqCst) {
                 break 'serve;
             }
-            match Pipe::create(DOCKER_ENGINE, false) {
+            match Pipe::create(name, false) {
                 Ok(p) => break Arc::new(p),
-                Err(_) => thread::sleep(std::time::Duration::from_millis(100)),
+                Err(_) => thread::sleep(Duration::from_millis(100)),
             }
         };
     }
     let _ = watcher.join();
+}
+
+/// Ends the connected clients of `name`, and waits for their instances to
+/// close. A cancel ends only the reads and writes waiting at that moment, so
+/// it is repeated until each client's threads have let go.
+fn hang_up(name: &str, clients: &Mutex<Vec<Weak<Pipe>>>) {
+    let until = Instant::now() + HANG_UP;
+    loop {
+        let open: Vec<Arc<Pipe>> = clients.lock().unwrap_or_else(PoisonError::into_inner).iter().filter_map(Weak::upgrade).collect();
+        if open.is_empty() {
+            return;
+        }
+        if Instant::now() > until {
+            log(&format!("{name}: {} connection(s) still open after the handover", open.len()));
+            return;
+        }
+        for p in &open {
+            p.cancel();
+        }
+        // Not held while waiting: the last reference closes the instance.
+        drop(open);
+        thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// The first of OTHER_ENGINES that is running.
@@ -272,7 +372,7 @@ fn other_engine() -> Option<&'static str> {
         while more && found.is_none() {
             let len = e.szExeFile.iter().position(|&c| c == 0).unwrap_or(e.szExeFile.len());
             let name = String::from_utf16_lossy(&e.szExeFile[..len]);
-            found = OTHER_ENGINES.iter().copied().find(|o| o.eq_ignore_ascii_case(&name));
+            found = engine_named(&name);
             more = Process32NextW(snap, &mut e) != 0;
         }
         CloseHandle(snap);
@@ -690,6 +790,10 @@ fn read_frame(r: &mut impl Read) -> io::Result<Option<(u8, u32, Vec<u8>)>> {
 
 /// Appends to %LOCALAPPDATA%\Kiri\kiri-win.log: there is no console.
 pub fn log(msg: &str) {
+    // Tests' pipes stay out of the real log.
+    if cfg!(test) {
+        return;
+    }
     let Some(dir) = std::env::var_os("LOCALAPPDATA").map(|d| std::path::PathBuf::from(d).join("Kiri")) else { return };
     let _ = std::fs::create_dir_all(&dir);
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("kiri-win.log")) {
@@ -705,6 +809,13 @@ pub fn log(msg: &str) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use crate::pipe::Pipe;
+
     #[test]
     fn frames_round_trip() {
         let mut wire = super::header(super::DATA, 7, 3).to_vec();
@@ -722,5 +833,55 @@ mod tests {
         // 4 GiB claimed, nothing behind it: an error at once, not an allocation.
         let huge = super::header(super::DATA, 7, u32::MAX as usize);
         assert_eq!(super::read_frame(&mut &huge[..]).unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn engines_are_known_by_file_name() {
+        let me = super::image_name(std::process::id()).unwrap();
+        assert_eq!(std::path::Path::new(&me), std::env::current_exe().unwrap());
+        assert_eq!(super::engine_named("docker desktop.EXE"), Some("Docker Desktop.exe"));
+        assert_eq!(super::engine_named("docker.exe"), None);
+        // This test's process is not new to a second look.
+        let mut new = super::NewEngines::default();
+        new.find();
+        assert!(new.seen.contains(&std::process::id()));
+    }
+
+    static OTHER: AtomicBool = AtomicBool::new(false);
+
+    fn other() -> Option<&'static str> {
+        OTHER.load(Ordering::SeqCst).then_some("test engine")
+    }
+
+    /// Another engine can create the pipe as its first instance soon after
+    /// it starts, though a client of Kiri's is connected and never closes.
+    #[test]
+    fn hands_the_pipe_back_with_a_client_connected() {
+        let name = format!(r"\\.\pipe\kiri-test-handover-{}", std::process::id());
+        let first = Pipe::create(&name, true).unwrap();
+        let n = name.clone();
+        // Served as serve_shared does: reading until the pipe ends.
+        let server = thread::spawn(move || {
+            super::serve_while_free(&n, first, other, |p: Arc<Pipe>| {
+                let mut buf = [0u8; 64];
+                while p.read(&mut buf).is_ok_and(|n| n > 0) {}
+            })
+        });
+        let client = Pipe::open(&name).unwrap();
+        client.write(b"GET /events").unwrap();
+        thread::sleep(Duration::from_millis(300));
+        OTHER.store(true, Ordering::SeqCst);
+        let started = Instant::now();
+        let theirs = loop {
+            match Pipe::create(&name, true) {
+                Ok(p) => break p,
+                Err(e) => {
+                    assert!(started.elapsed() < Duration::from_secs(1), "{name} still in use 1 s after the handover: {e}");
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+        };
+        server.join().unwrap();
+        drop((theirs, client));
     }
 }
