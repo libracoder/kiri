@@ -857,6 +857,51 @@ fn embedded_dns_batch(addr: [u8; 4], port: u16) -> Vec<Msg> {
     vec![begin, table, chain, flush, rule, end]
 }
 
+/// Whether `table` of `family` has a chain called `chain` (one GETCHAIN,
+/// answered with the chain or ENOENT).
+pub fn chain_exists(family: u8, table: &str, chain: &str) -> bool {
+    const NFT_MSG_GETCHAIN: u16 = 4;
+    let Ok(mut nl) = Netlink::open(libc::NETLINK_NETFILTER) else { return false };
+    let mut get = nft_in(family, NFT_MSG_GETCHAIN, NLM_F_ACK);
+    get.attr_str(1, table).attr_str(3, chain); // NFTA_CHAIN_TABLE, NFTA_CHAIN_NAME
+    nl.request(&mut [get]).is_ok()
+}
+
+/// A socket in nf_tables' multicast group (NFNLGRP_NFTABLES), readable
+/// after any change to any table; `drain` empties it.
+pub fn nftables_events() -> io::Result<OwnedFd> {
+    const NFNLGRP_NFTABLES: u32 = 7;
+    // SAFETY: plain socket creation; owned immediately.
+    let fd = sys::check(unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_RAW | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK, libc::NETLINK_NETFILTER) } as _, "netlink")?;
+    // SAFETY: `fd` is a fresh descriptor that nothing else owns.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd as i32) };
+    // Bound (the kernel picks the port id) and in the group: an unbound
+    // socket hears nothing.
+    // SAFETY: a zeroed sockaddr_nl is valid; the fields set are plain integers.
+    let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+    addr.nl_family = libc::AF_NETLINK as libc::sa_family_t;
+    addr.nl_groups = 1 << (NFNLGRP_NFTABLES - 1);
+    // SAFETY: binding our socket to an address that outlives the call.
+    sys::check(
+        unsafe { libc::bind(fd.as_raw_fd(), (&addr as *const libc::sockaddr_nl).cast(), std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t) } as _,
+        "netlink bind",
+    )?;
+    Ok(fd)
+}
+
+/// Reads and drops everything waiting on a `nftables_events` socket.
+pub fn drain(fd: &OwnedFd) {
+    let mut buf = [0u8; 8192];
+    loop {
+        // SAFETY: receiving into a buffer we own, without blocking.
+        let n = unsafe { libc::recv(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), libc::MSG_DONTWAIT) };
+        // ENOBUFS: events were lost while nobody read; the next recv goes on.
+        if n == 0 || (n < 0 && io::Error::last_os_error().raw_os_error() != Some(libc::ENOBUFS)) {
+            return;
+        }
+    }
+}
+
 /// Removes Kiri's table (a Linux host's engine stopping), if there is one.
 pub fn remove_nat() -> io::Result<()> {
     let mut nl = Netlink::open(libc::NETLINK_NETFILTER)?;

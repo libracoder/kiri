@@ -112,3 +112,6 @@ body-too-large-answered	#651	a request body over 8 MiB to an endpoint that does 
 body-too-large-chunked	#651	the same with a chunked body: an empty reply where a 413 belongs
 build-65-layers-run	#253	an image of 60 or more layers failed to start: the overlay options naming every layer did not fit in one page
 build-65-layers-lowest	#253	the lowest layer of a 65-layer image must be in its container
+dockerfw-internet	#247	with Docker on the same Linux host its FORWARD policy drop dropped every container's traffic, though Kiri's own table accepted it: no DNS, no internet
+dockerfw-rules	#247	Kiri's rules in Docker's DOCKER-USER chain, for IPv4 and IPv6, added when Docker's firewall appears while the engine runs
+dockerfw-docker-kept-apart	#247	letting Kiri's containers through Docker's firewall must not let them into a container on Docker's own bridge

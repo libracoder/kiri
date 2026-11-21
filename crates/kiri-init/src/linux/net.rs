@@ -125,7 +125,153 @@ pub fn host_uplink() -> io::Result<()> {
     // let containers reach the real machine's 127.0.0.1 services. host.docker
     // .internal maps to the bridge gateway instead (write_etc_files).
     let _ = HOST_UPLINK_INDEX.set(index);
+    let uplink6 = std::fs::read_to_string("/proc/net/ipv6_route").ok().and_then(|r| default_route6_iface(&r));
+    let _ = HOST_UPLINKS.set((iface.clone(), uplink6.unwrap_or(iface)));
+    through_docker(true);
     install_nat(Nat { uplink: index, redirect: false, dnat: Vec::new(), gateway: [0; 4] })
+}
+
+/// The Linux host's uplinks by name, IPv4 and IPv6 (the IPv6 default
+/// route's interface, else the IPv4 one), for `through_docker`.
+static HOST_UPLINKS: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
+
+/// The interface of the IPv6 default route in /proc/net/ipv6_route (dest
+/// `::/0`), but not `lo`, which holds the unreachable default.
+fn default_route6_iface(routes: &str) -> Option<String> {
+    routes.lines().find_map(|l| {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        (f.len() == 10 && f[0].bytes().all(|b| b == b'0') && f[1] == "00" && f[9] != "lo").then(|| f[9].to_owned())
+    })
+}
+
+/// Docker's chain for other software's rules in iptables' `filter` table.
+const DOCKER_USER: &str = "DOCKER-USER";
+
+/// Kiri's rules in DOCKER-USER, as iptables arguments after the chain:
+/// containers out through the uplink (what Kiri masquerades), their replies
+/// wherever they go (a published port reached from another interface), and
+/// anything into Kiri's bridges, which Kiri's own forward chain judges.
+fn docker_user_rules(uplink: &str) -> [Vec<&str>; 3] {
+    [
+        vec!["-i", "kiri+", "-o", uplink, "-m", "comment", "--comment", "kiri", "-j", "ACCEPT"],
+        vec!["-i", "kiri+", "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-m", "comment", "--comment", "kiri", "-j", "ACCEPT"],
+        vec!["-o", "kiri+", "-m", "comment", "--comment", "kiri", "-j", "ACCEPT"],
+    ]
+}
+
+/// Where `through_docker` is, per family (IPv4, IPv6): nothing done,
+/// rules added, or adding them failed (said once, not tried again).
+static THROUGH_DOCKER: [std::sync::atomic::AtomicU8; 2] = [std::sync::atomic::AtomicU8::new(NOT_ADDED), std::sync::atomic::AtomicU8::new(NOT_ADDED)];
+const NOT_ADDED: u8 = 0;
+const ADDED: u8 = 1;
+const FAILED: u8 = 2;
+
+/// Lets Kiri's containers through Docker's firewall on a Linux host that
+/// has Docker too (`on`), or takes that back (the engine stopping).
+///
+/// Docker sets the policy of the FORWARD chain in iptables' `filter` table
+/// to drop when it turns ip_forward on (as at boot, before the engine
+/// does), and it stays so. A forwarded packet must be accepted by every chain
+/// on the forward hook: Kiri's own table accepting it is not enough, and
+/// Docker's drops every container's traffic to the internet and every
+/// published port's. Docker's answer for other software is its DOCKER-USER
+/// chain, which it makes, jumps to first and never empties, also when it
+/// restarts. Kiri adds `docker_user_rules` there, through the host's own
+/// iptables (iptables-nft or legacy, as Docker uses it). No new connection
+/// into Docker's bridges is accepted (only replies, which Docker accepts
+/// too), so Docker keeps its containers as isolated as before.
+///
+/// Called when the engine starts, when it brings up a bridge and when any
+/// nf_tables table changes (`firewall_changed`), so Docker started after
+/// the engine is covered too. Without Docker, or once the rules are in, a
+/// call costs one netlink request per family and runs no program.
+fn through_docker(on: bool) {
+    use std::sync::atomic::Ordering;
+    let Some((up4, up6)) = HOST_UPLINKS.get() else { return };
+    let families = [(libc::NFPROTO_IPV4 as u8, "iptables", "/proc/net/ip_tables_names", up4), (libc::NFPROTO_IPV6 as u8, "ip6tables", "/proc/net/ip6_tables_names", up6)];
+    for (state, (family, tool, legacy, uplink)) in THROUGH_DOCKER.iter().zip(families) {
+        let now = state.load(Ordering::Relaxed);
+        if !on && now != ADDED {
+            continue;
+        }
+        // iptables-nft keeps DOCKER-USER in nf_tables; iptables-legacy in
+        // x_tables, which only the program reads.
+        let nft = netlink::chain_exists(family, "filter", DOCKER_USER);
+        if !nft && !std::fs::read_to_string(legacy).is_ok_and(|t| t.lines().any(|l| l == "filter")) {
+            // No Docker, or its chain went (its tables flushed) and Kiri's rules with it.
+            state.store(NOT_ADDED, Ordering::Relaxed);
+            continue;
+        }
+        if on && now != NOT_ADDED {
+            continue;
+        }
+        let Some(tool) = sbin(tool) else {
+            eprintln!("kiri-init: Docker's firewall is on this host, but there is no {tool} to let Kiri's containers through it");
+            state.store(FAILED, Ordering::Relaxed);
+            continue;
+        };
+        let run = |args: &[&str]| {
+            std::process::Command::new(&tool)
+                .args(["-w", "5"])
+                .args(args)
+                .stdin(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        };
+        // One listing says which rules are there (also left by an engine
+        // that crashed); iptables-legacy without Docker has no chain.
+        let Some(listing) = run(&["-S", DOCKER_USER]) else {
+            if nft {
+                eprintln!("kiri-init: {} cannot list {DOCKER_USER}, so Kiri's containers may not pass Docker's firewall", tool.display());
+            }
+            state.store(if on { FAILED } else { NOT_ADDED }, Ordering::Relaxed);
+            continue;
+        };
+        let mut ok = true;
+        for rule in docker_user_rules(uplink) {
+            // Not as listed: asked once more, in case this iptables prints it otherwise.
+            let there = listing.lines().any(|l| l.trim_end() == format!("-A {DOCKER_USER} {}", rule.join(" "))) || run(&[&["-C", DOCKER_USER], &rule[..]].concat()).is_some();
+            if on && !there {
+                ok &= run(&[&["-I", DOCKER_USER], &rule[..]].concat()).is_some();
+            } else if !on && there {
+                ok &= run(&[&["-D", DOCKER_USER], &rule[..]].concat()).is_some();
+            }
+        }
+        if on && ok {
+            eprintln!("kiri-init: Docker's firewall is on this host: Kiri's containers pass its FORWARD chain by rules in {DOCKER_USER} ({})", tool.display());
+        } else if !ok {
+            eprintln!("kiri-init: {} {DOCKER_USER} rules for Kiri's containers could not be {}", tool.display(), if on { "added" } else { "removed" });
+        }
+        state.store(if !on { NOT_ADDED } else if ok { ADDED } else { FAILED }, Ordering::Relaxed);
+    }
+}
+
+/// Linux host: a socket that hears of every nf_tables change, so Docker
+/// started after the engine (its DOCKER-USER chain made, its FORWARD policy
+/// set to drop) gets Kiri's rules at once. None if the kernel refuses it.
+pub fn firewall_events() -> Option<OwnedFd> {
+    netlink::nftables_events().inspect_err(|e| eprintln!("kiri-init: not watching the firewall for Docker: {e}")).ok()
+}
+
+/// `firewall_events` heard of a change: reads it and brings Kiri's rules in
+/// Docker's chain in line.
+pub fn firewall_changed(events: &OwnedFd) {
+    netlink::drain(events);
+    through_docker(true);
+}
+
+/// An administrator's program (iptables) by name, wherever the host keeps
+/// it: the agent's PATH may lack the sbin folders.
+fn sbin(name: &str) -> Option<std::path::PathBuf> {
+    let path = std::env::var("PATH").unwrap_or_default();
+    path.split(':')
+        .chain(["/usr/sbin", "/sbin", "/usr/local/sbin", "/usr/bin", "/bin"])
+        .filter(|d| !d.is_empty())
+        .map(|d| std::path::Path::new(d).join(name))
+        .find(|p| p.is_file())
 }
 
 /// What Kiri's IPv4 table was last built from, so it can be rebuilt when a
@@ -517,6 +663,9 @@ impl Bridges {
             // DNATed from 127.0.0.1, so the bridge needs no `route_localnet`;
             // an older engine set it on bridges that may still exist.
             let _ = sys::write_file(&format!("/proc/sys/net/ipv4/conf/{name}/route_localnet"), "0");
+            // Docker installed or started after the engine (nothing to do
+            // once its rules are in).
+            through_docker(true);
         }
         // The forward filter's rule for this bridge.
         refresh_nat()?;
@@ -629,6 +778,7 @@ pub fn remove_host_network() {
     }
     let _ = netlink::install_nat6(&[], &[]);
     let _ = ipv6_forwarding(false);
+    through_docker(false);
 }
 
 /// Gives a freshly cloned container its network: a veth pair whose peer
@@ -762,5 +912,28 @@ mod tests {
         kiri_proto::encode_net_attach::<&str>(&mut buf, "c1", "eth1", "kiri2", [10, 5, 0, 2], 24, [10, 5, 0, 1], &[], &[]);
         let Ok(kiri_proto::Msg::NetAttach { net, .. }) = kiri_proto::decode(&buf) else { panic!() };
         assert_eq!(Ip6::from_opts(net.opts), None);
+    }
+
+    #[test]
+    fn the_ipv6_uplink_is_the_default_routes_interface() {
+        let routes = "\
+fd00000000000000000000000000000000 40 00000000000000000000000000000000 00 00000000000000000000000000000000 00000100 00000001 00000000 00000001     eth0
+00000000000000000000000000000000 00 00000000000000000000000000000000 00 fe800000000000000000000000000001 00000400 00000002 00000000 00000003    wlan0
+00000000000000000000000000000000 00 00000000000000000000000000000000 00 00000000000000000000000000000000 ffffffff 00000001 00000000 00200200       lo
+";
+        assert_eq!(default_route6_iface(routes).as_deref(), Some("wlan0"));
+        // Only the unreachable default on lo: no IPv6 uplink.
+        assert_eq!(default_route6_iface(&routes.lines().skip(2).collect::<Vec<_>>().join("\n")), None);
+    }
+
+    #[test]
+    fn docker_user_rules_accept_only_kiris_own_traffic() {
+        let [out, replies, into] = docker_user_rules("eth0");
+        // New connections out of Kiri's bridges only through the uplink,
+        // never into Docker's bridges; replies anywhere.
+        assert_eq!(out.join(" "), "-i kiri+ -o eth0 -m comment --comment kiri -j ACCEPT");
+        assert_eq!(replies.join(" "), "-i kiri+ -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment kiri -j ACCEPT");
+        // Into Kiri's bridges, where Kiri's forward chain judges.
+        assert_eq!(into.join(" "), "-o kiri+ -m comment --comment kiri -j ACCEPT");
     }
 }
