@@ -480,15 +480,17 @@ enum Cancel {
 /// a start filling a new volume is let finish the fill even when cancelled.
 #[cfg(not(test))]
 const START_GRACE: Duration = Duration::from_secs(10);
+// Tests: wide enough apart that a slow, shared machine can't push one wait
+// into the other's window (300 and 400 ms did, at 436 ms).
 #[cfg(test)]
-const START_GRACE: Duration = Duration::from_millis(400);
+const START_GRACE: Duration = Duration::from_secs(2);
 /// The same for `rm -f`, which is expected to be prompt: a stuck start it
 /// cancels sooner, and that start answers with Docker's words for a start
 /// a removal got to first ("marked for removal").
 #[cfg(not(test))]
 const REMOVE_GRACE: Duration = Duration::from_secs(2);
 #[cfg(test)]
-const REMOVE_GRACE: Duration = Duration::from_millis(300);
+const REMOVE_GRACE: Duration = Duration::from_secs(1);
 
 /// What a cancelled start answers (see `Cancel`), as a 409 each time.
 fn cancelled_start_error(by: Option<Cancel>, id: &str) -> Option<Error> {
@@ -5357,7 +5359,7 @@ mod vm_recovery_tests {
                     done.send(r.map_err(|e| format!("{e:?}"))).unwrap();
                 })
             };
-            let got = finished.recv_timeout(Duration::from_secs(3));
+            let got = finished.recv_timeout(START_GRACE * 3);
             let took = t.elapsed();
             start.join().unwrap();
             worker.join().unwrap();
