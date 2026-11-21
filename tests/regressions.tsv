@@ -75,8 +75,8 @@ rm-f-stuck-start	#621	a stuck start could not be removed: rm -f, kill and stop n
 agent-dies-beside-stuck-start	#621	an agent that died beside a stuck start went unnoticed and every request hung
 rm-f-during-start	#621	rm -f sent while containers start must answer and leave nothing behind; the racing start succeeds or says Docker's "marked for removal"
 stop-during-start	#621	stop sent while containers start must answer and leave nothing behind; the racing start must succeed, as on Docker (#621 answered it 409)
-kill-during-start	#149	a kill, stop or rm -f sent while a container started was dropped (it kept running), then (#621) cancelled the start, which answered 409 where Docker answers 204
-kill-stuck-start	#149	a kill must not wait for ever behind a start that never finishes: after 10 s it cancels it
+kill-during-start	#650	a kill, stop or rm -f sent while a container started was dropped (it kept running), then (#621) cancelled the start, which answered 409 where Docker answers 204
+kill-stuck-start	#650	a kill must not wait for ever behind a start that never finishes: after 10 s it cancels it
 churn-beside-df	#621	create, start, exec and rm beside docker system df must each answer within its limit
 rm-f-exit-code	#622	docker run --rm exited 0, not 137, when docker rm -f raced it
 image-ls-untagged-row	#623	the image list hid untagged images
@@ -105,3 +105,7 @@ top-width	#625	docker top ignored column widths such as pid:8
 top-title-refused	#625	docker top accepted a PID title on a column other than pid, which Docker refuses
 top-title-no-pid	#625	docker top with a renamed pid column did not give Docker's error
 tests/ui/setup-wsl-unknown.js	#627	Windows' first start flashed Install WSL before kiri-win said whether WSL is there
+bind-v-creates	#651	on a Linux host a folder made for a missing bind-mount source was 0750 (the service's umask), so its own user could not look into it; Docker makes it 0755
+bind-create-0200	#651	a file a container makes with mode 0200 in a bind mount must be readable from the host by its owner; the check also runs as a plain user now
+body-too-large-answered	#651	a request body over 8 MiB to an endpoint that does not stream it got no answer: the connection was dropped
+body-too-large-chunked	#651	the same with a chunked body: an empty reply where a 413 belongs
