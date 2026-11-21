@@ -1877,6 +1877,27 @@ fn inspect_exposed(ports: &[super::ports::Binding], exposed: &[u16]) -> Value {
     if m.is_empty() { Value::Null } else { Value::Object(m) }
 }
 
+/// `HostConfig.Binds`, as the create form of every bind and named volume
+/// (`src:dst[:ro]`): what Watchtower and the "update container" actions
+/// rebuild a container from, so without it every mount is dropped (#610).
+/// Anonymous volumes are not Docker's Binds, and with none it is null.
+fn binds_list(c: &Container) -> Value {
+    binds_list_of(&c.spec.mount_info)
+}
+
+fn binds_list_of(info: &[Value]) -> Value {
+    let out: Vec<String> = info.iter().filter_map(|m| {
+        let dst = m["Destination"].as_str()?;
+        let src = match m["Type"].as_str()? {
+            "bind" => m["Source"].as_str()?.to_owned(),
+            "volume" => m["Name"].as_str()?.to_owned(),
+            _ => return None,
+        };
+        Some(if m["RW"] == json!(false) { format!("{src}:{dst}:ro") } else { format!("{src}:{dst}") })
+    }).collect();
+    if out.is_empty() { Value::Null } else { json!(out) }
+}
+
 /// Docker's `NetworkSettings.Ports` map for inspect and `docker port`.
 fn ports_map(c: &Container) -> Value {
     let bound: &[(super::ports::Binding, String, u16)] = c.forwards.as_ref().map_or(&[], |fw| &fw.bound);
@@ -2617,6 +2638,9 @@ fn list(req: &Request, engine: &Engine) -> Result<Value, Error> {
 fn inspect(c: &Container, nets: &[super::network::Network]) -> Value {
     let when = |t: Option<std::time::SystemTime>| t.map_or_else(|| time::ZERO.to_owned(), time::rfc3339);
     let argv = c.argv();
+    // Bound here, not inside the json!: the macro's nesting has a depth
+    // limit, and this map is the biggest one in the file.
+    let binds = binds_list(c);
     json!({
         "Id": c.id,
         "Created": time::rfc3339(c.created),
@@ -2681,6 +2705,7 @@ fn inspect(c: &Container, nets: &[super::network::Network]) -> Value {
             },
             "PidsLimit": if c.spec.limits.pids_max > 0 { Value::from(c.spec.limits.pids_max) } else { Value::Null },
             "NetworkMode": c.spec.network_mode,
+            "Binds": binds,
             "PidMode": c.spec.pid_mode,
             "VolumesFrom": if c.spec.volumes_from.is_empty() { Value::Null } else { json!(c.spec.volumes_from) },
             "Dns": c.spec.dns,
@@ -3771,6 +3796,18 @@ mod tests {
         assert_eq!(crate::client::kiri_version(&v), Some(env!("CARGO_PKG_VERSION")));
         // An engine from before KiriVersion: its Version was Kiri's.
         assert_eq!(crate::client::kiri_version(&json!({"Version": "0.2.0"})), Some("0.2.0"));
+    }
+
+    /// `HostConfig.Binds` is the create form of every bind and named volume
+    /// (#610): what Watchtower rebuilds a container from.
+    #[test]
+    fn binds_list_is_the_create_form_of_mounts() {
+        assert_eq!(binds_list_of(&[]), serde_json::Value::Null);
+        let bind = json!({"Type": "bind", "Source": "/tmp/proof", "Destination": "/proof", "RW": false});
+        let named = json!({"Type": "volume", "Name": "probe-data", "Destination": "/data", "RW": true});
+        let anon = json!({"Type": "volume", "Name": "anon", "Destination": "/anon", "RW": true});
+        let tmpfs = json!({"Type": "tmpfs", "Source": "", "Destination": "/scratch", "RW": true});
+        assert_eq!(binds_list_of(&[bind, named, tmpfs, anon]), json!(["/tmp/proof:/proof:ro", "probe-data:/data", "anon:/anon"]));
     }
 
     /// Docker's merge of a create's Entrypoint and Cmd with the image's.
