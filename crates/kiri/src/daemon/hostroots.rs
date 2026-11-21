@@ -52,14 +52,19 @@ pub fn set(body: &Value) -> io::Result<Value> {
         let tmp = p.with_extension("json.tmp");
         // A stale temp file, or a link put there, is not written through.
         let _ = std::fs::remove_file(&tmp);
-        {
-            use std::io::Write;
-            let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
-            f.write_all(to_json(&host).to_string().as_bytes())?;
-        }
+        write_private(&tmp, to_json(&host).to_string().as_bytes())?;
         std::fs::rename(&tmp, &p)?;
     }
     Ok(json!({"certs": certs, "distrusted": distrusted, "changed": changed}))
+}
+
+/// A new file only this user can read or write, whatever the umask (the
+/// daemon's unit may run with 0027, a shell with 022).
+fn write_private(path: &std::path::Path, bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)?;
+    f.write_all(bytes)
 }
 
 /// The kept file's JSON, if it is a regular file of a sane size.
@@ -102,6 +107,22 @@ mod tests {
         assert_eq!(host.certs.len(), 1);
         assert_eq!(host.distrusted[0].as_ref(), &[0x30, 0x02, 0x0a, 0x0b]);
         assert_eq!(to_json(&host), json!({"certs": ["3001"], "distrusted": ["30020a0b"]}));
+    }
+
+    #[test]
+    fn the_kept_roots_are_private_whatever_the_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = std::env::temp_dir().join(format!("kiri-hostroots-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let f = d.join("host-roots.json.tmp");
+        // SAFETY: umask only sets this process's file creation mask.
+        let before = unsafe { libc::umask(0o022) };
+        let made = write_private(&f, b"{}");
+        unsafe { libc::umask(before) };
+        made.unwrap();
+        assert_eq!(std::fs::metadata(&f).unwrap().permissions().mode() & 0o777, 0o600);
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[cfg(unix)]
