@@ -165,7 +165,8 @@ fn untar(reader: impl Read, dest: &Path) -> io::Result<u64> {
 fn untar_in(reader: impl Read, dest: &Path, detect_userns: fn() -> bool) -> io::Result<u64> {
     // Only looked at once a device or fifo entry turns up.
     let mut userns = None;
-    let mut archive = tar::Archive::new(reader);
+    // Empty numbers in headers read as 0, as in Docker (#618).
+    let mut archive = tar::Archive::new(super::tarnum::GoNumbers::new(reader));
     archive.set_preserve_permissions(true);
     archive.set_preserve_ownerships(true);
     archive.set_preserve_mtime(true);

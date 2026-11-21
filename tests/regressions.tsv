@@ -116,3 +116,4 @@ dockerfw-internet	#247	with Docker on the same Linux host its FORWARD policy dro
 dockerfw-rules	#247	Kiri's rules in Docker's DOCKER-USER chain, for IPv4 and IPv6, added when Docker's firewall appears while the engine runs
 dockerfw-docker-kept-apart	#247	letting Kiri's containers through Docker's firewall must not let them into a container on Docker's own bridge
 import-dir-mtime	#676	every directory of an image layer had the time Kiri unpacked it, not the layer's
+import-empty-numbers	#618	a layer whose header left size, uid or gid empty did not unpack: "numeric field was not a number" (servicebus-emulator)
