@@ -109,3 +109,6 @@ bind-v-creates	#651	on a Linux host a folder made for a missing bind-mount sourc
 bind-create-0200	#651	a file a container makes with mode 0200 in a bind mount must be readable from the host by its owner; the check also runs as a plain user now
 body-too-large-answered	#651	a request body over 8 MiB to an endpoint that does not stream it got no answer: the connection was dropped
 body-too-large-chunked	#651	the same with a chunked body: an empty reply where a 413 belongs
+dockerfw-internet	#247	with Docker on the same Linux host its FORWARD policy drop dropped every container's traffic, though Kiri's own table accepted it: no DNS, no internet
+dockerfw-rules	#247	Kiri's rules in Docker's DOCKER-USER chain, for IPv4 and IPv6, added when Docker's firewall appears while the engine runs
+dockerfw-docker-kept-apart	#247	letting Kiri's containers through Docker's firewall must not let them into a container on Docker's own bridge

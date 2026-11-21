@@ -271,6 +271,20 @@ $D restart -t 20 "$N" >/dev/null; up
 t ij-layers-kept-next-start "layers $IJ_LAYERS" "docker run --rm alpine:3.21 true; echo layers \$(ls /var/lib/kiri/layers | wc -l)"
 t ij-cleanup "done" "rm -f $ST/images.json.corrupt-*; echo done"
 t ij-warning-gone "[]" "docker info --format '{{json .Warnings}}'"
+# Docker on the same host (#247): its firewall makes iptables' FORWARD
+# policy drop, and a forwarded packet must pass every chain on the hook, so
+# Kiri's own table accepting it was not enough and containers had no
+# internet. Made here as Docker makes it, in the engine's network namespace
+# while the engine runs, with a container behind a bridge of "Docker's"
+# (docker0, a namespace serving on port 8080). Kiri's containers reach the
+# internet again through rules of its own in DOCKER-USER, and still not
+# Docker's container: no new connection into Docker's bridges passes.
+t dockerfw-setup "ok" "apk add -q iptables ip6tables iproute2 >/dev/null 2>&1 && for t in iptables ip6tables; do \$t -N DOCKER-USER && \$t -I FORWARD -j DOCKER-USER && \$t -P FORWARD DROP || exit 1; done && ip netns add dk && ip link add docker0 type bridge && ip link add dkh type veth peer name dkp && ip link set dkp netns dk && ip link set dkh master docker0 && ip addr add 172.31.250.1/24 dev docker0 && ip link set docker0 up && ip link set dkh up && ip -n dk addr add 172.31.250.2/24 dev dkp && ip -n dk link set dkp up && ip -n dk route add default via 172.31.250.1 && (ip netns exec dk python3 -m http.server 8080 >/dev/null 2>&1 &) && echo ok"
+t dockerfw-internet "Example Domain" "docker run --rm alpine wget -qO- -T 10 http://example.com"
+t dockerfw-rules "3 3" "echo \$(iptables -S DOCKER-USER | grep -c kiri) \$(ip6tables -S DOCKER-USER | grep -c kiri)"
+t dockerfw-docker-reachable "Directory listing" "wget -qO- -T 3 http://172.31.250.2:8080/"
+t dockerfw-docker-kept-apart "kept apart" "docker run --rm alpine sh -c 'wget -qO- -T 3 http://172.31.250.2:8080/ >/dev/null 2>&1 && echo reached || echo kept apart'"
+t dockerfw-cleanup "ok" "pkill -f '[h]ttp.server 8080'; ip netns del dk; ip link del docker0; for t in iptables ip6tables; do \$t -P FORWARD ACCEPT; \$t -D FORWARD -j DOCKER-USER; \$t -F DOCKER-USER; \$t -X DOCKER-USER; done; echo ok"
 $D rm -f "$N" >/dev/null
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" = 0 ]
