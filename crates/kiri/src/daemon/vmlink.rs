@@ -100,7 +100,18 @@ struct Writer {
 }
 
 impl Writer {
+    /// Whether the encoded request is within the agent's frame limit: one
+    /// over it ends the agent, and every container with it, so it fails
+    /// here alone, before anything is queued or sent.
+    fn fits(&self) -> io::Result<()> {
+        if self.out.len() > kiri_proto::MAX_FRAME {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("the request is too large for the engine ({} bytes, the limit is {})", self.out.len(), kiri_proto::MAX_FRAME)));
+        }
+        Ok(())
+    }
+
     fn write(&mut self, windows: &Windows, body: Option<(File, u64)>) -> io::Result<()> {
+        self.fits()?;
         let result = self.write_request(body);
         if result.is_err() {
             // A partial frame cannot be retried on this stream. Publish
@@ -340,6 +351,8 @@ impl VmLink {
             let mut w = self.writer.lock().unwrap_or_else(|e| e.into_inner());
             w.out.clear();
             encode(&mut w.out);
+            // Too large: refused before a reply slot is queued for it.
+            w.fits()?;
             // Queue the slot before writing, so the reply can never arrive first.
             {
                 let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
@@ -779,5 +792,39 @@ mod tests {
         assert!(!windows.lock().loss_handled, "only the reader owns exit accounting");
         let mut peer = peer;
         assert_eq!(peer.read(&mut [0]).unwrap(), 0, "the failed transport is closed in both directions");
+    }
+
+    /// The agent ends on a frame over its limit (every container with it):
+    /// a request that large, such as a container whose environment is over
+    /// 1 MiB, fails alone and nothing of it is sent.
+    #[test]
+    fn a_request_over_the_agents_frame_limit_is_refused_unsent() {
+        let (socket, mut peer) = UnixStream::pair().unwrap();
+        peer.set_nonblocking(true).unwrap();
+        // Never blocks on a peer that does not read: a request that were
+        // sent fills the socket and fails with WouldBlock instead.
+        socket.set_nonblocking(true).unwrap();
+        let mut writer = Writer { conn: std::os::fd::OwnedFd::from(socket).into(), out: vec![0; kiri_proto::MAX_FRAME + 1], blob: vec![0; 16] };
+        let windows = Windows::default();
+        let e = writer.write(&windows, None).unwrap_err();
+        assert!(e.to_string().contains("too large"), "{e}");
+        assert!(!windows.lock().lost, "the link stays");
+        assert_eq!(peer.read(&mut [0; 16]).map_err(|e| e.kind()), Err(io::ErrorKind::WouldBlock), "nothing sent");
+        writer.out = vec![7; 8];
+        assert!(writer.write(&windows, None).is_ok());
+        peer.set_nonblocking(false).unwrap();
+        let mut got = [0; 8];
+        peer.read_exact(&mut got).unwrap();
+        assert_eq!(got, [7; 8], "the link carries the next request");
+    }
+
+    /// A request of exactly the agent's limit is still sent.
+    #[test]
+    fn a_request_at_the_agents_frame_limit_fits() {
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let mut writer = Writer { conn: std::os::fd::OwnedFd::from(socket).into(), out: vec![0; kiri_proto::MAX_FRAME], blob: vec![0; 16] };
+        assert!(writer.fits().is_ok());
+        writer.out.push(0);
+        assert!(writer.fits().is_err());
     }
 }
