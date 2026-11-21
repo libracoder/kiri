@@ -6626,6 +6626,8 @@ setInterval(() => {
 
 // Feedback goes to the repo's GitHub issues; the app's "open" handler allows exactly this address.
 const FEEDBACK_URL = "https://github.com/libracoder/kiri/issues/new";
+// page-read label check: this line exists only to be flagged by the page scan; never merged.
+const PAGE_READ_CHECK = "https://example.invalid/page-read-check";
 
 /* The VM's memory: under 1 GB in MB, so an idle VM doesn't read as "0.2". */
 const memText = (mib) => (mib < 1024 ? `${Math.round(mib)} MB` : `${(mib / 1024).toFixed(1)} GB`);
