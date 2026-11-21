@@ -322,6 +322,8 @@ struct HostApplied {
     rlimits: Vec<(u32, u64, u64)>,
     groups: Vec<String>,
     nodes: Vec<super::hostopts::Node>,
+    masked: Option<Vec<CString>>,
+    readonly: Option<Vec<CString>>,
 }
 
 /// Docker's default capability set as a mask.
@@ -543,7 +545,8 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
         let pid = net.pid_join_pid.ok_or_else(|| cleanup(io::Error::other(format!("cannot join PID of a non running container: {target}"))))?;
         pid_join = Some(fs::File::open(format!("/proc/{pid}/ns/pid")).map_err(cleanup)?);
     }
-    prepared.host = HostApplied { rlimits: host.rlimits.clone(), groups: host.groups.clone(), nodes };
+    let (masked, readonly) = (host.masked.take(), host.readonly.take());
+    prepared.host = HostApplied { rlimits: host.rlimits.clone(), groups: host.groups.clone(), nodes, masked, readonly };
     // Small, short-lived files: kept in memory (/run is tmpfs), not on the data disk.
     let etc_dir = PathBuf::from("/run/kiri").join(spec.id);
     let embedded_dns = embedded_dns(spec, net.upstream_dns, net.dns.relay);
@@ -908,7 +911,7 @@ pub fn exec(spec: &ExecSpec<'_>, target_pid: libc::pid_t, paths: &Paths, profile
     let mut prepared = prepare(spec.argv, spec.env, spec.cwd, spec.user, None, spec.flags, spec.caps)?;
     // The container's ulimits and groups apply to its execs too, as with runc.
     let host = super::hostopts::parse(spec.opts)?;
-    prepared.host = HostApplied { rlimits: host.rlimits, groups: host.groups, nodes: Vec::new() };
+    prepared.host = HostApplied { rlimits: host.rlimits, groups: host.groups, ..Default::default() };
     // An exec runs under its container's profile, not the default.
     prepared.profile = profile.to_vec();
     let (parent_io, child_io) = stdio(&prepared)?;
@@ -1805,7 +1808,7 @@ fn child_fds(p: &Prepared, io: &ChildStdio) -> Vec<RawFd> {
         shm_size: _,
         init: _,
         // Paths, numbers and names only.
-        host: HostApplied { rlimits: _, groups: _, nodes: _ },
+        host: HostApplied { rlimits: _, groups: _, nodes: _, masked: _, readonly: _ },
         root_ready,
     } = p;
     let mut fds = match io {
@@ -1850,7 +1853,9 @@ fn container_child(p: &Prepared, rootfs: &CStr, io: &ChildStdio, close_first: &[
     }
     let root = inroot::open_root(Path::new(".")).unwrap_or_else(|e| fail("enter rootfs", e));
     let root = root.as_fd();
-    mount_container_filesystems(p.privileged, p.shm_size).unwrap_or_else(|e| fail("mount", e));
+    mount_container_filesystems(p.privileged, p.shm_size, &p.host).unwrap_or_else(|e| fail("mount", e));
+    // Taken before user mounts can cover /dev, as the source for MaskedPaths.
+    let null = p.host.masked.as_ref().filter(|m| !m.is_empty()).map(|_| dev_null().unwrap_or_else(|e| fail("masked paths", e)));
     super::hostopts::make_nodes(root, &p.host.nodes).unwrap_or_else(|e| fail("devices", e));
     for (src, target) in &p.etc_files {
         bind_file(root, src, target).unwrap_or_else(|e| fail(&target.to_string_lossy(), e));
@@ -1887,6 +1892,8 @@ fn container_child(p: &Prepared, rootfs: &CStr, io: &ChildStdio, close_first: &[
     // before it switches user and before the root goes read-only, so both
     // `-u 1000 -w /missing` and `--read-only -w /missing` start (#370).
     make_workdir(root, &p.cwd);
+    api_paths(p.host.readonly.as_deref().unwrap_or_default(), p.host.masked.as_deref().unwrap_or_default(), null.as_ref())
+        .unwrap_or_else(|e| fail("masked paths", e));
     if let Some(flags) = root_remount_flags(p.readonly_rootfs, p.nodev_root) {
         // Only the root itself: volumes, tmpfs and /dev stay as they are.
         sys::mount(c"none", c"/", c"none", flags, None).unwrap_or_else(|e| fail(if p.readonly_rootfs { "read-only root" } else { "nodev root" }, e));
@@ -2126,7 +2133,7 @@ fn root_remount_flags(readonly: bool, nodev: bool) -> Option<libc::c_ulong> {
 /// /dev/pts, /dev/shm, /dev/mqueue and a read-only cgroup view. Relative
 /// paths: the current directory is the container root. A privileged
 /// container gets the VM's devices and writable /sys and cgroups instead.
-fn mount_container_filesystems(privileged: bool, shm_size: u64) -> io::Result<()> {
+fn mount_container_filesystems(privileged: bool, shm_size: u64, host: &HostApplied) -> io::Result<()> {
     let nosuid_nodev_noexec = libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC;
     let ro = if privileged { 0 } else { libc::MS_RDONLY };
     for d in [c"proc", c"sys", c"dev"] {
@@ -2185,8 +2192,12 @@ fn mount_container_filesystems(privileged: bool, shm_size: u64) -> io::Result<()
     sys::mount(c"mqueue", c"dev/mqueue", c"mqueue", nosuid_nodev_noexec, None)?;
     sys::mkdir(c"sys/fs/cgroup", 0o755);
     sys::mount(c"cgroup2", c"sys/fs/cgroup", c"cgroup2", nosuid_nodev_noexec | ro, None)?;
-    if !privileged {
+    // An API list replaces Docker's default for that half (see `api_paths`).
+    if !privileged && host.readonly.is_none() {
         harden_proc()?;
+    }
+    if !privileged && host.masked.is_none() {
+        mask_proc();
     }
     Ok(())
 }
@@ -2249,8 +2260,8 @@ fn copy_host_devices(from: &Path, to: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Makes the dangerous parts of /proc read-only or hides them, as Docker's
-/// default `readonlyPaths` and `maskedPaths` do. The container is real root
+/// Makes the dangerous parts of /proc read-only, as Docker's default
+/// `readonlyPaths` does. The container is real root
 /// (no user namespace), and these sysctls and files are not namespaced, so
 /// without this a container could set `kernel.core_pattern` or
 /// `kernel.modprobe` and run code on the host. Paths are relative to the
@@ -2268,6 +2279,11 @@ fn harden_proc() -> io::Result<()> {
             let _ = sys::remount(p, ro as libc::c_ulong);
         }
     }
+    Ok(())
+}
+
+/// Hides what Docker's default `maskedPaths` does, relative to the container root.
+fn mask_proc() {
     // Hide files that leak host memory or kernel addresses, by covering them
     // with /dev/null (already created above).
     for p in [c"proc/kcore", c"proc/keys", c"proc/latency_stats", c"proc/timer_list", c"proc/timer_stats", c"proc/sched_debug", c"proc/interrupts"] {
@@ -2277,7 +2293,59 @@ fn harden_proc() -> io::Result<()> {
     for p in [c"proc/scsi", c"proc/acpi", c"proc/asound", c"sys/firmware", c"sys/devices/virtual/powercap"] {
         let _ = sys::mount(c"tmpfs", p, c"tmpfs", (libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC) as libc::c_ulong, Some(c"size=0k"));
     }
+}
+
+/// The API's own `ReadonlyPaths` and `MaskedPaths`, applied after pivot_root as runc does.
+fn api_paths(readonly: &[CString], masked: &[CString], null: Option<&OwnedFd>) -> io::Result<()> {
+    for p in readonly {
+        match sys::mount(p, p, c"none", libc::MS_BIND | libc::MS_REC, None) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            r => r?,
+        }
+        // A remount drops nosuid, nodev and noexec unless they are given again.
+        // SAFETY: statvfs is plain data; all-zero is a valid value.
+        let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+        // SAFETY: valid NUL-terminated path and a writable struct.
+        if unsafe { libc::statvfs(p.as_ptr(), &mut st) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let keep = st.f_flag & (libc::ST_NOSUID | libc::ST_NODEV | libc::ST_NOEXEC);
+        sys::remount(p, (libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY) as libc::c_ulong | keep)?;
+    }
+    for p in masked {
+        let null = null.ok_or_else(|| io::Error::other("no /dev/null to mask with"))?;
+        let src = CString::new(format!("/proc/self/fd/{}", null.as_raw_fd())).expect("no NUL");
+        match sys::mount(&src, p, c"none", libc::MS_BIND, None) {
+            Err(e) if e.kind() == io::ErrorKind::NotADirectory => {
+                sys::mount(c"tmpfs", p, c"tmpfs", (libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC) as libc::c_ulong, Some(c"size=0k"))?
+            }
+            // Only a missing target is skipped, never a source that stopped resolving.
+            Err(e) if e.kind() == io::ErrorKind::NotFound && fs::metadata(std::ffi::OsStr::from_bytes(src.as_bytes())).is_ok() => {}
+            r => r?,
+        }
+    }
     Ok(())
+}
+
+/// The container's own /dev/null as an O_PATH descriptor, checked to be device 1:3.
+fn dev_null() -> io::Result<OwnedFd> {
+    // SAFETY: valid NUL-terminated path; the descriptor is owned right away.
+    let fd = unsafe { libc::open(c"dev/null".as_ptr(), libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fresh descriptor nothing else owns.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    // SAFETY: stat is plain data; all-zero is a valid value.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: a descriptor we own and a writable struct.
+    if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if st.st_mode & libc::S_IFMT != libc::S_IFCHR || st.st_rdev != libc::makedev(1, 3) {
+        return Err(io::Error::other("/dev/null is not the null device"));
+    }
+    Ok(fd)
 }
 
 /// `""`, `root`, `1000`, `1000:1000`, `redis`, `redis:redis`: looked up in
