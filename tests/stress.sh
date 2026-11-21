@@ -227,6 +227,12 @@ if selected rm-f-exit-code; then
   badd=$(awk '($2 != 137 && $2 != "gone") || $3 == 1 {print $1 "s:" $2}' "$WORK/b.log" | sort | uniq -c | awk '{printf "%s%s x%d", s, $2, $1; s=", "}')
   # The same race seen by four waiters at once: wait until removed, until the
   # next exit, until not running (over the API), and docker wait.
+  # A wait that reaches the engine after the removal gets "No such
+  # container", from Docker too: its ContainerWait looks the container up
+  # first and answers 404 when it is gone. The docker CLI takes a while to
+  # start (over 0.1 s now and then on a slow VM), so docker wait gets a head
+  # start, and if it still came late that round counts as late, not as a
+  # wrong code. Late in most rounds means the race was not tested: a fail.
   : > "$WORK/w.log"
   [ "$B_TIMEOUTS" -ge 3 ] && WAITERS=0
   for i in $(seq "$WAITERS"); do
@@ -236,16 +242,21 @@ if selected rm-f-exit-code; then
       curl -s -m 30 --unix-socket "$SOCK" -X POST "http://d/containers/$n/wait?condition=$c" > "$WORK/w.$c" &
     done
     lim 30 "$D" wait "$n" > "$WORK/w.cli" 2>&1 &
-    sleep 0.1
+    sleep 0.5
     tm 15 "$D" rm -f "$n" >/dev/null
     wait
-    echo "removed=$(grep -o '"StatusCode":[0-9]*' "$WORK/w.removed" | cut -d: -f2) next-exit=$(grep -o '"StatusCode":[0-9]*' "$WORK/w.next-exit" | cut -d: -f2) not-running=$(grep -o '"StatusCode":[0-9]*' "$WORK/w.not-running" | cut -d: -f2) docker-wait=$(tr -d '\r\n' < "$WORK/w.cli")" >> "$WORK/w.log"
+    cli=$(tr -d '\r\n' < "$WORK/w.cli")
+    case $cli in *"No such container"*) cli=late ;; esac
+    echo "removed=$(grep -o '"StatusCode":[0-9]*' "$WORK/w.removed" | cut -d: -f2) next-exit=$(grep -o '"StatusCode":[0-9]*' "$WORK/w.next-exit" | cut -d: -f2) not-running=$(grep -o '"StatusCode":[0-9]*' "$WORK/w.not-running" | cut -d: -f2) docker-wait=$cli" >> "$WORK/w.log"
   done
-  wbad=$(grep -vc '^removed=137 next-exit=137 not-running=137 docker-wait=137$' "$WORK/w.log")
-  wfirst=$(grep -v '^removed=137 next-exit=137 not-running=137 docker-wait=137$' "$WORK/w.log" | sort | uniq -c | head -3 | sed 's/^ *//' | paste -sd ';' -)
+  W_OK='^removed=137 next-exit=137 not-running=137 docker-wait=(137|late)$'
+  wbad=$(grep -Evc "$W_OK" "$WORK/w.log")
+  wlate=$(grep -c 'docker-wait=late$' "$WORK/w.log")
+  [ $((wlate * 2)) -gt "$WAITERS" ] && wbad=$((wbad + wlate))
+  wfirst=$(grep -Ev "$W_OK" "$WORK/w.log" | sort | uniq -c | head -3 | sed 's/^ *//' | paste -sd ';' -)
   [ -s "$WORK/b.msgs" ] && sed "s/$P-rm-[0-9]*/NAME/g" "$WORK/b.msgs" | sort | uniq -c | sort -rn | head -5 | sed 's/^ */  seen /'
   check rm-f-exit-code "$([ "$bad" = 0 ] && [ "$wbad" = 0 ] && echo 1)" \
-    "$(wc -l < "$WORK/b.log" | tr -d ' ') runs: $tally; exit 0 in $zero${badd:+ (not 137 at: $badd)}; waiters: $wbad of $WAITERS rounds saw another code${wfirst:+ ($wfirst)}"
+    "$(wc -l < "$WORK/b.log" | tr -d ' ') runs: $tally; exit 0 in $zero${badd:+ (not 137 at: $badd)}; waiters: $wbad of $WAITERS rounds saw another code${wfirst:+ ($wfirst)}, docker wait late in $wlate"
 fi
 
 # (c) rm -f or stop sent while several containers start at once, beside
