@@ -986,6 +986,9 @@ impl Client {
     pub fn push(&self, store: &Store, image: &Image, target: &Reference, progress: &dyn Fn(PushProgress)) -> Result<(String, u64), Error> {
         let base = target.api_base();
         let repo = &target.repository;
+        // Every blob held until the manifest is up: the image removed
+        // meanwhile must not take a blob away mid-push.
+        let _held = crate::archive::hold(store, std::slice::from_ref(image))?;
         let config_size = std::fs::metadata(store.blob_path(&image.config_digest)?)?.len();
         let blobs: Vec<(String, u64)> =
             image.layers.iter().map(|l| (l.digest.clone(), l.size)).chain(std::iter::once((image.config_digest.clone(), config_size))).collect();
@@ -1415,6 +1418,84 @@ mod tests {
         let cfg = ureq::Agent::config_builder().http_status_as_error(false).build();
         let agent = ureq::Agent::with_parts(cfg, crate::connect::connector_with(Duration::from_millis(300)), ureq::unversioned::resolver::DefaultResolver::default());
         Client { agent, credentials: None }
+    }
+
+    /// A registry that takes every push: blobs are missing until put, and
+    /// it records what it was sent, by digest. `QUIT` ends it.
+    fn push_server() -> (String, std::thread::JoinHandle<HashMap<String, Vec<u8>>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let host = listener.local_addr().unwrap().to_string();
+        let served = std::thread::spawn(move || {
+            let mut blobs = HashMap::new();
+            'conns: for c in listener.incoming() {
+                let mut c = std::io::BufReader::new(c.unwrap());
+                loop {
+                    let mut head = String::new();
+                    let mut line = String::new();
+                    while line != "\r\n" {
+                        line.clear();
+                        if std::io::BufRead::read_line(&mut c, &mut line).unwrap_or(0) == 0 {
+                            continue 'conns;
+                        }
+                        head.push_str(&line);
+                    }
+                    let first = head.lines().next().unwrap_or_default().to_owned();
+                    if first.starts_with("QUIT") {
+                        break 'conns;
+                    }
+                    let len: usize = head.lines().find_map(|l| l.to_lowercase().strip_prefix("content-length: ").map(|v| v.trim().parse().unwrap())).unwrap_or(0);
+                    let mut body = vec![0u8; len];
+                    std::io::Read::read_exact(&mut c, &mut body).unwrap();
+                    let path = first.split(' ').nth(1).unwrap_or_default().to_owned();
+                    let reply = if first.starts_with("HEAD") {
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"
+                    } else if first.starts_with("POST") {
+                        "HTTP/1.1 202 Accepted\r\nLocation: /v2/t/blobs/uploads/1\r\nContent-Length: 0\r\n\r\n"
+                    } else {
+                        if !path.contains("/manifests/") {
+                            blobs.insert(path.split("digest=").nth(1).unwrap_or_default().to_owned(), body);
+                        }
+                        "HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n"
+                    };
+                    std::io::Write::write_all(c.get_mut(), reply.as_bytes()).unwrap();
+                }
+            }
+            blobs
+        });
+        (host, served)
+    }
+
+    /// The image removed while it is being pushed (its tag deleted by
+    /// another client): the push still sends every blob it began with.
+    #[test]
+    fn a_push_keeps_its_blobs_while_the_image_is_removed() {
+        use std::io::Write as _;
+        let root = std::env::temp_dir().join(format!("kiri-push-rm-test-{}", std::process::id()));
+        let store = Store::open(&root).unwrap();
+        let put = |bytes: &[u8]| {
+            let mut w = store.ingest().unwrap();
+            w.write_all(bytes).unwrap();
+            w.finish().unwrap()
+        };
+        let (layer, size) = put(b"\x1f\x8bnot really gzip");
+        let config = serde_json::json!({"os": "linux", "architecture": "amd64", "config": {}});
+        let (cfg, _) = put(&serde_json::to_vec(&config).unwrap());
+        let image = crate::archive::from_config("gone:1".into(), &cfg, &config, vec![Layer { digest: layer.clone(), size, media_type: "application/vnd.oci.image.layer.v1.tar+gzip".into() }]);
+        store.put_image(image.clone()).unwrap();
+        let (host, served) = push_server();
+        let target = Reference::parse(&format!("{host}/t:1")).unwrap();
+        let removed = std::sync::atomic::AtomicBool::new(false);
+        let pushed = test_client().push(&store, &image, &target, &|_| {
+            if !removed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                store.remove_image("gone:1").unwrap();
+            }
+        });
+        quit(&host);
+        let blobs = served.join().unwrap();
+        pushed.unwrap();
+        assert!(blobs.contains_key(&layer), "the layer went up");
+        assert!(blobs.contains_key(&cfg), "the config went up");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn blob() -> (Vec<u8>, String) {
