@@ -540,8 +540,8 @@ fn elevated(args: &[&str]) -> io::Result<i32> {
     }
 }
 
-/// Step 1: download WSL, then in one elevated run turn on Virtual Machine
-/// Platform and install WSL. Exit 3010 from either means a restart.
+/// Step 1: download WSL, then in one elevated run turn on the Linux optional
+/// components and install WSL. Exit 3010 from either means a restart.
 fn install_wsl() -> io::Result<()> {
     update(|s| s.tasks = tasks(&[tr("Download WSL"), tr("Administrator approval"), tr("Turn on Virtual Machine Platform"), tr("Install WSL")]));
     // WSL_MSI is this build's architecture's; on another PC it would not install.
@@ -562,9 +562,9 @@ fn install_wsl() -> io::Result<()> {
     match code {
         22 => return Err(io::Error::other("the downloaded WSL installer changed on disk; try again")),
         23 => return Err(io::Error::other("the WSL installer is not validly signed by Microsoft")),
-        20 => {
+        24 => {
             task(2, "error", "");
-            return Err(io::Error::other("Windows could not turn on Virtual Machine Platform (is virtualization on in the BIOS?)"));
+            return Err(io::Error::other("Windows could not turn on the Linux optional components (is virtualization on in the BIOS?)"));
         }
         21 => {
             task(2, "done", "");
