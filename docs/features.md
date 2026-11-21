@@ -11,7 +11,9 @@ Apple silicon and Intel Macs (macOS 14+), Windows 10 and 11 (x86-64 and Arm, thr
   `--restart`, `--entrypoint`), `exec`, `logs`, `attach`, `stop`, `kill`,
   `restart`, `rm`, `wait`, `rename`, `pause`/`unpause`, `update`, `stats`,
   `top`, `diff`, `export`, `commit`, `cp` (both ways, running or not),
-  `container prune`; records survive a daemon restart; filters on every list
+  `container prune`; records survive a daemon restart; filters on every list;
+  healthchecks (`--health-cmd` and the other `--health-*` options, including
+  `--health-start-interval`; `ps --filter health=`)
 - **Limits and security**: `--memory`, `--cpus`, `--cpu-shares`,
   `--pids-limit`, `--shm-size`; Docker's default capabilities and a default
   seccomp filter; `--cap-add`/`--cap-drop`, `--privileged`, `--read-only`,
@@ -45,14 +47,19 @@ Apple silicon and Intel Macs (macOS 14+), Windows 10 and 11 (x86-64 and Arm, thr
   `kiri domains set --http 8080 --https 8443` moves them with no restart,
   `kiri domains reset` puts back 80 and 443
 - **Storage**: named and anonymous volumes, bind mounts of Mac paths
-  (virtiofs), `--tmpfs`, `--mount`, `volume` commands
+  (virtiofs), `--tmpfs`, `--mount`, `volume` commands; local volumes that
+  bind a folder (`driver_opts: {type: none, o: bind, device: /path}`)
 - **Images**: `pull` (with `docker login` credentials), `push`, `tag`,
   `save`, `load`, `history`, `search`, `image prune`, `system df`;
   **amd64 images run through Rosetta**, `--platform` honoured
 - **Builds**: `docker build` / `buildx build` through BuildKit running in a
   Kiri container (buildx's docker-container driver), stopped when idle;
-  on Apple silicon, amd64 build steps run through Rosetta too
-- **Compose**: `up`, `down`, `ps`, `logs`, `exec`, multiple networks, events
+  `--platform` for one platform at a time; on Apple silicon, amd64 build
+  steps run through Rosetta too
+- **Compose**: `up` (with `--build` and `--wait`), `down`, `ps`, `logs`,
+  `exec`, `build:`, healthchecks, `depends_on` conditions
+  (`service_healthy`, `service_completed_successfully`), `platform:`,
+  multiple networks, events
 - **USB devices (beta)**: the USB tab hands a device (a serial adapter, a
   Zigbee stick, a development board) to your containers on Mac, Windows and
   Linux, and shows where it is inside Linux with the `--device` line to
@@ -134,3 +141,24 @@ unless the Mac already has a docker CLI.
   (`--add-host name:172.18.0.1` on Windows and Linux, the default bridge's
   gateway; `198.19.248.254` on a Mac) or `DOCKER_BUILDKIT=0`, where Kiri
   maps `host-gateway` itself.
+
+- **`docker build --platform linux/amd64,linux/arm64` fails** with
+  `docker exporter does not currently support exporting manifest lists`:
+  Kiri's builder loads one platform into Kiri per build. Build each
+  platform with its own `--platform`, or write all of them to an OCI
+  archive with `-o type=oci,dest=image.tar` (Kiri's `docker load` does not
+  read OCI archives).
+
+- **A build that cannot reach a registry says `not found`.** When BuildKit
+  cannot reach the registry (for example, no DNS in the builder), a base
+  image Kiri doesn't hold fails with `failed to resolve source metadata for
+  docker.io/library/alpine:3.15: docker.io/library/alpine:3.15: not found`.
+  So does a digest-pinned base (`FROM alpine:3.13@sha256:...`) right after
+  `docker pull` fetched it by that digest. Kiri's builder asks Kiri's image
+  mirror first; the mirror has no answer for that tag or digest, and when
+  the registry then can't be reached BuildKit reports the mirror's
+  "not found" instead of the network error. A docker-container builder
+  with no mirror shows the real cause (`dial tcp: lookup
+  registry-1.docker.io ...`). The builder runs on the default bridge, so
+  check from a container there:
+  `docker run --rm alpine nslookup registry-1.docker.io`.
