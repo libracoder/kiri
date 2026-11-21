@@ -52,6 +52,11 @@ limit-shares-inspect	#612	inspect did not give back the --cpu-shares asked for
 status-tag	#612	an image tag answered 204, not Docker's 201
 status-connect	#612	network connect answered 204, not Docker's 200
 status-disconnect	#612	network disconnect answered 204, not Docker's 200
+rename-dns-new	#467	after docker rename the new name did not resolve on a user network: the guest's DNS names were set at start only
+rename-dns-new-extra-net	#467	after docker rename the new name did not resolve on a network the container was connected to
+rename-dns-old-gone	#467	after docker rename the old name still resolved to the container
+rename-dns-old-gone-extra-net	#467	after docker rename the old name still resolved on a connected network
+rename-dns-keeps-own-servers	#467	a rename that dropped the container's names also dropped its own --dns servers, so its lookups went to Kiri's resolver
 status-exec-detached	#612	a detached exec start answered 204, not Docker's 200
 status-start-still-204	#612	the status fix must keep a container start at 204
 api-too-old	#612	an API version older than 1.24 was served instead of refused

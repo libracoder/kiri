@@ -714,14 +714,10 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
                 },
                 Ok(Msg::DnsRename { bridge, ip, ip6, names }) => {
                     // The names registered at start are keyed by address, so
-                    // drop them all and put back the renamed ones. A stopped
-                    // container sends no such frame.
-                    let names: Vec<&str> = names.iter().collect();
-                    dns.unregister(bridge, ip);
-                    dns.register(bridge, names.iter().copied(), ip);
-                    if let Ok(v6) = <[u8; 16]>::try_from(ip6) {
-                        dns.register6(bridge, names.iter().copied(), ip, v6);
-                    }
+                    // they are replaced as a set; its `--dns` servers stay. A
+                    // stopped container sends no such frame. No reply.
+                    dns.rename(bridge, ip, <[u8; 16]>::try_from(ip6).ok(), &names.iter().collect::<Vec<_>>());
+                    continue;
                 }
                 Ok(Msg::UplinkQuery) => match dhcp.as_ref().and_then(|d| d.lease.as_ref()) {
                     Some(l) => Msg::Uplink { ip: l.ip, gateway: l.gateway }.encode(&mut out),

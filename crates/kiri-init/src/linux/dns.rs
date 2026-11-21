@@ -292,6 +292,22 @@ impl Dns {
 
     pub fn unregister(&mut self, bridge: &str, ip: [u8; 4]) {
         self.clients.remove(&ip);
+        self.drop_names(bridge, ip);
+    }
+
+    /// `docker rename`: the names the container at `ip` answers to on
+    /// `bridge` become `names`. Unlike `unregister`, its own `--dns`
+    /// servers (kept under its address) stay.
+    pub fn rename(&mut self, bridge: &str, ip: [u8; 4], ip6: Option<[u8; 16]>, names: &[impl AsRef<str>]) {
+        self.drop_names(bridge, ip);
+        self.register(bridge, names.iter(), ip);
+        if let Some(v6) = ip6 {
+            self.register6(bridge, names.iter(), ip, v6);
+        }
+    }
+
+    /// Every name the container at `ip` has on `bridge`, A and AAAA.
+    fn drop_names(&mut self, bridge: &str, ip: [u8; 4]) {
         if let Some(table) = self.names.get_mut(bridge) {
             for list in table.values_mut() {
                 list.retain(|a| *a != ip);
@@ -891,14 +907,25 @@ mod tests {
         let mut dns = Dns::default();
         dns.servers.push(super::Server { bridges: vec!["kiri1".into()], sock: super::udp_socket().unwrap(), container: None });
         let ip = [10, 5, 0, 2];
+        let v6 = [0xfd, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
         dns.register("kiri1", ["old", "keep-alias"].iter(), ip);
-        dns.unregister("kiri1", ip);
-        dns.register("kiri1", ["new", "keep-alias"].iter().copied(), ip);
+        dns.register6("kiri1", ["old", "keep-alias"].iter(), ip, v6);
+        // Another container's name on the same network is left alone.
+        dns.register("kiri1", ["other"].iter(), [10, 5, 0, 3]);
+        dns.set_upstream(ip, vec![[8, 8, 8, 8]]);
+        dns.rename("kiri1", ip, Some(v6), &["new", "keep-alias"]);
         let q = query("new", 1);
         assert_eq!(answers(&dns.answer(0, &q).unwrap(), q.len()), [(1, ip.to_vec())]);
+        let q = query("new", 28);
+        assert_eq!(answers(&dns.answer(0, &q).unwrap(), q.len()), [(28, v6.to_vec())]);
         let q = query("keep-alias", 1);
         assert_eq!(answers(&dns.answer(0, &q).unwrap(), q.len()), [(1, ip.to_vec())]);
         assert!(dns.answer(0, &query("old", 1)).is_none());
+        assert!(dns.answer(0, &query("old", 28)).is_none());
+        let q = query("other", 1);
+        assert_eq!(answers(&dns.answer(0, &q).unwrap(), q.len()), [(1, vec![10, 5, 0, 3])]);
+        // Its own --dns servers are kept under its address: a rename keeps them.
+        assert_eq!(dns.clients.get(&ip), Some(&vec![[8, 8, 8, 8]]));
     }
 
     fn pending() -> Pending {

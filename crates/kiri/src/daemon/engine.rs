@@ -970,6 +970,9 @@ pub fn stop_wait(secs: i64) -> Duration {
     if secs < 0 { Duration::from_secs(365 * 86_400) } else { Duration::from_secs(secs as u64) }
 }
 
+/// One network's DNS names for a renamed container: (bridge, IPv4, IPv6, names).
+type RenamedDns = (String, [u8; 4], Option<[u8; 16]>, Vec<String>);
+
 pub struct Engine {
     pub volumes: Mutex<super::volumes::Volumes>,
     /// The VM, while it is awake. It sleeps (powers off, freeing all its
@@ -4042,10 +4045,9 @@ impl Engine {
         // rename has to replace them too, or the new name never resolves and
         // the old one keeps answering to the same address.
         let updates = self.dns_names_after_rename(&id);
-        // No update for a stopped container: don't wake a sleeping VM just
-        // to rename one.
+        // No update for a stopped container, and never a VM woken for one.
         if !updates.is_empty()
-            && let Ok(vm) = self.vm()
+            && let Some(vm) = self.awake()
         {
             for (bridge, ip, ip6, names) in updates {
                 let _ = vm.dns_rename(&bridge, ip, ip6, &names);
@@ -4057,32 +4059,33 @@ impl Engine {
 
     /// The DNS names a running container should answer to after a rename,
     /// one set per attached user network: (bridge, IPv4, IPv6, names). The
-    /// default bridge has no embedded DNS and is left out.
-    fn dns_names_after_rename(&self, id: &str) -> Vec<(String, [u8; 4], Option<[u8; 16]>, Vec<String>)> {
+    /// same names it was given there: at start on its first network (name,
+    /// aliases, hostname), on `attach_extra` for the others (name, short ID,
+    /// aliases). The default bridge has no embedded DNS and is left out.
+    fn dns_names_after_rename(&self, id: &str) -> Vec<RenamedDns> {
         let st = self.lock();
         let Some(c) = st.containers.get(id) else { return Vec::new() };
         if c.pid == 0 {
             return Vec::new();
         }
-        let hostname = if c.spec.hostname.is_empty() { c.short_id().to_owned() } else { c.spec.hostname.clone() };
-        let names_for = |aliases: &[String]| {
-            let mut names = vec![c.name.clone(), hostname.clone()];
-            names.extend(aliases.iter().cloned());
-            names
-        };
         let networks = self.lock_networks();
         let mut out = Vec::new();
         if let Some(ip) = c.ip
             && let Some(n) = networks.find(&c.spec.network_mode)
             && !n.builtin()
         {
-            out.push((n.bridge.clone(), ip, c.ip6, names_for(&c.spec.aliases)));
+            let hostname = if c.spec.hostname.is_empty() { c.short_id() } else { c.spec.hostname.as_str() };
+            let mut names = vec![c.name.clone()];
+            names.extend(c.spec.aliases.iter().cloned());
+            names.push(hostname.to_owned());
+            out.push((n.bridge.clone(), ip, c.ip6, names));
         }
         for (network, ip) in &c.extra_ips {
-            let Some(n) = networks.find(network) else { continue };
+            let Some(n) = networks.find(network).filter(|n| !n.builtin()) else { continue };
             let ip6 = c.extra_ip6s.iter().find(|(name, _)| name == network).map(|(_, ip)| *ip);
-            let aliases = c.spec.extra_networks.iter().find(|x| &x.name == network).map_or(&[][..], |x| x.aliases.as_slice());
-            out.push((n.bridge.clone(), *ip, ip6, names_for(aliases)));
+            let mut names = vec![c.name.clone(), c.short_id().to_owned()];
+            names.extend(c.spec.extra_networks.iter().find(|x| &x.name == network).into_iter().flat_map(|x| x.aliases.iter().cloned()));
+            out.push((n.bridge.clone(), *ip, ip6, names));
         }
         out
     }
