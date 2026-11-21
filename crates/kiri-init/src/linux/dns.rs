@@ -16,7 +16,8 @@
 //! leaves unanswered for `FALLBACK_AFTER`, is asked again through the Kiri
 //! daemon on the Mac, over vsock, which asks the Mac's own resolvers
 //! (crates/kiri/src/daemon/dns.rs). A container's own `--dns` servers are
-//! never second-guessed.
+//! tried in the order given when one refuses or can't be sent to, and are
+//! never second-guessed by the VM's resolver or the host.
 
 use std::collections::HashMap;
 use std::io::{self, Read};
@@ -81,8 +82,10 @@ struct Pending {
     id: u16,
     question: Vec<u8>,
     sent: Instant,
-    /// The query as sent (with `our` ID), to send again through the host.
+    /// The query as sent (with `our` ID), to send again.
     query: Vec<u8>,
+    /// The container's remaining `--dns` servers, in order.
+    remaining: Vec<[u8; 4]>,
     /// It may still go through the host: in the VM, asked of the VM's own
     /// resolver (not `--dns` servers), and not tried there yet.
     may_relay: bool,
@@ -325,9 +328,15 @@ impl Dns {
                 // SAFETY: receiving into a buffer we own.
                 let n = unsafe { libc::recv(fd, buf.as_mut_ptr().cast(), buf.len(), 0) };
                 if n < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ECONNREFUSED) {
-                    // Nothing listens at the resolver: ask the host now
-                    // rather than wait for the client to give up.
-                    self.relay(at);
+                    // Nothing listens: try the next server, or the host
+                    // if this query may go through it.
+                    let p = &mut self.pending[at];
+                    if let Some(sock) = ask_next(&mut p.remaining, &p.query) {
+                        p.sock = sock;
+                        p.sent = Instant::now();
+                    } else {
+                        self.relay(at);
+                    }
                     break;
                 }
                 if n < 12 {
@@ -417,7 +426,7 @@ impl Dns {
         let now = Instant::now();
         self.pending.retain(|p| now.duration_since(p.sent) < FORWARD_TIMEOUT);
         let key = self.servers[server].container.map_or(client.sin_addr.s_addr.to_ne_bytes(), |(_, owner)| owner);
-        let own = self.clients.get(&key).and_then(|v| v.first()).copied();
+        let own = self.clients.get(&key);
         if self.pending.len() >= MAX_PENDING || self.pending.iter().filter(|p| p.key == key).count() >= MAX_PER_CLIENT {
             return;
         }
@@ -429,9 +438,14 @@ impl Dns {
         let id = u16::from_be_bytes([msg[0], msg[1]]);
         msg[0..2].copy_from_slice(&our.to_be_bytes());
         let may_relay = self.relay && own.is_none();
-        let dest = own.or(upstream.first().copied());
+        let mut remaining = own.cloned().unwrap_or_default();
+        let sock = if own.is_some() {
+            ask_next(&mut remaining, &msg)
+        } else {
+            upstream.first().and_then(|d| ask(*d, &msg))
+        };
         // No resolver yet, or it can't be reached: the host, if allowed.
-        let (sock, relayed) = match dest.and_then(|d| ask(d, &msg)) {
+        let (sock, relayed) = match sock {
             Some(s) => (s, false),
             None if may_relay => match self.relay_stream(&msg) {
                 Some(s) => (s, true),
@@ -449,6 +463,7 @@ impl Dns {
             question: q[12..end].to_vec(),
             sent: now,
             query: msg,
+            remaining,
             may_relay: may_relay && !relayed,
             relayed: relayed.then(Vec::new),
         };
@@ -568,6 +583,16 @@ impl Dns {
             .min()
             .unwrap_or(-1)
     }
+}
+
+/// Tries the next servers in order, skipping ones we can't send to.
+fn ask_next(servers: &mut Vec<[u8; 4]>, msg: &[u8]) -> Option<OwnedFd> {
+    while !servers.is_empty() {
+        if let Some(sock) = ask(servers.remove(0), msg) {
+            return Some(sock);
+        }
+    }
+    None
 }
 
 /// A UDP socket connected to `dest`:53 with `msg` sent on it, or None if
@@ -804,6 +829,165 @@ mod tests {
         assert!(dns.pending.is_empty(), "answered queries close their sockets");
     }
 
+    fn wait_readable(fd: i32) {
+        let mut poll = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+        // SAFETY: poll has room for one descriptor.
+        assert_eq!(unsafe { libc::poll(&mut poll, 1, 1000) }, 1, "nothing arrived");
+        assert_ne!(poll.revents & (libc::POLLIN | libc::POLLERR), 0);
+    }
+
+    /// The address a connected socket sends to.
+    fn peer(fd: i32) -> [u8; 4] {
+        // SAFETY: sockaddr_in is plain data; getpeername fills it in.
+        let mut a: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::sockaddr_in>() as u32;
+        // SAFETY: getpeername writes at most `len` bytes into a sockaddr_in we own.
+        assert_eq!(unsafe { libc::getpeername(fd, (&mut a as *mut libc::sockaddr_in).cast(), &mut len) }, 0);
+        a.sin_addr.s_addr.to_ne_bytes()
+    }
+
+    #[test]
+    fn own_servers_are_tried_in_order_after_a_refusal() {
+        use std::net::UdpSocket;
+        use std::os::fd::AsRawFd;
+        let port = |fd: i32| {
+            let mut a: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+            let mut len = std::mem::size_of::<libc::sockaddr_in>() as u32;
+            // SAFETY: getsockname fills a sockaddr_in we own.
+            assert_eq!(unsafe { libc::getsockname(fd, (&mut a as *mut libc::sockaddr_in).cast(), &mut len) }, 0);
+            a.sin_port
+        };
+        let resolver_ip = [127, 0, 0, 5];
+        let resolver = UdpSocket::from(super::bound(resolver_ip).unwrap());
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        client.set_nonblocking(true).unwrap();
+        let std::net::SocketAddr::V4(addr) = client.local_addr().unwrap() else { panic!() };
+        let from = super::sockaddr(addr.ip().octets(), addr.port());
+        // One server still works; refusals move through the list in order.
+        for servers in [vec![resolver_ip], vec![[127, 0, 0, 4], resolver_ip], vec![[127, 0, 0, 4], [127, 0, 0, 6], resolver_ip]] {
+            let attempts = servers.len();
+            let owner = [10, 5, 0, 2];
+            let mut dns = Dns { relay: true, ..Default::default() };
+            dns.servers.push(Server { bridges: vec!["kiri1".into()], sock: udp_socket().unwrap(), container: Some((42, owner)) });
+            dns.set_upstream(owner, servers.clone());
+            let q = query("example.com", 1);
+            dns.forward(0, &q, from, &[]);
+            assert_eq!(dns.pending.len(), 1);
+            assert_eq!(peer(dns.pending[0].sock.as_raw_fd()), servers[0], "the first server is asked first");
+            let sent_query = dns.pending[0].query.clone();
+            for next in 1..attempts {
+                let fd = dns.pending[0].sock.as_raw_fd();
+                let old_port = port(fd);
+                dns.pending[0].sent = Instant::now() - super::FORWARD_TIMEOUT;
+                wait_readable(fd);
+                let retrying = Instant::now();
+                dns.on_readable(fd, &[]);
+                assert_eq!(dns.pending.len(), 1);
+                let p = &dns.pending[0];
+                assert_ne!(p.sock.as_raw_fd(), fd, "a fresh socket for the next server");
+                assert_ne!(port(p.sock.as_raw_fd()), old_port, "a fresh source port");
+                assert!(p.sent >= retrying, "a fresh retry survives the sweep");
+                assert_eq!(p.query, sent_query, "the same query and our ID");
+                assert_eq!(peer(p.sock.as_raw_fd()), servers[next], "servers are tried in the order given");
+            }
+            let mut buf = [0u8; 512];
+            wait_readable(resolver.as_raw_fd());
+            let (n, peer) = resolver.recv_from(&mut buf).unwrap();
+            assert_eq!(&buf[..n], sent_query);
+            let mut reply = buf[..n].to_vec();
+            reply[2] |= 0x80;
+            resolver.send_to(&reply, peer).unwrap();
+            let fd = dns.pending[0].sock.as_raw_fd();
+            wait_readable(fd);
+            dns.on_readable(fd, &[]);
+            assert!(dns.pending.is_empty(), "answered queries close their sockets");
+            wait_readable(client.as_raw_fd());
+            let n = client.recv(&mut buf).unwrap();
+            assert_eq!(&buf[..2], &q[..2], "the client's original ID");
+            assert_eq!(&buf[2..n], &reply[2..]);
+            assert!(dns.relay_down_until.is_none(), "no host relay was tried");
+        }
+    }
+
+    #[test]
+    fn an_own_server_that_cant_be_sent_to_is_skipped() {
+        use std::net::UdpSocket;
+        use std::os::fd::AsRawFd;
+        // The broadcast address can't be sent to (no permission, or no route):
+        // `ask` gives up on it at once.
+        let unsendable = [255, 255, 255, 255];
+        let resolver_ip = [127, 0, 0, 10];
+        let resolver = UdpSocket::from(super::bound(resolver_ip).unwrap());
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let std::net::SocketAddr::V4(addr) = client.local_addr().unwrap() else { panic!() };
+        let from = super::sockaddr(addr.ip().octets(), addr.port());
+        let owner = [10, 5, 0, 2];
+        let mut dns = Dns { relay: true, ..Default::default() };
+        dns.servers.push(Server { bridges: vec!["kiri1".into()], sock: udp_socket().unwrap(), container: Some((42, owner)) });
+        dns.set_upstream(owner, vec![unsendable, resolver_ip]);
+        dns.forward(0, &query("example.com", 1), from, &[]);
+        assert_eq!(dns.pending.len(), 1);
+        assert_eq!(peer(dns.pending[0].sock.as_raw_fd()), resolver_ip, "the server that can't be sent to was skipped");
+        let mut buf = [0u8; 512];
+        wait_readable(resolver.as_raw_fd());
+        let (n, _) = resolver.recv_from(&mut buf).unwrap();
+        assert_eq!(&buf[..n], &dns.pending[0].query[..]);
+        // With nothing to send to, no query is kept and the host is not asked.
+        let mut dns = Dns { relay: true, ..Default::default() };
+        dns.servers.push(Server { bridges: vec!["kiri1".into()], sock: udp_socket().unwrap(), container: Some((42, owner)) });
+        dns.set_upstream(owner, vec![unsendable]);
+        dns.forward(0, &query("example.com", 1), from, &[]);
+        assert!(dns.pending.is_empty());
+        assert!(dns.relay_down_until.is_none(), "no host relay was tried");
+    }
+
+    #[test]
+    fn exhausted_own_servers_never_use_the_vm_or_host() {
+        use std::io::ErrorKind;
+        use std::net::UdpSocket;
+        use std::os::fd::AsRawFd;
+        let vm_ip = [127, 0, 0, 9];
+        let vm = UdpSocket::from(super::bound(vm_ip).unwrap());
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        client.set_nonblocking(true).unwrap();
+        let std::net::SocketAddr::V4(addr) = client.local_addr().unwrap() else { panic!() };
+        let from = super::sockaddr(addr.ip().octets(), addr.port());
+        for servers in [vec![[127, 0, 0, 7]], vec![[127, 0, 0, 7], [127, 0, 0, 8]]] {
+            let attempts = servers.len();
+            let owner = [10, 5, 0, 2];
+            let mut dns = Dns { relay: true, ..Default::default() };
+            dns.servers.push(Server { bridges: vec!["kiri1".into()], sock: udp_socket().unwrap(), container: Some((42, owner)) });
+            dns.set_upstream(owner, servers);
+            dns.forward(0, &query("example.com", 1), from, &[vm_ip]);
+            assert_eq!(dns.pending.len(), 1);
+            for attempt in 0..attempts {
+                let fd = dns.pending[0].sock.as_raw_fd();
+                wait_readable(fd);
+                dns.on_readable(fd, &[vm_ip]);
+                assert_eq!(dns.pending.len(), 1);
+                if attempt + 1 < attempts {
+                    assert_ne!(dns.pending[0].sock.as_raw_fd(), fd, "the next server was tried");
+                } else {
+                    assert_eq!(dns.pending[0].sock.as_raw_fd(), fd, "no more servers");
+                }
+            }
+            let p = &dns.pending[0];
+            assert!(!p.may_relay && p.relayed.is_none());
+            let mut poll = libc::pollfd { fd: p.sock.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+            // SAFETY: poll has room for one descriptor.
+            assert_eq!(unsafe { libc::poll(&mut poll, 1, 100) }, 0, "no further retries");
+            let mut buf = [0u8; 512];
+            assert_eq!(client.recv(&mut buf).unwrap_err().kind(), ErrorKind::WouldBlock, "no answer");
+            assert_eq!(vm.recv(&mut buf).unwrap_err().kind(), ErrorKind::WouldBlock, "no VM lookup");
+            assert!(dns.relay_down_until.is_none(), "no host relay was tried");
+            assert_eq!(dns.timeout_ms(), -1);
+            // The usual sweep still drops an unanswered query.
+            dns.pending[0].sent = Instant::now() - super::FORWARD_TIMEOUT;
+            dns.forward(0, &[0; 12], from, &[vm_ip]);
+            assert!(dns.pending.is_empty());
+        }
+    }
+
     #[test]
     fn own_servers_go_with_the_container() {
         let mut dns = Dns::default();
@@ -883,6 +1067,7 @@ mod tests {
             question: b"\x03www\x07example\x03com\x00\x00\x01\x00\x01".to_vec(),
             sent: Instant::now(),
             query: Vec::new(),
+            remaining: Vec::new(),
             may_relay: false,
             relayed: None,
         }
