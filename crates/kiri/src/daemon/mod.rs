@@ -147,6 +147,12 @@ pub fn run(_args: &[String]) -> io::Result<()> {
     #[cfg(target_os = "macos")]
     finder(&engine);
     kiri_image::set_proxy_source(proxy::for_registry);
+    // The system's root certificates are read once, here while nothing
+    // waits for them, and not by the first pull: asking the macOS keychain
+    // about each of its certificates takes a moment (#303).
+    let _ = std::thread::Builder::new().name("kiri-tls-roots".into()).spawn(|| {
+        let _ = kiri_image::roots::trusted();
+    });
     // The managed BuildKit stops itself when builds have been idle a while.
     builder::watch(engine.clone());
     // A Kubernetes node the engine restarted gets its kubectl context.
