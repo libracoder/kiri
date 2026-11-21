@@ -241,7 +241,8 @@ pub mod copy_op {
 }
 
 pub mod copy_flags {
-    /// Keep the archive's owners (`docker cp -a`); otherwise root owns everything.
+    /// `docker cp -a` (`copyUIDGID`). The archive's owners are kept either way,
+    /// as Docker keeps them.
     pub const KEEP_OWNERS: u32 = 1;
     /// Refuse to replace a directory with a file or the reverse.
     pub const NO_OVERWRITE_DIR_NON_DIR: u32 = 2;

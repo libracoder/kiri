@@ -284,7 +284,10 @@ fn copy_in(conn: &mut fs::File, spec: &CopySpec<'_>) -> io::Result<()> {
         let mut archive = tar::Archive::new(&mut reader);
         archive.set_preserve_permissions(true);
         archive.set_preserve_mtime(true);
-        archive.set_preserve_ownerships(spec.flags & copy_flags::KEEP_OWNERS != 0);
+        // Docker keeps the owners in the archive's headers, with or without
+        // `docker cp -a`: DDEV and others put files in a container for a
+        // non-root user this way, such as a key only that user may read.
+        archive.set_preserve_ownerships(true);
         archive.set_unpack_xattrs(false);
         archive.set_overwrite(true);
         for entry in archive.entries()? {
