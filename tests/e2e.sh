@@ -1358,6 +1358,13 @@ t push-again "already exists" bash -c "$R push localhost:5055/team/alp:1 2>&1"
 # registry has, not the image ID or the index alpine was pulled from.
 t push-repo-digest "same" bash -c "d=\$($R push localhost:5055/team/alp:1 2>&1 | sed -n 's/.*digest: \(sha256:[0-9a-f]*\).*/\1/p'); [ -n \"\$d\" ] && [ \"\$($R image inspect localhost:5055/team/alp:1 --format '{{index .RepoDigests 0}}')\" = localhost:5055/team/alp@\$d ] && echo same"
 t pull-auth "3." bash -c "$R rmi localhost:5055/team/alp:1 >/dev/null && $R pull -q localhost:5055/team/alp:1 >/dev/null && $R run --rm localhost:5055/team/alp:1 cat /etc/alpine-release"
+# Testcontainers' docker-java sends the sign-in fields it doesn't use as JSON
+# null: they read as empty, and the username and password still sign in.
+NULLAUTH=$(printf '%s' '{"username":"kiriuser","password":"kiripass","serveraddress":"localhost:5055","auth":null,"email":null,"identitytoken":null,"registrytoken":null}' | base64 | tr '+/' '-_' | tr -d '=\n')
+$D rmi localhost:5055/team/alp:1 >/dev/null 2>&1
+t pull-auth-null-fields "Downloaded newer image" curl -s --unix-socket "$SOCK" -H "X-Registry-Auth: $NULLAUTH" -X POST 'http://d/v1.47/images/create?fromImage=localhost:5055/team/alp&tag=1'
+# docker-java's login (POST /auth) sends the same nulls.
+t login-null-fields "Login Succeeded" curl -s --unix-socket "$SOCK" -H 'Content-Type: application/json' -X POST 'http://d/v1.47/auth' -d '{"username":"kiriuser","password":"kiripass","serveraddress":"localhost:5055","auth":null,"email":null,"identitytoken":null,"registrytoken":null}'
 t pull-no-auth "pull access denied" bash -c "$R logout localhost:5055 >/dev/null; $R rmi localhost:5055/team/alp:1 >/dev/null; $R pull localhost:5055/team/alp:1 2>&1"
 t push-no-auth "authentication required" bash -c "$R tag alpine localhost:5055/team/alp:2 && $R push localhost:5055/team/alp:2 2>&1"
 # Not pushed, so no RepoDigest: not alpine's from Docker Hub, nor one made up.
