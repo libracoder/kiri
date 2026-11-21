@@ -17,6 +17,7 @@ Scenarios:
   special    a character and a block device, a fifo, and times of 0 (#679, #684)
   big        one layer of 4 MiB that does not compress (#661)
   nolayers   no layers at all (#685)
+  retype     one layer names a path twice, as another kind the second time
 
 --times PATH...: prints "MTIME PATH" for each path as the base's layers give
 it (the topmost layer that names it), what a container's stat must show."""
@@ -123,6 +124,12 @@ def crafted(name, n):
                  f("spec/zero", 0), d("zdir", 0), s("zlink", "spec/zero", 0)]]
     if name == "big":
         return [[f("big", data=os.urandom(4 << 20))]]
+    if name == "retype":
+        return [[d("swap1"), f("swap1/inner"), f("swap1", T1),
+                 s("swap2", "/srv"), d("swap2", T1),
+                 f("swap3"), d("swap3", T1),
+                 d("swap4"), f("swap4/inner"), s("swap4", "swap1", T1),
+                 d("swap5"), f("swap5/inner"), h("swap5", "swap1")]]
     if name in ("fresh", "nolayers"):
         return []
     raise SystemExit(f"layer-image.py: no scenario {name}")

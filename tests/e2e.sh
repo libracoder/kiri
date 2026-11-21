@@ -1282,6 +1282,15 @@ t layers-125-lifecycle "exec=124 restart=1 start=124 commit=126 committed=top1" 
 li hardlinks $LT:hl
 t layer-hardlink-symlinks "bin/hl=link:5:/bin/real bin/hl-dangling=link:2:/no/such/file other/hl-sym=link:5:/bin/real other/hl-rel=link:2:real other/chain2=link:5:/bin/real bin/hl-symsym=link:2:sym hl-dirlink=link:2:dir same-inode ok" \
   $D run --rm $LT:hl sh -c 'cd / && for p in bin/hl bin/hl-dangling other/hl-sym other/hl-rel other/chain2 bin/hl-symsym hl-dirlink; do [ -L $p ] && printf "%s=link:%s:%s " $p $(stat -c %h $p) $(readlink $p); done; [ $(stat -c %i bin/hl) = $(stat -c %i bin/sym) ] && printf "same-inode "; /bin/hl'
+# A layer that names a path twice as different kinds unpacks with the later
+# entry in place, as Docker's does: a directory then a file, a symlink then
+# a directory, a file then a directory, a directory then a hard link, and a
+# directory then a symlink. For that last one Docker also sets the gone
+# directory's time through the link (and fails if it dangles); Kiri leaves
+# the link and its target alone.
+li retype $LT:retype
+t layer-same-path-retyped "swap1=regular file swap2=directory swap3=directory swap4=symbolic link swap5=regular file" $D run --rm $LT:retype sh -c 'for p in swap1 swap2 swap3 swap4 swap5; do printf "%s=%s " $p "$(stat -c %F /$p)"; done'
+$D rmi $LT:retype >/dev/null 2>&1
 # Devices and fifos in a layer are unpacked as themselves, with their times;
 # a time of 0 stays 0 on a file, a directory and a symlink (#679, #684).
 li special $LT:special
