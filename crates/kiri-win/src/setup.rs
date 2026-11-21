@@ -191,14 +191,21 @@ fn quiet(program: &str) -> Command {
     c
 }
 
-/// WSL's own output is UTF-16.
+/// WSL's own output is UTF-16, in the language of the Windows it runs on.
+/// Checking only the first units' high bytes misses every non-ASCII letter:
+/// `Д` is U+0414, so its high byte is 0x04, not zero. A UTF-8 reading of
+/// UTF-16 has NULs, invalid bytes or control characters in it; when it has
+/// none, the bytes really were UTF-8.
 fn wsl_text(bytes: &[u8]) -> String {
-    if bytes.len() >= 2 && bytes.iter().skip(1).step_by(2).take(8).all(|&b| b == 0) {
-        let units: Vec<u16> = bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
-        String::from_utf16_lossy(&units).replace('\0', "")
-    } else {
-        String::from_utf8_lossy(bytes).into_owned()
+    let utf8 = String::from_utf8_lossy(bytes);
+    let looks_utf16 = utf8.contains('\0')
+        || utf8.contains('\u{fffd}')
+        || utf8.chars().any(|c| c.is_control() && !c.is_whitespace());
+    if !looks_utf16 {
+        return utf8.into_owned();
     }
+    let units: Vec<u16> = bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+    String::from_utf16_lossy(&units).replace('\0', "")
 }
 
 /// What `wsl.exe --version` said.
@@ -952,6 +959,31 @@ pub fn on_message(msg: &str) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn wsl_output_is_read_in_any_language() {
+        let utf16 = |s: &str| s.encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<u8>>();
+        // WSL appends an ASCII `Wsl/...` code to its errors in every
+        // language, so even a fully non-Latin message has NULs in its
+        // UTF-16 bytes and the check catches it whatever the script.
+        let code = "Error code: Wsl/WSL_E_WSL_OPTIONAL_COMPONENT_REQUIRED\r\n";
+        let messages = [
+            "Error code: Wsl/WSL_E_WSL_OPTIONAL_COMPONENT_REQUIRED\r\n".to_owned(),
+            format!("Für diese Anwendung ist die Komponente „Windows-Subsystem für Linux“ erforderlich. {code}"),
+            format!("Для этого приложения требуется дополнительный компонент подсистемы Windows для Linux. {code}"),
+            format!("此应用程序需要适用于 Linux 的 Windows 子系统组件。{code}"),
+            format!("このアプリケーションには Windows Subsystem for Linux の追加コンポーネントが必要です。{code}"),
+            format!("이 애플리케이션에는 Linux용 Windows 하위 시스템 구성 요소가 필요합니다. {code}"),
+            format!("هذا التطبيق يتطلب مكون Windows الفرعي لنظام Linux. {code}"),
+            format!("Εφαρμογή: απαιτείται το υποσύστημα Windows για Linux. {code}"),
+            format!("יישות זה דורש את רכיב Windows עבור Linux. {code}"),
+            format!("Энэ programa Linux üçün Windows podsistemi əlavə komponentini tələb edir. {code}"),
+        ];
+        for m in &messages {
+            assert_eq!(super::wsl_text(&utf16(m)), *m, "UTF-16: {m}");
+            assert_eq!(super::wsl_text(m.as_bytes()), *m, "UTF-8: {m}");
+        }
+    }
+
     #[test]
     fn a_failed_test_container_says_why() {
         let pull = "Unable to find image 'alpine:latest' locally\ndocker: Error response from daemon: the proxy http://127.0.0.1:7892 refused the connection or closed it: is it running? (network error: io: Connection refused (os error 111)).\nSee 'docker run --help'.\n";
