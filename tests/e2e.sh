@@ -384,6 +384,8 @@ t workdir-created-through-link "at /run/made" $D run --rm -w /var/run/made alpin
 # (CVE-2024-21626 in runc).
 t workdir-leaked-fd "started 0" bash -c "s=0; for n in \$(seq 3 25); do $D run --rm -w /proc/self/fd/\$n alpine true >/dev/null 2>&1 && s=\$((s+1)); done; echo started \$s"
 t user-numeric "uid=1000" $D run --rm -u 1000 alpine id
+# A uid /etc/passwd does not list runs with group 0, as Docker gives it.
+t user-numeric-unlisted-gid "uid=1000 gid=0(root)" $D run --rm -u 1000 alpine id
 t user-name "uid=70(postgres)" $D run --rm -u postgres postgres:17-alpine id
 t user-group "gid=0(root)" $D run --rm -u 1000:0 alpine id
 # The user's own group is one of its supplementary groups, as Docker sets them.

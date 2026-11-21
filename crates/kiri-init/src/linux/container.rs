@@ -2314,7 +2314,9 @@ fn resolve_user(user: &str) -> io::Result<(libc::uid_t, libc::gid_t)> {
     };
     let not_found = |what: &str| io::Error::new(io::ErrorKind::NotFound, format!("unknown {what} {user}"));
     let (uid, primary_gid) = match u.parse::<u32>() {
-        Ok(id) => (id, lookup_gid_for_uid(id).unwrap_or(id)),
+        // A uid /etc/passwd does not list runs with group 0, as Docker and
+        // BuildKit give it (moby/sys/user's default gid).
+        Ok(id) => (id, lookup_gid_for_uid(id).unwrap_or(0)),
         Err(_) => lookup("/etc/passwd", u).ok_or_else(|| not_found("user"))?,
     };
     let gid = match g {
@@ -3231,6 +3233,16 @@ mod tests {
         assert_eq!(super::net::mac_for([172, 17, 0, 2]), [2, 0x42, 0xac, 0x11, 0, 2]);
         assert_eq!(super::net::parse_mac("02:42:ac:11:00"), None);
         assert_eq!(super::net::parse_mac("02:42:ac:11:00:02:03"), None);
+    }
+
+    #[test]
+    fn a_numeric_user_with_no_passwd_entry_runs_with_group_0() {
+        // As Docker gives it (moby/sys/user's default gid): `docker run -u
+        // 48213` is uid=48213 gid=0, not gid=48213.
+        if super::lookup_gid_for_uid(48_213).is_none() {
+            assert_eq!(super::resolve_user("48213").unwrap(), (48_213, 0));
+        }
+        assert_eq!(super::resolve_user("48213:7").unwrap(), (48_213, 7), "a group given is kept");
     }
 
     /// A mount line is three fields, or seven with a volume's driver options.
