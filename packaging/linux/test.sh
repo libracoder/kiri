@@ -79,6 +79,19 @@ test_package() { # name full(0|1)
   step "$c" "dpkg -P drops data and group" "dpkg -P $name && test ! -e /var/lib/kiri -a ! -e /var/lib/kiri-daemon && ! getent group kiri"
   $docker rm -f "$c" >/dev/null 2>&1
 
+  if [ "$full" = 1 ] && dpkg-deb -I "$deb" | grep -q 'Depends:.*libc6'; then
+    # Ubuntu 22.04 ships glibc 2.35; the .deb must install there (#252).
+    echo "== .deb installs on Ubuntu 22.04 (glibc 2.35)"
+    local c22=kiri-deb22-test-$name debname22
+    debname22=$(basename "$deb")
+    $docker rm -f "$c22" >/dev/null 2>&1
+    $docker run -d --name "$c22" --privileged --tmpfs /run --tmpfs /tmp -v "$out:/pkg:ro" ubuntu:22.04 sleep infinity >/dev/null
+    step "$c22" "apt installs the .deb on 22.04" "apt-get update -qq >/dev/null 2>&1 && DEBIAN_FRONTEND=noninteractive apt-get install -y /pkg/$debname22"
+    step "$c22" "window binary loads on glibc 2.35" "ldd /usr/lib/kiri/kiri-window >/dev/null 2>&1"
+    step "$c22" "dpkg -r removes the package" "dpkg -r $name && test ! -e /usr/bin/kiri"
+    $docker rm -f "$c22" >/dev/null 2>&1
+  fi
+
   echo "== .rpm in a Fedora container"
   local rpmname; rpmname=$(basename "$rpm")
   $docker run --rm -v "$out:/pkg:ro" fedora:41 bash -c "
