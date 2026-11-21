@@ -5,8 +5,10 @@
 # which hears of those changes from the Mac, raise the fsnotify events Linux
 # raises for a local change ("M\t/mnt/mac/…" → IN_MODIFY, C/A/D likewise).
 # Paths are looked up beneath /mnt/mac only (no symlinks, no other mounts),
-# nothing is written and no dentry dropped, and only the VM's agent may
-# write (root, in the VM's first mount namespace: not a container).
+# nothing is written, and deleted or modified file names are dropped from
+# the guest's dcache so lookups see replacements before Apple's timeout.
+# Only the VM's agent may write (root, in the VM's first mount namespace:
+# not a container).
 --- a/fs/notify/Makefile
 +++ b/fs/notify/Makefile
 @@ -5,3 +5,5 @@
@@ -17,7 +19,7 @@
 +obj-$(CONFIG_FSNOTIFY)		+= kiri_inject.o
 --- /dev/null
 +++ b/fs/notify/kiri_inject.c
-@@ -0,0 +1,191 @@
+@@ -0,0 +1,221 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * /proc/kiri-fsnotify: changes made outside the VM, raised as fsnotify
@@ -35,9 +37,10 @@
 + *   A  PATH's attributes changed (IN_ATTRIB)
 + *   D  PATH was deleted          (IN_DELETE on its directory, IN_DELETE_SELF)
 + *
-+ * Only events are raised: nothing is written, and no dentry is dropped
-+ * (the share caches nothing, so lookups already ask the Mac). PATH is
-+ * looked up beneath /mnt/mac only, crossing no symlink and no mount, and
++ * Nothing is written. Deleted or modified cached file names are dropped
++ * so a lookup asks the Mac again rather than opening a deleted or
++ * replaced node until Apple's timeout. Directories and mount points stay.
++ * PATH is looked up beneath /mnt/mac only, crossing no symlink and no mount, and
 + * /mnt/mac must be the FUSE (virtiofs) share: a name can't lead anywhere
 + * else in the VM. Only the VM's own agent may write: root, in the VM's
 + * first mount namespace, so a container can't, even as root.
@@ -60,12 +63,28 @@
 +#define KIRI_SHARE "/mnt/mac"
 +#define KIRI_SCOPED (LOOKUP_BENEATH | LOOKUP_NO_SYMLINKS | LOOKUP_NO_XDEV | LOOKUP_NO_MAGICLINKS)
 +
-+/* The file was deleted outside: tell its directory, and the file's own
-+ * watchers if the VM still has its inode. */
++/* Expire a cached file name without unlinking or asking the Mac. Keep the
++ * returned reference until after a fresh lookup: an in-place change must
++ * not evict a watched inode. Directories and mount points stay reachable. */
++static struct dentry *kiri_expire(struct path *parent, struct qstr *name)
++{
++	struct dentry *child = try_lookup_noperm(name, parent->dentry);
++
++	if (IS_ERR_OR_NULL(child))
++		return child;
++	spin_lock(&child->d_lock);
++	if (d_really_is_positive(child) && !d_is_dir(child) && !d_mountpoint(child))
++		__d_drop(child);
++	spin_unlock(&child->d_lock);
++	return child;
++}
++
++/* The file was deleted outside: forget its cached name, tell its
++ * directory, and the file's own watchers if the VM still has its inode. */
 +static int kiri_deleted(struct path *parent, struct qstr *name)
 +{
 +	struct inode *dir = d_inode(parent->dentry);
-+	struct dentry *child = try_lookup_noperm(name, parent->dentry);
++	struct dentry *child = kiri_expire(parent, name);
 +
 +	if (IS_ERR(child))
 +		return PTR_ERR(child);
@@ -91,6 +110,7 @@
 +{
 +	char *slash = strrchr(rel, '/');
 +	struct path parent, target;
++	struct dentry *cached = NULL;
 +	struct qstr name;
 +	char *last;
 +	int err;
@@ -113,6 +133,20 @@
 +		err = kiri_deleted(&parent, &name);
 +		goto out;
 +	}
++	if (op == 'M') {
++		/* An editor's rename onto a file arrives as M, not D. Expire
++		 * before looking it up and before a watcher hears of the save. */
++		cached = kiri_expire(&parent, &name);
++		if (IS_ERR(cached)) {
++			err = PTR_ERR(cached);
++			cached = NULL;
++			goto out;
++		}
++		if (!fsnotify_sb_has_watchers(share->dentry->d_sb)) {
++			err = 0;
++			goto out;
++		}
++	}
 +	err = vfs_path_lookup(share->dentry, share->mnt, rel, KIRI_SCOPED, &target);
 +	if (err)
 +		goto out;
@@ -134,6 +168,7 @@
 +	}
 +	path_put(&target);
 +out:
++	dput(cached);
 +	path_put(&parent);
 +	return err;
 +}
@@ -169,13 +204,6 @@
 +		path_put(&share);
 +		return -EXDEV;
 +	}
-+	/* Without a watcher there is no one to tell, and a batch costs no
-+	 * lookups (a container writing many files to a bind mount sends its
-+	 * own changes back). */
-+	if (!fsnotify_sb_has_watchers(share.dentry->d_sb)) {
-+		path_put(&share);
-+		return count;
-+	}
 +	buf = memdup_user_nul(ubuf, count);
 +	if (IS_ERR(buf)) {
 +		path_put(&share);
@@ -191,6 +219,10 @@
 +			err = -EINVAL;
 +			continue;
 +		}
++		/* Deletes and modifications expire names without watchers.
++		 * Other events still cost no lookups without a watcher. */
++		if (line[0] != 'D' && line[0] != 'M' && !fsnotify_sb_has_watchers(share.dentry->d_sb))
++			continue;
 +		err = kiri_event(&share, line[0], rel);
 +	}
 +	kfree(buf);
