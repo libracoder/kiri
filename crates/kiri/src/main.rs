@@ -1,5 +1,9 @@
 //! The `kiri` command.
 
+// `daemon::api`'s inspect json! is deeper than the default macro recursion
+// allows.
+#![recursion_limit = "256"]
+
 use std::process::ExitCode;
 
 #[cfg(target_os = "macos")]
