@@ -48,6 +48,8 @@ pub fn main() {
 }
 
 fn run(init_start_ns: u64) -> io::Result<()> {
+    // Before anything starts: every container and step inherits them.
+    engine_rlimits();
     let paths = if transport::is_host_process() {
         // On a Linux host: the host's kernel filesystems, network and clock.
         host_dirs()?
@@ -69,6 +71,16 @@ fn run(init_start_ns: u64) -> io::Result<()> {
         net::remove_host_network();
     }
     served
+}
+
+/// Sets the limits containers and build steps inherit (hostopts::agent_rlimits),
+/// each on its own: one refused is said and the others are still set.
+fn engine_rlimits() {
+    for lim in hostopts::agent_rlimits() {
+        if let Err(e) = hostopts::set_rlimits(&[lim]) {
+            eprintln!("kiri-init: resource limits: {e}");
+        }
+    }
 }
 
 fn serve(paths: &container::Paths, init_start_ns: u64) -> io::Result<()> {

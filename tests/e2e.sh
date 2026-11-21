@@ -1233,6 +1233,8 @@ t load-hardlink-escape "escapes the layer" bash -c "$D load -q -i $IMD/hl-esc.ta
 $D rmi kiri-test/alp:v1 kiri-test/hl:abs kiri-test/hl:esc >/dev/null 2>&1; rm -rf "$IMD"
 
 section "docker build (BuildKit in the VM)"
+# A process's core-size and process limits, soft and hard, on one line.
+LIMS="grep -E '^Max (core file size|processes) ' /proc/self/limits | tr '\\n' ' ' | tr -s ' '"
 BD=$(mktemp -d)
 # BX, the builder, is set up at the top (beside the images).
 # FROM lines name alpine at KIRI_TEST_REGISTRY: BuildKit asks the registry for
@@ -1253,6 +1255,8 @@ t build-network "curl" bash -c "cd $BD && printf 'FROM $FA\nRUN apk add --no-cac
 needs buildx t build-resolvconf "nameserver $DEFAULT_NS" bash -c "cd $BD && printf 'FROM $FA\nRUN cat /etc/resolv.conf\n' > Dockerfile.dns && BUILDX_BUILDER=$BX perl -e 'alarm 300; exec @ARGV' $D build --no-cache --progress plain -f Dockerfile.dns . 2>&1"
 needs buildx code build-no-public-resolver 1 bash -c "cd $BD && BUILDX_BUILDER=$BX perl -e 'alarm 300; exec @ARGV' $D build --no-cache --progress plain -f Dockerfile.dns . 2>&1 | grep -q 'nameserver 8.8.8.8'"
 needs buildx t build-dns "Address" bash -c "cd $BD && printf 'FROM $FA\nRUN nslookup example.com\n' > Dockerfile.lookup && BUILDX_BUILDER=$BX perl -e 'alarm 300; exec @ARGV' $D build --no-cache --progress plain -f Dockerfile.lookup . 2>&1"
+# A step has no process or core-size limit either, as on Docker Engine.
+needs buildx t build-ulimits "Max core file size unlimited unlimited bytes Max processes unlimited unlimited processes" bash -c "cd $BD && printf 'FROM $FA\nRUN %s\n' \"$LIMS\" > Dockerfile.lim && BUILDX_BUILDER=$BX perl -e 'alarm 300; exec @ARGV' $D build --no-cache --progress plain -f Dockerfile.lim . 2>&1"
 t build-fails "exit code: 3" bash -c "cd $BD && printf 'FROM $FA\nRUN exit 3\n' > Dockerfile.bad && BUILDX_BUILDER=$BX $D build -f Dockerfile.bad . 2>&1"
 $D rmi kiri-test/built kiri-test/net >/dev/null 2>&1; rm -rf "$BD"
 
@@ -1284,6 +1288,13 @@ t limit-memory "134217728" $D exec lim cat /sys/fs/cgroup/memory.max
 t limit-cpus "50000 100000" $D exec lim cat /sys/fs/cgroup/cpu.max
 t limit-pids "50" $D exec lim cat /sys/fs/cgroup/pids.max
 t limit-shares "59" $D exec lim cat /sys/fs/cgroup/cpu.weight
+# No process or core-size limit, soft or hard, as on Docker Engine (dockerd
+# and containerd run with LimitNPROC and LimitCORE infinity); in the VM the
+# agent had the kernel's (a process limit from the memory, core size 0).
+# --ulimit still sets them, and inspect keeps what it was given.
+t ulimit-default "Max core file size unlimited unlimited bytes Max processes unlimited unlimited processes" bash -c "$D run --rm alpine sh -c \"$LIMS\""
+t ulimit-set "Max core file size 0 0 bytes Max processes 100 200 processes" bash -c "$D run --rm --ulimit core=0 --ulimit nproc=100:200 alpine sh -c \"$LIMS\""
+t ulimit-set-inspect '[{"Name":"nproc","Hard":200,"Soft":100}]' bash -c "$D create --name ulim --ulimit nproc=100:200 alpine >/dev/null && $D inspect -f '{{json .HostConfig.Ulimits}}' ulim; $D rm ulim >/dev/null"
 # 1024 shares, Docker's default, is the kernel's default weight (not less
 # than a container that set nothing), and inspect gives the shares back.
 t limit-shares-default "100 100" bash -c "echo \$($D run --rm --cpu-shares 1024 alpine cat /sys/fs/cgroup/cpu.weight) \$($D run --rm alpine cat /sys/fs/cgroup/cpu.weight)"
