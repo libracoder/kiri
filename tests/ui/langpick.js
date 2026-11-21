@@ -13,10 +13,10 @@ const saved = (name) => sent.filter((m) => m.type === "setpref" && m.name === na
 const rail = () => document.querySelector("nav [data-view=containers] .lbl").textContent;
 
 kiri.on({ type: "langpick" });
-t("a langpick event opens the language step with a row for each of the 38 languages", () => {
+t("a langpick event opens the language step with a row for each of the 39 languages", () => {
   if (!dlg()) throw new Error("no dialog");
   const ids = tilesNow().map((b) => b.dataset.lang).sort().join(" ");
-  if (ids !== LANGS.map(([id]) => id).sort().join(" ") || tilesNow().length !== 38) throw new Error("rows: " + ids);
+  if (ids !== LANGS.map(([id]) => id).sort().join(" ") || tilesNow().length !== 39) throw new Error("rows: " + ids);
 });
 t("one column, a line each", () => {
   const lefts = new Set(tilesNow().map((b) => Math.round(b.getBoundingClientRect().left)));
@@ -26,7 +26,7 @@ t("one column, a line each", () => {
 t("each row is in its own language, with its own Hello", () => {
   if (pickTile("de").querySelector(".ln").getAttribute("lang") !== "de" || !pickTile("de").textContent.includes("Deutsch") || !pickTile("de").textContent.includes("Hallo")) throw new Error(pickTile("de").textContent);
   if (!pickTile("zh-Hans").textContent.includes("简体中文") || !pickTile("zh-Hans").textContent.includes("你好")) throw new Error(pickTile("zh-Hans").textContent);
-  for (const [id, name, hello] of [["ja", "日本語", "こんにちは"], ["ko", "한국어", "안녕하세요"], ["zh-Hant", "繁體中文", "你好"], ["ru", "Русский", "Привет"], ["uk", "Українська", "Привіт"], ["hi", "हिन्दी", "नमस्ते"], ["fa", "فارسی", "سلام"], ["ckb", "کوردیی ناوەندی", "سڵاو"], ["el", "Ελληνικά", "Γεια σου"], ["kk", "Қазақша", "Сәлем"], ["te", "తెలుగు", "నమస్కారం"], ["am", "አማርኛ", "ሰላም"], ["th", "ไทย", "สวัสดี"], ["lo", "ລາວ", "ສະບາຍດີ"], ["nb", "Norsk bokmål", "Hei"], ["bn", "বাংলা", "নমস্কার"], ["ta", "தமிழ்", "வணக்கம்"], ["ar", "العربية", "مرحبًا"], ["vi", "Tiếng Việt", "Xin chào"], ["id", "Bahasa Indonesia", "Halo"]])
+  for (const [id, name, hello] of [["ja", "日本語", "こんにちは"], ["ko", "한국어", "안녕하세요"], ["zh-Hant", "繁體中文", "你好"], ["ru", "Русский", "Привет"], ["uk", "Українська", "Привіт"], ["hi", "हिन्दी", "नमस्ते"], ["ne", "नेपाली", "नमस्ते"], ["fa", "فارسی", "سلام"], ["ckb", "کوردیی ناوەندی", "سڵاو"], ["el", "Ελληνικά", "Γεια σου"], ["kk", "Қазақша", "Сәлем"], ["te", "తెలుగు", "నమస్కారం"], ["am", "አማርኛ", "ሰላም"], ["th", "ไทย", "สวัสดี"], ["lo", "ລາວ", "ສະບາຍດີ"], ["nb", "Norsk bokmål", "Hei"], ["bn", "বাংলা", "নমস্কার"], ["ta", "தமிழ்", "வணக்கம்"], ["ar", "العربية", "مرحبًا"], ["vi", "Tiếng Việt", "Xin chào"], ["id", "Bahasa Indonesia", "Halo"]])
     if (pickTile(id).querySelector(".ln").getAttribute("lang") !== id || !pickTile(id).textContent.includes(name) || !pickTile(id).textContent.includes(hello)) throw new Error(pickTile(id).textContent);
 });
 t("the system's language is marked and picked", () => {
