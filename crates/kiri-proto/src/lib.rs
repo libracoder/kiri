@@ -139,6 +139,9 @@ pub enum Msg<'a> {
     /// Host → guest: up to `len` bytes from `offset`. Answered by `FsData` or `Error`.
     FsRead { id: &'a str, path: &'a str, offset: u64, len: u32 },
     FsData(&'a [u8]),
+    /// Host → guest: where a link inside a running container's root points,
+    /// as the link says it. Answered by `FsData` or `Error`.
+    FsReadLink { id: &'a str, path: &'a str },
     /// Guest → host: memory is tight right now (a PSI trigger fired); grow
     /// the VM's memory. No reply.
     MemoryPressure,
@@ -726,6 +729,7 @@ mod kind {
     pub const FS_EVENTS: u16 = 78;
     pub const AWAIT_START: u16 = 79;
     pub const CANCEL_START: u16 = 80;
+    pub const FS_READ_LINK: u16 = 81;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1032,6 +1036,10 @@ impl Msg<'_> {
                 put_u32(o, len);
             }),
             Msg::FsData(d) => frame(out, kind::FS_DATA, |o| put_bytes(o, d)),
+            Msg::FsReadLink { id, path } => frame(out, kind::FS_READ_LINK, |o| {
+                put_str(o, id);
+                put_str(o, path);
+            }),
             Msg::MemoryPressure => frame(out, kind::MEMORY_PRESSURE, |_| {}),
             Msg::RemoveVolume { name } => frame(out, kind::REMOVE_VOLUME, |o| put_str(o, name)),
             Msg::RemoveBridge { bridge } => frame(out, kind::REMOVE_BRIDGE, |o| put_str(o, bridge)),
@@ -1317,6 +1325,7 @@ pub fn decode(frame: &[u8]) -> Result<Msg<'_>, DecodeError> {
         kind::FS_STAT_REQUEST => Msg::FsStatRequest { id: r.str()?, path: r.str()? },
         kind::FS_STAT => Msg::FsStat(read_entry(&mut r)?),
         kind::FS_LIST_REQUEST => Msg::FsListRequest { id: r.str()?, path: r.str()? },
+        kind::FS_READ_LINK => Msg::FsReadLink { id: r.str()?, path: r.str()? },
         kind::FS_LIST => {
             let count = r.u32()?;
             let start = r.pos;
@@ -1555,6 +1564,7 @@ mod tests {
         round(Msg::FsStat(FsEntry { name: "etc", mode: 0o40755, size: 4096, mtime: 1_700_000_000, mtime_nsec: 5, ino: 77 }));
         round(Msg::FsRead { id: "c1", path: "/etc/os-release", offset: 10, len: 4096 });
         round(Msg::FsData(b"NAME=Alpine"));
+        round(Msg::FsReadLink { id: "c1", path: "/usr/bin/X11" });
         round(Msg::MemoryPressure);
         round(Msg::RemoveVolume { name: "pgdata" });
         round(Msg::RemoveBridge { bridge: "kiri3" });

@@ -40,10 +40,10 @@ const NOENT: u32 = 2;
 const IO: u32 = 5;
 const ACCES: u32 = 13;
 const NOTDIR: u32 = 20;
+const INVAL: u32 = 22;
 const ROFS: u32 = 30;
 const STALE: u32 = 70;
 const BADHANDLE: u32 = 10001;
-const NOTSUPP: u32 = 10004;
 
 /// The export's filesystem id, `KIRI`.
 const FSID: u64 = 0x4b49_5249;
@@ -558,9 +558,8 @@ impl Server<'_> {
                 }
             }
             5 => {
-                // Links are followed inside the container, so none are shown.
-                a.opaque()?;
-                o.u32(NOTSUPP).bool(false);
+                let fh = a.opaque()?;
+                self.read_link(fh, o);
             }
             6 => {
                 let fh = a.opaque()?;
@@ -768,6 +767,34 @@ impl Server<'_> {
         }
     }
 
+    /// READLINK. Links are served as links (#648), pointing where they do
+    /// inside the container: see `in_container`.
+    fn read_link(&self, fh: &[u8], o: &mut Out) {
+        let at = match self.attr(fh) {
+            Ok(a) => a,
+            Err(e) => {
+                o.u32(e).bool(false);
+                return;
+            }
+        };
+        let (Ok(Node::File { id, path }), true) = (self.node(fh), at.link) else {
+            o.u32(INVAL);
+            at.post_op(o);
+            return;
+        };
+        match self.engine.fs_read_link(&id, &path) {
+            Ok(target) => {
+                o.u32(OK);
+                at.post_op(o);
+                o.opaque(in_container(&path, &String::from_utf8_lossy(&target)).as_bytes());
+            }
+            Err(e) => {
+                o.u32(errno(e));
+                at.post_op(o);
+            }
+        }
+    }
+
     fn readdir(&mut self, fh: &[u8; 16], cookie: u64, count: u32, plus: bool, o: &mut Out) {
         let dir_attr = match self.attr(fh) {
             Ok(a) => a,
@@ -840,6 +867,30 @@ impl Server<'_> {
     }
 }
 
+/// The link at `link`'s `target`, made relative so that the Mac resolves it
+/// inside the container's folder: `/` in a link is the container's root,
+/// not the Mac's, and `..` stops at that root, as in the container. A link
+/// to `/etc/hosts` at `/usr/x` reads `../etc/hosts`.
+fn in_container(link: &str, target: &str) -> String {
+    let depth = link.split('/').filter(|c| !c.is_empty()).count().saturating_sub(1);
+    let (mut out, mut d) = if target.starts_with('/') { (vec![".."; depth], 0) } else { (Vec::new(), depth) };
+    for c in target.split('/') {
+        match c {
+            "" | "." => {}
+            ".." if d == 0 => {}
+            ".." => {
+                d -= 1;
+                out.push("..");
+            }
+            c => {
+                d += 1;
+                out.push(c);
+            }
+        }
+    }
+    if out.is_empty() { ".".into() } else { out.join("/") }
+}
+
 fn garbage(xid: u32) -> Vec<u8> {
     let mut o = Out::default();
     o.u32(xid).u32(1).u32(0).u32(0).u32(0).u32(4); // GARBAGE_ARGS
@@ -890,6 +941,21 @@ mod tests {
     fn own_user_is_allowed() {
         let (a, _b) = UnixStream::pair().unwrap();
         assert!(allowed(&a));
+    }
+
+    /// A link resolves inside its container's folder, never into the Mac's.
+    #[test]
+    fn links_point_inside_the_container() {
+        assert_eq!(in_container("/usr/bin/X11", "."), ".");
+        assert_eq!(in_container("/bin", "usr/bin"), "usr/bin");
+        assert_eq!(in_container("/usr/x", "/etc/hosts"), "../etc/hosts");
+        assert_eq!(in_container("/lib64", "/"), ".");
+        assert_eq!(in_container("/a/b/c", "/"), "../..");
+        assert_eq!(in_container("/sys/bus/virtio/devices/virtio5/subsystem", "../../../bus/virtio"), "../../../bus/virtio");
+        // Above the root is the root, as in the container.
+        assert_eq!(in_container("/etc/x", "../../../../etc/passwd"), "../etc/passwd");
+        assert_eq!(in_container("/etc/x", "/../../etc/passwd"), "../etc/passwd");
+        assert_eq!(in_container("/a/l", "b/../../../c"), "b/../../c");
     }
 
     #[test]
