@@ -18,6 +18,17 @@ Environment=KIRI_SOCKET_GROUP=kiri
 Environment=HOME=/var/lib/kiri-daemon
 # The daemon creates the cgroups its containers run in.
 Delegate=yes
+# What containers inherit, as docker.service and containerd.service set it:
+# no process or core-size limit (systemd's defaults give a per-user process
+# limit and a soft core size of 0), and no task limit on the unit, whose
+# cgroup holds every container. Open files need nothing here: each
+# container gets Docker's 1048576 of its own.
+LimitNPROC=infinity
+LimitCORE=infinity
+TasksMax=infinity
+# Not docker.service's KillMode=process: nothing of the engine outlives it
+# (containers stop with it). Nor its OOMScoreAdjust=-500: containers would
+# inherit it, where Docker gives a container 0.
 KillMode=mixed
 Restart=on-failure
 RuntimeDirectory=kiri
