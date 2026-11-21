@@ -129,3 +129,17 @@ fwdrop-ufw-internet	#247	ufw turned on while the engine runs (its FORWARD policy
 fwdrop-ufw-reload	#247	Kiri's rules must survive ufw reload
 fwdrop-nft-warns	#247	an nftables chain of the administrator's own with policy drop: docker info says which rules let Kiri's containers through
 fwdrop-flush-rebuilt	#247	a flush of the whole ruleset (nftables.service) took Kiri's table, so containers had no NAT and no forward filter until the engine restarted
+layer-dir-times-alpine	#676	the reporter's command: alpine's directories showed the time Kiri unpacked the layer, not the layer's
+layer-dir-times-edges	#676	directory times from the layer, nested, in two layers, opaque, with a whiteout made in them, 0, after 2038, behind a symlink
+layer-dir-times-cp-out	#676	docker cp out of an image directory gave the unpack time
+layer-dir-times-commit	#676	a directory dated in a container lost its time through docker commit
+layers-59-to-125	#253	images of 60 or more layers failed to start: the overlay options naming every layer did not fit in one page
+layers-125-lifecycle	#253	a container of 125 layers must take exec, restart, stop and start, and a commit to 126 layers
+layer-hardlink-symlinks	#409	a hard link to a symlink failed to unpack (Nix images such as supabase/postgres); dangling, relative, chained and cross-directory ones too
+layer-special-files	#679	device nodes and fifos in a layer were not unpacked as such; a time of 0 became 1 (#684)
+load-no-layers-run	#685	an image with no layers did not start
+rmi-during-save	#661	a docker rmi during a docker save deleted a layer the save was still sending
+frame-limit-request-alone	#658	a request over the agent's frame limit ended the agent and every container with it
+user-boundaries	#664	a numeric user not in /etc/passwd did not get group 0
+ncpu-engine-cpus	#659	on a Linux host docker info's NCPU was the Mac VM's default of 2, not the CPUs the engine may run on
+ncpu-affinity	#659	an engine under a three-CPU affinity mask must say NCPU 3 (the old count said 2)
