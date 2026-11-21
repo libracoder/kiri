@@ -27,6 +27,22 @@ const MEMORY_FLOOR: u64 = 256 << 20;
 /// How much more the guest gets at once when it reports pressure.
 const MEMORY_GROW: u64 = 1 << 30;
 
+/// The balloon's next target, in bytes, or None to leave it: what the guest
+/// holds (`used`), plus what its kernel keeps for itself from boot (the
+/// VM's memory, `ceiling`, less the MemTotal it reports), plus headroom.
+/// That reserve is mostly the page table of every page (`struct page`),
+/// about 1.6% of the VM: 173 MiB of an 8 GiB one, where it left the guest
+/// below its reclaim watermarks. It then stalled reclaiming, asked for
+/// memory (`Event::Pressure`) and was squeezed again, every few seconds,
+/// with timers in containers a quarter second late each time (#509).
+/// Shrinks in steps, so the guest's caches go gradually, and grows at once.
+fn next_memory_target(used: u64, mem_total: u64, ceiling: u64, target: u64) -> Option<u64> {
+    let reserved = if mem_total > 0 { ceiling.saturating_sub(mem_total) } else { 0 };
+    let want = (used + reserved + MEMORY_HEADROOM).clamp(MEMORY_FLOOR, ceiling);
+    let next = if want < target { want.max(target.saturating_sub(256 << 20)) } else { want };
+    (next.abs_diff(target) >= 64 << 20).then_some(next)
+}
+
 /// What a request that needs the VM gets while Kiri is stopped.
 pub const STOPPED: &str = "Kiri is stopped: press Start in the Kiri window to run containers again";
 
@@ -2336,10 +2352,7 @@ impl Engine {
                 if !cfg!(target_os = "macos") {
                     continue;
                 }
-                let want = (used + MEMORY_HEADROOM).clamp(MEMORY_FLOOR, ceiling);
-                // Shrink in steps (so the guest's caches go gradually), grow at once.
-                let next = if want < *target { want.max(target.saturating_sub(256 << 20)) } else { want };
-                if next.abs_diff(*target) >= 64 << 20 {
+                if let Some(next) = next_memory_target(used, stats.mem_total_kib * 1024, ceiling, *target) {
                     *target = next;
                     vm.set_memory_target(next);
                 }
@@ -4885,6 +4898,65 @@ mod name_in_use_tests {
         );
         // What Testcontainers for Go matches before it retries its reaper.
         assert!(m.contains("The container name \"/reaper_1\" is already in use by "));
+    }
+}
+
+#[cfg(test)]
+mod memory_target_tests {
+    use super::{next_memory_target, MEMORY_FLOOR, MEMORY_HEADROOM};
+
+    const MIB: u64 = 1 << 20;
+    const GIB: u64 = 1 << 30;
+    /// An 8 GiB VM's guest, idle (#509): the MemTotal it reports, and
+    /// what its cgroups hold.
+    const CEILING: u64 = 8 * GIB;
+    const MEM_TOTAL: u64 = 8_211_244 * 1024;
+    const USED: u64 = 100 * MIB;
+
+    /// Runs the balloon loop from `target` until it stops moving.
+    fn settle(used: u64, mem_total: u64, mut target: u64) -> u64 {
+        while let Some(next) = next_memory_target(used, mem_total, CEILING, target) {
+            target = next;
+        }
+        target
+    }
+
+    /// The guest keeps the headroom above what it holds and what its kernel
+    /// took at boot, so it isn't left below its reclaim watermarks.
+    #[test]
+    fn the_guest_keeps_its_headroom_beyond_its_kernels_reserve() {
+        let target = settle(USED, MEM_TOTAL, CEILING);
+        let reserved = CEILING - MEM_TOTAL;
+        assert!(reserved > 150 * MIB, "an 8 GiB guest's kernel keeps about 173 MiB");
+        assert_eq!(target, USED + reserved + MEMORY_HEADROOM);
+        // Settled: nothing left to move.
+        assert_eq!(next_memory_target(USED, MEM_TOTAL, CEILING, target), None);
+    }
+
+    #[test]
+    fn it_shrinks_in_steps_and_grows_at_once() {
+        assert_eq!(next_memory_target(USED, MEM_TOTAL, CEILING, CEILING), Some(CEILING - 256 * MIB));
+        let target = settle(USED, MEM_TOTAL, CEILING);
+        let more = USED + GIB;
+        assert_eq!(next_memory_target(more, MEM_TOTAL, CEILING, target), Some(more + (CEILING - MEM_TOTAL) + MEMORY_HEADROOM));
+    }
+
+    #[test]
+    fn small_changes_leave_it_alone() {
+        let target = settle(USED, MEM_TOTAL, CEILING);
+        assert_eq!(next_memory_target(USED + 32 * MIB, MEM_TOTAL, CEILING, target), None);
+    }
+
+    /// No MemTotal (an agent that sent none): no reserve to add.
+    #[test]
+    fn without_a_mem_total_only_the_headroom_is_added() {
+        assert_eq!(settle(USED, 0, CEILING), USED + MEMORY_HEADROOM);
+    }
+
+    #[test]
+    fn it_stays_between_the_floor_and_the_ceiling() {
+        assert_eq!(settle(0, CEILING, CEILING), MEMORY_FLOOR);
+        assert_eq!(settle(CEILING, MEM_TOTAL, CEILING / 2), CEILING);
     }
 }
 
