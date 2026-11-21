@@ -1480,8 +1480,9 @@ RN_IP=$($D inspect -f '{{.NetworkSettings.Networks.rndns.IPAddress}}' rndns-old)
 RN_IP2=$($D inspect -f '{{.NetworkSettings.Networks.rndns2.IPAddress}}' rndns-old)
 t rename-dns-before "$RN_IP" $D run --rm --network rndns alpine getent hosts rndns-old
 $D rename rndns-old rndns-new
-t rename-dns-new "$RN_IP rndns-new" $D run --rm --network rndns alpine getent hosts rndns-new
-t rename-dns-new-extra-net "$RN_IP2 rndns-new" $D run --rm --network rndns2 alpine getent hosts rndns-new
+# getent pads the address with spaces: squeeze them before matching.
+t rename-dns-new "$RN_IP rndns-new" $D run --rm --network rndns alpine sh -c 'getent hosts rndns-new | tr -s " "'
+t rename-dns-new-extra-net "$RN_IP2 rndns-new" $D run --rm --network rndns2 alpine sh -c 'getent hosts rndns-new | tr -s " "'
 t rename-dns-alias "$RN_IP" $D run --rm --network rndns alpine getent hosts rndns-alias
 t rename-dns-alias-extra-net "$RN_IP2" $D run --rm --network rndns2 alpine getent hosts rndns2-alias
 t rename-dns-old-gone "old name gone" bash -c "$D run --rm --network rndns alpine sh -c 'getent hosts rndns-old || echo old name gone'"
@@ -1506,7 +1507,8 @@ RN_IP6=$($D inspect -f '{{.NetworkSettings.Networks.rndns6.GlobalIPv6Address}}' 
 $D rename rndns6-old rndns6-new
 t rename-dns-ipv6-only-aaaa "$RN_IP6" $D run --rm --network rndns6 alpine nslookup -type=AAAA rndns6-new
 t rename-dns-ipv6-only-no-a "no a records" $D run --rm --network rndns6 alpine sh -c "nslookup -type=A rndns6-new 2>&1 | sed -n '/^Name:/,\$p' | grep -qE 'Address.*[0-9]+[.][0-9]+[.][0-9]+[.][0-9]+' && echo a records || echo no a records"
-t rename-dns-ipv6-only-old-gone "old name gone" bash -c "$D run --rm --network rndns6 alpine sh -c 'nslookup -type=AAAA rndns6-old >/dev/null 2>&1 && echo still there || echo old name gone'"
+# nslookup exits 0 on an answer with no records too: look for a name in it.
+t rename-dns-ipv6-only-old-gone "old name gone" bash -c "$D run --rm --network rndns6 alpine sh -c 'nslookup -type=AAAA rndns6-old 2>&1 | grep -q \"^Name:\" && echo still there || echo old name gone'"
 $D rm -f rndns6-new >/dev/null; $D network rm rndns6 >/dev/null
 # Disconnecting leaves a gap in the eth numbers: each network keeps its own
 # interface, a later one takes the free number, and every address goes back.
