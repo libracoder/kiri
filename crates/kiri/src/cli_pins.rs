@@ -5,7 +5,7 @@
 #![allow(dead_code)]
 
 pub const DOCKER_CLI: (&str, &str) = ("29.9.2", "ea8a2ce5ac31f9f5f3fb711a7a485e1e46cc7a69798a629a70306f6e6af25b7a");
-pub const COMPOSE: (&str, &str) = ("v5.6.1", "fcce41226abd2b7b2936094e688bbd61284673dddafea542e08cb9a3b4423a8b");
+pub const COMPOSE: (&str, &str) = ("v5.8.0", "008b8fcf6c6d60340f5796626a0f0d51c042085793a9b1653343011727140b71");
 pub const BUILDX: (&str, &str) = ("v0.38.1", "6f20ba2437865311ef99015bf5d1039c3c8e4d2177c1c64aa41b134b5ecd3012");
 
 /// Grype, Anchore's image scanner (Builds → Security): the Apple Silicon
@@ -46,7 +46,7 @@ pub fn buildx_url(v: &str) -> String {
 /// (`cargo xtask app --arch x86_64`). Compose and buildx are GitHub's asset
 /// digests; the docker tarball as download.docker.com served it.
 pub const X86_DOCKER_CLI: (&str, &str) = ("29.9.2", "089c3f618df88bdef4f1257d9d604499136a1ec5168b67d194c260acad2b522f");
-pub const X86_COMPOSE: (&str, &str) = ("v5.6.1", "245c191b11a6345dd3b32b8f6eadeed1e1dcd5147aa46dfa423462e95f587e93");
+pub const X86_COMPOSE: (&str, &str) = ("v5.8.0", "5c41cd573c549dc66abb03c5b29d6d4dfaae206b2e79848d1c32482bb2a3b416");
 pub const X86_BUILDX: (&str, &str) = ("v0.38.1", "76e7a809cc98d34a4c1b7db23feac673def5b8dcdddd9e713ef26598689aa796");
 pub const X86_GRYPE: (&str, &str) = ("0.120.1", "5313004ccbc524c8757521dc3913f1edf4309f56bef06a2fb2d0c0eeade7cc62");
 
@@ -120,7 +120,7 @@ impl MacArch {
 /// `docker/docker` inside download.docker.com's static tarball; Compose and
 /// buildx are GitHub's asset digests.
 pub const LINUX_DOCKER_CLI: (&str, &str) = ("29.9.2", "9ac225999fd5e863f7694c728ef23d480616b1e5639328fa309befd4243d69eb");
-pub const LINUX_COMPOSE: (&str, &str) = ("v5.6.1", "47737f4236e6d3ccea7291995203f8f018058783b4c3a9469119811a0b5db8c0");
+pub const LINUX_COMPOSE: (&str, &str) = ("v5.8.0", "b8840f5008c447f41fce0a57ae3adeab42c89b1eb6e6012524bcabbfb4ffbaf6");
 pub const LINUX_BUILDX: (&str, &str) = ("v0.38.1", "e25d5cd675092bb5d1d03632fdc46cdf3fede7b514dc5f023a105e00d3ce5ad4");
 
 pub fn linux_docker_url(v: &str) -> String {
@@ -138,14 +138,14 @@ pub fn linux_buildx_url(v: &str) -> String {
 /// The same versions for Linux arm64, in the arm64 `kiri` .deb and .rpm,
 /// from the same places (packaging/linux/fetch-cli.sh).
 pub const LINUX_ARM64_DOCKER_CLI: (&str, &str) = ("29.9.2", "873b3e0207857c3b2f28392fb922f3ea6efe37620c16d4d4aaf2fef409c90b73");
-pub const LINUX_ARM64_COMPOSE: (&str, &str) = ("v5.6.1", "42cfa75f51ad0ccf290bad37899e0038a8c10a0069e85233ecc1d53e3ff1347d");
+pub const LINUX_ARM64_COMPOSE: (&str, &str) = ("v5.8.0", "1a9c918b2fb49b9c87f0018c64b5abd0d30715155e98dc939779fbaee6c414d3");
 pub const LINUX_ARM64_BUILDX: (&str, &str) = ("v0.38.1", "3b83b3731916ba433feccaaa689fe5bcdc81c641d92c8e6c2ea865dfa141c97a");
 
 /// The same versions for Windows x86-64, bundled with kiri-win
 /// (`cargo xtask windows`). Compose and buildx are GitHub's asset digests;
 /// the docker CLI's zip as download.docker.com served it.
 pub const WIN_DOCKER_CLI: (&str, &str) = ("29.9.2", "b2be959bfed1281ddaf665c0972cba9a62ce30c542b6bcce82f055bf8886bc7d");
-pub const WIN_COMPOSE: (&str, &str) = ("v5.6.1", "91b1492f0a923427651e2b955739d732ac36b8191193bf4799e62f3e3525c4cd");
+pub const WIN_COMPOSE: (&str, &str) = ("v5.8.0", "0c2d9245a5f61e8e3cc85009b8b4888fa82fded08239d28bd6da5ca818eda2b2");
 pub const WIN_BUILDX: (&str, &str) = ("v0.38.1", "fd2e18501910dd535ea3aa7f69010b3cfdfba0f47aa27674124554386dfa26f3");
 
 /// The static docker CLI for Windows; the binary is `docker/docker.exe` inside.
@@ -167,7 +167,7 @@ pub fn win_buildx_url(v: &str) -> String {
 /// x86_64 only), so it is built from docker/cli's own source at the release
 /// tag's commit, with Go's toolchain pinned and cgo off: Go builds that way
 /// are reproducible on any host, so the result is pinned like a download.
-pub const WIN_ARM64_COMPOSE: (&str, &str) = ("v5.6.1", "2a8ab89b27a7ba79c3ec5b3eb59e099b39990d2c7ea47fc38433fc24812ad266");
+pub const WIN_ARM64_COMPOSE: (&str, &str) = ("v5.8.0", "ec7a100a77d9aedbaa6e2b13a10140729860b58b8d2b6855d8191c52e7dd50fc");
 pub const WIN_ARM64_BUILDX: (&str, &str) = ("v0.38.1", "2d4e2e78d7ddf0ea6d63acde7e73599717e94e3f9417edd23d4ffeceef6777fc");
 
 /// docker/cli at tag v29.9.2 (WIN_DOCKER_CLI's version): the commit the
