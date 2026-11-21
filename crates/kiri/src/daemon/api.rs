@@ -2097,6 +2097,16 @@ pub(super) fn create(req: &Request, engine: &Engine) -> Result<Value, Error> {
     if let super::seccomp::Choice::Profile(json) = super::seccomp::choice(&strings(&host["SecurityOpt"]).unwrap_or_default()).map_err(Error::BadRequest)? {
         super::seccomp::compile(json, profile_caps(caps_from(host)?, host["Privileged"].as_bool().unwrap_or(false))).map_err(Error::BadRequest)?;
     }
+    // Kiri's host boundary stays under every profile, `seccomp=unconfined`
+    // and `--privileged` included: io_uring's socket operation would make a
+    // socket the filter never sees, so those syscalls stay blocked and an
+    // io_uring workload (Iggy and friends) fails saying to use exactly this
+    // option. Said out loud at create, where the person still is (#516).
+    let unconfined = matches!(super::seccomp::choice(&strings(&host["SecurityOpt"]).unwrap_or_default()), Ok(super::seccomp::Choice::Unconfined))
+        || host["Privileged"].as_bool().unwrap_or(false);
+    if unconfined {
+        crate::diag::warn!("seccomp is unconfined for this container, but Kiri's host boundary stays: io_uring syscalls remain blocked, and a workload that needs them (Iggy, other io_uring servers) will fail");
+    }
     let network_mode = match host["NetworkMode"].as_str().unwrap_or("default") {
         "" | "default" => body["NetworkingConfig"]["EndpointsConfig"].as_object()
             .and_then(|eps| endpoints_primary(eps.keys().map(String::as_str), |key| engine.lock_net().find(key).map(|n| (n.name.clone(), n.internal))))
