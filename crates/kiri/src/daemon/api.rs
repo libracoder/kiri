@@ -1300,6 +1300,14 @@ fn port_bindings(body: &Value, engine: &Engine, image: &kiri_image::Image) -> Re
 /// Desktop's and OrbStack's name for it).
 const SSH_AGENT_SOCK: &str = "/run/host-services/ssh-auth.sock";
 
+/// What the guest is given for that bind: the VM's path, or on a Linux host
+/// where the agent listens, under Kiri's own /run/kiri. The host's
+/// /run/host-services belongs to Docker Desktop for Linux, and the agent
+/// never creates it there (#420). Inspect still shows the path asked for.
+fn ssh_agent_source() -> &'static str {
+    if cfg!(target_os = "linux") { "/run/kiri/host-services/ssh-auth.sock" } else { SSH_AGENT_SOCK }
+}
+
 /// A container's mounts, worked out at create time.
 struct Mounts {
     /// For the guest: `source\ttarget\tflags`.
@@ -1574,7 +1582,7 @@ fn mounts(body: &Value, engine: &Engine, image: &kiri_image::Image) -> Result<Mo
                 out.info.push(json!({"Type": "bind", "Source": src, "Destination": dst, "Mode": "", "RW": !ro, "Propagation": "rprivate"}));
             }
             "bind" if src == SSH_AGENT_SOCK => {
-                out.guest.push(format!("{src}\t{dst}\t{}", flag("")));
+                out.guest.push(format!("{}\t{dst}\t{}", ssh_agent_source(), flag("")));
                 out.info.push(json!({"Type": "bind", "Source": src, "Destination": dst, "Mode": "", "RW": !ro, "Propagation": "rprivate"}));
             }
             "bind" => {
@@ -4872,6 +4880,16 @@ mod network_option_tests {
         assert!(super::check_volume_device(&opts(&[("type", "nfs"), ("o", "addr=10.0.0.1"), ("device", ":/export")])).is_ok());
         assert!(super::check_volume_device(&opts(&[("type", "tmpfs"), ("device", "tmpfs")])).is_ok());
         assert!(super::check_volume_device(&opts(&[])).is_ok());
+    }
+
+    #[test]
+    fn ssh_agent_bind_uses_the_agent_host_path_on_linux() {
+        // The guest is told where the agent listens: the VM's path, or
+        // Kiri's own /run/kiri on a Linux host (#420).
+        assert_eq!(
+            super::ssh_agent_source(),
+            if cfg!(target_os = "linux") { "/run/kiri/host-services/ssh-auth.sock" } else { "/run/host-services/ssh-auth.sock" }
+        );
     }
 
     /// `--add-host name:ip` and `--hostname` are written into the container's
