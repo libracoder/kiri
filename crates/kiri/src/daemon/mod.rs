@@ -39,6 +39,7 @@ pub(crate) mod rofs;
 mod seccomp;
 mod seccomp_names;
 mod storage;
+mod swarm;
 pub mod time;
 mod top;
 mod treecopy;

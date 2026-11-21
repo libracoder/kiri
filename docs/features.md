@@ -112,6 +112,23 @@ Apple silicon and Intel Macs (macOS 14+), Windows 10 and 11 (x86-64 and Arm, thr
   `exec`, `build:`, healthchecks, `depends_on` conditions
   (`service_healthy`, `service_completed_successfully`), `platform:`,
   multiple networks, events
+- **Swarm (one node)**: `docker swarm init`, `docker service` (`create`,
+  `ls`, `ps`, `inspect`, `scale`, `update`, `rollback`, `logs`, `rm`),
+  `docker stack deploy`/`rm`, `docker secret`, `docker config`, `docker
+  node ls`/`inspect`/`update`, and `--driver overlay` networks. Kiri is the
+  swarm's only node and its leader. A service's tasks are containers named
+  and labelled as Docker names them, kept as the spec says: replicas or
+  global, restart policy, placement constraints, rolling updates
+  (parallelism, delay, stop-first or start-first, monitor, failure action)
+  and rollbacks. A service's name resolves on its networks to its tasks
+  (`tasks.<name>` too); `--publish` works in ingress mode (one task takes
+  each port's connections) and host mode. Secrets are mounted at
+  `/run/secrets/<name>`, configs where their target says. Self-hosted
+  platforms that run on Swarm, such as Dokploy, install and deploy on it.
+  Not here: joining another node, autolock, job services, and a virtual IP
+  per service (a name resolves to the tasks' own addresses, as with
+  `--endpoint-mode dnsrr`). Secrets are kept in `swarm.json` in Kiri's data
+  folder, readable only by you, not encrypted as in Docker's Raft log
 - **USB devices (beta)**: the USB tab hands a device (a serial adapter, a
   Zigbee stick, a development board) to your containers on Mac, Windows and
   Linux, and shows where it is inside Linux with the `--device` line to
