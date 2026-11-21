@@ -73,10 +73,13 @@ pub fn bundled() -> &'static [CertificateDer<'static>] {
     webpki_root_certs::TLS_SERVER_ROOT_CERTS
 }
 
-/// The subject and public key of a certificate (their DER, as written in
+/// A certificate's issuer, subject and public key, each as DER.
+type Identity<'a> = (&'a [u8], &'a [u8], &'a [u8]);
+
+/// The issuer, subject and public key of a certificate (their DER, as written in
 /// it): what names a root, as opposed to one issue of it. None when `der`
 /// is not a certificate this can read.
-fn identity(der: &[u8]) -> Option<(&[u8], &[u8])> {
+fn identity(der: &[u8]) -> Option<Identity<'_>> {
     // One DER element: (tag, content, what follows).
     fn element(b: &[u8]) -> Option<(u8, &[u8], &[u8])> {
         let (&tag, rest) = b.split_first()?;
@@ -100,28 +103,34 @@ fn identity(der: &[u8]) -> Option<(&[u8], &[u8])> {
     if element(rest)?.0 == 0xa0 {
         rest = element(rest)?.2;
     }
-    // Serial number, signature algorithm, issuer, validity.
-    for _ in 0..4 {
+    // Serial number, signature algorithm, then the issuer, then validity.
+    for _ in 0..2 {
         rest = element(rest)?.2;
     }
+    let issuer = &rest[..rest.len() - element(rest)?.2.len()];
+    rest = element(rest)?.2;
+    rest = element(rest)?.2;
     let subject = &rest[..rest.len() - element(rest)?.2.len()];
     rest = element(rest)?.2;
     let spki = &rest[..rest.len() - element(rest)?.2.len()];
-    Some((subject, spki))
+    Some((issuer, subject, spki))
 }
 
-/// Whether `a` and `b` are the same root: the same subject and public key,
-/// so a re-issued copy of a distrusted root (new dates, same key) is it
-/// too. Certificates this cannot read are compared whole.
-fn same_root(a: &CertificateDer<'_>, b: &CertificateDer<'_>) -> bool {
-    match (identity(a), identity(b)) {
-        (Some(x), Some(y)) => x == y,
-        _ => a == b,
+/// Whether `c` is `d`, a distrusted certificate. A self-issued root is
+/// distrusted by its subject and public key, so a re-issued copy of it (new
+/// dates, same key) goes too. Any other certificate (a cross-certificate:
+/// the same name and key as a root, but issued by another one) is distrusted
+/// as itself only, so the self-signed root it vouches for stays. Certificates
+/// this cannot read are compared whole.
+fn same_root(c: &CertificateDer<'_>, d: &CertificateDer<'_>) -> bool {
+    match (identity(c), identity(d)) {
+        (Some((_, subject, key)), Some((issuer, d_subject, d_key))) if issuer == d_subject => subject == d_subject && key == d_key,
+        _ => c == d,
     }
 }
 
-/// `roots` without any certificate that is one of `distrusted`: the same
-/// root by subject and public key, whichever issue of it.
+/// `roots` without any certificate that is one of `distrusted` (see
+/// [`same_root`]).
 pub fn without(
     mut roots: Vec<CertificateDer<'static>>,
     distrusted: &[CertificateDer<'static>],
@@ -433,10 +442,39 @@ mod tests {
         let reissued = CertificateDer::from(other);
         assert_ne!(reissued, root);
         assert!(identity(&root).is_some(), "the bundled roots are readable");
-        let kept = without(vec![reissued.clone(), bundled()[1].clone()], &[root.clone()]);
+        let kept = without(vec![reissued.clone(), bundled()[1].clone()], std::slice::from_ref(&root));
         assert_eq!(kept, vec![bundled()[1].clone()]);
         // Unreadable entries fall back to whole-certificate comparison.
         assert_eq!(without(vec![cert(1), cert(2)], &[cert(2)]), vec![cert(1)]);
+    }
+
+    /// A certificate with these names and key, as the parser reads one.
+    fn fake(issuer: &str, subject: &str, key: &str, tag: u8) -> CertificateDer<'static> {
+        fn tlv(tag: u8, body: &[u8]) -> Vec<u8> {
+            let mut v = vec![tag, body.len() as u8];
+            v.extend_from_slice(body);
+            v
+        }
+        let name = |n: &str| tlv(0x30, n.as_bytes());
+        let mut tbs = tlv(0x02, &[tag]);
+        for part in [tlv(0x30, &[]), name(issuer), tlv(0x30, &[]), name(subject), tlv(0x30, key.as_bytes())] {
+            tbs.extend(part);
+        }
+        CertificateDer::from(tlv(0x30, &tlv(0x30, &tbs)))
+    }
+
+    #[test]
+    fn distrusting_a_cross_certificate_keeps_the_root_it_shares_a_key_with() {
+        let root = fake("R", "R", "key", 1);
+        let reissued = fake("R", "R", "key", 2);
+        let cross = fake("D", "R", "key", 3);
+        let other = fake("O", "O", "other", 4);
+        // The cross-certificate (R's name and key, issued by D): only itself.
+        let kept = without(vec![root.clone(), cross.clone(), other.clone()], std::slice::from_ref(&cross));
+        assert_eq!(kept, vec![root.clone(), other.clone()]);
+        // The self-signed root: itself and its re-issues.
+        let kept = without(vec![root.clone(), reissued, other.clone()], std::slice::from_ref(&root));
+        assert_eq!(kept, vec![other]);
     }
 
     #[test]

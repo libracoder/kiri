@@ -32,18 +32,11 @@ fn to_json(h: &Host) -> Value {
     json!({"certs": list(&h.certs), "distrusted": list(&h.distrusted)})
 }
 
-/// Whether `/proc/version` is that of a WSL kernel ("...-microsoft-standard-WSL2").
-fn is_wsl_kernel(version: &str) -> bool {
-    let v = version.to_ascii_lowercase();
-    v.contains("microsoft") || v.contains("wsl")
-}
-
 /// Whether this daemon is the engine in WSL: the only place kiri-win's
 /// roots belong. A native Linux daemon has its own store, and takes
 /// neither the roots nor the file they are kept in.
 pub fn in_wsl() -> bool {
-    static WSL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *WSL.get_or_init(|| std::fs::read_to_string("/proc/version").is_ok_and(|v| is_wsl_kernel(&v)))
+    super::binds::wsl().is_some()
 }
 
 /// Takes the roots kiri-win sent, keeping them for the next start when
@@ -109,12 +102,6 @@ mod tests {
         assert_eq!(host.certs.len(), 1);
         assert_eq!(host.distrusted[0].as_ref(), &[0x30, 0x02, 0x0a, 0x0b]);
         assert_eq!(to_json(&host), json!({"certs": ["3001"], "distrusted": ["30020a0b"]}));
-    }
-
-    #[test]
-    fn only_a_wsl_kernel_is_wsl() {
-        assert!(is_wsl_kernel("Linux version 5.15.153.1-microsoft-standard-WSL2 (root@x) (gcc)"));
-        assert!(!is_wsl_kernel("Linux version 6.8.0-45-generic (buildd@lcy02) (gcc)"));
     }
 
     #[cfg(unix)]
