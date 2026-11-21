@@ -198,9 +198,8 @@ fn quiet(program: &str) -> Command {
 /// none, the bytes really were UTF-8.
 fn wsl_text(bytes: &[u8]) -> String {
     let utf8 = String::from_utf8_lossy(bytes);
-    let looks_utf16 = utf8.contains('\0')
-        || utf8.contains('\u{fffd}')
-        || utf8.chars().any(|c| c.is_control() && !c.is_whitespace());
+    // UTF-16 is whole units; an ESC is a Linux program's colour code.
+    let looks_utf16 = bytes.len().is_multiple_of(2) && (utf8.contains('\0') || utf8.contains('\u{fffd}') || utf8.chars().any(|c| c.is_control() && !c.is_whitespace() && c != '\x1b'));
     if !looks_utf16 {
         return utf8.into_owned();
     }
@@ -271,6 +270,16 @@ fn nothing_listed(out: &[u8]) -> bool {
     ["WSL_E_DEFAULT_DISTRO_NOT_FOUND", "WSL_E_WSL_OPTIONAL_COMPONENT_REQUIRED"].iter().any(|code| text.contains(code))
 }
 
+/// Whether WSL's output says its optional component is off.
+fn component_required(out: &[u8]) -> bool {
+    String::from_utf8_lossy(out).replace('\0', "").contains("WSL_E_WSL_OPTIONAL_COMPONENT_REQUIRED")
+}
+
+/// Whether `wsl.exe -l -q` failed because WSL's optional component is off.
+fn components_off() -> bool {
+    crate::update::output_within(quiet("wsl.exe").args(["-l", "-q"]), WSL_ANSWER_LIMIT).is_ok_and(|o| !o.status.success() && (component_required(&o.stdout) || component_required(&o.stderr)))
+}
+
 fn existing_ubuntu() -> Option<String> {
     distros().unwrap_or_default().into_iter().find(|d| d.starts_with("Ubuntu"))
 }
@@ -324,6 +333,12 @@ fn current_step(s: &Saved) -> (&'static str, Option<String>) {
     // Install WSL (or asking for its distros, which would hang too).
     if silent.is_some() {
         return ("choose", silent);
+    }
+    // wsl.exe answers, but WSL's optional component is off (a setup before
+    // this one turned on Virtual Machine Platform alone): no distro would
+    // import, so step 1 again, which turns the components on.
+    if components_off() {
+        return ("welcome", None);
     }
     let step = match &s.distro {
         Some(d) if distros().is_some_and(|l| l.iter().any(|x| x == d)) => {
@@ -540,15 +555,36 @@ fn elevated(args: &[&str]) -> io::Result<i32> {
     }
 }
 
-/// Step 1: download WSL, then in one elevated run turn on the Linux optional
-/// components and install WSL. Exit 3010 from either means a restart.
+/// What a `kiri-admin.ps1 -Wsl` or `-Components` exit code says went
+/// wrong; None when it succeeded (0, or 3010: Windows must restart).
+fn admin_wsl_failed(code: i32) -> Option<String> {
+    Some(match code {
+        0 | 3010 => return None,
+        22 => "the downloaded WSL installer changed on disk; try again".into(),
+        23 => "the WSL installer is not validly signed by Microsoft".into(),
+        24 => "Windows could not turn on WSL's optional components (is virtualization on in the BIOS?)".into(),
+        21 => "the WSL installer failed".into(),
+        other => format!("the administrator step failed (exit code {other})"),
+    })
+}
+
+/// Step 1: download WSL, then in one elevated run turn on WSL's optional
+/// components and install WSL; or, when WSL is installed already, turn on
+/// the components alone. Exit 3010 means a restart.
 fn install_wsl() -> io::Result<()> {
     update(|s| s.tasks = tasks(&[tr("Download WSL"), tr("Administrator approval"), tr("Turn on Virtual Machine Platform"), tr("Install WSL")]));
     // WSL_MSI is this build's architecture's; on another PC it would not install.
     if let Some(e) = crate::win::arch_mismatch() {
         return Err(io::Error::other(e));
     }
-    let msi = download(&WSL_MSI, 0)?;
+    // WSL already answers, so only its optional components are off (see
+    // current_step): turn them on, with no installer to download or run.
+    let msi = if wsl_answer() == Wsl::There {
+        task(0, "done", "");
+        None
+    } else {
+        Some(download(&WSL_MSI, 0)?)
+    };
     update(|s| s.progress = Some(json!({"pct": null, "done": null, "total": null, "rate": null, "eta": null, "label": tr("Waiting for Windows' approval")})));
     task(1, "active", &tr("Windows is asking"));
     // The downloaded MSI lives in a user-writable folder, so a process at
@@ -556,22 +592,21 @@ fn install_wsl() -> io::Result<()> {
     // and the elevated install. kiri-admin.ps1 -Wsl re-verifies it, as admin,
     // on a copy the user cannot touch, and requires it to be Microsoft-signed,
     // before running it; its exit codes are read below.
-    let msi = msi.to_string_lossy();
-    let code = elevated(&["-Wsl", "-Msi", &msi, "-Sha256", WSL_MSI.sha256])?;
+    let code = match &msi {
+        Some(msi) => elevated(&["-Wsl", "-Msi", &msi.to_string_lossy(), "-Sha256", WSL_MSI.sha256])?,
+        None => elevated(&["-Components"])?,
+    };
     task(1, "done", &tr("approved"));
     match code {
-        22 => return Err(io::Error::other("the downloaded WSL installer changed on disk; try again")),
-        23 => return Err(io::Error::other("the WSL installer is not validly signed by Microsoft")),
-        24 => {
-            task(2, "error", "");
-            return Err(io::Error::other("Windows could not turn on the Linux optional components (is virtualization on in the BIOS?)"));
-        }
+        24 => task(2, "error", ""),
         21 => {
             task(2, "done", "");
             task(3, "error", "");
-            return Err(io::Error::other("the WSL installer failed"));
         }
         _ => {}
+    }
+    if let Some(why) = admin_wsl_failed(code) {
+        return Err(io::Error::other(why));
     }
     task(2, "done", "");
     task(3, "done", "");
@@ -982,6 +1017,51 @@ mod tests {
             assert_eq!(super::wsl_text(&utf16(m)), *m, "UTF-16: {m}");
             assert_eq!(super::wsl_text(m.as_bytes()), *m, "UTF-8: {m}");
         }
+    }
+
+    #[test]
+    fn linux_output_stays_utf8() {
+        // What a Linux command run through wsl.exe prints is UTF-8, colour
+        // codes and all, whatever its length.
+        for m in ["\x1b[31merror:\x1b[0m kiri-start: no such file\n", "\x1b[1mok\x1b[0m\r\n", "Für\n", "Für\r\n", "Для\r\n"] {
+            assert_eq!(super::wsl_text(m.as_bytes()), m);
+        }
+    }
+
+    #[test]
+    fn a_turned_off_component_is_seen_in_any_language() {
+        let utf16 = |s: &str| s.encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<u8>>();
+        assert!(super::component_required(&utf16("Для подсистемы Windows для Linux требуется дополнительный компонент.\r\nWsl/WSL_E_WSL_OPTIONAL_COMPONENT_REQUIRED\r\n")));
+        assert!(super::component_required(b"Error code: Wsl/WSL_E_WSL_OPTIONAL_COMPONENT_REQUIRED\r\n"));
+        assert!(!super::component_required(&utf16("Windows Subsystem for Linux has no installed distributions.\r\nError code: Wsl/WSL_E_DEFAULT_DISTRO_NOT_FOUND\r\n")));
+    }
+
+    /// kiri-admin.ps1 as installed beside kiri-win.exe.
+    const ADMIN_SCRIPT: &str = include_str!("../../../contrib/windows/kiri-admin.ps1");
+
+    /// The script's lines that are not comments.
+    fn admin_code() -> impl Iterator<Item = &'static str> {
+        ADMIN_SCRIPT.lines().filter(|l| !l.trim_start().starts_with('#'))
+    }
+
+    #[test]
+    fn the_admin_script_turns_on_both_wsl_components() {
+        let feature = |name: &str| admin_code().any(|l| l.contains(&format!("'/featurename:{name}'")));
+        assert!(feature("Microsoft-Windows-Subsystem-Linux"), "kiri-admin.ps1 must turn on the Subsystem for Linux component");
+        assert!(feature("VirtualMachinePlatform"), "kiri-admin.ps1 must turn on Virtual Machine Platform");
+    }
+
+    #[test]
+    fn every_admin_script_exit_code_is_read() {
+        assert_eq!(super::admin_wsl_failed(0), None);
+        assert_eq!(super::admin_wsl_failed(3010), None);
+        let codes: Vec<i32> = admin_code().flat_map(|l| l.split("exit ").skip(1)).filter_map(|rest| rest.split(|c: char| !c.is_ascii_digit()).next()?.parse().ok()).collect();
+        assert!(codes.contains(&24), "{codes:?}");
+        for code in codes.into_iter().filter(|c| *c != 0 && *c != 3010) {
+            let why = super::admin_wsl_failed(code).unwrap_or_default();
+            assert!(!why.is_empty() && !why.contains("administrator step"), "exit {code} from kiri-admin.ps1 has no message of its own");
+        }
+        assert!(super::admin_wsl_failed(1).is_some_and(|w| w.contains("exit code 1")));
     }
 
     #[test]
