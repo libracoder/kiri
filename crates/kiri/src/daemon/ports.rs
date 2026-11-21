@@ -745,7 +745,11 @@ fn relay(client: TcpStream, vm: &VmLink, ip: [u8; 4], port: u16, nat: Option<Soc
         }
     }
     let (guest, framed) = open_framed_relay(vm, ip, port)?;
-    vsock_stall(guest.fd.as_raw_fd())?;
+    // No timeout on the vsock: the framework's socket shim applies
+    // `SO_SNDTIMEO` to a quiet connection as a whole, closing it after
+    // exactly that long with nothing to send — a dev server's live-reload
+    // socket died every 300 s (#530). The client's end keeps the
+    // write-stall limit and keepalive, and its failure ends this one.
     let mut to_guest = std::fs::File::from(guest.fd.try_clone()?);
     let mut from_guest = std::fs::File::from(guest.fd.try_clone()?);
     let mut client_read = client.try_clone()?;
@@ -944,18 +948,6 @@ fn relayed_tcp(s: &TcpStream) -> io::Result<()> {
     set(libc::IPPROTO_TCP, idle, KEEPALIVE_IDLE.as_secs() as _)?;
     set(libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, KEEPALIVE_INTERVAL.as_secs() as _)?;
     set(libc::IPPROTO_TCP, libc::TCP_KEEPCNT, KEEPALIVE_PROBES)
-}
-
-/// The vsock end: no read deadline, so a quiet connection stays (#388). The
-/// client's end has keepalive; when it fails, the relay ends this one too.
-fn vsock_stall(fd: std::os::fd::RawFd) -> io::Result<()> {
-    let timeout = libc::timeval {
-        tv_sec: TCP_STALL.as_secs() as _,
-        tv_usec: 0,
-    };
-    // SAFETY: timeout is valid for the duration of the call on an owned socket.
-    let result = unsafe { libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDTIMEO, (&timeout as *const libc::timeval).cast(), std::mem::size_of::<libc::timeval>() as libc::socklen_t) };
-    if result == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
 }
 
 /// What containers reach as `host.docker.internal`.
