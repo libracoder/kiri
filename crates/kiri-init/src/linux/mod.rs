@@ -5,6 +5,7 @@ mod devices;
 mod copy;
 mod dns;
 mod fsnotify;
+mod firewall;
 mod fsview;
 mod hostopts;
 mod inroot;

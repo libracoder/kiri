@@ -95,7 +95,7 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
     };
     // On a Linux host, SIGTERM or SIGINT stops the agent as Shutdown does.
     let term = if host_process { Some(term_signals()?) } else { None };
-    // On a Linux host, Docker's firewall may come after the engine.
+    // On a Linux host, its firewall may start, reload or flush after the engine.
     let firewall = if host_process { net::firewall_events() } else { None };
     let mut bridges = Bridges::default();
     // In the VM, lookups the gateway's resolver fails go through the host.

@@ -17,7 +17,8 @@ kiri_seed_images alpine:latest || echo "linux-host: alpine could not be fetched"
 $D rm -f "$N" >/dev/null 2>&1
 $D run -d --name "$N" --privileged --tmpfs /run -v "$N":/var/lib/kiri -v "$N"-store:/root/.local/share/kiri \
   -v "$BIN:/opt/kiri:ro" alpine sh -c 'apk add -q docker-cli curl python3 >/dev/null 2>&1; exec /opt/kiri/kiri daemon' >/dev/null
-up() { for _ in $(seq 60); do $D exec "$N" sh -c 'DOCKER_HOST=unix:///root/.kiri/run/docker.sock docker version' >/dev/null 2>&1 && break; sleep 1; done; }
+# Up to 3 minutes: the container installs its tools with apk first, which can take over a minute.
+up() { for _ in $(seq 180); do $D exec "$N" sh -c 'DOCKER_HOST=unix:///root/.kiri/run/docker.sock docker version' >/dev/null 2>&1 && break; sleep 1; done; }
 up
 $D cp "$(dirname "$0")/testcontainers-api.py" "$N":/testcontainers-api.py >/dev/null
 $D cp "$(dirname "$0")/lib/images.sh" "$N":/images.sh >/dev/null
@@ -305,6 +306,30 @@ t dockerfw-rules "3 3" "echo \$(iptables -S DOCKER-USER | grep -c kiri) \$(ip6ta
 t dockerfw-docker-reachable "Directory listing" "wget -qO- -T 3 http://172.31.250.2:8080/"
 t dockerfw-docker-kept-apart "kept apart" "docker run --rm alpine sh -c 'wget -qO- -T 3 http://172.31.250.2:8080/ >/dev/null 2>&1 && echo reached || echo kept apart'"
 t dockerfw-cleanup "ok" "pkill -f '[h]ttp.server 8080'; ip netns del dk; ip link del docker0; for t in iptables ip6tables; do \$t -P FORWARD ACCEPT; \$t -D FORWARD -j DOCKER-USER; \$t -F DOCKER-USER; \$t -X DOCKER-USER; done; echo ok"
+# A FORWARD policy of drop without Docker (#247): set by hand, or by ufw.
+# Kiri's rules go at the top of FORWARD, for IPv4 and IPv6, and still let
+# no Kiri container into another program's bridge (virbr0, a namespace
+# serving on port 8080, as libvirt's guests sit behind it).
+t fwdrop-setup "ok" "apk add -q nftables >/dev/null 2>&1; for t in iptables ip6tables; do \$t -P FORWARD DROP || exit 1; done && ip netns add vm && ip link add virbr0 type bridge && ip link add vmh type veth peer name vmp && ip link set vmp netns vm && ip link set vmh master virbr0 && ip addr add 172.31.251.1/24 dev virbr0 && ip link set virbr0 up && ip link set vmh up && ip -n vm addr add 172.31.251.2/24 dev vmp && ip -n vm link set vmp up && ip -n vm route add default via 172.31.251.1 && (ip netns exec vm python3 -m http.server 8080 >/dev/null 2>&1 &) && echo ok"
+t fwdrop-internet "Example Domain" "docker run --rm alpine wget -qO- -T 10 http://example.com"
+t fwdrop-user-network "Example Domain" "docker network create fwdrop >/dev/null && docker run --rm --network fwdrop alpine wget -qO- -T 10 http://example.com; docker network rm fwdrop >/dev/null"
+t fwdrop-rules "3 3" "echo \$(iptables -S FORWARD | grep -c kiri) \$(ip6tables -S FORWARD | grep -c kiri)"
+t fwdrop-kept-apart "kept apart" "docker run --rm alpine sh -c 'wget -qO- -T 3 http://172.31.251.2:8080/ >/dev/null 2>&1 && echo reached || echo kept apart'"
+# ufw turned on while the engine runs, and reloaded: its policy is drop
+# and it reloads only its own chains.
+t fwdrop-ufw-setup "ok" "for t in iptables ip6tables; do \$t -F FORWARD; \$t -P FORWARD ACCEPT; done; apk add -q ufw >/dev/null 2>&1 && ufw --force enable >/dev/null && iptables -S FORWARD | grep -q 'P FORWARD DROP' && echo ok"
+t fwdrop-ufw-internet "Example Domain" "docker run --rm alpine wget -qO- -T 10 http://example.com"
+t fwdrop-ufw-reload "Example Domain" "ufw reload >/dev/null; docker run --rm alpine wget -qO- -T 10 http://example.com"
+t fwdrop-ufw-rules "3 3" "echo \$(iptables -S FORWARD | grep -c kiri) \$(ip6tables -S FORWARD | grep -c kiri)"
+# An nftables chain of the administrator's own with policy drop: Kiri does
+# not change it, and docker info says which rules let its containers through.
+t fwdrop-nft-warns "nft insert rule inet own forward iifname" "ufw --force disable >/dev/null; nft add table inet own && nft add chain inet own forward '{ type filter hook forward priority 0; policy drop; }' && sleep 1 && docker info --format '{{json .Warnings}}'"
+t fwdrop-nft-advice-works "Example Domain" "nft insert rule inet own forward oifname 'kiri*' accept && nft insert rule inet own forward iifname 'kiri*' ct state established,related accept && nft insert rule inet own forward iifname 'kiri*' oifname eth0 accept && docker run --rm alpine wget -qO- -T 10 http://example.com"
+t fwdrop-nft-warning-gone "gone" "docker info --format '{{json .Warnings}}' | grep -q 'inet own' && echo still there || echo gone"
+# A flush of the whole ruleset (nftables.service starting or reloading)
+# takes Kiri's own table: it is built again, or containers had no NAT.
+t fwdrop-flush-rebuilt "Example Domain" "nft flush ruleset; sleep 1; docker run --rm alpine wget -qO- -T 10 http://example.com"
+t fwdrop-cleanup "ok" "pkill -f '[h]ttp.server 8080'; ip netns del vm; ip link del virbr0; echo ok"
 $D rm -f "$N" >/dev/null
 # An engine in a user namespace (nested Docker, Sysbox, Coder, CI; #597),
 # where the kernel refuses mknod of a device: an image layer with a

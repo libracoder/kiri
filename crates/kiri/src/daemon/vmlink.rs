@@ -85,6 +85,10 @@ pub struct VmLink {
     /// (see `new`); only while the link lives.
     #[cfg(target_os = "linux")]
     _stop_conn: Arc<File>,
+    /// The agent's folder on a Linux host, where it leaves what `docker
+    /// info` should warn about (`host_warnings`).
+    #[cfg(target_os = "linux")]
+    agent_dir: std::path::PathBuf,
 }
 
 impl std::fmt::Debug for VmLink {
@@ -332,6 +336,8 @@ impl VmLink {
         Ok(VmLink {
             #[cfg(target_os = "linux")]
             _stop_conn: stop_conn,
+            #[cfg(target_os = "linux")]
+            agent_dir: vm.agent_dir().to_owned(),
             writer: Mutex::new(Writer { conn, out: Vec::with_capacity(4096), blob: vec![0; 256 * 1024] }),
             pending,
             windows,
@@ -663,6 +669,18 @@ impl VmLink {
             Reply::Stats(s) => Ok(s),
             other => Err(io::Error::other(format!("expected Stats, got {other:?}"))),
         }
+    }
+
+    /// What the agent on a Linux host found wrong with the host for `docker
+    /// info`: a firewall that drops the containers' traffic and that Kiri
+    /// may not change (an nftables.conf's chain), with the rules that let
+    /// them through. A VM has no host firewall to warn about.
+    pub fn host_warnings(&self) -> Vec<String> {
+        #[cfg(target_os = "linux")]
+        if let Ok(text) = std::fs::read_to_string(self.agent_dir.join("firewall-warnings")) {
+            return text.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect();
+        }
+        Vec::new()
     }
 
     /// Asks the guest to power off. The VM itself is released when the link drops.

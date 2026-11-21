@@ -121,3 +121,11 @@ buildx-bootstrap-loop	#83	about one buildx docker-container bootstrap in six fai
 taken-default-bridge-moves	#489	the default bridge kept a subnet Docker's docker0 had taken while Kiri was stopped, so its containers could not reach their gateway
 taken-pool-network-moves	#489	a network made without --subnet kept a subnet another engine's bridge had taken since, so its containers could not reach their gateway
 taken-user-subnet-refused	#489	a network whose --subnet another engine's bridge holds started containers that could not reach their gateway, with no word why
+fwdrop-internet	#247	a FORWARD policy of drop without Docker (set by hand or by ufw) dropped every container's traffic, though Kiri's own table accepted it
+fwdrop-user-network	#247	the same on a user-defined network (kiri1, kiri2, ...), not only the default bridge
+fwdrop-rules	#247	Kiri's rules at the top of FORWARD, for IPv4 and IPv6, when nothing else lets its containers through
+fwdrop-kept-apart	#247	letting Kiri's containers through the host's firewall must not let them into another program's bridge
+fwdrop-ufw-internet	#247	ufw turned on while the engine runs (its FORWARD policy drop) dropped every container's traffic
+fwdrop-ufw-reload	#247	Kiri's rules must survive ufw reload
+fwdrop-nft-warns	#247	an nftables chain of the administrator's own with policy drop: docker info says which rules let Kiri's containers through
+fwdrop-flush-rebuilt	#247	a flush of the whole ruleset (nftables.service) took Kiri's table, so containers had no NAT and no forward filter until the engine restarted

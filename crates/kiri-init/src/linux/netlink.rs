@@ -169,6 +169,68 @@ impl Netlink {
         }
         Ok(())
     }
+
+    /// Sends one dump request and hands each answer's payload (after the
+    /// netlink header) to `each`, until the kernel says it is done.
+    pub fn dump(&mut self, msg: &mut Msg, mut each: impl FnMut(&[u8])) -> io::Result<()> {
+        let seq = self.seq;
+        self.seq += 1;
+        let out = msg.finish(seq);
+        // SAFETY: sending a buffer we own on a socket we own (to the kernel).
+        sys::check(unsafe { libc::send(self.fd.as_raw_fd(), out.as_ptr().cast(), out.len(), 0) } as _, "netlink send")?;
+        // A dump's parts can be larger than an acknowledgement buffer.
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            // SAFETY: receiving into a buffer we own.
+            let n = sys::check(unsafe { libc::recv(self.fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0) } as _, "netlink recv")? as usize;
+            let mut off = 0;
+            while off + 16 <= n {
+                let len = u32::from_ne_bytes(buf[off..off + 4].try_into().expect("4")) as usize;
+                let ty = u16::from_ne_bytes(buf[off + 4..off + 6].try_into().expect("2"));
+                let got = u32::from_ne_bytes(buf[off + 8..off + 12].try_into().expect("4"));
+                if len < 16 || off + len > n {
+                    break;
+                }
+                if got == seq {
+                    match ty {
+                        NLMSG_DONE => return Ok(()),
+                        NLMSG_ERROR => {
+                            let code = i32::from_ne_bytes(buf[off + 16..off + 20].try_into().expect("4"));
+                            return if code == 0 { Ok(()) } else { Err(io::Error::from_raw_os_error(-code)) };
+                        }
+                        _ => each(&buf[off + 16..off + len]),
+                    }
+                }
+                off += (len + 3) & !3;
+            }
+        }
+    }
+}
+
+/// The attributes in `b`, as (type without its flag bits, payload).
+fn attrs(mut b: &[u8]) -> impl Iterator<Item = (u16, &[u8])> {
+    std::iter::from_fn(move || {
+        if b.len() < 4 {
+            return None;
+        }
+        let len = u16::from_ne_bytes([b[0], b[1]]) as usize;
+        let ty = u16::from_ne_bytes([b[2], b[3]]) & 0x3fff;
+        if len < 4 || len > b.len() {
+            return None;
+        }
+        let data = &b[4..len];
+        b = &b[((len + 3) & !3).min(b.len())..];
+        Some((ty, data))
+    })
+}
+
+/// A NUL-terminated netlink string.
+fn nl_str(b: &[u8]) -> String {
+    String::from_utf8_lossy(b.split(|&c| c == 0).next().unwrap_or_default()).into_owned()
+}
+
+fn be32(b: &[u8]) -> Option<u32> {
+    Some(u32::from_be_bytes(b.get(..4)?.try_into().ok()?))
 }
 
 /// `struct ifinfomsg`.
@@ -596,12 +658,33 @@ const CT_STATUS_DNAT: u32 = 1 << 5;
 /// and it passes. A container on two networks talks to each over its own
 /// interface there; a published port on another network is still reached
 /// through the host's address (ct status dnat), as with Docker.
-fn forward_filter(bridges: &[String]) -> Vec<Msg> {
-    forward_filter_in(libc::NFPROTO_IPV4 as u8, bridges)
+fn forward_filter(bridges: &[String], guard: Option<&str>) -> Vec<Msg> {
+    forward_filter_in(libc::NFPROTO_IPV4 as u8, bridges, guard)
+}
+
+/// While Kiri's bridges are in firewalld's trusted zone (`firewall.rs`),
+/// which accepts whatever they send, the uplinks (IPv4, IPv6) the forward
+/// filter lets new connections out through:
+///
+/// ```text
+///   iifname "kiri*" oifname != "kiri*" oifname != "<uplink>"
+///     ct state & (established|related) == 0 ct status & dnat == 0 drop
+/// ```
+///
+/// first in the chain. Kiri's containers then reach what the iptables rules
+/// let them reach where there is no firewalld (the internet through the
+/// uplink, published ports, replies), and not another program's bridge or
+/// network, which firewalld kept them from before.
+pub static FORWARD_GUARD: std::sync::Mutex<Option<(String, String)>> = std::sync::Mutex::new(None);
+
+/// `FORWARD_GUARD`'s uplink for `family`.
+fn forward_guard(family: u8) -> Option<String> {
+    FORWARD_GUARD.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|(up4, up6)| if family == libc::NFPROTO_IPV6 as u8 { up6.clone() } else { up4.clone() })
 }
 
 /// `forward_filter` for a table of `family`: the same rules hold for IPv6.
-fn forward_filter_in(family: u8, bridges: &[String]) -> Vec<Msg> {
+/// `guard`: the uplink, while `FORWARD_GUARD` holds one.
+fn forward_filter_in(family: u8, bridges: &[String], guard: Option<&str>) -> Vec<Msg> {
     let nft = |msg, flags| nft_in(family, msg, flags);
     let mut chain = nft(NFT_MSG_NEWCHAIN, NLM_F_ACK | NLM_F_CREATE);
     chain.attr_str(1, "kiri").attr_str(3, "forward");
@@ -646,12 +729,35 @@ fn forward_filter_in(family: u8, bridges: &[String]) -> Vec<Msg> {
         }
     };
     let (accept, drop) = (libc::NF_ACCEPT as u32, libc::NF_DROP as u32);
-    let mut msgs = vec![
-        chain,
+    let mut msgs = vec![chain];
+    if let Some(uplink) = guard {
+        let mut full = [0u8; 16];
+        let n = uplink.len().min(15);
+        full[..n].copy_from_slice(&uplink.as_bytes()[..n]);
+        // ct <key> & mask == 0
+        let ct_none = |r: &mut Msg, key: u32, mask: u32| {
+            r.nest(1).attr_str(1, "ct").nest(2).attr_be32(1, 1).attr_be32(2, key).end().end();
+            r.nest(1).attr_str(1, "bitwise").nest(2).attr_be32(1, 1).attr_be32(2, 1).attr_be32(3, 4);
+            r.nest(4).attr(1, &mask.to_ne_bytes()).end().nest(5).attr(1, &0u32.to_ne_bytes()).end().end().end();
+            r.nest(1).attr_str(1, "cmp").nest(2).attr_be32(1, 1).attr_be32(2, 0).nest(3).attr(1, &0u32.to_ne_bytes()).end().end().end();
+        };
+        msgs.push(rule(
+            &|r| {
+                ifname(6, 0)(r);
+                ifname(7, 1)(r);
+                r.nest(1).attr_str(1, "meta").nest(2).attr_be32(1, 1).attr_be32(2, 7).end().end();
+                r.nest(1).attr_str(1, "cmp").nest(2).attr_be32(1, 1).attr_be32(2, 1).nest(3).attr(1, &full).end().end().end();
+                ct_none(r, 0, CT_ESTABLISHED | CT_RELATED);
+                ct_none(r, 2, CT_STATUS_DNAT);
+            },
+            drop,
+        ));
+    }
+    msgs.extend([
         rule(&ifname(7, 1), accept),                           // NFT_CMP_NEQ
         rule(&ct_any(0, CT_ESTABLISHED | CT_RELATED), accept), // NFT_CT_STATE
         rule(&ct_any(2, CT_STATUS_DNAT), accept),              // NFT_CT_STATUS
-    ];
+    ]);
     msgs.extend(bridges.iter().map(|b| rule(&same_bridge(b), accept)));
     msgs.push(rule(&|_| {}, drop));
     msgs
@@ -803,7 +909,7 @@ pub fn install_nat6(subnets: &[([u8; 16], u8)], bridges: &[String]) -> io::Resul
         msgs.push(table);
         msgs.push(chain);
         msgs.extend(subnets.iter().map(|(s, p)| masq6_rule(*s, *p)));
-        msgs.extend(forward_filter_in(v6, bridges));
+        msgs.extend(forward_filter_in(v6, bridges, forward_guard(v6).as_deref()));
     }
     msgs.push(end);
     nl.request(&mut msgs)
@@ -857,14 +963,78 @@ fn embedded_dns_batch(addr: [u8; 4], port: u16) -> Vec<Msg> {
     vec![begin, table, chain, flush, rule, end]
 }
 
-/// Whether `table` of `family` has a chain called `chain` (one GETCHAIN,
-/// answered with the chain or ENOENT).
-pub fn chain_exists(family: u8, table: &str, chain: &str) -> bool {
+const NLM_F_DUMP: u16 = 0x300;
+
+/// One nf_tables chain of any table, as `chains` lists it: iptables-nft's
+/// (`ip filter FORWARD`), firewalld's, an nftables.conf's, Kiri's own.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Chain {
+    /// NFPROTO_INET, _IPV4, _IPV6, …
+    pub family: u8,
+    pub table: String,
+    pub name: String,
+    pub handle: u64,
+    /// A base chain's hook (NF_INET_FORWARD is 2); None for a chain only
+    /// jumped to.
+    pub hook: Option<u32>,
+    /// A base chain's policy (NF_DROP is 0, NF_ACCEPT 1).
+    pub policy: Option<u32>,
+}
+
+/// Every chain of every nf_tables table, in one dump. A host without a
+/// firewall answers with Kiri's own few.
+pub fn chains() -> io::Result<Vec<Chain>> {
     const NFT_MSG_GETCHAIN: u16 = 4;
-    let Ok(mut nl) = Netlink::open(libc::NETLINK_NETFILTER) else { return false };
-    let mut get = nft_in(family, NFT_MSG_GETCHAIN, NLM_F_ACK);
-    get.attr_str(1, table).attr_str(3, chain); // NFTA_CHAIN_TABLE, NFTA_CHAIN_NAME
-    nl.request(&mut [get]).is_ok()
+    let mut nl = Netlink::open(libc::NETLINK_NETFILTER)?;
+    let mut get = nft_in(libc::AF_UNSPEC as u8, NFT_MSG_GETCHAIN, NLM_F_DUMP);
+    let mut out = Vec::new();
+    nl.dump(&mut get, |p| out.extend(parse_chain(p)))?;
+    Ok(out)
+}
+
+/// A NEWCHAIN message's payload: nfgenmsg, then NFTA_CHAIN_* attributes.
+fn parse_chain(p: &[u8]) -> Option<Chain> {
+    let mut c = Chain { family: *p.first()?, ..Chain::default() };
+    for (ty, data) in attrs(p.get(4..)?) {
+        match ty {
+            1 => c.table = nl_str(data),
+            2 => c.handle = u64::from_be_bytes(data.get(..8)?.try_into().ok()?),
+            3 => c.name = nl_str(data),
+            4 => c.hook = attrs(data).find(|(t, _)| *t == 1).and_then(|(_, d)| be32(d)), // NFTA_HOOK_HOOKNUM
+            5 => c.policy = be32(data),
+            _ => {}
+        }
+    }
+    Some(c)
+}
+
+/// How many rules of `chain` in `table` of `family` carry `needle`
+/// somewhere in their encoding (an interface name, a comment). A chain
+/// that is not there has none.
+pub fn rules_with(family: u8, table: &str, chain: &str, needle: &[u8]) -> io::Result<usize> {
+    const NFT_MSG_GETRULE: u16 = 7;
+    let mut nl = Netlink::open(libc::NETLINK_NETFILTER)?;
+    let mut get = nft_in(family, NFT_MSG_GETRULE, NLM_F_DUMP);
+    get.attr_str(1, table).attr_str(2, chain); // NFTA_RULE_TABLE, NFTA_RULE_CHAIN: the kernel dumps only those
+    let mut n = 0;
+    let r = nl.dump(&mut get, |p| {
+        // Checked here too, for a kernel that dumps every rule.
+        let mut ours = (false, false);
+        for (ty, data) in attrs(p.get(4..).unwrap_or_default()) {
+            match ty {
+                1 => ours.0 = nl_str(data) == table,
+                2 => ours.1 = nl_str(data) == chain,
+                _ => {}
+            }
+        }
+        if ours == (true, true) && p.windows(needle.len()).any(|w| w == needle) {
+            n += 1;
+        }
+    });
+    match r {
+        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => Ok(0),
+        r => r.map(|()| n),
+    }
 }
 
 /// A socket in nf_tables' multicast group (NFNLGRP_NFTABLES), readable
@@ -970,7 +1140,7 @@ pub fn install_nat_from(uplink_index: i32, host_addr: [u8; 4], host_port: u16, r
         // ports are DNATed here (prerouting for the LAN, output for the host
         // itself), the whole table rebuilt on every change, atomically.
         let mut msgs = vec![begin, add, delete, table, chain, rule];
-        msgs.extend(forward_filter(bridges));
+        msgs.extend(forward_filter(bridges, forward_guard(libc::NFPROTO_IPV4 as u8).as_deref()));
         msgs.extend(localnet_guard());
         msgs.push(nat_chain("prerouting", 0, -100));
         msgs.push(nat_chain("output", 3, -100));
@@ -988,7 +1158,7 @@ pub fn install_nat_from(uplink_index: i32, host_addr: [u8; 4], host_port: u16, r
     // The host's own connections (and `--network host` containers).
     let out_rule = redirect_rule("output", host_addr, host_port, false);
     let mut msgs = vec![begin, add, delete, table, chain, rule, pre, out, dns_redirect_rule(host_addr), pre_rule, out_rule];
-    msgs.extend(forward_filter(bridges));
+    msgs.extend(forward_filter(bridges, forward_guard(libc::NFPROTO_IPV4 as u8).as_deref()));
     msgs.extend(localnet_guard());
     msgs.push(host_relay_guard(host_port));
     for d in dnat.iter().filter(|d| !d.udp) {
@@ -1110,7 +1280,7 @@ mod tests {
 
     #[test]
     fn forward_keeps_networks_apart() {
-        let msgs = forward_filter(&["kiri1".to_owned(), "kiri22".to_owned()]);
+        let msgs = forward_filter(&["kiri1".to_owned(), "kiri22".to_owned()], None);
         assert_eq!(msgs.len(), 7);
         let rules = &msgs[1..];
         // Nothing from a bridge is accepted on the interface name alone: that
@@ -1146,6 +1316,32 @@ mod tests {
     }
 
     #[test]
+    fn with_firewalld_new_connections_leave_only_through_the_uplink() {
+        let bridges = ["kiri0".to_owned()];
+        let plain = forward_filter(&bridges, None);
+        let guarded = forward_filter(&bridges, Some("eth0"));
+        // One rule more, first: the chain is msgs[0].
+        assert_eq!(guarded.len(), plain.len() + 1);
+        let g = &guarded[1];
+        assert_eq!(names(g), ["meta", "cmp", "meta", "cmp", "meta", "cmp", "ct", "bitwise", "cmp", "ct", "bitwise", "cmp", "immediate"]);
+        let e = exprs(g);
+        // iifname "kiri*", oifname != "kiri*", oifname != "eth0"
+        assert_eq!(be32(get(&e[0].1, 2)), 6);
+        assert_eq!((be32(get(&e[1].1, 2)), get(&attrs(get(&e[1].1, 3)), 1)), (0, &b"kiri"[..]));
+        assert_eq!(be32(get(&e[2].1, 2)), 7);
+        assert_eq!((be32(get(&e[3].1, 2)), get(&attrs(get(&e[3].1, 3)), 1)), (1, &b"kiri"[..]));
+        let mut eth0 = [0u8; 16];
+        eth0[..4].copy_from_slice(b"eth0");
+        assert_eq!((be32(get(&e[5].1, 2)), get(&attrs(get(&e[5].1, 3)), 1)), (1, &eth0[..]));
+        // not a reply, not a published port
+        assert_eq!(be32(get(&e[6].1, 2)), 0, "ct state");
+        assert_eq!(be32(get(&e[9].1, 2)), 2, "ct status");
+        assert_eq!(verdict(g), libc::NF_DROP as u32);
+        // The rest is as without firewalld.
+        assert_eq!(guarded[2..].iter().map(|m| m.buf.len()).collect::<Vec<_>>(), plain[1..].iter().map(|m| m.buf.len()).collect::<Vec<_>>());
+    }
+
+    #[test]
     fn ipv6_masquerade_matches_the_network_by_source() {
         let subnet = [0xfd, 0, 0, 1, 0, 2, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0];
         let r = masq6_rule(subnet, 64);
@@ -1164,8 +1360,8 @@ mod tests {
         assert_eq!(get(&attrs(get(&e[1].1, 4)), 1)[..8], [255, 255, 255, 255, 255, 255, 255, 0xf8]);
         // the IPv6 forward filter is the IPv4 one in another family
         let bridges = ["kiri3".to_owned()];
-        let f = forward_filter_in(libc::NFPROTO_IPV6 as u8, &bridges);
-        assert_eq!(f.len(), forward_filter(&bridges).len());
+        let f = forward_filter_in(libc::NFPROTO_IPV6 as u8, &bridges, None);
+        assert_eq!(f.len(), forward_filter(&bridges, None).len());
         assert!(f[1..].iter().all(|m| !names(m).contains(&"fib".to_owned())), "no nft_fib_ipv6 needed");
         assert!(f.iter().all(|m| m.buf[16] == libc::NFPROTO_IPV6 as u8));
     }

@@ -143,6 +143,12 @@ impl Vm {
         Ok(Vm { dir, child, events, closing: Arc::new(AtomicBool::new(false)), retired: false, stopped })
     }
 
+    /// The folder of the agent's sockets, private to root, where it also
+    /// leaves notes for the engine.
+    pub fn agent_dir(&self) -> &Path {
+        &self.dir
+    }
+
     pub fn next_event(&self, timeout: Duration) -> Option<Event> {
         self.events.recv_timeout(timeout).ok()
     }

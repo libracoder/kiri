@@ -1189,6 +1189,12 @@ impl Engine {
         self.records_damage.lock().unwrap_or_else(|e| e.into_inner()).message(&self.records).into_iter().collect()
     }
 
+    /// What the agent found wrong with a Linux host, for `docker info`
+    /// (`VmLink::host_warnings`).
+    pub fn host_warnings(&self) -> Vec<String> {
+        self.awake().map(|vm| vm.host_warnings()).unwrap_or_default()
+    }
+
     /// Why unpacked layers may belong to images the image list lost, for
     /// `docker info`.
     pub fn image_damage(&self) -> Option<String> {
