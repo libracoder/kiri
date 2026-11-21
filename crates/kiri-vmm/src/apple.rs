@@ -40,6 +40,10 @@ pub struct Config {
     pub disk: Option<PathBuf>,
     /// The host folders a bind mount may name, shared over virtiofs.
     pub share: Option<Share>,
+    /// Share arm64 emulator binaries with the guest over virtiofs: (directory,
+    /// tag). An Intel Mac's guest is x86-64 and Rosetta for Linux exists only
+    /// on Apple silicon, so arm64 images run through qemu-user instead.
+    pub emulator: Option<(PathBuf, String)>,
     /// Share Rosetta with the guest over virtiofs under this tag, so it can
     /// run x86-64 Linux binaries. Ignored if Rosetta is not installed.
     pub rosetta_tag: Option<String>,
@@ -447,6 +451,24 @@ pub fn rosetta_installed() -> bool {
     false
 }
 
+/// A read-only virtiofs share of one host directory, under `tag`.
+fn directory_share(
+    dir: &std::path::Path,
+    tag: &str,
+) -> io::Result<Retained<VZVirtioFileSystemDeviceConfiguration>> {
+    let dir_url = url(dir)?;
+    // SAFETY: allocations and initialisers that take the objects they own and
+    // return them retained; `dir_url` outlives the calls.
+    let fs = unsafe {
+        let shared = VZSharedDirectory::initWithURL_readOnly(VZSharedDirectory::alloc(), &dir_url, false);
+        let share = VZSingleDirectoryShare::initWithDirectory(VZSingleDirectoryShare::alloc(), &shared);
+        let fs = VZVirtioFileSystemDeviceConfiguration::initWithTag(VZVirtioFileSystemDeviceConfiguration::alloc(), &NSString::from_str(tag));
+        fs.setShare(Some(&share));
+        fs
+    };
+    Ok(fs)
+}
+
 fn url(path: &std::path::Path) -> io::Result<Retained<NSURL>> {
     if !path.exists() {
         return Err(io::Error::new(io::ErrorKind::NotFound, format!("{} not found", path.display())));
@@ -532,6 +554,14 @@ fn build(cfg: Config, queue: &DispatchQueue, events: Sender<Event>) -> io::Resul
             let fs = VZVirtioFileSystemDeviceConfiguration::initWithTag(VZVirtioFileSystemDeviceConfiguration::alloc(), &NSString::from_str(&s.tag));
             fs.setShare(Some(&share));
             shares.push(Retained::into_super(fs));
+        }
+        // The Intel guest's arm64 emulator, shared in like Rosetta below. A
+        // directory that went missing costs arm64 images, not the VM.
+        if let Some((dir, tag)) = &cfg.emulator {
+            match directory_share(dir, tag) {
+                Ok(fs) => shares.push(Retained::into_super(fs)),
+                Err(e) => eprintln!("kiri-vmm: no arm64 emulator share ({e}); arm64 images will not run"),
+            }
         }
         // Rosetta for Linux exists only on Apple Silicon.
         #[cfg(target_arch = "aarch64")]
