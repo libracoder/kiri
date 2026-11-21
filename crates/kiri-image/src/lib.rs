@@ -9,10 +9,12 @@ mod connect;
 pub mod jsonfile;
 pub mod reference;
 pub mod registry;
+pub mod roots;
 pub mod store;
 pub mod tags;
 
 pub use cancel::Cancel;
+pub use connect::tls_config;
 pub use reference::Reference;
 pub use registry::{Client, Credentials, Platform, Progress, PushProgress, set_proxy_source};
 pub use store::{Image, Layer, RunConfig, Store};

@@ -11,7 +11,21 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
 tar = "0.4"
-ureq = { version = "3", default-features = false, features = ["rustls"] }
+ureq = { version = "3", default-features = false, features = ["rustls-no-provider"] }
+# HTTPS for container names: the same rustls and ring ureq already brings in.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# The system's root certificates (macOS keychain, Windows store, /etc/ssl),
+# merged with the bundled Mozilla set for registries, updates and Share (#303).
+# roots.rs is self-contained (rustls-pki-types, rustls-native-certs, the
+# bundled set only): kiri-win compiles it by path, without kiri-image.
+rustls-native-certs = "0.8"
+rustls-pki-types = "1"
+webpki-root-certs = "1"
+
+[dev-dependencies]
+# Tests build a self-signed CA and serve TLS on localhost to prove the store
+# accepts it.
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem", "crypto"] }
 
 [lints]
 workspace = true

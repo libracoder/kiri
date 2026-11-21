@@ -1,5 +1,9 @@
 //! The `kiri` command.
 
+// Share's roots, aliased at the crate root so its crate::roots::trusted()
+// resolves; kiri-win mounts the same file by #[path] instead.
+#[cfg(any(unix, windows))]
+use kiri_image::roots;
 use std::process::ExitCode;
 
 #[cfg(target_os = "macos")]

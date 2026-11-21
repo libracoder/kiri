@@ -49,6 +49,21 @@ pub(crate) fn connector_with(stall: Duration) -> impl Connector<(), Out = impl T
     ().chain(ConnectProxyConnector::default()).chain(HappyConnector { stall }).chain(RustlsConnector::default())
 }
 
+/// The TLS settings every ureq agent is built on: the merged roots
+/// (`trusted`, the system's store and the bundled set) and ring. ureq is
+/// built without its bundled roots or a default provider, so an agent
+/// without these fails its first https call.
+pub fn tls_config(roots: &[rustls_pki_types::CertificateDer<'static>]) -> ureq::tls::TlsConfig {
+    ureq::tls::TlsConfig::builder()
+        .root_certs(ureq::tls::RootCerts::Specific(Arc::new(
+            roots
+                .iter()
+                .map(|c| ureq::tls::Certificate::from_der(c.as_ref()).to_owned())
+                .collect::<Vec<_>>(),
+        )))
+        .unversioned_rustls_crypto_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .build()
+}
 /// The addresses in the order to try them: the family the resolver put
 /// first leads (it sorts by RFC 6724, so that is IPv6 where IPv6 looks
 /// usable), then the families take turns, each keeping its own order.
