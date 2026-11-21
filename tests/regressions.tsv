@@ -116,3 +116,5 @@ dockerfw-internet	#247	with Docker on the same Linux host its FORWARD policy dro
 dockerfw-rules	#247	Kiri's rules in Docker's DOCKER-USER chain, for IPv4 and IPv6, added when Docker's firewall appears while the engine runs
 dockerfw-docker-kept-apart	#247	letting Kiri's containers through Docker's firewall must not let them into a container on Docker's own bridge
 import-dir-mtime	#676	every directory of an image layer had the time Kiri unpacked it, not the layer's
+buildx-copy-then-start	#83	buildx's bootstrap failed with "connection reset by peer": the engine answered the copy into the new BuildKit container, then closed the connection without saying so, and the start sent next on it was lost
+buildx-bootstrap-loop	#83	about one buildx docker-container bootstrap in six failed at the BuildKit container's start with "connection reset by peer", leaving it created

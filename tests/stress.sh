@@ -28,6 +28,10 @@
 #                       without having looked.
 #   churn-beside-df     create, start, exec, rm and volume churn beside system
 #                       df loops: no command over its limit, none failed
+#   buildx-bootstrap-loop
+#                       buildx docker-container builders made, bootstrapped
+#                       and removed: every first bootstrap starts its BuildKit
+#                       container (#83; skipped without buildx)
 #
 # The engine is found as tests/e2e.sh finds it (DOCKER_CONTEXT, default
 # kiri); images come from KIRI_TEST_REGISTRY (tests/lib/images.sh). It only
@@ -370,6 +374,41 @@ if selected churn-beside-df; then
   which=$(awk '$4 == 1 || $2 != 0 {print $1 ($4 == 1 ? ":timeout" : ":exit" $2)}' "$WORK/d.log" | sort | uniq -c | awk '{printf "%s%s x%d", s, $2, $1; s=", "}')
   check churn-beside-df "$([ "$cmds" -gt 0 ] && [ "$over" = 0 ] && [ "$errs" = 0 ] && echo 1)" \
     "$cmds commands, $over over their limit, $errs failed${which:+ ($which)}; ${per}$dfm"
+fi
+
+# (e) buildx's docker-container builder made, bootstrapped and removed, round
+# after round, each with a fresh name: every first bootstrap must start its
+# BuildKit container, with no retry. Kiri 0.1.18 closed the connection after
+# the copy into the container without saying so, and the start sent next on
+# it failed with "connection reset by peer" in about one round in six (#83).
+if selected buildx-bootstrap-loop; then
+  N=$((20 * ROUNDS)) LIM=120
+  case_start buildx-bootstrap-loop "$N buildx create, bootstrap, rm rounds; $LIM s a bootstrap"
+  if ! docker buildx version >/dev/null 2>&1; then
+    SKIP=$((SKIP + 1)); echo "  skip: buildx not installed"
+  else
+    BK=$(kiri_image_remote moby/buildkit:buildx-stable-1)
+    : > "$WORK/e.log"; e_bad=0
+    for i in $(seq "$N"); do
+      b=$P-bx-$i
+      TM_OUT=$WORK/e.out tm 30 docker buildx create --name "$b" --driver docker-container --driver-opt default-load=true --driver-opt "image=$BK" "$DOCKER_CONTEXT" >/dev/null
+      : > "$WORK/e.out"
+      read -r rc ms to <<<"$(TM_OUT=$WORK/e.out tm $LIM docker buildx inspect "$b" --bootstrap)"
+      st=$(lim 20 "$D" container inspect "buildx_buildkit_${b}0" --format '{{.State.Status}}' 2>&1)
+      echo "$rc $ms $to $st" >> "$WORK/e.log"
+      if [ "$rc" != 0 ] || [ "$st" != running ]; then
+        e_bad=$((e_bad + 1))
+        [ "$e_bad" -le 3 ] && echo "  round $i: exit $rc, container $st: $(grep -i error "$WORK/e.out" | tail -1 | sed "s/$b/NAME/g")"
+      fi
+      tm 60 docker buildx rm -f "$b" >/dev/null
+      lim 20 "$D" rm -f "buildx_buildkit_${b}0" >/dev/null 2>&1
+      # A wedged engine: three bootstraps over their limit say enough.
+      [ "$(awk '$3 == 1' "$WORK/e.log" | wc -l)" -ge 3 ] && { echo "  stopped after 3 bootstraps over $LIM s"; break; }
+    done
+    ran=$(wc -l < "$WORK/e.log" | tr -d ' ')
+    check buildx-bootstrap-loop "$([ "$ran" = "$N" ] && [ "$e_bad" = 0 ] && echo 1)" \
+      "$ran bootstraps, $e_bad failed or left the container not running; bootstrap $(stats "$WORK/e.log" 2)"
+  fi
 fi
 
 printf '\n%d passed, %d failed, %d skipped in %d s\n' "$PASS" "$FAIL" "$SKIP" $((SECONDS - T_START))

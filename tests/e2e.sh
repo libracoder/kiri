@@ -264,6 +264,9 @@ t version-kiri-component "Kiri=" $D version --format '{{range .Server.Components
 for c in version cmd keepalive close follow follow-created timestamps exec endpoints copy-after-start; do
   t "testcontainers-$c" "ok $c" python3 "$(dirname "$0")/testcontainers-api.py" "$SOCK" "$c"
 done
+# buildx's bootstrap asks the same way: a chunked copy into the new BuildKit
+# container, then its start on that connection, which must get an answer (#83).
+t buildx-copy-then-start "ok buildx-bootstrap" python3 "$(dirname "$0")/testcontainers-api.py" "$SOCK" buildx-bootstrap
 # A request that asks for the close is answered, then closed: Docker.DotNet
 # reads a 204 to the end of the stream and hung until its timeout (#520, #479).
 # curl knows a 204 has no body and would not notice, so the probe sends the
