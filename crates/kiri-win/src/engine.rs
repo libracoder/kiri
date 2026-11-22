@@ -913,8 +913,8 @@ pub fn trf(en: &str, vars: &[(&str, &dyn std::fmt::Display)]) -> String {
     crate::lang::fill(tr(en), vars)
 }
 
-fn set_pref(name: &str, value: Value) {
-    if !matches!(name, "font" | "mono" | "scale" | "termH" | "termFs" | "termFont" | "domainsAsked" | "theme" | "accent" | "starAsked" | "updateAuto" | "lang" | "langAsked") {
+pub(crate) fn set_pref(name: &str, value: Value) {
+    if !matches!(name, "font" | "mono" | "scale" | "termH" | "termFs" | "termFont" | "domainsAsked" | "theme" | "accent" | "starAsked" | "updateAuto" | "lang" | "langAsked" | "webUi" | "webUiLan" | "webUiPort") {
         return;
     }
     let Some(path) = prefs_path() else { return };
@@ -1029,6 +1029,7 @@ pub fn on_message(msg: &str) {
                 fonts_event();
             });
             emit(json!({"type": "prefs", "prefs": prefs()}).to_string());
+            crate::webctl::autostart_if_wanted();
             // KIRI_STAR_PROMPT=1 shows the star card now, as on the Mac.
             if std::env::var_os("KIRI_STAR_PROMPT").is_some() {
                 emit(r#"{"type":"starprompt"}"#.to_owned());
@@ -1233,6 +1234,29 @@ pub fn on_message(msg: &str) {
         // Settings → Resources: WSL's CPUs and memory, in .wslconfig.
         "resources" => crate::wslconfig::resources(None),
         "setresources" => crate::wslconfig::resources(Some(c.value)),
+        "webui" => crate::webctl::emit_status(),
+        "webuistart" => {
+            let lan = c.value["lan"].as_bool().unwrap_or(prefs()["webUiLan"] == true);
+            let port = c.value["port"].as_u64().or_else(|| prefs()["webUiPort"].as_u64()).unwrap_or(7676) as u16;
+            std::thread::spawn(move || match crate::webctl::start(lan, port) {
+                Ok(()) => {
+                    emit(notice("ok", &tr("Web UI is on")));
+                    crate::webctl::emit_status();
+                }
+                Err(e) => {
+                    emit(notice("error", &e));
+                    crate::webctl::emit_status();
+                }
+            });
+        }
+        "webuistop" => {
+            std::thread::spawn(|| {
+                crate::webctl::stop();
+                emit(notice("ok", &tr("Web UI is off")));
+                crate::webctl::emit_status();
+            });
+        }
+        "webuiopen" => crate::webctl::open_browser(),
         "domains" => domains(c.value.as_bool().unwrap_or(false)),
         "routerports" => {
             std::thread::spawn(|| router_ports(None));

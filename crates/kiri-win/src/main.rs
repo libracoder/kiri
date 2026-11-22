@@ -34,6 +34,8 @@ mod dns;
 #[cfg(windows)]
 mod engine;
 #[cfg(windows)]
+mod webctl;
+#[cfg(windows)]
 mod pipe;
 #[cfg(windows)]
 mod serve;

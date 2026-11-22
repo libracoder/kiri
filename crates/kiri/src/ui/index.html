@@ -100,7 +100,7 @@ aside { background: var(--side); border-inline-end: 1px solid var(--line); displ
    under Windows' own title bar. */
 .strip { grid-column: 1 / -1; display: flex; align-items: center; gap: 2px; padding: 0 12px; background: var(--side); border-bottom: 1px solid var(--line); }
 .strip .lights { width: 74px; flex: none; }
-body.win .strip .lights, body.linux .strip .lights { display: none; }
+body.win .strip .lights, body.linux .strip .lights, body.web .strip .lights { display: none; }
 .strip .gap { width: 6px; flex: none; }
 .strip .drag { flex: 1; align-self: stretch; min-width: 24px; }
 .sb { width: 28px; height: 28px; display: grid; place-items: center; padding: 0; border: 0; border-radius: 6px; background: transparent; color: var(--muted);
@@ -2582,7 +2582,39 @@ tr.usb-more > td { padding: 0; background: var(--panel); }
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);
-const send = (cmd, extra = {}) => window.webkit?.messageHandlers?.kiri?.postMessage(JSON.stringify({ cmd, ...extra }));
+/* Native window: webkit message handler. Browser (`kiri ui --web`): the same
+   JSON over a WebSocket to the local server. */
+const WEB = !!window.KIRI_WEB;
+const wsQueue = [];
+let kiriWs = null;
+function ensureWs() {
+  if (kiriWs) return kiriWs;
+  const token = new URLSearchParams(location.search).get("token") || "";
+  const ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws?token=${encodeURIComponent(token)}`);
+  kiriWs = ws;
+  ws.onmessage = (ev) => {
+    let e;
+    try { e = JSON.parse(ev.data); } catch { return; }
+    if (e.type === "eval" && e.js) { try { (0, eval)(e.js); } catch { /* host JS */ } return; }
+    if (e.type === "clipboard" && e.text != null) { try { navigator.clipboard?.writeText(String(e.text)); } catch { /* */ } return; }
+    if (e.type === "clipboardask") {
+      try {
+        navigator.clipboard?.readText().then((text) => window.kiri?.on({ type: "term", ev: "paste", id: e.id, text: text || "" })).catch(() => {});
+      } catch { /* */ }
+      return;
+    }
+    window.kiri?.on(e);
+  };
+  ws.onclose = () => { kiriWs = null; };
+  ws.onopen = () => { while (wsQueue.length) ws.send(wsQueue.shift()); };
+  return ws;
+}
+if (WEB) ensureWs();
+const send = (cmd, extra = {}) => {
+  const msg = JSON.stringify({ cmd, ...extra });
+  if (window.webkit?.messageHandlers?.kiri) window.webkit.messageHandlers.kiri.postMessage(msg);
+  else if (WEB) { const ws = ensureWs(); if (ws.readyState === 1) ws.send(msg); else wsQueue.push(msg); }
+};
 /* The window's language. Every word a person reads goes through tr(): the
    English text is the key, and lang/<tag>.json (spliced in by assemble.rs)
    maps it to the language picked in Settings → Appearance, or the system's
@@ -4367,6 +4399,36 @@ function buildsPane() {
   </div>`;
 }
 
+/* Settings → Web UI: the same page in a browser on localhost (or the LAN). */
+function webUiPane() {
+  const w = ui.webui;
+  if (!w) return `<div class="pane"><h3>${tr("Web UI")}</h3><p class="muted">${tr("Loading…")}</p></div>`;
+  if (w.here) {
+    return `<div class="pane"><h3>${tr("Web UI")}</h3>
+      <div class="pref"><span class="t">${tr("You're using the web UI")}</span><span class="d">${tr("This browser tab is the web UI. Turn it off from Settings in the Kiri app, or stop the process that printed the URL.")}</span></div>
+      ${w.url ? `<div class="pref"><span class="t">${tr("Address")}</span><span class="d mono">${esc(w.url)}</span><span class="pact">${copyBtn(w.url, "URL")}</span></div>` : ""}
+    </div>`;
+  }
+  const on = !!w.on, lan = !!(ui.webUiDraft?.lan ?? w.lan), port = +(ui.webUiDraft?.port ?? w.port ?? 7676);
+  const d = on
+    ? tr("On: the same window in a browser at the address below. A one-time token keeps the port from being an open Docker API.")
+    : tr("Off: open Kiri only as the app. Turn this on to use the same page in a browser on this computer, or on the LAN.");
+  return `<div class="pane"><h3>${tr("Web UI")}</h3>
+    <div class="pref"><span class="t">${on ? tr("On") : tr("Off")}</span><span class="d">${d}</span>
+      <div class="seg" role="group" aria-label="${tr("Web UI")}"><button data-webui="0" aria-pressed="${!on}">${tr("Off")}</button><button data-webui="1" aria-pressed="${on}">${tr("On")}</button></div></div>
+    <div class="pref"><span class="t">${tr("Allow on LAN")}</span><span class="d">${lan
+      ? tr("On: other devices on your network can open the URL. Only share it with people you trust.")
+      : tr("Off: only this computer can open it (127.0.0.1).")}</span>
+      <div class="seg" role="group" aria-label="${tr("Allow on LAN")}"><button data-webuilan="0" aria-pressed="${!lan}">${tr("Off")}</button><button data-webuilan="1" aria-pressed="${lan}">${tr("On")}</button></div></div>
+    <div class="pref"><span class="t">${tr("Port")}</span><span class="d">${tr("The local port the page listens on (default {port}).", { port: 7676 })}</span>
+      <input type="number" id="webui-port" min="1" max="65535" step="1" value="${port}" aria-label="${tr("Port")}"${on ? "" : ""} style="width:7rem"></div>
+    ${on && w.url ? `<div class="pref"><span class="t">${tr("Address")}</span><span class="d mono" title="${esc(w.url)}">${esc(w.url)}</span>
+      <span class="pact"><button class="btn sm" data-webuiopen>${tr("Open in browser")}</button>${copyBtn(w.url, "URL")}</span></div>` : ""}
+    <p class="muted">${tr("You can also run {cmd} in a terminal.", { cmd: `<span class="mono">kiri ui --web${lan ? " --lan" : ""}</span>` })}</p>
+  </div>`;
+}
+/* i18n */ void [tr("Web UI"), tr("You're using the web UI"), tr("This browser tab is the web UI. Turn it off from Settings in the Kiri app, or stop the process that printed the URL."), tr("Address"), tr("Off: open Kiri only as the app. Turn this on to use the same page in a browser on this computer, or on the LAN."), tr("On: the same window in a browser at the address below. A one-time token keeps the port from being an open Docker API."), tr("Allow on LAN"), tr("On: other devices on your network can open the URL. Only share it with people you trust."), tr("Off: only this computer can open it (127.0.0.1)."), tr("Port"), tr("The local port the page listens on (default {port})."), tr("Open in browser"), tr("You can also run {cmd} in a terminal."), tr("Web UI is on"), tr("Web UI is off")];
+
 /* Settings → Network: the proxy for pulls and, if wanted, for containers. */
 function networkPane() {
   const p = ui.proxy;
@@ -4535,8 +4597,8 @@ function renderSettings() {
       <dt>${tr("Made by")}</dt><dd><a data-open-site="https://canestack.com">Canestack Labs</a></dd>
     </dl>
     <p class="muted">${tr("The name comes from the Igbo word ntakịrị, “small”.")}</p></div>`;
-  const html = `<div class="settings"><div class="tabs">${tab("appearance", "textaa", tr("Appearance"))}${tab("resources", "stack", tr("Resources"))}${tab("network", "globe", tr("Network"))}${tab("builds", "hammer", tr("Builds"))}${loginsOn() ? tab("registries", "lock", tr("Registries")) : ""}${tab("kubernetes", "pods", "Kubernetes")}${tab("import", "stack", tr("Import"))}${tab("domains", "network", tr("Domains"))}${tab("diagnostics", "bug", tr("Diagnostics"))}${tab("about", "info", tr("About"))}</div>
-    ${prefs.tab === "diagnostics" ? diagPane() : prefs.tab === "about" ? aboutPane : prefs.tab === "domains" ? domainsPane : prefs.tab === "resources" ? `<div class="panes">${enginePane()}${resourcesPane()}</div>` : prefs.tab === "network" ? networkPane() : prefs.tab === "builds" ? buildsPane() : prefs.tab === "registries" && loginsOn() ? registriesPane() : prefs.tab === "kubernetes" ? kubernetesPane() : prefs.tab === "import" ? importPane() : appearance}</div>`;
+  const html = `<div class="settings"><div class="tabs">${tab("appearance", "textaa", tr("Appearance"))}${tab("resources", "stack", tr("Resources"))}${tab("network", "globe", tr("Network"))}${tab("builds", "hammer", tr("Builds"))}${loginsOn() ? tab("registries", "lock", tr("Registries")) : ""}${tab("kubernetes", "pods", "Kubernetes")}${tab("import", "stack", tr("Import"))}${tab("domains", "network", tr("Domains"))}${tab("webui", "open", tr("Web UI"))}${tab("diagnostics", "bug", tr("Diagnostics"))}${tab("about", "info", tr("About"))}</div>
+    ${prefs.tab === "diagnostics" ? diagPane() : prefs.tab === "about" ? aboutPane : prefs.tab === "domains" ? domainsPane : prefs.tab === "webui" ? webUiPane() : prefs.tab === "resources" ? `<div class="panes">${enginePane()}${resourcesPane()}</div>` : prefs.tab === "network" ? networkPane() : prefs.tab === "builds" ? buildsPane() : prefs.tab === "registries" && loginsOn() ? registriesPane() : prefs.tab === "kubernetes" ? kubernetesPane() : prefs.tab === "import" ? importPane() : appearance}</div>`;
   // The container lists arrive every few seconds; rebuilding an unchanged page
   // closes an open menu. The font menus list names in the interface font: an
   // option in its own font made WebKit load every installed font (438 here)
@@ -4573,6 +4635,12 @@ function renderSettings() {
   // A list left open over a page that's gone (another view) closes; over the page drawn again, it stays.
   if (langPopState.close) $("pref-lang-btn")?.setAttribute("aria-expanded", "true");
   $("pref-mono")?.addEventListener("change", (ev) => setPref("mono", ev.target.value));
+  $("webui-port")?.addEventListener("change", (ev) => {
+    const port = Math.max(1, Math.min(65535, +ev.target.value || 7676));
+    ui.webUiDraft = { ...(ui.webUiDraft || {}), port };
+    setPref("webUiPort", port);
+    if (ui.webui?.on) send("webuistart", { value: { lan: !!(ui.webUiDraft?.lan ?? ui.webui.lan), port } });
+  });
 }
 /* i18n */ void [tr("Blue"), tr("Purple"), tr("Orange"), tr("Teal"), tr("Pink"), tr("Green"), tr("Small"), tr("Medium"), tr("Large")];
 
@@ -4586,7 +4654,7 @@ function show(view) {
   if (view === "compose") { cmp.open = null; cmp.asked = 0; cmpAsk(); }
   if (view === "usb") usbPoll();
   if (view === "share") { send("shares"); send("shareusage"); shPoll(); }
-  if (view === "settings") { if (!fontLists.families.length) send("fonts"); send("about"); send("logins"); send("resources"); send("proxy"); send("routerports"); if (!ui.imp.sources) send("importsources"); if (prefs.tab === "diagnostics") diagOpen(); }
+  if (view === "settings") { if (!fontLists.families.length) send("fonts"); send("about"); send("logins"); send("resources"); send("proxy"); send("routerports"); send("webui"); if (!ui.imp.sources) send("importsources"); if (prefs.tab === "diagnostics") diagOpen(); }
   render();
   // From the top, as a container's or pod's page opens: leaving a page scrolled
   // down (a long Terminal or Logs tab) otherwise opened the next view below its rows.
@@ -8115,6 +8183,7 @@ window.kiri = {
       case "prefs": { const was = prefs.lang; Object.assign(prefs, e.prefs || {}); prefsIn = true; if (prefs.lang !== was) relang(); applyPrefs(); render(); paintEngine(); renderStatus(); break; }
       case "starprompt": starCard(tr("Kiri started your container.")); break;
       case "domains": ui.suffix = e.suffix; ui.domainsOn = e.on; ui.https = !!e.https; render(); break;
+      case "webui": ui.webui = e; ui.webUiDraft = { lan: !!e.lan, port: +(e.port || 7676) }; if (ui.view === "settings" && prefs.tab === "webui") render(); break;
       case "langpick": langPick(); break;
       case "welcome": welcome(); break;
       case "onboarding": onboarding(e); break;
@@ -8280,7 +8349,23 @@ $("content").addEventListener("click", (ev) => {
   else if ((el = t("[data-g]"))) projectAsk(el.dataset.project, el.dataset.g);
   else if ((el = t("[data-group]"))) toggleGroup(el);
   else if (composeClick(t)) {}
-  else if ((el = t("[data-stab]"))) { prefs.tab = el.dataset.stab; if (prefs.tab === "about") send("about"); if (prefs.tab === "builds") send("buildwith"); if (prefs.tab === "registries") send("logins"); if (prefs.tab === "diagnostics") diagOpen(); render(); }
+  else if ((el = t("[data-stab]"))) { prefs.tab = el.dataset.stab; if (prefs.tab === "about") send("about"); if (prefs.tab === "builds") send("buildwith"); if (prefs.tab === "registries") send("logins"); if (prefs.tab === "webui") send("webui"); if (prefs.tab === "diagnostics") diagOpen(); render(); }
+  else if ((el = t("[data-webui]"))) {
+    const on = !!+el.dataset.webui;
+    if (on === !!ui.webui?.on) return;
+    if (on) {
+      const lan = !!(ui.webUiDraft?.lan ?? ui.webui?.lan), port = +(ui.webUiDraft?.port ?? ui.webui?.port ?? 7676);
+      send("webuistart", { value: { lan, port } });
+    } else send("webuistop");
+  }
+  else if ((el = t("[data-webuilan]"))) {
+    const lan = !!+el.dataset.webuilan;
+    ui.webUiDraft = { ...(ui.webUiDraft || {}), lan };
+    setPref("webUiLan", lan);
+    if (ui.webui?.on) send("webuistart", { value: { lan, port: +(ui.webUiDraft?.port ?? ui.webui.port ?? 7676) } });
+    else render();
+  }
+  else if (t("[data-webuiopen]")) send("webuiopen");
   else if (diagClick(t)) {}
   else if ((el = t("[data-scale]"))) setPref("scale", +el.dataset.scale);
   else if ((el = t("[data-logsize]"))) setPref("logSize", +el.dataset.logsize);
@@ -9188,6 +9273,7 @@ document.addEventListener("keydown", (ev) => {
 });
 document.body.classList.toggle("win", WIN);
 document.body.classList.toggle("linux", LINUX);
+document.body.classList.toggle("web", WEB);
 $("vm-name").textContent = tr(VM);
 /* i18n */ void [tr("Linux VM"), tr("Engine")];
 // The live dots' beat: every 4 s while the window is in use and something

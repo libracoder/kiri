@@ -1,4 +1,5 @@
-//! `kiri ui`: a tiny native window over `kiri daemon`.
+//! `kiri ui`: a tiny native window over `kiri daemon`, or the same page in a
+//! browser (`kiri ui --web`).
 //!
 //! The system's own WebKit in a native window: AppKit through objc2 on the
 //! Mac (`mac.rs`), GTK on Linux (`gtk.rs`). No UI framework and no bundled
@@ -6,6 +7,8 @@
 //! with hand-written CSS. It sends JSON commands with
 //! `webkit.messageHandlers.kiri.postMessage('{"cmd":"start"}')`, and the
 //! engine thread pushes JSON events back with `kiri.on({...})`.
+//! [`web`] serves that page over HTTP and carries the same JSON on a
+//! WebSocket, so localhost or LAN browsers match the desktop window.
 
 use std::fmt::Write as _;
 use std::io;
@@ -50,6 +53,8 @@ mod weblogin;
 mod needs;
 mod sharing;
 mod usage;
+mod web;
+mod webctl;
 
 use crate::client;
 use crate::diag;
@@ -181,7 +186,34 @@ fn local_url(c: &serde_json::Value) -> Option<String> {
 
 /// Delivers one JSON event to the page. Callable from any thread.
 fn emit(json: String) {
+    if web::serving() {
+        web::broadcast(&json);
+        return;
+    }
     window::eval(format!("window.kiri && kiri.on({json})"));
+}
+
+/// Runs JavaScript in the page (native window) or as a WebSocket `eval` event.
+fn host_eval(js: String) {
+    if web::serving() {
+        web::eval(&js);
+    } else {
+        window::eval(js);
+    }
+}
+
+fn host_copy(text: &str) {
+    if web::serving() {
+        web::copy(text);
+    } else {
+        window::copy(text);
+    }
+}
+
+/// `kiri ui --web …`: the same page in a browser on localhost or the LAN.
+pub fn run_web(args: &[String]) -> io::Result<()> {
+    let opts = web::parse_opts(args).map_err(io::Error::other)?;
+    web::run(opts)
 }
 
 fn state(name: &str, error: Option<&str>) -> String {
@@ -508,7 +540,7 @@ fn trf(en: &str, vars: &[(&str, &dyn std::fmt::Display)]) -> String {
 }
 
 fn set_pref(name: &str, value: serde_json::Value) {
-    if !matches!(name, "font" | "mono" | "scale" | "termH" | "termFs" | "termFont" | "domainsAsked" | "theme" | "accent" | "importSeen" | "updateAuto" | "updateSkip" | "updateSnoozeUntil" | "columnWidths" | "crashReports" | "ctxSnooze" | "ctxBack" | "logSize" | "starAsked" | "setupSkip" | "lang" | "langAsked") {
+    if !matches!(name, "font" | "mono" | "scale" | "termH" | "termFs" | "termFont" | "domainsAsked" | "theme" | "accent" | "importSeen" | "updateAuto" | "updateSkip" | "updateSnoozeUntil" | "columnWidths" | "crashReports" | "ctxSnooze" | "ctxBack" | "logSize" | "starAsked" | "setupSkip" | "lang" | "langAsked" | "webUi" | "webUiLan" | "webUiPort") {
         return;
     }
     let Some(path) = prefs_path() else { return };
@@ -532,7 +564,7 @@ fn set_pref(name: &str, value: serde_json::Value) {
     if std::fs::write(&tmp, all.to_string()).and_then(|()| std::fs::rename(&tmp, &path)).is_err() {
         emit(notice("error", &tr("Could not save the setting to ~/.kiri/ui.json")));
     }
-    if name == "lang" {
+    if name == "lang" && !web::serving() {
         window::relang();
     }
 }
@@ -782,6 +814,9 @@ fn update_restart() {
                 diag::error!("the engine did not restart on the update", version = version, error = e);
             }
             reopen_after_exit();
+            if web::serving() {
+                std::process::exit(0);
+            }
             window::quit();
         }
         Err(e) => emit(serde_json::json!({"type": "updateerror", "error": e.to_string()}).to_string()),
@@ -1582,7 +1617,7 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
             Ok(())
         }
         "setpref" => {
-            if msg.name == "theme" {
+            if msg.name == "theme" && !web::serving() {
                 window::set_appearance(msg.value.as_str().unwrap_or("system"));
             }
             set_pref(&msg.name, msg.value);
@@ -1592,11 +1627,45 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
         // which the page adds and shows if it's the one picked.
         "langwords" => {
             if let Some(js) = lang::words_js(&msg.name) {
-                window::eval(js);
+                host_eval(js);
             }
             Ok(())
         }
         "about" => tx.send(Cmd::About),
+        // Settings → Web UI: status, start/stop a `kiri ui --web` child, open the URL.
+        "webui" => {
+            webctl::emit_status();
+            Ok(())
+        }
+        "webuistart" => {
+            let lan = msg.value["lan"].as_bool().unwrap_or(prefs()["webUiLan"] == true);
+            let port = msg.value["port"].as_u64().or_else(|| prefs()["webUiPort"].as_u64()).unwrap_or(u64::from(web::DEFAULT_PORT)) as u16;
+            std::thread::spawn(move || {
+                match webctl::start(lan, port) {
+                    Ok(()) => {
+                        emit(notice("ok", &tr("Web UI is on")));
+                        webctl::emit_status();
+                    }
+                    Err(e) => {
+                        emit(notice("error", &e));
+                        webctl::emit_status();
+                    }
+                }
+            });
+            Ok(())
+        }
+        "webuistop" => {
+            std::thread::spawn(|| {
+                webctl::stop();
+                emit(notice("ok", &tr("Web UI is off")));
+                webctl::emit_status();
+            });
+            Ok(())
+        }
+        "webuiopen" => {
+            webctl::open_browser();
+            Ok(())
+        }
         "domains" => tx.send(Cmd::Domains(msg.value.as_bool().unwrap_or(false))),
         // Settings → Domains → HTTPS: macOS asks for the password.
         "https" => {
@@ -1772,12 +1841,16 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
                 // A selection can be a whole screen of output.
                 "copy" => {
                     if let Some(text) = msg.value.as_str().filter(|t| !t.is_empty() && t.len() <= termwire::COPY_MAX) {
-                        window::copy(text);
+                        host_copy(text);
                     }
                 }
                 "paste" => {
                     let id = msg.id;
-                    window::paste(move |text| emit(termwire::paste(&id, &text)));
+                    if web::serving() {
+                        web::paste(&id);
+                    } else {
+                        window::paste(move |text| emit(termwire::paste(&id, &text)));
+                    }
                 }
                 // A link in a shell's output: web pages only, never a file or an app's scheme.
                 "link" => {
@@ -1792,7 +1865,7 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
         // The page can't write the clipboard itself; IDs and short text only.
         "copy" => {
             if !msg.name.is_empty() && msg.name.len() <= 4096 {
-                window::copy(&msg.name);
+                host_copy(&msg.name);
             }
             Ok(())
         }
@@ -2005,7 +2078,16 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
         // Open a compose file…: the system's own dialog, on the window's
         // thread; the path it gives stays here, the page gets the project.
         "composeopen" => {
-            window::pick_compose_file(&tr("Open a compose file"), &[tr("Compose files"), tr("YAML files")], |path| compose::picked(path, compose_cli, compose_store, emit));
+            if web::serving() {
+                // No system file dialog in the browser: the page may send a path.
+                if !msg.path.is_empty() {
+                    compose::picked(Some(std::path::PathBuf::from(msg.path)), compose_cli, compose_store, emit);
+                } else {
+                    emit(notice("error", "Open a compose file from the desktop window, or send a path"));
+                }
+            } else {
+                window::pick_compose_file(&tr("Open a compose file"), &[tr("Compose files"), tr("YAML files")], |path| compose::picked(path, compose_cli, compose_store, emit));
+            }
             Ok(())
         }
         // Before Run: what the image's start script won't start without.
@@ -2079,17 +2161,23 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
         // for a release that already happened, holding the window
         // until the next click.
         "drag" => {
-            window::drag();
+            if !web::serving() {
+                window::drag();
+            }
             Ok(())
         }
         // ⌘W when the built-in terminal doesn't have the focus.
         #[cfg(target_os = "macos")]
         "closewindow" => {
-            window::close_window();
+            if !web::serving() {
+                window::close_window();
+            }
             Ok(())
         }
         "zoom" => {
-            window::zoom();
+            if !web::serving() {
+                window::zoom();
+            }
             Ok(())
         }
         // Diagnostics, for the error Details and Settings → Diagnostics:
@@ -2176,6 +2264,8 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
                 emit(ev);
             }
             emit(serde_json::json!({"type": "prefs", "prefs": prefs()}).to_string());
+            // Settings → Web UI left on: start `kiri ui --web` again (or report one already up).
+            webctl::autostart_if_wanted();
             // KIRI_STAR_PROMPT=1 shows the star card now, asked before or not (for testing).
             if std::env::var_os("KIRI_STAR_PROMPT").is_some() {
                 emit(r#"{"type":"starprompt"}"#.to_owned());

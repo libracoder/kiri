@@ -85,6 +85,7 @@ usage: kiri COMMAND          docker's commands, on Kiri: kiri run, ps, exec,
        kiri daemon
        kiri bridge [--socket PATH]   (WSL2: the end of kiri-win.exe)
        kiri ui [--start] [--view containers|images|volumes|networks]
+       kiri ui --web [--lan] [--host ADDR] [--port N] [--start] [--view …]
        kiri setup [--use] [--no-agent] | kiri setup --uninstall
        kiri build-with [docker|kiri]   which builder docker build uses
        kiri domains [set [--http N] [--https N] | reset]   the *.kiri.local routers' ports
@@ -180,6 +181,8 @@ fn main() -> ExitCode {
             setup::first_launch();
             ui::run(true, None)
         }
+        #[cfg(any(target_os = "macos", all(target_os = "linux", feature = "window")))]
+        Some("ui") if args.iter().any(|a| a == "--web") => ui::run_web(&args[1..]),
         #[cfg(any(target_os = "macos", all(target_os = "linux", feature = "window")))]
         Some("ui") => ui::run(
             args.iter().any(|a| a == "--start"),

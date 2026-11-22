@@ -192,6 +192,7 @@ Kiri's own commands:
 | `kiri diag logs \| report` | Logs, and a report file to send with a bug |
 | `kiri bench [--runs N] [--network none\|bridge]` | Measure container start on your machine |
 | `kiri ui` | Open the window |
+| `kiri ui --web [--lan]` | Same UI in a browser (also Settings → Web UI) |
 
 ---
 

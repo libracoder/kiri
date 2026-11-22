@@ -69,7 +69,10 @@ Apple silicon and Intel Macs (macOS 14+), Windows 10 and 11 (x86-64 and Arm, thr
   a command line (and "Open in Terminal" for a full shell) and its files
   (preview, Save to Downloads, Show in Finder); Settings for fonts, text
   size, the VM's CPUs and memory (`~/.kiri/vm.json`, used from the VM's
-  next start; `KIRI_CPUS` and `KIRI_MEMORY_MIB` override it) and local names
+  next start; `KIRI_CPUS` and `KIRI_MEMORY_MIB` override it) and local names.
+  The same page is also served in a browser: Settings → Web UI, or
+  `kiri ui --web` on localhost (port 7676), or `kiri ui --web --lan` on the
+  LAN; the URL carries a one-time token so the port is not an open Docker API
 - **Menu bar**: Kiri stays in the menu bar when its window closes, with the
   VM's state, running containers (click one to open it) and Start/Stop
 - **Kubernetes**: `kiri k8s start` — a single-node k3s cluster in one
