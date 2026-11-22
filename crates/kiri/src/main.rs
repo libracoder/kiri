@@ -84,6 +84,7 @@ usage: kiri COMMAND          docker's commands, on Kiri: kiri run, ps, exec,
        kiri start                 start Kiri after a Stop (the window's Start)
        kiri daemon
        kiri bridge [--socket PATH]   (WSL2: the end of kiri-win.exe)
+       kiri host-autostart on|off     (Linux: engine at login, leaves it running)
        kiri ui [--start] [--view containers|images|volumes|networks]
        kiri setup [--use] [--no-agent] | kiri setup --uninstall
        kiri build-with [docker|kiri]   which builder docker build uses
@@ -130,6 +131,9 @@ fn main() -> ExitCode {
             Ok(code) => return ExitCode::from(code),
             Err(e) => Err(e),
         },
+        // Linux: only the login setting; the running engine is not touched.
+        #[cfg(target_os = "linux")]
+        Some("host-autostart") => hostaccess::autostart(&args[1..]),
         #[cfg(unix)]
         Some("raw") => match args.get(1).map(String::as_str) {
             Some("run") => run::run(&args[2..]),

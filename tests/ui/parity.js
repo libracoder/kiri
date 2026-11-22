@@ -26,4 +26,7 @@ show("usb");
 for (const th of document.querySelectorAll("#content thead th")) { const h = th.textContent.trim(); if (h) items.push(`column usb: ${h}`); }
 show("settings");
 for (const b of document.querySelectorAll("[data-stab]")) items.push(`settings ${b.dataset.stab}`);
+prefs.tab = "resources";
+render();
+if (seen(document.querySelector("[data-autostart]"))) items.push("settings start at login switch");
 report(items.map((x) => "ITEM " + x));

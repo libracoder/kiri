@@ -66,6 +66,23 @@ pub fn run(args: &[String]) -> io::Result<u8> {
     }
 }
 
+/// `kiri host-autostart on|off`: only changes whether the `kiri` service is
+/// enabled at login. No `--now` and no restart, so the engine that is running
+/// now (and its containers) is left alone.
+pub fn autostart(args: &[String]) -> io::Result<()> {
+    let [state] = args else { return Err(io::Error::other("usage: kiri host-autostart on|off")) };
+    let action = match state.as_str() {
+        "on" => "enable",
+        "off" => "disable",
+        _ => return Err(io::Error::other("usage: kiri host-autostart on|off")),
+    };
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } != 0 {
+        return Err(io::Error::other("needs root: sudo kiri host-autostart on|off"));
+    }
+    must(Command::new("systemctl").args([action, "kiri"]), &format!("systemctl {action} kiri"))
+}
+
 /// The engine running and answering on its socket; with `restart`, a
 /// running one restarted (on the binary the package installed).
 fn engine(restart: bool) -> io::Result<()> {

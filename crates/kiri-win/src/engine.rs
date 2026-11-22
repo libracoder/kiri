@@ -835,6 +835,11 @@ fn domains_event() -> String {
     json!({"type": "domains", "on": on, "suffix": if on { "kiri.local" } else { "kiri.localhost" }, "https": false}).to_string()
 }
 
+/// Whether Kiri starts at sign-in (the HKCU Run value).
+fn autostart_event() -> String {
+    json!({"type": "autostart", "on": crate::setup::autostart_enabled()}).to_string()
+}
+
 /// Settings → Domains, or the welcome: adds or removes the DNS rule.
 fn domains(on: bool) {
     let _ = std::thread::Builder::new().name("kiri-domains".into()).spawn(move || {
@@ -1034,6 +1039,7 @@ pub fn on_message(msg: &str) {
                 emit(r#"{"type":"starprompt"}"#.to_owned());
             }
             emit(domains_event());
+            emit(autostart_event());
             emit(status_event());
             ask_language();
             // The first time, offer <name>.kiri.local, as the Mac does.
@@ -1234,6 +1240,19 @@ pub fn on_message(msg: &str) {
         "resources" => crate::wslconfig::resources(None),
         "setresources" => crate::wslconfig::resources(Some(c.value)),
         "domains" => domains(c.value.as_bool().unwrap_or(false)),
+        "autostart" => {
+            if c.value.is_boolean() {
+                let on = c.value.as_bool().unwrap_or(false);
+                std::thread::spawn(move || {
+                    if let Err(e) = crate::setup::set_autostart(on) {
+                        emit(notice("error", &trf("Could not save: {error}", &[("error", &e)])));
+                    }
+                    emit(autostart_event());
+                });
+            } else {
+                emit(autostart_event());
+            }
+        }
         "routerports" => {
             std::thread::spawn(|| router_ports(None));
         }

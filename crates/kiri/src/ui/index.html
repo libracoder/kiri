@@ -2780,7 +2780,7 @@ const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&
 
 const ui = { acting: new Map(), gacting: new Map(), running: new Set(), launched: new Map(), runWatch: new Map(), need: null, probed: new Map(), probing: new Set(), why: new Map(), startErr: {}, fixed: null, openTab: null, listening: new Map(), starting: new Map(), scans: new Map(), scanf: { sev: "", fix: false, own: false }, view: "containers", vm: "stopped", containers: [], images: [], volumes: [], networks: [], sort: { images: { key: "pulled", desc: true } }, filter: "", suffix: "kiri.localhost", collapsed: new Set(), res: null, resDraft: {}, proxy: null, pxDraft: {}, rports: null, rpDraft: {}, rpAt: 0,
   imp: { sources: null, source: null, inv: null, picked: { images: new Set(), volumes: new Set(), containers: new Set() }, steps: {}, running: false, summary: "" },
-  upd: null, engineStale: null, staleHidden: false,
+  upd: null, engineStale: null, staleHidden: false, autostartOn: false,
   // The Builds view: the list, the picked build and its detail, and how its steps show.
   bl: { items: null, error: "", sel: null, d: null, steps: "all", internal: false, open: new Set(), confirm: null, tab: "steps", layers: null, plat: null } };
 function resetPicks() { ui.imp.picked = { images: new Set(), volumes: new Set(), containers: new Set() }; ui.imp.steps = {}; ui.imp.summary = ""; }
@@ -4426,7 +4426,9 @@ function enginePane() {
   const busy = shown === "booting" || shown === "stopping";
   const btn = off ? `<button class="btn primary" data-vmpower="start"${busy ? " disabled" : ""}>${tr("Start engine")}</button>`
     : `<button class="btn" data-vmpower="stop"${busy ? " disabled" : ""}>${tr("Turn off engine")}</button>`;
-  return `<div class="pane"><h3>${tr(VM)}</h3><div class="pref"><span class="t">${vmLabels[shown] != null ? tr(vmLabels[shown]) : "—"}</span><span class="d">${d}</span><span class="pact">${btn}</span></div></div>`;
+  return `<div class="pane"><h3>${tr(VM)}</h3><div class="pref"><span class="t">${vmLabels[shown] != null ? tr(vmLabels[shown]) : "—"}</span><span class="d">${d}</span><span class="pact">${btn}</span></div>
+    <div class="pref"><span class="t">${tr("Starts at login")}</span>${ui.autostartOn ? `<span class="d">${tr("The engine starts when you log in")}</span>` : ""}
+      <div class="seg" role="group" aria-label="${tr("Starts at login")}"><button data-autostart="0" aria-pressed="${!ui.autostartOn}">${tr("Off")}</button><button data-autostart="1" aria-pressed="${!!ui.autostartOn}">${tr("On")}</button></div></div></div>`;
 }
 /* i18n */ void [tr("Off"), tr("Starting…"), tr("Running"), tr("Stopping…"), tr("Linux VM"), tr("Engine")];
 
@@ -8115,6 +8117,7 @@ window.kiri = {
       case "prefs": { const was = prefs.lang; Object.assign(prefs, e.prefs || {}); prefsIn = true; if (prefs.lang !== was) relang(); applyPrefs(); render(); paintEngine(); renderStatus(); break; }
       case "starprompt": starCard(tr("Kiri started your container.")); break;
       case "domains": ui.suffix = e.suffix; ui.domainsOn = e.on; ui.https = !!e.https; render(); break;
+      case "autostart": ui.autostartOn = !!e.on; render(); break;
       case "langpick": langPick(); break;
       case "welcome": welcome(); break;
       case "onboarding": onboarding(e); break;
@@ -8289,6 +8292,7 @@ $("content").addEventListener("click", (ev) => {
   else if (t("[data-buildprune]")) { ui.bwPruning = true; send("buildprune"); render(); }
   else if ((el = t("[data-bw]"))) { const v = el.dataset.bw; if (ui.bw && !ui.bw.error && (v !== ui.bw.with || (v === "kiri" && !ui.bw.taken))) { ui.bw = { ...ui.bw, with: v }; send("buildwith", { value: v }); render(); } }
   else if ((el = t("[data-domains]"))) { if (!!+el.dataset.domains !== !!ui.domainsOn) send("domains", { value: !!+el.dataset.domains }); }
+  else if ((el = t("[data-autostart]"))) { const on = el.dataset.autostart === "1"; if (on !== !!ui.autostartOn) { ui.autostartOn = on; render(); send("autostart", { value: on }); } }
   else if ((el = t("[data-open-site]"))) send("open", { name: el.dataset.openSite });
   else if ((el = t("[data-updcheck]"))) { ui.updState = { ...(ui.updState || {}), checking: true }; send("updatecheck"); render(); }
   else if ((el = t("[data-updauto]"))) setPref("updateAuto", el.dataset.updauto === "1");

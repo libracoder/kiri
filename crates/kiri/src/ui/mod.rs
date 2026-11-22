@@ -816,6 +816,11 @@ fn domains_event() -> String {
     serde_json::json!({"type": "domains", "on": on, "suffix": if on { "kiri.local" } else { "kiri.localhost" }, "https": crate::daemon::tls::trusted()}).to_string()
 }
 
+/// Settings: whether Kiri's engine is ready when the user signs in.
+fn autostart_event() -> String {
+    serde_json::json!({"type":"autostart","on":setup::autostart_enabled()}).to_string()
+}
+
 /// Settings → About: this build, and the engine as the daemon reports it.
 fn about() {
     let info = client::get("/info").unwrap_or(serde_json::Value::Null);
@@ -1588,6 +1593,22 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
             set_pref(&msg.name, msg.value);
             Ok(())
         }
+        // Settings → Resources: start when I sign in. Only the next login is
+        // affected: the engine running right now is left alone.
+        "autostart" => {
+            if msg.value.is_boolean() {
+                let on = msg.value.as_bool().unwrap_or(false);
+                std::thread::spawn(move || {
+                    if let Err(e) = setup::set_autostart(on) {
+                        emit(notice("error", &trf("Could not save: {error}", &[("error", &e)])));
+                    }
+                    emit(autostart_event());
+                });
+            } else {
+                emit(autostart_event());
+            }
+            Ok(())
+        }
         // A language the page doesn't carry yet (it opens with one): its words,
         // which the page adds and shows if it's the one picked.
         "langwords" => {
@@ -2186,6 +2207,7 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
                 setup_tools();
             }
             emit(domains_event());
+            emit(autostart_event());
             emit(status_event());
             // A crash since the window last opened, for the page to
             // offer a report; crash files go if the person allowed it.

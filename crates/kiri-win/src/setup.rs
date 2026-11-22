@@ -125,6 +125,38 @@ fn dir() -> PathBuf {
     std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("Kiri")).unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// The HKCU Run value that starts Kiri at sign-in.
+const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+
+/// Whether Kiri is set to start at sign-in.
+pub fn autostart_enabled() -> bool {
+    let Ok(out) = quiet("reg.exe").args(["query", RUN_KEY, "/v", "Kiri"]).output() else {
+        return false;
+    };
+    // A value we wrote always carries --background; don't be fooled by a
+    // different program's "Kiri" value under the same name.
+    out.status.success() && String::from_utf8_lossy(&out.stdout).contains("--background")
+}
+
+/// Set whether Kiri starts at sign-in. Only affects future sign-ins: it does
+/// not touch the tray/engine already running.
+pub fn set_autostart(on: bool) -> io::Result<()> {
+    let status = if on {
+        let exe = dir().join("kiri-win.exe");
+        if !exe.is_file() {
+            return Err(io::Error::other("kiri-win.exe is not installed"));
+        }
+        quiet("reg.exe").args(["add", RUN_KEY, "/v", "Kiri", "/t", "REG_SZ", "/d", &format!("\"{}\" --background", exe.display()), "/f"]).status()?
+    } else {
+        quiet("reg.exe").args(["delete", RUN_KEY, "/v", "Kiri", "/f"]).status()?
+    };
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!("reg.exe failed with {status}")))
+    }
+}
+
 fn saved() -> Saved {
     std::fs::read(dir().join("setup.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
 }
@@ -984,16 +1016,8 @@ fn finish() {
     s.last_error = None;
     save(&s);
     crate::serve::set_setup_pending(false);
-    let exe = dir().join("kiri-win.exe");
-    let run_key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
-    if autostart {
-        if exe.is_file() {
-            let _ = quiet("reg.exe").args(["add", run_key, "/v", "Kiri", "/t", "REG_SZ", "/d", &format!("\"{}\" --background", exe.display()), "/f"]).status();
-        } else {
-            crate::serve::log("not set to start at sign-in: kiri-win.exe is not installed");
-        }
-    } else {
-        let _ = quiet("reg.exe").args(["delete", run_key, "/v", "Kiri", "/f"]).status();
+    if let Err(e) = set_autostart(autostart) {
+        crate::serve::log(&format!("Kiri could not change whether it starts at sign-in: {e}"));
     }
     let _ = quiet("reg.exe").args(["delete", r"HKCU\Software\Microsoft\Windows\CurrentVersion\RunOnce", "/v", "KiriSetup", "/f"]).status();
     Handle.run(|ui| ui.navigate_main());

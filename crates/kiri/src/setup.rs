@@ -788,18 +788,12 @@ fn agent_plist() -> io::Result<PathBuf> {
     Ok(home()?.join("Library/LaunchAgents").join(format!("{AGENT}.plist")))
 }
 
-fn uid() -> u32 {
-    // SAFETY: getuid cannot fail.
-    unsafe { libc::getuid() }
-}
-
-/// A LaunchAgent for `kiri daemon`: started at login, restarted if it
-/// crashes, never restarted after a clean exit.
-fn agent() -> io::Result<PathBuf> {
-    let exe = std::env::current_exe()?.canonicalize()?;
-    let log = home()?.join(crate::flavor::STATE.get()).join("daemon.log");
+/// The LaunchAgent's XML. `Disabled` keeps the job installed but stops
+/// launchd starting it at the next login; the running daemon is unaffected.
+fn agent_plist_text(exe: &Path, log: &Path, disabled: bool) -> String {
     let esc = |p: &Path| p.to_string_lossy().replace('&', "&amp;").replace('<', "&lt;");
-    let plist = format!(
+    let disabled_key = if disabled { "  <key>Disabled</key><true/>\n" } else { "" };
+    format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -810,15 +804,24 @@ fn agent() -> io::Result<PathBuf> {
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
   <key>ProcessType</key><string>Interactive</string>
-  <key>StandardOutPath</key><string>{}</string>
+{disabled_key}  <key>StandardOutPath</key><string>{}</string>
   <key>StandardErrorPath</key><string>{}</string>
 </dict>
 </plist>
 "#,
-        esc(&exe),
-        esc(&log),
-        esc(&log)
-    );
+        esc(exe),
+        esc(log),
+        esc(log),
+        disabled_key = disabled_key
+    )
+}
+
+/// Writes the plist without loading or unloading the job. The file stays
+/// (even when disabled), so `first_launch()` still sees setup as complete.
+fn write_agent(disabled: bool) -> io::Result<PathBuf> {
+    let exe = std::env::current_exe()?.canonicalize()?;
+    let log = home()?.join(crate::flavor::STATE.get()).join("daemon.log");
+    let plist = agent_plist_text(&exe, &log, disabled);
     let path = agent_plist()?;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -827,6 +830,37 @@ fn agent() -> io::Result<PathBuf> {
         std::fs::create_dir_all(dir)?;
     }
     std::fs::write(&path, plist)?;
+    Ok(path)
+}
+
+/// Whether Kiri's engine is set to start when this user signs in. The plist
+/// is kept with `Disabled` when off, so setup is still marked complete.
+pub fn autostart_enabled() -> bool {
+    let Ok(path) = agent_plist() else { return false };
+    if !path.is_file() || !agent_runs_this().unwrap_or(false) {
+        return false;
+    }
+    match std::fs::read_to_string(path) {
+        Ok(text) => !text.contains("<key>Disabled</key><true/>"),
+        Err(_) => false,
+    }
+}
+
+/// Turns signing-in startup on or off without booting out the engine that is
+/// running now: launchd reads the plist at the next login.
+pub fn set_autostart(on: bool) -> io::Result<()> {
+    write_agent(!on).map(|_| ())
+}
+
+fn uid() -> u32 {
+    // SAFETY: getuid cannot fail.
+    unsafe { libc::getuid() }
+}
+
+/// A LaunchAgent for `kiri daemon`: started at login, restarted if it
+/// crashes, never restarted after a clean exit.
+fn agent() -> io::Result<PathBuf> {
+    let path = write_agent(false)?;
     // Reload, so a new path to the binary takes effect.
     let _ = Command::new("/bin/launchctl").args(["bootout", &format!("gui/{}/{AGENT}", uid())]).stderr(std::process::Stdio::null()).status();
     // bootout returns before launchd has let the old job go, and a
@@ -966,6 +1000,20 @@ fn uninstall() -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn agent_plist_disabled_key() {
+        use std::path::Path;
+        let exe = Path::new("/Applications/Kiri.app/Contents/MacOS/kiri");
+        let log = Path::new("/Users/me/Library/Application Support/Kiri/daemon.log");
+        let on = super::agent_plist_text(exe, log, false);
+        let off = super::agent_plist_text(exe, log, true);
+        assert!(!on.contains("<key>Disabled</key>"), "{on}");
+        assert!(off.contains("<key>Disabled</key><true/>"), "{off}");
+        assert_eq!(off.replace("  <key>Disabled</key><true/>\n", ""), on);
+        assert!(on.contains(&format!("<string>{}</string><string>daemon</string>", exe.display())), "{on}");
+        assert!(on.contains(&format!("<string>{}</string>", log.display())), "{on}");
+    }
+
     #[test]
     fn runs_apple_script() {
         super::apple_script("do shell script \"true\"").unwrap();

@@ -1,15 +1,16 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
  "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
-<!-- The password prompt the window's setup checklist shows on a Linux host:
+<!-- The password prompt the window shows on a Linux host:
      `pkexec /usr/bin/kiri host-access USER` starts Kiri's engine and lets USER
-     use it (crates/kiri/src/hostaccess.rs). -->
+     use it; `pkexec /usr/bin/kiri host-autostart on|off` changes whether the
+     engine starts at login (crates/kiri/src/hostaccess.rs). -->
 <policyconfig>
   <vendor>Kiri</vendor>
   <vendor_url>https://runkiri.com</vendor_url>
   <action id="dev.kiri.host-access">
     <description>Set up Kiri for an account</description>
-    <message>Kiri needs your password to start its engine and let your account run containers.</message>
+    <message>Kiri needs your password to start its engine, let your account run containers, or change whether it starts at login.</message>
     <icon_name>kiri</icon_name>
     <defaults>
       <allow_any>auth_admin</allow_any>

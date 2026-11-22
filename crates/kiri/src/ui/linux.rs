@@ -2,6 +2,37 @@
 //! does it: the package manager installs and updates Kiri, the engine is a
 //! system service, and there is no OrbStack to import from.
 
+use std::io;
+use std::process::{Command, Stdio};
+
+/// The package's command; pkexec wants a full path.
+const KIRI: &str = "/usr/bin/kiri";
+
+fn which(cmd: &str) -> Option<std::path::PathBuf> {
+    std::env::split_paths(&std::env::var_os("PATH")?).map(|d| d.join(cmd)).find(|p| p.is_file())
+}
+
+/// Changes only whether the `kiri` service starts at login, through the
+/// window's usual password prompt. The CLI uses `systemctl enable/disable`
+/// with no `--now`, so the engine running right now is left alone.
+pub(super) fn set_autostart(on: bool) -> io::Result<()> {
+    let state = if on { "on" } else { "off" };
+    if which("pkexec").is_none() {
+        return Err(io::Error::other(format!("this system has no pkexec to ask for your password: in a terminal, run  sudo kiri host-autostart {state}")));
+    }
+    let out = Command::new("pkexec").arg(KIRI).arg("host-autostart").arg(state).stdin(Stdio::null()).output()?;
+    match out.status.code() {
+        Some(0) => Ok(()),
+        // pkexec: 126 the dialog was dismissed or the password refused, 127 not allowed.
+        Some(126) | Some(127) => Err(io::Error::other("Not changed: the password prompt was cancelled")),
+        _ => {
+            let why = String::from_utf8_lossy(&out.stderr);
+            let why = why.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("kiri host-autostart failed").trim_start_matches("kiri: ");
+            Err(io::Error::other(why.to_owned()))
+        }
+    }
+}
+
 /// Why the window can't reach the engine, and what to do about it.
 pub fn engine_down() -> std::io::Error {
     let socket = std::path::Path::new(crate::client::SERVICE_SOCKET);
@@ -16,6 +47,7 @@ pub fn engine_down() -> std::io::Error {
 
 pub mod setup {
     use std::io;
+    use std::process::Command;
 
     /// The docker CLI comes from the distribution; nothing to set up after it.
     pub fn after_tools() -> io::Result<()> {
@@ -46,6 +78,41 @@ pub mod setup {
         }
         let out = std::process::Command::new("docker").args(["context", "use", name]).output()?;
         if out.status.success() { Ok(()) } else { Err(io::Error::other(String::from_utf8_lossy(&out.stderr).trim().to_owned())) }
+    }
+
+    /// Whether the `kiri` service is enabled at login (`systemctl is-enabled`).
+    pub fn autostart_enabled() -> bool {
+        match Command::new("systemctl").args(["is-enabled", "kiri"]).output() {
+            Ok(out) => autostart_enabled_from(&String::from_utf8_lossy(&out.stdout), out.status.success()),
+            Err(_) => false,
+        }
+    }
+
+    /// `systemctl is-enabled` prints a state starting with "enabled" only on
+    /// success: "disabled", "masked", "static" and failures all mean off.
+    fn autostart_enabled_from(stdout: &str, ok: bool) -> bool {
+        ok && stdout.trim_start().starts_with("enabled")
+    }
+
+    /// Changes the login setting through pkexec; the running engine is not
+    /// stopped, booted out or restarted.
+    pub fn set_autostart(on: bool) -> io::Result<()> {
+        super::set_autostart(on)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::autostart_enabled_from;
+
+        #[test]
+        fn is_enabled() {
+            assert!(autostart_enabled_from("enabled\n", true));
+            assert!(autostart_enabled_from("enabled-runtime\n", true));
+            assert!(!autostart_enabled_from("disabled\n", false));
+            assert!(!autostart_enabled_from("enabled\n", false));
+            assert!(!autostart_enabled_from("masked\n", true));
+            assert!(!autostart_enabled_from("", true));
+        }
     }
 }
 
@@ -157,9 +224,9 @@ pub mod onboarding {
     use std::path::Path;
     use std::process::{Command, Stdio};
 
+    use super::{KIRI, which};
+
     const SOCKET: &str = crate::client::SERVICE_SOCKET;
-    /// The package's command; pkexec wants a full path.
-    const KIRI: &str = "/usr/bin/kiri";
 
     /// Each check's state for the page: "ok", "no" (fix it), "bad" (broken:
     /// fix it), "off" (can't tell until an earlier one passes) or "restart"
@@ -327,10 +394,6 @@ pub mod onboarding {
             (!p.is_null()).then(|| std::ffi::CStr::from_ptr((*p).pw_name).to_string_lossy().into_owned())
         };
         from_uid.or_else(|| std::env::var("USER").ok()).unwrap_or_default()
-    }
-
-    fn which(cmd: &str) -> Option<std::path::PathBuf> {
-        std::env::split_paths(&std::env::var_os("PATH")?).map(|d| d.join(cmd)).find(|p| p.is_file())
     }
 
     /// Ends this session, so the next sign-in has the kiri group: the
