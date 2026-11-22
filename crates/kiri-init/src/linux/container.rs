@@ -553,7 +553,7 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
     // Small, short-lived files: kept in memory (/run is tmpfs), not on the data disk.
     let etc_dir = PathBuf::from("/run/kiri").join(spec.id);
     let embedded_dns = embedded_dns(spec, net.upstream_dns, net.dns.relay);
-    let nameserver = embedded_dns.then(|| embedded_address(spec));
+    let nameserver = embedded_dns.then(|| embedded_address(spec)).or_else(|| host_network_resolver(spec, net.dns));
     prepared.etc_files = write_etc_files(spec, &etc_dir, net.upstream_dns, nameserver).map_err(cleanup)?;
     prepared.mounts = parse_mounts(spec.mounts).map_err(cleanup)?;
     // A network namespace of its own gets Docker's two defaults: any port
@@ -1292,6 +1292,31 @@ fn write_etc_files(spec: &RunSpec<'_>, base: &std::path::Path, upstream: &[[u8; 
 /// servers (`--dns`).
 fn embedded_dns(spec: &RunSpec<'_>, upstream: &[[u8; 4]], relay: bool) -> bool {
     embedded_dns_if(spec, || relay || net::local_resolver(upstream))
+}
+
+/// In the VM, a `--network host` container's resolver: the agent's on the
+/// default bridge's gateway, which is one of the VM's own addresses, so the
+/// container reaches it. As the default bridge's containers do, its
+/// lookups then go through the Mac when the Mac's resolver for the VM
+/// network doesn't answer (dns.rs), where asking that resolver directly
+/// would just fail. Not on a Linux host (the container has the host's own
+/// resolv.conf), nor with `--dns`. None, the VM's upstream as before, when
+/// the default bridge has no address or the agent can't listen there.
+fn host_network_resolver(spec: &RunSpec<'_>, dns: &mut super::dns::Dns) -> Option<[u8; 4]> {
+    if !host_network_uses_agent(spec, dns.relay) {
+        return None;
+    }
+    let gateway = net::bridge_ipv4(DEFAULT_BRIDGE)?;
+    dns.serve_or_warn(DEFAULT_BRIDGE, gateway).then_some(gateway)
+}
+
+/// The default bridge, where the agent's resolver answers on the gateway.
+const DEFAULT_BRIDGE: &str = "kiri0";
+
+/// Whether a container's lookups go to the agent's resolver on the default
+/// bridge because it shares the VM's own network (see `host_network_resolver`).
+fn host_network_uses_agent(spec: &RunSpec<'_>, relay: bool) -> bool {
+    relay && spec.flags & run_flags::NET_HOST != 0 && net_opts::values(spec.net.opts, net_opts::NAMESERVER).next().is_none()
 }
 
 /// `embedded_dns`, with `through_agent` saying whether the default bridge's
@@ -3328,7 +3353,14 @@ mod tests {
         let gateway = [[192, 168, 64, 1]];
         spec_with(0, &[], &|s| assert!(super::embedded_dns(s, &gateway, true), "so a refused gateway can fall back to the host"));
         spec_with(0, &["nameserver=8.8.8.8"], &|s| assert!(!super::embedded_dns(s, &gateway, true), "--dns servers are asked directly"));
-        spec_with(run_flags::NET_HOST, &[], &|s| assert!(!super::embedded_dns(s, &gateway, true), "host networking keeps the VM's resolv.conf"));
+        spec_with(run_flags::NET_HOST, &[], &|s| assert!(!super::embedded_dns(s, &gateway, true), "host networking has no embedded DNS of its own"));
+        // In the VM a host-network container asks the agent on the default
+        // bridge's gateway, so a refused gateway resolver falls back to the
+        // Mac too (#732); not with --dns, nor on a Linux host (no relay).
+        spec_with(run_flags::NET_HOST, &[], &|s| assert!(super::host_network_uses_agent(s, true)));
+        spec_with(run_flags::NET_HOST, &["nameserver=8.8.8.8"], &|s| assert!(!super::host_network_uses_agent(s, true), "--dns servers are asked directly"));
+        spec_with(run_flags::NET_HOST, &[], &|s| assert!(!super::host_network_uses_agent(s, false), "a Linux host keeps its own resolv.conf"));
+        spec_with(0, &[], &|s| assert!(!super::host_network_uses_agent(s, true), "a bridged container has its own"));
         // Named by the bridge's gateway, not 127.0.0.11: builders keep it
         // for their steps rather than swapping in 8.8.8.8.
         spec_with(0, &[], &|s| assert_eq!(super::embedded_address(s), [172, 17, 0, 1]));

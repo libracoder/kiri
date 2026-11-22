@@ -902,6 +902,23 @@ sleep 0.7
 t host-internal "Directory listing" $D run --rm alpine wget -qO- http://host.docker.internal:18999/
 t host-gateway "Directory listing" $D run --rm --add-host mac:host-gateway alpine wget -qO- http://mac:18999/
 t host-internal-hostnet "Directory listing" $D run --rm --network host alpine wget -qO- http://host.docker.internal:18999/
+# A port published on 127.0.0.1 or on every address is in the host's own
+# network, as Docker binds it: a --network host container reaches it at
+# 127.0.0.1 (#732; a host-network BuildKit pushing to a local registry).
+$D rm -f hn-lo hn-all >/dev/null 2>&1
+$D run -d --name hn-lo -p 127.0.0.1:18093:80 nginx:alpine >/dev/null
+$D run -d --name hn-all -p 18094:80 nginx:alpine >/dev/null
+nginx_up hn-lo; nginx_up hn-all
+t hostnet-published-loopback "Welcome to nginx" $D run --rm --network host alpine wget -qO- -T 5 http://127.0.0.1:18093/
+t hostnet-published-every-address "Welcome to nginx" $D run --rm --network host alpine wget -qO- -T 5 http://127.0.0.1:18094/
+# Gone with the container: the port is free in the host's network again.
+t hostnet-published-gone "ok" bash -c "$D rm -f hn-lo >/dev/null; $D run --rm --network host alpine sh -c 'wget -qO- -T 3 http://127.0.0.1:18093/ >/dev/null 2>&1 && echo still-there || echo ok'"
+$D rm -f hn-all >/dev/null 2>&1
+# In the VM a host-network container asks Kiri's resolver, as the default
+# bridge's do, so a lookup the Mac's resolver for the VM network refuses
+# goes through the Mac (#732). host.docker.internal answers only there.
+only mac t hostnet-dns-kiri "198.19.248.254" $D run --rm --network host alpine nslookup -timeout=5 host.docker.internal
+only mac t hostnet-dns-names "Address" $D run --rm --network host alpine nslookup -timeout=5 example.com
 only linux,wsl t host-internal-not-loopback "Connection refused" $D run --rm alpine wget -qO- -T 3 http://host.docker.internal:18998/
 kill "$HTTP_PID" ${HTTP_LO_PID:+"$HTTP_LO_PID"}; rm -rf "$HTTP_DIR"
 

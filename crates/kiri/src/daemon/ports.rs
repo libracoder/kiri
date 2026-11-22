@@ -207,6 +207,10 @@ pub struct Forwards {
     /// In the VM: the guest ports its kernel forwards for these listeners;
     /// dropping tells the agent to stop, then frees the ports.
     nat: Option<(Arc<VmLink>, String, Vec<NatPort>)>,
+    /// In the VM: the ports also published on the VM's own loopback, for
+    /// `--network host` containers (`loopback_ports`); dropping tells the
+    /// agent to stop.
+    loopback: Option<(Arc<VmLink>, String)>,
     /// What was actually bound: (binding, host address, host port).
     pub bound: Vec<(Binding, String, u16)>,
 }
@@ -223,6 +227,9 @@ impl Drop for Forwards {
             let _ = vm.unpublish(&id);
         }
         if let Some((vm, id, _ports)) = self.nat.take() {
+            let _ = vm.unpublish(&id);
+        }
+        if let Some((vm, id)) = self.loopback.take() {
             let _ = vm.unpublish(&id);
         }
         // Closing the write ends wakes every listener thread.
@@ -436,7 +443,7 @@ pub fn start(vm: Arc<VmLink>, id: &str, bindings: &[Binding], target_ip: [u8; 4]
             listeners.push((b.clone(), ip, port, l));
         }
     }
-    let mut fw = Forwards { wake: Vec::new(), threads: Vec::new(), kernel: None, nat: None, bound: Vec::new() };
+    let mut fw = Forwards { wake: Vec::new(), threads: Vec::new(), kernel: None, nat: None, loopback: None, bound: Vec::new() };
     // On a Linux host the daemon shares the kernel with the containers, so
     // the kernel can rewrite the packets (nftables DNAT) instead of two
     // user-space relays copying every byte; that serves every address but
@@ -493,6 +500,26 @@ pub fn start(vm: Arc<VmLink>, id: &str, bindings: &[Binding], target_ip: [u8; 4]
             Err(e) => crate::diag::warn!("NAT port forwarding unavailable; relaying over vsock", id = &id[..id.len().min(12)], error = e),
         }
     }
+    // In the VM: a `--network host` container shares the VM's network, not
+    // the Mac's, so the VM's 127.0.0.1 has none of these ports. Each TCP
+    // port the Mac has on its loopback is published there too: the agent
+    // sends the VM's own connections to it through the host relay, to this
+    // listener. As on Docker, where a published port is bound in the host's
+    // namespace. A target on loopback is itself a host-network container.
+    if cfg!(target_os = "macos") && target_ip != [127, 0, 0, 1] {
+        let ports = loopback_ports(listeners.iter().map(|(b, ip, port, _)| (b.container_port, ip.as_str(), *port)));
+        let mut published = false;
+        for (to_port, host_port) in ports {
+            let p = kiri_proto::Publish { id, udp: false, host_ip: [127, 0, 0, 1], host_port, to_ip: target_ip, to_port };
+            match vm.publish(p) {
+                Ok(()) => published = true,
+                Err(e) => crate::diag::warn!("published port not reachable from host-network containers", port = host_port, error = e),
+            }
+        }
+        if published {
+            fw.loopback = Some((vm.clone(), id.to_owned()));
+        }
+    }
     for ((b, ip, port, listener), nat) in listeners.into_iter().zip(nat) {
         let (wake_r, wake_w) = pipe()?;
         fw.wake.push(wake_w);
@@ -504,6 +531,19 @@ pub fn start(vm: Arc<VmLink>, id: &str, bindings: &[Binding], target_ip: [u8; 4]
         fw.bound.push((b, ip, port));
     }
     Ok(fw)
+}
+
+/// The TCP ports (container port, port bound on the Mac) that are on the
+/// Mac's loopback: bound on 127.0.0.1 or on every IPv4 address, once each.
+/// A port on one other address, or on IPv6 only, is not.
+fn loopback_ports<'a>(bound: impl Iterator<Item = (u16, &'a str, u16)>) -> Vec<(u16, u16)> {
+    let mut out: Vec<(u16, u16)> = Vec::new();
+    for (container_port, ip, port) in bound {
+        if matches!(ip, "" | "0.0.0.0" | "127.0.0.1") && !out.iter().any(|(_, p)| *p == port) {
+            out.push((container_port, port));
+        }
+    }
+    out
 }
 
 /// Asks the agent to forward a guest port to each container port, from the
@@ -1319,6 +1359,12 @@ mod tests {
         let mut out = Vec::new();
         super::copy_frames(&mut &stream[..10], &mut out).unwrap();
         assert_eq!(out, b"HTTP/1");
+    }
+
+    #[test]
+    fn loopback_ports_are_the_ones_on_the_macs_loopback() {
+        let bound = [(80, "0.0.0.0", 8080), (80, "::", 8080), (5000, "127.0.0.1", 5999), (443, "192.168.1.5", 8443), (53, "::1", 5353)];
+        assert_eq!(super::loopback_ports(bound.into_iter()), vec![(80, 8080), (5000, 5999)]);
     }
 
     #[test]

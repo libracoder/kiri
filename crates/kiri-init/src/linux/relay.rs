@@ -369,8 +369,10 @@ pub const HOST_VSOCK_PORT: u32 = 1026;
 
 /// Accepts one redirected connection, finds the port the container meant,
 /// dials the Mac and returns a relay between the two. Only connections that
-/// were redirected from `host_addr` are relayed: one made to the listener
-/// directly (from the LAN, on a Linux host) would reach the host's loopback.
+/// were redirected from `host_addr`, or from 127.0.0.1 (a port published on
+/// the Mac's loopback, which only the VM's own output chain redirects), are
+/// relayed: one made to the listener directly (from the LAN, on a Linux
+/// host) would reach the host's loopback.
 pub fn accept_host_bound(listener: &OwnedFd, host_addr: [u8; 4]) -> Option<Relay> {
     // SAFETY: accept4 on a listening socket we own; the fd is owned immediately.
     let fd = unsafe { libc::accept4(listener.as_raw_fd(), std::ptr::null_mut(), std::ptr::null_mut(), libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC) };
@@ -387,7 +389,7 @@ pub fn accept_host_bound(listener: &OwnedFd, host_addr: [u8; 4]) -> Option<Relay
         if libc::getsockopt(client.as_raw_fd(), libc::SOL_IP, SO_ORIGINAL_DST, (&mut dst as *mut libc::sockaddr_in).cast(), &mut len) != 0 {
             return Some(Relay::dead_one(client));
         }
-        if dst.sin_addr.s_addr != u32::from_ne_bytes(host_addr) {
+        if !redirected_from(dst.sin_addr.s_addr.to_ne_bytes(), host_addr) {
             return Some(Relay::dead_one(client));
         }
         u16::from_be(dst.sin_port)
@@ -414,6 +416,13 @@ pub fn accept_host_bound(listener: &OwnedFd, host_addr: [u8; 4]) -> Option<Relay
         udp: false,
         framed: false,
     })
+}
+
+/// Whether a host-bound connection's original destination is one the
+/// redirect rules send to the relay: the host's reserved address, or the
+/// VM's loopback (published ports only, see `loopback_published_rule`).
+fn redirected_from(dst: [u8; 4], host_addr: [u8; 4]) -> bool {
+    dst == host_addr || dst == super::netlink::LOOPBACK
 }
 
 fn dial_host(port: u32) -> io::Result<OwnedFd> {
@@ -580,6 +589,18 @@ pub fn accept_engine(listener: &OwnedFd) -> Option<Relay> {
 #[cfg(test)]
 mod tests {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    /// The host relay takes connections redirected from the host's address
+    /// and from the VM's loopback (published ports), nothing else.
+    #[test]
+    fn the_host_relay_takes_the_host_address_and_loopback() {
+        let host = [198, 19, 248, 254];
+        assert!(super::redirected_from(host, host));
+        assert!(super::redirected_from([127, 0, 0, 1], host));
+        for other in [[192, 168, 64, 2], [172, 17, 0, 1], [127, 0, 0, 2], [0, 0, 0, 0]] {
+            assert!(!super::redirected_from(other, host), "{other:?}");
+        }
+    }
 
     #[test]
     fn framed_reads_carry_their_length_and_end_with_an_empty_frame() {

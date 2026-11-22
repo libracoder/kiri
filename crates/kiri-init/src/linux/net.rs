@@ -257,6 +257,31 @@ pub fn local_resolver_among(servers: &[[u8; 4]], local: &[[u8; 4]]) -> bool {
 
 /// This machine's IPv4 addresses but loopback, what `fib daddr type local`
 /// matches.
+/// The IPv4 address of interface `name`, if it has one: a bridge's gateway.
+pub fn bridge_ipv4(name: &str) -> Option<[u8; 4]> {
+    let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs fills `list`, freed below.
+    if unsafe { libc::getifaddrs(&mut list) } != 0 {
+        return None;
+    }
+    let mut found = None;
+    let mut p = list;
+    while !p.is_null() && found.is_none() {
+        // SAFETY: a node of the list getifaddrs returned.
+        let ifa = unsafe { &*p };
+        // SAFETY: ifa_name is a NUL-terminated string the list owns.
+        let named = !ifa.ifa_name.is_null() && unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) }.to_bytes() == name.as_bytes();
+        // SAFETY: a non-null address of the list; AF_INET is a sockaddr_in.
+        if named && !ifa.ifa_addr.is_null() && i32::from(unsafe { (*ifa.ifa_addr).sa_family }) == libc::AF_INET {
+            found = Some(unsafe { (*(ifa.ifa_addr as *const libc::sockaddr_in)).sin_addr.s_addr }.to_ne_bytes());
+        }
+        p = ifa.ifa_next;
+    }
+    // SAFETY: the list getifaddrs returned, freed once.
+    unsafe { libc::freeifaddrs(list) };
+    found
+}
+
 fn local_addrs() -> Vec<[u8; 4]> {
     let mut out = Vec::new();
     let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
