@@ -153,23 +153,188 @@ pub enum Progress {
 
 /// What `docker login` saved, as the CLI sends it in `X-Registry-Auth`
 /// (base64url JSON) and in `POST /auth`.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default)]
 pub struct Credentials {
-    #[serde(default)]
     pub username: String,
-    #[serde(default)]
     pub password: String,
     /// `base64(user:password)`, which some clients send instead.
-    #[serde(default)]
     pub auth: String,
-    #[serde(default, rename = "serveraddress")]
     pub server_address: String,
     /// An OAuth refresh token from an earlier login.
-    #[serde(default, rename = "identitytoken")]
     pub identity_token: String,
     /// A bearer token to use as is.
-    #[serde(default, rename = "registrytoken")]
     pub registry_token: String,
+}
+
+/// Reads the way Docker reads an AuthConfig: keys match in any case, a JSON
+/// null leaves a field as it was (docker-java sends every field, the unused
+/// ones as null, #654), and a top-level null is an empty config.
+impl<'de> Deserialize<'de> for Credentials {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        d.deserialize_any(CredentialsVisitor { loose: false })
+    }
+}
+
+/// One entry of the CLI's `X-Registry-Config`, read the way Docker reads it:
+/// an entry that is not an object is empty, and a field of the wrong type is
+/// skipped, leaving the rest of the entry and the other entries as they are.
+#[derive(Debug, Clone, Default)]
+pub struct LooseCredentials(pub Credentials);
+
+impl<'de> Deserialize<'de> for LooseCredentials {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        d.deserialize_any(CredentialsVisitor { loose: true }).map(LooseCredentials)
+    }
+}
+
+/// An AuthConfig key, matched in any ASCII case without copying it.
+#[derive(Clone, Copy)]
+enum Field {
+    Username,
+    Password,
+    Auth,
+    ServerAddress,
+    IdentityToken,
+    RegistryToken,
+    Other,
+}
+
+impl<'de> Deserialize<'de> for Field {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl serde::de::Visitor<'_> for V {
+            type Value = Field;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a field name")
+            }
+            fn visit_str<E>(self, key: &str) -> Result<Field, E> {
+                const NAMES: [(&str, Field); 6] = [
+                    ("username", Field::Username),
+                    ("password", Field::Password),
+                    ("auth", Field::Auth),
+                    ("serveraddress", Field::ServerAddress),
+                    ("identitytoken", Field::IdentityToken),
+                    ("registrytoken", Field::RegistryToken),
+                ];
+                Ok(NAMES.into_iter().find(|(n, _)| n.eq_ignore_ascii_case(key)).map_or(Field::Other, |(_, f)| f))
+            }
+        }
+        d.deserialize_identifier(V)
+    }
+}
+
+/// A field's value when loose: a string is the value, anything else
+/// (null, a number, a bool, an array, an object) leaves the field as it was.
+struct Loose(Option<String>);
+
+impl<'de> Deserialize<'de> for Loose {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = Loose;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("any value")
+            }
+            fn visit_str<E>(self, v: &str) -> Result<Loose, E> {
+                Ok(Loose(Some(v.to_owned())))
+            }
+            fn visit_string<E>(self, v: String) -> Result<Loose, E> {
+                Ok(Loose(Some(v)))
+            }
+            fn visit_unit<E>(self) -> Result<Loose, E> {
+                Ok(Loose(None))
+            }
+            fn visit_bool<E>(self, _: bool) -> Result<Loose, E> {
+                Ok(Loose(None))
+            }
+            fn visit_i64<E>(self, _: i64) -> Result<Loose, E> {
+                Ok(Loose(None))
+            }
+            fn visit_u64<E>(self, _: u64) -> Result<Loose, E> {
+                Ok(Loose(None))
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<Loose, E> {
+                Ok(Loose(None))
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut s: A) -> Result<Loose, A::Error> {
+                while s.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+                Ok(Loose(None))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, mut m: A) -> Result<Loose, A::Error> {
+                while m.next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?.is_some() {}
+                Ok(Loose(None))
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+/// Reads an AuthConfig object. Strict, as for `X-Registry-Auth` and
+/// `POST /auth`: a value that is neither a string nor null is an error.
+/// Loose, as for an `X-Registry-Config` entry: such a value is skipped, and
+/// an entry that is not an object reads as empty.
+struct CredentialsVisitor {
+    loose: bool,
+}
+
+impl CredentialsVisitor {
+    fn other<E: serde::de::Error>(&self, u: serde::de::Unexpected) -> Result<Credentials, E> {
+        if self.loose { Ok(Credentials::default()) } else { Err(E::invalid_type(u, self)) }
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for CredentialsVisitor {
+    type Value = Credentials;
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("a registry credentials object")
+    }
+    fn visit_unit<E>(self) -> Result<Credentials, E> {
+        Ok(Credentials::default())
+    }
+    fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<Credentials, E> {
+        self.other(serde::de::Unexpected::Bool(v))
+    }
+    fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Credentials, E> {
+        self.other(serde::de::Unexpected::Signed(v))
+    }
+    fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Credentials, E> {
+        self.other(serde::de::Unexpected::Unsigned(v))
+    }
+    fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Credentials, E> {
+        self.other(serde::de::Unexpected::Float(v))
+    }
+    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Credentials, E> {
+        self.other(serde::de::Unexpected::Str(v))
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut s: A) -> Result<Credentials, A::Error> {
+        if !self.loose {
+            return Err(serde::de::Error::invalid_type(serde::de::Unexpected::Seq, &self));
+        }
+        while s.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+        Ok(Credentials::default())
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut m: A) -> Result<Credentials, A::Error> {
+        let mut c = Credentials::default();
+        while let Some(key) = m.next_key::<Field>()? {
+            let field = match key {
+                Field::Username => &mut c.username,
+                Field::Password => &mut c.password,
+                Field::Auth => &mut c.auth,
+                Field::ServerAddress => &mut c.server_address,
+                Field::IdentityToken => &mut c.identity_token,
+                Field::RegistryToken => &mut c.registry_token,
+                Field::Other => {
+                    m.next_value::<serde::de::IgnoredAny>()?;
+                    continue;
+                }
+            };
+            let v = if self.loose { m.next_value::<Loose>()?.0 } else { m.next_value::<Option<String>>()? };
+            if let Some(v) = v {
+                *field = v;
+            }
+        }
+        Ok(c)
+    }
 }
 
 impl Credentials {
@@ -1180,6 +1345,137 @@ fn not_found(e: Error, r: &Reference) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The header as clients send it: base64 of the JSON, URL-safe and
+    /// unpadded like docker-java and the CLI.
+    fn header(json: &str) -> String {
+        crate::b64::encode(json.as_bytes()).replace('+', "-").replace('/', "_").trim_end_matches('=').to_owned()
+    }
+
+    /// docker-java serialises every field of its AuthConfig, the ones it
+    /// does not use as JSON null; Docker reads null as empty (#654).
+    #[test]
+    fn credentials_read_null_fields_as_empty() {
+        let java = r#"{"username":"me","password":"pw","serveraddress":"registry.example.com","identitytoken":null,"registrytoken":null,"email":null,"stackOrchestrator":null,"auth":null}"#;
+        let c = Credentials::from_header(&header(java)).expect("username and password with null fields");
+        assert_eq!((c.username.as_str(), c.password.as_str(), c.server_address.as_str()), ("me", "pw", "registry.example.com"));
+        assert_eq!(c.basic().as_deref(), Some(format!("Basic {}", crate::b64::encode(b"me:pw")).as_str()));
+        assert!(c.identity_token.is_empty() && c.registry_token.is_empty() && c.auth.is_empty());
+
+        // Every field null: no sign-in, so the pull goes anonymous as before.
+        let all = r#"{"username":null,"password":null,"auth":null,"serveraddress":null,"identitytoken":null,"registrytoken":null,"email":null}"#;
+        assert!(Credentials::from_header(&header(all)).is_none());
+        let c: Credentials = serde_json::from_str(all).expect("POST /auth body with every field null");
+        assert!(c.username.is_empty() && c.server_address.is_empty());
+        // A server address alone, the credential fields null: still no sign-in.
+        let addr = r#"{"serveraddress":"registry.example.com","username":null,"password":null,"auth":null,"identitytoken":null,"registrytoken":null}"#;
+        assert!(Credentials::from_header(&header(addr)).is_none());
+
+        // Docker reads keys in any case, a null after a value leaves it, and a top-level null is empty.
+        let c = Credentials::from_header(&header(r#"{"UserName":"me","PASSWORD":"pw","serverAddress":"r.example","identityToken":"tok","RegistryToken":"rt"}"#)).unwrap();
+        assert_eq!((c.username.as_str(), c.password.as_str(), c.server_address.as_str(), c.identity_token.as_str(), c.registry_token.as_str()), ("me", "pw", "r.example", "tok", "rt"));
+        let c = Credentials::from_header(&header(r#"{"username":"me","username":null,"password":"pw"}"#)).unwrap();
+        assert_eq!(c.username, "me");
+        let c: Credentials = serde_json::from_str("null").expect("top-level null is an empty config");
+        assert!(c.username.is_empty() && c.server_address.is_empty());
+
+        // Only a username and password.
+        let c = Credentials::from_header(&header(r#"{"username":"me","password":"pw"}"#)).unwrap();
+        assert_eq!((c.username.as_str(), c.password.as_str(), c.server_address.as_str()), ("me", "pw", ""));
+
+        // A null server address is empty, and the rest is still used.
+        let c = Credentials::from_header(&header(r#"{"username":"me","password":"pw","serveraddress":null}"#)).unwrap();
+        assert_eq!((c.username.as_str(), c.server_address.as_str()), ("me", ""));
+
+        // identitytoken null beside a password, and a real one with the rest null.
+        let c = Credentials::from_header(&header(r#"{"username":"me","password":"pw","identitytoken":null}"#)).unwrap();
+        assert_eq!((c.username.as_str(), c.identity_token.as_str()), ("me", ""));
+        let c = Credentials::from_header(&header(r#"{"username":null,"password":null,"serveraddress":"ghcr.io","identitytoken":"tok"}"#)).unwrap();
+        assert_eq!((c.username.as_str(), c.identity_token.as_str(), c.server_address.as_str()), ("", "tok", "ghcr.io"));
+        let c = Credentials::from_header(&header(r#"{"username":null,"registrytoken":"bearer-tok","identitytoken":null}"#)).unwrap();
+        assert_eq!(c.registry_token, "bearer-tok");
+
+        // `auth` (base64 user:password) with the username null.
+        let auth = format!(r#"{{"username":null,"password":null,"auth":"{}"}}"#, crate::b64::encode(b"me:pw"));
+        let c = Credentials::from_header(&header(&auth)).unwrap();
+        assert_eq!((c.username.as_str(), c.password.as_str()), ("me", "pw"));
+
+        // Fields Kiri does not know are ignored, nulls, objects and all.
+        let extra = r#"{"username":"me","password":"pw","email":null,"stackOrchestrator":null,"x":{"y":[1,null]},"n":3}"#;
+        assert_eq!(Credentials::from_header(&header(extra)).unwrap().username, "me");
+    }
+
+    /// Later keys win whatever their case, a null after any spelling leaves
+    /// the value, and near-miss keys are not fields.
+    #[test]
+    fn credentials_keys_in_any_case_last_wins() {
+        let c: Credentials = serde_json::from_str(r#"{"serveraddress":"old","ServerAddress":"new","identitytoken":"old","IDENTITYTOKEN":"new"}"#).unwrap();
+        assert_eq!((c.server_address.as_str(), c.identity_token.as_str()), ("new", "new"));
+        let c: Credentials = serde_json::from_str(r#"{"ServerAddress":"old","serveraddress":"new","IdentityToken":"old","identitytoken":"new"}"#).unwrap();
+        assert_eq!((c.server_address.as_str(), c.identity_token.as_str()), ("new", "new"));
+        let c: Credentials = serde_json::from_str(r#"{"ServerAddress":"addr","serveraddress":null,"IdentityToken":"tok","identitytoken":null,"IDENTITYTOKEN":null}"#).unwrap();
+        assert_eq!((c.server_address.as_str(), c.identity_token.as_str()), ("addr", "tok"));
+        // An empty string is a value, so it clears an earlier one.
+        let c: Credentials = serde_json::from_str(r#"{"serveraddress":"addr","ServerAddress":""}"#).unwrap();
+        assert_eq!(c.server_address, "");
+        let c: Credentials = serde_json::from_str(r#"{"user":"a","usernames":"b","user_name":"c","passwordx":"d","identity_token":"e","serveraddres":"f"}"#).unwrap();
+        assert!(c.username.is_empty() && c.password.is_empty() && c.identity_token.is_empty() && c.server_address.is_empty());
+        let long = format!(r#"{{"{}":"x","username":"me"}}"#, "u".repeat(1 << 16));
+        assert_eq!(serde_json::from_str::<Credentials>(&long).unwrap().username, "me");
+        assert!(Credentials::from_header(&header("null")).is_none());
+    }
+
+    /// Unknown fields are skipped however deep they go; a known field that
+    /// is neither a string nor null, or a config that is not an object, is
+    /// an error, as Docker's decoder says for X-Registry-Auth.
+    #[test]
+    fn credentials_unknown_skipped_wrong_types_refused() {
+        let c: Credentials = serde_json::from_str(r#"{"Email":{"a":[{"b":{"c":[null,1,"s",true]}}]},"username":"me","Extra":[[],{}],"password":"pw"}"#).unwrap();
+        assert_eq!((c.username.as_str(), c.password.as_str()), ("me", "pw"));
+        for bad in [r#"{"username":1}"#, r#"{"Password":true}"#, r#"{"serveraddress":{}}"#, r#"{"IdentityToken":[]}"#, r#"{"auth":1.5}"#, r#"{"registrytoken":-1}"#, r#""me""#, "1", "true", "[]", r#"[{"username":"me"}]"#] {
+            assert!(serde_json::from_str::<Credentials>(bad).is_err(), "{bad}");
+            assert!(Credentials::from_header(&header(bad)).is_none(), "{bad}");
+        }
+    }
+
+    /// An X-Registry-Config entry: what is not an object is empty, and a
+    /// field of the wrong type is skipped, keeping the rest.
+    #[test]
+    fn loose_credentials_skip_what_does_not_fit() {
+        for other in ["null", "1", "-1", "1.5", "true", r#""me""#, "[]", r#"[{"username":"me"}]"#] {
+            let LooseCredentials(c) = serde_json::from_str(other).unwrap_or_else(|e| panic!("{other}: {e}"));
+            assert!(c.username.is_empty() && c.password.is_empty() && c.auth.is_empty(), "{other}");
+        }
+        let LooseCredentials(c) = serde_json::from_str(r#"{"username":"me","username":1,"Password":"pw","password":{"x":[1]},"identitytoken":[],"auth":true,"x":{"y":null}}"#).unwrap();
+        assert_eq!((c.username.as_str(), c.password.as_str(), c.identity_token.as_str(), c.auth.as_str()), ("me", "pw", "", ""));
+        let LooseCredentials(c) = serde_json::from_str(r#"{"identitytoken":"old","IdentityToken":"new","identityToken":null}"#).unwrap();
+        assert_eq!(c.identity_token, "new");
+    }
+
+    #[test]
+    fn credentials_header_reads_every_base64_form() {
+        // This password puts both a '+' and a '/' in the standard encoding, so URL-safe differs.
+        for pad in ["", " ", "  "] {
+            let json = format!(r#"{{"username":"me","password":"x?????>","serveraddress":null,"identitytoken":null}}{pad}"#);
+            let std = crate::b64::encode(json.as_bytes());
+            let url = std.replace('+', "-").replace('/', "_");
+            for form in [std.clone(), std.trim_end_matches('=').to_owned(), url.clone(), url.trim_end_matches('=').to_owned()] {
+                let c = Credentials::from_header(&form).unwrap_or_else(|| panic!("{form}"));
+                assert_eq!((c.username.as_str(), c.password.as_str()), ("me", "x?????>"), "{form}");
+            }
+        }
+        let e = crate::b64::encode(br#"{"username":"me","password":"x?????>","serveraddress":null,"identitytoken":null}"#);
+        assert!(e.contains('+') && e.contains('/'));
+    }
+
+    #[test]
+    fn credentials_header_empty_or_unreadable_is_none() {
+        for bad in ["", "   ", "!!!", "Z", &header("not json"), &header("{"), &header("[]"), &header("null"), &header(r#"{"username":1}"#)] {
+            assert!(Credentials::from_header(bad).is_none(), "{bad:?}");
+        }
+        // Empty strings, as the CLI sends when it sends them, are no sign-in either.
+        assert!(Credentials::from_header(&header(r#"{"username":"","password":"","identitytoken":""}"#)).is_none());
+    }
 
     #[test]
     fn a_missing_image_reads_as_docker_says_it() {

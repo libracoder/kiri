@@ -629,20 +629,22 @@ impl Options {
 /// password, identitytoken, …}) as a docker config.json for buildctl.
 fn registry_config(header: &str) -> Option<Vec<u8>> {
     let raw = kiri_image::b64::decode(header)?;
-    let v: Value = serde_json::from_slice(&raw).ok()?;
+    let servers: std::collections::BTreeMap<String, kiri_image::LooseCredentials> = serde_json::from_slice(&raw).ok()?;
     let mut auths = serde_json::Map::new();
-    for (server, a) in v.as_object()? {
+    for (server, kiri_image::LooseCredentials(c)) in servers {
         let mut e = serde_json::Map::new();
-        if let (Some(u), Some(p)) = (a["username"].as_str(), a["password"].as_str()) {
-            e.insert("auth".into(), kiri_image::b64::encode(format!("{u}:{p}").as_bytes()).into());
-        } else if let Some(t) = a["auth"].as_str().filter(|t| !t.is_empty()) {
-            e.insert("auth".into(), t.into());
+        if !c.password.is_empty() {
+            e.insert("auth".into(), kiri_image::b64::encode(format!("{}:{}", c.username, c.password).as_bytes()).into());
+        } else if !c.auth.is_empty() {
+            e.insert("auth".into(), c.auth.into());
+        } else if !c.username.is_empty() && c.identity_token.is_empty() {
+            e.insert("auth".into(), kiri_image::b64::encode(format!("{}:", c.username).as_bytes()).into());
         }
-        if let Some(t) = a["identitytoken"].as_str().filter(|t| !t.is_empty()) {
-            e.insert("identitytoken".into(), t.into());
+        if !c.identity_token.is_empty() {
+            e.insert("identitytoken".into(), c.identity_token.into());
         }
         if !e.is_empty() {
-            auths.insert(server.clone(), Value::Object(e));
+            auths.insert(server, Value::Object(e));
         }
     }
     (!auths.is_empty()).then(|| json!({"auths": auths}).to_string().into_bytes())
@@ -1156,6 +1158,65 @@ mod tests {
         assert_eq!(v["auths"]["https://index.docker.io/v1/"]["auth"], kiri_image::b64::encode(b"u:p"));
         assert_eq!(v["auths"]["ghcr.io"]["identitytoken"], "tok");
         assert!(v["auths"].get("empty").is_none());
+        // Null fields, as docker-java sends them, are empty (#654).
+        let header = kiri_image::b64::encode(br#"{"r.example":{"username":"u","password":"p","identitytoken":null,"auth":null,"email":null},"nulls":{"username":null,"password":null,"identitytoken":null}}"#);
+        let v: Value = serde_json::from_slice(&registry_config(&header).unwrap()).unwrap();
+        assert_eq!(v["auths"]["r.example"], json!({"auth": kiri_image::b64::encode(b"u:p")}));
+        assert!(v["auths"].get("nulls").is_none());
+        // A null registry value is skipped, and key case does not matter.
+        let header = kiri_image::b64::encode(br#"{"gone.example":null,"r.example":{"UserName":"u","Password":"p"}}"#);
+        let v: Value = serde_json::from_slice(&registry_config(&header).unwrap()).unwrap();
+        assert!(v["auths"].get("gone.example").is_none());
+        assert_eq!(v["auths"]["r.example"], json!({"auth": kiri_image::b64::encode(b"u:p")}));
+    }
+
+    /// What each registry entry becomes, field by field (#654).
+    #[test]
+    fn registry_config_entries() {
+        let entry = |json: &str| -> Value {
+            let header = kiri_image::b64::encode(format!(r#"{{"r.example":{json},"keep.example":{{"username":"k","password":"kp"}}}}"#).as_bytes());
+            let v: Value = serde_json::from_slice(&registry_config(&header).unwrap()).unwrap();
+            // The other registry is never affected by this one.
+            assert_eq!(v["auths"]["keep.example"], json!({"auth": kiri_image::b64::encode(b"k:kp")}), "{json}");
+            v["auths"].get("r.example").cloned().unwrap_or(Value::Null)
+        };
+        let auth = |s: &[u8]| json!({"auth": kiri_image::b64::encode(s)});
+        // No password: an `auth` there is kept.
+        let up = kiri_image::b64::encode(b"u:p");
+        assert_eq!(entry(&format!(r#"{{"username":"u","password":null,"auth":"{up}"}}"#)), json!({"auth": up}));
+        assert_eq!(entry(&format!(r#"{{"username":"u","auth":"{up}"}}"#)), json!({"auth": up}));
+        // A username beside an identity token is not made into a password sign-in.
+        assert_eq!(entry(r#"{"username":"u","password":null,"identitytoken":"tok"}"#), json!({"identitytoken": "tok"}));
+        assert_eq!(entry(r#"{"username":"u","password":"","identitytoken":"tok"}"#), json!({"identitytoken": "tok"}));
+        // A password with an empty username, and a username with an empty password.
+        assert_eq!(entry(r#"{"username":"","password":"secret"}"#), auth(b":secret"));
+        assert_eq!(entry(r#"{"password":"secret"}"#), auth(b":secret"));
+        assert_eq!(entry(r#"{"username":"u","password":""}"#), auth(b"u:"));
+        // Docker reads a missing or null password the same as an empty one.
+        assert_eq!(entry(r#"{"username":"u"}"#), auth(b"u:"));
+        assert_eq!(entry(r#"{"username":"u","password":null}"#), auth(b"u:"));
+        assert_eq!(entry(r#"{"username":"u","password":"p","identitytoken":"tok"}"#), json!({"auth": up, "identitytoken": "tok"}));
+        // A null after a value leaves it, the same key spelled the same way or not.
+        assert_eq!(entry(r#"{"identitytoken":"tok","identitytoken":null}"#), json!({"identitytoken": "tok"}));
+        assert_eq!(entry(r#"{"username":"u","username":null,"password":"p"}"#), json!({"auth": up}));
+        assert_eq!(entry(r#"{"IdentityToken":"tok","identitytoken":null}"#), json!({"identitytoken": "tok"}));
+        // Later keys win in whatever case, in the order sent.
+        assert_eq!(entry(r#"{"identitytoken":"old","IdentityToken":"new"}"#), json!({"identitytoken": "new"}));
+        assert_eq!(entry(r#"{"IdentityToken":"old","identitytoken":"new"}"#), json!({"identitytoken": "new"}));
+        assert_eq!(entry(r#"{"username":"old","UserName":"u","password":"p"}"#), json!({"auth": up}));
+        assert_eq!(entry(r#"{"UserName":"old","username":"u","password":"p"}"#), json!({"auth": up}));
+        // Unknown fields, nested or not, are skipped; a known one of the wrong type is skipped alone.
+        assert_eq!(entry(r#"{"x":{"y":[{"z":null}]},"username":"u","Email":[1,"a"],"password":"p"}"#), json!({"auth": up}));
+        assert_eq!(entry(r#"{"username":"u","password":"p","identitytoken":1,"auth":{"a":"b"}}"#), json!({"auth": up}));
+        assert_eq!(entry(r#"{"username":"u","username":7,"password":"p"}"#), json!({"auth": up}));
+        // An entry that is not an object is no sign-in, and the rest still is.
+        for other in ["null", "1", "true", r#""u:p""#, "[]", r#"[{"username":"u","password":"p"}]"#, "{}", r#"{"username":"","password":""}"#] {
+            assert_eq!(entry(other), Value::Null, "{other}");
+        }
+        // A config with nothing to sign in with is none, as is one that is not a map.
+        for none in ["{}", "null", "[]", r#""x""#, r#"{"r.example":null}"#] {
+            assert!(registry_config(&kiri_image::b64::encode(none.as_bytes())).is_none(), "{none}");
+        }
     }
 
     #[test]

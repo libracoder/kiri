@@ -143,3 +143,8 @@ frame-limit-request-alone	#658	a request over the agent's frame limit ended the 
 user-boundaries	#664	a numeric user not in /etc/passwd did not get group 0
 ncpu-engine-cpus	#659	on a Linux host docker info's NCPU was the Mac VM's default of 2, not the CPUs the engine may run on
 ncpu-affinity	#659	an engine under a three-CPU affinity mask must say NCPU 3 (the old count said 2)
+auth-null-fields	#654	POST /auth with JSON null fields (docker-java) was refused as invalid JSON
+auth-null-fields-wrong	#654	a wrong password with null fields must still say incorrect username or password
+pull-auth-null-fields	#654	X-Registry-Auth with JSON null fields (Testcontainers) was dropped, so a private pull went anonymous and got 401
+pull-auth-null-std-b64	#654	X-Registry-Auth with null fields in standard padded base64 must sign in too
+pull-auth-all-null	#654	X-Registry-Auth with every field null is no sign-in: the pull stays anonymous

@@ -1358,6 +1358,18 @@ t push-again "already exists" bash -c "$R push localhost:5055/team/alp:1 2>&1"
 # registry has, not the image ID or the index alpine was pulled from.
 t push-repo-digest "same" bash -c "d=\$($R push localhost:5055/team/alp:1 2>&1 | sed -n 's/.*digest: \(sha256:[0-9a-f]*\).*/\1/p'); [ -n \"\$d\" ] && [ \"\$($R image inspect localhost:5055/team/alp:1 --format '{{index .RepoDigests 0}}')\" = localhost:5055/team/alp@\$d ] && echo same"
 t pull-auth "3." bash -c "$R rmi localhost:5055/team/alp:1 >/dev/null && $R pull -q localhost:5055/team/alp:1 >/dev/null && $R run --rm localhost:5055/team/alp:1 cat /etc/alpine-release"
+# docker-java (Testcontainers) sends every AuthConfig field, the unused ones
+# as JSON null, in X-Registry-Auth and POST /auth; Docker reads null as
+# empty (#654). Headers in base64url without padding, and standard padded.
+NULLAUTH='{"username":"kiriuser","password":"kiripass","serveraddress":"localhost:5055","identitytoken":null,"registrytoken":null,"email":null,"auth":null,"stackOrchestrator":null}'
+NH=$(printf %s "$NULLAUTH" | base64 | tr '+/' '-_' | tr -d '=\n'); NH_STD=$(printf %s "$NULLAUTH" | base64 | tr -d '\n')
+NH_NONE=$(printf %s '{"username":null,"password":null,"serveraddress":null,"identitytoken":null,"email":null}' | base64 | tr -d '\n')
+NPULL="curl -s --unix-socket '$SOCK' -X POST 'http://d/v1.47/images/create?fromImage=localhost:5055/team/alp&tag=1'"
+t auth-null-fields "Login Succeeded" curl -s --unix-socket "$SOCK" -X POST -H 'Content-Type: application/json' -d "$NULLAUTH" http://d/v1.47/auth
+t auth-null-fields-wrong "incorrect username or password" curl -s --unix-socket "$SOCK" -X POST -H 'Content-Type: application/json' -d "${NULLAUTH/kiripass/nope}" http://d/v1.47/auth
+t pull-auth-all-null "pull access denied" bash -c "$D rmi localhost:5055/team/alp:1 >/dev/null 2>&1; $NPULL -H 'X-Registry-Auth: $NH_NONE'"
+t pull-auth-null-fields "3." bash -c "$D rmi localhost:5055/team/alp:1 >/dev/null 2>&1; ! $D image inspect localhost:5055/team/alp:1 >/dev/null 2>&1 && $NPULL -H 'X-Registry-Auth: $NH' >/dev/null && $D run --rm --pull never localhost:5055/team/alp:1 cat /etc/alpine-release"
+t pull-auth-null-std-b64 "3." bash -c "$D rmi localhost:5055/team/alp:1 >/dev/null && $NPULL -H 'X-Registry-Auth: $NH_STD' >/dev/null && $D run --rm --pull never localhost:5055/team/alp:1 cat /etc/alpine-release"
 t pull-no-auth "pull access denied" bash -c "$R logout localhost:5055 >/dev/null; $R rmi localhost:5055/team/alp:1 >/dev/null; $R pull localhost:5055/team/alp:1 2>&1"
 t push-no-auth "authentication required" bash -c "$R tag alpine localhost:5055/team/alp:2 && $R push localhost:5055/team/alp:2 2>&1"
 # Not pushed, so no RepoDigest: not alpine's from Docker Hub, nor one made up.

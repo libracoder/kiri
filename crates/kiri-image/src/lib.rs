@@ -14,5 +14,5 @@ pub mod tags;
 
 pub use cancel::Cancel;
 pub use reference::Reference;
-pub use registry::{Client, Credentials, Platform, Progress, PushProgress, set_proxy_source};
+pub use registry::{Client, Credentials, LooseCredentials, Platform, Progress, PushProgress, set_proxy_source};
 pub use store::{Image, Layer, RunConfig, Store};

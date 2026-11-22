@@ -99,6 +99,12 @@ impl Request {
         let query = query.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect();
         Request { method: method.to_owned(), path: path.to_owned(), api_version: None, query, headers: Vec::new(), body, http10: false, streamed: Cell::new(Streamed::No) }
     }
+
+    #[cfg(test)]
+    pub fn with_header(mut self, key: &str, value: &str) -> Request {
+        self.headers.push((key.to_owned(), value.to_owned()));
+        self
+    }
 }
 
 /// Reads the next request on a connection. `Ok(None)` is a clean close.

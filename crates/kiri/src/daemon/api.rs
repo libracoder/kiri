@@ -3485,6 +3485,60 @@ pub(super) fn parse_signal(raw: &str) -> Result<u32, Error> {
 mod tests {
     use super::*;
 
+    /// A loopback registry that takes only `Basic me:pw`.
+    fn basic_registry() -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let host = listener.local_addr().unwrap().to_string();
+        let want = format!("Basic {}", kiri_image::b64::encode(b"me:pw"));
+        std::thread::spawn(move || {
+            for c in listener.incoming() {
+                let Ok(mut c) = c else { break };
+                let mut head = Vec::new();
+                let mut b = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") && c.read(&mut b).unwrap_or(0) == 1 {
+                    head.push(b[0]);
+                }
+                let ok = String::from_utf8_lossy(&head).lines().any(|l| l.split_once(':').is_some_and(|(k, v)| k.eq_ignore_ascii_case("authorization") && v.trim() == want));
+                let status = if ok { "200 OK" } else { "401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"kiri\"" };
+                let _ = write!(c, "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            }
+        });
+        host
+    }
+
+    /// docker-java sends every AuthConfig field, unused ones as JSON null,
+    /// in `X-Registry-Auth` and in `POST /auth`; Docker reads null as empty (#654).
+    #[test]
+    fn registry_auth_with_null_fields_signs_in() {
+        let host = basic_registry();
+        let json = format!(r#"{{"username":"me","password":"pw","serveraddress":"{host}","identitytoken":null,"registrytoken":null,"email":null,"auth":null,"stackOrchestrator":null}}"#);
+        let header = kiri_image::b64::encode(json.as_bytes()).replace('+', "-").replace('/', "_").trim_end_matches('=').to_owned();
+        let pull = Request::internal("POST", "/images/create", &[], Vec::new()).with_header("X-Registry-Auth", &header);
+        client_for(&pull).login(&host).expect("pull client signs in with the header's password");
+        assert!(client_for(&Request::internal("POST", "/images/create", &[], Vec::new())).login(&host).is_err(), "no header is anonymous");
+
+        let login = auth(&Request::internal("POST", "/auth", &[], json.into_bytes())).expect("POST /auth with null fields");
+        assert_eq!(login["Status"], "Login Succeeded");
+        let wrong = format!(r#"{{"username":"me","password":"nope","serveraddress":"{host}","identitytoken":null,"email":null}}"#);
+        assert!(matches!(auth(&Request::internal("POST", "/auth", &[], wrong.into_bytes())), Err(Error::Unauthorized(_))));
+        assert!(matches!(auth(&Request::internal("POST", "/auth", &[], b"not json".to_vec())), Err(Error::BadRequest(_))));
+    }
+
+    /// A null server address, or every field null, in `X-Registry-Auth`.
+    #[test]
+    fn registry_auth_header_with_null_address_or_all_null() {
+        let host = basic_registry();
+        let hdr = |json: String| kiri_image::b64::encode(json.as_bytes()).replace('+', "-").replace('/', "_").trim_end_matches('=').to_owned();
+        let pull = |h: &str| client_for(&Request::internal("POST", "/images/create", &[], Vec::new()).with_header("X-Registry-Auth", h));
+        let null_addr = hdr(r#"{"username":"me","password":"pw","serveraddress":null,"identitytoken":null}"#.into());
+        pull(&null_addr).login(&host).expect("a null server address still signs in");
+        let all_null = hdr(r#"{"username":null,"password":null,"auth":null,"serveraddress":null,"identitytoken":null,"registrytoken":null}"#.into());
+        assert!(pull(&all_null).login(&host).is_err(), "every field null is anonymous");
+        let addr_only = hdr(format!(r#"{{"serveraddress":"{host}","username":null,"password":null,"auth":null,"identitytoken":null,"registrytoken":null}}"#));
+        assert!(pull(&addr_only).login(&host).is_err(), "an address with no credentials is anonymous");
+    }
+
     /// One prune command sends its filters to every prune: volumes and
     /// networks go only when their labels match, as in Docker; a volume
     /// with driver options is never pruned; networks take `until`.
