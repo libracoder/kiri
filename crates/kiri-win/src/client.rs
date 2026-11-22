@@ -211,6 +211,17 @@ pub fn get_background(path: &str) -> io::Result<Value> {
     Ok(r.json())
 }
 
+/// `get_quick`, marked as the window's own: the panel's polling /info has
+/// to answer fast, and may not count as use, or the VM never sleeps while
+/// the window is open (#668).
+pub fn get_background_quick(path: &str) -> io::Result<Value> {
+    let r = request_within("GET", path, None, true, Some(QUICK))?;
+    if !r.ok() {
+        return Err(io::Error::other(r.error()));
+    }
+    Ok(r.json())
+}
+
 /// The docker CLI Kiri ships, as the Mac's `docker_cli` (for builds.rs).
 pub fn docker_cli() -> Option<String> {
     Some(crate::detail::docker_cli())

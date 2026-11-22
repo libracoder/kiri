@@ -309,7 +309,7 @@ fn wakes(launch: bool, stopped: Option<bool>) -> bool {
 /// Whether Kiri was stopped (Stop in the window or the tray): then it stays
 /// off until Start. None when the engine's /info did not answer.
 fn stopped() -> Option<bool> {
-    client::get("/info").ok().map(|i| i["KiriStopped"] == true)
+    client::get_background("/info").ok().map(|i| i["KiriStopped"] == true)
 }
 
 /// The daemon's wake; a Linux host has no VM to wake, which is fine.
@@ -442,7 +442,9 @@ fn refresh() {
 
 /// The sidebar's engine panel and the tray menu's state.
 fn vm_panel() {
-    match client::get_quick("/info") {
+    // The window's own check-in, not use of the engine: counting it kept
+    // the VM awake for as long as the window was open (#668).
+    match client::get_background_quick("/info") {
         Ok(info) => {
             // A Linux host has no VM to put to sleep: it is always awake.
             let awake = info["KiriVmAwake"].as_bool().unwrap_or(true);
