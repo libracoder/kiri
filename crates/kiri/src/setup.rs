@@ -712,6 +712,16 @@ fn zdotdir(home: &Path) -> PathBuf {
 /// link to a dotfiles folder that moved made the app's first launch quit
 /// with only "No such file or directory" (#250).
 fn shell_path(home: &Path, zdotdir: &Path) -> io::Result<()> {
+    // The profiles are written once, at the first setup that reaches them:
+    // a person whose dotfiles tool takes the lines back out keeps them out,
+    // instead of Kiri putting them back on every launch (#556, points 3
+    // and 4 of #457). `--uninstall` takes the note with the lines, so a
+    // later setup writes them again.
+    let once = home.join(crate::flavor::STATE.get()).join(".profiles-written");
+    if once.is_file() {
+        return Ok(());
+    }
+    let _ = std::fs::write(&once, b"");
     for (file, line) in profiles(home, zdotdir) {
         // A link to nothing (or to a place Kiri can't reach): writing
         // through it fails when the target's folder is gone (#250), or makes
@@ -744,6 +754,7 @@ fn shell_path(home: &Path, zdotdir: &Path) -> io::Result<()> {
 }
 
 fn remove_shell_path(home: &Path, zdotdir: &Path) -> io::Result<()> {
+    let _ = std::fs::remove_file(home.join(crate::flavor::STATE.get()).join(".profiles-written"));
     for (file, line) in profiles(home, zdotdir) {
         let Ok(text) = std::fs::read_to_string(&file) else { continue };
         if !text.contains(PROFILE_MARK) {
