@@ -58,6 +58,34 @@ pub fn event() -> String {
     .to_string()
 }
 
+/// This process's tree, by each process's parent pid: the children it could
+/// have made. A pid whose process exited may belong to a newer one now: a
+/// child older than the parent it is matched to was made by the pid's earlier
+/// holder and is not ours, so its subtree stays out (#190). Without a creation
+/// time for one side, the link stands, as before.
+#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
+fn tree(all: &[(u32, u32)], me: u32, born: impl Fn(u32) -> Option<u64>) -> Vec<u32> {
+    let mut tree = vec![me];
+    let mut i = 0;
+    while i < tree.len() {
+        let parent = tree[i];
+        let made = born(parent);
+        tree.extend(
+            all.iter()
+                .filter(|p| {
+                    p.1 == parent
+                        && p.0 != parent
+                        && !tree.contains(&p.0)
+                        && made.map_or(true, |at| born(p.0).map_or(true, |c| c >= at))
+                })
+                .map(|p| p.0)
+                .collect::<Vec<_>>(),
+        );
+        i += 1;
+    }
+    tree
+}
+
 #[cfg(target_os = "macos")]
 fn procs() -> Vec<Proc> {
     // WebKit's processes are launchd's children, not ours: macOS says which
@@ -129,8 +157,10 @@ fn sample(pid: libc::pid_t, part: &'static str) -> Option<Proc> {
 #[cfg(target_os = "linux")]
 fn procs() -> Vec<Proc> {
     let me = std::process::id();
-    // pid, parent, name: field 2 of /proc/<pid>/stat is the name in brackets, then state and parent.
-    let all: Vec<(u32, u32, String)> = std::fs::read_dir("/proc")
+    // pid, parent, born, name: field 2 of /proc/<pid>/stat is the name in
+    // brackets, then state and parent; starttime, field 22, is ticks since
+    // boot, to tell a real child from one whose parent pid was reused (#190).
+    let all: Vec<(u32, u32, u64, String)> = std::fs::read_dir("/proc")
         .into_iter()
         .flatten()
         .flatten()
@@ -138,21 +168,17 @@ fn procs() -> Vec<Proc> {
         .filter_map(|pid| {
             let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
             let (name, rest) = stat.split_once(" (")?.1.rsplit_once(") ")?;
-            Some((pid, rest.split(' ').nth(1)?.parse().ok()?, name.to_owned()))
+            let f: Vec<u64> = rest.split(' ').map(|x| x.parse().unwrap_or(0)).collect();
+            Some((pid, *f.get(1)? as u32, *f.get(19)?, name.to_owned()))
         })
         .collect();
-    let mut tree = vec![me];
-    let mut i = 0;
-    while i < tree.len() {
-        let parent = tree[i];
-        tree.extend(all.iter().filter(|p| p.1 == parent && !tree.contains(&p.0)).map(|p| p.0).collect::<Vec<_>>());
-        i += 1;
-    }
+    let pairs: Vec<(u32, u32)> = all.iter().map(|p| (p.0, p.1)).collect();
+    let tree = tree(&pairs, me, |pid| all.iter().find(|p| p.0 == pid).map(|p| p.2));
     // SAFETY: sysconf has no preconditions.
     let tick_ns = 1_000_000_000 / u64::try_from(unsafe { libc::sysconf(libc::_SC_CLK_TCK) }).unwrap_or(100).max(1);
     tree.into_iter()
         .filter_map(|pid| {
-            let name = &all.iter().find(|p| p.0 == pid)?.2;
+            let name = &all.iter().find(|p| p.0 == pid)?.3;
             let part = if pid == me {
                 "Window"
             } else if name.starts_with("WebKitWebProces") {
@@ -202,14 +228,24 @@ fn procs() -> Vec<Proc> {
         CloseHandle(snap);
     }
     let me = std::process::id();
-    let mut tree = vec![me];
-    let mut i = 0;
-    while i < tree.len() {
-        let parent = tree[i];
-        tree.extend(all.iter().filter(|p| p.1 == parent && p.0 != parent && !tree.contains(&p.0)).map(|p| p.0).collect::<Vec<_>>());
-        i += 1;
-    }
     let ft = |f: FILETIME| (u64::from(f.dwHighDateTime) << 32 | u64::from(f.dwLowDateTime)) * 100;
+    // Each pid's creation time: a parent whose process exited may have had
+    // its pid taken by a newer one, whose subtree is not ours (#190).
+    let born = |pid: u32| -> Option<u64> {
+        // SAFETY: a query-only handle, read and closed.
+        unsafe {
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if h == 0 {
+                return None;
+            }
+            let (mut c, mut x, mut k, mut u) = (std::mem::zeroed(), std::mem::zeroed(), std::mem::zeroed(), std::mem::zeroed());
+            let at = if GetProcessTimes(h, &mut c, &mut x, &mut k, &mut u) != 0 { ft(c) } else { 0 };
+            CloseHandle(h);
+            (at != 0).then_some(at)
+        }
+    };
+    let pairs: Vec<(u32, u32)> = all.iter().map(|p| (p.0, p.1)).collect();
+    let tree = tree(&pairs, me, born);
     let mut out = Vec::new();
     for pid in tree {
         let name = all.iter().find(|p| p.0 == pid).map(|p| p.2.to_ascii_lowercase()).unwrap_or_default();
@@ -236,4 +272,39 @@ fn procs() -> Vec<Proc> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tree;
+
+    #[test]
+    fn pid_reuse_keeps_an_unrelated_subtree_out() {
+        // #190: a subtree's parent exited, its pid named a newer process, and
+        // the walk counted the orphans with our window: 826 MB of an office
+        // suite in the figure.
+        let all = [(1, 0), (2, 1), (3, 2), (4, 1)];
+        // born: 1 at 1000; 2 at 10, older than 1 is now, so not ours; 4 at 1010, ours.
+        let born = |pid| match pid {
+            1 => Some(1000),
+            2 => Some(10),
+            3 => Some(20),
+            4 => Some(1010),
+            _ => None,
+        };
+        assert_eq!(tree(&all, 1, born), vec![1, 4]);
+    }
+
+    #[test]
+    fn the_tree_keeps_every_child_its_parent_made() {
+        let all = [(1, 0), (2, 1), (3, 1), (4, 2)];
+        assert_eq!(tree(&all, 1, |pid| Some(u64::from(pid) * 10)), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn a_parent_of_unknown_age_keeps_its_children() {
+        // Without the parent's creation time the link stands, as before.
+        let all = [(1, 0), (2, 1)];
+        assert_eq!(tree(&all, 1, |pid| (pid != 1).then_some(5)), vec![1, 2]);
+    }
 }
