@@ -65,7 +65,7 @@ t("the file's tab: an edit asks what Apply will do, and Apply lights up only onc
 t("the plan is compared with what runs: a stopped service starts, an edit made elsewhere or a newer image recreates", () => {
   const ta = $("cmp-ta"); ta.value = ta.value + "\n"; ta.dispatchEvent(new Event("input"));
   kiri.on({ type: "composeplan", name: "shop", seq: cmp.seq, steps: [{ n: "db", act: "chg", what: ["outside"], from: "postgres:16", to: "postgres:16" }, { n: "web", act: "start", what: [] }, { n: "old", act: "rm", what: [] }], services: PROJECTS.projects[0].services });
-  eq(document.querySelector("#cmp-plan li.a-chg .why").textContent, "the file changed outside Kiri", "says why db is recreated");
+  eq(document.querySelector("#cmp-plan li.a-chg .why").textContent, "the file changed outside Kiribra", "says why db is recreated");
   eq(document.querySelector("#cmp-plan li.a-start .act").textContent, "Start", "a stopped service is started");
   eq(document.querySelector("#cmp-plan li.a-rm .why").textContent.includes("volumes stay"), true, "a removed service keeps its volumes");
 });
@@ -186,13 +186,13 @@ t("a Compose container is in Compose only: under its project, its address under 
   eq([document.querySelector('#content tr[data-key="w1"]'), document.querySelector("#content .empty h3")?.textContent], [null, "Your only container is in a Compose project"], "not in Containers");
   show("compose");
 });
-t("Apply sends what the draft was made from; a file changed outside Kiri offers Reload or Keep editing", () => {
+t("Apply sends what the draft was made from; a file changed outside Kiribra offers Reload or Keep editing", () => {
   cmpOpen("shop"); kiri.on(PROJECTS);
   kiri.on({ type: "composefile", name: "shop", path: "/w/shop/compose.yaml", text: "services:\n  db:\n    image: postgres:16\n", hash: "h1", mtime: 1 });
   click(document.querySelector('[data-cmptab="file"]'));
   kiri.on({ type: "composeplan", name: "shop", seq: cmp.seq, steps: [{ n: "db", act: "same", what: [] }], services: PROJECTS.projects[0].services });
   eq([$("cmp-edstate").textContent, document.querySelector("[data-cmpapply]").disabled], ["Saved, matches what runs", true], "unedited, and the plan says so");
-  // Unedited: a change outside Kiri is taken in, and planned against what runs.
+  // Unedited: a change outside Kiribra is taken in, and planned against what runs.
   sent.length = 0;
   kiri.on({ type: "composefile", name: "shop", path: "/w/shop/compose.yaml", text: "services:\n  db:\n    image: postgres:17\n", hash: "h2", mtime: 2 });
   eq([$("cmp-ta").value.includes("postgres:17"), $("cmp-edstate").textContent === "Saved, matches what runs"], [true, false], "the new file, no claim yet");
@@ -201,7 +201,7 @@ t("Apply sends what the draft was made from; a file changed outside Kiri offers 
   const ta = $("cmp-ta"); ta.value = ta.value.replace("postgres:17", "postgres:18"); ta.dispatchEvent(new Event("input"));
   sent.length = 0; click(document.querySelector("[data-cmpapply]"));
   eq(sent.find((m) => m.type === "composeapply")?.value.base, "h2", "the hash it was made from");
-  kiri.on({ type: "composeapply", name: "shop", done: true, ok: false, conflict: true, error: "The file changed outside Kiri" });
+  kiri.on({ type: "composeapply", name: "shop", done: true, ok: false, conflict: true, error: "The file changed outside Kiribra" });
   kiri.on({ type: "composefile", name: "shop", path: "/w/shop/compose.yaml", text: "services:\n  db:\n    image: mysql:8\n", hash: "h3", mtime: 3 });
   const box = document.querySelector("#cmp-conflict .cmp-conflict");
   eq([!!box, $("cmp-ta").value.includes("postgres:18"), document.querySelector("[data-cmpapply]").disabled], [true, true, true], "asks; the edits stay; no Apply meanwhile");
@@ -213,7 +213,7 @@ t("Apply sends what the draft was made from; a file changed outside Kiri offers 
   eq(!!document.querySelector("#cmp-conflict .cmp-conflict"), false, "no banner for the version kept over");
   sent.length = 0; click(document.querySelector("[data-cmpapply]"));
   eq(sent.find((m) => m.type === "composeapply")?.value.base, "h2", "Apply after Keep editing: still the old base, so it can't overwrite");
-  kiri.on({ type: "composeapply", name: "shop", done: true, ok: false, conflict: true, hash: "h3", error: "The file changed outside Kiri" });
+  kiri.on({ type: "composeapply", name: "shop", done: true, ok: false, conflict: true, hash: "h3", error: "The file changed outside Kiribra" });
   kiri.on({ type: "composefile", name: "shop", path: "/w/shop/compose.yaml", text: "services:\n  db:\n    image: mysql:8\n", hash: "h3", mtime: 3 });
   const again = document.querySelector("#cmp-conflict .cmp-conflict");
   eq([!!again, $("cmp-ta").value.includes("postgres:18")], [true, true], "the conflict shows again; the edits stay");
@@ -287,9 +287,9 @@ t("Start all and Remove project go to Compose by the project's name", () => {
   eq([m?.name, ["start", "stop"].includes(m?.value.action), sent.some((x) => x.type === "container")], ["shop", true, false], "one command, not one per container");
 });
 t("a project whose file is gone says so plainly, and its logs still load", () => {
-  kiri.on({ type: "composefile", name: "shop", error: "Kiri can't find this project's compose file" });
+  kiri.on({ type: "composefile", name: "shop", error: "Kiribra can't find this project's compose file" });
   click(document.querySelector('[data-cmptab="file"]'));
-  eq($("cmp-tab").textContent.trim(), "Kiri can't find this project's compose file. Its logs, Start, Stop and Remove still work.", "no raw error");
+  eq($("cmp-tab").textContent.trim(), "Kiribra can't find this project's compose file. Its logs, Start, Stop and Remove still work.", "no raw error");
   sent.length = 0; click(document.querySelector('[data-cmptab="logs"]'));
   eq(sent.some((m) => m.type === "composelogs" && m.name === "shop"), true, "asks for its logs");
 });

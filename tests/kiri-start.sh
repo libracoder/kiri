@@ -1,5 +1,5 @@
 #!/bin/sh
-# Kiri Linux's kiri-start (contrib/wsl/kiri-linux), in the Alpine it runs
+# Kiribra Linux's kiri-start (contrib/wsl/kiri-linux), in the Alpine it runs
 # on, with a stand-in daemon (python3) that, as the real one, makes its
 # socket and, on SIGTERM, removes it first and exits a few seconds later
 # (crates/kiri/src/daemon/mod.rs, stopping containers).
@@ -32,7 +32,7 @@ if sys.argv[1:] != ["daemon"]: sys.exit(1)
 open("/tmp/launches", "a").write("%d\n" % os.getpid())
 mode = open("/tmp/mode").read().strip()
 if mode == "exits": sys.exit(1)
-s = "/var/lib/kiri-daemon/.kiri/run/docker.sock"
+s = "/var/lib/kiri-daemon/.kiribra/run/docker.sock"
 def term(*_):
     if os.path.exists(s): os.remove(s)
     time.sleep(int(open("/tmp/stopwait").read()) if os.path.exists("/tmp/stopwait") else 4); sys.exit(0)
@@ -44,7 +44,7 @@ if mode == "up":
 while True: time.sleep(1)
 K
   chmod 755 /usr/local/bin/kiri
-  S=/var/lib/kiri-daemon/.kiri/run/docker.sock
+  S=/var/lib/kiri-daemon/.kiribra/run/docker.sock
   daemons() { pgrep -f "/usr/local/bin/[k]iri daemon"; }
   fail=0
   echo up >/tmp/mode

@@ -205,20 +205,20 @@ if ($Uninstall) {
   }
   Step "$dir removed" { Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue }
   # Last, since it asks for approval (Windows shows a UAC prompt): the DNS
-  # rule for <name>.kiri.local, if it was turned on. Declining it, or a
+  # rule for <name>.kiribra.local, if it was turned on. Declining it, or a
   # session with no desktop to ask on, leaves only this rule behind.
-  $nrpt = Get-DnsClientNrptRule -ErrorAction SilentlyContinue | Where-Object { $_.Namespace -contains ".kiri.local" }
+  $nrpt = Get-DnsClientNrptRule -ErrorAction SilentlyContinue | Where-Object { $_.Namespace -contains ".kiribra.local" }
   if ($nrpt) {
     if ([Environment]::UserInteractive) {
-      Step "DNS rule for *.kiri.local removed (asked for approval)" {
-        $p = Start-Process "$PSHOME\powershell.exe" -Verb RunAs -Wait -PassThru -WindowStyle Hidden -ArgumentList "-NoProfile", "-Command", "Get-DnsClientNrptRule | Where-Object { `$_.Namespace -contains '.kiri.local' } | Remove-DnsClientNrptRule -Force; Clear-DnsClientCache"
+      Step "DNS rule for *.kiribra.local removed (asked for approval)" {
+        $p = Start-Process "$PSHOME\powershell.exe" -Verb RunAs -Wait -PassThru -WindowStyle Hidden -ArgumentList "-NoProfile", "-Command", "Get-DnsClientNrptRule | Where-Object { `$_.Namespace -contains '.kiribra.local' } | Remove-DnsClientNrptRule -Force; Clear-DnsClientCache"
         if ($p.ExitCode -ne 0) { throw "exit code $($p.ExitCode)" }
       }
     } else {
-      Write-Host "- DNS rule for *.kiri.local left in place (no desktop to ask for approval on)"
+      Write-Host "- DNS rule for *.kiribra.local left in place (no desktop to ask for approval on)"
     }
-    if (Get-DnsClientNrptRule -ErrorAction SilentlyContinue | Where-Object { $_.Namespace -contains ".kiri.local" }) {
-      Write-Host "  To remove it, in an elevated PowerShell:  Get-DnsClientNrptRule | Where-Object { `$_.Namespace -contains '.kiri.local' } | Remove-DnsClientNrptRule -Force"
+    if (Get-DnsClientNrptRule -ErrorAction SilentlyContinue | Where-Object { $_.Namespace -contains ".kiribra.local" }) {
+      Write-Host "  To remove it, in an elevated PowerShell:  Get-DnsClientNrptRule | Where-Object { `$_.Namespace -contains '.kiribra.local' } | Remove-DnsClientNrptRule -Force"
     }
   }
   if ($problems.Count) { Write-Host "Kiri is removed, with $($problems.Count) step(s) that failed (above)." } else { Write-Host "Kiri is removed." }

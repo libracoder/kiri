@@ -1,5 +1,5 @@
-//! The docker CLI, Compose and buildx versions Kiri ships (bundled in
-//! Kiri.app, downloaded by Kiri Lite), each with the SHA-256 it must match.
+//! The docker CLI, Compose and buildx versions Kiribra ships (bundled in
+//! Kiribra.app, downloaded by Kiribra Lite), each with the SHA-256 it must match.
 //! Shared with xtask, so both always agree.
 
 #![allow(dead_code)]
@@ -17,7 +17,7 @@ pub fn grype_url(v: &str) -> String {
 }
 
 /// The same Grype for Linux, x86-64 and arm64: the engine scans in WSL for
-/// Windows' window, where Kiri's store is.
+/// Windows' window, where Kiribra's store is.
 pub const LINUX_GRYPE: (&str, &str) = ("0.120.1", "0a9ee97ef5ae2ee953b0a80098105052e846cdbe319a57d808b519c33cd1343d");
 pub const LINUX_ARM64_GRYPE: (&str, &str) = ("0.120.1", "29f47391dc283aa79fcc38e65224cd61f64dec0ecfd0db7074128ebf8ff23514");
 
@@ -42,7 +42,7 @@ pub fn buildx_url(v: &str) -> String {
     format!("https://github.com/docker/buildx/releases/download/{v}/{}", buildx_name(v))
 }
 
-/// The same versions for Intel Macs, bundled in the Intel Kiri.app
+/// The same versions for Intel Macs, bundled in the Intel Kiribra.app
 /// (`cargo xtask app --arch x86_64`). Compose and buildx are GitHub's asset
 /// digests; the docker tarball as download.docker.com served it.
 pub const X86_DOCKER_CLI: (&str, &str) = ("29.9.2", "089c3f618df88bdef4f1257d9d604499136a1ec5168b67d194c260acad2b522f");

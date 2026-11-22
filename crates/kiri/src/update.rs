@@ -82,17 +82,17 @@ pub fn latest() -> io::Result<Release> {
     release
 }
 
-/// The running Kiri.app.
+/// The running Kiribra.app.
 pub fn app() -> io::Result<PathBuf> {
     let exe = std::env::current_exe()?.canonicalize()?;
     let app = exe.ancestors().find(|p| p.extension().is_some_and(|e| e == "app")).map(Path::to_path_buf);
-    app.ok_or_else(|| io::Error::other("Kiri updates replace Kiri.app; this binary is not running from one"))
+    app.ok_or_else(|| io::Error::other("Kiribra updates replace Kiribra.app; this binary is not running from one"))
 }
 
 /// `.kiri-update/` beside the app: on the same volume, so installing is a
 /// rename.
 fn stage_dir(app: &Path) -> io::Result<PathBuf> {
-    Ok(app.parent().ok_or_else(|| io::Error::other("Kiri.app has no parent directory"))?.join(".kiri-update"))
+    Ok(app.parent().ok_or_else(|| io::Error::other("Kiribra.app has no parent directory"))?.join(".kiri-update"))
 }
 
 /// Downloads `release`, checks it and stages it for `install_staged`.
@@ -101,7 +101,7 @@ fn stage_dir(app: &Path) -> io::Result<PathBuf> {
 pub fn download(release: &Release, progress: &mut dyn FnMut(u64, Option<u64>), cancel: &AtomicBool) -> io::Result<()> {
     let app = app()?;
     if !newer(&release.version, env!("CARGO_PKG_VERSION")) {
-        return Err(io::Error::other(format!("Kiri {} is not newer than this {}", release.version, env!("CARGO_PKG_VERSION"))));
+        return Err(io::Error::other(format!("Kiribra {} is not newer than this {}", release.version, env!("CARGO_PKG_VERSION"))));
     }
     let dir = stage_dir(&app)?;
     let _ = std::fs::remove_dir_all(&dir);
@@ -121,7 +121,7 @@ pub fn download(release: &Release, progress: &mut dyn FnMut(u64, Option<u64>), c
 
 fn fetch_and_check(release: &Release, app: &Path, dir: &Path, progress: &mut dyn FnMut(u64, Option<u64>), cancel: &AtomicBool) -> io::Result<()> {
     // Download, hashing as it streams to disk.
-    let tgz = dir.join("Kiri.tar.gz");
+    let tgz = dir.join("Kiribra.tar.gz");
     let mut resp = agent().get(&release.url).call().map_err(io::Error::other)?;
     let total = resp.headers().get("content-length").and_then(|v| v.to_str().ok()?.parse::<u64>().ok());
     let mut body = resp.body_mut().with_config().limit(MAX_DOWNLOAD).reader();
@@ -154,9 +154,9 @@ fn fetch_and_check(release: &Release, app: &Path, dir: &Path, progress: &mut dyn
         return Err(io::Error::other("could not unpack the update"));
     }
     let _ = std::fs::remove_file(&tgz);
-    let new_app = unpacked.join("Kiri.app");
+    let new_app = unpacked.join("Kiribra.app");
     check(&new_app, app, &release.version)?;
-    std::fs::rename(&new_app, dir.join("Kiri.app"))?;
+    std::fs::rename(&new_app, dir.join("Kiribra.app"))?;
     let _ = std::fs::remove_dir_all(&unpacked);
     std::fs::write(dir.join("version"), &release.version)?;
     Ok(())
@@ -166,7 +166,7 @@ fn fetch_and_check(release: &Release, app: &Path, dir: &Path, progress: &mut dyn
 pub fn staged() -> Option<String> {
     let dir = stage_dir(&app().ok()?).ok()?;
     let version = std::fs::read_to_string(dir.join("version")).ok()?.trim().to_owned();
-    (dir.join("Kiri.app").is_dir() && newer(&version, env!("CARGO_PKG_VERSION"))).then_some(version)
+    (dir.join("Kiribra.app").is_dir() && newer(&version, env!("CARGO_PKG_VERSION"))).then_some(version)
 }
 
 /// Swaps the staged app in for the running one, checking it again first:
@@ -177,11 +177,11 @@ pub fn install_staged() -> io::Result<String> {
     let Some(version) = staged() else {
         return Err(io::Error::other("no update is staged"));
     };
-    let new_app = dir.join("Kiri.app");
+    let new_app = dir.join("Kiribra.app");
     check(&new_app, &app, &version).inspect_err(|e| crate::diag::error!("staged update failed its checks", version = version, error = e))?;
     // The old app moves aside, the new one takes its place, and the old one
     // is only deleted once the new one is there.
-    let old = dir.join("Kiri.old.app");
+    let old = dir.join("Kiribra.old.app");
     let _ = std::fs::remove_dir_all(&old);
     std::fs::rename(&app, &old)?;
     if let Err(e) = std::fs::rename(&new_app, &app) {
@@ -219,7 +219,7 @@ pub fn restart_engine(expect: &str) -> io::Result<String> {
 }
 
 /// Starts the engine if it is not running: through the LaunchAgent when it
-/// starts this copy of Kiri, so launchd owns the one engine there is, else
+/// starts this copy of Kiribra, so launchd owns the one engine there is, else
 /// as a child of its own session. Returns once it answers.
 pub fn start_engine() -> io::Result<()> {
     if crate::client::alive() {
@@ -313,12 +313,12 @@ pub fn wait_for_version(expect: &str, limit: std::time::Duration) -> Option<Stri
     last
 }
 
-/// Whether `new_app` is a genuine Kiri `promised`, newer than this build.
+/// Whether `new_app` is a genuine Kiribra `promised`, newer than this build.
 fn check(new_app: &Path, app: &Path, promised: &str) -> io::Result<()> {
     // A valid signature is not enough: `--verify` alone passes for any
     // self-consistent signature, including an attacker's own Developer ID or
     // an ad-hoc one. Pin the update to the SAME signing identity as the app
-    // already installed (its designated requirement), so only a genuine Kiri
+    // already installed (its designated requirement), so only a genuine Kiribra
     // release is accepted, and require Gatekeeper/notarization acceptance.
     let dr = Command::new("/usr/bin/codesign").args(["-d", "-r", "-"]).arg(app).output()?;
     let requirement = String::from_utf8_lossy(&dr.stdout)
@@ -331,7 +331,7 @@ fn check(new_app: &Path, app: &Path, promised: &str) -> io::Result<()> {
     let mut verify = Command::new("/usr/bin/codesign");
     verify.args(["--verify", "--deep", "--strict"]).arg(format!("-R={requirement}"));
     if !verify.arg(new_app).status()?.success() {
-        return Err(io::Error::other("the update is not signed by Kiri's own signing identity"));
+        return Err(io::Error::other("the update is not signed by Kiribra's own signing identity"));
     }
     if !Command::new("/usr/sbin/spctl").args(["-a", "-t", "exec"]).arg(new_app).status()?.success() {
         return Err(io::Error::other("the update is not notarized"));
@@ -353,10 +353,10 @@ fn check(new_app: &Path, app: &Path, promised: &str) -> io::Result<()> {
     };
     let promised = promised.trim_start_matches('v');
     if version != promised {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("the update is Kiri {version}, but the feed promised {promised}")));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("the update is Kiribra {version}, but the feed promised {promised}")));
     }
     if !newer(&version, env!("CARGO_PKG_VERSION")) {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("the update is Kiri {version}, which is not newer than this {}", env!("CARGO_PKG_VERSION"))));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("the update is Kiribra {version}, which is not newer than this {}", env!("CARGO_PKG_VERSION"))));
     }
     Ok(())
 }
@@ -396,10 +396,10 @@ pub fn run(args: &[String]) -> io::Result<()> {
     let current = env!("CARGO_PKG_VERSION");
     let release = latest()?;
     if !newer(&release.version, current) {
-        println!("Kiri {current} is up to date");
+        println!("Kiribra {current} is up to date");
         return Ok(());
     }
-    println!("Kiri {} is available (this is {current}){}", release.version, if release.notes.is_empty() { String::new() } else { format!(": {}", release.notes) });
+    println!("Kiribra {} is available (this is {current}){}", release.version, if release.notes.is_empty() { String::new() } else { format!(": {}", release.notes) });
     if args.iter().any(|a| a == "--check") {
         return Ok(());
     }
@@ -410,7 +410,7 @@ pub fn run(args: &[String]) -> io::Result<()> {
     let version = install_staged()?;
     // The daemon runs from the app: restart it on the new binary.
     restart_engine(&version)?;
-    println!("updated to Kiri {version}, and the engine runs it");
+    println!("updated to Kiribra {version}, and the engine runs it");
     Ok(())
 }
 

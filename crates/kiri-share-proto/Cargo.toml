@@ -1,6 +1,6 @@
 [package]
 name = "kiri-share-proto"
-description = "Wire protocol between `kiri share` and the Kiri Share edge"
+description = "Wire protocol between `kiri share` and the Kiribra Share edge"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

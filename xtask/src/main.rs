@@ -1,36 +1,36 @@
-//! Build tasks for Kiri. Run with `cargo xtask <task>`.
+//! Build tasks for Kiribra. Run with `cargo xtask <task>`.
 //!
 //!   guest    build kiri-init for the guest and pack guest/out/initramfs.cpio
 //!   kernel   build the guest kernel into guest/out/Image (needs a Docker engine)
 //!   disk     make the empty data disk template guest/out/data.img (needs a Docker engine)
 //!   host     build the `kiri` binary and sign it with the virtualization entitlement
-//!   app      host + target/Kiri.app: the guest, the icon and a bundled docker CLI,
+//!   app      host + target/Kiribra.app: the guest, the icon and a bundled docker CLI,
 //!            Compose and buildx
-//!   app-dev  app + target/dev/Kiri Dev.app: the same app as a second Kiri, with
+//!   app-dev  app + target/dev/Kiribra Dev.app: the same app as a second Kiribra, with
 //!            its own engine, containers and settings (crates/kiri/src/flavor.rs)
 //!            and a DEV band on its icon; never notarized. `app-dev builds`
-//!            makes Kiri Builds.app instead: one more, for one feature
-//!   release  app + target/Kiri-<version>-arm64.tar.gz and its update feed
+//!            makes Kiribra Builds.app instead: one more, for one feature
+//!   release  app + target/Kiribra-<version>-arm64.tar.gz and its update feed
 //!            (latest-mac-arm64.json)
 //!   linux    `kiri` and `kiri-init` for a Linux host, in target/linux/release
-//!            (built in a Linux container: needs a Docker engine, Kiri works)
+//!            (built in a Linux container: needs a Docker engine, Kiribra works)
 //!   windows  target/kiri-windows-x86_64: the x86-64 Linux engine for WSL2,
 //!            kiri-win.exe, the docker CLI, Compose and buildx, and the
 //!            scripts (contrib/windows: kiri.ps1, setup-tools.ps1, kiri-admin.ps1)
 //!   windows-dev  the same bundle with a debug kiri-win.exe for development
-//!   msi      windows + target/Kiri-<version>-x86_64.msi, the per-user installer
+//!   msi      windows + target/Kiribra-<version>-x86_64.msi, the per-user installer
 //!            (installer/windows/kiri.wxs; needs the wix dotnet tool)
 //!   msi-pack the MSI from the bundle already in target/kiri-windows-x86_64
 //!            The four Windows tasks take `--arch arm64` for Windows on Arm:
-//!            target/kiri-windows-aarch64 and Kiri-<version>-arm64.msi
+//!            target/kiri-windows-aarch64 and Kiribra-<version>-arm64.msi
 //!   docker-win-arm64  only the arm64 docker.exe, built from docker/cli's
 //!            source (Docker publishes none), checked against its pin
 //!   all      guest + host
 //!
 //! `--arch x86_64` (or `intel`) makes guest, kernel, host, app, app-lite,
-//! dmg, release and pack build Kiri for Intel Macs instead: an x86-64 guest
+//! dmg, release and pack build Kiribra for Intel Macs instead: an x86-64 guest
 //! in guest/out/x86_64, the host binary for x86_64-apple-darwin, and
-//! target/intel/Kiri.app with Intel builds of the docker CLI, Compose and
+//! target/intel/Kiribra.app with Intel builds of the docker CLI, Compose and
 //! buildx; its DMG, tarball and feed carry `-x86_64` in their names
 //! (latest-mac-x86_64.json), as Apple silicon's carry `-arm64`.
 
@@ -65,7 +65,7 @@ impl Profile {
     }
 }
 
-/// Which Mac a build is for. Kiri ships one app per architecture rather
+/// Which Mac a build is for. Kiribra ships one app per architecture rather
 /// than a universal one: the bundled docker CLI, Compose and buildx are most
 /// of the download, and a universal app would carry both builds of each.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -137,10 +137,10 @@ impl Arch {
     /// The app's folder under target/.
     fn app_dir(self, lite: bool) -> &'static str {
         match (self, lite) {
-            (Arch::Arm64, false) => "target/Kiri.app",
-            (Arch::Arm64, true) => "target/lite/Kiri.app",
-            (Arch::X86_64, false) => "target/intel/Kiri.app",
-            (Arch::X86_64, true) => "target/intel/lite/Kiri.app",
+            (Arch::Arm64, false) => "target/Kiribra.app",
+            (Arch::Arm64, true) => "target/lite/Kiribra.app",
+            (Arch::X86_64, false) => "target/intel/Kiribra.app",
+            (Arch::X86_64, true) => "target/intel/lite/Kiribra.app",
         }
     }
 
@@ -176,7 +176,7 @@ fn main() -> ExitCode {
         "docker-win-arm64" => docker_cli_arm64(&root.join("target/cli-cache")).map(|p| println!("{}", p.display())),
         "app" => app(&root, arch, false, Profile::Release).map(drop),
         "app-lite" => app(&root, arch, true, Profile::Release).map(drop),
-        // `app-dev builds`: Kiri Builds.app, a Kiri Dev of its own for one feature.
+        // `app-dev builds`: Kiribra Builds.app, a Kiribra Dev of its own for one feature.
         "app-dev" => match std::env::args().nth(2) {
             Some(f) if f.is_empty() || !f.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()) || f == "dev" => {
                 eprintln!("a feature name is lower-case letters and digits, not `dev`");
@@ -376,7 +376,7 @@ impl WinArch {
         }
     }
 
-    /// The MSI's name, as Windows says it (Kiri-<version>-arm64.msi).
+    /// The MSI's name, as Windows says it (Kiribra-<version>-arm64.msi).
     fn msi(self) -> &'static str {
         match self {
             WinArch::X64 => "x86_64",
@@ -414,8 +414,8 @@ impl WinArch {
 /// as `linux --arch amd64` is, and kiri-win.exe needs the
 /// x86_64-pc-windows-gnu target and MinGW.
 fn windows(root: &Path, debug: bool, arch: WinArch) -> io::Result<()> {
-    // The static (musl) engine, which runs in Kiri Linux and in Ubuntu, and
-    // Kiri Linux itself (scripts/kiri-linux.sh), built in WSL: on Windows,
+    // The static (musl) engine, which runs in Kiribra Linux and in Ubuntu, and
+    // Kiribra Linux itself (scripts/kiri-linux.sh), built in WSL: on Windows,
     // the default distro, with Rust installed. zig cross-compiles, so
     // either architecture builds in either WSL. `windows-dev` builds the
     // engine with the fast profile; the release bundle with the release one.
@@ -432,8 +432,8 @@ fn windows(root: &Path, debug: bool, arch: WinArch) -> io::Result<()> {
     let profile = if debug { Profile::Fast } else { Profile::Release };
     run(Command::new("wsl.exe").args(["--", "bash", &format!("{src}/scripts/windows-engine.sh"), &src, &out_dir, arch.linux(), profile.dir()]))?;
     run(Command::new("wsl.exe").args(["--", "sh", &format!("{src}/scripts/kiri-linux.sh"), &src, &out_dir, &format!("{out_dir}/kiri-linux.tar.gz"), arch.linux()]))?;
-    // Assemble the bundle first: the engine, Kiri Linux, the docker CLI,
-    // Compose and buildx (pinned, checked, as Kiri.app bundles them) and the
+    // Assemble the bundle first: the engine, Kiribra Linux, the docker CLI,
+    // Compose and buildx (pinned, checked, as Kiribra.app bundles them) and the
     // install scripts. kiri-win is built last, with the SHA-256 of each of
     // these embedded, so setup can refuse a bundle file that was tampered
     // with in the unzipped folder.
@@ -600,7 +600,7 @@ fn dir_size(dir: &Path) -> io::Result<u64> {
     Ok(total)
 }
 
-/// target/Kiri-<version>-x86_64.msi (or -arm64.msi): the per-user Windows
+/// target/Kiribra-<version>-x86_64.msi (or -arm64.msi): the per-user Windows
 /// installer (installer/windows/kiri.wxs) around the bundle in
 /// target/kiri-windows-x86_64 (or -aarch64). Both share one UpgradeCode, so
 /// either replaces the other (kiri.wxs says why); each has its own feed.
@@ -645,7 +645,7 @@ fn msi(root: &Path, arch: WinArch) -> io::Result<()> {
         return Err(io::Error::other(format!("no bundle in {}: run cargo xtask windows (or msi) first", bundle.display())));
     }
     let version = env!("CARGO_PKG_VERSION");
-    let name = format!("Kiri-{version}-{}.msi", arch.msi());
+    let name = format!("Kiribra-{version}-{}.msi", arch.msi());
     let out = root.join("target").join(&name);
     // The dialog art (brand/installer/windows, committed) gets this build's
     // version stamped onto a copy in target/wix-assets, with System.Drawing
@@ -695,7 +695,7 @@ fn msi(root: &Path, arch: WinArch) -> io::Result<()> {
     Ok(())
 }
 
-/// The docker CLI tools bundled into Kiri.app, pinned.
+/// The docker CLI tools bundled into Kiribra.app, pinned.
 /// SHA-256s from the releases (GitHub's asset digests; the docker tarball
 /// as download.docker.com served it), checked before anything is bundled.
 #[path = "../../crates/kiri/src/cli_pins.rs"]
@@ -754,9 +754,9 @@ fn verify(file: &Path, want: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// target/Kiri.app, signed with the virtualization entitlement. `lite`:
-/// target/lite/Kiri.app, without the docker CLI, Compose and buildx, which
-/// Kiri Lite downloads on first launch (src/tools.rs).
+/// target/Kiribra.app, signed with the virtualization entitlement. `lite`:
+/// target/lite/Kiribra.app, without the docker CLI, Compose and buildx, which
+/// Kiribra Lite downloads on first launch (src/tools.rs).
 fn app(root: &Path, arch: Arch, lite: bool, profile: Profile) -> io::Result<PathBuf> {
     host(root, arch, profile)?;
     let version = env!("CARGO_PKG_VERSION");
@@ -784,7 +784,7 @@ fn app(root: &Path, arch: Arch, lite: bool, profile: Profile) -> io::Result<Path
     }
     // The disk template is 64 GiB sparse. Packed as a sparse tarball it is a
     // few hundred KB, and zips, notarization and downloads never see the
-    // 64 GiB; Kiri unpacks it on first boot.
+    // 64 GiB; Kiribra unpacks it on first boot.
     run(Command::new("tar").args(["-cSzf"]).arg(res.join("guest/data.img.tgz")).arg("-C").arg(Arch::Arm64.guest_out(root)?).arg("data.img"))?;
 
     if !lite {
@@ -814,7 +814,7 @@ fn app(root: &Path, arch: Arch, lite: bool, profile: Profile) -> io::Result<Path
     }
 
     // The icon, from the brand PNGs.
-    let iconset = root.join("target/Kiri.iconset");
+    let iconset = root.join("target/Kiribra.iconset");
     let _ = fs::remove_dir_all(&iconset);
     fs::create_dir_all(&iconset)?;
     let png = root.join("brand/icon/png");
@@ -823,7 +823,7 @@ fn app(root: &Path, arch: Arch, lite: bool, profile: Profile) -> io::Result<Path
         let name = if scale == 1 { format!("icon_{size}x{size}.png") } else { format!("icon_{size}x{size}@2x.png") };
         fs::copy(png.join(format!("kiri-app-icon-{px}.png")), iconset.join(name))?;
     }
-    run(Command::new("iconutil").args(["-c", "icns", "-o"]).arg(res.join("Kiri.icns")).arg(&iconset))?;
+    run(Command::new("iconutil").args(["-c", "icns", "-o"]).arg(res.join("Kiribra.icns")).arg(&iconset))?;
     fs::remove_dir_all(&iconset)?;
 
     fs::write(
@@ -833,23 +833,23 @@ fn app(root: &Path, arch: Arch, lite: bool, profile: Profile) -> io::Result<Path
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>CFBundleName</key><string>Kiri</string>
-  <key>CFBundleDisplayName</key><string>Kiri</string>
+  <key>CFBundleName</key><string>Kiribra</string>
+  <key>CFBundleDisplayName</key><string>Kiribra</string>
   <key>CFBundleIdentifier</key><string>dev.kiri.app</string>
   <key>CFBundleExecutable</key><string>kiri</string>
-  <key>CFBundleIconFile</key><string>Kiri</string>
+  <key>CFBundleIconFile</key><string>Kiribra</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>{plain}</string>
   <key>CFBundleVersion</key><string>{plain}</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
   <key>NSHighResolutionCapable</key><true/>
-  <key>NSLocalNetworkUsageDescription</key><string>Kiri lets containers reach devices and services on your network, and serves the ports they publish.</string>
-  <key>NSDesktopFolderUsageDescription</key><string>Kiri shares this folder with containers you mount it into.</string>
-  <key>NSDocumentsFolderUsageDescription</key><string>Kiri shares this folder with containers you mount it into.</string>
-  <key>NSDownloadsFolderUsageDescription</key><string>Kiri saves files you download from containers here, and shares the folder with containers you mount it into.</string>
-  <key>NSRemovableVolumesUsageDescription</key><string>Kiri shares this drive with containers you mount it into.</string>
-  <key>NSNetworkVolumesUsageDescription</key><string>Kiri shares this network drive with containers you mount it into.</string>
+  <key>NSLocalNetworkUsageDescription</key><string>Kiribra lets containers reach devices and services on your network, and serves the ports they publish.</string>
+  <key>NSDesktopFolderUsageDescription</key><string>Kiribra shares this folder with containers you mount it into.</string>
+  <key>NSDocumentsFolderUsageDescription</key><string>Kiribra shares this folder with containers you mount it into.</string>
+  <key>NSDownloadsFolderUsageDescription</key><string>Kiribra saves files you download from containers here, and shares the folder with containers you mount it into.</string>
+  <key>NSRemovableVolumesUsageDescription</key><string>Kiribra shares this drive with containers you mount it into.</string>
+  <key>NSNetworkVolumesUsageDescription</key><string>Kiribra shares this network drive with containers you mount it into.</string>
 </dict>
 </plist>
 "#
@@ -861,16 +861,16 @@ fn app(root: &Path, arch: Arch, lite: bool, profile: Profile) -> io::Result<Path
     Ok(app)
 }
 
-/// target/dev/Kiri Dev.app, from the app just built: its own name and
-/// bundle identifier, which make the binary Kiri Dev, and the icon with a
+/// target/dev/Kiribra Dev.app, from the app just built: its own name and
+/// bundle identifier, which make the binary Kiribra Dev, and the icon with a
 /// DEV band. Signed again without the hardened runtime or a timestamp: it
 /// is never notarized, and the timestamp asks Apple's server on every build.
-/// With a feature, `builds`: target/dev/Kiri Builds.app, `dev.kiri.app.builds`,
-/// a BUILDS band, and its own engine beside Kiri's and Kiri Dev's.
+/// With a feature, `builds`: target/dev/Kiribra Builds.app, `dev.kiribra.app.builds`,
+/// a BUILDS band, and its own engine beside Kiribra's and Kiribra Dev's.
 fn app_dev(root: &Path, built: &Path, feature: Option<&str>) -> io::Result<()> {
     let (name, id, band, state) = match feature {
-        None => ("Kiri Dev".to_owned(), "dev.kiri.app.dev".to_owned(), "DEV".to_owned(), "kiri-dev".to_owned()),
-        Some(f) => (format!("Kiri {}{}", f[..1].to_ascii_uppercase(), &f[1..]), format!("dev.kiri.app.{f}"), f.to_ascii_uppercase(), format!("kiri-{f}")),
+        None => ("Kiribra Dev".to_owned(), "dev.kiribra.app.dev".to_owned(), "DEV".to_owned(), "kiribra-dev".to_owned()),
+        Some(f) => (format!("Kiribra {}{}", f[..1].to_ascii_uppercase(), &f[1..]), format!("dev.kiribra.app.{f}"), f.to_ascii_uppercase(), format!("kiri-{f}")),
     };
     let dir = root.join("target/dev");
     let app = dir.join(format!("{name}.app"));
@@ -879,8 +879,8 @@ fn app_dev(root: &Path, built: &Path, feature: Option<&str>) -> io::Result<()> {
     run(Command::new("ditto").arg(built).arg(&app))?;
     let contents = app.join("Contents");
     let plist = fs::read_to_string(contents.join("Info.plist"))?
-        .replace("<key>CFBundleName</key><string>Kiri</string>", &format!("<key>CFBundleName</key><string>{name}</string>"))
-        .replace("<key>CFBundleDisplayName</key><string>Kiri</string>", &format!("<key>CFBundleDisplayName</key><string>{name}</string>"))
+        .replace("<key>CFBundleName</key><string>Kiribra</string>", &format!("<key>CFBundleName</key><string>{name}</string>"))
+        .replace("<key>CFBundleDisplayName</key><string>Kiribra</string>", &format!("<key>CFBundleDisplayName</key><string>{name}</string>"))
         .replace("<string>dev.kiri.app</string>", &format!("<string>{id}</string>"));
     fs::write(contents.join("Info.plist"), plist)?;
 
@@ -903,7 +903,7 @@ fn app_dev(root: &Path, built: &Path, feature: Option<&str>) -> io::Result<()> {
         run(Command::new("iconutil").args(["-c", "icns", "-o"]).arg(&icns).arg(&iconset))?;
         fs::remove_dir_all(&iconset)?;
     }
-    fs::copy(&icns, contents.join("Resources/Kiri.icns"))?;
+    fs::copy(&icns, contents.join("Resources/Kiribra.icns"))?;
 
     // An executable UUID of its own (macho.rs): macOS's Local Network
     // permission follows it, and the copies of one build would share it.
@@ -948,13 +948,13 @@ fn sign(identity: &str, entitlements: Option<&Path>) -> Command {
     c
 }
 
-/// target/Kiri-<version>-arm64.dmg (-x86_64 for Intel): the app and an Applications shortcut, signed,
+/// target/Kiribra-<version>-arm64.dmg (-x86_64 for Intel): the app and an Applications shortcut, signed,
 /// then notarized by Apple in one submission, with the ticket stapled to the
 /// DMG and the app so Gatekeeper opens both offline. `KIRI_NOTARY_PROFILE`
 /// names credentials stored with `xcrun notarytool store-credentials`;
 /// unset or empty (as CI sets it when not notarizing) skips this.
 /// The drag-to-install disk image: a fixed
-/// Finder window with Kiri on the left, Applications on the right and an
+/// Finder window with Kiribra on the left, Applications on the right and an
 /// arrow between them (scripts/dmg-background.swift draws it,
 /// scripts/dmg-settings.py places the icons). dmgbuild writes the window's
 /// .DS_Store directly, with no Finder or AppleScript; it is installed,
@@ -1001,7 +1001,7 @@ fn dmg(root: &Path, app: &Path, arch: Arch, lite: bool) -> io::Result<PathBuf> {
     let bg = root.join("target/dmg-background");
     fs::create_dir_all(&bg)?;
     run(Command::new("swift").arg(root.join("scripts/dmg-background.swift")).arg(bg.join("background")))?;
-    let dmg = root.join(format!("target/Kiri-{}{version}{}.dmg", if lite { "Lite-" } else { "" }, arch.suffix()));
+    let dmg = root.join(format!("target/Kiribra-{}{version}{}.dmg", if lite { "Lite-" } else { "" }, arch.suffix()));
     let _ = fs::remove_file(&dmg);
     run(Command::new(&dmgbuild)
         .arg("-s")
@@ -1011,10 +1011,10 @@ fn dmg(root: &Path, app: &Path, arch: Arch, lite: bool) -> io::Result<PathBuf> {
         .arg("-D")
         .arg(format!("background={}", bg.join("background.png").display()))
         .arg(match (lite, arch) {
-            (false, Arch::Arm64) => "Kiri",
-            (true, Arch::Arm64) => "Kiri Lite",
-            (false, Arch::X86_64) => "Kiri for Intel",
-            (true, Arch::X86_64) => "Kiri Lite for Intel",
+            (false, Arch::Arm64) => "Kiribra",
+            (true, Arch::Arm64) => "Kiribra Lite",
+            (false, Arch::X86_64) => "Kiribra for Intel",
+            (true, Arch::X86_64) => "Kiribra Lite for Intel",
         })
         .arg(&dmg))?;
     run(sign(&signing_identity(), None).arg(&dmg))?;
@@ -1061,18 +1061,18 @@ fn feed_notes() -> io::Result<String> {
     Ok(extra)
 }
 
-/// target/Kiri-<version>-arm64.tar.gz (sparse-aware, so the disk template
+/// target/Kiribra-<version>-arm64.tar.gz (sparse-aware, so the disk template
 /// stays small) and target/latest-mac-arm64.json, the feed that Mac's app
 /// reads (crates/kiri/src/update.rs); for Intel, -x86_64 in both.
 fn release(root: &Path, app: &Path, arch: Arch) -> io::Result<()> {
     let version = env!("CARGO_PKG_VERSION");
     let suffix = arch.suffix();
-    let tarball = root.join(format!("target/Kiri-{version}{suffix}.tar.gz"));
-    run(Command::new("tar").args(["-cSzf"]).arg(&tarball).arg("-C").arg(app.parent().unwrap_or(root)).arg("Kiri.app"))?;
+    let tarball = root.join(format!("target/Kiribra-{version}{suffix}.tar.gz"));
+    run(Command::new("tar").args(["-cSzf"]).arg(&tarball).arg("-C").arg(app.parent().unwrap_or(root)).arg("Kiribra.app"))?;
     let sum = sha256(&tarball)?;
     let base = std::env::var("KIRI_RELEASE_BASE").unwrap_or_else(|_| "https://download.runkiri.com".to_owned());
     let extra = feed_notes()?;
-    let feed = format!("{{\"version\":\"{version}\",\"url\":\"{base}/Kiri-{version}{suffix}.tar.gz\",\"sha256\":\"{sum}\"{extra}}}\n");
+    let feed = format!("{{\"version\":\"{version}\",\"url\":\"{base}/Kiribra-{version}{suffix}.tar.gz\",\"sha256\":\"{sum}\"{extra}}}\n");
     let feed_path = root.join(format!("target/latest-mac{suffix}.json"));
     fs::write(&feed_path, &feed)?;
     println!("{} ({} KiB)\n{}", tarball.display(), fs::metadata(&tarball)?.len() / 1024, feed_path.display());

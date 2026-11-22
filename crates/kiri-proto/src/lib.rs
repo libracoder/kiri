@@ -1,4 +1,4 @@
-//! Wire protocol between the Kiri host and the guest agent.
+//! Wire protocol between the Kiribra host and the guest agent.
 //!
 //! Every frame is `len: u32 LE | kind: u16 LE | payload`, where `len` counts
 //! `kind` plus `payload`. Encoding writes into a caller-owned buffer and

@@ -56,7 +56,7 @@ pub fn from_page(source: &str) -> bool {
     source == PAGE_URL
 }
 
-/// The window's page when Kiri's own could not load: the reason, in a page
+/// The window's page when Kiribra's own could not load: the reason, in a page
 /// small enough for NavigateToString (a few hundred bytes and the reason).
 pub fn error_page(reason: &str) -> String {
     let esc: String = reason
@@ -71,11 +71,11 @@ pub fn error_page(reason: &str) -> String {
         })
         .collect();
     format!(
-        "<!doctype html><meta charset=utf-8><title>Kiri</title>\
+        "<!doctype html><meta charset=utf-8><title>Kiribra</title>\
 <style>body{{font:14px 'Segoe UI',sans-serif;margin:40px;color:#1b1f24;background:#f5f7fa}}\
 @media (prefers-color-scheme:dark){{body{{color:#e6e9ee;background:#0f1419}}}}code{{white-space:pre-wrap}}</style>\
-<h1 style=\"font-size:18px\">Kiri's window could not load</h1><p><code>{esc}</code></p>\
-<p>This is also in %LOCALAPPDATA%\\Kiri\\kiri-win.log. Quit Kiri from the tray icon and open it again; \
+<h1 style=\"font-size:18px\">Kiribra's window could not load</h1><p><code>{esc}</code></p>\
+<p>This is also in %LOCALAPPDATA%\\Kiribra\\kiri-win.log. Quit Kiribra from the tray icon and open it again; \
 if this comes back, please report it with that log.</p>"
     )
 }

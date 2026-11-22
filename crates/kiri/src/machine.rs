@@ -3,7 +3,7 @@
 //! name and uid inside (and passwordless sudo), and the homes folder
 //! (`/Users` on a Mac, `/home` on Linux) at the same path as on the host.
 //! `kiri machine shell` opens a login shell in it. On Windows the commands
-//! run as root in Kiri's WSL distro (crates/kiri/src/wsl.rs), so the
+//! run as root in Kiribra's WSL distro (crates/kiri/src/wsl.rs), so the
 //! machine's user is root there.
 
 use std::io;
@@ -37,7 +37,7 @@ fn ok(r: io::Result<client::Response>) -> io::Result<client::Response> {
 
 pub fn run(args: &[String]) -> io::Result<()> {
     if !client::alive() {
-        return Err(io::Error::other("kiri daemon is not running: open Kiri.app or run `kiri daemon`"));
+        return Err(io::Error::other("kiri daemon is not running: open Kiribra.app or run `kiri daemon`"));
     }
     let name = args.get(1).map(String::as_str).unwrap_or_default();
     let need_name = || if name.is_empty() { Err(io::Error::other("name a machine")) } else { Ok(()) };
@@ -180,14 +180,14 @@ fn urlish(s: &str) -> String {
 /// it is under HOMES, else in the user's home. The docker CLI handles the
 /// terminal.
 fn shell(name: &str, cmd: &[&str]) -> io::Result<()> {
-    let docker = client::docker_cli().ok_or_else(|| io::Error::other("no docker CLI found (Kiri.app bundles one)"))?;
+    let docker = client::docker_cli().ok_or_else(|| io::Error::other("no docker CLI found (Kiribra.app bundles one)"))?;
     let (user, _, _) = user();
     let home = home(&user);
     let cwd = std::env::current_dir().ok().filter(|d| d.starts_with(HOMES)).map_or_else(|| home.clone(), |d| d.display().to_string());
     let mut c = Command::new(docker);
     // The engine the other machine commands use (client::socket(), so
     // KIRI_SOCKET too), as `kiri exec` does, not a docker context: with
-    // `--context kiri`, a second Kiri's machines (or any, once that context
+    // `--context kiri`, a second Kiribra's machines (or any, once that context
     // was removed or pointed elsewhere) were "No such container".
     c.env("DOCKER_HOST", format!("unix://{}", client::socket()?.display())).env_remove("DOCKER_CONTEXT");
     // SAFETY: isatty has no preconditions.

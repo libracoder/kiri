@@ -1,4 +1,4 @@
-// A Kiri Dev window with four containers, two of them shared: what the
+// A Kiribra Dev window with four containers, two of them shared: what the
 // tests start from. `sent` records what the page asks the app to do.
 document.body.classList.add("dev");ui.status={dev:true};
 kiri.on({type:"state",state:"running"});

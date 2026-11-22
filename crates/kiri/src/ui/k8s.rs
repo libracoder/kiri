@@ -95,13 +95,13 @@ fn connect() -> io::Result<UnixStream> {
     Ok(s)
 }
 
-/// Writes one request marked as the window's own (`X-Kiri-Background`), so
+/// Writes one request marked as the window's own (`X-Kiribra-Background`), so
 /// refreshing the lists never counts as use of the VM.
 fn write_request(s: &mut UnixStream, method: &str, path: &str, body: Option<&Value>, extra: &str) -> io::Result<()> {
     let payload = body.map(Value::to_string).unwrap_or_default();
     write!(
         s,
-        "{method} {path} HTTP/1.1\r\nHost: kiri\r\nX-Kiri-Background: 1\r\n{extra}Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
+        "{method} {path} HTTP/1.1\r\nHost: kiri\r\nX-Kiribra-Background: 1\r\n{extra}Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
         payload.len()
     )
 }
@@ -455,7 +455,7 @@ fn stop_logs() {
 #[cfg(test)]
 mod tests {
     /// Against a running cluster (`kiri k8s start`), read-only:
-    /// `KIRI_LIVE_K8S=1 KIRI_SOCKET=~/.kiri-dev/run/docker.sock cargo test -p kiri live_k8s_lists -- --nocapture`.
+    /// `KIRI_LIVE_K8S=1 KIRI_SOCKET=~/.kiribra-dev/run/docker.sock cargo test -p kiri live_k8s_lists -- --nocapture`.
     #[test]
     fn live_k8s_lists() {
         if std::env::var_os("KIRI_LIVE_K8S").is_none() {

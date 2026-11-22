@@ -1,4 +1,4 @@
-//! `kiri hostrelay`: lets Kiri's engine in WSL2 reach a proxy on Windows' own
+//! `kiri hostrelay`: lets Kiribra's engine in WSL2 reach a proxy on Windows' own
 //! loopback, `127.0.0.1:7892`, where most Windows proxy apps listen. In
 //! WSL's default NAT networking the distro's 127.0.0.1 is its own, and
 //! Windows' firewall keeps the WSL network away from Windows' ports, so a

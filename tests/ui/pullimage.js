@@ -55,16 +55,16 @@ t("Esc goes back to the search, Esc again closes", () => {
 });
 t("a full reference is pulled exactly as written, and its row is at the top at once", () => {
   sent.length = 0;
-  openPull("ghcr.io/kiri-dev/api:0.4");
+  openPull("ghcr.io/kiribra-dev/api:0.4");
   const first = pop.querySelector(".pp-it");
-  eq([first.classList.contains("exact"), first.querySelector("small").textContent], [true, "ghcr.io/kiri-dev/api:0.4"], "exact");
+  eq([first.classList.contains("exact"), first.querySelector("small").textContent], [true, "ghcr.io/kiribra-dev/api:0.4"], "exact");
   eq(pop.querySelector(".reg").textContent, "ghcr.io", "registry");
   key("Enter");
-  eq(sent.filter((m) => m.type === "pull").map((m) => m.name), ["ghcr.io/kiri-dev/api:0.4"], "sent");
+  eq(sent.filter((m) => m.type === "pull").map((m) => m.name), ["ghcr.io/kiribra-dev/api:0.4"], "sent");
   eq(pop.hidden, true, "closed");
   const row = document.querySelector('#content tr.prow');
-  eq(row.dataset.key, "pull:ghcr.io/kiri-dev/api:0.4", "row");
-  eq(/Asking ghcr.io for kiri-dev\/api:0.4/.test(row.textContent), true, "asking");
+  eq(row.dataset.key, "pull:ghcr.io/kiribra-dev/api:0.4", "row");
+  eq(/Asking ghcr.io for kiribra-dev\/api:0.4/.test(row.textContent), true, "asking");
   eq(!!row.querySelector(".tile .hspin") && !row.querySelector("button .hspin"), true, "spinner in the tile");
 });
 t("Hub names are pulled as the engine names them", () => {
@@ -81,7 +81,7 @@ t("progress fills the row in place and the status bar counts the pulls", () => {
   kiri.on({ type: "pull", state: "progress", name: "node:22", got: 4e7, total: 8e7 });
   eq(cell.isConnected && cell.querySelector(".pbar span").style.width, "50%", "same cell");
   const rows = [...document.querySelectorAll("#content tr.prow")].map((r) => r.dataset.key);
-  eq(rows, ["pull:node:22", "pull:ghcr.io/kiri-dev/api:0.4"], "several at once, newest first");
+  eq(rows, ["pull:node:22", "pull:ghcr.io/kiribra-dev/api:0.4"], "several at once, newest first");
 });
 t("the status bar item takes you to Images", () => {
   show("containers");
@@ -113,21 +113,21 @@ t("not found: the row says so, with Docker Hub's best guess", () => {
   closePull();
 });
 t("connection lost: Retry pulls it again", () => {
-  kiri.on({ type: "pull", state: "done", name: "ghcr.io/kiri-dev/api:0.4", error: "read tcp 10.0.0.2:5123->140.82.1.1:443: connection reset by peer" });
-  const row = document.querySelector('tr[data-key="pull:ghcr.io/kiri-dev/api:0.4"]');
+  kiri.on({ type: "pull", state: "done", name: "ghcr.io/kiribra-dev/api:0.4", error: "read tcp 10.0.0.2:5123->140.82.1.1:443: connection reset by peer" });
+  const row = document.querySelector('tr[data-key="pull:ghcr.io/kiribra-dev/api:0.4"]');
   eq([row.classList.contains("warn"), /Connection lost/.test(row.textContent)], [true, true], "lost");
   sent.length = 0;
   row.querySelector("[data-pretry]").click();
-  eq(sent.filter((m) => m.type === "pull").map((m) => m.name), ["ghcr.io/kiri-dev/api:0.4"], "again");
+  eq(sent.filter((m) => m.type === "pull").map((m) => m.name), ["ghcr.io/kiribra-dev/api:0.4"], "again");
 });
 t("a private registry: sign-in needed, said in the row", () => {
-  kiri.on({ type: "pull", state: "done", name: "ghcr.io/kiri-dev/api:0.4", error: "Couldn't find an image called ghcr.io/kiri-dev/api. Check the name; if it's private, sign in with docker login." });
-  const row = document.querySelector('tr[data-key="pull:ghcr.io/kiri-dev/api:0.4"]');
-  eq(/Sign-in needed\. ghcr.io wants a sign-in for kiri-dev\/api\./.test(row.textContent.replace(/\s+/g, " ")), true, row.textContent);
+  kiri.on({ type: "pull", state: "done", name: "ghcr.io/kiribra-dev/api:0.4", error: "Couldn't find an image called ghcr.io/kiribra-dev/api. Check the name; if it's private, sign in with docker login." });
+  const row = document.querySelector('tr[data-key="pull:ghcr.io/kiribra-dev/api:0.4"]');
+  eq(/Sign-in needed\. ghcr.io wants a sign-in for kiribra-dev\/api\./.test(row.textContent.replace(/\s+/g, " ")), true, row.textContent);
   // Signing in from the window is held back: the row says docker login, then Retry.
   eq([!!row.querySelector("[data-signin]"), !!row.querySelector("[data-pretry]"), row.textContent.includes("docker login ghcr.io")], [false, true, true], "docker login, then Retry");
   row.querySelector("[data-pdismiss]").click();
-  eq(!!document.querySelector('tr[data-key="pull:ghcr.io/kiri-dev/api:0.4"]'), false, "dismissed");
+  eq(!!document.querySelector('tr[data-key="pull:ghcr.io/kiribra-dev/api:0.4"]'), false, "dismissed");
   eq(document.getElementById("sb-pullt"), null, "nothing pulling");
 });
 t("a click outside closes it; the row's Pull button pulls that image", () => {

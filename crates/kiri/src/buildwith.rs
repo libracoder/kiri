@@ -1,6 +1,6 @@
-//! Which builder plain `docker build` uses: Docker's own, or Kiri's.
+//! Which builder plain `docker build` uses: Docker's own, or Kiribra's.
 //!
-//! On a machine with no other engine, Kiri's, without asking. On one with
+//! On a machine with no other engine, Kiribra's, without asking. On one with
 //! OrbStack, Docker Desktop or another engine, the window asks once
 //! ("Keep building with Docker" is the default), and Settings → Builds
 //! switches it any time, at once, in terminals already open too.
@@ -11,27 +11,27 @@
 //! in which case buildx takes its current builder (`~/.docker/buildx/current`).
 //! Compose and `docker buildx build` take buildx's current builder.
 //!
-//! - Always: a buildx builder named after Kiri's context (`kiri`), a copy
-//!   of Kiri's builder (`kiri-build`: the same BuildKit and cache). A
+//! - Always: a buildx builder named after Kiribra's context (`kiri`), a copy
+//!   of Kiribra's builder (`kiri-build`: the same BuildKit and cache). A
 //!   builder in buildx's store wins over the context of the same name, so
-//!   `docker --context kiri build` builds on Kiri and loads into Kiri,
+//!   `docker --context kiri build` builds on Kiribra and loads into Kiribra,
 //!   where buildx would otherwise ask the engine for a BuildKit of its own,
-//!   which Kiri doesn't have. No other context is touched.
+//!   which Kiribra doesn't have. No other context is touched.
 //! - Build with Docker: nothing more. Builds follow docker's context, as
-//!   they did before Kiri: OrbStack's builds stay OrbStack's, and once
-//!   docker uses Kiri, builds run on Kiri.
-//! - Build with Kiri: the `builder` alias, and Kiri's builder as buildx's
+//!   they did before Kiribra: OrbStack's builds stay OrbStack's, and once
+//!   docker uses Kiribra, builds run on Kiribra.
+//! - Build with Kiribra: the `builder` alias, and Kiribra's builder as buildx's
 //!   current builder for every context (what `docker buildx use --global`
 //!   writes). `docker build`, `docker compose build` and `docker buildx
-//!   build` run on Kiri and load into Kiri whatever context docker uses.
+//!   build` run on Kiribra and load into Kiribra whatever context docker uses.
 //!   Everything else (`docker run`, `ps`, `compose up`…) still follows the
-//!   context, so an image built this way is in Kiri, not in Docker
+//!   context, so an image built this way is in Kiribra, not in Docker
 //!   Desktop's store.
 //!
-//! What Kiri changes for "Build with Kiri" (the alias and buildx's current
+//! What Kiribra changes for "Build with Kiribra" (the alias and buildx's current
 //! builder) is kept as it was in `build.json` first, and choosing Docker
 //! puts it back exactly, unless something else has changed it since.
-//! `kiri build` always builds on Kiri, whichever is chosen.
+//! `kiri build` always builds on Kiribra, whichever is chosen.
 //!
 //! The same file serves the Mac and Linux (`kiri build-with`, the window)
 //! and Windows (kiri-win includes it).
@@ -41,18 +41,18 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
-/// Docker's builder, or Kiri's.
+/// Docker's builder, or Kiribra's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum With {
     Docker,
-    Kiri,
+    Kiribra,
 }
 
 impl With {
     pub fn parse(s: &str) -> Option<With> {
         match s {
             "docker" => Some(With::Docker),
-            "kiri" => Some(With::Kiri),
+            "kiri" => Some(With::Kiribra),
             _ => None,
         }
     }
@@ -60,13 +60,13 @@ impl With {
     pub fn name(self) -> &'static str {
         match self {
             With::Docker => "docker",
-            With::Kiri => "kiri",
+            With::Kiribra => "kiri",
         }
     }
 }
 
-/// Where everything is: docker's config directory, buildx's, Kiri's
-/// `build.json`, and Kiri's builder and context names.
+/// Where everything is: docker's config directory, buildx's, Kiribra's
+/// `build.json`, and Kiribra's builder and context names.
 #[derive(Debug, Clone)]
 pub struct Places {
     pub docker: PathBuf,
@@ -123,28 +123,28 @@ impl Places {
     }
 
     /// Whether to ask: another engine is here, and nobody has chosen. A
-    /// choice Kiri made by itself on a machine that had none at the time is
+    /// choice Kiribra made by itself on a machine that had none at the time is
     /// asked about once another engine appears.
     pub fn ask(&self, other: Option<&str>) -> bool {
         let s = self.state();
         other.is_some() && (s["with"].is_null() || s["auto"] == true)
     }
 
-    /// Whether Kiri's builder is in buildx's store yet.
+    /// Whether Kiribra's builder is in buildx's store yet.
     pub fn ready(&self) -> bool {
         self.instance(&self.builder).is_file()
     }
 
-    /// Whether `docker build` goes to Kiri's builder in every context now.
+    /// Whether `docker build` goes to Kiribra's builder in every context now.
     pub fn taken(&self) -> bool {
         let cfg = read_json(&self.config()).unwrap_or_default();
         let cur = read_json(&self.current()).unwrap_or_default();
         cfg["aliases"]["builder"] == "buildx" && cur["Name"] == self.builder.as_str() && cur["Global"] == true
     }
 
-    /// The builder named after Kiri's context: Kiri's builder under that
+    /// The builder named after Kiribra's context: Kiribra's builder under that
     /// name. Left alone if one of that name is there that isn't a copy of
-    /// Kiri's.
+    /// Kiribra's.
     fn shadow(&self) -> io::Result<()> {
         let ours = read_json(&self.instance(&self.builder))?;
         if ours.get("Name").is_none() {
@@ -163,7 +163,7 @@ impl Places {
         Ok(())
     }
 
-    /// Whether a builder is Kiri's copy: its nodes are Kiri's builder's.
+    /// Whether a builder is Kiribra's copy: its nodes are Kiribra's builder's.
     fn copied(&self, instance: &Value) -> bool {
         let nodes = instance["Nodes"].as_array().map(Vec::as_slice).unwrap_or_default();
         !nodes.is_empty() && nodes.iter().all(|n| n["Name"].as_str().is_some_and(|name| name.starts_with(&self.builder)))
@@ -176,8 +176,8 @@ impl Places {
         write_json(&self.state, &s)
     }
 
-    /// Build with Kiri: the alias and the global current builder, after
-    /// keeping what was there. False if Kiri's builder isn't made yet (it
+    /// Build with Kiribra: the alias and the global current builder, after
+    /// keeping what was there. False if Kiribra's builder isn't made yet (it
     /// is taken once it is: `apply`).
     fn take(&self) -> io::Result<bool> {
         if !self.ready() {
@@ -209,7 +209,7 @@ impl Places {
     }
 
     /// Build with Docker: puts back what `take` kept, where it is still
-    /// as Kiri left it. Also when Kiri's program is gone (appwatch.rs):
+    /// as Kiribra left it. Also when Kiribra's program is gone (appwatch.rs):
     /// the choice itself is kept, so `apply` takes it again later.
     pub fn give_back(&self) -> io::Result<()> {
         let mut s = self.state();
@@ -251,17 +251,17 @@ impl Places {
         write_json(&self.state, &s)
     }
 
-    /// What was chosen, made so: called whenever Kiri's builder has been
+    /// What was chosen, made so: called whenever Kiribra's builder has been
     /// (re)made. Never fights a change made since, such as a `docker buildx
     /// use` of the user's own: only choosing again does that.
     pub fn apply(&self, other: Option<&str>) -> io::Result<()> {
         self.shadow()?;
         let s = self.state();
         match self.saved() {
-            Some(With::Kiri) if s["before"].is_null() => self.take().map(drop),
+            Some(With::Kiribra) if s["before"].is_null() => self.take().map(drop),
             Some(With::Docker) => self.give_back(),
             None if other.is_none() => {
-                self.save(With::Kiri, true)?;
+                self.save(With::Kiribra, true)?;
                 self.take().map(drop)
             }
             _ => Ok(()),
@@ -273,7 +273,7 @@ impl Places {
         self.save(with, false)?;
         self.shadow()?;
         match with {
-            With::Kiri => self.take().map(drop),
+            With::Kiribra => self.take().map(drop),
             With::Docker => self.give_back(),
         }
     }
@@ -281,7 +281,7 @@ impl Places {
     /// For the window: {with, ask, engine, taken, ready, builder, context}.
     pub fn status(&self, other: Option<&str>) -> Value {
         // Not chosen yet: Docker's, which is what happens until someone does.
-        let with = self.saved().unwrap_or(if other.is_some() { With::Docker } else { With::Kiri });
+        let with = self.saved().unwrap_or(if other.is_some() { With::Docker } else { With::Kiribra });
         json!({"type": "buildwith", "with": with.name(), "ask": self.ask(other), "engine": other, "taken": self.taken(), "ready": self.ready(), "builder": self.builder, "context": self.context})
     }
 
@@ -325,15 +325,15 @@ pub fn places() -> io::Result<Places> {
     let home = std::env::var_os("USERPROFILE").map(PathBuf::from).ok_or_else(|| io::Error::other("USERPROFILE is not set"))?;
     let local = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).ok_or_else(|| io::Error::other("LOCALAPPDATA is not set"))?;
     let docker = docker_dir(&home);
-    Ok(Places { buildx: buildx_dir(&docker), docker, state: local.join("Kiri").join("build.json"), builder: crate::builds::BUILDER.get().to_owned(), context: crate::flavor::CONTEXT.get().to_owned() })
+    Ok(Places { buildx: buildx_dir(&docker), docker, state: local.join("Kiribra").join("build.json"), builder: crate::builds::BUILDER.get().to_owned(), context: crate::flavor::CONTEXT.get().to_owned() })
 }
 
-/// The engine besides Kiri on this machine, by name, if there is one.
+/// The engine besides Kiribra on this machine, by name, if there is one.
 #[cfg(unix)]
 pub fn other_engine() -> Option<&'static str> {
     let home = PathBuf::from(std::env::var_os("HOME")?);
     let ours = crate::client::socket().ok().and_then(|s| s.canonicalize().ok());
-    // A socket that is Kiri's own (a /var/run/docker.sock pointing at Kiri) isn't another engine.
+    // A socket that is Kiribra's own (a /var/run/docker.sock pointing at Kiribra) isn't another engine.
     let live = |p: &Path| p.exists() && p.canonicalize().ok() != ours;
     let name = |p: &Path| {
         let t = p.canonicalize().unwrap_or_else(|_| p.to_path_buf()).to_string_lossy().into_owned();
@@ -374,7 +374,7 @@ pub fn other_engine() -> Option<&'static str> {
     apps.iter().find(|(p, _)| Path::new(p).exists()).map(|(_, n)| *n)
 }
 
-/// The engine besides Kiri on this PC, by name, if there is one.
+/// The engine besides Kiribra on this PC, by name, if there is one.
 #[cfg(windows)]
 pub fn other_engine() -> Option<&'static str> {
     let under = |var: &str, rel: &str| std::env::var_os(var).is_some_and(|d| Path::new(&d).join(rel).is_file());
@@ -391,7 +391,7 @@ pub fn other_engine() -> Option<&'static str> {
     }
 }
 
-/// After Kiri's builder is (re)made: what was chosen, made so.
+/// After Kiribra's builder is (re)made: what was chosen, made so.
 pub fn apply() -> io::Result<()> {
     places()?.apply(other_engine())
 }
@@ -425,18 +425,18 @@ pub fn cli(args: &[String]) -> io::Result<()> {
     if let Some(a) = args.first() {
         let with = With::parse(a).ok_or_else(|| io::Error::other("usage: kiri build-with [docker|kiri]"))?;
         p.choose(with)?;
-        if with == With::Kiri && !p.ready() {
+        if with == With::Kiribra && !p.ready() {
             crate::builds::ensure_builder();
         }
     }
     let s = p.status(other);
     let builder = &p.builder;
     match (s["with"].as_str(), other) {
-        (Some("kiri"), _) if !p.ready() => println!("docker build builds on Kiri once its builder `{builder}` is made (the window or `kiri setup` makes it while Kiri runs)"),
-        (Some("kiri"), Some(o)) => println!("docker build and docker compose build run on Kiri, whatever docker context is in use; the images are in Kiri, not {o}. `kiri build-with docker` switches back"),
-        (Some("kiri"), None) => println!("docker build and docker compose build run on Kiri (builder `{builder}`)"),
+        (Some("kiri"), _) if !p.ready() => println!("docker build builds on Kiribra once its builder `{builder}` is made (the window or `kiri setup` makes it while Kiribra runs)"),
+        (Some("kiri"), Some(o)) => println!("docker build and docker compose build run on Kiribra, whatever docker context is in use; the images are in Kiribra, not {o}. `kiri build-with docker` switches back"),
+        (Some("kiri"), None) => println!("docker build and docker compose build run on Kiribra (builder `{builder}`)"),
         (_, o) => println!(
-            "docker build follows docker's context{}: on Kiri when docker uses Kiri. `kiri build` always builds on Kiri; `kiri build-with kiri` sends every build to Kiri",
+            "docker build follows docker's context{}: on Kiribra when docker uses Kiribra. `kiri build` always builds on Kiribra; `kiri build-with kiri` sends every build to Kiribra",
             o.map(|o| format!(" ({o}'s builds stay {o}'s)")).unwrap_or_default()
         ),
     }
@@ -449,7 +449,7 @@ mod tests {
 
     fn places(dir: &Path) -> Places {
         let docker = dir.join(".docker");
-        Places { buildx: docker.join("buildx"), docker, state: dir.join(".kiri/build.json"), builder: "kiri-build".into(), context: "kiri".into() }
+        Places { buildx: docker.join("buildx"), docker, state: dir.join(".kiribra/build.json"), builder: "kiri-build".into(), context: "kiri".into() }
     }
 
     fn scratch(name: &str) -> PathBuf {
@@ -474,7 +474,7 @@ mod tests {
         let p = places(&d);
         // Before the builder exists: chosen, taken later.
         p.apply(None).unwrap();
-        assert_eq!(p.saved(), Some(With::Kiri));
+        assert_eq!(p.saved(), Some(With::Kiribra));
         assert!(!p.taken());
         builder(&p);
         p.apply(None).unwrap();
@@ -499,17 +499,17 @@ mod tests {
         let d = scratch("second");
         let main = places(&d);
         builder(&main);
-        main.choose(With::Kiri).unwrap();
-        // A development build of Kiri, its own state and builder, takes them.
+        main.choose(With::Kiribra).unwrap();
+        // A development build of Kiribra, its own state and builder, takes them.
         let dev = Places { state: d.join(".kiri-layers/build.json"), builder: "kiri-layers-build".into(), context: "kiri-layers".into(), ..places(&d) };
         let i = json!({"Name": "kiri-layers-build", "Driver": "docker-container", "Nodes": [{"Name": "kiri-layers-build0", "Endpoint": "kiri-layers"}], "Dynamic": false});
         write_bytes(&dev.instance("kiri-layers-build"), i.to_string().as_bytes()).unwrap();
-        dev.choose(With::Kiri).unwrap();
+        dev.choose(With::Kiribra).unwrap();
         assert!(dev.taken() && !main.taken());
         // Its app deleted: the daemon hands back (daemon/mod.rs).
         dev.give_back().unwrap();
-        assert!(main.taken(), "builds go to the first Kiri again");
-        assert_eq!(dev.saved(), Some(With::Kiri), "the choice stays");
+        assert!(main.taken(), "builds go to the first Kiribra again");
+        assert_eq!(dev.saved(), Some(With::Kiribra), "the choice stays");
         // Taken up again, it takes them again.
         dev.apply(None).unwrap();
         assert!(dev.taken());
@@ -529,11 +529,11 @@ mod tests {
         assert!(p.ask(Some("OrbStack")));
         assert_eq!(read(&p.current()).as_deref(), Some(current));
         assert_eq!(read_json(&p.config()).unwrap(), cfg);
-        p.choose(With::Kiri).unwrap();
+        p.choose(With::Kiribra).unwrap();
         assert!(p.taken());
         assert_eq!(read_json(&p.config()).unwrap()["aliases"], json!({"foo": "bar", "builder": "buildx"}));
         // Choosing again keeps the first snapshot.
-        p.choose(With::Kiri).unwrap();
+        p.choose(With::Kiribra).unwrap();
         p.choose(With::Docker).unwrap();
         assert_eq!(read_json(&p.config()).unwrap(), cfg);
         assert_eq!(read(&p.current()).as_deref(), Some(current));
@@ -546,13 +546,13 @@ mod tests {
         let p = places(&d);
         builder(&p);
         write_json(&p.config(), &json!({"aliases": {"builder": "mybuilder"}})).unwrap();
-        p.choose(With::Kiri).unwrap();
+        p.choose(With::Kiribra).unwrap();
         assert_eq!(read_json(&p.config()).unwrap()["aliases"]["builder"], "buildx");
         p.choose(With::Docker).unwrap();
         assert_eq!(read_json(&p.config()).unwrap(), json!({"aliases": {"builder": "mybuilder"}}));
         // An empty `aliases` that was there stays.
         write_json(&p.config(), &json!({"aliases": {}})).unwrap();
-        p.choose(With::Kiri).unwrap();
+        p.choose(With::Kiribra).unwrap();
         p.choose(With::Docker).unwrap();
         assert_eq!(read_json(&p.config()).unwrap(), json!({"aliases": {}}));
     }
@@ -562,7 +562,7 @@ mod tests {
         let d = scratch("since");
         let p = places(&d);
         builder(&p);
-        p.choose(With::Kiri).unwrap();
+        p.choose(With::Kiribra).unwrap();
         // `docker buildx use other` afterwards: apply doesn't take it back.
         let theirs = r#"{"Key":"kiri","Name":"other","Global":false}"#;
         write_bytes(&p.current(), theirs.as_bytes()).unwrap();

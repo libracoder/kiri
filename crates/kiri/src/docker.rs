@@ -1,5 +1,5 @@
 //! `kiri ps`, `kiri run`, `kiri compose up`…: Docker's own commands, run
-//! by the docker CLI against Kiri's daemon, whatever docker context is
+//! by the docker CLI against Kiribra's daemon, whatever docker context is
 //! selected. `kiri run -d --name web nginx` is `docker --context kiri run
 //! -d --name web nginx`.
 
@@ -18,7 +18,7 @@ pub const COMMANDS: &[&str] = &[
     "run", "save", "search", "start", "stats", "stop", "system", "tag", "top", "unpause", "update", "version", "volume", "wait",
 ];
 
-/// `kiri update` is two commands. Alone or with `--check` it updates Kiri;
+/// `kiri update` is two commands. Alone or with `--check` it updates Kiribra;
 /// with anything else it is Docker's `update`, which always names a
 /// container (`kiri update --memory 256m web`).
 #[cfg(any(target_os = "macos", test))]
@@ -34,16 +34,16 @@ pub fn handles(command: &str) -> bool {
 /// the exit code are docker's own. Returns only if that fails.
 #[cfg(unix)]
 pub fn run(args: &[String]) -> io::Result<()> {
-    let docker = client::docker_cli().ok_or_else(|| io::Error::other("no docker CLI found; open Kiri once to set it up"))?;
+    let docker = client::docker_cli().ok_or_else(|| io::Error::other("no docker CLI found; open Kiribra once to set it up"))?;
     let socket = client::socket()?;
     if !client::alive() {
-        return Err(io::Error::other("Kiri isn't running. Open Kiri, or start it with `kiri daemon`"));
+        return Err(io::Error::other("Kiribra isn't running. Open Kiribra, or start it with `kiri daemon`"));
     }
     let mut cmd = std::process::Command::new(docker);
     cmd.args(args).env("DOCKER_HOST", format!("unix://{}", socket.display())).env_remove("DOCKER_CONTEXT");
     // With DOCKER_HOST and no context, buildx would pick the endpoint's own
     // docker-driver builder, which needs BuildKit inside the engine: name
-    // Kiri's, if buildx knows it (the window sets it up) and the person
+    // Kiribra's, if buildx knows it (the window sets it up) and the person
     // hasn't picked one.
     if std::env::var_os("BUILDX_BUILDER").is_none() && buildx_knows(crate::builds::BUILDER.get()) {
         cmd.env("BUILDX_BUILDER", crate::builds::BUILDER.get());
@@ -51,8 +51,8 @@ pub fn run(args: &[String]) -> io::Result<()> {
     Err(cmd.exec())
 }
 
-/// On Windows: Kiri's docker.exe, beside this kiri.exe in
-/// %LOCALAPPDATA%\Kiri\bin (else one on PATH), with the `kiri` context
+/// On Windows: Kiribra's docker.exe, beside this kiri.exe in
+/// %LOCALAPPDATA%\Kiribra\bin (else one on PATH), with the `kiri` context
 /// setup made, which reaches the engine in WSL through kiri-win's pipe.
 /// Exits with docker's exit code.
 #[cfg(windows)]
@@ -64,7 +64,7 @@ pub fn run(args: &[String]) -> io::Result<()> {
         .env_remove("DOCKER_HOST")
         .env_remove("DOCKER_CONTEXT")
         .status()
-        .map_err(|e| io::Error::other(format!("could not run docker.exe ({e}); open Kiri once to set it up")))?;
+        .map_err(|e| io::Error::other(format!("could not run docker.exe ({e}); open Kiribra once to set it up")))?;
     std::process::exit(status.code().unwrap_or(1))
 }
 

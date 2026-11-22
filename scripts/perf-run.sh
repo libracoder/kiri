@@ -1,5 +1,5 @@
 #!/bin/sh
-# Runs Kiri's speed check (scripts/perf.py) for two Linux builds: main's and
+# Runs Kiribra's speed check (scripts/perf.py) for two Linux builds: main's and
 # a change's. Each engine runs in its own privileged container on this
 # machine's Docker, with its socket in WORK, and the check talks to both.
 #
@@ -26,7 +26,7 @@ for e in base head; do
   $SUDO rm -rf "$WORK/$e-run"; mkdir -p "$WORK/$e-run"
   docker run -d --name kiri-perf-$e --privileged --tmpfs /run \
     -v kiri-perf-$e-lib:/var/lib/kiri -v kiri-perf-$e-store:/root/.local/share/kiri \
-    -v "$bin:/opt/kiri:ro" -v "$WORK/$e-run:/root/.kiri/run" \
+    -v "$bin:/opt/kiri:ro" -v "$WORK/$e-run:/root/.kiribra/run" \
     alpine:3.21 sh -c 'exec /opt/kiri/kiri daemon' >/dev/null
 done
 pid() { docker inspect -f '{{.State.Pid}}' kiri-perf-$1; }

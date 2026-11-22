@@ -1,10 +1,10 @@
 // The Engine card shows the engine's real state (issue 188): Off with Start
 // until an engine is up, Starting… while it boots, Running once it answers
 // (setting up, BuildKit, asleep and waking included, since docker works then);
-// Stop makes it Off. Kiri's builder (its BuildKit image and cache volume)
+// Stop makes it Off. Kiribra's builder (its BuildKit image and cache volume)
 // isn't listed in Images or Volumes, and an empty Images list offers no
 // download.
-kiri.on({ type: "status", version: "0.1.14", dev: false, app: "Kiri", ours: "kiri", context: "kiri" });
+kiri.on({ type: "status", version: "0.1.14", dev: false, app: "Kiribra", ours: "kiri", context: "kiri" });
 kiri.on({ type: "prefs", prefs: {} });
 const R = [];
 const t = (name, fn) => { try { fn(); R.push("PASS " + name); } catch (e) { R.push("FAIL " + name + ": " + e.message); } };
@@ -18,11 +18,11 @@ const lists = (containers) => kiri.on({ type: "lists", containers, images: [], v
 const bk = { Id: "bk1", Names: ["/buildx_buildkit_kiri0"], Image: "moby/buildkit:buildx-stable-1", State: "running", Status: "Up 1 second", Labels: {} };
 const web = (State) => ({ Id: "web1", Names: ["/web"], Image: "nginx", State, Status: State === "running" ? "Up 1 second" : "Exited (0)", Labels: {} });
 
-// Fresh install: no engine yet, then Kiri sets up inside (boots, pulls
-// BuildKit, sleeps). A fresh Kiri has no containers of its own.
+// Fresh install: no engine yet, then Kiribra sets up inside (boots, pulls
+// BuildKit, sleeps). A fresh Kiribra has no containers of its own.
 lists([]);
 kiri.on({ type: "state", state: "stopped" });
-t("fresh Kiri with no engine yet reads Off with Start", () => eq(card(), OFF, "stopped"));
+t("fresh Kiribra with no engine yet reads Off with Start", () => eq(card(), OFF, "stopped"));
 t("status bar says off", () => eq(sbar().includes(VM + " off"), true, "status: " + sbar()));
 kiri.on({ type: "state", state: "booting" });
 t("its engine booting reads Starting…", () => eq([label(), vbtn().disabled], ["Starting…", true], "booting"));
@@ -95,13 +95,13 @@ const img = (id, tags, size = 1e8) => ({ Id: `sha256:${id}`, RepoTags: tags, Rep
 kiri.on({ type: "lists", containers: [], networks: [],
   images: [img("bk", ["moby/buildkit:buildx-stable-1"], 112e6), img("ng", ["nginx:latest"]), img("bk2", ["moby/buildkit:v0.24.0"])],
   volumes: [{ Name: "buildx_buildkit_kiri-build0_state", Driver: "local" }, { Name: "pgdata", Driver: "local" }] });
-t("Kiri's builder image isn't in Images; nginx and another BuildKit tag are", () => {
+t("Kiribra's builder image isn't in Images; nginx and another BuildKit tag are", () => {
   eq(ui.images.map((i) => i.RepoTags[0]), ["nginx:latest", "moby/buildkit:v0.24.0"], "images");
 });
 t("its cache volume isn't in Volumes", () => eq(ui.volumes.map((v) => v.Name), ["pgdata"], "volumes"));
 t("Settings → Builds shows the builder and Clear build cache", () => {
   const html = builderPref();
-  if (!/Kiri's builder/.test(html) || !/data-buildprune/.test(html)) throw new Error(html);
+  if (!/Kiribra's builder/.test(html) || !/data-buildprune/.test(html)) throw new Error(html);
 });
 
 kiri.on({ type: "lists", containers: [], networks: [], images: [img("bk", ["moby/buildkit:buildx-stable-1"])], volumes: [] });

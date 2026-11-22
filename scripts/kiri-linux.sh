@@ -1,5 +1,5 @@
 #!/bin/sh
-# Kiri Linux, the WSL2 distro Kiri runs in on Windows: Alpine's minirootfs
+# Kiribra Linux, the WSL2 distro Kiribra runs in on Windows: Alpine's minirootfs
 # (pinned, checked), the static kiri binaries and contrib/wsl/kiri-linux.
 # Runs as an ordinary user in WSL; the archive's files are owned by root.
 # x86_64 for x86-64 PCs, aarch64 for Windows on Arm (the binaries in <dir>

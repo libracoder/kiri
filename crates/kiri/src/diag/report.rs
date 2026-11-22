@@ -1,24 +1,24 @@
-//! `kiri diag`: Kiri's own log, read or followed, and the report to send us.
+//! `kiri diag`: Kiribra's own log, read or followed, and the report to send us.
 //!
 //! The report is one text file: versions and the system, whether the
 //! engine runs, the last lines of every log, recent crash files and macOS's
-//! own crash reports for Kiri, all through [`Redactor::for_user`].
+//! own crash reports for Kiribra, all through [`Redactor::for_user`].
 //!
-//! # Kiri Cloud
+//! # Kiribra Cloud
 //!
 //! `kiri diag report --send` (and, only when the person turned crash
-//! reports on, each new crash file) goes to `POST /v1/reports` on the Kiri
+//! reports on, each new crash file) goes to `POST /v1/reports` on the Kiribra
 //! Share edge, as JSON of at most 1 MB:
 //!
 //! ```text
 //! {"kind":"crash"|"report","part":"ui"|"daemon"|"cli","app_version":"0.1.4",
-//!  "flavor":"kiri"|"kiri-dev","os":"macOS 26.1","arch":"aarch64",
-//!  "install_id":"<32 hex digits, kept in ~/.kiri/install_id>",
+//!  "flavor":"kiri"|"kiribra-dev","os":"macOS 26.1","arch":"aarch64",
+//!  "install_id":"<32 hex digits, kept in ~/.kiribra/install_id>",
 //!  "created_at":"<RFC 3339>","text":"<the redacted report or crash>"}
 //! ```
 //!
 //! A report the person sends carries `Authorization: Bearer <token>` when
-//! signed in to Kiri Cloud, so it can be answered. A crash never does: it
+//! signed in to Kiribra Cloud, so it can be answered. A crash never does: it
 //! goes without the person's account. Crash uploads also leave out the image
 //! and container names their log lines name. It answers `201 {"id":"rep_…"}`, the id a person can quote to us. Crash
 //! files that went become `<name>.sent.txt`; any other answer leaves them
@@ -40,7 +40,7 @@ const USAGE: &str = "\
 usage: kiri diag logs [-f] [--ui|--engine|--cli] [--errors] [--op ID] [-n N]
        kiri diag report [--out PATH] [--send]
 
-logs     Kiri's own log, oldest first: the window (--ui), the engine
+logs     Kiribra's own log, oldest first: the window (--ui), the engine
          (--engine) and the command line (--cli), all three by default.
          --errors keeps warnings and errors; --op ID one window action's
          lines (the id an error's Details show); -n N lines (default 50);
@@ -48,7 +48,7 @@ logs     Kiri's own log, oldest first: the window (--ui), the engine
 report   One file to send us: versions, whether the engine runs, recent
          log lines and crashes, with your home folder and any tokens taken
          out. Saved to the Desktop (or --out PATH). --send also sends it to
-         Kiri Cloud and prints its id.";
+         Kiribra Cloud and prints its id.";
 
 /// A report body may be at most this big.
 pub const MAX_BODY: usize = 1 << 20;
@@ -353,10 +353,10 @@ fn crash_name(name: &str) -> Option<(u64, Part)> {
 }
 
 /// The report's text, redacted. `home` holds `Library/Logs/DiagnosticReports`;
-/// `state` is `~/.kiri`.
+/// `state` is `~/.kiribra`.
 pub fn assemble(home: &Path, state: &Path, facts: &Facts, redactor: &Redactor) -> String {
     let mut s = String::new();
-    let _ = writeln!(s, "Kiri diagnostics report");
+    let _ = writeln!(s, "Kiribra diagnostics report");
     let _ = writeln!(s, "Created:  {}", time::rfc3339(facts.created));
     let _ = writeln!(s, "App:      {} {} ({}), made by the {}", crate::flavor::APP, env!("CARGO_PKG_VERSION"), crate::flavor::CONTEXT, super::part().name());
     let _ = writeln!(s, "System:   {}", super::system().line());
@@ -470,14 +470,14 @@ fn report_cli(args: &[String]) -> io::Result<()> {
     if send_it {
         let id = send("report", super::part(), SystemTime::now(), &text)?;
         super::info!("report sent", id = id);
-        println!("sent to Kiri Cloud as {id}: quote it when you write to us");
+        println!("sent to Kiribra Cloud as {id}: quote it when you write to us");
     }
     Ok(())
 }
 
-// ---------------------------------------------------------------- Kiri Cloud
+// ---------------------------------------------------------------- Kiribra Cloud
 
-/// `~/.kiri/install_id`: 128 random bits in hex, made on first use, so
+/// `~/.kiribra/install_id`: 128 random bits in hex, made on first use, so
 /// reports from one Mac can be told apart without saying whose it is.
 pub fn install_id(state: &Path) -> String {
     let path = state.join("install_id");
@@ -530,7 +530,7 @@ pub fn body(kind: &str, part: Part, created: SystemTime, text: &str, install_id:
     }
 }
 
-/// Sends a report or crash; returns the id Kiri Cloud gave it.
+/// Sends a report or crash; returns the id Kiribra Cloud gave it.
 pub fn send(kind: &str, part: Part, created: SystemTime, text: &str) -> io::Result<String> {
     let state = super::state_dir().ok_or_else(|| io::Error::other("HOME is not set"))?;
     let body = body(kind, part, created, text, &install_id(&state));
@@ -542,9 +542,9 @@ pub fn send(kind: &str, part: Part, created: SystemTime, text: &str) -> io::Resu
             .as_str()
             .filter(|id| !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'))
             .map(str::to_owned)
-            .ok_or_else(|| io::Error::other("Kiri Cloud took the report but sent back no id")),
-        429 => Err(io::Error::other(format!("Kiri Cloud is taking no more reports for now (429){why}; try again later"))),
-        _ => Err(io::Error::other(format!("Kiri Cloud answered {status}{why}"))),
+            .ok_or_else(|| io::Error::other("Kiribra Cloud took the report but sent back no id")),
+        429 => Err(io::Error::other(format!("Kiribra Cloud is taking no more reports for now (429){why}; try again later"))),
+        _ => Err(io::Error::other(format!("Kiribra Cloud answered {status}{why}"))),
     }
 }
 
@@ -627,7 +627,7 @@ fn send_claimed(dir: &Path, name: &str, claimed: &Path, redactor: &Redactor) -> 
     };
     match send("crash", part, UNIX_EPOCH + Duration::from_secs(secs), &redactor.apply(&text)) {
         Ok(id) => {
-            let _ = std::fs::OpenOptions::new().append(true).open(claimed).and_then(|mut f| writeln!(f, "\nSent to Kiri Cloud as {id}"));
+            let _ = std::fs::OpenOptions::new().append(true).open(claimed).and_then(|mut f| writeln!(f, "\nSent to Kiribra Cloud as {id}"));
             let sent = dir.join(format!("{}.sent.txt", name.strip_suffix(".txt").unwrap_or(name)));
             let _ = std::fs::rename(claimed, sent);
             super::info!("crash report sent", file = name, id = id);
@@ -676,7 +676,7 @@ fn without_names(text: &str, lines: &[Value]) -> String {
 }
 
 /// Every `name` in `s` that stands alone (not inside a longer word, so a
-/// container `web` leaves `webpki` be, but not `web.kiri.local`).
+/// container `web` leaves `webpki` be, but not `web.kiribra.local`).
 fn replace_whole(s: &str, name: &str, with: &str) -> String {
     let joins = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '-');
     let (mut out, mut last, mut from) = (String::with_capacity(s.len()), 0, 0);
@@ -695,7 +695,7 @@ fn replace_whole(s: &str, name: &str, with: &str) -> String {
 
 /// The id a sent crash file ends with.
 fn sent_id(text: &str) -> Option<&str> {
-    text.lines().rev().find_map(|l| l.strip_prefix("Sent to Kiri Cloud as ")).map(str::trim).filter(|id| !id.is_empty())
+    text.lines().rev().find_map(|l| l.strip_prefix("Sent to Kiribra Cloud as ")).map(str::trim).filter(|id| !id.is_empty())
 }
 
 /// Sends one crash file the person picked in the window, whether or not
@@ -709,7 +709,7 @@ pub fn send_crash(name: &str) -> io::Result<String> {
         let text = std::fs::read_to_string(dir.join(name))?;
         return sent_id(&text).map(str::to_owned).ok_or_else(|| io::Error::other("it was sent, but its id isn't in the file"));
     }
-    let claimed = claim(&dir, name).ok_or_else(|| io::Error::other("Kiri is sending it already"))?;
+    let claimed = claim(&dir, name).ok_or_else(|| io::Error::other("Kiribra is sending it already"))?;
     send_claimed(&dir, name, &claimed, &Redactor::for_user())
 }
 
@@ -816,7 +816,7 @@ mod tests {
     #[test]
     fn reads_the_last_lines_of_several_logs_in_time_order() {
         let home = temp_home("read");
-        let state = home.join(".kiri");
+        let state = home.join(".kiribra");
         std::fs::create_dir_all(state.join("logs")).unwrap();
         let tagged = |t: &str, part: Part, msg: &str| super::super::json_line(t, Level::Info, part, msg, &[("op", "run-7c2e".into())]);
         let daemon = [tagged("2026-10-28T09:00:01.000Z", Part::Daemon, "a"), line("2026-10-28T09:00:03.000Z", Level::Error, Part::Daemon, "c")].join("\n");
@@ -839,10 +839,10 @@ mod tests {
             line("image pull failed", &[("image", "registry.acme.corp/secret-app:1.2".into()), ("error", "registry.acme.corp/secret-app:1.2: unauthorized".into())]),
             line("container exited", &[("name", "web".into()), ("image", "nginx".into())]),
         ];
-        let text = format!("panic at webpki: web.kiri.local is gone\n{}\n{}", render(&lines[0], true, false), render(&lines[1], true, false));
+        let text = format!("panic at webpki: web.kiribra.local is gone\n{}\n{}", render(&lines[0], true, false), render(&lines[1], true, false));
         let out = without_names(&text, &lines);
         assert!(!out.contains("secret-app") && !out.contains("acme") && !out.contains("nginx"), "{out}");
-        assert!(out.contains("webpki") && out.contains("[name].kiri.local") && out.contains("name=[name]"), "{out}");
+        assert!(out.contains("webpki") && out.contains("[name].kiribra.local") && out.contains("name=[name]"), "{out}");
     }
 
     #[test]
@@ -865,7 +865,7 @@ mod tests {
     #[test]
     fn assembles_a_redacted_report() {
         let home = temp_home("assemble");
-        let state = home.join(".kiri");
+        let state = home.join(".kiribra");
         let h = home.display().to_string();
         std::fs::create_dir_all(state.join("logs")).unwrap();
         std::fs::create_dir_all(state.join("crashes")).unwrap();
@@ -873,29 +873,29 @@ mod tests {
         std::fs::create_dir_all(&reports).unwrap();
         let mut log = String::new();
         for i in 0..400 {
-            log += &line(&format!("2026-10-28T09:{:02}:{:02}.000Z", i / 60, i % 60), Level::Info, Part::Daemon, &format!("event {i} in {h}/.kiri"));
+            log += &line(&format!("2026-10-28T09:{:02}:{:02}.000Z", i / 60, i % 60), Level::Info, Part::Daemon, &format!("event {i} in {h}/.kiribra"));
             log.push('\n');
         }
         std::fs::write(state.join("logs/daemon.log"), log).unwrap();
-        std::fs::write(state.join("daemon.log"), format!("2026-10-28T09:00:00.000Z kiri daemon: ready on unix://{h}/.kiri/run/docker.sock\n")).unwrap();
-        std::fs::write(state.join("crashes/1792800000-daemon.txt"), "Kiri crash report\nMessage:  boom with Bearer abcdefghijklmnop\n").unwrap();
-        std::fs::write(state.join("crashes/1792700000-ui.sent.txt"), "Kiri crash report\nMessage:  older\n").unwrap();
-        std::fs::write(reports.join("kiri-2026-10-28-094107.ips"), format!("{{\"app_name\":\"kiri\",\"crashReporterKey\":\"ABCD-1234\"}}\n{{\"procPath\":\"{h}/Applications/Kiri.app\"}}")).unwrap();
+        std::fs::write(state.join("daemon.log"), format!("2026-10-28T09:00:00.000Z kiri daemon: ready on unix://{h}/.kiribra/run/docker.sock\n")).unwrap();
+        std::fs::write(state.join("crashes/1792800000-daemon.txt"), "Kiribra crash report\nMessage:  boom with Bearer abcdefghijklmnop\n").unwrap();
+        std::fs::write(state.join("crashes/1792700000-ui.sent.txt"), "Kiribra crash report\nMessage:  older\n").unwrap();
+        std::fs::write(reports.join("kiri-2026-10-28-094107.ips"), format!("{{\"app_name\":\"kiri\",\"crashReporterKey\":\"ABCD-1234\"}}\n{{\"procPath\":\"{h}/Applications/Kiribra.app\"}}")).unwrap();
         std::fs::write(reports.join("Safari-2026-10-28-094107.ips"), "not ours").unwrap();
         let facts = Facts { engine: "not running".into(), crash_reports: false, created: UNIX_EPOCH + Duration::from_secs(1_792_800_000), containers: Some("web  nginx:alpine  Up 2 hours\n".into()) };
         let text = assemble(&home, &state, &facts, &Redactor::new(Some(h.clone()), Vec::new()));
 
-        assert!(text.starts_with("Kiri diagnostics report\nCreated:  2026-10-24T00:00:00"), "{text}");
+        assert!(text.starts_with("Kiribra diagnostics report\nCreated:  2026-10-24T00:00:00"), "{text}");
         assert!(text.contains("Engine:   not running") && text.contains("Crash reports: not sent automatically"));
-        assert!(text.contains("==== Log: engine (~/.kiri/logs/daemon.log) ===="));
+        assert!(text.contains("==== Log: engine (~/.kiribra/logs/daemon.log) ===="));
         // The last 300 of 400 lines.
-        assert!(text.contains("event 399 in ~/.kiri") && text.contains("event 100 in") && !text.contains("event 99 in"));
+        assert!(text.contains("event 399 in ~/.kiribra") && text.contains("event 100 in") && !text.contains("event 99 in"));
         assert!(text.contains("==== Log: window") && text.contains("(empty)"));
-        assert!(text.contains("kiri daemon: ready on unix://~/.kiri/run/docker.sock"));
+        assert!(text.contains("kiri daemon: ready on unix://~/.kiribra/run/docker.sock"));
         assert!(text.contains("==== Containers (names, images and status only) ====\nweb  nginx:alpine  Up 2 hours\n"));
         assert!(text.contains("2 in all") && text.contains("--- 1792800000-daemon.txt ---") && text.contains("boom with Bearer [redacted]"));
         assert!(text.find("1792800000-daemon").unwrap() < text.find("1792700000-ui").unwrap(), "newest crash first");
-        assert!(text.contains("--- kiri-2026-10-28-094107.ips ---") && text.contains("~/Applications/Kiri.app") && !text.contains("Safari"));
+        assert!(text.contains("--- kiri-2026-10-28-094107.ips ---") && text.contains("~/Applications/Kiribra.app") && !text.contains("Safari"));
         assert!(!text.contains("ABCD-1234") && !text.contains(&h), "{text}");
         assert!(text.len() < MAX_BODY);
         let _ = std::fs::remove_dir_all(&home);
@@ -930,8 +930,8 @@ mod tests {
     #[test]
     fn lists_crashes_with_their_ids() {
         let home = temp_home("list");
-        std::fs::write(home.join("1792800000-daemon.txt"), "Kiri crash report\nLocation: vm/balloon.rs:212:41\nMessage:  boom\n").unwrap();
-        std::fs::write(home.join("1792700000-ui.sent.txt"), "Kiri crash report\nMessage:  older\n\nSent to Kiri Cloud as rep_51c0e8d4\n").unwrap();
+        std::fs::write(home.join("1792800000-daemon.txt"), "Kiribra crash report\nLocation: vm/balloon.rs:212:41\nMessage:  boom\n").unwrap();
+        std::fs::write(home.join("1792700000-ui.sent.txt"), "Kiribra crash report\nMessage:  older\n\nSent to Kiribra Cloud as rep_51c0e8d4\n").unwrap();
         std::fs::write(home.join(".window-opened"), "1").unwrap();
         let list = crash_list(&home, 10);
         assert_eq!(list.len(), 2);
@@ -941,12 +941,12 @@ mod tests {
         assert_eq!(crash_list(&home, 1).len(), 1);
         assert!(claim(&home, "notes.txt").is_none());
         // An upload carries its part's lines up to the crash, not after.
-        let state = home.join(".kiri");
+        let state = home.join(".kiribra");
         std::fs::create_dir_all(state.join("logs")).unwrap();
         let log: Vec<String> = (0..250).map(|i| line(&format!("2026-10-24T00:{:02}:{:02}.000Z", i / 60, i % 60), Level::Info, Part::Daemon, &format!("e{i}"))).collect();
         std::fs::write(state.join("logs/daemon.log"), log.join("\n") + "\n").unwrap();
-        let up = crash_upload(&state, 1_792_800_000 + 240, Part::Daemon, "Kiri crash report\n");
-        assert!(up.starts_with("Kiri crash report\n\n==== The last 200 log lines before it ====\n"), "{up}");
+        let up = crash_upload(&state, 1_792_800_000 + 240, Part::Daemon, "Kiribra crash report\n");
+        assert!(up.starts_with("Kiribra crash report\n\n==== The last 200 log lines before it ====\n"), "{up}");
         assert!(up.contains(" e240") && up.contains(" e41\n") && !up.contains(" e40\n") && !up.contains(" e241"), "{up}");
         assert!(claim(&home, "1792800000-daemon.txt").is_some_and(|p| p.ends_with("1792800000-daemon.txt.sending")));
         assert!(claim(&home, "1792800000-daemon.txt").is_none(), "claimed once");

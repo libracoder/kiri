@@ -27,13 +27,13 @@ const MEMORY_FLOOR: u64 = 256 << 20;
 /// How much more the guest gets at once when it reports pressure.
 const MEMORY_GROW: u64 = 1 << 30;
 
-/// What a request that needs the VM gets while Kiri is stopped (Stop in
+/// What a request that needs the VM gets while Kiribra is stopped (Stop in
 /// the window, the tray or the menu bar): only Start ends that.
-pub const STOPPED: &str = "Kiri is stopped: run `kiri start`, or press Start in the Kiri window, to run containers again";
+pub const STOPPED: &str = "Kiribra is stopped: run `kiri start`, or press Start in the Kiribra window, to run containers again";
 /// What one gets while the daemon shuts down (WSL or Windows stopping it,
 /// a restart, an update): not a Stop, so nothing to press; the next
 /// command reaches the engine that comes up after it (#93).
-pub const SHUTTING: &str = "Kiri's engine is shutting down: run the command again in a moment";
+pub const SHUTTING: &str = "Kiribra's engine is shutting down: run the command again in a moment";
 
 /// The file that keeps "stopped" across engine restarts.
 fn stopped_marker() -> Option<std::path::PathBuf> {
@@ -104,7 +104,7 @@ fn physical_memory() -> u64 {
 }
 
 /// This process's resident memory, in bytes: on a Linux host the daemon runs
-/// beside its containers, so it counts in what Kiri holds.
+/// beside its containers, so it counts in what Kiribra holds.
 #[cfg(not(target_os = "macos"))]
 fn self_rss() -> u64 {
     let statm = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
@@ -354,7 +354,7 @@ impl Spec {
 
     /// Leaves the first network of a container that is not running, as
     /// `docker network disconnect` does on Docker for any of its networks.
-    /// Kiri keeps the first network apart (`network_mode`, `aliases`,
+    /// Kiribra keeps the first network apart (`network_mode`, `aliases`,
     /// `ipv4_address`, `ipv6_address`, `mac_address`) because only it gives
     /// the default route and the main address, so one of the others takes
     /// its place, with its own aliases, fixed addresses and MAC: none of the
@@ -363,7 +363,7 @@ impl Spec {
     /// gives the default route to: a network that reaches outside before an
     /// `internal` one (which gives no default route), then by name, as
     /// libnetwork orders a container's endpoints when none has a gateway
-    /// priority (Kiri keeps none), and as create picks the primary of
+    /// priority (Kiribra keeps none), and as create picks the primary of
     /// several endpoints. `internal` says whether a network is internal.
     /// With no other network it is left with none, as with `--network none`.
     pub fn leave_first_network(&mut self, internal: impl Fn(&str) -> bool) {
@@ -412,7 +412,7 @@ impl Spec {
     /// container's capabilities; empty for the default filter and for
     /// `unconfined`. `--privileged` only drops the default filter: an
     /// explicit profile still applies, as in moby's `WithSeccomp`. A profile
-    /// Kiri cannot apply is an error, never the default.
+    /// Kiribra cannot apply is an error, never the default.
     pub fn seccomp_program(&self) -> Result<Vec<u8>, Error> {
         let super::seccomp::Choice::Profile(json) = super::seccomp::choice(&self.security_opt).map_err(Error::BadRequest)? else {
             return Ok(Vec::new());
@@ -477,7 +477,7 @@ struct StartGate {
     shut: Mutex<bool>,
     opened: Condvar,
     /// Set by `Engine::await_start`: a stop, kill or `rm -f` found this start
-    /// stuck (`START_GRACE`, `REMOVE_GRACE`), or Kiri itself is stopping.
+    /// stuck (`START_GRACE`, `REMOVE_GRACE`), or Kiribra itself is stopping.
     /// `VmLink::run` reads it.
     cancel: std::sync::atomic::AtomicBool,
     /// Why it was cancelled (`Cancel`), for the start's answer.
@@ -488,7 +488,7 @@ struct StartGate {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 enum Cancel {
-    /// A stop or kill that waited `START_GRACE` for it, or Kiri's own
+    /// A stop or kill that waited `START_GRACE` for it, or Kiribra's own
     /// stop (Stop, the VM's sleep).
     Stopped = 1,
     /// `rm -f`, after `REMOVE_GRACE`.
@@ -676,7 +676,7 @@ pub struct ExecConfig {
     pub stdin: bool,
     /// `exec --privileged`, or any exec in a privileged container.
     pub privileged: bool,
-    /// Kiri's own (the Kubernetes service watcher): no events.
+    /// Kiribra's own (the Kubernetes service watcher): no events.
     pub internal: bool,
 }
 
@@ -813,7 +813,7 @@ impl Damage {
         let dir = records.parent().map(|d| d.display().to_string()).unwrap_or_default();
         let mut m = Vec::new();
         if let Some(e) = &self.unsaved {
-            m.push(format!("The container list in {dir} is damaged and no copy of it could be kept ({e}), so changes to containers are not saved until Kiri can write to that folder."));
+            m.push(format!("The container list in {dir} is damaged and no copy of it could be kept ({e}), so changes to containers are not saved until Kiribra can write to that folder."));
         }
         let copies = self.copies.iter().map(|c| c.display().to_string()).collect::<Vec<_>>().join(", ");
         match (self.copies.len(), self.unsaved.is_some()) {
@@ -824,12 +824,12 @@ impl Damage {
             (_, true) => m.push(format!("Copies of earlier damaged lists are kept at {copies}.")),
         }
         if let Some(e) = &self.unlistable {
-            m.push(format!("Kiri cannot list {dir} ({e}), so it cannot tell whether a damaged container list was kept there."));
+            m.push(format!("Kiribra cannot list {dir} ({e}), so it cannot tell whether a damaged container list was kept there."));
         }
         if self.unsaved.is_some() || !self.copies.is_empty() {
             m.push("Containers missing from `docker ps -a` cannot be listed again, but their volumes are still there and their files and logs are kept on disk.".into());
         }
-        let refuses = "Kiri deletes nothing on its own, and refuses volume, image and network prunes and removals of volumes and images without --force";
+        let refuses = "Kiribra deletes nothing on its own, and refuses volume, image and network prunes and removals of volumes and images without --force";
         let mut until = Vec::new();
         match self.copies.len() {
             0 => {}
@@ -856,7 +856,7 @@ fn image_damage_message(damage: &io::Result<Option<kiri_image::store::IndexDamag
     let d = match damage {
         Ok(None) => return None,
         Ok(Some(d)) => d,
-        Err(e) => return Some(format!("Kiri cannot read the image list in {} ({e}), so it cannot tell whether images are missing from it; it keeps every unpacked layer meanwhile.", root.display())),
+        Err(e) => return Some(format!("Kiribra cannot read the image list in {} ({e}), so it cannot tell whether images are missing from it; it keeps every unpacked layer meanwhile.", root.display())),
     };
     let copies = d.copies.iter().map(|c| c.display().to_string()).collect::<Vec<_>>().join(", ");
     let (one, kept) = if d.copies.len() == 1 { ("a copy of it is", "the copy is") } else { ("copies are", "the copies are") };
@@ -864,7 +864,7 @@ fn image_damage_message(damage: &io::Result<Option<kiri_image::store::IndexDamag
         0 => "Every image it names is listed again.".to_owned(),
         n => format!("{n} image(s) it names are missing from `docker images`: {}. Pulled ones can be pulled again; built or committed ones are in the copy.", d.missing.join(", ")),
     };
-    Some(format!("The image list was damaged and repaired; {one} kept at {copies}. {missing} Kiri keeps every unpacked layer until {kept} removed."))
+    Some(format!("The image list was damaged and repaired; {one} kept at {copies}. {missing} Kiribra keeps every unpacked layer until {kept} removed."))
 }
 
 /// Reads `containers.json`. One that does not parse is kept as a
@@ -1019,7 +1019,7 @@ pub struct Engine {
     pending_copy: Mutex<Option<Vec<u8>>>,
     me: OnceLock<Weak<Engine>>,
     /// Containers that come back on Start: the ones whose restart policy
-    /// would have started them when the daemon came up, held because Kiri
+    /// would have started them when the daemon came up, held because Kiribra
     /// was stopped (Start starts them) or because the VM did not boot
     /// (`retry_held` tries it again), and the ones Stop (or the VM's sleep on
     /// request) stopped, which `always` and `unless-stopped` bring back.
@@ -1551,7 +1551,7 @@ impl Engine {
         }
     }
 
-    /// Kiri's own: a port on the Mac's loopback that reaches `ip:port` in
+    /// Kiribra's own: a port on the Mac's loopback that reaches `ip:port` in
     /// the cluster (a service's ClusterIP or a pod), for sharing it.
     pub fn k8s_forward(&self, ip: [u8; 4], port: u16) -> Result<u16, Error> {
         if !in_k8s_ranges(ip) || port == 0 {
@@ -1657,7 +1657,7 @@ impl Engine {
         true
     }
 
-    /// The window's Stop: Kiri off until Start. Marked stopped first, so
+    /// The window's Stop: Kiribra off until Start. Marked stopped first, so
     /// nothing that comes in meanwhile boots it again; then every container
     /// stops and the VM powers off.
     pub fn stop_all(&self) -> Result<(), Error> {
@@ -1665,7 +1665,7 @@ impl Engine {
         if let Some(f) = stopped_marker() {
             let _ = std::fs::write(f, b"");
         }
-        crate::diag::info!("Kiri stopped: the VM stays off until Start");
+        crate::diag::info!("Kiribra stopped: the VM stays off until Start");
         self.sleep_now()
     }
 
@@ -1673,12 +1673,12 @@ impl Engine {
     /// for `/kiri/wake`).
     pub fn unstop(&self) {
         if self.stopped.swap(false, std::sync::atomic::Ordering::SeqCst) {
-            crate::diag::info!("Kiri started");
+            crate::diag::info!("Kiribra started");
         }
         if let Some(f) = stopped_marker() {
             let _ = std::fs::remove_file(f);
         }
-        // What the daemon would have restarted when it came up, had Kiri
+        // What the daemon would have restarted when it came up, had Kiribra
         // not been stopped then. Off this thread: the caller boots the VM.
         if let Some(me) = self.me.get().and_then(Weak::upgrade) {
             std::thread::spawn(move || me.start_held());
@@ -1722,7 +1722,7 @@ impl Engine {
     /// it. Tries again after 10 s, then twice as long each time, up to every
     /// 5 minutes: what launchd and systemd did by starting a daemon that
     /// exited, without the exits. Ends when the containers have started, when
-    /// Start took them, or when Kiri is stopped (then Start starts them).
+    /// Start took them, or when Kiribra is stopped (then Start starts them).
     fn retry_held(&self) {
         let Some(me) = self.me.get().and_then(Weak::upgrade) else { return };
         std::thread::spawn(move || {
@@ -1741,7 +1741,7 @@ impl Engine {
         });
     }
 
-    /// Kiri is stopped, parking the VM or shutting down: every one of
+    /// Kiribra is stopped, parking the VM or shutting down: every one of
     /// them is set before the running containers are signalled.
     fn halting(&self) -> bool {
         self.is_stopped() || self.parking.load(std::sync::atomic::Ordering::SeqCst) || SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst)
@@ -1751,7 +1751,7 @@ impl Engine {
         self.stopped.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Why the VM may not boot now: Kiri stopped (STOPPED), or the daemon
+    /// Why the VM may not boot now: Kiribra stopped (STOPPED), or the daemon
     /// shutting down (SHUTTING). Only a Stop says to press Start.
     fn boot_refused(&self) -> Option<&'static str> {
         boot_refusal(self.is_stopped(), SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst))
@@ -2039,12 +2039,12 @@ impl Engine {
         }
         match kiri_image::jsonfile::keep_copy(&self.records, &bytes) {
             Ok(copy) => {
-                crate::diag::warn!("the container list was changed outside Kiri: kept it as a copy before saving", copy = copy.display());
+                crate::diag::warn!("the container list was changed outside Kiribra: kept it as a copy before saving", copy = copy.display());
                 self.records_damage.lock().unwrap_or_else(|e| e.into_inner()).copies.push(copy);
                 true
             }
             Err(e) => {
-                crate::diag::error!("container records not saved: the list was changed outside Kiri and no copy of it could be kept", file = self.records.display(), error = e);
+                crate::diag::error!("container records not saved: the list was changed outside Kiribra and no copy of it could be kept", file = self.records.display(), error = e);
                 false
             }
         }
@@ -2232,7 +2232,7 @@ impl Engine {
                         let still_wanted = !me.is_stopped() && me.lock().containers.get(&id).is_some_and(|c| c.status == Status::Exited && !c.stopped_by_user);
                         if still_wanted {
                             match me.start_inner(&id, Start::Restart) {
-                                // Kiri is stopping: still pending, Start brings it back.
+                                // Kiribra is stopping: still pending, Start brings it back.
                                 Err(Error::Io(e)) if e.kind() == io::ErrorKind::WouldBlock => {}
                                 Err(e) => crate::diag::warn!("container did not restart", id = &id[..12], error = format!("{e:?}")),
                                 Ok(()) => {}
@@ -2302,7 +2302,7 @@ impl Engine {
                 match end {
                     // sleep_if_idle says why it slept.
                     VmEnd::Slept => {}
-                    // The daemon's own shutdown (`systemctl stop kiri`, quitting Kiri): asked for.
+                    // The daemon's own shutdown (`systemctl stop kiri`, quitting Kiribra): asked for.
                     VmEnd::ShutDown => {
                         self.save();
                         crate::diag::info!("the VM stopped");
@@ -2382,7 +2382,7 @@ impl Engine {
     }
 
     /// (ceiling, current target) in bytes. On a Linux host there is no VM
-    /// of Kiri's to bound: both are the machine's memory (in WSL, the memory
+    /// of Kiribra's to bound: both are the machine's memory (in WSL, the memory
     /// .wslconfig gives it), so the window shows use against what is there.
     pub fn memory(&self) -> (u64, u64) {
         if cfg!(target_os = "macos") {
@@ -2393,7 +2393,7 @@ impl Engine {
         }
     }
 
-    /// What Kiri's Linux holds now, in bytes; 0 while asleep.
+    /// What Kiribra's Linux holds now, in bytes; 0 while asleep.
     pub fn memory_used(&self) -> u64 {
         self.memory_used.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -2706,7 +2706,7 @@ impl Engine {
                 }
                 return Err(Error::Io(io::Error::other("the VM stopped")));
             }
-            // Kiri stopped or stopping (Stop, the VM's sleep on request): the
+            // Kiribra stopped or stopping (Stop, the VM's sleep on request): the
             // restart policy waits for Start, still pending, so Stop holds it.
             if reason != Start::User && (self.is_stopped() || self.parking.load(std::sync::atomic::Ordering::SeqCst)) {
                 return Err(Error::Io(io::Error::new(io::ErrorKind::WouldBlock, STOPPED)));
@@ -2929,7 +2929,7 @@ impl Engine {
         flags |= spec.security_flags();
         // Every container can reach the Mac, as with Docker Desktop and OrbStack.
         // --add-host and links come first: /etc/hosts takes the first match,
-        // so `--add-host host.docker.internal:IP` overrides Kiri's, as on Docker.
+        // so `--add-host host.docker.internal:IP` overrides Kiribra's, as on Docker.
         let mut hosts = spec.extra_hosts.clone();
         hosts.extend(links);
         hosts.push(format!("{}\thost.docker.internal host.kiri.internal", super::ports::HOST_ADDR));
@@ -2970,7 +2970,7 @@ impl Engine {
             g.wait();
         }
         // The guest knows nothing of this container while it waits, so a
-        // stop signal sent meanwhile (Kiri's Stop, the VM's sleep, the
+        // stop signal sent meanwhile (Kiribra's Stop, the VM's sleep, the
         // daemon's shutdown: each sets its flag before it signals) was
         // dropped there. Looked at again under the lock Stop reads the
         // containers with: running it now would leave it running after Stop.
@@ -3289,7 +3289,7 @@ impl Engine {
     /// start must end instead of running, already failed (`fail_start`).
     /// `vm_gone` is read under the engine lock. A start by the restart
     /// policy or recovery took `restart_pending` at its claim; refused
-    /// because Kiri began to stop, it puts it back under that same lock, so
+    /// because Kiribra began to stop, it puts it back under that same lock, so
     /// Stop's hold keeps the container (Exited, pending) whether its loop
     /// ran before or after this, and Start brings it back, as the same error
     /// at the top of `start_on_vm` leaves it. Not when the VM is gone
@@ -3434,13 +3434,13 @@ impl Engine {
         self.lock_networks().allocate6(&n.name, super::network::parse_ip6(want), &avoid).map_err(Error::Conflict)
     }
 
-    /// Where `<host>` (a `*.kiri.localhost` name) should go: the container
+    /// Where `<host>` (a `*.kiribra.localhost` name) should go: the container
     /// and the ports that could be its web port (domains.rs picks one).
     /// Names are the container name, or `<service>.<project>` for Compose
     /// services.
     pub fn route(&self, host: &str) -> Option<super::domains::Target> {
         let host = host.split(':').next()?.to_ascii_lowercase();
-        let name = host.strip_suffix(".kiri.localhost").or_else(|| host.strip_suffix(".kiri.local"))?.to_owned();
+        let name = host.strip_suffix(".kiribra.localhost").or_else(|| host.strip_suffix(".kiribra.local"))?.to_owned();
         let st = self.lock();
         let c = st.containers.values().find(|c| {
             c.status == Status::Running && {
@@ -3526,7 +3526,7 @@ impl Engine {
 
     /// Running containers' domains, for the router's "not found" page.
     pub fn domains(&self) -> Vec<String> {
-        let suffix = if super::dns::installed() { "kiri.local" } else { "kiri.localhost" };
+        let suffix = if super::dns::installed() { "kiribra.local" } else { "kiribra.localhost" };
         let mut v = self.each(|c| {
             let chosen = c.spec.labels.get(DOMAIN_LABEL).and_then(|v| v.as_str()).map(|d| own_name(d.split(',').next().unwrap_or("").trim()).to_owned());
             (c.status == Status::Running).then(|| format!("{}.{suffix}", chosen.filter(|d| !d.is_empty()).unwrap_or_else(|| c.name.clone())))
@@ -3763,7 +3763,7 @@ impl Engine {
             // alone would not change.
             if c.spec.left_all_networks {
                 if c.status == Status::Running {
-                    return Err(Error::Conflict(format!("Kiri cannot connect a running container that left all its networks to {}; stop the container first", net.name)));
+                    return Err(Error::Conflict(format!("Kiribra cannot connect a running container that left all its networks to {}; stop the container first", net.name)));
                 }
                 c.spec.join_first_network(ExtraNetwork { name: net.name.clone(), aliases, ipv4_address, ipv6_address, mac_address });
                 drop(st);
@@ -3818,7 +3818,7 @@ impl Engine {
                 // its resolver: moving those to another network while it
                 // runs needs the guest to do more than unplug it.
                 if c.status == Status::Running {
-                    return Err(Error::Conflict(format!("Kiri cannot disconnect a running container from its first network ({}); stop the container first", net.name)));
+                    return Err(Error::Conflict(format!("Kiribra cannot disconnect a running container from its first network ({}); stop the container first", net.name)));
                 }
                 let left = (c.ip.take(), c.ip6.take());
                 let nets = self.lock_networks();
@@ -3941,7 +3941,7 @@ impl Engine {
         Ok(self.vm()?.top(&id)?)
     }
 
-    /// Kiri's own: the TCP ports a running container listens on, split into
+    /// Kiribra's own: the TCP ports a running container listens on, split into
     /// those a published port would reach and those it would not.
     pub fn listening(&self, key: &str) -> Result<(Vec<u16>, Vec<u16>), Error> {
         let id = self.resolve(key)?;
@@ -3959,7 +3959,7 @@ impl Engine {
     }
 
     /// `docker rename`.
-    /// Kiri's own: new published ports for a container. A running one keeps
+    /// Kiribra's own: new published ports for a container. A running one keeps
     /// running: its ports are relays on the Mac, so only they are replaced.
     /// If the new ones cannot be bound, the old ones are put back.
     pub fn set_ports(&self, key: &str, ports: Vec<super::ports::Binding>) -> Result<(), Error> {
@@ -4004,7 +4004,7 @@ impl Engine {
         Ok(())
     }
 
-    /// Kiri's own: a container's environment. Takes effect at its next start;
+    /// Kiribra's own: a container's environment. Takes effect at its next start;
     /// says whether it is running now, so the caller can restart it.
     pub fn set_env(&self, key: &str, env: Vec<String>) -> Result<bool, Error> {
         let id = self.resolve(key)?;
@@ -4072,7 +4072,7 @@ impl Engine {
         let ended_start = if by_user {
             self.await_start(key, START_GRACE, Cancel::Stopped)
         } else {
-            // Kiri stopping, or its VM going to sleep: not held up by a
+            // Kiribra stopping, or its VM going to sleep: not held up by a
             // start, as before.
             self.cancel_start(key, Cancel::Stopped)
         };
@@ -4167,7 +4167,7 @@ impl Engine {
         self.cancel_gate(&id, &gate, by)
     }
 
-    /// Kiri's own stop of a container whose start is still under way: the
+    /// Kiribra's own stop of a container whose start is still under way: the
     /// start is cancelled at once (see `cancel_gate`). True when a start was
     /// under way.
     fn cancel_start(&self, key: &str, by: Cancel) -> bool {
@@ -4514,7 +4514,7 @@ impl Engine {
         self.lock().execs.values().filter(|e| e.container_id == container_id && e.running).count()
     }
 
-    /// Drops a finished exec's record: Kiri's own, which nobody inspects.
+    /// Drops a finished exec's record: Kiribra's own, which nobody inspects.
     pub fn forget_exec(&self, exec_id: &str) {
         self.lock().execs.remove(exec_id);
     }
@@ -4595,7 +4595,7 @@ impl Engine {
     }
 }
 
-/// A Docker event in Kiri's log: containers and images coming and going,
+/// A Docker event in Kiribra's log: containers and images coming and going,
 /// with name, image and exit code; never labels (they can hold anything).
 /// A BuildKit container's exec is a build session (`docker build`).
 /// The `key=value` network settings the guest takes with `Run`.
@@ -4739,7 +4739,7 @@ fn shared_volume_gates(st: &State, id: &str, spec: &Spec) -> Vec<Arc<StartGate>>
 }
 
 /// Whether a start that waited for other starts must not run its container
-/// after all: Kiri began to stop meanwhile (not already when the start was
+/// after all: Kiribra began to stop meanwhile (not already when the start was
 /// claimed: Stop's signals reach the guest only for containers it knows,
 /// which this one was not), or the VM is gone.
 fn refuse_after_wait(halted_at_claim: bool, halting: bool, vm_gone: bool) -> bool {
@@ -4781,14 +4781,14 @@ pub fn random_hex(bytes: usize) -> String {
 /// The label a container chooses its local names with.
 pub const DOMAIN_LABEL: &str = "dev.kiri.domain";
 
-/// `api.myapp`, from any of `api.myapp`, `api.myapp.kiri.local` or
-/// `api.myapp.kiri.localhost`.
+/// `api.myapp`, from any of `api.myapp`, `api.myapp.kiribra.local` or
+/// `api.myapp.kiribra.localhost`.
 fn own_name(d: &str) -> &str {
-    d.strip_suffix(".kiri.localhost").or_else(|| d.strip_suffix(".kiri.local")).unwrap_or(d)
+    d.strip_suffix(".kiribra.localhost").or_else(|| d.strip_suffix(".kiribra.local")).unwrap_or(d)
 }
 
 /// Docker's container-name rule: non-empty, `[a-zA-Z0-9_.-]` only. A name
-/// is a DNS label on user networks and part of `<name>.kiri.localhost`, so
+/// is a DNS label on user networks and part of `<name>.kiribra.localhost`, so
 /// it must not carry spaces, slashes or control characters.
 fn valid_container_name(n: &str) -> bool {
     !n.is_empty() && n.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
@@ -4846,7 +4846,7 @@ mod refusal_tests {
         assert!(shutting.contains("again"), "{shutting}");
         assert_eq!(super::boot_refusal(true, false), Some(super::STOPPED));
         assert_eq!(super::boot_refusal(true, true), Some(super::STOPPED));
-        assert!(super::STOPPED.starts_with("Kiri is stopped") && super::STOPPED.contains("`kiri start`"), "{}", super::STOPPED);
+        assert!(super::STOPPED.starts_with("Kiribra is stopped") && super::STOPPED.contains("`kiri start`"), "{}", super::STOPPED);
     }
 }
 
@@ -4980,7 +4980,7 @@ fn error_text(e: &Error) -> String {
 const SHUTDOWN_WAIT_CAP: Duration = Duration::from_secs(120);
 
 /// Who stops every container: the daemon shutting down (each wait capped,
-/// no events), or Kiri's Stop (`docker stop`'s waits and events).
+/// no events), or Kiribra's Stop (`docker stop`'s waits and events).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Stopping {
     Shutdown,
@@ -4994,7 +4994,7 @@ impl Engine {
         stop_wait(self.with(key, |c| c.spec.stop_timeout).ok().flatten().unwrap_or(DEFAULT_STOP_TIMEOUT))
     }
 
-    /// Daemon shutdown and Kiri's Stop: every running container gets its
+    /// Daemon shutdown and Kiribra's Stop: every running container gets its
     /// stop signal and its own stop timeout, as `docker stop` would, then
     /// SIGKILL, all at once. Returns the ones still running after SIGKILL.
     fn stop_together(&self, vm: &VmLink, ids: &[String], how: Stopping) -> Vec<String> {
@@ -5016,7 +5016,7 @@ impl Engine {
             pending.push((id.clone(), t0 + wait, None));
         }
         // A SIGKILLed container's exit is quick; don't hang on one that
-        // isn't. Kiri's Stop waits as long as `docker stop` does.
+        // isn't. Kiribra's Stop waits as long as `docker stop` does.
         let grace = if engine { Duration::from_secs(10) } else { Duration::from_secs(2) };
         let mut exited = Vec::new();
         let mut st = self.lock();
@@ -5213,14 +5213,14 @@ impl Engine {
 mod vm_recovery_tests {
     use super::*;
 
-    /// Run only in an isolated HOME and KIRI_DATA_DIR containing an Alpine
+    /// Run only in an isolated HOME and KIRIBRA_DATA_DIR containing an Alpine
     /// image and no containers, with a signed test binary and guest assets.
     #[cfg(target_os = "macos")]
     #[test]
     #[ignore = "requires an isolated store, signed binary and a real VM"]
     fn vm_loss_live_recovers_without_a_request() {
         assert_eq!(std::env::var("KIRI_LIVE_VM_RECOVERY").as_deref(), Ok("1"));
-        let root = PathBuf::from(std::env::var_os("KIRI_DATA_DIR").expect("isolated KIRI_DATA_DIR"));
+        let root = PathBuf::from(std::env::var_os("KIRIBRA_DATA_DIR").expect("isolated KIRIBRA_DATA_DIR"));
         let records = root.join("containers.json");
         if records.exists() {
             let saved: Vec<Saved> = serde_json::from_slice(&std::fs::read(records).unwrap()).unwrap();
@@ -5616,7 +5616,7 @@ mod vm_recovery_tests {
         }
         engine.stopped.store(false, std::sync::atomic::Ordering::SeqCst);
         let st = engine.lock();
-        assert_eq!(st.containers[&id].status, Status::Exited, "nothing starts while Kiri stops");
+        assert_eq!(st.containers[&id].status, Status::Exited, "nothing starts while Kiribra stops");
         assert!(st.containers[&id].restart_pending, "the restart stays pending, for Start to bring back");
         drop(st);
         engine.parking.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -6022,7 +6022,7 @@ mod records_tests {
         assert!(!m.contains("back"), "no advice to put a list back: {m}");
         let unsaved = Damage { unsaved: Some("Permission denied".into()), ..Default::default() };
         let m = unsaved.message(records).unwrap();
-        assert!(m.contains("changes to containers are not saved until Kiri can write to that folder") && m.contains("Permission denied") && m.contains("until a copy can be kept") && !m.contains("tidies up"), "{m}");
+        assert!(m.contains("changes to containers are not saved until Kiribra can write to that folder") && m.contains("Permission denied") && m.contains("until a copy can be kept") && !m.contains("tidies up"), "{m}");
         let unlistable = Damage { unlistable: Some("Permission denied".into()), ..Default::default() };
         let m = unlistable.message(records).unwrap();
         assert!(m.contains("cannot list /s") && m.contains("until that folder can be listed and the engine itself is restarted") && !m.contains("cannot be listed again"), "{m}");
@@ -6782,14 +6782,14 @@ mod start_wait_tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// A start that waited ends instead of running when Kiri began to stop
+    /// A start that waited ends instead of running when Kiribra began to stop
     /// meanwhile or the VM went; not when it was stopping already at the
     /// claim (its signals did not reach it, as before), and not when it had
     /// nothing to wait for (the caller does not look).
     #[test]
     fn a_start_that_waited_does_not_run_after_a_stop() {
         // (halted at claim, halting now, vm gone) -> refuse
-        assert!(refuse_after_wait(false, true, false), "Kiri began to stop while it waited");
+        assert!(refuse_after_wait(false, true, false), "Kiribra began to stop while it waited");
         assert!(refuse_after_wait(false, false, true), "the VM went");
         assert!(refuse_after_wait(true, true, true));
         assert!(!refuse_after_wait(false, false, false));
@@ -6808,10 +6808,10 @@ mod start_wait_tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// A start by the restart policy that waited and is refused because Kiri
+    /// A start by the restart policy that waited and is refused because Kiribra
     /// began to stop stays pending, so Stop's hold keeps it and Start
     /// brings it back; a user start is not made pending; nothing is refused
-    /// when Kiri was stopping at the claim, or is not stopping.
+    /// when Kiribra was stopping at the claim, or is not stopping.
     #[test]
     fn a_refused_policy_start_stays_pending_for_stop_to_hold() {
         let (engine, id, dir) = engine("refused");
@@ -6833,7 +6833,7 @@ mod start_wait_tests {
             let c = &st.containers[&id];
             (c.status == Status::Running || c.restart_pending) && comes_back(c)
         };
-        // (1) Kiri began to stop during the wait (the engine's stopped flag is set).
+        // (1) Kiribra began to stop during the wait (the engine's stopped flag is set).
         for reason in [Start::Restart, Start::DaemonRestart, Start::Held] {
             claimed(&engine, false);
             let guard = shut(&engine, &id);

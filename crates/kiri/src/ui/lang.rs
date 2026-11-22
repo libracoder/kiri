@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-/// Every translation Kiri ships, by language tag, as lang/<tag>.json maps
+/// Every translation Kiribra ships, by language tag, as lang/<tag>.json maps
 /// English to it. English itself has no file.
 pub const FILES: [(&str, &str); 37] = [
     ("id", include_str!("lang/id.json")),
@@ -92,7 +92,7 @@ pub fn strings_js(lang: &str) -> String {
 
 /// The host's answer to a page's `langwords`: JS that hands the page `tag`'s
 /// words, packed as [`strings_js`] packs them, and shows them if `tag` is the
-/// language picked. `None` for a tag Kiri has no file for.
+/// language picked. `None` for a tag Kiribra has no file for.
 pub fn words_js(tag: &str) -> Option<String> {
     let w = words(tag)?;
     Some(format!("window.kiriWords && kiriWords({})", serde_json::json!({ tag: w })))
@@ -104,7 +104,7 @@ fn maps() -> &'static HashMap<&'static str, HashMap<String, String>> {
     MAPS.get_or_init(|| FILES.iter().map(|(tag, json)| (*tag, serde_json::from_str(json).unwrap_or_default())).collect())
 }
 
-/// A language tag to one Kiri has, as the pages' `langFor` does: Chinese
+/// A language tag to one Kiribra has, as the pages' `langFor` does: Chinese
 /// written in Taiwan, Hong Kong and Macao (zh-TW, zh-HK, zh-MO, zh-Hant…)
 /// reads Traditional, any other Chinese Simplified; any Portuguese reads
 /// Brazilian; `in` is Indonesian's old tag (Java, older Android); any
@@ -145,10 +145,10 @@ pub fn resolve(pick: Option<&str>) -> &'static str {
 
 /// Whether the window asks for a language when it opens. Once, on a first
 /// start, for everyone; after an update, only for someone whose computer is in
-/// a language Kiri now speaks other than English and who never picked one in
+/// a language Kiribra now speaks other than English and who never picked one in
 /// Settings: the window has just changed language under them, and they may
 /// want English back. An English computer has nothing new to choose, and
-/// neither does one in a language Kiri doesn't have yet.
+/// neither does one in a language Kiribra doesn't have yet.
 pub fn should_ask(fresh: bool, prefs: &serde_json::Value, os: &[String]) -> bool {
     if prefs["langAsked"] == true {
         return false;
@@ -177,7 +177,7 @@ fn rtl_letter(c: char) -> bool {
     matches!(c, '\u{0590}'..='\u{08FF}' | '\u{FB1D}'..='\u{FDFF}' | '\u{FE70}'..='\u{FEFC}')
 }
 
-/// Right-to-left words that open with a Latin name ("docker يستخدم Kiri")
+/// Right-to-left words that open with a Latin name ("docker يستخدم Kiribra")
 /// would be laid out left to right wherever the text's direction comes from
 /// its first letter (the page, a menu, a notification). A right-to-left mark
 /// (U+200F, no width) in front says which way the sentence runs. A
@@ -327,7 +327,7 @@ mod tests {
         assert!(should_ask(false, &none, &os(&["zh-TW"])));
         // Dutch first, German second: German is what the window shows, so ask.
         assert!(should_ask(false, &none, &os(&["nl-NL", "de-DE"])));
-        // An English computer, or one Kiri can't speak yet, sees nothing new.
+        // An English computer, or one Kiribra can't speak yet, sees nothing new.
         assert!(!should_ask(false, &none, &os(&["en-GB"])));
         assert!(!should_ask(false, &none, &os(&["nl-NL", "he"])));
         // An Arabic computer asks: the window turned right to left under its owner.
@@ -498,7 +498,7 @@ mod tests {
         assert!(!rtl("en"));
         // Arabic first: nothing to add. A Latin name first: a right-to-left mark in front.
         assert_eq!(rtl_ready("الإعدادات…".into()), "الإعدادات…");
-        assert_eq!(rtl_ready("Kiri يعمل".into()), "\u{200F}Kiri يعمل");
+        assert_eq!(rtl_ready("Kiribra يعمل".into()), "\u{200F}Kiribra يعمل");
         // A placeholder isn't the first letter (it's filled as an island), and words with no Arabic stay as they are.
         assert_eq!(rtl_ready("{name} توقف".into()), "{name} توقف");
         assert_eq!(rtl_ready("Kubernetes".into()), "Kubernetes");

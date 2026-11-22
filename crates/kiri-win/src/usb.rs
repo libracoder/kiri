@@ -1,4 +1,4 @@
-//! The window's USB view on Windows: WSL 2, where Kiri's containers run,
+//! The window's USB view on Windows: WSL 2, where Kiribra's containers run,
 //! gets USB devices through usbipd-win (Microsoft's recommended tool). A
 //! device is shared once (`usbipd bind`, which Windows asks an
 //! administrator to approve) and then attached to WSL (`usbipd attach
@@ -117,7 +117,7 @@ pub fn list() -> Value {
     }
     match run(&["state"]).and_then(|s| serde_json::from_str::<Value>(&s).map_err(io::Error::other)) {
         Ok(state) => json!({"type": "usb", "devices": with_paths(rows(&state)), "can": "attach",
-            "note": crate::engine::tr("A device in Kiri is gone from Windows until you detach it. In a container: --device /dev/ttyUSB0 (serial), /dev/input (HID) or /dev/bus/usb (raw).")}),
+            "note": crate::engine::tr("A device in Kiribra is gone from Windows until you detach it. In a container: --device /dev/ttyUSB0 (serial), /dev/input (HID) or /dev/bus/usb (raw).")}),
         Err(e) => json!({"type": "usb", "devices": [], "error": e.to_string()}),
     }
 }
@@ -145,7 +145,7 @@ fn attach(bus: &str) -> io::Result<String> {
     }
     run(&["attach", "--wsl", "--busid", bus]).map_err(|e| io::Error::other(format!("{name} was not attached: {e}")))?;
     set_attached(bus, true);
-    Ok(crate::engine::trf("{name} is in Kiri", &[("name", &name)]))
+    Ok(crate::engine::trf("{name} is in Kiribra", &[("name", &name)]))
 }
 
 fn detach(bus: &str) -> io::Result<String> {

@@ -1,6 +1,6 @@
 [package]
 name = "kiri-init"
-description = "PID 1 and agent of the Kiri guest VM"
+description = "PID 1 and agent of the Kiribra guest VM"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

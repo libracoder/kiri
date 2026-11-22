@@ -1,6 +1,6 @@
 [package]
 name = "kiri-win"
-description = "Kiri's Windows side: the Docker API on a named pipe, carried into WSL2, and Kiri's window"
+description = "Kiribra's Windows side: the Docker API on a named pipe, carried into WSL2, and Kiribra's window"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -3,7 +3,7 @@
 # administrator's approval first. Installed beside kiri-win.exe, which checks
 # it against the SHA-256 it was built with and runs
 #   powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File kiri-admin.ps1 -Wsl -Msi <wsl .msi> -Sha256 <hex>
-#   powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File kiri-admin.ps1 -Dns -Suffix kiri.local [-Off]
+#   powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File kiri-admin.ps1 -Dns -Suffix kiribra.local [-Off]
 # A script file with parameters, not script text in kiri-win.exe handed to
 # PowerShell encoded: an elevated, hidden PowerShell fed an encoded script
 # is what malware droppers do, and Defender's heuristics quarantined a
@@ -14,7 +14,7 @@ param(
   [string]$Sha256,
   [switch]$Dns,
   [ValidatePattern('^[A-Za-z0-9.-]+$')]
-  [string]$Suffix = "kiri.local",
+  [string]$Suffix = "kiribra.local",
   [switch]$Off
 )
 $ErrorActionPreference = "Stop"

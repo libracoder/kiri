@@ -9,7 +9,7 @@
 //! requests marked as the window's own, which don't count as use. The
 //! cluster is started, stopped and recreated with the containers API, as
 //! `kiri k8s` does on the Mac (there is no `kiri k8s` on Windows): its
-//! settings are in %LOCALAPPDATA%\Kiri\k8s.json and its kubeconfig beside
+//! settings are in %LOCALAPPDATA%\Kiribra\k8s.json and its kubeconfig beside
 //! them; its `kiri` context is put into %USERPROFILE%\.kube\config at each
 //! start and whenever the window finds the engine with the node running.
 
@@ -104,7 +104,7 @@ fn copy(text: &str) {
 
 // --- the cluster's settings ---------------------------------------------------------
 
-/// The cluster's settings, in %LOCALAPPDATA%\Kiri\k8s.json: whether its API
+/// The cluster's settings, in %LOCALAPPDATA%\Kiribra\k8s.json: whether its API
 /// server (and, through the engine, its LoadBalancer services) answers on
 /// every interface rather than 127.0.0.1, extra names for its certificate,
 /// and the port asked for. They are applied when the node container is
@@ -128,9 +128,9 @@ impl Config {
     }
 }
 
-/// %LOCALAPPDATA%\Kiri, where the window keeps its settings.
+/// %LOCALAPPDATA%\Kiribra, where the window keeps its settings.
 fn state_dir() -> io::Result<PathBuf> {
-    std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("Kiri")).ok_or_else(|| io::Error::other("LOCALAPPDATA is not set"))
+    std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("Kiribra")).ok_or_else(|| io::Error::other("LOCALAPPDATA is not set"))
 }
 
 fn config_path() -> io::Result<PathBuf> {
@@ -188,7 +188,7 @@ fn bound_port(info: &Value) -> Option<u16> {
     live.as_str().or(made.as_str()).and_then(|p| p.parse().ok())
 }
 
-/// A port no program on this PC holds (another Kiri's cluster, Docker
+/// A port no program on this PC holds (another Kiribra's cluster, Docker
 /// Desktop's, a tunnel): nothing answers on it and it can be bound. WSL
 /// relays the engine's published ports to Windows' localhost, so a port
 /// held in WSL answers here too.
@@ -589,7 +589,7 @@ fn k3s_yaml() -> io::Result<String> {
     Ok(raw)
 }
 
-/// The cluster's kubeconfig, renamed to `kiri`, at %LOCALAPPDATA%\Kiri\kubeconfig,
+/// The cluster's kubeconfig, renamed to `kiri`, at %LOCALAPPDATA%\Kiribra\kubeconfig,
 /// and its cluster, user and context put into %USERPROFILE%\.kube\config
 /// (or the first of %KUBECONFIG%) by the Mac's own crates/kiri/src/kubeconfig.rs,
 /// with no kubectl.exe needed. Its server is 127.0.0.1 and the port: WSL
@@ -616,7 +616,7 @@ fn kubeconfig(port: u16, say: &dyn Fn(&str)) -> io::Result<bool> {
 static SYNCING: AtomicBool = AtomicBool::new(false);
 
 /// The context of a cluster that is already running, each time the window
-/// finds the engine (WSL restarted the node, or an older Kiri never wrote
+/// finds the engine (WSL restarted the node, or an older Kiribra never wrote
 /// it): in the background, once k3s has its kubeconfig, and rewritten if
 /// its port or certificate changed. Nothing when no node runs.
 pub(crate) fn sync_soon() {

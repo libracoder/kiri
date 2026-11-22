@@ -1,4 +1,4 @@
-//! Telling official Kiri builds from forks and scripts.
+//! Telling official Kiribra builds from forks and scripts.
 //!
 //! Each release is built with a random 32-byte build key compiled in. The
 //! edge knows the keys by id (`id:hex`) and challenges clients that set

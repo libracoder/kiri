@@ -1,8 +1,8 @@
-//! Settings → Resources on Windows. Kiri's engine runs in WSL's one VM,
+//! Settings → Resources on Windows. Kiribra's engine runs in WSL's one VM,
 //! whose CPUs and memory are `processors` and `memory` under `[wsl2]` in
 //! %USERPROFILE%\.wslconfig (memory is half of the PC's when unset). Saving
 //! writes those two keys and keeps the rest of the file; they apply when
-//! WSL restarts, which stops every WSL distro, not only Kiri's.
+//! WSL restarts, which stops every WSL distro, not only Kiribra's.
 
 use std::io;
 use std::path::PathBuf;
@@ -90,7 +90,7 @@ fn physical_mib() -> u64 {
 }
 
 /// What the running VM has: CPUs, and memory in MiB as Linux reports it
-/// (MemTotal; see `as_set`). None while Kiri's engine isn't running, so
+/// (MemTotal; see `as_set`). None while Kiribra's engine isn't running, so
 /// that Settings never starts WSL.
 fn running() -> Option<(u64, u64)> {
     if !crate::client::alive() {
@@ -139,7 +139,7 @@ fn event() -> Value {
         "max_cpus": max_cpus,
         "max_memory_mib": max_mib,
         "overridden": false,
-        "restart_note": "Restarting restarts WSL: every WSL distro stops, not only Kiri's, and Kiri's containers start again as they're set to.",
+        "restart_note": "Restarting restarts WSL: every WSL distro stops, not only Kiribra's, and Kiribra's containers start again as they're set to.",
     })
 }
 
@@ -161,7 +161,7 @@ pub fn resources(body: Option<Value>) {
         let saved = body.map(|b| save(&b));
         let ev = event();
         match saved {
-            // While Kiri's engine runs, the toast offers to restart WSL now.
+            // While Kiribra's engine runs, the toast offers to restart WSL now.
             Some(Ok(())) => emit(json!({"type": "notice", "kind": "ok", "text": tr("Saved in .wslconfig. WSL uses these from its next start"), "act": if ev["awake"] == true { "restartvm" } else { "" }}).to_string()),
             Some(Err(e)) => emit(notice("error", &trf("Could not save .wslconfig: {error}", &[("error", &e)]))),
             None => {}
@@ -170,7 +170,7 @@ pub fn resources(body: Option<Value>) {
     });
 }
 
-/// Restart to apply: WSL stops and Kiri's engine starts again.
+/// Restart to apply: WSL stops and Kiribra's engine starts again.
 pub fn restart() {
     std::thread::spawn(|| {
         let mut cmd = crate::win::tool("wsl.exe");

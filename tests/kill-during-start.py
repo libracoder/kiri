@@ -124,7 +124,7 @@ def check(path, image):
 
     def start(cid, removing):
         # A start answers 204, and the signal reaches the process once it
-        # runs, as on Docker. A forced removal can get there first (on Kiri,
+        # runs, as on Docker. A forced removal can get there first (on Kiribra,
         # one that finds the start still unfinished after 2 s): the start
         # then answers 409 "marked for removal", as Docker's does, or 404.
         status, body = request("POST", "/containers/" + cid + "/start", (204, 404, 409) if removing else (204,))

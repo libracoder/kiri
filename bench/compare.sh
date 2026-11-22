@@ -1,10 +1,10 @@
 #!/bin/bash
 # Times the hot paths of whatever engine `docker` talks to: container start,
-# exec, and 200 MB each way. Run it against Kiri and against another engine
+# exec, and 200 MB each way. Run it against Kiribra and against another engine
 # (Docker Desktop's WSL integration, dockerd) on the same machine, back to
 # back, and compare the lines. Medians of 30 for the latencies.
 #
-#   DOCKER_HOST=unix:///var/lib/kiri-daemon/.kiri/run/docker.sock bench/compare.sh kiri
+#   DOCKER_HOST=unix:///var/lib/kiri-daemon/.kiribra/run/docker.sock bench/compare.sh kiri
 #   DOCKER_HOST=unix:///var/run/docker.sock bench/compare.sh desktop
 #
 # Note: the "in" figure only means something if every byte arrived; the

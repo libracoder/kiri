@@ -1,7 +1,7 @@
-//! Diagnostics: Kiri's own log, crash reports and `kiri diag`.
+//! Diagnostics: Kiribra's own log, crash reports and `kiri diag`.
 //!
 //! Each process, the window (`ui`), the engine (`daemon`) and the command
-//! line (`cli`), writes one JSON line per event to `~/.kiri/logs/<part>.log`:
+//! line (`cli`), writes one JSON line per event to `~/.kiribra/logs/<part>.log`:
 //!
 //! ```text
 //! {"time":"2026-10-28T09:41:07.123Z","level":"warn","part":"daemon","msg":"container exited","fields":{"id":"3f2a9c1e0b7d","exit_code":"137"}}
@@ -19,11 +19,11 @@
 //! The window and the engine also send their stderr through a pipe (see
 //! [`capture_stderr`]): each line gets a timestamp in the log, and a
 //! timestamped copy goes on to the original stderr (the engine's
-//! `~/.kiri/daemon.log`), with the log's own events beside them.
+//! `~/.kiribra/daemon.log`), with the log's own events beside them.
 //!
-//! A panic in any process leaves `~/.kiri/crashes/<unix time>-<part>.txt`.
+//! A panic in any process leaves `~/.kiribra/crashes/<unix time>-<part>.txt`.
 //! `kiri diag report` gathers logs and crashes, redacted, into one file
-//! (see [`report`]); crash files go to Kiri Cloud by themselves only when
+//! (see [`report`]); crash files go to Kiribra Cloud by themselves only when
 //! the person turned that on (`"crashReports": true` in `ui.json`).
 
 use std::fmt::Write as _;
@@ -109,7 +109,7 @@ static ECHO: AtomicI32 = AtomicI32::new(-1);
 /// keeps under [`MAX_LOG`]; -1 when it isn't (a terminal, journald).
 static ECHO_SIZE: AtomicI64 = AtomicI64::new(-1);
 /// The same file as the original stderr, open for reading: launchd opens
-/// `~/.kiri/daemon.log` write-only.
+/// `~/.kiribra/daemon.log` write-only.
 static ECHO_READ: OnceLock<File> = OnceLock::new();
 
 /// This process's part; `cli` until [`init`] says otherwise.
@@ -196,10 +196,10 @@ pub fn enter_op(op: String) -> OpScope {
 
 /// The header that carries this thread's op to the engine, or nothing.
 pub fn op_header() -> String {
-    op().map(|o| format!("X-Kiri-Op: {o}\r\n")).unwrap_or_default()
+    op().map(|o| format!("X-Kiribra-Op: {o}\r\n")).unwrap_or_default()
 }
 
-/// `~/.kiri` (`~/.kiri-dev` for Kiri Dev).
+/// `~/.kiribra` (`~/.kiribra-dev` for Kiribra Dev).
 pub fn state_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|h| PathBuf::from(h).join(crate::flavor::STATE.get()))
 }
@@ -293,7 +293,7 @@ pub fn rotated(path: &Path, n: usize) -> PathBuf {
 
 fn append(part: Part, line: &str) -> io::Result<()> {
     // Unit tests log too (a setup step that fails on purpose): never into
-    // the real ~/.kiri/logs of whoever runs them.
+    // the real ~/.kiribra/logs of whoever runs them.
     if cfg!(test) {
         return Ok(());
     }
@@ -341,7 +341,7 @@ fn echo(text: &str) {
     let mut f = ManuallyDrop::new(unsafe { File::from_raw_fd(fd) });
     let line = format!("{text}\n");
     let _ = f.write_all(line.as_bytes());
-    // Nothing rotates the engine's ~/.kiri/daemon.log (launchd only appends),
+    // Nothing rotates the engine's ~/.kiribra/daemon.log (launchd only appends),
     // and logs/daemon.log already has these lines: keep it bounded here.
     // Counted, not stat'ed per line; what else writes to it (stdout) is
     // caught up when it's trimmed.
@@ -562,10 +562,10 @@ pub fn system() -> System {
     System { os, build, arch: std::env::consts::ARCH, model }
 }
 
-/// `kiri` or `kiri-dev`, as an upload names the flavor (a feature app
+/// `kiri` or `kiribra-dev`, as an upload names the flavor (a feature app
 /// counts as Dev); crash files say the exact one.
 pub fn flavor() -> &'static str {
-    if crate::flavor::dev() { "kiri-dev" } else { "kiri" }
+    if crate::flavor::dev() { "kiribra-dev" } else { "kiri" }
 }
 
 /// Writes a crash file (and an error line) on every panic, then lets the
@@ -612,7 +612,7 @@ pub fn crash_text(t: SystemTime, thread: &str, at: &str, message: &str, backtrac
     // The subcommand only: arguments can carry values (`-e KEY=VALUE`).
     let command = std::env::args().nth(1).filter(|a| a.len() <= 20 && a.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'));
     let text = format!(
-        "Kiri crash report\n\
+        "Kiribra crash report\n\
          Version:  {app} {version}\n\
          Flavor:   {flavor}\n\
          Part:     {part}\n\
@@ -705,7 +705,7 @@ mod tests {
             let _outer = enter_op("pull-0001".into());
             {
                 let _inner = enter_op("run-0002".into());
-                assert_eq!(op_header(), "X-Kiri-Op: run-0002\r\n");
+                assert_eq!(op_header(), "X-Kiribra-Op: run-0002\r\n");
                 std::thread::spawn(|| assert_eq!(super::op(), None)).join().unwrap();
             }
             assert_eq!(super::op().as_deref(), Some("pull-0001"));
@@ -799,7 +799,7 @@ mod tests {
         assert_eq!(b.file_name().unwrap(), "1792800000-daemon-1.txt");
         let text = crash_text(t, "kiri-api", "src/x.rs:1:2", "boom", "0: main");
         assert!(text.contains("Message:  boom") && text.contains("Thread:   kiri-api") && text.contains("Backtrace:\n0: main"), "{text}");
-        assert!(text.contains(&format!("Version:  Kiri {}", env!("CARGO_PKG_VERSION"))));
+        assert!(text.contains(&format!("Version:  Kiribra {}", env!("CARGO_PKG_VERSION"))));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

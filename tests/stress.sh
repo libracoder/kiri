@@ -62,14 +62,14 @@ IMG=alpine:latest
 WORK=$(mktemp -d)
 PASS=0 FAIL=0 SKIP=0 FAILED=()
 T_START=$SECONDS
-# $D quoted: the kiri binary's path may hold a space (Kiri Repro.app).
+# $D quoted: the kiri binary's path may hold a space (Kiribra Repro.app).
 kiri_docker() { "$D" "$@"; }
 # shellcheck source=SCRIPTDIR/lib/images.sh
 . "$(dirname "$0")/lib/images.sh"
 # shellcheck source=SCRIPTDIR/lib/regressions.sh
 . "$(dirname "$0")/lib/regressions.sh"
 
-# On macOS the engine's Linux is Kiri's VM, which this shell cannot see; on a
+# On macOS the engine's Linux is Kiribra's VM, which this shell cannot see; on a
 # Linux host and in WSL it is this host, so leftovers there are looked for too.
 KVER=$(perl -e 'alarm 30; exec @ARGV' "$D" version --format '{{.Server.KernelVersion}}' 2>/dev/null)
 case ${KIRI_TEST_SYSTEM:-} in
@@ -378,7 +378,7 @@ fi
 
 # (e) buildx's docker-container builder made, bootstrapped and removed, round
 # after round, each with a fresh name: every first bootstrap must start its
-# BuildKit container, with no retry. Kiri 0.1.18 closed the connection after
+# BuildKit container, with no retry. Kiribra 0.1.18 closed the connection after
 # the copy into the container without saying so, and the start sent next on
 # it failed with "connection reset by peer" in about one round in six (#83).
 if selected buildx-bootstrap-loop; then

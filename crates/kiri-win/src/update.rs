@@ -6,21 +6,21 @@
 //! `KIRI_UPDATE_URL` (default: `download.runkiri.com/latest-windows-x86_64.json`,
 //! or `latest-windows-arm64.json` for Windows on Arm's build);
 //! `url` is the MSI. The download is checked against the SHA-256, then the
-//! MSI itself is read (msi.dll) and must carry Kiri's own UpgradeCode, this
+//! MSI itself is read (msi.dll) and must carry Kiribra's own UpgradeCode, this
 //! build's platform (x64 and arm64 share the UpgradeCode, so an x64 MSI
-//! would otherwise replace an arm64 Kiri) and the version the feed
+//! would otherwise replace an arm64 Kiribra) and the version the feed
 //! promised, newer than this build, before it is
-//! staged in `%LOCALAPPDATA%\Kiri\update`. Installing hands the staged MSI
+//! staged in `%LOCALAPPDATA%\Kiribra\update`. Installing hands the staged MSI
 //! to msiexec once this process has quit (the files it replaces are in
 //! use until then): `kiri.ps1 -Update` (contrib/windows, installed beside
 //! the exe) waits for that, runs the per-user upgrade silently, and opens
-//! the new Kiri.
+//! the new Kiribra.
 //!
 //! The window downloads in the background, then installs on Restart now,
 //! or when it quits after Later (or at its next launch, if that quit never
 //! happened). The engine in WSL keeps running the old binary until
 //! `restart_engine` copies the new one in and restarts it, which the new
-//! Kiri does once the engine answers (`catch_up_engine`); the page offers
+//! Kiribra does once the engine answers (`catch_up_engine`); the page offers
 //! it as "Finish updating" when that failed and the engine still lags.
 //!
 //! What this cannot do that the Mac does: pin the download to a signing
@@ -46,7 +46,7 @@ const FEED: &str = "https://download.runkiri.com/latest-windows-x86_64.json";
 const FEED: &str = "https://download.runkiri.com/latest-windows-arm64.json";
 /// The biggest download accepted (the MSI is about 55 MB).
 const MAX_DOWNLOAD: u64 = 2 << 30;
-/// installer/windows/kiri.wxs's UpgradeCode: what makes an MSI a Kiri one.
+/// installer/windows/kiri.wxs's UpgradeCode: what makes an MSI a Kiribra one.
 const UPGRADE_CODE: &str = "{7C2E4B9A-5D13-4F8E-9B6A-0E1D3C5A7F21}";
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
@@ -79,9 +79,9 @@ pub fn newer(candidate: &str, current: &str) -> bool {
     false
 }
 
-/// %LOCALAPPDATA%\Kiri, where the MSI installs and kiri-win keeps its state.
+/// %LOCALAPPDATA%\Kiribra, where the MSI installs and kiri-win keeps its state.
 fn dir() -> PathBuf {
-    std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("Kiri")).unwrap_or_else(|| PathBuf::from("."))
+    std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("Kiribra")).unwrap_or_else(|| PathBuf::from("."))
 }
 
 /// Where a download is staged; it outlives the upgrade, which keeps the
@@ -141,7 +141,7 @@ fn content_length(url: &str) -> Option<u64> {
 /// `cancel` stops the download.
 pub fn download(release: &Release, progress: &mut dyn FnMut(u64, Option<u64>), cancel: &AtomicBool) -> io::Result<()> {
     if !newer(&release.version, CURRENT) {
-        return Err(io::Error::other(format!("Kiri {} is not newer than this {CURRENT}", release.version)));
+        return Err(io::Error::other(format!("Kiribra {} is not newer than this {CURRENT}", release.version)));
     }
     allowed_url(&release.url)?;
     let dir = stage_dir();
@@ -155,7 +155,7 @@ pub fn download(release: &Release, progress: &mut dyn FnMut(u64, Option<u64>), c
 }
 
 fn fetch_and_check(release: &Release, dir: &Path, progress: &mut dyn FnMut(u64, Option<u64>), cancel: &AtomicBool) -> io::Result<()> {
-    let part = dir.join("Kiri.msi.part");
+    let part = dir.join("Kiribra.msi.part");
     let total = if release.size > 0 { Some(release.size) } else { content_length(&release.url) };
     let mut child = curl()
         .args(["-fsSL", "--retry", "3", "--max-time", "3600", "--max-filesize", &MAX_DOWNLOAD.to_string(), "-o"])
@@ -187,7 +187,7 @@ fn fetch_and_check(release: &Release, dir: &Path, progress: &mut dyn FnMut(u64, 
     }
     let got = std::fs::metadata(&part)?.len();
     if got > MAX_DOWNLOAD {
-        return Err(io::Error::other("the update is larger than any Kiri release"));
+        return Err(io::Error::other("the update is larger than any Kiribra release"));
     }
     progress(got, Some(total.unwrap_or(got)));
     let sum = crate::setup::sha256(&part)?;
@@ -195,7 +195,7 @@ fn fetch_and_check(release: &Release, dir: &Path, progress: &mut dyn FnMut(u64, 
         return Err(io::Error::new(io::ErrorKind::InvalidData, format!("download does not match its SHA-256 (got {sum})")));
     }
     check(&part, &release.version)?;
-    let msi = dir.join(format!("Kiri-{}.msi", release.version.trim_start_matches('v')));
+    let msi = dir.join(format!("Kiribra-{}.msi", release.version.trim_start_matches('v')));
     std::fs::rename(&part, &msi)?;
     std::fs::write(dir.join("version"), release.version.trim_start_matches('v'))?;
     // A fresh stage: an earlier helper's failure no longer counts against it.
@@ -204,7 +204,7 @@ fn fetch_and_check(release: &Release, dir: &Path, progress: &mut dyn FnMut(u64, 
 }
 
 fn staged_msi(version: &str) -> PathBuf {
-    stage_dir().join(format!("Kiri-{version}.msi"))
+    stage_dir().join(format!("Kiribra-{version}.msi"))
 }
 
 /// The staged update's version, when there is one newer than this build.
@@ -225,20 +225,20 @@ fn verify_staged() -> io::Result<(String, PathBuf)> {
 
 /// A helper was left to install the staged update; it removes the stage
 /// when it is done, so this still being here at a launch means it failed
-/// (or has not run yet). Then Kiri starts as it is and the card offers
+/// (or has not run yet). Then Kiribra starts as it is and the card offers
 /// Restart now again, rather than quitting at every launch.
 pub fn attempted() -> bool {
     stage_dir().join("attempted").is_file()
 }
 
 /// Checks the staged MSI again, then leaves a helper behind that installs
-/// it as soon as this process has quit and opens the new Kiri. The caller
+/// it as soon as this process has quit and opens the new Kiribra. The caller
 /// quits. Returns the version.
 pub fn install_staged() -> io::Result<String> {
     let (version, msi) = verify_staged()?;
     std::fs::write(stage_dir().join("attempted"), "")?;
     // The helper is kiri.ps1 -Update, installed beside this exe: it waits
-    // for this process, upgrades silently and opens the new Kiri, logging
+    // for this process, upgrades silently and opens the new Kiribra, logging
     // to helper.log in the stage. A script file, not a script in this
     // binary: a hidden PowerShell fed an encoded script that runs msiexec
     // is what malware droppers do, and Defender's heuristics quarantined a
@@ -264,7 +264,7 @@ pub fn install_staged() -> io::Result<String> {
             .spawn()
     };
     spawn(CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB).or_else(|_| spawn(CREATE_NO_WINDOW))?;
-    crate::serve::log(&format!("update: installing Kiri {version} after quit"));
+    crate::serve::log(&format!("update: installing Kiribra {version} after quit"));
     Ok(version)
 }
 
@@ -272,12 +272,12 @@ pub fn install_staged() -> io::Result<String> {
 /// restarts the daemon (and the bridge, which serve restarts on the new
 /// binary). Running containers stop; those with a restart policy start again.
 pub fn restart_engine() -> io::Result<()> {
-    let distro = crate::setup::saved_distro().ok_or_else(|| io::Error::other("Kiri's Linux is not set up"))?;
+    let distro = crate::setup::saved_distro().ok_or_else(|| io::Error::other("Kiribra's Linux is not set up"))?;
     // The pkill patterns spell "kiri" as "[k]iri": `sh -c` runs with this
     // whole script on its command line, and a plain pattern would match
     // that too and kill the shell before it starts the daemon again.
     let script = if distro == crate::setup::KIRI_DISTRO {
-        // Kiri Linux: busybox, no systemd; this version's engine, kiri-start
+        // Kiribra Linux: busybox, no systemd; this version's engine, kiri-start
         // and wsl.conf go in, and kiri-start --restart stops the daemon,
         // waits for it to exit and starts it again, under its lock.
         format!("( {} ) >/dev/null || exit 1; pkill -f '/usr/local/bin/[k]iri bridge'; /usr/local/bin/kiri-start --restart", crate::wslsync::sync_script(&dir(), "", true))
@@ -311,25 +311,25 @@ pub fn restart_engine() -> io::Result<()> {
     }))
 }
 
-/// Whether `msi` is a Kiri installer of the version `promised`, newer than
+/// Whether `msi` is a Kiribra installer of the version `promised`, newer than
 /// this build: a swapped feed could otherwise point at any MSI, or at an
 /// older, genuine one and its known bugs.
 fn check(msi: &Path, promised: &str) -> io::Result<()> {
     let upgrade = msi_property(msi, "UpgradeCode")?;
     if !upgrade.trim().eq_ignore_ascii_case(UPGRADE_CODE) {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "the update is not a Kiri installer"));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "the update is not a Kiribra installer"));
     }
     let template = msi_template(msi)?;
     if !platform_matches(&template, crate::win::BUILD_ARCH) {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("the update is Kiri for {}, not for this {} Kiri", template.split(';').next().unwrap_or("another platform"), crate::win::BUILD_ARCH)));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("the update is Kiribra for {}, not for this {} Kiribra", template.split(';').next().unwrap_or("another platform"), crate::win::BUILD_ARCH)));
     }
     let version = msi_property(msi, "ProductVersion")?;
     let (version, promised) = (version.trim(), promised.trim_start_matches('v'));
     if version != promised {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("the update is Kiri {version}, but the feed promised {promised}")));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("the update is Kiribra {version}, but the feed promised {promised}")));
     }
     if !newer(version, CURRENT) {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("the update is Kiri {version}, which is not newer than this {CURRENT}")));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("the update is Kiribra {version}, which is not newer than this {CURRENT}")));
     }
     Ok(())
 }
@@ -465,7 +465,7 @@ pub fn check_now(manual: bool) {
         // An update went in and the engine in WSL still runs the old build:
         // it is moved over (once, catch_up_engine), rather than asking. The
         // card shows only if that fails, and on a manual check.
-        // What it tells the page before the window has opened (Kiri started
+        // What it tells the page before the window has opened (Kiribra started
         // in the background) waits in app.rs's queue, and shows when it opens.
         if !manual {
             catch_up_engine();
@@ -476,7 +476,7 @@ pub fn check_now(manual: bool) {
         }
         feed_check(manual);
     });
-    // And every 6 hours while Kiri runs (recheck.rs), as on the Mac.
+    // And every 6 hours while Kiribra runs (recheck.rs), as on the Mac.
     recheck::start(|| feed_check(false));
 }
 
@@ -488,7 +488,7 @@ fn feed_check(manual: bool) {
         // updated from the feed: it would "update" back to its release.
         if CURRENT.contains("-dev") {
             if manual {
-                emit(notice("ok", &trf("Kiri {version} is a test build: it doesn't update itself", &[("version", &CURRENT)])));
+                emit(notice("ok", &trf("Kiribra {version} is a test build: it doesn't update itself", &[("version", &CURRENT)])));
             }
             update_state("test", None, None);
             return;
@@ -509,7 +509,7 @@ fn feed_check(manual: bool) {
             Ok(_) => {
                 update_state("uptodate", None, None);
                 if manual {
-                    emit(notice("ok", &trf("Kiri {version} is the newest version", &[("version", &CURRENT)])));
+                    emit(notice("ok", &trf("Kiribra {version} is the newest version", &[("version", &CURRENT)])));
                 }
             }
             Err(e) => {
@@ -557,7 +557,7 @@ pub fn cancel_download() {
     CANCEL.store(true, Ordering::Relaxed);
 }
 
-/// Restart now: the helper is left behind and this Kiri quits; the new one
+/// Restart now: the helper is left behind and this Kiribra quits; the new one
 /// opens once the MSI is in.
 pub fn restart_now() {
     // The staged MSI is checked here, so the card hears of a bad one; the
@@ -574,9 +574,9 @@ pub fn restart_now() {
 /// The card's "Finish updating": the engine in WSL moves to the installed
 /// binary. Off the window's thread; the page hears when it is done.
 /// Before the engine starts (engine::ensure_daemon), the engine binaries in
-/// WSL are made the ones this app installed, when they differ, and in Kiri
+/// WSL are made the ones this app installed, when they differ, and in Kiribra
 /// Linux this version's kiri-start and wsl.conf (whose boot command starts
-/// the engine when WSL boots the distro), so a distro an older Kiri set up
+/// the engine when WSL boots the distro), so a distro an older Kiribra set up
 /// gets them too. Without it, declining "Restart engine" after an update
 /// left the old engine in WSL, and every later start (each login, each
 /// reboot) ran it again. Copying only: nothing running is stopped, so this
@@ -586,7 +586,7 @@ pub fn sync_engine() -> io::Result<bool> {
     if !dir().join("kiri").is_file() || !dir().join("kiri-init").is_file() {
         return Ok(false); // a development build run from elsewhere
     }
-    let distro = crate::setup::saved_distro().ok_or_else(|| io::Error::other("Kiri's Linux is not set up"))?;
+    let distro = crate::setup::saved_distro().ok_or_else(|| io::Error::other("Kiribra's Linux is not set up"))?;
     let script = crate::wslsync::sync_script(&dir(), "", distro == crate::setup::KIRI_DISTRO);
     let mut cmd = crate::win::tool("wsl.exe");
     std::os::windows::process::CommandExt::creation_flags(&mut cmd, CREATE_NO_WINDOW);
@@ -632,7 +632,7 @@ pub(crate) fn output_within(cmd: &mut Command, limit: Duration) -> io::Result<st
     child.wait_with_output()
 }
 
-/// The engine's own Kiri version, when it answers.
+/// The engine's own Kiribra version, when it answers.
 fn engine_version() -> Option<String> {
     crate::client::request("GET", "/version", None).ok().filter(|r| r.ok()).and_then(|r| crate::client::kiri_version(&r.json()).map(str::to_owned))
 }
@@ -642,7 +642,7 @@ static CATCH_UP: crate::wslsync::CatchUp = crate::wslsync::CatchUp::new();
 /// Once the engine answers (engine::ensure_daemon, on a thread of its own,
 /// and the window's update check), an engine older than this app is
 /// restarted on this one's, once per run of kiri-win (wslsync::CatchUp):
-/// after an update, Kiri Linux's boot command or the bridge starts the old
+/// after an update, Kiribra Linux's boot command or the bridge starts the old
 /// engine before anything here can copy the new one in, and with no window
 /// open nothing else would move it over. Waits for that restart; one asked
 /// while another runs returns at once. Never on the engine thread.
@@ -654,7 +654,7 @@ pub fn catch_up_engine() {
         engine_version,
         |v| newer(CURRENT, v),
         |v| {
-            crate::serve::log(&format!("update: the engine runs {v}, this Kiri is {CURRENT}; restarting it"));
+            crate::serve::log(&format!("update: the engine runs {v}, this Kiribra is {CURRENT}; restarting it"));
             emit(json!({"type": "state", "state": "booting"}).to_string());
             restart_and_report();
         },
@@ -720,7 +720,7 @@ mod tests {
     fn reads_this_installer_when_built() {
         // The MSI cargo xtask msi built, if there is one next to this build.
         let name = if cfg!(target_arch = "aarch64") { "arm64" } else { "x86_64" };
-        let msi = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target").join(format!("Kiri-{}-{name}.msi", env!("CARGO_PKG_VERSION")));
+        let msi = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target").join(format!("Kiribra-{}-{name}.msi", env!("CARGO_PKG_VERSION")));
         if msi.is_file() {
             assert_eq!(super::msi_property(&msi, "ProductVersion").unwrap(), env!("CARGO_PKG_VERSION"));
             assert!(super::msi_property(&msi, "UpgradeCode").unwrap().eq_ignore_ascii_case(super::UPGRADE_CODE));

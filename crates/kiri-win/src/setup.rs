@@ -1,9 +1,9 @@
 //! First run on Windows: from a PC with no WSL to `docker run` working, in
 //! the window (setup.html; the protocol is in setup-protocol.md). Steps:
 //! WSL (downloaded with progress, installed after one administrator
-//! approval, then a restart), a Linux for Kiri (Kiri Linux, from the
+//! approval, then a restart), a Linux for Kiribra (Kiribra Linux, from the
 //! bundle; or Ubuntu, downloaded), the engine, the Docker tools, ready.
-//! Progress lives in %LOCALAPPDATA%\Kiri\setup.json, so a restart resumes.
+//! Progress lives in %LOCALAPPDATA%\Kiribra\setup.json, so a restart resumes.
 
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -79,7 +79,7 @@ struct Saved {
     distro: Option<String>,
     /// Unix seconds of the WSL install that needs a restart.
     restart_after: Option<u64>,
-    /// Why setup last stopped, kept so a restart of Kiri doesn't lose it.
+    /// Why setup last stopped, kept so a restart of Kiribra doesn't lose it.
     last_error: Option<String>,
 }
 
@@ -99,11 +99,11 @@ struct State {
     sizes: Value,
     existing_ubuntu: bool,
     other_docker: bool,
-    /// The engine besides Kiri, by name (crate::buildwith), for the build question.
+    /// The engine besides Kiribra, by name (crate::buildwith), for the build question.
     other_engine: Option<&'static str>,
     make_default: bool,
-    /// Builds on Kiri: the answer to "Keep building with Docker / Build
-    /// with Kiri", asked only with another engine here.
+    /// Builds on Kiribra: the answer to "Keep building with Docker / Build
+    /// with Kiribra", asked only with another engine here.
     build_kiri: bool,
     autostart: bool,
     /// A first start: the page asks for the language before anything else.
@@ -119,7 +119,7 @@ static BUSY: AtomicBool = AtomicBool::new(false);
 static CANCEL: AtomicBool = AtomicBool::new(false);
 
 fn dir() -> PathBuf {
-    std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("Kiri")).unwrap_or_else(|| PathBuf::from("."))
+    std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("Kiribra")).unwrap_or_else(|| PathBuf::from("."))
 }
 
 fn saved() -> Saved {
@@ -136,7 +136,7 @@ fn save(s: &Saved) {
     let _ = std::fs::write(dir().join("setup.json"), serde_json::to_vec_pretty(s).unwrap_or_default());
 }
 
-/// The distro setup put Kiri in, for the bridge.
+/// The distro setup put Kiribra in, for the bridge.
 pub fn distro() -> Option<String> {
     saved().distro
 }
@@ -161,11 +161,11 @@ pub(crate) fn verified(rel: &str) -> io::Result<PathBuf> {
         return Err(io::Error::other(format!("this build carries no checksum for {rel}; build the bundle with `cargo xtask windows`")));
     };
     if !path.is_file() {
-        return Err(io::Error::other(format!("{rel} is missing from Kiri's folder")));
+        return Err(io::Error::other(format!("{rel} is missing from Kiribra's folder")));
     }
     let got = sha256(&path)?;
     if got != want {
-        return Err(io::Error::other(format!("{rel} in Kiri's folder does not match this build (SHA-256 {got}); download Kiri again")));
+        return Err(io::Error::other(format!("{rel} in Kiribra's folder does not match this build (SHA-256 {got}); download Kiribra again")));
     }
     Ok(path)
 }
@@ -213,7 +213,7 @@ enum Wsl {
     Silent(String),
 }
 
-/// The most `wsl.exe --version` or `wsl.exe -l -q` may take when Kiri
+/// The most `wsl.exe --version` or `wsl.exe -l -q` may take when Kiribra
 /// works out whether to open setup, and at which step.
 /// It reads WSL's installed version and answers in well under a second;
 /// right after Windows starts or wakes the WSL service can take a few
@@ -268,7 +268,7 @@ fn existing_ubuntu() -> Option<String> {
     distros().unwrap_or_default().into_iter().find(|d| d.starts_with("Ubuntu"))
 }
 
-/// Another Docker on this PC: Docker Desktop, or a docker CLI on PATH that is not Kiri's.
+/// Another Docker on this PC: Docker Desktop, or a docker CLI on PATH that is not Kiribra's.
 fn other_docker() -> bool {
     let desktop = std::env::var_os("ProgramFiles").is_some_and(|p| Path::new(&p).join(r"Docker\Docker\Docker Desktop.exe").is_file());
     let ours = dir().join("bin");
@@ -287,7 +287,7 @@ fn restarted_since(at: u64) -> bool {
     now_secs().saturating_sub(uptime) > at
 }
 
-/// Whether the window should open on setup rather than Kiri.
+/// Whether the window should open on setup rather than Kiribra.
 pub fn needed() -> bool {
     let s = saved();
     needs_setup(s.done, s.distro.as_deref(), distros)
@@ -444,7 +444,7 @@ fn mb(bytes: u64) -> u64 {
     (bytes + 500_000) / 1_000_000
 }
 
-/// Downloads `pin` into %LOCALAPPDATA%\Kiri\downloads with curl.exe (part
+/// Downloads `pin` into %LOCALAPPDATA%\Kiribra\downloads with curl.exe (part
 /// of Windows), showing bytes, speed and time left, then checks its SHA-256.
 fn download(pin: &Pin, task_index: usize) -> io::Result<PathBuf> {
     let dl = dir().join("downloads");
@@ -573,14 +573,14 @@ fn install_wsl() -> io::Result<()> {
         let mut s = saved();
         s.restart_after = Some(now_secs());
         save(&s);
-        // After the restart, Kiri opens once by itself and carries on.
+        // After the restart, Kiribra opens once by itself and carries on.
         if let Ok(exe) = std::env::current_exe() {
             let registered = quiet("reg.exe")
                 .args(["add", r"HKCU\Software\Microsoft\Windows\CurrentVersion\RunOnce", "/v", "KiriSetup", "/t", "REG_SZ", "/d", &format!("\"{}\"", exe.display()), "/f"])
                 .status()
                 .is_ok_and(|s| s.success());
                 if !registered {
-                    return Err(io::Error::other("Windows would not register Kiri to carry on after the restart"));
+                    return Err(io::Error::other("Windows would not register Kiribra to carry on after the restart"));
                 }
         }
         update(|s| {
@@ -596,16 +596,16 @@ fn install_wsl() -> io::Result<()> {
     Ok(())
 }
 
-/// Step 2: Kiri Linux from the bundle, or Ubuntu (already here, or downloaded).
+/// Step 2: Kiribra Linux from the bundle, or Ubuntu (already here, or downloaded).
 fn install_linux(kind: &str) -> io::Result<()> {
-    // The engine and Kiri Linux in the bundle are this build's architecture.
+    // The engine and Kiribra Linux in the bundle are this build's architecture.
     if let Some(e) = crate::win::arch_mismatch() {
         return Err(io::Error::other(e));
     }
     let base = dir().join("wsl");
     std::fs::create_dir_all(&base)?;
     let distro = if kind == "kiri" {
-        update(|s| s.tasks = tasks(&[tr("Unpack Kiri Linux"), tr("Add it to WSL"), tr("Start it")]));
+        update(|s| s.tasks = tasks(&[tr("Unpack Kiribra Linux"), tr("Add it to WSL"), tr("Start it")]));
         task(0, "active", "");
         let tar = verified("kiri-linux.tar.gz")?;
         task(0, "done", &format!("{} MB", std::fs::metadata(&tar)?.len().div_ceil(1_000_000)));
@@ -623,12 +623,12 @@ fn install_linux(kind: &str) -> io::Result<()> {
         let existing = existing_ubuntu();
         let distro = match existing {
             Some(d) => {
-                update(|s| s.tasks = tasks(&[tr("Use the Ubuntu already here"), tr("Install Kiri's engine in it"), tr("Start it")]));
+                update(|s| s.tasks = tasks(&[tr("Use the Ubuntu already here"), tr("Install Kiribra's engine in it"), tr("Start it")]));
                 task(0, "done", &d);
                 d
             }
             None => {
-                update(|s| s.tasks = tasks(&[tr("Download Ubuntu"), tr("Unpack it into WSL"), tr("Install Kiri's engine in it"), tr("Start it")]));
+                update(|s| s.tasks = tasks(&[tr("Download Ubuntu"), tr("Unpack it into WSL"), tr("Install Kiribra's engine in it"), tr("Start it")]));
                 let file = download(&UBUNTU, 0)?;
                 update(|s| s.progress = None);
                 task(1, "active", "≈ 1.6 GB");
@@ -693,8 +693,8 @@ fn engine() -> io::Result<()> {
     });
     task(0, "active", "");
     let t0 = Instant::now();
-    // Started here, not only waited for: setup resumed after Kiri or
-    // Windows restarted finds Kiri's Linux there but its engine not running,
+    // Started here, not only waited for: setup resumed after Kiribra or
+    // Windows restarted finds Kiribra's Linux there but its engine not running,
     // and nothing else starts it while the window is on setup.
     if !crate::client::alive()
         && let Err(e) = crate::engine::ensure_daemon()
@@ -706,7 +706,7 @@ fn engine() -> io::Result<()> {
             return Err(io::Error::other("cancelled"));
         }
         if t0.elapsed() > Duration::from_secs(60) {
-            return Err(io::Error::other("Kiri's engine did not answer within a minute"));
+            return Err(io::Error::other("Kiribra's engine did not answer within a minute"));
         }
         std::thread::sleep(Duration::from_millis(200));
     }
@@ -762,7 +762,7 @@ fn tools() -> io::Result<()> {
     update(|s| {
         s.step = "tools";
         s.progress = None;
-        s.tasks = tasks(&["docker 29.9.2".to_owned(), "Compose v5.6.1".to_owned(), "buildx v0.38.1".to_owned(), tr("docker build on Kiri"), tr("Make Kiri the default")]);
+        s.tasks = tasks(&["docker 29.9.2".to_owned(), "Compose v5.6.1".to_owned(), "buildx v0.38.1".to_owned(), tr("docker build on Kiribra"), tr("Make Kiribra the default")]);
     });
     task(0, "active", "");
     for f in ["bin/docker.exe", "bin/kiri.exe", "bin/cli-plugins/docker-compose.exe", "bin/cli-plugins/docker-buildx.exe"] {
@@ -813,7 +813,7 @@ fn tools() -> io::Result<()> {
             .unwrap_or_else(|| "installing the Docker tools failed".to_owned());
         return Err(io::Error::other(why));
     }
-    // From here on Kiri runs from %LOCALAPPDATA%\Kiri, not the download folder.
+    // From here on Kiribra runs from %LOCALAPPDATA%\Kiribra, not the download folder.
     if let Ok(exe) = std::env::current_exe() {
         let installed = dir().join("kiri-win.exe");
         if exe != installed {
@@ -827,13 +827,13 @@ fn tools() -> io::Result<()> {
     Ok(())
 }
 
-/// Ready → Open Kiri: remember setup is done, start at sign-in if asked.
+/// Ready → Open Kiribra: remember setup is done, start at sign-in if asked.
 fn finish() {
     let autostart = STATE.lock().unwrap_or_else(PoisonError::into_inner).as_ref().is_none_or(|s| s.autostart);
-    // Which builder docker build uses: asked with another engine here, Kiri's without.
+    // Which builder docker build uses: asked with another engine here, Kiribra's without.
     let asked = STATE.lock().unwrap_or_else(PoisonError::into_inner).as_ref().filter(|s| s.other_docker).map(|s| s.build_kiri);
     let built = match asked {
-        Some(kiri) => crate::buildwith::choose(if kiri { crate::buildwith::With::Kiri } else { crate::buildwith::With::Docker }),
+        Some(kiri) => crate::buildwith::choose(if kiri { crate::buildwith::With::Kiribra } else { crate::buildwith::With::Docker }),
         None => crate::buildwith::apply(),
     };
     if let Err(e) = built {
@@ -849,12 +849,12 @@ fn finish() {
     let run_key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
     if autostart {
         if exe.is_file() {
-            let _ = quiet("reg.exe").args(["add", run_key, "/v", "Kiri", "/t", "REG_SZ", "/d", &format!("\"{}\" --background", exe.display()), "/f"]).status();
+            let _ = quiet("reg.exe").args(["add", run_key, "/v", "Kiribra", "/t", "REG_SZ", "/d", &format!("\"{}\" --background", exe.display()), "/f"]).status();
         } else {
             crate::serve::log("not set to start at sign-in: kiri-win.exe is not installed");
         }
     } else {
-        let _ = quiet("reg.exe").args(["delete", run_key, "/v", "Kiri", "/f"]).status();
+        let _ = quiet("reg.exe").args(["delete", run_key, "/v", "Kiribra", "/f"]).status();
     }
     let _ = quiet("reg.exe").args(["delete", r"HKCU\Software\Microsoft\Windows\CurrentVersion\RunOnce", "/v", "KiriSetup", "/f"]).status();
     Handle.run(|ui| ui.navigate_main());
@@ -909,7 +909,7 @@ pub fn on_message(msg: &str) {
         }
         "setup-install-wsl" => run("wsl", install_wsl),
         "setup-restart" => {
-            let _ = quiet("shutdown.exe").args(["/r", "/t", "5", "/c", "Kiri: finishing Windows Subsystem for Linux"]).status();
+            let _ = quiet("shutdown.exe").args(["/r", "/t", "5", "/c", "Kiribra: finishing Windows Subsystem for Linux"]).status();
         }
         "setup-later" => Handle.run(crate::app::Ui::hide),
         "setup-choose" => {
@@ -988,7 +988,7 @@ mod tests {
         // First run, or no distro picked yet: setup, without asking WSL.
         assert!(needs_setup(false, Some("kiri"), || panic!("asked WSL")));
         assert!(needs_setup(true, None, || panic!("asked WSL")));
-        // Kiri's distro listed: Kiri. Gone from the list: setup again.
+        // Kiribra's distro listed: Kiribra. Gone from the list: setup again.
         assert!(!needs_setup(true, Some("kiri"), || listed(&["docker-desktop", "kiri"])));
         assert!(needs_setup(true, Some("kiri"), || listed(&["Ubuntu"])));
         assert!(needs_setup(true, Some("kiri"), || listed(&[])));
@@ -1017,7 +1017,7 @@ mod tests {
         assert!(t.elapsed() < ten, "waited {:?}", t.elapsed());
         // It fails with WSL's own time-out: the main window too.
         assert!(!needs_setup(true, Some("kiri"), || listed_by(quiet("cmd.exe").raw_arg("/c echo Error code: Wsl/Service/WSAETIMEDOUT 1>&2 & exit 1"), ten)));
-        // It answers: Kiri's distro listed, the main window; gone, setup.
+        // It answers: Kiribra's distro listed, the main window; gone, setup.
         assert!(!needs_setup(true, Some("kiri"), || listed_by(quiet("cmd.exe").raw_arg("/c echo docker-desktop& echo kiri"), ten)));
         assert!(needs_setup(true, Some("kiri"), || listed_by(quiet("cmd.exe").raw_arg("/c echo Ubuntu"), ten)));
         // No WSL at all lists nothing: setup.

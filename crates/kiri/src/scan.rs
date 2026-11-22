@@ -3,7 +3,7 @@
 //!
 //! Grype is downloaded on the first scan, at the pinned version and
 //! checksum (cli_pins.rs), with its vulnerability database (about 200 MB
-//! to download, 3 GB unpacked). It reads the image from Kiri's own store,
+//! to download, 3 GB unpacked). It reads the image from Kiribra's own store,
 //! through an OCI layout of hard links, so the VM isn't woken. Every scan
 //! is kept, under `scans/<image ID>/<unix time>` with a summary for the
 //! history list; the newest `KEEP` per image.
@@ -73,7 +73,7 @@ fn scan_times(dir: &Path) -> Vec<u64> {
     at
 }
 
-/// Grype's environment: its own database folder, no update nag, Kiri's proxy.
+/// Grype's environment: its own database folder, no update nag, Kiribra's proxy.
 fn command(args: &[&str]) -> io::Result<Command> {
     let mut c = Command::new(grype()?);
     c.args(args)
@@ -119,7 +119,7 @@ fn ensure_grype(progress: &mut dyn FnMut(u8)) -> io::Result<()> {
         let part = tmp.join("grype.tar.gz");
         crate::tools::download(&crate::tools::agent(), &grype_url(v), &part, progress)?;
         crate::tools::verify(&part, sum)?;
-        // busybox's tar in Kiri Linux; /bin is /usr/bin on Ubuntu.
+        // busybox's tar in Kiribra Linux; /bin is /usr/bin on Ubuntu.
         let st = Command::new(if cfg!(target_os = "macos") { "/usr/bin/tar" } else { "/bin/tar" }).arg("-xzf").arg(&part).arg("-C").arg(&tmp).arg("grype").status()?;
         if !st.success() {
             return Err(io::Error::other("could not unpack Grype"));
@@ -369,7 +369,7 @@ mod tests {
     }
 
     /// A real scan of an image in a real store, Grype and its database downloaded on first use:
-    /// `KIRI_LIVE_IMAGE=alpine:latest KIRI_DATA_DIR=... cargo test -p kiri scan_live -- --ignored --nocapture`.
+    /// `KIRI_LIVE_IMAGE=alpine:latest KIRIBRA_DATA_DIR=... cargo test -p kiri scan_live -- --ignored --nocapture`.
     #[test]
     #[ignore]
     fn scan_live() {

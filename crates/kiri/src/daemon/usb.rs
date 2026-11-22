@@ -205,7 +205,7 @@ fn attach_claimed(location: &str, name: &str, speed: u32, devid: u32, engine: &A
             guest: stream.fd.try_clone()?,
             asked: asked.clone(),
         });
-        // Back in Kiri: no longer waited for. Marked here, as the session
+        // Back in Kiribra: no longer waited for. Marked here, as the session
         // starts and before it can end, so a board that leaves again at once
         // is waited for again (`note_left` clears it) rather than lost.
         if let Some(ident) = &ident {
@@ -314,7 +314,7 @@ impl Wanted {
 
 const QUICK: Duration = Duration::from_secs(5);
 const MAX_QUICK: u32 = 5;
-/// Attaches that fail in a row before Kiri leaves the device to the Mac.
+/// Attaches that fail in a row before Kiribra leaves the device to the Mac.
 const MAX_FAILURES: u32 = 5;
 
 static WANTED: Mutex<Vec<Wanted>> = Mutex::new(Vec::new());
@@ -337,7 +337,7 @@ fn left(ident: Ident, name: &str, lasted: Duration) {
         return;
     }
     drop(w);
-    crate::diag::info!("USB device left the Mac's bus while attached; Kiri attaches it again when it comes back", name = name);
+    crate::diag::info!("USB device left the Mac's bus while attached; Kiribra attaches it again when it comes back", name = name);
     watch();
 }
 

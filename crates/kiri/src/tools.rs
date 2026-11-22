@@ -1,8 +1,8 @@
-//! Kiri Lite's docker CLI, Compose and buildx. Kiri.app bundles them; Kiri
+//! Kiribra Lite's docker CLI, Compose and buildx. Kiribra.app bundles them; Kiribra
 //! Lite downloads the same pinned versions (cli_pins.rs) on first launch
-//! into `~/Library/Application Support/Kiri/cli`, checks each against its
+//! into `~/Library/Application Support/Kiribra/cli`, checks each against its
 //! SHA-256 before anything is put in place, and moves it there atomically.
-//! Downloads go through Kiri's proxy settings (Settings → Network).
+//! Downloads go through Kiribra's proxy settings (Settings → Network).
 
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 
 use crate::cli_pins::MacArch;
 
-/// Where Kiri Lite keeps the tools.
+/// Where Kiribra Lite keeps the tools.
 pub fn dir() -> io::Result<PathBuf> {
     Ok(kiri_image::Store::default_root()?.join("cli"))
 }
@@ -24,7 +24,7 @@ pub fn installed() -> bool {
     dir().is_ok_and(|d| FILES.iter().all(|f| d.join(f).is_file()))
 }
 
-/// Whether this is Kiri Lite: the app bundle without the bundled CLI.
+/// Whether this is Kiribra Lite: the app bundle without the bundled CLI.
 pub fn lite() -> bool {
     std::env::current_exe()
         .ok()
@@ -152,8 +152,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Downloads the real tools into `KIRI_DATA_DIR`:
-    /// `KIRI_LIVE_TOOLS=1 KIRI_DATA_DIR=/tmp/x cargo test -p kiri tools_download -- --nocapture`.
+    /// Downloads the real tools into `KIRIBRA_DATA_DIR`:
+    /// `KIRI_LIVE_TOOLS=1 KIRIBRA_DATA_DIR=/tmp/x cargo test -p kiri tools_download -- --nocapture`.
     #[test]
     fn tools_download() {
         if std::env::var_os("KIRI_LIVE_TOOLS").is_none() {

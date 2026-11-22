@@ -1,5 +1,5 @@
 // The Share column in the container list: each state, and what pressing it does.
-kiri.on({ type: "status", version: "0.1.4", dev: true, app: "Kiri Dev", ours: "kiri-dev", context: "kiri-dev" });
+kiri.on({ type: "status", version: "0.1.4", dev: true, app: "Kiribra Dev", ours: "kiribra-dev", context: "kiribra-dev" });
 show("containers");
 const R = [];
 const t = (name, fn) => { try { fn(); R.push("PASS " + name); } catch (e) { R.push("FAIL " + name + ": " + e.message); } };

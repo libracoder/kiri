@@ -1,6 +1,6 @@
 [package]
 name = "kiri-vmm"
-description = "Boots the Kiri guest VM with Apple's Virtualization.framework"
+description = "Boots the Kiribra guest VM with Apple's Virtualization.framework"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -5,7 +5,7 @@
 //! file over it, so a reader sees the old list or the new one, never a mix
 //! or a cut-short file; syncing it to disk, before or after, is
 //! [`Durable`]'s choice. A list that does not parse anyway (an
-//! older Kiri wrote it, or the disk lost its tail) is kept as a
+//! older Kiribra wrote it, or the disk lost its tail) is kept as a
 //! `<name>.corrupt-*` copy ([`keep_copy`]; the image store moves its own
 //! aside, [`move_aside`]), and its complete leading records are what can
 //! still be read ([`salvage`]).

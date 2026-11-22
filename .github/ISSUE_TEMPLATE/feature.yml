@@ -1,18 +1,18 @@
 name: Feature request
-description: Something Kiri should do, or a change you'd like to make.
+description: Something Kiribra should do, or a change you'd like to make.
 labels: ["enhancement"]
 body:
   - type: textarea
     id: need
     attributes:
       label: What you're trying to do
-      description: The task, not the solution. What are you working on, and where does Kiri get in the way?
+      description: The task, not the solution. What are you working on, and where does Kiribra get in the way?
     validations:
       required: true
   - type: textarea
     id: idea
     attributes:
-      label: What you'd like Kiri to do
+      label: What you'd like Kiribra to do
       description: If Docker or another tool already does this, say how.
     validations:
       required: true

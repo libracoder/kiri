@@ -1,6 +1,6 @@
-//! Kiri's window on Windows: the Mac app's own page
-//! (crates/kiri/src/ui/index.html) in WebView2, and Kiri's icon in the
-//! notification area. Closing the window hides it and Kiri keeps serving
+//! Kiribra's window on Windows: the Mac app's own page
+//! (crates/kiri/src/ui/index.html) in WebView2, and Kiribra's icon in the
+//! notification area. Closing the window hides it and Kiribra keeps serving
 //! from the tray, as the Mac app stays in the menu bar.
 //!
 //! The page talks to its host through `webkit.messageHandlers.kiri`; a
@@ -49,7 +49,7 @@ pub const WM_SHOW: u32 = WM_APP + 3;
 const PAGE: &str = include_str!("../../kiri/src/ui/index.html");
 /// The first-run setup (setup.rs), Windows only.
 const SETUP_PAGE: &str = include_str!("setup.html");
-/// The window opens on setup rather than Kiri.
+/// The window opens on setup rather than Kiribra.
 static SETUP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Whether the window is on the setup page (setup commands are live then).
@@ -60,7 +60,7 @@ pub fn in_setup() -> bool {
 fn page_html() -> String {
     if SETUP.load(Ordering::SeqCst) { crate::assemble::words(SETUP_PAGE, crate::engine::prefs()["lang"].as_str()) } else { crate::assemble::page(PAGE, crate::engine::prefs()["lang"].as_str()) }
 }
-/// Kiri's icon cropped to its artwork for Windows (brand/windows-icons.ps1),
+/// Kiribra's icon cropped to its artwork for Windows (brand/windows-icons.ps1),
 /// by size: the Mac's has Apple's margin and looks small in the taskbar.
 const ICONS: [(i32, &[u8]); 8] = [
     (16, include_bytes!("../../../brand/icon/windows/kiri-16.png")),
@@ -230,7 +230,7 @@ const TIMER_FOREGROUND: usize = 1;
 /// Brings the window to the front. Windows lets a process take the
 /// foreground only while the user is working in it; to any other it
 /// flashes the taskbar button and leaves the window behind, which is how
-/// Kiri came up behind the installer's window and the shell. For a window
+/// Kiribra came up behind the installer's window and the shell. For a window
 /// the user asked for, sharing the input queue of the thread that is
 /// foreground makes the call ours to make; failing even that, the window
 /// at least goes on top of the others.
@@ -309,7 +309,7 @@ impl Ui {
         unsafe { IsWindowVisible(self.hwnd).as_bool() }
     }
 
-    /// Setup is done: the window becomes Kiri's.
+    /// Setup is done: the window becomes Kiribra's.
     pub fn navigate_main(&mut self) {
         SETUP.store(false, Ordering::SeqCst);
         self.loaded = false;
@@ -394,7 +394,7 @@ pub fn run(show: bool, setup: bool, on_message: impl Fn(String) + 'static, on_tr
         let scale = |v: i32| v * GetDpiForSystem() as i32 / 96;
         let (sw, sh) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
         let (w, h) = (scale(1280).min(sw * 9 / 10), scale(840).min(sh * 9 / 10));
-        let hwnd = CreateWindowExW(WINDOW_EX_STYLE(0), CLASS, w!("Kiri"), WS_OVERLAPPEDWINDOW, (sw - w) / 2, (sh - h) / 2, w, h, None, None, Some(instance.into()), None)?;
+        let hwnd = CreateWindowExW(WINDOW_EX_STYLE(0), CLASS, w!("Kiribra"), WS_OVERLAPPEDWINDOW, (sw - w) / 2, (sh - h) / 2, w, h, None, None, Some(instance.into()), None)?;
         let flag = windows::core::BOOL::from(windows_dark());
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, (&raw const flag).cast(), std::mem::size_of_val(&flag) as u32);
         hwnd
@@ -495,7 +495,7 @@ fn tray(hwnd: HWND, icon: Option<HICON>, op: windows::Win32::UI::Shell::NOTIFY_I
     if let Some(i) = icon {
         nid.hIcon = i;
     }
-    for (d, s) in nid.szTip.iter_mut().zip("Kiri".encode_utf16()) {
+    for (d, s) in nid.szTip.iter_mut().zip("Kiribra".encode_utf16()) {
         *d = s;
     }
     // SAFETY: a filled-in NOTIFYICONDATAW for our window.
@@ -517,9 +517,9 @@ fn tray_menu(hwnd: HWND) {
         };
         let l = crate::lang::resolve(crate::engine::prefs()["lang"].as_str());
         let tr = |en: &str| crate::lang::tr(l, en);
-        item(MF_STRING, ID_OPEN, &tr("Open Kiri"));
+        item(MF_STRING, ID_OPEN, &tr("Open Kiribra"));
         item(MF_SEPARATOR, 0, "");
-        item(MF_STRING | MF_GRAYED, 0, &tr("Kiri: {state}").replace("{state}", &if menu.vm.is_empty() { "…".to_owned() } else { tr(&menu.vm) }));
+        item(MF_STRING | MF_GRAYED, 0, &tr("Kiribra: {state}").replace("{state}", &if menu.vm.is_empty() { "…".to_owned() } else { tr(&menu.vm) }));
         for (i, (_, name)) in menu.running.iter().enumerate().take(20) {
             item(MF_STRING, ID_CONTAINER + i, &format!("    {name}"));
         }
@@ -528,7 +528,7 @@ fn tray_menu(hwnd: HWND) {
         item(MF_STRING, ID_STOP, &tr("Stop"));
         item(MF_SEPARATOR, 0, "");
         item(MF_STRING, ID_UPDATE, &tr("Check for Updates…"));
-        item(MF_STRING, ID_QUIT, &tr("Quit Kiri"));
+        item(MF_STRING, ID_QUIT, &tr("Quit Kiribra"));
         let mut p = POINT::default();
         let _ = GetCursorPos(&mut p);
         // The menu closes when clicking elsewhere only if we are foreground.
@@ -592,9 +592,9 @@ fn taskbar_created() -> u32 {
     ID.with(|id| *id)
 }
 
-/// WebView2's data (cache, local storage) lives in %LOCALAPPDATA%\Kiri.
+/// WebView2's data (cache, local storage) lives in %LOCALAPPDATA%\Kiribra.
 fn data_dir() -> HSTRING {
-    let dir = std::env::var_os("LOCALAPPDATA").map(|d| std::path::PathBuf::from(d).join("Kiri").join("WebView2")).unwrap_or_default();
+    let dir = std::env::var_os("LOCALAPPDATA").map(|d| std::path::PathBuf::from(d).join("Kiribra").join("WebView2")).unwrap_or_default();
     HSTRING::from(dir.as_os_str())
 }
 
@@ -945,7 +945,7 @@ mod tests {
         // SAFETY: plain Win32 and WebView2 calls on this thread, which pumps
         // their callbacks; LOCALAPPDATA is set before anything reads it.
         unsafe {
-            // The log (serve::log) goes to the test's folder, not Kiri's.
+            // The log (serve::log) goes to the test's folder, not Kiribra's.
             std::env::set_var("LOCALAPPDATA", local());
             let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
             let hwnd = CreateWindowExW(WINDOW_EX_STYLE::default(), w!("STATIC"), w!("kiri-win test"), WS_OVERLAPPEDWINDOW, 0, 0, 900, 700, None, None, None, None).unwrap();
@@ -1060,7 +1060,7 @@ mod tests {
         show_error(&wv, "a reason for the test");
         assert_eq!(completed(&wv, 30), Some(true), "the error page did not load");
         assert!(eval(&wv, "document.body.innerText").contains("a reason for the test"));
-        let log = std::fs::read_to_string(local().join("Kiri").join("kiri-win.log")).unwrap_or_default();
+        let log = std::fs::read_to_string(local().join("Kiribra").join("kiri-win.log")).unwrap_or_default();
         assert!(log.contains("the page did not load: a reason for the test"), "not in the log: {log}");
         // The error page can't reach the host commands.
         assert_eq!(eval(&wv, "location.href"), "\"about:blank\"");

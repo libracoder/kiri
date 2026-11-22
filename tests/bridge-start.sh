@@ -1,6 +1,6 @@
 #!/bin/sh
 # `kiri bridge` starting the engine when it is gone (#93), in the Alpine
-# Kiri Linux is: the Linux build (cargo xtask linux, or BIN=) as the bridge
+# Kiribra Linux is: the Linux build (cargo xtask linux, or BIN=) as the bridge
 # and the daemon, and contrib/wsl/kiri-linux/kiri-start, in a privileged
 # container standing in for the distro after a WSL restart (no daemon, its
 # socket file left behind). A stand-in kiri-win sends three connections at
@@ -27,7 +27,7 @@ $D run --rm --privileged --tmpfs /run -v "$BIN/kiri:/opt/kiri:ro" \
   apk add -q python3 >/dev/null 2>&1 || { echo "FAIL: no python3"; exit 1; }
   install -m 755 /opt/kiri /usr/local/bin/kiri
   install -m 755 /opt/kiri-start /usr/local/bin/kiri-start
-  S=/var/lib/kiri-daemon/.kiri/run/docker.sock
+  S=/var/lib/kiri-daemon/.kiribra/run/docker.sock
   mkdir -p "$(dirname $S)"
   # A socket file nobody listens on, as a daemon that died leaves it.
   python3 -c "import socket,sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])" $S

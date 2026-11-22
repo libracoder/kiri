@@ -1,5 +1,5 @@
 //! Proxies, for networks that need one. Settings → Network picks the mode
-//! (`~/.kiri/proxy.json`): the system's own settings (the default: macOS's;
+//! (`~/.kiribra/proxy.json`): the system's own settings (the default: macOS's;
 //! on Windows, Windows' as kiri-win sends them; on a Linux host, the proxy
 //! variables), a custom proxy, or none. Image pulls, pushes, search and login go through it, and
 //! when "pass to containers" is on, new containers get `HTTP_PROXY`,
@@ -19,7 +19,7 @@ pub struct Effective {
     pub http: Option<String>,
     pub https: Option<String>,
     pub no_proxy: Vec<String>,
-    /// macOS uses a PAC file, which Kiri does not run.
+    /// macOS uses a PAC file, which Kiribra does not run.
     pub pac: bool,
 }
 
@@ -184,7 +184,7 @@ pub fn container_env() -> Vec<String> {
     }
     if !env.is_empty() {
         let mut skip = e.no_proxy.clone();
-        skip.extend(["localhost", "127.0.0.1", ".kiri.local", ".kiri.localhost", "host.docker.internal"].map(str::to_owned));
+        skip.extend(["localhost", "127.0.0.1", ".kiribra.local", ".kiribra.localhost", "host.docker.internal"].map(str::to_owned));
         let skip = skip.join(",");
         env.push(format!("NO_PROXY={skip}"));
         env.push(format!("no_proxy={skip}"));

@@ -85,7 +85,7 @@ PATHS = [
     (("*.md", "docs/*", "LICENSE", "NOTICE", ".gitignore", "brand/*", ".github/ISSUE_TEMPLATE/*"), NONE, "words and pictures"),
     (("crates/kiri/src/ui/index.html", "crates/kiri/src/ui/lang/*", "crates/kiri/src/ui/*.js", "crates/kiri/src/ui/xterm/*",
       "crates/kiri-win/src/*.html", "tests/ui/*"), NONE, "the window's page: the UI tests workflow"),
-    (("guest/kernel/*",), NONE, "Kiri's kernel: a runner runs its own kernel and can't start Kiri's VM"),
+    (("guest/kernel/*",), NONE, "Kiribra's kernel: a runner runs its own kernel and can't start Kiribra's VM"),
     (("tests/*", "bench/*"), NONE, "the suites: the label run-tests runs them"),
     ((".github/workflows/codeql.yml", ".github/workflows/perf.yml", ".github/workflows/ui-tests.yml", "scripts/perf*", "scripts/ui-*",
       "scripts/i18n-check.py", "scripts/dmg-*", "scripts/ci/tests-scope.py", "scripts/ci/test_tests_scope.py", "scripts/ci/tests-scope-replay.py",

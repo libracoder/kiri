@@ -1,9 +1,9 @@
 // Issue 188: the sidebar's Linux VM card, the status bar and the main area
 // all show the engine's real state, whichever control started or stopped it:
-// the card, the main area's Start Kiri, Settings, or the menu bar / tray
+// the card, the main area's Start Kiribra, Settings, or the menu bar / tray
 // (which reach the engine without the page). Asleep is still on: the VM
 // rests to save memory and wakes on the next docker command.
-kiri.on({ type: "status", version: "0.2.0", dev: false, app: "Kiri", ours: "kiri", context: "kiri" });
+kiri.on({ type: "status", version: "0.2.0", dev: false, app: "Kiribra", ours: "kiri", context: "kiri" });
 kiri.on({ type: "prefs", prefs: {} });
 const R = [];
 const t = (name, fn) => { try { fn(); R.push("PASS " + name); } catch (e) { R.push("FAIL " + name + ": " + e.message); } };
@@ -32,7 +32,7 @@ t("Start from the card, then Stop from the card: all three say off", () => {
   state("stopping"); state("stopped");
   eq(everywhere(), STOPPED, "after Stop");
 });
-t("then Start Kiri in the main area: card, status bar and main area all say running", () => {
+t("then Start Kiribra in the main area: card, status bar and main area all say running", () => {
   document.getElementById("empty-start").click();
   eq(sent.at(-1)?.type, "start", "sent");
   state("booting");
@@ -91,7 +91,7 @@ t("waking from asleep reads running, not Starting…", () => {
   eq(card(), ON, "waking");
   vm(true); state("running");
 });
-t("a fresh Kiri whose engine is up and asleep reads running", () => {
+t("a fresh Kiribra whose engine is up and asleep reads running", () => {
   vm(false); state("asleep");
   eq(everywhere(), RUNNING, "fresh asleep");
 });

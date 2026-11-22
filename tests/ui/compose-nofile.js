@@ -10,7 +10,7 @@ const eq = (a, b, m) => { if (JSON.stringify(a) !== JSON.stringify(b)) throw new
 const click = (el) => el.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
 const lastToast = () => [...document.querySelectorAll(".toast")].pop()?.textContent || "";
 ui.vm = "running";
-const NF = "Kiri can't find this project's compose file", DE = "Kiri findet die Compose-Datei dieses Projekts nicht";
+const NF = "Kiribra can't find this project's compose file", DE = "Kiribra findet die Compose-Datei dieses Projekts nicht";
 kiri.on({ type: "lists", containers: [{ Id: "d1", Names: ["/shop-db-1"], Image: "postgres:16", State: "running", Status: "Up 1 hour", Created: 1, Ports: [], Labels: { "com.docker.compose.project": "shop", "com.docker.compose.service": "db" } }], images: [], volumes: [], networks: [] });
 const services = [{ name: "db", image: "postgres:16", build: "", ports: [], volumes: [], depends: [], networks: ["default"], kinds: [] }];
 const list = (o = {}) => kiri.on({ type: "composeprojects", logos: {}, projects: [{ name: "shop", dir: "/w/shop", files: ["/w/shop/compose.yaml"], readable: true, updated: 1, services, containers: [{ service: "db", id: "d1", name: "shop-db-1", image: "postgres:16", state: "running", status: "Up" }], ...o }] });

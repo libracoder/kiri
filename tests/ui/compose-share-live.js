@@ -16,7 +16,7 @@ const P = [{ name: "shop", dir: "/w/shop", files: ["/w/shop/compose.yaml"], read
 const port = (p) => ({ IP: "0.0.0.0", PrivatePort: +p.split(":")[1], PublicPort: +p.split(":")[0], Type: "tcp" });
 const lists = () => kiri.on({ type: "lists", images: [], volumes: [], networks: [], containers: P.flatMap((p) => p.containers.map((c) => ({ Id: c.id, Names: ["/" + c.name], Image: c.image, State: c.state, Status: c.state === "running" ? "Up 1 hour" : "Exited (0)", Created: 1,
   Ports: c.state === "running" ? (p.services.find((s) => s.name === c.service).ports || []).map(port) : [], Labels: { "com.docker.compose.project": p.name, "com.docker.compose.service": c.service } }))) });
-const on = (share) => kiri.on({ type: "status", version: "0.1.4", dev: share, share, app: "Kiri", ours: "kiri", context: "kiri" });
+const on = (share) => kiri.on({ type: "status", version: "0.1.4", dev: share, share, app: "Kiribra", ours: "kiri", context: "kiri" });
 ui.vm = "running"; on(true); lists();
 kiri.on({ type: "composeprojects", logos: {}, projects: P });
 sh.account = { signedIn: true };

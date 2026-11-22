@@ -1,5 +1,5 @@
 #!/bin/bash
-# The update test: what a person has on one version of Kiri must still be
+# The update test: what a person has on one version of Kiribra must still be
 # there, byte for byte, and working after the engine is replaced by another
 # version. Run before every release: `populate` on the last release, switch
 # the engine to the release candidate on the same data (as the updater or

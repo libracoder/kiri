@@ -589,7 +589,7 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
                     continue;
                 }
                 Ok(Msg::RemoveBridge { bridge }) => {
-                    // Only Kiri's own bridges, never another interface.
+                    // Only Kiribra's own bridges, never another interface.
                     if bridge.starts_with("kiri") && bridge != "kiri0" {
                         dns.forget_bridge(bridge);
                         bridges.remove(bridge);
@@ -959,7 +959,7 @@ fn flush_input(procs: &mut HashMap<libc::pid_t, Proc>, fd: RawFd, conn: &mut Fil
 }
 
 /// This process's resident memory, from /proc/self/statm (in pages).
-/// What Kiri's Linux holds, in KiB. In the VM, where this process is init,
+/// What Kiribra's Linux holds, in KiB. In the VM, where this process is init,
 /// it is the root cgroup: the whole guest. On a Linux host it is the
 /// containers' cgroup and this process; the daemon adds itself.
 fn held_kib(paths: &Paths, agent_rss_kib: u64) -> u64 {

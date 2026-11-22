@@ -1,7 +1,7 @@
-//! Container domains: `http://<name>.kiri.local` reaches a running
+//! Container domains: `http://<name>.kiribra.local` reaches a running
 //! container's HTTP port, and Compose services answer at
-//! `<service>.<project>.kiri.local`. dns.rs points those names at loopback;
-//! `*.kiri.localhost` works too, with no setup, since macOS resolves
+//! `<service>.<project>.kiribra.local`. dns.rs points those names at loopback;
+//! `*.kiribra.localhost` works too, with no setup, since macOS resolves
 //! `*.localhost` by itself. An unprivileged process may listen on port 80 on
 //! the wildcard address, so serving needs no root. Only connections from
 //! this Mac are served.
@@ -225,7 +225,7 @@ impl Kind {
         }
     }
     /// The port it should use: the environment variable, then Settings →
-    /// Domains (`~/.kiri/domains.json`), then 80 or 443.
+    /// Domains (`~/.kiribra/domains.json`), then 80 or 443.
     fn port(self) -> u16 {
         env_port(self.var()).or_else(|| saved_port(self)).unwrap_or(self.default())
     }
@@ -249,8 +249,8 @@ fn saved_port(kind: Kind) -> Option<u16> {
     v[kind.key()].as_u64().and_then(|p| u16::try_from(p).ok()).filter(|&p| p != 0)
 }
 
-/// Whether this engine has router ports of its own: Kiri Dev starts its
-/// routers only then, leaving 80 and 443 to the installed Kiri.
+/// Whether this engine has router ports of its own: Kiribra Dev starts its
+/// routers only then, leaving 80 and 443 to the installed Kiribra.
 pub fn own_ports() -> bool {
     env_port(Kind::Http.var()).is_some() || settings_path().is_some_and(|p| p.exists())
 }
@@ -265,7 +265,7 @@ pub fn report() -> serde_json::Value {
         v[kind.key()] = serde_json::json!({
             "port": r.as_ref().map_or(kind.port(), |r| r.port),
             "default": kind.default(),
-            // Off: no router (its port was taken at start, or Kiri Dev
+            // Off: no router (its port was taken at start, or Kiribra Dev
             // without ports of its own). Running but not serving: it
             // stepped aside for a container.
             "running": r.is_some(),
@@ -341,9 +341,9 @@ fn move_routers(engine: &Arc<Engine>, http: u16, https: u16) -> Result<(), Strin
 }
 
 /// The routers' ports with nothing saved, as the daemon starts them: the
-/// environment's, else 80 and 443; `None` for a test copy (Kiri Dev, Kiri
+/// environment's, else 80 and 443; `None` for a test copy (Kiribra Dev, Kiribra
 /// Repro...) without KIRI_HTTP_PORT, which starts none and so never takes
-/// 80 and 443 from the installed Kiri.
+/// 80 and 443 from the installed Kiribra.
 fn default_ports(dev: bool, env: impl Fn(Kind) -> Option<u16>) -> Option<(u16, u16)> {
     if dev && env(Kind::Http).is_none() {
         return None;
@@ -433,7 +433,7 @@ fn route(client: &mut impl ReadWrite, engine: &Engine, scheme: &str) -> io::Resu
             String::new()
         };
         let body = format!(
-            "<!doctype html><meta charset=utf-8><title>Kiri</title><body style=\"font:15px -apple-system,sans-serif;margin:40px\">\
+            "<!doctype html><meta charset=utf-8><title>Kiribra</title><body style=\"font:15px -apple-system,sans-serif;margin:40px\">\
              <h1>No running container for {}</h1>{running}",
             escape(&host),
         );
@@ -444,7 +444,7 @@ fn route(client: &mut impl ReadWrite, engine: &Engine, scheme: &str) -> io::Resu
     match engine.relay_to(target.ip, port) {
         Ok(g) => Ok(Some((head, g))),
         Err(e) => {
-            respond(client, 502, "Bad Gateway", &format!("Kiri could not reach the container: {}", escape(&e.to_string())))?;
+            respond(client, 502, "Bad Gateway", &format!("Kiribra could not reach the container: {}", escape(&e.to_string())))?;
             Ok(None)
         }
     }
@@ -630,11 +630,11 @@ fn respond(client: &mut impl Write, status: u16, reason: &str, body: &str) -> io
 
 /// Whether a request's Host is a name for this machine itself: `localhost`,
 /// anything under `.localhost` (which always resolves to loopback), a
-/// `.kiri.local` name, or a loopback address. Another site's domain is not,
+/// `.kiribra.local` name, or a loopback address. Another site's domain is not,
 /// even when its DNS answers with 127.0.0.1.
 fn local_host(host: &str) -> bool {
     let host = host.trim();
-    // Without the port: `[::1]:80`, `127.0.0.1:80`, `web.kiri.localhost:8080`.
+    // Without the port: `[::1]:80`, `127.0.0.1:80`, `web.kiribra.localhost:8080`.
     let name = match host.strip_prefix('[') {
         Some(v6) => v6.split(']').next().unwrap_or(""),
         None => match host.rsplit_once(':') {
@@ -643,7 +643,7 @@ fn local_host(host: &str) -> bool {
         },
     };
     let name = name.trim_end_matches('.').to_ascii_lowercase();
-    name == "localhost" || name.ends_with(".localhost") || name.ends_with(".kiri.local") || name.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+    name == "localhost" || name.ends_with(".localhost") || name.ends_with(".kiribra.local") || name.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
 fn escape(s: &str) -> String {
@@ -654,9 +654,9 @@ fn escape(s: &str) -> String {
 mod tests {
     use super::{candidates, choose, default_ports, Kind, Target};
 
-    /// Back to the start: Kiri's routers return to 80 and 443 (or the
+    /// Back to the start: Kiribra's routers return to 80 and 443 (or the
     /// environment's ports); a test copy's stop, unless the environment
-    /// gives it ports, so it never takes 80 and 443 from Kiri.
+    /// gives it ports, so it never takes 80 and 443 from Kiribra.
     #[test]
     fn reset_puts_back_the_ports_a_start_would_use() {
         let none = |_: Kind| None;
@@ -674,10 +674,10 @@ mod tests {
     /// machine's own names only: a rebinding page's Host is its own domain.
     #[test]
     fn only_this_machines_names_get_the_container_list() {
-        for local in ["localhost", "localhost:80", "nope.kiri.localhost", "NOPE.Kiri.Localhost:8080", "web.shop.kiri.local", "api.kiri.local:18780", "127.0.0.1", "127.0.0.1:80", "[::1]", "[::1]:443", "anything.localhost."] {
+        for local in ["localhost", "localhost:80", "nope.kiribra.localhost", "NOPE.Kiribra.Localhost:8080", "web.shop.kiribra.local", "api.kiribra.local:18780", "127.0.0.1", "127.0.0.1:80", "[::1]", "[::1]:443", "anything.localhost."] {
             assert!(super::local_host(local), "{local}");
         }
-        for foreign in ["", "rebind.example.com", "rebind.example.com:80", "kiri.localhost.example.com", "localhost.example.com", "192.168.1.10", "10.0.0.1:80", "[2001:db8::1]:80", "notlocalhost", "kiri.local.evil.io"] {
+        for foreign in ["", "rebind.example.com", "rebind.example.com:80", "kiribra.localhost.example.com", "localhost.example.com", "192.168.1.10", "10.0.0.1:80", "[2001:db8::1]:80", "notlocalhost", "kiribra.local.evil.io"] {
             assert!(!super::local_host(foreign), "{foreign}");
         }
     }

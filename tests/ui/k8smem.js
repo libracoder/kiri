@@ -1,5 +1,5 @@
 // Kubernetes views say when the VM is too small, or too full, for it.
-kiri.on({ type: "status", version: "0.1.4", dev: true, app: "Kiri Dev", ours: "kiri-dev", context: "kiri-dev" });
+kiri.on({ type: "status", version: "0.1.4", dev: true, app: "Kiribra Dev", ours: "kiribra-dev", context: "kiribra-dev" });
 const R = [];
 const t = (name, fn) => { try { fn(); R.push("PASS " + name); } catch (e) { R.push("FAIL " + name + ": " + e.message); } };
 const eq = (a, b, m) => { if (JSON.stringify(a) !== JSON.stringify(b)) throw new Error(m + ": got " + JSON.stringify(a) + " want " + JSON.stringify(b)); };

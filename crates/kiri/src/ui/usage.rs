@@ -1,4 +1,4 @@
-//! What Kiri's window costs this computer, for the status bar beside its
+//! What Kiribra's window costs this computer, for the status bar beside its
 //! version: memory and CPU of the window's process and the processes that
 //! draw its page (WebKit's on the Mac and Linux, WebView2's on Windows), not the
 //! engine's VM, which the status bar already shows. The Mac's window and

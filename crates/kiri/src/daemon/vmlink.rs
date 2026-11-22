@@ -672,7 +672,7 @@ impl VmLink {
     }
 
     /// What the agent on a Linux host found wrong with the host for `docker
-    /// info`: a firewall that drops the containers' traffic and that Kiri
+    /// info`: a firewall that drops the containers' traffic and that Kiribra
     /// may not change (an nftables.conf's chain), with the rules that let
     /// them through. A VM has no host firewall to warn about.
     pub fn host_warnings(&self) -> Vec<String> {

@@ -3,7 +3,7 @@
 // compose-namewarn.js in German: the warnings in German, alone and with the can't-check one.
 const ONE = "${DEPLOY_TOKEN} wird in einem Namen oder Ordnerpfad verwendet. Docker zeigt diese im Klartext.";
 const TWO = "${DEPLOY_TOKEN} und ${TAG_SECRET} werden in einem Namen oder Ordnerpfad verwendet. Docker zeigt diese im Klartext.";
-const HCHECK = "Kiri kann diese Datei mit verborgenem ${DEPLOY_TOKEN} nicht prüfen. Compose akzeptiert sie, daher funktioniert „Anwenden“ trotzdem.";
+const HCHECK = "Kiribra kann diese Datei mit verborgenem ${DEPLOY_TOKEN} nicht prüfen. Compose akzeptiert sie, daher funktioniert „Anwenden“ trotzdem.";
 const R = [];
 const t = (name, fn) => { try { fn(); R.push("PASS " + name); } catch (e) { R.push("FAIL " + name + ": " + e.message); } };
 const eq = (a, b, m) => { if (JSON.stringify(a) !== JSON.stringify(b)) throw new Error(m + ": got " + JSON.stringify(a) + " want " + JSON.stringify(b)); };

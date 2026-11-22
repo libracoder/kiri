@@ -4,7 +4,7 @@
 // on the row, its tooltip, its link and Containers' Remove confirm.
 const ONE = "${DEPLOY_TOKEN} is used in a name or folder path. Docker shows those in plain text.";
 const TWO = "${DEPLOY_TOKEN} and ${TAG_SECRET} are used in a name or folder path. Docker shows those in plain text.";
-const HCHECK = "Kiri can't check this file with ${DEPLOY_TOKEN} hidden. Compose accepts it, so Apply still works.";
+const HCHECK = "Kiribra can't check this file with ${DEPLOY_TOKEN} hidden. Compose accepts it, so Apply still works.";
 const R = [];
 const t = (name, fn) => { try { fn(); R.push("PASS " + name); } catch (e) { R.push("FAIL " + name + ": " + e.message); } };
 const eq = (a, b, m) => { if (JSON.stringify(a) !== JSON.stringify(b)) throw new Error(m + ": got " + JSON.stringify(a) + " want " + JSON.stringify(b)); };
@@ -41,7 +41,7 @@ t("the plan box says it for a draft, and says plainly when it has no plan", () =
   cmp.draft = "services:\n  app:\n    image: alpine:3.21\n";
   kiri.on({ type: "composeplan", name: "both", seq: cmp.seq, steps: [], services, warn: WARN, namewarn: nw(["${DEPLOY_TOKEN}"]) });
   const el = $("cmp-plan");
-  eq(el.querySelector(".lede").textContent, "Kiri can't show the plan with ${DEPLOY_TOKEN} hidden. Apply will run docker compose up.", "the lede");
+  eq(el.querySelector(".lede").textContent, "Kiribra can't show the plan with ${DEPLOY_TOKEN} hidden. Apply will run docker compose up.", "the lede");
   eq(el.textContent.includes("0 unchanged"), false, "no 0 unchanged");
   eq([...el.querySelectorAll(".err.warn")].map((e) => e.textContent), [HCHECK, ONE], "both warnings");
 });

@@ -89,7 +89,7 @@ impl Config {
             distro: flag("--distro").or_else(crate::setup::distro),
             pipe: flag("--pipe").unwrap_or_else(|| r"\\.\pipe\kiri".into()),
             // Where contrib/wsl/install.sh runs the daemon.
-            socket: flag("--socket").unwrap_or_else(|| "/var/lib/kiri-daemon/.kiri/run/docker.sock".into()),
+            socket: flag("--socket").unwrap_or_else(|| "/var/lib/kiri-daemon/.kiribra/run/docker.sock".into()),
             kiri: flag("--kiri").unwrap_or_else(|| "/usr/local/bin/kiri".into()),
         }
     }
@@ -105,7 +105,7 @@ pub fn set_setup_pending(pending: bool) {
     SETUP_PENDING.store(pending, Ordering::SeqCst);
 }
 
-const SETUP_UNFINISHED: &str = "Kiri's setup isn't finished: open Kiri to finish it";
+const SETUP_UNFINISHED: &str = "Kiribra's setup isn't finished: open Kiribra to finish it";
 
 fn setup_pending() -> bool {
     SETUP_PENDING.load(Ordering::SeqCst)
@@ -137,13 +137,13 @@ fn refuse_new(pipe: &Pipe, message: &str) -> bool {
 }
 
 /// Docker's own pipe. docker-py, the Go and Java SDKs, Testcontainers and
-/// IDE plugins open it without reading docker contexts, so Kiri serves it
+/// IDE plugins open it without reading docker contexts, so Kiribra serves it
 /// too while no other engine does.
 pub const DOCKER_ENGINE: &str = r"\\.\pipe\docker_engine";
 
 /// Processes that serve docker_engine themselves: while one runs, the pipe
-/// is theirs, and Kiri lets go of it (Docker Desktop cannot start its own
-/// while any instance of Kiri's is open).
+/// is theirs, and Kiribra lets go of it (Docker Desktop cannot start its own
+/// while any instance of Kiribra's is open).
 const OTHER_ENGINES: &[&str] = &["Docker Desktop.exe", "com.docker.backend.exe", "dockerd.exe", "Rancher Desktop.exe"];
 
 /// Carries connections to `distro` from now on (setup has just made it);
@@ -280,7 +280,7 @@ fn serve_while_free(hub: &Arc<Hub>, first: Pipe) {
             }
             Err(e) => log(&format!("{DOCKER_ENGINE} connect: {e}")),
         }
-        // Every instance in use: wait for a client to go, as for Kiri's pipe.
+        // Every instance in use: wait for a client to go, as for Kiribra's pipe.
         pipe = loop {
             if stop.load(Ordering::SeqCst) {
                 break 'serve;
@@ -484,9 +484,9 @@ impl Hub {
             return Ok(b.clone());
         }
         let cfg = self.cfg.lock().unwrap_or_else(PoisonError::into_inner).clone();
-        // Until setup has made Kiri's Linux there is nothing to bridge to.
+        // Until setup has made Kiribra's Linux there is nothing to bridge to.
         if cfg.distro.is_none() {
-            return Err(io::Error::new(io::ErrorKind::NotConnected, "Kiri is not set up yet"));
+            return Err(io::Error::new(io::ErrorKind::NotConnected, "Kiribra is not set up yet"));
         }
         // The last one has gone (WSL restarted, Windows slept): a docker
         // client is waiting, so a new one starts now, and the log says why;
@@ -727,7 +727,7 @@ impl Bridge {
                 return Answer::Gone;
             }
             if self.started.elapsed() > limits.hello {
-                return Answer::No(format!("wsl.exe was started {} s ago and Kiri's Linux has not answered", self.started.elapsed().as_secs()));
+                return Answer::No(format!("wsl.exe was started {} s ago and Kiribra's Linux has not answered", self.started.elapsed().as_secs()));
             }
             thread::sleep(Duration::from_millis(5));
         }
@@ -745,7 +745,7 @@ impl Bridge {
                 return Answer::Gone;
             }
             if began.elapsed() > limits.ping {
-                return Answer::No(format!("its wsl.exe runs, but Kiri's Linux did not answer in {} s", limits.ping.as_secs()));
+                return Answer::No(format!("its wsl.exe runs, but Kiribra's Linux did not answer in {} s", limits.ping.as_secs()));
             }
             thread::sleep(Duration::from_millis(2));
         }
@@ -808,7 +808,7 @@ fn serve_shared(hub: &Hub, pipe: Arc<Pipe>) {
                     setup_pending() && refuse_new(&pipe, SETUP_UNFINISHED)
                 } else {
                     log(&format!("bridge: {e}"));
-                    refuse_new(&pipe, &message(Some(&format!("WSL did not start Kiri's Linux ({e})"))))
+                    refuse_new(&pipe, &message(Some(&format!("WSL did not start Kiribra's Linux ({e})"))))
                 };
                 if answered {
                     linger(&pipe);
@@ -843,7 +843,7 @@ fn serve_shared(hub: &Hub, pipe: Arc<Pipe>) {
             silent += 1;
             dying_since = Instant::now();
             if silent >= SILENT_MOST {
-                let why = format!("WSL is not answering (wsl.exe ran {silent} times, {} s in all, and Kiri's Linux said nothing)", began.elapsed().as_secs());
+                let why = format!("WSL is not answering (wsl.exe ran {silent} times, {} s in all, and Kiribra's Linux said nothing)", began.elapsed().as_secs());
                 // Logged once for the clients that waited together.
                 let mut told = hub.silent.lock().unwrap_or_else(PoisonError::into_inner);
                 if !told.as_ref().is_some_and(|(at, _)| at.elapsed() < hub.limits.told_hold) {
@@ -883,7 +883,7 @@ fn serve_shared(hub: &Hub, pipe: Arc<Pipe>) {
         bridge.conns.lock().unwrap_or_else(PoisonError::into_inner).remove(&id);
         if gave_up(dying_since.elapsed()) {
             log(&format!("bridge: kept stopping as soon as it started, for {} s; told the docker client", BRIDGE_WAIT.as_secs()));
-            if refuse_new(&pipe, &message(Some("Kiri's Linux in WSL kept stopping as the command came in"))) {
+            if refuse_new(&pipe, &message(Some("Kiribra's Linux in WSL kept stopping as the command came in"))) {
                 linger(&pipe);
             }
             return;
@@ -1038,9 +1038,9 @@ fn read_frame(r: &mut impl Read) -> io::Result<Option<(u8, u32, Vec<u8>)>> {
     Ok(Some((h[0], id, data)))
 }
 
-/// Appends to %LOCALAPPDATA%\Kiri\kiri-win.log: there is no console.
+/// Appends to %LOCALAPPDATA%\Kiribra\kiri-win.log: there is no console.
 pub fn log(msg: &str) {
-    let Some(dir) = std::env::var_os("LOCALAPPDATA").map(|d| std::path::PathBuf::from(d).join("Kiri")) else { return };
+    let Some(dir) = std::env::var_os("LOCALAPPDATA").map(|d| std::path::PathBuf::from(d).join("Kiribra")) else { return };
     let _ = std::fs::create_dir_all(&dir);
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("kiri-win.log")) {
         // UTC to the millisecond, as the engine's /var/log/kiri.log writes
@@ -1155,7 +1155,7 @@ mod tests {
         (Arc::new(Hub::new(cfg, Box::new(move |_| Ok(next(n.fetch_add(1, Ordering::SeqCst)))), limits())), started)
     }
 
-    /// One docker client's request through `hub`, as over Kiri's pipe:
+    /// One docker client's request through `hub`, as over Kiribra's pipe:
     /// what it read back, and how long that took. Panics after 20 s
     /// without an end, where the client once waited for good.
     fn request(hub: &Arc<Hub>) -> (String, Duration) {

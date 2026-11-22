@@ -1,9 +1,9 @@
-//! Noticing that Kiri's own program is gone from where it started: the app
+//! Noticing that Kiribra's own program is gone from where it started: the app
 //! dragged to the Trash, a development build's folder deleted, or (on
 //! Windows, where a running program can't be deleted) its folder renamed
 //! or moved. What's left running can't do its job any more (on the Mac the
 //! VM's kernel went with the app), yet it still holds what "Build with
-//! Kiri" took, buildx's builder for every context, and every `docker
+//! Kiribra" took, buildx's builder for every context, and every `docker
 //! build` fails on it. The daemon (daemon/mod.rs) and kiri-win both watch,
 //! hand the builder back and stop.
 //!

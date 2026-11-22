@@ -176,12 +176,12 @@ fn place_lights(window: &NSWindow) {
     }
 }
 
-/// The brand icon, built in, so the Dock shows Kiri's logo even when the
-/// window is started from a terminal rather than from Kiri.app.
+/// The brand icon, built in, so the Dock shows Kiribra's logo even when the
+/// window is started from a terminal rather than from Kiribra.app.
 const ICON_PNG: &[u8] = include_bytes!("../../../../brand/icon/png/kiri-app-icon-512.png");
 
 fn set_dock_icon(app: &NSApplication) {
-    // Kiri Dev always runs from its bundle, whose icon has the DEV band.
+    // Kiribra Dev always runs from its bundle, whose icon has the DEV band.
     if crate::flavor::dev() {
         return;
     }
@@ -198,7 +198,7 @@ fn set_dock_icon(app: &NSApplication) {
 
 const MENUBAR_PNG: &[u8] = include_bytes!("../../../../brand/icon/png/kiri-menubar-template@2x.png");
 
-/// Kiri in the menu bar: a template image (macOS tints it for light and dark
+/// Kiribra in the menu bar: a template image (macOS tints it for light and dark
 /// menu bars) and a menu the delegate fills each time it opens.
 fn status_item(mtm: MainThreadMarker, delegate: &AppDelegate) {
     // SAFETY: AppKit's status bar API on the main thread; every object is
@@ -223,7 +223,7 @@ fn status_item(mtm: MainThreadMarker, delegate: &AppDelegate) {
     }
 }
 
-/// Settings → Appearance → Theme: Kiri's own macOS appearance, so the
+/// Settings → Appearance → Theme: Kiribra's own macOS appearance, so the
 /// window, its title-bar buttons and the page (through
 /// `prefers-color-scheme`) switch together. "system" follows macOS.
 pub(super) fn set_appearance(theme: &str) {
@@ -260,7 +260,7 @@ pub(super) fn set_appearance(theme: &str) {
     });
 }
 
-/// Shows the window (after it was closed or hidden) and brings Kiri forward,
+/// Shows the window (after it was closed or hidden) and brings Kiribra forward,
 /// putting the Dock icon back that closing the window took away.
 fn show_window(mtm: MainThreadMarker) {
     NSApplication::sharedApplication(mtm).setActivationPolicy(NSApplicationActivationPolicy::Regular);
@@ -541,7 +541,7 @@ define_class!(
     unsafe impl NSObjectProtocol for AppDelegate {}
 
     unsafe impl NSApplicationDelegate for AppDelegate {
-        /// Closing the window leaves Kiri in the menu bar only, as the tray
+        /// Closing the window leaves Kiribra in the menu bar only, as the tray
         /// does on Windows: the Dock icon goes until the window opens again.
         #[unsafe(method(applicationShouldTerminateAfterLastWindowClosed:))]
         fn should_terminate_after_last_window(&self, app: &NSApplication) -> bool {
@@ -611,7 +611,7 @@ define_class!(
             emit(r#"{"type":"view","view":"settings"}"#.to_owned());
         }
 
-        /// Kiri → Check for Updates…: asks now, and shows the card again
+        /// Kiribra → Check for Updates…: asks now, and shows the card again
         /// even for a version that was skipped or snoozed.
         #[unsafe(method(checkForUpdates:))]
         fn check_for_updates(&self, _sender: Option<&AnyObject>) {
@@ -711,12 +711,12 @@ impl AppDelegate {
             add(&tr("and {n} more…").replace("{n}", &(state.running.len() - 12).to_string()), Some(sel!(openWindow:)), "", 0);
         }
         menu.addItem(&NSMenuItem::separatorItem(mtm));
-        add(&tr("Open Kiri"), Some(sel!(openWindow:)), "o", 0);
+        add(&tr("Open Kiribra"), Some(sel!(openWindow:)), "o", 0);
         add(&tr("Settings…"), Some(sel!(openSettings:)), ",", 0);
         add(&if matches!(state.vm, "Running" | "Asleep") { tr("Stop Linux VM") } else { tr("Start Linux VM") }, Some(sel!(toggleVm:)), "", 0);
         menu.addItem(&NSMenuItem::separatorItem(mtm));
         // SAFETY: standard menu item construction; terminate: goes to the app.
-        let quit = unsafe { NSMenuItem::initWithTitle_action_keyEquivalent(NSMenuItem::alloc(mtm), &NSString::from_str(&tr("Quit Kiri")), Some(sel!(terminate:)), &NSString::from_str("q")) };
+        let quit = unsafe { NSMenuItem::initWithTitle_action_keyEquivalent(NSMenuItem::alloc(mtm), &NSString::from_str(&tr("Quit Kiribra")), Some(sel!(terminate:)), &NSString::from_str("q")) };
         menu.addItem(&quit);
     }
 }

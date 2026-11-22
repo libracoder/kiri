@@ -47,38 +47,38 @@
 //!   place. Two rules with the same conditions and different actions are
 //!   refused the same way. Checked live on Docker 29.8.2 with `socket`
 //!   arg0 == 10 (errno 13) and arg0 == 10 and arg1 & 15 == 2 (errno 95).
-//! - Kiri's answer is always the action of a rule that holds, or the default
+//! - Kiribra's answer is always the action of a rule that holds, or the default
 //!   when none does. The tree is read as libseccomp's filter reads it, but
 //!   where it ends in an action for a rule that does not hold (its tree can
 //!   share nodes between two parents and then answers for the wrong rule)
 //!   that action goes to a rule that has it and holds, or else the rules are
 //!   read one after the other. A call is never let through by a rule that
 //!   does not hold, whatever libseccomp does with the profile.
-//! - where libseccomp's own filter is not its tree, Kiri follows the tree.
+//! - where libseccomp's own filter is not its tree, Kiribra follows the tree.
 //!   `_gen_bpf_node` skips the load of an argument half that the node before
 //!   it has loaded, and the code of that node's subtree can fall through to
 //!   it with another argument in the accumulator. Where that happens
 //!   Docker's answer is not the tree's, and it is not always the action of a
 //!   rule that holds. Of 4,500 generated profiles that Docker's libseccomp
-//!   and Kiri both take, Kiri gives the same answer as libseccomp's tree
+//!   and Kiribra both take, Kiribra gives the same answer as libseccomp's tree
 //!   at every point where Docker's answer is the action of a rule that holds
-//!   and differs from Kiri's. On 8 of the profiles Docker's answer is the
+//!   and differs from Kiribra's. On 8 of the profiles Docker's answer is the
 //!   action of a rule that holds at every point and still differs from
-//!   Kiri's at some, and on 4 of the 8 Kiri's is the weaker one. Docker's
+//!   Kiribra's at some, and on 4 of the 8 Kiribra's is the weaker one. Docker's
 //!   default profile has only single-condition EQ,
 //!   MASKED_EQ and LT rules and compiles to the same program as before.
 //! - libseccomp also builds a tree for each other architecture it is given
-//!   (x86 and x32 next to amd64); Kiri filters the native one only, so an
+//!   (x86 and x32 next to amd64); Kiribra filters the native one only, so an
 //!   EEXIST that only a 32-bit tree gives is not reproduced. A call with
 //!   more conditional rules than the filter can hold tests is refused as too
 //!   large, never cut.
 //! - a call no rule matches gets `defaultAction`.
 //!
-//! Kiri differs in one more place, on purpose: only the native architecture is
+//! Kiribra differs in one more place, on purpose: only the native architecture is
 //! filtered for, and a call from any other (32-bit compat on arm64 or
 //! x86-64, x32) gets EPERM even where the profile's `archMap` or
 //! `architectures` would allow it. That is stricter than Docker and a
-//! boundary the guest keeps. Anything Kiri cannot do is an error that names
+//! boundary the guest keeps. Anything Kiribra cannot do is an error that names
 //! it, never a fallback.
 
 use std::collections::HashSet;
@@ -91,7 +91,7 @@ use super::seccomp_names as names;
 mod call;
 mod tree;
 
-/// Kiri's own VM kernel (macOS), for `minKernel` where the daemon does not
+/// Kiribra's own VM kernel (macOS), for `minKernel` where the daemon does not
 /// run on the containers' kernel itself. The guest agent does not report a
 /// version.
 #[cfg_attr(target_os = "linux", allow(dead_code))]
@@ -101,7 +101,7 @@ const VM_KERNEL: (u32, u32) = (6, 18);
 /// Linux (native and WSL 2) the engine runs on the host's kernel, so that is
 /// what `/proc/sys/kernel/osrelease` says, or `uname(2)` when that cannot be
 /// read or makes no version; there is no guess after those. On macOS it is
-/// Kiri's VM kernel.
+/// Kiribra's VM kernel.
 pub fn guest_kernel() -> Result<(u32, u32), String> {
     #[cfg(target_os = "linux")]
     return host_kernel(super::api::kernel_release(), uname_release).ok_or_else(|| "the kernel's version cannot be read (neither /proc/sys/kernel/osrelease nor uname gives one), which this profile's minKernel needs".to_owned());
@@ -217,7 +217,7 @@ impl Arch {
 /// What `--security-opt` says about seccomp.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Choice<'a> {
-    /// Kiri's built-in default filter.
+    /// Kiribra's built-in default filter.
     Default,
     /// `seccomp=unconfined`.
     Unconfined,
@@ -445,7 +445,7 @@ fn compile_with(arch: Arch, json: &str, caps: u64, kernel: &dyn Fn() -> Result<(
         return Err("seccomp listenerPath is not supported".into());
     }
     for f in &profile.flags {
-        // Kiri always sets this one, for every filter.
+        // Kiribra always sets this one, for every filter.
         if f != "SECCOMP_FILTER_FLAG_SPEC_ALLOW" {
             return Err(format!("seccomp flag {f:?} is not supported"));
         }

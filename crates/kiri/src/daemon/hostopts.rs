@@ -59,13 +59,13 @@ pub fn inspect(opts: &Value, key: &str) -> Value {
 }
 
 /// `--gpus` and Compose `deploy.resources.reservations.devices` arrive as
-/// DeviceRequests. Kiri has no GPU to give, and saying so beats a container
+/// DeviceRequests. Kiribra has no GPU to give, and saying so beats a container
 /// that silently runs on the CPU.
 pub fn check_device_requests(host: &Value) -> Result<(), String> {
     let Some(r) = host["DeviceRequests"].as_array().and_then(|a| a.first()) else { return Ok(()) };
     let caps = r["Capabilities"].as_array().map(|c| c.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(" ")).unwrap_or_default();
     Err(format!(
-        "could not select device driver {:?} with capabilities: [{caps}]: Kiri does not support GPUs or other device requests",
+        "could not select device driver {:?} with capabilities: [{caps}]: Kiribra does not support GPUs or other device requests",
         r["Driver"].as_str().unwrap_or("")
     ))
 }

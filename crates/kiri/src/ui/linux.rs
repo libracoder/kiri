@@ -1,5 +1,5 @@
 //! What the Mac's `setup`, `update` and `import` do for the window, as Linux
-//! does it: the package manager installs and updates Kiri, the engine is a
+//! does it: the package manager installs and updates Kiribra, the engine is a
 //! system service, and there is no OrbStack to import from.
 
 /// Why the window can't reach the engine, and what to do about it.
@@ -7,10 +7,10 @@ pub fn engine_down() -> std::io::Error {
     let socket = std::path::Path::new(crate::client::SERVICE_SOCKET);
     std::io::Error::other(match std::os::unix::net::UnixStream::connect(socket) {
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            "This session can't reach Kiri yet: log out and back in once, so your account's new kiri group applies"
+            "This session can't reach Kiribra yet: log out and back in once, so your account's new kiri group applies"
         }
-        _ if socket.exists() => "Kiri's engine isn't answering: sudo systemctl restart kiri",
-        _ => "Kiri's engine isn't running: sudo systemctl enable --now kiri",
+        _ if socket.exists() => "Kiribra's engine isn't answering: sudo systemctl restart kiri",
+        _ => "Kiribra's engine isn't running: sudo systemctl enable --now kiri",
     })
 }
 
@@ -22,12 +22,12 @@ pub mod setup {
         Ok(())
     }
 
-    /// `docker build` through Kiri's BuildKit builder, as on the Mac (needs
+    /// `docker build` through Kiribra's BuildKit builder, as on the Mac (needs
     /// the docker-buildx package, which the .deb pulls in).
     pub use crate::builds::ensure_builder;
 
     pub fn domains() -> io::Result<()> {
-        Err(io::Error::other("*.kiri.local isn't on Linux yet; containers answer at <name>.kiri.localhost"))
+        Err(io::Error::other("*.kiribra.local isn't on Linux yet; containers answer at <name>.kiribra.localhost"))
     }
 
     pub fn remove_domains() -> io::Result<()> {
@@ -54,7 +54,7 @@ pub mod update {
     use std::path::PathBuf;
     use std::sync::atomic::AtomicBool;
 
-    const BY_APT: &str = "on Linux, Kiri updates with your other packages (apt or dnf)";
+    const BY_APT: &str = "on Linux, Kiribra updates with your other packages (apt or dnf)";
 
     #[derive(serde::Serialize)]
     pub struct Release {
@@ -163,7 +163,7 @@ pub mod onboarding {
 
     /// Each check's state for the page: "ok", "no" (fix it), "bad" (broken:
     /// fix it), "off" (can't tell until an earlier one passes) or "restart"
-    /// (fixed, applies after signing in again). `ready` when Kiri can run
+    /// (fixed, applies after signing in again). `ready` when Kiribra can run
     /// containers for this account; docker and builds are offered, not required
     /// (someone may keep docker on another engine on purpose).
     pub fn checks() -> serde_json::Value {
@@ -185,7 +185,7 @@ pub mod onboarding {
         let ready = installed && usable;
         // Setup is done when docker and builds pass too, or someone chose to
         // skip them (docker kept on another engine on purpose): until then
-        // the checklist stays and Open Kiri waits.
+        // the checklist stays and Open Kiribra waits.
         let skipped = skipped();
         let done = |k: &str, state: &str| state == "ok" || skipped.iter().any(|s| s == k);
         let complete = ready && done("docker", docker) && done("builds", builds);
@@ -205,7 +205,7 @@ pub mod onboarding {
     }
 
     /// The optional checks someone chose to skip ("docker", "builds"), kept
-    /// in the window's settings (~/.kiri/ui.json, `setupSkip`).
+    /// in the window's settings (~/.kiribra/ui.json, `setupSkip`).
     fn skipped() -> Vec<String> {
         crate::ui::prefs()["setupSkip"].as_array().into_iter().flatten().filter_map(|v| v.as_str().map(str::to_owned)).collect()
     }
@@ -265,8 +265,8 @@ pub mod onboarding {
         }
     }
 
-    /// `docker` reaches Kiri: its current endpoint is Kiri's socket, or the
-    /// standard socket that leads to it. Kiri's own `docker` (the package's
+    /// `docker` reaches Kiribra: its current endpoint is Kiribra's socket, or the
+    /// standard socket that leads to it. Kiribra's own `docker` (the package's
     /// wrapper) does unless someone chose another context.
     pub fn docker_uses_kiri() -> bool {
         let Some(docker) = crate::client::docker_cli() else { return false };

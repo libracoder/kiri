@@ -1,6 +1,6 @@
 # Features
 
-What Kiri supports today, through the `kiri` Docker context.
+What Kiribra supports today, through the `kiri` Docker context.
 
 ## Platforms
 
@@ -32,15 +32,15 @@ Apple silicon and Intel Macs (macOS 14+), Windows 10 and 11 (x86-64 and Arm, thr
   `--gateway`, `--ip-range`, `--aux-address`), `--ip`, `--mac-address`,
   `--dns`, `--dns-search`, `--dns-option`, `--domainname`, `--link`,
   `--ipv6` (Compose `enable_ipv6`: an IPv6 subnet beside the IPv4 one, from
-  `--subnet` or a /64 of Kiri's own under fd00::/8; the default bridge stays
+  `--subnet` or a /64 of Kiribra's own under fd00::/8; the default bridge stays
   IPv4-only, as Docker's does), and
-  `http://<name>.kiri.local` once you turn it on (the app asks on first open;
-  Settings → Domains changes it), or `http://<name>.kiri.localhost` with no
-  setup. Compose services answer at `<service>.<project>.kiri.local`, and a
+  `http://<name>.kiribra.local` once you turn it on (the app asks on first open;
+  Settings → Domains changes it), or `http://<name>.kiribra.localhost` with no
+  setup. Compose services answer at `<service>.<project>.kiribra.local`, and a
   `dev.kiri.domain=api.myapp` label picks a container's own names; HTTPS too
-  (`https://<name>.kiri.local`), with Kiri's own certificate authority in
-  `~/.kiri/tls`, whose name constraints allow only `*.kiri.local` and
-  `*.kiri.localhost` (Settings → Domains → HTTPS asks macOS to trust it).
+  (`https://<name>.kiribra.local`), with Kiribra's own certificate authority in
+  `~/.kiribra/tls`, whose name constraints allow only `*.kiribra.local` and
+  `*.kiribra.localhost` (Settings → Domains → HTTPS asks macOS to trust it).
   The routers' ports from the terminal: `kiri domains` shows them,
   `kiri domains set --http 8080 --https 8443` moves them with no restart,
   `kiri domains reset` puts back 80 and 443
@@ -50,7 +50,7 @@ Apple silicon and Intel Macs (macOS 14+), Windows 10 and 11 (x86-64 and Arm, thr
   `save`, `load`, `history`, `search`, `image prune`, `system df`;
   **amd64 images run through Rosetta**, `--platform` honoured
 - **Builds**: `docker build` / `buildx build` through BuildKit running in a
-  Kiri container (buildx's docker-container driver), stopped when idle;
+  Kiribra container (buildx's docker-container driver), stopped when idle;
   on Apple silicon, amd64 build steps run through Rosetta too
 - **Compose**: `up`, `down`, `ps`, `logs`, `exec`, multiple networks, events
 - **USB devices (beta)**: the USB tab hands a device (a serial adapter, a
@@ -58,7 +58,7 @@ Apple silicon and Intel Macs (macOS 14+), Windows 10 and 11 (x86-64 and Arm, thr
   Linux, and shows where it is inside Linux with the `--device` line to
   copy. On a Mac, a device that drops off the bus while attached (the board
   resets, or the Mac sleeps) is attached again when it comes back
-- **Mac integration**: container files at `~/Kiri` in Finder (read-only
+- **Mac integration**: container files at `~/Kiribra` in Finder (read-only
   NFS, always current), SSH agent forwarding at
   `/run/host-services/ssh-auth.sock`
 - **Memory**: a balloon gives unused memory back while running, and the VM
@@ -68,18 +68,18 @@ Apple silicon and Intel Macs (macOS 14+), Windows 10 and 11 (x86-64 and Arm, thr
   container has its own page with details, live logs (find, level filter),
   a command line (and "Open in Terminal" for a full shell) and its files
   (preview, Save to Downloads, Show in Finder); Settings for fonts, text
-  size, the VM's CPUs and memory (`~/.kiri/vm.json`, used from the VM's
+  size, the VM's CPUs and memory (`~/.kiribra/vm.json`, used from the VM's
   next start; `KIRI_CPUS` and `KIRI_MEMORY_MIB` override it) and local names.
   The same page is also served in a browser: Settings → Web UI, or
   `kiri ui --web` on localhost (port 7676), or `kiri ui --web --lan` on the
   LAN; the URL carries a one-time token so the port is not an open Docker API
-- **Menu bar**: Kiri stays in the menu bar when its window closes, with the
+- **Menu bar**: Kiribra stays in the menu bar when its window closes, with the
   VM's state, running containers (click one to open it) and Start/Stop
 - **Kubernetes**: `kiri k8s start` — a single-node k3s cluster in one
   container, ready in ~20 s, as the `kiri` kubectl context
 - **Linux machines**: `kiri machine create dev --distro ubuntu` and
   `kiri machine shell dev` — your user, sudo, and `/Users` at the same path
-- **The app**: `cargo xtask app` builds `Kiri.app` with the `docker` CLI,
+- **The app**: `cargo xtask app` builds `Kiribra.app` with the `docker` CLI,
   Compose and buildx inside; opening it runs `kiri setup` (docker context,
   LaunchAgent, build builder) and the window; `kiri update` installs new
   releases after checking their SHA-256 and signature
@@ -93,7 +93,7 @@ Apple silicon and Intel Macs (macOS 14+), Windows 10 and 11 (x86-64 and Arm, thr
   which serves the API on `npipe:////./pipe/kiri` (the `kiri` docker
   context) and carries it into WSL over one `wsl.exe … kiri bridge`, so it
   needs no change to WSL's or Windows' network settings (`cargo xtask
-  msi` builds `target/Kiri-<version>-x86_64.msi`, a per-user installer
+  msi` builds `target/Kiribra-<version>-x86_64.msi`, a per-user installer
   around `target/kiri-windows-x86_64`; `kiri.ps1` in that folder installs
   the same without an MSI). Not TCP:
   WSL's localhost relay drops half-closes, and `docker run` loses its
@@ -106,12 +106,12 @@ Kubernetes LoadBalancer services are published on `localhost`, and
 
 The app and DMGs are signed with a Developer ID and notarized. Releases and
 the update feeds are at `https://download.runkiri.com`, and every file and
-feed names its architecture: `Kiri-<version>-arm64.dmg`, `Kiri-<version>-arm64.tar.gz`
+feed names its architecture: `Kiribra-<version>-arm64.dmg`, `Kiribra-<version>-arm64.tar.gz`
 and `latest-mac-arm64.json` for Apple silicon (`-x86_64` for Intel Macs),
-`Kiri-<version>-x86_64.msi` / `-arm64.msi` with `latest-windows-x86_64.json` /
+`Kiribra-<version>-x86_64.msi` / `-arm64.msi` with `latest-windows-x86_64.json` /
 `latest-windows-arm64.json` for Windows. Each app reads only its own feed, and
-each platform is published on its own. Two DMGs: `Kiri-<version>-arm64.dmg`
-bundles the docker CLI, Compose and buildx; `Kiri-Lite-<version>-arm64.dmg`
+each platform is published on its own. Two DMGs: `Kiribra-<version>-arm64.dmg`
+bundles the docker CLI, Compose and buildx; `Kiribra-Lite-<version>-arm64.dmg`
 (`cargo xtask app-lite`) leaves them out and downloads the same pinned
 versions on first launch (`crates/kiri/src/cli_pins.rs`, checked by SHA-256)
 unless the Mac already has a docker CLI.
@@ -120,8 +120,8 @@ unless the Mac already has a docker CLI.
 
 - **Mac: an attached USB device leaves your containers while the Mac
   sleeps.** macOS takes USB devices off the bus when it sleeps, so a device
-  such as `/dev/ttyACM0` is gone from containers until the Mac wakes. Kiri
-  then attaches it again by itself. Kiri doesn't keep the Mac awake for a
+  such as `/dev/ttyACM0` is gone from containers until the Mac wakes. Kiribra
+  then attaches it again by itself. Kiribra doesn't keep the Mac awake for a
   device, since that would drain a laptop's battery. For a long job that
   runs unattended (flashing boards, logging a serial port), keep the Mac
   awake while it runs: `caffeinate -s` in a terminal (on power), or turn on
@@ -131,9 +131,9 @@ unless the Mac already has a docker CLI.
 - **`docker build --add-host name:host-gateway` with BuildKit fails** with
   `host-gateway is not supported by the docker-container driver`. buildx
   refuses `host-gateway` for every builder except Docker's built-in one, and
-  Kiri's builder is a docker-container builder, so the build stops before
-  Kiri sees it. Docker's own docker-container builders do the same. Until
-  Kiri has a built-in builder (planned), use the address itself
+  Kiribra's builder is a docker-container builder, so the build stops before
+  Kiribra sees it. Docker's own docker-container builders do the same. Until
+  Kiribra has a built-in builder (planned), use the address itself
   (`--add-host name:172.18.0.1` on Windows and Linux, the default bridge's
-  gateway; `198.19.248.254` on a Mac) or `DOCKER_BUILDKIT=0`, where Kiri
+  gateway; `198.19.248.254` on a Mac) or `DOCKER_BUILDKIT=0`, where Kiribra
   maps `host-gateway` itself.

@@ -1,5 +1,5 @@
-//! Settings → Web UI on Windows: start `kiri ui --web` inside Kiri's WSL
-//! distro, read `~/.kiri/web-ui.json` from there, open the URL in the
+//! Settings → Web UI on Windows: start `kiri ui --web` inside Kiribra's WSL
+//! distro, read `~/.kiribra/web-ui.json` from there, open the URL in the
 //! browser. Same page commands as crates/kiri/src/ui/webctl.rs.
 
 use std::process::{Child, Command, Stdio};
@@ -29,7 +29,7 @@ fn wsl(args: &[&str]) -> Command {
 }
 
 fn read_status() -> Option<Value> {
-    let out = wsl(&["--", "sh", "-c", "cat /root/.kiri/web-ui.json 2>/dev/null || cat \"$HOME/.kiri/web-ui.json\" 2>/dev/null"]).output().ok()?;
+    let out = wsl(&["--", "sh", "-c", "cat /root/.kiribra/web-ui.json 2>/dev/null || cat \"$HOME/.kiribra/web-ui.json\" 2>/dev/null"]).output().ok()?;
     if !out.status.success() || out.stdout.is_empty() {
         return None;
     }
@@ -86,7 +86,7 @@ fn stop_child() {
 
 pub fn start(lan: bool, port: u16) -> Result<(), String> {
     if distro().is_none() {
-        return Err(tr("Kiri's Linux is not set up yet."));
+        return Err(tr("Kiribra's Linux is not set up yet."));
     }
     if let Some(st) = live_status() {
         let same = st["port"].as_u64() == Some(u64::from(port)) && st["lan"].as_bool() == Some(lan);

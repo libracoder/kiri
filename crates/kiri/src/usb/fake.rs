@@ -105,9 +105,9 @@ const REPORT: [u8; 52] = [
 fn string_descriptor(index: u8, kind: Kind) -> Option<Vec<u8>> {
     let text = match index {
         0 => return Some(vec![4, 3, 0x09, 0x04]),
-        1 => "Kiri",
-        2 if kind == Kind::Serial => "Kiri test serial",
-        2 => "Kiri test mouse",
+        1 => "Kiribra",
+        2 if kind == Kind::Serial => "Kiribra test serial",
+        2 => "Kiribra test mouse",
         3 => "KIRI0001",
         _ => return None,
     };
@@ -281,7 +281,7 @@ pub fn run(args: &[String]) -> io::Result<()> {
         unplug_after: opt("--unplug-after").and_then(|n| n.parse().ok()),
         session: Mutex::new(None),
     });
-    let name = if kind == Kind::Serial { "Kiri test serial" } else { "Kiri test mouse" };
+    let name = if kind == Kind::Serial { "Kiribra test serial" } else { "Kiribra test mouse" };
     let (stream, reader) = usbip::connect(&crate::client::socket()?, &location, name, FULL_SPEED, 0x7f << 16 | (std::process::id() & 0x7f))?;
     *fake.session.lock().unwrap_or_else(|e| e.into_inner()) = Some(stream.try_clone()?);
     eprintln!("kiri usb: {name} attached as {location}");

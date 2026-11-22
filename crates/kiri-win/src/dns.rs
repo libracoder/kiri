@@ -1,5 +1,5 @@
-//! `<name>.kiri.local` on Windows, as /etc/resolver/kiri.local is on the
-//! Mac: a name-resolution policy (NRPT) rule sends `.kiri.local` lookups to
+//! `<name>.kiribra.local` on Windows, as /etc/resolver/kiribra.local is on the
+//! Mac: a name-resolution policy (NRPT) rule sends `.kiribra.local` lookups to
 //! this small DNS server on 127.0.0.1:53, which answers 127.0.0.1, where
 //! the daemon's router sorts requests out by name. Adding or removing the
 //! rule is the only step that needs an administrator; Windows asks once.
@@ -8,12 +8,12 @@ use std::io;
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-const SUFFIX: &str = "kiri.local";
+const SUFFIX: &str = "kiribra.local";
 /// Where Windows keeps local NRPT rules.
 const RULES: &str = r"HKLM\SYSTEM\CurrentControlSet\Services\Dnscache\Parameters\DnsPolicyConfig";
 
 /// Whether the answerer holds 127.0.0.1:53. Without it the NRPT rule sends
-/// `.kiri.local` lookups to nobody, so Domains reads as off.
+/// `.kiribra.local` lookups to nobody, so Domains reads as off.
 static SERVING: AtomicBool = AtomicBool::new(false);
 
 pub fn serving() -> bool {
@@ -77,7 +77,7 @@ fn bind_exclusive() -> io::Result<UdpSocket> {
     }
 }
 
-/// The reply to one query: 127.0.0.1 for an A record under kiri.local, no
+/// The reply to one query: 127.0.0.1 for an A record under kiribra.local, no
 /// records for its other types, and REFUSED for any other name.
 fn answer(q: &[u8]) -> Option<Vec<u8>> {
     if q.len() < 12 || q[2] & 0x80 != 0 || u16::from_be_bytes([q[4], q[5]]) != 1 {
@@ -117,7 +117,7 @@ fn answer(q: &[u8]) -> Option<Vec<u8>> {
     Some(r)
 }
 
-/// Whether Windows sends `.kiri.local` lookups here.
+/// Whether Windows sends `.kiribra.local` lookups here.
 pub fn installed() -> bool {
     let mut cmd = crate::win::tool("reg");
     std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x0800_0000);
@@ -165,14 +165,14 @@ mod tests {
 
     #[test]
     fn answers_kiri_local_only() {
-        let r = super::answer(&query("Web.Kiri.Local", 1)).unwrap();
+        let r = super::answer(&query("Web.Kiribra.Local", 1)).unwrap();
         assert_eq!(&r[0..2], &[0x12, 0x34]);
         assert_eq!(r[3] & 0x0f, 0);
         assert_eq!(&r[r.len() - 4..], &[127, 0, 0, 1]);
-        let aaaa = super::answer(&query("web.kiri.local", 28)).unwrap();
+        let aaaa = super::answer(&query("web.kiribra.local", 28)).unwrap();
         assert_eq!(u16::from_be_bytes([aaaa[6], aaaa[7]]), 0);
         let other = super::answer(&query("example.com", 1)).unwrap();
         assert_eq!(other[3] & 0x0f, 5);
-        assert!(super::answer(&query("evil.kiri.local.example.com", 1)).unwrap()[3] & 0x0f == 5);
+        assert!(super::answer(&query("evil.kiribra.local.example.com", 1)).unwrap()[3] & 0x0f == 5);
     }
 }

@@ -1,6 +1,6 @@
-# How Kiri releases are built
+# How Kiribra releases are built
 
-Kiri's source is all here. Releases are built from it by a private
+Kiribra's source is all here. Releases are built from it by a private
 repository that holds only the build workflows. This page says what
 that repository does, what it doesn't, and how you can check what you
 download.
@@ -46,14 +46,14 @@ public repository.
 
 ## Checking what you download
 
-- **Mac:** `Kiri.app` is signed with our Developer ID and notarized by Apple.
-  Check it with `codesign --verify --deep --strict -v /Applications/Kiri.app`
-  and `spctl -a -vv /Applications/Kiri.app`.
+- **Mac:** `Kiribra.app` is signed with our Developer ID and notarized by Apple.
+  Check it with `codesign --verify --deep --strict -v /Applications/Kiribra.app`
+  and `spctl -a -vv /Applications/Kiribra.app`.
 - **Linux:** every release has `SHA256SUMS-linux` next to its packages.
   Check with `sha256sum -c --ignore-missing SHA256SUMS-linux`.
 - **Windows:** Authenticode signing is being set up. Until it's in place the
   installer is unsigned, and Windows SmartScreen asks before running it.
-- **Updates:** Kiri checks every update's SHA-256 against the release feed
+- **Updates:** Kiribra checks every update's SHA-256 against the release feed
   before installing it. On the Mac it also checks that the new app is signed
   by the same Developer ID team as the running one, not just signed by
   someone.

@@ -198,7 +198,7 @@ pub unsafe fn clone3(args: &CloneArgs) -> io::Result<libc::pid_t> {
 /// over several lines (a key a `user:` named) never goes on, unhidden, over
 /// the lines after it.
 /// Each line break is one space; every other character stays as it is, so
-/// what Kiri hides in Logs finds the value as it is.
+/// what Kiribra hides in Logs finds the value as it is.
 pub fn one_line(s: &str) -> String {
     s.replace("\r\n", " ").replace(['\n', '\r'], " ")
 }

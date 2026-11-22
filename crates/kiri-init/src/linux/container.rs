@@ -748,9 +748,9 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
             if let Some(e) = in_err {
                 net.dns.drop_container(pid);
                 match resolver {
-                    Some(at) => eprintln!("kiri-init: dns: {}: no resolver in its own network ({e}); it asks Kiri's at the gateway, {}", spec.id, net::ip_str(at)),
+                    Some(at) => eprintln!("kiri-init: dns: {}: no resolver in its own network ({e}); it asks Kiribra's at the gateway, {}", spec.id, net::ip_str(at)),
                     None => eprintln!(
-                        "kiri-init: dns: {}: no resolver of Kiri's could listen for it ({e}); it asks the host's resolvers directly, so names of other containers on its network will not resolve",
+                        "kiri-init: dns: {}: no resolver of Kiribra's could listen for it ({e}); it asks the host's resolvers directly, so names of other containers on its network will not resolve",
                         spec.id
                     ),
                 }
@@ -813,7 +813,7 @@ const PLAIN_UPPER: &str = "upper-plain";
 
 /// Whether the container's writable layer is plain: marked so, or still
 /// empty, in which case it is marked now, before its first mount writes
-/// anything. One written under a kernel's own defaults before Kiri chose
+/// anything. One written under a kernel's own defaults before Kiribra chose
 /// (Arch turns redirects and metacopy on) isn't, and stays readable only
 /// with those defaults.
 fn plain_upper(base: &Path) -> io::Result<bool> {
@@ -1229,7 +1229,7 @@ fn write_etc_files(spec: &RunSpec<'_>, base: &std::path::Path, upstream: &[[u8; 
     }
     let domain = net_opts::values(spec.net.opts, net_opts::DOMAINNAME).next().filter(|d| !d.is_empty());
     let mut hosts = String::from("127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n");
-    // On an IPv6-only network the IPv4 address is Kiri's own name for it.
+    // On an IPv6-only network the IPv4 address is Kiribra's own name for it.
     let v4 = spec.net.ip != [0; 4] && !net::Plug::from_opts(spec.net.opts).no_ipv4;
     if v4 {
         match domain {
@@ -1374,7 +1374,7 @@ fn resolv_conf(spec: &RunSpec<'_>, upstream: &[[u8; 4]], embedded: Option<[u8; 4
 /// A running container's resolv.conf once it has joined a user network
 /// (`network connect`): the embedded DNS is its only nameserver, as Docker
 /// rewrites the file (#449); search domains and options stay. Also the
-/// servers it named that `is_kiri` doesn't know as Kiri's own resolvers
+/// servers it named that `is_kiri` doesn't know as Kiribra's own resolvers
 /// (`--dns`), for the embedded DNS to forward to. None when it already
 /// names the embedded DNS or names no server at all.
 pub(super) fn joined_user_network(resolv: &str, is_kiri: impl Fn([u8; 4]) -> bool) -> Option<(String, Vec<[u8; 4]>)> {
@@ -1526,7 +1526,7 @@ fn apply_mount(root: BorrowedFd<'_>, image: Option<BorrowedFd<'_>>, m: &Mount) -
         // `/app/node_modules` must get the image's node_modules, not the
         // host's): looked up in the image's own tree when there is one.
         // The image tree also holds the container's own layer, so it can show
-        // the folder Kiri just made (or made on an earlier start) for this
+        // the folder Kiribra just made (or made on an earlier start) for this
         // mount. That isn't the image's: copying its root-owned 755 over the
         // volume would undo a tmpfs volume's uid=, gid= and mode= (#296).
         // So: when the lookup reaches the very folder this start created,
@@ -1566,7 +1566,7 @@ fn apply_mount(root: BorrowedFd<'_>, image: Option<BorrowedFd<'_>>, m: &Mount) -
     Ok(())
 }
 
-/// The xattr on a folder Kiri made in the container's layer to mount on.
+/// The xattr on a folder Kiribra made in the container's layer to mount on.
 const MOUNTPOINT_MARK: &std::ffi::CStr = c"user.kiri.mountpoint";
 
 fn mark_mountpoint(dir: &std::ffi::CStr) {
@@ -3116,13 +3116,13 @@ mod tests {
 
     /// `network connect` to a user network (#449): the embedded DNS becomes
     /// the only nameserver; search and options stay; `--dns` servers are
-    /// handed back for it to forward to, Kiri's own resolvers are not.
+    /// handed back for it to forward to, Kiribra's own resolvers are not.
     #[test]
     fn joining_a_user_network_names_the_embedded_dns() {
         let kiri = |a: [u8; 4]| a == [172, 17, 0, 1] || a == [192, 168, 64, 1];
         let (text, fwd) = super::joined_user_network("nameserver 172.17.0.1\nsearch corp.example\noptions ndots:2\n", kiri).expect("rewritten");
         assert_eq!(text, "nameserver 127.0.0.11\nsearch corp.example\noptions ndots:2\n");
-        assert!(fwd.is_empty(), "the bridge gateway is Kiri's own resolver");
+        assert!(fwd.is_empty(), "the bridge gateway is Kiribra's own resolver");
         let (text, fwd) = super::joined_user_network("nameserver 8.8.8.8\nnameserver 192.168.64.1\n", kiri).expect("rewritten");
         assert_eq!(text, "nameserver 127.0.0.11\n");
         assert_eq!(fwd, [[8, 8, 8, 8]], "--dns servers are forwarded to");

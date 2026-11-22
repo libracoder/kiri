@@ -1,5 +1,5 @@
 //! Settings → Web UI: start and stop a `kiri ui --web` child, keep its URL
-//! in `~/.kiri/web-ui.json`, and open it in the browser.
+//! in `~/.kiribra/web-ui.json`, and open it in the browser.
 
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
@@ -33,7 +33,7 @@ fn pid_alive(pid: u32) -> bool {
     }
 }
 
-/// Reads `~/.kiri/web-ui.json` when its pid is still live.
+/// Reads `~/.kiribra/web-ui.json` when its pid is still live.
 fn read_status() -> Option<serde_json::Value> {
     let path = status_path()?;
     let raw = std::fs::read(&path).ok()?;

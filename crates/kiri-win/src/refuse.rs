@@ -15,8 +15,8 @@ pub const REQUEST_WAIT: Duration = Duration::from_secs(2);
 /// before reasons sends it for an engine it could not reach too.
 pub fn message(why: Option<&str>) -> String {
     match why {
-        Some(why) => format!("Kiri's engine did not start: {why}. Run `kiri start`, or open Kiri and press Start"),
-        None => "Kiri's engine closed the connection without answering".to_owned(),
+        Some(why) => format!("Kiribra's engine did not start: {why}. Run `kiri start`, or open Kiribra and press Start"),
+        None => "Kiribra's engine closed the connection without answering".to_owned(),
     }
 }
 
@@ -80,7 +80,7 @@ mod tests {
     #[test]
     fn a_refusal_says_why_and_what_to_do() {
         let m = message(Some("kiri daemon exited as it started; see /var/log/kiri.log"));
-        assert_eq!(m, "Kiri's engine did not start: kiri daemon exited as it started; see /var/log/kiri.log. Run `kiri start`, or open Kiri and press Start");
+        assert_eq!(m, "Kiribra's engine did not start: kiri daemon exited as it started; see /var/log/kiri.log. Run `kiri start`, or open Kiribra and press Start");
         let (head, body) = split(&refusal(false, &m));
         assert!(head.starts_with("HTTP/1.1 503 Service Unavailable\r\n"), "{head}");
         assert!(head.contains("Content-Type: application/json") && head.contains("Connection: close"), "{head}");
@@ -113,7 +113,7 @@ mod tests {
     /// way, and no "press Start" for an engine that may well be running.
     #[test]
     fn a_close_with_no_reason_says_only_what_happened() {
-        assert_eq!(message(None), "Kiri's engine closed the connection without answering");
+        assert_eq!(message(None), "Kiribra's engine closed the connection without answering");
     }
 
     /// The refusal waits for the request, and no longer than it is given.

@@ -1,4 +1,4 @@
-# Kiri's own tests on a pull request, each job started only by what can
+# Kiribra's own tests on a pull request, each job started only by what can
 # break it. scripts/ci/tests-scope.py reads the change: for Rust, the code's
 # own markers (the module tree from each crate's roots, and the #[cfg(...)]
 # on each module and on the items the changed lines are in); for other
@@ -12,7 +12,7 @@
 #   macOS-only code                       -             -            yes
 #   the build (Cargo.toml, Cargo.lock),
 #   anything the script doesn't know     yes           yes           yes
-#   words, Kiri's kernel, the suites,
+#   words, Kiribra's kernel, the suites,
 #   comments only                         -             -             -
 #
 # Files Rust code includes (the window's page and its translations, which
@@ -23,7 +23,7 @@
 # - windows-build: the Windows app and CLI still compile, so shared code
 #   can't use something only Unix has.
 # - mac-build: the build and the unit tests on a Mac, and what the runner
-#   offers for Kiri's VM (in its job summary).
+#   offers for Kiribra's VM (in its job summary).
 # - scripts: a change to the suites' or scripts' shell or Python files is
 #   checked in under a minute: bash -n, shellcheck, py_compile, the
 #   regressions table and the CI scripts' own tests.
@@ -40,8 +40,8 @@
 #   quick jobs whatever the files are.
 #
 # A kernel change can't be tested on a runner (it runs the runner's kernel,
-# and a Mac runner can't start Kiri's VM), and the window's page has its own
-# workflow. The full suite on macOS and Windows runs on Kiri's own machines.
+# and a Mac runner can't start Kiribra's VM), and the window's page has its own
+# workflow. The full suite on macOS and Windows runs on Kiribra's own machines.
 #
 # Safe for pull requests from forks: it runs on GitHub's machines with a
 # read-only token and no secrets, and uses pull_request (never
@@ -158,7 +158,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # What the runner offers for Kiri's VM, to learn whether the suites
+      # What the runner offers for Kiribra's VM, to learn whether the suites
       # could run here one day. Only looks; never fails the job.
       - name: What this runner offers
         continue-on-error: true
@@ -177,9 +177,9 @@ jobs:
           } | tee -a "$GITHUB_STEP_SUMMARY"
       # The window's Compose tests call the docker CLI and Compose, which a
       # macOS runner doesn't have (Linux runners do, but the window isn't
-      # built there). The same versions Kiri.app bundles, each checked
+      # built there). The same versions Kiribra.app bundles, each checked
       # against its SHA-256 in crates/kiri/src/cli_pins.rs.
-      - name: The docker CLI and Compose Kiri ships
+      - name: The docker CLI and Compose Kiribra ships
         run: |
           pin() { sed -n "s/^pub const $1: (&str, &str) = (\"\([^\"]*\)\", \"\([0-9a-f]\{64\}\)\");$/\1 \2/p" crates/kiri/src/cli_pins.rs; }
           read -r dv dsum <<< "$(pin DOCKER_CLI)"
@@ -299,7 +299,7 @@ jobs:
           ls -l "$RUNNER_TEMP/bin"
       - name: Start the engine as a Linux host runs it
         run: sh scripts/ci/linux-host-engine.sh "$RUNNER_TEMP/bin"
-      # As root, as on Kiri's Linux test machines, where every release is
+      # As root, as on Kiribra's Linux test machines, where every release is
       # checked this way.
       - name: tests/e2e.sh, strict
         env:

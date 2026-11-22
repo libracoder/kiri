@@ -1,7 +1,7 @@
 //! The built-in terminal's shells on Windows: each tab or pane is a shell
 //! on its own ConPTY (Windows' pseudo console), in the user's folder, with
-//! Kiri's tools first on the PATH. PowerShell 7, Windows PowerShell, cmd,
-//! and each WSL distro except Kiri's own. What goes to and from the page is
+//! Kiribra's tools first on the PATH. PowerShell 7, Windows PowerShell, cmd,
+//! and each WSL distro except Kiribra's own. What goes to and from the page is
 //! in termwire.rs, shared with the Mac and Linux (crates/kiri/src/ui/term.rs).
 
 use std::collections::HashMap;
@@ -206,7 +206,7 @@ fn shells() -> Vec<Shell> {
     }
     list.push(Shell { id: "powershell".into(), label: "Windows PowerShell".into(), group: "" });
     list.push(Shell { id: "cmd".into(), label: "Command Prompt".into(), group: "" });
-    // Kiri's own distro runs the engine; Docker Desktop's aren't for logging into.
+    // Kiribra's own distro runs the engine; Docker Desktop's aren't for logging into.
     for d in crate::setup::distros().unwrap_or_default() {
         let lower = d.to_ascii_lowercase();
         if !lower.starts_with("kiri") && !lower.starts_with("docker-desktop") && d.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)) {
@@ -228,11 +228,11 @@ fn command_line(id: &str) -> String {
     }
 }
 
-/// This process's environment with Kiri's tools first on the PATH, as a
+/// This process's environment with Kiribra's tools first on the PATH, as a
 /// CreateProcessW block: `name=value` UTF-16 strings, sorted, each ending
 /// in a NUL, and one more NUL at the end.
 fn environment() -> Vec<u16> {
-    let ours = std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join(r"Kiri\bin")).filter(|d| d.is_dir());
+    let ours = std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join(r"Kiribra\bin")).filter(|d| d.is_dir());
     let exe_dir = std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.to_path_buf()));
     let mut vars: Vec<(String, String)> = std::env::vars_os().map(|(k, v)| (k.to_string_lossy().into_owned(), v.to_string_lossy().into_owned())).collect();
     let path_at = vars.iter().position(|(k, _)| k.eq_ignore_ascii_case("PATH"));
@@ -463,9 +463,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "runs the real docker login (Kiri's docker.exe), which reaches Docker's sign-in service"]
+    #[ignore = "runs the real docker login (Kiribra's docker.exe), which reaches Docker's sign-in service"]
     fn live_docker_login_shows_its_device_code_on_a_captured_console() {
-        let docker = std::path::PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap()).join(r"Kiri\bin\docker.exe");
+        let docker = std::path::PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap()).join(r"Kiribra\bin\docker.exe");
         let dir = std::env::temp_dir().join(format!("kiri-weblogin-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("config.json"), "{}").unwrap();

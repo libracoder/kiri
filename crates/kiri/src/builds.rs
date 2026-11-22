@@ -1,7 +1,7 @@
-//! Builds: BuildKit's history of `docker build`s on Kiri, for the window's
+//! Builds: BuildKit's history of `docker build`s on Kiribra, for the window's
 //! Builds view, read through `docker buildx history` (ls, inspect, logs).
 //!
-//! Only builders whose BuildKit container already exists on Kiri's engine
+//! Only builders whose BuildKit container already exists on Kiribra's engine
 //! are asked: asking any other would make buildx create one (and pull
 //! moby/buildkit). Asking a stopped one starts it, which wakes the VM, so
 //! the window asks only while the Builds view is open.
@@ -14,13 +14,13 @@ use serde_json::{Value, json};
 
 use crate::flavor::{CONTEXT, Name};
 
-/// Kiri's BuildKit builder, a docker-container one on Kiri's context.
-pub const BUILDER: Name = Name("kiri-build", "kiri-dev-build");
+/// Kiribra's BuildKit builder, a docker-container one on Kiribra's context.
+pub const BUILDER: Name = Name("kiri-build", "kiribra-dev-build");
 
 fn buildx(args: &[&str]) -> io::Result<(String, String)> {
-    let docker = crate::client::docker_cli().ok_or_else(|| io::Error::other("no docker CLI found (Kiri.app bundles one)"))?;
+    let docker = crate::client::docker_cli().ok_or_else(|| io::Error::other("no docker CLI found (Kiribra.app bundles one)"))?;
     let mut cmd = Command::new(docker);
-    // No console window flashing up from Kiri's window on Windows.
+    // No console window flashing up from Kiribra's window on Windows.
     #[cfg(windows)]
     std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x0800_0000);
     let out = cmd.args(["--context", CONTEXT.get(), "buildx"]).args(args).stdin(Stdio::null()).output()?;
@@ -37,7 +37,7 @@ fn values(s: &str) -> Vec<Value> {
     serde_json::Deserializer::from_str(s).into_iter::<Value>().map_while(Result::ok).collect()
 }
 
-/// The docker-container builders on Kiri's context whose BuildKit container exists.
+/// The docker-container builders on Kiribra's context whose BuildKit container exists.
 /// No buildx plugin (a distribution's plain docker CLI) means no builds yet, not an error.
 fn builders() -> io::Result<Vec<String>> {
     // Without the plugin, docker reads `buildx` as an unknown command or flag.
@@ -198,7 +198,7 @@ pub fn layers(builder: &str, id: &str) -> io::Result<Value> {
     Ok(json!({"builder": builder, "id": id, "images": images, "materials": info["Materials"]}))
 }
 
-/// An image in Kiri's store, pulled or built, the same way: read from the
+/// An image in Kiribra's store, pulled or built, the same way: read from the
 /// store's files, so the engine isn't asked and the VM isn't woken. Not on
 /// Windows, whose store is inside WSL.
 #[cfg(not(windows))]
@@ -220,7 +220,7 @@ pub(crate) fn stored(store: &kiri_image::Store, name: &str) -> io::Result<(kiri_
             store.images()?.into_iter().find(|i| !id.is_empty() && i.config_digest.trim_start_matches("sha256:").starts_with(id))
         }
     };
-    let i = found.ok_or_else(|| io::Error::other(format!("no image {name} in Kiri")))?;
+    let i = found.ok_or_else(|| io::Error::other(format!("no image {name} in Kiribra")))?;
     let manifest = json!({"config": {"digest": i.config_digest}, "layers": i.layers.iter().map(|l| json!({"size": l.size, "digest": l.digest})).collect::<Vec<_>>()});
     let config: Value = serde_json::from_slice(&store.read_config(&i.config_digest)?).map_err(io::Error::other)?;
     Ok((i, manifest, config))
@@ -257,7 +257,7 @@ pub(crate) fn image(manifest: &Value, config: &Value, platform: Option<&str>) ->
     json!({
         "platform": platform.map(str::to_owned).unwrap_or_else(|| format!("{}/{}", config["os"].as_str().unwrap_or("linux"), config["architecture"].as_str().unwrap_or("?"))),
         "size": manifest["layers"].as_array().into_iter().flatten().filter_map(|l| l["size"].as_u64()).sum::<u64>(),
-        // The image's ID, to find it among Kiri's images.
+        // The image's ID, to find it among Kiribra's images.
         "config_digest": manifest["config"]["digest"],
         "layers": rows,
         "config": {
@@ -317,12 +317,12 @@ fn unbase64(s: &str) -> Vec<u8> {
     out
 }
 
-/// buildx's docker-container builder `kiri-build` on the Kiri context,
-/// loading every build into Kiri. Its BuildKit is the daemon's managed
+/// buildx's docker-container builder `kiri-build` on the Kiribra context,
+/// loading every build into Kiribra. Its BuildKit is the daemon's managed
 /// builder (daemon/builder.rs): the daemon makes that container when buildx
 /// first looks for it, starts it on demand and stops it when idle, so this
 /// only registers the name with buildx and makes it the builder docker uses
-/// for Kiri. Without buildx there is nothing to do: `docker build` sends
+/// for Kiribra. Without buildx there is nothing to do: `docker build` sends
 /// the classic POST /build, which the daemon runs in the same BuildKit.
 /// The window calls this once the daemon answers: the builder setup skips
 /// when the daemon is not up yet.
@@ -337,13 +337,13 @@ pub fn builder() -> io::Result<bool> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while !crate::client::alive() {
         if std::time::Instant::now() > deadline {
-            return Err(io::Error::other("the Kiri daemon isn't answering yet"));
+            return Err(io::Error::other("the Kiribra daemon isn't answering yet"));
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
     let quiet = || std::process::Stdio::null();
     if !Command::new(&docker).args(["buildx", "version"]).stdout(quiet()).stderr(quiet()).status()?.success() {
-        println!("docker build: no buildx plugin here, so docker builds with Kiri's classic builder API (the same BuildKit, run by the daemon)");
+        println!("docker build: no buildx plugin here, so docker builds with Kiribra's classic builder API (the same BuildKit, run by the daemon)");
         return Ok(false);
     }
     let inspect = Command::new(&docker).args(["buildx", "inspect", BUILDER.get()]).stderr(quiet()).output()?;
@@ -356,8 +356,8 @@ pub fn builder() -> io::Result<bool> {
         exists = !Command::new(&docker).args(["buildx", "rm", "--keep-state", BUILDER.get()]).stdout(quiet()).stderr(quiet()).status()?.success();
     }
     if !exists {
-        // buildx create takes the Kiri context's name; without that context
-        // (Linux makes it only in the optional "docker uses Kiri" step) buildx
+        // buildx create takes the Kiribra context's name; without that context
+        // (Linux makes it only in the optional "docker uses Kiribra" step) buildx
         // reads the name as a host and fails on tcp://kiri:2375.
         ensure_context(&docker)?;
         let made = Command::new(&docker)
@@ -368,7 +368,7 @@ pub fn builder() -> io::Result<bool> {
             return Err(io::Error::other(failure("docker buildx create failed", &made.stderr)));
         }
     }
-    // Which builder plain `docker build` uses, Docker's or Kiri's, as
+    // Which builder plain `docker build` uses, Docker's or Kiribra's, as
     // chosen (crate::buildwith): it needs this builder to exist.
     if let Err(e) = crate::buildwith::apply() {
         println!("docker build: could not set which builder it uses ({e})");
@@ -376,7 +376,7 @@ pub fn builder() -> io::Result<bool> {
     Ok(true)
 }
 
-/// The docker context named CONTEXT, pointing at Kiri's socket, made when
+/// The docker context named CONTEXT, pointing at Kiribra's socket, made when
 /// missing. It is only made, never made current: which engine plain docker
 /// uses stays the user's choice.
 /// On Windows, setup (kiri.ps1) makes the context, on the pipe.
@@ -393,7 +393,7 @@ fn ensure_context(docker: impl AsRef<std::ffi::OsStr>) -> io::Result<()> {
         return Ok(());
     }
     let host = format!("host=unix://{}", crate::client::socket()?.display());
-    let out = Command::new(docker).args(["context", "create", CONTEXT.get(), "--description", "Kiri", "--docker", &host]).stdout(quiet()).output()?;
+    let out = Command::new(docker).args(["context", "create", CONTEXT.get(), "--description", "Kiribra", "--docker", &host]).stdout(quiet()).output()?;
     if out.status.success() { Ok(()) } else { Err(io::Error::other(failure("docker context create failed", &out.stderr))) }
 }
 
@@ -413,7 +413,7 @@ mod tests {
     /// A build already removed (a second click, or several removed at once)
     /// is removed: BuildKit's "lease not found" isn't an error to show. But
     /// BuildKit says the same for a build still running, which stays listed:
-    /// that one, or one Kiri can't list, still says so.
+    /// that one, or one Kiribra can't list, still says so.
     #[test]
     fn removing_a_build_already_gone_is_done() {
         let lost = r#"lease "ref_b1d0ne": not found"#;
@@ -473,7 +473,7 @@ mod tests {
 }
 
 /// An image in a real store:
-/// `KIRI_LIVE_IMAGE=name KIRI_DATA_DIR=... cargo test -p kiri image_layers_live -- --ignored --nocapture`.
+/// `KIRI_LIVE_IMAGE=name KIRIBRA_DATA_DIR=... cargo test -p kiri image_layers_live -- --ignored --nocapture`.
 /// Not on Windows, where kiri-win includes this file without `image_layers`.
 #[cfg(not(windows))]
 #[test]

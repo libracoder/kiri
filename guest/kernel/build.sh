@@ -1,5 +1,5 @@
 #!/bin/sh
-# Builds Kiri's guest kernel: allnoconfig + kiri.config, no modules.
+# Builds Kiribra's guest kernel: allnoconfig + kiri.config, no modules.
 # KARCH=arm64 (default): arm64 Image for Apple Silicon. KARCH=x86_64: a
 # bzImage for Intel Macs, from kiri.config without its Arm platform lines
 # plus kiri-x86_64.config, cross-compiled when the container is not x86-64.
@@ -18,7 +18,7 @@ apt-get update -qq && apt-get install -y -qq build-essential flex bison bc libss
 cd /build
 [ -f "linux-$KVER/Makefile" ] && [ -f "linux-$KVER/scripts/Kbuild.include" ] || { rm -rf "linux-$KVER"; curl -fsSL "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$KVER.tar.xz" | tar xJ; }
 cd "linux-$KVER"
-# Kiri's kernel patches. Reverse-apply first so re-runs on a cached tree stay clean.
+# Kiribra's kernel patches. Reverse-apply first so re-runs on a cached tree stay clean.
 for p in /src/patches/*.patch; do
   patch -p1 -R -s -f --dry-run < "$p" >/dev/null 2>&1 && patch -p1 -R -s < "$p"
   patch -p1 -s < "$p"

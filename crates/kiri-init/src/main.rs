@@ -1,4 +1,4 @@
-//! PID 1 of the Kiri guest VM, and its agent.
+//! PID 1 of the Kiribra guest VM, and its agent.
 //!
 //! It mounts the kernel filesystems, dials the host over vsock, reports how
 //! long boot took, then serves requests until told to power off. If the host

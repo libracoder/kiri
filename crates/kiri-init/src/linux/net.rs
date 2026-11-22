@@ -149,13 +149,13 @@ pub fn firewall_events() -> Option<OwnedFd> {
 }
 
 /// `firewall_events` heard of a change: reads it and brings the host's
-/// firewall, and Kiri's own tables, in line.
+/// firewall, and Kiribra's own tables, in line.
 pub fn firewall_changed(events: &OwnedFd) {
     netlink::drain(events);
     through_firewall(firewall::Why::Event);
 }
 
-/// `firewall::sync`, with Kiri's own tables built again as last built when
+/// `firewall::sync`, with Kiribra's own tables built again as last built when
 /// it asks: a flush of the whole ruleset (`nft flush ruleset`, as
 /// nftables.service runs it) took them, and containers had no masquerade,
 /// no published ports and no forward filter keeping the LAN off their
@@ -180,12 +180,12 @@ fn through_firewall(why: firewall::Why) {
     });
 }
 
-/// What Kiri's IPv6 table was last built from (`install_nat6`), to build it
+/// What Kiribra's IPv6 table was last built from (`install_nat6`), to build it
 /// again after a flush.
 #[allow(clippy::type_complexity)]
 static NAT6: std::sync::Mutex<(Vec<([u8; 16], u8)>, Vec<String>)> = std::sync::Mutex::new((Vec::new(), Vec::new()));
 
-/// What Kiri's IPv4 table was last built from, so it can be rebuilt when a
+/// What Kiribra's IPv4 table was last built from, so it can be rebuilt when a
 /// bridge comes or goes (the forward filter has a rule per bridge).
 struct Nat {
     uplink: i32,
@@ -199,7 +199,7 @@ static NAT: std::sync::Mutex<Option<Nat>> = std::sync::Mutex::new(None);
 /// published on every address are matched per address of this machine.
 static NO_FIB4: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Builds Kiri's IPv4 table from `nat` and the bridges made so far, and
+/// Builds Kiribra's IPv4 table from `nat` and the bridges made so far, and
 /// keeps `nat` for `refresh_nat`.
 fn install_nat(nat: Nat) -> io::Result<()> {
     use std::sync::atomic::Ordering;
@@ -224,7 +224,7 @@ fn install_nat(nat: Nat) -> io::Result<()> {
     r
 }
 
-/// Rebuilds Kiri's IPv4 table as last built, for the bridges there are now.
+/// Rebuilds Kiribra's IPv4 table as last built, for the bridges there are now.
 fn refresh_nat() -> io::Result<()> {
     let nat = NAT.lock().unwrap_or_else(|e| e.into_inner()).take();
     match nat {
@@ -524,7 +524,7 @@ pub struct Bridges {
 
 impl Bridges {
     /// Creates the bridge (once) with its gateway address (and IPv6 one)
-    /// and brings it up, with its rules in Kiri's tables. All or nothing: on
+    /// and brings it up, with its rules in Kiribra's tables. All or nothing: on
     /// an error the bridge is gone again and not recorded, so the next
     /// container tries afresh rather than starting with half the rules.
     pub fn ensure(&mut self, name: &str, gateway: Option<[u8; 4]>, prefix: u8, v6: Option<Ip6>) -> io::Result<i32> {
@@ -678,7 +678,7 @@ fn ipv6_forwarding(on: bool) -> io::Result<()> {
 static MADE_BRIDGES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
 /// Linux host, stopping: removes the bridges this agent brought up (only
-/// those: another engine's may share the network namespace) and Kiri's
+/// those: another engine's may share the network namespace) and Kiribra's
 /// nftables table, so nothing of the engine is left in the host's network.
 pub fn remove_host_network() {
     let names = std::mem::take(&mut *MADE_BRIDGES.lock().unwrap_or_else(|e| e.into_inner()));

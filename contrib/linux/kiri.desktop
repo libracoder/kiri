@@ -1,6 +1,6 @@
 [Desktop Entry]
 Type=Application
-Name=Kiri
+Name=Kiribra
 GenericName=Containers
 Comment=Run and share containers
 Exec=/usr/lib/kiri/kiri-window ui

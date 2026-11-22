@@ -1,33 +1,33 @@
-//! A Linux host's own firewall, which must let Kiri's containers through.
+//! A Linux host's own firewall, which must let Kiribra's containers through.
 //!
 //! Every base chain on the forward hook sees each forwarded packet, and an
-//! accept in one is not final: any other that drops it wins. Kiri's own
+//! accept in one is not final: any other that drops it wins. Kiribra's own
 //! table accepting its containers' traffic is not enough when the host has
 //! another forward chain that drops what it does not know:
 //!
 //! - iptables' FORWARD with policy drop: set by Docker when it turns
-//!   ip_forward on, by ufw (its default), or by hand. Kiri adds three rules
+//!   ip_forward on, by ufw (its default), or by hand. Kiribra adds three rules
 //!   (`kiri_rules`) with the host's own iptables, into Docker's DOCKER-USER
 //!   chain when it is there, else at the top of FORWARD.
-//! - firewalld: Kiri's bridges go into its `trusted` zone (runtime only),
+//! - firewalld: Kiribra's bridges go into its `trusted` zone (runtime only),
 //!   as Docker's and libvirt's bridges go into zones with target ACCEPT,
-//!   and Kiri's own forward chain then keeps their new connections to the
+//!   and Kiribra's own forward chain then keeps their new connections to the
 //!   uplink (`netlink::FORWARD_GUARD`).
 //! - any other nftables chain on the forward hook with policy drop (an
-//!   /etc/nftables.conf of the administrator's own): Kiri does not change
+//!   /etc/nftables.conf of the administrator's own): Kiribra does not change
 //!   another program's nftables chain. It says once in its log, and in
 //!   `docker info`, which rules let its containers through.
 //!
-//! Only what Kiri's containers need passes: new connections out through the
-//! uplink Kiri masquerades on, replies, and traffic into Kiri's bridges,
-//! which Kiri's own forward chain judges (replies, published ports, the same
+//! Only what Kiribra's containers need passes: new connections out through the
+//! uplink Kiribra masquerades on, replies, and traffic into Kiribra's bridges,
+//! which Kiribra's own forward chain judges (replies, published ports, the same
 //! network). No new connection into another program's bridge (Docker's,
 //! libvirt's) is accepted by these rules.
 //!
 //! Checked when the engine starts, when it brings up a bridge, and after
 //! every nf_tables change (`changed`), so a firewall started, reloaded or
 //! flushed after the engine is covered: the rules are added again, and
-//! Kiri's own table too when a flush took it. A check is one netlink dump of
+//! Kiribra's own table too when a flush took it. A check is one netlink dump of
 //! the chains; a program runs only when something must change. On a host
 //! with none of these firewalls nothing runs. Taken out when the engine
 //! stops; rules an engine that crashed left behind are reused, not doubled.
@@ -48,10 +48,10 @@ pub enum Why {
     Stop,
 }
 
-/// Kiri's rules in iptables' filter table, as iptables arguments after the
-/// chain: containers out through the uplink (what Kiri masquerades), their
+/// Kiribra's rules in iptables' filter table, as iptables arguments after the
+/// chain: containers out through the uplink (what Kiribra masquerades), their
 /// replies wherever they go (a published port reached from another
-/// interface), and anything into Kiri's bridges, which Kiri's own forward
+/// interface), and anything into Kiribra's bridges, which Kiribra's own forward
 /// chain judges.
 pub fn kiri_rules(uplink: &str) -> [Vec<&str>; 3] {
     [
@@ -65,12 +65,12 @@ pub fn kiri_rules(uplink: &str) -> [Vec<&str>; 3] {
 const DOCKER_USER: &str = "DOCKER-USER";
 const FORWARD: &str = "FORWARD";
 
-/// Where Kiri's rules go in iptables' filter table of one family: Docker's
+/// Where Kiribra's rules go in iptables' filter table of one family: Docker's
 /// DOCKER-USER when it is there (Docker jumps to it first and never empties
 /// it, also when it restarts), else the top of FORWARD when its policy is
 /// drop (ufw, or set by hand), as Docker, libvirt and podman put theirs.
 /// ufw reloads only its own chains, so rules at the top of FORWARD stay,
-/// ahead of ufw's. None when nothing there drops Kiri's traffic.
+/// ahead of ufw's. None when nothing there drops Kiribra's traffic.
 pub fn iptables_target(docker_user: bool, forward_drop: bool) -> Option<&'static str> {
     if docker_user {
         Some(DOCKER_USER)
@@ -90,14 +90,14 @@ const NF_DROP: u32 = 0;
 /// What the host's nf_tables chains say about its forward hook.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Hook {
-    /// Per family (IPv4, IPv6): where Kiri's rules go in iptables-nft's
+    /// Per family (IPv4, IPv6): where Kiribra's rules go in iptables-nft's
     /// filter table.
     pub iptables: [Option<&'static str>; 2],
     /// firewalld runs (its `inet firewalld` table), by the handle of a chain
     /// of it: a new one after firewalld reloads or restarts, which drops the
-    /// runtime zone Kiri's bridges were put in.
+    /// runtime zone Kiribra's bridges were put in.
     pub firewalld: Option<u64>,
-    /// Kiri's own forward chain, IPv4 and IPv6: gone after an `nft flush
+    /// Kiribra's own forward chain, IPv4 and IPv6: gone after an `nft flush
     /// ruleset` (nftables.service starting or reloading).
     pub kiri: [bool; 2],
     /// Other base chains on the forward hook with policy drop, as (family,
@@ -125,7 +125,7 @@ pub fn read_hook(chains: &[Chain]) -> Hook {
     h
 }
 
-/// Kiri's rules in an `iptables -S` listing, as (chain, arguments after
+/// Kiribra's rules in an `iptables -S` listing, as (chain, arguments after
 /// it): the lines with the comment `kiri`, quotes taken off.
 pub fn kiri_lines(listing: &str) -> Vec<(String, Vec<String>)> {
     listing
@@ -138,7 +138,7 @@ pub fn kiri_lines(listing: &str) -> Vec<(String, Vec<String>)> {
         .collect()
 }
 
-/// Where Kiri's rules go, from an `iptables -S` listing of the filter
+/// Where Kiribra's rules go, from an `iptables -S` listing of the filter
 /// table (iptables-legacy, which only the program reads).
 pub fn listed_target(listing: &str) -> Option<&'static str> {
     let docker_user = listing.lines().any(|l| l.trim_end() == format!("-N {DOCKER_USER}"));
@@ -146,7 +146,7 @@ pub fn listed_target(listing: &str) -> Option<&'static str> {
     iptables_target(docker_user, forward_drop)
 }
 
-/// The changes that bring Kiri's rules in `listing` in line: all three in
+/// The changes that bring Kiribra's rules in `listing` in line: all three in
 /// `target` (None: nowhere, the engine stopping) and none elsewhere, as
 /// iptables arguments (`-D chain …`, then `-I chain …`). Rules an engine
 /// that crashed left behind are kept where they belong, and taken out of a
@@ -169,7 +169,7 @@ pub fn iptables_changes(listing: &str, target: Option<&str>, uplink: &str) -> Ve
     out
 }
 
-/// What the administrator's own forward chain needs to let Kiri's
+/// What the administrator's own forward chain needs to let Kiribra's
 /// containers through, as `nft` commands.
 pub fn foreign_advice(family: u8, table: &str, chain: &str, up4: &str, up6: &str) -> String {
     let fam = match family {
@@ -186,12 +186,12 @@ pub fn foreign_advice(family: u8, table: &str, chain: &str, up4: &str, up6: &str
     rules.push("oifname \"kiri*\" accept".into());
     let cmds: Vec<String> = rules.iter().map(|r| format!("nft insert rule {fam} {table} {chain} {r}")).collect();
     format!(
-        "the firewall's nftables chain '{fam} {table} {chain}' (policy drop) drops the traffic of Kiri's containers, so they have no internet; Kiri does not change another program's chain. To let them through, run: {} (and add the same rules to that chain in /etc/nftables.conf to keep them)",
+        "the firewall's nftables chain '{fam} {table} {chain}' (policy drop) drops the traffic of Kiribra's containers, so they have no internet; Kiribra does not change another program's chain. To let them through, run: {} (and add the same rules to that chain in /etc/nftables.conf to keep them)",
         cmds.join("; ")
     )
 }
 
-/// What Kiri did in one place: nothing yet, its rules are in (the chain
+/// What Kiribra did in one place: nothing yet, its rules are in (the chain
 /// or zone), or adding them there failed (said once, and not tried again on
 /// every change while that is still where they go).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -230,11 +230,11 @@ pub fn set_uplinks(up4: String, up6: String) {
     let _ = UPLINKS.set((up4, up6));
 }
 
-/// Brings the host's firewall in line with Kiri's needs (see the module
-/// documentation), or takes Kiri's part out of it (`Why::Stop`). `rebuild`
-/// builds Kiri's own tables (IPv4, IPv6) again as last built, when a flush
+/// Brings the host's firewall in line with Kiribra's needs (see the module
+/// documentation), or takes Kiribra's part out of it (`Why::Stop`). `rebuild`
+/// builds Kiribra's own tables (IPv4, IPv6) again as last built, when a flush
 /// took them or their forward chain must change; it does nothing for a
-/// table Kiri has not built.
+/// table Kiribra has not built.
 pub fn sync(why: Why, rebuild: impl Fn([bool; 2])) {
     let Some((up4, up6)) = UPLINKS.get() else { return };
     let mut guard = STATE.lock().unwrap_or_else(|e| e.into_inner());
@@ -273,13 +273,13 @@ pub fn sync(why: Why, rebuild: impl Fn([bool; 2])) {
             *rules = match sbin(&format!("{tool}-nft")).or_else(|| sbin(tool)) {
                 Some(path) => iptables_sync(&path, None, Some(target), uplink),
                 None => {
-                    eprintln!("kiri-init: iptables' {target} chain drops forwarded traffic on this host, but there is no {tool} to let Kiri's containers through it");
+                    eprintln!("kiri-init: iptables' {target} chain drops forwarded traffic on this host, but there is no {tool} to let Kiribra's containers through it");
                     Rules::Failed(target)
                 }
             };
         }
         if rules.failed() {
-            warnings.push(format!("{tool}: Kiri could not add its rules to the filter table, whose FORWARD chain drops the traffic of Kiri's containers; see the engine log"));
+            warnings.push(format!("{tool}: Kiribra could not add its rules to the filter table, whose FORWARD chain drops the traffic of Kiribra's containers; see the engine log"));
         }
         // iptables-legacy: in x_tables, which only the program reads, and
         // which makes no nf_tables event.
@@ -299,11 +299,11 @@ pub fn sync(why: Why, rebuild: impl Fn([bool; 2])) {
             }
         }
         if rules.failed() {
-            warnings.push(format!("{tool}-legacy: Kiri could not add its rules to the filter table, whose FORWARD chain drops the traffic of Kiri's containers; see the engine log"));
+            warnings.push(format!("{tool}-legacy: Kiribra could not add its rules to the filter table, whose FORWARD chain drops the traffic of Kiribra's containers; see the engine log"));
         }
     }
     firewalld(st, hook.firewalld, why, &mut warnings);
-    // Kiri's forward chain keeps new connections to the uplink while its
+    // Kiribra's forward chain keeps new connections to the uplink while its
     // bridges are in firewalld's trusted zone (`netlink::FORWARD_GUARD`).
     let guard = (st.firewalld == Rules::In(ZONE)).then(|| (up4.clone(), up6.clone()));
     let guard_changed = {
@@ -313,17 +313,17 @@ pub fn sync(why: Why, rebuild: impl Fn([bool; 2])) {
         changed
     };
     // A flush of the whole ruleset (nftables.service starting or
-    // reloading) took Kiri's own tables. The IPv6 one is there only with an
+    // reloading) took Kiribra's own tables. The IPv6 one is there only with an
     // IPv6 network, which `rebuild` knows.
     let gone = [why == Why::Event && !hook.kiri[0], why == Why::Event && !hook.kiri[1]];
     if gone[0] {
-        eprintln!("kiri-init: Kiri's nftables table was removed (a flush of the whole ruleset?); building it again");
+        eprintln!("kiri-init: Kiribra's nftables table was removed (a flush of the whole ruleset?); building it again");
     }
     if guard_changed || gone[0] || gone[1] {
         rebuild([guard_changed || gone[0], guard_changed || gone[1]]);
     }
     for (family, table, chain) in &hook.foreign {
-        // Already let through (a rule naming Kiri's bridges).
+        // Already let through (a rule naming Kiribra's bridges).
         if netlink::rules_with(*family, table, chain, b"kiri").unwrap_or(0) > 0 {
             continue;
         }
@@ -338,7 +338,7 @@ pub fn sync(why: Why, rebuild: impl Fn([bool; 2])) {
     write_warnings(st, warnings.join("\n"));
 }
 
-/// Brings Kiri's rules in iptables' filter table (`listing`, or listed
+/// Brings Kiribra's rules in iptables' filter table (`listing`, or listed
 /// now) in line with `target`; see `iptables_changes`.
 fn iptables_sync(tool: &Path, listing: Option<&str>, target: Option<&'static str>, uplink: &str) -> Rules {
     let listed;
@@ -350,7 +350,7 @@ fn iptables_sync(tool: &Path, listing: Option<&str>, target: Option<&'static str
                 &listed
             }
             None => {
-                eprintln!("kiri-init: {} cannot list the filter table, so Kiri's containers may not pass the host's firewall", tool.display());
+                eprintln!("kiri-init: {} cannot list the filter table, so Kiribra's containers may not pass the host's firewall", tool.display());
                 return target.map_or(Rules::None, Rules::Failed);
             }
         },
@@ -362,33 +362,33 @@ fn iptables_sync(tool: &Path, listing: Option<&str>, target: Option<&'static str
     }
     match (target, ok) {
         (Some(t), true) => {
-            eprintln!("kiri-init: the host's firewall drops forwarded traffic: Kiri's containers pass it by rules in iptables' {t} chain ({})", tool.display());
+            eprintln!("kiri-init: the host's firewall drops forwarded traffic: Kiribra's containers pass it by rules in iptables' {t} chain ({})", tool.display());
             Rules::In(t)
         }
         (Some(t), false) => {
-            eprintln!("kiri-init: {} rules for Kiri's containers could not be added to {t}", tool.display());
+            eprintln!("kiri-init: {} rules for Kiribra's containers could not be added to {t}", tool.display());
             Rules::Failed(t)
         }
         (None, ok) => {
             if !ok {
-                eprintln!("kiri-init: {} rules for Kiri's containers could not all be removed", tool.display());
+                eprintln!("kiri-init: {} rules for Kiribra's containers could not all be removed", tool.display());
             }
             Rules::None
         }
     }
 }
 
-/// firewalld's zone for Kiri's bridges (all of them: `kiri+`).
+/// firewalld's zone for Kiribra's bridges (all of them: `kiri+`).
 const ZONE: &str = "trusted";
 
-/// Puts Kiri's bridges into firewalld's trusted zone, runtime only, once
+/// Puts Kiribra's bridges into firewalld's trusted zone, runtime only, once
 /// per firewalld run (a reload or restart drops runtime settings, and makes
 /// its table anew). An interface in no zone is in the default one, whose
 /// rules can reject the containers' traffic: a zone without forwarding (as
 /// firewalld before 1.0 had them, or set so), or the drop zone; and public
 /// takes only ssh from them, not the host's other services. A zone with
 /// target ACCEPT is what Docker (its `docker` zone) and libvirt give their
-/// bridges; Kiri's own forward chain then keeps the containers' new
+/// bridges; Kiribra's own forward chain then keeps the containers' new
 /// connections to the uplink, and the other programs' bridges keep their own
 /// filters. When the administrator put `kiri+` in a zone already, that zone
 /// stays.
@@ -402,21 +402,21 @@ fn firewalld(st: &mut State, seen: Option<u64>, why: Why, warnings: &mut Vec<Str
         st.firewalld_seen = seen;
         st.firewalld = match sbin("firewall-cmd") {
             None => {
-                eprintln!("kiri-init: firewalld runs, but there is no firewall-cmd to put Kiri's bridges in its {ZONE} zone");
+                eprintln!("kiri-init: firewalld runs, but there is no firewall-cmd to put Kiribra's bridges in its {ZONE} zone");
                 Rules::Failed(ZONE)
             }
             Some(cmd) => match std::process::Command::new(&cmd).args([&format!("--zone={ZONE}"), "--add-interface=kiri+"]).stdin(std::process::Stdio::null()).output() {
                 Ok(o) if o.status.success() => {
-                    eprintln!("kiri-init: firewalld runs: Kiri's bridges (kiri+) are in its {ZONE} zone until the engine stops");
+                    eprintln!("kiri-init: firewalld runs: Kiribra's bridges (kiri+) are in its {ZONE} zone until the engine stops");
                     Rules::In(ZONE)
                 }
                 Ok(o) => {
                     let why = String::from_utf8_lossy(&o.stderr).trim().to_owned();
                     if why.contains("ZONE_CONFLICT") {
-                        eprintln!("kiri-init: firewalld runs, and Kiri's bridges (kiri+) are in a zone of the administrator's already, which decides what Kiri's containers may reach");
+                        eprintln!("kiri-init: firewalld runs, and Kiribra's bridges (kiri+) are in a zone of the administrator's already, which decides what Kiribra's containers may reach");
                         Rules::None
                     } else {
-                        eprintln!("kiri-init: firewalld runs, but Kiri's bridges could not be put in its {ZONE} zone: {why}");
+                        eprintln!("kiri-init: firewalld runs, but Kiribra's bridges could not be put in its {ZONE} zone: {why}");
                         Rules::Failed(ZONE)
                     }
                 }
@@ -428,11 +428,11 @@ fn firewalld(st: &mut State, seen: Option<u64>, why: Why, warnings: &mut Vec<Str
         };
     }
     if st.firewalld.failed() {
-        warnings.push(format!("firewalld: Kiri could not put its bridges (kiri+) in the {ZONE} zone, so firewalld may reject its containers' traffic; see the engine log"));
+        warnings.push(format!("firewalld: Kiribra could not put its bridges (kiri+) in the {ZONE} zone, so firewalld may reject its containers' traffic; see the engine log"));
     }
 }
 
-/// The engine stopping: Kiri's rules out of iptables (where it put them)
+/// The engine stopping: Kiribra's rules out of iptables (where it put them)
 /// and its bridges out of firewalld's zone, unless the administrator put
 /// them there for good (the permanent configuration).
 fn stop(st: &mut State, up4: &str, up6: &str) {
@@ -451,7 +451,7 @@ fn stop(st: &mut State, up4: &str, up6: &str) {
     {
         let kept = run(&cmd, &["--permanent", &format!("--zone={ZONE}"), "--query-interface=kiri+"]).is_some_and(|o| o.trim() == "yes");
         if !kept && run(&cmd, &[&format!("--zone={ZONE}"), "--remove-interface=kiri+"]).is_none() {
-            eprintln!("kiri-init: Kiri's bridges could not be taken out of firewalld's {ZONE} zone");
+            eprintln!("kiri-init: Kiribra's bridges could not be taken out of firewalld's {ZONE} zone");
         }
     }
     st.firewalld = Rules::None;
@@ -513,11 +513,11 @@ mod tests {
     #[test]
     fn kiri_rules_accept_only_kiris_own_traffic() {
         let [out, replies, into] = kiri_rules("eth0");
-        // New connections out of Kiri's bridges only through the uplink,
+        // New connections out of Kiribra's bridges only through the uplink,
         // never into another program's bridges; replies anywhere.
         assert_eq!(out.join(" "), "-i kiri+ -o eth0 -m comment --comment kiri -j ACCEPT");
         assert_eq!(replies.join(" "), "-i kiri+ -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment kiri -j ACCEPT");
-        // Into Kiri's bridges, where Kiri's forward chain judges.
+        // Into Kiribra's bridges, where Kiribra's forward chain judges.
         assert_eq!(into.join(" "), "-o kiri+ -m comment --comment kiri -j ACCEPT");
     }
 
@@ -545,7 +545,7 @@ mod tests {
     fn with_docker_the_rules_stay_in_docker_user() {
         let chains = [chain(2, "filter", "FORWARD", Some(2), Some(0)), chain(2, "filter", "DOCKER-USER", None, None)];
         assert_eq!(read_hook(&chains).iptables, [Some("DOCKER-USER"), None]);
-        // Docker's chain is used even while FORWARD accepts (Docker started after Kiri turned forwarding on).
+        // Docker's chain is used even while FORWARD accepts (Docker started after Kiribra turned forwarding on).
         let chains = [chain(2, "filter", "FORWARD", Some(2), Some(1)), chain(2, "filter", "DOCKER-USER", None, None)];
         assert_eq!(read_hook(&chains).iptables, [Some("DOCKER-USER"), None]);
     }

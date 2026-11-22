@@ -1,5 +1,5 @@
-# dmgbuild settings for Kiri's drag-to-install disk image (xtask passes the -D values):
-#   app=<path to Kiri.app>  background=<1x png; a <name>@2x.png next to it is joined into one HiDPI TIFF>
+# dmgbuild settings for Kiribra's drag-to-install disk image (xtask passes the -D values):
+#   app=<path to Kiribra.app>  background=<1x png; a <name>@2x.png next to it is joined into one HiDPI TIFF>
 # A fixed 640x400 (content) icon-view window with no toolbar, sidebar or status bar: the app on the left, an
 # Applications alias on the right, and the background's arrow between them. dmgbuild writes the .DS_Store itself, so
 # this needs no Finder or AppleScript. The positions match scripts/dmg-background.swift.
@@ -12,7 +12,7 @@ format = "ULMO"  # LZMA: the smallest of hdiutil's formats
 filesystem = "HFS+"
 files = [app]
 symlinks = {"Applications": "/Applications"}
-icon = os.path.join(app, "Contents/Resources/Kiri.icns")  # the volume's icon
+icon = os.path.join(app, "Contents/Resources/Kiribra.icns")  # the volume's icon
 
 background = defines["background"]  # noqa: F821
 window_rect = ((200, 120), (640, 432))

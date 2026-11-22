@@ -1,6 +1,6 @@
 //! The Mac's first-launch checklist (#250): the steps `setup::first_launch`
 //! couldn't do, in the window's setup checklist (index.html, `onboarding`),
-//! as Linux shows its own. Each has Try again; the ones Kiri works without
+//! as Linux shows its own. Each has Try again; the ones Kiribra works without
 //! have Skip, which lasts until the app next opens.
 
 use std::sync::Mutex;
@@ -9,7 +9,7 @@ use serde_json::{Map, Value, json};
 
 use crate::setup::FIRST_STEPS;
 
-/// Steps Kiri works without: the commands (docker reaches Kiri through its
+/// Steps Kiribra works without: the commands (docker reaches Kiribra through its
 /// context either way) and starting at login (the window starts the engine).
 const OPTIONAL: [&str; 2] = ["commands", "login"];
 
@@ -67,6 +67,6 @@ mod tests {
         assert_eq!(event(&login, &["login".into()])["complete"], true, "skipped");
         let context = [("context", "~/.docker: File exists".to_owned())];
         let c = event(&context, &["context".into()]);
-        assert_eq!((c["complete"].as_bool(), c["ready"].as_bool()), (Some(false), Some(false)), "docker can't reach Kiri: no skipping that");
+        assert_eq!((c["complete"].as_bool(), c["ready"].as_bool()), (Some(false), Some(false)), "docker can't reach Kiribra: no skipping that");
     }
 }

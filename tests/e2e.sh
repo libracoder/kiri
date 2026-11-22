@@ -2,7 +2,7 @@
 # End-to-end tests: drives a running `kiri daemon` through the real docker
 # CLI (context `kiri`) and checks every result. Usage:
 #
-#   tests/e2e.sh            # functional tests (DOCKER_CONTEXT=kiri-dev for another Kiri)
+#   tests/e2e.sh            # functional tests (DOCKER_CONTEXT=kiribra-dev for another Kiribra)
 #   SOAK=500 tests/e2e.sh   # plus a leak soak of 500 container runs
 #   KIRI_TEST_STRICT=1 tests/e2e.sh   # what the setup lacks fails, not skipped
 #   KIRI_TEST_ONLY='^udp-|^build-dns$' tests/e2e.sh   # only the checks named
@@ -28,13 +28,13 @@ PASS=0
 FAIL=0
 SKIP=0
 FAILED=()
-# The Kiri under test. A second Kiri (context kiri-dev, kiri-rc...) has its
-# own Finder folder (~/Kiri Dev) and no *.kiri.localhost routers: there is
-# one pair of ports 80 and 443 on a Mac, and the installed Kiri has them.
+# The Kiribra under test. A second Kiribra (context kiribra-dev, kiri-rc...) has its
+# own Finder folder (~/Kiribra Dev) and no *.kiribra.localhost routers: there is
+# one pair of ports 80 and 443 on a Mac, and the installed Kiribra has them.
 FEATURE=${DOCKER_CONTEXT#kiri}; FEATURE=${FEATURE#-}
 # The engine under test's socket. Every `kiri` command (machines, k8s) and
-# every direct API call goes there, never to another Kiri on this Mac: once,
-# the Kubernetes checks ran on the installed Kiri and deleted its cluster.
+# every direct API call goes there, never to another Kiribra on this Mac: once,
+# the Kubernetes checks ran on the installed Kiribra and deleted its cluster.
 SOCK=$(docker context inspect "$DOCKER_CONTEXT" --format '{{.Endpoints.docker.Host}}' 2>/dev/null); SOCK=${SOCK#unix://}
 [ -S "$SOCK" ] || { echo "e2e: no engine socket for context $DOCKER_CONTEXT ($SOCK)"; exit 1; }
 export KIRI_SOCKET=$SOCK
@@ -47,7 +47,7 @@ if [ -z "${KIRI:-}" ]; then
   KIRI=$(for p in $(lsof -t "$SOCK" 2>/dev/null); do lsof -a -d txt -Fn -p "$p" 2>/dev/null; done | sed -n 's/^n//p' | grep '/kiri$' | head -1)
   [ -x "$KIRI" ] || KIRI=$(cd "$(dirname "$0")/.." && pwd)/target/release/kiri
 fi
-# KIRI_TEST_CLI=kiri: every check goes through Kiri's own commands (`kiri
+# KIRI_TEST_CLI=kiri: every check goes through Kiribra's own commands (`kiri
 # run`, `kiri build`, `kiri compose`...) and not through `docker`. They are
 # what people are told to use, so they must pass everything `docker` does.
 # One word with no spaces, as $D is used unquoted. `docker import` is
@@ -61,7 +61,7 @@ if [ "${KIRI_TEST_CLI:-docker}" = kiri ]; then
   trap 'rm -rf "$(dirname "$KIRI_AS_D")"' EXIT
   echo "e2e: commands go through $KIRI"
 fi
-if [ -z "$FEATURE" ]; then KF="$HOME/Kiri"; else KF="$HOME/Kiri $(printf %s "${FEATURE:0:1}" | tr a-z A-Z)${FEATURE:1}"; fi
+if [ -z "$FEATURE" ]; then KF="$HOME/Kiribra"; else KF="$HOME/Kiribra $(printf %s "${FEATURE:0:1}" | tr a-z A-Z)${FEATURE:1}"; fi
 KFQ=$(printf %q "$KF")
 
 # t NAME EXPECTED COMMAND... : passes when the command's output (stdout+stderr,
@@ -129,9 +129,9 @@ section() { printf '\n== %s\n' "$1"; SEC_ONLY=; SEC_NEEDS=; }
 SKIP_WHY=()
 skip() { selected "$1" || return 0; SKIP=$((SKIP + 1)); SKIP_WHY+=("$2"); printf '  SKIP %s (%s)\n' "$1" "$2"; }
 
-# Where each check runs. Kiri runs containers in its own Linux VM on macOS
+# Where each check runs. Kiribra runs containers in its own Linux VM on macOS
 # (SYS=mac), and on the host's own kernel on Linux (linux) and in WSL 2
-# (wsl). The engine says which: the VM's kernel is Kiri's ("6.18-kiri"),
+# (wsl). The engine says which: the VM's kernel is Kiribra's ("6.18-kiri"),
 # WSL 2's is Microsoft's. KIRI_TEST_SYSTEM=mac|linux|wsl says it instead.
 KVER=$($D version --format '{{.Server.KernelVersion}}' 2>/dev/null)
 case ${KIRI_TEST_SYSTEM:-} in
@@ -151,7 +151,7 @@ if [ "$(uname -s)" = Darwin ] && command -v script >/dev/null; then PTY="script 
 elif python3 -c 'import pty' >/dev/null 2>&1; then PTY="python3 $(printf %q "$(cd "$(dirname "$0")" && pwd)/lib/pty-run.py")"
 else PTY=false; NO_TTY="no terminal (neither BSD script nor python3)"; fi
 docker buildx version >/dev/null 2>&1 || NO_BUILDX="buildx not installed"
-# A session without the Mac's disk access (SSH, a fresh terminal) is refused ~/Kiri.
+# A session without the Mac's disk access (SSH, a fresh terminal) is refused ~/Kiribra.
 [ "$SYS" = mac ] && case $(ls "$KF" 2>&1 >/dev/null) in *'Operation not permitted'*) true ;; *) false ;; esac && NO_FINDER="no access to $KF from this session (Full Disk Access)"
 # A file's SHA-256, whichever tool the system has.
 if command -v shasum >/dev/null; then SHA="shasum -a 256"; else SHA=sha256sum; fi
@@ -195,7 +195,7 @@ gate() {
 BRIDGE_GW=172.17.0.1 DEFAULT_NS=172.17.0.1 HOSTNET_ADDR=192.168.64. HOSTNET_IF=eth0 HOST_UPS=1024
 if [ "$SYS" != mac ]; then
   # Docker's 172.17.0.0/16 unless the host is already on it (Docker's
-  # docker0, Kiri in another engine's container): then the first free
+  # docker0, Kiribra in another engine's container): then the first free
   # subnet (daemon/network.rs). As the engine says.
   BRIDGE_GW=$($D network inspect bridge -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}' 2>/dev/null)
   BRIDGE_GW=${BRIDGE_GW:-172.17.0.1}
@@ -238,12 +238,12 @@ IMAGES_SH="$(cd "$(dirname "$0")" && pwd)/lib/images.sh"
 . "$IMAGES_SH"
 HUB_LEFT0=$(kiri_hub_left)
 kiri_seed_images $KIRI_IMAGES_E2E || echo "e2e: an image could not be fetched; the checks that run it will fail"
-# Each Kiri's own builder: <context>-build (kiri-build for context kiri, and so on),
-# so builds go to the Kiri under test and not to another one on this Mac.
+# Each Kiribra's own builder: <context>-build (kiri-build for context kiri, and so on),
+# so builds go to the Kiribra under test and not to another one on this Mac.
 BX=${KIRI_BUILDER:-$DOCKER_CONTEXT-build}
 # buildx pulls its BuildKit image every time it makes the builder's
 # container, also when the image is here. A builder this suite makes takes
-# the image from its registry-qualified address; for Kiri's own builder, Kiri
+# the image from its registry-qualified address; for Kiribra's own builder, Kiribra
 # makes the container from the image already seeded (moby/buildkit), asked
 # here before buildx would.
 docker buildx inspect "$BX" >/dev/null 2>&1 || docker buildx create --name "$BX" --driver docker-container --driver-opt default-load=true --driver-opt "image=$(kiri_image_remote moby/buildkit:buildx-stable-1)" "$DOCKER_CONTEXT" >/dev/null
@@ -255,12 +255,12 @@ fi
 as_plain() { $D tag "$KIRI_REG/$1" "$1" >/dev/null 2>&1 && $D rmi "$KIRI_REG/$1" >/dev/null 2>&1; }
 
 section "engine"
-t version-server "Kiri" $D version
+t version-server "Kiribra" $D version
 t version-api "1.47" $D version --format '{{.Server.APIVersion}}'
 # What Testcontainers needs (#222, #121), asked as docker-java asks: a Docker
-# Engine version (Kiri's own beside it), the image's CMD for "Cmd": [], the
+# Engine version (Kiribra's own beside it), the image's CMD for "Cmd": [], the
 # connection kept after a copy, log follow, one timestamp a line.
-t version-kiri-component "Kiri=" $D version --format '{{range .Server.Components}}{{.Name}}={{.Version}} {{end}}'
+t version-kiri-component "Kiribra=" $D version --format '{{range .Server.Components}}{{.Name}}={{.Version}} {{end}}'
 for c in version cmd keepalive close follow follow-created timestamps exec endpoints copy-after-start; do
   t "testcontainers-$c" "ok $c" python3 "$(dirname "$0")/testcontainers-api.py" "$SOCK" "$c"
 done
@@ -295,8 +295,8 @@ t body-too-large-chunked "413 exit 0" bash -c "curl -s -m 20 -o /dev/null -w '%{
 rm -f "$BIGBODY"
 $D rm -f e2e-close >/dev/null 2>&1
 # Ryuk mounts the engine's socket and talks to it from inside.
-t socket-mount-reaches-kiri "Kiri" $D run --rm -v "$SOCK:/var/run/docker.sock" docker:cli docker version --format '{{.Server.Platform.Name}}'
-t info-os "Kiri" $D info --format '{{.OperatingSystem}}'
+t socket-mount-reaches-kiri "Kiribra" $D run --rm -v "$SOCK:/var/run/docker.sock" docker:cli docker version --format '{{.Server.Platform.Name}}'
+t info-os "Kiribra" $D info --format '{{.OperatingSystem}}'
 t info-cgroup "2" $D info --format '{{.CgroupVersion}}'
 # Compose's `up` and `logs -f` read the daemon's time before they attach (#346).
 t info-system-time "$(date -u +%Y-%m-%dT)" $D info --format '{{.SystemTime}}'
@@ -548,11 +548,11 @@ else
 fi
 
 section "engine Stop and Start"
-# Kiri's Stop is the engine's stop, not the user's, as stopping Docker's
+# Kiribra's Stop is the engine's stop, not the user's, as stopping Docker's
 # daemon is: Start brings back what `always` and `unless-stopped` kept
-# running, but not one the user stopped (docker stop) while Kiri was
+# running, but not one the user stopped (docker stop) while Kiribra was
 # stopped, which answers 204 (#181, #216). A Stop right after Start stops
-# the restarts under way too: nothing runs while Kiri is stopped (#181).
+# the restarts under way too: nothing runs while Kiribra is stopped (#181).
 SQ=$(printf %q "$SOCK")
 POST="curl -s -o /dev/null -w %{http_code} --unix-socket $SQ -X POST"
 RUNNING="$D inspect -f '{{.Name}}={{.State.Running}}' ss-us ss-al ss-user ss-no | tr -d / | tr '\n' ' '"
@@ -570,7 +570,7 @@ t engine-start-brings-back "ss-us=true ss-al=true ss-user=false ss-no=false" bas
 for i in 1 2 3 4; do $D run -d --name ss-al$i --restart always alpine sleep 1d >/dev/null; done
 t engine-start-then-stop "204 204 204" bash -c "echo \$($POST http://d/kiri/stop) \$($POST http://d/kiri/wake) \$($POST http://d/kiri/stop)"
 t engine-start-then-stop-none-run "running: 0" bash -c "sleep 5; echo running: \$($D ps -q --filter name=ss- | wc -l | tr -d ' ')"
-t engine-start-then-stop-refused "Kiri is stopped" $D run --rm alpine true
+t engine-start-then-stop-refused "Kiribra is stopped" $D run --rm alpine true
 # And says what ends it, from the command line too (#93).
 t engine-stopped-says-kiri-start "kiri start" $D run --rm alpine true
 t engine-start-again "204" $POST http://d/kiri/wake
@@ -674,7 +674,7 @@ t ipam-route "default via 10.231.0.254" $D run --rm --network ipamnet alpine ip 
 t ipam-overlap "Pool overlaps with other one on this address space" $D network create --subnet 10.231.0.0/16 ipamnet2
 t ipam-bad-gateway "no matching subnet for gateway" $D network create --subnet 10.232.0.0/24 --gateway 10.9.0.1 ipamnet3
 # A bridge name of one's own is refused, not reported and left unapplied:
-# Kiri's firewall knows its bridges by name (#423). Empty is Docker's unset.
+# Kiribra's firewall knows its bridges by name (#423). Empty is Docker's unset.
 t bridge-name-refused "does not support the network option com.docker.network.bridge.name" $D network create -o com.docker.network.bridge.name=cp-isolated --subnet 10.234.0.0/24 bridgename
 code bridge-name-nothing-made 1 $D network inspect bridgename
 t bridge-name-empty "map[]" bash -c "$D network create -o com.docker.network.bridge.name= bridgename >/dev/null && $D network inspect -f '{{.Options}}' bridgename; $D network rm bridgename >/dev/null"
@@ -817,30 +817,30 @@ kill "$HTTP_PID" ${HTTP_LO_PID:+"$HTTP_LO_PID"}; rm -rf "$HTTP_DIR"
 
 section "container domains"
 if [ -z "$FEATURE" ]; then
-  $D run -d --name dom nginx:alpine >/dev/null; ready http://dom.kiri.localhost
-  t domain-http "Welcome to nginx" curl -s -m 5 http://dom.kiri.localhost
-  t domain-unknown "No running container" curl -s -m 5 http://nope.kiri.localhost
+  $D run -d --name dom nginx:alpine >/dev/null; ready http://dom.kiribra.localhost
+  t domain-http "Welcome to nginx" curl -s -m 5 http://dom.kiribra.localhost
+  t domain-unknown "No running container" curl -s -m 5 http://nope.kiribra.localhost
   # A container that publishes the router's port gets it (Laravel Sail's
   # 80:80); the router takes it back once the container is gone.
   t domain-port-yield "Welcome to nginx" bash -c "$D run -d --name p80 -p 80:80 nginx:alpine >/dev/null && sleep 1 && curl -s -m 5 http://127.0.0.1/"
   $D rm -f p80 >/dev/null
-  t domain-port-back "Welcome to nginx" bash -c "for i in \$(seq 20); do curl -s -m 2 http://dom.kiri.localhost | grep -q nginx && break; sleep 0.5; done; curl -s -m 5 http://dom.kiri.localhost"
+  t domain-port-back "Welcome to nginx" bash -c "for i in \$(seq 20); do curl -s -m 2 http://dom.kiribra.localhost | grep -q nginx && break; sleep 0.5; done; curl -s -m 5 http://dom.kiribra.localhost"
   $D rm -f dom >/dev/null
 else
-  skip domain-http "only the installed Kiri serves *.kiri.localhost"
-  skip domain-unknown "only the installed Kiri serves *.kiri.localhost"
-  skip domain-port-yield "only the installed Kiri has the router on port 80"
-  skip domain-port-back "only the installed Kiri has the router on port 80"
+  skip domain-http "only the installed Kiribra serves *.kiribra.localhost"
+  skip domain-unknown "only the installed Kiribra serves *.kiribra.localhost"
+  skip domain-port-yield "only the installed Kiribra has the router on port 80"
+  skip domain-port-back "only the installed Kiribra has the router on port 80"
 fi
 
 # Settings → Domains moves the routers with no restart; a taken port
-# changes nothing. Kiri Dev has no routers until given ports, so there the
+# changes nothing. Kiribra Dev has no routers until given ports, so there the
 # move starts them, and its settings file goes afterwards.
 section "domain router ports"
 dport() { curl -s --unix-socket "$SOCK" http://d/kiri/domains | python3 -c "import json,sys; print(json.load(sys.stdin)['$1']['port'])"; }
 OLD_HTTP=$(dport http) OLD_HTTPS=$(dport https)
-# A test copy (Kiri Repro, Kiri Dev) starts with no routers unless given
-# ports of its own (domains.json): then OLD_HTTP is 80, the installed Kiri's.
+# A test copy (Kiribra Repro, Kiribra Dev) starts with no routers unless given
+# ports of its own (domains.json): then OLD_HTTP is 80, the installed Kiribra's.
 OWN_PORTS=; [ -n "$FEATURE" ] && [ -f "$HOME/.kiri-$FEATURE/domains.json" ] && OWN_PORTS=1
 $D run -d --name dmv nginx:alpine >/dev/null
 $D run -d --name dhold -p 18799:80 nginx:alpine >/dev/null
@@ -849,34 +849,34 @@ t domain-ports-zero "1 to 65535" curl -s --unix-socket "$SOCK" -X POST -d '{"htt
 t domain-ports-taken "18799 is in use" curl -s --unix-socket "$SOCK" -X POST -d '{"http":18799,"https":18743}' http://d/kiri/domains
 t domain-ports-unchanged "$OLD_HTTP" bash -c "curl -s --unix-socket '$SOCK' http://d/kiri/domains | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"http\"][\"port\"])'"
 t domain-ports-move '"port":18780' curl -s --unix-socket "$SOCK" -X POST -d '{"http":18780,"https":18743}' http://d/kiri/domains
-t domain-ports-http "Welcome to nginx" bash -c "for i in \$(seq 20); do curl -s -m 2 http://dmv.kiri.localhost:18780 | grep -q nginx && break; sleep 0.5; done; curl -s -m 5 http://dmv.kiri.localhost:18780"
-t domain-ports-https "Welcome to nginx" curl -sk -m 5 https://dmv.kiri.localhost:18743
+t domain-ports-http "Welcome to nginx" bash -c "for i in \$(seq 20); do curl -s -m 2 http://dmv.kiribra.localhost:18780 | grep -q nginx && break; sleep 0.5; done; curl -s -m 5 http://dmv.kiribra.localhost:18780"
+t domain-ports-https "Welcome to nginx" curl -sk -m 5 https://dmv.kiribra.localhost:18743
 # The "no such container" page lists the running containers only when asked
 # by one of this machine's own names: a page reached through DNS rebinding
 # asks with its own domain as the Host and could otherwise read the list.
-t domain-list-local "dmv.kiri.local" curl -s -m 5 -H 'Host: nope.kiri.localhost' http://127.0.0.1:18780
+t domain-list-local "dmv.kiribra.local" curl -s -m 5 -H 'Host: nope.kiribra.localhost' http://127.0.0.1:18780
 t domain-list-foreign-host "listed 0" bash -c "curl -s -m 5 -H 'Host: rebind.example.com' http://127.0.0.1:18780 | grep -c dmv | sed 's/^/listed /'"
-# The old port is free afterwards: only the installed Kiri's (Kiri Dev's
-# old port 80 is the installed Kiri's own router).
+# The old port is free afterwards: only the installed Kiribra's (Kiribra Dev's
+# old port 80 is the installed Kiribra's own router).
 if [ -z "$FEATURE" ]; then
-  t domain-ports-old-free "closed" bash -c "curl -s -m 2 -o /dev/null http://dmv.kiri.localhost:$OLD_HTTP && echo open || echo closed"
+  t domain-ports-old-free "closed" bash -c "curl -s -m 2 -o /dev/null http://dmv.kiribra.localhost:$OLD_HTTP && echo open || echo closed"
 else
-  skip domain-ports-old-free "port $OLD_HTTP is the installed Kiri's"
+  skip domain-ports-old-free "port $OLD_HTTP is the installed Kiribra's"
 fi
 # A container can still take the moved port, and gives it back.
 t domain-ports-yield "Welcome to nginx" bash -c "$D run -d --name d18780 -p 18780:80 nginx:alpine >/dev/null && sleep 1 && curl -s -m 5 http://127.0.0.1:18780/"
 $D rm -f d18780 >/dev/null
-t domain-ports-back "Welcome to nginx" bash -c "for i in \$(seq 20); do curl -s -m 2 http://dmv.kiri.localhost:18780 | grep -q nginx && break; sleep 0.5; done; curl -s -m 5 http://dmv.kiri.localhost:18780"
+t domain-ports-back "Welcome to nginx" bash -c "for i in \$(seq 20); do curl -s -m 2 http://dmv.kiribra.localhost:18780 | grep -q nginx && break; sleep 0.5; done; curl -s -m 5 http://dmv.kiribra.localhost:18780"
 if [ -z "$FEATURE" ]; then
   # t execs its command, so this is curl itself: a shell function there would never run.
   t domain-ports-restore "\"port\":$OLD_HTTP" curl -s --unix-socket "$SOCK" -X POST -H 'Content-Type: application/json' -d "{\"http\":$OLD_HTTP,\"https\":$OLD_HTTPS}" http://d/kiri/domains
-  t domain-ports-restored "Welcome to nginx" bash -c "for i in \$(seq 20); do curl -s -m 2 http://dmv.kiri.localhost:$OLD_HTTP | grep -q nginx && break; sleep 0.5; done; curl -s -m 5 http://dmv.kiri.localhost:$OLD_HTTP"
+  t domain-ports-restored "Welcome to nginx" bash -c "for i in \$(seq 20); do curl -s -m 2 http://dmv.kiribra.localhost:$OLD_HTTP | grep -q nginx && break; sleep 0.5; done; curl -s -m 5 http://dmv.kiribra.localhost:$OLD_HTTP"
 elif [ -n "$OWN_PORTS" ]; then
   # Ports of its own at the start: back to them.
   t domain-ports-restore "\"port\":$OLD_HTTP" curl -s --unix-socket "$SOCK" -X POST -H 'Content-Type: application/json' -d "{\"http\":$OLD_HTTP,\"https\":$OLD_HTTPS}" http://d/kiri/domains
 else
   # No routers at the start: back to none, which frees 18780 and 18743 now,
-  # not at its next restart, and never takes 80 and 443 from the installed Kiri.
+  # not at its next restart, and never takes 80 and 443 from the installed Kiribra.
   # Through `kiri domains reset` (CLI first); the API itself when $KIRI is
   # missing or older than that command.
   if [ -x "$KIRI" ] && "$KIRI" domains >/dev/null 2>&1; then
@@ -1075,7 +1075,7 @@ ready http://localhost:18380
 t compose-port "compose on kiri" curl -s -m 5 http://localhost:18380
 t compose-dns "PONG" bash -c "cd $CP && $D compose -p kiritest exec -T web sh -c 'apk add -q redis >/dev/null 2>&1; redis-cli -h cache ping || { cat /etc/resolv.conf; nslookup cache; ip addr show eth0; }'"
 t compose-ps "running" bash -c "cd $CP && $D compose -p kiritest ps --format '{{.State}}'"
-if [ -z "$FEATURE" ]; then t compose-domain "compose on kiri" curl -s -m 5 http://web.kiritest.kiri.localhost; else skip compose-domain "only the installed Kiri serves *.kiri.localhost"; fi
+if [ -z "$FEATURE" ]; then t compose-domain "compose on kiri" curl -s -m 5 http://web.kiritest.kiribra.localhost; else skip compose-domain "only the installed Kiribra serves *.kiribra.localhost"; fi
 t compose-down "Removed" bash -c "cd $CP && $D compose -p kiritest down -v 2>&1"
 t compose-clean "0" bash -c "$D ps -aq --filter label=com.docker.compose.project=kiritest | wc -l | tr -d ' '"
 t compose-bystander "bystander" $D ps --format '{{.Names}}'
@@ -1083,7 +1083,7 @@ $D rm -f bystander >/dev/null
 rm -rf "$CP"
 
 section "healthchecks and a Compose dev stack (#358)"
-# Kiri runs healthchecks itself; Compose's depends_on conditions, --wait and
+# Kiribra runs healthchecks itself; Compose's depends_on conditions, --wait and
 # local bind volumes are built on them.
 $D run -d --name hc-ok --health-cmd true --health-interval 1s alpine sleep 120 >/dev/null
 $D run -d --name hc-bad --health-cmd 'exit 1' --health-interval 1s --health-retries 3 alpine sleep 120 >/dev/null
@@ -1184,12 +1184,12 @@ $D rm -f pv >/dev/null
 section "kernel: netfilter, tc and interfaces"
 # Every line of tests/kernel-features.sh (nftables expressions, the iptables
 # matches and targets, ipset, IPVS, tc, ss, macvlan/WireGuard/IPsec...) is
-# one check: Kiri's guest kernel builds them all in, as it loads no modules.
+# one check: Kiribra's guest kernel builds them all in, as it loads no modules.
 KFEAT=$(perl -e 'alarm 180; exec @ARGV' $D run --rm --privileged -v "$(cd "$(dirname "$0")" && pwd)/kernel-features.sh:/k.sh:ro" alpine:3.22 sh /k.sh 2>&1 | tr -d '\r')
 # One check per line; the line itself is what shows when it fails.
 # On a Linux host or in WSL the kernel is the host's, and a feature its
 # kernel lacks (not built, module not loaded: what a container can't load)
-# is the host's, not Kiri's; Docker there would fail it the same way.
+# is the host's, not Kiribra's; Docker there would fail it the same way.
 kernel_lacks() { printf '%s' "$1" | grep -qE 'FAIL: .*(Unknown device type|Not supported|not supported|Protocol not available|Could not process rule: No such file or directory|Can.t initialize ipvs|RTNETLINK answers: Operation not supported)'; }
 # Microsoft's WSL kernel is built without a few of them, as its own
 # /proc/config.gz says ("# CONFIG_X is not set"): no setup can add those, so
@@ -1323,7 +1323,7 @@ t build-runs "from context" $D run --rm kiri-test/built
 t build-arg "hello" $D run --rm kiri-test/built
 needs buildx t build-cached "CACHED" bash -c "cd $BD && BUILDX_BUILDER=$BX $D build --progress plain --build-arg MSG=hello -t kiri-test/built . 2>&1"
 t build-network "curl" bash -c "cd $BD && printf 'FROM $FA\nRUN apk add --no-cache curl\n' > Dockerfile.net && BUILDX_BUILDER=$BX perl -e 'alarm 300; exec @ARGV' $D build -f Dockerfile.net -t kiri-test/net . >/dev/null 2>&1 && $D run --rm kiri-test/net curl --version"
-# Build steps keep Kiri's resolver (and with it the Mac's): no 8.8.8.8. On a
+# Build steps keep Kiribra's resolver (and with it the Mac's): no 8.8.8.8. On a
 # Linux host, the default bridge's, the host's resolvers (DEFAULT_NS).
 needs buildx t build-resolvconf "nameserver $DEFAULT_NS" bash -c "cd $BD && printf 'FROM $FA\nRUN cat /etc/resolv.conf\n' > Dockerfile.dns && BUILDX_BUILDER=$BX perl -e 'alarm 300; exec @ARGV' $D build --no-cache --progress plain -f Dockerfile.dns . 2>&1"
 needs buildx code build-no-public-resolver 1 bash -c "cd $BD && BUILDX_BUILDER=$BX perl -e 'alarm 300; exec @ARGV' $D build --no-cache --progress plain -f Dockerfile.dns . 2>&1 | grep -q 'nameserver 8.8.8.8'"
@@ -1523,13 +1523,13 @@ code pruned-gone 1 $D inspect prunable
 # The suite's own untagged image ($i), made from alpine and labelled
 # kiri-e2e-own=1, so every check below can name it. Docker lists it as
 # <none>:<none>, picks it with dangling=true and leaves it out with
-# dangling=false (Kiri once listed it as "sha256:<hex>" and never as dangling).
+# dangling=false (Kiribra once listed it as "sha256:<hex>" and never as dangling).
 OWN_UNTAGGED="c=\$($D create alpine true) && i=\$($D export \$c | $D import -c 'LABEL kiri-e2e-own=1' -) && $D rm \$c >/dev/null && trap '$D rmi \$i >/dev/null 2>&1' EXIT"
 t image-ls-untagged-row "<none>:<none>" bash -c "$OWN_UNTAGGED && $D image ls -a --filter label=kiri-e2e-own=1 --format '{{.Repository}}:{{.Tag}}'"
 t image-ls-dangling "<none>:<none>" bash -c "$OWN_UNTAGGED && $D image ls --filter dangling=true --filter label=kiri-e2e-own=1 --format '{{.Repository}}:{{.Tag}}'"
 t image-ls-dangling-false "NOT-LISTED" bash -c "$OWN_UNTAGGED && ($D image ls -q --no-trunc --filter dangling=false | grep -q \$i && echo LISTED || echo NOT-LISTED)"
 t image-ls-until "UNTIL-OK" bash -c "$OWN_UNTAGGED && out=\$($D image ls -q --filter until=1h --filter label=kiri-e2e-own=1) && [ -z \"\$out\" ] && echo UNTIL-OK"
-# Prunes with label filters. An engine that ignores them (Kiri before this
+# Prunes with label filters. An engine that ignores them (Kiribra before this
 # check) would remove every untagged image, so these first make sure the
 # engine lists the suite's own image as dangling, and prune nothing if not.
 # Two label filters that no object carries together keep everything in
@@ -1563,7 +1563,7 @@ section "amd64 images (Rosetta)"
 # their plain names, as a --platform run would pull them from Docker Hub.
 kiri_fetch alpine:latest linux/amd64
 kiri_fetch node:22-alpine linux/amd64
-# On a Mac, Kiri's VM runs them with Rosetta. On a Linux host or in WSL the
+# On a Mac, Kiribra's VM runs them with Rosetta. On a Linux host or in WSL the
 # host's kernel runs them: natively on an amd64 machine, elsewhere only with
 # an emulator registered for them (binfmt_misc, qemu-user-static), as with
 # Docker; without one the kernel answers "exec format error".
@@ -1582,9 +1582,9 @@ needs amd64 t rosetta-amd64-only-repo "x86_64" $D run --rm "$AMD64_ONLY" uname -
 needs amd64 t rosetta-node "v22" $D run --rm --platform linux/amd64 node:22-alpine node --version
 # Rosetta on macOS 15 stops on startup entries it doesn't know ("unhandled
 # auxillary vector type 29", #199): the kernel gives AT_HWCAP3 (29) only when
-# it says something, which it never does in Kiri's VM. alpine is the amd64
+# it says something, which it never does in Kiribra's VM. alpine is the amd64
 # image here, so on Apple silicon this reads what Rosetta was handed. On a
-# Linux host the kernel is the host's, not Kiri's.
+# Linux host the kernel is the host's, not Kiribra's.
 only mac t rosetta-no-auxv-29 "no type 29" $D run --rm alpine sh -c 'od -An -v -tu8 -w16 /proc/self/auxv | awk "\$1 == 29 { n++ } END { print n ? \"type 29 given\" : \"no type 29\" }"'
 # Back to the engine's own architecture for the rest (an Intel Mac's is amd64).
 ARCH=$($D version -f '{{.Server.Arch}}' 2>/dev/null)
@@ -1613,7 +1613,7 @@ t vsock-privileged "Address family not supported" $D run --rm --privileged pytho
 t seccomp-exec "Seccomp:	2" bash -c "$D run -d --name sec alpine sleep 30 >/dev/null; $D exec sec grep Seccomp: /proc/self/status"
 $D rm -f sec >/dev/null
 # docker info says the filter is on; a profile of the user's own is applied
-# (the CLI sends the file's JSON), under exec too, and one Kiri can't apply
+# (the CLI sends the file's JSON), under exec too, and one Kiribra can't apply
 # fails the run instead of quietly giving the default.
 SCD=$(mktemp -d)
 echo '{"defaultAction":"SCMP_ACT_ALLOW","syscalls":[{"names":["mkdir","mkdirat"],"action":"SCMP_ACT_ERRNO"}]}' > $SCD/deny-mkdir.json
@@ -1745,7 +1745,7 @@ if [ "${K8S:-0}" = 1 ]; then
   KH=$(mktemp -d); mkdir -p "$KH/.kube"
   KK="env HOME=$KH KIRI_SOCKET=$SOCK $KQ k8s"
   t k8s-start "is ready" bash -c "$KK start"
-  # The context `kiri k8s start` wrote: named after the Kiri build, not always `kiri`.
+  # The context `kiri k8s start` wrote: named after the Kiribra build, not always `kiri`.
   KCTX=$(env HOME="$KH" kubectl config get-contexts -o name 2>/dev/null | head -1); KCTX=${KCTX:-kiri}
   t k8s-node "Ready" env HOME="$KH" kubectl --context $KCTX get nodes
   # The pods' images come from KIRI_TEST_REGISTRY. k3s itself (rancher/k3s) is

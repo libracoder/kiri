@@ -13,7 +13,7 @@
 //! gateway (192.168.64.1). macOS doesn't always answer there: after a
 //! network change, sleep or a VPN, lookups are refused or go unanswered
 //! while the Mac itself resolves fine. So a lookup the gateway refuses, or
-//! leaves unanswered for `FALLBACK_AFTER`, is asked again through the Kiri
+//! leaves unanswered for `FALLBACK_AFTER`, is asked again through the Kiribra
 //! daemon on the Mac, over vsock, which asks the Mac's own resolvers
 //! (crates/kiri/src/daemon/dns.rs). A container's own `--dns` servers are
 //! never second-guessed.
@@ -183,7 +183,7 @@ impl Dns {
             Err(e) => {
                 if self.refused.insert(bridge.to_owned()) {
                     eprintln!(
-                        "kiri-init: dns: cannot listen on {bridge}'s gateway {}:53 ({e}); its containers ask Kiri's resolver at 127.0.0.11 in their own network instead",
+                        "kiri-init: dns: cannot listen on {bridge}'s gateway {}:53 ({e}); its containers ask Kiribra's resolver at 127.0.0.11 in their own network instead",
                         super::net::ip_str(gateway)
                     );
                 }

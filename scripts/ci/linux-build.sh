@@ -1,5 +1,5 @@
 #!/bin/sh
-# Kiri's eight Linux packages from this checkout, on any Debian or Ubuntu
+# Kiribra's eight Linux packages from this checkout, on any Debian or Ubuntu
 # with Rust, python3-venv, rpm and dpkg-deb: the release build's Ubuntu, WSL's
 # Ubuntu on a Windows PC, or the container linux-packages.sh starts on a Mac.
 # - the static engine for x86-64 and arm64 (scripts/windows-engine.sh, zig

@@ -1,8 +1,8 @@
 //! Settings → Diagnostics on Windows: the window's log
-//! (%LOCALAPPDATA%\Kiri\kiri-win.log) and the engine's (/var/log/kiri.log in
-//! WSL), as the lines the page shows from ~/.kiri/logs on the Mac
+//! (%LOCALAPPDATA%\Kiribra\kiri-win.log) and the engine's (/var/log/kiri.log in
+//! WSL), as the lines the page shows from ~/.kiribra/logs on the Mac
 //! (crates/kiri/src/diag/report.rs `page_lines`); a report saved to the
-//! Desktop or sent to Kiri Cloud, and the logs folder in Explorer. A panic
+//! Desktop or sent to Kiribra Cloud, and the logs folder in Explorer. A panic
 //! is a line in the window's log: there are no crash files on Windows.
 
 use std::io::{self, Read, Seek, SeekFrom};
@@ -20,11 +20,11 @@ use crate::daemon::time;
 
 /// How much of each log is read from its end, as on the Mac.
 const TAIL_BYTES: u64 = 512 << 10;
-/// Kiri Cloud takes reports up to 1 MB.
+/// Kiribra Cloud takes reports up to 1 MB.
 const MAX_BODY: usize = 1 << 20;
 
 fn kiri_dir() -> Option<PathBuf> {
-    std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("Kiri"))
+    std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("Kiribra"))
 }
 
 fn redactor() -> redact::Redactor {
@@ -174,7 +174,7 @@ fn windows_version() -> String {
 
 /// The report: versions, the container list if asked, and both logs.
 fn report_text(containers: bool) -> String {
-    let mut out = format!("Kiri for Windows {}\n{}\n{}\n", env!("CARGO_PKG_VERSION"), windows_version(), std::env::consts::ARCH);
+    let mut out = format!("Kiribra for Windows {}\n{}\n{}\n", env!("CARGO_PKG_VERSION"), windows_version(), std::env::consts::ARCH);
     if containers {
         out.push_str("\n== Containers ==\n");
         match crate::client::get("/containers/json?all=1") {
@@ -204,12 +204,12 @@ fn save_report(text: &str) -> io::Result<PathBuf> {
     let desktop = PathBuf::from(home).join("Desktop");
     let secs = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
     let t = time::rfc3339(UNIX_EPOCH + Duration::from_secs(secs));
-    let path = desktop.join(format!("Kiri report {} {}.txt", &t[..10], t[11..19].replace(':', "")));
+    let path = desktop.join(format!("Kiribra report {} {}.txt", &t[..10], t[11..19].replace(':', "")));
     std::fs::write(&path, text)?;
     Ok(path)
 }
 
-/// This install's random id, made once, as the Mac's ~/.kiri/install_id.
+/// This install's random id, made once, as the Mac's ~/.kiribra/install_id.
 fn install_id() -> String {
     let Some(dir) = kiri_dir() else { return String::new() };
     let path = dir.join("install_id");
@@ -239,7 +239,7 @@ fn send_report(text: &str) -> io::Result<String> {
             "kind": "report",
             "part": "ui",
             "app_version": env!("CARGO_PKG_VERSION"),
-            "flavor": if crate::flavor::dev() { "kiri-dev" } else { "kiri" },
+            "flavor": if crate::flavor::dev() { "kiribra-dev" } else { "kiri" },
             "os": windows_version(),
             "arch": std::env::consts::ARCH,
             "install_id": install_id(),
@@ -266,9 +266,9 @@ fn send_report(text: &str) -> io::Result<String> {
             .as_str()
             .filter(|id| !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'))
             .map(str::to_owned)
-            .ok_or_else(|| io::Error::other("Kiri Cloud took the report but sent back no id")),
-        429 => Err(io::Error::other(format!("Kiri Cloud is taking no more reports for now (429){why}; try again later"))),
-        _ => Err(io::Error::other(format!("Kiri Cloud answered {status}{why}"))),
+            .ok_or_else(|| io::Error::other("Kiribra Cloud took the report but sent back no id")),
+        429 => Err(io::Error::other(format!("Kiribra Cloud is taking no more reports for now (429){why}; try again later"))),
+        _ => Err(io::Error::other(format!("Kiribra Cloud answered {status}{why}"))),
     }
 }
 

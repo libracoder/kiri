@@ -1,5 +1,5 @@
 //! An image's page, Layers and Security, as crates/kiri/src/builds.rs
-//! (`image_layers`) and scan.rs are on the Mac. Kiri's store is inside WSL,
+//! (`image_layers`) and scan.rs are on the Mac. Kiribra's store is inside WSL,
 //! so the engine there reads the layers and runs Grype, keeping the scans
 //! beside the store (`/kiri/images/…`, crates/kiri/src/daemon/api.rs); this
 //! asks it, saves an SBOM to Downloads and opens advisory pages.
@@ -19,7 +19,7 @@ static LINKS: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 
 /// What a 404 means here: the engine in WSL predates these requests.
 fn failed(r: &Response) -> io::Error {
-    io::Error::other(if r.status == 404 { "Kiri's engine in WSL is older than this window: update Kiri".to_owned() } else { r.error() })
+    io::Error::other(if r.status == 404 { "Kiribra's engine in WSL is older than this window: update Kiribra".to_owned() } else { r.error() })
 }
 
 /// `/kiri/images/<what>?name=…[&at=…]`, as the window's own request.

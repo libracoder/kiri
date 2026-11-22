@@ -2,14 +2,14 @@
 # `kiri import` against a real source engine. Usage:
 #
 #   tests/import.sh orbstack          # or desktop-linux: the source's docker context
-#   KIRI=/path/to/kiri DOCKER_CONTEXT=kiri-builds tests/import.sh orbstack
+#   KIRI=/path/to/kiri DOCKER_CONTEXT=kiribra-builds tests/import.sh orbstack
 #
 # Each section sets up one reported case on the source, imports it into the
-# Kiri under test (context $DOCKER_CONTEXT, default kiri) and checks what Kiri
+# Kiribra under test (context $DOCKER_CONTEXT, default kiri) and checks what Kiribra
 # has. Everything it makes is named imp-* (and the anonymous volumes of its
 # own containers) on both engines, and only those are removed again, with
 # the images it or the imports brought; both engines are left as found.
-# The volume cases need about 14 GB free in Kiri for an 8 GiB file; with
+# The volume cases need about 14 GB free in Kiribra for an 8 GiB file; with
 # less they are skipped and said so. Exits non-zero if a check fails.
 
 set -u
@@ -62,10 +62,10 @@ ANON=()
 PINNED=
 PINNED_OURS=
 PINNED_KIRI_OURS=
-# What Kiri has before: read once both engines answer. Until then the
-# cleanup removes no image from Kiri.
+# What Kiribra has before: read once both engines answer. Until then the
+# cleanup removes no image from Kiribra.
 KIRI_HAD=
-# A Kiri container of ours goes with the 64-hex volumes the import gave it.
+# A Kiribra container of ours goes with the 64-hex volumes the import gave it.
 kiri_rm() {
   local c v
   for c in "$@"; do
@@ -98,7 +98,7 @@ cleanup() {
   [ -n "$PINNED_OURS" ] && "${S[@]}" rmi "$PINNED" >/dev/null 2>&1
   for i in ${FETCHED_SRC[@]+"${FETCHED_SRC[@]}"}; do "${S[@]}" rmi "$i" >/dev/null 2>&1; done
   for i in ${FETCHED_KIRI[@]+"${FETCHED_KIRI[@]}"}; do "${K[@]}" rmi "$i" >/dev/null 2>&1; done
-  # What the imports brought into Kiri: the test image, helper images.
+  # What the imports brought into Kiribra: the test image, helper images.
   [ -n "$KIRI_HAD" ] || return 0
   for i in $("${K[@]}" image ls --format '{{.Repository}}:{{.Tag}}' 2>/dev/null); do
     [[ "$KIRI_HAD" == *" $i "* ]] && continue
@@ -109,24 +109,24 @@ cleanup
 trap cleanup EXIT
 
 "${S[@]}" version >/dev/null 2>&1 || { echo "import: the source $SRC does not answer"; exit 1; }
-"${K[@]}" version >/dev/null 2>&1 || { echo "import: Kiri ($DOCKER_CONTEXT) does not answer"; exit 1; }
-had=$("${K[@]}" image ls --format '{{.Repository}}:{{.Tag}}') || { echo "import: could not list Kiri's images"; exit 1; }
+"${K[@]}" version >/dev/null 2>&1 || { echo "import: Kiribra ($DOCKER_CONTEXT) does not answer"; exit 1; }
+had=$("${K[@]}" image ls --format '{{.Repository}}:{{.Tag}}') || { echo "import: could not list Kiribra's images"; exit 1; }
 KIRI_HAD=" $(echo "$had" | tr '\n' ' ') "
-# The kiri under test must be the Kiri under test: else imports would land
-# in another one, perhaps a person's installed Kiri.
+# The kiri under test must be the Kiribra under test: else imports would land
+# in another one, perhaps a person's installed Kiribra.
 "${K[@]}" volume create imp-probe >/dev/null
 if ! "$KIRI" volume ls -q 2>/dev/null | grep -qx imp-probe; then
   echo "import: $KIRI does not talk to the engine of context $DOCKER_CONTEXT; set KIRI to its kiri"; exit 1
 fi
 "${K[@]}" volume rm imp-probe >/dev/null
 fetch "$SRC" "$TOOL" || { echo "import: could not get $TOOL on $SRC"; exit 1; }
-# Kiri's half of a volume copy runs only an image Kiri pulled from an
+# Kiribra's half of a volume copy runs only an image Kiribra pulled from an
 # official repository: the mirror's alpine is one, kept while this runs.
 if ! "${K[@]}" image inspect mirror.gcr.io/library/alpine >/dev/null 2>&1; then
-  "${K[@]}" pull -q mirror.gcr.io/library/alpine >/dev/null || { echo "import: could not get alpine on Kiri"; exit 1; }
+  "${K[@]}" pull -q mirror.gcr.io/library/alpine >/dev/null || { echo "import: could not get alpine on Kiribra"; exit 1; }
   FETCHED_KIRI+=(mirror.gcr.io/library/alpine)
 fi
-fetch "$DOCKER_CONTEXT" alpine || { echo "import: could not get alpine on Kiri"; exit 1; }
+fetch "$DOCKER_CONTEXT" alpine || { echo "import: could not get alpine on Kiribra"; exit 1; }
 src_sh() { "${S[@]}" run --rm --network none --entrypoint sh "$@"; }
 # A volume's files as text: name, owner, mode, type, and for what is not a
 # directory its link count and size; a file's mtime and checksum, a link's
@@ -153,13 +153,13 @@ printf '[{"Config":"config.json","RepoTags":["%s"],"Layers":["base.tar","top.tar
 "${K[@]}" load -i "$LA_DIR/look-alike.tar" >/dev/null && "${S[@]}" load -i "$LA_DIR/look-alike.tar" >/dev/null
 t la-in-kiri "2099" "${K[@]}" image inspect -f '{{.Created}}' "$LOOKALIKE"
 t la-on-source "2099" "${S[@]}" image inspect -f '{{.Created}}' "$LOOKALIKE"
-# An image with no name at all in Kiri (as a build without -t leaves one).
+# An image with no name at all in Kiribra (as a build without -t leaves one).
 sed 's/2099-01-01/2098-01-01/' "$LA_DIR/config.json" > "$LA_DIR/untagged.json"
 printf '[{"Config":"untagged.json","RepoTags":null,"Layers":["base.tar","top.tar"]}]' > "$LA_DIR/manifest.json"
 (cd "$LA_DIR" && COPYFILE_DISABLE=1 tar -cf untagged.tar manifest.json untagged.json base.tar top.tar)
 "${K[@]}" load -i "$LA_DIR/untagged.tar" >/dev/null && UNTAGGED_ID=sha256:$(sha "$LA_DIR/untagged.json")
 t la-untagged-in-kiri "2098" "${K[@]}" image inspect -f '{{.Created}}' "${UNTAGGED_ID:-none}"
-# The names in Kiri whose own record was pulled from an official repository.
+# The names in Kiribra whose own record was pulled from an official repository.
 official_names() {
   local n
   for n in $("${K[@]}" image ls --format '{{.Repository}}:{{.Tag}}'); do
@@ -167,7 +167,7 @@ official_names() {
       "${K[@]}" image inspect -f '{{json .RepoDigests}}' "$n" 2>/dev/null | grep -qF "\"${n%:*}@sha256:" && echo "$n"
   done
 }
-# helpers SINCE: the image each import helper Kiri made since then was given.
+# helpers SINCE: the image each import helper Kiribra made since then was given.
 helpers() { "${K[@]}" events --since "$1" --until "$(($(date +%s) + 1))" --filter event=create --filter label=dev.kiri.import-helper=1 --format '{{index .Actor.Attributes "image"}}' 2>&1; }
 # by_name SINCE: each helper since then was given an official image's name.
 by_name() {
@@ -179,7 +179,7 @@ by_name() {
 }
 "${S[@]}" volume create imp-vol-la >/dev/null
 src_sh -v imp-vol-la:/d "$TOOL" -c 'echo real > /d/f && mkdir /d/sub && echo deep > /d/sub/g && chown -R 1234:5678 /d/sub'
-# Shared by both engines, empty in Kiri: the list looks into it.
+# Shared by both engines, empty in Kiribra: the list looks into it.
 "${K[@]}" volume create imp-vol-la >/dev/null
 since=$(date +%s); sleep 1
 t la-list-works "imp-vol-la" "$KIRI" import "$SRC" --list
@@ -191,7 +191,7 @@ t la-volume-exact "real deep 1234:5678" "${K[@]}" run --rm --network none -v imp
 t la-volume-no-mark "no mark" "${K[@]}" run --rm --network none -v imp-vol-la:/d:ro alpine sh -c 'find /d -name look-alike-ran | grep -q . && echo marked || echo "no mark"'
 res=$(by_name "$since")
 t la-volume-ran-no-look-alike "all by the name of an official image" echo "$res"
-# Not in Kiri yet: the first helper to run is the one that writes it.
+# Not in Kiribra yet: the first helper to run is the one that writes it.
 "${S[@]}" volume create imp-vol-la-new >/dev/null
 src_sh -v imp-vol-la-new:/d "$TOOL" -c 'echo new > /d/f'
 t la-new-volume-imports "volume imp-vol-la-new: done" "$KIRI" import "$SRC" volume imp-vol-la-new
@@ -215,20 +215,20 @@ got=$("${K[@]}" run --rm --network none -v imp-vol-data:/d:ro alpine sh -c "$LIS
 t vol-exact-copy "same files" bash -c '[ "$1" = "$2" ] && echo "same files" || diff <(echo "$1") <(echo "$2")' _ "$want" "$got"
 t vol-copy-has-files "hard" echo "$got"
 
-section "#376 an empty volume in Kiri is not \"already in Kiri\"; a container brings its volumes"
+section "#376 an empty volume in Kiribra is not \"already in Kiribra\"; a container brings its volumes"
 "${S[@]}" volume create imp-vol-named >/dev/null
 "${S[@]}" run --name imp-vol-user --network none --entrypoint sh -v imp-vol-named:/named -v /anon "$TOOL" -c 'echo named > /named/f; echo anon > /anon/f'
 ANON=($("${S[@]}" inspect imp-vol-user --format '{{range .Mounts}}{{if eq .Destination "/anon"}}{{.Name}}{{end}}{{end}}'))
 # What a container's create or a failed copy leaves: the volume, empty.
 "${K[@]}" volume create imp-vol-named >/dev/null
-t vol-empty-offered-again "offered" bash -c '"$1" import "$2" --list | grep -q "imp-vol-named  (already in Kiri)" && echo "listed as already in Kiri" || echo offered' _ "$KIRI" "$SRC"
+t vol-empty-offered-again "offered" bash -c '"$1" import "$2" --list | grep -q "imp-vol-named  (already in Kiribra)" && echo "listed as already in Kiribra" || echo offered' _ "$KIRI" "$SRC"
 t vol-user-imports "container imp-vol-user: done" "$KIRI" import "$SRC" container imp-vol-user
-note "$TOOL is $("${S[@]}" image inspect -f '{{.Id}}' "$TOOL" | cut -c1-19) on $SRC, $("${K[@]}" image inspect -f '{{.Id}}' "$TOOL" 2>/dev/null | cut -c1-19) in Kiri"
+note "$TOOL is $("${S[@]}" image inspect -f '{{.Id}}' "$TOOL" | cut -c1-19) on $SRC, $("${K[@]}" image inspect -f '{{.Id}}' "$TOOL" 2>/dev/null | cut -c1-19) in Kiribra"
 t vol-named-has-data "named" "${K[@]}" run --rm --network none -v imp-vol-named:/n alpine cat /n/f
 t vol-anon-has-data "anon" "${K[@]}" run --rm --network none -v "${ANON[0]:-none}:/a" alpine cat /a/f
 t vol-anon-same-name "${ANON[0]:-none}" "${K[@]}" inspect imp-vol-user --format '{{range .Mounts}}{{.Name}} {{end}}'
-t vol-listed-once-filled "imp-vol-named  (already in Kiri)" "$KIRI" import "$SRC" --list
-# A Kiri volume with files is never written over.
+t vol-listed-once-filled "imp-vol-named  (already in Kiribra)" "$KIRI" import "$SRC" --list
+# A Kiribra volume with files is never written over.
 "${S[@]}" volume create imp-vol-keep >/dev/null
 src_sh -v imp-vol-keep:/d "$TOOL" -c 'echo source > /d/f'
 "${K[@]}" volume create imp-vol-keep >/dev/null
@@ -239,7 +239,7 @@ t vol-keep-untouched "kiri" "${K[@]}" run --rm --network none -v imp-vol-keep:/d
 section "#376 files of 8 GiB and more, a copy cut half-way"
 free_kiri=$("${K[@]}" run --rm --network none alpine df -k / | awk 'NR==2 {print $4}')
 free_src=$(src_sh "$TOOL" -c "df -k / | awk 'NR==2 {print \$4}'")
-note "free: Kiri $((free_kiri / 1048576)) GB, $SRC $((free_src / 1048576)) GB"
+note "free: Kiribra $((free_kiri / 1048576)) GB, $SRC $((free_src / 1048576)) GB"
 if [ "${free_kiri:-0}" -lt 14000000 ] || [ "${free_src:-0}" -lt 2000000 ]; then
   note "not enough free disk for these cases here: skipped"
 else
@@ -256,7 +256,7 @@ else
     local pid=$! i
     for i in $(seq 300); do pgrep -f "kiri-import-imp-vol-cut:|imp-vol-cut:/from" >/dev/null && break; sleep 0.1; done
     sleep 1
-    # Kiri's helpers while the copy runs: what each was given and runs.
+    # Kiribra's helpers while the copy runs: what each was given and runs.
     for c in $("${K[@]}" ps -q --filter label=dev.kiri.import-helper=1); do
       "${K[@]}" inspect -f '{{.Config.Image}} {{.Image}} {{json .Config.Entrypoint}}' "$c"
     done > /tmp/imp-cut-seen.$$ 2>&1
@@ -268,39 +268,39 @@ else
   src_sh -v imp-vol-cut:/d "$TOOL" -c 'cd /d && truncate -s 4G a-big && echo after > b-after'
   "${S[@]}" create --name imp-vol-cutter --network none -v imp-vol-cut:/d "$TOOL" >/dev/null
   out=$(cut "$KIRI" import "$SRC" volume imp-vol-cut)
-  t cut-said "unfinished in Kiri" echo "$out"
+  t cut-said "unfinished in Kiribra" echo "$out"
   seen=$(cat /tmp/imp-cut-seen.$$ 2>/dev/null); rm -f /tmp/imp-cut-seen.$$
   t cut-helper-by-name-with-entrypoint "by name, entrypoint sh" bash -c 'read -r given ran ep <<<"$1"; grep -qxF "$given" <<<"$2" && [ "$ep" = "[\"sh\"]" ] && echo "by name, entrypoint sh" || echo "seen: $1 (official: $2)"' _ "$seen" "$(official_names)"
   t cut-marked "kiri-import-unfinished" "${K[@]}" run --rm --network none -v imp-vol-cut:/d:ro alpine ls -A /d
-  t cut-offered-again "offered" bash -c '"$1" import "$2" --list | grep -q "imp-vol-cut  (already in Kiri)" && echo "listed as already in Kiri" || echo offered' _ "$KIRI" "$SRC"
-  # Used in Kiri since, by a container in any state: what it wrote there
+  t cut-offered-again "offered" bash -c '"$1" import "$2" --list | grep -q "imp-vol-cut  (already in Kiribra)" && echo "listed as already in Kiribra" || echo offered' _ "$KIRI" "$SRC"
+  # Used in Kiribra since, by a container in any state: what it wrote there
   # is not emptied away, not even with --force (that is about the source).
   # "${kept[@]}" FILE: the volume still has FILE, and is still unfinished.
   kept=("${K[@]}" run --rm --network none -v imp-vol-cut:/d:ro alpine sh -c 'echo "$(cat "/d/$0") $(ls -A /d | grep -c kiri-import-unfinished)"')
   "${K[@]}" run -d --name imp-vol-kiri-paused --network none -v imp-vol-cut:/d alpine sh -c 'echo paused > /d/paused; sleep 1d' >/dev/null
   sleep 1; "${K[@]}" pause imp-vol-kiri-paused >/dev/null
-  t cut-paused-in-kiri-refused "Kiri has imp-vol-kiri-paused using it" "$KIRI" import "$SRC" volume imp-vol-cut
+  t cut-paused-in-kiri-refused "Kiribra has imp-vol-kiri-paused using it" "$KIRI" import "$SRC" volume imp-vol-cut
   t cut-paused-kept "paused 1" "${kept[@]}" paused
   "${K[@]}" unpause imp-vol-kiri-paused >/dev/null 2>&1; kiri_rm imp-vol-kiri-paused
   # Exits at once, so it spends its time waiting to be started again.
   "${K[@]}" run -d --name imp-vol-kiri-again --restart always --network none -v imp-vol-cut:/d alpine sh -c 'if [ -e /d/own ]; then echo found; else echo own > /d/own; echo made; fi' >/dev/null
   sleep 3
-  t cut-restarting-in-kiri-refused "Kiri has imp-vol-kiri-again using it" "$KIRI" import "$SRC" volume imp-vol-cut
+  t cut-restarting-in-kiri-refused "Kiribra has imp-vol-kiri-again using it" "$KIRI" import "$SRC" volume imp-vol-cut
   t cut-restarting-kept "own 1" "${kept[@]}" own
   t cut-restarting-finds-its-file "found" bash -c 'n=$("$@" logs imp-vol-kiri-again 2>&1 | wc -l); for i in $(seq 90); do [ "$("$@" logs imp-vol-kiri-again 2>&1 | wc -l)" -gt "$n" ] && break; sleep 1; done; "$@" logs imp-vol-kiri-again 2>&1 | tail -1' _ "${K[@]}"
   kiri_rm imp-vol-kiri-again
   "${K[@]}" run --name imp-vol-kiri-stopped --network none -v imp-vol-cut:/d alpine sh -c 'echo stopped > /d/stopped' >/dev/null
-  t cut-stopped-in-kiri-refused "Kiri has imp-vol-kiri-stopped using it" "$KIRI" import "$SRC" volume imp-vol-cut
+  t cut-stopped-in-kiri-refused "Kiribra has imp-vol-kiri-stopped using it" "$KIRI" import "$SRC" volume imp-vol-cut
   t cut-stopped-kept "stopped 1" "${kept[@]}" stopped
   kiri_rm imp-vol-kiri-stopped
   "${K[@]}" run -d --name imp-vol-kiri-user --network none -v imp-vol-cut:/d alpine sh -c 'echo mine > /d/mine; sleep 1d' >/dev/null
   sleep 1
-  t cut-used-in-kiri-refused "Kiri has imp-vol-kiri-user using it" "$KIRI" import "$SRC" volume imp-vol-cut
-  t cut-used-in-kiri-force-refused "Kiri has imp-vol-kiri-user using it" "$KIRI" import "$SRC" --force volume imp-vol-cut
+  t cut-used-in-kiri-refused "Kiribra has imp-vol-kiri-user using it" "$KIRI" import "$SRC" volume imp-vol-cut
+  t cut-used-in-kiri-force-refused "Kiribra has imp-vol-kiri-user using it" "$KIRI" import "$SRC" --force volume imp-vol-cut
   t cut-used-in-kiri-kept "mine" "${K[@]}" exec imp-vol-kiri-user cat /d/mine
   kiri_rm imp-vol-kiri-user
   out=$(cut "$KIRI" import "$SRC" container imp-vol-cutter)
-  t cut-container-stops "unfinished in Kiri" echo "$out"
+  t cut-container-stops "unfinished in Kiribra" echo "$out"
   t cut-container-not-made "absent" bash -c '"$@" inspect imp-vol-cutter >/dev/null 2>&1 && echo present || echo absent' _ "${K[@]}"
   t cut-repaired "volume imp-vol-cut: done" "$KIRI" import "$SRC" volume imp-vol-cut
   t cut-exact "4294967296 after | a-big b-after |" "${K[@]}" run --rm --network none -v imp-vol-cut:/d:ro alpine sh -c 'echo "$(stat -c %s /d/a-big) $(cat /d/b-after) | $(ls -A /d | tr "\n" " ")|"'
@@ -356,7 +356,7 @@ else
 fi
 "${K[@]}" image inspect "$PINNED" >/dev/null 2>&1 || PINNED_KIRI_OURS=1
 "${S[@]}" create --name imp-digest "$PINNED" >/dev/null
-t digest-listed "a row of its own" bash -c '"$1" import "$2" --list | grep -qxE "  $3(  \(already in Kiri\))?" && echo "a row of its own"' _ "$KIRI" "$SRC" "$PINNED"
+t digest-listed "a row of its own" bash -c '"$1" import "$2" --list | grep -qxE "  $3(  \(already in Kiribra\))?" && echo "a row of its own"' _ "$KIRI" "$SRC" "$PINNED"
 t digest-container-imports "container imp-digest: done" "$KIRI" import "$SRC" container imp-digest
 t digest-kept-on-container "$PINNED" "${K[@]}" inspect -f '{{.Config.Image}}' imp-digest
 t digest-image-by-reference "[\"$PINNED\"]" "${K[@]}" image inspect -f '{{json .RepoTags}}' "$PINNED"

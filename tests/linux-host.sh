@@ -1,6 +1,6 @@
 #!/bin/bash
-# Kiri on a Linux host: runs the Linux build (cargo xtask linux) as the host
-# engine inside a privileged container on the current Docker engine (Kiri
+# Kiribra on a Linux host: runs the Linux build (cargo xtask linux) as the host
+# engine inside a privileged container on the current Docker engine (Kiribra
 # works), then drives it with the docker CLI from inside. No VM is involved:
 # containers run on that Linux kernel directly.
 set -u
@@ -18,11 +18,11 @@ $D rm -f "$N" >/dev/null 2>&1
 $D run -d --name "$N" --privileged --tmpfs /run -v "$N":/var/lib/kiri -v "$N"-store:/root/.local/share/kiri \
   -v "$BIN:/opt/kiri:ro" alpine sh -c 'apk add -q docker-cli curl python3 >/dev/null 2>&1; exec /opt/kiri/kiri daemon' >/dev/null
 # Up to 3 minutes: the container installs its tools with apk first, which can take over a minute.
-up() { for _ in $(seq 180); do $D exec "$N" sh -c 'DOCKER_HOST=unix:///root/.kiri/run/docker.sock docker version' >/dev/null 2>&1 && break; sleep 1; done; }
+up() { for _ in $(seq 180); do $D exec "$N" sh -c 'DOCKER_HOST=unix:///root/.kiribra/run/docker.sock docker version' >/dev/null 2>&1 && break; sleep 1; done; }
 up
 $D cp "$(dirname "$0")/testcontainers-api.py" "$N":/testcontainers-api.py >/dev/null
 $D cp "$(dirname "$0")/lib/images.sh" "$N":/images.sh >/dev/null
-$D exec -e KIRI_TEST_REGISTRY="$KIRI_REG" "$N" sh -c '. /images.sh; export DOCKER_HOST=unix:///root/.kiri/run/docker.sock; kiri_seed_images $KIRI_IMAGES_LINUX_HOST' ||
+$D exec -e KIRI_TEST_REGISTRY="$KIRI_REG" "$N" sh -c '. /images.sh; export DOCKER_HOST=unix:///root/.kiribra/run/docker.sock; kiri_seed_images $KIRI_IMAGES_LINUX_HOST' ||
   echo "linux-host: an image could not be fetched; the checks that run it will fail"
 PASS=0; FAIL=0
 # A failing check that guards a known bug prints which (tests/regressions.tsv).
@@ -30,7 +30,7 @@ PASS=0; FAIL=0
 . "$(dirname "$0")/lib/regressions.sh"
 t() {
   local name=$1 want=$2; shift 2
-  local got; got=$($D exec "$N" sh -c "export DOCKER_HOST=unix:///root/.kiri/run/docker.sock; $*" 2>&1 | tr -d '\r')
+  local got; got=$($D exec "$N" sh -c "export DOCKER_HOST=unix:///root/.kiribra/run/docker.sock; $*" 2>&1 | tr -d '\r')
   if [[ "$got" == *"$want"* ]]; then PASS=$((PASS + 1)); else FAIL=$((FAIL + 1)); printf '  FAIL %s\n    want: %s\n    got:  %s\n' "$name" "$want" "$(echo "$got" | head -3)"; kiri_guard "$name"; fi
 }
 t server-os "linux" "docker version --format '{{.Server.Os}}'"
@@ -53,8 +53,8 @@ t exec "nginx version" "docker exec web nginx -v"
 t port-inspect '{"80/tcp":[{"HostIp":"","HostPort":"18081"}]}' "docker inspect -f '{{json .HostConfig.PortBindings}}' web"
 # What the registry serves now, for update checkers (#257). Asked of
 # KIRI_TEST_REGISTRY, which serves Docker Hub's official images as they are.
-t distribution '"mediaType":"application/vnd.oci.image.index.v1+json"' "curl -s --unix-socket /root/.kiri/run/docker.sock http://d/v1.47/distribution/$KIRI_REG/alpine:3.21/json"
-t distribution-missing "404" "curl -s -o /dev/null -w '%{http_code}' --unix-socket /root/.kiri/run/docker.sock http://d/v1.47/distribution/$KIRI_REG/no-such-image-kiri-test/json"
+t distribution '"mediaType":"application/vnd.oci.image.index.v1+json"' "curl -s --unix-socket /root/.kiribra/run/docker.sock http://d/v1.47/distribution/$KIRI_REG/alpine:3.21/json"
+t distribution-missing "404" "curl -s -o /dev/null -w '%{http_code}' --unix-socket /root/.kiribra/run/docker.sock http://d/v1.47/distribution/$KIRI_REG/no-such-image-kiri-test/json"
 # A copy into a created container, then its start, mounts the same upper
 # dir twice in a row: kernels with overlayfs index on (Arch) refused the
 # second with EBUSY (#227). A renamed directory must survive a commit.
@@ -94,9 +94,9 @@ t exec-session-own "own" "docker exec web sh -c 's=\$(cut -d\" \" -f6 /proc/\$\$
 t cp "copied" "echo copied > /tmp/x && docker cp /tmp/x web:/tmp/x && docker exec web cat /tmp/x"
 # What Testcontainers needs (#222, #121); see tests/testcontainers-api.py.
 for c in version cmd keepalive close follow follow-created timestamps; do
-  t "testcontainers-$c" "ok $c" "for i in \$(seq 60); do command -v python3 >/dev/null && break; sleep 1; done; python3 /testcontainers-api.py /root/.kiri/run/docker.sock $c"
+  t "testcontainers-$c" "ok $c" "for i in \$(seq 60); do command -v python3 >/dev/null && break; sleep 1; done; python3 /testcontainers-api.py /root/.kiribra/run/docker.sock $c"
 done
-t socket-mount-reaches-kiri "Kiri" "docker run --rm -v /root/.kiri/run/docker.sock:/var/run/docker.sock docker:cli docker version --format '{{.Server.Platform.Name}}'"
+t socket-mount-reaches-kiri "Kiribra" "docker run --rm -v /root/.kiribra/run/docker.sock:/var/run/docker.sock docker:cli docker version --format '{{.Server.Platform.Name}}'"
 t stats "web" "docker stats --no-stream --format '{{.Name}}'"
 t network-dns "PONG" "docker network create lhn >/dev/null 2>&1; docker run -d --name db --network lhn redis:7-alpine >/dev/null; sleep 1; docker run --rm --network lhn redis:7-alpine redis-cli -h db ping"
 t bind-host-path "3." "docker run --rm -v /etc:/h:ro alpine cat /h/alpine-release"
@@ -139,11 +139,11 @@ t privileged-host-ptmx "character special file" "mkdir -p /hostdev && mount -t d
 t privileged-devices "DEVS-OK" "docker run --rm --privileged alpine sh -c 'test -c /dev/kmsg && test -c /dev/null && test -L /dev/ptmx && test -c /dev/pts/ptmx && echo DEVS-OK'"
 t privileged-tty "/dev/pts/0" "docker run --rm -t --privileged alpine tty"
 t cleanup "web" "docker rm -f web db dns"
-# Kiri's Stop is the engine's stop, not the user's, as stopping Docker's
+# Kiribra's Stop is the engine's stop, not the user's, as stopping Docker's
 # daemon is: Start, also after the engine restarted, brings back what
 # `always` and `unless-stopped` kept running, but not one the user stopped
-# (docker stop) while Kiri was stopped, which answers 204 (#181, #216).
-POST="curl -s -o /dev/null -w %{http_code} --unix-socket /root/.kiri/run/docker.sock -X POST"
+# (docker stop) while Kiribra was stopped, which answers 204 (#181, #216).
+POST="curl -s -o /dev/null -w %{http_code} --unix-socket /root/.kiribra/run/docker.sock -X POST"
 RUNNING="docker inspect -f '{{.Name}}={{.State.Running}}' ss-us ss-al ss-user ss-no | tr -d / | tr '\\n' ' '"
 BACK="for i in \$(seq 100); do [ \"\$(docker inspect -f '{{.State.Running}}' ss-us ss-al | tr '\\n' ' ')\" = 'true true ' ] && break; sleep 0.2; done; $RUNNING"
 ALL='ss-us ss-al ss-user ss-no ss-al1 ss-al2 ss-al3 ss-al4 ss-al5'
@@ -156,27 +156,27 @@ t ss-docker-stop-while-stopped "204" "$POST http://d/containers/ss-user/stop"
 t ss-start "204" "$POST http://d/kiri/wake"
 t ss-start-brings-back "ss-us=true ss-al=true ss-user=false ss-no=false" "$BACK"
 # Start, then Stop at once, after the engine restarted: the restarts under
-# way stop too, and nothing runs while Kiri is stopped (#181).
+# way stop too, and nothing runs while Kiribra is stopped (#181).
 t ss-stop-again "204" "$POST http://d/kiri/stop"
 $D restart -t 20 "$N" >/dev/null; up
 t ss-start-then-stop "204 204" "echo \$($POST http://d/kiri/wake) \$($POST http://d/kiri/stop)"
 t ss-start-then-stop-none-run "running: 0" "sleep 8; echo running: \$(docker ps -q | wc -l)"
-t ss-start-then-stop-refused "Kiri is stopped" "docker run --rm alpine true"
+t ss-start-then-stop-refused "Kiribra is stopped" "docker run --rm alpine true"
 t ss-restarted-start "204" "$POST http://d/kiri/wake"
 t ss-restarted-brings-back "ss-us=true ss-al=true ss-user=false ss-no=false" "$BACK"
 t ss-restarted-all-always "running: 7" "for i in \$(seq 100); do [ \$(docker ps -q | wc -l) -ge 7 ] && break; sleep 0.2; done; echo running: \$(docker ps -q | wc -l)"
 t ss-cleanup "ss-us" "docker rm -f $ALL"
-# Docker took a subnet Kiri had chosen while Kiri was stopped (or before a
-# network's first container, when Kiri makes its bridge): its docker0 or
-# br-… holds the address, with no carrier yet. Kiri's network moves to a
+# Docker took a subnet Kiribra had chosen while Kiribra was stopped (or before a
+# network's first container, when Kiribra makes its bridge): its docker0 or
+# br-… holds the address, with no carrier yet. Kiribra's network moves to a
 # free subnet, and its containers reach their gateway, DNS and the internet,
 # not the other engine's bridge; one whose --subnet the user gave is refused
 # with the reason (#489). The default bridge's subnet is read, not assumed:
 # this engine's container is itself on a 172.17 bridge.
 GW="docker network inspect -f '{{(index .IPAM.Config 0).Gateway}}'"
 t taken-setup "ok" "docker network create lh489 >/dev/null && docker network create --subnet 10.89.240.0/24 lh489u >/dev/null && echo ok"
-OLD_BRIDGE=$($D exec "$N" sh -c "DOCKER_HOST=unix:///root/.kiri/run/docker.sock $GW bridge")
-OLD_POOL=$($D exec "$N" sh -c "DOCKER_HOST=unix:///root/.kiri/run/docker.sock $GW lh489")
+OLD_BRIDGE=$($D exec "$N" sh -c "DOCKER_HOST=unix:///root/.kiribra/run/docker.sock $GW bridge")
+OLD_POOL=$($D exec "$N" sh -c "DOCKER_HOST=unix:///root/.kiribra/run/docker.sock $GW lh489")
 t taken-stop "204" "$POST http://d/kiri/stop"
 t taken-by-other-bridges "ok" "apk add -q iproute2 >/dev/null 2>&1; for b in docker489:$OLD_BRIDGE/16 br489:$OLD_POOL/16 br489u:10.89.240.1/24; do ip link add \${b%%:*} type bridge && ip addr add \${b#*:} dev \${b%%:*} && ip link set \${b%%:*} up || exit; done; echo ok"
 t taken-wake "204" "$POST http://d/kiri/wake"
@@ -227,7 +227,7 @@ t crash-cleanup "cr-always" "docker rm -f cr-always cr-unless-stopped cr-user"
 # inherited the allocator's lock held by that thread), and so did its stop,
 # exec and rm. A volume of 20,000 files makes each measurement take a while;
 # 100 starts run beside four loops of system df, each start given 15 s.
-t starts-beside-df "stuck 0" "docker run --rm -v dfwalk:/d alpine sh -c 'cd /d; for i in \$(seq 200); do mkdir \$i; for j in \$(seq 100); do : > \$i/\$j; done; done'; S=/root/.kiri/run/docker.sock; rm -f /tmp/dfstop; l() { while [ ! -e /tmp/dfstop ]; do curl -s -m 30 -o /dev/null --unix-socket \$S http://d/system/df; done; }; l & l & l & l & s=0; for i in \$(seq 100); do timeout -s KILL 15 docker run -d --name dfs\$i alpine true >/dev/null 2>&1; [ \$? = 137 ] && s=\$((s+1)); done; touch /tmp/dfstop; wait; for i in \$(seq 100); do timeout -s KILL 5 docker rm -f dfs\$i >/dev/null 2>&1; done; docker volume rm dfwalk >/dev/null; echo stuck \$s"
+t starts-beside-df "stuck 0" "docker run --rm -v dfwalk:/d alpine sh -c 'cd /d; for i in \$(seq 200); do mkdir \$i; for j in \$(seq 100); do : > \$i/\$j; done; done'; S=/root/.kiribra/run/docker.sock; rm -f /tmp/dfstop; l() { while [ ! -e /tmp/dfstop ]; do curl -s -m 30 -o /dev/null --unix-socket \$S http://d/system/df; done; }; l & l & l & l & s=0; for i in \$(seq 100); do timeout -s KILL 15 docker run -d --name dfs\$i alpine true >/dev/null 2>&1; [ \$? = 137 ] && s=\$((s+1)); done; touch /tmp/dfstop; wait; for i in \$(seq 100); do timeout -s KILL 5 docker rm -f dfs\$i >/dev/null 2>&1; done; docker volume rm dfwalk >/dev/null; echo stuck \$s"
 # A start whose first process never gets its root in place (here frozen by
 # the cgroup freezer from its first instruction, as a child that hung there
 # was) held the container's lifecycle lock for good: rm -f, kill and stop
@@ -254,7 +254,7 @@ t agent-dies-beside-stuck-start "answered, leftovers: none" "cg=\$(docker run -d
 # writable layer, also once another container has started and after the
 # next start, which finds a readable but shorter list (#438).
 ST=/root/.local/share/kiri
-CJ="export DOCKER_HOST=unix:///root/.kiri/run/docker.sock"
+CJ="export DOCKER_HOST=unix:///root/.kiribra/run/docker.sock"
 t cj-setup "ok" "docker run --name cj1 -v cjv1:/v alpine sh -c 'echo line-one; echo precious > /data' >/dev/null && docker run --name cj2 -v cjv2:/v alpine sh -c 'echo line-two; echo precious > /data' >/dev/null && echo ok"
 CJ_IDS=$($D exec "$N" sh -c "$CJ; docker inspect -f '{{.Id}}' cj1 cj2" | tr '\n' ' ')
 $D stop -t 20 "$N" >/dev/null
@@ -305,10 +305,10 @@ t ij-cleanup "done" "rm -f $ST/images.json.corrupt-*; echo done"
 t ij-warning-gone "[]" "docker info --format '{{json .Warnings}}'"
 # Docker on the same host (#247): its firewall makes iptables' FORWARD
 # policy drop, and a forwarded packet must pass every chain on the hook, so
-# Kiri's own table accepting it was not enough and containers had no
+# Kiribra's own table accepting it was not enough and containers had no
 # internet. Made here as Docker makes it, in the engine's network namespace
 # while the engine runs, with a container behind a bridge of "Docker's"
-# (docker0, a namespace serving on port 8080). Kiri's containers reach the
+# (docker0, a namespace serving on port 8080). Kiribra's containers reach the
 # internet again through rules of its own in DOCKER-USER, and still not
 # Docker's container: no new connection into Docker's bridges passes.
 t dockerfw-setup "ok" "apk add -q iptables ip6tables iproute2 >/dev/null 2>&1 && for t in iptables ip6tables; do \$t -N DOCKER-USER && \$t -I FORWARD -j DOCKER-USER && \$t -P FORWARD DROP || exit 1; done && ip netns add dk && ip link add docker0 type bridge && ip link add dkh type veth peer name dkp && ip link set dkp netns dk && ip link set dkh master docker0 && ip addr add 172.31.250.1/24 dev docker0 && ip link set docker0 up && ip link set dkh up && ip -n dk addr add 172.31.250.2/24 dev dkp && ip -n dk link set dkp up && ip -n dk route add default via 172.31.250.1 && (ip netns exec dk python3 -m http.server 8080 >/dev/null 2>&1 &) && echo ok"
@@ -318,8 +318,8 @@ t dockerfw-docker-reachable "Directory listing" "wget -qO- -T 3 http://172.31.25
 t dockerfw-docker-kept-apart "kept apart" "docker run --rm alpine sh -c 'wget -qO- -T 3 http://172.31.250.2:8080/ >/dev/null 2>&1 && echo reached || echo kept apart'"
 t dockerfw-cleanup "ok" "pkill -f '[h]ttp.server 8080'; ip netns del dk; ip link del docker0; for t in iptables ip6tables; do \$t -P FORWARD ACCEPT; \$t -D FORWARD -j DOCKER-USER; \$t -F DOCKER-USER; \$t -X DOCKER-USER; done; echo ok"
 # A FORWARD policy of drop without Docker (#247): set by hand, or by ufw.
-# Kiri's rules go at the top of FORWARD, for IPv4 and IPv6, and still let
-# no Kiri container into another program's bridge (virbr0, a namespace
+# Kiribra's rules go at the top of FORWARD, for IPv4 and IPv6, and still let
+# no Kiribra container into another program's bridge (virbr0, a namespace
 # serving on port 8080, as libvirt's guests sit behind it).
 t fwdrop-setup "ok" "apk add -q nftables >/dev/null 2>&1; for t in iptables ip6tables; do \$t -P FORWARD DROP || exit 1; done && ip netns add vm && ip link add virbr0 type bridge && ip link add vmh type veth peer name vmp && ip link set vmp netns vm && ip link set vmh master virbr0 && ip addr add 172.31.251.1/24 dev virbr0 && ip link set virbr0 up && ip link set vmh up && ip -n vm addr add 172.31.251.2/24 dev vmp && ip -n vm link set vmp up && ip -n vm route add default via 172.31.251.1 && (ip netns exec vm python3 -m http.server 8080 >/dev/null 2>&1 &) && echo ok"
 t fwdrop-internet "Example Domain" "docker run --rm alpine wget -qO- -T 10 http://example.com"
@@ -332,13 +332,13 @@ t fwdrop-ufw-setup "ok" "for t in iptables ip6tables; do \$t -F FORWARD; \$t -P 
 t fwdrop-ufw-internet "Example Domain" "docker run --rm alpine wget -qO- -T 10 http://example.com"
 t fwdrop-ufw-reload "Example Domain" "ufw reload >/dev/null; docker run --rm alpine wget -qO- -T 10 http://example.com"
 t fwdrop-ufw-rules "3 3" "echo \$(iptables -S FORWARD | grep -c kiri) \$(ip6tables -S FORWARD | grep -c kiri)"
-# An nftables chain of the administrator's own with policy drop: Kiri does
+# An nftables chain of the administrator's own with policy drop: Kiribra does
 # not change it, and docker info says which rules let its containers through.
 t fwdrop-nft-warns "nft insert rule inet own forward iifname" "ufw --force disable >/dev/null; nft add table inet own && nft add chain inet own forward '{ type filter hook forward priority 0; policy drop; }' && sleep 1 && docker info --format '{{json .Warnings}}'"
 t fwdrop-nft-advice-works "Example Domain" "nft insert rule inet own forward oifname 'kiri*' accept && nft insert rule inet own forward iifname 'kiri*' ct state established,related accept && nft insert rule inet own forward iifname 'kiri*' oifname eth0 accept && docker run --rm alpine wget -qO- -T 10 http://example.com"
 t fwdrop-nft-warning-gone "gone" "docker info --format '{{json .Warnings}}' | grep -q 'inet own' && echo still there || echo gone"
 # A flush of the whole ruleset (nftables.service starting or reloading)
-# takes Kiri's own table: it is built again, or containers had no NAT.
+# takes Kiribra's own table: it is built again, or containers had no NAT.
 t fwdrop-flush-rebuilt "Example Domain" "nft flush ruleset; sleep 1; docker run --rm alpine wget -qO- -T 10 http://example.com"
 t fwdrop-cleanup "ok" "pkill -f '[h]ttp.server 8080'; ip netns del vm; ip link del virbr0; echo ok"
 $D rm -f "$N" >/dev/null
@@ -381,7 +381,7 @@ else
     python3 /mkimage.py
     mkdir -p /var/lib/kiri && mount -t tmpfs t /var/lib/kiri && mount -t tmpfs t /root && ip link set lo up
     /opt/kiri/kiri daemon > /tmp/engine.log 2>&1 &
-    export DOCKER_HOST=unix:///root/.kiri/run/docker.sock
+    export DOCKER_HOST=unix:///root/.kiribra/run/docker.sock
     for i in $(seq 120); do docker version >/dev/null 2>&1 && break; sleep 0.25; done
     docker load -i /devices.tar >/dev/null && docker create kiri-nodes:1 >/dev/null || exit
     cd /var/lib/kiri/layers/*/ && for f in dev/kiri-null dev/kiri-loop pipe after; do printf "%s=" $f; stat -c %F $f 2>/dev/null || echo none; done | tr "\n" " "

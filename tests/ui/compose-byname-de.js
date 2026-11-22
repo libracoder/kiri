@@ -1,6 +1,6 @@
 // parity: macos windows linux
 // lang: de
-// A project Kiri manages by name (Compose can't list its file's variables): one
+// A project Kiribra manages by name (Compose can't list its file's variables): one
 // notice on the row, the page and where the plan would be; its services and
 // state from Docker; the file read-only, with no Apply, Discard or plan, and no
 // plan asked for. Its actions by name still work.
@@ -8,7 +8,7 @@ const R = [];
 const t = (name, fn) => { try { fn(); R.push("PASS " + name); } catch (e) { R.push("FAIL " + name + ": " + e.message); } };
 const eq = (a, b, m) => { if (JSON.stringify(a) !== JSON.stringify(b)) throw new Error(m + ": got " + JSON.stringify(a) + " want " + JSON.stringify(b)); };
 const click = (el) => el.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
-const NOTE = "Kiri kann die Variablen dieser Datei nicht prüfen und verwaltet dieses Projekt daher über seinen Namen. Wende Änderungen im Terminal an.", EN = "Kiri can't check this file's variables, so it manages this project by name. Apply changes from a terminal.";
+const NOTE = "Kiribra kann die Variablen dieser Datei nicht prüfen und verwaltet dieses Projekt daher über seinen Namen. Wende Änderungen im Terminal an.", EN = "Kiribra can't check this file's variables, so it manages this project by name. Apply changes from a terminal.";
 const NAMES = "Von Docker angezeigte Namen können geheime Werte enthalten.";
 ui.vm = "running";
 kiri.on({ type: "lists", containers: [{ Id: "d1", Names: ["/loose-db-1"], Image: "postgres:16", State: "running", Status: "Up 1 hour", Created: 1, Ports: [], Labels: { "com.docker.compose.project": "loose", "com.docker.compose.service": "db" } }], images: [], volumes: [], networks: [] });

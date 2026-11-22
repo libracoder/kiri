@@ -4,7 +4,7 @@
 // unless tests/ui/parity-allow.txt says why.
 ui.vm = "running";
 ui.containers.push({ Id: "k8s1", Names: ["/kiri-k8s"], Image: "rancher/k3s:v1.37.1-k3s1", State: "running", Ports: [], Labels: { "dev.kiri.k8s": "1" }, KiriStartedAt: Date.now() / 1000 - 600 });
-kiri.on({ type: "k8s", state: "running", ready: true, context: "kiri-dev",
+kiri.on({ type: "k8s", state: "running", ready: true, context: "kiribra-dev",
   services: [{ ns: "default", name: "web", type: "ClusterIP", clusterIP: "10.43.42.10", ports: [{ port: 80, targetPort: 80, protocol: "TCP" }], selector: { app: "web" }, ingress: [], created: "2026-10-28T00:00:00Z" }],
   pods: [{ ns: "default", name: "web-5fc9", ip: "10.42.0.17", labels: { app: "web" }, owner: "ReplicaSet", status: "Running", phase: "Running", ready: "1/1", allReady: true, restarts: 0, created: "2026-10-28T00:00:00Z",
     containers: [{ name: "c", image: "nginx", ready: true, restarts: 0, state: "running", ports: [{ containerPort: 80, protocol: "TCP" }] }] }] });

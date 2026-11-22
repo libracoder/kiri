@@ -29,7 +29,7 @@ t("Sign in on Docker Hub starts docker's own sign-in and opens under its row, ke
 t("the one-time code shows with Copy and Open Docker Hub, and says the password goes to Docker", () => {
   web("docker", "code", { code: "WDJB-MJHT", url: "https://login.docker.com/activate" });
   eq([panel().querySelector(".wcode b").textContent, panel().querySelector("[data-webopen]").textContent.trim()], ["WDJB-MJHT", "Open Docker Hub"], "code");
-  eq(/go to Docker, not Kiri/.test(panel().textContent), true, "safe line");
+  eq(/go to Docker, not Kiribra/.test(panel().textContent), true, "safe line");
   sent.length = 0;
   panel().querySelector("[data-webcopy]").click();
   eq(sent.map((m) => [m.type, m.name]), [["copy", "WDJB-MJHT"]], "copied");

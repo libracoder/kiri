@@ -1,4 +1,4 @@
-//! Moving to Kiri from OrbStack or Docker Desktop: images, volumes and
+//! Moving to Kiribra from OrbStack or Docker Desktop: images, volumes and
 //! containers, copied through the docker CLI so each engine speaks its own
 //! API. The source is only read: `docker save` for images, `inspect` for
 //! containers, and for a volume `docker cp` out of a container that mounts
@@ -14,14 +14,14 @@ use serde_json::{Value, json};
 
 use crate::client;
 
-/// The engines Kiri can import from: docker context name, label. Docker
+/// The engines Kiribra can import from: docker context name, label. Docker
 /// Desktop's context has the same name on Windows; OrbStack is Mac-only.
 pub const SOURCES: &[(&str, &str)] = if cfg!(windows) { &[("desktop-linux", "Docker Desktop")] } else { &[("orbstack", "OrbStack"), ("desktop-linux", "Docker Desktop")] };
 
 // kiri-win builds this file too, where docker_cli() gives a String.
 #[allow(clippy::useless_conversion)]
 fn docker() -> io::Result<PathBuf> {
-    client::docker_cli().map(PathBuf::from).ok_or_else(|| io::Error::other("no docker CLI found (Kiri bundles one)"))
+    client::docker_cli().map(PathBuf::from).ok_or_else(|| io::Error::other("no docker CLI found (Kiribra bundles one)"))
 }
 
 /// The docker CLI, run without a console window of its own (Windows opens
@@ -80,7 +80,7 @@ fn anonymous(name: &str) -> bool {
     name.len() == 64 && name.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// What the source has, and which of it Kiri already has. Containers come
+/// What the source has, and which of it Kiribra already has. Containers come
 /// oldest first, the order they were made in, so one that joins another's
 /// network (`container:`) comes after that one.
 pub fn inventory(source: &str) -> io::Result<Value> {
@@ -111,13 +111,13 @@ pub fn inventory(source: &str) -> io::Result<Value> {
         if images.iter().any(|i| i["name"] == name.as_str()) || (name.contains('@') && !used.contains(&name)) {
             continue;
         }
-        // Kiri lists an image pinned by digest by that reference, which
+        // Kiribra lists an image pinned by digest by that reference, which
         // `image ls` can't show: it is asked for by name.
         let have = kiri_images.contains(&name) || (name.contains('@') && has(kiri, "image", &name));
         images.push(json!({"name": name, "size": v["Size"], "have": have}));
     }
     let names: Vec<String> = json_lines(ctx, &["volume", "ls", "--format", "{{json .}}"])?.into_iter().filter_map(|v| v["Name"].as_str().map(str::to_owned)).collect();
-    // "Already in Kiri" only when Kiri's copy has files in and was finished:
+    // "Already in Kiribra" only when Kiribra's copy has files in and was finished:
     // an empty one, left by a container's create, or one a copy stopped
     // half-way in, is offered again. Without an image to look with, none is
     // taken as there.
@@ -233,7 +233,7 @@ fn pipe(mut from: Command, mut to: Command, from_ctx: &str, retar: impl FnOnce(&
 
 /// `docker --context src save IMAGE | docker --context kiri load`. What
 /// `docker save` writes for an image pinned by digest (`repo@sha256:…`)
-/// has no name, so Kiri would know it only by its id and the container
+/// has no name, so Kiribra would know it only by its id and the container
 /// that names it would not find it (#377): its manifest gets the name.
 pub fn image(source: &str, name: &str) -> io::Result<()> {
     let ctx = known(source)?;
@@ -359,7 +359,7 @@ fn retar(mut from: impl Read, mut to: impl Write, name: Option<&str>) -> io::Res
     }
 }
 
-/// Official images with `tar` and `sh`: one of these does Kiri's half of a
+/// Official images with `tar` and `sh`: one of these does Kiribra's half of a
 /// volume copy.
 const TAR_IMAGES: [&str; 4] = ["alpine", "busybox", "debian", "ubuntu"];
 
@@ -377,8 +377,8 @@ fn official(repo_digest: &str) -> bool {
     homes.iter().any(|home| repo.strip_prefix(home).is_some_and(|base| TAR_IMAGES.contains(&base)))
 }
 
-/// The name to run Kiri's half of a volume copy by: a `repo:tag` of the
-/// first of `images` (Kiri's image list: `RepoTags`, `RepoDigests`) whose
+/// The name to run Kiribra's half of a volume copy by: a `repo:tag` of the
+/// first of `images` (Kiribra's image list: `RepoTags`, `RepoDigests`) whose
 /// own record shows it was pulled under that name from an official
 /// repository ([`official`]). Run by that name, it is that record.
 fn pick_helper(images: &[Value]) -> Option<String> {
@@ -392,7 +392,7 @@ fn pick_helper(images: &[Value]) -> Option<String> {
     })
 }
 
-/// [`pick_helper`] of the images Kiri has, read once from its API.
+/// [`pick_helper`] of the images Kiribra has, read once from its API.
 fn helper_in_kiri() -> io::Result<Option<String>> {
     let r = client::request("GET", "/images/json", None)?;
     if !r.ok() {
@@ -401,18 +401,18 @@ fn helper_in_kiri() -> io::Result<Option<String>> {
     Ok(r.json().as_array().and_then(|images| pick_helper(images)))
 }
 
-/// When Kiri last failed to fetch a helper: tried once per import, not
+/// When Kiribra last failed to fetch a helper: tried once per import, not
 /// once per volume.
 static PULL_FAILED: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
 
-/// [`helper_in_kiri`], else busybox fetched by Kiri: from the public mirror,
+/// [`helper_in_kiri`], else busybox fetched by Kiribra: from the public mirror,
 /// else from Docker Hub when no image of the person's is called that.
 /// Nothing is taken from the source.
 fn helper() -> io::Result<String> {
     if let Some(name) = helper_in_kiri()? {
         return Ok(name);
     }
-    let none = || io::Error::other("Kiri needs one small official image to unpack volumes with: pull alpine or busybox in Kiri (docker pull alpine) and import again. A re-tagged or loaded copy does not count");
+    let none = || io::Error::other("Kiribra needs one small official image to unpack volumes with: pull alpine or busybox in Kiribra (docker pull alpine) and import again. A re-tagged or loaded copy does not count");
     let mut failed = PULL_FAILED.lock().unwrap_or_else(|e| e.into_inner());
     if failed.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(60)) {
         return Err(none());
@@ -431,10 +431,10 @@ fn helper() -> io::Result<String> {
 /// The label on the containers an import makes for itself.
 const HELPER: &str = "dev.kiri.import-helper=1";
 
-/// In a Kiri volume while a copy fills it; gone once the copy is whole.
+/// In a Kiribra volume while a copy fills it; gone once the copy is whole.
 const UNFINISHED: &str = ".kiri-import-unfinished";
 
-/// What a Kiri volume holds, for an import.
+/// What a Kiribra volume holds, for an import.
 #[derive(Debug, PartialEq, Clone, Copy)]
 enum Filled {
     /// Nothing: a copy may go in.
@@ -445,7 +445,7 @@ enum Filled {
     Yes,
 }
 
-/// How full each of `names`, volumes Kiri has, is: one helper mounts them all
+/// How full each of `names`, volumes Kiribra has, is: one helper mounts them all
 /// read-only and says which have files in and which a copy left unfinished.
 fn kiri_states(names: &[String], img: &str) -> io::Result<Vec<(String, Filled)>> {
     let mut cmd = cli()?;
@@ -475,7 +475,7 @@ fn users(ctx: &str, name: &str) -> io::Result<Vec<String>> {
     Ok(users.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect())
 }
 
-/// Every container Kiri has with the volume `name`, in any state (a paused
+/// Every container Kiribra has with the volume `name`, in any state (a paused
 /// one, one waiting on its restart policy, a stopped one all write to it
 /// again): (name, whether it is an import's own helper).
 fn mounting(ctx: &str, name: &str) -> io::Result<Vec<(String, bool)>> {
@@ -483,7 +483,7 @@ fn mounting(ctx: &str, name: &str) -> io::Result<Vec<(String, bool)>> {
     Ok(rows.iter().filter_map(|v| Some((v["name"].as_str()?.to_owned(), v["helper"] == "1"))).collect())
 }
 
-/// Why a volume a copy left unfinished in Kiri is not emptied while
+/// Why a volume a copy left unfinished in Kiribra is not emptied while
 /// containers there have it: what they wrote in it since would go.
 fn in_use_in_kiri(name: &str, users: &[(String, bool)]) -> Option<String> {
     if users.is_empty() {
@@ -491,11 +491,11 @@ fn in_use_in_kiri(name: &str, users: &[(String, bool)]) -> Option<String> {
     }
     let theirs: Vec<&str> = users.iter().filter(|(_, helper)| !helper).map(|(n, _)| n.as_str()).collect();
     if theirs.is_empty() {
-        return Some(format!("another import of {name} is running in Kiri: let it finish, then import again if it did not"));
+        return Some(format!("another import of {name} is running in Kiribra: let it finish, then import again if it did not"));
     }
     let them = if theirs.len() == 1 { "it" } else { "them" };
     Some(format!(
-        "{name} holds an unfinished copy in Kiri, and Kiri has {} using it: importing it again would replace what is in it. Remove {them} in Kiri (or remove the volume in Kiri) and import again; importing a container again brings its volumes first",
+        "{name} holds an unfinished copy in Kiribra, and Kiribra has {} using it: importing it again would replace what is in it. Remove {them} in Kiribra (or remove the volume in Kiribra) and import again; importing a container again brings its volumes first",
         theirs.join(", ")
     ))
 }
@@ -519,7 +519,7 @@ pub fn volume(source: &str, name: &str) -> io::Result<()> {
 }
 
 /// [`volume`]; `force` copies it even while a running container on the
-/// source uses it. A volume Kiri already has files in is left as it is;
+/// source uses it. A volume Kiribra already has files in is left as it is;
 /// one a copy left unfinished is emptied and copied again.
 pub fn volume_with(source: &str, name: &str, force: bool) -> io::Result<()> {
     let ctx = known(source)?;
@@ -529,8 +529,8 @@ pub fn volume_with(source: &str, name: &str, force: bool) -> io::Result<()> {
         return Err(io::Error::other(format!("{ctx}: no such volume: {name}")));
     }
     let there = has(kiri, "volume", name);
-    let already = || io::Error::new(io::ErrorKind::AlreadyExists, format!("Kiri already has {name} with files in it, and it is left as it is"));
-    // Asked first with an image Kiri has, before anything is fetched.
+    let already = || io::Error::new(io::ErrorKind::AlreadyExists, format!("Kiribra already has {name} with files in it, and it is left as it is"));
+    // Asked first with an image Kiribra has, before anything is fetched.
     let kiri_img = helper_in_kiri()?;
     let mut state = match (&kiri_img, there) {
         (_, false) => Some(Filled::No),
@@ -553,7 +553,7 @@ pub fn volume_with(source: &str, name: &str, force: bool) -> io::Result<()> {
     if state == Some(Filled::Yes) {
         return Err(already());
     }
-    // Emptying it is safe only while no container in Kiri has it, in any
+    // Emptying it is safe only while no container in Kiribra has it, in any
     // state; --force is about the source and does not change that. A helper
     // of this import that looked into it may take a moment to go.
     if state == Some(Filled::Unfinished) {
@@ -602,11 +602,11 @@ pub fn volume_with(source: &str, name: &str, force: bool) -> io::Result<()> {
     }
     let copied = copy_volume(ctx, &format!("{reader}:{at}/."), name, &img);
     let _ = cli()?.args(["--context", ctx, "rm", "-v", &reader]).stdout(Stdio::null()).stderr(Stdio::null()).status();
-    copied.map_err(|e| io::Error::other(format!("{e}; {name} is unfinished in Kiri: the next import empties it and copies it again, replacing what is in it then")))
+    copied.map_err(|e| io::Error::other(format!("{e}; {name} is unfinished in Kiribra: the next import empties it and copies it again, replacing what is in it then")))
 }
 
 /// `docker cp` out of the reader on the source, through [`retar`], untarred
-/// into the volume by a helper on Kiri that removes itself. The helper
+/// into the volume by a helper on Kiribra that removes itself. The helper
 /// marks the volume unfinished first (emptying what an unfinished copy
 /// left), and the mark goes only once every part of the copy succeeded.
 fn copy_volume(ctx: &str, from: &str, name: &str, img: &str) -> io::Result<()> {
@@ -631,7 +631,7 @@ fn copy_volume(ctx: &str, from: &str, name: &str, img: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// The container, made again in Kiri from the source's `inspect`, stopped.
+/// The container, made again in Kiribra from the source's `inspect`, stopped.
 /// One brought already as the network another joins, earlier in the same
 /// run of the window, is done.
 pub fn container(source: &str, name: &str) -> io::Result<()> {
@@ -650,7 +650,7 @@ pub fn container(source: &str, name: &str) -> io::Result<()> {
 static BROUGHT: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
 
 /// [`container`]: its image, its volumes with their files (named and
-/// anonymous, unless Kiri has them with files already; `force` as for
+/// anonymous, unless Kiribra has them with files already; `force` as for
 /// [`volume_with`]), the container whose network it joins and its own
 /// networks are brought first. `joining`: the containers waiting on this
 /// one for its network, so a loop stops.
@@ -665,7 +665,7 @@ pub fn container_with(source: &str, name: &str, force: bool, joining: &[&str]) -
     if !has(kiri, "image", &image) {
         self::image(source, &image)?;
     }
-    // Else create would make them in Kiri, empty.
+    // Else create would make them in Kiribra, empty.
     for v in volumes_of(&info) {
         match volume_with(source, &v, force) {
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
@@ -675,7 +675,7 @@ pub fn container_with(source: &str, name: &str, force: bool, joining: &[&str]) -
     let mut mode = info["HostConfig"]["NetworkMode"].as_str().unwrap_or("default").to_owned();
     let mut networks = serde_json::Map::new();
     if let Some(target) = mode.strip_prefix("container:") {
-        // The source's id for it is no name in Kiri; its own name is, once
+        // The source's id for it is no name in Kiribra; its own name is, once
         // it is there.
         let target = json_lines(ctx, &["inspect", "--type", "container", "--format", "{{json .Name}}", target])?
             .first()
@@ -692,7 +692,7 @@ pub fn container_with(source: &str, name: &str, force: bool, joining: &[&str]) -
         if !["bridge", "host", "none", "default"].contains(&net.as_str()) {
             let _ = cli()?.args(["--context", kiri, "network", "create", net]).stdout(Stdio::null()).stderr(Stdio::null()).status();
         }
-        // The source's own short ID is no name in Kiri.
+        // The source's own short ID is no name in Kiribra.
         let short = info["Id"].as_str().unwrap_or("").get(..12).unwrap_or("").to_owned();
         let aliases: Vec<&Value> = ep["Aliases"].as_array().into_iter().flatten().filter(|a| a.as_str() != Some(short.as_str())).collect();
         networks.insert(net.clone(), json!({"Aliases": aliases}));
@@ -715,12 +715,12 @@ fn volumes_of(info: &Value) -> Vec<String> {
     names
 }
 
-/// What Kiri's create takes of the source's `inspect`: command, environment,
+/// What Kiribra's create takes of the source's `inspect`: command, environment,
 /// labels, ports, mounts, restart policy, devices, DNS, healthcheck, limits
-/// and the rest Kiri keeps, with `mode` its network mode in Kiri and
+/// and the rest Kiribra keeps, with `mode` its network mode in Kiribra and
 /// `networks` its endpoints. Anonymous volumes (`-v /path`, an image's
-/// VOLUME) are named, as the copies already in Kiri are; else Kiri would make
-/// new empty ones. Beside `container:` mode, what Docker and Kiri refuse
+/// VOLUME) are named, as the copies already in Kiribra are; else Kiribra would make
+/// new empty ones. Beside `container:` mode, what Docker and Kiribra refuse
 /// there is left out: the source fills some of it in itself (#375).
 fn create_body(info: &Value, mode: &str, networks: Value) -> Value {
     let (cfg, hc) = (&info["Config"], &info["HostConfig"]);
@@ -820,7 +820,7 @@ enum Ask<'a> {
 
 /// The source named (if any), what to do, and whether `--force` copies
 /// volumes that running containers on the source use. A kind without
-/// exactly one name, `--list` with an item or with `--force`, or a flag Kiri
+/// exactly one name, `--list` with an item or with `--force`, or a flag Kiribra
 /// doesn't know is a usage error, never "import everything".
 fn parse<'a>(args: &[&'a str]) -> io::Result<(Option<&'a str>, Ask<'a>, bool)> {
     let usage = || io::Error::other(USAGE);
@@ -848,7 +848,7 @@ fn parse<'a>(args: &[&'a str]) -> io::Result<(Option<&'a str>, Ask<'a>, bool)> {
 }
 
 /// `kiri import [orbstack|desktop-linux] [--list | [--force] [image|volume|container NAME]]`:
-/// one item, or every image, named volume and container Kiri lacks.
+/// one item, or every image, named volume and container Kiribra lacks.
 pub fn run(args: &[String]) -> io::Result<()> {
     if args.iter().any(|a| a == "-h" || a == "--help") {
         println!("{USAGE}");
@@ -874,7 +874,7 @@ pub fn run(args: &[String]) -> io::Result<()> {
         for k in ["images", "volumes", "containers"] {
             println!("{k}:");
             for v in list(k) {
-                println!("  {}{}", v["name"].as_str().unwrap_or(""), if v["have"] == true { "  (already in Kiri)" } else { "" });
+                println!("  {}{}", v["name"].as_str().unwrap_or(""), if v["have"] == true { "  (already in Kiribra)" } else { "" });
             }
         }
         return Ok(());
@@ -974,7 +974,7 @@ mod tests {
         assert_eq!(parse(&["podman"]).unwrap(), (Some("podman"), Ask::Everything, false));
     }
 
-    // Kiri's half of a volume copy runs only an image the engine pulled
+    // Kiribra's half of a volume copy runs only an image the engine pulled
     // from an official repository, as its repo digests show: never one
     // that only has a name like one, wherever it came from.
     #[test]
@@ -1003,7 +1003,7 @@ mod tests {
         for bad in ["busybox", "busybox:1", "busybox@sha256:abc", &format!("busybox@sha512:{}", "a".repeat(64)), &format!("busybox@sha256:{}", "A".repeat(64))] {
             assert!(!official(bad), "{bad}");
         }
-        // Kiri's image list: one record per name, each with its own digests.
+        // Kiribra's image list: one record per name, each with its own digests.
         let rec = |name: &str, digests: &[String]| json!({"Id": format!("sha256:{}", "c".repeat(64)), "RepoTags": [name], "RepoDigests": digests});
         let records = [
             // Untagged: a load or build without a name.
@@ -1049,7 +1049,7 @@ mod tests {
         assert!(super::in_use("pg", "Docker Desktop", &["db".into(), "backup".into()]).unwrap().starts_with("pg is in use by db, backup, running on Docker Desktop: a copy taken now can be cut off mid-write. Stop them there"));
     }
 
-    // An unfinished volume in Kiri is not emptied while any container there
+    // An unfinished volume in Kiribra is not emptied while any container there
     // has it; only our own helpers there means another import is at it.
     #[test]
     fn refuses_to_empty_a_volume_kiri_has_in_use() {
@@ -1057,16 +1057,16 @@ mod tests {
         assert_eq!(in_use_in_kiri("pg", &[]), None);
         assert_eq!(
             in_use_in_kiri("pg", &[("db".into(), false)]).unwrap(),
-            "pg holds an unfinished copy in Kiri, and Kiri has db using it: importing it again would replace what is in it. Remove it in Kiri (or remove the volume in Kiri) and import again; importing a container again brings its volumes first"
+            "pg holds an unfinished copy in Kiribra, and Kiribra has db using it: importing it again would replace what is in it. Remove it in Kiribra (or remove the volume in Kiribra) and import again; importing a container again brings its volumes first"
         );
         let mixed = in_use_in_kiri("pg", &[("db".into(), false), ("kiri-import-pg".into(), true), ("backup".into(), false)]).unwrap();
-        assert!(mixed.contains("Kiri has db, backup using it") && mixed.contains("Remove them in Kiri"), "{mixed}");
-        assert_eq!(in_use_in_kiri("pg", &[("x".into(), true), ("y".into(), true)]).unwrap(), "another import of pg is running in Kiri: let it finish, then import again if it did not");
+        assert!(mixed.contains("Kiribra has db, backup using it") && mixed.contains("Remove them in Kiribra"), "{mixed}");
+        assert_eq!(in_use_in_kiri("pg", &[("x".into(), true), ("y".into(), true)]).unwrap(), "another import of pg is running in Kiribra: let it finish, then import again if it did not");
     }
 
-    // #375: beside `container:` mode, what Kiri refuses is left out (the
+    // #375: beside `container:` mode, what Kiribra refuses is left out (the
     // source fills in a hostname and the image's ports itself); devices,
-    // DNS, healthcheck and the rest Kiri keeps come along.
+    // DNS, healthcheck and the rest Kiribra keeps come along.
     #[test]
     fn builds_the_create_body() {
         use serde_json::{Value, json};
@@ -1131,7 +1131,7 @@ mod tests {
     }
 
     // #377: an image pinned by digest gets its reference in the archive's
-    // manifest, so Kiri knows it by that name; the rest passes unchanged.
+    // manifest, so Kiribra knows it by that name; the rest passes unchanged.
     // (The tar crate is a test dependency of crates/kiri only.)
     #[cfg(not(windows))]
     #[test]

@@ -1,8 +1,8 @@
-# Testing Kiri for Windows on Arm
+# Testing Kiribra for Windows on Arm
 
-Kiri for Windows on Arm is the same bundle and MSI as the x86-64 one, built
+Kiribra for Windows on Arm is the same bundle and MSI as the x86-64 one, built
 with `--arch arm64`. It is arm64 all the way down: `kiri-win.exe` for
-`aarch64-pc-windows-msvc`, the engine and Kiri Linux for aarch64 Linux in
+`aarch64-pc-windows-msvc`, the engine and Kiribra Linux for aarch64 Linux in
 WSL2, and an arm64 `docker.exe`, Compose and buildx. This page covers how to
 build it, and how much of it a Windows 11 VM on an Apple silicon Mac can test.
 
@@ -30,7 +30,7 @@ takes more than that call
 ([Apple forums](https://developer.apple.com/forums/thread/775546)). So
 an M3 or later Mac has the hardware, but no shipping product uses it for Windows.
 
-WSL1 runs in these VMs, but it is no use for Kiri. It translates Linux
+WSL1 runs in these VMs, but it is no use for Kiribra. It translates Linux
 syscalls and has no real kernel, so it has no namespaces, cgroups or
 overlayfs for the engine.
 
@@ -55,8 +55,8 @@ Everything up to the point where WSL2 starts:
   and Microsoft signature, and turns on Virtual Machine Platform. After the
   restart, WSL2 fails to start, and that failure is expected in a VM
 - the architecture guard: the x64 MSI installs on the Arm VM and runs under
-  emulation, and its setup stops with "This is Kiri for x64 PCs, and this PC
-  is arm64 ... Install Kiri-<version>-arm64.msi instead."
+  emulation, and its setup stops with "This is Kiribra for x64 PCs, and this PC
+  is arm64 ... Install Kiribra-<version>-arm64.msi instead."
 - installing the arm64 MSI over the x64 one: it replaces it (shared
   UpgradeCode, major upgrade)
 - the updater reads `latest-windows-arm64.json`, and refuses an x64 MSI
@@ -97,7 +97,7 @@ use) works the same way.
 
 ### In the VM, for either one
 
-- WebView2 is part of Windows 11, so nothing else is needed for Kiri's
+- WebView2 is part of Windows 11, so nothing else is needed for Kiribra's
   window.
 - Copy the MSIs in through the shared folder (Parallels: the Mac's home is
   `\\Mac\Home`; UTM: SPICE WebDAV or a shared directory).
@@ -129,7 +129,7 @@ Windows PC, or real Arm hardware), **not** inside a Mac VM. You need:
        cargo xtask msi --arch arm64
 
    which makes `target\kiri-windows-aarch64\`,
-   `target\Kiri-<version>-arm64.msi` and `target\latest-windows-arm64.json`.
+   `target\Kiribra-<version>-arm64.msi` and `target\latest-windows-arm64.json`.
    `cargo xtask windows --arch arm64` makes only the bundle.
    `cargo xtask msi-pack --arch arm64` repacks a bundle that is already
    there, and works inside the Mac VM too if you copy the bundle in
@@ -182,7 +182,7 @@ emulation start-up, and it would be the bundle's only emulated binary.
 
 ## Testing on real Arm hardware (end to end)
 
-After installing `Kiri-<version>-arm64.msi` and finishing setup with Kiri
+After installing `Kiribra-<version>-arm64.msi` and finishing setup with Kiribra
 Linux:
 
     docker version                       # Server: Os linux, Arch arm64

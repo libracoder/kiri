@@ -1,7 +1,7 @@
-//! Asking for a newer release again while Kiri keeps running. The window
+//! Asking for a newer release again while Kiribra keeps running. The window
 //! checks when it opens; a laptop that stays up for days, sleeping and
-//! waking with Kiri open, would otherwise never hear of a release until
-//! Kiri was quit. Every 6 hours by the wall clock, so time asleep counts:
+//! waking with Kiribra open, would otherwise never hear of a release until
+//! Kiribra was quit. Every 6 hours by the wall clock, so time asleep counts:
 //! a Mac that wakes after a night checks within minutes. The Mac and Linux
 //! (ui/mod.rs) and Windows (kiri-win's update.rs, which includes this file)
 //! use it the same way.

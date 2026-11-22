@@ -1,5 +1,5 @@
 //! `kiri share`: a public HTTPS URL for a local port or container, through
-//! the Kiri Share edge (`edge.runkiri.com`, tunnels on `*.runkiri.cloud`).
+//! the Kiribra Share edge (`edge.runkiri.com`, tunnels on `*.runkiri.cloud`).
 //!
 //! # API (used by the CLI below and by the daemon for the UI)
 //!
@@ -10,7 +10,7 @@
 //! - `on_event` gets every [`Event`]: `Connecting`, `Live { url, … }`,
 //!   `Request { method, path, status, ms, bytes_in, bytes_out, at }`,
 //!   `Notice`, `Reconnecting`, and finally `Ended { reason, error }`.
-//! - Account: [`load`] / [`save`] `~/.kiri/share.json` ([`Config`]),
+//! - Account: [`load`] / [`save`] `~/.kiribra/share.json` ([`Config`]),
 //!   [`login_dev`], [`login_start`] + [`login_poll`] (GitHub device flow),
 //!   [`logout`], [`whoami`].
 //!
@@ -66,7 +66,7 @@ fn build_key() -> Option<(&'static str, [u8; proto::attest::KEY_LEN])> {
 
 // ---------------------------------------------------------------- config
 
-/// `~/.kiri/share.json`.
+/// `~/.kiribra/share.json`.
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Config {
     /// Edge to use instead of edge.runkiri.com, as `host[:port]`.
@@ -86,13 +86,13 @@ fn config_path() -> io::Result<PathBuf> {
         return Ok(PathBuf::from(p));
     }
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from).ok_or_else(|| io::Error::other("HOME is not set"))?;
-    Ok(home.join(".kiri/share.json"))
+    Ok(home.join(".kiribra/share.json"))
 }
 
 // ---------------------------------------------------------------- traffic file
 
 /// What a `kiri share` on this computer has served, for the window, which
-/// can't see another process's traffic: `~/.kiri/shares/<pid>.json` as
+/// can't see another process's traffic: `~/.kiribra/shares/<pid>.json` as
 /// `{url, requests, in, out}`, beside the account file. Written every two
 /// seconds while it changes, and removed when the share ends; one left by a
 /// share that was killed matches no live link, and goes after a day.
@@ -197,7 +197,7 @@ fn random_hex(bytes: usize) -> String {
 
 /// The edge shows a computer's tunnels under this: the same for the app
 /// and `kiri share` on one computer, though their device ids can differ
-/// (Kiri Dev keeps its own config). A hash of the hardware id, never the id
+/// (Kiribra Dev keeps its own config). A hash of the hardware id, never the id
 /// itself; the device id when there is none.
 pub fn machine_id(device: &str) -> String {
     static RAW: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
@@ -398,7 +398,7 @@ fn api(srv: &Server, method: &str, path: &str, body: Option<&Value>, token: Opti
 }
 
 fn parse_http_response(raw: &[u8]) -> io::Result<(u16, Value)> {
-    let bad = || io::Error::new(io::ErrorKind::InvalidData, "the Kiri Share server sent a malformed answer");
+    let bad = || io::Error::new(io::ErrorKind::InvalidData, "the Kiribra Share server sent a malformed answer");
     let split = raw.windows(4).position(|w| w == b"\r\n\r\n").ok_or_else(bad)?;
     let head = std::str::from_utf8(&raw[..split]).map_err(|_| bad())?;
     let status = parse_status_line(head.as_bytes()).ok_or_else(bad)?;
@@ -425,12 +425,12 @@ fn dechunk(mut b: &[u8]) -> Option<Vec<u8>> {
 }
 
 fn api_error(v: &Value, status: u16) -> io::Error {
-    io::Error::other(v["error"].as_str().map(str::to_owned).unwrap_or_else(|| format!("the Kiri Share server answered {status}")))
+    io::Error::other(v["error"].as_str().map(str::to_owned).unwrap_or_else(|| format!("the Kiribra Share server answered {status}")))
 }
 
-/// Kiri Cloud's diagnostics intake, `POST /v1/reports` on the same edge
+/// Kiribra Cloud's diagnostics intake, `POST /v1/reports` on the same edge
 /// (`KIRI_SHARE_SERVER` and the config's `server` move it, as for sharing).
-/// `signed` sends the Kiri Cloud token when there is one, so a report the
+/// `signed` sends the Kiribra Cloud token when there is one, so a report the
 /// person sent can be answered; crashes always go without it, so they never
 /// name the person's GitHub account. See `crate::diag::report` (and
 /// crates/kiri-win/src/diag.rs on Windows).
@@ -549,7 +549,7 @@ fn signed_in(method: &str, path: &str, body: Option<&Value>) -> io::Result<(u16,
     Ok((status, v))
 }
 
-/// The account's reserved names, how many its plan allows, and names Kiri
+/// The account's reserved names, how many its plan allows, and names Kiribra
 /// Cloud recently didn't approve.
 #[derive(Debug, Clone, Default)]
 pub struct Names {
@@ -600,7 +600,7 @@ pub fn names() -> io::Result<Names> {
     Ok(Names { items: v["items"].as_array().into_iter().flatten().map(reserved_name).collect(), limit: v["limit"].as_u64(), refused })
 }
 
-/// Asks to reserve `name` for this account. Kiri Cloud reviews each name
+/// Asks to reserve `name` for this account. Kiribra Cloud reviews each name
 /// (202, `pending`); once approved `--name NAME` gets exactly
 /// `NAME.<tunnel domain>`, and nobody else can use it.
 pub fn reserve(name: &str) -> io::Result<ReservedName> {
@@ -640,7 +640,7 @@ pub struct LiveTunnel {
     pub host: String,
     /// `app` or `cli`.
     pub kind: String,
-    /// What opened it, as it told the edge: `Kiri Dev 0.9.4`, `kiri 0.9.4`.
+    /// What opened it, as it told the edge: `Kiribra Dev 0.9.4`, `kiri 0.9.4`.
     pub client: String,
     pub target: String,
     /// Unix seconds.
@@ -675,7 +675,7 @@ pub fn tunnels() -> io::Result<LiveTunnels> {
     let (status, v) = signed_in("GET", "/v1/tunnels/live", None)?;
     match status {
         200 => Ok(LiveTunnels { items: v["items"].as_array().into_iter().flatten().map(live_tunnel).collect(), limit: v["limit"].as_u64() }),
-        404 => Err(io::Error::new(io::ErrorKind::Unsupported, "this Kiri Cloud can't list tunnels")),
+        404 => Err(io::Error::new(io::ErrorKind::Unsupported, "this Kiribra Cloud can't list tunnels")),
         _ => Err(api_error(&v, status)),
     }
 }
@@ -747,7 +747,7 @@ pub struct Target {
 }
 
 /// Whether `kiri ARG` means "share this": a port number or `host:port`.
-/// No Kiri or docker command looks like either.
+/// No Kiribra or docker command looks like either.
 pub fn is_shorthand(arg: &str) -> bool {
     port_or_addr(arg).is_some()
 }
@@ -791,7 +791,7 @@ fn published_port(inspect: &Value) -> Option<String> {
     found.into_iter().next().map(|(_, a)| a)
 }
 
-/// `3000`, `host:port`, or the name of a Kiri container with a published port.
+/// `3000`, `host:port`, or the name of a Kiribra container with a published port.
 pub fn resolve(arg: &str) -> io::Result<Target> {
     if let Some(t) = port_or_addr(arg) {
         return Ok(t);
@@ -817,7 +817,7 @@ pub fn resolve_via(arg: &str, inspect: impl FnOnce(&str) -> io::Result<Option<Va
 #[cfg(unix)]
 fn container_target(arg: &str) -> io::Result<Target> {
     if !client::alive() {
-        return Err(io::Error::other(format!("`{arg}` isn't a port, and Kiri isn't running to look up a container by that name")));
+        return Err(io::Error::other(format!("`{arg}` isn't a port, and Kiribra isn't running to look up a container by that name")));
     }
     let r = client::request("GET", &format!("/containers/{arg}/json"), None)?;
     if r.status == 404 {
@@ -842,7 +842,7 @@ fn container_from(arg: &str, c: &Value) -> io::Result<Target> {
     Ok(Target { display: format!("{name} ({addr})"), label: name, addr })
 }
 
-/// `kiri share` on Windows has no client of the engine; Kiri's window there
+/// `kiri share` on Windows has no client of the engine; Kiribra's window there
 /// looks containers up through [`resolve_via`].
 #[cfg(windows)]
 fn container_target(arg: &str) -> io::Result<Target> {
@@ -998,7 +998,7 @@ pub fn start(opts: Options, on_event: impl Fn(Event) + Send + Sync + 'static) ->
     Ok(Handle { stop, thread: Some(thread) })
 }
 
-/// A tunnel's turns in Kiri's log: up, down, back, ended. Not its
+/// A tunnel's turns in Kiribra's log: up, down, back, ended. Not its
 /// requests, and never the token.
 fn log_event(e: &Event) {
     #[cfg(unix)]
@@ -1619,7 +1619,7 @@ fn issued_name(url: &str) -> String {
 fn session(srv: &Server, token: &str, who: &Who, name: &str, target: &Target, stop: &Stopper, on_event: &OnEvent) -> io::Result<(End, Option<String>)> {
     let (sock, conn) = dial(srv, proto::ALPN)?;
     if conn.alpn_protocol() != Some(proto::ALPN) {
-        return Ok((End::Final(format!("{} isn't a Kiri Share server", srv.host)), None));
+        return Ok((End::Final(format!("{} isn't a Kiribra Share server", srv.host)), None));
     }
     let mut reader = sock.try_clone()?;
     reader.set_read_timeout(Some(IDLE))?;
@@ -1730,7 +1730,7 @@ usage: kiri share PORT | HOST:PORT | CONTAINER [NAME | --name NAME] [--no-reserv
        kiri share status [--json]
 
 `kiri 3000` shares port 3000 at a random address; `kiri 3000 myapp` (or
---name myapp) at myapp.runkiri.cloud once it's reserved. Kiri Cloud checks each name before it's
+--name myapp) at myapp.runkiri.cloud once it's reserved. Kiribra Cloud checks each name before it's
 yours, usually within a day, and emails you; until then shares get a random address. If the name is free
 and your plan has a slot left, it's asked for first; --no-reserve uses it only as the start of a random
 address. --json prints
@@ -1751,7 +1751,7 @@ impl Paint {
         if self.on { format!("\x1b[{code}m{s}\x1b[0m") } else { s.to_owned() }
     }
 
-    /// Kiri's mustard, #E0B420.
+    /// Kiribra's mustard, #E0B420.
     fn accent(&self, s: &str) -> String {
         self.wrap("38;2;224;180;32", s)
     }
@@ -1827,7 +1827,7 @@ fn printer(target: String) -> impl Fn(Event) + Send + Sync + 'static {
         Event::Connecting { server } => {
             if !header_done.swap(true, Ordering::Relaxed) {
                 println!();
-                println!("  {}  {}", p.accent(&p.bold("◆ Kiri Share")), p.dim(&format!("connecting to {server}…")));
+                println!("  {}  {}", p.accent(&p.bold("◆ Kiribra Share")), p.dim(&format!("connecting to {server}…")));
             }
         }
         Event::Live { url, rate, remaining, warning, domains } => {
@@ -1881,7 +1881,7 @@ pub fn run(args: &[String]) -> io::Result<()> {
         Some("login") => login_cli(&args[1..]),
         Some("logout") => {
             logout()?;
-            println!("Signed out of Kiri Share.");
+            println!("Signed out of Kiribra Share.");
             Ok(())
         }
         Some("status") => status_cli(args.iter().any(|a| a == "--json")),
@@ -1995,12 +1995,12 @@ fn login_cli(args: &[String]) -> io::Result<()> {
     if let Some(i) = args.iter().position(|a| a == "--dev") {
         let login = args.get(i + 1).map_or("dev", String::as_str);
         let who = login_dev(login)?;
-        println!("Signed in to Kiri Share as {} (development edge).", p.bold(&who));
+        println!("Signed in to Kiribra Share as {} (development edge).", p.bold(&who));
         return Ok(());
     }
     let code = login_start()?;
     println!();
-    println!("  {}  Sign in to Kiri Share with GitHub", p.accent(&p.bold("◆")));
+    println!("  {}  Sign in to Kiribra Share with GitHub", p.accent(&p.bold("◆")));
     println!("     Open {} and enter", p.bold(&code.verification_uri));
     println!();
     println!("         {}", p.accent(&p.bold(&code.user_code)));
@@ -2082,14 +2082,14 @@ fn status_cli(json: bool) -> io::Result<()> {
         return Ok(());
     }
     if cfg.token.is_none() {
-        println!("Not signed in to Kiri Share ({}). Run `kiri share login`.", srv.host);
+        println!("Not signed in to Kiribra Share ({}). Run `kiri share login`.", srv.host);
         return Ok(());
     }
     let v = whoami()?;
     let rate = v["limits"]["rate"].as_u64().unwrap_or(0) as u32;
     let cap = v["usage"]["cap"].as_u64().unwrap_or(u64::MAX);
     let used = v["usage"]["used"].as_u64().unwrap_or(0);
-    println!("  {}  {}", p.accent(&p.bold("◆ Kiri Share")), p.dim(&srv.host));
+    println!("  {}  {}", p.accent(&p.bold("◆ Kiribra Share")), p.dim(&srv.host));
     println!("     {:<10}{}", "account", p.bold(v["login"].as_str().unwrap_or("?")));
     println!("     {:<10}{}", "trust", v["trust"].as_i64().unwrap_or(0));
     match v["limits"]["tunnels"].as_u64() {
@@ -2259,7 +2259,7 @@ mod tests {
     fn live_tunnels_read_from_the_edge() {
         let t = live_tunnel(&json!({
             "name": "api-7fq2ab", "label": "api", "url": "https://api-7fq2ab.runkiri.cloud", "machine": "m1", "device": "d1", "host": "paul-desktop",
-            "kind": "app", "client": "Kiri Dev 0.9.4", "target": "api (localhost:3000)", "started": 1_800_000_000u64,
+            "kind": "app", "client": "Kiribra Dev 0.9.4", "target": "api (localhost:3000)", "started": 1_800_000_000u64,
         }));
         assert_eq!((t.name.as_str(), t.label.as_str(), t.host.as_str(), t.kind.as_str(), t.started), ("api-7fq2ab", "api", "paul-desktop", "app", 1_800_000_000));
         // An edge that leaves fields out: the name is the label.

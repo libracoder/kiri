@@ -3,7 +3,7 @@
 // Settings › Diagnostics › Logs in a narrow window: each line's time, level and part stay
 // on top and its message takes a full-width line of its own under them, instead of a
 // column a few words wide.
-kiri.on({ type: "status", version: "0.2.2", app: "Kiri", ours: "kiri", context: "kiri" });
+kiri.on({ type: "status", version: "0.2.2", app: "Kiribra", ours: "kiri", context: "kiri" });
 const R = [];
 const t = (name, fn) => { try { fn(); R.push("PASS " + name); } catch (e) { R.push("FAIL " + name + ": " + e.message); } };
 prefs.tab = "diagnostics"; show("settings");

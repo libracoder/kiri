@@ -1,4 +1,4 @@
-# Kiri's speed check on every pull request: main and the change, built the
+# Kiribra's speed check on every pull request: main and the change, built the
 # same way and run side by side on one machine (scripts/perf-run.sh), with
 # requests alternating between them. The table lands in the run's summary;
 # the check fails when the change is slower than main past the limits in

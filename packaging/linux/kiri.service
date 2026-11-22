@@ -1,13 +1,13 @@
-# Kiri on a Linux host, as the .deb and .rpm install it: containers on this
+# Kiribra on a Linux host, as the .deb and .rpm install it: containers on this
 # machine's kernel, no VM. Users in the `kiri` group reach the API at
 # unix:///run/kiri/docker.sock:
 #   docker context create kiri --docker host=unix:///run/kiri/docker.sock
 # and, while no Docker engine has it, at /var/run/docker.sock too.
 [Unit]
-Description=Kiri container engine
+Description=Kiribra container engine
 Documentation=https://runkiri.com
-# After docker.service, when Docker is installed (ordering only: Kiri starts
-# without it): at boot Docker's docker0 and networks are up first, and Kiri
+# After docker.service, when Docker is installed (ordering only: Kiribra starts
+# without it): at boot Docker's docker0 and networks are up first, and Kiribra
 # picks its subnets around them, rather than the two taking the same one.
 After=network-online.target docker.service
 Wants=network-online.target
@@ -34,10 +34,10 @@ KillMode=mixed
 Restart=on-failure
 # Tools that ignore docker contexts (docker-py, Go's client.FromEnv,
 # docker-java, Testcontainers, IDE plugins) look for /var/run/docker.sock
-# (/run/docker.sock): when nothing is there, it links to Kiri's socket, whose
+# (/run/docker.sock): when nothing is there, it links to Kiribra's socket, whose
 # 0660 root:kiri is what counts. Docker's docker.socket or dockerd replaces
 # a link when it starts, so Docker keeps the path whenever it runs, and the
-# link goes when Kiri stops, if it is still Kiri's.
+# link goes when Kiribra stops, if it is still Kiribra's.
 ExecStartPost=-/bin/sh -c '[ "$$(readlink /run/docker.sock)" = /run/kiri/docker.sock ] || [ -e /run/docker.sock ] || [ -L /run/docker.sock ] || ln -s /run/kiri/docker.sock /run/docker.sock'
 ExecStopPost=-/bin/sh -c '[ "$$(readlink /run/docker.sock)" != /run/kiri/docker.sock ] || rm -f /run/docker.sock'
 RuntimeDirectory=kiri

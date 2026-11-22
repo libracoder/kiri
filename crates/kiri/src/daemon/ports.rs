@@ -359,10 +359,10 @@ fn listen_addrs(b: &Binding) -> Vec<(String, bool)> {
 }
 
 /// The program that has `port` on this Mac, when it is another program:
-/// an engine left running beside Kiri (the one containers were imported
+/// an engine left running beside Kiribra (the one containers were imported
 /// from) or a server on the Mac holds the port, and "already allocated"
-/// alone reads as if Kiri had lost track of its own containers. None when
-/// Kiri itself has it, or when lsof says nothing.
+/// alone reads as if Kiribra had lost track of its own containers. None when
+/// Kiribra itself has it, or when lsof says nothing.
 #[cfg(target_os = "macos")]
 fn holder(port: u16, udp: bool) -> Option<String> {
     let spec = if udp { format!("-iUDP:{port}") } else { format!("-iTCP:{port}") };
@@ -381,7 +381,7 @@ fn holder(_port: u16, _udp: bool) -> Option<String> {
 }
 
 /// The first command in `lsof -Fc` output (`p<pid>` and `c<command>`
-/// lines) that is not Kiri's own.
+/// lines) that is not Kiribra's own.
 #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
 fn holder_in(lsof: &str) -> Option<String> {
     lsof.lines().filter_map(|l| l.strip_prefix('c')).map(str::trim).find(|c| !c.is_empty() && !c.to_ascii_lowercase().starts_with("kiri")).map(str::to_owned)
@@ -401,14 +401,14 @@ pub fn start(vm: Arc<VmLink>, id: &str, bindings: &[Binding], target_ip: [u8; 4]
             let taken = |e: io::Error| {
                 if e.kind() == io::ErrorKind::AddrInUse {
                     let shown = if addr.is_ipv6() { format!("[{ip}]") } else { ip.clone() };
-                    // Docker's words, then who has the port when it is not Kiri.
+                    // Docker's words, then who has the port when it is not Kiribra.
                     let by = holder(b.host_port, b.proto == "udp").map(|name| format!(" (in use by {name})")).unwrap_or_default();
                     io::Error::new(e.kind(), format!("Bind for {shown}:{} failed: port is already allocated{by}", b.host_port))
                 } else {
                     e
                 }
             };
-            // Kiri's own container-domain router on this port lets it go
+            // Kiribra's own container-domain router on this port lets it go
             // (domains::step_aside), and the bind goes again.
             let bound = bind_socket(addr, b.proto == "udp").or_else(|e| {
                 if e.kind() == io::ErrorKind::AddrInUse && b.proto == "tcp" && port != 0 && super::domains::step_aside(port) { bind_socket(addr, false) } else { Err(e) }
@@ -737,7 +737,7 @@ fn relay(client: TcpStream, vm: &VmLink, ip: [u8; 4], port: u16, nat: Option<Soc
                     if NAT_WARNED.swap(true, Ordering::Relaxed) {
                         crate::diag::info!("the VM's NAT network is still unreachable; published ports keep going over vsock", to = addr, error = e);
                     } else {
-                        crate::diag::warn!("the VM's NAT network is unreachable, so published ports go over vsock (they still work); a VPN, or Kiri not allowed under Local Network in Privacy & Security, usually causes this", to = addr, error = e);
+                        crate::diag::warn!("the VM's NAT network is unreachable, so published ports go over vsock (they still work); a VPN, or Kiribra not allowed under Local Network in Privacy & Security, usually causes this", to = addr, error = e);
                     }
                 }
             }
@@ -1129,14 +1129,14 @@ mod tests {
         assert!(!host_bound_allowed(std::net::Ipv4Addr::new(10, 0, 0, 1), 5432, router), "loopback only");
     }
 
-    /// A clash names the other program holding the port, never Kiri itself.
+    /// A clash names the other program holding the port, never Kiribra itself.
     #[test]
     fn a_taken_port_names_the_program_that_has_it() {
         use super::holder_in;
         assert_eq!(holder_in("p85299\ncPython\nf3\n").as_deref(), Some("Python"));
         assert_eq!(holder_in("p10\nckiri\nf7\np11\ncOrbStack Helper\nf9\n").as_deref(), Some("OrbStack Helper"));
         assert_eq!(holder_in("p10\nckiri\nf7\n"), None);
-        assert_eq!(holder_in("p10\ncKiri Dev\n"), None);
+        assert_eq!(holder_in("p10\ncKiribra Dev\n"), None);
         assert_eq!(holder_in(""), None);
     }
 

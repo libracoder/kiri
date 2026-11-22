@@ -1,7 +1,7 @@
 // Share for Kubernetes: services and pods get the containers' Share cell; the
 // API server and kube-system never do; a pod is steered to its service; a
 // shared service or pod that goes ends its link with a reason.
-kiri.on({ type: "status", version: "0.1.4", dev: true, app: "Kiri Dev", ours: "kiri-dev", context: "kiri-dev" });
+kiri.on({ type: "status", version: "0.1.4", dev: true, app: "Kiribra Dev", ours: "kiribra-dev", context: "kiribra-dev" });
 const R = [];
 const t = (name, fn) => { try { fn(); R.push("PASS " + name); } catch (e) { R.push("FAIL " + name + ": " + e.message); } };
 const eq = (a, b, m) => { if (JSON.stringify(a) !== JSON.stringify(b)) throw new Error(m + ": got " + JSON.stringify(a) + " want " + JSON.stringify(b)); };
@@ -22,7 +22,7 @@ const PODS = [
   pod("default", "web-5fc9-cdl9f", "10.42.0.17", { app: "web" }, "ReplicaSet", [{ containerPort: 80, protocol: "TCP" }]),
   pod("default", "debug", "10.42.0.30", { run: "debug" }, undefined, [{ containerPort: 8080, protocol: "TCP" }]),
 ];
-const lists = (services, pods) => kiri.on({ type: "k8s", state: "running", ready: true, services, pods, context: "kiri-dev" });
+const lists = (services, pods) => kiri.on({ type: "k8s", state: "running", ready: true, services, pods, context: "kiribra-dev" });
 lists(SVCS, PODS);
 const row = (name) => [...document.querySelectorAll("#content tr.row")].find((r) => r.querySelector(".name")?.textContent.trim().startsWith(name));
 const cell = (name) => row(name)?.querySelector("td.col-share");

@@ -27,7 +27,7 @@ const SHOP = "services:\n  api:\n    image: api:dev\n    container_name: shop-${
 const BLOG = "services:\n  app:\n    image: app:dev\n  bad: [\n";
 const LONE = "services:\n  web:\n    image: web:dev\n    environment:\n      KEY: ${LONE_KEY:?set it}\n";
 ui.vm = "running";
-kiri.on({ type: "status", version: "0.1.4", dev: true, share: true, app: "Kiri", ours: "kiri", context: "kiri" });
+kiri.on({ type: "status", version: "0.1.4", dev: true, share: true, app: "Kiribra", ours: "kiri", context: "kiri" });
 const lists = () => kiri.on({ type: "lists", containers: ctrs, images: [], volumes: [], networks: [] });
 const projects = () => kiri.on({ type: "composeprojects", logos: {}, projects: P });
 lists(); projects();
@@ -85,7 +85,7 @@ const beta = () => !!document.querySelector("#title .beta");
     eq(dd.find(([k]) => k === "Services")[1], "3", "api, db and mailer");
     cmp.open = null; render();
   });
-  t("a file Kiri couldn't read: Services says — when the page lists none", () => {
+  t("a file Kiribra couldn't read: Services says — when the page lists none", () => {
     cmpOpen("lone");
     eq([...document.querySelectorAll("#cmp-head .dfacts div")].map((d) => [d.querySelector("dt").textContent, d.querySelector("dd").textContent]).find(([k]) => k === "Services")[1], "1", "lone lists web");
     cmp.open = null; render();

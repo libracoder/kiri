@@ -38,16 +38,16 @@ pub struct Service {
 }
 
 /// What a service is: its brand logo's slug (brands.rs), its language and
-/// framework for your own code, its role, and how Kiri knows.
+/// framework for your own code, its role, and how Kiribra knows.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Tech {
     pub slug: Option<String>,
     pub lang: Option<String>,
     pub fw: Option<String>,
     pub role: String,
-    /// Your own code (a build, or an image Kiri reads a language from).
+    /// Your own code (a build, or an image Kiribra reads a language from).
     pub app: bool,
-    /// How Kiri knows, in a few words ("Dockerfile FROM node:22 · package.json has next").
+    /// How Kiribra knows, in a few words ("Dockerfile FROM node:22 · package.json has next").
     pub how: String,
 }
 
@@ -326,7 +326,7 @@ fn from_binary(bytes: &[u8]) -> Option<Lang> {
     None
 }
 
-/// How big a program Kiri reads for its build info.
+/// How big a program Kiribra reads for its build info.
 const BINARY_MAX: usize = 128 << 20;
 
 /// A distroless or scratch image's program: copied out of a container
@@ -399,7 +399,7 @@ pub fn detect(s: &Service) -> Tech {
         let role = ROLES.iter().find(|(k, _)| *k == slug).map_or("Service", |(_, r)| r);
         return Tech { slug: Some(slug.to_owned()), lang: None, fw: None, role: role.to_owned(), app: false, how: format!("the image is {}", repo_of(&s.image)) };
     }
-    // Pulled, not built, and no brand Kiri knows: an image, not your code.
+    // Pulled, not built, and no brand Kiribra knows: an image, not your code.
     if s.build.is_none() && slug.is_none() {
         return Tech { slug: None, lang: None, fw: None, role: "Image".into(), app: false, how: if s.image.is_empty() { String::new() } else { format!("the image is {}", repo_of(&s.image)) } };
     }

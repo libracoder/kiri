@@ -33,7 +33,7 @@ const ICON_PNG: &[u8] = include_bytes!("../../../../brand/icon/png/kiri-app-icon
 /// the sidebar section to open on.
 pub fn run(autostart: bool, view: Option<String>) -> io::Result<()> {
     // The desktop file's name, before GTK starts: on Wayland it's the window's
-    // app id, which is how the dock finds Kiri's launcher and icon.
+    // app id, which is how the dock finds Kiribra's launcher and icon.
     glib::set_prgname(Some("kiri"));
     gtk::init().map_err(|e| io::Error::other(format!("no display to open the window on ({e})")))?;
     let (tx, rx) = mpsc::channel();

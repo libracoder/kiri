@@ -1,7 +1,7 @@
-//! `*.kiri.local`: a tiny DNS server on loopback that answers every name
-//! under `kiri.local` with 127.0.0.1, where the domain router (domains.rs)
+//! `*.kiribra.local`: a tiny DNS server on loopback that answers every name
+//! under `kiribra.local` with 127.0.0.1, where the domain router (domains.rs)
 //! picks the container from the Host header. macOS sends these lookups here
-//! because of `/etc/resolver/kiri.local`, which `kiri setup` installs once
+//! because of `/etc/resolver/kiribra.local`, which `kiri setup` installs once
 //! (it needs an administrator). Anything else is refused.
 //!
 //! Also the relay for container lookups the VM's gateway resolver fails
@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 
 /// The resolver file's port; unprivileged, so the daemon needs no root.
 pub const PORT: u16 = 53535;
-pub const RESOLVER: &str = "/etc/resolver/kiri.local";
-pub const SUFFIX: &str = "kiri.local";
+pub const RESOLVER: &str = "/etc/resolver/kiribra.local";
+pub const SUFFIX: &str = "kiribra.local";
 
 pub fn start() -> io::Result<()> {
     let sock = UdpSocket::bind(("127.0.0.1", PORT))?;
@@ -34,12 +34,12 @@ pub fn start() -> io::Result<()> {
     Ok(())
 }
 
-/// True when macOS will send `*.kiri.local` lookups to Kiri.
+/// True when macOS will send `*.kiribra.local` lookups to Kiribra.
 pub fn installed() -> bool {
     std::fs::read_to_string(RESOLVER).is_ok_and(|s| s.contains(&format!("port {PORT}")))
 }
 
-/// One reply for one query: A → 127.0.0.1 under kiri.local, an empty answer
+/// One reply for one query: A → 127.0.0.1 under kiribra.local, an empty answer
 /// for other types there (so AAAA falls back to A), REFUSED elsewhere.
 fn answer(q: &[u8]) -> Option<Vec<u8>> {
     if q.len() < 12 || q[2] & 0x80 != 0 || u16::from_be_bytes([q[4], q[5]]) != 1 {
@@ -246,7 +246,7 @@ fn question_name(q: &[u8]) -> Option<String> {
 /// `/etc/resolver/<domain>` file with the longest domain that `name` is in
 /// (VPNs and tools such as dnsmasq set these up), else `/etc/resolv.conf`'s,
 /// which macOS keeps to its current primary DNS servers. Read on every
-/// lookup, so network changes are followed. Kiri's own `kiri.local` file is
+/// lookup, so network changes are followed. Kiribra's own `kiribra.local` file is
 /// skipped: its server answers 127.0.0.1, the Mac's loopback, which means
 /// nothing in a container.
 fn mac_resolvers(name: &str, resolv_conf: &Path, resolver_dir: &Path) -> Vec<SocketAddr> {
@@ -301,13 +301,13 @@ mod tests {
 
     #[test]
     fn answers_kiri_local_only() {
-        let r = answer(&query("Web.kiri.local", 1)).unwrap();
+        let r = answer(&query("Web.kiribra.local", 1)).unwrap();
         assert_eq!((&r[..2], r[3], r[7]), (&[0x12, 0x34][..], 0, 1));
         assert_eq!(&r[r.len() - 4..], &[127, 0, 0, 1]);
-        let aaaa = answer(&query("web.kiri.local", 28)).unwrap();
+        let aaaa = answer(&query("web.kiribra.local", 28)).unwrap();
         assert_eq!((aaaa[3], aaaa[7]), (0, 0));
         assert_eq!(answer(&query("example.com", 1)).unwrap()[3], 5);
-        assert_eq!(answer(&query("notkiri.local", 1)).unwrap()[3], 5);
+        assert_eq!(answer(&query("notkiribra.local", 1)).unwrap()[3], 5);
         assert!(answer(&[0; 5]).is_none());
     }
 
@@ -320,14 +320,14 @@ mod tests {
         std::fs::write(&conf, "# macOS\nsearch home\nnameserver 192.168.1.1\nnameserver fe80::1%en0\nnameserver 2001:db8::53\n").unwrap();
         std::fs::write(resolvers.join("corp.example"), "nameserver 10.0.0.53\n").unwrap();
         std::fs::write(resolvers.join("eu.corp.example"), "nameserver 10.1.0.53\nport 5353\n").unwrap();
-        std::fs::write(resolvers.join("kiri.local"), "nameserver 127.0.0.1\nport 53535\n").unwrap();
+        std::fs::write(resolvers.join("kiribra.local"), "nameserver 127.0.0.1\nport 53535\n").unwrap();
         let r = |name: &str| super::mac_resolvers(name, &conf, &resolvers).iter().map(ToString::to_string).collect::<Vec<_>>();
         assert_eq!(r("registry-1.docker.io"), ["192.168.1.1:53", "[2001:db8::53]:53"]);
         assert_eq!(r("git.corp.example"), ["10.0.0.53:53"]);
         assert_eq!(r("corp.example"), ["10.0.0.53:53"]);
         assert_eq!(r("db.eu.corp.example"), ["10.1.0.53:5353"], "the longest domain wins");
         assert_eq!(r("notcorp.example"), ["192.168.1.1:53", "[2001:db8::53]:53"]);
-        assert_eq!(r("web.kiri.local"), ["192.168.1.1:53", "[2001:db8::53]:53"], "Kiri's own resolver is the Mac's loopback");
+        assert_eq!(r("web.kiribra.local"), ["192.168.1.1:53", "[2001:db8::53]:53"], "Kiribra's own resolver is the Mac's loopback");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

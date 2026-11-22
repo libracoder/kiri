@@ -1,6 +1,6 @@
 //! The container page, as crates/kiri/src/ui/detail.rs is on the Mac:
 //! inspect, live logs and stats, a command line, a terminal and its files.
-//! The Mac reads files through its NFS mount at ~/Kiri; here they come
+//! The Mac reads files through its NFS mount at ~/Kiribra; here they come
 //! through the daemon: listings and previews by exec, saving by the archive
 //! API, so a container must be running to browse it.
 
@@ -347,7 +347,7 @@ pub fn docker_cli() -> String {
     // The installed copy first; then the one beside kiri-win.exe (the
     // unzipped bundle), but only if it is the one this build shipped; else
     // whatever docker.exe is on PATH, found explicitly.
-    let installed = std::env::var_os("LOCALAPPDATA").map(|d| std::path::PathBuf::from(d).join("Kiri").join("bin").join("docker.exe"));
+    let installed = std::env::var_os("LOCALAPPDATA").map(|d| std::path::PathBuf::from(d).join("Kiribra").join("bin").join("docker.exe"));
     if let Some(p) = installed.filter(|p| p.is_file()) {
         return p.to_string_lossy().into_owned();
     }

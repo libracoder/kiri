@@ -1,6 +1,6 @@
 //! Pull image's suggestions: Docker Hub's search and each image's tags,
 //! as crates/kiri/src/ui/hub.rs does for the Mac. Answers are kept in
-//! %LOCALAPPDATA%\Kiri\hub.json, so a search seen before shows at once,
+//! %LOCALAPPDATA%\Kiribra\hub.json, so a search seen before shows at once,
 //! offline too; one older than a day is shown and then fetched again, and
 //! the page swaps in the fresh answer.
 //!
@@ -49,7 +49,7 @@ impl Kind {
 
 fn path() -> Option<PathBuf> {
     let local = std::env::var_os("LOCALAPPDATA")?;
-    Some(PathBuf::from(local).join("Kiri").join("hub.json"))
+    Some(PathBuf::from(local).join("Kiribra").join("hub.json"))
 }
 
 fn now() -> u64 {

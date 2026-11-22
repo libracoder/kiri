@@ -31,7 +31,7 @@ impl Redactor {
         Redactor::new(std::env::var("HOME").ok(), Vec::new())
     }
 
-    /// For a report: also the Kiri Cloud token, when signed in.
+    /// For a report: also the Kiribra Cloud token, when signed in.
     pub fn for_user() -> Redactor {
         Redactor::new(std::env::var("HOME").ok(), crate::share::read_config().token.into_iter().collect())
     }
@@ -507,7 +507,7 @@ fn flags(s: &str) -> String {
     out
 }
 
-/// What starts a token that says what it is: Kiri share's, GitHub's,
+/// What starts a token that says what it is: Kiribra share's, GitHub's,
 /// GitLab's, Docker Hub's, an AWS access key id, Stripe's, Slack's,
 /// Anthropic's, OpenAI's, Google's, npm's and PyPI's.
 const TOKEN_PREFIXES: [&str; 26] = [
@@ -546,8 +546,8 @@ mod tests {
 
     #[test]
     fn home_becomes_tilde_but_not_a_longer_name() {
-        let out = r().apply("open /Users/ada/.kiri/logs and /Users/adam/x and /Users/ada");
-        assert_eq!(out, "open ~/.kiri/logs and /Users/adam/x and ~");
+        let out = r().apply("open /Users/ada/.kiribra/logs and /Users/adam/x and /Users/ada");
+        assert_eq!(out, "open ~/.kiribra/logs and /Users/adam/x and ~");
     }
 
     #[test]

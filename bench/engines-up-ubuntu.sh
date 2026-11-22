@@ -22,7 +22,7 @@ sleep 4
 echo "docker-engine: $(DOCKER_HOST=unix:///run/dockerd-bench.sock docker version --format '{{.Server.Version}}' 2>&1 | head -1)"
 echo "podman-api:    $(DOCKER_HOST=unix:///run/podman-bench.sock docker version --format '{{.Server.Version}}' 2>&1 | head -1)"
 echo "nerdctl:       $(nerdctl version --format '{{.Server.Components}}' 2>&1 | head -c 80)"
-echo "kiri:          $(DOCKER_HOST=unix:///var/lib/kiri-daemon/.kiri/run/docker.sock docker version --format '{{.Server.Version}}' 2>&1 | head -1)"
+echo "kiri:          $(DOCKER_HOST=unix:///var/lib/kiri-daemon/.kiribra/run/docker.sock docker version --format '{{.Server.Version}}' 2>&1 | head -1)"
 echo "desktop:       $(docker version --format '{{.Server.Version}}' 2>&1 | head -1)"
 su - "$BENCH_USER" -c "setsid -f bash -c 'PATH=/usr/local/bin:/opt/lima/bin:\$PATH colima start --runtime docker --cpu 8 --memory 8 --disk 30 --vm-type qemu > ~/colima-start.log 2>&1; echo EXIT=\$? >> ~/colima-start.log' </dev/null >/dev/null 2>&1"
 echo "colima: starting in background"

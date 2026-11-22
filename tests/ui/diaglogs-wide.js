@@ -2,7 +2,7 @@
 // window: 1280x800
 // Settings › Diagnostics › Logs in a wide window is as it always was: time, level, part
 // and message side by side in columns 84, 38 and 46 px wide.
-kiri.on({ type: "status", version: "0.2.2", app: "Kiri", ours: "kiri", context: "kiri" });
+kiri.on({ type: "status", version: "0.2.2", app: "Kiribra", ours: "kiri", context: "kiri" });
 const R = [];
 const t = (name, fn) => { try { fn(); R.push("PASS " + name); } catch (e) { R.push("FAIL " + name + ": " + e.message); } };
 const eq = (a, b, m) => { if (JSON.stringify(a) !== JSON.stringify(b)) throw new Error(m + ": got " + JSON.stringify(a) + " want " + JSON.stringify(b)); };

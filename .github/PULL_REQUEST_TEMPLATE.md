@@ -19,7 +19,7 @@ Tested on: <!-- macOS / Windows / Linux, and which version -->
 
 ## How you found it
 
-- [ ] I use Kiri and ran into this myself
+- [ ] I use Kiribra and ran into this myself
 - [ ] I found it by reading the code or comparing with Docker
 - [ ] Someone else reported it (link the issue above)
 
@@ -27,6 +27,6 @@ AI tools used to write this change: <!-- yes / no; if yes, which parts -->
 
 ## Checklist
 
-- [ ] I have at most 3 pull requests open on Kiri, this one included
+- [ ] I have at most 3 pull requests open on Kiribra, this one included
 - [ ] `cargo fmt`, `cargo clippy` and the tests pass
 - [ ] It works on macOS, Windows and Linux, or the change only touches one of them

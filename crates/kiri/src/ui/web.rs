@@ -212,7 +212,7 @@ fn new_token() -> String {
     if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
         let _ = f.read_exact(&mut buf);
     } else {
-        // Last resort when urandom is missing (unusual on the hosts Kiri runs on).
+        // Last resort when urandom is missing (unusual on the hosts Kiribra runs on).
         let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
         for (i, b) in buf.iter_mut().enumerate() {
             *b = ((t >> (i * 8)) ^ u128::from(std::process::id())).to_le_bytes()[i % 16];

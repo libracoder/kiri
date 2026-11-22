@@ -3,7 +3,7 @@
 // After Apply: every service that stopped is named. Discard while the file is
 // gone clears the note, and the file back as it was offers no Overwrite. A
 // window reloaded mid-Apply shows the running Apply with Cancel. A project
-// that never appears says so. Kiri's own errors in the plan and the list are
+// that never appears says so. Kiribra's own errors in the plan and the list are
 // said in the window's language.
 const R = [];
 const t = (name, fn) => { try { fn(); R.push("PASS " + name); } catch (e) { R.push("FAIL " + name + ": " + e.message); } };
@@ -19,7 +19,7 @@ show("compose");
 const F = (text, hash, o = {}) => kiri.on({ type: "composefile", name: "shop", path: "/w/shop/compose.yaml", text, hash, mtime: 1, ...o });
 const edit = (from, to) => { const ta = $("cmp-ta"); ta.value = ta.value.replace(from, to); ta.dispatchEvent(new Event("input")); };
 const open = (text, hash) => { cmpOpen("shop"); F(text, hash); click(document.querySelector('[data-cmptab="file"]')); };
-const GONE = { error: "Kiri can't find this project's compose file" };
+const GONE = { error: "Kiribra can't find this project's compose file" };
 const TEXT = "services:\n  db:\n    image: postgres:16\n";
 
 t("two services stop after Apply: both are named, each with its logs", () => {
@@ -71,11 +71,11 @@ t("a project that never appears: said, and not left waiting", () => {
   list({}, cmp.askN);
   eq([cmp.opening, lastToast().includes("Dieses Projekt gibt es nicht mehr")], [null, true], lastToast());
 });
-t("Kiri's own errors in the list and the plan: in the window's language", () => {
+t("Kiribra's own errors in the list and the plan: in the window's language", () => {
   list({ readable: false, error: "docker compose took longer than 30 seconds", errkey: "slow", errargs: { secs: "30" } });
   eq(cmp.list.projects[0].error.includes("länger als 30 Sekunden"), true, cmp.list.projects[0].error);
   list({ readable: false, error: "couldn't read env file /w/shop/.env: it isn't a local regular file", errkey: "badEnv", errargs: { file: "/w/shop/.env" } });
-  eq(cmp.list.projects[0].error, "Die env-Datei /w/shop/.env konnte nicht gelesen werden: Sie ist keine normale lokale Datei", "an env file Kiri won't read");
+  eq(cmp.list.projects[0].error, "Die env-Datei /w/shop/.env konnte nicht gelesen werden: Sie ist keine normale lokale Datei", "an env file Kiribra won't read");
   list();
   open(TEXT, "h1");
   edit("postgres:16", "postgres:21");

@@ -12,7 +12,7 @@
 //! captures it and serves it over that connection until either side lets
 //! go, then gives it back to macOS.
 //!
-//! The helper is replaced when it differs from the Kiri asking (an update):
+//! The helper is replaced when it differs from the Kiribra asking (an update):
 //! that is one more prompt.
 
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -43,7 +43,7 @@ fn socket() -> PathBuf {
     PathBuf::from(format!("/var/run/{LABEL}.sock"))
 }
 
-/// The Kiri build the installed helper was copied from, written beside it.
+/// The Kiribra build the installed helper was copied from, written beside it.
 fn source() -> PathBuf {
     PathBuf::from(format!("/Library/PrivilegedHelperTools/{LABEL}.source"))
 }
@@ -55,7 +55,7 @@ fn digest(path: &Path) -> io::Result<String> {
     Ok(Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect())
 }
 
-/// Whether the installed helper was copied from this Kiri. (Not compared
+/// Whether the installed helper was copied from this Kiribra. (Not compared
 /// byte for byte: the copy is signed again on its own, see `install`.)
 fn current() -> bool {
     if !binary().exists() || !plist().exists() {
@@ -93,10 +93,10 @@ fn install() -> io::Result<()> {
     let sum = digest(&me)?;
     let q = |p: &Path| sh_quote(&p.to_string_lossy());
     // The copy is root's: a helper that ran a binary in the user's app
-    // bundle would run whatever replaced it, as root. Kiri's own signature
+    // bundle would run whatever replaced it, as root. Kiribra's own signature
     // seals the app's Info.plist, which the copy is without, so macOS
     // wouldn't run it: it gets a signature of its own (ad hoc, no
-    // entitlements; it needs none). Then which Kiri it came from.
+    // entitlements; it needs none). Then which Kiribra it came from.
     let command = format!(
         "set -e; mkdir -p /Library/PrivilegedHelperTools; cp {me} {bin}.new; \
          /usr/bin/codesign --force --sign - --identifier {label} {bin}.new; \
@@ -109,12 +109,12 @@ fn install() -> io::Result<()> {
         tmp = q(&tmp),
         plist = q(&plist)
     );
-    let r = crate::setup::as_admin(&command, "Kiri wants to install its USB helper, so it can connect USB devices to its Linux VM. It asks once.");
+    let r = crate::setup::as_admin(&command, "Kiribra wants to install its USB helper, so it can connect USB devices to its Linux VM. It asks once.");
     let _ = std::fs::remove_file(&tmp);
     r
 }
 
-/// Removes the helper (`kiri usb helper remove`, and uninstalling Kiri).
+/// Removes the helper (`kiri usb helper remove`, and uninstalling Kiribra).
 pub fn remove() -> io::Result<()> {
     if !plist().exists() && !binary().exists() {
         return Ok(());
@@ -128,13 +128,13 @@ pub fn remove() -> io::Result<()> {
         sh_quote(&source().to_string_lossy()),
         sh_quote(&socket().to_string_lossy())
     );
-    crate::setup::as_admin(&command, "Kiri wants to remove its USB helper.")?;
+    crate::setup::as_admin(&command, "Kiribra wants to remove its USB helper.")?;
     println!("removed the USB helper");
     Ok(())
 }
 
 /// A connection to the helper, installing or replacing it first if it
-/// isn't this Kiri.
+/// isn't this Kiribra.
 fn connect() -> io::Result<UnixStream> {
     if !current() {
         install()?;
@@ -160,10 +160,10 @@ pub fn attach(location: &str, name: &str, speed: u32, devid: u32) -> io::Result<
 
 /// The same, for the daemon attaching a device again when it comes back:
 /// never the administrator prompt, so only through a helper that is
-/// already this Kiri's.
+/// already this Kiribra's.
 pub fn reattach(location: &str, name: &str, speed: u32, devid: u32) -> io::Result<()> {
     if !current() {
-        return Err(io::Error::other("the USB helper is not this Kiri's (attach it once from the window to update it)"));
+        return Err(io::Error::other("the USB helper is not this Kiribra's (attach it once from the window to update it)"));
     }
     attach_through(UnixStream::connect(socket())?, location, name, speed, devid)
 }

@@ -63,7 +63,7 @@ impl Pipe {
             let e = io::Error::last_os_error();
             // FILE_FLAG_FIRST_PIPE_INSTANCE answers with these when some
             // process already serves the name: another kiri-win, or anything
-            // squatting it to pose as Kiri. Name the case for the caller.
+            // squatting it to pose as Kiribra. Name the case for the caller.
             if first && e.raw_os_error().is_some_and(|c| c == ERROR_ACCESS_DENIED as i32 || c == ERROR_PIPE_BUSY as i32) {
                 return Err(io::Error::new(io::ErrorKind::AddrInUse, format!("{name} is already served by another process ({e})")));
             }
@@ -239,7 +239,7 @@ fn overlapped_within(h: HANDLE, timeout: Option<std::time::Duration>, call: impl
             Err(io::Error::last_os_error())
         } else if GetOverlappedResult(h, &ov, &mut n, 1) == 0 {
             let e = io::Error::last_os_error();
-            if timed_out { Err(io::Error::new(io::ErrorKind::TimedOut, "Kiri did not answer in time")) } else { Err(e) }
+            if timed_out { Err(io::Error::new(io::ErrorKind::TimedOut, "Kiribra did not answer in time")) } else { Err(e) }
         } else {
             Ok(n)
         }

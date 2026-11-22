@@ -1,6 +1,6 @@
 // The Mac (#250): a first-launch step that failed waits in the same setup
 // checklist, over a window that works: its error as the log has it, Try
-// again, Skip for what Kiri works without, Show log, and Continue anyway.
+// again, Skip for what Kiribra works without, Show log, and Continue anyway.
 const out = [];
 const ok = (cond, what) => out.push(`${cond ? "PASS" : "FAIL"} ${what}`);
 const row = (k) => document.querySelector(`#onb [data-check="${k}"]`);
@@ -8,7 +8,7 @@ const obtn = (sel) => document.querySelector(`#onb ${sel}`);
 
 kiri.on({ type: "onboarding", os: "mac", ready: true, complete: false, skipped: [],
   checks: { context: "ok", commands: "ok", login: "no" },
-  errors: { login: "starting the engine at login: launchctl could not load ~/Library/LaunchAgents/dev.kiri.daemon.plist" } });
+  errors: { login: "starting the engine at login: launchctl could not load ~/Library/LaunchAgents/dev.kiribra.daemon.plist" } });
 ok(document.getElementById("onb"), "the checklist shows");
 ok(row("context") && row("commands") && row("login") && !row("access"), "the Mac's steps, not Linux's");
 ok(row("login").textContent.includes("runs from the app for now"), "says the engine runs from the app meanwhile");
@@ -39,10 +39,10 @@ ok(!obtn('[data-onbskip="context"]'), "docker's context can't be skipped");
 ok(obtn('[data-onbfix="all"]'), "Fix all with two left");
 ok(document.querySelector("#onb .onb-hd").textContent.includes("Some steps didn't work"), "says some steps didn't work");
 
-// Tried again and it worked: Kiri is set up.
+// Tried again and it worked: Kiribra is set up.
 kiri.on({ type: "onboarding", os: "mac", ready: true, complete: true, skipped: [], checks: { context: "ok", commands: "ok", login: "ok" }, errors: {} });
 ok(!obtn('[data-onb="log"]'), "no Show log once nothing failed");
-ok(obtn('[data-onb="open"]').textContent.includes("Open Kiri"), "Open Kiri when it's all done");
+ok(obtn('[data-onb="open"]').textContent.includes("Open Kiribra"), "Open Kiribra when it's all done");
 obtn('[data-onb="open"]').click();
 ok(!document.getElementById("onb") && sent.at(-1)?.type === "onbopen", "and it closes");
 

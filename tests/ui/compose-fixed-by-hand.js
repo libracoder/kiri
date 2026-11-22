@@ -1,5 +1,5 @@
 // parity: macos windows linux
-// A file broken in Kiri, applied (it fails after saving) and then put right by
+// A file broken in Kiribra, applied (it fails after saving) and then put right by
 // hand: once it runs as saved, the failed Apply's note goes; put right but
 // still not what runs, it reads as any saved change not applied yet.
 const R = [];
