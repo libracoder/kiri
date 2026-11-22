@@ -266,15 +266,34 @@ pub(crate) fn distros() -> Option<Vec<String>> {
 
 /// What `cmd` (wsl.exe -l -q) lists, as distros() says it.
 fn listed_by(cmd: &mut Command, limit: Duration) -> Option<Vec<String>> {
+    listing_by(cmd, limit).distros
+}
+
+/// One run of `wsl.exe -l -q`, read for both of its answers.
+struct Listing {
+    /// As distros() says it.
+    distros: Option<Vec<String>>,
+    /// It failed because WSL's optional component is off.
+    components_off: bool,
+}
+
+fn listing_by(cmd: &mut Command, limit: Duration) -> Listing {
     let o = match crate::update::output_within(cmd, limit) {
         Ok(o) => o,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Some(Vec::new()),
-        Err(_) => return None,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Listing { distros: Some(Vec::new()), components_off: false },
+        Err(_) => return Listing { distros: None, components_off: false },
     };
     if !o.status.success() {
-        return (nothing_listed(&o.stdout) || nothing_listed(&o.stderr)).then(Vec::new);
+        return Listing {
+            distros: (nothing_listed(&o.stdout) || nothing_listed(&o.stderr)).then(Vec::new),
+            components_off: component_required(&o.stdout) || component_required(&o.stderr),
+        };
     }
-    Some(wsl_text(&o.stdout).lines().map(|l| l.trim().to_owned()).filter(|l| !l.is_empty()).collect())
+    Listing { distros: Some(wsl_text(&o.stdout).lines().map(|l| l.trim().to_owned()).filter(|l| !l.is_empty()).collect()), components_off: false }
+}
+
+fn listing() -> Listing {
+    listing_by(quiet("wsl.exe").args(["-l", "-q"]), WSL_ANSWER_LIMIT)
 }
 
 /// Whether WSL's output carries one of its error codes. They are ASCII and
@@ -299,7 +318,7 @@ fn component_required(out: &[u8]) -> bool {
 
 /// Whether `wsl.exe -l -q` failed because WSL's optional component is off.
 fn components_off() -> bool {
-    crate::update::output_within(quiet("wsl.exe").args(["-l", "-q"]), WSL_ANSWER_LIMIT).is_ok_and(|o| !o.status.success() && (component_required(&o.stdout) || component_required(&o.stderr)))
+    listing().components_off
 }
 
 fn existing_ubuntu() -> Option<String> {
@@ -341,8 +360,14 @@ fn needs_setup(done: bool, distro: Option<&str>, listed: impl FnOnce() -> Option
 /// The step to show now, from what is on this PC, and why WSL did not
 /// answer when it didn't.
 fn current_step(s: &Saved) -> (&'static str, Option<String>) {
-    step_from(wsl_answer(), s, restarted_since, components_off, || match &s.distro {
-        Some(d) if distros().is_some_and(|l| l.iter().any(|x| x == d)) => {
+    // `wsl -l -q` runs once, when a check first needs it, for both answers.
+    let listing = std::cell::LazyCell::new(listing);
+    let off = std::cell::Cell::new(None);
+    let step = step_from(wsl_answer(), s, restarted_since, || {
+        off.set(Some(listing.components_off));
+        listing.components_off
+    }, || match &s.distro {
+        Some(d) if listing.distros.as_ref().is_some_and(|l| l.iter().any(|x| x == d)) => {
             if crate::client::alive() {
                 "tools"
             } else {
@@ -350,7 +375,14 @@ fn current_step(s: &Saved) -> (&'static str, Option<String>) {
             }
         }
         _ => "choose",
-    })
+    });
+    // The components read as on: what setup recorded about turning them on is spent.
+    if off.get() == Some(false) && s.components_on_at.is_some() {
+        let mut fresh = saved();
+        fresh.components_on_at = None;
+        save(&fresh);
+    }
+    step
 }
 
 /// What setup turned on and a restart did not bring.
@@ -655,7 +687,8 @@ fn install_wsl() -> io::Result<()> {
     let code = elevated(&admin_args(msi_path.as_deref()))?;
     task(approval, "done", &tr("approved"));
     match code {
-        0 | 3010 | 1 | 22 | 23 => {}
+        0 | 3010 => {}
+        1 | 22 | 23 => task(components, "error", ""),
         21 => {
             task(components, "done", "");
             if let Some(i) = install {
@@ -947,6 +980,7 @@ fn finish() {
     let mut s = saved();
     s.done = true;
     s.restart_after = None;
+    s.components_on_at = None;
     s.last_error = None;
     save(&s);
     crate::serve::set_setup_pending(false);
@@ -1206,11 +1240,22 @@ mod tests {
             assert!(!words.last().is_some_and(|w| *w == "exit"), "a bare exit: {line}");
         }
         assert!(codes.contains(&21) && codes.contains(&22) && codes.contains(&23), "{codes:?}");
-        for code in codes.into_iter().chain([24]).filter(|c| *c != 0 && *c != 3010) {
-            let why = super::admin_wsl_failed(code).unwrap_or_default();
-            assert!(!why.is_empty() && !why.contains("administrator step"), "exit {code} from kiri-admin.ps1 has no message of its own");
+        // Each code the script gives its own meaning has its own message: a
+        // code added to the script without one would fall to dism.exe's
+        // wording, so it must be listed here too.
+        let own = [
+            (21, "the WSL installer failed"),
+            (22, "the downloaded WSL installer changed on disk; try again"),
+            (23, "the WSL installer is not validly signed by Microsoft"),
+            (24, "Windows could not turn on WSL's optional components (dism.exe failed)"),
+        ];
+        for code in codes.into_iter().filter(|c| !matches!(c, 0 | 1 | 3010)) {
+            assert!(own.iter().any(|(c, _)| *c == code), "exit {code} from kiri-admin.ps1 has no message of its own");
         }
-        assert!(super::admin_wsl_failed(1).is_some_and(|w| w.contains("exit code 1")));
+        for (code, why) in own {
+            assert_eq!(super::admin_wsl_failed(code).as_deref(), Some(why), "exit {code}");
+        }
+        assert_eq!(super::admin_wsl_failed(1).as_deref(), Some("the administrator step failed (exit code 1)"));
         // dism.exe's code, passed on, is shown, and does not blame the BIOS.
         assert_eq!(super::admin_wsl_failed(0x800F_081Fu32 as i32).as_deref(), Some("Windows could not turn on WSL's optional components (dism.exe exit code 0x800F081F)"));
         assert_eq!(super::admin_wsl_failed(50).as_deref(), Some("Windows could not turn on WSL's optional components (dism.exe exit code 50)"));
@@ -1321,5 +1366,19 @@ mod tests {
         assert!(needs_setup(true, Some("kiri"), || listed_by(&mut std::process::Command::new("kiri-no-such-wsl.exe"), ten)));
         // A first run never waits on WSL before the window opens.
         assert!(needs_setup(false, Some("kiri"), || panic!("asked WSL")));
+    }
+
+    #[test]
+    fn one_wsl_listing_gives_both_answers() {
+        use super::{listing_by, quiet};
+        use std::os::windows::process::CommandExt;
+        use std::time::Duration;
+        let ten = Duration::from_secs(10);
+        let off = listing_by(quiet("cmd.exe").raw_arg("/c echo Error code: Wsl/WSL_E_WSL_OPTIONAL_COMPONENT_REQUIRED 1>&2 & exit 1"), ten);
+        assert!(off.components_off && off.distros == Some(Vec::new()));
+        let on = listing_by(quiet("cmd.exe").raw_arg("/c echo kiri"), ten);
+        assert!(!on.components_off && on.distros == Some(vec!["kiri".to_owned()]));
+        let silent = listing_by(quiet("cmd.exe").raw_arg("/c echo Error code: Wsl/Service/WSAETIMEDOUT 1>&2 & exit 1"), ten);
+        assert!(!silent.components_off && silent.distros.is_none());
     }
 }
