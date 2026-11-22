@@ -1185,7 +1185,7 @@
   "Turn off engine": "엔진 끄기",
   "Turn on Kiri's in Settings → Kubernetes instead of starting a copy.": "복사본을 시작하는 대신 설정 → Kubernetes에서 Kiri 자체 클러스터를 켜세요.",
   "Turn on Kubernetes": "Kubernetes 켜기",
-  "Turn on Virtual Machine Platform": "가상 머신 플랫폼 켜기",
+  "Turn on WSL's Windows components": "Turn on WSL's Windows components",
   "Turn security off for local use": "로컬 사용을 위해 보안 끄기",
   "Type": "유형",
   "Type one, or generate it": "입력하거나 생성하세요",

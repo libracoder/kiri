@@ -1185,7 +1185,7 @@
   "Turn off engine": "Қозғалтқышты өшіру",
   "Turn on Kiri's in Settings → Kubernetes instead of starting a copy.": "Көшірмесін іске қосудың орнына «Параметрлер» → «Kubernetes» бөлімінде Kiri-дікін қосыңыз.",
   "Turn on Kubernetes": "Kubernetes қосу",
-  "Turn on Virtual Machine Platform": "Виртуалды машина платформасын қосу",
+  "Turn on WSL's Windows components": "Turn on WSL's Windows components",
   "Turn security off for local use": "Жергілікті пайдалану үшін қорғанысты өшіру",
   "Type": "Түрі",
   "Type one, or generate it": "Енгізіңіз немесе жасатыңыз",

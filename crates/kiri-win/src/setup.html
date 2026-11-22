@@ -851,7 +851,7 @@ function trn(n, one, other, vars) { var s = isOne(n) ? one : other, v = { n: n }
   var base = { type: 'setup', linux: null, sizes: { wsl: 367575040, ubuntu: 418495746, kiri: 9000000 }, existingUbuntu: false, otherDocker: false, otherEngine: null,
     makeDefault: true, buildKiri: true, autostart: true, progress: null, tasks: [], log: [], error: null };
   var wsl = { step: 'wsl', progress: { pct: 58, done: 224395264, total: 367575040, rate: 19084083, eta: 9, label: 'Downloading WSL 3.0.3 from Microsoft' },
-    tasks: [T('Administrator approved', 'done', 'done'), T('Download WSL', 'active', '224 / 368 MB'), T('Turn on Virtual Machine Platform', 'todo', 'next'), T('Install WSL', 'todo', 'then a restart')] };
+    tasks: [T('Administrator approved', 'done', 'done'), T('Download WSL', 'active', '224 / 368 MB'), T("Turn on WSL's Windows components", 'todo', 'next'), T('Install WSL', 'todo', 'then a restart')] };
   var X = {
     welcome: { step: 'welcome' },
     wsl: wsl,

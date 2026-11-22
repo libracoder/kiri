@@ -1185,7 +1185,7 @@
   "Turn off engine": "Išjungti variklį",
   "Turn on Kiri's in Settings → Kubernetes instead of starting a copy.": "Užuot paleidę kopiją, įjunkite paties Kiri klasterį skiltyje Nustatymai → Kubernetes.",
   "Turn on Kubernetes": "Įjungti Kubernetes",
-  "Turn on Virtual Machine Platform": "Įjungti virtualiosios mašinos platformą",
+  "Turn on WSL's Windows components": "Turn on WSL's Windows components",
   "Turn security off for local use": "Išjungti saugą vietiniam naudojimui",
   "Type": "Tipas",
   "Type one, or generate it": "Įveskite arba sugeneruokite",

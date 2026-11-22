@@ -1185,7 +1185,7 @@
   "Turn off engine": "ሞተሩን አጥፋ",
   "Turn on Kiri's in Settings → Kubernetes instead of starting a copy.": "ቅጂ ከማስጀመር ይልቅ የKiriን በቅንብሮች → Kubernetes ውስጥ ያብሩ።",
   "Turn on Kubernetes": "Kubernetesን አብራ",
-  "Turn on Virtual Machine Platform": "Virtual Machine Platformን አብራ",
+  "Turn on WSL's Windows components": "Turn on WSL's Windows components",
   "Turn security off for local use": "ለአካባቢያዊ አጠቃቀም ደኅንነትን አጥፋ",
   "Type": "ዓይነት",
   "Type one, or generate it": "አንዱን ይተይቡ፣ ወይም ይፍጠሩት",

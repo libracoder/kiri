@@ -1185,7 +1185,7 @@
   "Turn off engine": "Oprește motorul",
   "Turn on Kiri's in Settings → Kubernetes instead of starting a copy.": "Activează-l pe cel al Kiri din Setări → Kubernetes în loc să pornești o copie.",
   "Turn on Kubernetes": "Activează Kubernetes",
-  "Turn on Virtual Machine Platform": "Activează Platforma de mașină virtuală",
+  "Turn on WSL's Windows components": "Turn on WSL's Windows components",
   "Turn security off for local use": "Dezactivează securitatea pentru uz local",
   "Type": "Tip",
   "Type one, or generate it": "Tastează una sau generează una",

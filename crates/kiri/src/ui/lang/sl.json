@@ -1185,7 +1185,7 @@
   "Turn off engine": "Izklopi pogon",
   "Turn on Kiri's in Settings → Kubernetes instead of starting a copy.": "Namesto zagona kopije vklopite Kirijevega v Nastavitve → Kubernetes.",
   "Turn on Kubernetes": "Vklopi Kubernetes",
-  "Turn on Virtual Machine Platform": "Vklopi platformo navideznega računalnika",
+  "Turn on WSL's Windows components": "Turn on WSL's Windows components",
   "Turn security off for local use": "Izklopi varnost za lokalno uporabo",
   "Type": "Vrsta",
   "Type one, or generate it": "Vnesite ga ali ga ustvarite",

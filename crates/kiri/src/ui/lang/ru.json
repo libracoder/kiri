@@ -1185,7 +1185,7 @@
   "Turn off engine": "Выключить движок",
   "Turn on Kiri's in Settings → Kubernetes instead of starting a copy.": "Вместо запуска копии включите кластер Kiri в разделе «Настройки» → «Kubernetes».",
   "Turn on Kubernetes": "Включить Kubernetes",
-  "Turn on Virtual Machine Platform": "Включить платформу виртуальных машин",
+  "Turn on WSL's Windows components": "Turn on WSL's Windows components",
   "Turn security off for local use": "Отключить защиту для локального использования",
   "Type": "Тип",
   "Type one, or generate it": "Введите его или создайте",

@@ -1185,7 +1185,7 @@
   "Turn off engine": "Motoru kapat",
   "Turn on Kiri's in Settings → Kubernetes instead of starting a copy.": "Bir kopya başlatmak yerine Ayarlar → Kubernetes'ten Kiri'ninkini açın.",
   "Turn on Kubernetes": "Kubernetes'i aç",
-  "Turn on Virtual Machine Platform": "Sanal Makine Platformu'nu aç",
+  "Turn on WSL's Windows components": "Turn on WSL's Windows components",
   "Turn security off for local use": "Yerel kullanım için güvenliği kapat",
   "Type": "Tür",
   "Type one, or generate it": "Bir tane yazın veya oluşturun",

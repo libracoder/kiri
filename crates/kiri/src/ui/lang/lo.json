@@ -1185,7 +1185,7 @@
   "Turn off engine": "ປິດເອນຈິນ",
   "Turn on Kiri's in Settings → Kubernetes instead of starting a copy.": "ເປີດ Kubernetes ຂອງ Kiri ໃນ ການຕັ້ງຄ່າ → Kubernetes ແທນການເລີ່ມອີກຊຸດ.",
   "Turn on Kubernetes": "ເປີດ Kubernetes",
-  "Turn on Virtual Machine Platform": "ເປີດ Virtual Machine Platform",
+  "Turn on WSL's Windows components": "Turn on WSL's Windows components",
   "Turn security off for local use": "ປິດຄວາມປອດໄພສຳລັບການໃຊ້ໃນເຄື່ອງ",
   "Type": "ປະເພດ",
   "Type one, or generate it": "ພິມເອງ, ຫຼື ສ້າງມັນ",

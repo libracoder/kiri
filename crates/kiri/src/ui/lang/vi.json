@@ -1185,7 +1185,7 @@
   "Turn off engine": "Tắt engine",
   "Turn on Kiri's in Settings → Kubernetes instead of starting a copy.": "Hãy bật cluster của Kiri trong Cài đặt → Kubernetes thay vì khởi động một bản sao.",
   "Turn on Kubernetes": "Bật Kubernetes",
-  "Turn on Virtual Machine Platform": "Bật Virtual Machine Platform",
+  "Turn on WSL's Windows components": "Turn on WSL's Windows components",
   "Turn security off for local use": "Tắt bảo mật khi dùng cục bộ",
   "Type": "Loại",
   "Type one, or generate it": "Nhập một mật khẩu, hoặc tạo tự động",

@@ -1185,7 +1185,7 @@
   "Turn off engine": "ఇంజిన్ ఆఫ్ చేయి",
   "Turn on Kiri's in Settings → Kubernetes instead of starting a copy.": "కాపీ ప్రారంభించడానికి బదులు సెట్టింగ్‌లు → Kubernetesలో Kiri సొంతదాన్ని ఆన్ చేయండి.",
   "Turn on Kubernetes": "Kubernetes ఆన్ చేయి",
-  "Turn on Virtual Machine Platform": "Virtual Machine Platform ఆన్ చేయి",
+  "Turn on WSL's Windows components": "Turn on WSL's Windows components",
   "Turn security off for local use": "లోకల్ వాడకం కోసం సెక్యూరిటీ ఆఫ్ చేయి",
   "Type": "రకం",
   "Type one, or generate it": "ఒకటి టైప్ చేయండి, లేదా జనరేట్ చేయండి",

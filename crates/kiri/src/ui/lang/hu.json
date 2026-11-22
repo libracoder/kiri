@@ -1185,7 +1185,7 @@
   "Turn off engine": "Motor kikapcsolása",
   "Turn on Kiri's in Settings → Kubernetes instead of starting a copy.": "Inkább kapcsold be a Kiri sajátját a Beállítások → Kubernetes alatt, ahelyett hogy egy másolatot indítanál.",
   "Turn on Kubernetes": "Kubernetes bekapcsolása",
-  "Turn on Virtual Machine Platform": "A Virtuálisgép-platform bekapcsolása",
+  "Turn on WSL's Windows components": "Turn on WSL's Windows components",
   "Turn security off for local use": "Biztonság kikapcsolása helyi használathoz",
   "Type": "Típus",
   "Type one, or generate it": "Írj be egyet, vagy generáld",

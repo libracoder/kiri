@@ -1185,7 +1185,7 @@
   "Turn off engine": "Wyłącz silnik",
   "Turn on Kiri's in Settings → Kubernetes instead of starting a copy.": "Zamiast uruchamiać kopię, włącz Kubernetes Kiri w sekcji Ustawienia → Kubernetes.",
   "Turn on Kubernetes": "Włącz Kubernetes",
-  "Turn on Virtual Machine Platform": "Włącz Platformę maszyny wirtualnej",
+  "Turn on WSL's Windows components": "Turn on WSL's Windows components",
   "Turn security off for local use": "Wyłącz zabezpieczenia do użytku lokalnego",
   "Type": "Typ",
   "Type one, or generate it": "Wpisz je lub wygeneruj",

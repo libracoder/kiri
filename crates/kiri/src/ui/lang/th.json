@@ -1185,7 +1185,7 @@
   "Turn off engine": "ปิดเอนจิน",
   "Turn on Kiri's in Settings → Kubernetes instead of starting a copy.": "เปิดของ Kiri ในการตั้งค่า → Kubernetes แทนการเริ่มอีกชุดหนึ่ง",
   "Turn on Kubernetes": "เปิด Kubernetes",
-  "Turn on Virtual Machine Platform": "เปิด Virtual Machine Platform",
+  "Turn on WSL's Windows components": "Turn on WSL's Windows components",
   "Turn security off for local use": "ปิดความปลอดภัยสำหรับการใช้งานในเครื่อง",
   "Type": "ประเภท",
   "Type one, or generate it": "พิมพ์เอง หรือสร้างขึ้นมา",

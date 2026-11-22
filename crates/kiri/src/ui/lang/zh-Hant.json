@@ -1185,7 +1185,7 @@
   "Turn off engine": "關閉引擎",
   "Turn on Kiri's in Settings → Kubernetes instead of starting a copy.": "請在「設定 → Kubernetes」中開啟 Kiri 內建的叢集，而不是另外啟動一份。",
   "Turn on Kubernetes": "開啟 Kubernetes",
-  "Turn on Virtual Machine Platform": "開啟虛擬機器平台",
+  "Turn on WSL's Windows components": "Turn on WSL's Windows components",
   "Turn security off for local use": "關閉安全性（僅供本機使用）",
   "Type": "類型",
   "Type one, or generate it": "輸入或產生一個",

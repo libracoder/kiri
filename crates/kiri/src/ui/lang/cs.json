@@ -1185,7 +1185,7 @@
   "Turn off engine": "Vypnout engine",
   "Turn on Kiri's in Settings → Kubernetes instead of starting a copy.": "Místo spouštění kopie zapněte Kubernetes Kiri v Nastavení → Kubernetes.",
   "Turn on Kubernetes": "Zapnout Kubernetes",
-  "Turn on Virtual Machine Platform": "Zapnout Platformu virtuálního počítače",
+  "Turn on WSL's Windows components": "Turn on WSL's Windows components",
   "Turn security off for local use": "Vypnout zabezpečení pro místní použití",
   "Type": "Typ",
   "Type one, or generate it": "Zadejte ho, nebo ho vygenerujte",

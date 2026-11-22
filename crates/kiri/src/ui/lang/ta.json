@@ -1185,7 +1185,7 @@
   "Turn off engine": "இன்ஜினை ஆஃப் செய்",
   "Turn on Kiri's in Settings → Kubernetes instead of starting a copy.": "நகலைத் தொடங்குவதற்குப் பதிலாக, அமைப்புகள் → Kubernetes-இல் Kiri-யுடையதை ஆன் செய்யவும்.",
   "Turn on Kubernetes": "Kubernetes-ஐ ஆன் செய்",
-  "Turn on Virtual Machine Platform": "Virtual Machine Platform-ஐ ஆன் செய்",
+  "Turn on WSL's Windows components": "Turn on WSL's Windows components",
   "Turn security off for local use": "உள்ளூர்ப் பயன்பாட்டுக்குப் பாதுகாப்பை ஆஃப் செய்",
   "Type": "வகை",
   "Type one, or generate it": "ஒன்றைத் தட்டச்சு செய்யவும், அல்லது உருவாக்கவும்",

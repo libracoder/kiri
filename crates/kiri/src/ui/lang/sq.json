@@ -1185,7 +1185,7 @@
   "Turn off engine": "Fik motorin",
   "Turn on Kiri's in Settings → Kubernetes instead of starting a copy.": "Aktivizoni atë të Kiri te Cilësimet → Kubernetes në vend që të nisni një kopje.",
   "Turn on Kubernetes": "Aktivizo Kubernetes",
-  "Turn on Virtual Machine Platform": "Aktivizo Virtual Machine Platform",
+  "Turn on WSL's Windows components": "Turn on WSL's Windows components",
   "Turn security off for local use": "Çaktivizo sigurinë për përdorim lokal",
   "Type": "Lloji",
   "Type one, or generate it": "Shkruani një, ose gjenerojeni",

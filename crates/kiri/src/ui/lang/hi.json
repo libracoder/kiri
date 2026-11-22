@@ -1185,7 +1185,7 @@
   "Turn off engine": "इंजन बंद करें",
   "Turn on Kiri's in Settings → Kubernetes instead of starting a copy.": "कॉपी शुरू करने के बजाय सेटिंग्स → Kubernetes में Kiri का वाला चालू करें।",
   "Turn on Kubernetes": "Kubernetes चालू करें",
-  "Turn on Virtual Machine Platform": "Virtual Machine Platform चालू करें",
+  "Turn on WSL's Windows components": "Turn on WSL's Windows components",
   "Turn security off for local use": "लोकल उपयोग के लिए सुरक्षा बंद करें",
   "Type": "प्रकार",
   "Type one, or generate it": "एक टाइप करें, या बनवाएँ",

@@ -1185,7 +1185,7 @@
   "Turn off engine": "Sammuta moottori",
   "Turn on Kiri's in Settings → Kubernetes instead of starting a copy.": "Ota Kirin oma käyttöön kohdassa Asetukset → Kubernetes sen sijaan, että käynnistäisit kopion.",
   "Turn on Kubernetes": "Ota Kubernetes käyttöön",
-  "Turn on Virtual Machine Platform": "Ota Virtual Machine Platform käyttöön",
+  "Turn on WSL's Windows components": "Turn on WSL's Windows components",
   "Turn security off for local use": "Poista suojaus käytöstä paikallista käyttöä varten",
   "Type": "Tyyppi",
   "Type one, or generate it": "Kirjoita tai luo se",

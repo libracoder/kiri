@@ -1185,7 +1185,7 @@
   "Turn off engine": "Απενεργοποίηση μηχανής",
   "Turn on Kiri's in Settings → Kubernetes instead of starting a copy.": "Ενεργοποιήστε το Kubernetes του Kiri στις Ρυθμίσεις → Kubernetes αντί να ξεκινήσετε αντίγραφο.",
   "Turn on Kubernetes": "Ενεργοποίηση Kubernetes",
-  "Turn on Virtual Machine Platform": "Ενεργοποίηση της Πλατφόρμας εικονικής μηχανής",
+  "Turn on WSL's Windows components": "Turn on WSL's Windows components",
   "Turn security off for local use": "Απενεργοποίηση ασφάλειας για τοπική χρήση",
   "Type": "Τύπος",
   "Type one, or generate it": "Πληκτρολογήστε έναν ή δημιουργήστε τον",

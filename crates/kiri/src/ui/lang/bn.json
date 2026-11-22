@@ -1185,7 +1185,7 @@
   "Turn off engine": "ইঞ্জিন বন্ধ করুন",
   "Turn on Kiri's in Settings → Kubernetes instead of starting a copy.": "একটি কপি চালু না করে সেটিংস → Kubernetes-এ Kiri-র নিজস্বটি চালু করুন।",
   "Turn on Kubernetes": "Kubernetes চালু করুন",
-  "Turn on Virtual Machine Platform": "Virtual Machine Platform চালু করুন",
+  "Turn on WSL's Windows components": "Turn on WSL's Windows components",
   "Turn security off for local use": "লোকাল ব্যবহারের জন্য সিকিউরিটি বন্ধ করুন",
   "Type": "ধরন",
   "Type one, or generate it": "একটি লিখুন, অথবা তৈরি করুন",

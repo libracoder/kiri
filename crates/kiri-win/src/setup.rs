@@ -640,10 +640,10 @@ fn install_wsl() -> io::Result<()> {
     let components_only = wsl_answer() == Wsl::There;
     // Task indexes: Download WSL and Install WSL only with the installer.
     let (approval, components, install) = if components_only {
-        update(|s| s.tasks = tasks(&[tr("Administrator approval"), tr("Turn on Virtual Machine Platform")]));
+        update(|s| s.tasks = tasks(&[tr("Administrator approval"), tr("Turn on WSL's Windows components")]));
         (0, 1, None)
     } else {
-        update(|s| s.tasks = tasks(&[tr("Download WSL"), tr("Administrator approval"), tr("Turn on Virtual Machine Platform"), tr("Install WSL")]));
+        update(|s| s.tasks = tasks(&[tr("Download WSL"), tr("Administrator approval"), tr("Turn on WSL's Windows components"), tr("Install WSL")]));
         (1, 2, Some(3))
     };
     // WSL_MSI is this build's architecture's; on another PC it would not install.
