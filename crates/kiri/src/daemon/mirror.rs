@@ -4,7 +4,10 @@
 //! A read-only registry API on 127.0.0.1, which containers reach at
 //! host.docker.internal. buildkitd.toml names it as a mirror of every
 //! registry Kiri has images from; a mirror that answers 404 is skipped, so
-//! anything not here comes from the registry itself. Paths carry a secret
+//! anything not here comes from the registry itself. A tag a registry
+//! published is not answered here even when Kiri holds it: the registry,
+//! not this machine, knows which platforms it has (see `lookup`).
+//! Paths carry a secret
 //! (`/v2/<token>/<registry>/<repo>/…`), so other local users can't read
 //! images through it. Manifests are made from the store's records (layers,
 //! config), the same bytes for the same image every time.
@@ -245,6 +248,15 @@ fn parse(path: &str, token: &str) -> Option<(String, String, bool, String)> {
     (!repo.is_empty() && !reference.is_empty() && !reference.contains('/')).then(|| (registry.to_owned(), repo.to_owned(), kind, reference.to_owned()))
 }
 
+/// Whether the mirror answers for `i` under its tag. It does for an image no
+/// registry has (built, loaded, committed: its digest is its config's), which
+/// is the one thing a build cannot get anywhere else. An image a registry
+/// published is left to that registry, which knows every platform of the tag;
+/// answering with the one platform Kiri pulled would hide the rest.
+fn serve_tag(i: &Image) -> bool {
+    i.repo_digest().is_none()
+}
+
 fn lookup(engine: &Engine, path: &str, token: &str) -> Option<Found> {
     let (registry, repo, is_manifest, reference) = parse(path, token)?;
     let images = engine.store.images().ok()?;
@@ -254,7 +266,12 @@ fn lookup(engine: &Engine, path: &str, token: &str) -> Option<Found> {
             return images.iter().filter(in_repo).find_map(|i| manifest(&engine.store, i).filter(|(_, d)| *d == reference)).map(|(b, d)| Found::Manifest(b, d));
         }
         let wanted = Reference::parse(&format!("{registry}/{repo}:{reference}")).ok()?.short();
-        let i = images.iter().find(|i| i.name == wanted)?;
+        // A tag a registry published is the registry's to answer: Kiri holds
+        // the one platform it pulled, and serving that says the tag has no
+        // other, so a build for another platform takes these binaries and
+        // fails on them (issue #57). 404 here makes the builder skip this
+        // mirror and pull the platform it asked for.
+        let i = images.iter().find(|i| i.name == wanted && serve_tag(i))?;
         let (b, d) = manifest(&engine.store, i)?;
         return Some(Found::Manifest(b, d));
     }
@@ -286,6 +303,35 @@ mod tests {
         #[cfg(not(target_os = "linux"))]
         assert_eq!(mirror_host(&networks), super::super::ports::HOST_ADDR);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_tag_a_registry_published_is_left_to_it() {
+        // Pulled: its digest is its manifest's, so a registry has it.
+        let pulled = Image { name: "alpine:3.20".into(), digest: "sha256:manifest".into(), ..made_here() };
+        assert!(!serve_tag(&pulled));
+        // Built or loaded here: nothing else can serve it, platform or not.
+        assert!(serve_tag(&made_here()));
+        // Tagged into another repository (docker tag alpine:3.20 mybase:dev):
+        // that name is not in any registry, so the mirror answers for it.
+        assert!(serve_tag(&Image { name: "mybase:dev".into(), ..made_here() }));
+    }
+
+    /// An image built here: no registry has it.
+    fn made_here() -> Image {
+        let config_digest = "sha256:config".to_owned();
+        Image {
+            name: "myapp:dev".into(),
+            digest: config_digest.clone(),
+            index_digest: None,
+            config_digest,
+            layers: Vec::new(),
+            size: 0,
+            platform: "linux/amd64".into(),
+            created: String::new(),
+            pulled_at: 0,
+            config: kiri_image::RunConfig::default(),
+        }
     }
 
     #[test]
