@@ -102,6 +102,7 @@ volume-prune-keeps-opts	#623	a volume prune deleted volumes made with driver opt
 build-prune-until-date	#623	a build-cache prune did not take until as a date
 dns-default-bridge-gateway	#624	on a host whose resolver is one of its own addresses (WSL), the default bridge got a loopback resolver
 dns-default-bridge-no-loopback	#624	on a host whose resolver is one of its own addresses (WSL), the default bridge got 127.0.0.11
+network-rm-init-gateway-dns	#248	a removed network's DNS listener stayed open in an --init container's PID 1, so the next network on that subnet had no DNS at its gateway (and, before #642, no container could start on it)
 build-resolvconf	#624	on a host whose resolver is one of its own addresses (WSL), build steps did not get Kiri's resolver
 build-no-public-resolver	#624	on a host whose resolver is one of its own addresses (WSL), BuildKit put 8.8.8.8 in build steps
 user-net-own-dns-server	#624	a container on a user network could not bind port 53 for its own DNS server
@@ -158,3 +159,4 @@ auth-null-fields-wrong	#654	a wrong password with null fields must still say inc
 pull-auth-null-fields	#654	X-Registry-Auth with JSON null fields (Testcontainers) was dropped, so a private pull went anonymous and got 401
 pull-auth-null-std-b64	#654	X-Registry-Auth with null fields in standard padded base64 must sign in too
 pull-auth-all-null	#654	X-Registry-Auth with every field null is no sign-in: the pull stays anonymous
+network-rm-failed-start-gateway-dns	#248	a start that failed on a network left a DNS listener at its gateway after the network was removed

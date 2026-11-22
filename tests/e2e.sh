@@ -639,16 +639,60 @@ $D rm -f db svc dnsbad >/dev/null
 t network-rm "appnet" $D network rm appnet
 code network-rm-builtin 1 $D network rm bridge
 # A network removed while an --init container runs frees its DNS address
-# for the next network on that subnet (#248).
+# for the next network on that subnet (#248). Two pad networks (own subnets)
+# keep the next network off the removed one's bridge name, so the new network
+# has the same subnet on a different bridge: only a listener the agent still
+# holds for the old gateway can answer there, and a fresh one is not reused.
+# Asking a gateway directly (NETWORK NAME GATEWAY ADDRESS): "resolved" when
+# it answers with the container's own address; an empty gateway or address
+# is said, never asked of the resolver in /etc/resolv.conf.
+GWASK='[ -n "$3" ] && [ -n "$4" ] || { echo "no gateway or address"; exit 0; }; '"$D"' run --rm --network "$1" alpine sh -c '\''nslookup -timeout=2 "$1" "$2" 2>&1 | grep -A2 ^Name: | grep -qwF "$3" && echo resolved || echo none'\'' _ "$2" "$3" "$4"'
+gwof() { $D network inspect "$1" -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}'; }
+ipon() { $D inspect -f "{{(index .NetworkSettings.Networks \"$2\").IPAddress}}" "$1" 2>/dev/null; }
+$D network create --subnet 10.236.1.0/24 initpad1 >/dev/null
 $D network create initnet >/dev/null
 initsub=$($D network inspect initnet -f '{{range .IPAM.Config}}{{.Subnet}}{{end}}')
 $D run -d --name initnetc --network initnet alpine sleep 60 >/dev/null
 $D run -d --name initkeep --init alpine sleep 60 >/dev/null
+# Hosts that refuse the gateway's port 53 (WSL 2 in its default networking)
+# never had a listener to leak: probe the gateway before removing the network.
+# Elsewhere the probe is a check of its own, so a gateway that stops answering
+# fails here rather than turning the two checks below into skips.
+initgw=$(bash -c "$GWASK" _ initnet initnetc "$(gwof initnet)" "$(ipon initnetc initnet)")
+# Only a probe that ran and got no answer on WSL is a skip; any other result
+# (an empty one, "no gateway or address") fails the first check.
+initgwdns=; initgwwsl=
+if [ "$initgw" = resolved ]; then initgwdns=1; elif [ "$initgw" = none ] && on wsl; then initgwwsl=1; fi
+gwskip() { if [ -n "$initgwwsl" ]; then skip "$1" "the gateway's port 53 can't be bound on WSL"; else skip_setup "$1" "the gateway's port 53 didn't answer"; fi; }
+if [ -z "$initgwwsl" ]; then t network-init-gateway-dns "resolved" echo "$initgw"; else gwskip network-init-gateway-dns; fi
 $D rm -f initnetc >/dev/null; $D network rm initnet >/dev/null
-$D network create initnet2 >/dev/null
+$D network create --subnet 10.236.2.0/24 initpad2 >/dev/null
+$D network create --subnet "$initsub" initnet2 >/dev/null
 t network-rm-init-same-subnet "$initsub" $D network inspect initnet2 -f '{{range .IPAM.Config}}{{.Subnet}}{{end}}'
 code network-rm-init-dns 0 $D run --rm --network initnet2 alpine true
-$D rm -f initkeep >/dev/null; $D network rm initnet2 >/dev/null
+# A start no longer fails when the gateway's listener can't be opened (#642),
+# so ask the gateway itself: it answers only if the old listener was freed.
+$D run -d --name initnet2c --network initnet2 alpine sleep 60 >/dev/null
+if [ -n "$initgwdns" ]; then
+  t network-rm-init-gateway-dns "resolved" bash -c "$GWASK" _ initnet2 initnet2c "$(gwof initnet2)" "$(ipon initnet2c initnet2)"
+else
+  gwskip network-rm-init-gateway-dns
+fi
+$D rm -f initkeep initnet2c >/dev/null; $D network rm initnet2 initpad2 >/dev/null
+# A start that fails on a network, then the network removed: the next network
+# on that subnet (another bridge) has its own working gateway.
+$D network create --subnet 10.236.3.0/24 failnet >/dev/null
+$D run -d --name failnetc --network failnet --sysctl net.ipv4.kiri_no_such_key=1 alpine sleep 60 >/dev/null 2>&1
+$D rm -f failnetc >/dev/null 2>&1; $D network rm failnet >/dev/null
+$D network create --subnet 10.236.4.0/24 failpad >/dev/null
+$D network create --subnet 10.236.3.0/24 failnet2 >/dev/null
+$D run -d --name failnet2c --network failnet2 alpine sleep 60 >/dev/null
+if [ -n "$initgwdns" ]; then
+  t network-rm-failed-start-gateway-dns "resolved" bash -c "$GWASK" _ failnet2 failnet2c "$(gwof failnet2)" "$(ipon failnet2c failnet2)"
+else
+  gwskip network-rm-failed-start-gateway-dns
+fi
+$D rm -f failnet2c >/dev/null; $D network rm failnet2 failpad initpad1 >/dev/null
 # --init's PID 1 doesn't keep its own stdin open: cat sees the end of it
 # (a held one would leave cat to the timeout, exit 143).
 code init-stdin-eof 0 bash -c "echo x | $D run -i --rm --init alpine timeout 10 cat"
