@@ -205,16 +205,9 @@ fn quiet(program: &str) -> Command {
 fn wsl_text(bytes: &[u8]) -> String {
     let (bytes, bom) = bytes.strip_prefix(&[0xFF, 0xFE]).map_or((bytes, false), |rest| (rest, true));
     let text = if bom || looks_utf16(bytes) {
-        let (pairs, rest) = bytes.as_chunks::<2>();
-        let units: Vec<u16> = pairs.iter().map(|&p| u16::from_le_bytes(p)).collect();
-        let mut text = String::from_utf16_lossy(&units);
-        // Output cut short mid-unit: an ASCII low byte is still its letter.
-        if let [last] = rest
-            && last.is_ascii()
-        {
-            text.push(char::from(*last));
-        }
-        text
+        // Output cut short mid-unit leaves a lone byte: half a code unit, dropped.
+        let units: Vec<u16> = bytes.as_chunks::<2>().0.iter().map(|&p| u16::from_le_bytes(p)).collect();
+        String::from_utf16_lossy(&units)
     } else {
         String::from_utf8_lossy(bytes).into_owned()
     };
@@ -1097,8 +1090,8 @@ mod tests {
             assert!(super::nothing_listed(&cut) && super::component_required(&cut), "{m}");
             assert!(super::nothing_listed(&utf16(m)) && super::component_required(&utf16(m)), "{m}");
         }
-        // A distro list cut short at an odd byte keeps its last letter.
-        assert_eq!(super::wsl_text(&utf16("kiri\r\nUbuntu")[..23]), "kiri\r\nUbuntu");
+        // A distro list cut short at an odd byte loses the half unit, not a letter more.
+        assert_eq!(super::wsl_text(&utf16("kiri\r\nUbuntu")[..23]), "kiri\r\nUbunt");
         // UTF-16 with no ASCII and no BOM is byte for byte valid UTF-8: only
         // the mark tells it apart.
         assert_eq!(super::wsl_text(&[&[0xFF, 0xFE][..], &utf16("ぁぃぅ")].concat()), "ぁぃぅ");
