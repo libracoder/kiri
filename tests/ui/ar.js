@@ -125,8 +125,10 @@ t("dragging a column's edge to the left widens it: its far edge is the left one"
 // A Compose project, and another engine behind `docker`: two lines the page joins itself.
 const member = (id, name, state) => ({ Id: id, Names: ["/" + name], Image: "nginx:alpine", State: state, Status: state === "running" ? "Up 1 hour" : "Exited (0)", Created: Date.now() / 1000 - 3600, Ports: [], Labels: { "com.docker.compose.project": "shop" } });
 kiri.on({ type: "lists", containers: [...ui.containers, member("c1", "shop_web_1", "running"), member("c2", "shop_db_1", "exited")], images: ui.images, volumes: ui.volumes, networks: ui.networks });
+kiri.on({ type: "composeprojects", logos: {}, projects: [{ name: "shop", dir: "/w/shop", files: ["/w/shop/compose.yaml"], readable: true, services: [], containers: [] }] });
 kiri.on({ ...ui.status, type: "status", app: "Kiri Dev", ours: "kiri", context: "default" });
-show("containers");
+// The project's row is in Compose.
+show("compose");
 t("a line the page joins itself keeps its Arabic words in order", () => {
   // "Compose", then Arabic words: marked, so it starts on the right like the rows around it.
   const sub = document.querySelector("tr.group .sub-name");
@@ -182,7 +184,7 @@ t("English again from Settings: left to right, as before", () => {
   if (getComputedStyle(document.querySelector(".settings .pane h3")).unicodeBidi === "plaintext") throw new Error("still plaintext");
   if (/[\u200F\u2068\u2069]/.test(tr("of {cap}", { cap: "5.0 GB" }))) throw new Error("marks left in English");
   if (document.querySelector("[dir=auto]")) throw new Error("dir=auto left on " + document.querySelector("[dir=auto]").className);
-  show("containers");
+  show("compose");
   const joined = document.querySelector("tr.group .sub-name").textContent + document.querySelector(".statusbar .ctx-warn").textContent + shTarget({ source: "old-web", target: "localhost:8080" });
   if (/[\u200F\u2068\u2069←]/.test(joined) || !joined.includes("docker → Docker's default engine")) throw new Error("the joined lines: " + JSON.stringify(joined));
   if (getComputedStyle(document.querySelector("th:not(.ck)")).textAlign !== "left") throw new Error("headings didn't go back");

@@ -129,6 +129,14 @@ pub fn step_aside(port: u16) -> bool {
     stepped
 }
 
+/// Whether a router serves `port` now. Containers reach the Mac's loopback
+/// through host.docker.internal (ports::host_bound), and the router routes
+/// by Host header alone: through it a container would reach every other
+/// container, whatever network it is on.
+pub fn routes(port: u16) -> bool {
+    ROUTERS.lock().unwrap_or_else(PoisonError::into_inner).iter().any(|r| r.port == port && !r.serving.lock().unwrap_or_else(PoisonError::into_inner).is_empty())
+}
+
 /// Every few seconds, a router that stepped aside tries its port again.
 fn reclaim() {
     loop {
@@ -146,11 +154,16 @@ fn reclaim() {
     }
 }
 
-/// Adds a router to the list, starting the take-back thread with the first.
+/// Adds a router to the list, starting the take-back thread with the first
+/// (once: the list is empty again after `reset` turns a test copy's off).
 fn register(router: Arc<Router>) -> io::Result<()> {
+    static RECLAIMING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     let mut routers = ROUTERS.lock().unwrap_or_else(PoisonError::into_inner);
-    if routers.is_empty() {
-        std::thread::Builder::new().name("kiri-domains-reclaim".into()).spawn(reclaim)?;
+    if !RECLAIMING.swap(true, std::sync::atomic::Ordering::Relaxed)
+        && let Err(e) = std::thread::Builder::new().name("kiri-domains-reclaim".into()).spawn(reclaim)
+    {
+        RECLAIMING.store(false, std::sync::atomic::Ordering::Relaxed);
+        return Err(e);
     }
     routers.push(router);
     Ok(())
@@ -278,6 +291,18 @@ pub fn set_ports(engine: &Arc<Engine>, http: u16, https: u16) -> Result<serde_js
     if http == https {
         return Err("HTTP and HTTPS need different ports".into());
     }
+    move_routers(engine, http, https)?;
+    let path = settings_path().ok_or("HOME is not set")?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::json!({"http": http, "https": https}).to_string())
+        .and_then(|()| std::fs::rename(&tmp, &path))
+        .map_err(|e| e.to_string())?;
+    Ok(report())
+}
+
+/// Moves the routers to `http` and `https` (starting one that isn't
+/// running); the caller holds `MOVING`.
+fn move_routers(engine: &Arc<Engine>, http: u16, https: u16) -> Result<(), String> {
     let mut moves: Vec<(Option<Arc<Router>>, Arc<Router>)> = Vec::new();
     for (kind, want) in [(Kind::Http, http), (Kind::Https, https)] {
         if let Some(p) = env_port(kind.var())
@@ -312,11 +337,39 @@ pub fn set_ports(engine: &Arc<Engine>, http: u16, https: u16) -> Result<serde_js
         register(new).map_err(|e| e.to_string())?;
         crate::diag::info!("the container-domain router moved", port = port);
     }
-    let path = settings_path().ok_or("HOME is not set")?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::json!({"http": http, "https": https}).to_string())
-        .and_then(|()| std::fs::rename(&tmp, &path))
-        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// The routers' ports with nothing saved, as the daemon starts them: the
+/// environment's, else 80 and 443; `None` for a test copy (Kiri Dev, Kiri
+/// Repro...) without KIRI_HTTP_PORT, which starts none and so never takes
+/// 80 and 443 from the installed Kiri.
+fn default_ports(dev: bool, env: impl Fn(Kind) -> Option<u16>) -> Option<(u16, u16)> {
+    if dev && env(Kind::Http).is_none() {
+        return None;
+    }
+    Some((env(Kind::Http).unwrap_or(Kind::Http.default()), env(Kind::Https).unwrap_or(Kind::Https.default())))
+}
+
+/// Settings → Domains back to the start: forgets the saved ports and puts
+/// the routers where a restart would, with no restart. A test copy's
+/// routers stop.
+pub fn reset(engine: &Arc<Engine>) -> Result<serde_json::Value, String> {
+    let _one = MOVING.lock().unwrap_or_else(PoisonError::into_inner);
+    match default_ports(crate::flavor::dev(), |k| env_port(k.var())) {
+        Some((http, https)) => move_routers(engine, http, https)?,
+        None => {
+            let off = std::mem::take(&mut *ROUTERS.lock().unwrap_or_else(PoisonError::into_inner));
+            for r in off {
+                r.stop();
+                crate::diag::info!("the container-domain router stopped", port = r.port);
+            }
+        }
+    }
+    match settings_path().map(std::fs::remove_file) {
+        Some(Err(e)) if e.kind() != io::ErrorKind::NotFound => return Err(e.to_string()),
+        _ => {}
+    }
     Ok(report())
 }
 
@@ -370,12 +423,19 @@ fn route(client: &mut impl ReadWrite, engine: &Engine, scheme: &str) -> io::Resu
         .find_map(|l| l.split_once(':').filter(|(k, _)| k.eq_ignore_ascii_case("host")).map(|(_, v)| v.trim().to_owned()))
         .unwrap_or_default();
     let Some(target) = engine.route(&host) else {
-        let list: String = engine.domains().iter().map(|d| { let d = escape(d); format!("<li><a href=\"{scheme}://{d}\">{d}</a></li>") }).collect();
+        // The running containers are listed only for this machine's own
+        // names. A page reached through DNS rebinding asks with its own
+        // domain as the Host, and could read the list from this answer.
+        let running = if local_host(&host) {
+            let list: String = engine.domains().iter().map(|d| { let d = escape(d); format!("<li><a href=\"{scheme}://{d}\">{d}</a></li>") }).collect();
+            format!("<p>Running containers:</p><ul>{}</ul>", if list.is_empty() { "<li>none</li>".to_owned() } else { list })
+        } else {
+            String::new()
+        };
         let body = format!(
             "<!doctype html><meta charset=utf-8><title>Kiri</title><body style=\"font:15px -apple-system,sans-serif;margin:40px\">\
-             <h1>No running container for {}</h1><p>Running containers:</p><ul>{}</ul>",
+             <h1>No running container for {}</h1>{running}",
             escape(&host),
-            if list.is_empty() { "<li>none</li>".to_owned() } else { list }
         );
         respond(client, 404, "Not Found", &body)?;
         return Ok(None);
@@ -568,13 +628,59 @@ fn respond(client: &mut impl Write, status: u16, reason: &str, body: &str) -> io
     )
 }
 
+/// Whether a request's Host is a name for this machine itself: `localhost`,
+/// anything under `.localhost` (which always resolves to loopback), a
+/// `.kiri.local` name, or a loopback address. Another site's domain is not,
+/// even when its DNS answers with 127.0.0.1.
+fn local_host(host: &str) -> bool {
+    let host = host.trim();
+    // Without the port: `[::1]:80`, `127.0.0.1:80`, `web.kiri.localhost:8080`.
+    let name = match host.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or(""),
+        None => match host.rsplit_once(':') {
+            Some((name, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => name,
+            _ => host,
+        },
+    };
+    let name = name.trim_end_matches('.').to_ascii_lowercase();
+    name == "localhost" || name.ends_with(".localhost") || name.ends_with(".kiri.local") || name.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
 fn escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{candidates, choose, Target};
+    use super::{candidates, choose, default_ports, Kind, Target};
+
+    /// Back to the start: Kiri's routers return to 80 and 443 (or the
+    /// environment's ports); a test copy's stop, unless the environment
+    /// gives it ports, so it never takes 80 and 443 from Kiri.
+    #[test]
+    fn reset_puts_back_the_ports_a_start_would_use() {
+        let none = |_: Kind| None;
+        let env = |k: Kind| Some(if k == Kind::Http { 8080 } else { 8443 });
+        let http_only = |k: Kind| (k == Kind::Http).then_some(8080);
+        assert_eq!(default_ports(false, none), Some((80, 443)));
+        assert_eq!(default_ports(false, env), Some((8080, 8443)));
+        assert_eq!(default_ports(true, none), None, "a test copy starts no routers");
+        assert_eq!(default_ports(true, env), Some((8080, 8443)));
+        assert_eq!(default_ports(true, http_only), Some((8080, 443)), "as the daemon starts it");
+        assert_eq!(default_ports(true, |k: Kind| (k == Kind::Https).then_some(8443)), None, "KIRI_HTTPS_PORT alone starts none");
+    }
+
+    /// The "no such container" page lists the running containers for this
+    /// machine's own names only: a rebinding page's Host is its own domain.
+    #[test]
+    fn only_this_machines_names_get_the_container_list() {
+        for local in ["localhost", "localhost:80", "nope.kiri.localhost", "NOPE.Kiri.Localhost:8080", "web.shop.kiri.local", "api.kiri.local:18780", "127.0.0.1", "127.0.0.1:80", "[::1]", "[::1]:443", "anything.localhost."] {
+            assert!(super::local_host(local), "{local}");
+        }
+        for foreign in ["", "rebind.example.com", "rebind.example.com:80", "kiri.localhost.example.com", "localhost.example.com", "192.168.1.10", "10.0.0.1:80", "[2001:db8::1]:80", "notlocalhost", "kiri.local.evil.io"] {
+            assert!(!super::local_host(foreign), "{foreign}");
+        }
+    }
 
     fn t(label: Option<u16>, published: &[u16], exposed: &[u16]) -> Target {
         Target { ip: [0; 4], id: String::new(), label, published: published.to_vec(), exposed: exposed.to_vec() }

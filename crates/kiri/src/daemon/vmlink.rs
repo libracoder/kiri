@@ -23,8 +23,9 @@ use kiri_vmm::Vm;
 pub enum Reply {
     LayerStatus(bool),
     LayerStored,
-    /// The process's PID, as the agent's kernel numbers it.
-    Started(u32),
+    /// The process's PID, as the agent's kernel numbers it, and whether
+    /// its root is still being made (see `VmLink::run`).
+    Started(u32, bool),
     Stats(Stats),
     Pong,
     FsStat(FileInfo),
@@ -80,6 +81,14 @@ pub struct VmLink {
     _vm: Mutex<Vm>,
     /// Opens vsock streams without that mutex, so connects run side by side.
     connector: kiri_vmm::Connector,
+    /// A copy of the connection, shut down when the agent process exits
+    /// (see `new`); only while the link lives.
+    #[cfg(target_os = "linux")]
+    _stop_conn: Arc<File>,
+    /// The agent's folder on a Linux host, where it leaves what `docker
+    /// info` should warn about (`host_warnings`).
+    #[cfg(target_os = "linux")]
+    agent_dir: std::path::PathBuf,
 }
 
 impl std::fmt::Debug for VmLink {
@@ -95,7 +104,18 @@ struct Writer {
 }
 
 impl Writer {
+    /// Whether the encoded request is within the agent's frame limit: one
+    /// over it ends the agent, and every container with it, so it fails
+    /// here alone, before anything is queued or sent.
+    fn fits(&self) -> io::Result<()> {
+        if self.out.len() > kiri_proto::MAX_FRAME {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("the request is too large for the engine ({} bytes, the limit is {})", self.out.len(), kiri_proto::MAX_FRAME)));
+        }
+        Ok(())
+    }
+
     fn write(&mut self, windows: &Windows, body: Option<(File, u64)>) -> io::Result<()> {
+        self.fits()?;
         let result = self.write_request(body);
         if result.is_err() {
             // A partial frame cannot be retried on this stream. Publish
@@ -261,7 +281,7 @@ impl VmLink {
                     }
                     Ok(Msg::LayerStatus(have)) => Reply::LayerStatus(have),
                     Ok(Msg::LayerStored(_)) => Reply::LayerStored,
-                    Ok(Msg::Started { pid, .. }) => Reply::Started(pid),
+                    Ok(Msg::Started { pid, starting, .. }) => Reply::Started(pid, starting),
                     Ok(Msg::Stats(s)) => Reply::Stats(s),
                     Ok(Msg::Pong(_)) => Reply::Pong,
                     Ok(Msg::FsStat(e)) => Reply::FsStat(FileInfo::from(e)),
@@ -294,7 +314,30 @@ impl VmLink {
             on_event(Event::Lost);
             wins.finish_loss();
         })?;
+        // On a Linux host the connection is a socket the agent process
+        // shares with its children: one that hung before closing its copy
+        // kept it open after the agent was gone, so the reader never saw
+        // the end, nothing waiting for a reply ever got one, and the agent
+        // was never restarted. Its exit ends the connection here instead.
+        // (A VM's vsock ends with the VM.)
+        #[cfg(target_os = "linux")]
+        let stop_conn = {
+            let stop_conn = Arc::new(conn.try_clone()?);
+            let weak = Arc::downgrade(&stop_conn);
+            vm.on_stop(Box::new(move || {
+                if let Some(c) = weak.upgrade() {
+                    use std::os::fd::AsRawFd;
+                    // SAFETY: shutdown on a socket this link still owns.
+                    unsafe { libc::shutdown(c.as_raw_fd(), libc::SHUT_RDWR) };
+                }
+            }));
+            stop_conn
+        };
         Ok(VmLink {
+            #[cfg(target_os = "linux")]
+            _stop_conn: stop_conn,
+            #[cfg(target_os = "linux")]
+            agent_dir: vm.agent_dir().to_owned(),
             writer: Mutex::new(Writer { conn, out: Vec::with_capacity(4096), blob: vec![0; 256 * 1024] }),
             pending,
             windows,
@@ -314,6 +357,8 @@ impl VmLink {
             let mut w = self.writer.lock().unwrap_or_else(|e| e.into_inner());
             w.out.clear();
             encode(&mut w.out);
+            // Too large: refused before a reply slot is queued for it.
+            w.fits()?;
             // Queue the slot before writing, so the reply can never arrive first.
             {
                 let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
@@ -383,9 +428,33 @@ impl VmLink {
         caps: u64,
         opts: &[String],
         seccomp: &[u8],
+        cancel: &std::sync::atomic::AtomicBool,
     ) -> io::Result<u32> {
         self.windows.open(id);
-        let r = self.call(|o| kiri_proto::encode_run(o, id, layers, argv, env, cwd, user, hostname, flags, net, mounts, limits, caps, opts, seccomp), None).and_then(started);
+        // Its process runs, but its root may not be in place yet (a new
+        // volume is being filled): the agent answered at once rather than
+        // stall every other container meanwhile. The start is reported only
+        // once an exec can enter it (#311), or fails as a start.
+        let r = self
+            .call(|o| kiri_proto::encode_run(o, id, layers, argv, env, cwd, user, hostname, flags, net, mounts, limits, caps, opts, seccomp), None)
+            .and_then(started)
+            .and_then(|(pid, starting)| {
+                if starting {
+                    // Stopped or removed meanwhile (`Engine::cancel_start`):
+                    // told again once the guest surely knows the container,
+                    // so a cancel sent before its `Run` arrived still counts.
+                    let mut told = false;
+                    let ask = || {
+                        if !told && cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                            told = true;
+                            self.cancel_start(id)?;
+                        }
+                        self.call(|o| Msg::AwaitStart { id }.encode(o), None)
+                    };
+                    wait_started(ask, std::thread::sleep)?;
+                }
+                Ok(pid)
+            });
         if r.is_err() {
             self.windows.close(id);
         }
@@ -455,10 +524,20 @@ impl VmLink {
         self.ack(|o| Msg::NetDetach { id, ifname: &ifname, bridge, ip }.encode(o))
     }
 
+    /// Replaces the DNS names the guest resolves for a container's address
+    /// on a bridge after `docker rename`; `v4` is whether the network has
+    /// IPv4 addresses. No reply, which is why the protocol is 8: an older
+    /// agent would answer an unknown frame with an error, and the next
+    /// request would take it for its own reply. The guest refuses a frame
+    /// that names no running container's address.
+    pub fn dns_rename(&self, id: &str, bridge: &str, ip: [u8; 4], ip6: Option<[u8; 16]>, v4: bool, names: &[String]) -> io::Result<()> {
+        self.send(|o| kiri_proto::encode_dns_rename(o, id, bridge, ip, ip6, v4, names))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn exec(&self, container_id: &str, exec_id: &str, argv: &[String], env: &[String], cwd: &str, user: &str, flags: u32, caps: u64, opts: &[String]) -> io::Result<u32> {
         self.windows.open(exec_id);
-        let r = self.call(|o| kiri_proto::encode_exec(o, container_id, exec_id, argv, env, cwd, user, flags, caps, opts), None).and_then(started);
+        let r = self.call(|o| kiri_proto::encode_exec(o, container_id, exec_id, argv, env, cwd, user, flags, caps, opts), None).and_then(started).map(|(pid, _)| pid);
         if r.is_err() {
             self.windows.close(exec_id);
         }
@@ -549,6 +628,12 @@ impl VmLink {
         self.send(|o| Msg::Kill { id, signal }.encode(o))
     }
 
+    /// See `Msg::CancelStart`. No reply: the start's own `AwaitStart` hears
+    /// how it ended.
+    pub fn cancel_start(&self, id: &str) -> io::Result<()> {
+        self.send(|o| Msg::CancelStart { id }.encode(o))
+    }
+
     pub fn remove(&self, id: &str) -> io::Result<()> {
         self.send(|o| Msg::Remove { id }.encode(o))
     }
@@ -594,6 +679,18 @@ impl VmLink {
             Reply::Stats(s) => Ok(s),
             other => Err(io::Error::other(format!("expected Stats, got {other:?}"))),
         }
+    }
+
+    /// What the agent on a Linux host found wrong with the host for `docker
+    /// info`: a firewall that drops the containers' traffic and that Kiri
+    /// may not change (an nftables.conf's chain), with the rules that let
+    /// them through. A VM has no host firewall to warn about.
+    pub fn host_warnings(&self) -> Vec<String> {
+        #[cfg(target_os = "linux")]
+        if let Ok(text) = std::fs::read_to_string(self.agent_dir.join("firewall-warnings")) {
+            return text.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect();
+        }
+        Vec::new()
     }
 
     /// Asks the guest to power off. The VM itself is released when the link drops.
@@ -644,12 +741,40 @@ impl VmLink {
     }
 }
 
-/// The PID a `Run` or `Exec` was answered with.
-fn started(r: Reply) -> io::Result<u32> {
+/// The PID a `Run` or `Exec` was answered with, and whether its root is
+/// still being made.
+fn started(r: Reply) -> io::Result<(u32, bool)> {
     match r {
-        Reply::Started(pid) => Ok(pid),
+        Reply::Started(pid, starting) => Ok((pid, starting)),
         other => Err(io::Error::other(format!("expected Started, got {other:?}"))),
     }
+}
+
+/// The pauses between `AwaitStart` asks: the first at once, then 1, 2, 4,
+/// 8, 16 ms, then every 25 ms. Most volumes fill within the first few; a
+/// big one is noticed within 25 ms of being done.
+fn await_backoff() -> impl Iterator<Item = std::time::Duration> {
+    [0, 1, 2, 4, 8, 16].into_iter().chain(std::iter::repeat(25)).map(std::time::Duration::from_millis)
+}
+
+/// Asks (`ask` sends `AwaitStart`) until the agent says the root is in
+/// place. An error fails the start, as it would have failed the `Run`
+/// itself: the child ended before its root was ready (the agent answers
+/// with the child's own reason, and sends no `Exited`), or the VM stopped.
+/// No lock is held while it sleeps: `call` takes and lets go of its own for
+/// each ask.
+fn wait_started(mut ask: impl FnMut() -> io::Result<Reply>, mut sleep: impl FnMut(std::time::Duration)) -> io::Result<()> {
+    for pause in await_backoff() {
+        if !pause.is_zero() {
+            sleep(pause);
+        }
+        match ask()? {
+            Reply::Started(_, true) => {}
+            Reply::Started(_, false) => return Ok(()),
+            other => return Err(io::Error::other(format!("expected Started, got {other:?}"))),
+        }
+    }
+    unreachable!("the backoff never ends")
 }
 
 fn read_frame(conn: &mut File, buf: &mut Vec<u8>) -> io::Result<()> {
@@ -667,6 +792,24 @@ mod tests {
     use std::os::unix::net::UnixStream;
 
     #[test]
+    fn a_starting_container_is_asked_about_until_its_root_is_in_place() {
+        use std::time::Duration;
+        let ms = |v: &[u64]| v.iter().map(|&m| Duration::from_millis(m)).collect::<Vec<_>>();
+        assert_eq!(await_backoff().take(9).collect::<Vec<_>>(), ms(&[0, 1, 2, 4, 8, 16, 25, 25, 25]));
+        // Starting twice, then in place: three asks, the first at once.
+        let mut answers = vec![Reply::Started(7, false), Reply::Started(7, true), Reply::Started(7, true)];
+        let (mut asks, mut slept) = (0, Vec::new());
+        assert!(wait_started(|| { asks += 1; Ok(answers.pop().unwrap()) }, |d| slept.push(d)).is_ok());
+        assert_eq!((asks, slept), (3, ms(&[1, 2])));
+        // An error (the child failed before its root was ready, the VM
+        // stopped) ends the wait and fails the start with it.
+        let mut answers = vec![Err(io::Error::other("run c1: mount /payload: No space left on device")), Ok(Reply::Started(7, true))];
+        let mut asks = 0;
+        let e = wait_started(|| { asks += 1; answers.pop().unwrap() }, |_| {}).unwrap_err();
+        assert_eq!((asks, e.to_string().as_str()), (2, "run c1: mount /payload: No space left on device"));
+    }
+
+    #[test]
     fn a_failed_write_disconnects_before_the_reader_accounts_loss() {
         let (socket, peer) = UnixStream::pair().unwrap();
         socket.shutdown(std::net::Shutdown::Write).unwrap();
@@ -677,5 +820,39 @@ mod tests {
         assert!(!windows.lock().loss_handled, "only the reader owns exit accounting");
         let mut peer = peer;
         assert_eq!(peer.read(&mut [0]).unwrap(), 0, "the failed transport is closed in both directions");
+    }
+
+    /// The agent ends on a frame over its limit (every container with it):
+    /// a request that large, such as a container whose environment is over
+    /// 1 MiB, fails alone and nothing of it is sent.
+    #[test]
+    fn a_request_over_the_agents_frame_limit_is_refused_unsent() {
+        let (socket, mut peer) = UnixStream::pair().unwrap();
+        peer.set_nonblocking(true).unwrap();
+        // Never blocks on a peer that does not read: a request that were
+        // sent fills the socket and fails with WouldBlock instead.
+        socket.set_nonblocking(true).unwrap();
+        let mut writer = Writer { conn: std::os::fd::OwnedFd::from(socket).into(), out: vec![0; kiri_proto::MAX_FRAME + 1], blob: vec![0; 16] };
+        let windows = Windows::default();
+        let e = writer.write(&windows, None).unwrap_err();
+        assert!(e.to_string().contains("too large"), "{e}");
+        assert!(!windows.lock().lost, "the link stays");
+        assert_eq!(peer.read(&mut [0; 16]).map_err(|e| e.kind()), Err(io::ErrorKind::WouldBlock), "nothing sent");
+        writer.out = vec![7; 8];
+        assert!(writer.write(&windows, None).is_ok());
+        peer.set_nonblocking(false).unwrap();
+        let mut got = [0; 8];
+        peer.read_exact(&mut got).unwrap();
+        assert_eq!(got, [7; 8], "the link carries the next request");
+    }
+
+    /// A request of exactly the agent's limit is still sent.
+    #[test]
+    fn a_request_at_the_agents_frame_limit_fits() {
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let mut writer = Writer { conn: std::os::fd::OwnedFd::from(socket).into(), out: vec![0; kiri_proto::MAX_FRAME], blob: vec![0; 16] };
+        assert!(writer.fits().is_ok());
+        writer.out.push(0);
+        assert!(writer.fits().is_err());
     }
 }

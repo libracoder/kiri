@@ -19,6 +19,10 @@ export DOCKER_CONTEXT=${DOCKER_CONTEXT:-kiri}
 K=${KIRI:-kiri}
 SOCK=$(docker context inspect "$DOCKER_CONTEXT" --format '{{.Endpoints.docker.Host}}' 2>/dev/null); SOCK=${SOCK#unix://}
 [ -S "$SOCK" ] || { echo "usb: no engine socket for context $DOCKER_CONTEXT ($SOCK)"; exit 1; }
+# alpine from KIRI_TEST_REGISTRY (tests/lib/images.sh), never from Docker Hub.
+# shellcheck source=SCRIPTDIR/lib/images.sh
+. "$(dirname "$0")/lib/images.sh"
+kiri_seed_images alpine:latest || echo "usb: alpine could not be fetched"
 export KIRI_SOCKET=$SOCK
 LOGS=$(mktemp -d)
 PASS=0 FAIL=0 FAILED=()

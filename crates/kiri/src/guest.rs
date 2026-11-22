@@ -12,6 +12,29 @@ use std::time::{Duration, Instant};
 use kiri_proto::{HEADER, Hello, LayerBegin, Msg, Stream};
 use kiri_vmm::{Config, Event, Vm};
 
+/// The virtiofs tag the guest mounts the Mac's folders under: `/mnt/mac`.
+pub const MAC_TAG: &str = "kiri-mac";
+
+/// The Mac's folders the guest is given: the ones a bind mount may name.
+///
+/// `/tmp` and `/var/folders` are not listed because they are links into
+/// `/private`, which the daemon resolves a bind source to before the guest
+/// sees it; `/` is not listed because sharing it would put the whole disk
+/// behind `/mnt/mac`, where any container that reaches the share — a bind of
+/// `/mnt/mac`, or `--cap-add SYS_ADMIN` and `mount -t virtiofs kiri-mac` —
+/// would have it.
+pub fn mac_share_dirs() -> Vec<kiri_vmm::ShareDir> {
+    ["Users", "Volumes", "private"]
+        .iter()
+        .map(|name| kiri_vmm::ShareDir { name: (*name).to_owned(), dir: PathBuf::from("/").join(name) })
+        .collect()
+}
+
+/// The share the guest is given: the Mac's folders under [`MAC_TAG`].
+pub fn mac_share() -> kiri_vmm::Share {
+    kiri_vmm::Share { tag: MAC_TAG.to_owned(), dirs: mac_share_dirs() }
+}
+
 /// How long each boot stage took, measured from the host.
 #[derive(Debug, Clone, Copy)]
 pub struct BootTimings {
@@ -160,8 +183,8 @@ impl Guest {
             agent_port: kiri_proto::HOST_PORT,
             disk: if opts.data_disk { Some(data_disk(&dir)?) } else { None },
             nat_mac: if opts.data_disk { Some(mac_address()?) } else { None },
-            // The Mac's filesystem, for bind mounts: /mnt/mac in the guest.
-            share: opts.data_disk.then(|| (PathBuf::from("/"), "kiri-mac".to_owned())),
+            // The Mac's folders a bind mount may name: /mnt/mac in the guest.
+            share: opts.data_disk.then(mac_share),
             rosetta_tag: opts.data_disk.then(|| "rosetta".to_owned()),
         };
         if !cfg.kernel.is_file() {
@@ -285,7 +308,14 @@ impl Guest {
         self.conn.write_all(&self.out)?;
         loop {
             match self.read()? {
-                Msg::Started { .. } => {}
+                Msg::Started { starting: false, .. } => {}
+                // Its root is still being made (a new volume filled): ask
+                // again until it is, as the daemon's link does. A start that
+                // fails meanwhile answers with an error, and sends no exit.
+                Msg::Started { starting: true, .. } => {
+                    std::thread::sleep(Duration::from_millis(5));
+                    self.send(Msg::AwaitStart { id: req.id })?;
+                }
                 Msg::Output { stream, data, .. } => on_output(stream, data),
                 Msg::Exited(e) => {
                     return Ok(RunResult {
@@ -467,6 +497,27 @@ pub fn guest_dir() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// What the guest is given is the Mac's folders, never the disk they sit
+    /// on: a container that reaches the share gets only these.
+    #[test]
+    fn the_share_is_the_macs_folders_not_the_disk() {
+        let dirs = mac_share_dirs();
+        let names: Vec<&str> = dirs.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, ["Users", "Volumes", "private"]);
+        for d in &dirs {
+            assert_eq!(d.dir, PathBuf::from("/").join(&d.name));
+            assert_ne!(d.dir, PathBuf::from("/"), "the disk itself is never shared");
+            assert!(!d.name.contains('/'), "a share name is one path component");
+            assert!(d.name != "." && d.name != "..");
+        }
+        assert_eq!(MAC_TAG, "kiri-mac");
+        let share = mac_share();
+        assert_eq!(share.tag, MAC_TAG);
+        assert_eq!(share.dirs.len(), 3);
+    }
+
     // A console log that can't be written (a full disk, a read-only file)
     // leaves the VM booting without one, not failing every request.
     #[test]

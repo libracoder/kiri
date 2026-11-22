@@ -130,6 +130,45 @@ static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 /// file does it between processes (the CLI opens the store too).
 static INDEX_LOCK: Mutex<()> = Mutex::new(());
 
+/// Taken around a blob's rename into place by a writer that holds it
+/// ([`Ingest::finish_pinned`]) and around a removal's check of the holds
+/// and its delete, so the two never interleave.
+static BLOB_LOCK: Mutex<()> = Mutex::new(());
+
+/// Blobs something in this process is using that an image's removal must
+/// not delete (a save or a push still sending them, a load until its images
+/// are recorded), by path, with how many hold each. One table for the
+/// process, so every `Store` of one folder shares it.
+static PINNED: Mutex<std::collections::BTreeMap<PathBuf, usize>> = Mutex::new(std::collections::BTreeMap::new());
+
+/// A blob kept from deletion until this is dropped ([`Store::pin`]).
+#[derive(Debug)]
+pub struct Pin(Option<PathBuf>);
+
+impl Pin {
+    fn take(path: PathBuf) -> Pin {
+        *PINNED.lock().unwrap_or_else(|e| e.into_inner()).entry(path.clone()).or_insert(0) += 1;
+        Pin(Some(path))
+    }
+}
+
+impl Drop for Pin {
+    fn drop(&mut self) {
+        let Some(p) = self.0.take() else { return };
+        let mut m = PINNED.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = m.get_mut(&p) {
+            *n -= 1;
+            if *n == 0 {
+                m.remove(&p);
+            }
+        }
+    }
+}
+
+fn pinned(p: &Path) -> bool {
+    PINNED.lock().unwrap_or_else(|e| e.into_inner()).contains_key(p)
+}
+
 /// Where the program writes error-level lines.
 pub type ErrorLog = fn(&str);
 static ERROR_LOG: OnceLock<ErrorLog> = OnceLock::new();
@@ -160,27 +199,47 @@ enum Index {
     Corrupt(Vec<u8>, serde_json::Error),
 }
 
-/// The images that can still be read from a damaged index: its complete
-/// leading records. That is everything when a shorter rewrite left old bytes
-/// after a complete array (the document ends early, the records are whole),
-/// and the records before the cut when the file was truncated.
+/// The images that can still be read from a damaged index, see
+/// [`crate::jsonfile::salvage`].
 fn salvage(bytes: &[u8]) -> Vec<Image> {
-    let Some(mut rest) = bytes.trim_ascii_start().strip_prefix(b"[") else {
-        return Vec::new();
-    };
-    let mut images = Vec::new();
-    loop {
-        rest = rest.trim_ascii_start();
-        rest = rest.strip_prefix(b",").unwrap_or(rest);
-        let mut records = serde_json::Deserializer::from_slice(rest).into_iter::<Image>();
-        match records.next() {
-            Some(Ok(image)) => {
-                images.push(image);
-                rest = &rest[records.byte_offset()..];
-            }
-            _ => return images,
+    crate::jsonfile::salvage(bytes)
+}
+
+/// The name of every image record in an index, damaged or not, including a
+/// record cut short after its name: what a person needs to know was lost.
+/// A record's `name` is its first field, so only a `"name"` right after a
+/// record's `{` (itself after `[` or `,`) counts, not a label called name.
+fn record_names(bytes: &[u8]) -> Vec<String> {
+    let text = String::from_utf8_lossy(bytes);
+    let before = |end: usize| text[..end].trim_end().chars().next_back();
+    let mut names = Vec::new();
+    for (at, _) in text.match_indices("\"name\"") {
+        let brace = text[..at].trim_end().len();
+        if before(brace) != Some('{') || !matches!(before(brace - 1), Some('[' | ',')) {
+            continue;
+        }
+        let Some(value) = text[at + 6..].trim_start().strip_prefix(':') else { continue };
+        if let Some(Ok(name)) = serde_json::Deserializer::from_str(value).into_iter::<String>().next() {
+            names.push(name);
         }
     }
+    names
+}
+
+/// The images a damaged index held that are not in `images`.
+fn missing(bytes: &[u8], images: &[Image]) -> Vec<String> {
+    let mut names = record_names(bytes);
+    names.retain(|n| !images.iter().any(|i| &i.name == n));
+    names.dedup();
+    names
+}
+
+/// The copies of damaged indexes kept beside `images.json`, and the images
+/// they name that the index no longer has. See [`Store::index_damage`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexDamage {
+    pub copies: Vec<PathBuf>,
+    pub missing: Vec<String>,
 }
 
 /// The filesystem-safe hexadecimal part of a SHA-256 digest.
@@ -324,14 +383,7 @@ impl Store {
     /// layer lists, are not kept on the host: only the index itself can say
     /// which image a blob belongs to.
     fn recover(&self, bytes: &[u8], error: &serde_json::Error) -> Vec<Image> {
-        let secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
-        let aside = self.root.join(format!(
-            "images.json.corrupt-{secs}-{}",
-            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        let moved = fs::rename(self.root.join("images.json"), &aside);
+        let moved = crate::jsonfile::move_aside(&self.root.join("images.json"));
         let images = salvage(bytes);
         let written = if images.is_empty() {
             Ok(())
@@ -339,18 +391,47 @@ impl Store {
             self.write_index(&images)
         };
         let kept = match &moved {
-            Ok(()) => format!("moved to {}", aside.display()),
+            Ok(aside) => format!("moved to {}", aside.display()),
             Err(e) => format!("not moved aside: {e}"),
         };
         let wrote = match &written {
             Ok(()) => String::new(),
             Err(e) => format!("; the repaired index was not written: {e}"),
         };
+        let lost = missing(bytes, &images);
+        let lost = if lost.is_empty() {
+            String::new()
+        } else {
+            format!("; dropped from the list: {} (their layers are kept while the copy is)", lost.join(", "))
+        };
         log_error(&format!(
-            "image index unreadable ({error}): {kept}, {} image(s) recovered{wrote}",
+            "image index unreadable ({error}): {kept}, {} image(s) recovered{lost}{wrote}",
             images.len()
         ));
         images
+    }
+
+    /// The `images.json.corrupt-*` copies kept beside the index, and the
+    /// images they name that it no longer lists; `None` with no copy. While
+    /// a copy is kept, the layers of the images it may still hold are not
+    /// someone else's to delete: the daemon keeps every unpacked layer and
+    /// says so in `docker info`. Removing the copies ends it.
+    pub fn index_damage(&self) -> io::Result<Option<IndexDamage>> {
+        // Read first: a damaged index is moved aside by this very read.
+        let images = self.images()?;
+        let copies = crate::jsonfile::kept_copies(&self.root.join("images.json"))?;
+        if copies.is_empty() {
+            return Ok(None);
+        }
+        let mut names = Vec::new();
+        for c in &copies {
+            for n in missing(&fs::read(c).unwrap_or_default(), &images) {
+                if !names.contains(&n) {
+                    names.push(n);
+                }
+            }
+        }
+        Ok(Some(IndexDamage { copies, missing: names }))
     }
 
     pub fn find(&self, name: &str) -> io::Result<Option<Image>> {
@@ -382,7 +463,18 @@ impl Store {
         self.write_index(&images)
     }
 
-    /// Removes the image and deletes blobs no remaining image uses.
+    /// Keeps the blob `digest` from deletion while the pin lives. Pin first,
+    /// then check the blob is there: a pin taken after the check could miss
+    /// a removal in between.
+    pub fn pin(&self, digest: &str) -> Pin {
+        match self.blob_path(digest) {
+            Ok(p) => Pin::take(p),
+            Err(_) => Pin(None),
+        }
+    }
+
+    /// Removes the image and deletes blobs no remaining image uses and
+    /// nothing holds ([`Store::pin`]).
     pub fn remove_image(&self, name: &str) -> io::Result<Option<Image>> {
         let _lock = self.lock_index()?;
         let mut images = self.read_locked()?;
@@ -391,35 +483,41 @@ impl Store {
         self.write_index(&images)?;
         let in_use = |d: &str| images.iter().any(|i| i.config_digest == d || i.layers.iter().any(|l| l.digest == d));
         for d in std::iter::once(&removed.config_digest).chain(removed.layers.iter().map(|l| &l.digest)) {
-            if !in_use(d)
-                && let Ok(path) = self.blob_path(d)
-            {
-                let _ = fs::remove_file(path);
+            if !in_use(d) {
+                self.remove_unpinned(d);
             }
         }
         Ok(Some(removed))
     }
 
-    /// Replaces the index with `images`: written whole to a temporary file
-    /// of its own beside it, then renamed over it. The old file is replaced,
-    /// not overwritten in place, so no bytes of it can trail the new one.
+    /// Deletes the blob `digest` if no image uses it and nothing holds it,
+    /// as [`Store::remove_image`] deletes the blobs it frees: for a writer
+    /// that put a blob in that nothing came to name.
+    pub fn remove_if_unused(&self, digest: &str) -> io::Result<()> {
+        let _lock = self.lock_index()?;
+        let images = self.read_locked()?;
+        if !images.iter().any(|i| i.config_digest == digest || i.layers.iter().any(|l| l.digest == digest)) {
+            self.remove_unpinned(digest);
+        }
+        Ok(())
+    }
+
+    /// The hold check and the delete under the blob lock, which a writer's
+    /// pin and rename take too ([`Ingest::finish_pinned`]): a blob written
+    /// or found again by a writer between the two is never deleted.
+    fn remove_unpinned(&self, digest: &str) {
+        let Ok(path) = self.blob_path(digest) else { return };
+        let _one = BLOB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if !pinned(&path) {
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    /// Replaces the index with `images`, see [`crate::jsonfile::replace`].
     /// Callers hold the index lock.
     fn write_index(&self, images: &[Image]) -> io::Result<()> {
-        let tmp = self.root.join(format!(
-            "images.json.{}.{}.tmp",
-            std::process::id(),
-            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
         let bytes = serde_json::to_vec_pretty(images).map_err(io::Error::other)?;
-        let result = File::create(&tmp).and_then(|mut f| {
-            f.write_all(&bytes)?;
-            f.sync_all()?;
-            fs::rename(&tmp, self.root.join("images.json"))
-        });
-        if result.is_err() {
-            let _ = fs::remove_file(&tmp);
-        }
-        result
+        crate::jsonfile::replace(&self.root.join("images.json"), &bytes, crate::jsonfile::Durable::Now)
     }
 }
 
@@ -504,6 +602,20 @@ impl Ingest {
         fs::rename(&self.tmp, self.root.join("blobs/sha256").join(&hex))?;
         Ok((format!("sha256:{hex}"), self.written))
     }
+
+    /// As [`Ingest::finish`], the blob held ([`Store::pin`]) from before
+    /// it is in place: a removal of the last image using a blob of the same
+    /// digest cannot delete it between the rename and the writer recording
+    /// an image that names it (`docker load`).
+    pub fn finish_pinned(mut self) -> io::Result<(String, u64, Pin)> {
+        let hex = hex(&std::mem::take(&mut self.hasher).finalize());
+        self.file.sync_all()?;
+        let dest = self.root.join("blobs/sha256").join(&hex);
+        let _one = BLOB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pin = Pin::take(dest.clone());
+        fs::rename(&self.tmp, &dest)?;
+        Ok((format!("sha256:{hex}"), self.written, pin))
+    }
 }
 
 impl Drop for Ingest {
@@ -529,6 +641,39 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A blob something still uses (a save, a push, a load not yet
+    /// recorded) outlives the removal of the image that named it.
+    #[test]
+    fn a_pinned_blob_outlives_the_removal_of_its_image() {
+        let root = std::env::temp_dir().join(format!("kiri-store-pin-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let store = Store::open(&root).unwrap();
+        let mut ingest = store.ingest().unwrap();
+        ingest.write_all(b"a layer a save is sending").unwrap();
+        let (layer, size) = ingest.finish().unwrap();
+        let image = |name: &str| Image {
+            name: name.into(),
+            digest: "sha256:manifest".into(),
+            index_digest: None,
+            config_digest: format!("sha256:{}", "3".repeat(64)),
+            layers: vec![Layer { digest: layer.clone(), size, media_type: "application/vnd.oci.image.layer.v1.tar".into() }],
+            size,
+            platform: "linux/amd64".into(),
+            created: String::new(),
+            pulled_at: 0,
+            config: RunConfig::default(),
+        };
+        store.put_image(image("a:1")).unwrap();
+        let pin = store.pin(&layer);
+        store.remove_image("a:1").unwrap();
+        assert!(store.has_blob(&layer, size), "something still holds it");
+        drop(pin);
+        store.put_image(image("b:1")).unwrap();
+        store.remove_image("b:1").unwrap();
+        assert!(!store.has_blob(&layer, size), "no one holds it any more");
+        fs::remove_dir_all(&root).unwrap();
+    }
 
     #[test]
     fn rejects_paths_instead_of_digests() {
@@ -721,10 +866,38 @@ mod tests {
         }
         let path = root.join("images.json");
         let bytes = fs::read(&path).unwrap();
+        assert_eq!(store.index_damage().unwrap(), None, "no copy, no damage");
         fs::write(&path, &bytes[..bytes.len() - 40]).unwrap();
+        // The image cut off is named while the copy is kept (#440), the
+        // first time the index is read too, and is no longer missing once it
+        // is back in the list.
+        let damage = store.index_damage().unwrap().unwrap();
         assert_eq!(names(&store), ["a:1", "b:1"]);
         assert_eq!(corrupt_files(&root).len(), 1);
+        assert_eq!((damage.copies, damage.missing), (corrupt_files(&root), vec!["c:1".to_owned()]));
+        store.put_image(named("c:1")).unwrap();
+        assert!(store.index_damage().unwrap().unwrap().missing.is_empty());
+        for c in corrupt_files(&root) {
+            fs::remove_file(c).unwrap();
+        }
+        assert_eq!(store.index_damage().unwrap(), None, "removing the copy ends it");
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn record_names_are_the_records_own() {
+        let bytes = serde_json::to_vec_pretty(&vec![named("a:1"), named("b:1"), named("c:1")]).unwrap();
+        assert_eq!(record_names(&bytes), ["a:1", "b:1", "c:1"]);
+        // A field inside a record that is called name too is not a record.
+        assert_eq!(record_names(br#"[{"name": "a:1", "config": {"name": "no"}, "x": [1, {"y": 2}]}, {"name":"b:1"}]"#), ["a:1", "b:1"]);
+        let compact = serde_json::to_vec(&vec![named("a:1"), named("b:1")]).unwrap();
+        assert_eq!(record_names(&compact), ["a:1", "b:1"]);
+        // Cut inside the last record, after its name: still named.
+        let at = bytes.windows(9).rposition(|w| w == b"\"digest\":").unwrap();
+        assert_eq!(missing(&bytes[..at], &[named("a:1")]), ["b:1", "c:1"]);
+        // Cut inside the name itself: no half name.
+        let at = bytes.windows(5).rposition(|w| w == b"c:1\",").unwrap() + 1;
+        assert_eq!(record_names(&bytes[..at]), ["a:1", "b:1"]);
     }
 
     #[test]

@@ -34,6 +34,41 @@ once; see the README.
 
 `tests/e2e.sh` only removes containers, networks and volumes it created.
 
+`tests/e2e.sh` runs on macOS, on a Linux host and in WSL 2, and asks the
+engine which one it is talking to. A check for a feature another system has
+alone (Finder, Rosetta) is marked `only mac` and skipped elsewhere; one that
+needs something the setup may lack (a terminal, buildx, Finder access from
+this session, an amd64 emulator, a kernel module on a Linux host) is marked
+`needs ...` and skipped while it is missing. Where the right answer differs
+by system (the default bridge's nameserver, `--network host`'s address), the
+check expects each system's. The summary counts the skips by reason. Set
+`KIRI_TEST_STRICT=1` for a run that should have everything: what the setup
+lacks then fails instead of being skipped.
+
+The test suites never pull from Docker Hub, which allows only 100 anonymous
+pulls an hour for a whole network. Each image they run comes from
+`KIRI_TEST_REGISTRY` (default `public.ecr.aws/docker/library`, the same
+official images; `mirror.gcr.io/library` is tried when it fails) and is tagged
+with its plain name, so a second run fetches nothing. The list and the
+fetching are in `tests/lib/images.sh`; `python3 tests/lib/check-images.py`
+fails when a script names an image the list lacks. `tests/e2e.sh` ends with
+`Docker Hub allowance used during the run (whole network): N`, which should
+be 0; other machines on the same network count against it too.
+
+Every bug fix adds a check that fails without the fix and passes with it (a
+line in `tests/e2e.sh` or `tests/linux-host.sh`, a case in `tests/stress.sh`,
+or a unit test), and names it in `tests/regressions.tsv` with the issue or
+pull request and one line on what broke. A listed check that fails says
+which bug it guards; `python3 tests/lib/check-regressions.py` fails when the
+table names a check that is gone. `KIRI_TEST_ONLY='^udp-'` runs only the
+`tests/e2e.sh` checks whose names match. `tests/stress.sh` runs the races
+(starts beside `docker system df`, `rm -f` against `docker run --rm` and
+against starts, a minute of churn) in two to five minutes;
+`KIRI_STRESS_ROUNDS` and `KIRI_STRESS_SECONDS` make it longer. On a Linux
+test host, `sudo KIRI_TEST_ALLOW_HOST_CHANGES=1 KIRI_ENGINE_RESTART='...'
+tests/wsl-shape.sh` runs the DNS checks with the host shaped like WSL 2 (its
+resolver an address of its own on `lo`) and puts the host back afterwards.
+
 ## Every feature ships on macOS, Windows and Linux together
 
 - A feature comes in one pull request, for all three systems, built and

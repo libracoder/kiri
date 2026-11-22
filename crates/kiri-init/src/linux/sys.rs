@@ -35,6 +35,70 @@ pub fn mount(src: &CStr, target: &CStr, fstype: &CStr, flags: libc::c_ulong, dat
     check(ret as _, &format!("mount {}", target.to_string_lossy())).map(drop)
 }
 
+/// Most of a page: the kernel copies mount options into one page and cuts
+/// the rest, so an overlay of many layers would lose its lowest ones.
+const MAX_OPTIONS: usize = 4000;
+
+/// An overlay of `lowers` (top first, each a folder path, relative to the
+/// working directory or absolute, with no `:` or `,`) at `target`, `rest`
+/// the options after the lower list (absolute paths). When the options do
+/// not fit in a page (some 60 layers by digest), the lowers are named by
+/// short links in a folder beside `target` and the mount is made from a
+/// child working in that folder: the same overlay, the agent's own working
+/// directory untouched (BuildKit's snapshotter does the same with short
+/// snapshot ids). The links go once the overlay holds its folders.
+pub fn mount_overlay(target: &Path, lowers: &[String], rest: &str, flags: libc::c_ulong) -> io::Result<()> {
+    let opts = format!("lowerdir={}{rest}", lowers.join(":"));
+    if opts.len() <= MAX_OPTIONS {
+        return mount(c"overlay", &cstr(target)?, c"overlay", flags, Some(&CString::new(opts)?));
+    }
+    let mut links = target.as_os_str().to_owned();
+    links.push(".lowers");
+    let links = std::path::PathBuf::from(links);
+    let _ = std::fs::remove_dir_all(&links);
+    std::fs::create_dir_all(&links)?;
+    let here = std::env::current_dir()?;
+    for (i, l) in lowers.iter().enumerate() {
+        std::os::unix::fs::symlink(here.join(l), links.join(i.to_string()))?;
+    }
+    let short: Vec<String> = (0..lowers.len()).map(|i| i.to_string()).collect();
+    let opts = CString::new(format!("lowerdir={}{rest}", short.join(":")))?;
+    let dir = cstr(&links)?;
+    let target_c = cstr(target)?;
+    let result = (|| {
+        if opts.as_bytes().len() > MAX_OPTIONS {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{} layers are more than one overlay can stack", lowers.len())));
+        }
+        // SAFETY: the child only calls chdir, mount and _exit, all
+        // async-signal-safe, on strings made before the fork.
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            // SAFETY: as above, in the child.
+            unsafe {
+                if libc::chdir(dir.as_ptr()) != 0 {
+                    libc::_exit(*libc::__errno_location());
+                }
+                let r = libc::mount(c"overlay".as_ptr(), target_c.as_ptr(), c"overlay".as_ptr(), flags, opts.as_ptr().cast());
+                libc::_exit(if r == 0 { 0 } else { *libc::__errno_location() });
+            }
+        }
+        check(pid as _, "fork")?;
+        let mut status = 0;
+        // SAFETY: waits for the child just made, into a local int.
+        check(unsafe { libc::waitpid(pid, &mut status, 0) } as _, "waitpid")?;
+        match (libc::WIFEXITED(status), libc::WEXITSTATUS(status)) {
+            (true, 0) => Ok(()),
+            (true, e) => {
+                let err = io::Error::from_raw_os_error(e);
+                Err(io::Error::new(err.kind(), format!("mount {}: {err}", target.display())))
+            }
+            _ => Err(io::Error::other(format!("mount {}: the mounting child died", target.display()))),
+        }
+    })();
+    let _ = std::fs::remove_dir_all(&links);
+    result
+}
+
 /// Mounts with no source or type, for changing propagation (`MS_PRIVATE` …).
 pub fn remount(target: &CStr, flags: libc::c_ulong) -> io::Result<()> {
     // SAFETY: `target` is a valid NUL-terminated string; the rest may be null.
@@ -130,10 +194,50 @@ pub unsafe fn clone3(args: &CloneArgs) -> io::Result<libc::pid_t> {
     check(ret, "clone3").map(|p| p as libc::pid_t)
 }
 
+/// The engine's own message as one line of the container's log: a value
+/// over several lines (a key a `user:` named) never goes on, unhidden, over
+/// the lines after it.
+/// Each line break is one space; every other character stays as it is, so
+/// what Kiri hides in Logs finds the value as it is.
+pub fn one_line(s: &str) -> String {
+    s.replace("\r\n", " ").replace(['\n', '\r'], " ")
+}
+
+/// Closes every descriptor from `first` up. For the child between clone and
+/// exec, which holds a copy of all of the agent's descriptors: close-on-exec
+/// closes them only at execve, and until then one is still a way out of the
+/// container (a working directory of `/proc/self/fd/N`).
+pub fn close_from(first: RawFd) {
+    // SAFETY: closing descriptors in this process; nothing is used after.
+    unsafe {
+        if libc::syscall(libc::SYS_close_range, first as libc::c_uint, libc::c_uint::MAX, 0) == 0 {
+            return;
+        }
+        // close_range is Linux 5.9+; older kernels close one at a time.
+        let max = match libc::sysconf(libc::_SC_OPEN_MAX) {
+            n if n > 0 => n.min(1 << 20) as RawFd,
+            _ => 1 << 16,
+        };
+        for fd in first..max {
+            libc::close(fd);
+        }
+    }
+}
+
+/// Whether the current directory is inside this process's root. The kernel
+/// gives a directory outside it as `(unreachable)/…`, which is how a
+/// working directory reached through a leaked descriptor shows.
+pub fn cwd_inside_root() -> bool {
+    let mut buf = [0u8; 4096];
+    // SAFETY: getcwd writes at most `buf.len()` bytes into `buf`.
+    let n = unsafe { libc::syscall(libc::SYS_getcwd, buf.as_mut_ptr(), buf.len()) };
+    n > 0 && buf[0] == b'/'
+}
+
 /// Writes `msg` straight to `fd` and exits without unwinding or running any
 /// destructors. Only for the child between clone and exec.
 pub fn child_fail(fd: RawFd, what: &str, err: io::Error) -> ! {
-    let msg = format!("kiri: cannot start container: {what}: {err}\n");
+    let msg = format!("kiri: cannot start container: {}\n", one_line(&format!("{what}: {err}")));
     // SAFETY: writing a valid buffer to a descriptor we hold, then exiting.
     unsafe {
         libc::write(fd, msg.as_ptr().cast(), msg.len());
@@ -153,7 +257,7 @@ pub fn exec_fail(fd: RawFd, exe: &CStr, err: io::Error, init: bool) -> ! {
     let (code, why) = exec_failure(&exe, &err, found, init);
     // runc reports what it refuses before the start as the daemon's error,
     // and a failed exec after it on the container's stderr, as is.
-    let msg = if code == 255 { format!("{why}\n") } else { format!("kiri: cannot start container: {why}\n") };
+    let msg = if code == 255 { format!("{why}\n") } else { format!("kiri: cannot start container: {}\n", one_line(&why)) };
     // SAFETY: writing a valid buffer to a descriptor we hold, then exiting.
     unsafe {
         libc::write(fd, msg.as_ptr().cast(), msg.len());
@@ -285,6 +389,35 @@ pub fn open_pty() -> io::Result<(OwnedFd, OwnedFd)> {
     }
 }
 
+/// The descriptor ranges to close so that only 0, 1, 2 and `keep` stay
+/// open: (first, last), inclusive, in order.
+pub fn close_ranges(keep: &[RawFd]) -> Vec<(libc::c_uint, libc::c_uint)> {
+    let mut keep: Vec<libc::c_uint> = keep.iter().filter(|&&fd| fd > 2).map(|&fd| fd as libc::c_uint).collect();
+    keep.sort_unstable();
+    keep.dedup();
+    let mut out = Vec::with_capacity(keep.len() + 1);
+    let mut next = 3;
+    for fd in keep {
+        if fd > next {
+            out.push((next, fd - 1));
+        }
+        next = fd + 1;
+    }
+    out.push((next, libc::c_uint::MAX));
+    out
+}
+
+/// Closes the ranges `close_ranges` gave, without allocating. Before Linux
+/// 5.9 there is no close_range, and the descriptors stay open, as they
+/// always did before.
+pub fn close_now(ranges: &[(libc::c_uint, libc::c_uint)]) {
+    for &(first, last) in ranges {
+        // SAFETY: closing descriptors of this process, which the caller
+        // no longer uses.
+        unsafe { libc::syscall(libc::SYS_close_range, first, last, 0) };
+    }
+}
+
 pub fn resize_pty(fd: RawFd, rows: u16, cols: u16) {
     let ws = libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
     // SAFETY: TIOCSWINSZ with a valid winsize on a descriptor we own.
@@ -294,6 +427,82 @@ pub fn resize_pty(fd: RawFd, rows: u16, cols: u16) {
 #[cfg(test)]
 mod tests {
     use std::io;
+
+    /// 131 layers by digest make options longer than a
+    /// page: the overlay still stacks them all, the lowest one included.
+    #[test]
+    fn an_overlay_of_more_layers_than_one_page_names() {
+        // SAFETY: a plain getter.
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipped: needs root to mount");
+            return;
+        }
+        let d = std::env::temp_dir().join(format!("kiri-many-lowers-{}", std::process::id()));
+        let layers = d.join("layers");
+        let mut lowers = Vec::new();
+        for i in 0..131 {
+            let name = format!("{i:064x}");
+            std::fs::create_dir_all(layers.join(&name)).unwrap();
+            std::fs::write(layers.join(&name).join(format!("f{i}")), b"x").unwrap();
+            lowers.insert(0, layers.join(&name).to_str().unwrap().to_owned());
+        }
+        let target = d.join("root");
+        std::fs::create_dir_all(&target).unwrap();
+        super::mount_overlay(&target, &lowers, ",index=off", libc::MS_RDONLY).unwrap();
+        let seen = target.join("f0").exists() && target.join("f130").exists();
+        let _ = super::umount_lazy(&target);
+        assert!(seen, "every layer is in the overlay");
+        assert!(!d.join("root.lowers").exists(), "the links are gone");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A value over several lines never starts a line of its own in the log.
+    #[test]
+    fn the_engines_message_is_one_line() {
+        assert_eq!(super::one_line("user: unknown user -----BEGIN KEY-----\nAAA\r\n-----END KEY-----"), "user: unknown user -----BEGIN KEY----- AAA -----END KEY-----");
+        // A backslash or a quote stays as the value has it.
+        assert_eq!(super::one_line("user: unknown user Bs-x\\yy\"4dd4"), "user: unknown user Bs-x\\yy\"4dd4");
+        assert_eq!(super::one_line("DOM\\bob\\n"), "DOM\\bob\\n");
+        assert_eq!(super::one_line("x\ny\rz"), "x y z");
+    }
+
+    #[test]
+    fn only_the_kept_descriptors_stay_open() {
+        let all = libc::c_uint::MAX;
+        assert_eq!(super::close_ranges(&[]), vec![(3, all)]);
+        // Standard streams are never closed; order and repeats don't matter.
+        assert_eq!(super::close_ranges(&[9, 2, 4, 9, 5, 0]), vec![(3, 3), (6, 8), (10, all)]);
+        assert_eq!(super::close_ranges(&[3]), vec![(4, all)]);
+        // The real thing, in a child of its own: the kept ones stay open,
+        // the rest are closed. Forked from a test with threads, so the
+        // child only makes system calls (the ranges are worked out first).
+        let (unrelated, unrelated_w) = super::pipe().unwrap();
+        let (kept, kept_w) = super::pipe().unwrap();
+        let (report, report_w) = super::pipe().unwrap();
+        use std::os::fd::AsRawFd;
+        let keep = [kept.as_raw_fd(), report_w.as_raw_fd()];
+        let ranges = super::close_ranges(&keep);
+        let check = [unrelated.as_raw_fd(), unrelated_w.as_raw_fd(), kept_w.as_raw_fd(), report.as_raw_fd()];
+        // SAFETY: the child makes only async-signal-safe system calls and
+        // leaves with _exit.
+        unsafe {
+            let pid = libc::fork();
+            assert!(pid >= 0);
+            if pid == 0 {
+                super::close_now(&ranges);
+                let open = |fd| libc::fcntl(fd, libc::F_GETFD) >= 0;
+                let mut ok = keep.iter().all(|&fd| open(fd)) && (0..3).all(open);
+                ok &= check.iter().all(|&fd| !open(fd));
+                libc::write(report_w.as_raw_fd(), if ok { b"y".as_ptr() } else { b"n".as_ptr() }.cast(), 1);
+                libc::_exit(0);
+            }
+            drop(report_w);
+            let mut said = [0u8; 1];
+            assert_eq!(libc::read(report.as_raw_fd(), said.as_mut_ptr().cast(), 1), 1, "the child said nothing");
+            libc::waitpid(pid, std::ptr::null_mut(), 0);
+            assert_eq!(&said, b"y", "a kept descriptor was closed, or another left open");
+        }
+    }
 
     /// A command that may not be run ends 126 and one that is missing 127,
     /// as with Docker (`docker run alpine /etc/passwd` is 126).

@@ -10,7 +10,7 @@ use std::path::Path;
 
 use kiri_proto::{Exited, MAX_OUTPUT_CHUNK, Msg, Stats, Stream};
 
-use super::container::{self, NetCtx, Paths, Process};
+use super::container::{self, NetCtx, Paths, Process, Root};
 use super::net::{self, Bridges, Dhcp};
 use super::{fsnotify, layers, meminfo, sys};
 
@@ -34,10 +34,43 @@ struct Proc {
     tty_hup: Option<std::time::Instant>,
 }
 
+impl Proc {
+    /// The one rule for what may be entered (exec, copy): a container's
+    /// own process, not an exec; its root in place; its setup not failed;
+    /// not exited. Nothing may enter a container before its root is in
+    /// place.
+    fn enterable(&self) -> bool {
+        self.run.container.is_none() && self.run.entered() && self.exited.is_none()
+    }
+}
+
 /// How long a hung-up terminal waits before it's polled again.
 const TTY_HUP_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
 
-pub fn serve(mut conn: File, paths: &Paths) -> io::Result<()> {
+pub fn serve(conn: File, paths: &Paths) -> io::Result<()> {
+    let mut procs: HashMap<libc::pid_t, Proc> = HashMap::new();
+    let served = serve_loop(conn, paths, &mut procs);
+    leave(&mut procs, super::transport::is_host_process());
+    served
+}
+
+/// However the agent leaves its loop (Shutdown, SIGTERM, the daemon gone,
+/// or an error, such as a write to a daemon that died before its end of
+/// stream was read), no child still filling a new volume is killed half
+/// way (see `Process::wait_root`): on a Linux host, everything is then
+/// stopped and torn down (`run` sweeps what is left after this); in the
+/// VM, which powers off next, it is waited for.
+fn leave(procs: &mut HashMap<libc::pid_t, Proc>, host_process: bool) {
+    if host_process {
+        stop_containers(procs);
+    } else {
+        for p in procs.values_mut() {
+            p.run.wait_root();
+        }
+    }
+}
+
+fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Proc>) -> io::Result<()> {
     let sigfd = child_signals()?;
     // In the VM a DHCP lease gives the uplink and DNS; on a Linux host the
     // host has them already.
@@ -62,6 +95,8 @@ pub fn serve(mut conn: File, paths: &Paths) -> io::Result<()> {
     };
     // On a Linux host, SIGTERM or SIGINT stops the agent as Shutdown does.
     let term = if host_process { Some(term_signals()?) } else { None };
+    // On a Linux host, its firewall may start, reload or flush after the engine.
+    let firewall = if host_process { net::firewall_events() } else { None };
     let mut bridges = Bridges::default();
     // In the VM, lookups the gateway's resolver fails go through the host.
     let mut dns = super::dns::Dns::default();
@@ -86,14 +121,14 @@ pub fn serve(mut conn: File, paths: &Paths) -> io::Result<()> {
     let udp = super::relay::listen_udp()?;
     let pressure = memory_pressure_trigger();
     let mut last_pressure = std::time::Instant::now() - std::time::Duration::from_secs(1);
-    // `docker system df`: measured on a thread, which wakes the loop through
-    // this pipe; the loop sends the `Usage` lines (it is the only writer).
-    let (usage_wake, usage_ring) = usage_pipe()?;
-    let usage_ring = std::sync::Arc::new(usage_ring);
-    let (usage_tx, usage_rx) = std::sync::mpsc::channel::<Vec<String>>();
-    let mut measuring = false;
+    // `docker system df`: measured in a child process (never a thread: see
+    // `usage`), whose pipe the loop polls; the loop sends the `Usage` lines
+    // (it is the only writer).
+    let mut measuring: Option<super::usage::Job> = None;
     let mut relays: Vec<super::relay::Relay> = Vec::new();
-    let mut procs: HashMap<libc::pid_t, Proc> = HashMap::new();
+    // Starts that failed after they were answered `starting`: the error the
+    // daemon's next `AwaitStart` for that id gets.
+    let mut failed_starts: HashMap<String, String> = HashMap::new();
     let mut fds: Vec<libc::pollfd> = Vec::with_capacity(16);
     let mut frame = Vec::with_capacity(4096);
     let mut out = Vec::with_capacity(4096);
@@ -102,6 +137,10 @@ pub fn serve(mut conn: File, paths: &Paths) -> io::Result<()> {
     let mut fs_events = fsnotify::Pending::default();
 
     loop {
+        // Woken by a starting container's word (its pipe is polled below):
+        // settled here, so its output is read from then on, or its failed
+        // start torn down.
+        settle_roots(procs, &mut dns, &mut failed_starts);
         fds.clear();
         fds.push(libc::pollfd { fd: conn.as_raw_fd(), events: libc::POLLIN, revents: 0 });
         fds.push(libc::pollfd { fd: sigfd.as_raw_fd(), events: libc::POLLIN, revents: 0 });
@@ -120,7 +159,8 @@ pub fn serve(mut conn: File, paths: &Paths) -> io::Result<()> {
         fds.push(libc::pollfd { fd: udp.as_raw_fd(), events: libc::POLLIN, revents: 0 });
         fds.push(libc::pollfd { fd: pressure.as_ref().map_or(-1, |f| f.as_raw_fd()), events: libc::POLLPRI, revents: 0 });
         fds.push(libc::pollfd { fd: term.as_ref().map_or(-1, |f| f.as_raw_fd()), events: libc::POLLIN, revents: 0 });
-        fds.push(libc::pollfd { fd: usage_wake.as_raw_fd(), events: libc::POLLIN, revents: 0 });
+        fds.push(libc::pollfd { fd: firewall.as_ref().map_or(-1, |f| f.as_raw_fd()), events: libc::POLLIN, revents: 0 });
+        fds.push(libc::pollfd { fd: measuring.as_ref().map_or(-1, super::usage::Job::fd), events: libc::POLLIN, revents: 0 });
         super::copy::interest(&mut fds);
         for r in &relays {
             r.interest(&mut fds);
@@ -132,8 +172,15 @@ pub fn serve(mut conn: File, paths: &Paths) -> io::Result<()> {
                 hung = true;
                 continue;
             }
-            for fd in [&p.run.stdout, &p.run.stderr].into_iter().flatten() {
-                fds.push(libc::pollfd { fd: fd.as_raw_fd(), events: libc::POLLIN, revents: 0 });
+            if let Some(fd) = p.run.starting_fd() {
+                fds.push(libc::pollfd { fd, events: libc::POLLIN, revents: 0 });
+            }
+            // Before its root is in place a child writes nothing there but
+            // the reason it failed, which the agent keeps for `AwaitStart`.
+            if p.run.entered() {
+                for fd in [&p.run.stdout, &p.run.stderr].into_iter().flatten() {
+                    fds.push(libc::pollfd { fd: fd.as_raw_fd(), events: libc::POLLIN, revents: 0 });
+                }
             }
             if let (Some(fd), false) = (&p.run.stdin, p.input.is_empty()) {
                 fds.push(libc::pollfd { fd: fd.as_raw_fd(), events: libc::POLLOUT, revents: 0 });
@@ -184,23 +231,23 @@ pub fn serve(mut conn: File, paths: &Paths) -> io::Result<()> {
             }
         }
 
-        dns.on_timer();
-
         // Output and input first, so a process's last words go out before its exit.
         for pfd in &fds[3..] {
             if pfd.revents == 0 {
                 continue;
             }
             if term.as_ref().is_some_and(|t| t.as_raw_fd() == pfd.fd) {
-                stop_containers(&mut procs);
+                stop_containers(procs);
                 return Ok(());
             }
-            if pfd.fd == usage_wake.as_raw_fd() {
-                let mut sink = [0u8; 16];
-                // SAFETY: reading into a buffer we own from a descriptor we own.
-                while unsafe { libc::read(usage_wake.as_raw_fd(), sink.as_mut_ptr().cast(), sink.len()) } > 0 {}
-                while let Ok(lines) = usage_rx.try_recv() {
-                    measuring = false;
+            if let Some(f) = firewall.as_ref().filter(|f| f.as_raw_fd() == pfd.fd) {
+                net::firewall_changed(f);
+                continue;
+            }
+            if measuring.as_ref().is_some_and(|j| j.fd() == pfd.fd) {
+                // The child is reaped like any other (`reap`).
+                if let Some(lines) = measuring.as_mut().and_then(super::usage::Job::read) {
+                    measuring = None;
                     out.clear();
                     kiri_proto::encode_usage(&mut out, &lines);
                     conn.write_all(&out)?;
@@ -240,8 +287,15 @@ pub fn serve(mut conn: File, paths: &Paths) -> io::Result<()> {
                 continue;
             }
             if pfd.fd == copies.as_raw_fd() {
-                let running: Vec<(&str, libc::pid_t)> =
-                    procs.iter().filter(|(_, p)| p.run.container.is_none() && p.exited.is_none()).map(|(pid, p)| (p.run.id.as_str(), *pid)).collect();
+                // Nothing may enter a container before its root is in
+                // place: one still making it is copied through its mounted
+                // root instead, as a stopped one is.
+                settle_roots(procs, &mut dns, &mut failed_starts);
+                let running: Vec<(&str, libc::pid_t)> = procs
+                    .iter()
+                    .filter(|(_, p)| p.enterable())
+                    .map(|(pid, p)| (p.run.id.as_str(), *pid))
+                    .collect();
                 super::copy::accept(&copies, &running, paths);
                 continue;
             }
@@ -277,10 +331,10 @@ pub fn serve(mut conn: File, paths: &Paths) -> io::Result<()> {
             }
             // Only process stdin is polled for writing beyond this point.
             if pfd.events & libc::POLLOUT != 0 {
-                flush_input(&mut procs, pfd.fd, &mut conn, &mut out)?;
+                flush_input(procs, pfd.fd, &mut conn, &mut out)?;
                 continue;
             }
-            let Some((pid, stream)) = owner(&procs, pfd.fd) else { continue };
+            let Some((pid, stream)) = owner(procs, pfd.fd) else { continue };
             let p = procs.get_mut(&pid).expect("owner found it");
             let slot = if stream == Stream::Stdout { &mut p.run.stdout } else { &mut p.run.stderr };
             let fd = slot.as_ref().expect("polled fd is open").as_raw_fd();
@@ -306,9 +360,13 @@ pub fn serve(mut conn: File, paths: &Paths) -> io::Result<()> {
 
         relays.retain(|r| !r.dead);
 
+        // After the replies that arrived with this wake-up were read, so one
+        // that came in just as its wait ran out is not thrown away.
+        dns.on_timer();
+
         if fds[1].revents != 0 {
             drain_signals(&sigfd);
-            reap(&mut procs);
+            reap(procs);
         }
 
         // Report processes that have exited and whose output is fully read,
@@ -320,7 +378,7 @@ pub fn serve(mut conn: File, paths: &Paths) -> io::Result<()> {
             .collect();
         for pid in done {
             let p = procs.remove(&pid).expect("listed above");
-            finish(&mut conn, &mut dns, &procs, p, true)?;
+            finish(&mut conn, &mut dns, procs, p, true)?;
         }
 
         if fds[0].revents != 0 {
@@ -328,11 +386,14 @@ pub fn serve(mut conn: File, paths: &Paths) -> io::Result<()> {
                 // The host went away: on a Linux host, the daemon died. Its
                 // containers do not outlive it (there is no live restore).
                 if host_process {
-                    stop_containers(&mut procs);
+                    stop_containers(procs);
                 }
                 return Ok(());
             }
             let received_ns = sys::boottime_ns();
+            // Whatever this request is, it sees where starting containers'
+            // roots stand now.
+            settle_roots(procs, &mut dns, &mut failed_starts);
             out.clear();
             match kiri_proto::decode(&frame) {
                 Ok(Msg::Ping(v)) => Msg::Pong(v).encode(&mut out),
@@ -340,10 +401,14 @@ pub fn serve(mut conn: File, paths: &Paths) -> io::Result<()> {
                     if host_process {
                         // The daemon has stopped them Docker's way already;
                         // what is left is killed and torn down.
-                        stop_containers(&mut procs);
+                        stop_containers(procs);
                     } else {
-                        for p in procs.values().filter(|p| p.exited.is_none()) {
-                            // SAFETY: signalling a child we started and have not reaped.
+                        for p in procs.values_mut().filter(|p| p.exited.is_none()) {
+                            // Never half-way through filling a volume.
+                            p.run.wait_root();
+                            // SAFETY: signalling a child we started and have
+                            // not reaped (one that ended before its root was
+                            // ready is a zombie until reaped).
                             unsafe { libc::kill(p.run.pid, libc::SIGKILL) };
                         }
                     }
@@ -369,31 +434,40 @@ pub fn serve(mut conn: File, paths: &Paths) -> io::Result<()> {
                     if spec.flags & (kiri_proto::run_flags::NET_NONE | kiri_proto::run_flags::NET_HOST) == 0 {
                         wait_for_lease(&mut dhcp, std::time::Duration::from_secs(3));
                     }
-                    let join_pid = kiri_proto::net_opts::values(spec.net.opts, kiri_proto::net_opts::NETNS).next().and_then(|t| running_pid(&procs, t));
+                    // Only its network namespace is joined, which exists from
+                    // clone: a container still filling a volume will do.
+                    let join_pid = kiri_proto::net_opts::values(spec.net.opts, kiri_proto::net_opts::NETNS).next().and_then(|t| netns_pid(procs, t));
+                    // A PID namespace exists from clone too.
+                    let pid_join_pid = kiri_proto::net_opts::values(spec.net.opts, kiri_proto::net_opts::PIDNS).next().and_then(|t| live_pid(procs, t));
+                    failed_starts.remove(spec.id);
                     container::spawn(
                     &spec,
                     paths,
-                    NetCtx { bridges: &mut bridges, dns: &mut dns, upstream_dns: dhcp.as_ref().and_then(|d| d.lease.as_ref()).map_or(&host_dns[..], |l| &l.dns), join_pid },
+                    NetCtx { bridges: &mut bridges, dns: &mut dns, upstream_dns: dhcp.as_ref().and_then(|d| d.lease.as_ref()).map_or(&host_dns[..], |l| &l.dns), join_pid, pid_join_pid },
                 )
                 } {
                     Ok(run) => {
                         let cloned_ns = sys::boottime_ns();
-                        Msg::Started { id: &run.id, pid: run.pid as u32 }.encode(&mut out);
-                        admit(&mut conn, &mut dns, &mut procs, new_proc(run, received_ns, cloned_ns))?;
+                        Msg::Started { id: &run.id, pid: run.pid as u32, starting: !run.entered() }.encode(&mut out);
+                        admit(&mut conn, &mut dns, procs, new_proc(run, received_ns, cloned_ns))?;
                     }
                     Err(e) => Msg::Error(&format!("run {}: {e}", spec.id)).encode(&mut out),
+                },
+                Ok(Msg::AwaitStart { id }) => match await_start(procs, &mut failed_starts, id) {
+                    Ok((pid, starting)) => Msg::Started { id, pid, starting }.encode(&mut out),
+                    Err(e) => Msg::Error(&e).encode(&mut out),
                 },
                 Ok(Msg::Exec(spec)) => {
                     // Its namespaces are entered through /proc/<pid>: only a
                     // container still running, never one exited under a freed pid.
                     // The container's own seccomp profile goes with it, if it has one.
-                    match running_pid(&procs, spec.container_id).and_then(|pid| procs.get(&pid).map(|p| (pid, p.run.seccomp.clone()))) {
+                    match running_pid(procs, spec.container_id).and_then(|pid| procs.get(&pid).map(|p| (pid, p.run.seccomp.clone()))) {
                         None => Msg::Error(&format!("container {} is not running", spec.container_id)).encode(&mut out),
                         Some((pid, profile)) => match container::exec(&spec, pid, paths, &profile) {
                             Ok(run) => {
                                 let cloned_ns = sys::boottime_ns();
-                                Msg::Started { id: &run.id, pid: run.pid as u32 }.encode(&mut out);
-                                admit(&mut conn, &mut dns, &mut procs, new_proc(run, received_ns, cloned_ns))?;
+                                Msg::Started { id: &run.id, pid: run.pid as u32, starting: false }.encode(&mut out);
+                                admit(&mut conn, &mut dns, procs, new_proc(run, received_ns, cloned_ns))?;
                             }
                             Err(e) => Msg::Error(&format!("exec in {}: {e}", spec.container_id)).encode(&mut out),
                         },
@@ -413,7 +487,7 @@ pub fn serve(mut conn: File, paths: &Paths) -> io::Result<()> {
                         }
                     }
                     if let Some(fd) = target {
-                        flush_input(&mut procs, fd, &mut conn, &mut out)?;
+                        flush_input(procs, fd, &mut conn, &mut out)?;
                     }
                     continue;
                 }
@@ -431,18 +505,32 @@ pub fn serve(mut conn: File, paths: &Paths) -> io::Result<()> {
                     continue;
                 }
                 Ok(Msg::Resize { id, rows, cols }) => {
-                    if let Some(fd) = running(&procs, id).filter(|p| p.run.tty).and_then(|p| p.run.stdout.as_ref()) {
+                    if let Some(fd) = running(procs, id).filter(|p| p.run.tty).and_then(|p| p.run.stdout.as_ref()) {
                         sys::resize_pty(fd.as_raw_fd(), rows, cols);
                     }
                     continue;
                 }
                 Ok(Msg::Kill { id, signal }) => {
-                    if let Some(p) = running(&procs, id) {
-                        // SAFETY: signalling a child we started and have not
-                        // reaped, so its pid can't belong to another process.
-                        unsafe { libc::kill(p.run.pid, signal as libc::c_int) };
+                    if let Some(p) = procs.values_mut().find(|p| p.run.id == id && p.exited.is_none()) {
+                        // A child still filling a new volume finishes first
+                        // (see `Process::wait_root`); one that ended before
+                        // its root was ready has failed its start, and is
+                        // torn down by `settle_roots`, not signalled.
+                        if p.run.wait_root() != Root::Ended {
+                            // SAFETY: signalling a child we started and have not
+                            // reaped, so its pid can't belong to another process.
+                            unsafe { libc::kill(p.run.pid, signal as libc::c_int) };
+                        }
                     }
                     continue; // no reply: the exit, if any, is reported as Exited
+                }
+                Ok(Msg::CancelStart { id }) => {
+                    // Never waits: a child still making its root is killed
+                    // now, one filling a volume once the fill is done.
+                    if let Some(p) = procs.values_mut().find(|p| p.run.id == id && p.run.container.is_none() && p.exited.is_none()) {
+                        p.run.cancel();
+                    }
+                    continue; // no reply: the start's next `AwaitStart` says how it ended
                 }
                 Ok(Msg::Remove { id }) => {
                     if !procs.values().any(|p| p.run.id == id) {
@@ -483,14 +571,18 @@ pub fn serve(mut conn: File, paths: &Paths) -> io::Result<()> {
                 Ok(Msg::UsageQuery) => {
                     // No reply here: replies go in order, and this can take
                     // seconds. The lines follow as a `Usage` message.
-                    if !measuring {
-                        measuring = true;
-                        let (layers, containers, tx, ring) = (paths.layers.clone(), paths.containers.clone(), usage_tx.clone(), usage_ring.clone());
-                        let _ = std::thread::Builder::new().name("usage".into()).spawn(move || {
-                            let _ = tx.send(super::usage::measure(&layers, &containers, Path::new(container::VOLUMES)));
-                            // SAFETY: writing one byte from a buffer we own to a descriptor we own.
-                            unsafe { libc::write(ring.as_raw_fd(), [1u8].as_ptr().cast(), 1) };
-                        });
+                    // One at a time: a query while one runs gets its answer.
+                    if measuring.is_none() {
+                        match super::usage::Job::start(&paths.layers, &paths.containers, Path::new(container::VOLUMES)) {
+                            Ok(job) => measuring = Some(job),
+                            Err(e) => {
+                                // Answered at once, unmeasured, rather than
+                                // left to the daemon's wait.
+                                eprintln!("kiri-init: system df: {e}");
+                                kiri_proto::encode_usage(&mut out, &[] as &[String]);
+                                conn.write_all(&out)?;
+                            }
+                        }
                     }
                     continue;
                 }
@@ -531,28 +623,28 @@ pub fn serve(mut conn: File, paths: &Paths) -> io::Result<()> {
                     }
                     continue;
                 }
-                Ok(Msg::Update { id, limits }) => match running_pid(&procs, id) {
+                Ok(Msg::Update { id, limits }) => match live_pid(procs, id) {
                     Some(_) => match super::cgroup::apply_limits(&paths.cgroup.join(id), &limits) {
                         Ok(()) => Msg::Ack.encode(&mut out),
                         Err(e) => Msg::Error(&format!("update: {e}")).encode(&mut out),
                     },
                     None => Msg::Error(&format!("container {id} is not running")).encode(&mut out),
                 },
-                Ok(Msg::Freeze { id, frozen }) => match running_pid(&procs, id) {
-                    Some(_) => match super::cgroup::freeze(&paths.cgroup.join(id), frozen) {
+                Ok(Msg::Freeze { id, frozen }) => match freeze_target(procs, id, frozen) {
+                    Ok(_) => match super::cgroup::freeze(&paths.cgroup.join(id), frozen) {
                         Ok(()) => Msg::Ack.encode(&mut out),
                         Err(e) => Msg::Error(&format!("freeze: {e}")).encode(&mut out),
                     },
-                    None => Msg::Error(&format!("container {id} is not running")).encode(&mut out),
+                    Err(e) => Msg::Error(&e).encode(&mut out),
                 },
-                Ok(Msg::StatsQuery { id }) => match running_pid(&procs, id) {
+                Ok(Msg::StatsQuery { id }) => match netns_pid(procs, id) {
                     Some(pid) => match super::cgroup::stats(&paths.cgroup.join(id), pid) {
                         Ok(s) => Msg::ContainerStats(s).encode(&mut out),
                         Err(e) => Msg::Error(&format!("stats: {e}")).encode(&mut out),
                     },
                     None => Msg::Error(&format!("container {id} is not running")).encode(&mut out),
                 },
-                Ok(Msg::TopQuery { id }) => match running_pid(&procs, id) {
+                Ok(Msg::TopQuery { id }) => match live_pid(procs, id) {
                     Some(_) => {
                         let lines = super::cgroup::top(&paths.cgroup.join(id));
                         kiri_proto::encode_top(&mut out, &lines);
@@ -560,11 +652,11 @@ pub fn serve(mut conn: File, paths: &Paths) -> io::Result<()> {
                     None => Msg::Error(&format!("container {id} is not running")).encode(&mut out),
                 },
                 Ok(Msg::UsbNodesQuery) => kiri_proto::encode_usb_nodes(&mut out, &super::usb::nodes()),
-                Ok(Msg::ListenQuery { id }) => match running_pid(&procs, id) {
+                Ok(Msg::ListenQuery { id }) => match netns_pid(procs, id) {
                     Some(pid) => kiri_proto::encode_listening(&mut out, &net::listening(pid)),
                     None => Msg::Error(&format!("container {id} is not running")).encode(&mut out),
                 },
-                Ok(Msg::NetAttach { id, ifname, net: n }) => match running_pid(&procs, id) {
+                Ok(Msg::NetAttach { id, ifname, net: n }) => match netns_pid(procs, id) {
                     Some(pid) => {
                         let num: u32 = ifname.strip_prefix("eth").and_then(|v| v.parse().ok()).unwrap_or(1);
                         let host_if = extra_veth(id, num);
@@ -575,10 +667,20 @@ pub fn serve(mut conn: File, paths: &Paths) -> io::Result<()> {
                         let v6 = net::Ip6::from_opts(n.opts);
                         let plug = net::Plug::from_opts(n.opts);
                         let attached = net::attach(&mut bridges, n.bridge, &host_if, pid, num, n.ip, n.prefix, n.gateway, mac, v6, plug)
-                            .and_then(|()| if plug.no_ipv4 { Ok(()) } else { dns.serve(n.bridge, n.gateway) })
+                            // A gateway that won't take the listener doesn't
+                            // stop the connect: names answer at 127.0.0.11 in
+                            // the container (dns.rs `serve_or_warn`, #477).
+                            .map(|()| {
+                                if !plug.no_ipv4 {
+                                    dns.serve_or_warn(n.bridge, n.gateway);
+                                }
+                            })
                             .and_then(|()| std::fs::File::open(format!("/proc/{pid}/ns/net")).and_then(|ns| dns.serve_in(&ns, pid, n.ip, n.bridge)));
                         match attached {
                             Ok(()) => {
+                                if let Some(name) = kiri_proto::net_opts::values(n.opts, kiri_proto::net_opts::NETWORK).next() {
+                                    dns.name_network(n.bridge, name);
+                                }
                                 if !plug.no_ipv4 {
                                     dns.register(n.bridge, n.dns_names.iter(), n.ip);
                                 }
@@ -589,6 +691,22 @@ pub fn serve(mut conn: File, paths: &Paths) -> io::Result<()> {
                                     p.run.dns_entries.push((n.bridge.to_owned(), n.ip));
                                     p.run.veths.push(host_if.clone());
                                 }
+                                // A user network's names come from the embedded
+                                // DNS, which now answers in the container: its
+                                // resolv.conf names it from here on (#449).
+                                if n.bridge != "kiri0" && !plug.no_ipv4 {
+                                    let upstream = dhcp.as_ref().and_then(|d| d.lease.as_ref()).map_or(&host_dns[..], |l| &l.dns);
+                                    let is_kiri = |a: [u8; 4]| upstream.contains(&a) || dns.serves_at(a) || a == [1, 1, 1, 1];
+                                    match container::use_embedded_dns(id, is_kiri) {
+                                        Ok(Some(servers)) if !servers.is_empty() => {
+                                            if let Some(owner) = dns.owner_of(pid) {
+                                                dns.set_upstream(owner, servers);
+                                            }
+                                        }
+                                        Ok(_) => {}
+                                        Err(e) => eprintln!("kiri-init: {id}: resolv.conf: {e}"),
+                                    }
+                                }
                                 Msg::Ack.encode(&mut out)
                             }
                             Err(e) => Msg::Error(&format!("connect: {e}")).encode(&mut out),
@@ -596,6 +714,20 @@ pub fn serve(mut conn: File, paths: &Paths) -> io::Result<()> {
                     }
                     None => Msg::Error(&format!("container {id} is not running")).encode(&mut out),
                 },
+                Ok(Msg::DnsRename { id, bridge, ip, ip6, v4, names }) => {
+                    // The names registered at start are keyed by address, so
+                    // they are replaced as a set; its `--dns` servers stay. A
+                    // stopped container sends no such frame. No reply.
+                    // Only a live container's own address on one of Kiri's
+                    // bridges: a frame that raced the container's exit or its
+                    // leaving the network, or that names another's address,
+                    // changes nothing.
+                    if rename_allowed(procs, id, bridge, ip) {
+                        let ip6 = <[u8; 16]>::try_from(ip6).ok();
+                        dns.rename(bridge, ip, ip6, v4, &names.iter().collect::<Vec<_>>());
+                    }
+                    continue;
+                }
                 Ok(Msg::UplinkQuery) => match dhcp.as_ref().and_then(|d| d.lease.as_ref()) {
                     Some(l) => Msg::Uplink { ip: l.ip, gateway: l.gateway }.encode(&mut out),
                     None => Msg::Error("no uplink lease").encode(&mut out),
@@ -604,7 +736,7 @@ pub fn serve(mut conn: File, paths: &Paths) -> io::Result<()> {
                     Ok(()) => Msg::Ack.encode(&mut out),
                     Err(e) => Msg::Error(&format!("route: {e}")).encode(&mut out),
                 },
-                Ok(Msg::NetDetach { id, ifname, bridge, ip }) => match running_pid(&procs, id) {
+                Ok(Msg::NetDetach { id, ifname, bridge, ip }) => match netns_pid(procs, id) {
                     Some(pid) => {
                         let num: u32 = ifname.strip_prefix("eth").and_then(|v| v.parse().ok()).unwrap_or(1);
                         dns.unregister(bridge, ip);
@@ -621,7 +753,7 @@ pub fn serve(mut conn: File, paths: &Paths) -> io::Result<()> {
                     }
                     None => Msg::Error(&format!("container {id} is not running")).encode(&mut out),
                 },
-                Ok(Msg::FsStatRequest { id, path }) => match running_rootfs(&procs, paths, id) {
+                Ok(Msg::FsStatRequest { id, path }) => match running_rootfs(procs, paths, id) {
                     Some(root) => match super::fsview::stat(&root, path) {
                         Ok(meta) => {
                             let name = path.rsplit('/').next().unwrap_or("");
@@ -631,7 +763,7 @@ pub fn serve(mut conn: File, paths: &Paths) -> io::Result<()> {
                     },
                     None => Msg::Error(&format!("container {id} is not running")).encode(&mut out),
                 },
-                Ok(Msg::FsListRequest { id, path }) => match running_rootfs(&procs, paths, id) {
+                Ok(Msg::FsListRequest { id, path }) => match running_rootfs(procs, paths, id) {
                     Some(root) => match super::fsview::list(&root, path) {
                         Ok(list) => {
                             let entries: Vec<_> = list.iter().map(|(n, m)| super::fsview::entry(n, *m)).collect();
@@ -641,7 +773,7 @@ pub fn serve(mut conn: File, paths: &Paths) -> io::Result<()> {
                     },
                     None => Msg::Error(&format!("container {id} is not running")).encode(&mut out),
                 },
-                Ok(Msg::FsRead { id, path, offset, len }) => match running_rootfs(&procs, paths, id) {
+                Ok(Msg::FsRead { id, path, offset, len }) => match running_rootfs(procs, paths, id) {
                     Some(root) => match super::fsview::read(&root, path, offset, len as usize, &mut fs_buf) {
                         Ok(()) => Msg::FsData(&fs_buf).encode(&mut out),
                         Err(e) => Msg::Error(&format!("read {path}: {e}")).encode(&mut out),
@@ -649,6 +781,12 @@ pub fn serve(mut conn: File, paths: &Paths) -> io::Result<()> {
                     None => Msg::Error(&format!("container {id} is not running")).encode(&mut out),
                 },
                 Ok(other) => Msg::Error(&format!("unexpected {other:?}")).encode(&mut out),
+                // A frame the host expects no reply to gets none, decoded
+                // or not: an answer would be read as the next one's reply.
+                Err(e) if kiri_proto::takes_no_reply(&frame) => {
+                    eprintln!("kiri-init: dropped a bad no-reply frame: {e:?}");
+                    continue;
+                }
                 Err(e) => Msg::Error(&format!("bad frame: {e:?}")).encode(&mut out),
             }
             conn.write_all(&out)?;
@@ -685,9 +823,117 @@ fn memory_pressure_trigger() -> Option<std::fs::File> {
     Some(f)
 }
 
-/// A running container's init (not an exec).
+/// A running container's init that may be entered (see `Proc::enterable`):
+/// one still filling a new volume reads as not running.
 fn running_pid(procs: &HashMap<libc::pid_t, Proc>, id: &str) -> Option<libc::pid_t> {
+    procs.iter().find(|(_, p)| p.run.id == id && p.enterable()).map(|(pid, _)| *pid)
+}
+
+/// A running container's init (not an exec), its root in place or not: for
+/// what only touches its cgroup or network namespace.
+fn live_pid(procs: &HashMap<libc::pid_t, Proc>, id: &str) -> Option<libc::pid_t> {
     procs.iter().find(|(_, p)| p.run.container.is_none() && p.run.id == id && p.exited.is_none()).map(|(pid, _)| *pid)
+}
+
+/// The init of a container whose network namespace may be joined: one
+/// still filling a volume will do, since its own namespace exists from the
+/// clone. Not one that itself joined another's (`--network container:`)
+/// and is not yet entered: its child has perhaps not joined it, and
+/// `/proc/<pid>/ns/net` could still be the host's. Answered as for a
+/// container that is not running.
+/// Whether a `DnsRename` may change names: `ip` on `bridge` is a live
+/// container's own entry, and the bridge is one of Kiri's user networks.
+fn rename_allowed(procs: &HashMap<libc::pid_t, Proc>, id: &str, bridge: &str, ip: [u8; 4]) -> bool {
+    bridge.starts_with("kiri")
+        && bridge != "kiri0"
+        && ip != [0; 4]
+        && procs.values().any(|p| p.run.container.is_none() && p.exited.is_none() && p.run.id == id && p.run.dns_entries.iter().any(|(b, a)| b == bridge && *a == ip))
+}
+
+fn netns_pid(procs: &HashMap<libc::pid_t, Proc>, id: &str) -> Option<libc::pid_t> {
+    procs.iter().find(|(_, p)| p.run.container.is_none() && p.run.id == id && p.exited.is_none() && (!p.run.joins_netns || p.enterable())).map(|(pid, _)| *pid)
+}
+
+/// The container a `Freeze` may act on. A child still filling a new volume
+/// is never frozen: the daemon's start waits (`AwaitStart`) for it to say
+/// its root is in place, which a frozen child never does, and a `docker
+/// commit` that paused it would then wait for that start forever. The
+/// daemon waits for the start before it pauses; this is the second line.
+/// Thawing touches nothing the child does, so it needs only a live one.
+fn freeze_target(procs: &HashMap<libc::pid_t, Proc>, id: &str, frozen: bool) -> Result<libc::pid_t, String> {
+    match (live_pid(procs, id), running_pid(procs, id)) {
+        (None, _) => Err(format!("container {id} is not running")),
+        (Some(pid), _) if !frozen => Ok(pid),
+        (Some(_), Some(pid)) => Ok(pid),
+        (Some(_), None) => Err(format!("container {id} is still starting")),
+    }
+}
+
+/// Looks again, without waiting, at the roots of containers that started
+/// before theirs was in place (see `Process::root`).
+fn settle_roots(procs: &mut HashMap<libc::pid_t, Proc>, dns: &mut super::dns::Dns, failed: &mut HashMap<String, String>) {
+    let mut ended = Vec::new();
+    for (pid, p) in procs.iter_mut().filter(|(_, p)| !p.run.entered()) {
+        match p.run.root() {
+            Root::Ended => ended.push(*pid),
+            // Its start was cancelled while it filled a volume: the fill is
+            // done, so it goes now (see `Process::cancel`).
+            Root::Ready if p.run.take_cancel() && p.exited.is_none() => {
+                // SAFETY: SIGKILL to our own child, not reaped yet.
+                unsafe { libc::kill(p.run.pid, libc::SIGKILL) };
+            }
+            _ => {}
+        }
+    }
+    for pid in ended {
+        let p = procs.remove(&pid).expect("listed above");
+        let why = format!("run {}: {}", p.run.id, p.run.start_failure().unwrap_or_default());
+        failed.insert(p.run.id.clone(), why);
+        drop_failed_start(dns, procs, p);
+    }
+}
+
+/// Tears down a container whose child ended before its root was in place,
+/// as `spawn` does for a start that fails within its wait: no `Exited`,
+/// since the start itself failed (the daemon hears it from `AwaitStart`),
+/// and its output, only the failure message, is not forwarded.
+fn drop_failed_start(dns: &mut super::dns::Dns, procs: &HashMap<libc::pid_t, Proc>, p: Proc) {
+    if p.exited.is_none() {
+        // Its pipe closed because it exited (it never execs before its
+        // root is ready), and it isn't reaped yet: the pid is still ours.
+        // SAFETY: reaping our own unreaped child.
+        unsafe { libc::waitpid(p.run.pid, std::ptr::null_mut(), 0) };
+    }
+    for (bridge, ip) in &p.run.dns_entries {
+        dns.unregister(bridge, *ip);
+    }
+    dns.drop_container(p.run.pid);
+    let shared = p.run.netns != 0 && procs.values().any(|o| o.exited.is_none() && o.run.netns == p.run.netns);
+    container::teardown(&p.run, shared);
+}
+
+/// `AwaitStart`: the container's pid, and whether its root is still being
+/// made; an error once it is not running, or ended before its root was in
+/// place (its exit is reported as usual).
+fn await_start(procs: &mut HashMap<libc::pid_t, Proc>, failed: &mut HashMap<String, String>, id: &str) -> Result<(u32, bool), String> {
+    if let Some(why) = failed.remove(id) {
+        return Err(why);
+    }
+    // The run still starting, before an earlier run of the same id whose
+    // exit is still being reported.
+    let mine = |p: &Proc| p.run.container.is_none() && p.run.id == id;
+    let pid = procs.iter().find(|(_, p)| mine(p) && !p.run.entered()).or_else(|| procs.iter().find(|(_, p)| mine(p))).map(|(pid, _)| *pid);
+    let Some((pid, p)) = pid.and_then(|pid| procs.get_mut(&pid).map(|p| (pid, p))) else {
+        // Its root was in place and it has exited since, its exit reported
+        // as usual: the start itself succeeded.
+        return Ok((0, false));
+    };
+    match p.run.root() {
+        Root::Ready => Ok((pid as u32, false)),
+        // Ended: the next `settle_roots` tears it down, and the next ask
+        // gets its reason.
+        Root::Starting | Root::Ended => Ok((pid as u32, true)),
+    }
 }
 
 /// The host side of a container's `eth{n}` for n > 0: 15 characters at most.
@@ -695,8 +941,15 @@ fn extra_veth(id: &str, n: u32) -> String {
     format!("kx{}{n}", &id[..id.len().min(9)])
 }
 
-/// The mounted root of a running container (not an exec).
+/// The root of a running container (not an exec), for the Mac's file
+/// browser. Through /proc it is the container's own view, with its volumes
+/// and bind mounts, as `docker cp` reads a running container: those are
+/// mounted only in its mount namespace, so the overlay the agent mounted
+/// shows their folders empty (#317). Its init just exited: that overlay.
 fn running_rootfs(procs: &HashMap<libc::pid_t, Proc>, paths: &Paths, id: &str) -> Option<std::path::PathBuf> {
+    if let Some(pid) = running_pid(procs, id) {
+        return Some(std::path::PathBuf::from(format!("/proc/{pid}/root")));
+    }
     procs.values().any(|p| p.run.container.is_none() && p.run.id == id).then(|| paths.containers.join(id).join("rootfs"))
 }
 
@@ -812,7 +1065,9 @@ fn child_signals() -> io::Result<OwnedFd> {
 /// writable layer of a `--rm` one. Veths go with their network namespaces.
 fn stop_containers(procs: &mut HashMap<libc::pid_t, Proc>) {
     super::copy::stop_all();
-    for p in procs.values().filter(|p| p.exited.is_none()) {
+    for p in procs.values_mut().filter(|p| p.exited.is_none()) {
+        // Never half-way through filling a volume (see `Process::wait_root`).
+        p.run.wait_root();
         // SAFETY: signalling a child we started and have not reaped.
         unsafe { libc::kill(p.run.pid, libc::SIGKILL) };
     }
@@ -896,6 +1151,12 @@ fn finish(conn: &mut File, dns: &mut super::dns::Dns, procs: &HashMap<libc::pid_
     Ok(())
 }
 
+/// The most `admit` forwards of an exited process's leftover output, per
+/// stream. More than a pipe holds (64 KiB by default, 1 MiB at most for a
+/// process without privileges), so nothing written before is lost; and an
+/// end to it, since a process the old one left behind can write for ever.
+const LAST_OUTPUT_MAX: usize = 1 << 20;
+
 /// Adds a started process. An exited one whose output is still being read
 /// can hold the same pid, which `reap` freed and a new clone just took:
 /// replaced silently, its exit was never reported (a `docker wait` or exec
@@ -908,13 +1169,22 @@ fn admit(conn: &mut File, dns: &mut super::dns::Dns, procs: &mut HashMap<libc::p
         let mut out = Vec::new();
         for (stream, fd) in [(Stream::Stdout, old.run.stdout.take()), (Stream::Stderr, old.run.stderr.take())] {
             let Some(fd) = fd else { continue };
-            loop {
-                // SAFETY: reading into a buffer we own from a non-blocking
-                // descriptor we own.
-                let got = unsafe { libc::read(fd.as_raw_fd(), chunk.as_mut_ptr().cast(), chunk.len()) };
+            // Only what is in the pipe already. A process the old one left
+            // behind in a session of its own can still hold the write end:
+            // a read that waited for it would hold up every container, and
+            // so would following one that never stops writing.
+            if sys::set_nonblocking(fd.as_raw_fd()).is_err() {
+                continue;
+            }
+            let mut left = LAST_OUTPUT_MAX;
+            while left > 0 {
+                // SAFETY: reading into a buffer we own from a descriptor we
+                // own, made non-blocking just above.
+                let got = unsafe { libc::read(fd.as_raw_fd(), chunk.as_mut_ptr().cast(), chunk.len().min(left)) };
                 if got <= 0 {
                     break;
                 }
+                left -= got as usize;
                 out.clear();
                 Msg::Output { id: &old.run.id, stream, data: &chunk[..got as usize] }.encode(&mut out);
                 conn.write_all(&out)?;
@@ -961,8 +1231,31 @@ fn reap(procs: &mut HashMap<libc::pid_t, Proc>) {
 
 #[cfg(test)]
 mod running_tests {
-    use super::{Process, new_proc, running, running_pid};
+    use super::{Process, await_start, live_pid, netns_pid, new_proc, rename_allowed, running, running_pid, settle_roots};
     use std::collections::HashMap;
+
+    #[test]
+    fn a_dns_rename_changes_only_a_live_containers_own_address() {
+        let ip = [10, 5, 0, 2];
+        let mut procs = HashMap::new();
+        let mut run = Process::for_test("c1", 100);
+        run.dns_entries.push(("kiri1".to_owned(), ip));
+        procs.insert(100, new_proc(run, 0, 0));
+        assert!(rename_allowed(&procs, "c1", "kiri1", ip));
+        assert!(!rename_allowed(&procs, "c2", "kiri1", ip), "another container's id");
+        assert!(!rename_allowed(&procs, "c1", "kiri1", [10, 5, 0, 3]), "another address");
+        assert!(!rename_allowed(&procs, "c1", "kiri2", ip), "a network it is not on");
+        assert!(!rename_allowed(&procs, "c1", "kiri0", ip), "the default bridge");
+        assert!(!rename_allowed(&procs, "c1", "eth0", ip), "not one of Kiri's bridges");
+        let mut run = Process::for_test("c3", 300);
+        run.dns_entries.push(("kiri1".to_owned(), [0; 4]));
+        procs.insert(300, new_proc(run, 0, 0));
+        assert!(!rename_allowed(&procs, "c3", "kiri1", [0; 4]), "no address");
+        // Once it has exited its names are gone with it: a late frame
+        // must not put them back.
+        procs.get_mut(&100).unwrap().exited = Some((0, 0));
+        assert!(!rename_allowed(&procs, "c1", "kiri1", ip));
+    }
 
     #[test]
     fn a_restarted_container_is_found_never_its_exited_run() {
@@ -980,6 +1273,112 @@ mod running_tests {
             procs.insert(200, new_proc(Process::for_test("c1", 200), 0, 0));
             assert_eq!(running(&procs, "c1").map(|p| p.run.pid), Some(200));
             assert_eq!(running_pid(&procs, "c1"), Some(200));
+        }
+    }
+
+    #[test]
+    fn a_container_still_making_its_root_cannot_be_entered() {
+        use std::io::Write;
+        let (r, mut w) = pipe();
+        let mut procs = HashMap::new();
+        let mut dns = super::super::dns::Dns::default();
+        let mut failed = HashMap::new();
+        procs.insert(300, new_proc(Process::starting_for_test("c1", 300, r.into(), None), 0, 0));
+        // Exec (and copy) see it as not running; signals, stats and its
+        // network still find it.
+        assert_eq!(running_pid(&procs, "c1"), None, "no exec while its root is not in place");
+        assert_eq!(live_pid(&procs, "c1"), Some(300), "its network can be joined");
+        assert_eq!(netns_pid(&procs, "c1"), Some(300), "it owns its namespace, which exists from the clone");
+        assert_eq!(running(&procs, "c1").map(|p| p.run.pid), Some(300), "kill still reaches it");
+        assert_eq!(await_start(&mut procs, &mut failed, "c1"), Ok((300, true)));
+        settle_roots(&mut procs, &mut dns, &mut failed);
+        assert_eq!(running_pid(&procs, "c1"), None);
+        // The child's byte: in place now.
+        w.write_all(b"r").unwrap();
+        settle_roots(&mut procs, &mut dns, &mut failed);
+        assert_eq!(running_pid(&procs, "c1"), Some(300));
+        assert_eq!(await_start(&mut procs, &mut failed, "c1"), Ok((300, false)));
+        // Gone since, its exit reported as usual: the start succeeded.
+        assert_eq!(await_start(&mut procs, &mut failed, "nope"), Ok((0, false)));
+        // Restarted while the first run's exit is still being reported: the
+        // ask is about the run still starting.
+        let mut old = new_proc(Process::for_test("c3", 400), 0, 0);
+        old.exited = Some((0, 0));
+        procs.insert(400, old);
+        let (r, _w) = pipe();
+        procs.insert(401, new_proc(Process::starting_for_test("c3", 401, r.into(), None), 0, 0));
+        assert_eq!(await_start(&mut procs, &mut failed, "c3"), Ok((401, true)));
+    }
+
+    #[test]
+    fn a_container_still_joining_a_network_cannot_be_joined_itself() {
+        use std::io::Write;
+        let (r, mut w) = pipe();
+        let mut procs = HashMap::new();
+        let mut dns = super::super::dns::Dns::default();
+        let mut failed = HashMap::new();
+        let mut p = Process::starting_for_test("c1", 300, r.into(), None);
+        p.joins_netns = true;
+        procs.insert(300, new_proc(p, 0, 0));
+        assert_eq!(live_pid(&procs, "c1"), Some(300));
+        assert_eq!(netns_pid(&procs, "c1"), None, "its child may not have joined yet: as if not running");
+        w.write_all(b"r").unwrap();
+        settle_roots(&mut procs, &mut dns, &mut failed);
+        assert_eq!(netns_pid(&procs, "c1"), Some(300), "entered: its namespace is the one joined");
+    }
+
+    #[test]
+    fn a_start_that_fails_while_starting_is_an_error_not_an_exit() {
+        use std::io::Write;
+        let (r, w) = pipe();
+        let r_fd = std::os::fd::AsRawFd::as_raw_fd(&r);
+        let (err_r, mut err_w) = pipe();
+        let mut procs = HashMap::new();
+        let mut dns = super::super::dns::Dns::default();
+        let mut failed = HashMap::new();
+        let mut p = new_proc(Process::starting_for_test("c2", 301, r.into(), Some(err_r.into())), 0, 0);
+        // Already reaped, so the teardown does not wait for pid 301.
+        p.exited = Some((127, 0));
+        procs.insert(301, p);
+        err_w.write_all(b"kiri: cannot start container: mount /payload: No space left on device (os error 28)\n").unwrap();
+        settle_roots(&mut procs, &mut dns, &mut failed);
+        assert_eq!(await_start(&mut procs, &mut failed, "c2"), Ok((301, true)), "still starting until the pipe closes");
+        drop(w);
+        wait_all_writers_gone(r_fd);
+        settle_roots(&mut procs, &mut dns, &mut failed);
+        assert!(procs.is_empty(), "torn down, never left for the exit path (no Exited)");
+        assert_eq!(running_pid(&procs, "c2"), None);
+        assert_eq!(
+            await_start(&mut procs, &mut failed, "c2"),
+            Err("run c2: mount /payload: No space left on device (os error 28)".into()),
+            "the start fails with the child's own reason"
+        );
+        assert!(failed.is_empty(), "answered once");
+    }
+
+    /// Waits, for at most 5 seconds, until no writer of the pipe is left:
+    /// `poll` reports POLLHUP on the read end then, whatever the events
+    /// asked for. Tests run as threads of one process, and a child another
+    /// test forks holds a copy of every open descriptor until it execs or
+    /// exits, so a write end dropped here is not yet closed for the reader.
+    /// The real agent is single-threaded, so this cannot happen there.
+    fn wait_all_writers_gone(read_end: std::os::fd::RawFd) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            let mut pfd = libc::pollfd { fd: read_end, events: 0, revents: 0 };
+            // SAFETY: one valid pollfd.
+            let n = unsafe { libc::poll(&mut pfd, 1, left.as_millis().min(i32::MAX as u128) as i32) };
+            if n > 0 && pfd.revents & libc::POLLHUP != 0 {
+                return;
+            }
+            if n < 0 {
+                assert_eq!(std::io::Error::last_os_error().kind(), std::io::ErrorKind::Interrupted, "poll failed");
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the write end is still held somewhere 5 s after it was dropped"
+            );
         }
     }
 
@@ -1020,6 +1419,165 @@ mod running_tests {
         assert!(matches!(kiri_proto::decode(&frame), Ok(Msg::Exited(e)) if e.id == "old" && e.code == 3), "then its exit");
         assert!(!super::read_frame(&mut host, &mut frame).unwrap(), "nothing about the new one");
     }
+
+    /// A process the old one left behind, in a session of its own, can keep
+    /// the old one's output pipe open for as long as it lives.
+    #[test]
+    fn a_new_process_on_a_freed_pid_does_not_wait_for_a_pipe_still_held() {
+        use kiri_proto::Msg;
+        use std::io::Write;
+        // Made as `container::stdio` makes a process's stdout.
+        let (out_r, out_w) = super::super::sys::pipe().unwrap();
+        let mut held = std::fs::File::from(out_w);
+        held.write_all(b"bye").unwrap();
+        let (done, waited) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let (mut host, mut conn) = pipe();
+            let mut dns = super::super::dns::Dns::default();
+            let mut procs = HashMap::new();
+            let mut old = new_proc(Process::for_test("old", 100), 0, 0);
+            old.run.stdout = Some(out_r);
+            old.exited = Some((3, 0));
+            procs.insert(100, old);
+            super::admit(&mut conn, &mut dns, &mut procs, new_proc(Process::for_test("new", 100), 0, 0)).unwrap();
+            drop(conn);
+            let mut frame = Vec::new();
+            let last_words = super::read_frame(&mut host, &mut frame).unwrap() && matches!(kiri_proto::decode(&frame), Ok(Msg::Output { id: "old", data: b"bye", .. }));
+            let exit = super::read_frame(&mut host, &mut frame).unwrap() && matches!(kiri_proto::decode(&frame), Ok(Msg::Exited(e)) if e.id == "old" && e.code == 3);
+            let _ = done.send((last_words, exit, procs[&100].run.id.clone()));
+        });
+        let got = waited.recv_timeout(std::time::Duration::from_secs(5));
+        // Only now does the pipe close: a read still waiting for it ends,
+        // so the thread can be joined whatever happened.
+        drop(held);
+        thread.join().unwrap();
+        assert_eq!(got, Ok((true, true, "new".to_owned())), "the old one's last output and exit go out, and nothing waits for the pipe to close");
+    }
+
+    /// The process left behind may also never stop writing. The agent has
+    /// one thread: following that output held up every container.
+    #[test]
+    fn a_new_process_on_a_freed_pid_does_not_follow_a_writer_that_never_stops() {
+        use kiri_proto::Msg;
+        use std::io::Write;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (out_r, out_w) = super::super::sys::pipe().unwrap();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let writer = {
+            let stop = stop.clone();
+            let mut w = std::fs::File::from(out_w);
+            let block = [b'x'; 4096];
+            // Some of it is in the pipe before the new process arrives.
+            w.write_all(&block).unwrap();
+            std::thread::spawn(move || while !stop.load(Ordering::SeqCst) && w.write_all(&block).is_ok() {})
+        };
+        let (mut host, mut conn) = pipe();
+        // The daemon's end: it reads what the agent sends, as it always does.
+        let reader = std::thread::spawn(move || {
+            let (mut frame, mut output, mut exited) = (Vec::new(), 0usize, false);
+            while super::read_frame(&mut host, &mut frame).unwrap_or(false) {
+                match kiri_proto::decode(&frame) {
+                    Ok(Msg::Output { id: "old", data, .. }) => output += data.len(),
+                    Ok(Msg::Exited(e)) if e.id == "old" => exited = true,
+                    _ => {}
+                }
+            }
+            (output, exited)
+        });
+        let (done, waited) = std::sync::mpsc::channel();
+        let agent = std::thread::spawn(move || {
+            let mut dns = super::super::dns::Dns::default();
+            let mut procs = HashMap::new();
+            let mut old = new_proc(Process::for_test("old", 100), 0, 0);
+            old.run.stdout = Some(out_r);
+            old.exited = Some((0, 0));
+            procs.insert(100, old);
+            super::admit(&mut conn, &mut dns, &mut procs, new_proc(Process::for_test("new", 100), 0, 0)).unwrap();
+            let _ = done.send(procs[&100].run.id.clone());
+        });
+        let got = waited.recv_timeout(std::time::Duration::from_secs(10));
+        // Whatever happened, the writer stops now, so every thread ends.
+        stop.store(true, Ordering::SeqCst);
+        agent.join().unwrap();
+        writer.join().unwrap();
+        let (output, exited) = reader.join().unwrap();
+        assert_eq!(got, Ok("new".to_owned()), "the new process is taken in while the writer is still writing");
+        assert!(exited, "the old one's exit goes out");
+        assert!(output > 0 && output <= super::LAST_OUTPUT_MAX, "its buffered output goes out, up to the limit: {output}");
+    }
+
+    #[test]
+    fn a_container_still_making_its_root_is_never_frozen() {
+        use std::io::Write;
+        let (r, mut w) = pipe();
+        let mut procs = HashMap::new();
+        let mut dns = super::super::dns::Dns::default();
+        let mut failed = HashMap::new();
+        procs.insert(300, new_proc(Process::starting_for_test("c1", 300, r.into(), None), 0, 0));
+        // Frozen while filling its volume, it never says its root is in
+        // place, and the daemon's start (and a commit that paused it) would
+        // wait for that forever.
+        assert_eq!(super::freeze_target(&procs, "c1", true), Err("container c1 is still starting".into()));
+        assert_eq!(super::freeze_target(&procs, "c1", false), Ok(300), "thawing is harmless");
+        assert_eq!(super::freeze_target(&procs, "nope", true), Err("container nope is not running".into()));
+        w.write_all(b"r").unwrap();
+        settle_roots(&mut procs, &mut dns, &mut failed);
+        assert_eq!(super::freeze_target(&procs, "c1", true), Ok(300), "its root in place: frozen as usual");
+    }
+
+    /// The container files view (`FsStat`, `FsList`, `FsRead`) reads through
+    /// the container's own root. A container still making its root has not
+    /// pivoted: /proc/<pid>/root is the agent's own root then, so it is
+    /// read through the overlay the agent mounted for it, as a stopped one
+    /// is, until its root is in place.
+    #[test]
+    fn the_files_view_never_reads_through_a_container_still_making_its_root() {
+        use std::io::Write;
+        let (r, mut w) = pipe();
+        let mut procs = HashMap::new();
+        let mut dns = super::super::dns::Dns::default();
+        let mut failed = HashMap::new();
+        let paths = super::Paths { layers: "/l".into(), containers: "/c".into(), cgroup: "/g".into() };
+        procs.insert(300, new_proc(Process::starting_for_test("c1", 300, r.into(), None), 0, 0));
+        assert_eq!(super::running_rootfs(&procs, &paths, "c1"), Some("/c/c1/rootfs".into()), "not /proc/300/root, which is the agent's own root");
+        assert_eq!(super::running_rootfs(&procs, &paths, "nope"), None);
+        w.write_all(b"r").unwrap();
+        settle_roots(&mut procs, &mut dns, &mut failed);
+        assert_eq!(super::running_rootfs(&procs, &paths, "c1"), Some("/proc/300/root".into()), "its root in place: its own view, with its volumes");
+    }
+
+    /// The agent leaving on a Linux host, by error as much as by Shutdown,
+    /// waits for a child still filling a new volume before it kills it.
+    #[test]
+    fn leaving_waits_for_a_child_still_making_its_root() {
+        use std::os::fd::AsRawFd;
+        // A real child, so the kill and the reap are real.
+        let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id() as libc::pid_t;
+        let (r, w) = pipe();
+        let mut procs = HashMap::new();
+        procs.insert(pid, new_proc(Process::starting_for_test("c1", pid, r.into(), None), 0, 0));
+        // It says it began a fill (`container::FILLING`).
+        let mut w = w;
+        std::io::Write::write_all(&mut w, b"f").unwrap();
+        let speaker = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            // SAFETY: signal 0 only asks whether the process exists.
+            let alive = unsafe { libc::kill(pid, 0) } == 0;
+            // SAFETY: one byte to a pipe we own.
+            unsafe { libc::write(w.as_raw_fd(), b"r".as_ptr().cast(), 1) };
+            alive
+        });
+        let t = std::time::Instant::now();
+        super::leave(&mut procs, true);
+        let waited = t.elapsed();
+        assert!(speaker.join().unwrap(), "not killed while it was still making its root");
+        assert!(waited >= std::time::Duration::from_millis(140), "left after {waited:?}, before the child spoke");
+        assert!(procs.is_empty(), "stopped and torn down");
+        // SAFETY: signal 0 only asks whether the process exists.
+        assert_ne!(unsafe { libc::kill(pid, 0) }, 0, "killed and reaped once its root was in place");
+        let _ = child.try_wait();
+    }
 }
 
 #[cfg(test)]
@@ -1038,11 +1596,3 @@ mod clock_tests {
     }
 }
 
-/// A non-blocking pipe: (read end the loop polls, write end the thread rings).
-fn usage_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
-    let mut fds = [0; 2];
-    // SAFETY: `fds` has room for the two descriptors pipe2 writes.
-    sys::check(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } as _, "pipe")?;
-    // SAFETY: pipe2 just opened both; nothing else owns them.
-    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
-}

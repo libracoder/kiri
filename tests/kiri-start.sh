@@ -16,6 +16,10 @@
 set -u
 D=${D:-docker}
 DIR=$(cd "$(dirname "$0")/.." && pwd)
+# alpine:3.24 from KIRI_TEST_REGISTRY (tests/lib/images.sh), never from Docker Hub.
+# shellcheck source=SCRIPTDIR/lib/images.sh
+. "$(dirname "$0")/lib/images.sh"
+kiri_seed_images alpine:3.24 || echo "an image could not be fetched"
 # The script is for the container's sh: its $ are expanded there.
 # shellcheck disable=SC2016
 $D run --rm -v "$DIR/contrib/wsl/kiri-linux/kiri-start:/usr/local/bin/kiri-start:ro" alpine:3.24 sh -c '

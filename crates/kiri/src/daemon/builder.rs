@@ -629,20 +629,22 @@ impl Options {
 /// password, identitytoken, …}) as a docker config.json for buildctl.
 fn registry_config(header: &str) -> Option<Vec<u8>> {
     let raw = kiri_image::b64::decode(header)?;
-    let v: Value = serde_json::from_slice(&raw).ok()?;
+    let servers: std::collections::BTreeMap<String, kiri_image::LooseCredentials> = serde_json::from_slice(&raw).ok()?;
     let mut auths = serde_json::Map::new();
-    for (server, a) in v.as_object()? {
+    for (server, kiri_image::LooseCredentials(c)) in servers {
         let mut e = serde_json::Map::new();
-        if let (Some(u), Some(p)) = (a["username"].as_str(), a["password"].as_str()) {
-            e.insert("auth".into(), kiri_image::b64::encode(format!("{u}:{p}").as_bytes()).into());
-        } else if let Some(t) = a["auth"].as_str().filter(|t| !t.is_empty()) {
-            e.insert("auth".into(), t.into());
+        if !c.password.is_empty() {
+            e.insert("auth".into(), kiri_image::b64::encode(format!("{}:{}", c.username, c.password).as_bytes()).into());
+        } else if !c.auth.is_empty() {
+            e.insert("auth".into(), c.auth.into());
+        } else if !c.username.is_empty() && c.identity_token.is_empty() {
+            e.insert("auth".into(), kiri_image::b64::encode(format!("{}:", c.username).as_bytes()).into());
         }
-        if let Some(t) = a["identitytoken"].as_str().filter(|t| !t.is_empty()) {
-            e.insert("identitytoken".into(), t.into());
+        if !c.identity_token.is_empty() {
+            e.insert("identitytoken".into(), c.identity_token.into());
         }
         if !e.is_empty() {
-            auths.insert(server.clone(), Value::Object(e));
+            auths.insert(server, Value::Object(e));
         }
     }
     (!auths.is_empty()).then(|| json!({"auths": auths}).to_string().into_bytes())
@@ -932,8 +934,11 @@ fn failure(tail: &[String], code: i32) -> String {
 /// `POST /build/prune`: BuildKit's prune, if the builder exists (started
 /// for it if stopped). `{CachesDeleted, SpaceReclaimed}`.
 pub fn prune(req: &Request, engine: &Engine) -> Result<Value, Error> {
-    let f = api::filters(req, &["until", "unused-for", "id", "parent", "type", "description", "inuse", "shared", "private"])?;
-    let argv = prune_argv(req, &f)?;
+    // Docker's daemon puts this before every prune error.
+    let argv = prune_filters(req).and_then(|f| prune_argv(req, &f)).map_err(|e| match e {
+        Error::BadRequest(m) => Error::BadRequest(format!("failed to prune build cache: {m}")),
+        e => e,
+    })?;
     if find(engine).is_none() {
         return Ok(json!({"CachesDeleted": [], "SpaceReclaimed": 0}));
     }
@@ -947,6 +952,28 @@ pub fn prune(req: &Request, engine: &Engine) -> Result<Value, Error> {
     }
     let (ids, space) = parse_prune(&text);
     Ok(json!({"CachesDeleted": ids, "SpaceReclaimed": space}))
+}
+
+/// The `filters` of `/build/prune`, read as Docker's daemon reads them
+/// (moby builder-next `Prune` and `toBuildkitPruneInfo`): `label` and
+/// `label!` are accepted and ignored, since `docker system prune --filter
+/// label=…` sends them here too; any other key takes one value, and `until`
+/// with `unused-for` is refused.
+fn prune_filters(req: &Request) -> Result<super::filters::Filters, Error> {
+    const ONE: [&str; 9] = ["until", "unused-for", "id", "parent", "type", "description", "inuse", "shared", "private"];
+    let f = api::filters(req, &[&ONE[..], &["label", "label!"]].concat())?;
+    if f.values("until").is_some() && f.values("unused-for").is_some() {
+        return Err(Error::BadRequest(r#"conflicting filters: "until" and "unused-for""#.into()));
+    }
+    for key in ONE {
+        let mut v = f.values(key).unwrap_or_default().to_vec();
+        v.sort();
+        v.dedup();
+        if v.len() > 1 {
+            return Err(Error::BadRequest("filters expect only one value".into()));
+        }
+    }
+    Ok(f)
 }
 
 fn prune_argv(req: &Request, f: &super::filters::Filters) -> Result<Vec<String>, Error> {
@@ -963,13 +990,15 @@ fn prune_argv(req: &Request, f: &super::filters::Filters) -> Result<Vec<String>,
             a.extend([flag.to_owned(), v]);
         }
     }
+    // A duration, date or Unix time, as Docker takes it; BuildKit wants the
+    // age, in whole seconds. A cut-off in the future keeps no age limit, as
+    // Docker's negative duration does.
     for key in ["until", "unused-for"] {
-        if let Some(v) = f.values(key).and_then(|v| v.first()) {
-            let ok = v.len() > 1 && v.ends_with(['h', 'm', 's']) && v[..v.len() - 1].bytes().all(|b| b.is_ascii_digit() || b"hms.".contains(&b));
-            if !ok {
-                return Err(Error::BadRequest(format!("{key}: give a duration such as 24h")));
+        if let Some(cut) = super::ops::prune_until(f, key)? {
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
+            if now > cut {
+                a.extend(["--keep-duration".into(), format!("{}s", (now - cut).round().max(1.0) as u64)]);
             }
-            a.extend(["--keep-duration".into(), v.clone()]);
         }
     }
     for (key, as_) in [("id", "id~="), ("parent", "parents=="), ("type", "type=="), ("description", "description==")] {
@@ -1129,6 +1158,65 @@ mod tests {
         assert_eq!(v["auths"]["https://index.docker.io/v1/"]["auth"], kiri_image::b64::encode(b"u:p"));
         assert_eq!(v["auths"]["ghcr.io"]["identitytoken"], "tok");
         assert!(v["auths"].get("empty").is_none());
+        // Null fields, as docker-java sends them, are empty (#654).
+        let header = kiri_image::b64::encode(br#"{"r.example":{"username":"u","password":"p","identitytoken":null,"auth":null,"email":null},"nulls":{"username":null,"password":null,"identitytoken":null}}"#);
+        let v: Value = serde_json::from_slice(&registry_config(&header).unwrap()).unwrap();
+        assert_eq!(v["auths"]["r.example"], json!({"auth": kiri_image::b64::encode(b"u:p")}));
+        assert!(v["auths"].get("nulls").is_none());
+        // A null registry value is skipped, and key case does not matter.
+        let header = kiri_image::b64::encode(br#"{"gone.example":null,"r.example":{"UserName":"u","Password":"p"}}"#);
+        let v: Value = serde_json::from_slice(&registry_config(&header).unwrap()).unwrap();
+        assert!(v["auths"].get("gone.example").is_none());
+        assert_eq!(v["auths"]["r.example"], json!({"auth": kiri_image::b64::encode(b"u:p")}));
+    }
+
+    /// What each registry entry becomes, field by field (#654).
+    #[test]
+    fn registry_config_entries() {
+        let entry = |json: &str| -> Value {
+            let header = kiri_image::b64::encode(format!(r#"{{"r.example":{json},"keep.example":{{"username":"k","password":"kp"}}}}"#).as_bytes());
+            let v: Value = serde_json::from_slice(&registry_config(&header).unwrap()).unwrap();
+            // The other registry is never affected by this one.
+            assert_eq!(v["auths"]["keep.example"], json!({"auth": kiri_image::b64::encode(b"k:kp")}), "{json}");
+            v["auths"].get("r.example").cloned().unwrap_or(Value::Null)
+        };
+        let auth = |s: &[u8]| json!({"auth": kiri_image::b64::encode(s)});
+        // No password: an `auth` there is kept.
+        let up = kiri_image::b64::encode(b"u:p");
+        assert_eq!(entry(&format!(r#"{{"username":"u","password":null,"auth":"{up}"}}"#)), json!({"auth": up}));
+        assert_eq!(entry(&format!(r#"{{"username":"u","auth":"{up}"}}"#)), json!({"auth": up}));
+        // A username beside an identity token is not made into a password sign-in.
+        assert_eq!(entry(r#"{"username":"u","password":null,"identitytoken":"tok"}"#), json!({"identitytoken": "tok"}));
+        assert_eq!(entry(r#"{"username":"u","password":"","identitytoken":"tok"}"#), json!({"identitytoken": "tok"}));
+        // A password with an empty username, and a username with an empty password.
+        assert_eq!(entry(r#"{"username":"","password":"secret"}"#), auth(b":secret"));
+        assert_eq!(entry(r#"{"password":"secret"}"#), auth(b":secret"));
+        assert_eq!(entry(r#"{"username":"u","password":""}"#), auth(b"u:"));
+        // Docker reads a missing or null password the same as an empty one.
+        assert_eq!(entry(r#"{"username":"u"}"#), auth(b"u:"));
+        assert_eq!(entry(r#"{"username":"u","password":null}"#), auth(b"u:"));
+        assert_eq!(entry(r#"{"username":"u","password":"p","identitytoken":"tok"}"#), json!({"auth": up, "identitytoken": "tok"}));
+        // A null after a value leaves it, the same key spelled the same way or not.
+        assert_eq!(entry(r#"{"identitytoken":"tok","identitytoken":null}"#), json!({"identitytoken": "tok"}));
+        assert_eq!(entry(r#"{"username":"u","username":null,"password":"p"}"#), json!({"auth": up}));
+        assert_eq!(entry(r#"{"IdentityToken":"tok","identitytoken":null}"#), json!({"identitytoken": "tok"}));
+        // Later keys win in whatever case, in the order sent.
+        assert_eq!(entry(r#"{"identitytoken":"old","IdentityToken":"new"}"#), json!({"identitytoken": "new"}));
+        assert_eq!(entry(r#"{"IdentityToken":"old","identitytoken":"new"}"#), json!({"identitytoken": "new"}));
+        assert_eq!(entry(r#"{"username":"old","UserName":"u","password":"p"}"#), json!({"auth": up}));
+        assert_eq!(entry(r#"{"UserName":"old","username":"u","password":"p"}"#), json!({"auth": up}));
+        // Unknown fields, nested or not, are skipped; a known one of the wrong type is skipped alone.
+        assert_eq!(entry(r#"{"x":{"y":[{"z":null}]},"username":"u","Email":[1,"a"],"password":"p"}"#), json!({"auth": up}));
+        assert_eq!(entry(r#"{"username":"u","password":"p","identitytoken":1,"auth":{"a":"b"}}"#), json!({"auth": up}));
+        assert_eq!(entry(r#"{"username":"u","username":7,"password":"p"}"#), json!({"auth": up}));
+        // An entry that is not an object is no sign-in, and the rest still is.
+        for other in ["null", "1", "true", r#""u:p""#, "[]", r#"[{"username":"u","password":"p"}]"#, "{}", r#"{"username":"","password":""}"#] {
+            assert_eq!(entry(other), Value::Null, "{other}");
+        }
+        // A config with nothing to sign in with is none, as is one that is not a map.
+        for none in ["{}", "null", "[]", r#""x""#, r#"{"r.example":null}"#] {
+            assert!(registry_config(&kiri_image::b64::encode(none.as_bytes())).is_none(), "{none}");
+        }
     }
 
     #[test]
@@ -1137,9 +1225,38 @@ mod tests {
         let f = api::filters(&r, &["until", "type"]).unwrap();
         let a = prune_argv(&r, &f).unwrap();
         let has = |pair: &[&str]| a.windows(pair.len()).any(|w| w == pair);
-        assert!(has(&["--all"]) && has(&["--keep-storage", "5000"]) && has(&["--keep-duration", "24h"]) && has(&["--filter", "type==regular"]));
-        let bad = Request::internal("POST", "/build/prune", &[("filters", r#"{"until":["2026-01-01"]}"#)], Vec::new());
-        assert!(prune_argv(&bad, &api::filters(&bad, &["until"]).unwrap()).is_err());
+        assert!(has(&["--all"]) && has(&["--keep-storage", "5000"]) && has(&["--keep-duration", "86400s"]) && has(&["--filter", "type==regular"]), "{a:?}");
+        for bad in [r#"{"until":["yesterday"]}"#, r#"{"until":["1d"]}"#, r#"{"unused-for":["2026-13-01"]}"#] {
+            let bad = Request::internal("POST", "/build/prune", &[("filters", bad)], Vec::new());
+            assert!(prune_argv(&bad, &api::filters(&bad, &["until", "unused-for"]).unwrap()).is_err());
+        }
+        // Docker's daemon takes `label`/`label!` and ignores them; one value per other key.
+        let req = |f: &str| Request::internal("POST", "/build/prune", &[("filters", f)], Vec::new());
+        let argv = |f: &str| prune_filters(&req(f)).and_then(|x| prune_argv(&req(f), &x));
+        assert_eq!(argv(r#"{"label":["a=b"],"label!":["c"]}"#).unwrap(), argv("").unwrap());
+        assert_eq!(argv(r#"{"label":{"a=b":true}}"#).unwrap(), argv("").unwrap());
+        let a = argv(r#"{"label":["a=b"],"until":["24h"],"type":["regular"],"id":["x"],"inuse":[""]}"#).unwrap();
+        assert!(a.windows(2).any(|w| w == ["--keep-duration", "86400s"]) && a.windows(2).any(|w| w == ["--filter", "type==regular"]));
+        assert!(a.windows(2).any(|w| w == ["--filter", "id~=x"]) && a.windows(2).any(|w| w == ["--filter", "inuse"]));
+        assert!(argv(r#"{"type":["regular","regular"]}"#).is_ok());
+        // `until` as a date or Unix time becomes the age BuildKit wants;
+        // one in the future sets no age limit.
+        let age = |f: &str| argv(f).unwrap().windows(2).find(|w| w[0] == "--keep-duration").map(|w| w[1].trim_end_matches('s').parse::<u64>().unwrap());
+        let day = |secs: u64| (secs + 60) / 86_400;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        assert_eq!(age(&format!(r#"{{"until":["{}"]}}"#, now - 3 * 86_400)).map(day), Some(3));
+        assert_eq!(age(&format!(r#"{{"until":["{}"]}}"#, super::super::time::rfc3339(UNIX_EPOCH + Duration::from_secs(now - 2 * 86_400)))).map(day), Some(2));
+        assert_eq!(age(r#"{"unused-for":["1h30m"]}"#), Some(5400));
+        assert_eq!(age(r#"{"until":["2999-01-01T00:00:00Z"]}"#), None);
+        let msg = |f: &str| match prune_filters(&req(f)) {
+            Err(Error::BadRequest(m)) => m,
+            other => panic!("{f}: {other:?}"),
+        };
+        assert_eq!(msg(r#"{"type":["regular","source.local"]}"#), "filters expect only one value");
+        assert_eq!(msg(r#"{"until":["1h","2h"]}"#), "filters expect only one value");
+        assert_eq!(msg(r#"{"until":["1h"],"unused-for":["2h"]}"#), r#"conflicting filters: "until" and "unused-for""#);
+        assert_eq!(msg(r#"{"dangling":["true"]}"#), "invalid filter 'dangling'");
+        assert_eq!(msg(r#"{"mutable":[""]}"#), "invalid filter 'mutable'");
         let (ids, space) = parse_prune("{\"ID\":\"a\",\"Size\":10}\n{\"ID\":\"b\",\"Size\":5}\nTotal: 15B\n");
         assert_eq!((ids, space), (vec!["a".to_owned(), "b".to_owned()], 15));
         let rows = du_rows(r#"[{"ID":"x","Mutable":false,"InUse":true,"Size":42,"Parents":["p"],"CreatedAt":"2026-10-30T10:00:00Z","LastUsedAt":null,"UsageCount":3,"Description":"mount / from exec","RecordType":"regular","Shared":false}]"#);

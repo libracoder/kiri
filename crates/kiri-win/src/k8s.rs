@@ -508,7 +508,11 @@ fn pull(repo: &str, tag: &str) -> io::Result<()> {
 
 /// `kiri k8s stop`: the node stops; its state is kept.
 fn stop(say: &dyn Fn(&str)) -> io::Result<()> {
-    ok(client::request("POST", &format!("/containers/{NAME}/stop"), None))?;
+    // Stopped already: Docker's 304, with no body, is done (as Start's is).
+    let stopped = client::request("POST", &format!("/containers/{NAME}/stop"), None)?;
+    if !stopped.ok() && stopped.status != 304 {
+        return Err(io::Error::other(stopped.error()));
+    }
     say("Kubernetes stopped (its state is kept; Start resumes it)");
     Ok(())
 }
@@ -516,7 +520,13 @@ fn stop(say: &dyn Fn(&str)) -> io::Result<()> {
 /// `kiri k8s delete`: the node, its volume, the kubeconfig and the context.
 fn delete_cluster(say: &dyn Fn(&str)) -> io::Result<()> {
     let _ = client::request("DELETE", &format!("/containers/{NAME}?force=1"), None)?;
-    let _ = client::request("DELETE", &format!("/volumes/{VOLUME}"), None)?;
+    // An explicit delete: forced, so a damaged container list (which makes
+    // the engine refuse removals it can't vouch for) doesn't keep it; any
+    // other refusal is said, not reported as deleted.
+    let r = client::request("DELETE", &format!("/volumes/{VOLUME}?force=1"), None)?;
+    if !r.ok() && r.status != 404 {
+        return Err(io::Error::other(format!("Kubernetes' state (volume {VOLUME}) was not deleted: {}", r.error())));
+    }
     let _ = std::fs::remove_file(state_dir()?.join("kubeconfig"));
     if let Err(e) = forget() {
         say(&format!("could not remove kubectl context `{}` ({e})", context()));

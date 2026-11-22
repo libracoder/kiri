@@ -211,7 +211,11 @@ fn run_inner(args: &[String]) -> io::Result<()> {
         Some("start") => start(flag("--use")),
         Some("stop") => {
             ensure_daemon()?;
-            ok(client::request("POST", &format!("/containers/{NAME}/stop"), None))?;
+            // Stopped already: Docker's 304, with no body, is done (as Start's is).
+            let stopped = client::request("POST", &format!("/containers/{NAME}/stop"), None)?;
+            if !stopped.ok() && stopped.status != 304 {
+                return Err(io::Error::other(stopped.error()));
+            }
             println!("Kubernetes stopped (its state is kept; `kiri k8s start` resumes it)");
             Ok(())
         }
@@ -511,7 +515,13 @@ fn status() -> io::Result<()> {
 fn delete() -> io::Result<()> {
     ensure_daemon()?;
     let _ = client::request("DELETE", &format!("/containers/{NAME}?force=1"), None)?;
-    let _ = client::request("DELETE", &format!("/volumes/{VOLUME}"), None)?;
+    // An explicit delete: forced, so a damaged container list (which makes
+    // the engine refuse removals it can't vouch for) doesn't keep it; any
+    // other refusal is said, not reported as deleted.
+    let r = client::request("DELETE", &format!("/volumes/{VOLUME}?force=1"), None)?;
+    if !r.ok() && r.status != 404 {
+        return Err(io::Error::other(format!("Kubernetes' state (volume {VOLUME}) was not deleted: {}", r.error())));
+    }
     let _ = std::fs::remove_file(home()?.join(crate::flavor::STATE.get()).join("kubeconfig"));
     forget();
     println!("Kubernetes deleted, with its state");

@@ -79,6 +79,9 @@ struct Saved {
     distro: Option<String>,
     /// Unix seconds of the WSL install that needs a restart.
     restart_after: Option<u64>,
+    /// Unix seconds of the last time setup turned WSL's optional components
+    /// on and went to the restart step for them.
+    components_on_at: Option<u64>,
     /// Why setup last stopped, kept so a restart of Kiri doesn't lose it.
     last_error: Option<String>,
 }
@@ -191,26 +194,135 @@ fn quiet(program: &str) -> Command {
     c
 }
 
-/// WSL's own output is UTF-16.
+/// WSL's own messages are UTF-16LE, in the language of the Windows it runs
+/// on; what a Linux program prints through wsl.exe is UTF-8. WSL's UTF-16
+/// always has ASCII in it (its `Wsl/...` error codes, CRLFs, spaces), whose
+/// units carry a NUL high byte at an odd offset; UTF-8 text has none. So a
+/// byte-order mark, or such NULs in at least a quarter of the units, reads
+/// as UTF-16LE, and anything else as UTF-8. UTF-16 with no ASCII and no BOM
+/// at all is the one thing this cannot tell from UTF-8. NULs and a leading
+/// BOM are dropped either way.
 fn wsl_text(bytes: &[u8]) -> String {
-    if bytes.len() >= 2 && bytes.iter().skip(1).step_by(2).take(8).all(|&b| b == 0) {
-        let units: Vec<u16> = bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
-        String::from_utf16_lossy(&units).replace('\0', "")
+    let (bytes, bom) = bytes.strip_prefix(&[0xFF, 0xFE]).map_or((bytes, false), |rest| (rest, true));
+    let text = if bom || looks_utf16(bytes) {
+        // Output cut short mid-unit leaves a lone byte: half a code unit, dropped.
+        let units: Vec<u16> = bytes.as_chunks::<2>().0.iter().map(|&p| u16::from_le_bytes(p)).collect();
+        String::from_utf16_lossy(&units)
     } else {
         String::from_utf8_lossy(bytes).into_owned()
+    };
+    text.trim_start_matches('\u{feff}').replace('\0', "")
+}
+
+/// Whether `bytes` (no BOM) has the odd-offset NULs of UTF-16LE ASCII units
+/// in at least a quarter of its units. Two at least: a stray NUL in short
+/// UTF-8 is not UTF-16.
+fn looks_utf16(bytes: &[u8]) -> bool {
+    let units = bytes.len() / 2;
+    let ascii = bytes.as_chunks::<2>().0.iter().filter(|&&[lo, hi]| lo != 0 && hi == 0).count();
+    ascii >= 2 && ascii * 4 >= units
+}
+
+/// What `wsl.exe --version` said.
+#[derive(Debug, PartialEq)]
+enum Wsl {
+    /// It answered: WSL is installed.
+    There,
+    /// It failed, or there is no wsl.exe: WSL is not installed.
+    Missing,
+    /// It ran past its limit (killed): WSL is there, only not answering;
+    /// the text says so.
+    Silent(String),
+}
+
+/// The most `wsl.exe --version` or `wsl.exe -l -q` may take when Kiri
+/// works out whether to open setup, and at which step.
+/// It reads WSL's installed version and answers in well under a second;
+/// right after Windows starts or wakes the WSL service can take a few
+/// seconds more. WSL_LIMIT (60 s) is sized for calls that start the VM and
+/// run something in it: too long for a first-run window to sit empty.
+const WSL_ANSWER_LIMIT: Duration = Duration::from_secs(15);
+
+fn wsl_check(cmd: &mut Command, limit: Duration) -> Wsl {
+    match crate::update::output_within(cmd, limit) {
+        Ok(o) if o.status.success() => Wsl::There,
+        Err(e) if e.kind() == io::ErrorKind::TimedOut => Wsl::Silent(e.to_string()),
+        _ => Wsl::Missing,
     }
 }
 
-fn wsl_installed() -> bool {
-    quiet("wsl.exe").arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success())
+fn wsl_answer() -> Wsl {
+    wsl_check(quiet("wsl.exe").arg("--version"), WSL_ANSWER_LIMIT)
 }
 
-pub(crate) fn distros() -> Vec<String> {
-    quiet("wsl.exe").args(["-l", "-q"]).output().map(|o| wsl_text(&o.stdout).lines().map(|l| l.trim().to_owned()).filter(|l| !l.is_empty()).collect()).unwrap_or_default()
+/// WSL's distros, or None when WSL did not answer: wsl.exe failed, or ran
+/// past WSL_ANSWER_LIMIT. Empty when there is nothing to list: no
+/// distros, no WSL turned on, or no wsl.exe at all. `wsl -l` starts no VM,
+/// so it gets the same limit as `wsl --version`: needed() asks it before
+/// the window opens, which must not sit unseen for WSL_LIMIT.
+pub(crate) fn distros() -> Option<Vec<String>> {
+    listed_by(quiet("wsl.exe").args(["-l", "-q"]), WSL_ANSWER_LIMIT)
+}
+
+/// What `cmd` (wsl.exe -l -q) lists, as distros() says it.
+fn listed_by(cmd: &mut Command, limit: Duration) -> Option<Vec<String>> {
+    listing_by(cmd, limit).distros
+}
+
+/// One run of `wsl.exe -l -q`, read for both of its answers.
+struct Listing {
+    /// As distros() says it.
+    distros: Option<Vec<String>>,
+    /// It failed because WSL's optional component is off.
+    components_off: bool,
+}
+
+fn listing_by(cmd: &mut Command, limit: Duration) -> Listing {
+    let o = match crate::update::output_within(cmd, limit) {
+        Ok(o) => o,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Listing { distros: Some(Vec::new()), components_off: false },
+        Err(_) => return Listing { distros: None, components_off: false },
+    };
+    if !o.status.success() {
+        return Listing {
+            distros: (nothing_listed(&o.stdout) || nothing_listed(&o.stderr)).then(Vec::new),
+            components_off: component_required(&o.stdout) || component_required(&o.stderr),
+        };
+    }
+    Listing { distros: Some(wsl_text(&o.stdout).lines().map(|l| l.trim().to_owned()).filter(|l| !l.is_empty()).collect()), components_off: false }
+}
+
+fn listing() -> Listing {
+    listing_by(quiet("wsl.exe").args(["-l", "-q"]), WSL_ANSWER_LIMIT)
+}
+
+/// Whether WSL's output carries one of its error codes. They are ASCII and
+/// read the same in every language: with the NULs gone they match in UTF-16
+/// at any length or offset, and in UTF-8, whatever the translated text
+/// around them.
+fn wsl_says(out: &[u8], codes: &[&str]) -> bool {
+    let text = String::from_utf8_lossy(out).replace('\0', "");
+    codes.iter().any(|code| text.contains(code))
+}
+
+/// Whether a failed `wsl.exe -l` said there is nothing to list, rather than
+/// that WSL did not answer.
+fn nothing_listed(out: &[u8]) -> bool {
+    wsl_says(out, &["WSL_E_DEFAULT_DISTRO_NOT_FOUND", "WSL_E_WSL_OPTIONAL_COMPONENT_REQUIRED"])
+}
+
+/// Whether WSL's output says its optional component is off.
+fn component_required(out: &[u8]) -> bool {
+    wsl_says(out, &["WSL_E_WSL_OPTIONAL_COMPONENT_REQUIRED"])
+}
+
+/// Whether `wsl.exe -l -q` failed because WSL's optional component is off.
+fn components_off() -> bool {
+    listing().components_off
 }
 
 fn existing_ubuntu() -> Option<String> {
-    distros().into_iter().find(|d| d.starts_with("Ubuntu"))
+    distros().unwrap_or_default().into_iter().find(|d| d.starts_with("Ubuntu"))
 }
 
 /// Another Docker on this PC: Docker Desktop, or a docker CLI on PATH that is not Kiri's.
@@ -235,21 +347,27 @@ fn restarted_since(at: u64) -> bool {
 /// Whether the window should open on setup rather than Kiri.
 pub fn needed() -> bool {
     let s = saved();
-    !s.done || s.distro.as_deref().is_none_or(|d| !distros().iter().any(|x| x == d))
+    needs_setup(s.done, s.distro.as_deref(), distros)
 }
 
-/// The step to show now, from what is on this PC.
-fn current_step(s: &Saved) -> &'static str {
-    if !wsl_installed() {
-        return "welcome";
-    }
-    if let Some(at) = s.restart_after {
-        if !restarted_since(at) {
-            return "restart";
-        }
-    }
-    match &s.distro {
-        Some(d) if distros().iter().any(|x| x == d) => {
+/// Setup is needed when it never finished, or its distro has gone from
+/// WSL's list. A WSL that does not answer (`listed` gives None) is not a
+/// missing one: the main window says why the engine is down.
+fn needs_setup(done: bool, distro: Option<&str>, listed: impl FnOnce() -> Option<Vec<String>>) -> bool {
+    !done || distro.is_none_or(|d| listed().is_some_and(|l| !l.iter().any(|x| x == d)))
+}
+
+/// The step to show now, from what is on this PC, and why WSL did not
+/// answer when it didn't.
+fn current_step(s: &Saved) -> (&'static str, Option<String>) {
+    // `wsl -l -q` runs once, when a check first needs it, for both answers.
+    let listing = std::cell::LazyCell::new(listing);
+    let off = std::cell::Cell::new(None);
+    let step = step_from(wsl_answer(), s, restarted_since, || {
+        off.set(Some(listing.components_off));
+        listing.components_off
+    }, || match &s.distro {
+        Some(d) if listing.distros.as_ref().is_some_and(|l| l.iter().any(|x| x == d)) => {
             if crate::client::alive() {
                 "tools"
             } else {
@@ -257,16 +375,58 @@ fn current_step(s: &Saved) -> &'static str {
             }
         }
         _ => "choose",
+    });
+    // The components read as on: what setup recorded about turning them on is spent.
+    if off.get() == Some(false) && s.components_on_at.is_some() {
+        let mut fresh = saved();
+        fresh.components_on_at = None;
+        save(&fresh);
     }
+    step
 }
 
-fn fresh_state(step: &'static str, s: &Saved) -> State {
+/// What setup turned on and a restart did not bring.
+const COMPONENTS_STILL_OFF: &str = "WSL's optional components are still off after Windows restarted. Check that Windows Subsystem for Linux and Virtual Machine Platform are on in Windows Features, then try again";
+
+/// current_step from what WSL answered, with the PC's checks passed in:
+/// `restarted` (since a time), `components_off`, and `installed`, the step
+/// for a WSL that is ready.
+fn step_from(answer: Wsl, s: &Saved, restarted: impl Fn(u64) -> bool, components_off: impl FnOnce() -> bool, installed: impl FnOnce() -> &'static str) -> (&'static str, Option<String>) {
+    let silent = match answer {
+        Wsl::Missing => return ("welcome", None),
+        Wsl::There => None,
+        Wsl::Silent(why) => Some(why),
+    };
+    if let Some(at) = s.restart_after
+        && !restarted(at)
+    {
+        return ("restart", None);
+    }
+    // Not answering is not missing: Choose a Linux, saying why, rather than
+    // Install WSL (or asking for its distros, which would hang too).
+    if silent.is_some() {
+        return ("choose", silent);
+    }
+    // wsl.exe answers, but WSL's optional component is off (a setup before
+    // this one turned on Virtual Machine Platform alone): no distro would
+    // import, so step 1 again, which turns the components on. When setup
+    // turned them on already and Windows has restarted since, step 1 says
+    // so rather than only asking again.
+    if components_off() {
+        let why = s.components_on_at.is_some_and(&restarted).then(|| COMPONENTS_STILL_OFF.to_owned());
+        return ("welcome", why);
+    }
+    (installed(), None)
+}
+
+/// `existing_ubuntu`: whether WSL lists an Ubuntu, asked only of a WSL that answered.
+fn fresh_state(step: &'static str, s: &Saved, existing_ubuntu: bool) -> State {
     let other = other_docker();
     State {
         step,
         linux: s.linux.clone(),
         sizes: json!({"wsl": WSL_MSI.size, "ubuntu": UBUNTU.size, "kiri": std::fs::metadata(bundle().join("kiri-linux.tar.gz")).map_or(0, |m| m.len())}),
-        existing_ubuntu: existing_ubuntu().is_some(),
+        existing_ubuntu,
         other_docker: other,
         other_engine: crate::buildwith::other_engine(),
         make_default: !other,
@@ -461,44 +621,95 @@ fn elevated(args: &[&str]) -> io::Result<i32> {
     }
 }
 
-/// Step 1: download WSL, then in one elevated run turn on Virtual Machine
-/// Platform and install WSL. Exit 3010 from either means a restart.
+/// What a `kiri-admin.ps1 -Wsl` or `-Components` exit code says went
+/// wrong; None when it succeeded (0, or 3010: Windows must restart). Codes
+/// the script does not give a meaning of its own are dism.exe's, passed
+/// through.
+fn admin_wsl_failed(code: i32) -> Option<String> {
+    Some(match code {
+        0 | 3010 => return None,
+        22 => "the downloaded WSL installer changed on disk; try again".into(),
+        23 => "the WSL installer is not validly signed by Microsoft".into(),
+        24 => "Windows could not turn on WSL's optional components (dism.exe failed)".into(),
+        21 => "the WSL installer failed".into(),
+        1 => "the administrator step failed (exit code 1)".into(),
+        // An HRESULT (0x800F...) reads as one; a Win32 code as a number.
+        dism if dism < 0 => format!("Windows could not turn on WSL's optional components (dism.exe exit code {dism:#010X})"),
+        dism => format!("Windows could not turn on WSL's optional components (dism.exe exit code {dism})"),
+    })
+}
+
+/// Step 1's elevated run: with WSL's installer when WSL is not installed,
+/// or, when wsl.exe answers already, its optional components alone.
+fn admin_args(msi: Option<&str>) -> Vec<&str> {
+    match msi {
+        Some(msi) => vec!["-Wsl", "-Msi", msi, "-Sha256", WSL_MSI.sha256],
+        None => vec!["-Components"],
+    }
+}
+
+/// Whether step 1 ends at the restart rather than at Choose a Linux, once
+/// the elevated run succeeded: Windows asked for one (3010), WSL does not
+/// answer yet, or its optional components still read as off (they take
+/// effect at the restart).
+fn restart_after_admin(code: i32, answers: impl FnOnce() -> bool, components_off: impl FnOnce() -> bool) -> bool {
+    code == 3010 || !answers() || components_off()
+}
+
+/// Step 1: download WSL, then in one elevated run turn on WSL's optional
+/// components and install WSL; or, when WSL is installed already, turn on
+/// the components alone. Exit 3010 means a restart.
 fn install_wsl() -> io::Result<()> {
-    update(|s| s.tasks = tasks(&[tr("Download WSL"), tr("Administrator approval"), tr("Turn on Virtual Machine Platform"), tr("Install WSL")]));
+    // WSL already answers, so only its optional components are off (see
+    // current_step): turn them on, with no installer to download or run.
+    let components_only = wsl_answer() == Wsl::There;
+    // Task indexes: Download WSL and Install WSL only with the installer.
+    let (approval, components, install) = if components_only {
+        update(|s| s.tasks = tasks(&[tr("Administrator approval"), tr("Turn on WSL's Windows components")]));
+        (0, 1, None)
+    } else {
+        update(|s| s.tasks = tasks(&[tr("Download WSL"), tr("Administrator approval"), tr("Turn on WSL's Windows components"), tr("Install WSL")]));
+        (1, 2, Some(3))
+    };
     // WSL_MSI is this build's architecture's; on another PC it would not install.
     if let Some(e) = crate::win::arch_mismatch() {
         return Err(io::Error::other(e));
     }
-    let msi = download(&WSL_MSI, 0)?;
+    let msi = if components_only { None } else { Some(download(&WSL_MSI, 0)?) };
     update(|s| s.progress = Some(json!({"pct": null, "done": null, "total": null, "rate": null, "eta": null, "label": tr("Waiting for Windows' approval")})));
-    task(1, "active", &tr("Windows is asking"));
+    task(approval, "active", &tr("Windows is asking"));
     // The downloaded MSI lives in a user-writable folder, so a process at
     // the user's own integrity could swap it between its SHA-256 check above
     // and the elevated install. kiri-admin.ps1 -Wsl re-verifies it, as admin,
     // on a copy the user cannot touch, and requires it to be Microsoft-signed,
     // before running it; its exit codes are read below.
-    let msi = msi.to_string_lossy();
-    let code = elevated(&["-Wsl", "-Msi", &msi, "-Sha256", WSL_MSI.sha256])?;
-    task(1, "done", &tr("approved"));
+    let msi_path = msi.as_ref().map(|m| m.to_string_lossy().into_owned());
+    let code = elevated(&admin_args(msi_path.as_deref()))?;
+    task(approval, "done", &tr("approved"));
     match code {
-        22 => return Err(io::Error::other("the downloaded WSL installer changed on disk; try again")),
-        23 => return Err(io::Error::other("the WSL installer is not validly signed by Microsoft")),
-        20 => {
-            task(2, "error", "");
-            return Err(io::Error::other("Windows could not turn on Virtual Machine Platform (is virtualization on in the BIOS?)"));
-        }
+        0 | 3010 => {}
+        1 | 22 | 23 => task(components, "error", ""),
         21 => {
-            task(2, "done", "");
-            task(3, "error", "");
-            return Err(io::Error::other("the WSL installer failed"));
+            task(components, "done", "");
+            if let Some(i) = install {
+                task(i, "error", "");
+            }
         }
-        _ => {}
+        _ => task(components, "error", ""),
     }
-    task(2, "done", "");
-    task(3, "done", "");
-    if code == 3010 || !wsl_installed() {
+    if let Some(why) = admin_wsl_failed(code) {
+        return Err(io::Error::other(why));
+    }
+    task(components, "done", "");
+    if let Some(i) = install {
+        task(i, "done", "");
+    }
+    // Just installed and not answering yet, or the components not on until
+    // Windows restarts: the restart step.
+    if restart_after_admin(code, || wsl_answer() == Wsl::There, components_off) {
         let mut s = saved();
         s.restart_after = Some(now_secs());
+        s.components_on_at = s.restart_after;
         save(&s);
         // After the restart, Kiri opens once by itself and carries on.
         if let Ok(exe) = std::env::current_exe() {
@@ -537,7 +748,7 @@ fn install_linux(kind: &str) -> io::Result<()> {
         let tar = verified("kiri-linux.tar.gz")?;
         task(0, "done", &format!("{} MB", std::fs::metadata(&tar)?.len().div_ceil(1_000_000)));
         task(1, "active", "");
-        if !distros().iter().any(|d| d == KIRI_DISTRO) {
+        if !distros().unwrap_or_default().iter().any(|d| d == KIRI_DISTRO) {
             log_line(&format!("wsl --import {KIRI_DISTRO} {} kiri-linux.tar.gz --version 2", base.join(KIRI_DISTRO).display()));
             wsl_ok(quiet("wsl.exe").args(["--import", KIRI_DISTRO]).arg(base.join(KIRI_DISTRO)).arg(&tar).args(["--version", "2"]))?;
         }
@@ -769,6 +980,7 @@ fn finish() {
     let mut s = saved();
     s.done = true;
     s.restart_after = None;
+    s.components_on_at = None;
     s.last_error = None;
     save(&s);
     crate::serve::set_setup_pending(false);
@@ -811,9 +1023,12 @@ pub fn on_message(msg: &str) {
         "setup-ready" => {
             std::thread::spawn(|| {
                 let s = saved();
-                let step = current_step(&s);
-                let mut fresh = fresh_state(step, &s);
-                if let Some(e) = &s.last_error {
+                let (step, silent) = current_step(&s);
+                let mut fresh = fresh_state(step, &s, silent.is_none() && existing_ubuntu().is_some());
+                if let Some(why) = silent {
+                    crate::serve::log(&format!("setup: {why}; showing {step}"));
+                    fresh.error = Some(why);
+                } else if let Some(e) = &s.last_error {
                     crate::serve::log(&format!("setup: carrying on at {step}; last time it stopped with: {e}"));
                     // A step that carries on by itself shows its own result;
                     // one waiting for a choice shows why setup stopped.
@@ -877,6 +1092,209 @@ pub fn on_message(msg: &str) {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn wsl_output_is_read_in_any_language() {
+        let utf16 = |s: &str| s.encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<u8>>();
+        // WSL appends an ASCII `Wsl/...` code to its errors in every
+        // language, so even a fully non-Latin message has NULs in its
+        // UTF-16 bytes and the check catches it whatever the script.
+        let code = "Error code: Wsl/WSL_E_WSL_OPTIONAL_COMPONENT_REQUIRED\r\n";
+        let messages = [
+            "Error code: Wsl/WSL_E_WSL_OPTIONAL_COMPONENT_REQUIRED\r\n".to_owned(),
+            format!("Für diese Anwendung ist die Komponente „Windows-Subsystem für Linux“ erforderlich. {code}"),
+            format!("Для этого приложения требуется дополнительный компонент подсистемы Windows для Linux. {code}"),
+            format!("此应用程序需要适用于 Linux 的 Windows 子系统组件。{code}"),
+            format!("このアプリケーションには Windows Subsystem for Linux の追加コンポーネントが必要です。{code}"),
+            format!("이 애플리케이션에는 Linux용 Windows 하위 시스템 구성 요소가 필요합니다. {code}"),
+            format!("هذا التطبيق يتطلب مكون Windows الفرعي لنظام Linux. {code}"),
+            format!("Εφαρμογή: απαιτείται το υποσύστημα Windows για Linux. {code}"),
+            format!("יישות זה דורש את רכיב Windows עבור Linux. {code}"),
+            format!("Энэ programa Linux üçün Windows podsistemi əlavə komponentini tələb edir. {code}"),
+        ];
+        for m in &messages {
+            assert_eq!(super::wsl_text(&utf16(m)), *m, "UTF-16: {m}");
+            assert_eq!(super::wsl_text(m.as_bytes()), *m, "UTF-8: {m}");
+            // With a byte-order mark: the mark goes.
+            assert_eq!(super::wsl_text(&[&[0xFF, 0xFE][..], &utf16(m)].concat()), *m, "UTF-16 BOM: {m}");
+            // Cut short at an odd byte (killed at its limit): no NULs left,
+            // and the code still reads.
+            let mut cut = utf16(m);
+            cut.truncate(cut.len() - 3);
+            let got = super::wsl_text(&cut);
+            assert!(!got.contains('\0') && m.starts_with(&got) && got.len() + 2 >= m.len(), "odd UTF-16: {got:?}");
+            assert!(super::nothing_listed(&cut) && super::component_required(&cut), "{m}");
+            assert!(super::nothing_listed(&utf16(m)) && super::component_required(&utf16(m)), "{m}");
+        }
+        // A distro list cut short at an odd byte loses the half unit, not a letter more.
+        assert_eq!(super::wsl_text(&utf16("kiri\r\nUbuntu")[..23]), "kiri\r\nUbunt");
+        // UTF-16 with no ASCII and no BOM is byte for byte valid UTF-8: only
+        // the mark tells it apart.
+        assert_eq!(super::wsl_text(&[&[0xFF, 0xFE][..], &utf16("ぁぃぅ")].concat()), "ぁぃぅ");
+    }
+
+    #[test]
+    fn linux_output_stays_utf8() {
+        // What a Linux command run through wsl.exe prints is UTF-8, colour
+        // codes and all, whatever its length.
+        for m in [
+            "\x1b[31merror:\x1b[0m kiri-start: no such file\n",
+            "\x1b[1mok\x1b[0m\r\n",
+            "Für\n",
+            "Für\r\n",
+            "Для\r\n",
+            // Even lengths with a terminal title (BEL), a spinner (BS), DEL,
+            // a C1 control and a literal replacement character.
+            "\x1b]0;kiri\x07ok\n",
+            "\x1b]8;;https://x\x07link\x1b]8;;\x07\n",
+            "|\x08/\x08-ok\n",
+            "a\x7fb\n",
+            "\u{9b}31mred\n",
+            "\u{fffd} ok\n",
+        ] {
+            assert_eq!(super::wsl_text(m.as_bytes()), m, "{m:?}");
+        }
+        // An invalid byte, even length: the rest stays as it was.
+        assert_eq!(super::wsl_text(b"ok \xff done\n"), "ok \u{fffd} done\n");
+        // A stray NUL in UTF-8, at an odd offset or not, even length or odd: dropped.
+        assert_eq!(super::wsl_text(b"o\0k\n"), "ok\n");
+        assert_eq!(super::wsl_text(b"error: \0 at the end\n"), "error:  at the end\n");
+        assert_eq!(super::wsl_text(b"error: \0at the end\n"), "error: at the end\n");
+        // A UTF-8 BOM goes too.
+        assert_eq!(super::wsl_text("\u{feff}ok\n".as_bytes()), "ok\n");
+    }
+
+    #[test]
+    fn a_turned_off_component_is_seen_in_any_language() {
+        let utf16 = |s: &str| s.encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<u8>>();
+        assert!(super::component_required(&utf16("Для подсистемы Windows для Linux требуется дополнительный компонент.\r\nWsl/WSL_E_WSL_OPTIONAL_COMPONENT_REQUIRED\r\n")));
+        assert!(super::component_required(b"Error code: Wsl/WSL_E_WSL_OPTIONAL_COMPONENT_REQUIRED\r\n"));
+        assert!(!super::component_required(&utf16("Windows Subsystem for Linux has no installed distributions.\r\nError code: Wsl/WSL_E_DEFAULT_DISTRO_NOT_FOUND\r\n")));
+    }
+
+    /// kiri-admin.ps1 as installed beside kiri-win.exe.
+    const ADMIN_SCRIPT: &str = include_str!("../../../contrib/windows/kiri-admin.ps1");
+
+    /// The script's lines that are not comments.
+    fn admin_code() -> impl Iterator<Item = &'static str> {
+        ADMIN_SCRIPT.lines().filter(|l| !l.trim_start().starts_with('#'))
+    }
+
+    /// The code of the script's `if (<mode>) { ... }` block, up to the
+    /// next blank line.
+    fn admin_block(mode: &str) -> String {
+        let open = format!("if (${mode}) {{");
+        admin_code().skip_while(|l| !l.starts_with(&open)).take_while(|l| !l.trim().is_empty()).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn the_admin_script_turns_on_both_wsl_components() {
+        let feature = |name: &str| admin_code().any(|l| l.contains(&format!("'/featurename:{name}'")));
+        assert!(feature("Microsoft-Windows-Subsystem-Linux"), "kiri-admin.ps1 must turn on the Subsystem for Linux component");
+        assert!(feature("VirtualMachinePlatform"), "kiri-admin.ps1 must turn on Virtual Machine Platform");
+        let args = admin_code().find(|l| l.starts_with("$featureArgs = ")).unwrap_or_default();
+        for a in ["'/online'", "'/enable-feature'", "'/all'", "'/norestart'"] {
+            assert!(args.contains(a), "$featureArgs lacks {a}");
+        }
+        assert!(admin_code().any(|l| l.contains("[switch]$Components")), "kiri-admin.ps1 has no -Components");
+        // Both modes run dism.exe with those arguments, and pass its code on.
+        for mode in ["Wsl", "Components"] {
+            let block = admin_block(mode);
+            assert!(block.contains(r#"System32\dism.exe" -ArgumentList $featureArgs"#), "-{mode} does not run dism.exe with $featureArgs:\n{block}");
+            assert!(block.contains("exit (DismFailed $features)"), "-{mode} does not pass dism.exe's code on:\n{block}");
+        }
+        assert!(admin_block("Components").contains("if ($features -eq 0 -or $features -eq 3010) { exit $features }"));
+    }
+
+    #[test]
+    fn the_admin_script_takes_one_mode_per_run() {
+        let check = admin_code().position(|l| l.contains("@($Wsl.IsPresent, $Components.IsPresent, $Dns.IsPresent) -eq $true).Count -ne 1) { throw"));
+        let first_mode = admin_code().position(|l| l.starts_with("if ($Wsl) {"));
+        assert!(check.is_some() && check < first_mode, "kiri-admin.ps1 must refuse two modes before running either");
+    }
+
+    #[test]
+    fn every_admin_script_exit_code_is_read() {
+        assert_eq!(super::admin_wsl_failed(0), None);
+        assert_eq!(super::admin_wsl_failed(3010), None);
+        // Every `exit` in the script's code, any case, inline comments and
+        // strings aside: a number, or dism.exe's own code passed on.
+        let mut codes = Vec::new();
+        for line in admin_code() {
+            let mut quote = None;
+            let code: String = line.chars().take_while(|&c| {
+                match (quote, c) {
+                    (None, '#') => return false,
+                    (None, '\'' | '"') => quote = Some(c),
+                    (Some(q), c) if c == q => quote = None,
+                    _ => {}
+                }
+                true
+            }).collect();
+            let lower = code.to_ascii_lowercase();
+            let words: Vec<&str> = lower.split(|c: char| c.is_whitespace() || c == ';' || c == '{' || c == '}').filter(|w| !w.is_empty()).collect();
+            for pair in words.windows(2).filter(|w| w[0] == "exit") {
+                match pair[1].parse::<i32>() {
+                    Ok(n) => codes.push(n),
+                    Err(_) => assert!(matches!(pair[1], "$features" | "(dismfailed"), "kiri-admin.ps1 exits with {:?}: {line}", pair[1]),
+                }
+            }
+            assert!(!words.last().is_some_and(|w| *w == "exit"), "a bare exit: {line}");
+        }
+        assert!(codes.contains(&21) && codes.contains(&22) && codes.contains(&23), "{codes:?}");
+        // Each code the script gives its own meaning has its own message: a
+        // code added to the script without one would fall to dism.exe's
+        // wording, so it must be listed here too.
+        let own = [
+            (21, "the WSL installer failed"),
+            (22, "the downloaded WSL installer changed on disk; try again"),
+            (23, "the WSL installer is not validly signed by Microsoft"),
+            (24, "Windows could not turn on WSL's optional components (dism.exe failed)"),
+        ];
+        for code in codes.into_iter().filter(|c| !matches!(c, 0 | 1 | 3010)) {
+            assert!(own.iter().any(|(c, _)| *c == code), "exit {code} from kiri-admin.ps1 has no message of its own");
+        }
+        for (code, why) in own {
+            assert_eq!(super::admin_wsl_failed(code).as_deref(), Some(why), "exit {code}");
+        }
+        assert_eq!(super::admin_wsl_failed(1).as_deref(), Some("the administrator step failed (exit code 1)"));
+        // dism.exe's code, passed on, is shown, and does not blame the BIOS.
+        assert_eq!(super::admin_wsl_failed(0x800F_081Fu32 as i32).as_deref(), Some("Windows could not turn on WSL's optional components (dism.exe exit code 0x800F081F)"));
+        assert_eq!(super::admin_wsl_failed(50).as_deref(), Some("Windows could not turn on WSL's optional components (dism.exe exit code 50)"));
+        assert!(!super::admin_wsl_failed(24).unwrap_or_default().contains("BIOS"));
+    }
+
+    #[test]
+    fn step_one_turns_on_the_components_alone_for_an_installed_wsl() {
+        use super::{admin_args, restart_after_admin, step_from, Saved, Wsl, COMPONENTS_STILL_OFF};
+        assert_eq!(admin_args(None), ["-Components"]);
+        assert_eq!(admin_args(Some(r"C:\wsl.msi")), ["-Wsl", "-Msi", r"C:\wsl.msi", "-Sha256", super::WSL_MSI.sha256]);
+
+        let ready = || "engine";
+        let never = |_: u64| false;
+        let always = |_: u64| true;
+        let fresh = Saved::default();
+        // No WSL: step 1, without asking about components.
+        assert_eq!(step_from(Wsl::Missing, &fresh, always, || panic!("asked"), ready), ("welcome", None));
+        // WSL answers but its component is off: step 1 again.
+        assert_eq!(step_from(Wsl::There, &fresh, always, || true, ready), ("welcome", None));
+        assert_eq!(step_from(Wsl::There, &fresh, always, || false, ready), ("engine", None));
+        // Turned on, and waiting for the restart: the restart step.
+        let waiting = Saved { restart_after: Some(5), components_on_at: Some(5), ..Saved::default() };
+        assert_eq!(step_from(Wsl::There, &waiting, never, || panic!("asked"), ready), ("restart", None));
+        // Restarted and still off: step 1, saying so.
+        assert_eq!(step_from(Wsl::There, &waiting, always, || true, ready), ("welcome", Some(COMPONENTS_STILL_OFF.to_owned())));
+        assert_eq!(step_from(Wsl::There, &waiting, always, || false, ready), ("engine", None));
+        // Silent: Choose a Linux, saying why.
+        assert_eq!(step_from(Wsl::Silent("slow".into()), &fresh, always, || panic!("asked"), ready), ("choose", Some("slow".into())));
+
+        // After the elevated run: restart on 3010, on a WSL that does not
+        // answer, or when the components still read as off.
+        assert!(restart_after_admin(3010, || panic!("asked"), || panic!("asked")));
+        assert!(restart_after_admin(0, || false, || panic!("asked")));
+        assert!(restart_after_admin(0, || true, || true));
+        assert!(!restart_after_admin(0, || true, || false));
+    }
+
+    #[test]
     fn a_failed_test_container_says_why() {
         let pull = "Unable to find image 'alpine:latest' locally\ndocker: Error response from daemon: the proxy http://127.0.0.1:7892 refused the connection or closed it: is it running? (network error: io: Connection refused (os error 111)).\nSee 'docker run --help'.\n";
         assert_eq!(super::test_failure(pull), "couldn't pull alpine: the proxy http://127.0.0.1:7892 refused the connection or closed it: is it running? (network error: io: Connection refused (os error 111))");
@@ -886,5 +1304,81 @@ mod tests {
         assert_eq!(super::test_failure(run), "the test container did not run: no space left on device");
         assert_eq!(super::test_failure("something odd\n"), "the test container did not run: something odd");
         assert_eq!(super::test_failure(""), "the test container did not run");
+    }
+
+    #[test]
+    fn a_wsl_that_never_answers_is_silent_within_its_limit() {
+        use super::{quiet, wsl_check, Wsl};
+        use std::time::{Duration, Instant};
+        // Stands in for a hung wsl.exe: about ten minutes of pings, killed at the limit.
+        let t = Instant::now();
+        let got = wsl_check(quiet("ping.exe").args(["-n", "600", "127.0.0.1"]), Duration::from_millis(300));
+        assert!(t.elapsed() < Duration::from_secs(10), "waited {:?}", t.elapsed());
+        assert!(matches!(&got, Wsl::Silent(why) if why.starts_with("WSL did not finish")), "{got:?}");
+        // One that answers is there; one that fails, or isn't there at all, is missing.
+        assert_eq!(wsl_check(quiet("cmd.exe").args(["/c", "exit 0"]), Duration::from_secs(10)), Wsl::There);
+        assert_eq!(wsl_check(quiet("cmd.exe").args(["/c", "exit 1"]), Duration::from_secs(10)), Wsl::Missing);
+        assert_eq!(wsl_check(&mut std::process::Command::new("kiri-no-such-wsl.exe"), Duration::from_secs(10)), Wsl::Missing);
+        // The limit a first-run window waits: well under WSL_LIMIT.
+        assert!(super::WSL_ANSWER_LIMIT < crate::update::WSL_LIMIT);
+    }
+
+    #[test]
+    fn a_wsl_that_does_not_answer_is_not_a_missing_wsl() {
+        use super::needs_setup;
+        let listed = |names: &[&str]| -> Option<Vec<String>> { Some(names.iter().map(|n| n.to_string()).collect()) };
+        // First run, or no distro picked yet: setup, without asking WSL.
+        assert!(needs_setup(false, Some("kiri"), || panic!("asked WSL")));
+        assert!(needs_setup(true, None, || panic!("asked WSL")));
+        // Kiri's distro listed: Kiri. Gone from the list: setup again.
+        assert!(!needs_setup(true, Some("kiri"), || listed(&["docker-desktop", "kiri"])));
+        assert!(needs_setup(true, Some("kiri"), || listed(&["Ubuntu"])));
+        assert!(needs_setup(true, Some("kiri"), || listed(&[])));
+        // WSL failed or timed out: not a missing distro.
+        assert!(!needs_setup(true, Some("kiri"), || None));
+
+        // A failed `wsl -l` that says there is nothing to list, in WSL's
+        // UTF-16, translated too, against one that only timed out.
+        let utf16 = |s: &str| s.encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<u8>>();
+        assert!(super::nothing_listed(&utf16("Windows Subsystem for Linux has no installed distributions.\r\nError code: Wsl/WSL_E_DEFAULT_DISTRO_NOT_FOUND\r\n")));
+        assert!(super::nothing_listed(&utf16("Для подсистемы Windows для Linux требуется дополнительный компонент.\r\nWsl/WSL_E_WSL_OPTIONAL_COMPONENT_REQUIRED\r\n")));
+        assert!(!super::nothing_listed(&utf16("Error code: Wsl/Service/WSAETIMEDOUT\r\n")));
+        assert!(!super::nothing_listed(b""));
+    }
+
+    #[test]
+    fn a_set_up_kiri_opens_its_window_when_wsl_never_answers() {
+        use super::{listed_by, needs_setup, quiet};
+        use std::os::windows::process::CommandExt;
+        use std::time::{Duration, Instant};
+        let ten = Duration::from_secs(10);
+        // Setup done, and `wsl -l -q` hangs (about ten minutes of pings
+        // stand in for it): the main window, once the limit kills it.
+        let t = Instant::now();
+        assert!(!needs_setup(true, Some("kiri"), || listed_by(quiet("ping.exe").args(["-n", "600", "127.0.0.1"]), Duration::from_millis(300))));
+        assert!(t.elapsed() < ten, "waited {:?}", t.elapsed());
+        // It fails with WSL's own time-out: the main window too.
+        assert!(!needs_setup(true, Some("kiri"), || listed_by(quiet("cmd.exe").raw_arg("/c echo Error code: Wsl/Service/WSAETIMEDOUT 1>&2 & exit 1"), ten)));
+        // It answers: Kiri's distro listed, the main window; gone, setup.
+        assert!(!needs_setup(true, Some("kiri"), || listed_by(quiet("cmd.exe").raw_arg("/c echo docker-desktop& echo kiri"), ten)));
+        assert!(needs_setup(true, Some("kiri"), || listed_by(quiet("cmd.exe").raw_arg("/c echo Ubuntu"), ten)));
+        // No WSL at all lists nothing: setup.
+        assert!(needs_setup(true, Some("kiri"), || listed_by(&mut std::process::Command::new("kiri-no-such-wsl.exe"), ten)));
+        // A first run never waits on WSL before the window opens.
+        assert!(needs_setup(false, Some("kiri"), || panic!("asked WSL")));
+    }
+
+    #[test]
+    fn one_wsl_listing_gives_both_answers() {
+        use super::{listing_by, quiet};
+        use std::os::windows::process::CommandExt;
+        use std::time::Duration;
+        let ten = Duration::from_secs(10);
+        let off = listing_by(quiet("cmd.exe").raw_arg("/c echo Error code: Wsl/WSL_E_WSL_OPTIONAL_COMPONENT_REQUIRED 1>&2 & exit 1"), ten);
+        assert!(off.components_off && off.distros == Some(Vec::new()));
+        let on = listing_by(quiet("cmd.exe").raw_arg("/c echo kiri"), ten);
+        assert!(!on.components_off && on.distros == Some(vec!["kiri".to_owned()]));
+        let silent = listing_by(quiet("cmd.exe").raw_arg("/c echo Error code: Wsl/Service/WSAETIMEDOUT 1>&2 & exit 1"), ten);
+        assert!(!silent.components_off && silent.distros.is_none());
     }
 }
