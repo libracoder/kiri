@@ -13,6 +13,30 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #608 Mac: the memory balloon leaves the guest its headroom, so containers don't stall every few seconds (unreleased)
+- Fixes: #509 Containers on a user network get TCP resets under sustained load (Supabase local stack: Kong → PostgREST); #646 kiri-balloon oscillates violently on idle VM: 100% CPU, 18+ TB page-in thrashing, bloated host RAM; #210 macOS: containers report hundreds of GB of block reads while the guest has no page cache
+- Caused: none known
+- Caused by: -
+- Check: none
+
+### #430 Windows: hand docker_engine back to Docker Desktop before it starts (unreleased)
+- Fixes: #426 Windows: Docker Desktop fails to start ("Access is denied" on \.\pipe\docker_engine) while Kiri serves the pipe
+- Caused: none known
+- Caused by: -
+- Check: none
+
+### #546 Linux: accounts from SSSD, LDAP or Entra ID can use the engine (unreleased)
+- Fixes: #349 Setup fails with "no account named <user>" for directory (non-/etc/passwd) users
+- Caused: none known
+- Caused by: -
+- Check: `access-directory-accounts`
+
+### #119 Images: registry mirrors for Docker Hub, in Settings and the CLI (unreleased)
+- Fixes: #118 Registry mirrors for Docker Hub (Settings + CLI); #329 Support insecure-registries (plain-HTTP and self-signed private registries), and read Docker's daemon.json; #611 Could support for pulling images from private repositories be added as soon as possible?
+- Caused: none known
+- Caused by: -
+- Check: `insecure-http-unlisted-refused`, `insecure-tls-unlisted-refused`, `insecure-login-unlisted-refused`, `insecure-cli-add`, `insecure-cli-refuses-everything`, `insecure-http-pull`, `insecure-http-push`, `insecure-selfsigned-pull`, `insecure-http-login`, `insecure-http-auth-pull`, `insecure-other-port-still-refused`, `insecure-docker-info`, `insecure-build`, `insecure-selfsigned-build`, `insecure-removed-refused`, `insecure-hand-edit`, `insecure-hand-edit-keeps-keys`, `mirror-http-pull`, `mirror-docker-info`, `mirror-build`, `insecure-cli-remove`, `mirror-cli-add`, `hub-downgrade-refused`, `socket-mount-settings-refused`, `mirror-cli-plain-needs-listing`, `insecure-daemon-json`
+
 ### #460 DNS: on a user-defined network, the next --dns server is tried when the first one refuses (unreleased)
 - Fixes: #455 User-defined network: embedded resolver does not fall back when the first --dns server refuses (default bridge does)
 - Caused: none known
