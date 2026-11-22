@@ -41,7 +41,7 @@
 
 Make sure you have one of:
 
-- macOS 14 or later, on Apple silicon or Intel
+- macOS 12 or later, on Apple silicon or Intel
 - Windows 10 or 11 with WSL 2, on x86-64 or Arm
 - Linux (Ubuntu, Fedora and others)
 
