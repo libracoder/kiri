@@ -188,3 +188,12 @@ mirror-cli-add	#118	there was no way to add a Docker Hub mirror from the termina
 hub-downgrade-refused	#329	Docker Hub must stay on verified HTTPS when its name resolves into a listed network, with a plain-HTTP registry on port 80 there
 socket-mount-settings-refused	#329	a container given the engine's socket could change Kiri's registry settings
 access-directory-accounts	#349	directory accounts and NSS groups outside /etc/passwd and /etc/group could not use a Linux host engine socket
+layer-same-path-retyped	#716	a layer that names a path twice as different kinds unpacked the first kind or failed; the later entry must win
+layer-retype-across-layers	#716	a path named again as another kind in a later layer
+layer-retype-whiteout	#716	a retyped path removed by a whiteout in the next layer, and a path given a whiteout then a new kind
+layer-retype-deep	#716	a retyped path deep in a tree, and a parent folder retyped over its subtree
+layer-retype-hardlink	#716	hard links to a retyped path
+rename-dns-reused-name	#467	a container renamed to a name an earlier container had held did not get that name
+rename-dns-reused-name-extra-net	#467	the same on a network the container was connected to
+dns-user-net-three-refused-servfail-at-once	#455	with three refusing --dns servers on a user network the lookup was not answered until the client gave up
+dns-user-net-three-silent-servfail-in-time	#455	with three silent --dns servers on a user network the lookup was not answered at all, instead of within their waits

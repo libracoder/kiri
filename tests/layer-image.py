@@ -18,6 +18,8 @@ Scenarios:
   big        one layer of 4 MiB that does not compress (#661)
   nolayers   no layers at all (#685)
   retype     one layer names a path twice, as another kind the second time
+  retype2    paths named again as another kind in a later layer, deep in a tree,
+             then removed by a whiteout, and hard links to a retyped path
 
 --times PATH...: prints "MTIME PATH" for each path as the base's layers give
 it (the topmost layer that names it), what a container's stat must show."""
@@ -130,6 +132,27 @@ def crafted(name, n):
                  f("swap3"), d("swap3", T1),
                  d("swap4"), f("swap4/inner"), s("swap4", "swap1", T1),
                  d("swap5"), f("swap5/inner"), h("swap5", "swap1")]]
+    if name == "retype2":
+        one = [d("ac1"), f("ac1/inner"),
+               f("ac2"),
+               s("ac3", "/srv"),
+               d("ac4"), f("ac4/inner"),
+               d("wo1"), f("wo1/inner"), f("wo1", T1),
+               f("wo2"),
+               d("deep"), d("deep/a"), d("deep/a/b"), f("deep/a/b/c"),
+               d("deep/a/b/d"), f("deep/a/b/d/e"), f("deep/a/b/d", T1),
+               d("deep2"), d("deep2/a"), d("deep2/a/b"), f("deep2/a/b/x"),
+               d("hl1"), f("hl1/inner"), f("hl1", T1, data=b"one"), h("hl1link", "hl1")]
+        two = [f("ac1", T2, data=b"was-dir"),
+               d("ac2", T2), f("ac2/inner", T2),
+               d("ac3", T2), f("ac3/inner", T2),
+               s("ac4", "ac2", T2),
+               f(".wh.wo1", T2),
+               f(".wh.wo2", T2), d("wo2", T2), f("wo2/new", T2),
+               d("deep/a/b/c", T2), f("deep/a/b/c/x", T2),
+               f("deep2/a", T2),
+               h("hl2link", "ac1")]
+        return [one, two]
     if name in ("fresh", "nolayers"):
         return []
     raise SystemExit(f"layer-image.py: no scenario {name}")

@@ -693,6 +693,23 @@ else
   gwskip network-rm-failed-start-gateway-dns
 fi
 $D rm -f failnet2c >/dev/null; $D network rm failnet2 failpad initpad1 >/dev/null
+# A network removed and made again on the same subnet while containers of
+# other networks keep running: names and the gateway answer on the new one,
+# and the container that stayed keeps its own network's names.
+$D network create --subnet 10.236.5.0/24 rcpad >/dev/null
+$D network create --subnet 10.236.6.0/24 rckeep >/dev/null
+$D network create --subnet 10.236.7.0/24 rcnet >/dev/null
+$D run -d --name rckeepc --network rckeep alpine sleep 120 >/dev/null
+$D run -d --name rcoldc --network rcnet alpine sleep 120 >/dev/null
+$D rm -f rcoldc >/dev/null; $D network rm rcnet >/dev/null
+$D network create --subnet 10.236.8.0/24 rcpad2 >/dev/null
+$D network create --subnet 10.236.7.0/24 rcnet2 >/dev/null
+$D run -d --name rcnewc --network rcnet2 alpine sleep 120 >/dev/null
+$D run -d --name rcnewd --network rcnet2 alpine sleep 120 >/dev/null
+t network-recreate-same-subnet-names "$(ipon rcnewc rcnet2)" $D exec rcnewd sh -c 'getent hosts rcnewc | cut -d" " -f1'
+t network-recreate-same-subnet-other-net-names "$(ipon rckeepc rckeep)" $D run --rm --network rckeep alpine sh -c 'getent hosts rckeepc | cut -d" " -f1'
+t network-recreate-same-subnet-old-name-gone "gone" bash -c "$D exec rcnewd sh -c 'getent hosts rcoldc || echo gone'"
+$D rm -f rckeepc rcnewc rcnewd >/dev/null; $D network rm rckeep rcnet2 rcpad rcpad2 >/dev/null
 # --init's PID 1 doesn't keep its own stdin open: cat sees the end of it
 # (a held one would leave cat to the timeout, exit 143).
 code init-stdin-eof 0 bash -c "echo x | $D run -i --rm --init alpine timeout 10 cat"
@@ -771,6 +788,20 @@ t dns-user-net-next-after-silence "example.com" $D run --rm --network ipamnet --
 t dns-user-net-all-refused-fails-at-once "SERVFAIL fast" $D run --rm --network ipamnet --dns 10.231.0.10 alpine sh -c 's=$(date +%s); case "$(nslookup -type=a example.com 2>&1)" in *SERVFAIL*) a=SERVFAIL ;; *) a=other ;; esac; [ $(( $(date +%s) - s )) -le 2 ] && echo "$a fast" || echo "$a slow"'
 # Only the first three --dns servers are used, as with Docker.
 t dns-user-net-fourth-server-unused "none" $D run --rm --network ipamnet --dns 10.231.0.10 --dns 10.231.0.10 --dns 10.231.0.10 --dns 9.9.9.9 alpine sh -c 'getent hosts example.com >/dev/null && echo answered || echo none'
+# Edge cases: IPv6 --dns servers are not asked by the embedded DNS and take
+# no IPv4 server's place.
+t dns-user-net-ipv6-server-skipped "example.com" $D run --rm --network ipamnet --dns 2001:db8::53 --dns 9.9.9.9 alpine getent hosts example.com
+t dns-user-net-ipv6-ahead-of-three-ipv4 "example.com" $D run --rm --network ipamnet --dns 2001:db8::53 --dns 10.231.0.10 --dns 10.231.0.10 --dns 9.9.9.9 alpine getent hosts example.com
+t dns-user-net-ipv6-only-names "10.231.0.10" $D run --rm --network ipamnet --dns 2001:db8::53 alpine nslookup fixed
+# Timing, asked with one dig query each (dig does not re-ask, as nslookup does)
+# in a fresh container, so the kernel's limit on "port unreachable" replies is
+# not reached: three refusing servers answer SERVFAIL at once, and three silent
+# ones within the 4 s each is given (12 s in all, as with Docker).
+$D rm -f kiri-e2e-dig-seed >/dev/null 2>&1
+$D run --name kiri-e2e-dig-seed alpine apk add --no-cache bind-tools >/dev/null 2>&1 && $D commit kiri-e2e-dig-seed kiri-e2e-dig >/dev/null && $D rm -f kiri-e2e-dig-seed >/dev/null
+t dns-user-net-three-refused-servfail-at-once "SERVFAIL fast" $D run --rm --network ipamnet --dns 10.231.0.10 --dns 10.231.0.10 --dns 10.231.0.10 kiri-e2e-dig sh -c 's=$(date +%s); a=$(dig +tries=1 +time=20 example.com | grep -o "status: [A-Z]*"); [ $(( $(date +%s) - s )) -le 2 ] && echo "${a#status: } fast" || echo "${a#status: } slow"'
+t dns-user-net-three-silent-servfail-in-time "SERVFAIL in time" $D run --rm --network ipamnet --dns 192.0.2.1 --dns 192.0.2.2 --dns 192.0.2.3 kiri-e2e-dig sh -c 's=$(date +%s); a=$(dig +tries=1 +time=20 example.com | grep -o "status: [A-Z]*"); [ $(( $(date +%s) - s )) -le 14 ] && echo "${a#status: } in time" || echo "${a#status: } late"'
+$D rmi kiri-e2e-dig >/dev/null 2>&1
 t dns-inspect "[9.9.9.9]" bash -c "$D create --name dnsc --dns 9.9.9.9 alpine true >/dev/null; $D inspect -f '{{.HostConfig.Dns}}' dnsc; $D rm dnsc >/dev/null"
 t domainname "web.example.com" $D run --rm -h web --domainname example.com alpine sh -c 'hostname -f 2>/dev/null || cat /etc/hosts'
 t domainname-uts "example.com" $D run --rm --domainname example.com alpine cat /proc/sys/kernel/domainname
@@ -1349,6 +1380,18 @@ t layer-hardlink-symlinks "bin/hl=link:5:/bin/real bin/hl-dangling=link:2:/no/su
 li retype $LT:retype
 t layer-same-path-retyped "swap1=regular file swap2=directory swap3=directory swap4=symbolic link swap5=regular file" $D run --rm $LT:retype sh -c 'for p in swap1 swap2 swap3 swap4 swap5; do printf "%s=%s " $p "$(stat -c %F /$p)"; done'
 $D rmi $LT:retype >/dev/null 2>&1
+# The same, across layers, deep in a tree, with a whiteout after it, and with
+# hard links to a retyped path.
+li retype2 $LT:retype2
+t layer-retype-across-layers "ac1=regular file:was-dir ac2=directory:inner ac3=directory:inner ac4=symbolic link:ac2" \
+  $D run --rm $LT:retype2 sh -c 'cd / && printf "ac1=%s:%s " "$(stat -c %F ac1)" "$(cat ac1)"; printf "ac2=%s:%s " "$(stat -c %F ac2)" "$(ls ac2)"; printf "ac3=%s:%s " "$(stat -c %F ac3)" "$(ls ac3)"; printf "ac4=%s:%s" "$(stat -c %F ac4)" "$(readlink ac4)"'
+t layer-retype-whiteout "wo1=gone wo2=directory:new" \
+  $D run --rm $LT:retype2 sh -c 'cd / && { [ -e wo1 ] || [ -L wo1 ]; } && printf "wo1=%s " "$(stat -c %F wo1)" || printf "wo1=gone "; printf "wo2=%s:%s" "$(stat -c %F wo2)" "$(ls wo2)"'
+t layer-retype-deep "deep/a/b/d=regular file deep/a/b/c=directory:x deep2/a=regular file deep2/a/b=gone" \
+  $D run --rm $LT:retype2 sh -c 'cd / && printf "deep/a/b/d=%s " "$(stat -c %F deep/a/b/d)"; printf "deep/a/b/c=%s:%s " "$(stat -c %F deep/a/b/c)" "$(ls deep/a/b/c)"; printf "deep2/a=%s " "$(stat -c %F deep2/a)"; [ -e deep2/a/b ] && printf "deep2/a/b=there" || printf "deep2/a/b=gone"'
+t layer-retype-hardlink "hl1=regular file:one:2 hl1link=same hl2link=same:was-dir:2" \
+  $D run --rm $LT:retype2 sh -c 'cd / && printf "hl1=%s:%s:%s " "$(stat -c %F hl1)" "$(cat hl1)" "$(stat -c %h hl1)"; [ "$(stat -c %i hl1)" = "$(stat -c %i hl1link)" ] && printf "hl1link=same " || printf "hl1link=other "; [ "$(stat -c %i ac1)" = "$(stat -c %i hl2link)" ] && printf "hl2link=same:%s:%s" "$(cat hl2link)" "$(stat -c %h ac1)" || printf "hl2link=other"'
+$D rmi $LT:retype2 >/dev/null 2>&1
 # Devices and fifos in a layer are unpacked as themselves, with their times;
 # a time of 0 stays 0 on a file, a directory and a symlink (#679, #684).
 li special $LT:special
@@ -1613,6 +1656,42 @@ $D rename rndns-new host.docker.internal
 t rename-dns-host-name-stays-host "198." bash -c "$D run --rm --network rndns alpine nslookup host.docker.internal 127.0.0.11 | grep -A1 '^Name:' | tail -1"
 code rename-name-starts-with-letter 1 $D rename host.docker.internal _rndns
 $D rm -f rndns-new host.docker.internal >/dev/null 2>&1; $D rm -f rndns-old >/dev/null 2>&1; $D network rm rndns rndns2 >/dev/null
+# Rename edge cases (#467). An alias equal to the old name keeps resolving.
+# A name given up, or used before by another container, never points at the
+# old owner. Renaming back restores the first name on every network, and a
+# network joined after a rename has the new name.
+rnip() { $D inspect -f "{{(index .NetworkSettings.Networks \"$2\").IPAddress}}" "$1" 2>/dev/null; }
+rnget() { $D run --rm --network "$1" alpine sh -c "getent hosts $2 | awk '{print \$1}'; true"; }
+export D; export -f rnget
+$D network create rne1 >/dev/null; $D network create rne2 >/dev/null; $D network create rne3 >/dev/null
+# A name that an earlier container held and gave up (it was removed).
+$D run -d --name rne-prior --network rne1 alpine sleep 300 >/dev/null
+$D rm -f rne-prior >/dev/null
+$D run -d --name rne-a --network rne1 --network-alias rne-a --dns 192.0.2.1 alpine sleep 300 >/dev/null
+$D network connect rne2 rne-a; sleep 0.2
+RE_IP1=$(rnip rne-a rne1); RE_IP2=$(rnip rne-a rne2)
+$D rename rne-a rne-b
+$D rename rne-b rne-prior
+t rename-dns-reused-name "${RE_IP1:-no address}" bash -c "rnget rne1 rne-prior"
+t rename-dns-reused-name-extra-net "${RE_IP2:-no address}" bash -c "rnget rne2 rne-prior"
+# The alias equal to the old name still resolves; the name in between is gone.
+t rename-dns-alias-is-old-name "${RE_IP1:-no address}" bash -c "rnget rne1 rne-a"
+t rename-dns-intermediate-gone "old name gone" bash -c "$D run --rm --network rne1 alpine sh -c 'getent hosts rne-b || echo old name gone'"
+# Back to the first name: it is the container's again, the others are not.
+$D rename rne-prior rne-a
+t rename-dns-back "${RE_IP1:-no address}" bash -c "rnget rne1 rne-a"
+t rename-dns-back-extra-net "${RE_IP2:-no address}" bash -c "rnget rne2 rne-a"
+t rename-dns-back-gives-up-name "old name gone" bash -c "$D run --rm --network rne1 alpine sh -c 'getent hosts rne-prior || echo old name gone'"
+# A network joined after the rename has the name it has now.
+$D rename rne-a rne-c
+$D network connect rne3 rne-c; sleep 0.2
+RE_IP3=$(rnip rne-c rne3)
+t rename-dns-connect-after "${RE_IP3:-no address}" bash -c "rnget rne3 rne-c"
+# Another container takes a name this one passed through: its address answers.
+$D run -d --name rne-b --network rne1 alpine sleep 300 >/dev/null
+RE_NEW=$(rnip rne-b rne1)
+t rename-dns-name-taken-by-other "${RE_NEW:-no address}" bash -c "rnget rne1 rne-b"
+$D rm -f rne-b rne-c >/dev/null 2>&1; $D network rm rne1 rne2 rne3 >/dev/null
 # On an IPv6-only network the address Kiri keeps for the container is not an
 # address: a rename gives the new name AAAA records and no A.
 $D network create --ipv6 --ipv4=false rndns6 >/dev/null
