@@ -691,6 +691,9 @@ fn image_remove(engine: &Engine, name: &str, force: bool) -> Result<Value, Error
         return Ok(json!([{"Untagged": i.name}]));
     }
     engine.emit_image("delete", &i.config_digest, &i.name);
+    // Its unpacked layers go with it while the VM runs; a VM that never
+    // boots again held them for ever (#722).
+    engine.prune_unpacked_layers();
     Ok(json!([{"Untagged": i.name}, {"Deleted": i.config_digest}]))
 }
 

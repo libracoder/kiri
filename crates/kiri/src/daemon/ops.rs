@@ -419,6 +419,11 @@ fn image_prune(req: &Request, engine: &Engine) -> Result<Value, Error> {
             }
         }
     }
+    // The unpacked layers of what went go with it while the VM runs, as a
+    // removal by name does (#722).
+    if !deleted.is_empty() {
+        engine.prune_unpacked_layers();
+    }
     Ok(json!({"ImagesDeleted": if deleted.is_empty() { Value::Null } else { Value::Array(deleted) }, "SpaceReclaimed": reclaimed}))
 }
 

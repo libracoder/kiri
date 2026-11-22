@@ -1340,6 +1340,24 @@ impl Engine {
         self.link.lock().unwrap_or_else(|e| e.into_inner()).as_ref().filter(|vm| !vm.is_disconnected()).cloned()
     }
 
+    /// Unpacked layers only a removed image used go with it: the boot's
+    /// keep-set, recomputed for the running VM, so a VM that stays up does
+    /// not hold them until its next boot (#722). The boot path runs this
+    /// same set whenever the VM starts again.
+    pub fn prune_unpacked_layers(&self) {
+        if self.keeps_everything() || !matches!(self.store.index_damage(), Ok(None)) {
+            return;
+        }
+        let Ok(images) = self.store.images() else { return };
+        let mut layers: std::collections::BTreeSet<String> = images.iter().flat_map(|i| i.layers.iter().map(|l| l.digest.clone())).collect();
+        layers.extend(self.lock().containers.values().flat_map(|c| c.layers.iter().cloned()));
+        if let Some(vm) = self.awake()
+            && let Err(e) = vm.retain_layers(&layers.into_iter().collect::<Vec<_>>())
+        {
+            crate::diag::warn!("the layers of a removed image were left for the next boot", error = e);
+        }
+    }
+
     fn vm_restart_candidates(&self) -> Vec<String> {
         let st = self.lock();
         let mut ids: Vec<String> = st.containers.values().filter(|c| recover_after_vm_loss(c)).map(|c| c.id.clone()).collect();
