@@ -43,9 +43,9 @@ t("the answer resets the boxes to what the engine has", () => {
   if (!/Names answer on 8080 and 443/.test(document.querySelector("#content .settings").textContent)) throw new Error("description keeps the old ports");
 });
 t("links carry a port that isn't the default", () => {
-  if (!localUrl({ Labels: {} }, "web").endsWith("web.kiri.localhost:8080")) throw new Error(localUrl({ Labels: {} }, "web"));
+  if (!localUrl({ Labels: {} }, "web").endsWith("web.kiribra.localhost:8080")) throw new Error(localUrl({ Labels: {} }, "web"));
   kiri.on(rpEvent(80, 443));
-  if (!localUrl({ Labels: {} }, "web").endsWith("web.kiri.localhost")) throw new Error(localUrl({ Labels: {} }, "web"));
+  if (!localUrl({ Labels: {} }, "web").endsWith("web.kiribra.localhost")) throw new Error(localUrl({ Labels: {} }, "web"));
 });
 t("a port set by an environment variable can't be edited, and says so", () => {
   kiri.on(rpEvent(8880, 443, { http: { env: "KIRI_HTTP_PORT" } }));
@@ -64,10 +64,10 @@ t("a router that couldn't start says its port is in use", () => {
   const n = document.querySelector("#content .rp-notes").textContent;
   if (!/off: port 80 is in use/.test(n) || /paused/.test(n)) throw new Error(n);
 });
-t("with no engine, the row says to start Kiri", () => {
+t("with no engine, the row says to start Kiribra", () => {
   kiri.on({ type: "routerports", error: "connection refused" });
   domains();
   if (document.getElementById("rp-http")) throw new Error("boxes shown");
-  if (!/Start Kiri/.test(document.querySelector("#content .settings").textContent)) throw new Error("no hint");
+  if (!/Start Kiribra/.test(document.querySelector("#content .settings").textContent)) throw new Error("no hint");
 });
 report([...R, ...items.map((x) => "ITEM " + x)]);

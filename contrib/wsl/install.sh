@@ -1,5 +1,5 @@
 #!/bin/sh
-# Kiri on Windows: run inside a WSL2 distro, as root, from the directory that
+# Kiribra on Windows: run inside a WSL2 distro, as root, from the directory that
 # holds the Linux build (cargo xtask windows; x86-64, or arm64 with --arch arm64):
 #   wsl -d Ubuntu -u root sh ./install.sh
 # Containers run on WSL2's Linux kernel. The daemon serves its unix socket
@@ -12,7 +12,7 @@ install -m 755 "$here/kiri" "$here/kiri-init" /usr/local/bin/
 if [ -d /run/systemd/system ]; then
   cat > /etc/systemd/system/kiri.service <<UNIT
 [Unit]
-Description=Kiri container engine
+Description=Kiribra container engine
 After=network-online.target docker.service
 [Service]
 ExecStart=/usr/local/bin/kiri daemon
@@ -28,11 +28,11 @@ UNIT
   systemctl enable kiri
   systemctl restart kiri
 else
-  # No systemd in this distro: start Kiri when WSL boots it.
+  # No systemd in this distro: start Kiribra when WSL boots it.
   if ! grep -q 'kiri daemon' /etc/wsl.conf 2>/dev/null; then
     printf '\n[boot]\ncommand = HOME=/var/lib/kiri-daemon nohup /usr/local/bin/kiri daemon >/var/log/kiri.log 2>&1 &\n' >> /etc/wsl.conf
   fi
   pkill -f '/usr/local/bin/kiri daemon' 2>/dev/null || true
   HOME=/var/lib/kiri-daemon nohup /usr/local/bin/kiri daemon >/var/log/kiri.log 2>&1 &
 fi
-echo "Kiri runs in WSL on /var/lib/kiri-daemon/.kiri/run/docker.sock"
+echo "Kiribra runs in WSL on /var/lib/kiri-daemon/.kiribra/run/docker.sock"

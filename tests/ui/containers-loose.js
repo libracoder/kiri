@@ -12,7 +12,7 @@ const C = (id, name, state, project, ago) => ({ Id: id, Names: ["/" + name], Ima
 const loose = [C("solo", "solo", "running", "", 60), C("idle", "idle", "exited", "", 120)];
 const members = [C("b1", "blog-app-1", "running", "blog", 300), C("s1", "shop-web-1", "running", "shop", 600), C("b2", "blog-worker-1", "exited", "blog", 900), C("s2", "shop-db-1", "running", "shop", 1200)];
 ui.vm = "running";
-kiri.on({ type: "status", version: "0.1.4", dev: true, share: true, app: "Kiri", ours: "kiri", context: "kiri" });
+kiri.on({ type: "status", version: "0.1.4", dev: true, share: true, app: "Kiribra", ours: "kiri", context: "kiri" });
 kiri.on({ type: "lists", containers: [...loose, ...members], images: [], volumes: [], networks: [] });
 show("containers");
 const click = (el, o = {}) => el.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, ...o }));

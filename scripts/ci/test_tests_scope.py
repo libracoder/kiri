@@ -23,7 +23,7 @@ def crate(name, deps=""):
     return f'[package]\nname = "{name}"\nversion = "0.0.0"\n\n{deps}\n'
 
 
-# A small repository shaped like Kiri's: kiri (all three), kiri-win (its
+# A small repository shaped like Kiribra's: kiri (all three), kiri-win (its
 # real code under cfg(windows), a stub elsewhere, #[path] includes from
 # kiri), kiri-init (Linux only: the jobs build it on Linux alone) and
 # kiri-vmm (a cfg(unix) dependency of kiri).
@@ -152,7 +152,7 @@ fn main() {
     "crates/kiri-vmm/Cargo.toml": crate("kiri-vmm"),
     "crates/kiri-vmm/src/lib.rs": "pub fn vmm() {}\n",
     "brand/kiri.ico": "ico\n",
-    "README.md": "# Kiri\n",
+    "README.md": "# Kiribra\n",
     "guest/kernel/kiri.config": "CONFIG_X=y\n",
     "contrib/windows/kiri.ps1": "Write-Host hi\n",
     "tests/e2e.sh": "#!/bin/bash\nt hello\n",

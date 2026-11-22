@@ -1,4 +1,4 @@
-//! Compiles the Kiri Share build key into official releases; the work is
+//! Compiles the Kiribra Share build key into official releases; the work is
 //! in build_share_key.rs, which kiri-win's build script includes too.
 
 include!("build_share_key.rs");

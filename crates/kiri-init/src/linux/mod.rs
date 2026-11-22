@@ -243,7 +243,7 @@ fn take_over(root: &std::path::Path, leftovers: impl Fn()) -> io::Result<()> {
         if waited > std::time::Duration::from_secs(8) {
             return Err(io::Error::new(
                 io::ErrorKind::AddrInUse,
-                format!("another Kiri engine is running on this machine (agent {old}, daemon {}): stop it first", daemon.unwrap_or(0)),
+                format!("another Kiribra engine is running on this machine (agent {old}, daemon {}): stop it first", daemon.unwrap_or(0)),
             ));
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -274,15 +274,15 @@ fn is_daemon(pid: libc::pid_t) -> bool {
 /// The cgroup containers go under on a Linux host, chosen as dockerd and
 /// containerd choose theirs on cgroup v2:
 ///
-/// - In a cgroup delegated to Kiri (a systemd service with `Delegate=yes`,
+/// - In a cgroup delegated to Kiribra (a systemd service with `Delegate=yes`,
 ///   or one made for it that holds only the daemon and this agent): those
 ///   processes, and no others, move to its `kiri-host` leaf, so it can hand
 ///   controllers down; containers go in its `kiri`.
-/// - At the root of a cgroup namespace that holds processes (Kiri inside a
+/// - At the root of a cgroup namespace that holds processes (Kiribra inside a
 ///   container): they move to a `kiri-host` leaf, as Docker-in-Docker's
 ///   entrypoint does; containers go in `kiri` beside it.
 /// - Anywhere else (a login session, WSL's `init.scope`: cgroups shared
-///   with processes that are not Kiri's): nothing moves, and containers go
+///   with processes that are not Kiribra's): nothing moves, and containers go
 ///   in `kiri` at the top of the hierarchy, as dockerd's cgroupfs driver
 ///   puts them in `docker`. Moving every process of a shared cgroup took
 ///   WSL's own along, one level deeper on every start.
@@ -357,12 +357,12 @@ fn mount_cgroup2(root: &std::path::Path) -> io::Result<()> {
     match empty {
         Ok(true) => mount(c"cgroup2", c"/sys/fs/cgroup", c"cgroup2", libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC, None)
             .map_err(|e| io::Error::new(e.kind(), format!("/sys/fs/cgroup has no cgroup tree (ip netns exec remounts /sys) and mounting cgroup2 there failed: {e}"))),
-        Ok(false) => Err(io::Error::new(io::ErrorKind::Unsupported, "Kiri needs cgroup v2 at /sys/fs/cgroup (this machine has cgroup v1 or a hybrid tree there)")),
-        Err(e) => Err(io::Error::new(e.kind(), format!("/sys/fs/cgroup: {e}; Kiri needs cgroup v2 mounted there"))),
+        Ok(false) => Err(io::Error::new(io::ErrorKind::Unsupported, "Kiribra needs cgroup v2 at /sys/fs/cgroup (this machine has cgroup v1 or a hybrid tree there)")),
+        Err(e) => Err(io::Error::new(e.kind(), format!("/sys/fs/cgroup: {e}; Kiribra needs cgroup v2 mounted there"))),
     }
 }
 
-/// Whether the agent's cgroup is Kiri's own: a systemd service's (with
+/// Whether the agent's cgroup is Kiribra's own: a systemd service's (with
 /// `Delegate=yes`, the whole cgroup is the service's), or one holding no
 /// process but this agent and its parent, the daemon.
 fn delegated(own: &std::path::Path, pids: &[String]) -> bool {

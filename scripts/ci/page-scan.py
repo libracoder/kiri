@@ -78,7 +78,7 @@ PATTERNS = [
     ("dynamic-import", "network", r"""\bimport\s*\((?!\s*["'][^"']*["']\s*\))""", "imports code from a computed place"),
     ("window-open", "network", r"""\bwindow\.open\s*\(""", "opens another window"),
     ("location", "network", r"""\blocation(?:\.href)?\s*=(?!=)|\blocation\.(?:assign|replace)\s*\(""", "navigates the page away"),
-    ("post-message", "network", r"""\.postMessage\s*\((?<!messageHandlers\.kiri\.postMessage\()""", "a message to another window or origin (the app bridge is messageHandlers.kiri)"),
+    ("post-message", "network", r"""\.postMessage\s*\((?<!messageHandlers\.kiribra\.postMessage\()""", "a message to another window or origin (the app bridge is messageHandlers.kiri)"),
     # -- code that builds or hides code
     ("eval", "code", r"""\beval\s*\(""", "runs a string as code"),
     ("function-ctor", "code", r"""\bnew\s+Function\s*\(|(?<![\w.])Function\s*\(\s*["'`]""", "builds code from a string"),

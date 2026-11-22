@@ -1,7 +1,7 @@
-//! Boots Kiri's Linux guest with Apple's Virtualization.framework.
+//! Boots Kiribra's Linux guest with Apple's Virtualization.framework.
 //!
 //! Every Virtualization.framework object lives on one private serial dispatch
-//! queue and is only touched there; the rest of Kiri sees plain Rust types and
+//! queue and is only touched there; the rest of Kiribra sees plain Rust types and
 //! events. The guest dials the host over vsock when it is ready, so start-up
 //! needs no polling.
 

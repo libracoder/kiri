@@ -21,12 +21,12 @@
 //!
 //! A daemon that is not there (its socket missing or refusing: WSL
 //! restarted and nothing started it, or it crashed) is started here, by
-//! kiri-start in Kiri Linux or `systemctl start kiri`, once for all the
+//! kiri-start in Kiribra Linux or `systemctl start kiri`, once for all the
 //! connections that come meanwhile (see `Starter`). A connection it still
 //! cannot reach is closed with the reason as the CLOSE's data, which
 //! kiri-win tells the docker client; a kiri-win from before this ignores
 //! CLOSE's data. Each start and how it went is also told to kiri-win
-//! (NOTE) for its own log. A stopped engine still runs and answers ("Kiri
+//! (NOTE) for its own log. A stopped engine still runs and answers ("Kiribra
 //! is stopped"), so it is never started here.
 
 use std::collections::HashMap;
@@ -90,9 +90,9 @@ const RETRY_MOST: Duration = Duration::from_secs(300);
 /// Why a start whose daemon took the connection and then answered nothing
 /// (it exited as it booted) is held as failed.
 const NO_ANSWER: &str = "it started, then stopped before answering; see /var/log/kiri.log";
-/// Kiri Linux's start script (contrib/wsl/kiri-linux).
+/// Kiribra Linux's start script (contrib/wsl/kiri-linux).
 const KIRI_START: &str = "/usr/local/bin/kiri-start";
-/// Where the daemon's own output goes in Kiri Linux (kiri-start) and in a
+/// Where the daemon's own output goes in Kiribra Linux (kiri-start) and in a
 /// distro without systemd (contrib/wsl/install.sh).
 const LOG: &str = "/var/log/kiri.log";
 
@@ -457,7 +457,7 @@ fn gone(e: &io::Error) -> bool {
     matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused)
 }
 
-/// Starts the daemon as this distro does: kiri-start in Kiri Linux,
+/// Starts the daemon as this distro does: kiri-start in Kiribra Linux,
 /// systemd's `kiri` service in a distro with systemd (contrib/wsl/install.sh).
 /// Killed at `until`. kiri-start's exit 1 (no socket yet) may still end
 /// with the daemon up, so it is not a failure here.

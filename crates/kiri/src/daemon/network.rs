@@ -11,7 +11,7 @@
 //! subnet one of them takes later moves, or is refused (`Network::settle`).
 //!
 //! `--ipv6` (Compose `enable_ipv6`) adds an IPv6 subnet beside the IPv4 one:
-//! an IPv6 `IPAM.Config` entry, or a /64 from Kiri's own ULA pool (a /48
+//! an IPv6 `IPAM.Config` entry, or a /64 from Kiribra's own ULA pool (a /48
 //! under fd00::/8 per engine), as Docker's default address pools hand out.
 //! The default `bridge` stays IPv4-only, as Docker's does.
 
@@ -56,7 +56,7 @@ pub struct Network {
     #[serde(default)]
     pub attachable: bool,
     /// An IPv6-only network (`--ipv4=false --ipv6`). It still has an IPv4
-    /// subnet, inside Kiri only: each container's address there is the
+    /// subnet, inside Kiribra only: each container's address there is the
     /// name the guest keeps it by (DNS, MAC), but nothing is given it, the
     /// bridge or the container, and inspect shows none, as with Docker.
     #[serde(default)]
@@ -294,7 +294,7 @@ fn ula_prefix(root: &std::path::Path) -> [u8; 6] {
 
 /// The /64 an `--ipv6` network without a subnet gets: subnet ID from a hash
 /// of the name, so a network made again gets the same one, moved on past
-/// any taken one (by Kiri, or routed on a Linux host).
+/// any taken one (by Kiribra, or routed on a Linux host).
 fn free_subnet6(ula: [u8; 6], name: &str, taken: &[([u8; 16], u8)]) -> Option<([u8; 16], u8)> {
     use sha2::Digest;
     let h = sha2::Sha256::digest(name.as_bytes());
@@ -342,7 +342,7 @@ fn builtin(name: &str, driver: &str, bridge: &str, subnet: [u8; 4], gateway: [u8
     }
 }
 
-/// `--opt com.docker.network.bridge.name=…`. Kiri names each bridge itself
+/// `--opt com.docker.network.bridge.name=…`. Kiribra names each bridge itself
 /// (`kiri0`, `kiri1`, …) and the guest's firewall recognises its bridges by
 /// that prefix (the forward filter, masquerading, the host.docker.internal
 /// and DNS redirects, the loopback guard), so another name is refused rather
@@ -360,7 +360,7 @@ fn checked_options(options: serde_json::Value) -> Result<serde_json::Value, Stri
         }
         Some(name) => {
             return Err(format!(
-                "Kiri does not support the network option {BRIDGE_NAME_OPT} ({name}): Kiri names each network's bridge itself (kiri1, kiri2, …), and its firewall rules depend on those names. Create the network without it"
+                "Kiribra does not support the network option {BRIDGE_NAME_OPT} ({name}): Kiribra names each network's bridge itself (kiri1, kiri2, …), and its firewall rules depend on those names. Create the network without it"
             ));
         }
     }
@@ -368,7 +368,7 @@ fn checked_options(options: serde_json::Value) -> Result<serde_json::Value, Stri
 }
 
 /// A network's options as inspect shows them: a bridge name that is not the
-/// bridge's own (kept by a Kiri that did not refuse it) is left out.
+/// bridge's own (kept by a Kiribra that did not refuse it) is left out.
 pub fn shown_options(n: &Network) -> serde_json::Value {
     let mut o = if n.options.is_object() { n.options.clone() } else { serde_json::json!({}) };
     if let Some(map) = o.as_object_mut()
@@ -475,7 +475,7 @@ fn parse_ipam6(c: &serde_json::Value, subnet: &str) -> Result<Ipam6, String> {
     let (net, prefix) = parse_cidr6(subnet, "subnet")?;
     // A network needs room for the gateway and at least one container.
     if !(1..=126).contains(&prefix) {
-        return Err(format!("invalid subnet {subnet}: Kiri supports IPv6 prefixes from /1 to /126"));
+        return Err(format!("invalid subnet {subnet}: Kiribra supports IPv6 prefixes from /1 to /126"));
     }
     let inside = |ip: [u8; 16]| in_subnet6(ip, net, prefix);
     let ip_range = match field("IPRange") {
@@ -518,7 +518,7 @@ pub fn parse_ipam(v: &serde_json::Value) -> Result<Option<Ipam>, String> {
 pub fn parse_ipam_both(v: &serde_json::Value) -> Result<(Option<Ipam>, Option<Ipam6>), String> {
     match v["Driver"].as_str().unwrap_or("") {
         "" | "default" => {}
-        d => return Err(format!("Kiri supports only the default IPAM driver, not {d}")),
+        d => return Err(format!("Kiribra supports only the default IPAM driver, not {d}")),
     }
     let configs = v["Config"].as_array().map(Vec::as_slice).unwrap_or(&[]);
     let mut out: Option<Ipam> = None;
@@ -528,7 +528,7 @@ pub fn parse_ipam_both(v: &serde_json::Value) -> Result<(Option<Ipam>, Option<Ip
         let subnet = field("Subnet");
         if subnet.contains(':') {
             if out6.is_some() {
-                return Err("Kiri supports one IPv6 subnet per network".into());
+                return Err("Kiribra supports one IPv6 subnet per network".into());
             }
             out6 = Some(parse_ipam6(c, &subnet)?);
             continue;
@@ -540,11 +540,11 @@ pub fn parse_ipam_both(v: &serde_json::Value) -> Result<(Option<Ipam>, Option<Ip
             return Err("invalid network config: an IP range or gateway needs a subnet".into());
         }
         if out.is_some() {
-            return Err("Kiri supports one IPv4 subnet per network".into());
+            return Err("Kiribra supports one IPv4 subnet per network".into());
         }
         let (net, prefix) = parse_cidr(&subnet, "subnet")?;
         if prefix > 30 || prefix < 8 {
-            return Err(format!("invalid subnet {subnet}: Kiri supports prefixes from /8 to /30"));
+            return Err(format!("invalid subnet {subnet}: Kiribra supports prefixes from /8 to /30"));
         }
         let inside = |ip: [u8; 4]| in_subnet(ip, net, prefix);
         let ip_range = match field("IPRange") {
@@ -588,7 +588,7 @@ impl Networks {
             Err(e) => return Err(e),
         };
         // A saved network whose subnet the host has taken since (Docker
-        // started while Kiri was stopped), or Docker will take back when it
+        // started while Kiribra was stopped), or Docker will take back when it
         // starts, moves off it; one whose subnet the user gave is refused at
         // its next container if the host holds it (#489).
         let host = host_networks();
@@ -607,7 +607,7 @@ impl Networks {
             }
         }
         // 172.17.0.0/16 as Docker uses, unless the host is already on it
-        // (Kiri on a Linux host inside another engine's container), Docker
+        // (Kiribra on a Linux host inside another engine's container), Docker
         // here will take it back when it starts, or a saved network has it.
         // Chosen afresh at each start: never saved, as Docker's own default
         // bridge is not.
@@ -637,10 +637,10 @@ impl Networks {
     /// Before a network's first container: its subnet checked against the
     /// host's once more (`Network::settle`), as the host may have taken it
     /// since it was chosen. Bridges are made at a network's first container,
-    /// so Docker started after Kiri, or at boot before Kiri's containers
+    /// so Docker started after Kiribra, or at boot before Kiribra's containers
     /// came back, may hold it by then. Nothing to do while containers are
     /// on it (their bridge, and its route, came first), off a Linux host
-    /// (Kiri's VM has its own network), or for host and none.
+    /// (Kiribra's VM has its own network), or for host and none.
     pub fn settle(&mut self, key: &str) -> Result<(), String> {
         if self.find(key).is_none_or(|n| n.bridge.is_empty() || !n.used.is_empty()) {
             return Ok(());
@@ -848,7 +848,7 @@ fn default_bridge_subnet(taken: &[([u8; 4], u8)], host: &[HostNet]) -> io::Resul
 const NO_FREE_SUBNET: &str = "no free subnet for the default bridge: 172.17.0.0/16 … 172.31.0.0/16 and 10.89.0.0/24 … 10.89.255.0/24 are all routed on this host or used by another network";
 
 /// The first free subnet: 172.17.0.0/16 (only for the default bridge), then
-/// 172.18.0.0/16 … 172.31.0.0/16, then 10.89.N.0/24, skipping ones Kiri
+/// 172.18.0.0/16 … 172.31.0.0/16, then 10.89.N.0/24, skipping ones Kiribra
 /// already uses and ones on the host's own links and interfaces.
 fn free_subnet(taken: &[([u8; 4], u8)], default_bridge: bool) -> Option<([u8; 4], u8)> {
     free_subnet_with(taken, default_bridge, &host_networks())
@@ -864,7 +864,7 @@ fn free_subnet_with(taken: &[([u8; 4], u8)], default_bridge: bool, host: &[HostN
         .find(|(s, p)| !taken.iter().any(|t| overlaps(*t, (*s, *p))) && !host.iter().any(|h| h.overlaps(*s, *p)))
 }
 
-/// A subnet the host itself is on, outside Kiri's bridges: an on-link route
+/// A subnet the host itself is on, outside Kiribra's bridges: an on-link route
 /// or an interface's address, and the interface it is on. Or one Docker
 /// will take back when it starts (`docker_saved`): not on the host now.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -891,9 +891,9 @@ impl HostNet {
     }
 
     /// Lies inside `subnet` (or is it), so the host routes that part of it,
-    /// `gateway` included when it is in it, to `dev` and not to Kiri's
+    /// `gateway` included when it is in it, to `dev` and not to Kiribra's
     /// bridge: the kernel picks the more specific route, and of two equal
-    /// ones the older. A host network around Kiri's leaves it working.
+    /// ones the older. A host network around Kiribra's leaves it working.
     fn inside(&self, subnet: [u8; 4], prefix: u8) -> bool {
         self.mask >= mask4(prefix) && (self.net & mask4(prefix)) == u32::from_be_bytes(subnet)
     }
@@ -909,7 +909,7 @@ impl HostNet {
 
 impl Network {
     /// A subnet a host network has taken since it was chosen (#489): Docker
-    /// started while Kiri was stopped, or before this network's first
+    /// started while Kiribra was stopped, or before this network's first
     /// container, and its docker0 or br-… holds it now. A subnet from the
     /// pool (the default bridge's, or one made without `--subnet`) moves to
     /// a free one: no container can have asked for an address on it, and
@@ -960,8 +960,8 @@ impl Network {
 }
 
 /// The host's own networks: its on-link routes plus the subnets its
-/// interfaces have addresses on, outside Kiri's bridges. Only a Linux host
-/// shares its routing table and interfaces with Kiri.
+/// interfaces have addresses on, outside Kiribra's bridges. Only a Linux host
+/// shares its routing table and interfaces with Kiribra.
 #[cfg(target_os = "linux")]
 fn host_networks() -> Vec<HostNet> {
     let mut out = on_link_routes(&std::fs::read_to_string("/proc/net/route").unwrap_or_default());
@@ -975,8 +975,8 @@ fn host_networks() -> Vec<HostNet> {
 /// each with its saved address and never looks at what else is on the host
 /// then (moby daemon/libnetwork/drivers/bridge/bridge_store.go,
 /// populateNetworks; for docker0, daemon/daemon_unix.go, selectBIP, takes
-/// the address docker0 has). A Kiri network on one of them while Docker is
-/// stopped would break Docker's, or Kiri's, when Docker starts. Only its
+/// the address docker0 has). A Kiribra network on one of them while Docker is
+/// stopped would break Docker's, or Kiribra's, when Docker starts. Only its
 /// very first start picks a subnet around what the host has.
 #[cfg(target_os = "linux")]
 fn docker_saved() -> Vec<HostNet> {
@@ -998,7 +998,7 @@ fn docker_saved() -> Vec<HostNet> {
                     out.extend(docker_bridges(&b));
                 }
             }
-            // A store Kiri can't read (not root): Docker's default.
+            // A store Kiribra can't read (not root): Docker's default.
             Err(e) if e.kind() == io::ErrorKind::PermissionDenied => out.push(HostNet { saved: true, ..HostNet::new("docker0", [172, 17, 0, 1], mask4(16)) }),
             Err(_) => {}
         }
@@ -1039,7 +1039,7 @@ fn host_networks() -> Vec<HostNet> {
     Vec::new()
 }
 
-/// The subnets this machine's interfaces have addresses on, outside Kiri's
+/// The subnets this machine's interfaces have addresses on, outside Kiribra's
 /// bridges and loopback. An address stays on an interface whose route is
 /// gone (a `noprefixroute` one) or not yet there, so this catches what the
 /// routing table misses.
@@ -1071,8 +1071,8 @@ fn host_addrs() -> Vec<HostNet> {
     interface_networks(entries)
 }
 
-/// The network of each interface address, skipping Kiri's own bridges and
-/// loopback: a bridge Kiri made earlier is its own business, and
+/// The network of each interface address, skipping Kiribra's own bridges and
+/// loopback: a bridge Kiribra made earlier is its own business, and
 /// 127.0.0.0/8 never overlaps the pool.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn interface_networks(entries: Vec<(String, [u8; 4], [u8; 4])>) -> Vec<HostNet> {
@@ -1083,9 +1083,9 @@ fn interface_networks(entries: Vec<(String, [u8; 4], [u8; 4])>) -> Vec<HostNet> 
         .collect()
 }
 
-/// The host's own IPv6 routes, outside Kiri's bridges, the default route
+/// The host's own IPv6 routes, outside Kiribra's bridges, the default route
 /// and link-local and multicast ones. Only a Linux host shares its routing
-/// table with Kiri.
+/// table with Kiribra.
 #[cfg(target_os = "linux")]
 fn host_routes6() -> Vec<([u8; 16], u8)> {
     let text = std::fs::read_to_string("/proc/net/ipv6_route").unwrap_or_default();
@@ -1112,7 +1112,7 @@ fn host_routes6() -> Vec<([u8; 16], u8)> {
 /// The routes in `/proc/net/route`'s text that put the host on a subnet, as
 /// Docker reserves them since 23.0 (moby#42598): not one through a gateway
 /// (OpenVPN's 0.0.0.0/1 and 128.0.0.0/1), an unreachable or prohibit one, or
-/// one to 0.0.0.0 (the default route, a WireGuard 0.0.0.0/1). Kiri's own
+/// one to 0.0.0.0 (the default route, a WireGuard 0.0.0.0/1). Kiribra's own
 /// bridges' routes are left out. A bridge with no carrier (Docker's docker0
 /// with no containers) keeps its route, marked linkdown: it is here too.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -1218,15 +1218,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// A bridge name of the user's own is refused: Kiri's firewall knows
+    /// A bridge name of the user's own is refused: Kiribra's firewall knows
     /// its bridges by their `kiri` prefix. An empty one is Docker's unset;
-    /// one kept by an older Kiri is not shown in inspect.
+    /// one kept by an older Kiribra is not shown in inspect.
     #[test]
     fn a_bridge_name_of_ones_own_is_refused_not_reported() {
         let (mut n, dir) = nets();
         let opts = |v: &str| Settings { options: serde_json::json!({BRIDGE_NAME_OPT: v, "com.docker.network.bridge.enable_ip_masquerade": "false"}), ..Default::default() };
         let e = n.create("isolated", opts("cp-isolated")).unwrap_err();
-        assert!(e.starts_with("Kiri does not support the network option com.docker.network.bridge.name (cp-isolated)"), "{e}");
+        assert!(e.starts_with("Kiribra does not support the network option com.docker.network.bridge.name (cp-isolated)"), "{e}");
         assert!(n.find("isolated").is_none(), "nothing made");
         let made = n.create("isolated", opts("")).unwrap();
         assert_eq!(made.options, serde_json::json!({"com.docker.network.bridge.enable_ip_masquerade": "false"}));
@@ -1375,7 +1375,7 @@ mod tests {
         assert!(default_bridge_subnet(&[], &host).is_err());
     }
 
-    /// Docker started after the default bridge was chosen (while Kiri was
+    /// Docker started after the default bridge was chosen (while Kiribra was
     /// stopped, or before its first container) and its docker0 holds
     /// 172.17.0.0/16 now: the default bridge moves before its first
     /// container, and stays while containers are on it (#489).

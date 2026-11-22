@@ -105,7 +105,7 @@ pub fn request(method: &str, path: &str, body: Option<&Value>) -> io::Result<Res
 /// A GET the window makes on its own (status, lists): it doesn't count as
 /// use, so it never keeps an idle VM awake.
 pub fn get_background(path: &str) -> io::Result<Value> {
-    let r = send("GET", path, None, "X-Kiri-Background: 1\r\n")?;
+    let r = send("GET", path, None, "X-Kiribra-Background: 1\r\n")?;
     if !r.ok() {
         return Err(io::Error::other(r.error()));
     }
@@ -142,8 +142,8 @@ fn send(method: &str, path: &str, body: Option<&Value>, extra: &str) -> io::Resu
     Ok(Response { status, body })
 }
 
-/// Kiri's own version from a `/version` answer: `KiriVersion`, or `Version`
-/// from an engine older than that field (it reported Kiri's version there;
+/// Kiribra's own version from a `/version` answer: `KiriVersion`, or `Version`
+/// from an engine older than that field (it reported Kiribra's version there;
 /// it is now the Docker Engine version clients gate on).
 pub fn kiri_version(version: &Value) -> Option<&str> {
     version["KiriVersion"].as_str().or_else(|| version["Version"].as_str())
@@ -159,7 +159,7 @@ pub fn get(path: &str) -> io::Result<Value> {
 
 /// Whether the daemon answers at all.
 pub fn alive() -> bool {
-    send("GET", "/_ping", None, "X-Kiri-Background: 1\r\n").is_ok_and(|r| r.ok())
+    send("GET", "/_ping", None, "X-Kiribra-Background: 1\r\n").is_ok_and(|r| r.ok())
 }
 
 /// A POST whose answer is JSON lines arriving over time (a pull's
@@ -206,7 +206,7 @@ pub fn post_lines_closable(path: &str, auth: Option<&str>, opened: impl FnOnce(&
 /// Calls `on_event` for each event until the connection ends or it returns false.
 pub fn events(mut on_event: impl FnMut(Value) -> bool) -> io::Result<()> {
     let mut s = connect(None)?;
-    write!(s, "GET /events HTTP/1.1\r\nHost: kiri\r\nX-Kiri-Background: 1\r\n\r\n")?;
+    write!(s, "GET /events HTTP/1.1\r\nHost: kiri\r\nX-Kiribra-Background: 1\r\n\r\n")?;
     let mut r = BufReader::new(s);
     let (status, _, chunked) = head(&mut r)?;
     if status != 200 || !chunked {
@@ -281,7 +281,7 @@ pub fn exec(container: &str, cmd: &[&str]) -> io::Result<(i64, String)> {
     Ok((code, String::from_utf8_lossy(&out).replace("\r\n", "\n")))
 }
 
-/// A docker CLI: on PATH, else the one bundled in Kiri.app.
+/// A docker CLI: on PATH, else the one bundled in Kiribra.app.
 pub fn docker_cli() -> Option<PathBuf> {
     let on_path = std::env::var_os("PATH").and_then(|p| std::env::split_paths(&p).map(|d| d.join("docker")).find(|d| d.is_file()));
     on_path
@@ -292,7 +292,7 @@ pub fn docker_cli() -> Option<PathBuf> {
         .or_else(lite_cli)
 }
 
-/// Kiri Lite's downloaded CLI.
+/// Kiribra Lite's downloaded CLI.
 #[cfg(target_os = "macos")]
 fn lite_cli() -> Option<PathBuf> {
     crate::tools::dir().ok().map(|d| d.join("docker")).filter(|d| d.is_file())

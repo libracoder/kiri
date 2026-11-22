@@ -1,5 +1,5 @@
 //! `kiri domains`: the ports of the container-domain routers
-//! (`http://<name>.kiri.local`), as Settings → Domains shows and changes
+//! (`http://<name>.kiribra.local`), as Settings → Domains shows and changes
 //! them. On Windows it runs in WSL, by the engine's own `kiri` (wsl.rs).
 
 use std::io;

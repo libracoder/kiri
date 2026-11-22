@@ -1,6 +1,6 @@
 // Run only says a container started once it stays up: a container that stops
 // with an error in its first seconds is said to have failed, with why; and
-// Run on a Kubernetes image points to Kiri's own cluster instead of starting
+// Run on a Kubernetes image points to Kiribra's own cluster instead of starting
 // a copy. kiri-k8s is marked Kubernetes, and stopping or removing it says it
 // turns Kubernetes off.
 const R = [];
@@ -67,7 +67,7 @@ t("Run on a Kubernetes image doesn't start a copy", () => {
   sent.length = 0;
   runImage("rancher/k3s:v1.31.4-k3s1");
   if (sent.some((m) => m.type === "run")) throw new Error("sent run");
-  if (!/This is Kubernetes. Kiri runs it for you/.test(dialog()?.textContent)) throw new Error(dialog()?.textContent);
+  if (!/This is Kubernetes. Kiribra runs it for you/.test(dialog()?.textContent)) throw new Error(dialog()?.textContent);
 });
 t("Kubernetes off: Turn on Kubernetes opens its settings", () => {
   const go = dialog().querySelector("[data-go]");

@@ -1,5 +1,5 @@
 //! Signing in to a registry through the registry's own page, so a password
-//! is never typed into Kiri: the Mac's window and Windows' (crates/kiri-win,
+//! is never typed into Kiribra: the Mac's window and Windows' (crates/kiri-win,
 //! by #[path]) answer the Pull from menu's Sign in with it.
 //!
 //! - Docker Hub: the docker CLI's own browser sign-in (`docker login`), on a
@@ -114,7 +114,7 @@ pub fn handle(cmd: &str, reg: String, value: &Value, emit: fn(String), ready: fn
             stop();
         }
         if let Err(e) = ready() {
-            emit(event(&reg, "failed", json!({"error": format!("Kiri's engine isn't running: {e}")})));
+            emit(event(&reg, "failed", json!({"error": format!("Kiribra's engine isn't running: {e}")})));
             return;
         }
         let out = match (cmd.as_str(), reg.as_str()) {
@@ -122,7 +122,7 @@ pub fn handle(cmd: &str, reg: String, value: &Value, emit: fn(String), ready: fn
             ("weblogin", "ghcr") => github(turn, emit, spawn),
             ("weblogin", "ecr") => ecr(turn, &profile, emit, spawn),
             ("webloginsso", "ecr") => aws_sso(turn, &profile, emit, spawn),
-            _ => Some(event(&reg, "failed", json!({"error": "Kiri can't sign in to that registry yet."}))),
+            _ => Some(event(&reg, "failed", json!({"error": "Kiribra can't sign in to that registry yet."}))),
         };
         // Cancelled meanwhile: the page has moved on.
         if current(turn) {

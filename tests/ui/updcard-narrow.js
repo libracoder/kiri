@@ -8,7 +8,7 @@ const R = [];
 const t = (name, fn) => { try { fn(); R.push("PASS " + name); } catch (e) { R.push("FAIL " + name + ": " + e.message); } };
 const ALL = LANGS.map((l) => l[0]);
 t("every language", () => { if (ALL.length < 38 || !ALL.includes("ar")) throw new Error(ALL.length + " languages"); });
-kiri.on({ type: "status", version: "0.2.2", app: "Kiri", ours: "kiri", context: "kiri" });
+kiri.on({ type: "status", version: "0.2.2", app: "Kiribra", ours: "kiri", context: "kiri" });
 const release = { version: "0.2.3", notes: "## New\n- Compose projects show each service's ports\n## Fixes\n- Logs keep their place", notes_url: "https://runkiri.com/releases/0.2.3/" };
 const states = {
   available: () => { ui.engineStale = null; ui.upd = null; kiri.on({ type: "update", manual: true, current: "0.2.2", release }); },

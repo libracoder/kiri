@@ -1,4 +1,4 @@
-//! Kiri's icon and version in kiri-win.exe. The icon is for Explorer, Start
+//! Kiribra's icon and version in kiri-win.exe. The icon is for Explorer, Start
 //! and a pinned taskbar button (the running window sets its own). The
 //! version is for Explorer's Details and for Windows Installer, which
 //! replaces a file by comparing versions: a file with none it judges by
@@ -7,7 +7,7 @@
 
 use std::path::Path;
 
-// The Kiri Share build key, as crates/kiri/build.rs compiles it: kiri-win
+// The Kiribra Share build key, as crates/kiri/build.rs compiles it: kiri-win
 // carries share.rs too, for the window's Share.
 include!("../kiri/build_share_key.rs");
 
@@ -42,12 +42,12 @@ BEGIN
   BEGIN
     BLOCK "040904B0"
     BEGIN
-      VALUE "CompanyName", "Kiri"
-      VALUE "FileDescription", "Kiri"
+      VALUE "CompanyName", "Kiribra"
+      VALUE "FileDescription", "Kiribra"
       VALUE "FileVersion", "{version}"
       VALUE "InternalName", "kiri-win"
       VALUE "OriginalFilename", "kiri-win.exe"
-      VALUE "ProductName", "Kiri"
+      VALUE "ProductName", "Kiribra"
       VALUE "ProductVersion", "{version}"
     END
   END

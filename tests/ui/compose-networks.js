@@ -1,7 +1,7 @@
 // parity: macos windows linux
 // The project's real networks in its header and the Structure footer (one, several, none, a custom
-// name); the notice for a name Kiri won't take, on the row and the page, the row described by it;
-// the name warning in the plan box with nothing to apply; Kiri's own Compose errors in words.
+// name); the notice for a name Kiribra won't take, on the row and the page, the row described by it;
+// the name warning in the plan box with nothing to apply; Kiribra's own Compose errors in words.
 const R = [];
 const t = (name, fn) => { try { fn(); R.push("PASS " + name); } catch (e) { R.push("FAIL " + name + ": " + e.message); } };
 const eq = (a, b, m) => { if (JSON.stringify(a) !== JSON.stringify(b)) throw new Error(m + ": got " + JSON.stringify(a) + " want " + JSON.stringify(b)); };
@@ -40,9 +40,9 @@ t("a long name is cut, with the whole in its tooltip", () => {
 });
 // A project's notices on the list: rows of their own under its row, each its whole text in its title.
 const notes = (n) => [...document.querySelectorAll(`#content tr.warnrow[data-cmpnote="${n}"] .name > div[title]`)].map((w) => w.title);
-t("a name Kiri won't take: the notice on the list, under the project's row, and on the page", () => {
+t("a name Kiribra won't take: the notice on the list, under the project's row, and on the page", () => {
   cmp.open = null; render();
-  const text = "This file's name uses ${A_SECRET}. Kiri uses the folder's name, m-pname-env, so it never puts a secret in a name.";
+  const text = "This file's name uses ${A_SECRET}. Kiribra uses the folder's name, m-pname-env, so it never puts a secret in a name.";
   eq(notes("m-pname-env").includes(text), true, "the list");
   eq(document.querySelector('#content tr.group[data-group="m-pname-env"]').nextElementSibling.matches(".warnrow"), true, "under its row");
   eq(notes("one"), [], "no warning, no row");
@@ -64,9 +64,9 @@ t("the plan box repeats the name warning with nothing to apply", () => {
   eq(el.querySelector(".lede").textContent.startsWith("Nothing yet"), true, "nothing yet");
   eq([...el.querySelectorAll(".err.warn")].map((e) => e.textContent), ["${A_SECRET} is used in a name or folder path. Docker shows those in plain text."], "the warning");
 });
-t("Kiri's own Compose errors read as its words", () => {
+t("Kiribra's own Compose errors read as its words", () => {
   eq(cmpErr({ errkey: "reqUnset", errargs: { name: "${A}, ${B}" } }), "Compose rejects this file. A required variable may not be set: ${A}, ${B}.", "required");
-  eq(cmpErr({ errkey: "rejectReal", errargs: {} }), "Compose rejects this file with its real values. Kiri can't show why with secrets hidden.", "real");
+  eq(cmpErr({ errkey: "rejectReal", errargs: {} }), "Compose rejects this file with its real values. Kiribra can't show why with secrets hidden.", "real");
   eq(cmpErr({ errkey: "yamlLine", errargs: { n: "6" } }), "Compose rejects this file: YAML error on line 6", "yaml");
 });
 report(R);

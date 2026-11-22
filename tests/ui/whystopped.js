@@ -94,7 +94,7 @@ t("MariaDB: the names in one sentence work too", () => {
 });
 
 closeDetail(); open("k1", KINDLOG);
-t("kindest/node: privileged mode, and Kiri's Kubernetes instead", () => {
+t("kindest/node: privileged mode, and Kiribra's Kubernetes instead", () => {
   if (!/This image needs privileged mode/.test(box()?.textContent)) throw new Error(box()?.textContent);
   if (!/mount: \/sys: permission denied/.test(box().querySelector("q").textContent)) throw new Error("quote");
   if (document.getElementById("fix-val")) throw new Error("offers a field");

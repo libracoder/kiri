@@ -16,7 +16,7 @@ t("the page is in Chinese", () => {
   if (!/[一-鿿]/.test(document.querySelector("nav [data-view=containers]").textContent)) throw new Error("the sidebar isn't");
 });
 for (const v of ["containers", "images", "volumes", "networks", "builds", "share"]) { show(v); check(`the ${v} view`); }
-// The USB view, with its beta note, a device in Kiri and one on the Mac (the
+// The USB view, with its beta note, a device in Kiribra and one on the Mac (the
 // note under the list is the host's, worded in the window's language there).
 show("usb");
 kiri.on({ type: "usb", can: "attach", devices: [

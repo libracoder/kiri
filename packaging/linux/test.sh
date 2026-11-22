@@ -1,7 +1,7 @@
 #!/bin/bash
-# Checks the packages build.sh made, without touching this machine's own Kiri:
+# Checks the packages build.sh made, without touching this machine's own Kiribra:
 #   DOCKER_HOST=unix:///run/kiri/docker.sock packaging/linux/test.sh <outdir> [docker CLI] [static docker CLI dir]
-# Needs any Docker-compatible engine (Kiri itself works) and, for the package
+# Needs any Docker-compatible engine (Kiribra itself works) and, for the package
 # listings, dpkg-deb and rpm on this machine.
 # For each of kiri-lite and kiri:
 # 1. lists the .deb and .rpm and their scripts;
@@ -58,10 +58,10 @@ test_package() { # name full(0|1)
   step "$c" "/var/lib/kiri is 710, not world-readable" "test \"\$(stat -c %a /var/lib/kiri)\" = 710"
   local cli
   if [ "$full" = 1 ]; then
-    step "$c" "/usr/bin/docker is Kiri's, through update-alternatives" "readlink -f /usr/bin/docker | grep -q /usr/libexec/kiri/docker"
+    step "$c" "/usr/bin/docker is Kiribra's, through update-alternatives" "readlink -f /usr/bin/docker | grep -q /usr/libexec/kiri/docker"
     step "$c" "docker version, no DOCKER_HOST needed" "for i in \$(seq 30); do docker version >/dev/null 2>&1 && break; sleep 1; done; docker version --format '{{.Server.Os}}' | grep -q linux"
     step "$c" "docker compose and buildx plugins found" "docker compose version | grep -q 'v5' && docker buildx version | grep -q 'v0.38'"
-    step "$c" "DOCKER_HOST set by the user wins over Kiri's default" "DOCKER_HOST=unix:///nonexistent docker version 2>&1 | grep -q nonexistent"
+    step "$c" "DOCKER_HOST set by the user wins over Kiribra's default" "DOCKER_HOST=unix:///nonexistent docker version 2>&1 | grep -q nonexistent"
     cli=docker
   elif [ -n "$clidir" ]; then
     step "$c" "docker version through the socket" "for i in \$(seq 30); do /opt/docker/docker -H unix:///run/kiri/docker.sock version >/dev/null 2>&1 && break; sleep 1; done; /opt/docker/docker -H unix:///run/kiri/docker.sock version --format '{{.Server.Os}}' | grep -q linux"

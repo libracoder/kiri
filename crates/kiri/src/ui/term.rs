@@ -1,5 +1,5 @@
 //! The built-in terminal's shells on the Mac and Linux: each tab or pane is
-//! a shell on its own pseudo-terminal, in the home folder, with Kiri's
+//! a shell on its own pseudo-terminal, in the home folder, with Kiribra's
 //! tools first on the PATH. What goes to and from the page is in
 //! termwire.rs; Windows does the same with a ConPTY (kiri-win's term.rs).
 
@@ -106,7 +106,7 @@ fn end(s: &Session) {
 
 /// A program on its own pseudo-terminal, for a sign-in that wants one
 /// (weblogin.rs): what it prints, what to type to it, a way to stop it, and
-/// its exit code. Kiri's tools first on the PATH, as for a shell.
+/// its exit code. Kiribra's tools first on the PATH, as for a shell.
 pub fn captured(program: &Path, args: &[&str]) -> std::io::Result<super::weblogin::Run> {
     let (master, slave_path) = new_pty()?;
     let master = Arc::new(File::from(master));
@@ -248,8 +248,8 @@ fn executable(p: &Path) -> bool {
     std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
-/// Kiri's own tools, put first on the shell's PATH: `kiri`, `docker` and
-/// the rest of what Kiri installs, and the copies inside the app.
+/// Kiribra's own tools, put first on the shell's PATH: `kiri`, `docker` and
+/// the rest of what Kiribra installs, and the copies inside the app.
 fn tool_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     if let Some(home) = std::env::var_os("HOME") {
@@ -354,7 +354,7 @@ fn open(id: &str, shell: &Path, cols: u16, rows: u16, emit: fn(String)) -> std::
     }
     let path = std::env::var_os("PATH").unwrap_or_default();
     let path = std::env::join_paths(tool_dirs().into_iter().chain(std::env::split_paths(&path))).unwrap_or(path);
-    cmd.env("PATH", path).env("TERM", "xterm-256color").env("COLORTERM", "truecolor").env("TERM_PROGRAM", "Kiri").env_remove("TERM_PROGRAM_VERSION");
+    cmd.env("PATH", path).env("TERM", "xterm-256color").env("COLORTERM", "truecolor").env("TERM_PROGRAM", "Kiribra").env_remove("TERM_PROGRAM_VERSION");
     if std::env::var_os("LANG").is_none() {
         cmd.env("LANG", "en_US.UTF-8");
     }
@@ -542,7 +542,7 @@ mod tests {
 
         handle("open", "t1", &serde_json::json!({"shell": "/bin/bash", "cols": 91, "rows": 17}), record);
         let typed = |s: &str| handle("input", "t1", &Value::String(termwire::b64(s.as_bytes())), record);
-        // A terminal of the size asked for, Kiri's tools on the PATH, and
+        // A terminal of the size asked for, Kiribra's tools on the PATH, and
         // the TERM programs expect.
         typed("stty size; echo \"T=$TERM\"; test -t 0 && echo IS-A-TTY; echo DONE$((40+2))\n");
         let (out, _) = output_until(&rx, "t1", "DONE42");

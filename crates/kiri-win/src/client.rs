@@ -73,7 +73,7 @@ impl Response {
 fn head(r: &mut impl BufRead) -> io::Result<(u16, Option<usize>, bool)> {
     let mut line = String::new();
     r.read_line(&mut line)?;
-    let status = line.split_whitespace().nth(1).and_then(|s| s.parse().ok()).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Kiri is not answering"))?;
+    let status = line.split_whitespace().nth(1).and_then(|s| s.parse().ok()).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Kiribra is not answering"))?;
     let (mut len, mut chunked) = (None, false);
     loop {
         line.clear();
@@ -128,7 +128,7 @@ pub fn request(method: &str, path: &str, body: Option<&Value>) -> io::Result<Res
 /// The header that marks a request as the window's own (`background`):
 /// refreshing a list never counts as use of the engine.
 fn background_header(background: bool) -> &'static str {
-    if background { "X-Kiri-Background: 1\r\n" } else { "" }
+    if background { "X-Kiribra-Background: 1\r\n" } else { "" }
 }
 
 /// One request, marked as the window's own when `background`.
@@ -177,8 +177,8 @@ pub fn request_within(method: &str, path: &str, body: Option<&Value>, background
     Ok(Response { status, body })
 }
 
-/// Kiri's own version from a `/version` answer: `KiriVersion`, or `Version`
-/// from an engine older than that field (it reported Kiri's version there;
+/// Kiribra's own version from a `/version` answer: `KiriVersion`, or `Version`
+/// from an engine older than that field (it reported Kiribra's version there;
 /// it is now the Docker Engine version clients gate on).
 pub fn kiri_version(version: &Value) -> Option<&str> {
     version["KiriVersion"].as_str().or_else(|| version["Version"].as_str())
@@ -211,7 +211,7 @@ pub fn get_background(path: &str) -> io::Result<Value> {
     Ok(r.json())
 }
 
-/// The docker CLI Kiri ships, as the Mac's `docker_cli` (for builds.rs).
+/// The docker CLI Kiribra ships, as the Mac's `docker_cli` (for builds.rs).
 pub fn docker_cli() -> Option<String> {
     Some(crate::detail::docker_cli())
 }

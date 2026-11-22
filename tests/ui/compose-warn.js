@@ -1,7 +1,7 @@
 // parity: macos windows linux
-// A project carrying a warning (a file Kiri can't check with a secret hidden) says it under the
+// A project carrying a warning (a file Kiribra can't check with a secret hidden) says it under the
 // project's tabs and on its row in the list; a healthy project has nothing there at all.
-const WANT = "Kiri can't check this file with DB_PASSWORD hidden. Compose accepts it, so Apply still works.";
+const WANT = "Kiribra can't check this file with DB_PASSWORD hidden. Compose accepts it, so Apply still works.";
 const R = [];
 const t = (name, fn) => { try { fn(); R.push("PASS " + name); } catch (e) { R.push("FAIL " + name + ": " + e.message); } };
 const eq = (a, b, m) => { if (JSON.stringify(a) !== JSON.stringify(b)) throw new Error(m + ": got " + JSON.stringify(a) + " want " + JSON.stringify(b)); };
@@ -11,7 +11,7 @@ const ctr = (p) => ({ Id: p + "-db", Names: [`/${p}-db-1`], Image: "postgres:16"
 kiri.on({ type: "lists", containers: [ctr("shop"), ctr("vault")], images: [], volumes: [], networks: [] });
 const services = [{ name: "db", image: "postgres:16", build: "", ports: [], volumes: [], depends: [], networks: ["default"], kinds: [] }];
 const proj = (name, o = {}) => ({ name, dir: "/w/" + name, files: [`/w/${name}/compose.yaml`], readable: true, updated: 1, services, containers: [{ service: "db", id: name + "-db", name: `${name}-db-1`, image: "postgres:16", state: "running", status: "Up" }], ...o });
-const WARN = { text: "Kiri can't check this file with DB_PASSWORD hidden. Compose accepts it, so Apply still works.", errkey: "hiddenCheck", errargs: { name: "DB_PASSWORD" } };
+const WARN = { text: "Kiribra can't check this file with DB_PASSWORD hidden. Compose accepts it, so Apply still works.", errkey: "hiddenCheck", errargs: { name: "DB_PASSWORD" } };
 kiri.on({ type: "composeprojects", logos: {}, projects: [proj("shop"), proj("vault", { warn: WARN })] });
 show("compose");
 const TABS = ["structure", "services", "file", "logs"];
@@ -23,7 +23,7 @@ const each = (name, want) => {
 t("a healthy project: nothing under the tabs on any tab, no stray text node", () => {
   eq(each("shop"), TABS.map((k) => [k, "", 0]), "the warning box on each tab");
 });
-t("a project Kiri can't check with a secret hidden: the warning in the window's language, on every tab", () => {
+t("a project Kiribra can't check with a secret hidden: the warning in the window's language, on every tab", () => {
   eq(each("vault"), TABS.map((k) => [k, WANT, 0]), "the warning box on each tab");
   eq($("content").textContent.includes("NaN"), false, "no NaN on the page");
 });

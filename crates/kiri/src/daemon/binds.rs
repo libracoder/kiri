@@ -152,7 +152,7 @@ pub fn source(src: &str, wsl: &Wsl) -> Result<String, Error> {
             return Err(bad("no WSL distro named"));
         }
         if let Some(ours) = wsl.distro.as_deref().filter(|d| !d.eq_ignore_ascii_case(distro)) {
-            return Err(bad(&format!("it is in the WSL distro {distro}, and Kiri runs in {ours}; use a path on a Windows drive or in {ours}")));
+            return Err(bad(&format!("it is in the WSL distro {distro}, and Kiribra runs in {ours}; use a path on a Windows drive or in {ours}")));
         }
         return Ok(clean(&format!("/{inner}")));
     }
@@ -163,7 +163,7 @@ pub fn source(src: &str, wsl: &Wsl) -> Result<String, Error> {
     if !src.contains('\\') && host != "." && host != "?" && !host.is_empty() && !path.is_empty() {
         return Ok(clean(&format!("/{rest}")));
     }
-    Err(bad("Kiri's WSL can reach the Windows drives (C:\\…) and its own files, not network shares or devices"))
+    Err(bad("Kiribra's WSL can reach the Windows drives (C:\\…) and its own files, not network shares or devices"))
 }
 
 /// A path on drive `letter`, under WSL's automount root.
@@ -193,7 +193,7 @@ const VM_ENGINE_SOCK: &str = "/run/host-services/docker.sock";
 
 /// The paths clients mean as "the engine" when they mount it into a
 /// container: Docker's own, and on the Mac the socket the client was given
-/// (`DOCKER_HOST=unix://~/.kiri/run/docker.sock`, which Testcontainers
+/// (`DOCKER_HOST=unix://~/.kiribra/run/docker.sock`, which Testcontainers
 /// mounts into Ryuk).
 const ENGINE_SOCKS: &[&str] = &["/var/run/docker.sock", "/run/docker.sock", "/private/var/run/docker.sock"];
 
@@ -201,7 +201,7 @@ const ENGINE_SOCKS: &[&str] = &["/var/run/docker.sock", "/run/docker.sock", "/pr
 /// Mac the VM's relay to this daemon, as Docker Desktop and OrbStack give
 /// the VM's engine. On a Linux host (and WSL) a socket at that path is
 /// mounted as it is, as Docker does (Docker's own, or the package's link to
-/// Kiri); a missing `/var/run/docker.sock` is Kiri's, rather than a new
+/// Kiribra); a missing `/var/run/docker.sock` is Kiribra's, rather than a new
 /// empty directory.
 pub fn engine_socket(src: &str) -> Option<String> {
     let own = super::socket_path().ok()?;
@@ -359,11 +359,11 @@ mod tests {
     #[test]
     fn wsl_and_pipe_sources() {
         assert_eq!(ok(r"\\wsl$\kiri\home\me:/app"), t("/home/me", "/app", ""));
-        assert_eq!(ok(r"\\wsl.localhost\Kiri\home\me\:/app:ro"), t("/home/me", "/app", "ro"));
+        assert_eq!(ok(r"\\wsl.localhost\Kiribra\home\me\:/app:ro"), t("/home/me", "/app", "ro"));
         assert_eq!(ok("//wsl.localhost/kiri/srv:/srv"), t("/srv", "/srv", ""));
         assert_eq!(ok(r"\\.\pipe\docker_engine:/var/run/docker.sock"), t("/var/run/docker.sock", "/var/run/docker.sock", ""));
         assert_eq!(ok("//var/run/docker.sock:/var/run/docker.sock:rw"), t("/var/run/docker.sock", "/var/run/docker.sock", "rw"));
-        // Distro unknown: taken as Kiri's own.
+        // Distro unknown: taken as Kiribra's own.
         let any = Wsl { root: "/mnt/".into(), distro: None };
         assert_eq!(split(r"\\wsl$\Ubuntu\home:/h", Some(&any)).unwrap(), t("/home", "/h", ""));
     }
@@ -425,8 +425,8 @@ mod tests {
         let all = |_: &str| true;
         #[cfg(target_os = "macos")]
         {
-            let own = "/Users/me/.kiri/run/docker.sock";
-            for s in ["/var/run/docker.sock", "/private/var/run/docker.sock", "/run/docker.sock", own, "/Users/me/.kiri/run//docker.sock"] {
+            let own = "/Users/me/.kiribra/run/docker.sock";
+            for s in ["/var/run/docker.sock", "/private/var/run/docker.sock", "/run/docker.sock", own, "/Users/me/.kiribra/run//docker.sock"] {
                 assert_eq!(engine_socket_for(s, own, all).as_deref(), Some(VM_ENGINE_SOCK), "{s}");
             }
             assert_eq!(engine_socket_for("/Users/me/.orbstack/run/docker.sock", own, none), None);
@@ -436,7 +436,7 @@ mod tests {
             let own = "/run/kiri/docker.sock";
             assert_eq!(engine_socket_for("/var/run/docker.sock", own, none).as_deref(), Some(own));
             assert_eq!(engine_socket_for("/run/docker.sock", own, none).as_deref(), Some(own));
-            // Docker's socket, or the package's link to Kiri's: mounted as it is.
+            // Docker's socket, or the package's link to Kiribra's: mounted as it is.
             assert_eq!(engine_socket_for("/var/run/docker.sock", own, all), None);
             assert_eq!(engine_socket_for(own, own, all), None);
         }

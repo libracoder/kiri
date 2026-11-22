@@ -1,5 +1,5 @@
 #!/bin/bash
-# Kiri for Windows, without Windows: copies target/kiri-windows-x86_64 (what
+# Kiribra for Windows, without Windows: copies target/kiri-windows-x86_64 (what
 # `cargo xtask windows` makes) into an x86-64 Ubuntu container standing in
 # for the WSL2 distro, runs its install.sh as a Windows user would, then
 # drives the engine from a second container with only the docker CLI,
@@ -15,7 +15,7 @@ ARCH=${1:-x86_64}
 case $ARCH in x86_64) PLATFORM=linux/amd64 ;; aarch64) PLATFORM=linux/arm64 ;; *) echo "usage: $0 [x86_64|aarch64]"; exit 2 ;; esac
 DIR=$(cd "$(dirname "$0")/.." && pwd)/target/kiri-windows-$ARCH
 [ -x "$DIR/kiri" ] || { echo "build first: cargo xtask windows (--arch arm64 for aarch64)"; exit 1; }
-SOCK=/var/lib/kiri-daemon/.kiri/run
+SOCK=/var/lib/kiri-daemon/.kiribra/run
 # The containers' and volumes' name prefix: another runs a second copy beside this one.
 W=${W:-kiri-wsl}
 $D rm -f $W $W-cli >/dev/null 2>&1
@@ -27,7 +27,7 @@ $D volume rm $W-run $W-lib $W-store >/dev/null 2>&1
 kiri_seed_images --platform $PLATFORM ubuntu:24.04 || echo "wsl: ubuntu:24.04 ($PLATFORM) could not be fetched"
 kiri_seed_images alpine:latest || echo "wsl: alpine could not be fetched"
 # WSL's disk is ext4; this container's own root is overlayfs, which can't be
-# an overlay's upper layer, so Kiri's state goes on volumes, as in
+# an overlay's upper layer, so Kiribra's state goes on volumes, as in
 # linux-host.sh.
 $D run -d --name "$W" --platform $PLATFORM --privileged --tmpfs /run -v $W-run:$SOCK \
   -v $W-lib:/var/lib/kiri -v $W-store:/var/lib/kiri-daemon/.local/share/kiri ubuntu:24.04 sleep infinity >/dev/null

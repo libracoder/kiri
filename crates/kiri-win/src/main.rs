@@ -1,9 +1,9 @@
-//! kiri-win: Kiri's Windows side. Serves the Docker API on a named pipe,
+//! kiri-win: Kiribra's Windows side. Serves the Docker API on a named pipe,
 //! `\\.\pipe\kiri`, and carries each connection into WSL2 over one
 //! long-lived `wsl.exe -u root -- kiri bridge`, multiplexed. TCP through
 //! WSL's localhost relay loses half-closes, which `docker run` and
 //! `attach` depend on; the pipe and the bridge keep them. It is also
-//! Kiri's window and tray icon.
+//! Kiribra's window and tray icon.
 //!
 //!   kiri-win [--background] [--distro NAME] [--pipe \\.\pipe\kiri] [--socket PATH] [--kiri PATH]
 //!
@@ -33,6 +33,8 @@ mod detail;
 mod dns;
 #[cfg(windows)]
 mod engine;
+#[cfg(windows)]
+mod webctl;
 #[cfg(windows)]
 mod pipe;
 #[cfg(windows)]
@@ -66,12 +68,12 @@ mod diag;
 #[path = "../../kiri/src/builds.rs"]
 #[allow(dead_code)]
 mod builds;
-// Which builder plain `docker build` uses, Docker's or Kiri's: the Mac's
+// Which builder plain `docker build` uses, Docker's or Kiribra's: the Mac's
 // and Linux's own crates/kiri/src/buildwith.rs.
 #[cfg(windows)]
 #[path = "../../kiri/src/buildwith.rs"]
 mod buildwith;
-// Kiri's program moved or deleted from where it started: the Mac's and
+// Kiribra's program moved or deleted from where it started: the Mac's and
 // Linux's own crates/kiri/src/appwatch.rs.
 #[cfg(windows)]
 #[path = "../../kiri/src/appwatch.rs"]
@@ -93,7 +95,7 @@ mod daemon {
 }
 #[cfg(windows)]
 mod wslconfig;
-// Kiri Dev's names (the window on Windows is always Kiri) and Share, the
+// Kiribra Dev's names (the window on Windows is always Kiribra) and Share, the
 // Mac's own files: crates/kiri/src/flavor.rs and share.rs.
 #[cfg(windows)]
 #[path = "../../kiri/src/flavor.rs"]
@@ -124,7 +126,7 @@ fn main() -> std::process::ExitCode {
     // Load DLLs only from System32, not from the folder kiri-win runs from.
     win::harden_dll_search();
     // Uninstalling (contrib/windows/kiri.ps1): docker build's own builder
-    // back as it was before Kiri changed it, and nothing else.
+    // back as it was before Kiribra changed it, and nothing else.
     if std::env::args().any(|a| a == "--uninstall-builds") {
         return match buildwith::places().and_then(|p| p.uninstall()) {
             Ok(()) => std::process::ExitCode::SUCCESS,
@@ -146,9 +148,9 @@ fn main() -> std::process::ExitCode {
         };
     }
     // An update Later staged that the last quit didn't install: in now, and
-    // the helper opens the new Kiri once this process has gone.
+    // the helper opens the new Kiribra once this process has gone.
     // A staged update goes in before anything else, once: if the helper
-    // that was left to install it failed, Kiri starts as it is and the
+    // that was left to install it failed, Kiribra starts as it is and the
     // window offers the update again rather than quitting on every launch.
     if update::staged().is_some() && !update::attempted() {
         match update::install_staged() {
@@ -158,7 +160,7 @@ fn main() -> std::process::ExitCode {
     }
     let cfg = serve::Config::from_args();
     let background = std::env::args().any(|a| a == "--background");
-    // First run (or Kiri's Linux gone): the window opens on setup. Naming a
+    // First run (or Kiribra's Linux gone): the window opens on setup. Naming a
     // distro (--distro) is for development and skips it.
     let setup = !std::env::args().any(|a| a == "--distro") && setup::needed();
     serve::set_setup_pending(setup);
@@ -170,7 +172,7 @@ fn main() -> std::process::ExitCode {
             }
             return std::process::ExitCode::SUCCESS;
         }
-        // No Kiri to show: whatever holds the name is not Kiri, and docker
+        // No Kiribra to show: whatever holds the name is not Kiribra, and docker
         // commands would talk to it as if it were. Say so and stop.
         let msg = format!("pipe: {e}; not starting");
         serve::log(&msg);
@@ -184,9 +186,9 @@ fn main() -> std::process::ExitCode {
     engine::start(engine::Env { distro: cfg.distro.clone(), pipe: cfg.pipe.clone() });
     // Its folder renamed, moved or deleted around it (Windows won't delete
     // a running program itself): docker build handed back as it was before
-    // Kiri took it, the choice kept for when Kiri runs again, and Kiri quits.
+    // Kiribra took it, the choice kept for when Kiribra runs again, and Kiribra quits.
     appwatch::watch(|exe| {
-        serve::log(&format!("{} is gone from where Kiri started; handing docker build back and quitting", exe.display()));
+        serve::log(&format!("{} is gone from where Kiribra started; handing docker build back and quitting", exe.display()));
         if let Err(e) = buildwith::places().and_then(|p| p.give_back()) {
             serve::log(&format!("docker build not handed back: {e}"));
         }

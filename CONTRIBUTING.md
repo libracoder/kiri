@@ -1,15 +1,15 @@
-# Contributing to Kiri
+# Contributing to Kiribra
 
 Thanks for helping. Issues and pull requests are welcome.
 
 ## Before you start
 
 For anything larger than a small fix, open an issue first so we can agree on
-the approach, and wait for that before you write the code. Kiri aims to be
+the approach, and wait for that before you write the code. Kiribra aims to be
 small and fast: changes that add a dependency, a background process or
 startup time need a good reason.
 
-Bug reports need the Kiri version and system, the exact commands you ran and
+Bug reports need the Kiribra version and system, the exact commands you ran and
 the output you got, as the issue form asks. A report we can't reproduce, or a
 problem found only by reading the code, may be closed until it can be shown
 on a real machine.
@@ -73,8 +73,8 @@ resolver an address of its own on `lo`) and puts the host back afterwards.
 
 - A feature comes in one pull request, for all three systems, built and
   tested on each of them before it's merged.
-- No `if (WIN)` or Kiri Dev (`flavor::dev()`) gate that hides a feature from
-  a system or from Kiri. Words may differ by system ("Show in Finder"); what
+- No `if (WIN)` or Kiribra Dev (`flavor::dev()`) gate that hides a feature from
+  a system or from Kiribra. Words may differ by system ("Show in Finder"); what
   the window offers may not. Plumbing (contexts, update URLs) may differ.
 - `python3 scripts/ui-test.py` must pass. Its parity test opens the window as
   each system and fails when one shows something another doesn't, unless
@@ -84,7 +84,7 @@ resolver an address of its own on `lo`) and puts the host back afterwards.
 
 ## Speed is a feature
 
-Kiri is small and fast on purpose, and every pull request is checked for it.
+Kiribra is small and fast on purpose, and every pull request is checked for it.
 The Speed check builds main and your change, runs both engines side by side
 on one machine and compares them: `docker run`, API round trips, the daemon's
 memory, the system calls one container costs, and the binaries' size. It

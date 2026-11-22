@@ -1,6 +1,6 @@
-//! HTTPS for container names: `https://myapp.kiri.local`. Kiri keeps its own
-//! certificate authority in `~/.kiri/tls`, made once, whose name constraints
-//! let it vouch for `*.kiri.local` and `*.kiri.localhost` only, so even its
+//! HTTPS for container names: `https://myapp.kiribra.local`. Kiribra keeps its own
+//! certificate authority in `~/.kiribra/tls`, made once, whose name constraints
+//! let it vouch for `*.kiribra.local` and `*.kiribra.localhost` only, so even its
 //! key could not impersonate any other site. The router (domains.rs) asks
 //! for a certificate per name as browsers connect (SNI), signed here on
 //! first use. macOS trusts the authority once the user says so in Settings
@@ -22,8 +22,8 @@ use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 
 /// The authority's name, as Keychain Access shows it.
-pub const CA_NAME: &str = "Kiri Local Certificate Authority";
-const SUFFIXES: [&str; 2] = ["kiri.local", "kiri.localhost"];
+pub const CA_NAME: &str = "Kiribra Local Certificate Authority";
+const SUFFIXES: [&str; 2] = ["kiribra.local", "kiribra.localhost"];
 
 pub fn dir() -> Option<PathBuf> {
     super::state_dir().ok().map(|d| d.join("tls"))
@@ -41,12 +41,12 @@ fn ca_params() -> Result<CertificateParams, rcgen::Error> {
     let mut p = CertificateParams::new(Vec::<String>::new())?;
     p.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
     p.distinguished_name.push(DnType::CommonName, CA_NAME);
-    p.distinguished_name.push(DnType::OrganizationName, "Kiri");
+    p.distinguished_name.push(DnType::OrganizationName, "Kiribra");
     p.name_constraints = Some(NameConstraints {
         permitted_subtrees: SUFFIXES.iter().map(|s| GeneralSubtree::DnsName((*s).to_owned())).collect(),
         // Exclude every IP address: with only the DNS subtrees permitted, an
         // IP SAN would otherwise be unconstrained, so a leaked CA key could
-        // vouch for https://<any IP>. Kiri only ever issues for its own names.
+        // vouch for https://<any IP>. Kiribra only ever issues for its own names.
         excluded_subtrees: vec![
             GeneralSubtree::IpAddress(CidrSubnet::V4([0; 4], [0; 4])),
             GeneralSubtree::IpAddress(CidrSubnet::V6([0; 16], [0; 16])),
@@ -62,7 +62,7 @@ fn err(e: rcgen::Error) -> io::Error {
     io::Error::other(e.to_string())
 }
 
-/// The authority: loaded from `~/.kiri/tls`, or made there the first time.
+/// The authority: loaded from `~/.kiribra/tls`, or made there the first time.
 fn authority() -> io::Result<(Issuer<'static, KeyPair>, CertificateDer<'static>)> {
     let dir = dir().ok_or_else(|| io::Error::other("HOME is not set"))?;
     let (cert_path, key_path) = (dir.join("ca.pem"), dir.join("ca-key.pem"));
@@ -214,7 +214,7 @@ pub fn server_config() -> io::Result<Arc<rustls::ServerConfig>> {
 /// The last answer to `trusted()`, and when.
 static TRUST: Mutex<Option<(Instant, bool)>> = Mutex::new(None);
 
-/// Whether macOS trusts Kiri's authority for this user, asked at most every
+/// Whether macOS trusts Kiribra's authority for this user, asked at most every
 /// few seconds. It is this authority's own certificate that must be trusted:
 /// a replaced authority (see `CA_VERSION`) has the same name as the old one,
 /// which stays trusted until removed, so matching by name would say yes while
@@ -252,7 +252,7 @@ fn current_ca_trusted() -> bool {
     false
 }
 
-/// Trusting Kiri's authority is the Mac keychain's; Linux's stores aren't wired yet.
+/// Trusting Kiribra's authority is the Mac keychain's; Linux's stores aren't wired yet.
 #[cfg(not(target_os = "macos"))]
 pub fn trust() -> io::Result<()> {
     Err(io::Error::other("HTTPS for containers isn't on Linux yet"))
@@ -266,7 +266,7 @@ pub fn untrust() -> io::Result<()> {
 #[cfg(target_os = "macos")]
 /// Makes the authority (if needed) and asks macOS to trust it for websites.
 /// macOS shows its own password prompt. The trust is set in this process,
-/// not through `security add-trusted-cert`, so the prompt names Kiri.
+/// not through `security add-trusted-cert`, so the prompt names Kiribra.
 pub fn trust() -> io::Result<()> {
     let (_, der) = authority()?;
     let ca = ca_path().ok_or_else(|| io::Error::other("HOME is not set"))?;
@@ -430,10 +430,10 @@ mod tests {
 
     #[test]
     fn only_kiri_names() {
-        assert!(super::ours("myapp.kiri.local"));
-        assert!(super::ours("web.shop.kiri.localhost"));
-        assert!(!super::ours("kiri.local"));
+        assert!(super::ours("myapp.kiribra.local"));
+        assert!(super::ours("web.shop.kiribra.localhost"));
+        assert!(!super::ours("kiribra.local"));
         assert!(!super::ours("example.com"));
-        assert!(!super::ours("evil.kiri.local.example.com"));
+        assert!(!super::ours("evil.kiribra.local.example.com"));
     }
 }

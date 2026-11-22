@@ -19,7 +19,7 @@ const P = [
   { name: "draft", dir: "/w/draft", files: ["/w/draft/compose.yaml"], readable: true, fresh: true, services: [svc("front", "nginx:alpine")], containers: [] },
 ];
 ui.vm = "running";
-kiri.on({ type: "status", version: "0.1.4", dev: true, share: true, app: "Kiri", ours: "kiri", context: "kiri" });
+kiri.on({ type: "status", version: "0.1.4", dev: true, share: true, app: "Kiribra", ours: "kiri", context: "kiri" });
 kiri.on({ type: "lists", containers: ctrs, images: [], volumes: [], networks: [] });
 kiri.on({ type: "composeprojects", logos: {}, projects: P });
 show("compose");

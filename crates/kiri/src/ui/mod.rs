@@ -1,4 +1,5 @@
-//! `kiri ui`: a tiny native window over `kiri daemon`.
+//! `kiri ui`: a tiny native window over `kiri daemon`, or the same page in a
+//! browser (`kiri ui --web`).
 //!
 //! The system's own WebKit in a native window: AppKit through objc2 on the
 //! Mac (`mac.rs`), GTK on Linux (`gtk.rs`). No UI framework and no bundled
@@ -6,6 +7,8 @@
 //! with hand-written CSS. It sends JSON commands with
 //! `webkit.messageHandlers.kiri.postMessage('{"cmd":"start"}')`, and the
 //! engine thread pushes JSON events back with `kiri.on({...})`.
+//! [`web`] serves that page over HTTP and carries the same JSON on a
+//! WebSocket, so localhost or LAN browsers match the desktop window.
 
 use std::fmt::Write as _;
 use std::io;
@@ -50,6 +53,8 @@ mod weblogin;
 mod needs;
 mod sharing;
 mod usage;
+mod web;
+mod webctl;
 
 use crate::client;
 use crate::diag;
@@ -87,7 +92,7 @@ enum Cmd {
     RemoveNetwork(String),
     /// Settings → About: the engine's details.
     About,
-    /// Settings → Domains: turn `*.kiri.local` on or off (asks for the password).
+    /// Settings → Domains: turn `*.kiribra.local` on or off (asks for the password).
     Domains(bool),
     /// New published ports for a container: `[{container_port, host_port, proto, host_ip}]`.
     Ports { id: String, ports: serde_json::Value },
@@ -166,9 +171,9 @@ fn local_url(c: &serde_json::Value) -> Option<String> {
         return None;
     }
     let label = |k: &str| c["Labels"][k].as_str().unwrap_or("");
-    let suffix = if crate::daemon::dns::installed() { "kiri.local" } else { "kiri.localhost" };
+    let suffix = if crate::daemon::dns::installed() { "kiribra.local" } else { "kiribra.localhost" };
     let chosen = label("dev.kiri.domain").split(',').next().unwrap_or("").trim();
-    let chosen = chosen.strip_suffix(".kiri.localhost").or_else(|| chosen.strip_suffix(".kiri.local")).unwrap_or(chosen);
+    let chosen = chosen.strip_suffix(".kiribra.localhost").or_else(|| chosen.strip_suffix(".kiribra.local")).unwrap_or(chosen);
     let name = c["Names"][0].as_str().unwrap_or("").trim_start_matches('/');
     let host = match (chosen, label("com.docker.compose.project")) {
         (c, _) if !c.is_empty() => c.to_owned(),
@@ -181,7 +186,34 @@ fn local_url(c: &serde_json::Value) -> Option<String> {
 
 /// Delivers one JSON event to the page. Callable from any thread.
 fn emit(json: String) {
+    if web::serving() {
+        web::broadcast(&json);
+        return;
+    }
     window::eval(format!("window.kiri && kiri.on({json})"));
+}
+
+/// Runs JavaScript in the page (native window) or as a WebSocket `eval` event.
+fn host_eval(js: String) {
+    if web::serving() {
+        web::eval(&js);
+    } else {
+        window::eval(js);
+    }
+}
+
+fn host_copy(text: &str) {
+    if web::serving() {
+        web::copy(text);
+    } else {
+        window::copy(text);
+    }
+}
+
+/// `kiri ui --web …`: the same page in a browser on localhost or the LAN.
+pub fn run_web(args: &[String]) -> io::Result<()> {
+    let opts = web::parse_opts(args).map_err(io::Error::other)?;
+    web::run(opts)
 }
 
 fn state(name: &str, error: Option<&str>) -> String {
@@ -233,7 +265,7 @@ fn engine(rx: Receiver<Cmd>, tx: Sender<Cmd>) {
                 emit(state("booting", None));
                 match ensure_daemon().and_then(|()| expect_ok(client::request("POST", "/kiri/wake", None))) {
                     Ok(()) => {
-                        // `docker build` through Kiri, if setup ran before the daemon was up.
+                        // `docker build` through Kiribra, if setup ran before the daemon was up.
                         std::thread::spawn(setup::ensure_builder);
                         refresh(&mut connected);
                     }
@@ -334,8 +366,8 @@ fn engine(rx: Receiver<Cmd>, tx: Sender<Cmd>) {
                 // Cancelling macOS's password prompt is a choice, not an error.
                 match result {
                     Err(e) if !e.to_string().contains("-128") => emit(notice("error", &trf("Could not change container names: {error}", &[("error", &e)]))),
-                    _ if crate::daemon::dns::installed() => emit(notice("ok", &tr("Containers now answer at <name>.kiri.local"))),
-                    _ if !on => emit(notice("ok", &tr("Containers answer at <name>.kiri.localhost"))),
+                    _ if crate::daemon::dns::installed() => emit(notice("ok", &tr("Containers now answer at <name>.kiribra.local"))),
+                    _ if !on => emit(notice("ok", &tr("Containers answer at <name>.kiribra.localhost"))),
                     _ => {}
                 }
                 // /var/run/docker.sock was asked for with the same password.
@@ -424,7 +456,7 @@ pub(crate) fn reveal(path: &std::path::Path) {
     }
 }
 
-/// Kiri's folder in the home directory, ~/.kiri: the window's settings and
+/// Kiribra's folder in the home directory, ~/.kiribra: the window's settings and
 /// files. On the Mac the engine's socket is in it too; on Linux the engine is
 /// a system service with its socket in /run/kiri. `KIRI_SOCKET` moves it, as
 /// on the Mac (the tests use that).
@@ -435,7 +467,7 @@ pub(crate) fn state_dir() -> Option<std::path::PathBuf> {
     client::socket().ok()?.parent()?.parent().map(std::path::Path::to_path_buf)
 }
 
-/// Kiri opening for the first time on this account: no settings were saved
+/// Kiribra opening for the first time on this account: no settings were saved
 /// before this run. Worked out on the first read, before anything is saved.
 fn fresh() -> bool {
     static FRESH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -451,14 +483,14 @@ fn ask_language() {
     }
 }
 
-/// The window's settings, kept in ~/.kiri/ui.json: font, mono, scale.
+/// The window's settings, kept in ~/.kiribra/ui.json: font, mono, scale.
 fn prefs_path() -> Option<std::path::PathBuf> {
     let dir = state_dir()?;
     let _ = std::fs::create_dir_all(&dir);
     Some(dir.join("ui.json"))
 }
 
-/// The settings, with the defaults for what the person hasn't picked: Kiri
+/// The settings, with the defaults for what the person hasn't picked: Kiribra
 /// starts dark until Settings → Appearance says otherwise.
 pub(crate) fn prefs() -> serde_json::Value {
     fresh();
@@ -476,8 +508,8 @@ pub(crate) fn prefs() -> serde_json::Value {
 /// (crate::usb words it in English; these are its notes).
 fn usb_words(mut v: serde_json::Value) -> serde_json::Value {
     let note = match v["note"].as_str() {
-        Some("A device in Kiri is gone from the Mac until you detach it. In a container: --device /dev/ttyUSB0 (serial), /dev/input (HID) or /dev/bus/usb (raw).") => {
-            tr("A device in Kiri is gone from the Mac until you detach it. In a container: --device /dev/ttyUSB0 (serial), /dev/input (HID) or /dev/bus/usb (raw).")
+        Some("A device in Kiribra is gone from the Mac until you detach it. In a container: --device /dev/ttyUSB0 (serial), /dev/input (HID) or /dev/bus/usb (raw).") => {
+            tr("A device in Kiribra is gone from the Mac until you detach it. In a container: --device /dev/ttyUSB0 (serial), /dev/input (HID) or /dev/bus/usb (raw).")
         }
         Some("Containers run on this computer's own kernel, so they see its USB devices as they are: docker run --device with the path shown.") => {
             tr("Containers run on this computer's own kernel, so they see its USB devices as they are: docker run --device with the path shown.")
@@ -490,8 +522,8 @@ fn usb_words(mut v: serde_json::Value) -> serde_json::Value {
 
 /// Attach's and Detach's word back, in the window's language.
 fn usb_text(text: &str) -> String {
-    match text.strip_suffix(" is in Kiri") {
-        Some(name) => trf("{name} is in Kiri", &[("name", &name)]),
+    match text.strip_suffix(" is in Kiribra") {
+        Some(name) => trf("{name} is in Kiribra", &[("name", &name)]),
         None if text == "Given back to the Mac" => tr("Given back to the Mac"),
         None => text.to_owned(),
     }
@@ -508,7 +540,7 @@ fn trf(en: &str, vars: &[(&str, &dyn std::fmt::Display)]) -> String {
 }
 
 fn set_pref(name: &str, value: serde_json::Value) {
-    if !matches!(name, "font" | "mono" | "scale" | "termH" | "termFs" | "termFont" | "domainsAsked" | "theme" | "accent" | "importSeen" | "updateAuto" | "updateSkip" | "updateSnoozeUntil" | "columnWidths" | "crashReports" | "ctxSnooze" | "ctxBack" | "logSize" | "starAsked" | "setupSkip" | "lang" | "langAsked") {
+    if !matches!(name, "font" | "mono" | "scale" | "termH" | "termFs" | "termFont" | "domainsAsked" | "theme" | "accent" | "importSeen" | "updateAuto" | "updateSkip" | "updateSnoozeUntil" | "columnWidths" | "crashReports" | "ctxSnooze" | "ctxBack" | "logSize" | "starAsked" | "setupSkip" | "lang" | "langAsked" | "webUi" | "webUiLan" | "webUiPort") {
         return;
     }
     let Some(path) = prefs_path() else { return };
@@ -530,9 +562,9 @@ fn set_pref(name: &str, value: serde_json::Value) {
     all[name] = value;
     let tmp = path.with_extension("json.tmp");
     if std::fs::write(&tmp, all.to_string()).and_then(|()| std::fs::rename(&tmp, &path)).is_err() {
-        emit(notice("error", &tr("Could not save the setting to ~/.kiri/ui.json")));
+        emit(notice("error", &tr("Could not save the setting to ~/.kiribra/ui.json")));
     }
-    if name == "lang" {
+    if name == "lang" && !web::serving() {
         window::relang();
     }
 }
@@ -593,7 +625,7 @@ fn resources(save: Option<serde_json::Value>) {
     }
 }
 
-/// A docker CLI from elsewhere (Docker Desktop, OrbStack, Homebrew): Kiri
+/// A docker CLI from elsewhere (Docker Desktop, OrbStack, Homebrew): Kiribra
 /// Lite then has nothing to download. An app opened from Finder has a short
 /// PATH, so the usual places are looked at too.
 fn other_docker_cli() -> bool {
@@ -603,7 +635,7 @@ fn other_docker_cli() -> bool {
     dirs.iter().any(|d| d.join("docker").is_file())
 }
 
-/// Downloads Kiri Lite's tools in the background, with progress for the page.
+/// Downloads Kiribra Lite's tools in the background, with progress for the page.
 fn setup_tools() {
     std::thread::spawn(|| {
         let mut last = std::time::Instant::now();
@@ -646,7 +678,7 @@ fn update_check(manual: bool) {
     if !manual && !crate::flavor::dev()
         && let Some(p) = crate::stale::stale_kiri()
     {
-        emit(notice("error", &trf("{path} comes first on your PATH, so terminals run it instead of this Kiri. If it's an older Kiri, remove it: rm {path}", &[("path", &p.display())])));
+        emit(notice("error", &trf("{path} comes first on your PATH, so terminals run it instead of this Kiribra. If it's an older Kiribra, remove it: rm {path}", &[("path", &p.display())])));
     }
     if let Some(v) = crate::client::request("GET", "/version", None).ok().filter(|r| r.ok()).and_then(|r| crate::client::kiri_version(&r.json()).map(str::to_owned))
         && update::newer(env!("CARGO_PKG_VERSION"), &v)
@@ -656,7 +688,7 @@ fn update_check(manual: bool) {
         if manual {
             emit(serde_json::json!({"type": "enginestale", "version": v}).to_string());
         } else {
-            diag::info!("the engine runs an older Kiri; restarting it", engine = v, app = env!("CARGO_PKG_VERSION"));
+            diag::info!("the engine runs an older Kiribra; restarting it", engine = v, app = env!("CARGO_PKG_VERSION"));
             restart_engine_now();
         }
     }
@@ -686,7 +718,7 @@ fn restart_engine_now() {
 
 /// Whether the feed has a newer release, and one already staged; the
 /// window's check and the 6-hourly one (recheck.rs).
-fn feed_check(manual: bool) {    // Kiri Dev is rebuilt from source, never updated from the feed, unless
+fn feed_check(manual: bool) {    // Kiribra Dev is rebuilt from source, never updated from the feed, unless
     // KIRI_UPDATE_URL names a test feed (to try the update card and What's new).
     if crate::flavor::dev() && std::env::var_os("KIRI_UPDATE_URL").is_none() {
         if manual {
@@ -699,7 +731,7 @@ fn feed_check(manual: bool) {    // Kiri Dev is rebuilt from source, never updat
     // from the feed either: it would "update" back to the release it came from.
     if env!("CARGO_PKG_VERSION").contains("-dev") {
         if manual {
-            emit(notice("ok", &trf("Kiri {version} is a test build: it doesn't update itself", &[("version", &env!("CARGO_PKG_VERSION"))])));
+            emit(notice("ok", &trf("Kiribra {version} is a test build: it doesn't update itself", &[("version", &env!("CARGO_PKG_VERSION"))])));
         }
         update_state("test", None, None);
         return;
@@ -729,7 +761,7 @@ fn feed_check(manual: bool) {    // Kiri Dev is rebuilt from source, never updat
         Ok(_) => {
             update_state("uptodate", None, None);
             if manual {
-                emit(notice("ok", &trf("Kiri {version} is the newest version", &[("version", &env!("CARGO_PKG_VERSION"))])));
+                emit(notice("ok", &trf("Kiribra {version} is the newest version", &[("version", &env!("CARGO_PKG_VERSION"))])));
             }
         }
         Err(e) => {
@@ -782,6 +814,9 @@ fn update_restart() {
                 diag::error!("the engine did not restart on the update", version = version, error = e);
             }
             reopen_after_exit();
+            if web::serving() {
+                std::process::exit(0);
+            }
             window::quit();
         }
         Err(e) => emit(serde_json::json!({"type": "updateerror", "error": e.to_string()}).to_string()),
@@ -802,8 +837,8 @@ fn status_event() -> String {
         cfg["currentContext"].as_str().map(str::to_owned)
     });
     // Linux: docker's default endpoint is the standard socket, which leads to
-    // Kiri while no Docker engine has it (the package links it), and the
-    // package's docker goes to Kiri's socket: that is docker using Kiri, as
+    // Kiribra while no Docker engine has it (the package links it), and the
+    // package's docker goes to Kiribra's socket: that is docker using Kiribra, as
     // the setup checklist says, not "Docker's default engine".
     #[cfg(target_os = "linux")]
     let context = if context.as_deref().is_none_or(|c| c == "default") && linux::onboarding::docker_uses_kiri() { Some(crate::flavor::CONTEXT.get().to_owned()) } else { context };
@@ -813,7 +848,7 @@ fn status_event() -> String {
 /// Which names containers answer at now.
 fn domains_event() -> String {
     let on = crate::daemon::dns::installed();
-    serde_json::json!({"type": "domains", "on": on, "suffix": if on { "kiri.local" } else { "kiri.localhost" }, "https": crate::daemon::tls::trusted()}).to_string()
+    serde_json::json!({"type": "domains", "on": on, "suffix": if on { "kiribra.local" } else { "kiribra.localhost" }, "https": crate::daemon::tls::trusted()}).to_string()
 }
 
 /// Settings → About: this build, and the engine as the daemon reports it.
@@ -1058,7 +1093,7 @@ fn stop_engine() -> io::Result<()> {
     }
 }
 
-/// Whether Kiri was stopped (Stop in the window): then it stays off, even
+/// Whether Kiribra was stopped (Stop in the window): then it stays off, even
 /// when the window opens, until Start.
 fn engine_stopped() -> bool {
     client::alive() && client::get_background("/info").is_ok_and(|i| i["KiriStopped"] == true)
@@ -1137,7 +1172,7 @@ fn toast(kind: &str, text: &str) -> String {
     s
 }
 
-/// The docker CLI, pointed at Kiri's engine whatever context is chosen, for
+/// The docker CLI, pointed at Kiribra's engine whatever context is chosen, for
 /// Compose in the window.
 fn compose_cli() -> io::Result<std::process::Command> {
     let docker = client::docker_cli().ok_or_else(|| io::Error::other("no docker CLI found"))?;
@@ -1146,7 +1181,7 @@ fn compose_cli() -> io::Result<std::process::Command> {
     Ok(cmd)
 }
 
-/// The compose files opened in the window: ~/.kiri/compose.json.
+/// The compose files opened in the window: ~/.kiribra/compose.json.
 fn compose_store() -> Option<std::path::PathBuf> {
     state_dir().map(|d| d.join("compose.json"))
 }
@@ -1582,7 +1617,7 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
             Ok(())
         }
         "setpref" => {
-            if msg.name == "theme" {
+            if msg.name == "theme" && !web::serving() {
                 window::set_appearance(msg.value.as_str().unwrap_or("system"));
             }
             set_pref(&msg.name, msg.value);
@@ -1592,11 +1627,45 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
         // which the page adds and shows if it's the one picked.
         "langwords" => {
             if let Some(js) = lang::words_js(&msg.name) {
-                window::eval(js);
+                host_eval(js);
             }
             Ok(())
         }
         "about" => tx.send(Cmd::About),
+        // Settings → Web UI: status, start/stop a `kiri ui --web` child, open the URL.
+        "webui" => {
+            webctl::emit_status();
+            Ok(())
+        }
+        "webuistart" => {
+            let lan = msg.value["lan"].as_bool().unwrap_or(prefs()["webUiLan"] == true);
+            let port = msg.value["port"].as_u64().or_else(|| prefs()["webUiPort"].as_u64()).unwrap_or(u64::from(web::DEFAULT_PORT)) as u16;
+            std::thread::spawn(move || {
+                match webctl::start(lan, port) {
+                    Ok(()) => {
+                        emit(notice("ok", &tr("Web UI is on")));
+                        webctl::emit_status();
+                    }
+                    Err(e) => {
+                        emit(notice("error", &e));
+                        webctl::emit_status();
+                    }
+                }
+            });
+            Ok(())
+        }
+        "webuistop" => {
+            std::thread::spawn(|| {
+                webctl::stop();
+                emit(notice("ok", &tr("Web UI is off")));
+                webctl::emit_status();
+            });
+            Ok(())
+        }
+        "webuiopen" => {
+            webctl::open_browser();
+            Ok(())
+        }
         "domains" => tx.send(Cmd::Domains(msg.value.as_bool().unwrap_or(false))),
         // Settings → Domains → HTTPS: macOS asks for the password.
         "https" => {
@@ -1604,8 +1673,8 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
             std::thread::spawn(move || {
                 let result = if on { crate::daemon::tls::trust() } else { crate::daemon::tls::untrust() };
                 match result {
-                    Ok(()) if on => emit(notice("ok", &tr("Kiri's certificate is trusted: containers open over HTTPS"))),
-                    Ok(()) => emit(notice("ok", &tr("Kiri's certificate is no longer trusted"))),
+                    Ok(()) if on => emit(notice("ok", &tr("Kiribra's certificate is trusted: containers open over HTTPS"))),
+                    Ok(()) => emit(notice("ok", &tr("Kiribra's certificate is no longer trusted"))),
                     Err(e) if e.to_string().contains("canceled") || e.to_string().contains("cancelled") => {}
                     Err(e) => emit(notice("error", &trf("Could not change the certificate's trust: {error}", &[("error", &e)]))),
                 }
@@ -1613,7 +1682,7 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
             });
             Ok(())
         }
-        // The USB view: the computer's devices, and which are in Kiri.
+        // The USB view: the computer's devices, and which are in Kiribra.
         "usb" => {
             std::thread::spawn(|| emit(usb_words(crate::usb::ui_list()).to_string()));
             Ok(())
@@ -1772,12 +1841,16 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
                 // A selection can be a whole screen of output.
                 "copy" => {
                     if let Some(text) = msg.value.as_str().filter(|t| !t.is_empty() && t.len() <= termwire::COPY_MAX) {
-                        window::copy(text);
+                        host_copy(text);
                     }
                 }
                 "paste" => {
                     let id = msg.id;
-                    window::paste(move |text| emit(termwire::paste(&id, &text)));
+                    if web::serving() {
+                        web::paste(&id);
+                    } else {
+                        window::paste(move |text| emit(termwire::paste(&id, &text)));
+                    }
                 }
                 // A link in a shell's output: web pages only, never a file or an app's scheme.
                 "link" => {
@@ -1792,7 +1865,7 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
         // The page can't write the clipboard itself; IDs and short text only.
         "copy" => {
             if !msg.name.is_empty() && msg.name.len() <= 4096 {
-                window::copy(&msg.name);
+                host_copy(&msg.name);
             }
             Ok(())
         }
@@ -1841,14 +1914,14 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
             });
             Ok(())
         }
-        // Which engine plain `docker` uses: Kiri, or back to the one before.
+        // Which engine plain `docker` uses: Kiribra, or back to the one before.
         "usecontext" => {
             let result = setup::use_context(&msg.name);
             emit(status_event());
             emit(serde_json::json!({"type": "usedcontext", "name": msg.name, "error": result.as_ref().err().map(|e| e.to_string())}).to_string());
             Ok(())
         }
-        // Settings → Builds: clear Kiri's builder cache (`docker builder
+        // Settings → Builds: clear Kiribra's builder cache (`docker builder
         // prune --all`), which Images and Volumes don't list.
         "buildprune" => {
             let tx = tx.clone();
@@ -1870,7 +1943,7 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
             std::thread::spawn(move || {
                 if let Some(with) = with {
                     match crate::buildwith::choose(with) {
-                        // Kiri's builder made now if it wasn't yet; it takes the choice.
+                        // Kiribra's builder made now if it wasn't yet; it takes the choice.
                         Ok(()) => setup::ensure_builder(),
                         Err(e) => emit(notice("error", &trf("Couldn't change which builder docker build uses: {error}", &[("error", &e)]))),
                     }
@@ -2005,7 +2078,16 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
         // Open a compose file…: the system's own dialog, on the window's
         // thread; the path it gives stays here, the page gets the project.
         "composeopen" => {
-            window::pick_compose_file(&tr("Open a compose file"), &[tr("Compose files"), tr("YAML files")], |path| compose::picked(path, compose_cli, compose_store, emit));
+            if web::serving() {
+                // No system file dialog in the browser: the page may send a path.
+                if !msg.path.is_empty() {
+                    compose::picked(Some(std::path::PathBuf::from(msg.path)), compose_cli, compose_store, emit);
+                } else {
+                    emit(notice("error", "Open a compose file from the desktop window, or send a path"));
+                }
+            } else {
+                window::pick_compose_file(&tr("Open a compose file"), &[tr("Compose files"), tr("YAML files")], |path| compose::picked(path, compose_cli, compose_store, emit));
+            }
             Ok(())
         }
         // Before Run: what the image's start script won't start without.
@@ -2063,10 +2145,10 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
         }
         // Only the container's own addresses: a page cannot open arbitrary URLs.
         "open" => {
-            let local = msg.name.strip_prefix("http://").or_else(|| msg.name.strip_prefix("https://")).and_then(|r| r.split(['/', ':']).next()).is_some_and(|h| h == "localhost" || h.ends_with(".kiri.localhost") || h.ends_with(".kiri.local"));
+            let local = msg.name.strip_prefix("http://").or_else(|| msg.name.strip_prefix("https://")).and_then(|r| r.split(['/', ':']).next()).is_some_and(|h| h == "localhost" || h.ends_with(".kiribra.localhost") || h.ends_with(".kiribra.local"));
             // A build warning's rule page (docs.docker.com/go/dockerfile/rule/…).
             let docs = msg.name.strip_prefix("https://docs.docker.com/go/").is_some_and(|rest| rest.bytes().all(|b| b.is_ascii_alphanumeric() || b"-/".contains(&b)));
-            if local || docs || msg.name == "https://runkiri.com" || msg.name == "https://runkiri.com/share/notice" || msg.name == "https://canestack.com" || msg.name == "https://github.com/libracoder/kiri/issues/new" || msg.name == "https://github.com/libracoder/kiri" || msg.name == "https://github.com/anchore/grype" || msg.name == "https://login.docker.com/activate" || msg.name == "https://github.com/login/device" {
+            if local || docs || msg.name == "https://runkiri.com" || msg.name == "https://runkiri.com/share/notice" || msg.name == "https://canestack.com" || msg.name == "https://github.com/astosweb/kiribra/issues/new" || msg.name == "https://github.com/astosweb/kiribra" || msg.name == "https://github.com/anchore/grype" || msg.name == "https://login.docker.com/activate" || msg.name == "https://github.com/login/device" {
                 open(&msg.name);
             }
             Ok(())
@@ -2079,17 +2161,23 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
         // for a release that already happened, holding the window
         // until the next click.
         "drag" => {
-            window::drag();
+            if !web::serving() {
+                window::drag();
+            }
             Ok(())
         }
         // ⌘W when the built-in terminal doesn't have the focus.
         #[cfg(target_os = "macos")]
         "closewindow" => {
-            window::close_window();
+            if !web::serving() {
+                window::close_window();
+            }
             Ok(())
         }
         "zoom" => {
-            window::zoom();
+            if !web::serving() {
+                window::zoom();
+            }
             Ok(())
         }
         // Diagnostics, for the error Details and Settings → Diagnostics:
@@ -2176,11 +2264,13 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
                 emit(ev);
             }
             emit(serde_json::json!({"type": "prefs", "prefs": prefs()}).to_string());
-            // KIRI_STAR_PROMPT=1 shows the star card now, asked before or not (for testing).
-            if std::env::var_os("KIRI_STAR_PROMPT").is_some() {
+            // Settings → Web UI left on: start `kiri ui --web` again (or report one already up).
+            webctl::autostart_if_wanted();
+            // KIRIBRA_STAR_PROMPT=1 shows the star card now, asked before or not (for testing).
+            if std::env::var_os("KIRIBRA_STAR_PROMPT").is_some() {
                 emit(r#"{"type":"starprompt"}"#.to_owned());
             }
-            // Kiri Lite: fetch the docker CLI, Compose and buildx the
+            // Kiribra Lite: fetch the docker CLI, Compose and buildx the
             // first time, unless this Mac already has a docker CLI.
             if crate::tools::lite() && !crate::tools::installed() && !other_docker_cli() {
                 setup_tools();
@@ -2201,7 +2291,7 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
             std::thread::spawn(|| update_check(false));
             recheck::start(|| feed_check(false));
             ask_language();
-            // The first time the app opens: ask, once, whether to use *.kiri.local (the Mac only, so far).
+            // The first time the app opens: ask, once, whether to use *.kiribra.local (the Mac only, so far).
             if cfg!(target_os = "macos") && !crate::flavor::dev() && !crate::daemon::dns::installed() && prefs()["domainsAsked"] != true {
                 set_pref("domainsAsked", true.into());
                 emit(r#"{"type":"welcome"}"#.to_owned());
@@ -2214,9 +2304,9 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
                 }
                 emit(crate::buildwith::event());
             });
-            // Linux: Kiri checks it can run containers for this account
+            // Linux: Kiribra checks it can run containers for this account
             // first; until it can, the page shows the setup checklist and
-            // nothing starts (its Open Kiri sends "onbopen").
+            // nothing starts (its Open Kiribra sends "onbopen").
             #[cfg(target_os = "linux")]
             {
                 let checks = linux::onboarding::checks();
@@ -2271,7 +2361,7 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
             Ok(())
         }
         // The Mac's checklist: Try again for one step, Skip for an optional
-        // one; Open Kiri only closes it, the engine is already reached.
+        // one; Open Kiribra only closes it, the engine is already reached.
         #[cfg(target_os = "macos")]
         "onbcheck" => {
             emit(macsetup::checks().to_string());

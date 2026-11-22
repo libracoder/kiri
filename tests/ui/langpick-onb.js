@@ -18,12 +18,12 @@ t("picking German redraws the checklist in German", () => {
   dlg().querySelector('[data-lang="de"]').click();
   const now = onbText();
   if (now === before) throw new Error("the checklist didn't change");
-  if (/Set up Kiri/.test(now)) throw new Error("still English: " + now.slice(0, 80));
+  if (/Set up Kiribra/.test(now)) throw new Error("still English: " + now.slice(0, 80));
 });
 t("Continue leaves the checklist, in German", () => {
   document.getElementById("lang-go").click();
   if (dlg()) throw new Error("the language step is still open");
   if (!document.getElementById("onb")) throw new Error("the checklist went too");
-  if (/Set up Kiri/.test(onbText())) throw new Error("English again");
+  if (/Set up Kiribra/.test(onbText())) throw new Error("English again");
 });
 report(R);

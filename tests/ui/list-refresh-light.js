@@ -19,7 +19,7 @@ const projects = () => kiri.on({ type: "composeprojects", logos: {}, projects: A
   return { name: `proj${p}`, dir: `/w/p${p}`, files: [`/w/p${p}/compose.yaml`], readable: true, services: m.map((c) => svc(c.Labels["com.docker.compose.service"])),
     containers: m.map((c) => ({ service: c.Labels["com.docker.compose.service"], id: c.Id, name: c.Names[0].slice(1), image: c.Image, state: c.State, status: c.Status })) }; }) });
 ui.vm = "running";
-kiri.on({ type: "status", version: "0.1.4", dev: true, share: true, app: "Kiri", ours: "kiri", context: "kiri" });
+kiri.on({ type: "status", version: "0.1.4", dev: true, share: true, app: "Kiribra", ours: "kiri", context: "kiri" });
 lists(); projects();
 const content = $("content"), tbl = () => content.querySelector("table[data-view]");
 // What a refresh changes on screen, from a MutationObserver over the list.

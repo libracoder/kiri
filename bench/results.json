@@ -101,7 +101,7 @@
         "metric": "Virtualization.framework configure + start",
         "value_ms": 95,
         "status": "measured",
-        "detail": "Apple's helper process start; outside Kiri"
+        "detail": "Apple's helper process start; outside Kiribra"
       },
       {
         "metric": "guest kernel boot to PID 1",
@@ -204,7 +204,7 @@
     "runs": 30,
     "rows": [
       {
-        "engine": "Kiri",
+        "engine": "Kiribra",
         "path": "Docker Engine API (kiri daemon)",
         "network": "bridge",
         "p50_ms": 2.55,
@@ -212,7 +212,7 @@
         "status": "measured"
       },
       {
-        "engine": "Kiri",
+        "engine": "Kiribra",
         "path": "docker CLI (context kiri)",
         "network": "bridge",
         "p50_ms": 14.15,
@@ -252,7 +252,7 @@
         "status": "measured"
       },
       {
-        "engine": "Kiri",
+        "engine": "Kiribra",
         "path": "Docker Engine API (kiri daemon)",
         "network": "none",
         "p50_ms": 2.68,
@@ -260,7 +260,7 @@
         "status": "measured"
       },
       {
-        "engine": "Kiri",
+        "engine": "Kiribra",
         "path": "docker CLI (context kiri)",
         "network": "none",
         "p50_ms": 13.97,
@@ -308,12 +308,12 @@
     "caveats": [
       "All three engines were driven by the same docker CLI (29.7.2) and the same Docker Engine API calls, in one run, on the same Mac, with default bridge networking and with --network none.",
       "During the run OrbStack had 86 containers and a Kubernetes cluster running, and Docker Desktop's VM was up as well; that load widens every engine's spread (p99). OrbStack's numbers are pessimistic.",
-      "Kiri reports a --rm container's exit once its record is removed and deletes its files in the guest just after; with the deletion inside the timing, Kiri's engine time was about 3 ms.",
-      "Of Kiri's ~14 ms through the docker CLI, most is the docker CLI itself starting up."
+      "Kiribra reports a --rm container's exit once its record is removed and deletes its files in the guest just after; with the deletion inside the timing, Kiribra's engine time was about 3 ms.",
+      "Of Kiribra's ~14 ms through the docker CLI, most is the docker CLI itself starting up."
     ],
     "quiet_kiri_ms": {
       "value": 1.26,
-      "detail": "Kiri alone, Docker Desktop stopped, --network none, Docker API, p50 of 50"
+      "detail": "Kiribra alone, Docker Desktop stopped, --network none, Docker API, p50 of 50"
     }
   }
 }

@@ -1,5 +1,5 @@
 // parity: macos windows linux
-// Compose shows Kiri's spinner while the engine takes its time: the first list in the page (never an empty
+// Compose shows Kiribra's spinner while the engine takes its time: the first list in the page (never an empty
 // table or the empty state before it), a later slow list by the title (after 600 ms, gone with the answer, with
 // nothing moving; a fast one never shows it), the file and a slow plan in the plan box, and Logs. A row's
 // action button rolls till its answer.
@@ -72,7 +72,7 @@ const hw = () => $("cmp-hwait");
   t("Logs wait with the spinner", () => eq(!!spin($("cmp-tab")), true, $("cmp-tab").innerHTML));
   kiri.on({ type: "composelogs", name: "shop", lines: [] }); render();
   t("the logs' answer takes it away", () => eq(!!spin($("cmp-tab")), false, $("cmp-tab").innerHTML));
-  t("reduced motion: the spinner slows, as Kiri's other spinners do", () => {
+  t("reduced motion: the spinner slows, as Kiribra's other spinners do", () => {
     const rules = [...document.styleSheets].flatMap((s) => [...s.cssRules]).filter((r) => r.media?.mediaText?.includes("reduce")).map((r) => r.cssText).join(" ");
     eq(/\.sh-spin\s*\{[^}]*animation-duration/.test(rules), true, "a reduced-motion rule for .sh-spin");
   });

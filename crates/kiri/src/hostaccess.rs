@@ -1,7 +1,7 @@
 //! `kiri host-access <user>`: everything the window's onboarding on a Linux
 //! host needs root for, in one go, so the system asks for a password once.
-//! The window runs it through pkexec (the polkit action dev.kiri.host-access,
-//! packaging/linux/dev.kiri.host-access.policy); `sudo kiri host-access $USER`
+//! The window runs it through pkexec (the polkit action dev.kiribra.host-access,
+//! packaging/linux/dev.kiribra.host-access.policy); `sudo kiri host-access $USER`
 //! does the same from a terminal.
 //!
 //! 1. The `kiri` group, if the package's install didn't make it.
@@ -15,7 +15,7 @@
 //! engine, after the package was upgraded), and waits for it to answer.
 //!
 //! Exit status: 0 done; 10 done, but this system keeps no access lists, so
-//! `user` must log out and back in once before Kiri lets them in.
+//! `user` must log out and back in once before Kiribra lets them in.
 
 use std::io;
 use std::os::unix::net::UnixStream;
@@ -55,11 +55,11 @@ pub fn run(args: &[String]) -> io::Result<u8> {
     engine(restart)?;
     match crate::daemon::access::grant(Path::new(SOCKET), GROUP) {
         Ok(_) => {
-            println!("{user} can use Kiri now");
+            println!("{user} can use Kiribra now");
             Ok(0)
         }
         Err(e) if crate::daemon::access::unsupported(&e) => {
-            println!("{user} can use Kiri after logging out and back in (this system keeps no access lists)");
+            println!("{user} can use Kiribra after logging out and back in (this system keeps no access lists)");
             Ok(SIGN_IN_AGAIN)
         }
         Err(e) => Err(io::Error::other(format!("couldn't give {user} the socket: {e}"))),
@@ -85,7 +85,7 @@ fn engine(restart: bool) -> io::Result<()> {
         }
         std::thread::sleep(Duration::from_millis(200));
     }
-    Err(io::Error::other("Kiri's engine didn't start: journalctl -u kiri says why"))
+    Err(io::Error::other("Kiribra's engine didn't start: journalctl -u kiri says why"))
 }
 
 fn answers() -> bool {

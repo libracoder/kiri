@@ -1,9 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  Kiri for Windows: a per-user MSI around the bundle `cargo xtask windows`
-  builds (target/kiri-windows-x86_64). It lays the bundle in %LOCALAPPDATA%\Kiri,
+  Kiribra for Windows: a per-user MSI around the bundle `cargo xtask windows`
+  builds (target/kiri-windows-x86_64). It lays the bundle in %LOCALAPPDATA%\Kiribra,
   the folder kiri-win.exe uses anyway, adds a Start menu entry and an
-  Apps & features row, and opens Kiri at the end: Kiri's own first-run setup
+  Apps & features row, and opens Kiribra at the end: Kiribra's own first-run setup
   then installs WSL if needed, imports the engine, and puts the docker CLI on
   PATH, per user, with no administrator rights. Removing it runs
   kiri.ps1 -Uninstall -IfSetUp (engine out of WSL, PATH and docker context
@@ -12,11 +12,11 @@
   Build (or `cargo xtask msi`, which builds the bundle first):
     wix build -arch x64 -ext WixToolset.UI.wixext -ext WixToolset.Util.wixext
       -d Version=<version> -d Bundle=..\..\target\kiri-windows-x86_64 -d Size="152.6 MB"
-      -loc kiri.wxl -o ..\..\target\Kiri-<version>-x86_64.msi kiri.wxs
+      -loc kiri.wxl -o ..\..\target\Kiribra-<version>-x86_64.msi kiri.wxs
 
   Windows on Arm (`cargo xtask msi`, arch arm64) is the same source with
   -arch arm64, -d Bundle=..\..\target\kiri-windows-aarch64 and -o
-  ..\..\target\Kiri-<version>-arm64.msi: the Platform is Arm64, the custom action
+  ..\..\target\Kiribra-<version>-arm64.msi: the Platform is Arm64, the custom action
   DLL Wix4UtilCA_A64 ($(sys.BUILDARCHSHORT)), and nothing else differs. A
   per-user install has no Program Files folder to choose, so there is no
   ProgramFiles64Folder/ProgramFilesArm64 question either.
@@ -30,8 +30,8 @@
   <?ifndef Bundle ?><?define Bundle = "..\..\target\kiri-windows-x86_64" ?><?endif?>
   <!-- What the install takes on disk, as the ready page says it: xtask measures the bundle. -->
   <?ifndef Size ?><?define Size = "" ?><?endif?>
-  <?define Name = "Kiri" ?>
-  <?define Manufacturer = "Kiri" ?>
+  <?define Name = "Kiribra" ?>
+  <?define Manufacturer = "Kiribra" ?>
   <?define Url = "https://runkiri.com" ?>
   <?define Description = "Tiny, fast container runtime" ?>
   <?define Keywords = "containers, docker, wsl, runtime" ?>
@@ -39,9 +39,9 @@
   <!--
     The UpgradeCode never changes; it is what makes a newer MSI replace an older one.
     The x64 and arm64 MSIs share it, on purpose: both install the same files
-    into the same %LOCALAPPDATA%\Kiri with the same HKCU keys and component
+    into the same %LOCALAPPDATA%\Kiribra with the same HKCU keys and component
     GUIDs, so two products side by side would fight over one folder. Shared,
-    the arm64 MSI replaces an x64 Kiri put on an Arm PC by mistake (as a
+    the arm64 MSI replaces an x64 Kiribra put on an Arm PC by mistake (as a
     major upgrade, AllowSameVersionUpgrades even at the same version), and
     the reverse. kiri-win's updater checks the MSI's platform as well as
     this code, and reads its own feed per architecture, so an update never
@@ -75,15 +75,15 @@
     <Property Id="ARPCONTACT" Value="$(Manufacturer)" />
     <Property Id="ARPCOMMENTS" Value="$(Description)" />
     <!--
-      The folder tree util:RemoveFolderEx deletes on uninstall: Kiri's own
-      %LOCALAPPDATA%\Kiri, with what the app wrote there (setup.json, logs,
-      the WebView2 cache, and wsl\kiri\ext4.vhdx, the Kiri Linux distro's
+      The folder tree util:RemoveFolderEx deletes on uninstall: Kiribra's own
+      %LOCALAPPDATA%\Kiribra, with what the app wrote there (setup.json, logs,
+      the WebView2 cache, and wsl\kiri\ext4.vhdx, the Kiribra Linux distro's
       disk, which kiri.ps1 unregisters first). The registry value goes into
       KIRIDIR_FOUND and is copied to KIRIDIR only when this product is
       already installed and not being replaced: in a major upgrade
       (UPGRADINGPRODUCTCODE is set while the old product is removed) KIRIDIR
       stays empty, RemoveFolderEx does nothing, and the user's data
-      survives. A value that is not <LocalAppData>\Kiri\ (a
+      survives. A value that is not <LocalAppData>\Kiribra\ (a
       tampered registry, or KIRIDIR given on the command line) is blanked.
     -->
     <Property Id="KIRIDIR_FOUND">
@@ -94,7 +94,7 @@
     <SetProperty Id="KIRIDIR" Value="[KIRIDIR_FOUND]" After="SetKIRIDIR_HOME" Sequence="execute" Condition="Installed AND NOT UPGRADINGPRODUCTCODE" />
     <SetProperty Id="KIRIDIR" Action="ResetKIRIDIR" Value="{}" After="SetKIRIDIR" Sequence="execute" Condition="NOT (KIRIDIR ~= KIRIDIR_HOME)" />
 
-    <!-- %LOCALAPPDATA%\Kiri: kiri-win.exe keeps setup.json, logs and the WebView2 cache here too. -->
+    <!-- %LOCALAPPDATA%\Kiribra: kiri-win.exe keeps setup.json, logs and the WebView2 cache here too. -->
     <StandardDirectory Id="LocalAppDataFolder">
       <Directory Id="INSTALLFOLDER" Name="$(Name)">
         <Directory Id="BinFolder" Name="bin">
@@ -154,7 +154,7 @@
       <ComponentGroupRef Id="KiriComponents" />
     </Feature>
 
-    <!-- A running Kiri is closed before its files are replaced or removed. -->
+    <!-- A running Kiribra is closed before its files are replaced or removed. -->
     <util:CloseApplication Id="CloseKiriWin" Target="kiri-win.exe" CloseMessage="yes" TerminateProcess="1" RebootPrompt="no" />
 
     <!--
@@ -177,10 +177,10 @@
     </InstallExecuteSequence>
 
     <!--
-      The pages, as drawn in the Kiri Installer Windows design: Welcome,
+      The pages, as drawn in the Kiribra Installer Windows design: Welcome,
       licence, ready, progress, done. All but the ready page are stock
       WixUI dialogs. It is WixUI_InstallDir without its folder page:
-      kiri-win runs from %LOCALAPPDATA%\Kiri and nowhere else, so the
+      kiri-win runs from %LOCALAPPDATA%\Kiribra and nowhere else, so the
       folder is not a choice; the ready page (KiriReadyDlg, below) shows
       it instead, with the size and the scope. Repair and remove still go
       through the stock VerifyReadyDlg.
@@ -195,13 +195,13 @@
     <WixVariable Id="WixUIBannerBmp" Value="$(Assets)\wix-banner.bmp" />
     <WixVariable Id="WixUIDialogBmp" Value="$(Assets)\wix-dialog.bmp" />
     <WixVariable Id="WixUILicenseRtf" Value="license.rtf" />
-    <UI Id="WixUI_Kiri">
+    <UI Id="WixUI_Kiribra">
       <TextStyle Id="WixUI_Font_Normal" FaceName="Segoe UI" Size="9" />
       <TextStyle Id="WixUI_Font_Bigger" FaceName="Segoe UI" Size="12" />
       <TextStyle Id="WixUI_Font_Title" FaceName="Segoe UI" Size="9" Bold="yes" />
       <!-- The ready page's table: labels in the design's slate, values in the system monospace. -->
-      <TextStyle Id="Kiri_Font_Label" FaceName="Segoe UI" Size="9" Red="58" Green="66" Blue="76" />
-      <TextStyle Id="Kiri_Font_Mono" FaceName="Consolas" Size="9" />
+      <TextStyle Id="Kiribra_Font_Label" FaceName="Segoe UI" Size="9" Red="58" Green="66" Blue="76" />
+      <TextStyle Id="Kiribra_Font_Mono" FaceName="Consolas" Size="9" />
       <Property Id="DefaultUIFont" Value="WixUI_Font_Normal" />
       <Property Id="ARPNOMODIFY" Value="1" />
 
@@ -232,7 +232,7 @@
       <Publish Dialog="MaintenanceTypeDlg" Control="RemoveButton" Event="NewDialog" Value="VerifyReadyDlg" />
       <Publish Dialog="MaintenanceTypeDlg" Control="Back" Event="NewDialog" Value="MaintenanceWelcomeDlg" />
 
-      <!-- The last page offers to launch Kiri, which runs first-run setup. -->
+      <!-- The last page offers to launch Kiribra, which runs first-run setup. -->
       <Publish Dialog="ExitDialog" Control="Finish" Event="DoAction" Value="LaunchKiri"
                Condition="WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 AND NOT Installed" />
 
@@ -248,9 +248,9 @@
         <Control Id="BannerLine" Type="Line" X="0" Y="44" Width="370" Height="0" />
         <Control Id="Description" Type="Text" X="25" Y="60" Width="320" Height="30" Transparent="yes" NoPrefix="yes" Text="!(loc.VerifyReadyDlgInstallText)" />
         <Control Id="FolderLabel" Type="Text" X="25" Y="104" Width="40" Height="12" Transparent="yes" NoPrefix="yes" Text="!(loc.KiriReadyFolder)" />
-        <Control Id="FolderValue" Type="Text" X="70" Y="104" Width="280" Height="12" Transparent="yes" NoPrefix="yes" Text="{\Kiri_Font_Mono}[INSTALLFOLDER]" />
+        <Control Id="FolderValue" Type="Text" X="70" Y="104" Width="280" Height="12" Transparent="yes" NoPrefix="yes" Text="{\Kiribra_Font_Mono}[INSTALLFOLDER]" />
         <Control Id="SizeLabel" Type="Text" X="25" Y="122" Width="40" Height="12" Transparent="yes" NoPrefix="yes" Text="!(loc.KiriReadySize)" />
-        <Control Id="SizeValue" Type="Text" X="70" Y="122" Width="280" Height="12" Transparent="yes" NoPrefix="yes" Text="{\Kiri_Font_Mono}$(Size)" />
+        <Control Id="SizeValue" Type="Text" X="70" Y="122" Width="280" Height="12" Transparent="yes" NoPrefix="yes" Text="{\Kiribra_Font_Mono}$(Size)" />
         <Control Id="ScopeLabel" Type="Text" X="25" Y="140" Width="40" Height="12" Transparent="yes" NoPrefix="yes" Text="!(loc.KiriReadyScope)" />
         <Control Id="ScopeValue" Type="Text" X="70" Y="140" Width="280" Height="12" Transparent="yes" NoPrefix="yes" Text="!(loc.KiriReadyScopeValue)" />
         <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />

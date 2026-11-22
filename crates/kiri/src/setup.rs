@@ -1,33 +1,33 @@
-//! `kiri setup`: makes this Mac use Kiri the way OrbStack's installer does,
+//! `kiri setup`: makes this Mac use Kiribra the way OrbStack's installer does,
 //! without touching anything another engine owns.
 //!
 //! - a `kiri` docker context (`--use` also makes it the current one)
 //! - a LaunchAgent that starts `kiri daemon` at login (`--no-agent` skips it)
-//! - the app's bundled `docker`, Compose and buildx, when run from Kiri.app
-//! - `docker` and `kiri` in `~/.kiri/bin`, which a marked line in the shell
+//! - the app's bundled `docker`, Compose and buildx, when run from Kiribra.app
+//! - `docker` and `kiri` in `~/.kiribra/bin`, which a marked line in the shell
 //!   profiles (zsh's, bash's, and fish's if used) adds to the end of PATH,
 //!   so a docker CLI already installed keeps priority; and
 //!   `/usr/local/bin/kiri` when that directory is the user's
 //! - on a Mac with no other Docker engine, `kiri` as docker's default context
-//! - a buildx builder, `kiri-build`, that loads what it builds into Kiri,
+//! - a buildx builder, `kiri-build`, that loads what it builds into Kiribra,
 //!   and the choice of builder for plain `docker build` (src/buildwith.rs)
-//! - `*.kiri.local` names for containers: `/etc/resolver/kiri.local`, which
+//! - `*.kiribra.local` names for containers: `/etc/resolver/kiribra.local`, which
 //!   needs an administrator once (`--no-domains` skips it; `--domains` does
 //!   only this)
-//! - `/var/run/docker.sock` linked to Kiri's socket, for tools that ignore
+//! - `/var/run/docker.sock` linked to Kiribra's socket, for tools that ignore
 //!   docker contexts (docker-py, Go's `client.FromEnv`, docker-java,
 //!   Testcontainers, IDE plugins), when no other engine has it: asked for
-//!   with `*.kiri.local`'s password (`--docker-socket` does only this), and
+//!   with `*.kiribra.local`'s password (`--docker-socket` does only this), and
 //!   put back at boot by a LaunchDaemon. Until then, or if the password is
-//!   declined, `~/.testcontainers.properties` points Testcontainers at Kiri,
+//!   declined, `~/.testcontainers.properties` points Testcontainers at Kiribra,
 //!   unless the user has a file of their own there
 //!
 //! `kiri setup --uninstall` takes back exactly those, and the `kiri` kubectl
 //! context that `kiri k8s` adds.
 //!
-//! Kiri Dev (src/flavor.rs) sets up only its own: the `kiri-dev` context,
-//! its LaunchAgent, its builder and `~/.kiri-dev/bin`. PATH, docker's
-//! default context and `*.kiri.local` stay the installed Kiri's.
+//! Kiribra Dev (src/flavor.rs) sets up only its own: the `kiribra-dev` context,
+//! its LaunchAgent, its builder and `~/.kiribra-dev/bin`. PATH, docker's
+//! default context and `*.kiribra.local` stay the installed Kiribra's.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -36,14 +36,14 @@ use std::process::Command;
 use serde_json::{Value, json};
 
 // The bundle identifier (`APP_ID`) named in the LaunchAgent makes macOS
-// say "Kiri" in Login Items, rather than the name on the signing
+// say "Kiribra" in Login Items, rather than the name on the signing
 // certificate.
 use crate::flavor::{AGENT, APP_ID, CONTEXT, dev};
 
 use crate::builds::{BUILDER, builder};
 pub use crate::builds::ensure_builder;
 
-/// `~/.kiri/bin`, or `~/.kiri-dev/bin`.
+/// `~/.kiribra/bin`, or `~/.kiribra-dev/bin`.
 fn bin_dir() -> io::Result<PathBuf> {
     Ok(home()?.join(crate::flavor::STATE.get()).join("bin"))
 }
@@ -83,14 +83,14 @@ fn write_json(path: &Path, v: &Value) -> io::Result<()> {
     std::fs::rename(tmp, path)
 }
 
-/// Kiri.app's `Contents`, when this binary runs from the app.
+/// Kiribra.app's `Contents`, when this binary runs from the app.
 fn bundle_contents() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
     let contents = exe.parent()?.parent()?.to_path_buf();
     contents.join("Info.plist").is_file().then_some(contents)
 }
 
-/// Whether this process is Kiri.app being opened from Finder or the Dock:
+/// Whether this process is Kiribra.app being opened from Finder or the Dock:
 /// the app's binary, started by launchd (LaunchServices), not from a shell,
 /// where running it bare must not change anything.
 pub fn launched_from_app() -> bool {
@@ -99,20 +99,20 @@ pub fn launched_from_app() -> bool {
 }
 
 /// The first time the app opens: the same as `kiri setup`, quietly, except
-/// `*.kiri.local`, which the window offers and the user chooses. It never
+/// `*.kiribra.local`, which the window offers and the user chooses. It never
 /// stops the window opening (#250): each step runs on its own, and the ones
 /// that fail wait in the window's setup checklist (`undone`) with their
 /// errors. Without the login item, the window starts the engine itself
 /// (update::start_engine).
 pub fn first_launch() {
-    let set_up = agent_plist().and_then(|p| Ok(p.is_file() && agent_runs_this()?)).map_err(step("checking how Kiri starts at login"));
+    let set_up = agent_plist().and_then(|p| Ok(p.is_file() && agent_runs_this()?)).map_err(step("checking how Kiribra starts at login"));
     // Not knowing is not set up: the steps run, and say what failed.
     let set_up = set_up.unwrap_or_else(|e| {
         crate::diag::warn!("setup step failed", step = "check", error = e);
         false
     });
     if set_up {
-        // Set up by an older Kiri: make sure the commands are there too.
+        // Set up by an older Kiribra: make sure the commands are there too.
         if let Some(contents) = bundle_contents() {
             let _ = bundled_cli(&contents);
         }
@@ -143,7 +143,7 @@ pub fn first_launch() {
 }
 
 /// The first launch's steps, as the window's checklist names them: the
-/// docker context (docker reaches Kiri), the kiri and docker commands, and
+/// docker context (docker reaches Kiribra), the kiri and docker commands, and
 /// starting the engine at login.
 pub const FIRST_STEPS: [&str; 3] = ["context", "commands", "login"];
 
@@ -188,11 +188,11 @@ pub fn run(args: &[String]) -> io::Result<()> {
         return uninstall();
     }
     if flag("--domains") {
-        return if dev() { Err(io::Error::other(format!("*.kiri.local belongs to the installed Kiri, not {}", crate::flavor::APP))) } else { domains() };
+        return if dev() { Err(io::Error::other(format!("*.kiribra.local belongs to the installed Kiribra, not {}", crate::flavor::APP))) } else { domains() };
     }
     if flag("--docker-socket") {
         if dev() {
-            return Err(io::Error::other(format!("/var/run/docker.sock belongs to the installed Kiri, not {}", crate::flavor::APP)));
+            return Err(io::Error::other(format!("/var/run/docker.sock belongs to the installed Kiribra, not {}", crate::flavor::APP)));
         }
         let result = docker_socket();
         println!("{}", docker_socket_fallback(&crate::daemon::socket_path()?));
@@ -206,7 +206,7 @@ pub fn run(args: &[String]) -> io::Result<()> {
         let mut cfg = read_json(&path).map_err(step("making kiri docker's current context"))?;
         cfg["currentContext"] = CONTEXT.get().into();
         write_json(&path, &cfg).map_err(step("making kiri docker's current context"))?;
-        println!("docker now uses Kiri by default (`docker context use default` to switch back)");
+        println!("docker now uses Kiribra by default (`docker context use default` to switch back)");
     }
     first_step("commands")?;
     if !flag("--no-agent") {
@@ -215,18 +215,18 @@ pub fn run(args: &[String]) -> io::Result<()> {
     }
     match builder() {
         Ok(true) => match crate::buildwith::places().map(|p| p.saved()) {
-            Ok(Some(crate::buildwith::With::Kiri)) => println!("docker build uses BuildKit in Kiri (builder `{BUILDER}`)"),
-            _ => println!("docker build follows docker's context, and builds on Kiri when docker uses Kiri (`kiri build-with kiri` sends every build to Kiri)"),
+            Ok(Some(crate::buildwith::With::Kiribra)) => println!("docker build uses BuildKit in Kiribra (builder `{BUILDER}`)"),
+            _ => println!("docker build follows docker's context, and builds on Kiribra when docker uses Kiribra (`kiri build-with kiri` sends every build to Kiribra)"),
         },
         Ok(false) => {}
-        Err(e) => println!("docker build: the `{BUILDER}` builder comes later ({e}); the window makes it once Kiri is running"),
+        Err(e) => println!("docker build: the `{BUILDER}` builder comes later ({e}); the window makes it once Kiribra is running"),
     }
     if !flag("--no-domains") && !dev() {
         // domains() asks for /var/run/docker.sock with the same password;
         // with the names already there, it is asked for on its own.
         let named = crate::daemon::dns::installed();
         if let Err(e) = domains() {
-            println!("container names stay on *.kiri.localhost ({e}); `kiri setup --domains` tries again");
+            println!("container names stay on *.kiribra.localhost ({e}); `kiri setup --domains` tries again");
         } else if named {
             if let Err(e) = docker_socket() {
                 println!("{DOCKER_SOCK} stays as it is ({e})");
@@ -239,25 +239,25 @@ pub fn run(args: &[String]) -> io::Result<()> {
     Ok(())
 }
 
-/// Points macOS at Kiri for `*.kiri.local`. Writing /etc/resolver needs an
+/// Points macOS at Kiribra for `*.kiribra.local`. Writing /etc/resolver needs an
 /// administrator, so macOS asks for the password, once.
 pub fn domains() -> io::Result<()> {
     use crate::daemon::dns;
     if dns::installed() {
-        println!("containers answer at http://<name>.kiri.local");
+        println!("containers answer at http://<name>.kiribra.local");
         return Ok(());
     }
     let tmp = std::env::temp_dir().join(format!("kiri-resolver-{}", std::process::id()));
-    std::fs::write(&tmp, format!("# Kiri: container names (kiri setup --uninstall removes this)\nnameserver 127.0.0.1\nport {}\n", dns::PORT))?;
+    std::fs::write(&tmp, format!("# Kiribra: container names (kiri setup --uninstall removes this)\nnameserver 127.0.0.1\nport {}\n", dns::PORT))?;
     // /var/run/docker.sock with the same password, when it is free. Its
     // failing must not undo the names: how it went is read back after.
     let link = docker_socket_script()?;
     let (command, why) = match &link {
         Some(l) => (
             format!("mkdir -p /etc/resolver && cp '{}' {} && chmod 644 {} && ({l} || true)", tmp.display(), dns::RESOLVER, dns::RESOLVER),
-            "Kiri wants to give your containers names like myapp.kiri.local, and to answer at /var/run/docker.sock for tools that look for Docker there.",
+            "Kiribra wants to give your containers names like myapp.kiribra.local, and to answer at /var/run/docker.sock for tools that look for Docker there.",
         ),
-        None => (format!("mkdir -p /etc/resolver && cp '{}' {} && chmod 644 {}", tmp.display(), dns::RESOLVER, dns::RESOLVER), "Kiri wants to give your containers names like myapp.kiri.local."),
+        None => (format!("mkdir -p /etc/resolver && cp '{}' {} && chmod 644 {}", tmp.display(), dns::RESOLVER, dns::RESOLVER), "Kiribra wants to give your containers names like myapp.kiribra.local."),
     };
     let result = as_admin(&command, why);
     let _ = std::fs::remove_file(&tmp);
@@ -266,14 +266,14 @@ pub fn domains() -> io::Result<()> {
         let _ = docker_socket_fallback(&crate::daemon::socket_path()?);
     }
     result?;
-    println!("containers answer at http://<name>.kiri.local");
+    println!("containers answer at http://<name>.kiribra.local");
     Ok(())
 }
 
 /// Where tools that ignore docker contexts look for Docker: docker-py, Go's
 /// `client.FromEnv`, docker-java, Testcontainers, many IDE plugins.
 const DOCKER_SOCK: &str = "/var/run/docker.sock";
-/// macOS empties /var/run at every boot, so a LaunchDaemon puts Kiri's link
+/// macOS empties /var/run at every boot, so a LaunchDaemon puts Kiribra's link
 /// back then, only if nothing else has taken the path by that time. Docker
 /// Desktop's and OrbStack's helpers replace it when they start, as they
 /// replace each other's.
@@ -283,7 +283,7 @@ const SOCKET_DAEMON: &str = "/Library/LaunchDaemons/dev.kiri.docker-socket.plist
 /// Who has /var/run/docker.sock.
 #[derive(Debug, PartialEq)]
 enum DockerSock {
-    Kiri,
+    Kiribra,
     Free,
     /// Another engine: what it points at.
     Taken(String),
@@ -309,7 +309,7 @@ fn docker_sock_at(path: &Path, ours: &Path, engines: &[PathBuf]) -> DockerSock {
     if meta.file_type().is_symlink() {
         let Ok(target) = std::fs::read_link(path) else { return DockerSock::Taken(path.display().to_string()) };
         if target == ours {
-            return DockerSock::Kiri;
+            return DockerSock::Kiribra;
         }
         if target.exists() || engines.iter().any(|e| target.starts_with(e)) {
             return DockerSock::Taken(target.display().to_string());
@@ -326,7 +326,7 @@ fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// The root commands that link /var/run/docker.sock to Kiri's socket and
+/// The root commands that link /var/run/docker.sock to Kiribra's socket and
 /// install the LaunchDaemon that puts it back at boot.
 struct LinkScript {
     command: String,
@@ -341,7 +341,7 @@ impl std::fmt::Display for LinkScript {
 }
 
 /// The commands for when /var/run/docker.sock is free; None when it is
-/// Kiri's already or another engine's, or for Kiri Dev.
+/// Kiribra's already or another engine's, or for Kiribra Dev.
 fn docker_socket_script() -> io::Result<Option<LinkScript>> {
     let ours = crate::daemon::socket_path()?;
     if dev() || docker_sock(&ours) != DockerSock::Free {
@@ -376,46 +376,46 @@ fn docker_socket_script() -> io::Result<Option<LinkScript>> {
     Ok(Some(LinkScript { command, tmp }))
 }
 
-/// `kiri setup --docker-socket`: /var/run/docker.sock to Kiri, if free
+/// `kiri setup --docker-socket`: /var/run/docker.sock to Kiribra, if free
 /// (macOS asks for the password).
 pub fn docker_socket() -> io::Result<()> {
     let Some(l) = docker_socket_script()? else { return Ok(()) };
-    let result = as_admin(&l.command, "Kiri wants to answer at /var/run/docker.sock, for tools that look for Docker there.");
+    let result = as_admin(&l.command, "Kiribra wants to answer at /var/run/docker.sock, for tools that look for Docker there.");
     let _ = std::fs::remove_file(&l.tmp);
     result
 }
 
-/// Says where tools that ignore docker contexts find Kiri, and keeps
+/// Says where tools that ignore docker contexts find Kiribra, and keeps
 /// `~/.testcontainers.properties` for when /var/run/docker.sock is not
-/// Kiri's but could be (a declined password, not yet asked).
+/// Kiribra's but could be (a declined password, not yet asked).
 fn docker_socket_fallback(ours: &Path) -> String {
     match docker_sock(ours) {
-        DockerSock::Kiri => {
+        DockerSock::Kiribra => {
             let _ = testcontainers(ours, false);
-            format!("{DOCKER_SOCK} → Kiri (docker-py, Testcontainers and other tools that ignore docker contexts)")
+            format!("{DOCKER_SOCK} → Kiribra (docker-py, Testcontainers and other tools that ignore docker contexts)")
         }
         DockerSock::Taken(t) => {
             let _ = testcontainers(ours, false);
-            format!("{DOCKER_SOCK} is another engine's ({t}) and stays so; DOCKER_HOST=unix://{} points a tool at Kiri", ours.display())
+            format!("{DOCKER_SOCK} is another engine's ({t}) and stays so; DOCKER_HOST=unix://{} points a tool at Kiribra", ours.display())
         }
         DockerSock::Free => match testcontainers(ours, true) {
-            Ok(true) => format!("{DOCKER_SOCK} is not Kiri's yet (`kiri setup --docker-socket` asks for the password); Testcontainers finds Kiri through ~/.testcontainers.properties"),
-            _ => format!("{DOCKER_SOCK} is not Kiri's yet (`kiri setup --docker-socket` asks for the password); until then DOCKER_HOST=unix://{} points a tool at Kiri", ours.display()),
+            Ok(true) => format!("{DOCKER_SOCK} is not Kiribra's yet (`kiri setup --docker-socket` asks for the password); Testcontainers finds Kiribra through ~/.testcontainers.properties"),
+            _ => format!("{DOCKER_SOCK} is not Kiribra's yet (`kiri setup --docker-socket` asks for the password); until then DOCKER_HOST=unix://{} points a tool at Kiribra", ours.display()),
         },
     }
 }
 
-/// The first line of the `~/.testcontainers.properties` Kiri writes: only a
-/// file that starts with it is Kiri's to change or remove.
-const TESTCONTAINERS_MARK: &str = "# Written by Kiri while /var/run/docker.sock is not Kiri's (kiri setup --uninstall removes it)";
+/// The first line of the `~/.testcontainers.properties` Kiribra writes: only a
+/// file that starts with it is Kiribra's to change or remove.
+const TESTCONTAINERS_MARK: &str = "# Written by Kiribra while /var/run/docker.sock is not Kiribra's (kiri setup --uninstall removes it)";
 
 fn testcontainers_text(ours: &Path) -> String {
     format!("{TESTCONTAINERS_MARK}\ndocker.host=unix://{}\n", ours.display())
 }
 
-/// Writes (`on`) or removes Kiri's `~/.testcontainers.properties`. A file
+/// Writes (`on`) or removes Kiribra's `~/.testcontainers.properties`. A file
 /// the user (or Testcontainers itself) wrote is never touched. True when
-/// Kiri's file is there afterwards.
+/// Kiribra's file is there afterwards.
 fn testcontainers(ours: &Path, on: bool) -> io::Result<bool> {
     testcontainers_at(&home()?.join(".testcontainers.properties"), ours, on)
 }
@@ -423,7 +423,7 @@ fn testcontainers(ours: &Path, on: bool) -> io::Result<bool> {
 fn testcontainers_at(path: &Path, ours: &Path, on: bool) -> io::Result<bool> {
     let ours_text = testcontainers_text(ours);
     match std::fs::read_to_string(path) {
-        // Only exactly what Kiri wrote: Testcontainers adds keys of its own.
+        // Only exactly what Kiribra wrote: Testcontainers adds keys of its own.
         Ok(text) if text.starts_with(TESTCONTAINERS_MARK) && text.lines().filter(|l| !l.trim().is_empty() && !l.starts_with('#')).all(|l| l.starts_with("docker.host=")) => {
             if on {
                 if text != ours_text {
@@ -447,7 +447,7 @@ fn testcontainers_at(path: &Path, ours: &Path, on: bool) -> io::Result<bool> {
 }
 
 /// For the window, after the password prompt: how /var/run/docker.sock
-/// went, if it is not Kiri's.
+/// went, if it is not Kiribra's.
 pub fn docker_socket_note() -> Option<String> {
     let ours = crate::daemon::socket_path().ok()?;
     match docker_sock(&ours) {
@@ -456,12 +456,12 @@ pub fn docker_socket_note() -> Option<String> {
     }
 }
 
-/// Takes /var/run/docker.sock back, if it is still Kiri's, and the
+/// Takes /var/run/docker.sock back, if it is still Kiribra's, and the
 /// LaunchDaemon that put it there.
 fn remove_docker_socket() -> io::Result<()> {
     let ours = crate::daemon::socket_path()?;
     let _ = testcontainers(&ours, false);
-    let linked = docker_sock(&ours) == DockerSock::Kiri;
+    let linked = docker_sock(&ours) == DockerSock::Kiribra;
     if !linked && !Path::new(SOCKET_DAEMON).exists() {
         return Ok(());
     }
@@ -469,25 +469,25 @@ fn remove_docker_socket() -> io::Result<()> {
     if linked {
         command.push_str(&format!("; [ \"$(readlink {DOCKER_SOCK})\" = {} ] && rm -f {DOCKER_SOCK}; true", sh_quote(&ours.to_string_lossy())));
     }
-    as_admin(&command, "Kiri wants to remove its /var/run/docker.sock.")?;
+    as_admin(&command, "Kiribra wants to remove its /var/run/docker.sock.")?;
     println!("removed {DOCKER_SOCK}");
     Ok(())
 }
 
-/// Takes `*.kiri.local` back; containers stay on `*.kiri.localhost`.
+/// Takes `*.kiribra.local` back; containers stay on `*.kiribra.localhost`.
 pub fn remove_domains() -> io::Result<()> {
     let resolver = crate::daemon::dns::RESOLVER;
     if !Path::new(resolver).exists() {
         return Ok(());
     }
-    as_admin(&format!("rm -f {resolver}"), "Kiri wants to remove its *.kiri.local names.")?;
-    println!("removed *.kiri.local");
+    as_admin(&format!("rm -f {resolver}"), "Kiribra wants to remove its *.kiribra.local names.")?;
+    println!("removed *.kiribra.local");
     Ok(())
 }
 
 /// Runs a shell command as root through macOS's own password prompt. The
 /// script runs in this process, not through `osascript`, so the prompt says
-/// "Kiri wants to make changes". AppleScript belongs on the main thread: the
+/// "Kiribra wants to make changes". AppleScript belongs on the main thread: the
 /// window's workers hand it there, and the CLI is already on it.
 pub(crate) fn as_admin(command: &str, why: &str) -> io::Result<()> {
     let script = format!("do shell script \"{}\" with prompt \"{}\" with administrator privileges", command.replace('"', "\\\""), why.replace('"', "\\\""));
@@ -522,7 +522,7 @@ fn apple_script(source: &str) -> io::Result<()> {
     Err(io::Error::other(format!("{} ({})", field("NSAppleScriptErrorMessage").unwrap_or_default(), field("NSAppleScriptErrorNumber").unwrap_or_default())))
 }
 
-/// Kiri Lite, once its tools are downloaded: the CLI links and the build
+/// Kiribra Lite, once its tools are downloaded: the CLI links and the build
 /// builder that `kiri setup` could not make without them.
 pub fn after_tools() -> io::Result<()> {
     if let Some(contents) = bundle_contents() {
@@ -541,7 +541,7 @@ fn context(socket: &Path) -> io::Result<()> {
     write_json(&context_dir(CONTEXT.get())?.join("meta.json"), &meta)
 }
 
-/// Makes `name` the context plain `docker` uses: Kiri's own (made first if
+/// Makes `name` the context plain `docker` uses: Kiribra's own (made first if
 /// missing), "default", or another context that exists, to switch back to.
 pub fn use_context(name: &str) -> io::Result<()> {
     if name == CONTEXT.get() {
@@ -560,10 +560,10 @@ pub fn use_context(name: &str) -> io::Result<()> {
     write_json(&path, &cfg)
 }
 
-/// Links `kiri` and the app's `docker` into `~/.kiri/bin`, puts that
+/// Links `kiri` and the app's `docker` into `~/.kiribra/bin`, puts that
 /// directory on PATH, and adds docker's plugins (Compose, buildx) to the
 /// CLI's plugin search path. An existing `docker` on PATH is left alone.
-/// The docker CLI, Compose and buildx are bundled in Kiri.app, or in Kiri
+/// The docker CLI, Compose and buildx are bundled in Kiribra.app, or in Kiribra
 /// Lite downloaded to tools::dir() (nothing yet if not downloaded); `kiri`
 /// is linked either way.
 fn bundled_cli(contents: &Path) -> io::Result<()> {
@@ -573,7 +573,7 @@ fn bundled_cli(contents: &Path) -> io::Result<()> {
     let kiri = ours.join("kiri");
     let _ = std::fs::remove_file(&kiri);
     std::os::unix::fs::symlink(contents.join("MacOS/kiri"), &kiri)?;
-    // Kiri Dev's commands are run by path: ~/.kiri-dev/bin/kiri.
+    // Kiribra Dev's commands are run by path: ~/.kiribra-dev/bin/kiri.
     if !dev() {
         let h = home()?;
         shell_path(&h, &zdotdir(&h))?;
@@ -589,8 +589,8 @@ fn bundled_cli(contents: &Path) -> io::Result<()> {
     let link = ours.join("docker");
     let _ = std::fs::remove_file(&link);
     std::os::unix::fs::symlink(bin.join("docker"), &link)?;
-    // Kiri Dev's plugins stay its own: `docker --context kiri-dev`, or
-    // ~/.kiri-dev/bin/docker.
+    // Kiribra Dev's plugins stay its own: `docker --context kiribra-dev`, or
+    // ~/.kiribra-dev/bin/docker.
     if dev() {
         println!("docker and kiri commands: {}", ours.display());
         return Ok(());
@@ -611,15 +611,15 @@ fn bundled_cli(contents: &Path) -> io::Result<()> {
 
 /// `/usr/local/bin/kiri`, when the user can write there (Homebrew on Intel
 /// Macs makes it theirs). That directory is on every shell's PATH already,
-/// so `kiri` works even in a terminal opened before Kiri was. A `kiri`
-/// there that isn't Kiri's is left alone.
+/// so `kiri` works even in a terminal opened before Kiribra was. A `kiri`
+/// there that isn't Kiribra's is left alone.
 const SYSTEM_LINK: &str = "/usr/local/bin/kiri";
 
 fn system_link(kiri: &Path) {
     let link = Path::new(SYSTEM_LINK);
-    // Missing, or a link an older Kiri left (to a Kiri.app or ~/.kiri/bin
+    // Missing, or a link an older Kiribra left (to a Kiribra.app or ~/.kiribra/bin
     // that moved, or to nothing): made again to this one. Anything else there
-    // isn't Kiri's to replace; stale::stale_kiri() names it.
+    // isn't Kiribra's to replace; stale::stale_kiri() names it.
     let replace = match std::fs::read_link(link) {
         Ok(target) => target != kiri && (kiri_link(&target) || !link.exists()),
         Err(_) => link.symlink_metadata().is_err(),
@@ -630,11 +630,11 @@ fn system_link(kiri: &Path) {
     }
 }
 
-/// A link target that is some Kiri's `kiri`: inside a Kiri app bundle, or a
-/// Kiri bin directory (~/.kiri/bin, ~/.kiri-dev/bin).
+/// A link target that is some Kiribra's `kiri`: inside a Kiribra app bundle, or a
+/// Kiribra bin directory (~/.kiribra/bin, ~/.kiribra-dev/bin).
 fn kiri_link(target: &Path) -> bool {
     let t = target.to_string_lossy();
-    t.ends_with("/kiri") && (t.contains(".app/Contents/MacOS/") || t.contains("/.kiri/bin/") || t.contains("/.kiri-dev/bin/"))
+    t.ends_with("/kiri") && (t.contains(".app/Contents/MacOS/") || t.contains("/.kiribra/bin/") || t.contains("/.kiribra-dev/bin/"))
 }
 
 /// Whether `/usr/local/bin/kiri` is the link system_link() makes.
@@ -669,19 +669,19 @@ fn regex_escape(s: &str) -> String {
     })
 }
 
-/// The marked lines Kiri adds to shell profiles, and removes on uninstall.
-const PROFILE_MARK: &str = "# Added by Kiri: its docker and kiri commands (kiri setup --uninstall removes this)";
+/// The marked lines Kiribra adds to shell profiles, and removes on uninstall.
+const PROFILE_MARK: &str = "# Added by Kiribra: its docker and kiri commands (kiri setup --uninstall removes this)";
 
-/// Adds `~/.kiri/bin` to the end of PATH once, however many of the
+/// Adds `~/.kiribra/bin` to the end of PATH once, however many of the
 /// profiles a shell reads. Plain sh, for zsh and bash alike.
-const SH_LINE: &str = r#"case ":$PATH:" in *":$HOME/.kiri/bin:"*) ;; *) export PATH="$PATH:$HOME/.kiri/bin" ;; esac"#;
+const SH_LINE: &str = r#"case ":$PATH:" in *":$HOME/.kiribra/bin:"*) ;; *) export PATH="$PATH:$HOME/.kiribra/bin" ;; esac"#;
 
-/// The line Kiri 0.1.0 wrote, only to `~/.zprofile`; taken back on uninstall.
-const OLD_SH_LINE: &str = "export PATH=\"$PATH:$HOME/.kiri/bin\"";
+/// The line Kiribra 0.1.0 wrote, only to `~/.zprofile`; taken back on uninstall.
+const OLD_SH_LINE: &str = "export PATH=\"$PATH:$HOME/.kiribra/bin\"";
 
-const FISH_LINE: &str = "fish_add_path --append $HOME/.kiri/bin";
+const FISH_LINE: &str = "fish_add_path --append $HOME/.kiribra/bin";
 
-/// The shell profiles Kiri puts `~/.kiri/bin` in, so `kiri` is found in
+/// The shell profiles Kiribra puts `~/.kiribra/bin` in, so `kiri` is found in
 /// every terminal:
 /// - zsh (the macOS default) reads `.zprofile` only in login shells, which
 ///   Terminal opens but VS Code, tmux and IDE terminals do not, and a
@@ -707,22 +707,22 @@ fn zdotdir(home: &Path) -> PathBuf {
     std::env::var_os("ZDOTDIR").filter(|d| !d.is_empty()).map_or_else(|| home.to_path_buf(), PathBuf::from)
 }
 
-/// Puts ~/.kiri/bin on the shell's PATH in each profile. A profile that
+/// Puts ~/.kiribra/bin on the shell's PATH in each profile. A profile that
 /// can't be written is passed over (and logged), not the end of setup: a
 /// link to a dotfiles folder that moved made the app's first launch quit
 /// with only "No such file or directory" (#250).
 fn shell_path(home: &Path, zdotdir: &Path) -> io::Result<()> {
     for (file, line) in profiles(home, zdotdir) {
-        // A link to nothing (or to a place Kiri can't reach): writing
+        // A link to nothing (or to a place Kiribra can't reach): writing
         // through it fails when the target's folder is gone (#250), or makes
         // a file where it points. It stays as the user left it.
         if file.symlink_metadata().is_ok() && !file.try_exists().unwrap_or(false) {
             crate::diag::warn!("shell profile skipped: a link to nothing", file = file.display());
             continue;
         }
-        // Only a profile Kiri could read, or one that isn't there, is
+        // Only a profile Kiribra could read, or one that isn't there, is
         // written: a read error (not UTF-8, no read permission) must never
-        // turn into a profile holding only Kiri's lines.
+        // turn into a profile holding only Kiribra's lines.
         let text = match std::fs::read_to_string(&file) {
             Ok(t) => t,
             Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
@@ -762,13 +762,13 @@ fn remove_shell_path(home: &Path, zdotdir: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// On a Mac with no other Docker engine, plain `docker` uses Kiri. With
+/// On a Mac with no other Docker engine, plain `docker` uses Kiribra. With
 /// OrbStack or Docker Desktop around, the user's choice stays as it is.
 fn default_context() -> io::Result<()> {
     let h = home()?;
-    // Kiri's own /var/run/docker.sock is not another engine.
+    // Kiribra's own /var/run/docker.sock is not another engine.
     let ours = crate::daemon::socket_path()?;
-    let system = !matches!(docker_sock(&ours), DockerSock::Kiri) && Path::new(DOCKER_SOCK).exists();
+    let system = !matches!(docker_sock(&ours), DockerSock::Kiribra) && Path::new(DOCKER_SOCK).exists();
     let other = system
         || [h.join(".orbstack/run/docker.sock"), h.join(".docker/run/docker.sock")].iter().any(|p| p.exists())
         || Path::new("/Applications/OrbStack.app").exists()
@@ -780,7 +780,7 @@ fn default_context() -> io::Result<()> {
     }
     cfg["currentContext"] = CONTEXT.get().into();
     write_json(&path, &cfg)?;
-    println!("docker uses Kiri by default (no other Docker engine on this Mac)");
+    println!("docker uses Kiribra by default (no other Docker engine on this Mac)");
     Ok(())
 }
 
@@ -847,7 +847,7 @@ fn agent() -> io::Result<PathBuf> {
 
 /// Starts the engine through the LaunchAgent, loading it first if launchd
 /// doesn't have it (Login Items turned off and on, or a plist written but
-/// never loaded). Ok(false) when there is no agent for this copy of Kiri,
+/// never loaded). Ok(false) when there is no agent for this copy of Kiribra,
 /// and the caller starts the engine itself.
 pub fn start_agent() -> io::Result<bool> {
     if !agent_plist()?.is_file() || !agent_runs_this()? {
@@ -866,7 +866,7 @@ pub fn start_agent() -> io::Result<bool> {
     Ok(loaded)
 }
 
-/// Whether the LaunchAgent starts this copy of Kiri. One left by another
+/// Whether the LaunchAgent starts this copy of Kiribra. One left by another
 /// copy (an older download, a build elsewhere) is replaced when this one opens.
 fn agent_runs_this() -> io::Result<bool> {
     let exe = std::env::current_exe()?.canonicalize()?;
@@ -874,7 +874,7 @@ fn agent_runs_this() -> io::Result<bool> {
     Ok(std::fs::read_to_string(agent_plist()?)?.contains(&format!("<string>{esc}</string><string>daemon</string>")))
 }
 
-/// Adds the app's name to a LaunchAgent written by an older Kiri. launchd
+/// Adds the app's name to a LaunchAgent written by an older Kiribra. launchd
 /// reads it at the next login, so the running daemon is left alone.
 fn name_agent() -> io::Result<()> {
     let path = agent_plist()?;
@@ -893,7 +893,7 @@ pub fn docker_cli() -> Option<PathBuf> {
 
 fn uninstall() -> io::Result<()> {
     let _ = Command::new("/bin/launchctl").args(["bootout", &format!("gui/{}/{AGENT}", uid())]).stderr(std::process::Stdio::null()).status();
-    // Uninstalling stops everything this Kiri runs: the engine (the agent,
+    // Uninstalling stops everything this Kiribra runs: the engine (the agent,
     // just booted out, which stops the VM and its containers) and any window
     // or kiri command still open from this app (`kiri share`, a second
     // daemon). Not this process: it's the one uninstalling.
@@ -903,7 +903,7 @@ fn uninstall() -> io::Result<()> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
-    // Only a context that still points at Kiri's socket is ours to remove.
+    // Only a context that still points at Kiribra's socket is ours to remove.
     let dir = context_dir(CONTEXT.get())?;
     let meta = read_json(&dir.join("meta.json"))?;
     if meta["Endpoints"]["docker"]["Host"].as_str().is_some_and(|h| h.ends_with(&format!("{}/run/docker.sock", crate::flavor::STATE))) {
@@ -922,13 +922,13 @@ fn uninstall() -> io::Result<()> {
     // `get_mut`: indexing would add the key to a config that lacks it.
     if let Some(dirs) = cfg.get_mut("cliPluginsExtraDirs").and_then(Value::as_array_mut) {
         let before = dirs.len();
-        dirs.retain(|d| !d.as_str().is_some_and(|s| s.contains("Kiri.app/Contents/Resources/bin")));
+        dirs.retain(|d| !d.as_str().is_some_and(|s| s.contains("Kiribra.app/Contents/Resources/bin")));
         changed |= dirs.len() != before;
     }
     if changed {
         write_json(&path, &cfg)?;
     }
-    // Docker's builder back as it was, before Kiri's goes.
+    // Docker's builder back as it was, before Kiribra's goes.
     if let Err(e) = crate::buildwith::places().and_then(|p| p.uninstall()) {
         println!("could not give docker build back its own builder ({e})");
     }
@@ -940,7 +940,7 @@ fn uninstall() -> io::Result<()> {
     }
     let _ = std::fs::remove_file(bin_dir()?.join("docker"));
     let _ = std::fs::remove_file(bin_dir()?.join("kiri"));
-    // The cluster's kubectl context (`kiri k8s`); the cluster stays in Kiri's data.
+    // The cluster's kubectl context (`kiri k8s`); the cluster stays in Kiribra's data.
     crate::k8s::forget();
     // Every flavor has a helper of its own.
     if let Err(e) = crate::usb::helper::remove() {
@@ -951,7 +951,7 @@ fn uninstall() -> io::Result<()> {
         return Ok(());
     }
     match home().and_then(|h| remove_shell_path(&h, &zdotdir(&h))) {
-        Ok(()) => println!("removed ~/.kiri/bin from shell profiles"),
+        Ok(()) => println!("removed ~/.kiribra/bin from shell profiles"),
         Err(e) => println!("could not tidy the shell profiles ({e})"),
     }
     if let Err(e) = remove_domains() {
@@ -960,7 +960,7 @@ fn uninstall() -> io::Result<()> {
     if let Err(e) = remove_docker_socket() {
         println!("could not remove {DOCKER_SOCK} ({e})");
     }
-    println!("Kiri's data stays in ~/Library/Application Support/Kiri; delete it to remove images and volumes too");
+    println!("Kiribra's data stays in ~/Library/Application Support/Kiribra; delete it to remove images and volumes too");
     Ok(())
 }
 
@@ -989,7 +989,7 @@ mod tests {
         let at = |engines: &[std::path::PathBuf]| super::docker_sock_at(&link, &ours, engines);
         assert_eq!(at(&[]), Free);
         std::os::unix::fs::symlink(&ours, &link).unwrap();
-        assert_eq!(at(&[]), Kiri, "Kiri's link, even with the daemon stopped");
+        assert_eq!(at(&[]), Kiribra, "Kiribra's link, even with the daemon stopped");
         // OrbStack's link with OrbStack not running: still OrbStack's.
         std::fs::remove_file(&link).unwrap();
         let orb = d.join(".orbstack/run/docker.sock");
@@ -1012,10 +1012,10 @@ mod tests {
     fn testcontainers_file_is_kiris_only_when_marked() {
         let d = scratch("tc");
         let path = d.join(".testcontainers.properties");
-        let ours = std::path::Path::new("/Users/me/.kiri/run/docker.sock");
+        let ours = std::path::Path::new("/Users/me/.kiribra/run/docker.sock");
         assert!(super::testcontainers_at(&path, ours, true).unwrap());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), super::testcontainers_text(ours));
-        assert!(std::fs::read_to_string(&path).unwrap().contains("docker.host=unix:///Users/me/.kiri/run/docker.sock\n"));
+        assert!(std::fs::read_to_string(&path).unwrap().contains("docker.host=unix:///Users/me/.kiribra/run/docker.sock\n"));
         assert!(!super::testcontainers_at(&path, ours, false).unwrap());
         assert!(!path.exists());
         // The user's own file, or one Testcontainers has added to, stays.
@@ -1030,7 +1030,7 @@ mod tests {
 
     #[test]
     fn quotes_for_sh() {
-        assert_eq!(super::sh_quote("/Users/o'neil/.kiri"), r"'/Users/o'\''neil/.kiri'");
+        assert_eq!(super::sh_quote("/Users/o'neil/.kiribra"), r"'/Users/o'\''neil/.kiribra'");
     }
 
     // #250: a profile that is a link to nowhere (a dotfiles folder that
@@ -1047,9 +1047,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&h);
     }
 
-    // #250, as Nix home-manager sets a Mac up: a profile Kiri can read but
+    // #250, as Nix home-manager sets a Mac up: a profile Kiribra can read but
     // not write (a link into a read-only store) is passed over, whether or
-    // not Kiri's line is in it already, and the other profiles get the line.
+    // not Kiribra's line is in it already, and the other profiles get the line.
     #[test]
     fn a_read_only_profile_does_not_stop_setup() {
         use std::os::unix::fs::PermissionsExt;
@@ -1074,8 +1074,8 @@ mod tests {
         }
     }
 
-    // A profile Kiri can't read as text is left exactly as it was, never
-    // replaced by Kiri's lines alone.
+    // A profile Kiribra can't read as text is left exactly as it was, never
+    // replaced by Kiribra's lines alone.
     #[test]
     fn an_unreadable_profile_is_left_alone() {
         let h = scratch("unreadable");
@@ -1091,7 +1091,7 @@ mod tests {
     fn shell_profiles_put_kiri_on_path_once_and_take_it_back() {
         let h = scratch("profiles");
         std::fs::write(h.join(".zprofile"), "export A=1").unwrap();
-        // An install by Kiri 0.1.0: the old line, in .zprofile only.
+        // An install by Kiribra 0.1.0: the old line, in .zprofile only.
         std::fs::write(h.join(".profile"), format!("export B=2\n\n{}\n{}\n", super::PROFILE_MARK, super::OLD_SH_LINE)).unwrap();
         std::fs::write(h.join(".bashrc"), "").unwrap();
         super::shell_path(&h, &h).unwrap();
@@ -1120,6 +1120,6 @@ mod tests {
             .env("PATH", "/usr/bin:/bin")
             .output()
             .unwrap();
-        assert_eq!(String::from_utf8_lossy(&out.stdout), "/usr/bin:/bin:/h/.kiri/bin");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "/usr/bin:/bin:/h/.kiribra/bin");
     }
 }

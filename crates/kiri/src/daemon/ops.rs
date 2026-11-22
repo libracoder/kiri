@@ -391,7 +391,7 @@ fn image_prune(req: &Request, engine: &Engine) -> Result<Value, Error> {
         return Err(Error::Conflict(why));
     }
     let f = filters(req, &["dangling", "until", "label", "label!"])?;
-    // Without `-a` only untagged images go; Kiri keeps none of those around.
+    // Without `-a` only untagged images go; Kiribra keeps none of those around.
     let dangling_only = f.bool("dangling").unwrap_or(true);
     let until = prune_until(&f, "until")?;
     let used: Vec<String> = engine.each(|c| Some(c.spec.image_id.clone()));

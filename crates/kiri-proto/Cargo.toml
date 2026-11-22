@@ -1,6 +1,6 @@
 [package]
 name = "kiri-proto"
-description = "Wire protocol between the Kiri host and guest"
+description = "Wire protocol between the Kiribra host and guest"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

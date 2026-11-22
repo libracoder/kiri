@@ -1,4 +1,4 @@
-//! Wire protocol between `kiri share` and the Kiri Share edge.
+//! Wire protocol between `kiri share` and the Kiribra Share edge.
 //!
 //! The client dials the edge over TLS on port 443 (ALPN [`ALPN`]) and keeps
 //! that one connection open. Each visitor connection the edge accepts for the
@@ -115,7 +115,7 @@ pub struct Hello<'a> {
     pub protocol: u16,
     /// The account token from `kiri share login`.
     pub token: &'a str,
-    /// Random id of this Kiri install, kept in `~/.kiri/share.json`.
+    /// Random id of this Kiribra install, kept in `~/.kiribra/share.json`.
     pub device: &'a str,
     /// Preferred first label of the hostname, such as a container name. The
     /// edge sanitises it and adds a random suffix.
@@ -440,7 +440,7 @@ mod tests {
     fn round_trip() {
         round(Msg::Hello(Hello { protocol: PROTOCOL, token: "tok", device: "dev", name: "web", target: "localhost:3000", client: "kiri 0.1.0", features: 0, machine: "", host: "" }));
         round(Msg::Hello(Hello { protocol: PROTOCOL, token: "tok", device: "dev", name: "web", target: "localhost:3000", client: "kiri 0.1.0", features: FEATURE_ATTEST, machine: "", host: "" }));
-        round(Msg::Hello(Hello { protocol: PROTOCOL, token: "tok", device: "dev", name: "web", target: "localhost:3000", client: "Kiri Dev 0.9.4", features: FEATURE_ATTEST, machine: "3f9a0c41d2e87b65", host: "paul-mbp" }));
+        round(Msg::Hello(Hello { protocol: PROTOCOL, token: "tok", device: "dev", name: "web", target: "localhost:3000", client: "Kiribra Dev 0.9.4", features: FEATURE_ATTEST, machine: "3f9a0c41d2e87b65", host: "paul-mbp" }));
         round(Msg::Welcome(Welcome { url: "https://web-x7k2.runkiri.cloud", rate: 512 * 1024, remaining: u64::MAX, warning: true, domains: "", lanes: 0, lane_key: "", window: 0 }));
         round(Msg::Welcome(Welcome { url: "https://web.runkiri.cloud", rate: 0, remaining: u64::MAX, warning: false, domains: "https://dev.example.com,https://b.example.org", lanes: 0, lane_key: "", window: 0 }));
         round(Msg::Welcome(Welcome { url: "https://web.runkiri.cloud", rate: 0, remaining: u64::MAX, warning: false, domains: "", lanes: 3, lane_key: "k3y", window: 1 << 20 }));

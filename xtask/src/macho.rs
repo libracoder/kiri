@@ -1,7 +1,7 @@
 //! A Mach-O executable's UUID (its `LC_UUID` load command), rewritten for one
 //! `app-dev` copy. macOS keeps an app's Local Network permission against the
 //! UUIDs of its executable, not its bundle id alone: every app-dev copy of
-//! one build (Kiri Repro, Kiri Gate, ...) shares the binary's UUID, so a copy
+//! one build (Kiribra Repro, Kiribra Gate, ...) shares the binary's UUID, so a copy
 //! that was never allowed takes local-network access away from one that
 //! was, and its pulls from a registry on the LAN fail with "No route to
 //! host" (os error 65). Each copy gets a UUID of its own, derived from the
@@ -149,9 +149,9 @@ mod tests {
     fn each_name_gets_its_own_uuid_and_nothing_else_changes() {
         let orig = thin();
         let (mut a, mut b, mut a2) = (orig.clone(), orig.clone(), orig.clone());
-        restamp_uuid(&mut a, "dev.kiri.app.repro").unwrap();
-        restamp_uuid(&mut b, "dev.kiri.app.lanprobe").unwrap();
-        restamp_uuid(&mut a2, "dev.kiri.app.repro").unwrap();
+        restamp_uuid(&mut a, "dev.kiribra.app.repro").unwrap();
+        restamp_uuid(&mut b, "dev.kiribra.app.lanprobe").unwrap();
+        restamp_uuid(&mut a2, "dev.kiribra.app.repro").unwrap();
         let (ua, ub) = (uuid_of(&a).unwrap(), uuid_of(&b).unwrap());
         assert_ne!(ua, UUID);
         assert_ne!(ua, ub);
@@ -182,7 +182,7 @@ mod tests {
         fat[off..off + slice.len()].copy_from_slice(&slice);
         fat[2 * off..2 * off + slice.len()].copy_from_slice(&slice);
         let before = fat.clone();
-        restamp_uuid(&mut fat, "dev.kiri.app.gate").unwrap();
+        restamp_uuid(&mut fat, "dev.kiribra.app.gate").unwrap();
         for s in [off, 2 * off] {
             assert_ne!(uuid_of(&fat[s..]).unwrap(), UUID);
         }
@@ -205,7 +205,7 @@ mod tests {
     fn a_real_binary_keeps_every_other_byte() {
         let orig = std::fs::read(std::env::current_exe().unwrap()).unwrap();
         let mut copy = orig.clone();
-        restamp_uuid(&mut copy, "dev.kiri.app.lanprobe").unwrap();
+        restamp_uuid(&mut copy, "dev.kiribra.app.lanprobe").unwrap();
         assert_ne!(uuid_of(&copy), uuid_of(&orig));
         let diff: Vec<usize> = orig.iter().zip(&copy).enumerate().filter(|(_, (a, b))| a != b).map(|(i, _)| i).collect();
         assert!(!diff.is_empty() && diff.len() <= 16 && diff.last().unwrap() - diff[0] < 16);

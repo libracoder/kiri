@@ -1,9 +1,9 @@
-//! Kiri's images as a registry, for its BuildKit: `FROM myapp:dev` (an
+//! Kiribra's images as a registry, for its BuildKit: `FROM myapp:dev` (an
 //! image built or loaded here, never pushed) works as it does with Docker.
 //!
 //! A read-only registry API on 127.0.0.1, which containers reach at
 //! host.docker.internal. buildkitd.toml names it as a mirror of every
-//! registry Kiri has images from; a mirror that answers 404 is skipped, so
+//! registry Kiribra has images from; a mirror that answers 404 is skipped, so
 //! anything not here comes from the registry itself. Paths carry a secret
 //! (`/v2/<token>/<registry>/<repo>/…`), so other local users can't read
 //! images through it. Manifests are made from the store's records (layers,
@@ -83,7 +83,7 @@ pub fn start(engine: &Arc<Engine>) {
     });
 }
 
-/// buildkitd.toml lines: this mirror for every registry Kiri has images
+/// buildkitd.toml lines: this mirror for every registry Kiribra has images
 /// from (Docker Hub always), over plain HTTP.
 #[cfg(target_os = "linux")]
 fn mirror_host(networks: &super::network::Networks) -> String {
@@ -218,7 +218,7 @@ enum Found {
     Blob(std::path::PathBuf, String),
 }
 
-/// An image's manifest as Kiri serves it, and its digest.
+/// An image's manifest as Kiribra serves it, and its digest.
 fn manifest(store: &kiri_image::Store, i: &Image) -> Option<(Vec<u8>, String)> {
     let config_size = std::fs::metadata(store.blob_path(&i.config_digest).ok()?).ok()?.len();
     let m = json!({

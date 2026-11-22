@@ -16,7 +16,7 @@ const lists = () => kiri.on({ type: "lists", containers: ctrs, images: [], volum
 const svc = (name) => ({ name, image: name + ":dev", build: "", ports: [], volumes: [], depends: [], networks: ["default"], kinds: [] });
 const mem = (p) => ctrs.filter((c) => c.Labels["com.docker.compose.project"] === p).map((c) => ({ service: c.Labels["com.docker.compose.service"], id: c.Id, name: c.Names[0].slice(1), image: c.Image, state: c.State, status: c.Status }));
 ui.vm = "running";
-kiri.on({ type: "status", version: "0.1.4", dev: true, share: true, app: "Kiri", ours: "kiri", context: "kiri" });
+kiri.on({ type: "status", version: "0.1.4", dev: true, share: true, app: "Kiribra", ours: "kiri", context: "kiri" });
 lists();
 kiri.on({ type: "composeprojects", logos: {}, projects: [
   { name: "blog", dir: "/w/blog", files: ["/w/blog/compose.yaml"], readable: true, services: [svc("app"), svc("worker")], containers: mem("blog") },

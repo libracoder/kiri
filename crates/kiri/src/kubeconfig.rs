@@ -1,11 +1,11 @@
-//! The cluster's entry in kubectl's own file, written by Kiri itself with
+//! The cluster's entry in kubectl's own file, written by Kiribra itself with
 //! no kubectl: `kiri k8s` on the Mac and Linux (crates/kiri/src/k8s.rs) and
 //! the window on Windows (crates/kiri-win/src/k8s.rs, which includes this
 //! file) use it.
 //!
 //! The file is the first of `$KUBECONFIG`, else `.kube/config` in the home
 //! folder (`%USERPROFILE%` on Windows), where kubectl looks. Only the
-//! cluster, user and context named after the engine (`kiri`, `kiri-dev`,
+//! cluster, user and context named after the engine (`kiri`, `kiribra-dev`,
 //! …) are added, replaced or removed; every other line stays as it was, in
 //! its place, comments too. `current-context` changes only when asked
 //! (`kiri k8s start --use`), or a new file has ours. It is written to a
@@ -345,7 +345,7 @@ users:
     client-key-data: S0VZ
 ";
 
-    /// A file as kubectl and `aws eks update-kubeconfig` leave it, with another Kiri's context.
+    /// A file as kubectl and `aws eks update-kubeconfig` leave it, with another Kiribra's context.
     const MINE: &str = "apiVersion: v1
 clusters:
 - cluster:
@@ -355,16 +355,16 @@ clusters:
 - cluster:
     certificate-authority-data: REVW
     server: https://127.0.0.1:6444
-  name: kiri-dev
+  name: kiribra-dev
 contexts:
 - context:
     cluster: arn:aws:eks:eu-central-1:1:cluster/prod
     user: arn:aws:eks:eu-central-1:1:cluster/prod
   name: prod
 - context:
-    cluster: kiri-dev
-    user: kiri-dev
-  name: kiri-dev
+    cluster: kiribra-dev
+    user: kiribra-dev
+  name: kiribra-dev
 current-context: prod
 kind: Config
 preferences: {}
@@ -377,7 +377,7 @@ users:
       - --region
       - eu-central-1
       command: aws
-- name: kiri-dev
+- name: kiribra-dev
   user:
     client-certificate-data: REVWQ0VSVA==
 ";
@@ -403,7 +403,7 @@ users:
         let ours = from_k3s(K3S, "kiri", 6445);
         let merged = merge(MINE, &ours, "kiri", false).unwrap();
         for list in LISTS {
-            let want = if list == "contexts" { vec!["prod", "kiri-dev", "kiri"] } else { vec!["arn:aws:eks:eu-central-1:1:cluster/prod", "kiri-dev", "kiri"] };
+            let want = if list == "contexts" { vec!["prod", "kiribra-dev", "kiri"] } else { vec!["arn:aws:eks:eu-central-1:1:cluster/prod", "kiribra-dev", "kiri"] };
             assert_eq!(names(&merged, list), want, "{list}");
         }
         // Taking ours out again gives the file back exactly.
@@ -423,8 +423,8 @@ users:
         let moved = merge(&merged, &from_k3s(K3S, "kiri", 6445).replace("Q0E=", "TkVXQ0E="), "kiri", false).unwrap();
         assert!(moved.contains("https://127.0.0.1:6445") && moved.contains("TkVXQ0E="));
         assert_eq!(moved.matches("name: kiri\n").count(), 3);
-        // kiri-dev's own port is untouched.
-        assert!(moved.contains("server: https://127.0.0.1:6444\n  name: kiri-dev"));
+        // kiribra-dev's own port is untouched.
+        assert!(moved.contains("server: https://127.0.0.1:6444\n  name: kiribra-dev"));
         assert_eq!(names(&moved, "clusters").len(), 3);
     }
 
@@ -458,8 +458,8 @@ users:
 
     #[test]
     fn removing_ours_leaves_others_and_clears_a_current_ours() {
-        let merged = merge(MINE, &from_k3s(K3S, "kiri-dev", 6446), "kiri-dev", true).unwrap();
-        let removed = remove(&merged, "kiri-dev").unwrap();
+        let merged = merge(MINE, &from_k3s(K3S, "kiribra-dev", 6446), "kiribra-dev", true).unwrap();
+        let removed = remove(&merged, "kiribra-dev").unwrap();
         assert_eq!(names(&removed, "contexts"), ["prod"]);
         assert!(removed.contains("current-context: \"\"\n"));
         assert_eq!(remove(MINE, "kiri").unwrap(), MINE);

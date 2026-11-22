@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Kiri's speed check: main against a pull request, on the same machine.
+"""Kiribra's speed check: main against a pull request, on the same machine.
 
 Two Linux engines run side by side, one built from main and one from the
 pull request, each in its own privileged container (see .github/workflows/

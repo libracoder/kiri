@@ -13,7 +13,7 @@ const C = (id, name, state, project, service) => ({ Id: id, Names: ["/" + name],
 const ctrs = [C("solo", "solo", "running"), C("w1", "shop-web-1", "running", "shop", "web"), C("d1", "shop-db-1", "exited", "shop", "db")];
 const svc = (name) => ({ name, image: "nginx:alpine", build: "", ports: [], volumes: [], depends: [], networks: ["default"], kinds: [] });
 ui.vm = "running";
-kiri.on({ type: "status", version: "0.1.4", dev: true, share: true, app: "Kiri", ours: "kiri", context: "kiri" });
+kiri.on({ type: "status", version: "0.1.4", dev: true, share: true, app: "Kiribra", ours: "kiri", context: "kiri" });
 kiri.on({ type: "lists", containers: ctrs, images: [], volumes: [], networks: [] });
 kiri.on({ type: "composeprojects", logos: {}, projects: [{ name: "shop", dir: "/w/shop", files: ["/w/shop/compose.yaml"], readable: true, services: [svc("web"), svc("db")],
   containers: ctrs.filter((c) => c.Labels["com.docker.compose.project"]).map((c) => ({ service: c.Labels["com.docker.compose.service"], id: c.Id, name: c.Names[0].slice(1), image: c.Image, state: c.State, status: c.Status })) }] });

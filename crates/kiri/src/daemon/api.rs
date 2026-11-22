@@ -1,6 +1,6 @@
 //! The Docker Engine API: the subset `docker run`, `ps`, `logs`, `stop`,
 //! `rm`, `images`, `pull`, `rmi`, `version` and `info` use. Anything else
-//! answers 404 with a message saying Kiri does not support it yet.
+//! answers 404 with a message saying Kiribra does not support it yet.
 
 use std::io::{self, BufReader};
 use std::os::fd::AsRawFd;
@@ -29,11 +29,11 @@ pub fn serve(stream: UnixStream, engine: Arc<Engine>) -> io::Result<()> {
         }
         // The window's action this request is part of: the engine's lines
         // for it carry the same op.
-        let _op = req.header("X-Kiri-Op").filter(|o| crate::diag::valid_op(o)).map(|o| crate::diag::enter_op(o.to_owned()));
+        let _op = req.header("X-Kiribra-Op").filter(|o| crate::diag::valid_op(o)).map(|o| crate::diag::enter_op(o.to_owned()));
         http::serving(&req);
-        // Kiri's own window checks in every few seconds; that isn't use, and
+        // Kiribra's own window checks in every few seconds; that isn't use, and
         // counting it would keep the VM from ever sleeping while it's open.
-        if req.header("X-Kiri-Background").is_none() {
+        if req.header("X-Kiribra-Background").is_none() {
             engine.touch();
         }
         match route(&req, &engine, &mut w, &mut r) {
@@ -130,16 +130,16 @@ fn route(req: &Request, engine: &Arc<Engine>, w: &mut UnixStream, r: &mut BufRea
     let m = req.method.as_str();
     match (m, p) {
         ("GET" | "HEAD", "/_ping") => {
-            // Builder-Version 1: the classic POST /build, which Kiri serves
+            // Builder-Version 1: the classic POST /build, which Kiribra serves
             // with its managed BuildKit (builder.rs). "2" would tell older
             // CLIs and Compose to use BuildKit inside the engine (/session,
-            // /grpc), which Kiri doesn't have.
+            // /grpc), which Kiribra doesn't have.
             http::respond_with(w, 200, "text/plain; charset=utf-8", "Builder-Version: 1\r\n", if m == "HEAD" { b"" } else { b"OK" })?;
             return Ok(Next::KeepAlive);
         }
         ("GET", "/version") => return reply(w, Ok(version()), 200),
         ("POST", "/auth") => return reply(w, auth(req), 200),
-        // Kiri's own: the window's Start and Stop.
+        // Kiribra's own: the window's Start and Stop.
         // Start: no longer stopped, and the VM up.
         ("POST", "/kiri/wake") => {
             engine.unstop();
@@ -174,14 +174,14 @@ fn route(req: &Request, engine: &Arc<Engine>, w: &mut UnixStream, r: &mut BufRea
             let id = p.strip_prefix("/kiri/containers/").and_then(|r| r.strip_suffix("/ports")).unwrap_or_default();
             return reply(w, set_ports(req, engine, id), 204);
         }
-        // Kiri's own: the TCP ports a container listens on, for publishing
+        // Kiribra's own: the TCP ports a container listens on, for publishing
         // ones its image never declared. `local` are the ones only it can
         // reach (bound to loopback).
         ("GET", p) if p.strip_prefix("/kiri/containers/").and_then(|r| r.strip_suffix("/listening")).is_some_and(|id| !id.is_empty()) => {
             let id = p.strip_prefix("/kiri/containers/").and_then(|r| r.strip_suffix("/listening")).unwrap_or_default();
             return reply(w, engine.listening(id).map(|(tcp, local)| json!({"tcp": tcp, "local": local})), 200);
         }
-        // Kiri's own: a loopback port reaching a Kubernetes service or pod,
+        // Kiribra's own: a loopback port reaching a Kubernetes service or pod,
         // for Share. `{"ip": "10.43.0.5", "port": 80}` → `{"port": 50123}`.
         ("POST", "/kiri/k8s/forward") => return reply(w, k8s_forward(req, engine), 200),
         ("DELETE", p) if p.strip_prefix("/kiri/k8s/forward/").is_some_and(|n| n.parse::<u16>().is_ok()) => {
@@ -270,7 +270,7 @@ fn route(req: &Request, engine: &Arc<Engine>, w: &mut UnixStream, r: &mut BufRea
         match (m, action) {
             ("GET", "json") => return reply(w, container_inspect(engine, id), 200),
             ("POST", "start") => {
-                // An idle BuildKit container that Kiri paused itself counts
+                // An idle BuildKit container that Kiribra paused itself counts
                 // as running: the next build resumes it.
                 match engine.with(id, |c| (c.status == Status::Running, c.paused && !super::engine::is_builder(c))) {
                     Ok((_, true)) => return reply(w, Err(Error::Conflict("cannot start a paused container, try unpause instead".into())), 204),
@@ -346,7 +346,7 @@ fn route(req: &Request, engine: &Arc<Engine>, w: &mut UnixStream, r: &mut BufRea
         }
     }
     crate::diag::warn!("unsupported request", method = m, path = p);
-    http::error(w, 404, &format!("Kiri does not support {m} {p} yet"))?;
+    http::error(w, 404, &format!("Kiribra does not support {m} {p} yet"))?;
     Ok(Next::KeepAlive)
 }
 
@@ -362,7 +362,7 @@ fn go_arch() -> &'static str {
 }
 
 /// On an Intel Mac the VM is x86-64 and there is no Rosetta for Linux:
-/// amd64 images run natively, and Kiri does not emulate Arm (no qemu), so
+/// amd64 images run natively, and Kiribra does not emulate Arm (no qemu), so
 /// an image with no amd64 build is refused with the reason rather than
 /// failing later with `exec format error`. `None` elsewhere, and when
 /// `platforms` has a linux/amd64 one.
@@ -377,15 +377,15 @@ fn amd64_only_refusal(image: &str, platforms: &[String]) -> Option<String> {
     if platforms.iter().any(|p| p == "linux/amd64" || p.starts_with("linux/amd64/")) {
         return None;
     }
-    let built = if platforms.is_empty() { "no platform Kiri can run".to_owned() } else { platforms.join(", ") };
+    let built = if platforms.is_empty() { "no platform Kiribra can run".to_owned() } else { platforms.join(", ") };
     Some(format!(
-        "{image} is built for {built}, and this Intel Mac runs linux/amd64 images (Kiri does not emulate Arm): use an image with a linux/amd64 build"
+        "{image} is built for {built}, and this Intel Mac runs linux/amd64 images (Kiribra does not emulate Arm): use an image with a linux/amd64 build"
     ))
 }
 
 /// The kernel containers run on, as `uname -r` prints it. On Linux (native
 /// and WSL 2) the engine runs straight on the host kernel, so that is read;
-/// on macOS it is Kiri's own guest kernel in the VM.
+/// on macOS it is Kiribra's own guest kernel in the VM.
 fn kernel_version() -> String {
     #[cfg(target_os = "linux")]
     if let Some(release) = linux_kernel_release() {
@@ -417,20 +417,20 @@ fn parse_release(raw: &str) -> Option<String> {
     (!release.is_empty()).then(|| release.to_owned())
 }
 
-/// The Docker Engine release whose API Kiri serves (`http::API_VERSION`,
+/// The Docker Engine release whose API Kiribra serves (`http::API_VERSION`,
 /// 1.47: Docker 27.3 to 27.5), reported as the engine's `Version`. Clients
 /// gate on it as a Docker version (Testcontainers wants at least 1.6.0), so
-/// Kiri's own version there read as an ancient engine. Kiri's own version is
-/// `KiriVersion`, and a component named "Kiri". Moves with `API_VERSION`.
+/// Kiribra's own version there read as an ancient engine. Kiribra's own version is
+/// `KiriVersion`, and a component named "Kiribra". Moves with `API_VERSION`.
 pub const ENGINE_VERSION: &str = "27.5.1";
 
 fn version() -> Value {
     let kiri = env!("CARGO_PKG_VERSION");
     json!({
-        "Platform": {"Name": "Kiri"},
+        "Platform": {"Name": "Kiribra"},
         "Components": [
             {"Name": "Engine", "Version": ENGINE_VERSION, "Details": {"ApiVersion": http::API_VERSION, "MinAPIVersion": "1.24", "Arch": go_arch(), "Os": "linux", "KernelVersion": kernel_version(), "GoVersion": "n/a (Rust)", "GitCommit": ""}},
-            {"Name": "Kiri", "Version": kiri, "Details": {}},
+            {"Name": "Kiribra", "Version": kiri, "Details": {}},
         ],
         "Version": ENGINE_VERSION,
         "KiriVersion": kiri,
@@ -460,7 +460,7 @@ fn info(engine: &Engine) -> Value {
         "Driver": "overlayfs",
         "ServerVersion": ENGINE_VERSION,
         "KiriVersion": env!("CARGO_PKG_VERSION"),
-        "OperatingSystem": "Kiri",
+        "OperatingSystem": "Kiribra",
         "OSType": "linux",
         "Architecture": std::env::consts::ARCH,
         "KernelVersion": kernel_version(),
@@ -579,7 +579,7 @@ fn images(req: &Request, engine: &Engine) -> Result<Value, Error> {
         list.iter()
             .zip(labels)
             .filter_map(|(i, labels)| {
-                // Kiri keeps an untagged image under its ID.
+                // Kiribra keeps an untagged image under its ID.
                 let untagged = i.name.starts_with("sha256:") && !list.iter().any(|o| o.config_digest == i.config_digest && !o.name.starts_with("sha256:"));
                 if i.name.starts_with("sha256:") && !untagged {
                     return None;
@@ -983,7 +983,7 @@ fn set_ports(req: &Request, engine: &Engine, id: &str) -> Result<Value, Error> {
     Ok(Value::Null)
 }
 
-/// Kiri's own: a container's whole environment, `NAME=value` each. A running
+/// Kiribra's own: a container's whole environment, `NAME=value` each. A running
 /// container restarts with it; its files are kept.
 fn k8s_forward(req: &Request, engine: &Engine) -> Result<Value, Error> {
     let body: Value = serde_json::from_slice(&req.body).map_err(|e| Error::BadRequest(format!("invalid JSON: {e}")))?;
@@ -1260,7 +1260,7 @@ fn port_bindings(body: &Value, engine: &Engine, image: &kiri_image::Image) -> Re
         let (port, proto) = key.split_once('/').unwrap_or((key, "tcp"));
         let port = port.parse().map_err(|_| Error::BadRequest(format!("invalid port {key}")))?;
         if proto != "tcp" && proto != "udp" {
-            return Err(Error::BadRequest(format!("Kiri forwards TCP and UDP ports, not {key}")));
+            return Err(Error::BadRequest(format!("Kiribra forwards TCP and UDP ports, not {key}")));
         }
         Ok((port, proto.to_owned()))
     };
@@ -1348,7 +1348,7 @@ fn mac_shared(src: &str) -> bool {
 /// /etc is the Mac's link to /private/etc, and Compose files written for a
 /// Linux host mount paths in it:
 /// - /etc/passwd, /etc/os-release and the others in `hostetc::FILES` are
-///   expected to be Linux's, so they are the ones Kiri keeps; and /etc
+///   expected to be Linux's, so they are the ones Kiribra keeps; and /etc
 ///   itself is the folder of them.
 /// - anything else the Mac has there (/etc/hosts, /etc/localtime) is the
 ///   Mac's.
@@ -1364,7 +1364,7 @@ fn mac_source(src: &str) -> Option<String> {
         _ => None,
     };
     if let Some(kept) = kept {
-        // Kiri's data folder is in the person's home, which is shared. If
+        // Kiribra's data folder is in the person's home, which is shared. If
         // it cannot be written, the path is the VM's, as it was.
         return kept.ok().and_then(|p| p.into_os_string().into_string().ok()).filter(|p| mac_shared(p));
     }
@@ -1572,7 +1572,7 @@ fn mounts(body: &Value, engine: &Engine, image: &kiri_image::Image) -> Result<Mo
             f.join(",")
         };
         // The engine's own socket (Testcontainers' Ryuk, CI runners): the VM's
-        // relay to this daemon on a Mac, or Kiri's socket on a Linux host.
+        // relay to this daemon on a Mac, or Kiribra's socket on a Linux host.
         let engine_sock = if kind == "bind" { super::binds::engine_socket(src) } else { None };
         match kind {
             "bind" if engine_sock.is_some() => {
@@ -1588,7 +1588,7 @@ fn mounts(body: &Value, engine: &Engine, image: &kiri_image::Image) -> Result<Mo
                     return Err(Error::BadRequest(format!("invalid mount source {src}: must be an absolute path")));
                 }
                 // Where the source is on this machine: itself, or on a Mac
-                // the path it leads to (a file Kiri keeps for /etc/passwd).
+                // the path it leads to (a file Kiribra keeps for /etc/passwd).
                 let here = if cfg!(target_os = "macos") { mac_source(src) } else { Some(src.to_owned()) };
                 let Some(here) = here else {
                     // The guest makes a missing source itself, as Docker does on Linux.
@@ -1638,7 +1638,7 @@ fn mounts(body: &Value, engine: &Engine, image: &kiri_image::Image) -> Result<Mo
                 out.guest.push(format!("tmpfs\t{dst}\t{}", flag(&format!("tmpfs,noexec,nosuid,nodev,{extra}"))));
                 out.info.push(json!({"Type": "tmpfs", "Source": "", "Destination": dst, "Mode": "", "RW": !ro, "Propagation": ""}));
             }
-            other => return Err(Error::BadRequest(format!("Kiri does not support {other} mounts"))),
+            other => return Err(Error::BadRequest(format!("Kiribra does not support {other} mounts"))),
         }
         Ok(())
     };
@@ -1689,7 +1689,7 @@ fn mounts(body: &Value, engine: &Engine, image: &kiri_image::Image) -> Result<Mo
         if kind == "volume" && !src.is_empty() && engine.volume_get(src).is_none() && !driver_opts.is_null() {
             match driver_opts["Name"].as_str().unwrap_or("") {
                 "" | "local" => {}
-                d => return Err(Error::BadRequest(format!("Kiri supports only local volumes, not {d}"))),
+                d => return Err(Error::BadRequest(format!("Kiribra supports only local volumes, not {d}"))),
             }
             let options = super::volumes::local_options(&driver_opts["Options"]).map_err(Error::BadRequest)?;
             engine.volume_ensure_with(src, m["VolumeOptions"]["Labels"].clone(), options)?;
@@ -1762,7 +1762,7 @@ fn volume_create(req: &Request, engine: &Engine) -> Result<Value, Error> {
     let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
     match body["Driver"].as_str().unwrap_or("local") {
         "" | "local" => {}
-        d => return Err(Error::BadRequest(format!("Kiri supports only local volumes, not {d}"))),
+        d => return Err(Error::BadRequest(format!("Kiribra supports only local volumes, not {d}"))),
     }
     let name = match body["Name"].as_str().unwrap_or("") {
         "" => super::engine::random_hex(32),
@@ -2092,7 +2092,7 @@ pub(super) fn create(req: &Request, engine: &Engine) -> Result<Value, Error> {
         return Err(Error::BadRequest("no image specified".into()));
     }
     let host = &body["HostConfig"];
-    // A seccomp profile Kiri cannot apply fails the create, before anything
+    // A seccomp profile Kiribra cannot apply fails the create, before anything
     // (volumes) is made for it.
     if let super::seccomp::Choice::Profile(json) = super::seccomp::choice(&strings(&host["SecurityOpt"]).unwrap_or_default()).map_err(Error::BadRequest)? {
         super::seccomp::compile(json, profile_caps(caps_from(host)?, host["Privileged"].as_bool().unwrap_or(false))).map_err(Error::BadRequest)?;
@@ -2203,7 +2203,7 @@ pub(super) fn create(req: &Request, engine: &Engine) -> Result<Value, Error> {
             return Err(Error::NotFound(format!("No such image: {image_name} for {p}")));
         }
     }
-    // The image's own config, for what Kiri's image model does not keep.
+    // The image's own config, for what Kiribra's image model does not keep.
     let image_cfg = image_config_json(engine, &image.config_digest);
     // Checked before mounts, which may create volumes.
     let healthcheck = healthcheck_from(&body, &image_cfg)?;
@@ -2595,7 +2595,7 @@ fn list(req: &Request, engine: &Engine) -> Result<Value, Error> {
                 "Created": time::unix(c.created),
                 "State": state_word(c),
                 "Status": ps_status(c, health.get(&c.id)),
-                // Kiri's own: the window counts "Up 3 s" from these every second.
+                // Kiribra's own: the window counts "Up 3 s" from these every second.
                 // Docker clients ignore fields they don't know.
                 "KiriStartedAt": c.started.map(time::unix),
                 "KiriFinishedAt": c.finished.map(time::unix),
@@ -2706,7 +2706,7 @@ fn network_settings(c: &Container, nets: &[super::network::Network]) -> Value {
         return json!({"IPAddress": "", "IPPrefixLen": 0, "MacAddress": "", "Ports": {}, "Networks": {}});
     }
     let prefix_of = |name: &str, has_ip: bool| if has_ip { nets.iter().find(|n| n.name == name).map_or(16, |n| n.prefix) } else { 0 };
-    // An IPv6-only network's IPv4 addresses are Kiri's own, not shown.
+    // An IPv6-only network's IPv4 addresses are Kiribra's own, not shown.
     let v4_on = |name: &str| !nets.iter().any(|n| n.name == name && n.no_ipv4);
     let ip = c.ip.filter(|_| v4_on(&c.spec.network_mode)).map(super::network::ip_str).unwrap_or_default();
     let v6 = |name: &str, ip6: Option<[u8; 16]>| {
@@ -2772,7 +2772,7 @@ fn network_json(engine: &Engine, n: &super::network::Network, with_members: bool
         if !n.aux.is_empty() {
             c["AuxiliaryAddresses"] = n.aux.iter().map(|(k, ip)| (k.clone(), Value::from(super::network::ip_str(*ip)))).collect::<serde_json::Map<_, _>>().into();
         }
-        // An IPv6-only network's IPv4 subnet is Kiri's own, not shown.
+        // An IPv6-only network's IPv4 subnet is Kiribra's own, not shown.
         let mut configs = if n.no_ipv4 { Vec::new() } else { vec![c] };
         if let Some(v) = &n.v6 {
             let mut c = json!({"Subnet": v.subnet_str(), "Gateway": super::network::ip6_str(v.gateway)});
@@ -2834,7 +2834,7 @@ fn network_create(req: &Request, engine: &Engine) -> Result<Value, Error> {
     let name = body["Name"].as_str().unwrap_or_default();
     match body["Driver"].as_str().unwrap_or("bridge") {
         "" | "bridge" => {}
-        d => return Err(Error::BadRequest(format!("Kiri supports only bridge networks, not {d}"))),
+        d => return Err(Error::BadRequest(format!("Kiribra supports only bridge networks, not {d}"))),
     }
     let (ipam, ipam6) = super::network::parse_ipam_both(&body["IPAM"]).map_err(Error::BadRequest)?;
     let settings = super::network::Settings {
@@ -3763,13 +3763,13 @@ mod tests {
         assert_eq!(v["Components"][0]["Name"], "Engine");
         assert_eq!(v["Components"][0]["Version"], ENGINE_VERSION);
         assert_eq!(v["KiriVersion"], env!("CARGO_PKG_VERSION"));
-        assert!(v["Components"].as_array().unwrap().iter().any(|c| c["Name"] == "Kiri" && c["Version"] == env!("CARGO_PKG_VERSION")));
+        assert!(v["Components"].as_array().unwrap().iter().any(|c| c["Name"] == "Kiribra" && c["Version"] == env!("CARGO_PKG_VERSION")));
         // The docker CLI reads every component's Details as strings.
         for c in v["Components"].as_array().unwrap() {
             assert!(c["Details"].as_object().unwrap().values().all(Value::is_string), "{c}");
         }
         assert_eq!(crate::client::kiri_version(&v), Some(env!("CARGO_PKG_VERSION")));
-        // An engine from before KiriVersion: its Version was Kiri's.
+        // An engine from before KiriVersion: its Version was Kiribra's.
         assert_eq!(crate::client::kiri_version(&json!({"Version": "0.2.0"})), Some("0.2.0"));
     }
 
@@ -3979,7 +3979,7 @@ mod tests {
     /// A pull sent with a body, as docker-modem (so Testcontainers for Node)
     /// sends its options as JSON, doesn't leave that body to be read as the
     /// start of the next request on the connection: it used to answer
-    /// `Kiri does not support {"fromImage":...}GET /containers/json yet`.
+    /// `Kiribra does not support {"fromImage":...}GET /containers/json yet`.
     /// A body too large to read out closes the connection after the answer.
     #[test]
     fn a_body_the_handler_leaves_unread_is_not_the_next_request() {
@@ -4157,7 +4157,7 @@ mod tests {
             assert!(answer.contains("Loaded image: demo:gz"), "{name}: {answer}");
             assert_eq!(found.as_deref(), Some(cfg.as_str()), "{name}");
         }
-        // Formats Docker takes that Kiri doesn't yet say so, not "cksum",
+        // Formats Docker takes that Kiribra doesn't yet say so, not "cksum",
         // and the client gets that answer after sending all of a big body.
         let mut bzip2 = b"BZh91AY&SY".to_vec();
         bzip2.resize(4 << 20, 0x5a);
@@ -4656,8 +4656,8 @@ mod network_option_tests {
     fn no_route_to_a_registry_on_the_local_network_points_at_local_network() {
         use kiri_image::registry::Error;
         let e65 = Error::Http("io: No route to host (os error 65)".into());
-        let hint = |e: &Error, reg: &str, proxied: bool| super::local_network_hint(e, reg, proxied, "Kiri Repro");
-        let want = |reg: &str| format!("{reg} is on the local network: Kiri Repro not allowed under Local Network in Privacy & Security (System Settings) usually causes this");
+        let hint = |e: &Error, reg: &str, proxied: bool| super::local_network_hint(e, reg, proxied, "Kiribra Repro");
+        let want = |reg: &str| format!("{reg} is on the local network: Kiribra Repro not allowed under Local Network in Privacy & Security (System Settings) usually causes this");
         for reg in ["192.168.1.20", "10.1.2.3:5000", "172.20.0.9", "169.254.10.1", "fd12::1", "[fe80::1]:5000"] {
             assert_eq!(hint(&e65, reg, false), cfg!(target_os = "macos").then(|| want(reg)), "{reg}");
         }
@@ -4886,7 +4886,7 @@ mod network_option_tests {
     fn host_names_are_checked_before_they_are_written() {
         assert!(super::valid_hostname("db"));
         assert!(super::valid_hostname("host.docker.internal"));
-        // What Docker takes, Kiri takes: Compose files name hosts like these.
+        // What Docker takes, Kiribra takes: Compose files name hosts like these.
         for ok in ["my_app", "My.Host_1", "-db", "db-", "a..b", "db."] {
             assert!(super::valid_hostname(ok), "{ok}");
         }
@@ -4909,7 +4909,7 @@ mod leave_first_network_tests {
     /// After the .NET Aspire sequence (created on bridge, connected to a
     /// session network, disconnected from bridge) inspect and the list show
     /// only the session network; after leaving that too, no network at all,
-    /// as Docker shows it, not the `none` Kiri keeps it on.
+    /// as Docker shows it, not the `none` Kiribra keeps it on.
     #[test]
     fn inspect_shows_only_the_networks_it_still_has() {
         let root = std::env::temp_dir().join(format!("kiri-leave-first-api-{}", std::process::id()));

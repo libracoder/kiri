@@ -23,7 +23,7 @@ t("Reload clicked after Apply said the file changed, before the file itself came
   edit("postgres:16", "postgres:17");
   kiri.on({ type: "composeplan", name: "shop", seq: cmp.seq, steps: [{ n: "db", act: "chg", what: ["image"], from: "postgres:16", to: "postgres:17" }], services });
   click(document.querySelector("[data-cmpapply]"));
-  kiri.on({ type: "composeapply", name: "shop", done: true, ok: false, conflict: true, hash: "h2", error: "The file changed outside Kiri" });
+  kiri.on({ type: "composeapply", name: "shop", done: true, ok: false, conflict: true, hash: "h2", error: "The file changed outside Kiribra" });
   sent.length = 0;
   let threw = null;
   try { click(document.querySelector("#cmp-conflict [data-cmpreload]")); } catch (e) { threw = e.message; }
@@ -35,7 +35,7 @@ t("Reload clicked after Apply said the file changed, before the file itself came
 t("the file goes while being edited: the draft stays, with a note, and Apply waits", () => {
   open("services:\n  db:\n    image: postgres:16\n", "h1");
   edit("postgres:16", "postgres:18");
-  F(undefined, undefined, { error: "Kiri can't find this project's compose file" });
+  F(undefined, undefined, { error: "Kiribra can't find this project's compose file" });
   eq([$("cmp-ta")?.value.includes("postgres:18"), cmpDirty()], [true, true], "the edits are still there");
   const note = document.querySelector("#cmp-conflict .cmp-conflict");
   eq([!!note, note?.textContent.includes("gone")], [true, true], "says the file is gone");
@@ -53,7 +53,7 @@ t("the file comes back different: Reload or keep the draft", () => {
 t("the file comes back as the draft: nothing to ask", () => {
   open("services:\n  db:\n    image: postgres:16\n", "h1");
   edit("postgres:16", "postgres:19");
-  F(undefined, undefined, { error: "Kiri can't find this project's compose file" });
+  F(undefined, undefined, { error: "Kiribra can't find this project's compose file" });
   F($("cmp-ta").value, "h6");
   eq([!!document.querySelector("#cmp-conflict .cmp-conflict"), cmpDirty(), cmp.file.hash], [false, false, "h6"], "saved as it is");
 });

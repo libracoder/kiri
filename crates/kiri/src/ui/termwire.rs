@@ -109,7 +109,7 @@ mod tests {
             let bytes: Vec<u8> = (0..n).map(|i| i.wrapping_mul(37).wrapping_add(200)).collect();
             assert_eq!(unb64(&b64(&bytes)).as_deref(), Some(&bytes[..]), "{n} bytes");
         }
-        assert_eq!(b64(b"Kiri"), "S2lyaQ==");
+        assert_eq!(b64(b"Kiribra"), "S2lyaQ==");
         assert_eq!(unb64("not base64!"), None);
     }
 

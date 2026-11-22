@@ -9,7 +9,7 @@ const t = (name, fn) => { try { fn(); R.push("PASS " + name); } catch (e) { R.pu
 const eq = (a, b, m) => { if (JSON.stringify(a) !== JSON.stringify(b)) throw new Error(m + ": got " + JSON.stringify(a) + " want " + JSON.stringify(b)); };
 const rows = () => [...document.querySelectorAll("#content tbody tr.row")];
 const opened = () => [...document.querySelectorAll("#content tr.usb-more")].map((r) => r.dataset.more);
-const mac = { type: "usb", can: "attach", note: "A device in Kiri is gone from the Mac until you detach it.", devices: [
+const mac = { type: "usb", can: "attach", note: "A device in Kiribra is gone from the Mac until you detach it.", devices: [
   { key: "0x01100000", name: "Zigbee 3.0 USB Dongle Plus", id: "10c4:ea60", speed: "full", state: "host", path: "" },
   { key: "0x02200000", name: "USB Mouse", id: "046d:c077", speed: "low", state: "kiri", path: "" }] };
 
@@ -32,12 +32,12 @@ t("closing it saves that, and it stays closed", () => {
 });
 t("the sidebar marks it Beta too", () => eq(document.querySelector('nav [data-view="usb"] .beta')?.textContent, "Beta", "nav"));
 t("one row per device", () => eq(rows().map((r) => r.dataset.key), ["0x01100000", "0x02200000"], "rows"));
-t("a device on the Mac can be attached, one in Kiri detached", () => {
+t("a device on the Mac can be attached, one in Kiribra detached", () => {
   eq(rows().map((r) => r.querySelector("[data-usbgo]")?.dataset.usbgo), ["attach", "detach"], "actions");
-  eq(rows().map((r) => r.querySelector(".pill").textContent), ["On this Mac", "In Kiri"], "state");
+  eq(rows().map((r) => r.querySelector(".pill").textContent), ["On this Mac", "In Kiribra"], "state");
 });
-t("the sidebar counts the devices in Kiri", () => eq($("n-usb").textContent, "1", "count"));
-t("the subtitle says how many", () => eq($("subtitle").textContent, "1 in Kiri · 2 devices", "subtitle"));
+t("the sidebar counts the devices in Kiribra", () => eq($("n-usb").textContent, "1", "count"));
+t("the subtitle says how many", () => eq($("subtitle").textContent, "1 in Kiribra · 2 devices", "subtitle"));
 t("the note says what attaching means", () => eq(/gone from the Mac/.test(document.querySelector(".usb-note")?.textContent || ""), true, "note"));
 
 sent.length = 0;
@@ -48,10 +48,10 @@ t("and the row says it's attaching, not clickable twice", () => {
   eq([b.textContent, b.disabled, !!b.querySelector(".spin")], ["Attaching…", true, true], "busy");
 });
 t("a refresh while it works keeps it busy", () => { kiri.on(mac); eq(rows()[0].querySelector(".actions button").textContent, "Attaching…", "busy"); });
-kiri.on({ type: "usbdone", key: "0x01100000", text: "Zigbee 3.0 USB Dongle Plus is in Kiri" });
+kiri.on({ type: "usbdone", key: "0x01100000", text: "Zigbee 3.0 USB Dongle Plus is in Kiribra" });
 kiri.on({ ...mac, devices: mac.devices.map((d) => ({ ...d, state: "kiri" })) });
 t("done: the toast says so and the row can be detached", () => {
-  eq(/is in Kiri/.test(document.body.textContent), true, "toast");
+  eq(/is in Kiribra/.test(document.body.textContent), true, "toast");
   eq(rows()[0].querySelector("[data-usbgo]")?.dataset.usbgo, "detach", "action");
   eq($("n-usb").textContent, "2", "count");
 });
@@ -76,7 +76,7 @@ t("each device's icon says what it is", () => {
     { key: "h", name: "USB2.0 HID", id: "0bda:1100", state: "host", kind: "" }] });
   const d = (k) => document.querySelector(`tr[data-key="${k}"] .tile path`)?.getAttribute("d");
   eq([d("m") === PH.mouse, d("k") === PH.keyboard, d("z") === PH.broadcast, d("s") === PH.circuitry, d("h") === PH.usb], [true, true, true, true, true], "icons");
-  // In Kiri the engine can't read its interfaces: the kind it had stays.
+  // In Kiribra the engine can't read its interfaces: the kind it had stays.
   kiri.on({ type: "usb", can: "attach", devices: [{ key: "m", name: "Razer Basilisk V3 Pro 35K", id: "1532:00d6", state: "kiri", kind: "" }] });
   eq(d("m") === PH.mouse, true, "kept");
   kiri.on(mac);
@@ -96,7 +96,7 @@ t("the caret opens one device's details: what it is, where, since when", () => {
   eq([/Razer/.test(m), /Mouse/.test(m), /1532:00d6/.test(m), /USB 1\.1 · 12 Mbps/.test(m), /Bus 1 · Device 4/.test(m), /just now/.test(m)], [true, true, true, true, true, true], "facts");
   eq(/Serial number/.test(m), false, "no serial when it has none");
 });
-t("a mouse in Kiri warns that this computer can't use it meanwhile", () => eq(/can't use it while it's in Kiri/.test(document.querySelector(".usb-warn")?.textContent || ""), true, "warn"));
+t("a mouse in Kiribra warns that this computer can't use it meanwhile", () => eq(/can't use it while it's in Kiribra/.test(document.querySelector(".usb-warn")?.textContent || ""), true, "warn"));
 rows()[2].cells[2].click();
 t("a click on another row opens it and closes the first", () => {
   eq(opened(), ["c"], "open");
@@ -124,7 +124,7 @@ kiri.on({ type: "usb", can: "attach", devices: [zig,
   { key: "w", name: "Waiting", id: "3333:4444", state: "kiri", paths: [] }] });
 document.querySelector('[data-usbmore="z"]').click();
 const side = () => document.querySelector("tr.usb-more .usb-side");
-t("in Kiri: the docker run flag for its device, copyable, and every path inside Linux", () => {
+t("in Kiribra: the docker run flag for its device, copyable, and every path inside Linux", () => {
   eq(side().querySelector("[data-copy]")?.dataset.copy, "--device /dev/ttyUSB0", "flag");
   eq([...side().querySelectorAll(".usb-paths dt")].map((x) => x.textContent), ["/dev/ttyUSB0", "/dev/bus/usb/003/002"], "paths");
   eq([...side().querySelectorAll(".usb-paths dd")].map((x) => x.textContent), ["serial port", "raw USB"], "what");
@@ -164,12 +164,12 @@ t("Linux: no attach; the row says where containers find it, with a copy button",
   eq(rows()[0].querySelector(".pill").textContent, "Containers see it", "state");
 });
 
-// A board that left the Mac's bus while in Kiri: waited for, and can be let go.
+// A board that left the Mac's bus while in Kiribra: waited for, and can be let go.
 kiri.on({ type: "usb", can: "attach", devices: [{ key: "0x01300000", name: "ESP32-S3", id: "", speed: "", state: "waiting", kind: "" }] });
 t("a device waited for says so, and offers Stop waiting", () => {
   const r = rows()[0];
   eq([r.querySelector(".pill").textContent, r.querySelector("[data-usbgo]")?.dataset.usbgo, r.querySelector("[data-usbgo]")?.textContent], ["Waiting to come back", "detach", "Stop waiting"], "row");
-  eq($("n-usb").textContent, "", "not counted as in Kiri");
+  eq($("n-usb").textContent, "", "not counted as in Kiribra");
 });
 sent.length = 0;
 rows()[0].querySelector("[data-usbgo]").click();

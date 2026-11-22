@@ -1,9 +1,9 @@
-//! `kiri bench`: the same container lifecycle on Kiri and on OrbStack.
+//! `kiri bench`: the same container lifecycle on Kiribra and on OrbStack.
 //!
 //! For each run: create a container from the image, run `true`, wait for it
 //! to exit and be removed. Measured three ways:
 //!
-//! - Kiri, through its engine (host → vsock → guest agent), VM already up.
+//! - Kiribra, through its engine (host → vsock → guest agent), VM already up.
 //! - OrbStack, through the Docker Engine API on its socket: create, wait for
 //!   removal, start. No CLI in the path, so engine against engine.
 //! - OrbStack, through `docker run --rm`, which is what people actually type.
@@ -33,7 +33,7 @@ struct Opts {
 /// A Docker-compatible engine to compare against: its socket under $HOME
 /// and the docker CLI context that points at it.
 const ENGINES: [(&str, &str, &str); 3] = [
-    ("Kiri daemon", ".kiri/run/docker.sock", "kiri"),
+    ("Kiribra daemon", ".kiribra/run/docker.sock", "kiri"),
     ("OrbStack", ".orbstack/run/docker.sock", "orbstack"),
     ("Docker Desktop", ".docker/run/docker.sock", "desktop-linux"),
 ];
@@ -57,14 +57,14 @@ pub fn run(args: &[String]) -> io::Result<()> {
     let wanted = |name: &str| o.only.as_deref().is_none_or(|w| name.to_ascii_lowercase().starts_with(w));
     let mut rows: Vec<(String, Vec<Duration>)> = Vec::new();
     if o.bridge {
-        // The engine-only path has no networking; the daemon rows below cover Kiri.
+        // The engine-only path has no networking; the daemon rows below cover Kiribra.
     } else if wanted("kiri") {
         // The daemon holds the data disk; a second VM may not open it.
         let daemon_up = crate::daemon::socket_path().is_ok_and(|p| UnixStream::connect(p).is_ok());
         if daemon_up {
-            println!("  Kiri engine-only row skipped: the daemon is running (measured through it below)");
+            println!("  Kiribra engine-only row skipped: the daemon is running (measured through it below)");
         } else {
-            rows.push(("Kiri — engine (vsock to guest agent)".into(), kiri(&o, warmup)?));
+            rows.push(("Kiribra — engine (vsock to guest agent)".into(), kiri(&o, warmup)?));
         }
     }
     let net = if o.bridge { "bridge" } else { "none" };
@@ -85,19 +85,19 @@ pub fn run(args: &[String]) -> io::Result<()> {
 
     let ms = |d: Duration| d.as_secs_f64() * 1e3;
     println!("{:44} {:>9} {:>9} {:>9}", "", "p50", "p99", "mean");
-    // Each engine is compared with Kiri on the same path (API with API, CLI
+    // Each engine is compared with Kiribra on the same path (API with API, CLI
     // with CLI); the engine-only row stands in when the daemon was not up.
     let path_of = |n: &str| if n.contains("CLI") { "CLI" } else { "API" };
     let kiri_on = |path: &str| {
         rows.iter()
-            .filter(|(n, _)| n.starts_with("Kiri") && (path_of(n) == path || n.contains("engine")))
+            .filter(|(n, _)| n.starts_with("Kiribra") && (path_of(n) == path || n.contains("engine")))
             .map(|(_, v)| pct(v, 50))
             .next()
     };
     for (name, v) in &rows {
         let mean = v.iter().sum::<Duration>() / v.len().max(1) as u32;
         let ratio = match kiri_on(path_of(name)) {
-            Some(b) if !b.is_zero() && !name.starts_with("Kiri") => format!("   {:.0}× Kiri", pct(v, 50).as_secs_f64() / b.as_secs_f64()),
+            Some(b) if !b.is_zero() && !name.starts_with("Kiribra") => format!("   {:.0}× Kiribra", pct(v, 50).as_secs_f64() / b.as_secs_f64()),
             _ => String::new(),
         };
         println!("{name:44} {:>6.2} ms {:>6.2} ms {:>6.2} ms{ratio}", ms(pct(v, 50)), ms(pct(v, 99)), ms(mean));
@@ -145,7 +145,7 @@ fn kiri(o: &Opts, warmup: usize) -> io::Result<Vec<Duration>> {
     }
     let n = o.runs.max(1) as u32;
     println!(
-        "  Kiri guest-side mean: namespaces + mounts + cgroup {:.2} ms, process lifetime {:.2} ms",
+        "  Kiribra guest-side mean: namespaces + mounts + cgroup {:.2} ms, process lifetime {:.2} ms",
         (setup / n).as_secs_f64() * 1e3,
         (process / n).as_secs_f64() * 1e3
     );

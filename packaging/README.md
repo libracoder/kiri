@@ -1,6 +1,6 @@
 # Packaging
 
-How Kiri reaches people on each platform, and what each piece of this
+How Kiribra reaches people on each platform, and what each piece of this
 directory (and `installer/windows`) does.
 
 | Platform | Package | Built by | Contents |
@@ -8,13 +8,13 @@ directory (and `installer/windows`) does.
 | Linux (Debian, Ubuntu) | `kiri_<v>_amd64.deb`, `_arm64.deb` | `packaging/linux/build.sh` | engine + docker CLI, Compose, buildx; the window on x86-64 |
 | Linux (Debian, Ubuntu) | `kiri-lite_<v>_amd64.deb`, `_arm64.deb` | `packaging/linux/build.sh` | engine only |
 | Linux (Fedora, RHEL, openSUSE) | `kiri-<v>-1.x86_64.rpm`, `.aarch64.rpm`, `kiri-lite-…rpm` | `packaging/linux/build.sh` | same two flavours |
-| Windows | `Kiri-<v>-x86_64.msi` | `cargo xtask msi` | engine for WSL2, `kiri-win.exe`, docker CLI, Compose, buildx |
-| Windows on Arm | `Kiri-<v>-arm64.msi` | `cargo xtask msi --arch arm64` | the same, arm64 throughout (docker CLI built from source) |
-| macOS | `Kiri.app` in `Kiri-<v>-arm64.dmg` (`-x86_64` for Intel), Kiri Lite | `cargo xtask release` | app + CLI tools; Lite downloads the tools |
+| Windows | `Kiribra-<v>-x86_64.msi` | `cargo xtask msi` | engine for WSL2, `kiri-win.exe`, docker CLI, Compose, buildx |
+| Windows on Arm | `Kiribra-<v>-arm64.msi` | `cargo xtask msi --arch arm64` | the same, arm64 throughout (docker CLI built from source) |
+| macOS | `Kiribra.app` in `Kiribra-<v>-arm64.dmg` (`-x86_64` for Intel), Kiribra Lite | `cargo xtask release` | app + CLI tools; Lite downloads the tools |
 
-Two flavours everywhere, with the same meaning: **Kiri** brings the docker
+Two flavours everywhere, with the same meaning: **Kiribra** brings the docker
 CLI, Compose and buildx so `docker run` works right after installing;
-**Kiri Lite** is the engine alone for people who already have a `docker`.
+**Kiribra Lite** is the engine alone for people who already have a `docker`.
 The CLI versions and their SHA-256s are pinned once, in
 `crates/kiri/src/cli_pins.rs`, for all three platforms.
 
@@ -44,7 +44,7 @@ distro). What the packages do:
 
 - `/usr/bin/kiri`, `/usr/bin/kiri-init`, `kiri.service` (installed, not
   started: installing alone runs nothing. The engine starts, and starts at
-  boot, when someone sets Kiri up: the window's Allow access, or
+  boot, when someone sets Kiribra up: the window's Allow access, or
   `sudo kiri host-access $USER`. An upgrade leaves a running engine as it
   is), the `kiri` group that owns
   `/run/kiri/docker.sock`. Members of the kiri group can run containers as
@@ -58,12 +58,12 @@ distro). What the packages do:
   winning, as on Windows. Compose and buildx go into
   `/usr/lib/docker/cli-plugins` the same way, one alternatives link each, so
   the package installs beside `docker-compose-plugin`, `docker-buildx-plugin`
-  and `docker-desktop` (whose plugins Kiri's docker then uses). A link is
+  and `docker-desktop` (whose plugins Kiribra's docker then uses). A link is
   made only when Docker's own copy isn't in any of the CLI's plugin folders
   (`/usr/lib`, `/usr/libexec`, `/usr/local/lib`, `/usr/local/libexec`
   `…/docker/cli-plugins`), and a dpkg trigger (rpm `%filetriggerin` and
   `%filetriggerpostun`) checks again whenever another package changes those
-  folders, so Docker's plugins installed or removed after Kiri still win. Its `docker` talks to Kiri's socket unless
+  folders, so Docker's plugins installed or removed after Kiribra still win. Its `docker` talks to Kiribra's socket unless
   `DOCKER_HOST`, `DOCKER_CONTEXT` or a context of your own says otherwise.
 - The x86-64 full package also has the window: `/usr/lib/kiri/kiri-window`
   (kiri built with `--features window`, linking GTK 3 and WebKitGTK 4.1, so
@@ -77,7 +77,7 @@ distro). What the packages do:
   those with a restart policy start again.
 
 Tests: `packaging/linux/test.sh` (package listings, install/remove in
-privileged Ubuntu and Fedora containers on any Docker-compatible engine, Kiri
+privileged Ubuntu and Fedora containers on any Docker-compatible engine, Kiribra
 included; nested, so it proves the files and scripts, not container runs) and
 `packaging/linux/test-host.sh` (on a real host or VM with systemd: install,
 run containers, publish a port, remove; it stops a kiri daemon already running
@@ -92,10 +92,10 @@ The Mac already has the app and the dmg; Homebrew is the third way in, for
 people who live in the terminal. Plan:
 
 1. **A tap, not homebrew-core, to start**: a `homebrew-kiri` repository (not
-   made yet) with `Formula/kiri.rb`. Users run `brew install libracoder/kiri/kiri`.
+   made yet) with `Formula/kiri.rb`. Users run `brew install astosweb/kiribra/kiri`.
    homebrew-core wants a stable, notable, open project with no vendored
    binaries, so that comes later, if at all.
-2. **Formula = Kiri Lite from source or binary.** Simplest and most Homebrew-like:
+2. **Formula = Kiribra Lite from source or binary.** Simplest and most Homebrew-like:
    build from the release tarball with `cargo install --path crates/kiri`
    (`depends_on "rust" => :build`), install `kiri` to `bin`, and let
    `brew services start kiri` run `kiri daemon` as a user LaunchAgent (a
@@ -104,16 +104,16 @@ people who live in the terminal. Plan:
    `depends_on "docker"` and `"docker-compose"`, `"docker-buildx"` as
    recommended deps, which is exactly the Lite split.
 3. **A cask for the app**: `Casks/kiri.rb` pointing at the dmg with its
-   SHA-256, `app "Kiri.app"`, `zap` listing `~/.kiri` and the LaunchAgent, for
-   people who want the window. `brew install --cask libracoder/kiri/kiri`.
-4. **Automate the bump**: Kiri CI's release step opens a PR on the tap with
+   SHA-256, `app "Kiribra.app"`, `zap` listing `~/.kiribra` and the LaunchAgent, for
+   people who want the window. `brew install --cask astosweb/kiribra/kiri`.
+4. **Automate the bump**: Kiribra CI's release step opens a PR on the tap with
    the new version and checksums (formula from the source tarball, cask from
    the dmg) whenever it publishes a release; `brew bump-formula-pr` does most
    of this.
 
 Open questions before building it: whether the formula should build the
 guest (`cargo xtask guest` needs the aarch64 musl target and a kernel image,
-which Homebrew will not do) or download Kiri's prebuilt guest image at first
+which Homebrew will not do) or download Kiribra's prebuilt guest image at first
 run as Lite does today; and whether the virtualization entitlement survives
 a Homebrew-built binary (it needs signing with the entitlement, which the
 formula can do with `codesign --sign -` ad hoc for local use).

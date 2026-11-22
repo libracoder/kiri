@@ -1,4 +1,4 @@
-//! Compose in the window: the projects that have run on Kiri, each one's
+//! Compose in the window: the projects that have run on Kiribra, each one's
 //! services and compose file, what Apply will change, and Apply itself
 //! (save the file, then `docker compose up -d`, so only the services that
 //! changed are recreated). The Mac's and Linux's window and Windows' (crates/kiri-win, by
@@ -6,15 +6,15 @@
 //!
 //! A project is found by its containers' labels (com.docker.compose.project,
 //! .project.working_dir, .project.config_files): it shows once it has run on
-//! Kiri, and its file stays where it is. What the file means comes from
+//! Kiribra, and its file stays where it is. What the file means comes from
 //! `docker compose config --format json`, the CLI's own reading of it, so
 //! extends, overrides, profiles and `.env` interpolation are Compose's, not
 //! a second parser's. That reading is kept per file and change time.
 //!
-//! The page names a project, never a path: the file Kiri reads and writes is
+//! The page names a project, never a path: the file Kiribra reads and writes is
 //! the one the project's own containers name, or one the person picked in the
 //! system's own file dialog (Open a compose file…), which the shell shows and
-//! hands to [`open_file`]. Those are kept in Kiri's state folder
+//! hands to [`open_file`]. Those are kept in Kiribra's state folder
 //! (compose.json), so a project that has never run is listed too.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -29,12 +29,12 @@ use serde_json::{Value, json};
 use super::composetech as tech;
 use crate::client;
 
-/// A docker CLI command that reaches Kiri: the shell makes it (DOCKER_HOST
-/// on the Mac and Linux; the Kiri context and no console window on Windows).
+/// A docker CLI command that reaches Kiribra: the shell makes it (DOCKER_HOST
+/// on the Mac and Linux; the Kiribra context and no console window on Windows).
 pub type Cli = fn() -> io::Result<Command>;
 
 /// Where the compose files opened in the window are kept (compose.json in
-/// Kiri's state folder; the shell says where that is).
+/// Kiribra's state folder; the shell says where that is).
 pub type Store = fn() -> Option<PathBuf>;
 
 const PROJECT: &str = "com.docker.compose.project";
@@ -109,11 +109,11 @@ pub fn projects(containers: &Value) -> Vec<Project> {
 
 fn find(name: &str, store: Store) -> io::Result<Project> {
     let containers = client::get_background("/containers/json?all=1")?;
-    all_projects(&containers, store).into_iter().find(|p| p.name == name).ok_or_else(|| io::Error::other(format!("no Compose project {name} on Kiri")))
+    all_projects(&containers, store).into_iter().find(|p| p.name == name).ok_or_else(|| io::Error::other(format!("no Compose project {name} on Kiribra")))
 }
 
-/// What the window says when a project's file isn't one Kiri will read or write.
-pub const NO_FILE: &str = "Kiri can't find this project's compose file";
+/// What the window says when a project's file isn't one Kiribra will read or write.
+pub const NO_FILE: &str = "Kiribra can't find this project's compose file";
 
 /// A path as a person and the docker CLI write it: Windows' canonical form
 /// `\\?\C:\x` is `C:\x`, and `\\?\UNC\server\share\x` is
@@ -137,7 +137,7 @@ fn real_path(p: &Path) -> io::Result<PathBuf> {
     std::fs::canonicalize(p).map(plain_path)
 }
 
-/// A compose file Kiri may read into the window and write on Apply: an
+/// A compose file Kiribra may read into the window and write on Apply: an
 /// absolute path to a .yaml or .yml regular file, as it is once links are
 /// followed (the labels it comes from are any container's to set).
 pub fn valid_file(f: &str) -> Option<PathBuf> {
@@ -198,7 +198,7 @@ fn valid_file_from(f: &str, remote: bool) -> Option<PathBuf> {
 
 /// [`checked_files`], and the env files Compose reads for it: each one the
 /// labels name a local regular file, and the folder's `.env` none or one
-/// (never a pipe or a device, which would hold Compose and Kiri reading it);
+/// (never a pipe or a device, which would hold Compose and Kiribra reading it);
 /// else why not, as `docker compose` itself refuses a missing one.
 fn checked(p: Project, store: Store) -> Result<Project, String> {
     let mut p = checked_files(p, store)?;
@@ -378,11 +378,11 @@ fn name_scalar(text: &str) -> Option<String> {
 }
 
 /// A file whose `name:` uses a secret, listed by its folder's name (as
-/// Kiri lists a file it opened): the notice that Kiri never takes that name.
+/// Kiribra lists a file it opened): the notice that Kiribra never takes that name.
 pub fn folder_note(vars: &[String], name: &str, dir: &str) -> Option<Value> {
     let vars = vars.join(", ");
     (!vars.is_empty() && !dir.is_empty() && name == folder_name(Path::new(dir))).then(|| {
-        json!({"text": format!("This file's name uses {vars}. Kiri uses the folder's name, {name}, so it never puts a secret in a name."), "errkey": "nameFolder", "errargs": {"vars": vars, "name": name}})
+        json!({"text": format!("This file's name uses {vars}. Kiribra uses the folder's name, {name}, so it never puts a secret in a name."), "errkey": "nameFolder", "errargs": {"vars": vars, "name": name}})
     })
 }
 
@@ -408,7 +408,7 @@ pub fn project_networks(name: &str, model: Option<&Value>, containers: &Value) -
     out
 }
 
-/// What Kiri says of an env file it won't read.
+/// What Kiribra says of an env file it won't read.
 fn bad_env(f: &str) -> String {
     format!("couldn't read env file {f}: it isn't a local regular file")
 }
@@ -433,8 +433,8 @@ fn checked_files(mut p: Project, store: Store) -> Result<Project, String> {
     let files: Option<Vec<String>> = p.files.iter().map(|f| valid_file_from(f, mine(f)).map(|r| r.to_string_lossy().into_owned())).collect();
     p.files = files.ok_or_else(|| NO_FILE.to_owned())?;
     let beside = |d: &str| p.files.iter().any(|f| mine(f) && Path::new(f).parent() == Some(Path::new(d)));
-    // The folder is a label too: never a network one, before Kiri looks in it.
-    // A folder that is gone, or one Kiri won't look in: the file's own, as
+    // The folder is a label too: never a network one, before Kiribra looks in it.
+    // A folder that is gone, or one Kiribra won't look in: the file's own, as
     // `docker compose -f` alone would take.
     if remote_path(&p.dir) || Path::new(&p.dir).is_absolute() {
         p.dir = valid_dir(&p.dir, beside(&p.dir)).unwrap_or_default();
@@ -473,7 +473,7 @@ fn find_checked(name: &str, store: Store) -> Result<Project, String> {
 }
 
 /// A content hash of the file (FNV-1a, 64 bits): what the page's draft was
-/// based on, so Apply can tell the file changed outside Kiri since.
+/// based on, so Apply can tell the file changed outside Kiribra since.
 pub fn file_hash(bytes: &[u8]) -> String {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in bytes {
@@ -483,14 +483,14 @@ pub fn file_hash(bytes: &[u8]) -> String {
     format!("{h:016x}")
 }
 
-/// The file as it was before Kiri's last save over it, per project, and the
-/// hash of what Kiri wrote: Discard after a failed Apply puts it back.
+/// The file as it was before Kiribra's last save over it, per project, and the
+/// hash of what Kiribra wrote: Discard after a failed Apply puts it back.
 type Before = HashMap<String, (String, Vec<u8>, String)>;
 static BEFORE: LazyLock<Mutex<Before>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// After Kiri saved over `path` (`disk` was there, `wrote` is the new
+/// After Kiribra saved over `path` (`disk` was there, `wrote` is the new
 /// hash): what Discard puts back is the file before the first Apply that
-/// didn't take, so a second failed Apply over Kiri's own save keeps it. One
+/// didn't take, so a second failed Apply over Kiribra's own save keeps it. One
 /// over a file changed since (by hand, after Reload) starts again from it.
 fn remember_before(name: &str, path: &str, disk: Vec<u8>, wrote: &str) {
     let mut before = BEFORE.lock().unwrap_or_else(|e| e.into_inner());
@@ -529,7 +529,7 @@ fn own_env(cli: Cli, p: &Project) -> Vec<(String, String)> {
         return v.clone();
     }
     // An env file that isn't a regular one is never read (a pipe would hold
-    // Compose and Kiri): the environment's values alone.
+    // Compose and Kiribra): the environment's values alone.
     let dotenv = (!p.dir.is_empty()).then(|| Path::new(&p.dir).join(".env"));
     if p.env_files.iter().any(|f| !std::fs::metadata(f).is_ok_and(|m| m.is_file())) || dotenv.as_deref().is_some_and(|d| !regular_or_none(d)) {
         return std::env::vars().collect();
@@ -643,13 +643,13 @@ pub fn includes(text: &str) -> Vec<Include> {
     out
 }
 
-/// A local regular file once links are followed: what Kiri reads of a
-/// file a project's text names (a pipe would hold Kiri).
+/// A local regular file once links are followed: what Kiribra reads of a
+/// file a project's text names (a pipe would hold Kiribra).
 fn local_file(f: &Path) -> bool {
     !remote_path(&f.to_string_lossy()) && std::fs::metadata(f).is_ok_and(|m| m.is_file())
 }
 
-/// The most Kiri reads of a file a project's text names.
+/// The most Kiribra reads of a file a project's text names.
 const READ_CAP: u64 = 16 << 20;
 
 /// A local regular file's text ([`local_file`]), as much as [`READ_CAP`]
@@ -878,7 +878,7 @@ fn file_path(v: &str) -> bool {
 // value is never in what Compose reads, so never in what it says. Each
 // stand-in it says back is shown as its variable, `${DB_PASSWORD}`. Only
 // `config --hash` (it prints no values) and Apply's `up` read the real
-// values: what `up` says, and the names Kiri shows from what runs (images,
+// values: what `up` says, and the names Kiribra shows from what runs (images,
 // paths, the engine's own lines in Logs), hide each secret by exact match of
 // every form it is printed in ([`forms`]), as its variable too.
 
@@ -1038,7 +1038,7 @@ fn compose_names(cli: Cli, p: &Project, draft: Option<&str>) -> Option<Vec<Var>>
     if let Some((_, _, v)) = NAMES.lock().unwrap_or_else(|e| e.into_inner()).get(&key).filter(|(s, at, _)| *s == st && at.elapsed() < std::time::Duration::from_secs(3)) {
         return v.clone();
     }
-    // An env file that isn't a regular one would hold Compose and Kiri.
+    // An env file that isn't a regular one would hold Compose and Kiribra.
     let waits = !p.dir.is_empty() && !regular_or_none(&Path::new(&p.dir).join(".env")) || !p.env_files.iter().all(|f| regular_or_none(Path::new(f))) || service_env_ok(p).is_err();
     let names = (|| {
         if waits {
@@ -1116,9 +1116,9 @@ pub fn variables_table(out: &str) -> Option<Vec<Var>> {
     )
 }
 
-/// The docker CLI Kiri ships (beside Kiri, in Kiri.app's Resources/bin, or
+/// The docker CLI Kiribra ships (beside Kiribra, in Kiribra.app's Resources/bin, or
 /// docker.exe beside kiri.exe), run as `cmd` is: same arguments and
-/// environment. None when Kiri ships none, or `cmd` is that one already.
+/// environment. None when Kiribra ships none, or `cmd` is that one already.
 fn bundled(cmd: &Command) -> Option<Command> {
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
@@ -1170,7 +1170,7 @@ pub fn text_names(text: &str) -> Vec<String> {
 }
 
 /// [`stand_ins`] of `vars`, and a stand-in for each secret-named variable
-/// of `names` whose value Kiri doesn't hold (an included project's env file
+/// of `names` whose value Kiribra doesn't hold (an included project's env file
 /// it couldn't read): its real value is then unknown (empty), and it is
 /// hidden all the same. The shell's environment gives a stand-in over every
 /// env file, an include's too. A plain value (empty, a path, a short
@@ -1209,10 +1209,10 @@ fn stands_full(cli: Cli, p: &Project, draft: Option<&str>) -> (Vec<Stand>, bool)
 
 /// [`stands_full`], and the secret-named variables the file requires
 /// (`${X:?…}`, `${X?…}`). Every secret-named variable Compose names gets a
-/// stand-in, whatever its default or required marker and whether Kiri
-/// holds its value: a value Kiri's own reader misses (an include it can't
+/// stand-in, whatever its default or required marker and whether Kiribra
+/// holds its value: a value Kiribra's own reader misses (an include it can't
 /// follow) is never read into the window. Also whether a stand-in has no
-/// value Kiri holds, so the real reading may differ ([`config`]).
+/// value Kiribra holds, so the real reading may differ ([`config`]).
 fn stands_unset(cli: Cli, p: &Project, draft: Option<&str>) -> (Vec<Stand>, bool, Vec<String>) {
     let vars = vars_for(cli, p, draft);
     let text = draft.map_or_else(|| p.files.first().and_then(|f| read_text(Path::new(f))).unwrap_or_default(), str::to_owned);
@@ -1267,7 +1267,7 @@ fn standing(mut cmd: Command, stands: &[Stand]) -> Command {
 /// own names for what `up` says, never for the window).
 fn real(model: &Value, stands: &[Stand]) -> Value {
     let mut text = model.to_string();
-    // A value Kiri doesn't hold keeps its token.
+    // A value Kiribra doesn't hold keeps its token.
     for s in stands.iter().filter(|s| !s.real.is_empty()) {
         text = text.replace(&s.token, &json_escape(&s.real, false));
     }
@@ -1387,7 +1387,7 @@ pub fn forms(v: &str) -> Vec<String> {
     out
 }
 
-/// Takes secrets out of the text Kiri shows ([`secrets`]). Only free text
+/// Takes secrets out of the text Kiribra shows ([`secrets`]). Only free text
 /// that real values can reach (what `up` says, the engine's own lines in
 /// Logs, an error) is matched by value: each stand-in Compose says back,
 /// and each whole secret in any form it is printed in, become the variable
@@ -1768,17 +1768,17 @@ fn declared(text: &str) -> Vec<String> {
     out
 }
 
-/// The words Kiri itself wrote in an error, as the page translates them:
+/// The words Kiribra itself wrote in an error, as the page translates them:
 /// `(key, args)`, or none for Compose's and the system's own.
 pub fn error_key(e: &str) -> Option<(&'static str, Value)> {
     let exact = [
         ("pick a .yaml or .yml compose file", "notCompose"),
         (NOT_COMPOSE, "notComposeFile"),
         (NO_FILE, "noFile"),
-        ("Kiri has no state folder", "noState"),
-        ("The file changed outside Kiri since Apply saved it", "changedSinceApply"),
-        ("The file changed outside Kiri", "changed"),
-        ("Kiri has nothing to put back", "nothingToRestore"),
+        ("Kiribra has no state folder", "noState"),
+        ("The file changed outside Kiribra since Apply saved it", "changedSinceApply"),
+        ("The file changed outside Kiribra", "changed"),
+        ("Kiribra has nothing to put back", "nothingToRestore"),
         ("Apply cancelled", "cancelled"),
         (READ_ONLY, "readOnly"),
         (BY_NAME, "byName"),
@@ -1791,7 +1791,7 @@ pub fn error_key(e: &str) -> Option<(&'static str, Value)> {
     if let Some((_, k)) = exact.iter().find(|(t, _)| *t == e) {
         return Some((k, json!({})));
     }
-    if let Some(n) = e.strip_prefix("no Compose project ").and_then(|r| r.strip_suffix(" on Kiri")) {
+    if let Some(n) = e.strip_prefix("no Compose project ").and_then(|r| r.strip_suffix(" on Kiribra")) {
         return Some(("noProject", json!({"name": n})));
     }
     if let Some(n) = e.strip_prefix(REQ_ERR).and_then(|r| r.strip_suffix('.')).filter(|n| n.starts_with("${") && n.split(", ").all(|v| v.starts_with("${") && v.ends_with('}') && !v.contains(' '))) {
@@ -1826,7 +1826,7 @@ pub fn error_key(e: &str) -> Option<(&'static str, Value)> {
 /// stdout, or its stderr when it fails or takes longer than `secs`. Past
 /// that, the whole tree goes (the `docker-compose` plugin `docker` started
 /// too), and its pipes are never waited on: a child that still holds them
-/// keeps nothing of Kiri's waiting.
+/// keeps nothing of Kiribra's waiting.
 /// How a short CLI run ended ([`run_ran`]).
 #[derive(Debug, PartialEq)]
 pub enum Ran {
@@ -1838,7 +1838,7 @@ pub enum Ran {
 }
 
 impl Ran {
-    /// Its output, or why not in Kiri's words for a timeout.
+    /// Its output, or why not in Kiribra's words for a timeout.
     fn result(self) -> Result<Vec<u8>, String> {
         match self {
             Ran::Passed(o) => Ok(o),
@@ -1954,7 +1954,7 @@ fn all_projects(containers: &Value, store: Store) -> Vec<Project> {
 
 /// Saves the opened list: `keep` decides what stays of what was there.
 fn save_opened(store: Store, keep: impl Fn(&str, &str) -> bool, add: Option<(&str, &str)>) -> io::Result<()> {
-    let path = store().ok_or_else(|| io::Error::other("Kiri has no state folder"))?;
+    let path = store().ok_or_else(|| io::Error::other("Kiribra has no state folder"))?;
     let mut list: Vec<Value> = opened(store).into_iter().filter(|p| keep(&p.name, &p.files[0])).map(|p| json!({"name": p.name, "file": p.files[0]})).collect();
     if let Some((name, file)) = add {
         list.push(json!({"name": name, "file": file}));
@@ -2033,7 +2033,7 @@ fn opened_name(cli: Cli, p: &Project) -> String {
     }
 }
 
-/// What Kiri says of a YAML file that isn't a compose file (a Kubernetes manifest).
+/// What Kiribra says of a YAML file that isn't a compose file (a Kubernetes manifest).
 pub const NOT_COMPOSE: &str = "This file isn't a compose file: it has no services";
 
 /// Whether a YAML file reads as a compose file: a top-level `services` or
@@ -2152,7 +2152,7 @@ fn config(cli: Cli, p: &Project, draft: Option<&str>, profiles: &[String]) -> Re
 }
 
 /// [`config`], and whether Compose couldn't list the file's variables:
-/// then Kiri reads nothing of the file but where a YAML error is
+/// then Kiribra reads nothing of the file but where a YAML error is
 /// ([`unlisted`]), and the project is managed by name ([`CfgErr::by_name`]).
 fn config_state(cli: Cli, p: &Project, draft: Option<&str>, profiles: &[String]) -> (Result<Value, CfgErr>, bool) {
     // Only the YAML error's shape leaves [`unlisted`]: it needs no stand-in,
@@ -2162,7 +2162,7 @@ fn config_state(cli: Cli, p: &Project, draft: Option<&str>, profiles: &[String])
     }
     let (stands, _, required) = stands_unset(cli, p, draft);
     let r = config_of(cli, p, draft, profiles, &stands).map_err(|e| match e.key {
-        // Kiri's own words, keyed by Kiri: as they are.
+        // Kiribra's own words, keyed by Kiribra: as they are.
         Some(_) => e,
         // Where a YAML error is, decided here from Compose's own text.
         None => match yaml_at(&e, p, true) {
@@ -2183,7 +2183,7 @@ fn config_state(cli: Cli, p: &Project, draft: Option<&str>, profiles: &[String])
     (r, false)
 }
 
-/// What Kiri may say of a file whose variables Compose can't list: a YAML
+/// What Kiribra may say of a file whose variables Compose can't list: a YAML
 /// syntax error's line, and whether it is in the open file; else nothing,
 /// and the project is managed by name. Never a word Compose said.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -2226,7 +2226,7 @@ pub enum YamlAt {
 }
 
 impl YamlAt {
-    /// Kiri's own words for an error in another file.
+    /// Kiribra's own words for an error in another file.
     fn text(&self) -> String {
         match self {
             YamlAt::Top(n) => format!("{YAML_ERR}{n}"),
@@ -2246,9 +2246,9 @@ impl YamlAt {
 }
 
 /// Why `config` can't read a file: the text, and where a YAML error is.
-/// `key` is set only by Kiri, for its own words ([`CfgErr::own`]): text a
+/// `key` is set only by Kiribra, for its own words ([`CfgErr::own`]): text a
 /// process said is never keyed. `by_name`: Compose can't list the file's
-/// variables, so Kiri reads nothing of it and manages it by name.
+/// variables, so Kiribra reads nothing of it and manages it by name.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct CfgErr {
     pub text: String,
@@ -2258,13 +2258,13 @@ pub struct CfgErr {
 }
 
 impl CfgErr {
-    /// Kiri's own words, with the page's key for them.
+    /// Kiribra's own words, with the page's key for them.
     fn own(text: impl Into<String>) -> Self {
         let text = text.into();
         CfgErr { key: error_key(&text), text, ..CfgErr::default() }
     }
 
-    /// A file Kiri manages by name only ([`BY_NAME`]).
+    /// A file Kiribra manages by name only ([`BY_NAME`]).
     fn by_name() -> Self {
         CfgErr { by_name: true, ..CfgErr::own(BY_NAME) }
     }
@@ -2334,8 +2334,8 @@ fn relative(dir: &Path, path: &Path) -> String {
     out.to_string_lossy().replace('\\', "/")
 }
 
-/// What Kiri says of a file Compose rejects with its real values only.
-pub const REAL_ERR: &str = "Compose rejects this file with its real values. Kiri can't show why with secrets hidden.";
+/// What Kiribra says of a file Compose rejects with its real values only.
+pub const REAL_ERR: &str = "Compose rejects this file with its real values. Kiribra can't show why with secrets hidden.";
 /// … when the file requires a secret-named variable: the start, then the variables.
 pub const REQ_ERR: &str = "Compose rejects this file. A required variable may not be set: ";
 /// … when Compose can't list the variables and the file isn't YAML: the start, then the line.
@@ -2417,16 +2417,16 @@ fn config_of(cli: Cli, p: &Project, draft: Option<&str>, profiles: &[String], st
     }
 }
 
-/// What Kiri says of a project it manages by name: Compose can't list
-/// its file's variables, so Kiri reads nothing of the file ([`Unlisted`]).
-pub const BY_NAME: &str = "Kiri can't check this file's variables, so it manages this project by name. Apply changes from a terminal.";
+/// What Kiribra says of a project it manages by name: Compose can't list
+/// its file's variables, so Kiribra reads nothing of the file ([`Unlisted`]).
+pub const BY_NAME: &str = "Kiribra can't check this file's variables, so it manages this project by name. Apply changes from a terminal.";
 /// … beside it while the project has containers: their names are Docker's.
 pub const NAMES_SHOWN: &str = "Names Docker shows may contain secret values.";
 
 /// On a reading the stand-ins couldn't make though the real values can:
 /// the variables to name ([`config`]); empty when Compose couldn't list them.
 const UNCHECKED: &str = "x-kiri-unchecked";
-/// On a service only the real values give: its name is all Kiri shows.
+/// On a service only the real values give: its name is all Kiribra shows.
 const HIDDEN: &str = "x-kiri-hidden";
 
 /// The last reading the stand-ins gave, per project and profiles.
@@ -2440,7 +2440,7 @@ fn by_name_note() -> Value {
 /// What the window says of a reading marked [`UNCHECKED`] (and its key).
 fn unchecked_note(m: &Value) -> Option<Value> {
     let name = m[UNCHECKED].as_str()?;
-    Some(json!({"text": format!("Kiri can't check this file with {name} hidden. Compose accepts it, so Apply still works."), "errkey": "hiddenCheck", "errargs": {"name": name}}))
+    Some(json!({"text": format!("Kiribra can't check this file with {name} hidden. Compose accepts it, so Apply still works."), "errkey": "hiddenCheck", "errargs": {"name": name}}))
 }
 
 /// The variables (`${NAME}`) of `stands` used in a field Docker shows as a
@@ -2536,7 +2536,7 @@ pub fn name_note(vars: &[String]) -> Option<Value> {
 }
 
 /// Whether Compose accepts the file with its real values; a run that takes
-/// too long says so (Kiri's own words), not that Compose rejects it.
+/// too long says so (Kiribra's own words), not that Compose rejects it.
 fn real_passes(cli: Cli, p: &Project, draft: Option<&str>, profiles: &[String]) -> Result<bool, String> {
     let Ok(mut cmd) = cli() else { return Ok(false) };
     cmd.args(project_args(p, draft.map(|_| "-"))).args(profile_args(profiles)).args(["config", "--quiet"]);
@@ -2554,7 +2554,7 @@ thread_local! {
 }
 
 /// One `config` run, with `stands` in place of their values.
-/// Compose's own words come back unkeyed; a timeout is Kiri's ([`CfgErr::own`]).
+/// Compose's own words come back unkeyed; a timeout is Kiribra's ([`CfgErr::own`]).
 fn config_with(cli: Cli, p: &Project, draft: Option<&str>, profiles: &[String], stands: &[Stand]) -> Result<Value, CfgErr> {
     let mut cmd = standing(cli().map_err(|e| CfgErr::own(e.to_string()))?, stands);
     cmd.args(project_args(p, draft.map(|_| "-"))).args(profile_args(profiles)).args(["config", "--format", "json"]);
@@ -2594,7 +2594,7 @@ fn real_services(cli: Cli, p: &Project, draft: Option<&str>, profiles: &[String]
 
 /// Each service's `image:` and short-form `ports:` as the file's `text`
 /// writes them, only those that hold no variable (`$`): what a service
-/// Kiri can't read with its secrets hidden still shows.
+/// Kiribra can't read with its secrets hidden still shows.
 pub fn text_details(text: &str) -> BTreeMap<String, (Option<String>, Vec<String>)> {
     let mut out: BTreeMap<String, (Option<String>, Vec<String>)> = BTreeMap::new();
     let (mut in_services, mut svc_indent, mut svc, mut in_ports) = (false, None::<usize>, None::<String>, None::<usize>);
@@ -2793,7 +2793,7 @@ pub fn fill_plain(v: &str, vars: &[(String, String)]) -> Option<String> {
 struct Reading {
     stamp: Stamp,
     at: std::time::Instant,
-    /// Compose couldn't list the variables ([`config_state`]): files Kiri can't find may change it.
+    /// Compose couldn't list the variables ([`config_state`]): files Kiribra can't find may change it.
     loose: bool,
     read: Result<Value, CfgErr>,
     /// The variables in the file's own `name:` ([`own_name_vars`]), once asked for.
@@ -2803,7 +2803,7 @@ type Readings = HashMap<String, Reading>;
 static READ: LazyLock<Mutex<Readings>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// How long a reading by name is kept while the top file stays: its stamp
-/// can't cover a file Kiri can't find (`include: - ${SUBDIR:-sub}/compose.yaml`).
+/// can't cover a file Kiribra can't find (`include: - ${SUBDIR:-sub}/compose.yaml`).
 const BY_NAME_FOR: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Every reading of project `name` read again on the next ask (after an Apply).
@@ -2945,7 +2945,7 @@ pub struct Step {
     /// "add", "chg", "start", "rm" or "same".
     pub act: &'static str,
     /// What changed: image, ports, environment, volumes, depends_on, build,
-    /// settings; or outside (the file changed since it started, not by Kiri),
+    /// settings; or outside (the file changed since it started, not by Kiribra),
     /// pulled (its image name points at a newer image).
     pub what: Vec<&'static str>,
     pub image: (String, String),
@@ -2958,7 +2958,7 @@ pub struct Running {
     pub hash: String,
     /// The image ID the container was made from (com.docker.compose.image, else its ImageID).
     pub image_id: String,
-    /// The image ID its image name points at now, when Kiri has the image.
+    /// The image ID its image name points at now, when Kiribra has the image.
     pub image_now: Option<String>,
     pub running: bool,
     pub image: String,
@@ -2970,7 +2970,7 @@ pub struct Running {
 /// recreated; one with no container is created; a stopped one is started;
 /// containers of services the draft no longer has are removed (their volumes
 /// stay). What changed is read off the saved file; a change that isn't there
-/// was made to the file outside Kiri since the service started.
+/// was made to the file outside Kiribra since the service started.
 ///
 /// The image a container runs (`from`) is Docker's name for it, shown as
 /// Docker has it.
@@ -3282,7 +3282,7 @@ fn error_json(e: impl Into<CfgErr>, draft: &str, vars: &[(String, String)], hide
     let text = error_text(e);
     let text = if line.is_some() { shown_text(&text) } else { text };
     let mut v = json!({"line": line, "text": hider.hide(&text)});
-    // Only Kiri's own words have a key, given when Kiri made them.
+    // Only Kiribra's own words have a key, given when Kiribra made them.
     if let Some((k, a)) = err.key {
         v["errkey"] = k.into();
         v["errargs"] = a;
@@ -3291,7 +3291,7 @@ fn error_json(e: impl Into<CfgErr>, draft: &str, vars: &[(String, String)], hide
 }
 
 /// The list's key for a reading's error: an error in another file by its
-/// place ([`YamlAt`]), its path hidden as the text is; else the key Kiri
+/// place ([`YamlAt`]), its path hidden as the text is; else the key Kiribra
 /// gave its own words ([`CfgErr::own`]). Compose's text is never keyed.
 fn list_key(at: Option<&YamlAt>, own: Option<(&'static str, Value)>, hider: &Hider) -> Option<(&'static str, Value)> {
     let key = at.and_then(YamlAt::key).map(|(k, mut a)| {
@@ -3336,7 +3336,7 @@ fn argv(v: &Value) -> Vec<String> {
 }
 
 /// `{type: "composeprojects", projects: [...], logos}`: each project with its
-/// services (from the file when Kiri can read it, else from its containers),
+/// services (from the file when Kiribra can read it, else from its containers),
 /// what each is made of, and its containers.
 pub fn projects_event(cli: Cli, store: Store) -> String {
     let containers = match client::get_background("/containers/json?all=1") {
@@ -3417,7 +3417,7 @@ fn project_row(cli: Cli, store: Store, p: Project, containers: &Value, image_ids
     })
 }
 
-/// The row of a project Kiri manages by name ([`BY_NAME`]): its name, its
+/// The row of a project Kiribra manages by name ([`BY_NAME`]): its name, its
 /// file, and its services and state from Docker's containers alone, as
 /// for a project whose file is gone. Nothing of the file is read but the
 /// variables of its own `name:` (from its text).
@@ -3447,13 +3447,13 @@ fn by_name_row(p: Project, text: &str, containers: &Value, image_ids: &HashMap<S
 }
 
 /// A container as the list shows it: its name and image as Docker has
-/// them, never altered, as Kiri's Containers section shows them too.
+/// them, never altered, as Kiribra's Containers section shows them too.
 fn member_view(m: &Member) -> Value {
     json!({"service": m.service, "id": m.id, "name": m.name, "image": m.image, "state": m.state, "status": m.status, "created": m.created})
 }
 
 /// Whether Discard has a file to put back for the project, whose file at
-/// `path` now has `hash`: not once the file is as it was before Kiri's save
+/// `path` now has `hash`: not once the file is as it was before Kiribra's save
 /// (put back by hand), which is what runs; that one is forgotten. And
 /// whether this reading is the one that found it put back so.
 fn still_before(name: &str, path: &str, hash: &str) -> (bool, bool) {
@@ -3467,7 +3467,7 @@ fn still_before(name: &str, path: &str, hash: &str) -> (bool, bool) {
 
 /// `{type: "composefile", name, path, text, hash, mtime}`: the project's
 /// first file, as it is on disk (`hash` is what an Apply of a draft made
-/// from it sends back), or `error` when Kiri can't find it.
+/// from it sends back), or `error` when Kiribra can't find it.
 pub fn file_event(name: &str, store: Store) -> String {
     // The file reads whatever its env files are: Apply is what refuses them.
     let r = find(name, store).map_err(|e| e.to_string()).and_then(|p| checked_files(p, store)).and_then(|p| {
@@ -3480,7 +3480,7 @@ pub fn file_event(name: &str, store: Store) -> String {
         Ok((path, _, hash, _)) => still_before(name, path, hash),
         Err(_) => (BEFORE.lock().unwrap_or_else(|e| e.into_inner()).contains_key(name), false),
     };
-    // `back`: put back by hand as it was before Kiri's save, which is what runs.
+    // `back`: put back by hand as it was before Kiribra's save, which is what runs.
     match r {
         Ok((path, text, hash, mtime)) => json!({"type": "composefile", "name": name, "path": path, "text": text.replace("\r\n", "\n"), "hash": hash, "mtime": mtime, "restore": restore, "back": back}).to_string(),
         Err(e) => own_event(json!({"type": "composefile", "name": name}), e),
@@ -3509,7 +3509,7 @@ pub fn plan_event(cli: Cli, store: Store, name: &str, draft: &str, seq: &Value) 
     let (mut hider, mut vars) = (Hider::default(), Vec::new());
     let r = (|| {
         let containers = client::get_background("/containers/json?all=1").map_err(|e| CfgErr::own(e.to_string()))?;
-        let p = all_projects(&containers, store).into_iter().find(|p| p.name == name).ok_or_else(|| CfgErr::own(format!("no Compose project {name} on Kiri")))?;
+        let p = all_projects(&containers, store).into_iter().find(|p| p.name == name).ok_or_else(|| CfgErr::own(format!("no Compose project {name} on Kiribra")))?;
         let p = checked(p, store).map_err(CfgErr::own)?;
         // Managed by name: no plan, and nothing of the draft is read.
         if saved_reading(cli, &p, &[], false).read.is_err_and(|e| e.by_name) {
@@ -3576,7 +3576,7 @@ pub fn plan_event(cli: Cli, store: Store, name: &str, draft: &str, seq: &Value) 
 /// Writes the file in one step (a file beside it, renamed over it), so a
 /// watcher or a crash never sees half of it; line endings stay the file's.
 /// A link is followed and its target written; the file keeps its mode (and
-/// owner, where Kiri may set it), and the file beside it has that mode from
+/// owner, where Kiribra may set it), and the file beside it has that mode from
 /// the start, so a private file is never readable by others on the way.
 /// `base` is the hash the file must still have: checked again just before
 /// the rename, under the file's lock, so an outside edit made while Compose
@@ -3595,15 +3595,15 @@ fn save(path: &Path, text: &str, base: &str) -> io::Result<()> {
 /// UTF-8's byte order mark, which some editors put at a file's start.
 const BOM: &[u8] = b"\xef\xbb\xbf";
 
-/// What Kiri says when the compose file is read-only: it is never written.
+/// What Kiribra says when the compose file is read-only: it is never written.
 pub const READ_ONLY: &str = "The compose file is read-only";
 
-/// The file changed outside Kiri: nothing was written.
+/// The file changed outside Kiribra: nothing was written.
 #[derive(Debug)]
 pub struct Changed;
 impl std::fmt::Display for Changed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("The file changed outside Kiri")
+        f.write_str("The file changed outside Kiribra")
     }
 }
 impl std::error::Error for Changed {}
@@ -3612,7 +3612,7 @@ fn changed(e: &io::Error) -> bool {
     e.get_ref().is_some_and(|i| i.is::<Changed>())
 }
 
-/// One lock per file Kiri writes: a save and a Discard never cross.
+/// One lock per file Kiribra writes: a save and a Discard never cross.
 type Locks = HashMap<PathBuf, std::sync::Arc<Mutex<()>>>;
 static WRITING: LazyLock<Mutex<Locks>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -3855,9 +3855,9 @@ fn cancelled(name: &str) -> bool {
     UPS.lock().unwrap_or_else(|e| e.into_inner()).get(name).is_some_and(|u| u.cancelled)
 }
 
-/// An error as an event carries it: Kiri's own words, keyed for the page
+/// An error as an event carries it: Kiribra's own words, keyed for the page
 /// in its language ([`error_key`]), or what a process said, as it is and
-/// never keyed. Only Kiri makes an `Own`.
+/// never keyed. Only Kiribra makes an `Own`.
 #[derive(Debug, PartialEq)]
 pub enum Fault {
     Own(String),
@@ -3880,7 +3880,7 @@ impl Fault {
     }
 }
 
-/// An event with Kiri's own error `e` on it, keyed ([`Fault::Own`]).
+/// An event with Kiribra's own error `e` on it, keyed ([`Fault::Own`]).
 fn own_event(mut ev: Value, e: impl Into<String>) -> String {
     Fault::Own(e.into()).put(&mut ev);
     ev.to_string()
@@ -3897,15 +3897,15 @@ impl Drop for Applying {
     }
 }
 
-/// Discard after a failed Apply: puts back the file as it was before Kiri
+/// Discard after a failed Apply: puts back the file as it was before Kiribra
 /// saved over it, unless it has changed since (then it says so).
 pub fn restore(name: &str, store: Store) -> Result<(), String> {
     let p = find_checked(name, store)?;
-    let (file, bytes, wrote) = BEFORE.lock().unwrap_or_else(|e| e.into_inner()).get(name).cloned().ok_or("Kiri has nothing to put back")?;
+    let (file, bytes, wrote) = BEFORE.lock().unwrap_or_else(|e| e.into_inner()).get(name).cloned().ok_or("Kiribra has nothing to put back")?;
     if file != p.files[0] {
         return Err(NO_FILE.into());
     }
-    write_over(Path::new(&file), &bytes, &wrote).map_err(|e| if changed(&e) { "The file changed outside Kiri since Apply saved it".to_owned() } else { e.to_string() })?;
+    write_over(Path::new(&file), &bytes, &wrote).map_err(|e| if changed(&e) { "The file changed outside Kiribra since Apply saved it".to_owned() } else { e.to_string() })?;
     BEFORE.lock().unwrap_or_else(|e| e.into_inner()).remove(name);
     Ok(())
 }
@@ -3913,7 +3913,7 @@ pub fn restore(name: &str, store: Store) -> Result<(), String> {
 /// Apply: checks the draft, saves it, and runs `docker compose up -d
 /// --remove-orphans`, sending its progress lines as
 /// `{type: "composeapply", name, line}` and then `{…, done: true, ok, error,
-/// hash}` (`hash`: the file's as Kiri left it, for the next Apply's base).
+/// hash}` (`hash`: the file's as Kiribra left it, for the next Apply's base).
 /// `base` is the hash of the file the draft was made from: when the file on
 /// disk is no longer that (or the page sends none), nothing is saved and the
 /// answer has `conflict` and the file's hash now. When `up` fails the file
@@ -3933,7 +3933,7 @@ pub fn apply(cli: Cli, store: Store, name: &str, draft: &str, base: Option<&str>
     }
     let _applying = Applying(name.to_owned());
     let mut hidden = Hider::default();
-    // Kiri's own words keyed, a process's hidden and never keyed.
+    // Kiribra's own words keyed, a process's hidden and never keyed.
     let done = |ok: bool, error: Option<Fault>, saved: bool, hidden: &Hider, hash: Option<&str>| {
         let mut ev = json!({"type": "composeapply", "name": name, "done": true, "ok": ok, "error": null, "saved": saved, "hash": hash});
         match error {
@@ -3944,13 +3944,13 @@ pub fn apply(cli: Cli, store: Store, name: &str, draft: &str, base: Option<&str>
         emit(ev.to_string())
     };
     let stopped = |saved: bool, changed: &[String], hash: Option<&str>| emit(own_event(json!({"type": "composeapply", "name": name, "done": true, "ok": false, "cancelled": true, "changed": changed, "saved": saved, "hash": hash}), "Apply cancelled"));
-    let conflict = |now: &str| emit(own_event(json!({"type": "composeapply", "name": name, "done": true, "ok": false, "conflict": true, "hash": now}), "The file changed outside Kiri"));
+    let conflict = |now: &str| emit(own_event(json!({"type": "composeapply", "name": name, "done": true, "ok": false, "conflict": true, "hash": now}), "The file changed outside Kiribra"));
     let own = |e: &str| Some(Fault::Own(e.to_owned()));
     let p = match find_checked(name, store) {
         Ok(p) => p,
         Err(e) => return done(false, own(&e), false, &hidden, None),
     };
-    // Managed by name ([`BY_NAME`]): Apply is the terminal's, never Kiri's.
+    // Managed by name ([`BY_NAME`]): Apply is the terminal's, never Kiribra's.
     if saved_reading(cli, &p, &[], false).read.is_err_and(|e| e.by_name) {
         return done(false, own(BY_NAME), false, &hidden, None);
     }
@@ -3985,7 +3985,7 @@ pub fn apply(cli: Cli, store: Store, name: &str, draft: &str, base: Option<&str>
                 let ej = error_json(&e, draft, &[], &hidden);
                 return emit(json!({"type": "composeapply", "name": name, "done": true, "ok": false, "error": ej["text"], "errkey": ej["errkey"], "errargs": ej["errargs"], "saved": false, "hash": disk_hash}).to_string());
             }
-            // Kiri's own words keep the key Kiri gave them; Compose's go as said.
+            // Kiribra's own words keep the key Kiribra gave them; Compose's go as said.
             let f = if e.key.is_some() { Fault::Own(e.text.clone()) } else { Fault::Said(error_text(&e)) };
             return done(false, Some(f), false, &hidden, Some(&disk_hash));
         }
@@ -4153,7 +4153,7 @@ fn shown_error(hidden: &Hider, e: &str) -> String {
     }
 }
 
-/// [`shown_error`], as whose words it is: Kiri's when nothing but a secret was left.
+/// [`shown_error`], as whose words it is: Kiribra's when nothing but a secret was left.
 fn shown_fault(hidden: &Hider, e: &str) -> Fault {
     let h = hidden.hide_up(e);
     let words = h.split("${").map(|p| p.split_once('}').map_or(p, |(_, r)| r)).collect::<String>().split(|c: char| !c.is_alphabetic()).any(|w| w.chars().count() >= 3);
@@ -4212,7 +4212,7 @@ pub fn logs_event(cli: Cli, store: Store, name: &str) -> String {
         let p = checked(p.clone(), store).unwrap_or(Project { dir: String::new(), files: Vec::new(), env_files: Vec::new(), ..p });
         let hider = hider_of(cli, store, name);
         // By the project's name, from its containers: the file is never
-        // read, so one Kiri can only check with its secrets hidden still
+        // read, so one Kiribra can only check with its secrets hidden still
         // gives its logs.
         let out = logs_out(cli, &p.name).map_err(|e| Fault::Said(hider.hide(&e)))?;
         let mut lines = log_lines(&String::from_utf8_lossy(&out));
@@ -4340,7 +4340,7 @@ pub fn action_error(e: &str) -> String {
     if kept.is_empty() { e.trim().to_owned() } else { kept.join("\n") }
 }
 
-/// Kiri's own words keyed ([`Fault::Own`]); what Compose said, as it is.
+/// Kiribra's own words keyed ([`Fault::Own`]); what Compose said, as it is.
 fn action(cli: Cli, name: &str, what: &str) -> Result<(), Fault> {
     let own = |e: String| Fault::Own(e);
     let args = action_args(name, what).ok_or_else(|| own("no such action".into()))?;
@@ -4687,7 +4687,7 @@ mod live {
         let c: Value = client::get("/containers/json?all=1").unwrap();
         keep("containers", &c.to_string());
 
-        // Edited outside Kiri: what Apply does is compared with what runs.
+        // Edited outside Kiribra: what Apply does is compared with what runs.
         let outside = std::fs::read_to_string(&file).unwrap().replace("    image: redis:7-alpine", "    image: redis:7-alpine\n    command: [\"redis-server\", \"--save\", \"\"]");
         std::fs::write(&file, &outside).unwrap();
         let pl: Value = serde_json::from_str(&plan_event(cli, store, name, &outside, &json!(3))).unwrap();
@@ -4849,10 +4849,10 @@ mod live {
         println!("profile plan {}", pl["steps"]);
         assert!(pl["steps"].as_array().unwrap().iter().all(|s| s["act"] == "same"), "{pl}");
 
-        // Changed outside Kiri since the draft was made: nothing is saved.
+        // Changed outside Kiribra since the draft was made: nothing is saved.
         let outside = format!("{text}# changed outside\n");
         std::fs::write(&file, &outside).unwrap();
-        apply(cli, st, n, &format!("{text}# Kiri's edit\n"), Some(&hash), em);
+        apply(cli, st, n, &format!("{text}# Kiribra's edit\n"), Some(&hash), em);
         assert_eq!((last()["conflict"].clone(), last()["ok"].clone()), (json!(true), json!(false)), "{}", last());
         assert_eq!(std::fs::read_to_string(&file).unwrap(), outside, "the outside change stays");
 
@@ -5154,7 +5154,7 @@ mod live {
         std::fs::write(dir.join(".env"), &env).unwrap();
 
         // By name (an include whose path holds a variable, so Compose can't
-        // list the variables): Kiri reads nothing of the file but a YAML
+        // list the variables): Kiribra reads nothing of the file but a YAML
         // error's line, lists the project from Docker, acts on it by name,
         // and never plans or applies it.
         {
@@ -5207,7 +5207,7 @@ mod live {
             assert!(row()["containers"].as_array().unwrap().iter().all(|c| c["state"] != "running"), "stopped");
             action(cli, &loose, "start").unwrap();
             assert_eq!(row()["containers"].as_array().unwrap().iter().filter(|c| c["state"] == "running").count(), 2, "started");
-            // B: a required variable whose message holds a secret and Kiri's
+            // B: a required variable whose message holds a secret and Kiribra's
             // own words: not a word of it reaches the list, plan or Apply.
             std::fs::write(ld.join(".env"), "DB_PASSWORD=Need-live-x-77q\n").unwrap();
             std::fs::write(ld.join("sub/compose.yaml"), format!("{sub_ok}    environment:\n      - \"A=${{NEED:?${{DB_PASSWORD}} is already being applied}}\"\n")).unwrap();
@@ -5429,7 +5429,7 @@ mod live {
         let _ = cli().unwrap().args(["rm", "-f", "x-Dpl-x-4u4u9"]).stdout(Stdio::null()).status();
 
         // An included secret with a default or required marker, by an aliased
-        // include Kiri's own reader doesn't follow: it stands in all the same.
+        // include Kiribra's own reader doesn't follow: it stands in all the same.
         let sub = |d: &Path, body: &str| {
             std::fs::create_dir_all(d.join("sub")).unwrap();
             std::fs::write(d.join("sub/.env"), "DB_PASSWORD=FAKEsubPw-aa11\n").unwrap();
@@ -5522,7 +5522,7 @@ mod live {
         assert_eq!((last()["errkey"].as_str(), last()["ok"].as_bool()), (Some("yamlInc"), Some(false)), "{}", last());
         assert_eq!(std::fs::read_to_string(&file).unwrap(), inc, "nothing saved");
 
-        // Two includes, one secret name: a plain value in the one Kiri follows never shows the other's secret.
+        // Two includes, one secret name: a plain value in the one Kiribra follows never shows the other's secret.
         const SUB: &str = "FAKEsubPw-aa11";
         for s in ["sub1", "sub2"] {
             std::fs::create_dir_all(dir.join(s)).unwrap();
@@ -5619,7 +5619,7 @@ mod tests {
         let r = |hash: &str, running: bool, now: Option<&str>| Running { hash: hash.into(), image_id: "i1".into(), image_now: now.map(str::to_owned), running, image: "x".into() };
         let now: BTreeMap<String, Running> = [
             ("db".to_owned(), r("h-db-16", true, Some("i1"))),
-            // web's file was edited outside Kiri after it started.
+            // web's file was edited outside Kiribra after it started.
             ("web".to_owned(), r("h-web-old", true, Some("i1"))),
             // api's image name now points at a newer pull.
             ("api".to_owned(), r("h-api", true, Some("i2"))),
@@ -5958,7 +5958,7 @@ mod tests {
         c["Status"] = "Exited (1) 1 second ago".into();
         let f = watch_with(|| Some(json!([c.clone()])), "myapp", &touched, std::time::Duration::ZERO, std::time::Duration::ZERO);
         assert_eq!(f.iter().map(|f| f["svc"].clone()).collect::<Vec<_>>(), [json!("web")]);
-        // A secret that is the project's name: the name stays where Kiri shows it.
+        // A secret that is the project's name: the name stays where Kiribra shows it.
         let hide = Hider::new(vec![("${APP_TOKEN}".into(), "myapp".into())], vec!["web".to_owned()]);
         assert!(matches!(up_line(" Container myapp-web-1 Recreate ", "myapp", &mut images, &mut |_| None, &hide, &mut touched), UpLine::State(_, "recreating")));
         // A secret that is a service's name: the name is never hidden.
@@ -5991,7 +5991,7 @@ mod tests {
         remember_before("twice", "/w/c.yaml", a.clone(), &file_hash(&b));
         remember_before("twice", "/w/c.yaml", b, &file_hash(&c));
         assert_eq!(BEFORE.lock().unwrap()["twice"], ("/w/c.yaml".to_owned(), a, file_hash(&c)));
-        // Changed by hand since Kiri's save: that is what Discard keeps now.
+        // Changed by hand since Kiribra's save: that is what Discard keeps now.
         remember_before("twice", "/w/c.yaml", b"by hand".to_vec(), &file_hash(b"v4"));
         assert_eq!(BEFORE.lock().unwrap()["twice"].1, b"by hand");
         BEFORE.lock().unwrap().remove("twice");
@@ -6114,21 +6114,21 @@ mod tests {
     #[test]
     fn kiris_own_errors_carry_a_key_for_the_page() {
         let k = error_key;
-        assert_eq!(k("The file changed outside Kiri since Apply saved it"), Some(("changedSinceApply", json!({}))));
-        assert_eq!(k("The file changed outside Kiri"), Some(("changed", json!({}))));
-        assert_eq!(k("Kiri has nothing to put back"), Some(("nothingToRestore", json!({}))));
+        assert_eq!(k("The file changed outside Kiribra since Apply saved it"), Some(("changedSinceApply", json!({}))));
+        assert_eq!(k("The file changed outside Kiribra"), Some(("changed", json!({}))));
+        assert_eq!(k("Kiribra has nothing to put back"), Some(("nothingToRestore", json!({}))));
         assert_eq!(k("pick a .yaml or .yml compose file"), Some(("notCompose", json!({}))));
-        assert_eq!(k("no Compose project shop on Kiri"), Some(("noProject", json!({"name": "shop"}))));
+        assert_eq!(k("no Compose project shop on Kiribra"), Some(("noProject", json!({"name": "shop"}))));
         assert_eq!(k("shop is already being applied"), Some(("busy", json!({"name": "shop"}))));
         assert_eq!(k("docker compose took longer than 30 seconds"), Some(("slow", json!({"secs": "30"}))));
         assert_eq!(k(READ_ONLY), Some(("readOnly", json!({}))));
         assert_eq!(k(&bad_env("/w/shop/.env")), Some(("badEnv", json!({"file": "/w/shop/.env"}))));
         // Compose's own words go as they are.
         assert_eq!(k("services.web additional properties 'x' not allowed"), None);
-        let ev: Value = serde_json::from_str(&own_event(json!({"type": "composerestored", "name": "shop"}), "Kiri has nothing to put back")).unwrap();
+        let ev: Value = serde_json::from_str(&own_event(json!({"type": "composerestored", "name": "shop"}), "Kiribra has nothing to put back")).unwrap();
         assert_eq!(ev["errkey"], "nothingToRestore");
         // What a process said is never keyed, whatever it says.
-        for said in ["shop is already being applied", "Apply cancelled", "no Compose project x on Kiri", "docker compose took longer than 3 seconds", BY_NAME] {
+        for said in ["shop is already being applied", "Apply cancelled", "no Compose project x on Kiribra", "docker compose took longer than 3 seconds", BY_NAME] {
             let mut ev = json!({"type": "composeaction"});
             Fault::Said(said.into()).put(&mut ev);
             assert!(ev["errkey"].is_null() && ev["error"] == said, "{ev}");
@@ -6326,7 +6326,7 @@ mod tests {
         let e = error_json(CfgErr::own("docker compose took longer than 30 seconds"), "services: {}\n", &[], &Hider::default());
         assert_eq!((e["errkey"].clone(), e["errargs"].clone()), (json!("slow"), json!({"secs": "30"})));
         assert!(error_json("services.web additional properties 'x' not allowed", "", &[], &Hider::default())["errkey"].is_null());
-        // Compose's words are never keyed, even when they read as Kiri's.
+        // Compose's words are never keyed, even when they read as Kiribra's.
         for said in ["docker compose took longer than 30 seconds", "pw-x-1 is already being applied", "Compose rejects this file: YAML error on line 3"] {
             assert!(error_json(said, "", &[], &Hider::default())["errkey"].is_null(), "{said}");
         }
@@ -6886,7 +6886,7 @@ mod tests {
         assert_eq!(m[UNCHECKED], "${APP_SECRETS}");
         let note = unchecked_note(&m).unwrap();
         assert_eq!(note["errkey"], "hiddenCheck");
-        assert_eq!(note["text"], "Kiri can't check this file with ${APP_SECRETS} hidden. Compose accepts it, so Apply still works.");
+        assert_eq!(note["text"], "Kiribra can't check this file with ${APP_SECRETS} hidden. Compose accepts it, so Apply still works.");
         // A reading that worked before stands for the file till one works again.
         config(dcli, &p, Some("services:\n  x:\n    image: alpine\n"), &[]).unwrap();
         let m = config(dcli, &p, Some("services:\n  x:\n    image: alpine\n    extends:\n      file: ${BASE_SECRET}\n      service: base\n"), &[]);
@@ -7606,7 +7606,7 @@ mod tests {
     #[test]
     fn a_file_compose_cant_list_the_variables_of_is_managed_by_name() {
         // `config --variables` can't follow an include path with a variable
-        // in it: Kiri reads nothing more of the file, not even its services.
+        // in it: Kiribra reads nothing more of the file, not even its services.
         let (shown, _) = inc_window("il-varpath", "include:\n  - ${SUBDIR:-sub}/compose.yaml\nservices:\n  x:\n    image: alpine\n", &inc_sub);
         no_inc_secret("var path", &shown, &[INC_PW]);
         assert!(shown.contains(BY_NAME) && shown.contains("byName") && !shown.contains("\"db\""), "{shown}");
@@ -7930,7 +7930,7 @@ mod tests {
         assert!(file.exists(), "the compose file stays");
         let _ = std::fs::remove_dir_all(dir());
     }
-    /// The include forms Kiri's own reader may not follow, each top file
+    /// The include forms Kiribra's own reader may not follow, each top file
     /// with the included project's secret in `sub/.env` (or its env file).
     fn include_forms() -> Vec<(&'static str, String)> {
         let tail = "services:\n  x:\n    image: alpine\n";
@@ -7974,7 +7974,7 @@ mod tests {
     fn a_file_the_real_values_reject_says_so_without_composes_words() {
         let d = tdir("realrej");
         let p = Project { name: "realrej".into(), dir: d.to_string_lossy().into(), files: vec![d.join("compose.yaml").to_string_lossy().into()], ..Project::default() };
-        // An image of a secret Kiri holds nowhere: empty with the real values.
+        // An image of a secret Kiribra holds nowhere: empty with the real values.
         let e = config(dcli, &p, Some("services:\n  x:\n    image: \"${Q7_TOKEN}\"\n"), &[]).unwrap_err();
         assert_eq!(error_key(&e).unwrap().0, "rejectReal", "{e}");
         let _ = std::fs::remove_dir_all(&d);
@@ -7994,7 +7994,7 @@ mod tests {
             let p = Project { name: tag.into(), dir: d.to_string_lossy().into(), files: vec![d.join("compose.yaml").to_string_lossy().into()], ..Project::default() };
             *pre.borrow_mut() = match config(dcli, &p, Some(top), &[]) {
                 Ok(m) => format!("ok {m}"),
-                // Kiri's own words only: Compose's would be unkeyed.
+                // Kiribra's own words only: Compose's would be unkeyed.
                 Err(e) if e.key.is_some() => e.text,
                 Err(e) => format!("unkeyed {}", e.text),
             };
@@ -8209,7 +8209,7 @@ mod tests {
         // Named by Docker (`-p`, or the name the terminal's run made): no notice.
         assert!(folder_note(&name_text_vars("name: pnenv-${A_SECRET}\n"), "pnenv-x1", &dir).is_none());
         assert!(folder_note(&name_text_vars("name: shop\n"), &name, &dir).is_none());
-        // A file opened in Kiri whose name holds a secret is listed by its folder.
+        // A file opened in Kiribra whose name holds a secret is listed by its folder.
         std::fs::write(d.join("compose.yaml"), "name: pnenv-${A_SECRET}\nservices:\n  x:\n    image: alpine\n").unwrap();
         std::fs::write(d.join(".env"), "A_SECRET=Zq9-pname-77x\n").unwrap();
         let p = Project { name, dir: dir.clone(), files: vec![d.join("compose.yaml").to_string_lossy().into()], ..Project::default() };
@@ -8317,7 +8317,7 @@ mod tests {
     }
 
     /// A project whose include path holds a variable: Compose can't list
-    /// its variables, so Kiri reads it by names only.
+    /// its variables, so Kiribra reads it by names only.
     fn loose_project(tag: &str, sub: &str) -> (PathBuf, Project) {
         let d = tdir(tag);
         std::fs::create_dir_all(d.join("sub")).unwrap();
@@ -8345,7 +8345,7 @@ mod tests {
         let r = row(dcli, &p);
         assert!(r["errkey"] == "yamlInc" && r["byname"].is_null() && r["warn"].is_null(), "{r}");
         assert_eq!(r["error"], format!("{YAML_INC}5"), "{r}");
-        // Fixed outside Kiri: seen once the top file changes (or in 30 s).
+        // Fixed outside Kiribra: seen once the top file changes (or in 30 s).
         std::fs::write(d.join("sub/compose.yaml"), "services:\n  db:\n    image: postgres:16\n").unwrap();
         assert_eq!(row(dcli, &p)["errkey"], "yamlInc", "kept while the top file stays");
         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -8354,7 +8354,7 @@ mod tests {
         assert!(r["byname"] == true && r["error"].is_null() && r["readable"] == false && r["warn"]["errkey"] == "byName" && r["warn"]["text"] == BY_NAME, "{r}");
         // No containers: no services, not started, no names warning.
         assert!(r["services"] == json!([]) && r["fresh"] == true && r["namewarn"].is_null(), "{r}");
-        // After an Apply from Kiri (or a forget): at once.
+        // After an Apply from Kiribra (or a forget): at once.
         std::fs::write(d.join("sub/compose.yaml"), "services:\n  db: [\n").unwrap();
         forget_readings(&p.name);
         assert_eq!(row(dcli, &p)["errkey"], "yamlInc");
@@ -8421,7 +8421,7 @@ mod tests {
     #[test]
     fn a_crafted_required_message_passes_no_word_of_compose_or_a_secret() {
         let _one = LOOSE_TEST.lock().unwrap_or_else(|e| e.into_inner());
-        // A crafted message: Compose's own text would end in Kiri's "busy" words.
+        // A crafted message: Compose's own text would end in Kiribra's "busy" words.
         let sub = "services:\n  db:\n    image: postgres:16\n    environment:\n      - \"A=${NEED:?${DB_PASSWORD} is already being applied}\"\n";
         let shown = by_name_shown("loose-crafted", sub, "DB_PASSWORD=Crafted-x-91zq\n");
         assert!(!shown.contains("Crafted-x-91zq") && !shown.contains("already being applied") && !shown.contains("busy") && !shown.contains("NEED"), "{shown}");

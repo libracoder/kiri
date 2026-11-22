@@ -1,4 +1,4 @@
-# Kiri on a Linux host as an RPM: `kiri` (engine + docker CLI, Compose,
+# Kiribra on a Linux host as an RPM: `kiri` (engine + docker CLI, Compose,
 # buildx) or `kiri-lite` (engine only), chosen by packaging/linux/build.sh
 # through kiri_name and with_cli. Static (musl) binaries: no runtime
 # dependencies, no debuginfo. With with_window, `kiri` also carries the
@@ -18,7 +18,7 @@ Source1:        kiri-init
 Source2:        kiri.service
 Source3:        LICENSE
 Source4:        NOTICE
-Source18:       dev.kiri.host-access.policy
+Source18:       dev.kiribra.host-access.policy
 %if 0%{?with_cli}
 Source5:        docker
 Source6:        docker-compose
@@ -35,7 +35,7 @@ Source14:       kiri-app-icon-64.png
 Source15:       kiri-app-icon-128.png
 Source16:       kiri-app-icon-256.png
 Source17:       kiri-app-icon-512.png
-Source19:       dev.kiri.Kiri.metainfo.xml
+Source19:       dev.kiribra.Kiribra.metainfo.xml
 Requires:       gtk3
 Requires:       webkit2gtk4.1
 # The window's setup checklist asks for the password through pkexec.
@@ -55,17 +55,17 @@ Requires(posttrans): %{_sbindir}/update-alternatives
 %endif
 
 %description
-Kiri runs containers on this machine's kernel and speaks the Docker API on
+Kiribra runs containers on this machine's kernel and speaks the Docker API on
 /run/kiri/docker.sock for users in the kiri group (and at
 /var/run/docker.sock while no Docker engine has it). No VM, no daemon other
 than kiri itself. Members of the kiri group can run containers as root on
 this machine; treat it like the docker group.
 %if 0%{?with_cli}
-This package brings the docker CLI, Compose and buildx with it, as Kiri.app
+This package brings the docker CLI, Compose and buildx with it, as Kiribra.app
 does on the Mac: `docker run` works right after installing. A docker CLI from
 another package keeps precedence on PATH.
 %if 0%{?with_window}
-Kiri's window is in the app menu, or: kiri ui
+Kiribra's window is in the app menu, or: kiri ui
 %endif
 %else
 Engine only: point any docker CLI at it with
@@ -82,7 +82,7 @@ install -D -m 755 %{SOURCE1} %{buildroot}%{_bindir}/kiri-init
 install -D -m 644 %{SOURCE2} %{buildroot}%{_unitdir}/kiri.service
 install -D -m 644 %{SOURCE3} %{buildroot}%{_licensedir}/%{name}/LICENSE
 install -D -m 644 %{SOURCE4} %{buildroot}%{_licensedir}/%{name}/NOTICE
-install -D -m 644 %{SOURCE18} %{buildroot}%{_datadir}/polkit-1/actions/dev.kiri.host-access.policy
+install -D -m 644 %{SOURCE18} %{buildroot}%{_datadir}/polkit-1/actions/dev.kiribra.host-access.policy
 %if 0%{?with_cli}
 install -D -m 755 %{SOURCE5} %{buildroot}/usr/libexec/kiri/bin/docker
 install -D -m 755 %{SOURCE8} %{buildroot}/usr/libexec/kiri/docker
@@ -92,7 +92,7 @@ install -D -m 755 %{SOURCE7} %{buildroot}/usr/libexec/kiri/cli-plugins/docker-bu
 %if 0%{?with_window}
 install -D -m 755 %{SOURCE9} %{buildroot}/usr/lib/kiri/kiri-window
 install -D -m 644 %{SOURCE10} %{buildroot}%{_datadir}/applications/kiri.desktop
-install -D -m 644 %{SOURCE19} %{buildroot}%{_datadir}/metainfo/dev.kiri.Kiri.metainfo.xml
+install -D -m 644 %{SOURCE19} %{buildroot}%{_datadir}/metainfo/dev.kiribra.Kiribra.metainfo.xml
 install -D -m 644 %{SOURCE11} %{buildroot}%{_datadir}/icons/hicolor/scalable/apps/kiri.svg
 for s in 16 32 64 128 256 512; do
   install -D -m 644 %{_sourcedir}/kiri-app-icon-$s.png %{buildroot}%{_datadir}/icons/hicolor/${s}x${s}/apps/kiri.png
@@ -106,43 +106,43 @@ exit 0
 %post
 if [ -d /run/systemd/system ]; then
   systemctl daemon-reload >/dev/null 2>&1 || :
-  # Not started or enabled: it starts when someone sets Kiri up (the window's
+  # Not started or enabled: it starts when someone sets Kiribra up (the window's
   # Allow access, or `kiri host-access`). An upgrade ($1 >= 2) restarts a
   # running engine on the new binary, as the Mac and Windows apps do after
   # an update; its containers stop, and those with a restart policy start again.
   if [ "$1" -ge 2 ] && systemctl is-active -q kiri.service; then
-    echo "Kiri is upgraded: restarting the engine on the new version."
+    echo "Kiribra is upgraded: restarting the engine on the new version."
     systemctl try-restart kiri.service || echo "  The engine didn't restart: sudo systemctl restart kiri"
   fi
 fi
 # A `kiri` before /usr/bin on PATH runs instead of this package's.
 for d in /usr/local/sbin /usr/local/bin; do
   if [ -e "$d/kiri" ] && [ "$(readlink -f "$d/kiri")" != /usr/bin/kiri ]; then
-    echo "Warning: $d/kiri comes before /usr/bin/kiri on PATH, so it runs instead of this Kiri."
-    echo "  If it's an older Kiri, remove it:  sudo rm $d/kiri"
+    echo "Warning: $d/kiri comes before /usr/bin/kiri on PATH, so it runs instead of this Kiribra."
+    echo "  If it's an older Kiribra, remove it:  sudo rm $d/kiri"
   fi
 done
 %if 0%{?with_cli}
 # Only a /usr/bin/docker that is absent or already an alternatives link; a
 # real file, or a symlink another package or the administrator put there, is
-# left alone: Kiri's CLI must not take over someone else's docker.
+# left alone: Kiribra's CLI must not take over someone else's docker.
 free=1
 if [ -e /usr/bin/docker ] || [ -L /usr/bin/docker ]; then
   case "$(readlink /usr/bin/docker 2>/dev/null)" in /etc/alternatives/*) ;; *) free=0 ;; esac
 fi
 if [ "$free" = 1 ]; then
   %{_sbindir}/update-alternatives --install /usr/bin/docker docker /usr/libexec/kiri/docker 10 || :
-  echo "Kiri is installed with its own docker CLI (docker, docker compose, docker buildx)."
+  echo "Kiribra is installed with its own docker CLI (docker, docker compose, docker buildx)."
 else
-  echo "Kiri is installed; /usr/bin/docker belongs to something else and stays. Kiri's CLI: /usr/libexec/kiri/docker"
+  echo "Kiribra is installed; /usr/bin/docker belongs to something else and stays. Kiribra's CLI: /usr/libexec/kiri/docker"
 fi
 %else
-echo "Kiri is installed (engine only). Point a docker CLI at it:"
+echo "Kiribra is installed (engine only). Point a docker CLI at it:"
 echo "  docker context create kiri --docker host=unix:///run/kiri/docker.sock && docker context use kiri"
 %endif
-echo "To use it without sudo:  sudo kiri host-access \$USER   (or open Kiri, which sets it up)"
+echo "To use it without sudo:  sudo kiri host-access \$USER   (or open Kiribra, which sets it up)"
 echo "Members of the kiri group can run containers as root on this machine; treat it like the docker group."
-echo "While no Docker engine has /var/run/docker.sock, it leads to Kiri too (for Testcontainers, docker-py and other tools that ignore docker contexts)."
+echo "While no Docker engine has /var/run/docker.sock, it leads to Kiribra too (for Testcontainers, docker-py and other tools that ignore docker contexts)."
 exit 0
 
 %preun
@@ -169,8 +169,8 @@ exit 0
 %posttrans
 # Compose and buildx into /usr/lib/docker/cli-plugins where the slot is free
 # and Docker's own copy isn't in another of the CLI's plugin folders; else
-# Kiri's link goes and Docker's copy is used. In %posttrans because an
-# upgrade from a Kiri that put real files there erases them only after %post;
+# Kiribra's link goes and Docker's copy is used. In %posttrans because an
+# upgrade from a Kiribra that put real files there erases them only after %post;
 # again whenever another package changes Docker's plugin folders.
 mkdir -p /usr/lib/docker/cli-plugins
 for p in docker-compose docker-buildx; do
@@ -225,7 +225,7 @@ if [ -d /run/systemd/system ]; then
   systemctl daemon-reload >/dev/null 2>&1 || :
 fi
 if [ "$1" -eq 0 ]; then
-  echo "Kiri is removed; its images, containers and volumes stay in /var/lib/kiri"
+  echo "Kiribra is removed; its images, containers and volumes stay in /var/lib/kiri"
 fi
 exit 0
 
@@ -235,7 +235,7 @@ exit 0
 %{_bindir}/kiri
 %{_bindir}/kiri-init
 %{_unitdir}/kiri.service
-%{_datadir}/polkit-1/actions/dev.kiri.host-access.policy
+%{_datadir}/polkit-1/actions/dev.kiribra.host-access.policy
 %if 0%{?with_cli}
 %dir /usr/libexec/kiri
 %dir /usr/libexec/kiri/bin
@@ -250,9 +250,9 @@ exit 0
 /usr/lib/kiri/kiri-window
 %{_datadir}/applications/kiri.desktop
 %{_datadir}/icons/hicolor/*/apps/kiri.*
-%{_datadir}/metainfo/dev.kiri.Kiri.metainfo.xml
+%{_datadir}/metainfo/dev.kiribra.Kiribra.metainfo.xml
 %endif
 
 %changelog
-* Sun Oct 25 2026 Kiri <kiri@canestack.com> - %{kiri_version}-1
+* Sun Oct 25 2026 Kiribra <kiri@canestack.com> - %{kiri_version}-1
 - Packaged from the static Linux build

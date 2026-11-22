@@ -331,7 +331,7 @@ pub fn add_address(nl: &mut Netlink, index: i32, addr: [u8; 4], prefix: u8) -> i
 
 /// An IPv6 address, usable at once: no duplicate address detection, which
 /// would leave it tentative (not usable as a source) for about a second.
-/// Kiri hands out every address on its networks, so none can be taken.
+/// Kiribra hands out every address on its networks, so none can be taken.
 pub fn add_address6(nl: &mut Netlink, index: i32, addr: [u8; 16], prefix: u8) -> io::Result<()> {
     const IFA_F_NODAD: u8 = 0x02;
     let mut m = Msg::new(RTM_NEWADDR, NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL);
@@ -435,7 +435,7 @@ const NFT_MSG_NEWCHAIN: u16 = 3;
 const NFT_MSG_NEWRULE: u16 = 6;
 const NFT_MSG_DELRULE: u16 = 8;
 
-/// The start of a batch that replaces Kiri's table of `family`: add it
+/// The start of a batch that replaces Kiribra's table of `family`: add it
 /// (nothing happens when it is there already), then delete it, so the rest
 /// of the batch makes it again from nothing. One batch keeps the old table
 /// if anything in it is refused. DESTROYTABLE would do it in one message,
@@ -476,12 +476,12 @@ fn nat_chain(name: &str, hook: u32, priority: i32) -> Msg {
     chain
 }
 
-/// Kiri's container bridges are kiri0, kiri1, … (the daemon names them).
+/// Kiribra's container bridges are kiri0, kiri1, … (the daemon names them).
 const BRIDGE_PREFIX: &[u8] = b"kiri";
 
 /// `ip daddr <addr> tcp redirect to :<port>`: connections to `addr` (any
 /// port) go to a local listener, which can read the original port back.
-/// With `from_bridges`, only packets arriving on a Kiri bridge match
+/// With `from_bridges`, only packets arriving on a Kiribra bridge match
 /// (`iifname "kiri*"`): the redirect leads to the host's loopback, which
 /// nothing on the uplink (the LAN, on a Linux host) may reach.
 fn redirect_rule(chain: &str, addr: [u8; 4], port: u16, from_bridges: bool) -> Msg {
@@ -644,7 +644,7 @@ const CT_STATUS_DNAT: u32 = 1 << 5;
 /// Without it, anything that can route to the engine (another VM on the
 /// NAT network, a LAN neighbour of a Linux host) reached every container
 /// port, published or not, with ip_forward on. Only traffic headed into a
-/// Kiri bridge is judged: a Linux host's other forwarding stays as it was.
+/// Kiribra bridge is judged: a Linux host's other forwarding stays as it was.
 ///
 /// Containers on different networks do not reach each other, as Docker's
 /// DOCKER-ISOLATION chains keep them apart: a packet from one bridge is
@@ -662,7 +662,7 @@ fn forward_filter(bridges: &[String], guard: Option<&str>) -> Vec<Msg> {
     forward_filter_in(libc::NFPROTO_IPV4 as u8, bridges, guard)
 }
 
-/// While Kiri's bridges are in firewalld's trusted zone (`firewall.rs`),
+/// While Kiribra's bridges are in firewalld's trusted zone (`firewall.rs`),
 /// which accepts whatever they send, the uplinks (IPv4, IPv6) the forward
 /// filter lets new connections out through:
 ///
@@ -671,7 +671,7 @@ fn forward_filter(bridges: &[String], guard: Option<&str>) -> Vec<Msg> {
 ///     ct state & (established|related) == 0 ct status & dnat == 0 drop
 /// ```
 ///
-/// first in the chain. Kiri's containers then reach what the iptables rules
+/// first in the chain. Kiribra's containers then reach what the iptables rules
 /// let them reach where there is no firewalld (the internet through the
 /// uplink, published ports, replies), and not another program's bridge or
 /// network, which firewalld kept them from before.
@@ -775,7 +775,7 @@ fn forward_filter_in(family: u8, bridges: &[String], guard: Option<&str>) -> Vec
 /// With `route_localnet` on a bridge, the kernel would take a packet a
 /// container sends to 127.0.0.1 (raw socket, gateway MAC) as local: any
 /// service bound to the host's loopback answered (the CVE-2020-8558 hole,
-/// closed as kube-proxy does). Kiri no longer sets it (the daemon relays
+/// closed as kube-proxy does). Kiribra no longer sets it (the daemon relays
 /// the host's loopback connections to published ports), but something
 /// else on a Linux host may (kube-proxy sets `conf.all.route_localnet`),
 /// so the guard stays. Replies to established connections still pass.
@@ -879,7 +879,7 @@ fn masq6_rule(subnet: [u8; 16], prefix: u8) -> Msg {
     rule
 }
 
-/// Kiri's IPv6 table, for the IPv6 networks `subnets`, rebuilt whole (and
+/// Kiribra's IPv6 table, for the IPv6 networks `subnets`, rebuilt whole (and
 /// removed with the last one, so an engine with none has no IPv6 rules):
 ///
 /// ```text
@@ -917,7 +917,7 @@ pub fn install_nat6(subnets: &[([u8; 16], u8)], bridges: &[String]) -> io::Resul
 
 /// The table, in a container's own network namespace, that sends its DNS
 /// for 127.0.0.11:53 to the embedded DNS's socket there. Not `kiri`: an
-/// engine inside the container (Kiri on a "Linux host" in a privileged
+/// engine inside the container (Kiribra on a "Linux host" in a privileged
 /// container) replaces its own `kiri` table.
 const EMBEDDED_DNS_TABLE: &str = "kiri_dns";
 
@@ -934,7 +934,7 @@ const EMBEDDED_DNS_TABLE: &str = "kiri_dns";
 /// The embedded DNS listens on 127.0.0.11:`port`, a free high port, so port
 /// 53 stays free for a DNS server of the container's own (dnsmasq, Pi-hole,
 /// CoreDNS bind 0.0.0.0:53), while the container's lookups at 127.0.0.11:53
-/// still reach Kiri's. Replies are mapped back to port 53 by conntrack. TCP
+/// still reach Kiribra's. Replies are mapped back to port 53 by conntrack. TCP
 /// is not redirected: the embedded DNS answers over UDP only.
 pub fn redirect_embedded_dns(addr: [u8; 4], port: u16) -> io::Result<()> {
     let mut nl = Netlink::open(libc::NETLINK_NETFILTER)?;
@@ -966,7 +966,7 @@ fn embedded_dns_batch(addr: [u8; 4], port: u16) -> Vec<Msg> {
 const NLM_F_DUMP: u16 = 0x300;
 
 /// One nf_tables chain of any table, as `chains` lists it: iptables-nft's
-/// (`ip filter FORWARD`), firewalld's, an nftables.conf's, Kiri's own.
+/// (`ip filter FORWARD`), firewalld's, an nftables.conf's, Kiribra's own.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Chain {
     /// NFPROTO_INET, _IPV4, _IPV6, …
@@ -982,7 +982,7 @@ pub struct Chain {
 }
 
 /// Every chain of every nf_tables table, in one dump. A host without a
-/// firewall answers with Kiri's own few.
+/// firewall answers with Kiribra's own few.
 pub fn chains() -> io::Result<Vec<Chain>> {
     const NFT_MSG_GETCHAIN: u16 = 4;
     let mut nl = Netlink::open(libc::NETLINK_NETFILTER)?;
@@ -1072,7 +1072,7 @@ pub fn drain(fd: &OwnedFd) {
     }
 }
 
-/// Removes Kiri's table (a Linux host's engine stopping), if there is one.
+/// Removes Kiribra's table (a Linux host's engine stopping), if there is one.
 pub fn remove_nat() -> io::Result<()> {
     let mut nl = Netlink::open(libc::NETLINK_NETFILTER)?;
     let mut begin = Msg::new(NFNL_MSG_BATCH_BEGIN, 0);
@@ -1083,7 +1083,7 @@ pub fn remove_nat() -> io::Result<()> {
     nl.request(&mut [begin, add, delete, end])
 }
 
-/// Kiri's NAT table:
+/// Kiribra's NAT table:
 ///
 /// ```text
 /// table ip kiri {
@@ -1153,7 +1153,7 @@ pub fn install_nat_from(uplink_index: i32, host_addr: [u8; 4], host_port: u16, r
     }
     let pre = nat_chain("prerouting", 0, -100); // NF_INET_PRE_ROUTING
     let out = nat_chain("output", 3, -100); // NF_INET_LOCAL_OUT
-    // Only from Kiri's own bridges: the LAN must not reach the loopback relay.
+    // Only from Kiribra's own bridges: the LAN must not reach the loopback relay.
     let pre_rule = redirect_rule("prerouting", host_addr, host_port, true);
     // The host's own connections (and `--network host` containers).
     let out_rule = redirect_rule("output", host_addr, host_port, false);

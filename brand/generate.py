@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Writes the Kiri logo SVG family into brand/logo and brand/icon."""
+"""Writes the Kiribra logo SVG family into brand/logo and brand/icon."""
 import os, sys
 
 OUT = sys.argv[1]  # brand dir
@@ -90,22 +90,22 @@ for name, v in variants.items():
         m = mark_color(v['lines'], uid)
         wm = wordmark(v['ink'], v['dot'])
     # mark only
-    write(f'logo/kiri-mark-{name}.svg', svg(64, 64, m, 'Kiri'))
+    write(f'logo/kiri-mark-{name}.svg', svg(64, 64, m, 'Kiribra'))
     # horizontal: mark 64 tall, wordmark scaled 1.0 sitting on the box baseline
     # box spans y 12..52; wordmark spans y 10..56 -> shift so baseline 56 -> 52
     hw = 64 + 12 + WM_W * 0.8
     body = f'{m}\n  <g transform="translate(76 7.2) scale(0.8)">{wm}</g>'
-    write(f'logo/kiri-horizontal-{name}.svg', svg(hw, 64, body, 'Kiri'))
+    write(f'logo/kiri-horizontal-{name}.svg', svg(hw, 64, body, 'Kiribra'))
     # stacked: mark scaled 1.6 above, wordmark centred below
     sw = 120
     mx = (sw - 64 * 1.6) / 2
     body = (f'<g transform="translate({mx:g} 0) scale(1.6)">{m}</g>\n'
             f'  <g transform="translate({(sw - WM_W) / 2:g} 104)">{wm}</g>')
-    write(f'logo/kiri-stacked-{name}.svg', svg(sw, 164, body, 'Kiri'))
+    write(f'logo/kiri-stacked-{name}.svg', svg(sw, 164, body, 'Kiribra'))
 
 # ---------- favicon: simplified mark, no speed lines, fills the tile ----------
 fav = f'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32">
-  <title>Kiri</title>
+  <title>Kiribra</title>
   <g transform="translate(2.6 0) skewX(-10)">
     <clipPath id="fc"><rect x="5" y="2" width="26" height="28" rx="7"/></clipPath>
     <rect x="5" y="2" width="26" height="28" rx="7" fill="{EMBER}"/>
@@ -127,7 +127,7 @@ def app_icon(m, rx, width, tile_note):
     scale = round(width * t / 59, 3)
     ax, ay = round(512 - 30.5 * scale, 1), round(512 - 32 * scale, 1)
     return f'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
-  <title>Kiri app icon</title>
+  <title>Kiribra app icon</title>
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0" stop-color="#1B232C"/>
@@ -163,7 +163,7 @@ def app_icon(m, rx, width, tile_note):
 
 write('icon/kiri-app-icon.svg', app_icon(100, 185, 0.84, 'macOS-style rounded tile with 100px safe margin'))
 # Windows draws icons to the edge of their square, and Apple's margin makes
-# Kiri look a size small in the taskbar: the tile fills the canvas (same
+# Kiribra look a size small in the taskbar: the tile fills the canvas (same
 # corner ratio) and the mark is drawn larger. Rendered to PNGs and an .ico
 # by windows-icons.ps1.
 write('icon/kiri-app-icon-windows.svg', app_icon(0, 230, 0.86, 'Windows: the tile fills the square, the mark drawn larger'))

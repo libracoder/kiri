@@ -1,7 +1,7 @@
 // Every share on the account, coloured by computer: this window's own and
 // kiri share's on this Mac are green (the CLI one tagged), another computer's
 // are purple External. The plan's limit counts them all.
-kiri.on({ type: "status", version: "0.1.4", dev: true, app: "Kiri Dev", ours: "kiri-dev", context: "kiri-dev" });
+kiri.on({ type: "status", version: "0.1.4", dev: true, app: "Kiribra Dev", ours: "kiribra-dev", context: "kiribra-dev" });
 const R = [];
 const t = (name, fn) => { try { fn(); R.push("PASS " + name); } catch (e) { R.push("FAIL " + name + ": " + e.message); } };
 const eq = (a, b, m) => { if (JSON.stringify(a) !== JSON.stringify(b)) throw new Error(m + ": got " + JSON.stringify(a) + " want " + JSON.stringify(b)); };
@@ -11,9 +11,9 @@ for (const id of [2, 3]) sh.items.delete(id);
 sh.starting.clear();
 ui.containers.push({ Id: "f1", Names: ["/flower"], Image: "mher/flower:2.0", State: "running", Status: "Up 1 hour", Created: Date.now() / 1000 - 3600, Ports: [{ PublicPort: 8088, PrivatePort: 5555, Type: "tcp" }], Labels: {} });
 const NOW = Date.now() / 1000;
-const WEB = { name: "web-k3x9ab", label: "web", url: "https://web-k3x9.runkiri.cloud", host: "paul-mbp", kind: "app", program: "Kiri Dev", target: "web (localhost:8080)", started: NOW - 840, mine: true, where: "here" };
+const WEB = { name: "web-k3x9ab", label: "web", url: "https://web-k3x9.runkiri.cloud", host: "paul-mbp", kind: "app", program: "Kiribra Dev", target: "web (localhost:8080)", started: NOW - 840, mine: true, where: "here" };
 const FLOWER = { name: "flower-demo-x1ab23", label: "flower-demo", url: "https://flower-demo-x1.runkiri.cloud", host: "paul-mbp", kind: "cli", program: "kiri share", target: "localhost:8088", started: NOW - 2520, mine: false, where: "here" };
-const API = { name: "api-7fq2ab", label: "api", url: "https://api-7fq2.runkiri.cloud", host: "paul-desktop", kind: "app", program: "Kiri Dev", target: "api (localhost:3000)", started: NOW - 7500, mine: false, where: "external" };
+const API = { name: "api-7fq2ab", label: "api", url: "https://api-7fq2.runkiri.cloud", host: "paul-desktop", kind: "app", program: "Kiribra Dev", target: "api (localhost:3000)", started: NOW - 7500, mine: false, where: "external" };
 const list = (items, limit = 3) => kiri.on({ type: "sharetunnels", items, limit });
 list([WEB, FLOWER, API]);
 const card = () => { shCard("list"); return $("sh-modal"); };
@@ -32,7 +32,7 @@ t("the card: this Mac's shares green, the CLI one tagged, the other computer's p
   eq(text(rows[1].querySelector(".sh-mnum")), "42 minup", "time up");
   eq(text(c.querySelector(".sh-mgroup")), "External on other computers", "heading");
   eq(text(rows[2].querySelector("b")), "apiExternal", "External tag");
-  eq(text(rows[2].querySelector("small")), "Kiri Dev on paul-desktop · :3000", "machine and program");
+  eq(text(rows[2].querySelector("small")), "Kiribra Dev on paul-desktop · :3000", "machine and program");
   eq(!!rows[2].querySelector(".tile.ext"), true, "purple tile");
   eq(text(c.querySelector("h3")), "Shared 3 live", "counts all");
   eq(text(c.querySelector(".sh-tot")), "3 of 3 tunnels in use", "plan slots");
@@ -57,7 +57,7 @@ t("the Share view: 3 of 3, a slot each by computer, and the rows", () => {
   eq([...cli.querySelectorAll(".sh-acts button")].map((b) => b.title), ["Disconnect"], "no Pause");
   eq(text(document.querySelector(".sh-group")), "External running on other computers on your account", "group");
   const ext = document.querySelector('.sh-row.ext[data-shname="api-7fq2ab"]');
-  eq(text(ext.querySelector(".sh-sub")), "Kiri Dev on paul-desktop · port 3000", "External sub");
+  eq(text(ext.querySelector(".sh-sub")), "Kiribra Dev on paul-desktop · port 3000", "External sub");
   eq([...ext.querySelectorAll(".sh-traffic > *")].map(text), ["2 h 5 min"], "External uptime, once, on the right");
   eq([...ext.querySelectorAll(".sh-acts button")].map(text), [""], "one stop icon, like the shares here");
   eq(getComputedStyle(ext).cursor, "default", "not clickable");
@@ -102,11 +102,11 @@ t("the same rule matches a CLI share of the container by name", () => {
   eq(text(again.querySelector(".shc")), "Share", "another host's 8088 isn't this container");
   list([WEB, FLOWER, API]);
 });
-t("another program on this Mac (the other Kiri app) is green too, tagged with its name", () => {
-  list([WEB, FLOWER, API, { ...API, name: "docs-ab12cd", label: "docs", host: "paul-mbp", where: "here", program: "Kiri", target: "localhost:4000" }]);
+t("another program on this Mac (the other Kiribra app) is green too, tagged with its name", () => {
+  list([WEB, FLOWER, API, { ...API, name: "docs-ab12cd", label: "docs", host: "paul-mbp", where: "here", program: "Kiribra", target: "localhost:4000" }]);
   const rows = rowsOf(card());
   eq(rows.map((r) => r.className), ["sh-mrow live", "sh-mrow live", "sh-mrow live", "sh-mrow ext"], "green");
-  eq(text(rows[2].querySelector(".cli-tag")), "Kiri", "tag");
+  eq(text(rows[2].querySelector(".cli-tag")), "Kiribra", "tag");
   $("sh-modal").remove();
   list([WEB, FLOWER, API]);
 });
@@ -128,8 +128,8 @@ t("Stop on another computer's share asks first, naming that computer", () => {
   document.querySelector('[data-shext="api-7fq2ab"]').click();
   const d = $("sh-stopext");
   eq(text(d.querySelector("h3")), "Stop api on paul-desktop?", "title");
-  eq(text(d.querySelector(".ext-where small")), "Kiri Dev on paul-desktop · port 3000", "where");
-  eq(d.querySelector("p").textContent.includes("Kiri Dev there shows the share as stopped from another computer"), true, "what happens there");
+  eq(text(d.querySelector(".ext-where small")), "Kiribra Dev on paul-desktop · port 3000", "where");
+  eq(d.querySelector("p").textContent.includes("Kiribra Dev there shows the share as stopped from another computer"), true, "what happens there");
   eq(text(d.querySelector("[data-go]")), "Stop on paul-desktop", "button");
   eq(sent.filter((x) => x.type === "sharestop").length, 0, "nothing yet");
   d.querySelector("[data-close]").click();
@@ -184,7 +184,7 @@ t("seen from the other computer, the colours mirror", () => {
   sh.items.set(1, { ...web, url: API.url, source: "api" });
   const rows = rowsOf(card());
   eq(rows.map((r) => r.className), ["sh-mrow live", "sh-mrow ext", "sh-mrow ext"], "colours");
-  eq(rows.slice(1).map((r) => text(r.querySelector("small"))), ["Kiri Dev on paul-mbp · :8080", "kiri share on paul-mbp · :8088"], "which program, where");
+  eq(rows.slice(1).map((r) => text(r.querySelector("small"))), ["Kiribra Dev on paul-mbp · :8080", "kiri share on paul-mbp · :8088"], "which program, where");
   $("sh-modal").remove();
   sh.items.set(1, web); list([WEB, FLOWER, API]);
 });

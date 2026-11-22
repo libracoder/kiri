@@ -4,7 +4,7 @@
 # serve` attaches a captured one, and the guest's real USB stack, cdc-acm
 # and usbhid take it from there. Usage:
 #
-#   DOCKER_CONTEXT=kiri-usb KIRI="target/dev/Kiri Usb.app/Contents/MacOS/kiri" tests/usb.sh
+#   DOCKER_CONTEXT=kiri-usb KIRI="target/dev/Kiribra Usb.app/Contents/MacOS/kiri" tests/usb.sh
 #
 # Covers: enumeration, a 1 MiB echo through /dev/ttyACM0, opens and closes
 # (each one unlinks pending URBs), line coding, a stalled endpoint, two
@@ -96,7 +96,7 @@ for loc in $(attached | grep -o '"Location":"[^"]*"' | cut -d'"' -f4); do detach
 echo "-- a serial device"
 check "serial attaches" fake t-serial serial
 check "it enumerates as a CDC ACM tty" wait_acm 1
-check "with its own descriptors" bash -c "vm 'cat /sys/bus/usb/devices/*/product' | grep -q 'Kiri test serial'"
+check "with its own descriptors" bash -c "vm 'cat /sys/bus/usb/devices/*/product' | grep -q 'Kiribra test serial'"
 check "1 MiB echoes back unchanged" echo_through /dev/ttyACM0 1048576
 check "64 KiB echoes back again" echo_through /dev/ttyACM0 65536
 opens=$(docker run --rm --device /dev/ttyACM0 alpine sh -c '
@@ -149,9 +149,9 @@ api POST /kiri/sleep >/dev/null
 check "attaching wakes a sleeping VM" fake t-wake serial
 check "and the device works" bash -c "wait_acm 1 && echo_through /dev/ttyACM0 4096"
 api POST /kiri/stop >/dev/null
-check "stopping Kiri ends the device's session" gone t-wake
+check "stopping Kiribra ends the device's session" gone t-wake
 perl -e 'alarm 30; exec @ARGV' "$K" usb fake serial --location t-stopped >"$LOGS/t-stopped.log" 2>&1
-check "attaching while Kiri is stopped is refused" grep -q "Kiri did not take the device" "$LOGS/t-stopped.log"
+check "attaching while Kiribra is stopped is refused" grep -q "Kiribra did not take the device" "$LOGS/t-stopped.log"
 api POST /kiri/wake >/dev/null
 if [ -n "${IDLE_SECS:-}" ]; then
   fake t-idle serial; wait_acm 1
@@ -188,7 +188,7 @@ echo "-- a mouse (interrupt IN)"
 check "mouse attaches" fake t-mouse mouse --reports 100000
 ev=
 for _ in $(seq 50); do
-  ev=$(vm 'for d in /sys/class/input/event*; do grep -q "Kiri test mouse" $d/device/name 2>/dev/null && basename $d; done' | head -1)
+  ev=$(vm 'for d in /sys/class/input/event*; do grep -q "Kiribra test mouse" $d/device/name 2>/dev/null && basename $d; done' | head -1)
   [ -n "$ev" ] && break
   sleep 0.2
 done

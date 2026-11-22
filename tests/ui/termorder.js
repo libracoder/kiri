@@ -1,6 +1,6 @@
 // In a container's Terminal tab each reply lands under its own command, whichever
 // answers first, and a command that never ends does not hold the next (#338).
-kiri.on({ type: "status", version: "0.2.2", app: "Kiri", ours: "kiri", context: "kiri" });
+kiri.on({ type: "status", version: "0.2.2", app: "Kiribra", ours: "kiri", context: "kiri" });
 const R = [];
 const t = (name, fn) => { try { fn(); R.push("PASS " + name); } catch (e) { R.push("FAIL " + name + ": " + e.message); } };
 const eq = (a, b, m) => { if (JSON.stringify(a) !== JSON.stringify(b)) throw new Error(m + ": got " + JSON.stringify(a) + " want " + JSON.stringify(b)); };

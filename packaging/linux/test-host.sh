@@ -33,26 +33,26 @@ host_test() { # name full(0|1)
   deb=$(pkgfile "$name")
   # dnf, not rpm -i: it brings what the package requires (update-alternatives).
   if [ "$fmt" = deb ]; then install="dpkg -i '$deb'" remove="dpkg -r $name"; else install="dnf install -y -q '$deb'" remove="rpm -e $name"; fi
-  # postinst offers Kiri's docker through update-alternatives only when
+  # postinst offers Kiribra's docker through update-alternatives only when
   # /usr/bin/docker is absent or already an alternatives link; one that
   # belongs to something else (Docker Desktop's symlink in WSL, a docker-ce
-  # file) must be left alone, and Kiri's CLI is then /usr/libexec/kiri/docker.
+  # file) must be left alone, and Kiribra's CLI is then /usr/libexec/kiri/docker.
   if [ -e /usr/bin/docker ] || [ -L /usr/bin/docker ]; then
     case "$(readlink /usr/bin/docker 2>/dev/null)" in /etc/alternatives/*) ;; *) slot_free=0 ;; esac
   fi
-  # The unit links /var/run/docker.sock to Kiri only when nothing is there.
+  # The unit links /var/run/docker.sock to Kiribra only when nothing is there.
   local sock_free=1
   { [ -e /run/docker.sock ] || [ -L /run/docker.sock ]; } && sock_free=0
   echo
   echo "#### $name on $(. /etc/os-release; echo "$PRETTY_NAME")"
   check "${install%% *} install $(basename "$deb")" "$install"
-  # Installing runs nothing: the engine starts when someone sets Kiri up.
+  # Installing runs nothing: the engine starts when someone sets Kiribra up.
   check "installed, engine not started or enabled" "! systemctl is-enabled -q kiri && ! systemctl is-active -q kiri && test ! -S /run/kiri/docker.sock"
   # The window's setup checklist: \`kiri host-access USER\` (through pkexec)
   # starts the engine and lets an account in at once, by name on the socket's
   # access list, without it signing in again. Checked as that user with no
   # groups at all, as a session started before the change would be.
-  check "polkit action for the password prompt" "test -f /usr/share/polkit-1/actions/dev.kiri.host-access.policy"
+  check "polkit action for the password prompt" "test -f /usr/share/polkit-1/actions/dev.kiribra.host-access.policy"
   userdel kiri-acl-test >/dev/null 2>&1; useradd --system --no-create-home kiri-acl-test
   userdel kiri-acl-other >/dev/null 2>&1; useradd --system --no-create-home kiri-acl-other
   check "kiri host-access starts the engine and adds the account to the kiri group" "/usr/bin/kiri host-access kiri-acl-test && systemctl is-enabled -q kiri && systemctl is-active -q kiri && id -nG kiri-acl-test | grep -qw kiri"
@@ -67,13 +67,13 @@ host_test() { # name full(0|1)
   check "/var/lib/kiri is 710, not world-readable" "test \"\$(stat -c %a /var/lib/kiri)\" = 710"
   check "/var/lib/kiri-daemon (StateDirectory) exists" "test -d /var/lib/kiri-daemon"
   if [ "$sock_free" = 1 ]; then
-    check "/var/run/docker.sock links to Kiri's socket" "test \"\$(readlink /var/run/docker.sock)\" = /run/kiri/docker.sock"
+    check "/var/run/docker.sock links to Kiribra's socket" "test \"\$(readlink /var/run/docker.sock)\" = /run/kiri/docker.sock"
   else
     check "/var/run/docker.sock ($(readlink /var/run/docker.sock 2>/dev/null || echo a socket)) left to its owner" "test \"\$(readlink /var/run/docker.sock 2>/dev/null)\" != /run/kiri/docker.sock"
   fi
   if [ "$full" = 1 ]; then
     if [ "$slot_free" = 1 ]; then
-      check "/usr/bin/docker is Kiri's (update-alternatives)" "readlink -f /usr/bin/docker | grep -q /usr/libexec/kiri/docker"
+      check "/usr/bin/docker is Kiribra's (update-alternatives)" "readlink -f /usr/bin/docker | grep -q /usr/libexec/kiri/docker"
       cli=docker
     else
       check "/usr/bin/docker ($(readlink /usr/bin/docker 2>/dev/null || echo a file)) left to its owner" "! readlink -f /usr/bin/docker | grep -q /usr/libexec/kiri/docker"
@@ -103,11 +103,11 @@ host_test() { # name full(0|1)
       check "docker through /var/run/docker.sock, no context" "$clidir/docker -H unix:///var/run/docker.sock version --format '{{.Server.Os}}' | grep -q linux"
     fi
     # Testcontainers' Ryuk: a container driving the engine through the socket it was given.
-    # Kiri's socket, wherever it is: /var/run/docker.sock when Kiri linked it,
+    # Kiribra's socket, wherever it is: /var/run/docker.sock when Kiribra linked it,
     # else /run/kiri/docker.sock (the other socket, Docker Desktop's in WSL
-    # for one, is not Kiri). The server must say it's Kiri.
+    # for one, is not Kiribra). The server must say it's Kiribra.
     local ksock=/var/run/docker.sock; [ "$sock_free" = 1 ] || ksock=/run/kiri/docker.sock
-    check "container mounts Kiri's socket and reaches Kiri" "$cli run --rm -v $ksock:/var/run/docker.sock docker:cli docker version --format '{{.Server.Platform.Name}} {{.Server.Version}}' | grep -qi kiri"
+    check "container mounts Kiribra's socket and reaches Kiribra" "$cli run --rm -v $ksock:/var/run/docker.sock docker:cli docker version --format '{{.Server.Platform.Name}} {{.Server.Version}}' | grep -qi kiri"
     check "published port answers" "$cli rm -f kiri-pkg-web >/dev/null 2>&1; $cli run -d --name kiri-pkg-web -p 127.0.0.1:18083:80 nginx:alpine >/dev/null && for i in \$(seq 40); do curl -fs 127.0.0.1:18083 >/dev/null 2>&1 && break; sleep 0.5; done; curl -fs 127.0.0.1:18083 | grep -q 'Welcome to nginx'; r=\$?; $cli rm -f kiri-pkg-web >/dev/null 2>&1; [ \$r -eq 0 ]"
   else
     echo "  [skip] docker run (pass a static docker CLI dir as the 2nd argument)"

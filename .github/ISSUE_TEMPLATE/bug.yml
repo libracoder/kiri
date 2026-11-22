@@ -1,12 +1,12 @@
 name: Bug report
-description: Something in Kiri doesn't work as it should.
+description: Something in Kiribra doesn't work as it should.
 labels: ["bug"]
 body:
   - type: input
     id: version
     attributes:
-      label: Kiri version and system
-      description: From Kiri's About window, or `kiri version`.
+      label: Kiribra version and system
+      description: From Kiribra's About window, or `kiri version`.
       placeholder: "0.2.0 on macOS 26.1 (Apple silicon)"
     validations:
       required: true
@@ -38,4 +38,4 @@ body:
     id: notes
     attributes:
       label: Anything else
-      description: How often it happens, a workaround you found, Kiri's logs if they show the problem.
+      description: How often it happens, a workaround you found, Kiribra's logs if they show the problem.

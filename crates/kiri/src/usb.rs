@@ -63,7 +63,7 @@ fn list() -> io::Result<()> {
     println!("{:<12} {:<10} {:<6} {:<10} {:<9} NAME", "LOCATION", "ID", "SPEED", "STATE", "KIND");
     for d in &devices {
         let state = if attached.iter().any(|a| a == &d.location()) {
-            "in Kiri"
+            "in Kiribra"
         } else if waiting.iter().any(|(l, _)| l == &d.location()) {
             "waiting"
         } else {
@@ -72,7 +72,7 @@ fn list() -> io::Result<()> {
         let kind = match d.kind() { "" => "usb", k => k };
         println!("{:<12} {:04x}:{:04x}  {:<6} {:<10} {:<9} {}", d.location(), d.vendor, d.product, d.speed_name(), state, kind, d.name);
     }
-    // Left the bus: Kiri attaches them again when they come back.
+    // Left the bus: Kiribra attaches them again when they come back.
     for (l, name) in waiting.iter().filter(|(l, _)| !devices.iter().any(|d| &d.location() == l)) {
         println!("{:<12} {:<10} {:<6} {:<10} {:<9} {}", l, "-", "-", "waiting", "-", name);
     }
@@ -91,7 +91,7 @@ pub fn attached() -> Vec<String> {
         .collect()
 }
 
-/// The devices that left and that Kiri attaches again when they come back,
+/// The devices that left and that Kiribra attaches again when they come back,
 /// as (location, name).
 #[cfg(target_os = "macos")]
 fn waiting() -> Vec<(String, String)> {
@@ -109,11 +109,11 @@ fn waiting() -> Vec<(String, String)> {
 fn attach(which: &str) -> io::Result<()> {
     let d = mac::find(which)?;
     if attached().contains(&d.location()) {
-        println!("{} is already in Kiri.", d.name);
+        println!("{} is already in Kiribra.", d.name);
         return Ok(());
     }
     attach_device(&d)?;
-    println!("{} is in Kiri now. In a container: --device /dev/ttyUSB0 (serial), /dev/input (HID) or /dev/bus/usb (raw).", d.name);
+    println!("{} is in Kiribra now. In a container: --device /dev/ttyUSB0 (serial), /dev/input (HID) or /dev/bus/usb (raw).", d.name);
     println!("It is gone from the Mac until `kiri usb detach {}`.", d.location());
     Ok(())
 }
@@ -144,7 +144,7 @@ fn detach(which: &str) -> io::Result<()> {
         // Away from the bus and waited for: `kiri usb ls` gives its location.
         Err(e) => {
             return match waiting().into_iter().find(|(l, _)| l == which) {
-                Some((l, name)) => detach_location(&l).map(|()| println!("Kiri stops waiting for {name}; it stays on the Mac when it comes back.")),
+                Some((l, name)) => detach_location(&l).map(|()| println!("Kiribra stops waiting for {name}; it stays on the Mac when it comes back.")),
                 None => Err(e),
             };
         }
@@ -277,7 +277,7 @@ mod kind_tests {
 // One shape on every system: { type: "usb", devices: [{ key, name, id,
 // speed, state, path, kind, maker, serial, bus, dev, busid, since }], note }.
 // maker, serial, bus/dev (or Windows' busid) and since (Unix seconds, when
-// it went into Kiri) are there when the system knows them. `state` is "kiri" (in the VM), "host" (on
+// it went into Kiribra) are there when the system knows them. `state` is "kiri" (in the VM), "host" (on
 // this computer, can be attached) or "shared" (containers see it as it is).
 
 /// The devices for the window's USB view.
@@ -308,11 +308,11 @@ pub fn ui_list() -> serde_json::Value {
         }
     }
     serde_json::json!({"type": "usb", "devices": rows, "can": "attach",
-        "note": "A device in Kiri is gone from the Mac until you detach it. In a container: --device /dev/ttyUSB0 (serial), /dev/input (HID) or /dev/bus/usb (raw)."})
+        "note": "A device in Kiribra is gone from the Mac until you detach it. In a container: --device /dev/ttyUSB0 (serial), /dev/input (HID) or /dev/bus/usb (raw)."})
 }
 
 /// A device's `state` from its row in the daemon's list: "waiting" when it
-/// left and Kiri attaches it again when it comes back.
+/// left and Kiribra attaches it again when it comes back.
 #[cfg(target_os = "macos")]
 fn state_of(inside: Option<&serde_json::Value>) -> &'static str {
     match inside {
@@ -332,7 +332,7 @@ fn paths(a: &serde_json::Value) -> Vec<serde_json::Value> {
 pub fn ui_attach(key: &str) -> io::Result<String> {
     let d = mac::find(key)?;
     attach_device(&d)?;
-    Ok(format!("{} is in Kiri", d.name))
+    Ok(format!("{} is in Kiribra", d.name))
 }
 
 #[cfg(target_os = "macos")]

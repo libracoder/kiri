@@ -13,7 +13,7 @@
 //! file over it, so a reader sees the old index or the new one, never a mix.
 //! A change reads the index and writes it back with the lock held, so two
 //! pulls or builds finishing together cannot lose each other's image. An
-//! index that does not parse (written by an older Kiri, or damaged) is moved
+//! index that does not parse (written by an older Kiribra, or damaged) is moved
 //! aside as `images.json.corrupt-*` and what can be read from it is kept.
 
 use std::fs::{self, File};
@@ -252,16 +252,16 @@ pub fn digest_hex(digest: &str) -> io::Result<&str> {
 }
 
 impl Store {
-    /// The per-user data directory: `~/Library/Application Support/Kiri` on
+    /// The per-user data directory: `~/Library/Application Support/Kiribra` on
     /// macOS, `$XDG_DATA_HOME/kiri` (or `~/.local/share/kiri`) elsewhere.
-    /// `KIRI_DATA_DIR` overrides both.
+    /// `KIRIBRA_DATA_DIR` overrides both.
     pub fn default_root() -> io::Result<PathBuf> {
-        if let Some(dir) = std::env::var_os("KIRI_DATA_DIR") {
+        if let Some(dir) = std::env::var_os("KIRIBRA_DATA_DIR") {
             return Ok(PathBuf::from(dir));
         }
         let home = std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| io::Error::other("HOME is not set"))?;
         Ok(if cfg!(target_os = "macos") {
-            home.join("Library/Application Support/Kiri")
+            home.join("Library/Application Support/Kiribra")
         } else if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
             PathBuf::from(xdg).join("kiri")
         } else {

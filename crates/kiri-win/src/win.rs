@@ -26,7 +26,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{SendMessageTimeoutW, HWND_BROA
 const LOAD_LIBRARY_SEARCH_SYSTEM32: u32 = 0x0000_0800;
 
 /// What every script kiri-win runs gets before `-File <script>`: no
-/// profile, no prompts, and no execution policy in the way of Kiri's own
+/// profile, no prompts, and no execution policy in the way of Kiribra's own
 /// unsigned scripts.
 pub const PS_FILE: [&str; 5] = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"];
 
@@ -179,7 +179,7 @@ pub fn harden_dll_search() {
 pub const BUILD_ARCH: &str = if cfg!(target_arch = "aarch64") { "arm64" } else { "x64" };
 
 /// The PC's own processor, as Windows reports it even to a program running
-/// under emulation (an x64 Kiri on Windows on Arm): "arm64", "x64", or
+/// under emulation (an x64 Kiribra on Windows on Arm): "arm64", "x64", or
 /// None when Windows does not say.
 pub fn native_arch() -> Option<&'static str> {
     let (mut process, mut native) = (0u16, 0u16);
@@ -195,10 +195,10 @@ pub fn native_arch() -> Option<&'static str> {
     }
 }
 
-/// Why this Kiri cannot set up on this PC, if it cannot: its Linux half is
+/// Why this Kiribra cannot set up on this PC, if it cannot: its Linux half is
 /// built for one architecture, and WSL2 runs the PC's own (an arm64
 /// kernel on Windows on Arm, with no x86-64 emulation inside its distros),
-/// and WSL's installer is per architecture too. An x64 Kiri does start on
+/// and WSL's installer is per architecture too. An x64 Kiribra does start on
 /// an Arm PC, under Windows' emulation, so it says which to install.
 pub fn arch_mismatch() -> Option<String> {
     mismatch(BUILD_ARCH, native_arch()?)
@@ -207,7 +207,7 @@ pub fn arch_mismatch() -> Option<String> {
 fn mismatch(build: &str, native: &str) -> Option<String> {
     (build != native).then(|| {
         let v = env!("CARGO_PKG_VERSION");
-        format!("This is Kiri for {build} PCs, and this PC is {native}: its Linux cannot run Kiri's {build} engine. Install Kiri-{v}-{}.msi instead.", if native == "arm64" { "arm64" } else { "x86_64" })
+        format!("This is Kiribra for {build} PCs, and this PC is {native}: its Linux cannot run Kiribra's {build} engine. Install Kiribra-{v}-{}.msi instead.", if native == "arm64" { "arm64" } else { "x86_64" })
     })
 }
 
@@ -228,7 +228,7 @@ mod tests {
         assert_eq!(super::mismatch("x64", "x64"), None);
         assert_eq!(super::mismatch("arm64", "arm64"), None);
         let m = super::mismatch("x64", "arm64").unwrap();
-        assert!(m.contains(&format!("Kiri-{}-arm64.msi", env!("CARGO_PKG_VERSION"))), "{m}");
+        assert!(m.contains(&format!("Kiribra-{}-arm64.msi", env!("CARGO_PKG_VERSION"))), "{m}");
         assert!(super::mismatch("arm64", "x64").unwrap().ends_with("-x86_64.msi instead."));
     }
 }

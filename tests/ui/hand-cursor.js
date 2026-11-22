@@ -26,7 +26,7 @@ function sweep(where, root = document) {
 const click = (el) => el && el.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
 const now = Math.floor(Date.now() / 1000);
 ui.vm = "running";
-kiri.on({ type: "status", version: "0.1.4", dev: true, share: true, app: "Kiri", ours: "kiri", context: "kiri" });
+kiri.on({ type: "status", version: "0.1.4", dev: true, share: true, app: "Kiribra", ours: "kiri", context: "kiri" });
 const C = (id, project, service, state) => ({ Id: id, Names: [`/${project}-${service}-1`], Image: `${service}:dev`, State: state, Status: state === "running" ? "Up 1 hour" : "Exited (0)",
   Created: now - 600, Ports: [{ IP: "0.0.0.0", PrivatePort: 80, PublicPort: 8081, Type: "tcp" }], Labels: { "com.docker.compose.project": project, "com.docker.compose.service": service } });
 kiri.on({ type: "lists", containers: [...ui.containers, C("b1", "blog", "app", "running"), C("b2", "blog", "worker", "exited")],

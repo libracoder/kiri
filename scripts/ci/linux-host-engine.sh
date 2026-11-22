@@ -1,5 +1,5 @@
 #!/bin/sh
-# Starts Kiri on this Linux machine the way a Linux host runs it
+# Starts Kiribra on this Linux machine the way a Linux host runs it
 # (contrib/linux/kiri.service): the static engine in /usr/local/bin, the
 # systemd unit and the socket at /run/kiri/docker.sock, and root's docker
 # context `kiri`, which tests/e2e.sh and tests/stress.sh use (the Tests

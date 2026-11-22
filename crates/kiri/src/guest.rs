@@ -1,4 +1,4 @@
-//! A running Kiri guest: the VM plus the agent connection, with boot timings.
+//! A running Kiribra guest: the VM plus the agent connection, with boot timings.
 
 // Parts of this serve only the Mac (the window, boot timings).
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -132,11 +132,11 @@ impl Guest {
         // Virtualization.framework cannot boot its x86-64 guest.
         #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
         if translated() {
-            return Err(io::Error::other("this is Kiri for Intel Macs, and this Mac has Apple silicon: install Kiri for Apple silicon from runkiri.com"));
+            return Err(io::Error::other("this is Kiribra for Intel Macs, and this Mac has Apple silicon: install Kiribra for Apple silicon from runkiri.com"));
         }
         if !Vm::is_supported() {
             return Err(io::Error::other(if cfg!(target_os = "linux") {
-                "on Linux, Kiri runs containers on this machine's kernel and needs root: sudo kiri daemon"
+                "on Linux, Kiribra runs containers on this machine's kernel and needs root: sudo kiri daemon"
             } else {
                 "this Mac does not support virtualization"
             }));
@@ -224,10 +224,10 @@ impl Guest {
             other => return Err(io::Error::other(format!("expected Hello, got {other:?}"))),
         };
         // The agent comes from the same install, so another version means the
-        // files changed under a running Kiri: stop rather than misread it.
+        // files changed under a running Kiribra: stop rather than misread it.
         if guest.hello.protocol != kiri_proto::PROTOCOL {
             return Err(io::Error::other(format!(
-                "the VM agent speaks protocol {}, this Kiri speaks {}: quit Kiri and open it again",
+                "the VM agent speaks protocol {}, this Kiribra speaks {}: quit Kiribra and open it again",
                 guest.hello.protocol,
                 kiri_proto::PROTOCOL
             )));
@@ -465,22 +465,22 @@ fn translated() -> bool {
 #[cfg(target_os = "macos")]
 fn missing_kernel(kernel: &std::path::Path, exe: Option<&std::path::Path>) -> io::Error {
     let msg = match exe {
-        Some(exe) if !exe.exists() => format!("{} was deleted or moved while it ran: open Kiri again from where it is now", crate::flavor::APP),
-        // The whole path, so it shows where Kiri looked.
-        _ => format!("the guest kernel {} is missing: reinstall Kiri", std::path::absolute(kernel).unwrap_or_else(|_| kernel.to_owned()).display()),
+        Some(exe) if !exe.exists() => format!("{} was deleted or moved while it ran: open Kiribra again from where it is now", crate::flavor::APP),
+        // The whole path, so it shows where Kiribra looked.
+        _ => format!("the guest kernel {} is missing: reinstall Kiribra", std::path::absolute(kernel).unwrap_or_else(|_| kernel.to_owned()).display()),
     };
     io::Error::new(io::ErrorKind::NotFound, msg)
 }
 
 #[cfg(target_os = "macos")]
 /// Where the kernel and initramfs live: `KIRI_GUEST_DIR`, else
-/// `Kiri.app/Contents/Resources/guest` when running from the app, else the
+/// `Kiribra.app/Contents/Resources/guest` when running from the app, else the
 /// in-repo build output (development).
 pub fn guest_dir() -> PathBuf {
     if let Some(d) = std::env::var_os("KIRI_GUEST_DIR") {
         return PathBuf::from(d);
     }
-    // Through its links: `kiri` on the PATH is one (~/.kiri/bin/kiri), and
+    // Through its links: `kiri` on the PATH is one (~/.kiribra/bin/kiri), and
     // the guest is beside the binary it leads to, not beside the link.
     let exe = std::env::current_exe().ok().map(|e| e.canonicalize().unwrap_or(e));
     let bundled = exe.as_ref().and_then(|e| e.parent().map(|d| d.join("../Resources/guest"))).filter(|d| d.join(KERNEL).is_file());

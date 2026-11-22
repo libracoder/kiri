@@ -1,18 +1,18 @@
 //! Putting the engine this app installed into its WSL distro: the binaries,
-//! and in Kiri Linux its start script and wsl.conf (whose boot command
+//! and in Kiribra Linux its start script and wsl.conf (whose boot command
 //! starts the engine whenever WSL boots the distro). The script is built
 //! here and run by crates/kiri-win/src/update.rs; tested on any host.
 
 use std::path::Path;
 use std::sync::{Mutex, TryLockError};
 
-/// Kiri Linux's own files, as this version has them.
+/// Kiribra Linux's own files, as this version has them.
 const KIRI_START: &str = include_str!("../../../contrib/wsl/kiri-linux/kiri-start");
 const WSL_CONF: &str = include_str!("../../../contrib/wsl/kiri-linux/wsl.conf");
 
 /// The script, run in WSL as root, that makes the engine in /usr/local/bin
 /// (where both distros keep it: kiri-start, install.sh) the one in the
-/// Windows folder `from`, and in Kiri Linux (`kiri_linux`) its kiri-start
+/// Windows folder `from`, and in Kiribra Linux (`kiri_linux`) its kiri-start
 /// this version's and /etc/wsl.conf's `[boot] command` this version's
 /// (the rest of that file is left as it is). Only what differs is copied,
 /// each file replaced whole through a temp file of its own (two copies at
@@ -66,7 +66,7 @@ const BOOT_AWK: &str = "function key(l) { sub(/#.*/, \"\", l); gsub(/[[:space:]]
      END { flush(); if (!done) { if (NR) print \"\"; print \"[boot]\"; print want } }";
 
 /// Moving an engine older than this app over to this app's, at most once
-/// per run of kiri-win. After an update, Kiri Linux's boot command (or the
+/// per run of kiri-win. After an update, Kiribra Linux's boot command (or the
 /// bridge) starts the engine in WSL before kiri-win can copy the new one in,
 /// so finding it answering says nothing about its version: that is asked
 /// once it answers. A restart that fails is not tried again in this run
@@ -151,7 +151,7 @@ mod tests {
         std::fs::write(root.join("usr/local/bin/kiri"), "old kiri").unwrap();
         std::fs::write(root.join("usr/local/bin/kiri-init"), "init").unwrap();
         std::fs::write(root.join("usr/local/bin/kiri-start"), "old start").unwrap();
-        // An older Kiri Linux's, and a user's own line.
+        // An older Kiribra Linux's, and a user's own line.
         std::fs::write(root.join("etc/wsl.conf"), "[boot]\nsystemd = false\n\n[user]\ndefault = root\n[automount]\noptions = metadata\n").unwrap();
         std::fs::write(tools.join("wslpath"), "#!/bin/sh\n[ \"$1\" = -a ] && shift\necho \"$1\"\n").unwrap();
         std::fs::set_permissions(tools.join("wslpath"), std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -225,7 +225,7 @@ mod tests {
         assert_eq!(run(Some("[user]\ndefault = root\n")), format!("[user]\ndefault = root\n\n[boot]\n{want}\n"));
         // Saved with CRLF, and a header with a comment: still the one [boot].
         assert_eq!(run(Some("[boot]\r\nsystemd = false\r\ncommand = /old\r\n[user]\r\ndefault = root\r\n")), format!("[boot]\r\nsystemd = false\r\n{want}\n[user]\r\ndefault = root\r\n"));
-        assert_eq!(run(Some("[boot] # Kiri's\ncommand=/old # mine\n")), format!("[boot] # Kiri's\n{want}\n"));
+        assert_eq!(run(Some("[boot] # Kiribra's\ncommand=/old # mine\n")), format!("[boot] # Kiribra's\n{want}\n"));
         // A commented-out command is left, and one added.
         assert_eq!(run(Some("[boot]\n# command = /off\n")), format!("[boot]\n# command = /off\n{want}\n"));
         assert_eq!(run(None), format!("[boot]\n{want}\n"));
@@ -250,7 +250,7 @@ mod tests {
     /// is Windows' quoting, not sh's.
     #[test]
     fn the_script_has_no_backslash() {
-        assert!(!sync_script(Path::new("C:/Users/x/AppData/Local/Kiri"), "", true).contains('\\'));
+        assert!(!sync_script(Path::new("C:/Users/x/AppData/Local/Kiribra"), "", true).contains('\\'));
     }
 
     /// An engine older than this app is restarted once: not again after

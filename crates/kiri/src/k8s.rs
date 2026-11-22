@@ -1,5 +1,5 @@
 //! `kiri k8s`: a single-node Kubernetes cluster (k3s) in one privileged
-//! Kiri container, as OrbStack and Docker Desktop offer. Its API server is
+//! Kiribra container, as OrbStack and Docker Desktop offer. Its API server is
 //! on `127.0.0.1:6443` (or the next free port), its state in the `kiri-k8s` volume, and `kubectl`
 //! gets a `kiri` context in its own file (src/kubeconfig.rs), at each start, at the engine's
 //! start while the node runs, and by `kiri k8s status`; `delete` takes it out.
@@ -22,7 +22,7 @@ fn home() -> io::Result<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| io::Error::other("HOME is not set"))
 }
 
-/// The cluster's settings, in `~/.kiri/k8s.json`: whether its API server
+/// The cluster's settings, in `~/.kiribra/k8s.json`: whether its API server
 /// (and, through the daemon, its LoadBalancer services) answers on every
 /// interface rather than 127.0.0.1, and extra names for its certificate.
 /// They are applied when the node container is created, so `kiri k8s set`
@@ -61,7 +61,7 @@ pub(crate) fn bound_port(info: &serde_json::Value) -> Option<u16> {
     live.as_str().or(made.as_str()).and_then(|p| p.parse().ok())
 }
 
-/// A port no program on the Mac holds (another Kiri's cluster, Docker
+/// A port no program on the Mac holds (another Kiribra's cluster, Docker
 /// Desktop's, a tunnel): nothing answers on it and it can be bound.
 fn port_free(port: u16, lan: bool) -> bool {
     let local = std::net::SocketAddr::from(([127, 0, 0, 1], port));
@@ -77,7 +77,7 @@ fn pick_port(want: u16, lan: bool) -> io::Result<u16> {
     let last = want.saturating_add(PORT_TRIES);
     (want..=last).find(|&p| port_free(p, lan)).ok_or_else(|| {
         io::Error::other(format!(
-            "ports {want}–{last} are all in use on this Mac, so the cluster's API server has none to take. Choose another in Settings → Kubernetes (or `kiri k8s set --port N`), or stop what holds them, such as another Kiri's Kubernetes"
+            "ports {want}–{last} are all in use on this Mac, so the cluster's API server has none to take. Choose another in Settings → Kubernetes (or `kiri k8s set --port N`), or stop what holds them, such as another Kiribra's Kubernetes"
         ))
     })
 }
@@ -183,7 +183,7 @@ fn ensure_daemon() -> io::Result<()> {
     if client::alive() {
         return Ok(());
     }
-    Err(io::Error::other("kiri daemon is not running: open Kiri.app or run `kiri daemon`"))
+    Err(io::Error::other("kiri daemon is not running: open Kiribra.app or run `kiri daemon`"))
 }
 
 fn ok(r: io::Result<client::Response>) -> io::Result<client::Response> {
@@ -354,7 +354,7 @@ fn host_manifest() -> String {
     let addr = crate::daemon::ports::HOST_ADDR;
     let zones: Vec<String> = HOST_NAMES.iter().map(|n| format!("{n}:53")).collect();
     format!(
-        "# Written by Kiri at each `kiri k8s start`: pods resolve the host's names, as containers do.\n\
+        "# Written by Kiribra at each `kiri k8s start`: pods resolve the host's names, as containers do.\n\
 apiVersion: v1\n\
 kind: ConfigMap\n\
 metadata:\n\
@@ -375,7 +375,7 @@ data:\n\
 /// A CoreDNS that was running before the manifest was there doesn't see it
 /// (its `reload` watches the Corefile, not what it imports), so once k3s
 /// has applied the ConfigMap, CoreDNS is restarted: only when the manifest
-/// was just written, so a cluster's first start with it, or a Kiri that
+/// was just written, so a cluster's first start with it, or a Kiribra that
 /// changes it.
 fn restart_coredns() -> io::Result<()> {
     let script = "k='kubectl -n kube-system'; for i in $(seq 90); do \
@@ -403,7 +403,7 @@ fn host_names() -> io::Result<bool> {
     Ok(out.contains("written"))
 }
 
-/// The cluster's kubeconfig, renamed to `kiri`, at ~/.kiri/kubeconfig, and
+/// The cluster's kubeconfig, renamed to `kiri`, at ~/.kiribra/kubeconfig, and
 /// its cluster, user and context put into kubectl's file (src/kubeconfig.rs),
 /// with no kubectl needed: the app's `kiri k8s start` runs with launchd's
 /// PATH, where none is found. Whether kubectl's file changed.
@@ -433,7 +433,7 @@ pub(crate) fn sync(wait: Duration) -> io::Result<bool> {
     if !r.ok() || r.json()["State"]["Running"] != true {
         return Ok(false);
     }
-    // A cluster made by an older Kiri gets it here too, at the engine's start.
+    // A cluster made by an older Kiribra gets it here too, at the engine's start.
     let host_names_written = host_names().unwrap_or_else(|e| {
         crate::diag::warn!("host names manifest not written", error = e);
         false
@@ -501,7 +501,7 @@ fn status() -> io::Result<()> {
     let moved = if port != want { format!(" ({want} was in use)") } else { String::new() };
     println!("Kubernetes: {state}, API on 127.0.0.1:{port}{moved}");
     if state == "running" {
-        // A context missing or out of date (written by an older Kiri, or not at all) is put right.
+        // A context missing or out of date (written by an older Kiribra, or not at all) is put right.
         if let Err(e) = sync(Duration::ZERO) {
             println!("kubectl context `{CONTEXT}` not written: {e}");
         }

@@ -1,4 +1,4 @@
-# Kiri on a Linux host: containers on this machine's kernel, no VM.
+# Kiribra on a Linux host: containers on this machine's kernel, no VM.
 # Install: cargo xtask linux, copy target/linux/release/{kiri,kiri-init} to
 # /usr/local/bin, then:  cp kiri.service /etc/systemd/system/ &&
 #   groupadd -f kiri && systemctl enable --now kiri
@@ -6,10 +6,10 @@
 # Membership of the `kiri` group is root-equivalent (a member can mount any
 # path into a container as root), exactly like the `docker` group.
 [Unit]
-Description=Kiri container engine
+Description=Kiribra container engine
 Documentation=https://kiri.canestack.com
-# After docker.service, when Docker is installed (ordering only: Kiri starts
-# without it): at boot Docker's docker0 and networks are up first, and Kiri
+# After docker.service, when Docker is installed (ordering only: Kiribra starts
+# without it): at boot Docker's docker0 and networks are up first, and Kiribra
 # picks its subnets around them, rather than the two taking the same one.
 After=network-online.target docker.service
 Wants=network-online.target

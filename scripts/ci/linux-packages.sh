@@ -1,6 +1,6 @@
 #!/bin/sh
-# Kiri's Linux packages on a Mac, in an arm64 Linux container (the Mac's
-# docker engine is Kiri): scripts/ci/linux-build.sh with what it needs
+# Kiribra's Linux packages on a Mac, in an arm64 Linux container (the Mac's
+# docker engine is Kiribra): scripts/ci/linux-build.sh with what it needs
 # installed first. Release builds make them on Ubuntu instead and test them
 # there and on Fedora.
 #

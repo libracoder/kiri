@@ -15,13 +15,13 @@ way the main page does: it sends JSON strings with
 | `setup-restart` | | Restart → "Restart now" |
 | `setup-later` | | Restart → "Restart later" (hides the window to the tray) |
 | `setup-choose` | `value`: `"kiri"` or `"ubuntu"` | Choose a Linux → the primary button |
-| `setup-switch` | `value`: `"kiri"` | while Ubuntu downloads → "Use Kiri Linux instead" |
+| `setup-switch` | `value`: `"kiri"` | while Ubuntu downloads → "Use Kiribra Linux instead" |
 | `setup-cancel` | | any progress screen → "Cancel" (back to the step's start) |
 | `setup-retry` | | error → "Try again" |
-| `setup-default` | `value`: bool | Docker tools → "Make Kiri the default for docker" checkbox |
-| `setup-build` | `value`: `"docker"` or `"kiri"` | Docker tools → Builds (shown only with another engine and Kiri not made docker's default): "Keep building with Docker" / "Build with Kiri" |
-| `setup-autostart` | `value`: bool | Ready → "Start Kiri when I sign in" |
-| `setup-open` | | Ready → "Open Kiri" (the main window replaces setup) |
+| `setup-default` | `value`: bool | Docker tools → "Make Kiribra the default for docker" checkbox |
+| `setup-build` | `value`: `"docker"` or `"kiri"` | Docker tools → Builds (shown only with another engine and Kiribra not made docker's default): "Keep building with Docker" / "Build with Kiribra" |
+| `setup-autostart` | `value`: bool | Ready → "Start Kiribra when I sign in" |
+| `setup-open` | | Ready → "Open Kiribra" (the main window replaces setup) |
 | `setup-quit` | | Welcome → "Quit" |
 | `copy` | `value`: text | Ready → "Copy" |
 | `open` | `name`: https URL | "What is WSL?" |

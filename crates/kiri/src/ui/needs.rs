@@ -27,7 +27,7 @@ pub struct Need {
 }
 
 /// `{type: "needs", image, id, vars: [{name, alts, instead, why}]}`; no vars
-/// when the image needs nothing that Kiri can read, or can't be read.
+/// when the image needs nothing that Kiribra can read, or can't be read.
 pub fn event(image: &str) -> String {
     let id = client::get(&format!("/images/{}/json", esc(image))).ok().and_then(|v| v["Id"].as_str().map(str::to_owned)).unwrap_or_default();
     let vars: Vec<Value> = probe(image)
@@ -142,7 +142,7 @@ pub(super) fn first_entry(tar: &[u8]) -> Option<Entry> {
     None
 }
 
-/// For a URL path or query; `:` and `@` stay as they are, since Kiri's engine
+/// For a URL path or query; `:` and `@` stay as they are, since Kiribra's engine
 /// matches an image name without decoding them.
 pub(super) fn esc(s: &str) -> String {
     s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"/-._:@".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()

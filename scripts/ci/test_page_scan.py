@@ -17,8 +17,8 @@ _spec.loader.exec_module(ps)
 BASE = {
     "crates/kiri/src/ui/index.html": "\n".join([
         "<script>",
-        "const send = (cmd, extra = {}) => window.webkit?.messageHandlers?.kiri?.postMessage(JSON.stringify({ cmd, ...extra }));",
-        'const FEEDBACK_URL = "https://github.com/libracoder/kiri/issues/new";',
+        "const send = (cmd, extra = {}) => window.webkit?.messageHandlers?.kiribra?.postMessage(JSON.stringify({ cmd, ...extra }));",
+        'const FEEDBACK_URL = "https://github.com/astosweb/kiribra/issues/new";',
         'send("refresh");',
         'send("login", { name: server, value: { username: u, secret: tk.value } });',
         "const old = fetch(x); // pretend the page already had this",
@@ -28,7 +28,7 @@ BASE = {
 
 # name: (a line it flags, an ordinary line it doesn't)
 CASES = {
-    "url": ('const u = "https://evil.example/collect";', 'const u = "https://github.com/libracoder/kiri/issues/new";'),
+    "url": ('const u = "https://evil.example/collect";', 'const u = "https://github.com/astosweb/kiribra/issues/new";'),
     "protocol-relative": ('img.setAttribute("src", "//evil.example/p.gif");', "// a comment about the list"),
     "ip": ('const host = "203.0.113.7";', 'const bind = "0.0.0.0:8080 failed";'),
     "data-blob": ('a.setAttribute("href", "blob:x");', 'const label = tr("data: none");'),
@@ -110,10 +110,10 @@ class NotNew(unittest.TestCase):
         self.assertEqual(flagged("    " + line), set())  # same line, moved and indented
 
     def test_a_known_address_moved_is_not_flagged(self):
-        self.assertEqual(flagged('link("https://github.com/libracoder/kiri/issues/new")'), set())
+        self.assertEqual(flagged('link("https://github.com/astosweb/kiribra/issues/new")'), set())
 
     def test_a_known_host_as_a_prefix_is_not_enough(self):
-        self.assertIn("url", flagged('x("https://github.com/libracoder/kiri/issues/new.evil.example")'))
+        self.assertIn("url", flagged('x("https://github.com/astosweb/kiribra/issues/new.evil.example")'))
 
     def test_translations(self):
         lang = "crates/kiri/src/ui/lang/fa.json"

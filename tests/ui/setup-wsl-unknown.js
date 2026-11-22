@@ -2,7 +2,7 @@
 // window: 1024x700
 // Windows' first start: the setup window opens before kiri-win has said
 // whether WSL is on this PC (that check runs wsl.exe and can take a while).
-// Until it says, the window is the frame only: no "Welcome to Kiri / Install
+// Until it says, the window is the frame only: no "Welcome to Kiribra / Install
 // WSL" flashing by on a PC that has WSL. Then WSL there: the language, then
 // Choose a Linux; WSL not answering: Choose a Linux with why; WSL missing:
 // Install WSL.
@@ -13,7 +13,7 @@ const t = (name, fn) => { try { fn(); R.push("PASS " + name); } catch (e) { R.pu
 const frame = () => new Promise((r) => setTimeout(() => setTimeout(r, 0), 0));
 const main = () => document.getElementById("main");
 const text = () => document.querySelector(".app").textContent;
-const wslAsk = () => main().querySelector('[data-cmd="setup-install-wsl"]') || /Install WSL|Welcome to Kiri|doesn't have yet/.test(text());
+const wslAsk = () => main().querySelector('[data-cmd="setup-install-wsl"]') || /Install WSL|Welcome to Kiribra|doesn't have yet/.test(text());
 const state = (more) => kiri.on({ type: "setup", sizes: { wsl: 367575040, ubuntu: 418495746, kiri: 9000000 }, existingUbuntu: false, otherDocker: false,
   makeDefault: true, buildKiri: true, autostart: true, progress: null, tasks: [], log: [], error: null, ...more });
 
@@ -65,7 +65,7 @@ await frame();
 t("WSL missing: Welcome with Install WSL", () => {
   const b = main().querySelector('[data-cmd="setup-install-wsl"]');
   if (!b || b.textContent !== "Install WSL") throw new Error("no Install WSL: " + main().textContent.slice(0, 80));
-  if (main().querySelector("h1").textContent !== "Welcome to Kiri") throw new Error(main().querySelector("h1").textContent);
+  if (main().querySelector("h1").textContent !== "Welcome to Kiribra") throw new Error(main().querySelector("h1").textContent);
 });
 
 report([...R]);

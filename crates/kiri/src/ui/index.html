@@ -3,9 +3,9 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Kiri</title>
+<title>Kiribra</title>
 <style>
-/* Kiri window. Hand-written, no framework: only the rules this page uses. */
+/* Kiribra window. Hand-written, no framework: only the rules this page uses. */
 :root {
   --blue: #0D6EFD; --blue-hover: #0B5ED7; --blue-active: #0A58CA; --blue-light: #6EA8FE;
   --moss: #3FB68B; --sun: #FFC23D; --red: #DC3545;
@@ -100,7 +100,7 @@ aside { background: var(--side); border-inline-end: 1px solid var(--line); displ
    under Windows' own title bar. */
 .strip { grid-column: 1 / -1; display: flex; align-items: center; gap: 2px; padding: 0 12px; background: var(--side); border-bottom: 1px solid var(--line); }
 .strip .lights { width: 74px; flex: none; }
-body.win .strip .lights, body.linux .strip .lights { display: none; }
+body.win .strip .lights, body.linux .strip .lights, body.web .strip .lights { display: none; }
 .strip .gap { width: 6px; flex: none; }
 .strip .drag { flex: 1; align-self: stretch; min-width: 24px; }
 .sb { width: 28px; height: 28px; display: grid; place-items: center; padding: 0; border: 0; border-radius: 6px; background: transparent; color: var(--muted);
@@ -125,7 +125,7 @@ body.win .strip .lights, body.linux .strip .lights { display: none; }
 .gfind:focus-within kbd { opacity: 0; }
 @media (max-width: 900px) { .gfind { width: 200px; } .gfind:focus-within { width: 300px; } }
 .about-head .devband { vertical-align: 4px; font-size: var(--fs-small); }
-/* Kiri Dev: the icon's blue DEV band, beside the name in the sidebar and About. */
+/* Kiribra Dev: the icon's blue DEV band, beside the name in the sidebar and About. */
 .devband { display: none; padding: 2px 6px 1px; border-radius: 4px; background: #3B86F0; color: #fff; font-size: var(--fs-small); font-weight: 800; letter-spacing: .12em; line-height: 1.3; }
 body.dev .devband { display: inline-block; }
 .mark { width: 22px; height: 22px; flex: none; }
@@ -525,7 +525,7 @@ table.sized .name[data-detail] > div:last-child { max-width: none; }
 .swatches button { width: 22px; height: 22px; border-radius: 50%; border: 0; background: var(--sw); cursor: pointer; box-shadow: 0 0 0 2px var(--bg), 0 0 0 2px var(--bg); }
 .swatches button[aria-checked=true] { box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px var(--text); }
 .range { grid-row: 1 / span 2; grid-column: 2; display: flex; align-items: center; gap: 10px; }
-/* Drawn by Kiri, not the system: macOS WebKit, WebView2 (Chromium) and
+/* Drawn by Kiribra, not the system: macOS WebKit, WebView2 (Chromium) and
    WebKitGTK each draw a native slider their own way. This is the Mac's: a
    dark track, filled in blue up to a white pill. --fill is set from the
    value (rangeFill). */
@@ -563,12 +563,12 @@ tr.member .tree { width: 16px; align-self: stretch; position: relative; flex: no
 tr.member .tree::before { content: ""; position: absolute; inset-inline-start: 7.5px; top: -10px; bottom: -10px; border-inline-start: 1px solid var(--line); }
 tr.member .tree.last::before { bottom: 50%; }
 tr.member .tree::after { content: ""; position: absolute; inset-inline-start: 7.5px; top: 50%; width: 8px; border-top: 1px solid var(--line); }
-/* One icon for every container; one you can reach by name wears a tiny Kiri on its corner. */
+/* One icon for every container; one you can reach by name wears a tiny Kiribra on its corner. */
 .tile-wrap { position: relative; flex: none; }
 .kbadge { position: absolute; inset-inline-end: -3px; bottom: -3px; display: flex; filter: drop-shadow(0 0 1.5px var(--bg)); }
 .kbadge .kdot { width: 8px; height: 9px; }
 /* A container under its project (a member row, on the tree line; its project's Services tab lists the same members):
-   a 24px tile under the project's 30px stack, to show the hierarchy; its icon, corner and Kiri badge scaled to match.
+   a 24px tile under the project's 30px stack, to show the hierarchy; its icon, corner and Kiribra badge scaled to match.
    A container in no project, and every other list and page, keep the 30px tile. */
 tr.member .tree + .tile-wrap > .tile, table[data-view="cmpsvcs"] td .tile-wrap > .tile { width: 24px; height: 24px; border-radius: 6px; }
 tr.member .tree + .tile-wrap > .tile svg, table[data-view="cmpsvcs"] td .tile-wrap > .tile svg { width: 14px; height: 14px; }
@@ -871,7 +871,7 @@ tr[data-rowopen] .sel, .sel { cursor: text; -webkit-user-select: text; user-sele
 .statusbar .dot.booting, .statusbar .dot.stopping { background: var(--sun); }
 .statusbar .dot.asleep { background: transparent; box-shadow: inset 0 0 0 1.5px var(--moss); }
 .statusbar .sep { color: var(--faint); }
-/* Kiri Dev, after the version: solid amber with near-black text, the same in either theme. */
+/* Kiribra Dev, after the version: solid amber with near-black text, the same in either theme. */
 .statusbar .dev { padding: 0 6px; border-radius: 4px; background: #F5B400; color: #1A1300; font-size: var(--fs-small); font-weight: 600; letter-spacing: .02em; }
 .statusbar .badge { padding: 0 6px; border-radius: 4px; background: color-mix(in srgb, var(--blue) 18%, transparent); color: var(--text); font-size: var(--fs-small); letter-spacing: .02em; }
 .statusbar button { border: 0; background: none; color: inherit; font: inherit; padding: 0; cursor: pointer; }
@@ -883,7 +883,7 @@ tr[data-rowopen] .sel, .sel { cursor: text; -webkit-user-select: text; user-sele
 .statusbar .upd .track { width: 64px; height: 4px; border-radius: 2px; background: var(--line); overflow: hidden; }
 .statusbar .upd .track i { display: block; height: 100%; background: var(--blue); }
 .statusbar .upd .x { color: var(--muted); display: inline-flex; }
-/* docker uses another engine: the status bar says so in amber; once it's Kiri, green. */
+/* docker uses another engine: the status bar says so in amber; once it's Kiribra, green. */
 .statusbar .ctx-warn { height: 18px; padding: 0 8px; border-radius: 9px; color: var(--sun-text); background: color-mix(in srgb, var(--sun) 14%, transparent); font-weight: 600; }
 .statusbar .ctx-warn:hover { color: var(--sun-text); background: color-mix(in srgb, var(--sun) 24%, transparent); }
 .statusbar .ctx-warn svg { width: 12px; height: 12px; fill: currentColor; }
@@ -939,14 +939,14 @@ tr[data-rowopen] .sel, .sel { cursor: text; -webkit-user-select: text; user-sele
               border-radius: 6px; padding: 1px 6px; font-variant-numeric: tabular-nums; pointer-events: none; }
 .key { display: inline-flex; align-items: center; gap: 4px; color: var(--muted); }
 .key i { width: 10px; height: 2px; border-radius: 1px; display: inline-block; }
-/* A running container's address, behind a tiny Kiri. */
+/* A running container's address, behind a tiny Kiribra. */
 .local { display: inline-flex; align-items: center; gap: 5px; margin-top: 3px; padding: 0 6px; height: 17px; border-radius: 10px; border: 0;
          background: color-mix(in srgb, #E0B420 12%, transparent); color: var(--text); font: 500 var(--fs-small) var(--mono-font); cursor: pointer; max-width: 100%; }
 .local:hover { background: color-mix(in srgb, #E0B420 24%, transparent); }
 .local span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .kdot { width: 12px; height: 13px; flex: none; }
 .tile.kiri .kdot { width: 17px; height: 18px; }
-/* First open: localhost or .kiri.local, as two small pictures. */
+/* First open: localhost or .kiribra.local, as two small pictures. */
 .choices { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .choice { display: grid; gap: 8px; padding: 12px; border-radius: 10px; border: 1px solid var(--line); background: var(--raised); color: var(--text);
           text-align: var(--start); font: var(--fs) var(--ui-font); cursor: pointer; }
@@ -956,7 +956,7 @@ tr[data-rowopen] .sel, .sel { cursor: text; -webkit-user-select: text; user-sele
 .choice .t { font-weight: 600; }
 .choice .d { color: var(--muted); font-size: var(--fs); }
 /* The language step: a header that says hello in the language picked, over a
-   faint cloud of the others, with Kiri's mark; then a search field and one
+   faint cloud of the others, with Kiribra's mark; then a search field and one
    list, a line for each language: its own name, its English name, its hello.
    The dialog keeps its height while a search narrows the list; on a short
    window the list scrolls and the header and Continue stay. */
@@ -1183,7 +1183,7 @@ tr.row:hover td.actions .acts-row { background: linear-gradient(var(--fwd), tran
 .about dt { color: var(--muted); }
 .about dd { font-variant-numeric: tabular-nums; }
 .about a { color: var(--blue-light); cursor: pointer; text-decoration: none; }
-/* The setup checklist: Linux opens on it until Kiri can run containers; the Mac shows it over a working window
+/* The setup checklist: Linux opens on it until Kiribra can run containers; the Mac shows it over a working window
    when a first-launch step failed (onboarding()). */
 #onb { position: fixed; inset: 0; z-index: 30; background: var(--bg); overflow: auto; display: grid; place-items: start center; }
 #onb .onb-in { width: min(460px, calc(100% - 32px)); padding: 44px 0 28px; }
@@ -1635,7 +1635,7 @@ tr.row:hover td.actions .acts-row { background: linear-gradient(var(--fwd), tran
 /* Every monospace text in Builds (steps, times, logs, the error's Dockerfile lines, the context path) one size smaller than elsewhere. */
 .bl-detail .mono, .bl-detail pre, .bl-time, .bl-sub { font-size: var(--fs-small); }
 
-/* What's new: the release's notes in a window. Kiri runs in from the left, the old
+/* What's new: the release's notes in a window. Kiribra runs in from the left, the old
    version steps aside and the new one pops in with sparks, while the notes are already there to read. */
 .wn-dialog { width: min(520px, calc(100% - 32px)); max-height: calc(100% - 48px); display: flex; flex-direction: column; overflow: hidden; padding: 0;
              background: var(--panel); border: 1px solid var(--line); border-radius: 14px; box-shadow: 0 24px 60px rgba(0, 0, 0, .35); animation: wn-in .22s ease-out; }
@@ -1801,7 +1801,7 @@ body.sway .is-art .load { animation: sway 1.2s ease-in-out; }
 .pref .kdelete, .pref .pact { grid-row: 1 / span 2; grid-column: 2; }
 .pane .seg button:disabled { opacity: .5; cursor: default; }
 
-/* --- Share: what's shared on the internet, live (Kiri Dev on the Mac; Kiri on Windows) ---- */
+/* --- Share: what's shared on the internet, live (Kiribra Dev on the Mac; Kiribra on Windows) ---- */
 nav button.shareonly { display: none; }
 body.share nav button.shareonly { display: flex; }
 .sh { max-width: 980px; display: grid; gap: 18px; padding-top: 6px; -webkit-user-select: text; user-select: text; }
@@ -1905,7 +1905,7 @@ body.share nav button.shareonly { display: flex; }
 /* On the container's page, with its name beside it. */
 .sh-ico.lbl { width: auto; display: inline-flex; gap: 6px; padding-block: 0; padding-inline: 8px 10px; font: 500 var(--fs) var(--ui-font); }
 .sh-ico.lbl.live::after { inset-inline-start: 18px; inset-inline-end: auto; top: 5px; }
-/* The Share column (Kiri Dev). Yellow: can be shared. Green: shared. Grey: can't be
+/* The Share column (Kiribra Dev). Yellow: can be shared. Green: shared. Grey: can't be
    yet (stopped, or no published port): the same Share, disabled. Red: sharing failed. The
    negative margin lines the globe up with the column's heading; the padding is only for the hover. */
 .shc { display: inline-flex; align-items: center; gap: 5px; height: 22px; max-width: 100%; margin-inline-start: -6px; padding-block: 0; padding-inline: 6px 8px; border: 0; border-radius: 6px; background: none;
@@ -2205,10 +2205,10 @@ main > .sh-pane { flex: 1; min-height: 0; display: flex; flex-direction: column;
    `--ring` is how far it grows. */
 @keyframes ring { 0% { transform: scale(1); opacity: .7; } 80%, 100% { transform: scale(var(--ring, 2.3)); opacity: 0; } }
 /* They beat together, once every few seconds (`beat` in the script), and
-   rest in between with nothing to draw; not at all while Kiri isn't the
+   rest in between with nothing to draw; not at all while Kiribra isn't the
    window in use. */
 body { --beat: none; }
-/* Nothing moves while Kiri isn't the window in use (`away` in the script). */
+/* Nothing moves while Kiribra isn't the window in use (`away` in the script). */
 body.away *, body.away *::before, body.away *::after { animation-play-state: paused !important; }
 body.beat { --beat: ring 1.6s ease-out; }
 @keyframes sh-blink { 50% { opacity: .35; } }
@@ -2299,7 +2299,7 @@ body.beat { --beat: ring 1.6s ease-out; }
 .dt-foot .ok svg { width: 14px; height: 14px; fill: var(--moss); }
 .dt-foot .ok .mono { color: var(--text); user-select: text; -webkit-user-select: text; }
 .dt-foot .err { font-size: var(--fs); color: var(--red-text); }
-/* Create report… and Send to Kiri: what goes in, and the id once sent. */
+/* Create report… and Send to Kiribra: what goes in, and the id once sent. */
 .rp-dialog { width: min(500px, calc(100% - 32px)); }
 .rp-list { display: grid; border: 1px solid var(--line); border-radius: 9px; overflow: hidden; }
 .rp-item { display: grid; grid-template-columns: 14px 1fr; gap: 1px 10px; align-items: start; padding: 9px 12px; }
@@ -2516,7 +2516,7 @@ tr.usb-more > td { padding: 0; background: var(--panel); }
   <button class="sb chev" id="nav-fwd" disabled><svg viewBox="0 0 256 256" data-ph="caret"></svg></button>
   <span class="drag"></span>
   <label class="gfind" id="gfind"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="7" cy="7" r="4.8"/><path d="M10.6 10.6L14 14"/></svg>
-    <input id="gq" placeholder="Search containers, images…" data-i18n-ph="Search containers, images…" spellcheck="false" autocomplete="off" role="combobox" aria-controls="pal" aria-expanded="false" aria-label="Search Kiri" data-i18n-label="Search Kiri"><kbd id="gkbd">⌘K</kbd></label>
+    <input id="gq" placeholder="Search containers, images…" data-i18n-ph="Search containers, images…" spellcheck="false" autocomplete="off" role="combobox" aria-controls="pal" aria-expanded="false" aria-label="Search Kiribra" data-i18n-label="Search Kiribra"><kbd id="gkbd">⌘K</kbd></label>
   <button class="sb" id="strip-settings" title="Settings" data-i18n-title="Settings" aria-label="Settings" data-i18n-label="Settings"><svg viewBox="0 0 256 256" data-ph="gear"></svg></button>
 </header>
 
@@ -2536,7 +2536,7 @@ tr.usb-more > td { padding: 0; background: var(--panel); }
     <button data-view="pods"><svg class="i" viewBox="0 0 256 256" data-ph="pods"></svg><span class="lbl" data-i18n="Pods">Pods</span><span class="count" id="n-pods"></span></button>
     <button data-view="services"><svg class="i" viewBox="0 0 256 256" data-ph="services"></svg><span class="lbl" data-i18n="Services">Services</span><span class="count" id="n-services"></span></button>
   </nav>
-  <div class="navlabel">Kiri</div>
+  <div class="navlabel">Kiribra</div>
   <nav>
     <button data-view="usb"><svg class="i" viewBox="0 0 256 256" data-ph="usb"></svg><span class="lbl" data-i18n="USB">USB</span><span class="beta" data-i18n-title="USB passthrough is new: tell us how it works with your devices" title="USB passthrough is new: tell us how it works with your devices" data-i18n="Beta">Beta</span><span class="count" id="n-usb"></span></button>
     <button data-view="share" class="shareonly"><svg class="i" viewBox="0 0 256 256" data-ph="globe"></svg><span class="lbl" data-i18n="Share">Share</span></button>
@@ -2582,7 +2582,39 @@ tr.usb-more > td { padding: 0; background: var(--panel); }
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);
-const send = (cmd, extra = {}) => window.webkit?.messageHandlers?.kiri?.postMessage(JSON.stringify({ cmd, ...extra }));
+/* Native window: webkit message handler. Browser (`kiri ui --web`): the same
+   JSON over a WebSocket to the local server. */
+const WEB = !!window.KIRI_WEB;
+const wsQueue = [];
+let kiriWs = null;
+function ensureWs() {
+  if (kiriWs) return kiriWs;
+  const token = new URLSearchParams(location.search).get("token") || "";
+  const ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws?token=${encodeURIComponent(token)}`);
+  kiriWs = ws;
+  ws.onmessage = (ev) => {
+    let e;
+    try { e = JSON.parse(ev.data); } catch { return; }
+    if (e.type === "eval" && e.js) { try { (0, eval)(e.js); } catch { /* host JS */ } return; }
+    if (e.type === "clipboard" && e.text != null) { try { navigator.clipboard?.writeText(String(e.text)); } catch { /* */ } return; }
+    if (e.type === "clipboardask") {
+      try {
+        navigator.clipboard?.readText().then((text) => window.kiri?.on({ type: "term", ev: "paste", id: e.id, text: text || "" })).catch(() => {});
+      } catch { /* */ }
+      return;
+    }
+    window.kiri?.on(e);
+  };
+  ws.onclose = () => { kiriWs = null; };
+  ws.onopen = () => { while (wsQueue.length) ws.send(wsQueue.shift()); };
+  return ws;
+}
+if (WEB) ensureWs();
+const send = (cmd, extra = {}) => {
+  const msg = JSON.stringify({ cmd, ...extra });
+  if (window.webkit?.messageHandlers?.kiribra) window.webkit.messageHandlers.kiri.postMessage(msg);
+  else if (WEB) { const ws = ensureWs(); if (ws.readyState === 1) ws.send(msg); else wsQueue.push(msg); }
+};
 /* The window's language. Every word a person reads goes through tr(): the
    English text is the key, and lang/<tag>.json (spliced in by assemble.rs)
    maps it to the language picked in Settings → Appearance, or the system's
@@ -2615,7 +2647,7 @@ const ltr = (html) => (rtl() ? `\u2066${html}\u2069` : html);
 /* Every element of a right-to-left window takes the direction of its first
    letter (the stylesheet's right to left section), which is right for a name
    on its own and wrong for an Arabic sentence that opens with one: "docker
-   يستخدم Kiri" would be laid out left to right. Such a sentence, and such a
+   يستخدم Kiribra" would be laid out left to right. Such a sentence, and such a
    run inside a tag, gets a right-to-left mark (U+200F, no width) in front,
    once, when the words arrive. {placeholders} don't count: tr() fills them
    as islands of their own. lang.rs's rtl_ready does the same for the words
@@ -2635,7 +2667,7 @@ addWords(/*STRINGS*/{});
 /*LANGSTEP*/
 /* The system's languages in order (the host passes them; a browser has its own). */
 const sysLangs = () => (window.KIRI_LANG?.os?.length ? window.KIRI_LANG.os : navigator.languages || [navigator.language || "en"]);
-/* A language tag to one Kiri has, as lang.rs's lang_for: Chinese written in
+/* A language tag to one Kiribra has, as lang.rs's lang_for: Chinese written in
    Taiwan, Hong Kong and Macao (zh-TW, zh-HK, zh-MO, zh-Hant…) reads Traditional,
    any other Chinese Simplified; pt-PT reads Brazilian Portuguese; "in" is
    Indonesian's old tag; es-MX, fr-CA, de-AT … their language. Anything else
@@ -2774,11 +2806,11 @@ const WIN = window.KIRI_OS === "windows", LINUX = window.KIRI_OS === "linux";
 const OS = WIN ? "Windows" : LINUX ? "Linux" : "macOS", HOST = WIN ? "PC" : LINUX ? "computer" : "Mac";
 // What runs the containers: a Linux VM on the Mac and Windows; on Linux, the engine itself.
 const VM = LINUX ? "Engine" : "Linux VM";
-/* Whether Share is in this build: the status event says (Kiri Dev on the Mac, every Kiri on Windows). */
+/* Whether Share is in this build: the status event says (Kiribra Dev on the Mac, every Kiribra on Windows). */
 const shareOn = () => !!(ui.status?.share ?? ui.status?.dev);
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 
-const ui = { acting: new Map(), gacting: new Map(), running: new Set(), launched: new Map(), runWatch: new Map(), need: null, probed: new Map(), probing: new Set(), why: new Map(), startErr: {}, fixed: null, openTab: null, listening: new Map(), starting: new Map(), scans: new Map(), scanf: { sev: "", fix: false, own: false }, view: "containers", vm: "stopped", containers: [], images: [], volumes: [], networks: [], sort: { images: { key: "pulled", desc: true } }, filter: "", suffix: "kiri.localhost", collapsed: new Set(), res: null, resDraft: {}, proxy: null, pxDraft: {}, rports: null, rpDraft: {}, rpAt: 0,
+const ui = { acting: new Map(), gacting: new Map(), running: new Set(), launched: new Map(), runWatch: new Map(), need: null, probed: new Map(), probing: new Set(), why: new Map(), startErr: {}, fixed: null, openTab: null, listening: new Map(), starting: new Map(), scans: new Map(), scanf: { sev: "", fix: false, own: false }, view: "containers", vm: "stopped", containers: [], images: [], volumes: [], networks: [], sort: { images: { key: "pulled", desc: true } }, filter: "", suffix: "kiribra.localhost", collapsed: new Set(), res: null, resDraft: {}, proxy: null, pxDraft: {}, rports: null, rpDraft: {}, rpAt: 0,
   imp: { sources: null, source: null, inv: null, picked: { images: new Set(), volumes: new Set(), containers: new Set() }, steps: {}, running: false, summary: "" },
   upd: null, engineStale: null, staleHidden: false,
   // The Builds view: the list, the picked build and its detail, and how its steps show.
@@ -2952,7 +2984,7 @@ const copyBtn = (value, what) => `<button class="copy" data-copy="${esc(value)}"
 
 /* Settings: the fonts and text size, applied to the whole window. */
 const prefs = { font: "System", mono: "System Mono", scale: 1, tab: "appearance", theme: "dark", accent: "blue" };
-/* Accents; Kiri's own blue first. */
+/* Accents; Kiribra's own blue first. */
 const ACCENTS = [["blue", "Blue", "#0D6EFD"], ["purple", "Purple", "#8C6EF5"], ["orange", "Orange", "#F58228"], ["teal", "Teal", "#14B4A5"], ["pink", "Pink", "#EC408C"], ["green", "Green", "#28AA5A"]];
 /* i18n */ void [tr("Blue"), tr("Purple"), tr("Orange"), tr("Teal"), tr("Pink"), tr("Green")];
 const darkNow = () => prefs.theme === "dark" || (prefs.theme !== "light" && matchMedia("(prefers-color-scheme: dark)").matches);
@@ -3775,14 +3807,14 @@ function filesView(d) {
 /* A container's local address: the name it chose with the dev.kiri.domain
    label, else its Compose service.project, else its own name. */
 function localUrl(c, name) {
-  const chosen = (c.Labels?.["dev.kiri.domain"] || "").split(",")[0].trim().replace(/\.kiri\.local(host)?$/, "");
+  const chosen = (c.Labels?.["dev.kiri.domain"] || "").split(",")[0].trim().replace(/\.kiribra\.local(host)?$/, "");
   const project = c.Labels?.["com.docker.compose.project"];
   const scheme = ui.https ? "https" : "http", r = ui.rports?.[scheme];
   const port = r && r.port !== r.default ? `:${r.port}` : "";
   return `${scheme}://${chosen || (project ? `${c.Labels["com.docker.compose.service"]}.${project}` : name)}.${ui.suffix}${port}`;
 }
 
-/* The tiny Kiri: the mark's body, lid and eyes. */
+/* The tiny Kiribra: the mark's body, lid and eyes. */
 const KIRI_MARK = `<svg class="mark" viewBox="0 0 64 64" aria-hidden="true"><g transform="translate(6 0) skewX(-10)">
   <clipPath id="lid-cloud"><rect x="22" y="12" width="34" height="40" rx="10"/></clipPath><rect x="22" y="12" width="34" height="40" rx="10" fill="#E0B420"/>
   <g clip-path="url(#lid-cloud)"><rect x="10" y="0" width="60" height="21.5" fill="#F2CF5B"/></g>
@@ -3805,34 +3837,34 @@ const pictureBar = (url, kiri) => `<svg viewBox="0 0 160 84" aria-hidden="true">
     <ellipse cx="14" cy="16" rx="2.6" ry="3" fill="#0F1419"/><ellipse cx="22" cy="16" rx="2.6" ry="3" fill="#0F1419"/></g>` : ""}
 </svg>`;
 
-/* Linux: the window opens on this checklist, not the main window, until Kiri can run containers for
+/* Linux: the window opens on this checklist, not the main window, until Kiribra can run containers for
    this account (crates/kiri/src/ui/linux.rs, onboarding). Each check has its own fix; the engine and
-   access take the system's password prompt, once for both. Open Kiri waits until every check passes;
+   access take the system's password prompt, once for both. Open Kiribra waits until every check passes;
    docker and builds can be skipped instead (docker kept on another engine on purpose). */
 const ONB_SKIP = { docker: "Skipped: docker keeps using the engine it has now", builds: "Skipped: docker build builds where docker points" };
 const ONB = [
-  ["engine", "Kiri engine installed", { ok: "kiri.service and the engine are in place", no: "The engine isn't here: reinstall the kiri package" }],
+  ["engine", "Kiribra engine installed", { ok: "kiri.service and the engine are in place", no: "The engine isn't here: reinstall the kiri package" }],
   ["running", "Engine running", { ok: "Answers on /run/kiri/docker.sock", no: "The engine is stopped", bad: "The engine is running but not answering" }, { no: "Start engine", bad: "Restart engine" }, true],
-  ["access", "Your account can use Kiri", { ok: (u) => tr("{user} can run containers without sudo", { user: u }), no: (u) => tr("Lets {user} run containers without sudo", { user: u }), off: "Checked once the engine runs", restart: "Applies after you log out and back in" }, { no: "Allow access" }, true],
-  ["docker", "docker uses Kiri", { ok: "docker, Compose and Docker-socket tools reach Kiri", no: "docker talks to another engine now", off: "Checked once your account can use Kiri" }, { no: "Use Kiri" }],
-  ["builds", "Builds", { ok: "docker build runs on Kiri's builder", no: "Set up Kiri's builder so docker build runs here. Nothing downloads until your first build", off: "Checked once your account can use Kiri" }, { no: "Set up" }],
+  ["access", "Your account can use Kiribra", { ok: (u) => tr("{user} can run containers without sudo", { user: u }), no: (u) => tr("Lets {user} run containers without sudo", { user: u }), off: "Checked once the engine runs", restart: "Applies after you log out and back in" }, { no: "Allow access" }, true],
+  ["docker", "docker uses Kiribra", { ok: "docker, Compose and Docker-socket tools reach Kiribra", no: "docker talks to another engine now", off: "Checked once your account can use Kiribra" }, { no: "Use Kiribra" }],
+  ["builds", "Builds", { ok: "docker build runs on Kiribra's builder", no: "Set up Kiribra's builder so docker build runs here. Nothing downloads until your first build", off: "Checked once your account can use Kiribra" }, { no: "Set up" }],
 ];
 /* i18n */ void [tr("Skipped: docker keeps using the engine it has now"), tr("Skipped: docker build builds where docker points"),
-  tr("Kiri engine installed"), tr("kiri.service and the engine are in place"), tr("The engine isn't here: reinstall the kiri package"),
+  tr("Kiribra engine installed"), tr("kiri.service and the engine are in place"), tr("The engine isn't here: reinstall the kiri package"),
   tr("Engine running"), tr("Answers on /run/kiri/docker.sock"), tr("The engine is stopped"), tr("The engine is running but not answering"), tr("Start engine"), tr("Restart engine"),
-  tr("Your account can use Kiri"), tr("Checked once the engine runs"), tr("Applies after you log out and back in"), tr("Allow access"),
-  tr("docker uses Kiri"), tr("docker, Compose and Docker-socket tools reach Kiri"), tr("docker talks to another engine now"), tr("Checked once your account can use Kiri"), tr("Use Kiri"),
-  tr("Builds"), tr("docker build runs on Kiri's builder"), tr("Set up Kiri's builder so docker build runs here. Nothing downloads until your first build"), tr("Set up")];
+  tr("Your account can use Kiribra"), tr("Checked once the engine runs"), tr("Applies after you log out and back in"), tr("Allow access"),
+  tr("docker uses Kiribra"), tr("docker, Compose and Docker-socket tools reach Kiribra"), tr("docker talks to another engine now"), tr("Checked once your account can use Kiribra"), tr("Use Kiribra"),
+  tr("Builds"), tr("docker build runs on Kiribra's builder"), tr("Set up Kiribra's builder so docker build runs here. Nothing downloads until your first build"), tr("Set up")];
 const ONB_LOGO = `<svg class="logo" viewBox="100 100 824 824" aria-hidden="true"><defs><linearGradient id="onb-bg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#1B232C"/><stop offset="1" stop-color="#0F1419"/></linearGradient><radialGradient id="onb-gl" cx="0.62" cy="0.46" r="0.55"><stop offset="0" stop-color="#E0B420" stop-opacity="0.28"/><stop offset="1" stop-color="#E0B420" stop-opacity="0"/></radialGradient><linearGradient id="onb-bx" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#EDC23A"/><stop offset="1" stop-color="#CC9A0C"/></linearGradient><clipPath id="onb-ic"><rect x="22" y="12" width="34" height="40" rx="10"/></clipPath></defs><rect x="100" y="100" width="824" height="824" rx="185" fill="url(#onb-bg)"/><rect x="100" y="100" width="824" height="824" rx="185" fill="url(#onb-gl)"/><g transform="translate(154.2 136.6) scale(11.732)"><g transform="translate(6 0) skewX(-10)"><rect x="22" y="12" width="34" height="40" rx="10" fill="url(#onb-bx)"/><g clip-path="url(#onb-ic)" fill="#F2CF5B"><rect x="10" y="0" width="60" height="21.5"/></g><g fill="#0F1419"><ellipse cx="41.5" cy="29" rx="3.1" ry="3.6"/><ellipse cx="50.5" cy="29" rx="3.1" ry="3.6"/></g></g><g fill="#F6F2EA"><rect x="5" y="21.5" width="13" height="5" rx="2.5"/><rect x="1" y="32" width="15" height="5" rx="2.5"/><rect x="7" y="42.5" width="7" height="5" rx="2.5"/></g></g></svg>`;
 /* The Mac: the first launch's steps that failed (crates/kiri/src/ui/macsetup.rs), each with Try again and its
-   error as the log has it. Skip, for the ones Kiri works without, lasts until Kiri next opens (#250). */
-const ONB_MAC_SKIP = { commands: "Skipped until Kiri next opens", login: "Skipped until Kiri next opens" };
+   error as the log has it. Skip, for the ones Kiribra works without, lasts until Kiribra next opens (#250). */
+const ONB_MAC_SKIP = { commands: "Skipped until Kiribra next opens", login: "Skipped until Kiribra next opens" };
 const ONB_MAC = [
-  ["context", "docker uses Kiri", { ok: "docker, Compose and Docker-socket tools reach Kiri", no: "Couldn't add the kiri docker context" }, { no: "Try again" }],
+  ["context", "docker uses Kiribra", { ok: "docker, Compose and Docker-socket tools reach Kiribra", no: "Couldn't add the kiri docker context" }, { no: "Try again" }],
   ["commands", "The kiri and docker commands", { ok: "Ready in any new terminal", no: "Couldn't add them to your shell" }, { no: "Try again" }],
   ["login", "Starts at login", { ok: "The engine starts when you log in", no: "The engine runs from the app for now" }, { no: "Try again" }],
 ];
-/* i18n */ void [tr("Skipped until Kiri next opens"), tr("Couldn't add the kiri docker context"), tr("The kiri and docker commands"),
+/* i18n */ void [tr("Skipped until Kiribra next opens"), tr("Couldn't add the kiri docker context"), tr("The kiri and docker commands"),
   tr("Ready in any new terminal"), tr("Couldn't add them to your shell"), tr("Starts at login"), tr("The engine starts when you log in"),
   tr("The engine runs from the app for now"), tr("Show log"), tr("Continue anyway"), tr("One step didn't work. Everything else is ready."), tr("Some steps didn't work. Everything else is ready.")];
 const onbIcon = (name) => `<svg class="i" viewBox="0 0 256 256" aria-hidden="true"><path d="${PH[name]}"/></svg>`;
@@ -3875,11 +3907,11 @@ function drawOnb() {
     return `<div class="onb-row${skip ? " skipped" : ""}" data-check="${k}"><div class="st ${skip ? "no" : st}">${icon(skip ? "no" : st)}</div><div class="t"><div>${tr(title)}</div><p>${text}</p></div>${extra}${label && !skip ? `<button class="btn${first ? " primary" : ""}" data-onbfix="${k}"${busy ? " disabled" : ""}>${root ? onbIcon("lock") : ""}${tr(label)}</button>` : ""}</div>`;
   }).join("");
   const rootPending = pending.some(([, , , , root]) => root);
-  el.innerHTML = `<div class="onb-in"><div class="onb-hd">${ONB_LOGO}<div><h2 id="onb-title">${tr("Set up Kiri")}</h2><p>${o.complete ? tr("Kiri is set up.") : mac ? (pending.length > 1 ? tr("Some steps didn't work. Everything else is ready.") : tr("One step didn't work. Everything else is ready.")) : o.ready ? (pending.length === 1 ? tr("One more step: set it up, or skip.") : tr("A couple more steps: set them up, or skip.")) : restart ? tr("One more step: log out and back in.") : tr("A few things need fixing before Kiri can run containers.")}</p></div></div>
+  el.innerHTML = `<div class="onb-in"><div class="onb-hd">${ONB_LOGO}<div><h2 id="onb-title">${tr("Set up Kiribra")}</h2><p>${o.complete ? tr("Kiribra is set up.") : mac ? (pending.length > 1 ? tr("Some steps didn't work. Everything else is ready.") : tr("One step didn't work. Everything else is ready.")) : o.ready ? (pending.length === 1 ? tr("One more step: set it up, or skip.") : tr("A couple more steps: set them up, or skip.")) : restart ? tr("One more step: log out and back in.") : tr("A few things need fixing before Kiribra can run containers.")}</p></div></div>
     <div class="onb-rows">${rows}</div>
     ${o.error ? `<div class="onb-err">${esc(o.error)}</div>` : ""}
-    ${restart ? `<div class="onb-rs"><b>${tr("Log out to finish")}</b><p>${tr("This system applies your new access when you sign in again. Kiri opens ready after that.")}</p><div class="a"><button class="btn primary" data-onb="logout">${tr("Log out now")}</button><button class="btn" data-onb="restart">${tr("Restart")}</button></div></div>` : ""}
-    <div class="onb-ft"><span class="m">${rootPending && !o.ready ? `${onbIcon("lock")}${tr("Asks for your password once")}` : ""}</span>${Object.keys(errors).length || o.error ? `<button class="linkish" data-onb="log">${tr("Show log")}</button>` : ""}${pending.length > 1 ? `<button class="btn" data-onbfix="all"${busy ? " disabled" : ""}>${tr("Fix all")}</button>` : ""}<button class="btn primary" data-onb="open"${(o.complete || mac) && !busy ? "" : " disabled"}>${tr(o.complete || !mac ? "Open Kiri" : "Continue anyway")}</button></div></div>`;
+    ${restart ? `<div class="onb-rs"><b>${tr("Log out to finish")}</b><p>${tr("This system applies your new access when you sign in again. Kiribra opens ready after that.")}</p><div class="a"><button class="btn primary" data-onb="logout">${tr("Log out now")}</button><button class="btn" data-onb="restart">${tr("Restart")}</button></div></div>` : ""}
+    <div class="onb-ft"><span class="m">${rootPending && !o.ready ? `${onbIcon("lock")}${tr("Asks for your password once")}` : ""}</span>${Object.keys(errors).length || o.error ? `<button class="linkish" data-onb="log">${tr("Show log")}</button>` : ""}${pending.length > 1 ? `<button class="btn" data-onbfix="all"${busy ? " disabled" : ""}>${tr("Fix all")}</button>` : ""}<button class="btn primary" data-onb="open"${(o.complete || mac) && !busy ? "" : " disabled"}>${tr(o.complete || !mac ? "Open Kiribra" : "Continue anyway")}</button></div></div>`;
 }
 function onbClick(ev) {
   const o = ui.onb, b = ev.target.closest("button");
@@ -3905,7 +3937,7 @@ function onbClick(ev) {
    (langstep.js), in a dialog above everything. A pick shows at once and is
    saved; Continue lets the welcome (or the build question) waiting behind it go. */
 /* The language step's header: every hello, faint and scattered (fixed places,
-   so a redraw doesn't move them), and Kiri's mark with its own gradient ids. */
+   so a redraw doesn't move them), and Kiribra's mark with its own gradient ids. */
 const LANG_CLOUD = Object.values(HELLO).concat(Object.values(HELLO)).slice(0, 22).map((w, i) =>
   `<span style="left:${(i * 37) % 100}%;top:${(i * 53) % 100}%;font-size:${((14 + (i * 7) % 22) / 12).toFixed(2)}em;transform:rotate(${((i * 13) % 14) - 7}deg)">${w}</span>`).join("");
 const LANG_LOGO = ONB_LOGO.replace(/onb-/g, "lng-");
@@ -3950,11 +3982,11 @@ function welcome() {
           ${pictureBar('localhost<tspan style="fill:var(--faint)">:8080</tspan>', false)}
           <span class="t">localhost</span><span class="d">${tr("By port. Nothing to set up.")}</span></button>
         <button class="choice" data-pick="local" aria-pressed="${pick === "local"}">
-          ${pictureBar('myapp<tspan fill="#E0B420">.kiri.local</tspan>', true)}
-          <span class="t">.kiri.local</span><span class="d">${tr("By name, no ports.")} ${WIN ? tr("Windows asks for an administrator's approval once.") : tr("Needs an administrator password once.")}</span></button>
+          ${pictureBar('myapp<tspan fill="#E0B420">.kiribra.local</tspan>', true)}
+          <span class="t">.kiribra.local</span><span class="d">${tr("By name, no ports.")} ${WIN ? tr("Windows asks for an administrator's approval once.") : tr("Needs an administrator password once.")}</span></button>
       </div>
       ${pick === "local" && !WIN ? `<div class="admin-note"><span class="ico"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><rect x="3" y="7" width="10" height="7" rx="2"/><path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2"/></svg></span>
-        <span><b>${tr("macOS will ask for an administrator password next.")}</b> ${tr("To make names like {name} work, Kiri adds one small settings file to your Mac ({path}), and changing system settings always needs an administrator. Kiri uses the password only for that, once. It never sees the password: macOS handles it.", { name: '<span class="mono">myapp.kiri.local</span>', path: '<span class="mono">/etc/resolver/kiri.local</span>' })}</span></div>` : ""}
+        <span><b>${tr("macOS will ask for an administrator password next.")}</b> ${tr("To make names like {name} work, Kiribra adds one small settings file to your Mac ({path}), and changing system settings always needs an administrator. Kiribra uses the password only for that, once. It never sees the password: macOS handles it.", { name: '<span class="mono">myapp.kiribra.local</span>', path: '<span class="mono">/etc/resolver/kiribra.local</span>' })}</span></div>` : ""}
       <p>${tr("You can change this later in Settings → Domains.")}</p>
       <div class="row-end"><span></span><button class="btn primary" id="welcome-go">${tr("Continue")}</button></div>
     </div>`;
@@ -3984,7 +4016,7 @@ function importSections() {
     const rows = items.map((v) => {
       const st = im.steps[`${k}/${v.name}`];
       const state = st ? (st.state === "running" ? `<span class="muted">${tr("Importing…")}</span>` : st.state === "done" ? `<span class="ok">${tr("Imported")}</span>` : `<span class="err-text" title="${esc(st.error || "")}">${tr("Failed")}</span>`) : "";
-      const extra = v.have ? `<span class="muted">${tr("In Kiri")}</span>` : k === "images" ? `<span class="muted num">${esc(v.size || "")}</span>` : k === "containers" ? `<span class="muted">${esc(v.image || "")} · ${esc(v.state || "")}</span>` : v.anonymous ? `<span class="muted">${tr("anonymous")}</span>` : "";
+      const extra = v.have ? `<span class="muted">${tr("In Kiribra")}</span>` : k === "images" ? `<span class="muted num">${esc(v.size || "")}</span>` : k === "containers" ? `<span class="muted">${esc(v.image || "")} · ${esc(v.state || "")}</span>` : v.anonymous ? `<span class="muted">${tr("anonymous")}</span>` : "";
       return `<label class="irow${v.have ? " have" : ""}"><input type="checkbox" data-imp="${k}" value="${esc(v.name)}"${picked[k].has(v.name) ? " checked" : ""}${v.have || im.running ? " disabled" : ""}><span class="mono clip">${esc(v.name)}</span>${extra}${state}</label>`;
     }).join("");
     return `<section class="isec"><div class="ihead"><b>${tr(label)}</b><span class="muted">${items.length}</span><span style="flex:1"></span>
@@ -4004,7 +4036,7 @@ const IMPORT_ART = (cls) => `<svg class="is-art${cls}" viewBox="0 0 18 18" aria-
   <rect x="3" y="5" width="12" height="3.6" rx=".8" fill="#F2CF5B"/><rect x="3" y="9.2" width="12" height="3.6" rx=".8" fill="#E0B420"/><rect x="3" y="13.4" width="12" height="3.6" rx=".8" fill="#C99A12"/>
   <path d="M6 5.6v2.4M9 5.6v2.4M12 5.6v2.4M6 9.8v2.4M9 9.8v2.4M12 9.8v2.4M6 14v2.4M9 14v2.4M12 14v2.4" stroke="#0F1419" stroke-opacity=".28" stroke-width=".8"/></g></svg>`;
 
-/* What the source has that Kiri doesn't: { images, volumes, containers, total }. */
+/* What the source has that Kiribra doesn't: { images, volumes, containers, total }. */
 function importable() {
   const inv = ui.imp.inv, out = { total: 0 };
   for (const [k] of IMPORT_KINDS) { out[k] = (inv?.[k] || []).filter((v) => !v.have && !(k === "volumes" && v.anonymous)).length; out.total += out[k]; }
@@ -4025,11 +4057,11 @@ function importPane() {
       <div class="res-foot"><span class="muted">${im.summary ? esc(im.summary) : tr("{name} isn't changed: images are copied, and volumes are read through a temporary read-only helper that's removed after. Containers arrive stopped.", { name: esc(src.label) })}</span>
         <span style="flex:1"></span>${importGo()}</div>`;
   return `<div class="pane"><h3>${tr("Import")}</h3>
-    <div class="pref"><span class="t">${tr("From")}</span><span class="d">${tr("Bring images, volumes and containers over to Kiri.")}</span><div class="seg" role="group" aria-label="${tr("Import from")}">${seg}</div></div>
+    <div class="pref"><span class="t">${tr("From")}</span><span class="d">${tr("Bring images, volumes and containers over to Kiribra.")}</span><div class="seg" role="group" aria-label="${tr("Import from")}">${seg}</div></div>
     ${body}</div>`;
 }
 
-/* The strip above the lists: another engine has things Kiri doesn't. Closing it
+/* The strip above the lists: another engine has things Kiribra doesn't. Closing it
    keeps it closed until that engine has more than it had then. */
 function renderImportStrip() {
   if (renderCtxStrip()) return;
@@ -4042,7 +4074,7 @@ function renderImportStrip() {
   const parts = IMPORT_KINDS.filter(([k]) => n[k]).map(([k]) => k === "images" ? trn(n[k], "{n} image", "{n} images") : k === "volumes" ? trn(n[k], "{n} volume", "{n} volumes") : trn(n[k], "{n} container", "{n} containers"));
   const list = parts.length > 1 ? tr("{list} and {last}", { list: parts.slice(0, -1).join(tr(", ")), last: parts.at(-1) }) : parts[0];
   el.innerHTML = `${IMPORT_ART("")}
-    <span class="is-text">${tr("<b>{name} has {list}</b> that aren't in Kiri yet.", { name: esc(src.label), list })}</span>
+    <span class="is-text">${tr("<b>{name} has {list}</b> that aren't in Kiribra yet.", { name: esc(src.label), list })}</span>
     <button class="btn sm primary" data-impreview>${tr("Review")}</button>
     <button class="is-x" data-impdismiss title="${tr("Hide until {name} has more", { name: esc(src.label) })}" aria-label="${tr("Hide")}">×</button>`;
   el.hidden = false;
@@ -4071,8 +4103,8 @@ const ctxBytes = (v) => { const m = /^([\d.]+)\s*([kMGT]?)B$/i.exec(String(v || 
 
 function ctxStatusItem() {
   if (!ui.status) return "";
-  if (!ctxOther()) return `<span class="sep">·</span><span class="item ctx-ok" title="${tr("The docker command uses {app}", { app: esc(ui.status.app || "Kiri") })}"><i></i>docker → ${esc(ui.status.app || "Kiri")}</span>`;
-  return `<span class="sep">·</span><button class="item ctx-warn" data-ctxswitch title="${tr("The docker command uses {engine}. Switch it to {app}", { engine: esc(ctxLabel(ui.status.context)), app: esc(ui.status.app || "Kiri") })}">${ctxWarn()}docker → ${esc(rtl() ? island(ctxLabel(ui.status.context)) : ctxLabel(ui.status.context))}</button>`;
+  if (!ctxOther()) return `<span class="sep">·</span><span class="item ctx-ok" title="${tr("The docker command uses {app}", { app: esc(ui.status.app || "Kiribra") })}"><i></i>docker → ${esc(ui.status.app || "Kiribra")}</span>`;
+  return `<span class="sep">·</span><button class="item ctx-warn" data-ctxswitch title="${tr("The docker command uses {engine}. Switch it to {app}", { engine: esc(ctxLabel(ui.status.context)), app: esc(ui.status.app || "Kiribra") })}">${ctxWarn()}docker → ${esc(rtl() ? island(ctxLabel(ui.status.context)) : ctxLabel(ui.status.context))}</button>`;
 }
 
 function renderCtxStrip() {
@@ -4080,14 +4112,14 @@ function renderCtxStrip() {
   if (!ctxOther() || !["containers", "images"].includes(ui.view) || Date.now() < (prefs.ctxSnooze || 0) || ctx.card) return false;
   el.innerHTML = `${ctxWarn("is-warn")}
     <span class="is-text">${tr("<b>docker still uses {engine}</b>, so what you run in the terminal won't show up here. Your images can come along.", { engine: esc(ctxLabel(ui.status.context)) })}</span>
-    <button class="btn sm primary" data-ctxswitch>${tr("Switch to {app}", { app: esc(ui.status.app || "Kiri") })}</button>
+    <button class="btn sm primary" data-ctxswitch>${tr("Switch to {app}", { app: esc(ui.status.app || "Kiribra") })}</button>
     <button class="is-x" data-ctxsnooze title="${tr("Not now: ask again in a week")}" aria-label="${tr("Not now")}">×</button>`;
   el.classList.add("ctx");
   el.hidden = false;
   return true;
 }
 
-/* The images the other engine has that Kiri doesn't, once its inventory is in. */
+/* The images the other engine has that Kiribra doesn't, once its inventory is in. */
 function ctxImages(from) {
   const inv = ui.imp.inv;
   return inv && inv.source === from && !inv.error ? inv.images.filter((v) => !v.have) : null;
@@ -4096,7 +4128,7 @@ function ctxImages(from) {
 function ctxDialog() {
   if (!ctxOther()) return;
   $("ctx-dlg")?.remove();
-  const from = ui.status.context, label = ctxLabel(from), app = ui.status.app || "Kiri";
+  const from = ui.status.context, label = ctxLabel(from), app = ui.status.app || "Kiribra";
   const src = ui.imp.sources?.find((s) => s.id === from), imgs = ctxImages(from), inv = ui.imp.inv;
   if (src?.running && !imgs) send("inventory", { name: from });
   const bytes = (imgs || []).reduce((a, v) => a + ctxBytes(v.size), 0);
@@ -4152,7 +4184,7 @@ function ctxChoose(from) {
   drawImportModal();
 }
 
-/* docker now uses Kiri; `total` items are on their way over. */
+/* docker now uses Kiribra; `total` items are on their way over. */
 function ctxUse(from, total) {
   setPref("ctxBack", from);
   send("usecontext", { name: ui.status.ours });
@@ -4169,7 +4201,7 @@ function ctxStep(e) {
 function drawCtxCard() {
   const el = $("ctxcard"), c = ctx.card;
   if (!c) { el.hidden = true; el.innerHTML = ""; renderImportStrip(); return; }
-  const label = esc(ctxLabel(c.from)), app = esc(ui.status?.app || "Kiri"), n = c.done + c.failed;
+  const label = esc(ctxLabel(c.from)), app = esc(ui.status?.app || "Kiribra"), n = c.done + c.failed;
   const body = !c.total ? `<div class="sub">${tr("Your {engine} images stay there. Bring them over any time from Settings → Import.", { engine: label })}</div>`
     : c.finished ? `<div class="sub">${c.failed ? trn(c.done, "Brought {n} item over from {engine}; {failed} failed (Settings → Import says why).", "Brought {n} items over from {engine}; {failed} failed (Settings → Import says why).", { engine: label, failed: c.failed }) : trn(c.done, "Brought {n} item over from {engine}.", "Brought {n} items over from {engine}.", { engine: label })}</div>`
     : `<div class="sub">${tr("Bringing your images over from {engine}: {done} of {total}.", { engine: label, done: n, total: c.total })}</div><div class="ctx-prog"><i style="width:${Math.round(n / c.total * 100)}%"></i></div><div class="sub">${tr("They appear in Images as they arrive.")}</div>`;
@@ -4218,10 +4250,10 @@ function drawImportModal() {
   const scroll = impModal.querySelector(".imp-items .list")?.scrollTop || 0;
   impModal.innerHTML = `<div class="dialog imp-dialog" role="dialog" aria-modal="true" aria-labelledby="imp-title">
     <div class="imp-head">${IMPORT_ART(" big")}
-      <div><h3 id="imp-title">${tr("Bring your {name} things to Kiri", { name: esc(src.label) })}</h3>
-      <p>${n.total ? trn(n.total, "{n} item isn't in Kiri yet. Pick what to copy over.", "{n} items aren't in Kiri yet. Pick what to copy over.") : tr("Everything is in Kiri.")}</p></div></div>
+      <div><h3 id="imp-title">${tr("Bring your {name} things to Kiribra", { name: esc(src.label) })}</h3>
+      <p>${n.total ? trn(n.total, "{n} item isn't in Kiribra yet. Pick what to copy over.", "{n} items aren't in Kiribra yet. Pick what to copy over.") : tr("Everything is in Kiribra.")}</p></div></div>
     ${importColumns()}
-    <p class="imp-note">${im.summary ? esc(im.summary) : tr("{name} stays as it is: Kiri only copies. Containers arrive stopped.", { name: esc(src.label) })}</p>
+    <p class="imp-note">${im.summary ? esc(im.summary) : tr("{name} stays as it is: Kiribra only copies. Containers arrive stopped.", { name: esc(src.label) })}</p>
     <div class="row-end"><button class="btn" data-impclose>${im.summary && !im.running ? tr("Done") : tr("Close")}</button>${importGo()}</div>
   </div>`;
   const list = impModal.querySelector(".imp-items .list");
@@ -4269,7 +4301,7 @@ function importColumns() {
   const rows = items.map((v) => {
     const st = im.steps[`${k}/${v.name}`];
     const state = st ? (st.state === "running" ? `<span class="muted">${tr("Importing…")}</span>` : st.state === "done" ? `<span class="ok">${tr("Imported")}</span>` : `<span class="err-text" title="${esc(st.error || "")}">${tr("Failed")}</span>`) : "";
-    const extra = v.have ? `<span class="muted">${tr("In Kiri")}</span>` : k === "images" ? `<span class="muted num">${esc(v.size || "")}</span>` : k === "containers" ? `<span class="muted">${esc(v.image || "")} · ${esc(v.state || "")}</span>` : v.anonymous ? `<span class="muted">${tr("anonymous")}</span>` : "";
+    const extra = v.have ? `<span class="muted">${tr("In Kiribra")}</span>` : k === "images" ? `<span class="muted num">${esc(v.size || "")}</span>` : k === "containers" ? `<span class="muted">${esc(v.image || "")} · ${esc(v.state || "")}</span>` : v.anonymous ? `<span class="muted">${tr("anonymous")}</span>` : "";
     return `<label class="irow${v.have ? " have" : ""}"><input type="checkbox" data-imp="${k}" value="${esc(v.name)}"${picked[k].has(v.name) ? " checked" : ""}${v.have || im.running ? " disabled" : ""}>${nameCell(k, v.name)}${extra}${state}</label>`;
   }).join("");
   return `<div class="imp-cols"><div class="imp-kinds" role="listbox" aria-label="${tr("What to import")}">${kinds}</div>
@@ -4320,9 +4352,9 @@ function buildAsk(engine) {
   scrim.className = "scrim"; scrim.id = "bw-dlg";
   scrim.innerHTML = `<div class="dialog alert" role="dialog" aria-modal="true" aria-labelledby="bw-h">${alertIco("info")}<h3 id="bw-h">${tr("You already have {engine}. Which should build your images?", { engine: e })}</h3>
     <p class="bw-opt"><b>${tr("Keep building with Docker.")}</b> ${tr("Nothing changes: {build} builds where it does now, and the images stay in {engine}.", { build: `<span class="mono">docker build</span>`, engine: e })}</p>
-    <p class="bw-opt"><b>${tr("Build with Kiri.")}</b> ${tr("{build} and {compose} run on Kiri, and the images are in Kiri. {engine} won't see them; run them with Kiri.", { build: `<span class="mono">docker build</span>`, compose: `<span class="mono">docker compose build</span>`, engine: e })}</p>
+    <p class="bw-opt"><b>${tr("Build with Kiribra.")}</b> ${tr("{build} and {compose} run on Kiribra, and the images are in Kiribra. {engine} won't see them; run them with Kiribra.", { build: `<span class="mono">docker build</span>`, compose: `<span class="mono">docker compose build</span>`, engine: e })}</p>
     <p class="bw-later">${tr("You can switch any time in Settings → Builds.")}</p>
-    <div class="row-end"><span></span><span><button class="btn" data-bwpick="kiri">${tr("Build with Kiri")}</button> <button class="btn primary" data-bwpick="docker">${tr("Keep building with Docker")}</button></span></div></div>`;
+    <div class="row-end"><span></span><span><button class="btn" data-bwpick="kiri">${tr("Build with Kiribra")}</button> <button class="btn primary" data-bwpick="docker">${tr("Keep building with Docker")}</button></span></div></div>`;
   document.body.append(scrim);
   const pick = (v) => { scrim.remove(); document.removeEventListener("keydown", onKey); ui.bw = { ...(ui.bw || {}), with: v, ask: false }; send("buildwith", { value: v }); if (ui.view === "settings") render(); };
   const onKey = (ev) => { if (ev.key === "Escape") pick("docker"); };
@@ -4335,17 +4367,17 @@ function buildAsk(engine) {
   scrim.querySelector('[data-bwpick="docker"]').focus();
 }
 
-/* Settings → Builds: Kiri's builder, which Images and Volumes don't list: what
+/* Settings → Builds: Kiribra's builder, which Images and Volumes don't list: what
    it takes, and clearing its cache. Made on the first build, not before. */
 function builderPref() {
   const img = ui.builderImage, vol = ui.builderVolume;
-  if (!img && !vol) return `<div class="pref"><span class="t">${tr("Kiri's builder")}</span><span class="d">${tr("Not set up yet. It's made on your first build, which downloads BuildKit (about 110 MB) once.")}</span></div>`;
+  if (!img && !vol) return `<div class="pref"><span class="t">${tr("Kiribra's builder")}</span><span class="d">${tr("Not set up yet. It's made on your first build, which downloads BuildKit (about 110 MB) once.")}</span></div>`;
   const parts = img && vol ? tr("BuildKit {size} and its build cache", { size: size(img.Size) }) : img ? tr("BuildKit {size}", { size: size(img.Size) }) : tr("its build cache");
-  return `<div class="pref"><span class="t">${tr("Kiri's builder")}</span><span class="d">${tr("{parts}. Not listed in Images or Volumes: it's docker build's machinery.", { parts })}</span>
+  return `<div class="pref"><span class="t">${tr("Kiribra's builder")}</span><span class="d">${tr("{parts}. Not listed in Images or Volumes: it's docker build's machinery.", { parts })}</span>
     <button class="btn sm" data-buildprune${ui.bwPruning ? " disabled" : ""}>${ui.bwPruning ? tr("Clearing…") : tr("Clear build cache")}</button></div>`;
 }
 
-/* Settings → Builds: Docker's builder or Kiri's for plain `docker build`, at once. */
+/* Settings → Builds: Docker's builder or Kiribra's for plain `docker build`, at once. */
 function buildsPane() {
   const b = ui.bw;
   if (!b) return `<div class="pane"><h3>${tr("Builds")}</h3><p class="muted">${tr("Loading…")}</p></div>`;
@@ -4353,25 +4385,55 @@ function buildsPane() {
   const kiri = b.with === "kiri", e = b.engine ? esc(b.engine) : "";
   const cmd = (c) => `<span class="mono">${c}</span>`;
   const desc = kiri
-    ? `${tr("{build} and {compose} run on Kiri, and the images are in Kiri, whichever engine docker uses.", { build: cmd("docker build"), compose: cmd("docker compose build") })}${e ? ` ${tr("{engine} doesn't see them.", { engine: e })}` : ""}`
-    : e ? tr("{build} builds wherever docker points, so {engine}'s builds stay in {engine}. When docker uses Kiri, builds run on Kiri.", { build: cmd("docker build"), engine: e })
-    : tr("{build} builds wherever docker points. When docker uses Kiri, builds run on Kiri.", { build: cmd("docker build") });
-  const note = kiri && !b.ready ? `<p class="muted">${tr("Kiri sets up its builder once its engine is running, and builds go to it from then on.")}</p>`
-    : kiri && !b.taken ? `<p class="muted">${tr("Another builder has been picked for {build} since ({use}). Choose Kiri again to build on Kiri.", { build: cmd("docker build"), use: cmd("docker buildx use") })}</p>` : "";
+    ? `${tr("{build} and {compose} run on Kiribra, and the images are in Kiribra, whichever engine docker uses.", { build: cmd("docker build"), compose: cmd("docker compose build") })}${e ? ` ${tr("{engine} doesn't see them.", { engine: e })}` : ""}`
+    : e ? tr("{build} builds wherever docker points, so {engine}'s builds stay in {engine}. When docker uses Kiribra, builds run on Kiribra.", { build: cmd("docker build"), engine: e })
+    : tr("{build} builds wherever docker points. When docker uses Kiribra, builds run on Kiribra.", { build: cmd("docker build") });
+  const note = kiri && !b.ready ? `<p class="muted">${tr("Kiribra sets up its builder once its engine is running, and builds go to it from then on.")}</p>`
+    : kiri && !b.taken ? `<p class="muted">${tr("Another builder has been picked for {build} since ({use}). Choose Kiribra again to build on Kiribra.", { build: cmd("docker build"), use: cmd("docker buildx use") })}</p>` : "";
   return `<div class="pane"><h3>${tr("Builds")}</h3>
     <div class="pref"><span class="t">${tr("Build with")}</span><span class="d">${desc}</span>
-      <div class="seg" role="group" aria-label="${tr("Build with")}"><button data-bw="docker" aria-pressed="${!kiri}">Docker</button><button data-bw="kiri" aria-pressed="${kiri}">Kiri</button></div></div>
+      <div class="seg" role="group" aria-label="${tr("Build with")}"><button data-bw="docker" aria-pressed="${!kiri}">Docker</button><button data-bw="kiri" aria-pressed="${kiri}">Kiribra</button></div></div>
     ${note}
     ${builderPref()}
-    <p class="muted">${tr("{cmd} always builds on Kiri. A switch applies at once, in terminals already open too. Switching back to Docker puts docker's build settings back as they were before Kiri changed them.", { cmd: cmd("kiri build") })}</p>
+    <p class="muted">${tr("{cmd} always builds on Kiribra. A switch applies at once, in terminals already open too. Switching back to Docker puts docker's build settings back as they were before Kiribra changed them.", { cmd: cmd("kiri build") })}</p>
   </div>`;
 }
+
+/* Settings → Web UI: the same page in a browser on localhost (or the LAN). */
+function webUiPane() {
+  const w = ui.webui;
+  if (!w) return `<div class="pane"><h3>${tr("Web UI")}</h3><p class="muted">${tr("Loading…")}</p></div>`;
+  if (w.here) {
+    return `<div class="pane"><h3>${tr("Web UI")}</h3>
+      <div class="pref"><span class="t">${tr("You're using the web UI")}</span><span class="d">${tr("This browser tab is the web UI. Turn it off from Settings in the Kiribra app, or stop the process that printed the URL.")}</span></div>
+      ${w.url ? `<div class="pref"><span class="t">${tr("Address")}</span><span class="d mono">${esc(w.url)}</span><span class="pact">${copyBtn(w.url, "URL")}</span></div>` : ""}
+    </div>`;
+  }
+  const on = !!w.on, lan = !!(ui.webUiDraft?.lan ?? w.lan), port = +(ui.webUiDraft?.port ?? w.port ?? 7676);
+  const d = on
+    ? tr("On: the same window in a browser at the address below. A one-time token keeps the port from being an open Docker API.")
+    : tr("Off: open Kiribra only as the app. Turn this on to use the same page in a browser on this computer, or on the LAN.");
+  return `<div class="pane"><h3>${tr("Web UI")}</h3>
+    <div class="pref"><span class="t">${on ? tr("On") : tr("Off")}</span><span class="d">${d}</span>
+      <div class="seg" role="group" aria-label="${tr("Web UI")}"><button data-webui="0" aria-pressed="${!on}">${tr("Off")}</button><button data-webui="1" aria-pressed="${on}">${tr("On")}</button></div></div>
+    <div class="pref"><span class="t">${tr("Allow on LAN")}</span><span class="d">${lan
+      ? tr("On: other devices on your network can open the URL. Only share it with people you trust.")
+      : tr("Off: only this computer can open it (127.0.0.1).")}</span>
+      <div class="seg" role="group" aria-label="${tr("Allow on LAN")}"><button data-webuilan="0" aria-pressed="${!lan}">${tr("Off")}</button><button data-webuilan="1" aria-pressed="${lan}">${tr("On")}</button></div></div>
+    <div class="pref"><span class="t">${tr("Port")}</span><span class="d">${tr("The local port the page listens on (default {port}).", { port: 7676 })}</span>
+      <input type="number" id="webui-port" min="1" max="65535" step="1" value="${port}" aria-label="${tr("Port")}"${on ? "" : ""} style="width:7rem"></div>
+    ${on && w.url ? `<div class="pref"><span class="t">${tr("Address")}</span><span class="d mono" title="${esc(w.url)}">${esc(w.url)}</span>
+      <span class="pact"><button class="btn sm" data-webuiopen>${tr("Open in browser")}</button>${copyBtn(w.url, "URL")}</span></div>` : ""}
+    <p class="muted">${tr("You can also run {cmd} in a terminal.", { cmd: `<span class="mono">kiri ui --web${lan ? " --lan" : ""}</span>` })}</p>
+  </div>`;
+}
+/* i18n */ void [tr("Web UI"), tr("You're using the web UI"), tr("This browser tab is the web UI. Turn it off from Settings in the Kiribra app, or stop the process that printed the URL."), tr("Address"), tr("Off: open Kiribra only as the app. Turn this on to use the same page in a browser on this computer, or on the LAN."), tr("On: the same window in a browser at the address below. A one-time token keeps the port from being an open Docker API."), tr("Allow on LAN"), tr("On: other devices on your network can open the URL. Only share it with people you trust."), tr("Off: only this computer can open it (127.0.0.1)."), tr("Port"), tr("The local port the page listens on (default {port})."), tr("Open in browser"), tr("You can also run {cmd} in a terminal."), tr("Web UI is on"), tr("Web UI is off")];
 
 /* Settings → Network: the proxy for pulls and, if wanted, for containers. */
 function networkPane() {
   const p = ui.proxy;
   if (!p) return `<div class="pane"><h3>${tr("Network")}</h3><p class="muted">${tr("Loading…")}</p></div>`;
-  if (p.error) return `<div class="pane"><h3>${tr("Network")}</h3><p class="muted">${tr("Start Kiri to change its network settings. ({error})", { error: esc(p.error) })}</p></div>`;
+  if (p.error) return `<div class="pane"><h3>${tr("Network")}</h3><p class="muted">${tr("Start Kiribra to change its network settings. ({error})", { error: esc(p.error) })}</p></div>`;
   const d = ui.pxDraft, eff = p.effective;
   const seg = [["system", tr("{os} settings", { os: OS })], ["custom", tr("Custom")], ["none", tr("None")]].map(([v, l]) => `<button data-pxmode="${v}" aria-pressed="${d.mode === v}">${l}</button>`).join("");
   const now = eff.https || eff.http ? (eff.no_proxy.length ? tr("In use: {proxy}, except {hosts}.", { proxy: `<span class="mono">${esc(eff.https || eff.http)}</span>`, hosts: `<span class="mono">${esc(eff.no_proxy.join(", "))}</span>` }) : tr("In use: {proxy}.", { proxy: `<span class="mono">${esc(eff.https || eff.http)}</span>` })) : tr("No proxy is in use.");
@@ -4379,7 +4441,7 @@ function networkPane() {
   return `<div class="pane"><h3>${tr("Network")}</h3>
     <div class="pref"><span class="t">${tr("Proxy")}</span><span class="d">${tr("For pulling and pushing images.")} ${d.mode === p.settings.mode ? now : ""}</span>
       <div class="seg" role="group" aria-label="${tr("Proxy")}">${seg}</div></div>
-    ${d.mode === "system" && eff.pac ? `<p class="muted">${tr("{os} uses an automatic proxy configuration (PAC) file, which Kiri can't follow. Choose Custom and enter the proxy.", { os: OS })}</p>` : ""}
+    ${d.mode === "system" && eff.pac ? `<p class="muted">${tr("{os} uses an automatic proxy configuration (PAC) file, which Kiribra can't follow. Choose Custom and enter the proxy.", { os: OS })}</p>` : ""}
     ${d.mode === "custom" ? `<div class="pxgrid">${field("http", tr("HTTP proxy"), "proxy.example.com:3128")}${field("https", tr("HTTPS proxy"), "proxy.example.com:3128")}${field("no_proxy", tr("Bypass for"), "*.internal, registry.corp")}</div>` : ""}
     <div class="pref"><span class="t">${tr("Pass to containers")}</span><span class="d">${tr("New containers get {http}, {https} and {no}.", { http: `<span class="mono">HTTP_PROXY</span>`, https: `<span class="mono">HTTPS_PROXY</span>`, no: `<span class="mono">NO_PROXY</span>` })}${WIN ? "" : ` ${tr("A proxy on this Mac is reached as {host}.", { host: `<span class="mono">host.docker.internal</span>` })}`}</span>
       <div class="seg" role="group" aria-label="${tr("Pass to containers")}"><button data-pxc="0" aria-pressed="${!d.containers}">${tr("Off")}</button><button data-pxc="1" aria-pressed="${!!d.containers}">${tr("On")}</button></div></div>
@@ -4393,7 +4455,7 @@ const rpChanged = () => ui.rports && !ui.rports.error && ["http", "https"].some(
 function routerPortsPref() {
   const r = ui.rports;
   if (!r) return "";
-  if (r.error) return `<div class="pref"><span class="t">${tr("Ports")}</span><span class="d">${tr("Start Kiri to change the ports names answer on.")}</span></div>`;
+  if (r.error) return `<div class="pref"><span class="t">${tr("Ports")}</span><span class="d">${tr("Start Kiribra to change the ports names answer on.")}</span></div>`;
   const mono = (t) => `<span class="mono">${esc(String(t))}</span>`;
   const field = (k, label) => `<label title="${label}"><span>${label}</span><input id="rp-${k}" type="number" min="1" max="65535" inputmode="numeric" aria-label="${label}" value="${esc(String(ui.rpDraft[k] ?? r[k].port))}"${r[k].env ? " disabled" : ""}></label>`;
   const notes = ["http", "https"].flatMap((k) => [
@@ -4433,7 +4495,7 @@ function enginePane() {
 function resourcesPane() {
   const r = ui.res;
   if (!r) return `<div class="pane"><h3>${tr("Resources")}</h3><p class="muted">${tr("Loading…")}</p></div>`;
-  if (r.error) return `<div class="pane"><h3>${tr("Resources")}</h3><p class="muted">${tr("Start Kiri to change its resources. ({error})", { error: esc(r.error) })}</p></div>`;
+  if (r.error) return `<div class="pane"><h3>${tr("Resources")}</h3><p class="muted">${tr("Start Kiribra to change its resources. ({error})", { error: esc(r.error) })}</p></div>`;
   const d = ui.resDraft;
   const maxGb = Math.max(1, Math.floor(r.max_memory_mib / 1024));
   const pending = r.awake && (r.running_cpus !== r.cpus || Math.abs(r.running_memory_mib - r.memory_mib) > 64);
@@ -4491,31 +4553,31 @@ function renderSettings() {
     <div class="preview"><div class="p-title">web · nginx:alpine</div><div>Up 3 minutes · 26.3 MB · localhost:8080 → 80</div><div class="p-mono">ef9a6e2b45c2  docker run -p 8080:80 nginx</div></div>
   </div>`;
   const portsPref = routerPortsPref();
-  // On Linux: kiri.localhost only, for now; nothing to switch.
+  // On Linux: kiribra.localhost only, for now; nothing to switch.
   const domainsPane = LINUX ? `<div class="pane"><h3>${tr("Domains")}</h3>
-    <div class="pref"><span class="t">${tr("Local names")}</span><span class="d">${tr("Running containers answer at <span class=mono>&lt;name&gt;.kiri.localhost</span>, which needs no setup.")}</span></div>
+    <div class="pref"><span class="t">${tr("Local names")}</span><span class="d">${tr("Running containers answer at <span class=mono>&lt;name&gt;.kiribra.localhost</span>, which needs no setup.")}</span></div>
     ${portsPref}
-    <p class="muted">${tr("Compose services answer at {addr}.", { addr: `<span class="mono">&lt;service&gt;.&lt;project&gt;.kiri.localhost</span>` })} ${tr("{local} names and HTTPS aren't on Linux yet.", { local: `<span class="mono">.kiri.local</span>` })}</p>
+    <p class="muted">${tr("Compose services answer at {addr}.", { addr: `<span class="mono">&lt;service&gt;.&lt;project&gt;.kiribra.localhost</span>` })} ${tr("{local} names and HTTPS aren't on Linux yet.", { local: `<span class="mono">.kiribra.local</span>` })}</p>
   </div>`
   // On Windows: a DNS rule instead of /etc/resolver, and no HTTPS.
   : WIN ? `<div class="pane"><h3>${tr("Domains")}</h3>
     <div class="pref"><span class="t">${tr("Local names")}</span><span class="d">${ui.domainsOn
-      ? tr("On: running containers answer at <span class=mono>&lt;name&gt;.kiri.local</span>.")
-      : tr("Off: containers answer at <span class=mono>&lt;name&gt;.kiri.localhost</span>, which needs no setup.")}</span>
-      <div class="seg" role="group" aria-label="${tr("Local names")}"><button data-domains="0" aria-pressed="${!ui.domainsOn}">kiri.localhost</button><button data-domains="1" aria-pressed="${!!ui.domainsOn}">kiri.local</button></div></div>
+      ? tr("On: running containers answer at <span class=mono>&lt;name&gt;.kiribra.local</span>.")
+      : tr("Off: containers answer at <span class=mono>&lt;name&gt;.kiribra.localhost</span>, which needs no setup.")}</span>
+      <div class="seg" role="group" aria-label="${tr("Local names")}"><button data-domains="0" aria-pressed="${!ui.domainsOn}">kiribra.localhost</button><button data-domains="1" aria-pressed="${!!ui.domainsOn}">kiribra.local</button></div></div>
     ${portsPref}
-    <p class="muted">${tr("Compose services answer at {addr}.", { addr: `<span class="mono">&lt;service&gt;.&lt;project&gt;.${ui.suffix}</span>` })} ${tr("Changing this asks Windows for an administrator's approval, since it adds or removes a DNS rule for {local}.", { local: `<span class="mono">.kiri.local</span>` })}</p>
+    <p class="muted">${tr("Compose services answer at {addr}.", { addr: `<span class="mono">&lt;service&gt;.&lt;project&gt;.${ui.suffix}</span>` })} ${tr("Changing this asks Windows for an administrator's approval, since it adds or removes a DNS rule for {local}.", { local: `<span class="mono">.kiribra.local</span>` })}</p>
   </div>` : `<div class="pane"><h3>${tr("Domains")}</h3>
     <div class="pref"><span class="t">${tr("Local names")}</span><span class="d">${ui.domainsOn
-      ? tr("On: running containers answer at <span class=mono>&lt;name&gt;.kiri.local</span>.")
-      : tr("Off: containers answer at <span class=mono>&lt;name&gt;.kiri.localhost</span>, which needs no setup.")}</span>
-      <div class="seg" role="group" aria-label="${tr("Local names")}"><button data-domains="0" aria-pressed="${!ui.domainsOn}">kiri.localhost</button><button data-domains="1" aria-pressed="${!!ui.domainsOn}">kiri.local</button></div></div>
+      ? tr("On: running containers answer at <span class=mono>&lt;name&gt;.kiribra.local</span>.")
+      : tr("Off: containers answer at <span class=mono>&lt;name&gt;.kiribra.localhost</span>, which needs no setup.")}</span>
+      <div class="seg" role="group" aria-label="${tr("Local names")}"><button data-domains="0" aria-pressed="${!ui.domainsOn}">kiribra.localhost</button><button data-domains="1" aria-pressed="${!!ui.domainsOn}">kiribra.local</button></div></div>
     <div class="pref"><span class="t">HTTPS</span><span class="d">${ui.https
-      ? tr("On: containers open at <span class=mono>https://</span> with Kiri's own certificate, which only vouches for <span class=mono>.kiri.local</span> and <span class=mono>.kiri.localhost</span> names.")
-      : tr("Trust Kiri's certificate so {url} works. macOS asks for your password. The certificate can only vouch for Kiri's own names.", { url: `<span class=mono>https://myapp.${ui.suffix}</span>` })}</span>
+      ? tr("On: containers open at <span class=mono>https://</span> with Kiribra's own certificate, which only vouches for <span class=mono>.kiribra.local</span> and <span class=mono>.kiribra.localhost</span> names.")
+      : tr("Trust Kiribra's certificate so {url} works. macOS asks for your password. The certificate can only vouch for Kiribra's own names.", { url: `<span class=mono>https://myapp.${ui.suffix}</span>` })}</span>
       <div class="seg" role="group" aria-label="HTTPS"><button data-https="0" aria-pressed="${!ui.https}">${tr("Off")}</button><button data-https="1" aria-pressed="${!!ui.https}">${tr("On")}</button></div></div>
     ${portsPref}
-    <p class="muted">${tr("Compose services answer at {addr}.", { addr: `<span class="mono">&lt;service&gt;.&lt;project&gt;.${ui.suffix}</span>` })} ${tr("Changing this needs admin rights (an administrator password), since it adds or removes {path}.", { path: `<span class="mono">/etc/resolver/kiri.local</span>` })}</p>
+    <p class="muted">${tr("Compose services answer at {addr}.", { addr: `<span class="mono">&lt;service&gt;.&lt;project&gt;.${ui.suffix}</span>` })} ${tr("Changing this needs admin rights (an administrator password), since it adds or removes {path}.", { path: `<span class="mono">/etc/resolver/kiribra.local</span>` })}</p>
   </div>`;
   const a = about;
   const mib = (b) => (b ? `${(b / 1073741824).toFixed(1)} GB` : "—");
@@ -4524,10 +4586,10 @@ function renderSettings() {
         <rect x="22" y="12" width="34" height="40" rx="10" fill="#E0B420"/><g clip-path="url(#lid2)"><rect x="10" y="0" width="60" height="21.5" fill="#F2CF5B"/></g>
         <g fill="#0F1419"><ellipse cx="41.5" cy="29" rx="3.1" ry="3.6"/><ellipse cx="50.5" cy="29" rx="3.1" ry="3.6"/></g></g>
         <g fill="currentColor" opacity=".55"><rect x="5" y="21.5" width="13" height="5" rx="2.5"/><rect x="1" y="32" width="15" height="5" rx="2.5"/><rect x="7" y="42.5" width="7" height="5" rx="2.5"/></g></svg>
-      <div><div class="n">Kiri <span class="devband">DEV</span></div><div class="muted">${tr("A small, fast container runtime.")}</div></div></div>
+      <div><div class="n">Kiribra <span class="devband">DEV</span></div><div class="muted">${tr("A small, fast container runtime.")}</div></div></div>
     ${aboutUpdate(a?.app)}
     <dl>
-      <dt>${tr("Engine")}</dt><dd>${a?.running ? `Kiri ${esc(a.engine)} · Docker API ${esc(a.api)}` : tr("Not running")}</dd>
+      <dt>${tr("Engine")}</dt><dd>${a?.running ? `Kiribra ${esc(a.engine)} · Docker API ${esc(a.api)}` : tr("Not running")}</dd>
       <dt>${tr(VM)}</dt><dd>${a?.running ? `${a.awake ? tr("Running") : tr("Asleep")} · ${tr("kernel {version}", { version: esc(a.kernel) })}` : "—"}</dd>
       <dt>${tr("CPUs")}</dt><dd>${esc(a?.cpus ?? "—")}</dd>
       <dt>${tr("Memory")}</dt><dd>${a?.running ? tr("up to {size}", { size: mib(a.memory) }) : "—"}</dd>
@@ -4535,8 +4597,8 @@ function renderSettings() {
       <dt>${tr("Made by")}</dt><dd><a data-open-site="https://canestack.com">Canestack Labs</a></dd>
     </dl>
     <p class="muted">${tr("The name comes from the Igbo word ntakịrị, “small”.")}</p></div>`;
-  const html = `<div class="settings"><div class="tabs">${tab("appearance", "textaa", tr("Appearance"))}${tab("resources", "stack", tr("Resources"))}${tab("network", "globe", tr("Network"))}${tab("builds", "hammer", tr("Builds"))}${loginsOn() ? tab("registries", "lock", tr("Registries")) : ""}${tab("kubernetes", "pods", "Kubernetes")}${tab("import", "stack", tr("Import"))}${tab("domains", "network", tr("Domains"))}${tab("diagnostics", "bug", tr("Diagnostics"))}${tab("about", "info", tr("About"))}</div>
-    ${prefs.tab === "diagnostics" ? diagPane() : prefs.tab === "about" ? aboutPane : prefs.tab === "domains" ? domainsPane : prefs.tab === "resources" ? `<div class="panes">${enginePane()}${resourcesPane()}</div>` : prefs.tab === "network" ? networkPane() : prefs.tab === "builds" ? buildsPane() : prefs.tab === "registries" && loginsOn() ? registriesPane() : prefs.tab === "kubernetes" ? kubernetesPane() : prefs.tab === "import" ? importPane() : appearance}</div>`;
+  const html = `<div class="settings"><div class="tabs">${tab("appearance", "textaa", tr("Appearance"))}${tab("resources", "stack", tr("Resources"))}${tab("network", "globe", tr("Network"))}${tab("builds", "hammer", tr("Builds"))}${loginsOn() ? tab("registries", "lock", tr("Registries")) : ""}${tab("kubernetes", "pods", "Kubernetes")}${tab("import", "stack", tr("Import"))}${tab("domains", "network", tr("Domains"))}${tab("webui", "open", tr("Web UI"))}${tab("diagnostics", "bug", tr("Diagnostics"))}${tab("about", "info", tr("About"))}</div>
+    ${prefs.tab === "diagnostics" ? diagPane() : prefs.tab === "about" ? aboutPane : prefs.tab === "domains" ? domainsPane : prefs.tab === "webui" ? webUiPane() : prefs.tab === "resources" ? `<div class="panes">${enginePane()}${resourcesPane()}</div>` : prefs.tab === "network" ? networkPane() : prefs.tab === "builds" ? buildsPane() : prefs.tab === "registries" && loginsOn() ? registriesPane() : prefs.tab === "kubernetes" ? kubernetesPane() : prefs.tab === "import" ? importPane() : appearance}</div>`;
   // The container lists arrive every few seconds; rebuilding an unchanged page
   // closes an open menu. The font menus list names in the interface font: an
   // option in its own font made WebKit load every installed font (438 here)
@@ -4573,6 +4635,12 @@ function renderSettings() {
   // A list left open over a page that's gone (another view) closes; over the page drawn again, it stays.
   if (langPopState.close) $("pref-lang-btn")?.setAttribute("aria-expanded", "true");
   $("pref-mono")?.addEventListener("change", (ev) => setPref("mono", ev.target.value));
+  $("webui-port")?.addEventListener("change", (ev) => {
+    const port = Math.max(1, Math.min(65535, +ev.target.value || 7676));
+    ui.webUiDraft = { ...(ui.webUiDraft || {}), port };
+    setPref("webUiPort", port);
+    if (ui.webui?.on) send("webuistart", { value: { lan: !!(ui.webUiDraft?.lan ?? ui.webui.lan), port } });
+  });
 }
 /* i18n */ void [tr("Blue"), tr("Purple"), tr("Orange"), tr("Teal"), tr("Pink"), tr("Green"), tr("Small"), tr("Medium"), tr("Large")];
 
@@ -4586,7 +4654,7 @@ function show(view) {
   if (view === "compose") { cmp.open = null; cmp.asked = 0; cmpAsk(); }
   if (view === "usb") usbPoll();
   if (view === "share") { send("shares"); send("shareusage"); shPoll(); }
-  if (view === "settings") { if (!fontLists.families.length) send("fonts"); send("about"); send("logins"); send("resources"); send("proxy"); send("routerports"); if (!ui.imp.sources) send("importsources"); if (prefs.tab === "diagnostics") diagOpen(); }
+  if (view === "settings") { if (!fontLists.families.length) send("fonts"); send("about"); send("logins"); send("resources"); send("proxy"); send("routerports"); send("webui"); if (!ui.imp.sources) send("importsources"); if (prefs.tab === "diagnostics") diagOpen(); }
   render();
   // From the top, as a container's or pod's page opens: leaving a page scrolled
   // down (a long Terminal or Logs tab) otherwise opened the next view below its rows.
@@ -4599,14 +4667,14 @@ const empty = {
   volumes: { title: "No volumes yet", body: "Named volumes from <code>docker volume create</code> or <code>-v name:/path</code> show up here.", art: "database" },
   networks: { title: "No networks yet", body: "Networks you create with <code>docker network create</code> show up here.", art: "network" },
   builds: { title: "No builds yet", body: "Builds you run with <code>docker build</code> show up here, with each step's time, cache and output.", art: "hammer" },
-  stopped: { title: "Kiri is not running", body: "Start it to run containers. It starts in a fraction of a second and sleeps when idle.", art: "cube" },
+  stopped: { title: "Kiribra is not running", body: "Start it to run containers. It starts in a fraction of a second and sleeps when idle.", art: "cube" },
 };
-/* i18n */ void [tr("No containers yet"), tr("Containers you start with <code>docker run</code> or Compose show up here, with the <code>{context}</code> context."), tr("No images yet"), tr("Images you pull or build show up here: <code>docker pull alpine</code>, or search above."), tr("No volumes yet"), tr("Named volumes from <code>docker volume create</code> or <code>-v name:/path</code> show up here."), tr("No networks yet"), tr("Networks you create with <code>docker network create</code> show up here."), tr("No builds yet"), tr("Builds you run with <code>docker build</code> show up here, with each step's time, cache and output."), tr("Kiri is not running"), tr("Start it to run containers. It starts in a fraction of a second and sleeps when idle.")];
+/* i18n */ void [tr("No containers yet"), tr("Containers you start with <code>docker run</code> or Compose show up here, with the <code>{context}</code> context."), tr("No images yet"), tr("Images you pull or build show up here: <code>docker pull alpine</code>, or search above."), tr("No volumes yet"), tr("Named volumes from <code>docker volume create</code> or <code>-v name:/path</code> show up here."), tr("No networks yet"), tr("Networks you create with <code>docker network create</code> show up here."), tr("No builds yet"), tr("Builds you run with <code>docker build</code> show up here, with each step's time, cache and output."), tr("Kiribra is not running"), tr("Start it to run containers. It starts in a fraction of a second and sleeps when idle.")];
 
 function renderEmpty(view) {
   const e = empty[view];
-  // Nothing here downloads anything: exploring an empty Kiri shouldn't pull an image.
-  const action = view === "stopped" ? `<button class="btn primary" id="empty-start">${tr("Start Kiri")}</button>` : "";
+  // Nothing here downloads anything: exploring an empty Kiribra shouldn't pull an image.
+  const action = view === "stopped" ? `<button class="btn primary" id="empty-start">${tr("Start Kiribra")}</button>` : "";
   $("content").innerHTML = `<div class="empty"><div><svg class="i art" viewBox="0 0 256 256"><path d="${PH[e.art]}"/></svg>
     <h3>${tr(e.title)}</h3><p>${tr(e.body, e.vars)}</p>${action}</div></div>`;
   $("empty-start")?.addEventListener("click", (ev) => { ev.currentTarget.disabled = true; powerEngine("start"); });
@@ -4661,7 +4729,7 @@ function rowSlot(keep) {
 
 // Resized columns. A table's widths are kept as shares of the room beside its last column (the
 // actions, which keep their pixel width), so they follow the window. Columns hidden at narrow
-// widths don't take a share while hidden. They're saved with the other settings in ~/.kiri/ui.json.
+// widths don't take a share while hidden. They're saved with the other settings in ~/.kiribra/ui.json.
 const widths = () => (prefs.columnWidths ||= {});
 function saveWidths() { send("setpref", { name: "columnWidths", value: widths() }); }
 // The boxes' column keeps its own width and isn't one of these.
@@ -4919,7 +4987,7 @@ function groupActed(project) {
 }
 
 // ---------- Compose: its own place under Docker ----------
-// A list of the projects that have run on Kiri (from their containers' labels; the
+// A list of the projects that have run on Kiribra (from their containers' labels; the
 // engine reads each file with docker compose config), each folding its services open
 // under it; a project's page has Structure (what depends on what), Services, its
 // Compose file (edit, then Apply: save, then docker compose up -d) and Logs.
@@ -4965,7 +5033,7 @@ function cmpCounts(p) {
   const cs = kept("compose").filter((c) => cmpOf(c) === p.name);
   return { all: cs.length, run: cs.filter((c) => c.State === "running").length };
 }
-// The services the page lists (Services tab): those with a container and those without; — when Kiri couldn't read the file.
+// The services the page lists (Services tab): those with a container and those without; — when Kiribra couldn't read the file.
 const cmpSvcCount = (p) => new Set([...ui.containers.filter((c) => cmpOf(c) === p.name).map((c) => c.Labels?.["com.docker.compose.service"]), ...cmpUnmade(p).map((s) => s.name)]).size || (p.error ? "—" : 0);
 function cmpPill(p) {
   const pill = (k, full) => `<span class="pill ${k}" title="${esc(full)}">${esc(full)}</span>`;
@@ -4984,7 +5052,7 @@ function cmpSvcPill(p, svc) {
   const word = state === "restarting" ? tr("Restarting") : c ? statusText(c) : m.status;
   return `<span class="pill ${esc(state)}${c ? exitClass(c) : ""}"${c && state !== "restarting" ? ` data-live="${esc(c.Id)}"` : ""} title="${esc(full)}">${esc(word)}</span>`;
 }
-// A project's warning (a file Kiri can't check with its secrets hidden): the project's page says it in full, its row in the list too.
+// A project's warning (a file Kiribra can't check with its secrets hidden): the project's page says it in full, its row in the list too.
 // A secret used in a container name or image (namewarn) says so too, with the other warning or alone.
 const cmpWarns = (p) => [p.warn && !p.error ? cmpErr({ ...p.warn, error: p.warn.text }) : "", cmpNameWarn(p), p.namefolder ? cmpErr({ ...p.namefolder, error: p.namefolder.text }) : ""].filter(Boolean);
 const cmpNameWarn = (p) => p.namewarn ? cmpErr({ ...p.namewarn, error: p.namewarn.text }) : "";
@@ -5007,7 +5075,7 @@ function cmpAsk() {
   // A later list that takes a while: a small spinner by the title till it comes (the first has its own, in the page).
   if (cmp.list && !cmp.waitT) cmp.waitT = setTimeout(() => cmpHWait(true), 600);
 }
-// Compose's spinner: Kiri's own (sh-spin), with its word (Loading…) unless `quiet`.
+// Compose's spinner: Kiribra's own (sh-spin), with its word (Loading…) unless `quiet`.
 const cmpSpin = (quiet = false) => `<span class="cmp-wait" role="status" aria-label="${tr("Loading…")}"><i class="sh-spin"></i>${quiet ? "" : `<span>${tr("Loading…")}</span>`}</span>`;
 function cmpHWait(on) {
   if (!on) { clearTimeout(cmp.waitT); cmp.waitT = 0; }
@@ -5051,7 +5119,7 @@ function cmpSvcRow(p, s, member) {
         ${btn("⋯", `data-smore="${pe}" data-svc="${se}" aria-label="${tr("More actions for {name}", { name: se })}" aria-haspopup="menu"`, "more")}
       </div></td></tr>`;
 }
-// A project's notices: what Compose rejects, what Kiri can't check, a secret in a name, the folder's name, and by name (ⓘ).
+// A project's notices: what Compose rejects, what Kiribra can't check, a secret in a name, the folder's name, and by name (ⓘ).
 // Each with its line in the file, when it has one.
 const CMP_INFILE = new Set(["reqUnset", "rejectReal", "yamlLine", "yamlIn", "yamlInc", "hiddenCheck", "nameSecret", "nameFolder"]);
 function cmpNotes(p) {
@@ -5078,7 +5146,7 @@ function renderCompose() {
   if (cmp.open && !cmpProject(cmp.open)) { cmp.open = null; renderHead(); }
   if (cmp.open) return renderComposePage();
   const projects = cmp.list.projects || [];
-  if (!kept("compose").length && !projects.length) return setHTML($("content"), `<div class="empty"><h3>${tr("No Compose projects yet")}</h3><p>${tr("Projects you start with {cmd} show up here once they have run on Kiri.", { cmd: "<code>docker compose up</code>" })}</p></div>`);
+  if (!kept("compose").length && !projects.length) return setHTML($("content"), `<div class="empty"><h3>${tr("No Compose projects yet")}</h3><p>${tr("Projects you start with {cmd} show up here once they have run on Kiribra.", { cmd: "<code>docker compose up</code>" })}</p></div>`);
   // The containers as Containers sorts them; a project sits where its first one lands.
   const items = sortBy(listed("compose"), "compose", CONTAINER_SORT), all = tabOf("compose") === "all";
   // Under All only, as the tabs count containers: services with no container, and projects with none (after the rest).
@@ -5103,8 +5171,8 @@ function renderCompose() {
 }
 
 // The engine's words when a project's file is gone, or isn't one it will read: plain, and what still works.
-const CMP_NO_FILE = "Kiri can't find this project's compose file";
-const cmpNoFile = (e) => e === CMP_NO_FILE ? `${tr("Kiri can't find this project's compose file.")} ${tr("Its logs, Start, Stop and Remove still work.")}` : tr("The compose file isn't on this computer: {error}", { error: esc(e) });
+const CMP_NO_FILE = "Kiribra can't find this project's compose file";
+const cmpNoFile = (e) => e === CMP_NO_FILE ? `${tr("Kiribra can't find this project's compose file.")} ${tr("Its logs, Start, Stop and Remove still work.")}` : tr("The compose file isn't on this computer: {error}", { error: esc(e) });
 const CMP_TABS = [["structure", "Structure"], ["services", "Services"], ["file", "Compose file"], ["logs", "Logs"]];
 /* i18n */ void [tr("Structure"), tr("Services"), tr("Compose file"), tr("Logs")];
 const cmpDirty = () => cmp.file && cmp.draft != null && cmp.draft !== cmp.file.text;
@@ -5138,7 +5206,7 @@ function renderComposePage() {
   // A file read since that found it: the list's "can't find" is stale.
   // By name, the file's tab says it where the plan would be: not twice.
   const pw = cmpWarns(p).filter((w) => !(p.byname && cmp.tab === "file" && w === CMP_ERR.byName()));
-  const warn = p.error && !(p.error === CMP_NO_FILE && cmp.file && (!cmp.file.error || cmp.tab === "file")) ? `<p class="warn">${p.error === CMP_NO_FILE ? cmpNoFile(p.error) : tr("Kiri can't read the compose file: {error}", { error: esc(p.error) })}</p>${pw.map((w) => `<p class="warn">${esc(w)}</p>`).join("")}` : pw.map((w) => `<p class="warn">${esc(w)}</p>`).join("");
+  const warn = p.error && !(p.error === CMP_NO_FILE && cmp.file && (!cmp.file.error || cmp.tab === "file")) ? `<p class="warn">${p.error === CMP_NO_FILE ? cmpNoFile(p.error) : tr("Kiribra can't read the compose file: {error}", { error: esc(p.error) })}</p>${pw.map((w) => `<p class="warn">${esc(w)}</p>`).join("")}` : pw.map((w) => `<p class="warn">${esc(w)}</p>`).join("");
   // The file's tab keeps its editor while the lists refresh: only the head, actions and warning change.
   if (cmp.key === key && $("cmp-tab")) {
     morph($("cmp-head"), head); morph($("cmp-tabs"), `${tabs}<span class="spacer"></span><span class="dacts" id="cmp-acts">${cmpActs()}</span>`); setHTML($("cmp-warn"), warn);
@@ -5359,7 +5427,7 @@ function cmpDraw() {
   st.title = st.textContent;
   const cf = $("cmp-conflict");
   if (cf) cf.innerHTML = cmp.gone ? `<div class="cmp-conflict" role="alert"><b>${tr("The compose file is gone from its folder.")}</b> ${tr("Your edits stay here. Apply waits until the file is back.")}</div>`
-    : cmp.conflict ? `<div class="cmp-conflict" role="alert"><b>${cmp.conflict.back ? tr("The compose file is back, and differs from your edits.") : tr("The file changed outside Kiri.")}</b><span class="spacer"></span>${btn(tr("Reload (lose your edits)"), "data-cmpreload")}${btn(tr("Keep editing"), "data-cmpkeep")}${cmp.conflict.hash ? btn(tr("Overwrite their changes"), "data-cmpoverwrite", "danger") : ""}</div>` : "";
+    : cmp.conflict ? `<div class="cmp-conflict" role="alert"><b>${cmp.conflict.back ? tr("The compose file is back, and differs from your edits.") : tr("The file changed outside Kiribra.")}</b><span class="spacer"></span>${btn(tr("Reload (lose your edits)"), "data-cmpreload")}${btn(tr("Keep editing"), "data-cmpkeep")}${cmp.conflict.hash ? btn(tr("Overwrite their changes"), "data-cmpoverwrite", "danger") : ""}</div>` : "";
   // The outline: each service, marked new, changed or broken; a click goes to its line.
   const lines = cmpLines(ta.value), acts = new Map(); ((d || cmpFresh() || un || pend) && cmp.plan?.steps || []).forEach((s) => acts.set(s.n, s.act));
   const badSvc = bad ? [...lines].filter(([, l]) => l <= bad).pop()?.[0] : null;
@@ -5383,7 +5451,7 @@ function cmpPlanSoon() {
 }
 // Where Apply is with a service, from Compose's progress.
 const cmpStep = (st) => ({ pulling: tr("Pulling"), pulled: tr("Pulled"), building: tr("Building"), built: tr("Building"), recreating: tr("Recreating…"), creating: tr("Creating…"), created: tr("Starting…"), starting: tr("Starting…"), started: tr("Started"), removing: tr("Removing…"), removed: tr("Done") })[st] || st;
-const cmpWhat = (w) => ({ image: tr("image"), ports: tr("ports"), environment: tr("environment"), volumes: tr("volumes"), depends_on: tr("depends on"), build: tr("build"), settings: tr("settings"), outside: tr("the file changed outside Kiri"), vars: tr("a variable it uses changed"), pulled: tr("a newer image") })[w] || w;
+const cmpWhat = (w) => ({ image: tr("image"), ports: tr("ports"), environment: tr("environment"), volumes: tr("volumes"), depends_on: tr("depends on"), build: tr("build"), settings: tr("settings"), outside: tr("the file changed outside Kiribra"), vars: tr("a variable it uses changed"), pulled: tr("a newer image") })[w] || w;
 function cmpPlanDraw() {
   const el = $("cmp-plan"); if (!el) return;
   // Managed by name: no plan, only why, where the plan would be.
@@ -5392,12 +5460,12 @@ function cmpPlanDraw() {
   const steps = pl?.steps || [], n = (a) => steps.filter((s) => s.act === a).length;
   const sum = [n("add") && `<span class="chipsum a-add">${tr("{n} new", { n: n("add") })}</span>`, n("chg") && `<span class="chipsum a-chg">${tr("{n} recreated", { n: n("chg") })}</span>`, n("rm") && `<span class="chipsum a-rm">${tr("{n} removed", { n: n("rm") })}</span>`, `<span class="muted">${tr("{n} unchanged", { n: n("same") })}</span>`].filter(Boolean).join(" ");
   const label = { add: tr("Create"), chg: tr("Recreate"), start: tr("Start"), rm: tr("Remove"), same: tr("Unchanged") }, mark = { add: "+", chg: "↻", start: "▸", rm: "−", same: "✓" };
-  const why = (s) => s.hidden ? tr("Kiri can't show this service's details with its secrets hidden") : s.act === "add" ? (s.to ? tr("New service from {image}.", { image: `<span class="mono">${esc(s.to)}</span>` }) : tr("New service, built from its folder."))
+  const why = (s) => s.hidden ? tr("Kiribra can't show this service's details with its secrets hidden") : s.act === "add" ? (s.to ? tr("New service from {image}.", { image: `<span class="mono">${esc(s.to)}</span>` }) : tr("New service, built from its folder."))
     : s.act === "rm" ? tr("Not in the file any more: stopped and removed. Its volumes stay.")
     : s.act === "chg" ? s.what.map((w) => w === "image" ? `${tr("image")} <del class="mono">${esc(s.from)}</del> → <ins class="mono">${esc(s.to)}</ins>` : cmpWhat(w)).join(" · ") : "";
   const same = steps.filter((s) => s.act === "same"), shown = same.length > 3 ? [...steps.filter((s) => s.act !== "same"), { n: tr("{n} more", { n: same.length }), act: "same", what: [], more: same.map((s) => s.n).join(", ") }] : steps;
-  // With a secret hidden Kiri has no plan to show: it says so, not "0 unchanged".
-  const blind = pl?.warn?.errkey === "hiddenCheck" && !steps.length ? tr("Kiri can't show the plan with {name} hidden. {apply} will run docker compose up.", { name: pl.warn.errargs?.name || "", apply: tr("Apply") })
+  // With a secret hidden Kiribra has no plan to show: it says so, not "0 unchanged".
+  const blind = pl?.warn?.errkey === "hiddenCheck" && !steps.length ? tr("Kiribra can't show the plan with {name} hidden. {apply} will run docker compose up.", { name: pl.warn.errargs?.name || "", apply: tr("Apply") })
  : "";
   const wait = cmp.planWait === cmp.seq && cmp.plan?.seq !== cmp.seq ? cmpSpin() : "";
   el.innerHTML = `<h4>${tr("What Apply does")}</h4>${wait ? `<p class="lede">${wait}</p>` : ""}<p class="lede">${!d ? tr("Nothing yet: the file matches what's running. Change it and this lists what happens to each service.") : pl?.error ? tr("Fix the file first.") : blind ? esc(blind) : pl ? sum : tr("Loading…")}</p>
@@ -5429,39 +5497,39 @@ function cmpApply() {
   send("composeapply", { name: cmp.open, value: { text: cmp.draft, base: cmp.file.hash, mtime: cmp.file.mtime } });
   cmpDraw(); render();
 }
-// Kiri's own errors come with a key and its values (errkey, errargs): said in the window's language.
+// Kiribra's own errors come with a key and its values (errkey, errargs): said in the window's language.
 // Compose's and Docker's own words come as they are.
 const CMP_ERR = {
-  noProject: (a) => tr("There's no Compose project {name} on Kiri", a),
+  noProject: (a) => tr("There's no Compose project {name} on Kiribra", a),
   notCompose: () => tr("Pick a .yaml or .yml compose file"),
   notComposeFile: () => tr("This file isn't a compose file: it has no services"),
   nameClash: (a) => tr("A project named {name} already runs from {dir}. Open that one, or give this file its own name: line.", a),
-  changedSinceApply: () => tr("The file changed outside Kiri since Apply saved it"),
-  nothingToRestore: () => tr("Kiri has nothing to put back"),
-  changed: () => tr("The file changed outside Kiri"),
+  changedSinceApply: () => tr("The file changed outside Kiribra since Apply saved it"),
+  nothingToRestore: () => tr("Kiribra has nothing to put back"),
+  changed: () => tr("The file changed outside Kiribra"),
   cancelled: () => tr("Apply cancelled"),
   busy: (a) => tr("{name} is already being applied. Wait for it to finish, or cancel it.", a),
-  readOnly: () => tr("The compose file is read-only, so Kiri can't save it. Make it writable, then Apply again."),
+  readOnly: () => tr("The compose file is read-only, so Kiribra can't save it. Make it writable, then Apply again."),
   cantRun: (a) => tr("Couldn't run docker compose: {error}", a),
   slow: (a) => tr("docker compose took longer than {secs} seconds", a),
   cantSave: (a) => tr("Couldn't save the compose file: {error}", a),
   badEnv: (a) => tr("Couldn't read env file {file}: it isn't a local regular file", a),
   upFailed: () => tr("docker compose up failed"),
   upStopped: () => tr("docker compose up stopped"),
-  noState: () => tr("Kiri has no state folder"),
-  noCli: () => tr("Kiri can't find the docker CLI. Restart Kiri to set it up again."),
-  noAction: () => tr("Kiri doesn't know that action"),
-  noFile: () => tr("Kiri can't find this project's compose file."),
+  noState: () => tr("Kiribra has no state folder"),
+  noCli: () => tr("Kiribra can't find the docker CLI. Restart Kiribra to set it up again."),
+  noAction: () => tr("Kiribra doesn't know that action"),
+  noFile: () => tr("Kiribra can't find this project's compose file."),
   badImage: (a) => tr("The image name from {name} isn't valid", a),
-  byName: () => tr("Kiri can't check this file's variables, so it manages this project by name. Apply changes from a terminal."),
+  byName: () => tr("Kiribra can't check this file's variables, so it manages this project by name. Apply changes from a terminal."),
   namesShown: () => tr("Names Docker shows may contain secret values."),
   reqUnset: (a) => tr("Compose rejects this file. A required variable may not be set: {name}.", a),
-  rejectReal: () => tr("Compose rejects this file with its real values. Kiri can't show why with secrets hidden."),
+  rejectReal: () => tr("Compose rejects this file with its real values. Kiribra can't show why with secrets hidden."),
   yamlLine: (a) => tr("Compose rejects this file: YAML error on line {n}", a),
   yamlInc: (a) => tr("Compose rejects this file: YAML error in an included file, line {n}", a),
   yamlIn: (a) => tr("Compose rejects this file: YAML error in {file}, line {n}", a),
-  nameFolder: (a) => tr("This file's name uses {vars}. Kiri uses the folder's name, {name}, so it never puts a secret in a name.", a),
-  hiddenCheck: (a) => tr("Kiri can't check this file with {name} hidden. Compose accepts it, so Apply still works.", a),
+  nameFolder: (a) => tr("This file's name uses {vars}. Kiribra uses the folder's name, {name}, so it never puts a secret in a name.", a),
+  hiddenCheck: (a) => tr("Kiribra can't check this file with {name} hidden. Compose accepts it, so Apply still works.", a),
   nameSecret: (a) => { const ns = Array.isArray(a.names) && a.names.length ? a.names : [a.name || ""]; return trn(ns.length, "{name} is used in a name or folder path. Docker shows those in plain text.", "{name} are used in a name or folder path. Docker shows those in plain text.", { name: cmpList(ns) }); },
 };
 // "A, B and C" in the window's language.
@@ -5536,7 +5604,7 @@ function cmpEvent(e) {
       const svcs = e.failed.map((f) => f.svc), list = svcs.length > 1 ? `${svcs.slice(0, -1).join(", ")}${tr(" and ")}${svcs[svcs.length - 1]}` : svcs[0];
       toast("error", trn(svcs.length, "Applied {name}, but {svc} stopped", "Applied {name}, but {svcs} stopped", { name: e.name, svc: svcs[0], svcs: list }));
     } else if (e.ok) toast("ok", tr("Applied {name}", { name: e.name }));
-    // Changed outside Kiri (Keep editing doesn't change that): the banner again, nothing written.
+    // Changed outside Kiribra (Keep editing doesn't change that): the banner again, nothing written.
     else if (e.conflict) { cmp.kept = null; cmp.conflict = { pending: true, hash: e.hash }; send("composefile", { name: e.name }); }
     else if (e.cancelled) toast("ok", e.changed?.length ? trn(e.changed.length, "Apply cancelled. {svc} had already changed; the rest were not changed.", "Apply cancelled. {n} services had already changed; the rest were not changed.", { svc: e.changed[0] }) : tr("Apply cancelled. No service was changed."));
     else if (e.saved) toast("error", tr("Saved {name}, not applied: {error}", { name: e.name, error: e.error || "" }));
@@ -5578,7 +5646,7 @@ function composeClick(t) {
   }
   else if (t("[data-cmprestore]")) send("composerestore", { name: cmp.open });
   else if (t("[data-cmpcancel]")) send("composecancel", { name: cmp.open });
-  // The file changed outside Kiri: take it (losing the edits), or keep the edits over it.
+  // The file changed outside Kiribra: take it (losing the edits), or keep the edits over it.
   // Reload: the outside version. Clicked before it has come (Apply's answer says only that it changed): ask for it, and show it once it's here.
   else if (t("[data-cmpreload]")) {
     if (typeof cmp.conflict?.text === "string") { cmp.file = cmp.conflict; cmp.draft = cmp.conflict.text; }
@@ -5590,7 +5658,7 @@ function composeClick(t) {
   // Only this (or Reload) writes over an outside edit; Apply still checks it's that one.
   else if (t("[data-cmpoverwrite]")) {
     const theirs = cmp.conflict?.hash; if (!theirs) return true;
-    confirmRemove(tr("Overwrite their changes?"), tr("The file changed outside Kiri. Apply writes your edits over it, and those changes are lost."), tr("Overwrite"), () => {
+    confirmRemove(tr("Overwrite their changes?"), tr("The file changed outside Kiribra. Apply writes your edits over it, and those changes are lost."), tr("Overwrite"), () => {
       cmp.file = { ...cmp.file, hash: theirs }; cmp.conflict = null; cmp.kept = null; cmpApply();
     });
   }
@@ -5622,7 +5690,7 @@ function containerRow(c, member = false, o = {}) {
     const starting = !up && ui.starting.has(c.Id), enter = up && ui.starting.delete(c.Id) ? "enter" : "", roll = (a) => (ui.acting.get(c.Id)?.action === a ? " rolling" : "");
     const more = `${o.remove === false ? " data-noremove" : ""}${o.file ? ` data-mfile="${esc(project || "")}" data-svc="${esc(c.Labels?.["com.docker.compose.service"] || "")}"` : ""}`;
     return `<tr class="row${member ? " member" : ""}${chosen(v, c)}" data-rowopen="detail" data-key="${c.Id}"${pickAt(v, c)}>
-      ${pickCell(v, c)}<td><div class="name" data-detail="${c.Id}">${member ? `<span class="tree${member === "last" ? " last" : ""}" aria-hidden="true"></span>` : ""}<div class="tile-wrap">${tile(c.icon, "cube")}${reach ? `<span class="kbadge" title="${tr("Reachable at {addr}", { addr: esc(domain) })}">${KDOT}</span>` : ""}</div><div title="${esc(name)}"><span class="link">${esc(name)}</span>${isKiriK8s(c) ? `<span class="k8s-mark" title="${tr("Kiri's Kubernetes cluster")}" aria-label="Kubernetes"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="${K8S_LOGO}"/></svg></span>` : ""}${reach ? `<div class="sub-name"><button class="sub-addr" data-open="${esc(domain)}" title="${tr("Open {addr}", { addr: esc(domain) })}">${esc(domain.replace(/^https?:\/\//, ""))}</button></div>` : `<div class="sub-name" title="${esc(c.Image)}">${esc(refLabel(c.Image))}</div>`}</div></div></td>
+      ${pickCell(v, c)}<td><div class="name" data-detail="${c.Id}">${member ? `<span class="tree${member === "last" ? " last" : ""}" aria-hidden="true"></span>` : ""}<div class="tile-wrap">${tile(c.icon, "cube")}${reach ? `<span class="kbadge" title="${tr("Reachable at {addr}", { addr: esc(domain) })}">${KDOT}</span>` : ""}</div><div title="${esc(name)}"><span class="link">${esc(name)}</span>${isKiriK8s(c) ? `<span class="k8s-mark" title="${tr("Kiribra's Kubernetes cluster")}" aria-label="Kubernetes"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="${K8S_LOGO}"/></svg></span>` : ""}${reach ? `<div class="sub-name"><button class="sub-addr" data-open="${esc(domain)}" title="${tr("Open {addr}", { addr: esc(domain) })}">${esc(domain.replace(/^https?:\/\//, ""))}</button></div>` : `<div class="sub-name" title="${esc(c.Image)}">${esc(refLabel(c.Image))}</div>`}</div></div></td>
       <td class="clip col-state">${statusPill(c)}</td>
       <td class="num nowrap">${ports(c, 1) || '<span class="muted">—</span>'}</td>
       ${shareOn() ? `<td class="col-share">${shareCell(c, name)}</td>` : ""}
@@ -5747,7 +5815,7 @@ function imageSize(c) {
 }
 
 /* The environment editor, in place of the list on the container's page.
-   Docker can't change a container's environment; Kiri's engine can: it
+   Docker can't change a container's environment; Kiribra's engine can: it
    keeps the container and its files, and restarts it if it's running. */
 const envSplit = (e) => { const i = e.indexOf("="); return i < 0 ? [e, ""] : [e.slice(0, i), e.slice(i + 1)]; };
 function envOpen() {
@@ -6011,9 +6079,9 @@ function containerAction(action, id) {
   }
   const c = ui.containers.find((x) => x.Id === id), name = c ? cname(c) : short(id);
   const act = () => { if (action !== "start") ctrActing(action, id); send("container", { action, id }); };
-  // kiri-k8s is Kiri's Kubernetes: stopping or removing it turns Kubernetes off.
-  if (isKiriK8s(c) && action === "stop") return confirmRemove(tr("Stop Kubernetes?"), tr("{k8s} is Kiri's Kubernetes cluster. Stopping it turns Kubernetes off, and its pods stop until it starts again.", { k8s: "<span class=\"mono\">kiri-k8s</span>" }), tr("Stop"), act);
-  if (isKiriK8s(c) && action === "remove") return confirmRemove(tr("Remove Kubernetes' container?"), tr("{k8s} is Kiri's Kubernetes cluster. Removing it turns Kubernetes off. The cluster's data stays in the {k8s} volume; Delete cluster in Settings → Kubernetes removes everything.", { k8s: "<span class=\"mono\">kiri-k8s</span>" }), tr("Remove"), act);
+  // kiri-k8s is Kiribra's Kubernetes: stopping or removing it turns Kubernetes off.
+  if (isKiriK8s(c) && action === "stop") return confirmRemove(tr("Stop Kubernetes?"), tr("{k8s} is Kiribra's Kubernetes cluster. Stopping it turns Kubernetes off, and its pods stop until it starts again.", { k8s: "<span class=\"mono\">kiri-k8s</span>" }), tr("Stop"), act);
+  if (isKiriK8s(c) && action === "remove") return confirmRemove(tr("Remove Kubernetes' container?"), tr("{k8s} is Kiribra's Kubernetes cluster. Removing it turns Kubernetes off. The cluster's data stays in the {k8s} volume; Delete cluster in Settings → Kubernetes removes everything.", { k8s: "<span class=\"mono\">kiri-k8s</span>" }), tr("Remove"), act);
   if (action !== "remove") return act();
   const up = c && (c.State === "running" || c.State === "paused");
   confirmRemove(tr("Remove {name}?", { name: esc(name) }), up ? tr("It's stopped and deleted, with its files and unnamed volumes. Named volumes stay.") : tr("It's deleted, with its files and unnamed volumes. Named volumes stay."), tr("Remove"), act);
@@ -6082,7 +6150,7 @@ function renderImages() {
   table([[tr("Repository"), "", "repo", { share: 3 }], [tr("Tag"), "", "tag", { share: 1.2 }], [tr("Used by"), "", "used", { share: 1.4 }], ["ID", "col-id", "id", { share: 1 }], [tr("Size"), "r", "size", { share: 0.8 }], [tr("Created"), "col-created", "created", { share: 1 }], [tr("Pulled"), "", "pulled", { share: 1 }]], rows, "images");
 }
 
-// An image's page: Images › name, with its layers and settings read from Kiri's store.
+// An image's page: Images › name, with its layers and settings read from Kiribra's store.
 function openImage(name) {
   ui.imgd = { name, layers: null };
   send("imagelayers", { name });
@@ -6120,16 +6188,16 @@ function renderVolumes() {
     <td class="actions"><div class="acts-row">${ibtn("trash", tr("Remove"), `data-rmvol="${esc(v.Name)}"`, "danger")}</div></td></tr>`), "volumes");
 }
 
-/* USB: the computer's USB devices, and which are in Kiri. On a Mac a device is
+/* USB: the computer's USB devices, and which are in Kiribra. On a Mac a device is
    passed through to the VM (Attach; the first one asks for the password, to
-   install Kiri's USB helper); on Windows, WSL takes it through usbipd-win (one
+   install Kiribra's USB helper); on Windows, WSL takes it through usbipd-win (one
    Windows prompt per device, the first time); on Linux containers already see
    every device, so each row says where to find it. */
 ui.usb = { items: null, busy: new Map(), note: "", can: "", error: "", missing: false, timer: 0, open: "", opening: "", tab: "run" };
-const usbState = (s) => ({ kiri: [tr("In Kiri"), "running"], waiting: [tr("Waiting to come back"), "paused"], host: [WIN ? tr("On this PC") : tr("On this Mac"), ""], shared: [tr("Containers see it"), "running"] })[s];
+const usbState = (s) => ({ kiri: [tr("In Kiribra"), "running"], waiting: [tr("Waiting to come back"), "paused"], host: [WIN ? tr("On this PC") : tr("On this Mac"), ""], shared: [tr("Containers see it"), "running"] })[s];
 /* Each device's icon: its kind as the engine read it from the device's
    interfaces, or, where it can't (Windows), from its name and vendor. A
-   kind once known stays with the device: one in Kiri hides its interfaces. */
+   kind once known stays with the device: one in Kiribra hides its interfaces. */
 const USB_ICON = { mouse: "mouse", keyboard: "keyboard", network: "ethernet", serial: "circuitry", radio: "broadcast", storage: "harddrive", audio: "microphone", camera: "webcam" };
 const usbKinds = new Map();
 function usbKind(d) {
@@ -6175,7 +6243,7 @@ function usbAct(act, key) {
 }
 function usbSubtitle() {
   const xs = ui.usb.items || [], n = xs.filter((d) => d.state === "kiri").length;
-  return xs.length ? `${n ? `${tr("{n} in Kiri", { n })} · ` : ""}${trn(xs.length, "{n} device", "{n} devices")}` : "";
+  return xs.length ? `${n ? `${tr("{n} in Kiribra", { n })} · ` : ""}${trn(xs.length, "{n} device", "{n} devices")}` : "";
 }
 /* While USB is in beta: what works, and where to say how it went. Closed, it stays closed. */
 const usbBanner = () => prefs.usbBetaClosed ? "" : `<div class="usb-beta" role="note"><svg class="i" viewBox="0 0 256 256" aria-hidden="true"><path d="${PH.usb}"/></svg>
@@ -6193,7 +6261,7 @@ function renderUsbBody() {
   if (u.items === null) { c.innerHTML = art(tr("Looking for USB devices…"), ""); return; }
   if (u.missing) {
     const busy = u.busy.get("install");
-    c.innerHTML = art(tr("USB needs usbipd-win"), tr("Windows hands USB devices to WSL, where Kiri's containers run, through usbipd-win, Microsoft's recommended tool."),
+    c.innerHTML = art(tr("USB needs usbipd-win"), tr("Windows hands USB devices to WSL, where Kiribra's containers run, through usbipd-win, Microsoft's recommended tool."),
       `<button class="btn primary" data-usbgo="install"${busy ? " disabled" : ""}>${busy || tr("Install usbipd-win")}</button>`);
     return;
   }
@@ -6206,9 +6274,9 @@ function renderUsbBody() {
     const busy = u.busy.get(d.key);
     if (busy) return `<button class="btn sm usb-busy" disabled aria-busy="true"><span class="spin" aria-hidden="true"></span>${busy}</button>`;
     if (u.can !== "attach") return d.path ? copyBtn(`--device ${d.path}`, "docker flag") : "";
-    if (d.state === "waiting") return `<button class="btn sm" data-usbgo="detach" data-key="${esc(d.key)}" title="${tr("Kiri attaches it again when it's back. Stop waiting to leave it on this computer.")}">${tr("Stop waiting")}</button>`;
+    if (d.state === "waiting") return `<button class="btn sm" data-usbgo="detach" data-key="${esc(d.key)}" title="${tr("Kiribra attaches it again when it's back. Stop waiting to leave it on this computer.")}">${tr("Stop waiting")}</button>`;
     return d.state === "kiri" ? `<button class="btn sm" data-usbgo="detach" data-key="${esc(d.key)}" title="${tr("Give it back to this computer")}"><svg class="i" viewBox="0 0 256 256" aria-hidden="true"><path d="${PH.eject}"/></svg>${tr("Detach")}</button>`
-      : `<button class="btn sm primary" data-usbgo="attach" data-key="${esc(d.key)}" title="${tr("Hand it to Kiri's containers")}"><svg class="i" viewBox="0 0 256 256" aria-hidden="true"><path d="${PH.plug}"/></svg>${tr("Attach")}</button>`;
+      : `<button class="btn sm primary" data-usbgo="attach" data-key="${esc(d.key)}" title="${tr("Hand it to Kiribra's containers")}"><svg class="i" viewBox="0 0 256 256" aria-hidden="true"><path d="${PH.plug}"/></svg>${tr("Attach")}</button>`;
   };
   table([[tr("Device")], ["ID"], [tr("Speed")], [tr("State")], [tr("Attached")]], items.map((d) => {
     const [word, cls] = usbState(d.state) || [d.state, ""];
@@ -6230,8 +6298,8 @@ const USB_SPEED = { low: "USB 1.0 · 1.5 Mbps", full: "USB 1.1 · 12 Mbps", high
 function usbMore(d) {
   const kind = usbKind(d);
   const type = { mouse: tr("Mouse"), keyboard: tr("Keyboard"), network: tr("Network"), serial: tr("Serial"), radio: tr("Radio"), storage: tr("Storage"), audio: tr("Audio"), camera: tr("Camera") }[kind] || tr("USB device");
-  const warn = d.state === "kiri" && (kind === "mouse" || kind === "keyboard") ? tr("This computer can't use it while it's in Kiri: detach it to get it back.")
-    : kind === "audio" || kind === "camera" ? tr("Kiri can't pass sound or video through yet: containers won't get anything from it.") : "";
+  const warn = d.state === "kiri" && (kind === "mouse" || kind === "keyboard") ? tr("This computer can't use it while it's in Kiribra: detach it to get it back.")
+    : kind === "audio" || kind === "camera" ? tr("Kiribra can't pass sound or video through yet: containers won't get anything from it.") : "";
   const mono = (v) => `<span class="mono">${esc(v)}</span>`;
   const facts = [
     [tr("Manufacturer"), d.maker && esc(d.maker)],
@@ -6257,7 +6325,7 @@ function usbUse(d, kind) {
   const paths = (d.paths || []).filter((p) => p && p.path);
   const head = `<div class="h4">${tr("In a container")}</div>`;
   if (d.state === "host") return `${head}<p class="usb-note">${tr("Attach it to see where it shows up in Linux.")}</p>`;
-  if (d.state === "waiting") return `${head}<p class="usb-note">${tr("Kiri attaches it again when it's back. Stop waiting to leave it on this computer.")}</p>`;
+  if (d.state === "waiting") return `${head}<p class="usb-note">${tr("Kiribra attaches it again when it's back. Stop waiting to leave it on this computer.")}</p>`;
   if (kind === "audio" || kind === "camera") return `${head}<p class="usb-note">${tr("Nothing to pass to a container yet.")}</p>${usbPaths(paths)}`;
   const dev = paths.find((p) => p.path.startsWith("/dev/"))?.path || d.path;
   if (!dev) return `${head}<p class="usb-note">${paths.length ? tr("It's a network interface inside Linux, not a device file.") : tr("Linux hasn't made a device for it yet.")}</p>${usbPaths(paths)}`;
@@ -6432,7 +6500,7 @@ function layersView(L, plat, words) {
     </div>`;
 }
 
-// Security: the image a build made, scanned with Grype once it's in Kiri.
+// Security: the image a build made, scanned with Grype once it's in Kiribra.
 function blSecurity() {
   const L = ui.bl.layers;
   if (!L) return `<div class="bl-loading muted">${tr("Reading the image…")}</div>`;
@@ -6440,11 +6508,11 @@ function blSecurity() {
   if (!L.images?.length) return `<p class="bl-none">${tr("This build made no image to scan: it failed before exporting, or its output was the cache only.")}</p>`;
   const im = L.images.find((i) => i.platform === ui.bl.plat) || L.images[0];
   const img = ui.images.find((i) => i.Id === im.config_digest);
-  if (!img) return `<p class="bl-none">${tr("This build's image isn't in Kiri, so there's nothing here to scan. It was pushed or exported elsewhere, or removed since. Build it with <code>--load</code> to scan it here.")}</p>`;
+  if (!img) return `<p class="bl-none">${tr("This build's image isn't in Kiribra, so there's nothing here to scan. It was pushed or exported elsewhere, or removed since. Build it with <code>--load</code> to scan it here.")}</p>`;
   return scanView(img, { own: tr("this build") });
 }
 
-/* Scanning: Grype, run on the Mac against Kiri's store. One image's scan,
+/* Scanning: Grype, run on the Mac against Kiribra's store. One image's scan,
    keyed by its ID; the same view for a build and for an image's page. */
 const SEVS = ["Critical", "High", "Medium", "Low", "Negligible", "Unknown"];
 const sevKey = (s) => (SEVS.includes(s) ? s : "Unknown").toLowerCase();
@@ -6467,7 +6535,7 @@ function scanView(img, words) {
     const pct = st.phase === "scanner" ? st.pct : null;
     return `<div class="sc-run"><div class="sc-runline"><span class="sc-spin" aria-hidden="true"></span><b>${SCAN_PHASE[st.phase] ? tr(SCAN_PHASE[st.phase]) : tr("Starting the scan")}</b><span class="spacer"></span>${poweredBy()}</div>
       ${pct != null ? `<div class="pprog"><div class="pbar"><span style="width:${pct}%"></span></div><span class="num">${pct}%</span></div>` : `<div class="stripe"></div>`}
-      <p class="muted">${tr("Kiri runs Grype here on your Mac against the image in Kiri's store. The image isn't uploaded anywhere.")}</p></div>`;
+      <p class="muted">${tr("Kiribra runs Grype here on your Mac against the image in Kiribra's store. The image isn't uploaded anywhere.")}</p></div>`;
   }
   if (st.open != null) {
     if (st.result?.scanned !== st.open) return `<div class="bl-loading muted">${tr("Opening the scan…")}</div>`;
@@ -6476,7 +6544,7 @@ function scanView(img, words) {
   if (!st.history) return st.histErr ? `<p class="sc-err">${esc(st.histErr)}</p>` : `<div class="bl-loading muted">${tr("Reading the scans…")}</div>`;
   if (!st.history.length) return `<form class="sc-intro" data-scanform="${esc(id)}">
       <div class="sc-introtop">${BL_ICON("shieldcheck")}<b>${tr("Scan {image} for known vulnerabilities", { image: esc(label) })}</b></div>
-      <p class="muted">${tr("Kiri finds every package in the image (OS packages, language libraries and binaries) and checks each against a vulnerability database. No scans yet: run the first one.")}</p>
+      <p class="muted">${tr("Kiribra finds every package in the image (OS packages, language libraries and binaries) and checks each against a vulnerability database. No scans yet: run the first one.")}</p>
       ${scannerOptions(scannerFresh(id))}
       ${err}<div class="sc-go"><button type="submit" class="btn primary">${tr("Start scan")}</button></div></form>`;
   const rows = st.history.map((h, n) => `<tr class="sc-hrow" data-scanat="${h.scanned}" data-scanimg="${esc(id)}">
@@ -6499,7 +6567,7 @@ const scannerOptions = (fresh) => `<fieldset class="sc-opts"><legend class="mute
     <label class="sc-opt"><input type="radio" name="scanner" value="grype" checked>
       <img src="${GRYPE_MARK}" alt="">
       <span>${rlm()}<b>Grype</b> <span class="muted">· ${tr("Anchore, open source")}</span><br>
-      <span class="muted">${tr("Runs here on your Mac against Kiri's copy of the image; nothing is uploaded.")}${fresh ? ` ${tr("The first scan downloads Grype and its database, about 230 MB (3 GB unpacked).")}` : ""}</span></span></label>
+      <span class="muted">${tr("Runs here on your Mac against Kiribra's copy of the image; nothing is uploaded.")}${fresh ? ` ${tr("The first scan downloads Grype and its database, about 230 MB (3 GB unpacked).")}` : ""}</span></span></label>
   </fieldset>`;
 const scannerFresh = (id) => !ui.scans.get(id)?.history?.length && ![...ui.scans.values()].some((x) => x.history?.length);
 
@@ -6625,16 +6693,16 @@ setInterval(() => {
 }, 2000);
 
 // Feedback goes to the repo's GitHub issues; the app's "open" handler allows exactly this address.
-const FEEDBACK_URL = "https://github.com/libracoder/kiri/issues/new";
+const FEEDBACK_URL = "https://github.com/astosweb/kiribra/issues/new";
 
 /* The VM's memory: under 1 GB in MB, so an idle VM doesn't read as "0.2". */
 const memText = (mib) => (mib < 1024 ? `${Math.round(mib)} MB` : `${(mib / 1024).toFixed(1)} GB`);
 const memTitle = () => !ui.mem?.target ? tr("The {vm} is asleep: it holds no memory", { vm: LANG === "en" ? VM.toLowerCase() : tr(VM) })
-  : LINUX ? tr("Kiri's containers and engine use {used}, of the {total} this computer has.", { used: memText(ui.mem.used), total: memText(ui.mem.ceiling) })
-  : WIN ? tr("Kiri's containers, engine and agent hold {used} of the {total} WSL has (.wslconfig sets that).", { used: memText(ui.mem.used), total: memText(ui.mem.ceiling) })
+  : LINUX ? tr("Kiribra's containers and engine use {used}, of the {total} this computer has.", { used: memText(ui.mem.used), total: memText(ui.mem.ceiling) })
+  : WIN ? tr("Kiribra's containers, engine and agent hold {used} of the {total} WSL has (.wslconfig sets that).", { used: memText(ui.mem.used), total: memText(ui.mem.ceiling) })
   : tr("In use {used}. The VM may take up to {target} right now, and grows as containers need more.", { used: memText(ui.mem.used), target: memText(ui.mem.target) });
 /* i18n */ void [tr("Linux VM"), tr("Engine"), tr("Mac"), tr("PC"), tr("computer")];
-/* What Kiri's window costs this computer (ui/usage.rs): memory and CPU of
+/* What Kiribra's window costs this computer (ui/usage.rs): memory and CPU of
    the window and the processes that draw this page, not the Linux VM. */
 function usageItem() {
   const u = ui.usage;
@@ -6643,7 +6711,7 @@ function usageItem() {
   // the whole computer, which is what a reader takes "CPU" to mean.
   const cores = Math.max(1, u.cores || 1);
   const cpu = (c) => `${pct(c / cores)} CPU`;
-  const why = `${tr("What Kiri's window uses on this {host}, not counting the {vm}:", { host: tr(HOST), vm: tr(VM) })}\n`
+  const why = `${tr("What Kiribra's window uses on this {host}, not counting the {vm}:", { host: tr(HOST), vm: tr(VM) })}\n`
     + (u.parts || []).map((p) => `${USE_PARTS[p.name] ? tr(USE_PARTS[p.name]) : p.name}${p.n > 1 ? ` (${tr("{n} processes", { n: p.n })})` : ""}: ${size(p.mem)} · ${cpu(p.cpu)}`).join("\n")
     + `\n\n${tr("CPU is a share of all {n} cores: 100% would be every core busy.", { n: cores })}`;
   return `<span class="sep">·</span><span class="num use" title="${esc(why)}">${size(u.mem)} · ${cpu(u.cpu)}</span>`;
@@ -6679,7 +6747,7 @@ function renderStatus() {
   const vmText = { running: tr("{vm} running", { vm: tr(VM) }), stopped: tr("{vm} off", { vm: tr(VM) }), booting: tr("Starting…"), stopping: tr("Stopping…") }[vshown] || vshown;
   const mem = ui.mem ? tr("{used} of {total}", { used: memText(ui.mem.used), total: `${Math.round(ui.mem.ceiling / 1024)} GB` }) : "";
   const parts = [
-    `<span class="item">${KDOT}<span>Kiri ${esc(ui.status?.version || "")}</span>${ui.status?.dev ? `<span class="dev" title="${tr("{app}: its own engine, containers and settings", { app: esc(ui.status?.app || "Kiri Dev") })}">DEV</span>` : ""}</span>`,
+    `<span class="item">${KDOT}<span>Kiribra ${esc(ui.status?.version || "")}</span>${ui.status?.dev ? `<span class="dev" title="${tr("{app}: its own engine, containers and settings", { app: esc(ui.status?.app || "Kiribra Dev") })}">DEV</span>` : ""}</span>`,
     usageItem(),
     updateChip(),
     pullItem(),
@@ -6701,7 +6769,7 @@ function renderStatus() {
 /* Updates (design A): a card in the bottom-right corner offers a newer
    release (Download, Snooze, Skip this version, × until the next launch);
    the download shows in the status bar; then Restart now or Later, which
-   installs it when Kiri quits. After a Later the engine may still run the
+   installs it when Kiribra quits. After a Later the engine may still run the
    older build: the card offers to restart it. */
 const UPD_ICON = {
   up: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"></circle><path d="M12 16V8M8.5 11.5 12 8l3.5 3.5"></path></svg>`,
@@ -6721,16 +6789,16 @@ function updateChip() {
     const tip = u.total ? `${tr("{got} of {total} MB", { got: mbs(u.got), total: mbs(u.total) })}${left ? ` · ${tr("about {time} left", { time: left < 90 ? `${left} s` : `${Math.round(left / 60)} min` })}` : ""}` : `${mbs(u.got)} MB`;
     return `<span class="upd" title="${esc(tip)}">${UPD_ICON.down}<span>${tr("Downloading {version}", { version: esc(u.version) })}</span><span class="track"><i style="width:${pct}%"></i></span><span class="num">${pct}%</span><button class="x" data-upd="cancel" aria-label="${tr("Cancel download")}">${UPD_ICON.x}</button></span>`;
   }
-  if (u?.phase === "ready") return `<button class="upd ok" data-upd="show" title="${tr("Installs when you quit Kiri")}">${UPD_ICON.ok}${tr("{version} ready", { version: esc(u.version) })}</button>`;
+  if (u?.phase === "ready") return `<button class="upd ok" data-upd="show" title="${tr("Installs when you quit Kiribra")}">${UPD_ICON.ok}${tr("{version} ready", { version: esc(u.version) })}</button>`;
   if (u?.phase === "available" && u.hidden) return `<button class="badge" data-upd="show" title="${tr("Show the update")}">${tr("{version} available", { version: esc(u.version) })}</button>`;
-  if (ui.engineStale && ui.staleHidden) return `<button class="badge" data-upd="showengine" title="${tr("The engine still runs Kiri {version}", { version: esc(ui.engineStale) })}">${tr("Restart engine to finish")}</button>`;
+  if (ui.engineStale && ui.staleHidden) return `<button class="badge" data-upd="showengine" title="${tr("The engine still runs Kiribra {version}", { version: esc(ui.engineStale) })}">${tr("Restart engine to finish")}</button>`;
   return "";
 }
 
 /* About's update row: this version and what the last check found
    ("updatestate"), or the card's download as it goes (ui.upd). Linux's
    kiri is a .deb or .rpm installed by hand (there's no apt or dnf repository
-   yet), so it links to the releases page; test builds and Kiri Dev don't
+   yet), so it links to the releases page; test builds and Kiribra Dev don't
    update themselves, so those say so instead of offering a download. */
 function aboutUpdate(version) {
   const u = ui.upd, s = ui.updState, v = esc(s?.current || version || "");
@@ -6741,7 +6809,7 @@ function aboutUpdate(version) {
     const pct = u.total ? Math.round((u.got / u.total) * 100) : 0;
     row = `<span>${tr("Downloading {version}", { version: esc(u.version) })}</span><span class="updbar"><span style="width:${pct}%"></span></span><span class="faint">${u.total ? tr("{got} of {total} MB", { got: (u.got / 1e6).toFixed(0), total: (u.total / 1e6).toFixed(0) }) : ""}</span><button class="linkbtn" data-upd="cancel">${tr("Cancel")}</button>`;
   } else if (u?.phase === "ready") {
-    row = `<span>${tr("Kiri {version} is downloaded", { version: esc(u.version) })}</span>${btn(tr("Restart to update"), 'data-upd="restart"', "primary")}`;
+    row = `<span>${tr("Kiribra {version} is downloaded", { version: esc(u.version) })}</span>${btn(tr("Restart to update"), 'data-upd="restart"', "primary")}`;
   } else if (u?.phase === "available") {
     const whatsNew = u.notes.trim() || NOTES_URL.test(u.notesUrl) ? `<button class="linkbtn" data-upd="notes">${tr("What's new")}</button>` : "";
     row = `<span>${tr("Version {version}", { version: v })}</span><span class="updpill new">${tr("{version} available", { version: esc(u.version) })}</span>${btn(u.error ? tr("Try again") : tr("Download"), 'data-upd="download"', "primary")}${whatsNew}`;
@@ -6759,7 +6827,7 @@ function aboutUpdate(version) {
   const notes = u?.phase === "available" && u.notes.trim() ? `<div class="updnotes"><b>${tr("What's new in {version}", { version: esc(u.version) })}</b>${notesHtml(u.notes)}</div>` : "";
   const fixed = s?.state === "test" || s?.state === "dev";
   const auto = prefs.updateAuto !== false;
-  return `<div class="updrow">${row}</div>${notes}${fixed ? "" : `<div class="pref"><span class="t">${tr("Check for updates automatically")}</span><span class="d">${auto ? tr("On: Kiri checks each time it opens. It never updates without asking.") : tr("Off: Kiri checks only when you click Check now.")}</span>
+  return `<div class="updrow">${row}</div>${notes}${fixed ? "" : `<div class="pref"><span class="t">${tr("Check for updates automatically")}</span><span class="d">${auto ? tr("On: Kiribra checks each time it opens. It never updates without asking.") : tr("Off: Kiribra checks only when you click Check now.")}</span>
       <div class="seg" role="group" aria-label="${tr("Check for updates automatically")}"><button data-updauto="0" aria-pressed="${!auto}">${tr("Off")}</button><button data-updauto="1" aria-pressed="${auto}">${tr("On")}</button></div></div>`}`;
 }
 
@@ -6770,19 +6838,19 @@ function renderUpdate() {
   const el = $("updcard"), u = ui.upd;
   const card = (ic, title, sub, close, body) => `<div class="updcard" role="dialog" aria-label="${esc(title)}">
     <div class="head"><div class="ic ${ic === "ok" ? "ok" : ""}">${UPD_ICON[ic]}</div><div class="txt"><h4>${esc(title)}</h4><div class="sub">${sub}</div></div>
-    ${close ? `<button class="close" data-upd="${close}" aria-label="${tr("Close")}" title="${tr("Hide until Kiri next opens")}">${UPD_ICON.x}</button>` : ""}</div>${body}</div>`;
+    ${close ? `<button class="close" data-upd="${close}" aria-label="${tr("Close")}" title="${tr("Hide until Kiribra next opens")}">${UPD_ICON.x}</button>` : ""}</div>${body}</div>`;
   if (u && !u.hidden && u.phase === "available") {
     const whatsNew = u.notes.trim() || NOTES_URL.test(u.notesUrl) ? ` · <button data-upd="notes">${tr("What's new")}</button>` : "";
     const sub = `${tr("You have {version}", { version: esc(u.current) })}${whatsNew}${u.error ? `<div class="err">${tr("Couldn't download it: {error}", { error: esc(u.error) })}</div>` : ""}`;
-    el.innerHTML = card("up", tr("Kiri {version} is available", { version: u.version }), sub, "hide", `<div class="row">
+    el.innerHTML = card("up", tr("Kiribra {version} is available", { version: u.version }), sub, "hide", `<div class="row">
       ${btn(u.error ? tr("Try again") : tr("Download"), 'data-upd="download"', "primary")}
       ${u.snoozing ? `<span class="snooze">${btn(tr("Tomorrow"), 'data-upd="snooze1"')}${btn(tr("In a week"), 'data-upd="snooze7"')}</span>` : btn(tr("Snooze ▾"), 'data-upd="snooze" aria-haspopup="true"')}
       <button class="skip" data-upd="skip">${tr("Skip this version")}</button></div>`);
   } else if (u && !u.hidden && u.phase === "ready") {
-    el.innerHTML = card("ok", tr("Kiri {version} is ready to install", { version: u.version }), tr("Restart Kiri to finish. Running containers stop, and those with a restart policy start again.") + (u.error ? `<div class="err">${esc(u.error)}</div>` : ""), "", `<div class="row">${btn(tr("Restart now"), 'data-upd="restart"', "primary")}${btn(tr("Later"), 'data-upd="later"')}</div>
-      <div class="foot">${tr("Later installs it when you quit Kiri.")}</div>`);
+    el.innerHTML = card("ok", tr("Kiribra {version} is ready to install", { version: u.version }), tr("Restart Kiribra to finish. Running containers stop, and those with a restart policy start again.") + (u.error ? `<div class="err">${esc(u.error)}</div>` : ""), "", `<div class="row">${btn(tr("Restart now"), 'data-upd="restart"', "primary")}${btn(tr("Later"), 'data-upd="later"')}</div>
+      <div class="foot">${tr("Later installs it when you quit Kiribra.")}</div>`);
   } else if (ui.engineStale && !ui.staleHidden && (!u || u.hidden || u.phase === "downloading")) {
-    el.innerHTML = card("up", tr("Finish updating to Kiri {version}", { version: ui.status?.version || "" }), tr("The engine still runs {version}. Restarting it stops running containers, and those with a restart policy start again.", { version: esc(ui.engineStale) }), "", `<div class="row">${btn(tr("Restart engine"), 'data-upd="engine"', "primary")}${btn(tr("Later"), 'data-upd="enginelater"')}</div>`);
+    el.innerHTML = card("up", tr("Finish updating to Kiribra {version}", { version: ui.status?.version || "" }), tr("The engine still runs {version}. Restarting it stops running containers, and those with a restart policy start again.", { version: esc(ui.engineStale) }), "", `<div class="row">${btn(tr("Restart engine"), 'data-upd="engine"', "primary")}${btn(tr("Later"), 'data-upd="enginelater"')}</div>`);
   } else el.innerHTML = crashCard();
 }
 
@@ -6866,7 +6934,7 @@ function drawNotes() {
     <div class="wn-hero">
       <button class="close" data-wn="close" aria-label="${tr("Close")}">${UPD_ICON.x}</button>
       <div class="wn-stage">${WN_KIRI}<div class="wn-vers">${u.current ? `<span class="wn-ver old">${esc(u.current)}</span><span class="wn-arrow">→</span>` : ""}<span class="wn-ver new">${esc(u.version)}</span><i class="wn-spark"></i><i class="wn-spark"></i><i class="wn-spark"></i><i class="wn-spark"></i></div></div>
-      <h3 id="wn-title">${tr("What's new in Kiri {version}", { version: esc(u.version) })}</h3>
+      <h3 id="wn-title">${tr("What's new in Kiribra {version}", { version: esc(u.version) })}</h3>
       <p>${u.current ? `${tr("You have {version}.", { version: esc(u.current) })} ` : ""}${tr("Your containers keep running while it downloads.")}</p>
     </div>
     <div class="wn-body">${notesHtml(u.notes)}</div>
@@ -6938,7 +7006,7 @@ function render() {
   // Builds is not in the sidebar on Windows.
   const nBuilds = $("n-builds"); if (nBuilds) nBuilds.textContent = ui.bl.items ? ui.bl.items.length : "";
   // The strip's search narrows the list on screen; it names what it searches.
-  $("gq").placeholder = ["containers", "images", "volumes", "networks", "builds", "pods", "services"].includes(v) && !ui.detail && !ui.imgd ? tr("Search {view}…", { view: tr(v) }) : v === "compose" && !cmp.open && !ui.detail ? tr("Search {view}…", { view: "Compose" }) : tr("Search Kiri…");
+  $("gq").placeholder = ["containers", "images", "volumes", "networks", "builds", "pods", "services"].includes(v) && !ui.detail && !ui.imgd ? tr("Search {view}…", { view: tr(v) }) : v === "compose" && !cmp.open && !ui.detail ? tr("Search {view}…", { view: "Compose" }) : tr("Search Kiribra…");
   /* i18n */ void [tr("containers"), tr("images"), tr("volumes"), tr("networks"), tr("builds"), tr("pods"), tr("services")];
   // A connection's pane belongs to the Share view; any other view takes the page back.
   if (v !== "share") { $("sh-pane")?.remove(); $("content").hidden = false; }
@@ -6978,7 +7046,7 @@ function setVm(state, error) {
 }
 /* The Linux VM card, the status bar, Settings › Resources and the main area
    all show the engine's real state, ui.vm, whichever control started or
-   stopped it: the card, the main area's Start Kiri, Settings, or the menu
+   stopped it: the card, the main area's Start Kiribra, Settings, or the menu
    bar and tray, which reach the engine without the page. Asleep is on: the
    VM rests to save memory and the next docker command wakes it, so it reads
    Running, and waking does too. Off is only Stop (or no engine at all). */
@@ -7026,7 +7094,7 @@ function headTitles() {
 }
 addEventListener("resize", () => headTitles());
 
-/* Kiri Lite's first launch: the Docker tools download, as a small bar. */
+/* Kiribra Lite's first launch: the Docker tools download, as a small bar. */
 function toolsBar(e) {
   let bar = $("toolsbar");
   if (e.state === "done") { bar?.remove(); return toast("ok", tr("Docker tools are ready")); }
@@ -7153,7 +7221,7 @@ function toast(kind, text, op, open, act, why) {
 }
 
 /* Run says a container started only once it stays up: the button spins a
-   few seconds more while Kiri watches it, and one that stops with an error
+   few seconds more while Kiribra watches it, and one that stops with an error
    in that time, or within 10 s, is said to have failed, with why (the tip
    turns red when its last log lines arrive). */
 const RUN_SAY = 3000, RUN_WATCH = 10000;
@@ -7171,7 +7239,7 @@ function runSay(id) {
   if (ui.view === "images") render();
   if (!runTip(w.image, w.text, id)) toast("ok", w.text, null, id);
   const c = ui.containers.find((x) => x.Id === id);
-  if (c) starMoment(w.ms ? tr("Kiri started {name} in {time}.", { name: cname(c), time: w.ms < 1000 ? `${w.ms} ms` : `${(w.ms / 1000).toFixed(1)} s` }) : tr("Kiri started {name}.", { name: cname(c) }));
+  if (c) starMoment(w.ms ? tr("Kiribra started {name} in {time}.", { name: cname(c), time: w.ms < 1000 ? `${w.ms} ms` : `${(w.ms / 1000).toFixed(1)} s` }) : tr("Kiribra started {name}.", { name: cname(c) }));
 }
 function runWatchCheck() {
   for (const [id, w] of ui.runWatch) {
@@ -7197,17 +7265,17 @@ function runWatchCheck() {
   }
 }
 
-/* Kubernetes in a container (k3s, kind's node, minikube's): Kiri runs its own
+/* Kubernetes in a container (k3s, kind's node, minikube's): Kiribra runs its own
    cluster, kiri-k8s, with the access k3s needs, so Run doesn't start another
-   copy that would stop at once; it points to the one Kiri runs. */
+   copy that would stop at once; it points to the one Kiribra runs. */
 const K8S_IMAGES = /^(?:docker\.io\/)?(?:rancher\/k3s|k3s|kindest\/node|rancher\/k3d-[\w-]+|kicbase\/stable|gcr\.io\/k8s-minikube\/kicbase)$/;
 const isK8sImage = (image) => K8S_IMAGES.test(repoOf(image));
 const isKiriK8s = (c) => c?.Names?.[0] === "/kiri-k8s";
 function k8sRunNote(image) {
   const on = ui.containers.some((c) => isKiriK8s(c) && c.State === "running");
-  confirmRemove(tr("This is Kubernetes. Kiri runs it for you"), `${tr("{image} is a whole Kubernetes cluster in a container.", { image: esc(image) })} ${on
-    ? tr("Kiri's own, {name}, is on, so another copy isn't needed.", { name: `<span class="mono">kiri-k8s</span>` })
-    : tr("Turn on Kiri's in Settings → Kubernetes instead of starting a copy.")}`, on ? tr("Open Pods") : tr("Turn on Kubernetes"),
+  confirmRemove(tr("This is Kubernetes. Kiribra runs it for you"), `${tr("{image} is a whole Kubernetes cluster in a container.", { image: esc(image) })} ${on
+    ? tr("Kiribra's own, {name}, is on, so another copy isn't needed.", { name: `<span class="mono">kiri-k8s</span>` })
+    : tr("Turn on Kiribra's in Settings → Kubernetes instead of starting a copy.")}`, on ? tr("Open Pods") : tr("Turn on Kubernetes"),
     () => { if (on) show("pods"); else { prefs.tab = "kubernetes"; show("settings"); } }, "primary");
 }
 
@@ -7314,7 +7382,7 @@ function needLearn(image, name) {
   if (!repo || NEEDS[parts.slice(-2).join("/")] || NEEDS[parts.at(-1)]) return;
   try { const m = JSON.parse(localStorage.getItem("kiri.needs") || "{}"); m[repo] = name; localStorage.setItem("kiri.needs", JSON.stringify(m)); } catch {}
 }
-/* Any other image: Kiri reads its start script first (`needs`), for the
+/* Any other image: Kiribra reads its start script first (`needs`), for the
    variables it exits without. Once per image build; Run's spinner shows meanwhile. */
 const imageId = (name) => ui.images.find((i) => i.RepoTags?.includes(name))?.Id;
 const probedFresh = (name) => { const p = ui.probed.get(name); return !!p && (!p.id || !imageId(name) || p.id === imageId(name)); };
@@ -7374,7 +7442,7 @@ function needOpen(image) {
   el.innerHTML = `<div class="hd"><span class="oic">${svgOf("lock")}</span><h3>${tr("{image} needs {what} to start", { image: esc(image), what: esc(what) })}</h3><p class="why">${esc(n.learned ? n.why : tr(n.why))}</p></div>
     ${body}${more}
     <div class="ft"><div class="row"><button class="btn sm quiet" data-needcancel>${tr("Cancel")} <span class="kbd">esc</span></button><button class="btn sm primary" data-needgo>${tr("Run")}</button></div>
-      <span class="note">${tr("Saved in the container's environment. Kiri doesn't keep a copy.")}</span></div>`;
+      <span class="note">${tr("Saved in the container's environment. Kiribra doesn't keep a copy.")}</span></div>`;
   ui.need = { image, n, el };
   document.body.append(el);
   needCheck();
@@ -7561,15 +7629,15 @@ function fixPanel(c) {
         ${secretish(w.name) ? btn(tr("Generate"), `data-fixgen${busy ? " disabled" : ""}`) : ""}
         ${busy ? `<button class="btn sm primary" disabled><i class="spin"></i>${tr("Starting…")}</button>` : btn(tr("Save and start"), `data-fixsave${val && (!wantsStrong(w.name) || strong(val)) ? "" : " disabled"}`, "primary")}</div>
       ${hint}
-      <div class="foot"><span class="note">${tr("Saved in this container's environment. Kiri doesn't keep a copy.")}</span>${logLink}</div>${alt}`);
+      <div class="foot"><span class="note">${tr("Saved in this container's environment. Kiribra doesn't keep a copy.")}</span>${logLink}</div>${alt}`);
   }
   if (w.kind === "privileged") {
     const kind = /kindest\/node/.test(c.Image || "");
     return box(tr("This image needs privileged mode"), `${quote}
       ${kind ? `<p>${tr("<b>kindest/node</b> is the node image of kind, a tool that runs Kubernetes in Docker. kind starts it for you, with privileged mode and the settings it needs. Started on its own, it stops at this {mount}.", { mount: `<span class="mono">mount</span>` })}</p>
-      <p>${tr("For Kubernetes on this {host}, Kiri has its own. It's the switch under Kubernetes in the sidebar.", { host: tr(HOST) })}</p>`
+      <p>${tr("For Kubernetes on this {host}, Kiribra has its own. It's the switch under Kubernetes in the sidebar.", { host: tr(HOST) })}</p>`
         : `<p>${tr("It asks to change the Linux VM itself, which Run doesn't allow. If you trust {image}, start it yourself with {cmd}.", { image: `<b>${esc(c.Image)}</b>`, cmd: `<span class="mono">docker run --privileged</span>` })}</p>`}
-      <div class="foot">${kind ? btn(tr("Use Kiri's Kubernetes"), "data-fixk8s", "primary") : ""}${logLink}<span class="note"></span></div>`);
+      <div class="foot">${kind ? btn(tr("Use Kiribra's Kubernetes"), "data-fixk8s", "primary") : ""}${logLink}<span class="note"></span></div>`);
   }
   if (w.kind === "port") {
     const h = w.holder && (w.holder.Names?.[0] || "").replace(/^\//, "");
@@ -7662,10 +7730,10 @@ function closable(el, close) {
   el.querySelector(".tclose").addEventListener("click", (ev) => { ev.stopPropagation(); close(); });
 }
 
-/* Star Kiri, asked once ever: the first time something works (a container
+/* Star Kiribra, asked once ever: the first time something works (a container
    started, a pull done, a share link live, Kubernetes up), a card a moment
    after that toast. ui.json keeps starAsked, so it never comes back. */
-const STAR_URL = "https://github.com/libracoder/kiri";
+const STAR_URL = "https://github.com/astosweb/kiribra";
 const STAR_IC = `<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2.6l2.9 6 6.6.8-4.9 4.5 1.3 6.5L12 17.2l-5.9 3.2 1.3-6.5-4.9-4.5 6.6-.8Z"/></svg>`;
 let prefsIn = false, starTimer = 0;
 function starMoment(text) {
@@ -7676,7 +7744,7 @@ function starCard(text) {
   prefs.starAsked = true; send("setpref", { name: "starAsked", value: true });
   const el = document.createElement("div");
   el.className = "toast star"; el.setAttribute("role", "status");
-  el.innerHTML = `<span class="sic">${STAR_IC}</span><div class="txt"><b></b><span class="sub">${tr("If Kiri's useful, a star on GitHub helps others find it.")}</span>
+  el.innerHTML = `<span class="sic">${STAR_IC}</span><div class="txt"><b></b><span class="sub">${tr("If Kiribra's useful, a star on GitHub helps others find it.")}</span>
     <div class="acts">${btn(tr("★ Star on GitHub"), "data-star", "primary")}${btn(tr("Not now"), "data-starx", "ghost")}</div></div>`;
   el.querySelector("b").textContent = text;
   const go = () => { el.classList.add("leaving"); setTimeout(() => el.remove(), 200); };
@@ -7692,13 +7760,13 @@ function starCheck() {
   const up = new Set(ui.containers.filter((c) => c.State === "running" && !isKiriK8s(c)).map((c) => c.Id));
   const id = starUp && [...up].find((x) => !starUp.has(x));
   starUp = up;
-  if (id) setTimeout(() => { const c = ui.containers.find((x) => x.Id === id); if (c?.State === "running" && !ui.runWatch.has(id)) starMoment(tr("Kiri started {name}.", { name: cname(c) })); }, RUN_SAY);
+  if (id) setTimeout(() => { const c = ui.containers.find((x) => x.Id === id); if (c?.State === "running" && !ui.runWatch.has(id)) starMoment(tr("Kiribra started {name}.", { name: cname(c) })); }, RUN_SAY);
 }
 
 /* After a remove: the box is hoisted off the stack, with the space it gave back. */
 function removedToast(e) {
   const img = ui.images.find((i) => i.RepoTags?.includes(e.name));
-  const freed = e.deleted && img ? tr("Freed {size}", { size: `<em>${size(img.Size)}</em>` }) : e.deleted ? tr("Gone from Kiri") : tr("Untagged; another tag still uses it");
+  const freed = e.deleted && img ? tr("Freed {size}", { size: `<em>${size(img.Size)}</em>` }) : e.deleted ? tr("Gone from Kiribra") : tr("Untagged; another tag still uses it");
   const el = document.createElement("div");
   el.className = "toast removed";
   el.setAttribute("role", "status");
@@ -7717,7 +7785,7 @@ function engineToast(e) {
   const secs = e.ms < 1000 ? `${e.ms} ms` : `${(e.ms / 1000).toFixed(1)} s`;
   el.innerHTML = `<div class="yard" aria-hidden="true"><i></i><i></i><i class="box"></i>
       <span class="tick">${TICK}</span></div>
-    <div class="txt"><b>${tr("Engine updated")}</b><span class="sub">${tr("Running Kiri {version} · back in {time}", { version: esc(e.version || ""), time: secs })}</span></div><div class="life"></div>`;
+    <div class="txt"><b>${tr("Engine updated")}</b><span class="sub">${tr("Running Kiribra {version} · back in {time}", { version: esc(e.version || ""), time: secs })}</span></div><div class="life"></div>`;
   $("toasts").append(el);
   retire(el, 4000);
 }
@@ -7750,7 +7818,7 @@ function pulledToast(e) {
   el.querySelector("[data-run]").addEventListener("click", () => { runImage(e.name); leave(); });
 }
 
-/* Diagnostics: Kiri's own log, its crash files and reports to Kiri Cloud.
+/* Diagnostics: Kiribra's own log, its crash files and reports to Kiribra Cloud.
    Settings → Diagnostics shows them; the card after a crash offers that
    crash's report; an error toast's Details shows its action's log lines. */
 const DG_PART = { ui: "Window", daemon: "Engine", cli: "CLI" };
@@ -7825,14 +7893,14 @@ function diagPane() {
         : busy ? `<span class="pill">${tr("Sending…")}</span>` : `<span class="pill">${tr("Not sent")}</span>${btn(tr("Send"), `data-crashsend="${esc(c.name)}"`)}`}</span>
     </div>${open ? `<pre class="dg-stack">${esc(c.text || "")}</pre>` : ""}`;
   };
-  const crashes = dg.crashes == null ? `<div class="none">${tr("Looking for crash reports…")}</div>` : dg.crashes.length ? dg.crashes.map(crash).join("") : `<div class="none">${tr("No crashes. Kiri keeps a report here if one of its parts ever stops unexpectedly.")}</div>`;
+  const crashes = dg.crashes == null ? `<div class="none">${tr("Looking for crash reports…")}</div>` : dg.crashes.length ? dg.crashes.map(crash).join("") : `<div class="none">${tr("No crashes. Kiribra keeps a report here if one of its parts ever stops unexpectedly.")}</div>`;
   return `<div class="pane diag"><h3>${tr("Diagnostics")}</h3>
     <div class="pref"><span class="t">${tr("Send crash reports automatically")}</span>
-      <span class="d">${tr("When part of Kiri crashes, the stack trace and the last 200 log lines before it go to Kiri Cloud, with Kiri's and the system's versions, the computer's model and a random ID for this install. Never your Kiri Cloud account, and nothing from inside your containers. Your home folder, image and container names, tokens and passwords are taken out.")}</span>
+      <span class="d">${tr("When part of Kiribra crashes, the stack trace and the last 200 log lines before it go to Kiribra Cloud, with Kiribra's and the system's versions, the computer's model and a random ID for this install. Never your Kiribra Cloud account, and nothing from inside your containers. Your home folder, image and container names, tokens and passwords are taken out.")}</span>
       <div class="seg" role="group" aria-label="${tr("Send crash reports automatically")}"><button data-dgauto="0" aria-pressed="${prefs.crashReports !== true}">${tr("Off")}</button><button data-dgauto="1" aria-pressed="${prefs.crashReports === true}">${tr("On")}</button></div></div>
     <div class="pref"><span class="t">${tr("Diagnostics report")}</span>
       <span class="d">${tr("Recent logs, crash reports and versions in one redacted file, for when something goes wrong.")}</span>
-      <div class="dg-acts"><button class="btn sm" data-dgreport="save">${tr("Create report…")}</button><button class="btn sm" data-dgreport="send">${dgIcon("send")}${tr("Send to Kiri")}</button></div>
+      <div class="dg-acts"><button class="btn sm" data-dgreport="save">${tr("Create report…")}</button><button class="btn sm" data-dgreport="send">${dgIcon("send")}${tr("Send to Kiribra")}</button></div>
       ${dg.sent ? `<div class="dg-result">${dgIcon("checkcircle")}<span>${tr("Sent. Quote {id} if you write to us.", { id: `<span class="mono">${esc(dg.sent)}</span>` })}</span>${copyBtn(dg.sent, tr("report ID"))}</div>` : ""}</div>
     <h4 class="ksub">${tr("Recent crashes")}</h4>
     <div class="dg-crashes">${crashes}</div>
@@ -7846,7 +7914,7 @@ function diagPane() {
         <span style="flex:1"></span>
         <label class="toggle"><input type="checkbox" id="dg-follow"${dg.follow ? " checked" : ""}> ${tr("Follow")}</label>
       </div>
-      <div class="dg-log" id="dg-log" role="log" aria-label="${tr("Kiri's log")}"></div>
+      <div class="dg-log" id="dg-log" role="log" aria-label="${tr("Kiribra's log")}"></div>
       <div class="dg-logfoot"><span class="dg-live${dg.follow ? "" : " off"}"><i></i>${dg.follow ? tr("Live|stream") : tr("Paused")}</span><span>·</span><span class="num" id="dg-count"></span>
         <span>${tr("· the newest 500 · up to 15 MB a part is kept")}</span>
         <span style="flex:1"></span><button class="btn sm" data-dgfolder>${dgIcon("folder")}${tr("Open logs folder")}</button></div>
@@ -7884,7 +7952,7 @@ function showDiag(op, crash) {
   requestAnimationFrame(() => (op ? $("dg-log") : document.querySelector(".dg-crashes"))?.scrollIntoView({ block: "nearest" }));
 }
 
-/* Create report… (saved to the Desktop, shown in Finder) and Send to Kiri:
+/* Create report… (saved to the Desktop, shown in Finder) and Send to Kiribra:
    what goes in first, the container list only when ticked. */
 let rp = null;
 function reportDialog(mode) {
@@ -7910,11 +7978,11 @@ function drawReport() {
   const send_ = rp.mode === "send", done = rp.state === "sent";
   const item = (t, d) => `<div class="rp-item">${dgIcon("check")}<span class="t">${t}</span><span class="d">${d}</span></div>`;
   scrim.innerHTML = `<div class="dialog rp-dialog" role="dialog" aria-modal="true" aria-labelledby="rp-t">
-    <h3 id="rp-t">${send_ ? tr("Send a report to Kiri") : tr("Create a diagnostics report")}</h3>
-    <p>${send_ ? tr("We get the file below, redacted, and you get an ID to quote when you write to us. If you're signed in to Kiri Cloud, it says it's from you, so we can reply.") : tr("One text file, redacted, saved to your Desktop and shown in Finder. Read it before you share it.")}</p>
-    <div class="rp-list">${item(tr("Kiri's logs"), tr("The last 300 lines from the window, the engine and kiri commands, and the engine's own output"))}
-      ${item(tr("Crash reports"), tr("The 5 newest, and macOS's own crash reports for Kiri from the last 30 days"))}
-      ${item(tr("Kiri and this Mac"), tr("Versions, macOS, whether the engine runs, how many containers and images"))}
+    <h3 id="rp-t">${send_ ? tr("Send a report to Kiribra") : tr("Create a diagnostics report")}</h3>
+    <p>${send_ ? tr("We get the file below, redacted, and you get an ID to quote when you write to us. If you're signed in to Kiribra Cloud, it says it's from you, so we can reply.") : tr("One text file, redacted, saved to your Desktop and shown in Finder. Read it before you share it.")}</p>
+    <div class="rp-list">${item(tr("Kiribra's logs"), tr("The last 300 lines from the window, the engine and kiri commands, and the engine's own output"))}
+      ${item(tr("Crash reports"), tr("The 5 newest, and macOS's own crash reports for Kiribra from the last 30 days"))}
+      ${item(tr("Kiribra and this Mac"), tr("Versions, macOS, whether the engine runs, how many containers and images"))}
       <label class="rp-item opt"><input type="checkbox" data-rpopt${rp.containers ? " checked" : ""}${rp.state ? " disabled" : ""}><span class="t">${tr("Container list")}</span><span class="d">${tr("Names, images and status. Not their files, logs or environment.")}</span></label></div>
     <div class="rp-red">${dgIcon("shieldcheck")}<span>${tr("Your home folder's path, tokens, passwords and other secrets are blanked before anything is written.")}</span></div>
     ${done ? `<div class="rp-id"><span class="lab">${tr("Report ID")}</span><span class="val">${esc(rp.id)}</span><button class="btn sm" data-rpcopy>${dgIcon("copy")}${tr("Copy")}</button></div>` : ""}
@@ -7928,15 +7996,15 @@ function drawReport() {
 function crashCard() {
   const c = ui.crash;
   if (!c || c.hidden) return "";
-  const who = DG_WHO[c.part] ? tr(DG_WHO[c.part]) : tr("Part of Kiri"), when = dgWhen(c.time, true);
-  const title = c.part === "cli" ? tr("A kiri command crashed") : tr("Kiri quit unexpectedly last time");
-  const more = c.count > 1 ? tr(" That's {count} crashes since Kiri last opened.", { count: c.count }) : "";
+  const who = DG_WHO[c.part] ? tr(DG_WHO[c.part]) : tr("Part of Kiribra"), when = dgWhen(c.time, true);
+  const title = c.part === "cli" ? tr("A kiri command crashed") : tr("Kiribra quit unexpectedly last time");
+  const more = c.count > 1 ? tr(" That's {count} crashes since Kiribra last opened.", { count: c.count }) : "";
   const head = (ic, h, sub) => `<div class="updcard" role="dialog" aria-label="${esc(h)}">
     <div class="head"><div class="ic ${ic}">${dgIcon(ic === "ok" ? "checkcircle" : "warning")}</div><div class="txt"><h4>${esc(h)}</h4><div class="sub">${sub}</div></div>
     <button class="close" data-crashcard="close" aria-label="${tr("Close")}">${UPD_ICON.x}</button></div>`;
   if (c.id || c.state === "sent") return `${head("ok", tr("Report sent"), tr("Quote {id} if you write to us about this crash.", { id: `<span class="mono">${esc(c.id)}</span>` }))}
     <div class="row">${btn(`${dgIcon("copy")}${tr("Copy ID")}`, 'data-crashcard="copy"')}<button class="lnk" data-crashcard="view">${tr("Details")}</button></div></div>`;
-  if (c.sent || (c.crashReports && c.state !== "error")) return `${head("calm", title, tr("{who} stopped {when}.{more} Crash reports are sent automatically, so this one goes to Kiri too.", { who, when: esc(when), more }))}
+  if (c.sent || (c.crashReports && c.state !== "error")) return `${head("calm", title, tr("{who} stopped {when}.{more} Crash reports are sent automatically, so this one goes to Kiribra too.", { who, when: esc(when), more }))}
     <div class="row"><button class="lnk" data-crashcard="view">${tr("Details")}</button></div></div>`;
   return `${head("calm", title, tr("{who} stopped {when}.{more} A report helps us fix it: the stack trace and the last 200 log lines before it, with your home folder and tokens blanked.", { who, when: esc(when), more }))}
     ${c.error ? `<div class="err">${tr("Couldn't send it: {error}", { error: esc(c.error) })}</div>` : ""}
@@ -8113,8 +8181,9 @@ window.kiri = {
       case "enginerestarted": engineToast(e); break;
       case "view": if (empty[e.view] || e.view === "settings") show(e.view); break;
       case "prefs": { const was = prefs.lang; Object.assign(prefs, e.prefs || {}); prefsIn = true; if (prefs.lang !== was) relang(); applyPrefs(); render(); paintEngine(); renderStatus(); break; }
-      case "starprompt": starCard(tr("Kiri started your container.")); break;
+      case "starprompt": starCard(tr("Kiribra started your container.")); break;
       case "domains": ui.suffix = e.suffix; ui.domainsOn = e.on; ui.https = !!e.https; render(); break;
+      case "webui": ui.webui = e; ui.webUiDraft = { lan: !!e.lan, port: +(e.port || 7676) }; if (ui.view === "settings" && prefs.tab === "webui") render(); break;
       case "langpick": langPick(); break;
       case "welcome": welcome(); break;
       case "onboarding": onboarding(e); break;
@@ -8124,7 +8193,7 @@ window.kiri = {
         ui.status = e;
         document.body.classList.toggle("dev", !!e.dev);
         document.body.classList.toggle("share", !!(e.share ?? e.dev));
-        // The context docker uses for this Kiri: kiri, or a Kiri Dev's own.
+        // The context docker uses for this Kiribra: kiri, or a Kiribra Dev's own.
         if (e.ours) empty.containers.vars.context = esc(e.ours);
         render(); if (!ui.imp.sources) send("importsources"); break;
       case "update": {
@@ -8280,7 +8349,23 @@ $("content").addEventListener("click", (ev) => {
   else if ((el = t("[data-g]"))) projectAsk(el.dataset.project, el.dataset.g);
   else if ((el = t("[data-group]"))) toggleGroup(el);
   else if (composeClick(t)) {}
-  else if ((el = t("[data-stab]"))) { prefs.tab = el.dataset.stab; if (prefs.tab === "about") send("about"); if (prefs.tab === "builds") send("buildwith"); if (prefs.tab === "registries") send("logins"); if (prefs.tab === "diagnostics") diagOpen(); render(); }
+  else if ((el = t("[data-stab]"))) { prefs.tab = el.dataset.stab; if (prefs.tab === "about") send("about"); if (prefs.tab === "builds") send("buildwith"); if (prefs.tab === "registries") send("logins"); if (prefs.tab === "webui") send("webui"); if (prefs.tab === "diagnostics") diagOpen(); render(); }
+  else if ((el = t("[data-webui]"))) {
+    const on = !!+el.dataset.webui;
+    if (on === !!ui.webui?.on) return;
+    if (on) {
+      const lan = !!(ui.webUiDraft?.lan ?? ui.webui?.lan), port = +(ui.webUiDraft?.port ?? ui.webui?.port ?? 7676);
+      send("webuistart", { value: { lan, port } });
+    } else send("webuistop");
+  }
+  else if ((el = t("[data-webuilan]"))) {
+    const lan = !!+el.dataset.webuilan;
+    ui.webUiDraft = { ...(ui.webUiDraft || {}), lan };
+    setPref("webUiLan", lan);
+    if (ui.webui?.on) send("webuistart", { value: { lan, port: +(ui.webUiDraft?.port ?? ui.webui.port ?? 7676) } });
+    else render();
+  }
+  else if (t("[data-webuiopen]")) send("webuiopen");
   else if (diagClick(t)) {}
   else if ((el = t("[data-scale]"))) setPref("scale", +el.dataset.scale);
   else if ((el = t("[data-logsize]"))) setPref("logSize", +el.dataset.logsize);
@@ -8377,7 +8462,7 @@ document.addEventListener("keydown", (ev) => {
    state changes, often just as the engine comes back while someone reaches
    for Start. A press that began on Start, or within half a second of it
    turning to Stop, is not a Stop: that recorded a Stop nobody asked for,
-   and docker then said "Kiri is stopped" until Start (#93). */
+   and docker then said "Kiribra is stopped" until Start (#93). */
 $("vm-toggle").addEventListener("pointerdown", (ev) => {
   const b = ev.currentTarget;
   b.dataset.pressed = b.dataset.act === "stop" && Date.now() - Number(b.dataset.flipped || 0) < 500 ? "start" : b.dataset.act || "";
@@ -8422,7 +8507,7 @@ empty.services = { title: "No services", body: "Services you create with <code>k
 /* i18n */ void [tr("No pods"), tr("Pods you create with <code>kubectl</code> show up here, grouped by namespace."), tr("No services"), tr("Services you create with <code>kubectl expose</code> show up here. LoadBalancer services answer on <code>localhost</code>.")];
 // The system's own pods start folded away.
 ui.collapsed.add("ns:kube-system");
-const k8sContext = () => k8s.context || (ui.status?.dev ? "kiri-dev" : "kiri");
+const k8sContext = () => k8s.context || (ui.status?.dev ? "kiribra-dev" : "kiri");
 /* The Mac address of the API server, from the node's real port binding. */
 const k8sApi = () => (k8s.port ? `127.0.0.1:${k8s.port}` : "");
 const k8sMoved = () => (k8s.port && k8s.port !== k8s.wantPort ? tr(" ({port} was in use)", { port: k8s.wantPort }) : "");
@@ -8555,7 +8640,7 @@ function renderK8s() {
 
 /* Kubernetes wants about 2 GB. When the VM can't give it that, or its memory
    is nearly all used, say so on every Kubernetes view: a starved API server
-   just stops answering, which otherwise looks like Kiri being flaky. */
+   just stops answering, which otherwise looks like Kiribra being flaky. */
 const K8S_MIB = 2048;
 function k8sMem() {
   const m = ui.mem, node = k8sNode();
@@ -8581,11 +8666,11 @@ function k8sOff() {
   const title = k8s.state === null ? tr("Looking for Kubernetes…") : stuck ? tr("Kubernetes isn't answering")
     : k8s.op === "stop" ? tr("Kubernetes is stopping") : k8s.op === "deletecluster" ? tr("Deleting Kubernetes") : busy ? tr("Kubernetes is starting") : tr("Kubernetes is off");
   const body = k8s.state === null ? ""
-    : stuck ? (k8s.error ? tr("Its node runs, but the API server doesn't answer: {error}. A busy or memory-starved VM can do this; Kiri keeps asking.", { error: `<span class="mono">${esc(k8s.error)}</span>` })
-      : tr("Its node runs, but the API server doesn't answer. A busy or memory-starved VM can do this; Kiri keeps asking."))
+    : stuck ? (k8s.error ? tr("Its node runs, but the API server doesn't answer: {error}. A busy or memory-starved VM can do this; Kiribra keeps asking.", { error: `<span class="mono">${esc(k8s.error)}</span>` })
+      : tr("Its node runs, but the API server doesn't answer. A busy or memory-starved VM can do this; Kiribra keeps asking."))
     : starting || (busy && !k8s.op) ? tr("A single-node cluster (k3s) in one container. It takes about 20 s, longer the first time, while k3s downloads.")
     : busy ? ""
-    : tr("Start a single-node cluster (k3s) in one Kiri container. Its API is on {api} (or the next free port), and kubectl gets the {context} context, as with <code>kiri k8s start</code>.", { api: `<code>127.0.0.1:${k8s.wantPort}</code>`, context: `<code>${esc(k8sContext())}</code>` });
+    : tr("Start a single-node cluster (k3s) in one Kiribra container. Its API is on {api} (or the next free port), and kubectl gets the {context} context, as with <code>kiri k8s start</code>.", { api: `<code>127.0.0.1:${k8s.wantPort}</code>`, context: `<code>${esc(k8sContext())}</code>` });
   const settings = `<p class="kstep"><button class="linkish" data-ksettings>${tr("Kubernetes settings")}</button></p>`;
   const action = k8s.state === null ? ""
     : stuck ? settings
@@ -8866,7 +8951,7 @@ function podInfo(p) {
       ${labels.map(([k, v]) => `<tr><td class="mono">${esc(k)}</td><td class="mono muted">${esc(v)}</td></tr>`).join("")}</tbody></table>` : `<p class="muted">${tr("None")}</p>`}`;
 }
 
-/* Services. Kiri publishes a LoadBalancer service's ports on localhost, so
+/* Services. Kiribra publishes a LoadBalancer service's ports on localhost, so
    those open in the browser; the rest are only reachable in the cluster. */
 const NOT_HTTP = new Set([22, 25, 53, 1883, 2181, 3306, 5432, 5672, 6379, 6443, 9042, 9092, 11211, 27017]);
 const httpPort = (x) => (x.protocol || "TCP") === "TCP" && (/http|web/i.test(`${x.name || ""} ${x.appProtocol || ""}`) || (!NOT_HTTP.has(x.port) && !NOT_HTTP.has(+x.targetPort)));
@@ -9188,6 +9273,7 @@ document.addEventListener("keydown", (ev) => {
 });
 document.body.classList.toggle("win", WIN);
 document.body.classList.toggle("linux", LINUX);
+document.body.classList.toggle("web", WEB);
 $("vm-name").textContent = tr(VM);
 /* i18n */ void [tr("Linux VM"), tr("Engine")];
 // The live dots' beat: every 4 s while the window is in use and something
@@ -9210,7 +9296,7 @@ setInterval(() => {
 // Animations rest while another window is in front, or this one is hidden.
 const away = () => document.body.classList.toggle("away", document.hidden || !document.hasFocus());
 addEventListener("focus", away); addEventListener("blur", away); document.addEventListener("visibilitychange", away);
-// The crane's sway (.is-art), once every 20 s while Kiri is the window in use.
+// The crane's sway (.is-art), once every 20 s while Kiribra is the window in use.
 setInterval(() => {
   document.body.classList.remove("sway");
   if (!document.hidden && document.hasFocus() && document.querySelector(".is-art")) requestAnimationFrame(() => document.body.classList.add("sway"));
@@ -9269,7 +9355,7 @@ try { setRail(localStorage.getItem("kiri.rail") === "1"); } catch { setRail(fals
 // Folding animates; opening the window as it was left doesn't.
 requestAnimationFrame(() => requestAnimationFrame(() => document.body.classList.add("anim")));
 
-/* --- Share: a container's public https link, through Kiri Share. A running
+/* --- Share: a container's public https link, through Kiribra Share. A running
    container with a published port gets a Share button; the Share view lists
    what's shared, live, with its traffic and the account's monthly cap. The
    Rust side keeps the tunnels (ui/sharing.rs) and sends their events as
@@ -9306,10 +9392,10 @@ const shUp = (x) => shFor2(Date.now() - (x.started || 0) * 1000);
 const shBare = (url) => (url || "").replace(/^https:\/\//, "");
 const shPortOf = (target) => (target || "").match(/:(\d+)\)?$/)?.[1] || "";
 const shHost = (x) => x.host || tr("another computer");
-/* Who runs it, where: "Kiri Dev on paul-desktop", "kiri share on this Mac". */
-const shWhere = (x) => tr("{program} on {host}", { program: x.program || (x.kind === "cli" ? "kiri share" : "Kiri"), host: x.where === "here" ? tr(SH_HERE) : shHost(x) });
+/* Who runs it, where: "Kiribra Dev on paul-desktop", "kiri share on this Mac". */
+const shWhere = (x) => tr("{program} on {host}", { program: x.program || (x.kind === "cli" ? "kiri share" : "Kiribra"), host: x.where === "here" ? tr(SH_HERE) : shHost(x) });
 /* The tag on a share on this computer that the window didn't open: CLI, or the other app's name. */
-const shTag = (x) => `<span class="cli-tag">${x.kind === "cli" ? "CLI" : esc(x.program || "Kiri")}</span>`;
+const shTag = (x) => `<span class="cli-tag">${x.kind === "cli" ? "CLI" : esc(x.program || "Kiribra")}</span>`;
 const shExtTag = { toString: () => `<span class="ext-tag">${tr("External")}</span>` };
 
 function shPoll() { if (sh.account?.signedIn && !sh.remoteOff) send("sharetunnels"); }
@@ -9345,7 +9431,7 @@ function shCliFor(c, name) {
 function shSlotsText(html) {
   const who = (n, x = false) => (html ? `<span class="who${x ? " x" : ""}">${esc(n)}</span>` : n);
   const and = (a) => (a.length < 2 ? a.join("") : tr("{list} and {last}", { list: a.slice(0, -1).join(", "), last: a[a.length - 1] }));
-  const here = [...shLive().map((x) => who(kShName(x))), ...shCli().map((x) => `${who(x.label || x.name)} (${x.kind === "cli" ? "kiri share" : esc(x.program || "Kiri")})`)];
+  const here = [...shLive().map((x) => who(kShName(x))), ...shCli().map((x) => `${who(x.label || x.name)} (${x.kind === "cli" ? "kiri share" : esc(x.program || "Kiribra")})`)];
   const hosts = new Map();
   for (const x of shExt()) hosts.set(shHost(x), [...(hosts.get(shHost(x)) || []), who(x.label || x.name, true)]);
   const parts = [...(here.length ? [tr("{names} on {host}", { names: and(here), host: tr(SH_HERE) })] : []), ...[...hosts].map(([h, n]) => tr("{names} on {host}", { names: and(n), host: html ? esc(h) : h }))];
@@ -9409,7 +9495,7 @@ function shStopExt(name) {
   const x = shExt().find((y) => y.name === name);
   if (!x) return;
   const where = esc(shHost(x)), label = esc(x.label || x.name), port = shPortOf(x.target);
-  const what = x.kind === "cli" ? tr("The kiri share there stops.") : tr("The app on {host} keeps running, and {program} there shows the share as stopped from another computer.", { host: where, program: esc(x.program || "Kiri") });
+  const what = x.kind === "cli" ? tr("The kiri share there stops.") : tr("The app on {host} keeps running, and {program} there shows the share as stopped from another computer.", { host: where, program: esc(x.program || "Kiribra") });
   const scrim = document.createElement("div");
   scrim.className = "scrim"; scrim.id = "sh-stopext";
   scrim.innerHTML = `<div class="dialog alert" role="alertdialog" aria-modal="true" aria-labelledby="sh-stopext-t">${alertIco("warn")}<h3 id="sh-stopext-t">${tr("Stop {name} on {host}?", { name: label, host: where })}</h3>
@@ -9681,11 +9767,11 @@ function renderShare() {
     : `<div class="sh-empty">${shGlobe}<h3>${tr("Nothing shared yet")}</h3><p>${tr("Press <b>Share</b> on a running container to give it a public https link anyone can open.")}</p>
         <button class="btn" data-shcontainers>${tr("Go to Containers")}</button></div>`;
   const foot = !a ? "" : a.signedIn
-    ? `<div class="sh-foot"><span class="sh-ghmark" title="${tr("Signed in with GitHub")}">${shSvg("github")}</span>${tr("Signed in to Kiri Cloud with GitHub as {login}", { login: `<b>${esc(a.login || tr("you"))}</b>` })}
+    ? `<div class="sh-foot"><span class="sh-ghmark" title="${tr("Signed in with GitHub")}">${shSvg("github")}</span>${tr("Signed in to Kiribra Cloud with GitHub as {login}", { login: `<b>${esc(a.login || tr("you"))}</b>` })}
         ${a.session ? `<span class="sep">·</span><span title="${tr("This sign-in's ID: a hash of its token, safe to quote when asking for help")}">${tr("Session")} <code class="sh-sess">${esc(a.session)}</code></span>` : ""}
         <span class="sep">·</span><button class="linkish" data-shlogout>${tr("Sign out")}</button></div>`
     : `<div class="sh-foot">${tr("Not signed in")}<button class="linkish" data-shlogin>${tr("Sign in with GitHub")}</button></div>`;
-  const intro = `<p class="sh-intro">${tr("Share gives a container or a Kubernetes service a public https link through a secure tunnel to Kiri Cloud.")} ${a?.signedIn && !sh.remoteOff ? tr("This lists every link on your account, on any computer.") : tr("It stays up while Kiri is running.")}</p>`;
+  const intro = `<p class="sh-intro">${tr("Share gives a container or a Kubernetes service a public https link through a secure tunnel to Kiribra Cloud.")} ${a?.signedIn && !sh.remoteOff ? tr("This lists every link on your account, on any computer.") : tr("It stays up while Kiribra is running.")}</p>`;
   morph($("content"), `<div class="sh">${intro}${stats}${list}${foot}</div>`);
 }
 /* Puts `html` in `el` changing only what differs, so a redraw doesn't restart
@@ -9759,7 +9845,7 @@ function shHealth(it) {
   const addr = (it.target || "").match(/\(([^)]+)\)/)?.[1];
   const notes = [];
   if (shDown(it)) notes.push(`<div class="sh-note bad">${shSvg("warning")}<span>${addr ? tr("<b>{name} isn't answering</b> on {addr}, so visitors get an error page. Is the app inside it running?", { name: esc(it.source), addr: esc(addr) }) : tr("<b>{name} isn't answering</b>, so visitors get an error page. Is the app inside it running?", { name: esc(it.source) })}</span></div>`);
-  if (it.warning && !it.paused) notes.push(`<div class="sh-note info">${shSvg("info")}<span>${tr("Visitors' browsers see a short <b>Kiri Cloud notice page</b> first, then your app.")} <button class="linkish" data-shnotice title="${SH_NOTICE_URL}">${tr("See what it looks like ↗")}</button></span></div>`);
+  if (it.warning && !it.paused) notes.push(`<div class="sh-note info">${shSvg("info")}<span>${tr("Visitors' browsers see a short <b>Kiribra Cloud notice page</b> first, then your app.")} <button class="linkish" data-shnotice title="${SH_NOTICE_URL}">${tr("See what it looks like ↗")}</button></span></div>`);
   if (it.remaining != null && it.remaining < 512 * 2 ** 20) notes.push(`<div class="sh-note warn">${shSvg("warning")}<span>${tr("Only {size} left this month. When it runs out, the link stops until next month.", { size: size(it.remaining) })}</span></div>`);
   return `<div class="sh-healthline">${bits.join(`<span class="sep">·</span>`)}</div>${notes.join("")}`;
 }
@@ -9848,7 +9934,7 @@ function shSignin() {
        <div class="sh-waiting"><i class="sh-spin"></i>${tr("Waiting for GitHub…")}</div>
        <div class="row-end"><span></span><button class="btn" data-close>${tr("Cancel")}</button></div>`
     : `<h3 id="sh-in-t">${tr("Sign in to share {what}", { what })}</h3>
-       <p>${tr("Kiri Cloud gives it a public https link through a secure tunnel from this {host}. You sign in with GitHub, so every link traces back to a person. Kiri never sees your password.", { host: tr(HOST) })}</p>
+       <p>${tr("Kiribra Cloud gives it a public https link through a secure tunnel from this {host}. You sign in with GitHub, so every link traces back to a person. Kiribra never sees your password.", { host: tr(HOST) })}</p>
        <div class="row-end"><span></span><span><button class="btn" data-close>${tr("Not now")}</button> <button class="btn primary sh-gh" data-shlogin>${gh}${tr("Continue with GitHub")}</button></span></div>`}</div>`;
 }
 
@@ -9930,19 +10016,19 @@ function shCardOne(it) {
   const live = it.state === "live", host = (it.url || "").replace(/^https:\/\//, "");
   const k = kParse(it.source), c = ui.containers.find((x) => cname(x) === it.source), port = k ? k.port : (it.target || "").match(/:(\d+)\)?$/)?.[1];
   const node = (ic, label, cls = "") => `<div class="sh-node ${cls}"><div class="sh-nic">${ic}</div><span>${label}</span></div>`;
-  // Visitors → Kiri Cloud → the container: a dot travels along for each request.
+  // Visitors → Kiribra Cloud → the container: a dot travels along for each request.
   const flow = `<div class="sh-flow" aria-hidden="true">
       ${node(shSvg("globe"), tr("Visitors"))}
-      <div class="sh-lane"></div>${node(KIRI_MARK, "Kiri Cloud", "kiri")}<div class="sh-lane"></div>
+      <div class="sh-lane"></div>${node(KIRI_MARK, "Kiribra Cloud", "kiri")}<div class="sh-lane"></div>
       ${node(kShTile(it) || (c ? tile(c.icon, "cube") : `<div class="tile">${shGlobe}</div>`), `${esc(kShName(it))}${port ? `<em>:${port}</em>` : ""}`)}</div>`;
   return `<div class="dialog sh-dlg" role="dialog" aria-modal="false" aria-labelledby="sh-dlg-t">
     <button class="sh-x" data-close aria-label="${tr("Hide")}">×</button>
     ${live ? flow : `<div class="sh-hero wait">${shSvg("globe")}</div>`}
     <h3 id="sh-dlg-t">${live ? tr("You're sharing {name}", { name: `<b>${esc(kShName(it))}</b>` }) : tr("Reconnecting {name}…", { name: `<b>${esc(kShName(it))}</b>` })}</h3>
-    <p>${tr("Anyone with this link can open it while Kiri is running.")}</p>
+    <p>${tr("Anyone with this link can open it while Kiribra is running.")}</p>
     ${host ? `<div class="sh-linkbox">${shSvg("link")}<span title="${esc(it.url)}">${esc(host)}</span>
       <button class="btn sm" data-mcopy>${tr("Copy")}</button><button class="btn sm" data-mopen>${tr("Open")}</button></div>` : ""}
-    ${live && it.warning ? `<p class="sh-popnote">${shSvg("info")}${tr("Browsers see a short Kiri Cloud notice page first.")}<button class="linkish" data-mnotice title="${SH_NOTICE_URL}">${tr("See it ↗")}</button></p>` : ""}
+    ${live && it.warning ? `<p class="sh-popnote">${shSvg("info")}${tr("Browsers see a short Kiribra Cloud notice page first.")}<button class="linkish" data-mnotice title="${SH_NOTICE_URL}">${tr("See it ↗")}</button></p>` : ""}
     ${live ? `<div class="sh-feed" id="sh-feed">${shFeed(it, 4)}</div>` : ""}
     <div class="sh-dlg-foot"><button class="linkish danger" data-mstop>${tr("Stop sharing")}</button><span class="spacer"></span>
       <button class="linkish" data-mall>${tr("Details")}</button><button class="btn primary sm" data-close>${tr("Done")}</button></div></div>`;
@@ -10010,7 +10096,7 @@ function shShare(name) {
   shSignin();
 }
 
-/* The Share button on a running container with a published port (Kiri Dev only);
+/* The Share button on a running container with a published port (Kiribra Dev only);
    never the cluster's node, whose port is the Kubernetes API. */
 /* The globe that shares a container, and shows it shared, on the container's
    page; `label` adds Share, Sharing… or Shared beside it. Empty when the
@@ -10059,7 +10145,7 @@ function shPublishThen(c, name) {
   shPublishing.set(c.Id, name); sh.starting.add(name); render();
   send("listening", { id: c.Id });
   // An older engine never answers; don't spin for good.
-  setTimeout(() => { if (shPublishing.get(c.Id) === name) shPublishFail(c.Id, tr("Couldn't share {name}: Kiri couldn't tell which port it listens on. Publish one from its page.", { name })); }, 10000);
+  setTimeout(() => { if (shPublishing.get(c.Id) === name) shPublishFail(c.Id, tr("Couldn't share {name}: Kiribra couldn't tell which port it listens on. Publish one from its page.", { name })); }, 10000);
 }
 function shPublishFail(id, text) {
   const name = shPublishing.get(id);
@@ -10616,21 +10702,21 @@ function webPanel(r) {
   const head = aws ? title(tr("Use your AWS profile")) : gh ? title(tr("Sign in with GitHub")) : title(tr("Sign in to {registry}", { registry: "Docker Hub" }));
   let body;
   if (w.state === "notool") {
-    body = `<p>${w.tool === "gh" ? tr("Kiri signs in to GitHub with the GitHub CLI (gh), which isn't installed. Install it, then try again.")
-      : w.tool === "aws" ? tr("Kiri uses your AWS profile through the AWS CLI, which isn't installed. Public images still pull.")
-      : tr("Kiri signs in to Docker Hub with the docker command, which isn't installed. Install it, then try again.")}</p><div class="wft">${cancel(tr("Close"))}</div>`;
+    body = `<p>${w.tool === "gh" ? tr("Kiribra signs in to GitHub with the GitHub CLI (gh), which isn't installed. Install it, then try again.")
+      : w.tool === "aws" ? tr("Kiribra uses your AWS profile through the AWS CLI, which isn't installed. Public images still pull.")
+      : tr("Kiribra signs in to Docker Hub with the docker command, which isn't installed. Install it, then try again.")}</p><div class="wft">${cancel(tr("Close"))}</div>`;
   } else if (w.state === "failed") {
     body = `<p class="werr">${esc(w.error)}</p><div class="wft">${cancel(tr("Close"))}<button type="button" class="btn primary" data-websign="${r.id}">${tr("Try again")}</button></div>`;
   } else if (w.state === "code") {
-    body = `<p>${gh ? tr("GitHub's page asks you to let Kiri read your packages. Check that it shows this code:") : tr("Docker's own page signs you in. Check that it shows this code:")}</p>
+    body = `<p>${gh ? tr("GitHub's page asks you to let Kiribra read your packages. Check that it shows this code:") : tr("Docker's own page signs you in. Check that it shows this code:")}</p>
       <div class="wcode"><b>${esc(w.code)}</b><button type="button" class="btn" data-webcopy>${svgOf("copy")}${tr("Copy")}</button></div>
       <div class="wft">${cancel()}<button type="button" class="btn primary" data-webopen>${tr("Open {site}", { site: gh ? "GitHub" : "Docker Hub" })} ${svgOf("open")}</button></div>
-      ${safe(gh ? tr("You sign in on github.com. Kiri gets a token that can only read packages.") : tr("Your password and two-step code go to Docker, not Kiri."))}`;
+      ${safe(gh ? tr("You sign in on github.com. Kiribra gets a token that can only read packages.") : tr("Your password and two-step code go to Docker, not Kiribra."))}`;
   } else if (w.state === "waiting") {
     body = `${wait(w.code ? tr("Waiting for you to approve {code} in the browser…", { code: `<b>${esc(w.code)}</b>` }) : tr("Waiting for you to sign in in the browser…"))}
       <div class="wft">${w.url && !aws ? `<button type="button" class="linkish" data-webagain>${tr("Open the page again")}</button><span class="sp"></span>` : ""}${cancel()}</div>`;
   } else if (w.state === "sso") {
-    body = `${title(tr("Your AWS sign-in expired"))}<p>${tr("The profile {profile} signs in through AWS IAM Identity Center. Kiri runs {cmd}, which opens AWS's page.", { profile: `<b>${esc(w.profile)}</b>`, cmd: "<code>aws sso login</code>" })}</p>
+    body = `${title(tr("Your AWS sign-in expired"))}<p>${tr("The profile {profile} signs in through AWS IAM Identity Center. Kiribra runs {cmd}, which opens AWS's page.", { profile: `<b>${esc(w.profile)}</b>`, cmd: "<code>aws sso login</code>" })}</p>
       <div class="wft">${cancel()}<button type="button" class="btn primary" data-websso>${tr("Sign in with AWS")} ${svgOf("open")}</button></div>`;
     return `<div class="wpanel">${body}</div>`;
   } else if (aws && (w.state === "mfa" || w.state === "mfacheck")) {
@@ -10641,11 +10727,11 @@ function webPanel(r) {
         : `<div class="wotp${w.bad ? " bad" : ""}" role="group" aria-label="${tr("MFA code")}">${[0, 1, 2, 3, 4, 5].map((i) => `${i === 3 ? '<span class="dash">–</span>' : ""}<input inputmode="numeric" autocomplete="one-time-code" maxlength="6" data-mfa="${i}" aria-label="${i + 1}">`).join("")}</div>
       ${w.bad ? `<div class="wbad">${tr("AWS didn't accept that code. Wait for the next one and try again.")}</div>` : ""}`}
       <div class="wft">${cancel()}</div>
-      ${safe(tr("The code goes straight to the AWS CLI; Kiri doesn't keep it."))}`;
+      ${safe(tr("The code goes straight to the AWS CLI; Kiribra doesn't keep it."))}`;
     return `<div class="wpanel">${body}</div>`;
   } else if (aws && w.state === "profiles") {
     const list = w.profiles;
-    body = `<p>${tr("Public images on public.ecr.aws need nothing. For your own account's registry, Kiri runs {cmd} with this profile.", { cmd: "<code>aws ecr get-login-password</code>" })}</p>
+    body = `<p>${tr("Public images on public.ecr.aws need nothing. For your own account's registry, Kiribra runs {cmd} with this profile.", { cmd: "<code>aws ecr get-login-password</code>" })}</p>
       ${list == null ? wait(tr("Starting…")) : !list.length ? `<p>${tr("The AWS CLI has no profiles yet. Set one up with {cmd}.", { cmd: "<code>aws configure</code>" })}</p>`
         : `<label>${tr("AWS profile")}<select data-webprof>${list.map((p) => `<option${p === w.profile ? " selected" : ""}>${esc(p)}</option>`).join("")}</select></label>`}
       <div class="wft">${cancel()}${list?.length ? `<button type="button" class="btn primary" data-webprofile>${tr("Use this profile")}</button>` : ""}</div>
@@ -10748,7 +10834,7 @@ function ppList() {
     html = pp.status === "error" ? "" : exact;
     if (other) {
       const li = loginFor(r.host);
-      html += `<div class="pp-hint">${tr("{host} isn't searchable from here, so Kiri pulls the reference as typed.", { host: esc(r.host) })} ${li ? tr("Signed in as {name}.", { name: `<b>${esc(li.username || tr("a saved token"))}</b>` })
+      html += `<div class="pp-hint">${tr("{host} isn't searchable from here, so Kiribra pulls the reference as typed.", { host: esc(r.host) })} ${li ? tr("Signed in as {name}.", { name: `<b>${esc(li.username || tr("a saved token"))}</b>` })
         : !loginsOn() ? tr("If it's private, run {cmd} first.", { cmd: `<code>docker login ${esc(r.host)}</code>` }) : pp.signin ? tr("If it's private, sign in first:") : tr("If it's private, {link} first.", { link: `<button class="linkish" data-ppsignin>${tr("sign in to {host}", { host: esc(r.host) })}</button>` })}</div>${!li && pp.signin ? signinForm("pp", r.host, tr("Sign in")) : ""}`;
     }
     else if (pp.status === "short") html += `<div class="pp-hint">${tr("Keep typing to search Docker Hub.")}</div>`;
@@ -11095,7 +11181,7 @@ function registriesPane() {
       ${s.error ? `<div class="signin-err" role="alert">${esc(s.error)}</div>` : ""}
       <div class="res-foot"><span class="muted" id="reg-store">${esc(regStore(k))}</span><span style="flex:1"></span><button class="btn" data-regcancel${dis}>${tr("Cancel")}</button><button class="btn primary" data-signin-go${dis}>${s.busy ? tr("Signing in…") : tr("Sign in")}</button></div></div>`;
   return `<div class="pane"><h3>${tr("Registries")}</h3>
-    <p class="muted">${tr("Signed in to a registry, Kiri pulls its private images, and docker uses the same sign-in.")}</p>
+    <p class="muted">${tr("Signed in to a registry, Kiribra pulls its private images, and docker uses the same sign-in.")}</p>
     ${rows}${form}</div>`;
 }
 

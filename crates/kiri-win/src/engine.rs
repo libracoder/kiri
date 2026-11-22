@@ -52,7 +52,7 @@ static LISTED: std::sync::LazyLock<std::sync::Mutex<std::time::Instant>> = std::
 #[derive(Debug, Clone)]
 pub(crate) enum Cmd {
     Start,
-    /// Kiri came up: the window opened, or the hidden launch at login.
+    /// Kiribra came up: the window opened, or the hidden launch at login.
     /// Start, except that an engine the person stopped stays stopped.
     Launch,
     Stop,
@@ -109,7 +109,7 @@ fn env() -> Env {
     ENV.lock().unwrap_or_else(PoisonError::into_inner).clone().unwrap_or(Env { distro: None, pipe: r"\\.\pipe\kiri".into() })
 }
 
-/// The WSL distro Kiri's engine runs in, when not the default one: the
+/// The WSL distro Kiribra's engine runs in, when not the default one: the
 /// one named at start, or the one setup has just made (a first run starts
 /// with none, and setup's distro was otherwise left to WSL's default).
 pub(crate) fn distro() -> Option<String> {
@@ -297,7 +297,7 @@ fn bring_up(launch: bool) {
     }
 }
 
-/// Whether bringing Kiri up wakes the engine: Start always does, a launch
+/// Whether bringing Kiribra up wakes the engine: Start always does, a launch
 /// only when the engine said it was not stopped. Not knowing (its /info
 /// did not answer: an engine just started, or a wsl.exe slow after Windows
 /// woke) is no reason to wake it: that ended a person's Stop. A docker
@@ -306,7 +306,7 @@ fn wakes(launch: bool, stopped: Option<bool>) -> bool {
     !launch || stopped == Some(false)
 }
 
-/// Whether Kiri was stopped (Stop in the window or the tray): then it stays
+/// Whether Kiribra was stopped (Stop in the window or the tray): then it stays
 /// off until Start. None when the engine's /info did not answer.
 fn stopped() -> Option<bool> {
     client::get("/info").ok().map(|i| i["KiriStopped"] == true)
@@ -319,7 +319,7 @@ fn wake() -> io::Result<()> {
 }
 
 /// Makes sure the daemon answers, as this app's version: Ubuntu uses the
-/// `kiri` systemd service; the small Kiri Linux distro starts
+/// `kiri` systemd service; the small Kiribra Linux distro starts
 /// /usr/local/bin/kiri-start instead. An engine that answers on another
 /// version (started by the boot command or the bridge before an update's
 /// engine was copied in) is restarted on this one, once per run, on a
@@ -367,20 +367,20 @@ fn start_daemon() -> io::Result<()> {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    Err(io::Error::other("Kiri's engine did not start in WSL: run contrib\\windows\\kiri.ps1 to install it"))
+    Err(io::Error::other("Kiribra's engine did not start in WSL: run contrib\\windows\\kiri.ps1 to install it"))
 }
 
-/// `docker build` through Kiri, as on the Mac: BuildKit in a Kiri container
-/// (buildx's docker-container driver), loading what it builds into Kiri.
+/// `docker build` through Kiribra, as on the Mac: BuildKit in a Kiribra container
+/// (buildx's docker-container driver), loading what it builds into Kiribra.
 /// That container is the daemon's managed builder, made when buildx first
 /// looks for it and stopped when idle (crates/kiri/src/daemon/builder.rs);
 /// without buildx the CLI's classic POST /build uses the same BuildKit.
 /// kiri.ps1 makes it the builder `docker build` uses (BUILDX_BUILDER) when
-/// Kiri is the only engine; beside Docker Desktop, `buildx use` makes it the
+/// Kiribra is the only engine; beside Docker Desktop, `buildx use` makes it the
 /// one for the `kiri` context, and `buildx install` makes plain `docker
 /// build` use it, as on the Mac (crates/kiri/src/setup.rs `builder`), or
 /// it builds with buildx's fallback for the context, which never loads the
-/// image into Kiri. Needs the `kiri` context, which kiri.ps1 makes.
+/// image into Kiribra. Needs the `kiri` context, which kiri.ps1 makes.
 fn ensure_builder() {
     const BUILDER: &str = "kiri-build";
     let docker = crate::detail::docker_cli();
@@ -704,7 +704,7 @@ fn set_ports(id: &str, ports: Value) -> io::Result<()> {
 fn set_env(id: &str, env: Vec<String>) -> io::Result<()> {
     let r = client::request("POST", &format!("/kiri/containers/{id}/env"), Some(&json!({"env": env})))?;
     if r.status == 404 && !r.error().contains("No such container") {
-        return Err(io::Error::other("This engine can't change a container's environment yet: update Kiri's engine in WSL and try again."));
+        return Err(io::Error::other("This engine can't change a container's environment yet: update Kiribra's engine in WSL and try again."));
     }
     expect_ok(Ok(r))?;
     let info = client::get(&format!("/containers/{id}/json"))?;
@@ -753,10 +753,10 @@ fn about() {
 /// DOCKER_HOST and wherever Docker Desktop keeps the CLI config).
 fn status_event() -> String {
     let context = docker(&["context", "show"]).ok().map(|s| s.trim().to_owned()).filter(|c| !c.is_empty());
-    json!({"type": "status", "version": env!("CARGO_PKG_VERSION"), "share": true, "app": "Kiri", "ours": "kiri", "context": context.unwrap_or_else(|| "default".into())}).to_string()
+    json!({"type": "status", "version": env!("CARGO_PKG_VERSION"), "share": true, "app": "Kiribra", "ours": "kiribra", "context": context.unwrap_or_else(|| "default".into())}).to_string()
 }
 
-/// The docker CLI on Kiri's context, without a console window, for Compose
+/// The docker CLI on Kiribra's context, without a console window, for Compose
 /// in the window.
 fn compose_cli() -> io::Result<std::process::Command> {
     let mut cmd = crate::win::tool(&crate::detail::docker_cli());
@@ -765,7 +765,7 @@ fn compose_cli() -> io::Result<std::process::Command> {
     Ok(cmd)
 }
 
-/// The compose files opened in the window: %LOCALAPPDATA%\Kiri\compose.json.
+/// The compose files opened in the window: %LOCALAPPDATA%\Kiribra\compose.json.
 fn compose_store() -> Option<std::path::PathBuf> {
     prefs_path().map(|p| p.with_file_name("compose.json"))
 }
@@ -791,11 +791,11 @@ fn builds_event() -> String {
 }
 
 /// Which builder docker build uses, as chosen (crate::buildwith). An older
-/// Kiri named its builder in the user's BUILDX_BUILDER, which sent every
-/// build to Kiri whatever docker used: that goes, as Kiri's.
+/// Kiribra named its builder in the user's BUILDX_BUILDER, which sent every
+/// build to Kiribra whatever docker used: that goes, as Kiribra's.
 fn build_with() {
     // The user's own value (HKCU\Environment) goes only if it is still
-    // Kiri's. By reg.exe, not a PowerShell -Command: kiri-win runs no
+    // Kiribra's. By reg.exe, not a PowerShell -Command: kiri-win runs no
     // script text it carries (crate::win says why).
     if std::env::var("BUILDX_BUILDER").is_ok_and(|b| b == crate::builds::BUILDER.get()) {
         let reg = |args: &[&str]| {
@@ -818,28 +818,28 @@ fn build_with() {
     }
 }
 
-/// Which engine plain `docker` uses: Kiri, or back to the one before.
+/// Which engine plain `docker` uses: Kiribra, or back to the one before.
 fn use_context(name: &str) {
     let result = if name.is_empty() { Err(io::Error::other("no context named")) } else { docker(&["context", "use", name]).map(drop) };
     emit(status_event());
     emit(json!({"type": "usedcontext", "name": name, "error": result.as_ref().err().map(|e| e.to_string())}).to_string());
 }
 
-/// Which names containers answer at: <name>.kiri.local once its DNS rule
-/// is in (crate::dns), else <name>.kiri.localhost, which Windows' browsers
-/// resolve to this machine with no setup. HTTPS with Kiri's certificate is
+/// Which names containers answer at: <name>.kiribra.local once its DNS rule
+/// is in (crate::dns), else <name>.kiribra.localhost, which Windows' browsers
+/// resolve to this machine with no setup. HTTPS with Kiribra's certificate is
 /// the Mac's only.
 fn domains_event() -> String {
     // The rule alone is not enough: nothing answers if port 53 was taken.
     let on = crate::dns::installed() && crate::dns::serving();
-    json!({"type": "domains", "on": on, "suffix": if on { "kiri.local" } else { "kiri.localhost" }, "https": false}).to_string()
+    json!({"type": "domains", "on": on, "suffix": if on { "kiribra.local" } else { "kiribra.localhost" }, "https": false}).to_string()
 }
 
 /// Settings → Domains, or the welcome: adds or removes the DNS rule.
 fn domains(on: bool) {
     let _ = std::thread::Builder::new().name("kiri-domains".into()).spawn(move || {
         if on && !crate::dns::serving() {
-            emit(notice("error", &tr("Another program holds 127.0.0.1:53, so Kiri cannot answer for <name>.kiri.local; containers stay at <name>.kiri.localhost")));
+            emit(notice("error", &tr("Another program holds 127.0.0.1:53, so Kiribra cannot answer for <name>.kiribra.local; containers stay at <name>.kiribra.localhost")));
             emit(domains_event());
             return;
         }
@@ -847,8 +847,8 @@ fn domains(on: bool) {
             // Saying no to Windows' prompt is a choice, not an error.
             Err(e) if e.to_string().contains("canceled") => {}
             Err(e) => emit(notice("error", &trf("Could not change container names: {error}", &[("error", &e)]))),
-            Ok(()) if on => emit(notice("ok", &tr("Containers now answer at <name>.kiri.local"))),
-            Ok(()) => emit(notice("ok", &tr("Containers answer at <name>.kiri.localhost"))),
+            Ok(()) if on => emit(notice("ok", &tr("Containers now answer at <name>.kiribra.local"))),
+            Ok(()) => emit(notice("ok", &tr("Containers answer at <name>.kiribra.localhost"))),
         }
         emit(domains_event());
         send(Cmd::Refresh);
@@ -867,7 +867,7 @@ pub(crate) fn clipboard(text: &str) -> io::Result<()> {
     if status.success() { Ok(()) } else { Err(io::Error::other("clip.exe failed")) }
 }
 
-/// Kiri opening for the first time on this account: no settings were saved
+/// Kiribra opening for the first time on this account: no settings were saved
 /// before this run. Worked out on the first read, before anything is saved.
 pub(crate) fn fresh() -> bool {
     static FRESH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -883,12 +883,12 @@ fn ask_language() {
     }
 }
 
-/// The window's settings, in %LOCALAPPDATA%\Kiri\ui.json.
+/// The window's settings, in %LOCALAPPDATA%\Kiribra\ui.json.
 fn prefs_path() -> Option<std::path::PathBuf> {
-    std::env::var_os("LOCALAPPDATA").map(|d| std::path::PathBuf::from(d).join("Kiri").join("ui.json"))
+    std::env::var_os("LOCALAPPDATA").map(|d| std::path::PathBuf::from(d).join("Kiribra").join("ui.json"))
 }
 
-/// The settings, with the defaults for what the person hasn't picked: Kiri
+/// The settings, with the defaults for what the person hasn't picked: Kiribra
 /// starts dark until Settings → Appearance says otherwise.
 pub fn prefs() -> Value {
     fresh();
@@ -913,8 +913,8 @@ pub fn trf(en: &str, vars: &[(&str, &dyn std::fmt::Display)]) -> String {
     crate::lang::fill(tr(en), vars)
 }
 
-fn set_pref(name: &str, value: Value) {
-    if !matches!(name, "font" | "mono" | "scale" | "termH" | "termFs" | "termFont" | "domainsAsked" | "theme" | "accent" | "starAsked" | "updateAuto" | "lang" | "langAsked") {
+pub(crate) fn set_pref(name: &str, value: Value) {
+    if !matches!(name, "font" | "mono" | "scale" | "termH" | "termFs" | "termFont" | "domainsAsked" | "theme" | "accent" | "starAsked" | "updateAuto" | "lang" | "langAsked" | "webUi" | "webUiLan" | "webUiPort") {
         return;
     }
     let Some(path) = prefs_path() else { return };
@@ -923,13 +923,13 @@ fn set_pref(name: &str, value: Value) {
     let tmp = path.with_extension("json.tmp");
     let saved = path.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| std::fs::write(&tmp, p.to_string())).and_then(|()| std::fs::rename(&tmp, &path));
     if saved.is_err() {
-        emit(notice("error", &trf("Could not save the setting to {path}", &[("path", &"%LOCALAPPDATA%\\Kiri\\ui.json")])));
+        emit(notice("error", &trf("Could not save the setting to {path}", &[("path", &"%LOCALAPPDATA%\\Kiribra\\ui.json")])));
     }
 }
 
-/// A page link: only Kiri's own addresses, as on the Mac.
+/// A page link: only Kiribra's own addresses, as on the Mac.
 fn allowed_url(url: &str) -> bool {
-    if url == "https://kiri.canestack.com" || url == "https://learn.microsoft.com/windows/wsl/about" || url == "https://github.com/libracoder/kiri/issues/new" || url == "https://github.com/libracoder/kiri" || url == "https://login.docker.com/activate" || url == "https://github.com/login/device" {
+    if url == "https://kiri.canestack.com" || url == "https://learn.microsoft.com/windows/wsl/about" || url == "https://github.com/astosweb/kiribra/issues/new" || url == "https://github.com/astosweb/kiribra" || url == "https://login.docker.com/activate" || url == "https://github.com/login/device" {
         return true;
     }
     let Some(rest) = url.strip_prefix("http://").or_else(|| url.strip_prefix("https://")) else { return false };
@@ -941,7 +941,7 @@ fn allowed_url(url: &str) -> bool {
         return false;
     }
     let host = authority.split(':').next().unwrap_or("");
-    host == "localhost" || host.ends_with(".kiri.localhost") || host.ends_with(".kiri.local")
+    host == "localhost" || host.ends_with(".kiribra.localhost") || host.ends_with(".kiribra.local")
 }
 
 #[cfg(test)]
@@ -962,7 +962,7 @@ mod tests {
         assert!(expect_done(Err(std::io::Error::other("no engine"))).is_err());
     }
 
-    /// Only Start ends a Stop: Kiri coming up (the window, or hidden at
+    /// Only Start ends a Stop: Kiribra coming up (the window, or hidden at
     /// login) starts the engine unless the person stopped it.
     #[test]
     fn a_launch_does_not_undo_a_stop() {
@@ -989,14 +989,14 @@ mod tests {
     #[test]
     fn only_kiris_own_urls_open() {
         assert!(allowed_url("http://localhost:8080/app"));
-        assert!(allowed_url("https://web.kiri.localhost/"));
-        assert!(allowed_url("http://api.kiri.local"));
-        assert!(allowed_url("https://github.com/libracoder/kiri"));
+        assert!(allowed_url("https://web.kiribra.localhost/"));
+        assert!(allowed_url("http://api.kiribra.local"));
+        assert!(allowed_url("https://github.com/astosweb/kiribra"));
         assert!(!allowed_url("http://evil.example/"));
         // Bypass attempts the audit found.
         assert!(!allowed_url("http://localhost:1@evil.example/"));
-        assert!(!allowed_url("http://evil.example\\x.kiri.localhost"));
-        assert!(!allowed_url("https://evil.example/#.kiri.localhost"));
+        assert!(!allowed_url("http://evil.example\\x.kiribra.localhost"));
+        assert!(!allowed_url("https://evil.example/#.kiribra.localhost"));
         assert!(!allowed_url("ftp://localhost/"));
     }
 }
@@ -1029,14 +1029,15 @@ pub fn on_message(msg: &str) {
                 fonts_event();
             });
             emit(json!({"type": "prefs", "prefs": prefs()}).to_string());
-            // KIRI_STAR_PROMPT=1 shows the star card now, as on the Mac.
-            if std::env::var_os("KIRI_STAR_PROMPT").is_some() {
+            crate::webctl::autostart_if_wanted();
+            // KIRIBRA_STAR_PROMPT=1 shows the star card now, as on the Mac.
+            if std::env::var_os("KIRIBRA_STAR_PROMPT").is_some() {
                 emit(r#"{"type":"starprompt"}"#.to_owned());
             }
             emit(domains_event());
             emit(status_event());
             ask_language();
-            // The first time, offer <name>.kiri.local, as the Mac does.
+            // The first time, offer <name>.kiribra.local, as the Mac does.
             if !crate::dns::installed() && crate::dns::serving() && prefs()["domainsAsked"] != true {
                 set_pref("domainsAsked", json!(true));
                 emit(r#"{"type":"welcome"}"#.to_owned());
@@ -1051,7 +1052,7 @@ pub fn on_message(msg: &str) {
                 emit(crate::buildwith::event());
             });
             send(Cmd::Refresh);
-            // Opening the window starts Kiri, unless it was stopped: that waits for Start.
+            // Opening the window starts Kiribra, unless it was stopped: that waits for Start.
             send(Cmd::Launch);
             // Anything newer than this build, and a staged update not yet in.
             crate::update::check_now(false);
@@ -1233,6 +1234,29 @@ pub fn on_message(msg: &str) {
         // Settings → Resources: WSL's CPUs and memory, in .wslconfig.
         "resources" => crate::wslconfig::resources(None),
         "setresources" => crate::wslconfig::resources(Some(c.value)),
+        "webui" => crate::webctl::emit_status(),
+        "webuistart" => {
+            let lan = c.value["lan"].as_bool().unwrap_or(prefs()["webUiLan"] == true);
+            let port = c.value["port"].as_u64().or_else(|| prefs()["webUiPort"].as_u64()).unwrap_or(7676) as u16;
+            std::thread::spawn(move || match crate::webctl::start(lan, port) {
+                Ok(()) => {
+                    emit(notice("ok", &tr("Web UI is on")));
+                    crate::webctl::emit_status();
+                }
+                Err(e) => {
+                    emit(notice("error", &e));
+                    crate::webctl::emit_status();
+                }
+            });
+        }
+        "webuistop" => {
+            std::thread::spawn(|| {
+                crate::webctl::stop();
+                emit(notice("ok", &tr("Web UI is off")));
+                crate::webctl::emit_status();
+            });
+        }
+        "webuiopen" => crate::webctl::open_browser(),
         "domains" => domains(c.value.as_bool().unwrap_or(false)),
         "routerports" => {
             std::thread::spawn(|| router_ports(None));

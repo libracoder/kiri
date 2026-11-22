@@ -1,6 +1,6 @@
 #!/bin/bash
 # The Linux half of the Windows bundle (cargo xtask windows runs this in
-# WSL): static kiri and kiri-init (musl), so the same binaries run in Kiri
+# WSL): static kiri and kiri-init (musl), so the same binaries run in Kiribra
 # Linux (Alpine) and in Ubuntu. x86_64 for x86-64 PCs, aarch64 for Windows
 # on Arm, from either kind of WSL. ring's C code is compiled by zig cc,
 # from a Python venv in ~/.cache, so the distro needs nothing installed.

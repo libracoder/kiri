@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-/// The first `kiri` on the user's PATH, when it isn't this Kiri's: an older
+/// The first `kiri` on the user's PATH, when it isn't this Kiribra's: an older
 /// copy (a manual build in ~/.local/bin, Homebrew, a file in /usr/local/bin)
 /// that runs instead of this one in every terminal. Reported, never deleted.
 /// The PATH is the login shell's: a window opened from Finder or the app
@@ -29,7 +29,7 @@ pub fn stale_kiri() -> Option<PathBuf> {
     }
 }
 
-/// This Kiri's `kiri`: the running binary on the Mac (the window is the same
+/// This Kiribra's `kiri`: the running binary on the Mac (the window is the same
 /// binary), the package's /usr/bin/kiri beside Linux's separate window.
 fn our_kiri() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;

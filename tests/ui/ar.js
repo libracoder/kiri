@@ -126,7 +126,7 @@ t("dragging a column's edge to the left widens it: its far edge is the left one"
 const member = (id, name, state) => ({ Id: id, Names: ["/" + name], Image: "nginx:alpine", State: state, Status: state === "running" ? "Up 1 hour" : "Exited (0)", Created: Date.now() / 1000 - 3600, Ports: [], Labels: { "com.docker.compose.project": "shop" } });
 kiri.on({ type: "lists", containers: [...ui.containers, member("c1", "shop_web_1", "running"), member("c2", "shop_db_1", "exited")], images: ui.images, volumes: ui.volumes, networks: ui.networks });
 kiri.on({ type: "composeprojects", logos: {}, projects: [{ name: "shop", dir: "/w/shop", files: ["/w/shop/compose.yaml"], readable: true, services: [], containers: [] }] });
-kiri.on({ ...ui.status, type: "status", app: "Kiri Dev", ours: "kiri", context: "default" });
+kiri.on({ ...ui.status, type: "status", app: "Kiribra Dev", ours: "kiri", context: "default" });
 // The project's row is in Compose.
 show("compose");
 t("a line the page joins itself keeps its Arabic words in order", () => {

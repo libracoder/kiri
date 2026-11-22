@@ -46,7 +46,7 @@ use std::time::{Duration, Instant};
 
 use crate::diag;
 
-/// `~/.kiri` (`~/.kiri-dev` for Kiri Dev): the daemon's state (the CA key, proxy settings). Always under
+/// `~/.kiribra` (`~/.kiribra-dev` for Kiribra Dev): the daemon's state (the CA key, proxy settings). Always under
 /// HOME: `KIRI_SOCKET` may point the socket anywhere, but it must not move
 /// private state into a directory another user can prepare.
 pub fn state_dir() -> io::Result<PathBuf> {
@@ -54,7 +54,7 @@ pub fn state_dir() -> io::Result<PathBuf> {
     Ok(home.join(crate::flavor::STATE.get()))
 }
 
-/// `~/.kiri/run/docker.sock`, beside OrbStack's `~/.orbstack/run/docker.sock`.
+/// `~/.kiribra/run/docker.sock`, beside OrbStack's `~/.orbstack/run/docker.sock`.
 pub fn socket_path() -> io::Result<PathBuf> {
     if let Some(s) = std::env::var_os("KIRI_SOCKET") {
         return Ok(PathBuf::from(s));
@@ -142,7 +142,7 @@ pub fn run(_args: &[String]) -> io::Result<()> {
     diag::info!("engine ready", version = env!("CARGO_PKG_VERSION"), ms = t0.elapsed().as_millis(), socket = format!("unix://{}", socket.display()));
     // Crash files from earlier runs, if the person said they may go.
     diag::report::spawn_crash_sender(Duration::from_secs(30), Some(Duration::from_secs(6 * 3600)));
-    // Container files in Finder, at ~/Kiri. A Linux host has them on its
+    // Container files in Finder, at ~/Kiribra. A Linux host has them on its
     // own disk already.
     #[cfg(target_os = "macos")]
     finder(&engine);
@@ -151,8 +151,8 @@ pub fn run(_args: &[String]) -> io::Result<()> {
     builder::watch(engine.clone());
     // A Kubernetes node the engine restarted gets its kubectl context.
     crate::k8s::sync_at_start();
-    // Kiri Dev leaves *.kiri.local and ports 80 and 443 to the installed
-    // Kiri, unless given ports of its own (Settings → Domains, or
+    // Kiribra Dev leaves *.kiribra.local and ports 80 and 443 to the installed
+    // Kiribra, unless given ports of its own (Settings → Domains, or
     // KIRI_HTTP_PORT and KIRI_HTTPS_PORT).
     let routers = !crate::flavor::dev() || domains::own_ports();
     if crate::flavor::dev() {
@@ -160,7 +160,7 @@ pub fn run(_args: &[String]) -> io::Result<()> {
             diag::info!(format!("{}: container domains off (ports in Settings → Domains turn them on)", crate::flavor::APP));
         }
     } else if let Err(e) = dns::start() {
-        diag::warn!("*.kiri.local off", error = e);
+        diag::warn!("*.kiribra.local off", error = e);
     }
     if routers {
         match domains::start_tls(engine.clone()) {
@@ -170,7 +170,7 @@ pub fn run(_args: &[String]) -> io::Result<()> {
         match domains::start(engine.clone()) {
             Ok(port) => diag::info!(format!(
                 "container domains on http://<name>.{}{}",
-                if dns::installed() { "kiri.local" } else { "kiri.localhost" },
+                if dns::installed() { "kiribra.local" } else { "kiribra.localhost" },
                 if port == 80 { String::new() } else { format!(":{port}") }
             )),
             Err(e) => diag::warn!("container domains off", error = e),
@@ -240,7 +240,7 @@ fn watch_own_app(engine: std::sync::Arc<engine::Engine>, socket: std::path::Path
     });
 }
 
-/// Serves container files over NFS and mounts them at ~/Kiri.
+/// Serves container files over NFS and mounts them at ~/Kiribra.
 /// KIRI_NO_FINDER=1 skips the mount.
 #[cfg(target_os = "macos")]
 fn finder(engine: &std::sync::Arc<engine::Engine>) {

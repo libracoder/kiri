@@ -16,7 +16,7 @@ mod builds;
 // for Windows).
 #[cfg(unix)]
 mod appwatch;
-// Which builder plain `docker build` uses: Docker's or Kiri's.
+// Which builder plain `docker build` uses: Docker's or Kiribra's.
 #[cfg(unix)]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod buildwith;
@@ -79,16 +79,17 @@ mod tools;
 mod update;
 
 const USAGE: &str = "\
-usage: kiri COMMAND          docker's commands, on Kiri: kiri run, ps, exec,
+usage: kiri COMMAND          docker's commands, on Kiribra: kiri run, ps, exec,
                              logs, stop, rm, images, pull, build, compose…
-       kiri start                 start Kiri after a Stop (the window's Start)
+       kiri start                 start Kiribra after a Stop (the window's Start)
        kiri daemon
        kiri bridge [--socket PATH]   (WSL2: the end of kiri-win.exe)
        kiri ui [--start] [--view containers|images|volumes|networks]
+       kiri ui --web [--lan] [--host ADDR] [--port N] [--start] [--view …]
        kiri setup [--use] [--no-agent] | kiri setup --uninstall
        kiri build-with [docker|kiri]   which builder docker build uses
-       kiri domains [set [--http N] [--https N] | reset]   the *.kiri.local routers' ports
-       kiri update [--check]      update Kiri (with a container: docker's update)
+       kiri domains [set [--http N] [--https N] | reset]   the *.kiribra.local routers' ports
+       kiri update [--check]      update Kiribra (with a container: docker's update)
        kiri diag logs [-f] [--ui|--engine|--cli] [--errors] [-n N]
        kiri diag report [--out PATH] [--send]   (a file to send us, tokens taken out)
        kiri PORT [NAME]           share a local port on the internet (same as kiri share PORT)
@@ -174,12 +175,14 @@ fn main() -> ExitCode {
         Some("update") if !docker::is_container_update(&args[1..]) => update::run(&args[1..]),
         #[cfg(unix)]
         Some("diag") => diag::run(&args[1..]),
-        // Opening Kiri.app: set up on first launch, then the window.
+        // Opening Kiribra.app: set up on first launch, then the window.
         #[cfg(target_os = "macos")]
         None if setup::launched_from_app() => {
             setup::first_launch();
             ui::run(true, None)
         }
+        #[cfg(any(target_os = "macos", all(target_os = "linux", feature = "window")))]
+        Some("ui") if args.iter().any(|a| a == "--web") => ui::run_web(&args[1..]),
         #[cfg(any(target_os = "macos", all(target_os = "linux", feature = "window")))]
         Some("ui") => ui::run(
             args.iter().any(|a| a == "--start"),
@@ -227,7 +230,7 @@ fn window(args: &[String]) -> std::io::Result<()> {
     use std::os::unix::process::CommandExt;
     if !std::path::Path::new(WINDOW).exists() {
         return Err(std::io::Error::other(
-            "this Kiri has no window. It comes with the kiri package for x86-64 (Debian, Ubuntu, Fedora); \
+            "this Kiribra has no window. It comes with the kiri package for x86-64 (Debian, Ubuntu, Fedora); \
              kiri-lite and the ARM packages are the engine and CLI only",
         ));
     }
@@ -235,20 +238,20 @@ fn window(args: &[String]) -> std::io::Result<()> {
     Err(std::process::Command::new(WINDOW).args(args).exec())
 }
 
-/// `kiri start`: Kiri on again after a Stop (the window's, the tray's or
+/// `kiri start`: Kiribra on again after a Stop (the window's, the tray's or
 /// the menu bar's), as the window's Start does; the containers Stop held
 /// come back. On an engine that wasn't stopped it only wakes the VM.
 #[cfg(unix)]
 fn engine_start() -> std::io::Result<()> {
     if !client::alive() {
-        return Err(std::io::Error::other("Kiri's engine isn't running. Open Kiri, or start it with `kiri daemon`"));
+        return Err(std::io::Error::other("Kiribra's engine isn't running. Open Kiribra, or start it with `kiri daemon`"));
     }
     let r = client::request("POST", "/kiri/wake", None)?;
     // 404: a Linux host's engine, which has no VM to wake and no Stop.
     if !r.ok() && r.status != 404 {
         return Err(std::io::Error::other(r.error()));
     }
-    println!("Kiri is started");
+    println!("Kiribra is started");
     Ok(())
 }
 
@@ -267,6 +270,6 @@ fn engine_version_check() {
     let Some(engine) = client::request("GET", "/version", None).ok().filter(|r| r.ok()).and_then(|r| client::kiri_version(&r.json()).map(str::to_owned)) else { return };
     if engine != me && engine != "0.0.0" {
         let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "kiri".into());
-        eprintln!("kiri: this kiri ({exe}) is {me}, but the engine runs {engine}. Restart the engine to use one version (Kiri → Restart engine), or remove the older kiri.");
+        eprintln!("kiri: this kiri ({exe}) is {me}, but the engine runs {engine}. Restart the engine to use one version (Kiribra → Restart engine), or remove the older kiri.");
     }
 }

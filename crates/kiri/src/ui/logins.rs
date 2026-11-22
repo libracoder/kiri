@@ -23,7 +23,7 @@ mod b64;
 /// Docker Hub's key in config.json and with credential helpers.
 pub const HUB: &str = "https://index.docker.io/v1/";
 /// What credential helpers label their items, in the Keychain and in
-/// Credential Manager; Kiri's own items say the same, so either finds both.
+/// Credential Manager; Kiribra's own items say the same, so either finds both.
 #[cfg_attr(target_os = "linux", allow(dead_code))]
 const LABEL: &str = "Docker Credentials";
 /// The username a helper gives for an identity token instead of a password.
@@ -161,7 +161,7 @@ fn valid_helper(name: &str) -> bool {
 }
 
 /// `docker-credential-<name>`: on PATH, else where Docker Desktop, Homebrew
-/// or Kiri put it (an app started from Finder has a short PATH).
+/// or Kiribra put it (an app started from Finder has a short PATH).
 fn helper_path(name: &str) -> Option<PathBuf> {
     let file = format!("docker-credential-{name}{}", std::env::consts::EXE_SUFFIX);
     let path: Vec<PathBuf> = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect()).unwrap_or_default();
@@ -173,10 +173,10 @@ pub(super) fn helper_dirs() -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = ["/usr/local/bin", "/opt/homebrew/bin", "/Applications/Docker.app/Contents/Resources/bin"].map(PathBuf::from).into();
     if let Some(h) = std::env::var_os("HOME").map(PathBuf::from) {
         v.push(h.join(".docker/bin"));
-        v.push(h.join(".kiri/bin"));
+        v.push(h.join(".kiribra/bin"));
         v.push(h.join("Applications/Docker.app/Contents/Resources/bin"));
     }
-    // Kiri.app's own.
+    // Kiribra.app's own.
     if let Some(dir) = std::env::current_exe().ok().and_then(|e| e.canonicalize().ok()).and_then(|e| e.parent().map(|d| d.join("../Resources/bin"))) {
         v.push(dir);
     }
@@ -191,7 +191,7 @@ pub(super) fn helper_dirs() -> Vec<PathBuf> {
         v.push(pf.join(r"Docker\Docker\resources\bin"));
     }
     if let Some(d) = env("LOCALAPPDATA") {
-        v.push(d.join(r"Kiri\bin"));
+        v.push(d.join(r"Kiribra\bin"));
     }
     if let Some(d) = env("USERPROFILE") {
         v.push(d.join(r".docker\bin"));
@@ -275,7 +275,7 @@ fn auths_entry<'a>(cfg: &'a Value, key: &str) -> Option<&'a Value> {
 }
 
 /// The sign-in for `key`, found as the docker CLI finds it: the configured
-/// helper when it's there; else the system's store, where Kiri saves one
+/// helper when it's there; else the system's store, where Kiribra saves one
 /// when there's no helper; then config.json itself.
 pub fn find(key: &str) -> Option<Login> {
     let cfg = read_config();
@@ -334,7 +334,7 @@ pub fn login(server: &str, username: &str, secret: &str) -> String {
     let body = json!({"username": username, "password": secret, "serveraddress": key});
     let resp = match client::request("POST", "/auth", Some(&body)) {
         Ok(r) => r,
-        Err(e) => return failed(&key, &format!("Kiri's engine didn't answer: {e}")),
+        Err(e) => return failed(&key, &format!("Kiribra's engine didn't answer: {e}")),
     };
     if resp.status == 401 || resp.status == 403 {
         return failed(&key, &format!("{} didn't accept that username and password or token.", display(&key)));
@@ -417,7 +417,7 @@ pub fn handle(cmd: &str, server: String, value: &Value, emit: fn(String), ready:
         "login" => {
             match ready() {
                 Ok(()) => emit(login(&server, &username, &secret)),
-                Err(e) => emit(failed(&server_key(&server), &format!("Kiri's engine isn't running: {e}"))),
+                Err(e) => emit(failed(&server_key(&server), &format!("Kiribra's engine isn't running: {e}"))),
             }
             emit(list());
         }
@@ -806,7 +806,7 @@ mod tests {
         assert_eq!(registry("nginx:alpine"), HUB);
         assert_eq!(registry("bitnami/redis:7"), HUB);
         assert_eq!(registry("docker.io/library/redis"), HUB);
-        assert_eq!(registry("ghcr.io/kiri-dev/api:0.4"), "ghcr.io");
+        assert_eq!(registry("ghcr.io/kiribra-dev/api:0.4"), "ghcr.io");
         assert_eq!(registry("localhost:5000/app"), "localhost:5000");
         assert_eq!(registry("localhost/app"), "localhost");
         assert_eq!(registry("123.dkr.ecr.eu-west-1.amazonaws.com/app@sha256:abc"), "123.dkr.ecr.eu-west-1.amazonaws.com");

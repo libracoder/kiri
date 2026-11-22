@@ -239,15 +239,15 @@ fn linux_terminal(file: &std::path::Path) -> io::Result<()> {
 
 /// The container's root on the Mac (the Finder view), and `path` inside it.
 /// Only plain components are allowed, so nothing outside the container is read.
-/// `host_path`, once the engine's files are really at `~/Kiri`. On the Mac
+/// `host_path`, once the engine's files are really at `~/Kiribra`. On the Mac
 /// they are there only while the engine's Finder mount is: it is skipped
 /// when the folder already holds the person's own files, and those must
 /// never be listed as the container's.
 fn shown_path(name: &str, path: &str) -> io::Result<PathBuf> {
     #[cfg(target_os = "macos")]
     if !crate::daemon::nfs::is_mounted() {
-        let dir = crate::daemon::nfs::mount_point().map_or_else(|_| "~/Kiri".into(), |d| d.display().to_string());
-        return Err(io::Error::other(format!("Container files show through {dir}, and the engine has nothing mounted there now. If {dir} has your own files in it, Kiri leaves them alone: move them and restart the engine.")));
+        let dir = crate::daemon::nfs::mount_point().map_or_else(|_| "~/Kiribra".into(), |d| d.display().to_string());
+        return Err(io::Error::other(format!("Container files show through {dir}, and the engine has nothing mounted there now. If {dir} has your own files in it, Kiribra leaves them alone: move them and restart the engine.")));
     }
     host_path(name, path)
 }
@@ -378,8 +378,8 @@ mod tests {
 
     #[test]
     fn keeps_paths_inside_the_container() {
-        assert!(super::host_path("web", "/etc/nginx/nginx.conf").unwrap().ends_with("Kiri/web/etc/nginx/nginx.conf"));
-        assert!(super::host_path("web", "").unwrap().ends_with("Kiri/web"));
+        assert!(super::host_path("web", "/etc/nginx/nginx.conf").unwrap().ends_with("Kiribra/web/etc/nginx/nginx.conf"));
+        assert!(super::host_path("web", "").unwrap().ends_with("Kiribra/web"));
         assert!(super::host_path("web", "/etc/../../other").is_err());
         assert!(super::host_path("../web", "/").is_err());
         assert!(super::host_path("", "/").is_err());

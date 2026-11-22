@@ -1,5 +1,5 @@
 //! Pull image's suggestions: Docker Hub's search and each image's tags.
-//! Answers are kept in ~/Library/Caches/Kiri/hub.json, so a search seen
+//! Answers are kept in ~/Library/Caches/Kiribra/hub.json, so a search seen
 //! before shows at once, offline too; one older than a day is shown and
 //! then fetched again, and the page swaps in the fresh answer.
 
@@ -34,7 +34,7 @@ impl Kind {
 
 fn path() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join("Library/Caches/Kiri/hub.json"))
+    Some(PathBuf::from(home).join("Library/Caches/Kiribra/hub.json"))
 }
 
 fn now() -> u64 {

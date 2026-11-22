@@ -1,4 +1,4 @@
-// What Kiri's window costs, beside its version in the status bar.
+// What Kiribra's window costs, beside its version in the status bar.
 const R = [];
 const t = (name, fn) => { try { fn(); R.push("PASS " + name); } catch (e) { R.push("FAIL " + name + ": " + e.message); } };
 t("the window asks what it costs, and shows it beside the version", () => {

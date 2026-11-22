@@ -354,7 +354,7 @@ pub fn connect(socket: &Path, location: &str, name: &str, speed: u32, devid: u32
         let _ = r.read_exact(&mut body);
         let text = String::from_utf8_lossy(&body);
         let msg = serde_json::from_str::<serde_json::Value>(&text).ok().and_then(|v| v["message"].as_str().map(str::to_owned)).unwrap_or_else(|| text.trim().to_owned());
-        return Err(io::Error::other(format!("Kiri did not take the device: {msg}")));
+        return Err(io::Error::other(format!("Kiribra did not take the device: {msg}")));
     }
     stream.set_read_timeout(None)?;
     Ok((stream, r))

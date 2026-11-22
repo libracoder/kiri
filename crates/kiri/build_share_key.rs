@@ -1,10 +1,10 @@
-// Compiles the Kiri Share build key into official releases: `include!`d
+// Compiles the Kiribra Share build key into official releases: `include!`d
 // by the build scripts of `kiri` and `kiri-win`, which both carry
 // `share.rs`.
 // 
 // Release builds set `KIRI_SHARE_BUILD_KEY=id:hex` (64 hex digits); the
 // edge uses it to tell official builds from forks (see
-// `kiri-share-proto::attest`). Without it Kiri builds and works the same,
+// `kiri-share-proto::attest`). Without it Kiribra builds and works the same,
 // and its tunnels show as unverified. The key is stored masked, so it isn't
 // a plain string in the binary; that only slows down someone looking.
 

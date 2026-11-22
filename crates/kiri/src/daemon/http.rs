@@ -434,7 +434,7 @@ fn head(w: &mut impl Write, status: u16, extra: &str) -> io::Result<()> {
     let closing = if CLOSING.with(std::cell::Cell::get) && !extra.contains("Connection:") { CLOSE } else { "" };
     write!(
         w,
-        "HTTP/1.1 {status} {}\r\nApi-Version: {API_VERSION}\r\nDocker-Experimental: false\r\nOstype: linux\r\nServer: Kiri/{} (linux)\r\n{extra}{closing}\r\n",
+        "HTTP/1.1 {status} {}\r\nApi-Version: {API_VERSION}\r\nDocker-Experimental: false\r\nOstype: linux\r\nServer: Kiribra/{} (linux)\r\n{extra}{closing}\r\n",
         reason(status),
         env!("CARGO_PKG_VERSION")
     )

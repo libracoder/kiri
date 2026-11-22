@@ -120,13 +120,13 @@ def check_version():
     _, _, v = c.request("GET", "/version")
     v = json.loads(v)
     major = int(v["Version"].split(".")[0])
-    # Testcontainers refuses an engine below 1.6.0; Kiri's own 0.x read as one.
+    # Testcontainers refuses an engine below 1.6.0; Kiribra's own 0.x read as one.
     assert major >= 20, f"Version {v['Version']} is not a Docker Engine version"
     assert v.get("KiriVersion"), "no KiriVersion"
-    assert any(x["Name"] == "Kiri" for x in v["Components"]), "no Kiri component"
+    assert any(x["Name"] == "Kiribra" for x in v["Components"]), "no Kiribra component"
     _, _, i = c.request("GET", "/info")
     assert json.loads(i)["ServerVersion"] == v["Version"], "info's ServerVersion differs"
-    return f"engine {v['Version']}, Kiri {v['KiriVersion']}"
+    return f"engine {v['Version']}, Kiribra {v['KiriVersion']}"
 
 
 def check_cmd():
@@ -414,7 +414,7 @@ def check_copy_after_start():
 def check_buildx_bootstrap(rounds=20):
     # buildx's docker-container driver makes its BuildKit container, copies
     # /etc/buildkit into it (a chunked PUT /archive) and starts it at once,
-    # on the same pooled connection. Kiri 0.1.18 answered the copy and then
+    # on the same pooled connection. Kiribra 0.1.18 answered the copy and then
     # closed the connection without saying so: the start went into a closing
     # socket and buildx failed with "connection reset by peer", in about one
     # bootstrap in six (#83). Asked raw, the lost start shows every time.

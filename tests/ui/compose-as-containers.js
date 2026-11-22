@@ -25,7 +25,7 @@ const P = [
   { name: "draft", dir: "/w/draft", files: ["/w/draft/compose.yaml"], readable: true, fresh: true, services: [svc("web"), svc("api")], containers: [] },
 ];
 ui.vm = "running";
-kiri.on({ type: "status", version: "0.1.4", dev: true, share: true, app: "Kiri", ours: "kiri", context: "kiri" });
+kiri.on({ type: "status", version: "0.1.4", dev: true, share: true, app: "Kiribra", ours: "kiri", context: "kiri" });
 const solo = { Id: "solo", Names: ["/solo"], Image: "nginx", State: "running", Status: "Up", Created: now - 50, Ports: [{ IP: "0.0.0.0", PrivatePort: 80, PublicPort: 8081, Type: "tcp" }], Labels: {} };
 // The same containers with no project (and the address Compose's would have): what Containers draws for them.
 const looseOf = (c) => ({ ...c, Labels: { "dev.kiri.domain": `${c.Labels["com.docker.compose.service"]}.${c.Labels["com.docker.compose.project"]}` } });
@@ -48,7 +48,7 @@ const look = () => {
   return { head: Math.round(tbl.tHead.rows[0].getBoundingClientRect().height), row: Math.round(r.getBoundingClientRect().height), pad: [cs(name).paddingTop, cs(name).paddingRight, cs(name).paddingBottom, cs(r.cells[0]).paddingLeft].join(" "),
     cols: [...tbl.tHead.rows[0].cells].filter((c) => !c.classList.contains("ck")).map((c) => c.firstChild.textContent) };
 };
-// A tile's size, corner and icon; a loose container's Kiri badge, where it sits off the tile's corner and its size.
+// A tile's size, corner and icon; a loose container's Kiribra badge, where it sits off the tile's corner and its size.
 const tileLook = (el) => { const t = el.getBoundingClientRect(), i = el.querySelector("svg").getBoundingClientRect(); return [t.width, t.height, cs(el).borderRadius, i.width, i.height]; };
 const badgeLook = (wrap) => { const t = wrap.querySelector(".tile").getBoundingClientRect(), b = wrap.querySelector(".kbadge").getBoundingClientRect(), d = wrap.querySelector(".kbadge .kdot").getBoundingClientRect();
   return [b.right - t.right, b.bottom - t.bottom, d.width, d.height]; };
@@ -87,7 +87,7 @@ t("a project's containers have no Remove: no trash, none in ⋯, Show in compose
   eq($$c('tr.member [data-c="remove"], tr.member [data-ksettings]').length, 0, "no trash");
   eq(btns(row("b2")), ["Start it to restart it", "Start", "More actions for blog-worker-1"], "Restart, Start, ⋯");
   click(row("b1").querySelector("[data-more]"));
-  eq(menu(), ["Open http://app.blog.kiri.localhost", "Ports…", "Pause", "Show in compose file"], "⋯");
+  eq(menu(), ["Open http://app.blog.kiribra.localhost", "Ports…", "Pause", "Show in compose file"], "⋯");
   closeMenu();
 });
 t("replicas: one row each", () => {
@@ -121,7 +121,7 @@ t("a project's notices: rows of the same shape under its row, ⚠ or ⓘ, the fi
   const w = grp("blog").nextElementSibling, n = grp("named").nextElementSibling;
   eq([w.matches("tr.member.warnrow"), !!w.querySelector(".tile.warn"), w.querySelector(".wtitle").textContent, w.querySelector(".sub-name").textContent, btns(w)],
     [true, true, "Compose rejects this file.", "A required variable may not be set: BLOG_KEY.", ["Show in file"]], "rejects");
-  eq([n.matches(".warnrow.info"), !!n.querySelector(".tile.note"), n.querySelector(".wtitle").textContent, btns(n)], [true, true, "Kiri can't check this file's variables, so it manages this project by name.", []], "by name");
+  eq([n.matches(".warnrow.info"), !!n.querySelector(".tile.note"), n.querySelector(".wtitle").textContent, btns(n)], [true, true, "Kiribra can't check this file's variables, so it manages this project by name.", []], "by name");
   eq(w.offsetHeight, row("b1").offsetHeight, "as tall as a container's row");
   eq(w.nextElementSibling.dataset.key, "b1", "its containers after it");
   eq($$c('tr.unmade[data-cmpsvc="named"]').length, 0, "by name, no service rows");
