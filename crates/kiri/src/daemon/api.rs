@@ -3464,11 +3464,15 @@ fn upload_reader<'a>(head: Vec<u8>, rest: impl io::Read + 'a) -> Result<Box<dyn 
 
 fn archive_put(req: &Request, engine: &Engine, id: &str, w: &mut UnixStream, r: &mut BufReader<UnixStream>) -> io::Result<Next> {
     use kiri_proto::copy_flags;
-    let path = req.query("path").unwrap_or("/");
+    let raw_path = req.query("path").unwrap_or("/");
     let mut flags = copy_flags::CHUNKED;
-    if req.flag("copyUIDGID") {
+    let path = if req.flag("copyUIDGID") {
         flags |= copy_flags::KEEP_OWNERS;
-    }
+        let user = engine.with(id, |c| c.spec.user.clone()).unwrap_or_default();
+        if user.is_empty() { raw_path.to_owned() } else { format!("{raw_path}\0{user}") }
+    } else {
+        raw_path.to_owned()
+    };
     if req.flag("noOverwriteDirNonDir") {
         flags |= copy_flags::NO_OVERWRITE_DIR_NON_DIR;
     }
@@ -3485,7 +3489,7 @@ fn archive_put(req: &Request, engine: &Engine, id: &str, w: &mut UnixStream, r: 
             return Ok(Next::Close);
         }
     };
-    let stream = match engine.copy(id, kiri_proto::copy_op::IN, path, flags) {
+    let stream = match engine.copy(id, kiri_proto::copy_op::IN, &path, flags) {
         Ok(s) => s,
         Err(e) => {
             error_closing(w, e)?;

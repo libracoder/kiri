@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #595 Copy: keep the archive's owners on PUT /containers/{id}/archive, and chown to Config.User on copyUIDGID (unreleased)
+- Fixes: #594 PUT /containers/{id}/archive (docker cp) gives files to root; Docker keeps the archive's owners
+- Caused: none known
+- Caused by: -
+- Check: `cp-in-keeps-owner`, `cp-in-keeps-dir-and-symlink-owner`, `cp-in-copy-uidgid`
+
 ### #673 Layers: an empty number in a tar header is 0, as in Docker, so servicebus-emulator unpacks (unreleased)
 - Fixes: #618 Layers: an empty number in a tar header is 0, as in Docker, so servicebus-emulator unpacks
 - Caused: none known

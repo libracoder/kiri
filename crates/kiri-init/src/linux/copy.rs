@@ -272,47 +272,136 @@ fn ask(chan: &OwnedFd, kind: char, spec: &CopySpec<'_>) -> io::Result<()> {
 
 /// Unpacks the archive that follows into `spec.path`, a directory.
 fn copy_in(conn: &mut fs::File, spec: &CopySpec<'_>) -> io::Result<()> {
-    let dest = std::path::Path::new(spec.path);
+    let (path, user) = if spec.flags & copy_flags::KEEP_OWNERS != 0 {
+        spec.path.split_once('\0').unwrap_or((spec.path, ""))
+    } else {
+        (spec.path, "")
+    };
+    let dest = std::path::Path::new(path);
     match fs::metadata(dest) {
         Ok(m) if m.is_dir() => {}
-        Ok(_) => return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("notdir: extraction point is not a directory: {}", spec.path))),
-        Err(_) => return Err(io::Error::new(io::ErrorKind::NotFound, format!("notfound: Could not find the file {} in container {}", spec.path, spec.id))),
+        Ok(_) => return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("notdir: extraction point is not a directory: {path}"))),
+        Err(_) => return Err(io::Error::new(io::ErrorKind::NotFound, format!("notfound: Could not find the file {path} in container {}", spec.id))),
     }
+    let owner = if user.is_empty() { None } else { Some(resolve_copy_user_in(std::path::Path::new("/"), user)?) };
     let source: Box<dyn Read + '_> = if spec.flags & copy_flags::CHUNKED != 0 { Box::new(Chunks::new(&mut *conn)) } else { Box::new(&mut *conn) };
     let mut reader = BufReader::with_capacity(256 * 1024, source);
-    {
-        let mut archive = tar::Archive::new(&mut reader);
-        archive.set_preserve_permissions(true);
-        archive.set_preserve_mtime(true);
-        archive.set_preserve_ownerships(spec.flags & copy_flags::KEEP_OWNERS != 0);
-        archive.set_unpack_xattrs(false);
-        archive.set_overwrite(true);
-        for entry in archive.entries()? {
-            let mut entry = entry?;
-            if spec.flags & copy_flags::NO_OVERWRITE_DIR_NON_DIR != 0 {
-                let target = dest.join(entry.path()?);
-                if let Ok(m) = fs::symlink_metadata(&target) {
-                    if m.is_dir() != entry.header().entry_type().is_dir() {
-                        return Err(io::Error::new(
-                            io::ErrorKind::AlreadyExists,
-                            format!("cannot overwrite {} {} with {}", if m.is_dir() { "directory" } else { "non-directory" }, target.display(), if m.is_dir() { "non-directory" } else { "directory" }),
-                        ));
-                    }
-                }
-            }
-            let path = entry.path()?.into_owned();
-            // `docker cp` and the classic build's context keep a time of 0.
-            if entry.unpack_in(dest)? {
-                super::layers::keep_zero_time(dest, &path, entry.header())?;
-            }
-        }
-    }
+    unpack_in(&mut reader, dest, spec.flags, owner)?;
     // The archive's trailing padding: read it so the host's writes complete.
     io::copy(&mut reader, &mut io::sink())?;
     drop(reader);
     let mut out = Vec::new();
     Msg::CopyDone.encode(&mut out);
     conn.write_all(&out)
+}
+
+/// Moby's `applyTarCopyUserOptions` (`getUIDGID`): resolves a container's
+/// non-empty `Config.User` (`user[:group]`) against its `/etc/passwd` and
+/// `/etc/group` when `copyUIDGID` (`docker cp -a`) is set.
+fn resolve_copy_user_in(root: &std::path::Path, user: &str) -> io::Result<(libc::uid_t, libc::gid_t)> {
+    let (u, g) = user.split_once(':').unwrap_or((user, ""));
+    let (mut uid, mut gid) = (0, 0);
+    if !u.is_empty() {
+        let passwd = fs::read_to_string(root.join("etc/passwd")).unwrap_or_default();
+        if let Ok(id) = u.parse::<u32>()
+            && id <= i32::MAX as u32
+        {
+            uid = id;
+            gid = passwd
+                .lines()
+                .find_map(|l| {
+                    let mut f = l.split(':');
+                    (f.nth(2)?.parse::<u32>().ok()? == id).then(|| f.next()?.parse::<u32>().ok()).flatten()
+                })
+                .unwrap_or(0);
+        } else {
+            (uid, gid) = passwd
+                .lines()
+                .find_map(|l| {
+                    let mut f = l.split(':');
+                    if f.next()? != u {
+                        return None;
+                    }
+                    Some((f.nth(1)?.parse::<u32>().ok()?, f.next()?.parse::<u32>().ok()?))
+                })
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("failed to look up user {u:?} in container")))?;
+        }
+    }
+    if !g.is_empty() {
+        if let Ok(id) = g.parse::<u32>()
+            && id <= i32::MAX as u32
+        {
+            gid = id;
+        } else {
+            let group = fs::read_to_string(root.join("etc/group")).unwrap_or_default();
+            gid = group
+                .lines()
+                .find_map(|l| {
+                    let mut f = l.split(':');
+                    if f.next()? != g {
+                        return None;
+                    }
+                    f.nth(1)?.parse::<u32>().ok()
+                })
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("failed to look up group {g:?} in container")))?;
+        }
+    }
+    Ok((uid, gid))
+}
+
+fn unpack_in(reader: impl Read, dest: &std::path::Path, flags: u32, owner: Option<(libc::uid_t, libc::gid_t)>) -> io::Result<()> {
+    let mut archive = tar::Archive::new(reader);
+    archive.set_preserve_permissions(true);
+    archive.set_preserve_mtime(true);
+    // Moby's `defaultTarCopyOptions` preserves the archive's header UID/GID
+    // (`ChownOpts == nil`); when `copyUIDGID` (`docker cp -a`) is set on a
+    // container with a non-empty `Config.User`, `applyTarCopyUserOptions`
+    // sets `ChownOpts` (`owner`) to chown every unpacked entry to that user.
+    archive.set_preserve_ownerships(owner.is_none());
+    archive.set_unpack_xattrs(false);
+    archive.set_overwrite(true);
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        if flags & copy_flags::NO_OVERWRITE_DIR_NON_DIR != 0 {
+            let target = dest.join(entry.path()?);
+            if let Ok(m) = fs::symlink_metadata(&target)
+                && m.is_dir() != entry.header().entry_type().is_dir()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("cannot overwrite {} {} with {}", if m.is_dir() { "directory" } else { "non-directory" }, target.display(), if m.is_dir() { "non-directory" } else { "directory" }),
+                ));
+            }
+        }
+        let path = entry.path()?.into_owned();
+        // `docker cp` and the classic build's context keep a time of 0.
+        if entry.unpack_in(dest)? {
+            if let Some((uid, gid)) = owner
+                && !entry.header().entry_type().is_pax_global_extensions()
+            {
+                let mut file_dst = dest.to_path_buf();
+                for part in path.components() {
+                    if let std::path::Component::Normal(p) = part {
+                        file_dst.push(p);
+                    }
+                }
+                if file_dst != dest {
+                    let c = sys::cstr(&file_dst)?;
+                    // SAFETY: valid NUL-terminated path inside the container chroot.
+                    sys::check(unsafe { libc::lchown(c.as_ptr(), uid, gid) } as _, "lchown")?;
+                    if !fs::symlink_metadata(&file_dst)?.file_type().is_symlink()
+                        && let Ok(mode) = entry.header().mode()
+                        && mode & 0o6000 != 0
+                    {
+                        // SAFETY: valid NUL-terminated non-symlink path.
+                        sys::check(unsafe { libc::chmod(c.as_ptr(), (mode & 0o7777) as libc::mode_t) } as _, "chmod")?;
+                    }
+                }
+            }
+            super::layers::keep_zero_time(dest, &path, entry.header())?;
+        }
+    }
+    Ok(())
 }
 
 /// A `copy_flags::CHUNKED` archive: chunks of `len: u32 LE | bytes`, read
@@ -639,5 +728,91 @@ mod tests {
         let wire = [&5u32.to_le_bytes()[..], b"ab"].concat();
         let err = Chunks::new(&wire[..]).read_to_end(&mut Vec::new()).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn unpack_in_keeps_owners_and_does_not_chown_symlink_targets() {
+        // SAFETY: a plain getter.
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipped: needs root to keep owners");
+            return;
+        }
+        let dest = std::env::temp_dir().join(format!("kiri-copy-owners-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dest);
+        fs::create_dir_all(&dest).unwrap();
+        fs::write(dest.join("target"), b"stay").unwrap();
+        std::os::unix::fs::symlink("target", dest.join("replaced")).unwrap();
+
+        let mut b = tar::Builder::new(Vec::new());
+        let h = |kind: tar::EntryType, size: u64, mode: u32| {
+            let mut h = tar::Header::new_gnu();
+            h.set_entry_type(kind);
+            h.set_size(size);
+            h.set_mode(mode);
+            h.set_uid(1234);
+            h.set_gid(1235);
+            h.set_mtime(1_700_000_000);
+            h.set_cksum();
+            h
+        };
+        b.append_data(&mut h(tar::EntryType::Directory, 0, 0o750), "dir", &[][..]).unwrap();
+        b.append_data(&mut h(tar::EntryType::Regular, 3, 0o600), "dir/owned.pem", &b"key"[..]).unwrap();
+        b.append_link(&mut h(tar::EntryType::Symlink, 0, 0o777), "link", "target").unwrap();
+        b.append_data(&mut h(tar::EntryType::Regular, 3, 0o640), "replaced", &b"new"[..]).unwrap();
+        let bytes = b.into_inner().unwrap();
+
+        unpack_in(&bytes[..], &dest, 0, None).unwrap();
+
+        let meta = |p: &str| fs::symlink_metadata(dest.join(p)).unwrap();
+        let dir = meta("dir");
+        assert_eq!((dir.uid(), dir.gid(), dir.mode() & 0o777), (1234, 1235, 0o750));
+        let pem = meta("dir/owned.pem");
+        assert_eq!((pem.uid(), pem.gid(), pem.mode() & 0o777), (1234, 1235, 0o600));
+        assert_eq!(fs::read(dest.join("dir/owned.pem")).unwrap(), b"key");
+        let link = meta("link");
+        assert!(link.file_type().is_symlink());
+        assert_eq!((link.uid(), link.gid()), (1234, 1235));
+        let replaced = meta("replaced");
+        assert!(replaced.file_type().is_file());
+        assert_eq!((replaced.uid(), replaced.gid(), replaced.mode() & 0o777), (1234, 1235, 0o640));
+        assert_eq!(fs::read(dest.join("replaced")).unwrap(), b"new");
+        let target = meta("target");
+        assert_eq!((target.uid(), target.gid()), (0, 0));
+        assert_eq!(fs::read(dest.join("target")).unwrap(), b"stay");
+
+        unpack_in(&bytes[..], &dest, 0, Some((2375, 2376))).unwrap();
+        assert_eq!((meta("dir").uid(), meta("dir").gid()), (2375, 2376));
+        assert_eq!((meta("dir/owned.pem").uid(), meta("dir/owned.pem").gid(), meta("dir/owned.pem").mode() & 0o777), (2375, 2376, 0o600));
+        assert_eq!((meta("link").uid(), meta("link").gid()), (2375, 2376));
+        assert_eq!((meta("target").uid(), meta("target").gid()), (0, 0));
+
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn resolve_copy_user_matches_moby_get_uid_gid() {
+        let root = std::env::temp_dir().join(format!("kiri-copy-user-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("etc")).unwrap();
+        fs::write(root.join("etc/passwd"), "root:x:0:0:root:/root:/bin/sh\ntestuser:x:2375:2376::/home/testuser:/bin/sh\n").unwrap();
+        fs::write(root.join("etc/group"), "root:x:0:\ntestgroup:x:2376:\n").unwrap();
+
+        for (spec, want) in [
+            ("7777:", (7777, 0)),
+            (":7777", (0, 7777)),
+            ("2375", (2375, 2376)),
+            ("7777", (7777, 0)),
+            ("2375:2376", (2375, 2376)),
+            ("testuser:testgroup", (2375, 2376)),
+            ("testuser", (2375, 2376)),
+            ("testuser:7777", (2375, 7777)),
+            ("7777:testgroup", (7777, 2376)),
+        ] {
+            assert_eq!(resolve_copy_user_in(&root, spec).unwrap(), want, "{spec}");
+        }
+        assert!(resolve_copy_user_in(&root, "nosuchuser").is_err());
+        assert!(resolve_copy_user_in(&root, "testuser:nosuchgroup").is_err());
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

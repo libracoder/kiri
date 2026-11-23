@@ -1245,7 +1245,24 @@ $D run -d --name cpc alpine sleep 120 >/dev/null
 t cp-in-file "one" bash -c "$D cp $CPD/a.txt cpc:/tmp/ && $D exec cpc cat /tmp/a.txt"
 t cp-in-dir "two" bash -c "$D cp $CPD/dir cpc:/tmp/ && $D exec cpc cat /tmp/dir/sub/b.txt"
 t cp-in-rename "one" bash -c "$D cp $CPD/a.txt cpc:/tmp/renamed.txt && $D exec cpc cat /tmp/renamed.txt"
-t cp-in-root-owner "0 0" bash -c "$D exec cpc stat -c '%u %g' /tmp/a.txt"
+# The archive's owners are kept, as Docker keeps them without -a (#594): DDEV
+# puts its mkcert key (mode 0600) in a container this way for the web user,
+# and a symlink's owner is set on the link itself, never on its target.
+OWNED='import io,sys,tarfile
+b=io.BytesIO(); t=tarfile.open(fileobj=b,mode="w"); f=tarfile.TarInfo("owned.pem"); f.size=3; f.mode=0o600; f.uid=1234; f.gid=1235
+t.addfile(f,io.BytesIO(b"key")); t.close(); sys.stdout.buffer.write(b.getvalue())'
+t cp-in-keeps-owner "1234 1235 600 key" bash -c "python3 -c '$OWNED' | $D cp - cpc:/tmp/ && echo \$($D exec cpc stat -c '%u %g %a' /tmp/owned.pem) \$($D exec -u 1234 cpc cat /tmp/owned.pem)"
+OWNED_TREE='import io,sys,tarfile
+b=io.BytesIO(); t=tarfile.open(fileobj=b,mode="w")
+d=tarfile.TarInfo("owned-dir"); d.type=tarfile.DIRTYPE; d.mode=0o750; d.uid=1234; d.gid=1235; t.addfile(d)
+s=tarfile.TarInfo("owned-link"); s.type=tarfile.SYMTYPE; s.linkname="/etc/hostname"; s.uid=1234; s.gid=1235; t.addfile(s)
+f=tarfile.TarInfo("owned-over"); f.size=3; f.mode=0o640; f.uid=1234; f.gid=1235; t.addfile(f,io.BytesIO(b"new"))
+t.close(); sys.stdout.buffer.write(b.getvalue())'
+t cp-in-keeps-dir-and-symlink-owner "dir=1234:1235:750 link=1234:1235 over=1234:1235:regular file targets=0:0:0:0" bash -c "$D exec cpc ln -sf /etc/alpine-release /tmp/owned-over && python3 -c '$OWNED_TREE' | curl -s --unix-socket $(printf %q "$SOCK") -X PUT --data-binary @- 'http://d/v1.47/containers/cpc/archive?path=/tmp' && $D exec cpc sh -c 'echo \"dir=\$(stat -c %u:%g:%a /tmp/owned-dir) link=\$(stat -c %u:%g /tmp/owned-link) over=\$(stat -c %u:%g:%F /tmp/owned-over) targets=\$(stat -c %u:%g /etc/hostname):\$(stat -c %u:%g /etc/alpine-release)\"'"
+# With -a (copyUIDGID), Moby's applyTarCopyUserOptions chowns unpacked entries
+# to the container's Config.User when set, while keeping tar header owners
+# without -a or when Config.User is empty.
+t cp-in-copy-uidgid "no-a=1234:1235 with-a=1000:1000 default-a=1234:1235" bash -c "$D run -d --name cpu -u 1000:1000 alpine sleep 120 >/dev/null && python3 -c '$OWNED' | $D cp - cpu:/tmp/ && $D cp -a $CPD/a.txt cpu:/tmp/a.txt && python3 -c '$OWNED' | $D cp -a - cpc:/tmp/ && echo \"no-a=\$($D exec cpu stat -c %u:%g /tmp/owned.pem) with-a=\$($D exec cpu stat -c %u:%g /tmp/a.txt) default-a=\$($D exec cpc stat -c %u:%g /tmp/owned.pem)\"; $D rm -f cpu >/dev/null 2>&1"
 # A time of 0 stays 0, as Docker unpacks it (the tar crate would make it 1).
 t cp-in-zero-time "time 0" bash -c "echo z > $CPD/z && TZ=UTC touch -t 197001010000.00 $CPD/z && tar -C $CPD -cf - z | $D cp - cpc:/tmp/ && echo time \$($D exec cpc stat -c %Y /tmp/z)"
 t cp-out-file "fromctr" bash -c "$D exec cpc sh -c 'echo fromctr > /etc/motd2' && $D cp cpc:/etc/motd2 $CPD/ && cat $CPD/motd2"

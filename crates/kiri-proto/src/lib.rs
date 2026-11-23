@@ -260,7 +260,11 @@ pub mod copy_op {
 }
 
 pub mod copy_flags {
-    /// Keep the archive's owners (`docker cp -a`); otherwise root owns everything.
+    /// `docker cp -a` (`copyUIDGID`): chown unpacked entries to the
+    /// container's `Config.User` when one is set (Moby's
+    /// `applyTarCopyUserOptions`), sent as `"<path>\0<user>"` in
+    /// `CopySpec::path`. Without `-a`, or when `Config.User` is empty, the
+    /// archive's header UID/GID are kept.
     pub const KEEP_OWNERS: u32 = 1;
     /// Refuse to replace a directory with a file or the reverse.
     pub const NO_OVERWRITE_DIR_NON_DIR: u32 = 2;
