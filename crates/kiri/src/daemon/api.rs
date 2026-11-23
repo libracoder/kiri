@@ -2036,7 +2036,7 @@ fn command(entry: Option<Vec<String>>, cmd: Option<Vec<String>>, image_entry: &[
     })
 }
 
-/// The primary network when NetworkMode is empty or `default`: the first
+/// The primary network when NetworkMode is empty, `default` or `bridge`: the first
 /// resolved endpoint's name, unless bridge is listed. No match keeps bridge.
 /// Unknown endpoints are left for create to reject. `keys` come from the
 /// request's JSON map, so they are sorted and "first" is the same every time.
@@ -2208,8 +2208,11 @@ pub(super) fn create(req: &Request, engine: &Engine) -> Result<Value, Error> {
         super::seccomp::Choice::Unconfined => true,
         super::seccomp::Choice::Default => false,
     };
+    // NetworkMode `bridge` too: Docker joins only the endpoints' networks
+    // when there are any, whatever the mode names (k3d sends `bridge` with
+    // its cluster network, #727), unless they list bridge.
     let network_mode = match host["NetworkMode"].as_str().unwrap_or("default") {
-        "" | "default" => body["NetworkingConfig"]["EndpointsConfig"].as_object()
+        "" | "default" | "bridge" => body["NetworkingConfig"]["EndpointsConfig"].as_object()
             .and_then(|eps| endpoints_primary(eps.keys().map(String::as_str), |key| engine.lock_net().find(key).map(|n| (n.name.clone(), n.internal))))
             .unwrap_or_else(|| "bridge".to_owned()),
         m => m.to_owned(),
@@ -4068,6 +4071,120 @@ mod tests {
             assert_eq!(endpoints_primary(keys.iter().copied(), resolve).as_deref(), *expected, "{keys:?}");
         }
         assert!(asked.borrow().iter().all(|k| !k.starts_with("container:")), "a container: key was looked up as a network");
+    }
+
+    /// `POST /containers/create` network selection across `HostConfig.NetworkMode`
+    /// and `NetworkingConfig.EndpointsConfig` (#407, #727).
+    #[test]
+    fn create_network_mode_with_endpoints_config() {
+        let (root, engine) = engine_in("create-net-endpoints", false);
+        let image = test_image("net-ep:1");
+        engine.store.put_image(image.clone()).unwrap();
+        let k3d = engine.lock_net().create("k3d-net", Default::default()).unwrap();
+        engine.lock_net().create("custom-a", Default::default()).unwrap();
+        engine.lock_net().create("custom-b", Default::default()).unwrap();
+        engine.lock_net().create("back-net", super::super::network::Settings { internal: true, ..Default::default() }).unwrap();
+
+        let make = |name: &str, body: Value| -> Result<(String, Value), Error> {
+            let req = Request::internal("POST", "/containers/create", &[("name", name)], serde_json::to_vec(&body).unwrap());
+            let created = create(&req, &engine)?;
+            let id = created["Id"].as_str().unwrap().to_owned();
+            let inspected = container_inspect(&engine, &id)?;
+            Ok((id, inspected))
+        };
+        let net_names = |inspected: &Value| -> Vec<String> {
+            let mut names: Vec<String> = inspected["NetworkSettings"]["Networks"].as_object().unwrap().keys().cloned().collect();
+            names.sort();
+            names
+        };
+
+        // 1. NetworkMode "bridge" + non-empty EndpointsConfig without bridge -> joins ONLY k3d-net.
+        let (id1, ins1) = make("bridge-k3d", json!({
+            "Image": "net-ep:1", "Cmd": ["true"],
+            "HostConfig": {"NetworkMode": "bridge"},
+            "NetworkingConfig": {"EndpointsConfig": {"k3d-net": {"Aliases": ["node-0"]}}},
+        })).unwrap();
+        assert_eq!(net_names(&ins1), ["k3d-net"]);
+        assert_eq!(ins1["NetworkSettings"]["Networks"]["k3d-net"]["Aliases"], json!(["node-0"]));
+        engine.with(&id1, |c| {
+            assert_eq!(c.spec.network_mode, "k3d-net");
+            assert!(c.spec.extra_networks.is_empty());
+        }).unwrap();
+
+        // Same when EndpointsConfig names the network by ID, and with internal + outside networks.
+        let (_, ins1_id) = make("bridge-k3d-id", json!({
+            "Image": "net-ep:1", "Cmd": ["true"],
+            "HostConfig": {"NetworkMode": "bridge"},
+            "NetworkingConfig": {"EndpointsConfig": {k3d.id.as_str(): {}, "back-net": {}}},
+        })).unwrap();
+        assert_eq!(net_names(&ins1_id), ["back-net", "k3d-net"]);
+        assert_eq!(ins1_id["HostConfig"]["NetworkMode"], "k3d-net", "outside network beats internal");
+
+        // 2. NetworkMode "bridge" + EndpointsConfig including both bridge and k3d-net -> joins BOTH.
+        let (id2, ins2) = make("bridge-and-k3d", json!({
+            "Image": "net-ep:1", "Cmd": ["true"],
+            "HostConfig": {"NetworkMode": "bridge"},
+            "NetworkingConfig": {"EndpointsConfig": {"bridge": {}, "k3d-net": {"Aliases": ["both"]}}},
+        })).unwrap();
+        assert_eq!(net_names(&ins2), ["bridge", "k3d-net"]);
+        assert_eq!(ins2["NetworkSettings"]["Networks"]["k3d-net"]["Aliases"], json!(["both"]));
+        engine.with(&id2, |c| {
+            assert_eq!(c.spec.network_mode, "bridge");
+            assert_eq!(c.spec.extra_networks.len(), 1);
+            assert_eq!(c.spec.extra_networks[0].name, "k3d-net");
+        }).unwrap();
+
+        // 3. NetworkMode "bridge" + empty or absent EndpointsConfig -> joins bridge as usual.
+        for (name, body) in [
+            ("bridge-empty-eps", json!({"Image": "net-ep:1", "Cmd": ["true"], "HostConfig": {"NetworkMode": "bridge"}, "NetworkingConfig": {"EndpointsConfig": {}}})),
+            ("bridge-no-eps", json!({"Image": "net-ep:1", "Cmd": ["true"], "HostConfig": {"NetworkMode": "bridge"}})),
+        ] {
+            let (id, ins) = make(name, body).unwrap();
+            assert_eq!(net_names(&ins), ["bridge"], "{name}");
+            engine.with(&id, |c| {
+                assert_eq!(c.spec.network_mode, "bridge", "{name}");
+                assert!(c.spec.extra_networks.is_empty(), "{name}");
+            }).unwrap();
+        }
+
+        // 4. Named user network in NetworkMode + another in EndpointsConfig -> keeps NetworkMode primary + extra.
+        let (id4, ins4) = make("custom-a-and-b", json!({
+            "Image": "net-ep:1", "Cmd": ["true"],
+            "HostConfig": {"NetworkMode": "custom-a"},
+            "NetworkingConfig": {"EndpointsConfig": {"custom-b": {"Aliases": ["b-alias"]}}},
+        })).unwrap();
+        assert_eq!(net_names(&ins4), ["custom-a", "custom-b"]);
+        assert_eq!(ins4["NetworkSettings"]["Networks"]["custom-b"]["Aliases"], json!(["b-alias"]));
+        engine.with(&id4, |c| {
+            assert_eq!(c.spec.network_mode, "custom-a");
+            assert_eq!(c.spec.extra_networks.len(), 1);
+            assert_eq!(c.spec.extra_networks[0].name, "custom-b");
+        }).unwrap();
+
+        // 5. Special NetworkModes ("host", "none", "container:<id>") with EndpointsConfig stay unaffected / rejected.
+        let (id_host, _) = make("host-with-ep", json!({
+            "Image": "net-ep:1", "Cmd": ["true"],
+            "HostConfig": {"NetworkMode": "host"},
+            "NetworkingConfig": {"EndpointsConfig": {"k3d-net": {}}},
+        })).unwrap();
+        engine.with(&id_host, |c| assert_eq!(c.spec.network_mode, "host")).unwrap();
+
+        let (id_none, _) = make("none-with-ep", json!({
+            "Image": "net-ep:1", "Cmd": ["true"],
+            "HostConfig": {"NetworkMode": "none"},
+            "NetworkingConfig": {"EndpointsConfig": {"k3d-net": {}}},
+        })).unwrap();
+        engine.with(&id_none, |c| assert_eq!(c.spec.network_mode, "none")).unwrap();
+
+        let err_ctr = make("ctr-with-ep", json!({
+            "Image": "net-ep:1", "Cmd": ["true"],
+            "HostConfig": {"NetworkMode": format!("container:{id1}")},
+            "NetworkingConfig": {"EndpointsConfig": {"k3d-net": {}}},
+        }));
+        assert!(matches!(err_ctr, Err(Error::BadRequest(ref m)) if m.contains("sharing network namespace")), "{err_ctr:?}");
+
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

@@ -123,7 +123,7 @@ t cp-in-copy-uidgid "no-a=1234:1235 with-a=1000:1000 default-a=1234:1235" "docke
 t cp-out-dot "hi no-out" "docker exec web sh -c 'mkdir -p /out; echo hi > /out/a.txt' && rm -rf /tmp/cpdot && mkdir -p /tmp/cpdot && docker cp web:/out/. /tmp/cpdot && echo \"\$(cat /tmp/cpdot/a.txt) \$([ ! -e /tmp/cpdot/out ] && echo no-out || echo has-out)\"; rm -rf /tmp/cpdot"
 t archive-directory-contents "PASS stopped docker cp of a parent into new directory" "python3 /archive-directory-contents.py /root/.kiri/run/docker.sock"
 # What Testcontainers needs (#222, #121); see tests/testcontainers-api.py.
-for c in version cmd keepalive close follow follow-created timestamps; do
+for c in version cmd keepalive close follow follow-created timestamps endpoints; do
   t "testcontainers-$c" "ok $c" "for i in \$(seq 60); do command -v python3 >/dev/null && break; sleep 1; done; python3 /testcontainers-api.py /root/.kiri/run/docker.sock $c"
 done
 t socket-mount-reaches-kiri "Kiri" "docker run --rm -v /root/.kiri/run/docker.sock:/var/run/docker.sock docker:cli docker version --format '{{.Server.Platform.Name}}'"

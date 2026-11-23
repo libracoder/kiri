@@ -323,7 +323,7 @@ def check_endpoints():
     # NetworkingConfig.EndpointsConfig. Docker joins that network and not
     # bridge, so its embedded DNS answers the aliases (#407).
     c = Conn()
-    for name in ("tc-api-net-web", "tc-api-net-client"):
+    for name in ("tc-api-net-web", "tc-api-net-client", "tc-api-net-bridge-mode"):
         c.request("DELETE", f"/containers/{name}?force=1")
     c.request("DELETE", "/networks/tc-api-net")
     status, _, data = c.request("POST", "/networks/create", {"Name": "tc-api-net"})
@@ -339,6 +339,18 @@ def check_endpoints():
     assert networks == ["tc-api-net"], f"networks {networks}, want only tc-api-net"
     _, status, _, out = exec_start(Conn(), ids["tc-api-net-client"], ["getent", "hosts", "tc-web"])
     assert status == 200 and re.search(rb"\d+\.\d+\.\d+\.\d+\s+tc-web", out), f"the alias did not resolve: {out!r}"
+    # k3d sends NetworkMode "bridge" with its cluster network in
+    # EndpointsConfig. Docker still joins only that network, so the nodes
+    # find each other by name through its embedded DNS (#727).
+    bridged = fresh(c, "tc-api-net-bridge-mode", ["sleep", "600"], HostConfig={"NetworkMode": "bridge"},
+                    NetworkingConfig={"EndpointsConfig": {"tc-api-net": {}}})
+    status, _, data = c.request("POST", f"/containers/{bridged}/start")
+    assert status == 204, f"start {status} {data[:200]!r}"
+    _, _, d = c.request("GET", f"/containers/{bridged}/json")
+    networks = sorted(json.loads(d)["NetworkSettings"]["Networks"])
+    assert networks == ["tc-api-net"], f"NetworkMode bridge: networks {networks}, want only tc-api-net"
+    _, status, _, out = exec_start(Conn(), bridged, ["getent", "hosts", "tc-web"])
+    assert status == 200 and re.search(rb"\d+\.\d+\.\d+\.\d+\s+tc-web", out), f"NetworkMode bridge: the alias did not resolve: {out!r}"
     # Two networks, the internal one sorted first: the default route must go
     # by the one that reaches outside, as Docker picks its gateway.
     c.request("DELETE", "/containers/tc-api-net-two?force=1")
@@ -358,7 +370,7 @@ def check_endpoints():
     gateway = networks["tc-api-net-z-front"]["Gateway"]
     _, status, _, out = exec_start(Conn(), two, ["ip", "route"])
     assert status == 200 and re.search(rb"default via " + re.escape(gateway.encode()) + rb"\b", out), f"no default route by {gateway} (the outside network): {out!r}"
-    return "joins only the networks named in EndpointsConfig, its alias resolves, and an internal one doesn't take the default route"
+    return "joins only the networks named in EndpointsConfig (NetworkMode \"\" or \"bridge\"), its alias resolves, and an internal one doesn't take the default route"
 
 
 def check_copy_after_start():
