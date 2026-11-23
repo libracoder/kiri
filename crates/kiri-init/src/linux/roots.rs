@@ -23,6 +23,9 @@ struct Root {
     /// Removed (`docker rm`, `--rm`) while in use: its files go with the
     /// last user.
     remove: bool,
+    /// Unpacked layer hex digests mounted as lowerdirs for this root, kept
+    /// safe from live `RetainLayers` until the mount goes away.
+    layers: Vec<String>,
 }
 
 /// What letting go of a root leaves to do.
@@ -37,10 +40,20 @@ struct Table(HashMap<PathBuf, Root>);
 
 impl Table {
     /// True when this is the first user, who must mount it.
-    fn take(&mut self, base: &Path) -> bool {
+    fn take(&mut self, base: &Path, layers: &[&str]) -> bool {
         let r = self.0.entry(base.to_owned()).or_default();
         r.users += 1;
-        r.users == 1
+        if r.users == 1 {
+            r.layers = layers.iter().filter_map(|d| super::layers::hex(d).ok().map(str::to_owned)).collect();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Layer hex digests currently held by any active overlay mount.
+    fn in_use_layers(&self) -> Vec<String> {
+        self.0.values().filter(|r| r.users > 0).flat_map(|r| r.layers.iter().cloned()).collect()
     }
 
     /// One more user of a root already mounted; false if it isn't.
@@ -98,10 +111,15 @@ thread_local! {
 pub fn acquire(paths: &Paths, id: &str, layers: &[&str]) -> io::Result<PathBuf> {
     container::valid_id(id)?;
     let base = paths.containers.join(id);
-    if !TABLE.with_borrow_mut(|t| t.take(&base)) {
+    if !TABLE.with_borrow_mut(|t| t.take(&base, layers)) {
         return Ok(base.join("rootfs"));
     }
     container::mount_rootfs(paths, id, layers).inspect_err(|_| TABLE.with_borrow_mut(|t| t.forget(&base)))
+}
+
+/// Layer hex digests currently held by any active overlay mount.
+pub fn in_use_layers() -> Vec<String> {
+    TABLE.with_borrow(Table::in_use_layers)
 }
 
 /// Holds a root that is mounted now (a running container's), for a copy
@@ -157,20 +175,20 @@ mod tests {
     #[test]
     fn the_first_user_mounts_and_the_last_unmounts() {
         let (mut t, a) = (Table::default(), Path::new("/c/a"));
-        assert!(t.take(a), "the container starts: it mounts");
-        assert!(!t.take(a), "a copy meanwhile uses the same mount");
+        assert!(t.take(a, &[]), "the container starts: it mounts");
+        assert!(!t.take(a, &[]), "a copy meanwhile uses the same mount");
         assert_eq!(t.give(a), Some(Left::InUse), "the copy ends: still running");
         assert_eq!(t.give(a), Some(Left::Unmount { remove: false }), "the container exits");
         assert_eq!(t.give(a), None, "nothing left to let go");
-        assert!(t.take(a), "a later start mounts again");
+        assert!(t.take(a, &[]), "a later start mounts again");
     }
 
     #[test]
     fn a_root_removed_in_use_goes_with_its_last_user() {
         let (mut t, a) = (Table::default(), Path::new("/c/a"));
         assert!(t.doom(a), "not in use: removed now");
-        t.take(a);
-        t.take(a);
+        t.take(a, &[]);
+        t.take(a, &[]);
         assert!(!t.doom(a));
         assert_eq!(t.give(a), Some(Left::InUse));
         assert_eq!(t.give(a), Some(Left::Unmount { remove: true }));
@@ -180,10 +198,10 @@ mod tests {
     fn a_copy_into_a_running_container_keeps_its_root_past_a_restart() {
         let (mut t, a) = (Table::default(), Path::new("/c/a"));
         assert!(!t.hold(a), "nothing mounted: nothing to hold");
-        t.take(a);
+        t.take(a, &[]);
         assert!(t.hold(a));
         assert_eq!(t.give(a), Some(Left::InUse), "the container exits: the copy still writes");
-        assert!(!t.take(a), "the restart shares it instead of mounting again");
+        assert!(!t.take(a, &[]), "the restart shares it instead of mounting again");
         assert_eq!(t.give(a), Some(Left::InUse));
         assert_eq!(t.give(a), Some(Left::Unmount { remove: false }));
     }
@@ -191,8 +209,30 @@ mod tests {
     #[test]
     fn a_failed_mount_is_not_counted() {
         let (mut t, a) = (Table::default(), Path::new("/c/a"));
-        assert!(t.take(a));
+        assert!(t.take(a, &[]));
         t.forget(a);
-        assert!(t.take(a), "the next user mounts");
+        assert!(t.take(a, &[]), "the next user mounts");
+    }
+
+    #[test]
+    fn in_use_layers_tracks_mounted_roots_until_release() {
+        let (mut t, a) = (Table::default(), Path::new("/c/a"));
+        let h1 = "a".repeat(64);
+        let h2 = "b".repeat(64);
+        let d1 = format!("sha256:{h1}");
+        let d2 = format!("sha256:{h2}");
+        assert!(t.in_use_layers().is_empty());
+        assert!(t.take(a, &[d1.as_str(), d2.as_str()]));
+        assert_eq!(t.in_use_layers(), vec![h1.clone(), h2.clone()]);
+        // A second user (e.g. docker cp) keeps the same layers mounted.
+        assert!(!t.take(a, &[]));
+        assert_eq!(t.give(a), Some(Left::InUse));
+        assert_eq!(t.in_use_layers(), vec![h1, h2]);
+        assert_eq!(t.give(a), Some(Left::Unmount { remove: false }));
+        assert!(t.in_use_layers().is_empty());
+        // A failed mount drops its layers too.
+        assert!(t.take(a, &[d1.as_str()]));
+        t.forget(a);
+        assert!(t.in_use_layers().is_empty());
     }
 }

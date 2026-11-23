@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #722 Engine: prune unreferenced unpacked layers immediately on image removal, prune, tag overwrite and container removal (unreleased)
+- Fixes: #722 Unpacked layers in `/var/lib/kiri/layers` are not removed when images are removed or pruned, or when Kiri is quit and reopened
+- Caused: none known
+- Caused by: -
+- Check: `layer-gc-rmi-df`, `layer-gc-rmi-disk`, `layer-gc-container-keeps-layer`
+
 ### #344 Guest kernel: link the arm64 vDSO with both hash tables for macOS 14's Rosetta (unreleased)
 - Fixes: #344 macOS 14 (Apple silicon): every linux/amd64 container aborts with Rosetta "Failed to find vdso DT_HASH"
 - Caused: none known

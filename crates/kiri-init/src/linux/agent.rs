@@ -619,7 +619,10 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
                     continue;
                 }
                 Ok(Msg::RetainLayers(keep)) => {
-                    layers::retain(&paths.layers, keep.iter());
+                    // Any layer currently mounted as a lowerdir of a running
+                    // container or copy job stays until its mount is released.
+                    let mounted = super::roots::in_use_layers();
+                    layers::retain(&paths.layers, keep.iter().chain(mounted.iter().map(String::as_str)));
                     continue;
                 }
                 Ok(Msg::SetTime(ns)) => {

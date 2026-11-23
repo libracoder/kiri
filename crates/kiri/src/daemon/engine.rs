@@ -1184,6 +1184,33 @@ struct State {
     removed: VecDeque<(String, i32)>,
     /// `State.Health` of containers with a healthcheck, by id.
     health: HashMap<String, HealthRun>,
+    /// Unpacked layer digests pinned by in-flight creates (from image lookup
+    /// until the container is inserted into `containers`), with refcounts so
+    /// concurrent `prune_layers` never deletes a layer being unpacked (#722).
+    pinned_layers: HashMap<String, usize>,
+}
+
+/// Keeps layer digests in `retained_layers` until dropped (see `Engine::pin_layers`).
+pub(super) struct LayerPin<'a> {
+    engine: &'a Engine,
+    digests: Vec<String>,
+}
+
+impl Drop for LayerPin<'_> {
+    fn drop(&mut self) {
+        if self.digests.is_empty() {
+            return;
+        }
+        let mut st = self.engine.lock();
+        for d in &self.digests {
+            if let Some(n) = st.pinned_layers.get_mut(d) {
+                *n -= 1;
+                if *n == 0 {
+                    st.pinned_layers.remove(d);
+                }
+            }
+        }
+    }
 }
 
 /// Set while the daemon shuts down: exits then are not restarts.
@@ -1589,18 +1616,8 @@ impl Engine {
         // the image list can't be read, rather than deleting everything, and
         // while a damaged copy of it is kept: images cut from the list may
         // still be someone's (#440).
-        let image_damage = self.store.index_damage();
-        match self.store.images() {
-            _ if keep.is_none() => {}
-            _ if !matches!(image_damage, Ok(None)) => {
-                crate::diag::warn!("kept every unpacked layer: the image list was damaged", detail = image_damage_message(&image_damage, self.store.root()).unwrap_or_default());
-            }
-            Ok(images) => {
-                let mut layers: std::collections::BTreeSet<String> = images.iter().flat_map(|i| i.layers.iter().map(|l| l.digest.clone())).collect();
-                layers.extend(self.lock().containers.values().flat_map(|c| c.layers.iter().cloned()));
-                vm.retain_layers(&layers.into_iter().collect::<Vec<_>>())?;
-            }
-            Err(e) => crate::diag::warn!("kept every unpacked layer: images unreadable", error = e),
+        if let Some(layers) = self.retained_layers() {
+            vm.retain_layers(&layers)?;
         }
         *self.memory_target.lock().unwrap_or_else(|e| e.into_inner()) = ceiling;
         self.sleeping.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -2459,10 +2476,12 @@ impl Engine {
                 };
                 let mut anon = Vec::new();
                 let mut removed_log = None;
+                let mut removed_layers = Vec::new();
                 if remove {
                     if let Some(c) = st.containers.remove(id) {
                         anon = c.spec.anon_volumes;
                         removed_log = Some(c.log);
+                        removed_layers = c.layers;
                     }
                     note_removed(&mut st, id, code);
                 }
@@ -2501,6 +2520,16 @@ impl Engine {
                                 let _ = vm.remove_volume(&v);
                             }
                         }
+                    });
+                }
+                // If this `--rm` container was the last holder of layers from
+                // an overwritten image, prune them off the reader thread (#722).
+                if !removed_layers.is_empty()
+                    && self.has_unlisted_layer(&removed_layers)
+                    && let Some(me) = self.me.get().and_then(Weak::upgrade)
+                {
+                    let _ = std::thread::Builder::new().name("kiri-layer-gc".into()).spawn(move || {
+                        me.prune_layers();
                     });
                 }
                 self.changed.notify_all();
@@ -2875,6 +2904,79 @@ impl Engine {
         Ok(ancestor_ids(&self.store.images()?, values))
     }
 
+    /// Keeps `digests` in `retained_layers` until the returned guard drops,
+    /// so a concurrent `prune_layers` cannot delete layers while a container
+    /// is being created from them (#722).
+    pub(super) fn pin_layers<'a>(&'a self, digests: impl IntoIterator<Item = &'a str>) -> LayerPin<'a> {
+        let digests: Vec<String> = digests.into_iter().map(str::to_owned).collect();
+        if !digests.is_empty() {
+            let mut st = self.lock();
+            for d in &digests {
+                *st.pinned_layers.entry(d.clone()).or_insert(0) += 1;
+            }
+        }
+        LayerPin { engine: self, digests }
+    }
+
+    /// Every layer digest the guest must keep (every image's, every running
+    /// and stopped container's, and every in-flight create's). `None` when
+    /// either list is damaged or unreadable: then nothing is deleted (#440).
+    fn retained_layers(&self) -> Option<Vec<String>> {
+        if self.keeps_everything() {
+            return None;
+        }
+        let image_damage = self.store.index_damage();
+        if !matches!(image_damage, Ok(None)) {
+            crate::diag::warn!(
+                "kept every unpacked layer: the image list was damaged",
+                detail = image_damage_message(&image_damage, self.store.root()).unwrap_or_default()
+            );
+            return None;
+        }
+        let images = match self.store.images() {
+            Ok(images) => images,
+            Err(e) => {
+                crate::diag::warn!("kept every unpacked layer: images unreadable", error = e);
+                return None;
+            }
+        };
+        let mut layers: std::collections::BTreeSet<String> = images
+            .iter()
+            .flat_map(|i| i.layers.iter().map(|l| l.digest.clone()))
+            .collect();
+        let st = self.lock();
+        layers.extend(st.containers.values().flat_map(|c| c.layers.iter().cloned()));
+        layers.extend(st.pinned_layers.keys().cloned());
+        drop(st);
+        Some(layers.into_iter().collect())
+    }
+
+    /// Whether any digest in `layers` is no longer listed by any image in the
+    /// store: removing a container that held it may now free the unpacked layer.
+    fn has_unlisted_layer(&self, layers: &[String]) -> bool {
+        let Ok(images) = self.store.images() else { return false };
+        layers.iter().any(|d| !images.iter().any(|i| i.layers.iter().any(|l| &l.digest == d)))
+    }
+
+    /// Deletes unpacked layers in the guest that no image, container or
+    /// in-flight create uses any more (#722). Does not boot a sleeping VM:
+    /// the next boot runs the same pass (`vm_inner`). Waits for the guest
+    /// (`ping`), so an immediate `docker system df` or listing of
+    /// `/var/lib/kiri/layers` sees the space freed.
+    pub fn prune_layers(&self) {
+        let Some(vm) = self.awake() else { return };
+        if let Err(e) = self.prune_layers_with(|keep| vm.retain_layers(keep).and_then(|()| vm.ping())) {
+            crate::diag::warn!("unpacked layers left for the next boot", error = e);
+        }
+    }
+
+    /// Runs a live `retain_layers` pass serialized with `ensure_layers`.
+    fn prune_layers_with(&self, send: impl FnOnce(&[String]) -> io::Result<()>) -> io::Result<()> {
+        let _one_at_a_time = self.layers.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(keep) = self.retained_layers() else { return Ok(()) };
+        send(&keep)
+    }
+
     /// Sends the guest every layer of these (digest, media type) it doesn't
     /// have unpacked, from the blob store.
     fn ensure_layers<'a>(&self, vm: &VmLink, layers: impl Iterator<Item = (&'a str, &'a str)>) -> io::Result<()> {
@@ -2918,6 +3020,7 @@ impl Engine {
     /// Records a container and makes sure its layers are in the guest, so
     /// `start` has nothing left to do but run it.
     pub fn create(&self, name: Option<String>, spec: Spec, image: &Image) -> Result<String, Error> {
+        let _pin = self.pin_layers(image.layers.iter().map(|l| l.digest.as_str()));
         if !image.layers.is_empty() {
             let vm = self.vm()?;
             self.ensure_layers(&vm, image.layers.iter().map(|l| (l.digest.as_str(), l.media_type.as_str())))?;
@@ -4779,6 +4882,12 @@ impl Engine {
             && let Err(e) = vm.remove(&id)
         {
             crate::diag::warn!("writable layer left for the next boot", id = id, error = e);
+        }
+        if let Some(c) = &removed
+            && !c.layers.is_empty()
+            && self.has_unlisted_layer(&c.layers)
+        {
+            self.prune_layers();
         }
         if with_volumes {
             for v in anon {
@@ -8125,6 +8234,179 @@ mod leave_first_network_tests {
         }))
         .unwrap();
         assert!(!s.left_all_networks);
+    }
+}
+
+#[cfg(test)]
+mod layer_gc_tests {
+    use super::*;
+
+    fn hex_digest(c: &str) -> String {
+        format!("sha256:{}", c.repeat(64))
+    }
+
+    fn test_image(name: &str, cfg: &str, layers: &[&str]) -> Image {
+        Image {
+            mirror: None,
+            name: name.into(),
+            digest: hex_digest(cfg),
+            index_digest: None,
+            config_digest: hex_digest(cfg),
+            layers: layers
+                .iter()
+                .map(|d| kiri_image::Layer { digest: (*d).into(), size: 1024, media_type: "application/vnd.oci.image.layer.v1.tar".into() })
+                .collect(),
+            size: layers.len() as u64 * 1024,
+            platform: "linux/arm64".into(),
+            created: String::new(),
+            pulled_at: 0,
+            config: Default::default(),
+        }
+    }
+
+    fn insert_container(engine: &Engine, id: &str, image_id: &str, layers: Vec<String>, status: Status) {
+        let spec: Spec = serde_json::from_value(serde_json::json!({
+            "image": "demo:1", "image_id": image_id, "entrypoint": [], "cmd": ["true"],
+            "env": [], "cwd": "/", "user": "", "auto_remove": false, "network_mode": "none", "labels": {},
+        }))
+        .unwrap();
+        let mut st = engine.lock();
+        st.containers.insert(
+            id.into(),
+            Container {
+                lifecycle: Arc::new(Mutex::new(0)),
+                names_sync: Arc::default(),
+                start_gate: Arc::default(),
+                id: id.into(),
+                name: format!("c-{id}"),
+                layers,
+                spec,
+                created: SystemTime::now(),
+                status,
+                started: None,
+                finished: None,
+                exit_code: 0,
+                oom_killed: false,
+                vm_stopped: false,
+                stopped_by_user: false,
+                restart_count: 0,
+                restart_pending: false,
+                exits: 0,
+                size: None,
+                ip: None,
+                pid: 0,
+                forwards: None,
+                live: false,
+                early_input: Vec::new(),
+                early_close: false,
+                start_owed: false,
+                paused: false,
+                extra_ips: Vec::new(),
+                extra_ifs: Vec::new(),
+                ip6: None,
+                extra_ip6s: Vec::new(),
+                log: Arc::new(Mutex::new(super::super::logfile::Log::new(
+                    super::super::logfile::dir(engine.store.root(), id),
+                    &Default::default(),
+                ))),
+                attached: Vec::new(),
+            },
+        );
+    }
+
+    /// Live layer GC keeps layers referenced by remaining images, running
+    /// containers, stopped containers and in-flight creates, while dropping
+    /// layers only a removed or overwritten image used (#722).
+    #[test]
+    fn retained_layers_keeps_images_containers_and_in_flight_pins() {
+        let root = std::env::temp_dir().join(format!("kiri-layer-gc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let engine = boot_without_vm(&root);
+
+        let (shared, only_a, only_b, stopped_l, running_l, inflight_l) =
+            (hex_digest("1"), hex_digest("2"), hex_digest("3"), hex_digest("4"), hex_digest("5"), hex_digest("6"));
+        engine.store.put_image(test_image("a:1", "a", &[&shared, &only_a])).unwrap();
+        engine.store.put_image(test_image("b:1", "b", &[&shared, &only_b])).unwrap();
+        insert_container(&engine, "stopped1", &hex_digest("c"), vec![stopped_l.clone()], Status::Exited);
+        insert_container(&engine, "running1", &hex_digest("d"), vec![running_l.clone()], Status::Running);
+
+        // Removing a:1 drops only_a, while shared stays for b:1 and container layers stay.
+        engine.store.remove_image("a:1").unwrap();
+        let mut sent = Vec::new();
+        engine.prune_layers_with(|keep| {
+            sent = keep.to_vec();
+            Ok(())
+        }).unwrap();
+        let mut want = vec![shared.clone(), only_b.clone(), stopped_l.clone(), running_l.clone()];
+        want.sort();
+        assert_eq!(sent, want);
+
+        // An in-flight create pins its layers across prune_layers even if the
+        // image disappears before the container is inserted, and overlapping
+        // pins are reference-counted.
+        let p1 = engine.pin_layers([inflight_l.as_str()]);
+        let p2 = engine.pin_layers([inflight_l.as_str()]);
+        assert!(engine.retained_layers().unwrap().contains(&inflight_l));
+        drop(p1);
+        assert!(engine.retained_layers().unwrap().contains(&inflight_l), "second pin still holds it");
+        drop(p2);
+        assert!(!engine.retained_layers().unwrap().contains(&inflight_l), "gone once last pin drops");
+
+        // has_unlisted_layer detects when removing a container frees a layer
+        // whose image was already overwritten or removed, and stays false for
+        // layers still in store.images().
+        assert!(!engine.has_unlisted_layer(&[shared.clone(), only_b.clone()]));
+        assert!(engine.has_unlisted_layer(&[shared.clone(), stopped_l.clone()]));
+
+        // Removing the stopped container drops stopped_l from the retained set.
+        engine.remove("stopped1", false, false).unwrap();
+        assert!(!engine.retained_layers().unwrap().contains(&stopped_l));
+        assert!(engine.retained_layers().unwrap().contains(&running_l));
+
+        // Overwriting b:1 drops only_b immediately from the retained set.
+        let fresh = hex_digest("7");
+        engine.store.put_image(test_image("b:1", "e", &[&shared, &fresh])).unwrap();
+        let kept = engine.retained_layers().unwrap();
+        assert!(!kept.contains(&only_b));
+        assert!(kept.contains(&shared) && kept.contains(&fresh) && kept.contains(&running_l));
+
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Neither live GC nor boot-time GC deletes any layer while either
+    /// `containers.json` or `images.json` has a `.corrupt-*` copy (#440, #722).
+    #[test]
+    fn prune_layers_skips_when_records_or_images_are_damaged() {
+        let root = std::env::temp_dir().join(format!("kiri-layer-gc-damaged-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("containers.json.corrupt-1-0"), b"[").unwrap();
+        let engine = boot_without_vm(&root);
+        assert!(engine.retained_layers().is_none(), "damaged containers.json must keep every layer");
+        let mut called = false;
+        engine.prune_layers_with(|_| {
+            called = true;
+            Ok(())
+        }).unwrap();
+        assert!(!called);
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&root);
+
+        let root2 = std::env::temp_dir().join(format!("kiri-layer-gc-imgdmg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root2);
+        std::fs::create_dir_all(&root2).unwrap();
+        std::fs::write(root2.join("images.json.corrupt-1-0"), b"[").unwrap();
+        let engine2 = boot_without_vm(&root2);
+        assert!(engine2.retained_layers().is_none(), "damaged images.json must keep every layer");
+        let mut called2 = false;
+        engine2.prune_layers_with(|_| {
+            called2 = true;
+            Ok(())
+        }).unwrap();
+        assert!(!called2);
+        drop(engine2);
+        let _ = std::fs::remove_dir_all(&root2);
     }
 }
 

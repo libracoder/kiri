@@ -920,6 +920,49 @@ t inspect-exposed-udp '{"132/sctp":{},"53/tcp":{},"53/udp":{},"5353/udp":{}} {"1
 t limit-memory-swap "def=268435456:ok custom=201326592:ok zero=134217728:ok unlim=-1:ok none=0:ok upd=335544320:ok cpus=335544320:ok uunlim=-1:ok umem=-1:ok bad=ok:ok:ok" "docker rm -f lhsw0 lhsw1 lhsw2 lhsw3 lhsw4 lhswu >/dev/null 2>&1; sw() { docker exec \"\$1\" sh -c \"[ ! -e /sys/fs/cgroup/memory.swap.max ] && echo ok || { v=\\\$(cat /sys/fs/cgroup/memory.swap.max); [ \\\"\\\$v\\\" = \\\"\$2\\\" ] && echo ok || echo bad:\\\$v; }\"; }; docker run -d --name lhsw0 alpine sleep 60 >/dev/null; docker run -d --name lhsw1 --memory 128m alpine sleep 60 >/dev/null; docker run -d --name lhsw2 --memory 128m --memory-swap 192m alpine sleep 60 >/dev/null; docker run -d --name lhsw3 --memory 128m --memory-swap 128m alpine sleep 60 >/dev/null; docker run -d --name lhsw4 --memory 128m --memory-swap -1 alpine sleep 60 >/dev/null; none=\$(docker inspect -f '{{.HostConfig.MemorySwap}}' lhsw0):\$(sw lhsw0 max); def=\$(docker inspect -f '{{.HostConfig.MemorySwap}}' lhsw1):\$(sw lhsw1 134217728); custom=\$(docker inspect -f '{{.HostConfig.MemorySwap}}' lhsw2):\$(sw lhsw2 67108864); zero=\$(docker inspect -f '{{.HostConfig.MemorySwap}}' lhsw3):\$(sw lhsw3 0); unlim=\$(docker inspect -f '{{.HostConfig.MemorySwap}}' lhsw4):\$(sw lhsw4 max); docker update --memory 512m lhsw1 2>&1 | grep -q 'Memory limit should be smaller than already set memoryswap limit' && b1=ok || b1=bad; docker create --memory-swap 64m alpine true 2>&1 | grep -q 'You should always set the Memory limit' && b2=ok || b2=bad; docker create --memory 128m --memory-swap 64m alpine true 2>&1 | grep -q 'Minimum memoryswap limit' && b3=ok || b3=bad; docker update --memory 192m --memory-swap 320m lhsw1 >/dev/null; upd=\$(docker inspect -f '{{.HostConfig.MemorySwap}}' lhsw1):\$(sw lhsw1 134217728); docker update --cpus 1 lhsw1 >/dev/null; cpus=\$(docker inspect -f '{{.HostConfig.MemorySwap}}' lhsw1):\$(sw lhsw1 134217728); docker update --memory-swap -1 lhsw1 >/dev/null; uunlim=\$(docker inspect -f '{{.HostConfig.MemorySwap}}' lhsw1):\$(sw lhsw1 max); docker update --memory 256m lhsw1 >/dev/null; umem=\$(docker inspect -f '{{.HostConfig.MemorySwap}}' lhsw1):\$(sw lhsw1 max); docker rm -f lhsw0 lhsw1 lhsw2 lhsw3 lhsw4 >/dev/null 2>&1; echo \"def=\$def custom=\$custom zero=\$zero unlim=\$unlim none=\$none upd=\$upd cpus=\$cpus uunlim=\$uunlim umem=\$umem bad=\$b1:\$b2:\$b3\""
 # Container stats carry cgroup CPU throttling counters in Docker units (#537).
 t stats-cpu-throttling "ok" "docker rm -f lhthr >/dev/null 2>&1; id=\$(docker run -d --name lhthr --cpus 0.1 alpine sh -c 'i=0; while [ \$i -lt 200000 ]; do i=\$((i+1)); done; sleep 10'); out=\$(curl -s --unix-socket /root/.kiri/run/docker.sock \"http://d/v1.47/containers/\$id/stats?stream=false\" | python3 -c 'import json, sys; td = json.load(sys.stdin)[\"cpu_stats\"][\"throttling_data\"]; print(\"ok\" if td[\"periods\"] > 0 and td[\"throttled_periods\"] > 0 and td[\"throttled_time\"] > 0 else td)'); docker rm -f lhthr >/dev/null 2>&1; echo \"\$out\""
+# Removing an image or overwriting a tag reclaims unreferenced unpacked layers
+# and their .done markers in /var/lib/kiri/layers immediately, while keeping
+# layers still referenced by an existing container until it is removed (#722).
+t layer-gc-rmi-disk "DISK-FREED" '
+  docker rm -f lh-lgc >/dev/null 2>&1; docker rmi kiri-lh-lgc:1 >/dev/null 2>&1
+  docker run --rm alpine true >/dev/null &&
+  base=$(ls /var/lib/kiri/layers | wc -l) &&
+  docker run --name lh-lgc alpine sh -c "head -c 10485760 /dev/urandom > /big.bin" >/dev/null &&
+  docker commit lh-lgc kiri-lh-lgc:1 >/dev/null &&
+  docker rm lh-lgc >/dev/null &&
+  docker run --rm kiri-lh-lgc:1 true &&
+  with_img=$(ls /var/lib/kiri/layers | wc -l) &&
+  df_before=$(curl -s --unix-socket /root/.kiri/run/docker.sock http://kiri/system/df | python3 -c "import json,sys; print(json.load(sys.stdin)[\"LayersSize\"])") &&
+  docker rmi kiri-lh-lgc:1 >/dev/null &&
+  after=$(ls /var/lib/kiri/layers | wc -l) &&
+  df_after=$(curl -s --unix-socket /root/.kiri/run/docker.sock http://kiri/system/df | python3 -c "import json,sys; print(json.load(sys.stdin)[\"LayersSize\"])") &&
+  if [ "$with_img" -gt "$base" ] && [ "$after" -eq "$base" ] && [ $((df_before - df_after)) -ge 8388608 ]; then
+    echo DISK-FREED
+  else
+    echo "base=$base with=$with_img after=$after df_before=$df_before df_after=$df_after"
+  fi
+'
+t layer-gc-container-keeps-layer "KEPT-THEN-FREED" '
+  docker rm -f lh-lgc-hold lh-lgc-tmp >/dev/null 2>&1; docker rmi kiri-lh-lgc:2 >/dev/null 2>&1
+  docker run --rm alpine true >/dev/null &&
+  base=$(ls /var/lib/kiri/layers | wc -l) &&
+  docker run --name lh-lgc-tmp alpine sh -c "echo v1 > /ver" >/dev/null &&
+  docker commit lh-lgc-tmp kiri-lh-lgc:2 >/dev/null &&
+  docker rm lh-lgc-tmp >/dev/null &&
+  docker run --name lh-lgc-hold kiri-lh-lgc:2 cat /ver >/dev/null &&
+  docker run --name lh-lgc-tmp alpine sh -c "echo v2 > /ver" >/dev/null &&
+  docker commit lh-lgc-tmp kiri-lh-lgc:2 >/dev/null &&
+  docker rm lh-lgc-tmp >/dev/null &&
+  kept=$(docker start -a lh-lgc-hold) &&
+  docker rm lh-lgc-hold >/dev/null &&
+  docker rmi kiri-lh-lgc:2 >/dev/null &&
+  after=$(ls /var/lib/kiri/layers | wc -l) &&
+  if [ "$kept" = "v1" ] && [ "$after" -eq "$base" ]; then
+    echo KEPT-THEN-FREED
+  else
+    echo "kept=$kept base=$base after=$after"
+  fi
+'
 $D rm -f "$N" >/dev/null
 # An engine in a user namespace (nested Docker, Sysbox, Coder, CI; #597),
 # where the kernel refuses mknod of a device and raising nofile past the

@@ -133,8 +133,8 @@ pub enum Msg<'a> {
     /// Sent once after connecting. No reply.
     Retain(StrList<'a>),
     /// Host → guest: delete every unpacked layer except these (by blob
-    /// digest), and any left half-written. Sent once after connecting,
-    /// before anything runs. No reply.
+    /// digest), and any left half-written. Sent on connect and after images
+    /// or containers stop referencing layers. No reply.
     RetainLayers(StrList<'a>),
     /// Asks how much disk the guest's layers, containers and volumes use.
     UsageQuery,
