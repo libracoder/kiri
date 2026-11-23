@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### Build mirror: leave a registry's tags to the registry (unreleased)
+- Fixes: #57 Builds for a foreign platform use the local image of the same tag and ignore --platform (Invalid ELF image for this architecture)
+- Caused: none known
+- Caused by: -
+- Check: `build-platform-pulled-tag`, `build-local-tag`
+
 ### #464 Engine: oversized guest replies are capped to the frame limit instead of stopping the VM (unreleased)
 - Fixes: #463 A big `docker top` or Files-tab listing restarts the whole VM
 - Caused: none known

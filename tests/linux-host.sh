@@ -360,6 +360,36 @@ t insecure-hand-edit-keeps-keys "kept" "/opt/kiri/kiri registry mirror add http:
 t mirror-http-pull "Downloaded newer image" "docker pull kiri-mirror-only:1 2>&1"
 t mirror-docker-info "http://$RIP:5055/" "docker info 2>/dev/null | sed -n '/Registry Mirrors/,/^ [A-Z]/p'"
 t mirror-build "rorrim-tliub" "gw=\$(docker inspect kiri-reg-http --format '{{.NetworkSettings.IPAddress}}'):5000; /opt/kiri/kiri registry mirror remove http://$RIP:5055 >/dev/null 2>&1; /opt/kiri/kiri registry insecure add \$gw >/dev/null 2>&1; /opt/kiri/kiri registry mirror add http://\$gw >/dev/null 2>&1; docker rmi kiri-mirror-only:1 >/dev/null 2>&1; printf 'FROM kiri-mirror-only:1\\nRUN echo built-mirror | rev\\n' > /bins/Dockerfile && DOCKER_BUILDKIT=0 docker build --no-cache /bins >/tmp/b.log 2>&1; grep -m1 -o rorrim-tliub /tmp/b.log || grep -i -m3 'error\|fail' /tmp/b.log"
+# A tag a registry published is left to the registry in builds, even when one
+# platform of it is already in the local store, so a build for another
+# platform gets the platform it asked for (#57); an image only in the local
+# store is still served from Kiri's mirror.
+MULTI_PUSH='python3 -c '\''
+import gzip, hashlib, io, json, sys, tarfile, urllib.request
+u = f"http://localhost:{sys.argv[1]}/v2/library/kiri-mirror-only"
+h = lambda b: "sha256:" + hashlib.sha256(b).hexdigest()
+put = lambda p, ct, b: urllib.request.urlopen(urllib.request.Request(p, data=b, headers={"Content-Type": ct}, method="PUT"))
+def blob(b):
+    loc = urllib.request.urlopen(urllib.request.Request(f"{u}/blobs/uploads/", method="POST")).headers["Location"]
+    sep = "&" if "?" in loc else "?"
+    put(f"{loc}{sep}digest={h(b)}", "application/octet-stream", b)
+    return h(b)
+ms = []
+for a in ("amd64", "arm64"):
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as t:
+        d = f"layer-{a}\n".encode(); ti = tarfile.TarInfo("arch"); ti.size = len(d); t.addfile(ti, io.BytesIO(d))
+    raw = buf.getvalue(); gz = gzip.compress(raw); ld = blob(gz)
+    cfg = json.dumps({"architecture": a, "os": "linux", "config": {"Labels": {"plat": f"from-{a}"}}, "rootfs": {"type": "layers", "diff_ids": [h(raw)]}}).encode()
+    cd = blob(cfg); mt = "application/vnd.docker.distribution.manifest.v2+json"
+    m = json.dumps({"schemaVersion": 2, "mediaType": mt, "config": {"mediaType": "application/vnd.docker.container.image.v1+json", "digest": cd, "size": len(cfg)}, "layers": [{"mediaType": "application/vnd.docker.image.rootfs.diff.tar.gzip", "digest": ld, "size": len(gz)}]}).encode()
+    put(f"{u}/manifests/{h(m)}", mt, m)
+    ms.append({"mediaType": mt, "digest": h(m), "size": len(m), "platform": {"architecture": a, "os": "linux"}})
+lt = "application/vnd.docker.distribution.manifest.list.v2+json"
+put(f"{u}/manifests/multi", lt, json.dumps({"schemaVersion": 2, "mediaType": lt, "manifests": ms}).encode())
+'\'' 5055'
+t build-platform-pulled-tag "resolved-other-platform" "$MULTI_PUSH && here=\$(docker version --format '{{.Server.Arch}}') && { [ \"\$here\" = amd64 ] && other=arm64 || other=amd64; } && docker pull -q kiri-mirror-only:multi >/dev/null && lhere=\$(docker image inspect -f '{{index .RootFS.Layers 0}}' kiri-mirror-only:multi) && printf 'FROM kiri-mirror-only:multi\\nCOPY Dockerfile /df\\n' > /bins/Dockerfile && DOCKER_BUILDKIT=0 docker build -q --no-cache --platform linux/\$other -t kiri-mirror-only:built /bins >/dev/null 2>&1 && lbuilt=\$(docker image inspect -f '{{index .RootFS.Layers 0}}' kiri-mirror-only:built) && pbuilt=\$(docker image inspect -f '{{.Architecture}} {{index .Config.Labels \"plat\"}}' kiri-mirror-only:built) && [ \"\$pbuilt\" = \"\$other from-\$other\" ] && [ \"\$lbuilt\" != \"\$lhere\" ] && echo resolved-other-platform || echo \"here=\$here got=\$pbuilt lhere=\$lhere lbuilt=\$lbuilt\""
+t build-local-tag "local-still-served" "here=\$(docker version --format '{{.Server.Arch}}') && docker tag kiri-mirror-only:multi kiri-local-only:1 && printf 'FROM kiri-local-only:1\\nCOPY Dockerfile /df2\\n' > /bins/Dockerfile && DOCKER_BUILDKIT=0 docker build -q --no-cache -t kiri-local-only:built /bins >/dev/null 2>&1 && [ \"\$(docker image inspect -f '{{index .Config.Labels \"plat\"}}' kiri-local-only:built)\" = \"from-\$here\" ] && echo local-still-served; docker rmi kiri-mirror-only:multi kiri-mirror-only:built kiri-local-only:1 kiri-local-only:built >/dev/null 2>&1"
 # Docker Hub is reached over verified HTTPS whatever the list covers: a
 # name server (here /etc/hosts) that puts its name inside a listed network,
 # in front of a plain-HTTP registry on port 80, must not turn the pull into

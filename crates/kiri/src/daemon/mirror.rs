@@ -4,7 +4,10 @@
 //! A read-only registry API on 127.0.0.1, which containers reach at
 //! host.docker.internal. buildkitd.toml names it as a mirror of every
 //! registry Kiri has images from; a mirror that answers 404 is skipped, so
-//! anything not here comes from the registry itself. Paths carry a secret
+//! anything not here comes from the registry itself. A tag a registry
+//! published is not answered here even when Kiri holds it: the registry,
+//! not this machine, knows which platforms it has (see `lookup`).
+//! Paths carry a secret
 //! (`/v2/<token>/<registry>/<repo>/…`), so other local users can't read
 //! images through it. Manifests are made from the store's records (layers,
 //! config), the same bytes for the same image every time.
@@ -350,7 +353,7 @@ fn answer(conn: TcpStream, engine: &Engine) -> io::Result<()> {
     if method != "GET" && method != "HEAD" {
         return head(&mut w, "405 Method Not Allowed", "", 0);
     }
-    match lookup(engine, target.split('?').next().unwrap_or_default(), &token()) {
+    match lookup(&engine.store, target.split('?').next().unwrap_or_default(), &token()) {
         Some(Found::Manifest(bytes, digest)) => {
             head(&mut w, "200 OK", &format!("Content-Type: application/vnd.oci.image.manifest.v1+json\r\nDocker-Content-Digest: {digest}\r\n"), bytes.len() as u64)?;
             if method == "GET" {
@@ -403,22 +406,36 @@ fn parse(path: &str, token: &str) -> Option<(String, String, bool, String)> {
     (!repo.is_empty() && !reference.is_empty() && !reference.contains('/')).then(|| (registry.to_owned(), repo.to_owned(), kind, reference.to_owned()))
 }
 
-fn lookup(engine: &Engine, path: &str, token: &str) -> Option<Found> {
+/// Whether the mirror answers for `i` under its tag. It does for an image no
+/// registry has (built, loaded, committed: its digest is its config's), which
+/// is the one thing a build cannot get anywhere else. An image a registry
+/// published is left to that registry, which knows every platform of the tag;
+/// answering with the one platform Kiri pulled would hide the rest.
+fn serve_tag(i: &Image) -> bool {
+    i.repo_digest().is_none()
+}
+
+fn lookup(store: &kiri_image::Store, path: &str, token: &str) -> Option<Found> {
     let (registry, repo, is_manifest, reference) = parse(path, token)?;
-    let images = engine.store.images().ok()?;
+    let images = store.images().ok()?;
     let in_repo = |i: &&Image| Reference::parse(&i.name).is_ok_and(|n| n.registry == registry && n.repository == repo);
     if is_manifest {
         if reference.starts_with("sha256:") {
-            return images.iter().filter(in_repo).find_map(|i| manifest(&engine.store, i).filter(|(_, d)| *d == reference)).map(|(b, d)| Found::Manifest(b, d));
+            return images.iter().filter(in_repo).find_map(|i| manifest(store, i).filter(|(_, d)| *d == reference)).map(|(b, d)| Found::Manifest(b, d));
         }
         let wanted = Reference::parse(&format!("{registry}/{repo}:{reference}")).ok()?.short();
-        let i = images.iter().find(|i| i.name == wanted)?;
-        let (b, d) = manifest(&engine.store, i)?;
+        // A tag a registry published is the registry's to answer: Kiri holds
+        // the one platform it pulled, and serving that says the tag has no
+        // other, so a build for another platform takes these binaries and
+        // fails on them (issue #57). 404 here makes the builder skip this
+        // mirror and pull the platform it asked for.
+        let i = images.iter().find(|i| i.name == wanted && serve_tag(i))?;
+        let (b, d) = manifest(store, i)?;
         return Some(Found::Manifest(b, d));
     }
     // Only blobs of that repository's images.
     let owned = images.iter().filter(in_repo).any(|i| i.config_digest == reference || i.layers.iter().any(|l| l.digest == reference));
-    let path = engine.store.blob_path(&reference).ok()?;
+    let path = store.blob_path(&reference).ok()?;
     (owned && path.is_file()).then_some(Found::Blob(path, reference))
 }
 
@@ -534,6 +551,108 @@ mod tests {
         #[cfg(not(target_os = "linux"))]
         assert_eq!(mirror_host(&networks), super::super::ports::HOST_ADDR);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_tag_a_registry_published_is_left_to_it() {
+        // Pulled: its digest is its manifest's, so a registry has it.
+        let pulled = Image { name: "alpine:3.20".into(), digest: "sha256:manifest".into(), ..made_here() };
+        assert!(!serve_tag(&pulled));
+        // Pulled through a configured Docker Hub mirror (#119) or from a multi-arch index.
+        let mirrored = Image { mirror: Some("mirror.lan:5000".into()), index_digest: Some("sha256:index".into()), ..pulled.clone() };
+        assert!(!serve_tag(&mirrored));
+        // Another tag in the same repository still carries that repository's digest.
+        assert!(!serve_tag(&pulled.tagged("alpine:latest".into())));
+        // Built, loaded or committed here: nothing else can serve it, platform or not.
+        assert!(serve_tag(&made_here()));
+        // Tagged into another repository (docker tag alpine:3.20 mybase:dev):
+        // that name is not in any registry, so the mirror answers for it.
+        assert!(serve_tag(&pulled.tagged("mybase:dev".into())));
+    }
+
+    #[test]
+    fn lookup_skips_published_tags_but_serves_local_tags_digests_and_blobs() {
+        let dir = std::env::temp_dir().join(format!("kiri-mirror-lookup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = kiri_image::Store::open(&dir).unwrap();
+        let write_blob = |bytes: &[u8]| {
+            let mut w = store.ingest().unwrap();
+            w.write_all(bytes).unwrap();
+            w.finish().unwrap()
+        };
+        let cfg = json!({"architecture": "amd64", "os": "linux", "config": {}});
+        let (cfg_digest, _) = write_blob(&serde_json::to_vec(&cfg).unwrap());
+        let (layer_digest, layer_size) = write_blob(b"layer-bytes");
+        let layers = vec![kiri_image::Layer { digest: layer_digest.clone(), size: layer_size, media_type: "application/vnd.oci.image.layer.v1.tar+gzip".into() }];
+
+        // 1. Registry-pulled image (also when pulled via a #119 mirror): tag
+        // lookup returns None (404) so BuildKit falls through to the configured
+        // mirror or upstream registry, while digest and blob lookups still hit
+        // the local store so cached layers are not re-downloaded.
+        let pulled = Image {
+            name: "alpine:3.20".into(),
+            digest: format!("sha256:{}", "a".repeat(64)),
+            index_digest: Some(format!("sha256:{}", "b".repeat(64))),
+            mirror: Some("mirror.lan:5000".into()),
+            ..kiri_image::archive::from_config("alpine:3.20".into(), &cfg_digest, &cfg, layers.clone())
+        };
+        let (_, pulled_manifest_digest) = manifest(&store, &pulled).unwrap();
+        store.put_image(pulled.clone()).unwrap();
+
+        assert!(lookup(&store, "/v2/tok/docker.io/library/alpine/manifests/3.20", "tok").is_none());
+        assert!(matches!(
+            lookup(&store, &format!("/v2/tok/docker.io/library/alpine/manifests/{pulled_manifest_digest}"), "tok"),
+            Some(Found::Manifest(_, d)) if d == pulled_manifest_digest
+        ));
+        assert!(matches!(
+            lookup(&store, &format!("/v2/tok/docker.io/library/alpine/blobs/{layer_digest}"), "tok"),
+            Some(Found::Blob(_, d)) if d == layer_digest
+        ));
+        assert!(matches!(
+            lookup(&store, &format!("/v2/tok/docker.io/library/alpine/blobs/{cfg_digest}"), "tok"),
+            Some(Found::Blob(_, d)) if d == cfg_digest
+        ));
+        // Another repository cannot read alpine's blobs.
+        assert!(lookup(&store, &format!("/v2/tok/docker.io/library/other/blobs/{layer_digest}"), "tok").is_none());
+
+        // 2. Retagged into a local repository (`docker tag alpine:3.20 mybase:dev`):
+        // served by tag and by blob under the new repository.
+        store.put_image(pulled.tagged("mybase:dev".into())).unwrap();
+        assert!(matches!(
+            lookup(&store, "/v2/tok/docker.io/library/mybase/manifests/dev", "tok"),
+            Some(Found::Manifest(_, d)) if d == pulled_manifest_digest
+        ));
+        assert!(matches!(
+            lookup(&store, &format!("/v2/tok/docker.io/library/mybase/blobs/{layer_digest}"), "tok"),
+            Some(Found::Blob(_, d)) if d == layer_digest
+        ));
+
+        // 3. Built, loaded or committed here: served by tag until pushed to a registry.
+        let local = kiri_image::archive::from_config("localhost:5000/myapp:dev".into(), &cfg_digest, &cfg, layers);
+        store.put_image(local).unwrap();
+        assert!(matches!(lookup(&store, "/v2/tok/localhost:5000/myapp/manifests/dev", "tok"), Some(Found::Manifest(..))));
+        store.set_pushed("localhost:5000/myapp:dev", &cfg_digest, &format!("sha256:{}", "c".repeat(64))).unwrap();
+        assert!(lookup(&store, "/v2/tok/localhost:5000/myapp/manifests/dev", "tok").is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An image built here: no registry has it.
+    fn made_here() -> Image {
+        let config_digest = "sha256:config".to_owned();
+        Image {
+            name: "myapp:dev".into(),
+            digest: config_digest.clone(),
+            index_digest: None,
+            config_digest,
+            layers: Vec::new(),
+            size: 0,
+            platform: "linux/amd64".into(),
+            created: String::new(),
+            pulled_at: 0,
+            config: kiri_image::RunConfig::default(),
+            mirror: None,
+        }
     }
 
     #[test]

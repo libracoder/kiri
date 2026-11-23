@@ -1522,6 +1522,30 @@ if [ -n "$HOSTIP" ]; then
   t mirror-cli-add "http://$HOSTIP:5056" "$KIRI" registry mirror add "http://$HOSTIP:5056"
   t mirror-http-pull "3." bash -c "$D pull -q kiri-mirror-only:1 >/dev/null && $D run --rm kiri-mirror-only:1 cat /etc/alpine-release"
   t mirror-docker-info "http://$HOSTIP:5056/" bash -c "$D info 2>/dev/null | sed -n '/Registry Mirrors/,/^ [A-Z]/p'"
+  python3 - 5056 <<'PY'
+import gzip, hashlib, io, json, sys, tarfile, urllib.request
+u = f"http://localhost:{sys.argv[1]}/v2/library/kiri-mirror-only"
+h = lambda b: "sha256:" + hashlib.sha256(b).hexdigest()
+put = lambda p, ct, b: urllib.request.urlopen(urllib.request.Request(p, data=b, headers={"Content-Type": ct}, method="PUT"))
+def blob(b):
+    loc = urllib.request.urlopen(urllib.request.Request(f"{u}/blobs/uploads/", method="POST")).headers["Location"]
+    sep = "&" if "?" in loc else "?"
+    put(f"{loc}{sep}digest={h(b)}", "application/octet-stream", b)
+    return h(b)
+ms = []
+for a in ("amd64", "arm64"):
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as t:
+        d = f"layer-{a}\n".encode(); ti = tarfile.TarInfo("arch"); ti.size = len(d); t.addfile(ti, io.BytesIO(d))
+    raw = buf.getvalue(); gz = gzip.compress(raw); ld = blob(gz)
+    cfg = json.dumps({"architecture": a, "os": "linux", "config": {"Labels": {"plat": f"from-{a}"}}, "rootfs": {"type": "layers", "diff_ids": [h(raw)]}}).encode()
+    cd = blob(cfg); mt = "application/vnd.docker.distribution.manifest.v2+json"
+    m = json.dumps({"schemaVersion": 2, "mediaType": mt, "config": {"mediaType": "application/vnd.docker.container.image.v1+json", "digest": cd, "size": len(cfg)}, "layers": [{"mediaType": "application/vnd.docker.image.rootfs.diff.tar.gzip", "digest": ld, "size": len(gz)}]}).encode()
+    put(f"{u}/manifests/{h(m)}", mt, m)
+    ms.append({"mediaType": mt, "digest": h(m), "size": len(m), "platform": {"architecture": a, "os": "linux"}})
+lt = "application/vnd.docker.distribution.manifest.list.v2+json"
+put(f"{u}/manifests/multi", lt, json.dumps({"schemaVersion": 2, "mediaType": lt, "manifests": ms}).encode())
+PY
   if command -v openssl >/dev/null 2>&1 && openssl req -x509 -newkey rsa:2048 -nodes -days 3 -subj /CN=kiri-other.test -addext subjectAltName=DNS:kiri-other.test -keyout "$REG/other.key" -out "$REG/other.pem" 2>/dev/null; then
     chmod 644 "$REG/other.key"
     $D run -d --name reg3 -p 5444:5000 -v "$REG:/tls:ro" -e REGISTRY_HTTP_TLS_CERTIFICATE=/tls/other.pem -e REGISTRY_HTTP_TLS_KEY=/tls/other.key registry:2 >/dev/null
@@ -1535,8 +1559,13 @@ if [ -n "$HOSTIP" ]; then
     skip_setup insecure-selfsigned-build "openssl is not installed"
   fi
   t mirror-build "rorrim-tliub" bash -c "gw=\$($D inspect reg2 --format '{{.NetworkSettings.IPAddress}}'):5000; \"$KIRI\" registry mirror remove http://$HOSTIP:5056 >/dev/null 2>&1; \"$KIRI\" registry insecure add \$gw >/dev/null 2>&1; \"$KIRI\" registry mirror add http://\$gw >/dev/null 2>&1; $D rmi kiri-mirror-only:1 >/dev/null 2>&1; mkdir -p \"$REG/bins\" && printf 'FROM kiri-mirror-only:1\nRUN echo built-mirror | rev\n' > \"$REG/bins/Dockerfile\" && DOCKER_BUILDKIT=0 $D build --no-cache \"$REG/bins\" >\"$REG/b.log\" 2>&1; grep -m1 -o rorrim-tliub \"$REG/b.log\" || grep -Ei -m3 'error|fail' \"$REG/b.log\"; \"$KIRI\" registry mirror remove http://\$gw >/dev/null 2>&1; \"$KIRI\" registry insecure remove \$gw >/dev/null 2>&1"
+  # A tag a registry published is left to the registry in builds, even when
+  # one platform of it is already in the local store (#57); an image only in
+  # the local store is still served from Kiri's mirror.
+  t build-platform-pulled-tag "resolved-other-platform" bash -c "\"$KIRI\" registry insecure add $HOSTIP:5056 >/dev/null 2>&1; \"$KIRI\" registry mirror add http://$HOSTIP:5056 >/dev/null 2>&1; $D pull -q kiri-mirror-only:multi >/dev/null 2>&1; gw=\$($D inspect reg2 --format '{{.NetworkSettings.IPAddress}}'):5000; \"$KIRI\" registry mirror remove http://$HOSTIP:5056 >/dev/null 2>&1; \"$KIRI\" registry insecure add \$gw >/dev/null 2>&1; \"$KIRI\" registry mirror add http://\$gw >/dev/null 2>&1; here=\$($D version --format '{{.Server.Arch}}') && { [ \"\$here\" = amd64 ] && other=arm64 || other=amd64; } && lhere=\$($D image inspect -f '{{index .RootFS.Layers 0}}' kiri-mirror-only:multi) && mkdir -p \"$REG/bins\" && printf 'FROM kiri-mirror-only:multi\nCOPY Dockerfile /df\n' > \"$REG/bins/Dockerfile\" && DOCKER_BUILDKIT=0 $D build -q --no-cache --platform linux/\$other -t kiri-mirror-only:built \"$REG/bins\" >/dev/null 2>&1 && lbuilt=\$($D image inspect -f '{{index .RootFS.Layers 0}}' kiri-mirror-only:built) && pbuilt=\$($D image inspect -f '{{.Architecture}} {{index .Config.Labels \"plat\"}}' kiri-mirror-only:built) && [ \"\$pbuilt\" = \"\$other from-\$other\" ] && [ \"\$lbuilt\" != \"\$lhere\" ] && echo resolved-other-platform || echo \"here=\$here got=\$pbuilt lhere=\$lhere lbuilt=\$lbuilt\"; \"$KIRI\" registry mirror remove http://\$gw >/dev/null 2>&1; \"$KIRI\" registry insecure remove \$gw >/dev/null 2>&1"
+  t build-local-tag "local-still-served" bash -c "if ! $D image inspect kiri-mirror-only:multi >/dev/null 2>&1; then \"$KIRI\" registry insecure add $HOSTIP:5056 >/dev/null 2>&1; \"$KIRI\" registry mirror add http://$HOSTIP:5056 >/dev/null 2>&1; $D pull -q kiri-mirror-only:multi >/dev/null 2>&1; fi; gw=\$($D inspect reg2 --format '{{.NetworkSettings.IPAddress}}'):5000; \"$KIRI\" registry mirror remove http://$HOSTIP:5056 >/dev/null 2>&1; \"$KIRI\" registry insecure add \$gw >/dev/null 2>&1; \"$KIRI\" registry mirror add http://\$gw >/dev/null 2>&1; here=\$($D version --format '{{.Server.Arch}}') && $D tag kiri-mirror-only:multi kiri-local-only:1 && mkdir -p \"$REG/bins\" && printf 'FROM kiri-local-only:1\nCOPY Dockerfile /df2\n' > \"$REG/bins/Dockerfile\" && DOCKER_BUILDKIT=0 $D build -q --no-cache -t kiri-local-only:built \"$REG/bins\" >/dev/null 2>&1 && [ \"\$($D image inspect -f '{{index .Config.Labels \"plat\"}}' kiri-local-only:built)\" = \"from-\$here\" ] && echo local-still-served; \"$KIRI\" registry mirror remove http://\$gw >/dev/null 2>&1; \"$KIRI\" registry insecure remove \$gw >/dev/null 2>&1"
   "$KIRI" registry mirror remove "http://$HOSTIP:5056" >/dev/null 2>&1; "$KIRI" registry insecure remove "$HOSTIP:5056" >/dev/null 2>&1; $R logout "$HOSTIP:5055" >/dev/null 2>&1
-  $D rmi kiri-mirror-only:1 >/dev/null 2>&1; $D rm -f reg2 >/dev/null
+  $D rmi kiri-mirror-only:1 kiri-mirror-only:multi kiri-mirror-only:built kiri-local-only:1 kiri-local-only:built >/dev/null 2>&1; $D rm -f reg2 >/dev/null
 else
   skip insecure-registries "this computer has no network address to reach the registry at"
 fi
