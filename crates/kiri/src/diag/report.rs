@@ -253,23 +253,59 @@ pub struct Facts {
     pub created: SystemTime,
     /// The container list, when the person ticked it in the window.
     pub containers: Option<String>,
+    /// VM uplink / DHCP status and (on macOS) bridge & UDP port 67 summary.
+    pub vm_network: Option<String>,
 }
 
-/// The engine as the report describes it, asked without waking the VM.
-fn engine_line() -> String {
+/// The engine as the report describes it (plus its `/info` payload), asked
+/// without waking the VM.
+fn engine_facts() -> (String, Option<Value>) {
     if !crate::client::alive() {
-        return "not running".into();
+        return ("not running".into(), None);
     }
     let version = crate::client::get_background("/version").unwrap_or_default();
     let info = crate::client::get_background("/info").unwrap_or_default();
-    format!(
+    let line = format!(
         "running (engine {}, VM {}, {} of {} containers running, {} images)",
         crate::client::kiri_version(&version).unwrap_or("?"),
         if info["KiriVmAwake"] == true { "awake" } else { "asleep" },
         info["ContainersRunning"].as_u64().unwrap_or(0),
         info["Containers"].as_u64().unwrap_or(0),
         info["Images"].as_u64().unwrap_or(0),
-    )
+    );
+    (line, Some(info))
+}
+
+/// Formats the VM uplink / DHCP fallback and host UDP port 67 lines for the
+/// report. Returns `None` when there is nothing to report (e.g. Linux host).
+pub fn vm_network_summary(info: Option<&Value>, bridge: Option<&crate::daemon::vmnet::Bridge>, udp67: Option<&str>) -> Option<String> {
+    let (mut lines, mut dhcp_failed, mut recorded_udp67) = (Vec::new(), false, None);
+    if let Some(u) = info.and_then(|i| i.get("KiriVmUplink")).filter(|v| v.is_object()) {
+        recorded_udp67 = u["udp67"].as_str();
+        let (ip, gw) = (u["ip"].as_str().unwrap_or("?"), u["gateway"].as_str().unwrap_or("?"));
+        match u["mode"].as_str().unwrap_or("") {
+            "dhcp" => lines.push(format!("VM uplink: DHCP ({ip} via {gw})")),
+            "static-fallback" => {
+                dhcp_failed = true;
+                let (br, dns) = (u["bridge"].as_str().unwrap_or("bridge100"), u["dns"].as_str().unwrap_or("?"));
+                lines.push(format!("VM uplink: static fallback on {br} ({ip} via {gw}, dns {dns}) — DHCP did not answer"));
+            }
+            "fallback-failed" => {
+                dhcp_failed = true;
+                lines.push(format!("VM uplink: no uplink — DHCP did not answer and fallback failed ({})", u["reason"].as_str().unwrap_or("unknown")));
+            }
+            _ => {}
+        }
+    }
+    if let Some(b) = bridge {
+        lines.push(format!("Host vmnet bridge: {} ({}/{})", b.name, std::net::Ipv4Addr::from(b.gateway), b.prefix));
+    }
+    if let Some(holder) = udp67.or(recorded_udp67) {
+        lines.push(format!("Host UDP port 67: {holder}"));
+    } else if dhcp_failed {
+        lines.push("Host UDP port 67: none visible".into());
+    }
+    (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
 /// The engine's containers, one a line: name, image and status. Nothing
@@ -362,6 +398,11 @@ pub fn assemble(home: &Path, state: &Path, facts: &Facts, redactor: &Redactor) -
     let _ = writeln!(s, "System:   {}", super::system().line());
     let _ = writeln!(s, "Engine:   {}", facts.engine);
     let _ = writeln!(s, "Crash reports: {}", if facts.crash_reports { "sent automatically" } else { "not sent automatically" });
+    if let Some(net) = &facts.vm_network {
+        for line in net.lines() {
+            let _ = writeln!(s, "{line}");
+        }
+    }
 
     for (part, title) in [(Part::Daemon, "engine"), (Part::Ui, "window"), (Part::Cli, "command line")] {
         let path = log_file(state, part);
@@ -374,15 +415,20 @@ pub fn assemble(home: &Path, state: &Path, facts: &Facts, redactor: &Redactor) -
         }
     }
 
-    // The engine's own stderr, as launchd (or the window) keeps it.
-    let raw = state.join("daemon.log");
-    let _ = writeln!(s, "\n==== Engine output ({}) ====", raw.display());
-    let text = tail(&raw, LOG_BUDGET as u64);
-    let lines: Vec<&str> = text.lines().collect();
-    if lines.is_empty() {
-        let _ = writeln!(s, "(empty)");
-    } else {
-        let _ = writeln!(s, "{}", lines[lines.len().saturating_sub(200)..].join("\n"));
+    // The engine's own stderr, as launchd (or the window) keeps it, and the
+    // VM's console log (kiri-init messages, kernel boot, DHCP fallback).
+    for (title, path, always) in [("Engine output", state.join("daemon.log"), true), ("Guest console", state.join("logs/guest-console.log"), false)] {
+        if !always && !path.is_file() {
+            continue;
+        }
+        let _ = writeln!(s, "\n==== {title} ({}) ====", path.display());
+        let text = tail(&path, LOG_BUDGET as u64);
+        let lines: Vec<&str> = text.lines().collect();
+        if lines.is_empty() {
+            let _ = writeln!(s, "(empty)");
+        } else {
+            let _ = writeln!(s, "{}", lines[lines.len().saturating_sub(200)..].join("\n"));
+        }
     }
 
     if let Some(list) = &facts.containers {
@@ -419,7 +465,17 @@ pub fn assemble(home: &Path, state: &Path, facts: &Facts, redactor: &Redactor) -
 pub fn report_text(containers: bool) -> io::Result<String> {
     let home = std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| io::Error::other("HOME is not set"))?;
     let state = home.join(crate::flavor::STATE.get());
-    let facts = Facts { engine: engine_line(), crash_reports: crash_reports_on(), created: SystemTime::now(), containers: containers.then(container_lines) };
+    let (engine, info) = engine_facts();
+    let bridge = crate::daemon::vmnet::current_bridge();
+    let udp67 = crate::daemon::vmnet::udp67_holder();
+    let vm_network = vm_network_summary(info.as_ref(), bridge.as_ref(), udp67.as_deref());
+    let facts = Facts {
+        engine,
+        crash_reports: crash_reports_on(),
+        created: SystemTime::now(),
+        containers: containers.then(container_lines),
+        vm_network,
+    };
     Ok(assemble(&home, &state, &facts, &Redactor::for_user()))
 }
 
@@ -882,7 +938,7 @@ mod tests {
         std::fs::write(state.join("crashes/1792700000-ui.sent.txt"), "Kiri crash report\nMessage:  older\n").unwrap();
         std::fs::write(reports.join("kiri-2026-10-28-094107.ips"), format!("{{\"app_name\":\"kiri\",\"crashReporterKey\":\"ABCD-1234\"}}\n{{\"procPath\":\"{h}/Applications/Kiri.app\"}}")).unwrap();
         std::fs::write(reports.join("Safari-2026-10-28-094107.ips"), "not ours").unwrap();
-        let facts = Facts { engine: "not running".into(), crash_reports: false, created: UNIX_EPOCH + Duration::from_secs(1_792_800_000), containers: Some("web  nginx:alpine  Up 2 hours\n".into()) };
+        let facts = Facts { engine: "not running".into(), crash_reports: false, created: UNIX_EPOCH + Duration::from_secs(1_792_800_000), containers: Some("web  nginx:alpine  Up 2 hours\n".into()), vm_network: None };
         let text = assemble(&home, &state, &facts, &Redactor::new(Some(h.clone()), Vec::new()));
 
         assert!(text.starts_with("Kiri diagnostics report\nCreated:  2026-10-24T00:00:00"), "{text}");
@@ -964,6 +1020,32 @@ mod tests {
         assert_eq!(pending(&home, 1_792_700_001), ["1792800000-daemon.txt"]);
         assert_eq!(pending(&home, 1_792_800_000), ["1792800000-daemon.txt"]);
         assert!(pending(&home, 1_792_800_001).is_empty());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn report_includes_vm_uplink_dhcp_fallback_udp67_and_guest_console() {
+        let bridge = crate::daemon::vmnet::Bridge { name: "bridge100".into(), gateway: [192, 168, 64, 1], prefix: 24 };
+        let fallback_info = json!({"KiriVmUplink": {"mode": "static-fallback", "bridge": "bridge100", "ip": "192.168.64.2/24", "gateway": "192.168.64.1", "dns": "192.168.64.1", "udp67": "kavd (pid 412)"}});
+        let summary = vm_network_summary(Some(&fallback_info), Some(&bridge), Some("kavd (pid 412)")).unwrap();
+        assert!(summary.contains("VM uplink: static fallback on bridge100 (192.168.64.2/24 via 192.168.64.1, dns 192.168.64.1) — DHCP did not answer"), "{summary}");
+        assert!(summary.contains("Host vmnet bridge: bridge100 (192.168.64.1/24)") && summary.contains("Host UDP port 67: kavd (pid 412)"), "{summary}");
+
+        let ok = vm_network_summary(Some(&json!({"KiriVmUplink": {"mode": "dhcp", "ip": "192.168.64.28", "gateway": "192.168.64.1"}})), Some(&bridge), None).unwrap();
+        assert!(ok.contains("VM uplink: DHCP (192.168.64.28 via 192.168.64.1)") && !ok.contains("UDP port 67"), "{ok}");
+
+        let fail = vm_network_summary(Some(&json!({"KiriVmUplink": {"mode": "fallback-failed", "reason": "no bridge100"}})), None, None).unwrap();
+        assert!(fail.contains("DHCP did not answer and fallback failed (no bridge100)") && fail.contains("Host UDP port 67: none visible"), "{fail}");
+        assert_eq!(vm_network_summary(None, None, None), None);
+
+        let home = temp_home("vm-net");
+        let state = home.join(".kiri");
+        std::fs::create_dir_all(state.join("logs")).unwrap();
+        std::fs::write(state.join("logs/guest-console.log"), "kiri-init: DHCP did not answer; configured eth0 statically as 192.168.64.2/24 via 192.168.64.1 from host\n").unwrap();
+        let facts = Facts { engine: "running".into(), crash_reports: false, created: UNIX_EPOCH + Duration::from_secs(1_792_800_000), containers: None, vm_network: Some(summary) };
+        let text = assemble(&home, &state, &facts, &Redactor::new(Some(home.display().to_string()), Vec::new()));
+        assert!(text.contains("VM uplink: static fallback on bridge100") && text.contains("Host UDP port 67: kavd (pid 412)"), "{text}");
+        assert!(text.contains("==== Guest console (~/.kiri/logs/guest-console.log) ====") && text.contains("configured eth0 statically as 192.168.64.2/24"), "{text}");
         let _ = std::fs::remove_dir_all(&home);
     }
 }

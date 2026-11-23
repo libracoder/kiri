@@ -1345,6 +1345,8 @@ pub struct Engine {
     /// Configs are content-addressed, so an entry never goes stale; entries
     /// of images no longer stored are dropped on the next listing.
     image_labels: Mutex<HashMap<String, serde_json::Value>>,
+    /// The running VM's uplink status for `/info` and `kiri diag report` (#435).
+    uplink: Mutex<serde_json::Value>,
 }
 
 /// k3s's pod and service ranges, which `kiri k8s` leaves at their defaults.
@@ -1473,6 +1475,7 @@ impl Engine {
             k8s_routes: Mutex::new(None),
             k8s_fwd: Mutex::new(HashMap::new()),
             image_labels: Mutex::new(HashMap::new()),
+            uplink: Mutex::new(serde_json::Value::Null),
         });
         let _ = engine.me.set(Arc::downgrade(&engine));
         engine.start_syncer();
@@ -1493,9 +1496,61 @@ impl Engine {
     }
 
     /// What the agent found wrong with a Linux host, for `docker info`
-    /// (`VmLink::host_warnings`).
+    /// (`VmLink::host_warnings`), or a Mac VM uplink fallback failure.
     pub fn host_warnings(&self) -> Vec<String> {
-        self.awake().map(|vm| vm.host_warnings()).unwrap_or_default()
+        let mut out = self.awake().map(|vm| vm.host_warnings()).unwrap_or_default();
+        if let Some(w) = self.uplink.lock().unwrap_or_else(|e| e.into_inner())["warning"].as_str() {
+            out.push(w.to_owned());
+        }
+        out
+    }
+
+    /// The running VM's uplink status for `/info` and `kiri diag report`.
+    pub fn uplink_info(&self) -> serde_json::Value {
+        self.uplink.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Waits up to 2 s for macOS `bootpd` to lease `eth0` in the VM; if DHCP
+    /// does not answer (e.g. another app bound UDP port 67), configures the
+    /// VM's uplink directly from the Mac's `vmnet` bridge (#435).
+    #[cfg(target_os = "macos")]
+    fn ensure_uplink(&self, vm: &VmLink) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Ok((ip, gw)) = vm.uplink() {
+                *self.uplink.lock().unwrap_or_else(|e| e.into_inner()) = serde_json::json!({
+                    "mode": "dhcp",
+                    "ip": std::net::Ipv4Addr::from(ip).to_string(),
+                    "gateway": std::net::Ipv4Addr::from(gw).to_string(),
+                });
+                return;
+            }
+            if vm.is_disconnected() {
+                return;
+            }
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            std::thread::sleep(left.min(Duration::from_millis(100)));
+        }
+        let udp67 = super::vmnet::udp67_holder();
+        let status = match super::vmnet::discover_uplink(self.store.root())
+            .and_then(|(b, ip)| vm.set_uplink(ip, b.prefix, b.gateway, b.gateway).map(|()| (b, ip)).map_err(|e| e.to_string()))
+        {
+            Ok((b, addr)) => {
+                let (ip, gw) = (format!("{}/{}", std::net::Ipv4Addr::from(addr), b.prefix), std::net::Ipv4Addr::from(b.gateway).to_string());
+                crate::diag::warn!("VM DHCP did not answer; configured VM uplink directly from Mac", bridge = b.name, ip = ip, gateway = gw, dns = gw, udp67 = udp67.as_deref().unwrap_or("none visible"));
+                serde_json::json!({"mode": "static-fallback", "bridge": b.name, "ip": ip, "gateway": gw, "dns": gw, "udp67": udp67})
+            }
+            Err(reason) => {
+                crate::diag::warn!("VM DHCP did not answer and static uplink fallback failed", error = reason, udp67 = udp67.as_deref().unwrap_or("none visible"));
+                let holder = udp67.as_deref().map(|h| format!(" (UDP port 67 held by {h})")).unwrap_or_default();
+                let warning = format!("VM has no IPv4 uplink: DHCP did not answer and static fallback failed: {reason}{holder}");
+                serde_json::json!({"mode": "fallback-failed", "reason": reason, "udp67": udp67, "warning": warning})
+            }
+        };
+        *self.uplink.lock().unwrap_or_else(|e| e.into_inner()) = status;
     }
 
     /// Why unpacked layers may belong to images the image list lost, for
@@ -1622,6 +1677,8 @@ impl Engine {
         *self.memory_target.lock().unwrap_or_else(|e| e.into_inner()) = ceiling;
         self.sleeping.store(false, std::sync::atomic::Ordering::SeqCst);
         self.lock().vm_booted_at = Some(std::time::Instant::now());
+        #[cfg(target_os = "macos")]
+        self.ensure_uplink(&vm);
         *self.link.lock().unwrap_or_else(|e| e.into_inner()) = Some(vm.clone());
         crate::diag::info!("VM booted", ms = t0.elapsed().as_millis(), cpus = cpus, memory_mib = ceiling >> 20);
         drop(waking);
@@ -2618,6 +2675,7 @@ impl Engine {
                 self.k8s_lb.lock().unwrap_or_else(|e| e.into_inner()).clear();
                 self.k8s_fwd.lock().unwrap_or_else(|e| e.into_inner()).clear();
                 self.k8s_routes.lock().unwrap_or_else(|e| e.into_inner()).take();
+                *self.uplink.lock().unwrap_or_else(|e| e.into_inner()) = serde_json::Value::Null;
                 self.changed.notify_all();
                 match end {
                     // sleep_if_idle says why it slept.
