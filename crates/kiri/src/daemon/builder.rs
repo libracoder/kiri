@@ -1063,7 +1063,7 @@ fn run(req: &Request, engine: &Engine, o: &mut Options, r: &mut BufReader<UnixSt
         }
     })
     .map_err(|e| match e {
-        Error::NotFound(m) | Error::Conflict(m) | Error::BadRequest(m) | Error::Unauthorized(m) => m,
+        Error::NotFound(m) | Error::Conflict(m) | Error::BadRequest(m) | Error::Unauthorized(m) | Error::Forbidden(m) => m,
         Error::Io(e) => e.to_string(),
     })?;
     let dir = format!("{WORK}/{}", super::engine::random_hex(8));

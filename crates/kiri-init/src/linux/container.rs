@@ -1517,7 +1517,7 @@ pub(super) fn use_embedded_dns(id: &str, is_kiri: impl Fn([u8; 4]) -> bool) -> i
 }
 
 /// One mount, resolved before clone.
-struct Mount {
+pub(super) struct Mount {
     /// A guest path, or None for a tmpfs.
     source: Option<CString>,
     /// Relative to the container root (the child mounts before pivot_root).
@@ -1533,12 +1533,22 @@ struct Mount {
     tmpfs_flags: libc::c_ulong,
 }
 
+impl Mount {
+    pub(super) fn is_tmpfs(&self) -> bool {
+        self.tmpfs_opts.is_some()
+    }
+
+    pub(super) fn is_copy_up(&self) -> bool {
+        self.copy_up
+    }
+}
+
 /// `source\ttarget\tflags` entries. Flags: `ro`, `create` (make the source
 /// directory), `copyup`, `tmpfs` (source ignored) and tmpfs options and
 /// flags (`noexec`, `exec`, `nosuid`, …; later ones win). A volume with
 /// driver options adds `\ttype\tdevice\tflags(hex)\tdata`, and is mounted
 /// at its source first.
-fn parse_mounts(list: StrList<'_>) -> io::Result<Vec<Mount>> {
+pub(super) fn parse_mounts(list: StrList<'_>) -> io::Result<Vec<Mount>> {
     let mut out = Vec::with_capacity(list.len());
     for m in list.iter() {
         let bad = || io::Error::new(io::ErrorKind::InvalidInput, format!("bad mount {m:?}"));
@@ -1600,7 +1610,7 @@ fn depth(target: &CStr) -> usize {
 
 /// A tmpfs's mount flags from its flag words, in order, so `exec` after
 /// Docker's default `noexec` wins.
-fn tmpfs_flags(words: &[&str]) -> libc::c_ulong {
+pub(super) fn tmpfs_flags(words: &[&str]) -> libc::c_ulong {
     let mut f = 0;
     for w in words {
         match *w {
@@ -1624,7 +1634,7 @@ fn tmpfs_flags(words: &[&str]) -> libc::c_ulong {
 /// pivot_root), creating the target as a directory or an empty file. The
 /// target is looked up inside `root`, so an image's symlink cannot point
 /// the mount, the copy-up or the new directory outside the container.
-fn apply_mount(root: BorrowedFd<'_>, image: Option<BorrowedFd<'_>>, m: &Mount) -> io::Result<()> {
+pub(super) fn apply_mount(root: BorrowedFd<'_>, image: Option<BorrowedFd<'_>>, m: &Mount) -> io::Result<()> {
     let t = Path::new(std::ffi::OsStr::from_bytes(m.target.to_bytes()));
     if let Some(opts) = &m.tmpfs_opts {
         let at = inroot::open(root, t, Last::Dir)?;
@@ -1706,7 +1716,7 @@ fn same_dir(a: &inroot::Found, b: &inroot::Found) -> bool {
 /// root) without the mounts on it: the image as it is under any bind.
 /// None where the kernel has no open_tree (before Linux 5.2); volumes are
 /// then filled from what the path shows, as before.
-fn image_tree() -> Option<OwnedFd> {
+pub(super) fn image_tree() -> Option<OwnedFd> {
     const OPEN_TREE_CLONE: libc::c_uint = 1;
     // SAFETY: a valid NUL-terminated path; the result is a new descriptor or -1.
     let fd = unsafe { libc::syscall(libc::SYS_open_tree, libc::AT_FDCWD, c".".as_ptr(), OPEN_TREE_CLONE | libc::O_CLOEXEC as libc::c_uint) };

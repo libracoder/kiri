@@ -115,6 +115,7 @@ fn status_of(e: Error) -> (u16, String) {
         Error::Conflict(m) => (409, m),
         Error::BadRequest(m) => (400, m),
         Error::Unauthorized(m) => (401, m),
+        Error::Forbidden(m) => (403, m),
         Error::Io(e) => (500, e.to_string()),
     }
 }
@@ -3403,6 +3404,8 @@ pub(super) fn send_chunks(archive: &mut dyn io::Read, to_guest: &mut impl io::Wr
 pub(super) fn copy_error(m: &str) -> Error {
     if let Some(m) = m.strip_prefix("notfound: ") {
         Error::NotFound(m.to_owned())
+    } else if let Some(m) = m.strip_prefix("forbidden: ") {
+        Error::Forbidden(m.to_owned())
     } else if let Some(m) = m.strip_prefix("notdir: ") {
         Error::BadRequest(m.to_owned())
     } else if m.contains("no such container") {
@@ -3459,7 +3462,11 @@ fn archive_get(req: &Request, engine: &Engine, id: &str, w: &mut UnixStream) -> 
             // HEAD answers carry no body, so the reason goes nowhere; the CLI
             // reports "no such file" from the status alone.
             if req.method == "HEAD" {
-                let status = match copy_error(m) { Error::NotFound(_) => 404, _ => 400 };
+                let status = match copy_error(m) {
+                    Error::NotFound(_) => 404,
+                    Error::Forbidden(_) => 403,
+                    _ => 400,
+                };
                 http::head_only(w, status, "")?;
                 return Ok(Next::KeepAlive);
             }
@@ -4787,6 +4794,16 @@ mod tests {
             at += len;
         }
         assert_eq!((got, at), (archive, wire.len()));
+    }
+
+    #[test]
+    fn copy_error_maps_readonly_refusals_to_forbidden_403() {
+        for msg in ["mounted volume is marked read-only", "container rootfs is marked read-only"] {
+            let err = copy_error(&format!("forbidden: {msg}"));
+            assert_eq!(status_of(err), (403, msg.to_owned()));
+        }
+        assert_eq!(status_of(copy_error("notfound: Could not find the file /x in container c1")), (404, "Could not find the file /x in container c1".to_owned()));
+        assert_eq!(status_of(copy_error("notdir: extraction point is not a directory: /x")), (400, "extraction point is not a directory: /x".to_owned()));
     }
 
     #[test]

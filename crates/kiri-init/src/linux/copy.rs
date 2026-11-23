@@ -8,18 +8,19 @@
 //! child asks for it over a socket pair of its own, so a copy and a start at
 //! the same moment share one mount (see `roots`, #227).
 
+use std::cell::RefCell;
+use std::error::Error as StdError;
 use std::fs;
 use std::io::{self, BufReader, BufWriter, Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::path::{Path, PathBuf};
 
-use kiri_proto::{COPY_PORT, CopySpec, FsEntry, Msg, copy_flags, copy_op};
-
-use std::cell::RefCell;
-use std::path::PathBuf;
+use kiri_proto::{COPY_PORT, CopySpec, FsEntry, Msg, StrList, copy_flags, copy_op};
 
 use super::container::{self, Paths};
+use super::inroot;
 use super::sys;
 
 /// A copy child as the agent sees it: its end of the child's socket pair
@@ -191,11 +192,13 @@ fn job(sock: OwnedFd, chan: OwnedFd, running: &[(&str, libc::pid_t)], paths: &Pa
         // These read the writable layer itself, next to the image's layers.
         copy_op::DIFF | copy_op::COMMIT => layer_job(&mut conn, &spec, paths),
         _ => {
-            if let Err(e) = enter(&spec, running, paths, &chan) {
-                return reply_error(&mut conn, &format!("container {}: {e}", spec.id));
-            }
+            let mounts = match enter(&spec, running, paths, &chan) {
+                Ok(m) => m,
+                Err(e) => return reply_error(&mut conn, &format!("container {}: {e}", spec.id)),
+            };
+            drop(chan);
             match spec.op {
-                copy_op::IN => copy_in(&mut conn, &spec),
+                copy_op::IN => copy_in(&mut conn, &spec, &mounts),
                 copy_op::OUT | copy_op::STAT => copy_out(&mut conn, &spec),
                 copy_op::EXPORT => export(&mut conn),
                 op => Err(io::Error::new(io::ErrorKind::InvalidInput, format!("unknown copy op {op}"))),
@@ -208,9 +211,59 @@ fn job(sock: OwnedFd, chan: OwnedFd, running: &[(&str, libc::pid_t)], paths: &Pa
     }
 }
 
-/// Makes the container's root this process's `/`.
-fn enter(spec: &CopySpec<'_>, running: &[(&str, libc::pid_t)], paths: &Paths, chan: &OwnedFd) -> io::Result<()> {
-    let root = match running.iter().find(|(id, _)| *id == spec.id) {
+/// A mount active in the container's root view, used by `copy_in` to refuse
+/// writes into read-only mounts and to overwrite bind-mounted files in place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MountAccess {
+    target: PathBuf,
+    ro: bool,
+    tmpfs: bool,
+}
+
+/// Normalizes an absolute mount target path (`"/data/"` → `"/data"`, `"/"` stays `"/"`).
+fn clean_mount_target(target: &str) -> String {
+    let parts: Vec<&str> = target.split('/').filter(|c| !c.is_empty() && *c != ".").collect();
+    format!("/{}", parts.join("/"))
+}
+
+/// Pure parsing of `CopySpec::mounts` (no filesystem I/O): validates each line
+/// and sorts parent-first, matching `container::parse_mounts`.
+fn parse_mount_access(list: StrList<'_>) -> io::Result<Vec<MountAccess>> {
+    let mut out = Vec::with_capacity(list.len());
+    for m in list.iter() {
+        let f: Vec<&str> = m.split('\t').collect();
+        if f.len() != 3 && f.len() != 7 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("bad mount {m:?}")));
+        }
+        let (given_target, words) = (f[1], f[2]);
+        if !given_target.starts_with('/') || given_target.split('/').any(|c| c == "..") {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("bad mount target {given_target}")));
+        }
+        let flags: Vec<&str> = words.split(',').filter(|w| !w.is_empty()).collect();
+        let tmpfs = flags.contains(&"tmpfs");
+        let ro = if tmpfs { container::tmpfs_flags(&flags) & libc::MS_RDONLY != 0 } else { flags.contains(&"ro") };
+        out.push(MountAccess { target: PathBuf::from(clean_mount_target(given_target)), ro, tmpfs });
+    }
+    out.sort_by_key(|m| m.target.components().count());
+    Ok(out)
+}
+
+/// Resolves each mount's target inside the container chroot so symlinks in
+/// mount target paths (e.g. `/var/run/cfg` → `/run/cfg`) match canonicalized
+/// destination paths.
+fn resolve_mount_targets(access: &mut [MountAccess]) {
+    for m in access {
+        if let Ok(real) = fs::canonicalize(&m.target) {
+            m.target = real;
+        }
+    }
+}
+
+/// Makes the container's root this process's `/`, assembling non-tmpfs volumes
+/// and bind mounts in a private mount namespace when the container is not
+/// running (except for `EXPORT`, which reads only the overlay rootfs).
+fn enter(spec: &CopySpec<'_>, running: &[(&str, libc::pid_t)], paths: &Paths, chan: &OwnedFd) -> io::Result<Vec<MountAccess>> {
+    match running.iter().find(|(id, _)| *id == spec.id) {
         // An export is the container's own filesystem, without its mounts:
         // the overlay the agent mounted for it.
         // It may have stopped since: then the root is mounted for it.
@@ -221,24 +274,70 @@ fn enter(spec: &CopySpec<'_>, running: &[(&str, libc::pid_t)], paths: &Paths, ch
                 }
                 ask(chan, 'm', spec)?;
             }
-            paths.containers.join(spec.id).join("rootfs")
+            chroot_into(&paths.containers.join(spec.id).join("rootfs"))?;
+            Ok(Vec::new())
         }
-        // Through /proc the root shows the container's mounts (volumes) too.
-        // The copy holds the container's root meanwhile, so a restart can't
-        // mount a second one over the same layer while it still writes.
+        // Through /proc the root shows the container's live mounts (including
+        // tmpfs). The copy holds the container's root meanwhile, so a restart
+        // can't mount a second one over the same layer while it still writes.
         Some((_, pid)) => {
             let _ = ask(chan, 'h', spec);
-            std::path::PathBuf::from(format!("/proc/{pid}/root"))
+            let mut access = parse_mount_access(spec.mounts)?;
+            chroot_into(&PathBuf::from(format!("/proc/{pid}/root")))?;
+            resolve_mount_targets(&mut access);
+            Ok(access)
         }
         None => {
             if spec.layers.is_empty() {
                 return Err(io::Error::new(io::ErrorKind::NotFound, "no such container"));
             }
             ask(chan, 'm', spec)?;
-            paths.containers.join(spec.id).join("rootfs")
+            let rootfs = paths.containers.join(spec.id).join("rootfs");
+            if spec.op == copy_op::EXPORT {
+                chroot_into(&rootfs)?;
+                return Ok(Vec::new());
+            }
+            // A stopped or created container has no live tmpfs mounts.
+            let mut access = parse_mount_access(spec.mounts)?;
+            access.retain(|m| !m.tmpfs);
+            if !access.is_empty() {
+                // Assemble mounts strictly inside this short-lived child's own
+                // mount namespace so nothing ever leaks into the agent's.
+                sys::unshare(libc::CLONE_NEWNS)?;
+                sys::remount(c"/", libc::MS_REC | libc::MS_SLAVE)?;
+                let mut mounts = container::parse_mounts(spec.mounts)?;
+                mounts.retain(|m| !m.is_tmpfs());
+                let rootfs_c = sys::cstr(&rootfs)?;
+                // SAFETY: valid NUL-terminated path.
+                unsafe { sys::check(libc::chdir(rootfs_c.as_ptr()) as _, "chdir")? };
+                let root = inroot::open_root(Path::new("."))?;
+                let image = if mounts.iter().any(container::Mount::is_copy_up) { container::image_tree() } else { None };
+                for m in &mounts {
+                    container::apply_mount(root.as_fd(), image.as_ref().map(|f| f.as_fd()), m)?;
+                }
+                drop(image);
+                drop(root);
+                if spec.op == copy_op::IN && spec.flags & copy_flags::READONLY_ROOTFS != 0 {
+                    // Defense in depth: remount only the rootfs mount read-only
+                    // in our private namespace, leaving writable mounts rw.
+                    sys::mount(c"none", c".", c"none", libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY, None)?;
+                }
+                // SAFETY: valid NUL-terminated paths.
+                unsafe {
+                    sys::check(libc::chroot(c".".as_ptr()) as _, "chroot")?;
+                    sys::check(libc::chdir(c"/".as_ptr()) as _, "chdir")?;
+                }
+            } else {
+                chroot_into(&rootfs)?;
+            }
+            resolve_mount_targets(&mut access);
+            Ok(access)
         }
-    };
-    let c = sys::cstr(&root)?;
+    }
+}
+
+fn chroot_into(root: &Path) -> io::Result<()> {
+    let c = sys::cstr(root)?;
     // SAFETY: valid NUL-terminated paths.
     unsafe {
         sys::check(libc::chroot(c.as_ptr()) as _, "chroot")?;
@@ -271,8 +370,125 @@ fn ask(chan: &OwnedFd, kind: char, spec: &CopySpec<'_>) -> io::Result<()> {
     }
 }
 
+/// Refuses writes when the innermost mount containing `canonical_path` is
+/// read-only, or when `canonical_path` is outside every mount and the
+/// container has `--read-only`.
+fn check_writable(canonical_path: &Path, mounts: &[MountAccess], readonly_rootfs: bool) -> io::Result<()> {
+    let innermost = mounts
+        .iter()
+        .filter(|m| canonical_path == m.target || canonical_path.starts_with(&m.target))
+        .max_by_key(|m| m.target.components().count());
+    match innermost {
+        Some(m) if m.ro => Err(io::Error::new(io::ErrorKind::PermissionDenied, "forbidden: mounted volume is marked read-only")),
+        Some(_) => Ok(()),
+        None if readonly_rootfs => Err(io::Error::new(io::ErrorKind::PermissionDenied, "forbidden: container rootfs is marked read-only")),
+        None => Ok(()),
+    }
+}
+
+/// Resolves a tar entry's target path under `canonical_dest`, following
+/// existing symlinks in parent components (inside the container chroot) while
+/// keeping the final component unfollowed (since unpacking replaces a final
+/// symlink rather than writing through it).
+fn resolve_entry_target(canonical_dest: &Path, entry_path: &Path) -> PathBuf {
+    let mut parts: Vec<&std::ffi::OsStr> = Vec::new();
+    for c in entry_path.components() {
+        match c {
+            std::path::Component::Normal(p) => parts.push(p),
+            std::path::Component::ParentDir => {
+                parts.pop();
+            }
+            std::path::Component::CurDir | std::path::Component::RootDir | std::path::Component::Prefix(_) => {}
+        }
+    }
+    let Some((last, parents)) = parts.split_last() else {
+        return canonical_dest.to_path_buf();
+    };
+    let mut cur = canonical_dest.to_path_buf();
+    let mut exists = true;
+    for part in parents {
+        cur.push(part);
+        if exists {
+            match fs::canonicalize(&cur) {
+                Ok(real) => cur = real,
+                Err(_) => exists = false,
+            }
+        }
+    }
+    cur.push(last);
+    cur
+}
+
+fn is_erofs(e: &io::Error) -> bool {
+    if e.raw_os_error() == Some(libc::EROFS) {
+        return true;
+    }
+    let mut cur: Option<&(dyn StdError + 'static)> = e.source();
+    while let Some(src) = cur {
+        if src.downcast_ref::<io::Error>().is_some_and(|ioe| ioe.raw_os_error() == Some(libc::EROFS)) {
+            return true;
+        }
+        cur = src.source();
+    }
+    false
+}
+
+fn map_erofs(e: io::Error, path: &Path, mounts: &[MountAccess], readonly_rootfs: bool) -> io::Error {
+    if !is_erofs(&e) {
+        return e;
+    }
+    match check_writable(path, mounts, readonly_rootfs) {
+        Err(ro) => ro,
+        Ok(()) => io::Error::new(io::ErrorKind::PermissionDenied, "forbidden: mounted volume is marked read-only"),
+    }
+}
+
+/// Overwrites an existing bind-mounted regular file in place: `unlink(2)` on a
+/// file bind mount fails with `EBUSY`, so `tar::Entry::unpack_in` cannot
+/// replace it by remove-and-recreate.
+fn unpack_mount_file<R: Read>(entry: &mut tar::Entry<'_, R>, target: &Path, owner: Option<(libc::uid_t, libc::gid_t)>) -> io::Result<()> {
+    let c = sys::cstr(target)?;
+    // SAFETY: valid NUL-terminated path; O_NOFOLLOW never follows a symlink,
+    // and O_NONBLOCK avoids blocking if a FIFO was swapped in.
+    let fd = unsafe { libc::open(c.as_ptr(), libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fresh descriptor owned only here.
+    let mut file = fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+    // SAFETY: plain zeroed stat filled from our own descriptor.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    sys::check(unsafe { libc::fstat(file.as_raw_fd(), &mut st) } as _, "fstat")?;
+    if st.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "mount target is not a regular file"));
+    }
+    // SAFETY: valid regular-file descriptor we own.
+    sys::check(unsafe { libc::ftruncate(file.as_raw_fd(), 0) } as _, "ftruncate")?;
+    io::copy(entry, &mut file)?;
+    if let Some((uid, gid)) = owner {
+        // SAFETY: valid descriptor we own.
+        sys::check(unsafe { libc::fchown(file.as_raw_fd(), uid, gid) } as _, "fchown")?;
+    } else if let (Ok(uid), Ok(gid)) = (entry.header().uid(), entry.header().gid()) {
+        // SAFETY: valid descriptor we own; best-effort like tar::Archive.
+        unsafe { libc::fchown(file.as_raw_fd(), uid as libc::uid_t, gid as libc::gid_t) };
+    }
+    if let Ok(mode) = entry.header().mode() {
+        // SAFETY: valid descriptor we own.
+        sys::check(unsafe { libc::fchmod(file.as_raw_fd(), (mode & 0o7777) as libc::mode_t) } as _, "fchmod")?;
+    }
+    if let Ok(mtime) = entry.header().mtime() {
+        let times = [
+            libc::timespec { tv_sec: 0, tv_nsec: libc::UTIME_OMIT },
+            libc::timespec { tv_sec: mtime as _, tv_nsec: 0 },
+        ];
+        // SAFETY: valid descriptor and 2-element timespec array.
+        unsafe { libc::futimens(file.as_raw_fd(), times.as_ptr()) };
+    }
+    Ok(())
+}
+
 /// Unpacks the archive that follows into `spec.path`, a directory.
-fn copy_in(conn: &mut fs::File, spec: &CopySpec<'_>) -> io::Result<()> {
+fn copy_in(conn: &mut fs::File, spec: &CopySpec<'_>, mounts: &[MountAccess]) -> io::Result<()> {
     let (path, user) = if spec.flags & copy_flags::KEEP_OWNERS != 0 {
         spec.path.split_once('\0').unwrap_or((spec.path, ""))
     } else {
@@ -284,10 +500,13 @@ fn copy_in(conn: &mut fs::File, spec: &CopySpec<'_>) -> io::Result<()> {
         Ok(_) => return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("notdir: extraction point is not a directory: {path}"))),
         Err(_) => return Err(io::Error::new(io::ErrorKind::NotFound, format!("notfound: Could not find the file {path} in container {}", spec.id))),
     }
+    let canonical_dest = fs::canonicalize(dest)?;
+    let readonly_rootfs = spec.flags & copy_flags::READONLY_ROOTFS != 0;
+    check_writable(&canonical_dest, mounts, readonly_rootfs)?;
     let owner = if user.is_empty() { None } else { Some(resolve_copy_user_in(std::path::Path::new("/"), user)?) };
     let source: Box<dyn Read + '_> = if spec.flags & copy_flags::CHUNKED != 0 { Box::new(Chunks::new(&mut *conn)) } else { Box::new(&mut *conn) };
     let mut reader = BufReader::with_capacity(256 * 1024, source);
-    unpack_in(&mut reader, dest, spec.flags, owner)?;
+    unpack_in(&mut reader, dest, &canonical_dest, spec.flags, owner, mounts, readonly_rootfs)?;
     // The archive's trailing padding: read it so the host's writes complete.
     io::copy(&mut reader, &mut io::sink())?;
     drop(reader);
@@ -350,7 +569,15 @@ fn resolve_copy_user_in(root: &std::path::Path, user: &str) -> io::Result<(libc:
     Ok((uid, gid))
 }
 
-fn unpack_in(reader: impl Read, dest: &std::path::Path, flags: u32, owner: Option<(libc::uid_t, libc::gid_t)>) -> io::Result<()> {
+fn unpack_in(
+    reader: impl Read,
+    dest: &std::path::Path,
+    canonical_dest: &std::path::Path,
+    flags: u32,
+    owner: Option<(libc::uid_t, libc::gid_t)>,
+    mounts: &[MountAccess],
+    readonly_rootfs: bool,
+) -> io::Result<()> {
     let mut archive = tar::Archive::new(reader);
     archive.set_preserve_permissions(true);
     archive.set_preserve_mtime(true);
@@ -363,10 +590,19 @@ fn unpack_in(reader: impl Read, dest: &std::path::Path, flags: u32, owner: Optio
     archive.set_overwrite(true);
     for entry in archive.entries()? {
         let mut entry = entry?;
+        let path = entry.path()?.into_owned();
+        let etype = entry.header().entry_type();
+        let check_path = if !etype.is_pax_global_extensions() && !etype.is_pax_local_extensions() {
+            let resolved = resolve_entry_target(canonical_dest, &path);
+            check_writable(&resolved, mounts, readonly_rootfs)?;
+            Some(resolved)
+        } else {
+            None
+        };
         if flags & copy_flags::NO_OVERWRITE_DIR_NON_DIR != 0 {
-            let target = dest.join(entry.path()?);
+            let target = dest.join(&path);
             if let Ok(m) = fs::symlink_metadata(&target)
-                && m.is_dir() != entry.header().entry_type().is_dir()
+                && m.is_dir() != etype.is_dir()
             {
                 return Err(io::Error::new(
                     io::ErrorKind::AlreadyExists,
@@ -374,11 +610,19 @@ fn unpack_in(reader: impl Read, dest: &std::path::Path, flags: u32, owner: Optio
                 ));
             }
         }
-        let path = entry.path()?.into_owned();
+        if let Some(ref resolved) = check_path
+            && etype.is_file()
+            && mounts.iter().any(|m| m.target == *resolved)
+            && fs::symlink_metadata(resolved).is_ok_and(|m| m.file_type().is_file())
+        {
+            unpack_mount_file(&mut entry, resolved, owner).map_err(|e| map_erofs(e, resolved, mounts, readonly_rootfs))?;
+            continue;
+        }
         // `docker cp` and the classic build's context keep a time of 0.
-        if entry.unpack_in(dest)? {
+        let target_for_err = check_path.as_deref().unwrap_or(canonical_dest);
+        if entry.unpack_in(dest).map_err(|e| map_erofs(e, target_for_err, mounts, readonly_rootfs))? {
             if let Some((uid, gid)) = owner
-                && !entry.header().entry_type().is_pax_global_extensions()
+                && !etype.is_pax_global_extensions()
             {
                 let mut file_dst = dest.to_path_buf();
                 for part in path.components() {
@@ -967,7 +1211,7 @@ mod tests {
         b.append_data(&mut h(tar::EntryType::Regular, 3, 0o640), "replaced", &b"new"[..]).unwrap();
         let bytes = b.into_inner().unwrap();
 
-        unpack_in(&bytes[..], &dest, 0, None).unwrap();
+        unpack_in(&bytes[..], &dest, &dest, 0, None, &[], false).unwrap();
 
         let meta = |p: &str| fs::symlink_metadata(dest.join(p)).unwrap();
         let dir = meta("dir");
@@ -986,7 +1230,7 @@ mod tests {
         assert_eq!((target.uid(), target.gid()), (0, 0));
         assert_eq!(fs::read(dest.join("target")).unwrap(), b"stay");
 
-        unpack_in(&bytes[..], &dest, 0, Some((2375, 2376))).unwrap();
+        unpack_in(&bytes[..], &dest, &dest, 0, Some((2375, 2376)), &[], false).unwrap();
         assert_eq!((meta("dir").uid(), meta("dir").gid()), (2375, 2376));
         assert_eq!((meta("dir/owned.pem").uid(), meta("dir/owned.pem").gid(), meta("dir/owned.pem").mode() & 0o777), (2375, 2376, 0o600));
         assert_eq!((meta("link").uid(), meta("link").gid()), (2375, 2376));
@@ -1092,6 +1336,119 @@ mod tests {
         let skip = |lowers: &[OwnedFd]| is_marker_attr(p(".dockerenv"), true, 0, 0o100755, 0, 0) && !in_lower_layers(lowers, p(".dockerenv"));
         assert!(skip(&clean_lowers));
         assert!(!skip(&image_lowers));
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn parse_mount_access_sorts_parents_first_and_tracks_ro_and_tmpfs() {
+        let mut buf = Vec::new();
+        kiri_proto::encode_copy(
+            &mut buf,
+            copy_op::IN,
+            "c1",
+            "/",
+            0,
+            &["sha256:a"],
+            &[
+                "/v/sub\t/app/sub/\tro",
+                "/v/app\t/app\tcreate,copyup",
+                "tmpfs\t/tmp\ttmpfs,noexec,ro",
+                "tmpfs\t/run\ttmpfs,ro,rw",
+            ],
+        );
+        let Msg::Copy(spec) = kiri_proto::decode(&buf).unwrap() else { panic!() };
+        let got = parse_mount_access(spec.mounts).unwrap();
+        assert_eq!(
+            got,
+            [
+                MountAccess { target: PathBuf::from("/app"), ro: false, tmpfs: false },
+                MountAccess { target: PathBuf::from("/tmp"), ro: true, tmpfs: true },
+                MountAccess { target: PathBuf::from("/run"), ro: false, tmpfs: true },
+                MountAccess { target: PathBuf::from("/app/sub"), ro: true, tmpfs: false },
+            ]
+        );
+        let mut bad = Vec::new();
+        kiri_proto::encode_copy(&mut bad, copy_op::IN, "c1", "/", 0, &[], &["/src\t../escape\tro"]);
+        let Msg::Copy(bad_spec) = kiri_proto::decode(&bad).unwrap() else { panic!() };
+        assert!(parse_mount_access(bad_spec.mounts).is_err());
+    }
+
+    #[test]
+    fn check_writable_enforces_innermost_mount_and_readonly_rootfs() {
+        let m = |target: &str, ro: bool| MountAccess { target: PathBuf::from(target), ro, tmpfs: false };
+        let mounts = [m("/app", false), m("/app/ro", true), m("/app/ro/rw", false), m("/ro", true)];
+        let err = |p: &str, ro_root: bool| check_writable(Path::new(p), &mounts, ro_root).unwrap_err().to_string();
+
+        assert_eq!(err("/ro", false), "forbidden: mounted volume is marked read-only");
+        assert_eq!(err("/ro/sub/f", false), "forbidden: mounted volume is marked read-only");
+        assert_eq!(err("/app/ro", false), "forbidden: mounted volume is marked read-only");
+        assert_eq!(err("/app/ro/file", false), "forbidden: mounted volume is marked read-only");
+        // Component boundary: `/app/ro2` is under `/app` (rw), not `/app/ro`.
+        assert!(check_writable(Path::new("/app/ro2/file"), &mounts, true).is_ok());
+        // Writable nested mount inside a read-only mount succeeds.
+        assert!(check_writable(Path::new("/app/ro/rw"), &mounts, true).is_ok());
+        assert!(check_writable(Path::new("/app/ro/rw/x"), &mounts, true).is_ok());
+        // Path outside every mount: refused iff `--read-only`.
+        assert!(check_writable(Path::new("/etc"), &mounts, false).is_ok());
+        assert_eq!(err("/etc", true), "forbidden: container rootfs is marked read-only");
+        // Writable mount on a `--read-only` rootfs succeeds.
+        assert!(check_writable(Path::new("/app/file"), &mounts, true).is_ok());
+        // `:ro` mount on a `--read-only` rootfs reports the mounted volume error.
+        assert_eq!(err("/ro/x", true), "forbidden: mounted volume is marked read-only");
+    }
+
+    #[test]
+    fn unpack_in_refuses_ro_mounts_and_overwrites_file_mounts_in_place() {
+        let base = std::env::temp_dir().join(format!("kiri-copy-ro-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let root = base.join("root");
+        fs::create_dir_all(root.join("ro")).unwrap();
+        fs::create_dir_all(root.join("rw")).unwrap();
+        fs::create_dir_all(root.join("etc")).unwrap();
+        fs::write(root.join("etc/app.conf"), b"old").unwrap();
+        fs::write(root.join("etc/ro.conf"), b"stay").unwrap();
+        std::os::unix::fs::symlink(root.join("etc"), root.join("rw/to_etc")).unwrap();
+        let canonical_root = fs::canonicalize(&root).unwrap();
+        let mounts = [
+            MountAccess { target: canonical_root.join("ro"), ro: true, tmpfs: false },
+            MountAccess { target: canonical_root.join("rw"), ro: false, tmpfs: false },
+            MountAccess { target: canonical_root.join("etc/app.conf"), ro: false, tmpfs: false },
+            MountAccess { target: canonical_root.join("etc/ro.conf"), ro: true, tmpfs: false },
+        ];
+        let tar_file = |name: &str, data: &[u8]| {
+            let mut b = tar::Builder::new(Vec::new());
+            let mut h = tar::Header::new_gnu();
+            h.set_entry_type(tar::EntryType::Regular);
+            h.set_size(data.len() as u64);
+            h.set_mode(0o640);
+            h.set_mtime(0);
+            h.set_cksum();
+            b.append_data(&mut h, name, data).unwrap();
+            b.into_inner().unwrap()
+        };
+
+        // Entry targeting a `:ro` file bind mount is refused before writing.
+        let bytes = tar_file("ro.conf", b"pwn");
+        let err = unpack_in(&bytes[..], &canonical_root.join("etc"), &canonical_root.join("etc"), 0, None, &mounts, false).unwrap_err();
+        assert_eq!(err.to_string(), "forbidden: mounted volume is marked read-only");
+        assert_eq!(fs::read(canonical_root.join("etc/ro.conf")).unwrap(), b"stay");
+
+        // Entry escaping a `:rw` volume through a symlink to a `--read-only` rootfs is refused.
+        let bytes = tar_file("to_etc/pwn", b"bad");
+        let err = unpack_in(&bytes[..], &canonical_root.join("rw"), &canonical_root.join("rw"), 0, None, &mounts, true).unwrap_err();
+        assert_eq!(err.to_string(), "forbidden: container rootfs is marked read-only");
+        assert!(!canonical_root.join("etc/pwn").exists());
+
+        // Entry targeting a `:rw` file bind mount overwrites in place (keeping inode and zero mtime).
+        let before_ino = fs::symlink_metadata(canonical_root.join("etc/app.conf")).unwrap().ino();
+        let bytes = tar_file("app.conf", b"updated");
+        unpack_in(&bytes[..], &canonical_root.join("etc"), &canonical_root.join("etc"), 0, None, &mounts, false).unwrap();
+        let after = fs::symlink_metadata(canonical_root.join("etc/app.conf")).unwrap();
+        assert_eq!(after.ino(), before_ino, "file bind mount must be overwritten in place, not unlinked");
+        assert_eq!(fs::read(canonical_root.join("etc/app.conf")).unwrap(), b"updated");
+        assert_eq!(after.mtime(), 0);
+        assert_eq!(after.mode() & 0o777, 0o640);
 
         let _ = fs::remove_dir_all(&base);
     }

@@ -281,6 +281,9 @@ pub mod copy_flags {
     /// Intel Mac with macOS 14 passes a half-close on as a full one, and the
     /// guest's answer fails with EPIPE.
     pub const CHUNKED: u32 = 4;
+    /// `IN`: the container has `--read-only` (`HostConfig.ReadonlyRootfs`), so
+    /// writes outside writable mounts are refused.
+    pub const READONLY_ROOTFS: u32 = 8;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -290,16 +293,21 @@ pub struct CopySpec<'a> {
     pub path: &'a str,
     pub flags: u32,
     pub layers: StrList<'a>,
+    /// The container's mounts (`source\ttarget\tflags[\t…]`, as in
+    /// [`RunSpec::mounts`]). Empty from an older daemon, and empty for
+    /// `EXPORT`, `DIFF` and `COMMIT`.
+    pub mounts: StrList<'a>,
 }
 
 /// Encodes a `Copy` frame from the sender's side.
-pub fn encode_copy<S: AsRef<str>>(out: &mut Vec<u8>, op: u8, id: &str, path: &str, flags: u32, layers: &[S]) {
+pub fn encode_copy<S: AsRef<str>>(out: &mut Vec<u8>, op: u8, id: &str, path: &str, flags: u32, layers: &[S], mounts: &[S]) {
     frame(out, kind::COPY, |o| {
         o.push(op);
         put_str(o, id);
         put_str(o, path);
         put_u32(o, flags);
         StrList::put(o, layers);
+        StrList::put(o, mounts);
     });
 }
 
@@ -1199,6 +1207,8 @@ impl Msg<'_> {
                 put_u32(o, c.flags);
                 put_u32(o, c.layers.count);
                 o.extend_from_slice(c.layers.raw);
+                put_u32(o, c.mounts.count);
+                o.extend_from_slice(c.mounts.raw);
             }),
             Msg::CopyStat { entry, link } => frame(out, kind::COPY_STAT, |o| {
                 put_entry(o, &entry);
@@ -1512,7 +1522,15 @@ pub fn decode(frame: &[u8]) -> Result<Msg<'_>, DecodeError> {
             }
             Msg::DnsRename { id, bridge, ip, ip6, v4, names }
         }
-        kind::COPY => Msg::Copy(CopySpec { op: r.u8()?, id: r.str()?, path: r.str()?, flags: r.u32()?, layers: r.list()? }),
+        kind::COPY => Msg::Copy(CopySpec {
+            op: r.u8()?,
+            id: r.str()?,
+            path: r.str()?,
+            flags: r.u32()?,
+            layers: r.list()?,
+            // Trailing list; absent from an older daemon.
+            mounts: if r.remaining() >= 4 { r.list()? } else { StrList::default() },
+        }),
         kind::COPY_STAT => Msg::CopyStat { entry: read_entry(&mut r)?, link: r.str()? },
         kind::COPY_DONE => Msg::CopyDone,
         kind::UPDATE => Msg::Update { id: r.str()?, limits: read_limits(&mut r)? },
@@ -1916,13 +1934,24 @@ mod tests {
         round(Msg::Uplink { ip: [192, 168, 64, 18], gateway: [192, 168, 64, 1] });
         round(Msg::Ack);
         let mut buf = Vec::new();
-        encode_copy(&mut buf, copy_op::IN, "c1", "/etc", copy_flags::KEEP_OWNERS, &["sha256:a", "sha256:b"]);
+        let mounts = ["/var/lib/kiri/volumes/pg/_data\t/var/lib/postgresql/data\tcreate,copyup", "/host/cfg\t/etc/app\tro"];
+        encode_copy(&mut buf, copy_op::IN, "c1", "/etc", copy_flags::KEEP_OWNERS | copy_flags::READONLY_ROOTFS, &["sha256:a", "sha256:b"], &mounts);
         let Msg::Copy(c) = decode(&buf).unwrap() else { panic!() };
-        assert_eq!((c.op, c.id, c.path, c.flags), (copy_op::IN, "c1", "/etc", copy_flags::KEEP_OWNERS));
+        assert_eq!((c.op, c.id, c.path, c.flags), (copy_op::IN, "c1", "/etc", copy_flags::KEEP_OWNERS | copy_flags::READONLY_ROOTFS));
         assert_eq!(c.layers.iter().collect::<Vec<_>>(), ["sha256:a", "sha256:b"]);
+        assert_eq!(c.mounts.iter().collect::<Vec<_>>(), mounts);
         let mut again = Vec::new();
         Msg::Copy(c).encode(&mut again);
         assert_eq!(buf, again);
+        // An older daemon's Copy frame without the mount list still decodes.
+        let mut old = Vec::new();
+        encode_copy(&mut old, copy_op::OUT, "c1", "/etc", 0, &["sha256:a"], &[]);
+        old.truncate(old.len() - 4);
+        let len = (old.len() - 4) as u32;
+        old[..4].copy_from_slice(&len.to_le_bytes());
+        let Msg::Copy(old_c) = decode(&old).unwrap() else { panic!() };
+        assert_eq!(old_c.layers.iter().collect::<Vec<_>>(), ["sha256:a"]);
+        assert!(old_c.mounts.is_empty());
         let mut buf = Vec::new();
         let entries = [
             FsEntry { name: "a", mode: 0o100644, size: 1, mtime: 2, mtime_nsec: 9, ino: 1 },

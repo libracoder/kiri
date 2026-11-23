@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #245 Engine: mount volumes and binds for `docker cp` on non-running containers and refuse read-only archive writes (unreleased)
+- Fixes: #245 `docker cp` on a created or stopped container ignores named volumes and bind mounts, and `PUT /containers/{id}/archive` does not refuse read-only mounts or `--read-only` rootfs with 403 Forbidden
+- Caused: none known
+- Caused by: -
+- Check: `cp-created-volume-out`, `cp-created-volume-in`, `cp-created-volume-copyup`, `cp-created-bind-mounts`, `cp-created-nested-mounts`, `cp-ro-volume-refused`, `cp-ro-rootfs-refused`, `cp-created-symlink-confined`
+
 ### #515 Host relay: close open proxy connections when the relay stream ends (unreleased)
 - Fixes: no issue
 - Caused: none known

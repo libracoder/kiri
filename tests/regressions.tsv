@@ -260,3 +260,11 @@ limit-memory-swap-refused	#523	invalid --memory-swap values on create and update
 limit-memory-swap-update	#523	docker update dropped --memory-swap or failed to keep an existing custom or unlimited swap limit (#690)
 limit-memory-swap	#523	every container with --memory was pinned to memory.swap.max = 0 instead of getting Docker's 2x default or --memory-swap (#690)
 stats-cpu-throttling	#537	container stats always reported zero for cpu_stats.throttling_data even when a CPU-limited container was throttled
+cp-created-volume-out	#245	GET /containers/{id}/archive (docker cp out) on a created or stopped container opened only the overlay rootfs without mounting named volumes, returning 404 for files in the volume (Supabase CLI PG_VERSION check)
+cp-created-volume-in	#245	PUT /containers/{id}/archive (docker cp in) on a created or stopped container wrote into the overlay under the mountpoint instead of into the mounted named volume, while docker export must stay rootfs-only
+cp-created-volume-copyup	#245	docker cp on a created container with a fresh empty named volume did not populate it from the image directory (unless nocopy is set)
+cp-created-bind-mounts	#245	docker cp out of and into a created or stopped container ignored directory and file bind mounts (while tmpfs mounts must remain unmounted when not running)
+cp-created-nested-mounts	#245	docker cp on a created or stopped container with nested mounts must apply mounts parent-first regardless of argument order
+cp-ro-volume-refused	#245	PUT /containers/{id}/archive into a read-only (:ro) volume or bind mount on a running or stopped container must fail with 403 Forbidden and "mounted volume is marked read-only" before writing
+cp-ro-rootfs-refused	#245	PUT /containers/{id}/archive onto a --read-only container rootfs must fail with 403 Forbidden and "container rootfs is marked read-only" while allowing writes into :rw volumes
+cp-created-symlink-confined	#245	mount target lookup and docker cp path resolution on a non-running container must confine symlinks inside the container rootfs without escaping onto the host or VM filesystem

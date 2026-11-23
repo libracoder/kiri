@@ -394,6 +394,7 @@ fn reason(status: u16) -> &'static str {
         204 => "No Content",
         304 => "Not Modified",
         400 => "Bad Request",
+        403 => "Forbidden",
         404 => "Not Found",
         409 => "Conflict",
         413 => "Request Entity Too Large",

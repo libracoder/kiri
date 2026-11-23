@@ -1374,6 +1374,7 @@ pub enum Error {
     Conflict(String),
     BadRequest(String),
     Unauthorized(String),
+    Forbidden(String),
     Io(io::Error),
 }
 
@@ -3893,20 +3894,32 @@ impl Engine {
     /// Opens a `docker cp` session with the guest for a container, running
     /// or not: the request frame is sent, the caller does the rest.
     pub fn copy(&self, key: &str, op: u8, path: &str, flags: u32) -> Result<kiri_vmm::VsockStream, Error> {
-        self.wait_for_start(&self.resolve(key)?);
+        let use_mounts = matches!(op, kiri_proto::copy_op::IN | kiri_proto::copy_op::OUT | kiri_proto::copy_op::STAT);
+        let (self_gate, shared_gates) = {
+            let st = self.lock();
+            let id = resolve(&st, key)?;
+            let c = st.containers.get(&id).expect("resolved");
+            let shared = if use_mounts { shared_volume_gates(&st, &id, &c.spec) } else { Vec::new() };
+            (c.start_gate.clone(), shared)
+        };
+        self_gate.wait();
+        for gate in shared_gates {
+            gate.wait();
+        }
         // Looked up after the wait: a `--rm` start that failed meanwhile has
         // removed the container, and a copy must not then write into a
         // folder made again for a container that no longer exists.
-        let (id, layers) = {
+        let (id, layers, spec) = {
             let st = self.lock();
             let id = resolve(&st, key)?;
-            let layers = st.containers.get(&id).map(|c| c.layers.clone()).unwrap_or_default();
-            (id, layers)
+            let c = st.containers.get(&id).expect("resolved");
+            (id, c.layers.clone(), c.spec.clone())
         };
+        let (mounts, flags) = copy_mounts_and_flags(&spec, op, flags);
         let vm = self.vm()?;
         let stream = vm.connect(kiri_proto::COPY_PORT)?;
         let mut out = Vec::new();
-        kiri_proto::encode_copy(&mut out, op, &id, path, flags, &layers);
+        kiri_proto::encode_copy(&mut out, op, &id, path, flags, &layers, &mounts);
         std::io::Write::write_all(&mut std::fs::File::from(stream.fd.try_clone()?), &out)?;
         Ok(stream)
     }
@@ -5776,9 +5789,26 @@ fn close_monitor(h: &mut HealthRun) {
     }
 }
 
+/// Mounts and flags carried on a guest `Copy` frame. Archive ops (`IN`, `OUT`,
+/// `STAT`) carry the container's mounts (with refreshed bind sources) and
+/// `READONLY_ROOTFS` for `IN`; `EXPORT`, `DIFF` and `COMMIT` operate on the
+/// container's rootfs/layer alone, without mounts.
+fn copy_mounts_and_flags(spec: &Spec, op: u8, flags: u32) -> (Vec<String>, u32) {
+    if !matches!(op, kiri_proto::copy_op::IN | kiri_proto::copy_op::OUT | kiri_proto::copy_op::STAT) {
+        return (Vec::new(), flags);
+    }
+    let mounts = super::api::fresh_bind_sources(&spec.mounts, &spec.mount_info);
+    let flags = if op == kiri_proto::copy_op::IN && spec.readonly_rootfs {
+        flags | kiri_proto::copy_flags::READONLY_ROOTFS
+    } else {
+        flags
+    };
+    (mounts, flags)
+}
+
 fn error_text(e: &Error) -> String {
     match e {
-        Error::NotFound(m) | Error::Conflict(m) | Error::BadRequest(m) | Error::Unauthorized(m) => m.clone(),
+        Error::NotFound(m) | Error::Conflict(m) | Error::BadRequest(m) | Error::Unauthorized(m) | Error::Forbidden(m) => m.clone(),
         Error::Io(e) => e.to_string(),
     }
 }
@@ -7352,6 +7382,32 @@ mod start_wait_tests {
         drop(guard);
         let r = copying.join().unwrap();
         assert!(matches!(r, Err(Error::NotFound(_))), "{r:?}");
+        drop(engine);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn copy_mounts_and_flags_scope_mounts_and_readonly_rootfs() {
+        let (engine, id, dir) = engine("copy-mounts");
+        let mut s = engine.lock().containers[&id].spec.clone();
+        s.mounts = vec![
+            "/var/lib/kiri/volumes/pg/_data\t/var/lib/postgresql/data\tcreate,copyup".into(),
+            "tmpfs\t/tmp\ttmpfs,noexec,nosuid,nodev".into(),
+        ];
+        s.readonly_rootfs = true;
+        let (mounts, flags) = copy_mounts_and_flags(&s, kiri_proto::copy_op::IN, kiri_proto::copy_flags::CHUNKED);
+        assert_eq!(mounts, s.mounts);
+        assert_eq!(flags, kiri_proto::copy_flags::CHUNKED | kiri_proto::copy_flags::READONLY_ROOTFS);
+        for op in [kiri_proto::copy_op::OUT, kiri_proto::copy_op::STAT] {
+            let (mounts, flags) = copy_mounts_and_flags(&s, op, 0);
+            assert_eq!(mounts, s.mounts);
+            assert_eq!(flags, 0);
+        }
+        for op in [kiri_proto::copy_op::EXPORT, kiri_proto::copy_op::DIFF, kiri_proto::copy_op::COMMIT] {
+            let (mounts, flags) = copy_mounts_and_flags(&s, op, 0);
+            assert!(mounts.is_empty(), "op {op} must not mount volumes/binds");
+            assert_eq!(flags, 0);
+        }
         drop(engine);
         let _ = std::fs::remove_dir_all(dir);
     }

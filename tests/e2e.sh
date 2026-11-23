@@ -1308,7 +1308,85 @@ code cp-into-missing-dir 1 $D cp "$CPD/a.txt" cpc:/nodir/
 $D create --name cpcreated alpine cat /tmp/a.txt >/dev/null
 t cp-into-created "one" bash -c "$D cp $CPD/a.txt cpcreated:/tmp/ && $D start -a cpcreated"
 t cp-from-stopped "a.txt" bash -c "$D cp cpcreated:/tmp/a.txt - | tar -t"
-$D rm -f cpc cpcreated >/dev/null; rm -rf "$CPD"
+# Non-running containers mount their volumes and binds (excluding tmpfs) for
+# `docker cp`, populate fresh empty volumes from the image unless `nocopy` is
+# set, keep `docker export` rootfs-only, and refuse `PUT /archive` on `:ro`
+# mounts and `--read-only` rootfs with 403 (#245).
+mkdir -p "$CPD/bdir" "$CPD/outer" "$CPD/inner"
+echo host-dir > "$CPD/bdir/fromhost.txt"
+echo host-file > "$CPD/bfile.txt"
+echo updated-file > "$CPD/updated.txt"
+echo ro-orig > "$CPD/rofile.txt"
+echo outer-v > "$CPD/outer/outer.txt"
+echo inner-v > "$CPD/inner/inner.txt"
+echo add-in > "$CPD/add.txt"
+tar -C "$CPD" -cf "$CPD/a.tar" a.txt
+$D volume rm cpv-pg cpv-new cpv-nocopy cpv-ro cpv-rw cpv-sym >/dev/null 2>&1 || true
+$D run --rm -v cpv-pg:/var/lib/postgresql/data alpine sh -c 'echo 17 > /var/lib/postgresql/data/PG_VERSION' >/dev/null
+$D create --name cpv-created -v cpv-pg:/var/lib/postgresql/data alpine true >/dev/null
+t cp-created-volume-out "17" bash -c "$D cp cpv-created:/var/lib/postgresql/data/PG_VERSION - | tar -xO"
+t cp-created-volume-in "one export=0" bash -c "$D cp $CPD/a.txt cpv-created:/var/lib/postgresql/data/staged.conf && echo \"\$($D run --rm -v cpv-pg:/d alpine cat /d/staged.conf) export=\$($D export cpv-created | tar -t | grep -cE 'PG_VERSION|staged.conf')\""
+$D create --name cpv-new-c -v cpv-new:/etc/apk alpine true >/dev/null
+$D create --name cpv-nocopy-c -v cpv-nocopy:/etc/apk:nocopy alpine true >/dev/null
+t cp-created-volume-copyup "copyup=1 filled=1 nocopy=1" bash -c "c=\$($D cp cpv-new-c:/etc/apk/repositories - | tar -xO | head -n1 | grep -c alpine); f=\$($D run --rm -v cpv-new:/d alpine head -n1 /d/repositories | grep -c alpine); $D cp cpv-nocopy-c:/etc/apk/repositories - >/dev/null 2>&1; n=\$?; echo \"copyup=\$c filled=\$f nocopy=\$n\""
+$D create --name cp-bind-c -v "$CPD/bdir:/mnt/bdir" -v "$CPD/bfile.txt:/mnt/bfile.txt" --tmpfs /etc/apk alpine true >/dev/null
+t cp-created-bind-mounts "dir-out=host-dir dir-in=one file-out=host-file file-in=updated-file tmpfs=1" bash -c "do=\$($D cp cp-bind-c:/mnt/bdir/fromhost.txt - | tar -xO); $D cp $CPD/a.txt cp-bind-c:/mnt/bdir/staged.txt && di=\$(cat $CPD/bdir/staged.txt); fo=\$($D cp cp-bind-c:/mnt/bfile.txt - | tar -xO); $D cp $CPD/updated.txt cp-bind-c:/mnt/bfile.txt && fi=\$(cat $CPD/bfile.txt); tf=\$($D cp cp-bind-c:/etc/apk/repositories - | tar -xO | head -n1 | grep -c alpine); echo \"dir-out=\$do dir-in=\$di file-out=\$fo file-in=\$fi tmpfs=\$tf\""
+$D create --name cp-nest-c -v "$CPD/inner:/app/sub" -v "$CPD/outer:/app" alpine true >/dev/null
+t cp-created-nested-mounts "outer=outer-v inner=inner-v in=add-in clean=1" bash -c "o=\$($D cp cp-nest-c:/app/outer.txt - | tar -xO); i=\$($D cp cp-nest-c:/app/sub/inner.txt - | tar -xO); $D cp $CPD/add.txt cp-nest-c:/app/sub/add.txt && a=\$(cat $CPD/inner/add.txt); c=\$([ ! -e $CPD/outer/sub/add.txt ] && echo 1 || echo 0); echo \"outer=\$o inner=\$i in=\$a clean=\$c\""
+$D run --rm -v cpv-ro:/d alpine sh -c 'echo keep > /d/keep.txt' >/dev/null
+$D create --name cp-ro-c -v cpv-ro:/ro:ro -v "$CPD/rofile.txt:/mnt/rofile.txt:ro" alpine true >/dev/null
+$D run -d --name cp-ro-r -v cpv-ro:/ro:ro -v "$CPD/rofile.txt:/mnt/rofile.txt:ro" alpine sleep 120 >/dev/null
+t cp-ro-volume-refused "c-vol=403:mounted volume is marked read-only r-vol=403:mounted volume is marked read-only c-file=403:mounted volume is marked read-only r-file=403:mounted volume is marked read-only orig=ro-orig" bash -c "
+  put() { curl -s -w '\n%{http_code}' --unix-socket $(printf %q "$SOCK") -X PUT --data-binary @\"\$2\" \"http://d/v1.47/containers/\$1/archive?path=\$3\"; }
+  tar -C $CPD -cf $CPD/rofile.tar rofile.txt
+  for tag in c:cp-ro-c r:cp-ro-r; do
+    k=\${tag%%:*}; n=\${tag#*:}
+    out=\$(put \"\$n\" $CPD/a.tar /ro); code=\${out##*\$'\n'}; body=\${out%\$'\n'*}; msg=\$(printf '%s' \"\$body\" | sed -n 's/.*\"message\":\"\\([^\"]*\\)\".*/\\1/p')
+    printf '%s-vol=%s:%s ' \"\$k\" \"\$code\" \"\$msg\"
+  done
+  for tag in c:cp-ro-c r:cp-ro-r; do
+    k=\${tag%%:*}; n=\${tag#*:}
+    out=\$(put \"\$n\" $CPD/rofile.tar /mnt); code=\${out##*\$'\n'}; body=\${out%\$'\n'*}; msg=\$(printf '%s' \"\$body\" | sed -n 's/.*\"message\":\"\\([^\"]*\\)\".*/\\1/p')
+    printf '%s-file=%s:%s ' \"\$k\" \"\$code\" \"\$msg\"
+  done
+  printf 'orig=%s\n' \"\$(cat $CPD/rofile.txt)\"
+"
+$D create --name cp-roroot-c --read-only -v cpv-rw:/rw alpine true >/dev/null
+$D run -d --name cp-roroot-r --read-only -v cpv-rw:/rw alpine sleep 120 >/dev/null
+t cp-ro-rootfs-refused "c-root=403:container rootfs is marked read-only r-root=403:container rootfs is marked read-only rw=cp-roroot-c.txt,cp-roroot-r.txt," bash -c "
+  put() { curl -s -w '\n%{http_code}' --unix-socket $(printf %q "$SOCK") -X PUT --data-binary @$CPD/a.tar \"http://d/v1.47/containers/\$1/archive?path=/tmp\"; }
+  for tag in c:cp-roroot-c r:cp-roroot-r; do
+    k=\${tag%%:*}; n=\${tag#*:}
+    out=\$(put \"\$n\"); code=\${out##*\$'\n'}; body=\${out%\$'\n'*}; msg=\$(printf '%s' \"\$body\" | sed -n 's/.*\"message\":\"\\([^\"]*\\)\".*/\\1/p')
+    $D cp $CPD/a.txt \"\$n:/rw/\$n.txt\" >/dev/null
+    printf '%s-root=%s:%s ' \"\$k\" \"\$code\" \"\$msg\"
+  done
+  printf 'rw=%s\n' \"\$($D run --rm -v cpv-rw:/d alpine sh -c 'ls /d | sort | tr \"\\n\" ,')\"
+"
+python3 - "$CPD/sym.tar" <<'PY'
+import hashlib, io, json, sys, tarfile
+layer = io.BytesIO()
+with tarfile.open(fileobj=layer, mode="w", format=tarfile.GNU_FORMAT) as t:
+    for d in ["etc/", "mnt/"]:
+        i = tarfile.TarInfo(d); i.type = tarfile.DIRTYPE; i.mode = 0o755; t.addfile(i)
+    f = tarfile.TarInfo("etc/from-image"); f.size = 8; f.mode = 0o644; t.addfile(f, io.BytesIO(b"in-image"))
+    s1 = tarfile.TarInfo("mnt/escape-mount"); s1.type = tarfile.SYMTYPE; s1.linkname = "/etc"; t.addfile(s1)
+    s2 = tarfile.TarInfo("mnt/escape-copy"); s2.type = tarfile.SYMTYPE; s2.linkname = "/etc/from-image"; t.addfile(s2)
+lb = layer.getvalue()
+cfg = json.dumps({"os":"linux","config":{"Cmd":["/bin/true"]},"rootfs":{"type":"layers","diff_ids":["sha256:"+hashlib.sha256(lb).hexdigest()]}}).encode()
+c = hashlib.sha256(cfg).hexdigest() + ".json"
+man = json.dumps([{"Config":c,"RepoTags":["kiri-cp-sym:1"],"Layers":["layer.tar"]}]).encode()
+with tarfile.open(sys.argv[1], "w") as t:
+    for n, d in [("layer.tar", lb), (c, cfg), ("manifest.json", man)]:
+        i = tarfile.TarInfo(n); i.size = len(d); t.addfile(i, io.BytesIO(d))
+PY
+$D load -q -i "$CPD/sym.tar" >/dev/null
+$D create --name cp-sym-c -v cpv-sym:/mnt/escape-mount kiri-cp-sym:1 >/dev/null
+t cp-created-symlink-confined "vol=one img=in-image" bash -c "$D cp $CPD/a.txt cp-sym-c:/mnt/escape-mount/inside.txt && echo \"vol=\$($D run --rm -v cpv-sym:/d alpine cat /d/inside.txt) img=\$($D cp -L cp-sym-c:/mnt/escape-copy - | tar -xO)\""
+$D rm -f cpc cpcreated cpv-created cpv-new-c cpv-nocopy-c cp-bind-c cp-nest-c cp-ro-c cp-ro-r cp-roroot-c cp-roroot-r cp-sym-c >/dev/null 2>&1
+$D rmi kiri-cp-sym:1 >/dev/null 2>&1 || true
+$D volume rm cpv-pg cpv-new cpv-nocopy cpv-ro cpv-rw cpv-sym >/dev/null 2>&1 || true
+rm -rf "$CPD"
 
 section "privileged"
 t priv-caps "000001ffffffffff" $D run --rm --privileged alpine grep CapEff /proc/self/status
