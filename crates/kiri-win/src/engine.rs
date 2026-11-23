@@ -309,7 +309,7 @@ fn wakes(launch: bool, stopped: Option<bool>) -> bool {
 /// Whether Kiri was stopped (Stop in the window or the tray): then it stays
 /// off until Start. None when the engine's /info did not answer.
 fn stopped() -> Option<bool> {
-    client::get("/info").ok().map(|i| i["KiriStopped"] == true)
+    client::get_background("/info").ok().map(|i| i["KiriStopped"] == true)
 }
 
 /// The daemon's wake; a Linux host has no VM to wake, which is fine.
@@ -999,6 +999,28 @@ mod tests {
         assert!(!allowed_url("https://evil.example/#.kiri.localhost"));
         assert!(!allowed_url("ftp://localhost/"));
     }
+
+    #[test]
+    fn background_engine_checks_mark_background_and_wake_does_not() {
+        let info = super::client::mock_reply(b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\n{\"KiriStopped\":true}");
+        assert_eq!(super::stopped(), Some(true));
+        let req = String::from_utf8(info.lock().unwrap().clone()).unwrap();
+        assert!(req.contains("\r\nX-Kiri-Background: 1\r\n"), "stopped() must mark background: {req}");
+
+        let wake_wire = super::client::mock_reply(b"HTTP/1.1 204 No Content\r\n\r\n");
+        super::wake().unwrap();
+        let req = String::from_utf8(wake_wire.lock().unwrap().clone()).unwrap();
+        assert!(req.starts_with("POST /kiri/wake HTTP/1.1\r\n"), "{req}");
+        assert!(!req.contains("X-Kiri-Background"), "wake() must not mark background: {req}");
+
+        let proxy_get = super::client::mock_reply(b"HTTP/1.1 200 OK\r\nContent-Length: 15\r\n\r\n{\"settings\":{}}");
+        let proxy_put = super::client::mock_reply(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}");
+        super::push_windows_proxy(serde_json::json!({"http": null, "https": null, "no_proxy": [], "pac": false}), |_| std::collections::HashMap::new());
+        let get_req = String::from_utf8(proxy_get.lock().unwrap().clone()).unwrap();
+        let put_req = String::from_utf8(proxy_put.lock().unwrap().clone()).unwrap();
+        assert!(get_req.starts_with("GET /kiri/proxy HTTP/1.1\r\n") && get_req.contains("\r\nX-Kiri-Background: 1\r\n"), "{get_req}");
+        assert!(put_req.starts_with("PUT /kiri/proxy/system HTTP/1.1\r\n") && put_req.contains("\r\nX-Kiri-Background: 1\r\n"), "{put_req}");
+    }
 }
 
 /// The page's "fonts" event, made once (the window asks each time Settings
@@ -1437,10 +1459,14 @@ fn windows_proxy() -> Value {
 
 /// Tells the daemon what Windows' proxy is. A proxy on Windows' own
 /// 127.0.0.1 (Windows' or one set in Settings → Network) is reached through
-/// the relay (relay.rs), and the daemon gets its ports too.
+/// the relay (relay.rs), and the daemon gets its ports too. Sent every
+/// minute, so marked as the window's own: it never keeps the VM awake.
 pub(crate) fn send_windows_proxy() {
-    let mut body = windows_proxy();
-    let custom = client::get("/kiri/proxy").map(|v| v["settings"].clone()).unwrap_or_default();
+    push_windows_proxy(windows_proxy(), crate::relay::ports);
+}
+
+fn push_windows_proxy(mut body: Value, relay_ports: impl FnOnce(&[u16]) -> std::collections::HashMap<u16, u16>) {
+    let custom = client::get_background("/kiri/proxy").map(|v| v["settings"].clone()).unwrap_or_default();
     let mut targets: Vec<u16> = [&body["http"], &body["https"], &custom["http"], &custom["https"]]
         .iter()
         .filter_map(|v| v.as_str())
@@ -1448,9 +1474,9 @@ pub(crate) fn send_windows_proxy() {
         .collect();
     targets.sort_unstable();
     targets.dedup();
-    let relay = crate::relay::ports(&targets);
+    let relay = relay_ports(&targets);
     body["relay"] = relay.iter().map(|(t, l)| (t.to_string(), json!(l))).collect::<serde_json::Map<_, _>>().into();
-    let _ = client::request("PUT", "/kiri/proxy/system", Some(&body));
+    let _ = client::request_with("PUT", "/kiri/proxy/system", Some(&body), true);
 }
 
 /// Settings → Domains: reads (or moves, then reads) the routers' ports. The

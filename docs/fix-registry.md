@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #723 Windows: the window's own refresh no longer keeps the VM awake (unreleased)
+- Fixes: #668 Windows: the window's own refresh keeps the VM from sleeping
+- Caused: none known
+- Caused by: -
+- Check: none
+
 ### #524 Import: keep volume xattrs with GNU tar (unreleased)
 - Fixes: #485 kiri import loses user.* extended attributes on named volumes (Supabase Storage 500 ENODATA)
 - Caused: none known

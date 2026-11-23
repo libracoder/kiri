@@ -25,7 +25,7 @@ mod assemble;
 #[cfg(windows)]
 #[path = "../../kiri/src/ui/lang.rs"]
 mod lang;
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 mod client;
 #[cfg(windows)]
 mod detail;

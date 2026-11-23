@@ -634,7 +634,7 @@ pub(crate) fn output_within(cmd: &mut Command, limit: Duration) -> io::Result<st
 
 /// The engine's own Kiri version, when it answers.
 fn engine_version() -> Option<String> {
-    crate::client::request("GET", "/version", None).ok().filter(|r| r.ok()).and_then(|r| crate::client::kiri_version(&r.json()).map(str::to_owned))
+    crate::client::get_background("/version").ok().and_then(|v| crate::client::kiri_version(&v).map(str::to_owned))
 }
 
 static CATCH_UP: crate::wslsync::CatchUp = crate::wslsync::CatchUp::new();
