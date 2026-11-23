@@ -59,6 +59,9 @@ pub struct Paths {
     pub layers: PathBuf,
     pub containers: PathBuf,
     pub cgroup: PathBuf,
+    /// The mounted cgroup v2 hierarchy root (`/sys/fs/cgroup`, or
+    /// `/sys/fs/cgroup/unified` on a hybrid host such as stock WSL 2).
+    pub cgroup_root: PathBuf,
 }
 
 /// A process the agent started: a container's PID 1, or an exec.
@@ -935,8 +938,8 @@ pub fn exec(spec: &ExecSpec<'_>, target_pid: libc::pid_t, paths: &Paths, profile
     let init_cgroup;
     if cloned.as_ref().is_err_and(|e| e.kind() == io::ErrorKind::ResourceBusy) {
         let rel = fs::read_to_string(format!("/proc/{target_pid}/cgroup")).unwrap_or_default();
-        let rel = rel.lines().find_map(|l| l.strip_prefix("0::")).unwrap_or("").trim_start_matches('/').to_owned();
-        init_cgroup = fs::File::open(std::path::Path::new("/sys/fs/cgroup").join(&rel));
+        let rel = rel.lines().find_map(|l| l.strip_prefix("0::")).unwrap_or("").trim().trim_start_matches('/').to_owned();
+        init_cgroup = fs::File::open(paths.cgroup_root.join(&rel));
         match &init_cgroup {
             Ok(fd) => {
                 let retry = CloneArgs { cgroup: fd.as_raw_fd() as u64, ..args };

@@ -112,6 +112,18 @@ pub fn umount_lazy(target: &Path) -> io::Result<()> {
     check(unsafe { libc::umount2(t.as_ptr(), libc::MNT_DETACH) } as _, "umount").map(drop)
 }
 
+/// Linux's `CGROUP2_SUPER_MAGIC` (`<linux/magic.h>`).
+const CGROUP2_SUPER_MAGIC: i64 = 0x6367_7270;
+
+/// Whether `path` sits on a mounted `cgroup2` filesystem.
+pub fn is_cgroup2(path: &Path) -> bool {
+    let Ok(c) = cstr(path) else { return false };
+    // SAFETY: `st` is plain zero-initialized data; `c` is a valid C string.
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: statfs writes into `st`.
+    unsafe { libc::statfs(c.as_ptr(), &mut st) == 0 && st.f_type as i64 == CGROUP2_SUPER_MAGIC }
+}
+
 pub fn mkdir(p: &CStr, mode: libc::mode_t) {
     // SAFETY: `p` is a valid NUL-terminated string. EEXIST is expected and fine.
     unsafe { libc::mkdir(p.as_ptr(), mode) };

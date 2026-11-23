@@ -723,6 +723,86 @@ t systempaths-symlink-escape "ctr:os=[] apk=[] root=ok host:canary=intact-rw" "e
 # frame limit: `docker top` succeeds and both that container and a sibling stay
 # running instead of dropping the agent link (#463).
 t top-frame-cap "top=0 has=yes big=running sib=running" "docker rm -f lh-top-big lh-top-sib >/dev/null 2>&1; docker run -d --name lh-top-sib alpine sleep 300 >/dev/null && docker run -d --name lh-top-big alpine sh -c 'exec sh -c \"sleep 1d;:\" \$(for i in \$(seq 160); do printf \"%08000d \" 0; done)' >/dev/null && for _ in \$(seq 50); do n=\$(docker exec lh-top-big sh -c 'wc -c < /proc/1/cmdline' 2>/dev/null || echo 0); [ \"\${n:-0}\" -gt 1000000 ] && break; sleep 0.1; done && out=\$(docker top lh-top-big 2>&1); rc=\$?; case \"\$out\" in *'sleep 1d'*) has=yes ;; *) has=no ;; esac; echo top=\$rc has=\$has big=\$(docker inspect -f '{{.State.Status}}' lh-top-big) sib=\$(docker inspect -f '{{.State.Status}}' lh-top-sib); docker rm -f lh-top-big lh-top-sib >/dev/null 2>&1"
+# Stock WSL 2 mounts a hybrid cgroup tree: tmpfs on /sys/fs/cgroup, cgroup2 on
+# /sys/fs/cgroup/unified, and v1 controllers alongside it (leaving unified's
+# cgroup.controllers empty). kiri-init must find or mount cgroup2 and run
+# containers (including resource flags, exec, stats, top, pause, update, stop/rm)
+# without failing (#277).
+$D exec -i "$N" sh -c 'cat > /hybrid-cgroup-test.sh' <<'SH'
+#!/bin/sh
+set -u
+export DOCKER_HOST=unix:///root/.kiri/run/docker.sock
+docker save alpine:latest -o /tmp/alpine277.tar >/dev/null 2>&1 || { echo "save-failed"; exit 1; }
+export KIRI_BIN=/opt/kiri/kiri
+
+cat > /tmp/exercise277.sh <<'EOF'
+#!/bin/sh
+set -u
+mount -t tmpfs t /var/lib/kiri && mount -t tmpfs t /root && ip link set lo up
+"$KIRI_BIN" daemon >/tmp/lh277.log 2>&1 &
+p=$!
+export DOCKER_HOST=unix:///root/.kiri/run/docker.sock
+for i in $(seq 60); do docker version >/dev/null 2>&1 && break; sleep 0.2; done
+docker load -q -i /tmp/alpine277.tar >/dev/null 2>&1 || { kill $p 2>/dev/null; wait $p 2>/dev/null; echo load-fail; exit 0; }
+ok=ok
+docker run --rm alpine true >/dev/null 2>&1 || ok=run-fail
+[ "$ok" = ok ] && { docker run --rm --memory 64m --cpus 1 --pids-limit 50 --shm-size 128m alpine true >/dev/null 2>&1 || ok=limits-fail; }
+if [ "$ok" = ok ]; then
+  cid=$(docker run -d alpine sleep 60 2>/dev/null) || ok=bg-fail
+  [ "$ok" = ok ] && { docker exec "$cid" true >/dev/null 2>&1 || ok=exec-fail; }
+  [ "$ok" = ok ] && { docker stats --no-stream --format "{{.Name}}" "$cid" >/dev/null 2>&1 || ok=stats-fail; }
+  [ "$ok" = ok ] && { docker top "$cid" >/dev/null 2>&1 || ok=top-fail; }
+  [ "$ok" = ok ] && { docker pause "$cid" >/dev/null 2>&1 && docker unpause "$cid" >/dev/null 2>&1 || ok=pause-fail; }
+  [ "$ok" = ok ] && { docker update --memory 128m "$cid" >/dev/null 2>&1 || ok=update-fail; }
+  [ "$ok" = ok ] && { docker stop -t 1 "$cid" >/dev/null 2>&1 && docker rm "$cid" >/dev/null 2>&1 || ok=stop-fail; }
+fi
+kill $p 2>/dev/null; wait $p 2>/dev/null
+echo "$ok"
+EOF
+chmod +x /tmp/exercise277.sh
+
+s1=$(unshare --mount --propagation private --net --fork sh -c '
+  mount -t tmpfs -o mode=755 tmpfs /sys/fs/cgroup
+  mkdir -p /sys/fs/cgroup/unified /sys/fs/cgroup/systemd /sys/fs/cgroup/freezer /sys/fs/cgroup/devices /sys/fs/cgroup/cpu /sys/fs/cgroup/memory /sys/fs/cgroup/pids
+  mount -t cgroup2 -o nsdelegate cgroup2 /sys/fs/cgroup/unified
+  mount -t cgroup -o none,name=systemd cgroup /sys/fs/cgroup/systemd 2>/dev/null || true
+  mount -t cgroup -o freezer cgroup /sys/fs/cgroup/freezer 2>/dev/null || true
+  mount -t cgroup -o devices cgroup /sys/fs/cgroup/devices 2>/dev/null || true
+  /tmp/exercise277.sh
+')
+
+mkdir -p /sys/fs/cgroup/kiri-lh277/sub
+s2=$(sh -c '
+  echo $$ > /sys/fs/cgroup/kiri-lh277/sub/cgroup.procs
+  exec unshare --cgroup --mount --propagation private --net --fork sh -c "
+    mount -t tmpfs -o mode=755 tmpfs /sys/fs/cgroup
+    mkdir -p /sys/fs/cgroup/unified /sys/fs/cgroup/cpu /sys/fs/cgroup/memory /sys/fs/cgroup/pids
+    mount -t cgroup2 -o nsdelegate cgroup2 /sys/fs/cgroup/unified
+    ctrl=\$(cat /sys/fs/cgroup/unified/cgroup.controllers)
+    [ -z \"\$ctrl\" ] || { echo \"unexpected-ctrl:\$ctrl\"; exit 0; }
+    /tmp/exercise277.sh
+  "
+')
+rmdir /sys/fs/cgroup/kiri-lh277/sub/kiri-host /sys/fs/cgroup/kiri-lh277/sub/kiri /sys/fs/cgroup/kiri-lh277/sub /sys/fs/cgroup/kiri-lh277 2>/dev/null || true
+
+s3=$(unshare --mount --propagation private --net --fork sh -c '
+  mount -t tmpfs -o mode=755 tmpfs /sys/fs/cgroup
+  mkdir -p /sys/fs/cgroup/cpu /sys/fs/cgroup/memory /sys/fs/cgroup/pids
+  mount -t tmpfs t /var/lib/kiri && mount -t tmpfs t /root && ip link set lo up
+  "$KIRI_BIN" daemon >/tmp/lh277-v1.log 2>&1 &
+  p=$!
+  export DOCKER_HOST=unix:///root/.kiri/run/docker.sock
+  for i in $(seq 60); do docker version >/dev/null 2>&1 && break; sleep 0.2; done
+  docker load -q -i /tmp/alpine277.tar >/dev/null 2>&1 || { kill $p 2>/dev/null; wait $p 2>/dev/null; echo load-fail; exit 0; }
+  docker run --rm alpine true >/dev/null 2>&1 && ok=ok || ok=run-fail
+  kill $p 2>/dev/null; wait $p 2>/dev/null
+  echo "$ok"
+')
+
+rm -f /tmp/alpine277.tar /tmp/exercise277.sh /tmp/lh277.log /tmp/lh277-v1.log
+echo "hybrid=$s1 noctrl=$s2 v1only=$s3"
+SH
+t wsl-hybrid-cgroup "hybrid=ok noctrl=ok v1only=ok" "apk add -q util-linux util-linux-misc iproute2 >/dev/null 2>&1; sh /hybrid-cgroup-test.sh"
 $D rm -f "$N" >/dev/null
 # An engine in a user namespace (nested Docker, Sysbox, Coder, CI; #597),
 # where the kernel refuses mknod of a device: an image layer with a

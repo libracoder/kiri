@@ -1546,7 +1546,12 @@ mod running_tests {
         let mut procs = HashMap::new();
         let mut dns = super::super::dns::Dns::default();
         let mut failed = HashMap::new();
-        let paths = super::Paths { layers: "/l".into(), containers: "/c".into(), cgroup: "/g".into() };
+        let paths = super::Paths {
+            layers: "/l".into(),
+            containers: "/c".into(),
+            cgroup: "/g".into(),
+            cgroup_root: "/sys/fs/cgroup".into(),
+        };
         procs.insert(300, new_proc(Process::starting_for_test("c1", 300, r.into(), None), 0, 0));
         assert_eq!(super::running_rootfs(&procs, &paths, "c1"), Some("/c/c1/rootfs".into()), "not /proc/300/root, which is the agent's own root");
         assert_eq!(super::running_rootfs(&procs, &paths, "nope"), None);

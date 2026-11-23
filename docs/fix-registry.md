@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### Engine: run containers on a hybrid cgroup tree such as stock WSL 2 (unreleased)
+- Fixes: #277 Windows: containers fail on a stock WSL2 — Kiri Linux boots a hybrid cgroup tree, so `kiri-init` exits 1
+- Caused: none known
+- Caused by: -
+- Check: `wsl-hybrid-cgroup`
+
 ### #595 Copy: keep the archive's owners on PUT /containers/{id}/archive, and chown to Config.User on copyUIDGID (unreleased)
 - Fixes: #594 PUT /containers/{id}/archive (docker cp) gives files to root; Docker keeps the archive's owners
 - Caused: none known

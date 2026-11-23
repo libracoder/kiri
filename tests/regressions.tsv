@@ -221,3 +221,4 @@ import-empty-numbers	#618	a layer whose header left size, uid or gid empty did n
 cp-in-keeps-owner	#594	PUT /containers/{id}/archive and docker cp without -a gave files to root instead of keeping the archive's owners, so a mode-0600 file uploaded for a non-root user (DDEV's mkcert CA key) was unreadable to that user
 cp-in-keeps-dir-and-symlink-owner	#594	PUT /containers/{id}/archive without copyUIDGID must keep directory and symlink owners from the tar headers without chowning symlink targets
 cp-in-copy-uidgid	#594	PUT /containers/{id}/archive with copyUIDGID (docker cp -a) must chown unpacked entries to the container's Config.User when set while keeping tar header owners without -a or when Config.User is empty
+wsl-hybrid-cgroup	#277	on stock WSL 2 (hybrid /sys/fs/cgroup tmpfs + /sys/fs/cgroup/unified cgroup2, with controllers held by v1), kiri-init exited 1 and containers failed to start
