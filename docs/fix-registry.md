@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #484 Daemon: log memory-kill figures, relieve the balloon first, and attribute op stops (unreleased)
+- Fixes: #474 Daemon: log memory-kill figures and attribute Kiri-initiated stops to their operation
+- Caused: none known
+- Caused by: -
+- Check: none
+
 ### #537 Engine: report cgroup CPU throttling in container stats (unreleased)
 - Fixes: no issue
 - Caused: none known

@@ -8,7 +8,7 @@ use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
 
-use kiri_proto::{Exited, MAX_OUTPUT_CHUNK, Msg, Stats, Stream};
+use kiri_proto::{Exited, MAX_OUTPUT_CHUNK, MemoryPressure, Msg, Stats, Stream};
 
 use super::container::{self, NetCtx, Paths, Process, Root};
 use super::net::{self, Bridges, Dhcp};
@@ -270,8 +270,10 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
                 // At most ten a second: the host reacts to the first one.
                 if last_pressure.elapsed() >= std::time::Duration::from_millis(100) {
                     last_pressure = std::time::Instant::now();
+                    let (_, mem_available_kib, _) = meminfo_full();
+                    let (mem_stall, _) = super::cgroup::memory_trouble();
                     out.clear();
-                    Msg::MemoryPressure.encode(&mut out);
+                    Msg::MemoryPressure(MemoryPressure { mem_available_kib, mem_stall }).encode(&mut out);
                     conn.write_all(&out)?;
                 }
                 continue;

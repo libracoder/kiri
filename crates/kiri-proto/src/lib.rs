@@ -52,8 +52,10 @@ pub const INPUT_WINDOW: usize = 4 << 20;
 /// reply: an older agent's "unexpected" error would be taken as the reply
 /// to the next request. 8 added `DnsRename`, another no-reply message, for
 /// the same reason. 9 added `Limits::swap_max`: an older agent would read
-/// the limits one field short.
-pub const PROTOCOL: u16 = 9;
+/// the limits one field short. 10 added a payload on `MemoryPressure`
+/// (MemAvailable and PSI full avg10): an older agent's bare `MemoryPressure`
+/// has neither field, so decode rejects it as truncated.
+pub const PROTOCOL: u16 = 10;
 
 /// Most names a `DnsRename` may carry: a name, its aliases and a hostname.
 pub const MAX_DNS_NAMES: usize = 256;
@@ -155,8 +157,9 @@ pub enum Msg<'a> {
     /// as the link says it. Answered by `FsData` or `Error`.
     FsReadLink { id: &'a str, path: &'a str },
     /// Guest → host: memory is tight right now (a PSI trigger fired); grow
-    /// the VM's memory. No reply.
-    MemoryPressure,
+    /// the VM's memory, and carry the readings that go with a memory kill.
+    /// No reply.
+    MemoryPressure(MemoryPressure),
     /// Host → guest: delete a named volume's data. No reply.
     RemoveVolume { name: &'a str },
     /// Host → guest, first frame on a connection to [`COPY_PORT`]: copy
@@ -706,6 +709,16 @@ pub struct Exited<'a> {
     pub oom_killed: bool,
 }
 
+/// What the guest sends with [`Msg::MemoryPressure`]: the readings behind a
+/// memory kill, so the host can log the numbers in the same event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryPressure {
+    /// MemAvailable from /proc/meminfo, in KiB.
+    pub mem_available_kib: u64,
+    /// PSI "full avg10" in hundredths of a percent (see `Stats::mem_stall`).
+    pub mem_stall: u64,
+}
+
 /// A list of strings borrowed from a frame. Iterate it; it never allocates.
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub struct StrList<'a> {
@@ -1164,7 +1177,10 @@ impl Msg<'_> {
                 put_str(o, id);
                 put_str(o, path);
             }),
-            Msg::MemoryPressure => frame(out, kind::MEMORY_PRESSURE, |_| {}),
+            Msg::MemoryPressure(p) => frame(out, kind::MEMORY_PRESSURE, |o| {
+                put_u64(o, p.mem_available_kib);
+                put_u64(o, p.mem_stall);
+            }),
             Msg::RemoveVolume { name } => frame(out, kind::REMOVE_VOLUME, |o| put_str(o, name)),
             Msg::RemoveBridge { bridge } => frame(out, kind::REMOVE_BRIDGE, |o| put_str(o, bridge)),
             Msg::DnsRename { id, bridge, ip, ip6, v4, names } => frame(out, kind::DNS_RENAME, |o| {
@@ -1475,7 +1491,10 @@ pub fn decode(frame: &[u8]) -> Result<Msg<'_>, DecodeError> {
         }
         kind::FS_READ => Msg::FsRead { id: r.str()?, path: r.str()?, offset: r.u64()?, len: r.u32()? },
         kind::FS_DATA => Msg::FsData(r.bytes()?),
-        kind::MEMORY_PRESSURE => Msg::MemoryPressure,
+        kind::MEMORY_PRESSURE => Msg::MemoryPressure(MemoryPressure {
+            mem_available_kib: r.u64()?,
+            mem_stall: r.u64()?,
+        }),
         kind::REMOVE_VOLUME => Msg::RemoveVolume { name: r.str()? },
         kind::REMOVE_BRIDGE => Msg::RemoveBridge { bridge: r.str()? },
         kind::DNS_RENAME => {
@@ -1826,13 +1845,28 @@ mod tests {
     }
 
     #[test]
+    fn memory_pressure_payload_survives_encoding_and_covers_protocol() {
+        // An agent from before `MemoryPressure`'s payload sends a bare frame
+        // with neither field; the host rejects it on `Hello`.
+        const { assert!(PROTOCOL >= 10) };
+        round(Msg::MemoryPressure(MemoryPressure { mem_available_kib: 0, mem_stall: 0 }));
+        round(Msg::MemoryPressure(MemoryPressure { mem_available_kib: 524_288, mem_stall: 1234 }));
+        let mut bare = Vec::new();
+        frame(&mut bare, kind::MEMORY_PRESSURE, |_| {});
+        assert_eq!(decode(&bare), Err(DecodeError::Truncated));
+        let mut half = Vec::new();
+        frame(&mut half, kind::MEMORY_PRESSURE, |o| put_u64(o, 4096));
+        assert_eq!(decode(&half), Err(DecodeError::Truncated));
+    }
+
+    #[test]
     fn fs_messages_survive_encoding() {
         round(Msg::FsStatRequest { id: "c1", path: "/etc" });
         round(Msg::FsStat(FsEntry { name: "etc", mode: 0o40755, size: 4096, mtime: 1_700_000_000, mtime_nsec: 5, ino: 77 }));
         round(Msg::FsRead { id: "c1", path: "/etc/os-release", offset: 10, len: 4096 });
         round(Msg::FsData(b"NAME=Alpine"));
         round(Msg::FsReadLink { id: "c1", path: "/usr/bin/X11" });
-        round(Msg::MemoryPressure);
+        round(Msg::MemoryPressure(MemoryPressure { mem_available_kib: 1, mem_stall: 2 }));
         round(Msg::RemoveVolume { name: "pgdata" });
         round(Msg::RemoveBridge { bridge: "kiri3" });
         round(Msg::CopyStat { entry: FsEntry { name: "hosts", mode: 0o100644, size: 9, mtime: 3, mtime_nsec: 4, ino: 5 }, link: "" });
