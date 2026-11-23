@@ -3736,6 +3736,9 @@ mod tests {
         engine.volume_ensure_with("free", json!({}), Default::default()).unwrap();
         listed_user(&engine, "used", &image);
         assert!(matches!(engine.volume_remove("used", false), Err(Error::Conflict(m)) if m.contains("volume is in use")));
+        // Force doesn't remove a volume in use either, as in Docker (#773).
+        assert!(matches!(engine.volume_remove("used", true), Err(Error::Conflict(m)) if m.contains("volume is in use")));
+        assert!(engine.volume_get("used").is_some(), "the volume in use is kept");
         engine.volume_remove("free", false).unwrap();
         assert!(engine.volume_get("free").is_none());
         assert!(matches!(image_remove(&engine, "used:1", false), Err(Error::Conflict(m)) if m.contains("is using its referenced image")));

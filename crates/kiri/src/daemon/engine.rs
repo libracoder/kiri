@@ -4590,8 +4590,10 @@ impl Engine {
         if self.volume_get(name).is_none() {
             return Err(Error::NotFound(format!("get {name}: no such volume")));
         }
+        // A volume a container uses is refused even with force, as in Docker:
+        // force only overrides the damaged-list refusal below.
         let users = self.volume_users(name);
-        if !users.is_empty() && !force {
+        if !users.is_empty() {
             return Err(Error::Conflict(format!("remove {name}: volume is in use - [{}]", users.join(", "))));
         }
         if !force && let Some(why) = self.refusal(&format!("Volume {name} was not removed, because the container list may be missing a container that uses it; `docker volume rm --force` removes it anyway")) {
