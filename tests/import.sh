@@ -62,8 +62,9 @@ ANON=()
 PINNED=
 PINNED_OURS=
 PINNED_KIRI_OURS=
-# What Kiri has before: read once both engines answer. Until then the
-# cleanup removes no image from Kiri.
+# What both engines have before: read once both answer. Until then cleanup
+# removes no image that wasn't explicitly fetched here.
+SRC_HAD=
 KIRI_HAD=
 # A Kiri container of ours goes with the 64-hex volumes the import gave it.
 kiri_rm() {
@@ -80,7 +81,7 @@ OURS_C="imp-digest imp-net-joiner imp-net-target imp-vol-user imp-vol-writer imp
 LOOKALIKE=localhost/imp-x/library/busybox:9
 UNTAGGED_ID=
 LA_DIR=
-OURS_V="imp-vol-la imp-vol-la-new imp-vol-data imp-vol-named imp-vol-keep imp-vol-busy imp-vol-huge imp-vol-cut imp-probe"
+OURS_V="imp-vol-la imp-vol-la-new imp-vol-data imp-vol-xattrs imp-vol-named imp-vol-keep imp-vol-busy imp-vol-huge imp-vol-cut imp-probe"
 cleanup() {
   kiri_rm $OURS_C
   "${S[@]}" rm -fv $OURS_C >/dev/null 2>&1
@@ -98,11 +99,17 @@ cleanup() {
   [ -n "$PINNED_OURS" ] && "${S[@]}" rmi "$PINNED" >/dev/null 2>&1
   for i in ${FETCHED_SRC[@]+"${FETCHED_SRC[@]}"}; do "${S[@]}" rmi "$i" >/dev/null 2>&1; done
   for i in ${FETCHED_KIRI[@]+"${FETCHED_KIRI[@]}"}; do "${K[@]}" rmi "$i" >/dev/null 2>&1; done
-  # What the imports brought into Kiri: the test image, helper images.
+  # What the imports brought into either engine: the test image, helper images.
+  if [ -n "$SRC_HAD" ]; then
+    for i in $("${S[@]}" image ls --format '{{.Repository}}:{{.Tag}}' 2>/dev/null); do
+      [[ "$SRC_HAD" == *" $i "* ]] && continue
+      [[ "$i" =~ ^((mirror\.gcr\.io|public\.ecr\.aws/docker)/library/)?(alpine|busybox|debian|ubuntu): ]] && "${S[@]}" rmi "$i" >/dev/null 2>&1
+    done
+  fi
   [ -n "$KIRI_HAD" ] || return 0
   for i in $("${K[@]}" image ls --format '{{.Repository}}:{{.Tag}}' 2>/dev/null); do
     [[ "$KIRI_HAD" == *" $i "* ]] && continue
-    [[ "$i" == "$TOOL" || "$i" =~ ^(alpine|busybox|debian|ubuntu): ]] && "${K[@]}" rmi "$i" >/dev/null 2>&1
+    [[ "$i" == "$TOOL" || "$i" =~ ^((mirror\.gcr\.io|public\.ecr\.aws/docker)/library/)?(alpine|busybox|debian|ubuntu): ]] && "${K[@]}" rmi "$i" >/dev/null 2>&1
   done
 }
 cleanup
@@ -110,6 +117,8 @@ trap cleanup EXIT
 
 "${S[@]}" version >/dev/null 2>&1 || { echo "import: the source $SRC does not answer"; exit 1; }
 "${K[@]}" version >/dev/null 2>&1 || { echo "import: Kiri ($DOCKER_CONTEXT) does not answer"; exit 1; }
+had=$("${S[@]}" image ls --format '{{.Repository}}:{{.Tag}}') || { echo "import: could not list $SRC's images"; exit 1; }
+SRC_HAD=" $(echo "$had" | tr '\n' ' ') "
 had=$("${K[@]}" image ls --format '{{.Repository}}:{{.Tag}}') || { echo "import: could not list Kiri's images"; exit 1; }
 KIRI_HAD=" $(echo "$had" | tr '\n' ' ') "
 # The kiri under test must be the Kiri under test: else imports would land
@@ -215,6 +224,41 @@ got=$("${K[@]}" run --rm --network none -v imp-vol-data:/d:ro alpine sh -c "$LIS
 t vol-exact-copy "same files" bash -c '[ "$1" = "$2" ] && echo "same files" || diff <(echo "$1") <(echo "$2")' _ "$want" "$got"
 t vol-copy-has-files "hard" echo "$got"
 
+section "#485 volume import keeps user.* extended attributes (Supabase Storage)"
+fetch "$SRC" python:3.13-alpine || { echo "import: could not get python:3.13-alpine on $SRC"; exit 1; }
+fetch "$DOCKER_CONTEXT" python:3.13-alpine || { echo "import: could not get python:3.13-alpine on Kiri"; exit 1; }
+"${S[@]}" volume create imp-vol-xattrs >/dev/null
+"${S[@]}" run --rm --network none -v imp-vol-xattrs:/d python:3.13-alpine python3 -c '
+import os
+os.makedirs("/d/sub", exist_ok=True)
+with open("/d/obj", "wb") as f: f.write(b"supabase-blob")
+os.chmod("/d/obj", 0o640)
+os.chown("/d/obj", 1234, 5678)
+os.setxattr("/d/obj", "user.test", b"hello-xattr")
+os.setxattr("/d/obj", "user.metadata", b"{\"contentType\":\"image/png\"}")
+os.setxattr("/d/obj", "user.empty", b"")
+os.setxattr("/d/sub", "user.dir", b"dir-val")
+with open("/d/far", "wb") as f: f.write(b"far")
+os.chown("/d/far", 3000000, 3000001)
+os.setxattr("/d/far", "user.highuid", b"ok")
+'
+t import-volume-xattrs-runs "volume imp-vol-xattrs: done" "$KIRI" import "$SRC" volume imp-vol-xattrs
+t import-volume-xattrs "xattrs-ok" "${K[@]}" run --rm --network none -v imp-vol-xattrs:/d:ro python:3.13-alpine python3 -c '
+import os, stat
+st = os.lstat("/d/obj")
+assert open("/d/obj", "rb").read() == b"supabase-blob"
+assert stat.S_IMODE(st.st_mode) == 0o640
+assert (st.st_uid, st.st_gid) == (1234, 5678)
+assert os.getxattr("/d/obj", "user.test") == b"hello-xattr"
+assert os.getxattr("/d/obj", "user.metadata") == b"{\"contentType\":\"image/png\"}"
+assert os.getxattr("/d/obj", "user.empty") == b""
+assert os.getxattr("/d/sub", "user.dir") == b"dir-val"
+fst = os.lstat("/d/far")
+assert (fst.st_uid, fst.st_gid) == (3000000, 3000001)
+assert os.getxattr("/d/far", "user.highuid") == b"ok"
+print("xattrs-ok")
+'
+
 section "#376 an empty volume in Kiri is not \"already in Kiri\"; a container brings its volumes"
 "${S[@]}" volume create imp-vol-named >/dev/null
 "${S[@]}" run --name imp-vol-user --network none --entrypoint sh -v imp-vol-named:/named -v /anon "$TOOL" -c 'echo named > /named/f; echo anon > /anon/f'
@@ -254,13 +298,13 @@ else
   cut() {
     "$@" > /tmp/imp-cut.$$ 2>&1 &
     local pid=$! i
-    for i in $(seq 300); do pgrep -f "kiri-import-imp-vol-cut:|imp-vol-cut:/from" >/dev/null && break; sleep 0.1; done
+    for i in $(seq 300); do pgrep -f "kiri-import-imp-vol-cut|imp-vol-cut:/from" >/dev/null && break; sleep 0.1; done
     sleep 1
     # Kiri's helpers while the copy runs: what each was given and runs.
     for c in $("${K[@]}" ps -q --filter label=dev.kiri.import-helper=1); do
       "${K[@]}" inspect -f '{{.Config.Image}} {{.Image}} {{json .Config.Entrypoint}}' "$c"
     done > /tmp/imp-cut-seen.$$ 2>&1
-    pkill -f "kiri-import-imp-vol-cut:|imp-vol-cut:/from"
+    pkill -f "kiri-import-imp-vol-cut|imp-vol-cut:/from"
     wait $pid
     cat /tmp/imp-cut.$$; rm -f /tmp/imp-cut.$$
   }

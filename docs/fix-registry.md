@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #524 Import: keep volume xattrs with GNU tar (unreleased)
+- Fixes: #485 kiri import loses user.* extended attributes on named volumes (Supabase Storage 500 ENODATA)
+- Caused: none known
+- Caused by: -
+- Check: `import-volume-xattrs`
+
 ### #137 Archives: preserve directory-contents paths for docker cp (unreleased)
 - Fixes: #617 `docker cp container:/dir/. dest` copies the folder itself instead of its contents
 - Caused: none known
