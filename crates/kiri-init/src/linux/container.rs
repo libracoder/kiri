@@ -565,7 +565,7 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
     // Small, short-lived files: kept in memory (/run is tmpfs), not on the data disk.
     let etc_dir = PathBuf::from("/run/kiri").join(spec.id);
     let embedded_dns = embedded_dns(spec, net.upstream_dns, net.dns.relay);
-    let nameserver = embedded_dns.then(|| embedded_address(spec));
+    let nameserver = embedded_dns.then(|| embedded_address(spec)).or_else(|| host_network_resolver(spec, net.bridges, net.dns));
     prepared.etc_files = write_etc_files(spec, &etc_dir, net.upstream_dns, nameserver).map_err(cleanup)?;
     prepared.mounts = parse_mounts(spec.mounts).map_err(cleanup)?;
     // A network namespace of its own gets Docker's two defaults: any port
@@ -1399,6 +1399,57 @@ fn write_etc_files(spec: &RunSpec<'_>, base: &std::path::Path, upstream: &[[u8; 
 /// servers (`--dns`).
 fn embedded_dns(spec: &RunSpec<'_>, upstream: &[[u8; 4]], relay: bool) -> bool {
     embedded_dns_if(spec, || relay || net::local_resolver(upstream))
+}
+
+/// In the VM, a `--network host` container's resolver: the agent's on the
+/// default bridge's gateway, which is one of the VM's own addresses, so the
+/// container reaches it. As the default bridge's containers do, its
+/// lookups then go through the Mac when the Mac's resolver for the VM
+/// network doesn't answer (dns.rs), where asking that resolver directly
+/// would just fail. Not on a Linux host (the container has the host's own
+/// resolv.conf), nor with `--dns`. On a fresh VM before any bridged
+/// container has started, `kiri0` is brought up on demand with the default
+/// bridge's gateway and prefix. None, the VM's upstream as before, when
+/// the bridge can't be brought up or the agent can't listen there.
+fn host_network_resolver(spec: &RunSpec<'_>, bridges: &mut net::Bridges, dns: &mut super::dns::Dns) -> Option<[u8; 4]> {
+    if !host_network_uses_agent(spec, dns.relay) {
+        return None;
+    }
+    let gateway = match net::bridge_ipv4(DEFAULT_BRIDGE) {
+        Some(gw) => gw,
+        None => {
+            let (gw, prefix) = host_bridge_addr(spec);
+            if let Err(e) = bridges.ensure(DEFAULT_BRIDGE, Some(gw), prefix, None) {
+                eprintln!("kiri-init: dns: cannot bring up {DEFAULT_BRIDGE} for host-network DNS: {e}");
+                return None;
+            }
+            gw
+        }
+    };
+    dns.serve_or_warn(DEFAULT_BRIDGE, gateway).then_some(gateway)
+}
+
+/// The default bridge, where the agent's resolver answers on the gateway.
+const DEFAULT_BRIDGE: &str = "kiri0";
+const DEFAULT_BRIDGE_GATEWAY: [u8; 4] = [172, 17, 0, 1];
+const DEFAULT_BRIDGE_PREFIX: u8 = 16;
+
+/// Gateway and prefix for bringing up `DEFAULT_BRIDGE` when a `--network host`
+/// container starts before any bridged one: what the daemon sent on `spec.net`
+/// when present, falling back to Docker's default 172.17.0.1/16.
+fn host_bridge_addr(spec: &RunSpec<'_>) -> ([u8; 4], u8) {
+    if spec.net.gateway == [0; 4] {
+        (DEFAULT_BRIDGE_GATEWAY, DEFAULT_BRIDGE_PREFIX)
+    } else {
+        let prefix = if spec.net.prefix == 0 { DEFAULT_BRIDGE_PREFIX } else { spec.net.prefix };
+        (spec.net.gateway, prefix)
+    }
+}
+
+/// Whether a container's lookups go to the agent's resolver on the default
+/// bridge because it shares the VM's own network (see `host_network_resolver`).
+fn host_network_uses_agent(spec: &RunSpec<'_>, relay: bool) -> bool {
+    relay && spec.flags & run_flags::NET_HOST != 0 && net_opts::values(spec.net.opts, net_opts::NAMESERVER).next().is_none()
 }
 
 /// `embedded_dns`, with `through_agent` saying whether the default bridge's
@@ -3655,13 +3706,42 @@ mod tests {
         let gateway = [[192, 168, 64, 1]];
         spec_with(0, &[], &|s| assert!(super::embedded_dns(s, &gateway, true), "so a refused gateway can fall back to the host"));
         spec_with(0, &["nameserver=8.8.8.8"], &|s| assert!(!super::embedded_dns(s, &gateway, true), "--dns servers are asked directly"));
-        spec_with(run_flags::NET_HOST, &[], &|s| assert!(!super::embedded_dns(s, &gateway, true), "host networking keeps the VM's resolv.conf"));
+        spec_with(run_flags::NET_HOST, &[], &|s| assert!(!super::embedded_dns(s, &gateway, true), "host networking has no embedded DNS of its own"));
+        // In the VM a host-network container asks the agent on the default
+        // bridge's gateway, so a refused gateway resolver falls back to the
+        // Mac too (#732); not with --dns, nor on a Linux host (no relay).
+        spec_with(run_flags::NET_HOST, &[], &|s| assert!(super::host_network_uses_agent(s, true)));
+        spec_with(run_flags::NET_HOST, &["nameserver=8.8.8.8"], &|s| assert!(!super::host_network_uses_agent(s, true), "--dns servers are asked directly"));
+        spec_with(run_flags::NET_HOST, &[], &|s| assert!(!super::host_network_uses_agent(s, false), "a Linux host keeps its own resolv.conf"));
+        spec_with(0, &[], &|s| assert!(!super::host_network_uses_agent(s, true), "a bridged container has its own"));
         // Named by the bridge's gateway, not 127.0.0.11: builders keep it
         // for their steps rather than swapping in 8.8.8.8.
         spec_with(0, &[], &|s| assert_eq!(super::embedded_address(s), [172, 17, 0, 1]));
         spec_with(0, &[], &|s| assert_eq!(super::resolv_conf(s, &gateway, Some(super::embedded_address(s))), "nameserver 172.17.0.1\n"));
         // A user network keeps Docker's 127.0.0.11, as does a Linux host.
         spec_with(run_flags::DNS_GATEWAY, &[], &|s| assert_eq!(super::embedded_address(s), super::super::dns::EMBEDDED));
+    }
+
+    #[test]
+    fn host_network_resolver_picks_bridge_gateway_or_default() {
+        let check = |gateway: [u8; 4], prefix: u8, opts: &[&str], f: &mut dyn FnMut(&kiri_proto::RunSpec<'_>)| {
+            let mut buf = Vec::new();
+            let net = Net { bridge: "", ip: [0; 4], prefix, gateway, extra_hosts: &[], dns_names: &[], opts };
+            encode_run(&mut buf, "c1", &[], &["sh"], &[], "/", "", "c1", run_flags::NET_HOST, net, &[], &Limits::default(), 0, &[] as &[&str], &[]);
+            let Ok(Msg::Run(spec)) = decode(&buf) else { panic!() };
+            f(&spec);
+        };
+        check([172, 18, 0, 1], 24, &[], &mut |s| assert_eq!(super::host_bridge_addr(s), ([172, 18, 0, 1], 24)));
+        check([0; 4], 0, &[], &mut |s| assert_eq!(super::host_bridge_addr(s), ([172, 17, 0, 1], 16), "standalone caller falls back to 172.17.0.1/16"));
+        check([172, 18, 0, 1], 0, &[], &mut |s| assert_eq!(super::host_bridge_addr(s), ([172, 18, 0, 1], 16), "zero prefix falls back to /16"));
+
+        let mut bridges = super::net::Bridges::default();
+        let mut dns = super::super::dns::Dns::default();
+        check([172, 17, 0, 1], 16, &[], &mut |s| assert_eq!(super::host_network_resolver(s, &mut bridges, &mut dns), None, "no relay on a Linux host"));
+        dns.relay = true;
+        check([172, 17, 0, 1], 16, &["nameserver=8.8.8.8"], &mut |s| {
+            assert_eq!(super::host_network_resolver(s, &mut bridges, &mut dns), None, "--dns bypasses agent resolver");
+        });
     }
 
     /// WSL 2: the host's resolver is 10.255.255.254, an address on `lo`.
