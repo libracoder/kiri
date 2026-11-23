@@ -268,3 +268,4 @@ cp-created-nested-mounts	#245	docker cp on a created or stopped container with n
 cp-ro-volume-refused	#245	PUT /containers/{id}/archive into a read-only (:ro) volume or bind mount on a running or stopped container must fail with 403 Forbidden and "mounted volume is marked read-only" before writing
 cp-ro-rootfs-refused	#245	PUT /containers/{id}/archive onto a --read-only container rootfs must fail with 403 Forbidden and "container rootfs is marked read-only" while allowing writes into :rw volumes
 cp-created-symlink-confined	#245	mount target lookup and docker cp path resolution on a non-running container must confine symlinks inside the container rootfs without escaping onto the host or VM filesystem
+rosetta-vdso-dt-hash	#344	the arm64 guest kernel vDSO was linked with DT_GNU_HASH only, so macOS 14's Rosetta aborted every linux/amd64 container with "Failed to find vdso DT_HASH"

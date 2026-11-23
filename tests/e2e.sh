@@ -2088,6 +2088,12 @@ needs amd64 t rosetta-node "v22" $D run --rm --platform linux/amd64 node:22-alpi
 # image here, so on Apple silicon this reads what Rosetta was handed. On a
 # Linux host the kernel is the host's, not Kiri's.
 only mac t rosetta-no-auxv-29 "no type 29" $D run --rm alpine sh -c 'od -An -v -tu8 -w16 /proc/self/auxv | awk "\$1 == 29 { n++ } END { print n ? \"type 29 given\" : \"no type 29\" }"'
+# Rosetta on macOS 14 looks up arm64 vDSO symbols through DT_HASH ("Failed to
+# find vdso DT_HASH", #344): the guest kernel links its vDSO with
+# --hash-style=both so PT_DYNAMIC carries both DT_HASH (4) and DT_GNU_HASH
+# (0x6ffffef5). python:3.13-alpine is the native image here, so on Apple
+# silicon this reads the arm64 vDSO that Rosetta itself is handed.
+only mac t rosetta-vdso-dt-hash "DT_HASH+DT_GNU_HASH" $D run --rm python:3.13-alpine python -c 'import ctypes, itertools, struct; libc = ctypes.CDLL(None); libc.getauxval.restype = ctypes.c_ulong; b, rd = libc.getauxval(33), ctypes.string_at; phoff, = struct.unpack_from("<Q", rd(b, 64), 32); phent, phnum = struct.unpack_from("<HH", rd(b, 64), 54); ph = [struct.unpack_from("<IIQQQQQQ", rd(b + phoff + i * phent, 56)) for i in range(phnum)]; bias = b - min(p[3] for p in ph if p[0] == 1); dyn = next(p for p in ph if p[0] == 2); tags = set(itertools.takewhile(bool, (t for t, _ in struct.iter_unpack("<qq", rd(bias + dyn[3], dyn[6]))))); print("DT_HASH+DT_GNU_HASH" if {4, 0x6ffffef5} <= tags else sorted(tags))'
 # Back to the engine's own architecture for the rest (an Intel Mac's is amd64).
 ARCH=$($D version -f '{{.Server.Arch}}' 2>/dev/null)
 # A set-up line, not part of the check: with KIRI_TEST_ONLY the checks after

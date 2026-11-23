@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #344 Guest kernel: link the arm64 vDSO with both hash tables for macOS 14's Rosetta (unreleased)
+- Fixes: #344 macOS 14 (Apple silicon): every linux/amd64 container aborts with Rosetta "Failed to find vdso DT_HASH"
+- Caused: none known
+- Caused by: -
+- Check: `rosetta-vdso-dt-hash`
+
 ### #245 Engine: mount volumes and binds for `docker cp` on non-running containers and refuse read-only archive writes (unreleased)
 - Fixes: #245 `docker cp` on a created or stopped container ignores named volumes and bind mounts, and `PUT /containers/{id}/archive` does not refuse read-only mounts or `--read-only` rootfs with 403 Forbidden
 - Caused: none known
