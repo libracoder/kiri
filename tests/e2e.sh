@@ -421,6 +421,14 @@ t hostname-underscore "db_master" $D run --rm --hostname db_master alpine hostna
 t hostname-newline-refused "invalid hostname" $D run --rm --hostname $'db\n10.0.0.9 evil' alpine cat /etc/hosts
 t add-host-underscore "10.1.2.3" $D run --rm --add-host my_app.local:10.1.2.3 alpine getent hosts my_app.local
 t pid1 "1" $D run --rm alpine sh -c 'echo $$'
+t container-marker "regular empty file 755 0:0" $D run --rm alpine stat -c '%F %a %u:%g' /.dockerenv
+t container-marker-nonroot "marker-ok" $D run --rm -u 1000 alpine sh -c 'test -f /.dockerenv && test -r /.dockerenv && test ! -s /.dockerenv && echo marker-ok'
+t container-marker-readonly "marker-ok" $D run --rm --read-only alpine sh -c 'test -f /.dockerenv && test ! -s /.dockerenv && echo marker-ok'
+t container-marker-readonly-nonroot "marker-ok" $D run --rm --read-only -u 1000 alpine sh -c 'test -f /.dockerenv && test -r /.dockerenv && test ! -s /.dockerenv && echo marker-ok'
+# The second start finds the marker the first one made.
+t container-marker-restart "marker-ok" bash -c "$D run --name e2e-marker alpine sh -c 'test -f /.dockerenv && test ! -s /.dockerenv && echo marker-ok' >/dev/null && $D start -a e2e-marker; $D rm -f e2e-marker >/dev/null"
+# An image with a link there starts, and nothing is made where the link points.
+t container-marker-link "link-ok" bash -c "$D run --name e2e-marker alpine sh -c 'rm /.dockerenv && ln -s /outside/marker /.dockerenv' && $D commit e2e-marker kiri-test/marker-link >/dev/null && $D run --rm kiri-test/marker-link sh -c 'test -L /.dockerenv && test ! -e /outside && echo link-ok'; $D rm -f e2e-marker >/dev/null; $D rmi kiri-test/marker-link >/dev/null"
 t proc "PID" $D run --rm alpine ps
 t dev-null "ok" $D run --rm alpine sh -c 'echo x > /dev/null && echo ok'
 t dev-null-nonroot "ok" $D run --rm -u 1000 alpine sh -c 'echo x > /dev/null && head -c 1 /dev/urandom >/dev/null && echo ok'
@@ -1658,6 +1666,10 @@ t diff-deleted "D /etc/motd" $D diff ren2
 t diff-changed "C /etc/profile" $D diff ren2
 t export "bin/busybox" bash -c "$D export ren2 | tar -t | grep -x bin/busybox"
 t export-has-change "added" bash -c "$D export ren2 | tar -t | grep -x added"
+# The marker is the engine's, not a change: exported with the rest, but in
+# neither the diff nor a committed layer.
+t diff-no-marker "marker lines: 0" bash -c "echo marker lines: \$($D diff ren2 | grep -c dockerenv)"
+t export-has-marker ".dockerenv" bash -c "$D export ren2 | tar -t | grep -Fx .dockerenv"
 # docker import (#461): the export back as a one-layer image, plain or gzip.
 t import "sha256:" bash -c "$D export ren2 | $D import -c 'CMD [\"cat\",\"/added\"]' -c 'ENV KIRI=1' -m 'from ren2' - kiri-test/imported:1"
 t import-runs "hi" $D run --rm kiri-test/imported:1
@@ -1678,6 +1690,15 @@ t import-dir-mtime "1000000000" bash -c "$D export ren2 | python3 -c 'import io,
 t import-empty-numbers "ok 0:0" bash -c "$D export ren2 | python3 \"$(dirname "$0")/lib/tar-empty-numbers.py\" | $D import - kiri-test/imported:6 >/dev/null && $D run --rm kiri-test/imported:6 sh -c 'cat /empty-numbers/ok; stat -c %u:%g /empty-numbers' | tr '\\n' ' '"
 $D rmi kiri-test/imported:1 kiri-test/imported:2 kiri-test/imported:3 kiri-test/imported:6 kiri-test/imported:7 >/dev/null 2>&1
 t commit "sha256:" $D commit -c 'CMD ["cat","/added"]' -c 'ENV KIRI=1' ren2 kiri-test/committed:1
+t commit-no-marker "clean" bash -c "$D save kiri-test/committed:1 | python3 -c 'import io, sys, tarfile
+names = []
+image = tarfile.open(fileobj=io.BytesIO(sys.stdin.buffer.read()))
+for blob in filter(tarfile.TarInfo.isfile, image):
+    try:
+        names += tarfile.open(fileobj=image.extractfile(blob)).getnames()
+    except tarfile.TarError:
+        pass
+print(\"clean\" if \"added\" in names and not {\".dockerenv\", \"./.dockerenv\"} & set(names) else names)'"
 t commit-runs "hi" $D run --rm kiri-test/committed:1
 t commit-env "KIRI=1" $D run --rm kiri-test/committed:1 env
 t commit-whiteout "gone" bash -c "$D run --rm kiri-test/committed:1 sh -c 'test -e /etc/motd || echo gone'"

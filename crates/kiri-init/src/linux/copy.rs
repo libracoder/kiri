@@ -19,7 +19,7 @@ use kiri_proto::{COPY_PORT, CopySpec, FsEntry, Msg, copy_flags, copy_op};
 use std::cell::RefCell;
 use std::path::PathBuf;
 
-use super::container::Paths;
+use super::container::{self, Paths};
 use super::sys;
 
 /// A copy child as the agent sees it: its end of the child's socket pair
@@ -673,6 +673,38 @@ fn is_opaque(path: &std::path::Path) -> bool {
     n == 1 && v[0] == b'y'
 }
 
+/// The marker as the agent made it at start: not a change the container
+/// made, so Docker shows it in neither `docker diff` nor a committed layer.
+/// Once the container has written to it or changed its mode or owner, it is
+/// a change like any other.
+fn is_marker(rel: &std::path::Path, m: &fs::Metadata) -> bool {
+    is_marker_attr(rel, m.file_type().is_file(), m.len(), m.mode(), m.uid(), m.gid())
+}
+
+fn is_marker_attr(rel: &std::path::Path, is_file: bool, len: u64, mode: u32, uid: u32, gid: u32) -> bool {
+    rel.as_os_str().as_encoded_bytes() == container::MARKER.to_bytes()
+        && is_file
+        && len == 0
+        && mode & 0o7777 == 0o755
+        && uid == 0
+        && gid == 0
+}
+
+fn in_lower_layers(lowers: &[OwnedFd], rel: &std::path::Path) -> bool {
+    for l in lowers {
+        let Some(rel) = rel.to_str() else { continue };
+        let Ok(fd) = super::fsview::open_in(l.as_raw_fd(), rel, libc::O_PATH | libc::O_NOFOLLOW) else { continue };
+        // SAFETY: fstat into a zeroed stat on a descriptor we own.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 {
+            continue;
+        }
+        let whiteout = st.st_mode & libc::S_IFMT == libc::S_IFCHR && st.st_rdev == 0;
+        return !whiteout;
+    }
+    false
+}
+
 /// `docker diff` and `docker commit`, from the writable layer.
 fn layer_job(conn: &mut fs::File, spec: &CopySpec<'_>, paths: &Paths) -> io::Result<()> {
     if spec.layers.is_empty() {
@@ -692,6 +724,7 @@ fn layer_job(conn: &mut fs::File, spec: &CopySpec<'_>, paths: &Paths) -> io::Res
             (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd) })
         })
         .collect();
+    let in_lower = |rel: &std::path::Path| in_lower_layers(&lowers, rel);
     // A running container writes its upper layer while we walk it, and could
     // swap a directory for a link to `/` between our look and our read
     // (`docker diff`, `commit --pause=false`). Inside a chroot of the layer
@@ -721,6 +754,9 @@ fn layer_job(conn: &mut fs::File, spec: &CopySpec<'_>, paths: &Paths) -> io::Res
         for e in names.into_iter().rev() {
             let r = rel.join(e.file_name());
             let Ok(m) = fs::symlink_metadata(e.path()) else { continue };
+            if is_marker(&r, &m) && !in_lower(&r) {
+                continue;
+            }
             if m.is_dir() {
                 stack.push(r.clone());
             }
@@ -730,20 +766,6 @@ fn layer_job(conn: &mut fs::File, spec: &CopySpec<'_>, paths: &Paths) -> io::Res
     entries.sort_by(|a, b| a.0.cmp(&b.0));
     done(conn)?;
     if spec.op == copy_op::DIFF {
-        let in_lower = |rel: &std::path::Path| {
-            for l in &lowers {
-                let Some(rel) = rel.to_str() else { continue };
-                let Ok(fd) = super::fsview::open_in(l.as_raw_fd(), rel, libc::O_PATH | libc::O_NOFOLLOW) else { continue };
-                // SAFETY: fstat into a zeroed stat on a descriptor we own.
-                let mut st: libc::stat = unsafe { std::mem::zeroed() };
-                if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 {
-                    continue;
-                }
-                let whiteout = st.st_mode & libc::S_IFMT == libc::S_IFCHR && st.st_rdev == 0;
-                return !whiteout;
-            }
-            false
-        };
         let mut w = BufWriter::new(&mut *conn);
         for (rel, m) in &entries {
             let kind = if is_whiteout(m) {
@@ -998,5 +1020,79 @@ mod tests {
         assert!(resolve_copy_user_in(&root, "testuser:nosuchgroup").is_err());
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn only_an_untouched_root_marker_is_skipped_by_diff_and_commit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let p = std::path::Path::new;
+        assert!(is_marker_attr(p(".dockerenv"), true, 0, 0o100755, 0, 0));
+        assert!(!is_marker_attr(p("sub/.dockerenv"), true, 0, 0o100755, 0, 0));
+        assert!(!is_marker_attr(p("added"), true, 0, 0o100755, 0, 0));
+        assert!(!is_marker_attr(p(".dockerenv"), false, 0, 0o120755, 0, 0));
+        assert!(!is_marker_attr(p(".dockerenv"), true, 2, 0o100755, 0, 0));
+        // `chmod 600 /.dockerenv`, `rm && touch` (0644), or special mode bits.
+        assert!(!is_marker_attr(p(".dockerenv"), true, 0, 0o100600, 0, 0));
+        assert!(!is_marker_attr(p(".dockerenv"), true, 0, 0o100644, 0, 0));
+        assert!(!is_marker_attr(p(".dockerenv"), true, 0, 0o101755, 0, 0));
+        assert!(!is_marker_attr(p(".dockerenv"), true, 0, 0o104755, 0, 0));
+        // `chown 1000:1000 /.dockerenv` (or uid-only / gid-only changes).
+        assert!(!is_marker_attr(p(".dockerenv"), true, 0, 0o100755, 1000, 0));
+        assert!(!is_marker_attr(p(".dockerenv"), true, 0, 0o100755, 0, 1000));
+        assert!(!is_marker_attr(p(".dockerenv"), true, 0, 0o100755, 1000, 1000));
+
+        let base = std::env::temp_dir().join(format!("kiri-copy-marker-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("sub")).unwrap();
+        let meta = |rel: &str| fs::symlink_metadata(base.join(rel)).unwrap();
+
+        fs::write(base.join(".dockerenv"), b"").unwrap();
+        fs::set_permissions(base.join(".dockerenv"), fs::Permissions::from_mode(0o755)).unwrap();
+        let m = meta(".dockerenv");
+        assert_eq!(is_marker(p(".dockerenv"), &m), m.uid() == 0 && m.gid() == 0);
+        assert!(!is_marker(p("sub/.dockerenv"), &m));
+        assert!(!is_marker(p("added"), &m));
+
+        fs::set_permissions(base.join(".dockerenv"), fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(!is_marker(p(".dockerenv"), &meta(".dockerenv")));
+
+        fs::set_permissions(base.join(".dockerenv"), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(base.join(".dockerenv"), b"hi").unwrap();
+        assert!(!is_marker(p(".dockerenv"), &meta(".dockerenv")));
+
+        fs::remove_file(base.join(".dockerenv")).unwrap();
+        std::os::unix::fs::symlink("/outside", base.join(".dockerenv")).unwrap();
+        assert!(!is_marker(p(".dockerenv"), &meta(".dockerenv")));
+
+        fs::remove_file(base.join(".dockerenv")).unwrap();
+        fs::create_dir(base.join(".dockerenv")).unwrap();
+        assert!(!is_marker(p(".dockerenv"), &meta(".dockerenv")));
+
+        // Truncating an image-provided `/.dockerenv` to 0 bytes leaves an empty
+        // `0755 0:0` file in `upper`, which must not be skipped when a lower
+        // layer already has `/.dockerenv`.
+        let lower_clean = base.join("lower-clean");
+        let lower_image = base.join("lower-image");
+        fs::create_dir_all(&lower_clean).unwrap();
+        fs::create_dir_all(&lower_image).unwrap();
+        fs::write(lower_image.join(".dockerenv"), b"from-image\n").unwrap();
+        let open_dir = |dir: &std::path::Path| {
+            let c = sys::cstr(dir).unwrap();
+            // SAFETY: plain open of a temp directory we just created.
+            let fd = unsafe { libc::open(c.as_ptr(), libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+            assert!(fd >= 0);
+            // SAFETY: fresh descriptor.
+            unsafe { OwnedFd::from_raw_fd(fd) }
+        };
+        let clean_lowers = [open_dir(&lower_clean)];
+        let image_lowers = [open_dir(&lower_image)];
+        assert!(!in_lower_layers(&clean_lowers, p(".dockerenv")));
+        assert!(in_lower_layers(&image_lowers, p(".dockerenv")));
+        let skip = |lowers: &[OwnedFd]| is_marker_attr(p(".dockerenv"), true, 0, 0o100755, 0, 0) && !in_lower_layers(lowers, p(".dockerenv"));
+        assert!(skip(&clean_lowers));
+        assert!(!skip(&image_lowers));
+
+        let _ = fs::remove_dir_all(&base);
     }
 }
