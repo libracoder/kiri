@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #728 Networks: NetworkMode bridge with other networks in EndpointsConfig joins only those, as Docker does (unreleased)
+- Fixes: #727 Engine: `NetworkMode: "bridge"` + one `EndpointsConfig` network joins both networks with bridge DNS, so `k3d cluster create` agents can't reach the server
+- Caused: none known
+- Caused by: -
+- Check: `testcontainers-endpoints`
+
 ### #171 Linux: the window no longer goes blank on hover with WebKitGTK 2.54 (unreleased)
 - Fixes: #587 Kiri doesn't render UI
 - Caused: none known
