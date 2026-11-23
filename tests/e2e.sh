@@ -1410,6 +1410,14 @@ t rmi-during-save "complete runs" bash -c "f=\$(mktemp); rm -f \$f.go; ( $D save
 $D rm -f e2e-frame e2e-frame-big >/dev/null 2>&1; $D run -d --name e2e-frame alpine sleep 300 >/dev/null
 t frame-limit-request-alone "refused alive=yes next=ok" bash -c "python3 -c 'import json; print(json.dumps({\"Image\":\"alpine\",\"Cmd\":[\"true\"],\"Env\":[\"BIG=\"+\"a\"*1200000]}))' | curl -s -o /dev/null --unix-socket '$SOCK' -H 'Content-Type: application/json' -X POST --data-binary @- 'http://d/v1.47/containers/create?name=e2e-frame-big'; c=\$(curl -s -o /dev/null -w '%{http_code}' --unix-socket '$SOCK' -X POST http://d/v1.47/containers/e2e-frame-big/start); case \$c in 2*) printf 'started ' ;; *) printf 'refused ' ;; esac; echo alive=\$($D exec e2e-frame echo yes) next=\$($D run --rm alpine echo ok)"
 $D rm -f e2e-frame e2e-frame-big >/dev/null 2>&1
+# An oversized guest reply (`docker top` on a ~1.3 MB cmdline) stays within the
+# frame limit: `docker top` succeeds and both that container and a sibling stay
+# running instead of dropping the VM link (#463).
+$D rm -f e2e-top-big e2e-top-sib >/dev/null 2>&1
+$D run -d --name e2e-top-sib alpine sleep 300 >/dev/null
+$D run -d --name e2e-top-big alpine sh -c 'exec sh -c "sleep 1d;:" $(for i in $(seq 160); do printf "%08000d " 0; done)' >/dev/null
+t top-frame-cap "top=0 has=yes big=running sib=running" bash -c "for _ in \$(seq 50); do n=\$($D exec e2e-top-big sh -c 'wc -c < /proc/1/cmdline' 2>/dev/null || echo 0); [ \"\${n:-0}\" -gt 1000000 ] && break; sleep 0.1; done; out=\$($D top e2e-top-big 2>&1); rc=\$?; case \"\$out\" in *'sleep 1d'*) has=yes ;; *) has=no ;; esac; echo top=\$rc has=\$has big=\$($D inspect -f '{{.State.Status}}' e2e-top-big) sib=\$($D inspect -f '{{.State.Status}}' e2e-top-sib)"
+$D rm -f e2e-top-big e2e-top-sib >/dev/null 2>&1
 # Users as Docker resolves them (#664): a numeric one in /etc/passwd gets
 # its group, one not listed group 0, a name its own.
 t user-boundaries "0:0 65534:65534 99999:0 nobody:65534 guest:100 1234:5678" bash -c "for u in 0 65534 99999 nobody guest 1234:5678; do printf '%s:%s ' \"\${u%%:*}\" \"\$($D run --rm -u \$u alpine id -g)\"; done"

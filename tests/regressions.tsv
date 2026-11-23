@@ -209,3 +209,4 @@ systempaths-api-bad-rel	#378	a relative path in HostConfig.MaskedPaths was not r
 systempaths-api-bad-dotdot	#378	a .. component in HostConfig.ReadonlyPaths was not refused with 400
 systempaths-bwrap	#378	bubblewrap inside a non-privileged container with --security-opt systempaths=unconfined could not mount a fresh /proc
 systempaths-symlink-escape	#378	a symlink in the image at a MaskedPaths or ReadonlyPaths entry must resolve inside the container root and never touch the host or cover /
+top-frame-cap	#463	a docker top reply over MAX_FRAME (1 MiB) made read_frame drop the VM link and kill every running container

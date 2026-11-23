@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #464 Engine: oversized guest replies are capped to the frame limit instead of stopping the VM (unreleased)
+- Fixes: #463 A big `docker top` or Files-tab listing restarts the whole VM
+- Caused: none known
+- Caused by: -
+- Check: `top-frame-cap`
+
 ### #490 Engine: systempaths=unconfined, MaskedPaths and ReadonlyPaths are applied (unreleased)
 - Fixes: #378 Engine: --security-opt systempaths=unconfined is ignored, breaking bubblewrap (bwrap) inside non-privileged containers
 - Caused: none known
