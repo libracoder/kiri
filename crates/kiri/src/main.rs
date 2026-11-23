@@ -62,6 +62,9 @@ mod run;
 #[cfg(unix)]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod scan;
+// `kiri scan`: vulnerability scanning from the terminal (Windows: in WSL).
+#[cfg(unix)]
+mod scan_cli;
 #[cfg(target_os = "macos")]
 mod setup;
 #[cfg(unix)]
@@ -91,6 +94,7 @@ usage: kiri COMMAND          docker's commands, on Kiri: kiri run, ps, exec,
        kiri build-with [docker|kiri]   which builder docker build uses
        kiri domains [set [--http N] [--https N] | reset]   the *.kiri.local routers' ports
        kiri registry [insecure|mirror] [list | add X... | remove X...]   daemon.json's insecure registries and Docker Hub mirrors
+       kiri scan [--json] [--history] <image>   known vulnerabilities in an image, found by Grype
        kiri update [--check]      update Kiri (with a container: docker's update)
        kiri diag logs [-f] [--ui|--engine|--cli] [--errors] [-n N]
        kiri diag report [--out PATH] [--send]   (a file to send us, tokens taken out)
@@ -167,6 +171,8 @@ fn main() -> ExitCode {
         Some("domains") => domains_cli::run(&args[1..]),
         #[cfg(unix)]
         Some("registry") => registry_cli::run(&args[1..]),
+        #[cfg(unix)]
+        Some("scan") => scan_cli::run(&args[1..]),
         #[cfg(unix)]
         Some("k8s") => k8s::run(&args[1..]),
         #[cfg(unix)]
@@ -273,5 +279,16 @@ fn engine_version_check() {
     if engine != me && engine != "0.0.0" {
         let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "kiri".into());
         eprintln!("kiri: this kiri ({exe}) is {me}, but the engine runs {engine}. Restart the engine to use one version (Kiri → Restart engine), or remove the older kiri.");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::USAGE;
+
+    #[test]
+    fn usage_lists_scan_command() {
+        assert!(USAGE.contains("kiri scan [--json] [--history] <image>"));
+        assert!(!USAGE.ends_with('\n'));
     }
 }

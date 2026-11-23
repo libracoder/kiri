@@ -167,12 +167,23 @@ pub fn alive() -> bool {
 /// `auth` is a registry sign-in for a pull (`X-Registry-Auth`, base64url).
 /// `opened` gets the connection once it is made, so another thread can
 /// shut it down to stop the request (Cancel on a pull).
-pub fn post_lines_closable(path: &str, auth: Option<&str>, opened: impl FnOnce(&UnixStream), mut on_line: impl FnMut(Value)) -> io::Result<u16> {
+pub fn post_lines_closable(path: &str, auth: Option<&str>, opened: impl FnOnce(&UnixStream), on_line: impl FnMut(Value)) -> io::Result<u16> {
+    post_lines_inner(path, auth, Some(Duration::from_secs(120)), opened, on_line)
+}
+
+/// Like `post_lines_closable` without a read timeout, for long-running
+/// streamed operations such as `/kiri/images/scan` (first-time DB download).
+#[cfg(target_os = "linux")]
+pub fn post_lines_unbounded(path: &str, on_line: impl FnMut(Value)) -> io::Result<u16> {
+    post_lines_inner(path, None, None, |_| {}, on_line)
+}
+
+fn post_lines_inner(path: &str, auth: Option<&str>, timeout: Option<Duration>, opened: impl FnOnce(&UnixStream), mut on_line: impl FnMut(Value)) -> io::Result<u16> {
     if auth.is_some_and(|a| a.contains(['\r', '\n'])) {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "header contains a line break"));
     }
     let auth = auth.map(|a| format!("X-Registry-Auth: {a}\r\n")).unwrap_or_default();
-    let mut s = connect(Some(Duration::from_secs(120)))?;
+    let mut s = connect(timeout)?;
     opened(&s);
     write!(s, "POST {path} HTTP/1.1\r\nHost: kiri\r\nConnection: close\r\n{auth}{}Content-Type: application/json\r\nContent-Length: 0\r\n\r\n", crate::diag::op_header())?;
     let mut r = BufReader::new(s);

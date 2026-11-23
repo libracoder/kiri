@@ -1,7 +1,8 @@
-//! `kiri k8s`, `kiri machine`, `kiri diag`, `kiri usb` and `kiri domains` on Windows: the engine's own
+//! `kiri k8s`, `kiri machine`, `kiri diag`, `kiri usb`, `kiri domains`,
+//! `kiri registry` and `kiri scan` on Windows: the engine's own
 //! commands, run by the Linux `kiri` in the WSL distro Kiri's engine lives
 //! in, as the engine runs (root, with its HOME), so it finds the daemon's
-//! socket. Arguments go through as they are: Windows paths are not
+//! socket and store. Arguments go through as they are: Windows paths are not
 //! translated. `kiri machine shell` is the exception: it needs a terminal
 //! and a docker CLI, so it runs on Windows (machine_shell below).
 
@@ -10,7 +11,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 /// The commands passed to the engine in WSL.
-pub const COMMANDS: &[&str] = &["k8s", "machine", "diag", "usb", "domains", "registry"];
+pub const COMMANDS: &[&str] = &["k8s", "machine", "diag", "usb", "domains", "registry", "scan"];
 
 /// In Kiri Linux, kiri-start wakes the engine if it isn't up; in a distro
 /// of the user's own, systemd or wsl.conf runs it.
@@ -58,4 +59,14 @@ fn machine_shell(name: &str, rest: &[String]) -> io::Result<()> {
         _ => args.extend(["sh", "-c", "exec $(command -v bash || command -v sh) -l"].map(str::to_owned)),
     }
     crate::docker::run(&args)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::COMMANDS;
+
+    #[test]
+    fn forwards_scan_to_wsl() {
+        assert!(COMMANDS.contains(&"scan"));
+    }
 }

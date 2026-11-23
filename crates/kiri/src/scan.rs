@@ -42,16 +42,37 @@ fn root() -> io::Result<PathBuf> {
     kiri_image::Store::default_root()
 }
 
-fn grype() -> io::Result<PathBuf> {
-    Ok(root()?.join("scanner/grype"))
+fn grype_in(root: &Path) -> PathBuf {
+    root.join("scanner/grype")
 }
 
 /// Scans kept per image.
 const KEEP: usize = 20;
 
 /// An image's scans, one folder each: Grype's JSON report, the SBOM and a summary.
-fn scan_dir(config_digest: &str) -> io::Result<PathBuf> {
-    Ok(root()?.join("scans").join(kiri_image::store::digest_hex(config_digest)?))
+fn scan_dir_in(root: &Path, config_digest: &str) -> io::Result<PathBuf> {
+    Ok(root.join("scans").join(kiri_image::store::digest_hex(config_digest)?))
+}
+
+/// Strips ANSI CSI escape sequences (`\x1b[...<final>`) from a line.
+pub(crate) fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for n in chars.by_ref() {
+                    if ('@'..='~').contains(&n) {
+                        break;
+                    }
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// The image's scans, newest first, by their time. A scan kept before there
@@ -74,10 +95,10 @@ fn scan_times(dir: &Path) -> Vec<u64> {
 }
 
 /// Grype's environment: its own database folder, no update nag, Kiri's proxy.
-fn command(args: &[&str]) -> io::Result<Command> {
-    let mut c = Command::new(grype()?);
+fn command_in(root: &Path, args: &[&str]) -> Command {
+    let mut c = Command::new(grype_in(root));
     c.args(args)
-        .env("GRYPE_DB_CACHE_DIR", root()?.join("scanner/db"))
+        .env("GRYPE_DB_CACHE_DIR", root.join("scanner/db"))
         .env("GRYPE_CHECK_FOR_APP_UPDATE", "false");
     let p = crate::daemon::proxy::effective();
     if let Some(u) = &p.https {
@@ -89,7 +110,7 @@ fn command(args: &[&str]) -> io::Result<Command> {
     if !p.no_proxy.is_empty() {
         c.env("NO_PROXY", p.no_proxy.join(","));
     }
-    Ok(c)
+    c
 }
 
 fn run(mut c: Command, what: &str) -> io::Result<()> {
@@ -98,14 +119,19 @@ fn run(mut c: Command, what: &str) -> io::Result<()> {
         return Ok(());
     }
     let err = String::from_utf8_lossy(&out.stderr);
-    // Grype's log lines carry colour codes; keep the last plain line.
-    let line = err.lines().rev().map(|l| l.replace('\u{1b}', "")).map(|l| l.trim_start_matches(|c: char| c == '[' || c.is_ascii_digit() || c == ';' || c == 'm').to_string()).find(|l| !l.trim().is_empty()).unwrap_or_default();
-    Err(io::Error::other(format!("{what}: {}", line.trim())))
+    // Grype's log lines carry colour codes; keep the last plain line, redacted.
+    let line = err.lines().rev().map(strip_ansi).find(|l| !l.trim().is_empty()).unwrap_or_default();
+    let msg = crate::diag::redact::Redactor::home_only().apply(line.trim());
+    if msg.is_empty() {
+        Err(io::Error::other(what.to_owned()))
+    } else {
+        Err(io::Error::other(format!("{what}: {msg}")))
+    }
 }
 
 /// Downloads Grype if it isn't there yet, checked against its pinned SHA-256.
-fn ensure_grype(progress: &mut dyn FnMut(u8)) -> io::Result<()> {
-    let dest = grype()?;
+fn ensure_grype_in(root: &Path, progress: &mut dyn FnMut(u8)) -> io::Result<()> {
+    let dest = grype_in(root);
     if dest.is_file() {
         return Ok(());
     }
@@ -168,7 +194,11 @@ fn layout(store: &kiri_image::Store, i: &kiri_image::Image, to: &Path) -> io::Re
 /// Scans the image (a name or an ID). `progress(phase, percent)`, with phase
 /// "scanner" (downloading Grype), "database" or "scanning".
 pub fn scan(name: &str, progress: &mut dyn FnMut(&str, u8)) -> io::Result<Value> {
-    let store = kiri_image::Store::open(root()?)?;
+    scan_in(&root()?, name, progress)
+}
+
+fn scan_in(root: &Path, name: &str, progress: &mut dyn FnMut(&str, u8)) -> io::Result<Value> {
+    let store = kiri_image::Store::open(root)?;
     let (i, ..) = crate::builds::stored(&store, name)?;
     {
         let mut r = RUNNING.lock().unwrap();
@@ -177,19 +207,19 @@ pub fn scan(name: &str, progress: &mut dyn FnMut(&str, u8)) -> io::Result<Value>
         }
     }
     let result = (|| {
-        ensure_grype(&mut |pct| progress("scanner", pct))?;
+        ensure_grype_in(root, &mut |pct| progress("scanner", pct))?;
         progress("database", 0);
-        let has_db = root()?.join("scanner/db").read_dir().is_ok_and(|mut d| d.next().is_some());
+        let has_db = root.join("scanner/db").read_dir().is_ok_and(|mut d| d.next().is_some());
         // Offline with a database already here: scan with what's here, and
         // Grype says so itself if it's too old.
-        if let Err(e) = run(command(&["db", "update", "-q"])?, "Could not update the vulnerability database") {
-            if !has_db {
-                return Err(e);
-            }
+        if let Err(e) = run(command_in(root, &["db", "update", "-q"]), "Could not update the vulnerability database")
+            && !has_db
+        {
+            return Err(e);
         }
         progress("scanning", 0);
         let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-        let dir = scan_dir(&i.config_digest)?.join(at.to_string());
+        let dir = scan_dir_in(root, &i.config_digest)?.join(at.to_string());
         std::fs::create_dir_all(&dir)?;
         let tmp = store.root().join("tmp").join(format!("scan-{}-{}", std::process::id(), kiri_image::store::digest_hex(&i.config_digest)?));
         let _ = std::fs::remove_dir_all(&tmp);
@@ -197,11 +227,9 @@ pub fn scan(name: &str, progress: &mut dyn FnMut(&str, u8)) -> io::Result<Value>
         let report = dir.join("grype.json.part");
         let sbom = dir.join("sbom.cdx.json.part");
         let target = format!("oci-dir:{}", tmp.display());
-        let out = (|| {
-            let mut c = command(&["-q", &target, "-o", &format!("json={}", report.display()), "-o", &format!("cyclonedx-json={}", sbom.display())])?;
-            c.env("GRYPE_DB_AUTO_UPDATE", "false");
-            run(c, "The scan failed")
-        })();
+        let mut c = command_in(root, &["-q", &target, "-o", &format!("json={}", report.display()), "-o", &format!("cyclonedx-json={}", sbom.display())]);
+        c.env("GRYPE_DB_AUTO_UPDATE", "false");
+        let out = run(c, "The scan failed");
         let _ = std::fs::remove_dir_all(&tmp);
         if let Err(e) = out {
             let _ = std::fs::remove_dir_all(&dir);
@@ -209,12 +237,14 @@ pub fn scan(name: &str, progress: &mut dyn FnMut(&str, u8)) -> io::Result<Value>
         }
         std::fs::rename(&report, dir.join("grype.json"))?;
         std::fs::rename(&sbom, dir.join("sbom.cdx.json"))?;
+        // Invalidate any cached summary if a second scan ran in the same second.
+        let _ = std::fs::remove_file(dir.join("summary.json"));
         // Only the newest KEEP.
-        let all = scan_dir(&i.config_digest)?;
+        let all = scan_dir_in(root, &i.config_digest)?;
         for old in scan_times(&all).into_iter().skip(KEEP) {
             let _ = std::fs::remove_dir_all(all.join(old.to_string()));
         }
-        open(name, Some(at))?.ok_or_else(|| io::Error::other("the scan wrote no report"))
+        open_in(root, name, Some(at))?.ok_or_else(|| io::Error::other("the scan wrote no report"))
     })();
     RUNNING.lock().unwrap().as_mut().map(|r| r.remove(&i.config_digest));
     result
@@ -223,16 +253,20 @@ pub fn scan(name: &str, progress: &mut dyn FnMut(&str, u8)) -> io::Result<Value>
 /// The image's scans for the history list, newest first: when, the count
 /// per severity, how many have a fix. Each summary is worked out once and kept.
 pub fn history(name: &str) -> io::Result<Value> {
-    let store = kiri_image::Store::open(root()?)?;
+    history_in(&root()?, name)
+}
+
+fn history_in(root: &Path, name: &str) -> io::Result<Value> {
+    let store = kiri_image::Store::open(root)?;
     let (i, ..) = crate::builds::stored(&store, name)?;
-    let all = scan_dir(&i.config_digest)?;
+    let all = scan_dir_in(root, &i.config_digest)?;
     let mut list = Vec::new();
     for at in scan_times(&all) {
         let path = all.join(at.to_string()).join("summary.json");
         let summary = match std::fs::read(&path).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()) {
             Some(v) => v,
             None => {
-                let Some(full) = open(name, Some(at))? else { continue };
+                let Some(full) = open_in(root, name, Some(at))? else { continue };
                 let mut counts = serde_json::Map::new();
                 for v in full["vulns"].as_array().into_iter().flatten() {
                     let k = v["severity"].as_str().unwrap_or("Unknown").to_owned();
@@ -254,9 +288,13 @@ pub fn history(name: &str) -> io::Result<Value> {
 /// One of the image's scans in full (the newest when `at` is None), or None
 /// if it has none.
 pub fn open(name: &str, at: Option<u64>) -> io::Result<Option<Value>> {
-    let store = kiri_image::Store::open(root()?)?;
+    open_in(&root()?, name, at)
+}
+
+fn open_in(root: &Path, name: &str, at: Option<u64>) -> io::Result<Option<Value>> {
+    let store = kiri_image::Store::open(root)?;
     let (i, manifest, config) = crate::builds::stored(&store, name)?;
-    let all = scan_dir(&i.config_digest)?;
+    let all = scan_dir_in(root, &i.config_digest)?;
     let Some(when) = at.or_else(|| scan_times(&all).first().copied()) else { return Ok(None) };
     let dir = all.join(when.to_string());
     let Ok(raw) = std::fs::read(dir.join("grype.json")) else { return Ok(None) };
@@ -313,9 +351,10 @@ fn summarize(report: &Value, lines: &[Value], config: &Value) -> Value {
 
 /// One scan's SBOM, where it's kept.
 pub fn sbom(name: &str, at: u64) -> io::Result<PathBuf> {
-    let store = kiri_image::Store::open(root()?)?;
+    let root = root()?;
+    let store = kiri_image::Store::open(&root)?;
     let (i, ..) = crate::builds::stored(&store, name)?;
-    let from = scan_dir(&i.config_digest)?.join(at.to_string()).join("sbom.cdx.json");
+    let from = scan_dir_in(&root, &i.config_digest)?.join(at.to_string()).join("sbom.cdx.json");
     if !from.is_file() {
         return Err(io::Error::other("scan the image first"));
     }
@@ -366,6 +405,160 @@ mod tests {
         assert_eq!((v[0]["id"].as_str(), v[0]["base"].as_bool(), v[0]["by"].as_str()), (Some("CVE-2"), Some(false), Some("COPY . /app")));
         assert_eq!(v[0]["url"], "", "only https advisories");
         assert_eq!((v[1]["layer"].as_u64(), v[1]["base"].as_bool(), v[1]["fixed"].as_array().map(Vec::len)), (Some(0), Some(true), Some(0)));
+    }
+
+    #[test]
+    fn grype_pins_and_urls_cover_macos_and_linux() {
+        for (v, sum) in [GRYPE, cli_pins::LINUX_GRYPE, cli_pins::LINUX_ARM64_GRYPE] {
+            assert!(!v.is_empty());
+            assert_eq!(sum.len(), 64);
+            assert!(sum.bytes().all(|b| b.is_ascii_hexdigit()));
+        }
+        assert!(grype_url(GRYPE.0).starts_with("https://github.com/anchore/grype/releases/download/v"));
+        assert_eq!(
+            cli_pins::linux_grype_url("0.120.1", "amd64"),
+            "https://github.com/anchore/grype/releases/download/v0.120.1/grype_0.120.1_linux_amd64.tar.gz"
+        );
+        assert_eq!(
+            cli_pins::linux_grype_url("0.120.1", "arm64"),
+            "https://github.com/anchore/grype/releases/download/v0.120.1/grype_0.120.1_linux_arm64.tar.gz"
+        );
+    }
+
+    #[test]
+    fn strips_ansi_and_redacts_failed_grype_output() {
+        assert_eq!(strip_ansi("\x1b[31merror:\x1b[0m failed to fetch \x1b[1mdb\x1b[0m"), "error: failed to fetch db");
+        let mut c = Command::new("/bin/sh");
+        c.args(["-c", "printf '\\033[31mproxy failed: http://bob:hunter2@proxy.example:3128\\033[0m\\n' >&2; exit 1"]);
+        let err = run(c, "The scan failed").unwrap_err().to_string();
+        assert!(err.starts_with("The scan failed: "), "{err}");
+        assert!(!err.contains("hunter2"), "secret leaked: {err}");
+        assert!(!err.contains('\x1b'), "ANSI leaked: {err}");
+        assert!(err.contains("http://[redacted]@proxy.example:3128"), "{err}");
+    }
+
+    #[test]
+    fn scan_open_and_history_end_to_end_with_mock_grype() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("kiri-scan-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = kiri_image::Store::open(&dir).unwrap();
+
+        let layer_bytes = b"fake-layer-tar-bytes";
+        let layer_digest = kiri_image::store::sha256_digest(layer_bytes);
+        std::fs::write(store.blob_path(&layer_digest).unwrap(), layer_bytes).unwrap();
+
+        let config_bytes = serde_json::to_vec(&json!({
+            "architecture": "arm64",
+            "os": "linux",
+            "created": "2026-11-16T20:00:00Z",
+            "rootfs": {"type": "layers", "diff_ids": ["sha256:diff0"]},
+            "history": [{"created": "2026-11-16T20:00:00Z", "created_by": "ADD rootfs /"}]
+        }))
+        .unwrap();
+        let config_digest = kiri_image::store::sha256_digest(&config_bytes);
+        std::fs::write(store.blob_path(&config_digest).unwrap(), &config_bytes).unwrap();
+
+        store
+            .put_image(kiri_image::Image {
+                name: "demo:1".to_owned(),
+                digest: config_digest.clone(),
+                index_digest: None,
+                config_digest: config_digest.clone(),
+                layers: vec![kiri_image::Layer {
+                    digest: layer_digest,
+                    size: layer_bytes.len() as u64,
+                    media_type: "application/vnd.oci.image.layer.v1.tar+gzip".to_owned(),
+                }],
+                size: layer_bytes.len() as u64,
+                platform: "linux/arm64".to_owned(),
+                created: "2026-11-16T20:00:00Z".to_owned(),
+                pulled_at: 1_794_859_620,
+                config: kiri_image::RunConfig::default(),
+                mirror: None,
+            })
+            .unwrap();
+
+        let scanner = dir.join("scanner");
+        std::fs::create_dir_all(scanner.join("db")).unwrap();
+        let mock = scanner.join("grype");
+        let script = r#"#!/bin/sh
+set -eu
+if [ "${1:-}" = "db" ] && [ "${2:-}" = "update" ]; then
+  exit 0
+fi
+oci=""
+json_out=""
+sbom_out=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    oci-dir:*) oci="${1#oci-dir:}" ;;
+    -o)
+      shift
+      case "$1" in
+        json=*) json_out="${1#json=}" ;;
+        cyclonedx-json=*) sbom_out="${1#cyclonedx-json=}" ;;
+      esac
+      ;;
+  esac
+  shift
+done
+[ -f "$oci/oci-layout" ] && [ -f "$oci/index.json" ]
+cat > "$json_out" <<'EOF'
+{
+  "descriptor": {"db": {"status": {"built": "2026-11-16T00:00:00Z"}}},
+  "matches": [
+    {
+      "vulnerability": {"id": "CVE-2026-1001", "severity": "Critical", "fix": {"state": "fixed", "versions": ["3.1.1"]}, "dataSource": "https://nvd.nist.gov/vuln/detail/CVE-2026-1001", "description": "critical bug"},
+      "artifact": {"name": "openssl", "version": "3.1.0", "type": "apk", "locations": [{"layerID": "sha256:diff0"}]}
+    },
+    {
+      "vulnerability": {"id": "CVE-2026-1002", "severity": "Negligible", "fix": {"state": "not-fixed"}, "dataSource": "https://nvd.nist.gov/vuln/detail/CVE-2026-1002", "description": "minor"},
+      "artifact": {"name": "musl", "version": "1.2.4", "type": "apk", "locations": [{"layerID": "sha256:diff0"}]}
+    }
+  ]
+}
+EOF
+cat > "$sbom_out" <<'EOF'
+{"components": [{"name": "openssl"}, {"name": "musl"}, {"name": "busybox"}]}
+EOF
+"#;
+        std::fs::write(&mock, script).unwrap();
+        std::fs::set_permissions(&mock, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut phases = Vec::new();
+        let report = scan_in(&dir, "demo:1", &mut |phase, pct| phases.push((phase.to_owned(), pct))).unwrap();
+        assert!(phases.iter().any(|(p, _)| p == "database"), "{phases:?}");
+        assert!(phases.iter().any(|(p, _)| p == "scanning"), "{phases:?}");
+
+        // `--json` output from `scan` must match `GET /kiri/images/scan` (`open`).
+        let opened = open_in(&dir, "demo:1", None).unwrap().unwrap();
+        assert_eq!(report, opened);
+        assert_eq!(report["id"], config_digest);
+        assert_eq!(report["packages"], 3);
+        assert_eq!(report["db"], "2026-11-16T00:00:00Z");
+        assert_eq!(report["grype"], GRYPE.0);
+        assert_eq!(report["vulns"].as_array().unwrap().len(), 2);
+
+        let table = crate::scan_cli::format_report("demo:1", &report).unwrap();
+        assert!(table.contains("demo:1: 3 packages, 2 findings, 1 with a fix available, database built 2026-11-16T00:00:00Z"), "{table}");
+        assert!(table.contains("1 Critical, 1 Negligible"), "{table}");
+        assert!(table.contains("fixed in 3.1.1"), "{table}");
+
+        let hist = history_in(&dir, "demo:1").unwrap();
+        assert_eq!(hist["id"], config_digest);
+        assert_eq!(hist["scans"].as_array().unwrap().len(), 1);
+        let hist_table = crate::scan_cli::format_history(&hist).unwrap();
+        assert!(hist_table.contains("1 Critical, 1 Negligible"), "{hist_table}");
+
+        // Missing image gives a clear error.
+        let missing = scan_in(&dir, "no-such-image:latest", &mut |_, _| {}).unwrap_err().to_string();
+        assert_eq!(missing, "no image no-such-image:latest in Kiri");
+        let missing_hist = history_in(&dir, "no-such-image:latest").unwrap_err().to_string();
+        assert_eq!(missing_hist, "no image no-such-image:latest in Kiri");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A real scan of an image in a real store, Grype and its database downloaded on first use:
