@@ -239,3 +239,6 @@ container-marker-link	#131	a symlink at /.dockerenv in the image must not be fol
 diff-no-marker	#131	an untouched /.dockerenv created by the engine must not appear in docker diff
 export-has-marker	#131	docker export must include /.dockerenv as Docker does
 commit-no-marker	#131	docker commit must not include an untouched /.dockerenv in the committed layer
+inspect-binds	#610	docker inspect omitted HostConfig.Binds, dropping -v binds, named volumes and socket paths on container recreate
+inspect-mounts-tmpfs	#610	docker inspect omitted HostConfig.Mounts, HostConfig.Tmpfs and Config.Volumes
+inspect-recreate-mounts	#610	recreating a container from its inspect Config and HostConfig (Watchtower, Portainer, Arcane) lost its volumes, read-only binds, tmpfs and socket mounts

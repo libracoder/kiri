@@ -373,6 +373,11 @@ pub struct Spec {
     /// For `inspect`: Docker's `Mounts` entries.
     #[serde(default)]
     pub mount_info: Vec<serde_json::Value>,
+    /// For `inspect`: HostConfig's `Binds`, `Mounts` and `Tmpfs` as create
+    /// gave them, and `Volumes` (Config's, with the image's VOLUME lines).
+    /// Null for a container saved before they were kept (#610).
+    #[serde(default)]
+    pub mount_request: serde_json::Value,
     /// Named volumes it uses (kept while it exists), and the anonymous ones
     /// created for it (deleted with it on `--rm` or `rm -v`).
     #[serde(default)]

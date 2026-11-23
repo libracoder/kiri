@@ -1842,6 +1842,80 @@ fn mounts(body: &Value, engine: &Engine, image: &kiri_image::Image) -> Result<Mo
     Ok(out)
 }
 
+/// What inspect gives back of a create's mounts: HostConfig's `Binds`,
+/// `Mounts` and `Tmpfs` as they came, and `Volumes` (`-v /path`) with the
+/// image's VOLUME lines, as Docker's Config has them. Tools that recreate a
+/// container from its inspect (Watchtower, Portainer, Arcane) copy these (#610).
+fn mount_request(body: &Value, image_cfg: &Value) -> Value {
+    let host = &body["HostConfig"];
+    let mut volumes = serde_json::Map::new();
+    for given in [&body["Volumes"], &image_cfg["config"]["Volumes"]] {
+        for path in given.as_object().into_iter().flat_map(|m| m.keys()) {
+            volumes.entry(path.clone()).or_insert_with(|| json!({}));
+        }
+    }
+    json!({
+        "Binds": host["Binds"],
+        "Mounts": host["Mounts"],
+        "Tmpfs": host["Tmpfs"],
+        "Volumes": if volumes.is_empty() { Value::Null } else { Value::Object(volumes) },
+    })
+}
+
+/// [`mount_request`] for inspect. A container saved before it was kept has
+/// only Docker's `Mounts` entries, so they are made from those: a bind or a
+/// named volume as a `Binds` line, a tmpfs in `Tmpfs` (or `Mounts` when
+/// read-only), an anonymous volume in `Volumes` (or `Mounts` when read-only),
+/// never leaking generated anonymous volume IDs or internal paths.
+fn inspect_mounts(spec: &Spec, is_anon_volume: impl Fn(&str) -> bool) -> Value {
+    if !spec.mount_request.is_null() {
+        return spec.mount_request.clone();
+    }
+    let (mut binds, mut mounts, mut tmpfs, mut volumes) = (Vec::new(), Vec::new(), serde_json::Map::new(), serde_json::Map::new());
+    let mut seen = std::collections::HashSet::new();
+    for m in &spec.mount_info {
+        let dst = m["Destination"].as_str().unwrap_or_default();
+        if dst.is_empty() || !seen.insert(dst.trim_end_matches('/').to_owned()) {
+            continue;
+        }
+        let rw = m["RW"] != false;
+        let ro = if rw { "" } else { ":ro" };
+        match (m["Type"].as_str(), m["Name"].as_str()) {
+            (Some("bind"), _) => {
+                let src = m["Source"].as_str().unwrap_or_default();
+                if !src.is_empty() {
+                    binds.push(format!("{src}:{dst}{ro}"));
+                }
+            }
+            (Some("volume"), Some(name)) if spec.anon_volumes.iter().any(|a| a == name) || is_anon_volume(name) => {
+                if rw {
+                    volumes.insert(dst.to_owned(), json!({}));
+                } else {
+                    mounts.push(json!({"Type": "volume", "Target": dst, "ReadOnly": true}));
+                }
+            }
+            (Some("volume"), Some(name)) if !name.is_empty() => {
+                binds.push(format!("{name}:{dst}{ro}"));
+            }
+            (Some("tmpfs"), _) => {
+                if rw {
+                    tmpfs.insert(dst.to_owned(), json!(""));
+                } else {
+                    mounts.push(json!({"Type": "tmpfs", "Target": dst, "ReadOnly": true}));
+                }
+            }
+            _ => {}
+        }
+    }
+    let or_null = |v: Value, empty: bool| if empty { Value::Null } else { v };
+    json!({
+        "Binds": or_null(json!(binds), binds.is_empty()),
+        "Mounts": or_null(json!(mounts), mounts.is_empty()),
+        "Tmpfs": or_null(json!(tmpfs), tmpfs.is_empty()),
+        "Volumes": or_null(json!(volumes), volumes.is_empty()),
+    })
+}
+
 fn volume_json(v: &super::volumes::Volume) -> Value {
     json!({
         "Name": v.name,
@@ -2402,6 +2476,7 @@ pub(super) fn create(req: &Request, engine: &Engine) -> Result<Value, Error> {
         pid_mode,
         mounts: mounts.guest,
         mount_info: mounts.info,
+        mount_request: mount_request(&body, &image_cfg),
         volumes: mounts.volumes,
         anon_volumes: mounts.anon,
         restart: RestartPolicy {
@@ -2643,8 +2718,9 @@ fn container_inspect(engine: &Engine, key: &str) -> Result<Value, Error> {
     let id = engine.resolve(key)?;
     let networks: Vec<super::network::Network> = engine.lock_net().all().to_vec();
     let health = engine.health(&id);
+    let anon_vols: Vec<String> = engine.volume_list().into_iter().filter(|v| v.anonymous).map(|v| v.name).collect();
     engine.with(&id, |c| {
-        let mut v = inspect(c, &networks);
+        let mut v = inspect(c, &networks, &anon_vols);
         v["NetworkSettings"]["Networks"] = endpoints(c, &networks);
         // The old top-level fields describe the default bridge only.
         if c.spec.network_mode == "bridge" {
@@ -2731,7 +2807,7 @@ fn list(req: &Request, engine: &Engine) -> Result<Value, Error> {
     Ok(Value::Array(rows.into_iter().map(|(_, v)| v).collect()))
 }
 
-fn inspect(c: &Container, nets: &[super::network::Network]) -> Value {
+fn inspect(c: &Container, nets: &[super::network::Network], anon_vols: &[String]) -> Value {
     let when = |t: Option<std::time::SystemTime>| t.map_or_else(|| time::ZERO.to_owned(), time::rfc3339);
     let argv = c.argv();
     let mut v = json!({
@@ -2817,6 +2893,12 @@ fn inspect(c: &Container, nets: &[super::network::Network]) -> Value {
     });
     for key in ["MaskedPaths", "ReadonlyPaths"] {
         v["HostConfig"][key] = super::hostopts::system_paths(&c.spec.host_opts, key, c.spec.privileged);
+    }
+    // Set apart: more keys in the macro above pass its recursion limit.
+    let mounts = inspect_mounts(&c.spec, |name| anon_vols.iter().any(|a| a == name));
+    v["Config"]["Volumes"] = mounts["Volumes"].clone();
+    for key in ["Binds", "Mounts", "Tmpfs"] {
+        v["HostConfig"][key] = mounts[key].clone();
     }
     v
 }
@@ -5227,6 +5309,260 @@ mod network_option_tests {
         assert_eq!(warnings_for(json!({"Privileged": true, "SecurityOpt": ["seccomp=unconfined"]})), expected);
         drop(engine);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Creates a container from `body` (on an image with a VOLUME line) and
+    /// returns its inspect, as `docker inspect` shows it.
+    fn inspect_after_create(name: &str, body: Value) -> Value {
+        let dir = std::env::temp_dir().join(format!("kiri-inspect-mounts-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = super::super::engine::boot_without_vm(&dir);
+        let cfg = json!({"created": "2026-11-20T00:00:00Z", "architecture": "arm64", "os": "linux", "config": {"Cmd": ["true"], "Volumes": {"/var/lib/img": {}}}});
+        let mut w = engine.store.ingest().unwrap();
+        io::Write::write_all(&mut w, &serde_json::to_vec(&cfg).unwrap()).unwrap();
+        let (digest, _) = w.finish().unwrap();
+        engine.store.put_image(kiri_image::archive::from_config("demo:local".into(), &digest, &cfg, Vec::new())).unwrap();
+        let mut body = body;
+        body["Image"] = json!("demo:local");
+        let id = super::create(&Request::internal("POST", "/containers/create", &[], serde_json::to_vec(&body).unwrap()), &engine).unwrap()["Id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let v = container_inspect(&engine, &id).unwrap();
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&dir);
+        v
+    }
+
+    /// `-v` and Compose's short syntax arrive as Binds, `--mount` and the
+    /// long syntax as Mounts, `--tmpfs` as Tmpfs. Docker gives each back as
+    /// it came, and tools that recreate a container (Watchtower, Portainer,
+    /// Arcane) copy HostConfig: without them the new container has no volumes (#610).
+    #[test]
+    fn inspect_gives_back_binds_mounts_and_tmpfs_as_created() {
+        let src = std::env::temp_dir().join(format!("kiri-inspect-src-{}", std::process::id()));
+        std::fs::create_dir_all(&src).unwrap();
+        let src = src.to_str().unwrap().to_owned();
+        let binds = json!([
+            format!("{src}:/b:ro"),
+            "k610vol:/data:rw",
+            "/var/run/docker.sock:/var/run/docker.sock",
+            "/run/host-services/ssh-auth.sock:/run/host-services/ssh-auth.sock",
+        ]);
+        let mounts = json!([
+            {"Type": "bind", "Source": src, "Target": "/b2", "ReadOnly": true},
+            {"Type": "bind", "Source": "/run/host-services/ssh-auth.sock", "Target": "/ssh2.sock", "ReadOnly": true},
+            {"Type": "volume", "Source": "k610other", "Target": "/data2", "ReadOnly": true, "VolumeOptions": {"NoCopy": true}},
+            {"Type": "volume", "Target": "/anon2", "VolumeOptions": {}},
+            {"Type": "tmpfs", "Target": "/t", "TmpfsOptions": {"SizeBytes": 1048576}},
+        ]);
+        let tmpfs = json!({"/t2": "size=2m"});
+        let v = inspect_after_create("given", json!({"HostConfig": {"Binds": binds, "Mounts": mounts, "Tmpfs": tmpfs}}));
+        assert_eq!(v["HostConfig"]["Binds"], binds);
+        assert_eq!(v["HostConfig"]["Mounts"], mounts);
+        assert_eq!(v["HostConfig"]["Tmpfs"], tmpfs);
+        assert_eq!(v["Config"]["Volumes"], json!({"/var/lib/img": {}}));
+        // HostConfig must never leak internal volume or relay socket paths.
+        let hc_text = v["HostConfig"].to_string();
+        assert!(!hc_text.contains("/var/lib/kiri/volumes/"), "HostConfig leaked volume path: {hc_text}");
+        assert!(!hc_text.contains("/run/kiri/host-services/ssh-auth.sock"), "HostConfig leaked host ssh relay path: {hc_text}");
+        assert!(!hc_text.contains("/run/host-services/docker.sock"), "HostConfig leaked vm docker relay path: {hc_text}");
+        assert!(!hc_text.contains("docker.container.sock"), "HostConfig leaked container socket path: {hc_text}");
+        let _ = std::fs::remove_dir_all(&src);
+    }
+
+    /// With no mounts asked for, Docker shows none.
+    #[test]
+    fn inspect_without_mounts_shows_none() {
+        let v = inspect_after_create("none", json!({"HostConfig": {}}));
+        assert_eq!(v["HostConfig"]["Binds"], Value::Null);
+        assert_eq!(v["HostConfig"]["Mounts"], Value::Null);
+        assert_eq!(v["HostConfig"]["Tmpfs"], Value::Null);
+        assert_eq!(v["Config"]["Volumes"], json!({"/var/lib/img": {}}));
+    }
+
+    /// `-v /path` arrives in Config.Volumes; Docker's inspect lists it there
+    /// with the image's VOLUME lines, never in HostConfig.Binds under its
+    /// generated 64-hex volume ID, so a recreate makes fresh anonymous volumes.
+    #[test]
+    fn inspect_lists_anonymous_volumes_in_config_volumes() {
+        let v = inspect_after_create("anon", json!({"Volumes": {"/anon": {}}, "HostConfig": {}}));
+        assert_eq!(v["Config"]["Volumes"], json!({"/anon": {}, "/var/lib/img": {}}));
+        assert_eq!(v["HostConfig"]["Binds"], Value::Null);
+        assert_eq!(v["HostConfig"]["Mounts"], Value::Null);
+        assert_eq!(v["HostConfig"]["Tmpfs"], Value::Null);
+    }
+
+    /// Recreating a container directly from its inspect `Config` + `HostConfig`
+    /// verbatim (as Watchtower, Portainer and Arcane do) succeeds with no
+    /// duplicate mount points and keeps named volumes, `:ro`, `ReadOnly: true`,
+    /// tmpfs, and socket paths while giving anonymous volumes fresh IDs (#610).
+    #[test]
+    fn inspect_recreate_round_trip_keeps_mounts_without_duplicates() {
+        let dir = std::env::temp_dir().join(format!("kiri-inspect-recreate-{}", std::process::id()));
+        let src = std::env::temp_dir().join(format!("kiri-inspect-recreate-src-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&src);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&src).unwrap();
+        let src_s = src.to_str().unwrap().to_owned();
+        let engine = super::super::engine::boot_without_vm(&dir);
+        let cfg = json!({"created": "2026-11-20T00:00:00Z", "architecture": "arm64", "os": "linux", "config": {"Cmd": ["true"], "Volumes": {"/var/lib/img": {}, "/img-overridden": {}}}});
+        let mut w = engine.store.ingest().unwrap();
+        io::Write::write_all(&mut w, &serde_json::to_vec(&cfg).unwrap()).unwrap();
+        let (digest, _) = w.finish().unwrap();
+        engine.store.put_image(kiri_image::archive::from_config("demo:local".into(), &digest, &cfg, Vec::new())).unwrap();
+
+        let body = json!({
+            "Image": "demo:local",
+            "Volumes": {"/anon": {}},
+            "HostConfig": {
+                "Binds": [
+                    format!("{src_s}:/b:ro"),
+                    "k610vol:/data",
+                    "k610img:/img-overridden",
+                    "/var/run/docker.sock:/var/run/docker.sock",
+                    "/run/host-services/ssh-auth.sock:/run/host-services/ssh-auth.sock",
+                ],
+                "Mounts": [
+                    {"Type": "bind", "Source": src_s, "Target": "/b2", "ReadOnly": true},
+                    {"Type": "volume", "Source": "k610rovol", "Target": "/rovol", "ReadOnly": true},
+                    {"Type": "tmpfs", "Target": "/t", "TmpfsOptions": {"SizeBytes": 1048576}},
+                ],
+                "Tmpfs": {"/t2": "size=2m"},
+            }
+        });
+        let id1 = super::create(&Request::internal("POST", "/containers/create", &[], serde_json::to_vec(&body).unwrap()), &engine).unwrap()["Id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let v1 = container_inspect(&engine, &id1).unwrap();
+
+        let mut recreate = v1["Config"].clone();
+        recreate["HostConfig"] = v1["HostConfig"].clone();
+        let id2 = super::create(&Request::internal("POST", "/containers/create", &[], serde_json::to_vec(&recreate).unwrap()), &engine).unwrap()["Id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let v2 = container_inspect(&engine, &id2).unwrap();
+
+        assert_eq!(v2["HostConfig"]["Binds"], v1["HostConfig"]["Binds"]);
+        assert_eq!(v2["HostConfig"]["Mounts"], v1["HostConfig"]["Mounts"]);
+        assert_eq!(v2["HostConfig"]["Tmpfs"], v1["HostConfig"]["Tmpfs"]);
+        assert_eq!(v2["Config"]["Volumes"], json!({"/anon": {}, "/var/lib/img": {}, "/img-overridden": {}}));
+
+        // Top-level Mounts has every expected destination exactly once.
+        let mounts2 = v2["Mounts"].as_array().unwrap();
+        let dsts: Vec<&str> = mounts2.iter().map(|m| m["Destination"].as_str().unwrap()).collect();
+        let unique: std::collections::HashSet<&str> = dsts.iter().copied().collect();
+        assert_eq!(dsts.len(), unique.len(), "duplicate mount targets after recreate: {dsts:?}");
+        let find = |dst: &str| mounts2.iter().find(|m| m["Destination"] == dst).unwrap_or_else(|| panic!("missing {dst}"));
+        assert_eq!(find("/b")["RW"], false);
+        assert_eq!(find("/b2")["RW"], false);
+        assert_eq!(find("/data")["Name"], "k610vol");
+        assert_eq!(find("/img-overridden")["Name"], "k610img");
+        assert_eq!(find("/rovol")["Name"], "k610rovol");
+        assert_eq!(find("/rovol")["RW"], false);
+        assert_eq!(find("/var/run/docker.sock")["Source"], "/var/run/docker.sock");
+        assert_eq!(find("/run/host-services/ssh-auth.sock")["Source"], "/run/host-services/ssh-auth.sock");
+        assert_eq!(find("/t")["Type"], "tmpfs");
+        assert_eq!(find("/t2")["Type"], "tmpfs");
+        // Anonymous volumes get fresh IDs on recreate instead of being pinned in Binds.
+        let anon1 = v1["Mounts"].as_array().unwrap().iter().find(|m| m["Destination"] == "/anon").unwrap()["Name"].as_str().unwrap();
+        let anon2 = find("/anon")["Name"].as_str().unwrap();
+        assert_ne!(anon1, anon2, "recreated container must get a fresh anonymous volume");
+        assert!(!v1["HostConfig"]["Binds"].to_string().contains(anon1));
+
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&src);
+    }
+
+    /// A container saved before `mount_request` was kept has only Docker's
+    /// `Mounts` entries: its Binds, Mounts, Tmpfs and anonymous volumes are
+    /// made from those without leaking `/var/lib/kiri/volumes/...`, internal
+    /// socket paths, or anonymous 64-hex IDs, and recreating from inspect works.
+    #[test]
+    fn inspect_of_an_older_container_derives_its_mounts() {
+        let root = std::env::temp_dir().join(format!("kiri-inspect-older-{}", std::process::id()));
+        let src = std::env::temp_dir().join(format!("kiri-inspect-older-src-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&src);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&src).unwrap();
+        let src_s = src.to_str().unwrap().to_owned();
+        let engine = super::super::engine::boot_without_vm(&root);
+        let cfg = json!({"created": "2026-11-20T00:00:00Z", "architecture": "arm64", "os": "linux", "config": {"Cmd": ["true"]}});
+        let mut w = engine.store.ingest().unwrap();
+        io::Write::write_all(&mut w, &serde_json::to_vec(&cfg).unwrap()).unwrap();
+        let (digest, _) = w.finish().unwrap();
+        let image = kiri_image::archive::from_config("older:1".into(), &digest, &cfg, Vec::new());
+        engine.store.put_image(image.clone()).unwrap();
+        // An anonymous volume borrowed via --volumes-from lives in volumes.json
+        // as anonymous even when not listed on this container's anon_volumes.
+        let borrowed_anon = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        engine.volume_ensure(borrowed_anon, json!({}), true).unwrap();
+        let spec: super::super::engine::Spec = serde_json::from_value(json!({
+            "image": image.name, "image_id": image.config_digest, "entrypoint": [], "cmd": ["true"],
+            "env": [], "cwd": "/", "user": "", "auto_remove": false, "network_mode": "none", "labels": {},
+            "restart": {"name": "no", "max_retries": 0}, "volumes": ["named", "namedro", borrowed_anon], "anon_volumes": ["0123abcd", "deadbeef"],
+            "mount_info": [
+                {"Type": "bind", "Source": src_s, "Destination": "/src", "Mode": "", "RW": false, "Propagation": "rprivate"},
+                {"Type": "bind", "Source": "/var/run/docker.sock", "Destination": "/var/run/docker.sock", "Mode": "", "RW": true, "Propagation": "rprivate"},
+                {"Type": "bind", "Source": "/run/host-services/ssh-auth.sock", "Destination": "/run/host-services/ssh-auth.sock", "Mode": "", "RW": true, "Propagation": "rprivate"},
+                {"Type": "volume", "Name": "named", "Source": "/var/lib/kiri/volumes/named/_data", "Destination": "/data", "Driver": "local", "Mode": "z", "RW": true, "Propagation": ""},
+                {"Type": "volume", "Name": "namedro", "Source": "/var/lib/kiri/volumes/namedro/_data", "Destination": "/dataro", "Driver": "local", "Mode": "z", "RW": false, "Propagation": ""},
+                {"Type": "volume", "Name": "0123abcd", "Source": "/var/lib/kiri/volumes/0123abcd/_data", "Destination": "/anon", "Driver": "local", "Mode": "z", "RW": true, "Propagation": ""},
+                {"Type": "volume", "Name": "deadbeef", "Source": "/var/lib/kiri/volumes/deadbeef/_data", "Destination": "/anonro", "Driver": "local", "Mode": "z", "RW": false, "Propagation": ""},
+                {"Type": "volume", "Name": borrowed_anon, "Source": format!("/var/lib/kiri/volumes/{borrowed_anon}/_data"), "Destination": "/borrowed", "Driver": "local", "Mode": "z", "RW": true, "Propagation": ""},
+                {"Type": "tmpfs", "Source": "", "Destination": "/t", "Mode": "", "RW": true, "Propagation": ""},
+                {"Type": "tmpfs", "Source": "", "Destination": "/tro", "Mode": "", "RW": false, "Propagation": ""},
+            ],
+        })).unwrap();
+        let id = engine.create(Some("older".into()), spec, &image).unwrap();
+        let v = container_inspect(&engine, &id).unwrap();
+        assert_eq!(
+            v["HostConfig"]["Binds"],
+            json!([
+                format!("{src_s}:/src:ro"),
+                "/var/run/docker.sock:/var/run/docker.sock",
+                "/run/host-services/ssh-auth.sock:/run/host-services/ssh-auth.sock",
+                "named:/data",
+                "namedro:/dataro:ro",
+            ])
+        );
+        assert_eq!(
+            v["HostConfig"]["Mounts"],
+            json!([
+                {"Type": "volume", "Target": "/anonro", "ReadOnly": true},
+                {"Type": "tmpfs", "Target": "/tro", "ReadOnly": true},
+            ])
+        );
+        assert_eq!(v["HostConfig"]["Tmpfs"], json!({"/t": ""}));
+        assert_eq!(v["Config"]["Volumes"], json!({"/anon": {}, "/borrowed": {}}));
+        let hc_text = v["HostConfig"].to_string();
+        assert!(!hc_text.contains("/var/lib/kiri/volumes/"));
+        assert!(!hc_text.contains("0123abcd"));
+        assert!(!hc_text.contains("deadbeef"));
+        assert!(!hc_text.contains(borrowed_anon));
+
+        // Recreating from the legacy container's inspect succeeds with no duplicates.
+        let mut recreate = v["Config"].clone();
+        recreate["HostConfig"] = v["HostConfig"].clone();
+        let id2 = super::create(&Request::internal("POST", "/containers/create", &[], serde_json::to_vec(&recreate).unwrap()), &engine).unwrap()["Id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let v2 = container_inspect(&engine, &id2).unwrap();
+        let dsts: Vec<&str> = v2["Mounts"].as_array().unwrap().iter().map(|m| m["Destination"].as_str().unwrap()).collect();
+        let unique: std::collections::HashSet<&str> = dsts.iter().copied().collect();
+        assert_eq!(dsts.len(), unique.len(), "duplicate mount targets after legacy recreate: {dsts:?}");
+        assert_eq!(dsts.len(), 10);
+
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&src);
     }
 
     #[test]
