@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #515 Host relay: close open proxy connections when the relay stream ends (unreleased)
+- Fixes: no issue
+- Caused: none known
+- Caused by: -
+- Check: none
+
 ### #715 DNS: Go clients' SRV lookups are answered here, and forwarded lookups are never silently dropped (unreleased)
 - Fixes: #715 Go gRPC clients (RoadRunner's Temporal plugin) fail with "context deadline exceeded" resolving container names via 127.0.0.11 while getent/nslookup/dig work
 - Caused: none known

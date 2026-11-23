@@ -95,20 +95,66 @@ struct Entry {
     stream: Option<TcpStream>,
 }
 
+#[derive(Default)]
+struct State {
+    closed: bool,
+    entries: HashMap<u32, Entry>,
+}
+
 /// The connections open through one relay, by id.
 #[derive(Default)]
-pub struct Conns(Mutex<HashMap<u32, Entry>>);
+pub struct Conns(Mutex<State>);
+
+struct CloseAll(Arc<Conns>);
+
+impl Drop for CloseAll {
+    fn drop(&mut self) {
+        self.0.close_all();
+    }
+}
 
 impl Conns {
-    fn map(&self) -> std::sync::MutexGuard<'_, HashMap<u32, Entry>> {
+    fn state(&self) -> std::sync::MutexGuard<'_, State> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// A new connection: what arrives for it waits here until it is made.
-    fn open(&self, id: u32) -> Receiver<Op> {
+    fn open(&self, id: u32) -> Option<Receiver<Op>> {
         let (tx, rx) = sync_channel(QUEUE);
-        self.map().insert(id, Entry { tx, stream: None });
-        rx
+        let prev = {
+            let mut s = self.state();
+            if s.closed {
+                return None;
+            }
+            s.entries.insert(id, Entry { tx, stream: None })
+        };
+        if let Some(prev) = prev
+            && let Some(stream) = prev.stream
+        {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+        Some(rx)
+    }
+
+    fn close(&self, id: u32) -> bool {
+        let Some(e) = self.state().entries.remove(&id) else { return false };
+        if let Some(s) = e.stream {
+            let _ = s.shutdown(Shutdown::Both);
+        }
+        true
+    }
+
+    fn close_all(&self) {
+        let entries = {
+            let mut s = self.state();
+            s.closed = true;
+            std::mem::take(&mut s.entries)
+        };
+        for (_, e) in entries {
+            if let Some(s) = e.stream {
+                let _ = s.shutdown(Shutdown::Both);
+            }
+        }
     }
 
     /// A frame for one of the connections.
@@ -117,22 +163,17 @@ impl Conns {
             DATA => Op::Data(data),
             EOF => Op::Eof,
             CLOSE => {
-                if let Some(e) = self.map().remove(&id)
-                    && let Some(s) = e.stream
-                {
-                    let _ = s.shutdown(Shutdown::Both);
-                }
+                self.close(id);
                 return;
             }
             _ => return,
         };
         // Sent outside the lock: a full queue waits for its own writer only.
-        let tx = self.map().get(&id).map(|e| e.tx.clone());
+        let tx = self.state().entries.get(&id).map(|e| e.tx.clone());
         if let Some(tx) = tx {
             let _ = tx.send(op);
         }
     }
-
 }
 
 /// Joins `stream` to connection `id`: what it reads goes to the other end
@@ -140,17 +181,23 @@ impl Conns {
 fn attach(conns: &Arc<Conns>, out: &Out, id: u32, rx: Receiver<Op>, stream: TcpStream) {
     let _ = stream.set_nodelay(true);
     let (Ok(reader), Ok(writer)) = (stream.try_clone(), stream.try_clone()) else {
-        conns.map().remove(&id);
+        conns.close(id);
         let _ = send(out, CLOSE, id, &[]);
         return;
     };
-    match conns.map().get_mut(&id) {
-        Some(e) => e.stream = Some(stream),
-        // Closed while it was being made.
-        None => {
-            let _ = stream.shutdown(Shutdown::Both);
-            return;
+    let (attached, to_shutdown) = {
+        let mut s = conns.state();
+        match s.entries.get_mut(&id) {
+            Some(e) => (true, e.stream.replace(stream)),
+            // Closed while it was being made.
+            None => (false, Some(stream)),
         }
+    };
+    if let Some(s) = to_shutdown {
+        let _ = s.shutdown(Shutdown::Both);
+    }
+    if !attached {
+        return;
     }
     // Each half that ends counts; the second one forgets the connection.
     let halves = Arc::new(AtomicU8::new(0));
@@ -159,7 +206,7 @@ fn attach(conns: &Arc<Conns>, out: &Out, id: u32, rx: Receiver<Op>, stream: TcpS
         let halves = halves.clone();
         move || {
             if halves.fetch_add(1, Ordering::SeqCst) == 1 {
-                conns.map().remove(&id);
+                conns.close(id);
             }
         }
     };
@@ -172,7 +219,7 @@ fn attach(conns: &Arc<Conns>, out: &Out, id: u32, rx: Receiver<Op>, stream: TcpS
                 Op::Data(d) => {
                     if writer.write_all(&d).is_err() {
                         let _ = writer.shutdown(Shutdown::Both);
-                        c.map().remove(&id);
+                        c.close(id);
                         let _ = send(&o, CLOSE, id, &[]);
                         return;
                     }
@@ -193,18 +240,21 @@ fn attach(conns: &Arc<Conns>, out: &Out, id: u32, rx: Receiver<Op>, stream: TcpS
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => {
-                    let _ = send(&o, EOF, id, &[]);
+                    if send(&o, EOF, id, &[]).is_err() {
+                        c.close(id);
+                    }
                     break;
                 }
                 Ok(n) => {
                     if send(&o, DATA, id, &buf[..n]).is_err() {
+                        c.close(id);
                         break;
                     }
                 }
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Err(_) => {
                     // Gone while the other end may still be sending: say so.
-                    if c.map().remove(&id).is_some() {
+                    if c.close(id) {
                         let _ = send(&o, CLOSE, id, &[]);
                     }
                     break;
@@ -219,6 +269,7 @@ fn attach(conns: &Arc<Conns>, out: &Out, id: u32, rx: Receiver<Op>, stream: TcpS
 /// connection over `out`, until kiri-win goes, and the listeners with it.
 pub fn listen_side(input: impl Read, out: &Out) -> io::Result<()> {
     let conns = Arc::new(Conns::default());
+    let _close = CloseAll(conns.clone());
     let next = Arc::new(AtomicU32::new(1));
     let mut listening: HashMap<u16, u16> = HashMap::new();
     let mut r = BufReader::with_capacity(CHUNK, input);
@@ -254,8 +305,13 @@ fn listen(target: u16, conns: &Arc<Conns>, out: &Out, next: &Arc<AtomicU32>) -> 
         for s in l.incoming() {
             let Ok(s) = s else { continue };
             let id = next.fetch_add(1, Ordering::SeqCst);
-            let rx = conns.open(id);
+            let Some(rx) = conns.open(id) else {
+                let _ = s.shutdown(Shutdown::Both);
+                return;
+            };
             if send(&out, OPEN, id, &target.to_be_bytes()).is_err() {
+                conns.close(id);
+                let _ = s.shutdown(Shutdown::Both);
                 return;
             }
             attach(&conns, &out, id, rx, s);
@@ -268,6 +324,7 @@ fn listen(target: u16, conns: &Arc<Conns>, out: &Out, next: &Arc<AtomicU32>) -> 
 /// on the ports `allowed` names, and hands LISTENING replies to `listening`.
 pub fn dial_side(input: impl Read, out: &Out, allowed: impl Fn(u16) -> bool, listening: impl Fn(u16, u16)) -> io::Result<()> {
     let conns = Arc::new(Conns::default());
+    let _close = CloseAll(conns.clone());
     let mut r = BufReader::with_capacity(CHUNK, input);
     while let Some((kind, id, data)) = read_frame(&mut r)? {
         match kind {
@@ -278,12 +335,12 @@ pub fn dial_side(input: impl Read, out: &Out, allowed: impl Fn(u16) -> bool, lis
                     continue;
                 };
                 // Data that arrives while it dials waits in the queue.
-                let rx = conns.open(id);
+                let Some(rx) = conns.open(id) else { continue };
                 let (c, o) = (conns.clone(), out.clone());
                 std::thread::spawn(move || match dial(target) {
                     Ok(s) => attach(&c, &o, id, rx, s),
                     Err(_) => {
-                        c.map().remove(&id);
+                        c.close(id);
                         let _ = send(&o, CLOSE, id, &[]);
                     }
                 });
@@ -452,5 +509,210 @@ mod tests {
         c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
         let mut buf = [0u8; 1];
         assert!(matches!(c.read(&mut buf), Ok(0) | Err(_)));
+    }
+
+    fn assert_closed(conn: &mut TcpStream) {
+        conn.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+        let mut buf = [0u8; 1];
+        let res = conn.read(&mut buf);
+        assert!(
+            matches!(res, Ok(0))
+                || matches!(res, Err(ref e) if !matches!(e.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock)),
+            "expected closed socket, got {res:?}"
+        );
+    }
+
+    #[test]
+    fn ending_the_relay_closes_its_open_connections() {
+        // dial_side: open proxy socket closes when the frame stream hits EOF.
+        let proxy = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = proxy.local_addr().unwrap().port();
+        let (in_rx, in_tx) = io::pipe().unwrap();
+        let (mut out_rx, out_tx) = io::pipe().unwrap();
+        let in_out: Out = Arc::new(Mutex::new(in_tx));
+        let dial_out: Out = Arc::new(Mutex::new(out_tx));
+        let o = dial_out.clone();
+        let h = std::thread::spawn(move || dial_side(in_rx, &o, move |p| p == port, |_, _| {}));
+
+        send(&in_out, OPEN, 1, &port.to_be_bytes()).unwrap();
+        let (mut conn, _) = proxy.accept().unwrap();
+        conn.write_all(b"x").unwrap();
+        assert_eq!(read_frame(&mut out_rx).unwrap(), Some((DATA, 1, b"x".to_vec())));
+
+        drop(in_out);
+        h.join().unwrap().unwrap();
+        drop(dial_out);
+        assert_closed(&mut conn);
+
+        // listen_side: open client socket closes when the frame stream hits EOF.
+        let (in_rx, in_tx) = io::pipe().unwrap();
+        let (mut out_rx, out_tx) = io::pipe().unwrap();
+        let in_out: Out = Arc::new(Mutex::new(in_tx));
+        let listen_out: Out = Arc::new(Mutex::new(out_tx));
+        let o = listen_out.clone();
+        let h = std::thread::spawn(move || listen_side(in_rx, &o));
+
+        send(&in_out, LISTEN, 0, &port.to_be_bytes()).unwrap();
+        let Some((LISTENING, 0, reply)) = read_frame(&mut out_rx).unwrap() else { panic!("expected LISTENING") };
+        let local = port_of(&reply, 2).unwrap();
+        let mut client = TcpStream::connect(("127.0.0.1", local)).unwrap();
+        assert_eq!(read_frame(&mut out_rx).unwrap(), Some((OPEN, 1, port.to_be_bytes().to_vec())));
+        client.write_all(b"y").unwrap();
+        assert_eq!(read_frame(&mut out_rx).unwrap(), Some((DATA, 1, b"y".to_vec())));
+
+        drop(in_out);
+        h.join().unwrap().unwrap();
+        drop(listen_out);
+        assert_closed(&mut client);
+    }
+
+    #[test]
+    fn ending_the_relay_with_a_full_queue_tears_down_without_deadlocking() {
+        let proxy = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = proxy.local_addr().unwrap().port();
+        let (in_rx, in_tx) = io::pipe().unwrap();
+        let (mut out_rx, out_tx) = io::pipe().unwrap();
+        let in_out: Out = Arc::new(Mutex::new(in_tx));
+        let dial_out: Out = Arc::new(Mutex::new(out_tx));
+        let o = dial_out.clone();
+        let h = std::thread::spawn(move || dial_side(in_rx, &o, move |p| p == port, |_, _| {}));
+
+        send(&in_out, OPEN, 1, &port.to_be_bytes()).unwrap();
+        let (mut conn, _) = proxy.accept().unwrap();
+        conn.write_all(b"x").unwrap();
+        assert_eq!(read_frame(&mut out_rx).unwrap(), Some((DATA, 1, b"x".to_vec())));
+
+        // Fill the socket send buffer and the sync_channel(QUEUE) buffer without reading from conn.
+        let chunk = vec![b'a'; CHUNK * 4];
+        for _ in 0..QUEUE {
+            send(&in_out, DATA, 1, &chunk).unwrap();
+        }
+
+        drop(in_out);
+        h.join().unwrap().unwrap();
+        drop(dial_out);
+        // Drain any kernel-buffered bytes and confirm the socket was shut down.
+        conn.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+        let mut buf = vec![0u8; CHUNK * 4];
+        loop {
+            match conn.read(&mut buf) {
+                Ok(0) => break,
+                Ok(_) => continue,
+                Err(e) => {
+                    assert!(
+                        !matches!(e.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock),
+                        "expected closed socket after full queue EOF, got {e:?}"
+                    );
+                    break;
+                }
+            }
+        }
+
+        // Also verify teardown when all QUEUE slots of sync_channel(QUEUE) are 100% full (TrySendError::Full).
+        let conns = Arc::new(Conns::default());
+        let (_out_rx, out_tx) = io::pipe().unwrap();
+        let out: Out = Arc::new(Mutex::new(out_tx));
+        let rx = conns.open(1).unwrap();
+        let client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let (mut peer, _) = proxy.accept().unwrap();
+        attach(&conns, &out, 1, rx, client);
+        let tx = conns.state().entries.get(&1).unwrap().tx.clone();
+        while tx.try_send(Op::Data(chunk.clone())).is_ok() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(matches!(tx.try_send(Op::Data(vec![b'z'])), Err(std::sync::mpsc::TrySendError::Full(_))));
+        drop(tx);
+        conns.close_all();
+        assert!(conns.state().entries.is_empty());
+        assert!(conns.open(2).is_none());
+        peer.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+        loop {
+            match peer.read(&mut buf) {
+                Ok(0) => break,
+                Ok(_) => continue,
+                Err(e) => {
+                    assert!(!matches!(e.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock));
+                    break;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn broken_frame_output_pipe_cleans_up_the_connection() {
+        let proxy = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = proxy.local_addr().unwrap().port();
+        let (in_rx, in_tx) = io::pipe().unwrap();
+        let (mut out_rx, out_tx) = io::pipe().unwrap();
+        let in_out: Out = Arc::new(Mutex::new(in_tx));
+        let dial_out: Out = Arc::new(Mutex::new(out_tx));
+        let o = dial_out.clone();
+        let h = std::thread::spawn(move || dial_side(in_rx, &o, move |p| p == port, |_, _| {}));
+
+        send(&in_out, OPEN, 1, &port.to_be_bytes()).unwrap();
+        let (mut conn, _) = proxy.accept().unwrap();
+        conn.write_all(b"x").unwrap();
+        assert_eq!(read_frame(&mut out_rx).unwrap(), Some((DATA, 1, b"x".to_vec())));
+
+        // Break the output pipe while the input stream stays open.
+        drop(out_rx);
+        let _ = conn.write_all(b"y");
+        assert_closed(&mut conn);
+
+        drop(in_out);
+        h.join().unwrap().unwrap();
+
+        // Direct Conns check: a broken output pipe removes the entry from Conns.
+        let conns = Arc::new(Conns::default());
+        let (out_rx, out_tx) = io::pipe().unwrap();
+        drop(out_rx);
+        let out: Out = Arc::new(Mutex::new(out_tx));
+        let rx = conns.open(1).unwrap();
+        let client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let (mut peer, _) = proxy.accept().unwrap();
+        attach(&conns, &out, 1, rx, client);
+        assert!(conns.state().entries.contains_key(&1));
+        peer.write_all(b"z").unwrap();
+        assert_closed(&mut peer);
+        assert!(conns.state().entries.is_empty());
+    }
+
+    #[test]
+    fn connections_attaching_or_arriving_after_close_all_are_shut_down() {
+        let proxy = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = proxy.local_addr().unwrap().port();
+        let (_out_rx, out_tx) = io::pipe().unwrap();
+        let out: Out = Arc::new(Mutex::new(out_tx));
+
+        // 1. An in-flight connection opened before close_all() that reaches attach() after close_all().
+        let conns = Arc::new(Conns::default());
+        let rx = conns.open(1).unwrap();
+        conns.close_all();
+        let client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let (mut peer, _) = proxy.accept().unwrap();
+        attach(&conns, &out, 1, rx, client);
+        assert_closed(&mut peer);
+        assert!(conns.state().entries.is_empty());
+
+        // 2. A new TCP connection arriving at listen_side's listener after listen_side has torn down.
+        let (in_rx, in_tx) = io::pipe().unwrap();
+        let (mut out_rx, out_tx) = io::pipe().unwrap();
+        let in_out: Out = Arc::new(Mutex::new(in_tx));
+        let listen_out: Out = Arc::new(Mutex::new(out_tx));
+        let o = listen_out.clone();
+        let h = std::thread::spawn(move || listen_side(in_rx, &o));
+
+        send(&in_out, LISTEN, 0, &port.to_be_bytes()).unwrap();
+        let Some((LISTENING, 0, reply)) = read_frame(&mut out_rx).unwrap() else { panic!("expected LISTENING") };
+        let local = port_of(&reply, 2).unwrap();
+
+        drop(in_out);
+        h.join().unwrap().unwrap();
+        drop(listen_out);
+
+        if let Ok(mut late) = TcpStream::connect(("127.0.0.1", local)) {
+            assert_closed(&mut late);
+        }
+        assert!(read_frame(&mut out_rx).unwrap().is_none(), "no OPEN frame emitted after teardown");
     }
 }
