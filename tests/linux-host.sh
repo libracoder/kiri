@@ -48,6 +48,12 @@ else
 fi
 t run "3." "docker run --rm alpine cat /etc/alpine-release"
 t home "/root" "docker run --rm alpine sh -c 'echo \$HOME'"
+t container-marker "regular empty file 755 0:0" "docker run --rm alpine stat -c '%F %a %u:%g' /.dockerenv"
+t container-marker-nonroot "marker-ok" "docker run --rm -u 1000 alpine sh -c 'test -f /.dockerenv && test -r /.dockerenv && test ! -s /.dockerenv && echo marker-ok'"
+t container-marker-readonly "marker-ok" "docker run --rm --read-only alpine sh -c 'test -f /.dockerenv && test ! -s /.dockerenv && echo marker-ok'"
+t container-marker-readonly-nonroot "marker-ok" "docker run --rm --read-only -u 1000 alpine sh -c 'test -f /.dockerenv && test -r /.dockerenv && test ! -s /.dockerenv && echo marker-ok'"
+t container-marker-restart "marker-ok" "docker rm -f lh-marker >/dev/null 2>&1; docker run --name lh-marker alpine sh -c 'test -f /.dockerenv && test ! -s /.dockerenv && echo marker-ok' >/dev/null && docker start -a lh-marker; docker rm -f lh-marker >/dev/null"
+t container-marker-link "link-ok" "docker rm -f lh-marker >/dev/null 2>&1; docker run --name lh-marker alpine sh -c 'rm /.dockerenv && ln -s /outside/marker /.dockerenv' && docker commit lh-marker kiri-test/marker-link >/dev/null && docker run --rm kiri-test/marker-link sh -c 'test -L /.dockerenv && test ! -e /outside' && test ! -e /outside && echo link-ok; docker rm -f lh-marker >/dev/null; docker rmi kiri-test/marker-link >/dev/null 2>&1"
 t internet "Example Domain" "docker run --rm alpine wget -qO- -T 10 http://example.com"
 t port "Welcome to nginx" "docker run -d --name web -p 18081:80 nginx:alpine >/dev/null; for i in \$(seq 30); do curl -s localhost:18081 && break; sleep 0.3; done"
 t exec "nginx version" "docker exec web nginx -v"
@@ -88,6 +94,17 @@ t failed-start-frees-root "gone mounts=0" "docker rm -f kiri-badsysctl >/dev/nul
 t failed-start-no-dns "none" "docker network create kiri-dnsfail >/dev/null 2>&1; docker rm -f kiri-dnsbad >/dev/null 2>&1; docker run -d --name kiri-dnsbad --network kiri-dnsfail --sysctl net.ipv4.kiri_no_such_key=1 alpine sleep 60 >/dev/null 2>&1; docker run --rm --network kiri-dnsfail alpine sh -c 'nslookup kiri-dnsbad 2>&1 | grep -qE \"^Address: [0-9.]+\$\" && echo answered || echo none'; docker rm -f kiri-dnsbad >/dev/null 2>&1; docker network rm kiri-dnsfail >/dev/null"
 t cp-stopped-unmounts "after=0" "id=\$(docker create alpine true); docker cp /etc/hostname \$id:/f >/dev/null; for i in \$(seq 20); do [ \$($mounts) = 0 ] && break; sleep 0.1; done; echo after=\$($mounts); docker rm \$id >/dev/null"
 t commit-renamed-dir "kept" "docker rm -f kiri-rename >/dev/null 2>&1; docker run --name kiri-rename alpine mv /etc/apk /etc/apk2; docker commit kiri-rename kiri-rename-test >/dev/null; docker rm -f kiri-rename >/dev/null; docker run --rm kiri-rename-test sh -c 'test -f /etc/apk2/repositories && echo kept'; docker rmi kiri-rename-test >/dev/null"
+t diff-no-marker "marker lines: 0" "docker rm -f lh-mkr >/dev/null 2>&1; docker run --name lh-mkr alpine sh -c 'echo hi > /added' && echo marker lines: \$(docker diff lh-mkr | grep -c dockerenv)"
+t export-has-marker ".dockerenv" "docker export lh-mkr | tar -t | grep -Fx .dockerenv"
+t commit-no-marker "clean" "docker commit lh-mkr kiri-test/marker-committed:1 >/dev/null && docker save kiri-test/marker-committed:1 | python3 -c 'import io, sys, tarfile
+names = []
+image = tarfile.open(fileobj=io.BytesIO(sys.stdin.buffer.read()))
+for blob in filter(tarfile.TarInfo.isfile, image):
+    try:
+        names += tarfile.open(fileobj=image.extractfile(blob)).getnames()
+    except tarfile.TarError:
+        pass
+print(\"clean\" if \"added\" in names and not {\".dockerenv\", \"./.dockerenv\"} & set(names) else names)'; docker rm -f lh-mkr >/dev/null; docker rmi kiri-test/marker-committed:1 >/dev/null 2>&1"
 # A layer whose directory has empty size, uid and gid fields: Docker reads an
 # empty number as 0 (#618, mcr.microsoft.com/azure-messaging/servicebus-emulator).
 $D cp "$(dirname "$0")/lib/tar-empty-numbers.py" "$N":/tar-empty-numbers.py >/dev/null

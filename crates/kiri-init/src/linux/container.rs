@@ -43,6 +43,9 @@ const LAST_CAP: u32 = 40;
 
 const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
+/// The file Docker puts in every container's root, relative to that root.
+pub const MARKER: &CStr = c".dockerenv";
+
 /// What networking the agent can offer a new container right now.
 pub struct NetCtx<'a> {
     pub bridges: &'a mut Bridges,
@@ -1853,6 +1856,28 @@ fn bind_file(root: BorrowedFd<'_>, src: &CStr, target: &CStr) -> io::Result<()> 
     sys::mount(src, &at.proc_path(), c"none", libc::MS_BIND, None)
 }
 
+/// Docker's `/.dockerenv`: an empty file, 0755, owned by root. Whatever the
+/// image (or an earlier start) has there stays as it is: O_EXCL never
+/// follows a link, so one that points out of the container is not written
+/// through, and a link or directory there does not fail the start.
+fn make_marker(root: BorrowedFd<'_>) -> io::Result<()> {
+    // SAFETY: valid directory fd and NUL-terminated name.
+    let fd = unsafe { libc::openat(root.as_raw_fd(), MARKER.as_ptr(), libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC, 0o755) };
+    if fd >= 0 {
+        // SAFETY: the descriptor opened just above, owned by nothing else;
+        // openat applies the process's umask, so set 0755 explicitly.
+        unsafe {
+            libc::fchmod(fd, 0o755);
+            libc::close(fd);
+        }
+        return Ok(());
+    }
+    match io::Error::last_os_error() {
+        e if e.raw_os_error() == Some(libc::EEXIST) => Ok(()),
+        e => Err(e),
+    }
+}
+
 /// Where the child reports a failure before it has execed: the stderr pipe,
 /// or the pty socket (the agent reads text there instead of a descriptor).
 fn report_fd(io: &ChildStdio) -> RawFd {
@@ -1970,6 +1995,10 @@ fn container_child(p: &Prepared, rootfs: &CStr, io: &ChildStdio, close_first: &[
     for (src, target) in &p.etc_files {
         bind_file(root, src, target).unwrap_or_else(|e| fail(&target.to_string_lossy(), e));
     }
+    // SDKs use Docker's marker to detect container execution when cgroup
+    // namespaces hide the host's cgroup path. Made before changing user or
+    // making the root filesystem read-only.
+    make_marker(root).unwrap_or_else(|e| fail("container marker", e));
     // The image's tree without the mounts made on it, for filling new
     // volumes; closed (and so unmounted) once they are all in place.
     let image = if p.mounts.iter().any(|m| m.copy_up) { image_tree() } else { None };
@@ -3391,6 +3420,52 @@ mod tests {
         assert_eq!(fwd, [[8, 8, 8, 8]], "--dns servers are forwarded to");
         assert!(super::joined_user_network("nameserver 127.0.0.11\n", kiri).is_none(), "already on the embedded DNS");
         assert!(super::joined_user_network("", kiri).is_none(), "no file to speak of");
+    }
+
+    /// The marker is made empty where the root has none. What is there
+    /// already stays: a file (a restart), a directory, and a link, whose
+    /// target outside the root is neither made nor touched.
+    #[test]
+    fn marker_is_made_once_and_never_through_a_link() {
+        use std::os::fd::AsFd;
+        use std::os::unix::fs::MetadataExt;
+        let base = std::env::temp_dir().join(format!("kiri-marker-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (plain, linked, linked_existing, dir) = (base.join("plain"), base.join("linked"), base.join("linked-existing"), base.join("dir"));
+        let marker = |root: &std::path::Path| root.join(super::MARKER.to_str().unwrap());
+        let make = |root: &std::path::Path| super::make_marker(super::inroot::open_root(root).unwrap().as_fd());
+        for root in [&plain, &linked, &linked_existing, &dir] {
+            std::fs::create_dir_all(root).unwrap();
+        }
+
+        make(&plain).unwrap();
+        let meta = std::fs::symlink_metadata(marker(&plain)).unwrap();
+        assert!(meta.is_file() && meta.len() == 0);
+        assert_eq!(meta.mode() & 0o7777, 0o755);
+        std::fs::write(marker(&plain), b"kept").unwrap();
+        set_mode(&marker(&plain), 0o640);
+        make(&plain).unwrap();
+        assert_eq!(std::fs::read(marker(&plain)).unwrap(), b"kept");
+        assert_eq!(mode_of(&marker(&plain)), 0o640);
+
+        std::os::unix::fs::symlink(base.join("outside"), marker(&linked)).unwrap();
+        make(&linked).unwrap();
+        assert!(std::fs::symlink_metadata(marker(&linked)).unwrap().file_type().is_symlink());
+        assert!(!base.join("outside").exists(), "made through the link");
+
+        let existing = base.join("existing");
+        std::fs::write(&existing, b"host").unwrap();
+        set_mode(&existing, 0o600);
+        std::os::unix::fs::symlink(&existing, marker(&linked_existing)).unwrap();
+        make(&linked_existing).unwrap();
+        assert!(std::fs::symlink_metadata(marker(&linked_existing)).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read(&existing).unwrap(), b"host");
+        assert_eq!(mode_of(&existing), 0o600);
+
+        std::fs::create_dir(marker(&dir)).unwrap();
+        make(&dir).unwrap();
+        assert!(marker(&dir).is_dir());
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]

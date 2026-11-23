@@ -230,3 +230,12 @@ import-volume-xattrs	#485	kiri import used docker cp and BusyBox tar, silently d
 clone3-seccomp-fallback	#529	when an outer seccomp filter blocks clone3 with ENOSYS or EPERM (Android/Droidspaces, restricted Docker), containers and docker exec failed to start instead of falling back to clone(2)
 finder-symlink-is-link	#648	the Finder NFS mount reported container symlinks as their targets instead of symlinks, so directory symlink loops (/usr/bin/X11 -> .) caused infinite Finder and Spotlight recursion
 finder-no-proc-sys	#648	the Finder NFS mount exposed the kernel's /proc and /sys filesystems, whose symlink cycles and pseudo-files kept Spotlight and the VM at 100% CPU
+container-marker	#131	containers lacked /.dockerenv (empty regular file, 0755, root:root), breaking SDK container detection under cgroup v2 namespaces
+container-marker-nonroot	#131	/.dockerenv must exist and be readable by non-root container users
+container-marker-readonly	#131	/.dockerenv must be created before a --read-only rootfs is remounted read-only
+container-marker-readonly-nonroot	#131	/.dockerenv must exist and be readable on a --read-only rootfs for non-root users
+container-marker-restart	#131	restarting a container that already has /.dockerenv must succeed and keep the marker
+container-marker-link	#131	a symlink at /.dockerenv in the image must not be followed on container start
+diff-no-marker	#131	an untouched /.dockerenv created by the engine must not appear in docker diff
+export-has-marker	#131	docker export must include /.dockerenv as Docker does
+commit-no-marker	#131	docker commit must not include an untouched /.dockerenv in the committed layer

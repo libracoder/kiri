@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #131 Containers: expose /.dockerenv for SDK detection (unreleased)
+- Fixes: no issue
+- Caused: none known
+- Caused by: -
+- Check: `container-marker`, `container-marker-nonroot`, `container-marker-readonly`, `container-marker-readonly-nonroot`, `container-marker-restart`, `container-marker-link`, `diff-no-marker`, `export-has-marker`, `commit-no-marker`
+
 ### #655 Finder: show container symlinks as symlinks and omit /proc and /sys (unreleased)
 - Fixes: #648 Finder mount (~/Kiri) causes 100% CPU via infinite directory recursion on container symlinks
 - Caused: none known
