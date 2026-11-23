@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #779 Bench: fail the API benchmark on curl errors instead of timing failed runs (unreleased)
+- Fixes: #669 `bench/api.sh` passes `--ignore-failure` to `hyperfine` on `api-exec`, masking curl failures and recording time-to-failure as valid timings
+- Caused: none known
+- Caused by: -
+- Check: none
+
 ### #545 Linux: a memory limit gets as much swap again, and `--memory-swap` is applied, as on Docker (unreleased)
 - Fixes: #523 Linux: containers with `--memory` get `memory.swap.max = 0` and `--memory-swap` is ignored; #690
 - Caused: none known
