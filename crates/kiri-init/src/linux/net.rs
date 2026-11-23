@@ -81,6 +81,67 @@ impl Plug {
     }
 }
 
+/// A network a container can reach the outside through: one that is not
+/// `--internal`, with the gateways it offers. Kept per running container, in
+/// the order its networks were plugged in, so that a disconnect can hand the
+/// default route on to the next one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Uplink {
+    /// Host side of its veth, which names the attachment on a disconnect.
+    pub veth: String,
+    /// Its interface in the container: `eth0`, `eth1` …
+    pub ifname: String,
+    pub v4: Option<[u8; 4]>,
+    pub v6: Option<[u8; 16]>,
+}
+
+impl Uplink {
+    /// None for an internal network, which never gives a default route.
+    pub fn of(veth: &str, ifname: &str, gateway: [u8; 4], v6: Option<Ip6>, plug: Plug) -> Option<Uplink> {
+        let v4 = (!plug.internal && !plug.no_ipv4).then_some(gateway);
+        let v6 = v6.filter(|_| !plug.internal).map(|v| v.gateway);
+        (v4.is_some() || v6.is_some()).then(|| Uplink { veth: veth.to_owned(), ifname: ifname.to_owned(), v4, v6 })
+    }
+}
+
+/// The uplinks that hold the IPv4 and the IPv6 default route: for each, the
+/// first one plugged in that has it. `attach` adds every uplink's route and
+/// the kernel keeps the first (the later ones are EEXIST), so this is the
+/// same choice. Docker would take the network whose name sorts first among
+/// equals; keeping the first is steadier: plugging in a network never moves
+/// a running container's traffic.
+pub fn route_holders(uplinks: &[Uplink]) -> (Option<&Uplink>, Option<&Uplink>) {
+    (uplinks.iter().find(|u| u.v4.is_some()), uplinks.iter().find(|u| u.v6.is_some()))
+}
+
+/// Takes the attachment whose host veth is `veth` out of `uplinks`, after it
+/// was unplugged. If it held a default route, the next uplink gets it, as
+/// Docker moves the default gateway when a container leaves that network;
+/// with none left the container has no default route, as on internal-only
+/// networks. The kernel dropped the old route with the interface.
+pub fn hand_over_default_routes(pid: libc::pid_t, uplinks: &mut Vec<Uplink>, veth: &str) -> io::Result<()> {
+    let (old4, old6) = route_holders(uplinks);
+    let (was4, was6) = (old4.is_some_and(|u| u.veth == veth), old6.is_some_and(|u| u.veth == veth));
+    uplinks.retain(|u| u.veth != veth);
+    if !was4 && !was6 {
+        return Ok(());
+    }
+    let (new4, new6) = route_holders(uplinks);
+    let (new4, new6) = (new4.filter(|_| was4), new6.filter(|_| was6));
+    if new4.is_none() && new6.is_none() {
+        return Ok(());
+    }
+    let netns = std::fs::File::open(format!("/proc/{pid}/ns/net"))?;
+    let mut inner = Netlink::open_in(&netns)?;
+    if let Some(u) = new4 {
+        netlink::replace_default_route(&mut inner, netlink::index_in(&netns, &u.ifname)?, u.v4.unwrap_or_default())?;
+    }
+    if let Some(u) = new6 {
+        netlink::replace_default_route6(&mut inner, netlink::index_in(&netns, &u.ifname)?, u.v6.unwrap_or_default())?;
+    }
+    Ok(())
+}
+
 pub fn ip6_str(a: [u8; 16]) -> String {
     std::net::Ipv6Addr::from(a).to_string()
 }
@@ -714,11 +775,13 @@ pub fn attach_container(
     attach(bridges, bridge, host_ifname, pid, 0, ip, prefix, gateway, mac, v6, plug)
 }
 
-/// Plugs the container into `bridge` as `eth{n}`. Only `eth0` gets the
-/// default route; more networks add their subnets, as with Docker. The
-/// first network with IPv6 gives the IPv6 default route. An `internal`
-/// network gives no default route at all, so traffic beyond it fails at
-/// once (unreachable), as with Docker. On a network without IPv6 the
+/// Plugs the container into `bridge` as `eth{n}`. The first non-internal
+/// network with IPv4 gives the IPv4 default route, even when it is not
+/// `eth0` (an internal network first, an outside one second); later ones
+/// keep it, and only add their subnets. The same goes for IPv6. An
+/// `internal` network never gives a default route, so traffic beyond it
+/// fails at once (unreachable), as with Docker. `hand_over_default_routes`
+/// moves a route on when its network is disconnected. On a network without IPv6 the
 /// interface has IPv6 off (no link-local address), as Docker does. On an
 /// IPv6-only network `ip` is only the name the container is kept by (its
 /// MAC is made from it): neither the interface nor the bridge gets it.
@@ -749,7 +812,7 @@ pub fn attach(bridges: &mut Bridges, bridge: &str, host_ifname: &str, pid: libc:
         netlink::add_address6(&mut inner, index, v.ip, v.prefix)?;
     }
     netlink::set_up(&mut inner, index)?;
-    if n == 0 && !internal && !no_ipv4 {
+    if !internal && !no_ipv4 {
         netlink::add_default_route(&mut inner, index, gateway)?;
     }
     if let Some(v) = v6.filter(|_| !internal) {
@@ -838,5 +901,37 @@ fd00000000000000000000000000000000 40 00000000000000000000000000000000 00 000000
         assert_eq!(default_route6_iface(routes).as_deref(), Some("wlan0"));
         // Only the unreachable default on lo: no IPv6 uplink.
         assert_eq!(default_route6_iface(&routes.lines().skip(2).collect::<Vec<_>>().join("\n")), None);
+    }
+
+    fn up(veth: &str, v4: bool, v6: bool) -> Uplink {
+        Uplink { veth: veth.into(), ifname: veth.into(), v4: v4.then_some([10, 0, 0, 1]), v6: v6.then_some([0xfd; 16]) }
+    }
+
+    #[test]
+    fn internal_networks_are_no_uplink() {
+        let v6 = Some(Ip6 { ip: [0xfd; 16], prefix: 64, gateway: [0xfd; 16] });
+        assert_eq!(Uplink::of("kv1", "eth0", [10, 0, 0, 1], v6, Plug { internal: true, no_ipv4: false }), None);
+        let u = Uplink::of("kv1", "eth1", [10, 0, 0, 1], None, Plug::default()).unwrap();
+        assert_eq!((u.ifname.as_str(), u.v4, u.v6), ("eth1", Some([10, 0, 0, 1]), None));
+        let u = Uplink::of("kv1", "eth1", [10, 0, 0, 1], v6, Plug { internal: false, no_ipv4: true }).unwrap();
+        assert_eq!((u.v4, u.v6), (None, Some([0xfd; 16])));
+    }
+
+    #[test]
+    fn the_first_uplink_with_each_family_holds_its_default_route() {
+        let ups = [up("a", false, true), up("b", true, false), up("c", true, true)];
+        let (r4, r6) = route_holders(&ups);
+        assert_eq!((r4.map(|u| u.veth.as_str()), r6.map(|u| u.veth.as_str())), (Some("b"), Some("a")));
+        assert_eq!(route_holders(&[]), (None, None));
+    }
+
+    #[test]
+    fn a_disconnect_that_takes_no_default_route_touches_nothing() {
+        // The pid is never used: nothing to hand over, so no namespace is opened.
+        let mut ups = vec![up("a", true, true), up("b", true, true)];
+        hand_over_default_routes(-1, &mut ups, "b").unwrap();
+        assert_eq!(ups, [up("a", true, true)]);
+        hand_over_default_routes(-1, &mut ups, "a").unwrap();
+        assert!(ups.is_empty());
     }
 }

@@ -90,6 +90,9 @@ pub struct Process {
     /// network namespace would otherwise keep them, and the address that
     /// goes back to the pool, alive.
     pub veths: Vec<String>,
+    /// Its non-internal networks, in the order they were plugged in: which
+    /// one takes the default route when the one holding it is disconnected.
+    pub uplinks: Vec<net::Uplink>,
     /// Inode of its own network namespace, or of the one it joined; 0 for
     /// the host's and for execs. Says whether a namespace outlives this
     /// container (see `teardown`).
@@ -253,6 +256,7 @@ impl Process {
             tty: false,
             dns_entries: Vec::new(),
             veths: Vec::new(),
+            uplinks: Vec::new(),
             netns: 0,
             joins_netns: false,
             seccomp: Vec::new(),
@@ -722,6 +726,7 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
         Err(e) => return Err(kill_child(e)),
     }
     let mut veths = Vec::new();
+    let mut uplinks = Vec::new();
     // Names, AAAA records and `--dns` servers to give the DNS server, once
     // nothing can fail any more: a failed start must not leave its names
     // answering (#325). Nothing is answered before then anyway, since the
@@ -747,6 +752,7 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
         let plug = net::Plug::from_opts(spec.net.opts);
         net::attach_container(net.bridges, spec.net.bridge, &host_if, pid, spec.net.ip, spec.net.prefix, spec.net.gateway, mac, v6, plug)
             .map_err(|e| kill_child(io::Error::new(e.kind(), format!("network: {e}"))))?;
+        uplinks.extend(net::Uplink::of(&host_if, "eth0", spec.net.gateway, v6, plug));
         veths.push(host_if);
         if embedded_dns {
             if let Some(name) = net_opts::values(spec.net.opts, net_opts::NETWORK).next() {
@@ -830,6 +836,7 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
         tty: prepared.tty,
         dns_entries: (bridged && embedded_dns).then(|| (spec.net.bridge.to_owned(), spec.net.ip)).into_iter().collect(),
         veths,
+        uplinks,
         netns,
         joins_netns: net_opts::values(spec.net.opts, net_opts::NETNS).next().is_some(),
         seccomp: spec.seccomp.to_vec(),
@@ -1026,6 +1033,7 @@ pub fn exec(spec: &ExecSpec<'_>, target_pid: libc::pid_t, paths: &Paths, profile
         tty: prepared.tty,
         dns_entries: Vec::new(),
         veths: Vec::new(),
+        uplinks: Vec::new(),
         netns: 0,
         joins_netns: false,
         seccomp: Vec::new(),

@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #193 Networks: give secondary external networks an IPv4 default route and hand default routes over on disconnect (unreleased)
+- Fixes: #381 macOS: no IPv4 default route when an internal network occupies eth0
+- Caused: none known
+- Caused by: -
+- Check: `connect-keeps-default`, `internal-first-no-default`, `internal-first-external-default`, `internal-first-external-restart`, `disconnect-last-external-no-default`, `internal-first-second-external`, `disconnect-hands-default-on`, `internal-first-ipv6-no-default`, `disconnect-hands-ipv6-default-on`
+
 ### #759 Engine: inspect gives back HostConfig's Binds, Mounts and Tmpfs, so a recreate keeps its volumes (unreleased)
 - Fixes: #610 Engine: `docker inspect` drops `HostConfig.Binds`, `HostConfig.Mounts`, `HostConfig.Tmpfs` and `Config.Volumes`, so Watchtower, Portainer and Arcane lose volumes and binds when recreating containers
 - Caused: none known

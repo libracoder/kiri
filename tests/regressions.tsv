@@ -242,3 +242,12 @@ commit-no-marker	#131	docker commit must not include an untouched /.dockerenv in
 inspect-binds	#610	docker inspect omitted HostConfig.Binds, dropping -v binds, named volumes and socket paths on container recreate
 inspect-mounts-tmpfs	#610	docker inspect omitted HostConfig.Mounts, HostConfig.Tmpfs and Config.Volumes
 inspect-recreate-mounts	#610	recreating a container from its inspect Config and HostConfig (Watchtower, Portainer, Arcane) lost its volumes, read-only binds, tmpfs and socket mounts
+connect-keeps-default	#381	connecting a second external network must keep the first external network's IPv4 default route without adding a duplicate
+internal-first-no-default	#381	an --internal network on eth0 must never supply an IPv4 default route
+internal-first-external-default	#381	a container with an --internal network on eth0 and an external network on eth1 got no IPv4 default route
+internal-first-external-restart	#381	restarting a container whose eth0 is --internal and eth1 is external must restore the IPv4 default route on eth1
+disconnect-last-external-no-default	#381	disconnecting the last external network must leave a container on --internal networks with no default route
+internal-first-second-external	#381	attaching a second external network after an --internal primary network must keep the first external network's default route
+disconnect-hands-default-on	#381	disconnecting the external network that holds the IPv4 default route must hand the default route over to the next remaining external network
+internal-first-ipv6-no-default	#381	an --internal IPv6 network on eth0 must never supply an IPv6 default route
+disconnect-hands-ipv6-default-on	#381	disconnecting the external IPv6 network that holds the IPv6 default route must hand the default route over to the next remaining external IPv6 network

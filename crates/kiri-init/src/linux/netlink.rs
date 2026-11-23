@@ -350,30 +350,36 @@ pub fn add_address6(nl: &mut Netlink, index: i32, addr: [u8; 16], prefix: u8) ->
 /// The IPv6 default route through `gateway` on `index`. The first network
 /// with IPv6 a container joins keeps it: a second one is EEXIST, left be.
 pub fn add_default_route6(nl: &mut Netlink, index: i32, gateway: [u8; 16]) -> io::Result<()> {
-    let mut m = Msg::new(RTM_NEWROUTE, NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL);
-    let mut rt = [0u8; 12];
-    rt[0] = libc::AF_INET6 as u8;
-    rt[4] = libc::RT_TABLE_MAIN;
-    rt[5] = libc::RTPROT_BOOT;
-    rt[6] = libc::RT_SCOPE_UNIVERSE;
-    rt[7] = libc::RTN_UNICAST;
-    m.raw(&rt).attr(RTA_GATEWAY, &gateway).attr_u32(RTA_OIF, index as u32);
-    match nl.request(&mut [m]) {
-        Err(e) if e.raw_os_error() == Some(libc::EEXIST) => Ok(()),
-        r => r,
-    }
+    default_route(nl, libc::AF_INET6, &gateway, index, NLM_F_EXCL)
 }
 
+/// The IPv4 default route through `gateway` on `index`. As with IPv6 the
+/// first non-internal network keeps it: without EXCL Linux would take a
+/// second default of the same metric, and send through either.
 pub fn add_default_route(nl: &mut Netlink, index: i32, gateway: [u8; 4]) -> io::Result<()> {
-    let mut m = Msg::new(RTM_NEWROUTE, NLM_F_ACK | NLM_F_CREATE);
+    default_route(nl, libc::AF_INET, &gateway, index, NLM_F_EXCL)
+}
+
+/// Moves the IPv4 default route to `gateway` on `index`, or adds it.
+pub fn replace_default_route(nl: &mut Netlink, index: i32, gateway: [u8; 4]) -> io::Result<()> {
+    default_route(nl, libc::AF_INET, &gateway, index, NLM_F_REPLACE)
+}
+
+/// Moves the IPv6 default route to `gateway` on `index`, or adds it.
+pub fn replace_default_route6(nl: &mut Netlink, index: i32, gateway: [u8; 16]) -> io::Result<()> {
+    default_route(nl, libc::AF_INET6, &gateway, index, NLM_F_REPLACE)
+}
+
+fn default_route(nl: &mut Netlink, family: i32, gateway: &[u8], index: i32, flags: u16) -> io::Result<()> {
+    let mut m = Msg::new(RTM_NEWROUTE, NLM_F_ACK | NLM_F_CREATE | flags);
     // struct rtmsg: family, dst_len, src_len, tos, table, protocol, scope, type, flags.
     let mut rt = [0u8; 12];
-    rt[0] = libc::AF_INET as u8;
+    rt[0] = family as u8;
     rt[4] = libc::RT_TABLE_MAIN;
     rt[5] = libc::RTPROT_BOOT;
     rt[6] = libc::RT_SCOPE_UNIVERSE;
     rt[7] = libc::RTN_UNICAST;
-    m.raw(&rt).attr(RTA_GATEWAY, &gateway).attr_u32(RTA_OIF, index as u32);
+    m.raw(&rt).attr(RTA_GATEWAY, gateway).attr_u32(RTA_OIF, index as u32);
     match nl.request(&mut [m]) {
         Err(e) if e.raw_os_error() == Some(libc::EEXIST) => Ok(()),
         r => r,
