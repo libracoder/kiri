@@ -252,3 +252,5 @@ disconnect-hands-default-on	#381	disconnecting the external network that holds t
 internal-first-ipv6-no-default	#381	an --internal IPv6 network on eth0 must never supply an IPv6 default route
 disconnect-hands-ipv6-default-on	#381	disconnecting the external IPv6 network that holds the IPv6 default route must hand the default route over to the next remaining external IPv6 network
 inspect-exposed-udp	#620	docker inspect dropped non-TCP exposed ports (such as 53/udp or 132/sctp) from Config.ExposedPorts and NetworkSettings.Ports
+userns-run	#597	when the Linux engine runs inside a user namespace (nested Docker, Coder, Sysbox), container start failed on mknod /dev/null (EPERM) and on raising the default nofile rlimit past the engine's hard limit
+userns-run-privileged	#597	when the Linux engine runs inside a user namespace, --privileged containers skipped standard /dev nodes after copy_host_devices failed mknod with EPERM

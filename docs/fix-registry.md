@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #597 Linux host: start containers when the engine runs in a user namespace (unreleased)
+- Fixes: #597 Linux host: containers fail to start when the engine runs in a user namespace (`mknod dev/null: Operation not permitted`, default `nofile` above `rlim_max`)
+- Caused: none known
+- Caused by: -
+- Check: `userns-run`, `userns-run-privileged`
+
 ### #620 Engine: inspect keeps an exposed port's protocol, UDP included (unreleased)
 - Fixes: no issue
 - Caused: none known

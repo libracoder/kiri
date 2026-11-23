@@ -572,7 +572,18 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
     // and ping without root. Host networking, and `--network container:`
     // (that container already has them), keep what they have.
     if spec.flags & run_flags::NET_HOST == 0 && prepared.net_join.is_none() {
+        let had_ping = host.sysctls.iter().any(|s| s.path == "net/ipv4/ping_group_range");
         super::hostopts::add_net_defaults(&mut host.sysctls);
+        if !had_ping
+            && let Ok(map) = fs::read_to_string("/proc/self/gid_map")
+        {
+            let max = ping_group_max(&map);
+            if max < DEFAULT_PING_MAX
+                && let Some(s) = host.sysctls.iter_mut().find(|s| s.path == "net/ipv4/ping_group_range")
+            {
+                s.value = format!("0 {max}");
+            }
+        }
     }
     let bridged = !spec.net.bridge.is_empty() && spec.flags & (run_flags::NET_HOST | run_flags::NET_NONE) == 0 && prepared.net_join.is_none();
     let mut go = None;
@@ -2164,7 +2175,7 @@ fn finish_child(p: &Prepared, io: &ChildStdio, console: bool) -> ! {
 
     // While still root with every capability: raising a hard limit needs
     // CAP_SYS_RESOURCE.
-    super::hostopts::set_rlimits(&p.host.rlimits).unwrap_or_else(|e| fail("ulimits", e));
+    apply_rlimits(&p.host.rlimits).unwrap_or_else(|e| fail("ulimits", e));
 
     for cap in 0..=LAST_CAP {
         if !p.privileged && p.caps & (1 << cap) == 0 {
@@ -2316,22 +2327,19 @@ fn mount_container_filesystems(privileged: bool, shm_size: u64, host: &HostAppli
     if privileged {
         copy_host_devices(Path::new("/dev"), Path::new("dev"))?;
     }
-    for (name, major, minor) in [
-        (c"dev/null", 1, 3),
-        (c"dev/zero", 1, 5),
-        (c"dev/full", 1, 7),
-        (c"dev/random", 1, 8),
-        (c"dev/urandom", 1, 9),
-        (c"dev/tty", 5, 0),
+    for (host, name, major, minor) in [
+        (c"/dev/null", c"dev/null", 1, 3),
+        (c"/dev/zero", c"dev/zero", 1, 5),
+        (c"/dev/full", c"dev/full", 1, 7),
+        (c"/dev/random", c"dev/random", 1, 8),
+        (c"/dev/urandom", c"dev/urandom", 1, 9),
+        (c"/dev/tty", c"dev/tty", 5, 0),
     ] {
-        if privileged {
+        if privileged && is_char_dev(name) {
             // Copied from the host already.
             continue;
         }
-        sys::mknod(name, libc::S_IFCHR | 0o666, major, minor)?;
-        // mknod applies the umask; every user in the container needs these.
-        // SAFETY: valid NUL-terminated path.
-        unsafe { libc::chmod(name.as_ptr(), 0o666) };
+        make_or_bind_dev(host, name, major, minor)?;
     }
     // The host's /proc still, before the pivot.
     for (target, link) in dev_links(Path::new("/proc/kcore").exists()) {
@@ -2358,6 +2366,117 @@ fn mount_container_filesystems(privileged: bool, shm_size: u64, host: &HostAppli
         mask_proc();
     }
     Ok(())
+}
+
+/// The default `nofile` soft and hard limit the daemon sends when a run sets
+/// no `--ulimit nofile=...` of its own.
+const DEFAULT_NOFILE: u64 = 1_048_576;
+const DEFAULT_PING_MAX: u64 = 2_147_483_647;
+
+/// The highest group id in the `/proc/self/gid_map` extent that maps 0,
+/// clamped to `2147483647`. In the initial user namespace (`0 0 4294967295`)
+/// this is `2147483647`; in a user namespace (`0 0 65536`) the kernel refuses
+/// any upper bound that is not mapped (`EINVAL` on `ping_group_range`, #597).
+fn ping_group_max(gid_map: &str) -> u64 {
+    for line in gid_map.lines() {
+        let mut f = line.split_whitespace();
+        if let (Some("0"), Some(_outer), Some(count)) = (f.next(), f.next(), f.next())
+            && let Ok(n) = count.parse::<u64>()
+            && n > 0
+        {
+            return (n - 1).min(DEFAULT_PING_MAX);
+        }
+    }
+    DEFAULT_PING_MAX
+}
+
+/// Caps the default `nofile` limit (`1048576:1048576`) to `rlim_max` when the
+/// engine's own hard limit is lower (as in a user namespace or a nested
+/// container with a `524288` ceiling, where raising past it is refused). An
+/// explicit `--ulimit nofile=...` is left as given, so a lower value applies
+/// and one above `rlim_max` still fails with the kernel's error.
+fn cap_default_nofile(rlimits: &mut [(u32, u64, u64)], rlim_max: u64) -> bool {
+    let mut capped = false;
+    if rlim_max > 0 && rlim_max < DEFAULT_NOFILE {
+        for (res, soft, hard) in rlimits {
+            if *res == libc::RLIMIT_NOFILE as u32 && *soft == DEFAULT_NOFILE && *hard == DEFAULT_NOFILE {
+                *soft = rlim_max;
+                *hard = rlim_max;
+                capped = true;
+            }
+        }
+    }
+    capped
+}
+
+/// Applies resource limits, falling back to the engine's own hard `nofile`
+/// limit if the default `1048576` is refused with `EPERM` (#597).
+fn apply_rlimits(rlimits: &[(u32, u64, u64)]) -> io::Result<()> {
+    match super::hostopts::set_rlimits(rlimits) {
+        Ok(()) => Ok(()),
+        Err(e) if e.raw_os_error() == Some(libc::EPERM) || e.kind() == io::ErrorKind::PermissionDenied => {
+            let mut rl = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+            // SAFETY: valid writable rlimit struct.
+            if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } != 0 {
+                return Err(e);
+            }
+            let mut capped = rlimits.to_vec();
+            if !cap_default_nofile(&mut capped, rl.rlim_max) {
+                return Err(e);
+            }
+            super::hostopts::set_rlimits(&capped)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether `path` already exists as a character device node (never following a symlink).
+fn is_char_dev(path: &CStr) -> bool {
+    fstat_at(libc::AT_FDCWD, path, libc::AT_SYMLINK_NOFOLLOW)
+        .is_ok_and(|st| st.st_mode & libc::S_IFMT == libc::S_IFCHR)
+}
+
+/// Creates a standard character device node at `target` on the container's
+/// fresh `/dev` tmpfs, or, when `mknod` is refused in a user namespace
+/// (`EPERM`), bind-mounts `host` onto a newly created empty file at `target`,
+/// as runc does (#597).
+fn make_or_bind_dev(host: &CStr, target: &CStr, major: u32, minor: u32) -> io::Result<()> {
+    match sys::mknod(target, libc::S_IFCHR | 0o666, major, minor) {
+        Ok(()) => {
+            // mknod applies the umask; every user in the container needs these.
+            // SAFETY: valid NUL-terminated path.
+            unsafe { libc::chmod(target.as_ptr(), 0o666) };
+            Ok(())
+        }
+        Err(e) if e.raw_os_error() == Some(libc::EPERM) || e.kind() == io::ErrorKind::PermissionDenied => {
+            let (host_fd, target_fd) = prepare_dev_bind(host, target)?;
+            let src = CString::new(format!("/proc/self/fd/{}", host_fd.as_raw_fd())).expect("no NUL");
+            let dst = CString::new(format!("/proc/self/fd/{}", target_fd.as_raw_fd())).expect("no NUL");
+            sys::mount(&src, &dst, c"none", libc::MS_BIND, None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Verifies that `host` is a real character device (not a symlink or other
+/// file) and creates an empty regular mountpoint file at `target` without
+/// following symlinks or overwriting an existing entry.
+fn prepare_dev_bind(host: &CStr, target: &CStr) -> io::Result<(OwnedFd, OwnedFd)> {
+    let host_fd = open_at(libc::AT_FDCWD, host, libc::O_PATH | libc::O_NOFOLLOW)?;
+    let st = fstat_at(host_fd.as_raw_fd(), c"", libc::AT_EMPTY_PATH)?;
+    if st.st_mode & libc::S_IFMT != libc::S_IFCHR {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a character device", host.to_string_lossy()),
+        ));
+    }
+    let target_fd = open_at_mode(
+        libc::AT_FDCWD,
+        target,
+        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW,
+        0o666,
+    )?;
+    Ok((host_fd, target_fd))
 }
 
 /// The links runc makes in a container's /dev (relative to its root):
@@ -3766,5 +3885,90 @@ mod tests {
             super::cgroup_of_proc(hybrid, "1:name=systemd:/\n0::/\n"),
             (String::new(), hybrid.to_path_buf())
         );
+    }
+
+    /// In a user namespace or nested container whose hard `nofile` limit is
+    /// below the default `1048576` (#597), only the default `nofile` entry is
+    /// clamped to `rlim_max`; explicit `--ulimit nofile=...` values and other
+    /// resources stay untouched.
+    #[test]
+    fn cap_default_nofile_clamps_only_the_default_nofile_limit() {
+        let nofile = libc::RLIMIT_NOFILE as u32;
+        let nproc = libc::RLIMIT_NPROC as u32;
+        let mut lims = vec![(nproc, 100, 200), (nofile, super::DEFAULT_NOFILE, super::DEFAULT_NOFILE)];
+        assert!(super::cap_default_nofile(&mut lims, 524_288));
+        assert_eq!(lims, [(nproc, 100, 200), (nofile, 524_288, 524_288)]);
+
+        let mut high_host = vec![(nofile, super::DEFAULT_NOFILE, super::DEFAULT_NOFILE)];
+        assert!(!super::cap_default_nofile(&mut high_host, super::DEFAULT_NOFILE));
+        assert!(!super::cap_default_nofile(&mut high_host, 2_097_152));
+        assert!(!super::cap_default_nofile(&mut high_host, 0));
+        assert_eq!(high_host, [(nofile, super::DEFAULT_NOFILE, super::DEFAULT_NOFILE)]);
+
+        let mut explicit = vec![(nofile, 65_536, 65_536), (nofile, 600_000, 600_000), (nofile, 65_536, super::DEFAULT_NOFILE)];
+        assert!(!super::cap_default_nofile(&mut explicit, 524_288));
+        assert_eq!(
+            explicit,
+            [(nofile, 65_536, 65_536), (nofile, 600_000, 600_000), (nofile, 65_536, super::DEFAULT_NOFILE)]
+        );
+        assert_eq!(super::ping_group_max("         0          0 4294967295\n"), super::DEFAULT_PING_MAX);
+        assert_eq!(super::ping_group_max("         0          0      65536\n"), 65_535);
+        assert_eq!(super::ping_group_max("         0       1000          1\n         1     100000      65536\n"), 0);
+        assert_eq!(super::ping_group_max(""), super::DEFAULT_PING_MAX);
+    }
+
+    /// When `mknod` is refused in a user namespace (#597), `prepare_dev_bind`
+    /// verifies the host source is a real character device (never following a
+    /// symlink) and creates the mountpoint file with `O_CREAT | O_EXCL |
+    /// O_NOFOLLOW` so a symlink or existing file at the target is refused.
+    #[test]
+    fn prepare_dev_bind_verifies_char_device_and_refuses_symlinks() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::symlink;
+
+        let (base, dev, _vol, outside) = fill_dirs("dev-bind");
+        let cstr = |p: &std::path::Path| CString::new(p.as_os_str().as_bytes()).unwrap();
+
+        let target = dev.join("null");
+        let (_h, _t) = super::prepare_dev_bind(c"/dev/null", &cstr(&target)).expect("fresh target with /dev/null");
+        assert!(std::fs::symlink_metadata(&target).unwrap().is_file());
+        assert!(super::is_char_dev(c"/dev/null"));
+        assert!(!super::is_char_dev(&cstr(&target)));
+
+        // Existing file at target is refused with EEXIST.
+        let e = super::prepare_dev_bind(c"/dev/null", &cstr(&target)).unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(libc::EEXIST));
+
+        // Symlink at target (to an existing outside file or dangling) is refused and never followed.
+        let victim = outside.join("victim");
+        std::fs::write(&victim, b"untouched").unwrap();
+        let link_existing = dev.join("zero");
+        symlink(&victim, &link_existing).unwrap();
+        let e = super::prepare_dev_bind(c"/dev/null", &cstr(&link_existing)).unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(libc::EEXIST));
+        assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
+
+        let gone = outside.join("gone");
+        let link_dangling = dev.join("full");
+        symlink(&gone, &link_dangling).unwrap();
+        let e = super::prepare_dev_bind(c"/dev/null", &cstr(&link_dangling)).unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(libc::EEXIST));
+        assert!(!gone.exists());
+
+        // Non-character-device host sources (regular file, directory, symlink to /dev/null) are refused before creating target.
+        let fake_chr = outside.join("fake");
+        std::fs::write(&fake_chr, b"").unwrap();
+        let link_chr = outside.join("null-link");
+        symlink("/dev/null", &link_chr).unwrap();
+        assert!(!super::is_char_dev(&cstr(&link_chr)));
+        for bad_src in [&fake_chr, &outside, &link_chr] {
+            let unmade = dev.join("unmade");
+            let e = super::prepare_dev_bind(&cstr(bad_src), &cstr(&unmade)).unwrap_err();
+            assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(!unmade.exists(), "target must not be created when source is invalid");
+        }
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

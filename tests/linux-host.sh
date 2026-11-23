@@ -917,13 +917,14 @@ t inspect-recreate-mounts "binds=ok code=201 kept|rokept|from-host|bro=ro|vro=ro
 t inspect-exposed-udp '{"132/sctp":{},"53/tcp":{},"53/udp":{},"5353/udp":{}} {"132/sctp":null,"53/tcp":null,"53/udp":null,"5353/udp":null}' "docker rm -f lhudp lhudp-base >/dev/null 2>&1; docker rmi kiri-lh-udp:1 >/dev/null 2>&1; docker create --name lhudp-base alpine true >/dev/null && docker commit -c 'EXPOSE 53/udp 132/sctp' lhudp-base kiri-lh-udp:1 >/dev/null && docker run -d --name lhudp --expose 53 --expose 5353/udp kiri-lh-udp:1 sleep 60 >/dev/null && out=\$(docker inspect -f '{{json .Config.ExposedPorts}} {{json .NetworkSettings.Ports}}' lhudp); docker rm -f lhudp lhudp-base >/dev/null 2>&1; docker rmi kiri-lh-udp:1 >/dev/null 2>&1; echo \"\$out\""
 $D rm -f "$N" >/dev/null
 # An engine in a user namespace (nested Docker, Sysbox, Coder, CI; #597),
-# where the kernel refuses mknod of a device: an image layer with a
-# character and a block device, a fifo and a file still unpacks, the devices
-# left out as Docker leaves them out and the fifo made. Before, the whole
-# layer failed ("mknod: Operation not permitted"). That engine runs alone in
-# its own container, in a new user namespace (root mapped to root, 65536
-# ids, so /proc/self/uid_map is not "0 0 4294967295") with its own mount
-# and network namespaces, and only unpacks: docker load, then docker create.
+# where the kernel refuses mknod of a device and raising nofile past the
+# outer hard limit (524288): an image layer with a character and a block
+# device, a fifo and a file still unpacks, the devices left out as Docker
+# leaves them out and the fifo made; and both plain and --privileged
+# containers start with /dev/null, /dev/urandom and the outer nofile limit.
+# That engine runs alone in its own container, in a new user namespace (root
+# mapped to root, 65536 ids, so /proc/self/uid_map is not "0 0 4294967295")
+# with its own mount and network namespaces.
 U="$N-userns"
 # t, for output got elsewhere than the engine's container.
 check() {
@@ -932,6 +933,7 @@ check() {
 $D rm -f "$U" >/dev/null 2>&1
 $D run -d --name "$U" --privileged --tmpfs /run -v "$BIN:/opt/kiri:ro" alpine sleep 1d >/dev/null
 $D exec "$U" sh -c 'apk add -q util-linux-misc python3 docker-cli >/dev/null 2>&1'
+$D save alpine:latest | $D exec -i "$U" sh -c 'cat > /alpine.tar'
 $D exec -i "$U" sh -c 'cat > /mkimage.py' <<'PY'
 import hashlib, io, json, tarfile
 layer = io.BytesIO()
@@ -952,15 +954,21 @@ if ! $D exec "$U" unshare -U -r true 2>/dev/null; then
   echo "  SKIP userns-layer-devices: no user namespace can be made on this host"
 else
   got=$($D exec "$U" unshare --user --map-users=0:0:65536 --map-groups=0:0:65536 --setuid=0 --setgid=0 --mount --propagation private --net --fork sh -c '
+    ulimit -n 524288
     python3 /mkimage.py
     mkdir -p /var/lib/kiri && mount -t tmpfs t /var/lib/kiri && mount -t tmpfs t /root && ip link set lo up
     /opt/kiri/kiri daemon > /tmp/engine.log 2>&1 &
     export DOCKER_HOST=unix:///root/.kiri/run/docker.sock
     for i in $(seq 120); do docker version >/dev/null 2>&1 && break; sleep 0.25; done
     docker load -i /devices.tar >/dev/null && docker create kiri-nodes:1 >/dev/null || exit
-    cd /var/lib/kiri/layers/*/ && for f in dev/kiri-null dev/kiri-loop pipe after; do printf "%s=" $f; stat -c %F $f 2>/dev/null || echo none; done | tr "\n" " "
+    (cd /var/lib/kiri/layers/*/ && for f in dev/kiri-null dev/kiri-loop pipe after; do printf "%s=" $f; stat -c %F $f 2>/dev/null || echo none; done | tr "\n" " ")
+    docker load -q -i /alpine.tar >/dev/null
+    printf "\nrun="; docker run --rm alpine sh -c '\''cat /dev/null; head -c 4 /dev/urandom | wc -c; ulimit -n'\'' 2>&1 | tr "\n" ":"
+    printf "\npriv="; docker run --rm --privileged alpine sh -c '\''cat /dev/null; head -c 4 /dev/urandom | wc -c'\'' 2>&1 | tr "\n" ":"
     kill %1' 2>&1 | tr -d '\r')
   check userns-layer-devices "dev/kiri-null=none dev/kiri-loop=none pipe=fifo after=regular file" "$got"
+  check userns-run "run=4:524288:" "$got"
+  check userns-run-privileged "priv=4:" "$got"
 fi
 $D rm -f "$U" >/dev/null
 echo "$PASS passed, $FAIL failed"
