@@ -1514,6 +1514,19 @@ if [ -n "$HOSTIP" ]; then
   t mirror-cli-add "http://$HOSTIP:5056" "$KIRI" registry mirror add "http://$HOSTIP:5056"
   t mirror-http-pull "3." bash -c "$D pull -q kiri-mirror-only:1 >/dev/null && $D run --rm kiri-mirror-only:1 cat /etc/alpine-release"
   t mirror-docker-info "http://$HOSTIP:5056/" bash -c "$D info 2>/dev/null | sed -n '/Registry Mirrors/,/^ [A-Z]/p'"
+  if command -v openssl >/dev/null 2>&1 && openssl req -x509 -newkey rsa:2048 -nodes -days 3 -subj /CN=kiri-other.test -addext subjectAltName=DNS:kiri-other.test -keyout "$REG/other.key" -out "$REG/other.pem" 2>/dev/null; then
+    chmod 644 "$REG/other.key"
+    $D run -d --name reg3 -p 5444:5000 -v "$REG:/tls:ro" -e REGISTRY_HTTP_TLS_CERTIFICATE=/tls/other.pem -e REGISTRY_HTTP_TLS_KEY=/tls/other.key registry:2 >/dev/null
+    for _ in $(seq 50); do curl -sk -m 1 -o /dev/null https://localhost:5444/v2/ && break; sleep 0.2; done
+    $D tag alpine localhost:5444/team/alp:1 && $D push -q localhost:5444/team/alp:1 >/dev/null && $D rmi localhost:5444/team/alp:1 >/dev/null
+    t insecure-selfsigned-unlisted-build-refused "refused" bash -c "gw=\$($D inspect reg3 --format '{{.NetworkSettings.IPAddress}}'):5000; mkdir -p \"$REG/bins\" && printf 'FROM %s/team/alp:1\nRUN true\n' \"\$gw\" > \"$REG/bins/Dockerfile\" && (DOCKER_BUILDKIT=0 $D build --no-cache \"$REG/bins\" >/dev/null 2>&1 && echo built || echo refused)"
+    t insecure-selfsigned-build "dengis-fles" bash -c "gw=\$($D inspect reg3 --format '{{.NetworkSettings.IPAddress}}'):5000; \"$KIRI\" registry insecure add \$gw >/dev/null 2>&1; mkdir -p \"$REG/bins\" && printf 'FROM %s/team/alp:1\nRUN echo self-signed | rev\n' \"\$gw\" > \"$REG/bins/Dockerfile\" && DOCKER_BUILDKIT=0 $D build --no-cache \"$REG/bins\" >\"$REG/b.log\" 2>&1; grep -m1 -o dengis-fles \"$REG/b.log\" || grep -Ei -m3 'error|fail' \"$REG/b.log\"; \"$KIRI\" registry insecure remove \$gw >/dev/null 2>&1"
+    $D rm -f reg3 >/dev/null
+  else
+    skip_setup insecure-selfsigned-unlisted-build-refused "openssl is not installed"
+    skip_setup insecure-selfsigned-build "openssl is not installed"
+  fi
+  t mirror-build "rorrim-tliub" bash -c "gw=\$($D inspect reg2 --format '{{.NetworkSettings.IPAddress}}'):5000; \"$KIRI\" registry mirror remove http://$HOSTIP:5056 >/dev/null 2>&1; \"$KIRI\" registry insecure add \$gw >/dev/null 2>&1; \"$KIRI\" registry mirror add http://\$gw >/dev/null 2>&1; $D rmi kiri-mirror-only:1 >/dev/null 2>&1; mkdir -p \"$REG/bins\" && printf 'FROM kiri-mirror-only:1\nRUN echo built-mirror | rev\n' > \"$REG/bins/Dockerfile\" && DOCKER_BUILDKIT=0 $D build --no-cache \"$REG/bins\" >\"$REG/b.log\" 2>&1; grep -m1 -o rorrim-tliub \"$REG/b.log\" || grep -Ei -m3 'error|fail' \"$REG/b.log\"; \"$KIRI\" registry mirror remove http://\$gw >/dev/null 2>&1; \"$KIRI\" registry insecure remove \$gw >/dev/null 2>&1"
   "$KIRI" registry mirror remove "http://$HOSTIP:5056" >/dev/null 2>&1; "$KIRI" registry insecure remove "$HOSTIP:5056" >/dev/null 2>&1; $R logout "$HOSTIP:5055" >/dev/null 2>&1
   $D rmi kiri-mirror-only:1 >/dev/null 2>&1; $D rm -f reg2 >/dev/null
 else

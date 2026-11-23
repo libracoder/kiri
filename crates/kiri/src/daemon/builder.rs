@@ -533,9 +533,18 @@ pub fn create_for_buildx(engine: &Engine, name: Option<&str>) -> Option<Result<V
     Some(create(engine, &mut |_| {}).map(|id| json!({"Id": id, "Warnings": []})))
 }
 
+/// Claims the builder for a build or prune after checking whether it must
+/// be restarted first: this build is counted in [`BUILDS`] only after the
+/// busy check, so an idle stale builder is restarted while one another
+/// build is using is not.
+fn claim_for_build(up: bool, execs: usize, stale: bool) -> (bool, Busy) {
+    let restart = restart_now(up, BUILDS.load(Ordering::Relaxed) > 0 || execs > 0, stale);
+    (restart, Busy::new())
+}
+
 /// The builder, made if need be, started and answering. `say` hears what
 /// takes a while (a pull, a start).
-fn ensure_running(engine: &Engine, say: &mut dyn FnMut(&str)) -> Result<String, Error> {
+fn ensure_running(engine: &Engine, say: &mut dyn FnMut(&str)) -> Result<(String, Busy), Error> {
     if find(engine).is_none() {
         // Before the lock: a pull must not hold the builder up for others.
         ensure_image(engine, say)?;
@@ -545,12 +554,10 @@ fn ensure_running(engine: &Engine, say: &mut dyn FnMut(&str)) -> Result<String, 
         Some(found) => found,
         None => (create(engine, say)?, Status::Created),
     };
-    // daemon.json edited by hand since the builder started (Settings and
-    // `kiri registry` refresh it at once): restarted with the new file
-    // while no build uses it, as buildkitd reads it only when it starts.
-    let stale = status == Status::Running
-        && !builder_busy(engine, &id)
-        && is_stale(WRITTEN.lock().unwrap_or_else(|e| e.into_inner()).as_deref(), &Registries::now(&super::mirror::registry_names(engine)));
+    // daemon.json edited by hand, or a setting saved while the builder ran:
+    // restarted with the new file while no other build uses it, as buildkitd
+    // reads it only when it starts.
+    let (stale, busy) = claim_for_build(status == Status::Running, engine.running_execs(&id), stale_now(engine));
     if stale {
         if engine.is_paused(&id) {
             engine.pause(&id, false)?;
@@ -566,7 +573,7 @@ fn ensure_running(engine: &Engine, say: &mut dyn FnMut(&str)) -> Result<String, 
     }
     LAST_USE.store(now_secs(), Ordering::Relaxed);
     wait_ready(engine, &id)?;
-    Ok(id)
+    Ok((id, busy))
 }
 
 /// Waits for a started builder's buildkitd to answer.
@@ -1012,7 +1019,6 @@ pub fn build(req: &Request, engine: &Arc<Engine>, w: &mut UnixStream, r: &mut Bu
             *h = format!("{}={host}", &h[..h.len() - mac.len()]);
         }
     }
-    let _busy = Busy::new();
     // The context may be left partly unread: the connection closes after.
     http::begin_stream_with(w, 200, "application/json", http::CLOSE)?;
     let probe = w.try_clone()?;
@@ -1051,7 +1057,7 @@ pub fn build(req: &Request, engine: &Arc<Engine>, w: &mut UnixStream, r: &mut Bu
 
 fn run(req: &Request, engine: &Engine, o: &mut Options, r: &mut BufReader<UnixStream>, out: &mut Out<'_>, probe: &UnixStream) -> Result<Vec<kiri_image::Image>, String> {
     let quiet = o.quiet;
-    let id = ensure_running(engine, &mut |m| {
+    let (id, _busy) = ensure_running(engine, &mut |m| {
         if !quiet {
             out.stream(&format!("{m}\n"));
         }
@@ -1220,8 +1226,7 @@ pub fn prune(req: &Request, engine: &Engine) -> Result<Value, Error> {
     if find(engine).is_none() {
         return Ok(json!({"CachesDeleted": [], "SpaceReclaimed": 0}));
     }
-    let _busy = Busy::new();
-    let id = ensure_running(engine, &mut |_| {})?;
+    let (id, _busy) = ensure_running(engine, &mut |_| {})?;
     let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
     let (code, text) = engine.exec_capture(&id, &argv)?;
     if code != 0 {
@@ -1376,6 +1381,22 @@ mod tests {
         assert!(!restart_now(true, false, false));
         let at = |s: Step| STOP_THEN_WRITE.iter().position(|x| *x == s).unwrap();
         assert!(at(Step::Resume) < at(Step::Stop) && at(Step::Stop) < at(Step::Write), "{STOP_THEN_WRITE:?}");
+
+        let _g = ENSURE.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(BUILDS.load(Ordering::Relaxed), 0);
+        let (restart_first, b1) = claim_for_build(true, 0, true);
+        assert!(restart_first, "an idle stale builder is restarted before this build marks it busy");
+        assert_eq!(BUILDS.load(Ordering::Relaxed), 1);
+        let (restart_while_busy, b2) = claim_for_build(true, 0, true);
+        assert!(!restart_while_busy, "a builder another build is using must not be restarted");
+        drop((b1, b2));
+        assert_eq!(BUILDS.load(Ordering::Relaxed), 0);
+        let (restart_fresh, b3) = claim_for_build(true, 0, false);
+        assert!(!restart_fresh, "a fresh builder is not restarted");
+        drop(b3);
+        assert_eq!(BUILDS.load(Ordering::Relaxed), 0);
+        let (restart_exec_busy, _b4) = claim_for_build(true, 1, true);
+        assert!(!restart_exec_busy, "a builder with an active buildx exec is not restarted");
     }
 
     /// `before_exec` re-checks the builder's state under `ENSURE` (so a waiter

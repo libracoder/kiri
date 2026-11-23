@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### Builder: restart an idle running builder after a registry settings change (unreleased)
+- Fixes: #329 Support insecure-registries (plain-HTTP and self-signed private registries), and read Docker's daemon.json; #118 Registry mirrors for Docker Hub (Settings + CLI)
+- Caused: none known
+- Caused by: #119
+- Check: `insecure-selfsigned-build`, `insecure-selfsigned-unlisted-build-refused`, `mirror-build`
+
 ### #608 Mac: the memory balloon leaves the guest its headroom, so containers don't stall every few seconds (unreleased)
 - Fixes: #509 Containers on a user network get TCP resets under sustained load (Supabase local stack: Kong → PostgREST); #646 kiri-balloon oscillates violently on idle VM: 100% CPU, 18+ TB page-in thrashing, bloated host RAM; #210 macOS: containers report hundreds of GB of block reads while the guest has no page cache
 - Caused: none known
@@ -33,7 +39,7 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ### #119 Images: registry mirrors for Docker Hub, in Settings and the CLI (unreleased)
 - Fixes: #118 Registry mirrors for Docker Hub (Settings + CLI); #329 Support insecure-registries (plain-HTTP and self-signed private registries), and read Docker's daemon.json; #611 Could support for pulling images from private repositories be added as soon as possible?
-- Caused: none known
+- Caused: `build()` and `prune()` in `daemon/builder.rs` took `Busy::new()` before `ensure_running()` checked `!builder_busy()`, so a running builder was never restarted after a mirror or insecure-registry change and `mirror-build` and `insecure-selfsigned-build` failed (found running `tests/linux-host.sh` on Linux 6.8)
 - Caused by: -
 - Check: `insecure-http-unlisted-refused`, `insecure-tls-unlisted-refused`, `insecure-login-unlisted-refused`, `insecure-cli-add`, `insecure-cli-refuses-everything`, `insecure-http-pull`, `insecure-http-push`, `insecure-selfsigned-pull`, `insecure-http-login`, `insecure-http-auth-pull`, `insecure-other-port-still-refused`, `insecure-docker-info`, `insecure-build`, `insecure-selfsigned-build`, `insecure-removed-refused`, `insecure-hand-edit`, `insecure-hand-edit-keeps-keys`, `mirror-http-pull`, `mirror-docker-info`, `mirror-build`, `insecure-cli-remove`, `mirror-cli-add`, `hub-downgrade-refused`, `socket-mount-settings-refused`, `mirror-cli-plain-needs-listing`, `insecure-daemon-json`
 
