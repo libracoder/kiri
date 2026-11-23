@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #171 Linux: the window no longer goes blank on hover with WebKitGTK 2.54 (unreleased)
+- Fixes: #587 Kiri doesn't render UI
+- Caused: none known
+- Caused by: -
+- Check: none
+
 ### #131 Containers: expose /.dockerenv for SDK detection (unreleased)
 - Fixes: no issue
 - Caused: none known
