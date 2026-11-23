@@ -1168,13 +1168,55 @@ pub fn install_nat_from(uplink_index: i32, host_addr: [u8; 4], host_port: u16, r
     msgs.extend(localnet_guard());
     msgs.push(host_relay_guard(host_port));
     for d in dnat.iter().filter(|d| !d.udp) {
-        msgs.push(dnat_rule_from("prerouting", d, Some((uplink_index, gateway))));
+        if d.host_ip == LOOPBACK {
+            // A port the Mac has on its loopback, for the VM's own
+            // connections (`--network host` containers) to 127.0.0.1.
+            // Skip `host_port` itself: redirecting to the same port does not
+            // mark `ct status dnat`, so `host_relay_guard` and `redirected_from`
+            // reject direct connections to the relay listener.
+            if d.host_port != host_port {
+                msgs.push(loopback_published_rule(d.host_port, host_port));
+            }
+        } else {
+            msgs.push(dnat_rule_from("prerouting", d, Some((uplink_index, gateway))));
+        }
     }
-    if dnat.iter().any(|d| !d.udp) {
+    if dnat.iter().any(|d| !d.udp && d.host_ip != LOOPBACK) {
         msgs.push(published_masq_rule(uplink_index, gateway));
     }
     msgs.push(end);
     nl.request(&mut msgs)
+}
+
+/// A published port's `host_ip` in the VM that means "the Mac's loopback":
+/// the VM's own connections to 127.0.0.1 on it reach the Mac's 127.0.0.1.
+pub const LOOPBACK: [u8; 4] = [127, 0, 0, 1];
+
+/// `ip daddr 127.0.0.1 tcp dport <port> redirect to :<relay>`, in output:
+/// in the VM, a connection the VM itself makes (a `--network host`
+/// container) to a port published on the Mac's loopback goes to the host
+/// relay, which dials the Mac's 127.0.0.1 on that port, where Kiri's own
+/// listener forwards it to the container. As on Docker, where the
+/// published port is bound in the host's own network namespace. The
+/// redirect stays on the loopback, so `route_localnet` stays off.
+fn loopback_published_rule(port: u16, relay: u16) -> Msg {
+    let mut rule = nft(NFT_MSG_NEWRULE, NLM_F_ACK | NLM_F_CREATE | 0x800);
+    rule.attr_str(1, "kiri").attr_str(2, "output");
+    rule.nest(4);
+    // meta l4proto => reg 1; cmp eq tcp
+    rule.nest(1).attr_str(1, "meta").nest(2).attr_be32(1, 1).attr_be32(2, 16).end().end();
+    rule.nest(1).attr_str(1, "cmp").nest(2).attr_be32(1, 1).attr_be32(2, 0).nest(3).attr(1, &[libc::IPPROTO_TCP as u8]).end().end().end();
+    // payload daddr => reg 1; cmp eq 127.0.0.1
+    rule.nest(1).attr_str(1, "payload").nest(2).attr_be32(1, 1).attr_be32(2, 1).attr_be32(3, 16).attr_be32(4, 4).end().end();
+    rule.nest(1).attr_str(1, "cmp").nest(2).attr_be32(1, 1).attr_be32(2, 0).nest(3).attr(1, &LOOPBACK).end().end().end();
+    // payload transport header + 2 (dport) => reg 1; cmp eq port
+    rule.nest(1).attr_str(1, "payload").nest(2).attr_be32(1, 1).attr_be32(2, 2).attr_be32(3, 2).attr_be32(4, 2).end().end();
+    rule.nest(1).attr_str(1, "cmp").nest(2).attr_be32(1, 1).attr_be32(2, 0).nest(3).attr(1, &port.to_be_bytes()).end().end().end();
+    // immediate reg 1 = relay; redir to it
+    rule.nest(1).attr_str(1, "immediate").nest(2).attr_be32(1, 1).nest(2).attr(1, &relay.to_be_bytes()).end().end().end();
+    rule.nest(1).attr_str(1, "redir").nest(2).attr_be32(1, 1).end().end();
+    rule.end();
+    rule
 }
 
 #[cfg(test)]
@@ -1372,9 +1414,30 @@ mod tests {
         assert!(f.iter().all(|m| m.buf[16] == libc::NFPROTO_IPV6 as u8));
     }
 
+    /// In the VM, a port published on the Mac's loopback: the VM's own TCP
+    /// connections to 127.0.0.1 on it, in output, go to the host relay.
+    #[test]
+    fn a_loopback_published_port_redirects_the_vms_own_connections_to_the_relay() {
+        let r = loopback_published_rule(5999, 1026);
+        let top = attrs(&r.buf[20..]);
+        assert_eq!(get(&top, 2), b"output\0", "the VM's own connections only, not the bridges'");
+        assert_eq!(names(&r), ["meta", "cmp", "payload", "cmp", "payload", "cmp", "immediate", "redir"]);
+        let e = exprs(&r);
+        assert_eq!(get(&attrs(get(&e[1].1, 3)), 1), &[libc::IPPROTO_TCP as u8]);
+        // network header + 16, 4 bytes: daddr, which must be 127.0.0.1
+        assert_eq!((be32(get(&e[2].1, 2)), be32(get(&e[2].1, 3)), be32(get(&e[2].1, 4))), (1, 16, 4));
+        assert_eq!(get(&attrs(get(&e[3].1, 3)), 1), &LOOPBACK);
+        // transport header + 2, 2 bytes: dport
+        assert_eq!((be32(get(&e[4].1, 2)), be32(get(&e[4].1, 3)), be32(get(&e[4].1, 4))), (2, 2, 2));
+        assert_eq!(get(&attrs(get(&e[5].1, 3)), 1), &5999u16.to_be_bytes());
+        assert_eq!(get(&attrs(get(&e[6].1, 2)), 1), &1026u16.to_be_bytes(), "redirected to the relay's port");
+    }
+
     #[test]
     fn host_relay_takes_only_redirected_connections() {
         let r = host_relay_guard(1026);
+        let top = attrs(&r.buf[20..]);
+        assert_eq!(get(&top, 2), b"input\0", "guards every incoming interface, loopback included");
         assert_eq!(names(&r), ["meta", "cmp", "payload", "cmp", "ct", "bitwise", "cmp", "immediate"]);
         let e = exprs(&r);
         assert_eq!(get(&attrs(get(&e[1].1, 3)), 1), &[libc::IPPROTO_TCP as u8]);

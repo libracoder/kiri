@@ -316,6 +316,31 @@ pub fn local_resolver_among(servers: &[[u8; 4]], local: &[[u8; 4]]) -> bool {
     servers.iter().any(|s| local.contains(s))
 }
 
+/// The IPv4 address of interface `name`, if it has one: a bridge's gateway.
+pub fn bridge_ipv4(name: &str) -> Option<[u8; 4]> {
+    let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs fills `list`, freed below.
+    if unsafe { libc::getifaddrs(&mut list) } != 0 {
+        return None;
+    }
+    let mut found = None;
+    let mut p = list;
+    while !p.is_null() && found.is_none() {
+        // SAFETY: a node of the list getifaddrs returned.
+        let ifa = unsafe { &*p };
+        // SAFETY: ifa_name is a NUL-terminated string the list owns.
+        let named = !ifa.ifa_name.is_null() && unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) }.to_bytes() == name.as_bytes();
+        // SAFETY: a non-null address of the list; AF_INET is a sockaddr_in.
+        if named && !ifa.ifa_addr.is_null() && i32::from(unsafe { (*ifa.ifa_addr).sa_family }) == libc::AF_INET {
+            found = Some(unsafe { (*(ifa.ifa_addr as *const libc::sockaddr_in)).sin_addr.s_addr }.to_ne_bytes());
+        }
+        p = ifa.ifa_next;
+    }
+    // SAFETY: the list getifaddrs returned, freed once.
+    unsafe { libc::freeifaddrs(list) };
+    found
+}
+
 /// This machine's IPv4 addresses but loopback, what `fib daddr type local`
 /// matches.
 fn local_addrs() -> Vec<[u8; 4]> {
@@ -583,21 +608,50 @@ pub struct Bridges {
     made: HashMap<String, (i32, Option<[u8; 4]>, u8, Bridge6)>,
 }
 
+/// What `Bridges::ensure` needs to do for a bridge given its cached state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BridgePlan {
+    /// Already up with everything asked for.
+    Reuse(i32),
+    /// Already up with the same IPv4 gateway/prefix; add IPv6 in place so
+    /// existing sockets and containers on the bridge are not disrupted.
+    AddV6(i32),
+    /// A different subnet took the bridge name: tear down and recreate.
+    Recreate,
+    /// Not created yet.
+    Create,
+}
+
 impl Bridges {
+    fn plan(&self, name: &str, gateway: Option<[u8; 4]>, prefix: u8, want6: Bridge6) -> BridgePlan {
+        match self.made.get(name) {
+            Some(&(i, g, p, b6)) if (g, p) == (gateway, prefix) => match (b6, want6) {
+                (None, None) => BridgePlan::Reuse(i),
+                (None, Some(_)) => BridgePlan::AddV6(i),
+                // Already has IPv6 (e.g. a later container with IPv6 disabled,
+                // or a host-network caller that only needs IPv4): keep it.
+                (Some(_), None) => BridgePlan::Reuse(i),
+                (Some(a), Some(b)) if a == b => BridgePlan::Reuse(i),
+                (Some(_), Some(_)) => BridgePlan::Recreate,
+            },
+            Some(_) => BridgePlan::Recreate,
+            None => BridgePlan::Create,
+        }
+    }
+
     /// Creates the bridge (once) with its gateway address (and IPv6 one)
     /// and brings it up, with its rules in Kiri's tables. All or nothing: on
     /// an error the bridge is gone again and not recorded, so the next
     /// container tries afresh rather than starting with half the rules.
     pub fn ensure(&mut self, name: &str, gateway: Option<[u8; 4]>, prefix: u8, v6: Option<Ip6>) -> io::Result<i32> {
         let want6 = v6.map(|v| (v.gateway, v.prefix));
-        match self.made.get(name) {
-            Some(&(i, g, p, b6)) if (g, p, b6) == (gateway, prefix, want6) => return Ok(i),
+        match self.plan(name, gateway, prefix, want6) {
+            BridgePlan::Reuse(i) => return Ok(i),
+            BridgePlan::AddV6(i) => return self.add_v6(name, i, gateway, prefix, v6.expect("AddV6 requires v6")),
             // The network was removed and its bridge name reused for one
             // with another subnet: start the bridge afresh.
-            Some(_) => {
-                self.remove(name);
-            }
-            None => {}
+            BridgePlan::Recreate => self.remove(name),
+            BridgePlan::Create => {}
         }
         let r = self.bring_up(name, gateway, prefix, v6);
         if r.is_err() {
@@ -612,6 +666,17 @@ impl Bridges {
             }
         }
         r
+    }
+
+    fn add_v6(&mut self, name: &str, index: i32, gateway: Option<[u8; 4]>, prefix: u8, v: Ip6) -> io::Result<i32> {
+        let mut nl = Netlink::open(libc::NETLINK_ROUTE)?;
+        netlink::add_address6(&mut nl, index, v.gateway, v.prefix)?;
+        self.made.insert(name.to_owned(), (index, gateway, prefix, Some((v.gateway, v.prefix))));
+        if let Err(e) = self.update_v6(Some(v)) {
+            self.made.insert(name.to_owned(), (index, gateway, prefix, None));
+            return Err(e);
+        }
+        Ok(index)
     }
 
     fn bring_up(&mut self, name: &str, gateway: Option<[u8; 4]>, prefix: u8, v6: Option<Ip6>) -> io::Result<i32> {
@@ -933,5 +998,39 @@ fd00000000000000000000000000000000 40 00000000000000000000000000000000 00 000000
         assert_eq!(ups, [up("a", true, true)]);
         hand_over_default_routes(-1, &mut ups, "a").unwrap();
         assert!(ups.is_empty());
+    }
+
+    #[test]
+    fn bridge_ipv4_reads_an_interfaces_address() {
+        assert_eq!(bridge_ipv4("lo"), Some([127, 0, 0, 1]));
+        assert_eq!(bridge_ipv4("kiri-no-such-if"), None);
+    }
+
+    #[test]
+    fn bridges_ensure_is_idempotent_and_adds_ipv6_in_place() {
+        let gw4 = [172, 17, 0, 1];
+        let gw6 = [0xfd, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1];
+        let other6 = [0xfd, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 1];
+        let v6 = Ip6 { ip: gw6, prefix: 64, gateway: gw6 };
+
+        let mut bridges = Bridges::default();
+        assert_eq!(bridges.plan("kiri0", Some(gw4), 16, None), BridgePlan::Create);
+
+        // Once kiri0 is brought up IPv4-only (e.g. by host-network DNS on a fresh VM),
+        // a repeat ensure reuses it without touching netlink, and a later IPv6 attach
+        // upgrades it in place rather than tearing it down.
+        bridges.made.insert("kiri0".into(), (42, Some(gw4), 16, None));
+        assert_eq!(bridges.ensure("kiri0", Some(gw4), 16, None).unwrap(), 42);
+        assert_eq!(bridges.plan("kiri0", Some(gw4), 16, Some((gw6, 64))), BridgePlan::AddV6(42));
+        assert_eq!(bridges.plan("kiri0", Some([172, 18, 0, 1]), 16, None), BridgePlan::Recreate);
+        assert_eq!(bridges.plan("kiri0", Some(gw4), 24, None), BridgePlan::Recreate);
+        assert_eq!(bridges.plan("kiri0", None, 16, Some((gw6, 64))), BridgePlan::Recreate);
+
+        // Once IPv6 is configured on kiri0, both matching IPv6 callers and IPv4-only
+        // callers reuse the existing bridge; a different IPv6 subnet recreates it.
+        bridges.made.insert("kiri0".into(), (42, Some(gw4), 16, Some((gw6, 64))));
+        assert_eq!(bridges.ensure("kiri0", Some(gw4), 16, Some(v6)).unwrap(), 42);
+        assert_eq!(bridges.ensure("kiri0", Some(gw4), 16, None).unwrap(), 42);
+        assert_eq!(bridges.plan("kiri0", Some(gw4), 16, Some((other6, 64))), BridgePlan::Recreate);
     }
 }

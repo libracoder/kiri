@@ -314,7 +314,7 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
                 continue;
             }
             if let Some(l) = host_bound.as_ref().filter(|l| l.as_raw_fd() == pfd.fd) {
-                while let Some(r) = super::relay::accept_host_bound(l, super::net::HOST_ADDR) {
+                while let Some(r) = super::relay::accept_host_bound(l, super::net::HOST_ADDR, super::net::HOST_RELAY_PORT) {
                     relays.push(r);
                 }
                 continue;
@@ -441,8 +441,10 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
                 Ok(Msg::Run(spec)) => match {
                     // A container that wants the network must not start before the
                     // VM has it: right after boot the DHCP lease can be a few
-                    // hundred milliseconds away.
-                    if spec.flags & (kiri_proto::run_flags::NET_NONE | kiri_proto::run_flags::NET_HOST) == 0 {
+                    // hundred milliseconds away. Only `--network none` skips it;
+                    // `--network host` shares the VM's network and needs the lease
+                    // too (on a Linux host `dhcp` is None so this is a no-op).
+                    if needs_lease(spec.flags) {
                         wait_for_lease(&mut dhcp, std::time::Duration::from_secs(3));
                     }
                     // Only its network namespace is joined, which exists from
@@ -827,6 +829,13 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
 
 /// A PSI trigger: readable (POLLPRI) when tasks stall on memory for 50 ms
 /// within any 500 ms window. None if the kernel has no PSI.
+/// Whether a container start should wait for the VM's DHCP lease: every
+/// network mode except `--network none`, including `--network host` (which
+/// shares the VM's network and needs its route and upstream DNS).
+fn needs_lease(flags: u32) -> bool {
+    flags & kiri_proto::run_flags::NET_NONE == 0
+}
+
 /// Runs the DHCP client alone until it has a lease or `max` passes.
 fn wait_for_lease(dhcp: &mut Option<Dhcp>, max: std::time::Duration) {
     let Some(d) = dhcp.as_mut() else { return };
@@ -1613,6 +1622,21 @@ mod running_tests {
         // SAFETY: signal 0 only asks whether the process exists.
         assert_ne!(unsafe { libc::kill(pid, 0) }, 0, "killed and reaped once its root was in place");
         let _ = child.try_wait();
+    }
+
+    #[test]
+    fn wait_for_lease_runs_for_bridged_and_host_but_not_none() {
+        use kiri_proto::run_flags;
+        assert!(super::needs_lease(0), "default bridge needs a lease");
+        assert!(super::needs_lease(run_flags::NET_HOST), "host network in the VM shares eth0 and needs a lease");
+        assert!(super::needs_lease(run_flags::NET_HOST | run_flags::REMOVE));
+        assert!(!super::needs_lease(run_flags::NET_NONE), "--network none skips waiting for a lease");
+        assert!(!super::needs_lease(run_flags::NET_NONE | run_flags::REMOVE));
+        // On a Linux host there is no DHCP client; wait_for_lease is an immediate no-op.
+        let mut none = None;
+        let t = std::time::Instant::now();
+        super::wait_for_lease(&mut none, std::time::Duration::from_secs(3));
+        assert!(t.elapsed() < std::time::Duration::from_secs(1));
     }
 }
 

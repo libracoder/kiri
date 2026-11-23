@@ -3305,7 +3305,12 @@ impl Engine {
         let (bridge, ip, prefix, gateway) = match net.as_ref().map(|n| n.driver.as_str()) {
             Some("host") => {
                 flags |= run_flags::NET_HOST;
-                (String::new(), [0; 4], 0, [0; 4])
+                // Pass the default bridge's gateway and prefix so the VM's
+                // agent can bring up kiri0 on demand for host-network DNS
+                // before any bridged container starts, while keeping `bridge`
+                // empty so this container is not treated as bridged.
+                let (prefix, gateway) = self.lock_networks().find("bridge").map_or((0, [0; 4]), |b| (b.prefix, b.gateway));
+                (String::new(), [0; 4], prefix, gateway)
             }
             Some("bridge") => {
                 let n = net.as_ref().expect("matched");
