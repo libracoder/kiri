@@ -322,6 +322,8 @@ struct HostApplied {
     rlimits: Vec<(u32, u64, u64)>,
     groups: Vec<String>,
     nodes: Vec<super::hostopts::Node>,
+    masked: Option<Vec<CString>>,
+    readonly: Option<Vec<CString>>,
 }
 
 /// Docker's default capability set as a mask.
@@ -543,7 +545,8 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
         let pid = net.pid_join_pid.ok_or_else(|| cleanup(io::Error::other(format!("cannot join PID of a non running container: {target}"))))?;
         pid_join = Some(fs::File::open(format!("/proc/{pid}/ns/pid")).map_err(cleanup)?);
     }
-    prepared.host = HostApplied { rlimits: host.rlimits.clone(), groups: host.groups.clone(), nodes };
+    let (masked, readonly) = (host.masked.take(), host.readonly.take());
+    prepared.host = HostApplied { rlimits: host.rlimits.clone(), groups: host.groups.clone(), nodes, masked, readonly };
     // Small, short-lived files: kept in memory (/run is tmpfs), not on the data disk.
     let etc_dir = PathBuf::from("/run/kiri").join(spec.id);
     let embedded_dns = embedded_dns(spec, net.upstream_dns, net.dns.relay);
@@ -908,7 +911,7 @@ pub fn exec(spec: &ExecSpec<'_>, target_pid: libc::pid_t, paths: &Paths, profile
     let mut prepared = prepare(spec.argv, spec.env, spec.cwd, spec.user, None, spec.flags, spec.caps)?;
     // The container's ulimits and groups apply to its execs too, as with runc.
     let host = super::hostopts::parse(spec.opts)?;
-    prepared.host = HostApplied { rlimits: host.rlimits, groups: host.groups, nodes: Vec::new() };
+    prepared.host = HostApplied { rlimits: host.rlimits, groups: host.groups, ..Default::default() };
     // An exec runs under its container's profile, not the default.
     prepared.profile = profile.to_vec();
     let (parent_io, child_io) = stdio(&prepared)?;
@@ -1805,7 +1808,7 @@ fn child_fds(p: &Prepared, io: &ChildStdio) -> Vec<RawFd> {
         shm_size: _,
         init: _,
         // Paths, numbers and names only.
-        host: HostApplied { rlimits: _, groups: _, nodes: _ },
+        host: HostApplied { rlimits: _, groups: _, nodes: _, masked: _, readonly: _ },
         root_ready,
     } = p;
     let mut fds = match io {
@@ -1850,7 +1853,12 @@ fn container_child(p: &Prepared, rootfs: &CStr, io: &ChildStdio, close_first: &[
     }
     let root = inroot::open_root(Path::new(".")).unwrap_or_else(|e| fail("enter rootfs", e));
     let root = root.as_fd();
-    mount_container_filesystems(p.privileged, p.shm_size).unwrap_or_else(|e| fail("mount", e));
+    mount_container_filesystems(p.privileged, p.shm_size, &p.host).unwrap_or_else(|e| fail("mount", e));
+    // Taken before user mounts can cover /dev, as the source for MaskedPaths.
+    let null = (!p.privileged)
+        .then(|| p.host.masked.as_ref().filter(|m| !m.is_empty()))
+        .flatten()
+        .map(|_| dev_null().unwrap_or_else(|e| fail("masked paths", e)));
     super::hostopts::make_nodes(root, &p.host.nodes).unwrap_or_else(|e| fail("devices", e));
     for (src, target) in &p.etc_files {
         bind_file(root, src, target).unwrap_or_else(|e| fail(&target.to_string_lossy(), e));
@@ -1887,6 +1895,8 @@ fn container_child(p: &Prepared, rootfs: &CStr, io: &ChildStdio, close_first: &[
     // before it switches user and before the root goes read-only, so both
     // `-u 1000 -w /missing` and `--read-only -w /missing` start (#370).
     make_workdir(root, &p.cwd);
+    api_paths(root, p.privileged, p.host.readonly.as_deref().unwrap_or_default(), p.host.masked.as_deref().unwrap_or_default(), null.as_ref())
+        .unwrap_or_else(|e| fail("masked paths", e));
     if let Some(flags) = root_remount_flags(p.readonly_rootfs, p.nodev_root) {
         // Only the root itself: volumes, tmpfs and /dev stay as they are.
         sys::mount(c"none", c"/", c"none", flags, None).unwrap_or_else(|e| fail(if p.readonly_rootfs { "read-only root" } else { "nodev root" }, e));
@@ -2126,7 +2136,7 @@ fn root_remount_flags(readonly: bool, nodev: bool) -> Option<libc::c_ulong> {
 /// /dev/pts, /dev/shm, /dev/mqueue and a read-only cgroup view. Relative
 /// paths: the current directory is the container root. A privileged
 /// container gets the VM's devices and writable /sys and cgroups instead.
-fn mount_container_filesystems(privileged: bool, shm_size: u64) -> io::Result<()> {
+fn mount_container_filesystems(privileged: bool, shm_size: u64, host: &HostApplied) -> io::Result<()> {
     let nosuid_nodev_noexec = libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC;
     let ro = if privileged { 0 } else { libc::MS_RDONLY };
     for d in [c"proc", c"sys", c"dev"] {
@@ -2185,8 +2195,12 @@ fn mount_container_filesystems(privileged: bool, shm_size: u64) -> io::Result<()
     sys::mount(c"mqueue", c"dev/mqueue", c"mqueue", nosuid_nodev_noexec, None)?;
     sys::mkdir(c"sys/fs/cgroup", 0o755);
     sys::mount(c"cgroup2", c"sys/fs/cgroup", c"cgroup2", nosuid_nodev_noexec | ro, None)?;
-    if !privileged {
+    // An API list replaces Docker's default for that half (see `api_paths`).
+    if !privileged && host.readonly.is_none() {
         harden_proc()?;
+    }
+    if !privileged && host.masked.is_none() {
+        mask_proc();
     }
     Ok(())
 }
@@ -2249,8 +2263,8 @@ fn copy_host_devices(from: &Path, to: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Makes the dangerous parts of /proc read-only or hides them, as Docker's
-/// default `readonlyPaths` and `maskedPaths` do. The container is real root
+/// Makes the dangerous parts of /proc read-only, as Docker's default
+/// `readonlyPaths` does. The container is real root
 /// (no user namespace), and these sysctls and files are not namespaced, so
 /// without this a container could set `kernel.core_pattern` or
 /// `kernel.modprobe` and run code on the host. Paths are relative to the
@@ -2268,6 +2282,11 @@ fn harden_proc() -> io::Result<()> {
             let _ = sys::remount(p, ro as libc::c_ulong);
         }
     }
+    Ok(())
+}
+
+/// Hides what Docker's default `maskedPaths` does, relative to the container root.
+fn mask_proc() {
     // Hide files that leak host memory or kernel addresses, by covering them
     // with /dev/null (already created above).
     for p in [c"proc/kcore", c"proc/keys", c"proc/latency_stats", c"proc/timer_list", c"proc/timer_stats", c"proc/sched_debug", c"proc/interrupts"] {
@@ -2277,7 +2296,133 @@ fn harden_proc() -> io::Result<()> {
     for p in [c"proc/scsi", c"proc/acpi", c"proc/asound", c"sys/firmware", c"sys/devices/virtual/powercap"] {
         let _ = sys::mount(c"tmpfs", p, c"tmpfs", (libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC) as libc::c_ulong, Some(c"size=0k"));
     }
+}
+
+/// Looks up an existing `path` inside `root` without creating anything,
+/// resolving symlinks and `..` against `root` so neither can leave it.
+/// Returns the descriptor and whether it is a directory, or `None` when a
+/// component is missing, a parent is not a directory, or the path resolves
+/// to `root` itself.
+fn lookup_existing(root: BorrowedFd<'_>, path: &Path) -> io::Result<Option<(OwnedFd, bool)>> {
+    use std::collections::VecDeque;
+    use std::ffi::OsString;
+    use std::path::Component;
+
+    let parts = |p: &std::ffi::OsStr| -> VecDeque<OsString> {
+        Path::new(p)
+            .components()
+            .filter_map(|c| match c {
+                Component::Normal(n) => Some(n.to_owned()),
+                Component::ParentDir => Some(OsString::from("..")),
+                Component::RootDir | Component::CurDir | Component::Prefix(_) => None,
+            })
+            .collect()
+    };
+    let root_st = fstat_at(root.as_raw_fd(), c"", libc::AT_EMPTY_PATH)?;
+    let is_root = |st: &libc::stat| st.st_dev == root_st.st_dev && st.st_ino == root_st.st_ino;
+    let mut todo = parts(path.as_os_str());
+    let mut dirs: Vec<OwnedFd> = vec![root.try_clone_to_owned()?];
+    let mut links = 0u32;
+    while let Some(name) = todo.pop_front() {
+        if name == ".." {
+            if dirs.len() > 1 {
+                dirs.pop();
+            }
+            continue;
+        }
+        let is_last = todo.is_empty();
+        let dir = dirs.last().expect("root stays").as_raw_fd();
+        let c = CString::new(name.as_os_str().as_bytes()).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+        let fd = match open_at(dir, &c, libc::O_PATH | libc::O_NOFOLLOW) {
+            Ok(fd) => fd,
+            Err(e) if matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ENOTDIR)) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let st = fstat_at(fd.as_raw_fd(), c"", libc::AT_EMPTY_PATH)?;
+        match st.st_mode & libc::S_IFMT {
+            libc::S_IFLNK => {
+                links += 1;
+                if links > 40 {
+                    return Err(io::Error::from_raw_os_error(libc::ELOOP));
+                }
+                let target = read_link_at(fd.as_raw_fd(), c"")?;
+                let bytes = target.as_bytes();
+                if bytes.first() == Some(&b'/') {
+                    dirs.truncate(1);
+                }
+                for comp in parts(std::ffi::OsStr::from_bytes(bytes)).into_iter().rev() {
+                    todo.push_front(comp);
+                }
+            }
+            libc::S_IFDIR if !is_last => dirs.push(fd),
+            libc::S_IFDIR => return Ok((!is_root(&st)).then_some((fd, true))),
+            _ if is_last => return Ok(Some((fd, false))),
+            _ => return Ok(None),
+        }
+    }
+    let fd = dirs.pop().expect("root stays");
+    let st = fstat_at(fd.as_raw_fd(), c"", libc::AT_EMPTY_PATH)?;
+    Ok((!is_root(&st)).then_some((fd, true)))
+}
+
+/// The API's own `ReadonlyPaths` and `MaskedPaths`, applied after pivot_root as runc does.
+fn api_paths(root: BorrowedFd<'_>, privileged: bool, readonly: &[CString], masked: &[CString], null: Option<&OwnedFd>) -> io::Result<()> {
+    if privileged {
+        return Ok(());
+    }
+    let proc_fd = |fd: &OwnedFd| CString::new(format!("/proc/self/fd/{}", fd.as_raw_fd())).expect("no NUL");
+    for p in readonly {
+        let path = Path::new(std::ffi::OsStr::from_bytes(p.as_bytes()));
+        let Some((fd, _)) = lookup_existing(root, path)? else { continue };
+        let target = proc_fd(&fd);
+        sys::mount(&target, &target, c"none", libc::MS_BIND | libc::MS_REC, None)?;
+        // The first descriptor is under the new bind mount; look again to
+        // reach the mount itself, and keep its nosuid, nodev and noexec flags.
+        let Some((fd, _)) = lookup_existing(root, path)? else { continue };
+        let target = proc_fd(&fd);
+        // SAFETY: statvfs is plain data; all-zero is a valid value.
+        let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+        // SAFETY: valid NUL-terminated path and a writable struct.
+        if unsafe { libc::statvfs(target.as_ptr(), &mut st) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let keep = st.f_flag & (libc::ST_NOSUID | libc::ST_NODEV | libc::ST_NOEXEC);
+        sys::remount(&target, (libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY) as libc::c_ulong | keep)?;
+    }
+    for p in masked {
+        let null = null.ok_or_else(|| io::Error::other("no /dev/null to mask with"))?;
+        let path = Path::new(std::ffi::OsStr::from_bytes(p.as_bytes()));
+        let Some((fd, is_dir)) = lookup_existing(root, path)? else { continue };
+        let target = proc_fd(&fd);
+        if is_dir {
+            sys::mount(c"tmpfs", &target, c"tmpfs", (libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC) as libc::c_ulong, Some(c"size=0k"))?;
+        } else {
+            let src = proc_fd(null);
+            sys::mount(&src, &target, c"none", libc::MS_BIND, None)?;
+        }
+    }
     Ok(())
+}
+
+/// The container's own /dev/null as an O_PATH descriptor, checked to be device 1:3.
+fn dev_null() -> io::Result<OwnedFd> {
+    // SAFETY: valid NUL-terminated path; the descriptor is owned right away.
+    let fd = unsafe { libc::open(c"dev/null".as_ptr(), libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fresh descriptor nothing else owns.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    // SAFETY: stat is plain data; all-zero is a valid value.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: a descriptor we own and a writable struct.
+    if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if st.st_mode & libc::S_IFMT != libc::S_IFCHR || st.st_rdev != libc::makedev(1, 3) {
+        return Err(io::Error::other("/dev/null is not the null device"));
+    }
+    Ok(fd)
 }
 
 /// `""`, `root`, `1000`, `1000:1000`, `redis`, `redis:redis`: looked up in
@@ -3340,5 +3485,48 @@ mod tests {
         assert_eq!((ro & libc::MS_RDONLY, ro & libc::MS_NODEV), (libc::MS_RDONLY, 0));
         let both = super::root_remount_flags(true, true).expect("remounted");
         assert_eq!(both & (libc::MS_RDONLY | libc::MS_NODEV), libc::MS_RDONLY | libc::MS_NODEV);
+    }
+
+    /// `MaskedPaths` and `ReadonlyPaths` targets are looked up inside the
+    /// container's root without creating missing folders: links inside the
+    /// image work, links pointing outside or to `/` (`../..`) never leave
+    /// the root or cover `/` itself, and a path under a file is skipped.
+    #[test]
+    fn lookup_existing_stays_in_root_and_makes_nothing() {
+        use std::os::fd::{AsFd, AsRawFd};
+        use std::os::unix::fs::symlink;
+        use std::path::Path;
+        let (base, root, _vol, outside) = fill_dirs("lookup-existing");
+        std::fs::create_dir_all(root.join("etc")).unwrap();
+        std::fs::create_dir_all(root.join("usr/lib")).unwrap();
+        std::fs::create_dir_all(root.join("var")).unwrap();
+        std::fs::create_dir_all(root.join("custom")).unwrap();
+        std::fs::write(root.join("usr/lib/os-release"), b"alpine").unwrap();
+        std::fs::write(outside.join("secret"), b"host").unwrap();
+        symlink("../usr/lib/os-release", root.join("etc/os-release")).unwrap();
+        symlink(outside.join("secret"), root.join("custom/out")).unwrap();
+        symlink("../../../../../../outside/secret", root.join("custom/rel")).unwrap();
+        symlink("../..", root.join("custom/up")).unwrap();
+        symlink("/custom/loop_b", root.join("custom/loop_a")).unwrap();
+        symlink("/custom/loop_a", root.join("custom/loop_b")).unwrap();
+
+        let r = super::inroot::open_root(&root).unwrap();
+        let (fd, is_dir) = super::lookup_existing(r.as_fd(), Path::new("/etc/os-release")).unwrap().expect("in-image link");
+        assert!(!is_dir);
+        assert_eq!(std::fs::read(format!("/proc/self/fd/{}", fd.as_raw_fd())).unwrap(), b"alpine");
+        let (_fd, is_dir) = super::lookup_existing(r.as_fd(), Path::new("/var")).unwrap().expect("directory");
+        assert!(is_dir);
+        assert!(super::lookup_existing(r.as_fd(), Path::new("/nope/sub")).unwrap().is_none());
+        assert!(!root.join("nope").exists(), "missing parent is not created");
+        assert!(super::lookup_existing(r.as_fd(), Path::new("/usr/lib/os-release/sub")).unwrap().is_none(), "parent is a file");
+        assert!(super::lookup_existing(r.as_fd(), Path::new("/custom/out")).unwrap().is_none(), "absolute link stays in root");
+        assert!(super::lookup_existing(r.as_fd(), Path::new("/custom/rel")).unwrap().is_none(), ".. stops at root");
+        assert!(super::lookup_existing(r.as_fd(), Path::new("/custom/up")).unwrap().is_none(), "root itself is not returned");
+        assert!(super::lookup_existing(r.as_fd(), Path::new("/")).unwrap().is_none(), "root itself is not returned");
+        assert_eq!(super::lookup_existing(r.as_fd(), Path::new("/custom/loop_a")).unwrap_err().raw_os_error(), Some(libc::ELOOP));
+        let paths = [std::ffi::CString::new("/etc/os-release").unwrap()];
+        assert!(super::api_paths(r.as_fd(), true, &paths, &paths, None).is_ok(), "privileged skips api_paths");
+        assert!(super::api_paths(r.as_fd(), false, &[], &paths, None).is_err(), "unprivileged applies masked paths");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

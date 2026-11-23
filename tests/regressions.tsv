@@ -197,3 +197,15 @@ rename-dns-reused-name	#467	a container renamed to a name an earlier container h
 rename-dns-reused-name-extra-net	#467	the same on a network the container was connected to
 dns-user-net-three-refused-servfail-at-once	#455	with three refusing --dns servers on a user network the lookup was not answered until the client gave up
 dns-user-net-three-silent-servfail-in-time	#455	with three silent --dns servers on a user network the lookup was not answered at all, instead of within their waits
+systempaths-default	#378	a non-privileged container must keep Docker's default masked and read-only paths under /proc and /sys
+systempaths-unconfined	#378	--security-opt systempaths=unconfined was ignored, leaving /proc and /sys paths covered
+systempaths-unconfined-colon	#378	--security-opt systempaths:unconfined was ignored, leaving /proc and /sys paths covered
+systempaths-privileged	#378	a privileged container must not cover /proc or /sys with default masked or read-only mounts
+systempaths-inspect	#378	inspect did not show empty MaskedPaths and ReadonlyPaths for --security-opt systempaths=unconfined
+systempaths-inspect-default	#378	inspect did not show Docker's default MaskedPaths and ReadonlyPaths
+systempaths-inspect-privileged	#378	inspect did not show empty MaskedPaths and ReadonlyPaths for a privileged container
+systempaths-api-lists	#378	HostConfig.MaskedPaths and ReadonlyPaths from the API were dropped instead of applied
+systempaths-api-bad-rel	#378	a relative path in HostConfig.MaskedPaths was not refused with 400
+systempaths-api-bad-dotdot	#378	a .. component in HostConfig.ReadonlyPaths was not refused with 400
+systempaths-bwrap	#378	bubblewrap inside a non-privileged container with --security-opt systempaths=unconfined could not mount a fresh /proc
+systempaths-symlink-escape	#378	a symlink in the image at a MaskedPaths or ReadonlyPaths entry must resolve inside the container root and never touch the host or cover /

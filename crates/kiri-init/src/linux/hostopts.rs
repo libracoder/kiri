@@ -62,6 +62,10 @@ pub struct HostOpts {
     pub rules: Vec<Rule>,
     /// `--group-add`: names (looked up in the container's /etc/group) or ids.
     pub groups: Vec<String>,
+    /// `MaskedPaths` and `ReadonlyPaths` when the API set them; `None` keeps
+    /// the default (Docker's lists, or nothing for a privileged container).
+    pub masked: Option<Vec<CString>>,
+    pub readonly: Option<Vec<CString>>,
 }
 
 fn bad(line: &str) -> io::Error {
@@ -110,6 +114,19 @@ pub fn parse(list: StrList<'_>) -> io::Result<HostOpts> {
             }
             ["devrule", kind, major, minor, perms] => o.rules.push(devices::parse_rule(kind, major, minor, perms).ok_or_else(|| bad(line))?),
             ["group", g] if !g.is_empty() => o.groups.push((*g).to_owned()),
+            [kind @ ("masked" | "readonly"), paths @ ..] => {
+                let paths = paths
+                    .iter()
+                    .map(|p| {
+                        if p.starts_with('/') && !p.split('/').any(|c| c == "..") {
+                            CString::new(*p).map_err(|_| bad(line))
+                        } else {
+                            Err(bad(line))
+                        }
+                    })
+                    .collect::<io::Result<Vec<_>>>()?;
+                *(if *kind == "masked" { &mut o.masked } else { &mut o.readonly }) = Some(paths);
+            }
             _ => return Err(bad(line)),
         }
     }
@@ -398,6 +415,17 @@ mod tests {
         assert_eq!(o.devices[0].container, "/dev/fuse");
         assert_eq!(o.rules.len(), 1);
         assert_eq!(o.groups, ["video"]);
+        assert!(o.masked.is_none() && o.readonly.is_none());
+        let buf = list(&["masked", "readonly\t/proc/sys\t/data"]);
+        let kiri_proto::Msg::Retain(l) = kiri_proto::decode(&buf).unwrap() else { panic!() };
+        let o = parse(l).unwrap();
+        assert_eq!(o.masked, Some(vec![]));
+        assert_eq!(o.readonly, Some(vec![c"/proc/sys".to_owned(), c"/data".to_owned()]));
+        for bad_path in ["masked\tproc/kcore", "masked\t/../etc", "readonly\t/proc/../etc"] {
+            let buf = list(&[bad_path]);
+            let kiri_proto::Msg::Retain(l) = kiri_proto::decode(&buf).unwrap() else { panic!() };
+            assert!(parse(l).is_err(), "{bad_path}");
+        }
         for bad in ["sysctl\tnet\tkernel/core_pattern\t|x", "sysctl\tipc\tkernel/../x\t1", "sysctl\tuts\tkernel/hostname\tx", "rlimit\t99\t1\t1", "device\tdev\t/x\trwm", "nope"] {
             let buf = list(&[bad]);
             let kiri_proto::Msg::Retain(l) = kiri_proto::decode(&buf).unwrap() else { panic!() };

@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #490 Engine: systempaths=unconfined, MaskedPaths and ReadonlyPaths are applied (unreleased)
+- Fixes: #378 Engine: --security-opt systempaths=unconfined is ignored, breaking bubblewrap (bwrap) inside non-privileged containers
+- Caused: none known
+- Caused by: -
+- Check: `systempaths-default`, `systempaths-unconfined`, `systempaths-unconfined-colon`, `systempaths-privileged`, `systempaths-inspect`, `systempaths-inspect-default`, `systempaths-inspect-privileged`, `systempaths-api-lists`, `systempaths-api-bad-rel`, `systempaths-api-bad-dotdot`, `systempaths-bwrap`, `systempaths-symlink-escape`
+
 ### Builder: restart an idle running builder after a registry settings change (unreleased)
 - Fixes: #329 Support insecure-registries (plain-HTTP and self-signed private registries), and read Docker's daemon.json; #118 Registry mirrors for Docker Hub (Settings + CLI)
 - Caused: none known
