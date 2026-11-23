@@ -212,3 +212,8 @@ systempaths-symlink-escape	#378	a symlink in the image at a MaskedPaths or Reado
 top-frame-cap	#463	a docker top reply over MAX_FRAME (1 MiB) made read_frame drop the VM link and kill every running container
 build-platform-pulled-tag	#57	a build for another platform from a tag already pulled locally took the local image's platform instead of asking the registry
 build-local-tag	#57	leaving registry tags to the registry must still serve images built, loaded or tagged only here
+seccomp-unconfined-warns	#516	--security-opt seccomp=unconfined gave no warning that Kiri keeps its host boundary (io_uring and vsock sockets stay blocked)
+seccomp-unconfined-colon-warns	#516	--security-opt seccomp:unconfined gave no warning that Kiri keeps its host boundary
+seccomp-unconfined-api-warnings	#516	POST /containers/create returned empty Warnings when seccomp=unconfined was passed
+seccomp-default-no-warning	#516	a default container without seccomp=unconfined must return empty Warnings
+seccomp-unconfined-io-uring-blocked	#516	io_uring_setup must stay blocked with EPERM even under seccomp=unconfined

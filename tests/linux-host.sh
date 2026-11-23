@@ -124,6 +124,12 @@ t memory-limit "67108864" "docker run --rm --memory 64m alpine cat /sys/fs/cgrou
 # was created as root while the container's cgroup directory was still open.
 t workdir-made-inside-root "outside 0" "find /sys/fs/cgroup /var/lib/kiri /run -name kiri-wd-probe -exec rmdir {} + 2>/dev/null; for n in \$(seq 3 25); do for p in kiri-wd-probe ../kiri-wd-probe; do docker run --rm -w /proc/self/fd/\$n/\$p alpine true >/dev/null 2>&1; done; done; echo outside \$(find /sys/fs/cgroup /var/lib/kiri /run -name kiri-wd-probe 2>/dev/null | wc -l)"
 t seccomp "Seccomp:	2" "docker run --rm alpine grep Seccomp: /proc/self/status"
+# seccomp=unconfined / seccomp:unconfined warns that Kiri's host boundary
+# (io_uring and vsock sockets) stays in place (#516).
+t seccomp-unconfined-warns "io_uring and vsock sockets stay blocked" "docker run --rm --security-opt seccomp=unconfined alpine unshare -U echo userns-ok"
+t seccomp-unconfined-colon-warns "io_uring and vsock sockets stay blocked" "docker run --rm --security-opt seccomp:unconfined alpine true"
+t seccomp-unconfined-api-warnings "io_uring and vsock sockets stay blocked" "out=\$(curl -s --unix-socket /root/.kiri/run/docker.sock -H 'Content-Type: application/json' -d '{\"Image\":\"alpine\",\"Cmd\":[\"true\"],\"HostConfig\":{\"SecurityOpt\":[\"seccomp=unconfined\"]}}' http://d/containers/create); id=\$(printf '%s' \"\$out\" | sed -n 's/.*\"Id\":\"\([0-9a-f]*\)\".*/\\1/p'); [ -n \"\$id\" ] && docker rm -f \"\$id\" >/dev/null 2>&1; printf '%s\n' \"\$out\""
+t seccomp-default-no-warning "[]" "out=\$(curl -s --unix-socket /root/.kiri/run/docker.sock -H 'Content-Type: application/json' -d '{\"Image\":\"alpine\",\"Cmd\":[\"true\"]}' http://d/containers/create); id=\$(printf '%s' \"\$out\" | sed -n 's/.*\"Id\":\"\([0-9a-f]*\)\".*/\\1/p'); [ -n \"\$id\" ] && docker rm -f \"\$id\" >/dev/null 2>&1; printf '%s\n' \"\$out\" | sed -n 's/.*\"Warnings\":\(\[[^]]*\]\).*/\\1/p'"
 t udp "10.9.8.7" "docker run -d --name dns -p 15354:53/udp alpine sh -c 'apk add -q dnsmasq >/dev/null 2>&1; dnsmasq -k --address=/kiri.test/10.9.8.7' >/dev/null; for i in \$(seq 40); do out=\$(nslookup -port=15354 kiri.test 127.0.0.1 2>/dev/null) && break; sleep 0.5; done; echo \"\$out\" | grep -o 10.9.8.7"
 t ipv6-network "true" "docker network create --ipv6 --subnet fd00:4c:1::/64 lh6 >/dev/null && docker network inspect lh6 -f '{{.EnableIPv6}}'"
 t ipv6-ping "1 packets received" "docker run -d --name v6a --network lh6 nginx:alpine >/dev/null; docker run --rm --network lh6 alpine ping -6 -c 1 -W 2 v6a"

@@ -1892,6 +1892,13 @@ t seccomp-on "Seccomp:	2" $D run --rm alpine grep Seccomp: /proc/self/status
 t seccomp-userns "not permitted" $D run --rm alpine unshare -U true
 t seccomp-keyctl "not permitted" bash -c "$D run --rm alpine sh -c 'apk add -q keyutils >/dev/null 2>&1; keyctl show 2>&1'"
 t seccomp-unconfined "userns-ok" $D run --rm --security-opt seccomp=unconfined alpine unshare -U echo userns-ok
+# seccomp=unconfined / seccomp:unconfined warns that Kiri's host boundary
+# (io_uring and vsock sockets) stays in place, while default containers do not (#516).
+t seccomp-unconfined-warns "io_uring and vsock sockets stay blocked" $D run --rm --security-opt seccomp=unconfined alpine true
+t seccomp-unconfined-colon-warns "io_uring and vsock sockets stay blocked" $D run --rm --security-opt seccomp:unconfined alpine true
+t seccomp-unconfined-api-warnings "io_uring and vsock sockets stay blocked" bash -c "out=\$(curl -s --unix-socket $SQ -H 'Content-Type: application/json' -d '{\"Image\":\"alpine\",\"Cmd\":[\"true\"],\"HostConfig\":{\"SecurityOpt\":[\"seccomp=unconfined\"]}}' http://d/containers/create); id=\$(printf '%s' \"\$out\" | sed -n 's/.*\"Id\":\"\([0-9a-f]*\)\".*/\1/p'); [ -n \"\$id\" ] && $D rm -f \"\$id\" >/dev/null 2>&1; printf '%s\n' \"\$out\""
+t seccomp-default-no-warning "[]" bash -c "out=\$(curl -s --unix-socket $SQ -H 'Content-Type: application/json' -d '{\"Image\":\"alpine\",\"Cmd\":[\"true\"]}' http://d/containers/create); id=\$(printf '%s' \"\$out\" | sed -n 's/.*\"Id\":\"\([0-9a-f]*\)\".*/\1/p'); [ -n \"\$id\" ] && $D rm -f \"\$id\" >/dev/null 2>&1; printf '%s\n' \"\$out\" | sed -n 's/.*\"Warnings\":\(\[[^]]*\]\).*/\1/p'"
+t seccomp-unconfined-io-uring-blocked "-1 1" $D run --rm --security-opt seccomp=unconfined python:3.13-alpine python -c 'import ctypes; libc = ctypes.CDLL(None, use_errno=True); r = libc.syscall(425, 1, ctypes.create_string_buffer(120)); print(r, ctypes.get_errno())'
 t seccomp-privileged-boundary "Seccomp:	2" $D run --rm --privileged alpine grep Seccomp: /proc/self/status
 t vsock-unconfined "Address family not supported" $D run --rm --security-opt seccomp=unconfined python:3.13-alpine python -c 'import socket; socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)'
 t vsock-privileged "Address family not supported" $D run --rm --privileged python:3.13-alpine python -c 'import socket; socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)'

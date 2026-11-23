@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### Engine: `seccomp=unconfined` warns that Kiri's host boundary stays in place (unreleased)
+- Fixes: #516 Apache Iggy can't start: the host-boundary filter blocks io_uring, and `seccomp=unconfined` / `--privileged` can't lift it
+- Caused: none known
+- Caused by: -
+- Check: `seccomp-unconfined-warns`, `seccomp-unconfined-colon-warns`, `seccomp-unconfined-api-warnings`, `seccomp-default-no-warning`, `seccomp-unconfined-io-uring-blocked`
+
 ### Build mirror: leave a registry's tags to the registry (unreleased)
 - Fixes: #57 Builds for a foreign platform use the local image of the same tag and ignore --platform (Invalid ELF image for this architecture)
 - Caused: none known

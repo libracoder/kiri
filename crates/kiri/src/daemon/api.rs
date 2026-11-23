@@ -2161,6 +2161,15 @@ pub(super) fn limits_from(h: &Value, base: super::engine::Limits) -> super::engi
     l
 }
 
+/// Returned in `POST /containers/create`'s `Warnings` when the caller asks for
+/// `--security-opt seccomp=unconfined` (or `seccomp:unconfined`). Kiri lifts
+/// the default syscall filter there, but `kiri-init` still installs the host
+/// boundary on both VM and Linux-host containers (no `io_uring`, no `AF_VSOCK`
+/// sockets), so workloads that ask for `seccomp=unconfined` to get `io_uring`
+/// are told up front instead of failing silently with `EPERM` (#516).
+const SECCOMP_UNCONFINED_WARNING: &str =
+    "seccomp=unconfined lifts the default syscall filter, but Kiri keeps its host boundary: io_uring and vsock sockets stay blocked";
+
 pub(super) fn create(req: &Request, engine: &Engine) -> Result<Value, Error> {
     let body: Value = serde_json::from_slice(&req.body).map_err(|e| Error::BadRequest(format!("invalid JSON: {e}")))?;
     let image_name = body["Image"].as_str().unwrap_or_default();
@@ -2168,11 +2177,17 @@ pub(super) fn create(req: &Request, engine: &Engine) -> Result<Value, Error> {
         return Err(Error::BadRequest("no image specified".into()));
     }
     let host = &body["HostConfig"];
+    let security_opt = strings(&host["SecurityOpt"]).unwrap_or_default();
     // A seccomp profile Kiri cannot apply fails the create, before anything
     // (volumes) is made for it.
-    if let super::seccomp::Choice::Profile(json) = super::seccomp::choice(&strings(&host["SecurityOpt"]).unwrap_or_default()).map_err(Error::BadRequest)? {
-        super::seccomp::compile(json, profile_caps(caps_from(host)?, host["Privileged"].as_bool().unwrap_or(false))).map_err(Error::BadRequest)?;
-    }
+    let seccomp_unconfined = match super::seccomp::choice(&security_opt).map_err(Error::BadRequest)? {
+        super::seccomp::Choice::Profile(json) => {
+            super::seccomp::compile(json, profile_caps(caps_from(host)?, host["Privileged"].as_bool().unwrap_or(false))).map_err(Error::BadRequest)?;
+            false
+        }
+        super::seccomp::Choice::Unconfined => true,
+        super::seccomp::Choice::Default => false,
+    };
     let network_mode = match host["NetworkMode"].as_str().unwrap_or("default") {
         "" | "default" => body["NetworkingConfig"]["EndpointsConfig"].as_object()
             .and_then(|eps| endpoints_primary(eps.keys().map(String::as_str), |key| engine.lock_net().find(key).map(|n| (n.name.clone(), n.internal))))
@@ -2258,7 +2273,10 @@ pub(super) fn create(req: &Request, engine: &Engine) -> Result<Value, Error> {
         }
         extra_hosts.push(format!("{ip}\t{name}"));
     }
-    let warnings: Vec<&str> = Vec::new();
+    let mut warnings: Vec<&str> = Vec::new();
+    if seccomp_unconfined {
+        warnings.push(SECCOMP_UNCONFINED_WARNING);
+    }
     // --ulimit, --sysctl, --device, --device-cgroup-rule, --group-add:
     // refused now with Docker's error rather than at start.
     let host_opts = super::hostopts::from_host(host);
@@ -2326,7 +2344,7 @@ pub(super) fn create(req: &Request, engine: &Engine) -> Result<Value, Error> {
         caps: caps_from(host)?,
         cap_add: strings(&host["CapAdd"]).unwrap_or_default(),
         cap_drop: strings(&host["CapDrop"]).unwrap_or_default(),
-        security_opt: strings(&host["SecurityOpt"]).unwrap_or_default(),
+        security_opt,
         readonly_rootfs: host["ReadonlyRootfs"].as_bool().unwrap_or(false),
         hostname,
         stop_signal: body["StopSignal"].as_str().filter(|s| !s.is_empty()).map(signal).or_else(|| {
@@ -5007,6 +5025,40 @@ mod network_option_tests {
         let (status, message) = create(json!({}), "demo:nosuch");
         assert_eq!(status, 404);
         assert!(message.starts_with("No such image: demo:nosuch"));
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `--security-opt seccomp=unconfined` (and `seccomp:unconfined`) warns in
+    /// `POST /containers/create`'s `Warnings` that Kiri's host boundary stays
+    /// in place; default containers, `--privileged` alone, and options where a
+    /// later `seccomp=` entry overrides `unconfined` produce no warning (#516).
+    #[test]
+    fn seccomp_unconfined_warns_that_the_host_boundary_stays() {
+        let dir = std::env::temp_dir().join(format!("kiri-seccomp-warn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = super::super::engine::boot_without_vm(&dir);
+        let cfg = json!({"created": "2026-11-23T00:00:00Z", "architecture": "arm64", "os": "linux", "config": {"Cmd": ["true"]}});
+        let mut w = engine.store.ingest().unwrap();
+        io::Write::write_all(&mut w, &serde_json::to_vec(&cfg).unwrap()).unwrap();
+        let (digest, _) = w.finish().unwrap();
+        engine.store.put_image(kiri_image::archive::from_config("demo:local".into(), &digest, &cfg, Vec::new())).unwrap();
+        let warnings_for = |host: Value| {
+            let body = json!({"Image": "demo:local", "HostConfig": host});
+            let res = super::create(&Request::internal("POST", "/containers/create", &[], serde_json::to_vec(&body).unwrap()), &engine).unwrap();
+            res["Warnings"].clone()
+        };
+        let expected = json!([super::SECCOMP_UNCONFINED_WARNING]);
+        assert_eq!(warnings_for(json!({})), json!([]));
+        assert_eq!(warnings_for(json!({"SecurityOpt": ["seccomp=builtin"]})), json!([]));
+        assert_eq!(warnings_for(json!({"SecurityOpt": ["seccomp=unconfined"]})), expected);
+        assert_eq!(warnings_for(json!({"SecurityOpt": ["seccomp:unconfined"]})), expected);
+        assert_eq!(warnings_for(json!({"SecurityOpt": ["seccomp=builtin", "seccomp=unconfined"]})), expected);
+        assert_eq!(warnings_for(json!({"SecurityOpt": ["seccomp=unconfined", "seccomp=builtin"]})), json!([]));
+        assert_eq!(warnings_for(json!({"SecurityOpt": ["seccomp=unconfined", r#"seccomp={"defaultAction":"SCMP_ACT_ALLOW"}"#]})), json!([]));
+        assert_eq!(warnings_for(json!({"Privileged": true})), json!([]));
+        assert_eq!(warnings_for(json!({"Privileged": true, "SecurityOpt": ["seccomp=unconfined"]})), expected);
         drop(engine);
         let _ = std::fs::remove_dir_all(&dir);
     }
