@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #127 Linux: standalone root daemon serves 0660 `/run/kiri/docker.sock` for containerized SDK clients (unreleased)
+- Fixes: #127 Linux daemon: Docker-compatible socket access for containerized SDK clients
+- Caused: none known
+- Caused by: -
+- Check: `socket-container-uid-group`
+
 ### #749 Linux: `kiri update --check` checks the release feed instead of falling through to `docker update` (unreleased)
 - Fixes: #749 Linux: `kiri update --check` falls through to `docker update`
 

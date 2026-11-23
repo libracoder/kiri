@@ -232,27 +232,41 @@ pub fn real(p: &str) -> Option<Real> {
 pub fn engine_socket(src: &str) -> Option<String> {
     let own = super::socket_path().ok()?;
     let own = own.to_string_lossy();
-    engine_socket_for(src, &own, real)
+    let alias = if std::env::var_os("KIRI_SOCKET").is_none() {
+        super::home_socket_path().ok().filter(|p| p.as_os_str() != own.as_ref())
+    } else {
+        None
+    };
+    let alias = alias.as_deref().and_then(|p| p.to_str());
+    engine_socket_with_alias(src, &own, alias, real)
 }
 
 /// [`engine_socket`], with `resolve` giving where a path that exists
 /// really is. The path as given is followed first, as the kernel will
 /// follow it; only a path that is not there is compared as text.
+#[cfg(test)]
 fn engine_socket_for(src: &str, own: &str, resolve: impl Fn(&str) -> Option<Real>) -> Option<String> {
+    engine_socket_with_alias(src, own, None, resolve)
+}
+
+fn engine_socket_with_alias(src: &str, own: &str, alias: Option<&str>, resolve: impl Fn(&str) -> Option<Real>) -> Option<String> {
     let found = resolve(src);
-    let is_own = found.as_ref().zip(resolve(own)).is_some_and(|(a, b)| a.same(&b));
+    let is_own = found.as_ref().is_some_and(|a| {
+        resolve(own).is_some_and(|b| a.same(&b)) || alias.and_then(&resolve).is_some_and(|b| a.same(&b))
+    });
     let text = clean(src);
+    let matches_text = |p: &str| text == clean(p);
     #[cfg(target_os = "macos")]
     {
         let named = ENGINE_SOCKS.contains(&text.as_str()) || found.as_ref().is_some_and(|r| ENGINE_SOCKS.contains(&r.path.as_str()));
-        (is_own || named || text == clean(own)).then(|| VM_ENGINE_SOCK.to_owned())
+        (is_own || named || matches_text(own) || alias.is_some_and(matches_text)).then(|| VM_ENGINE_SOCK.to_owned())
     }
     #[cfg(not(target_os = "macos"))]
     {
         let given = || super::caller::container_socket(Path::new(own)).to_string_lossy().into_owned();
         match found {
             Some(_) => is_own.then(given),
-            None => (text == clean(own) || ENGINE_SOCKS.contains(&text.as_str())).then(given),
+            None => (matches_text(own) || alias.is_some_and(matches_text) || ENGINE_SOCKS.contains(&text.as_str())).then(given),
         }
     }
 }
@@ -514,6 +528,9 @@ mod tests {
             let raw = fake(&spelled, &[]);
             let raw = |p: &str| if p == "/tmp/l//../kiri/docker.sock" || p == own { raw(p) } else { None };
             assert_eq!(engine_socket_for("/tmp/l//../kiri/docker.sock", own, raw).as_deref(), given);
+            // Compatibility home socket alias alongside /run/kiri/docker.sock also maps to the container socket.
+            let home_alias = "/root/.kiri/run/docker.sock";
+            assert_eq!(engine_socket_with_alias(home_alias, own, Some(home_alias), &itself).as_deref(), given);
         }
         assert_eq!(engine_socket_for("/srv/app.sock", "/x/docker.sock", none), None);
         assert_eq!(engine_socket_for("/srv/app.sock", "/x/docker.sock", &itself), None);

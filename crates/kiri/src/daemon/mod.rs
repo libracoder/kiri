@@ -57,13 +57,36 @@ pub fn state_dir() -> io::Result<PathBuf> {
     Ok(home.join(crate::flavor::STATE.get()))
 }
 
-/// `~/.kiri/run/docker.sock`, beside OrbStack's `~/.orbstack/run/docker.sock`.
+static BOUND_SOCKET: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Root on Linux uses `/run/kiri/docker.sock`; other users use `~/.kiri/run/docker.sock`,
+/// beside OrbStack's `~/.orbstack/run/docker.sock`.
 pub fn socket_path() -> io::Result<PathBuf> {
-    if let Some(s) = std::env::var_os("KIRI_SOCKET") {
+    if let Some(s) = BOUND_SOCKET.get() {
+        return Ok(s.clone());
+    }
+    // SAFETY: geteuid cannot fail.
+    let linux_root = cfg!(target_os = "linux") && unsafe { libc::geteuid() } == 0;
+    socket_path_for(std::env::var_os("KIRI_SOCKET").as_deref(), linux_root, std::env::var_os("HOME").as_deref())
+}
+
+pub(crate) fn home_socket_path() -> io::Result<PathBuf> {
+    home_socket_path_for(std::env::var_os("HOME").as_deref())
+}
+
+fn home_socket_path_for(home: Option<&std::ffi::OsStr>) -> io::Result<PathBuf> {
+    let home = home.map(PathBuf::from).ok_or_else(|| io::Error::other("HOME is not set"))?;
+    Ok(home.join(crate::flavor::STATE.get()).join("run/docker.sock"))
+}
+
+fn socket_path_for(override_path: Option<&std::ffi::OsStr>, linux_root: bool, home: Option<&std::ffi::OsStr>) -> io::Result<PathBuf> {
+    if let Some(s) = override_path {
         return Ok(PathBuf::from(s));
     }
-    let home = std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| io::Error::other("HOME is not set"))?;
-    Ok(home.join(crate::flavor::STATE.get()).join("run/docker.sock"))
+    if linux_root {
+        return Ok(PathBuf::from("/run/kiri/docker.sock"));
+    }
+    home_socket_path_for(home)
 }
 
 /// Raises the soft open-file limit to the hard one, as Go does for dockerd.
@@ -104,24 +127,40 @@ pub fn run(_args: &[String]) -> io::Result<()> {
         libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
         set
     };
-    let socket = socket_path()?;
+    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+    let mut socket = socket_path()?;
+    #[cfg(target_os = "linux")]
+    let mut extra_home_socket = if std::env::var_os("KIRI_SOCKET").is_none() {
+        home_socket_path().ok().filter(|p| p != &socket)
+    } else {
+        None
+    };
     if UnixStream::connect(&socket).is_ok() {
-        // Not an error: launchd (KeepAlive on failure) must not retry it.
-        diag::info!("engine already running", socket = socket.display());
-        return Ok(());
+        #[cfg(target_os = "linux")]
+        if let Some(home_sock) = extra_home_socket.take()
+            && UnixStream::connect(&home_sock).is_err()
+        {
+            socket = home_sock;
+        } else {
+            // Not an error: launchd (KeepAlive on failure) must not retry it.
+            diag::info!("engine already running", socket = socket.display());
+            return Ok(());
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            // Not an error: launchd (KeepAlive on failure) must not retry it.
+            diag::info!("engine already running", socket = socket.display());
+            return Ok(());
+        }
     }
-    if let Some(dir) = socket.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let _ = std::fs::remove_file(&socket); // stale, from a daemon that died
-    let listener = UnixListener::bind(&socket)?;
-    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
+    let _ = BOUND_SOCKET.set(socket.clone());
     // On a Linux host the daemon runs as root; `KIRI_SOCKET_GROUP=kiri`
     // lets that group's users in, as the docker group does for dockerd.
+    // Without an explicit group, root on Linux uses ordinary 0660 Unix
+    // group access (`docker` when present), so containerized SDK clients
+    // whose numeric uid has no host account can connect via socket gid.
     let access_group = std::env::var_os("KIRI_SOCKET_GROUP");
-    if let Some(group) = &access_group {
-        socket_group(&socket, group)?;
-    }
+    let listener = bind_daemon_socket(&socket, access_group.as_deref())?;
     // On a Linux host (and WSL) containers that mount the engine's socket
     // are given this one instead (binds.rs), so the API knows their
     // connections by where they arrive (caller.rs). Made as the daemon's
@@ -130,21 +169,27 @@ pub fn run(_args: &[String]) -> io::Result<()> {
     #[cfg(target_os = "linux")]
     let for_containers = {
         let path = caller::container_socket(&socket);
-        let _ = std::fs::remove_file(&path);
-        let listener = UnixListener::bind(&path)?;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-        if let Some(group) = &access_group {
-            socket_group(&path, group)?;
-        }
+        let listener = bind_daemon_socket(&path, access_group.as_deref())?;
         (listener, path)
     };
+    #[cfg(target_os = "linux")]
+    let extra_home = extra_home_socket.and_then(|path| {
+        if UnixStream::connect(&path).is_ok() {
+            return None;
+        }
+        bind_daemon_socket(&path, access_group.as_deref()).ok().map(|l| (l, path))
+    });
     // Each member by name too, so one just added needn't sign in again; and
     // connections are checked against the group when made and while open, so
     // a member removed is let go at once, whatever the list still says.
     #[cfg(target_os = "linux")]
     let gate = match &access_group {
         Some(group) => {
-            let gate = access::Gate::new(&[socket.as_path(), for_containers.1.as_path()], group)?;
+            let mut gated = vec![socket.as_path(), for_containers.1.as_path()];
+            if let Some((_, ref home_path)) = extra_home {
+                gated.push(home_path.as_path());
+            }
+            let gate = access::Gate::new(&gated, group)?;
             match gate.grant() {
                 Ok(n) => diag::info!("socket access list written", members = n),
                 Err(e) => diag::warn!("socket access list not written: new members sign in again first", error = e),
@@ -200,7 +245,11 @@ pub fn run(_args: &[String]) -> io::Result<()> {
         }
     }
 
-    watch_own_app(engine.clone(), socket.clone());
+    #[cfg(target_os = "linux")]
+    let extra_sock = extra_home.as_ref().map(|(_, p)| p.clone());
+    #[cfg(not(target_os = "linux"))]
+    let extra_sock: Option<PathBuf> = None;
+    watch_own_app(engine.clone(), socket.clone(), extra_sock.clone());
 
     let on_signal = engine.clone();
     let sock = socket.clone();
@@ -213,6 +262,9 @@ pub fn run(_args: &[String]) -> io::Result<()> {
         nfs::unmount();
         let _ = std::fs::remove_file(&sock);
         let _ = std::fs::remove_file(caller::container_socket(&sock));
+        if let Some(ref extra) = extra_sock {
+            let _ = std::fs::remove_file(extra);
+        }
         on_signal.shutdown();
         // Give the guest a moment to power off before the VM is released.
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -221,6 +273,10 @@ pub fn run(_args: &[String]) -> io::Result<()> {
 
     #[cfg(target_os = "linux")]
     {
+        if let Some((extra_listener, _)) = extra_home {
+            let (engine_extra, gate_extra) = (engine.clone(), gate.clone());
+            std::thread::Builder::new().name("kiri-api-home".into()).spawn(move || accept(&extra_listener, &engine_extra, &gate_extra, caller::Caller::Host))?;
+        }
         let (engine2, gate2) = (engine.clone(), gate.clone());
         std::thread::Builder::new().name("kiri-api-containers".into()).spawn(move || accept(&for_containers.0, &engine2, &gate2, caller::Caller::Container))?;
         accept(&listener, &engine, &gate, caller::Caller::Host);
@@ -228,6 +284,14 @@ pub fn run(_args: &[String]) -> io::Result<()> {
     #[cfg(not(target_os = "linux"))]
     accept(&listener, &engine, caller::Caller::Host);
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn admit_connection(gate: &Option<std::sync::Arc<access::Gate>>, conn: &UnixStream) -> Result<Option<access::Seat>, ()> {
+    match gate {
+        Some(gate) => gate.admit(conn).map(Some).ok_or(()),
+        None => Ok(None),
+    }
 }
 
 /// Serves each connection `listener` takes, as `who`'s, on a thread of its own.
@@ -246,12 +310,8 @@ fn accept(
             // Checked here, not in the accept loop: a slow user lookup holds up
             // this connection only.
             #[cfg(target_os = "linux")]
-            let _seat = match &gate {
-                Some(gate) => match gate.admit(&conn) {
-                    Some(seat) => Some(seat),
-                    None => return,
-                },
-                None => None,
+            let Ok(_seat) = admit_connection(&gate, &conn) else {
+                return;
             };
             let _ = api::serve(conn, engine, who);
         });
@@ -264,7 +324,7 @@ fn accept(
 /// When the app this daemon runs from is deleted (appwatch.rs): docker
 /// build handed back (buildwith.rs: what was there before; the choice
 /// stays, so the app taken up again takes it again), and the engine stops.
-fn watch_own_app(engine: std::sync::Arc<engine::Engine>, socket: std::path::PathBuf) {
+fn watch_own_app(engine: std::sync::Arc<engine::Engine>, socket: std::path::PathBuf, extra_socket: Option<std::path::PathBuf>) {
     crate::appwatch::watch(move |exe| {
         diag::error!("the app this engine runs from was deleted; stopping and handing docker build back", path = exe.display());
         if let Err(e) = crate::buildwith::places().and_then(|p| p.give_back()) {
@@ -274,6 +334,9 @@ fn watch_own_app(engine: std::sync::Arc<engine::Engine>, socket: std::path::Path
         nfs::unmount();
         let _ = std::fs::remove_file(&socket);
         let _ = std::fs::remove_file(caller::container_socket(&socket));
+        if let Some(ref extra) = extra_socket {
+            let _ = std::fs::remove_file(extra);
+        }
         engine.shutdown();
         std::thread::sleep(Duration::from_millis(50));
         // 0: launchd restarts the engine on failure only, and there is
@@ -296,12 +359,67 @@ fn finder(engine: &std::sync::Arc<engine::Engine>) {
     }
 }
 
-/// Gives `group` read-write access to the socket.
-fn socket_group(socket: &std::path::Path, group: &std::ffi::OsStr) -> io::Result<()> {
+fn bind_daemon_socket(socket: &std::path::Path, access_group: Option<&std::ffi::OsStr>) -> io::Result<UnixListener> {
+    if let Some(dir) = socket.parent() {
+        std::fs::create_dir_all(dir)?;
+        if dir == std::path::Path::new("/run/kiri") {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755))?;
+        }
+    }
+    let _ = std::fs::remove_file(socket); // stale, from a daemon that died
+    let _ = std::fs::remove_dir(socket); // empty directory left by a pre-0.2.3 bind mount
+    let listener = UnixListener::bind(socket)?;
+    std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))?;
+    if let Some(group) = access_group {
+        socket_group(socket, group)?;
+    } else {
+        default_socket_access(socket)?;
+    }
+    Ok(listener)
+}
+
+/// Docker-compatible permissions for a root-run Linux daemon when no explicit
+/// `KIRI_SOCKET_GROUP` is configured: mode 0660 (never world-writable), with
+/// the `docker` group when present on the host.
+fn default_socket_access(socket: &std::path::Path) -> io::Result<()> {
+    // SAFETY: geteuid cannot fail.
+    let linux_root = cfg!(target_os = "linux") && unsafe { libc::geteuid() } == 0;
+    default_socket_access_with(socket, linux_root, lookup_group_gid, apply_socket_gid)
+}
+
+fn default_socket_access_with(
+    socket: &std::path::Path,
+    linux_root: bool,
+    lookup_gid: impl FnOnce(&std::ffi::OsStr) -> io::Result<u32>,
+    apply_gid: impl FnMut(&std::path::Path, Option<u32>) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut apply_gid = apply_gid;
+    if !linux_root {
+        return Ok(());
+    }
+    match lookup_gid(std::ffi::OsStr::new("docker")) {
+        Ok(gid) => match apply_gid(socket, Some(gid)) {
+            Ok(()) => Ok(()),
+            // In a single-user namespace where the host's `docker` gid is not
+            // mapped, chown returns EINVAL: keep the socket's group at 0660.
+            Err(e) if e.raw_os_error() == Some(libc::EINVAL) => apply_gid(socket, None),
+            Err(e) => Err(e),
+        },
+        // When `KIRI_SOCKET_GROUP` is unset, `docker` is optional: Alpine /
+        // BusyBox `getent group docker` exits 1 (`ErrorKind::Other`) when
+        // absent, while glibc exits 2 (`ErrorKind::NotFound`). Keep root's
+        // group at 0660 rather than refusing to start the daemon.
+        Err(_) => apply_gid(socket, None),
+    }
+}
+
+fn lookup_group_gid(group: &std::ffi::OsStr) -> io::Result<u32> {
     #[cfg(target_os = "linux")]
-    let gid = access::group_gid(group)?;
+    {
+        access::group_gid(group)
+    }
     #[cfg(not(target_os = "linux"))]
-    let gid = {
+    {
         let name = std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(group)).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
         // SAFETY: getgrnam with a valid C string; the result is read at once.
         unsafe {
@@ -309,9 +427,218 @@ fn socket_group(socket: &std::path::Path, group: &std::ffi::OsStr) -> io::Result
             if g.is_null() {
                 return Err(io::Error::new(io::ErrorKind::NotFound, format!("no group {}", group.to_string_lossy())));
             }
-            (*g).gr_gid
+            Ok((*g).gr_gid)
         }
-    };
-    std::os::unix::fs::chown(socket, None, Some(gid))?;
+    }
+}
+
+fn apply_socket_gid(socket: &std::path::Path, gid: Option<u32>) -> io::Result<()> {
+    if let Some(gid) = gid {
+        std::os::unix::fs::chown(socket, None, Some(gid))?;
+    }
     std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o660))
+}
+
+/// Gives `group` read-write access to the socket.
+fn socket_group(socket: &std::path::Path, group: &std::ffi::OsStr) -> io::Result<()> {
+    let gid = lookup_group_gid(group)?;
+    apply_socket_gid(socket, Some(gid))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsStr;
+    use std::os::unix::fs::MetadataExt;
+
+    #[test]
+    fn root_linux_default_socket_and_overrides() {
+        assert_eq!(socket_path_for(None, true, Some(OsStr::new("/root"))).unwrap(), PathBuf::from("/run/kiri/docker.sock"));
+        assert_eq!(socket_path_for(None, true, None).unwrap(), PathBuf::from("/run/kiri/docker.sock"));
+        assert_eq!(
+            socket_path_for(Some(OsStr::new("/custom/kiri.sock")), true, Some(OsStr::new("/root"))).unwrap(),
+            PathBuf::from("/custom/kiri.sock")
+        );
+        assert_eq!(
+            socket_path_for(None, false, Some(OsStr::new("/home/alice"))).unwrap(),
+            PathBuf::from("/home/alice").join(crate::flavor::STATE.get()).join("run/docker.sock")
+        );
+    }
+
+    #[test]
+    fn default_socket_access_uses_0660_never_world_writable_and_selects_docker_group() {
+        let dir = std::env::temp_dir().join(format!("kiri-daemon-sock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("docker.sock");
+        let _listener = UnixListener::bind(&sock).unwrap();
+        std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+
+        // Non-root / macOS default keeps 0600 and is never world-writable.
+        default_socket_access_with(&sock, false, |_| unreachable!(), apply_socket_gid).unwrap();
+        assert_eq!(mode(&sock), 0o600);
+        assert_eq!(mode(&sock) & 0o002, 0, "socket must never be world-writable");
+
+        // Root on Linux with `docker` group present selects `docker` group and 0660 (never 0666).
+        // SAFETY: getegid cannot fail.
+        let my_gid = unsafe { libc::getegid() };
+        let mut applied_gid = None;
+        default_socket_access_with(
+            &sock,
+            true,
+            |g| {
+                assert_eq!(g, OsStr::new("docker"));
+                Ok(my_gid)
+            },
+            |p, gid| {
+                applied_gid = gid;
+                apply_socket_gid(p, gid)
+            },
+        )
+        .unwrap();
+        assert_eq!(applied_gid, Some(my_gid));
+        assert_eq!(mode(&sock), 0o660);
+        assert_eq!(mode(&sock) & 0o007, 0, "socket must forbid world access (never 0666)");
+        assert_eq!(std::fs::metadata(&sock).unwrap().gid(), my_gid);
+
+        // Root on Linux without a `docker` group keeps existing group and sets 0660 (never 0666).
+        std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mut fallback_gid = Some(99999);
+        default_socket_access_with(
+            &sock,
+            true,
+            |_| Err(io::Error::new(io::ErrorKind::NotFound, "no group docker")),
+            |p, gid| {
+                fallback_gid = gid;
+                apply_socket_gid(p, gid)
+            },
+        )
+        .unwrap();
+        assert_eq!(fallback_gid, None);
+        assert_eq!(mode(&sock), 0o660);
+        assert_eq!(mode(&sock) & 0o007, 0, "socket must forbid world access (never 0666)");
+
+        // Unmapped gid in a user namespace (EINVAL) also falls back cleanly to 0660.
+        std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mut attempts = Vec::new();
+        default_socket_access_with(
+            &sock,
+            true,
+            |_| Ok(999),
+            |p, gid| {
+                attempts.push(gid);
+                if gid.is_some() {
+                    return Err(io::Error::from_raw_os_error(libc::EINVAL));
+                }
+                apply_socket_gid(p, None)
+            },
+        )
+        .unwrap();
+        assert_eq!(attempts, vec![Some(999), None]);
+        assert_eq!(mode(&sock), 0o660);
+
+        // BusyBox `getent group docker` exits 1 (`ErrorKind::Other`) when absent: must still start at 0660.
+        std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600)).unwrap();
+        default_socket_access_with(
+            &sock,
+            true,
+            |_| Err(io::Error::other("getent group docker: exit status: 1")),
+            apply_socket_gid,
+        )
+        .unwrap();
+        assert_eq!(mode(&sock), 0o660);
+
+        // Explicit KIRI_SOCKET_GROUP fails closed when the group does not exist.
+        assert_eq!(socket_group(&sock, OsStr::new("kiri-no-such-group-127")).unwrap_err().kind(), io::ErrorKind::NotFound);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn peer_authorization_allows_container_uid_when_unmanaged_and_denies_without_gid_or_when_managed() {
+        // Container-only numeric UID 54321 must not exist in the host's /etc/passwd.
+        #[cfg(target_os = "linux")]
+        const PROBE_ID: u32 = 54321;
+        let has_host_entry = std::fs::read_to_string("/etc/passwd")
+            .unwrap_or_default()
+            .lines()
+            .any(|l| l.split(':').nth(2) == Some("54321"));
+        assert!(!has_host_entry, "54321 must not be a host account");
+
+        let dir = std::env::temp_dir().join(format!("kiri-peer-auth-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let sock = dir.join("docker.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        // SAFETY: getegid cannot fail.
+        let sock_gid = unsafe { libc::getegid() };
+        default_socket_access_with(&sock, true, |_| Ok(sock_gid), apply_socket_gid).unwrap();
+
+        let m = std::fs::metadata(&sock).unwrap();
+        let mode = m.permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o660);
+        // Group rw (0o060) lets a container UID with supplementary `sock_gid` connect;
+        // other is 0 (0o007 == 0) so the kernel denies any UID/GID lacking `sock_gid` with EACCES.
+        assert_eq!(mode & 0o070, 0o060);
+        assert_eq!(mode & 0o007, 0);
+
+        #[cfg(target_os = "linux")]
+        {
+            let (_client, server) = UnixStream::pair().unwrap();
+            // 1. When KIRI_SOCKET_GROUP is unset (`gate` is `None`), a connected peer that
+            // passed the kernel's 0660 group check is admitted without requiring an `/etc/passwd` entry.
+            assert!(admit_connection(&None, &server).is_ok());
+
+            // 2. When KIRI_SOCKET_GROUP IS explicitly set, managed account-membership check is
+            // enforced: container-only numeric `uid=54321` is not a member of that managed group and is DENIED.
+            let gate = access::Gate::new(&[sock.as_path()], OsStr::new("root")).unwrap();
+            assert!(!gate.allowed_for_test(PROBE_ID).unwrap(), "non-NSS peer must be denied by managed KIRI_SOCKET_GROUP gate");
+
+            // SAFETY: geteuid cannot fail.
+            if unsafe { libc::geteuid() } == 0 {
+                let try_connect = |with_sock_gid: bool| -> io::ErrorKind {
+                    // SAFETY: fork in a test; the child only drops privileges, connects and exits with raw errno.
+                    unsafe {
+                        let pid = libc::fork();
+                        if pid == 0 {
+                            let rc = if with_sock_gid {
+                                let gids = [sock_gid as libc::gid_t];
+                                libc::setgroups(1, gids.as_ptr())
+                            } else {
+                                libc::setgroups(0, std::ptr::null())
+                            };
+                            if rc != 0 || libc::setgid(PROBE_ID) != 0 || libc::setuid(PROBE_ID) != 0 {
+                                libc::_exit(126);
+                            }
+                            match UnixStream::connect(&sock) {
+                                Ok(_) => libc::_exit(0),
+                                Err(e) => libc::_exit(e.raw_os_error().unwrap_or(1).clamp(1, 125)),
+                            }
+                        }
+                        let mut status = 0;
+                        libc::waitpid(pid, &mut status, 0);
+                        let code = libc::WEXITSTATUS(status);
+                        if code == 0 {
+                            io::ErrorKind::Other
+                        } else {
+                            io::Error::from_raw_os_error(code).kind()
+                        }
+                    }
+                };
+                // Denied by kernel 0660 when lacking `sock_gid`.
+                assert_eq!(try_connect(false), io::ErrorKind::PermissionDenied);
+                // Allowed by kernel 0660 when carrying supplementary `sock_gid`, and admitted when KIRI_SOCKET_GROUP is unset.
+                assert_eq!(try_connect(true), io::ErrorKind::Other);
+                let (accepted, _) = listener.accept().unwrap();
+                assert!(admit_connection(&None, &accepted).is_ok());
+                // Denied by managed `KIRI_SOCKET_GROUP` gate even after kernel 0660 connect.
+                assert!(admit_connection(&Some(gate), &accepted).is_err());
+            }
+        }
+        let _ = listener;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

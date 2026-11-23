@@ -276,3 +276,4 @@ bind-recreate	#402	deleting or replacing a bind-mounted file on the Mac left a s
 hostnet-published-loopback	#732	a port published on 127.0.0.1 was unreachable from a --network host container at 127.0.0.1 (Mac): connection refused
 hostnet-published-every-address	#732	the same for a port published on every address
 hostnet-dns-kiri	#732	a --network host container asked the Mac's resolver for the VM network directly, with no fallback when it refused
+socket-container-uid-group	#127	a standalone root-run Linux daemon put its 0600 socket under /root/.kiri/run/docker.sock instead of a 0660 /run/kiri/docker.sock, locking out containerized SDK clients whose numeric uid has no host account

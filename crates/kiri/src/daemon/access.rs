@@ -1137,6 +1137,17 @@ impl Gate {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn allowed_for_test(&self, uid: u32) -> io::Result<bool> {
+        let mut state = self.lookup.lock().unwrap_or_else(|e| e.into_inner());
+        state.recent.remove(&uid);
+        drop(state);
+        self.allowed_with(uid, |u| {
+            let group = self.cached_group()?;
+            Ok(member_of_detailed(u, &group)? == Membership::Allowed)
+        })
+    }
+
     fn allowed_with(&self, uid: u32, check: impl Fn(u32) -> io::Result<bool>) -> io::Result<bool> {
         if uid == 0 || uid == self.owner {
             return Ok(true);
