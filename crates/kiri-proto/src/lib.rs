@@ -627,6 +627,9 @@ pub struct ContainerStats {
     pub tx_packets: u64,
     pub io_read_bytes: u64,
     pub io_write_bytes: u64,
+    pub cpu_periods: u64,
+    pub cpu_throttled_periods: u64,
+    pub cpu_throttled_usec: u64,
 }
 
 fn put_container_stats(o: &mut Vec<u8>, s: &ContainerStats) {
@@ -638,10 +641,13 @@ fn put_container_stats(o: &mut Vec<u8>, s: &ContainerStats) {
     for v in [s.rx_bytes, s.rx_packets, s.tx_bytes, s.tx_packets, s.io_read_bytes, s.io_write_bytes] {
         put_u64(o, v);
     }
+    for v in [s.cpu_periods, s.cpu_throttled_periods, s.cpu_throttled_usec] {
+        put_u64(o, v);
+    }
 }
 
 fn read_container_stats(r: &mut Reader<'_>) -> Result<ContainerStats, DecodeError> {
-    Ok(ContainerStats {
+    let mut stats = ContainerStats {
         read_ns: r.u64()?,
         mem_current: r.u64()?,
         mem_max: r.u64()?,
@@ -658,7 +664,15 @@ fn read_container_stats(r: &mut Reader<'_>) -> Result<ContainerStats, DecodeErro
         tx_packets: r.u64()?,
         io_read_bytes: r.u64()?,
         io_write_bytes: r.u64()?,
-    })
+        ..Default::default()
+    };
+    // Older agents end the message after the block I/O counters.
+    if r.remaining() != 0 {
+        stats.cpu_periods = r.u64()?;
+        stats.cpu_throttled_periods = r.u64()?;
+        stats.cpu_throttled_usec = r.u64()?;
+    }
+    Ok(stats)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1539,6 +1553,29 @@ mod tests {
         m.encode(&mut buf);
         assert_eq!(frame_len(buf[..4].try_into().unwrap()).unwrap(), buf.len());
         assert_eq!(decode(&buf).unwrap(), m);
+    }
+
+    #[test]
+    fn cpu_throttling_stats() {
+        let stats = ContainerStats {
+            cpu_periods: 8,
+            cpu_throttled_periods: 3,
+            cpu_throttled_usec: 1200,
+            ..Default::default()
+        };
+        round(Msg::ContainerStats(stats));
+        // An older agent omits the three trailing throttling words.
+        let mut frame = Vec::new();
+        Msg::ContainerStats(stats).encode(&mut frame);
+        let mut old = frame[..frame.len() - 24].to_vec();
+        let len = (old.len() - 4) as u32;
+        old[..4].copy_from_slice(&len.to_le_bytes());
+        assert_eq!(decode(&old).unwrap(), Msg::ContainerStats(ContainerStats::default()));
+        // A truncated trailing section is rejected rather than partially decoded.
+        let mut partial = frame[..frame.len() - 8].to_vec();
+        let len = (partial.len() - 4) as u32;
+        partial[..4].copy_from_slice(&len.to_le_bytes());
+        assert_eq!(decode(&partial), Err(DecodeError::Truncated));
     }
 
     #[test]

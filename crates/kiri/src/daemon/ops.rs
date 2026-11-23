@@ -78,7 +78,11 @@ fn stats_json(id: &str, name: &str, s: &kiri_proto::ContainerStats, pre: Option<
             "cpu_usage": {"total_usage": s.cpu_usage_usec * 1000, "usage_in_kernelmode": s.cpu_system_usec * 1000, "usage_in_usermode": s.cpu_user_usec * 1000},
             "system_cpu_usage": s.system_ticks * TICK_NS,
             "online_cpus": s.online_cpus,
-            "throttling_data": {"periods": 0, "throttled_periods": 0, "throttled_time": 0},
+            "throttling_data": {
+                "periods": s.cpu_periods,
+                "throttled_periods": s.cpu_throttled_periods,
+                "throttled_time": s.cpu_throttled_usec.saturating_mul(1000),
+            },
         })
     };
     let read = time::rfc3339(std::time::SystemTime::now());
@@ -791,5 +795,41 @@ mod disk_usage_tests {
         assert_eq!(du.containers.get("c1"), Some(&8192));
         assert_eq!(du.volumes.get("data"), Some(&12288));
         assert_eq!((du.layers.len(), du.containers.len(), du.volumes.len()), (1, 1, 1));
+    }
+}
+
+#[cfg(test)]
+mod stats_tests {
+    use super::stats_json;
+    use kiri_proto::ContainerStats;
+    use serde_json::json;
+
+    #[test]
+    fn throttling_data_matches_cgroup_counters_in_docker_units() {
+        let prev = ContainerStats {
+            cpu_periods: 4,
+            cpu_throttled_periods: 2,
+            cpu_throttled_usec: 1000,
+            ..Default::default()
+        };
+        let sample = ContainerStats {
+            cpu_periods: 11,
+            cpu_throttled_periods: 9,
+            cpu_throttled_usec: 4321,
+            ..Default::default()
+        };
+        let value = stats_json("id", "work", &sample, Some(&prev), 0);
+        assert_eq!(
+            value["cpu_stats"]["throttling_data"],
+            json!({
+                "periods": 11, "throttled_periods": 9, "throttled_time": 4_321_000,
+            })
+        );
+        assert_eq!(
+            value["precpu_stats"]["throttling_data"],
+            json!({
+                "periods": 4, "throttled_periods": 2, "throttled_time": 1_000_000,
+            })
+        );
     }
 }

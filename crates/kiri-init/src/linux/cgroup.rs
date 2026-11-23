@@ -67,8 +67,20 @@ pub fn freeze(dir: &Path, frozen: bool) -> io::Result<()> {
     Err(io::Error::new(io::ErrorKind::TimedOut, "the container did not freeze in time"))
 }
 
+fn keyed_opt(text: &str, key: &str) -> Option<u64> {
+    text.lines().find_map(|l| l.strip_prefix(key).and_then(|v| v.strip_prefix(' '))).and_then(|v| v.trim().parse().ok())
+}
+
 fn keyed(text: &str, key: &str) -> u64 {
-    text.lines().find_map(|l| l.strip_prefix(key).and_then(|v| v.strip_prefix(' '))).and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+    keyed_opt(text, key).unwrap_or(0)
+}
+
+/// CPU throttling counters from `cpu.stat`: `(nr_periods, nr_throttled, throttled_usec)`.
+/// cgroup v2 reports `throttled_usec` in microseconds; cgroup v1 reports
+/// `throttled_time` in nanoseconds.
+fn cpu_throttling(cpu_stat: &str) -> (u64, u64, u64) {
+    let throttled_usec = keyed_opt(cpu_stat, "throttled_usec").unwrap_or_else(|| keyed(cpu_stat, "throttled_time") / 1000);
+    (keyed(cpu_stat, "nr_periods"), keyed(cpu_stat, "nr_throttled"), throttled_usec)
 }
 
 /// What the cgroup holds and cannot give back, in bytes: anonymous, shared
@@ -114,6 +126,7 @@ pub fn stats(dir: &Path, pid: libc::pid_t) -> io::Result<ContainerStats> {
     let read = |f: &str| fs::read_to_string(dir.join(f)).unwrap_or_default();
     let cpu = read("cpu.stat");
     let mem_stat = read("memory.stat");
+    let (cpu_periods, cpu_throttled_periods, cpu_throttled_usec) = cpu_throttling(&cpu);
     let mut s = ContainerStats {
         read_ns: sys::boottime_ns(),
         mem_current: read("memory.current").trim().parse().unwrap_or(0),
@@ -122,6 +135,9 @@ pub fn stats(dir: &Path, pid: libc::pid_t) -> io::Result<ContainerStats> {
         cpu_usage_usec: keyed(&cpu, "usage_usec"),
         cpu_user_usec: keyed(&cpu, "user_usec"),
         cpu_system_usec: keyed(&cpu, "system_usec"),
+        cpu_periods,
+        cpu_throttled_periods,
+        cpu_throttled_usec,
         pids: read("pids.current").trim().parse().unwrap_or(0),
         // SAFETY: sysconf has no preconditions.
         online_cpus: unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) }.max(1) as u32,
@@ -347,6 +363,20 @@ mod tests {
         assert_eq!(fs::read_to_string(dir.join("pids.max")).unwrap(), "32");
         assert!(!dir.join("memory.max").exists());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cpu_throttling_reads_v2_and_v1_formats() {
+        let v2 = "usage_usec 12345\nuser_usec 10000\nsystem_usec 2345\nnr_periods 12\nnr_throttled 5\nthrottled_usec 43210\n";
+        assert_eq!(cpu_throttling(v2), (12, 5, 43_210));
+
+        let v2_zero = "usage_usec 500\nnr_periods 4\nnr_throttled 0\nthrottled_usec 0\n";
+        assert_eq!(cpu_throttling(v2_zero), (4, 0, 0));
+
+        let v1 = "nr_periods 12\nnr_throttled 5\nthrottled_time 43210000\n";
+        assert_eq!(cpu_throttling(v1), (12, 5, 43_210));
+
+        assert_eq!(cpu_throttling(""), (0, 0, 0));
     }
 
     #[test]

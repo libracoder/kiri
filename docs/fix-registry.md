@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #537 Engine: report cgroup CPU throttling in container stats (unreleased)
+- Fixes: no issue
+- Caused: none known
+- Caused by: -
+- Check: `stats-cpu-throttling`
+
 ### #779 Bench: fail the API benchmark on curl errors instead of timing failed runs (unreleased)
 - Fixes: #669 `bench/api.sh` passes `--ignore-failure` to `hyperfine` on `api-exec`, masking curl failures and recording time-to-failure as valid timings
 - Caused: none known

@@ -258,3 +258,4 @@ limit-memory-swap-inspect	#523	containers with --memory reported HostConfig.Memo
 limit-memory-swap-refused	#523	invalid --memory-swap values on create and update were accepted instead of refused with Docker's error messages (#690)
 limit-memory-swap-update	#523	docker update dropped --memory-swap or failed to keep an existing custom or unlimited swap limit (#690)
 limit-memory-swap	#523	every container with --memory was pinned to memory.swap.max = 0 instead of getting Docker's 2x default or --memory-swap (#690)
+stats-cpu-throttling	#537	container stats always reported zero for cpu_stats.throttling_data even when a CPU-limited container was throttled

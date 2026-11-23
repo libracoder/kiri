@@ -1655,6 +1655,14 @@ t oom-kill "137" bash -c "$D run --rm --memory 32m alpine sh -c 'tail /dev/zero'
 t stats "128MiB" $D stats --no-stream --format '{{.MemUsage}}' lim
 t stats-pids "PIDS" $D stats --no-stream lim
 t stats-stream "lim" bash -c "perl -e 'alarm 3; exec @ARGV' $D stats --format '{{.Name}}' lim 2>/dev/null | head -1"
+# Container stats carry cgroup CPU throttling counters in Docker units (#537).
+t stats-cpu-throttling "ok" bash -c "
+  $D rm -f lim-thr >/dev/null 2>&1
+  id=\$($D run -d --name lim-thr --cpus 0.1 alpine sh -c 'i=0; while [ \$i -lt 200000 ]; do i=\$((i+1)); done; sleep 10')
+  out=\$(curl -s --unix-socket $(printf %q "$SOCK") \"http://d/v1.47/containers/\$id/stats?stream=false\" | python3 -c 'import json, sys; td = json.load(sys.stdin)[\"cpu_stats\"][\"throttling_data\"]; print(\"ok\" if td[\"periods\"] > 0 and td[\"throttled_periods\"] > 0 and td[\"throttled_time\"] > 0 else td)')
+  $D rm -f lim-thr >/dev/null 2>&1
+  echo \"\$out\"
+"
 t top "nginx: master process" $D top lim
 t top-ps-titles "PPID" $D top lim
 # ps_args picks ps's columns, as Docker runs ps with them (#348).
