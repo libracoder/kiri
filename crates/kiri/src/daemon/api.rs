@@ -1366,6 +1366,23 @@ fn port_bindings(body: &Value, engine: &Engine, image: &kiri_image::Image) -> Re
 /// The VM path containers mount to reach the Mac's SSH agent (Docker
 /// Desktop's and OrbStack's name for it).
 const SSH_AGENT_SOCK: &str = "/run/host-services/ssh-auth.sock";
+const HOST_SSH_AGENT_SOCK: &str = "/run/kiri/host-services/ssh-auth.sock";
+
+/// What the guest is given for that bind: the VM's path, or on a Linux host
+/// where the agent listens, under Kiri's own /run/kiri. The host's
+/// /run/host-services belongs to Docker Desktop for Linux, and the agent
+/// never creates it there (#420). Inspect still shows the path asked for.
+fn ssh_agent_source() -> &'static str {
+    ssh_agent_source_for(cfg!(target_os = "linux"))
+}
+
+fn ssh_agent_source_for(linux: bool) -> &'static str {
+    if linux { HOST_SSH_AGENT_SOCK } else { SSH_AGENT_SOCK }
+}
+
+fn is_ssh_agent_sock(src: &str) -> bool {
+    src.starts_with('/') && lexical_path(src) == SSH_AGENT_SOCK
+}
 
 /// A container's mounts, worked out at create time.
 struct Mounts {
@@ -1466,6 +1483,9 @@ fn fresh_bind_sources_with(guest: &[String], info: &[Value], engine_socket: impl
             let Some((old, rest)) = line.split_once('\t') else { return line.clone() };
             let src = info.get(idx).filter(|i| paired && i["Type"] == "bind").and_then(|i| i["Source"].as_str());
             if !mac {
+                if is_ssh_agent_sock(old) || src.is_some_and(is_ssh_agent_sock) {
+                    return format!("{}\t{rest}", ssh_agent_source_for(!mac));
+                }
                 let given = src.and_then(&engine_socket).or_else(|| old.starts_with('/').then(|| engine_socket(old)).flatten());
                 return given.map_or_else(|| line.clone(), |given| format!("{given}\t{rest}"));
             }
@@ -1655,8 +1675,8 @@ fn mounts(body: &Value, engine: &Engine, image: &kiri_image::Image) -> Result<Mo
                 out.guest.push(format!("{}\t{dst}\t{}", engine_sock.as_deref().unwrap_or_default(), flag("")));
                 out.info.push(json!({"Type": "bind", "Source": src, "Destination": dst, "Mode": "", "RW": !ro, "Propagation": "rprivate"}));
             }
-            "bind" if src == SSH_AGENT_SOCK => {
-                out.guest.push(format!("{src}\t{dst}\t{}", flag("")));
+            "bind" if is_ssh_agent_sock(src) => {
+                out.guest.push(format!("{}\t{dst}\t{}", ssh_agent_source(), flag("")));
                 out.info.push(json!({"Type": "bind", "Source": src, "Destination": dst, "Mode": "", "RW": !ro, "Propagation": "rprivate"}));
             }
             "bind" => {
@@ -3869,6 +3889,31 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// Both `-v /run/host-services/ssh-auth.sock:...` and `--mount type=bind,source=/run/host-services/ssh-auth.sock,...`
+    /// resolve to `ssh_agent_source()` for the guest while keeping `/run/host-services/ssh-auth.sock`
+    /// in inspect, without needing `/run/host-services` to exist on the host (#420).
+    #[test]
+    fn ssh_agent_mounts_resolve_without_touching_host_run_host_services() {
+        let (root, engine) = engine_in("ssh-agent-mounts", false);
+        let image = test_image("ssh:1");
+        let body = json!({
+            "HostConfig": {
+                "Binds": ["/run/host-services/ssh-auth.sock:/run/host-services/ssh-auth.sock"],
+                "Mounts": [{"Type": "bind", "Source": "/run/host-services/ssh-auth.sock", "Target": "/agent.sock", "ReadOnly": true}],
+            }
+        });
+        let m = mounts(&body, &engine, &image).unwrap();
+        let src = ssh_agent_source();
+        assert_eq!(m.guest, [format!("{src}\t/run/host-services/ssh-auth.sock\t"), format!("{src}\t/agent.sock\tro")]);
+        assert_eq!(m.info[0]["Source"], "/run/host-services/ssh-auth.sock");
+        assert_eq!(m.info[0]["RW"], true);
+        assert_eq!(m.info[1]["Source"], "/run/host-services/ssh-auth.sock");
+        assert_eq!(m.info[1]["Destination"], "/agent.sock");
+        assert_eq!(m.info[1]["RW"], false);
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     /// `--pid`: empty and `host` as given, `container:<name>` kept with the
     /// full id; anything else, or an unknown container, refused.
     #[test]
@@ -5239,6 +5284,38 @@ mod network_option_tests {
         assert!(super::check_volume_device(&opts(&[("type", "nfs"), ("o", "addr=10.0.0.1"), ("device", ":/export")])).is_ok());
         assert!(super::check_volume_device(&opts(&[("type", "tmpfs"), ("device", "tmpfs")])).is_ok());
         assert!(super::check_volume_device(&opts(&[])).is_ok());
+    }
+
+    #[test]
+    fn ssh_agent_bind_uses_the_agent_host_path_on_linux() {
+        // The guest is told where the agent listens: the VM's path, or
+        // Kiri's own /run/kiri on a Linux host (#420).
+        assert_eq!(super::ssh_agent_source_for(false), "/run/host-services/ssh-auth.sock");
+        assert_eq!(super::ssh_agent_source_for(true), "/run/kiri/host-services/ssh-auth.sock");
+        assert_eq!(
+            super::ssh_agent_source(),
+            if cfg!(target_os = "linux") { "/run/kiri/host-services/ssh-auth.sock" } else { "/run/host-services/ssh-auth.sock" }
+        );
+        assert!(super::is_ssh_agent_sock("/run/host-services/ssh-auth.sock"));
+        assert!(super::is_ssh_agent_sock("/run/host-services//ssh-auth.sock"));
+        assert!(super::is_ssh_agent_sock("/run/./host-services/ssh-auth.sock"));
+        assert!(!super::is_ssh_agent_sock("run/host-services/ssh-auth.sock"));
+        // A container made before #420 with /run/host-services/ssh-auth.sock
+        // in its saved guest mount line gets /run/kiri/host-services/ssh-auth.sock
+        // when started on Linux, while inspect keeps the path asked for.
+        let guest = vec!["/run/host-services/ssh-auth.sock\t/run/host-services/ssh-auth.sock\tro".to_owned()];
+        let info = vec![serde_json::json!({"Type": "bind", "Source": "/run/host-services/ssh-auth.sock"})];
+        assert_eq!(
+            super::fresh_bind_sources_with(&guest, &info, |_| None, false),
+            ["/run/kiri/host-services/ssh-auth.sock\t/run/host-services/ssh-auth.sock\tro"]
+        );
+        assert_eq!(super::fresh_bind_sources_with(&guest, &[], |_| None, false), ["/run/kiri/host-services/ssh-auth.sock\t/run/host-services/ssh-auth.sock\tro"]);
+        let slash_guest = vec!["/run/host-services//ssh-auth.sock\t/run/host-services/ssh-auth.sock\tro".to_owned()];
+        assert_eq!(
+            super::fresh_bind_sources_with(&slash_guest, &[], |_| None, false),
+            ["/run/kiri/host-services/ssh-auth.sock\t/run/host-services/ssh-auth.sock\tro"]
+        );
+        assert_eq!(super::fresh_bind_sources_with(&guest, &info, |_| None, true), guest);
     }
 
     /// `--add-host name:ip` and `--hostname` are written into the container's

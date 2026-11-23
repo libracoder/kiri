@@ -430,29 +430,89 @@ impl Relay {
 /// SSH agent forwarding: containers that mount this socket reach the Mac's
 /// SSH agent. Each connection is relayed over vsock; keys never leave the Mac.
 pub const SSH_AGENT_SOCK: &str = "/run/host-services/ssh-auth.sock";
+/// The same socket on a Linux host: under Kiri's own runtime directory, not
+/// the host's /run/host-services, which Docker Desktop for Linux also uses
+/// for its docker.proxy.sock. Creating that directory root 0700 stopped
+/// Docker Desktop from starting (#420), so on a host process the agent
+/// never creates or chmods it.
+pub const HOST_SSH_AGENT_SOCK: &str = "/run/kiri/host-services/ssh-auth.sock";
 pub const SSH_VSOCK_PORT: u32 = 1027;
 
+/// Where the agent listens for SSH agent connections: the VM's
+/// /run/host-services, or Kiri's own directory on a Linux host.
+fn ssh_agent_sock() -> &'static str {
+    ssh_agent_sock_for(super::transport::is_host_process())
+}
+
+fn ssh_agent_sock_for(host_process: bool) -> &'static str {
+    if host_process { HOST_SSH_AGENT_SOCK } else { SSH_AGENT_SOCK }
+}
+
 pub fn listen_ssh_agent() -> io::Result<OwnedFd> {
-    std::fs::create_dir_all("/run/host-services")?;
-    let _ = std::fs::remove_file(SSH_AGENT_SOCK);
-    // SAFETY: plain unix socket setup; the fd is owned immediately.
+    listen_ssh_agent_at(ssh_agent_sock())
+}
+
+fn listen_ssh_agent_at(sock_path: &str) -> io::Result<OwnedFd> {
+    use std::os::unix::fs::DirBuilderExt;
+    let (dir, sock_name) = match sock_path.rsplit_once('/') {
+        Some((d, name)) if !name.is_empty() => (if d.is_empty() { "/" } else { d }, name),
+        _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("invalid socket path: {sock_path}"))),
+    };
+    if let Some((parent, _)) = dir.rsplit_once('/')
+        && !parent.is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    // SAFETY: plain unix socket setup against a directory fd opened with O_NOFOLLOW; fds are owned immediately.
     unsafe {
-        // The socket below is 0777 for any user in a container. On a Linux
-        // host this directory is the host's own, so only root, which
-        // bind-mounts the socket into containers, may reach it by path.
-        let dir = std::ffi::CString::new("/run/host-services").expect("no NUL");
-        sys::check(libc::chmod(dir.as_ptr(), 0o700) as _, "chmod /run/host-services")?;
-        let fd = sys::check(libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK, 0) as _, "socket")?;
-        let sock = OwnedFd::from_raw_fd(fd as RawFd);
+        // The socket below is 0777 for any user in a container. This
+        // directory is the agent's own (the VM's /run/host-services, or
+        // Kiri's /run/kiri/host-services on a Linux host), so only root,
+        // which bind-mounts the socket into containers, may reach it by path.
+        // Opened with O_DIRECTORY | O_NOFOLLOW before unlinking or binding so
+        // a symlink there is refused without touching its target.
+        let dir_c = std::ffi::CString::new(dir).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in directory path"))?;
+        let sock_c = std::ffi::CString::new(sock_name).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in socket name"))?;
+        let dfd = sys::check(
+            libc::open(dir_c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) as _,
+            &format!("open {dir}"),
+        )?;
+        let dfd = OwnedFd::from_raw_fd(dfd as RawFd);
+        if libc::geteuid() == 0 {
+            sys::check(libc::fchown(dfd.as_raw_fd(), 0, 0) as _, &format!("chown {dir}"))?;
+        }
+        sys::check(libc::fchmod(dfd.as_raw_fd(), 0o700) as _, &format!("chmod {dir}"))?;
+        if libc::unlinkat(dfd.as_raw_fd(), sock_c.as_ptr(), 0) != 0 {
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() != Some(libc::ENOENT) {
+                return Err(e);
+            }
+        }
         let mut a: libc::sockaddr_un = std::mem::zeroed();
         a.sun_family = libc::AF_UNIX as libc::sa_family_t;
-        for (d, s) in a.sun_path.iter_mut().zip(SSH_AGENT_SOCK.bytes()) {
+        if sock_path.len() >= a.sun_path.len() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("socket path too long: {sock_path}")));
+        }
+        let proc_dir = format!("/proc/self/fd/{}", dfd.as_raw_fd());
+        let proc_sock = format!("{proc_dir}/{sock_name}");
+        let bind_path = if proc_sock.len() < a.sun_path.len() && std::path::Path::new(&proc_dir).exists() {
+            proc_sock.as_str()
+        } else {
+            sock_path
+        };
+        for (d, s) in a.sun_path.iter_mut().zip(bind_path.bytes()) {
             *d = s as libc::c_char;
         }
+        let fd = sys::check(libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK, 0) as _, "socket")?;
+        let sock = OwnedFd::from_raw_fd(fd as RawFd);
         sys::check(libc::bind(sock.as_raw_fd(), (&a as *const libc::sockaddr_un).cast(), std::mem::size_of::<libc::sockaddr_un>() as u32) as _, "bind")?;
         // Any user in a container may use it, as with Docker Desktop.
-        let path = std::ffi::CString::new(SSH_AGENT_SOCK).expect("no NUL");
-        libc::chmod(path.as_ptr(), 0o777);
+        sys::check(libc::fchmodat(dfd.as_raw_fd(), sock_c.as_ptr(), 0o777, 0) as _, &format!("chmod {sock_path}"))?;
         sys::check(libc::listen(sock.as_raw_fd(), 64) as _, "listen")?;
         Ok(sock)
     }
@@ -538,5 +598,52 @@ mod tests {
         // No room for a frame: not read, and not taken for EOF.
         let full = buf.len() + 4;
         assert_eq!(super::read_frame_into(r.as_raw_fd(), &mut buf, full).unwrap(), 1);
+    }
+
+    #[test]
+    fn ssh_agent_socket_stays_out_of_the_host_run_host_services() {
+        use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+        // In the VM the socket is the VM's own /run/host-services; on a Linux
+        // host it moves under Kiri's /run/kiri, so Docker Desktop for Linux
+        // keeps its docker.proxy.sock there (#420).
+        assert_eq!(super::ssh_agent_sock_for(false), "/run/host-services/ssh-auth.sock");
+        assert_eq!(super::ssh_agent_sock_for(true), "/run/kiri/host-services/ssh-auth.sock");
+
+        let root = std::path::PathBuf::from(format!("/tmp/kiri-ssh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let sock = root.join("kiri/host-services/ssh-auth.sock");
+        let sock_str = sock.to_str().unwrap();
+        let listener = super::listen_ssh_agent_at(sock_str).unwrap();
+        assert!(!root.join("host-services").exists(), "sibling host-services must not be created");
+        let dir_mode = std::fs::metadata(root.join("kiri/host-services")).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700, "parent directory must be 0700 so unprivileged host users cannot traverse it");
+        let meta = std::fs::symlink_metadata(&sock).unwrap();
+        assert!(meta.file_type().is_socket());
+        assert_eq!(meta.permissions().mode() & 0o777, 0o777);
+        drop(listener);
+
+        // An existing broader directory is tightened to 0700 and a stale socket is replaced.
+        std::fs::set_permissions(root.join("kiri/host-services"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let listener = super::listen_ssh_agent_at(sock_str).unwrap();
+        let dir_mode = std::fs::metadata(root.join("kiri/host-services")).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700);
+        drop(listener);
+
+        // A symlink at the host-services directory is refused without chmodding
+        // its target or unlinking an existing file inside it.
+        std::fs::remove_dir_all(root.join("kiri/host-services")).unwrap();
+        let victim = root.join("victim");
+        std::fs::create_dir(&victim).unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let canary = victim.join("ssh-auth.sock");
+        std::fs::write(&canary, b"keep").unwrap();
+        std::os::unix::fs::symlink(&victim, root.join("kiri/host-services")).unwrap();
+        assert!(super::listen_ssh_agent_at(sock_str).is_err());
+        assert_eq!(std::fs::metadata(&victim).unwrap().permissions().mode() & 0o777, 0o755);
+        assert_eq!(std::fs::read(&canary).unwrap(), b"keep", "symlink target contents must not be unlinked");
+
+        let long = format!("{}/{}", root.display(), "a".repeat(120));
+        assert_eq!(super::listen_ssh_agent_at(&long).unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

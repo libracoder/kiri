@@ -222,3 +222,5 @@ cp-in-keeps-owner	#594	PUT /containers/{id}/archive and docker cp without -a gav
 cp-in-keeps-dir-and-symlink-owner	#594	PUT /containers/{id}/archive without copyUIDGID must keep directory and symlink owners from the tar headers without chowning symlink targets
 cp-in-copy-uidgid	#594	PUT /containers/{id}/archive with copyUIDGID (docker cp -a) must chown unpacked entries to the container's Config.User when set while keeping tar header owners without -a or when Config.User is empty
 wsl-hybrid-cgroup	#277	on stock WSL 2 (hybrid /sys/fs/cgroup tmpfs + /sys/fs/cgroup/unified cgroup2, with controllers held by v1), kiri-init exited 1 and containers failed to start
+host-services-untouched	#420	on a Linux host kiri-init created /run/host-services as root 0700, locking Docker Desktop for Linux out of /run/host-services/docker.proxy.sock
+host-services-ssh-agent-mount	#420	containers mounting /run/host-services/ssh-auth.sock must still get the agent's SSH relay socket while the host's /run/host-services is left alone

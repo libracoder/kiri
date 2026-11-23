@@ -1024,6 +1024,10 @@ code bind-mount-missing 125 $D run --rm --mount type=bind,source=/kiri/does/not/
 # host the daemon's umask (0027) must not shut out the user whose mount it is.
 t bind-v-creates "made 755 755" bash -c "$D run --rm -v $BIND/new/dir:/n alpine true && [ -d $BIND/new/dir ] && perl -e 'print q(made); printf q( %o), (stat)[2] & 07777 for @ARGV' $BIND/new $BIND/new/dir"
 t bind-file "from the mac" $D run --rm -v "$BIND/hello.txt:/etc/greeting" alpine cat /etc/greeting
+# Docker Desktop's SSH agent mount path (/run/host-services/ssh-auth.sock) works
+# through -v and --mount for non-root container users too, while inspect shows
+# the path asked for (#420).
+t host-services-ssh-agent-mount "sock1=ok sock2=ok src=/run/host-services/ssh-auth.sock" bash -c "id=\$($D create -u 1000:1000 -v /run/host-services/ssh-auth.sock:/run/host-services/ssh-auth.sock --mount type=bind,source=/run/host-services/ssh-auth.sock,target=/ssh2.sock alpine sh -c 'test -S /run/host-services/ssh-auth.sock && test -w /run/host-services/ssh-auth.sock && s1=ok || s1=no; test -S /ssh2.sock && test -w /ssh2.sock && s2=ok || s2=no; printf \"sock1=%s sock2=%s \" \"\$s1\" \"\$s2\"'); src=\$($D inspect -f '{{(index .Mounts 0).Source}}' \$id); $D start -a \$id; $D rm -f \$id >/dev/null; echo \"src=\$src\""
 # A file made, changed and deleted on the Mac raises inotify events in the
 # container, as one made there does: file watchers (Vite, webpack, nodemon)
 # pick up saves made in an editor on the Mac. inotifyd prints n (created),
