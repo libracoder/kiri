@@ -2708,7 +2708,11 @@ fn endpoints(c: &Container, networks: &[super::network::Network]) -> Value {
             }),
         );
     };
-    add(&c.spec.network_mode, c.ip, c.ip6, &c.spec.aliases, &c.spec.ipv4_address, &c.spec.ipv6_address);
+    // A first network it left while running is not shown, as Docker shows
+    // none it was disconnected from (see `Container::first_network_left`).
+    if !c.first_network_left {
+        add(&c.spec.network_mode, c.ip, c.ip6, &c.spec.aliases, &c.spec.ipv4_address, &c.spec.ipv6_address);
+    }
     for x in &c.spec.extra_networks {
         let ip6 = c.extra_ip6s.iter().find(|(n, _)| *n == x.name).map(|(_, ip)| *ip);
         add(&x.name, c.extra_ips.iter().find(|(n, _)| *n == x.name).map(|(_, ip)| *ip), ip6, &x.aliases, &x.ipv4_address, &x.ipv6_address);
@@ -2781,7 +2785,7 @@ fn list(req: &Request, engine: &Engine) -> Result<Value, Error> {
             return None;
         }
         let labels = if c.spec.labels.is_object() { c.spec.labels.clone() } else { json!({}) };
-        let net = networks.iter().find(|n| n.name == c.spec.network_mode || n.id == c.spec.network_mode || (c.spec.network_mode == "default" && n.name == "bridge"));
+        let net = networks.iter().find(|n| n.name == c.spec.network_mode || n.id == c.spec.network_mode || (c.spec.network_mode == "default" && n.name == "bridge")).filter(|_| !c.first_network_left);
         let keep = f.any("id", |v| c.id.starts_with(v))
             && f.name(&c.name)
             && f.labels(&labels)
@@ -2929,17 +2933,21 @@ fn network_settings(c: &Container, nets: &[super::network::Network]) -> Value {
     let prefix_of = |name: &str, has_ip: bool| if has_ip { nets.iter().find(|n| n.name == name).map_or(16, |n| n.prefix) } else { 0 };
     // An IPv6-only network's IPv4 addresses are Kiri's own, not shown.
     let v4_on = |name: &str| !nets.iter().any(|n| n.name == name && n.no_ipv4);
-    let ip = c.ip.filter(|_| v4_on(&c.spec.network_mode)).map(super::network::ip_str).unwrap_or_default();
+    // A first network it left while running is not shown (see `endpoints`).
+    let first = !c.first_network_left;
+    let ip = c.ip.filter(|_| first && v4_on(&c.spec.network_mode)).map(super::network::ip_str).unwrap_or_default();
     let v6 = |name: &str, ip6: Option<[u8; 16]>| {
         let n = nets.iter().find(|n| n.name == name).and_then(|n| n.v6.as_ref()).filter(|_| ip6.is_some());
         (ip6.map(super::network::ip6_str).unwrap_or_default(), n.map_or(0, |v| v.prefix), n.map(|v| super::network::ip6_str(v.gateway)).unwrap_or_default())
     };
     let mut networks = serde_json::Map::new();
-    let (ip6, prefix6, gateway6) = v6(&c.spec.network_mode, c.ip6);
-    networks.insert(
-        c.spec.network_mode.clone(),
-        json!({"IPAddress": ip, "IPPrefixLen": prefix_of(&c.spec.network_mode, !ip.is_empty()), "IPAMConfig": ipam_config(&c.spec.ipv4_address, &c.spec.ipv6_address), "Aliases": c.spec.aliases, "NetworkID": "", "MacAddress": c.spec.mac_address, "GlobalIPv6Address": ip6, "GlobalIPv6PrefixLen": prefix6, "IPv6Gateway": gateway6}),
-    );
+    let (ip6, prefix6, gateway6) = v6(&c.spec.network_mode, c.ip6.filter(|_| first));
+    if first {
+        networks.insert(
+            c.spec.network_mode.clone(),
+            json!({"IPAddress": ip, "IPPrefixLen": prefix_of(&c.spec.network_mode, !ip.is_empty()), "IPAMConfig": ipam_config(&c.spec.ipv4_address, &c.spec.ipv6_address), "Aliases": c.spec.aliases, "NetworkID": "", "MacAddress": c.spec.mac_address, "GlobalIPv6Address": ip6, "GlobalIPv6PrefixLen": prefix6, "IPv6Gateway": gateway6}),
+        );
+    }
     for x in &c.spec.extra_networks {
         let ip = c.extra_ips.iter().find(|(n, _)| *n == x.name).filter(|_| v4_on(&x.name)).map(|(_, ip)| super::network::ip_str(*ip)).unwrap_or_default();
         let prefix = prefix_of(&x.name, !ip.is_empty());
@@ -6055,6 +6063,45 @@ mod leave_first_network_tests {
         engine.disconnect("probe-net", &id).unwrap();
         assert!(names(&container_inspect(&engine, &id).unwrap()["NetworkSettings"]["Networks"]).is_empty());
         assert!(names(&engine.with(&id, |c| network_settings(c, &networks)).unwrap()["Networks"]).is_empty());
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A running container that left its first network shows no network and
+    /// no address there, as Docker shows it after a disconnect, though Kiri
+    /// keeps it plugged in until it stops; joined again, it shows the
+    /// network with the aliases it was given now (#789).
+    #[test]
+    fn inspect_hides_a_first_network_left_while_running() {
+        let root = std::env::temp_dir().join(format!("kiri-leave-first-running-api-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let engine = super::super::engine::boot_without_vm(&root);
+        engine.lock_net().create("probe-net", Default::default()).unwrap();
+        let image = kiri_image::Image { mirror: None,
+            name: "test:1".into(), digest: "sha256:0123".into(), index_digest: None, config_digest: "sha256:0123".into(),
+            layers: Vec::new(), size: 0, platform: "linux/arm64".into(), created: String::new(), pulled_at: 0, config: Default::default(),
+        };
+        let spec: super::super::engine::Spec = serde_json::from_value(json!({
+            "image": "test:1", "image_id": "sha256:0123", "entrypoint": [], "cmd": ["true"],
+            "env": [], "cwd": "/", "user": "", "auto_remove": false, "network_mode": "probe-net", "labels": {},
+            "restart": {"name": "no", "max_retries": 0}
+        })).unwrap();
+        let id = engine.create(Some("probe".into()), spec, &image).unwrap();
+        engine.mark_running_for_test(&id, [172, 30, 0, 5]);
+        let names = |v: &Value| v.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+        let networks: Vec<super::super::network::Network> = engine.lock_net().all().to_vec();
+        assert_eq!(names(&container_inspect(&engine, &id).unwrap()["NetworkSettings"]["Networks"]), ["probe-net"]);
+        engine.disconnect("probe-net", &id).unwrap();
+        assert!(names(&container_inspect(&engine, &id).unwrap()["NetworkSettings"]["Networks"]).is_empty());
+        let settings = engine.with(&id, |c| network_settings(c, &networks)).unwrap();
+        assert!(names(&settings["Networks"]).is_empty());
+        assert_eq!(settings["IPAddress"], "");
+        engine.connect("probe-net", &id, vec!["router".into()], String::new(), String::new(), String::new()).unwrap();
+        let inspected = container_inspect(&engine, &id).unwrap();
+        assert_eq!(names(&inspected["NetworkSettings"]["Networks"]), ["probe-net"]);
+        assert_eq!(inspected["NetworkSettings"]["Networks"]["probe-net"]["Aliases"], json!(["router"]));
+        assert_eq!(inspected["NetworkSettings"]["Networks"]["probe-net"]["IPAddress"], "172.30.0.5");
         drop(engine);
         let _ = std::fs::remove_dir_all(root);
     }

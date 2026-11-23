@@ -2008,7 +2008,13 @@ t leave-first-inspect "[probe-net ]" bash -c "echo \"[\$($D inspect -f '{{range 
 t leave-first-default-route "default via" $D exec probe ip route
 t leave-first-dns "Name:" $D exec probe nslookup probe-peer
 t leave-first-no-eth1 "eth0 only" bash -c "$D exec probe ip -o link | grep -q eth1 && echo also-eth1 || echo eth0 only"
-t leave-first-running-refused "stop the container first" bash -c "$D network connect bridge probe && $D network disconnect probe-net probe 2>&1"
+# A running container leaves its first network as far as others can see:
+# its name stops resolving there, and connecting it again with a new alias
+# brings it back on the same address. That is how a tool updates a running
+# container's aliases (DDEV's router, #789).
+t leave-first-running-gone "gone" bash -c "$D network disconnect probe-net probe && ($D exec probe-peer nslookup probe >/dev/null 2>&1 && echo still || echo gone)"
+t leave-first-running-inspect "[]" bash -c "echo \"[\$($D inspect -f '{{range \$k, \$v := .NetworkSettings.Networks}}{{\$k}} {{end}}' probe)]\""
+t leave-first-running-rejoin "Name:" bash -c "$D network connect --alias probe-alias probe-net probe && $D exec probe-peer nslookup probe-alias"
 t leave-last-network "lo only" bash -c "$D rm -f probe >/dev/null; $D create --name probe alpine sleep 300 >/dev/null && $D network disconnect bridge probe && $D start probe >/dev/null && ($D exec probe ip -o link | grep -q eth0 && echo has-eth0 || echo lo only)"
 t leave-last-reconnect "Name:" bash -c "$D stop -t 0 probe >/dev/null && $D network connect probe-net probe && $D start probe >/dev/null && $D exec probe nslookup probe-peer"
 $D rm -f probe probe-peer >/dev/null; t leave-first-network-rm "removed" bash -c "$D network rm probe-net >/dev/null && echo removed"
