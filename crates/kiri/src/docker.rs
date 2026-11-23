@@ -21,7 +21,7 @@ pub const COMMANDS: &[&str] = &[
 /// `kiri update` is two commands. Alone or with `--check` it updates Kiri;
 /// with anything else it is Docker's `update`, which always names a
 /// container (`kiri update --memory 256m web`).
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 pub fn is_container_update(args: &[String]) -> bool {
     args.iter().any(|a| !matches!(a.as_str(), "--check" | "-h" | "--help"))
 }

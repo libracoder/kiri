@@ -13,11 +13,16 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #749 Linux: `kiri update --check` checks the release feed instead of falling through to `docker update` (unreleased)
+- Fixes: #749 Linux: `kiri update --check` falls through to `docker update`
+
 ### #435 Mac: hand the VM its network settings directly when DHCP does not answer (unreleased)
 - Fixes: #435 Containers have no internet: VM never gets IPv4/uplink lease when another app binds UDP 67
 - Caused: none known
 - Caused by: -
 - Check: none
+
+
 
 ### #735 macOS: reach loopback-published ports and Kiri's resolver from `--network host` containers (unreleased)
 - Fixes: #732 macOS: `--network host` containers have no DNS and can't reach ports published on 127.0.0.1, so a host-network BuildKit can't push to a local registry

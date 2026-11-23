@@ -77,7 +77,7 @@ mod ui;
 #[cfg(unix)]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod tools;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 mod update;
 
 const USAGE: &str = "\
@@ -175,7 +175,7 @@ fn main() -> ExitCode {
         Some("usb") => usb::run(&args[1..]),
         #[cfg(target_os = "macos")]
         Some("import") => import::run(&args[1..]),
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         Some("update") if !docker::is_container_update(&args[1..]) => update::run(&args[1..]),
         #[cfg(unix)]
         Some("diag") => diag::run(&args[1..]),
