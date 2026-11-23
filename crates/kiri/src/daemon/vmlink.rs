@@ -674,6 +674,13 @@ impl VmLink {
         }
     }
 
+    pub fn fs_read_link(&self, id: &str, path: &str) -> io::Result<Vec<u8>> {
+        match self.call(|o| Msg::FsReadLink { id, path }.encode(o), None)? {
+            Reply::FsData(d) => Ok(d),
+            other => Err(io::Error::other(format!("expected FsData, got {other:?}"))),
+        }
+    }
+
     pub fn stats(&self) -> io::Result<Stats> {
         match self.call(|o| Msg::StatsRequest.encode(o), None)? {
             Reply::Stats(s) => Ok(s),

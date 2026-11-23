@@ -3651,6 +3651,12 @@ impl Engine {
         self.vm()?.fs_read(id, path, offset, len)
     }
 
+    /// For the Finder view (macOS).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub fn fs_read_link(&self, id: &str, path: &str) -> io::Result<Vec<u8>> {
+        self.vm()?.fs_read_link(id, path)
+    }
+
     /// A stream into the guest relay towards `ip:port`.
     pub fn relay_to(&self, ip: [u8; 4], port: u16) -> io::Result<kiri_vmm::VsockStream> {
         let vm = self.vm()?;

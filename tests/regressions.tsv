@@ -228,3 +228,5 @@ archive-directory-contents	#617	GET /containers/{id}/archive normalized away a t
 cp-out-dot	#617	docker cp container:/out/. dst copied the folder itself (dst/out/a.txt) instead of its contents (dst/a.txt)
 import-volume-xattrs	#485	kiri import used docker cp and BusyBox tar, silently dropping user.* extended attributes on named volumes (Supabase Storage 500 ENODATA)
 clone3-seccomp-fallback	#529	when an outer seccomp filter blocks clone3 with ENOSYS or EPERM (Android/Droidspaces, restricted Docker), containers and docker exec failed to start instead of falling back to clone(2)
+finder-symlink-is-link	#648	the Finder NFS mount reported container symlinks as their targets instead of symlinks, so directory symlink loops (/usr/bin/X11 -> .) caused infinite Finder and Spotlight recursion
+finder-no-proc-sys	#648	the Finder NFS mount exposed the kernel's /proc and /sys filesystems, whose symlink cycles and pseudo-files kept Spotlight and the VM at 100% CPU

@@ -789,6 +789,13 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
                     },
                     None => Msg::Error(&format!("container {id} is not running")).encode(&mut out),
                 },
+                Ok(Msg::FsReadLink { id, path }) => match running_rootfs(procs, paths, id) {
+                    Some(root) => match super::fsview::read_link(&root, path, &mut fs_buf) {
+                        Ok(()) => Msg::FsData(&fs_buf).encode(&mut out),
+                        Err(e) => Msg::Error(&format!("readlink {path}: {e}")).encode(&mut out),
+                    },
+                    None => Msg::Error(&format!("container {id} is not running")).encode(&mut out),
+                },
                 Ok(other) => Msg::Error(&format!("unexpected {other:?}")).encode(&mut out),
                 // A frame the host expects no reply to gets none, decoded
                 // or not: an answer would be read as the next one's reply.

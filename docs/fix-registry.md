@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #655 Finder: show container symlinks as symlinks and omit /proc and /sys (unreleased)
+- Fixes: #648 Finder mount (~/Kiri) causes 100% CPU via infinite directory recursion on container symlinks
+- Caused: none known
+- Caused by: -
+- Check: `finder-symlink-is-link`, `finder-no-proc-sys`
+
 ### #549 Engine: fall back to clone(2) when seccomp blocks clone3 (unreleased)
 - Fixes: #529 Containers fail to start with `clone3: Function not implemented (os error 38)` when seccomp blocks `clone3`
 - Caused: none known

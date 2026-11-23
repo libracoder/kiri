@@ -989,6 +989,8 @@ needs finder t finder-root "docker-entrypoint.sh" ls "$KF/fsv"
 needs finder t finder-read "Alpine Linux" cat "$KF/fsv/etc/os-release"
 needs finder t finder-hash "match" bash -c "$D exec fsv sh -c 'head -c 3000000 /dev/urandom > /tmp/r.bin'; a=\$($D exec fsv sha256sum /tmp/r.bin | cut -c1-64); b=\$($SHA $KFQ/fsv/tmp/r.bin | cut -c1-64); [ \"\$a\" = \"\$b\" ] && echo match"
 needs finder t finder-symlink-inside "docker-entrypoint.sh" bash -c "$D exec fsv ln -s / /loop && ls $KFQ/fsv/loop/"
+needs finder t finder-symlink-is-link "link . Alpine Linux" bash -c "$D exec fsv ln -sf ../../../../etc/os-release /tmp/escape && [ -L $KFQ/fsv/loop ] && [ -L $KFQ/fsv/tmp/escape ] && printf 'link %s ' \"\$(readlink $KFQ/fsv/loop)\" && grep -o 'Alpine Linux' $KFQ/fsv/tmp/escape | head -1"
+needs finder t finder-no-proc-sys "hidden" bash -c "! ls $KFQ/fsv | grep -qxE 'proc|sys' && ! ls $KFQ/fsv/proc >/dev/null 2>&1 && ! ls $KFQ/fsv/sys >/dev/null 2>&1 && echo hidden"
 needs finder code finder-readonly 1 bash -c "echo x > $KFQ/fsv/tmp/written"
 t finder-mounted "nfs" bash -c "mount | grep -F \" on $KF \""
 # A file rewritten in place (same path, same size) must never read stale.
