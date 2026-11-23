@@ -91,25 +91,91 @@ fn sync_fs(path: &Path) -> io::Result<()> {
 /// Deletes every layer not in `keep` (blob digests), every layer without
 /// its marker, and whatever an unpack left half-done. Anything that isn't
 /// one of those names is left alone.
+///
+/// The `.done` marker is removed before the layer directory so a layer
+/// stops counting as present immediately, even if deleting its directory is
+/// interrupted.
 pub fn retain<'a>(root: &Path, keep: impl Iterator<Item = &'a str>) {
     let keep: std::collections::HashSet<&str> = keep.filter_map(|d| hex(d).ok()).collect();
     let Ok(entries) = fs::read_dir(root) else { return };
+    let mut leftovers = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        let leftover = name.starts_with(".tmp-") || name.starts_with(".stale-");
-        let (h, is_marker) = match name.strip_suffix(".done") {
-            Some(h) => (h, true),
-            None => (name, false),
-        };
-        let layer = h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit());
-        if !leftover && !layer {
+        if name.starts_with(".tmp-") || name.starts_with(".stale-") {
+            leftovers.push(entry.path());
             continue;
         }
-        let whole = layer && root.join(h).is_dir() && root.join(format!("{h}.done")).is_file();
-        if leftover || !keep.contains(h) || !whole {
-            let path = entry.path();
-            let _ = if is_marker || !path.is_dir() { fs::remove_file(&path) } else { fs::remove_dir_all(&path) };
+        let h = name.strip_suffix(".done").unwrap_or(name);
+        if h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()) {
+            seen.insert(h.to_owned());
+        }
+    }
+    for path in leftovers {
+        remove_entry(&path);
+    }
+    for h in seen {
+        let dir = root.join(&h);
+        let mark = root.join(format!("{h}.done"));
+        let whole = dir.is_dir() && mark.is_file();
+        if !keep.contains(h.as_str()) || !whole {
+            // Marker first: once gone, `present()` returns false even if
+            // removing the directory fails or is cut short.
+            remove_entry(&mark);
+            remove_entry(&dir);
+        }
+    }
+}
+
+/// Removes a file, symlink or directory tree in the layer store. On
+/// `PermissionDenied` inside a layer tree (read-only directories without
+/// `CAP_DAC_OVERRIDE`), makes directories writable and retries once.
+fn remove_entry(path: &Path) {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return,
+        Err(e) => {
+            eprintln!("kiri-init: stat {}: {e}", path.display());
+            return;
+        }
+    };
+    if !meta.file_type().is_dir() {
+        if let Err(e) = fs::remove_file(path)
+            && e.kind() != io::ErrorKind::NotFound
+        {
+            eprintln!("kiri-init: remove {}: {e}", path.display());
+        }
+        return;
+    }
+    match fs::remove_dir_all(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+            make_dirs_writable(path);
+            if let Err(e) = fs::remove_dir_all(path)
+                && e.kind() != io::ErrorKind::NotFound
+            {
+                eprintln!("kiri-init: remove {}: {e}", path.display());
+            }
+        }
+        Err(e) => eprintln!("kiri-init: remove {}: {e}", path.display()),
+    }
+}
+
+/// Grants owner rwx on every real directory under `root` so `remove_dir_all`
+/// can unlink entries inside read-only image directories. Symlinks are never
+/// followed.
+fn make_dirs_writable(root: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
+        let Ok(entries) = fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                stack.push(entry.path());
+            }
         }
     }
 }
@@ -1486,6 +1552,32 @@ mod tests {
         assert!(!root.join(&broken).exists(), "unmarked layer kept");
         assert!(!root.join(format!(".stale-{broken}-1")).exists() && !root.join(format!(".tmp-{broken}")).exists());
         assert!(root.join("other").is_file());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Layers with read-only subdirectories (Go module caches, Nix stores)
+    /// are still removed along with their `.done` markers, and orphan `.done`
+    /// markers without a layer directory go too (#722).
+    #[test]
+    fn retain_removes_readonly_layer_dirs_and_orphan_markers() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch("retain-ro");
+        let blob = layer_blob(&[("sub/file", b"hello")]);
+        send(&root, D1, &blob);
+        send(&root, D2, &blob);
+        // Make D2's subdirectory read-only (0555) so plain remove_dir_all
+        // fails when running without CAP_DAC_OVERRIDE.
+        let sub = dir(&root, D2).unwrap().join("sub");
+        fs::set_permissions(&sub, fs::Permissions::from_mode(0o555)).unwrap();
+        // An orphan `.done` marker with no directory beside it.
+        let orphan = "4".repeat(64);
+        fs::write(root.join(format!("{orphan}.done")), b"").unwrap();
+
+        retain(&root, [D1].into_iter());
+        assert!(present(&root, D1), "referenced layer stays");
+        assert!(!dir(&root, D2).unwrap().exists(), "unreferenced read-only layer dir must go");
+        assert!(!marker(&root, D2).unwrap().exists(), "unreferenced layer .done marker must go");
+        assert!(!root.join(format!("{orphan}.done")).exists(), "orphan .done marker must go");
         let _ = fs::remove_dir_all(&root);
     }
 

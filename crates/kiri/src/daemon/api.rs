@@ -724,6 +724,7 @@ fn image_remove(engine: &Engine, name: &str, force: bool) -> Result<Value, Error
     if other_tags {
         return Ok(json!([{"Untagged": i.name}]));
     }
+    engine.prune_layers();
     engine.emit_image("delete", &i.config_digest, &i.name);
     Ok(json!([{"Untagged": i.name}, {"Deleted": i.config_digest}]))
 }
@@ -739,6 +740,7 @@ fn image_tag(req: &Request, engine: &Engine, source: &str) -> Result<(), Error> 
     let full = format!("{repo}:{tag}");
     let name = Reference::parse(&full).map(|r| r.short()).map_err(|e| Error::BadRequest(format!("invalid reference format: {e}")))?;
     engine.store.put_image(i.tagged(name.clone()))?;
+    engine.prune_layers();
     engine.emit_image("tag", &i.config_digest, &name);
     Ok(())
 }
@@ -763,6 +765,7 @@ fn image_load(req: &Request, engine: &Engine, w: &mut UnixStream, r: &mut BufRea
     };
     match loaded {
         Ok(images) => {
+            engine.prune_layers();
             http::begin_stream_with(w, 200, "application/json", http::CLOSE)?;
             for i in &images {
                 engine.emit_image("load", &i.config_digest, &i.name);
@@ -850,6 +853,7 @@ fn import(req: &Request, engine: &Engine, stdin: &mut dyn io::Read) -> Result<St
     let layers = vec![kiri_image::Layer { digest, size, media_type: "application/vnd.oci.image.layer.v1.tar".into() }];
     let name = name.unwrap_or_else(|| config_digest.clone());
     engine.store.put_image(kiri_image::archive::from_config(name.clone(), &config_digest, &cfg, layers))?;
+    engine.prune_layers();
     engine.emit_image("import", &config_digest, &name);
     Ok(config_digest)
 }
@@ -1213,6 +1217,7 @@ fn run_pull(req: &Request, engine: &Engine, reference: &Reference, job: &super::
     }
     match result {
         Ok(image) => {
+            engine.prune_layers();
             // Docker reports the digest it was asked for: the index's, if any.
             line(json!({"status": format!("Digest: {}", image.index_digest.as_ref().unwrap_or(&image.digest))}));
             line(json!({"status": format!("Status: Downloaded newer image for {}", image.name)}));
@@ -2400,6 +2405,7 @@ pub(super) fn create(req: &Request, engine: &Engine) -> Result<Value, Error> {
     }
 
     let image = engine.image(image_name)?.ok_or_else(|| Error::NotFound(format!("No such image: {image_name}")))?;
+    let _layer_pin = engine.pin_layers(image.layers.iter().map(|l| l.digest.as_str()));
     if let Some(why) = intel_mac_refusal(image_name, std::slice::from_ref(&image.platform)) {
         return Err(Error::BadRequest(why));
     }

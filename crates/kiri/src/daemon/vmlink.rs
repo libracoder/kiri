@@ -625,6 +625,15 @@ impl VmLink {
         self.send(|o| kiri_proto::encode_retain_layers(o, digests))
     }
 
+    /// Waits for every earlier no-reply frame (such as `retain_layers`) to
+    /// finish on the guest: the agent processes frames in order.
+    pub fn ping(&self) -> io::Result<()> {
+        match self.call(|o| Msg::Ping(0).encode(o), None)? {
+            Reply::Pong => Ok(()),
+            other => Err(io::Error::other(format!("expected Pong, got {other:?}"))),
+        }
+    }
+
     pub fn kill(&self, id: &str, signal: u32) -> io::Result<()> {
         self.send(|o| Msg::Kill { id, signal }.encode(o))
     }

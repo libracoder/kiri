@@ -344,6 +344,7 @@ fn commit(req: &Request, engine: &Engine) -> Result<Value, Error> {
     };
     let image = kiri_image::archive::from_config(name, &config_digest, &cfg, layers);
     engine.store.put_image(image)?;
+    engine.prune_layers();
     engine.emit_container("commit", &id, &[]);
     Ok(json!({"Id": config_digest}))
 }
@@ -400,6 +401,7 @@ fn image_prune(req: &Request, engine: &Engine) -> Result<Value, Error> {
     let until = prune_until(&f, "until")?;
     let used: Vec<String> = engine.each(|c| Some(c.spec.image_id.clone()));
     let mut deleted = Vec::new();
+    let mut any_deleted = false;
     let mut reclaimed = 0u64;
     for i in engine.store.images()? {
         if used.contains(&i.config_digest) || (dangling_only && !i.name.starts_with("sha256:")) {
@@ -418,10 +420,14 @@ fn image_prune(req: &Request, engine: &Engine) -> Result<Value, Error> {
             deleted.push(json!({"Untagged": i.name}));
             engine.emit_image("untag", &i.config_digest, &i.name);
             if !engine.store.images()?.iter().any(|o| o.config_digest == i.config_digest) {
+                any_deleted = true;
                 deleted.push(json!({"Deleted": i.config_digest}));
                 engine.emit_image("delete", &i.config_digest, &i.name);
             }
         }
+    }
+    if any_deleted {
+        engine.prune_layers();
     }
     Ok(json!({"ImagesDeleted": if deleted.is_empty() { Value::Null } else { Value::Array(deleted) }, "SpaceReclaimed": reclaimed}))
 }
@@ -475,7 +481,7 @@ fn system_df(engine: &Engine) -> Result<Value, Error> {
     }
     // Every image layer once, as `layer_size` counts it; with the guest's
     // numbers, plus the rest of the layer store: layers only stopped
-    // containers still use, and leftovers the next VM start clears.
+    // containers still use, and any leftovers the next VM start clears.
     let mut seen = HashSet::new();
     let mut layers_size: u64 = images.iter().flat_map(|i| &i.layers).filter(|l| seen.insert(l.digest.trim_start_matches("sha256:"))).map(layer_size).sum();
     if let Some(d) = &du {

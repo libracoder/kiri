@@ -14,6 +14,49 @@ N=${N:-kiri-linux-host}
 # shellcheck source=SCRIPTDIR/lib/images.sh
 . "$(dirname "$0")/lib/images.sh"
 kiri_seed_images alpine:latest || echo "linux-host: alpine could not be fetched"
+# Removing an image or overwriting a tag reclaims unreferenced unpacked layers
+# and their .done markers in /var/lib/kiri/layers immediately, while keeping
+# layers still referenced by an existing container until it is removed (#722).
+t layer-gc-rmi-disk "DISK-FREED" '
+  docker rm -f lh-lgc >/dev/null 2>&1; docker rmi kiri-lh-lgc:1 >/dev/null 2>&1
+  docker run --rm alpine true >/dev/null &&
+  base=$(ls /var/lib/kiri/layers | wc -l) &&
+  docker run --name lh-lgc alpine sh -c "head -c 10485760 /dev/urandom > /big.bin" >/dev/null &&
+  docker commit lh-lgc kiri-lh-lgc:1 >/dev/null &&
+  docker rm lh-lgc >/dev/null &&
+  docker run --rm kiri-lh-lgc:1 true &&
+  with_img=$(ls /var/lib/kiri/layers | wc -l) &&
+  df_before=$(curl -s --unix-socket /root/.kiri/run/docker.sock http://kiri/system/df | python3 -c "import json,sys; print(json.load(sys.stdin)[\"LayersSize\"])") &&
+  docker rmi kiri-lh-lgc:1 >/dev/null &&
+  after=$(ls /var/lib/kiri/layers | wc -l) &&
+  df_after=$(curl -s --unix-socket /root/.kiri/run/docker.sock http://kiri/system/df | python3 -c "import json,sys; print(json.load(sys.stdin)[\"LayersSize\"])") &&
+  if [ "$with_img" -gt "$base" ] && [ "$after" -eq "$base" ] && [ $((df_before - df_after)) -ge 8388608 ]; then
+    echo DISK-FREED
+  else
+    echo "base=$base with=$with_img after=$after df_before=$df_before df_after=$df_after"
+  fi
+'
+t layer-gc-container-keeps-layer "KEPT-THEN-FREED" '
+  docker rm -f lh-lgc-hold lh-lgc-tmp >/dev/null 2>&1; docker rmi kiri-lh-lgc:2 >/dev/null 2>&1
+  docker run --rm alpine true >/dev/null &&
+  base=$(ls /var/lib/kiri/layers | wc -l) &&
+  docker run --name lh-lgc-tmp alpine sh -c "echo v1 > /ver" >/dev/null &&
+  docker commit lh-lgc-tmp kiri-lh-lgc:2 >/dev/null &&
+  docker rm lh-lgc-tmp >/dev/null &&
+  docker run --name lh-lgc-hold kiri-lh-lgc:2 cat /ver >/dev/null &&
+  docker run --name lh-lgc-tmp alpine sh -c "echo v2 > /ver" >/dev/null &&
+  docker commit lh-lgc-tmp kiri-lh-lgc:2 >/dev/null &&
+  docker rm lh-lgc-tmp >/dev/null &&
+  kept=$(docker start -a lh-lgc-hold) &&
+  docker rm lh-lgc-hold >/dev/null &&
+  docker rmi kiri-lh-lgc:2 >/dev/null &&
+  after=$(ls /var/lib/kiri/layers | wc -l) &&
+  if [ "$kept" = "v1" ] && [ "$after" -eq "$base" ]; then
+    echo KEPT-THEN-FREED
+  else
+    echo "kept=$kept base=$base after=$after"
+  fi
+'
 $D rm -f "$N" >/dev/null 2>&1
 $D run -d --name "$N" --privileged --tmpfs /run -v "$N":/var/lib/kiri -v "$N"-store:/root/.local/share/kiri \
   -v "$BIN:/opt/kiri:ro" alpine sh -c 'apk add -q docker-cli curl python3 >/dev/null 2>&1; exec /opt/kiri/kiri daemon' >/dev/null

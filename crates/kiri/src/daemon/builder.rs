@@ -1027,6 +1027,7 @@ pub fn build(req: &Request, engine: &Arc<Engine>, w: &mut UnixStream, r: &mut Bu
     let result = run(req, engine, &mut o, r, &mut out, &probe);
     match result {
         Ok(images) => {
+            engine.prune_layers();
             let id = images[0].config_digest.clone();
             let short: String = id.trim_start_matches("sha256:").chars().take(12).collect();
             out.line(json!({"aux": {"ID": id}}));

@@ -269,3 +269,6 @@ cp-ro-volume-refused	#245	PUT /containers/{id}/archive into a read-only (:ro) vo
 cp-ro-rootfs-refused	#245	PUT /containers/{id}/archive onto a --read-only container rootfs must fail with 403 Forbidden and "container rootfs is marked read-only" while allowing writes into :rw volumes
 cp-created-symlink-confined	#245	mount target lookup and docker cp path resolution on a non-running container must confine symlinks inside the container rootfs without escaping onto the host or VM filesystem
 rosetta-vdso-dt-hash	#344	the arm64 guest kernel vDSO was linked with DT_GNU_HASH only, so macOS 14's Rosetta aborted every linux/amd64 container with "Failed to find vdso DT_HASH"
+layer-gc-rmi-df	#722	removing an image left its unpacked layers in /var/lib/kiri/layers and in docker system df until the next VM boot
+layer-gc-rmi-disk	#722	docker rmi left the removed image's unpacked layer directory and .done marker on disk in /var/lib/kiri/layers
+layer-gc-container-keeps-layer	#722	layer GC after overwriting a tag must keep layers still used by an existing container and reclaim them once that container is removed
