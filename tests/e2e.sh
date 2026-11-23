@@ -893,6 +893,9 @@ code port-ipv6-only-not-v4 7 curl -s -m 2 http://127.0.0.1:18183
 # Traefik's docker provider picks the port from these keys (#492).
 t port-exposed-null '{"80/tcp":null,"9000/tcp":null}' bash -c "$D run -d --name pubx --expose 9000 nginx:alpine >/dev/null; $D inspect -f '{{json .NetworkSettings.Ports}}' pubx"
 t port-exposed-stopped '{}' bash -c "$D stop -t 1 pubx >/dev/null; $D inspect -f '{{json .NetworkSettings.Ports}}' pubx"
+# Exposed ports keep their protocol from the image and --expose, UDP and SCTP
+# included, in both Config.ExposedPorts and NetworkSettings.Ports (#620).
+t inspect-exposed-udp '{"132/sctp":{},"53/tcp":{},"53/udp":{},"5353/udp":{}} {"132/sctp":null,"53/tcp":null,"53/udp":null,"5353/udp":null}' bash -c "$D create --name pubudp-base alpine true >/dev/null && $D commit -c 'EXPOSE 53/udp 132/sctp' pubudp-base kiri-exp-udp:1 >/dev/null && $D run -d --name pubudp --expose 53 --expose 5353/udp kiri-exp-udp:1 sleep 60 >/dev/null && out=\$($D inspect -f '{{json .Config.ExposedPorts}} {{json .NetworkSettings.Ports}}' pubudp); $D rm -f pubudp pubudp-base >/dev/null 2>&1; $D rmi kiri-exp-udp:1 >/dev/null 2>&1; echo \"\$out\""
 $D rm -f pub pub2 puball pub6 pubx >/dev/null
 code port-closed-after-stop 7 curl -s -m 2 http://localhost:18180
 

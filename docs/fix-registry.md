@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #620 Engine: inspect keeps an exposed port's protocol, UDP included (unreleased)
+- Fixes: no issue
+- Caused: none known
+- Caused by: -
+- Check: `inspect-exposed-udp`
+
 ### #193 Networks: give secondary external networks an IPv4 default route and hand default routes over on disconnect (unreleased)
 - Fixes: #381 macOS: no IPv4 default route when an internal network occupies eth0
 - Caused: none known

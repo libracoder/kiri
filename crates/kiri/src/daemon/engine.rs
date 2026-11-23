@@ -363,9 +363,9 @@ pub struct Spec {
     /// `-p` bindings.
     #[serde(default)]
     pub ports: Vec<super::ports::Binding>,
-    /// TCP ports the image (or `--expose`) declares; picks the domain's port.
-    #[serde(default)]
-    pub exposed: Vec<u16>,
+    /// Port/protocol keys the image or `--expose` declares.
+    #[serde(default, deserialize_with = "deserialize_exposed")]
+    pub exposed: Vec<String>,
     /// Bind mounts as the guest takes them: `source\ttarget\tflags`, where
     /// `source` is a path inside the VM.
     #[serde(default)]
@@ -472,6 +472,43 @@ pub struct Spec {
     /// `container:<full id>`.
     #[serde(default)]
     pub pid_mode: String,
+}
+
+/// Normalizes an ExposedPorts key (`"53"`, `"53/UDP"`, `"132/sctp"`) to
+/// `"<port>/<lowercase-proto>"`, ignoring port 0 and malformed entries.
+pub(super) fn normalize_exposed_key(key: &str) -> Option<String> {
+    let (port, proto) = key.split_once('/').unwrap_or((key, "tcp"));
+    if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let port: u16 = port.parse().ok()?;
+    if port == 0 || proto.is_empty() || !proto.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return None;
+    }
+    Some(format!("{port}/{}", proto.to_ascii_lowercase()))
+}
+
+/// Older containers.json records stored only TCP port numbers.
+fn deserialize_exposed<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Port {
+        Key(String),
+        Tcp(u16),
+    }
+
+    let mut ports: Vec<String> = Option::<Vec<Port>>::deserialize(deserializer)?
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|port| match port {
+            Port::Key(key) => normalize_exposed_key(&key),
+            Port::Tcp(0) => None,
+            Port::Tcp(port) => Some(format!("{port}/tcp")),
+        })
+        .collect();
+    ports.sort_unstable();
+    ports.dedup();
+    Ok(ports)
 }
 
 /// One `--link name:alias`.
@@ -3634,8 +3671,16 @@ impl Engine {
             id: c.id.clone(),
             label: c.spec.labels.get("dev.kiri.http.port").and_then(|v| v.as_str()).and_then(|p| p.parse().ok()),
             published: c.spec.ports.iter().filter(|b| b.proto != "udp").map(|b| b.container_port).collect(),
-            exposed: c.spec.exposed.clone(),
+            exposed: c.spec.exposed.iter().filter_map(|key| key.strip_suffix("/tcp")?.parse().ok()).collect(),
         })
+    }
+
+    #[cfg(test)]
+    pub(super) fn mark_running_for_test(&self, id: &str, ip: [u8; 4]) {
+        let mut st = self.lock();
+        let c = st.containers.get_mut(id).unwrap();
+        c.status = Status::Running;
+        c.ip = Some(ip);
     }
 
     /// For the Finder view (macOS).

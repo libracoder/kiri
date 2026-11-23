@@ -251,3 +251,4 @@ internal-first-second-external	#381	attaching a second external network after an
 disconnect-hands-default-on	#381	disconnecting the external network that holds the IPv4 default route must hand the default route over to the next remaining external network
 internal-first-ipv6-no-default	#381	an --internal IPv6 network on eth0 must never supply an IPv6 default route
 disconnect-hands-ipv6-default-on	#381	disconnecting the external IPv6 network that holds the IPv6 default route must hand the default route over to the next remaining external IPv6 network
+inspect-exposed-udp	#620	docker inspect dropped non-TCP exposed ports (such as 53/udp or 132/sctp) from Config.ExposedPorts and NetworkSettings.Ports
