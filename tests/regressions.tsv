@@ -111,6 +111,7 @@ user-net-own-dns-upstream	#624	a container running its own DNS server must still
 dns-user-net-next-after-refusal	#455	on a user network a --dns server that refused ended the lookup: the next --dns server was never asked
 dns-user-net-all-refused-fails-at-once	#455	when every --dns server of a container on a user network refused, the lookup waited for the client to give up instead of failing
 dns-user-net-next-after-silence	#455	on a user network a --dns server that never answered ended the lookup: the next --dns server was never asked
+dns-user-net-srv-nodata	#715	gRPC's `_grpclb._tcp.<name>` SRV lookup was forwarded instead of answered NODATA, so Go's resolver timed out on 127.0.0.11 and gRPC shut the channel down
 top-l	#625	docker top -l was refused or gave the wrong columns
 top-l-values	#625	docker top -l gave wrong values
 top-efl-cmd	#625	docker top -efl gave the wrong command column

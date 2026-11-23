@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #715 DNS: Go clients' SRV lookups are answered here, and forwarded lookups are never silently dropped (unreleased)
+- Fixes: #715 Go gRPC clients (RoadRunner's Temporal plugin) fail with "context deadline exceeded" resolving container names via 127.0.0.11 while getent/nslookup/dig work
+- Caused: none known
+- Caused by: -
+- Check: `dns-user-net-srv-nodata`
+
 ### #484 Daemon: log memory-kill figures, relieve the balloon first, and attribute op stops (unreleased)
 - Fixes: #474 Daemon: log memory-kill figures and attribute Kiri-initiated stops to their operation
 - Caused: none known

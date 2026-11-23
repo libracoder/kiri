@@ -808,6 +808,10 @@ t dns-user-net-ipv6-only-names "10.231.0.10" $D run --rm --network ipamnet --dns
 # ones within the 4 s each is given (12 s in all, as with Docker).
 $D rm -f kiri-e2e-dig-seed >/dev/null 2>&1
 $D run --name kiri-e2e-dig-seed alpine apk add --no-cache bind-tools >/dev/null 2>&1 && $D commit kiri-e2e-dig-seed kiri-e2e-dig >/dev/null && $D rm -f kiri-e2e-dig-seed >/dev/null
+# #715: gRPC looks up `_grpclb._tcp.<name>` before the name's A records.
+# The service is on this network, so it is answered NODATA here rather than
+# forwarded: a silent --dns server must not turn the lookup into a timeout.
+t dns-user-net-srv-nodata "NOERROR 0" $D run --rm --network ipamnet --dns 192.0.2.1 kiri-e2e-dig sh -c 'o=$(dig +tries=1 +time=2 _grpclb._tcp.fixed. SRV); s=$(echo "$o" | grep -o "status: [A-Z]*"); a=$(echo "$o" | grep -o "ANSWER: [0-9]*"); echo "${s#status: } ${a#ANSWER: }"'
 t dns-user-net-three-refused-servfail-at-once "SERVFAIL fast" $D run --rm --network ipamnet --dns 10.231.0.10 --dns 10.231.0.10 --dns 10.231.0.10 kiri-e2e-dig sh -c 's=$(date +%s); a=$(dig +tries=1 +time=20 example.com | grep -o "status: [A-Z]*"); [ $(( $(date +%s) - s )) -le 2 ] && echo "${a#status: } fast" || echo "${a#status: } slow"'
 t dns-user-net-three-silent-servfail-in-time "SERVFAIL in time" $D run --rm --network ipamnet --dns 192.0.2.1 --dns 192.0.2.2 --dns 192.0.2.3 kiri-e2e-dig sh -c 's=$(date +%s); a=$(dig +tries=1 +time=20 example.com | grep -o "status: [A-Z]*"); [ $(( $(date +%s) - s )) -le 14 ] && echo "${a#status: } in time" || echo "${a#status: } late"'
 $D rmi kiri-e2e-dig >/dev/null 2>&1
