@@ -513,6 +513,7 @@ fn info(engine: &Engine) -> Value {
         "RegistryConfig": super::daemon_json::info(),
         "KiriAgentMemory": engine.agent_rss().unwrap_or(0),
         "KiriVmAwake": engine.is_awake(),
+        "KiriVmUplink": engine.uplink_info(),
         "KiriStopped": engine.is_stopped(),
         "KiriMemoryCeiling": engine.memory().0,
         "KiriMemoryTarget": engine.memory().1,

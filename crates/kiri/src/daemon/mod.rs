@@ -36,6 +36,7 @@ mod top;
 mod usb;
 mod vmcpu;
 mod vmlink;
+pub(crate) mod vmnet;
 mod volumes;
 #[cfg(target_os = "macos")]
 mod watch;

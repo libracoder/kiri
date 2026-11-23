@@ -577,6 +577,12 @@ impl VmLink {
         }
     }
 
+    /// Configures the VM's uplink (`eth0`) directly when macOS DHCP did not
+    /// answer. Ignored by the guest if it already obtained a DHCP lease.
+    pub fn set_uplink(&self, ip: [u8; 4], prefix: u8, gateway: [u8; 4], dns: [u8; 4]) -> io::Result<()> {
+        self.ack(|o| Msg::SetUplink { ip, prefix, gateway, dns }.encode(o))
+    }
+
     /// Forwards a published port in the kernel (on a Linux host; in the VM,
     /// from the NAT network). `Err` means the agent could not; the caller
     /// falls back to relaying.
