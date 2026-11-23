@@ -2226,11 +2226,30 @@ pub(super) fn cpu_weight(shares: u64) -> u32 {
     ((w * 1e9).round() / 1e9).ceil() as u32
 }
 
-pub(super) fn limits_from(h: &Value, base: super::engine::Limits) -> super::engine::Limits {
+pub(super) fn limits_from(h: &Value, base: super::engine::Limits) -> Result<super::engine::Limits, Error> {
     let mut l = base;
+    // Normalize pre-#545 containers (`memory_max > 0, memory_swap == 0`) to
+    // Docker's effective `2 * memory` limit before checking updates against it.
+    l.memory_swap = l.memory_swap();
+    // Docker's checks for `--memory-swap`, in Docker's words.
+    let swap = h["MemorySwap"].as_i64().filter(|s| *s != 0);
     if let Some(m) = h["Memory"].as_u64().filter(|m| *m > 0) {
+        if swap.is_none() && l.memory_swap > 0 && m > l.memory_swap as u64 {
+            return Err(Error::BadRequest("Memory limit should be smaller than already set memoryswap limit, update the memoryswap at the same time".into()));
+        }
         l.memory_max = m;
     }
+    if let Some(s) = swap {
+        if s > 0 && l.memory_max == 0 {
+            return Err(Error::BadRequest("You should always set the Memory limit when using Memoryswap limit, see usage".into()));
+        }
+        if s > 0 && (s as u64) < l.memory_max {
+            return Err(Error::BadRequest("Minimum memoryswap limit should be larger than memory limit, see usage".into()));
+        }
+        l.memory_swap = s.max(-1);
+    }
+    // Only a memory limit: as much swap again, which Docker writes down.
+    l.memory_swap = l.memory_swap();
     if let Some(n) = h["NanoCpus"].as_u64().filter(|n| *n > 0) {
         // --cpus 1.5 → 150 ms of CPU time every 100 ms.
         l.cpu_period = 100_000;
@@ -2247,7 +2266,7 @@ pub(super) fn limits_from(h: &Value, base: super::engine::Limits) -> super::engi
     if let Some(p) = h["PidsLimit"].as_i64().filter(|p| *p > 0) {
         l.pids_max = p as u32;
     }
-    l
+    Ok(l)
 }
 
 /// Returned in `POST /containers/create`'s `Warnings` when the caller asks for
@@ -2374,6 +2393,7 @@ pub(super) fn create(req: &Request, engine: &Engine) -> Result<Value, Error> {
     let host_opts = super::hostopts::from_host(host);
     super::hostopts::guest_lines(&host_opts, network_mode == "host").map_err(Error::BadRequest)?;
     super::hostopts::check_device_requests(host).map_err(Error::BadRequest)?;
+    let limits = super::engine::Limits { shm_size: host["ShmSize"].as_u64().unwrap_or(0), ..limits_from(host, super::engine::Limits::default())? };
     if let Some(s) = body["StopSignal"].as_str().filter(|s| !s.is_empty()) {
         parse_signal(s)?;
     }
@@ -2433,7 +2453,7 @@ pub(super) fn create(req: &Request, engine: &Engine) -> Result<Value, Error> {
         user: pick("User", &image.config.user),
         auto_remove: host["AutoRemove"].as_bool().unwrap_or(false),
         privileged: host["Privileged"].as_bool().unwrap_or(false),
-        limits: super::engine::Limits { shm_size: host["ShmSize"].as_u64().unwrap_or(0), ..limits_from(host, super::engine::Limits::default()) },
+        limits,
         caps: caps_from(host)?,
         cap_add: strings(&host["CapAdd"]).unwrap_or_default(),
         cap_drop: strings(&host["CapDrop"]).unwrap_or_default(),
@@ -2891,6 +2911,7 @@ fn inspect(c: &Container, nets: &[super::network::Network], anon_vols: &[String]
         v["HostConfig"][key] = super::hostopts::system_paths(&c.spec.host_opts, key, c.spec.privileged);
     }
     // Set apart: more keys in the macro above pass its recursion limit.
+    v["HostConfig"]["MemorySwap"] = json!(c.spec.limits.memory_swap());
     let mounts = inspect_mounts(&c.spec, |name| anon_vols.iter().any(|a| a == name));
     v["Config"]["Volumes"] = mounts["Volumes"].clone();
     for key in ["Binds", "Mounts", "Tmpfs"] {
@@ -5138,7 +5159,7 @@ mod network_option_tests {
         for (shares, weight) in [(2, 1), (512, 59), (1024, 100), (4096, 303), (262_144, 10_000), (1, 1), (999_999, 10_000)] {
             assert_eq!(super::cpu_weight(shares), weight, "{shares}");
         }
-        let l = super::limits_from(&json!({"CpuShares": 1024}), Default::default());
+        let l = super::limits_from(&json!({"CpuShares": 1024}), Default::default()).unwrap();
         assert_eq!((l.cpu_shares, l.cpu_weight), (1024, 100));
         // Rises with the shares, never backwards.
         let mut last = 0;
@@ -5884,6 +5905,101 @@ mod network_option_tests {
         assert!(super::valid_hosts_name("a b"), "Docker takes it: two names for one address");
         for bad in ["db\t1.2.3.4 evil", "db\n", "db\r", "db\0", ""] {
             assert!(!super::valid_hosts_name(bad), "{bad:?}");
+        }
+    }
+
+    /// `--memory-swap` as Docker Engine takes it (#523): memory plus swap,
+    /// twice the memory when not given, -1 for unlimited swap.
+    #[test]
+    fn memory_swap_is_memory_plus_swap_as_in_docker() {
+        let create = |h: Value| limits_from(&h, super::super::engine::Limits::default());
+        let swap = |l: super::super::engine::Limits| l.wire().swap_max;
+        const G: u64 = 1 << 30;
+
+        let l = create(json!({"Memory": 4 * G})).unwrap();
+        assert_eq!((l.memory_swap, swap(l)), (8 * G as i64, 4 * G));
+        let l = create(json!({"Memory": 4 * G, "MemorySwap": 6 * G})).unwrap();
+        assert_eq!((l.memory_swap, swap(l)), (6 * G as i64, 2 * G));
+        let l = create(json!({"Memory": 4 * G, "MemorySwap": 4 * G})).unwrap();
+        assert_eq!(swap(l), 0, "--memory-swap equal to --memory: no swap");
+        let l = create(json!({"Memory": 4 * G, "MemorySwap": -1})).unwrap();
+        assert_eq!((l.memory_swap, swap(l)), (-1, kiri_proto::NO_LIMIT));
+        let l = create(json!({"MemorySwap": -1})).unwrap();
+        assert_eq!((l.memory_swap, swap(l)), (-1, kiri_proto::NO_LIMIT));
+        let l = create(json!({})).unwrap();
+        assert_eq!((l.memory_swap, swap(l)), (0, kiri_proto::NO_LIMIT), "no memory limit, no swap limit");
+        assert_eq!(l.wire(), kiri_proto::Limits::default(), "unlimited container matches wire default");
+
+        // Overflow near i64::MAX: 2 * Memory saturates at i64::MAX without wrapping or panicking.
+        let five_eb: u64 = 5 << 60;
+        let l = create(json!({"Memory": five_eb})).unwrap();
+        assert_eq!(l.memory_swap, i64::MAX);
+        assert_eq!(swap(l), (i64::MAX as u64) - five_eb);
+        let l = create(json!({"Memory": i64::MAX as u64})).unwrap();
+        assert_eq!((l.memory_swap, swap(l)), (i64::MAX, 0));
+        let l = create(json!({"Memory": u64::MAX})).unwrap();
+        assert_eq!((l.memory_swap, swap(l)), (i64::MAX, 0));
+
+        let bad = |h: Value| match create(h) {
+            Err(Error::BadRequest(m)) => m,
+            other => panic!("{other:?}"),
+        };
+        assert!(bad(json!({"MemorySwap": G})).starts_with("You should always set the Memory limit"));
+        assert!(bad(json!({"Memory": 2 * G, "MemorySwap": G})).starts_with("Minimum memoryswap limit"));
+
+        // docker update keeps what it isn't given, and refuses a memory
+        // limit above the memory plus swap already set.
+        let base = create(json!({"Memory": 4 * G, "MemorySwap": 6 * G})).unwrap();
+        let l = limits_from(&json!({"Memory": 0, "MemorySwap": 0, "NanoCpus": 2_000_000_000u64}), base).unwrap();
+        assert_eq!((l.memory_max, l.memory_swap, swap(l)), (4 * G, 6 * G as i64, 2 * G), "updating --cpus keeps custom MemorySwap");
+        let l = limits_from(&json!({"Memory": 5 * G}), base).unwrap();
+        assert_eq!((l.memory_max, l.memory_swap, swap(l)), (5 * G, 6 * G as i64, G));
+        let l = limits_from(&json!({"Memory": 4 * G, "MemorySwap": 8 * G}), base).unwrap();
+        assert_eq!(swap(l), 4 * G);
+        let l = limits_from(&json!({"MemorySwap": -1}), base).unwrap();
+        assert_eq!((l.memory_swap, swap(l)), (-1, kiri_proto::NO_LIMIT));
+        match limits_from(&json!({"Memory": 7 * G}), base) {
+            Err(Error::BadRequest(m)) => assert!(m.starts_with("Memory limit should be smaller than already set memoryswap limit"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+        match limits_from(&json!({"MemorySwap": 2 * G}), base) {
+            Err(Error::BadRequest(m)) => assert!(m.starts_with("Minimum memoryswap limit"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+        match limits_from(&json!({"Memory": 8 * G, "MemorySwap": 6 * G}), base) {
+            Err(Error::BadRequest(m)) => assert!(m.starts_with("Minimum memoryswap limit"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+        let no_mem = create(json!({})).unwrap();
+        match limits_from(&json!({"MemorySwap": G}), no_mem) {
+            Err(Error::BadRequest(m)) => assert!(m.starts_with("You should always set the Memory limit"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+
+        // Updating --memory or --cpus when base.memory_swap == -1 keeps -1 (unlimited swap).
+        let unlim = create(json!({"Memory": 4 * G, "MemorySwap": -1})).unwrap();
+        let l = limits_from(&json!({"Memory": 512 << 20}), unlim).unwrap();
+        assert_eq!((l.memory_max, l.memory_swap, swap(l)), (512 << 20, -1, kiri_proto::NO_LIMIT));
+        let l = limits_from(&json!({"Memory": 8 * G}), unlim).unwrap();
+        assert_eq!((l.memory_max, l.memory_swap, swap(l)), (8 * G, -1, kiri_proto::NO_LIMIT));
+        let l = limits_from(&json!({"NanoCpus": 2_000_000_000u64}), unlim).unwrap();
+        assert_eq!((l.memory_max, l.memory_swap, swap(l)), (4 * G, -1, kiri_proto::NO_LIMIT));
+
+        // Updating Memory above i64::MAX against an i64::MAX MemorySwap is refused.
+        let huge = create(json!({"Memory": five_eb})).unwrap();
+        match limits_from(&json!({"Memory": u64::MAX}), huge) {
+            Err(Error::BadRequest(m)) => assert!(m.starts_with("Memory limit should be smaller than already set memoryswap limit"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+
+        // Saved before `memory_swap`: Docker's default, not no swap, and updates honour it.
+        let old: super::super::engine::Limits = serde_json::from_value(json!({"memory_max": G, "cpu_quota": 0, "cpu_period": 0, "cpu_weight": 0, "pids_max": 0})).unwrap();
+        assert_eq!((old.memory_swap(), swap(old)), (2 * G as i64, G));
+        let l = limits_from(&json!({"Memory": 3 * G / 2}), old).unwrap();
+        assert_eq!((l.memory_max, l.memory_swap, swap(l)), (3 * G / 2, 2 * G as i64, G / 2));
+        match limits_from(&json!({"Memory": 3 * G}), old) {
+            Err(Error::BadRequest(m)) => assert!(m.starts_with("Memory limit should be smaller than already set memoryswap limit"), "{m}"),
+            other => panic!("{other:?}"),
         }
     }
 }

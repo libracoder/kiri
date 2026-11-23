@@ -147,7 +147,7 @@ fn top(req: &Request, engine: &Engine, key: &str) -> Result<Value, Error> {
 fn update(req: &Request, engine: &Engine, key: &str) -> Result<Value, Error> {
     let b = body(req)?;
     let base = engine.with(key, |c| c.spec.limits)?;
-    let limits = super::api::limits_from(&b, base);
+    let limits = super::api::limits_from(&b, base)?;
     let restart = b["RestartPolicy"]["Name"].as_str().filter(|n| !n.is_empty()).map(|n| super::engine::RestartPolicy {
         name: n.to_owned(),
         max_retries: b["RestartPolicy"]["MaximumRetryCount"].as_u64().unwrap_or(0) as u32,

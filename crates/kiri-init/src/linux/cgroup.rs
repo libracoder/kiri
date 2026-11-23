@@ -36,9 +36,13 @@ pub fn apply_limits(dir: &Path, l: &Limits) -> io::Result<()> {
     }
     let mem = if l.memory_max == 0 { "max".into() } else { l.memory_max.to_string() };
     write_control(dir, "memory.max", &mem, l.memory_max != 0)?;
-    // No swap in the VM: a limit is a limit.
+    // Docker's `--memory-swap`, worked out by the daemon. The VM has no swap,
+    // so it matters on a Linux host, which may. A kernel without swap or a
+    // hybrid cgroup tree without the memory controller has no such file; open
+    // without `O_CREAT` so we never create fake files or hit kernfs `EACCES`.
     if let Ok(mut f) = OpenOptions::new().write(true).truncate(true).open(dir.join("memory.swap.max")) {
-        let _ = f.write_all(b"0");
+        let swap = if l.swap_max == kiri_proto::NO_LIMIT { "max".into() } else { l.swap_max.to_string() };
+        let _ = f.write_all(swap.as_bytes());
     }
     let period = if l.cpu_period == 0 { 100_000 } else { l.cpu_period };
     let cpu_max = if l.cpu_quota == 0 { format!("max {period}") } else { format!("{} {period}", l.cpu_quota) };
@@ -290,27 +294,47 @@ mod tests {
         for f in ["memory.max", "memory.swap.max", "cpu.max", "cpu.weight", "pids.max"] {
             fs::write(dir.join(f), "").unwrap();
         }
-        let lim = Limits { memory_max: 67_108_864, cpu_quota: 50_000, cpu_period: 100_000, cpu_weight: 250, pids_max: 64, shm_size: 0 };
+        let lim = Limits { memory_max: 67_108_864, cpu_quota: 50_000, cpu_period: 100_000, cpu_weight: 250, pids_max: 64, shm_size: 0, swap_max: 67_108_864 };
         apply_limits(&dir, &lim).unwrap();
         assert_eq!(fs::read_to_string(dir.join("memory.max")).unwrap(), "67108864");
-        assert_eq!(fs::read_to_string(dir.join("memory.swap.max")).unwrap(), "0");
+        assert_eq!(fs::read_to_string(dir.join("memory.swap.max")).unwrap(), "67108864");
         assert_eq!(fs::read_to_string(dir.join("cpu.max")).unwrap(), "50000 100000");
         assert_eq!(fs::read_to_string(dir.join("cpu.weight")).unwrap(), "250");
         assert_eq!(fs::read_to_string(dir.join("pids.max")).unwrap(), "64");
+
+        // Zero swap (`--memory-swap == --memory`) and unlimited swap (`-1`).
+        apply_limits(&dir, &Limits { swap_max: 0, ..lim }).unwrap();
+        assert_eq!(fs::read_to_string(dir.join("memory.swap.max")).unwrap(), "0");
+        apply_limits(&dir, &Limits { swap_max: kiri_proto::NO_LIMIT, ..lim }).unwrap();
+        assert_eq!(fs::read_to_string(dir.join("memory.swap.max")).unwrap(), "max");
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn apply_limits_skips_missing_controllers_on_hybrid_tree() {
         // Hybrid cgroup v2 directory whose controllers are bound to v1: none of
-        // memory.max, cpu.max, cpu.weight or pids.max exist.
+        // memory.max, memory.swap.max, cpu.max, cpu.weight or pids.max exist.
         let dir = temp_cgroup("hybrid");
-        let lim = Limits { memory_max: 67_108_864, cpu_quota: 50_000, cpu_period: 100_000, cpu_weight: 250, pids_max: 64, shm_size: 134_217_728 };
+        let lim = Limits { memory_max: 67_108_864, cpu_quota: 50_000, cpu_period: 100_000, cpu_weight: 250, pids_max: 64, shm_size: 134_217_728, swap_max: 67_108_864 };
         apply_limits(&dir, &lim).unwrap();
         // OpenOptions without O_CREAT must not create fake files either.
         assert!(!dir.join("memory.max").exists());
+        assert!(!dir.join("memory.swap.max").exists());
         assert!(!dir.join("cpu.max").exists());
         assert!(!dir.join("pids.max").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_limits_skips_missing_swap_file_when_memory_exists() {
+        // Kernel without swap accounting (or VM kernel with no swap): memory.max
+        // exists, memory.swap.max does not.
+        let dir = temp_cgroup("no-swap");
+        fs::write(dir.join("memory.max"), "").unwrap();
+        let lim = Limits { memory_max: 67_108_864, swap_max: 33_554_432, ..Default::default() };
+        apply_limits(&dir, &lim).unwrap();
+        assert_eq!(fs::read_to_string(dir.join("memory.max")).unwrap(), "67108864");
+        assert!(!dir.join("memory.swap.max").exists());
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -1635,6 +1635,22 @@ t ulimit-set-inspect '[{"Name":"nproc","Hard":200,"Soft":100}]' bash -c "$D crea
 t limit-shares-default "100 100" bash -c "echo \$($D run --rm --cpu-shares 1024 alpine cat /sys/fs/cgroup/cpu.weight) \$($D run --rm alpine cat /sys/fs/cgroup/cpu.weight)"
 t limit-shares-inspect "512" $D inspect -f '{{.HostConfig.CpuShares}}' lim
 t limit-inspect "134217728 500000000 50" $D inspect -f '{{.HostConfig.Memory}} {{.HostConfig.NanoCpus}} {{.HostConfig.PidsLimit}}' lim
+# --memory gets as much swap again by default, and --memory-swap is applied and
+# validated as on Docker (#523, #690).
+t limit-memory-swap-inspect "268435456 201326592 134217728 -1 0" bash -c "
+  a=\$($D inspect -f '{{.HostConfig.MemorySwap}}' lim)
+  b=\$($D create --memory 128m --memory-swap 192m alpine true); bv=\$($D inspect -f '{{.HostConfig.MemorySwap}}' \$b); $D rm \$b >/dev/null
+  c=\$($D create --memory 128m --memory-swap 128m alpine true); cv=\$($D inspect -f '{{.HostConfig.MemorySwap}}' \$c); $D rm \$c >/dev/null
+  d=\$($D create --memory 128m --memory-swap -1 alpine true); dv=\$($D inspect -f '{{.HostConfig.MemorySwap}}' \$d); $D rm \$d >/dev/null
+  e=\$($D create alpine true); ev=\$($D inspect -f '{{.HostConfig.MemorySwap}}' \$e); $D rm \$e >/dev/null
+  echo \"\$a \$bv \$cv \$dv \$ev\"
+"
+t limit-memory-swap-refused "nomem=ok small=ok over=ok" bash -c "
+  $D create --memory-swap 64m alpine true 2>&1 | grep -q 'You should always set the Memory limit' && nm=ok || nm=bad
+  $D create --memory 128m --memory-swap 64m alpine true 2>&1 | grep -q 'Minimum memoryswap limit' && sm=ok || sm=bad
+  $D update --memory 512m lim 2>&1 | grep -q 'Memory limit should be smaller than already set memoryswap limit' && ov=ok || ov=bad
+  echo \"nomem=\$nm small=\$sm over=\$ov\"
+"
 t oom-kill "137" bash -c "$D run --rm --memory 32m alpine sh -c 'tail /dev/zero' >/dev/null 2>&1; echo \$?"
 t stats "128MiB" $D stats --no-stream --format '{{.MemUsage}}' lim
 t stats-pids "PIDS" $D stats --no-stream lim
@@ -1666,6 +1682,21 @@ t update-memory "268435456" bash -c "$D update --memory 256m lim >/dev/null && $
 t update-cpus "200000 100000" bash -c "$D update --cpus 2 lim >/dev/null && $D exec lim cat /sys/fs/cgroup/cpu.max"
 t update-kept "268435456" bash -c "$D restart -t 1 lim >/dev/null && $D exec lim cat /sys/fs/cgroup/memory.max"
 t update-restart-policy "always" bash -c "$D update --restart always lim >/dev/null && $D inspect -f '{{.HostConfig.RestartPolicy.Name}}' lim"
+t limit-memory-swap-update "201326592:335544320:ok 201326592:335544320:ok 201326592:-1:ok 268435456:-1:ok" bash -c "
+  $D rm -f lim-sw >/dev/null 2>&1
+  $D run -d --name lim-sw --memory 128m alpine sleep 60 >/dev/null
+  sw() { $D exec lim-sw sh -c \"[ ! -e /sys/fs/cgroup/memory.swap.max ] && echo ok || { v=\\\$(cat /sys/fs/cgroup/memory.swap.max); [ \\\"\\\$v\\\" = \\\"\$1\\\" ] && echo ok || echo bad:\\\$v; }\"; }
+  $D update --memory 192m --memory-swap 320m lim-sw >/dev/null
+  s1=\"\$($D inspect -f '{{.HostConfig.Memory}}:{{.HostConfig.MemorySwap}}' lim-sw):\$(sw 134217728)\"
+  $D update --cpus 1 lim-sw >/dev/null
+  s2=\"\$($D inspect -f '{{.HostConfig.Memory}}:{{.HostConfig.MemorySwap}}' lim-sw):\$(sw 134217728)\"
+  $D update --memory-swap -1 lim-sw >/dev/null
+  s3=\"\$($D inspect -f '{{.HostConfig.Memory}}:{{.HostConfig.MemorySwap}}' lim-sw):\$(sw max)\"
+  $D update --memory 256m lim-sw >/dev/null
+  s4=\"\$($D inspect -f '{{.HostConfig.Memory}}:{{.HostConfig.MemorySwap}}' lim-sw):\$(sw max)\"
+  $D rm -f lim-sw >/dev/null
+  echo \"\$s1 \$s2 \$s3 \$s4\"
+"
 t stop-paused "exited" bash -c "$D pause lim >/dev/null; $D stop -t 2 lim >/dev/null && $D inspect -f '{{.State.Status}}' lim"
 $D rm -f lim >/dev/null
 

@@ -51,8 +51,9 @@ pub const INPUT_WINDOW: usize = 4 << 20;
 /// the container's root is in place. 7 added `CancelStart`, which has no
 /// reply: an older agent's "unexpected" error would be taken as the reply
 /// to the next request. 8 added `DnsRename`, another no-reply message, for
-/// the same reason.
-pub const PROTOCOL: u16 = 8;
+/// the same reason. 9 added `Limits::swap_max`: an older agent would read
+/// the limits one field short.
+pub const PROTOCOL: u16 = 9;
 
 /// Most names a `DnsRename` may carry: a name, its aliases and a hostname.
 pub const MAX_DNS_NAMES: usize = 256;
@@ -554,9 +555,10 @@ pub struct RunSpec<'a> {
     pub seccomp: &'a [u8],
 }
 
-/// cgroup limits (`--memory`, `--cpus`, `--cpu-shares`, `--pids-limit`).
-/// Zero means no limit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// cgroup limits (`--memory`, `--memory-swap`, `--cpus`, `--cpu-shares`,
+/// `--pids-limit`). Zero means no limit, except `swap_max` where `0` means no
+/// swap and [`NO_LIMIT`] means no limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
     pub memory_max: u64,
     /// CPU time allowed per `cpu_period` microseconds (`--cpus 1.5` is 150000/100000).
@@ -567,6 +569,17 @@ pub struct Limits {
     pub pids_max: u32,
     /// `--shm-size` in bytes; 0 means 64 MiB.
     pub shm_size: u64,
+    /// cgroup v2 `memory.swap.max` in bytes, [`NO_LIMIT`] for `max`.
+    pub swap_max: u64,
+}
+
+/// A limit of `max`.
+pub const NO_LIMIT: u64 = u64::MAX;
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self { memory_max: 0, cpu_quota: 0, cpu_period: 0, cpu_weight: 0, pids_max: 0, shm_size: 0, swap_max: NO_LIMIT }
+    }
 }
 
 fn put_limits(out: &mut Vec<u8>, l: &Limits) {
@@ -576,10 +589,19 @@ fn put_limits(out: &mut Vec<u8>, l: &Limits) {
     put_u32(out, l.cpu_weight);
     put_u32(out, l.pids_max);
     put_u64(out, l.shm_size);
+    put_u64(out, l.swap_max);
 }
 
 fn read_limits(r: &mut Reader<'_>) -> Result<Limits, DecodeError> {
-    Ok(Limits { memory_max: r.u64()?, cpu_quota: r.u64()?, cpu_period: r.u32()?, cpu_weight: r.u32()?, pids_max: r.u32()?, shm_size: r.u64()? })
+    Ok(Limits {
+        memory_max: r.u64()?,
+        cpu_quota: r.u64()?,
+        cpu_period: r.u32()?,
+        cpu_weight: r.u32()?,
+        pids_max: r.u32()?,
+        shm_size: r.u64()?,
+        swap_max: r.u64()?,
+    })
 }
 
 /// One container's resource use, read from its cgroup and network namespace.
@@ -1602,10 +1624,11 @@ mod tests {
     fn run_spec_lists_survive_encoding() {
         let mut buf = Vec::new();
         let net = Net { bridge: "kiri0", ip: [172, 17, 0, 2], prefix: 16, gateway: [172, 17, 0, 1], extra_hosts: &["1.2.3.4 x"], dns_names: &["web"], opts: &["netns=c0", "nameserver=8.8.8.8"] };
-        let limits = Limits { memory_max: 256 << 20, cpu_quota: 150_000, cpu_period: 100_000, cpu_weight: 100, pids_max: 64, shm_size: 1 << 20 };
+        let limits = Limits { memory_max: 256 << 20, cpu_quota: 150_000, cpu_period: 100_000, cpu_weight: 100, pids_max: 64, shm_size: 1 << 20, swap_max: 512 << 20 };
         encode_run(&mut buf, "c1", &["sha256:top", "sha256:base"], &["echo", "hi"], &["A=1"], "/", "", "c1", 3, net, &["/a\t/b\tro"], &limits, 0b101, &["rlimit\t7\t1024\t2048"], &[]);
         let Msg::Run(r) = decode(&buf).unwrap() else { panic!() };
         assert_eq!(r.id, "c1");
+        assert_eq!(r.limits, limits);
         assert_eq!(r.layers.iter().collect::<Vec<_>>(), ["sha256:top", "sha256:base"]);
         assert_eq!(r.argv.iter().collect::<Vec<_>>(), ["echo", "hi"]);
         assert_eq!(r.env.len(), 1);
@@ -1759,6 +1782,13 @@ mod tests {
     }
 
     #[test]
+    fn the_protocol_version_covers_swap_max() {
+        // An agent from before `Limits::swap_max` reads the limits one field short.
+        const { assert!(PROTOCOL >= 9) };
+        assert_eq!(Limits::default().swap_max, NO_LIMIT);
+    }
+
+    #[test]
     fn fs_messages_survive_encoding() {
         round(Msg::FsStatRequest { id: "c1", path: "/etc" });
         round(Msg::FsStat(FsEntry { name: "etc", mode: 0o40755, size: 4096, mtime: 1_700_000_000, mtime_nsec: 5, ino: 77 }));
@@ -1770,7 +1800,7 @@ mod tests {
         round(Msg::RemoveBridge { bridge: "kiri3" });
         round(Msg::CopyStat { entry: FsEntry { name: "hosts", mode: 0o100644, size: 9, mtime: 3, mtime_nsec: 4, ino: 5 }, link: "" });
         round(Msg::CopyDone);
-        round(Msg::Update { id: "c1", limits: Limits { memory_max: 1, cpu_quota: 2, cpu_period: 3, cpu_weight: 4, pids_max: 5, shm_size: 6 } });
+        round(Msg::Update { id: "c1", limits: Limits { memory_max: 1, cpu_quota: 2, cpu_period: 3, cpu_weight: 4, pids_max: 5, shm_size: 6, swap_max: NO_LIMIT } });
         round(Msg::Freeze { id: "c1", frozen: true });
         round(Msg::StatsQuery { id: "c1" });
         round(Msg::ContainerStats(ContainerStats { read_ns: 1, mem_current: 2, online_cpus: 4, rx_bytes: 9, io_write_bytes: 11, ..Default::default() }));

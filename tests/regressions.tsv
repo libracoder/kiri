@@ -254,3 +254,7 @@ disconnect-hands-ipv6-default-on	#381	disconnecting the external IPv6 network th
 inspect-exposed-udp	#620	docker inspect dropped non-TCP exposed ports (such as 53/udp or 132/sctp) from Config.ExposedPorts and NetworkSettings.Ports
 userns-run	#597	when the Linux engine runs inside a user namespace (nested Docker, Coder, Sysbox), container start failed on mknod /dev/null (EPERM) and on raising the default nofile rlimit past the engine's hard limit
 userns-run-privileged	#597	when the Linux engine runs inside a user namespace, --privileged containers skipped standard /dev nodes after copy_host_devices failed mknod with EPERM
+limit-memory-swap-inspect	#523	containers with --memory reported HostConfig.MemorySwap 0 instead of 2x memory and dropped --memory-swap (#690)
+limit-memory-swap-refused	#523	invalid --memory-swap values on create and update were accepted instead of refused with Docker's error messages (#690)
+limit-memory-swap-update	#523	docker update dropped --memory-swap or failed to keep an existing custom or unlimited swap limit (#690)
+limit-memory-swap	#523	every container with --memory was pinned to memory.swap.max = 0 instead of getting Docker's 2x default or --memory-swap (#690)

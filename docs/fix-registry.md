@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #545 Linux: a memory limit gets as much swap again, and `--memory-swap` is applied, as on Docker (unreleased)
+- Fixes: #523 Linux: containers with `--memory` get `memory.swap.max = 0` and `--memory-swap` is ignored; #690
+- Caused: none known
+- Caused by: -
+- Check: `limit-memory-swap`, `limit-memory-swap-inspect`, `limit-memory-swap-refused`, `limit-memory-swap-update`
+
 ### #597 Linux host: start containers when the engine runs in a user namespace (unreleased)
 - Fixes: #597 Linux host: containers fail to start when the engine runs in a user namespace (`mknod dev/null: Operation not permitted`, default `nofile` above `rlim_max`)
 - Caused: none known
