@@ -130,6 +130,12 @@ t socket-mount-reaches-kiri "Kiri" "docker run --rm -v /root/.kiri/run/docker.so
 # A container given the engine's socket uses Docker's API, not Kiri's own
 # settings: the same CLI that changes them here is refused from inside one.
 t socket-mount-settings-refused "not from a container" "docker run --rm -v /opt/kiri/kiri:/kiri:ro -v /root/.kiri/run/docker.sock:/var/run/docker.sock -e KIRI_SOCKET=/var/run/docker.sock alpine /kiri registry insecure add 10.9.9.9:5000 2>&1"
+# A standalone root-run Linux daemon listens at /run/kiri/docker.sock (0660,
+# never world-writable) and lets a containerized client whose numeric uid
+# (54321) has no host account in /etc/passwd call /_ping and /version when it
+# carries the socket's gid, while refusing a container uid without that gid
+# with EACCES (#127).
+t socket-container-uid-group "sock=0:660:0:660 uid=absent ping=OK ver=Kiri cli=Kiri denied=eacces" "m1=\$(stat -c '%u:%a' /run/kiri/docker.sock 2>/dev/null || echo none); m2=\$(stat -c '%u:%a' /run/kiri/docker.container.sock 2>/dev/null || echo none); grep -q '^[^:]*:[^:]*:54321:' /etc/passwd && u=present || u=absent; gid=\$(stat -c %g /run/kiri/docker.sock 2>/dev/null || echo 99999); allow=\$(docker run --rm --user \"54321:\$gid\" -v /run/kiri/docker.sock:/var/run/docker.sock nginx:alpine sh -c 'p=\$(curl -s --unix-socket /var/run/docker.sock http://d/_ping); curl -s --unix-socket /var/run/docker.sock http://d/version | grep -q \"\\\"Kiri\\\"\" && v=Kiri || v=no; printf \"ping=%s ver=%s\" \"\$p\" \"\$v\"' 2>&1); cli=\$(docker run --rm --user \"54321:\$gid\" -v /run/kiri/docker.sock:/var/run/docker.sock -e HOME=/tmp docker:cli docker version --format '{{.Server.Platform.Name}}' 2>&1); deny=\$(docker run --rm --user 54321:54321 -v /run/kiri/docker.sock:/var/run/docker.sock nginx:alpine curl -sS --unix-socket /var/run/docker.sock http://d/_ping 2>&1); echo \"\$deny\" | grep -qi 'permission denied' && d=eacces || d=\"bad:\$deny\"; echo \"sock=\$m1:\$m2 uid=\$u \$allow cli=\$cli denied=\$d\""
 t stats "web" "docker stats --no-stream --format '{{.Name}}'"
 t network-dns "PONG" "docker network create lhn >/dev/null 2>&1; docker run -d --name db --network lhn redis:7-alpine >/dev/null; sleep 1; docker run --rm --network lhn redis:7-alpine redis-cli -h db ping"
 t bind-host-path "3." "docker run --rm -v /etc:/h:ro alpine cat /h/alpine-release"
