@@ -812,6 +812,73 @@ t wsl-hybrid-cgroup "hybrid=ok noctrl=ok v1only=ok" "apk add -q util-linux util-
 # Linux uses for docker.proxy.sock (#420).
 t host-services-untouched "absent=yes kiri=root:root:700:socket host-unpriv=denied dd=65534:65534:755:no-kiri-sock:rm-ok" "absent=\$([ ! -e /run/host-services ] && echo yes || echo no); kdir=\$(stat -c '%U:%G:%a' /run/kiri/host-services 2>/dev/null); ksock=\$(stat -c '%F' /run/kiri/host-services/ssh-auth.sock 2>/dev/null); su nobody -s /bin/sh -c 'test -e /run/kiri/host-services/ssh-auth.sock' 2>/dev/null && unpriv=reached || unpriv=denied; mkdir -p /run/host-services && chown 65534:65534 /run/host-services && chmod 755 /run/host-services && : > /run/host-services/docker.proxy.sock && chown 65534:65534 /run/host-services/docker.proxy.sock; $POST http://d/kiri/stop >/dev/null && $POST http://d/kiri/wake >/dev/null && docker run --rm -v /run/host-services/ssh-auth.sock:/run/host-services/ssh-auth.sock alpine test -S /run/host-services/ssh-auth.sock; dd_dir=\$(stat -c '%u:%g:%a' /run/host-services 2>/dev/null); [ ! -e /run/host-services/ssh-auth.sock ] && dd_sock=no-kiri-sock || dd_sock=clobbered; su nobody -s /bin/sh -c 'rm /run/host-services/docker.proxy.sock' 2>/dev/null && dd_rm=rm-ok || dd_rm=rm-denied; rm -rf /run/host-services; echo \"absent=\$absent kiri=\$kdir:\$ksock host-unpriv=\$unpriv dd=\$dd_dir:\$dd_sock:\$dd_rm\""
 t host-services-ssh-agent-mount "sock1=ok sock2=ok src=/run/host-services/ssh-auth.sock host-absent=yes" "id=\$(docker create -u 1000:1000 -v /run/host-services/ssh-auth.sock:/run/host-services/ssh-auth.sock --mount type=bind,source=/run/host-services/ssh-auth.sock,target=/ssh2.sock alpine sh -c 'test -S /run/host-services/ssh-auth.sock && test -w /run/host-services/ssh-auth.sock && s1=ok || s1=no; test -S /ssh2.sock && test -w /ssh2.sock && s2=ok || s2=no; printf \"sock1=%s sock2=%s \" \"\$s1\" \"\$s2\"'); src=\$(docker inspect -f '{{(index .Mounts 0).Source}}' \$id); docker start -a \$id; docker rm -f \$id >/dev/null; [ ! -e /run/host-services ] && ha=yes || ha=no; echo \"src=\$src host-absent=\$ha\""
+# When an outer seccomp filter blocks clone3 with ENOSYS or EPERM (Android /
+# Droidspaces, older Docker profiles; #529), kiri-init falls back to clone(2),
+# moves the child into its cgroup, unshares CLONE_NEWCGROUP before mounting
+# /sys/fs/cgroup, and places docker exec in the container's cgroup (or its
+# init's sub-cgroup when the root cgroup refuses processes).
+$D exec -i "$N" sh -c 'cat > /clone3-seccomp-test.sh' <<'SH'
+#!/bin/sh
+set -u
+export DOCKER_HOST=unix:///root/.kiri/run/docker.sock
+docker save alpine:latest -o /tmp/alpine529.tar >/dev/null 2>&1 || { echo "save-failed"; exit 1; }
+export KIRI_BIN=/opt/kiri/kiri
+
+cat > /tmp/deny-clone3.py <<'PY'
+import ctypes, errno, os, struct, sys
+code = getattr(errno, sys.argv[1])
+insns = struct.pack(
+    "=HBBIHBBIHBBIHBBI",
+    0x20, 0, 0, 0,
+    0x15, 0, 1, 435,
+    0x06, 0, 0, 0x00050000 | code,
+    0x06, 0, 0, 0x7fff0000,
+)
+buf = ctypes.create_string_buffer(insns, len(insns))
+class Prog(ctypes.Structure):
+    _fields_ = [("len", ctypes.c_ushort), ("filter", ctypes.c_void_p)]
+prog = Prog(4, ctypes.addressof(buf))
+libc = ctypes.CDLL(None, use_errno=True)
+if libc.prctl(22, 2, ctypes.byref(prog), 0, 0) != 0:
+    sys.exit(ctypes.get_errno())
+os.execvp(sys.argv[2], sys.argv[2:])
+PY
+
+cat > /tmp/exercise529.sh <<'EOF'
+#!/bin/sh
+set -u
+err=$1
+mount -t tmpfs t /var/lib/kiri && mount -t tmpfs t /root && ip link set lo up
+python3 /tmp/deny-clone3.py "$err" "$KIRI_BIN" daemon >/tmp/lh529.log 2>&1 &
+p=$!
+export DOCKER_HOST=unix:///root/.kiri/run/docker.sock
+for i in $(seq 60); do docker version >/dev/null 2>&1 && break; sleep 0.2; done
+docker load -q -i /tmp/alpine529.tar >/dev/null 2>&1 || { kill $p 2>/dev/null; wait $p 2>/dev/null; echo load-fail; exit 1; }
+r1=$(docker run --rm --memory 64m alpine sh -c 'printf "%s:%s" "$(cat /sys/fs/cgroup/memory.max)" "$(cat /proc/1/cgroup)"' 2>&1) || {
+  kill $p 2>/dev/null; wait $p 2>/dev/null; echo "run-fail:$r1"; exit 1
+}
+cid=$(docker run -d --privileged --memory 64m alpine sleep 60 2>&1) || {
+  kill $p 2>/dev/null; wait $p 2>/dev/null; echo "bg-fail:$cid"; exit 1
+}
+r2=$(docker exec "$cid" sh -c 'printf "%s:%s" "$(cat /sys/fs/cgroup/memory.max)" "$(cat /proc/self/cgroup)"' 2>&1) || {
+  docker rm -f "$cid" >/dev/null 2>&1; kill $p 2>/dev/null; wait $p 2>/dev/null; echo "exec-fail:$r2"; exit 1
+}
+r3=$(docker exec "$cid" sh -c 'mkdir -p /sys/fs/cgroup/sub && echo 1 > /sys/fs/cgroup/sub/cgroup.procs && echo $$ > /sys/fs/cgroup/sub/cgroup.procs && echo +pids > /sys/fs/cgroup/cgroup.subtree_control' 2>&1 &&
+     docker exec "$cid" cat /proc/self/cgroup 2>&1) || {
+  docker rm -f "$cid" >/dev/null 2>&1; kill $p 2>/dev/null; wait $p 2>/dev/null; echo "sub-fail:$r3"; exit 1
+}
+docker rm -f "$cid" >/dev/null 2>&1
+kill $p 2>/dev/null; wait $p 2>/dev/null
+echo "$r1|$r2|$r3"
+EOF
+chmod +x /tmp/exercise529.sh
+
+e1=$(unshare --mount --propagation private --net --fork /tmp/exercise529.sh ENOSYS)
+e2=$(unshare --mount --propagation private --net --fork /tmp/exercise529.sh EPERM)
+rm -f /tmp/alpine529.tar /tmp/deny-clone3.py /tmp/exercise529.sh /tmp/lh529.log
+echo "enosys=$e1 eperm=$e2"
+SH
+t clone3-seccomp-fallback "enosys=67108864:0::/|67108864:0::/|0::/sub eperm=67108864:0::/|67108864:0::/|0::/sub" "apk add -q util-linux util-linux-misc iproute2 python3 >/dev/null 2>&1; sh /clone3-seccomp-test.sh"
 $D rm -f "$N" >/dev/null
 # An engine in a user namespace (nested Docker, Sysbox, Coder, CI; #597),
 # where the kernel refuses mknod of a device: an image layer with a

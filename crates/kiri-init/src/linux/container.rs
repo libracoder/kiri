@@ -1,9 +1,11 @@
 //! Starts containers and execs.
 //!
-//! A container is one clone3 straight into fresh namespaces and its cgroup;
-//! the child sets up its root and execs. An exec joins a running container's
-//! namespaces and cgroup the same way. No runc, no shim, no extra fork:
-//! every process is a direct child of the agent, so waiting just works.
+//! A container is one clone3 straight into fresh namespaces and its cgroup
+//! (or, where clone3 is blocked, one clone that the agent then moves into
+//! its cgroup); the child sets up its root and execs. An exec joins a
+//! running container's namespaces and cgroup the same way. No runc, no shim,
+//! no extra fork: every process is a direct child of the agent, so waiting
+//! just works.
 
 use std::ffi::{CStr, CString};
 use std::fs;
@@ -317,6 +319,9 @@ struct Prepared {
     /// made, `pivot_root` done), so a start is not reported before an exec
     /// can join its mount namespace (#311).
     root_ready: Option<OwnedFd>,
+    /// The child's end of the pipe that says it has been moved into its
+    /// cgroup. Only a start that fell back to clone(2) waits on it.
+    cgroup_ready: Option<OwnedFd>,
 }
 
 /// The parts of [`super::hostopts::HostOpts`] the child applies itself.
@@ -576,6 +581,10 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
     // instead of the container's, where its image users don't exist (#311).
     let (root_ready, child_root_ready) = sys::pipe().map_err(cleanup)?;
     prepared.root_ready = Some(child_root_ready);
+    // The child waits here until the agent has moved it into its cgroup, for
+    // a start that clone3 could not place there itself.
+    let (child_cgroup_ready, cgroup_go) = sys::pipe().map_err(cleanup)?;
+    prepared.cgroup_ready = Some(child_cgroup_ready);
     let (parent_io, child_io) = stdio(&prepared).map_err(cleanup)?;
     let rootfs_c = sys::cstr(&rootfs).map_err(cleanup)?;
 
@@ -605,12 +614,15 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
     let close_first = sys::close_ranges(&child_fds(&prepared, &child_io));
     // SAFETY: the agent is single-threaded, as clone3 without CLONE_VM needs.
     let cloned = unsafe { sys::clone3(&args) };
-    if let Ok(0) = cloned {
-        container_child(&prepared, &rootfs_c, &child_io, &close_first);
+    if let Ok(c) = &cloned
+        && c.pid == 0
+    {
+        container_child(&prepared, &rootfs_c, &child_io, &close_first, !c.into_cgroup);
     }
     let restored = own_pid_ns.map_or(Ok(()), |own| sys::setns(own.as_raw_fd(), libc::CLONE_NEWPID));
     drop(pid_join);
-    let pid = cloned.map_err(cleanup)?;
+    let cloned = cloned.map_err(cleanup)?;
+    let pid = cloned.pid;
     if let Err(e) = restored {
         // The agent's next children would land in the other container: a
         // start that cannot undo that is not one to go on with.
@@ -624,6 +636,7 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
     // The child holds its own copy of the write end: only then does closing
     // it (the child exiting early) read as EOF here.
     drop(prepared.root_ready.take());
+    drop(prepared.cgroup_ready.take());
     if flags & libc::CLONE_NEWNET as u64 != 0 {
         netns = fs::File::open(format!("/proc/{pid}/ns/net")).map_or(0, |f| netns_inode(&f));
     }
@@ -668,6 +681,18 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
             None => e,
         }
     };
+    if !cloned.into_cgroup {
+        // clone(2) cannot put the child in its cgroup: do it now, before it
+        // mounts anything and its limits have to apply. The child waits on
+        // the pipe until this write is done.
+        fs::write(cgroup.join("cgroup.procs"), pid.to_string())
+            .map_err(|e| kill_child(io::Error::new(e.kind(), format!("cgroup: {e}"))))?;
+        // SAFETY: one byte to a pipe we own: "you are in your cgroup".
+        if unsafe { libc::write(cgroup_go.as_raw_fd(), b"g".as_ptr().cast(), 1) } != 1 {
+            return Err(kill_child(io::Error::last_os_error()));
+        }
+    }
+    drop(cgroup_go);
     // Before `pivot_root`, an exec joining its mount namespace gets the
     // agent's `/etc/passwd`, and an image user such as `dev` is unknown
     // (#311). So the start waits for the root, briefly (ROOT_READY_WAIT):
@@ -918,6 +943,10 @@ pub fn exec(spec: &ExecSpec<'_>, target_pid: libc::pid_t, paths: &Paths, profile
     // An exec runs under its container's profile, not the default.
     prepared.profile = profile.to_vec();
     let (parent_io, child_io) = stdio(&prepared)?;
+    // The child waits here until the agent has moved it into its cgroup, for
+    // a start that clone3 could not place there itself.
+    let (child_cgroup_ready, cgroup_go) = sys::pipe()?;
+    prepared.cgroup_ready = Some(child_cgroup_ready);
     let args = CloneArgs {
         flags: CLONE_INTO_CGROUP,
         exit_signal: libc::SIGCHLD as u64,
@@ -937,9 +966,8 @@ pub fn exec(spec: &ExecSpec<'_>, target_pid: libc::pid_t, paths: &Paths, profile
     // no processes. Join the one its init lives in, as runc does.
     let init_cgroup;
     if cloned.as_ref().is_err_and(|e| e.kind() == io::ErrorKind::ResourceBusy) {
-        let rel = fs::read_to_string(format!("/proc/{target_pid}/cgroup")).unwrap_or_default();
-        let rel = rel.lines().find_map(|l| l.strip_prefix("0::")).unwrap_or("").trim().trim_start_matches('/').to_owned();
-        init_cgroup = fs::File::open(paths.cgroup_root.join(&rel));
+        let (rel, dir) = proc_cgroup(&paths.cgroup_root, target_pid);
+        init_cgroup = fs::File::open(dir);
         match &init_cgroup {
             Ok(fd) => {
                 let retry = CloneArgs { cgroup: fd.as_raw_fd() as u64, ..args };
@@ -949,12 +977,36 @@ pub fn exec(spec: &ExecSpec<'_>, target_pid: libc::pid_t, paths: &Paths, profile
             Err(e) => cloned = Err(io::Error::new(e.kind(), format!("cgroup {rel}: {e}"))),
         }
     }
-    if let Ok(0) = cloned {
-        exec_child(&prepared, &namespaces, &child_io);
+    if let Ok(c) = &cloned
+        && c.pid == 0
+    {
+        exec_child(&prepared, &namespaces, &child_io, !c.into_cgroup);
     }
     let restored = sys::setns(own_pid_ns.as_raw_fd(), libc::CLONE_NEWPID);
-    let pid = cloned?;
-    restored?;
+    drop(prepared.cgroup_ready.take());
+    let child = cloned?;
+    let pid = child.pid;
+    if let Err(e) = restored {
+        // SAFETY: killing and reaping the child we just cloned.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+            libc::waitpid(pid, std::ptr::null_mut(), 0);
+        }
+        return Err(e);
+    }
+    if !child.into_cgroup {
+        // clone(2) cannot put the exec in the container's cgroup: do it now,
+        // then let it join the container's namespaces.
+        if let Err(e) = move_child(&paths.cgroup.join(spec.container_id), &paths.cgroup_root, pid, target_pid, &cgroup_go) {
+            // SAFETY: killing and reaping the child we just cloned.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+                libc::waitpid(pid, std::ptr::null_mut(), 0);
+            }
+            return Err(e);
+        }
+    }
+    drop(cgroup_go);
     drop(cgroup_fd);
     let (stdin, stdout, stderr) = finish_stdio(parent_io, child_io).map_err(|e| {
         // SAFETY: killing the child we just cloned.
@@ -980,6 +1032,38 @@ pub fn exec(spec: &ExecSpec<'_>, target_pid: libc::pid_t, paths: &Paths, profile
         filling: false,
         cancelled: false,
     })
+}
+
+/// The cgroup v2 directory (under `cgroup_root`) where `pid` lives, and
+/// its hierarchy-relative path for error messages.
+fn proc_cgroup(cgroup_root: &Path, pid: libc::pid_t) -> (String, PathBuf) {
+    let text = fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap_or_default();
+    cgroup_of_proc(cgroup_root, &text)
+}
+
+fn cgroup_of_proc(cgroup_root: &Path, proc_cgroup: &str) -> (String, PathBuf) {
+    let rel = proc_cgroup.lines().find_map(|l| l.strip_prefix("0::")).unwrap_or("").trim().trim_start_matches('/').to_owned();
+    let dir = if rel.is_empty() { cgroup_root.to_path_buf() } else { cgroup_root.join(&rel) };
+    (rel, dir)
+}
+
+/// Moves a child started with clone(2) into `cgroup`, then lets it go on.
+/// `init_pid`: the container's init, whose cgroup is used when the
+/// container's own cgroup takes no processes (Docker in Docker, BuildKit
+/// move theirs into sub-cgroups), as runc does.
+fn move_child(cgroup: &Path, cgroup_root: &Path, pid: libc::pid_t, init_pid: libc::pid_t, go: &OwnedFd) -> io::Result<()> {
+    if let Err(e) = fs::write(cgroup.join("cgroup.procs"), pid.to_string()) {
+        if e.kind() != io::ErrorKind::ResourceBusy {
+            return Err(e);
+        }
+        let (rel, dir) = proc_cgroup(cgroup_root, init_pid);
+        fs::write(dir.join("cgroup.procs"), pid.to_string()).map_err(|e| io::Error::new(e.kind(), format!("joining cgroup {rel}: {e}")))?;
+    }
+    // SAFETY: one byte to a pipe we own: "you are in your cgroup".
+    if unsafe { libc::write(go.as_raw_fd(), b"g".as_ptr().cast(), 1) } != 1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Unmounts a container and, for `--rm`, deletes its writable layer.
@@ -1214,6 +1298,7 @@ fn prepare(argv: StrList<'_>, env: StrList<'_>, cwd: &str, user: &str, hostname:
         init: flags & run_flags::INIT != 0,
         host: HostApplied::default(),
         root_ready: None,
+        cgroup_ready: None,
     })
 }
 
@@ -1780,7 +1865,8 @@ fn report_fd(io: &ChildStdio) -> RawFd {
 /// The descriptors a container's child, right after its clone, still uses
 /// of those it inherited: its standard streams (or terminal socket), which
 /// are also where it reports a failure; the network namespace it joins;
-/// the pipes it says "root ready" on and waits for its network on. Every
+/// the pipes it says "root ready" on, waits for its network on, and waits
+/// for its cgroup placement on. Every
 /// other descriptor it uses it opens itself, later (its root, the image's
 /// tree, its terminal). Standard input, output and error (0, 1, 2) always
 /// stay. Every field of `Prepared` is named, so a descriptor added to it
@@ -1813,6 +1899,7 @@ fn child_fds(p: &Prepared, io: &ChildStdio) -> Vec<RawFd> {
         // Paths, numbers and names only.
         host: HostApplied { rlimits: _, groups: _, nodes: _, masked: _, readonly: _ },
         root_ready,
+        cgroup_ready,
     } = p;
     let mut fds = match io {
         ChildStdio::Tty { sock } => vec![sock.as_raw_fd()],
@@ -1825,12 +1912,15 @@ fn child_fds(p: &Prepared, io: &ChildStdio) -> Vec<RawFd> {
     fds.extend(net_join.as_ref().map(AsRawFd::as_raw_fd));
     fds.extend(net_ready.as_ref().map(AsRawFd::as_raw_fd));
     fds.extend(root_ready.as_ref().map(AsRawFd::as_raw_fd));
+    fds.extend(cgroup_ready.as_ref().map(AsRawFd::as_raw_fd));
     fds
 }
 
 /// Runs in the cloned child: PID 1 of the container, in its own namespaces
 /// and cgroup. Never returns: it execs or exits 127 with a message.
-fn container_child(p: &Prepared, rootfs: &CStr, io: &ChildStdio, close_first: &[(libc::c_uint, libc::c_uint)]) -> ! {
+/// `fallback`: clone3 was blocked, so clone(2) made this child: it is not
+/// in its cgroup yet and has no cgroup namespace of its own.
+fn container_child(p: &Prepared, rootfs: &CStr, io: &ChildStdio, close_first: &[(libc::c_uint, libc::c_uint)], fallback: bool) -> ! {
     // First of all: the clone gave this child a copy of every descriptor
     // the agent had open, and filling a new volume can take seconds while
     // the agent goes on. Held here, a network's DNS socket keeps its
@@ -1844,6 +1934,20 @@ fn container_child(p: &Prepared, rootfs: &CStr, io: &ChildStdio, close_first: &[
     sys::close_now(close_first);
     let err = report_fd(io);
     let fail = |what: &str, e: io::Error| -> ! { child_fail(err, what, e) };
+
+    if fallback {
+        // The agent moves us into the container's cgroup, then unshares a
+        // cgroup namespace rooted there, as clone3 with CLONE_INTO_CGROUP
+        // would have done before we ran anything.
+        if let Some(ready) = &p.cgroup_ready {
+            let mut b = [0u8; 1];
+            // SAFETY: reading one byte into a local buffer from a pipe we own.
+            if unsafe { libc::read(ready.as_raw_fd(), b.as_mut_ptr().cast(), 1) } != 1 {
+                fail("cgroup", io::Error::other("the agent could not move this container into its cgroup"));
+            }
+        }
+        sys::unshare(libc::CLONE_NEWCGROUP).unwrap_or_else(|e| fail("cgroup namespace", e));
+    }
 
     // Mount events must not leak back into the agent's namespace.
     sys::remount(c"/", libc::MS_REC | libc::MS_PRIVATE).unwrap_or_else(|e| fail("make mounts private", e));
@@ -1932,8 +2036,19 @@ fn container_child(p: &Prepared, rootfs: &CStr, io: &ChildStdio, close_first: &[
 
 /// Runs in the cloned child of an exec: joins the container's remaining
 /// namespaces (the PID namespace was set before clone), then execs.
-fn exec_child(p: &Prepared, namespaces: &[(fs::File, libc::c_int)], io: &ChildStdio) -> ! {
+/// `fallback`: clone3 was blocked, so it waits until the agent has moved it
+/// into the container's cgroup.
+fn exec_child(p: &Prepared, namespaces: &[(fs::File, libc::c_int)], io: &ChildStdio, fallback: bool) -> ! {
     let err = report_fd(io);
+    if fallback
+        && let Some(ready) = &p.cgroup_ready
+    {
+        let mut b = [0u8; 1];
+        // SAFETY: reading one byte into a local buffer from a pipe we own.
+        if unsafe { libc::read(ready.as_raw_fd(), b.as_mut_ptr().cast(), 1) } != 1 {
+            child_fail(err, "cgroup", io::Error::other("the agent could not move this exec into its cgroup"));
+        }
+    }
     for (fd, kind) in namespaces {
         sys::setns(fd.as_raw_fd(), *kind).unwrap_or_else(|e| child_fail(err, "join container", e));
     }
@@ -3531,5 +3646,42 @@ mod tests {
         assert!(super::api_paths(r.as_fd(), true, &paths, &paths, None).is_ok(), "privileged skips api_paths");
         assert!(super::api_paths(r.as_fd(), false, &[], &paths, None).is_err(), "unprivileged applies masked paths");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// When clone3 is blocked (#529), `move_child` writes the child's PID to
+    /// `cgroup.procs` and signals `cgroup_go`; when a container's root cgroup
+    /// refuses processes (`EBUSY`), `cgroup_of_proc` resolves the container
+    /// init's cgroup under `paths.cgroup_root`, including hybrid trees (#277).
+    #[test]
+    fn move_child_places_fallback_child_and_resolves_hybrid_init_cgroup() {
+        use std::os::fd::AsRawFd;
+        use std::path::Path;
+        let dir = std::env::temp_dir().join(format!("kiri-move-child-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("cgroup.procs"), b"").unwrap();
+        let (ready, go) = super::sys::pipe().unwrap();
+        super::move_child(&dir, &dir, 4242, 1, &go).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("cgroup.procs")).unwrap(), "4242");
+        let mut b = [0u8; 1];
+        // SAFETY: reading the byte move_child just wrote to the pipe.
+        assert_eq!(unsafe { libc::read(ready.as_raw_fd(), b.as_mut_ptr().cast(), 1) }, 1);
+        assert_eq!(&b, b"g");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let unified = Path::new("/sys/fs/cgroup");
+        assert_eq!(
+            super::cgroup_of_proc(unified, "0::/kiri/c1/init\n"),
+            ("kiri/c1/init".to_owned(), unified.join("kiri/c1/init"))
+        );
+        let hybrid = Path::new("/sys/fs/cgroup/unified");
+        assert_eq!(
+            super::cgroup_of_proc(hybrid, "2:devices:/\n1:name=systemd:/\n0::/kiri/c1/sub\n"),
+            ("kiri/c1/sub".to_owned(), hybrid.join("kiri/c1/sub"))
+        );
+        assert_eq!(
+            super::cgroup_of_proc(hybrid, "1:name=systemd:/\n0::/\n"),
+            (String::new(), hybrid.to_path_buf())
+        );
     }
 }

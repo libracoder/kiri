@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #549 Engine: fall back to clone(2) when seccomp blocks clone3 (unreleased)
+- Fixes: #529 Containers fail to start with `clone3: Function not implemented (os error 38)` when seccomp blocks `clone3`
+- Caused: none known
+- Caused by: -
+- Check: `clone3-seccomp-fallback`
+
 ### #723 Windows: the window's own refresh no longer keeps the VM awake (unreleased)
 - Fixes: #668 Windows: the window's own refresh keeps the VM from sleeping
 - Caused: none known

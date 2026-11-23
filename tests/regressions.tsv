@@ -227,3 +227,4 @@ host-services-ssh-agent-mount	#420	containers mounting /run/host-services/ssh-au
 archive-directory-contents	#617	GET /containers/{id}/archive normalized away a trailing /., dropped ./ from directory-contents entries, and did not resolve .. by name or keep / on root entries
 cp-out-dot	#617	docker cp container:/out/. dst copied the folder itself (dst/out/a.txt) instead of its contents (dst/a.txt)
 import-volume-xattrs	#485	kiri import used docker cp and BusyBox tar, silently dropping user.* extended attributes on named volumes (Supabase Storage 500 ENODATA)
+clone3-seccomp-fallback	#529	when an outer seccomp filter blocks clone3 with ENOSYS or EPERM (Android/Droidspaces, restricted Docker), containers and docker exec failed to start instead of falling back to clone(2)
