@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #673 Layers: an empty number in a tar header is 0, as in Docker, so servicebus-emulator unpacks (unreleased)
+- Fixes: #618 Layers: an empty number in a tar header is 0, as in Docker, so servicebus-emulator unpacks
+- Caused: none known
+- Caused by: -
+- Check: `import-empty-numbers`
+
 ### Engine: `seccomp=unconfined` warns that Kiri's host boundary stays in place (unreleased)
 - Fixes: #516 Apache Iggy can't start: the host-boundary filter blocks io_uring, and `seccomp=unconfined` / `--privileged` can't lift it
 - Caused: none known

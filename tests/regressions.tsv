@@ -217,3 +217,4 @@ seccomp-unconfined-colon-warns	#516	--security-opt seccomp:unconfined gave no wa
 seccomp-unconfined-api-warnings	#516	POST /containers/create returned empty Warnings when seccomp=unconfined was passed
 seccomp-default-no-warning	#516	a default container without seccomp=unconfined must return empty Warnings
 seccomp-unconfined-io-uring-blocked	#516	io_uring_setup must stay blocked with EPERM even under seccomp=unconfined
+import-empty-numbers	#618	a layer whose header left size, uid or gid empty did not unpack: "numeric field was not a number" (servicebus-emulator)

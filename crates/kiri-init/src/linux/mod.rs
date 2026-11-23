@@ -17,6 +17,7 @@ mod relay;
 mod roots;
 mod seccomp;
 mod sys;
+mod tarnum;
 mod transport;
 mod trim;
 mod usb;

@@ -1648,7 +1648,10 @@ t import-bad-change "not a valid change command" bash -c "$D export ren2 | $D im
 # A directory keeps its time from the layer, after files are unpacked into
 # it too, as on Docker (#676).
 t import-dir-mtime "1000000000" bash -c "$D export ren2 | python3 -c 'import io,sys,tarfile; s=tarfile.open(fileobj=sys.stdin.buffer,mode=\"r|*\"); o=tarfile.open(fileobj=sys.stdout.buffer,mode=\"w|\"); [o.addfile(m,s.extractfile(m) if m.isreg() else None) for m in s]; d=tarfile.TarInfo(\"dated\"); d.type,d.mode,d.mtime=tarfile.DIRTYPE,0o755,1000000000; o.addfile(d); f=tarfile.TarInfo(\"dated/f\"); f.mtime=1000000000; o.addfile(f,io.BytesIO()); o.close()' | $D import - kiri-test/imported:7 >/dev/null && $D run --rm kiri-test/imported:7 stat -c %Y /dated"
-$D rmi kiri-test/imported:1 kiri-test/imported:2 kiri-test/imported:3 kiri-test/imported:7 >/dev/null 2>&1
+# A layer whose directory has empty size, uid and gid fields: Docker reads an
+# empty number as 0 (#618, mcr.microsoft.com/azure-messaging/servicebus-emulator).
+t import-empty-numbers "ok 0:0" bash -c "$D export ren2 | python3 \"$(dirname "$0")/lib/tar-empty-numbers.py\" | $D import - kiri-test/imported:6 >/dev/null && $D run --rm kiri-test/imported:6 sh -c 'cat /empty-numbers/ok; stat -c %u:%g /empty-numbers' | tr '\\n' ' '"
+$D rmi kiri-test/imported:1 kiri-test/imported:2 kiri-test/imported:3 kiri-test/imported:6 kiri-test/imported:7 >/dev/null 2>&1
 t commit "sha256:" $D commit -c 'CMD ["cat","/added"]' -c 'ENV KIRI=1' ren2 kiri-test/committed:1
 t commit-runs "hi" $D run --rm kiri-test/committed:1
 t commit-env "KIRI=1" $D run --rm kiri-test/committed:1 env

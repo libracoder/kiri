@@ -87,6 +87,10 @@ t failed-start-frees-root "gone mounts=0" "docker rm -f kiri-badsysctl >/dev/nul
 t failed-start-no-dns "none" "docker network create kiri-dnsfail >/dev/null 2>&1; docker rm -f kiri-dnsbad >/dev/null 2>&1; docker run -d --name kiri-dnsbad --network kiri-dnsfail --sysctl net.ipv4.kiri_no_such_key=1 alpine sleep 60 >/dev/null 2>&1; docker run --rm --network kiri-dnsfail alpine sh -c 'nslookup kiri-dnsbad 2>&1 | grep -qE \"^Address: [0-9.]+\$\" && echo answered || echo none'; docker rm -f kiri-dnsbad >/dev/null 2>&1; docker network rm kiri-dnsfail >/dev/null"
 t cp-stopped-unmounts "after=0" "id=\$(docker create alpine true); docker cp /etc/hostname \$id:/f >/dev/null; for i in \$(seq 20); do [ \$($mounts) = 0 ] && break; sleep 0.1; done; echo after=\$($mounts); docker rm \$id >/dev/null"
 t commit-renamed-dir "kept" "docker rm -f kiri-rename >/dev/null 2>&1; docker run --name kiri-rename alpine mv /etc/apk /etc/apk2; docker commit kiri-rename kiri-rename-test >/dev/null; docker rm -f kiri-rename >/dev/null; docker run --rm kiri-rename-test sh -c 'test -f /etc/apk2/repositories && echo kept'; docker rmi kiri-rename-test >/dev/null"
+# A layer whose directory has empty size, uid and gid fields: Docker reads an
+# empty number as 0 (#618, mcr.microsoft.com/azure-messaging/servicebus-emulator).
+$D cp "$(dirname "$0")/lib/tar-empty-numbers.py" "$N":/tar-empty-numbers.py >/dev/null
+t import-empty-numbers "ok 0:0" "id=\$(docker create alpine true); docker export \$id | python3 /tar-empty-numbers.py | docker import - kiri-test/empty-numbers:1 >/dev/null && docker run --rm kiri-test/empty-numbers:1 sh -c 'cat /empty-numbers/ok; stat -c %u:%g /empty-numbers' | tr '\\n' ' '; docker rm \$id >/dev/null; docker rmi kiri-test/empty-numbers:1 >/dev/null 2>&1"
 # A container and an exec each lead their own session, so killpg from inside
 # never reaches the daemon (#191).
 t session-own "SID=1" "docker run --rm alpine sh -c 'echo SID=\$(cut -d\" \" -f6 /proc/1/stat)'"
