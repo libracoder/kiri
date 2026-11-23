@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #137 Archives: preserve directory-contents paths for docker cp (unreleased)
+- Fixes: #617 `docker cp container:/dir/. dest` copies the folder itself instead of its contents
+- Caused: none known
+- Caused by: -
+- Check: `archive-directory-contents`, `cp-out-dot`
+
 ### #571 Linux: keep the SSH agent socket under /run/kiri, not /run/host-services (unreleased)
 - Fixes: #420 Linux host: engine creates /run/host-services as root 0700, so Docker Desktop for Linux can't start
 - Caused: none known

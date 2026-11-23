@@ -21,6 +21,7 @@ $D run -d --name "$N" --privileged --tmpfs /run -v "$N":/var/lib/kiri -v "$N"-st
 up() { for _ in $(seq 180); do $D exec "$N" sh -c 'DOCKER_HOST=unix:///root/.kiri/run/docker.sock docker version' >/dev/null 2>&1 && break; sleep 1; done; }
 up
 $D cp "$(dirname "$0")/testcontainers-api.py" "$N":/testcontainers-api.py >/dev/null
+$D cp "$(dirname "$0")/archive-directory-contents.py" "$N":/archive-directory-contents.py >/dev/null
 $D cp "$(dirname "$0")/lib/images.sh" "$N":/images.sh >/dev/null
 $D exec -e KIRI_TEST_REGISTRY="$KIRI_REG" "$N" sh -c '. /images.sh; export DOCKER_HOST=unix:///root/.kiri/run/docker.sock; kiri_seed_images $KIRI_IMAGES_LINUX_HOST' ||
   echo "linux-host: an image could not be fetched; the checks that run it will fail"
@@ -102,6 +103,8 @@ t cp "copied" "echo copied > /tmp/x && docker cp /tmp/x web:/tmp/x && docker exe
 t cp-in-keeps-owner "1234 1235 600 key" "rm -rf /tmp/cpo && mkdir -p /tmp/cpo && printf key > /tmp/cpo/owned.pem && chmod 600 /tmp/cpo/owned.pem && chown 1234:1235 /tmp/cpo/owned.pem && tar -C /tmp/cpo -cf - owned.pem | docker cp - web:/tmp/ && echo \$(docker exec web stat -c '%u %g %a' /tmp/owned.pem) \$(docker exec -u 1234 web cat /tmp/owned.pem)"
 t cp-in-keeps-dir-and-symlink-owner "dir=1234:1235:750 link=1234:1235 over=1234:1235:regular file targets=0:0:0:0" "mkdir -p /tmp/cpo/owned-dir && chmod 750 /tmp/cpo/owned-dir && ln -sf /etc/hostname /tmp/cpo/owned-link && printf new > /tmp/cpo/owned-over && chmod 640 /tmp/cpo/owned-over && chown -Rh 1234:1235 /tmp/cpo && docker exec web ln -sf /etc/alpine-release /tmp/owned-over && tar -C /tmp/cpo -cf - owned-dir owned-link owned-over | curl -s --unix-socket /root/.kiri/run/docker.sock -X PUT --data-binary @- 'http://d/v1.47/containers/web/archive?path=/tmp' && docker exec web sh -c 'echo \"dir=\$(stat -c %u:%g:%a /tmp/owned-dir) link=\$(stat -c %u:%g /tmp/owned-link) over=\$(stat -c %u:%g:%F /tmp/owned-over) targets=\$(stat -c %u:%g /etc/hostname):\$(stat -c %u:%g /etc/alpine-release)\"'"
 t cp-in-copy-uidgid "no-a=1234:1235 with-a=1000:1000 default-a=1234:1235" "docker rm -f cpu >/dev/null 2>&1; docker run -d --name cpu -u 1000:1000 alpine sleep 120 >/dev/null && tar -C /tmp/cpo -cf - owned.pem | docker cp - cpu:/tmp/ && docker cp -a /tmp/x cpu:/tmp/x && tar -C /tmp/cpo -cf - owned.pem | docker cp -a - web:/tmp/ && echo \"no-a=\$(docker exec cpu stat -c %u:%g /tmp/owned.pem) with-a=\$(docker exec cpu stat -c %u:%g /tmp/x) default-a=\$(docker exec web stat -c %u:%g /tmp/owned.pem)\"; rm -rf /tmp/cpo; docker rm -f cpu >/dev/null 2>&1"
+t cp-out-dot "hi no-out" "docker exec web sh -c 'mkdir -p /out; echo hi > /out/a.txt' && rm -rf /tmp/cpdot && mkdir -p /tmp/cpdot && docker cp web:/out/. /tmp/cpdot && echo \"\$(cat /tmp/cpdot/a.txt) \$([ ! -e /tmp/cpdot/out ] && echo no-out || echo has-out)\"; rm -rf /tmp/cpdot"
+t archive-directory-contents "PASS stopped docker cp of a parent into new directory" "python3 /archive-directory-contents.py /root/.kiri/run/docker.sock"
 # What Testcontainers needs (#222, #121); see tests/testcontainers-api.py.
 for c in version cmd keepalive close follow follow-created timestamps; do
   t "testcontainers-$c" "ok $c" "for i in \$(seq 60); do command -v python3 >/dev/null && break; sleep 1; done; python3 /testcontainers-api.py /root/.kiri/run/docker.sock $c"

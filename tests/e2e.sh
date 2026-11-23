@@ -369,6 +369,7 @@ t output-bytes "5488895" bash -c "$D run --rm alpine sh -c 'seq 1 800000' | wc -
 t killed-by-signal "137" $D run --rm alpine sh -c 'sh -c "kill -9 \$\$"; echo $?'
 
 section "run: config"
+code archive-directory-contents 0 python3 "$(dirname "$0")/archive-directory-contents.py" "$SOCK"
 t env "bar" $D run --rm -e FOO=bar alpine sh -c 'echo $FOO'
 t env-image "PATH=/usr/local/sbin" $D run --rm alpine env
 t workdir "/tmp" $D run --rm -w /tmp alpine pwd
@@ -1271,6 +1272,7 @@ t cp-in-copy-uidgid "no-a=1234:1235 with-a=1000:1000 default-a=1234:1235" bash -
 t cp-in-zero-time "time 0" bash -c "echo z > $CPD/z && TZ=UTC touch -t 197001010000.00 $CPD/z && tar -C $CPD -cf - z | $D cp - cpc:/tmp/ && echo time \$($D exec cpc stat -c %Y /tmp/z)"
 t cp-out-file "fromctr" bash -c "$D exec cpc sh -c 'echo fromctr > /etc/motd2' && $D cp cpc:/etc/motd2 $CPD/ && cat $CPD/motd2"
 t cp-out-dir "deep" bash -c "$D exec cpc sh -c 'mkdir -p /opt/x/y; echo deep > /opt/x/y/z' && $D cp cpc:/opt/x $CPD/xx && cat $CPD/xx/y/z"
+t cp-out-dot "hi no-out" bash -c "$D exec cpc sh -c 'mkdir -p /out; echo hi > /out/a.txt' && mkdir -p $CPD/dst && $D cp cpc:/out/. $CPD/dst && echo \"\$(cat $CPD/dst/a.txt) \$([ ! -e $CPD/dst/out ] && echo no-out || echo has-out)\""
 t cp-out-stdout "alpine-release" bash -c "$D cp cpc:/etc/alpine-release - | tar -t"
 t cp-out-symlink "-> " bash -c "$D exec cpc ln -sf /etc/alpine-release /tmp/rel && $D cp cpc:/tmp/rel - | tar -tv"
 t cp-big "match" bash -c "head -c 30000000 /dev/urandom > $CPD/big && $D cp $CPD/big cpc:/tmp/big && a=\$($SHA $CPD/big | cut -c1-64); b=\$($D exec cpc sha256sum /tmp/big | cut -c1-64); [ \$a = \$b ] && echo match"
