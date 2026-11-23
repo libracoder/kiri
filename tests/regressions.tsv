@@ -272,3 +272,4 @@ rosetta-vdso-dt-hash	#344	the arm64 guest kernel vDSO was linked with DT_GNU_HAS
 layer-gc-rmi-df	#722	removing an image left its unpacked layers in /var/lib/kiri/layers and in docker system df until the next VM boot
 layer-gc-rmi-disk	#722	docker rmi left the removed image's unpacked layer directory and .done marker on disk in /var/lib/kiri/layers
 layer-gc-container-keeps-layer	#722	layer GC after overwriting a tag must keep layers still used by an existing container and reclaim them once that container is removed
+bind-recreate	#402	deleting or replacing a bind-mounted file on the Mac left a stale guest dentry until Apple's cache timeout, causing ENOENT or truncated reads (#399)

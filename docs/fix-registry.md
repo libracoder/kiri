@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #402 Guest kernel: drop stale cached bind-mount file dentries on host change (unreleased)
+- Fixes: #399 macOS: bind-mounted files deleted or replaced on the Mac return ENOENT or stale cached contents until Apple's cache timeout
+- Caused: none known
+- Caused by: -
+- Check: `bind-recreate`
+
 ### #722 Engine: prune unreferenced unpacked layers immediately on image removal, prune, tag overwrite and container removal (unreleased)
 - Fixes: #722 Unpacked layers in `/var/lib/kiri/layers` are not removed when images are removed or pruned, or when Kiri is quit and reopened
 - Caused: none known

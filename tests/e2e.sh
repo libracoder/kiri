@@ -1042,6 +1042,7 @@ code bind-mount-missing 125 $D run --rm --mount type=bind,source=/kiri/does/not/
 # host the daemon's umask (0027) must not shut out the user whose mount it is.
 t bind-v-creates "made 755 755" bash -c "$D run --rm -v $BIND/new/dir:/n alpine true && [ -d $BIND/new/dir ] && perl -e 'print q(made); printf q( %o), (stat)[2] & 07777 for @ARGV' $BIND/new $BIND/new/dir"
 t bind-file "from the mac" $D run --rm -v "$BIND/hello.txt:/etc/greeting" alpine cat /etc/greeting
+code bind-recreate 0 env D="$D" bash "$(dirname "$0")/bind-recreate.sh"
 # Docker Desktop's SSH agent mount path (/run/host-services/ssh-auth.sock) works
 # through -v and --mount for non-root container users too, while inspect shows
 # the path asked for (#420).

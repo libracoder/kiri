@@ -5,8 +5,11 @@
 # which hears of those changes from the Mac, raise the fsnotify events Linux
 # raises for a local change ("M\t/mnt/mac/…" → IN_MODIFY, C/A/D likewise).
 # Paths are looked up beneath /mnt/mac only (no symlinks, no other mounts),
-# nothing is written and no dentry dropped, and only the VM's agent may
-# write (root, in the VM's first mount namespace: not a container).
+# nothing is written, and cached non-directory, non-mountpoint dentries are
+# dropped so guest lookups see deletes and replacements before Apple's cache
+# timeout (walking cached dentries only when nobody watches, with no requests
+# to the Mac). Only the VM's agent may write (root, in the VM's first mount
+# namespace: not a container).
 --- a/fs/notify/Makefile
 +++ b/fs/notify/Makefile
 @@ -5,3 +5,5 @@
@@ -17,7 +20,7 @@
 +obj-$(CONFIG_FSNOTIFY)		+= kiri_inject.o
 --- /dev/null
 +++ b/fs/notify/kiri_inject.c
-@@ -0,0 +1,191 @@
+@@ -0,0 +1,262 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * /proc/kiri-fsnotify: changes made outside the VM, raised as fsnotify
@@ -35,12 +38,15 @@
 + *   A  PATH's attributes changed (IN_ATTRIB)
 + *   D  PATH was deleted          (IN_DELETE on its directory, IN_DELETE_SELF)
 + *
-+ * Only events are raised: nothing is written, and no dentry is dropped
-+ * (the share caches nothing, so lookups already ask the Mac). PATH is
-+ * looked up beneath /mnt/mac only, crossing no symlink and no mount, and
-+ * /mnt/mac must be the FUSE (virtiofs) share: a name can't lead anywhere
-+ * else in the VM. Only the VM's own agent may write: root, in the VM's
-+ * first mount namespace, so a container can't, even as root.
++ * Nothing is written. Cached non-directory, non-mountpoint dentries are
++ * dropped before lookups and events so the guest sees host deletes,
++ * replacements, and attribute changes before Apple's cache timeout; when
++ * nobody is watching, only already-cached dentries are walked (no requests
++ * to the Mac). Directories and mount points are left alone. PATH is looked
++ * up beneath /mnt/mac only, crossing no symlink and no mount, and /mnt/mac
++ * must be the FUSE (virtiofs) share: a name can't lead anywhere else in the
++ * VM. Only the VM's own agent may write: root, in the VM's first mount
++ * namespace, so a container can't, even as root.
 + */
 +#include <linux/dcache.h>
 +#include <linux/err.h>
@@ -60,8 +66,53 @@
 +#define KIRI_SHARE "/mnt/mac"
 +#define KIRI_SCOPED (LOOKUP_BENEATH | LOOKUP_NO_SYMLINKS | LOOKUP_NO_XDEV | LOOKUP_NO_MAGICLINKS)
 +
-+/* The file was deleted outside: tell its directory, and the file's own
-+ * watchers if the VM still has its inode. */
++/* Drop a cached file or negative dentry so the next lookup asks the Mac.
++ * Directories and mount points stay reachable. */
++static void kiri_drop_dentry(struct dentry *dentry, bool negative_only)
++{
++	spin_lock(&dentry->d_lock);
++	if (!d_is_dir(dentry) && !d_mountpoint(dentry) &&
++	    (!negative_only || d_really_is_negative(dentry)))
++		__d_drop(dentry);
++	spin_unlock(&dentry->d_lock);
++}
++
++/* Walk `rel` below `root` in the guest dcache only (no filesystem lookups or
++ * revalidations to the Mac) and drop the final dentry if cached. */
++static void kiri_drop_cached(struct dentry *root, const char *rel,
++			     bool negative_only)
++{
++	struct dentry *cur = dget(root);
++	const char *p = rel;
++
++	while (*p) {
++		const char *slash = strchr(p, '/');
++		size_t len = slash ? (size_t)(slash - p) : strlen(p);
++		struct qstr name = QSTR_INIT(p, len);
++		struct dentry *next;
++
++		next = try_lookup_noperm(&name, cur);
++		dput(cur);
++		if (IS_ERR_OR_NULL(next))
++			return;
++		if (slash) {
++			if (!d_is_dir(next) || d_mountpoint(next)) {
++				dput(next);
++				return;
++			}
++			cur = next;
++			p = slash + 1;
++		} else {
++			kiri_drop_dentry(next, negative_only);
++			dput(next);
++			return;
++		}
++	}
++	dput(cur);
++}
++
++/* The file was deleted outside: drop its cached name, tell its directory,
++ * and tell the file's own watchers if the VM still has its inode. */
 +static int kiri_deleted(struct path *parent, struct qstr *name)
 +{
 +	struct inode *dir = d_inode(parent->dentry);
@@ -69,6 +120,8 @@
 +
 +	if (IS_ERR(child))
 +		return PTR_ERR(child);
++	if (child)
++		kiri_drop_dentry(child, false);
 +	if (child && d_really_is_positive(child)) {
 +		struct inode *inode = d_inode(child);
 +		__u32 mask = FS_DELETE;
@@ -112,6 +165,17 @@
 +	if (op == 'D') {
 +		err = kiri_deleted(&parent, &name);
 +		goto out;
++	}
++	if (op == 'M' || op == 'A' || op == 'C') {
++		struct dentry *cached = try_lookup_noperm(&name, parent.dentry);
++
++		if (!IS_ERR_OR_NULL(cached)) {
++			/* Expire before looking up so a replacement or in-place
++			 * change refreshes attributes and inode before watchers
++			 * read; an inotify mark pins the inode across the drop. */
++			kiri_drop_dentry(cached, op == 'C');
++			dput(cached);
++		}
 +	}
 +	err = vfs_path_lookup(share->dentry, share->mnt, rel, KIRI_SCOPED, &target);
 +	if (err)
@@ -169,13 +233,6 @@
 +		path_put(&share);
 +		return -EXDEV;
 +	}
-+	/* Without a watcher there is no one to tell, and a batch costs no
-+	 * lookups (a container writing many files to a bind mount sends its
-+	 * own changes back). */
-+	if (!fsnotify_sb_has_watchers(share.dentry->d_sb)) {
-+		path_put(&share);
-+		return count;
-+	}
 +	buf = memdup_user_nul(ubuf, count);
 +	if (IS_ERR(buf)) {
 +		path_put(&share);
@@ -189,6 +246,23 @@
 +			continue;
 +		if (line[1] != '\t' || !(rel = kiri_relative(line + 2))) {
 +			err = -EINVAL;
++			continue;
++		}
++		/* Without a watcher there is no one to tell: walk cached
++		 * dentries only so a batch costs no requests to the Mac. */
++		if (!fsnotify_sb_has_watchers(share.dentry->d_sb)) {
++			switch (line[0]) {
++			case 'D':
++			case 'M':
++			case 'A':
++				kiri_drop_cached(share.dentry, rel, false);
++				break;
++			case 'C':
++				kiri_drop_cached(share.dentry, rel, true);
++				break;
++			default:
++				err = -EINVAL;
++			}
 +			continue;
 +		}
 +		err = kiri_event(&share, line[0], rel);
