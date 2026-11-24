@@ -1010,9 +1010,14 @@ pub fn build(req: &Request, engine: &Arc<Engine>, w: &mut UnixStream, r: &mut Bu
             return Ok(Next::Close);
         }
     };
-    // `host-gateway` was parsed as the Mac's address; on a Linux host it's
-    // the bridge gateway, as `docker run` gives (kiri-init maps it there).
-    let host = super::mirror::host_addr(engine);
+    // `host-gateway` was parsed as the Mac's address; on WSL 2 with the Windows
+    // host relay active it's 192.168.65.254, and on a plain Linux host it's the
+    // bridge gateway, as `docker run` gives (kiri-init maps it there).
+    let host = if crate::hostrelay::wsl_host_active() {
+        crate::hostrelay::WSL_HOST_ADDR_STR.to_owned()
+    } else {
+        super::mirror::host_addr(engine)
+    };
     if host != super::ports::HOST_ADDR {
         let mac = format!("={}", super::ports::HOST_ADDR);
         for h in o.extra_hosts.iter_mut().filter(|h| h.ends_with(&mac)) {

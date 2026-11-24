@@ -605,20 +605,20 @@ pub struct Dnat {
     pub to_port: u16,
 }
 
-/// `[ip daddr <host_ip> | fib daddr type local ip daddr != 127.0.0.0/8]
+/// `[ip daddr <host_ip> | fib daddr type local [ip daddr != <exclude_ip>] ip daddr != 127.0.0.0/8]
 /// <tcp|udp> dport <host_port> dnat to <to_ip>:<to_port>`.
-fn dnat_rule(chain: &str, d: &Dnat) -> Msg {
-    dnat_rule_from(chain, d, None)
+fn dnat_rule(chain: &str, d: &Dnat, exclude_ip: Option<[u8; 4]>) -> Msg {
+    dnat_rule_from(chain, d, None, exclude_ip)
 }
 
 /// `dnat_rule`, matching only packets that arrive on interface `from.0`
 /// from address `from.1` (`iif <uplink> ip saddr <gateway> ...`).
-fn dnat_rule_from(chain: &str, d: &Dnat, from: Option<(i32, [u8; 4])>) -> Msg {
-    dnat_rule_in("kiri", chain, d, from)
+fn dnat_rule_from(chain: &str, d: &Dnat, from: Option<(i32, [u8; 4])>, exclude_ip: Option<[u8; 4]>) -> Msg {
+    dnat_rule_in("kiri", chain, d, from, exclude_ip)
 }
 
 /// `dnat_rule_from` in table `table`.
-fn dnat_rule_in(table: &str, chain: &str, d: &Dnat, from: Option<(i32, [u8; 4])>) -> Msg {
+fn dnat_rule_in(table: &str, chain: &str, d: &Dnat, from: Option<(i32, [u8; 4])>, exclude_ip: Option<[u8; 4]>) -> Msg {
     let mut rule = nft(NFT_MSG_NEWRULE, NLM_F_ACK | NLM_F_CREATE | 0x800);
     rule.attr_str(1, table).attr_str(2, chain);
     rule.nest(4);
@@ -634,10 +634,14 @@ fn dnat_rule_in(table: &str, chain: &str, d: &Dnat, from: Option<(i32, [u8; 4])>
         // fib daddr type => reg 1 (NFTA_FIB_DREG, RESULT = ADDRTYPE 3, FLAGS = DADDR 2); cmp eq RTN_LOCAL
         rule.nest(1).attr_str(1, "fib").nest(2).attr_be32(1, 1).attr_be32(2, 3).attr_be32(3, 2).end().end();
         rule.nest(1).attr_str(1, "cmp").nest(2).attr_be32(1, 1).attr_be32(2, 0).nest(3).attr(1, &2u32.to_ne_bytes()).end().end().end();
-        // payload daddr => reg 1; reg 1 &= 255.0.0.0; cmp neq 127.0.0.0. Without
-        // it a packet for 127.0.0.1 is rewritten before routing: one arriving
-        // from the LAN would reach the container instead of being dropped.
+        // payload daddr => reg 1; optional cmp neq exclude_ip (WSL host-gateway
+        // 192.168.65.254 on `lo`); then reg 1 &= 255.0.0.0; cmp neq 127.0.0.0.
+        // Without the loopback guard a packet for 127.0.0.1 is rewritten before
+        // routing: one arriving from the LAN would reach the container instead of being dropped.
         rule.nest(1).attr_str(1, "payload").nest(2).attr_be32(1, 1).attr_be32(2, 1).attr_be32(3, 16).attr_be32(4, 4).end().end();
+        if let Some(skip) = exclude_ip {
+            rule.nest(1).attr_str(1, "cmp").nest(2).attr_be32(1, 1).attr_be32(2, 1).nest(3).attr(1, &skip).end().end().end();
+        }
         rule.nest(1).attr_str(1, "bitwise").nest(2).attr_be32(1, 1).attr_be32(2, 1).attr_be32(3, 4);
         rule.nest(4).attr(1, &[255, 0, 0, 0]).end().nest(5).attr(1, &[0; 4]).end().end().end();
         rule.nest(1).attr_str(1, "cmp").nest(2).attr_be32(1, 1).attr_be32(2, 1).nest(3).attr(1, &[127, 0, 0, 0]).end().end().end();
@@ -938,10 +942,10 @@ fn host_relay_guard_in(family: u8, port: u16) -> Msg {
 /// A published port's DNAT rules: one, or with `local` (a kernel without
 /// nft_fib_ipv4, so no `fib daddr type local`) one per address of this
 /// machine for a port published on every address.
-fn dnat_rules(chain: &str, d: &Dnat, local: Option<&[[u8; 4]]>) -> Vec<Msg> {
+fn dnat_rules(chain: &str, d: &Dnat, local: Option<&[[u8; 4]]>, exclude_ip: Option<[u8; 4]>) -> Vec<Msg> {
     match local {
-        Some(addrs) if d.host_ip == [0; 4] => addrs.iter().map(|a| dnat_rule(chain, &Dnat { host_ip: *a, ..*d })).collect(),
-        _ => vec![dnat_rule(chain, d)],
+        Some(addrs) if d.host_ip == [0; 4] => addrs.iter().map(|a| dnat_rule(chain, &Dnat { host_ip: *a, ..*d }, None)).collect(),
+        _ => vec![dnat_rule(chain, d, exclude_ip)],
     }
 }
 
@@ -1072,7 +1076,7 @@ fn embedded_dns_batch(addr: [u8; 4], port: u16) -> Vec<Msg> {
     // that took 15-30 ms of every container start.
     let mut flush = nft(NFT_MSG_DELRULE, NLM_F_ACK);
     flush.attr_str(1, EMBEDDED_DNS_TABLE).attr_str(2, "output");
-    let rule = dnat_rule_in(EMBEDDED_DNS_TABLE, "output", &Dnat { udp: true, host_ip: addr, host_port: 53, to_ip: addr, to_port: port }, None);
+    let rule = dnat_rule_in(EMBEDDED_DNS_TABLE, "output", &Dnat { udp: true, host_ip: addr, host_port: 53, to_ip: addr, to_port: port }, None, None);
     let mut end = Msg::new(NFNL_MSG_BATCH_END, 0);
     end.raw(&nfgen(libc::AF_UNSPEC as u8, NFNL_SUBSYS_NFTABLES));
     vec![begin, table, chain, flush, rule, end]
@@ -1218,6 +1222,7 @@ pub fn remove_nat() -> io::Result<()> {
 /// Mac reaches over the NAT network, so they match only connections from
 /// the uplink's gateway `gateway` (the Mac itself): other VMs on the NAT
 /// network, or the LAN routed through the Mac, never reach a container.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub fn install_nat_with_egress(
     uplink_index: i32,
@@ -1231,6 +1236,24 @@ pub fn install_nat_with_egress(
     egress_port: u16,
     egress_routes: &[([u8; 4], u8)],
     egress_skip: &[([u8; 4], u8)],
+) -> io::Result<()> {
+    install_nat_full(uplink_index, host_addr, host_port, redirect, dnat, gateway, bridges, local, egress_port, egress_routes, egress_skip, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn install_nat_full(
+    uplink_index: i32,
+    host_addr: [u8; 4],
+    host_port: u16,
+    redirect: bool,
+    dnat: &[Dnat],
+    gateway: [u8; 4],
+    bridges: &[String],
+    local: Option<&[[u8; 4]]>,
+    egress_port: u16,
+    egress_routes: &[([u8; 4], u8)],
+    egress_skip: &[([u8; 4], u8)],
+    wsl_host: Option<[u8; 4]>,
 ) -> io::Result<()> {
     let mut nl = Netlink::open(libc::NETLINK_NETFILTER)?;
     // The table is replaced, not appended to (on a Linux host it outlives
@@ -1275,9 +1298,14 @@ pub fn install_nat_with_egress(
         }
         msgs.push(nat_chain("prerouting", 0, -100));
         msgs.push(nat_chain("output", 3, -100));
+        if let Some(wsl_addr) = wsl_host {
+            // UDP 53 sent to 192.168.65.254 from container bridges goes to
+            // the embedded DNS on the receiving bridge's gateway.
+            msgs.push(dns_redirect_rule(wsl_addr));
+        }
         for d in dnat {
-            msgs.extend(dnat_rules("prerouting", d, local));
-            msgs.extend(dnat_rules("output", d, local));
+            msgs.extend(dnat_rules("prerouting", d, local, wsl_host));
+            msgs.extend(dnat_rules("output", d, local, wsl_host));
         }
         if have_egress {
             for &(subnet, prefix) in egress_skip {
@@ -1314,7 +1342,7 @@ pub fn install_nat_with_egress(
                 msgs.push(loopback_published_rule(d.host_port, host_port));
             }
         } else {
-            msgs.push(dnat_rule_from("prerouting", d, Some((uplink_index, gateway))));
+            msgs.push(dnat_rule_from("prerouting", d, Some((uplink_index, gateway)), None));
         }
     }
     if have_egress {
@@ -1642,5 +1670,17 @@ mod tests {
             assert_eq!(be32(get(&e[6].1, 2)), 0, "== 0");
             assert_eq!(verdict(&r), libc::NF_DROP as u32);
         }
+    }
+
+    #[test]
+    fn published_dnat_excludes_wsl_host_gateway_when_set() {
+        let d = Dnat { udp: false, host_ip: [0; 4], host_port: 8080, to_ip: [172, 17, 0, 2], to_port: 80 };
+        let plain = dnat_rule("prerouting", &d, None);
+        let wsl = dnat_rule("prerouting", &d, Some([192, 168, 65, 254]));
+        assert_eq!(names(&plain), ["fib", "cmp", "payload", "bitwise", "cmp", "meta", "cmp", "payload", "cmp", "immediate", "immediate", "nat"]);
+        assert_eq!(names(&wsl), ["fib", "cmp", "payload", "cmp", "bitwise", "cmp", "meta", "cmp", "payload", "cmp", "immediate", "immediate", "nat"]);
+        let e = exprs(&wsl);
+        assert_eq!(be32(get(&e[3].1, 2)), 1, "cmp neq");
+        assert_eq!(get(&attrs(get(&e[3].1, 3)), 1), &[192, 168, 65, 254]);
     }
 }

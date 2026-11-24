@@ -343,6 +343,7 @@ pub(crate) fn ensure_daemon() -> io::Result<()> {
     if !client::alive() {
         start_daemon()?;
     }
+    crate::relay::ensure_started();
     std::thread::spawn(crate::update::catch_up_engine);
     crate::wslconfig::sync_wsl_integration_soon();
     Ok(())

@@ -299,3 +299,4 @@ import-upper-runs-with-files	#410	an imported container started without the file
 leave-first-running-disconnect	#789	disconnecting a running container from its only network was refused (or left its veth, routes, and published ports active instead of isolating it)
 leave-first-running-reconnect	#789	reconnecting a running container after leaving its first network failed to restore veth connectivity, DNS aliases, or published ports
 leave-first-running-promote	#789	disconnecting a running container's first network when attached to a second network failed to isolate the left network, promote the default route, or rebind published ports
+crates/kiri/src/hostrelay.rs	#550	on Windows (WSL 2), host.docker.internal resolved to the WSL bridge gateway (172.17.0.1) instead of 192.168.65.254 relayed to Windows 127.0.0.1 and [::1]

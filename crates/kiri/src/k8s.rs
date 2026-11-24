@@ -355,7 +355,11 @@ const HOST_MANIFEST: &str = "kiri-host-names.yaml";
 /// everything else resolves as before. A `hosts` block in a `.override`
 /// would clash with the NodeHosts one k3s' Corefile already has.
 fn host_manifest() -> String {
-    let addr = crate::daemon::ports::HOST_ADDR;
+    let addr = if crate::hostrelay::wsl_host_active() {
+        crate::hostrelay::WSL_HOST_ADDR_STR
+    } else {
+        crate::daemon::ports::HOST_ADDR
+    };
     let zones: Vec<String> = HOST_NAMES.iter().map(|n| format!("{n}:53")).collect();
     format!(
         "# Written by Kiri at each `kiri k8s start`: pods resolve the host's names, as containers do.\n\

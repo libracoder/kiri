@@ -161,6 +161,18 @@ pub fn docker_engine_endpoint() -> crate::dockerctx::Endpoint {
     other_engine().map(|o| crate::dockerctx::Endpoint::Taken(o.to_owned())).unwrap_or(crate::dockerctx::Endpoint::Free)
 }
 
+/// The WSL distro the pipe bridge targets, once `serve::start` has run.
+pub fn distro() -> Option<String> {
+    HUB.get().and_then(|hub| hub.cfg.lock().unwrap_or_else(PoisonError::into_inner).distro.clone())
+}
+
+/// The `kiri` binary path inside WSL configured for the pipe bridge.
+pub fn kiri() -> String {
+    HUB.get()
+        .map(|hub| hub.cfg.lock().unwrap_or_else(PoisonError::into_inner).kiri.clone())
+        .unwrap_or_else(|| "/usr/local/bin/kiri".to_owned())
+}
+
 /// Carries connections to `distro` from now on (setup has just made it);
 /// the bridge to the old one is left to end.
 pub fn set_distro(distro: &str) {
@@ -168,6 +180,7 @@ pub fn set_distro(distro: &str) {
         hub.cfg.lock().unwrap_or_else(PoisonError::into_inner).distro = Some(distro.to_owned());
         hub.retire();
     }
+    crate::relay::renew();
 }
 
 /// The engine in WSL was replaced by this version's: connections from now
@@ -180,6 +193,7 @@ pub fn renew_bridge() {
     {
         log("bridge: the engine in WSL was replaced; new connections get a bridge from the new one");
     }
+    crate::relay::renew();
 }
 
 /// Serves the pipe on threads of its own. Fails if another kiri-win
@@ -192,7 +206,9 @@ pub fn start(cfg: Config) -> io::Result<()> {
     let _ = HUB.set(hub.clone());
     let h = hub.clone();
     thread::Builder::new().name("kiri-docker-engine".into()).spawn(move || docker_engine(&h))?;
-    // Start WSL now, so the first docker command does not wait for it.
+    // Start WSL and the Windows host relay now, so the first docker command
+    // gets both the daemon and host.docker.internal without waiting for the UI.
+    crate::relay::ensure_started();
     let h = hub.clone();
     thread::spawn(move || {
         if let Err(e) = h.bridge() {
@@ -258,6 +274,7 @@ fn docker_engine(hub: &Arc<Hub>) {
         };
         set_docker_engine_owner(crate::dockerctx::Endpoint::Kiri);
         say(format!("serving {DOCKER_ENGINE} as well (no other engine has it)"));
+        crate::relay::ensure_started();
         let (h, mut new) = (hub.clone(), NewEngines::default());
         serve_while_free(
             DOCKER_ENGINE,
@@ -1491,6 +1508,7 @@ impl Bridge {
             .spawn()?;
         let (Some(input), Some(output)) = (child.stdin.take(), child.stdout.take()) else { return Err(io::Error::other("wsl.exe has no stdio")) };
         log("bridge started");
+        crate::relay::ensure_started();
         Ok(Bridge::over(Box::new(input), output, Box::new(Wsl(child))))
     }
 
@@ -1717,6 +1735,9 @@ fn serve_shared(hub: &Hub, pipe: Arc<Pipe>) {
             linger(pipe);
         }
         return;
+    }
+    if HUB.get().is_some() {
+        crate::relay::ensure_started();
     }
     // A bridge can die between hub.bridge() and the insert below: while WSL
     // is still booting, wsl.exe exits at once. `replies` ends every

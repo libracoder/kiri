@@ -1669,12 +1669,39 @@ fn fresh_bind_sources_with(guest: &[String], info: &[Value], engine_socket: impl
         .collect()
 }
 
+/// Parses `--add-host name:ip` entries into `/etc/hosts` lines (`ip\tname`).
+/// `host-gateway` is always stored as `HOST_ADDR` (never baking `192.168.65.254`
+/// into the saved container spec) so `kiri-init`'s `host_etc_target` maps it
+/// dynamically at container start time based on whether the WSL host relay is
+/// live, falling back to the bridge gateway if the relay isn't running later.
+fn extra_hosts_from(raw: &[String]) -> Result<Vec<String>, Error> {
+    let mut extra_hosts = Vec::with_capacity(raw.len());
+    for h in raw {
+        let Some((name, ip)) = h.split_once(':') else { continue };
+        let ip = if ip == "host-gateway" { super::ports::HOST_ADDR } else { ip };
+        if ip.parse::<std::net::IpAddr>().is_err() {
+            return Err(Error::BadRequest(format!("invalid IP address: {ip}")));
+        }
+        if !valid_hosts_name(name) {
+            return Err(Error::BadRequest(format!("invalid host name ({name})")));
+        }
+        extra_hosts.push(format!("{ip}\t{name}"));
+    }
+    Ok(extra_hosts)
+}
+
 /// An NFS or CIFS server name as an address the guest kernel can use.
-/// `host.docker.internal` is the Mac, as it is for containers.
+/// `host.docker.internal` is the Mac (or the Windows host under WSL 2),
+/// as it is for containers.
 fn resolve_server(host: &str) -> Option<String> {
     use std::net::ToSocketAddrs;
-    if cfg!(target_os = "macos") && matches!(host, "host.docker.internal" | "host.kiri.internal") {
-        return Some(super::ports::HOST_ADDR.to_owned());
+    if matches!(host, "host.docker.internal" | "host.kiri.internal") {
+        if cfg!(target_os = "macos") {
+            return Some(super::ports::HOST_ADDR.to_owned());
+        }
+        if crate::hostrelay::wsl_host_active() {
+            return Some(crate::hostrelay::WSL_HOST_ADDR_STR.to_owned());
+        }
     }
     let addrs: Vec<std::net::SocketAddr> = (host, 0).to_socket_addrs().ok()?.collect();
     addrs.iter().find(|a| a.is_ipv4()).or(addrs.first()).map(|a| a.ip().to_string())
@@ -2558,18 +2585,7 @@ pub(super) fn create_for(req: &Request, engine: &Engine, wsl_distro: Option<&str
     // `--add-host name:ip` arrives as "name:ip"; /etc/hosts wants "ip name".
     // Both are written into the container's /etc/hosts by the guest, so a
     // newline in either would add lines of its own.
-    let mut extra_hosts = Vec::new();
-    for h in strings(&host["ExtraHosts"]).unwrap_or_default() {
-        let Some((name, ip)) = h.split_once(':') else { continue };
-        let ip = if ip == "host-gateway" { super::ports::HOST_ADDR } else { ip };
-        if ip.parse::<std::net::IpAddr>().is_err() {
-            return Err(Error::BadRequest(format!("invalid IP address: {ip}")));
-        }
-        if !valid_hosts_name(name) {
-            return Err(Error::BadRequest(format!("invalid host name ({name})")));
-        }
-        extra_hosts.push(format!("{ip}\t{name}"));
-    }
+    let extra_hosts = extra_hosts_from(&strings(&host["ExtraHosts"]).unwrap_or_default())?;
     let mut warnings: Vec<&str> = Vec::new();
     if seccomp_unconfined {
         warnings.push(SECCOMP_UNCONFINED_WARNING);
@@ -6536,5 +6552,15 @@ mod resources_disk_tests {
         assert!(linux.get("min_disk_gb").is_none());
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn host_gateway_extra_host_stores_placeholder_not_wsl_addr() {
+        let raw = vec!["myhost:host-gateway".to_owned(), "db:10.0.0.2".to_owned()];
+        assert_eq!(
+            extra_hosts_from(&raw).unwrap(),
+            vec![format!("{}\tmyhost", super::super::ports::HOST_ADDR), "10.0.0.2\tdb".to_owned()]
+        );
+        assert!(extra_hosts_from(&["bad:not-an-ip".to_owned()]).is_err());
     }
 }

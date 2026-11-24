@@ -3620,13 +3620,19 @@ impl Engine {
             flags |= run_flags::INIT;
         }
         flags |= spec.security_flags();
-        // Every container can reach the Mac, as with Docker Desktop and OrbStack.
-        // --add-host and links come first: /etc/hosts takes the first match,
-        // so `--add-host host.docker.internal:IP` overrides Kiri's, as on Docker.
+        // Every container can reach the Mac (or Windows host on WSL 2), as with
+        // Docker Desktop and OrbStack. --add-host and links come first:
+        // /etc/hosts takes the first match, so `--add-host host.docker.internal:IP`
+        // overrides Kiri's, as on Docker.
         let mut hosts = spec.extra_hosts.clone();
         hosts.extend(links);
-        hosts.push(format!("{}\thost.docker.internal host.kiri.internal", super::ports::HOST_ADDR));
-        hosts.push(format!("{}\tgateway.docker.internal", super::ports::HOST_ADDR));
+        let host_ip = if crate::hostrelay::wsl_host_active() {
+            crate::hostrelay::WSL_HOST_ADDR_STR
+        } else {
+            super::ports::HOST_ADDR
+        };
+        hosts.push(format!("{host_ip}\thost.docker.internal host.kiri.internal"));
+        hosts.push(format!("{host_ip}\tgateway.docker.internal"));
         let mut opts = net_opts(&spec, joined.as_deref(), &domainname);
         opts.extend(net6_opts);
         opts.extend(pid_joined.map(|t| format!("{}={t}", kiri_proto::net_opts::PIDNS)));

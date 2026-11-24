@@ -484,8 +484,16 @@ impl Dns {
 
     /// Answers a query for a name on this network, or None to forward it.
     fn answer(&self, server: usize, q: &[u8]) -> Option<Vec<u8>> {
+        self.answer_with_host_fn(server, q, super::net::effective_host_addr)
+    }
+
+    #[cfg(test)]
+    fn answer_with_host(&self, server: usize, q: &[u8], host_ip: [u8; 4]) -> Option<Vec<u8>> {
+        self.answer_with_host_fn(server, q, || host_ip)
+    }
+
+    fn answer_with_host_fn(&self, server: usize, q: &[u8], host_ip: impl FnOnce() -> [u8; 4]) -> Option<Vec<u8>> {
         let (name, qtype, end) = parse_question(q)?;
-        let host = vec![super::net::HOST_ADDR];
         // Of the server's networks that have the name, the first by Docker
         // network name answers, as with Docker: not the first joined. A
         // name Compose gives a service on every network it joins then
@@ -514,20 +522,25 @@ impl Dns {
         let addrs = bridge.and_then(|b| self.names.get(b)).and_then(|t| t.get(lookup));
         let addrs6 = bridge.and_then(|b| self.names6.get(b)).and_then(|t| t.get(lookup));
         // The host's names answer A with the host's address, and AAAA with
-        // no records: the host relay is IPv4 only.
-        let addrs = match addrs {
-            None if is_host => Some(&host),
-            a => a,
+        // no records: the host relay is IPv4 only. Resolve the host IP lazily
+        // so non-host DNS queries never touch the filesystem or procfs.
+        let host: [u8; 4];
+        let a_addrs: Option<&[[u8; 4]]> = match addrs {
+            None if is_host => {
+                host = host_ip();
+                Some(std::slice::from_ref(&host))
+            }
+            a => a.map(Vec::as_slice),
         };
         // A container name with no address of the asked type is NODATA, not
         // forwarded: the name is this network's.
-        if addrs.is_none() && addrs6.is_none() {
+        if a_addrs.is_none() && addrs6.is_none() {
             return None;
         }
         // A service name has no records of its own: the container it
         // belongs to has the addresses, and the caller looks those up by
         // the container's name.
-        let a: &[[u8; 4]] = if service.is_none() && (qtype == 1 || qtype == 255) { addrs.map_or(&[], Vec::as_slice) } else { &[] };
+        let a: &[[u8; 4]] = if service.is_none() && (qtype == 1 || qtype == 255) { a_addrs.unwrap_or(&[]) } else { &[] };
         let aaaa: &[([u8; 4], [u8; 16])] = if service.is_none() && (qtype == 28 || qtype == 255) { addrs6.map_or(&[], Vec::as_slice) } else { &[] };
         let mut r = Vec::with_capacity(end + 16 * a.len() + 28 * aaaa.len());
         r.extend_from_slice(&q[0..2]); // id
@@ -1051,6 +1064,17 @@ mod tests {
         assert_eq!((r[3] & 0x0f, answers(&r, q6.len()).len()), (0, 0));
         let q = query("gateway.docker.internal", 255);
         assert_eq!(answers(&dns.answer(0, &q).unwrap(), q.len()), [(1, super::super::net::HOST_ADDR.to_vec())]);
+        // Non-host queries must not invoke the host IP lookup callback at all.
+        assert!(dns.answer_with_host_fn(0, other, || panic!("host IP lookup called for non-host query")).is_none());
+        // On WSL 2 with Windows host relay active, all host names answer 192.168.65.254 (A) and NODATA (AAAA).
+        let wsl = super::super::net::WSL_HOST_ADDR;
+        for name in ["host.docker.internal", "host.kiri.internal", "gateway.docker.internal"] {
+            let qa = query(name, 1);
+            assert_eq!(answers(&dns.answer_with_host(0, &qa, wsl).unwrap(), qa.len()), [(1, wsl.to_vec())], "{name} A");
+            let qaaaa = query(name, 28);
+            let r = dns.answer_with_host(0, &qaaaa, wsl).unwrap();
+            assert_eq!((r[3] & 0x0f, answers(&r, qaaaa.len()).len()), (0, 0), "{name} AAAA NODATA");
+        }
     }
 
     #[test]

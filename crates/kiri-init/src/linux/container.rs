@@ -1381,18 +1381,18 @@ fn write_etc_files(spec: &RunSpec<'_>, base: &std::path::Path, upstream: &[[u8; 
             }
         }
     }
-    // On a Linux host there is no loopback redirect; host.docker.internal
-    // points at the bridge gateway, like Docker's host-gateway, so it reaches
-    // host services on 0.0.0.0 but not ones bound only to 127.0.0.1.
-    // A host-network container is on the host already, loopback included,
-    // so there the name is the loopback address.
+    // On a plain Linux host there is no loopback redirect; host.docker.internal
+    // points at the bridge gateway (or 127.0.0.1 for `--network host`).
+    // On Windows (WSL 2) when `kiri hostrelay` is active (`192.168.65.254` on
+    // `lo`), host.docker.internal / host.kiri.internal / host-gateway point at
+    // `192.168.65.254` for all networks (default bridge, user networks, and
+    // `--network host`), matching Docker Desktop.
     let host_addr = net::ip_str(net::HOST_ADDR);
     let host_net = spec.flags & run_flags::NET_HOST != 0;
-    let gateway = if host_net { "127.0.0.1".to_owned() } else { net::ip_str(spec.net.gateway) };
-    let map_host = super::transport::is_host_process() && (host_net || spec.net.gateway != [0; 4]);
+    let mapped = host_etc_target(super::transport::is_host_process(), net::wsl_host_relay_active(), host_net, spec.net.gateway);
     for line in spec.net.extra_hosts.iter() {
-        if map_host {
-            hosts.push_str(&line.replace(&host_addr, &gateway));
+        if let Some(target) = mapped.as_deref() {
+            hosts.push_str(&line.replace(&host_addr, target));
         } else {
             hosts.push_str(line);
         }
@@ -1407,6 +1407,25 @@ fn write_etc_files(spec: &RunSpec<'_>, base: &std::path::Path, upstream: &[[u8; 
         out.push((sys::cstr(&src)?, CString::new(format!("etc/{name}")).expect("no NUL")));
     }
     Ok(out)
+}
+
+/// Target IP replacing `net::HOST_ADDR` in container `/etc/hosts` lines.
+/// Returns `None` in the macOS VM (keep `198.19.248.254`) and for `--network none`
+/// on a plain Linux host.
+fn host_etc_target(host_process: bool, wsl_relay_active: bool, host_net: bool, gateway: [u8; 4]) -> Option<String> {
+    if !host_process {
+        return None;
+    }
+    if wsl_relay_active {
+        return Some(net::ip_str(net::WSL_HOST_ADDR));
+    }
+    if host_net {
+        Some("127.0.0.1".to_owned())
+    } else if gateway != [0; 4] {
+        Some(net::ip_str(gateway))
+    } else {
+        None
+    }
 }
 
 /// The container's resolv.conf. On a user-defined network the embedded DNS
@@ -4082,5 +4101,20 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn host_etc_target_maps_wsl_host_relay_across_all_network_modes() {
+        // macOS VM keeps 198.19.248.254 unchanged.
+        assert_eq!(super::host_etc_target(false, false, false, [172, 17, 0, 1]), None);
+        assert_eq!(super::host_etc_target(false, true, true, [0; 4]), None);
+        // Plain Linux host uses bridge gateway or 127.0.0.1 for --network host.
+        assert_eq!(super::host_etc_target(true, false, false, [172, 17, 0, 1]).as_deref(), Some("172.17.0.1"));
+        assert_eq!(super::host_etc_target(true, false, true, [0; 4]).as_deref(), Some("127.0.0.1"));
+        assert_eq!(super::host_etc_target(true, false, false, [0; 4]), None);
+        // WSL 2 with active Windows host relay resolves to 192.168.65.254 everywhere.
+        assert_eq!(super::host_etc_target(true, true, false, [172, 17, 0, 1]).as_deref(), Some("192.168.65.254"));
+        assert_eq!(super::host_etc_target(true, true, false, [172, 18, 0, 1]).as_deref(), Some("192.168.65.254"));
+        assert_eq!(super::host_etc_target(true, true, true, [0; 4]).as_deref(), Some("192.168.65.254"));
     }
 }

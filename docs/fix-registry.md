@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #550 Windows: resolve host.docker.internal and host.kiri.internal to 192.168.65.254 and relay to Windows loopback (unreleased)
+- Fixes: #550 Windows: host.docker.internal resolves to the WSL VM's bridge gateway (172.17.0.1) instead of the Windows host, unlike Docker Desktop
+- Caused: none known
+- Caused by: -
+- Check: `crates/kiri/src/hostrelay.rs`
+
 ### #810 Networks: disconnect and reconnect a running container's first network cleanly at Layer 2/3, DNS, and port forwarding (unreleased)
 - Fixes: #789 A running container can't leave its first network, so its network aliases can't be changed (follow-up to #418)
 - Caused: none known

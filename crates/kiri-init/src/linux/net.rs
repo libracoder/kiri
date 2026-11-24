@@ -11,11 +11,79 @@ use super::netlink::{self, Netlink};
 use super::sys;
 
 pub const UPLINK: &str = "eth0";
-/// What `host.docker.internal` resolves to inside containers. Connections to
-/// it are redirected to the agent and relayed to the Mac's localhost.
+/// What `host.docker.internal` resolves to inside containers in the VM.
+/// Connections to it are redirected to the agent and relayed to the Mac's localhost.
 pub const HOST_ADDR: [u8; 4] = [198, 19, 248, 254];
+/// What `host.docker.internal`, `host.kiri.internal`, and `host-gateway`
+/// resolve to on Windows (WSL 2) when `kiri hostrelay` is active, matching
+/// Docker Desktop.
+pub const WSL_HOST_ADDR: [u8; 4] = [192, 168, 65, 254];
 /// Where the redirect lands: the agent's listener for host-bound connections.
 pub const HOST_RELAY_PORT: u16 = 1026;
+
+/// True when running under Microsoft's WSL 2 kernel.
+pub fn is_wsl() -> bool {
+    static WSL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *WSL.get_or_init(|| {
+        std::fs::read_to_string("/proc/sys/kernel/osrelease")
+            .is_ok_and(|r| r.to_ascii_lowercase().contains("microsoft"))
+    })
+}
+
+const HOST_RELAY_PID_FILE: &str = "/run/kiri-hostrelay.pid";
+
+/// Checks whether a Linux `/proc/<pid>/cmdline` (NUL-separated argv) belongs
+/// to `kiri hostrelay` (empty cmdline also excludes unreaped zombies).
+fn is_hostrelay_cmdline(cmdline: &[u8]) -> bool {
+    let mut args = cmdline.split(|&b| b == 0);
+    let Some(argv0) = args.next() else { return false };
+    let Some(argv1) = args.next() else { return false };
+    !argv0.is_empty() && argv1 == b"hostrelay"
+}
+
+fn read_pid_file(path: &std::path::Path) -> Option<u32> {
+    std::fs::read_to_string(path).ok()?.trim().parse::<u32>().ok().filter(|&p| p > 0)
+}
+
+fn pid_is_alive(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
+        return false;
+    }
+    // SAFETY: signal 0 checks process existence without sending a signal.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+fn pid_file_alive(path: &std::path::Path, verify: impl FnOnce(u32) -> bool) -> bool {
+    read_pid_file(path).is_some_and(|pid| pid_is_alive(pid) && verify(pid))
+}
+
+fn hostrelay_pid_matches(pid: u32) -> bool {
+    std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|c| is_hostrelay_cmdline(&c))
+}
+
+/// True when running on WSL 2 with a live `kiri hostrelay` process owning
+/// `192.168.65.254` (verified via `/run/kiri-hostrelay.pid`, `kill(pid, 0)`,
+/// and `/proc/<pid>/cmdline`, catching unclean exits without `getifaddrs()`).
+pub fn wsl_host_relay_active() -> bool {
+    is_wsl() && pid_file_alive(std::path::Path::new(HOST_RELAY_PID_FILE), hostrelay_pid_matches)
+}
+
+/// Address answered for `host.docker.internal` / `host.kiri.internal` /
+/// `gateway.docker.internal` in the embedded DNS: `192.168.65.254` on WSL 2
+/// when the Windows host relay is active, else `HOST_ADDR`.
+pub fn effective_host_addr() -> [u8; 4] {
+    effective_host_addr_for(super::transport::is_host_process(), wsl_host_relay_active())
+}
+
+pub fn effective_host_addr_for(host_process: bool, wsl_relay_active: bool) -> [u8; 4] {
+    if host_process && wsl_relay_active { WSL_HOST_ADDR } else { HOST_ADDR }
+}
 /// Where outbound container TCP connections to VPN tunnel prefixes or under
 /// host egress land, to be relayed over vsock to the host dialer.
 pub const EGRESS_RELAY_PORT: u16 = 1038;
@@ -340,8 +408,9 @@ fn install_nat(nat: Nat) -> io::Result<()> {
     let egress = EGRESS_ROUTES.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let skip = if egress.is_empty() { Vec::new() } else { egress_skip_subnets() };
     let any_addr = nat.dnat.iter().any(|d| d.host_ip == [0; 4]);
+    let wsl_host = (!nat.redirect && is_wsl()).then_some(WSL_HOST_ADDR);
     let install = |local: Option<&[[u8; 4]]>| {
-        netlink::install_nat_with_egress(
+        netlink::install_nat_full(
             nat.uplink,
             HOST_ADDR,
             HOST_RELAY_PORT,
@@ -353,6 +422,7 @@ fn install_nat(nat: Nat) -> io::Result<()> {
             EGRESS_RELAY_PORT,
             &egress,
             &skip,
+            wsl_host,
         )
     };
     let r = if any_addr && NO_FIB4.load(Ordering::Relaxed) {
@@ -453,7 +523,9 @@ fn local_addrs() -> Vec<[u8; 4]> {
         if !ifa.ifa_addr.is_null() && i32::from(unsafe { (*ifa.ifa_addr).sa_family }) == libc::AF_INET {
             // SAFETY: an AF_INET address is a sockaddr_in.
             let a = unsafe { (*(ifa.ifa_addr as *const libc::sockaddr_in)).sin_addr.s_addr }.to_ne_bytes();
-            if a[0] != 127 && !out.contains(&a) {
+            // Exclude loopback and (on WSL 2) the Windows host-gateway address so
+            // published-port DNAT fallback rules never hijack host.docker.internal.
+            if a[0] != 127 && (!is_wsl() || a != WSL_HOST_ADDR) && !out.contains(&a) {
                 out.push(a);
             }
         }
@@ -1237,5 +1309,23 @@ fd00000000000000000000000000000000 40 00000000000000000000000000000000 00 000000
         // No-op when a lease (from DHCP or SetUplink) is already active.
         assert!(!dhcp.apply_static_with([192, 168, 64, 9], 24, [192, 168, 64, 1], [0; 4], |_| panic!("must not reconfigure")).unwrap());
         assert_eq!(dhcp.lease.as_ref().unwrap().ip, [192, 168, 64, 2]);
+    }
+
+    #[test]
+    fn effective_host_addr_uses_wsl_host_addr_only_when_wsl_relay_active() {
+        assert_eq!(effective_host_addr_for(false, false), HOST_ADDR);
+        assert_eq!(effective_host_addr_for(false, true), HOST_ADDR);
+        assert_eq!(effective_host_addr_for(true, false), HOST_ADDR);
+        assert_eq!(effective_host_addr_for(true, true), WSL_HOST_ADDR);
+        assert!(is_hostrelay_cmdline(b"/usr/local/bin/kiri\0hostrelay\0"));
+        assert!(!is_hostrelay_cmdline(b"/usr/local/bin/kiri\0daemon\0"));
+        assert!(!is_hostrelay_cmdline(b""));
+        let pid_path = std::env::temp_dir().join(format!("kiri-net-hostrelay-{}.pid", std::process::id()));
+        let _ = std::fs::remove_file(&pid_path);
+        assert!(!pid_file_alive(&pid_path, |_| true));
+        std::fs::write(&pid_path, format!("{}\n", std::process::id())).unwrap();
+        assert!(pid_file_alive(&pid_path, |_| true));
+        assert!(!pid_file_alive(&pid_path, |_| false));
+        let _ = std::fs::remove_file(&pid_path);
     }
 }
