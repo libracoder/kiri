@@ -120,6 +120,33 @@ pub fn mountinfo_readonly(mountinfo: &str, target: &Path) -> Option<ReadOnlyKind
     best.and_then(|(_, kind)| kind)
 }
 
+/// OpenZFS's `ZFS_SUPER_MAGIC` (`zpl_super.c`).
+pub const ZFS_SUPER_MAGIC: i64 = 0x2fc1_2fc1;
+
+/// Inspects `/proc/self/mountinfo` text for the filesystem type of the active
+/// mount covering `target` (longest ancestor mountpoint, with later lines
+/// winning ties for overmounts).
+pub fn mountinfo_fstype<'a>(mountinfo: &'a str, target: &Path) -> Option<&'a str> {
+    let target_str = target.to_string_lossy();
+    let mut best: Option<(usize, &'a str)> = None;
+    for line in mountinfo.lines() {
+        let Some((before, after)) = line.split_once(" - ") else { continue };
+        let Some(mp_raw) = before.split_whitespace().nth(4) else { continue };
+        let Some(fstype) = after.split_whitespace().next() else { continue };
+        let mp = unescape_mount_path(mp_raw);
+        let mp_norm = norm_mount_path(&mp);
+        if mount_covers(mp_norm, &target_str) && best.is_none_or(|(len, _)| mp_norm.len() >= len) {
+            best = Some((mp_norm.len(), fstype));
+        }
+    }
+    best.map(|(_, fstype)| fstype)
+}
+
+/// Whether `/proc/self/mountinfo` reports fstype `"zfs"` for the active mount covering `target`.
+pub fn is_zfs_mountinfo(mountinfo: &str, target: &Path) -> bool {
+    mountinfo_fstype(mountinfo, target) == Some("zfs")
+}
+
 /// Pure helper testing whether `osrelease` or WSL interop markers indicate WSL.
 pub fn is_wsl_env(osrelease: &str, interop_exists: bool) -> bool {
     if interop_exists {
@@ -202,7 +229,32 @@ pub fn detect_path_readonly(path: &Path) -> Option<ReadOnlyKind> {
 }
 
 #[cfg(target_os = "linux")]
-pub fn check_daemon_storage(store_root: Option<&Path>) -> Option<String> {
+fn is_statfs_zfs(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) else { return false };
+    // SAFETY: `st` is plain zero-initialized data; `c` is a valid C string.
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: statfs writes into `st`.
+    unsafe { libc::statfs(c.as_ptr(), &mut st) == 0 && st.f_type as i64 == ZFS_SUPER_MAGIC }
+}
+
+#[cfg(target_os = "linux")]
+pub fn detect_path_zfs(path: &Path) -> bool {
+    let Some(existing) = path.ancestors().find(|p| !p.as_os_str().is_empty() && p.exists()) else {
+        return false;
+    };
+    if is_statfs_zfs(existing) {
+        return true;
+    }
+    let Ok(mi) = std::fs::read_to_string("/proc/self/mountinfo") else {
+        return false;
+    };
+    let canon = existing.canonicalize().ok();
+    is_zfs_mountinfo(&mi, canon.as_deref().unwrap_or(existing))
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_agent_path(store_root: Option<&Path>) -> std::path::PathBuf {
     let default_root = kiri_image::Store::os_default_root().ok();
     let owned_root;
     let root = match store_root {
@@ -212,10 +264,34 @@ pub fn check_daemon_storage(store_root: Option<&Path>) -> Option<String> {
             owned_root.as_deref()
         }
     };
-    let agent_path = match (root, default_root.as_deref()) {
+    match (root, default_root.as_deref()) {
         (Some(r), Some(def)) => super::storage::agent_dir(r, def).unwrap_or_else(|| std::path::PathBuf::from("/var/lib/kiri")),
         _ => std::path::PathBuf::from("/var/lib/kiri"),
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn is_daemon_storage_zfs(store_root: Option<&Path>) -> bool {
+    let volumes = resolve_agent_path(store_root).join("volumes");
+    detect_path_zfs(&volumes)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn is_daemon_storage_zfs(_store_root: Option<&Path>) -> bool {
+    false
+}
+
+#[cfg(target_os = "linux")]
+pub fn check_daemon_storage(store_root: Option<&Path>) -> Option<String> {
+    let owned_root;
+    let root = match store_root {
+        Some(r) => Some(r),
+        None => {
+            owned_root = kiri_image::Store::default_root().ok();
+            owned_root.as_deref()
+        }
     };
+    let agent_path = resolve_agent_path(root);
     let state = super::state_dir().ok();
     let mut kind: Option<ReadOnlyKind> = None;
     for p in [Some(agent_path.as_path()), root, state.as_deref()].into_iter().flatten() {
@@ -293,5 +369,26 @@ tmpfs /run tmpfs rw,nosuid,nodev,mode=755 0 0
 
         let linux_msg = format_readonly_error(ReadOnlyKind::EmergencyRo, false);
         assert!(linux_msg.contains("/var/lib/kiri") && linux_msg.contains("emergency_ro") && linux_msg.contains("dmesg") && linux_msg.contains("fsck"), "{linux_msg}");
+    }
+
+    #[test]
+    fn parses_mountinfo_zfs_and_loopback_ext4_overmounts() {
+        let zfs_root = "\
+25 1 0:30 / / rw,relatime shared:1 - zfs rpool/ROOT/ubuntu_wuq1tk rw,xattr,posixacl,casesensitive
+26 25 0:31 / /var/lib rw,relatime shared:2 - zfs rpool/ROOT/ubuntu_wuq1tk/var/lib rw,xattr,posixacl,casesensitive
+91 26 7:3 / /var/lib/kiri/volumes/kiri-k8s/_data rw,relatime - ext4 /dev/loop3 rw,noinit_itable
+92 25 0:40 / /mnt/zfs\\040pool rw,relatime - zfs tank/pool rw,xattr,posixacl
+";
+        assert_eq!(mountinfo_fstype(zfs_root, Path::new("/var/lib/kiri/volumes")), Some("zfs"));
+        assert!(is_zfs_mountinfo(zfs_root, Path::new("/var/lib/kiri/volumes")));
+        assert!(is_zfs_mountinfo(zfs_root, Path::new("/var/lib/kiri/volumes/kiri-k8s")));
+        assert!(is_zfs_mountinfo(zfs_root, Path::new("/mnt/zfs pool/kiri/volumes")));
+        // Loopback ext4 overmounted onto kiri-k8s/_data wins over parent ZFS dataset.
+        assert_eq!(mountinfo_fstype(zfs_root, Path::new("/var/lib/kiri/volumes/kiri-k8s/_data")), Some("ext4"));
+        assert!(!is_zfs_mountinfo(zfs_root, Path::new("/var/lib/kiri/volumes/kiri-k8s/_data")));
+
+        let ext4_root = "25 1 8:1 / / rw,relatime - ext4 /dev/nvme0n1p2 rw\n";
+        assert_eq!(mountinfo_fstype(ext4_root, Path::new("/var/lib/kiri/volumes")), Some("ext4"));
+        assert!(!is_zfs_mountinfo(ext4_root, Path::new("/var/lib/kiri/volumes")));
     }
 }

@@ -560,6 +560,7 @@ fn info(engine: &Engine) -> Value {
         "KiriOomKills": engine.memory_trouble().1,
         "KiriCpuPercent": engine.cpu_percent(),
         "KiriStorageReadOnly": engine.storage_readonly(),
+        "KiriStorageZfs": engine.storage_zfs(),
         "Warnings": engine.records_damage().into_iter().chain(engine.image_damage()).chain(engine.host_warnings()).collect::<Vec<_>>(),
     })
 }

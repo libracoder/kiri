@@ -1692,6 +1692,11 @@ impl Engine {
         super::rofs::check_daemon_storage(Some(self.store.root()))
     }
 
+    /// Whether Kiri's Linux volumes directory sits on ZFS (#607).
+    pub fn storage_zfs(&self) -> bool {
+        super::rofs::is_daemon_storage_zfs(Some(self.store.root()))
+    }
+
     /// What the agent found wrong with a Linux host, for `docker info`
     /// (`VmLink::host_warnings`), a read-only storage filesystem, or a Mac VM
     /// uplink fallback failure.

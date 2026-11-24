@@ -285,6 +285,7 @@ struct Teardown {
     base: PathBuf,
     cgroup: PathBuf,
     remove: bool,
+    loop_mounts: Vec<String>,
 }
 
 /// Everything the child needs, prepared before clone so the child does as
@@ -501,7 +502,7 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
 
     let cgroup = paths.cgroup.join(spec.id);
     let remove = spec.flags & run_flags::REMOVE != 0;
-    let undo = Teardown { base: base.clone(), cgroup: cgroup.clone(), remove };
+    let undo = Teardown { base: base.clone(), cgroup: cgroup.clone(), remove, loop_mounts: Vec::new() };
     // A restart that fails must not take the stopped container's files with it.
     let cleanup = |e: io::Error| {
         undo_now(&undo, remove);
@@ -574,6 +575,12 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
     let nameserver = embedded_dns.then(|| embedded_address(spec)).or_else(|| host_network_resolver(spec, net.bridges, net.dns));
     prepared.etc_files = write_etc_files(spec, &etc_dir, net.upstream_dns, nameserver).map_err(cleanup)?;
     prepared.mounts = parse_mounts(spec.mounts).map_err(cleanup)?;
+    let loop_mounts: Vec<String> = prepared.mounts.iter().filter_map(|m| m.loop_mount.clone()).collect();
+    let undo = Teardown { base: base.clone(), cgroup: cgroup.clone(), remove, loop_mounts: loop_mounts.clone() };
+    let cleanup = |e: io::Error| {
+        undo_now(&undo, remove);
+        e
+    };
     // A network namespace of its own gets Docker's two defaults: any port
     // and ping without root. Host networking, and `--network container:`
     // (that container already has them), keep what they have.
@@ -858,7 +865,7 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
         netns,
         joins_netns: net_opts::values(spec.net.opts, net_opts::NETNS).next().is_some(),
         seccomp: spec.seccomp.to_vec(),
-        teardown: Some(Teardown { base, cgroup, remove }),
+        teardown: Some(Teardown { base, cgroup, remove, loop_mounts }),
         starting: starting.get().then_some(root_ready),
         ended_before_ready: None,
         filling: filling.get(),
@@ -1203,6 +1210,9 @@ fn undo_now(t: &Teardown, remove_files: bool) {
         let _ = fs::remove_dir_all(PathBuf::from("/run/kiri").join(id));
     }
     remove_cgroup(&t.cgroup);
+    for path in &t.loop_mounts {
+        super::volmount::release_loop(path);
+    }
     if remove_files {
         super::roots::remove(&t.base);
     }
@@ -1278,6 +1288,9 @@ pub fn sweep(paths: &Paths, cgroup: &std::path::Path) {
             let _ = net::detach(&name);
         }
     }
+    // Detach any loopback ext4 image mounted for `kiri-k8s` on a ZFS host so
+    // the filesystem flushes cleanly and no orphan loop mount remains.
+    super::volmount::release_k8s_ext4_if_mounted();
 }
 
 /// Kills every process in a cgroup and below it, and waits (briefly) until
@@ -1673,6 +1686,8 @@ pub(super) struct Mount {
     tmpfs_opts: Option<CString>,
     /// tmpfs mount flags (`noexec`, `nosuid`, `nodev`, `ro`).
     tmpfs_flags: libc::c_ulong,
+    /// Loopback ext4 volume mount acquired for this container (released on stop).
+    loop_mount: Option<String>,
 }
 
 impl Mount {
@@ -1692,50 +1707,85 @@ impl Mount {
 /// at its source first.
 pub(super) fn parse_mounts(list: StrList<'_>) -> io::Result<Vec<Mount>> {
     let mut out = Vec::with_capacity(list.len());
-    for m in list.iter() {
-        let bad = || io::Error::new(io::ErrorKind::InvalidInput, format!("bad mount {m:?}"));
-        // Three fields: source, target, flags. Seven: the same, then a
-        // volume's driver options (`type`, `device`, flags, data). Any other
-        // count is a separator inside a field — a target alone comes from an
-        // image's VOLUME line — and is refused here as well as at the host.
-        let f: Vec<&str> = m.split('\t').collect();
-        if f.len() != 3 && f.len() != 7 {
-            return Err(bad());
+    let release_acquired = |mounts: &[Mount]| {
+        for m in mounts {
+            if let Some(path) = &m.loop_mount {
+                super::volmount::release_loop(path);
+            }
         }
-        let (src, given_target, words) = (f[0], f[1], f[2]);
-        let flags: Vec<&str> = words.split(',').filter(|f| !f.is_empty()).collect();
-        if !given_target.starts_with('/') || given_target.split('/').any(|c| c == "..") {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("bad mount target {given_target}")));
+    };
+    let parsed = (|| -> io::Result<()> {
+        for m in list.iter() {
+            let bad = || io::Error::new(io::ErrorKind::InvalidInput, format!("bad mount {m:?}"));
+            // Three fields: source, target, flags. Seven: the same, then a
+            // volume's driver options (`type`, `device`, flags, data). Any other
+            // count is a separator inside a field — a target alone comes from an
+            // image's VOLUME line — and is refused here as well as at the host.
+            let f: Vec<&str> = m.split('\t').collect();
+            if f.len() != 3 && f.len() != 7 {
+                return Err(bad());
+            }
+            let (src, given_target, words) = (f[0], f[1], f[2]);
+            let flags: Vec<&str> = words.split(',').filter(|f| !f.is_empty()).collect();
+            if !given_target.starts_with('/') || given_target.split('/').any(|c| c == "..") {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("bad mount target {given_target}")));
+            }
+            let rel = given_target.trim_start_matches('/');
+            let target = CString::new(if rel.is_empty() { "." } else { rel })?;
+            let ro = flags.contains(&"ro");
+            if flags.contains(&"tmpfs") {
+                let opts: Vec<&str> = flags.iter().copied().filter(|f| f.contains('=')).collect();
+                let opts = if opts.is_empty() { "mode=1777".to_owned() } else { opts.join(",") };
+                let tmpfs_flags = tmpfs_flags(&flags);
+                let ro = tmpfs_flags & libc::MS_RDONLY != 0;
+                out.push(Mount { source: None, target, ro, dir: true, copy_up: false, tmpfs_opts: Some(CString::new(opts)?), tmpfs_flags, loop_mount: None });
+                continue;
+            }
+            // A missing source becomes a directory, as Docker does; one that is
+            // there already (a file such as /etc/hostname, too) is used as it is.
+            if flags.contains(&"create") && fs::symlink_metadata(src).is_err() {
+                fs::create_dir_all(src)?;
+            }
+            let mut loop_mount = None;
+            if f.len() == 7 && !f[3].is_empty() {
+                super::volmount::ensure(src, f[3], f[4], f[5], f[6])?;
+            } else if super::volmount::ensure_k8s_ext4(src)? {
+                loop_mount = Some(src.to_owned());
+            }
+            let meta = match fs::metadata(src) {
+                Ok(meta) => meta,
+                Err(e) => {
+                    if let Some(path) = &loop_mount {
+                        super::volmount::release_loop(path);
+                    }
+                    return Err(io::Error::new(e.kind(), format!("mount source {src}: {e}")));
+                }
+            };
+            let source = match sys::cstr(src) {
+                Ok(s) => s,
+                Err(e) => {
+                    if let Some(path) = &loop_mount {
+                        super::volmount::release_loop(path);
+                    }
+                    return Err(e);
+                }
+            };
+            out.push(Mount {
+                source: Some(source),
+                target,
+                ro,
+                dir: meta.is_dir(),
+                copy_up: flags.contains(&"copyup"),
+                tmpfs_opts: None,
+                tmpfs_flags: 0,
+                loop_mount,
+            });
         }
-        let rel = given_target.trim_start_matches('/');
-        let target = CString::new(if rel.is_empty() { "." } else { rel })?;
-        let ro = flags.contains(&"ro");
-        if flags.contains(&"tmpfs") {
-            let opts: Vec<&str> = flags.iter().copied().filter(|f| f.contains('=')).collect();
-            let opts = if opts.is_empty() { "mode=1777".to_owned() } else { opts.join(",") };
-            let tmpfs_flags = tmpfs_flags(&flags);
-            let ro = tmpfs_flags & libc::MS_RDONLY != 0;
-            out.push(Mount { source: None, target, ro, dir: true, copy_up: false, tmpfs_opts: Some(CString::new(opts)?), tmpfs_flags });
-            continue;
-        }
-        // A missing source becomes a directory, as Docker does; one that is
-        // there already (a file such as /etc/hostname, too) is used as it is.
-        if flags.contains(&"create") && fs::symlink_metadata(src).is_err() {
-            fs::create_dir_all(src)?;
-        }
-        if f.len() == 7 && !f[3].is_empty() {
-            super::volmount::ensure(src, f[3], f[4], f[5], f[6])?;
-        }
-        let meta = fs::metadata(src).map_err(|e| io::Error::new(e.kind(), format!("mount source {src}: {e}")))?;
-        out.push(Mount {
-            source: Some(sys::cstr(src)?),
-            target,
-            ro,
-            dir: meta.is_dir(),
-            copy_up: flags.contains(&"copyup"),
-            tmpfs_opts: None,
-            tmpfs_flags: 0,
-        });
+        Ok(())
+    })();
+    if let Err(e) = parsed {
+        release_acquired(&out);
+        return Err(e);
     }
     // Parents before what's under them, as Docker sorts mounts: the CLI sends
     // `-v` in no set order, and `/app/node_modules` mounted before `/app`
@@ -3750,7 +3800,7 @@ mod tests {
 
     #[test]
     fn mounts_go_parents_first_whatever_order_they_came_in() {
-        let m = |t: &str| super::Mount { source: None, target: std::ffi::CString::new(t).unwrap(), ro: false, dir: true, copy_up: false, tmpfs_opts: None, tmpfs_flags: 0 };
+        let m = |t: &str| super::Mount { source: None, target: std::ffi::CString::new(t).unwrap(), ro: false, dir: true, copy_up: false, tmpfs_opts: None, tmpfs_flags: 0, loop_mount: None };
         let mut mounts = vec![m("app/node_modules"), m("app"), m("data"), m("app/cache/x"), m(".")];
         mounts.sort_by_key(|x| super::depth(&x.target));
         let order: Vec<_> = mounts.iter().map(|x| x.target.to_str().unwrap()).collect();

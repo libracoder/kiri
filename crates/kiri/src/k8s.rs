@@ -239,8 +239,51 @@ pub(crate) fn apply_set_args(cfg: &mut Config, args: &[String]) -> io::Result<()
     Ok(())
 }
 
+/// Extra kubelet `root-dir` flag passed on Linux ZFS hosts (#607) so kubelet
+/// (`nodefs`) lives inside the loopback-ext4 `/var/lib/rancher/k3s` volume
+/// alongside containerd (`imagefs`) rather than on the ZFS container rootfs.
+pub(crate) const ZFS_KUBELET_ROOT_ARG: &str = "--kubelet-arg=root-dir=/var/lib/rancher/k3s/kubelet";
+
+/// Label recorded on the `kiri-k8s` volume when backed by a loopback ext4 image on ZFS.
+const ZFS_BACKING_LABEL: &str = "dev.kiri.k8s.backing";
+
+/// Maximum trailing container log lines included when `kiri-k8s` exits during startup.
+const CRASH_LOG_LINES: usize = 15;
+
+/// Whether custom `k3s_args` already specify kubelet's `root-dir`.
+pub(crate) fn has_kubelet_root_dir(args: &[String]) -> bool {
+    args.iter().filter(|a| valid_k3s_arg(a)).any(|a| {
+        let s = a.trim();
+        s.contains("root-dir=")
+            || s == "root-dir"
+            || s == "--root-dir"
+            || s.ends_with("=root-dir")
+            || s.ends_with("=--root-dir")
+    })
+}
+
+/// Reads `KiriStorageZfs` from a daemon `/info` response.
+pub(crate) fn storage_zfs_from_info(info: &serde_json::Value) -> Option<bool> {
+    info["KiriStorageZfs"].as_bool()
+}
+
+/// Whether the running daemon's volumes directory sits on ZFS (#607).
+fn daemon_storage_zfs() -> bool {
+    client::get("/info")
+        .ok()
+        .and_then(|info| storage_zfs_from_info(&info))
+        .unwrap_or_else(|| crate::daemon::rofs::is_daemon_storage_zfs(None))
+}
+
 /// Builds the `k3s server` command vector for the node container.
+#[cfg(test)]
 pub(crate) fn server_cmd(cfg: &Config) -> Vec<String> {
+    server_cmd_for(cfg, false)
+}
+
+/// Builds the `k3s server` command vector, adding `--kubelet-arg=root-dir=…`
+/// on Linux ZFS hosts (#607) unless custom `k3s_args` already configure `root-dir`.
+pub(crate) fn server_cmd_for(cfg: &Config, zfs: bool) -> Vec<String> {
     let mut cmd: Vec<String> = [
         "server",
         "--disable",
@@ -256,6 +299,9 @@ pub(crate) fn server_cmd(cfg: &Config) -> Vec<String> {
     .to_vec();
     for name in cfg.tls_san.iter().filter(|n| valid_san(n)) {
         cmd.extend(["--tls-san".to_owned(), name.clone()]);
+    }
+    if zfs && !has_kubelet_root_dir(&cfg.k3s_args) {
+        cmd.push(ZFS_KUBELET_ROOT_ARG.to_owned());
     }
     for arg in cfg.k3s_args.iter().filter(|a| valid_k3s_arg(a)) {
         cmd.push(arg.clone());
@@ -345,11 +391,18 @@ const CONFIG_LABEL: &str = "dev.kiri.k8s.config";
 /// What of the settings a node is made with, as its label keeps them. The
 /// host folders are in it too, so a node made before it had them (or before
 /// one existed) is made again at its next start.
+#[cfg(test)]
 fn made_with(cfg: &Config) -> String {
-    if cfg.version.is_none() && cfg.k3s_args.is_empty() {
+    made_with_for(cfg, false)
+}
+
+fn made_with_for(cfg: &Config, zfs: bool) -> String {
+    if !zfs && cfg.version.is_none() && cfg.k3s_args.is_empty() {
         serde_json::to_string(&(cfg.lan, &cfg.tls_san, cfg.api_port(), host_folders())).unwrap_or_default()
-    } else {
+    } else if !zfs {
         serde_json::to_string(&(cfg.lan, &cfg.tls_san, cfg.api_port(), host_folders(), cfg.version_tag(), &cfg.k3s_args)).unwrap_or_default()
+    } else {
+        serde_json::to_string(&(cfg.lan, &cfg.tls_san, cfg.api_port(), host_folders(), cfg.version_tag(), &cfg.k3s_args, "zfs-ext4")).unwrap_or_default()
     }
 }
 
@@ -365,8 +418,33 @@ fn host_folders() -> Vec<&'static str> {
 }
 
 /// The node's binds: its state, then the host folders.
+#[cfg(test)]
 fn binds() -> Vec<String> {
-    std::iter::once(format!("{VOLUME}:/var/lib/rancher/k3s")).chain(host_folders().into_iter().map(|d| format!("{d}:{d}"))).collect()
+    binds_for(false)
+}
+
+/// The node's binds for the active storage backend: on ZFS, `:nocopy` skips
+/// cloning the container rootfs for initial volume copy-up while `kiri-init`
+/// loop-mounts the sparse `ext4.img` onto `/var/lib/kiri/volumes/kiri-k8s/_data`.
+pub(crate) fn binds_for(zfs: bool) -> Vec<String> {
+    let vol_bind = if zfs {
+        format!("{VOLUME}:/var/lib/rancher/k3s:nocopy")
+    } else {
+        format!("{VOLUME}:/var/lib/rancher/k3s")
+    };
+    std::iter::once(vol_bind).chain(host_folders().into_iter().map(|d| format!("{d}:{d}"))).collect()
+}
+
+/// `POST /volumes/create` body for the `kiri-k8s` volume: keeps `DriverOpts`
+/// empty so `kiri-init`'s `volmount::ensure_k8s_ext4` backs `_data` with a
+/// sparse loopback `ext4` image when `/var/lib/kiri/volumes` sits on ZFS (#607).
+pub(crate) fn volume_create_body(zfs: bool) -> serde_json::Value {
+    let labels = if zfs {
+        json!({"dev.kiri.k8s": "1", ZFS_BACKING_LABEL: "ext4-loop"})
+    } else {
+        json!({"dev.kiri.k8s": "1"})
+    };
+    json!({"Name": VOLUME, "Driver": "local", "Labels": labels})
 }
 
 fn ensure_daemon() -> io::Result<()> {
@@ -424,26 +502,168 @@ fn exists() -> io::Result<bool> {
     Ok(client::request("GET", &format!("/containers/{NAME}/json"), None)?.ok())
 }
 
+/// Returns `Some(exit_code)` when `/containers/kiri-k8s/json` shows that the
+/// node container is no longer running (`State.Running == false` /
+/// `State.Status == "exited"`) or has already crashed and been restarted by its
+/// `unless-stopped` policy (`RestartCount > initial_restarts`).
+pub(crate) fn node_exit_code(info: &serde_json::Value, initial_restarts: Option<u64>) -> Option<i64> {
+    let state = &info["State"];
+    let exit_code = state["ExitCode"].as_i64().unwrap_or(1);
+    let running = state["Running"].as_bool();
+    let status = state["Status"].as_str();
+    if running == Some(false) || matches!(status, Some("exited" | "dead" | "created")) {
+        return Some(exit_code);
+    }
+    if let (Some(base), Some(cur)) = (initial_restarts, info["RestartCount"].as_u64())
+        && cur > base
+    {
+        return Some(exit_code);
+    }
+    None
+}
+
+/// Extracts the last `keep` non-empty lines from `/containers/{id}/logs` output,
+/// stripping Docker's 8-byte multiplexed stream headers when `!tty`.
+pub(crate) fn decode_log_lines(body: &[u8], tty: bool, keep: usize) -> Vec<String> {
+    let mut text = Vec::with_capacity(body.len());
+    if tty {
+        text.extend_from_slice(body);
+    } else {
+        let mut rest = body;
+        while !rest.is_empty() {
+            if rest.len() >= 8 && rest[0] <= 2 && rest[1..4] == [0, 0, 0] {
+                let len = u32::from_be_bytes([rest[4], rest[5], rest[6], rest[7]]) as usize;
+                let end = (8 + len).min(rest.len());
+                text.extend_from_slice(&rest[8..end]);
+                rest = &rest[end..];
+            } else {
+                text.extend_from_slice(rest);
+                break;
+            }
+        }
+    }
+    let decoded = String::from_utf8_lossy(&text);
+    let all: Vec<String> = decoded
+        .split('\n')
+        .map(|l| l.trim_end_matches('\r').to_owned())
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    all[all.len().saturating_sub(keep)..].to_vec()
+}
+
+/// Formats an immediate startup crash error with the exit code and last log lines.
+pub(crate) fn format_node_crash_error(exit_code: i64, log_lines: &[String]) -> String {
+    let base = format!(
+        "the node ({NAME}) exited before becoming ready (exit code {exit_code}); see `docker --context {CONTEXT} logs {NAME}`"
+    );
+    if log_lines.is_empty() {
+        base
+    } else {
+        format!("{base}:\n  {}", log_lines.join("\n  "))
+    }
+}
+
+/// Polls until `check_kubectl_ready` succeeds, failing fast with the container's
+/// last log lines if `inspect` reports that `kiri-k8s` exited or crash-looped.
+pub(crate) fn wait_for_ready_with(
+    initial_restarts: Option<u64>,
+    timeout: Duration,
+    poll_interval: Duration,
+    mut inspect: impl FnMut() -> io::Result<serde_json::Value>,
+    mut check_kubectl_ready: impl FnMut() -> bool,
+    mut fetch_tail_logs: impl FnMut(bool) -> Vec<String>,
+    mut on_crash: impl FnMut(),
+) -> io::Result<()> {
+    let deadline = Instant::now() + timeout;
+    let mut base_restarts = initial_restarts;
+    loop {
+        if let Ok(info) = inspect() {
+            let base = *base_restarts.get_or_insert_with(|| info["RestartCount"].as_u64().unwrap_or(0));
+            if let Some(code) = node_exit_code(&info, Some(base)) {
+                let tty = info["Config"]["Tty"].as_bool().unwrap_or(false);
+                let lines = fetch_tail_logs(tty);
+                on_crash();
+                return Err(io::Error::other(format_node_crash_error(code, &lines)));
+            }
+        }
+        if check_kubectl_ready() {
+            return Ok(());
+        }
+        if let Ok(info) = inspect() {
+            let base = *base_restarts.get_or_insert_with(|| info["RestartCount"].as_u64().unwrap_or(0));
+            if let Some(code) = node_exit_code(&info, Some(base)) {
+                let tty = info["Config"]["Tty"].as_bool().unwrap_or(false);
+                let lines = fetch_tail_logs(tty);
+                on_crash();
+                return Err(io::Error::other(format_node_crash_error(code, &lines)));
+            }
+        }
+        if Instant::now() > deadline {
+            return Err(io::Error::other(format!(
+                "the node was not ready after 3 minutes; see `docker --context {CONTEXT} logs {NAME}`"
+            )));
+        }
+        std::thread::sleep(poll_interval);
+    }
+}
+
+fn node_tail_logs(tty: bool) -> Vec<String> {
+    client::request(
+        "GET",
+        &format!("/containers/{NAME}/logs?stdout=1&stderr=1&tail={CRASH_LOG_LINES}"),
+        None,
+    )
+    .ok()
+    .filter(|r| r.ok())
+    .map(|r| decode_log_lines(&r.body, tty, CRASH_LOG_LINES))
+    .unwrap_or_default()
+}
+
+fn wait_for_ready(initial_restarts: Option<u64>) -> io::Result<()> {
+    wait_for_ready_with(
+        initial_restarts,
+        Duration::from_secs(180),
+        Duration::from_secs(1),
+        || client::get(&format!("/containers/{NAME}/json")),
+        || {
+            matches!(
+                client::exec(NAME, &["timeout", "-s", "KILL", "20", "kubectl", "get", "nodes", "--no-headers"]),
+                Ok((0, out)) if out.split_whitespace().nth(1) == Some("Ready")
+            )
+        },
+        node_tail_logs,
+        || {
+            let _ = client::request("POST", &format!("/containers/{NAME}/stop"), None);
+        },
+    )
+}
+
 fn start(use_context: bool) -> io::Result<()> {
     ensure_daemon()?;
     let t0 = Instant::now();
     let cfg = config();
+    let zfs = daemon_storage_zfs();
     let want = cfg.api_port();
     // A stopped node keeps its port unless something else has taken it since;
     // then it is made again (its state is in the volume) on a free one.
     let mut moved_to = None;
     if exists()? {
         let info = client::get(&format!("/containers/{NAME}/json"))?;
-        if info["State"]["Running"] != true {
-            // Settings changed while it was stopped (a node from before the label: its port).
-            let stale = match info["Config"]["Labels"][CONFIG_LABEL].as_str() {
-                Some(made) => made != made_with(&cfg),
-                None => bound_port(&info) != Some(want),
+        let made_label = info["Config"]["Labels"][CONFIG_LABEL].as_str();
+        let want_made = made_with_for(&cfg, zfs);
+        if info["State"]["Running"] != true || (zfs && made_label != Some(want_made.as_str())) {
+            // Settings changed while it was stopped (a node from before the label: its port),
+            // or a ZFS node made without ext4 loopback + kubelet root-dir support.
+            let stale = match made_label {
+                Some(made) => made != want_made,
+                None => zfs || bound_port(&info) != Some(want),
             };
             if stale {
                 println!("applying the changed settings (the cluster's state is kept)…");
                 ok(client::request("DELETE", &format!("/containers/{NAME}?force=1"), None))?;
-            } else if let Some(held) = bound_port(&info).filter(|&p| !port_free(p, cfg.lan)) {
+            } else if info["State"]["Running"] != true
+                && let Some(held) = bound_port(&info).filter(|&p| !port_free(p, cfg.lan))
+            {
                 let port = pick_port(want, cfg.lan)?;
                 println!("port {held} is in use now; moving the API server to {port}…");
                 ok(client::request("DELETE", &format!("/containers/{NAME}?force=1"), None))?;
@@ -466,17 +686,18 @@ fn start(use_context: bool) -> io::Result<()> {
         if let Some(e) = String::from_utf8_lossy(&pulled.body).lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok()).find_map(|v| v["error"].as_str().map(str::to_owned)) {
             return Err(io::Error::other(e));
         }
-        let cmd = server_cmd(&cfg);
+        ok(client::request("POST", "/volumes/create", Some(&volume_create_body(zfs))))?;
+        let cmd = server_cmd_for(&cfg, zfs);
         let body = json!({
             "Image": cfg.image(),
             "Cmd": cmd,
             "Hostname": "kiri",
-            "Labels": {"dev.kiri.k8s": "1", PORT_LABEL: port.to_string(), CONFIG_LABEL: made_with(&cfg)},
+            "Labels": {"dev.kiri.k8s": "1", PORT_LABEL: port.to_string(), CONFIG_LABEL: made_with_for(&cfg, zfs)},
             "ExposedPorts": {"6443/tcp": {}},
             "HostConfig": {
                 "Privileged": true,
                 "Tmpfs": {"/run": "", "/var/run": ""},
-                "Binds": binds(),
+                "Binds": binds_for(zfs),
                 "PortBindings": {"6443/tcp": [{"HostIp": if cfg.lan { "0.0.0.0" } else { "127.0.0.1" }, "HostPort": port.to_string()}]},
                 "RestartPolicy": {"Name": "unless-stopped"},
             },
@@ -487,27 +708,25 @@ fn start(use_context: bool) -> io::Result<()> {
     if !started.ok() && started.status != 304 {
         return Err(io::Error::other(started.error()));
     }
-    // Early, so a new cluster's CoreDNS and user manifests (e.g. a custom CNI) apply right away.
-    let host_names_written = host_names().unwrap_or_else(|e| {
-        println!("pods may not resolve host.docker.internal: {e}");
-        false
-    });
-    if let Err(e) = sync_user_manifests() {
-        println!("user manifests from ~/.kiri/k8s-manifests were not synced: {e}");
+    let initial_info = client::get(&format!("/containers/{NAME}/json")).ok();
+    let initial_restarts = initial_info.as_ref().and_then(|v| v["RestartCount"].as_u64());
+    let mut host_names_written = false;
+    if initial_info.as_ref().is_none_or(|v| node_exit_code(v, None).is_none()) {
+        // Early, so a new cluster's CoreDNS and user manifests (e.g. a custom CNI) apply right away.
+        host_names_written = host_names().unwrap_or_else(|e| {
+            if client::get(&format!("/containers/{NAME}/json")).ok().is_none_or(|v| node_exit_code(&v, initial_restarts).is_none()) {
+                println!("pods may not resolve host.docker.internal: {e}");
+            }
+            false
+        });
+        if let Err(e) = sync_user_manifests()
+            && client::get(&format!("/containers/{NAME}/json")).ok().is_none_or(|v| node_exit_code(&v, initial_restarts).is_none())
+        {
+            println!("user manifests from ~/.kiri/k8s-manifests were not synced: {e}");
+        }
     }
     println!("waiting for the node…");
-    let deadline = Instant::now() + Duration::from_secs(180);
-    loop {
-        if let Ok((0, out)) = client::exec(NAME, &["timeout", "-s", "KILL", "20", "kubectl", "get", "nodes", "--no-headers"]) {
-            if out.split_whitespace().nth(1) == Some("Ready") {
-                break;
-            }
-        }
-        if Instant::now() > deadline {
-            return Err(io::Error::other(format!("the node was not ready after 3 minutes; see `docker --context kiri logs {NAME}`")));
-        }
-        std::thread::sleep(Duration::from_secs(1));
-    }
+    wait_for_ready(initial_restarts)?;
     if host_names_written {
         if let Err(e) = restart_coredns() {
             println!("pods may not resolve host.docker.internal until CoreDNS restarts: {e}");
@@ -719,9 +938,11 @@ fn kubeconfig(use_context: bool, port: u16) -> io::Result<bool> {
 /// certificate changed. Nothing when there is no running node.
 pub(crate) fn sync(wait: Duration) -> io::Result<bool> {
     let r = client::request("GET", &format!("/containers/{NAME}/json"), None)?;
-    if !r.ok() || r.json()["State"]["Running"] != true {
+    let initial = r.json();
+    if !r.ok() || initial["State"]["Running"] != true {
         return Ok(false);
     }
+    let initial_restarts = initial["RestartCount"].as_u64();
     // A cluster made by an older Kiri gets it here too, at the engine's start.
     let host_names_written = host_names().unwrap_or_else(|e| {
         crate::diag::warn!("host names manifest not written", error = e);
@@ -729,6 +950,11 @@ pub(crate) fn sync(wait: Duration) -> io::Result<bool> {
     });
     let deadline = Instant::now() + wait;
     while k3s_yaml().is_err() {
+        if let Ok(info) = client::get(&format!("/containers/{NAME}/json"))
+            && node_exit_code(&info, initial_restarts).is_some()
+        {
+            return Err(io::Error::other("the node exited before writing its kubeconfig"));
+        }
         if Instant::now() > deadline {
             return Err(io::Error::other("the cluster's kubeconfig was not there in time"));
         }
@@ -1092,5 +1318,165 @@ mod tests {
             ]
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn zfs_mode_wires_kubelet_root_dir_and_loopback_ext4_volume_options() {
+        // /info KiriStorageZfs parsing.
+        assert_eq!(super::storage_zfs_from_info(&serde_json::json!({"KiriStorageZfs": true})), Some(true));
+        assert_eq!(super::storage_zfs_from_info(&serde_json::json!({"KiriStorageZfs": false})), Some(false));
+        assert_eq!(super::storage_zfs_from_info(&serde_json::json!({})), None);
+
+        // Volume create payload keeps DriverOpts empty (so kiri-init's volmount::ensure_k8s_ext4
+        // runs on /var/lib/kiri/volumes/kiri-k8s/_data) and marks ZFS loopback backing in Labels.
+        let std_vol = super::volume_create_body(false);
+        assert_eq!(std_vol["Name"], "kiri-k8s");
+        assert_eq!(std_vol["Driver"], "local");
+        assert!(std_vol.get("DriverOpts").is_none());
+        assert!(std_vol["Labels"].get(super::ZFS_BACKING_LABEL).is_none());
+
+        let zfs_vol = super::volume_create_body(true);
+        assert_eq!(zfs_vol["Name"], "kiri-k8s");
+        assert_eq!(zfs_vol["Driver"], "local");
+        assert!(zfs_vol.get("DriverOpts").is_none());
+        assert_eq!(zfs_vol["Labels"][super::ZFS_BACKING_LABEL], "ext4-loop");
+
+        // Binds use :nocopy on ZFS and plain volume bind otherwise.
+        assert_eq!(super::binds_for(false)[0], "kiri-k8s:/var/lib/rancher/k3s");
+        assert_eq!(super::binds_for(true)[0], "kiri-k8s:/var/lib/rancher/k3s:nocopy");
+
+        // Default ZFS server_cmd adds --kubelet-arg=root-dir=/var/lib/rancher/k3s/kubelet
+        // so kubelet (nodefs) sits on the ext4 loop device instead of ZFS rootfs (#607).
+        let mut cfg = super::Config::default();
+        assert!(!super::server_cmd_for(&cfg, false).contains(&super::ZFS_KUBELET_ROOT_ARG.to_owned()));
+        let zfs_cmd = super::server_cmd_for(&cfg, true);
+        assert!(zfs_cmd.contains(&super::ZFS_KUBELET_ROOT_ARG.to_owned()), "{zfs_cmd:?}");
+
+        // Custom user args come after ZFS kubelet root-dir when they don't set root-dir.
+        cfg.k3s_args = vec!["--flannel-backend=none".into()];
+        let zfs_with_extra = super::server_cmd_for(&cfg, true);
+        let root_pos = zfs_with_extra.iter().position(|a| a == super::ZFS_KUBELET_ROOT_ARG).unwrap();
+        let extra_pos = zfs_with_extra.iter().position(|a| a == "--flannel-backend=none").unwrap();
+        assert!(root_pos < extra_pos, "{zfs_with_extra:?}");
+
+        // User-supplied root-dir in k3s_args is respected and not duplicated.
+        for user_args in [
+            vec!["--kubelet-arg=root-dir=/custom/kubelet".to_owned()],
+            vec!["--kubelet-arg=--root-dir=/custom/kubelet".to_owned()],
+            vec!["--kubelet-arg".to_owned(), "root-dir=/custom/kubelet".to_owned()],
+            vec!["--kubelet-arg=root-dir".to_owned(), "/custom/kubelet".to_owned()],
+        ] {
+            cfg.k3s_args = user_args.clone();
+            assert!(super::has_kubelet_root_dir(&cfg.k3s_args), "{user_args:?}");
+            let cmd = super::server_cmd_for(&cfg, true);
+            assert!(!cmd.contains(&super::ZFS_KUBELET_ROOT_ARG.to_owned()), "{cmd:?}");
+        }
+
+        // made_with_for distinguishes ZFS from non-ZFS so pre-fix ZFS nodes are recreated,
+        // while keeping non-ZFS made_with identical.
+        let plain = super::Config::default();
+        assert_eq!(super::made_with(&plain), super::made_with_for(&plain, false));
+        assert_ne!(super::made_with_for(&plain, true), super::made_with_for(&plain, false));
+    }
+
+    #[test]
+    fn readiness_wait_fails_fast_when_container_exits_or_crash_loops() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+
+        fn docker_frame(stream: u8, line: &str) -> Vec<u8> {
+            let mut out = vec![stream, 0, 0, 0];
+            out.extend_from_slice(&(line.len() as u32).to_be_bytes());
+            out.extend_from_slice(line.as_bytes());
+            out
+        }
+
+        // Multiplexed Docker log decoding + tail truncation.
+        let mut raw_logs = docker_frame(1, "time=\"2026-11-24T17:00:00Z\" level=info msg=\"Starting k3s\"\n");
+        raw_logs.extend(docker_frame(
+            2,
+            "F1124 17:00:01.123456 1 server.go:123] Failed to start ContainerManager: cannot find filesystem info for device \"rpool/ROOT/ubuntu\"\r\n\n",
+        ));
+        let decoded = super::decode_log_lines(&raw_logs, false, 15);
+        assert_eq!(decoded.len(), 2);
+        assert!(decoded[1].contains("cannot find filesystem info for device \"rpool/ROOT/ubuntu\""));
+        assert_eq!(super::decode_log_lines(&raw_logs, false, 1), vec![decoded[1].clone()]);
+        assert_eq!(super::decode_log_lines(b"tty line 1\r\ntty line 2\n", true, 5), vec!["tty line 1", "tty line 2"]);
+
+        // 1) Immediate container exit (State.Running == false, State.Status == "exited") fails fast (< 500ms, not 180s).
+        let crashed_stops = AtomicUsize::new(0);
+        let t0 = Instant::now();
+        let err = super::wait_for_ready_with(
+            Some(0),
+            Duration::from_secs(180),
+            Duration::from_secs(5),
+            || {
+                Ok(serde_json::json!({
+                    "State": {"Status": "exited", "Running": false, "ExitCode": 1},
+                    "RestartCount": 0,
+                    "Config": {"Tty": false}
+                }))
+            },
+            || false,
+            |tty| super::decode_log_lines(&raw_logs, tty, 15),
+            || {
+                crashed_stops.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .unwrap_err();
+        assert!(t0.elapsed() < Duration::from_millis(500), "took {:?}", t0.elapsed());
+        assert_eq!(crashed_stops.load(Ordering::SeqCst), 1);
+        let msg = err.to_string();
+        assert!(msg.contains("exit code 1"), "{msg}");
+        assert!(msg.contains("cannot find filesystem info for device"), "{msg}");
+        // Last line is the fatal k3s log line so ui/k8s.rs surfaces it directly.
+        assert!(msg.lines().last().unwrap().contains("cannot find filesystem info for device"), "{msg}");
+
+        // 2) Crash-loop under `RestartPolicy: unless-stopped` (Running == true again, RestartCount > initial_restarts).
+        let loop_stops = AtomicUsize::new(0);
+        let err_loop = super::wait_for_ready_with(
+            Some(2),
+            Duration::from_secs(180),
+            Duration::from_secs(5),
+            || {
+                Ok(serde_json::json!({
+                    "State": {"Status": "running", "Running": true, "ExitCode": 255},
+                    "RestartCount": 3,
+                    "Config": {"Tty": true}
+                }))
+            },
+            || false,
+            |_| vec!["Error: unknown flag: --bad-k3s-arg".into()],
+            || {
+                loop_stops.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .unwrap_err();
+        assert_eq!(loop_stops.load(Ordering::SeqCst), 1);
+        assert!(err_loop.to_string().contains("exit code 255") && err_loop.to_string().contains("--bad-k3s-arg"));
+
+        // 3) Healthy startup polls until kubectl reports Ready without false-failing on prior RestartCount.
+        let polls = AtomicUsize::new(0);
+        let healthy_stops = AtomicUsize::new(0);
+        super::wait_for_ready_with(
+            Some(2),
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+            || {
+                Ok(serde_json::json!({
+                    "State": {"Status": "running", "Running": true, "ExitCode": 0},
+                    "RestartCount": 2,
+                    "Config": {"Tty": false}
+                }))
+            },
+            || polls.fetch_add(1, Ordering::SeqCst) >= 2,
+            |_| Vec::new(),
+            || {
+                healthy_stops.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .unwrap();
+        assert_eq!(healthy_stops.load(Ordering::SeqCst), 0);
+        assert!(polls.load(Ordering::SeqCst) >= 3);
     }
 }

@@ -106,6 +106,12 @@ pub fn remount(target: &CStr, flags: libc::c_ulong) -> io::Result<()> {
     check(ret as _, &format!("remount {}", target.to_string_lossy())).map(drop)
 }
 
+pub fn umount(target: &Path) -> io::Result<()> {
+    let t = cstr(target)?;
+    // SAFETY: `t` is a valid NUL-terminated string.
+    check(unsafe { libc::umount2(t.as_ptr(), 0) } as _, "umount").map(drop)
+}
+
 pub fn umount_lazy(target: &Path) -> io::Result<()> {
     let t = cstr(target)?;
     // SAFETY: `t` is a valid NUL-terminated string.
@@ -115,6 +121,9 @@ pub fn umount_lazy(target: &Path) -> io::Result<()> {
 /// Linux's `CGROUP2_SUPER_MAGIC` (`<linux/magic.h>`).
 const CGROUP2_SUPER_MAGIC: i64 = 0x6367_7270;
 
+/// OpenZFS's `ZFS_SUPER_MAGIC` (`zpl_super.c`).
+pub const ZFS_SUPER_MAGIC: i64 = 0x2fc1_2fc1;
+
 /// Whether `path` sits on a mounted `cgroup2` filesystem.
 pub fn is_cgroup2(path: &Path) -> bool {
     let Ok(c) = cstr(path) else { return false };
@@ -122,6 +131,15 @@ pub fn is_cgroup2(path: &Path) -> bool {
     let mut st: libc::statfs = unsafe { std::mem::zeroed() };
     // SAFETY: statfs writes into `st`.
     unsafe { libc::statfs(c.as_ptr(), &mut st) == 0 && st.f_type as i64 == CGROUP2_SUPER_MAGIC }
+}
+
+/// Whether `statfs(2)` reports `ZFS_SUPER_MAGIC` on `path`.
+pub fn is_statfs_zfs(path: &Path) -> bool {
+    let Ok(c) = cstr(path) else { return false };
+    // SAFETY: `st` is plain zero-initialized data; `c` is a valid C string.
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: statfs writes into `st`.
+    unsafe { libc::statfs(c.as_ptr(), &mut st) == 0 && st.f_type as i64 == ZFS_SUPER_MAGIC }
 }
 
 /// Why a container storage filesystem is read-only.
@@ -236,6 +254,46 @@ pub fn mountinfo_readonly(mountinfo: &str, target: &Path) -> Option<ReadOnlyKind
         }
     }
     best.and_then(|(_, kind)| kind)
+}
+
+/// Inspects `/proc/self/mountinfo` text for the filesystem type of the active
+/// mount covering `target` (longest ancestor mountpoint, with later lines
+/// winning ties for overmounts).
+pub fn mountinfo_fstype<'a>(mountinfo: &'a str, target: &Path) -> Option<&'a str> {
+    let target_str = target.to_string_lossy();
+    let mut best: Option<(usize, &'a str)> = None;
+    for line in mountinfo.lines() {
+        let Some((before, after)) = line.split_once(" - ") else { continue };
+        let Some(mp_raw) = before.split_whitespace().nth(4) else { continue };
+        let Some(fstype) = after.split_whitespace().next() else { continue };
+        let mp = unescape_mount_path(mp_raw);
+        let mp_norm = norm_mount_path(&mp);
+        if mount_covers(mp_norm, &target_str) && best.is_none_or(|(len, _)| mp_norm.len() >= len) {
+            best = Some((mp_norm.len(), fstype));
+        }
+    }
+    best.map(|(_, fstype)| fstype)
+}
+
+/// Whether `/proc/self/mountinfo` reports fstype `"zfs"` for the active mount covering `target`.
+pub fn is_zfs_mountinfo(mountinfo: &str, target: &Path) -> bool {
+    mountinfo_fstype(mountinfo, target) == Some("zfs")
+}
+
+/// Whether `path` (or its nearest existing ancestor) sits on a ZFS filesystem,
+/// checked via `statfs(ZFS_SUPER_MAGIC)` with `/proc/self/mountinfo` fallback.
+pub fn is_zfs(path: &Path) -> bool {
+    let Some(existing) = path.ancestors().find(|p| !p.as_os_str().is_empty() && p.exists()) else {
+        return false;
+    };
+    if is_statfs_zfs(existing) {
+        return true;
+    }
+    let Ok(mi) = std::fs::read_to_string("/proc/self/mountinfo") else {
+        return false;
+    };
+    let canon = existing.canonicalize().ok();
+    is_zfs_mountinfo(&mi, canon.as_deref().unwrap_or(existing))
 }
 
 /// Whether `statvfs(2)` reports `ST_RDONLY` on `path`.
