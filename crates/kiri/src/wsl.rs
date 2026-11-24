@@ -9,8 +9,8 @@
 
 #![cfg_attr(not(windows), allow(dead_code))]
 
-use std::io::{self, Read, Seek, SeekFrom};
-use std::path::PathBuf;
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -179,6 +179,120 @@ pub(crate) fn wsl_command_args(distro: &str, args: &[String]) -> Vec<String> {
     out
 }
 
+/// Default Windows named pipe served by `kiri-win.exe`.
+const PIPE: &str = r"\\.\pipe\kiri";
+
+/// Path to the Windows-side stopped marker (`%LOCALAPPDATA%\Kiri\stopped`),
+/// shared with `kiri-win.exe`.
+pub(crate) fn stopped_marker_in(local_app_data: &Path) -> PathBuf {
+    local_app_data.join("Kiri").join("stopped")
+}
+
+/// Removes `%LOCALAPPDATA%\Kiri\stopped` if present.
+pub(crate) fn clear_stopped_marker_at(path: &Path) {
+    let _ = std::fs::remove_file(path);
+}
+
+fn clear_stopped_marker() {
+    if let Some(dir) = std::env::var_os("LOCALAPPDATA") {
+        clear_stopped_marker_at(&stopped_marker_in(&PathBuf::from(dir)));
+    }
+}
+
+/// Sends `POST /kiri/wake` over an open pipe/stream so a running `kiri-win.exe`
+/// clears its in-memory `STOPPED` gate, removes `%LOCALAPPDATA%\Kiri\stopped`,
+/// boots WSL, and updates the window/tray immediately.
+pub(crate) fn wake_over_stream(mut stream: impl Read + Write) -> io::Result<()> {
+    stream.write_all(b"POST /kiri/wake HTTP/1.1\r\nHost: kiri\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")?;
+    stream.flush()?;
+    let mut r = BufReader::new(stream);
+    let mut status_line = String::new();
+    if r.read_line(&mut status_line)? == 0 {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Kiri closed the connection without answering"));
+    }
+    let status: u16 = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Kiri is not answering"))?;
+    let mut content_len: Option<usize> = None;
+    let mut chunked = false;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if r.read_line(&mut line)? == 0 {
+            break;
+        }
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some((k, v)) = trimmed.split_once(':') {
+            if k.eq_ignore_ascii_case("content-length") {
+                content_len = v.trim().parse().ok();
+            } else if k.eq_ignore_ascii_case("transfer-encoding") {
+                chunked = v.trim().eq_ignore_ascii_case("chunked");
+            }
+        }
+    }
+    if (200..300).contains(&status) || status == 404 {
+        return Ok(());
+    }
+    let mut body = Vec::new();
+    if let Some(n) = content_len {
+        body.resize(n.min(64 * 1024), 0);
+        let _ = r.read_exact(&mut body);
+    } else if chunked {
+        line.clear();
+        if r.read_line(&mut line).is_ok()
+            && let Ok(n) = usize::from_str_radix(line.trim().split(';').next().unwrap_or(""), 16)
+            && n > 0
+        {
+            body.resize(n.min(64 * 1024), 0);
+            let _ = r.read_exact(&mut body);
+        }
+    } else {
+        let _ = r.take(64 * 1024).read_to_end(&mut body);
+    }
+    let msg = serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| v["message"].as_str().map(str::to_owned))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            let text = String::from_utf8_lossy(&body).trim().to_owned();
+            if text.is_empty() { format!("HTTP {status}") } else { text }
+        });
+    Err(io::Error::other(msg))
+}
+
+#[cfg(windows)]
+fn wake_via_pipe(pipe_name: &str) -> Option<io::Result<()>> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const ERROR_PIPE_BUSY: i32 = 231;
+    const SECURITY_IDENTIFICATION: u32 = 0x0001_0000;
+    for _ in 0..20 {
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0)
+            .security_qos_flags(SECURITY_IDENTIFICATION)
+            .open(pipe_name)
+        {
+            Ok(file) => return Some(wake_over_stream(file)),
+            Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+#[cfg(not(windows))]
+fn wake_via_pipe(_pipe_name: &str) -> Option<io::Result<()>> {
+    None
+}
+
 /// Runs `kiri <args>` in WSL and exits with its exit code.
 pub fn run(args: &[String]) -> io::Result<()> {
     if let [m, verb, name, rest @ ..] = args
@@ -193,6 +307,22 @@ pub fn run(args: &[String]) -> io::Result<()> {
         && diag_report(rest)?
     {
         return Ok(());
+    }
+    if args.len() == 1 && args[0] == "start" {
+        if let Some(res) = wake_via_pipe(PIPE) {
+            match res {
+                Ok(()) => {
+                    clear_stopped_marker();
+                    println!("Kiri is started");
+                    return Ok(());
+                }
+                Err(e) if !matches!(e.kind(), io::ErrorKind::UnexpectedEof | io::ErrorKind::BrokenPipe) => {
+                    return Err(e);
+                }
+                Err(_) => {}
+            }
+        }
+        clear_stopped_marker();
     }
     let distro = distro().ok_or_else(|| io::Error::other("Kiri isn't set up yet. Open Kiri from the Start menu first"))?;
     // wsl.exe from System32, never one found in the current folder.
@@ -231,8 +361,77 @@ fn machine_shell(name: &str, rest: &[String]) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{COMMANDS, SCRIPT, forward_args, parse_diag_report_args, wsl_command_args};
+    use super::{COMMANDS, SCRIPT, clear_stopped_marker_at, forward_args, parse_diag_report_args, stopped_marker_in, wake_over_stream, wsl_command_args};
+    use std::io::{self, Cursor, Read, Write};
     use std::path::PathBuf;
+
+    struct MockPipe {
+        sent: Vec<u8>,
+        reply: Cursor<Vec<u8>>,
+    }
+
+    impl MockPipe {
+        fn new(reply: &[u8]) -> Self {
+            Self { sent: Vec::new(), reply: Cursor::new(reply.to_vec()) }
+        }
+    }
+
+    impl Read for MockPipe {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.reply.read(buf)
+        }
+    }
+
+    impl Write for MockPipe {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.sent.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn windows_start_clears_stopped_marker_and_wakes_over_pipe() {
+        let dir = std::env::temp_dir().join(format!("kiri-wsl-start-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let marker = stopped_marker_in(&dir);
+        assert_eq!(marker, dir.join("Kiri").join("stopped"));
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, b"").unwrap();
+        assert!(marker.is_file());
+        clear_stopped_marker_at(&marker);
+        assert!(!marker.exists());
+        // Clearing when already absent is a no-op.
+        clear_stopped_marker_at(&marker);
+
+        // 204 No Content succeeds and sends POST /kiri/wake.
+        let mut pipe = MockPipe::new(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n");
+        wake_over_stream(&mut pipe).unwrap();
+        let wire = String::from_utf8(pipe.sent).unwrap();
+        assert!(wire.starts_with("POST /kiri/wake HTTP/1.1\r\n"), "{wire}");
+        assert!(wire.contains("\r\nConnection: close\r\n"), "{wire}");
+
+        // 404 (older engine without wake) is also accepted cleanly.
+        let mut old = MockPipe::new(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+        wake_over_stream(&mut old).unwrap();
+
+        // 503 surfaces the daemon/pipe JSON message.
+        let body = r#"{"message":"Kiri's setup isn't finished: open Kiri to finish it"}"#;
+        let reply = format!("HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+        let mut refused = MockPipe::new(reply.as_bytes());
+        let err = wake_over_stream(&mut refused).unwrap_err();
+        assert_eq!(err.to_string(), "Kiri's setup isn't finished: open Kiri to finish it");
+
+        // Closed pipe without response returns UnexpectedEof so caller can fall back.
+        let mut eof = MockPipe::new(b"");
+        let err = wake_over_stream(&mut eof).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn forwards_scan_to_wsl() {

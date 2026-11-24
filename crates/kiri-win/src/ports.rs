@@ -672,6 +672,10 @@ mod runtime {
             return;
         }
         let _guard = SYNC_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        if crate::serve::is_stopped() {
+            clear_all_forwarders();
+            return;
+        }
         let (all_ips, win_v4, win_v6) = query_windows_host_ips();
         let body = json!({ "host_ips": all_ips });
         let resp = match crate::client::request_within("POST", "/kiri/win-ports", Some(&body), true, Some(Duration::from_secs(3))) {

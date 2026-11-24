@@ -101,6 +101,46 @@ static HUB: std::sync::OnceLock<Arc<Hub>> = std::sync::OnceLock::new();
 /// told so, rather than having its connection simply closed.
 static SETUP_PENDING: AtomicBool = AtomicBool::new(false);
 
+/// User explicitly stopped Kiri (Stop in the window or tray): mirrored at
+/// `%LOCALAPPDATA%\Kiri\stopped` so `kiri-win.exe` does not respawn `wsl.exe`
+/// in the background until Start or `kiri start` (`POST /kiri/wake`).
+static STOPPED: crate::refuse::StoppedGate = crate::refuse::StoppedGate::new();
+
+fn stopped_marker() -> Option<std::path::PathBuf> {
+    std::env::var_os("LOCALAPPDATA").map(|d| std::path::PathBuf::from(d).join("Kiri").join("stopped"))
+}
+
+/// Initializes the stopped gate from `%LOCALAPPDATA%\Kiri\stopped` at startup.
+pub fn init_stopped() {
+    if STOPPED.init_from(stopped_marker().as_deref()) {
+        log("stopped marker present; keeping WSL off until Start or `kiri start`");
+    }
+}
+
+/// Whether Kiri is stopped on the Windows side and must not spawn `wsl.exe`.
+pub fn is_stopped() -> bool {
+    STOPPED.is_stopped()
+}
+
+/// Marks Kiri stopped or running on the Windows side, keeping
+/// `%LOCALAPPDATA%\Kiri\stopped` in sync.
+pub fn set_stopped(stopped: bool) {
+    STOPPED.set(stopped, stopped_marker().as_deref());
+    if !stopped
+        && let Some(hub) = HUB.get()
+    {
+        *hub.silent.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    }
+}
+
+/// Immediately terminates any running bridge `wsl.exe` and closes its open
+/// connections (such as `/events`) so nothing keeps `vmmemWSL` alive.
+pub fn stop_bridge() {
+    if let Some(hub) = HUB.get() {
+        hub.stop();
+    }
+}
+
 pub fn set_setup_pending(pending: bool) {
     SETUP_PENDING.store(pending, Ordering::SeqCst);
 }
@@ -134,6 +174,16 @@ fn refuse_new(pipe: &Pipe, message: &str) -> bool {
     let mut buf = vec![0u8; 64 * 1024];
     let n = pipe.read_within(&mut buf, Some(REQUEST_WAIT)).unwrap_or(0);
     refuse(pipe, is_head(&buf[..n]), message)
+}
+
+/// `refuse`, reusing the already-read request bytes when present so a client
+/// whose request was inspected before connecting to the bridge is answered
+/// immediately without waiting another `REQUEST_WAIT`.
+fn refuse_client(pipe: &Pipe, prefetched: Option<&[u8]>, message: &str) -> bool {
+    match prefetched {
+        Some(head) => refuse(pipe, is_head(head), message),
+        None => refuse_new(pipe, message),
+    }
 }
 
 /// Docker's own pipe. docker-py, the Go and Java SDKs, Testcontainers and
@@ -208,15 +258,18 @@ pub fn start(cfg: Config) -> io::Result<()> {
     thread::Builder::new().name("kiri-docker-engine".into()).spawn(move || docker_engine(&h))?;
     // Start WSL and the Windows host relay now, so the first docker command
     // gets both the daemon and host.docker.internal without waiting for the UI.
-    crate::relay::ensure_started();
-    let h = hub.clone();
-    thread::spawn(move || {
-        if let Err(e) = h.bridge() {
-            if e.kind() != io::ErrorKind::NotConnected {
-                log(&format!("bridge: {e}"));
+    // When stopped, keep WSL untouched until Start or `kiri start`.
+    if !is_stopped() {
+        crate::relay::ensure_started();
+        let h = hub.clone();
+        thread::spawn(move || {
+            if let Err(e) = h.bridge() {
+                if e.kind() != io::ErrorKind::NotConnected {
+                    log(&format!("bridge: {e}"));
+                }
             }
-        }
-    });
+        });
+    }
     thread::Builder::new().name("kiri-pipe".into()).spawn(move || {
         let mut pipe = first;
         loop {
@@ -274,7 +327,9 @@ fn docker_engine(hub: &Arc<Hub>) {
         };
         set_docker_engine_owner(crate::dockerctx::Endpoint::Kiri);
         say(format!("serving {DOCKER_ENGINE} as well (no other engine has it)"));
-        crate::relay::ensure_started();
+        if !is_stopped() {
+            crate::relay::ensure_started();
+        }
         let (h, mut new) = (hub.clone(), NewEngines::default());
         serve_while_free(
             DOCKER_ENGINE,
@@ -1400,10 +1455,22 @@ impl Hub {
         true
     }
 
+    /// Takes the running bridge out of use and ends its `wsl.exe` immediately,
+    /// closing any open connections (such as `/events`) so nothing keeps WSL alive.
+    fn stop(&self) -> bool {
+        let Some(b) = self.current.lock().unwrap_or_else(PoisonError::into_inner).take() else { return false };
+        b.retired.store(true, Ordering::SeqCst);
+        b.kill("Kiri stopped");
+        true
+    }
+
     fn bridge(&self) -> io::Result<Arc<Bridge>> {
         let mut current = self.current.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(b) = current.as_ref().filter(|b| !b.dead.load(Ordering::SeqCst)) {
             return Ok(b.clone());
+        }
+        if is_stopped() {
+            return Err(io::Error::new(io::ErrorKind::NotConnected, crate::refuse::STOPPED));
         }
         let cfg = self.cfg.lock().unwrap_or_else(PoisonError::into_inner).clone();
         // Until setup has made Kiri's Linux there is nothing to bridge to.
@@ -1733,6 +1800,35 @@ fn serve_shared(hub: &Hub, pipe: Arc<Pipe>) {
         }
         return;
     }
+    let mut prefetched: Option<Vec<u8>> = None;
+    let mut woke = false;
+    if is_stopped() {
+        let mut first = vec![0u8; 64 * 1024];
+        let n = pipe.read_within(&mut first, Some(REQUEST_WAIT)).unwrap_or(0);
+        if pipe.is_aborted() {
+            return;
+        }
+        first.truncate(n);
+        match STOPPED.inspect_request(&first, stopped_marker().as_deref()) {
+            crate::refuse::GateDecision::Wake => {
+                log("pipe: POST /kiri/wake received while stopped; waking Kiri");
+                *hub.silent.lock().unwrap_or_else(PoisonError::into_inner) = None;
+                prefetched = Some(first);
+                woke = true;
+            }
+            crate::refuse::GateDecision::Refuse => {
+                if refuse(pipe, is_head(&first), crate::refuse::STOPPED) {
+                    linger(pipe);
+                }
+                return;
+            }
+            crate::refuse::GateDecision::Forward => {
+                if !first.is_empty() {
+                    prefetched = Some(first);
+                }
+            }
+        }
+    }
     if HUB.get().is_some() {
         crate::relay::ensure_started();
     }
@@ -1758,14 +1854,26 @@ fn serve_shared(hub: &Hub, pipe: Arc<Pipe>) {
         if pipe.is_aborted() {
             return;
         }
+        if is_stopped() {
+            if refuse_client(pipe, prefetched.as_deref(), crate::refuse::STOPPED) {
+                linger(pipe);
+            }
+            return;
+        }
         let bridge = match hub.bridge() {
             Ok(b) => b,
             Err(e) => {
                 let answered = if e.kind() == io::ErrorKind::NotConnected {
-                    setup_pending() && refuse_new(pipe, SETUP_UNFINISHED)
+                    if setup_pending() {
+                        refuse_client(pipe, prefetched.as_deref(), SETUP_UNFINISHED)
+                    } else if is_stopped() {
+                        refuse_client(pipe, prefetched.as_deref(), crate::refuse::STOPPED)
+                    } else {
+                        false
+                    }
                 } else {
                     log(&format!("bridge: {e}"));
-                    refuse_new(pipe, &message(Some(&format!("WSL did not start Kiri's Linux ({e})"))))
+                    refuse_client(pipe, prefetched.as_deref(), &message(Some(&format!("WSL did not start Kiri's Linux ({e})"))))
                 };
                 if answered {
                     linger(pipe);
@@ -1788,7 +1896,7 @@ fn serve_shared(hub: &Hub, pipe: Arc<Pipe>) {
                 bridge.kill("it was started while WSL was not answering, and has said nothing");
                 continue;
             }
-            if refuse_new(pipe, &message(Some(&why))) {
+            if refuse_client(pipe, prefetched.as_deref(), &message(Some(&why))) {
                 linger(pipe);
             }
             return;
@@ -1814,7 +1922,7 @@ fn serve_shared(hub: &Hub, pipe: Arc<Pipe>) {
                 }
                 *told = Some((Instant::now(), why.clone()));
                 drop(told);
-                if refuse_new(pipe, &message(Some(&why))) {
+                if refuse_client(pipe, prefetched.as_deref(), &message(Some(&why))) {
                     linger(pipe);
                 }
                 return;
@@ -1844,9 +1952,15 @@ fn serve_shared(hub: &Hub, pipe: Arc<Pipe>) {
             break (bridge, id, window, rx, queued);
         }
         bridge.conns.lock().unwrap_or_else(PoisonError::into_inner).remove(&id);
+        if is_stopped() {
+            if refuse_client(pipe, prefetched.as_deref(), crate::refuse::STOPPED) {
+                linger(pipe);
+            }
+            return;
+        }
         if gave_up(dying_since.elapsed()) {
             log(&format!("bridge: kept stopping as soon as it started, for {} s; told the docker client", BRIDGE_WAIT.as_secs()));
-            if refuse_new(pipe, &message(Some("Kiri's Linux in WSL kept stopping as the command came in"))) {
+            if refuse_client(pipe, prefetched.as_deref(), &message(Some("Kiri's Linux in WSL kept stopping as the command came in"))) {
                 linger(pipe);
             }
             return;
@@ -1868,28 +1982,32 @@ fn serve_shared(hub: &Hub, pipe: Arc<Pipe>) {
     let mut buf = vec![0u8; 64 * 1024];
     let mut first_chunk = true;
     let end = loop {
-        match pipe.read(&mut buf) {
-            Ok(0) => break EOF,
-            Ok(n) => {
-                if first_chunk {
-                    first_chunk = false;
-                    if crate::ports::is_port_affecting_request(&buf[..n]) {
-                        port_op.store(true, Ordering::SeqCst);
-                        crate::ports::before_container_op();
-                    }
-                }
-                request.set(is_head(&buf[..n]));
-                // Out of credit with the client gone (nothing to read its
-                // reply), or the connection closed: stop.
-                if window.as_ref().is_some_and(|w| !w.take(n, || pipe.alive())) {
-                    break CLOSE;
-                }
-                if bridge.send(DATA, id, &buf[..n]).is_err() {
-                    break CLOSE;
-                }
+        let from_prefetch = prefetched.take();
+        let chunk: &[u8] = match from_prefetch.as_deref() {
+            Some(data) => data,
+            None => match pipe.read(&mut buf) {
+                Ok(0) => break EOF,
+                Ok(n) => &buf[..n],
+                // The client closed the pipe.
+                Err(_) => break CLOSE,
+            },
+        };
+        let n = chunk.len();
+        if first_chunk {
+            first_chunk = false;
+            if crate::ports::is_port_affecting_request(chunk) {
+                port_op.store(true, Ordering::SeqCst);
+                crate::ports::before_container_op();
             }
-            // The client closed the pipe.
-            Err(_) => break CLOSE,
+        }
+        request.set(is_head(chunk));
+        // Out of credit with the client gone (nothing to read its
+        // reply), or the connection closed: stop.
+        if window.as_ref().is_some_and(|w| !w.take(n, || pipe.alive())) {
+            break CLOSE;
+        }
+        if bridge.send(DATA, id, chunk).is_err() {
+            break CLOSE;
         }
     };
     // Gone before a word: nothing for a refusal to wait for.
@@ -1912,6 +2030,9 @@ fn serve_shared(hub: &Hub, pipe: Arc<Pipe>) {
         });
     }
     let replies_ended = writer.join().unwrap_or(false);
+    if woke && HUB.get().is_some() {
+        crate::engine::on_external_wake();
+    }
     if port_op.load(Ordering::Relaxed) {
         crate::ports::notify();
     }

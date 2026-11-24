@@ -72,6 +72,9 @@ static WSL_SYNC_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// Applies the current WSL integration settings to all enabled distros and updates
 /// the daemon's per-distro sockets in `/mnt/wsl/kiri/sockets/<NAME>/docker.sock`.
 pub fn apply_wsl_integration(disabled: Option<&str>, background: bool) -> io::Result<()> {
+    if background && crate::serve::is_stopped() {
+        return Ok(());
+    }
     let _guard = WSL_SYNC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let enabled = enabled_distros();
     if enabled.is_empty() && disabled.is_none() {
@@ -232,7 +235,7 @@ fn physical_mib() -> u64 {
 /// (MemTotal; see `as_set`). None while Kiri's engine isn't running, so
 /// that Settings never starts WSL.
 fn running() -> Option<(u64, u64)> {
-    if !crate::client::alive() {
+    if crate::serve::is_stopped() || !crate::client::alive() {
         return None;
     }
     let mut cmd = crate::win::tool("wsl.exe");

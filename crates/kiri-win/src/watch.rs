@@ -559,8 +559,14 @@ mod runtime {
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }
             }
+            if crate::serve::is_stopped() {
+                continue;
+            }
             let lines = coalesce_events(&batch);
             for chunk in lines.chunks(BATCH) {
+                if crate::serve::is_stopped() {
+                    break;
+                }
                 let body = json!({"events": chunk});
                 let _ = crate::client::request_within("POST", "/kiri/fs-events", Some(&body), true, Some(Duration::from_secs(3)));
             }
@@ -568,6 +574,9 @@ mod runtime {
     }
 
     fn desired_watches() -> Option<(String, Vec<WatchSpec>)> {
+        if crate::serve::is_stopped() {
+            return None;
+        }
         let resp = crate::client::get_quick("/kiri/watch-roots").ok()?;
         let root = resp["automount_root"].as_str().unwrap_or("/mnt/").to_owned();
         let mut specs = Vec::new();
@@ -596,7 +605,11 @@ mod runtime {
         let mut last_root = String::from("/mnt/");
 
         while !stop.load(Ordering::SeqCst) {
-            if let Some((root, want)) = desired_watches() {
+            if crate::serve::is_stopped() {
+                for (_, w) in active.drain() {
+                    w.stop();
+                }
+            } else if let Some((root, want)) = desired_watches() {
                 let root_changed = root != last_root;
                 last_root = root.clone();
                 let want_set: HashSet<WatchSpec> = want.iter().cloned().collect();

@@ -681,6 +681,9 @@ pub(crate) fn sync_soon() {
         let result = (|| -> io::Result<bool> {
             let deadline = Instant::now() + Duration::from_secs(180);
             loop {
+                if crate::serve::is_stopped() {
+                    return Ok(false);
+                }
                 let (status, info) = request("GET", &format!("/containers/{NAME}/json"), None)?;
                 if status == 404 || info["State"]["Running"] != true {
                     return Ok(false);

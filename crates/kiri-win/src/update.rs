@@ -640,6 +640,9 @@ pub(crate) fn output_within(cmd: &mut Command, limit: Duration) -> io::Result<st
 
 /// The engine's own Kiri version, when it answers.
 fn engine_version() -> Option<String> {
+    if crate::serve::is_stopped() {
+        return None;
+    }
     crate::client::get_background("/version").ok().and_then(|v| crate::client::kiri_version(&v).map(str::to_owned))
 }
 

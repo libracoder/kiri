@@ -2,11 +2,130 @@
 //! WSL (crates/kiri/src/bridge.rs closes the connection with why), rather
 //! than a pipe that simply breaks. Plain functions, tested on any host.
 
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex, PoisonError};
 use std::time::Duration;
 
 /// How long a client's request may take to come before it is answered anyway.
 pub const REQUEST_WAIT: Duration = Duration::from_secs(2);
+
+/// What a docker client is told while Kiri is stopped (explicit Stop in the
+/// window or tray): matches `crates/kiri/src/daemon/engine.rs::STOPPED`.
+pub const STOPPED: &str = "Kiri is stopped: run `kiri start`, or press Start in the Kiri window, to run containers again";
+
+/// Strips an optional Docker API version prefix (`/v1.47`) from `path`,
+/// matching `crates/kiri/src/daemon/http.rs::strip_version`.
+fn strip_version(path: &str) -> &str {
+    if let Some(rest) = path.strip_prefix("/v")
+        && let Some(i) = rest.find('/')
+        && !rest[..i].is_empty()
+        && rest[..i].bytes().any(|b| b.is_ascii_digit())
+        && rest[..i].bytes().all(|b| b.is_ascii_digit() || b == b'.')
+    {
+        return &rest[i..];
+    }
+    path
+}
+
+/// Whether the first HTTP request line in `request` is `POST /kiri/wake`
+/// (or versioned `POST /v*/kiri/wake`).
+pub fn is_wake_request(request: &[u8]) -> bool {
+    let line_end = request.iter().position(|&b| b == b'\r' || b == b'\n').unwrap_or(request.len().min(1024));
+    let Ok(line) = std::str::from_utf8(&request[..line_end]) else {
+        return false;
+    };
+    let mut parts = line.split_whitespace();
+    let Some("POST") = parts.next() else {
+        return false;
+    };
+    let Some(target) = parts.next() else {
+        return false;
+    };
+    if let Some(version) = parts.next()
+        && (!version.eq_ignore_ascii_case("HTTP/1.1") && !version.eq_ignore_ascii_case("HTTP/1.0") || parts.next().is_some())
+    {
+        return false;
+    }
+    let path = target.split('?').next().unwrap_or(target);
+    strip_version(path) == "/kiri/wake"
+}
+
+/// Returns `Some(d)` only when `distro` is Kiri's dedicated bundled distro
+/// (`kiri_distro`, i.e. `"kiri"`). Never returns a shared user distro such as
+/// Ubuntu so explicit Stop / Stop-on-quit never kills unrelated WSL shells.
+pub fn terminate_target<'a>(distro: Option<&'a str>, kiri_distro: &str) -> Option<&'a str> {
+    distro.filter(|&d| d == kiri_distro)
+}
+
+/// Action the Windows pipe server should take for an incoming connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateDecision {
+    /// Engine is not stopped: forward normally.
+    Forward,
+    /// Engine was stopped and the request is `POST /kiri/wake` (or `/v*/kiri/wake`):
+    /// gate and marker are now cleared; forward the already-read request bytes.
+    Wake,
+    /// Engine is stopped and the request is not a wake: reply HTTP 503 with
+    /// [`STOPPED`] without spawning `wsl.exe`.
+    Refuse,
+}
+
+/// Windows-side stopped gate (`AtomicBool`) mirrored on disk at
+/// `%LOCALAPPDATA%\Kiri\stopped` so `kiri-win.exe` keeps WSL off after an
+/// explicit Stop and across restarts until Start or `kiri start`.
+pub struct StoppedGate {
+    stopped: AtomicBool,
+}
+
+impl StoppedGate {
+    pub const fn new() -> Self {
+        Self { stopped: AtomicBool::new(false) }
+    }
+
+    pub fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::SeqCst)
+    }
+
+    /// Initializes the stopped flag from `marker`'s existence on disk.
+    pub fn init_from(&self, marker: Option<&Path>) -> bool {
+        let stopped = marker.is_some_and(Path::is_file);
+        self.stopped.store(stopped, Ordering::SeqCst);
+        stopped
+    }
+
+    /// Updates both the in-memory flag and the on-disk `marker` file.
+    pub fn set(&self, stopped: bool, marker: Option<&Path>) {
+        if stopped {
+            self.stopped.store(true, Ordering::SeqCst);
+            if let Some(p) = marker {
+                if let Some(dir) = p.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                let _ = std::fs::write(p, b"");
+            }
+        } else {
+            if let Some(p) = marker {
+                let _ = std::fs::remove_file(p);
+            }
+            self.stopped.store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// Decides what to do with `first_request` when the pipe server saw
+    /// `is_stopped()`. Clears the gate and marker on `POST /kiri/wake`.
+    pub fn inspect_request(&self, first_request: &[u8], marker: Option<&Path>) -> GateDecision {
+        if !self.is_stopped() {
+            return GateDecision::Forward;
+        }
+        if is_wake_request(first_request) {
+            self.set(false, marker);
+            GateDecision::Wake
+        } else {
+            GateDecision::Refuse
+        }
+    }
+}
 
 /// What a client the engine cannot serve is told: why the bridge could not
 /// reach it, and what to do. A CLOSE with no reason says only what
@@ -141,5 +260,110 @@ mod tests {
         let began = Instant::now();
         assert!(!none.head(Duration::from_millis(100)));
         assert!(began.elapsed() >= Duration::from_millis(100));
+    }
+
+    #[test]
+    fn stopped_gate_persists_and_initializes_from_marker() {
+        let dir = std::env::temp_dir().join(format!("kiri-win-stopped-gate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let marker = dir.join("Kiri").join("stopped");
+
+        let gate = StoppedGate::new();
+        assert!(!gate.init_from(Some(&marker)));
+        assert!(!gate.is_stopped());
+
+        gate.set(true, Some(&marker));
+        assert!(gate.is_stopped());
+        assert!(marker.is_file());
+
+        // A fresh process sees the marker at startup without touching WSL.
+        let restarted = StoppedGate::new();
+        assert!(restarted.init_from(Some(&marker)));
+        assert!(restarted.is_stopped());
+
+        restarted.set(false, Some(&marker));
+        assert!(!restarted.is_stopped());
+        assert!(!marker.exists());
+
+        let after_start = StoppedGate::new();
+        assert!(!after_start.init_from(Some(&marker)));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stopped_gate_allows_wake_and_refuses_other_requests_with_503() {
+        let dir = std::env::temp_dir().join(format!("kiri-win-wake-gate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let marker = dir.join("Kiri").join("stopped");
+
+        // Request matcher coverage.
+        assert!(is_wake_request(b"POST /kiri/wake HTTP/1.1\r\nHost: kiri\r\n\r\n"));
+        assert!(is_wake_request(b"POST /kiri/wake HTTP/1.0\r\n\r\n"));
+        assert!(is_wake_request(b"POST /kiri/wake?from=cli HTTP/1.1\r\n\r\n"));
+        assert!(is_wake_request(b"POST /v1.47/kiri/wake HTTP/1.1\r\nHost: kiri\r\n\r\n"));
+        assert!(is_wake_request(b"POST /v1.24/kiri/wake?x=1 HTTP/1.1\r\n\r\n"));
+        assert!(!is_wake_request(b"GET /kiri/wake HTTP/1.1\r\n\r\n"));
+        assert!(!is_wake_request(b"HEAD /_ping HTTP/1.1\r\n\r\n"));
+        assert!(!is_wake_request(b"GET /_ping HTTP/1.1\r\n\r\n"));
+        assert!(!is_wake_request(b"GET /v1.47/containers/json HTTP/1.1\r\n\r\n"));
+        assert!(!is_wake_request(b"POST /containers/create HTTP/1.1\r\n\r\n"));
+        assert!(!is_wake_request(b"POST /kiri/stop HTTP/1.1\r\n\r\n"));
+        assert!(!is_wake_request(b"POST /kiri/wake/extra HTTP/1.1\r\n\r\n"));
+        assert!(!is_wake_request(b"POST /v/kiri/wake HTTP/1.1\r\n\r\n"));
+        assert!(!is_wake_request(b"POST /v./kiri/wake HTTP/1.1\r\n\r\n"));
+        assert!(!is_wake_request(b""));
+
+        let gate = StoppedGate::new();
+        // When running, everything forwards without refusal.
+        assert_eq!(gate.inspect_request(b"GET /_ping HTTP/1.1\r\n\r\n", Some(&marker)), GateDecision::Forward);
+
+        // Once stopped, ordinary Docker requests are refused with 503 STOPPED
+        // and leave the gate + marker intact.
+        gate.set(true, Some(&marker));
+        for req in [
+            b"GET /_ping HTTP/1.1\r\nHost: kiri\r\n\r\n".as_slice(),
+            b"HEAD /_ping HTTP/1.1\r\nHost: kiri\r\n\r\n".as_slice(),
+            b"GET /v1.47/containers/json HTTP/1.1\r\n\r\n".as_slice(),
+            b"POST /containers/create HTTP/1.1\r\n\r\n".as_slice(),
+            b"GET /kiri/wake HTTP/1.1\r\n\r\n".as_slice(),
+            b"".as_slice(),
+        ] {
+            assert_eq!(gate.inspect_request(req, Some(&marker)), GateDecision::Refuse);
+            assert!(gate.is_stopped());
+            assert!(marker.is_file());
+            let (head, body) = split(&refusal(is_head(req), STOPPED));
+            assert!(head.starts_with("HTTP/1.1 503 Service Unavailable\r\n"), "{head}");
+            if is_head(req) {
+                assert!(body.is_empty());
+            } else {
+                assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["message"], STOPPED);
+            }
+        }
+
+        // POST /kiri/wake clears the gate and removes the marker.
+        assert_eq!(gate.inspect_request(b"POST /kiri/wake HTTP/1.1\r\nHost: kiri\r\n\r\n", Some(&marker)), GateDecision::Wake);
+        assert!(!gate.is_stopped());
+        assert!(!marker.exists());
+
+        // Versioned POST /v1.47/kiri/wake also wakes and clears the marker.
+        gate.set(true, Some(&marker));
+        assert_eq!(gate.inspect_request(b"POST /v1.47/kiri/wake HTTP/1.1\r\nHost: kiri\r\n\r\n", Some(&marker)), GateDecision::Wake);
+        assert!(!gate.is_stopped());
+        assert!(!marker.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn terminate_target_only_allows_kiri_distro() {
+        assert_eq!(terminate_target(Some("kiri"), "kiri"), Some("kiri"));
+        assert_eq!(terminate_target(Some("Ubuntu"), "kiri"), None);
+        assert_eq!(terminate_target(Some("Ubuntu-26.04"), "kiri"), None);
+        assert_eq!(terminate_target(Some("Debian"), "kiri"), None);
+        assert_eq!(terminate_target(Some("kiri-linux"), "kiri"), None);
+        assert_eq!(terminate_target(Some("Kiri"), "kiri"), None);
+        assert_eq!(terminate_target(Some(""), "kiri"), None);
+        assert_eq!(terminate_target(None, "kiri"), None);
     }
 }

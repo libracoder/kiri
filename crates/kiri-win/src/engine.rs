@@ -151,13 +151,64 @@ fn state(name: &str, error: Option<&str>) -> String {
     .to_string()
 }
 
+/// Terminates Kiri's dedicated WSL distro (`kiri`) so `vmmemWSL` releases RAM
+/// when no other WSL distro is running. Never terminates a shared user distro
+/// (e.g. Ubuntu), which would kill unrelated WSL shells.
+fn terminate_kiri_distro() {
+    if let Some(d) = crate::refuse::terminate_target(distro().as_deref(), crate::setup::KIRI_DISTRO) {
+        crate::serve::log(&format!("engine: terminating WSL distro {d}"));
+        let mut cmd = crate::win::tool("wsl.exe");
+        std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x0800_0000);
+        if let Err(e) = crate::update::output_within(cmd.args(["--terminate", d]), crate::update::WSL_LIMIT) {
+            crate::serve::log(&format!("engine: wsl --terminate {d} failed: {e}"));
+        }
+    }
+}
+
+/// Emits stopped UI state and updates the tray menu directly without touching WSL.
+/// When `zero_vm` is true (on an explicit Stop transition from `"stopping"`),
+/// also emits a zeroed `vm` panel before `"stopped"` so counters clear immediately.
+fn emit_stopped(zero_vm: bool) {
+    RUNNING.lock().unwrap_or_else(PoisonError::into_inner).clear();
+    *STORAGE_RO_SHOWN.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    if zero_vm {
+        emit(json!({
+            "type": "vm",
+            "awake": false,
+            "target_mib": 0,
+            "ceiling_mib": 0,
+            "used_mib": 0,
+            "running": 0,
+            "cpus": 0,
+            "daemon_kib": 0,
+        })
+        .to_string());
+    }
+    emit(state("stopped", None));
+    Handle.set_menu(Menu { vm: "Stopped".into(), running: Vec::new() });
+}
+
+/// Called after an external `POST /kiri/wake` (for example `kiri start` from
+/// the CLI) wakes Kiri through the named pipe while `kiri-win` was stopped.
+pub(crate) fn on_external_wake() {
+    std::thread::spawn(|| send_windows_roots(true));
+    std::thread::spawn(send_windows_proxy);
+    std::thread::spawn(crate::update::catch_up_engine);
+    crate::wslconfig::sync_wsl_integration_soon();
+    crate::watch::notify_containers_changed();
+    crate::ports::notify();
+    send(Cmd::Refresh);
+}
+
 fn engine(rx: &Receiver<Cmd>, tx: Sender<Cmd>) {
     watch(tx);
     // Windows' proxy and root certificates for the daemon, now and every
     // minute.
     std::thread::spawn(|| loop {
-        send_windows_proxy();
-        send_windows_roots(false);
+        if !crate::serve::is_stopped() {
+            send_windows_proxy();
+            send_windows_roots(false);
+        }
         std::thread::sleep(Duration::from_secs(60));
     });
     let mut pending: Option<Cmd> = None;
@@ -170,19 +221,28 @@ fn engine(rx: &Receiver<Cmd>, tx: Sender<Cmd>) {
             Ok(Cmd::Start) => bring_up(false),
             Ok(Cmd::Launch) => bring_up(true),
             // Stop means off: every container stopped, the engine off until
-            // Start (nothing wakes it meanwhile), and this window's shares closed.
+            // Start (nothing wakes it meanwhile), this window's shares closed,
+            // and Kiri's dedicated WSL distro terminated so vmmemWSL frees RAM.
             Ok(Cmd::Stop) => {
                 emit(state("stopping", None));
                 sharing::close_all();
-                let stopped = match expect_ok(client::request("POST", "/kiri/stop", None)) {
-                    // An engine older than Stop: its sleep.
-                    Err(e) if e.to_string().contains("404") => expect_ok(client::request("POST", "/kiri/sleep", None)),
-                    r => r,
-                };
-                if let Err(e) = stopped {
-                    emit(notice("error", &e.to_string()));
+                if !crate::serve::is_stopped() {
+                    let stopped = match expect_ok(client::request("POST", "/kiri/stop", None)) {
+                        // An engine older than Stop: its sleep.
+                        Err(e) if e.to_string().contains("404") => expect_ok(client::request("POST", "/kiri/sleep", None)),
+                        r => r,
+                    };
+                    if let Err(e) = stopped {
+                        emit(notice("error", &e.to_string()));
+                    }
                 }
-                refresh();
+                crate::serve::set_stopped(true);
+                crate::serve::stop_bridge();
+                crate::relay::stop();
+                crate::ports::notify();
+                crate::watch::notify_containers_changed();
+                terminate_kiri_distro();
+                emit_stopped(true);
             }
             Ok(Cmd::Refresh) => {
                 // Events come in bursts (create, start, …): one refresh per
@@ -235,10 +295,12 @@ fn engine(rx: &Receiver<Cmd>, tx: Sender<Cmd>) {
             Ok(Cmd::About) => about(),
             Err(RecvTimeoutError::Disconnected) => return,
             Err(RecvTimeoutError::Timeout) => {
-                vm_panel();
                 emit_docker_state_if_changed();
-                if LISTED.lock().unwrap_or_else(|e| e.into_inner()).elapsed() >= LIST_EVERY {
-                    refresh();
+                if !crate::serve::is_stopped() {
+                    vm_panel();
+                    if LISTED.lock().unwrap_or_else(|e| e.into_inner()).elapsed() >= LIST_EVERY {
+                        refresh();
+                    }
                 }
             }
         }
@@ -249,7 +311,7 @@ fn engine(rx: &Receiver<Cmd>, tx: Sender<Cmd>) {
 /// the engine for a refresh. Reconnects when the daemon comes back.
 fn watch(tx: Sender<Cmd>) {
     let _ = std::thread::Builder::new().name("kiri-ui-events".into()).spawn(move || loop {
-        if client::alive_quick() {
+        if !crate::serve::is_stopped() && client::alive_quick() {
             if tx.send(Cmd::Refresh).is_err() {
                 return;
             }
@@ -297,6 +359,13 @@ pub(crate) fn path_escape(s: &str) -> String {
 /// Before, the hidden launch at login, and the window opening before the
 /// daemon was up, sent Start and so undid it (#394).
 fn bring_up(launch: bool) {
+    if launch && crate::serve::is_stopped() {
+        emit_stopped(false);
+        return;
+    }
+    if !launch {
+        crate::serve::set_stopped(false);
+    }
     // Up and stopped already: nothing to bring up, and no "booting" shown.
     if launch && client::alive_quick() && stopped() == Some(true) {
         return refresh();
@@ -311,7 +380,10 @@ fn bring_up(launch: bool) {
             std::thread::spawn(|| send_windows_roots(true));
             if woken {
                 std::thread::spawn(ensure_builder);
+                std::thread::spawn(send_windows_proxy);
             }
+            crate::watch::notify_containers_changed();
+            crate::ports::notify();
             refresh();
         }
         Err(e) => emit(state("stopped", Some(&e.to_string()))),
@@ -463,6 +535,10 @@ fn ensure_builder() {
 /// Sends the page every list, from the daemon.
 fn refresh() {
     *LISTED.lock().unwrap_or_else(|e| e.into_inner()) = std::time::Instant::now();
+    if crate::serve::is_stopped() {
+        emit_stopped(false);
+        return;
+    }
     let lists = (|| -> io::Result<Value> {
         // Quick: a refresh never holds the engine thread behind a start.
         let containers = client::get_quick("/containers/json?all=1")?;
@@ -501,6 +577,9 @@ static STORAGE_RO_SHOWN: Mutex<Option<String>> = Mutex::new(None);
 
 /// The sidebar's engine panel and the tray menu's state.
 fn vm_panel() {
+    if crate::serve::is_stopped() {
+        return;
+    }
     match client::get_quick("/info") {
         Ok(info) => {
             // A Linux host has no VM to put to sleep: it is always awake.

@@ -85,7 +85,7 @@ fn log_once(msg: String) {
 }
 
 fn current_distro_and_kiri() -> Option<(String, String)> {
-    if crate::storage::moving() || crate::storage::unavailable().is_some() {
+    if crate::serve::is_stopped() || crate::storage::moving() || crate::storage::unavailable().is_some() {
         return None;
     }
     // The bridge's distro, the engine's, or during setup the one setup just made.
@@ -168,6 +168,9 @@ fn start(distro: Option<String>, kiri: String) -> io::Result<Arc<Relay>> {
 fn ensure_relay(distro: String, kiri: String) -> Option<Arc<Relay>> {
     let distro = Some(distro);
     let mut slot = lock(&RELAY);
+    if crate::serve::is_stopped() {
+        return None;
+    }
     match slot.as_ref() {
         Some(r) if !r.dead.load(Ordering::SeqCst) && r.distro == distro && r.kiri == kiri => Some(r.clone()),
         old => {
@@ -193,6 +196,9 @@ fn ensure_relay(distro: String, kiri: String) -> Option<Arc<Relay>> {
 /// window) get `host.docker.internal` automatically. Non-blocking and throttled
 /// when a recent attempt just failed.
 pub fn ensure_started() {
+    if crate::serve::is_stopped() {
+        return;
+    }
     let Some((distro, kiri)) = current_distro_and_kiri() else {
         return;
     };
@@ -214,6 +220,16 @@ pub fn ensure_started() {
     });
 }
 
+/// Tears down the running host relay (`kiri hostrelay` in WSL) so no open
+/// `wsl.exe` keeps `vmmemWSL` alive after an explicit Stop.
+pub fn stop() {
+    let old = lock(&RELAY).take();
+    *lock(&LAST_START) = None;
+    if let Some(old) = old {
+        old.close();
+    }
+}
+
 /// Replaces the running host relay (e.g. after setup picks a distro or an
 /// engine update replaces `/usr/local/bin/kiri` in WSL).
 pub fn renew() {
@@ -233,6 +249,9 @@ pub fn renew() {
 /// starting the relay when it isn't running. Also ensures the `host.docker.internal`
 /// catch-all relay is active even when no proxy ports are configured.
 pub fn ports(targets: &[u16]) -> HashMap<u16, u16> {
+    if crate::serve::is_stopped() {
+        return HashMap::new();
+    }
     if targets.is_empty() {
         ensure_started();
         return HashMap::new();
