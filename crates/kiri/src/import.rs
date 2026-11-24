@@ -273,8 +273,12 @@ fn put_number(field: &mut [u8], v: u64) {
 
 /// A tar number field as written: octal, or base-256.
 fn get_number(field: &[u8]) -> Option<u64> {
-    if field[0] & 0x80 != 0 {
-        return Some(field[1..].iter().fold(0u64, |n, b| n << 8 | u64::from(*b)));
+    if field.first().copied()? & 0x80 != 0 {
+        let val = &field[1..];
+        if field[0] != 0x80 || val[..val.len().saturating_sub(8)].iter().any(|b| *b != 0) {
+            return None;
+        }
+        return Some(val[val.len().saturating_sub(8)..].iter().fold(0u64, |n, b| n << 8 | u64::from(*b)));
     }
     let text = String::from_utf8_lossy(field.split(|c| *c == 0).next().unwrap_or_default()).trim().to_owned();
     if text.is_empty() { Some(0) } else { u64::from_str_radix(&text, 8).ok() }
@@ -297,6 +301,52 @@ fn pax_records(data: &[u8]) -> Vec<(String, String)> {
     out
 }
 
+fn pax_record(k: &str, v: &str) -> Vec<u8> {
+    let rest = k.len() + v.len() + 3;
+    let mut n = rest + 1;
+    while rest + n.to_string().len() != n {
+        n = rest + n.to_string().len();
+    }
+    format!("{n} {k}={v}\n").into_bytes()
+}
+
+/// Rewrites `size` records in `data` to `new_size`, keeping every other pax
+/// record's raw bytes unchanged (including binary `SCHILY.xattr.*` values).
+fn rewrite_pax_size(data: &[u8], new_size: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len() + 16);
+    let mut rest = data;
+    let mut replaced = false;
+    while let Some(sp) = rest.iter().position(|b| *b == b' ') {
+        let Some(len) = std::str::from_utf8(&rest[..sp]).ok().and_then(|l| l.parse::<usize>().ok()).filter(|l| *l > sp + 1 && *l <= rest.len()) else { break };
+        let record = &rest[sp + 1..len];
+        let record = record.strip_suffix(b"\n").unwrap_or(record);
+        if record.iter().position(|b| *b == b'=').is_some_and(|eq| &record[..eq] == b"size") {
+            out.extend_from_slice(&pax_record("size", new_size));
+            replaced = true;
+        } else {
+            out.extend_from_slice(&rest[..len]);
+        }
+        rest = &rest[len..];
+    }
+    out.extend_from_slice(rest);
+    if !replaced {
+        out.extend_from_slice(&pax_record("size", new_size));
+    }
+    out
+}
+
+fn update_checksum(h: &mut [u8; 512]) {
+    h[148..156].fill(b' ');
+    let sum: u32 = h.iter().map(|b| u32::from(*b)).sum();
+    h[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+}
+
+fn write_small(to: &mut impl Write, h: &[u8; 512], data: &[u8]) -> io::Result<()> {
+    to.write_all(h)?;
+    to.write_all(data)?;
+    to.write_all(&[0u8; 512][..data.len().next_multiple_of(512) - data.len()])
+}
+
 /// Passes a tar stream from `from` to `to`, entry by entry. A pax header's
 /// size, uid and gid are written into the next entry's own header as well:
 /// `docker cp` puts a size of 8 GiB or more and an owner above 2097151 only
@@ -311,36 +361,62 @@ fn retar(mut from: impl Read, mut to: impl Write, name: Option<&str>) -> io::Res
     let mut h = [0u8; 512];
     // What a pax header said, for the entry after it.
     let mut pax: Vec<(String, String)> = Vec::new();
+    let mut pax_bytes = 0usize;
+    let mut pending_pax: Option<([u8; 512], Vec<u8>)> = None;
     loop {
         from.read_exact(&mut h).map_err(cut("a header, before the archive's end"))?;
         if h.iter().all(|b| *b == 0) {
+            if let Some((px_h, px_data)) = pending_pax.take() {
+                write_small(&mut to, &px_h, &px_data)?;
+            }
             to.write_all(&h)?;
             io::copy(&mut from, &mut to)?;
             return to.flush();
         }
+        if h[156] == b'x' {
+            if let Some((px_h, px_data)) = pending_pax.take() {
+                write_small(&mut to, &px_h, &px_data)?;
+            }
+            let size = get_number(&h[124..136]).ok_or_else(|| bad("a damaged header"))?;
+            let padded = size.checked_next_multiple_of(512).ok_or_else(|| bad("a damaged header"))?;
+            if size > 16 << 20 || pax_bytes.saturating_add(size as usize) > 16 << 20 {
+                return Err(bad("a header or manifest.json too large"));
+            }
+            let mut data = vec![0u8; padded as usize];
+            from.read_exact(&mut data).map_err(cut("a pax header"))?;
+            data.truncate(size as usize);
+            pax_bytes += data.len();
+            pax.extend(pax_records(&data));
+            pending_pax = Some((h, data));
+            continue;
+        }
         let mut changed = false;
         for (key, at) in [("size", 124..136), ("uid", 108..116), ("gid", 116..124)] {
-            if let Some(v) = pax.iter().find(|(k, _)| k == key).and_then(|(_, v)| v.parse::<u64>().ok()) {
+            if let Some(v) = pax.iter().rfind(|(k, _)| k == key).and_then(|(_, v)| v.parse::<u64>().ok()) {
                 put_number(&mut h[at], v);
                 changed = true;
             }
         }
-        pax.clear();
+        let pax_path = pax.iter().rfind(|(k, _)| k == "path").map(|(_, v)| v.clone());
         let size = get_number(&h[124..136]).ok_or_else(|| bad("a damaged header"))?;
-        let padded = size.div_ceil(512) * 512;
-        let manifest = name.is_some() && matches!(h[156], b'0' | 0) && text(&h[345..500]).is_empty() && text(&h[..100]).trim_start_matches("./") == "manifest.json";
-        let small = manifest || h[156] == b'x';
-        if small && size > 16 << 20 {
+        let padded = size.checked_next_multiple_of(512).ok_or_else(|| bad("a damaged header"))?;
+        let entry_path = match pax_path {
+            Some(p) => p,
+            None => match text(&h[345..500]) {
+                prefix if &h[257..263] == b"ustar\0" && !prefix.is_empty() => format!("{prefix}/{}", text(&h[..100])),
+                _ if text(&h[345..500]).is_empty() || &h[257..265] == b"ustar  \0" => text(&h[..100]),
+                _ => String::new(),
+            },
+        };
+        let manifest = name.is_some() && matches!(h[156], b'0' | 0) && entry_path.trim_start_matches("./") == "manifest.json";
+        if manifest && size > 16 << 20 {
             return Err(bad("a header or manifest.json too large"));
         }
         let mut data = Vec::new();
-        if small {
+        if manifest {
             data = vec![0u8; padded as usize];
-            from.read_exact(&mut data).map_err(cut(if manifest { "manifest.json" } else { "a pax header" }))?;
+            from.read_exact(&mut data).map_err(cut("manifest.json"))?;
             data.truncate(size as usize);
-        }
-        if h[156] == b'x' {
-            pax = pax_records(&data);
         }
         if let (true, Some(name)) = (manifest, name) {
             let mut m: Value = serde_json::from_slice(&data).map_err(|e| bad(&format!("manifest.json: {e}")))?;
@@ -354,18 +430,31 @@ fn retar(mut from: impl Read, mut to: impl Write, name: Option<&str>) -> io::Res
             data = serde_json::to_vec(&m).map_err(io::Error::other)?;
             put_number(&mut h[124..136], data.len() as u64);
             changed = true;
+            if let Some((mut px_h, mut px_data)) = pending_pax.take() {
+                let new_size = data.len().to_string();
+                if pax.iter().any(|(k, v)| k == "size" && v != &new_size) {
+                    px_data = rewrite_pax_size(&px_data, &new_size);
+                    put_number(&mut px_h[124..136], px_data.len() as u64);
+                    update_checksum(&mut px_h);
+                }
+                write_small(&mut to, &px_h, &px_data)?;
+            }
+        }
+        pax.clear();
+        pax_bytes = 0;
+        if let Some((px_h, px_data)) = pending_pax.take() {
+            write_small(&mut to, &px_h, &px_data)?;
         }
         if changed {
-            h[148..156].fill(b' ');
-            let sum: u32 = h.iter().map(|b| u32::from(*b)).sum();
-            h[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+            update_checksum(&mut h);
         }
-        to.write_all(&h)?;
-        if small {
-            to.write_all(&data)?;
-            to.write_all(&vec![0u8; data.len().div_ceil(512) * 512 - data.len()])?;
-        } else if io::copy(&mut (&mut from).take(padded), &mut to)? != padded {
-            return Err(bad("cut off inside a file's body"));
+        if manifest {
+            write_small(&mut to, &h, &data)?;
+        } else {
+            to.write_all(&h)?;
+            if io::copy(&mut (&mut from).take(padded), &mut to)? != padded {
+                return Err(bad("cut off inside a file's body"));
+            }
         }
     }
 }
@@ -1140,8 +1229,12 @@ fn read_one(ctx: &str, id: &str, path: &str, held: &std::sync::atomic::AtomicU64
         cp.stop();
         return Ok(Read1::Dir(bytes));
     }
-    let padded = entry.size.div_ceil(512) * 512;
-    if entry.size > READ_AHEAD_FILE || held.fetch_add(padded, Ordering::Relaxed) + padded > READ_AHEAD_TOTAL {
+    if entry.size > READ_AHEAD_FILE {
+        cp.stop();
+        return Ok(Read1::Later);
+    }
+    let padded = entry.size.next_multiple_of(512);
+    if held.fetch_add(padded, Ordering::Relaxed).saturating_add(padded) > READ_AHEAD_TOTAL {
         cp.stop();
         return Ok(Read1::Later);
     }
@@ -1168,7 +1261,7 @@ fn read_paths(ctx: &str, id: &str, path: &str, out: &mut dyn Write, whole: bool)
             cp.stop();
             return Ok(());
         }
-        let padded = entry.size.div_ceil(512) * 512;
+        let padded = entry.size.checked_next_multiple_of(512).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "tar stream: a damaged header"))?;
         let mut body = (&mut cp.out).take(padded);
         let copied = io::copy(&mut body, out)?;
         if copied != padded {
@@ -1285,7 +1378,7 @@ fn read_entry(r: &mut dyn Read) -> io::Result<Option<TarEntry>> {
             if size > 16 << 20 {
                 return Err(bad("a header too large"));
             }
-            let mut data = vec![0u8; (size.div_ceil(512) * 512) as usize];
+            let mut data = vec![0u8; size.next_multiple_of(512) as usize];
             r.read_exact(&mut data).map_err(|e| if e.kind() == io::ErrorKind::UnexpectedEof { bad("cut off inside a header") } else { e })?;
             data.truncate(size as usize);
             match h[156] {
@@ -1319,6 +1412,7 @@ fn read_entry(r: &mut dyn Read) -> io::Result<Option<TarEntry>> {
             }
             _ => true,
         });
+        size.checked_next_multiple_of(512).ok_or_else(|| bad("a damaged header"))?;
         return Ok(Some(TarEntry { header: h, pax, name, link, size }));
     }
 }
@@ -1357,7 +1451,7 @@ fn write_entry(out: &mut dyn Write, e: &TarEntry, name: &str, link: &str) -> io:
         h[345..500].fill(0);
     }
     for (key, at) in [("size", 124..136), ("uid", 108..116), ("gid", 116..124)] {
-        if let Some(v) = pax.iter().find(|(k, _)| k == key).and_then(|(_, v)| v.parse::<u64>().ok()) {
+        if let Some(v) = pax.iter().rfind(|(k, _)| k == key).and_then(|(_, v)| v.parse::<u64>().ok()) {
             put_number(&mut h[at], v);
         }
     }
@@ -1365,17 +1459,12 @@ fn write_entry(out: &mut dyn Write, e: &TarEntry, name: &str, link: &str) -> io:
     if !pax.is_empty() {
         let mut data = Vec::new();
         for (k, v) in &pax {
-            let rest = k.len() + v.len() + 3;
-            let mut len = rest + 1;
-            while rest + len.to_string().len() != len {
-                len = rest + len.to_string().len();
-            }
-            data.extend_from_slice(format!("{len} {k}={v}\n").as_bytes());
+            data.extend_from_slice(&pax_record(k, v));
         }
         let mut x = plain_header(b'x', "././@PaxHeader", data.len() as u64, 0o644);
         put_checksum(&mut x);
         out.write_all(&x)?;
-        data.resize(data.len().div_ceil(512) * 512, 0);
+        data.resize(data.len().next_multiple_of(512), 0);
         out.write_all(&data)?;
     }
     out.write_all(&h)
@@ -1410,9 +1499,7 @@ fn put_text(field: &mut [u8], s: &str) {
 }
 
 fn put_checksum(h: &mut [u8; 512]) {
-    h[148..156].fill(b' ');
-    let sum: u32 = h.iter().map(|b| u32::from(*b)).sum();
-    h[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+    update_checksum(h);
 }
 
 /// An entry's body, padded to whole blocks, from `from` to `to`.
@@ -2579,6 +2666,265 @@ mod tests {
             ]),
             "2 items could not be imported:\n  container db: missing bind\n  container web: unknown error"
         );
+    }
+
+    #[test]
+    fn updates_pax_size_for_manifest_and_keeps_raw_pax_when_unchanged() {
+        let name = "ghcr.io/o/r@sha256:49dbca2bb9fc8e48bfc2cc5e039c0e867ca32012f6c739d07b8b0ad603b0d9c8";
+        let manifest = br#"[{"Config":"blobs/sha256/cc","RepoTags":null,"Layers":["blobs/sha256/aa"]}]"#;
+        let entry = |prefix: &[u8], path: &[u8], typeflag: u8, body: &[u8]| {
+            let mut h = [0u8; 512];
+            h[..path.len()].copy_from_slice(path);
+            h[345..345 + prefix.len()].copy_from_slice(prefix);
+            super::put_number(&mut h[100..108], 0o644);
+            super::put_number(&mut h[124..136], body.len() as u64);
+            h[156] = typeflag;
+            h[257..263].copy_from_slice(b"ustar\0");
+            h[263..265].copy_from_slice(b"00");
+            super::update_checksum(&mut h);
+            let mut out = Vec::new();
+            super::write_small(&mut out, &h, body).unwrap();
+            out
+        };
+        let assert_valid_checksums = |tar_bytes: &[u8]| {
+            for block in tar_bytes.chunks_exact(512).filter(|b| b.iter().any(|c| *c != 0) && &b[257..263] == b"ustar\0") {
+                let mut check: [u8; 512] = block.try_into().unwrap();
+                let got = check[148..156].to_vec();
+                super::update_checksum(&mut check);
+                assert_eq!(got, check[148..156]);
+            }
+        };
+
+        // 1. PAX header with `size`, `mtime`, `path=./manifest.json`, and raw binary xattr:
+        //    rewrites `size` + header size + checksum while keeping binary xattr bytes intact,
+        //    and leaves the following `index.json` entry aligned.
+        let bin_xattr = b"29 SCHILY.xattr.user.bin=\x00\xff\xfe\n";
+        assert_eq!(bin_xattr.len(), 29);
+        let mut pax = Vec::new();
+        pax.extend_from_slice(&super::pax_record("mtime", "1700000000.5"));
+        pax.extend_from_slice(bin_xattr);
+        pax.extend_from_slice(&super::pax_record("path", "./manifest.json"));
+        pax.extend_from_slice(&super::pax_record("size", &manifest.len().to_string()));
+        let mut input = entry(b"", b"PaxHeader/manifest", b'x', &pax);
+        input.extend_from_slice(&entry(b"", b"truncated_name", b'0', manifest));
+        input.extend_from_slice(&entry(b"", b"index.json", b'0', b"{}"));
+        input.extend_from_slice(&[0u8; 1024]);
+
+        let mut out = Vec::new();
+        super::retar(input.as_slice(), &mut out, Some(name)).unwrap();
+        assert_valid_checksums(&out);
+
+        let pax_len = super::get_number(&out[124..136]).unwrap() as usize;
+        let pax_payload = &out[512..512 + pax_len];
+        assert!(pax_payload.windows(bin_xattr.len()).any(|w| w == bin_xattr), "raw binary xattr preserved");
+        assert!(out[512 + pax_len..1024].iter().all(|b| *b == 0));
+        let recs = super::pax_records(pax_payload);
+        let pax_size: usize = recs.iter().rfind(|(k, _)| k == "size").unwrap().1.parse().unwrap();
+        let ustar_size = super::get_number(&out[1024 + 124..1024 + 136]).unwrap() as usize;
+        assert_eq!(pax_size, ustar_size);
+        assert!(pax_size > manifest.len());
+        let m: serde_json::Value = serde_json::from_slice(&out[1536..1536 + pax_size]).unwrap();
+        assert_eq!(m[0]["RepoTags"], serde_json::json!([name]));
+        let next_hdr = 1536 + pax_size.next_multiple_of(512);
+        assert_eq!(&out[next_hdr..next_hdr + 11], b"index.json\0");
+        assert_eq!(&out[next_hdr + 512..next_hdr + 514], b"{}");
+
+        #[cfg(not(windows))]
+        {
+            let mut seen = Vec::new();
+            for e in tar::Archive::new(out.as_slice()).entries().unwrap() {
+                let mut e = e.unwrap();
+                let p = e.path().unwrap().to_string_lossy().into_owned();
+                let mut body = Vec::new();
+                std::io::Read::read_to_end(&mut e, &mut body).unwrap();
+                seen.push((p, body));
+            }
+            assert_eq!(seen.len(), 2);
+            assert_eq!(seen[0].0.trim_start_matches("./"), "manifest.json");
+            let parsed: serde_json::Value = serde_json::from_slice(&seen[0].1).unwrap();
+            assert_eq!(parsed[0]["RepoTags"], serde_json::json!([name]));
+            assert_eq!(seen[1], ("index.json".to_owned(), b"{}".to_vec()));
+        }
+
+        // 2. PAX header WITHOUT `size` on `manifest.json` (matched via USTAR prefix `.` + `manifest.json`
+        //    when no PAX `path` is set): raw PAX header & payload stay byte-for-byte unchanged.
+        let mut pax_no_size = Vec::new();
+        pax_no_size.extend_from_slice(&super::pax_record("mtime", "1700000000.25"));
+        pax_no_size.extend_from_slice(bin_xattr);
+        let raw_pax_blocks = entry(b"", b"PaxHeader/manifest.json", b'x', &pax_no_size);
+        let mut input2 = raw_pax_blocks.clone();
+        input2.extend_from_slice(&entry(b".", b"manifest.json", b'0', manifest));
+        input2.extend_from_slice(&[0u8; 1024]);
+        let mut out2 = Vec::new();
+        super::retar(input2.as_slice(), &mut out2, Some(name)).unwrap();
+        assert_eq!(&out2[..raw_pax_blocks.len()], raw_pax_blocks.as_slice(), "PAX header untouched when no size record");
+        let ustar_size2 = super::get_number(&out2[1024 + 124..1024 + 136]).unwrap() as usize;
+        let m2: serde_json::Value = serde_json::from_slice(&out2[1536..1536 + ustar_size2]).unwrap();
+        assert_eq!(m2[0]["RepoTags"], serde_json::json!([name]));
+
+        // 3. PAX `size` already matches rewritten `manifest.json` length: raw PAX bytes stay untouched.
+        let already = serde_json::to_vec(&serde_json::json!([{"Config":"blobs/sha256/cc","Layers":["blobs/sha256/aa"],"RepoTags":[name]}])).unwrap();
+        let mut pax_same = Vec::new();
+        pax_same.extend_from_slice(bin_xattr);
+        pax_same.extend_from_slice(&super::pax_record("size", &already.len().to_string()));
+        let same_pax_blocks = entry(b"", b"PaxHeader/manifest.json", b'x', &pax_same);
+        let mut input3 = same_pax_blocks.clone();
+        input3.extend_from_slice(&entry(b"", b"manifest.json", b'0', &already));
+        input3.extend_from_slice(&[0u8; 1024]);
+        let mut out3 = Vec::new();
+        super::retar(input3.as_slice(), &mut out3, Some(name)).unwrap();
+        assert_eq!(&out3[..same_pax_blocks.len()], same_pax_blocks.as_slice(), "PAX header untouched when size unchanged");
+    }
+
+    #[test]
+    fn pax_rfind_precedence_and_consecutive_x_headers() {
+        let name = "ghcr.io/o/r@sha256:49dbca2bb9fc8e48bfc2cc5e039c0e867ca32012f6c739d07b8b0ad603b0d9c8";
+        let manifest = br#"[{"Config":"blobs/sha256/cc","RepoTags":null,"Layers":["blobs/sha256/aa"]}]"#;
+        let entry = |path: &[u8], typeflag: u8, size_override: Option<u64>, body: &[u8]| {
+            let mut h = [0u8; 512];
+            h[..path.len()].copy_from_slice(path);
+            super::put_number(&mut h[100..108], 0o644);
+            super::put_number(&mut h[124..136], size_override.unwrap_or(body.len() as u64));
+            h[156] = typeflag;
+            h[257..263].copy_from_slice(b"ustar\0");
+            h[263..265].copy_from_slice(b"00");
+            super::update_checksum(&mut h);
+            let mut out = Vec::new();
+            super::write_small(&mut out, &h, body).unwrap();
+            out
+        };
+
+        // 1. Duplicate keys in one PAX header: last `size`, `uid`, `gid`, and `path` win (`rfind`).
+        let mut dup_pax = Vec::new();
+        dup_pax.extend_from_slice(&super::pax_record("size", "99999"));
+        dup_pax.extend_from_slice(&super::pax_record("size", "5"));
+        dup_pax.extend_from_slice(&super::pax_record("uid", "111"));
+        dup_pax.extend_from_slice(&super::pax_record("uid", "3000000"));
+        dup_pax.extend_from_slice(&super::pax_record("gid", "222"));
+        dup_pax.extend_from_slice(&super::pax_record("gid", "3000001"));
+        dup_pax.extend_from_slice(&super::pax_record("path", "manifest.json"));
+        dup_pax.extend_from_slice(&super::pax_record("path", "sub/manifest.json"));
+        let mut input = entry(b"manifest.json", b'x', None, &dup_pax);
+        // Even though USTAR says `manifest.json` and the first PAX `path` said `manifest.json`,
+        // the last PAX `path` is `sub/manifest.json`, so `retar` must NOT parse `hello` as JSON.
+        input.extend_from_slice(&entry(b"manifest.json", b'0', Some(0), b"hello"));
+        input.extend_from_slice(&[0u8; 1024]);
+        let mut out = Vec::new();
+        super::retar(input.as_slice(), &mut out, Some(name)).unwrap();
+        let file_hdr = &out[1024..1536];
+        assert_eq!(super::get_number(&file_hdr[124..136]), Some(5));
+        assert_eq!(super::get_number(&file_hdr[108..116]), Some(3_000_000));
+        assert_eq!(super::get_number(&file_hdr[116..124]), Some(3_000_001));
+        assert_eq!(&out[1536..1541], b"hello");
+
+        // 2. Consecutive `'x'` headers before `manifest.json`, plus trailing `'x'` before EOF:
+        //    first `'x'` carries `path` + `size` + `uid=100`, second `'x'` overrides `uid=3000002`
+        //    and has no `size` of its own; both `'x'` headers are emitted and the second gets the
+        //    updated `size` so downstream PAX readers see the rewritten manifest length.
+        let mut pax1 = Vec::new();
+        pax1.extend_from_slice(&super::pax_record("path", "other.txt"));
+        pax1.extend_from_slice(&super::pax_record("path", "manifest.json"));
+        pax1.extend_from_slice(&super::pax_record("uid", "100"));
+        pax1.extend_from_slice(&super::pax_record("gid", "3000005"));
+        pax1.extend_from_slice(&super::pax_record("size", &manifest.len().to_string()));
+        let mut pax2 = Vec::new();
+        pax2.extend_from_slice(&super::pax_record("uid", "3000002"));
+        pax2.extend_from_slice(&super::pax_record("mtime", "1700000001"));
+        let orphan_pax = super::pax_record("comment", "trailing-before-eof");
+
+        let x1 = entry(b"PaxHeader/1", b'x', None, &pax1);
+        let x2 = entry(b"PaxHeader/2", b'x', None, &pax2);
+        let x_eof = entry(b"PaxHeader/eof", b'x', None, &orphan_pax);
+        let mut input2 = Vec::new();
+        input2.extend_from_slice(&x1);
+        input2.extend_from_slice(&x2);
+        input2.extend_from_slice(&entry(b"ignored", b'0', Some(0), manifest));
+        input2.extend_from_slice(&x_eof);
+        input2.extend_from_slice(&[0u8; 1024]);
+
+        let mut out2 = Vec::new();
+        super::retar(input2.as_slice(), &mut out2, Some(name)).unwrap();
+        // First `'x'` flushed intact at offset 0.
+        assert_eq!(&out2[..1024], x1.as_slice());
+        // Second `'x'` at offset 1024 carries the updated `size` overriding `x1`.
+        let pax2_len = super::get_number(&out2[1024 + 124..1024 + 136]).unwrap() as usize;
+        let recs2 = super::pax_records(&out2[1536..1536 + pax2_len]);
+        let updated_size: usize = recs2.iter().rfind(|(k, _)| k == "size").unwrap().1.parse().unwrap();
+        // Manifest USTAR header at offset 2048 has overridden uid from `x2`, gid from `x1`, and updated size.
+        let mh = &out2[2048..2560];
+        assert_eq!(super::get_number(&mh[108..116]), Some(3_000_002));
+        assert_eq!(super::get_number(&mh[116..124]), Some(3_000_005));
+        assert_eq!(super::get_number(&mh[124..136]), Some(updated_size as u64));
+        let m: serde_json::Value = serde_json::from_slice(&out2[2560..2560 + updated_size]).unwrap();
+        assert_eq!(m[0]["RepoTags"], serde_json::json!([name]));
+        // Orphan `'x'` before EOF is flushed intact right before the 1024-byte zero trailer.
+        let orphan_off = 2560 + updated_size.next_multiple_of(512);
+        assert_eq!(&out2[orphan_off..orphan_off + 1024], x_eof.as_slice());
+        assert_eq!(&out2[orphan_off + 1024..], &[0u8; 1024]);
+
+        // Also verify `read_entry` resolves consecutive `'x'` headers + rewritten `size` cleanly.
+        let mut reader = out2.as_slice();
+        let e = super::read_entry(&mut reader).unwrap().unwrap();
+        assert_eq!(e.name, "manifest.json");
+        assert_eq!(e.size, updated_size as u64);
+    }
+
+    #[test]
+    fn rejects_malformed_base256_and_overflow_tar_headers() {
+        assert_eq!(super::get_number(&[]), None);
+        assert_eq!(super::get_number(&[0x80, 0, 0, 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]), Some(u64::MAX));
+        assert_eq!(super::get_number(&[0x80, 0, 0, 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe, 0x00]), Some(u64::MAX - 511));
+        for bad_num in [
+            [0xff; 12],
+            [0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            [0x81, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            [0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            [0x80, 0, 0, 1, 0, 0, 0, 0, 0, 0, 2, 0],
+            [0x80, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        ] {
+            assert_eq!(super::get_number(&bad_num), None, "{bad_num:?}");
+        }
+
+        // Damaged / overflowing base-256 sizes on both `'0'` and `'x'` headers fail cleanly
+        // without wrapping `padded` to 0.
+        for typeflag in [b'0', b'x'] {
+            for bad in [
+                // u64::MAX and u64::MAX - 510: valid u64, overflows `checked_next_multiple_of(512)`
+                [0x80, 0, 0, 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+                [0x80, 0, 0, 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe, 0x01],
+                // Negative base-256 (`field[0] != 0x80`)
+                [0xff; 12],
+                [0x81, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                // >64-bit positive base-256
+                [0x80, 0, 0, 1, 0, 0, 0, 0, 0, 0, 2, 0],
+            ] {
+                let mut raw = vec![0u8; 1536];
+                raw[..4].copy_from_slice(b"bad\0");
+                raw[124..136].copy_from_slice(&bad);
+                raw[156] = typeflag;
+                raw[257..263].copy_from_slice(b"ustar\0");
+                raw[263..265].copy_from_slice(b"00");
+                super::update_checksum(raw[..512].as_mut().try_into().unwrap());
+                let err = super::retar(raw.as_slice(), &mut Vec::new(), None).unwrap_err();
+                assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{typeflag:?} {bad:?}: {err}");
+                let mut r = raw.as_slice();
+                assert!(super::read_entry(&mut r).is_err(), "read_entry {typeflag:?} {bad:?}");
+            }
+        }
+
+        // Overflowing size supplied via a PAX `size` record (`u64::MAX`) is also rejected.
+        let pax_overflow = super::pax_record("size", &u64::MAX.to_string());
+        let mut px_h = super::plain_header(b'x', "PaxHeader/overflow", pax_overflow.len() as u64, 0o644);
+        super::update_checksum(&mut px_h);
+        let mut f_h = super::plain_header(b'0', "overflow.bin", 0, 0o644);
+        super::update_checksum(&mut f_h);
+        let mut stream = Vec::new();
+        super::write_small(&mut stream, &px_h, &pax_overflow).unwrap();
+        stream.extend_from_slice(&f_h);
+        stream.extend_from_slice(&[0u8; 1024]);
+        assert_eq!(super::retar(stream.as_slice(), &mut Vec::new(), None).unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+        let mut sr = stream.as_slice();
+        assert!(super::read_entry(&mut sr).is_err());
     }
 
 }
