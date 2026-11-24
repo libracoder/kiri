@@ -1866,6 +1866,21 @@ t update-memory "268435456" bash -c "$D update --memory 256m lim >/dev/null && $
 t update-cpus "200000 100000" bash -c "$D update --cpus 2 lim >/dev/null && $D exec lim cat /sys/fs/cgroup/cpu.max"
 t update-kept "268435456" bash -c "$D restart -t 1 lim >/dev/null && $D exec lim cat /sys/fs/cgroup/memory.max"
 t update-restart-policy "always" bash -c "$D update --restart always lim >/dev/null && $D inspect -f '{{.HostConfig.RestartPolicy.Name}}' lim"
+t restart-policy-refused "update=1 policy=no run=125" bash -c "
+  $D rm -f lim-restart lim-negative-restart >/dev/null 2>&1
+  $D create --name lim-restart alpine true >/dev/null || exit 1
+  $D update --restart bogus lim-restart
+  update=\$?
+  policy=\$($D inspect -f '{{.HostConfig.RestartPolicy.Name}}' lim-restart)
+  run_error=\$($D run --name lim-negative-restart --restart on-failure:-1 alpine true 2>&1)
+  run=\$?
+  $D rm -f lim-restart lim-negative-restart >/dev/null 2>&1
+  case \"\$run_error\" in
+    *'maximum retry count cannot be negative'*) ;;
+    *) echo \"\$run_error\"; exit 1 ;;
+  esac
+  echo \"update=\$update policy=\$policy run=\$run\"
+"
 t limit-memory-swap-update "201326592:335544320:ok 201326592:335544320:ok 201326592:-1:ok 268435456:-1:ok" bash -c "
   $D rm -f lim-sw >/dev/null 2>&1
   $D run -d --name lim-sw --memory 128m alpine sleep 60 >/dev/null

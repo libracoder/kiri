@@ -328,3 +328,4 @@ load-oci-no-platform	#465	loading a multi-platform OCI archive for an absent pla
 load-oci-buildx	#465	docker buildx build --output type=oci archives use io.containerd.image.name for the full image name while org.opencontainers.image.ref.name holds only the tag
 crates/kiri/src/share.rs	#207	Share mutex locks panicked on poisoning under panic=abort, traffic/state writes used shared .tmp names without create_new/0600 or Ended serialization, and sharing a non-localhost target gave no warning
 crates/kiri-init/src/linux/mod.rs	#207	with panic=abort, a panic in PID 1 or the host agent aborted silently without writing its message and location directly to stderr from a stack buffer
+restart-policy-refused	#841	docker update stored unknown restart policies or enabled restarts on AutoRemove containers, and container create/update accepted negative or non-on-failure MaximumRetryCount values

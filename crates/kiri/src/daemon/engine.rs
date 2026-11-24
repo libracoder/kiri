@@ -4811,6 +4811,11 @@ impl Engine {
         let running = {
             let mut st = self.lock();
             let c = st.containers.get_mut(&id).ok_or_else(|| gone(&id))?;
+            if c.spec.auto_remove && restart.as_ref().is_some_and(|r| r.name != "no") {
+                return Err(Error::Conflict(format!(
+                    "Cannot update container {id}: Restart policy cannot be updated because AutoRemove is enabled for the container"
+                )));
+            }
             c.spec.limits = limits;
             if let Some(r) = restart {
                 c.spec.restart = r;

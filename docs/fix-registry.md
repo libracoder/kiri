@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #841 API: refuse invalid restart policies on create and update (unreleased)
+- Fixes: no issue
+- Caused: none known
+- Caused by: -
+- Check: `restart-policy-refused`
+
 ### #575 CLI: Kiri bundles Docker Compose 5.8.0 (unreleased)
 - Fixes: no issue
 - Caused: none known
