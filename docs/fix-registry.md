@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #743 CLI: `kiri --help` lists only commands compiled for this OS (unreleased)
+- Fixes: #743 Linux: `kiri --help` lists macOS-only commands (`setup`, `update`, `import`, `bench`, `boot`) that immediately fail
+- Caused: none known
+- Caused by: -
+- Check: `crates/kiri/src/main.rs`
+
 ### Build: serve digest-pinned local bases, relay default-bridge stub DNS, and support host-network builds (unreleased)
 - Fixes: #209 Windows: docker build hangs when a RUN step needs network (BuildKit has no usable DNS); #288 BuildKit fails to resolve digest-pinned FROM image already pulled into Kiri's image store; #330 Linux: containers have no DNS on the default bridge; Compose/BuildKit builds can't resolve a digest-pinned base; bun install gets ConnectionRefused
 - Caused: none known

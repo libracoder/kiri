@@ -306,3 +306,4 @@ crates/kiri/src/wsl.rs	#761	running kiri.exe diag report [--out PATH] on Windows
 dns-default-bridge-stub	#330	on a Linux host whose /etc/resolv.conf names only 127.0.0.53 (systemd-resolved), default-bridge containers got 1.1.1.1 instead of querying the host stub through the bridge gateway over UDP and TCP
 build-pinned-digest	#288	a digest-pinned FROM image (@sha256:...) already pulled into Kiri's store was re-serialized instead of served with its upstream manifest and index bytes, failing BuildKit's digest check (#330)
 build-host-network-dns	#209	build steps under docker build and docker build --network=host (or a host-network builder) could not resolve names through a loopback stub resolver on the host (#330)
+crates/kiri/src/main.rs	#743	kiri --help listed commands not compiled for the current OS (such as macOS-only setup, import, bench and boot on Linux, or Linux-only bridge on macOS)

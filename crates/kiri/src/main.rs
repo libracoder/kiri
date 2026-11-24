@@ -86,31 +86,175 @@ mod tools;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod update;
 
-const USAGE: &str = "\
-usage: kiri COMMAND          docker's commands, on Kiri: kiri run, ps, exec,
-                             logs, stop, rm, images, pull, build, compose…
-       kiri start                 start Kiri after a Stop (the window's Start)
-       kiri daemon
-       kiri bridge [--socket PATH]   (WSL2: the end of kiri-win.exe)
-       kiri ui [--start] [--view containers|images|volumes|networks]
-       kiri setup [--use] [--no-agent] | kiri setup --uninstall
-       kiri build-with [docker|kiri]   which builder docker build uses
-       kiri domains [set [--http N] [--https N] | reset]   the *.kiri.local routers' ports
-       kiri registry [insecure|mirror] [list | add X... | remove X...]   daemon.json's insecure registries and Docker Hub mirrors
-       kiri scan [--json] [--history] <image>   known vulnerabilities in an image, found by Grype
-       kiri update [--check]      update Kiri (with a container: docker's update)
-       kiri diag logs [-f] [--ui|--engine|--cli] [--errors] [-n N]
-       kiri diag report [--out PATH] [--send]   (a file to send us, tokens taken out)
-       kiri PORT [NAME]           share a local port on the internet (same as kiri share PORT)
-       kiri share PORT|CONTAINER [--name N] | share login | logout | status
-       kiri k8s start [--use] | stop | status | delete | set [--lan on|off] [--tls-san NAME,…] [--port N]
-       kiri usb [list] | attach DEVICE | detach DEVICE   USB devices for containers, beta (Mac: pass through to the VM)
-       kiri machine create NAME [--distro D] | list | shell NAME | stop | delete NAME
-       kiri import [orbstack | desktop-linux] [--list | [--force] [image|volume|container NAME]]
-       kiri bench [--runs N] [--image IMAGE] [--network none|bridge]
-       kiri boot [--console] [--pings N]
-       kiri raw run [--rm] [-e KEY=VALUE]... IMAGE [COMMAND...]   (its own guest, no daemon)
-       kiri raw pull <image> | raw images | raw rmi <image>...";
+const USAGE_LINES: &[&str] = &[
+    "usage: kiri COMMAND          docker's commands, on Kiri: kiri run, ps, exec,",
+    "                             logs, stop, rm, images, pull, build, compose…",
+    "       kiri start                 start Kiri after a Stop (the window's Start)",
+    #[cfg(unix)]
+    "       kiri daemon",
+    #[cfg(target_os = "linux")]
+    "       kiri bridge [--socket PATH]   (WSL2: the end of kiri-win.exe)",
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    "       kiri ui [--start] [--view containers|images|volumes|networks|builds]",
+    #[cfg(target_os = "macos")]
+    "       kiri setup [--use] [--no-agent] | kiri setup --uninstall",
+    #[cfg(unix)]
+    "       kiri build-with [docker|kiri]   which builder docker build uses",
+    "       kiri domains [set [--http N] [--https N] | reset]   the *.kiri.local routers' ports",
+    "       kiri registry [insecure|mirror] [list | add X... | remove X...]   daemon.json's insecure registries and Docker Hub mirrors",
+    "       kiri scan [--json] [--history] <image>   known vulnerabilities in an image, found by Grype",
+    #[cfg(target_os = "macos")]
+    "       kiri update [--check]      update Kiri (with a container: docker's update)",
+    #[cfg(target_os = "linux")]
+    "       kiri update --check        check for a newer Kiri (with a container: docker's update)",
+    "       kiri diag logs [-f] [--ui|--engine|--cli] [--errors] [-n N]",
+    "       kiri diag report [--out PATH] [--send]   (a file to send us, tokens taken out)",
+    "       kiri PORT [NAME]           share a local port on the internet (same as kiri share PORT)",
+    "       kiri share PORT|CONTAINER [--name N] | share login | logout | status",
+    "       kiri k8s start [--use] | stop | status | delete | set [--lan on|off] [--tls-san NAME,…] [--port N]",
+    "       kiri usb [list] | attach DEVICE | detach DEVICE   USB devices for containers, beta (Mac: pass through to the VM)",
+    "       kiri machine create NAME [--distro D] | list | shell NAME | stop | delete NAME",
+    #[cfg(target_os = "macos")]
+    "       kiri import [orbstack | desktop-linux] [--list | [--force] [image|volume|container NAME]]",
+    #[cfg(target_os = "macos")]
+    "       kiri bench [--runs N] [--image IMAGE] [--network none|bridge]",
+    #[cfg(target_os = "macos")]
+    "       kiri boot [--console] [--pings N]",
+    #[cfg(unix)]
+    "       kiri raw run [--rm] [-e KEY=VALUE]... IMAGE [COMMAND...]   (its own guest, no daemon)",
+    #[cfg(unix)]
+    "       kiri raw pull <image> | raw images | raw rmi <image>...",
+];
+
+fn usage() -> String {
+    USAGE_LINES.join("\n")
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Command<'a> {
+    #[cfg(unix)]
+    Daemon(&'a [String]),
+    #[cfg(target_os = "linux")]
+    Bridge(&'a [String]),
+    #[cfg(target_os = "linux")]
+    HostRelay,
+    #[cfg(target_os = "linux")]
+    HostAccess(&'a [String]),
+    #[cfg(unix)]
+    RawRun(&'a [String]),
+    #[cfg(unix)]
+    RawPull(&'a [String]),
+    #[cfg(unix)]
+    RawImages(&'a [String]),
+    #[cfg(unix)]
+    RawRmi(&'a [String]),
+    #[cfg(target_os = "macos")]
+    Bench(&'a [String]),
+    #[cfg(target_os = "macos")]
+    Boot(&'a [String]),
+    #[cfg(target_os = "macos")]
+    Setup(&'a [String]),
+    #[cfg(any(unix, windows))]
+    Share(&'a [String]),
+    #[cfg(unix)]
+    Start,
+    #[cfg(windows)]
+    Start(&'a [String]),
+    #[cfg(unix)]
+    BuildWith(&'a [String]),
+    #[cfg(unix)]
+    Domains(&'a [String]),
+    #[cfg(unix)]
+    Registry(&'a [String]),
+    #[cfg(unix)]
+    Scan(&'a [String]),
+    #[cfg(unix)]
+    K8s(&'a [String]),
+    #[cfg(unix)]
+    Machine(&'a [String]),
+    #[cfg(unix)]
+    Usb(&'a [String]),
+    #[cfg(target_os = "macos")]
+    Import(&'a [String]),
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    Update(&'a [String]),
+    #[cfg(unix)]
+    Diag(&'a [String]),
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    Ui(&'a [String]),
+    #[cfg(any(unix, windows))]
+    Docker(&'a [String]),
+    #[cfg(windows)]
+    Wsl(&'a [String]),
+}
+
+impl<'a> Command<'a> {
+    fn parse(args: &'a [String]) -> Option<Command<'a>> {
+        match args.first().map(String::as_str) {
+            #[cfg(unix)]
+            Some("daemon") => Some(Command::Daemon(&args[1..])),
+            #[cfg(target_os = "linux")]
+            Some("bridge") => Some(Command::Bridge(&args[1..])),
+            #[cfg(target_os = "linux")]
+            Some("hostrelay") => Some(Command::HostRelay),
+            #[cfg(target_os = "linux")]
+            Some("host-access") => Some(Command::HostAccess(&args[1..])),
+            #[cfg(unix)]
+            Some("raw") => match args.get(1).map(String::as_str) {
+                Some("run") => Some(Command::RawRun(&args[2..])),
+                Some("pull") => Some(Command::RawPull(&args[2..])),
+                Some("images") => Some(Command::RawImages(&args[2..])),
+                Some("rmi") => Some(Command::RawRmi(&args[2..])),
+                _ => None,
+            },
+            #[cfg(target_os = "macos")]
+            Some("bench") => Some(Command::Bench(&args[1..])),
+            #[cfg(target_os = "macos")]
+            Some("boot") => Some(Command::Boot(&args[1..])),
+            #[cfg(target_os = "macos")]
+            Some("setup") => Some(Command::Setup(&args[1..])),
+            #[cfg(any(unix, windows))]
+            Some("share") => Some(Command::Share(&args[1..])),
+            // `kiri 3000`: share a port straight away.
+            #[cfg(any(unix, windows))]
+            Some(a) if share::is_shorthand(a) => Some(Command::Share(args)),
+            // Bare: the window's Start (`kiri start NAME` is docker's start).
+            #[cfg(unix)]
+            Some("start") if args.len() == 1 => Some(Command::Start),
+            // On Windows, by the `kiri` in WSL, once kiri-start has the daemon up.
+            #[cfg(windows)]
+            Some("start") if args.len() == 1 => Some(Command::Start(args)),
+            #[cfg(unix)]
+            Some("build-with") => Some(Command::BuildWith(&args[1..])),
+            #[cfg(unix)]
+            Some("domains") => Some(Command::Domains(&args[1..])),
+            #[cfg(unix)]
+            Some("registry") => Some(Command::Registry(&args[1..])),
+            #[cfg(unix)]
+            Some("scan") => Some(Command::Scan(&args[1..])),
+            #[cfg(unix)]
+            Some("k8s") => Some(Command::K8s(&args[1..])),
+            #[cfg(unix)]
+            Some("machine") => Some(Command::Machine(&args[1..])),
+            #[cfg(unix)]
+            Some("usb") => Some(Command::Usb(&args[1..])),
+            #[cfg(target_os = "macos")]
+            Some("import") => Some(Command::Import(&args[1..])),
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            Some("update") if !docker::is_container_update(&args[1..]) => Some(Command::Update(&args[1..])),
+            #[cfg(unix)]
+            Some("diag") => Some(Command::Diag(&args[1..])),
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            Some("ui") => Some(Command::Ui(args)),
+            #[cfg(any(unix, windows))]
+            Some(c) if docker::handles(c) => Some(Command::Docker(args)),
+            // Windows: the engine's commands, by the `kiri` in WSL.
+            #[cfg(windows)]
+            Some(c) if wsl::COMMANDS.contains(&c) => Some(Command::Wsl(args)),
+            _ => None,
+        }
+    }
+}
 
 fn main() -> ExitCode {
     flavor::init();
@@ -127,91 +271,82 @@ fn main() -> ExitCode {
         None if setup::launched_from_app() => diag::Part::Ui,
         _ => diag::Part::Cli,
     });
-    let result: std::io::Result<()> = match args.first().map(String::as_str) {
+    let result: std::io::Result<()> = match Command::parse(&args) {
         #[cfg(unix)]
-        Some("daemon") => daemon::run(&args[1..]),
+        Some(Command::Daemon(rest)) => daemon::run(rest),
         #[cfg(target_os = "linux")]
-        Some("bridge") => bridge::run(&args[1..]),
+        Some(Command::Bridge(rest)) => bridge::run(rest),
         #[cfg(target_os = "linux")]
-        Some("hostrelay") => hostrelay::run(),
+        Some(Command::HostRelay) => hostrelay::run(),
         // Linux hosts: what the window's onboarding needs root for (through pkexec).
         #[cfg(target_os = "linux")]
-        Some("host-access") => match hostaccess::run(&args[1..]) {
+        Some(Command::HostAccess(rest)) => match hostaccess::run(rest) {
             Ok(code) => return ExitCode::from(code),
             Err(e) => Err(e),
         },
         #[cfg(unix)]
-        Some("raw") => match args.get(1).map(String::as_str) {
-            Some("run") => run::run(&args[2..]),
-            Some("pull") => images::pull(&args[2..]),
-            Some("images") => images::list(&args[2..]),
-            Some("rmi") => images::remove(&args[2..]),
-            _ => {
-                eprintln!("{USAGE}");
-                return ExitCode::FAILURE;
-            }
-        },
-        #[cfg(target_os = "macos")]
-        Some("bench") => bench::run(&args[1..]),
-        #[cfg(target_os = "macos")]
-        Some("boot") => boot::run(&args[1..]),
-        #[cfg(target_os = "macos")]
-        Some("setup") => setup::run(&args[1..]),
-        #[cfg(any(unix, windows))]
-        Some("share") => share::run(&args[1..]),
-        // `kiri 3000`: share a port straight away.
-        #[cfg(any(unix, windows))]
-        Some(a) if share::is_shorthand(a) => share::run(&args),
-        // Bare: the window's Start (`kiri start NAME` is docker's start).
+        Some(Command::RawRun(rest)) => run::run(rest),
         #[cfg(unix)]
-        Some("start") if args.len() == 1 => engine_start(),
-        // On Windows, by the `kiri` in WSL, once kiri-start has the daemon up.
+        Some(Command::RawPull(rest)) => images::pull(rest),
+        #[cfg(unix)]
+        Some(Command::RawImages(rest)) => images::list(rest),
+        #[cfg(unix)]
+        Some(Command::RawRmi(rest)) => images::remove(rest),
+        #[cfg(target_os = "macos")]
+        Some(Command::Bench(rest)) => bench::run(rest),
+        #[cfg(target_os = "macos")]
+        Some(Command::Boot(rest)) => boot::run(rest),
+        #[cfg(target_os = "macos")]
+        Some(Command::Setup(rest)) => setup::run(rest),
+        #[cfg(any(unix, windows))]
+        Some(Command::Share(rest)) => share::run(rest),
+        #[cfg(unix)]
+        Some(Command::Start) => engine_start(),
         #[cfg(windows)]
-        Some("start") if args.len() == 1 => wsl::run(&args),
+        Some(Command::Start(all)) => wsl::run(all),
         #[cfg(unix)]
-        Some("build-with") => buildwith::cli(&args[1..]),
+        Some(Command::BuildWith(rest)) => buildwith::cli(rest),
         #[cfg(unix)]
-        Some("domains") => domains_cli::run(&args[1..]),
+        Some(Command::Domains(rest)) => domains_cli::run(rest),
         #[cfg(unix)]
-        Some("registry") => registry_cli::run(&args[1..]),
+        Some(Command::Registry(rest)) => registry_cli::run(rest),
         #[cfg(unix)]
-        Some("scan") => scan_cli::run(&args[1..]),
+        Some(Command::Scan(rest)) => scan_cli::run(rest),
         #[cfg(unix)]
-        Some("k8s") => k8s::run(&args[1..]),
+        Some(Command::K8s(rest)) => k8s::run(rest),
         #[cfg(unix)]
-        Some("machine") => machine::run(&args[1..]),
+        Some(Command::Machine(rest)) => machine::run(rest),
         #[cfg(unix)]
-        Some("usb") => usb::run(&args[1..]),
+        Some(Command::Usb(rest)) => usb::run(rest),
         #[cfg(target_os = "macos")]
-        Some("import") => import::run(&args[1..]),
+        Some(Command::Import(rest)) => import::run(rest),
         #[cfg(any(target_os = "macos", target_os = "linux"))]
-        Some("update") if !docker::is_container_update(&args[1..]) => update::run(&args[1..]),
+        Some(Command::Update(rest)) => update::run(rest),
         #[cfg(unix)]
-        Some("diag") => diag::run(&args[1..]),
-        // Opening Kiri.app: set up on first launch, then the window.
-        #[cfg(target_os = "macos")]
-        None if setup::launched_from_app() => {
-            setup::first_launch();
-            ui::run(true, None)
-        }
+        Some(Command::Diag(rest)) => diag::run(rest),
         #[cfg(any(target_os = "macos", all(target_os = "linux", feature = "window")))]
-        Some("ui") => ui::run(
-            args.iter().any(|a| a == "--start"),
-            args.iter().position(|a| a == "--view").and_then(|i| args.get(i + 1)).cloned(),
+        Some(Command::Ui(all)) => ui::run(
+            all.iter().any(|a| a == "--start"),
+            all.iter().position(|a| a == "--view").and_then(|i| all.get(i + 1)).cloned(),
         ),
         // The static engine has no window: the package's own build of it.
         #[cfg(all(target_os = "linux", not(feature = "window")))]
-        Some("ui") => window(&args),
+        Some(Command::Ui(all)) => window(all),
         #[cfg(any(unix, windows))]
-        Some(c) if docker::handles(c) => {
+        Some(Command::Docker(all)) => {
             engine_version_check();
-            docker::run(&args)
+            docker::run(all)
         }
-        // Windows: the engine's commands, by the `kiri` in WSL.
         #[cfg(windows)]
-        Some(c) if wsl::COMMANDS.contains(&c) => wsl::run(&args),
-        _ => {
-            eprintln!("{USAGE}");
+        Some(Command::Wsl(all)) => wsl::run(all),
+        // Opening Kiri.app: set up on first launch, then the window.
+        #[cfg(target_os = "macos")]
+        None if args.is_empty() && setup::launched_from_app() => {
+            setup::first_launch();
+            ui::run(true, None)
+        }
+        None => {
+            eprintln!("{}", usage());
             return ExitCode::FAILURE;
         }
     };
@@ -294,11 +429,138 @@ fn engine_version_check() {
 
 #[cfg(test)]
 mod tests {
-    use super::USAGE;
+    use super::{Command, usage};
+
+    fn parse(words: &[&str]) -> Option<Vec<String>> {
+        let args: Vec<String> = words.iter().map(|s| (*s).to_owned()).collect();
+        Command::parse(&args)?;
+        Some(args)
+    }
+
+    fn advertised_subcommands(help: &str) -> Vec<&str> {
+        help.lines()
+            .filter_map(|line| line.strip_prefix("usage: ").unwrap_or(line).trim_start().strip_prefix("kiri "))
+            .filter_map(|rest| rest.split_whitespace().next())
+            .collect()
+    }
 
     #[test]
     fn usage_lists_scan_command() {
-        assert!(USAGE.contains("kiri scan [--json] [--history] <image>"));
-        assert!(!USAGE.ends_with('\n'));
+        let help = usage();
+        assert!(help.contains("kiri scan [--json] [--history] <image>"));
+        assert!(!help.ends_with('\n'));
+    }
+
+    #[test]
+    fn usage_lists_only_commands_for_this_os() {
+        let help = usage();
+        let cmds = advertised_subcommands(&help);
+        for common in ["COMMAND", "start", "domains", "registry", "scan", "diag", "PORT", "share", "k8s", "usb", "machine"] {
+            assert!(cmds.contains(&common), "help missing `{common}`:\n{help}");
+        }
+        #[cfg(unix)]
+        {
+            for unix_cmd in ["daemon", "ui", "build-with", "update", "raw"] {
+                assert!(cmds.contains(&unix_cmd), "unix help missing `{unix_cmd}`:\n{help}");
+            }
+            assert!(
+                help.contains("kiri ui [--start] [--view containers|images|volumes|networks|builds]"),
+                "unix help missing `kiri ui` views (including builds):\n{help}"
+            );
+        }
+        #[cfg(target_os = "macos")]
+        {
+            for mac_cmd in ["setup", "update", "import", "bench", "boot"] {
+                assert!(cmds.contains(&mac_cmd), "macOS help missing `{mac_cmd}`:\n{help}");
+            }
+            assert!(help.contains("kiri update [--check]"), "macOS help missing `kiri update [--check]`:\n{help}");
+            assert!(!cmds.contains(&"bridge"), "macOS help must not list Linux-only `bridge`:\n{help}");
+        }
+        #[cfg(target_os = "linux")]
+        {
+            assert!(cmds.contains(&"bridge"), "Linux help missing `bridge`:\n{help}");
+            assert!(cmds.contains(&"update"), "Linux help missing `update`:\n{help}");
+            assert!(help.contains("kiri update --check"), "Linux help missing `kiri update --check`:\n{help}");
+            assert!(!help.contains("kiri update [--check]"), "Linux help must not list macOS `kiri update [--check]`:\n{help}");
+            for mac_cmd in ["setup", "import", "bench", "boot"] {
+                assert!(!cmds.contains(&mac_cmd), "Linux help must not list macOS-only `{mac_cmd}`:\n{help}");
+            }
+        }
+        #[cfg(windows)]
+        {
+            for unix_or_mac in ["daemon", "bridge", "ui", "setup", "build-with", "update", "import", "bench", "boot", "raw"] {
+                assert!(!cmds.contains(&unix_or_mac), "Windows help must not list `{unix_or_mac}`:\n{help}");
+            }
+        }
+    }
+
+    #[test]
+    fn every_advertised_command_dispatches_in_main() {
+        let help = usage();
+        let mut count = 0;
+        for line in help.lines() {
+            let Some(rest) = line.strip_prefix("usage: ").unwrap_or(line).trim_start().strip_prefix("kiri ") else {
+                continue;
+            };
+            let mut words = rest.split_whitespace();
+            let subcmd = words.next().expect("subcommand after `kiri `");
+            count += 1;
+            match subcmd {
+                "COMMAND" => {
+                    let args = ["run".to_owned()];
+                    assert!(matches!(Command::parse(&args), Some(Command::Docker(_))));
+                }
+                "PORT" => {
+                    let args = ["3000".to_owned()];
+                    assert!(matches!(Command::parse(&args), Some(Command::Share(_))));
+                }
+                "raw" => {
+                    for part in rest.split('|') {
+                        let mut p = part.split_whitespace();
+                        if p.next() == Some("raw") {
+                            let verb = p.next().expect("verb after `raw`");
+                            let args = ["raw".to_owned(), verb.to_owned()];
+                            let parsed = Command::parse(&args);
+                            assert!(
+                                parsed.is_some() && !matches!(parsed, Some(Command::Docker(_))),
+                                "`kiri raw {verb}` advertised in usage has no dispatch arm in main"
+                            );
+                        }
+                    }
+                }
+                other => {
+                    let args = [other.to_owned()];
+                    let parsed = Command::parse(&args);
+                    assert!(
+                        parsed.is_some() && !matches!(parsed, Some(Command::Docker(_))),
+                        "`kiri {other}` advertised in usage has no dispatch arm in main"
+                    );
+                }
+            }
+        }
+        assert!(count > 0);
+        assert!(parse(&["--help"]).is_none());
+        assert!(parse(&["-h"]).is_none());
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        for args in [
+            vec!["update".to_owned()],
+            vec!["update".to_owned(), "--check".to_owned()],
+            vec!["update".to_owned(), "--help".to_owned()],
+            vec!["update".to_owned(), "-h".to_owned()],
+        ] {
+            assert!(matches!(Command::parse(&args), Some(Command::Update(_))), "expected Command::Update for {args:?}");
+        }
+        let container_update = ["update".to_owned(), "--memory".to_owned(), "256m".to_owned(), "web".to_owned()];
+        assert!(matches!(Command::parse(&container_update), Some(Command::Docker(_))));
+        #[cfg(target_os = "macos")]
+        assert!(parse(&["bridge"]).is_none());
+        #[cfg(target_os = "linux")]
+        for mac_cmd in ["setup", "import", "bench", "boot"] {
+            assert!(parse(&[mac_cmd]).is_none(), "`kiri {mac_cmd}` should not dispatch on Linux");
+        }
+        #[cfg(windows)]
+        for unix_cmd in ["daemon", "bridge", "ui", "setup", "build-with", "import", "bench", "boot", "raw"] {
+            assert!(parse(&[unix_cmd]).is_none(), "`kiri {unix_cmd}` should not dispatch on Windows");
+        }
     }
 }
