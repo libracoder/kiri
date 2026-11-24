@@ -1617,6 +1617,36 @@ t layer-dir-times-edges "deep=1000000000 n1=1000000001 n24=1000000024 two=100030
 # The times stay through docker cp out, docker commit and a run of the commit.
 t layer-dir-times-cp-out "1000300000 two 1000100000 two/f1" bash -c "id=\$($D create $LT:dirs) && $D cp \$id:/two - | python3 -c 'import sys,tarfile; [print(int(m.mtime), m.name) for m in tarfile.open(fileobj=sys.stdin.buffer,mode=\"r|\")]' | sort -k2 | tr '\n' ' '; $D rm \$id >/dev/null"
 t layer-dir-times-commit "1000000000 /cd 1100000000 /two 1000000001 /deep/n1" bash -c "$D rm -f e2e-ltc >/dev/null 2>&1; $D run --name e2e-ltc $LT:dirs sh -c 'mkdir /cd && touch -d @1000000000 /cd && echo x > /two/f3 && touch -d @1100000000 /two' && $D commit e2e-ltc $LT:dirs-committed >/dev/null && $D run --rm $LT:dirs-committed stat -c '%Y %n' /cd /two /deep/n1 | tr '\n' ' '; $D rm -f e2e-ltc >/dev/null"
+# Opening a committed lower-layer file O_WRONLY copies it up to a new ext4
+# inode on the upper layer; the guest kernel clears STATX_BTIME on overlayfs
+# so creationTime() callers (OpenJDK 22+ / Elasticsearch node.lock, #412) fall
+# back to mtime and never see btime jump across copy-up.
+only mac t overlay-copyup-btime "btime-ok" bash -c "$D rm -f e2e-btime-seed >/dev/null 2>&1; $D rmi kiri-test/btime:1 >/dev/null 2>&1; $D run --name e2e-btime-seed python:3.13-alpine python -c 'import os; os.close(os.open(\"/node.lock\", os.O_CREAT | os.O_WRONLY, 0o644)); os.utime(\"/node.lock\", (1700000000, 1700000000))' && $D commit e2e-btime-seed kiri-test/btime:1 >/dev/null && $D rm -f e2e-btime-seed >/dev/null && out=\$($D run --rm kiri-test/btime:1 python -c 'import ctypes, os, platform, struct, time
+nr = {\"aarch64\": 291, \"x86_64\": 332}[platform.machine()]
+libc = ctypes.CDLL(None, use_errno=True)
+libc.syscall.argtypes = [ctypes.c_long, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint, ctypes.c_uint, ctypes.c_void_p]
+libc.syscall.restype = ctypes.c_long
+def sx(dfd, p, fl):
+    b = ctypes.create_string_buffer(256)
+    r = libc.syscall(nr, dfd, p, fl, 0xfff, b)
+    assert r == 0, (r, ctypes.get_errno())
+    m, = struct.unpack_from(\"<I\", b, 0x00)
+    ino, = struct.unpack_from(\"<Q\", b, 0x20)
+    bt = struct.unpack_from(\"<qI\", b, 0x50)
+    mt = struct.unpack_from(\"<qI\", b, 0x70)
+    dev = struct.unpack_from(\"<II\", b, 0x88)
+    assert (m & 0x7ff) == 0x7ff and ino > 0, (hex(m), ino)
+    return m & 0x800, bt, mt, (dev, ino)
+b1 = sx(-100, b\"/node.lock\", 0)
+time.sleep(0.1)
+fd = os.open(\"/node.lock\", os.O_WRONLY)
+b2 = sx(-100, b\"/node.lock\", 0)
+b3 = sx(fd, b\"\", 0x1000)
+os.close(fd)
+os.close(os.open(\"/upper.lock\", os.O_CREAT | os.O_WRONLY, 0o644))
+os.utime(\"/upper.lock\", (1700000001, 1700000001))
+bu = sx(-100, b\"/upper.lock\", 0)
+print(\"btime-ok\" if b1 == b2 == b3 and b1[:3] == (0, (0, 0), (1700000000, 0)) and bu[:3] == (0, (0, 0), (1700000001, 0)) else (b1, b2, b3, bu))'); $D rmi kiri-test/btime:1 >/dev/null 2>&1; echo \"\$out\""
 # Images of 59 to 125 layers start, with their top and lowest layers in the
 # container (#253: from 60 the overlay's options did not fit in a page). The
 # 125-layer one is also the next check's.

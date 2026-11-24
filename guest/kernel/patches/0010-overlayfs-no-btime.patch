@@ -1,0 +1,32 @@
+# Header: Overlayfs copies up a lower file by creating a fresh inode on the
+# upper ext4 filesystem and copying mode, owner and mtime/atime with VFS
+# setattr, which cannot set creation time (btime). A statx(STATX_BTIME) before
+# and after opening an image-layer file for writing therefore sees btime jump
+# from the unpacked layer's time to the time of copy-up. OpenJDK 22+ reads
+# BasicFileAttributes.creationTime() from STATX_BTIME and falls back to mtime
+# when STATX_BTIME is absent from stx_mask; Lucene's NativeFSLockFactory
+# (Elasticsearch 8.19+ on a committed image's node.lock, #412) checks
+# creationTime() before and after opening the lock file for writing and aborts
+# with "Underlying file changed by an external force" when btime shifts.
+# Clear STATX_BTIME in ovl_getattr() (statx(2) defines it as optional) so
+# overlayfs never reports an unstable underlying btime and callers fall back
+# to mtime, which copy-up preserves.
+--- a/fs/overlayfs/inode.c
++++ b/fs/overlayfs/inode.c
+@@ -173,6 +173,16 @@
+ 	err = vfs_getattr_nosec(&realpath, stat, request_mask, flags);
+ 	if (err)
+ 		goto out;
++
++	/*
++	 * Copy-up creates a fresh upper inode whose creation time (btime) is
++	 * the time of copy-up rather than the lower file's, as VFS setattr
++	 * cannot set btime. Clear STATX_BTIME so callers such as OpenJDK's
++	 * BasicFileAttributes.creationTime() fall back to mtime, which copy-up
++	 * preserves (#412).
++	 */
++	stat->result_mask &= ~STATX_BTIME;
++	stat->btime = (struct timespec64){};
+ 
+ 	/* Report the effective immutable/append-only STATX flags */
+ 	generic_fill_statx_attr(inode, stat);
