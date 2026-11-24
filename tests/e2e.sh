@@ -1530,7 +1530,29 @@ python3 "$(dirname "$0")/hardlink-image.py" "$IMD/hl.tar" kiri-test/hl:abs /bin/
 python3 "$(dirname "$0")/hardlink-image.py" "$IMD/hl-esc.tar" kiri-test/hl:esc /../../etc/hostname
 t load-hardlink-absolute "hello from tool" bash -c "$D load -q -i $IMD/hl.tar >/dev/null && id=\$($D create kiri-test/hl:abs) && $D cp \$id:/bin/tool-1.0 - | tar -xO; $D rm \$id >/dev/null"
 t load-hardlink-escape "escapes the layer" bash -c "$D load -q -i $IMD/hl-esc.tar >/dev/null && $D create kiri-test/hl:esc"
-$D rmi kiri-test/alp:v1 kiri-test/hl:abs kiri-test/hl:esc >/dev/null 2>&1; rm -rf "$IMD"
+# OCI image layouts (index.json + blobs/sha256/...) from skopeo/buildx:
+# tagged via org.opencontainers.image.ref.name or io.containerd.image.name,
+# untagged digest-only, nested multi-platform indexes with platform selection,
+# and fast-path verification when blobs already exist in the store (#465, #782).
+$D save -o "$IMD/alp-oci-src.tar" alpine >/dev/null
+python3 "$(dirname "$0")/oci-image.py" "$IMD/alp-oci-src.tar" "$IMD/oci-ref.tar" ref kiri-test/oci-ref:1
+python3 "$(dirname "$0")/oci-image.py" "$IMD/alp-oci-src.tar" "$IMD/oci-untagged.tar" untagged
+python3 "$(dirname "$0")/oci-image.py" "$IMD/alp-oci-src.tar" "$IMD/oci-multi.tar" multi kiri-test/oci-multi:1
+python3 "$(dirname "$0")/oci-image.py" "$IMD/alp-oci-src.tar" "$IMD/oci-tampered.tar" tampered kiri-test/oci-bad:1
+t load-oci-ref "Loaded image: kiri-test/oci-ref:1" $D load -i "$IMD/oci-ref.tar"
+t load-oci-ref-runs "3." $D run --rm kiri-test/oci-ref:1 cat /etc/alpine-release
+t load-oci-untagged "Loaded image ID: sha256:" bash -c "out=\$($D load -i $IMD/oci-untagged.tar); echo \"\$out\"; id=\${out##*Loaded image ID: }; id=\${id%%[[:space:]]*}; [ -n \"\$id\" ] && $D rmi \"\$id\" >/dev/null 2>&1 || true"
+code load-oci-tampered 1 $D load -i "$IMD/oci-tampered.tar"
+t load-oci-native "Loaded image: kiri-test/oci-multi:1" $D load -i "$IMD/oci-multi.tar"
+t load-oci-platform "linux/amd64" bash -c "curl -s -X POST --unix-socket '$SOCK' 'http://localhost/v1.47/images/load?platform=linux%2Famd64' --data-binary @'$IMD/oci-multi.tar' | grep -q 'Loaded image: kiri-test/oci-multi:1' && $D image inspect -f '{{.Os}}/{{.Architecture}}' kiri-test/oci-multi:1"
+t load-oci-platform-json "linux/arm64" bash -c "curl -s -X POST --unix-socket '$SOCK' 'http://localhost/v1.47/images/load?platform=%7B%22architecture%22%3A%22arm64%22%2C%22os%22%3A%22linux%22%7D' --data-binary @'$IMD/oci-multi.tar' | grep -q 'Loaded image: kiri-test/oci-multi:1' && $D image inspect -f '{{.Os}}/{{.Architecture}}' kiri-test/oci-multi:1"
+t load-oci-no-platform "not found" curl -s -X POST --unix-socket "$SOCK" 'http://localhost/v1.47/images/load?platform=linux%2Fs390x' --data-binary @"$IMD/oci-multi.tar"
+printf 'FROM %s/alpine:latest\nRUN echo oci-works > /msg\nCMD ["cat","/msg"]\n' "$KIRI_REG" > "$IMD/Dockerfile"
+needs buildx t load-oci-buildx "Loaded image: kiri-test/oci-bx:1" bash -c "cd '$IMD' && BUILDX_BUILDER='$BX' perl -e 'alarm 300; exec @ARGV' docker buildx build --output type=oci,dest='$IMD/bx.tar' -t kiri-test/oci-bx:1 . >/dev/null 2>&1 && $D load -i '$IMD/bx.tar'"
+needs buildx t load-oci-buildx-runs "oci-works" $D run --rm kiri-test/oci-bx:1
+needs buildx t load-oci-buildx-multi "Loaded image: kiri-test/oci-bxm:1" bash -c "cd '$IMD' && BUILDX_BUILDER='$BX' perl -e 'alarm 300; exec @ARGV' docker buildx build --platform linux/amd64,linux/arm64 --output type=oci,dest='$IMD/bx-multi.tar' -t kiri-test/oci-bxm:1 . >/dev/null 2>&1 && tar -tf '$IMD/bx-multi.tar' | grep -qF index.json && $D load -i '$IMD/bx-multi.tar'"
+needs buildx t load-oci-buildx-multi-runs "oci-works" $D run --rm kiri-test/oci-bxm:1
+$D rmi kiri-test/alp:v1 kiri-test/hl:abs kiri-test/hl:esc kiri-test/oci-ref:1 kiri-test/oci-multi:1 kiri-test/oci-bx:1 kiri-test/oci-bxm:1 >/dev/null 2>&1; rm -rf "$IMD"
 
 section "image layers: times, many layers, links, special files"
 # Images made by tests/layer-image.py: alpine's layers and crafted ones, all

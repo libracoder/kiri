@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #465 Images: load OCI image-layout archives and verify existing content-addressed blobs in memory (unreleased)
+- Fixes: #465 Load OCI image-layout archives (`index.json` + `blobs/sha256/...`) in `docker load`
+- Caused: none known
+- Caused by: -
+- Check: `load-oci-ref`, `load-oci-ref-runs`, `load-oci-untagged`, `load-oci-tampered`, `load-oci-native`, `load-oci-platform`, `load-oci-platform-json`, `load-oci-no-platform`, `load-oci-buildx`, `load-oci-buildx-runs`, `load-oci-buildx-multi`, `load-oci-buildx-multi-runs`
+
 ### #764 Linux: discard published ports for `--network host` containers at runtime so container listeners don't fail with `EADDRINUSE` (unreleased)
 - Fixes: #764 Linux: `ports` are applied with `network_mode: host`, so the container's listener fails with EADDRINUSE
 - Caused: none known

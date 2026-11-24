@@ -318,3 +318,11 @@ crates/kiri/src/client.rs	#836	Linux client socket discovery missed WSL 2 integr
 crates/kiri/src/daemon/mod.rs	#836	non-root kiri daemon on Linux bound ~/.kiri/run/docker.sock instead of failing fast, and sudo kiri daemon did not fall back to the kiri group, grant SUDO_UID POSIX ACL access, or link /run/docker.sock when free
 crates/kiri/src/docker.rs	#836	kiri docker subcommands reported socket permission errors and Linux/WSL not-running errors with the macOS `kiri daemon` message instead of OS-accurate guidance
 hostnet-ports-discarded	#764	on a Linux host, a container with network_mode: host and published ports bound host port forwarders in the shared host netns, causing the container's own listener to fail with EADDRINUSE and populating NetworkSettings.Ports instead of {}
+load-oci-ref	#465	docker load rejected OCI image-layout archives (index.json + blobs/sha256/...) with "no manifest.json"
+load-oci-untagged	#465	untagged digest-only OCI image-layout archives had no tag annotation and needed to load by config digest ID
+load-oci-tampered	#782	loading an archive whose blobs/sha256/<hex> path already existed in the store could bypass or corrupt content verification if tampered bytes matched the stored size
+load-oci-native	#465	multi-platform nested OCI index archives needed host-platform resolution and io.containerd.image.name annotation handling
+load-oci-platform	#465	POST /images/load?platform=... did not select the requested platform from a multi-platform OCI index
+load-oci-platform-json	#465	Docker API v1.48 sends platform as a JSON-encoded ocispec.Platform object on POST /images/load
+load-oci-no-platform	#465	loading a multi-platform OCI archive for an absent platform needed an explicit error rather than loading another arch or attestation manifest
+load-oci-buildx	#465	docker buildx build --output type=oci archives use io.containerd.image.name for the full image name while org.opencontainers.image.ref.name holds only the tag

@@ -780,14 +780,53 @@ fn image_tag(req: &Request, engine: &Engine, source: &str) -> Result<(), Error> 
     Ok(())
 }
 
+fn platform_value(v: &Value) -> Option<Platform> {
+    if let Some(s) = v.as_str() {
+        return Platform::parse(s);
+    }
+    let arch = v["architecture"].as_str().filter(|s| !s.is_empty())?;
+    let os = v["os"].as_str().filter(|s| !s.is_empty()).unwrap_or("linux");
+    Platform::parse(&format!("{os}/{arch}"))
+}
+
+/// Platforms asked for by `POST /images/load?platform=...`, accepting both
+/// Kiri/plain `os/arch` strings and Docker API v1.48 JSON `ocispec.Platform`
+/// objects or arrays.
+fn parse_load_platforms(req: &Request) -> Result<Vec<Platform>, Error> {
+    let mut out = Vec::new();
+    for raw in req.queries("platform").filter(|p| !p.is_empty()) {
+        let trimmed = raw.trim();
+        if trimmed.starts_with('[') {
+            let list: Vec<Value> = serde_json::from_str(trimmed).map_err(|_| Error::BadRequest(format!("invalid platform: {raw}")))?;
+            for item in list {
+                out.push(platform_value(&item).ok_or_else(|| Error::BadRequest(format!("invalid platform: {raw}")))?);
+            }
+        } else if trimmed.starts_with('{') {
+            let v: Value = serde_json::from_str(trimmed).map_err(|_| Error::BadRequest(format!("invalid platform: {raw}")))?;
+            out.push(platform_value(&v).ok_or_else(|| Error::BadRequest(format!("invalid platform: {raw}")))?);
+        } else {
+            out.push(Platform::parse(trimmed).ok_or_else(|| Error::BadRequest(format!("invalid platform: {raw}")))?);
+        }
+    }
+    Ok(out)
+}
+
 /// `docker load`: an image archive, plain or gzip- or zstd-compressed as Docker
 /// accepts it, streamed into the store.
 fn image_load(req: &Request, engine: &Engine, w: &mut UnixStream, r: &mut BufReader<UnixStream>) -> io::Result<Next> {
     use std::io::Read;
     let mut body = http::Body::new(req, r);
+    let platforms = match parse_load_platforms(req) {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = io::copy(&mut body, &mut io::sink());
+            error_closing(w, e)?;
+            return Ok(Next::Close);
+        }
+    };
     let mut head = Vec::with_capacity(6);
     (&mut body).take(6).read_to_end(&mut head)?;
-    let loaded = upload_reader(head, &mut body).map(|archive| kiri_image::archive::load(&engine.store, archive));
+    let loaded = upload_reader(head, &mut body).map(|archive| kiri_image::archive::load_platforms(&engine.store, archive, &platforms));
     let loaded = match loaded {
         Ok(loaded) => loaded,
         Err(e) => {
@@ -5332,6 +5371,112 @@ mod tests {
         let (answer, found) = load("load-bzip2", &bzip2);
         assert!(answer.starts_with("HTTP/1.1 400") && answer.contains("bzip2-compressed archive isn't supported yet"), "{answer}");
         assert_eq!(found, None);
+    }
+
+    /// `POST /images/load` accepts OCI image-layout archives (plain, gzipped,
+    /// untagged, and with `?platform=...` as plain string or Docker API v1.48 JSON).
+    #[test]
+    fn image_load_takes_oci_archives_and_platform_queries() {
+        use std::io::{Read, Write};
+        let (src, src_engine) = engine_in("load-oci-src", false);
+        let put = |bytes: &[u8]| {
+            let mut w = src_engine.store.ingest().unwrap();
+            w.write_all(bytes).unwrap();
+            w.finish().unwrap()
+        };
+        let make_manifest = |arch: &str| {
+            let cfg_bytes = serde_json::to_vec(&json!({"os": "linux", "architecture": arch, "created": "2026-01-01T00:00:00Z", "config": {"Cmd": [arch]}})).unwrap();
+            let (cfg, cfg_sz) = put(&cfg_bytes);
+            let (layer, layer_sz) = put(format!("layer-{arch}").as_bytes());
+            let man_bytes = serde_json::to_vec(&json!({
+                "schemaVersion": 2,
+                "config": {"mediaType": "application/vnd.oci.image.config.v1+json", "digest": cfg, "size": cfg_sz},
+                "layers": [{"mediaType": "application/vnd.oci.image.layer.v1.tar", "digest": layer, "size": layer_sz}],
+            }))
+            .unwrap();
+            let (man, man_sz) = put(&man_bytes);
+            (cfg, cfg_bytes, layer, format!("layer-{arch}").into_bytes(), man, man_bytes, man_sz)
+        };
+        let amd = make_manifest("amd64");
+        let arm = make_manifest("arm64");
+        let nested_bytes = serde_json::to_vec(&json!({
+            "schemaVersion": 2,
+            "manifests": [
+                {"mediaType": "application/vnd.oci.image.manifest.v1+json", "digest": amd.4, "size": amd.6, "platform": {"os": "linux", "architecture": "amd64"}},
+                {"mediaType": "application/vnd.oci.image.manifest.v1+json", "digest": arm.4, "size": arm.6, "platform": {"os": "linux", "architecture": "arm64"}},
+            ]
+        }))
+        .unwrap();
+        let (nested, nested_sz) = put(&nested_bytes);
+        drop(src_engine);
+        let _ = std::fs::remove_dir_all(src);
+
+        let build_oci = |tag: Option<&str>| {
+            let mut b = tar::Builder::new(Vec::new());
+            let mut add = |name: &str, data: &[u8]| {
+                let mut h = tar::Header::new_ustar();
+                h.set_size(data.len() as u64);
+                h.set_mode(0o644);
+                h.set_entry_type(tar::EntryType::Regular);
+                b.append_data(&mut h, name, data).unwrap();
+            };
+            for (cfg, cfg_b, layer, layer_b, man, man_b, _) in [&amd, &arm] {
+                add(&format!("blobs/sha256/{}", cfg.strip_prefix("sha256:").unwrap()), cfg_b);
+                add(&format!("blobs/sha256/{}", layer.strip_prefix("sha256:").unwrap()), layer_b);
+                add(&format!("blobs/sha256/{}", man.strip_prefix("sha256:").unwrap()), man_b);
+            }
+            add(&format!("blobs/sha256/{}", nested.strip_prefix("sha256:").unwrap()), &nested_bytes);
+            add("oci-layout", br#"{"imageLayoutVersion":"1.0.0"}"#);
+            let mut desc = json!({"mediaType": "application/vnd.oci.image.index.v1+json", "digest": nested, "size": nested_sz});
+            if let Some(t) = tag {
+                desc["annotations"] = json!({"io.containerd.image.name": format!("docker.io/{t}"), "org.opencontainers.image.ref.name": "1"});
+            }
+            add("index.json", &serde_json::to_vec(&json!({"schemaVersion": 2, "manifests": [desc]})).unwrap());
+            b.into_inner().unwrap()
+        };
+
+        let tagged_tar = build_oci(Some("demo/oci:1"));
+        let untagged_tar = build_oci(None);
+        let mut gz_tar = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz_tar.write_all(&tagged_tar).unwrap();
+        let gz_tar = gz_tar.finish().unwrap();
+
+        let post = |name: &str, query: &str, body: &[u8]| {
+            let (root, engine) = engine_in(name, false);
+            let (mut client, server) = UnixStream::pair().unwrap();
+            let served = std::thread::spawn({
+                let engine = engine.clone();
+                move || serve(server, engine, Caller::Host)
+            });
+            write!(client, "POST /v1.48/images/load{query} HTTP/1.1\r\nHost: docker\r\nContent-Type: application/x-tar\r\nContent-Length: {}\r\n\r\n", body.len()).unwrap();
+            client.write_all(body).unwrap();
+            let mut answer = String::new();
+            client.read_to_string(&mut answer).unwrap();
+            served.join().unwrap().unwrap();
+            let images = engine.store.images().unwrap();
+            drop(engine);
+            let _ = std::fs::remove_dir_all(root);
+            (answer, images)
+        };
+
+        let (ans, imgs) = post("oci-gz-amd", "?platform=linux%2Famd64", &gz_tar);
+        assert!(ans.starts_with("HTTP/1.1 200") && ans.contains("Loaded image: demo/oci:1"), "{ans}");
+        assert_eq!(imgs[0].platform, "linux/amd64");
+
+        // Docker API v1.48 sends platform as JSON-encoded ocispec.Platform.
+        let (ans, imgs) = post("oci-json-arm", "?platform=%7B%22architecture%22%3A%22arm64%22%2C%22os%22%3A%22linux%22%7D", &tagged_tar);
+        assert!(ans.starts_with("HTTP/1.1 200") && ans.contains("Loaded image: demo/oci:1"), "{ans}");
+        assert_eq!(imgs[0].platform, "linux/arm64");
+
+        // Untagged OCI archive loads by ID.
+        let (ans, imgs) = post("oci-untagged", "", &untagged_tar);
+        assert!(ans.starts_with("HTTP/1.1 200") && ans.contains("Loaded image ID: sha256:"), "{ans}");
+        assert!(imgs[0].name.starts_with("sha256:"));
+
+        // Invalid platform returns 400 after draining body.
+        let (ans, imgs) = post("oci-bad-plat", "?platform=%2F", &tagged_tar);
+        assert!(ans.starts_with("HTTP/1.1 400") && ans.contains("invalid platform"), "{ans}");
+        assert!(imgs.is_empty());
     }
 
     /// Every damaged gzip is a 400, including the ones Docker 29 accepts

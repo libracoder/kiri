@@ -324,7 +324,7 @@ impl Store {
     /// True if the blob is present with the expected size. Blobs are only
     /// renamed into place after their digest was verified, so presence is proof.
     pub fn has_blob(&self, digest: &str, size: u64) -> bool {
-        self.blob_path(digest).is_ok_and(|p| fs::metadata(p).is_ok_and(|m| m.len() == size))
+        self.blob_path(digest).is_ok_and(|p| blob_ready(&p, size))
     }
 
     pub fn blob_writer(&self, digest: &str) -> io::Result<BlobWriter> {
@@ -619,12 +619,21 @@ impl Write for Ingest {
     }
 }
 
+fn blob_ready(dest: &Path, expected_size: u64) -> bool {
+    fs::symlink_metadata(dest).is_ok_and(|m| m.is_file() && m.len() == expected_size)
+}
+
 impl Ingest {
     /// Publishes the blob under its digest. Returns (digest, size).
     pub fn finish(mut self) -> io::Result<(String, u64)> {
         let hex = hex(&std::mem::take(&mut self.hasher).finalize());
+        let dest = self.root.join("blobs/sha256").join(&hex);
+        if blob_ready(&dest, self.written) {
+            let _ = fs::remove_file(&self.tmp);
+            return Ok((format!("sha256:{hex}"), self.written));
+        }
         self.file.sync_all()?;
-        fs::rename(&self.tmp, self.root.join("blobs/sha256").join(&hex))?;
+        fs::rename(&self.tmp, dest)?;
         Ok((format!("sha256:{hex}"), self.written))
     }
 
@@ -634,10 +643,14 @@ impl Ingest {
     /// an image that names it (`docker load`).
     pub fn finish_pinned(mut self) -> io::Result<(String, u64, Pin)> {
         let hex = hex(&std::mem::take(&mut self.hasher).finalize());
-        self.file.sync_all()?;
         let dest = self.root.join("blobs/sha256").join(&hex);
         let _one = BLOB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let pin = Pin::take(dest.clone());
+        if blob_ready(&dest, self.written) {
+            let _ = fs::remove_file(&self.tmp);
+            return Ok((format!("sha256:{hex}"), self.written, pin));
+        }
+        self.file.sync_all()?;
         fs::rename(&self.tmp, &dest)?;
         Ok((format!("sha256:{hex}"), self.written, pin))
     }
@@ -647,6 +660,22 @@ impl Drop for Ingest {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.tmp);
     }
+}
+
+/// Hashes every byte of `r` with SHA-256, returning `(digest, bytes_read)`.
+pub fn hash_stream(mut r: impl io::Read) -> io::Result<(String, u64)> {
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 65536];
+    let mut total = 0u64;
+    loop {
+        let n = r.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        total += n as u64;
+    }
+    Ok((format!("sha256:{}", hex(&hasher.finalize())), total))
 }
 
 pub fn sha256_digest(bytes: &[u8]) -> String {
@@ -1037,5 +1066,34 @@ mod tests {
         assert_eq!(named("localhost:5000/app:1").repo(), "localhost:5000/app");
         assert_eq!(named("localhost:5000/app").repo(), "localhost:5000/app");
         assert_eq!(named(&format!("kindest/node@sha256:{}", "a".repeat(64))).repo(), "kindest/node");
+    }
+
+    #[test]
+    fn ingest_skips_rewrite_only_when_existing_blob_matches_size() {
+        let root = scratch("ingest-skip");
+        let _ = fs::remove_dir_all(&root);
+        let store = Store::open(&root).unwrap();
+        let data = b"hello content addressed store";
+        let mut w = store.ingest().unwrap();
+        w.write_all(data).unwrap();
+        let (digest, size) = w.finish().unwrap();
+        let path = store.blob_path(&digest).unwrap();
+        assert_eq!(size, data.len() as u64);
+
+        // Existing matching file: finish_pinned keeps it without replacing it.
+        let mut w2 = store.ingest().unwrap();
+        w2.write_all(data).unwrap();
+        let (d2, s2, _pin) = w2.finish_pinned().unwrap();
+        assert_eq!((d2, s2), (digest.clone(), size));
+        assert_eq!(fs::read(&path).unwrap(), data);
+
+        // Truncated/corrupted blob of wrong size on disk is repaired by rename.
+        fs::write(&path, b"short").unwrap();
+        let mut w3 = store.ingest().unwrap();
+        w3.write_all(data).unwrap();
+        w3.finish().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), data);
+
+        fs::remove_dir_all(&root).unwrap();
     }
 }
