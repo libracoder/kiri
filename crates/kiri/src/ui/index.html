@@ -1167,6 +1167,29 @@ tr.row:hover td.actions .acts-row { background: linear-gradient(var(--fwd), tran
 .pref + .rp-notes { margin-top: -6px; }
 .pref .sockhint { display: inline-flex; align-items: center; gap: 4px; flex-wrap: wrap; margin-top: 4px; color: var(--text); }
 .pref .sockhint code { padding: 1px 6px; border-radius: 5px; background: var(--panel); border: 1px solid var(--line); font: var(--fs-mono) var(--mono-font); user-select: text; -webkit-user-select: text; }
+/* Settings → Storage */
+.st-t { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.st-badge { font-size: var(--fs-small); font-weight: 500; padding: 1px 7px; border-radius: 99px; background: color-mix(in srgb, var(--blue) 16%, transparent); color: var(--text); }
+.st-path { overflow-wrap: anywhere; word-break: break-word; color: var(--text); }
+.st-meta { display: block; margin-top: 4px; font-variant-numeric: tabular-nums; }
+.pref .st-acts { grid-row: 1 / span 2; grid-column: 2; display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+.st-box { border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; background: var(--panel); display: grid; gap: 8px; min-width: 0; }
+.st-box.warn { border-color: color-mix(in srgb, var(--sun) 45%, var(--line)); background: color-mix(in srgb, var(--sun) 8%, var(--panel)); }
+.st-box.err { border-color: color-mix(in srgb, var(--red) 45%, var(--line)); background: color-mix(in srgb, var(--red) 8%, var(--panel)); }
+.st-box .st-hd { display: flex; align-items: center; gap: 8px; font-weight: 600; }
+.st-box.warn .st-hd svg { color: var(--sun-text); flex: none; }
+.st-box.err .st-hd svg { color: var(--red-text); flex: none; }
+.st-box p { color: var(--muted); font-size: var(--fs); overflow-wrap: anywhere; }
+.st-box .st-row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 4px; }
+.st-bar { width: 100%; height: 6px; border-radius: 9px; background: var(--raised); overflow: hidden; }
+.st-bar span { display: block; height: 100%; background: var(--blue); }
+.st-opts { display: grid; gap: 8px; margin-top: 4px; }
+.st-opt { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 2px 10px; align-items: start; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); cursor: pointer; }
+.st-opt:has(input:checked) { border-color: var(--blue); background: color-mix(in srgb, var(--blue) 8%, var(--bg)); }
+.st-opt input { margin-top: 3px; accent-color: var(--blue); }
+.st-opt b { font-weight: 600; color: var(--text); }
+.st-opt small { grid-column: 2; color: var(--muted); font-size: var(--fs-small); }
+@media (max-width: 520px) { .pref.st-pref { grid-template-columns: minmax(0, 1fr); } .pref.st-pref .st-acts { grid-row: auto; grid-column: 1; justify-content: flex-start; margin-top: 8px; } }
 /* Chinese and Japanese break between any two characters: a short choice (关闭, 开启)
    stays on one line, as an English word does; Korean's too. Only in a CJK window,
    so English lays out as it did. */
@@ -2780,7 +2803,7 @@ const VM = LINUX ? "Engine" : "Linux VM";
 const shareOn = () => !!(ui.status?.share ?? ui.status?.dev);
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 
-const ui = { acting: new Map(), gacting: new Map(), running: new Set(), launched: new Map(), runWatch: new Map(), need: null, probed: new Map(), probing: new Set(), why: new Map(), startErr: {}, fixed: null, openTab: null, listening: new Map(), starting: new Map(), scans: new Map(), scanf: { sev: "", fix: false, own: false }, view: "containers", vm: "stopped", containers: [], images: [], volumes: [], networks: [], sort: { images: { key: "pulled", desc: true } }, filter: "", suffix: "kiri.localhost", collapsed: new Set(), res: null, resDraft: {}, proxy: null, pxDraft: {}, rports: null, rpDraft: {}, rpAt: 0, regcfg: null, regBase: null, regDraft: { insecure: [], mirrors: [] }, regAdd: { insecure: "", mirrors: "" }, dockersock: null, sockTaking: false, ctxSwitching: false,
+const ui = { acting: new Map(), gacting: new Map(), running: new Set(), launched: new Map(), runWatch: new Map(), need: null, probed: new Map(), probing: new Set(), why: new Map(), startErr: {}, fixed: null, openTab: null, listening: new Map(), starting: new Map(), scans: new Map(), scanf: { sev: "", fix: false, own: false }, view: "containers", vm: "stopped", containers: [], images: [], volumes: [], networks: [], sort: { images: { key: "pulled", desc: true } }, filter: "", suffix: "kiri.localhost", collapsed: new Set(), res: null, resDraft: {}, storage: null, stErr: "", proxy: null, pxDraft: {}, rports: null, rpDraft: {}, rpAt: 0, regcfg: null, regBase: null, regDraft: { insecure: [], mirrors: [] }, regAdd: { insecure: "", mirrors: "" }, dockersock: null, sockTaking: false, ctxSwitching: false,
   imp: { sources: null, source: null, inv: null, picked: { images: new Set(), volumes: new Set(), containers: new Set() }, steps: {}, running: false, summary: "" },
   upd: null, engineStale: null, staleHidden: false,
   // The Builds view: the list, the picked build and its detail, and how its steps show.
@@ -4543,6 +4566,125 @@ function wslPane() {
   return `<div class="pane"><h3>${tr("WSL integration")}</h3>${rows}</div>`;
 }
 
+/* Settings → Storage: where Kiri keeps images, containers, and volumes. */
+const stPhaseText = (p) => ({
+  stopping: tr("Stopping containers…"),
+  copying: tr("Copying data…"),
+  verifying: tr("Verifying copy…"),
+  switching: tr("Switching storage…"),
+  restarting: tr("Restarting engine…"),
+}[p] || tr("Moving data…"));
+
+function storageUnavailableBox(s, linkSettings) {
+  return `<div class="st-box warn" role="alert">
+    <div class="st-hd"><svg class="i" viewBox="0 0 256 256" aria-hidden="true"><path d="${PH.warning}"/></svg><span>${tr("Storage location unavailable")}</span></div>
+    <p>${tr("Kiri couldn't find its data in {path}. Connect its drive and retry, choose another folder, or reset to the default location.", { path: `<span class="mono st-path">${esc(s.path || "")}</span>` })}</p>
+    <div class="st-row">
+      <button class="btn primary" data-stretry>${tr("Retry")}</button>
+      <button class="btn" data-stpick>${tr("Change…")}</button>
+      <button class="btn" data-streset>${tr("Reset to default")}</button>
+      ${linkSettings ? `<button class="btn" data-stgoto>${tr("Open storage settings")}</button>` : ""}
+    </div>
+  </div>`;
+}
+
+function renderStorageUnavailable() {
+  const s = ui.storage || {};
+  $("content").innerHTML = `<div class="empty"><div><svg class="i art" viewBox="0 0 256 256"><path d="${PH.harddrive}"/></svg>
+    <h3>${tr("Storage location unavailable")}</h3>
+    <p>${tr("Kiri couldn't find its data in {path}. Connect its drive and retry, choose another folder, or reset to the default location.", { path: `<span class="mono st-path">${esc(s.path || "")}</span>` })}</p>
+    <div class="st-row" style="justify-content:center">
+      <button class="btn primary" data-stretry>${tr("Retry")}</button>
+      <button class="btn" data-stpick>${tr("Change…")}</button>
+      <button class="btn" data-streset>${tr("Reset to default")}</button>
+      <button class="btn" data-stgoto>${tr("Open storage settings")}</button>
+    </div></div></div>`;
+}
+
+function storagePane() {
+  const s = ui.storage;
+  if (!s) return `<div class="pane"><h3>${tr("Storage")}</h3><p class="muted">${tr("Loading…")}</p></div>`;
+  if (s.error && !s.path) return `<div class="pane"><h3>${tr("Storage")}</h3><p class="muted">${tr("Start Kiri to change its storage location. ({error})", { error: esc(s.error) })}</p></div>`;
+  const moving = s.state === "moving", unavail = s.state === "unavailable", locked = moving || !!s.env;
+  const stats = [s.used != null ? tr("{size} used", { size: size(s.used) }) : "", s.free != null ? tr("{size} free", { size: size(s.free) }) : "", s.fs ? esc(s.fs) : ""].filter(Boolean).join(" · ");
+  const badge = !s.custom && !s.env ? `<span class="st-badge">${tr("Default")}</span>` : "";
+  const m = s.moving;
+  const pct = m && m.total > 0 ? Math.min(100, Math.round((m.done / m.total) * 100)) : null;
+  const progressBox = moving && m ? `<div class="st-box" role="status">
+    <div class="st-hd"><span>${stPhaseText(m.phase)}</span></div>
+    <p>${tr("Moving Kiri's data to {path}.", { path: `<span class="mono st-path">${esc(m.to || "")}</span>` })}</p>
+    ${pct != null ? `<div class="st-bar"><span style="width:${pct}%"></span></div><p class="num">${size(m.done)} / ${size(m.total)} (${pct}%)</p>` : ""}
+    <p>${tr("Running containers pause while Kiri copies its data and start again once it's done.")}</p>
+  </div>` : "";
+  const errText = ui.stErr || (!moving && s.error ? s.error : "");
+  const errBox = errText ? `<div class="st-box err" role="alert">
+    <div class="st-hd"><svg class="i" viewBox="0 0 256 256" aria-hidden="true"><path d="${PH.warning}"/></svg><span>${tr("Couldn't change storage location")}</span></div>
+    <p>${esc(errText)}</p>
+    ${ui.stErr ? `<div class="st-row"><button class="btn sm" data-sterrclose>${tr("Dismiss")}</button></div>` : ""}
+  </div>` : "";
+  const oldRow = s.old && s.state === "ok" ? `<div class="pref st-pref">
+    <span class="t">${tr("Old data")}</span>
+    <span class="d">${tr("Previous data is still in {path}. Remove it once everything works in the new location.", { path: `<span class="mono st-path">${esc(s.old)}</span>` })}</span>
+    <span class="st-acts"><button class="btn" data-strmold>${tr("Remove old data")}</button></span>
+  </div>` : "";
+  return `<div class="pane"><h3>${tr("Storage")}</h3>
+    ${unavail ? storageUnavailableBox(s, false) : ""}
+    <div class="pref st-pref">
+      <span class="t st-t"><span>${tr("Storage location")}</span>${badge}</span>
+      <span class="d"><span class="mono st-path">${esc(s.path || "")}</span>${stats ? `<span class="st-meta">${stats}</span>` : ""}</span>
+      <span class="st-acts">
+        <button class="btn" data-stpick${locked ? " disabled" : ""}>${tr("Change…")}</button>
+        ${s.custom ? `<button class="btn" data-streset${locked ? " disabled" : ""}>${tr("Reset to default")}</button>` : ""}
+      </span>
+    </div>
+    ${s.env ? `<p class="muted">${tr("{var} sets Kiri's storage location, so it can't be changed here.", { var: `<span class="mono">KIRI_DATA_DIR</span>` })}</p>` : ""}
+    ${progressBox}
+    ${errBox}
+    ${oldRow}
+    <p class="muted">${tr("Images, containers, and volumes live in this folder. External drives must use a native filesystem (APFS on macOS, ext4/xfs/btrfs on Linux, NTFS on Windows); FAT and exFAT drives aren't supported.")}</p>
+  </div>`;
+}
+
+function storageConfirm(c) {
+  $("st-dlg")?.remove();
+  const s = ui.storage || {};
+  const unavail = s.state === "unavailable";
+  const hasData = !unavail && ((s.used || 0) > 0 || ui.containers.length > 0 || ui.images.length > 0 || ui.volumes.length > 0);
+  const showMode = !c.reset && hasData;
+  const title = c.reset ? tr("Reset storage location to default?") : tr("Change storage location?");
+  const meta = !unavail && c.free != null ? `<p>${tr("Destination: {path} ({free} free).", { path: `<span class="mono st-path">${esc(c.path)}</span>`, free: size(c.free) })}</p>`
+    : `<p>${tr("Destination: {path}.", { path: `<span class="mono st-path">${esc(c.path)}</span>` })}</p>`;
+  const warn = c.replaces ? `<p>${tr("Existing Kiri data in this folder will be replaced.")}</p>` : "";
+  const modeHtml = showMode ? `<div class="st-opts" role="radiogroup" aria-label="${tr("Migration mode")}">
+    <label class="st-opt"><input type="radio" name="st-mode" value="move" checked><b>${tr("Move existing images, containers, and volumes")}</b><small>${tr("Stops running containers, copies your data, and starts them again.")}</small></label>
+    <label class="st-opt"><input type="radio" name="st-mode" value="fresh"><b>${tr("Start fresh")}</b><small>${tr("Starts empty in the new folder. Your old folder stays until you remove it.")}</small></label>
+  </div>` : `<p>${unavail ? tr("Kiri will switch to this folder and restart the engine.") : tr("Running containers will stop while Kiri moves your data and start again once it's done.")}</p>`;
+  const scrim = document.createElement("div");
+  scrim.className = "scrim"; scrim.id = "st-dlg";
+  scrim.innerHTML = `<div class="dialog alert" role="dialog" aria-modal="true" aria-labelledby="st-h">${alertIco(c.replaces ? "warn" : "info")}<h3 id="st-h">${title}</h3>
+    ${meta}${warn}${modeHtml}
+    <div class="row-end"><span></span><span><button class="btn" data-stcancel>${tr("Cancel")}</button> <button class="btn primary" data-stgo>${c.reset ? tr("Reset to default") : tr("Move data")}</button></span></div></div>`;
+  document.body.append(scrim);
+  const goBtn = scrim.querySelector("[data-stgo]");
+  const close = () => { scrim.remove(); document.removeEventListener("keydown", onKey); };
+  const onKey = (ev) => { if (ev.key === "Escape") close(); };
+  document.addEventListener("keydown", onKey);
+  scrim.querySelectorAll('input[name="st-mode"]').forEach((r) => r.addEventListener("change", () => {
+    goBtn.textContent = r.value === "fresh" && r.checked ? tr("Start fresh") : tr("Move data");
+  }));
+  scrim.addEventListener("click", (ev) => {
+    if (ev.target === scrim || ev.target.closest("[data-stcancel]")) return close();
+    if (ev.target.closest("[data-stgo]")) {
+      const fresh = scrim.querySelector('input[name="st-mode"]:checked')?.value === "fresh";
+      ui.stErr = "";
+      if (c.reset) send("storagereset");
+      else send("storagemove", { path: c.path, value: { fresh } });
+      close();
+    }
+  });
+  goBtn.focus();
+}
+
 function renderSettings() {
   const tab = (id, icon, label) => `<button data-stab="${id}" aria-current="${prefs.tab === id}"><svg class="i" viewBox="0 0 256 256"><path d="${PH[icon]}"/></svg>${label}</button>`;
   const opts = (list, current, system) => {
@@ -4637,8 +4779,8 @@ function renderSettings() {
       <dt>${tr("Made by")}</dt><dd><a data-open-site="https://canestack.com">Canestack Labs</a></dd>
     </dl>
     <p class="muted">${tr("The name comes from the Igbo word ntakịrị, “small”.")}</p></div>`;
-  const html = `<div class="settings"><div class="tabs">${tab("appearance", "textaa", tr("Appearance"))}${tab("resources", "stack", tr("Resources"))}${tab("network", "globe", tr("Network"))}${tab("builds", "hammer", tr("Builds"))}${tab("registries", "lock", tr("Registries"))}${tab("kubernetes", "pods", "Kubernetes")}${tab("import", "stack", tr("Import"))}${tab("domains", "network", tr("Domains"))}${tab("diagnostics", "bug", tr("Diagnostics"))}${tab("about", "info", tr("About"))}</div>
-    ${prefs.tab === "diagnostics" ? diagPane() : prefs.tab === "about" ? aboutPane : prefs.tab === "domains" ? domainsPane : prefs.tab === "resources" ? `<div class="panes">${enginePane()}${resourcesPane()}${wslPane()}</div>` : prefs.tab === "network" ? networkPane() : prefs.tab === "builds" ? buildsPane() : prefs.tab === "registries" ? `<div class="panes">${loginsOn() ? registriesPane() : ""}${regListPane("insecure")}${regListPane("mirrors")}</div>` : prefs.tab === "kubernetes" ? kubernetesPane() : prefs.tab === "import" ? importPane() : appearance}</div>`;
+  const html = `<div class="settings"><div class="tabs">${tab("appearance", "textaa", tr("Appearance"))}${tab("resources", "stack", tr("Resources"))}${tab("storage", "harddrive", tr("Storage"))}${tab("network", "globe", tr("Network"))}${tab("builds", "hammer", tr("Builds"))}${tab("registries", "lock", tr("Registries"))}${tab("kubernetes", "pods", "Kubernetes")}${tab("import", "stack", tr("Import"))}${tab("domains", "network", tr("Domains"))}${tab("diagnostics", "bug", tr("Diagnostics"))}${tab("about", "info", tr("About"))}</div>
+    ${prefs.tab === "diagnostics" ? diagPane() : prefs.tab === "about" ? aboutPane : prefs.tab === "domains" ? domainsPane : prefs.tab === "resources" ? `<div class="panes">${enginePane()}${resourcesPane()}${wslPane()}</div>` : prefs.tab === "storage" ? storagePane() : prefs.tab === "network" ? networkPane() : prefs.tab === "builds" ? buildsPane() : prefs.tab === "registries" ? `<div class="panes">${loginsOn() ? registriesPane() : ""}${regListPane("insecure")}${regListPane("mirrors")}</div>` : prefs.tab === "kubernetes" ? kubernetesPane() : prefs.tab === "import" ? importPane() : appearance}</div>`;
   // The container lists arrive every few seconds; rebuilding an unchanged page
   // closes an open menu. The font menus list names in the interface font: an
   // option in its own font made WebKit load every installed font (438 here)
@@ -4693,7 +4835,7 @@ function show(view) {
   if (view === "compose") { cmp.open = null; cmp.asked = 0; cmpAsk(); }
   if (view === "usb") usbPoll();
   if (view === "share") { send("shares"); send("shareusage"); shPoll(); }
-  if (view === "settings") { if (!fontLists.families.length) send("fonts"); send("about"); send("logins"); send("resources"); send("dockersock"); send("proxy"); send("registryconfig"); send("routerports"); if (!ui.imp.sources) send("importsources"); if (prefs.tab === "diagnostics") diagOpen(); }
+  if (view === "settings") { if (!fontLists.families.length) send("fonts"); send("about"); send("logins"); send("resources"); send("storage"); send("dockersock"); send("proxy"); send("registryconfig"); send("routerports"); if (!ui.imp.sources) send("importsources"); if (prefs.tab === "diagnostics") diagOpen(); }
   render();
   // From the top, as a container's or pod's page opens: leaving a page scrolled
   // down (a long Terminal or Logs tab) otherwise opened the next view below its rows.
@@ -7053,6 +7195,7 @@ function render() {
   if (v === "share") return renderShare();
   // The devices are the computer's: listed whether the engine runs or not.
   if (v === "usb") return renderUsb();
+  if (ui.storage?.state === "unavailable") return renderStorageUnavailable();
   if (ui.vm === "stopped") return renderEmpty("stopped");
   if ((v === "containers" || v === "compose") && ui.detail) {
     // The list refreshes while you edit the environment: keep your place.
@@ -8316,6 +8459,17 @@ window.kiri = {
         break;
       }
       case "resources": ui.res = e; ui.resDraft = { cpus: e.cpus, memory_mib: e.memory_mib, ...(e.disk_gb != null ? { disk_gb: e.disk_gb } : {}) }; if (ui.view === "settings") render(); break;
+      case "storage": {
+        const wasUnavail = ui.storage?.state === "unavailable";
+        ui.storage = e;
+        if (e.state === "moving") ui.stErr = "";
+        if (ui.view === "settings" || e.state === "unavailable" || wasUnavail) render();
+        break;
+      }
+      case "storagecheck":
+        if (e.error) { ui.stErr = e.error; if (ui.view === "settings") render(); else toast("error", e.error); }
+        else { ui.stErr = ""; storageConfirm(e); }
+        break;
       case "detail": openDetail(e.id); break;
       case "inspect":
         if (ui.detail?.id === e.id) {
@@ -8415,7 +8569,20 @@ $("content").addEventListener("click", (ev) => {
   else if ((el = t("[data-g]"))) projectAsk(el.dataset.project, el.dataset.g);
   else if ((el = t("[data-group]"))) toggleGroup(el);
   else if (composeClick(t)) {}
-  else if ((el = t("[data-stab]"))) { prefs.tab = el.dataset.stab; if (prefs.tab === "about") send("about"); if (prefs.tab === "network") { send("proxy"); send("dockersock"); } if (prefs.tab === "builds") send("buildwith"); if (prefs.tab === "registries") { send("logins"); send("registryconfig"); } if (prefs.tab === "diagnostics") diagOpen(); render(); }
+  else if ((el = t("[data-stab]"))) { prefs.tab = el.dataset.stab; if (prefs.tab === "about") send("about"); if (prefs.tab === "storage") send("storage"); if (prefs.tab === "network") { send("proxy"); send("dockersock"); } if (prefs.tab === "builds") send("buildwith"); if (prefs.tab === "registries") { send("logins"); send("registryconfig"); } if (prefs.tab === "diagnostics") diagOpen(); render(); }
+  else if (t("[data-stpick]")) { ui.stErr = ""; send("storagepick"); }
+  else if (t("[data-streset]")) {
+    if (ui.storage?.state === "unavailable") {
+      confirmRemove(tr("Reset storage location to default?"), tr("Kiri will switch back to its default folder and restart the engine. Data on the disconnected drive isn't deleted."), tr("Reset to default"), () => send("storagereset"), "primary");
+    } else {
+      ui.stErr = "";
+      send("storagecheck", { path: "", value: { reset: true } });
+    }
+  }
+  else if (t("[data-stretry]")) { ui.stErr = ""; send("storageretry"); }
+  else if (t("[data-strmold]")) { confirmRemove(tr("Remove old data?"), tr("Everything in {path} will be deleted for good.", { path: `<span class="mono st-path">${esc(ui.storage?.old || "")}</span>` }), tr("Remove"), () => send("storageremoveold")); }
+  else if (t("[data-sterrclose]")) { ui.stErr = ""; render(); }
+  else if (t("[data-stgoto]")) { prefs.tab = "storage"; show("settings"); }
   else if (diagClick(t)) {}
   else if ((el = t("[data-scale]"))) setPref("scale", +el.dataset.scale);
   else if ((el = t("[data-logsize]"))) setPref("logSize", +el.dataset.logsize);

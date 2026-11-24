@@ -150,6 +150,11 @@ fn route(req: &Request, engine: &Arc<Engine>, caller: &Caller, w: &mut UnixStrea
         http::error(w, 403, "this is changed in Kiri's window or with the kiri command on this machine, not from a container")?;
         return Ok(Next::Close);
     }
+    // While Settings → Storage moves the data, nothing may change it.
+    if super::storage::moving() && !matches!(m, "GET" | "HEAD") {
+        super::storage::refuse_while_moving(w)?;
+        return Ok(Next::Close);
+    }
     if let Some(done) = super::ops::route(req, engine, w) {
         return done;
     }
@@ -245,6 +250,12 @@ fn route(req: &Request, engine: &Arc<Engine>, caller: &Caller, w: &mut UnixStrea
         ("POST", "/build") => return super::builder::build(req, engine, w, r),
         ("POST", "/build/cancel") => return reply(w, super::builder::cancel(req, engine), 200),
         ("POST", "/build/prune") => return reply(w, super::builder::prune(req, engine), 200),
+        // Settings → Storage: where the data is, and moving it (storage.rs).
+        ("GET", "/kiri/storage") => return reply(w, Ok(super::storage::report(engine)), 200),
+        ("POST", "/kiri/storage/check") => return reply(w, super::storage::check_request(req, engine), 200),
+        ("POST", "/kiri/storage") => return reply(w, super::storage::start(req, engine), 202),
+        ("POST", "/kiri/storage/reset") => return reply(w, super::storage::start_reset(engine), 202),
+        ("DELETE", "/kiri/storage/old") => return reply(w, super::storage::remove_old(engine), 200),
         ("GET", "/kiri/builder") => return reply(w, Ok(super::builder::settings_report(engine)), 200),
         ("POST", "/kiri/builder") => return reply(w, super::builder::set_settings(req).map(|()| super::builder::settings_report(engine)), 200),
         ("GET", "/kiri/watch-roots") => return reply(w, Ok(watch_roots(engine)), 200),
@@ -459,7 +470,7 @@ fn parse_release(raw: &str) -> Option<String> {
 /// `KiriVersion`, and a component named "Kiri". Moves with `API_VERSION`.
 pub const ENGINE_VERSION: &str = "27.5.1";
 
-fn version() -> Value {
+pub(super) fn version() -> Value {
     let kiri = env!("CARGO_PKG_VERSION");
     json!({
         "Platform": {"Name": "Kiri"},

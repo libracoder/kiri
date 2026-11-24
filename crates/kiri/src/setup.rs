@@ -501,6 +501,41 @@ pub fn after_tools() -> io::Result<()> {
     builder().map(drop)
 }
 
+/// After Settings → Storage moved the data folder from `old`: Kiri Lite's
+/// docker link (`~/.kiri/bin/docker`) and docker's plugin folder, which
+/// point into the data folder, point into the new one.
+pub fn relink_cli(old: &Path) -> io::Result<()> {
+    let new = kiri_image::Store::default_root()?;
+    let link = bin_dir()?.join("docker");
+    if let Some(to) = std::fs::read_link(&link).ok().and_then(|t| moved(&t, old, &new)) {
+        std::fs::remove_file(&link)?;
+        std::os::unix::fs::symlink(to, &link)?;
+    }
+    let path = docker_dir()?.join("config.json");
+    let mut cfg = read_json(&path)?;
+    if repoint_plugin_dirs(&mut cfg, old, &new) {
+        write_json(&path, &cfg)?;
+    }
+    Ok(())
+}
+
+/// `path` under `new` instead of `old`, if it was under `old`.
+fn moved(path: &Path, old: &Path, new: &Path) -> Option<PathBuf> {
+    path.strip_prefix(old).ok().map(|rest| new.join(rest))
+}
+
+/// Moves docker's plugin folders under `old` to `new`; whether any moved.
+fn repoint_plugin_dirs(cfg: &mut Value, old: &Path, new: &Path) -> bool {
+    let mut changed = false;
+    for d in cfg["cliPluginsExtraDirs"].as_array_mut().into_iter().flatten() {
+        if let Some(to) = d.as_str().and_then(|s| moved(Path::new(s), old, new)) {
+            *d = to.to_string_lossy().into_owned().into();
+            changed = true;
+        }
+    }
+    changed
+}
+
 /// The context, as `docker context create kiri --docker host=…` writes it.
 fn context(socket: &Path) -> io::Result<()> {
     crate::dockerctx::write_context(&context_dir(CONTEXT.get())?, CONTEXT.get(), crate::flavor::APP.get(), &format!("unix://{}", socket.display()))
@@ -1019,6 +1054,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// Settings → Storage moved the data folder: Kiri Lite's plugin folder
+    /// follows it, and other plugin folders stay.
+    #[test]
+    fn plugin_folders_follow_the_data_folder() {
+        use std::path::Path;
+        let (old, new) = (Path::new("/Users/u/Library/Application Support/Kiri"), Path::new("/Volumes/External/kiri"));
+        let mut cfg = serde_json::json!({"cliPluginsExtraDirs": ["/opt/homebrew/lib/docker/cli-plugins", "/Users/u/Library/Application Support/Kiri/cli/cli-plugins"]});
+        assert!(super::repoint_plugin_dirs(&mut cfg, old, new));
+        assert_eq!(cfg["cliPluginsExtraDirs"], serde_json::json!(["/opt/homebrew/lib/docker/cli-plugins", "/Volumes/External/kiri/cli/cli-plugins"]));
+        assert!(!super::repoint_plugin_dirs(&mut cfg, old, new), "nothing left to move");
+        assert_eq!(super::moved(Path::new("/elsewhere/docker"), old, new), None);
     }
 
     #[test]

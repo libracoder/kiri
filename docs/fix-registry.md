@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #355 Settings → Storage: move Kiri's data folder to another drive (unreleased)
+- Fixes: #355 Custom storage directory (Settings → Storage location)
+- Caused: none known
+- Caused by: -
+- Check: `tests/ui/storage-location.js`
+
 ### #577 Network: show default Docker socket owner and accurate CLI binding across macOS, Linux, Windows, and Windows setup (unreleased)
 - Fixes: #577 Settings → Network: show who owns the default Docker socket (`/var/run/docker.sock` / `\\.\pipe\docker_engine`), offer to link it when free on macOS, and show `DOCKER_HOST` hint when another engine owns it; #369 report plain `docker` CLI binding accurately when another context or `DOCKER_HOST`/`DOCKER_CONTEXT` overrides Kiri, and apply "Make Kiri the default for docker" in Windows setup
 - Caused: none known

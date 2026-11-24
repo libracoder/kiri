@@ -193,6 +193,42 @@ pub fn pick_file(title: &str, filters: &[(String, String)], done: impl FnOnce(Op
     }
 }
 
+/// Settings → Storage → Change…: Windows' own folder picker (`FOS_PICKFOLDERS`)
+/// over the window, on its thread, outside `with_ui`. `done` gets the chosen
+/// folder, or None when cancelled, on a thread of its own.
+pub fn pick_folder(title: &str, done: impl FnOnce(Option<std::path::PathBuf>) + Send + 'static) {
+    let title = HSTRING::from(title);
+    BARE.lock().unwrap_or_else(PoisonError::into_inner).push(Box::new(move |hwnd| {
+        // SAFETY: on the window's thread, where COM is initialised (run).
+        let path = unsafe { folder_dialog(hwnd, &title) }.ok().flatten();
+        std::thread::spawn(move || done(path));
+    }));
+    let hwnd = WINDOW.load(Ordering::SeqCst);
+    if hwnd != 0 {
+        // SAFETY: posting to our own window; a closed one just drops it.
+        let _ = unsafe { PostMessageW(Some(HWND(hwnd as _)), WM_RUN, WPARAM(0), LPARAM(0)) };
+    }
+}
+
+/// IFileOpenDialog with `FOS_PICKFOLDERS`: one local folder on disk, or None when cancelled.
+unsafe fn folder_dialog(owner: HWND, title: &HSTRING) -> windows::core::Result<Option<std::path::PathBuf>> {
+    use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_INPROC_SERVER};
+    use windows::Win32::UI::Shell::{FileOpenDialog, IFileOpenDialog, FOS_FORCEFILESYSTEM, FOS_PATHMUSTEXIST, FOS_PICKFOLDERS, SIGDN_FILESYSPATH};
+    // SAFETY: COM calls on this thread's apartment.
+    unsafe {
+        let d: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)?;
+        d.SetTitle(title)?;
+        d.SetOptions(d.GetOptions()? | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST)?;
+        if d.Show(Some(owner)).is_err() {
+            return Ok(None);
+        }
+        let name = d.GetResult()?.GetDisplayName(SIGDN_FILESYSPATH)?;
+        let path = name.to_string().ok();
+        CoTaskMemFree(Some(name.0 as *const _));
+        Ok(path.map(std::path::PathBuf::from))
+    }
+}
+
 /// Jobs that need only the window's handle and run outside with_ui (a modal
 /// dialog), on the window's thread.
 type BareJob = Box<dyn FnOnce(HWND) + Send>;

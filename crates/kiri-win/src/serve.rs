@@ -1393,6 +1393,13 @@ impl Hub {
         if cfg.distro.is_none() {
             return Err(io::Error::new(io::ErrorKind::NotConnected, "Kiri is not set up yet"));
         }
+        // Never boot WSL while storage is moving or its custom drive is offline.
+        if crate::storage::moving() {
+            return Err(io::Error::new(io::ErrorKind::NotConnected, "Kiri is moving its data"));
+        }
+        if let Some(missing) = crate::storage::unavailable() {
+            return Err(io::Error::new(io::ErrorKind::NotConnected, crate::storage::unavailable_message(&missing)));
+        }
         // The last one has gone (WSL restarted, Windows slept): a docker
         // client is waiting, so a new one starts now, and the log says why;
         // once, not again for each try while new ones die as they start.
@@ -1699,6 +1706,18 @@ fn serve(hub: &Hub, pipe: Pipe) {
 fn serve_shared(hub: &Hub, pipe: Arc<Pipe>) {
     let flush = FlushOnDrop(pipe);
     let pipe = &flush.0;
+    if crate::storage::moving() {
+        if refuse_new(pipe, "Kiri is moving its data to another folder: try again when Settings → Storage says it's done") {
+            linger(pipe);
+        }
+        return;
+    }
+    if let Some(missing) = crate::storage::unavailable() {
+        if refuse_new(pipe, &crate::storage::unavailable_message(&missing)) {
+            linger(pipe);
+        }
+        return;
+    }
     // A bridge can die between hub.bridge() and the insert below: while WSL
     // is still booting, wsl.exe exits at once. `replies` ends every
     // connection it finds when that happens, but one registered after that

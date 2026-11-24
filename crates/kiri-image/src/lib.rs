@@ -11,6 +11,7 @@ pub mod jsonfile;
 pub mod mirror;
 pub mod reference;
 pub mod registry;
+pub mod storage;
 pub mod store;
 pub mod tags;
 

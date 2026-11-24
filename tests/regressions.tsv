@@ -279,3 +279,4 @@ hostnet-dns-kiri	#732	a --network host container asked the Mac's resolver for th
 socket-container-uid-group	#127	a standalone root-run Linux daemon put its 0600 socket under /root/.kiri/run/docker.sock instead of a 0660 /run/kiri/docker.sock, locking out containerized SDK clients whose numeric uid has no host account
 tests/disk-grow.py	#384	the macOS VM data disk stayed fixed at 64 GiB instead of growing via KIRI_DISK_GB / vm.json and online ext4 resize
 tests/ui/resources-disk.js	#384	Settings -> Resources had no Disk image size control for macOS VM disk growth without shrinking
+tests/ui/storage-location.js	#355	Settings → Storage had no way to move images, containers, volumes and the VM disk to another folder or external drive, or recover when an external drive is unplugged

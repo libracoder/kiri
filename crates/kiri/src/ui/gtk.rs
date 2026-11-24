@@ -406,6 +406,19 @@ pub(super) fn pick_compose_file(title: &str, filters: &[String; 2], done: impl F
     });
 }
 
+/// Settings → Storage → Change…: GTK's folder chooser (the desktop's portal
+/// when there is one), on GTK's main thread. `done` gets the path, or None.
+pub(super) fn pick_folder(title: &str, done: impl FnOnce(Option<std::path::PathBuf>) + Send + 'static) {
+    let title = title.to_owned();
+    glib::MainContext::default().invoke(move || {
+        let parent = WINDOW.with(|v| v.borrow().clone());
+        let dialog = gtk::FileChooserNative::new(Some(&title), parent.as_ref(), gtk::FileChooserAction::SelectFolder, None, None);
+        let picked = if dialog.run() == gtk::ResponseType::Accept { dialog.filename() } else { None };
+        dialog.destroy();
+        done(picked);
+    });
+}
+
 /// The installed font families, sorted; `mono` keeps the fixed-pitch ones.
 pub(super) fn font_families(mono: bool) -> Vec<String> {
     let spacing = if mono { ":spacing=mono" } else { ":" };

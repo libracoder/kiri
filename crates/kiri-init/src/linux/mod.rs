@@ -155,6 +155,9 @@ fn host_dirs() -> io::Result<container::Paths> {
     // SAFETY: umask only changes this process's file-creation mask.
     unsafe { libc::umask(0o022) };
     let root = PathBuf::from(DATA);
+    if let Some(data) = std::env::var_os("KIRI_AGENT_DATA").map(PathBuf::from).filter(|p| p.is_absolute() && p != &root) {
+        mount_agent_data(&data, &root)?;
+    }
     let mkdir = |p: &std::path::Path, mode: u32| -> io::Result<()> {
         std::fs::create_dir_all(p)?;
         std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode))
@@ -198,6 +201,39 @@ fn host_dirs() -> io::Result<container::Paths> {
     std::fs::write(&record, paths.cgroup.as_os_str().as_encoded_bytes())?;
     std::env::set_current_dir(&paths.layers)?;
     Ok(paths)
+}
+
+/// Bind-mounts `src` (the chosen folder's `agent` directory, from
+/// `KIRI_AGENT_DATA`) onto `/var/lib/kiri` so every agent path stays under
+/// `/var/lib/kiri` while living on the chosen disk. No-op when `src` is
+/// already mounted there; detaches any other mount on `target` first.
+fn mount_agent_data(src: &std::path::Path, target: &std::path::Path) -> io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    std::fs::create_dir_all(src)?;
+    std::fs::create_dir_all(target)?;
+    let (sm, tm) = (std::fs::metadata(src)?, std::fs::metadata(target)?);
+    if (sm.dev(), sm.ino()) == (tm.dev(), tm.ino()) {
+        return Ok(());
+    }
+    let c_target = CString::new(target.as_os_str().as_bytes()).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    if std::fs::read_to_string("/proc/self/mountinfo").is_ok_and(|m| is_mounted_at(&m, target)) {
+        // SAFETY: valid NUL-terminated path; detaches a stale mount at `target`.
+        unsafe { libc::umount2(c_target.as_ptr(), libc::MNT_DETACH) };
+    }
+    let c_src = CString::new(src.as_os_str().as_bytes()).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    // SAFETY: valid NUL-terminated paths for a bind mount (fstype and data unused).
+    check(unsafe { libc::mount(c_src.as_ptr(), c_target.as_ptr(), std::ptr::null(), libc::MS_BIND, std::ptr::null()) } as _, "bind-mount KIRI_AGENT_DATA").map(drop)
+}
+
+/// Whether `/proc/self/mountinfo` lists a mount whose target is `target`.
+fn is_mounted_at(mountinfo: &str, target: &std::path::Path) -> bool {
+    let want = target.to_string_lossy();
+    mountinfo.lines().any(|line| {
+        let Some((before, _)) = line.split_once(" - ") else { return false };
+        before.split_whitespace().nth(4).is_some_and(|mp| unescape_mount_path(mp) == want)
+    })
 }
 
 /// The lock on a Linux host's data directory, held while the agent runs.
@@ -830,5 +866,17 @@ mod cgroup_discovery_tests {
         assert!(!super::delegated(Path::new("/sys/fs/cgroup/unified/init.scope"), &[]));
         assert!(super::delegated(Path::new("/sys/fs/cgroup/unified/system.slice/kiri.service"), &[]));
         assert!(super::delegated(Path::new("/sys/fs/cgroup/unified/custom"), &[std::process::id().to_string()]));
+    }
+
+    #[test]
+    fn is_mounted_at_finds_exact_mountpoint() {
+        let mountinfo = "\
+28 1 8:1 / / rw,relatime - ext4 /dev/sda1 rw
+55 28 8:2 /kiri/agent /var/lib/kiri rw,relatime - ext4 /dev/sdb1 rw
+56 28 8:2 /sub /var/lib/kiri/volumes/x rw,relatime - ext4 /dev/sdb1 rw
+";
+        assert!(super::is_mounted_at(mountinfo, Path::new("/var/lib/kiri")));
+        assert!(!super::is_mounted_at(mountinfo, Path::new("/var/lib")));
+        assert!(!super::is_mounted_at(mountinfo, Path::new("/media/ssd")));
     }
 }

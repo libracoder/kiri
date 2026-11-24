@@ -350,6 +350,10 @@ pub(crate) fn ensure_daemon() -> io::Result<()> {
 
 /// Starts the daemon in WSL, this app's engine copied in first.
 fn start_daemon() -> io::Result<()> {
+    if let Some(missing) = crate::storage::unavailable() {
+        crate::storage::emit_report();
+        return Err(io::Error::other(crate::storage::unavailable_message(&missing)));
+    }
     crate::serve::log("engine: not answering; starting it in WSL");
     // The engine this app installed, not one an update left behind.
     match crate::update::sync_engine() {
@@ -1173,6 +1177,7 @@ pub fn on_message(msg: &str) {
             }
             emit(domains_event());
             emit_docker_state();
+            std::thread::spawn(crate::storage::emit_report);
             ask_language();
             // The first time, offer <name>.kiri.local, as the Mac does.
             if !crate::dns::installed() && crate::dns::serving() && prefs()["domainsAsked"] != true {
@@ -1500,6 +1505,31 @@ pub fn on_message(msg: &str) {
                 emit(builds_event());
             });
         }
+        // Settings → Storage: where WSL keeps Kiri's VHDX, and moving it.
+        "storage" => {
+            std::thread::spawn(crate::storage::emit_report);
+        }
+        "storagepick" => {
+            crate::app::pick_folder(&tr("Choose a storage folder"), |path| {
+                if let Some(p) = path {
+                    crate::storage::check_and_emit(Some(p.to_string_lossy().into_owned()), false, false);
+                }
+            });
+        }
+        "storagecheck" => {
+            let path = (!c.path.trim().is_empty()).then(|| c.path.clone());
+            let fresh = c.value["fresh"] == true;
+            let reset = c.value["reset"] == true;
+            std::thread::spawn(move || crate::storage::check_and_emit(path, fresh, reset));
+        }
+        "storagemove" => {
+            let path = (!c.path.trim().is_empty()).then(|| c.path.clone());
+            let fresh = c.value["fresh"] == true;
+            crate::storage::start_move(path, fresh);
+        }
+        "storagereset" => crate::storage::reset(),
+        "storageretry" => crate::storage::retry(),
+        "storageremoveold" => crate::storage::remove_old(),
         // Settings → Diagnostics and an error's Details: crate::diag.
         cmd @ ("diaglogs" | "diagreport" | "diagsend" | "diagcrashes" | "diagsendcrash" | "diagfolder") => {
             crate::diag::handle(cmd, c.name, c.id, &c.value);

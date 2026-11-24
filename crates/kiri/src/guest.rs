@@ -155,7 +155,7 @@ impl Guest {
             cmdline: String::new(),
             console: console_output(opts)?,
             agent_port: kiri_proto::HOST_PORT,
-            disk: None,
+            disk: if opts.data_disk { linux_agent_data()? } else { None },
             share: None,
             rosetta_tag: None,
             nat_mac: None,
@@ -379,6 +379,19 @@ impl Guest {
 
 fn unexpected(wanted: &str, got: &Msg<'_>) -> io::Error {
     io::Error::other(format!("expected {wanted}, got {got:?}"))
+}
+
+/// The agent's data folder on a Linux host when Settings → Storage moved it
+/// off the default location: `<root>/agent`, which `kiri-init` bind-mounts
+/// onto `/var/lib/kiri`. None when using the default folder or `KIRI_DATA_DIR`.
+#[cfg(target_os = "linux")]
+fn linux_agent_data() -> io::Result<Option<PathBuf>> {
+    if std::env::var_os("KIRI_DATA_DIR").is_some() {
+        return Ok(None);
+    }
+    let root = kiri_image::Store::default_root()?;
+    let default = kiri_image::Store::os_default_root()?;
+    Ok((root != default).then(|| root.join("agent")))
 }
 
 /// The agent on a Linux host: `KIRI_AGENT`, else `kiri-init` beside `kiri`.

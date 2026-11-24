@@ -121,7 +121,7 @@ static STATE: Mutex<Option<State>> = Mutex::new(None);
 static BUSY: AtomicBool = AtomicBool::new(false);
 static CANCEL: AtomicBool = AtomicBool::new(false);
 
-fn dir() -> PathBuf {
+pub(crate) fn dir() -> PathBuf {
     std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("Kiri")).unwrap_or_else(|| PathBuf::from("."))
 }
 
@@ -202,6 +202,11 @@ fn quiet(program: &str) -> Command {
 /// as UTF-16LE, and anything else as UTF-8. UTF-16 with no ASCII and no BOM
 /// at all is the one thing this cannot tell from UTF-8. NULs and a leading
 /// BOM are dropped either way.
+/// Combines wsl.exe's stdout and stderr, decoding UTF-16LE when WSL speaks it.
+pub(crate) fn wsl_output(stdout: &[u8], stderr: &[u8]) -> String {
+    wsl_text(stdout) + &wsl_text(stderr)
+}
+
 fn wsl_text(bytes: &[u8]) -> String {
     let (bytes, bom) = bytes.strip_prefix(&[0xFF, 0xFE]).map_or((bytes, false), |rest| (rest, true));
     let text = if bom || looks_utf16(bytes) {
@@ -345,7 +350,12 @@ fn restarted_since(at: u64) -> bool {
 }
 
 /// Whether the window should open on setup rather than Kiri.
+/// Never opens setup (which could re-create an empty distro) when a custom
+/// storage folder in `storage.json` is currently offline.
 pub fn needed() -> bool {
+    if crate::storage::unavailable().is_some() {
+        return false;
+    }
     let s = saved();
     needs_setup(s.done, s.distro.as_deref(), distros)
 }

@@ -733,6 +733,162 @@ fn router_ports(set: Option<serde_json::Value>) {
     emit(v.to_string());
 }
 
+/// Settings → Storage: reads current location, space, and migration state.
+fn storage_status() {
+    match client::get_background("/kiri/storage") {
+        Ok(mut v) => {
+            v["type"] = "storage".into();
+            emit(v.to_string());
+        }
+        Err(e) => emit(serde_json::json!({"type": "storage", "error": e.to_string()}).to_string()),
+    }
+}
+
+/// Validates a proposed storage folder and emits `storagecheck` to the page.
+fn storage_check(path: Option<String>, fresh: bool, reset: bool) {
+    let mut body = serde_json::json!({"fresh": fresh});
+    if let Some(p) = path.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        body["path"] = p.into();
+    }
+    let shown_path = path.unwrap_or_default();
+    let ev = match client::request("POST", "/kiri/storage/check", Some(&body)) {
+        Ok(r) if r.ok() => {
+            let mut v = r.json();
+            v["type"] = "storagecheck".into();
+            v["reset"] = reset.into();
+            v
+        }
+        Ok(r) => serde_json::json!({"type": "storagecheck", "path": shown_path, "error": r.error(), "reset": reset}),
+        Err(e) => serde_json::json!({"type": "storagecheck", "path": shown_path, "error": e.to_string(), "reset": reset}),
+    };
+    emit(ev.to_string());
+}
+
+/// Polls `GET /kiri/storage` until a move finishes (surviving the brief
+/// socket gap while the daemon execs itself onto the new folder).
+fn watch_storage_move(tx: Sender<Cmd>) {
+    let mut disconnected = 0u32;
+    for _ in 0..7200 {
+        std::thread::sleep(Duration::from_millis(400));
+        match client::get_background("/kiri/storage") {
+            Ok(mut v) => {
+                disconnected = 0;
+                let state = v["state"].as_str().unwrap_or("").to_owned();
+                let err = v["error"].as_str().map(str::to_owned);
+                let path = v["path"].as_str().unwrap_or("").to_owned();
+                v["type"] = "storage".into();
+                emit(v.to_string());
+                if state != "moving" {
+                    if let Some(e) = err {
+                        emit(notice("error", &e));
+                    } else if state == "ok" && !path.is_empty() {
+                        emit(notice("ok", &trf("Kiri's data moved to {path}", &[("path", &path)])));
+                    }
+                    let _ = tx.send(Cmd::Refresh);
+                    return;
+                }
+            }
+            Err(_) => {
+                disconnected += 1;
+                if disconnected > 75 {
+                    storage_status();
+                    let _ = tx.send(Cmd::Refresh);
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Starts moving Kiri's data to `path` (or back to default when None).
+fn storage_move(path: Option<String>, fresh: bool, tx: Sender<Cmd>) {
+    let mut body = serde_json::json!({"fresh": fresh});
+    if let Some(p) = path.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        body["path"] = p.into();
+    }
+    match client::request("POST", "/kiri/storage", Some(&body)) {
+        Ok(r) if r.ok() => {
+            let mut v = r.json();
+            v["type"] = "storage".into();
+            emit(v.to_string());
+            watch_storage_move(tx);
+        }
+        Ok(r) => {
+            emit(notice("error", &r.error()));
+            storage_status();
+        }
+        Err(e) => {
+            emit(notice("error", &e.to_string()));
+            storage_status();
+        }
+    }
+}
+
+fn storage_reset(tx: Sender<Cmd>) {
+    match client::request("POST", "/kiri/storage/reset", None) {
+        Ok(r) if r.ok() => {
+            if r.status == 204 {
+                // Unavailable mode: daemon restarts on default folder.
+                watch_storage_move(tx);
+            } else {
+                let mut v = r.json();
+                v["type"] = "storage".into();
+                emit(v.to_string());
+                watch_storage_move(tx);
+            }
+        }
+        Ok(r) => {
+            emit(notice("error", &r.error()));
+            storage_status();
+        }
+        Err(e) => {
+            emit(notice("error", &e.to_string()));
+            storage_status();
+        }
+    }
+}
+
+fn storage_retry(tx: Sender<Cmd>) {
+    match client::request("POST", "/kiri/storage/retry", None) {
+        Ok(r) if r.ok() => {
+            for _ in 0..50 {
+                std::thread::sleep(Duration::from_millis(200));
+                if let Ok(mut v) = client::get_background("/kiri/storage")
+                    && v["state"] != "unavailable"
+                {
+                    v["type"] = "storage".into();
+                    emit(v.to_string());
+                    emit(notice("ok", &tr("Storage is available again")));
+                    let _ = tx.send(Cmd::Refresh);
+                    return;
+                }
+            }
+            storage_status();
+        }
+        Ok(r) => {
+            emit(notice("error", &r.error()));
+            storage_status();
+        }
+        Err(e) => {
+            emit(notice("error", &e.to_string()));
+            storage_status();
+        }
+    }
+}
+
+fn storage_remove_old() {
+    match client::request("DELETE", "/kiri/storage/old", None) {
+        Ok(r) if r.ok() => {
+            let mut v = r.json();
+            v["type"] = "storage".into();
+            emit(v.to_string());
+            emit(notice("ok", &tr("Old data removed")));
+        }
+        Ok(r) => emit(notice("error", &r.error())),
+        Err(e) => emit(notice("error", &e.to_string())),
+    }
+}
+
 /// Reads (or saves, then reads) the VM's CPUs and memory for Settings.
 fn resources(save: Option<serde_json::Value>) {
     let saved = save.map(|body| client::request("POST", "/kiri/resources", Some(&body)));
@@ -1287,6 +1443,13 @@ fn vm_panel(connected: &mut bool) {
                 *connected = false;
             }
             emit(state("stopped", None));
+            if client::alive()
+                && let Ok(mut v) = client::get_background("/kiri/storage")
+                && v["state"] == "unavailable"
+            {
+                v["type"] = "storage".into();
+                emit(v.to_string());
+            }
         }
     }
 }
@@ -2245,6 +2408,47 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
             std::thread::spawn(move || router_ports(Some(body)));
             Ok(())
         }
+        // Settings → Storage: data directory location, validation, and moving.
+        "storage" => {
+            std::thread::spawn(storage_status);
+            Ok(())
+        }
+        "storagepick" => {
+            window::pick_folder(&tr("Choose a storage folder"), |path| {
+                if let Some(p) = path {
+                    std::thread::spawn(move || storage_check(Some(p.to_string_lossy().into_owned()), false, false));
+                }
+            });
+            Ok(())
+        }
+        "storagecheck" => {
+            let path = (!msg.path.trim().is_empty()).then(|| msg.path.clone());
+            let fresh = msg.value["fresh"] == true;
+            let reset = msg.value["reset"] == true;
+            std::thread::spawn(move || storage_check(path, fresh, reset));
+            Ok(())
+        }
+        "storagemove" => {
+            let path = (!msg.path.trim().is_empty()).then(|| msg.path.clone());
+            let fresh = msg.value["fresh"] == true;
+            let tx = tx.clone();
+            std::thread::spawn(move || storage_move(path, fresh, tx));
+            Ok(())
+        }
+        "storagereset" => {
+            let tx = tx.clone();
+            std::thread::spawn(move || storage_reset(tx));
+            Ok(())
+        }
+        "storageretry" => {
+            let tx = tx.clone();
+            std::thread::spawn(move || storage_retry(tx));
+            Ok(())
+        }
+        "storageremoveold" => {
+            std::thread::spawn(storage_remove_old);
+            Ok(())
+        }
         // Settings → Resources.
         "resources" => {
             std::thread::spawn(|| resources(None));
@@ -2490,6 +2694,7 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
             }
             emit(domains_event());
             emit_docker_state();
+            std::thread::spawn(storage_status);
             // A crash since the window last opened, for the page to
             // offer a report; crash files go if the person allowed it.
             std::thread::spawn(|| {

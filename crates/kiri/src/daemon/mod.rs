@@ -30,8 +30,10 @@ pub(crate) mod ports;
 mod pulls;
 mod seccomp;
 mod seccomp_names;
+mod storage;
 pub mod time;
 mod top;
+mod treecopy;
 #[cfg(target_os = "macos")]
 mod usb;
 mod vmcpu;
@@ -201,9 +203,27 @@ pub fn run(_args: &[String]) -> io::Result<()> {
     };
 
     kiri_image::store::set_error_log(|message| diag::error!("image store", detail = message));
-    let store = kiri_image::Store::open(kiri_image::Store::default_root()?)?;
+    let root = match kiri_image::Store::default_root() {
+        Ok(root) => root,
+        Err(e) => match kiri_image::storage::unavailable(&e) {
+            Some(missing) => {
+                return unavailable(
+                    &listener,
+                    socket,
+                    set,
+                    missing.to_owned(),
+                    #[cfg(target_os = "linux")]
+                    &gate,
+                );
+            }
+            None => return Err(e),
+        },
+    };
+    let store = kiri_image::Store::open(root)?;
     let engine = engine::Engine::boot(store).inspect_err(|e| diag::error!("engine did not start", error = e))?;
     diag::info!("engine ready", version = env!("CARGO_PKG_VERSION"), ms = t0.elapsed().as_millis(), socket = format!("unix://{}", socket.display()));
+    // Settings → Storage moved the data and started this daemon on it.
+    storage::after_restart(&engine);
     // Crash files from earlier runs, if the person said they may go.
     diag::report::spawn_crash_sender(Duration::from_secs(30), Some(Duration::from_secs(6 * 3600)));
     // Container files in Finder, at ~/Kiri. A Linux host has them on its
@@ -306,10 +326,26 @@ fn accept(
     #[cfg(target_os = "linux")] gate: &Option<std::sync::Arc<access::Gate>>,
     who: caller::Caller,
 ) {
+    let engine = engine.clone();
+    serve_each(
+        listener,
+        #[cfg(target_os = "linux")]
+        gate,
+        std::sync::Arc::new(move |conn| {
+            let _ = api::serve(conn, engine.clone(), who.clone());
+        }),
+    );
+}
+
+/// Hands each connection `listener` takes to `serve`, on a thread of its own.
+fn serve_each(
+    listener: &UnixListener,
+    #[cfg(target_os = "linux")] gate: &Option<std::sync::Arc<access::Gate>>,
+    serve: std::sync::Arc<dyn Fn(UnixStream) + Send + Sync>,
+) {
     for conn in listener.incoming() {
         let Ok(conn) = conn else { continue };
-        let engine = engine.clone();
-        let who = who.clone();
+        let serve = serve.clone();
         #[cfg(target_os = "linux")]
         let gate = gate.clone();
         let spawned = std::thread::Builder::new().name("kiri-api".into()).spawn(move || {
@@ -319,12 +355,44 @@ fn accept(
             let Ok(_seat) = admit_connection(&gate, &conn) else {
                 return;
             };
-            let _ = api::serve(conn, engine, who);
+            serve(conn);
         });
         if let Err(e) = spawned {
             diag::error!("cannot start a connection thread", error = e);
         }
     }
+}
+
+/// The data folder chosen in Settings → Storage isn't there (its drive
+/// isn't connected): no empty store is made in its place, and the daemon
+/// stays up rather than exiting (launchd and systemd would only start it
+/// again and again), answering what Settings → Storage needs to say so
+/// and offer Retry or Reset to default (storage::serve_unavailable).
+fn unavailable(
+    listener: &UnixListener,
+    socket: PathBuf,
+    set: libc::sigset_t,
+    missing: PathBuf,
+    #[cfg(target_os = "linux")] gate: &Option<std::sync::Arc<access::Gate>>,
+) -> io::Result<()> {
+    diag::error!("Kiri's data folder isn't available: the engine waits for it, or for Settings → Storage", folder = missing.display());
+    std::thread::Builder::new().name("kiri-signals".into()).spawn(move || {
+        let mut sig = 0;
+        // SAFETY: waits on the blocked set; writes the signal number to `sig`.
+        unsafe { libc::sigwait(&set, &mut sig) };
+        let _ = std::fs::remove_file(&socket);
+        let _ = std::fs::remove_file(caller::container_socket(&socket));
+        std::process::exit(0);
+    })?;
+    serve_each(
+        listener,
+        #[cfg(target_os = "linux")]
+        gate,
+        std::sync::Arc::new(move |conn| {
+            let _ = storage::serve_unavailable(conn, &missing);
+        }),
+    );
+    Ok(())
 }
 
 /// When the app this daemon runs from is deleted (appwatch.rs): docker

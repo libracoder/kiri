@@ -256,13 +256,22 @@ pub fn digest_hex(digest: &str) -> io::Result<&str> {
 }
 
 impl Store {
-    /// The per-user data directory: `~/Library/Application Support/Kiri` on
-    /// macOS, `$XDG_DATA_HOME/kiri` (or `~/.local/share/kiri`) elsewhere.
-    /// `KIRI_DATA_DIR` overrides both.
+    /// The data directory: `KIRI_DATA_DIR` if set, else the folder chosen
+    /// in Settings → Storage (`~/.kiri/storage.json`, see
+    /// [`crate::storage`]), else [`Store::os_default_root`]. A chosen folder
+    /// without its marker (a drive that isn't connected) is an error that
+    /// [`crate::storage::unavailable`] recognises, never a fresh folder.
     pub fn default_root() -> io::Result<PathBuf> {
         if let Some(dir) = std::env::var_os("KIRI_DATA_DIR") {
             return Ok(PathBuf::from(dir));
         }
+        crate::storage::resolve(crate::storage::read()?, Self::os_default_root()?)
+    }
+
+    /// The per-user data directory when nothing else is chosen:
+    /// `~/Library/Application Support/Kiri` on macOS, `$XDG_DATA_HOME/kiri`
+    /// (or `~/.local/share/kiri`) elsewhere.
+    pub fn os_default_root() -> io::Result<PathBuf> {
         let home = std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| io::Error::other("HOME is not set"))?;
         Ok(if cfg!(target_os = "macos") {
             home.join("Library/Application Support/Kiri")

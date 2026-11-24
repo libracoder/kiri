@@ -117,6 +117,9 @@ mod refuse;
 // path mapping, buffer decoding and coalescing tested on any host.
 #[cfg(any(windows, test))]
 mod watch;
+// Settings → Storage: custom WSL distro location in %LOCALAPPDATA%\Kiri\storage.json.
+#[cfg(any(windows, test))]
+mod storage;
 // Settings → Import from Docker Desktop: the Mac's and Linux's own
 // crates/kiri/src/import.rs, through the docker CLI's contexts.
 #[cfg(windows)]
