@@ -108,13 +108,22 @@ thread_local! {
 }
 
 /// The container's mounted root, mounting it if nobody has yet.
-pub fn acquire(paths: &Paths, id: &str, layers: &[&str]) -> io::Result<PathBuf> {
+/// When `writable` is true (containers without `--read-only`), refuses a
+/// read-only / `emergency_ro` upper filesystem or read-only overlay fallback.
+pub fn acquire(paths: &Paths, id: &str, layers: &[&str], writable: bool) -> io::Result<PathBuf> {
     container::valid_id(id)?;
     let base = paths.containers.join(id);
     if !TABLE.with_borrow_mut(|t| t.take(&base, layers)) {
-        return Ok(base.join("rootfs"));
+        let rootfs = base.join("rootfs");
+        if writable
+            && let Err(e) = container::ensure_writable_rootfs(&base, &rootfs)
+        {
+            release(&base);
+            return Err(e);
+        }
+        return Ok(rootfs);
     }
-    container::mount_rootfs(paths, id, layers).inspect_err(|_| TABLE.with_borrow_mut(|t| t.forget(&base)))
+    container::mount_rootfs(paths, id, layers, writable).inspect_err(|_| TABLE.with_borrow_mut(|t| t.forget(&base)))
 }
 
 /// Layer hex digests currently held by any active overlay mount.
@@ -159,7 +168,7 @@ pub fn remove(base: &Path) {
 
 /// Unmounts at once when nothing holds the mount, so the next mount of the
 /// same layer never overlaps one still being let go; lazily otherwise.
-fn unmount(rootfs: &Path) {
+pub(super) fn unmount(rootfs: &Path) {
     let Ok(t) = sys::cstr(rootfs) else { return };
     // SAFETY: `t` is a valid NUL-terminated string.
     if unsafe { libc::umount2(t.as_ptr(), 0) } != 0 {

@@ -304,6 +304,10 @@ mod imp {
         read().map(|c| c.path).unwrap_or_else(default_root)
     }
 
+    pub fn current_vhdx() -> PathBuf {
+        current_root().join("ext4.vhdx")
+    }
+
     fn dir_size(dir: &Path) -> u64 {
         let Ok(entries) = fs::read_dir(dir) else { return 0 };
         let mut total = 0u64;

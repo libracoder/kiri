@@ -1642,10 +1642,18 @@ impl Engine {
         self.records_damage.lock().unwrap_or_else(|e| e.into_inner()).message(&self.records).into_iter().collect()
     }
 
+    /// Actionable error when Kiri's Linux / WSL 2 storage filesystem is
+    /// mounted read-only (`ST_RDONLY`, `ro`, or ext4 `emergency_ro`, #768).
+    pub fn storage_readonly(&self) -> Option<String> {
+        super::rofs::check_daemon_storage(Some(self.store.root()))
+    }
+
     /// What the agent found wrong with a Linux host, for `docker info`
-    /// (`VmLink::host_warnings`), or a Mac VM uplink fallback failure.
+    /// (`VmLink::host_warnings`), a read-only storage filesystem, or a Mac VM
+    /// uplink fallback failure.
     pub fn host_warnings(&self) -> Vec<String> {
-        let mut out = self.awake().map(|vm| vm.host_warnings()).unwrap_or_default();
+        let mut out: Vec<String> = self.storage_readonly().into_iter().collect();
+        out.extend(self.awake().map(|vm| vm.host_warnings()).unwrap_or_default());
         if let Some(w) = self.uplink.lock().unwrap_or_else(|e| e.into_inner())["warning"].as_str() {
             out.push(w.to_owned());
         }
@@ -1782,6 +1790,10 @@ impl Engine {
             cpus: Some(cpus),
             disk_gb: disk_cfg,
             ..Default::default()
+        })
+        .map_err(|e| match self.storage_readonly() {
+            Some(ro) => io::Error::new(e.kind(), ro),
+            None => e,
         })
         .inspect_err(|e| crate::diag::error!("VM did not boot", error = e))?;
         self.disk_gb.store(crate::guest::disk::current_gb(), std::sync::atomic::Ordering::Relaxed);

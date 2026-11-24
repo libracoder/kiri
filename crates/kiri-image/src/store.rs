@@ -296,8 +296,14 @@ impl Store {
 
     pub fn open(root: impl Into<PathBuf>) -> io::Result<Store> {
         let root = root.into();
-        fs::create_dir_all(root.join("blobs/sha256"))?;
-        fs::create_dir_all(root.join("tmp"))?;
+        let blobs = root.join("blobs/sha256");
+        if !blobs.is_dir() {
+            fs::create_dir_all(blobs)?;
+        }
+        let tmp = root.join("tmp");
+        if !tmp.is_dir() {
+            fs::create_dir_all(tmp)?;
+        }
         Ok(Store { root })
     }
 

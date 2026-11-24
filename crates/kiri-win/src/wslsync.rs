@@ -201,6 +201,107 @@ pub fn encode_enabled_distros(distros: &[String]) -> Vec<u8> {
     serde_json::to_vec_pretty(&serde_json::json!({ "distros": distros })).unwrap_or_default()
 }
 
+/// Why Kiri's WSL 2 storage filesystem (`/` or `/var/lib/kiri`) is read-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WslReadOnly {
+    /// Linux ext4 aborted its journal (`errors=remount-ro`) and added `emergency_ro`.
+    EmergencyRo,
+    /// Mounted read-only (`ro`).
+    ReadOnly,
+}
+
+impl WslReadOnly {
+    fn merge(self, other: Self) -> Self {
+        if self == Self::EmergencyRo || other == Self::EmergencyRo {
+            Self::EmergencyRo
+        } else {
+            Self::ReadOnly
+        }
+    }
+}
+
+fn unescape_proc_mount_path(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\'
+            && i + 3 < bytes.len()
+            && bytes[i + 1..i + 4].iter().all(|b| (b'0'..=b'7').contains(b))
+        {
+            let val = ((bytes[i + 1] - b'0') << 6) | ((bytes[i + 2] - b'0') << 3) | (bytes[i + 3] - b'0');
+            out.push(val);
+            i += 4;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn parse_mount_opts(opts: &str) -> Option<WslReadOnly> {
+    let mut ro = false;
+    for opt in opts.split(',') {
+        match opt.trim() {
+            "emergency_ro" => return Some(WslReadOnly::EmergencyRo),
+            "ro" => ro = true,
+            _ => {}
+        }
+    }
+    ro.then_some(WslReadOnly::ReadOnly)
+}
+
+fn mount_for_target(proc_mounts: &str, target: &str) -> Option<WslReadOnly> {
+    let mut best: Option<(usize, Option<WslReadOnly>)> = None;
+    for line in proc_mounts.lines() {
+        let mut f = line.split_whitespace();
+        let (Some(_spec), Some(mp_raw), Some(_fstype), Some(opts)) = (f.next(), f.next(), f.next(), f.next()) else {
+            continue;
+        };
+        let mp = unescape_proc_mount_path(mp_raw);
+        let mp_norm = {
+            let t = mp.trim_end_matches('/');
+            if t.is_empty() { "/" } else { t }
+        };
+        let covers = mp_norm == "/"
+            || target == mp_norm
+            || (target.starts_with(mp_norm) && target.as_bytes().get(mp_norm.len()) == Some(&b'/'));
+        if covers && best.is_none_or(|(len, _)| mp_norm.len() >= len) {
+            best = Some((mp_norm.len(), parse_mount_opts(opts)));
+        }
+    }
+    best.and_then(|(_, kind)| kind)
+}
+
+/// Checks `/proc/mounts` text from Kiri's WSL distro for `/` or `/var/lib/kiri`
+/// mounted read-only (`ro` or ext4 `emergency_ro`, #768).
+pub fn parse_wsl_readonly_mounts(proc_mounts: &str) -> Option<WslReadOnly> {
+    match (mount_for_target(proc_mounts, "/"), mount_for_target(proc_mounts, "/var/lib/kiri")) {
+        (Some(a), Some(b)) => Some(a.merge(b)),
+        (Some(a), None) | (None, Some(a)) => Some(a),
+        (None, None) => None,
+    }
+}
+
+/// Formats an actionable recovery message naming `vhdx_path` when known.
+pub fn wsl_readonly_message(kind: WslReadOnly, vhdx_path: Option<&Path>) -> String {
+    let state = match kind {
+        WslReadOnly::EmergencyRo => "was remounted read-only by Linux (emergency_ro)",
+        WslReadOnly::ReadOnly => "is mounted read-only (emergency_ro)",
+    };
+    let vhdx = vhdx_path
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| r"<path>\ext4.vhdx".to_owned());
+    format!(
+        "Kiri's WSL2 disk (ext4.vhdx) {state} after an unclean shutdown or filesystem error. \
+         To recover: 1) run `wsl --shutdown` in PowerShell; \
+         2) attach the disk bare with `wsl --mount \"{vhdx}\" --vhd --bare`; \
+         3) from another Linux distro in WSL, find the device with `lsblk` and run `sudo e2fsck -f -y -D /dev/<disk>`, then `wsl --unmount`; \
+         or move/recreate storage in Settings -> Storage."
+    )
+}
+
 /// SHA-256 of `"kiri"`, used by the Docker CLI for `~/.docker/contexts/meta/<hash>/meta.json`.
 const KIRI_CONTEXT_HASH: &str = "c288b06224b0bc4af8a3d80f683a27a8fc72e45f901a7e6766109e2fc1d5c2b9";
 
@@ -426,7 +527,33 @@ mod tests {
     /// is Windows' quoting, not sh's.
     #[test]
     fn the_script_has_no_backslash() {
+        assert!(!KIRI_START.contains('\\'));
         assert!(!sync_script(Path::new("C:/Users/x/AppData/Local/Kiri"), "", true).contains('\\'));
+    }
+
+    #[test]
+    fn kiri_start_refuses_emergency_ro_with_clean_recovery_message() {
+        let dir = std::env::temp_dir().join(format!("kiri-start-ro-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mounts = dir.join("mounts");
+        std::fs::write(
+            &mounts,
+            "/dev/sdd / ext4 rw,relatime,discard,errors=remount-ro,data=ordered,emergency_ro 0 0\ntmpfs /run tmpfs rw,nosuid,nodev,mode=755 0 0\n",
+        )
+        .unwrap();
+        let out = Command::new("sh")
+            .args(["-c", KIRI_START])
+            .env("KIRI_PROC_MOUNTS", &mounts)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2));
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("Kiri's WSL2 disk (ext4.vhdx) was remounted read-only by Linux (emergency_ro)"), "{err}");
+        assert!(err.contains("wsl --shutdown") && err.contains("wsl --mount") && err.contains("e2fsck -f -y -D"), "{err}");
+        assert!(err.contains("Settings -> Storage"), "{err}");
+        assert!(!err.contains(r"'\''") && !err.contains('\x1b'), "unescaped quotes or control chars leaked: {err:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// An engine older than this app is restarted once: not again after
@@ -600,5 +727,30 @@ mod tests {
         assert!(own_sock.exists(), "running dockerd socket must not be removed on disable");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod ro_tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn parses_wsl_proc_mounts_and_formats_vhdx_recovery_message() {
+        let healthy = "/dev/sdd / ext4 rw,relatime,discard,errors=remount-ro,data=ordered 0 0\n";
+        assert_eq!(parse_wsl_readonly_mounts(healthy), None);
+
+        let emergency = "/dev/sdd / ext4 rw,relatime,discard,errors=remount-ro,data=ordered,emergency_ro 0 0\n";
+        assert_eq!(parse_wsl_readonly_mounts(emergency), Some(WslReadOnly::EmergencyRo));
+
+        let separate_ro = "/dev/sda1 / ext4 rw,relatime 0 0\n/dev/sdb1 /var/lib/kiri ext4 ro,relatime 0 0\n";
+        assert_eq!(parse_wsl_readonly_mounts(separate_ro), Some(WslReadOnly::ReadOnly));
+
+        let overmounted_rw = "/dev/sda1 / ext4 rw,relatime 0 0\n/dev/sdb1 /var/lib/kiri ext4 ro,relatime 0 0\n/dev/sdb1 /var/lib/kiri ext4 rw,relatime 0 0\n";
+        assert_eq!(parse_wsl_readonly_mounts(overmounted_rw), None);
+
+        let msg = wsl_readonly_message(WslReadOnly::EmergencyRo, Some(Path::new(r"D:\KiriData\ext4.vhdx")));
+        assert!(msg.contains(r#"wsl --mount "D:\KiriData\ext4.vhdx" --vhd --bare"#), "{msg}");
+        assert!(msg.contains("wsl --shutdown") && msg.contains("e2fsck -f -y -D") && msg.contains("Settings -> Storage"), "{msg}");
     }
 }

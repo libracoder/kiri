@@ -15,6 +15,9 @@ pub const REQUEST_WAIT: Duration = Duration::from_secs(2);
 /// before reasons sends it for an engine it could not reach too.
 pub fn message(why: Option<&str>) -> String {
     match why {
+        Some(why) if why.contains("emergency_ro") || why.contains("mounted read-only") || why.contains("remounted read-only") => {
+            format!("Kiri's engine did not start: {why}")
+        }
         Some(why) => format!("Kiri's engine did not start: {why}. Run `kiri start`, or open Kiri and press Start"),
         None => "Kiri's engine closed the connection without answering".to_owned(),
     }
@@ -114,6 +117,10 @@ mod tests {
     #[test]
     fn a_close_with_no_reason_says_only_what_happened() {
         assert_eq!(message(None), "Kiri's engine closed the connection without answering");
+        let ro = "Kiri's WSL2 disk (ext4.vhdx) was remounted read-only by Linux (emergency_ro) after an unclean shutdown or filesystem error.";
+        let got = message(Some(ro));
+        assert_eq!(got, format!("Kiri's engine did not start: {ro}"));
+        assert!(!got.contains("press Start"), "{got}");
     }
 
     /// The refusal waits for the request, and no longer than it is given.

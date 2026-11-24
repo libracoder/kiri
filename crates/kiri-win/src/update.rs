@@ -290,6 +290,9 @@ pub fn restart_engine() -> io::Result<()> {
     std::os::windows::process::CommandExt::creation_flags(&mut cmd, CREATE_NO_WINDOW);
     let out = output_within(cmd.args(crate::wslsync::wsl_sh(&distro, &script)), RESTART_LIMIT)?;
     if !out.status.success() {
+        if let Some(ro) = crate::engine::probe_wsl_readonly(Some(&distro)) {
+            return Err(io::Error::other(ro));
+        }
         return Err(io::Error::other(first_line(&out.stderr, "the engine did not restart")));
     }
     // Done only when the engine answers as this version: a restart that
@@ -592,6 +595,9 @@ pub fn sync_engine() -> io::Result<bool> {
     std::os::windows::process::CommandExt::creation_flags(&mut cmd, CREATE_NO_WINDOW);
     let out = output_within(cmd.args(crate::wslsync::wsl_sh(&distro, &script)), WSL_LIMIT)?;
     if !out.status.success() {
+        if let Some(ro) = crate::engine::probe_wsl_readonly(Some(&distro)) {
+            return Err(io::Error::other(ro));
+        }
         return Err(io::Error::other(first_line(&out.stderr, "could not copy the engine into WSL")));
     }
     Ok(String::from_utf8_lossy(&out.stdout).contains("copied"))
