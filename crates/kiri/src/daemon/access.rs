@@ -1558,6 +1558,22 @@ pub fn set(socket: &Path, uids: &[u32]) -> io::Result<()> {
     if r == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
 }
 
+/// Best-effort grants a single non-root `uid` (such as `SUDO_UID` when running
+/// `sudo kiri daemon`) read-write POSIX ACL access on each socket, keeping
+/// owner/group rw and other `---`. Ignores filesystems without ACL support.
+pub fn grant_uid(sockets: &[&Path], uid: u32) {
+    if uid == 0 || uid == u32::MAX {
+        return;
+    }
+    for socket in sockets {
+        if let Err(e) = set(socket, &[uid])
+            && !unsupported(&e)
+        {
+            crate::diag::warn!("socket access list for invoking user not written", uid = uid, path = socket.display(), error = e);
+        }
+    }
+}
+
 /// Writes the access list of every one of `sockets` with `set`, each tried
 /// whatever became of the one before; the first error, if any.
 fn set_each(sockets: &[PathBuf], uids: &[u32], set: impl Fn(&Path, &[u32]) -> io::Result<()>) -> io::Result<()> {

@@ -314,3 +314,6 @@ crates/kiri-image/src/reference.rs	#746	Reference::parse and archive::load accep
 crates/kiri/src/daemon/mirror.rs	#746	registry and mirror names were written into buildkitd.toml without TOML string escaping, so a quote or backslash broke buildkitd startup on every build
 crates/kiri/src/daemon/http.rs	#745	chunked request bodies left trailer headers on keep-alive connections, Expect: 100-continue never sent 100 Continue before reading bodies, and conflicting Transfer-Encoding + Content-Length headers were not rejected with 400 Bad Request (#134)
 tests/ui/watch-bind-mounts.js	#487	Settings -> Resources had no toggle on Windows to turn C:\ bind-mount file events (watchBindMounts) on or off
+crates/kiri/src/client.rs	#836	Linux client socket discovery missed WSL 2 integration sockets under /mnt/wsl/kiri/sockets/<distro>/docker.sock (and /var/run/docker.sock symlinks to them) and reported socket EACCES as "Kiri isn't running"
+crates/kiri/src/daemon/mod.rs	#836	non-root kiri daemon on Linux bound ~/.kiri/run/docker.sock instead of failing fast, and sudo kiri daemon did not fall back to the kiri group, grant SUDO_UID POSIX ACL access, or link /run/docker.sock when free
+crates/kiri/src/docker.rs	#836	kiri docker subcommands reported socket permission errors and Linux/WSL not-running errors with the macOS `kiri daemon` message instead of OS-accurate guidance

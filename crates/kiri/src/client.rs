@@ -5,23 +5,102 @@
 // Parts of this serve only the Mac (the window, boot timings).
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 
+use std::ffi::OsStr;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use serde_json::Value;
 
 pub fn socket() -> io::Result<PathBuf> {
-    if let Some(s) = std::env::var_os("KIRI_SOCKET") {
+    let kiri_socket = std::env::var_os("KIRI_SOCKET");
+    let home = std::env::var_os("HOME");
+    #[cfg(target_os = "linux")]
+    {
+        let wsl_distro = std::env::var_os("WSL_DISTRO_NAME");
+        let wsl_sockets_dir = PathBuf::from(crate::daemon::binds::wsl_kiri_dir()).join("sockets");
+        socket_for(
+            kiri_socket.as_deref(),
+            Some(Path::new(SERVICE_SOCKET)),
+            wsl_distro.as_deref(),
+            Some(wsl_sockets_dir.as_path()),
+            &[Path::new("/var/run/docker.sock"), Path::new("/run/docker.sock")],
+            home.as_deref(),
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        socket_for(kiri_socket.as_deref(), None, None, None, &[], home.as_deref())
+    }
+}
+
+fn safe_wsl_distro(name: &str) -> bool {
+    crate::daemon::binds::valid_distro_name(name) && !name.contains("..")
+}
+
+fn is_wsl_socket_path(target: &Path, wsl_sockets_dir: &Path) -> bool {
+    let Ok(rel) = target.strip_prefix(wsl_sockets_dir) else {
+        return false;
+    };
+    let mut comps = rel.components();
+    match (comps.next(), comps.next(), comps.next()) {
+        (Some(Component::Normal(distro)), Some(Component::Normal(file)), None) => {
+            distro.to_str().is_some_and(safe_wsl_distro) && file == "docker.sock"
+        }
+        _ => false,
+    }
+}
+
+/// Whether a socket path is present on disk, treating `EACCES` on a parent
+/// directory (such as a `0750` WSL integration socket directory) as present so
+/// `check_alive` surfaces a clear permission-denied error instead of falling
+/// back to a missing home socket.
+fn socket_present(path: &Path) -> bool {
+    match std::fs::metadata(path) {
+        Ok(_) => true,
+        Err(e) => e.kind() == io::ErrorKind::PermissionDenied,
+    }
+}
+
+fn socket_for(
+    kiri_socket: Option<&OsStr>,
+    service_socket: Option<&Path>,
+    wsl_distro: Option<&OsStr>,
+    wsl_sockets_dir: Option<&Path>,
+    docker_sock_links: &[&Path],
+    home: Option<&OsStr>,
+) -> io::Result<PathBuf> {
+    if let Some(s) = kiri_socket {
         return Ok(PathBuf::from(s));
     }
-    // Linux: the engine is the `kiri` system service (contrib/linux/kiri.service).
-    #[cfg(target_os = "linux")]
-    if std::path::Path::new(SERVICE_SOCKET).exists() {
-        return Ok(PathBuf::from(SERVICE_SOCKET));
+    // Linux: the engine is the `kiri` system service (contrib/linux/kiri.service)
+    // or a root-run `sudo kiri daemon` at `/run/kiri/docker.sock`.
+    if let Some(service) = service_socket
+        && socket_present(service)
+    {
+        return Ok(service.to_path_buf());
     }
-    let home = std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| io::Error::other("HOME is not set"))?;
+    // WSL 2 integration: Kiri for Windows exposes per-distro sockets under
+    // `/mnt/wsl/kiri/sockets/<distro>/docker.sock` and symlinks
+    // `/var/run/docker.sock` to them.
+    if let Some(wsl_dir) = wsl_sockets_dir {
+        if let Some(distro) = wsl_distro.and_then(|d| d.to_str()).filter(|d| safe_wsl_distro(d)) {
+            let candidate = wsl_dir.join(distro).join("docker.sock");
+            if socket_present(&candidate) {
+                return Ok(candidate);
+            }
+        }
+        for link in docker_sock_links {
+            if let Ok(target) = std::fs::read_link(link)
+                && is_wsl_socket_path(&target, wsl_dir)
+                && socket_present(&target)
+            {
+                return Ok(target);
+            }
+        }
+    }
+    let home = home.map(PathBuf::from).ok_or_else(|| io::Error::other("HOME is not set"))?;
     Ok(home.join(crate::flavor::STATE.get()).join("run/docker.sock"))
 }
 
@@ -50,10 +129,14 @@ impl Response {
     }
 }
 
-fn connect(timeout: Option<Duration>) -> io::Result<UnixStream> {
-    let s = UnixStream::connect(socket()?)?;
+fn connect_to(sock: &Path, timeout: Option<Duration>) -> io::Result<UnixStream> {
+    let s = UnixStream::connect(sock)?;
     s.set_read_timeout(timeout)?;
     Ok(s)
+}
+
+fn connect(timeout: Option<Duration>) -> io::Result<UnixStream> {
+    connect_to(&socket()?, timeout)
 }
 
 fn head(r: &mut impl BufRead) -> io::Result<(u16, Option<usize>, bool)> {
@@ -113,7 +196,11 @@ pub fn get_background(path: &str) -> io::Result<Value> {
 }
 
 fn send(method: &str, path: &str, body: Option<&Value>, extra: &str) -> io::Result<Response> {
-    let mut s = connect(Some(Duration::from_secs(120)))?;
+    send_to(&socket()?, method, path, body, extra)
+}
+
+fn send_to(sock: &Path, method: &str, path: &str, body: Option<&Value>, extra: &str) -> io::Result<Response> {
+    let mut s = connect_to(sock, Some(Duration::from_secs(120)))?;
     let payload = body.map(Value::to_string).unwrap_or_default();
     // The window's action this is part of, for the engine's log lines.
     let op = crate::diag::op_header();
@@ -219,6 +306,65 @@ pub fn get(path: &str) -> io::Result<Value> {
 /// Whether the daemon answers at all.
 pub fn alive() -> bool {
     send("GET", "/_ping", None, "X-Kiri-Background: 1\r\n").is_ok_and(|r| r.ok())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn is_wsl_env(wsl_distro: Option<&OsStr>, wsl_interop_paths: &[&Path]) -> bool {
+    wsl_distro.is_some_and(|s| !s.is_empty()) || wsl_interop_paths.iter().any(|p| p.exists())
+}
+
+fn not_running_message_for(is_linux: bool, is_wsl: bool) -> &'static str {
+    if !is_linux {
+        "Kiri isn't running. Open Kiri, or start it with `kiri daemon`"
+    } else if is_wsl {
+        "Kiri isn't running. Open Kiri on Windows (and enable this distro in Settings -> Resources -> WSL integration), or run `sudo kiri host-access $USER`"
+    } else {
+        "Kiri isn't running. Open Kiri, or run `sudo kiri host-access $USER` (or `sudo kiri daemon`)"
+    }
+}
+
+/// Actionable OS-specific error text when the engine is not running.
+pub fn not_running_message() -> &'static str {
+    #[cfg(target_os = "linux")]
+    let wsl = is_wsl_env(
+        std::env::var_os("WSL_DISTRO_NAME").as_deref(),
+        &[Path::new("/proc/sys/fs/binfmt_misc/WSLInterop"), Path::new("/proc/sys/fs/binfmt_misc/WSLInterop-late")],
+    );
+    #[cfg(not(target_os = "linux"))]
+    let wsl = false;
+    not_running_message_for(cfg!(target_os = "linux"), wsl)
+}
+
+fn permission_denied_error(sock: &Path, is_linux: bool) -> io::Error {
+    let msg = if is_linux {
+        format!(
+            "cannot connect to Kiri's socket ({}): permission denied. Run `sudo kiri host-access $USER` (or open Kiri) to grant access",
+            sock.display()
+        )
+    } else {
+        format!("cannot connect to Kiri's socket ({}): permission denied", sock.display())
+    };
+    io::Error::new(io::ErrorKind::PermissionDenied, msg)
+}
+
+fn check_alive_at(sock: &Path, not_running: &str) -> io::Result<()> {
+    match send_to(sock, "GET", "/_ping", None, "X-Kiri-Background: 1\r\n") {
+        Ok(r) if r.ok() => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => Err(permission_denied_error(sock, cfg!(target_os = "linux"))),
+        _ => Err(io::Error::new(io::ErrorKind::NotConnected, not_running)),
+    }
+}
+
+/// Probes the engine socket, distinguishing `PermissionDenied` (`EACCES`) from
+/// the daemon not running and formatting OS-appropriate guidance.
+pub fn check_alive() -> io::Result<()> {
+    check_alive_with(not_running_message())
+}
+
+/// Like [`check_alive`], using `not_running` when the daemon is not running.
+pub fn check_alive_with(not_running: &str) -> io::Result<()> {
+    let sock = socket()?;
+    check_alive_at(&sock, not_running)
 }
 
 /// A POST whose answer is JSON lines arriving over time (a pull's
@@ -375,7 +521,20 @@ fn lite_cli() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use std::io;
+    use std::ffi::OsStr;
+    use std::io::{self, Read, Write};
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!("kiri-client-{tag}-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 
     /// `kiri import` streams a container's writable layer (#410): the body
     /// is chunked, and ended only when all of it was written, so the daemon
@@ -398,5 +557,156 @@ mod tests {
         assert_eq!(e.to_string(), "the source failed");
         assert!(!wire.ends_with(b"0\r\n\r\n"), "{:?}", String::from_utf8_lossy(&wire));
         assert!(super::refused(&io::Error::from(io::ErrorKind::BrokenPipe)) && !super::refused(&io::Error::other("x")));
+    }
+
+    #[test]
+    fn socket_for_discovers_wsl_integration_sockets_and_symlinks() {
+        let root = temp_dir("wsl-sock");
+        let home = root.join("home/alice");
+        let service = root.join("run/kiri/docker.sock");
+        let wsl_sockets = root.join("mnt/wsl/kiri/sockets");
+        let ubuntu_sock = wsl_sockets.join("Ubuntu/docker.sock");
+        let var_run_link = root.join("var/run/docker.sock");
+        let run_link = root.join("run/docker.sock");
+        for d in [home.as_path(), service.parent().unwrap(), ubuntu_sock.parent().unwrap(), var_run_link.parent().unwrap(), run_link.parent().unwrap()] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let home_sock = home.join(crate::flavor::STATE.get()).join("run/docker.sock");
+
+        // 1. Nothing exists yet: falls back to HOME socket.
+        assert_eq!(
+            super::socket_for(None, Some(&service), Some(OsStr::new("Ubuntu")), Some(&wsl_sockets), &[&var_run_link, &run_link], Some(home.as_os_str())).unwrap(),
+            home_sock
+        );
+
+        // 2. WSL integration socket for WSL_DISTRO_NAME exists: discovered cleanly.
+        std::fs::write(&ubuntu_sock, "").unwrap();
+        assert_eq!(
+            super::socket_for(None, Some(&service), Some(OsStr::new("Ubuntu")), Some(&wsl_sockets), &[&var_run_link, &run_link], Some(home.as_os_str())).unwrap(),
+            ubuntu_sock
+        );
+
+        // 3. Unsafe WSL_DISTRO_NAME values are ignored (never traverse outside wsl_sockets).
+        for bad in ["", ".", "..", "../Ubuntu", "Ubuntu/..", "a/b", r"a\b", "foo..bar", "Ubuntu\n"] {
+            assert_eq!(
+                super::socket_for(None, Some(&service), Some(OsStr::new(bad)), Some(&wsl_sockets), &[&var_run_link, &run_link], Some(home.as_os_str())).unwrap(),
+                home_sock,
+                "unsafe distro name must be ignored: {bad:?}"
+            );
+        }
+
+        // 4. When WSL_DISTRO_NAME is stripped (sudo/ssh/cron), /var/run/docker.sock -> /mnt/wsl/kiri/sockets/<distro>/docker.sock resolves.
+        std::os::unix::fs::symlink(&ubuntu_sock, &var_run_link).unwrap();
+        assert_eq!(
+            super::socket_for(None, Some(&service), None, Some(&wsl_sockets), &[&var_run_link, &run_link], Some(home.as_os_str())).unwrap(),
+            ubuntu_sock
+        );
+        // Same through /run/docker.sock when /var/run/docker.sock is absent.
+        std::fs::remove_file(&var_run_link).unwrap();
+        std::os::unix::fs::symlink(&ubuntu_sock, &run_link).unwrap();
+        assert_eq!(
+            super::socket_for(None, Some(&service), None, Some(&wsl_sockets), &[&var_run_link, &run_link], Some(home.as_os_str())).unwrap(),
+            ubuntu_sock
+        );
+
+        // 5. Symlinks outside wsl_sockets or with traversal are ignored.
+        std::fs::remove_file(&run_link).unwrap();
+        let other_sock = root.join("other.sock");
+        std::fs::write(&other_sock, "").unwrap();
+        std::os::unix::fs::symlink(&other_sock, &var_run_link).unwrap();
+        let traversal = wsl_sockets.join("../other/docker.sock");
+        std::os::unix::fs::symlink(&traversal, &run_link).unwrap();
+        assert_eq!(
+            super::socket_for(None, Some(&service), None, Some(&wsl_sockets), &[&var_run_link, &run_link], Some(home.as_os_str())).unwrap(),
+            home_sock
+        );
+
+        // 6. Service socket (/run/kiri/docker.sock) takes precedence over WSL sockets.
+        std::fs::write(&service, "").unwrap();
+        assert_eq!(
+            super::socket_for(None, Some(&service), Some(OsStr::new("Ubuntu")), Some(&wsl_sockets), &[&var_run_link, &run_link], Some(home.as_os_str())).unwrap(),
+            service
+        );
+
+        // 7. Explicit KIRI_SOCKET takes precedence over everything.
+        assert_eq!(
+            super::socket_for(Some(OsStr::new("/custom/kiri.sock")), Some(&service), Some(OsStr::new("Ubuntu")), Some(&wsl_sockets), &[&var_run_link, &run_link], Some(home.as_os_str())).unwrap(),
+            PathBuf::from("/custom/kiri.sock")
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn check_alive_distinguishes_alive_not_running_and_permission_denied() {
+        let dir = temp_dir("alive");
+        let missing = dir.join("missing.sock");
+        let err = super::check_alive_at(&missing, "not running msg").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotConnected);
+        assert_eq!(err.to_string(), "not running msg");
+
+        // Live server responding 200 OK to /_ping succeeds.
+        let live = dir.join("live.sock");
+        let listener = UnixListener::bind(&live).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut req = Vec::new();
+            let mut buf = [0u8; 256];
+            while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                match conn.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => req.extend_from_slice(&buf[..n]),
+                }
+            }
+            conn.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK").unwrap();
+            let _ = conn.flush();
+            let _ = conn.shutdown(std::net::Shutdown::Write);
+        });
+        super::check_alive_at(&live, "not running msg").unwrap();
+        server.join().unwrap();
+
+        // Linux permission-denied message guides user to host-access.
+        let linux_perm = super::permission_denied_error(Path::new("/run/kiri/docker.sock"), true);
+        assert_eq!(linux_perm.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            linux_perm.to_string(),
+            "cannot connect to Kiri's socket (/run/kiri/docker.sock): permission denied. Run `sudo kiri host-access $USER` (or open Kiri) to grant access"
+        );
+
+        // Unprivileged connect to a 0000 socket surfaces PermissionDenied directly.
+        // SAFETY: geteuid cannot fail.
+        if unsafe { libc::geteuid() } != 0 {
+            let locked = dir.join("locked.sock");
+            let _listener = UnixListener::bind(&locked).unwrap();
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let err = super::check_alive_at(&locked, "not running msg").unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+            assert!(err.to_string().contains("permission denied"), "got: {err}");
+            assert!(err.to_string().contains(&locked.display().to_string()), "got: {err}");
+        }
+
+        // OS- and WSL-specific not-running messages.
+        assert_eq!(
+            super::not_running_message_for(false, false),
+            "Kiri isn't running. Open Kiri, or start it with `kiri daemon`"
+        );
+        assert_eq!(
+            super::not_running_message_for(true, true),
+            "Kiri isn't running. Open Kiri on Windows (and enable this distro in Settings -> Resources -> WSL integration), or run `sudo kiri host-access $USER`"
+        );
+        assert_eq!(
+            super::not_running_message_for(true, false),
+            "Kiri isn't running. Open Kiri, or run `sudo kiri host-access $USER` (or `sudo kiri daemon`)"
+        );
+
+        // WSL detection via WSL_DISTRO_NAME or binfmt_misc interop file.
+        let interop = dir.join("WSLInterop");
+        assert!(!super::is_wsl_env(None, &[&interop]));
+        assert!(!super::is_wsl_env(Some(OsStr::new("")), &[&interop]));
+        assert!(super::is_wsl_env(Some(OsStr::new("Ubuntu")), &[&interop]));
+        std::fs::write(&interop, "enabled\n").unwrap();
+        assert!(super::is_wsl_env(None, &[&interop]));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

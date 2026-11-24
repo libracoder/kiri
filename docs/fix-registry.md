@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #836 CLI & Daemon: discover WSL 2 integration sockets, fail fast on non-root Linux daemon, grant invoking sudo user access, and distinguish socket permission errors (unreleased)
+- Fixes: #836 Kiri isn't running. Open Kiri, or start it with `kiri daemon`
+- Caused: none known
+- Caused by: -
+- Check: `crates/kiri/src/client.rs`, `crates/kiri/src/daemon/mod.rs`, `crates/kiri/src/docker.rs`
+
 ### #487 UI & Diagnostics: add Windows bind-watch toggle, fix narrow socket layout, and remove macOS copy on Linux/Windows (unreleased)
 - Fixes: #487 Windows: `C:\` bind-mount file changes don't trigger inotify inside containers (Settings UI toggle)
 - Caused: none known

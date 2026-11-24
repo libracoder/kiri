@@ -130,10 +130,15 @@ fn usage() -> String {
     USAGE_LINES.join("\n")
 }
 
+#[cfg(any(windows, test))]
+const WINDOWS_DAEMON_ERROR: &str = "on Windows, Kiri's engine runs in WSL without `kiri daemon`: run `kiri start` or open Kiri";
+
 #[derive(Debug, PartialEq, Eq)]
 enum Command<'a> {
     #[cfg(unix)]
     Daemon(&'a [String]),
+    #[cfg(windows)]
+    Daemon,
     #[cfg(target_os = "linux")]
     Bridge(&'a [String]),
     #[cfg(target_os = "linux")]
@@ -193,6 +198,8 @@ impl<'a> Command<'a> {
         match args.first().map(String::as_str) {
             #[cfg(unix)]
             Some("daemon") => Some(Command::Daemon(&args[1..])),
+            #[cfg(windows)]
+            Some("daemon") => Some(Command::Daemon),
             #[cfg(target_os = "linux")]
             Some("bridge") => Some(Command::Bridge(&args[1..])),
             #[cfg(target_os = "linux")]
@@ -274,6 +281,8 @@ fn main() -> ExitCode {
     let result: std::io::Result<()> = match Command::parse(&args) {
         #[cfg(unix)]
         Some(Command::Daemon(rest)) => daemon::run(rest),
+        #[cfg(windows)]
+        Some(Command::Daemon) => Err(std::io::Error::other(WINDOWS_DAEMON_ERROR)),
         #[cfg(target_os = "linux")]
         Some(Command::Bridge(rest)) => bridge::run(rest),
         #[cfg(target_os = "linux")]
@@ -384,6 +393,18 @@ fn window(args: &[String]) -> std::io::Result<()> {
     Err(std::process::Command::new(WINDOW).args(args).exec())
 }
 
+#[cfg(unix)]
+fn engine_start_not_running_message() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        "Kiri's engine isn't running. Open Kiri, or start it with `kiri daemon`"
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        client::not_running_message()
+    }
+}
+
 /// `kiri start`: Kiri on again after a Stop (the window's, the tray's or
 /// the menu bar's), as the window's Start does; the containers Stop held
 /// come back. On an engine that wasn't stopped it only wakes the VM.
@@ -396,9 +417,7 @@ fn engine_start() -> std::io::Result<()> {
         }
         update::start_engine()?;
     }
-    if !client::alive() {
-        return Err(std::io::Error::other("Kiri's engine isn't running. Open Kiri, or start it with `kiri daemon`"));
-    }
+    client::check_alive_with(engine_start_not_running_message())?;
     let r = client::request("POST", "/kiri/wake", None)?;
     // 404: a Linux host's engine, which has no VM to wake and no Stop.
     if !r.ok() && r.status != 404 {
@@ -559,8 +578,16 @@ mod tests {
             assert!(parse(&[mac_cmd]).is_none(), "`kiri {mac_cmd}` should not dispatch on Linux");
         }
         #[cfg(windows)]
-        for unix_cmd in ["daemon", "bridge", "ui", "setup", "build-with", "import", "bench", "boot", "raw"] {
-            assert!(parse(&[unix_cmd]).is_none(), "`kiri {unix_cmd}` should not dispatch on Windows");
+        {
+            for unix_cmd in ["bridge", "ui", "setup", "build-with", "import", "bench", "boot", "raw"] {
+                assert!(parse(&[unix_cmd]).is_none(), "`kiri {unix_cmd}` should not dispatch on Windows");
+            }
+            let daemon_args = ["daemon".to_owned()];
+            assert_eq!(Command::parse(&daemon_args), Some(Command::Daemon));
         }
+        assert_eq!(
+            super::WINDOWS_DAEMON_ERROR,
+            "on Windows, Kiri's engine runs in WSL without `kiri daemon`: run `kiri start` or open Kiri"
+        );
     }
 }

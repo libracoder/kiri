@@ -111,7 +111,62 @@ fn raise_open_files() {
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn ensure_linux_root(euid: u32) -> io::Result<()> {
+    if euid != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "on Linux, Kiri runs containers on this machine's kernel and needs root: run `sudo kiri host-access $USER` (or `sudo kiri daemon`)",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn sudo_uid_from(raw: Option<&std::ffi::OsStr>) -> Option<u32> {
+    let uid: u32 = raw?.to_str()?.parse().ok()?;
+    (uid != 0 && uid != u32::MAX).then_some(uid)
+}
+
+#[cfg(target_os = "linux")]
+const RUN_DOCKER_SOCK: &str = "/run/docker.sock";
+#[cfg(target_os = "linux")]
+const VAR_RUN_DOCKER_SOCK: &str = "/var/run/docker.sock";
+
+#[cfg(any(target_os = "linux", test))]
+fn path_occupied(path: &std::path::Path) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => true,
+        Err(e) => e.kind() != io::ErrorKind::NotFound,
+    }
+}
+
+/// Best-effort links `/run/docker.sock -> /run/kiri/docker.sock` when neither
+/// `/run/docker.sock` nor `/var/run/docker.sock` exists (no file, socket, or
+/// symlink), matching `kiri.service`'s `ExecStartPost`.
+#[cfg(any(target_os = "linux", test))]
+fn maybe_link_docker_sock(run_link: &std::path::Path, var_run_link: &std::path::Path, target: &std::path::Path) {
+    if path_occupied(run_link) || path_occupied(var_run_link) {
+        return;
+    }
+    let _ = std::os::unix::fs::symlink(target, run_link);
+}
+
+/// Removes `/run/docker.sock` on clean shutdown only if it still symlinks to
+/// `/run/kiri/docker.sock`, matching `kiri.service`'s `ExecStopPost`.
+#[cfg(any(target_os = "linux", test))]
+fn cleanup_docker_sock_symlink(link: &std::path::Path, target: &std::path::Path) {
+    if std::fs::read_link(link).ok().as_deref() == Some(target) {
+        let _ = std::fs::remove_file(link);
+    }
+}
+
 pub fn run(_args: &[String]) -> io::Result<()> {
+    // On Linux, fail fast before binding any socket when invoked without root
+    // (inside a rootless user namespace such as `unshare -r`, geteuid() == 0).
+    // SAFETY: geteuid cannot fail.
+    #[cfg(target_os = "linux")]
+    ensure_linux_root(unsafe { libc::geteuid() })?;
     let t0 = Instant::now();
     raise_open_files();
     // SIGINT/SIGTERM shut down cleanly: power the guest off, remove the socket.
@@ -199,7 +254,12 @@ pub fn run(_args: &[String]) -> io::Result<()> {
             gate.clone().watch()?;
             Some(gate)
         }
-        None => None,
+        None => {
+            if let Some(uid) = sudo_uid_from(std::env::var_os("SUDO_UID").as_deref()) {
+                access::grant_uid(&[socket.as_path(), for_containers.1.as_path()], uid);
+            }
+            None
+        }
     };
 
     kiri_image::store::set_error_log(|message| diag::error!("image store", detail = message));
@@ -266,10 +326,27 @@ pub fn run(_args: &[String]) -> io::Result<()> {
     }
 
     #[cfg(target_os = "linux")]
+    let manage_docker_sock = std::env::var_os("KIRI_SOCKET").is_none() && socket == std::path::Path::new(crate::client::SERVICE_SOCKET);
+    #[cfg(target_os = "linux")]
+    if manage_docker_sock {
+        maybe_link_docker_sock(
+            std::path::Path::new(RUN_DOCKER_SOCK),
+            std::path::Path::new(VAR_RUN_DOCKER_SOCK),
+            std::path::Path::new(crate::client::SERVICE_SOCKET),
+        );
+    }
+
+    #[cfg(target_os = "linux")]
     let extra_sock = extra_home.as_ref().map(|(_, p)| p.clone());
     #[cfg(not(target_os = "linux"))]
     let extra_sock: Option<PathBuf> = None;
-    watch_own_app(engine.clone(), socket.clone(), extra_sock.clone());
+    watch_own_app(
+        engine.clone(),
+        socket.clone(),
+        extra_sock.clone(),
+        #[cfg(target_os = "linux")]
+        manage_docker_sock,
+    );
 
     init_wsl_sockets(engine.clone());
 
@@ -282,6 +359,10 @@ pub fn run(_args: &[String]) -> io::Result<()> {
         diag::info!("engine shutting down", signal = sig);
         #[cfg(target_os = "macos")]
         nfs::unmount();
+        #[cfg(target_os = "linux")]
+        if manage_docker_sock {
+            cleanup_docker_sock_symlink(std::path::Path::new(RUN_DOCKER_SOCK), std::path::Path::new(crate::client::SERVICE_SOCKET));
+        }
         let _ = std::fs::remove_file(&sock);
         let _ = std::fs::remove_file(caller::container_socket(&sock));
         if let Some(ref extra) = extra_sock {
@@ -398,7 +479,12 @@ fn unavailable(
 /// When the app this daemon runs from is deleted (appwatch.rs): docker
 /// build handed back (buildwith.rs: what was there before; the choice
 /// stays, so the app taken up again takes it again), and the engine stops.
-fn watch_own_app(engine: std::sync::Arc<engine::Engine>, socket: std::path::PathBuf, extra_socket: Option<std::path::PathBuf>) {
+fn watch_own_app(
+    engine: std::sync::Arc<engine::Engine>,
+    socket: std::path::PathBuf,
+    extra_socket: Option<std::path::PathBuf>,
+    #[cfg(target_os = "linux")] manage_docker_sock: bool,
+) {
     crate::appwatch::watch(move |exe| {
         diag::error!("the app this engine runs from was deleted; stopping and handing docker build back", path = exe.display());
         if let Err(e) = crate::buildwith::places().and_then(|p| p.give_back()) {
@@ -406,6 +492,10 @@ fn watch_own_app(engine: std::sync::Arc<engine::Engine>, socket: std::path::Path
         }
         #[cfg(target_os = "macos")]
         nfs::unmount();
+        #[cfg(target_os = "linux")]
+        if manage_docker_sock {
+            cleanup_docker_sock_symlink(std::path::Path::new(RUN_DOCKER_SOCK), std::path::Path::new(crate::client::SERVICE_SOCKET));
+        }
         let _ = std::fs::remove_file(&socket);
         let _ = std::fs::remove_file(caller::container_socket(&socket));
         if let Some(ref extra) = extra_socket {
@@ -454,7 +544,7 @@ fn bind_daemon_socket(socket: &std::path::Path, access_group: Option<&std::ffi::
 
 /// Docker-compatible permissions for a root-run Linux daemon when no explicit
 /// `KIRI_SOCKET_GROUP` is configured: mode 0660 (never world-writable), with
-/// the `docker` group when present on the host.
+/// the `docker` group when present, else `kiri` when present, else root's group.
 fn default_socket_access(socket: &std::path::Path) -> io::Result<()> {
     // SAFETY: geteuid cannot fail.
     let linux_root = cfg!(target_os = "linux") && unsafe { libc::geteuid() } == 0;
@@ -464,23 +554,23 @@ fn default_socket_access(socket: &std::path::Path) -> io::Result<()> {
 fn default_socket_access_with(
     socket: &std::path::Path,
     linux_root: bool,
-    lookup_gid: impl FnOnce(&std::ffi::OsStr) -> io::Result<u32>,
-    apply_gid: impl FnMut(&std::path::Path, Option<u32>) -> io::Result<()>,
+    mut lookup_gid: impl FnMut(&std::ffi::OsStr) -> io::Result<u32>,
+    mut apply_gid: impl FnMut(&std::path::Path, Option<u32>) -> io::Result<()>,
 ) -> io::Result<()> {
-    let mut apply_gid = apply_gid;
     if !linux_root {
         return Ok(());
     }
-    match lookup_gid(std::ffi::OsStr::new("docker")) {
+    let gid = lookup_gid(std::ffi::OsStr::new("docker")).or_else(|_| lookup_gid(std::ffi::OsStr::new("kiri")));
+    match gid {
         Ok(gid) => match apply_gid(socket, Some(gid)) {
             Ok(()) => Ok(()),
-            // In a single-user namespace where the host's `docker` gid is not
+            // In a single-user namespace where the host's group gid is not
             // mapped, chown returns EINVAL: keep the socket's group at 0660.
             Err(e) if e.raw_os_error() == Some(libc::EINVAL) => apply_gid(socket, None),
             Err(e) => Err(e),
         },
-        // When `KIRI_SOCKET_GROUP` is unset, `docker` is optional: Alpine /
-        // BusyBox `getent group docker` exits 1 (`ErrorKind::Other`) when
+        // When `KIRI_SOCKET_GROUP` is unset, `docker` and `kiri` are optional:
+        // Alpine / BusyBox `getent group ...` exits 1 (`ErrorKind::Other`) when
         // absent, while glibc exits 2 (`ErrorKind::NotFound`). Keep root's
         // group at 0660 rather than refusing to start the daemon.
         Err(_) => apply_gid(socket, None),
@@ -786,13 +876,39 @@ mod tests {
         assert_eq!(mode(&sock) & 0o007, 0, "socket must forbid world access (never 0666)");
         assert_eq!(std::fs::metadata(&sock).unwrap().gid(), my_gid);
 
-        // Root on Linux without a `docker` group keeps existing group and sets 0660 (never 0666).
+        // Root on Linux without `docker` but with `kiri` group selects `kiri` and 0660 (never 0666).
+        std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mut looked_up = Vec::new();
+        let mut kiri_applied_gid = None;
+        default_socket_access_with(
+            &sock,
+            true,
+            |g| {
+                looked_up.push(g.to_os_string());
+                if g == OsStr::new("kiri") {
+                    Ok(my_gid)
+                } else {
+                    Err(io::Error::new(io::ErrorKind::NotFound, "no group docker"))
+                }
+            },
+            |p, gid| {
+                kiri_applied_gid = gid;
+                apply_socket_gid(p, gid)
+            },
+        )
+        .unwrap();
+        assert_eq!(looked_up, vec![OsStr::new("docker"), OsStr::new("kiri")]);
+        assert_eq!(kiri_applied_gid, Some(my_gid));
+        assert_eq!(mode(&sock), 0o660);
+        assert_eq!(mode(&sock) & 0o007, 0, "socket must forbid world access (never 0666)");
+
+        // Root on Linux without `docker` or `kiri` group keeps existing group and sets 0660 (never 0666).
         std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600)).unwrap();
         let mut fallback_gid = Some(99999);
         default_socket_access_with(
             &sock,
             true,
-            |_| Err(io::Error::new(io::ErrorKind::NotFound, "no group docker")),
+            |_| Err(io::Error::new(io::ErrorKind::NotFound, "no group")),
             |p, gid| {
                 fallback_gid = gid;
                 apply_socket_gid(p, gid)
@@ -959,5 +1075,58 @@ mod tests {
         assert!(ws.sync(&[WslDistroConfig { name: "../evil".into(), gid }]).is_err());
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn linux_root_check_sudo_uid_and_docker_sock_symlink() {
+        // Non-root fails immediately with actionable error; root / rootless userns (euid 0) succeeds.
+        assert!(ensure_linux_root(0).is_ok());
+        let err = ensure_linux_root(1000).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            err.to_string(),
+            "on Linux, Kiri runs containers on this machine's kernel and needs root: run `sudo kiri host-access $USER` (or `sudo kiri daemon`)"
+        );
+
+        // SUDO_UID parsing accepts valid non-zero uids only.
+        assert_eq!(sudo_uid_from(None), None);
+        assert_eq!(sudo_uid_from(Some(OsStr::new(""))), None);
+        assert_eq!(sudo_uid_from(Some(OsStr::new("0"))), None);
+        assert_eq!(sudo_uid_from(Some(OsStr::new("4294967295"))), None);
+        assert_eq!(sudo_uid_from(Some(OsStr::new("abc"))), None);
+        assert_eq!(sudo_uid_from(Some(OsStr::new("-1"))), None);
+        assert_eq!(sudo_uid_from(Some(OsStr::new("1000"))), Some(1000));
+
+        // /run/docker.sock symlink creation and clean shutdown removal.
+        let dir = std::env::temp_dir().join(format!("kiri-docker-sock-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("run/kiri")).unwrap();
+        std::fs::create_dir_all(dir.join("var/run")).unwrap();
+        let target = dir.join("run/kiri/docker.sock");
+        let run_link = dir.join("run/docker.sock");
+        let var_run_link = dir.join("var/run/docker.sock");
+        std::fs::write(&target, "").unwrap();
+
+        // Creates symlink when neither path is occupied, and removes it when pointing to target.
+        maybe_link_docker_sock(&run_link, &var_run_link, &target);
+        assert_eq!(std::fs::read_link(&run_link).unwrap(), target);
+        cleanup_docker_sock_symlink(&run_link, &target);
+        assert!(!path_occupied(&run_link));
+
+        // Does not overwrite an existing /var/run/docker.sock (file, socket, or dangling symlink).
+        std::os::unix::fs::symlink("/mnt/wsl/kiri/sockets/Ubuntu/docker.sock", &var_run_link).unwrap();
+        maybe_link_docker_sock(&run_link, &var_run_link, &target);
+        assert!(!path_occupied(&run_link));
+        std::fs::remove_file(&var_run_link).unwrap();
+
+        // Does not overwrite or delete a /run/docker.sock owned by another engine.
+        let other = dir.join("other.sock");
+        std::os::unix::fs::symlink(&other, &run_link).unwrap();
+        maybe_link_docker_sock(&run_link, &var_run_link, &target);
+        assert_eq!(std::fs::read_link(&run_link).unwrap(), other);
+        cleanup_docker_sock_symlink(&run_link, &target);
+        assert_eq!(std::fs::read_link(&run_link).unwrap(), other);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

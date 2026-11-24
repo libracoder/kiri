@@ -36,9 +36,7 @@ pub fn handles(command: &str) -> bool {
 pub fn run(args: &[String]) -> io::Result<()> {
     let docker = client::docker_cli().ok_or_else(|| io::Error::other("no docker CLI found; open Kiri once to set it up"))?;
     let socket = client::socket()?;
-    if !client::alive() {
-        return Err(io::Error::other("Kiri isn't running. Open Kiri, or start it with `kiri daemon`"));
-    }
+    client::check_alive()?;
     let mut cmd = std::process::Command::new(docker);
     cmd.args(args).env("DOCKER_HOST", format!("unix://{}", socket.display())).env_remove("DOCKER_CONTEXT");
     // With DOCKER_HOST and no context, buildx would pick the endpoint's own
