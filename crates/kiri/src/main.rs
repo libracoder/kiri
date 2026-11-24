@@ -74,7 +74,7 @@ mod setup;
 mod usb;
 #[cfg(unix)]
 mod stale;
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 mod wsl;
 #[cfg(any(unix, windows))]
 mod share;

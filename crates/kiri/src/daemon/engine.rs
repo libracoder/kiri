@@ -2294,6 +2294,29 @@ impl Engine {
         out
     }
 
+    /// Active published port bindings across all running containers, for
+    /// `kiri-win`'s Windows UDP and host-IP port forwarder (`/kiri/win-ports`).
+    pub fn published_ports(&self) -> Vec<super::ports::PublishedPort> {
+        let st = self.lock();
+        let mut out = Vec::new();
+        for c in st.containers.values() {
+            if c.status != Status::Running {
+                continue;
+            }
+            let Some(fw) = &c.forwards else { continue };
+            for (b, host_ip, host_port) in &fw.bound {
+                out.push(super::ports::PublishedPort {
+                    proto: b.proto.clone(),
+                    host_ip: host_ip.clone(),
+                    host_port: *host_port,
+                });
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
     /// The WSL drive bind sources (`/mnt/<drive>` or `/mnt/<drive>/...`) of
     /// running containers, under `automount_root` (e.g. `/mnt/`).
     pub fn wsl_bind_sources(&self, automount_root: &str) -> Vec<String> {

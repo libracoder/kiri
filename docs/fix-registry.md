@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #640, #218, #761 Windows: forward published UDP and host-IP/LAN TCP ports to WSL 2, and write `kiri diag report --out` on the Windows filesystem (unreleased)
+- Fixes: #640 [Windows] Published UDP Ports Are Not Forwarding Packets to Containers; #218 Windows: publishing a port on a host IP (-p IP:port:port) fails with 'Address not available (os error 99)'; 0.0.0.0 is loopback-only; #761 `kiri diag report --out <path>` on Windows wrote inside the WSL rootfs instead of the Windows path
+- Caused: none known
+- Caused by: -
+- Check: `crates/kiri-win/src/ports.rs`, `crates/kiri/src/daemon/ports.rs`, `crates/kiri/src/wsl.rs`
+
 ### #550 Windows: resolve host.docker.internal and host.kiri.internal to 192.168.65.254 and relay to Windows loopback (unreleased)
 - Fixes: #550 Windows: host.docker.internal resolves to the WSL VM's bridge gateway (172.17.0.1) instead of the Windows host, unlike Docker Desktop
 - Caused: none known
