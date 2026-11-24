@@ -485,12 +485,40 @@ fn nat_chain(name: &str, hook: u32, priority: i32) -> Msg {
 /// Kiri's container bridges are kiri0, kiri1, … (the daemon names them).
 const BRIDGE_PREFIX: &[u8] = b"kiri";
 
-/// `ip daddr <addr> tcp redirect to :<port>`: connections to `addr` (any
-/// port) go to a local listener, which can read the original port back.
-/// With `from_bridges`, only packets arriving on a Kiri bridge match
-/// (`iifname "kiri*"`): the redirect leads to the host's loopback, which
-/// nothing on the uplink (the LAN, on a Linux host) may reach.
-fn redirect_rule(chain: &str, addr: [u8; 4], port: u16, from_bridges: bool) -> Msg {
+/// Netmask bytes for an IPv4 CIDR prefix length (`0..=32`).
+pub fn ipv4_mask(prefix: u8) -> [u8; 4] {
+    let p = prefix.min(32);
+    if p == 0 { [0; 4] } else { (u32::MAX << (32 - p)).to_be_bytes() }
+}
+
+/// Masks `ip` to its `prefix`-bit network address.
+pub fn mask_ipv4(ip: [u8; 4], prefix: u8) -> [u8; 4] {
+    let m = ipv4_mask(prefix);
+    [ip[0] & m[0], ip[1] & m[1], ip[2] & m[2], ip[3] & m[3]]
+}
+
+fn match_daddr_prefix(rule: &mut Msg, addr: [u8; 4], prefix: u8) {
+    let p = prefix.min(32);
+    if p == 0 {
+        return;
+    }
+    // payload network header + 16 (daddr), 4 bytes => reg 1
+    rule.nest(1).attr_str(1, "payload").nest(2).attr_be32(1, 1).attr_be32(2, 1).attr_be32(3, 16).attr_be32(4, 4).end().end();
+    if p < 32 {
+        let mask = ipv4_mask(p);
+        let net = mask_ipv4(addr, p);
+        rule.nest(1).attr_str(1, "bitwise").nest(2).attr_be32(1, 1).attr_be32(2, 1).attr_be32(3, 4);
+        rule.nest(4).attr(1, &mask).end().nest(5).attr(1, &[0; 4]).end().end().end();
+        rule.nest(1).attr_str(1, "cmp").nest(2).attr_be32(1, 1).attr_be32(2, 0).nest(3).attr(1, &net).end().end().end();
+    } else {
+        rule.nest(1).attr_str(1, "cmp").nest(2).attr_be32(1, 1).attr_be32(2, 0).nest(3).attr(1, &addr).end().end().end();
+    }
+}
+
+/// `ip daddr <addr>/<prefix> tcp redirect to :<port>`: connections to
+/// `addr/prefix` (any port) go to a local listener, which can read the
+/// original destination and port back via `SO_ORIGINAL_DST`.
+fn redirect_prefix_rule(chain: &str, addr: [u8; 4], prefix: u8, port: u16, from_bridges: bool) -> Msg {
     let mut rule = nft(NFT_MSG_NEWRULE, NLM_F_ACK | NLM_F_CREATE | 0x800);
     rule.attr_str(1, "kiri").attr_str(2, chain);
     rule.nest(4);
@@ -503,14 +531,39 @@ fn redirect_rule(chain: &str, addr: [u8; 4], port: u16, from_bridges: bool) -> M
     // meta l4proto => reg 1; cmp eq tcp
     rule.nest(1).attr_str(1, "meta").nest(2).attr_be32(1, 1).attr_be32(2, 16).end().end();
     rule.nest(1).attr_str(1, "cmp").nest(2).attr_be32(1, 1).attr_be32(2, 0).nest(3).attr(1, &[libc::IPPROTO_TCP as u8]).end().end().end();
-    // payload network header + 16 (daddr), 4 bytes => reg 1; cmp eq addr
-    rule.nest(1).attr_str(1, "payload").nest(2).attr_be32(1, 1).attr_be32(2, 1).attr_be32(3, 16).attr_be32(4, 4).end().end();
-    rule.nest(1).attr_str(1, "cmp").nest(2).attr_be32(1, 1).attr_be32(2, 0).nest(3).attr(1, &addr).end().end().end();
+    match_daddr_prefix(&mut rule, addr, prefix);
     // immediate reg 1 = port; redir to it
     rule.nest(1).attr_str(1, "immediate").nest(2).attr_be32(1, 1).nest(2).attr(1, &port.to_be_bytes()).end().end().end();
     rule.nest(1).attr_str(1, "redir").nest(2).attr_be32(1, 1).end().end();
     rule.end();
     rule
+}
+
+/// `ip daddr <addr>/<prefix> tcp accept`: exempts local, bridge and uplink
+/// subnets from subsequent broader egress redirect rules (such as `0.0.0.0/0`).
+fn accept_prefix_rule(chain: &str, addr: [u8; 4], prefix: u8, from_bridges: bool) -> Msg {
+    let mut rule = nft(NFT_MSG_NEWRULE, NLM_F_ACK | NLM_F_CREATE | 0x800);
+    rule.attr_str(1, "kiri").attr_str(2, chain);
+    rule.nest(4);
+    if from_bridges {
+        rule.nest(1).attr_str(1, "meta").nest(2).attr_be32(1, 1).attr_be32(2, 6).end().end();
+        rule.nest(1).attr_str(1, "cmp").nest(2).attr_be32(1, 1).attr_be32(2, 0).nest(3).attr(1, BRIDGE_PREFIX).end().end().end();
+    }
+    rule.nest(1).attr_str(1, "meta").nest(2).attr_be32(1, 1).attr_be32(2, 16).end().end();
+    rule.nest(1).attr_str(1, "cmp").nest(2).attr_be32(1, 1).attr_be32(2, 0).nest(3).attr(1, &[libc::IPPROTO_TCP as u8]).end().end().end();
+    match_daddr_prefix(&mut rule, addr, prefix);
+    rule.nest(1).attr_str(1, "immediate").nest(2).attr_be32(1, 0).nest(2).nest(2).attr_be32(1, libc::NF_ACCEPT as u32).end().end().end().end();
+    rule.end();
+    rule
+}
+
+/// `ip daddr <addr> tcp redirect to :<port>`: connections to `addr` (any
+/// port) go to a local listener, which can read the original port back.
+/// With `from_bridges`, only packets arriving on a Kiri bridge match
+/// (`iifname "kiri*"`): the redirect leads to the host's loopback, which
+/// nothing on the uplink (the LAN, on a Linux host) may reach.
+fn redirect_rule(chain: &str, addr: [u8; 4], port: u16, from_bridges: bool) -> Msg {
+    redirect_prefix_rule(chain, addr, 32, port, from_bridges)
 }
 
 /// `iifname "kiri*" ip daddr <addr> udp dport 53 redirect to :53`: DNS
@@ -688,6 +741,30 @@ fn forward_guard(family: u8) -> Option<String> {
     FORWARD_GUARD.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|(up4, up6)| if family == libc::NFPROTO_IPV6 as u8 { up6.clone() } else { up4.clone() })
 }
 
+/// `tcp flags syn tcp option maxseg size set rt mtu`: clamps the TCP MSS on
+/// forwarded SYN packets to the route's path MTU.
+fn tcp_mss_clamp_rule(family: u8) -> Msg {
+    let mut rule = nft_in(family, NFT_MSG_NEWRULE, NLM_F_ACK | NLM_F_CREATE | 0x800);
+    rule.attr_str(1, "kiri").attr_str(2, "forward");
+    rule.nest(4);
+    // meta l4proto => reg 1; cmp eq tcp
+    rule.nest(1).attr_str(1, "meta").nest(2).attr_be32(1, 1).attr_be32(2, 16).end().end();
+    rule.nest(1).attr_str(1, "cmp").nest(2).attr_be32(1, 1).attr_be32(2, 0).nest(3).attr(1, &[libc::IPPROTO_TCP as u8]).end().end().end();
+    // payload transport header + 13 (tcp flags), 1 byte => reg 1; (reg 1 & 0x02) != 0 (SYN)
+    rule.nest(1).attr_str(1, "payload").nest(2).attr_be32(1, 1).attr_be32(2, 2).attr_be32(3, 13).attr_be32(4, 1).end().end();
+    rule.nest(1).attr_str(1, "bitwise").nest(2).attr_be32(1, 1).attr_be32(2, 1).attr_be32(3, 1);
+    rule.nest(4).attr(1, &[0x02]).end().nest(5).attr(1, &[0x00]).end().end().end();
+    rule.nest(1).attr_str(1, "cmp").nest(2).attr_be32(1, 1).attr_be32(2, 1).nest(3).attr(1, &[0x00]).end().end().end();
+    // rt load tcpmss (NFT_RT_TCPMSS = 3) => reg 1
+    rule.nest(1).attr_str(1, "rt").nest(2).attr_be32(1, 1).attr_be32(2, 3).end().end();
+    // byteorder reg 1 = hton(reg 1, 2, 2) (NFT_BYTEORDER_HTON = 1)
+    rule.nest(1).attr_str(1, "byteorder").nest(2).attr_be32(1, 1).attr_be32(2, 1).attr_be32(3, 1).attr_be32(4, 2).attr_be32(5, 2).end().end();
+    // exthdr write tcpopt reg 1 => 2b @ 2 + 2 (type 2 = TCPOPT_MAXSEG, op 1 = NFT_EXTHDR_OP_TCPOPT)
+    rule.nest(1).attr_str(1, "exthdr").nest(2).attr_be32(7, 1).attr(2, &[2]).attr_be32(3, 2).attr_be32(4, 2).attr_be32(6, 1).end().end();
+    rule.end();
+    rule
+}
+
 /// `forward_filter` for a table of `family`: the same rules hold for IPv6.
 /// `guard`: the uplink, while `FORWARD_GUARD` holds one.
 fn forward_filter_in(family: u8, bridges: &[String], guard: Option<&str>) -> Vec<Msg> {
@@ -759,6 +836,7 @@ fn forward_filter_in(family: u8, bridges: &[String], guard: Option<&str>) -> Vec
             drop,
         ));
     }
+    msgs.push(tcp_mss_clamp_rule(family));
     msgs.extend([
         rule(&ifname(7, 1), accept),                           // NFT_CMP_NEQ
         rule(&ct_any(0, CT_ESTABLISHED | CT_RELATED), accept), // NFT_CT_STATE
@@ -1141,7 +1219,19 @@ pub fn remove_nat() -> io::Result<()> {
 /// the uplink's gateway `gateway` (the Mac itself): other VMs on the NAT
 /// network, or the LAN routed through the Mac, never reach a container.
 #[allow(clippy::too_many_arguments)]
-pub fn install_nat_from(uplink_index: i32, host_addr: [u8; 4], host_port: u16, redirect: bool, dnat: &[Dnat], gateway: [u8; 4], bridges: &[String], local: Option<&[[u8; 4]]>) -> io::Result<()> {
+pub fn install_nat_with_egress(
+    uplink_index: i32,
+    host_addr: [u8; 4],
+    host_port: u16,
+    redirect: bool,
+    dnat: &[Dnat],
+    gateway: [u8; 4],
+    bridges: &[String],
+    local: Option<&[[u8; 4]]>,
+    egress_port: u16,
+    egress_routes: &[([u8; 4], u8)],
+    egress_skip: &[([u8; 4], u8)],
+) -> io::Result<()> {
     let mut nl = Netlink::open(libc::NETLINK_NETFILTER)?;
     // The table is replaced, not appended to (on a Linux host it outlives
     // the agent and changes with every published port), in one batch:
@@ -1172,6 +1262,7 @@ pub fn install_nat_from(uplink_index: i32, host_addr: [u8; 4], host_port: u16, r
 
     let mut end = Msg::new(NFNL_MSG_BATCH_END, 0);
     end.raw(&nfgen(libc::AF_UNSPEC as u8, NFNL_SUBSYS_NFTABLES));
+    let have_egress = egress_port != 0 && !egress_routes.is_empty();
     if !redirect {
         // A Linux host: no host.docker.internal redirect, but its published
         // ports are DNATed here (prerouting for the LAN, output for the host
@@ -1179,11 +1270,22 @@ pub fn install_nat_from(uplink_index: i32, host_addr: [u8; 4], host_port: u16, r
         let mut msgs = vec![begin, add, delete, table, chain, rule];
         msgs.extend(forward_filter(bridges, forward_guard(libc::NFPROTO_IPV4 as u8).as_deref()));
         msgs.extend(localnet_guard());
+        if have_egress {
+            msgs.push(host_relay_guard(egress_port));
+        }
         msgs.push(nat_chain("prerouting", 0, -100));
         msgs.push(nat_chain("output", 3, -100));
         for d in dnat {
             msgs.extend(dnat_rules("prerouting", d, local));
             msgs.extend(dnat_rules("output", d, local));
+        }
+        if have_egress {
+            for &(subnet, prefix) in egress_skip {
+                msgs.push(accept_prefix_rule("prerouting", subnet, prefix, true));
+            }
+            for &(dst, prefix) in egress_routes {
+                msgs.push(redirect_prefix_rule("prerouting", dst, prefix, egress_port, true));
+            }
         }
         msgs.push(end);
         return nl.request(&mut msgs);
@@ -1198,6 +1300,9 @@ pub fn install_nat_from(uplink_index: i32, host_addr: [u8; 4], host_port: u16, r
     msgs.extend(forward_filter(bridges, forward_guard(libc::NFPROTO_IPV4 as u8).as_deref()));
     msgs.extend(localnet_guard());
     msgs.push(host_relay_guard(host_port));
+    if have_egress {
+        msgs.push(host_relay_guard(egress_port));
+    }
     for d in dnat.iter().filter(|d| !d.udp) {
         if d.host_ip == LOOPBACK {
             // A port the Mac has on its loopback, for the VM's own
@@ -1210,6 +1315,16 @@ pub fn install_nat_from(uplink_index: i32, host_addr: [u8; 4], host_port: u16, r
             }
         } else {
             msgs.push(dnat_rule_from("prerouting", d, Some((uplink_index, gateway))));
+        }
+    }
+    if have_egress {
+        for &(subnet, prefix) in egress_skip {
+            msgs.push(accept_prefix_rule("prerouting", subnet, prefix, true));
+            msgs.push(accept_prefix_rule("output", subnet, prefix, false));
+        }
+        for &(dst, prefix) in egress_routes {
+            msgs.push(redirect_prefix_rule("prerouting", dst, prefix, egress_port, true));
+            msgs.push(redirect_prefix_rule("output", dst, prefix, egress_port, false));
         }
     }
     if dnat.iter().any(|d| !d.udp && d.host_ip != LOOPBACK) {
@@ -1374,8 +1489,9 @@ mod tests {
     #[test]
     fn forward_keeps_networks_apart() {
         let msgs = forward_filter(&["kiri1".to_owned(), "kiri22".to_owned()], None);
-        assert_eq!(msgs.len(), 7);
-        let rules = &msgs[1..];
+        assert_eq!(msgs.len(), 8);
+        assert_eq!(names(&msgs[1]), ["meta", "cmp", "payload", "bitwise", "cmp", "rt", "byteorder", "exthdr"], "SYN MSS clamping to route MTU");
+        let rules = &msgs[2..];
         // Nothing from a bridge is accepted on the interface name alone: that
         // let any network reach any other.
         for r in rules {
@@ -1406,6 +1522,22 @@ mod tests {
         assert_eq!(be32(get(&exprs(&rules[0])[0].1, 2)), 7, "meta oifname");
         assert_eq!(be32(get(&exprs(&rules[1])[0].1, 2)), 0, "ct state");
         assert_eq!(be32(get(&exprs(&rules[2])[0].1, 2)), 2, "ct status");
+    }
+
+    #[test]
+    fn egress_prefix_redirect_and_accept_rules_match_cidr() {
+        let r24 = redirect_prefix_rule("prerouting", [10, 0, 5, 10], 24, 1038, true);
+        assert_eq!(names(&r24), ["meta", "cmp", "meta", "cmp", "payload", "bitwise", "cmp", "immediate", "redir"]);
+        let e = exprs(&r24);
+        assert_eq!(get(&attrs(get(&e[5].1, 4)), 1), &[255, 255, 255, 0]);
+        assert_eq!(get(&attrs(get(&e[6].1, 3)), 1), &[10, 0, 5, 0]);
+
+        let r0 = redirect_prefix_rule("output", [0, 0, 0, 0], 0, 1038, false);
+        assert_eq!(names(&r0), ["meta", "cmp", "immediate", "redir"], "0.0.0.0/0 needs no payload daddr match");
+
+        let skip = accept_prefix_rule("prerouting", [172, 17, 0, 1], 16, true);
+        assert_eq!(names(&skip), ["meta", "cmp", "meta", "cmp", "payload", "bitwise", "cmp", "immediate"]);
+        assert_eq!(verdict(&skip), libc::NF_ACCEPT as u32);
     }
 
     #[test]

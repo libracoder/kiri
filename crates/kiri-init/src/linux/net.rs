@@ -16,6 +16,9 @@ pub const UPLINK: &str = "eth0";
 pub const HOST_ADDR: [u8; 4] = [198, 19, 248, 254];
 /// Where the redirect lands: the agent's listener for host-bound connections.
 pub const HOST_RELAY_PORT: u16 = 1026;
+/// Where outbound container TCP connections to VPN tunnel prefixes or under
+/// host egress land, to be relayed over vsock to the host dialer.
+pub const EGRESS_RELAY_PORT: u16 = 1038;
 /// Container interfaces stay below this, so any uplink MTU fits.
 const CONTAINER_MTU: u32 = 1500;
 
@@ -267,9 +270,66 @@ struct Nat {
 }
 
 static NAT: std::sync::Mutex<Option<Nat>> = std::sync::Mutex::new(None);
+/// Egress IPv4 CIDR prefixes redirected to `EGRESS_RELAY_PORT`.
+static EGRESS_ROUTES: std::sync::Mutex<Vec<([u8; 4], u8)>> = std::sync::Mutex::new(Vec::new());
+/// Active bridge IPv4 subnets `(name, network, prefix)`, exempt from egress redirect.
+static BRIDGE_SUBNETS: std::sync::Mutex<Vec<(String, [u8; 4], u8)>> = std::sync::Mutex::new(Vec::new());
+/// The VM uplink's IPv4 subnet `(network, prefix)`, exempt from egress redirect.
+static UPLINK_SUBNET: std::sync::Mutex<Option<([u8; 4], u8)>> = std::sync::Mutex::new(None);
 /// The kernel has no nft_fib_ipv4 (`fib daddr type local`): ports
 /// published on every address are matched per address of this machine.
 static NO_FIB4: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn parse_cidr(s: &str) -> Option<([u8; 4], u8)> {
+    let (ip, prefix) = s.trim().split_once('/')?;
+    let ip = parse_ip(ip)?;
+    let prefix: u8 = prefix.parse().ok().filter(|&p| p <= 32)?;
+    Some((netlink::mask_ipv4(ip, prefix), prefix))
+}
+
+pub fn parse_egress_routes(list: kiri_proto::StrList<'_>) -> Vec<([u8; 4], u8)> {
+    let mut out = Vec::new();
+    for s in list.iter() {
+        if let Some(c) = parse_cidr(s)
+            && !out.contains(&c)
+        {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Whether `routes` includes full host egress (`0.0.0.0/0`), in which case
+/// guest upstream DNS lookups should go straight through the host DNS relay.
+pub fn egress_prefers_dns_relay(routes: &[([u8; 4], u8)]) -> bool {
+    routes.iter().any(|&(_, prefix)| prefix == 0)
+}
+
+/// Updates the IPv4 CIDR prefixes redirected to the host egress dialer and
+/// rebuilds Kiri's IPv4 nftables table.
+pub fn set_egress_routes(routes: Vec<([u8; 4], u8)>) -> io::Result<()> {
+    *EGRESS_ROUTES.lock().unwrap_or_else(|e| e.into_inner()) = routes;
+    refresh_nat()
+}
+
+fn egress_skip_subnets() -> Vec<([u8; 4], u8)> {
+    let mut skip = vec![
+        ([127, 0, 0, 0], 8),
+        ([169, 254, 0, 0], 16),
+        ([224, 0, 0, 0], 3),
+    ];
+    if let Some(up) = *UPLINK_SUBNET.lock().unwrap_or_else(|e| e.into_inner())
+        && !skip.contains(&up)
+    {
+        skip.push(up);
+    }
+    for &(_, net, prefix) in BRIDGE_SUBNETS.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        if !skip.contains(&(net, prefix)) {
+            skip.push((net, prefix));
+        }
+    }
+    skip
+}
 
 /// Builds Kiri's IPv4 table from `nat` and the bridges made so far, and
 /// keeps `nat` for `refresh_nat`. In the VM (`nat.redirect`), also installs
@@ -277,8 +337,24 @@ static NO_FIB4: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::n
 fn install_nat(nat: Nat) -> io::Result<()> {
     use std::sync::atomic::Ordering;
     let bridges = MADE_BRIDGES.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let egress = EGRESS_ROUTES.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let skip = if egress.is_empty() { Vec::new() } else { egress_skip_subnets() };
     let any_addr = nat.dnat.iter().any(|d| d.host_ip == [0; 4]);
-    let install = |local: Option<&[[u8; 4]]>| netlink::install_nat_from(nat.uplink, HOST_ADDR, HOST_RELAY_PORT, nat.redirect, &nat.dnat, nat.gateway, &bridges, local);
+    let install = |local: Option<&[[u8; 4]]>| {
+        netlink::install_nat_with_egress(
+            nat.uplink,
+            HOST_ADDR,
+            HOST_RELAY_PORT,
+            nat.redirect,
+            &nat.dnat,
+            nat.gateway,
+            &bridges,
+            local,
+            EGRESS_RELAY_PORT,
+            &egress,
+            &skip,
+        )
+    };
     let r = if any_addr && NO_FIB4.load(Ordering::Relaxed) {
         install(Some(&local_addrs()))
     } else {
@@ -594,6 +670,8 @@ impl Dhcp {
                     let mut nl = Netlink::open(libc::NETLINK_ROUTE)?;
                     netlink::add_address(&mut nl, self.index, lease.ip, lease.prefix)?;
                     netlink::add_default_route(&mut nl, self.index, lease.gateway)?;
+                    *UPLINK_SUBNET.lock().unwrap_or_else(|e| e.into_inner()) = Some((netlink::mask_ipv4(lease.ip, lease.prefix), lease.prefix));
+                    let _ = refresh_nat();
                     self.state = DhcpState::Bound;
                     self.lease = Some(lease);
                     return Ok(true);
@@ -716,6 +794,7 @@ impl Bridges {
                 let _ = netlink::delete_link(&mut nl, name);
             }
             MADE_BRIDGES.lock().unwrap_or_else(|e| e.into_inner()).retain(|m| m != name);
+            BRIDGE_SUBNETS.lock().unwrap_or_else(|e| e.into_inner()).retain(|(m, ..)| m != name);
             let had6 = matches!(self.made.remove(name), Some((.., Some(_))));
             let _ = refresh_nat();
             if had6 {
@@ -744,6 +823,13 @@ impl Bridges {
             made.push(name.to_owned());
         }
         drop(made);
+        {
+            let mut subs = BRIDGE_SUBNETS.lock().unwrap_or_else(|e| e.into_inner());
+            subs.retain(|(m, ..)| m != name);
+            if let Some(g) = gateway {
+                subs.push((name.to_owned(), netlink::mask_ipv4(g, prefix), prefix));
+            }
+        }
         let index = netlink::index_of(name)?;
         if let Some(g) = gateway {
             netlink::add_address(&mut nl, index, g, prefix)?;
@@ -777,6 +863,7 @@ impl Bridges {
             let _ = netlink::delete_link(&mut nl, name);
         }
         MADE_BRIDGES.lock().unwrap_or_else(|e| e.into_inner()).retain(|m| m != name);
+        BRIDGE_SUBNETS.lock().unwrap_or_else(|e| e.into_inner()).retain(|(m, ..)| m != name);
         if let Err(e) = refresh_nat() {
             eprintln!("kiri-init: NAT: {e}");
         }
@@ -865,6 +952,8 @@ static MADE_BRIDGES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::
 /// nftables table, so nothing of the engine is left in the host's network.
 pub fn remove_host_network() {
     let names = std::mem::take(&mut *MADE_BRIDGES.lock().unwrap_or_else(|e| e.into_inner()));
+    BRIDGE_SUBNETS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    EGRESS_ROUTES.lock().unwrap_or_else(|e| e.into_inner()).clear();
     if let Ok(mut nl) = Netlink::open(libc::NETLINK_ROUTE) {
         for name in names {
             let _ = netlink::delete_link(&mut nl, &name);

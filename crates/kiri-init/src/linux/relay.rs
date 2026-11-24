@@ -383,6 +383,132 @@ pub fn listen_host_bound(port: u16) -> io::Result<OwnedFd> {
 
 /// The host side listens on this vsock port for host-bound connections.
 pub const HOST_VSOCK_PORT: u32 = 1026;
+/// The host side listens on this vsock port for outbound TCP connections
+/// redirected from containers (split-tunnel VPN routes, network extensions).
+pub const EGRESS_VSOCK_PORT: u32 = kiri_proto::EGRESS_TCP_PORT;
+
+/// Whether a redirected container connection's original destination may be
+/// sent to the host egress dialer: never loopback, unspecified, link-local,
+/// multicast/reserved, port 0, or `host.docker.internal` (which has its own
+/// listener).
+pub fn egress_dst_allowed(ip: [u8; 4], port: u16, host_addr: [u8; 4]) -> bool {
+    port != 0
+        && ip[0] != 0
+        && ip[0] != 127
+        && !(ip[0] == 169 && ip[1] == 254)
+        && ip[0] < 224
+        && ip != host_addr
+}
+
+/// Accepts one connection redirected by an egress route rule, reads the
+/// original IPv4 destination and port via `SO_ORIGINAL_DST`, dials the host on
+/// `EGRESS_VSOCK_PORT` with `ip[4] port[2]`, and returns a relay between the
+/// two. Direct connections not redirected by netfilter are dropped by
+/// `host_relay_guard` in the input chain and rejected here if their
+/// destination is local or forbidden.
+pub fn accept_egress(listener: &OwnedFd, host_addr: [u8; 4]) -> Option<Relay> {
+    accept_egress_with(listener, host_addr, || dial_host(EGRESS_VSOCK_PORT))
+}
+
+pub fn accept_egress_with(
+    listener: &OwnedFd,
+    host_addr: [u8; 4],
+    dial: impl FnOnce() -> io::Result<OwnedFd>,
+) -> Option<Relay> {
+    // SAFETY: accept4 on a listening socket we own; the fd is owned immediately.
+    let fd = unsafe {
+        libc::accept4(
+            listener.as_raw_fd(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: `fd` is a fresh descriptor that nothing else owns.
+    let client = unsafe { OwnedFd::from_raw_fd(fd) };
+    let one: libc::c_int = 1;
+    // SAFETY: setting TCP_NODELAY on a stream socket we own.
+    unsafe {
+        libc::setsockopt(
+            client.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_NODELAY,
+            (&one as *const libc::c_int).cast(),
+            4,
+        );
+    }
+    // SAFETY: SO_ORIGINAL_DST fills a sockaddr_in with the pre-redirect destination.
+    let (ip, port) = unsafe {
+        let mut dst: libc::sockaddr_in = std::mem::zeroed();
+        let mut len = std::mem::size_of::<libc::sockaddr_in>() as u32;
+        const SO_ORIGINAL_DST: libc::c_int = 80;
+        if libc::getsockopt(
+            client.as_raw_fd(),
+            libc::SOL_IP,
+            SO_ORIGINAL_DST,
+            (&mut dst as *mut libc::sockaddr_in).cast(),
+            &mut len,
+        ) != 0
+        {
+            return Some(Relay::dead_one(client));
+        }
+        let mut local: libc::sockaddr_in = std::mem::zeroed();
+        let mut local_len = std::mem::size_of::<libc::sockaddr_in>() as u32;
+        if libc::getsockname(
+            listener.as_raw_fd(),
+            (&mut local as *mut libc::sockaddr_in).cast(),
+            &mut local_len,
+        ) == 0
+            && dst.sin_port == local.sin_port
+            && (dst.sin_addr.s_addr == local.sin_addr.s_addr || local.sin_addr.s_addr == 0)
+        {
+            // A direct non-redirected connection to the listener's own port has
+            // SO_ORIGINAL_DST equal to the socket's local endpoint; reject it
+            // if the port matches and the IP is one of this machine's own.
+            let mut own: libc::sockaddr_in = std::mem::zeroed();
+            let mut own_len = std::mem::size_of::<libc::sockaddr_in>() as u32;
+            if libc::getsockname(
+                client.as_raw_fd(),
+                (&mut own as *mut libc::sockaddr_in).cast(),
+                &mut own_len,
+            ) == 0
+                && dst.sin_addr.s_addr == own.sin_addr.s_addr
+            {
+                return Some(Relay::dead_one(client));
+            }
+        }
+        (dst.sin_addr.s_addr.to_ne_bytes(), u16::from_be(dst.sin_port))
+    };
+    if !egress_dst_allowed(ip, port, host_addr) {
+        return Some(Relay::dead_one(client));
+    }
+    let Ok(host) = dial() else {
+        return Some(Relay::dead_one(client));
+    };
+    let mut header = [ip[0], ip[1], ip[2], ip[3], 0, 0];
+    header[4..].copy_from_slice(&port.to_be_bytes());
+    // SAFETY: a 6-byte write to a just-connected stream; the socket buffer is empty.
+    if unsafe { libc::write(host.as_raw_fd(), header.as_ptr().cast(), 6) } != 6 {
+        return Some(Relay::dead_one(client));
+    }
+    if sys::set_nonblocking(host.as_raw_fd()).is_err() {
+        return Some(Relay::dead_one(client));
+    }
+    Some(Relay {
+        host,
+        target: Some(client),
+        connected: true,
+        header: Vec::new(),
+        up: Pipe::new(),
+        down: Pipe::new(),
+        dead: false,
+        udp: false,
+        framed: false,
+    })
+}
 
 /// Accepts one redirected connection, finds the port the container meant,
 /// dials the Mac and returns a relay between the two. Only connections that
@@ -725,5 +851,213 @@ mod tests {
         let long = format!("{}/{}", root.display(), "a".repeat(120));
         assert_eq!(super::listen_ssh_agent_at(&long).unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn egress_dst_guard_rejects_local_and_allows_vpn_and_public_destinations() {
+        let host = super::super::net::HOST_ADDR;
+        assert!(!super::egress_dst_allowed([127, 0, 0, 1], 443, host));
+        assert!(!super::egress_dst_allowed([0, 0, 0, 0], 443, host));
+        assert!(!super::egress_dst_allowed([169, 254, 169, 254], 80, host));
+        assert!(!super::egress_dst_allowed([224, 0, 0, 1], 80, host));
+        assert!(!super::egress_dst_allowed([255, 255, 255, 255], 80, host));
+        assert!(!super::egress_dst_allowed(host, 80, host));
+        assert!(!super::egress_dst_allowed([10, 0, 5, 10], 0, host));
+        assert!(super::egress_dst_allowed([10, 0, 5, 10], 443, host));
+        assert!(super::egress_dst_allowed([10, 254, 99, 10], 8443, host));
+        assert!(super::egress_dst_allowed([198, 18, 2, 3], 443, host));
+    }
+
+    #[test]
+    fn egress_redirect_relays_vpn_tcp_with_original_dst_and_exempts_bridge_peers() {
+        use std::io::{Read, Write};
+        use super::super::{net, netlink, sys};
+
+        // Requires root (CAP_NET_ADMIN / CLONE_NEWNET) on Linux.
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+
+        let spawn_netns_holder = || -> (libc::pid_t, std::fs::File) {
+            let mut pipe = [0; 2];
+            assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0);
+            if pid == 0 {
+                unsafe {
+                    libc::close(pipe[0]);
+                    if libc::unshare(libc::CLONE_NEWNET) != 0 {
+                        libc::_exit(1);
+                    }
+                    let _ = libc::write(pipe[1], b"1".as_ptr().cast(), 1);
+                    libc::close(pipe[1]);
+                    loop {
+                        libc::pause();
+                    }
+                }
+            }
+            unsafe { libc::close(pipe[1]) };
+            let mut b = [0u8; 1];
+            assert_eq!(unsafe { libc::read(pipe[0], b.as_mut_ptr().cast(), 1) }, 1);
+            unsafe { libc::close(pipe[0]) };
+            let ns = std::fs::File::open(format!("/proc/{pid}/ns/net")).expect("open child netns");
+            (pid, ns)
+        };
+
+        // Run inside a forked child with its own root network namespace so the
+        // host machine's interfaces and nftables rules are never touched.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0);
+        if child == 0 {
+            unsafe {
+                if libc::unshare(libc::CLONE_NEWNET) != 0 {
+                    libc::_exit(2);
+                }
+            }
+            let mut nl = netlink::Netlink::open(libc::NETLINK_ROUTE).unwrap();
+            netlink::set_up(&mut nl, 1).unwrap();
+            netlink::create_bridge(&mut nl, "eth0").unwrap();
+            let eth0 = netlink::index_of("eth0").unwrap();
+            netlink::add_address(&mut nl, eth0, [192, 168, 64, 2], 24).unwrap();
+            netlink::set_up(&mut nl, eth0).unwrap();
+            netlink::add_default_route(&mut nl, eth0, [192, 168, 64, 1]).unwrap();
+            sys::write_file("/proc/sys/net/ipv4/ip_forward", "1").unwrap();
+
+            let (c1_pid, c1_ns) = spawn_netns_holder();
+            let (c2_pid, c2_ns) = spawn_netns_holder();
+
+            let mut bridges = net::Bridges::default();
+            net::attach_container(
+                &mut bridges,
+                "kiri0",
+                "kv_eg1",
+                c1_pid,
+                [172, 18, 0, 2],
+                16,
+                [172, 18, 0, 1],
+                None,
+                None,
+                net::Plug::default(),
+            )
+            .unwrap();
+            net::attach_container(
+                &mut bridges,
+                "kiri0",
+                "kv_eg2",
+                c2_pid,
+                [172, 18, 0, 3],
+                16,
+                [172, 18, 0, 1],
+                None,
+                None,
+                net::Plug::default(),
+            )
+            .unwrap();
+
+            let skip = [([127, 0, 0, 0], 8), ([172, 18, 0, 0], 16), ([192, 168, 64, 0], 24)];
+            netlink::install_nat_with_egress(
+                eth0,
+                net::HOST_ADDR,
+                net::HOST_RELAY_PORT,
+                true,
+                &[],
+                [192, 168, 64, 1],
+                &["kiri0".to_owned()],
+                None,
+                net::EGRESS_RELAY_PORT,
+                &[([10, 254, 99, 0], 24)],
+                &skip,
+            )
+            .unwrap();
+
+            let listener = super::listen_host_bound(net::EGRESS_RELAY_PORT).unwrap();
+
+            // 1) Container 1 dials mock VPN destination 10.254.99.10:8443.
+            let c1_sock = netlink::in_netns(&c1_ns, || super::connect([10, 254, 99, 10], 8443)).unwrap();
+            let mut pfd = libc::pollfd { fd: listener.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+            assert_eq!(unsafe { libc::poll(&mut pfd, 1, 2000) }, 1, "egress listener must receive redirected SYN");
+
+            let mut pair = [0; 2];
+            assert_eq!(unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0, pair.as_mut_ptr()) }, 0);
+            let mut mock_host = unsafe { std::fs::File::from_raw_fd(pair[0]) };
+            let relay_host = unsafe { OwnedFd::from_raw_fd(pair[1]) };
+
+            let mut relay = super::accept_egress_with(&listener, net::HOST_ADDR, || Ok(relay_host)).expect("accept_egress");
+            assert!(!relay.dead, "redirected VPN connection must be accepted");
+
+            let mut hdr = [0u8; 6];
+            mock_host.read_exact(&mut hdr).unwrap();
+            assert_eq!(hdr, [10, 254, 99, 10, 0x20, 0xfb], "SO_ORIGINAL_DST must report 10.254.99.10:8443");
+
+            let mut c1_pfd = libc::pollfd { fd: c1_sock.as_raw_fd(), events: libc::POLLOUT, revents: 0 };
+            assert_eq!(unsafe { libc::poll(&mut c1_pfd, 1, 2000) }, 1);
+            let req = b"GET /vpn HTTP/1.1\r\n\r\n";
+            assert_eq!(unsafe { libc::write(c1_sock.as_raw_fd(), req.as_ptr().cast(), req.len()) }, req.len() as isize);
+
+            relay.step();
+            let mut got_req = vec![0u8; req.len()];
+            mock_host.read_exact(&mut got_req).unwrap();
+            assert_eq!(got_req, req);
+
+            let resp = b"HTTP/1.1 200 OK\r\n\r\nvpn-ok";
+            mock_host.write_all(resp).unwrap();
+            drop(mock_host);
+
+            for _ in 0..20 {
+                relay.step();
+                if relay.dead {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            unsafe {
+                let flags = libc::fcntl(c1_sock.as_raw_fd(), libc::F_GETFL);
+                libc::fcntl(c1_sock.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK);
+            }
+            let mut c1_file = unsafe { std::fs::File::from_raw_fd(c1_sock.as_raw_fd()) };
+            std::mem::forget(c1_sock);
+            let mut got_resp = vec![0u8; resp.len()];
+            c1_file.read_exact(&mut got_resp).unwrap();
+            assert_eq!(got_resp, resp);
+            let mut eof = [0u8; 1];
+            assert_eq!(c1_file.read(&mut eof).unwrap(), 0, "relay must pass clean EOF to container");
+
+            // 2) Even under full host egress (0.0.0.0/0), container-to-container
+            // TCP on the bridge (172.18.0.2 -> 172.18.0.3:9090) is exempt and
+            // connects directly without hitting the egress relay listener.
+            netlink::install_nat_with_egress(
+                eth0,
+                net::HOST_ADDR,
+                net::HOST_RELAY_PORT,
+                true,
+                &[],
+                [192, 168, 64, 1],
+                &["kiri0".to_owned()],
+                None,
+                net::EGRESS_RELAY_PORT,
+                &[([0, 0, 0, 0], 0)],
+                &skip,
+            )
+            .unwrap();
+
+            let peer_listener = netlink::in_netns(&c2_ns, || std::net::TcpListener::bind("172.18.0.3:9090")).unwrap();
+            let mut peer_client = netlink::in_netns(&c1_ns, || std::net::TcpStream::connect("172.18.0.3:9090")).unwrap();
+            let mut check_egress = libc::pollfd { fd: listener.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+            assert_eq!(unsafe { libc::poll(&mut check_egress, 1, 50) }, 0, "bridge peer traffic must not hit egress listener");
+            let (mut peer_accepted, _) = peer_listener.accept().unwrap();
+            peer_client.write_all(b"peer-ping").unwrap();
+            let mut peer_buf = [0u8; 9];
+            peer_accepted.read_exact(&mut peer_buf).unwrap();
+            assert_eq!(&peer_buf, b"peer-ping");
+
+            unsafe {
+                libc::kill(c1_pid, libc::SIGKILL);
+                libc::kill(c2_pid, libc::SIGKILL);
+                libc::_exit(0);
+            }
+        }
+        let mut status: libc::c_int = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0, "child failed with status {status}");
     }
 }

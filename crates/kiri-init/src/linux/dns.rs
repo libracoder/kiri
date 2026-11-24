@@ -144,6 +144,11 @@ pub struct Dns {
     /// Lookups the VM's resolver fails go through the host (in the VM; a
     /// Linux host's agent asks the host's resolvers itself).
     pub relay: bool,
+    /// Send upstream lookups straight through the host relay instead of
+    /// asking the VM's gateway resolver first (when a macOS network
+    /// extension or host egress mode is active, or once the gateway resolver
+    /// has answered with a `198.18.0.0/15` Fake-IP address).
+    pub prefer_relay: bool,
     /// The host didn't take a relayed lookup: none are tried until then.
     relay_down_until: Option<Instant>,
     /// Bridges whose gateway wouldn't take the listener (`serve_or_warn`):
@@ -407,6 +412,16 @@ impl Dns {
                     if matches!(msg[3] & 0x0f, 2 | 5) && self.pending[at].own.is_some() && self.ask_next_own(at) {
                         break;
                     }
+                    // A macOS security network extension intercepting the VM
+                    // bridge's DNS answers with a Fake-IP in 198.18.0.0/15
+                    // (#367): ask the Mac's own resolvers over vsock instead,
+                    // and prefer the host relay from then on.
+                    if self.pending[at].own.is_none() && self.pending[at].may_relay && answer_has_fake_ip(msg) {
+                        self.prefer_relay = true;
+                        if self.relay(at) {
+                            break;
+                        }
+                    }
                     self.answered(at, msg);
                     break;
                 }
@@ -544,13 +559,21 @@ impl Dns {
                 at = Some(i);
                 Some(sock)
             }),
+            None if self.prefer_relay && may_relay => None,
             None => upstream.first().and_then(|d| ask(*d, &msg)),
         };
-        // No resolver yet, or it can't be reached: the host, if allowed.
+        // No resolver yet, or it can't be reached (or `prefer_relay` chose the host): the host, if allowed.
         let (sock, relayed) = match sock {
             Some(s) => (s, false),
             None => match may_relay.then(|| self.relay_stream(&msg)).flatten() {
                 Some(s) => (s, true),
+                None if self.prefer_relay && own.is_none() => match upstream.first().and_then(|d| ask(*d, &msg)) {
+                    Some(s) => (s, false),
+                    None => {
+                        send_to(self.servers[server].sock.as_raw_fd(), &servfail(id, rd(q), &q[12..end]), &client);
+                        return;
+                    }
+                },
                 // No upstream that can be sent to and no host relay (none on
                 // a Linux host, not used for `--dns`, or backing off):
                 // answer at once rather than leave Go's resolver to time
@@ -884,6 +907,38 @@ fn bound(ip: [u8; 4], port: u16) -> io::Result<OwnedFd> {
 
 fn response_matches(msg: &[u8], pending: &Pending) -> bool {
     msg.get(2).is_some_and(|flags| flags & 0x80 != 0) && msg.get(12..12 + pending.question.len()).is_some_and(|question| question == pending.question)
+}
+
+/// Whether a DNS reply carries an A record in `198.18.0.0/15` (RFC 2544
+/// benchmarking space, used by macOS security network extensions as a
+/// synthetic Fake-IP range, #367), excluding `host.docker.internal`.
+fn answer_has_fake_ip(msg: &[u8]) -> bool {
+    let Some((_, _, mut pos)) = parse_question(msg) else { return false };
+    let ancount = u16::from_be_bytes([msg[6], msg[7]]) as usize;
+    for _ in 0..ancount {
+        loop {
+            let Some(&b) = msg.get(pos) else { return false };
+            if b == 0 {
+                pos += 1;
+                break;
+            }
+            if b & 0xc0 == 0xc0 {
+                pos += 2;
+                break;
+            }
+            pos += 1 + (b as usize);
+        }
+        let Some(hdr) = msg.get(pos..pos + 10) else { return false };
+        let rtype = u16::from_be_bytes([hdr[0], hdr[1]]);
+        let rdlen = u16::from_be_bytes([hdr[8], hdr[9]]) as usize;
+        pos += 10;
+        let Some(rdata) = msg.get(pos..pos + rdlen) else { return false };
+        if rtype == 1 && rdlen == 4 && rdata[0] == 198 && (rdata[1] & 0xfe) == 18 && rdata != super::net::HOST_ADDR {
+            return true;
+        }
+        pos += rdlen;
+    }
+    false
 }
 
 fn random_id() -> Option<u16> {
@@ -2003,5 +2058,23 @@ mod tests {
 
         response[2] = 0x01;
         assert!(!response_matches(&response, &p));
+    }
+
+    #[test]
+    fn detects_fake_ip_answers_in_198_18_range_and_ignores_real_or_host_ips() {
+        let mut msg = query("registry.npmjs.org", 1);
+        msg[2] = 0x81;
+        msg[3] = 0x80;
+        msg[6..8].copy_from_slice(&1u16.to_be_bytes());
+        // Name pointer 0xc00c, type A (1), class IN (1), TTL 60, rdlen 4, rdata
+        msg.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 198, 18, 2, 3]);
+        let rdata_off = msg.len() - 4;
+        assert!(super::answer_has_fake_ip(&msg), "198.18.2.3 is a Fake-IP answer (#367)");
+        msg[rdata_off..].copy_from_slice(&[198, 19, 0, 42]);
+        assert!(super::answer_has_fake_ip(&msg), "198.19.0.42 is in 198.18.0.0/15");
+        msg[rdata_off..].copy_from_slice(&super::super::net::HOST_ADDR);
+        assert!(!super::answer_has_fake_ip(&msg), "host.docker.internal is not a Fake-IP");
+        msg[rdata_off..].copy_from_slice(&[104, 16, 25, 34]);
+        assert!(!super::answer_has_fake_ip(&msg), "real public IP is not a Fake-IP");
     }
 }

@@ -614,6 +614,12 @@ impl VmLink {
         self.send(|o| kiri_proto::encode_fs_events(o, lines))
     }
 
+    /// Sets the IPv4 CIDR prefixes (`a.b.c.d/prefix`) whose outbound container
+    /// TCP connections the guest redirects to the host egress dialer. No reply.
+    pub fn set_egress_routes<S: AsRef<str>>(&self, routes: &[S]) -> io::Result<()> {
+        self.send(|o| kiri_proto::encode_set_egress_routes(o, routes))
+    }
+
     /// The Mac's wall clock, for the guest. Sent at boot, and again while it
     /// runs: the VM's clock stops while the Mac sleeps.
     pub fn set_time(&self) -> io::Result<()> {

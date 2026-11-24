@@ -54,8 +54,11 @@ pub const INPUT_WINDOW: usize = 4 << 20;
 /// the same reason. 9 added `Limits::swap_max`: an older agent would read
 /// the limits one field short. 10 added a payload on `MemoryPressure`
 /// (MemAvailable and PSI full avg10): an older agent's bare `MemoryPressure`
-/// has neither field, so decode rejects it as truncated.
-pub const PROTOCOL: u16 = 10;
+/// has neither field, so decode rejects it as truncated. 11 added
+/// `SetEgressRoutes`, another no-reply message (sent on every VM boot): an
+/// older agent's "unexpected" error would be taken as the reply to the next
+/// request.
+pub const PROTOCOL: u16 = 11;
 
 /// Most names a `DnsRename` may carry: a name, its aliases and a hostname.
 pub const MAX_DNS_NAMES: usize = 256;
@@ -240,6 +243,12 @@ pub enum Msg<'a> {
     /// request; the VM runs inside the daemon process today, so the two
     /// versions cannot differ.
     FsEvents(StrList<'a>),
+    /// Host → guest: IPv4 CIDR prefixes (`a.b.c.d/prefix`) whose outbound
+    /// container TCP connections are redirected to the agent and relayed over
+    /// [`EGRESS_TCP_PORT`] for the host to dial (split-tunnel VPN routes,
+    /// security network extensions, or `0.0.0.0/0` under host egress). Empty
+    /// clears the redirect rules. No reply.
+    SetEgressRoutes(StrList<'a>),
     /// Success, for requests with nothing else to say.
     Ack,
 }
@@ -251,6 +260,11 @@ pub const COPY_PORT: u32 = 1028;
 /// the VM's gateway resolver didn't answer as `u16 len | query`, as DNS over
 /// TCP frames it, and gets `u16 len | reply` back: one lookup per connection.
 pub const DNS_RELAY_PORT: u32 = 1037;
+
+/// vsock port of the host's outbound TCP relay. The agent sends `ip[4] port[2]`
+/// for a connection redirected from a container, and the host dials it and
+/// relays bytes both ways.
+pub const EGRESS_TCP_PORT: u32 = 1038;
 
 /// vsock port of the guest's USB passthrough: one connection per device,
 /// `speed u32 | devid u32` then USB/IP (crates/kiri-init/src/linux/usb.rs).
@@ -856,6 +870,7 @@ mod kind {
     pub const DNS_RENAME: u16 = 81;
     pub const FS_READ_LINK: u16 = 82;
     pub const SET_UPLINK: u16 = 83;
+    pub const SET_EGRESS_ROUTES: u16 = 84;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -925,10 +940,15 @@ pub fn encode_net_attach<S: AsRef<str>>(out: &mut Vec<u8>, id: &str, ifname: &st
 }
 
 /// Whether `frame` is of a kind the guest answers with no reply
-/// (`DnsRename`): one that doesn't decode is then dropped, not answered
-/// with an `Error` the host would read as the next request's reply.
+/// (`DnsRename`, `SetEgressRoutes`): one that doesn't decode is then dropped,
+/// not answered with an `Error` the host would read as the next request's reply.
 pub fn takes_no_reply(frame: &[u8]) -> bool {
-    frame.len() >= HEADER && u16::from_le_bytes([frame[4], frame[5]]) == kind::DNS_RENAME
+    frame.len() >= HEADER && matches!(u16::from_le_bytes([frame[4], frame[5]]), kind::DNS_RENAME | kind::SET_EGRESS_ROUTES)
+}
+
+/// Encodes a `SetEgressRoutes` frame from the sender's CIDR strings.
+pub fn encode_set_egress_routes<S: AsRef<str>>(out: &mut Vec<u8>, routes: &[S]) {
+    frame(out, kind::SET_EGRESS_ROUTES, |out| StrList::put_capped(out, routes, MAX_BODY));
 }
 
 /// Encodes a `DnsRename` frame from the sender's slices.
@@ -1246,6 +1266,10 @@ impl Msg<'_> {
                 put_u32(o, lines.count);
                 o.extend_from_slice(lines.raw);
             }),
+            Msg::SetEgressRoutes(routes) => frame(out, kind::SET_EGRESS_ROUTES, |o| {
+                put_u32(o, routes.count);
+                o.extend_from_slice(routes.raw);
+            }),
             Msg::Listening(lines) => frame(out, kind::LISTENING, |o| {
                 put_u32(o, lines.count);
                 o.extend_from_slice(lines.raw);
@@ -1556,6 +1580,7 @@ pub fn decode(frame: &[u8]) -> Result<Msg<'_>, DecodeError> {
         kind::USB_NODES_QUERY => Msg::UsbNodesQuery,
         kind::USB_NODES => Msg::UsbNodes(r.list()?),
         kind::FS_EVENTS => Msg::FsEvents(r.list()?),
+        kind::SET_EGRESS_ROUTES => Msg::SetEgressRoutes(r.list()?),
         kind::NET_ATTACH => Msg::NetAttach {
             id: r.str()?,
             ifname: r.str()?,
@@ -1874,6 +1899,16 @@ mod tests {
     }
 
     #[test]
+    fn the_protocol_version_covers_set_egress_routes() {
+        // An agent from before `SetEgressRoutes` answers it with an error
+        // that the host would take as the reply to its next request.
+        const { assert!(PROTOCOL >= 11) };
+        let mut buf = Vec::new();
+        encode_set_egress_routes(&mut buf, &["10.0.5.0/24"]);
+        assert!(takes_no_reply(&buf));
+    }
+
+    #[test]
     fn the_protocol_version_covers_swap_max() {
         // An agent from before `Limits::swap_max` reads the limits one field short.
         const { assert!(PROTOCOL >= 9) };
@@ -1927,6 +1962,11 @@ mod tests {
         encode_fs_events(&mut buf, &["M\t/mnt/mac/Users/a/app/main.js", "D\t/mnt/mac/Users/a/app/old.js"]);
         let Msg::FsEvents(lines) = decode(&buf).unwrap() else { panic!() };
         assert_eq!(lines.iter().collect::<Vec<_>>(), ["M\t/mnt/mac/Users/a/app/main.js", "D\t/mnt/mac/Users/a/app/old.js"]);
+        let mut buf = Vec::new();
+        encode_set_egress_routes(&mut buf, &["10.0.5.0/24", "198.18.0.0/15"]);
+        let Msg::SetEgressRoutes(routes) = decode(&buf).unwrap() else { panic!() };
+        assert_eq!(routes.iter().collect::<Vec<_>>(), ["10.0.5.0/24", "198.18.0.0/15"]);
+        assert!(takes_no_reply(&buf));
         let mut buf = Vec::new();
         encode_listening(&mut buf, &["   0: 00000000:11D7 00000000:0000 0A"]);
         let Msg::Listening(lines) = decode(&buf).unwrap() else { panic!() };
@@ -2040,6 +2080,7 @@ mod tests {
             ("usage", encode_usage::<String>),
             ("usb_nodes", encode_usb_nodes::<String>),
             ("fs_events", encode_fs_events::<String>),
+            ("set_egress_routes", encode_set_egress_routes::<String>),
             ("listening", encode_listening::<String>),
         ];
         // Exact single-item fit (MAX_BODY - 8 bytes) and 1 byte over.

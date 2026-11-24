@@ -13,6 +13,9 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #319 Mac: relay outbound container TCP for split-tunnel VPN routes and security network extensions (unreleased)
+- Fixes: #319 Mac: containers can't reach hosts behind a split-tunnel VPN; #367 Mac: containers have no working HTTP/HTTPS when a security network extension is active (DNS answers 198.18.x, TCP reset); #616 macOS: large HTTPS downloads from Google-fronted hosts stall in containers (~10 KB/s) while the Mac gets 17 MB/s; Cloudflare is fine
+
 ### #127 Linux: standalone root daemon serves 0660 `/run/kiri/docker.sock` for containerized SDK clients (unreleased)
 - Fixes: #127 Linux daemon: Docker-compatible socket access for containerized SDK clients
 - Caused: none known
@@ -27,6 +30,7 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 - Caused: none known
 - Caused by: -
 - Check: none
+
 
 
 

@@ -1645,6 +1645,8 @@ impl Engine {
         })?);
         // host.docker.internal: the guest dials back for each connection.
         vm.listen(super::ports::HOST_BOUND_PORT, Box::new(super::ports::serve_host_bound))?;
+        // Outbound container TCP to VPN tunnel routes or under host egress.
+        vm.listen(kiri_proto::EGRESS_TCP_PORT, Box::new(super::ports::serve_egress))?;
         // SSH agent forwarding, for containers that mount /run/host-services/ssh-auth.sock.
         vm.listen(super::ports::SSH_AGENT_PORT, Box::new(super::ports::serve_ssh_agent))?;
         // The engine's API, for containers that mount /var/run/docker.sock
@@ -1658,6 +1660,16 @@ impl Engine {
         if cfg!(target_os = "macos") {
             vm.listen(kiri_proto::DNS_RELAY_PORT, Box::new(super::dns::serve_relay))?;
         }
+        // The VM's own NAT subnet, which the host egress dialer must refuse
+        // (VM only). Without a lease yet the default subnet still covers it,
+        // and publishing a port learns it again.
+        if cfg!(target_os = "macos") {
+            match vm.uplink() {
+                Ok((_ip, gateway)) => super::ports::set_vm_subnet(gateway, super::ports::VM_UPLINK_PREFIX),
+                Err(e) => crate::diag::debug!("VM uplink not known yet", error = e),
+            }
+        }
+        super::ports::sync_egress_routes(&vm);
         // Everything else on the guest's disk belongs to containers that are
         // gone, unless the container list was damaged: then a container
         // missing from it may still be someone's, and so may the layers only

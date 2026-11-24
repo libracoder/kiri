@@ -107,6 +107,7 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
     // listener would only be a port open to the LAN and a clash with any
     // host service on it.
     let host_bound = if host_process { None } else { Some(super::relay::listen_host_bound(net::HOST_RELAY_PORT)?) };
+    let mut egress = if host_process { None } else { Some(super::relay::listen_host_bound(net::EGRESS_RELAY_PORT)?) };
     let framed = super::relay::listen_framed()?;
     let ssh_agent = super::relay::listen_ssh_agent()?;
     // The engine's API for containers that mount the docker socket (VM only).
@@ -152,6 +153,7 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
         fds.push(libc::pollfd { fd: forward.as_raw_fd(), events: libc::POLLIN, revents: 0 });
         fds.push(libc::pollfd { fd: framed.as_raw_fd(), events: libc::POLLIN, revents: 0 });
         fds.push(libc::pollfd { fd: host_bound.as_ref().map_or(-1, |l| l.as_raw_fd()), events: libc::POLLIN, revents: 0 });
+        fds.push(libc::pollfd { fd: egress.as_ref().map_or(-1, |l| l.as_raw_fd()), events: libc::POLLIN, revents: 0 });
         fds.push(libc::pollfd { fd: ssh_agent.as_raw_fd(), events: libc::POLLIN, revents: 0 });
         fds.push(libc::pollfd { fd: engine_api.as_ref().map_or(-1, |l| l.as_raw_fd()), events: libc::POLLIN, revents: 0 });
         fds.push(libc::pollfd { fd: copies.as_raw_fd(), events: libc::POLLIN, revents: 0 });
@@ -315,6 +317,12 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
             }
             if let Some(l) = host_bound.as_ref().filter(|l| l.as_raw_fd() == pfd.fd) {
                 while let Some(r) = super::relay::accept_host_bound(l, super::net::HOST_ADDR, super::net::HOST_RELAY_PORT) {
+                    relays.push(r);
+                }
+                continue;
+            }
+            if let Some(l) = egress.as_ref().filter(|l| l.as_raw_fd() == pfd.fd) {
+                while let Some(r) = super::relay::accept_egress(l, super::net::HOST_ADDR) {
                     relays.push(r);
                 }
                 continue;
@@ -613,6 +621,19 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
                 }
                 Ok(Msg::FsEvents(lines)) => {
                     fs_events.add(lines.iter());
+                    continue;
+                }
+                Ok(Msg::SetEgressRoutes(routes)) => {
+                    let parsed = net::parse_egress_routes(routes);
+                    if !host_process && !parsed.is_empty() && egress.is_none() {
+                        egress = super::relay::listen_host_bound(net::EGRESS_RELAY_PORT)
+                            .inspect_err(|e| eprintln!("kiri-init: no egress relay listener: {e}"))
+                            .ok();
+                    }
+                    dns.prefer_relay = !host_process && net::egress_prefers_dns_relay(&parsed);
+                    if let Err(e) = net::set_egress_routes(parsed) {
+                        eprintln!("kiri-init: egress routes: {e}");
+                    }
                     continue;
                 }
                 Ok(Msg::Retain(keep)) => {
