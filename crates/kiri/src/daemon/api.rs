@@ -1643,6 +1643,82 @@ fn is_ssh_agent_sock(src: &str) -> bool {
     src.starts_with('/') && lexical_path(src) == SSH_AGENT_SOCK
 }
 
+/// Classification of a container bind mount source that should be backed by
+/// Kiri's SSH agent relay socket instead of a plain filesystem bind.
+#[derive(Debug, PartialEq, Eq)]
+enum SshAgentBind {
+    /// Docker Desktop / OrbStack's virtual `/run/host-services/ssh-auth.sock`.
+    Virtual,
+    /// A macOS host SSH agent Unix socket (virtiofs cannot forward host Unix
+    /// domain sockets into the Linux VM). Holds `Some(canonical_path)` when a
+    /// live, current-UID-owned socket exists on disk; `None` when a well-known
+    /// agent socket path does not exist yet.
+    MacHost(Option<std::path::PathBuf>),
+}
+
+fn ssh_agent_bind_for(src: &str, mac: bool) -> Option<SshAgentBind> {
+    if is_ssh_agent_sock(src) {
+        return Some(SshAgentBind::Virtual);
+    }
+    if !mac || !src.starts_with('/') {
+        return None;
+    }
+    let p = std::path::Path::new(src);
+    match std::fs::symlink_metadata(p) {
+        Ok(_) => {
+            // Resolve symlinks first so a link named `S.gpg-agent.ssh` pointing
+            // to `docker.sock` or another socket is judged by its real target.
+            let canon = std::fs::canonicalize(p).ok()?;
+            if !super::ports::is_owned_unix_socket(&canon) || super::ports::is_kiri_socket_path(&canon) {
+                return None;
+            }
+            if super::ports::is_known_mac_ssh_agent_sock_path(&canon)
+                || super::ports::matches_default_ssh_auth_sock(&canon)
+            {
+                Some(SshAgentBind::MacHost(Some(canon)))
+            } else {
+                None
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Not on disk yet (e.g. gpg-agent not started): still translate
+            // well-known Mac agent socket paths to the guest relay so `-v` does
+            // not create a directory over `S.gpg-agent.ssh`.
+            let clean = std::path::PathBuf::from(lexical_path(src));
+            if !super::ports::is_kiri_socket_path(&clean)
+                && super::ports::is_known_mac_ssh_agent_sock_path(&clean)
+            {
+                Some(SshAgentBind::MacHost(None))
+            } else {
+                None
+            }
+        }
+        Err(_) => None,
+    }
+}
+
+/// Restores a strict host SSH agent bind mount as the preferred upstream on
+/// container start (macOS only), so restarting a container after a daemon
+/// reboot keeps reaching the agent it mounted without allowing container-created
+/// specs to point `serve_ssh_agent` at arbitrary sockets.
+pub(super) fn refresh_ssh_agent_mounts(info: &[Value]) {
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+    for m in info {
+        if m["Type"] != "bind" {
+            continue;
+        }
+        let Some(src) = m["Source"].as_str() else { continue };
+        if super::binds::engine_socket(src).is_some() {
+            continue;
+        }
+        if let Some(SshAgentBind::MacHost(Some(host_path))) = ssh_agent_bind_for(src, true) {
+            super::ports::set_preferred_ssh_auth_sock_strict(&host_path);
+        }
+    }
+}
+
 /// A container's mounts, worked out at create time.
 struct Mounts {
     /// For the guest: `source\ttarget\tflags`.
@@ -1749,7 +1825,13 @@ fn fresh_bind_sources_with(guest: &[String], info: &[Value], engine_socket: impl
                 return given.map_or_else(|| line.clone(), |given| format!("{given}\t{rest}"));
             }
             let Some(src) = src else { return line.clone() };
-            if !old.strip_prefix(MAC_ROOT).is_some_and(|p| p.starts_with('/')) || engine_socket(src).is_some() {
+            if engine_socket(src).is_some() {
+                return line.clone();
+            }
+            if ssh_agent_bind_for(src, mac).is_some() {
+                return format!("{}\t{rest}", ssh_agent_source_for(!mac));
+            }
+            if !old.strip_prefix(MAC_ROOT).is_some_and(|p| p.starts_with('/')) {
                 return line.clone();
             }
             format!("{}\t{rest}", guest_bind_source(src))
@@ -1923,10 +2005,11 @@ fn volumes_from_mounts(guest: &[String], info: &[Value], ro: bool) -> Vec<(Strin
 /// VOLUME lines.
 #[cfg(test)]
 fn mounts(body: &Value, engine: &Engine, image: &kiri_image::Image) -> Result<Mounts, Error> {
-    mounts_for(body, engine, image, None)
+    mounts_for(body, engine, image, &super::caller::Caller::Host)
 }
 
-fn mounts_for(body: &Value, engine: &Engine, image: &kiri_image::Image, wsl_distro: Option<&str>) -> Result<Mounts, Error> {
+fn mounts_for(body: &Value, engine: &Engine, image: &kiri_image::Image, caller: &super::caller::Caller) -> Result<Mounts, Error> {
+    let wsl_distro = caller.wsl_distro();
     let host = &body["HostConfig"];
     let mut out = Mounts { guest: Vec::new(), info: Vec::new(), volumes: Vec::new(), anon: Vec::new() };
     let check_target = |t: &str| -> Result<(), Error> {
@@ -1961,12 +2044,22 @@ fn mounts_for(body: &Value, engine: &Engine, image: &kiri_image::Image, wsl_dist
         // The engine's own socket (Testcontainers' Ryuk, CI runners): the VM's
         // relay to this daemon on a Mac, or Kiri's socket on a Linux host.
         let engine_sock = if kind == "bind" { super::binds::engine_socket_for_distro(src, wsl_distro) } else { None };
+        let ssh_sock = if kind == "bind" && engine_sock.is_none() {
+            ssh_agent_bind_for(src, cfg!(target_os = "macos"))
+        } else {
+            None
+        };
         match kind {
             "bind" if engine_sock.is_some() => {
                 out.guest.push(format!("{}\t{dst}\t{}", engine_sock.as_deref().unwrap_or_default(), flag("")));
                 out.info.push(json!({"Type": "bind", "Source": src, "Destination": dst, "Mode": "", "RW": !ro, "Propagation": "rprivate"}));
             }
-            "bind" if is_ssh_agent_sock(src) => {
+            "bind" if ssh_sock.is_some() => {
+                if let Some(SshAgentBind::MacHost(Some(ref host_path))) = ssh_sock
+                    && *caller == super::caller::Caller::Host
+                {
+                    super::ports::set_preferred_ssh_auth_sock(host_path);
+                }
                 out.guest.push(format!("{}\t{dst}\t{}", ssh_agent_source(), flag("")));
                 out.info.push(json!({"Type": "bind", "Source": src, "Destination": dst, "Mode": "", "RW": !ro, "Propagation": "rprivate"}));
             }
@@ -2608,7 +2701,7 @@ const SECCOMP_UNCONFINED_WARNING: &str =
     "seccomp=unconfined lifts the default syscall filter, but Kiri keeps its host boundary: io_uring and vsock sockets stay blocked";
 
 pub(super) fn create(req: &Request, engine: &Engine) -> Result<Value, Error> {
-    create_for(req, engine, None)
+    create_by(req, engine, &super::caller::Caller::Host)
 }
 
 fn unc_wsl_distro(s: &str) -> Option<String> {
@@ -2676,15 +2769,20 @@ fn created_wsl_distro(caller: &Caller, engine_distro: Option<&str>, labels: &Val
 fn create_by(req: &Request, engine: &Engine, caller: &Caller) -> Result<Value, Error> {
     let body_labels = serde_json::from_slice::<Value>(&req.body).ok().map(|b| b["Labels"].clone()).unwrap_or(Value::Null);
     let record_distro = created_wsl_distro(caller, super::binds::wsl().and_then(|w| w.distro.as_deref()), &body_labels);
-    create_inner(req, engine, caller.wsl_distro(), record_distro)
+    create_inner(req, engine, caller, record_distro)
 }
 
+#[cfg(test)]
 pub(super) fn create_for(req: &Request, engine: &Engine, wsl_distro: Option<&str>) -> Result<Value, Error> {
     let record_distro = wsl_distro.filter(|d| super::binds::valid_distro_name(d)).map(str::to_owned);
-    create_inner(req, engine, wsl_distro, record_distro)
+    let caller = match wsl_distro {
+        Some(d) => Caller::Wsl(d.to_owned()),
+        None => Caller::Host,
+    };
+    create_inner(req, engine, &caller, record_distro)
 }
 
-fn create_inner(req: &Request, engine: &Engine, wsl_distro: Option<&str>, record_wsl_distro: Option<String>) -> Result<Value, Error> {
+fn create_inner(req: &Request, engine: &Engine, caller: &Caller, record_wsl_distro: Option<String>) -> Result<Value, Error> {
     let body: Value = serde_json::from_slice(&req.body).map_err(|e| Error::BadRequest(format!("invalid JSON: {e}")))?;
     let image_name = body["Image"].as_str().unwrap_or_default();
     if image_name.is_empty() {
@@ -2817,7 +2915,7 @@ fn create_inner(req: &Request, engine: &Engine, wsl_distro: Option<&str>, record
             "can't create 'AutoRemove' container with restart policy".into(),
         ));
     }
-    let mounts = mounts_for(&body, engine, &image, wsl_distro)?;
+    let mounts = mounts_for(&body, engine, &image, caller)?;
     let exposed = exposed_ports(&body, &image_cfg);
     let ports = port_bindings(&body, &exposed)?;
     if !ports.is_empty() && network_mode == "none" {
@@ -4937,6 +5035,140 @@ mod tests {
         assert_eq!(m.info[1]["RW"], false);
         drop(engine);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// On macOS, direct bind mounts of host SSH agent sockets (GnuPG's
+    /// `S.gpg-agent.ssh`, 1Password's `agent.sock`, launchd's `Listeners`) map
+    /// the guest source to `/run/host-services/ssh-auth.sock` while keeping
+    /// inspect's `Source` intact — and never treat Kiri's `docker.sock` or
+    /// symlinks to it as an SSH agent socket (#763).
+    #[test]
+    fn mac_host_ssh_agent_bind_mounts_translate_and_never_match_kiri_socket() {
+        use std::os::unix::net::UnixListener;
+
+        // Well-known Mac SSH agent socket paths match only when mac == true.
+        for path in [
+            "/Users/alice/.gnupg/S.gpg-agent.ssh",
+            "/Users/alice/.1password/agent.sock",
+            "/Users/alice/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock",
+            "/private/tmp/com.apple.launchd.abc123/Listeners",
+            "/var/run/com.apple.launchd.abc123/Listeners",
+        ] {
+            assert!(super::ssh_agent_bind_for(path, true).is_some(), "mac should recognize {path}");
+            assert!(super::ssh_agent_bind_for(path, false).is_none(), "linux must leave {path} alone");
+        }
+
+        // Security: Kiri's socket (synthetic or real) is never recognized as an SSH agent socket.
+        assert!(super::ssh_agent_bind_for("/Users/alice/.kiri/run/docker.sock", true).is_none());
+        assert!(super::ssh_agent_bind_for("/var/run/docker.sock", true).is_none());
+        if let Ok(own) = super::super::socket_path() {
+            assert!(super::ssh_agent_bind_for(&own.to_string_lossy(), true).is_none());
+        }
+
+        // Real filesystem checks: live socket vs regular file vs symlink to docker.sock.
+        let dir = std::env::temp_dir().join(format!("kiri-api-ssh-bind-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("real")).unwrap();
+        std::fs::create_dir_all(dir.join("fake")).unwrap();
+        std::fs::create_dir_all(dir.join("link")).unwrap();
+
+        let live_gpg = dir.join("real/S.gpg-agent.ssh");
+        let _gpg_listener = UnixListener::bind(&live_gpg).unwrap();
+        let live_gpg_str = live_gpg.to_str().unwrap();
+        assert_eq!(
+            super::ssh_agent_bind_for(live_gpg_str, true),
+            Some(super::SshAgentBind::MacHost(Some(std::fs::canonicalize(&live_gpg).unwrap())))
+        );
+        assert_eq!(super::ssh_agent_bind_for(live_gpg_str, false), None);
+
+        // Regular file with the same name is not intercepted.
+        let regular_file = dir.join("fake/S.gpg-agent.ssh");
+        std::fs::write(&regular_file, b"plain file").unwrap();
+        assert_eq!(super::ssh_agent_bind_for(regular_file.to_str().unwrap(), true), None);
+
+        // Symlink named S.gpg-agent.ssh pointing to docker.sock is rejected after canonicalize.
+        let docker_sock = dir.join("docker.sock");
+        let _docker_listener = UnixListener::bind(&docker_sock).unwrap();
+        let evil_link = dir.join("link/S.gpg-agent.ssh");
+        std::os::unix::fs::symlink(&docker_sock, &evil_link).unwrap();
+        assert_eq!(super::ssh_agent_bind_for(evil_link.to_str().unwrap(), true), None);
+
+        // fresh_bind_sources_with on macOS preserves /run/host-services/ssh-auth.sock on
+        // restart and upgrades legacy /mnt/mac/.../S.gpg-agent.ssh mounts while keeping
+        // engine socket binds untouched.
+        let gpg_info = vec![
+            json!({"Type": "bind", "Source": "/Users/alice/.gnupg/S.gpg-agent.ssh"}),
+            json!({"Type": "bind", "Source": "/Users/alice/.kiri/run/docker.sock"}),
+        ];
+        let restarted = vec![
+            "/run/host-services/ssh-auth.sock\t/ssh-agent\t".to_owned(),
+            "/run/host-services/docker.sock\t/var/run/docker.sock\t".to_owned(),
+        ];
+        let legacy = vec![
+            "/mnt/mac/Users/alice/.gnupg/S.gpg-agent.ssh\t/ssh-agent\tro".to_owned(),
+            "/run/host-services/docker.sock\t/var/run/docker.sock\t".to_owned(),
+        ];
+        let sock = |s: &str| (s == "/Users/alice/.kiri/run/docker.sock").then(|| "/run/host-services/docker.sock".to_owned());
+        assert_eq!(super::fresh_bind_sources_with(&restarted, &gpg_info, sock, true), restarted);
+        assert_eq!(
+            super::fresh_bind_sources_with(&legacy, &gpg_info, sock, true),
+            [
+                "/run/host-services/ssh-auth.sock\t/ssh-agent\tro",
+                "/run/host-services/docker.sock\t/var/run/docker.sock\t",
+            ]
+        );
+
+        #[cfg(target_os = "macos")]
+        {
+            let _guard = super::super::ports::PREFERRED_SSH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            super::super::ports::clear_preferred_ssh_auth_sock();
+
+            let (root, engine) = engine_in("mac-gpg-ssh-mounts", false);
+            let image = test_image("ssh:1");
+            let own_sock = super::super::socket_path().unwrap().to_string_lossy().into_owned();
+            let body = json!({
+                "HostConfig": {
+                    "Binds": [
+                        "/Users/alice/.gnupg/S.gpg-agent.ssh:/ssh-agent",
+                        format!("{live_gpg_str}:/live-gpg.sock:ro"),
+                        format!("{own_sock}:/not-ssh"),
+                    ],
+                    "Mounts": [
+                        {"Type": "bind", "Source": "/Users/alice/.1password/agent.sock", "Target": "/op.sock", "ReadOnly": true},
+                    ],
+                }
+            });
+            // Container caller must never mutate the daemon's preferred SSH agent socket.
+            let m_container = super::mounts_for(&body, &engine, &image, &super::super::caller::Caller::Container).unwrap();
+            assert!(super::super::ports::current_preferred_ssh_auth_sock().is_none(), "Caller::Container must not set preferred SSH socket");
+            assert_eq!(
+                m_container.guest,
+                [
+                    "/run/host-services/ssh-auth.sock\t/ssh-agent\t",
+                    "/run/host-services/ssh-auth.sock\t/live-gpg.sock\tro",
+                    "/run/host-services/docker.sock\t/not-ssh\t",
+                    "/run/host-services/ssh-auth.sock\t/op.sock\tro",
+                ]
+            );
+            assert_eq!(m_container.info[0]["Source"], "/Users/alice/.gnupg/S.gpg-agent.ssh");
+            assert_eq!(m_container.info[1]["Source"], live_gpg_str);
+            assert_eq!(m_container.info[2]["Source"], own_sock);
+            assert_eq!(m_container.info[3]["Source"], "/Users/alice/.1password/agent.sock");
+
+            // Host caller records the live GPG socket as preferred while keeping inspect intact.
+            let m_host = super::mounts_for(&body, &engine, &image, &super::super::caller::Caller::Host).unwrap();
+            assert_eq!(m_host.guest, m_container.guest);
+            assert_eq!(
+                super::super::ports::current_preferred_ssh_auth_sock(),
+                Some(std::fs::canonicalize(&live_gpg).unwrap())
+            );
+
+            super::super::ports::clear_preferred_ssh_auth_sock();
+            drop(engine);
+            let _ = std::fs::remove_dir_all(root);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `--pid`: empty and `host` as given, `container:<name>` kept with the

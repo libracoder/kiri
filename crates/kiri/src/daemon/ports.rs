@@ -2063,22 +2063,533 @@ fn watch_macos_routes(weak: std::sync::Weak<VmLink>, mut last: Vec<String>) {
 /// vsock port the guest dials for SSH agent connections.
 pub const SSH_AGENT_PORT: u32 = 1027;
 
-/// The Mac's SSH agent socket: `$SSH_AUTH_SOCK`, or launchd's if the daemon
-/// was not started from a shell that has it.
-fn ssh_auth_sock() -> Option<std::path::PathBuf> {
-    if let Some(p) = std::env::var_os("SSH_AUTH_SOCK") {
-        return Some(p.into());
+/// Host SSH agent socket last bind-mounted explicitly by a host-side create
+/// (or restored at start from a strict user agent mount) on macOS. Validated
+/// before storing (canonicalized, owned Unix socket, allowed SSH agent path,
+/// never Kiri's own socket) and re-checked on every connection.
+static PREFERRED_SSH_AUTH_SOCK: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+
+/// Normalizes an absolute path lexically (`//`, `/./`, `/../`) without
+/// touching the filesystem.
+fn lexical_clean_path(p: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    for c in p.split('/') {
+        match c {
+            "" | "." => {}
+            ".." => {
+                out.pop();
+            }
+            c => out.push(c),
+        }
     }
-    let out = std::process::Command::new("/bin/launchctl").args(["getenv", "SSH_AUTH_SOCK"]).output().ok()?;
+    format!("/{}", out.join("/"))
+}
+
+/// Whether `path` is Apple launchd's default per-session SSH agent socket:
+/// `/private/tmp/com.apple.launchd.<id>/Listeners`,
+/// `/tmp/com.apple.launchd.<id>/Listeners`,
+/// `/private/var/run/com.apple.launchd.<id>/Listeners`, or
+/// `/var/run/com.apple.launchd.<id>/Listeners`.
+pub(crate) fn is_launchd_ssh_sock(path: &std::path::Path) -> bool {
+    let Some(s) = path.to_str() else { return false };
+    if !s.starts_with('/') {
+        return false;
+    }
+    let clean = lexical_clean_path(s);
+    const PREFIXES: &[&str] = &["/private/tmp/", "/tmp/", "/private/var/run/", "/var/run/"];
+    let Some(rest) = PREFIXES.iter().find_map(|p| clean.strip_prefix(p)) else {
+        return false;
+    };
+    let Some(dir) = rest.strip_suffix("/Listeners") else {
+        return false;
+    };
+    dir.starts_with("com.apple.launchd.")
+        && !dir.contains('/')
+        && dir.len() > "com.apple.launchd.".len()
+}
+
+/// Whether `path` exists as a Unix domain socket owned by this process's
+/// effective UID (follows symlinks, matching `UnixStream::connect`).
+pub(crate) fn is_owned_unix_socket(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    // SAFETY: geteuid only reads this process's effective user ID.
+    meta.file_type().is_socket() && meta.uid() == unsafe { libc::geteuid() }
+}
+
+fn is_kiri_run_dir(dir: &std::path::Path) -> bool {
+    match dir.file_name().and_then(|n| n.to_str()) {
+        Some("kiri") => true,
+        Some("run") => dir
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with(".kiri") || n == "kiri"),
+        _ => false,
+    }
+}
+
+/// Whether `path` is Kiri's own daemon socket or sits inside Kiri's runtime
+/// socket directory (`~/.kiri*/run/` or `/run/kiri/`). Never allowed as an SSH
+/// agent upstream.
+pub(crate) fn is_kiri_socket_path(path: &std::path::Path) -> bool {
+    let Some(s) = path.to_str() else { return false };
+    if super::binds::engine_socket(s).is_some() {
+        return true;
+    }
+    let clean = std::path::PathBuf::from(lexical_clean_path(s));
+    let canon = std::fs::canonicalize(path).unwrap_or_else(|_| clean.clone());
+    for own in [super::socket_path().ok(), super::home_socket_path().ok()].into_iter().flatten() {
+        let own_clean = std::path::PathBuf::from(lexical_clean_path(&own.to_string_lossy()));
+        let own_canon = std::fs::canonicalize(&own).unwrap_or_else(|_| own_clean.clone());
+        if canon == own_canon || clean == own_clean {
+            return true;
+        }
+        if let Some(dir) = own_canon.parent()
+            && is_kiri_run_dir(dir)
+            && canon.starts_with(dir)
+        {
+            return true;
+        }
+        if let Some(dir) = own_clean.parent()
+            && is_kiri_run_dir(dir)
+            && clean.starts_with(dir)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether `path` (already canonicalized when on disk, or lexically cleaned
+/// otherwise) names a well-known macOS SSH agent socket:
+/// - Apple launchd's `com.apple.launchd.*/Listeners`
+/// - GnuPG's `S.gpg-agent.ssh` under a Mac user or temp share
+/// - 1Password's `~/.1password/agent.sock` or
+///   `~/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock`
+pub(crate) fn is_known_mac_ssh_agent_sock_path(path: &std::path::Path) -> bool {
+    if is_launchd_ssh_sock(path) {
+        return true;
+    }
+    let Some(s) = path.to_str() else { return false };
+    if !s.starts_with('/') {
+        return false;
+    }
+    let clean = lexical_clean_path(s);
+    if clean.ends_with("/S.gpg-agent.ssh") {
+        const SHARES: &[&str] = &[
+            "/Users/",
+            "/Volumes/",
+            "/private/tmp/",
+            "/tmp/",
+            "/private/var/folders/",
+            "/var/folders/",
+        ];
+        if SHARES.iter().any(|p| clean.starts_with(p)) {
+            return true;
+        }
+        for var in ["HOME", "GNUPGHOME"] {
+            if let Some(dir) = std::env::var_os(var).filter(|v| !v.is_empty()) {
+                let base = lexical_clean_path(&dir.to_string_lossy());
+                if clean.strip_prefix(&base).is_some_and(|r| r.starts_with('/')) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+    const ONE_PASSWORD_SUFFIXES: &[&str] = &[
+        "/.1password/agent.sock",
+        "/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock",
+    ];
+    for suffix in ONE_PASSWORD_SUFFIXES {
+        if let Some(prefix) = clean.strip_suffix(suffix) {
+            if prefix.starts_with("/Users/") || prefix.starts_with("/Volumes/") {
+                return true;
+            }
+            if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty())
+                && prefix == lexical_clean_path(&home.to_string_lossy())
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Strict allowlist used when restoring a preferred SSH agent socket on
+/// container start (without caller context): only permits launchd's
+/// `Listeners`, 1Password's `agent.sock` directly under the user's `$HOME`,
+/// or GnuPG's `S.gpg-agent.ssh` inside `~/.gnupg`, `$GNUPGHOME`, or
+/// `gpgconf --list-dirs agent-ssh-socket`.
+fn is_strict_mac_ssh_agent_sock_path_for(
+    path: &std::path::Path,
+    home: Option<&std::path::Path>,
+    gnupg_home: Option<&std::path::Path>,
+    gpgconf_sock: Option<&std::path::Path>,
+) -> bool {
+    if is_launchd_ssh_sock(path) {
+        return true;
+    }
+    let Some(s) = path.to_str() else { return false };
+    if !s.starts_with('/') {
+        return false;
+    }
+    let clean = lexical_clean_path(s);
+    let same = |candidate: std::path::PathBuf| -> bool {
+        let cand_clean = lexical_clean_path(&candidate.to_string_lossy());
+        if clean == cand_clean {
+            return true;
+        }
+        std::fs::canonicalize(&candidate)
+            .ok()
+            .and_then(|c| c.to_str().map(lexical_clean_path))
+            .is_some_and(|c| c == clean)
+    };
+    if let Some(h) = home {
+        for rel in [
+            ".gnupg/S.gpg-agent.ssh",
+            ".1password/agent.sock",
+            "Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock",
+        ] {
+            if same(h.join(rel)) {
+                return true;
+            }
+        }
+    }
+    if let Some(g) = gnupg_home
+        && same(g.join("S.gpg-agent.ssh"))
+    {
+        return true;
+    }
+    if let Some(sock) = gpgconf_sock
+        && same(sock.to_path_buf())
+    {
+        return true;
+    }
+    false
+}
+
+/// Whether a `gpg-agent.conf` file enables SSH agent support via an
+/// uncommented `enable-ssh-support` directive.
+fn gpg_agent_ssh_enabled(conf: &str) -> bool {
+    let mut enabled = false;
+    for line in conf.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        match line.split_whitespace().next() {
+            Some("enable-ssh-support") => enabled = true,
+            Some("no-enable-ssh-support") => enabled = false,
+            _ => {}
+        }
+    }
+    enabled
+}
+
+fn launchctl_getenv(var: &str) -> Option<std::path::PathBuf> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let out = std::process::Command::new("/bin/launchctl")
+        .args(["getenv", var])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
     let p = String::from_utf8_lossy(&out.stdout).trim().to_owned();
     (!p.is_empty()).then(|| p.into())
+}
+
+fn gpgconf_candidates() -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            if !dir.as_os_str().is_empty() {
+                out.push(dir.join("gpgconf"));
+            }
+        }
+    }
+    for fallback in [
+        "/opt/homebrew/bin/gpgconf",
+        "/usr/local/bin/gpgconf",
+        "/usr/local/MacGPG2/bin/gpgconf",
+    ] {
+        let p = std::path::PathBuf::from(fallback);
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    }
+    out
+}
+
+fn is_executable_file(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).is_ok_and(|m| m.is_file() && (m.permissions().mode() & 0o111 != 0))
+}
+
+fn gpgconf_agent_ssh_socket(gnupg_home: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
+    let bin = gpgconf_candidates().into_iter().find(|p| is_executable_file(p))?;
+    let mut cmd = std::process::Command::new(bin);
+    cmd.args(["--list-dirs", "agent-ssh-socket"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    if let Some(dir) = gnupg_home {
+        cmd.env("GNUPGHOME", dir);
+    }
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    (!s.is_empty()).then(|| std::path::PathBuf::from(s))
+}
+
+/// Checks whether GPG SSH support is enabled in `$GNUPGHOME/gpg-agent.conf`
+/// (when `GNUPGHOME` is set) or `~/.gnupg/gpg-agent.conf`, and if so returns
+/// candidate GPG SSH agent socket paths in preference order.
+fn gather_gpg_ssh_info(
+    gnupg_home: Option<&std::path::Path>,
+    home: Option<&std::path::Path>,
+    gpgconf_sock: impl FnOnce(Option<&std::path::Path>) -> Option<std::path::PathBuf>,
+) -> (bool, Vec<std::path::PathBuf>) {
+    let conf_dir = gnupg_home.map(std::path::Path::to_path_buf).or_else(|| home.map(|h| h.join(".gnupg")));
+    let enabled = conf_dir
+        .as_deref()
+        .and_then(|d| std::fs::read_to_string(d.join("gpg-agent.conf")).ok())
+        .is_some_and(|text| gpg_agent_ssh_enabled(&text));
+    if !enabled {
+        return (false, Vec::new());
+    }
+    let mut socks = Vec::new();
+    let mut push_unique = |p: std::path::PathBuf| {
+        if !p.as_os_str().is_empty() && !socks.contains(&p) {
+            socks.push(p);
+        }
+    };
+    if let Some(g) = gnupg_home {
+        push_unique(g.join("S.gpg-agent.ssh"));
+    }
+    if let Some(s) = gpgconf_sock(gnupg_home) {
+        push_unique(s);
+    }
+    if let Some(h) = home {
+        push_unique(h.join(".gnupg/S.gpg-agent.ssh"));
+    }
+    (true, socks)
+}
+
+/// Inputs to [`resolve_ssh_auth_sock_candidates`], factored out so the macOS
+/// resolution order can be unit-tested without touching process environment or
+/// spawning `launchctl`/`gpgconf`.
+#[derive(Default)]
+struct SshAuthInputs {
+    preferred: Option<std::path::PathBuf>,
+    env_sock: Option<std::path::PathBuf>,
+    launchctl_sock: Option<std::path::PathBuf>,
+    gpg_ssh_enabled: bool,
+    gpg_sockets: Vec<std::path::PathBuf>,
+}
+
+/// Orders live host SSH agent socket candidates on macOS:
+/// 1. Explicit host SSH agent socket recorded from a Mac bind mount.
+/// 2. Explicit non-launchd `$SSH_AUTH_SOCK` in this process's environment.
+/// 3. Explicit non-launchd `launchctl getenv SSH_AUTH_SOCK`.
+/// 4. GnuPG's `S.gpg-agent.ssh` when `gpg-agent.conf` has `enable-ssh-support`.
+/// 5. Fallback to launchd's default `com.apple.launchd.*/Listeners` socket.
+fn resolve_ssh_auth_sock_candidates(
+    inputs: &SshAuthInputs,
+    is_live: impl Fn(&std::path::Path) -> bool,
+) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let mut push_unique = |p: &std::path::Path| {
+        if !p.as_os_str().is_empty() && !out.iter().any(|existing: &std::path::PathBuf| existing == p) {
+            out.push(p.to_path_buf());
+        }
+    };
+    // 1) Explicit host SSH agent socket recorded from a Mac bind mount.
+    if let Some(p) = inputs.preferred.as_deref()
+        && is_live(p)
+    {
+        push_unique(p);
+    }
+    // 2) Explicit non-launchd $SSH_AUTH_SOCK from daemon environment.
+    if let Some(p) = inputs.env_sock.as_deref()
+        && !is_launchd_ssh_sock(p)
+        && is_live(p)
+    {
+        push_unique(p);
+    }
+    // 3) Explicit non-launchd `launchctl getenv SSH_AUTH_SOCK`.
+    if let Some(p) = inputs.launchctl_sock.as_deref()
+        && !is_launchd_ssh_sock(p)
+        && is_live(p)
+    {
+        push_unique(p);
+    }
+    // 4) GPG SSH agent socket when `enable-ssh-support` is configured.
+    if inputs.gpg_ssh_enabled {
+        for p in &inputs.gpg_sockets {
+            if is_live(p) {
+                push_unique(p);
+            }
+        }
+    }
+    // 5) Fallback to launchd's Listeners socket from env or launchctl.
+    for p in [inputs.env_sock.as_deref(), inputs.launchctl_sock.as_deref()].into_iter().flatten() {
+        if is_live(p) {
+            push_unique(p);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+fn resolve_ssh_auth_sock(
+    inputs: &SshAuthInputs,
+    is_live: impl Fn(&std::path::Path) -> bool,
+) -> Option<std::path::PathBuf> {
+    resolve_ssh_auth_sock_candidates(inputs, is_live).into_iter().next()
+}
+
+fn gather_ssh_auth_inputs(include_preferred: bool) -> SshAuthInputs {
+    let preferred = if include_preferred {
+        PREFERRED_SSH_AUTH_SOCK.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    } else {
+        None
+    };
+    let env_sock = std::env::var_os("SSH_AUTH_SOCK")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from);
+    if !cfg!(target_os = "macos") {
+        return SshAuthInputs {
+            preferred: None,
+            env_sock,
+            launchctl_sock: None,
+            gpg_ssh_enabled: false,
+            gpg_sockets: Vec::new(),
+        };
+    }
+    let launchctl_sock = launchctl_getenv("SSH_AUTH_SOCK");
+    let home = std::env::var_os("HOME")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from);
+    let gnupg_home = std::env::var_os("GNUPGHOME")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| launchctl_getenv("GNUPGHOME"));
+    let (gpg_ssh_enabled, gpg_sockets) = gather_gpg_ssh_info(
+        gnupg_home.as_deref(),
+        home.as_deref(),
+        gpgconf_agent_ssh_socket,
+    );
+    SshAuthInputs {
+        preferred,
+        env_sock,
+        launchctl_sock,
+        gpg_ssh_enabled,
+        gpg_sockets,
+    }
+}
+
+fn ssh_auth_sock_candidates_for(include_preferred: bool) -> Vec<std::path::PathBuf> {
+    let inputs = gather_ssh_auth_inputs(include_preferred);
+    if cfg!(target_os = "macos") {
+        resolve_ssh_auth_sock_candidates(&inputs, is_owned_unix_socket)
+    } else {
+        // On Linux the daemon may run as root while $SSH_AUTH_SOCK belongs
+        // to a non-root user, so keep the existing env behavior.
+        inputs.env_sock.into_iter().collect()
+    }
+}
+
+/// The host's discovered SSH agent socket, ignoring any previously recorded
+/// bind-mount preference (so bind-mount validation cannot bootstrap itself).
+pub(crate) fn default_ssh_auth_sock() -> Option<std::path::PathBuf> {
+    ssh_auth_sock_candidates_for(false).into_iter().next()
+}
+
+/// Whether `canon` (already canonicalized) matches the daemon's discovered
+/// host SSH agent socket (`default_ssh_auth_sock()`).
+pub(crate) fn matches_default_ssh_auth_sock(canon: &std::path::Path) -> bool {
+    let Some(default) = default_ssh_auth_sock() else { return false };
+    let default_canon = std::fs::canonicalize(&default).unwrap_or(default);
+    canon == default_canon
+}
+
+fn set_preferred_ssh_auth_sock_inner(path: &std::path::Path, strict: bool) -> bool {
+    let Ok(canon) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    if !is_owned_unix_socket(&canon) || is_kiri_socket_path(&canon) {
+        return false;
+    }
+    let allowed = if strict {
+        let home = std::env::var_os("HOME")
+            .filter(|v| !v.is_empty())
+            .map(std::path::PathBuf::from);
+        let gnupg_home = std::env::var_os("GNUPGHOME")
+            .filter(|v| !v.is_empty())
+            .map(std::path::PathBuf::from)
+            .or_else(|| launchctl_getenv("GNUPGHOME"));
+        let gpgconf_sock = canon
+            .file_name()
+            .is_some_and(|n| n == "S.gpg-agent.ssh")
+            .then(|| gpgconf_agent_ssh_socket(gnupg_home.as_deref()))
+            .flatten();
+        is_strict_mac_ssh_agent_sock_path_for(&canon, home.as_deref(), gnupg_home.as_deref(), gpgconf_sock.as_deref())
+            || matches_default_ssh_auth_sock(&canon)
+    } else {
+        is_known_mac_ssh_agent_sock_path(&canon) || matches_default_ssh_auth_sock(&canon)
+    };
+    if !allowed {
+        return false;
+    }
+    *PREFERRED_SSH_AUTH_SOCK.lock().unwrap_or_else(|e| e.into_inner()) = Some(canon);
+    true
+}
+
+/// Records an explicitly bind-mounted Mac SSH agent socket (from a host
+/// caller) as the preferred upstream for `serve_ssh_agent`, after verifying
+/// canonical path, Unix socket type, current-UID ownership, allowlist, and
+/// that it is never Kiri's own daemon socket.
+pub(crate) fn set_preferred_ssh_auth_sock(path: &std::path::Path) -> bool {
+    set_preferred_ssh_auth_sock_inner(path, false)
+}
+
+/// Strict variant used on container start (when caller identity is no longer
+/// present): only records sockets under the user's own GPG/1Password/launchd
+/// locations or matching `default_ssh_auth_sock()`.
+pub(crate) fn set_preferred_ssh_auth_sock_strict(path: &std::path::Path) -> bool {
+    set_preferred_ssh_auth_sock_inner(path, true)
+}
+
+#[cfg(test)]
+pub(crate) static PREFERRED_SSH_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn current_preferred_ssh_auth_sock() -> Option<std::path::PathBuf> {
+    PREFERRED_SSH_AUTH_SOCK.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+#[cfg(test)]
+pub(crate) fn clear_preferred_ssh_auth_sock() {
+    *PREFERRED_SSH_AUTH_SOCK.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 /// One container connection to the SSH agent, relayed to the Mac's agent.
 pub fn serve_ssh_agent(stream: kiri_vmm::VsockStream) {
     let _ = std::thread::Builder::new().name("kiri-ssh-agent".into()).spawn(move || {
-        let Some(path) = ssh_auth_sock() else { return };
-        let Ok(agent) = std::os::unix::net::UnixStream::connect(path) else {
+        let Some(agent) = ssh_auth_sock_candidates_for(true)
+            .into_iter()
+            .find_map(|path| std::os::unix::net::UnixStream::connect(path).ok())
+        else {
             return;
         };
         let (Ok(mut agent_read), Ok(from_guest), Ok(to_guest)) = (agent.try_clone(), stream.fd.try_clone(), stream.fd.try_clone()) else {
@@ -2885,5 +3396,238 @@ Wireless LAN adapter Wi-Fi:\r\n\
             assert!(text.starts_with("HTTP/1.1 200 OK\r\n") && text.ends_with("\r\n\r\nOK"), "{text}");
             assert_eq!(cap.open(), 0);
         }
+    }
+
+    #[test]
+    fn ssh_auth_sock_resolution_prefers_gpg_over_launchd_and_honors_explicit_overrides() {
+        use std::path::{Path, PathBuf};
+        let p = PathBuf::from;
+        let launchd_tmp = p("/private/tmp/com.apple.launchd.abc123/Listeners");
+        let launchd_var = p("/var/run/com.apple.launchd.xyz789/Listeners");
+        let gpg = p("/Users/alice/.gnupg/S.gpg-agent.ssh");
+        let onepass = p("/Users/alice/.1password/agent.sock");
+        let custom = p("/Users/alice/.ssh/custom-agent.sock");
+        let all_live = |_: &Path| true;
+
+        // 1) GPG with enable-ssh-support wins over launchd Listeners (both /private/tmp and /var/run forms).
+        for launchd in [&launchd_tmp, &launchd_var] {
+            let inputs = super::SshAuthInputs {
+                preferred: None,
+                env_sock: Some(launchd.clone()),
+                launchctl_sock: Some(launchd.clone()),
+                gpg_ssh_enabled: true,
+                gpg_sockets: vec![gpg.clone()],
+            };
+            assert_eq!(super::resolve_ssh_auth_sock(&inputs, all_live), Some(gpg.clone()), "{launchd:?}");
+            // Launchd remains as fallback candidate behind GPG if GPG's socket is stale.
+            assert_eq!(super::resolve_ssh_auth_sock_candidates(&inputs, all_live), vec![gpg.clone(), launchd.clone()]);
+        }
+
+        // 2) Without enable-ssh-support, launchd stays selected even if S.gpg-agent.ssh exists.
+        let disabled_gpg = super::SshAuthInputs {
+            preferred: None,
+            env_sock: Some(launchd_tmp.clone()),
+            launchctl_sock: Some(launchd_tmp.clone()),
+            gpg_ssh_enabled: false,
+            gpg_sockets: vec![gpg.clone()],
+        };
+        assert_eq!(super::resolve_ssh_auth_sock(&disabled_gpg, all_live), Some(launchd_tmp.clone()));
+
+        // 3) Explicit non-launchd `launchctl getenv SSH_AUTH_SOCK` wins over launchd env and GPG.
+        let launchctl_override = super::SshAuthInputs {
+            preferred: None,
+            env_sock: Some(launchd_var.clone()),
+            launchctl_sock: Some(onepass.clone()),
+            gpg_ssh_enabled: true,
+            gpg_sockets: vec![gpg.clone()],
+        };
+        assert_eq!(super::resolve_ssh_auth_sock(&launchctl_override, all_live), Some(onepass.clone()));
+
+        // 4) Explicit non-launchd process env `$SSH_AUTH_SOCK` wins over launchctl and GPG.
+        let env_override = super::SshAuthInputs {
+            preferred: None,
+            env_sock: Some(custom.clone()),
+            launchctl_sock: Some(onepass.clone()),
+            gpg_ssh_enabled: true,
+            gpg_sockets: vec![gpg.clone()],
+        };
+        assert_eq!(super::resolve_ssh_auth_sock(&env_override, all_live), Some(custom.clone()));
+
+        // 5) Recorded bind-mount `preferred` wins over everything when live,
+        //    and falls through cleanly when missing/dead.
+        let with_preferred = super::SshAuthInputs {
+            preferred: Some(gpg.clone()),
+            env_sock: Some(custom.clone()),
+            launchctl_sock: Some(onepass.clone()),
+            gpg_ssh_enabled: true,
+            gpg_sockets: vec![gpg.clone()],
+        };
+        assert_eq!(super::resolve_ssh_auth_sock(&with_preferred, all_live), Some(gpg.clone()));
+        assert_eq!(
+            super::resolve_ssh_auth_sock(&with_preferred, |cand| cand != gpg.as_path()),
+            Some(custom.clone())
+        );
+
+        // 6) Dead explicit env_sock falls through to live GPG socket.
+        let dead_env = super::SshAuthInputs {
+            preferred: None,
+            env_sock: Some(custom.clone()),
+            launchctl_sock: Some(launchd_tmp.clone()),
+            gpg_ssh_enabled: true,
+            gpg_sockets: vec![gpg.clone()],
+        };
+        assert_eq!(
+            super::resolve_ssh_auth_sock(&dead_env, |cand| cand != custom.as_path()),
+            Some(gpg)
+        );
+    }
+
+    #[test]
+    fn gpg_agent_conf_parsing_and_socket_discovery() {
+        use std::path::PathBuf;
+        assert!(super::gpg_agent_ssh_enabled("enable-ssh-support\n"));
+        assert!(super::gpg_agent_ssh_enabled("  enable-ssh-support  # for git\n"));
+        assert!(super::gpg_agent_ssh_enabled("default-cache-ttl 600\nenable-ssh-support\n"));
+        assert!(!super::gpg_agent_ssh_enabled("# enable-ssh-support\n"));
+        assert!(!super::gpg_agent_ssh_enabled("#enable-ssh-support\n"));
+        assert!(!super::gpg_agent_ssh_enabled("   # enable-ssh-support\n"));
+        assert!(!super::gpg_agent_ssh_enabled("enable-ssh-support-extra\n"));
+        assert!(!super::gpg_agent_ssh_enabled("enable-ssh-support\nno-enable-ssh-support\n"));
+        assert!(!super::gpg_agent_ssh_enabled(""));
+
+        let root = std::env::temp_dir().join(format!("kiri-gpg-conf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = root.join("home");
+        let custom_gnupg = root.join("custom-gnupg");
+        std::fs::create_dir_all(home.join(".gnupg")).unwrap();
+        std::fs::create_dir_all(&custom_gnupg).unwrap();
+
+        // Commented-out enable-ssh-support does NOT enable GPG discovery or run gpgconf.
+        std::fs::write(home.join(".gnupg/gpg-agent.conf"), "# enable-ssh-support\n").unwrap();
+        let (enabled, socks) = super::gather_gpg_ssh_info(None, Some(&home), |_| panic!("gpgconf must not be called when disabled"));
+        assert!(!enabled);
+        assert!(socks.is_empty());
+
+        // Uncommented enable-ssh-support under ~/.gnupg discovers gpgconf socket then ~/.gnupg/S.gpg-agent.ssh.
+        std::fs::write(home.join(".gnupg/gpg-agent.conf"), "default-cache-ttl 300\nenable-ssh-support # on\n").unwrap();
+        let gpgconf_path = PathBuf::from("/private/var/folders/aa/bb/T/gnupg/S.gpg-agent.ssh");
+        let (enabled, socks) = super::gather_gpg_ssh_info(None, Some(&home), |_| Some(gpgconf_path.clone()));
+        assert!(enabled);
+        assert_eq!(socks, vec![gpgconf_path.clone(), home.join(".gnupg/S.gpg-agent.ssh")]);
+
+        // Custom GNUPGHOME takes precedence over ~/.gnupg and orders $GNUPGHOME -> gpgconf -> ~/.gnupg.
+        std::fs::write(custom_gnupg.join("gpg-agent.conf"), "enable-ssh-support\n").unwrap();
+        let (enabled, socks) = super::gather_gpg_ssh_info(Some(&custom_gnupg), Some(&home), |dir| {
+            assert_eq!(dir, Some(custom_gnupg.as_path()));
+            Some(gpgconf_path.clone())
+        });
+        assert!(enabled);
+        assert_eq!(socks, vec![custom_gnupg.join("S.gpg-agent.ssh"), gpgconf_path, home.join(".gnupg/S.gpg-agent.ssh")]);
+
+        // Custom GNUPGHOME without enable-ssh-support does NOT silently inherit ~/.gnupg/gpg-agent.conf.
+        std::fs::write(custom_gnupg.join("gpg-agent.conf"), "# enable-ssh-support\n").unwrap();
+        let (enabled, socks) = super::gather_gpg_ssh_info(Some(&custom_gnupg), Some(&home), |_| panic!("should not run gpgconf"));
+        assert!(!enabled);
+        assert!(socks.is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mac_ssh_agent_socket_allowlist_and_preferred_security() {
+        use std::os::unix::net::UnixListener;
+        use std::path::Path;
+
+        // Launchd detection covers both /tmp and /var/run (+ /private/*) layouts.
+        for ok in [
+            "/private/tmp/com.apple.launchd.abc123/Listeners",
+            "/tmp/com.apple.launchd.abc123/Listeners",
+            "/private/var/run/com.apple.launchd.oQTvCAtcQS/Listeners",
+            "/var/run/com.apple.launchd.oQTvCAtcQS/Listeners",
+            "/var/run//com.apple.launchd.abc/Listeners",
+        ] {
+            assert!(super::is_launchd_ssh_sock(Path::new(ok)), "{ok}");
+            assert!(super::is_known_mac_ssh_agent_sock_path(Path::new(ok)), "{ok}");
+        }
+        for bad in [
+            "/tmp/com.apple.launchd./Listeners",
+            "/tmp/com.apple.launchd.abc/sub/Listeners",
+            "/Users/alice/com.apple.launchd.abc/Listeners",
+            "/var/run/docker.sock",
+            "tmp/com.apple.launchd.abc/Listeners",
+        ] {
+            assert!(!super::is_launchd_ssh_sock(Path::new(bad)), "{bad}");
+        }
+
+        // Known Mac agent socket paths vs rejected non-SSH paths.
+        for ok in [
+            "/Users/alice/.gnupg/S.gpg-agent.ssh",
+            "/Users/alice/.config/gnupg/S.gpg-agent.ssh",
+            "/Users/alice/.1password/agent.sock",
+            "/Users/alice/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock",
+        ] {
+            assert!(super::is_known_mac_ssh_agent_sock_path(Path::new(ok)), "{ok}");
+        }
+        for bad in [
+            "/Users/alice/.kiri/run/docker.sock",
+            "/var/run/docker.sock",
+            "/tmp/postgres.sock",
+            "/etc/S.gpg-agent.ssh",
+            "/Users/alice/S.gpg-agent",
+        ] {
+            assert!(!super::is_known_mac_ssh_agent_sock_path(Path::new(bad)), "{bad}");
+        }
+
+        // Strict path allowlist only permits user's own GPG/1Password/launchd paths.
+        let fake_home = Path::new("/Users/alice");
+        let fake_gnupg = Path::new("/Users/alice/.config/gnupg");
+        let fake_gpgconf = Path::new("/private/var/folders/aa/bb/T/d.1234/S.gpg-agent.ssh");
+        assert!(super::is_strict_mac_ssh_agent_sock_path_for(Path::new("/Users/alice/.gnupg/S.gpg-agent.ssh"), Some(fake_home), None, None));
+        assert!(super::is_strict_mac_ssh_agent_sock_path_for(Path::new("/Users/alice/.config/gnupg/S.gpg-agent.ssh"), Some(fake_home), Some(fake_gnupg), None));
+        assert!(super::is_strict_mac_ssh_agent_sock_path_for(fake_gpgconf, Some(fake_home), None, Some(fake_gpgconf)));
+        assert!(super::is_strict_mac_ssh_agent_sock_path_for(Path::new("/Users/alice/.1password/agent.sock"), Some(fake_home), None, None));
+        assert!(!super::is_strict_mac_ssh_agent_sock_path_for(Path::new("/tmp/untrusted/S.gpg-agent.ssh"), Some(fake_home), None, None));
+        assert!(!super::is_strict_mac_ssh_agent_sock_path_for(Path::new("/Users/alice/.kiri/run/docker.sock"), Some(fake_home), None, None));
+
+        // Live Unix socket security checks for set_preferred_ssh_auth_sock.
+        let _guard = super::PREFERRED_SSH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        super::clear_preferred_ssh_auth_sock();
+
+        let dir = std::env::temp_dir().join(format!("kiri-ssh-pref-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Regular file named S.gpg-agent.ssh is rejected (not a socket).
+        let reg = dir.join("reg");
+        std::fs::create_dir_all(&reg).unwrap();
+        let reg_file = reg.join("S.gpg-agent.ssh");
+        std::fs::write(&reg_file, b"not a socket").unwrap();
+        assert!(!super::set_preferred_ssh_auth_sock(&reg_file));
+        assert!(super::current_preferred_ssh_auth_sock().is_none());
+
+        // Arbitrary socket named docker.sock is rejected, AND a symlink named
+        // S.gpg-agent.ssh pointing to docker.sock is ALSO rejected after canonicalize.
+        let docker_sock = dir.join("docker.sock");
+        let _docker_listener = UnixListener::bind(&docker_sock).unwrap();
+        assert!(!super::set_preferred_ssh_auth_sock(&docker_sock));
+        let evil_link_dir = dir.join("evil");
+        std::fs::create_dir_all(&evil_link_dir).unwrap();
+        let evil_link = evil_link_dir.join("S.gpg-agent.ssh");
+        std::os::unix::fs::symlink(&docker_sock, &evil_link).unwrap();
+        assert!(!super::set_preferred_ssh_auth_sock(&evil_link), "symlink to docker.sock must be rejected");
+        assert!(super::current_preferred_ssh_auth_sock().is_none());
+
+        // A real owned S.gpg-agent.ssh Unix socket is accepted by set_preferred_ssh_auth_sock
+        // (for host callers), while set_preferred_ssh_auth_sock_strict rejects temp paths
+        // outside ~/.gnupg / $GNUPGHOME / gpgconf.
+        let gpg_sock = dir.join("S.gpg-agent.ssh");
+        let _gpg_listener = UnixListener::bind(&gpg_sock).unwrap();
+        assert!(!super::set_preferred_ssh_auth_sock_strict(&gpg_sock));
+        assert!(super::current_preferred_ssh_auth_sock().is_none());
+        assert!(super::set_preferred_ssh_auth_sock(&gpg_sock));
+        assert_eq!(super::current_preferred_ssh_auth_sock(), Some(std::fs::canonicalize(&gpg_sock).unwrap()));
+
+        super::clear_preferred_ssh_auth_sock();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

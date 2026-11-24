@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #763 macOS: discover GPG `S.gpg-agent.ssh` and translate host SSH agent socket bind mounts (unreleased)
+- Fixes: #763 support mac GPG `SSH_AUTH_SOCK`
+- Caused: none known
+- Caused by: -
+- Check: `mac-gpg-ssh-agent-mount`, `crates/kiri/src/daemon/ports.rs`, `crates/kiri/src/daemon/api.rs`
+
 ### #816 Kubernetes: support custom k3s version, extra `k3s server` arguments, and `~/.kiri/k8s-manifests` auto-deploy manifests in `kiri k8s` (unreleased)
 - Fixes: #816 Kiri Kubernetes - support more k3s arguments
 - Caused: none known

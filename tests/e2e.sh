@@ -1087,6 +1087,27 @@ only mac t bind-nonroot-ro "ro-ok userns-ok" bash -c "mkdir -p $BIND/ro && print
 # through -v and --mount for non-root container users too, while inspect shows
 # the path asked for (#420).
 t host-services-ssh-agent-mount "sock1=ok sock2=ok src=/run/host-services/ssh-auth.sock" bash -c "id=\$($D create -u 1000:1000 -v /run/host-services/ssh-auth.sock:/run/host-services/ssh-auth.sock --mount type=bind,source=/run/host-services/ssh-auth.sock,target=/ssh2.sock alpine sh -c 'test -S /run/host-services/ssh-auth.sock && test -w /run/host-services/ssh-auth.sock && s1=ok || s1=no; test -S /ssh2.sock && test -w /ssh2.sock && s2=ok || s2=no; printf \"sock1=%s sock2=%s \" \"\$s1\" \"\$s2\"'); src=\$($D inspect -f '{{(index .Mounts 0).Source}}' \$id); $D start -a \$id; $D rm -f \$id >/dev/null; echo \"src=\$src\""
+# On macOS, mounting a host GPG SSH agent socket (S.gpg-agent.ssh) translates
+# to the VM's SSH agent relay socket while inspect keeps the Mac path, survives
+# restart, and forwards real SSH agent identities (#763).
+only mac t mac-gpg-ssh-agent-mount "run1=ok run2=ok src=ok" env D="$D" bash -c '
+  d=$(mktemp -d /tmp/kiri-gpg-ssh.XXXXXX); pid=""
+  cleanup() { [ -n "$pid" ] && kill "$pid" 2>/dev/null || true; rm -rf "$d"; }
+  trap cleanup EXIT
+  sock="$d/S.gpg-agent.ssh"
+  eval "$(ssh-agent -s -a "$sock")" >/dev/null
+  pid=$SSH_AGENT_PID
+  ssh-keygen -q -t ed25519 -N "" -C "kiri-gpg-test" -f "$d/id"
+  SSH_AUTH_SOCK="$sock" ssh-add "$d/id" >/dev/null 2>&1
+  py="import socket; s=socket.socket(socket.AF_UNIX); s.connect(\"/ssh-agent\"); s.sendall(bytes([0,0,0,1,11])); r=s.recv(4096); print(\"ok\" if b\"kiri-gpg-test\" in r else repr(r))"
+  id=$($D create -v "$sock:/ssh-agent" python:3.13-alpine python3 -c "$py")
+  r1=$($D start -a "$id")
+  r2=$($D start -a "$id")
+  src=$($D inspect -f "{{(index .Mounts 0).Source}}" "$id")
+  $D rm -f "$id" >/dev/null
+  [ "$src" = "$sock" ] && s=ok || s="bad:$src"
+  echo "run1=$r1 run2=$r2 src=$s"
+'
 # A file made, changed and deleted on the Mac raises inotify events in the
 # container, as one made there does: file watchers (Vite, webpack, nodemon)
 # pick up saves made in an editor on the Mac. inotifyd prints n (created),

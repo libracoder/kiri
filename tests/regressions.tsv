@@ -345,3 +345,4 @@ crates/kiri/src/daemon/hostroots.rs	#303	Windows host roots persistence in WSL m
 crates/kiri/src/setup.rs	#556	opening Kiri.app re-appended the ~/.kiri/bin PATH block to shell profiles on every launch even when removed or when a profile already put ~/.kiri/bin on PATH, with no kiri setup --no-profiles opt-out
 crates/kiri/src/k8s.rs	#816	kiri k8s set had no --version or --k3s-arg/--clear-k3s-args options to pin a k3s image tag or pass custom k3s server flags, and kiri k8s start did not sync ~/.kiri/k8s-manifests into k3s
 crates/kiri-win/src/k8s.rs	#816	Windows k8s.json config and container creation did not preserve or apply custom k3s version tags and extra k3s server arguments
+mac-gpg-ssh-agent-mount	#763	macOS launchd-started daemons used Apple's empty default Listeners SSH socket instead of GnuPG's S.gpg-agent.ssh when enable-ssh-support was set, and direct host SSH agent socket bind mounts failed across virtiofs

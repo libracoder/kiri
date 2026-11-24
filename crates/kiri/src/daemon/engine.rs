@@ -3577,6 +3577,7 @@ impl Engine {
         // Docker does: re-pointing it between runs (a `current` release
         // link) mounts the new target.
         spec.mounts = super::api::fresh_bind_sources(&spec.mounts, &spec.mount_info);
+        super::api::refresh_ssh_agent_mounts(&spec.mount_info);
         let mut hostname = if spec.hostname.is_empty() { id[..12].to_owned() } else { spec.hostname.clone() };
         let mut domainname = spec.domainname.clone();
         // `--network container:<id>`: that container's namespace, hostname
