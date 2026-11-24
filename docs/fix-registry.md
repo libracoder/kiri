@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #783 Engine: serialize `containers.json` by reference without cloning container specs (unreleased)
+- Fixes: no issue
+- Caused: none known
+- Caused by: -
+- Check: `crates/kiri/src/daemon/engine.rs`
+
 ### #839, #784 API: support `limit` on `GET /containers/json` (`docker ps -l` / `-n`) across all states and borrow networks without cloning (unreleased)
 - Fixes: no issue
 - Caused: none known

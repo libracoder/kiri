@@ -349,7 +349,7 @@ pub struct RestartPolicy {
     pub max_retries: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Spec {
     pub image: String,
     pub image_id: String,
@@ -979,7 +979,7 @@ fn lock_log(l: &Mutex<super::logfile::Log>) -> MutexGuard<'_, super::logfile::Lo
 }
 
 /// What `containers.json` holds for one container.
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct Saved {
     id: String,
     name: String,
@@ -998,6 +998,84 @@ struct Saved {
     restart_count: u32,
     #[serde(default)]
     health: Option<super::health::Health>,
+}
+
+#[cfg(test)]
+impl Saved {
+    fn from_container(c: &Container, health: Option<&super::health::Health>) -> Self {
+        Saved {
+            id: c.id.clone(),
+            name: c.name.clone(),
+            spec: c.spec.clone(),
+            layers: c.layers.clone(),
+            created_ns: ns(c.created),
+            status: c.status,
+            started_ns: c.started.map(ns),
+            finished_ns: c.finished.map(ns),
+            exit_code: c.exit_code,
+            oom_killed: c.oom_killed,
+            vm_stopped: c.vm_stopped,
+            stopped_by_user: c.stopped_by_user,
+            restart_count: c.restart_count,
+            health: health.cloned(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl From<&Container> for Saved {
+    fn from(c: &Container) -> Self {
+        Self::from_container(c, None)
+    }
+}
+
+/// Borrowed view of [`Saved`] for zero-clone serialization in [`Engine::save`].
+#[derive(Serialize)]
+struct SavedRef<'a> {
+    id: &'a str,
+    name: &'a str,
+    spec: &'a Spec,
+    layers: &'a [String],
+    created_ns: u64,
+    status: Status,
+    started_ns: Option<u64>,
+    finished_ns: Option<u64>,
+    exit_code: i32,
+    #[serde(default)]
+    oom_killed: bool,
+    #[serde(default)]
+    vm_stopped: bool,
+    stopped_by_user: bool,
+    restart_count: u32,
+    #[serde(default)]
+    health: Option<&'a super::health::Health>,
+}
+
+impl<'a> SavedRef<'a> {
+    fn from_container(c: &'a Container, health: Option<&'a super::health::Health>) -> Self {
+        SavedRef {
+            id: &c.id,
+            name: &c.name,
+            spec: &c.spec,
+            layers: &c.layers,
+            created_ns: ns(c.created),
+            status: c.status,
+            started_ns: c.started.map(ns),
+            finished_ns: c.finished.map(ns),
+            exit_code: c.exit_code,
+            oom_killed: c.oom_killed,
+            vm_stopped: c.vm_stopped,
+            stopped_by_user: c.stopped_by_user,
+            restart_count: c.restart_count,
+            health,
+        }
+    }
+}
+
+impl<'a> From<&'a Container> for SavedRef<'a> {
+    fn from(c: &'a Container) -> Self {
+        Self::from_container(c, None)
+    }
 }
 
 /// What `load` reads of `containers.json`.
@@ -2508,26 +2586,11 @@ impl Engine {
         }
         let json = {
             let st = self.lock();
-            let saved: Vec<Saved> = st
+            let saved: Vec<SavedRef<'_>> = st
                 .containers
                 .values()
                 .filter(|c| !c.spec.auto_remove)
-                .map(|c| Saved {
-                    id: c.id.clone(),
-                    name: c.name.clone(),
-                    spec: c.spec.clone(),
-                    layers: c.layers.clone(),
-                    created_ns: ns(c.created),
-                    status: c.status,
-                    started_ns: c.started.map(ns),
-                    finished_ns: c.finished.map(ns),
-                    exit_code: c.exit_code,
-                    oom_killed: c.oom_killed,
-                    vm_stopped: c.vm_stopped,
-                    stopped_by_user: c.stopped_by_user,
-                    restart_count: c.restart_count,
-                    health: st.health.get(&c.id).map(|h| h.health.clone()),
-                })
+                .map(|c| SavedRef::from_container(c, st.health.get(&c.id).map(|h| &h.health)))
                 .collect();
             serde_json::to_vec(&saved)
         };
@@ -9209,6 +9272,198 @@ mod volume_remove_tests {
         assert!(engine.volume_get("anon-used").is_none());
 
         drop(engine);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn saved_ref_matches_saved_byte_for_byte_and_roundtrips() {
+        use crate::daemon::{health, logfile, ports};
+        let dir = std::env::temp_dir().join(format!("kiri-saved-ref-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let spec = Spec {
+            image: "registry.example.com/team/service:1.2.3".into(),
+            image_id: "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            entrypoint: vec!["/usr/local/bin/entrypoint".into(), "--strict".into()],
+            cmd: vec!["serve".into(), "--port=8080".into()],
+            env: vec!["RUST_LOG=info".into(), "APP_ENV=production".into()],
+            cwd: "/srv/service".into(),
+            user: "1000:1000".into(),
+            auto_remove: false,
+            network_mode: "frontend".into(),
+            labels: serde_json::json!({
+                "com.docker.compose.project": "kiri",
+                "com.docker.compose.service": "api",
+            }),
+            tty: true,
+            open_stdin: true,
+            restart: RestartPolicy { name: "on-failure".into(), max_retries: 5 },
+            console_size: Some((42, 132)),
+            aliases: vec!["api".into(), "api.internal".into()],
+            extra_hosts: vec!["10.10.0.5 db.internal".into()],
+            ports: vec![
+                ports::Binding {
+                    container_port: 8080,
+                    proto: "tcp".into(),
+                    host_ip: "127.0.0.1".into(),
+                    host_port: 18080,
+                },
+                ports::Binding {
+                    container_port: 5353,
+                    proto: "udp".into(),
+                    host_ip: String::new(),
+                    host_port: 0,
+                },
+            ],
+            exposed: vec!["5353/udp".into(), "8080/tcp".into()],
+            mounts: vec!["/host/data\t/data\trw".into()],
+            mount_info: vec![serde_json::json!({
+                "Type": "bind",
+                "Source": "/host/data",
+                "Destination": "/data",
+                "RW": true,
+            })],
+            mount_request: serde_json::json!({
+                "Binds": ["/host/data:/data:rw"],
+                "Mounts": [],
+                "Tmpfs": {"/run": "rw,noexec,nosuid,size=65536k"},
+                "Volumes": {"/var/lib/data": {}},
+            }),
+            volumes: vec!["named-data".into(), "shared-cache".into()],
+            anon_volumes: vec!["anon-00112233".into()],
+            privileged: true,
+            limits: Limits {
+                memory_max: 512 << 20,
+                cpu_quota: 150_000,
+                cpu_period: 100_000,
+                cpu_weight: 200,
+                pids_max: 256,
+                shm_size: 128 << 20,
+                cpu_shares: 2048,
+                memory_swap: 1024 << 20,
+            },
+            caps: 0x3fff,
+            cap_add: vec!["NET_ADMIN".into()],
+            cap_drop: vec!["MKNOD".into()],
+            security_opt: vec!["no-new-privileges:true".into()],
+            readonly_rootfs: true,
+            hostname: "api-node-1".into(),
+            stop_signal: Some(15),
+            stop_timeout: Some(25),
+            healthcheck: Some(health::Healthcheck {
+                test: vec!["CMD-SHELL".into(), "curl -fsS http://127.0.0.1:8080/healthz || exit 1".into()],
+                interval: 10_000_000_000,
+                timeout: 5_000_000_000,
+                start_period: 15_000_000_000,
+                start_interval: 2_000_000_000,
+                retries: 3,
+            }),
+            shell: vec!["/bin/bash".into(), "-o".into(), "pipefail".into(), "-c".into()],
+            init: Some(true),
+            extra_networks: vec![ExtraNetwork {
+                name: "backplane".into(),
+                aliases: vec!["api-bp".into()],
+                ipv4_address: "172.28.0.10".into(),
+                ipv6_address: "fd00:28::10".into(),
+                mac_address: "02:42:ac:1c:00:0a".into(),
+            }],
+            log_config: logfile::LogConfig {
+                kind: "json-file".into(),
+                config: std::collections::BTreeMap::from([
+                    ("max-file".into(), "4".into()),
+                    ("max-size".into(), "20m".into()),
+                ]),
+            },
+            ipv4_address: "172.20.0.9".into(),
+            ipv6_address: "fd00:20::9".into(),
+            mac_address: "02:42:ac:14:00:09".into(),
+            left_all_networks: true,
+            dns: vec!["1.1.1.1".into(), "8.8.8.8".into()],
+            dns_search: vec!["svc.cluster.local".into()],
+            dns_options: vec!["ndots:2".into(), "timeout:1".into()],
+            domainname: "example.internal".into(),
+            links: vec![Link {
+                id: "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210".into(),
+                name: "redis".into(),
+                alias: "cache".into(),
+            }],
+            host_opts: serde_json::json!({
+                "Sysctls": {"net.core.somaxconn": "1024"},
+                "Ulimits": [{"Name": "nofile", "Soft": 4096, "Hard": 8192}],
+                "GroupAdd": ["wheel"],
+            }),
+            volumes_from: vec!["seed-data:ro".into()],
+            pid_mode: "host".into(),
+            wsl_distro: Some("Ubuntu".into()),
+        };
+
+        let log_dir = dir.join("containers").join("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+        let c = Container {
+            lifecycle: Arc::new(Mutex::new(0)),
+            names_sync: Arc::default(),
+            start_gate: Arc::default(),
+            id: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            name: "full-container".into(),
+            log: Arc::new(Mutex::new(logfile::Log::new(log_dir, &spec.log_config))),
+            spec,
+            layers: vec![
+                "sha256:1111111111111111111111111111111111111111111111111111111111111111".into(),
+                "sha256:2222222222222222222222222222222222222222222222222222222222222222".into(),
+            ],
+            created: UNIX_EPOCH + Duration::from_nanos(1_700_000_000_123_456_789),
+            status: Status::Exited,
+            started: Some(UNIX_EPOCH + Duration::from_nanos(1_700_000_010_222_333_444)),
+            finished: Some(UNIX_EPOCH + Duration::from_nanos(1_700_000_050_555_666_777)),
+            exit_code: 137,
+            oom_killed: true,
+            vm_stopped: true,
+            stopped_by_user: true,
+            restart_count: 4,
+            restart_pending: true,
+            exits: 4,
+            size: Some((42, 132)),
+            ip: Some([172, 20, 0, 9]),
+            pid: 4321,
+            forwards: None,
+            paused: true,
+            extra_ips: vec![("backplane".into(), [172, 28, 0, 10])],
+            first_if: Some(0),
+            extra_ifs: vec![("backplane".into(), 1)],
+            ip6: Some([0xfd, 0, 0, 0x20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9]),
+            extra_ip6s: vec![("backplane".into(), [0xfd, 0, 0, 0x28, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10])],
+            live: false,
+            early_input: vec![1, 2, 3],
+            early_close: true,
+            start_owed: false,
+            attached: Vec::new(),
+        };
+
+        // 1. Direct From<&Container> (health = None).
+        assert_eq!(serde_json::to_value(SavedRef::from(&c)).unwrap(), serde_json::to_value(Saved::from(&c)).unwrap());
+        assert_eq!(serde_json::to_string(&SavedRef::from(&c)).unwrap(), serde_json::to_string(&Saved::from(&c)).unwrap());
+        assert_eq!(serde_json::to_vec(&SavedRef::from(&c)).unwrap(), serde_json::to_vec(&Saved::from(&c)).unwrap());
+
+        // 2. Populated health state + full round-trip deserialization back into Saved.
+        let health = health::Health {
+            status: health::UNHEALTHY.into(),
+            failing_streak: 3,
+            log: VecDeque::from([health::Probe {
+                start: "2026-11-24T10:00:00.000000000Z".into(),
+                end: "2026-11-24T10:00:01.250000000Z".into(),
+                exit_code: 1,
+                output: "probe failed: connection refused\n".into(),
+            }]),
+        };
+        let saved_ref = SavedRef::from_container(&c, Some(&health));
+        let saved_owned = Saved::from_container(&c, Some(&health));
+
+        assert_eq!(serde_json::to_value(&saved_ref).unwrap(), serde_json::to_value(&saved_owned).unwrap());
+        let ref_bytes = serde_json::to_vec(&saved_ref).unwrap();
+        let owned_bytes = serde_json::to_vec(&saved_owned).unwrap();
+        assert_eq!(ref_bytes, owned_bytes);
+
+        let decoded: Saved = serde_json::from_slice(&ref_bytes).unwrap();
+        assert_eq!(decoded, saved_owned);
+
         let _ = std::fs::remove_dir_all(dir);
     }
 }
