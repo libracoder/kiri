@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #493 Windows: open jsonfile for writing before sync so FlushFileBuffers succeeds (unreleased)
+- Fixes: no issue
+- Caused: none known
+- Caused by: #452
+- Check: none
+
 ### #411 Import: translate Docker Desktop `/host_mnt` and `/run/desktop/mnt/host` bind sources and report reasons for unimported containers (unreleased)
 - Fixes: #411 Docker Desktop import: containers with `/host_mnt` bind-mount sources are skipped silently
 - Caused: none known

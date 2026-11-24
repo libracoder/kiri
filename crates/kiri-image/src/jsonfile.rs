@@ -77,13 +77,27 @@ pub fn replace(path: &Path, bytes: &[u8], durable: Durable) -> io::Result<()> {
 /// folder, so the rename itself is on disk. Nothing to do if there is no
 /// file (yet).
 pub fn sync(path: &Path) -> io::Result<()> {
-    match File::open(path) {
+    match open_for_sync(path) {
         Ok(f) => synced(&f)?,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e),
     }
     sync_dir(parent(path));
     Ok(())
+}
+
+/// Opens `path` so [`File::sync_all`] can flush it. Windows'
+/// `FlushFileBuffers` rejects a read-only handle (`ERROR_ACCESS_DENIED`),
+/// so ask for write access (without creating, truncating or modifying
+/// anything) and fall back to read-only when the file cannot be opened for
+/// writing.
+fn open_for_sync(path: &Path) -> io::Result<File> {
+    fs::OpenOptions::new().read(true).write(true).open(path).or_else(|e| match e.kind() {
+        io::ErrorKind::PermissionDenied
+        | io::ErrorKind::ReadOnlyFilesystem
+        | io::ErrorKind::IsADirectory => File::open(path),
+        _ => Err(e),
+    })
 }
 
 fn parent(path: &Path) -> &Path {
@@ -228,6 +242,34 @@ mod tests {
         sync(&d.join("missing.json")).unwrap();
         let names: Vec<_> = fs::read_dir(&d).unwrap().flatten().map(|e| e.file_name()).collect();
         assert_eq!(names, ["list.json"], "no temporary file is left behind");
+        let _ = fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn sync_keeps_contents_and_falls_back_read_only() {
+        let d = dir("sync");
+        let p = d.join("list.json");
+        let missing = d.join("missing.json");
+        fs::write(&p, b"[1,2]").unwrap();
+
+        let before = syncs_here();
+        sync(&p).unwrap();
+        assert_eq!(syncs_here(), before + 1);
+        assert_eq!(fs::read(&p).unwrap(), b"[1,2]");
+
+        sync(&missing).unwrap();
+        assert!(!missing.exists(), "sync never creates a missing file");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&p, fs::Permissions::from_mode(0o444)).unwrap();
+            sync(&p).unwrap();
+            assert_eq!(fs::read(&p).unwrap(), b"[1,2]");
+            sync(&d).unwrap();
+            fs::set_permissions(&p, fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
         let _ = fs::remove_dir_all(d);
     }
 
