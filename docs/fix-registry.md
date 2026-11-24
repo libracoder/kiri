@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #382, #415 Guest kernel: persist explicit `chown` ownership on virtiofs inodes and enable close-to-open page/dir caching with 1 MiB read-ahead (unreleased)
+- Fixes: #382 `chown` on macOS bind mounts returns 0 without updating file owner, breaking subsequent `chmod` (`initdb`, PostgreSQL, npm) as that user; #415 Slow small-file read throughput on macOS virtiofs bind mounts
+- Caused: none known
+- Caused by: -
+- Check: `bind-chown-chmod`
+
 ### #864 Images: free unreferenced blobs on tag overwrite with race-free blob pinning (unreleased)
 - Fixes: #864 An image replaced under its name disappears, but its blobs stay on the Mac and nothing can remove them
 - Caused: none known
