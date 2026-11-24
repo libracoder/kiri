@@ -117,6 +117,10 @@ mod refuse;
 // path mapping, buffer decoding and coalescing tested on any host.
 #[cfg(any(windows, test))]
 mod watch;
+// Windows inbound published-port forwarder (UDP and non-loopback host-IP TCP
+// to WSL 2's eth0 IPv4 address): tested on any host.
+#[cfg(any(windows, test))]
+mod ports;
 // Settings → Storage: custom WSL distro location in %LOCALAPPDATA%\Kiri\storage.json.
 #[cfg(any(windows, test))]
 mod storage;
@@ -188,6 +192,7 @@ fn main() -> std::process::ExitCode {
         return std::process::ExitCode::FAILURE;
     }
     client::set_pipe(&cfg.pipe);
+    ports::start();
     if let Err(e) = dns::start() {
         serve::log(&format!("dns on 127.0.0.1:53: {e}"));
     }

@@ -488,12 +488,28 @@ fn default_out() -> io::Result<PathBuf> {
     Ok(if desktop.is_dir() { desktop } else { home }.join(format!("kiri-report-{stamp}.txt")))
 }
 
+/// Resolves an explicit `--out` path (translating a Windows drive path like
+/// `C:\Temp\report.txt` to `/mnt/c/Temp/report.txt` when running inside WSL 2)
+/// or falls back to `default_out()`.
+fn resolve_out_path(out: Option<PathBuf>, wsl: Option<&crate::daemon::binds::Wsl>) -> io::Result<PathBuf> {
+    let Some(p) = out else {
+        return default_out();
+    };
+    if let (Some(w), Some(s)) = (wsl, p.to_str())
+        && (s.contains('\\') || s.as_bytes().get(1) == Some(&b':'))
+        && let Ok(mapped) = crate::daemon::binds::source(s, w)
+    {
+        return Ok(PathBuf::from(mapped));
+    }
+    Ok(p)
+}
+
 /// Writes the report, readable only by this user. Returns where.
 pub fn save_report(text: &str, out: Option<PathBuf>) -> io::Result<PathBuf> {
-    let path = match out {
-        Some(p) => p,
-        None => default_out()?,
-    };
+    let path = resolve_out_path(out, crate::daemon::binds::wsl())?;
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        let _ = std::fs::create_dir_all(parent);
+    }
     let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&path)?;
     f.write_all(text.as_bytes())?;
     Ok(path)
@@ -1047,5 +1063,22 @@ mod tests {
         assert!(text.contains("VM uplink: static fallback on bridge100") && text.contains("Host UDP port 67: kavd (pid 412)"), "{text}");
         assert!(text.contains("==== Guest console (~/.kiri/logs/guest-console.log) ====") && text.contains("configured eth0 statically as 192.168.64.2/24"), "{text}");
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn resolves_windows_out_path_in_wsl() {
+        let wsl = crate::daemon::binds::Wsl { root: "/mnt/".into(), distro: Some("kiri".into()) };
+        assert_eq!(
+            resolve_out_path(Some(PathBuf::from(r"C:\Temp\kiri-test-report.txt")), Some(&wsl)).unwrap(),
+            PathBuf::from("/mnt/c/Temp/kiri-test-report.txt")
+        );
+        assert_eq!(
+            resolve_out_path(Some(PathBuf::from("D:/reports/out.txt")), Some(&wsl)).unwrap(),
+            PathBuf::from("/mnt/d/reports/out.txt")
+        );
+        assert_eq!(
+            resolve_out_path(Some(PathBuf::from("/tmp/kiri-report.txt")), Some(&wsl)).unwrap(),
+            PathBuf::from("/tmp/kiri-report.txt")
+        );
     }
 }

@@ -1865,13 +1865,22 @@ fn serve_shared(hub: &Hub, pipe: Arc<Pipe>) {
     // Whether the client's request has come, and is a HEAD: a refusal
     // waits for it (see `refuse_new`).
     let request = Arc::new(Arrival::default());
-    let (p, b, w, r) = (pipe.clone(), bridge.clone(), window.clone(), request.clone());
-    let writer = thread::spawn(move || to_client(&p, &rx, &queued, &b, w.as_deref().map(|w| (id, w)), &r));
+    let port_op = Arc::new(AtomicBool::new(false));
+    let (p, b, w, r, po) = (pipe.clone(), bridge.clone(), window.clone(), request.clone(), port_op.clone());
+    let writer = thread::spawn(move || to_client(&p, &rx, &queued, &b, w.as_deref().map(|w| (id, w)), &r, &po));
     let mut buf = vec![0u8; 64 * 1024];
+    let mut first_chunk = true;
     let end = loop {
         match pipe.read(&mut buf) {
             Ok(0) => break EOF,
             Ok(n) => {
+                if first_chunk {
+                    first_chunk = false;
+                    if crate::ports::is_port_affecting_request(&buf[..n]) {
+                        port_op.store(true, Ordering::SeqCst);
+                        crate::ports::before_container_op();
+                    }
+                }
                 request.set(is_head(&buf[..n]));
                 // Out of credit with the client gone (nothing to read its
                 // reply), or the connection closed: stop.
@@ -1906,6 +1915,9 @@ fn serve_shared(hub: &Hub, pipe: Arc<Pipe>) {
         });
     }
     let replies_ended = writer.join().unwrap_or(false);
+    if port_op.load(Ordering::Relaxed) {
+        crate::ports::notify();
+    }
     let aborted = pipe.is_aborted();
     if end == EOF && replies_ended && !aborted {
         linger(pipe);
@@ -1945,7 +1957,7 @@ fn gave_up(waited: Duration) -> bool {
 /// bridge (`credit`) as they go when it does flow control. True if they
 /// ended with EOF, or the client was told why the engine could not serve
 /// it (once its `request` had come).
-fn to_client(pipe: &Pipe, rx: &Receiver<Reply>, queued: &AtomicUsize, bridge: &Bridge, credit: Option<(u32, &Window)>, request: &Arrival) -> bool {
+fn to_client(pipe: &Pipe, rx: &Receiver<Reply>, queued: &AtomicUsize, bridge: &Bridge, credit: Option<(u32, &Window)>, request: &Arrival, port_op: &AtomicBool) -> bool {
     let mut done = 0usize;
     let mut answered = false;
     loop {
@@ -1982,6 +1994,9 @@ fn to_client(pipe: &Pipe, rx: &Receiver<Reply>, queued: &AtomicUsize, bridge: &B
             // that is EOF reads as one only with no data queued ahead of
             // it; behind data it is merged away and the client waits on.
             Reply::Eof => {
+                if port_op.load(Ordering::Relaxed) {
+                    crate::ports::after_container_op();
+                }
                 pipe.flush();
                 return !pipe.is_aborted() && pipe.write(&[]).is_ok();
             }

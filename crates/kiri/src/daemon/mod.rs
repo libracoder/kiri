@@ -5,7 +5,7 @@
 #[cfg(target_os = "linux")]
 pub mod access;
 mod api;
-mod binds;
+pub(crate) mod binds;
 mod builder;
 mod caller;
 mod daemon_json;

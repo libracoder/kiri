@@ -254,9 +254,11 @@ fn watch(tx: Sender<Cmd>) {
             // A Kubernetes node already running gets its kubectl context.
             crate::k8s::sync_soon();
             crate::watch::notify_containers_changed();
+            crate::ports::notify();
             crate::wslconfig::sync_wsl_integration_soon();
             let _ = client::events(|_| {
                 crate::watch::notify_containers_changed();
+                crate::ports::notify();
                 tx.send(Cmd::Refresh).is_ok()
             });
         }
@@ -712,6 +714,7 @@ fn host_ports(info: &Value, with_inner: bool) -> Vec<String> {
 
 fn set_ports(id: &str, ports: Value) -> io::Result<()> {
     expect_ok(client::request("POST", &format!("/kiri/containers/{id}/ports"), Some(&json!({"ports": ports}))))?;
+    crate::ports::sync_now();
     let now = host_ports(&client::get(&format!("/containers/{id}/json"))?, true);
     emit(notice("ok", &if now.is_empty() { tr("Ports removed") } else { trf("Ports saved: {ports}", &[("ports", &now.join(", "))]) }));
     Ok(())

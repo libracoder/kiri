@@ -197,6 +197,225 @@ pub struct Binding {
     pub host_port: u16,
 }
 
+/// One active published port binding reported to `kiri-win` (`/kiri/win-ports`).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct PublishedPort {
+    pub proto: String,
+    pub host_ip: String,
+    pub host_port: u16,
+}
+
+static WINDOWS_HOST_IPS: Mutex<Option<BTreeSet<IpAddr>>> = Mutex::new(None);
+static LAST_IPCONFIG_PROBE: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// Parses a bare or bracketed IPv4/IPv6 host address, stripping any `%scope`
+/// suffix and canonicalizing IPv4-mapped IPv6 addresses.
+pub fn parse_host_ip(s: &str) -> Option<IpAddr> {
+    let bare = s.trim().strip_prefix('[').and_then(|i| i.strip_suffix(']')).unwrap_or(s.trim());
+    let bare = bare.split('%').next().unwrap_or(bare);
+    bare.parse::<IpAddr>().ok().map(|a| a.to_canonical())
+}
+
+/// Records the Windows host interface IPs pushed by `kiri-win` and persists
+/// them in the daemon state directory when the list changes so container
+/// starts after a daemon restart still recognize Windows interface addresses.
+pub fn set_windows_host_ips(ips: &[String]) {
+    let mut set = BTreeSet::from([
+        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+    ]);
+    for s in ips {
+        if let Some(ip) = parse_host_ip(s)
+            && !ip.is_unspecified()
+            && !ip.is_multicast()
+        {
+            set.insert(ip);
+        }
+    }
+    {
+        let mut guard = WINDOWS_HOST_IPS.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_none() {
+            *guard = load_persisted_windows_host_ips();
+        }
+        if guard.as_ref() == Some(&set) {
+            return;
+        }
+        *guard = Some(set.clone());
+    }
+    if let Ok(dir) = super::state_dir() {
+        let list: Vec<String> = set.iter().map(ToString::to_string).collect();
+        if let Ok(bytes) = serde_json::to_vec(&list) {
+            let tmp = dir.join("win-host-ips.json.tmp");
+            let path = dir.join("win-host-ips.json");
+            if std::fs::write(&tmp, bytes).is_ok() {
+                let _ = std::fs::rename(&tmp, &path);
+            }
+        }
+    }
+}
+
+fn load_persisted_windows_host_ips() -> Option<BTreeSet<IpAddr>> {
+    let path = super::state_dir().ok()?.join("win-host-ips.json");
+    let bytes = std::fs::read(path).ok()?;
+    let list: Vec<String> = serde_json::from_slice(&bytes).ok()?;
+    let mut set = BTreeSet::from([
+        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+    ]);
+    for s in &list {
+        if let Some(ip) = parse_host_ip(s)
+            && !ip.is_unspecified()
+            && !ip.is_multicast()
+        {
+            set.insert(ip);
+        }
+    }
+    Some(set)
+}
+
+/// Extracts Windows host interface IPv4 and IPv6 addresses from `ipconfig.exe`
+/// output in a locale-independent way: in every Windows locale, each adapter's
+/// IPv4 address line is immediately followed by its `255.x.x.x` subnet mask
+/// line, whereas the default gateway comes after the subnet mask.
+pub fn parse_ipconfig_addrs(output: &str) -> BTreeSet<IpAddr> {
+    let mut set = BTreeSet::from([
+        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+    ]);
+    let mut pending_v4: Option<std::net::Ipv4Addr> = None;
+    let mut seen_mask_in_section = false;
+    for raw_line in output.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // Adapter section header (e.g. `Ethernet adapter vEthernet (WSL):`).
+        if line.ends_with(':') && !line.contains(". :") && !line.contains(" : ") {
+            pending_v4 = None;
+            seen_mask_in_section = false;
+            continue;
+        }
+        let val = match line.split_once(": ") {
+            Some((_, right)) => right.trim(),
+            None => match line.strip_suffix(':') {
+                Some(_) => continue,
+                None => line,
+            },
+        };
+        let token = val.split(['(', '%', ' ']).next().unwrap_or("").trim();
+        if token.is_empty() {
+            continue;
+        }
+        if let Ok(v4) = token.parse::<std::net::Ipv4Addr>() {
+            if v4.octets()[0] == 255 {
+                seen_mask_in_section = true;
+                if let Some(interface_ip) = pending_v4.take()
+                    && !interface_ip.is_unspecified()
+                    && !interface_ip.is_multicast()
+                {
+                    set.insert(IpAddr::V4(interface_ip));
+                }
+            } else {
+                pending_v4 = Some(v4);
+            }
+        } else if !seen_mask_in_section
+            && let Some(IpAddr::V6(v6)) = parse_host_ip(token)
+            && !v6.is_unspecified()
+            && !v6.is_multicast()
+        {
+            set.insert(IpAddr::V6(v6));
+        }
+    }
+    set
+}
+
+fn probe_windows_host_ips_from_wsl() -> Option<BTreeSet<IpAddr>> {
+    let wsl = super::binds::wsl()?;
+    {
+        let mut last = LAST_IPCONFIG_PROBE.lock().unwrap_or_else(|e| e.into_inner());
+        if last.is_some_and(|t| t.elapsed() < Duration::from_secs(2)) {
+            return None;
+        }
+        *last = Some(Instant::now());
+    }
+    let ipconfig = format!("{}c/Windows/System32/ipconfig.exe", wsl.root);
+    let out = std::process::Command::new(ipconfig)
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let parsed = parse_ipconfig_addrs(&text);
+    (parsed.len() > 2).then_some(parsed)
+}
+
+/// Whether `ip` is a valid interface address on the Windows host when running
+/// inside WSL 2.
+pub fn is_windows_host_ip(ip: &str) -> bool {
+    let Some(addr) = parse_host_ip(ip) else {
+        return false;
+    };
+    if addr.is_unspecified() || addr.is_multicast() {
+        return false;
+    }
+    {
+        let mut guard = WINDOWS_HOST_IPS.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_none() {
+            *guard = load_persisted_windows_host_ips();
+        }
+        if let Some(set) = guard.as_ref()
+            && set.contains(&addr)
+        {
+            return true;
+        }
+    }
+    if let Some(probed) = probe_windows_host_ips_from_wsl() {
+        let mut guard = WINDOWS_HOST_IPS.lock().unwrap_or_else(|e| e.into_inner());
+        let set = guard.get_or_insert_with(BTreeSet::new);
+        set.extend(probed);
+        return set.contains(&addr);
+    }
+    false
+}
+
+/// The WSL 2 distro's primary internal IPv4 address (`eth0` / default route
+/// interface), which `kiri-win` on Windows forwards TCP and UDP ports to.
+pub fn wsl_ipv4() -> Option<std::net::Ipv4Addr> {
+    let default_iface = std::fs::read_to_string("/proc/net/route")
+        .ok()
+        .and_then(|routes| {
+            routes.lines().skip(1).find_map(|l| {
+                let mut f = l.split_whitespace();
+                let iface = f.next()?;
+                let dst = f.next()?;
+                (dst == "00000000").then(|| iface.to_owned())
+            })
+        });
+    let addrs: Vec<(String, std::net::Ipv4Addr)> = super::network::host_interface_ipv4()
+        .into_iter()
+        .filter(|(_, ip)| !ip.is_loopback() && !ip.is_unspecified())
+        .collect();
+    if let Some(def) = default_iface.as_deref()
+        && let Some((_, ip)) = addrs.iter().find(|(n, _)| n == def)
+    {
+        return Some(*ip);
+    }
+    if let Some((_, ip)) = addrs.iter().find(|(n, _)| n == "eth0") {
+        return Some(*ip);
+    }
+    addrs
+        .into_iter()
+        .find(|(n, _)| {
+            !n.starts_with("lo")
+                && !n.starts_with("kiri")
+                && !n.starts_with("veth")
+                && !n.starts_with("docker")
+                && !n.starts_with("br-")
+                && !n.starts_with("cni")
+                && !n.starts_with("flannel")
+        })
+        .map(|(_, ip)| ip)
+}
+
 /// A running forward for one container; dropping it closes every listener.
 pub struct Forwards {
     wake: Vec<OwnedFd>,
@@ -402,8 +621,18 @@ fn holder_in(lsof: &str) -> Option<String> {
 /// Binds every port first (so a clash fails the start cleanly), then starts
 /// one accept thread per listener.
 pub fn start(vm: Arc<VmLink>, id: &str, bindings: &[Binding], target_ip: [u8; 4]) -> io::Result<Forwards> {
-    let mut listeners = Vec::with_capacity(bindings.len());
-    let mut udp = Vec::new();
+    let in_wsl = super::binds::wsl().is_some();
+    // In WSL 2 NAT mode, `wsl_ipv4()` is WSL's dedicated internal `eth0` IP.
+    // In mirrored/bridged mode, `wsl_ipv4()` is itself one of the Windows host
+    // interface IPs; filter it out so we never bind an extra LAN socket for a
+    // loopback-only (`-p 127.0.0.1:port/udp`) binding.
+    let wsl_eth0 = if in_wsl {
+        wsl_ipv4().filter(|ip| !is_windows_host_ip(&ip.to_string()))
+    } else {
+        None
+    };
+    let mut listeners: Vec<(Binding, Option<String>, String, u16, TcpListener)> = Vec::with_capacity(bindings.len());
+    let mut udp: Vec<(Binding, Option<String>, String, u16, UdpSocket)> = Vec::new();
     for b in bindings {
         // A port picked by the kernel (0) is picked once: the `::` listener
         // takes the one 0.0.0.0 got.
@@ -420,11 +649,41 @@ pub fn start(vm: Arc<VmLink>, id: &str, bindings: &[Binding], target_ip: [u8; 4]
                     e
                 }
             };
+            let is_udp = b.proto == "udp";
             // Kiri's own container-domain router on this port lets it go
             // (domains::step_aside), and the bind goes again.
-            let bound = bind_socket(addr, b.proto == "udp").or_else(|e| {
-                if e.kind() == io::ErrorKind::AddrInUse && b.proto == "tcp" && port != 0 && super::domains::step_aside(port) { bind_socket(addr, false) } else { Err(e) }
-            });
+            let try_bind = |a: SocketAddr| {
+                bind_socket(a, is_udp).or_else(|e| {
+                    if e.kind() == io::ErrorKind::AddrInUse && !is_udp && port != 0 && super::domains::step_aside(port) {
+                        bind_socket(a, false)
+                    } else {
+                        Err(e)
+                    }
+                })
+            };
+            let (bound, bind_ip) = match try_bind(addr) {
+                Ok(s) => (Ok(s), ip.clone()),
+                // In WSL 2, a Windows host interface IP (`-p <WinLANIP>:port:cport`)
+                // is not assigned inside the Linux VM (`EADDRNOTAVAIL` / os error 99).
+                // When the IP belongs to a Windows host interface and WSL has a
+                // distinct internal `eth0` IPv4 address, bind WSL's `eth0` address
+                // (never 0.0.0.0, which would make wslrelay.exe expose 127.0.0.1:port
+                // on Windows) while `kiri-win` binds `<WinLANIP>:port` on Windows and
+                // forwards to `<wsl_eth0>:<port>`.
+                Err(e)
+                    if in_wsl
+                        && (e.kind() == io::ErrorKind::AddrNotAvailable || e.raw_os_error() == Some(libc::EADDRNOTAVAIL))
+                        && is_windows_host_ip(&ip) =>
+                {
+                    if let Some(fallback_ip) = wsl_eth0 {
+                        let fallback_addr = SocketAddr::new(IpAddr::V4(fallback_ip), port);
+                        (try_bind(fallback_addr), fallback_ip.to_string())
+                    } else {
+                        (Err(e), ip.clone())
+                    }
+                }
+                Err(e) => (Err(e), ip.clone()),
+            };
             let sock = match bound {
                 Ok(s) => s,
                 Err(e) if required => return Err(taken(e)),
@@ -435,17 +694,45 @@ pub fn start(vm: Arc<VmLink>, id: &str, bindings: &[Binding], target_ip: [u8; 4]
                     continue;
                 }
             };
-            if b.proto == "udp" {
+            if is_udp {
                 let s = UdpSocket::from(sock);
                 s.set_nonblocking(true)?;
                 port = s.local_addr()?.port();
-                udp.push((b.clone(), ip, port, s));
+                udp.push((b.clone(), Some(ip), bind_ip.clone(), port, s));
+                // WSL 2's localhostForwarding never forwards UDP, so `kiri-win`
+                // forwards Windows UDP ports (including 127.0.0.1:port/udp) to
+                // `<wsl_eth0>:<port>/udp`. Ensure `<wsl_eth0>:<port>/udp` is
+                // also bound/DNATed inside WSL when the primary bind was loopback
+                // or IPv6-only.
+                if let Some(eth0) = wsl_eth0 {
+                    let eth0_str = eth0.to_string();
+                    if bind_ip != "0.0.0.0"
+                        && bind_ip != eth0_str
+                        && !udp.iter().any(|(_, _, bip, p, _)| *p == port && (bip == "0.0.0.0" || bip == &eth0_str))
+                        && let Ok(aux_fd) = bind_socket(SocketAddr::new(IpAddr::V4(eth0), port), true)
+                    {
+                        let aux = UdpSocket::from(aux_fd);
+                        let _ = aux.set_nonblocking(true);
+                        udp.push((b.clone(), None, eth0_str, port, aux));
+                    }
+                }
                 continue;
             }
             let l = TcpListener::from(sock);
             l.set_nonblocking(true)?;
             port = l.local_addr()?.port();
-            listeners.push((b.clone(), ip, port, l));
+            listeners.push((b.clone(), Some(ip.clone()), bind_ip.clone(), port, l));
+            if let Some(eth0) = wsl_eth0 {
+                let eth0_str = eth0.to_string();
+                if ip == "::"
+                    && !listeners.iter().any(|(_, _, bip, p, _)| *p == port && (bip == "0.0.0.0" || bip == &eth0_str))
+                    && let Ok(aux_fd) = bind_socket(SocketAddr::new(IpAddr::V4(eth0), port), false)
+                {
+                    let aux = TcpListener::from(aux_fd);
+                    let _ = aux.set_nonblocking(true);
+                    listeners.push((b.clone(), None, eth0_str, port, aux));
+                }
+            }
         }
     }
     let mut fw = Forwards { wake: Vec::new(), threads: Vec::new(), kernel: None, nat: None, loopback: None, bound: Vec::new() };
@@ -455,10 +742,20 @@ pub fn start(vm: Arc<VmLink>, id: &str, bindings: &[Binding], target_ip: [u8; 4]
     // loopback. The listeners below relay the rest. A target on loopback (a
     // --network host container) stays relayed: that is a local socket.
     if cfg!(target_os = "linux") && target_ip != [127, 0, 0, 1] {
-        let all = udp.iter().map(|(b, ip, port, _)| (b, ip, *port, true)).chain(listeners.iter().map(|(b, ip, port, _)| (b, ip, *port, false)));
+        let all = udp
+            .iter()
+            .map(|(b, _, bind_ip, port, _)| (b, bind_ip, *port, true))
+            .chain(listeners.iter().map(|(b, _, bind_ip, port, _)| (b, bind_ip, *port, false)));
         let mut published = Ok(false);
-        for (b, ip, port, is_udp) in all.filter(|(_, ip, ..)| kernel_forwards(ip)) {
-            let p = kiri_proto::Publish { id, udp: is_udp, host_ip: kernel_host_ip(ip).expect("checked IPv4 binding"), host_port: port, to_ip: target_ip, to_port: b.container_port };
+        for (b, bind_ip, port, is_udp) in all.filter(|(_, bind_ip, ..)| kernel_forwards(bind_ip)) {
+            let p = kiri_proto::Publish {
+                id,
+                udp: is_udp,
+                host_ip: kernel_host_ip(bind_ip).expect("checked IPv4 binding"),
+                host_port: port,
+                to_ip: target_ip,
+                to_port: b.container_port,
+            };
             published = vm.publish(p).map(|()| true);
             if published.is_err() {
                 break;
@@ -467,10 +764,10 @@ pub fn start(vm: Arc<VmLink>, id: &str, bindings: &[Binding], target_ip: [u8; 4]
         match published {
             Ok(any) => {
                 // Sockets only the kernel serves stay bound, so the ports read as taken.
-                let (kernel_udp, relay_udp): (Vec<_>, Vec<_>) = udp.into_iter().partition(|(_, ip, ..)| !relays_too(ip));
-                let (kernel_tcp, relay_tcp): (Vec<_>, Vec<_>) = listeners.into_iter().partition(|(_, ip, ..)| !relays_too(ip));
-                fw.bound.extend(kernel_udp.iter().map(|(b, ip, port, _)| (b.clone(), ip.clone(), *port)));
-                fw.bound.extend(kernel_tcp.iter().map(|(b, ip, port, _)| (b.clone(), ip.clone(), *port)));
+                let (kernel_udp, relay_udp): (Vec<_>, Vec<_>) = udp.into_iter().partition(|(_, _, bind_ip, ..)| !relays_too(bind_ip));
+                let (kernel_tcp, relay_tcp): (Vec<_>, Vec<_>) = listeners.into_iter().partition(|(_, _, bind_ip, ..)| !relays_too(bind_ip));
+                fw.bound.extend(kernel_udp.iter().filter_map(|(b, rep_ip, _, port, _)| rep_ip.as_ref().map(|ip| (b.clone(), ip.clone(), *port))));
+                fw.bound.extend(kernel_tcp.iter().filter_map(|(b, rep_ip, _, port, _)| rep_ip.as_ref().map(|ip| (b.clone(), ip.clone(), *port))));
                 if any {
                     fw.kernel = Some((vm.clone(), id.to_owned(), kernel_tcp.into_iter().map(|(.., s)| s).collect(), kernel_udp.into_iter().map(|(.., s)| s).collect()));
                 }
@@ -483,7 +780,7 @@ pub fn start(vm: Arc<VmLink>, id: &str, bindings: &[Binding], target_ip: [u8; 4]
             }
         }
     }
-    for (b, ip, port, sock) in udp {
+    for (b, rep_ip, _bind_ip, port, sock) in udp {
         let (wake_r, wake_w) = pipe()?;
         fw.wake.push(wake_w);
         let vm = vm.clone();
@@ -491,7 +788,9 @@ pub fn start(vm: Arc<VmLink>, id: &str, bindings: &[Binding], target_ip: [u8; 4]
         fw.threads.push(std::thread::Builder::new().name(format!("kiri-udp-{port}")).spawn(move || {
             udp_loop(&sock, &wake_r, &vm, target_ip, container_port);
         })?);
-        fw.bound.push((b, ip, port));
+        if let Some(ip) = rep_ip {
+            fw.bound.push((b, ip, port));
+        }
     }
     // In the VM: the guest kernel forwards each TCP binding from a port of
     // its own on the NAT network. A target on loopback stays relayed.
@@ -512,7 +811,7 @@ pub fn start(vm: Arc<VmLink>, id: &str, bindings: &[Binding], target_ip: [u8; 4]
     // listener. As on Docker, where a published port is bound in the host's
     // namespace. A target on loopback is itself a host-network container.
     if cfg!(target_os = "macos") && target_ip != [127, 0, 0, 1] {
-        let ports = loopback_ports(listeners.iter().map(|(b, ip, port, _)| (b.container_port, ip.as_str(), *port)));
+        let ports = loopback_ports(listeners.iter().filter_map(|(b, rep_ip, _, port, _)| rep_ip.as_deref().map(|ip| (b.container_port, ip, *port))));
         let mut published = false;
         for (to_port, host_port) in ports {
             let p = kiri_proto::Publish { id, udp: false, host_ip: [127, 0, 0, 1], host_port, to_ip: target_ip, to_port };
@@ -525,7 +824,7 @@ pub fn start(vm: Arc<VmLink>, id: &str, bindings: &[Binding], target_ip: [u8; 4]
             fw.loopback = Some((vm.clone(), id.to_owned()));
         }
     }
-    for ((b, ip, port, listener), nat) in listeners.into_iter().zip(nat) {
+    for ((b, rep_ip, _bind_ip, port, listener), nat) in listeners.into_iter().zip(nat) {
         let (wake_r, wake_w) = pipe()?;
         fw.wake.push(wake_w);
         let vm = vm.clone();
@@ -533,7 +832,9 @@ pub fn start(vm: Arc<VmLink>, id: &str, bindings: &[Binding], target_ip: [u8; 4]
         fw.threads.push(std::thread::Builder::new().name(format!("kiri-port-{port}")).spawn(move || {
             accept_loop(&listener, &wake_r, &vm, target_ip, container_port, nat);
         })?);
-        fw.bound.push((b, ip, port));
+        if let Some(ip) = rep_ip {
+            fw.bound.push((b, ip, port));
+        }
     }
     Ok(fw)
 }
@@ -2355,5 +2656,41 @@ mod tests {
             super::host_egress_routes_for(Some("10.254.99.0/24"), false, &[], false),
             vec!["10.254.99.0/24"]
         );
+    }
+
+    #[test]
+    fn ipconfig_parser_extracts_windows_interface_ips_and_excludes_gateways_and_masks() {
+        let sample = "\
+Windows IP Configuration\r\n\
+\r\n\
+Ethernet adapter vEthernet (WSL):\r\n\
+\r\n\
+   Connection-specific DNS Suffix  . : \r\n\
+   Link-local IPv6 Address . . . . . : fe80::1234:5678:9abc:def0%42\r\n\
+   IPv4 Address. . . . . . . . . . . : 198.51.100.1\r\n\
+   Subnet Mask . . . . . . . . . . . : 255.255.240.0\r\n\
+   Default Gateway . . . . . . . . . : \r\n\
+\r\n\
+Wireless LAN adapter Wi-Fi:\r\n\
+\r\n\
+   Connection-specific DNS Suffix  . : lan\r\n\
+   IPv6 Address. . . . . . . . . . . : 2001:db8::42(Preferred)\r\n\
+   Link-local IPv6 Address . . . . . : fe80::abcd:ef01:2345:6789%18\r\n\
+   IPv4 Address. . . . . . . . . . . : 192.0.2.50(Preferred)\r\n\
+   Subnet Mask . . . . . . . . . . . : 255.255.255.0\r\n\
+   Default Gateway . . . . . . . . . : fe80::1%18\r\n\
+                                       192.0.2.1\r\n";
+        let ips = super::parse_ipconfig_addrs(sample);
+        assert!(ips.contains(&"127.0.0.1".parse().unwrap()));
+        assert!(ips.contains(&"::1".parse().unwrap()));
+        assert!(ips.contains(&"198.51.100.1".parse().unwrap()));
+        assert!(ips.contains(&"192.0.2.50".parse().unwrap()));
+        assert!(ips.contains(&"2001:db8::42".parse().unwrap()));
+        // Subnet masks, default gateways, and arbitrary bogus IPs must not match.
+        assert!(!ips.contains(&"255.255.255.0".parse().unwrap()));
+        assert!(!ips.contains(&"255.255.240.0".parse().unwrap()));
+        assert!(!ips.contains(&"192.0.2.1".parse().unwrap()));
+        assert!(!ips.contains(&"fe80::1".parse().unwrap()));
+        assert!(!ips.contains(&"203.0.113.99".parse().unwrap()));
     }
 }

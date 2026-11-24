@@ -276,6 +276,8 @@ fn route(req: &Request, engine: &Arc<Engine>, caller: &Caller, w: &mut UnixStrea
         ("POST", "/kiri/builder") => return reply(w, super::builder::set_settings(req).map(|()| super::builder::settings_report(engine)), 200),
         ("GET", "/kiri/watch-roots") => return reply(w, Ok(watch_roots(engine)), 200),
         ("POST", "/kiri/fs-events") => return reply(w, fs_events(req, engine), 204),
+        ("GET", "/kiri/win-ports") => return reply(w, Ok(win_ports(engine)), 200),
+        ("POST", "/kiri/win-ports") => return reply(w, sync_win_ports(req, engine), 200),
         ("GET", "/images/json") => return reply(w, images(req, engine), 200),
         ("POST", "/images/create") if req.query("fromSrc").is_some_and(|s| !s.is_empty()) => return image_import(req, engine, w, r),
         ("POST", "/images/create") => return pull(req, engine, w),
@@ -1233,6 +1235,31 @@ fn fs_events(req: &Request, engine: &Engine) -> Result<Value, Error> {
     let lines = parse_fs_events(&req.body, root)?;
     engine.send_fs_events(&lines);
     Ok(Value::Null)
+}
+
+/// Active published ports and WSL's internal `eth0` IPv4 address for
+/// `kiri-win`'s Windows UDP and host-IP port forwarder.
+fn win_ports(engine: &Engine) -> Value {
+    let wsl_ip = super::ports::wsl_ipv4().map(|ip| ip.to_string());
+    let ports: Vec<Value> = engine
+        .published_ports()
+        .into_iter()
+        .map(|p| json!({"proto": p.proto, "host_ip": p.host_ip, "host_port": p.host_port}))
+        .collect();
+    json!({
+        "wsl_ip": wsl_ip,
+        "ports": ports,
+    })
+}
+
+fn sync_win_ports(req: &Request, engine: &Engine) -> Result<Value, Error> {
+    if !req.body.is_empty() {
+        let body: Value = serde_json::from_slice(&req.body).map_err(|e| Error::BadRequest(format!("invalid JSON: {e}")))?;
+        if let Some(ips) = strings(&body["host_ips"]) {
+            super::ports::set_windows_host_ips(&ips);
+        }
+    }
+    Ok(win_ports(engine))
 }
 
 /// A registry client with the credentials the CLI sent, if any.

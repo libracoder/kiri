@@ -866,12 +866,20 @@ fn free_subnet_with(taken: &[([u8; 4], u8)], default_bridge: bool, host: &[HostN
 /// A subnet the host itself is on, outside Kiri's bridges: an on-link route
 /// or an interface's address, and the interface it is on. Or one Docker
 /// will take back when it starts (`docker_saved`): not on the host now.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Eq)]
 struct HostNet {
     net: u32,
     mask: u32,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    addr: [u8; 4],
     dev: String,
     saved: bool,
+}
+
+impl PartialEq for HostNet {
+    fn eq(&self, other: &Self) -> bool {
+        (self.net, self.mask, &self.dev, self.saved) == (other.net, other.mask, &other.dev, other.saved)
+    }
 }
 
 fn mask4(prefix: u8) -> u32 {
@@ -880,7 +888,7 @@ fn mask4(prefix: u8) -> u32 {
 
 impl HostNet {
     fn new(dev: &str, addr: [u8; 4], mask: u32) -> HostNet {
-        HostNet { net: u32::from_be_bytes(addr) & mask, mask, dev: dev.to_owned(), saved: false }
+        HostNet { net: u32::from_be_bytes(addr) & mask, mask, addr, dev: dev.to_owned(), saved: false }
     }
 
     /// Shares any address with `subnet`: a new subnet keeps clear of it.
@@ -1035,6 +1043,16 @@ fn docker_bridges(b: &[u8]) -> Vec<HostNet> {
 
 #[cfg(not(target_os = "linux"))]
 fn host_networks() -> Vec<HostNet> {
+    Vec::new()
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn host_interface_ipv4() -> Vec<(String, std::net::Ipv4Addr)> {
+    host_addrs().into_iter().map(|h| (h.dev, std::net::Ipv4Addr::from(h.addr))).collect()
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(super) fn host_interface_ipv4() -> Vec<(String, std::net::Ipv4Addr)> {
     Vec::new()
 }
 
