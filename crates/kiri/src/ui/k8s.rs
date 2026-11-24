@@ -73,8 +73,15 @@ pub fn handle(action: &str, value: &Value) {
     }
 }
 
-/// Settings' Copy buttons (the API server's address, a kubectl command), by
-/// pbcopy: the page's own clipboard needs a gesture WebKit doesn't always see.
+/// Settings' Copy buttons (the API server's address, a kubectl command):
+/// the page's own clipboard needs a gesture WebKit doesn't always see.
+#[cfg(target_os = "linux")]
+fn copy(text: &str) {
+    super::window::copy(text);
+    emit(notice("ok", &super::trf("Copied {text}", &[("text", &text)])));
+}
+
+#[cfg(not(target_os = "linux"))]
 fn copy(text: &str) {
     use std::io::Write;
     let done = std::process::Command::new("/usr/bin/pbcopy").stdin(std::process::Stdio::piped()).spawn().and_then(|mut c| {
