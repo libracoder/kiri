@@ -97,6 +97,11 @@ impl Request {
         self.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)).map(|(_, v)| v.as_str())
     }
 
+    /// All request headers in wire order (preserving repeated header names).
+    pub fn headers(&self) -> &[(String, String)] {
+        &self.headers
+    }
+
     /// The connection closes after this request's response: the client
     /// sent `Connection: close` (Docker.DotNet does on every request), or
     /// spoke HTTP/1.0 without `Connection: keep-alive` (RFC 9112 §9.3), as
@@ -894,6 +899,13 @@ pub fn end(w: &mut impl Write) -> io::Result<()> {
 /// the connection carries multiplexed output frames until it closes.
 pub fn upgrade(w: &mut impl Write) -> io::Result<()> {
     head(w, 101, "Content-Type: application/vnd.docker.raw-stream\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n")?;
+    w.flush()
+}
+
+/// Switches the connection to HTTP/2 cleartext (`h2c`) for BuildKit's `/grpc`
+/// and `/session` endpoints.
+pub fn upgrade_h2c(w: &mut impl Write) -> io::Result<()> {
+    head(w, 101, "Connection: Upgrade\r\nUpgrade: h2c\r\n")?;
     w.flush()
 }
 

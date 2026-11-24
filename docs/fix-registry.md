@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #734 Builder: load images built by containerized Docker CLIs into Kiri's store (unreleased)
+- Fixes: #734 `docker build` from a `docker` CLI inside a container leaves the image out of Kiri's store
+- Caused: none known
+- Caused by: -
+- Check: `crates/kiri/src/daemon/grpc.rs`
+
 ### #763 macOS: discover GPG `S.gpg-agent.ssh` and translate host SSH agent socket bind mounts (unreleased)
 - Fixes: #763 support mac GPG `SSH_AUTH_SOCK`
 - Caused: none known

@@ -15,6 +15,7 @@ pub mod proxy;
 mod domains;
 mod engine;
 mod filters;
+mod grpc;
 mod health;
 mod hostetc;
 // A Windows host's roots, for the engine in WSL.

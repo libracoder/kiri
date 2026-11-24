@@ -170,10 +170,9 @@ fn route(req: &Request, engine: &Arc<Engine>, caller: &Caller, w: &mut UnixStrea
     }
     match (m, p) {
         ("GET" | "HEAD", "/_ping") => {
-            // Builder-Version 1: the classic POST /build, which Kiri serves
-            // with its managed BuildKit (builder.rs). "2" would tell older
-            // CLIs and Compose to use BuildKit inside the engine (/session,
-            // /grpc), which Kiri doesn't have.
+            // Builder-Version 1 keeps classic CLIs, older Compose and SDKs
+            // without buildx on POST /build (served by builder.rs), while
+            // buildx probes POST /grpc directly and uses the docker driver.
             http::respond_with(w, 200, "text/plain; charset=utf-8", "Builder-Version: 1\r\n", if m == "HEAD" { b"" } else { b"OK" })?;
             return Ok(Next::KeepAlive);
         }
@@ -269,6 +268,8 @@ fn route(req: &Request, engine: &Arc<Engine>, caller: &Caller, w: &mut UnixStrea
         ("POST", "/build") => return super::builder::build(req, engine, w, r),
         ("POST", "/build/cancel") => return reply(w, super::builder::cancel(req, engine), 200),
         ("POST", "/build/prune") => return reply(w, super::builder::prune(req, engine), 200),
+        ("POST", "/grpc") => return super::grpc::grpc(req, engine, w, r),
+        ("POST", "/session") => return super::grpc::session(req, engine, w, r),
         // Settings → Storage: where the data is, and moving it (storage.rs).
         ("GET", "/kiri/storage") => return reply(w, Ok(super::storage::report(engine)), 200),
         ("POST", "/kiri/storage/check") => return reply(w, super::storage::check_request(req, engine), 200),
@@ -3708,7 +3709,7 @@ fn forward_stdin(engine: Arc<Engine>, id: String, r: &mut BufReader<UnixStream>)
 /// it closely follows data, though the next read would see the end. For
 /// `docker run -i` that was a process waiting forever for the end of its input,
 /// in 1 to 5 runs in 100. poll is woken for it.
-fn wait_readable(stream: &UnixStream) {
+pub(super) fn wait_readable(stream: &UnixStream) {
     let mut fd = libc::pollfd { fd: stream.as_raw_fd(), events: libc::POLLIN, revents: 0 };
     // SAFETY: one valid pollfd. Any other failure leaves the read to block or to
     // report it, as without this.

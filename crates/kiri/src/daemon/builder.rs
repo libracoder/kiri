@@ -299,7 +299,7 @@ impl Registries {
     }
 }
 
-fn builder_host_net(engine: &Engine, id: &str) -> bool {
+pub(super) fn builder_host_net(engine: &Engine, id: &str) -> bool {
     engine.with(id, |c| c.spec.network_mode == "host").unwrap_or(false)
 }
 
@@ -582,7 +582,7 @@ fn claim_for_build(up: bool, execs: usize, stale: bool) -> (bool, Busy) {
 
 /// The builder, made if need be, started and answering. `say` hears what
 /// takes a while (a pull, a start).
-fn ensure_running(engine: &Engine, say: &mut dyn FnMut(&str)) -> Result<(String, Busy), Error> {
+pub(super) fn ensure_running(engine: &Engine, say: &mut dyn FnMut(&str)) -> Result<(String, Busy), Error> {
     if find(engine).is_none() {
         // Before the lock: a pull must not hold the builder up for others.
         ensure_image(engine, say)?;
@@ -686,7 +686,7 @@ fn refresh_due(engine: &Engine, id: &str) -> bool {
 }
 
 /// A build in progress, for the idle watch.
-struct Busy;
+pub(super) struct Busy;
 
 impl Busy {
     fn new() -> Busy {
@@ -704,7 +704,7 @@ impl Drop for Busy {
 
 // --- In and out of the container -------------------------------------------
 
-fn internal_exec(argv: &[String], stdin: bool, env: Vec<String>) -> ExecConfig {
+pub(super) fn internal_exec(argv: &[String], stdin: bool, env: Vec<String>) -> ExecConfig {
     ExecConfig { console_size: None, argv: argv.to_vec(), env, cwd: "/".into(), user: String::new(), tty: false, stdin, privileged: true, internal: true }
 }
 

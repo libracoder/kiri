@@ -12,14 +12,16 @@
 //! images through it. Manifests are made from the store's records (layers,
 //! config), the same bytes for the same image every time.
 
+use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use kiri_image::{Image, Reference};
+use kiri_image::{Image, Layer, Platform, Reference};
 
 use super::engine::Engine;
 
@@ -27,8 +29,24 @@ use super::engine::Engine;
 /// finds the mirror its config names.
 const PORT: u16 = 47_391;
 const DEV_PORT: u16 = 47_392;
+const MAX_MIRROR_WORKERS: usize = 128;
 
-static LISTENING: OnceLock<Option<u16>> = OnceLock::new();
+#[derive(Clone, Copy)]
+struct MirrorListen {
+    port: u16,
+    has_bridge: bool,
+}
+
+static LISTENING: OnceLock<Option<MirrorListen>> = OnceLock::new();
+static ACTIVE_WORKERS: AtomicUsize = AtomicUsize::new(0);
+
+struct WorkerGuard;
+
+impl Drop for WorkerGuard {
+    fn drop(&mut self) {
+        ACTIVE_WORKERS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 /// The mirror's secret path segment, kept in the state directory so it
 /// survives restarts (the builder's config keeps naming it).
@@ -67,6 +85,10 @@ pub fn start(engine: &Arc<Engine>) {
         let listener = TcpListener::bind(("127.0.0.1", wanted)).or_else(|_| TcpListener::bind(("127.0.0.1", 0))).ok()?;
         let port = listener.local_addr().ok()?.port();
         let me = Arc::downgrade(engine);
+        #[cfg(target_os = "linux")]
+        let mut has_bridge = false;
+        #[cfg(not(target_os = "linux"))]
+        let has_bridge = true;
         // On a Linux host the builder reaches the mirror at the default
         // bridge's gateway (mirror_host): containers have no way to the
         // host's loopback there, so it listens on that address too.
@@ -75,14 +97,16 @@ pub fn start(engine: &Arc<Engine>) {
             match bind_freely(gateway, port) {
                 Ok(l) => {
                     let me = me.clone();
-                    let _ = std::thread::Builder::new().name("kiri-build-mirror".into()).spawn(move || serve(l, me));
+                    if std::thread::Builder::new().name("kiri-build-mirror".into()).spawn(move || serve(l, me)).is_ok() {
+                        has_bridge = true;
+                    }
                 }
                 Err(e) => crate::diag::warn!("image mirror not on the bridge; builds pull from registries", error = e),
             }
         }
         std::thread::Builder::new().name("kiri-build-mirror".into()).spawn(move || serve(listener, me)).ok()?;
         crate::diag::info!("image mirror for builds", port = port);
-        Some(port)
+        Some(MirrorListen { port, has_bridge })
     });
 }
 
@@ -274,6 +298,19 @@ fn format_tables(tables: &[(String, Table)]) -> String {
     out
 }
 
+/// The mirror's `host:port` as reached from the builder container (`127.0.0.1`
+/// on Linux when the builder uses `--network=host`, else the bridge gateway /
+/// VM host address). `None` if the mirror listener for that network mode failed
+/// to start.
+pub fn upload_endpoint(engine: &Engine, host_net: bool) -> Option<String> {
+    let listen = LISTENING.get().copied().flatten()?;
+    if cfg!(target_os = "linux") && !host_net && !listen.has_bridge {
+        return None;
+    }
+    let addr = if cfg!(target_os = "linux") && host_net { "127.0.0.1".to_owned() } else { mirror_host(&engine.lock_net()) };
+    Some(format!("{addr}:{}", listen.port))
+}
+
 /// buildkitd.toml's registry tables, for `c` (daemon.json's settings) and
 /// `names` ([`registry_names`]), with `host_net` selecting `127.0.0.1` on
 /// Linux when the builder runs in the host network namespace (`--driver-opt
@@ -281,9 +318,7 @@ fn format_tables(tables: &[(String, Table)]) -> String {
 /// exists.
 pub fn config_for(engine: &Engine, c: &kiri_image::RegistryConfig, names: &[String], host_net: bool) -> String {
     let mut tables: Vec<(String, Table)> = Vec::new();
-    if let Some(port) = LISTENING.get().copied().flatten() {
-        let addr = if cfg!(target_os = "linux") && host_net { "127.0.0.1".to_owned() } else { mirror_host(&engine.lock_net()) };
-        let host = format!("{addr}:{port}");
+    if let Some(host) = upload_endpoint(engine, host_net) {
         let token = token();
         for name in names {
             add_mirror(&mut tables, name, format!("{host}/{token}/{name}"));
@@ -355,38 +390,382 @@ fn registries(tables: &mut Vec<(String, Table)>, c: &kiri_image::RegistryConfig,
     }
 }
 
+// --- Ephemeral one-shot image load uploads (/v2/load/<nonce>/image/...) ------
+
+const MAX_LOAD_UPLOADS: usize = 256;
+const MAX_LOAD_CHILD_MANIFESTS: usize = 64;
+
+struct UploadEntry {
+    ingest: kiri_image::store::Ingest,
+    written: u64,
+}
+
+struct LoadSlot {
+    nonce: String,
+    engine: Arc<Engine>,
+    closed: AtomicBool,
+    target_tags: Mutex<Vec<String>>,
+    uploads: Mutex<HashMap<String, Arc<Mutex<Option<UploadEntry>>>>>,
+    child_manifests: Mutex<HashMap<String, Vec<u8>>>,
+    pins: Mutex<Vec<kiri_image::store::Pin>>,
+    newly_ingested: Mutex<Vec<String>>,
+    used_digests: Mutex<HashSet<String>>,
+    committed_digest: Mutex<Option<String>>,
+}
+
+impl LoadSlot {
+    fn close_and_cleanup(&self) {
+        self.closed.store(true, Ordering::Release);
+        let uploads = std::mem::take(&mut *self.uploads.lock().unwrap_or_else(|e| e.into_inner()));
+        for handle in uploads.values() {
+            if let Ok(mut guard) = handle.try_lock() {
+                let _ = guard.take();
+            }
+        }
+        drop(uploads);
+        self.child_manifests.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        let mut pins = self.pins.lock().unwrap_or_else(|e| e.into_inner());
+        let newly = std::mem::take(&mut *self.newly_ingested.lock().unwrap_or_else(|e| e.into_inner()));
+        let used = self.used_digests.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        pins.clear();
+        drop(pins);
+        for d in newly {
+            if !used.contains(&d) {
+                let _ = self.engine.store.remove_if_unused(&d);
+            }
+        }
+    }
+
+    fn record_blob(&self, pin: kiri_image::store::Pin, newly_ingested: Option<String>) -> bool {
+        let mut pins = self.pins.lock().unwrap_or_else(|e| e.into_inner());
+        if self.closed.load(Ordering::Acquire) {
+            drop(pins);
+            drop(pin);
+            if let Some(d) = newly_ingested {
+                let _ = self.engine.store.remove_if_unused(&d);
+            }
+            return false;
+        }
+        pins.push(pin);
+        if let Some(d) = newly_ingested {
+            self.newly_ingested.lock().unwrap_or_else(|e| e.into_inner()).push(d);
+        }
+        true
+    }
+}
+
+impl Drop for LoadSlot {
+    fn drop(&mut self) {
+        self.close_and_cleanup();
+    }
+}
+
+static LOADS: Mutex<Option<HashMap<String, Arc<LoadSlot>>>> = Mutex::new(None);
+
+/// An ephemeral push target in the mirror for one `Solve` call from BuildKit's
+/// `docker` driver (`grpc.rs`). Uses a per-build random nonce (never the
+/// read-only mirror's secret `token()`), exposes no image reads, and cleans up
+/// any uncommitted blobs on drop.
+pub struct LoadSession {
+    nonce: String,
+    slot: Arc<LoadSlot>,
+}
+
+impl std::fmt::Debug for LoadSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoadSession").field("nonce", &self.nonce).finish()
+    }
+}
+
+impl LoadSession {
+    pub fn new(engine: Arc<Engine>, target_tags: Vec<String>) -> LoadSession {
+        let nonce = super::engine::random_hex(16);
+        let mut deduped = Vec::with_capacity(target_tags.len());
+        let mut seen = HashSet::with_capacity(target_tags.len());
+        for t in target_tags {
+            if seen.insert(t.clone()) {
+                deduped.push(t);
+            }
+        }
+        let slot = Arc::new(LoadSlot {
+            nonce: nonce.clone(),
+            engine,
+            closed: AtomicBool::new(false),
+            target_tags: Mutex::new(deduped),
+            uploads: Mutex::new(HashMap::new()),
+            child_manifests: Mutex::new(HashMap::new()),
+            pins: Mutex::new(Vec::new()),
+            newly_ingested: Mutex::new(Vec::new()),
+            used_digests: Mutex::new(HashSet::new()),
+            committed_digest: Mutex::new(None),
+        });
+        LOADS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(HashMap::new)
+            .insert(nonce.clone(), slot.clone());
+        LoadSession { nonce, slot }
+    }
+
+    /// Adds extra target tags to this load session (when a solve names multiple
+    /// `moby` exporters).
+    pub fn add_tags(&self, extra: Vec<String>) {
+        let mut tags = self.slot.target_tags.lock().unwrap_or_else(|e| e.into_inner());
+        let mut seen: HashSet<String> = tags.iter().cloned().collect();
+        for t in extra {
+            if seen.insert(t.clone()) {
+                tags.push(t);
+            }
+        }
+    }
+
+    /// Reference passed to BuildKit's `image` exporter (`push=true`).
+    pub fn repo_ref(&self, endpoint: &str) -> String {
+        format!("{endpoint}/load/{}/image:out", self.nonce)
+    }
+
+    /// The stored image's config digest once BuildKit has pushed the manifest.
+    pub fn committed_digest(&self) -> Option<String> {
+        self.slot.committed_digest.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
+impl Drop for LoadSession {
+    fn drop(&mut self) {
+        if let Some(map) = LOADS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            map.remove(&self.nonce);
+        }
+        self.slot.close_and_cleanup();
+    }
+}
+
+fn is_hex_id(s: &str) -> bool {
+    s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn find_load_slot(nonce: &str) -> Option<Arc<LoadSlot>> {
+    if !is_hex_id(nonce) {
+        return None;
+    }
+    LOADS.lock().unwrap_or_else(|e| e.into_inner()).as_ref()?.get(nonce).cloned()
+}
+
 fn serve(listener: TcpListener, engine: Weak<Engine>) {
     for conn in listener.incoming() {
         let Ok(conn) = conn else { continue };
         let Some(engine) = engine.upgrade() else { return };
+        if ACTIVE_WORKERS
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < MAX_MIRROR_WORKERS).then_some(n + 1))
+            .is_err()
+        {
+            continue;
+        }
+        let guard = WorkerGuard;
         let _ = std::thread::Builder::new().name("kiri-build-mirror".into()).spawn(move || {
+            let _guard = guard;
             let _ = conn.set_read_timeout(Some(Duration::from_secs(30)));
             let _ = answer(conn, &engine);
         });
     }
 }
 
-/// One request, then the connection closes.
-fn answer(conn: TcpStream, engine: &Engine) -> io::Result<()> {
-    let mut r = BufReader::new((&conn).take(16 << 10));
-    let mut line = String::new();
-    r.read_line(&mut line)?;
-    let mut parts = line.split_whitespace();
-    let (method, target) = (parts.next().unwrap_or_default().to_owned(), parts.next().unwrap_or_default().to_owned());
-    loop {
-        let mut h = String::new();
-        if r.read_line(&mut h)? == 0 || h.trim().is_empty() {
-            break;
+#[derive(Clone, Copy)]
+enum BodyFraming {
+    None,
+    Length(u64),
+    Chunked,
+}
+
+fn read_http_body<R: BufRead, W: Write>(r: &mut R, framing: BodyFraming, out: &mut W, limit: Option<u64>) -> io::Result<u64> {
+    let mut total = 0u64;
+    let mut buf = [0u8; 32 * 1024];
+    let mut copy_exact = |r: &mut R, mut rem: u64, out: &mut W, total: &mut u64| -> io::Result<()> {
+        while rem > 0 {
+            let want = buf.len().min(rem as usize);
+            let n = r.read(&mut buf[..want])?;
+            if n == 0 {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated request body"));
+            }
+            *total = total.checked_add(n as u64).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "body overflow"))?;
+            if limit.is_some_and(|l| *total > l) {
+                return Err(io::Error::new(io::ErrorKind::FileTooLarge, "request body too large"));
+            }
+            out.write_all(&buf[..n])?;
+            rem -= n as u64;
+        }
+        Ok(())
+    };
+    match framing {
+        BodyFraming::None => Ok(0),
+        BodyFraming::Length(n) => {
+            copy_exact(r, n, out, &mut total)?;
+            Ok(total)
+        }
+        BodyFraming::Chunked => loop {
+            let mut line = String::new();
+            if (&mut *r).take(1024).read_line(&mut line)? == 0 {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated chunk header"));
+            }
+            if !line.ends_with('\n') {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "chunk header too long"));
+            }
+            let raw = line.trim_end_matches(['\r', '\n']);
+            let hex = raw.split(';').next().unwrap_or_default().trim();
+            let size = u64::from_str_radix(hex, 16).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad chunk size"))?;
+            if size == 0 {
+                // Drain bounded trailers until blank line.
+                for _ in 0..128 {
+                    let mut tr = String::new();
+                    if (&mut *r).take(4096).read_line(&mut tr)? == 0 || tr == "\r\n" || tr == "\n" {
+                        break;
+                    }
+                }
+                return Ok(total);
+            }
+            copy_exact(r, size, out, &mut total)?;
+            let mut crlf = [0u8; 2];
+            r.read_exact(&mut crlf)?;
+            if crlf != *b"\r\n" {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "bad chunk delimiter"));
+            }
+        },
+    }
+}
+
+fn query_param(query: &str, key: &str) -> Option<String> {
+    for kv in query.split('&').filter(|s| !s.is_empty()) {
+        let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
+        if k == key {
+            return Some(percent_decode(v));
         }
     }
-    let mut w = &conn;
-    let head = |w: &mut &TcpStream, status: &str, extra: &str, len: u64| write!(w, "HTTP/1.1 {status}\r\nConnection: close\r\nContent-Length: {len}\r\n{extra}\r\n");
-    if method != "GET" && method != "HEAD" {
-        return head(&mut w, "405 Method Not Allowed", "", 0);
+    None
+}
+
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let hex = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'+' => out.push(b' '),
+            b'%' if i + 2 < b.len() && hex(b[i + 1]).is_some() && hex(b[i + 2]).is_some() => {
+                out.push(hex(b[i + 1]).unwrap_or(0) << 4 | hex(b[i + 2]).unwrap_or(0));
+                i += 2;
+            }
+            c => out.push(c),
+        }
+        i += 1;
     }
-    match lookup(&engine.store, target.split('?').next().unwrap_or_default(), &token()) {
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// One request, then the connection closes.
+fn answer(conn: TcpStream, engine: &Engine) -> io::Result<()> {
+    let mut w = conn.try_clone()?;
+    let mut r = BufReader::new(conn);
+    answer_stream(&mut r, &mut w, engine)
+}
+
+fn answer_stream<R: BufRead, W: Write>(r: &mut R, w: &mut W, engine: &Engine) -> io::Result<()> {
+    let head = |w: &mut W, status: &str, extra: &str, len: u64| write!(w, "HTTP/1.1 {status}\r\nConnection: close\r\nContent-Length: {len}\r\n{extra}\r\n");
+    let (method, target, framing, expect_continue) = {
+        let mut head_reader = (&mut *r).take(16 << 10);
+        let mut raw_line = Vec::new();
+        if head_reader.read_until(b'\n', &mut raw_line)? == 0 {
+            return Ok(());
+        }
+        let Ok(line) = std::str::from_utf8(&raw_line) else {
+            head(w, "400 Bad Request", "", 0)?;
+            return w.flush();
+        };
+        if !line.ends_with('\n') {
+            head(w, "400 Bad Request", "", 0)?;
+            return w.flush();
+        }
+        let mut parts = line.split_whitespace();
+        let (method, target) = (parts.next().unwrap_or_default().to_owned(), parts.next().unwrap_or_default().to_owned());
+        let mut content_length: Option<u64> = None;
+        let mut chunked = false;
+        let mut expect_continue = false;
+        let mut saw_end = false;
+        loop {
+            let mut raw_h = Vec::new();
+            if head_reader.read_until(b'\n', &mut raw_h)? == 0 {
+                break;
+            }
+            let Ok(h) = std::str::from_utf8(&raw_h) else {
+                head(w, "400 Bad Request", "", 0)?;
+                return w.flush();
+            };
+            if !h.ends_with('\n') {
+                head(w, "400 Bad Request", "", 0)?;
+                return w.flush();
+            }
+            if h.trim().is_empty() {
+                saw_end = true;
+                break;
+            }
+            if let Some((k, v)) = h.split_once(':') {
+                let k = k.trim();
+                let v = v.trim();
+                if k.eq_ignore_ascii_case("content-length") {
+                    let Ok(parsed) = v.parse::<u64>() else {
+                        head(w, "400 Bad Request", "", 0)?;
+                        return w.flush();
+                    };
+                    if content_length.is_some_and(|prev| prev != parsed) {
+                        head(w, "400 Bad Request", "", 0)?;
+                        return w.flush();
+                    }
+                    content_length = Some(parsed);
+                } else if k.eq_ignore_ascii_case("transfer-encoding") && v.to_ascii_lowercase().contains("chunked") {
+                    chunked = true;
+                } else if k.eq_ignore_ascii_case("expect") && v.to_ascii_lowercase().contains("100-continue") {
+                    expect_continue = true;
+                }
+            }
+        }
+        if !saw_end || (chunked && content_length.is_some()) {
+            head(w, "400 Bad Request", "", 0)?;
+            return w.flush();
+        }
+        let framing = if chunked {
+            BodyFraming::Chunked
+        } else if let Some(n) = content_length.filter(|n| *n > 0) {
+            BodyFraming::Length(n)
+        } else {
+            BodyFraming::None
+        };
+        (method, target, framing, expect_continue)
+    };
+    let (path, query) = target.split_once('?').unwrap_or((&target, ""));
+
+    // Registry v2 ping (`GET /v2/` / `HEAD /v2/`).
+    if matches!(method.as_str(), "GET" | "HEAD") && (path == "/v2/" || path == "/v2") {
+        let body = if method == "GET" { b"{}".as_slice() } else { b"".as_slice() };
+        head(w, "200 OK", "Docker-Distribution-Api-Version: registry/2.0\r\nContent-Type: application/json\r\n", body.len() as u64)?;
+        w.write_all(body)?;
+        return w.flush();
+    }
+
+    // Ephemeral one-shot image upload for BuildKit's `docker` driver.
+    if let Some(rest) = path.strip_prefix("/v2/load/") {
+        if let Some((nonce, sub)) = rest.split_once("/image/") {
+            return handle_load(engine, nonce, sub, &method, query, framing, expect_continue, r, w);
+        }
+        head(w, "404 Not Found", "", 0)?;
+        return w.flush();
+    }
+
+    if method != "GET" && method != "HEAD" {
+        head(w, "405 Method Not Allowed", "", 0)?;
+        return w.flush();
+    }
+    match lookup(&engine.store, path, &token()) {
         Some(Found::Manifest(bytes, media_type, digest)) => {
-            head(&mut w, "200 OK", &format!("Content-Type: {media_type}\r\nDocker-Content-Digest: {digest}\r\n"), bytes.len() as u64)?;
+            head(w, "200 OK", &format!("Content-Type: {media_type}\r\nDocker-Content-Digest: {digest}\r\n"), bytes.len() as u64)?;
             if method == "GET" {
                 w.write_all(&bytes)?;
             }
@@ -394,14 +773,338 @@ fn answer(conn: TcpStream, engine: &Engine) -> io::Result<()> {
         Some(Found::Blob(path, digest)) => {
             let mut f = std::fs::File::open(&path)?;
             let len = f.metadata()?.len();
-            head(&mut w, "200 OK", &format!("Content-Type: application/octet-stream\r\nDocker-Content-Digest: {digest}\r\n"), len)?;
+            head(w, "200 OK", &format!("Content-Type: application/octet-stream\r\nDocker-Content-Digest: {digest}\r\n"), len)?;
             if method == "GET" {
-                io::copy(&mut f, &mut w)?;
+                io::copy(&mut f, w)?;
             }
         }
-        None => head(&mut w, "404 Not Found", "", 0)?,
+        None => head(w, "404 Not Found", "", 0)?,
     }
     w.flush()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_load<R: BufRead, W: Write>(
+    engine: &Engine,
+    nonce: &str,
+    sub: &str,
+    method: &str,
+    query: &str,
+    framing: BodyFraming,
+    expect_continue: bool,
+    r: &mut R,
+    w: &mut W,
+) -> io::Result<()> {
+    let head = |w: &mut W, status: &str, extra: &str, len: u64| write!(w, "HTTP/1.1 {status}\r\nConnection: close\r\nContent-Length: {len}\r\n{extra}\r\n");
+    let Some(slot) = find_load_slot(nonce).filter(|s| !s.closed.load(Ordering::Acquire)) else {
+        head(w, "404 Not Found", "", 0)?;
+        return w.flush();
+    };
+    let send_continue = |w: &mut W| -> io::Result<()> {
+        if expect_continue {
+            w.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
+            w.flush()?;
+        }
+        Ok(())
+    };
+    let base = format!("/v2/load/{}/image", slot.nonce);
+
+    // HEAD /blobs/<digest>: dedup check for blobs already in Kiri's store.
+    if method == "HEAD" && let Some(digest) = sub.strip_prefix("blobs/") {
+        let Ok(hex) = kiri_image::store::digest_hex(digest) else {
+            head(w, "400 Bad Request", "", 0)?;
+            return w.flush();
+        };
+        let valid_digest = format!("sha256:{}", hex.to_ascii_lowercase());
+        let pin = engine.store.pin(&valid_digest);
+        if let Ok(path) = engine.store.blob_path(&valid_digest) && let Ok(meta) = std::fs::metadata(&path) && meta.is_file() {
+            if !slot.record_blob(pin, None) {
+                head(w, "404 Not Found", "", 0)?;
+                return w.flush();
+            }
+            head(w, "200 OK", &format!("Docker-Content-Digest: {valid_digest}\r\n"), meta.len())?;
+            return w.flush();
+        }
+        head(w, "404 Not Found", "", 0)?;
+        return w.flush();
+    }
+
+    // POST /blobs/uploads/ (start chunked upload, cross-repo mount, or monolithic upload).
+    if method == "POST" && matches!(sub, "blobs/uploads/" | "blobs/uploads") {
+        if let Some(expected) = query_param(query, "digest") {
+            let Ok(hex) = kiri_image::store::digest_hex(&expected) else {
+                head(w, "400 Bad Request", "", 0)?;
+                return w.flush();
+            };
+            let expected = format!("sha256:{}", hex.to_ascii_lowercase());
+            send_continue(w)?;
+            let existed = engine.store.blob_path(&expected).is_ok_and(|p| p.is_file());
+            let mut ingest = engine.store.ingest()?;
+            read_http_body(r, framing, &mut ingest, None)?;
+            let (actual, _, pin) = ingest.finish_pinned()?;
+            if actual != expected {
+                drop(pin);
+                let _ = engine.store.remove_if_unused(&actual);
+                head(w, "400 Bad Request", "", 0)?;
+                return w.flush();
+            }
+            if !slot.record_blob(pin, (!existed).then_some(actual)) {
+                head(w, "404 Not Found", "", 0)?;
+                return w.flush();
+            }
+            head(w, "201 Created", &format!("Location: {base}/blobs/{expected}\r\nDocker-Content-Digest: {expected}\r\n"), 0)?;
+            return w.flush();
+        }
+        if let Some(mount) = query_param(query, "mount") && let Ok(hex) = kiri_image::store::digest_hex(&mount) {
+            let mount = format!("sha256:{}", hex.to_ascii_lowercase());
+            let pin = engine.store.pin(&mount);
+            if engine.store.blob_path(&mount).is_ok_and(|p| p.is_file()) {
+                if !slot.record_blob(pin, None) {
+                    head(w, "404 Not Found", "", 0)?;
+                    return w.flush();
+                }
+                head(w, "201 Created", &format!("Location: {base}/blobs/{mount}\r\nDocker-Content-Digest: {mount}\r\n"), 0)?;
+                return w.flush();
+            }
+        }
+        let mut uploads = slot.uploads.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.closed.load(Ordering::Acquire) {
+            drop(uploads);
+            head(w, "404 Not Found", "", 0)?;
+            return w.flush();
+        }
+        if uploads.len() >= MAX_LOAD_UPLOADS {
+            drop(uploads);
+            head(w, "429 Too Many Requests", "", 0)?;
+            return w.flush();
+        }
+        let uuid = super::engine::random_hex(16);
+        let entry = UploadEntry { ingest: engine.store.ingest()?, written: 0 };
+        uploads.insert(uuid.clone(), Arc::new(Mutex::new(Some(entry))));
+        drop(uploads);
+        head(w, "202 Accepted", &format!("Location: {base}/blobs/uploads/{uuid}\r\nDocker-Upload-UUID: {uuid}\r\nRange: 0-0\r\n"), 0)?;
+        return w.flush();
+    }
+
+    // DELETE /blobs/uploads/<uuid>: cancel an in-progress upload.
+    if method == "DELETE" && let Some(uuid) = sub.strip_prefix("blobs/uploads/") && is_hex_id(uuid) {
+        if slot.uploads.lock().unwrap_or_else(|e| e.into_inner()).remove(uuid).is_some() {
+            head(w, "204 No Content", "", 0)?;
+        } else {
+            head(w, "404 Not Found", "", 0)?;
+        }
+        return w.flush();
+    }
+
+    // PATCH /blobs/uploads/<uuid>: stream chunk into an active upload.
+    if method == "PATCH" && let Some(uuid) = sub.strip_prefix("blobs/uploads/") && is_hex_id(uuid) {
+        let Some((id, handle)) = slot
+            .uploads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_key_value(uuid)
+            .map(|(k, v)| (k.clone(), v.clone()))
+        else {
+            head(w, "404 Not Found", "", 0)?;
+            return w.flush();
+        };
+        send_continue(w)?;
+        let mut guard = handle.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.closed.load(Ordering::Acquire) {
+            let _ = guard.take();
+            head(w, "404 Not Found", "", 0)?;
+            return w.flush();
+        }
+        let Some(entry) = guard.as_mut() else {
+            head(w, "404 Not Found", "", 0)?;
+            return w.flush();
+        };
+        let n = read_http_body(r, framing, &mut entry.ingest, None)?;
+        entry.written += n;
+        let end = entry.written.saturating_sub(1);
+        head(w, "202 Accepted", &format!("Location: {base}/blobs/uploads/{id}\r\nDocker-Upload-UUID: {id}\r\nRange: 0-{end}\r\n"), 0)?;
+        return w.flush();
+    }
+
+    // PUT /blobs/uploads/<uuid>?digest=sha256:... : finalize upload into blob store.
+    if method == "PUT" && let Some(uuid) = sub.strip_prefix("blobs/uploads/") && is_hex_id(uuid) {
+        let Some(expected) = query_param(query, "digest").and_then(|d| {
+            kiri_image::store::digest_hex(&d).ok().map(|h| format!("sha256:{}", h.to_ascii_lowercase()))
+        }) else {
+            head(w, "400 Bad Request", "", 0)?;
+            return w.flush();
+        };
+        let Some(handle) = slot.uploads.lock().unwrap_or_else(|e| e.into_inner()).remove(uuid) else {
+            head(w, "404 Not Found", "", 0)?;
+            return w.flush();
+        };
+        let mut guard = handle.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(mut entry) = guard.take() else {
+            head(w, "404 Not Found", "", 0)?;
+            return w.flush();
+        };
+        drop(guard);
+        if slot.closed.load(Ordering::Acquire) {
+            head(w, "404 Not Found", "", 0)?;
+            return w.flush();
+        }
+        send_continue(w)?;
+        read_http_body(r, framing, &mut entry.ingest, None)?;
+        let existed = engine.store.blob_path(&expected).is_ok_and(|p| p.is_file());
+        let (actual, _, pin) = entry.ingest.finish_pinned()?;
+        if actual != expected {
+            drop(pin);
+            let _ = engine.store.remove_if_unused(&actual);
+            head(w, "400 Bad Request", "", 0)?;
+            return w.flush();
+        }
+        if !slot.record_blob(pin, (!existed).then_some(actual)) {
+            head(w, "404 Not Found", "", 0)?;
+            return w.flush();
+        }
+        head(w, "201 Created", &format!("Location: {base}/blobs/{expected}\r\nDocker-Content-Digest: {expected}\r\n"), 0)?;
+        return w.flush();
+    }
+
+    // HEAD /manifests/<ref>: always 404 so BuildKit pushes the final manifest.
+    if method == "HEAD" && let Some(reference) = sub.strip_prefix("manifests/") && !reference.contains('/') {
+        let _ = reference;
+        head(w, "404 Not Found", "", 0)?;
+        return w.flush();
+    }
+
+    // PUT /manifests/<ref>: commit image(s) into Kiri's store.
+    if method == "PUT" && let Some(reference) = sub.strip_prefix("manifests/") && !reference.contains('/') {
+        send_continue(w)?;
+        let mut body = Vec::new();
+        if let Err(e) = read_http_body(r, framing, &mut body, Some(MAX_MANIFEST)) {
+            let status = if e.kind() == io::ErrorKind::FileTooLarge { "413 Payload Too Large" } else { "400 Bad Request" };
+            head(w, status, "", 0)?;
+            return w.flush();
+        }
+        let manifest_digest = kiri_image::store::sha256_digest(&body);
+        if reference.starts_with("sha256:") {
+            if manifest_digest != reference {
+                head(w, "400 Bad Request", "", 0)?;
+                return w.flush();
+            }
+            let mut children = slot.child_manifests.lock().unwrap_or_else(|e| e.into_inner());
+            if children.len() >= MAX_LOAD_CHILD_MANIFESTS && !children.contains_key(&manifest_digest) {
+                drop(children);
+                head(w, "429 Too Many Requests", "", 0)?;
+                return w.flush();
+            }
+            children.insert(manifest_digest.clone(), body);
+            drop(children);
+            head(w, "201 Created", &format!("Docker-Content-Digest: {manifest_digest}\r\n"), 0)?;
+            return w.flush();
+        }
+        match commit_load_manifest(engine, &slot, &body) {
+            Ok(()) => {
+                head(w, "201 Created", &format!("Docker-Content-Digest: {manifest_digest}\r\n"), 0)?;
+                return w.flush();
+            }
+            Err(e) => {
+                crate::diag::warn!("build mirror image commit failed", error = e);
+                head(w, "400 Bad Request", "", 0)?;
+                return w.flush();
+            }
+        }
+    }
+
+    head(w, "405 Method Not Allowed", "", 0)?;
+    w.flush()
+}
+
+fn layer_media_type(path: &std::path::Path) -> &'static str {
+    let mut magic = [0u8; 4];
+    let n = std::fs::File::open(path).and_then(|mut f| f.read(&mut magic)).unwrap_or(0);
+    match &magic[..n] {
+        [0x1f, 0x8b, ..] => "application/vnd.oci.image.layer.v1.tar+gzip",
+        [0x28, 0xb5, 0x2f, 0xfd] => "application/vnd.oci.image.layer.v1.tar+zstd",
+        _ => "application/vnd.oci.image.layer.v1.tar",
+    }
+}
+
+fn commit_load_manifest(engine: &Engine, slot: &LoadSlot, raw: &[u8]) -> io::Result<()> {
+    if slot.closed.load(Ordering::Acquire) {
+        return Err(io::Error::new(io::ErrorKind::BrokenPipe, "load session closed"));
+    }
+    let parsed: Value = serde_json::from_slice(raw).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("manifest JSON: {e}")))?;
+    // If BuildKit pushed an OCI image index (e.g. with attestations), resolve
+    // the matching platform image manifest from the previously pushed children.
+    let manifest: Value = if let Some(list) = parsed["manifests"].as_array() {
+        let host = Platform::host_linux();
+        let is_image = |m: &&Value| {
+            let ref_type = m["annotations"]["vnd.docker.reference.type"].as_str();
+            let os = m["platform"]["os"].as_str().unwrap_or("linux");
+            let arch = m["platform"]["architecture"].as_str().unwrap_or("");
+            ref_type != Some("attestation-manifest") && os != "unknown" && arch != "unknown"
+        };
+        let chosen = list
+            .iter()
+            .filter(is_image)
+            .find(|m| {
+                m["platform"]["os"].as_str() == Some(host.os.as_str())
+                    && m["platform"]["architecture"].as_str() == Some(host.architecture.as_str())
+            })
+            .or_else(|| list.iter().find(is_image))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "image index contains no runnable manifest"))?;
+        let digest = chosen["digest"].as_str().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "index entry missing digest"))?;
+        let children = slot.child_manifests.lock().unwrap_or_else(|e| e.into_inner());
+        let child_bytes = children.get(digest).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("missing child manifest {digest}")))?;
+        serde_json::from_slice(child_bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("child manifest JSON: {e}")))?
+    } else {
+        parsed
+    };
+
+    let config_digest = manifest["config"]["digest"]
+        .as_str()
+        .filter(|d| kiri_image::store::digest_hex(d).is_ok())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "manifest missing config digest"))?
+        .to_owned();
+    let mut extra_pins = vec![engine.store.pin(&config_digest)];
+    let config_bytes = engine.store.read_config(&config_digest)?;
+    let config_json: Value = serde_json::from_slice(&config_bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("image config: {e}")))?;
+
+    let mut layers = Vec::new();
+    let mut used = vec![config_digest.clone()];
+    for l in manifest["layers"].as_array().into_iter().flatten() {
+        let digest = l["digest"]
+            .as_str()
+            .filter(|d| kiri_image::store::digest_hex(d).is_ok())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "layer missing digest"))?
+            .to_owned();
+        extra_pins.push(engine.store.pin(&digest));
+        let path = engine.store.blob_path(&digest)?;
+        let size = std::fs::metadata(&path)?.len();
+        let media_type = l["mediaType"]
+            .as_str()
+            .filter(|m| !m.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| layer_media_type(&path).to_owned());
+        used.push(digest.clone());
+        layers.push(Layer { digest, size, media_type });
+    }
+
+    let mut pins = slot.pins.lock().unwrap_or_else(|e| e.into_inner());
+    if slot.closed.load(Ordering::Acquire) {
+        return Err(io::Error::new(io::ErrorKind::BrokenPipe, "load session closed"));
+    }
+    let target_tags = slot.target_tags.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let names = if target_tags.is_empty() { vec![config_digest.clone()] } else { target_tags };
+    for name in &names {
+        let img = kiri_image::archive::from_config(name.clone(), &config_digest, &config_json, layers.clone());
+        engine.store.put_image(img)?;
+        if !name.starts_with("sha256:") {
+            engine.emit_image("tag", &config_digest, name);
+        }
+    }
+    engine.prune_layers();
+    pins.extend(extra_pins);
+    slot.used_digests.lock().unwrap_or_else(|e| e.into_inner()).extend(used);
+    *slot.committed_digest.lock().unwrap_or_else(|e| e.into_inner()) = Some(config_digest);
+    Ok(())
 }
 
 const OCI_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
@@ -805,5 +1508,160 @@ mod tests {
         for bad in ["evil\".com/x:1", "evil\\com/x:1", "host/x:ta\"g", "host/x?y:1", "h#x/y:1"] {
             assert!(kiri_image::Reference::parse(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn load_session_accepts_oci_push_and_cleans_up_aborted_blobs() {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("kiri-mirror-load-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = kiri_image::Store::open(&dir).unwrap();
+        let engine = Engine::boot(store).unwrap();
+
+        let send = |req: &[u8]| -> String {
+            let mut r = BufReader::new(io::Cursor::new(req));
+            let mut w = Vec::new();
+            answer_stream(&mut r, &mut w, &engine).unwrap();
+            String::from_utf8(w).unwrap()
+        };
+
+        // /v2/ ping answers 200.
+        assert!(send(b"GET /v2/ HTTP/1.1\r\nHost: d\r\n\r\n").starts_with("HTTP/1.1 200 OK"));
+
+        // Seed an existing base layer to test HEAD dedup.
+        let mut bw = engine.store.ingest().unwrap();
+        bw.write_all(b"base-layer").unwrap();
+        let (base_digest, _) = bw.finish().unwrap();
+
+        let session = LoadSession::new(engine.clone(), vec!["probe-incontainer:latest".into(), "probe-alias:1".into()]);
+        let prefix = format!("/v2/load/{}/image", session.nonce);
+
+        // HEAD for existing base blob -> 200; missing blob -> 404.
+        let head_ok = send(format!("HEAD {prefix}/blobs/{base_digest} HTTP/1.1\r\nHost: d\r\n\r\n").as_bytes());
+        assert!(head_ok.starts_with("HTTP/1.1 200 OK"), "{head_ok}");
+        let missing = format!("sha256:{}", "0".repeat(64));
+        assert!(send(format!("HEAD {prefix}/blobs/{missing} HTTP/1.1\r\nHost: d\r\n\r\n").as_bytes()).starts_with("HTTP/1.1 404 "));
+
+        // Push a new layer via POST + PATCH (chunked) + PUT with percent-encoded digest.
+        let new_layer = b"hello-new-layer";
+        let new_digest = kiri_image::store::sha256_digest(new_layer);
+        let started = send(format!("POST {prefix}/blobs/uploads/ HTTP/1.1\r\nHost: d\r\nContent-Length: 0\r\n\r\n").as_bytes());
+        assert!(started.starts_with("HTTP/1.1 202 Accepted"), "{started}");
+        let loc = started.lines().find_map(|l| l.strip_prefix("Location: ")).unwrap().trim().to_owned();
+        let patch_req = format!(
+            "PATCH {loc} HTTP/1.1\r\nHost: d\r\nTransfer-Encoding: chunked\r\n\r\n6\r\nhello-\r\n0\r\n\r\n"
+        );
+        let patched = send(patch_req.as_bytes());
+        assert!(patched.starts_with("HTTP/1.1 202 Accepted"), "{patched}");
+        let enc_digest = new_digest.replace(':', "%3A");
+        let mut put_req = format!("PUT {loc}?digest={enc_digest} HTTP/1.1\r\nHost: d\r\nContent-Length: 9\r\n\r\n").into_bytes();
+        put_req.extend_from_slice(b"new-layer");
+        let finished = send(&put_req);
+        assert!(finished.starts_with("HTTP/1.1 201 Created"), "{finished}");
+
+        // Push image config via monolithic POST ?digest=...
+        let cfg = serde_json::to_vec(&json!({
+            "os": "linux",
+            "architecture": "amd64",
+            "created": "2026-11-24T00:00:00Z",
+            "config": {"Cmd": ["sh"]},
+            "rootfs": {"type": "layers", "diff_ids": [base_digest, new_digest]}
+        }))
+        .unwrap();
+        let cfg_digest = kiri_image::store::sha256_digest(&cfg);
+        let mut cfg_req = format!(
+            "POST {prefix}/blobs/uploads/?digest={} HTTP/1.1\r\nHost: d\r\nContent-Length: {}\r\n\r\n",
+            cfg_digest.replace(':', "%3A"),
+            cfg.len()
+        )
+        .into_bytes();
+        cfg_req.extend_from_slice(&cfg);
+        assert!(send(&cfg_req).starts_with("HTTP/1.1 201 Created"));
+
+        // Push child platform manifest by digest, then OCI index with an attestation entry.
+        let child = serde_json::to_vec(&json!({
+            "schemaVersion": 2,
+            "mediaType": OCI_MANIFEST,
+            "config": {"mediaType": "application/vnd.oci.image.config.v1+json", "digest": cfg_digest, "size": cfg.len()},
+            "layers": [
+                {"mediaType": "application/vnd.oci.image.layer.v1.tar", "digest": base_digest, "size": 10},
+                {"mediaType": "application/vnd.oci.image.layer.v1.tar", "digest": new_digest, "size": new_layer.len()},
+            ]
+        }))
+        .unwrap();
+        let child_digest = kiri_image::store::sha256_digest(&child);
+        let mut child_req = format!("PUT {prefix}/manifests/{child_digest} HTTP/1.1\r\nHost: d\r\nContent-Length: {}\r\n\r\n", child.len()).into_bytes();
+        child_req.extend_from_slice(&child);
+        assert!(send(&child_req).starts_with("HTTP/1.1 201 Created"));
+
+        let index = serde_json::to_vec(&json!({
+            "schemaVersion": 2,
+            "mediaType": OCI_INDEX,
+            "manifests": [
+                {"mediaType": OCI_MANIFEST, "digest": child_digest, "size": child.len(), "platform": {"os": "linux", "architecture": "amd64"}},
+                {"mediaType": OCI_MANIFEST, "digest": missing, "size": 12, "platform": {"os": "unknown", "architecture": "unknown"}, "annotations": {"vnd.docker.reference.type": "attestation-manifest"}},
+            ]
+        }))
+        .unwrap();
+        let mut idx_req = format!("PUT {prefix}/manifests/out HTTP/1.1\r\nHost: d\r\nContent-Length: {}\r\n\r\n", index.len()).into_bytes();
+        idx_req.extend_from_slice(&index);
+        assert!(send(&idx_req).starts_with("HTTP/1.1 201 Created"));
+
+        assert_eq!(session.committed_digest().as_deref(), Some(cfg_digest.as_str()));
+        let img1 = engine.store.find("probe-incontainer:latest").unwrap().expect("tagged image stored");
+        let img2 = engine.store.find("probe-alias:1").unwrap().expect("second tag stored");
+        assert_eq!(img1.config_digest, cfg_digest);
+        assert_eq!(img2.config_digest, cfg_digest);
+        assert!(serve_tag(&img1), "locally built image must be served by mirror for subsequent FROM");
+        drop(session);
+
+        // Nonce is invalid after drop.
+        assert!(send(format!("HEAD {prefix}/blobs/{base_digest} HTTP/1.1\r\nHost: d\r\n\r\n").as_bytes()).starts_with("HTTP/1.1 404 "));
+
+        // Aborted session cleans up its uncommitted uploaded blob on drop.
+        let aborted = LoadSession::new(engine.clone(), vec!["never-committed:1".into()]);
+        let aprefix = format!("/v2/load/{}/image", aborted.nonce);
+        let orphan = b"orphan-uncommitted-blob";
+        let orphan_digest = kiri_image::store::sha256_digest(orphan);
+        let mut oreq = format!(
+            "POST {aprefix}/blobs/uploads/?digest={} HTTP/1.1\r\nHost: d\r\nContent-Length: {}\r\n\r\n",
+            orphan_digest.replace(':', "%3A"),
+            orphan.len()
+        )
+        .into_bytes();
+        oreq.extend_from_slice(orphan);
+        assert!(send(&oreq).starts_with("HTTP/1.1 201 Created"));
+        assert!(engine.store.blob_path(&orphan_digest).unwrap().is_file());
+        drop(aborted);
+        assert!(!engine.store.blob_path(&orphan_digest).unwrap().exists(), "aborted session blob must be removed on drop");
+
+        // Untagged LoadSession stores image under its config_digest, DELETE cancels upload,
+        // and invalid digests / path-traversal / conflicting framing are rejected.
+        let untagged = LoadSession::new(engine.clone(), Vec::new());
+        let uprefix = format!("/v2/load/{}/image", untagged.nonce);
+        // Invalid digests and path-traversal attempts on HEAD are rejected with 400 (never touch filesystem).
+        assert!(send(format!("HEAD {uprefix}/blobs/sha256:../../etc/passwd HTTP/1.1\r\nHost: d\r\n\r\n").as_bytes()).starts_with("HTTP/1.1 400 "));
+        assert!(send(format!("HEAD {uprefix}/blobs/notadigest HTTP/1.1\r\nHost: d\r\n\r\n").as_bytes()).starts_with("HTTP/1.1 400 "));
+        // Conflicting Content-Length and Transfer-Encoding is rejected with 400.
+        assert!(
+            send(format!("POST {uprefix}/blobs/uploads/ HTTP/1.1\r\nHost: d\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n").as_bytes())
+                .starts_with("HTTP/1.1 400 ")
+        );
+        // DELETE cancels an active upload.
+        let started2 = send(format!("POST {uprefix}/blobs/uploads/ HTTP/1.1\r\nHost: d\r\nContent-Length: 0\r\n\r\n").as_bytes());
+        let loc2 = started2.lines().find_map(|l| l.strip_prefix("Location: ")).unwrap().trim().to_owned();
+        assert!(send(format!("DELETE {loc2} HTTP/1.1\r\nHost: d\r\n\r\n").as_bytes()).starts_with("HTTP/1.1 204 "));
+        assert!(send(format!("DELETE {loc2} HTTP/1.1\r\nHost: d\r\n\r\n").as_bytes()).starts_with("HTTP/1.1 404 "));
+        // Commit single-platform manifest directly into untagged session.
+        let mut ureq = format!("PUT {uprefix}/manifests/out HTTP/1.1\r\nHost: d\r\nContent-Length: {}\r\n\r\n", child.len()).into_bytes();
+        ureq.extend_from_slice(&child);
+        assert!(send(&ureq).starts_with("HTTP/1.1 201 Created"));
+        assert_eq!(untagged.committed_digest().as_deref(), Some(cfg_digest.as_str()));
+        assert!(engine.store.find(&cfg_digest).unwrap().is_some(), "untagged image stored under config digest");
+        drop(untagged);
+
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
