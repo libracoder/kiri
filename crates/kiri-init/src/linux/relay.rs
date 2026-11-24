@@ -346,11 +346,28 @@ fn connect(ip: [u8; 4], port: u16) -> io::Result<OwnedFd> {
     }
 }
 
-/// The reverse direction, for `host.docker.internal`: TCP connections a
-/// container makes to the reserved host address are redirected here.
+/// The reverse direction, for `host.docker.internal` and loopback-published
+/// ports: TCP connections a container makes to the reserved host address or
+/// (from the VM itself) to a port published on the Mac's loopback (`127.0.0.1`
+/// or `::1`) are redirected here. Dual-stack (`[::]` with `IPV6_V6ONLY = 0`),
+/// falling back to `AF_INET` only if the kernel has no IPv6.
 pub fn listen_host_bound(port: u16) -> io::Result<OwnedFd> {
     // SAFETY: plain socket setup; the fd is owned immediately.
     unsafe {
+        let fd = libc::socket(libc::AF_INET6, libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK, 0);
+        if fd >= 0 {
+            let sock = OwnedFd::from_raw_fd(fd as RawFd);
+            let zero: libc::c_int = 0;
+            sys::check(libc::setsockopt(sock.as_raw_fd(), libc::IPPROTO_IPV6, libc::IPV6_V6ONLY, (&zero as *const libc::c_int).cast(), 4) as _, "v6only")?;
+            let one: libc::c_int = 1;
+            libc::setsockopt(sock.as_raw_fd(), libc::SOL_SOCKET, libc::SO_REUSEADDR, (&one as *const libc::c_int).cast(), 4);
+            let mut a: libc::sockaddr_in6 = std::mem::zeroed();
+            a.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+            a.sin6_port = port.to_be();
+            sys::check(libc::bind(sock.as_raw_fd(), (&a as *const libc::sockaddr_in6).cast(), std::mem::size_of::<libc::sockaddr_in6>() as u32) as _, "bind")?;
+            sys::check(libc::listen(sock.as_raw_fd(), 128) as _, "listen")?;
+            return Ok(sock);
+        }
         let fd = sys::check(libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK, 0) as _, "socket")?;
         let sock = OwnedFd::from_raw_fd(fd as RawFd);
         let one: libc::c_int = 1;
@@ -369,11 +386,11 @@ pub const HOST_VSOCK_PORT: u32 = 1026;
 
 /// Accepts one redirected connection, finds the port the container meant,
 /// dials the Mac and returns a relay between the two. Only connections that
-/// were redirected from `host_addr`, or from 127.0.0.1 on another port (a
-/// port published on the Mac's loopback, which only the VM's own output
+/// were redirected from `host_addr`, or from 127.0.0.1 / ::1 on another port
+/// (a port published on the Mac's loopback, which only the VM's own output
 /// chain redirects), are relayed: one made to the listener directly (from
-/// the LAN, or from a `--network host` container dialling `127.0.0.1:relay_port`)
-/// would reach the host's loopback.
+/// the LAN, or from a `--network host` container dialling `127.0.0.1:relay_port`
+/// or `[::1]:relay_port`) would reach the host's loopback.
 pub fn accept_host_bound(listener: &OwnedFd, host_addr: [u8; 4], relay_port: u16) -> Option<Relay> {
     // SAFETY: accept4 on a listening socket we own; the fd is owned immediately.
     let fd = unsafe { libc::accept4(listener.as_raw_fd(), std::ptr::null_mut(), std::ptr::null_mut(), libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC) };
@@ -382,19 +399,8 @@ pub fn accept_host_bound(listener: &OwnedFd, host_addr: [u8; 4], relay_port: u16
     }
     // SAFETY: `fd` is a fresh descriptor that nothing else owns.
     let client = unsafe { OwnedFd::from_raw_fd(fd) };
-    // SAFETY: SO_ORIGINAL_DST fills a sockaddr_in with the pre-redirect destination.
-    let port = unsafe {
-        let mut dst: libc::sockaddr_in = std::mem::zeroed();
-        let mut len = std::mem::size_of::<libc::sockaddr_in>() as u32;
-        const SO_ORIGINAL_DST: libc::c_int = 80;
-        if libc::getsockopt(client.as_raw_fd(), libc::SOL_IP, SO_ORIGINAL_DST, (&mut dst as *mut libc::sockaddr_in).cast(), &mut len) != 0 {
-            return Some(Relay::dead_one(client));
-        }
-        let dst_port = u16::from_be(dst.sin_port);
-        if !redirected_from(dst.sin_addr.s_addr.to_ne_bytes(), dst_port, host_addr, relay_port) {
-            return Some(Relay::dead_one(client));
-        }
-        dst_port
+    let Some(port) = original_dst_port(client.as_raw_fd(), host_addr, relay_port) else {
+        return Some(Relay::dead_one(client));
     };
     let Ok(host) = dial_host(HOST_VSOCK_PORT) else { return Some(Relay::dead_one(client)) };
     // The Mac connects to its own loopback: services bound to 127.0.0.1 work.
@@ -420,6 +426,29 @@ pub fn accept_host_bound(listener: &OwnedFd, host_addr: [u8; 4], relay_port: u16
     })
 }
 
+/// Pre-redirect destination port of an accepted `host_bound` connection, if
+/// it came from one of Kiri's IPv4 (`SOL_IP` / `SO_ORIGINAL_DST`) or IPv6
+/// (`SOL_IPV6` / `IP6T_SO_ORIGINAL_DST`) redirect rules.
+fn original_dst_port(fd: RawFd, host_addr: [u8; 4], relay_port: u16) -> Option<u16> {
+    const SO_ORIGINAL_DST: libc::c_int = 80; // also IP6T_SO_ORIGINAL_DST on SOL_IPV6
+    // SAFETY: SO_ORIGINAL_DST / IP6T_SO_ORIGINAL_DST fill sockaddr_in / sockaddr_in6.
+    unsafe {
+        let mut dst: libc::sockaddr_in = std::mem::zeroed();
+        let mut len = std::mem::size_of::<libc::sockaddr_in>() as u32;
+        if libc::getsockopt(fd, libc::SOL_IP, SO_ORIGINAL_DST, (&mut dst as *mut libc::sockaddr_in).cast(), &mut len) == 0 {
+            let dst_port = u16::from_be(dst.sin_port);
+            return redirected_from(dst.sin_addr.s_addr.to_ne_bytes(), dst_port, host_addr, relay_port).then_some(dst_port);
+        }
+        let mut dst6: libc::sockaddr_in6 = std::mem::zeroed();
+        let mut len6 = std::mem::size_of::<libc::sockaddr_in6>() as u32;
+        if libc::getsockopt(fd, libc::SOL_IPV6, SO_ORIGINAL_DST, (&mut dst6 as *mut libc::sockaddr_in6).cast(), &mut len6) == 0 {
+            let dst_port = u16::from_be(dst6.sin6_port);
+            return redirected_from6(dst6.sin6_addr.s6_addr, dst_port, relay_port).then_some(dst_port);
+        }
+        None
+    }
+}
+
 /// Whether a host-bound connection's original destination is one the
 /// redirect rules send to the relay: the host's reserved address, or the
 /// VM's loopback on another port (published ports only, see
@@ -427,6 +456,13 @@ pub fn accept_host_bound(listener: &OwnedFd, host_addr: [u8; 4], relay_port: u16
 /// indistinguishable from a direct, non-redirected connection).
 fn redirected_from(dst: [u8; 4], dst_port: u16, host_addr: [u8; 4], relay_port: u16) -> bool {
     dst == host_addr || (dst == super::netlink::LOOPBACK && dst_port != relay_port)
+}
+
+/// The IPv6 counterpart of `redirected_from`: the VM's `::1` loopback on a
+/// published port (`loopback_published_rule6`), never `relay_port` itself or
+/// any other IPv6 address.
+fn redirected_from6(dst: [u8; 16], dst_port: u16, relay_port: u16) -> bool {
+    dst == super::netlink::LOOPBACK6 && dst_port != relay_port
 }
 
 fn dial_host(port: u32) -> io::Result<OwnedFd> {
@@ -595,8 +631,9 @@ mod tests {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
     /// The host relay takes connections redirected from the host's address
-    /// and from the VM's loopback on another port (published ports), never
-    /// direct connections to the relay's own port or other addresses.
+    /// and from the VM's loopback (`127.0.0.1` and `::1`) on another port
+    /// (published ports), never direct connections to the relay's own port or
+    /// other addresses.
     #[test]
     fn the_host_relay_takes_the_host_address_and_loopback() {
         let host = [198, 19, 248, 254];
@@ -608,6 +645,19 @@ mod tests {
         for other in [[192, 168, 64, 2], [172, 17, 0, 1], [127, 0, 0, 2], [0, 0, 0, 0]] {
             assert!(!super::redirected_from(other, 5999, host, relay), "{other:?}");
             assert!(!super::redirected_from(other, relay, host, relay), "{other:?}");
+        }
+        let lo6 = super::super::netlink::LOOPBACK6;
+        assert!(super::redirected_from6(lo6, 5999, relay));
+        assert!(!super::redirected_from6(lo6, relay, relay), "direct ::1 connection to the relay");
+        for other6 in [
+            [0; 16],
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 127, 0, 0, 1],
+            [0xfd, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1],
+            [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        ] {
+            assert!(!super::redirected_from6(other6, 5999, relay), "{other6:?}");
+            assert!(!super::redirected_from6(other6, relay, relay), "{other6:?}");
         }
     }
 

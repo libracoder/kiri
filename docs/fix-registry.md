@@ -34,7 +34,7 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 - Fixes: #732 macOS: `--network host` containers have no DNS and can't reach ports published on 127.0.0.1, so a host-network BuildKit can't push to a local registry
 - Caused: none known
 - Caused by: -
-- Check: `hostnet-published-loopback`, `hostnet-published-every-address`, `hostnet-published-gone`, `hostnet-dns-kiri`, `hostnet-dns-names`
+- Check: `hostnet-published-loopback`, `hostnet-published-localhost`, `hostnet-published-every-address`, `hostnet-published-gone`, `hostnet-dns-kiri`, `hostnet-dns-names`
 
 ### #402 Guest kernel: drop stale cached bind-mount file dentries on host change (unreleased)
 - Fixes: #399 macOS: bind-mounted files deleted or replaced on the Mac return ENOENT or stale cached contents until Apple's cache timeout

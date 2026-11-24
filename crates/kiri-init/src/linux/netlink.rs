@@ -830,7 +830,15 @@ fn localnet_guard() -> Vec<Msg> {
 /// VM's address, a container dialling its gateway) never reached the Mac;
 /// now it is not even accepted. Redirected connections are DNATed and pass.
 fn host_relay_guard(port: u16) -> Msg {
-    let mut rule = nft(NFT_MSG_NEWRULE, NLM_F_ACK | NLM_F_CREATE | 0x800);
+    host_relay_guard_in(libc::NFPROTO_IPV4 as u8, port)
+}
+
+fn host_relay_guard6(port: u16) -> Msg {
+    host_relay_guard_in(libc::NFPROTO_IPV6 as u8, port)
+}
+
+fn host_relay_guard_in(family: u8, port: u16) -> Msg {
+    let mut rule = nft_in(family, NFT_MSG_NEWRULE, NLM_F_ACK | NLM_F_CREATE | 0x800);
     rule.attr_str(1, "kiri").attr_str(2, "input");
     rule.nest(4);
     // meta l4proto => reg 1; cmp eq tcp
@@ -885,8 +893,9 @@ fn masq6_rule(subnet: [u8; 16], prefix: u8) -> Msg {
     rule
 }
 
-/// Kiri's IPv6 table, for the IPv6 networks `subnets`, rebuilt whole (and
-/// removed with the last one, so an engine with none has no IPv6 rules):
+/// Kiri's IPv6 table, for the IPv6 networks `subnets` and (in the VM, when
+/// `redirect` is true) the `::1` loopback redirect for published ports and
+/// the input guard on `host_port`, rebuilt whole:
 ///
 /// ```text
 /// table ip6 kiri {
@@ -894,9 +903,15 @@ fn masq6_rule(subnet: [u8; 16], prefix: u8) -> Msg {
 ///     ip6 saddr <subnet> oifname != "kiri*" masquerade   # one per network
 ///   }
 ///   chain forward { … }   (the IPv4 table's `forward_filter`)
+///   chain input   { type filter hook input priority 0;
+///     tcp dport <host_port> ct status & dnat == 0 drop
+///   }
+///   chain output  { type nat hook output priority -100;
+///     ip6 daddr ::1 tcp dport <port> redirect to :<host_port>
+///   }
 /// }
 /// ```
-pub fn install_nat6(subnets: &[([u8; 16], u8)], bridges: &[String]) -> io::Result<()> {
+pub fn install_nat6(subnets: &[([u8; 16], u8)], bridges: &[String], host_port: u16, redirect: bool, dnat: &[Dnat]) -> io::Result<()> {
     let v6 = libc::NFPROTO_IPV6 as u8;
     let mut nl = Netlink::open(libc::NETLINK_NETFILTER)?;
     let mut begin = Msg::new(NFNL_MSG_BATCH_BEGIN, 0);
@@ -905,17 +920,33 @@ pub fn install_nat6(subnets: &[([u8; 16], u8)], bridges: &[String]) -> io::Resul
     let mut end = Msg::new(NFNL_MSG_BATCH_END, 0);
     end.raw(&nfgen(libc::AF_UNSPEC as u8, NFNL_SUBSYS_NFTABLES));
     let mut msgs = vec![begin, add, delete];
-    if !subnets.is_empty() {
+    if !subnets.is_empty() || redirect {
         let mut table = nft_in(v6, NFT_MSG_NEWTABLE, NLM_F_ACK | NLM_F_CREATE);
         table.attr_str(1, "kiri");
+        msgs.push(table);
+    }
+    if !subnets.is_empty() {
         let mut chain = nft_in(v6, NFT_MSG_NEWCHAIN, NLM_F_ACK | NLM_F_CREATE);
         chain.attr_str(1, "kiri").attr_str(3, "postrouting");
         chain.nest(4).attr_be32(1, 4).attr_be32(2, 100).end();
         chain.attr_be32(5, 1).attr_str(7, "nat");
-        msgs.push(table);
         msgs.push(chain);
         msgs.extend(subnets.iter().map(|(s, p)| masq6_rule(*s, *p)));
         msgs.extend(forward_filter_in(v6, bridges, forward_guard(v6).as_deref()));
+    }
+    if redirect {
+        let mut input = nft_in(v6, NFT_MSG_NEWCHAIN, NLM_F_ACK | NLM_F_CREATE);
+        input.attr_str(1, "kiri").attr_str(3, "input");
+        input.nest(4).attr_be32(1, 1).attr_be32(2, 0).end(); // NF_INET_LOCAL_IN, priority 0
+        input.attr_be32(5, 1).attr_str(7, "filter");
+        let mut output = nft_in(v6, NFT_MSG_NEWCHAIN, NLM_F_ACK | NLM_F_CREATE);
+        output.attr_str(1, "kiri").attr_str(3, "output");
+        output.nest(4).attr_be32(1, 3).attr_be32(2, -100i32 as u32).end(); // NF_INET_LOCAL_OUT, priority -100
+        output.attr_be32(5, 1).attr_str(7, "nat");
+        msgs.extend([input, host_relay_guard6(host_port), output]);
+        for d in dnat.iter().filter(|d| !d.udp && d.host_ip == LOOPBACK && d.host_port != host_port) {
+            msgs.push(loopback_published_rule6(d.host_port, host_port));
+        }
     }
     msgs.push(end);
     nl.request(&mut msgs)
@@ -1189,8 +1220,9 @@ pub fn install_nat_from(uplink_index: i32, host_addr: [u8; 4], host_port: u16, r
 }
 
 /// A published port's `host_ip` in the VM that means "the Mac's loopback":
-/// the VM's own connections to 127.0.0.1 on it reach the Mac's 127.0.0.1.
+/// the VM's own connections to 127.0.0.1 or ::1 on it reach the Mac's 127.0.0.1.
 pub const LOOPBACK: [u8; 4] = [127, 0, 0, 1];
+pub const LOOPBACK6: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
 
 /// `ip daddr 127.0.0.1 tcp dport <port> redirect to :<relay>`, in output:
 /// in the VM, a connection the VM itself makes (a `--network host`
@@ -1200,15 +1232,28 @@ pub const LOOPBACK: [u8; 4] = [127, 0, 0, 1];
 /// published port is bound in the host's own network namespace. The
 /// redirect stays on the loopback, so `route_localnet` stays off.
 fn loopback_published_rule(port: u16, relay: u16) -> Msg {
-    let mut rule = nft(NFT_MSG_NEWRULE, NLM_F_ACK | NLM_F_CREATE | 0x800);
+    loopback_published_rule_in(libc::NFPROTO_IPV4 as u8, 16, &LOOPBACK, port, relay)
+}
+
+/// `ip6 daddr ::1 tcp dport <port> redirect to :<relay>`, in output of
+/// `table ip6 kiri`: the IPv6 counterpart of `loopback_published_rule`, so
+/// clients in a `--network host` container that resolve `localhost` to `::1`
+/// first (musl's `getaddrinfo`) and do not fall back to `127.0.0.1` reach
+/// the Mac's loopback-published port too.
+fn loopback_published_rule6(port: u16, relay: u16) -> Msg {
+    loopback_published_rule_in(libc::NFPROTO_IPV6 as u8, 24, &LOOPBACK6, port, relay)
+}
+
+fn loopback_published_rule_in(family: u8, daddr_offset: u32, loopback: &[u8], port: u16, relay: u16) -> Msg {
+    let mut rule = nft_in(family, NFT_MSG_NEWRULE, NLM_F_ACK | NLM_F_CREATE | 0x800);
     rule.attr_str(1, "kiri").attr_str(2, "output");
     rule.nest(4);
     // meta l4proto => reg 1; cmp eq tcp
     rule.nest(1).attr_str(1, "meta").nest(2).attr_be32(1, 1).attr_be32(2, 16).end().end();
     rule.nest(1).attr_str(1, "cmp").nest(2).attr_be32(1, 1).attr_be32(2, 0).nest(3).attr(1, &[libc::IPPROTO_TCP as u8]).end().end().end();
-    // payload daddr => reg 1; cmp eq 127.0.0.1
-    rule.nest(1).attr_str(1, "payload").nest(2).attr_be32(1, 1).attr_be32(2, 1).attr_be32(3, 16).attr_be32(4, 4).end().end();
-    rule.nest(1).attr_str(1, "cmp").nest(2).attr_be32(1, 1).attr_be32(2, 0).nest(3).attr(1, &LOOPBACK).end().end().end();
+    // payload daddr => reg 1; cmp eq loopback (127.0.0.1 or ::1)
+    rule.nest(1).attr_str(1, "payload").nest(2).attr_be32(1, 1).attr_be32(2, 1).attr_be32(3, daddr_offset).attr_be32(4, loopback.len() as u32).end().end();
+    rule.nest(1).attr_str(1, "cmp").nest(2).attr_be32(1, 1).attr_be32(2, 0).nest(3).attr(1, loopback).end().end().end();
     // payload transport header + 2 (dport) => reg 1; cmp eq port
     rule.nest(1).attr_str(1, "payload").nest(2).attr_be32(1, 1).attr_be32(2, 2).attr_be32(3, 2).attr_be32(4, 2).end().end();
     rule.nest(1).attr_str(1, "cmp").nest(2).attr_be32(1, 1).attr_be32(2, 0).nest(3).attr(1, &port.to_be_bytes()).end().end().end();
@@ -1415,10 +1460,11 @@ mod tests {
     }
 
     /// In the VM, a port published on the Mac's loopback: the VM's own TCP
-    /// connections to 127.0.0.1 on it, in output, go to the host relay.
+    /// connections to 127.0.0.1 or ::1 on it, in output, go to the host relay.
     #[test]
     fn a_loopback_published_port_redirects_the_vms_own_connections_to_the_relay() {
         let r = loopback_published_rule(5999, 1026);
+        assert_eq!(r.buf[16], libc::NFPROTO_IPV4 as u8);
         let top = attrs(&r.buf[20..]);
         assert_eq!(get(&top, 2), b"output\0", "the VM's own connections only, not the bridges'");
         assert_eq!(names(&r), ["meta", "cmp", "payload", "cmp", "payload", "cmp", "immediate", "redir"]);
@@ -1431,22 +1477,38 @@ mod tests {
         assert_eq!((be32(get(&e[4].1, 2)), be32(get(&e[4].1, 3)), be32(get(&e[4].1, 4))), (2, 2, 2));
         assert_eq!(get(&attrs(get(&e[5].1, 3)), 1), &5999u16.to_be_bytes());
         assert_eq!(get(&attrs(get(&e[6].1, 2)), 1), &1026u16.to_be_bytes(), "redirected to the relay's port");
+
+        let r6 = loopback_published_rule6(5999, 1026);
+        assert_eq!(r6.buf[16], libc::NFPROTO_IPV6 as u8);
+        let top6 = attrs(&r6.buf[20..]);
+        assert_eq!(get(&top6, 2), b"output\0");
+        assert_eq!(names(&r6), ["meta", "cmp", "payload", "cmp", "payload", "cmp", "immediate", "redir"]);
+        let e6 = exprs(&r6);
+        assert_eq!(get(&attrs(get(&e6[1].1, 3)), 1), &[libc::IPPROTO_TCP as u8]);
+        // network header + 24, 16 bytes: ip6 daddr, which must be ::1
+        assert_eq!((be32(get(&e6[2].1, 2)), be32(get(&e6[2].1, 3)), be32(get(&e6[2].1, 4))), (1, 24, 16));
+        assert_eq!(get(&attrs(get(&e6[3].1, 3)), 1), &LOOPBACK6);
+        assert_eq!((be32(get(&e6[4].1, 2)), be32(get(&e6[4].1, 3)), be32(get(&e6[4].1, 4))), (2, 2, 2));
+        assert_eq!(get(&attrs(get(&e6[5].1, 3)), 1), &5999u16.to_be_bytes());
+        assert_eq!(get(&attrs(get(&e6[6].1, 2)), 1), &1026u16.to_be_bytes());
     }
 
     #[test]
     fn host_relay_takes_only_redirected_connections() {
-        let r = host_relay_guard(1026);
-        let top = attrs(&r.buf[20..]);
-        assert_eq!(get(&top, 2), b"input\0", "guards every incoming interface, loopback included");
-        assert_eq!(names(&r), ["meta", "cmp", "payload", "cmp", "ct", "bitwise", "cmp", "immediate"]);
-        let e = exprs(&r);
-        assert_eq!(get(&attrs(get(&e[1].1, 3)), 1), &[libc::IPPROTO_TCP as u8]);
-        // transport header + 2, 2 bytes: dport
-        assert_eq!((be32(get(&e[2].1, 2)), be32(get(&e[2].1, 3)), be32(get(&e[2].1, 4))), (2, 2, 2));
-        assert_eq!(get(&attrs(get(&e[3].1, 3)), 1), &1026u16.to_be_bytes());
-        assert_eq!(be32(get(&e[4].1, 2)), 2, "ct status");
-        assert_eq!(get(&attrs(get(&e[5].1, 4)), 1), &CT_STATUS_DNAT.to_ne_bytes());
-        assert_eq!(be32(get(&e[6].1, 2)), 0, "== 0");
-        assert_eq!(verdict(&r), libc::NF_DROP as u32);
+        for (r, family) in [(host_relay_guard(1026), libc::NFPROTO_IPV4 as u8), (host_relay_guard6(1026), libc::NFPROTO_IPV6 as u8)] {
+            assert_eq!(r.buf[16], family);
+            let top = attrs(&r.buf[20..]);
+            assert_eq!(get(&top, 2), b"input\0", "guards every incoming interface, loopback included");
+            assert_eq!(names(&r), ["meta", "cmp", "payload", "cmp", "ct", "bitwise", "cmp", "immediate"]);
+            let e = exprs(&r);
+            assert_eq!(get(&attrs(get(&e[1].1, 3)), 1), &[libc::IPPROTO_TCP as u8]);
+            // transport header + 2, 2 bytes: dport
+            assert_eq!((be32(get(&e[2].1, 2)), be32(get(&e[2].1, 3)), be32(get(&e[2].1, 4))), (2, 2, 2));
+            assert_eq!(get(&attrs(get(&e[3].1, 3)), 1), &1026u16.to_be_bytes());
+            assert_eq!(be32(get(&e[4].1, 2)), 2, "ct status");
+            assert_eq!(get(&attrs(get(&e[5].1, 4)), 1), &CT_STATUS_DNAT.to_ne_bytes());
+            assert_eq!(be32(get(&e[6].1, 2)), 0, "== 0");
+            assert_eq!(verdict(&r), libc::NF_DROP as u32);
+        }
     }
 }

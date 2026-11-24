@@ -234,7 +234,7 @@ fn through_firewall(why: firewall::Why) {
         let nat6 = NAT6.lock().unwrap_or_else(|e| e.into_inner()).clone();
         if v6
             && !nat6.0.is_empty()
-            && let Err(e) = netlink::install_nat6(&nat6.0, &nat6.1)
+            && let Err(e) = refresh_nat6(&nat6.0, &nat6.1)
         {
             eprintln!("kiri-init: IPv6 NAT: {e}");
         }
@@ -245,6 +245,17 @@ fn through_firewall(why: firewall::Why) {
 /// again after a flush.
 #[allow(clippy::type_complexity)]
 static NAT6: std::sync::Mutex<(Vec<([u8; 16], u8)>, Vec<String>)> = std::sync::Mutex::new((Vec::new(), Vec::new()));
+
+/// Rebuilds Kiri's IPv6 table from `subnets`/`bridges` and, in the VM, the
+/// loopback redirect and input guard for `HOST_RELAY_PORT`.
+fn refresh_nat6(subnets: &[([u8; 16], u8)], bridges: &[String]) -> io::Result<()> {
+    let (redirect, dnat) = NAT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map_or((false, Vec::new()), |n| (n.redirect, n.dnat.clone()));
+    netlink::install_nat6(subnets, bridges, HOST_RELAY_PORT, redirect, &dnat)
+}
 
 /// What Kiri's IPv4 table was last built from, so it can be rebuilt when a
 /// bridge comes or goes (the forward filter has a rule per bridge).
@@ -261,7 +272,8 @@ static NAT: std::sync::Mutex<Option<Nat>> = std::sync::Mutex::new(None);
 static NO_FIB4: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Builds Kiri's IPv4 table from `nat` and the bridges made so far, and
-/// keeps `nat` for `refresh_nat`.
+/// keeps `nat` for `refresh_nat`. In the VM (`nat.redirect`), also installs
+/// the IPv6 `::1` loopback redirect and input guard on a best-effort basis.
 fn install_nat(nat: Nat) -> io::Result<()> {
     use std::sync::atomic::Ordering;
     let bridges = MADE_BRIDGES.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -280,7 +292,12 @@ fn install_nat(nat: Nat) -> io::Result<()> {
         }
     };
     if r.is_ok() {
+        let redirect = nat.redirect;
         *NAT.lock().unwrap_or_else(|e| e.into_inner()) = Some(nat);
+        if redirect {
+            let nat6 = NAT6.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let _ = refresh_nat6(&nat6.0, &nat6.1);
+        }
     }
     r
 }
@@ -785,7 +802,7 @@ impl Bridges {
         if added.is_some() {
             ipv6_forwarding(true)?;
         }
-        let r = netlink::install_nat6(&subnets, &names);
+        let r = refresh_nat6(&subnets, &names);
         if r.is_ok() {
             *NAT6.lock().unwrap_or_else(|e| e.into_inner()) = (subnets.clone(), names.clone());
         }
@@ -856,7 +873,7 @@ pub fn remove_host_network() {
     if let Err(e) = netlink::remove_nat() {
         eprintln!("kiri-init: removing the nftables table: {e}");
     }
-    let _ = netlink::install_nat6(&[], &[]);
+    let _ = netlink::install_nat6(&[], &[], HOST_RELAY_PORT, false, &[]);
     let _ = ipv6_forwarding(false);
     through_firewall(firewall::Why::Stop);
 }
