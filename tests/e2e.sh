@@ -1111,6 +1111,51 @@ t vol-in-use "in use" bash -c "$D run -d --name vu -v tvol:/v alpine sleep 30 >/
 $D rm -f vu >/dev/null
 t vol-rm "tvol" $D volume rm tvol thtml tempty
 t vol-create "made-vol" $D volume create made-vol
+# `docker volume rm -f` refuses volumes in use by running, stopped or created
+# containers (-v, --mount, --volumes-from) with 409 and keeps their data, and
+# returns 204 when the volume does not exist (#773).
+t vol-rm-force-in-use "409 kept 409 kept 409 kept 409 kept data=important gone" bash -c "
+  $D rm -f vf-run vf-stop vf-creat vf-from >/dev/null 2>&1
+  $D volume rm -f vforce-used vforce-from >/dev/null 2>&1
+  $D run --rm -v vforce-used:/d alpine sh -c 'echo important > /d/file'
+  $D run -d --name vf-run -v vforce-used:/d alpine sleep 60 >/dev/null
+  o1=\$($D volume rm -f vforce-used 2>&1); c1=\$?
+  s1=\$(curl -s -o /dev/null -w '%{http_code}' --unix-socket $(printf %q "$SOCK") -X DELETE 'http://d/volumes/vforce-used?force=1')
+  k1=\$($D volume ls -q --filter name='^vforce-used\$' | sed 's/.*/kept/')
+  $D rm -f vf-run >/dev/null
+  $D run --name vf-stop --mount type=volume,source=vforce-used,target=/d alpine true >/dev/null
+  o2=\$($D volume rm -f vforce-used 2>&1); c2=\$?
+  s2=\$(curl -s -o /dev/null -w '%{http_code}' --unix-socket $(printf %q "$SOCK") -X DELETE 'http://d/volumes/vforce-used?force=1')
+  k2=\$($D volume ls -q --filter name='^vforce-used\$' | sed 's/.*/kept/')
+  $D create --name vf-from --volumes-from vf-stop alpine true >/dev/null
+  $D rm vf-stop >/dev/null
+  o3=\$($D volume rm -f vforce-used 2>&1); c3=\$?
+  s3=\$(curl -s -o /dev/null -w '%{http_code}' --unix-socket $(printf %q "$SOCK") -X DELETE 'http://d/volumes/vforce-used?force=1')
+  k3=\$($D volume ls -q --filter name='^vforce-used\$' | sed 's/.*/kept/')
+  $D create --name vf-creat --mount type=volume,source=vforce-from,target=/d alpine true >/dev/null
+  o4=\$($D volume rm -f vforce-from 2>&1); c4=\$?
+  s4=\$(curl -s -o /dev/null -w '%{http_code}' --unix-socket $(printf %q "$SOCK") -X DELETE 'http://d/volumes/vforce-from?force=1')
+  k4=\$($D volume ls -q --filter name='^vforce-from\$' | sed 's/.*/kept/')
+  $D rm -f vf-from vf-creat >/dev/null
+  data=\$($D run --rm -v vforce-used:/d alpine cat /d/file)
+  $D volume rm -f vforce-used vforce-from >/dev/null
+  gone=\$($D volume ls -q --filter name='^vforce-used\$')
+  [ -z \"\$gone\" ] && gone=gone
+  grep -q 'in use' <<<\"\$o1\" && grep -q 'vf-run' <<<\"\$o1\" &&
+    grep -q 'in use' <<<\"\$o2\" && grep -q 'vf-stop' <<<\"\$o2\" &&
+    grep -q 'in use' <<<\"\$o3\" && grep -q 'vf-from' <<<\"\$o3\" &&
+    grep -q 'in use' <<<\"\$o4\" && grep -q 'vf-creat' <<<\"\$o4\" &&
+    [ \"\$c1\" != 0 ] && [ \"\$c2\" != 0 ] && [ \"\$c3\" != 0 ] && [ \"\$c4\" != 0 ] &&
+    echo \"\$s1 \$k1 \$s2 \$k2 \$s3 \$k3 \$s4 \$k4 data=\$data \$gone\"
+"
+t vol-rm-force-missing "rm=1 rm_f=0 404 204" bash -c "
+  $D volume rm -f vforce-missing >/dev/null 2>&1 || true
+  $D volume rm vforce-missing >/dev/null 2>&1; rm_no=\$?
+  $D volume rm -f vforce-missing >/dev/null 2>&1; rm_f=\$?
+  s_no=\$(curl -s -o /dev/null -w '%{http_code}' --unix-socket $(printf %q "$SOCK") -X DELETE 'http://d/volumes/vforce-missing')
+  s_f=\$(curl -s -o /dev/null -w '%{http_code}' --unix-socket $(printf %q "$SOCK") -X DELETE 'http://d/volumes/vforce-missing?force=1')
+  echo \"rm=\$rm_no rm_f=\$rm_f \$s_no \$s_f\"
+"
 t tmpfs "size=10240k" $D run --rm --tmpfs /scratch:size=10m alpine sh -c 'mount | grep scratch'
 t tmpfs-mount "tmpfs on /t" $D run --rm --mount type=tmpfs,target=/t alpine sh -c 'mount | grep " /t "'
 # `--volumes-from` lends another container's volumes and binds at the same

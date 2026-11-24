@@ -4161,6 +4161,9 @@ mod tests {
         engine.volume_ensure_with("free", json!({}), Default::default()).unwrap();
         listed_user(&engine, "used", &image);
         assert!(matches!(engine.volume_remove("used", false), Err(Error::Conflict(m)) if m.contains("volume is in use")));
+        // Force doesn't remove a volume in use either, as in Docker (#773).
+        assert!(matches!(engine.volume_remove("used", true), Err(Error::Conflict(m)) if m.contains("volume is in use")));
+        assert!(engine.volume_get("used").is_some(), "the volume in use is kept");
         engine.volume_remove("free", false).unwrap();
         assert!(engine.volume_get("free").is_none());
         assert!(matches!(image_remove(&engine, "used:1", false), Err(Error::Conflict(m)) if m.contains("is using its referenced image")));
@@ -4196,6 +4199,100 @@ mod tests {
         image_remove(&engine, "lost:2", false).unwrap();
         image_remove(&engine, "lost:1", true).unwrap();
         assert!(engine.store.images().unwrap().is_empty(), "forced, it goes");
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn delete_volume_http(engine: &Arc<Engine>, target: &str) -> (u16, String) {
+        use std::io::{Read, Write};
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let served = std::thread::spawn({
+            let engine = engine.clone();
+            move || serve(server, engine, Caller::Host)
+        });
+        client.write_all(format!("DELETE /volumes/{target} HTTP/1.1\r\nHost: d\r\nConnection: close\r\n\r\n").as_bytes()).unwrap();
+        let mut raw = String::new();
+        client.read_to_string(&mut raw).unwrap();
+        served.join().unwrap().unwrap();
+        let (head, body) = raw.split_once("\r\n\r\n").unwrap_or((&raw, ""));
+        let code = head.lines().next().and_then(|l| l.split_whitespace().nth(1)).and_then(|s| s.parse().ok()).unwrap_or(0);
+        (code, body.to_owned())
+    }
+
+    fn create_mounted(engine: &Engine, name: &str, image: &kiri_image::Image, body: Value) -> String {
+        let m = mounts(&body, engine, image).unwrap();
+        let volumes_from = strings(&body["HostConfig"]["VolumesFrom"]).unwrap_or_default();
+        let spec: super::super::engine::Spec = serde_json::from_value(json!({
+            "image": image.name, "image_id": image.config_digest, "entrypoint": [], "cmd": ["true"],
+            "env": [], "cwd": "/", "user": "", "auto_remove": false, "network_mode": "none", "labels": {},
+            "restart": {"name": "no", "max_retries": 0}, "volumes": m.volumes, "anon_volumes": m.anon,
+            "mounts": m.guest, "mount_info": m.info, "volumes_from": volumes_from,
+        })).unwrap();
+        engine.create(Some(name.into()), spec, image).unwrap()
+    }
+
+    /// `DELETE /volumes/{name}` matches Docker's exact status codes and errors:
+    /// 404/204 for missing volumes (without/with `force`), and 409 Conflict for
+    /// volumes in use via `-v`, `--mount type=volume`, or `--volumes-from`
+    /// across created/running/stopped containers regardless of `force` (#773).
+    #[test]
+    fn delete_volume_http_status_and_in_use_match_docker() {
+        let (root, engine) = engine_in("vol-http", false);
+        let image = test_image("vol:1");
+        engine.store.put_image(image.clone()).unwrap();
+
+        // Missing volume: 404 without force (or force=0/false), 204 with force=1/true.
+        for path in ["missing", "missing?force=0", "missing?force=false"] {
+            let (code, body) = delete_volume_http(&engine, path);
+            assert_eq!(code, 404, "{path}: {body}");
+            assert!(body.contains("get missing: no such volume"), "{path}: {body}");
+        }
+        for path in ["missing?force=1", "missing?force=true"] {
+            let (code, body) = delete_volume_http(&engine, path);
+            assert_eq!(code, 204, "{path}: {body}");
+            assert!(body.is_empty(), "{path}: {body}");
+        }
+
+        // `-v` bind-style named volume on created and exited container.
+        let c_bind = create_mounted(&engine, "c-bind", &image, json!({"HostConfig": {"Binds": ["v-bind:/d"]}}));
+        for target in ["v-bind", "v-bind?force=1", "v-bind?force=true"] {
+            let (code, body) = delete_volume_http(&engine, target);
+            assert_eq!(code, 409, "{target}: {body}");
+            assert!(body.contains("remove v-bind: volume is in use - [c-bind]"), "{target}: {body}");
+            assert!(engine.volume_get("v-bind").is_some());
+        }
+        engine.set_status(&c_bind, super::super::engine::Status::Exited);
+        assert_eq!(delete_volume_http(&engine, "v-bind?force=1").0, 409);
+
+        // `--mount type=volume` on running container.
+        let c_mount = create_mounted(
+            &engine,
+            "c-mount",
+            &image,
+            json!({"HostConfig": {"Mounts": [{"Type": "volume", "Source": "v-mount", "Target": "/d"}]}}),
+        );
+        engine.set_status(&c_mount, super::super::engine::Status::Running);
+        let (code, body) = delete_volume_http(&engine, "v-mount?force=1");
+        assert_eq!(code, 409, "{body}");
+        assert!(body.contains("remove v-mount: volume is in use - [c-mount]"), "{body}");
+
+        // `--volumes-from` retains the volume even after the source container is removed.
+        let c_vfrom = create_mounted(&engine, "c-vfrom", &image, json!({"HostConfig": {"VolumesFrom": ["c-bind"]}}));
+        engine.remove(&c_bind, false, false).unwrap();
+        let (code, body) = delete_volume_http(&engine, "v-bind?force=1");
+        assert_eq!(code, 409, "{body}");
+        assert!(body.contains("remove v-bind: volume is in use - [c-vfrom]"), "{body}");
+        assert!(engine.volume_get("v-bind").is_some());
+
+        // Removing holders frees the volumes for removal.
+        engine.remove(&c_vfrom, false, false).unwrap();
+        engine.set_status(&c_mount, super::super::engine::Status::Exited);
+        engine.remove(&c_mount, false, false).unwrap();
+        assert_eq!(delete_volume_http(&engine, "v-bind?force=1").0, 204);
+        assert_eq!(delete_volume_http(&engine, "v-mount").0, 204);
+        assert!(engine.volume_get("v-bind").is_none());
+        assert!(engine.volume_get("v-mount").is_none());
+
         drop(engine);
         let _ = std::fs::remove_dir_all(root);
     }

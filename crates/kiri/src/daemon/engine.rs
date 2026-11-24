@@ -5298,10 +5298,18 @@ impl Engine {
 
     pub fn volume_remove(&self, name: &str, force: bool) -> Result<(), Error> {
         if self.volume_get(name).is_none() {
+            // Docker Engine returns 204 No Content for `DELETE /volumes/{name}?force=1`
+            // when the volume does not exist, and 404 Not Found without `force`.
+            if force {
+                return Ok(());
+            }
             return Err(Error::NotFound(format!("get {name}: no such volume")));
         }
-        let users = self.volume_users(name);
-        if !users.is_empty() && !force {
+        // A volume a container uses is refused even with `force`, as in Docker:
+        // `force` only ignores a missing volume and the damaged-list refusal below.
+        let mut users = self.volume_users(name);
+        if !users.is_empty() {
+            users.sort();
             return Err(Error::Conflict(format!("remove {name}: volume is in use - [{}]", users.join(", "))));
         }
         if !force && let Some(why) = self.refusal(&format!("Volume {name} was not removed, because the container list may be missing a container that uses it; `docker volume rm --force` removes it anyway")) {
@@ -7240,6 +7248,13 @@ pub fn boot_without_vm(root: &std::path::Path) -> Arc<Engine> {
 }
 
 #[cfg(test)]
+impl Engine {
+    pub(super) fn set_status(&self, id: &str, status: Status) {
+        self.lock().containers.get_mut(id).unwrap().status = status;
+    }
+}
+
+#[cfg(test)]
 mod records_tests {
     use super::*;
     use std::path::Path;
@@ -9033,6 +9048,91 @@ mod exit_log_tests {
         assert_eq!(engine.stopping_ops.lock().unwrap_or_else(|e| e.into_inner()).len(), 2);
         engine.on_event(Event::Lost);
         assert!(engine.stopping_ops.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+        drop(engine);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod volume_remove_tests {
+    use super::*;
+
+    fn test_image() -> Image {
+        Image {
+            mirror: None,
+            name: "test:local".into(),
+            digest: "sha256:test".into(),
+            index_digest: None,
+            config_digest: "sha256:test".into(),
+            layers: Vec::new(),
+            size: 0,
+            platform: "linux/arm64".into(),
+            created: String::new(),
+            pulled_at: 0,
+            config: Default::default(),
+        }
+    }
+
+    fn container_with_volumes(engine: &Engine, image: &Image, name: &str, volumes: Vec<String>, anon_volumes: Vec<String>) -> String {
+        let spec: Spec = serde_json::from_value(serde_json::json!({
+            "image": image.name, "image_id": image.config_digest, "entrypoint": [], "cmd": ["true"],
+            "env": [], "cwd": "/", "user": "", "auto_remove": false, "network_mode": "none", "labels": {},
+            "restart": {"name": "no", "max_retries": 0}, "volumes": volumes, "anon_volumes": anon_volumes,
+        }))
+        .unwrap();
+        engine.create(Some(name.into()), spec, image).unwrap()
+    }
+
+    #[test]
+    fn volume_remove_refuses_users_across_states_and_force_ignores_missing() {
+        let dir = std::env::temp_dir().join(format!("kiri-vol-rm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let engine = boot_without_vm(&dir);
+        let image = test_image();
+
+        // Missing volume: 404 without force, 204 (Ok) with force.
+        assert!(matches!(engine.volume_remove("missing", false), Err(Error::NotFound(m)) if m == "get missing: no such volume"));
+        engine.volume_remove("missing", true).unwrap();
+
+        // Volume in use: refused with or without force across Created, Running, Exited.
+        engine.volume_ensure("used", serde_json::json!({}), false).unwrap();
+        engine.volume_ensure("anon-used", serde_json::json!({}), true).unwrap();
+        let holder = container_with_volumes(&engine, &image, "holder", vec!["used".into()], Vec::new());
+        let anon_holder = container_with_volumes(&engine, &image, "anon-holder", Vec::new(), vec!["anon-used".into()]);
+
+        for status in [Status::Created, Status::Running, Status::Exited] {
+            engine.lock().containers.get_mut(&holder).unwrap().status = status;
+            for force in [false, true] {
+                assert!(
+                    matches!(engine.volume_remove("used", force), Err(Error::Conflict(m)) if m == "remove used: volume is in use - [holder]"),
+                    "status={status:?} force={force}"
+                );
+                assert!(engine.volume_get("used").is_some());
+            }
+        }
+
+        // Multiple holders are sorted deterministically in the conflict message.
+        let holder2 = container_with_volumes(&engine, &image, "alpha-holder", vec!["used".into()], Vec::new());
+        assert!(matches!(
+            engine.volume_remove("used", true),
+            Err(Error::Conflict(m)) if m == "remove used: volume is in use - [alpha-holder, holder]"
+        ));
+
+        // Anonymous volume in use is also refused even with force.
+        assert!(matches!(
+            engine.volume_remove("anon-used", true),
+            Err(Error::Conflict(m)) if m == "remove anon-used: volume is in use - [anon-holder]"
+        ));
+
+        // Once containers are gone, force and non-force removal succeed.
+        engine.remove(&holder, false, false).unwrap();
+        engine.remove(&holder2, false, false).unwrap();
+        engine.remove(&anon_holder, false, false).unwrap();
+        engine.volume_remove("used", true).unwrap();
+        engine.volume_remove("anon-used", false).unwrap();
+        assert!(engine.volume_get("used").is_none());
+        assert!(engine.volume_get("anon-used").is_none());
+
         drop(engine);
         let _ = std::fs::remove_dir_all(dir);
     }

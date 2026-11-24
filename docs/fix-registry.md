@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #773 Volumes: `docker volume rm --force` refuses volumes in use and succeeds when missing, as Docker does (unreleased)
+- Fixes: #773 `docker volume rm --force` removes a volume that a container still uses
+- Caused: none known
+- Caused by: -
+- Check: `vol-rm-force-in-use`, `vol-rm-force-missing`
+
 ### #840 CLI: `kiri update --help` prints usage without checking for updates (unreleased)
 - Fixes: no issue
 - Caused: none known
