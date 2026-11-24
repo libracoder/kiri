@@ -368,12 +368,43 @@ pub fn post_lines_closable(path: &str, auth: Option<&str>, opened: impl FnOnce(C
 /// under way (Start). Marked as the window's own, as on the Mac, so status
 /// and diagnostic checks never keep an idle VM awake.
 pub fn alive() -> bool {
-    request_within("GET", "/_ping", None, true, Some(PING_WAIT)).is_ok_and(|r| r.ok())
+    alive_within(PING_WAIT)
 }
 
 /// `alive`, for the event watcher: false after QUICK without an answer.
 pub fn alive_quick() -> bool {
-    request_within("GET", "/_ping", None, true, Some(QUICK)).is_ok_and(|r| r.ok())
+    alive_within(QUICK)
+}
+
+/// `alive`, giving up after `timeout` without an answer.
+pub fn alive_within(timeout: Duration) -> bool {
+    request_within("GET", "/_ping", None, true, Some(timeout)).is_ok_and(|r| r.ok())
+}
+
+/// Polls `/_ping` until the daemon answers or `limit` has passed, pausing
+/// `pause` between failed tries. Each try gets only the time left before
+/// the deadline, so a pipe that accepts connections without answering
+/// (for example a hung `wsl.exe`) cannot stretch the loop past `limit`.
+pub fn wait_alive(limit: Duration, pause: Duration) -> bool {
+    wait_alive_with(limit, pause, alive_within)
+}
+
+fn wait_alive_with(limit: Duration, pause: Duration, mut probe: impl FnMut(Duration) -> bool) -> bool {
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return false;
+        }
+        if probe(left) {
+            return true;
+        }
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return false;
+        }
+        std::thread::sleep(pause.min(left));
+    }
 }
 
 /// A long-lived streamed response (`/events`, `logs?follow=1`, `stats`),
@@ -596,11 +627,60 @@ mod tests {
         assert!(req.starts_with("GET /_ping HTTP/1.1\r\n"), "{req}");
         assert!(req.contains("\r\nX-Kiri-Background: 1\r\n"), "alive_quick must mark background: {req}");
 
+        let bounded_ping = mock_reply(OK_PING);
+        assert!(alive_within(Duration::from_secs(2)));
+        let req = wire_text(&bounded_ping);
+        assert!(req.starts_with("GET /_ping HTTP/1.1\r\n"), "{req}");
+        assert!(req.contains("\r\nX-Kiri-Background: 1\r\n"), "alive_within must mark background: {req}");
+
+        let _fail = mock_reply(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n");
+        assert!(!alive_within(Duration::from_secs(2)));
+
         let ev = mock_reply(OK_CHUNKED);
         events(|_| false).unwrap();
         let req = wire_text(&ev);
         assert!(req.starts_with("GET /events HTTP/1.1\r\n"), "{req}");
         assert!(req.contains("\r\nX-Kiri-Background: 1\r\n"), "events must mark background: {req}");
+    }
+
+    /// A hung ping (pipe accepts, nothing behind it answers) consumes at most
+    /// the remaining budget and ends the wait loop at `limit`, rather than
+    /// multiplying per-call timeouts across 100 iterations.
+    #[test]
+    fn wait_alive_bounds_slow_probes_and_retries_fast_ones() {
+        use std::time::Instant;
+
+        // A hanging probe: sleeps for the timeout it was given and returns false.
+        let mut calls = 0usize;
+        let limit = Duration::from_millis(120);
+        let began = Instant::now();
+        assert!(!wait_alive_with(limit, Duration::from_millis(20), |timeout| {
+            calls += 1;
+            assert!(timeout <= limit, "probe timeout {timeout:?} exceeded limit {limit:?}");
+            std::thread::sleep(timeout);
+            false
+        }));
+        assert_eq!(calls, 1, "a single hung probe should exhaust the budget and stop");
+        assert!(began.elapsed() < Duration::from_millis(400), "waited {:?}", began.elapsed());
+
+        // Fast failing probes retry with shrinking budgets until one answers.
+        let mut seen = Vec::new();
+        assert!(wait_alive_with(Duration::from_millis(500), Duration::from_millis(25), |timeout| {
+            seen.push(timeout);
+            seen.len() == 3
+        }));
+        assert_eq!(seen.len(), 3);
+        assert!(seen[2] < seen[0], "remaining budget should shrink across retries: {seen:?}");
+
+        // Fast failing probes stop once `limit` passes.
+        let mut fast_calls = 0usize;
+        let began = Instant::now();
+        assert!(!wait_alive_with(Duration::from_millis(100), Duration::from_millis(25), |_| {
+            fast_calls += 1;
+            false
+        }));
+        assert!((2..=10).contains(&fast_calls), "unexpected retry count: {fast_calls}");
+        assert!(began.elapsed() >= Duration::from_millis(90) && began.elapsed() < Duration::from_millis(400), "waited {:?}", began.elapsed());
     }
 
     #[test]

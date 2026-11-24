@@ -24,7 +24,7 @@ kiri_seed_images alpine:3.24 || echo "an image could not be fetched"
 # shellcheck disable=SC2016
 $D run --rm -v "$DIR/contrib/wsl/kiri-linux/kiri-start:/usr/local/bin/kiri-start:ro" alpine:3.24 sh -c '
   apk add -q python3 >/dev/null 2>&1 || { echo "FAIL: no python3"; exit 1; }
-  # MODE: up (socket after 0.5 s), nosocket, exits.
+  # MODE: up (socket after 0.5 s), nosocket, exits, sockexit (binds socket then exits).
   cat >/usr/local/bin/kiri <<"K"
 #!/usr/bin/python3
 import os, signal, socket, sys, time
@@ -33,6 +33,10 @@ open("/tmp/launches", "a").write("%d\n" % os.getpid())
 mode = open("/tmp/mode").read().strip()
 if mode == "exits": sys.exit(1)
 s = "/var/lib/kiri-daemon/.kiri/run/docker.sock"
+if mode == "sockexit":
+    os.makedirs(os.path.dirname(s), exist_ok=True)
+    l = socket.socket(socket.AF_UNIX); l.bind(s); l.listen(8)
+    sys.exit(1)
 def term(*_):
     if os.path.exists(s): os.remove(s)
     time.sleep(int(open("/tmp/stopwait").read()) if os.path.exists("/tmp/stopwait") else 4); sys.exit(0)
@@ -92,5 +96,9 @@ K
   echo exits >/tmp/mode
   sh /usr/local/bin/kiri-start 2>/tmp/err; code=$?
   [ $code = 2 ] && grep -q "exited as it started" /tmp/err || { echo "FAIL: a daemon that exits: exit $code, $(cat /tmp/err)"; fail=1; }
-  [ $fail = 0 ] && echo "ok: one daemon for four starts; a start while it stops, and --restart (a slow stop too), start a new one; no socket is exit 1, one that exits is exit 2"
+  # A daemon that binds its socket and immediately exits: exit 2, dead socket removed.
+  echo sockexit >/tmp/mode
+  sh /usr/local/bin/kiri-start 2>/tmp/err; code=$?
+  [ $code = 2 ] && [ ! -e $S ] && grep -q "exited as it started" /tmp/err || { echo "FAIL: a daemon that binds its socket then exits: exit $code, sock=$(ls -l $S 2>&1), $(cat /tmp/err)"; fail=1; }
+  [ $fail = 0 ] && echo "ok: one daemon for four starts; a start while it stops, and --restart (a slow stop too), start a new one; no socket is exit 1, one that exits (before or after binding its socket) is exit 2"
   exit $fail'

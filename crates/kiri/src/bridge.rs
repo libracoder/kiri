@@ -81,6 +81,11 @@ const LIMIT: usize = 2 * WINDOW;
 /// socket), or about as long waiting on its lock behind another; 5 s more
 /// so one that would just make it is not killed.
 const START_LIMIT: Duration = Duration::from_secs(25);
+/// How long a socket that refuses connections is retried after a start
+/// returns before concluding the daemon created it and exited. A healthy
+/// daemon takes milliseconds between bind and listen (or to remove a stale
+/// socket under systemd), never the full START_LIMIT.
+const REFUSED_LIMIT: Duration = Duration::from_secs(1);
 /// After a start failed, connections within this get its reason at once,
 /// rather than each starting the engine again. Doubled after each failed
 /// start in a row, up to RETRY_MOST: an engine that exits as it starts
@@ -303,6 +308,8 @@ struct Starter {
     tell: Option<Box<dyn Fn(&str) + Send + Sync>>,
     /// The most one start takes (START_LIMIT).
     limit: Duration,
+    /// The most a socket refusing connections is retried after a start (REFUSED_LIMIT).
+    refused_limit: Duration,
     state: Mutex<StartState>,
     cv: Condvar,
 }
@@ -324,7 +331,16 @@ struct StartState {
 
 impl Starter {
     fn new(socket: PathBuf, start: Box<dyn Fn(Instant) -> Result<(), String> + Send + Sync>, log: PathBuf) -> Starter {
-        Starter { socket, start, log, tell: None, limit: START_LIMIT, state: Mutex::new(StartState { backoff: RETRY_AFTER, ..StartState::default() }), cv: Condvar::new() }
+        Starter {
+            socket,
+            start,
+            log,
+            tell: None,
+            limit: START_LIMIT,
+            refused_limit: REFUSED_LIMIT,
+            state: Mutex::new(StartState { backoff: RETRY_AFTER, ..StartState::default() }),
+            cv: Condvar::new(),
+        }
     }
 
     /// A connection to the daemon, or why there is none.
@@ -340,13 +356,15 @@ impl Starter {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         st = self.cv.wait_while(st, |s| s.running).unwrap_or_else(|e| e.into_inner());
         // A start ended since the try above (this one waited for it, or it
-        // ended just after): its outcome is this connection's too.
+        // ended just after): try the socket first in case a daemon came up
+        // externally while a failed start ran, else use its outcome.
         if st.ended != ended {
-            if let Some((_, why)) = st.failed.as_ref().filter(|_| !st.connected) {
-                return Err(why.clone());
-            }
+            let why = st.failed.as_ref().filter(|_| !st.connected).map(|(_, w)| w.clone());
             drop(st);
-            return UnixStream::connect(&self.socket).map_err(|e| format!("it started, then did not answer ({e})"));
+            return match UnixStream::connect(&self.socket) {
+                Ok(s) => Ok(s),
+                Err(e) => Err(why.unwrap_or_else(|| format!("it started, then did not answer ({e})"))),
+            };
         }
         if let Some((at, why)) = &st.failed
             && at.elapsed() < st.backoff
@@ -388,6 +406,7 @@ impl Starter {
         if let Err(why) = (self.start)(until) {
             return failed(why);
         }
+        let mut refused_since: Option<Instant> = None;
         loop {
             match UnixStream::connect(&self.socket) {
                 Ok(s) => {
@@ -397,7 +416,17 @@ impl Starter {
                     return Ok(s);
                 }
                 Err(e) if Instant::now() >= until => return failed(format!("it did not answer within {} s ({e}); see {LOG}", self.limit.as_secs())),
-                Err(_) => std::thread::sleep(Duration::from_millis(100)),
+                Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
+                    let since = *refused_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() >= self.refused_limit {
+                        return failed(format!("its socket refused connections ({e}); see {LOG}"));
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(_) => {
+                    refused_since = None;
+                    std::thread::sleep(Duration::from_millis(100));
+                }
             }
         }
     }
@@ -809,6 +838,105 @@ mod tests {
         let why = starter.connect().unwrap_err();
         assert!(why.starts_with("it did not answer within 1 s"), "{why}");
         assert!(began.elapsed() >= starter.limit && began.elapsed() < starter.limit + Duration::from_secs(1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A daemon that creates its socket and then exits leaves a socket that
+    /// refuses connections: the bridge fails quickly instead of waiting out
+    /// the full start limit, and back-off still applies.
+    #[test]
+    fn a_refusing_socket_does_not_wait_the_full_start_limit() {
+        let dir = temp("refused");
+        let sock = dir.join("d.sock");
+        let starts = Arc::new(AtomicUsize::new(0));
+        let (s, n) = (sock.clone(), starts.clone());
+        let mut starter = Starter::new(
+            sock,
+            Box::new(move |_| {
+                n.fetch_add(1, Ordering::SeqCst);
+                let _ = std::fs::remove_file(&s);
+                // Bound, then dropped: the socket file stays and refuses connections.
+                drop(UnixListener::bind(&s).unwrap());
+                Ok(())
+            }),
+            dir.join("log"),
+        );
+        starter.limit = Duration::from_secs(10);
+        let began = Instant::now();
+        let why = starter.connect().unwrap_err();
+        assert!(began.elapsed() < Duration::from_secs(3), "waited {:?} ({why})", began.elapsed());
+        assert!(why.contains("refused") && why.contains(LOG), "{why}");
+        // Back-off still applies: the next connect gets the reason without another start.
+        assert_eq!(starter.connect().unwrap_err(), why);
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A stale socket that briefly refuses connections while the new daemon
+    /// replaces it (for example under systemd) still connects within REFUSED_LIMIT.
+    #[test]
+    fn a_transiently_refusing_socket_still_connects() {
+        let dir = temp("transient-refused");
+        let sock = dir.join("d.sock");
+        // Stale socket present before and right after start returns.
+        drop(UnixListener::bind(&sock).unwrap());
+        let s = sock.clone();
+        let starter = Starter::new(
+            sock,
+            Box::new(move |_| {
+                let s = s.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(200));
+                    let _ = std::fs::remove_file(&s);
+                    echo_daemon(&s);
+                });
+                Ok(())
+            }),
+            dir.join("log"),
+        );
+        let mut conn = starter.connect().expect("daemon replaced stale socket within REFUSED_LIMIT");
+        conn.write_all(b"hi").unwrap();
+        conn.shutdown(Shutdown::Write).unwrap();
+        let mut reply = Vec::new();
+        conn.read_to_end(&mut reply).unwrap();
+        assert_eq!(reply, b"hi");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A connection waiting behind a start that fails still connects if the
+    /// daemon came up externally meanwhile, instead of returning the stale error.
+    #[test]
+    fn a_waiter_connects_if_the_daemon_comes_up_while_a_start_fails() {
+        let dir = temp("waiter-recovers");
+        let sock = dir.join("d.sock");
+        let (started_tx, started_rx) = channel();
+        let (finish_tx, finish_rx) = channel();
+        let finish_rx = Mutex::new(finish_rx);
+        let starter = Arc::new(Starter::new(
+            sock.clone(),
+            Box::new(move |_| {
+                let _ = started_tx.send(());
+                let _ = finish_rx.lock().unwrap().recv();
+                Err("kiri-start failed".to_owned())
+            }),
+            dir.join("log"),
+        ));
+        let s1 = starter.clone();
+        let first = std::thread::spawn(move || s1.connect());
+        started_rx.recv().unwrap();
+        let s2 = starter.clone();
+        let second = std::thread::spawn(move || s2.connect());
+        std::thread::sleep(Duration::from_millis(100));
+        // The daemon comes up externally while the first start is failing.
+        echo_daemon(&sock);
+        let _ = finish_tx.send(());
+        assert_eq!(first.join().unwrap().unwrap_err(), "kiri-start failed");
+        let mut conn = second.join().unwrap().expect("waiter should connect once daemon is up");
+        conn.write_all(b"ok").unwrap();
+        conn.shutdown(Shutdown::Write).unwrap();
+        let mut reply = Vec::new();
+        conn.read_to_end(&mut reply).unwrap();
+        assert_eq!(reply, b"ok");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

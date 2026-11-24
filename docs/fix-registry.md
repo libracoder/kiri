@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #395 Windows: fail fast on a refusing daemon socket, recover waiters when the daemon comes up, and bound Start's ping loop (unreleased)
+- Fixes: #395 Windows: leftovers from the WSL restart fix (#318)
+- Caused: none known
+- Caused by: #318
+- Check: none
+
 ### #514 Windows: cancel in-flight terminal opens on close or replacement (unreleased)
 - Fixes: no issue
 - Caused: none known

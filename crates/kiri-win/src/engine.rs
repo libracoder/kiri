@@ -381,11 +381,8 @@ fn start_daemon() -> io::Result<()> {
         std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x0800_0000);
         let _ = crate::update::output_within(cmd.args(["-u", "root", "--", "/usr/local/bin/kiri-start"]), crate::update::WSL_LIMIT);
     }
-    for _ in 0..100 {
-        if client::alive() {
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(100));
+    if client::wait_alive(Duration::from_secs(10), Duration::from_millis(100)) {
+        return Ok(());
     }
     Err(io::Error::other("Kiri's engine did not start in WSL: run contrib\\windows\\kiri.ps1 to install it"))
 }
