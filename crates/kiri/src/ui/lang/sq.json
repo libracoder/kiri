@@ -1850,5 +1850,9 @@
   "Continue anyway": "Vazhdo prapë",
   "One step didn't work. Everything else is ready.": "Një hap nuk funksionoi. Gjithçka tjetër është gati.",
   "Some steps didn't work. Everything else is ready.": "Disa hapa nuk funksionuan. Gjithçka tjetër është gati.",
-  "No matches": "Asnjë përputhje"
+  "No matches": "Asnjë përputhje",
+  "Disk image size": "Madhësia e imazhit të diskut",
+  "KIRI_CPUS, KIRI_MEMORY_MIB or KIRI_DISK_GB is set for the daemon, and it takes precedence over these.": "KIRI_CPUS, KIRI_MEMORY_MIB ose KIRI_DISK_GB është vendosur për daemon-in dhe ka përparësi ndaj këtyre.",
+  "Running now with {cpus}, up to {mem}, and a {disk} disk.": "Tani në punë me {cpus}, deri në {mem} dhe disk {disk}.",
+  "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "Maksimumi deri ku mund të rritet disku i VM-së. Hapësira në {os} përdoret vetëm kur shkruhen të dhëna; nuk tkurret kurrë. Zbatohet pas rinisjes."
 }

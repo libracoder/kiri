@@ -1850,5 +1850,9 @@
   "Continue anyway": "Folytatás mindenképp",
   "One step didn't work. Everything else is ready.": "Egy lépés nem sikerült. Minden más készen áll.",
   "Some steps didn't work. Everything else is ready.": "Néhány lépés nem sikerült. Minden más készen áll.",
-  "No matches": "Nincs találat"
+  "No matches": "Nincs találat",
+  "Disk image size": "Lemezkép mérete",
+  "KIRI_CPUS, KIRI_MEMORY_MIB or KIRI_DISK_GB is set for the daemon, and it takes precedence over these.": "A démonnál be van állítva a KIRI_CPUS, a KIRI_MEMORY_MIB vagy a KIRI_DISK_GB, és ez felülírja ezeket.",
+  "Running now with {cpus}, up to {mem}, and a {disk} disk.": "Most így fut: {cpus}, legfeljebb {mem} memória és {disk} lemez.",
+  "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "A virtuális gép lemezének maximális mérete. A tárhely csak adatok írásakor foglalódik el a rendszeren ({os}), és soha nem zsugorodik. Újraindításkor lép életbe."
 }

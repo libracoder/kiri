@@ -1850,5 +1850,9 @@
   "Continue anyway": "ቢሆንም ቀጥል",
   "One step didn't work. Everything else is ready.": "አንድ ደረጃ አልሠራም። ሌላው ሁሉ ዝግጁ ነው።",
   "Some steps didn't work. Everything else is ready.": "አንዳንድ ደረጃዎች አልሠሩም። ሌላው ሁሉ ዝግጁ ነው።",
-  "No matches": "ምንም የሚዛመድ የለም"
+  "No matches": "ምንም የሚዛመድ የለም",
+  "Disk image size": "የዲስክ ምስል መጠን",
+  "KIRI_CPUS, KIRI_MEMORY_MIB or KIRI_DISK_GB is set for the daemon, and it takes precedence over these.": "KIRI_CPUS፣ KIRI_MEMORY_MIB ወይም KIRI_DISK_GB ለዴሞኑ ተቀናብሯል፣ ከእነዚህም ቅድሚያ ይወስዳል።",
+  "Running now with {cpus}, up to {mem}, and a {disk} disk.": "አሁን በ{cpus}፣ እስከ {mem} እና በ{disk} ዲስክ እየሠራ ነው።",
+  "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "የVM ዲስክ ሊያድግ የሚችለው ከፍተኛ መጠን። በ{os} ላይ ቦታ የሚያዝበት ውሂብ ሲጻፍ ብቻ ነው፤ በፍጹም አይቀንስም። ዳግም ሲጀመር ተግባራዊ ይሆናል።"
 }

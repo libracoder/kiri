@@ -1850,5 +1850,9 @@
   "Continue anyway": "Trotzdem fortfahren",
   "One step didn't work. Everything else is ready.": "Ein Schritt hat nicht geklappt. Alles andere ist bereit.",
   "Some steps didn't work. Everything else is ready.": "Einige Schritte haben nicht geklappt. Alles andere ist bereit.",
-  "No matches": "Keine Treffer"
+  "No matches": "Keine Treffer",
+  "Disk image size": "Größe des Festplattenimages",
+  "KIRI_CPUS, KIRI_MEMORY_MIB or KIRI_DISK_GB is set for the daemon, and it takes precedence over these.": "KIRI_CPUS, KIRI_MEMORY_MIB oder KIRI_DISK_GB ist für den Daemon gesetzt und hat Vorrang vor diesen Werten.",
+  "Running now with {cpus}, up to {mem}, and a {disk} disk.": "Läuft jetzt mit {cpus}, bis zu {mem} und einer {disk}-Festplatte.",
+  "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "Die maximale Größe der VM-Festplatte. Speicherplatz auf {os} wird erst beim Schreiben von Daten belegt; die Größe schrumpft nie. Gilt nach einem Neustart."
 }

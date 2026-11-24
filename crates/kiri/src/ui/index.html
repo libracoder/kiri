@@ -4409,6 +4409,7 @@ function routerPortsPref() {
 
 /* Settings → Resources: the most the Linux VM may use. */
 const gb = (mib) => `${Math.round(mib / 1024)} GB`;
+const diskGb = (g) => `${g} GB`;
 const cpuText = (n) => trn(n, "{n} CPU", "{n} CPUs");
 /* How far along its track a slider's blue fill reaches, as CSS: to the
    middle of the thumb, which travels the track less its own 26 px. */
@@ -4416,7 +4417,7 @@ const rangeFill = (v, min, max) => {
   const f = max > min ? (v - min) / (max - min) : 0;
   return `calc(13px + (100% - 26px) * ${f.toFixed(4)})`;
 };
-const resChanged = () => ui.res && (ui.resDraft.cpus !== ui.res.cpus || ui.resDraft.memory_mib !== ui.res.memory_mib);
+const resChanged = () => ui.res && (ui.resDraft.cpus !== ui.res.cpus || ui.resDraft.memory_mib !== ui.res.memory_mib || (ui.res.disk_gb != null && ui.resDraft.disk_gb !== ui.res.disk_gb));
 /* Settings › Resources: the engine's on/off, the same switch as the card. */
 function enginePane() {
   const { shown } = engineShown(), off = shown === "stopped";
@@ -4436,14 +4437,21 @@ function resourcesPane() {
   if (r.error) return `<div class="pane"><h3>${tr("Resources")}</h3><p class="muted">${tr("Start Kiri to change its resources. ({error})", { error: esc(r.error) })}</p></div>`;
   const d = ui.resDraft;
   const maxGb = Math.max(1, Math.floor(r.max_memory_mib / 1024));
-  const pending = r.awake && (r.running_cpus !== r.cpus || Math.abs(r.running_memory_mib - r.memory_mib) > 64);
+  const hasDisk = r.disk_gb != null;
+  const minDisk = r.min_disk_gb ?? 64;
+  const maxDisk = Math.max(minDisk, r.max_disk_gb ?? 1024);
+  const diskVal = hasDisk ? Math.min(Math.max(d.disk_gb ?? r.disk_gb, minDisk), maxDisk) : minDisk;
+  const diskStep = minDisk % 8 === 0 && diskVal % 8 === 0 && maxDisk % 8 === 0 ? 8 : 1;
+  const pending = r.awake && (r.running_cpus !== r.cpus || Math.abs(r.running_memory_mib - r.memory_mib) > 64 || (hasDisk && r.running_disk_gb != null && r.running_disk_gb !== r.disk_gb));
   return `<div class="pane"><h3>${tr("Resources")}</h3>
     <div class="pref"><span class="t">${tr("CPUs")}</span><span class="d">${tr("Shared with {os}: the VM only uses them while containers are busy.", { os: OS })}</span>
       <div class="range"><input type="range" id="res-cpus" min="1" max="${r.max_cpus}" step="1" value="${d.cpus}" aria-label="${tr("CPUs")}" style="--fill:${rangeFill(d.cpus, 1, r.max_cpus)}"><span class="num" id="res-cpus-v">${cpuText(d.cpus)}</span></div></div>
     <div class="pref"><span class="t">${tr("Memory")}</span><span class="d">${tr("The most the VM may take. It uses memory only as containers need it and gives the rest back to {os}.", { os: OS })}</span>
       <div class="range"><input type="range" id="res-mem" min="1024" max="${maxGb * 1024}" step="1024" value="${Math.min(d.memory_mib, maxGb * 1024)}" aria-label="${tr("Memory")}" style="--fill:${rangeFill(Math.min(d.memory_mib, maxGb * 1024), 1024, maxGb * 1024)}"><span class="num" id="res-mem-v">${gb(d.memory_mib)}</span></div></div>
-    ${r.overridden ? `<p class="muted">${tr("KIRI_CPUS or KIRI_MEMORY_MIB is set for the daemon, and it takes precedence over these.")}</p>` : ""}
-    <div class="res-foot"><span class="muted">${r.awake ? tr("Running now with {cpus} and up to {mem}.", { cpus: cpuText(r.running_cpus), mem: gb(r.running_memory_mib) }) : tr("The VM is asleep; it starts with these next time.")}</span>
+    ${hasDisk ? `<div class="pref"><span class="t">${tr("Disk image size")}</span><span class="d">${tr("The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.", { os: OS })}</span>
+      <div class="range"><input type="range" id="res-disk" min="${minDisk}" max="${maxDisk}" step="${diskStep}" value="${diskVal}" aria-label="${tr("Disk image size")}" style="--fill:${rangeFill(diskVal, minDisk, maxDisk)}"><span class="num" id="res-disk-v">${diskGb(diskVal)}</span></div></div>` : ""}
+    ${r.overridden ? `<p class="muted">${hasDisk ? tr("KIRI_CPUS, KIRI_MEMORY_MIB or KIRI_DISK_GB is set for the daemon, and it takes precedence over these.") : tr("KIRI_CPUS or KIRI_MEMORY_MIB is set for the daemon, and it takes precedence over these.")}</p>` : ""}
+    <div class="res-foot"><span class="muted">${r.awake ? (hasDisk ? tr("Running now with {cpus}, up to {mem}, and a {disk} disk.", { cpus: cpuText(r.running_cpus), mem: gb(r.running_memory_mib), disk: diskGb(r.running_disk_gb ?? r.disk_gb) }) : tr("Running now with {cpus} and up to {mem}.", { cpus: cpuText(r.running_cpus), mem: gb(r.running_memory_mib) })) : tr("The VM is asleep; it starts with these next time.")}</span>
       <span style="flex:1"></span>
       ${pending ? `<button class="btn" id="res-restart" data-restartvm>${tr("Restart VM to apply")}</button>` : ""}
       <button class="btn primary" id="res-save" data-saveres${resChanged() ? "" : " disabled"}>${tr("Save")}</button></div>
@@ -4564,10 +4572,11 @@ function renderSettings() {
     const go = document.querySelector("#content [data-impgo]"), n = importCount();
     if (go) { go.disabled = !n; go.textContent = n ? trn(n, "Import {n} item", "Import {n} items") : tr("Import"); }
   }));
-  for (const id of ["res-cpus", "res-mem"]) $(id)?.addEventListener("input", (ev) => {
-    ui.resDraft[id === "res-cpus" ? "cpus" : "memory_mib"] = +ev.target.value;
-    ev.target.style.setProperty("--fill", rangeFill(+ev.target.value, +ev.target.min, +ev.target.max));
-    $(`${id}-v`).textContent = id === "res-cpus" ? cpuText(+ev.target.value) : gb(+ev.target.value);
+  for (const id of ["res-cpus", "res-mem", "res-disk"]) $(id)?.addEventListener("input", (ev) => {
+    const v = +ev.target.value;
+    ui.resDraft[id === "res-cpus" ? "cpus" : id === "res-mem" ? "memory_mib" : "disk_gb"] = v;
+    ev.target.style.setProperty("--fill", rangeFill(v, +ev.target.min, +ev.target.max));
+    $(`${id}-v`).textContent = id === "res-cpus" ? cpuText(v) : id === "res-mem" ? gb(v) : diskGb(v);
     $("res-save").disabled = !resChanged();
   });
   $("pref-font")?.addEventListener("change", (ev) => setPref("font", ev.target.value));
@@ -8211,7 +8220,7 @@ window.kiri = {
         if (ui.view === "settings") render();
         break;
       }
-      case "resources": ui.res = e; ui.resDraft = { cpus: e.cpus, memory_mib: e.memory_mib }; if (ui.view === "settings") render(); break;
+      case "resources": ui.res = e; ui.resDraft = { cpus: e.cpus, memory_mib: e.memory_mib, ...(e.disk_gb != null ? { disk_gb: e.disk_gb } : {}) }; if (ui.view === "settings") render(); break;
       case "detail": openDetail(e.id); break;
       case "inspect":
         if (ui.detail?.id === e.id) {

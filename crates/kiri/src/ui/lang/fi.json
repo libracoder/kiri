@@ -1850,5 +1850,9 @@
   "Continue anyway": "Jatka silti",
   "One step didn't work. Everything else is ready.": "Yksi vaihe ei onnistunut. Kaikki muu on valmista.",
   "Some steps didn't work. Everything else is ready.": "Jotkin vaiheet eivät onnistuneet. Kaikki muu on valmista.",
-  "No matches": "Ei osumia"
+  "No matches": "Ei osumia",
+  "Disk image size": "Levykuvan koko",
+  "KIRI_CPUS, KIRI_MEMORY_MIB or KIRI_DISK_GB is set for the daemon, and it takes precedence over these.": "Daemonille on asetettu KIRI_CPUS, KIRI_MEMORY_MIB tai KIRI_DISK_GB, ja ne menevät näiden edelle.",
+  "Running now with {cpus}, up to {mem}, and a {disk} disk.": "Käynnissä nyt: {cpus}, muistia enintään {mem}, levy {disk}.",
+  "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "Enimmäiskoko, johon virtuaalikoneen levy voi kasvaa. Tilaa kuluu järjestelmästä {os} vain dataa kirjoitettaessa, eikä levy koskaan pienene. Tulee voimaan uudelleenkäynnistyksessä."
 }

@@ -1850,5 +1850,9 @@
   "Continue anyway": "هەر بەردەوام بە",
   "One step didn't work. Everything else is ready.": "یەک هەنگاو سەرکەوتوو نەبوو. هەموو شتێکی تر ئامادەیە.",
   "Some steps didn't work. Everything else is ready.": "هەندێک هەنگاو سەرکەوتوو نەبوون. هەموو شتێکی تر ئامادەیە.",
-  "No matches": "هیچ شتێکی هاوتا نییە"
+  "No matches": "هیچ شتێکی هاوتا نییە",
+  "Disk image size": "قەبارەی وێنەی دیسک",
+  "KIRI_CPUS, KIRI_MEMORY_MIB or KIRI_DISK_GB is set for the daemon, and it takes precedence over these.": "KIRI_CPUS، KIRI_MEMORY_MIB یان KIRI_DISK_GB بۆ daemon دانراوە، و لەسەر ئەمانە پێشەنگی هەیە.",
+  "Running now with {cpus}, up to {mem}, and a {disk} disk.": "ئێستا بە {cpus}، تا {mem} و دیسکی {disk} کاردەکات.",
+  "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "زۆرترین قەبارە کە دیسکی VM دەتوانێت بۆی گەورە ببێت. تەنها کاتێک داتا دەنووسرێت جێگا لەسەر {os} بەکاردەهێنێت؛ هەرگیز بچووک نابێتەوە. لە کاتی دەستپێکردنەوەدا جێبەجێ دەبێت."
 }

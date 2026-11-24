@@ -1850,5 +1850,9 @@
   "Continue anyway": "Vseeno nadaljuj",
   "One step didn't work. Everything else is ready.": "En korak ni uspel. Vse drugo je pripravljeno.",
   "Some steps didn't work. Everything else is ready.": "Nekateri koraki niso uspeli. Vse drugo je pripravljeno.",
-  "No matches": "Ni zadetkov"
+  "No matches": "Ni zadetkov",
+  "Disk image size": "Velikost slike diska",
+  "KIRI_CPUS, KIRI_MEMORY_MIB or KIRI_DISK_GB is set for the daemon, and it takes precedence over these.": "Za demon je nastavljen KIRI_CPUS, KIRI_MEMORY_MIB ali KIRI_DISK_GB, ki ima prednost pred temi nastavitvami.",
+  "Running now with {cpus}, up to {mem}, and a {disk} disk.": "Zdaj teče s {cpus}, največ {mem} in diskom {disk}.",
+  "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "Največja velikost, do katere lahko zraste disk navideznega računalnika. Prostor v sistemu {os} se porablja šele ob zapisovanju podatkov; disk se nikoli ne skrči. Uveljavi se ob ponovnem zagonu."
 }

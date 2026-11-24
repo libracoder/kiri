@@ -1850,5 +1850,9 @@
   "Continue anyway": "Усе одно продовжити",
   "One step didn't work. Everything else is ready.": "Один крок не вдався. Усе інше готове.",
   "Some steps didn't work. Everything else is ready.": "Деякі кроки не вдалися. Усе інше готове.",
-  "No matches": "Збігів немає"
+  "No matches": "Збігів немає",
+  "Disk image size": "Розмір образу диска",
+  "KIRI_CPUS, KIRI_MEMORY_MIB or KIRI_DISK_GB is set for the daemon, and it takes precedence over these.": "Для демона задано змінну KIRI_CPUS, KIRI_MEMORY_MIB або KIRI_DISK_GB, і вона має пріоритет над цими налаштуваннями.",
+  "Running now with {cpus}, up to {mem}, and a {disk} disk.": "Зараз працює з {cpus}, до {mem} пам’яті та диском {disk}.",
+  "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "Максимум, до якого може вирости диск ВМ. Місце на {os} займається лише під час запису даних; розмір ніколи не зменшується. Застосовується після перезапуску."
 }

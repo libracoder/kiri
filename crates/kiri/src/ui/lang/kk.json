@@ -1850,5 +1850,9 @@
   "Continue anyway": "Бәрібір жалғастыру",
   "One step didn't work. Everything else is ready.": "Бір қадам орындалмады. Қалғанының бәрі дайын.",
   "Some steps didn't work. Everything else is ready.": "Кейбір қадамдар орындалмады. Қалғанының бәрі дайын.",
-  "No matches": "Сәйкестік жоқ"
+  "No matches": "Сәйкестік жоқ",
+  "Disk image size": "Диск кескінінің өлшемі",
+  "KIRI_CPUS, KIRI_MEMORY_MIB or KIRI_DISK_GB is set for the daemon, and it takes precedence over these.": "Демон үшін KIRI_CPUS, KIRI_MEMORY_MIB немесе KIRI_DISK_GB орнатылған және ол осы баптаулардан басым.",
+  "Running now with {cpus}, up to {mem}, and a {disk} disk.": "Қазір {cpus}, {mem} дейінгі жад және {disk} дискімен жұмыс істеп тұр.",
+  "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "Виртуалды машина дискі өсе алатын ең үлкен өлшем. {os} жүйесінде орын тек деректер жазылғанда ғана алынады; ол ешқашан кішіреймейді. Қайта іске қосқанда қолданылады."
 }

@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 use kiri_proto::{HEADER, Hello, LayerBegin, Msg, Stream};
 use kiri_vmm::{Config, Event, Vm};
 
+pub mod disk;
+
 /// The virtiofs tag the guest mounts the Mac's folders under: `/mnt/mac`.
 pub const MAC_TAG: &str = "kiri-mac";
 
@@ -68,6 +70,9 @@ pub struct BootOptions {
     pub memory_mib: Option<u64>,
     /// The VM's CPUs; 2 if not set.
     pub cpus: Option<usize>,
+    /// The VM's persistent data disk size in GiB (`vm.json`'s `disk_gb`);
+    /// `KIRI_DISK_GB` overrides this when set.
+    pub disk_gb: Option<u64>,
 }
 
 fn console_output(opts: &BootOptions) -> io::Result<Option<OwnedFd>> {
@@ -181,7 +186,7 @@ impl Guest {
             cmdline,
             console: console_output(opts)?,
             agent_port: kiri_proto::HOST_PORT,
-            disk: if opts.data_disk { Some(data_disk(&dir)?) } else { None },
+            disk: if opts.data_disk { Some(data_disk(&dir, opts.disk_gb)?) } else { None },
             nat_mac: if opts.data_disk { Some(mac_address()?) } else { None },
             // The Mac's folders a bind mount may name: /mnt/mac in the guest.
             share: opts.data_disk.then(mac_share),
@@ -388,7 +393,8 @@ fn agent_binary() -> PathBuf {
 #[cfg(target_os = "macos")]
 /// The guest's data disk, copied from the empty template on first use. On
 /// APFS the copy is a clone: instant, and it takes no space until written.
-fn data_disk(guest_dir: &std::path::Path) -> io::Result<PathBuf> {
+fn data_disk(guest_dir: &std::path::Path, configured_gb: Option<u64>) -> io::Result<PathBuf> {
+    let requested = disk::requested_size(configured_gb)?;
     let vm = kiri_image::Store::default_root()?.join("vm");
     std::fs::create_dir_all(&vm)?;
     let disk = vm.join("data.img");
@@ -416,6 +422,7 @@ fn data_disk(guest_dir: &std::path::Path) -> io::Result<PathBuf> {
         }
         std::fs::rename(tmp, &disk)?;
     }
+    disk::grow(&disk, requested)?;
     Ok(disk)
 }
 

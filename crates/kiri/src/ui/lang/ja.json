@@ -1850,5 +1850,9 @@
   "Continue anyway": "このまま続ける",
   "One step didn't work. Everything else is ready.": "1 つの手順がうまくいきませんでした。ほかはすべて準備できています。",
   "Some steps didn't work. Everything else is ready.": "いくつかの手順がうまくいきませんでした。ほかはすべて準備できています。",
-  "No matches": "一致するものはありません"
+  "No matches": "一致するものはありません",
+  "Disk image size": "ディスクイメージのサイズ",
+  "KIRI_CPUS, KIRI_MEMORY_MIB or KIRI_DISK_GB is set for the daemon, and it takes precedence over these.": "デーモンに KIRI_CPUS、KIRI_MEMORY_MIB、または KIRI_DISK_GB が設定されており、こちらの設定より優先されます。",
+  "Running now with {cpus}, up to {mem}, and a {disk} disk.": "現在 {cpus}、最大 {mem}、{disk} ディスクで実行中です。",
+  "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "VM ディスクが拡張できる上限です。{os} 上の容量はデータが書き込まれた分だけ使用され、縮小することはありません。再起動時に適用されます。"
 }

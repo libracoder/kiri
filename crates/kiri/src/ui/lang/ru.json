@@ -1850,5 +1850,9 @@
   "Continue anyway": "Всё равно продолжить",
   "One step didn't work. Everything else is ready.": "Один шаг не удался. Всё остальное готово.",
   "Some steps didn't work. Everything else is ready.": "Некоторые шаги не удались. Всё остальное готово.",
-  "No matches": "Совпадений нет"
+  "No matches": "Совпадений нет",
+  "Disk image size": "Размер образа диска",
+  "KIRI_CPUS, KIRI_MEMORY_MIB or KIRI_DISK_GB is set for the daemon, and it takes precedence over these.": "Для демона задана переменная KIRI_CPUS, KIRI_MEMORY_MIB или KIRI_DISK_GB, и она имеет приоритет над этими настройками.",
+  "Running now with {cpus}, up to {mem}, and a {disk} disk.": "Сейчас работает с {cpus}, до {mem} памяти и диском {disk}.",
+  "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "Максимум, до которого может вырасти диск ВМ. Место на {os} занимается только по мере записи данных; размер никогда не уменьшается. Применяется после перезапуска."
 }

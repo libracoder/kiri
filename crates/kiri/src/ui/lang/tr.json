@@ -1850,5 +1850,9 @@
   "Continue anyway": "Yine de devam et",
   "One step didn't work. Everything else is ready.": "Bir adım çalışmadı. Geri kalan her şey hazır.",
   "Some steps didn't work. Everything else is ready.": "Bazı adımlar çalışmadı. Geri kalan her şey hazır.",
-  "No matches": "Eşleşme yok"
+  "No matches": "Eşleşme yok",
+  "Disk image size": "Disk görüntüsü boyutu",
+  "KIRI_CPUS, KIRI_MEMORY_MIB or KIRI_DISK_GB is set for the daemon, and it takes precedence over these.": "Daemon için KIRI_CPUS, KIRI_MEMORY_MIB veya KIRI_DISK_GB ayarlı ve bunlar buradakilerden önceliklidir.",
+  "Running now with {cpus}, up to {mem}, and a {disk} disk.": "Şu anda {cpus}, en fazla {mem} ve {disk} disk ile çalışıyor.",
+  "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "VM diskinin büyüyebileceği en fazla boyut. {os} üzerinde alan yalnızca veri yazıldıkça kullanılır; asla küçülmez. Yeniden başlatmada uygulanır."
 }

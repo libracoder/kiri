@@ -1850,5 +1850,9 @@
   "Continue anyway": "ดำเนินการต่อ",
   "One step didn't work. Everything else is ready.": "ขั้นตอนหนึ่งไม่สำเร็จ ส่วนอื่นพร้อมทั้งหมด",
   "Some steps didn't work. Everything else is ready.": "บางขั้นตอนไม่สำเร็จ ส่วนอื่นพร้อมทั้งหมด",
-  "No matches": "ไม่พบรายการที่ตรงกัน"
+  "No matches": "ไม่พบรายการที่ตรงกัน",
+  "Disk image size": "ขนาดอิมเมจดิสก์",
+  "KIRI_CPUS, KIRI_MEMORY_MIB or KIRI_DISK_GB is set for the daemon, and it takes precedence over these.": "มีการตั้งค่า KIRI_CPUS, KIRI_MEMORY_MIB หรือ KIRI_DISK_GB ให้ daemon ซึ่งมีลำดับความสำคัญเหนือค่าเหล่านี้",
+  "Running now with {cpus}, up to {mem}, and a {disk} disk.": "ขณะนี้ทำงานด้วย {cpus} สูงสุด {mem} และดิสก์ {disk}",
+  "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "ขนาดสูงสุดที่ดิสก์ของ VM ขยายได้ พื้นที่บน {os} จะถูกใช้เมื่อมีการเขียนข้อมูลเท่านั้น และจะไม่หดเล็กลง มีผลเมื่อรีสตาร์ท"
 }

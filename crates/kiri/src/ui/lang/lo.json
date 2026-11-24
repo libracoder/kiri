@@ -1850,5 +1850,9 @@
   "Continue anyway": "ສືບຕໍ່ຕໍ່ໄປ",
   "One step didn't work. Everything else is ready.": "ມີ 1 ຂັ້ນຕອນບໍ່ສຳເລັດ. ສ່ວນອື່ນພ້ອມທັງໝົດ.",
   "Some steps didn't work. Everything else is ready.": "ບາງຂັ້ນຕອນບໍ່ສຳເລັດ. ສ່ວນອື່ນພ້ອມທັງໝົດ.",
-  "No matches": "ບໍ່ມີລາຍການທີ່ກົງກັນ"
+  "No matches": "ບໍ່ມີລາຍການທີ່ກົງກັນ",
+  "Disk image size": "ຂະໜາດອິມເມຈດິສກ໌",
+  "KIRI_CPUS, KIRI_MEMORY_MIB or KIRI_DISK_GB is set for the daemon, and it takes precedence over these.": "KIRI_CPUS, KIRI_MEMORY_MIB ຫຼື KIRI_DISK_GB ຖືກຕັ້ງໄວ້ສຳລັບ daemon, ແລະ ມັນມີຜົນເໜືອກວ່າຄ່າເຫຼົ່ານີ້.",
+  "Running now with {cpus}, up to {mem}, and a {disk} disk.": "ຕອນນີ້ແລ່ນດ້ວຍ {cpus}, ສູງສຸດ {mem} ແລະ ດິສກ໌ {disk}.",
+  "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "ຂະໜາດສູງສຸດທີ່ດິສກ໌ VM ສາມາດຂະຫຍາຍໄດ້. ພື້ນທີ່ໃນ {os} ຈະຖືກໃຊ້ສະເພາະເມື່ອມີການຂຽນຂໍ້ມູນ ແລະ ບໍ່ເຄີຍຫົດລົງ. ມີຜົນເມື່ອເລີ່ມໃໝ່."
 }

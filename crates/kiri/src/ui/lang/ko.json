@@ -1850,5 +1850,9 @@
   "Continue anyway": "그래도 계속",
   "One step didn't work. Everything else is ready.": "한 단계가 실패했습니다. 나머지는 모두 준비되었습니다.",
   "Some steps didn't work. Everything else is ready.": "일부 단계가 실패했습니다. 나머지는 모두 준비되었습니다.",
-  "No matches": "일치하는 항목 없음"
+  "No matches": "일치하는 항목 없음",
+  "Disk image size": "디스크 이미지 크기",
+  "KIRI_CPUS, KIRI_MEMORY_MIB or KIRI_DISK_GB is set for the daemon, and it takes precedence over these.": "데몬에 KIRI_CPUS, KIRI_MEMORY_MIB 또는 KIRI_DISK_GB가 설정되어 있어 이 값보다 우선합니다.",
+  "Running now with {cpus}, up to {mem}, and a {disk} disk.": "지금 {cpus}, 최대 {mem}, {disk} 디스크로 실행 중입니다.",
+  "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "VM 디스크가 커질 수 있는 최대 크기입니다. {os}의 공간은 데이터를 쓸 때만 사용되며 줄어들지 않습니다. 재시작 시 적용됩니다."
 }

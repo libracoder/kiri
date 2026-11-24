@@ -1850,5 +1850,9 @@
   "Continue anyway": "به هر حال ادامه بده",
   "One step didn't work. Everything else is ready.": "یک مرحله انجام نشد. بقیه چیزها آماده است.",
   "Some steps didn't work. Everything else is ready.": "چند مرحله انجام نشد. بقیه چیزها آماده است.",
-  "No matches": "موردی پیدا نشد"
+  "No matches": "موردی پیدا نشد",
+  "Disk image size": "اندازهٔ تصویر دیسک",
+  "KIRI_CPUS, KIRI_MEMORY_MIB or KIRI_DISK_GB is set for the daemon, and it takes precedence over these.": "KIRI_CPUS، KIRI_MEMORY_MIB یا KIRI_DISK_GB برای سرویس پس‌زمینه تنظیم شده و بر این تنظیمات اولویت دارد.",
+  "Running now with {cpus}, up to {mem}, and a {disk} disk.": "اکنون با {cpus}، حداکثر {mem} و دیسک {disk} در حال اجراست.",
+  "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "بیشترین اندازه‌ای که دیسک ماشین مجازی می‌تواند بزرگ شود. فضا در {os} فقط هنگام نوشتن داده‌ها مصرف می‌شود و هرگز کوچک نمی‌شود. پس از راه‌اندازی مجدد اعمال می‌شود."
 }

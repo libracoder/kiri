@@ -949,16 +949,56 @@ fn image_scan(req: &Request, w: &mut UnixStream) -> io::Result<Next> {
 /// the limits of this Mac.
 fn resources(engine: &Engine) -> Value {
     use super::engine as e;
-    json!({
-        "cpus": e::vm_cpus(),
-        "memory_mib": e::memory_ceiling() >> 20,
-        "running_cpus": engine.cpus(),
-        "running_memory_mib": engine.memory().0 >> 20,
-        "awake": engine.is_awake(),
-        "max_cpus": e::max_cpus(),
-        "max_memory_mib": e::physical_memory_bytes() >> 20,
-        "overridden": std::env::var_os("KIRI_CPUS").is_some() || std::env::var_os("KIRI_MEMORY_MIB").is_some(),
-    })
+    #[cfg(target_os = "macos")]
+    let disk = Some((crate::guest::disk::current_gb(), e::vm_disk_gb(), engine.disk_gb()));
+    #[cfg(not(target_os = "macos"))]
+    let disk: Option<(u64, u64, u64)> = None;
+    let overridden = std::env::var_os("KIRI_CPUS").is_some()
+        || std::env::var_os("KIRI_MEMORY_MIB").is_some()
+        || (cfg!(target_os = "macos") && std::env::var_os("KIRI_DISK_GB").is_some());
+    resources_payload(
+        e::vm_cpus(),
+        e::memory_ceiling() >> 20,
+        engine.cpus(),
+        engine.memory().0 >> 20,
+        engine.is_awake(),
+        e::max_cpus(),
+        e::physical_memory_bytes() >> 20,
+        overridden,
+        disk,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resources_payload(
+    cpus: usize,
+    memory_mib: u64,
+    running_cpus: usize,
+    running_memory_mib: u64,
+    awake: bool,
+    max_cpus: usize,
+    max_memory_mib: u64,
+    overridden: bool,
+    disk: Option<(u64, u64, u64)>,
+) -> Value {
+    let mut v = json!({
+        "cpus": cpus,
+        "memory_mib": memory_mib,
+        "running_cpus": running_cpus,
+        "running_memory_mib": running_memory_mib,
+        "awake": awake,
+        "max_cpus": max_cpus,
+        "max_memory_mib": max_memory_mib,
+        "overridden": overridden,
+    });
+    if let Some((current_disk_gb, disk_gb, running_disk_gb)) = disk {
+        let (min_disk_gb, max_disk_gb) = crate::guest::disk::ui_bounds(current_disk_gb, disk_gb);
+        v["disk_gb"] = json!(disk_gb);
+        v["running_disk_gb"] = json!(running_disk_gb);
+        v["min_disk_gb"] = json!(min_disk_gb);
+        v["max_disk_gb"] = json!(max_disk_gb);
+    }
+    v
 }
 
 /// The host's system proxy, from kiri-win on Windows: `{http, https,
@@ -1021,13 +1061,46 @@ fn set_domain_ports(req: &Request, engine: &Arc<Engine>) -> Result<Value, Error>
 
 fn set_resources(req: &Request) -> Result<(), Error> {
     use super::engine as e;
-    let body: Value = serde_json::from_slice(&req.body).map_err(|e| Error::BadRequest(format!("invalid JSON: {e}")))?;
-    let max_mem = e::physical_memory_bytes() >> 20;
-    let cpus = body["cpus"].as_u64().filter(|c| (1..=e::max_cpus() as u64).contains(c)).ok_or_else(|| Error::BadRequest(format!("cpus must be 1 to {}", e::max_cpus())))?;
-    let mem = body["memory_mib"].as_u64().filter(|m| (1024..=max_mem).contains(m)).ok_or_else(|| Error::BadRequest(format!("memory_mib must be 1024 to {max_mem}")))?;
     let path = e::resources_path().ok_or_else(|| Error::Io(io::Error::other("HOME is not set")))?;
+    let current_disk = cfg!(target_os = "macos").then(crate::guest::disk::current_gb);
+    save_resources(
+        &req.body,
+        &path,
+        e::max_cpus() as u64,
+        e::physical_memory_bytes() >> 20,
+        current_disk,
+        e::vm_disk_gb_config(),
+    )
+}
+
+fn save_resources(
+    raw_body: &[u8],
+    path: &std::path::Path,
+    max_cpus: u64,
+    max_mem: u64,
+    current_disk_gb: Option<u64>,
+    existing_disk_gb: Option<u64>,
+) -> Result<(), Error> {
+    let body: Value = serde_json::from_slice(raw_body).map_err(|e| Error::BadRequest(format!("invalid JSON: {e}")))?;
+    let cpus = body["cpus"].as_u64().filter(|c| (1..=max_cpus).contains(c)).ok_or_else(|| Error::BadRequest(format!("cpus must be 1 to {max_cpus}")))?;
+    let mem = body["memory_mib"].as_u64().filter(|m| (1024..=max_mem).contains(m)).ok_or_else(|| Error::BadRequest(format!("memory_mib must be 1024 to {max_mem}")))?;
+    let mut out = json!({"cpus": cpus, "memory_mib": mem});
+    if let Some(val) = body.get("disk_gb").filter(|v| !v.is_null()) {
+        let current = current_disk_gb.unwrap_or(crate::guest::disk::DEFAULT_GB);
+        let (min_disk, max_disk) = crate::guest::disk::ui_bounds(current, existing_disk_gb.unwrap_or(current));
+        let disk_gb = val
+            .as_u64()
+            .filter(|d| (min_disk..=max_disk).contains(d))
+            .ok_or_else(|| Error::BadRequest(format!("disk_gb must be {min_disk} to {max_disk}")))?;
+        out["disk_gb"] = json!(disk_gb);
+    } else if let Some(prev) = existing_disk_gb {
+        out["disk_gb"] = json!(prev);
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(Error::Io)?;
+    }
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, json!({"cpus": cpus, "memory_mib": mem}).to_string()).and_then(|()| std::fs::rename(&tmp, &path)).map_err(Error::Io)
+    std::fs::write(&tmp, out.to_string()).and_then(|()| std::fs::rename(&tmp, path)).map_err(Error::Io)
 }
 
 fn set_ports(req: &Request, engine: &Engine, id: &str) -> Result<Value, Error> {
@@ -6155,5 +6228,64 @@ mod leave_first_network_tests {
         assert!(names(&engine.with(&id, |c| network_settings(c, &networks)).unwrap()["Networks"]).is_empty());
         drop(engine);
         let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+mod resources_disk_tests {
+    use super::*;
+
+    #[test]
+    fn resources_payload_round_trip_and_disk_bounds() {
+        let dir = std::env::temp_dir().join(format!(
+            "kiri-res-disk-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let path = dir.join("vm.json");
+
+        // Save CPUs, memory and disk_gb; verify vm.json contents.
+        let body = json!({"cpus": 4, "memory_mib": 8192, "disk_gb": 128}).to_string();
+        save_resources(body.as_bytes(), &path, 12, 32768, Some(64), None).unwrap();
+        let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved, json!({"cpus": 4, "memory_mib": 8192, "disk_gb": 128}));
+
+        // Omitting disk_gb preserves the existing disk_gb in vm.json.
+        let body2 = json!({"cpus": 6, "memory_mib": 4096}).to_string();
+        save_resources(body2.as_bytes(), &path, 12, 32768, Some(64), saved["disk_gb"].as_u64()).unwrap();
+        let saved2: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved2, json!({"cpus": 6, "memory_mib": 4096, "disk_gb": 128}));
+
+        // Shrinking below current data.img size (128 GiB) is rejected with 400.
+        let shrink = json!({"cpus": 4, "memory_mib": 8192, "disk_gb": 96}).to_string();
+        match save_resources(shrink.as_bytes(), &path, 12, 32768, Some(128), Some(128)) {
+            Err(Error::BadRequest(msg)) => assert!(msg.contains("disk_gb must be 128 to 1024"), "{msg}"),
+            other => panic!("expected BadRequest for shrink, got {other:?}"),
+        }
+
+        // Below 64 GiB template floor, zero, negative, and oversized values are rejected.
+        for bad in [json!(0), json!(32), json!(-1), json!(2048), json!("128")] {
+            let raw = json!({"cpus": 4, "memory_mib": 8192, "disk_gb": bad}).to_string();
+            match save_resources(raw.as_bytes(), &path, 12, 32768, Some(64), None) {
+                Err(Error::BadRequest(msg)) => assert!(msg.contains("disk_gb must be"), "{msg}"),
+                other => panic!("expected BadRequest for {bad}, got {other:?}"),
+            }
+        }
+
+        // Payload includes disk fields on macOS and omits them when None (Linux).
+        let mac = resources_payload(4, 8192, 4, 8192, true, 12, 32768, false, Some((128, 256, 128)));
+        assert_eq!(mac["disk_gb"], 256);
+        assert_eq!(mac["running_disk_gb"], 128);
+        assert_eq!(mac["min_disk_gb"], 128);
+        assert_eq!(mac["max_disk_gb"], 1024);
+
+        let linux = resources_payload(4, 8192, 4, 8192, true, 12, 32768, false, None);
+        assert!(linux.get("disk_gb").is_none());
+        assert!(linux.get("min_disk_gb").is_none());
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -1850,5 +1850,9 @@
   "Continue anyway": "Tetap lanjutkan",
   "One step didn't work. Everything else is ready.": "Satu langkah tidak berhasil. Yang lainnya sudah siap.",
   "Some steps didn't work. Everything else is ready.": "Beberapa langkah tidak berhasil. Yang lainnya sudah siap.",
-  "No matches": "Tidak ada yang cocok"
+  "No matches": "Tidak ada yang cocok",
+  "Disk image size": "Ukuran image disk",
+  "KIRI_CPUS, KIRI_MEMORY_MIB or KIRI_DISK_GB is set for the daemon, and it takes precedence over these.": "KIRI_CPUS, KIRI_MEMORY_MIB, atau KIRI_DISK_GB diatur untuk daemon, dan lebih diutamakan daripada pengaturan ini.",
+  "Running now with {cpus}, up to {mem}, and a {disk} disk.": "Berjalan sekarang dengan {cpus}, hingga {mem}, dan disk {disk}.",
+  "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "Batas maksimum pertumbuhan disk VM. Ruang di {os} hanya terpakai saat data ditulis; ukurannya tidak pernah menyusut. Berlaku setelah mulai ulang."
 }

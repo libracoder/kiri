@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #384 macOS: configurable VM disk size with online ext4 growth (unreleased)
+- Fixes: #384 macOS: VM data.img is fixed at 64 GiB with no disk size setting
+- Caused: none known
+- Caused by: -
+- Check: `tests/disk-grow.py`, `tests/ui/resources-disk.js`
+
 ### #487 Windows: opt-in file-change events for `C:\` bind mounts (unreleased)
 - Fixes: #487 Windows: file watchers in containers never hear of changes made on Windows to files in `C:\` bind mounts
 

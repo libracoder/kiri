@@ -243,13 +243,29 @@ pub fn max_cpus() -> usize {
     std::thread::available_parallelism().map_or(2, std::num::NonZero::get)
 }
 
-/// What Settings → Resources saved, read at each boot: `{"cpus", "memory_mib"}`.
+/// What Settings → Resources saved, read at each boot: `{"cpus", "memory_mib", "disk_gb"}`.
 pub fn resources_path() -> Option<std::path::PathBuf> {
     super::state_dir().ok().map(|d| d.join("vm.json"))
 }
 
 pub fn resources() -> serde_json::Value {
     resources_path().and_then(|p| std::fs::read(p).ok()).and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(serde_json::Value::Null)
+}
+
+/// The VM's persistent data disk size from `vm.json`, if valid.
+pub fn vm_disk_gb_config() -> Option<u64> {
+    resources()["disk_gb"]
+        .as_u64()
+        .filter(|&gb| crate::guest::disk::size_bytes(gb).is_ok())
+}
+
+/// The VM's effective data disk size in GiB: `KIRI_DISK_GB`, else
+/// Settings → Resources (`vm.json`), else 64 GiB; never below the current
+/// `data.img` size.
+pub fn vm_disk_gb() -> u64 {
+    let env_os = std::env::var_os("KIRI_DISK_GB");
+    let env_str = env_os.as_ref().and_then(|v| v.to_str());
+    crate::guest::disk::effective_gb(env_str, vm_disk_gb_config(), crate::guest::disk::current_gb())
 }
 
 pub fn physical_memory_bytes() -> u64 {
@@ -1310,6 +1326,8 @@ pub struct Engine {
     ceiling: std::sync::atomic::AtomicU64,
     /// CPUs the running VM has.
     cpus: std::sync::atomic::AtomicUsize,
+    /// Data disk capacity in GiB the running VM booted with (macOS).
+    disk_gb: std::sync::atomic::AtomicU64,
     memory_target: Mutex<u64>,
     /// What the guest last used, in bytes (0 while asleep): the balloon's
     /// measure, without the pages the balloon itself holds.
@@ -1463,6 +1481,7 @@ impl Engine {
             parking: std::sync::atomic::AtomicBool::new(false),
             ceiling: std::sync::atomic::AtomicU64::new(ceiling),
             cpus: std::sync::atomic::AtomicUsize::new(vm_cpus()),
+            disk_gb: std::sync::atomic::AtomicU64::new(vm_disk_gb()),
             memory_target: Mutex::new(ceiling),
             memory_used: std::sync::atomic::AtomicU64::new(0),
             mem_available_kib: std::sync::atomic::AtomicU64::new(0),
@@ -1622,7 +1641,7 @@ impl Engine {
         if recovery && !self.lock().containers.values().any(recover_after_vm_loss) {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "VM recovery was canceled"));
         }
-        let (ceiling, cpus) = (memory_ceiling(), vm_cpus());
+        let (ceiling, cpus, disk_cfg) = (memory_ceiling(), vm_cpus(), vm_disk_gb_config());
         self.ceiling.store(ceiling, std::sync::atomic::Ordering::Relaxed);
         self.cpus.store(cpus, std::sync::atomic::Ordering::Relaxed);
         let t0 = std::time::Instant::now();
@@ -1633,9 +1652,11 @@ impl Engine {
             console_log: crate::diag::console::path().ok(),
             memory_mib: Some(ceiling >> 20),
             cpus: Some(cpus),
+            disk_gb: disk_cfg,
             ..Default::default()
         })
         .inspect_err(|e| crate::diag::error!("VM did not boot", error = e))?;
+        self.disk_gb.store(crate::guest::disk::current_gb(), std::sync::atomic::Ordering::Relaxed);
         let (vm, conn) = guest.into_parts();
         let me = self.me.get().cloned().unwrap_or_default();
         let vm = Arc::new(VmLink::new(vm, conn, move |ev| {
@@ -2171,6 +2192,11 @@ impl Engine {
     /// CPUs the VM has (or will boot with).
     pub fn cpus(&self) -> usize {
         self.cpus.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Data disk capacity in GiB the VM has (or will boot with).
+    pub fn disk_gb(&self) -> u64 {
+        self.disk_gb.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The Mac folders and files that running containers bind-mount, as

@@ -1850,5 +1850,9 @@
   "Continue anyway": "Continuă oricum",
   "One step didn't work. Everything else is ready.": "Un pas nu a funcționat. Restul este gata.",
   "Some steps didn't work. Everything else is ready.": "Unii pași nu au funcționat. Restul este gata.",
-  "No matches": "Nicio potrivire"
+  "No matches": "Nicio potrivire",
+  "Disk image size": "Dimensiunea imaginii de disc",
+  "KIRI_CPUS, KIRI_MEMORY_MIB or KIRI_DISK_GB is set for the daemon, and it takes precedence over these.": "KIRI_CPUS, KIRI_MEMORY_MIB sau KIRI_DISK_GB este setat pentru daemon și are prioritate față de acestea.",
+  "Running now with {cpus}, up to {mem}, and a {disk} disk.": "Rulează acum cu {cpus}, până la {mem} și un disc de {disk}.",
+  "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "Maximul la care poate crește discul VM-ului. Spațiul pe {os} este folosit doar pe măsură ce se scriu date; nu se micșorează niciodată. Se aplică la repornire."
 }

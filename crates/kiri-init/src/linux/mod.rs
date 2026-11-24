@@ -2,6 +2,7 @@ mod agent;
 mod cgroup;
 mod container;
 mod devices;
+mod disk;
 mod copy;
 mod dns;
 mod fsnotify;
@@ -542,6 +543,8 @@ fn data_dirs() -> io::Result<container::Paths> {
     if let Err(ref e) = disk {
         eprintln!("kiri-init: no data disk ({e}); keeping images in memory");
         mount(c"kiri", c"/var/lib/kiri", c"tmpfs", libc::MS_NOATIME, Some(c"mode=0755"))?;
+    } else if let Err(e) = disk::grow() {
+        eprintln!("kiri-init: growing data disk: {e}");
     }
     // The Mac's filesystem over virtiofs, for bind mounts.
     sys::mkdir(c"/mnt", 0o755);

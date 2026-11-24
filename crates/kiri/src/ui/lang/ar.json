@@ -1850,5 +1850,9 @@
   "Continue anyway": "المتابعة على أي حال",
   "One step didn't work. Everything else is ready.": "لم تنجح خطوة واحدة. كل شيء آخر جاهز.",
   "Some steps didn't work. Everything else is ready.": "لم تنجح بعض الخطوات. كل شيء آخر جاهز.",
-  "No matches": "لا توجد نتائج مطابقة"
+  "No matches": "لا توجد نتائج مطابقة",
+  "Disk image size": "حجم صورة القرص",
+  "KIRI_CPUS, KIRI_MEMORY_MIB or KIRI_DISK_GB is set for the daemon, and it takes precedence over these.": "المتغير KIRI_CPUS أو KIRI_MEMORY_MIB أو KIRI_DISK_GB معيّن للخدمة الخلفية، وله الأولوية على هذه الإعدادات.",
+  "Running now with {cpus}, up to {mem}, and a {disk} disk.": "يعمل الآن بـ {cpus} وبحد أقصى {mem} وقرص بحجم {disk}.",
+  "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "أقصى حجم قد ينمو إليه قرص الجهاز الافتراضي. لا تُستهلك المساحة على {os} إلا عند كتابة البيانات، ولا يتقلص الحجم أبداً. يُطبّق عند إعادة التشغيل."
 }

@@ -1850,5 +1850,9 @@
   "Continue anyway": "Vẫn tiếp tục",
   "One step didn't work. Everything else is ready.": "Một bước không thành công. Mọi thứ khác đã sẵn sàng.",
   "Some steps didn't work. Everything else is ready.": "Một số bước không thành công. Mọi thứ khác đã sẵn sàng.",
-  "No matches": "Không có kết quả phù hợp"
+  "No matches": "Không có kết quả phù hợp",
+  "Disk image size": "Kích thước ảnh đĩa",
+  "KIRI_CPUS, KIRI_MEMORY_MIB or KIRI_DISK_GB is set for the daemon, and it takes precedence over these.": "KIRI_CPUS, KIRI_MEMORY_MIB hoặc KIRI_DISK_GB đã được đặt cho daemon và được ưu tiên hơn các thiết lập này.",
+  "Running now with {cpus}, up to {mem}, and a {disk} disk.": "Đang chạy với {cpus}, tối đa {mem} và đĩa {disk}.",
+  "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "Mức tối đa đĩa VM có thể mở rộng. Dung lượng trên {os} chỉ được dùng khi ghi dữ liệu; đĩa không bao giờ thu nhỏ. Áp dụng khi khởi động lại."
 }
