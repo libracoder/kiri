@@ -450,7 +450,41 @@ lt = "application/vnd.docker.distribution.manifest.list.v2+json"
 put(f"{u}/manifests/multi", lt, json.dumps({"schemaVersion": 2, "mediaType": lt, "manifests": ms}).encode())
 '\'' 5055'
 t build-platform-pulled-tag "resolved-other-platform" "$MULTI_PUSH && here=\$(docker version --format '{{.Server.Arch}}') && { [ \"\$here\" = amd64 ] && other=arm64 || other=amd64; } && docker pull -q kiri-mirror-only:multi >/dev/null && lhere=\$(docker image inspect -f '{{index .RootFS.Layers 0}}' kiri-mirror-only:multi) && printf 'FROM kiri-mirror-only:multi\\nCOPY Dockerfile /df\\n' > /bins/Dockerfile && DOCKER_BUILDKIT=0 docker build -q --no-cache --platform linux/\$other -t kiri-mirror-only:built /bins >/dev/null 2>&1 && lbuilt=\$(docker image inspect -f '{{index .RootFS.Layers 0}}' kiri-mirror-only:built) && pbuilt=\$(docker image inspect -f '{{.Architecture}} {{index .Config.Labels \"plat\"}}' kiri-mirror-only:built) && [ \"\$pbuilt\" = \"\$other from-\$other\" ] && [ \"\$lbuilt\" != \"\$lhere\" ] && echo resolved-other-platform || echo \"here=\$here got=\$pbuilt lhere=\$lhere lbuilt=\$lbuilt\""
-t build-local-tag "local-still-served" "here=\$(docker version --format '{{.Server.Arch}}') && docker tag kiri-mirror-only:multi kiri-local-only:1 && printf 'FROM kiri-local-only:1\\nCOPY Dockerfile /df2\\n' > /bins/Dockerfile && DOCKER_BUILDKIT=0 docker build -q --no-cache -t kiri-local-only:built /bins >/dev/null 2>&1 && [ \"\$(docker image inspect -f '{{index .Config.Labels \"plat\"}}' kiri-local-only:built)\" = \"from-\$here\" ] && echo local-still-served; docker rmi kiri-mirror-only:multi kiri-mirror-only:built kiri-local-only:1 kiri-local-only:built >/dev/null 2>&1"
+t build-local-tag "local-still-served" "here=\$(docker version --format '{{.Server.Arch}}') && docker tag kiri-mirror-only:multi kiri-local-only:1 && printf 'FROM kiri-local-only:1\\nCOPY Dockerfile /df2\\n' > /bins/Dockerfile && DOCKER_BUILDKIT=0 docker build -q --no-cache -t kiri-local-only:built /bins >/dev/null 2>&1 && [ \"\$(docker image inspect -f '{{index .Config.Labels \"plat\"}}' kiri-local-only:built)\" = \"from-\$here\" ] && echo local-still-served"
+# A digest-pinned FROM (`FROM repo@sha256:…` and `FROM repo:tag@sha256:…`)
+# builds from Kiri's store mirror using the exact raw index and manifest bytes
+# saved at pull time, even after the upstream mirror is removed (#288, #330).
+t build-pinned-digest "pinned-index-and-tag-ok" "here=\$(docker version --format '{{.Server.Arch}}') && gw=\$(docker inspect kiri-reg-http --format '{{.NetworkSettings.IPAddress}}'):5000 && rd=\$(docker image inspect -f '{{index .RepoDigests 0}}' kiri-mirror-only:multi) && d=\${rd#*@} && /opt/kiri/kiri registry mirror remove http://\$gw >/dev/null 2>&1 && printf \"FROM kiri-mirror-only@\$d\\nCOPY Dockerfile /df3\\n\" > /bins/Dockerfile && DOCKER_BUILDKIT=0 docker build -q --no-cache -t kiri-mirror-only:pin1 /bins >/dev/null 2>&1 && printf \"FROM kiri-mirror-only:multi@\$d\\nCOPY Dockerfile /df4\\n\" > /bins/Dockerfile && DOCKER_BUILDKIT=0 docker build -q --no-cache -t kiri-mirror-only:pin2 /bins >/dev/null 2>&1 && [ \"\$(docker image inspect -f '{{index .Config.Labels \"plat\"}}' kiri-mirror-only:pin1)\" = \"from-\$here\" ] && [ \"\$(docker image inspect -f '{{index .Config.Labels \"plat\"}}' kiri-mirror-only:pin2)\" = \"from-\$here\" ] && echo pinned-index-and-tag-ok; docker rmi kiri-mirror-only:multi kiri-mirror-only:built kiri-mirror-only:pin1 kiri-mirror-only:pin2 kiri-local-only:built >/dev/null 2>&1"
+# When the host's /etc/resolv.conf names only 127.0.0.53 (systemd-resolved's
+# stub, with no /run/systemd/resolve/resolv.conf), default-bridge containers,
+# standard build steps, and --network=host build steps all resolve through the
+# agent at the bridge gateway over UDP and TCP (#209, #330).
+STUB53='python3 -c '\''
+import socket, struct, threading
+def ans(q):
+    i = 12
+    while i < len(q) and q[i]: i += 1 + q[i]
+    end = i + 5
+    qt = struct.unpack("!H", q[end-4:end-2])[0] if end <= len(q) else 0
+    if qt == 1:
+        return q[:2] + b"\x81\x80\x00\x01\x00\x01\x00\x00\x00\x00" + q[12:end] + b"\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04\x0a\x35\x35\x35"
+    return q[:2] + b"\x81\x80\x00\x01\x00\x00\x00\x00\x00\x00" + q[12:end]
+u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); u.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); u.bind(("127.0.0.53", 53))
+t = socket.socket(socket.AF_INET, socket.SOCK_STREAM); t.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); t.bind(("127.0.0.53", 53)); t.listen(16)
+def ul():
+    while True:
+        d, a = u.recvfrom(2048); u.sendto(ans(d), a)
+def tl():
+    while True:
+        c, _ = t.accept()
+        with c:
+            h = c.recv(2)
+            if len(h) == 2:
+                q = c.recv(struct.unpack("!H", h)[0]); r = ans(q); c.sendall(struct.pack("!H", len(r)) + r)
+threading.Thread(target=ul, daemon=True).start(); tl()
+'\'''
+t dns-default-bridge-stub "gw-ok 10.53.53.53" "cp /etc/resolv.conf /tmp/resolv.330 && ($STUB53 >/dev/null 2>&1 & echo \$! > /tmp/stub53.pid) && sleep 0.2 && printf 'nameserver 127.0.0.53\\n' > /etc/resolv.conf && gw=\$(docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}') && out=\$(docker run --rm alpine sh -c 'grep -Fx \"nameserver '\"\$gw\"'\" /etc/resolv.conf >/dev/null && printf \"gw-ok \" && nslookup stub53.kiri.test | awk \"/Address: 10\\.53\\.53\\.53/ {print \\\$2; exit}\"'); kill \$(cat /tmp/stub53.pid) 2>/dev/null; mv /tmp/resolv.330 /etc/resolv.conf; echo \"\$out\""
+t build-host-network-dns "bridge=10.53.53.53 host=10.53.53.53" "docker tag alpine:3.21 kiri-local-dns:1 && cp /etc/resolv.conf /tmp/resolv.209 && ($STUB53 >/dev/null 2>&1 & echo \$! > /tmp/stub209.pid) && sleep 0.2 && printf 'nameserver 127.0.0.53\\n' > /etc/resolv.conf && mkdir -p /b209 && printf 'FROM kiri-local-dns:1\\nRUN nslookup stub53.kiri.test | grep -F 10.53.53.53\\n' > /b209/Dockerfile && b1=\$(DOCKER_BUILDKIT=0 docker build --no-cache /b209 2>&1 | grep -o '10\\.53\\.53\\.53' | head -1) && b2=\$(DOCKER_BUILDKIT=0 docker build --no-cache --network=host /b209 2>&1 | grep -o '10\\.53\\.53\\.53' | head -1); kill \$(cat /tmp/stub209.pid) 2>/dev/null; mv /tmp/resolv.209 /etc/resolv.conf; rm -rf /b209; docker rmi kiri-local-only:1 kiri-local-dns:1 >/dev/null 2>&1; echo \"bridge=\$b1 host=\$b2\""
 # Docker Hub is reached over verified HTTPS whatever the list covers: a
 # name server (here /etc/hosts) that puts its name inside a listed network,
 # in front of a plain-HTTP registry on port 80, must not turn the pull into

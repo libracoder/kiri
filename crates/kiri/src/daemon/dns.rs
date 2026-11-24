@@ -183,11 +183,38 @@ fn relay_query(query: &[u8], servers: &[SocketAddr]) -> Option<Vec<u8>> {
             let Ok(n) = sock.recv(&mut buf) else { break };
             let r = &buf[..n];
             if n >= 12 && r[..2] == query[..2] && r[2] & 0x80 != 0 {
+                if r[2] & 0x02 != 0
+                    && let Some(full) = relay_tcp(query, *server, until.saturating_duration_since(Instant::now()))
+                {
+                    return Some(full);
+                }
                 return Some(r.to_vec());
             }
         }
     }
     None
+}
+
+/// Retries a truncated (`TC=1`) UDP reply over TCP so large responses arrive whole.
+fn relay_tcp(query: &[u8], server: SocketAddr, wait: Duration) -> Option<Vec<u8>> {
+    if wait.is_zero() {
+        return None;
+    }
+    let mut stream = std::net::TcpStream::connect_timeout(&server, wait).ok()?;
+    let _ = stream.set_read_timeout(Some(wait));
+    let _ = stream.set_write_timeout(Some(wait));
+    let len = u16::try_from(query.len()).ok()?.to_be_bytes();
+    stream.write_all(&len).ok()?;
+    stream.write_all(query).ok()?;
+    let mut rlen = [0u8; 2];
+    stream.read_exact(&mut rlen).ok()?;
+    let n = u16::from_be_bytes(rlen) as usize;
+    if n < 12 {
+        return None;
+    }
+    let mut reply = vec![0u8; n];
+    stream.read_exact(&mut reply).ok()?;
+    (reply[..2] == query[..2] && reply[2] & 0x80 != 0).then_some(reply)
 }
 
 /// SERVFAIL for `query`: no resolver on the Mac answered either.
@@ -350,6 +377,39 @@ mod tests {
         resolver.join().unwrap();
         assert_eq!((&r[..2], r[2] & 0x80, &r[12..]), (&q[..2], 0x80, &q[12..]));
         assert_eq!(super::question_name(&q).as_deref(), Some("registry-1.docker.io"));
+    }
+
+    #[test]
+    fn a_truncated_udp_reply_is_retried_over_tcp() {
+        use std::io::{Read, Write};
+        let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = udp.local_addr().unwrap();
+        let tcp = std::net::TcpListener::bind(addr).unwrap();
+        let udp_srv = std::thread::spawn(move || {
+            let mut buf = [0u8; 512];
+            let (n, from) = udp.recv_from(&mut buf).unwrap();
+            buf[2] |= 0x82; // QR=1, TC=1
+            udp.send_to(&buf[..n], from).unwrap();
+        });
+        let tcp_srv = std::thread::spawn(move || {
+            let (mut s, _) = tcp.accept().unwrap();
+            let mut len = [0u8; 2];
+            s.read_exact(&mut len).unwrap();
+            let mut q = vec![0u8; u16::from_be_bytes(len) as usize];
+            s.read_exact(&mut q).unwrap();
+            q[2] = 0x81;
+            q[3] = 0x80;
+            q[6..8].copy_from_slice(&1u16.to_be_bytes());
+            q.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 104, 16, 1, 2]);
+            s.write_all(&(q.len() as u16).to_be_bytes()).unwrap();
+            s.write_all(&q).unwrap();
+        });
+        let q = query("registry.npmjs.org", 1);
+        let r = super::relay_query(&q, &[addr]).expect("retried over TCP");
+        udp_srv.join().unwrap();
+        tcp_srv.join().unwrap();
+        assert_eq!(r[2] & 0x02, 0, "full TCP reply has TC=0");
+        assert_eq!(&r[r.len() - 4..], &[104, 16, 1, 2]);
     }
 
     #[test]

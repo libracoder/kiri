@@ -474,9 +474,12 @@ pub fn local_resolver(servers: &[[u8; 4]]) -> bool {
     !servers.is_empty() && local_resolver_among(servers, &local_addrs())
 }
 
-/// `local_resolver`, given this machine's addresses.
+/// `local_resolver`, given this machine's addresses. Loopback stubs
+/// (`127.0.0.53`, systemd-resolved) and Tailscale's MagicDNS (`100.100.100.100`)
+/// live in the host's network namespace too, so bridged containers reach them
+/// through the agent at the bridge gateway rather than naming them directly.
 pub fn local_resolver_among(servers: &[[u8; 4]], local: &[[u8; 4]]) -> bool {
-    servers.iter().any(|s| local.contains(s))
+    servers.iter().any(|s| s[0] == 127 || *s == [100, 100, 100, 100] || local.contains(s))
 }
 
 /// The IPv4 address of interface `name`, if it has one: a bridge's gateway.

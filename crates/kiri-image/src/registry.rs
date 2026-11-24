@@ -1141,7 +1141,7 @@ impl Client {
 
         // An index lists one manifest per platform; pick ours and fetch it.
         let index_digest = manifest.manifests.is_some().then(|| sha256_digest(&bytes));
-        let (manifest, digest) = if let Some(entries) = manifest.manifests {
+        let (index_bytes, manifest, manifest_bytes, digest) = if let Some(entries) = manifest.manifests {
             let wanted = entries.iter().find(|m| {
                 m.platform.as_ref().is_some_and(|p| p.os == platform.os && p.architecture == platform.architecture)
             });
@@ -1156,19 +1156,20 @@ impl Client {
                         .collect(),
                 });
             };
-            let (bytes, _) = self.manifest(r, &entry.digest).map_err(stopped)?;
-            if sha256_digest(&bytes) != entry.digest {
+            let (entry_bytes, _) = self.manifest(r, &entry.digest).map_err(stopped)?;
+            if sha256_digest(&entry_bytes) != entry.digest {
                 return Err(Error::Manifest(format!("manifest {} failed digest check", entry.digest)));
             }
-            let m: Manifest = serde_json::from_slice(&bytes).map_err(|e| Error::Manifest(e.to_string()))?;
-            (m, entry.digest.clone())
+            let m: Manifest = serde_json::from_slice(&entry_bytes).map_err(|e| Error::Manifest(e.to_string()))?;
+            (Some(bytes), m, entry_bytes, entry.digest.clone())
         } else {
             if r.is_digest() && sha256_digest(&bytes) != r.reference {
                 return Err(Error::Manifest("manifest failed digest check".into()));
             }
-            (manifest, sha256_digest(&bytes))
+            let d = sha256_digest(&bytes);
+            (None, manifest, bytes, d)
         };
-        Ok(Resolved { target: r.clone(), index_digest, digest, manifest, media_type })
+        Ok(Resolved { target: r.clone(), index_digest, index_bytes, digest, manifest, manifest_bytes, media_type })
     }
 
     /// The second half of a pull: the config and layers of `resolved`,
@@ -1183,7 +1184,7 @@ impl Client {
         progress: &(dyn Fn(Progress) + Sync),
         cancel: &Cancel,
     ) -> Result<Image, Error> {
-        let Resolved { target, index_digest, digest, manifest, media_type } = resolved;
+        let Resolved { target, index_digest, index_bytes, digest, manifest, manifest_bytes, media_type } = resolved;
         let (Some(config), Some(layers)) = (manifest.config.as_ref(), manifest.layers.as_ref()) else {
             return Err(Error::Manifest(format!("{media_type} has no config or layers")));
         };
@@ -1299,6 +1300,23 @@ impl Client {
             },
             mirror,
         };
+        // Keep the registry's exact manifest and multi-arch index bytes in the
+        // blob store so Kiri's build mirror can serve digest-pinned FROM
+        // references (`FROM repo:tag@sha256:…` and `FROM repo@sha256:…`) with
+        // matching SHA-256 digests (#288, #330).
+        let save_raw = |d: &str, bytes: &[u8]| -> Result<(), Error> {
+            if store.has_blob(d, bytes.len() as u64) {
+                return Ok(());
+            }
+            let mut w = store.blob_writer(d)?;
+            w.write_all(bytes)?;
+            w.finish()?;
+            Ok(())
+        };
+        save_raw(digest, manifest_bytes)?;
+        if let (Some(idx_digest), Some(idx_bytes)) = (index_digest.as_deref(), index_bytes.as_deref()) {
+            save_raw(idx_digest, idx_bytes)?;
+        }
         // The last moment a cancel can stop it: after this it is pulled.
         if cancel.is_cancelled() {
             return Err(Error::Cancelled);
@@ -1879,8 +1897,10 @@ struct Token {
 struct Resolved {
     target: Reference,
     index_digest: Option<String>,
+    index_bytes: Option<Vec<u8>>,
     digest: String,
     manifest: Manifest,
+    manifest_bytes: Vec<u8>,
     media_type: String,
 }
 

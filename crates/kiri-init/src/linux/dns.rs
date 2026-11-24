@@ -74,8 +74,12 @@ const OWN_DEADLINE: Duration = Duration::from_secs(4 * MAX_OWN_SERVERS as u64);
 /// than `MAX_PER_CLIENT`. One more is answered SERVFAIL at once.
 const MAX_OWN_PER_CLIENT: usize = 16;
 const _: () = assert!(MAX_OWN_PER_CLIENT < MAX_PER_CLIENT);
-/// Largest reply the host relay may send (a DNS over TCP frame's limit).
+/// Largest reply the host relay or a TCP upstream may send (a DNS over TCP frame's limit).
 const MAX_RELAYED: usize = 2 + 65_535;
+/// Concurrent TCP DNS client connections accepted across all listeners.
+const MAX_TCP_CLIENTS: usize = 64;
+/// Maximum queued reply bytes for one TCP DNS client before it is dropped.
+const MAX_TCP_SEND: usize = 65_536;
 
 /// Docker's embedded DNS address, inside each container.
 pub const EMBEDDED: [u8; 4] = [127, 0, 0, 11];
@@ -101,6 +105,17 @@ struct Server {
     container: Option<i32>,
 }
 
+struct TcpClient {
+    id: u64,
+    server: u64,
+    key: ClientKey,
+    sock: OwnedFd,
+    recv: Vec<u8>,
+    send: Vec<u8>,
+    eof: bool,
+    started: Instant,
+}
+
 struct Pending {
     /// Its own socket, connected to the resolver: a fresh source port for
     /// every query, as Docker's embedded DNS does, so one lost or blocked
@@ -115,6 +130,8 @@ struct Pending {
     /// The server the query came in on (`Server::id`).
     server: u64,
     client: libc::sockaddr_in,
+    /// `Some(TcpClient::id)` when the client asked over TCP; `None` for UDP.
+    tcp_client: Option<u64>,
     id: u16,
     question: Vec<u8>,
     /// When it was asked of the server it is with now.
@@ -124,13 +141,20 @@ struct Pending {
     /// The query as sent (with `our` ID), to send again.
     query: Vec<u8>,
     /// With the container's own `--dns` servers (kept under `key`): the
-    /// position of the one it is with. None for the VM's resolver.
+    /// position of the one it is with. None for the VM's / host's resolver.
     own: Option<usize>,
+    /// Host/VM upstream servers and the index currently asked when `own` is None.
+    upstreams: Vec<[u8; 4]>,
+    upstream_at: usize,
     /// It may still go through the host: in the VM, asked of the VM's own
     /// resolver (not `--dns` servers), and not tried there yet.
     may_relay: bool,
     /// Sent through the host: the reply's bytes so far, `u16 len | reply`.
     relayed: Option<Vec<u8>>,
+    /// Sent over TCP to an upstream server: remaining request bytes to write,
+    /// while `tcp_recv` collects the `u16 len | reply` answer.
+    tcp_send: Option<Vec<u8>>,
+    tcp_recv: Vec<u8>,
 }
 
 /// One name's IPv6 addresses, each with its container's IPv4 address.
@@ -139,6 +163,9 @@ type Owned6 = Vec<([u8; 4], [u8; 16])>;
 #[derive(Default)]
 pub struct Dns {
     servers: Vec<Server>,
+    /// `(Server::id, listener)` for DNS over TCP on gateways and `127.0.0.11`.
+    tcp_servers: Vec<(u64, OwnedFd)>,
+    tcp_clients: Vec<TcpClient>,
     /// bridge → name (lowercase) → addresses.
     names: HashMap<String, HashMap<String, Vec<[u8; 4]>>>,
     /// bridge → name → (the container's IPv4 address there, its IPv6 one):
@@ -222,7 +249,11 @@ impl Dns {
             self.forget_pending();
         }
         let sock = bound(gateway, 53)?;
-        self.servers.push(Server { id: server_id(), bridges: vec![bridge.to_owned()], sock, container: None });
+        let id = server_id();
+        if let Ok(tcp) = tcp_bound(gateway, 53) {
+            self.tcp_servers.push((id, tcp));
+        }
+        self.servers.push(Server { id, bridges: vec![bridge.to_owned()], sock, container: None });
         Ok(())
     }
 
@@ -259,8 +290,12 @@ impl Dns {
             }
             return Ok(());
         }
-        let sock = super::netlink::in_netns(netns, embedded_socket)?;
-        self.servers.push(Server { id: server_id(), bridges: vec![bridge.to_owned()], sock, container: Some(pid) });
+        let (sock, tcp) = super::netlink::in_netns(netns, embedded_socket)?;
+        let id = server_id();
+        if let Some(tcp) = tcp {
+            self.tcp_servers.push((id, tcp));
+        }
+        self.servers.push(Server { id, bridges: vec![bridge.to_owned()], sock, container: Some(pid) });
         Ok(())
     }
 
@@ -281,12 +316,15 @@ impl Dns {
         self.servers.retain(|s| s.container != Some(pid));
         self.container_upstreams.remove(&pid);
         self.pending.retain(|p| p.key != ClientKey::Container(pid));
+        self.tcp_clients.retain(|c| c.key != ClientKey::Container(pid));
         self.forget_pending();
     }
 
-    /// Forwarded queries whose server is gone go too.
+    /// Forwarded queries and TCP sockets whose server is gone go too.
     fn forget_pending(&mut self) {
         let servers = &self.servers;
+        self.tcp_servers.retain(|(sid, _)| servers.iter().any(|s| s.id == *sid));
+        self.tcp_clients.retain(|c| servers.iter().any(|s| s.id == c.server));
         self.pending.retain(|p| servers.iter().any(|s| s.id == p.server));
     }
 
@@ -374,6 +412,7 @@ impl Dns {
         // Its queries in flight go with it: a container given the address
         // next never gets them, or their answers.
         self.pending.retain(|p| p.key != ClientKey::Ip(ip));
+        self.tcp_clients.retain(|c| c.key != ClientKey::Ip(ip));
         self.drop_names(bridge, ip);
     }
 
@@ -409,9 +448,47 @@ impl Dns {
         }
     }
 
-    /// Descriptors to poll: each server's, plus each forwarded query's.
+    /// Descriptors to poll: each server's (UDP and TCP), accepted TCP clients,
+    /// and forwarded queries in flight.
     pub fn fds(&self) -> impl Iterator<Item = RawFd> + '_ {
-        self.servers.iter().map(|s| s.sock.as_raw_fd()).chain(self.pending.iter().map(|p| p.sock.as_raw_fd()))
+        self.servers
+            .iter()
+            .map(|s| s.sock.as_raw_fd())
+            .chain(self.tcp_servers.iter().map(|(_, s)| s.as_raw_fd()))
+            .chain(self.tcp_clients.iter().map(|c| c.sock.as_raw_fd()))
+            .chain(self.pending.iter().map(|p| p.sock.as_raw_fd()))
+    }
+
+    /// Appends poll descriptors with read/write interest for the agent's loop.
+    pub fn interest(&self, fds: &mut Vec<libc::pollfd>) {
+        for s in &self.servers {
+            fds.push(libc::pollfd { fd: s.sock.as_raw_fd(), events: libc::POLLIN, revents: 0 });
+        }
+        for (_, tcp) in &self.tcp_servers {
+            fds.push(libc::pollfd { fd: tcp.as_raw_fd(), events: libc::POLLIN, revents: 0 });
+        }
+        for c in &self.tcp_clients {
+            let events = if !c.send.is_empty() {
+                libc::POLLOUT
+            } else if !c.eof {
+                libc::POLLIN
+            } else {
+                0
+            };
+            if events != 0 {
+                fds.push(libc::pollfd { fd: c.sock.as_raw_fd(), events, revents: 0 });
+            }
+        }
+        for p in &self.pending {
+            let events = if p.tcp_send.as_ref().is_some_and(|b| !b.is_empty()) { libc::POLLIN | libc::POLLOUT } else { libc::POLLIN };
+            fds.push(libc::pollfd { fd: p.sock.as_raw_fd(), events, revents: 0 });
+        }
+    }
+
+    /// True when `fd` is a server listener (UDP socket or TCP listener), so
+    /// the host agent refreshes `/etc/resolv.conf` on new queries.
+    pub fn is_listener(&self, fd: RawFd) -> bool {
+        self.servers.iter().any(|s| s.sock.as_raw_fd() == fd) || self.tcp_servers.iter().any(|(_, s)| s.as_raw_fd() == fd)
     }
 
     pub fn owns(&self, fd: RawFd) -> bool {
@@ -423,6 +500,10 @@ impl Dns {
         if let Some(at) = self.pending.iter().position(|p| p.sock.as_raw_fd() == fd) {
             if self.pending[at].relayed.is_some() {
                 self.read_relayed(at);
+                return;
+            }
+            if self.pending[at].tcp_send.is_some() {
+                self.step_tcp_upstream(at);
                 return;
             }
             // A forwarded answer: hand it back to whoever asked.
@@ -441,10 +522,15 @@ impl Dns {
                 let msg = &mut buf[..n as usize];
                 let p = &self.pending[at];
                 if u16::from_be_bytes([msg[0], msg[1]]) == p.our && response_matches(msg, p) {
-                    // REFUSED or SERVFAIL from one of its own servers: the
-                    // next one, as with Docker. From the last, it goes back.
-                    if matches!(msg[3] & 0x0f, 2 | 5) && self.pending[at].own.is_some() && self.ask_next_own(at) {
-                        break;
+                    // REFUSED or SERVFAIL from one of its own servers (or when
+                    // another host upstream is listed): try the next one.
+                    if matches!(msg[3] & 0x0f, 2 | 5) {
+                        if self.pending[at].own.is_some() && self.ask_next_own(at) {
+                            break;
+                        }
+                        if self.pending[at].own.is_none() && self.ask_next_upstream(at) {
+                            break;
+                        }
                     }
                     // A macOS security network extension intercepting the VM
                     // bridge's DNS answers with a Fake-IP in 198.18.0.0/15
@@ -460,6 +546,14 @@ impl Dns {
                     break;
                 }
             }
+            return;
+        }
+        if let Some(at) = self.tcp_clients.iter().position(|c| c.sock.as_raw_fd() == fd) {
+            self.step_tcp_client(at, upstream);
+            return;
+        }
+        if let Some(&(sid, _)) = self.tcp_servers.iter().find(|(_, s)| s.as_raw_fd() == fd) {
+            self.accept_tcp_clients(fd, sid);
             return;
         }
         let Some(server) = self.servers.iter().position(|s| s.sock.as_raw_fd() == fd) else {
@@ -565,6 +659,21 @@ impl Dns {
     }
 
     fn forward(&mut self, server: usize, q: &[u8], client: libc::sockaddr_in, upstream: &[[u8; 4]]) {
+        let key = self.servers[server]
+            .container
+            .map_or_else(|| ClientKey::Ip(client.sin_addr.s_addr.to_ne_bytes()), ClientKey::Container);
+        self.forward_with(server, q, client, None, key, upstream);
+    }
+
+    fn forward_with(
+        &mut self,
+        server: usize,
+        q: &[u8],
+        client: libc::sockaddr_in,
+        tcp_client: Option<u64>,
+        key: ClientKey,
+        upstream: &[[u8; 4]],
+    ) {
         let now = Instant::now();
         // A query past its deadline is answered SERVFAIL here too, before
         // the slots are counted: `on_readable` runs before `on_timer`.
@@ -575,8 +684,7 @@ impl Dns {
                 self.fail(at);
             }
         }
-        let key = self.servers[server].container.map_or_else(|| ClientKey::Ip(client.sin_addr.s_addr.to_ne_bytes()), ClientKey::Container);
-        let own = self.own_servers(key).map(|v| (v.len(), v.first().copied()));
+        let own = self.own_servers(key).map(|v| v.len());
         let Some((_, _, end)) = parse_question(q) else {
             return;
         };
@@ -586,10 +694,11 @@ impl Dns {
             mine_own += usize::from(p.own.is_some());
         }
         if self.pending.len() >= MAX_PENDING || mine >= MAX_PER_CLIENT || (own.is_some() && mine_own >= MAX_OWN_PER_CLIENT) {
-            // With its own servers the client is told at once (they may
-            // hold a slot for `OWN_DEADLINE`); else it asks again.
-            if own.is_some() {
-                send_to(self.servers[server].sock.as_raw_fd(), &servfail(id_of(q), rd(q), &q[12..end]), &client);
+            // With its own servers (or over TCP) the client is told at once;
+            // else UDP asks again.
+            if own.is_some() || tcp_client.is_some() {
+                let fail = servfail(id_of(q), rd(q), &q[12..end]);
+                self.reply_now(server, client, tcp_client, &fail);
             }
             return;
         }
@@ -598,26 +707,39 @@ impl Dns {
         let id = u16::from_be_bytes([msg[0], msg[1]]);
         msg[0..2].copy_from_slice(&our.to_be_bytes());
         let may_relay = self.relay && own.is_none();
-        let mut at = None;
-        let sock = match own {
+        let use_tcp = tcp_client.is_some();
+        let mut own_at = None;
+        let mut upstream_at = 0;
+        let upstreams: Vec<[u8; 4]> = if own.is_none() { upstream.to_vec() } else { Vec::new() };
+        let dialed = match own {
             // The first of its own servers that can be sent to.
-            Some((len, _)) => (0..len).find_map(|i| {
-                let sock = self.own_servers(key).and_then(|v| v.get(i)).and_then(|d| ask(*d, &msg))?;
-                at = Some(i);
-                Some(sock)
+            Some(len) => (0..len).find_map(|i| {
+                let d = self.own_servers(key).and_then(|v| v.get(i)).copied()?;
+                let s = ask_dest(d, &msg, use_tcp)?;
+                own_at = Some(i);
+                Some(s)
             }),
             None if self.prefer_relay && may_relay => None,
-            None => upstream.first().and_then(|d| ask(*d, &msg)),
+            None => upstreams.iter().enumerate().find_map(|(i, d)| {
+                let s = ask_dest(*d, &msg, use_tcp)?;
+                upstream_at = i;
+                Some(s)
+            }),
         };
         // No resolver yet, or it can't be reached (or `prefer_relay` chose the host): the host, if allowed.
-        let (sock, relayed) = match sock {
-            Some(s) => (s, false),
+        let (sock, tcp_send, relayed) = match dialed {
+            Some((s, tcp_send)) => (s, tcp_send, false),
             None => match may_relay.then(|| self.relay_stream(&msg)).flatten() {
-                Some(s) => (s, true),
-                None if self.prefer_relay && own.is_none() => match upstream.first().and_then(|d| ask(*d, &msg)) {
-                    Some(s) => (s, false),
+                Some(s) => (s, None, true),
+                None if self.prefer_relay && own.is_none() => match upstreams.iter().enumerate().find_map(|(i, d)| {
+                    let s = ask_dest(*d, &msg, use_tcp)?;
+                    upstream_at = i;
+                    Some(s)
+                }) {
+                    Some((s, tcp_send)) => (s, tcp_send, false),
                     None => {
-                        send_to(self.servers[server].sock.as_raw_fd(), &servfail(id, rd(q), &q[12..end]), &client);
+                        let fail = servfail(id, rd(q), &q[12..end]);
+                        self.reply_now(server, client, tcp_client, &fail);
                         return;
                     }
                 },
@@ -626,7 +748,8 @@ impl Dns {
                 // answer at once rather than leave Go's resolver to time
                 // out waiting for a reply that will never come (#715).
                 None => {
-                    send_to(self.servers[server].sock.as_raw_fd(), &servfail(id, rd(q), &q[12..end]), &client);
+                    let fail = servfail(id, rd(q), &q[12..end]);
+                    self.reply_now(server, client, tcp_client, &fail);
                     return;
                 }
             },
@@ -637,23 +760,38 @@ impl Dns {
             key,
             server: self.servers[server].id,
             client,
+            tcp_client,
             id,
             question: q[12..end].to_vec(),
             sent: now,
             started: now,
             query: msg,
-            own: at,
+            own: own_at,
+            upstreams,
+            upstream_at,
             may_relay: may_relay && !relayed,
             relayed: relayed.then(Vec::new),
+            tcp_send,
+            tcp_recv: Vec::new(),
         };
         self.pending.push(p);
+    }
+
+    fn reply_now(&mut self, server: usize, client: libc::sockaddr_in, tcp_client: Option<u64>, msg: &[u8]) {
+        if let Some(cid) = tcp_client {
+            self.send_tcp_reply(cid, msg);
+        } else {
+            send_to(self.servers[server].sock.as_raw_fd(), msg, &client);
+        }
     }
 
     /// Hands a matching answer to whoever asked, and forgets the query.
     fn answered(&mut self, at: usize, msg: &mut [u8]) {
         let p = self.pending.swap_remove(at);
         msg[0..2].copy_from_slice(&p.id.to_be_bytes());
-        if let Some(s) = self.servers.iter().find(|s| s.id == p.server) {
+        if let Some(cid) = p.tcp_client {
+            self.send_tcp_reply(cid, msg);
+        } else if let Some(s) = self.servers.iter().find(|s| s.id == p.server) {
             send_to(s.sock.as_raw_fd(), msg, &p.client);
         }
     }
@@ -667,6 +805,7 @@ impl Dns {
         let p = &self.pending[at];
         let Some(mut i) = p.own else { return false };
         let key = p.key;
+        let use_tcp = p.tcp_client.is_some();
         if p.started.elapsed() >= OWN_DEADLINE || self.own_servers(key).is_none_or(|v| i + 1 >= v.len()) {
             return false;
         }
@@ -676,12 +815,44 @@ impl Dns {
         loop {
             i += 1;
             let Some(dest) = self.own_servers(key).and_then(|v| v.get(i)).copied() else { break };
-            if let Some(sock) = ask(dest, &self.pending[at].query) {
+            if let Some((sock, tcp_send)) = ask_dest(dest, &self.pending[at].query, use_tcp) {
                 let p = &mut self.pending[at];
                 p.sock = sock;
                 p.our = our;
                 p.own = Some(i);
                 p.sent = Instant::now();
+                p.tcp_send = tcp_send;
+                p.tcp_recv.clear();
+                return true;
+            }
+        }
+        self.pending[at].query[0..2].copy_from_slice(&was);
+        false
+    }
+
+    /// Sends pending query `at` to the next host/VM upstream server (e.g.
+    /// `systemd-resolved`'s upstream fallback when `127.0.0.53` refuses).
+    fn ask_next_upstream(&mut self, at: usize) -> bool {
+        let p = &self.pending[at];
+        if p.own.is_some() || p.upstream_at + 1 >= p.upstreams.len() {
+            return false;
+        }
+        let mut i = p.upstream_at;
+        let use_tcp = p.tcp_client.is_some();
+        let Some(our) = random_id() else { return false };
+        let was = [p.query[0], p.query[1]];
+        self.pending[at].query[0..2].copy_from_slice(&our.to_be_bytes());
+        while i + 1 < self.pending[at].upstreams.len() {
+            i += 1;
+            let dest = self.pending[at].upstreams[i];
+            if let Some((sock, tcp_send)) = ask_dest(dest, &self.pending[at].query, use_tcp) {
+                let p = &mut self.pending[at];
+                p.sock = sock;
+                p.our = our;
+                p.upstream_at = i;
+                p.sent = Instant::now();
+                p.tcp_send = tcp_send;
+                p.tcp_recv.clear();
                 return true;
             }
         }
@@ -690,10 +861,10 @@ impl Dns {
     }
 
     /// The server a query is with can't be reached or refused: the next of
-    /// the container's own, else the host if the query may go through it,
-    /// else SERVFAIL to the client.
+    /// the container's own, else the next host upstream, else the host relay
+    /// if the query may go through it, else SERVFAIL to the client.
     fn hand_over(&mut self, at: usize) {
-        if !self.ask_next_own(at) && !self.relay(at) {
+        if !self.ask_next_own(at) && !self.ask_next_upstream(at) && !self.relay(at) {
             self.fail(at);
         }
     }
@@ -701,8 +872,10 @@ impl Dns {
     /// Answers pending query `at` SERVFAIL and forgets it (closing its socket).
     fn fail(&mut self, at: usize) {
         let p = self.pending.swap_remove(at);
-        if let Some(s) = self.servers.iter().find(|s| s.id == p.server) {
-            let reply = servfail(p.id, rd(&p.query), &p.question);
+        let reply = servfail(p.id, rd(&p.query), &p.question);
+        if let Some(cid) = p.tcp_client {
+            self.send_tcp_reply(cid, &reply);
+        } else if let Some(s) = self.servers.iter().find(|s| s.id == p.server) {
             send_to(s.sock.as_raw_fd(), &reply, &p.client);
         }
     }
@@ -720,10 +893,237 @@ impl Dns {
         if let Some(stream) = stream {
             p.sock = stream;
             p.relayed = Some(Vec::new());
+            p.tcp_send = None;
+            p.tcp_recv.clear();
             p.sent = Instant::now();
             true
         } else {
             false
+        }
+    }
+
+    fn accept_tcp_clients(&mut self, listener: RawFd, server: u64) {
+        let container = self.servers.iter().find(|s| s.id == server).and_then(|s| s.container);
+        loop {
+            // SAFETY: sockaddr_in is plain data; accept4 fills it in.
+            let mut from: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+            let mut len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+            // SAFETY: accept4 on a non-blocking TCP listener we own.
+            let fd = unsafe { libc::accept4(listener, (&mut from as *mut libc::sockaddr_in).cast(), &mut len, libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC) };
+            if fd < 0 {
+                break;
+            }
+            // SAFETY: fresh descriptor owned solely here.
+            let sock = unsafe { OwnedFd::from_raw_fd(fd) };
+            if self.tcp_clients.len() >= MAX_TCP_CLIENTS {
+                continue;
+            }
+            let key = container.map_or_else(|| ClientKey::Ip(from.sin_addr.s_addr.to_ne_bytes()), ClientKey::Container);
+            self.tcp_clients.push(TcpClient {
+                id: server_id(),
+                server,
+                key,
+                sock,
+                recv: Vec::new(),
+                send: Vec::new(),
+                eof: false,
+                started: Instant::now(),
+            });
+        }
+    }
+
+    fn send_tcp_reply(&mut self, cid: u64, msg: &[u8]) {
+        let Ok(len) = u16::try_from(msg.len()) else {
+            self.drop_tcp_client(cid);
+            return;
+        };
+        let Some(at) = self.tcp_clients.iter().position(|c| c.id == cid) else { return };
+        if self.tcp_clients[at].send.len() + 2 + msg.len() > MAX_TCP_SEND {
+            self.drop_tcp_client(cid);
+            return;
+        }
+        self.tcp_clients[at].send.extend_from_slice(&len.to_be_bytes());
+        self.tcp_clients[at].send.extend_from_slice(msg);
+        self.flush_tcp_client(at);
+    }
+
+    fn flush_tcp_client(&mut self, at: usize) {
+        let fd = self.tcp_clients[at].sock.as_raw_fd();
+        while !self.tcp_clients[at].send.is_empty() {
+            let buf = &self.tcp_clients[at].send;
+            // SAFETY: writing a buffer we own to a socket we own.
+            let n = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
+            if n > 0 {
+                self.tcp_clients[at].send.drain(..n as usize);
+                self.tcp_clients[at].started = Instant::now();
+                continue;
+            }
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            if err.kind() == io::ErrorKind::WouldBlock {
+                return;
+            }
+            let cid = self.tcp_clients[at].id;
+            self.drop_tcp_client(cid);
+            return;
+        }
+        let cid = self.tcp_clients[at].id;
+        if self.tcp_clients[at].eof && self.tcp_clients[at].send.is_empty() && !self.pending.iter().any(|p| p.tcp_client == Some(cid)) {
+            self.drop_tcp_client(cid);
+        }
+    }
+
+    fn drop_tcp_client(&mut self, cid: u64) {
+        self.tcp_clients.retain(|c| c.id != cid);
+    }
+
+    fn step_tcp_client(&mut self, at: usize, upstream: &[[u8; 4]]) {
+        let cid = self.tcp_clients[at].id;
+        let server_id_val = self.tcp_clients[at].server;
+        let key = self.tcp_clients[at].key;
+        if !self.tcp_clients[at].send.is_empty() {
+            self.flush_tcp_client(at);
+        }
+        let Some(at) = self.tcp_clients.iter().position(|c| c.id == cid) else { return };
+        if !self.tcp_clients[at].send.is_empty() {
+            return;
+        }
+        let fd = self.tcp_clients[at].sock.as_raw_fd();
+        let mut buf = [0u8; 4096];
+        while !self.tcp_clients[at].eof {
+            // SAFETY: reading into a buffer we own from a non-blocking socket we own.
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+            if n > 0 {
+                self.tcp_clients[at].started = Instant::now();
+                self.tcp_clients[at].recv.extend_from_slice(&buf[..n as usize]);
+                if self.tcp_clients[at].recv.len() > MAX_RELAYED {
+                    self.drop_tcp_client(cid);
+                    return;
+                }
+                continue;
+            }
+            if n == 0 {
+                self.tcp_clients[at].eof = true;
+                break;
+            }
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            if err.kind() == io::ErrorKind::WouldBlock {
+                break;
+            }
+            self.drop_tcp_client(cid);
+            return;
+        }
+        let Some(server) = self.servers.iter().position(|s| s.id == server_id_val) else {
+            self.drop_tcp_client(cid);
+            return;
+        };
+        loop {
+            let Some(pos) = self.tcp_clients.iter().position(|c| c.id == cid) else { return };
+            let Some(raw) = framed_reply(&self.tcp_clients[pos].recv) else {
+                if self.tcp_clients[pos].eof {
+                    self.tcp_clients[pos].recv.clear();
+                }
+                break;
+            };
+            let query = raw.to_vec();
+            let consumed = 2 + query.len();
+            self.tcp_clients[pos].recv.drain(..consumed);
+            if query.len() < 12 || parse_question(&query).is_none() {
+                self.drop_tcp_client(cid);
+                return;
+            }
+            match self.answer(server, &query) {
+                Some(reply) => self.send_tcp_reply(cid, &reply),
+                None => {
+                    // SAFETY: zeroed sockaddr_in placeholder; TCP replies use `cid`.
+                    let placeholder: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+                    self.forward_with(server, &query, placeholder, Some(cid), key, upstream);
+                }
+            }
+        }
+        if let Some(pos) = self.tcp_clients.iter().position(|c| c.id == cid) {
+            self.flush_tcp_client(pos);
+        }
+    }
+
+    fn step_tcp_upstream(&mut self, at: usize) {
+        let fd = self.pending[at].sock.as_raw_fd();
+        while self.pending[at].tcp_send.as_ref().is_some_and(|b| !b.is_empty()) {
+            let buf = self.pending[at].tcp_send.as_ref().expect("checked");
+            // SAFETY: writing a buffer we own to a non-blocking TCP socket we own.
+            let n = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
+            if n > 0 {
+                if let Some(b) = &mut self.pending[at].tcp_send {
+                    b.drain(..n as usize);
+                }
+                continue;
+            }
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            if matches!(err.raw_os_error(), Some(libc::EAGAIN | libc::EINPROGRESS)) || err.kind() == io::ErrorKind::WouldBlock {
+                return;
+            }
+            self.hand_over(at);
+            return;
+        }
+        let mut buf = [0u8; 4096];
+        let mut eof = false;
+        loop {
+            // SAFETY: reading into a buffer we own from a non-blocking TCP socket we own.
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+            if n > 0 {
+                self.pending[at].tcp_recv.extend_from_slice(&buf[..n as usize]);
+                if self.pending[at].tcp_recv.len() > MAX_RELAYED {
+                    self.hand_over(at);
+                    return;
+                }
+                continue;
+            }
+            if n == 0 {
+                eof = true;
+                break;
+            }
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            if err.kind() == io::ErrorKind::WouldBlock {
+                break;
+            }
+            self.hand_over(at);
+            return;
+        }
+        if let Some(reply) = framed_reply(&self.pending[at].tcp_recv) {
+            let mut msg = reply.to_vec();
+            let p = &self.pending[at];
+            if msg.len() >= 12 && u16::from_be_bytes([msg[0], msg[1]]) == p.our && response_matches(&msg, p) {
+                if matches!(msg[3] & 0x0f, 2 | 5) {
+                    if self.pending[at].own.is_some() && self.ask_next_own(at) {
+                        return;
+                    }
+                    if self.pending[at].own.is_none() && self.ask_next_upstream(at) {
+                        return;
+                    }
+                }
+                if self.pending[at].own.is_none() && self.pending[at].may_relay && answer_has_fake_ip(&msg) {
+                    self.prefer_relay = true;
+                    if self.relay(at) {
+                        return;
+                    }
+                }
+                self.answered(at, &mut msg);
+            } else {
+                self.hand_over(at);
+            }
+        } else if eof {
+            self.hand_over(at);
         }
     }
 
@@ -809,14 +1209,25 @@ impl Dns {
                 } else if now.duration_since(p.sent) >= OWN_WAIT {
                     self.hand_over(at);
                 }
-            } else if p.may_relay && now.duration_since(p.sent) >= FALLBACK_AFTER {
-                self.relay(at);
+            } else if (p.upstream_at + 1 < p.upstreams.len() || p.may_relay) && now.duration_since(p.sent) >= FALLBACK_AFTER {
+                if !self.ask_next_upstream(at) {
+                    self.relay(at);
+                }
             } else if now.duration_since(p.sent) >= FORWARD_TIMEOUT {
                 // An upstream that never answered must not leave the
                 // client to hit its own timeout with no reply at all.
                 self.fail(at);
             }
         }
+        let pending = &self.pending;
+        self.tcp_clients.retain(|c| {
+            let has_pending = pending.iter().any(|p| p.tcp_client == Some(c.id));
+            if c.eof && c.send.is_empty() && !has_pending {
+                return false;
+            }
+            let limit = if has_pending { OWN_DEADLINE } else { FORWARD_TIMEOUT };
+            now.duration_since(c.started) < limit
+        });
     }
 
     /// Milliseconds until `on_timer` has something to do; -1 for never.
@@ -828,7 +1239,7 @@ impl Dns {
             .map(|p| {
                 let due = if p.own.is_some() {
                     left(p.sent, OWN_WAIT).min(left(p.started, OWN_DEADLINE))
-                } else if p.may_relay {
+                } else if p.upstream_at + 1 < p.upstreams.len() || p.may_relay {
                     left(p.sent, FALLBACK_AFTER).min(left(p.sent, FORWARD_TIMEOUT))
                 } else {
                     // Even with no relay left, the query must be answered
@@ -837,6 +1248,10 @@ impl Dns {
                 };
                 wait_ms(due)
             })
+            .chain(self.tcp_clients.iter().map(|c| {
+                let limit = if self.pending.iter().any(|p| p.tcp_client == Some(c.id)) { OWN_DEADLINE } else { FORWARD_TIMEOUT };
+                wait_ms(left(c.started, limit))
+            }))
             .min()
             .unwrap_or(-1)
     }
@@ -893,29 +1308,71 @@ fn ask(dest: [u8; 4], msg: &[u8]) -> Option<OwnedFd> {
     Some(sock)
 }
 
+/// Dials `dest`:53 over UDP (`!tcp`) or non-blocking TCP (`tcp`).
+fn ask_dest(dest: [u8; 4], msg: &[u8], tcp: bool) -> Option<(OwnedFd, Option<Vec<u8>>)> {
+    if tcp { ask_tcp(dest, msg).map(|(s, rem)| (s, Some(rem))) } else { ask(dest, msg).map(|s| (s, None)) }
+}
+
+/// A non-blocking TCP socket connecting to `dest`:53 with framed `msg` queued
+/// (and sent immediately when `connect` completes synchronously).
+fn ask_tcp(dest: [u8; 4], msg: &[u8]) -> Option<(OwnedFd, Vec<u8>)> {
+    let len = u16::try_from(msg.len()).ok()?.to_be_bytes();
+    let fd = sys::check(
+        unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK, 0) } as _,
+        "dns tcp socket",
+    )
+    .ok()?;
+    // SAFETY: `fd` is fresh and ours.
+    let sock = unsafe { OwnedFd::from_raw_fd(fd as RawFd) };
+    let to = sockaddr(dest, 53);
+    // SAFETY: connecting a socket we own to a valid sockaddr_in.
+    let rc = unsafe { libc::connect(sock.as_raw_fd(), (&to as *const libc::sockaddr_in).cast(), std::mem::size_of::<libc::sockaddr_in>() as u32) };
+    if rc != 0 && io::Error::last_os_error().raw_os_error() != Some(libc::EINPROGRESS) {
+        return None;
+    }
+    let mut frame = Vec::with_capacity(2 + msg.len());
+    frame.extend_from_slice(&len);
+    frame.extend_from_slice(msg);
+    if rc == 0 {
+        // SAFETY: writing a buffer we own on a connected non-blocking socket.
+        let n = unsafe { libc::write(sock.as_raw_fd(), frame.as_ptr().cast(), frame.len()) };
+        if n > 0 {
+            frame.drain(..n as usize);
+        }
+    }
+    Some((sock, frame))
+}
+
 /// The reply in `u16 len | reply`, once all of it is there.
 fn framed_reply(got: &[u8]) -> Option<&[u8]> {
     let len = u16::from_be_bytes([*got.first()?, *got.get(1)?]) as usize;
     got.get(2..2 + len)
 }
 
-/// The embedded DNS's socket in a container's network namespace, which
-/// the calling thread is in: on a free high port of 127.0.0.11, with
-/// 127.0.0.11:53 redirected to it, as Docker does, so that a DNS server of
-/// the container's own (dnsmasq, Pi-hole, CoreDNS, AdGuard) can bind
-/// 0.0.0.0:53 while the container's lookups still reach this one. Where the
-/// redirect can't be made (a kernel without nf_nat), port 53 itself.
-fn embedded_socket() -> io::Result<OwnedFd> {
+/// The embedded DNS's sockets (UDP and TCP) in a container's network
+/// namespace, which the calling thread is in: on free high ports of
+/// 127.0.0.11, with 127.0.0.11:53 (UDP and TCP) redirected to them, as Docker
+/// does, so that a DNS server of the container's own (dnsmasq, Pi-hole,
+/// CoreDNS, AdGuard) can bind 0.0.0.0:53 while the container's lookups still
+/// reach this one. Where the redirect can't be made (a kernel without nf_nat),
+/// port 53 itself.
+fn embedded_socket() -> io::Result<(OwnedFd, Option<OwnedFd>)> {
     let sock = bound(EMBEDDED, 0)?;
-    match local_port(&sock).and_then(|port| super::netlink::redirect_embedded_dns(EMBEDDED, port)) {
-        Ok(()) => Ok(sock),
+    let (tcp, tcp_port) = match tcp_bound(EMBEDDED, 0).and_then(|t| local_port(&t).map(|p| (t, p))) {
+        Ok((t, p)) => (Some(t), Some(p)),
+        Err(_) => (None, None),
+    };
+    let redirected = local_port(&sock).and_then(|up| super::netlink::redirect_embedded_dns(EMBEDDED, up, tcp_port));
+    match redirected {
+        Ok(()) => Ok((sock, tcp)),
         Err(e) => {
             static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 eprintln!("kiri-init: dns: no redirect to the embedded DNS ({e}); it takes port 53 in each container");
             }
-            drop(sock);
-            bound(EMBEDDED, 53)
+            drop((sock, tcp));
+            let udp53 = bound(EMBEDDED, 53)?;
+            Ok((udp53, tcp_bound(EMBEDDED, 53).ok()))
         }
     }
 }
@@ -949,6 +1406,28 @@ fn bound(ip: [u8; 4], port: u16) -> io::Result<OwnedFd> {
         unsafe { libc::bind(sock.as_raw_fd(), (&addr as *const libc::sockaddr_in).cast(), std::mem::size_of::<libc::sockaddr_in>() as u32) } as _,
         "dns bind",
     )?;
+    Ok(sock)
+}
+
+/// A non-blocking TCP listening socket bound to `ip`:`port` (0: a free one).
+fn tcp_bound(ip: [u8; 4], port: u16) -> io::Result<OwnedFd> {
+    // SAFETY: plain socket creation; owned immediately.
+    let fd = sys::check(
+        unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK, 0) } as _,
+        "dns tcp listen socket",
+    )?;
+    // SAFETY: `fd` is fresh and ours.
+    let sock = unsafe { OwnedFd::from_raw_fd(fd as RawFd) };
+    let one: libc::c_int = 1;
+    // SAFETY: valid integer option on a socket we own.
+    let _ = unsafe { libc::setsockopt(sock.as_raw_fd(), libc::SOL_SOCKET, libc::SO_REUSEADDR, (&one as *const libc::c_int).cast(), std::mem::size_of::<libc::c_int>() as u32) };
+    let addr = sockaddr(ip, port);
+    // SAFETY: bind and listen on a socket we own with a sockaddr_in of its size.
+    sys::check(
+        unsafe { libc::bind(sock.as_raw_fd(), (&addr as *const libc::sockaddr_in).cast(), std::mem::size_of::<libc::sockaddr_in>() as u32) } as _,
+        "dns tcp bind",
+    )?;
+    sys::check(unsafe { libc::listen(sock.as_raw_fd(), 64) } as _, "dns tcp listen")?;
     Ok(sock)
 }
 
@@ -1953,15 +2432,241 @@ mod tests {
             key: super::ClientKey::Ip([0; 4]),
             server: 0,
             client: unsafe { std::mem::zeroed() },
+            tcp_client: None,
             id: 7,
             question: b"\x03www\x07example\x03com\x00\x00\x01\x00\x01".to_vec(),
             sent: Instant::now(),
             query: Vec::new(),
             own: None,
+            upstreams: Vec::new(),
+            upstream_at: 0,
             started: Instant::now(),
             may_relay: false,
             relayed: None,
+            tcp_send: None,
+            tcp_recv: Vec::new(),
         }
+    }
+
+    #[test]
+    fn host_upstreams_fall_back_when_stub_refuses_and_tcp_dns_answers_local_and_forwarded() {
+        use std::io::{Read, Write};
+        use std::os::fd::AsRawFd;
+
+        // 1. UDP upstream fallback: a refusing loopback stub (127.0.0.68)
+        // hands over to the secondary upstream (127.0.0.69:53) (#330).
+        let stub_refused = [127, 0, 0, 68];
+        let fallback_ip = [127, 0, 0, 69];
+        let fallback_udp = std::net::UdpSocket::from(super::bound(fallback_ip, 53).unwrap());
+        let fallback_tcp = std::net::TcpListener::from(super::tcp_bound(fallback_ip, 53).unwrap());
+        fallback_tcp.set_nonblocking(false).unwrap();
+        let (client_udp, from) = client();
+        let mut dns = Dns::default();
+        let sid = super::server_id();
+        let tcp_listener = super::tcp_bound([127, 0, 0, 1], 0).unwrap();
+        let tcp_port = super::local_port(&tcp_listener).unwrap();
+        dns.servers.push(Server { id: sid, bridges: vec!["kiri0".into()], sock: udp_socket().unwrap(), container: None });
+        dns.tcp_servers.push((sid, tcp_listener));
+        dns.register("kiri0", ["svc"].iter(), [172, 17, 0, 9]);
+
+        let q = query("example.com", 1);
+        dns.forward(0, &q, from, &[stub_refused, fallback_ip]);
+        assert_eq!(dns.pending.len(), 1);
+        let fd0 = dns.pending[0].sock.as_raw_fd();
+        wait_readable(fd0);
+        dns.on_readable(fd0, &[stub_refused, fallback_ip]);
+        assert_eq!(dns.pending.len(), 1, "handed over to fallback upstream");
+        assert_eq!(peer(dns.pending[0].sock.as_raw_fd()), fallback_ip);
+        let mut buf = [0u8; 512];
+        wait_readable(fallback_udp.as_raw_fd());
+        let (n, peer_addr) = fallback_udp.recv_from(&mut buf).unwrap();
+        buf[2] |= 0x80;
+        fallback_udp.send_to(&buf[..n], peer_addr).unwrap();
+        let fd1 = dns.pending[0].sock.as_raw_fd();
+        wait_readable(fd1);
+        dns.on_readable(fd1, &[stub_refused, fallback_ip]);
+        assert_eq!(told(&client_udp, 1000), Some((u16::from_be_bytes([q[0], q[1]]), 0)));
+
+        // 2. TCP DNS listener: local network name (`svc`) and forwarded large
+        // upstream reply (>512 bytes, as after TC=1 in `bun install`, #330).
+        let upstream_worker = std::thread::spawn(move || {
+            let (mut s, _) = fallback_tcp.accept().unwrap();
+            let mut len = [0u8; 2];
+            s.read_exact(&mut len).unwrap();
+            let mut uq = vec![0u8; u16::from_be_bytes(len) as usize];
+            s.read_exact(&mut uq).unwrap();
+            let mut reply = uq;
+            reply[2] = 0x81;
+            reply[3] = 0x80;
+            reply[6..8].copy_from_slice(&40u16.to_be_bytes());
+            for i in 0..40u8 {
+                reply.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 104, 16, 0, i]);
+            }
+            assert!(reply.len() > 600);
+            s.write_all(&(reply.len() as u16).to_be_bytes()).unwrap();
+            s.write_all(&reply).unwrap();
+        });
+
+        let client_worker = std::thread::spawn(move || {
+            let mut c = std::net::TcpStream::connect(("127.0.0.1", tcp_port)).unwrap();
+            // First query: local container name `svc` -> 172.17.0.9.
+            let q1 = query("svc", 1);
+            c.write_all(&(q1.len() as u16).to_be_bytes()).unwrap();
+            c.write_all(&q1).unwrap();
+            let mut rlen = [0u8; 2];
+            c.read_exact(&mut rlen).unwrap();
+            let mut r1 = vec![0u8; u16::from_be_bytes(rlen) as usize];
+            c.read_exact(&mut r1).unwrap();
+            assert_eq!(&r1[r1.len() - 4..], &[172, 17, 0, 9]);
+
+            // Second query on the same TCP stream: external large response via fallback_tcp.
+            let mut q2 = query("registry.npmjs.org", 1);
+            q2[0..2].copy_from_slice(&0x4242u16.to_be_bytes());
+            c.write_all(&(q2.len() as u16).to_be_bytes()).unwrap();
+            c.write_all(&q2).unwrap();
+            c.read_exact(&mut rlen).unwrap();
+            let mut r2 = vec![0u8; u16::from_be_bytes(rlen) as usize];
+            c.read_exact(&mut r2).unwrap();
+            assert!(r2.len() > 600);
+            assert_eq!(&r2[0..2], &[0x42, 0x42]);
+            assert_eq!(u16::from_be_bytes([r2[6], r2[7]]), 40);
+        });
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while !client_worker.is_finished() && Instant::now() < deadline {
+            let mut fds = Vec::new();
+            dns.interest(&mut fds);
+            let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, 20) };
+            if rc > 0 {
+                for pfd in fds {
+                    if pfd.revents != 0 && dns.owns(pfd.fd) {
+                        dns.on_readable(pfd.fd, &[stub_refused, fallback_ip]);
+                    }
+                }
+            }
+            dns.on_timer();
+        }
+        client_worker.join().unwrap();
+        upstream_worker.join().unwrap();
+    }
+
+    #[test]
+    fn multiple_timed_out_queries_on_a_closed_tcp_client_never_panic_and_tcp_interest_respects_eof_and_backpressure() {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::time::Duration;
+
+        let mut dns = Dns::default();
+        let sid = super::server_id();
+        dns.servers.push(Server { id: sid, bridges: vec!["kiri0".into()], sock: udp_socket().unwrap(), container: Some(77) });
+
+        // 1. >=3 timed-out/failing queries on a closed/reset TCP client:
+        // when `flush_tcp_client` drops the broken client on the first EPIPE,
+        // `drop_tcp_client` must not mutate `self.pending` while `on_timer` or
+        // `forward_with` walks `self.pending` by index.
+        for sweep_in_forward in [false, true] {
+            let mut fds = [0; 2];
+            assert_eq!(unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_NONBLOCK, 0, fds.as_mut_ptr()) }, 0);
+            let (server_end, client_end) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+            drop(client_end); // close peer immediately so writes fail with EPIPE
+            let cid = super::server_id();
+            dns.tcp_clients.push(super::TcpClient {
+                id: cid,
+                server: sid,
+                key: super::ClientKey::Container(77),
+                sock: server_end,
+                recv: Vec::new(),
+                send: Vec::new(),
+                eof: false,
+                started: Instant::now(),
+            });
+            for qid in [1u16, 2, 3, 4] {
+                let mut p = pending();
+                p.id = qid;
+                p.server = sid;
+                p.key = super::ClientKey::Container(77);
+                p.tcp_client = Some(cid);
+                p.sent = Instant::now() - super::FORWARD_TIMEOUT - Duration::from_secs(1);
+                dns.pending.push(p);
+            }
+            if sweep_in_forward {
+                let q = query("example.com", 1);
+                let placeholder: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+                dns.forward_with(0, &q, placeholder, Some(cid), super::ClientKey::Container(77), &[]);
+            } else {
+                dns.on_timer();
+            }
+            assert!(dns.pending.is_empty(), "all 4 expired TCP queries failed cleanly without index panic");
+            assert!(dns.tcp_clients.is_empty(), "broken TCP client was dropped");
+        }
+
+        // 2. EOF clears trailing incomplete frame, suppresses POLLIN in interest(),
+        // and reaps the client once pending queries finish; non-empty send buffer
+        // polls POLLOUT without POLLIN and drops the client if MAX_TCP_SEND is exceeded.
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_NONBLOCK, 0, fds.as_mut_ptr()) }, 0);
+        let (server_end, client_end) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        let cid = super::server_id();
+        let sock_fd = server_end.as_raw_fd();
+        dns.tcp_clients.push(super::TcpClient {
+            id: cid,
+            server: sid,
+            key: super::ClientKey::Container(77),
+            sock: server_end,
+            recv: vec![0, 20, 1, 2], // incomplete frame
+            send: vec![1, 2, 3],
+            eof: false,
+            started: Instant::now() - Duration::from_secs(3),
+        });
+        let mut pollfds = Vec::new();
+        dns.interest(&mut pollfds);
+        let c_pfd = pollfds.iter().find(|p| p.fd == sock_fd).expect("polled for POLLOUT");
+        assert_eq!(c_pfd.events, libc::POLLOUT, "no POLLIN while send buffer is non-empty");
+
+        // Shut down client write half so read returns 0 (EOF) while a pending query is in flight.
+        unsafe { libc::shutdown(client_end.as_raw_fd(), libc::SHUT_WR) };
+        let mut p = pending();
+        p.server = sid;
+        p.key = super::ClientKey::Container(77);
+        p.tcp_client = Some(cid);
+        dns.pending.push(p);
+
+        // Drain send buffer and step client to hit EOF.
+        dns.step_tcp_client(0, &[]);
+        let mut drain = [0u8; 16];
+        let _ = unsafe { libc::read(client_end.as_raw_fd(), drain.as_mut_ptr().cast(), drain.len()) };
+        dns.step_tcp_client(0, &[]);
+        assert_eq!(dns.tcp_clients.len(), 1, "kept while pending query is in flight");
+        assert!(dns.tcp_clients[0].eof, "marked eof");
+        assert!(dns.tcp_clients[0].recv.is_empty(), "incomplete frame cleared on eof");
+
+        pollfds.clear();
+        dns.interest(&mut pollfds);
+        assert!(pollfds.iter().all(|p| p.fd != sock_fd), "half-closed idle TCP client is not polled for POLLIN");
+
+        // Exceeding MAX_TCP_SEND drops the client; or once pending finishes, eof client is reaped.
+        dns.pending.clear();
+        dns.on_timer();
+        assert!(dns.tcp_clients.is_empty(), "reaped once eof, send empty, and no pending query");
+
+        // Verify MAX_TCP_SEND cap and that unregister(Ip) never drops ClientKey::Container clients.
+        let mut fds2 = [0; 2];
+        assert_eq!(unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_NONBLOCK, 0, fds2.as_mut_ptr()) }, 0);
+        let (s2, _c2) = unsafe { (OwnedFd::from_raw_fd(fds2[0]), OwnedFd::from_raw_fd(fds2[1])) };
+        let cid2 = super::server_id();
+        dns.tcp_clients.push(super::TcpClient {
+            id: cid2,
+            server: sid,
+            key: super::ClientKey::Container(77),
+            sock: s2,
+            recv: Vec::new(),
+            send: vec![0u8; super::MAX_TCP_SEND - 10],
+            eof: false,
+            started: Instant::now(),
+        });
+        dns.unregister("kiri0", [172, 17, 0, 2]);
+        assert_eq!(dns.tcp_clients.len(), 1, "unregistering an IP never drops a Container TCP client");
+        dns.send_tcp_reply(cid2, &[0u8; 32]);
+        assert!(dns.tcp_clients.is_empty(), "client exceeding MAX_TCP_SEND is dropped");
     }
 
     /// The default bridge moved off a subnet the host took (#489): its

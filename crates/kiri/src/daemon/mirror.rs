@@ -234,11 +234,15 @@ pub fn unverified(c: &kiri_image::RegistryConfig, names: &[String]) -> Vec<Strin
 }
 
 /// buildkitd.toml's registry tables, for `c` (daemon.json's settings) and
-/// `names` ([`registry_names`]).
-pub fn config(engine: &Engine, c: &kiri_image::RegistryConfig, names: &[String]) -> String {
+/// `names` ([`registry_names`]), with `host_net` selecting `127.0.0.1` on
+/// Linux when the builder runs in the host network namespace (`--driver-opt
+/// network=host`), where the loopback listener is always up even before `kiri0`
+/// exists.
+pub fn config_for(engine: &Engine, c: &kiri_image::RegistryConfig, names: &[String], host_net: bool) -> String {
     let mut tables: Vec<(String, Table)> = Vec::new();
     if let Some(port) = LISTENING.get().copied().flatten() {
-        let host = format!("{}:{port}", mirror_host(&engine.lock_net()));
+        let addr = if cfg!(target_os = "linux") && host_net { "127.0.0.1".to_owned() } else { mirror_host(&engine.lock_net()) };
+        let host = format!("{addr}:{port}");
         let token = token();
         for name in names {
             add_mirror(&mut tables, name, format!("{host}/{token}/{name}"));
@@ -354,8 +358,8 @@ fn answer(conn: TcpStream, engine: &Engine) -> io::Result<()> {
         return head(&mut w, "405 Method Not Allowed", "", 0);
     }
     match lookup(&engine.store, target.split('?').next().unwrap_or_default(), &token()) {
-        Some(Found::Manifest(bytes, digest)) => {
-            head(&mut w, "200 OK", &format!("Content-Type: application/vnd.oci.image.manifest.v1+json\r\nDocker-Content-Digest: {digest}\r\n"), bytes.len() as u64)?;
+        Some(Found::Manifest(bytes, media_type, digest)) => {
+            head(&mut w, "200 OK", &format!("Content-Type: {media_type}\r\nDocker-Content-Digest: {digest}\r\n"), bytes.len() as u64)?;
             if method == "GET" {
                 w.write_all(&bytes)?;
             }
@@ -373,10 +377,42 @@ fn answer(conn: TcpStream, engine: &Engine) -> io::Result<()> {
     w.flush()
 }
 
+const OCI_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
+const OCI_INDEX: &str = "application/vnd.oci.image.index.v1+json";
+const MAX_MANIFEST: u64 = 4 << 20;
+
 #[derive(Debug)]
 enum Found {
-    Manifest(Vec<u8>, String),
+    Manifest(Vec<u8>, String, String),
     Blob(std::path::PathBuf, String),
+}
+
+/// Content-Type for raw manifest or index JSON `bytes`.
+fn manifest_media_type(bytes: &[u8]) -> String {
+    if let Ok(v) = serde_json::from_slice::<Value>(bytes) {
+        if let Some(mt) = v["mediaType"].as_str().map(str::trim).filter(|m| !m.is_empty() && !m.contains(['\r', '\n'])) {
+            return mt.to_owned();
+        }
+        if v.get("manifests").is_some() {
+            return OCI_INDEX.to_owned();
+        }
+    }
+    OCI_MANIFEST.to_owned()
+}
+
+/// Reads a raw upstream manifest or multi-arch index blob saved during `pull`,
+/// verifying that its bytes hash to `digest`.
+fn stored_manifest(store: &kiri_image::Store, digest: &str) -> Option<(Vec<u8>, String)> {
+    let path = store.blob_path(digest).ok()?;
+    let len = std::fs::metadata(&path).ok()?.len();
+    if len > MAX_MANIFEST {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    (kiri_image::store::sha256_digest(&bytes) == digest).then(|| {
+        let media_type = manifest_media_type(&bytes);
+        (bytes, media_type)
+    })
 }
 
 /// An image's manifest as Kiri serves it, and its digest.
@@ -384,7 +420,7 @@ fn manifest(store: &kiri_image::Store, i: &Image) -> Option<(Vec<u8>, String)> {
     let config_size = std::fs::metadata(store.blob_path(&i.config_digest).ok()?).ok()?.len();
     let m = json!({
         "schemaVersion": 2,
-        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "mediaType": OCI_MANIFEST,
         "config": {"mediaType": "application/vnd.oci.image.config.v1+json", "digest": i.config_digest, "size": config_size},
         "layers": i.layers.iter().map(|l| json!({"mediaType": l.media_type, "digest": l.digest, "size": l.size})).collect::<Vec<Value>>(),
     });
@@ -421,7 +457,16 @@ fn lookup(store: &kiri_image::Store, path: &str, token: &str) -> Option<Found> {
     let in_repo = |i: &&Image| Reference::parse(&i.name).is_ok_and(|n| n.registry == registry && n.repository == repo);
     if is_manifest {
         if reference.starts_with("sha256:") {
-            return images.iter().filter(in_repo).find_map(|i| manifest(store, i).filter(|(_, d)| *d == reference)).map(|(b, d)| Found::Manifest(b, d));
+            // Serve the exact raw manifest or multi-arch index bytes saved
+            // during `docker pull` when an image in this repository owns that
+            // digest, so digest-pinned builds (`FROM repo:tag@sha256:…` or
+            // `FROM repo@sha256:…`) verify cleanly from Kiri's store (#288, #330).
+            if images.iter().filter(in_repo).any(|i| i.digest == reference || i.index_digest.as_deref() == Some(reference.as_str()))
+                && let Some((b, mt)) = stored_manifest(store, &reference)
+            {
+                return Some(Found::Manifest(b, mt, reference));
+            }
+            return images.iter().filter(in_repo).find_map(|i| manifest(store, i).filter(|(_, d)| *d == reference)).map(|(b, d)| Found::Manifest(b, OCI_MANIFEST.to_owned(), d));
         }
         let wanted = Reference::parse(&format!("{registry}/{repo}:{reference}")).ok()?.short();
         // A tag a registry published is the registry's to answer: Kiri holds
@@ -431,10 +476,10 @@ fn lookup(store: &kiri_image::Store, path: &str, token: &str) -> Option<Found> {
         // mirror and pull the platform it asked for.
         let i = images.iter().find(|i| i.name == wanted && serve_tag(i))?;
         let (b, d) = manifest(store, i)?;
-        return Some(Found::Manifest(b, d));
+        return Some(Found::Manifest(b, OCI_MANIFEST.to_owned(), d));
     }
     // Only blobs of that repository's images.
-    let owned = images.iter().filter(in_repo).any(|i| i.config_digest == reference || i.layers.iter().any(|l| l.digest == reference));
+    let owned = images.iter().filter(in_repo).any(|i| i.referenced_digests().any(|d| d == reference));
     let path = store.blob_path(&reference).ok()?;
     (owned && path.is_file()).then_some(Found::Blob(path, reference))
 }
@@ -602,7 +647,7 @@ mod tests {
         assert!(lookup(&store, "/v2/tok/docker.io/library/alpine/manifests/3.20", "tok").is_none());
         assert!(matches!(
             lookup(&store, &format!("/v2/tok/docker.io/library/alpine/manifests/{pulled_manifest_digest}"), "tok"),
-            Some(Found::Manifest(_, d)) if d == pulled_manifest_digest
+            Some(Found::Manifest(_, _, d)) if d == pulled_manifest_digest
         ));
         assert!(matches!(
             lookup(&store, &format!("/v2/tok/docker.io/library/alpine/blobs/{layer_digest}"), "tok"),
@@ -620,7 +665,7 @@ mod tests {
         store.put_image(pulled.tagged("mybase:dev".into())).unwrap();
         assert!(matches!(
             lookup(&store, "/v2/tok/docker.io/library/mybase/manifests/dev", "tok"),
-            Some(Found::Manifest(_, d)) if d == pulled_manifest_digest
+            Some(Found::Manifest(_, _, d)) if d == pulled_manifest_digest
         ));
         assert!(matches!(
             lookup(&store, &format!("/v2/tok/docker.io/library/mybase/blobs/{layer_digest}"), "tok"),
@@ -628,11 +673,54 @@ mod tests {
         ));
 
         // 3. Built, loaded or committed here: served by tag until pushed to a registry.
-        let local = kiri_image::archive::from_config("localhost:5000/myapp:dev".into(), &cfg_digest, &cfg, layers);
+        let local = kiri_image::archive::from_config("localhost:5000/myapp:dev".into(), &cfg_digest, &cfg, layers.clone());
         store.put_image(local).unwrap();
         assert!(matches!(lookup(&store, "/v2/tok/localhost:5000/myapp/manifests/dev", "tok"), Some(Found::Manifest(..))));
         store.set_pushed("localhost:5000/myapp:dev", &cfg_digest, &format!("sha256:{}", "c".repeat(64))).unwrap();
         assert!(lookup(&store, "/v2/tok/localhost:5000/myapp/manifests/dev", "tok").is_none());
+
+        // 4. Digest-pinned multi-arch pull (`docker pull oven/bun:1-alpine@sha256:<index>`):
+        // raw index and platform manifest bytes are served verbatim with their
+        // upstream Content-Type so BuildKit's SHA-256 verification succeeds (#288, #330).
+        let raw_manifest = format!(
+            "{{\n  \"schemaVersion\": 2,\n  \"mediaType\": \"application/vnd.docker.distribution.manifest.v2+json\",\n  \"config\": {{\"mediaType\": \"application/vnd.docker.container.image.v1+json\", \"size\": 42, \"digest\": \"{cfg_digest}\"}},\n  \"layers\": [{{\"mediaType\": \"application/vnd.docker.image.rootfs.diff.tar.gzip\", \"size\": {layer_size}, \"digest\": \"{layer_digest}\"}}]\n}}"
+        );
+        let (raw_man_digest, _) = write_blob(raw_manifest.as_bytes());
+        let raw_index = format!(
+            "{{\n  \"schemaVersion\": 2,\n  \"mediaType\": \"application/vnd.oci.image.index.v1+json\",\n  \"manifests\": [\n    {{\"mediaType\": \"application/vnd.docker.distribution.manifest.v2+json\", \"size\": {}, \"digest\": \"{raw_man_digest}\", \"platform\": {{\"architecture\": \"amd64\", \"os\": \"linux\"}}}},\n    {{\"mediaType\": \"application/vnd.docker.distribution.manifest.v2+json\", \"size\": 999, \"digest\": \"sha256:{}\", \"platform\": {{\"architecture\": \"arm64\", \"os\": \"linux\"}}}}\n  ]\n}}",
+            raw_manifest.len(),
+            "e".repeat(64)
+        );
+        let (raw_idx_digest, _) = write_blob(raw_index.as_bytes());
+        let pinned = Image {
+            name: format!("oven/bun@{raw_idx_digest}"),
+            digest: raw_man_digest.clone(),
+            index_digest: Some(raw_idx_digest.clone()),
+            ..kiri_image::archive::from_config(format!("oven/bun@{raw_idx_digest}"), &cfg_digest, &cfg, layers)
+        };
+        store.put_image(pinned).unwrap();
+        match lookup(&store, &format!("/v2/tok/docker.io/oven/bun/manifests/{raw_idx_digest}"), "tok") {
+            Some(Found::Manifest(b, mt, d)) => {
+                assert_eq!(b, raw_index.as_bytes(), "exact upstream index bytes");
+                assert_eq!(kiri_image::store::sha256_digest(&b), raw_idx_digest);
+                assert_eq!(mt, "application/vnd.oci.image.index.v1+json");
+                assert_eq!(d, raw_idx_digest);
+            }
+            other => panic!("expected raw index manifest, got {other:?}"),
+        }
+        match lookup(&store, &format!("/v2/tok/docker.io/oven/bun/manifests/{raw_man_digest}"), "tok") {
+            Some(Found::Manifest(b, mt, d)) => {
+                assert_eq!(b, raw_manifest.as_bytes(), "exact upstream platform manifest bytes");
+                assert_eq!(kiri_image::store::sha256_digest(&b), raw_man_digest);
+                assert_eq!(mt, "application/vnd.docker.distribution.manifest.v2+json");
+                assert_eq!(d, raw_man_digest);
+            }
+            other => panic!("expected raw platform manifest, got {other:?}"),
+        }
+        // Unpulled platform digest returns None (404) so BuildKit falls back to the registry.
+        assert!(lookup(&store, &format!("/v2/tok/docker.io/oven/bun/manifests/sha256:{}", "e".repeat(64)), "tok").is_none());
+        // Cross-repo isolation holds for raw manifests too.
+        assert!(lookup(&store, &format!("/v2/tok/docker.io/library/other/manifests/{raw_idx_digest}"), "tok").is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### Build: serve digest-pinned local bases, relay default-bridge stub DNS, and support host-network builds (unreleased)
+- Fixes: #209 Windows: docker build hangs when a RUN step needs network (BuildKit has no usable DNS); #288 BuildKit fails to resolve digest-pinned FROM image already pulled into Kiri's image store; #330 Linux: containers have no DNS on the default bridge; Compose/BuildKit builds can't resolve a digest-pinned base; bun install gets ConnectionRefused
+- Caused: none known
+- Caused by: -
+- Check: `dns-default-bridge-stub`, `build-pinned-digest`, `build-host-network-dns`
+
 ### #640, #218, #761 Windows: forward published UDP and host-IP/LAN TCP ports to WSL 2, and write `kiri diag report --out` on the Windows filesystem (unreleased)
 - Fixes: #640 [Windows] Published UDP Ports Are Not Forwarding Packets to Containers; #218 Windows: publishing a port on a host IP (-p IP:port:port) fails with 'Address not available (os error 99)'; 0.0.0.0 is loopback-only; #761 `kiri diag report --out <path>` on Windows wrote inside the WSL rootfs instead of the Windows path
 - Caused: none known

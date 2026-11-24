@@ -121,6 +121,18 @@ impl Image {
         let same_repo = Reference::parse(&self.name).is_ok_and(|n| n.registry == r.registry && n.repository == r.repository);
         same_repo && (self.digest == r.reference || self.index_digest.as_deref() == Some(r.reference.as_str()))
     }
+
+    /// Every blob digest this image record owns in the store: its config,
+    /// its layers, and (when pulled from a registry) its raw manifest and
+    /// multi-arch index blobs so Kiri's build mirror can serve exact
+    /// digest-verified bytes.
+    pub fn referenced_digests(&self) -> impl Iterator<Item = &str> {
+        let manifest = (self.digest != self.config_digest).then_some(self.digest.as_str());
+        std::iter::once(self.config_digest.as_str())
+            .chain(manifest)
+            .chain(self.index_digest.as_deref())
+            .chain(self.layers.iter().map(|l| l.digest.as_str()))
+    }
 }
 
 #[derive(Debug)]
@@ -494,8 +506,8 @@ impl Store {
         let Some(pos) = images.iter().position(|i| i.name == name) else { return Ok(None) };
         let removed = images.remove(pos);
         self.write_index(&images)?;
-        let in_use = |d: &str| images.iter().any(|i| i.config_digest == d || i.layers.iter().any(|l| l.digest == d));
-        for d in std::iter::once(&removed.config_digest).chain(removed.layers.iter().map(|l| &l.digest)) {
+        let in_use = |d: &str| images.iter().any(|i| i.referenced_digests().any(|r| r == d));
+        for d in removed.referenced_digests() {
             if !in_use(d) {
                 self.remove_unpinned(d);
             }
@@ -509,7 +521,7 @@ impl Store {
     pub fn remove_if_unused(&self, digest: &str) -> io::Result<()> {
         let _lock = self.lock_index()?;
         let images = self.read_locked()?;
-        if !images.iter().any(|i| i.config_digest == digest || i.layers.iter().any(|l| l.digest == digest)) {
+        if !images.iter().any(|i| i.referenced_digests().any(|r| r == digest)) {
             self.remove_unpinned(digest);
         }
         Ok(())
@@ -744,6 +756,41 @@ mod tests {
             assert!(store.find(&name).unwrap().is_some(), "{name}");
         }
         assert!(store.find(&format!("other/node@{index}")).unwrap().is_none());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn removes_raw_manifest_and_index_blobs_when_no_image_references_them() {
+        let root = std::env::temp_dir().join(format!("kiri-store-raw-manifest-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let store = Store::open(&root).unwrap();
+        let put = |bytes: &[u8]| {
+            let mut w = store.ingest().unwrap();
+            w.write_all(bytes).unwrap();
+            w.finish().unwrap()
+        };
+        let (cfg, cfg_sz) = put(b"{\"os\":\"linux\",\"architecture\":\"amd64\"}");
+        let (man, man_sz) = put(b"{\"schemaVersion\":2,\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\"}");
+        let (idx, idx_sz) = put(b"{\"schemaVersion\":2,\"mediaType\":\"application/vnd.oci.image.index.v1+json\"}");
+        let img = |name: &str| Image {
+            name: name.into(),
+            digest: man.clone(),
+            index_digest: Some(idx.clone()),
+            config_digest: cfg.clone(),
+            layers: Vec::new(),
+            size: 0,
+            platform: "linux/amd64".into(),
+            created: String::new(),
+            pulled_at: 0,
+            config: RunConfig::default(),
+            mirror: None,
+        };
+        store.put_image(img("app:1")).unwrap();
+        store.put_image(img("app:latest")).unwrap();
+        store.remove_image("app:1").unwrap();
+        assert!(store.has_blob(&cfg, cfg_sz) && store.has_blob(&man, man_sz) && store.has_blob(&idx, idx_sz), "second tag still holds all blobs");
+        store.remove_image("app:latest").unwrap();
+        assert!(!store.has_blob(&cfg, cfg_sz) && !store.has_blob(&man, man_sz) && !store.has_blob(&idx, idx_sz), "last tag frees raw manifest and index blobs");
         fs::remove_dir_all(&root).unwrap();
     }
 
