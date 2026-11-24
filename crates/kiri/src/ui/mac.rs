@@ -35,6 +35,11 @@ thread_local! {
     /// Scripts for a page made again, kept until it says `ready`: the menu
     /// bar's Settings… or a container shows the window and sends at once.
     static QUEUED: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+    /// The last left mouse-down the app received (`watch_presses`), so a
+    /// drag the page asks for starts where the button went down.
+    static PRESS: RefCell<Option<Retained<objc2_app_kit::NSEvent>>> = const { RefCell::new(None) };
+    /// The event monitor that keeps `PRESS`; kept for as long as the app runs.
+    static PRESS_MONITOR: RefCell<Option<Retained<AnyObject>>> = const { RefCell::new(None) };
 }
 
 /// `autostart` boots the VM as soon as the page has loaded; `view` picks the
@@ -123,6 +128,7 @@ fn make_window(mtm: MainThreadMarker, tx: Sender<Cmd>, autostart: bool, view: Op
     place_lights(&window);
     WEBVIEW.with(|w| *w.borrow_mut() = Some(webview));
     WINDOW.with(|w| *w.borrow_mut() = Some(window.clone()));
+    watch_presses();
     Ok(window)
 }
 
@@ -166,6 +172,37 @@ fn release_page() {
     });
     drop(webview);
     super::page_gone();
+}
+
+/// Keeps each left mouse-down AppKit delivers, before the window gets it,
+/// for `drag`, and clears it on mouse-up. The monitor hands every event on
+/// unchanged.
+fn watch_presses() {
+    use std::ptr::NonNull;
+    use objc2_app_kit::{NSEvent, NSEventMask};
+    let handler = block2::RcBlock::new(|event: NonNull<NSEvent>| -> *mut NSEvent {
+        // SAFETY: AppKit calls a local monitor on the main thread with a valid event.
+        record_press(unsafe { event.as_ref() });
+        event.as_ptr()
+    });
+    let mask = NSEventMask::LeftMouseDown | NSEventMask::LeftMouseUp;
+    // SAFETY: an NSEvent class method on the main thread; the handler
+    // returns the event it was given, so delivery is as before.
+    let monitor: Option<Retained<AnyObject>> =
+        unsafe { msg_send![objc2::class!(NSEvent), addLocalMonitorForEventsMatchingMask: mask, handler: &*handler] };
+    PRESS_MONITOR.with(|m| *m.borrow_mut() = monitor);
+}
+
+fn record_press(event: &objc2_app_kit::NSEvent) {
+    use objc2_app_kit::NSEventType;
+    let press = if event.r#type() == NSEventType::LeftMouseDown {
+        // SAFETY: `event` is a live NSEvent reference; retaining it keeps it
+        // alive after the current run-loop turn's autorelease pool drains.
+        unsafe { Retained::retain(std::ptr::from_ref(event).cast_mut()) }
+    } else {
+        None
+    };
+    PRESS.with(|p| *p.borrow_mut() = press);
 }
 
 /// The page's strip across the top (index.html's `.strip`), in points.
@@ -426,19 +463,39 @@ pub(super) fn quit() {
 
 /// The page covers the title bar, and WebKit ignores CSS drag regions, so
 /// the page asks for the drag itself on mouse-down over empty chrome. The
-/// message lands after the mouse-down: if the button is already up (a quick
-/// click), AppKit's current event is the mouse-up, and a drag started then
-/// waits for a release that already happened, holding the window until the
-/// next click.
+/// message lands after the mouse-down, when AppKit's current event is often
+/// no longer it (a hand already moving sends mouse-dragged events, a Force
+/// Touch trackpad pressure ones), so nothing moved (#337). The drag starts
+/// from the real press `watch_presses` kept instead: its place and time,
+/// so the window follows the pointer from where the button went down. Only
+/// while the button is held: after a quick click the current event is the
+/// mouse-up, and a drag started then waits for a release that already
+/// happened, holding the window until the next click.
 pub(super) fn drag() {
+    use objc2_app_kit::NSEvent;
     let Some(mtm) = MainThreadMarker::new() else { return };
+    let buttons = NSEvent::pressedMouseButtons();
     WINDOW.with(|w| {
-        if let (Some(window), Some(event)) = (w.borrow().as_ref(), NSApplication::sharedApplication(mtm).currentEvent()) {
-            if event.r#type() == objc2_app_kit::NSEventType::LeftMouseDown && objc2_app_kit::NSEvent::pressedMouseButtons() & 1 != 0 {
-                window.performWindowDragWithEvent(&event);
-            }
+        let Some(window) = w.borrow().clone() else { return };
+        if let Some(down) = press_for_drag(window.windowNumber(), buttons, || NSApplication::sharedApplication(mtm).currentEvent()) {
+            window.performWindowDragWithEvent(&down);
         }
     });
+}
+
+fn press_for_drag(
+    window_number: isize,
+    buttons: usize,
+    current: impl FnOnce() -> Option<Retained<objc2_app_kit::NSEvent>>,
+) -> Option<Retained<objc2_app_kit::NSEvent>> {
+    use objc2_app_kit::NSEventType;
+    if buttons & 1 == 0 {
+        PRESS.with(|p| *p.borrow_mut() = None);
+        return None;
+    }
+    let ours = |e: &objc2_app_kit::NSEvent| e.r#type() == NSEventType::LeftMouseDown && e.windowNumber() == window_number;
+    // This window's press; without one (none seen yet), the current event if it is a press.
+    PRESS.with(|p| p.borrow().clone()).filter(|e| ours(e)).or_else(|| current().filter(|e| ours(e)))
 }
 
 /// Closes the window, as the menu's Close Window did before ⌘W went to the page.
@@ -828,5 +885,70 @@ impl AppDelegate {
         let this = Self::alloc(mtm).set_ivars(AppIvars { tx, engine: RefCell::new(Some(engine)), shown: RefCell::new(Vec::new()) });
         // SAFETY: NSObject's init on a freshly allocated object.
         unsafe { msg_send![super(this), init] }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use objc2::msg_send;
+    use objc2::rc::{Retained, autoreleasepool};
+    use objc2_app_kit::{NSEvent, NSEventModifierFlags, NSEventType};
+    use objc2_foundation::NSPoint;
+
+    use super::{PRESS, press_for_drag, record_press};
+
+    fn mouse_event(kind: NSEventType, window_number: isize, event_number: isize) -> Retained<NSEvent> {
+        // SAFETY: AppKit event constructor with valid value arguments and a nil graphics context.
+        let event: Option<Retained<NSEvent>> = unsafe {
+            msg_send![
+                objc2::class!(NSEvent),
+                mouseEventWithType: kind,
+                location: NSPoint::new(24.0, 12.0),
+                modifierFlags: NSEventModifierFlags::empty(),
+                timestamp: 1.0f64,
+                windowNumber: window_number,
+                context: Option::<&objc2::runtime::AnyObject>::None,
+                eventNumber: event_number,
+                clickCount: 1isize,
+                pressure: 1.0f32,
+            ]
+        };
+        event.expect("mouse event")
+    }
+
+    #[test]
+    fn drag_uses_the_kept_press_across_autorelease_pools_until_release() {
+        PRESS.with(|p| *p.borrow_mut() = None);
+
+        // A mouse-down captured in an earlier run-loop turn survives the pool
+        // drain and is chosen even after the current event has moved on.
+        autoreleasepool(|_| {
+            let down = mouse_event(NSEventType::LeftMouseDown, 7, 101);
+            record_press(&down);
+        });
+        let dragged = mouse_event(NSEventType::LeftMouseDragged, 7, 102);
+        let picked = press_for_drag(7, 1, || Some(dragged)).expect("kept press");
+        assert_eq!((picked.r#type(), picked.windowNumber(), picked.eventNumber()), (NSEventType::LeftMouseDown, 7, 101));
+
+        // Another window never takes this window's press, nor lends its own.
+        assert!(press_for_drag(8, 1, || None).is_none());
+        let other = mouse_event(NSEventType::LeftMouseDown, 8, 103);
+        record_press(&other);
+        assert!(press_for_drag(7, 1, || Some(other)).is_none());
+
+        // Once the button is up, a late drag message starts nothing and clears the press.
+        let down = mouse_event(NSEventType::LeftMouseDown, 7, 104);
+        record_press(&down);
+        assert!(press_for_drag(7, 0, || None).is_none());
+        assert!(PRESS.with(|p| p.borrow().is_none()));
+
+        // A mouse-up also clears the kept press, and without one a live mouse-down fallback works.
+        record_press(&down);
+        let up = mouse_event(NSEventType::LeftMouseUp, 7, 105);
+        record_press(&up);
+        assert!(PRESS.with(|p| p.borrow().is_none()));
+        assert!(press_for_drag(7, 1, || None).is_none());
+        let fallback = press_for_drag(7, 1, || Some(down)).expect("current mouse-down fallback");
+        assert_eq!(fallback.eventNumber(), 104);
     }
 }

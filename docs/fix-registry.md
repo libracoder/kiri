@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #512 Mac: the window drags from its strip from where the button went down (unreleased)
+- Fixes: #337 macOS 26: dragging the window from the top strip doesn't move the window
+- Caused: none known
+- Caused by: -
+- Check: none
+
 ### #190 Windows: ignore unrelated processes whose parent PID was recycled in the window usage tree (unreleased)
 - Fixes: #190 Windows: window usage counts unrelated processes when a recycled parent PID matches a child of Kiri
 - Caused: none known
