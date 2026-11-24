@@ -60,6 +60,8 @@ stage_engine() { # root unitdir
   install -m 644 "$here/kiri.service" "$1/$2/kiri.service"
   # The password prompt for `kiri host-access` (the window's setup checklist).
   install -D -m 644 "$here/dev.kiri.host-access.policy" "$1/usr/share/polkit-1/actions/dev.kiri.host-access.policy"
+  # NetworkManager leaves Kiri's bridges and veths alone.
+  install -D -m 644 "$here/kiri-nm.conf" "$1/usr/lib/NetworkManager/conf.d/kiri.conf"
 }
 stage_cli() { # root
   # The plugins stay in Kiri's own directory: /usr/lib/docker/cli-plugins
@@ -161,7 +163,7 @@ EOF
 build_rpm() { # name full(0|1)
   local top=$work/rpm-$1
   mkdir -p "$top"/{SOURCES,BUILD,RPMS,SRPMS,SPECS}
-  cp "$bindir/kiri" "$bindir/kiri-init" "$here/kiri.service" "$here/dev.kiri.host-access.policy" "$root/LICENSE" "$root/NOTICE" "$top/SOURCES/"
+  cp "$bindir/kiri" "$bindir/kiri-init" "$here/kiri.service" "$here/dev.kiri.host-access.policy" "$here/kiri-nm.conf" "$root/LICENSE" "$root/NOTICE" "$top/SOURCES/"
   local with=()
   if [ "$2" = 1 ]; then
     cp "$clidir/docker" "$top/SOURCES/docker"

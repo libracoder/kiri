@@ -53,6 +53,7 @@ host_test() { # name full(0|1)
   # access list, without it signing in again. Checked as that user with no
   # groups at all, as a session started before the change would be.
   check "polkit action for the password prompt" "test -f /usr/share/polkit-1/actions/dev.kiri.host-access.policy"
+  check "NetworkManager leaves Kiri's interfaces alone" "grep -Fqx '[device-kiri]' /usr/lib/NetworkManager/conf.d/kiri.conf && grep -Fqx 'match-device=interface-name:kiri*,interface-name:kv?????????????,interface-name:kx??????????*' /usr/lib/NetworkManager/conf.d/kiri.conf && grep -Fqx 'managed=0' /usr/lib/NetworkManager/conf.d/kiri.conf && ! grep -Fqx '[keyfile]' /usr/lib/NetworkManager/conf.d/kiri.conf"
   userdel kiri-acl-test >/dev/null 2>&1; useradd --system --no-create-home kiri-acl-test
   userdel kiri-acl-other >/dev/null 2>&1; useradd --system --no-create-home kiri-acl-other
   check "kiri host-access starts the engine and adds the account to the kiri group" "/usr/bin/kiri host-access kiri-acl-test && systemctl is-enabled -q kiri && systemctl is-active -q kiri && id -nG kiri-acl-test | grep -qw kiri"
@@ -113,7 +114,7 @@ host_test() { # name full(0|1)
     echo "  [skip] docker run (pass a static docker CLI dir as the 2nd argument)"
   fi
   check "$remove" "$remove"
-  check "service stopped, binaries gone, data kept" "! systemctl is-active kiri && test ! -e /usr/bin/kiri && test -d /var/lib/kiri"
+  check "service stopped, binaries gone, data kept" "! systemctl is-active kiri && test ! -e /usr/bin/kiri && test ! -e /usr/lib/NetworkManager/conf.d/kiri.conf && test -d /var/lib/kiri"
   [ "$sock_free" = 1 ] && check "/var/run/docker.sock link gone with the service" "test ! -L /var/run/docker.sock"
   [ "$full" = 1 ] && check "docker alternative withdrawn" "test ! -e /usr/bin/docker || ! readlink -f /usr/bin/docker | grep -q libexec/kiri"
 }
