@@ -1856,5 +1856,8 @@
   "Running now with {cpus}, up to {mem}, and a {disk} disk.": "現在 {cpus}、最大 {mem}、{disk} ディスクで実行中です。",
   "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "VM ディスクが拡張できる上限です。{os} 上の容量はデータが書き込まれた分だけ使用され、縮小することはありません。再起動時に適用されます。",
   "No other WSL distros installed.": "他の WSL ディストリビューションはインストールされていません。",
-  "WSL integration": "WSL 統合"
+  "WSL integration": "WSL 統合",
+  "Close: the memory the window uses is freed. It takes a moment to open again, and open terminals end.": "閉じる：ウインドウが使うメモリを解放します。再び開くまでに少し時間がかかり、開いているターミナルは終了します。",
+  "Closing the window": "ウインドウを閉じたとき",
+  "Hide: the window stays ready and opens again at once.": "隠す：ウインドウは準備されたまま残り、すぐに再び開きます。"
 }

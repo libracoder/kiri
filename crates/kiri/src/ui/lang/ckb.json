@@ -1856,5 +1856,8 @@
   "Running now with {cpus}, up to {mem}, and a {disk} disk.": "ئێستا بە {cpus}، تا {mem} و دیسکی {disk} کاردەکات.",
   "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "زۆرترین قەبارە کە دیسکی VM دەتوانێت بۆی گەورە ببێت. تەنها کاتێک داتا دەنووسرێت جێگا لەسەر {os} بەکاردەهێنێت؛ هەرگیز بچووک نابێتەوە. لە کاتی دەستپێکردنەوەدا جێبەجێ دەبێت.",
   "No other WSL distros installed.": "هیچ دابەشکراوێکی دیکەی WSL دانەمەزراوە.",
-  "WSL integration": "ئاوێتەکردنی WSL"
+  "WSL integration": "ئاوێتەکردنی WSL",
+  "Close: the memory the window uses is freed. It takes a moment to open again, and open terminals end.": "داخستن: ئەو بیرگەیەی پەنجەرەکە بەکاری دەهێنێت ئازاد دەکرێت. کردنەوەی دووبارەی کەمێک کات دەبات، و تێرمیناڵە کراوەکان کۆتاییان دێت.",
+  "Closing the window": "داخستنی پەنجەرە",
+  "Hide: the window stays ready and opens again at once.": "شاردنەوە: پەنجەرەکە ئامادە دەمێنێتەوە و دەستبەجێ دەکرێتەوە."
 }

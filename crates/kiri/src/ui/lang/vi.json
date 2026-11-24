@@ -1856,5 +1856,8 @@
   "Running now with {cpus}, up to {mem}, and a {disk} disk.": "Đang chạy với {cpus}, tối đa {mem} và đĩa {disk}.",
   "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "Mức tối đa đĩa VM có thể mở rộng. Dung lượng trên {os} chỉ được dùng khi ghi dữ liệu; đĩa không bao giờ thu nhỏ. Áp dụng khi khởi động lại.",
   "No other WSL distros installed.": "Chưa cài đặt bản phân phối WSL nào khác.",
-  "WSL integration": "Tích hợp WSL"
+  "WSL integration": "Tích hợp WSL",
+  "Close: the memory the window uses is freed. It takes a moment to open again, and open terminals end.": "Đóng: giải phóng bộ nhớ cửa sổ đang dùng. Mở lại sẽ mất một lúc, và các terminal đang mở sẽ bị đóng.",
+  "Closing the window": "Khi đóng cửa sổ",
+  "Hide: the window stays ready and opens again at once.": "Ẩn: cửa sổ luôn sẵn sàng và mở lại ngay."
 }

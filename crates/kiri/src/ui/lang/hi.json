@@ -1856,5 +1856,8 @@
   "Running now with {cpus}, up to {mem}, and a {disk} disk.": "अभी {cpus}, अधिकतम {mem} और {disk} डिस्क के साथ चल रहा है।",
   "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "VM डिस्क अधिकतम इतना बढ़ सकता है। {os} पर जगह तभी इस्तेमाल होती है जब डेटा लिखा जाता है; यह कभी छोटा नहीं होता। रीस्टार्ट पर लागू होता है।",
   "No other WSL distros installed.": "कोई अन्य WSL डिस्ट्रो इंस्टॉल नहीं है।",
-  "WSL integration": "WSL एकीकरण"
+  "WSL integration": "WSL एकीकरण",
+  "Close: the memory the window uses is freed. It takes a moment to open again, and open terminals end.": "बंद करें: विंडो की इस्तेमाल की गई मेमोरी खाली हो जाती है। फिर से खुलने में थोड़ा समय लगता है, और खुले टर्मिनल बंद हो जाते हैं।",
+  "Closing the window": "विंडो बंद करने पर",
+  "Hide: the window stays ready and opens again at once.": "छिपाएँ: विंडो तैयार रहती है और तुरंत फिर से खुलती है।"
 }

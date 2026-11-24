@@ -1856,5 +1856,8 @@
   "Running now with {cpus}, up to {mem}, and a {disk} disk.": "Kjører nå med {cpus}, opptil {mem} og en disk på {disk}.",
   "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "Det meste VM-disken kan vokse til. Plass på {os} brukes bare etter hvert som data skrives; den krymper aldri. Gjelder ved omstart.",
   "No other WSL distros installed.": "Ingen andre WSL-distribusjoner er installert.",
-  "WSL integration": "WSL-integrering"
+  "WSL integration": "WSL-integrering",
+  "Close: the memory the window uses is freed. It takes a moment to open again, and open terminals end.": "Lukk: minnet vinduet bruker, frigjøres. Det tar et øyeblikk å åpne det igjen, og åpne terminaler avsluttes.",
+  "Closing the window": "Når vinduet lukkes",
+  "Hide: the window stays ready and opens again at once.": "Skjul: vinduet holdes klart og åpnes igjen med en gang."
 }

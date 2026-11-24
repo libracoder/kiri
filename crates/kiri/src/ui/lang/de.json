@@ -1856,5 +1856,8 @@
   "Running now with {cpus}, up to {mem}, and a {disk} disk.": "Läuft jetzt mit {cpus}, bis zu {mem} und einer {disk}-Festplatte.",
   "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "Die maximale Größe der VM-Festplatte. Speicherplatz auf {os} wird erst beim Schreiben von Daten belegt; die Größe schrumpft nie. Gilt nach einem Neustart.",
   "No other WSL distros installed.": "Keine weiteren WSL-Distributionen installiert.",
-  "WSL integration": "WSL-Integration"
+  "WSL integration": "WSL-Integration",
+  "Close: the memory the window uses is freed. It takes a moment to open again, and open terminals end.": "Schließen: Der Speicher des Fensters wird freigegeben. Es braucht einen Moment, um wieder zu öffnen, und offene Terminals werden beendet.",
+  "Closing the window": "Beim Schließen des Fensters",
+  "Hide: the window stays ready and opens again at once.": "Ausblenden: Das Fenster bleibt bereit und öffnet sich sofort wieder."
 }

@@ -1856,5 +1856,8 @@
   "Running now with {cpus}, up to {mem}, and a {disk} disk.": "Қазір {cpus}, {mem} дейінгі жад және {disk} дискімен жұмыс істеп тұр.",
   "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "Виртуалды машина дискі өсе алатын ең үлкен өлшем. {os} жүйесінде орын тек деректер жазылғанда ғана алынады; ол ешқашан кішіреймейді. Қайта іске қосқанда қолданылады.",
   "No other WSL distros installed.": "Басқа WSL дистрибутивтері орнатылмаған.",
-  "WSL integration": "WSL интеграциясы"
+  "WSL integration": "WSL интеграциясы",
+  "Close: the memory the window uses is freed. It takes a moment to open again, and open terminals end.": "Жабу: терезе пайдаланатын жад босатылады. Қайта ашылуына біраз уақыт кетеді, ал ашық терминалдар жабылады.",
+  "Closing the window": "Терезені жапқанда",
+  "Hide: the window stays ready and opens again at once.": "Жасыру: терезе дайын күйде қалады және бірден қайта ашылады."
 }

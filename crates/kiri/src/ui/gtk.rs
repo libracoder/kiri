@@ -3,8 +3,13 @@
 //! `webkit.messageHandlers.kiri`, which WebKitGTK has too, and gets events
 //! through `kiri.on(...)`.
 //!
-//! The window keeps the desktop's own title bar, as on Windows. Closing it
-//! quits the window only: the engine is a system service and keeps running.
+//! The window keeps the desktop's own title bar, as on Windows. While a
+//! `StatusNotifierWatcher` is on the session bus (`sni.rs`), closing the
+//! window hides it behind the tray icon (or, with Settings → Appearance →
+//! Closing the window → Close, lets go of its WebKit view too so WebKit's
+//! helper processes end). With no tray host on the desktop, closing the
+//! window quits `kiri ui` as before. Either way the engine is a system
+//! service and keeps running.
 
 use std::cell::RefCell;
 use std::ffi::{CStr, c_char, c_int, c_void};
@@ -23,12 +28,18 @@ thread_local! {
     /// The page and its window. Only ever touched on GTK's main thread.
     static WEBVIEW: RefCell<Option<WebView>> = const { RefCell::new(None) };
     static WINDOW: RefCell<Option<gtk::Window>> = const { RefCell::new(None) };
+    /// Where a page made again (after the window let go of its own) sends
+    /// its messages.
+    static PAGE_TX: RefCell<Option<mpsc::Sender<Cmd>>> = const { RefCell::new(None) };
+    /// Scripts for a page made again, kept until it says `ready`: the tray
+    /// menu's container items show the window and send at once.
+    static QUEUED: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
 }
 
 /// Before the page's own scripts: which system this is.
 const SHIM: &str = r#"window.KIRI_OS = "linux";"#;
 
-const ICON_PNG: &[u8] = include_bytes!("../../../../brand/icon/png/kiri-app-icon-512.png");
+pub(super) const ICON_PNG: &[u8] = include_bytes!("../../../../brand/icon/png/kiri-app-icon-512.png");
 
 /// `autostart` starts the engine as soon as the page has loaded; `view` picks
 /// the sidebar section to open on.
@@ -40,6 +51,8 @@ pub fn run(autostart: bool, view: Option<String>) -> io::Result<()> {
     let (tx, rx) = mpsc::channel();
     let engine_tx = tx.clone();
     let engine = std::thread::Builder::new().name("kiri-engine".into()).spawn(move || engine(rx, engine_tx))?;
+    PAGE_TX.with(|t| *t.borrow_mut() = Some(tx.clone()));
+    super::sni::start(tx.clone(), ICON_PNG);
 
     let window = gtk::Window::new(gtk::WindowType::Toplevel);
     window.set_title(crate::flavor::APP.get());
@@ -56,13 +69,45 @@ pub fn run(autostart: bool, view: Option<String>) -> io::Result<()> {
     window.set_size_request(760, 480);
     window.set_position(gtk::WindowPosition::Center);
 
+    let webview = make_webview(tx.clone(), autostart, view);
+    window.add(&webview);
+    // Before set_appearance, which gives it its background.
+    WEBVIEW.with(|v| *v.borrow_mut() = Some(webview));
+
+    set_appearance(prefs()["theme"].as_str().unwrap_or("system"));
+    let quit_tx = tx;
+    window.connect_delete_event(move |window, _| {
+        if super::sni::tray_available() {
+            window.hide();
+            release_page(window);
+            return glib::Propagation::Stop;
+        }
+        let _ = quit_tx.send(Cmd::Quit);
+        gtk::main_quit();
+        glib::Propagation::Proceed
+    });
+    window.show_all();
+    WINDOW.with(|v| *v.borrow_mut() = Some(window));
+    gtk::main();
+    let _ = engine.join();
+    Ok(())
+}
+
+/// The page, in a new WebKitGTK view.
+fn make_webview(tx: mpsc::Sender<Cmd>, autostart: bool, view: Option<String>) -> WebView {
     let content = UserContentManager::new();
     content.add_script(&UserScript::new(SHIM, UserContentInjectedFrames::TopFrame, UserScriptInjectionTime::Start, &[], &[]));
     content.register_script_message_handler("kiri");
-    let page_tx = tx.clone();
     content.connect_script_message_received(Some("kiri"), move |_, message| {
         if let Some(text) = message.js_value().map(|v| v.to_str()) {
-            super::handle(&text, &page_tx, autostart, view.as_deref());
+            let text = text.to_string();
+            // A page made again has loaded: what was sent meanwhile goes in now.
+            if serde_json::from_str::<serde_json::Value>(&text).is_ok_and(|m| m["cmd"] == "ready") {
+                for js in QUEUED.with(|q| q.borrow_mut().take()).unwrap_or_default() {
+                    eval(js);
+                }
+            }
+            super::handle(&text, &tx, autostart, view.as_deref());
         }
     });
     let webview = WebView::with_user_content_manager(&content);
@@ -76,23 +121,32 @@ pub fn run(autostart: bool, view: Option<String>) -> io::Result<()> {
         whole_frames(&settings);
         settings.set_enable_write_console_messages_to_stdout(cfg!(debug_assertions));
     }
+    let dark = match prefs()["theme"].as_str().unwrap_or("system") {
+        "dark" => true,
+        "light" => false,
+        _ => desktop_dark(),
+    };
+    webview.set_background_color(&page_background(dark));
     webview.load_html(&super::assemble::page(PAGE, super::prefs()["lang"].as_str()), None);
-    window.add(&webview);
-    // Before set_appearance, which gives it its background.
-    WEBVIEW.with(|v| *v.borrow_mut() = Some(webview));
+    webview
+}
 
-    set_appearance(prefs()["theme"].as_str().unwrap_or("system"));
-    let quit_tx = tx;
-    window.connect_delete_event(move |_, _| {
-        let _ = quit_tx.send(Cmd::Quit);
-        gtk::main_quit();
-        glib::Propagation::Proceed
-    });
-    window.show_all();
-    WINDOW.with(|v| *v.borrow_mut() = Some(window));
-    gtk::main();
-    let _ = engine.join();
-    Ok(())
+/// The window closed with Settings → Closing the window → Close while the tray
+/// is up: it lets go of its WebKitGTK view, freeing `WebKitWebProcess` and
+/// `WebKitNetworkProcess`. The tray and the engine thread stay; [`show`] makes
+/// the page again.
+fn release_page(window: &gtk::Window) {
+    if prefs()["closeButton"] != "close" {
+        return;
+    }
+    let Some(webview) = WEBVIEW.with(|v| v.borrow_mut().take()) else { return };
+    QUEUED.with(|q| *q.borrow_mut() = None);
+    window.remove(&webview);
+    // SAFETY: `webview` was just removed from `window` and taken out of
+    // `WEBVIEW`, so nothing queries it after `gtk_widget_destroy`.
+    unsafe { webview.destroy() };
+    drop(webview);
+    super::page_gone();
 }
 
 /// Turns off WebKit's `PropagateDamagingInformation`. With it on and no GPU
@@ -194,6 +248,14 @@ pub(super) fn relang() {}
 
 pub(super) fn eval(js: String) {
     glib::MainContext::default().invoke(move || {
+        let js = QUEUED.with(|q| match q.borrow_mut().as_mut() {
+            Some(queued) => {
+                queued.push(js);
+                None
+            }
+            None => Some(js),
+        });
+        let Some(js) = js else { return };
         WEBVIEW.with(|v| {
             if let Some(webview) = v.borrow().as_ref() {
                 webview.evaluate_javascript(&js, None, None, None::<&gtk::gio::Cancellable>, |_| {});
@@ -202,14 +264,49 @@ pub(super) fn eval(js: String) {
     });
 }
 
-/// Closes the window, from any thread.
-pub(super) fn quit() {
+/// Shows the window again (from the tray's click or Open Kiri), making the
+/// page again if closing the window let go of it.
+pub(super) fn show() {
     glib::MainContext::default().invoke(|| {
         WINDOW.with(|v| {
             if let Some(window) = v.borrow().as_ref() {
-                window.close();
+                if WEBVIEW.with(|w| w.borrow().is_none())
+                    && let Some(tx) = PAGE_TX.with(|t| t.borrow().clone())
+                {
+                    let webview = make_webview(tx, false, None);
+                    QUEUED.with(|q| *q.borrow_mut() = Some(Vec::new()));
+                    window.add(&webview);
+                    webview.show();
+                    WEBVIEW.with(|w| *w.borrow_mut() = Some(webview));
+                }
+                window.show();
+                window.present();
             }
         });
+    });
+}
+
+/// The tray host left the session bus or refused the item: a window closed
+/// to the tray (hidden, or without its page) comes back, so there is never
+/// neither a window nor a tray icon.
+pub(super) fn tray_gone() {
+    glib::MainContext::default().invoke(|| {
+        let hidden = WINDOW.with(|v| v.borrow().as_ref().is_some_and(|w| !w.is_visible()));
+        if hidden || WEBVIEW.with(|w| w.borrow().is_none()) {
+            show();
+        }
+    });
+}
+
+/// Quits the window and its engine thread, from any thread.
+pub(super) fn quit() {
+    glib::MainContext::default().invoke(|| {
+        PAGE_TX.with(|t| {
+            if let Some(tx) = t.borrow().as_ref() {
+                let _ = tx.send(Cmd::Quit);
+            }
+        });
+        gtk::main_quit();
     });
 }
 

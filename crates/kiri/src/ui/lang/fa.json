@@ -1856,5 +1856,8 @@
   "Running now with {cpus}, up to {mem}, and a {disk} disk.": "اکنون با {cpus}، حداکثر {mem} و دیسک {disk} در حال اجراست.",
   "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "بیشترین اندازه‌ای که دیسک ماشین مجازی می‌تواند بزرگ شود. فضا در {os} فقط هنگام نوشتن داده‌ها مصرف می‌شود و هرگز کوچک نمی‌شود. پس از راه‌اندازی مجدد اعمال می‌شود.",
   "No other WSL distros installed.": "توزیع WSL دیگری نصب نشده است.",
-  "WSL integration": "یکپارچه‌سازی WSL"
+  "WSL integration": "یکپارچه‌سازی WSL",
+  "Close: the memory the window uses is freed. It takes a moment to open again, and open terminals end.": "بستن: حافظه‌ای که پنجره مصرف می‌کند آزاد می‌شود. باز شدن دوباره‌اش کمی طول می‌کشد و ترمینال‌های باز بسته می‌شوند.",
+  "Closing the window": "بستن پنجره",
+  "Hide: the window stays ready and opens again at once.": "پنهان کردن: پنجره آماده می‌ماند و بی‌درنگ دوباره باز می‌شود."
 }

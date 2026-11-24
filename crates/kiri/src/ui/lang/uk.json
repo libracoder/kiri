@@ -1856,5 +1856,8 @@
   "Running now with {cpus}, up to {mem}, and a {disk} disk.": "Зараз працює з {cpus}, до {mem} пам’яті та диском {disk}.",
   "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "Максимум, до якого може вирости диск ВМ. Місце на {os} займається лише під час запису даних; розмір ніколи не зменшується. Застосовується після перезапуску.",
   "No other WSL distros installed.": "Інших дистрибутивів WSL не встановлено.",
-  "WSL integration": "Інтеграція з WSL"
+  "WSL integration": "Інтеграція з WSL",
+  "Close: the memory the window uses is freed. It takes a moment to open again, and open terminals end.": "Закрити: пам’ять, яку займає вікно, звільняється. Повторне відкриття триває мить, а відкриті термінали закриваються.",
+  "Closing the window": "Закриття вікна",
+  "Hide: the window stays ready and opens again at once.": "Приховати: вікно залишається готовим і одразу відкривається знову."
 }

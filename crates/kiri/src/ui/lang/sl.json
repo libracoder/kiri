@@ -1856,5 +1856,8 @@
   "Running now with {cpus}, up to {mem}, and a {disk} disk.": "Zdaj teče s {cpus}, največ {mem} in diskom {disk}.",
   "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "Največja velikost, do katere lahko zraste disk navideznega računalnika. Prostor v sistemu {os} se porablja šele ob zapisovanju podatkov; disk se nikoli ne skrči. Uveljavi se ob ponovnem zagonu.",
   "No other WSL distros installed.": "Nameščene ni nobene druge distribucije WSL.",
-  "WSL integration": "Integracija z WSL"
+  "WSL integration": "Integracija z WSL",
+  "Close: the memory the window uses is freed. It takes a moment to open again, and open terminals end.": "Zapri: pomnilnik, ki ga uporablja okno, se sprosti. Ponovno odpiranje traja trenutek, odprti terminali pa se končajo.",
+  "Closing the window": "Ob zapiranju okna",
+  "Hide: the window stays ready and opens again at once.": "Skrij: okno ostane pripravljeno in se takoj znova odpre."
 }

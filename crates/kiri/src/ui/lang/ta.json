@@ -1856,5 +1856,8 @@
   "Running now with {cpus}, up to {mem}, and a {disk} disk.": "இப்போது {cpus}, அதிகபட்சம் {mem} மற்றும் {disk} வட்டுடன் இயங்குகிறது.",
   "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "VM வட்டு அதிகபட்சம் வளரக்கூடிய அளவு. தரவு எழுதப்படும்போது மட்டுமே {os}-இல் இடம் பயன்படுத்தப்படும்; இது ஒருபோதும் சுருங்காது. மறுதொடக்கத்தில் நடைமுறைக்கு வரும்.",
   "No other WSL distros installed.": "வேறு எந்த WSL விநியோகங்களும் நிறுவப்படவில்லை.",
-  "WSL integration": "WSL ஒருங்கிணைப்பு"
+  "WSL integration": "WSL ஒருங்கிணைப்பு",
+  "Close: the memory the window uses is freed. It takes a moment to open again, and open terminals end.": "மூடு: சாளரம் பயன்படுத்தும் நினைவகம் விடுவிக்கப்படும். மீண்டும் திறக்கச் சற்று நேரமாகும், திறந்திருக்கும் டெர்மினல்கள் முடிவடையும்.",
+  "Closing the window": "சாளரத்தை மூடும்போது",
+  "Hide: the window stays ready and opens again at once.": "மறை: சாளரம் தயாராக இருந்து உடனே மீண்டும் திறக்கும்."
 }

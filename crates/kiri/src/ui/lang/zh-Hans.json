@@ -1856,5 +1856,8 @@
   "Running now with {cpus}, up to {mem}, and a {disk} disk.": "当前运行使用 {cpus}、内存最多 {mem}、{disk} 磁盘。",
   "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "虚拟机磁盘最多可扩展到的大小。仅在写入数据时才会占用 {os} 上的空间，且永不缩小。重启后生效。",
   "No other WSL distros installed.": "未安装其他 WSL 发行版。",
-  "WSL integration": "WSL 集成"
+  "WSL integration": "WSL 集成",
+  "Close: the memory the window uses is freed. It takes a moment to open again, and open terminals end.": "关闭：释放窗口占用的内存。重新打开需要片刻，已打开的终端会结束。",
+  "Closing the window": "关闭窗口时",
+  "Hide: the window stays ready and opens again at once.": "隐藏：窗口保持就绪，可立即重新打开。"
 }

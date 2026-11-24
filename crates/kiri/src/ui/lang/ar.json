@@ -1856,5 +1856,8 @@
   "Running now with {cpus}, up to {mem}, and a {disk} disk.": "يعمل الآن بـ {cpus} وبحد أقصى {mem} وقرص بحجم {disk}.",
   "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "أقصى حجم قد ينمو إليه قرص الجهاز الافتراضي. لا تُستهلك المساحة على {os} إلا عند كتابة البيانات، ولا يتقلص الحجم أبداً. يُطبّق عند إعادة التشغيل.",
   "No other WSL distros installed.": "لا توجد توزيعات WSL أخرى مثبّتة.",
-  "WSL integration": "تكامل WSL"
+  "WSL integration": "تكامل WSL",
+  "Close: the memory the window uses is freed. It takes a moment to open again, and open terminals end.": "إغلاق: تُحرَّر الذاكرة التي تستخدمها النافذة. تستغرق لحظة لتُفتح مجددًا، وتُنهى الطرفيات المفتوحة.",
+  "Closing the window": "عند إغلاق النافذة",
+  "Hide: the window stays ready and opens again at once.": "إخفاء: تبقى النافذة جاهزة وتُفتح مجددًا على الفور."
 }

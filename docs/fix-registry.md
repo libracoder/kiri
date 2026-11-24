@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #706, #539 UI: Linux tray icon and unified window-close setting (Hide vs Close) across macOS, Windows and Linux (unreleased)
+- Fixes: #405 Linux: close the window to the tray, as on Windows; #168 Release or suspend WebView2 memory when window is closed to tray (Lightweight background mode)
+- Caused: none known
+- Caused by: -
+- Check: `tests/ui/closebutton.js`
+
 ### #384 macOS: configurable VM disk size with online ext4 growth (unreleased)
 - Fixes: #384 macOS: VM data.img is fixed at 64 GiB with no disk size setting
 - Caused: none known

@@ -1856,5 +1856,8 @@
   "Running now with {cpus}, up to {mem}, and a {disk} disk.": "এখন {cpus}, সর্বোচ্চ {mem} ও {disk} ডিস্ক নিয়ে চলছে।",
   "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "VM ডিস্ক সর্বোচ্চ যতটা বড় হতে পারে। ডেটা লেখা হলেই কেবল {os}-এ জায়গা ব্যবহার হয়; এটি কখনো ছোট হয় না। রিস্টার্ট করলে প্রয়োগ হয়।",
   "No other WSL distros installed.": "অন্য কোনো WSL ডিস্ট্রো ইনস্টল করা নেই।",
-  "WSL integration": "WSL ইন্টিগ্রেশন"
+  "WSL integration": "WSL ইন্টিগ্রেশন",
+  "Close: the memory the window uses is freed. It takes a moment to open again, and open terminals end.": "বন্ধ করুন: উইন্ডোর ব্যবহৃত মেমরি মুক্ত হয়। আবার খুলতে একটু সময় লাগে, এবং খোলা টার্মিনালগুলো বন্ধ হয়ে যায়।",
+  "Closing the window": "উইন্ডো বন্ধ করলে",
+  "Hide: the window stays ready and opens again at once.": "লুকান: উইন্ডো প্রস্তুত থাকে এবং সঙ্গে সঙ্গে আবার খোলে।"
 }

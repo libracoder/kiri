@@ -1856,5 +1856,8 @@
   "Running now with {cpus}, up to {mem}, and a {disk} disk.": "Dabar veikia su {cpus}, iki {mem} ir {disk} disku.",
   "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "Didžiausias dydis, iki kurio gali išaugti VM diskas. Vieta {os} naudojama tik rašant duomenis; diskas niekada nesumažėja. Pritaikoma paleidus iš naujo.",
   "No other WSL distros installed.": "Kitų WSL distribucijų neįdiegta.",
-  "WSL integration": "WSL integracija"
+  "WSL integration": "WSL integracija",
+  "Close: the memory the window uses is freed. It takes a moment to open again, and open terminals end.": "Uždaryti: lango naudojama atmintis atlaisvinama. Vėl atsidaryti užtrunka akimirką, o atviri terminalai užbaigiami.",
+  "Closing the window": "Uždarant langą",
+  "Hide: the window stays ready and opens again at once.": "Slėpti: langas lieka paruoštas ir iškart atsidaro vėl."
 }

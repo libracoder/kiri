@@ -1856,5 +1856,8 @@
   "Running now with {cpus}, up to {mem}, and a {disk} disk.": "ຕອນນີ້ແລ່ນດ້ວຍ {cpus}, ສູງສຸດ {mem} ແລະ ດິສກ໌ {disk}.",
   "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "ຂະໜາດສູງສຸດທີ່ດິສກ໌ VM ສາມາດຂະຫຍາຍໄດ້. ພື້ນທີ່ໃນ {os} ຈະຖືກໃຊ້ສະເພາະເມື່ອມີການຂຽນຂໍ້ມູນ ແລະ ບໍ່ເຄີຍຫົດລົງ. ມີຜົນເມື່ອເລີ່ມໃໝ່.",
   "No other WSL distros installed.": "ບໍ່ມີ WSL distro ອື່ນຕິດຕັ້ງຢู่.",
-  "WSL integration": "ການເຊື່ອມໂຍງ WSL"
+  "WSL integration": "ການເຊື່ອມໂຍງ WSL",
+  "Close: the memory the window uses is freed. It takes a moment to open again, and open terminals end.": "ປິດ: ໜ່ວຍຄວາມຈຳທີ່ໜ້າຕ່າງໃຊ້ຈະຖືກປ່ອຍຄືນ. ການເປີດຄືນຈະໃຊ້ເວລາໜ້ອຍໜຶ່ງ ແລະ ເທີມິນອນທີ່ເປີດຢູ່ຈະຖືກປິດ.",
+  "Closing the window": "ເມື່ອປິດໜ້າຕ່າງ",
+  "Hide: the window stays ready and opens again at once.": "ເຊື່ອງ: ໜ້າຕ່າງຈະກຽມພ້ອມໄວ້ ແລະ ເປີດຄືນໄດ້ທັນທີ."
 }

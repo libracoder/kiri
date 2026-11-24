@@ -1856,5 +1856,8 @@
   "Running now with {cpus}, up to {mem}, and a {disk} disk.": "Εκτελείται τώρα με {cpus}, έως {mem} και δίσκο {disk}.",
   "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "Το μέγιστο μέγεθος στο οποίο μπορεί να μεγαλώσει ο δίσκος της VM. Καταλαμβάνει χώρο στο {os} μόνο καθώς γράφονται δεδομένα και δεν μικραίνει ποτέ. Εφαρμόζεται κατά την επανεκκίνηση.",
   "No other WSL distros installed.": "Δεν υπάρχουν άλλες εγκατεστημένες διανομές WSL.",
-  "WSL integration": "Ενσωμάτωση WSL"
+  "WSL integration": "Ενσωμάτωση WSL",
+  "Close: the memory the window uses is freed. It takes a moment to open again, and open terminals end.": "Κλείσιμο: η μνήμη που χρησιμοποιεί το παράθυρο ελευθερώνεται. Χρειάζεται μια στιγμή για να ανοίξει ξανά, και τα ανοιχτά τερματικά τερματίζονται.",
+  "Closing the window": "Κλείσιμο του παραθύρου",
+  "Hide: the window stays ready and opens again at once.": "Απόκρυψη: το παράθυρο μένει έτοιμο και ανοίγει ξανά αμέσως."
 }

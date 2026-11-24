@@ -129,6 +129,15 @@ pub fn emit(json: String) {
     Handle.eval(format!("window.kiri && kiri.on({json})"));
 }
 
+/// The window let go of its page (app.rs, Ui::close): the terminals, the
+/// log and the live figures it followed end with it, as when Linux's window
+/// closes. The page asks for what it needs again when it next loads.
+pub fn page_gone() {
+    crate::term::handle("closeall", "", &Value::Null, emit);
+    crate::detail::stop_logs();
+    crate::detail::stop_stats();
+}
+
 pub fn notice(kind: &str, text: &str) -> String {
     json!({"type": "notice", "kind": kind, "text": text}).to_string()
 }
@@ -930,7 +939,7 @@ fn set_pref(name: &str, value: Value) {
         crate::watch::set_enabled(crate::watch::is_enabled());
         return;
     }
-    if !matches!(name, "font" | "mono" | "scale" | "termH" | "termFs" | "termFont" | "domainsAsked" | "theme" | "accent" | "starAsked" | "updateAuto" | "lang" | "langAsked") {
+    if !matches!(name, "font" | "mono" | "scale" | "termH" | "termFs" | "termFont" | "domainsAsked" | "theme" | "accent" | "starAsked" | "updateAuto" | "lang" | "langAsked" | "closeButton") {
         return;
     }
     let Some(path) = prefs_path() else { return };

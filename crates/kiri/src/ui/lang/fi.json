@@ -1856,5 +1856,8 @@
   "Running now with {cpus}, up to {mem}, and a {disk} disk.": "Käynnissä nyt: {cpus}, muistia enintään {mem}, levy {disk}.",
   "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "Enimmäiskoko, johon virtuaalikoneen levy voi kasvaa. Tilaa kuluu järjestelmästä {os} vain dataa kirjoitettaessa, eikä levy koskaan pienene. Tulee voimaan uudelleenkäynnistyksessä.",
   "No other WSL distros installed.": "Muita WSL-jakeluita ei ole asennettu.",
-  "WSL integration": "WSL-integraatio"
+  "WSL integration": "WSL-integraatio",
+  "Close: the memory the window uses is freed. It takes a moment to open again, and open terminals end.": "Sulje: ikkunan käyttämä muisti vapautetaan. Uudelleen avautuminen kestää hetken, ja avoimet päätteet suljetaan.",
+  "Closing the window": "Ikkunan sulkeminen",
+  "Hide: the window stays ready and opens again at once.": "Piilota: ikkuna pysyy valmiina ja avautuu heti uudelleen."
 }

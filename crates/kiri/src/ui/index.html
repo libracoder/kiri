@@ -4506,6 +4506,10 @@ function renderSettings() {
       <div class="seg" role="group" aria-label="${tr("Text size")}">${SIZES.map((z) => `<button data-scale="${z}" aria-pressed="${Math.abs((prefs.scale || 1) - z) < 0.01}">${Math.round(z * 100)}%</button>`).join("")}</div></div>
     <div class="pref"><span class="t">${tr("Log text")}</span><span class="d">${tr("Container, Kubernetes and diagnostics logs.")}</span>
       <div class="seg" role="group" aria-label="${tr("Log text")}">${LOG_SIZES.map(([px, l]) => `<button data-logsize="${px}" aria-pressed="${prefs.logSize === px}">${tr(l)}</button>`).join("")}</div></div>
+    <div class="pref"><span class="t">${tr("Closing the window")}</span><span class="d">${prefs.closeButton === "close"
+      ? tr("Close: the memory the window uses is freed. It takes a moment to open again, and open terminals end.")
+      : tr("Hide: the window stays ready and opens again at once.")}</span>
+      <div class="seg" role="group" aria-label="${tr("Closing the window")}"><button data-closebtn="hide" aria-pressed="${prefs.closeButton !== "close"}">${tr("Hide")}</button><button data-closebtn="close" aria-pressed="${prefs.closeButton === "close"}">${tr("Close")}</button></div></div>
     <div class="preview"><div class="p-title">web · nginx:alpine</div><div>Up 3 minutes · 26.3 MB · localhost:8080 → 80</div><div class="p-mono">ef9a6e2b45c2  docker run -p 8080:80 nginx</div></div>
   </div>`;
   const portsPref = routerPortsPref();
@@ -8334,6 +8338,7 @@ $("content").addEventListener("click", (ev) => {
   else if (diagClick(t)) {}
   else if ((el = t("[data-scale]"))) setPref("scale", +el.dataset.scale);
   else if ((el = t("[data-logsize]"))) setPref("logSize", +el.dataset.logsize);
+  else if ((el = t("[data-closebtn]"))) setPref("closeButton", el.dataset.closebtn);
   else if ((el = t("[data-theme-pick]"))) setPref("theme", el.dataset.themePick);
   else if ((el = t("[data-accent]"))) setPref("accent", el.dataset.accent);
   else if (t("[data-buildprune]")) { ui.bwPruning = true; send("buildprune"); render(); }

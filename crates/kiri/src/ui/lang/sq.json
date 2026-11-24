@@ -1856,5 +1856,8 @@
   "Running now with {cpus}, up to {mem}, and a {disk} disk.": "Tani në punë me {cpus}, deri në {mem} dhe disk {disk}.",
   "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "Maksimumi deri ku mund të rritet disku i VM-së. Hapësira në {os} përdoret vetëm kur shkruhen të dhëna; nuk tkurret kurrë. Zbatohet pas rinisjes.",
   "No other WSL distros installed.": "Nuk ka shpërndarje të tjera WSL të instaluara.",
-  "WSL integration": "Integrimi me WSL"
+  "WSL integration": "Integrimi me WSL",
+  "Close: the memory the window uses is freed. It takes a moment to open again, and open terminals end.": "Mbyll: memoria që përdor dritarja lirohet. Rihapja zgjat një çast dhe terminalet e hapura mbyllen.",
+  "Closing the window": "Kur mbyllet dritarja",
+  "Hide: the window stays ready and opens again at once.": "Fshih: dritarja mbetet gati dhe hapet sërish menjëherë."
 }

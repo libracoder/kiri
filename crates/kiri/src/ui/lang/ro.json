@@ -1856,5 +1856,8 @@
   "Running now with {cpus}, up to {mem}, and a {disk} disk.": "Rulează acum cu {cpus}, până la {mem} și un disc de {disk}.",
   "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "Maximul la care poate crește discul VM-ului. Spațiul pe {os} este folosit doar pe măsură ce se scriu date; nu se micșorează niciodată. Se aplică la repornire.",
   "No other WSL distros installed.": "Nu sunt instalate alte distribuții WSL.",
-  "WSL integration": "Integrare WSL"
+  "WSL integration": "Integrare WSL",
+  "Close: the memory the window uses is freed. It takes a moment to open again, and open terminals end.": "Închide: memoria folosită de fereastră este eliberată. Redeschiderea durează o clipă, iar terminalele deschise se închid.",
+  "Closing the window": "La închiderea ferestrei",
+  "Hide: the window stays ready and opens again at once.": "Ascunde: fereastra rămâne pregătită și se redeschide imediat."
 }

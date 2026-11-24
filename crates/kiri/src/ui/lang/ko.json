@@ -1856,5 +1856,8 @@
   "Running now with {cpus}, up to {mem}, and a {disk} disk.": "지금 {cpus}, 최대 {mem}, {disk} 디스크로 실행 중입니다.",
   "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "VM 디스크가 커질 수 있는 최대 크기입니다. {os}의 공간은 데이터를 쓸 때만 사용되며 줄어들지 않습니다. 재시작 시 적용됩니다.",
   "No other WSL distros installed.": "설치된 다른 WSL 배포판이 없습니다.",
-  "WSL integration": "WSL 통합"
+  "WSL integration": "WSL 통합",
+  "Close: the memory the window uses is freed. It takes a moment to open again, and open terminals end.": "닫기: 창이 쓰는 메모리를 해제합니다. 다시 여는 데 잠시 걸리며, 열려 있는 터미널은 종료됩니다.",
+  "Closing the window": "창을 닫을 때",
+  "Hide: the window stays ready and opens again at once.": "숨기기: 창이 준비된 채로 남아 바로 다시 열립니다."
 }

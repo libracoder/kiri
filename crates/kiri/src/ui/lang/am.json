@@ -1856,5 +1856,8 @@
   "Running now with {cpus}, up to {mem}, and a {disk} disk.": "አሁን በ{cpus}፣ እስከ {mem} እና በ{disk} ዲስክ እየሠራ ነው።",
   "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "የVM ዲስክ ሊያድግ የሚችለው ከፍተኛ መጠን። በ{os} ላይ ቦታ የሚያዝበት ውሂብ ሲጻፍ ብቻ ነው፤ በፍጹም አይቀንስም። ዳግም ሲጀመር ተግባራዊ ይሆናል።",
   "No other WSL distros installed.": "ሌሎች የWSL ስርጭቶች አልተጫኑም።",
-  "WSL integration": "የWSL ውህደት"
+  "WSL integration": "የWSL ውህደት",
+  "Close: the memory the window uses is freed. It takes a moment to open again, and open terminals end.": "ዝጋ፦ መስኮቱ የሚጠቀመው ማህደረ ትውስታ ይለቀቃል። እንደገና ለመክፈት ትንሽ ጊዜ ይወስዳል፣ የተከፈቱ ተርሚናሎችም ይዘጋሉ።",
+  "Closing the window": "መስኮቱን ሲዘጉ",
+  "Hide: the window stays ready and opens again at once.": "ደብቅ፦ መስኮቱ ዝግጁ ሆኖ ይቆያል፣ ወዲያውኑም እንደገና ይከፈታል።"
 }

@@ -1856,5 +1856,8 @@
   "Running now with {cpus}, up to {mem}, and a {disk} disk.": "Most így fut: {cpus}, legfeljebb {mem} memória és {disk} lemez.",
   "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "A virtuális gép lemezének maximális mérete. A tárhely csak adatok írásakor foglalódik el a rendszeren ({os}), és soha nem zsugorodik. Újraindításkor lép életbe.",
   "No other WSL distros installed.": "Nincs más WSL-disztribúció telepítve.",
-  "WSL integration": "WSL-integráció"
+  "WSL integration": "WSL-integráció",
+  "Close: the memory the window uses is freed. It takes a moment to open again, and open terminals end.": "Bezárás: az ablak által használt memória felszabadul. Újbóli megnyitása egy pillanatig tart, a nyitott terminálok pedig bezárulnak.",
+  "Closing the window": "Az ablak bezárásakor",
+  "Hide: the window stays ready and opens again at once.": "Elrejtés: az ablak készenlétben marad, és azonnal újra megnyílik."
 }

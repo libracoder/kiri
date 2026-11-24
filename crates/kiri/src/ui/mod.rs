@@ -22,6 +22,8 @@ mod macsetup;
 use mac as window;
 #[cfg(target_os = "linux")]
 mod gtk;
+#[cfg(any(target_os = "linux", test))]
+mod sni;
 #[cfg(target_os = "linux")]
 use gtk as window;
 pub use window::run;
@@ -507,8 +509,18 @@ fn trf(en: &str, vars: &[(&str, &dyn std::fmt::Display)]) -> String {
     lang::fill(tr(en), vars)
 }
 
+/// The window let go of its page (mac.rs / gtk.rs, Settings → Closing the
+/// window → Close): the terminals, the log and the live figures it followed
+/// end with it, as when the window quits. The page asks for what it needs
+/// again when it next loads.
+fn page_gone() {
+    term::handle("closeall", "", &serde_json::Value::Null, emit);
+    detail::stop_logs();
+    detail::stop_stats();
+}
+
 fn set_pref(name: &str, value: serde_json::Value) {
-    if !matches!(name, "font" | "mono" | "scale" | "termH" | "termFs" | "termFont" | "domainsAsked" | "theme" | "accent" | "importSeen" | "updateAuto" | "updateSkip" | "updateSnoozeUntil" | "columnWidths" | "crashReports" | "ctxSnooze" | "ctxBack" | "logSize" | "starAsked" | "setupSkip" | "lang" | "langAsked") {
+    if !matches!(name, "font" | "mono" | "scale" | "termH" | "termFs" | "termFont" | "domainsAsked" | "theme" | "accent" | "importSeen" | "updateAuto" | "updateSkip" | "updateSnoozeUntil" | "columnWidths" | "crashReports" | "ctxSnooze" | "ctxBack" | "logSize" | "starAsked" | "setupSkip" | "lang" | "langAsked" | "closeButton") {
         return;
     }
     let Some(path) = prefs_path() else { return };

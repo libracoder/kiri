@@ -1856,5 +1856,8 @@
   "Running now with {cpus}, up to {mem}, and a {disk} disk.": "Berjalan sekarang dengan {cpus}, hingga {mem}, dan disk {disk}.",
   "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "Batas maksimum pertumbuhan disk VM. Ruang di {os} hanya terpakai saat data ditulis; ukurannya tidak pernah menyusut. Berlaku setelah mulai ulang.",
   "No other WSL distros installed.": "Tidak ada distro WSL lain yang terinstal.",
-  "WSL integration": "Integrasi WSL"
+  "WSL integration": "Integrasi WSL",
+  "Close: the memory the window uses is freed. It takes a moment to open again, and open terminals end.": "Tutup: memori yang dipakai jendela dibebaskan. Perlu sesaat untuk membukanya lagi, dan terminal yang terbuka ditutup.",
+  "Closing the window": "Saat menutup jendela",
+  "Hide: the window stays ready and opens again at once.": "Sembunyikan: jendela tetap siap dan langsung terbuka lagi."
 }

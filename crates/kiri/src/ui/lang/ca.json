@@ -1856,5 +1856,8 @@
   "Running now with {cpus}, up to {mem}, and a {disk} disk.": "Ara s'executa amb {cpus}, fins a {mem} i un disc de {disk}.",
   "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "El màxim que pot créixer el disc de la VM. Només ocupa espai a {os} a mesura que s'escriuen dades; no s'encongeix mai. S'aplica en reiniciar.",
   "No other WSL distros installed.": "No hi ha cap altra distribució de WSL instal·lada.",
-  "WSL integration": "Integració amb WSL"
+  "WSL integration": "Integració amb WSL",
+  "Close: the memory the window uses is freed. It takes a moment to open again, and open terminals end.": "Tanca: s’allibera la memòria que fa servir la finestra. Tarda un moment a tornar-se a obrir, i els terminals oberts es tanquen.",
+  "Closing the window": "En tancar la finestra",
+  "Hide: the window stays ready and opens again at once.": "Amaga: la finestra es manté a punt i es torna a obrir a l’instant."
 }

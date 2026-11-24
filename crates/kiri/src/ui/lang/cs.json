@@ -1856,5 +1856,8 @@
   "Running now with {cpus}, up to {mem}, and a {disk} disk.": "Teď běží s {cpus}, až {mem} a diskem {disk}.",
   "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "Nejvíc, na kolik může disk virtuálního počítače vyrůst. Místo v systému {os} zabírá až při zápisu dat; nikdy se nezmenšuje. Použije se po restartu.",
   "No other WSL distros installed.": "Nejsou nainstalovány žádné další distribuce WSL.",
-  "WSL integration": "Integrace s WSL"
+  "WSL integration": "Integrace s WSL",
+  "Close: the memory the window uses is freed. It takes a moment to open again, and open terminals end.": "Zavřít: paměť, kterou okno používá, se uvolní. Znovu se otevře až po chvilce a otevřené terminály se ukončí.",
+  "Closing the window": "Zavření okna",
+  "Hide: the window stays ready and opens again at once.": "Skrýt: okno zůstane připravené a znovu se otevře hned."
 }

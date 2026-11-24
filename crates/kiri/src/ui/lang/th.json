@@ -1856,5 +1856,8 @@
   "Running now with {cpus}, up to {mem}, and a {disk} disk.": "ขณะนี้ทำงานด้วย {cpus} สูงสุด {mem} และดิสก์ {disk}",
   "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "ขนาดสูงสุดที่ดิสก์ของ VM ขยายได้ พื้นที่บน {os} จะถูกใช้เมื่อมีการเขียนข้อมูลเท่านั้น และจะไม่หดเล็กลง มีผลเมื่อรีสตาร์ท",
   "No other WSL distros installed.": "ไม่มีดิสโทร WSL อื่นติดตั้งอยู่",
-  "WSL integration": "การผสานรวม WSL"
+  "WSL integration": "การผสานรวม WSL",
+  "Close: the memory the window uses is freed. It takes a moment to open again, and open terminals end.": "ปิด: คืนหน่วยความจำที่หน้าต่างใช้ การเปิดอีกครั้งจะใช้เวลาสักครู่ และเทอร์มินัลที่เปิดอยู่จะถูกปิด",
+  "Closing the window": "เมื่อปิดหน้าต่าง",
+  "Hide: the window stays ready and opens again at once.": "ซ่อน: หน้าต่างพร้อมอยู่เสมอและเปิดกลับมาได้ทันที"
 }

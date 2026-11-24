@@ -1856,5 +1856,8 @@
   "Running now with {cpus}, up to {mem}, and a {disk} disk.": "Şu anda {cpus}, en fazla {mem} ve {disk} disk ile çalışıyor.",
   "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "VM diskinin büyüyebileceği en fazla boyut. {os} üzerinde alan yalnızca veri yazıldıkça kullanılır; asla küçülmez. Yeniden başlatmada uygulanır.",
   "No other WSL distros installed.": "Başka WSL dağıtımı kurulu değil.",
-  "WSL integration": "WSL entegrasyonu"
+  "WSL integration": "WSL entegrasyonu",
+  "Close: the memory the window uses is freed. It takes a moment to open again, and open terminals end.": "Kapat: pencerenin kullandığı bellek boşaltılır. Yeniden açılması biraz sürer ve açık terminaller kapanır.",
+  "Closing the window": "Pencere kapatılınca",
+  "Hide: the window stays ready and opens again at once.": "Gizle: pencere hazır bekler ve hemen yeniden açılır."
 }
