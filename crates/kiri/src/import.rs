@@ -5,7 +5,9 @@
 //! mounts it read-only and is removed after (keeping file owners and `user.*`
 //! extended attributes, which `docker cp` or a copy through the Finder would
 //! lose; falling back to `docker cp` when offline without GNU tar).
-//! Containers arrive stopped.
+//! Containers arrive stopped, with the files they wrote outside their
+//! volumes: what `docker diff` lists, read path by path with `docker cp`
+//! into the container's writable layer in Kiri (#410).
 
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
@@ -871,6 +873,553 @@ pub fn container_with(source: &str, name: &str, force: bool, joining: &[&str]) -
     if !r.ok() {
         return Err(io::Error::other(create_error(r.status, &r.error())));
     }
+    if let Err(e) = writable_layer(ctx, &info, name) {
+        // Without the files it wrote, the container is not the one it was:
+        // it goes again, and the reason is said. Its volumes stay.
+        let _ = client::request("DELETE", &format!("/containers/{name}?force=1"), None);
+        return Err(io::Error::other(format!("its writable layer: {e}")));
+    }
+    Ok(())
+}
+
+/// The engine's own files, which each engine makes and mounts over the
+/// container's for itself: never carried over.
+const ENGINE_FILES: [&str; 4] = ["/etc/hosts", "/etc/hostname", "/etc/resolv.conf", "/.dockerenv"];
+
+/// The kernel's filesystems and the engine's `/dev`, mounted in every
+/// container: nothing at or under them is carried over.
+const KERNEL_TREES: [&str; 3] = ["/proc", "/sys", "/dev"];
+
+/// How many `docker cp` run at once to read the paths a layer changed.
+const READERS: usize = 8;
+
+/// A file up to this size is read ahead, in parallel, while the paths
+/// before it are written; a bigger one is read when its turn comes.
+const READ_AHEAD_FILE: u64 = 1 << 20;
+
+/// What the files read ahead may hold at once, all together.
+const READ_AHEAD_TOTAL: u64 = 64 << 20;
+
+/// The container's writable layer on the source (#410): the files it wrote
+/// outside its volumes, its changes to the image's files and what it
+/// deleted of them, as `docker diff` lists them, become the writable layer
+/// of the container just made as `name` in Kiri, before it first runs.
+/// Nothing is made on the source: each path is read with `docker cp`, only
+/// what changed, never the image's unchanged files, and nothing at or under
+/// the container's mounts (volumes are copied as volumes, binds stay where
+/// they are). A container that changed nothing costs one `docker diff`.
+fn writable_layer(ctx: &str, info: &Value, name: &str) -> io::Result<()> {
+    let id = info["Id"].as_str().filter(|id| !id.is_empty()).ok_or_else(|| io::Error::other("the source gave no container id"))?;
+    let out = cli()?.args(["--context", ctx, "container", "diff", id]).stdin(Stdio::null()).stderr(Stdio::piped()).output()?;
+    if !out.status.success() {
+        return Err(io::Error::other(format!("{ctx}: docker diff: {}", String::from_utf8_lossy(&out.stderr).trim())));
+    }
+    let plan = plan_layer(&parse_diff(&String::from_utf8_lossy(&out.stdout)), &mount_points(info));
+    if plan.is_empty() {
+        return Ok(());
+    }
+    let r = client::post_stream(&format!("/kiri/containers/{name}/upper"), "application/x-tar", |w| write_layer(ctx, id, &plan, w))?;
+    if !r.ok() {
+        return Err(io::Error::other(create_error(r.status, &r.error())));
+    }
+    Ok(())
+}
+
+/// `docker diff`'s lines as (kind, path): `A` added, `C` changed, `D`
+/// deleted. A line that is none of these, or names a path that is not
+/// absolute and plain (no `.`, `..` or empty steps), is left out.
+fn parse_diff(text: &str) -> Vec<(char, String)> {
+    text.lines()
+        .filter_map(|l| {
+            let (kind, path) = l.strip_suffix('\r').unwrap_or(l).split_once(' ')?;
+            let kind = match kind {
+                "A" => 'A',
+                "C" => 'C',
+                "D" => 'D',
+                _ => return None,
+            };
+            let plain = path.len() > 1 && path.starts_with('/') && path[1..].split('/').all(|c| !matches!(c, "" | "." | ".."));
+            plain.then(|| (kind, path.to_owned()))
+        })
+        .collect()
+}
+
+/// Where the container has something mounted on the source: volumes, binds
+/// and tmpfs, as absolute paths without a trailing `/`.
+fn mount_points(info: &Value) -> Vec<String> {
+    let hc = &info["HostConfig"];
+    let mut found: Vec<&str> = info["Mounts"].as_array().into_iter().flatten().filter_map(|m| m["Destination"].as_str()).collect();
+    found.extend(hc["Mounts"].as_array().into_iter().flatten().filter_map(|m| m["Target"].as_str()));
+    found.extend(hc["Tmpfs"].as_object().into_iter().flatten().map(|(k, _)| k.as_str()));
+    let mut points: Vec<String> = Vec::new();
+    for p in found {
+        let clean = format!("/{}", p.split('/').filter(|c| !c.is_empty() && *c != ".").collect::<Vec<_>>().join("/"));
+        if clean != "/" && !points.contains(&clean) {
+            points.push(clean);
+        }
+    }
+    points
+}
+
+/// Whether `path` is `top` or under it.
+fn at_or_under(path: &str, top: &str) -> bool {
+    path == top || below(path, top)
+}
+
+/// Whether `path` is under `top` (not `top` itself).
+fn below(path: &str, top: &str) -> bool {
+    path.strip_prefix(top).is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Paths in the order a layer lists them: each directory right before
+/// what is under it.
+fn path_order(a: &str, b: &str) -> std::cmp::Ordering {
+    a.split('/').cmp(b.split('/'))
+}
+
+/// What of a container's writable layer is carried over, from what `docker
+/// diff` lists. `docker diff` names every path the layer holds (an added
+/// directory's contents too) and the directories they are in, so each is
+/// read on its own; only a new directory with nothing mounted under it is
+/// read whole, in one go.
+#[derive(Debug, Default, PartialEq)]
+struct LayerPlan {
+    /// Deleted on the source: a whiteout each, unless the path is there
+    /// again (a directory deleted and made again, which turns opaque).
+    deleted: Vec<String>,
+    /// Carried over by their own entry: a file whole, a directory with its
+    /// mode, owner and time and none of what is in it, which is listed (or
+    /// unchanged in the image) on its own. `/etc` changed because a file was
+    /// added to it brings that file and `/etc`'s own entry, not all of `/etc`.
+    entries: Vec<String>,
+    /// New directories, not in the image, carried over whole.
+    trees: Vec<String>,
+}
+
+impl LayerPlan {
+    fn is_empty(&self) -> bool {
+        self.deleted.is_empty() && self.entries.is_empty() && self.trees.is_empty()
+    }
+}
+
+/// The plan for `changes` (`docker diff`'s lines) of a container with
+/// `mounts`: nothing at or under a mount, the engine's own files or the
+/// kernel's filesystems; a directory listed only for those is left out;
+/// every directory a path is in comes too, so the layer keeps its mode
+/// and owner.
+fn plan_layer(changes: &[(char, String)], mounts: &[String]) -> LayerPlan {
+    let left_out = |p: &str| ENGINE_FILES.contains(&p) || KERNEL_TREES.iter().copied().chain(mounts.iter().map(String::as_str)).any(|t| at_or_under(p, t));
+    let mut sorted: Vec<&(char, String)> = changes.iter().collect();
+    sorted.sort_by(|a, b| path_order(&a.1, &b.1));
+    sorted.dedup_by(|a, b| a.1 == b.1);
+    let mut plan = LayerPlan::default();
+    let mut i = 0;
+    while i < sorted.len() {
+        let (kind, path) = (sorted[i].0, sorted[i].1.as_str());
+        let end = sorted[i + 1..].iter().position(|(_, p)| !below(p, path)).map_or(sorted.len(), |n| i + 1 + n);
+        let inside = &sorted[i + 1..end];
+        i += 1;
+        if left_out(path) {
+            continue;
+        }
+        match kind {
+            'D' => plan.deleted.push(path.to_owned()),
+            'A' if !inside.is_empty() && inside.iter().all(|(k, p)| *k == 'A' && !left_out(p)) => {
+                plan.trees.push(path.to_owned());
+                i = end;
+            }
+            'C' if !inside.is_empty() && inside.iter().all(|(_, p)| left_out(p)) => {}
+            _ => plan.entries.push(path.to_owned()),
+        }
+    }
+    let mut have: std::collections::HashSet<String> = plan.deleted.iter().chain(&plan.entries).chain(&plan.trees).cloned().collect();
+    let mut parents = Vec::new();
+    for p in plan.deleted.iter().chain(&plan.entries).chain(&plan.trees) {
+        let mut at = p.as_str();
+        while let Some((parent, _)) = at.rsplit_once('/').filter(|(parent, _)| !parent.is_empty()) {
+            if have.insert(parent.to_owned()) {
+                parents.push(parent.to_owned());
+            }
+            at = parent;
+        }
+    }
+    plan.entries.extend(parents);
+    plan.entries.sort_by(|a, b| path_order(a, b));
+    plan
+}
+
+/// One path the layer brings, read on its own ahead of its turn.
+enum Read1 {
+    /// Not there (gone since `docker diff`), or nothing a tar can hold (a socket).
+    Missing,
+    /// A directory's own entry.
+    Dir(Vec<u8>),
+    /// Anything else, whole.
+    Whole(Vec<u8>),
+    /// A file too big to read ahead: read when its turn comes.
+    Later,
+}
+
+/// Writes the layer `plan` names as an OCI layer tar (whiteouts as `.wh.`
+/// files, opaque directories with `.wh..wh..opq`), each path read from the
+/// source container `id` with `docker cp`. What the writer refuses keeps
+/// its error kind: `client::post_stream` then reads the daemon's reason.
+fn write_layer(ctx: &str, id: &str, plan: &LayerPlan, out: &mut dyn Write) -> io::Result<()> {
+    let ahead: Vec<&str> = plan.entries.iter().chain(&plan.deleted).map(String::as_str).collect();
+    let mut read = read_ahead(ctx, id, &ahead)?.into_iter();
+    let mut got: std::collections::HashMap<&str, Read1> = ahead.iter().map(|p| (*p, read.next().unwrap_or(Read1::Later))).collect();
+    let mut steps: Vec<(&str, u8)> = plan.entries.iter().map(|p| (p.as_str(), b'e')).collect();
+    steps.extend(plan.deleted.iter().map(|p| (p.as_str(), b'd')));
+    steps.extend(plan.trees.iter().map(|p| (p.as_str(), b't')));
+    steps.sort_by(|a, b| path_order(a.0, b.0));
+    for (path, step) in steps {
+        if step == b't' {
+            read_paths(ctx, id, path, out, true)?;
+            continue;
+        }
+        match (got.remove(path).unwrap_or(Read1::Later), step) {
+            (Read1::Missing, b'd') => write_marker(out, &whiteout_name(path))?,
+            (Read1::Missing, _) => {}
+            // Deleted, and a directory there again: what the image had in it is gone.
+            (Read1::Dir(bytes), b'd') => {
+                out.write_all(&bytes)?;
+                write_marker(out, &format!("{}/.wh..wh..opq", &path[1..]))?;
+            }
+            (Read1::Dir(bytes) | Read1::Whole(bytes), _) => out.write_all(&bytes)?,
+            (Read1::Later, _) => read_paths(ctx, id, path, out, false)?,
+        }
+    }
+    out.write_all(&[0u8; 1024])
+}
+
+/// The name of the whiteout that deletes `path`: `.wh.` and its name, in
+/// its directory.
+fn whiteout_name(path: &str) -> String {
+    let (dir, base) = path.rsplit_once('/').unwrap_or(("", path));
+    format!("{}.wh.{base}", if dir.is_empty() { String::new() } else { format!("{}/", &dir[1..]) })
+}
+
+/// Reads `paths` from the source container, [`READERS`] at a time: each
+/// one's entry, in the order given, ready to write.
+fn read_ahead(ctx: &str, id: &str, paths: &[&str]) -> io::Result<Vec<Read1>> {
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    let next = AtomicUsize::new(0);
+    let held = AtomicU64::new(0);
+    let failed = AtomicBool::new(false);
+    let slots: Vec<std::sync::Mutex<Option<io::Result<Read1>>>> = paths.iter().map(|_| std::sync::Mutex::new(None)).collect();
+    std::thread::scope(|s| {
+        for _ in 0..READERS.min(paths.len()) {
+            s.spawn(|| {
+                while !failed.load(Ordering::Relaxed) {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(path) = paths.get(i) else { break };
+                    let r = read_one(ctx, id, path, &held);
+                    failed.fetch_or(r.is_err(), Ordering::Relaxed);
+                    *slots[i].lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
+                }
+            });
+        }
+    });
+    slots.into_iter().map(|s| s.into_inner().unwrap_or_else(|e| e.into_inner()).unwrap_or(Ok(Read1::Later))).collect()
+}
+
+/// One path's own entry, read ahead: a directory's without what is in it,
+/// a small file's whole; a big one is left for later, so what is read
+/// ahead stays under [`READ_AHEAD_TOTAL`] (`held`).
+fn read_one(ctx: &str, id: &str, path: &str, held: &std::sync::atomic::AtomicU64) -> io::Result<Read1> {
+    use std::sync::atomic::Ordering;
+    let mut cp = Cp::start(ctx, id, path)?;
+    let entry = match read_entry(&mut cp.out) {
+        Ok(Some(e)) => e,
+        Ok(None) => return cp.finish().map(|_| Read1::Missing),
+        Err(e) => return cp.failed(e).map(|()| Read1::Missing),
+    };
+    let mut bytes = Vec::new();
+    write_renamed(&mut bytes, &entry, path)?;
+    if entry.header[156] == b'5' {
+        cp.stop();
+        return Ok(Read1::Dir(bytes));
+    }
+    let padded = entry.size.div_ceil(512) * 512;
+    if entry.size > READ_AHEAD_FILE || held.fetch_add(padded, Ordering::Relaxed) + padded > READ_AHEAD_TOTAL {
+        cp.stop();
+        return Ok(Read1::Later);
+    }
+    if let Err(e) = copy_body(&mut cp.out, &mut bytes, padded) {
+        return cp.failed(e).map(|()| Read1::Missing);
+    }
+    cp.stop();
+    Ok(Read1::Whole(bytes))
+}
+
+/// Writes `path` read from the source container now: its own entry (a
+/// directory's without what is in it), or with `whole` everything under
+/// it. Gone since `docker diff` (a running container), it is left out.
+fn read_paths(ctx: &str, id: &str, path: &str, out: &mut dyn Write, whole: bool) -> io::Result<()> {
+    let mut cp = Cp::start(ctx, id, path)?;
+    loop {
+        let entry = match read_entry(&mut cp.out) {
+            Ok(Some(e)) => e,
+            Ok(None) => return cp.finish().map(|_| ()),
+            Err(e) => return cp.failed(e),
+        };
+        write_renamed(out, &entry, path)?;
+        if !whole && entry.header[156] == b'5' {
+            cp.stop();
+            return Ok(());
+        }
+        let padded = entry.size.div_ceil(512) * 512;
+        let mut body = (&mut cp.out).take(padded);
+        let copied = io::copy(&mut body, out)?;
+        if copied != padded {
+            return cp.failed(io::Error::new(io::ErrorKind::UnexpectedEof, "cut off inside a file's body"));
+        }
+        if !whole {
+            cp.stop();
+            return Ok(());
+        }
+    }
+}
+
+/// `docker cp` of one path out of the source container, as a tar stream.
+struct Cp {
+    child: std::process::Child,
+    out: std::process::ChildStdout,
+    said: Option<std::thread::JoinHandle<String>>,
+    path: String,
+}
+
+impl Cp {
+    fn start(ctx: &str, id: &str, path: &str) -> io::Result<Cp> {
+        let mut child = cli()?.args(["--context", ctx, "cp", &format!("{id}:{path}"), "-"]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+        let out = child.stdout.take().ok_or_else(|| io::Error::other("no output from docker"))?;
+        // Read meanwhile: a full pipe would stop it.
+        let said = child.stderr.take().map(|mut e| {
+            std::thread::spawn(move || {
+                let mut text = String::new();
+                let _ = e.read_to_string(&mut text);
+                text.trim().to_owned()
+            })
+        });
+        Ok(Cp { child, out, said, path: path.to_owned() })
+    }
+
+    /// Stops it: all that was wanted of it is read.
+    fn stop(self) {
+        drop(self);
+    }
+
+    /// Waits for it to end. `Ok(false)` when the path is not there.
+    fn finish(mut self) -> io::Result<bool> {
+        let _ = io::copy(&mut self.out, &mut io::sink());
+        let status = self.child.wait()?;
+        let said = self.said.take().and_then(|t| t.join().ok()).unwrap_or_default();
+        if status.success() {
+            return Ok(true);
+        }
+        if gone(&said) {
+            return Ok(false);
+        }
+        Err(io::Error::other(format!("docker cp {}: {}", self.path, if said.is_empty() { "failed" } else { &said })))
+    }
+
+    /// After reading its output failed with `e`: `Ok` when the path is
+    /// simply not there, else what docker said, or `e`.
+    fn failed(mut self, e: io::Error) -> io::Result<()> {
+        self.end();
+        let said = self.said.take().and_then(|t| t.join().ok()).unwrap_or_default();
+        if gone(&said) {
+            return Ok(());
+        }
+        let why = if said.is_empty() { e.to_string() } else { said };
+        Err(io::Error::new(if e.kind() == io::ErrorKind::BrokenPipe { io::ErrorKind::Other } else { e.kind() }, format!("docker cp {}: {why}", self.path)))
+    }
+}
+
+impl Cp {
+    fn end(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// One stopped early, or left when writing failed, ends with it.
+impl Drop for Cp {
+    fn drop(&mut self) {
+        self.end();
+    }
+}
+
+/// Whether `docker cp` said the path is not there.
+fn gone(said: &str) -> bool {
+    let said = said.to_ascii_lowercase();
+    said.contains("could not find the file") || said.contains("no such container:path")
+}
+
+/// A tar entry as read: its header, its pax records (`path` and
+/// `linkpath` taken out into `name` and `link`), and its body's size.
+struct TarEntry {
+    header: [u8; 512],
+    pax: Vec<(String, String)>,
+    name: String,
+    link: String,
+    size: u64,
+}
+
+/// The next entry's headers in a tar stream, its body still to read;
+/// `None` at the archive's end. Pax and GNU long-name headers are folded
+/// into the entry they come before.
+fn read_entry(r: &mut dyn Read) -> io::Result<Option<TarEntry>> {
+    let bad = |what: &str| io::Error::new(io::ErrorKind::InvalidData, format!("tar stream: {what}"));
+    let text = |b: &[u8]| String::from_utf8_lossy(b.split(|c| *c == 0).next().unwrap_or_default()).into_owned();
+    let mut pax: Vec<(String, String)> = Vec::new();
+    let (mut long_name, mut long_link) = (None, None);
+    loop {
+        let mut h = [0u8; 512];
+        r.read_exact(&mut h).map_err(|e| if e.kind() == io::ErrorKind::UnexpectedEof { bad("cut off before the archive's end") } else { e })?;
+        if h.iter().all(|b| *b == 0) {
+            return Ok(None);
+        }
+        let size = get_number(&h[124..136]).ok_or_else(|| bad("a damaged header"))?;
+        if matches!(h[156], b'x' | b'g' | b'L' | b'K') {
+            if size > 16 << 20 {
+                return Err(bad("a header too large"));
+            }
+            let mut data = vec![0u8; (size.div_ceil(512) * 512) as usize];
+            r.read_exact(&mut data).map_err(|e| if e.kind() == io::ErrorKind::UnexpectedEof { bad("cut off inside a header") } else { e })?;
+            data.truncate(size as usize);
+            match h[156] {
+                b'x' => pax.extend(pax_records(&data)),
+                b'L' => long_name = Some(text(&data)),
+                b'K' => long_link = Some(text(&data)),
+                // A global header says nothing about this entry.
+                _ => {}
+            }
+            continue;
+        }
+        let posix = &h[257..263] == b"ustar\0";
+        let mut name = long_name.unwrap_or_else(|| match text(&h[345..500]) {
+            prefix if posix && !prefix.is_empty() => format!("{prefix}/{}", text(&h[..100])),
+            _ => text(&h[..100]),
+        });
+        let mut link = long_link.unwrap_or_else(|| text(&h[157..257]));
+        let mut size = size;
+        pax.retain(|(k, v)| match k.as_str() {
+            "path" => {
+                name.clone_from(v);
+                false
+            }
+            "linkpath" => {
+                link.clone_from(v);
+                false
+            }
+            "size" => {
+                size = v.parse().unwrap_or(size);
+                true
+            }
+            _ => true,
+        });
+        return Ok(Some(TarEntry { header: h, pax, name, link, size }));
+    }
+}
+
+/// Writes `e`, which `docker cp` of `path` named from `path`'s last step
+/// (`hosts2` for `/etc/hosts2`), under its path in the layer instead
+/// (`etc/hosts2`); a hard link's target likewise. Anything else under
+/// that name is not what was asked for.
+fn write_renamed(out: &mut dyn Write, e: &TarEntry, path: &str) -> io::Result<()> {
+    let base = path.rsplit('/').next().unwrap_or_default();
+    let rebase = |name: &str| -> Option<String> {
+        let rest = name.trim_start_matches("./").trim_start_matches('/').strip_prefix(base)?;
+        (rest.is_empty() || rest.starts_with('/')).then(|| format!("{}{rest}", &path[1..]))
+    };
+    let name = rebase(&e.name).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("docker cp {path}: an entry named {:?}", e.name)))?;
+    let link = if e.header[156] == b'1' { rebase(&e.link).unwrap_or_else(|| e.link.clone()) } else { e.link.clone() };
+    write_entry(out, e, &name, &link)
+}
+
+/// Writes `e`'s headers as `name` (and `link`): in the header where they
+/// fit, else in a pax header before it, which also keeps the records it
+/// came with, less overlayfs's own attributes. Size, owner and group a pax
+/// record gives go in the header too, as [`retar`] puts them.
+fn write_entry(out: &mut dyn Write, e: &TarEntry, name: &str, link: &str) -> io::Result<()> {
+    let mut pax: Vec<(String, String)> = e.pax.iter().filter(|(k, _)| !k.starts_with("SCHILY.xattr.trusted.overlay.")).cloned().collect();
+    if name.len() > 100 {
+        pax.push(("path".into(), name.into()));
+    }
+    if link.len() > 100 {
+        pax.push(("linkpath".into(), link.into()));
+    }
+    let mut h = e.header;
+    put_text(&mut h[..100], name);
+    put_text(&mut h[157..257], link);
+    if &h[257..263] == b"ustar\0" {
+        h[345..500].fill(0);
+    }
+    for (key, at) in [("size", 124..136), ("uid", 108..116), ("gid", 116..124)] {
+        if let Some(v) = pax.iter().find(|(k, _)| k == key).and_then(|(_, v)| v.parse::<u64>().ok()) {
+            put_number(&mut h[at], v);
+        }
+    }
+    put_checksum(&mut h);
+    if !pax.is_empty() {
+        let mut data = Vec::new();
+        for (k, v) in &pax {
+            let rest = k.len() + v.len() + 3;
+            let mut len = rest + 1;
+            while rest + len.to_string().len() != len {
+                len = rest + len.to_string().len();
+            }
+            data.extend_from_slice(format!("{len} {k}={v}\n").as_bytes());
+        }
+        let mut x = plain_header(b'x', "././@PaxHeader", data.len() as u64, 0o644);
+        put_checksum(&mut x);
+        out.write_all(&x)?;
+        data.resize(data.len().div_ceil(512) * 512, 0);
+        out.write_all(&data)?;
+    }
+    out.write_all(&h)
+}
+
+/// An empty file named `name`, owned by root: a whiteout or opaque mark.
+fn write_marker(out: &mut dyn Write, name: &str) -> io::Result<()> {
+    let e = TarEntry { header: plain_header(b'0', "", 0, 0o644), pax: Vec::new(), name: name.to_owned(), link: String::new(), size: 0 };
+    write_entry(out, &e, name, "")
+}
+
+/// A ustar header of kind `kind`, owned by root, with a time of 0.
+fn plain_header(kind: u8, name: &str, size: u64, mode: u32) -> [u8; 512] {
+    let mut h = [0u8; 512];
+    put_text(&mut h[..100], name);
+    put_number(&mut h[100..108], u64::from(mode));
+    put_number(&mut h[108..116], 0);
+    put_number(&mut h[116..124], 0);
+    put_number(&mut h[124..136], size);
+    put_number(&mut h[136..148], 0);
+    h[156] = kind;
+    h[257..263].copy_from_slice(b"ustar\0");
+    h[263..265].copy_from_slice(b"00");
+    h
+}
+
+/// A text field: as much of `s` as fits, the rest NUL.
+fn put_text(field: &mut [u8], s: &str) {
+    field.fill(0);
+    let n = s.len().min(field.len());
+    field[..n].copy_from_slice(&s.as_bytes()[..n]);
+}
+
+fn put_checksum(h: &mut [u8; 512]) {
+    h[148..156].fill(b' ');
+    let sum: u32 = h.iter().map(|b| u32::from(*b)).sum();
+    h[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+}
+
+/// An entry's body, padded to whole blocks, from `from` to `to`.
+fn copy_body(from: &mut dyn Read, to: &mut Vec<u8>, padded: u64) -> io::Result<()> {
+    if (&mut *from).take(padded).read_to_end(to)? as u64 != padded {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "cut off inside a file's body"));
+    }
     Ok(())
 }
 
@@ -1193,6 +1742,132 @@ mod tests {
     fn anonymous_volumes() {
         assert!(super::anonymous(&"a1".repeat(32)));
         assert!(!super::anonymous("pgdata"));
+    }
+
+    /// #410: what of a container's writable layer `kiri import` reads. `/etc`
+    /// changed because a file was added to it brings that file and `/etc`'s
+    /// own entry, never the rest of `/etc`; a new directory comes whole in
+    /// one read, unless something is mounted under it; nothing at or under a
+    /// mount, the engine's own files or the kernel's filesystems; every
+    /// directory a path is in comes too.
+    #[test]
+    fn plans_only_what_the_writable_layer_changed() {
+        let diff = "C /etc\nA /etc/hosts2\nC /etc/hosts\nA /app\nA /app/x\nA /app/sub\nA /app/sub/y\nA /srv\nA /srv/cache\nA /srv/keep\nA /data\n\
+                    C /usr\nC /usr/share\nD /usr/share/doc\nC /opt\nD /opt/again\nA /opt/again/new\nA /var/lib/x\nC /proc\nA /dev/shm/x\n\
+                    C /run\nA /run/tmp\nA /.dockerenv\n";
+        let mounts = ["/data".to_owned(), "/srv/cache".to_owned(), "/run/tmp".to_owned()];
+        let plan = super::plan_layer(&super::parse_diff(diff), &mounts);
+        let v = |s: &[&str]| s.iter().map(|p| (*p).to_owned()).collect::<Vec<_>>();
+        assert_eq!(
+            plan,
+            super::LayerPlan {
+                deleted: v(&["/opt/again", "/usr/share/doc"]),
+                entries: v(&["/etc", "/etc/hosts2", "/opt", "/opt/again/new", "/srv", "/srv/keep", "/usr", "/usr/share", "/var", "/var/lib", "/var/lib/x"]),
+                trees: v(&["/app"]),
+            }
+        );
+        // Nothing changed, or only what each engine makes for itself: one
+        // `docker diff`, and nothing sent.
+        assert!(super::plan_layer(&[], &mounts).is_empty());
+        assert!(super::plan_layer(&super::parse_diff("C /etc\nA /etc/hostname\nC /etc/resolv.conf\nA /data\n"), &mounts).is_empty());
+        // A changed directory alone (its mode, say) is its own entry.
+        assert_eq!(super::plan_layer(&super::parse_diff("C /tmp\n"), &[]).entries, v(&["/tmp"]));
+    }
+
+    #[test]
+    fn reads_docker_diff_lines() {
+        let got = super::parse_diff("C /etc\r\nA /etc/a b\nX /x\nA relative\nA /a/../b\nA /a//b\nA /\nD /gone\n\n");
+        assert_eq!(got, [('C', "/etc".to_owned()), ('A', "/etc/a b".to_owned()), ('D', "/gone".to_owned())]);
+    }
+
+    #[test]
+    fn finds_where_a_container_has_mounts() {
+        let info = serde_json::json!({
+            "Mounts": [{"Type": "volume", "Destination": "/data/"}, {"Type": "bind", "Destination": "/src"}],
+            "HostConfig": {"Mounts": [{"Type": "tmpfs", "Target": "/cache"}, {"Target": "/src"}], "Tmpfs": {"/run/tmp": "size=1m"}},
+        });
+        assert_eq!(super::mount_points(&info), ["/data", "/src", "/cache", "/run/tmp"]);
+    }
+
+    /// `docker cp ctr:/srv/app -` names its entries from `app`: each is
+    /// written under its path in the layer, a hard link's target too, a
+    /// symlink's target as it is; long names go in pax; owners and
+    /// attributes stay, but overlayfs's own; a stream cut short is an error.
+    #[test]
+    fn writes_what_docker_cp_read_under_its_path_in_the_layer() {
+        use std::io::Read;
+        let entry = |kind: u8, name: &str, link: &str, size: u64, pax: &[(&str, &str)]| {
+            let mut header = super::plain_header(kind, "", size, if kind == b'5' { 0o750 } else { 0o640 });
+            super::put_number(&mut header[108..116], 1000);
+            super::put_number(&mut header[116..124], 1001);
+            let pax = pax.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect();
+            super::TarEntry { header, pax, name: name.to_owned(), link: link.to_owned(), size }
+        };
+        let long = format!("app/{}", "n".repeat(120));
+        let mut src = Vec::new();
+        for (e, body) in [
+            (entry(b'5', "app/", "", 0, &[]), &b""[..]),
+            (entry(b'0', "app/f", "", 5, &[("SCHILY.xattr.trusted.overlay.redirect", "/x"), ("SCHILY.xattr.user.k", "v")]), b"hello"),
+            (entry(b'2', "app/l", "f", 0, &[]), b""),
+            (entry(b'1', "app/h", "app/f", 0, &[]), b""),
+            (entry(b'0', &long, "", 0, &[]), b""),
+        ] {
+            super::write_entry(&mut src, &e, &e.name.clone(), &e.link.clone()).unwrap();
+            src.extend_from_slice(body);
+            src.resize(src.len().div_ceil(512) * 512, 0);
+        }
+        src.extend_from_slice(&[0u8; 1024]);
+
+        let mut out = Vec::new();
+        let mut r = &src[..];
+        while let Some(e) = super::read_entry(&mut r).unwrap() {
+            super::write_renamed(&mut out, &e, "/srv/app").unwrap();
+            let padded = e.size.div_ceil(512) * 512;
+            std::io::copy(&mut (&mut r).take(padded), &mut out).unwrap();
+        }
+        out.extend_from_slice(&[0u8; 1024]);
+
+        let mut r = &out[..];
+        let mut got = Vec::new();
+        for block in out.chunks(512).filter(|b| b.iter().any(|c| *c != 0) && (b[257..263] == *b"ustar\0")) {
+            let mut h: [u8; 512] = block.try_into().unwrap();
+            let sum = h[148..156].to_vec();
+            super::put_checksum(&mut h);
+            assert_eq!(sum, h[148..156], "a valid checksum");
+        }
+        while let Some(e) = super::read_entry(&mut r).unwrap() {
+            let mut body = vec![0u8; (e.size.div_ceil(512) * 512) as usize];
+            r.read_exact(&mut body).unwrap();
+            body.truncate(e.size as usize);
+            let owner = (super::get_number(&e.header[108..116]), super::get_number(&e.header[116..124]));
+            got.push((e.name.clone(), e.link.clone(), e.pax.clone(), String::from_utf8(body).unwrap(), owner));
+        }
+        let none: Vec<(String, String)> = Vec::new();
+        let owner = (Some(1000), Some(1001));
+        assert_eq!(got[0], ("srv/app/".to_owned(), String::new(), none.clone(), String::new(), owner));
+        assert_eq!(got[1], ("srv/app/f".to_owned(), String::new(), vec![("SCHILY.xattr.user.k".to_owned(), "v".to_owned())], "hello".to_owned(), owner));
+        assert_eq!(got[2], ("srv/app/l".to_owned(), "f".to_owned(), none.clone(), String::new(), owner));
+        assert_eq!(got[3], ("srv/app/h".to_owned(), "srv/app/f".to_owned(), none.clone(), String::new(), owner));
+        assert_eq!(got[4].0, format!("srv/{long}"));
+        assert_eq!(got.len(), 5);
+
+        // Only what was asked for: an entry by another name is an error.
+        let mut sink = Vec::new();
+        assert!(super::write_renamed(&mut sink, &entry(b'0', "apples", "", 0, &[]), "/srv/app").is_err());
+        assert!(super::write_renamed(&mut sink, &entry(b'0', "app", "", 0, &[]), "/srv/app").is_ok());
+        // Cut short, inside a header or before the archive's end.
+        assert!(super::read_entry(&mut &src[..300]).is_err());
+        assert!(super::read_entry(&mut &src[..0]).is_err());
+    }
+
+    #[test]
+    fn names_whiteouts_beside_what_they_delete() {
+        assert_eq!(super::whiteout_name("/etc/gone"), "etc/.wh.gone");
+        assert_eq!(super::whiteout_name("/gone"), ".wh.gone");
+        let mut out = Vec::new();
+        super::write_marker(&mut out, &format!("d/{}/.wh..wh..opq", "x".repeat(100))).unwrap();
+        let e = super::read_entry(&mut &out[..]).unwrap().unwrap();
+        assert_eq!((e.name, e.size, e.header[156]), (format!("d/{}/.wh..wh..opq", "x".repeat(100)), 0, b'0'));
     }
 
     // #266: a fresh machine with neither engine gets a plain answer, not

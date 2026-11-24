@@ -861,7 +861,7 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
 
 /// Marks a container whose writable layer holds only whole files and whole
 /// renamed directories (no overlayfs redirects or metadata-only copies).
-const PLAIN_UPPER: &str = "upper-plain";
+pub(super) const PLAIN_UPPER: &str = "upper-plain";
 
 /// Whether the container's writable layer is plain: marked so, or still
 /// empty, in which case it is marked now, before its first mount writes
@@ -880,6 +880,17 @@ fn plain_upper(base: &Path) -> io::Result<bool> {
     }
     fs::write(marker, b"")?;
     Ok(true)
+}
+
+/// Marks a writable layer that `kiri import` brought in whole as plain
+/// (see `plain_upper`): it holds whole files, whole directories, whiteouts
+/// and opaque marks, and no overlayfs redirects or metadata-only copies
+/// (`copy` strips those attributes). Without the mark its first mount would
+/// find it already written to and keep the kernel's defaults, under which
+/// later writes may redirect directories that `docker diff` and `commit`
+/// can't read.
+pub(super) fn mark_plain_upper(base: &Path) -> io::Result<()> {
+    fs::write(base.join(PLAIN_UPPER), b"")
 }
 
 /// The overlayfs features to mount with, whatever the kernel's defaults

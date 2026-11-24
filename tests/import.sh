@@ -75,14 +75,14 @@ kiri_rm() {
     for v in $v; do [[ "$v" =~ ^[0-9a-f]{64}$ ]] && "${K[@]}" volume rm -f "$v" >/dev/null 2>&1; done
   done
 }
-OURS_C="imp-digest imp-host-mnt imp-net-joiner imp-net-target imp-vol-user imp-vol-writer imp-vol-idle imp-vol-cutter imp-vol-kiri-user imp-vol-kiri-paused imp-vol-kiri-again imp-vol-kiri-stopped"
+OURS_C="imp-digest imp-host-mnt imp-upper imp-net-joiner imp-net-target imp-vol-user imp-vol-writer imp-vol-idle imp-vol-cutter imp-vol-kiri-user imp-vol-kiri-paused imp-vol-kiri-again imp-vol-kiri-stopped"
 # An image named like an official one, with a creation date ahead: its
 # sh, tar, rm and find leave a mark and refuse the work. Never to be run.
 LOOKALIKE=localhost/imp-x/library/busybox:9
 UNTAGGED_ID=
 LA_DIR=
 HM_DIR=
-OURS_V="imp-vol-la imp-vol-la-new imp-vol-data imp-vol-xattrs imp-vol-named imp-vol-keep imp-vol-busy imp-vol-huge imp-vol-cut imp-probe"
+OURS_V="imp-upper-vol imp-vol-la imp-vol-la-new imp-vol-data imp-vol-xattrs imp-vol-named imp-vol-keep imp-vol-busy imp-vol-huge imp-vol-cut imp-probe"
 cleanup() {
   kiri_rm $OURS_C
   "${S[@]}" rm -fv $OURS_C >/dev/null 2>&1
@@ -423,6 +423,24 @@ t import-host-mnt-binds "ok" bash -c '
 ' _ docker "$DOCKER_CONTEXT" "$HM_DIR"
 t import-host-mnt-reads "from-host-mnt from-direct" "${K[@]}" start -a imp-host-mnt
 kiri_rm imp-host-mnt
+
+section "#410 a container's writable layer"
+# Made on the source by its first run: a new folder owned by 1000 with a
+# file and a link, a changed and a deleted file of the image, a file added
+# to /etc, and a file in a volume. Each later run only reports, and says
+# "kept" when the first run's files are there.
+UP_SCRIPT='if [ -e /srv/app ]; then printf kept; else mkdir -p /srv/app/sub && echo added > /srv/app/sub/f && ln -s sub/f /srv/app/l && chown -R 1000:1000 /srv/app && echo changed > /etc/motd && rm /etc/issue && echo added2 > /etc/hosts2 && echo in-volume > /data/v && printf made; fi; echo " $(cat /srv/app/sub/f /etc/motd /etc/hosts2) $(stat -c %u:%g /srv/app/sub/f) $(readlink /srv/app/l) $(test -e /etc/issue && echo issue-there || echo issue-gone) $(cat /data/v)"'
+"${S[@]}" run --name imp-upper --network none -v imp-upper-vol:/data --entrypoint sh "$TOOL" -c "$UP_SCRIPT" >/dev/null
+src_before=$("${S[@]}" ps -aq | wc -l)
+t import-upper-imports "container imp-upper: done" "$KIRI" import "$SRC" container imp-upper
+t import-upper-nothing-left "$src_before" bash -c '"$@" ps -aq | wc -l' _ "${S[@]}"
+t import-upper-diff-before-start "D /etc/issue" "${K[@]}" diff imp-upper
+t import-upper-only-what-changed "A /etc/hosts2" bash -c '"$@" diff imp-upper | grep "^A /etc/" | tr "\n" " "' _ "${K[@]}"
+# Under /etc only its three changes, none of its unchanged files.
+t import-upper-not-whole-etc "3" bash -c '"$@" diff imp-upper | grep -c "^[ACD] /etc/"' _ "${K[@]}"
+t import-upper-no-volume-files "absent" bash -c '"$@" diff imp-upper | grep -q "^A /data/" && echo present || echo absent' _ "${K[@]}"
+t import-upper-runs-with-files "kept added changed added2 1000:1000 sub/f issue-gone in-volume" "${K[@]}" start -a imp-upper
+kiri_rm imp-upper
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || { printf 'failed: %s\n' "${FAILED[*]}"; exit 1; }

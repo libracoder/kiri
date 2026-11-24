@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #410 Import: containers keep the files they wrote outside their volumes (unreleased)
+- Fixes: #410 Docker Desktop import drops each container's writable layer (data outside volumes is lost); docker diff fails with chroot error
+- Caused: none known
+- Caused by: -
+- Check: `upper-import-accepted`, `upper-diff-before-start`, `upper-size-rw`, `upper-start-sees-added`, `upper-start-hides-deleted`, `upper-refused-once-started`, `import-upper-imports`, `import-upper-nothing-left`, `import-upper-not-whole-etc`, `import-upper-runs-with-files`, `diff-never-started`, `commit-never-started`
+
 ### #744 CLI: `kiri domains` says when the daemon is not running (unreleased)
 - Fixes: #744 kiri domains prints "No such file or directory (os error 2)" with no engine
 - Caused: none known

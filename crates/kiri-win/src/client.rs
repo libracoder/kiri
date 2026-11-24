@@ -248,6 +248,11 @@ pub fn request_within(method: &str, path: &str, body: Option<&Value>, background
         background_header(background),
         payload.len()
     )?;
+    answer(s)
+}
+
+/// The answer to a request just sent; the whole body is read, chunked or not.
+fn answer(s: impl Read) -> io::Result<Response> {
     let mut r = BufReader::new(s);
     let (status, len, chunked) = head(&mut r)?;
     let mut body = Vec::new();
@@ -265,6 +270,56 @@ pub fn request_within(method: &str, path: &str, body: Option<&Value>, background
         r.read_to_end(&mut body)?;
     }
     Ok(Response { status, body })
+}
+
+/// A POST whose body `write` streams, chunked, so its length need not be
+/// known first: `kiri import`'s copy of a container's writable layer, as
+/// crates/kiri/src/client.rs sends it. A body `write` gives up on is never
+/// ended, so the daemon sees it cut short, not as a whole one; if the daemon
+/// stopped reading first (it refused the request), its answer is returned,
+/// which says why.
+pub fn post_stream(path: &str, content_type: &str, write: impl FnOnce(&mut dyn Write) -> io::Result<()>) -> io::Result<Response> {
+    line_safe(path)?;
+    line_safe(content_type)?;
+    let mut s = open_conn(None)?;
+    write!(s, "POST {path} HTTP/1.1\r\nHost: kiri\r\nConnection: close\r\nContent-Type: {content_type}\r\nTransfer-Encoding: chunked\r\n\r\n")?;
+    match stream_body(&mut s, write) {
+        Ok(()) => answer(s),
+        Err(e) if matches!(e.kind(), io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted) => match answer(s) {
+            Ok(r) if !r.ok() => Ok(r),
+            _ => Err(e),
+        },
+        Err(e) => Err(e),
+    }
+}
+
+/// Writes a body chunked, in chunks of up to 256 KiB, and ends it only when
+/// `write` succeeds.
+fn stream_body(to: impl Write, write: impl FnOnce(&mut dyn Write) -> io::Result<()>) -> io::Result<()> {
+    let mut body = io::BufWriter::with_capacity(256 << 10, Chunked(to));
+    write(&mut body)?;
+    let mut chunked = body.into_inner().map_err(io::IntoInnerError::into_error)?;
+    chunked.0.write_all(b"0\r\n\r\n")?;
+    chunked.0.flush()
+}
+
+/// HTTP/1.1 chunked transfer coding: each write is one chunk.
+struct Chunked<W: Write>(W);
+
+impl<W: Write> Write for Chunked<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        write!(self.0, "{:x}\r\n", buf.len())?;
+        self.0.write_all(buf)?;
+        self.0.write_all(b"\r\n")?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
 }
 
 /// Kiri's own version from a `/version` answer: `KiriVersion`, or `Version`
@@ -611,6 +666,30 @@ mod tests {
         let req = wire_text(&proxy_put);
         assert!(req.starts_with("PUT /kiri/proxy/system HTTP/1.1\r\n"), "{req}");
         assert!(req.contains("\r\nX-Kiri-Background: 1\r\n"), "background proxy push must mark background: {req}");
+    }
+
+    #[test]
+    fn a_streamed_body_is_chunked_and_ended_only_when_whole() {
+        let sent = mock_reply(b"HTTP/1.1 204 No Content\r\n\r\n");
+        let r = post_stream("/kiri/containers/db/upper", "application/x-tar", |w| {
+            w.write_all(b"hello")?;
+            w.write_all(b" world")
+        })
+        .unwrap();
+        assert_eq!(r.status, 204);
+        let req = wire_text(&sent);
+        assert!(req.starts_with("POST /kiri/containers/db/upper HTTP/1.1\r\n"), "{req}");
+        assert!(req.contains("\r\nTransfer-Encoding: chunked\r\n") && req.contains("\r\nContent-Type: application/x-tar\r\n"), "{req}");
+        assert!(req.ends_with("\r\n\r\nb\r\nhello world\r\n0\r\n\r\n"), "{req}");
+
+        let cut = mock_reply(b"HTTP/1.1 204 No Content\r\n\r\n");
+        let e = post_stream("/kiri/containers/db/upper", "application/x-tar", |w| {
+            w.write_all(b"part")?;
+            Err(io::Error::other("the source failed"))
+        })
+        .unwrap_err();
+        assert_eq!(e.to_string(), "the source failed");
+        assert!(!wire_text(&cut).ends_with("0\r\n\r\n"), "a body cut short is never ended");
     }
 
     #[test]

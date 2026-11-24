@@ -286,3 +286,13 @@ absolute-form-containers	#757	docker-modem requests such as GET http://127.0.0.1
 import-host-mnt-container	#411	importing a container with a Docker Desktop /host_mnt bind-mount source did not translate the path to the host path
 import-host-mnt-binds	#411	imported container HostConfig.Binds kept the /host_mnt prefix or dropped bind mount options instead of stripping /host_mnt
 import-host-mnt-reads	#411	a container imported with a /host_mnt bind source mounted an empty VM directory instead of the host files
+upper-import-accepted	#410	kiri import had no way to bring a container's writable layer into Kiri, so files it wrote outside its volumes were lost
+upper-diff-before-start	#410	a container's imported writable layer must show in docker diff before its first start
+upper-size-rw	#410	a container's imported writable layer must count in docker system df (SizeRw) before its first start
+upper-start-sees-added	#410	files added and changed in an imported writable layer (owners, modes, links) were missing once the container started
+upper-start-hides-deleted	#410	a file the source container deleted from its image came back after import (its whiteout was lost)
+upper-refused-once-started	#410	an imported writable layer must never be written under a running container's mounted root
+import-upper-imports	#410	Docker Desktop import dropped each container's writable layer (data outside volumes was lost)
+import-upper-nothing-left	#410	reading a container's writable layer must leave no container behind on the source
+import-upper-not-whole-etc	#410	a directory changed only because a file was added to it must not bring all of its unchanged files
+import-upper-runs-with-files	#410	an imported container started without the files it wrote outside its volumes

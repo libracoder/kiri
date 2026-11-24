@@ -122,6 +122,11 @@ fn send(method: &str, path: &str, body: Option<&Value>, extra: &str) -> io::Resu
         "{method} {path} HTTP/1.1\r\nHost: kiri\r\nConnection: close\r\n{extra}{op}Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
         payload.len()
     )?;
+    answer(s)
+}
+
+/// The answer to a request just sent; the whole body is read, chunked or not.
+fn answer(s: impl Read) -> io::Result<Response> {
     let mut r = BufReader::new(s);
     let (status, len, chunked) = head(&mut r)?;
     let mut body = Vec::new();
@@ -140,6 +145,60 @@ fn send(method: &str, path: &str, body: Option<&Value>, extra: &str) -> io::Resu
         r.read_to_end(&mut body)?;
     }
     Ok(Response { status, body })
+}
+
+/// A POST whose body `write` streams, chunked, so its length need not be
+/// known first: `kiri import`'s copy of a container's writable layer. A
+/// body `write` gives up on is never ended, so the daemon sees it cut
+/// short, not as a whole one; if the daemon stopped reading first (it
+/// refused the request), its answer is returned, which says why.
+pub fn post_stream(path: &str, content_type: &str, write: impl FnOnce(&mut dyn Write) -> io::Result<()>) -> io::Result<Response> {
+    let s = connect(Some(Duration::from_secs(300)))?;
+    let op = crate::diag::op_header();
+    (&s).write_all(format!("POST {path} HTTP/1.1\r\nHost: kiri\r\nConnection: close\r\n{op}Content-Type: {content_type}\r\nTransfer-Encoding: chunked\r\n\r\n").as_bytes())?;
+    match stream_body(&s, write) {
+        Ok(()) => answer(&s),
+        Err(e) if refused(&e) => match answer(&s) {
+            Ok(r) if !r.ok() => Ok(r),
+            _ => Err(e),
+        },
+        Err(e) => Err(e),
+    }
+}
+
+/// Writes a body chunked, in chunks of up to 256 KiB, and ends it only when
+/// `write` succeeds.
+pub(crate) fn stream_body(to: impl Write, write: impl FnOnce(&mut dyn Write) -> io::Result<()>) -> io::Result<()> {
+    let mut body = io::BufWriter::with_capacity(256 << 10, Chunked(to));
+    write(&mut body)?;
+    let mut chunked = body.into_inner().map_err(io::IntoInnerError::into_error)?;
+    chunked.0.write_all(b"0\r\n\r\n")?;
+    chunked.0.flush()
+}
+
+/// Whether a write failed because the other end closed: the daemon may
+/// have answered before reading the whole body.
+fn refused(e: &io::Error) -> bool {
+    matches!(e.kind(), io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted)
+}
+
+/// HTTP/1.1 chunked transfer coding: each write is one chunk.
+struct Chunked<W: Write>(W);
+
+impl<W: Write> Write for Chunked<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        write!(self.0, "{:x}\r\n", buf.len())?;
+        self.0.write_all(buf)?;
+        self.0.write_all(b"\r\n")?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
 }
 
 /// Kiri's own version from a `/version` answer: `KiriVersion`, or `Version`
@@ -312,4 +371,32 @@ fn lite_cli() -> Option<PathBuf> {
 #[cfg(not(target_os = "macos"))]
 fn lite_cli() -> Option<PathBuf> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+
+    /// `kiri import` streams a container's writable layer (#410): the body
+    /// is chunked, and ended only when all of it was written, so the daemon
+    /// never takes a copy cut short for a whole one.
+    #[test]
+    fn a_streamed_body_is_chunked_and_ended_only_when_whole() {
+        let mut wire = Vec::new();
+        super::stream_body(&mut wire, |w| {
+            w.write_all(b"hello")?;
+            w.write_all(b" world")
+        })
+        .unwrap();
+        assert_eq!(wire, b"b\r\nhello world\r\n0\r\n\r\n");
+        let mut wire = Vec::new();
+        let e = super::stream_body(&mut wire, |w| {
+            w.write_all(b"part")?;
+            Err(io::Error::other("the source failed"))
+        })
+        .unwrap_err();
+        assert_eq!(e.to_string(), "the source failed");
+        assert!(!wire.ends_with(b"0\r\n\r\n"), "{:?}", String::from_utf8_lossy(&wire));
+        assert!(super::refused(&io::Error::from(io::ErrorKind::BrokenPipe)) && !super::refused(&io::Error::other("x")));
+    }
 }

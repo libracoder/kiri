@@ -191,6 +191,8 @@ fn job(sock: OwnedFd, chan: OwnedFd, running: &[(&str, libc::pid_t)], paths: &Pa
     let result = match spec.op {
         // These read the writable layer itself, next to the image's layers.
         copy_op::DIFF | copy_op::COMMIT => layer_job(&mut conn, &spec, paths),
+        // And this one writes it, before the container ever runs.
+        copy_op::UPPER => upper_job(&mut conn, &spec, running, paths, &chan),
         _ => {
             let mounts = match enter(&spec, running, paths, &chan) {
                 Ok(m) => m,
@@ -1051,6 +1053,114 @@ fn layer_job(conn: &mut fs::File, spec: &CopySpec<'_>, paths: &Paths) -> io::Res
     w.flush()
 }
 
+/// `kiri import`: the writable layer a container had on the engine it came
+/// from, as an OCI layer tar (see `copy_op::UPPER`), becomes its own before
+/// it ever runs. Writing under the upper dir of a mounted overlay is
+/// undefined behaviour to the kernel, so a running container, or one whose
+/// root is mounted for a copy, is refused, as is one that has a writable
+/// layer already.
+fn upper_job(conn: &mut fs::File, spec: &CopySpec<'_>, running: &[(&str, libc::pid_t)], paths: &Paths, chan: &OwnedFd) -> io::Result<()> {
+    if spec.layers.is_empty() {
+        return reply_error(conn, "no such container");
+    }
+    container::valid_id(spec.id)?;
+    // `h` holds a root only when it is mounted; this child exits soon and
+    // lets it go again.
+    if running.iter().any(|(id, _)| *id == spec.id) || ask(chan, 'h', spec).is_ok() {
+        return reply_error(conn, &format!("container {} is in use: its writable layer can only be brought in before it runs", spec.id));
+    }
+    let base = paths.containers.join(spec.id);
+    if fs::read_dir(base.join("upper")).is_ok_and(|mut d| d.next().is_some()) {
+        return reply_error(conn, &format!("container {} already has a writable layer of its own", spec.id));
+    }
+    let source: Box<dyn Read + '_> = if spec.flags & copy_flags::CHUNKED != 0 { Box::new(Chunks::new(&mut *conn)) } else { Box::new(&mut *conn) };
+    import_upper(BufReader::with_capacity(256 * 1024, source), &base)?;
+    done(conn)
+}
+
+/// Unpacks the layer `reader` holds into `<base>/upper`. It is unpacked
+/// beside it first and moved in whole, so a copy cut short leaves the
+/// container as it was; overlayfs's own attributes are stripped, and the
+/// layer is marked plain (`container::mark_plain_upper`).
+fn import_upper(mut reader: impl Read, base: &Path) -> io::Result<()> {
+    let upper = base.join("upper");
+    let staging = base.join("upper.import");
+    fs::create_dir_all(base)?;
+    match fs::remove_dir_all(&staging) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    fs::create_dir(&staging)?;
+    let unpacked = (|| -> io::Result<()> {
+        // The root of the container's filesystem takes this directory's
+        // mode and owner, as with the `upper` a first start makes.
+        fs::set_permissions(&staging, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
+        super::layers::untar(&mut reader, &staging)?;
+        // The archive's trailing padding, so the host's writes complete.
+        io::copy(&mut reader, &mut io::sink())?;
+        strip_overlay_xattrs(&staging)?;
+        // An empty `upper` an earlier copy's mount left goes first.
+        match fs::remove_dir(&upper) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+        fs::rename(&staging, &upper)
+    })();
+    if let Err(e) = unpacked {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(e);
+    }
+    container::mark_plain_upper(base)
+}
+
+/// Removes overlayfs's own attributes (`trusted.overlay.*`: redirects,
+/// metacopy, origin) from everything under `root`, keeping the opaque mark
+/// `layers::untar` sets for `.wh..wh..opq`. An imported layer is whole
+/// files and directories; an attribute an archive carried must not make
+/// the mount look elsewhere for them.
+fn strip_overlay_xattrs(root: &Path) -> io::Result<()> {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        let meta = fs::symlink_metadata(&path)?;
+        let c = sys::cstr(&path)?;
+        let mut names = vec![0u8; 4096];
+        let n = loop {
+            // SAFETY: valid NUL-terminated path; fills at most `names.len()` bytes.
+            let n = unsafe { libc::llistxattr(c.as_ptr(), names.as_mut_ptr().cast(), names.len()) };
+            if n >= 0 {
+                break n as usize;
+            }
+            match io::Error::last_os_error() {
+                e if e.raw_os_error() == Some(libc::ERANGE) && names.len() < 1 << 20 => names.resize(names.len() * 4, 0),
+                e if e.raw_os_error() == Some(libc::ENOTSUP) => break 0,
+                e => return Err(e),
+            }
+        };
+        for name in names[..n].split(|b| *b == 0).filter(|name| overlay_own(name)) {
+            let name = std::ffi::CString::new(name).map_err(io::Error::other)?;
+            // SAFETY: valid NUL-terminated path and attribute name.
+            if unsafe { libc::lremovexattr(c.as_ptr(), name.as_ptr()) } != 0 {
+                let e = io::Error::last_os_error();
+                if e.raw_os_error() != Some(libc::ENODATA) {
+                    return Err(e);
+                }
+            }
+        }
+        if meta.is_dir() {
+            for e in fs::read_dir(&path)? {
+                stack.push(e?.path());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether an extended attribute is one overlayfs reads in an upper dir,
+/// other than the opaque mark.
+fn overlay_own(name: &[u8]) -> bool {
+    name.starts_with(b"trusted.overlay.") && name != b"trusted.overlay.opaque"
+}
+
 fn reply_error(conn: &mut fs::File, msg: &str) -> io::Result<()> {
     let mut out = Vec::new();
     Msg::Error(msg).encode(&mut out);
@@ -1068,6 +1178,90 @@ fn read_frame(conn: &mut impl Read, buf: &mut Vec<u8>) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_overlayfs_own_attributes_but_the_opaque_mark_are_stripped() {
+        assert!(overlay_own(b"trusted.overlay.redirect"));
+        assert!(overlay_own(b"trusted.overlay.metacopy"));
+        assert!(overlay_own(b"trusted.overlay.origin"));
+        assert!(!overlay_own(b"trusted.overlay.opaque"));
+        assert!(!overlay_own(b"security.capability"));
+        assert!(!overlay_own(b"user.overlay.redirect"));
+        assert!(!overlay_own(b"trusted.overlayx"));
+    }
+
+    /// `kiri import` (#410): a writable layer from another engine becomes
+    /// the container's `upper`, whiteouts and opaque marks as overlayfs reads
+    /// them, owners and links kept, overlayfs's own attributes gone, marked
+    /// plain; one cut short leaves nothing behind.
+    #[test]
+    fn an_imported_writable_layer_becomes_the_upper_dir_whole() {
+        // SAFETY: a plain getter.
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipped: needs root for owners, whiteouts and trusted attributes");
+            return;
+        }
+        let base = std::env::temp_dir().join(format!("kiri-import-upper-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let layer = |cut: bool| {
+            let mut b = tar::Builder::new(Vec::new());
+            let h = |kind: tar::EntryType, size: u64, mode: u32, owner: u64| {
+                let mut h = tar::Header::new_ustar();
+                h.set_entry_type(kind);
+                h.set_size(size);
+                h.set_mode(mode);
+                h.set_uid(owner);
+                h.set_gid(owner);
+                h.set_mtime(1_700_000_000);
+                h
+            };
+            b.append_data(&mut h(tar::EntryType::Directory, 0, 0o750, 1000), "added/", io::empty()).unwrap();
+            b.append_pax_extensions([("SCHILY.xattr.trusted.overlay.redirect", &b"/elsewhere"[..])]).unwrap();
+            b.append_data(&mut h(tar::EntryType::Regular, 5, 0o640, 1000), "added/file", &b"hello"[..]).unwrap();
+            b.append_link(&mut h(tar::EntryType::Symlink, 0, 0o777, 0), "link", "added/file").unwrap();
+            b.append_data(&mut h(tar::EntryType::Directory, 0, 0o755, 0), "etc/", io::empty()).unwrap();
+            b.append_data(&mut h(tar::EntryType::Regular, 0, 0o644, 0), "etc/.wh.gone", io::empty()).unwrap();
+            b.append_data(&mut h(tar::EntryType::Regular, 4, 0o644, 0), "etc/motd", &b"new\n"[..]).unwrap();
+            b.append_data(&mut h(tar::EntryType::Directory, 0, 0o755, 0), "again/", io::empty()).unwrap();
+            b.append_data(&mut h(tar::EntryType::Regular, 0, 0o644, 0), "again/.wh..wh..opq", io::empty()).unwrap();
+            let mut bytes = b.into_inner().unwrap();
+            if cut {
+                // Inside the first file's body.
+                bytes.truncate(512 * 4 + 2);
+            }
+            bytes
+        };
+
+        // Cut short: an error, and neither `upper` nor its staging is left.
+        assert!(import_upper(&layer(true)[..], &base).is_err());
+        assert!(!base.join("upper").exists() && !base.join("upper.import").exists() && !base.join(super::container::PLAIN_UPPER).exists());
+
+        // An empty `upper` (an earlier copy's mount made it) is taken over.
+        fs::create_dir_all(base.join("upper")).unwrap();
+        import_upper(&layer(false)[..], &base).unwrap();
+        let upper = base.join("upper");
+        let meta = |p: &str| fs::symlink_metadata(upper.join(p)).unwrap();
+        assert!(!base.join("upper.import").exists());
+        assert!(base.join(super::container::PLAIN_UPPER).exists(), "marked plain");
+        assert_eq!(meta("").mode() & 0o7777, 0o755);
+        let added = meta("added");
+        assert_eq!((added.uid(), added.gid(), added.mode() & 0o7777, added.mtime()), (1000, 1000, 0o750, 1_700_000_000));
+        let file = meta("added/file");
+        assert_eq!((file.uid(), file.gid(), file.mode() & 0o7777), (1000, 1000, 0o640));
+        assert_eq!(fs::read(upper.join("added/file")).unwrap(), b"hello");
+        assert_eq!(fs::read_link(upper.join("link")).unwrap(), Path::new("added/file"));
+        assert_eq!(fs::read(upper.join("etc/motd")).unwrap(), b"new\n");
+        assert!(is_whiteout(&meta("etc/gone")), "a 0:0 character device");
+        assert!(!upper.join("etc/.wh.gone").exists());
+        assert!(is_opaque(&upper.join("again")));
+        assert!(!upper.join("again/.wh..wh..opq").exists());
+        let c = sys::cstr(upper.join("added/file")).unwrap();
+        // SAFETY: valid path and name; a size query.
+        let redirect = unsafe { libc::lgetxattr(c.as_ptr(), c"trusted.overlay.redirect".as_ptr(), std::ptr::null_mut(), 0) };
+        assert!(redirect < 0, "overlayfs's own attribute stripped");
+
+        let _ = fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn contents_keep_dot_prefix_and_long_names() {

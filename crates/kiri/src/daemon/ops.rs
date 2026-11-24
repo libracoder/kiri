@@ -190,7 +190,7 @@ fn changes(engine: &Engine, key: &str) -> Result<Value, Error> {
             Some(json!({"Path": path, "Kind": kind}))
         })
         .collect();
-    Ok(if list.is_empty() { Value::Null } else { Value::Array(list) })
+    Ok(Value::Array(list))
 }
 
 fn export(engine: &Engine, key: &str, w: &mut UnixStream) -> io::Result<Next> {

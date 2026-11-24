@@ -6084,8 +6084,8 @@ fn close_monitor(h: &mut HealthRun) {
 
 /// Mounts and flags carried on a guest `Copy` frame. Archive ops (`IN`, `OUT`,
 /// `STAT`) carry the container's mounts (with refreshed bind sources) and
-/// `READONLY_ROOTFS` for `IN`; `EXPORT`, `DIFF` and `COMMIT` operate on the
-/// container's rootfs/layer alone, without mounts.
+/// `READONLY_ROOTFS` for `IN`; `EXPORT`, `DIFF`, `COMMIT` and `UPPER` operate
+/// on the container's rootfs/layer alone, without mounts.
 fn copy_mounts_and_flags(spec: &Spec, op: u8, flags: u32) -> (Vec<String>, u32) {
     if !matches!(op, kiri_proto::copy_op::IN | kiri_proto::copy_op::OUT | kiri_proto::copy_op::STAT) {
         return (Vec::new(), flags);
@@ -7696,7 +7696,7 @@ mod start_wait_tests {
             assert_eq!(mounts, s.mounts);
             assert_eq!(flags, 0);
         }
-        for op in [kiri_proto::copy_op::EXPORT, kiri_proto::copy_op::DIFF, kiri_proto::copy_op::COMMIT] {
+        for op in [kiri_proto::copy_op::EXPORT, kiri_proto::copy_op::DIFF, kiri_proto::copy_op::COMMIT, kiri_proto::copy_op::UPPER] {
             let (mounts, flags) = copy_mounts_and_flags(&s, op, 0);
             assert!(mounts.is_empty(), "op {op} must not mount volumes/binds");
             assert_eq!(flags, 0);

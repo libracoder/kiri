@@ -86,7 +86,9 @@ pub fn serve(stream: UnixStream, engine: Arc<Engine>, caller: Caller) -> io::Res
 /// (`/images/create` is `docker import`'s; a pull's, when a client sends
 /// one, is read out after it, by `http::finish_body`).
 fn streams_body(method: &str, path: &str) -> bool {
-    matches!((method, path), ("PUT", p) if p.starts_with("/containers/") && p.ends_with("/archive")) || (method == "POST" && matches!(path, "/images/load" | "/images/create" | "/build"))
+    matches!((method, path), ("PUT", p) if p.starts_with("/containers/") && p.ends_with("/archive"))
+        || matches!((method, path), ("POST", p) if p.starts_with("/kiri/containers/") && p.ends_with("/upper"))
+        || (method == "POST" && matches!(path, "/images/load" | "/images/create" | "/build"))
 }
 
 pub(super) enum Next {
@@ -235,6 +237,12 @@ fn route(req: &Request, engine: &Arc<Engine>, caller: &Caller, w: &mut UnixStrea
         ("POST", p) if p.strip_prefix("/kiri/containers/").and_then(|r| r.strip_suffix("/env")).is_some_and(|id| !id.is_empty()) => {
             let id = p.strip_prefix("/kiri/containers/").and_then(|r| r.strip_suffix("/env")).unwrap_or_default();
             return reply(w, set_env(req, engine, id), 204);
+        }
+        // `kiri import`: the writable layer a container had on the engine
+        // it came from (an OCI layer tar), before it first runs here.
+        ("POST", p) if p.strip_prefix("/kiri/containers/").and_then(|r| r.strip_suffix("/upper")).is_some_and(|id| !id.is_empty()) => {
+            let id = p.strip_prefix("/kiri/containers/").and_then(|r| r.strip_suffix("/upper")).unwrap_or_default();
+            return upper_put(req, engine, id, w, r);
         }
         // An image's page for kiri-win, whose window can't read the store
         // inside WSL: its layers and its Grype scans (crate::scan), as the
@@ -3840,6 +3848,64 @@ fn archive_put(req: &Request, engine: &Engine, id: &str, w: &mut UnixStream, r: 
     }
 }
 
+/// `POST /kiri/containers/{id}/upper`: `kiri import`'s copy of the writable
+/// layer a container had on Docker Desktop or OrbStack, an uncompressed OCI
+/// layer tar (whiteouts as `.wh.` files), unpacked by the guest into the
+/// container's own writable layer (copy.rs, `copy_op::UPPER`). Only for a
+/// container that is not running and has no writable layer yet. A
+/// container's connection never gets here (`container_may`).
+fn upper_put(req: &Request, engine: &Engine, id: &str, w: &mut UnixStream, r: &mut BufReader<UnixStream>) -> io::Result<Next> {
+    let refused = match engine.with(id, |c| c.status == Status::Running || c.paused) {
+        Ok(true) => Some(Error::Conflict(format!("container {id} is running: its writable layer can only be brought in before it runs"))),
+        Ok(false) => None,
+        Err(e) => Some(e),
+    };
+    if let Some(e) = refused {
+        error_closing(w, e)?;
+        return Ok(Next::Close);
+    }
+    let mut body = http::Body::new(req, r);
+    let stream = match engine.copy(id, kiri_proto::copy_op::UPPER, "/", kiri_proto::copy_flags::CHUNKED) {
+        Ok(s) => s,
+        Err(e) => {
+            error_closing(w, e)?;
+            return Ok(Next::Close);
+        }
+    };
+    let mut to_guest = std::fs::File::from(stream.fd.try_clone()?);
+    if let Err(e) = send_chunks(&mut body, &mut to_guest) {
+        // Cut short: dropping the stream ends the guest's copy, which then
+        // leaves the container as it was.
+        error_closing(w, Error::BadRequest(format!("the layer could not be read: {e}")))?;
+        return Ok(Next::Close);
+    }
+    let mut from_guest = std::fs::File::from(stream.fd.try_clone()?);
+    let result = match guest_frame(&mut from_guest) {
+        Ok(frame) => match kiri_proto::decode(&frame) {
+            Ok(kiri_proto::Msg::CopyDone) => Ok(()),
+            Ok(kiri_proto::Msg::Error(m)) if m.contains("in use") || m.contains("already has") => Err(Error::Conflict(m.to_owned())),
+            Ok(kiri_proto::Msg::Error(m)) => Err(copy_error(m)),
+            Ok(other) => Err(Error::Io(io::Error::other(format!("unexpected copy reply: {other:?}")))),
+            Err(e) => Err(Error::Io(io::Error::other(format!("bad copy reply: {e:?}")))),
+        },
+        Err(e) => Err(Error::Io(e)),
+    };
+    match result {
+        Ok(()) if io::copy(&mut body, &mut io::sink()).is_ok() => {
+            http::empty(w, 204)?;
+            Ok(Next::KeepAlive)
+        }
+        Ok(()) => {
+            error_closing(w, Error::BadRequest("the layer could not be read to its end".into()))?;
+            Ok(Next::Close)
+        }
+        Err(e) => {
+            error_closing(w, e)?;
+            Ok(Next::Close)
+        }
+    }
+}
+
 /// A signal by name or number for a stop signal Docker has already
 /// accepted; one it could not parse is SIGTERM, Docker's default.
 pub(super) fn signal(name: &str) -> u32 {
@@ -4657,7 +4723,7 @@ mod tests {
         };
         let mut routes = kiri_routes(body_of(include_str!("api.rs"), "\nfn route("));
         routes.extend(kiri_routes(body_of(include_str!("ops.rs"), "\npub fn route(")));
-        for known in [("POST", "/kiri/stop"), ("POST", "/kiri/sleep"), ("POST", "/kiri/registries"), ("PUT", "/kiri/proxy/system"), ("POST", "/kiri/builder"), ("POST", "/kiri/containers/1/ports"), ("DELETE", "/kiri/k8s/forward/1"), ("GET", "/kiri/watch-roots"), ("POST", "/kiri/fs-events")] {
+        for known in [("POST", "/kiri/stop"), ("POST", "/kiri/sleep"), ("POST", "/kiri/registries"), ("PUT", "/kiri/proxy/system"), ("POST", "/kiri/builder"), ("POST", "/kiri/containers/1/ports"), ("POST", "/kiri/containers/1/upper"), ("DELETE", "/kiri/k8s/forward/1"), ("GET", "/kiri/watch-roots"), ("POST", "/kiri/fs-events")] {
             assert!(routes.iter().any(|(m, p)| (m.as_str(), p.as_str()) == known), "{known:?} not found in route(): {routes:?}");
         }
         for (m, p) in &routes {

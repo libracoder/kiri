@@ -221,8 +221,9 @@ fn unpack(blob: &mut impl Read, media_type: &str, dest: &Path, compressed: u64) 
 
 /// Unpacks a layer tarball, translating OCI whiteouts into the form overlayfs
 /// reads: `.wh.name` becomes a 0:0 character device `name`, and
-/// `.wh..wh..opq` marks its directory opaque.
-fn untar(reader: impl Read, dest: &Path) -> io::Result<u64> {
+/// `.wh..wh..opq` marks its directory opaque. Also how `copy` unpacks a
+/// container's imported writable layer.
+pub(super) fn untar(reader: impl Read, dest: &Path) -> io::Result<u64> {
     untar_in(reader, dest, in_user_namespace)
 }
 

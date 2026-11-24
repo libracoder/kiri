@@ -2349,8 +2349,39 @@ t cp-sys-by-link "1" bash -c "$D cp ans:/data/root/sys - | tar -t | wc -l | tr -
 t cp-link-still-copies "hi" bash -c "$D cp ans:/data/root/f.txt - | tar -xO"
 t cp-tar-mode "0000644" bash -c "$D cp ans:/f.txt - | dd bs=1 skip=100 count=7 2>/dev/null"
 # A container that never started: nothing changed yet, and it commits.
-t diff-never-started "0" bash -c "$D rm -f ans0 >/dev/null; $D create --name ans0 alpine true >/dev/null; $D diff ans0 | wc -l | tr -d ' '"
+t diff-never-started "0" bash -c "set -o pipefail; $D rm -f ans0 >/dev/null; $D create --name ans0 alpine true >/dev/null; $D diff ans0 | wc -l | tr -d ' '"
 t commit-never-started "committed" bash -c "$D commit ans0 anstag:c >/dev/null && $D run --rm anstag:c echo committed"
+# kiri import (#410): a writable layer brought in before the container
+# first runs. docker diff and docker system df see it, and the container
+# sees what was added and changed, and not what was deleted.
+UPPER_TAR=$(mktemp)
+python3 - "$UPPER_TAR" <<'PY'
+import io, sys, tarfile
+t = tarfile.open(sys.argv[1], "w", format=tarfile.PAX_FORMAT)
+def add(name, kind=tarfile.REGTYPE, data=b"", mode=0o644, owner=0, link=""):
+    i = tarfile.TarInfo(name)
+    i.type, i.mode, i.uid, i.gid, i.size, i.linkname, i.mtime = kind, mode, owner, owner, len(data), link, 1700000000
+    t.addfile(i, io.BytesIO(data))
+add("imported", tarfile.DIRTYPE, mode=0o750, owner=1000)
+add("imported/file", data=b"added\n", owner=1000)
+add("imported/link", tarfile.SYMTYPE, link="file")
+add("etc", tarfile.DIRTYPE, mode=0o755)
+add("etc/motd", data=b"changed\n")
+add("etc/.wh.issue")
+t.close()
+PY
+UPPER_POST="$API -o /dev/null -w %{http_code} -X POST -H Expect: -H Content-Type:application/x-tar -H Transfer-Encoding:chunked --data-binary @$UPPER_TAR"
+$D rm -f ansup >/dev/null 2>&1
+$D create --name ansup alpine sleep 1d >/dev/null
+t upper-import-accepted "204" $UPPER_POST http://d/kiri/containers/ansup/upper
+t upper-diff-before-start "6" bash -c "$D diff ansup | grep -cxE 'C /etc|D /etc/issue|C /etc/motd|A /imported|A /imported/file|A /imported/link'"
+t upper-size-rw "counted" bash -c "$API http://d/system/df | python3 -c 'import json, sys; print(\"counted\" if [c.get(\"SizeRw\", 0) for c in json.load(sys.stdin)[\"Containers\"] if \"/ansup\" in c[\"Names\"]][0] > 0 else \"not counted\")'"
+$D start ansup >/dev/null
+t upper-start-sees-added "added changed 1000:1000 750 file" $D exec ansup sh -c 'echo $(cat /imported/file) $(cat /etc/motd) $(stat -c %u:%g /imported/file) $(stat -c %a /imported) $(readlink /imported/link)'
+t upper-start-hides-deleted "gone" $D exec ansup sh -c 'test -e /etc/issue && echo there || echo gone'
+t upper-refused-once-started "409" $UPPER_POST http://d/kiri/containers/ansup/upper
+$D rm -f ansup >/dev/null 2>&1
+rm -f "$UPPER_TAR"
 # A network that doesn't exist: created, refused at start, and the CLI
 # does not read it as a missing image and pull.
 t create-missing-network "201" $API -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' -d '{"Image":"alpine","HostConfig":{"NetworkMode":"ans-nosuch"}}' 'http://d/containers/create?name=ans-n'
