@@ -308,6 +308,12 @@ pub mod copy_flags {
     /// `IN`: the container has `--read-only` (`HostConfig.ReadonlyRootfs`), so
     /// writes outside writable mounts are refused.
     pub const READONLY_ROOTFS: u32 = 8;
+    /// `OUT` / `EXPORT`: the guest sends the archive in `<= 64 KiB` chunks
+    /// (`len: u32 LE | bytes`, ending with an empty chunk), waiting for a
+    /// 1-byte credit ack from the host before sending each chunk, so
+    /// `COPY_PORT` is never left unread while the host writes to
+    /// `ENGINE_API_PORT` (#874).
+    pub const PACED: u32 = 16;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

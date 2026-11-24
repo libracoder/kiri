@@ -81,8 +81,9 @@ pub fn parse_dhcpd_leases(text: &str) -> Vec<([u8; 4], Option<[u8; 6]>)> {
     out
 }
 
-/// Parses `netstat -anv -p udp` output for listeners bound to UDP port 67.
-pub fn parse_udp67_listeners(netstat: &str) -> Vec<(Option<String>, u32)> {
+/// Parses `netstat -anv -p udp` or `-p tcp` output for listeners bound to `port`.
+pub fn parse_netstat_listeners(netstat: &str, port: u16, udp: bool) -> Vec<(Option<String>, u32)> {
+    let suffix = format!(".{port}");
     let (mut out, mut pid_col) = (Vec::new(), None);
     for line in netstat.lines().map(str::trim).filter(|l| !l.is_empty()) {
         if let Some((_, after)) = line.split_once("(state)") {
@@ -90,14 +91,19 @@ pub fn parse_udp67_listeners(netstat: &str) -> Vec<(Option<String>, u32)> {
             continue;
         }
         let f: Vec<&str> = line.split_whitespace().collect();
-        if f.len() < 6 || !matches!(f[0], "udp4" | "udp46" | "udp6") || !f[3].ends_with(".67") {
+        let proto_ok = if udp {
+            matches!(f.first().copied(), Some("udp4" | "udp46" | "udp6"))
+        } else {
+            matches!(f.first().copied(), Some("tcp4" | "tcp46" | "tcp6")) && f.get(5) == Some(&"LISTEN")
+        };
+        if !proto_ok || f.len() < if udp { 6 } else { 7 } || !f[3].ends_with(&suffix) {
             continue;
         }
         let named = |t: &str| {
             let (n, p) = t.rsplit_once(':')?;
             (!n.is_empty() && !n.starts_with("0x") && !n.contains(':')).then(|| p.parse::<u32>().ok().filter(|&p| p > 0))?.map(|p| (Some(n.to_owned()), p))
         };
-        let tail = &f[5..];
+        let tail = if udp { &f[5..] } else { &f[6..] };
         let entry = pid_col
             .and_then(|i| tail.get(i).copied())
             .and_then(|t| named(t).or_else(|| t.parse::<u32>().ok().filter(|&p| p > 0).map(|p| (None, p))))
@@ -107,6 +113,11 @@ pub fn parse_udp67_listeners(netstat: &str) -> Vec<(Option<String>, u32)> {
         }
     }
     out
+}
+
+/// Parses `netstat -anv -p udp` output for listeners bound to UDP port 67.
+pub fn parse_udp67_listeners(netstat: &str) -> Vec<(Option<String>, u32)> {
+    parse_netstat_listeners(netstat, 67, true)
 }
 
 /// Picks the host bridge backing Apple's shared NAT network (`bridge100+`).
@@ -239,20 +250,25 @@ pub fn discover_uplink(_store_root: &Path) -> Result<(Bridge, [u8; 4]), String> 
 }
 
 #[cfg(target_os = "macos")]
+pub fn process_name(pid: u32) -> Option<String> {
+    std::process::Command::new("/bin/ps")
+        .args(["-p", &pid.to_string(), "-o", "comm="])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .and_then(|o| {
+            let raw = String::from_utf8_lossy(&o.stdout).trim().to_owned();
+            (!raw.is_empty()).then(|| Path::new(&raw).file_name().and_then(|f| f.to_str()).unwrap_or(&raw).to_owned())
+        })
+}
+
+#[cfg(target_os = "macos")]
 pub fn udp67_holder() -> Option<String> {
     let out = std::process::Command::new("/usr/sbin/netstat").args(["-anv", "-p", "udp"]).stderr(std::process::Stdio::null()).output().ok()?;
     let mut listeners = parse_udp67_listeners(&String::from_utf8_lossy(&out.stdout));
     for (name, pid) in &mut listeners {
         if name.is_none() {
-            *name = std::process::Command::new("/bin/ps")
-                .args(["-p", &pid.to_string(), "-o", "comm="])
-                .stderr(std::process::Stdio::null())
-                .output()
-                .ok()
-                .and_then(|o| {
-                    let raw = String::from_utf8_lossy(&o.stdout).trim().to_owned();
-                    (!raw.is_empty()).then(|| Path::new(&raw).file_name().and_then(|f| f.to_str()).unwrap_or(&raw).to_owned())
-                });
+            *name = process_name(*pid);
         }
     }
     format_udp67_summary(&listeners)

@@ -165,7 +165,7 @@ fn route(req: &Request, engine: &Arc<Engine>, caller: &Caller, w: &mut UnixStrea
         super::storage::refuse_while_moving(w)?;
         return Ok(Next::Close);
     }
-    if let Some(done) = super::ops::route(req, engine, w) {
+    if let Some(done) = super::ops::route(req, engine, caller, w) {
         return done;
     }
     match (m, p) {
@@ -383,7 +383,7 @@ fn route(req: &Request, engine: &Arc<Engine>, caller: &Caller, w: &mut UnixStrea
                 super::builder::before_exec(engine, id);
                 return reply(w, exec_create(req, engine, id), 201);
             }
-            ("HEAD" | "GET", "archive") => return archive_get(req, engine, id, w),
+            ("HEAD" | "GET", "archive") => return archive_get(req, engine, id, caller, w),
             ("PUT", "archive") => return archive_put(req, engine, id, w, r),
             ("DELETE", "") => return reply(w, engine.remove(id, req.flag("force"), req.flag("v")).map(|()| Value::Null), 204),
             _ => {}
@@ -3998,12 +3998,55 @@ fn path_stat_header(e: &kiri_proto::FsEntry<'_>, link: &str) -> String {
     format!("X-Docker-Container-Path-Stat: {}\r\n", kiri_image::b64::encode(stat.to_string().as_bytes()))
 }
 
+const COPY_OUT_CHUNK: usize = 64 * 1024;
+
+pub(super) fn use_paced_copy(caller: &Caller) -> bool {
+    cfg!(target_os = "macos") && *caller == Caller::Container
+}
+
+/// Streams a `COPY_PORT` archive (`OUT` or `EXPORT`) to an HTTP chunked
+/// response. When `paced` is true, sends a 1-byte credit ack before reading
+/// each `<= 64 KiB` chunk and finishes `f` before `http::chunk` writes to `w`,
+/// so `COPY_PORT` never fills its host buffer while `w` blocks on
+/// `ENGINE_API_PORT` (#874).
+pub(super) fn stream_copy_out(f: &mut (impl io::Read + io::Write), w: &mut impl io::Write, paced: bool) -> io::Result<()> {
+    let mut buf = vec![0u8; COPY_OUT_CHUNK];
+    if paced {
+        let mut hdr = [0u8; 4];
+        loop {
+            f.write_all(&[1])?;
+            f.read_exact(&mut hdr)?;
+            let n = u32::from_le_bytes(hdr) as usize;
+            if n == 0 {
+                return Ok(());
+            }
+            if n > COPY_OUT_CHUNK {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, format!("oversized paced copy chunk {n}")));
+            }
+            f.read_exact(&mut buf[..n])?;
+            http::chunk(w, &buf[..n])?;
+        }
+    }
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            return Ok(());
+        }
+        http::chunk(w, &buf[..n])?;
+    }
+}
+
 /// `docker cp` out of a container (GET), or the stat it starts with (HEAD).
-fn archive_get(req: &Request, engine: &Engine, id: &str, w: &mut UnixStream) -> io::Result<Next> {
-    use std::io::Read;
+fn archive_get(req: &Request, engine: &Engine, id: &str, caller: &Caller, w: &mut UnixStream) -> io::Result<Next> {
     let path = req.query("path").unwrap_or("/");
-    let op = if req.method == "HEAD" { kiri_proto::copy_op::STAT } else { kiri_proto::copy_op::OUT };
-    let stream = match engine.copy(id, op, path, 0) {
+    let (op, paced, flags) = if req.method == "HEAD" {
+        (kiri_proto::copy_op::STAT, false, 0)
+    } else {
+        let paced = use_paced_copy(caller);
+        let flags = if paced { kiri_proto::copy_flags::PACED } else { 0 };
+        (kiri_proto::copy_op::OUT, paced, flags)
+    };
+    let stream = match engine.copy(id, op, path, flags) {
         Ok(s) => s,
         Err(e) => return reply(w, Err(e), 200),
     };
@@ -4032,14 +4075,7 @@ fn archive_get(req: &Request, engine: &Engine, id: &str, w: &mut UnixStream) -> 
         return Ok(Next::KeepAlive);
     }
     http::begin_stream_with(w, 200, "application/x-tar", &header)?;
-    let mut buf = vec![0u8; 256 * 1024];
-    loop {
-        let n = f.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        http::chunk(w, &buf[..n])?;
-    }
+    stream_copy_out(&mut f, w, paced)?;
     http::end(w)?;
     drop(stream);
     Ok(Next::KeepAlive)
@@ -4687,7 +4723,7 @@ mod tests {
                 serde_json::to_vec(&body).unwrap(),
             );
             let (mut client, mut server) = UnixStream::pair().unwrap();
-            super::super::ops::route(&req, &engine, &mut server)
+            super::super::ops::route(&req, &engine, &Caller::Host, &mut server)
                 .unwrap()
                 .unwrap();
             drop(server);
@@ -7937,5 +7973,71 @@ mod resources_disk_tests {
         assert!(by_name("plain-host").get("KiriWslDistro").is_none());
         drop(engine);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stream_copy_out_paces_chunks_and_rejects_oversized_frames() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+
+        let (mut host_copy, mut guest_copy) = UnixStream::pair().unwrap();
+        let (mut api_client, mut api_server) = UnixStream::pair().unwrap();
+        let payload: Vec<u8> = (0..(150 * 1024)).map(|i| (i % 251) as u8).collect();
+        let expected = payload.clone();
+
+        let guest = std::thread::spawn(move || {
+            for chunk in payload.chunks(COPY_OUT_CHUNK) {
+                let mut ack = [0u8; 1];
+                guest_copy.read_exact(&mut ack).unwrap();
+                assert_eq!(ack[0], 1);
+                guest_copy.write_all(&(chunk.len() as u32).to_le_bytes()).unwrap();
+                guest_copy.write_all(chunk).unwrap();
+            }
+            let mut ack = [0u8; 1];
+            guest_copy.read_exact(&mut ack).unwrap();
+            guest_copy.write_all(&0u32.to_le_bytes()).unwrap();
+        });
+
+        let server = std::thread::spawn(move || {
+            super::stream_copy_out(&mut host_copy, &mut api_server, true).unwrap();
+            http::end(&mut api_server).unwrap();
+        });
+
+        let mut raw = Vec::new();
+        api_client.read_to_end(&mut raw).unwrap();
+        guest.join().unwrap();
+        server.join().unwrap();
+
+        // Decode HTTP chunked response body and verify exact payload.
+        let mut decoded = Vec::new();
+        let mut pos = 0;
+        loop {
+            let line_end = raw[pos..].windows(2).position(|w| w == b"\r\n").unwrap() + pos;
+            let len_str = std::str::from_utf8(&raw[pos..line_end]).unwrap();
+            let len = usize::from_str_radix(len_str, 16).unwrap();
+            pos = line_end + 2;
+            if len == 0 {
+                assert_eq!(&raw[pos..], b"\r\n");
+                break;
+            }
+            assert!(len <= COPY_OUT_CHUNK);
+            decoded.extend_from_slice(&raw[pos..pos + len]);
+            pos += len;
+            assert_eq!(&raw[pos..pos + 2], b"\r\n");
+            pos += 2;
+        }
+        assert_eq!(decoded, expected);
+
+        // Oversized paced chunk header (or BE Msg::Error frame) is rejected cleanly.
+        let (mut host_bad, mut guest_bad) = UnixStream::pair().unwrap();
+        let mut sink = Vec::new();
+        let bad_guest = std::thread::spawn(move || {
+            let mut ack = [0u8; 1];
+            guest_bad.read_exact(&mut ack).unwrap();
+            guest_bad.write_all(&((COPY_OUT_CHUNK as u32) + 1).to_le_bytes()).unwrap();
+        });
+        let err = super::stream_copy_out(&mut host_bad, &mut sink, true).unwrap_err();
+        bad_guest.join().unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }

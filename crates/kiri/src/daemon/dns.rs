@@ -278,6 +278,8 @@ fn question_name(q: &[u8]) -> Option<String> {
     }
 }
 
+static SELF_LOOP_WARNED: AtomicBool = AtomicBool::new(false);
+
 /// Where the Mac would send a lookup for `name`: the servers of the
 /// `/etc/resolver/<domain>` file with the longest domain that `name` is in
 /// (VPNs and tools such as dnsmasq set these up), else `/etc/resolv.conf`'s,
@@ -286,6 +288,16 @@ fn question_name(q: &[u8]) -> Option<String> {
 /// skipped: its server answers 127.0.0.1, the Mac's loopback, which means
 /// nothing in a container.
 fn mac_resolvers(name: &str, resolv_conf: &Path, resolver_dir: &Path) -> Vec<SocketAddr> {
+    mac_resolvers_with(name, resolv_conf, resolver_dir, super::ports::host_port_53_published(), Some(&SELF_LOOP_WARNED))
+}
+
+fn mac_resolvers_with(
+    name: &str,
+    resolv_conf: &Path,
+    resolver_dir: &Path,
+    skip_loopback_53: bool,
+    warn_once: Option<&AtomicBool>,
+) -> Vec<SocketAddr> {
     let mut best: Option<(usize, Vec<SocketAddr>)> = None;
     for entry in std::fs::read_dir(resolver_dir).into_iter().flatten().flatten() {
         let Ok(text) = std::fs::read_to_string(entry.path()) else { continue };
@@ -307,7 +319,20 @@ fn mac_resolvers(name: &str, resolv_conf: &Path, resolver_dir: &Path) -> Vec<Soc
             best = Some((domain.len(), servers));
         }
     }
-    best.map(|(_, s)| s).unwrap_or_else(|| parse_servers(&std::fs::read_to_string(resolv_conf).unwrap_or_default()))
+    let mut servers = best.map(|(_, s)| s).unwrap_or_else(|| parse_servers(&std::fs::read_to_string(resolv_conf).unwrap_or_default()));
+    if skip_loopback_53 {
+        let before = servers.len();
+        servers.retain(|s| !(s.port() == 53 && s.ip().to_canonical().is_loopback()));
+        if servers.len() < before
+            && let Some(said) = warn_once
+            && !said.swap(true, Ordering::Relaxed)
+        {
+            crate::diag::warn!(
+                "skipping Mac loopback DNS (127.0.0.1:53 / [::1]:53) while a container publishes host port 53 to prevent a DNS relay loop; pass an explicit --dns (or DoH/DoT) on the DNS container"
+            );
+        }
+    }
+    servers
 }
 
 /// `nameserver` lines (and a `port` line) of a resolv.conf-style file.
@@ -456,5 +481,52 @@ mod tests {
         assert!(!super::should_warn_gateway_dns(false, &said));
         assert!(super::should_warn_gateway_dns(true, &said), "still warns once when shared NAT is active");
         assert!(!super::should_warn_gateway_dns(true, &said), "only once per run");
+    }
+
+    #[test]
+    fn mac_resolvers_skips_loopback_port_53_when_container_publishes_dns() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = std::env::temp_dir().join(format!("kiri-dns-loop-guard-{}", std::process::id()));
+        let resolvers = dir.join("resolver");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&resolvers).unwrap();
+        let conf = dir.join("resolv.conf");
+
+        std::fs::write(&conf, "nameserver 127.0.0.1\nnameserver ::1\nnameserver 192.168.1.1\n").unwrap();
+        std::fs::write(resolvers.join("loop53.example"), "nameserver 127.0.0.1\n").unwrap();
+        std::fs::write(resolvers.join("highport.example"), "nameserver 127.0.0.1\nport 5353\n").unwrap();
+
+        let strs = |list: Vec<std::net::SocketAddr>| list.into_iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        // When no container publishes port 53, loopback :53 resolvers are preserved.
+        assert_eq!(
+            strs(super::mac_resolvers_with("example.com", &conf, &resolvers, false, None)),
+            ["127.0.0.1:53", "[::1]:53", "192.168.1.1:53"]
+        );
+        assert_eq!(
+            strs(super::mac_resolvers_with("a.loop53.example", &conf, &resolvers, false, None)),
+            ["127.0.0.1:53"]
+        );
+
+        // When a container publishes port 53, 127.0.0.1:53 and [::1]:53 are skipped
+        // while non-loopback :53 and loopback high-port resolvers stay usable.
+        let warned = AtomicBool::new(false);
+        assert_eq!(
+            strs(super::mac_resolvers_with("example.com", &conf, &resolvers, true, Some(&warned))),
+            ["192.168.1.1:53"]
+        );
+        assert!(warned.load(Ordering::Relaxed), "warns once when loopback :53 is filtered");
+        assert!(super::mac_resolvers_with("a.loop53.example", &conf, &resolvers, true, Some(&warned)).is_empty());
+        assert_eq!(
+            strs(super::mac_resolvers_with("a.highport.example", &conf, &resolvers, true, Some(&warned))),
+            ["127.0.0.1:5353"]
+        );
+
+        // With only loopback :53 in resolv.conf, filtering returns empty (SERVFAIL) instead of looping.
+        std::fs::write(&conf, "nameserver 127.0.0.1\nnameserver ::1\n").unwrap();
+        assert!(super::mac_resolvers_with("example.com", &conf, &resolvers, true, None).is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

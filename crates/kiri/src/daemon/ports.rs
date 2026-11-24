@@ -15,7 +15,7 @@
 //! CPUs; through the bridge alone, one CPU carried it all and the port
 //! ran at about half of Docker's speed on 127.0.0.1.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -39,6 +39,9 @@ const RELAY_FRAMED_PORT: u32 = 1030;
 static NO_FRAMED_RELAY: AtomicBool = AtomicBool::new(false);
 /// A UDP client quiet this long has its session closed, as conntrack does.
 const UDP_IDLE: Duration = Duration::from_secs(60);
+/// Port-53 DNS queries churn many short-lived client ports, so reap faster
+/// to avoid filling the 1024-session cap (#760).
+const UDP_DNS_IDLE: Duration = Duration::from_secs(10);
 /// A TCP peer that takes none of the relay's bytes for this long is given up
 /// on. Quiet is not stuck: nothing limits how long a connection may idle,
 /// as with docker-proxy (#388).
@@ -96,6 +99,39 @@ pub fn shared_nat_active() -> bool {
         2 => true,
         _ => super::engine::shared_nat(),
     }
+}
+
+static HOST_PORT_53_BINDS: AtomicUsize = AtomicUsize::new(0);
+
+struct HostPort53Guard;
+
+impl HostPort53Guard {
+    fn acquire() -> Self {
+        HOST_PORT_53_BINDS.fetch_add(1, Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for HostPort53Guard {
+    fn drop(&mut self) {
+        HOST_PORT_53_BINDS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// True while at least one container publishes host port 53 on loopback or
+/// wildcard, so `dns::mac_resolvers` skips `127.0.0.1:53` / `[::1]:53` (#760).
+pub fn host_port_53_published() -> bool {
+    HOST_PORT_53_BINDS.load(Ordering::Relaxed) > 0
+}
+
+fn binds_host_dns_port(bound: &[(Binding, String, u16)]) -> bool {
+    bound.iter().any(|(_, ip, port)| {
+        *port == 53
+            && (ip.is_empty()
+                || ip == "0.0.0.0"
+                || ip == "::"
+                || ip.parse::<IpAddr>().is_ok_and(|a| a.is_loopback()))
+    })
 }
 /// New connections over the NAT network: a burst of `NAT_BURST`, then
 /// `NAT_RATE` a second; the rest go over vsock, which takes thousands a
@@ -450,6 +486,8 @@ pub struct Forwards {
     /// `--network host` containers (`loopback_ports`); dropping tells the
     /// agent to stop if `nat` didn't already unpublish the container.
     loopback: Option<(Arc<VmLink>, String)>,
+    /// Tracks an active host port-53 binding while these forwards stay up (#760).
+    host_port_53: Option<HostPort53Guard>,
     /// What was actually bound: (binding, host address, host port).
     pub bound: Vec<(Binding, String, u16)>,
 }
@@ -523,10 +561,38 @@ fn relays_too(ip: &str) -> bool {
     !kernel_forwards(ip) || kernel_host_ip(ip) == Some([0; 4])
 }
 
+#[cfg(target_os = "macos")]
+fn bind_loopback_interface(fd: std::os::fd::RawFd, is_ipv6: bool) -> io::Result<()> {
+    // SAFETY: `c"lo0"` is a static NUL-terminated C string.
+    let idx = unsafe { libc::if_nametoindex(c"lo0".as_ptr()) };
+    if idx == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let (level, opt) = if is_ipv6 {
+        (libc::IPPROTO_IPV6, libc::IPV6_BOUND_IF)
+    } else {
+        (libc::IPPROTO_IP, libc::IP_BOUND_IF)
+    };
+    // SAFETY: `idx` is a `c_uint` interface index matching `setsockopt`.
+    if unsafe { libc::setsockopt(fd, level, opt, (&idx as *const libc::c_uint).cast(), std::mem::size_of::<libc::c_uint>() as libc::socklen_t) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn bind_loopback_interface(_fd: std::os::fd::RawFd, _is_ipv6: bool) -> io::Result<()> {
+    Ok(())
+}
+
 /// A socket bound to `addr`; an IPv6 one with IPV6_V6ONLY, so `[::]:port`
 /// sits beside `0.0.0.0:port` (as Docker binds both) instead of clashing
 /// with it, and serves IPv6 alone.
 fn bind_socket(addr: SocketAddr, udp: bool) -> io::Result<OwnedFd> {
+    bind_socket_on_if(addr, udp, false)
+}
+
+fn bind_socket_on_if(addr: SocketAddr, udp: bool, bind_lo0: bool) -> io::Result<OwnedFd> {
     let (family, ty) = (if addr.is_ipv6() { libc::AF_INET6 } else { libc::AF_INET }, if udp { libc::SOCK_DGRAM } else { libc::SOCK_STREAM });
     // SAFETY: plain socket creation; owned at once.
     let fd = unsafe { libc::socket(family, ty, 0) };
@@ -546,6 +612,9 @@ fn bind_socket(addr: SocketAddr, udp: bool) -> io::Result<OwnedFd> {
     }
     if addr.is_ipv6() && set(libc::IPPROTO_IPV6, libc::IPV6_V6ONLY) != 0 {
         return Err(io::Error::last_os_error());
+    }
+    if cfg!(target_os = "macos") && bind_lo0 {
+        bind_loopback_interface(sock.as_raw_fd(), addr.is_ipv6())?;
     }
     // SAFETY: the sockaddr storage is filled for `addr`'s family and sized to match.
     let (storage, len) = sockaddr_of(addr);
@@ -613,7 +682,7 @@ fn listen_addrs(b: &Binding) -> Vec<(String, bool)> {
 /// an engine left running beside Kiri (the one containers were imported
 /// from) or a server on the Mac holds the port, and "already allocated"
 /// alone reads as if Kiri had lost track of its own containers. None when
-/// Kiri itself has it, or when lsof says nothing.
+/// Kiri itself has it, or when neither `lsof` nor `netstat -anv` finds a holder.
 #[cfg(target_os = "macos")]
 fn holder(port: u16, udp: bool) -> Option<String> {
     let spec = if udp { format!("-iUDP:{port}") } else { format!("-iTCP:{port}") };
@@ -622,8 +691,18 @@ fn holder(port: u16, udp: bool) -> Option<String> {
     if !udp {
         cmd.arg("-sTCP:LISTEN");
     }
-    let out = cmd.stderr(std::process::Stdio::null()).output().ok()?;
-    holder_in(&String::from_utf8_lossy(&out.stdout))
+    if let Ok(out) = cmd.stderr(std::process::Stdio::null()).output()
+        && let Some(name) = holder_in(&String::from_utf8_lossy(&out.stdout))
+    {
+        return Some(name);
+    }
+    let proto = if udp { "udp" } else { "tcp" };
+    let out = std::process::Command::new("/usr/sbin/netstat")
+        .args(["-anv", "-p", proto])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    holder_in_netstat(&String::from_utf8_lossy(&out.stdout), port, udp, std::process::id(), super::vmnet::process_name)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -636,6 +715,62 @@ fn holder(_port: u16, _udp: bool) -> Option<String> {
 #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
 fn holder_in(lsof: &str) -> Option<String> {
     lsof.lines().filter_map(|l| l.strip_prefix('c')).map(str::trim).find(|c| !c.is_empty() && !c.to_ascii_lowercase().starts_with("kiri")).map(str::to_owned)
+}
+
+/// Fallback holder lookup from `netstat -anv` when unprivileged `lsof` cannot
+/// inspect root-owned sockets (e.g. `mDNSResponder` on port 53, #760).
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+fn holder_in_netstat(
+    netstat: &str,
+    port: u16,
+    udp: bool,
+    self_pid: u32,
+    mut resolve_pid: impl FnMut(u32) -> Option<String>,
+) -> Option<String> {
+    for (name, pid) in super::vmnet::parse_netstat_listeners(netstat, port, udp) {
+        if pid == self_pid {
+            continue;
+        }
+        let Some(resolved) = name.or_else(|| resolve_pid(pid)) else { continue };
+        let trimmed = resolved.trim();
+        if !trimmed.is_empty() && !trimmed.to_ascii_lowercase().starts_with("kiri") {
+            return Some(trimmed.to_owned());
+        }
+    }
+    None
+}
+
+fn is_non_default_ipv4_loopback(ip: &str) -> bool {
+    ip.parse::<std::net::Ipv4Addr>().is_ok_and(|v4| v4.is_loopback() && v4 != std::net::Ipv4Addr::LOCALHOST)
+}
+
+fn format_bind_error(
+    e: io::Error,
+    shown_ip: &str,
+    bare_ip: &str,
+    host_port: u16,
+    holder_name: Option<&str>,
+    is_macos: bool,
+    shared_nat_active: bool,
+) -> io::Error {
+    if e.kind() == io::ErrorKind::AddrInUse {
+        let by = holder_name.map(|name| format!(" (in use by {name})")).unwrap_or_default();
+        let mut msg = format!("Bind for {shown_ip}:{host_port} failed: port is already allocated{by}");
+        if is_macos && host_port == 53 && (shared_nat_active || holder_name.is_some_and(|n| n.eq_ignore_ascii_case("mDNSResponder"))) {
+            msg.push_str("; macOS shared NAT uses port 53 (mDNSResponder): run `kiri vm set --shared-nat off` and restart Kiri, or bind a high port with `/etc/resolver/<domain>` (`port <N>`)");
+        }
+        return io::Error::new(e.kind(), msg);
+    }
+    if is_macos
+        && (e.kind() == io::ErrorKind::AddrNotAvailable || e.raw_os_error() == Some(libc::EADDRNOTAVAIL))
+        && is_non_default_ipv4_loopback(bare_ip)
+    {
+        return io::Error::new(
+            e.kind(),
+            format!("Bind for {shown_ip}:{host_port} failed: address is not assigned on macOS (run `sudo ifconfig lo0 alias {bare_ip}` or use `127.0.0.1`)"),
+        );
+    }
+    e
 }
 
 fn wildcard_of(addr: SocketAddr) -> SocketAddr {
@@ -661,7 +796,11 @@ fn bind_with_macos_low_loopback(
     is_udp: bool,
     step_aside: impl FnMut(u16) -> bool,
 ) -> io::Result<(OwnedFd, bool)> {
-    bind_with_macos_low_loopback_with(addr, port, is_udp, cfg!(target_os = "macos"), bind_socket, step_aside)
+    let bind = |a: SocketAddr, u: bool| {
+        let bind_lo0 = addr.ip().is_loopback() && a.ip().is_unspecified();
+        bind_socket_on_if(a, u, bind_lo0)
+    };
+    bind_with_macos_low_loopback_with(addr, port, is_udp, cfg!(target_os = "macos"), bind, step_aside)
 }
 
 fn bind_with_macos_low_loopback_with<T>(
@@ -723,14 +862,10 @@ pub fn start(vm: Arc<VmLink>, id: &str, bindings: &[Binding], target_ip: [u8; 4]
         for (ip, required) in listen_addrs(b) {
             let addr = host_addr(&ip, port)?;
             let taken = |e: io::Error| {
-                if e.kind() == io::ErrorKind::AddrInUse {
-                    let shown = if addr.is_ipv6() { format!("[{ip}]") } else { ip.clone() };
-                    // Docker's words, then who has the port when it is not Kiri.
-                    let by = holder(b.host_port, b.proto == "udp").map(|name| format!(" (in use by {name})")).unwrap_or_default();
-                    io::Error::new(e.kind(), format!("Bind for {shown}:{} failed: port is already allocated{by}", b.host_port))
-                } else {
-                    e
-                }
+                let shown = if addr.is_ipv6() { format!("[{ip}]") } else { ip.clone() };
+                // Docker's words, then who has the port when it is not Kiri.
+                let by = (e.kind() == io::ErrorKind::AddrInUse).then(|| holder(b.host_port, b.proto == "udp")).flatten();
+                format_bind_error(e, &shown, &ip, b.host_port, by.as_deref(), cfg!(target_os = "macos"), shared_nat_active())
             };
             let is_udp = b.proto == "udp";
             let (bound, bind_ip, loopback_only) = match bind_with_macos_low_loopback(addr, port, is_udp, super::domains::step_aside) {
@@ -812,7 +947,7 @@ pub fn start(vm: Arc<VmLink>, id: &str, bindings: &[Binding], target_ip: [u8; 4]
             }
         }
     }
-    let mut fw = Forwards { wake: Vec::new(), threads: Vec::new(), kernel: None, nat: None, loopback: None, bound: Vec::new() };
+    let mut fw = Forwards { wake: Vec::new(), threads: Vec::new(), kernel: None, nat: None, loopback: None, host_port_53: None, bound: Vec::new() };
     // On a Linux host the daemon shares the kernel with the containers, so
     // the kernel can rewrite the packets (nftables DNAT) instead of two
     // user-space relays copying every byte; that serves every address but
@@ -913,6 +1048,9 @@ pub fn start(vm: Arc<VmLink>, id: &str, bindings: &[Binding], target_ip: [u8; 4]
             fw.bound.push((b, ip, port));
         }
     }
+    if binds_host_dns_port(&fw.bound) {
+        fw.host_port_53 = Some(HostPort53Guard::acquire());
+    }
     Ok(fw)
 }
 
@@ -958,7 +1096,7 @@ struct UdpSession {
     last: Instant,
     reader: JoinHandle<()>,
     // Keeps the connection open until the session ends.
-    _guest: kiri_vmm::VsockStream,
+    _guest: Option<kiri_vmm::VsockStream>,
 }
 
 impl UdpSession {
@@ -969,9 +1107,31 @@ impl UdpSession {
     }
 }
 
+fn udp_idle_timeout(host_port: u16, container_port: u16) -> Duration {
+    if host_port == 53 || container_port == 53 { UDP_DNS_IDLE } else { UDP_IDLE }
+}
+
 /// Datagrams from each client go to the container over its own session;
 /// replies come back to that client. Quiet sessions close.
 fn udp_loop(sock: &UdpSocket, wake: &OwnedFd, vm: &Arc<VmLink>, ip: [u8; 4], port: u16, loopback_only: bool) {
+    let host_port = sock.local_addr().map(|a| a.port()).unwrap_or(0);
+    udp_loop_with(sock, wake, loopback_only, udp_idle_timeout(host_port, port), |s, peer| {
+        open_udp_session(s, vm, ip, port, peer)
+    });
+}
+
+fn udp_loop_with(
+    sock: &UdpSocket,
+    wake: &OwnedFd,
+    loopback_only: bool,
+    idle: Duration,
+    mut open_session: impl FnMut(&UdpSocket, SocketAddr) -> io::Result<UdpSession>,
+) {
+    if cfg!(target_os = "macos") && loopback_only {
+        let is_v6 = sock.local_addr().is_ok_and(|a| a.is_ipv6());
+        let _ = bind_loopback_interface(sock.as_raw_fd(), is_v6);
+    }
+    let poll_ms = (idle.as_millis() / 2).clamp(100, 5_000) as libc::c_int;
     let mut sessions: std::collections::HashMap<SocketAddr, UdpSession> = std::collections::HashMap::new();
     let mut buf = vec![0u8; 65_536];
     loop {
@@ -988,7 +1148,7 @@ fn udp_loop(sock: &UdpSocket, wake: &OwnedFd, vm: &Arc<VmLink>, ip: [u8; 4], por
             },
         ];
         // SAFETY: polling two descriptors we own; wake up now and then to reap.
-        let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, 5_000) };
+        let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, poll_ms) };
         if n < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
             break;
         }
@@ -1009,7 +1169,7 @@ fn udp_loop(sock: &UdpSocket, wake: &OwnedFd, vm: &Arc<VmLink>, ip: [u8; 4], por
                         }
                     }
                 }
-                match open_udp_session(sock, vm, ip, port, peer) {
+                match open_session(sock, peer) {
                     Ok(s) => {
                         sessions.insert(peer, s);
                     }
@@ -1027,8 +1187,8 @@ fn udp_loop(sock: &UdpSocket, wake: &OwnedFd, vm: &Arc<VmLink>, ip: [u8; 4], por
                 }
             }
         }
-        let idle: Vec<SocketAddr> = sessions.iter().filter(|(_, s)| s.last.elapsed() >= UDP_IDLE || s.reader.is_finished()).map(|(a, _)| *a).collect();
-        for a in idle {
+        let idle_peers: Vec<SocketAddr> = sessions.iter().filter(|(_, s)| s.last.elapsed() >= idle || s.reader.is_finished()).map(|(a, _)| *a).collect();
+        for a in idle_peers {
             if let Some(s) = sessions.remove(&a) {
                 s.close();
             }
@@ -1065,7 +1225,7 @@ fn open_udp_session(sock: &UdpSocket, vm: &VmLink, ip: [u8; 4], port: u16, peer:
         to_guest,
         last: Instant::now(),
         reader,
-        _guest: guest,
+        _guest: Some(guest),
     })
 }
 
@@ -2731,71 +2891,292 @@ pub fn serve_engine_api(stream: kiri_vmm::VsockStream, engine: std::sync::Weak<s
     });
 }
 
+fn set_nonblocking_cloexec(fd: std::os::fd::RawFd) -> io::Result<()> {
+    // SAFETY: fcntl on a descriptor we own.
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: F_GETFL takes no extra args on a descriptor we own.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if flags & libc::O_NONBLOCK == 0 {
+        // SAFETY: F_SETFL with O_NONBLOCK on a descriptor we own.
+        if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let one: libc::c_int = 1;
+        // SAFETY: best-effort SO_NOSIGPIPE on a descriptor we own.
+        unsafe { libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_NOSIGPIPE, (&one as *const libc::c_int).cast(), std::mem::size_of::<libc::c_int>() as libc::socklen_t) };
+    }
+    Ok(())
+}
+
+fn shutdown_fd(fd: std::os::fd::RawFd, how: libc::c_int) {
+    // SAFETY: caller owns or keeps `fd` alive for the duration of the relay.
+    unsafe { libc::shutdown(fd, how) };
+}
+
+/// Non-blocking drain into `buf` up to `cap`; returns `Ok(true)` on EOF.
+fn drain_nonblock(fd: std::os::fd::RawFd, buf: &mut VecDeque<u8>, cap: usize, tmp: &mut [u8]) -> io::Result<bool> {
+    while buf.len() < cap {
+        let want = (cap - buf.len()).min(tmp.len());
+        // SAFETY: `tmp` has at least `want` writable bytes and `fd` is open.
+        let n = unsafe { libc::read(fd, tmp.as_mut_ptr().cast(), want) };
+        if n > 0 {
+            buf.extend(&tmp[..n as usize]);
+        } else if n == 0 {
+            return Ok(true);
+        } else {
+            let e = io::Error::last_os_error();
+            match e.raw_os_error() {
+                Some(libc::EINTR) => continue,
+                Some(c) if c == libc::EAGAIN || c == libc::EWOULDBLOCK => return Ok(false),
+                _ => return Err(e),
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Non-blocking flush from `buf` (`<= chunk_cap` per write); returns bytes written.
+fn flush_nonblock(fd: std::os::fd::RawFd, buf: &mut VecDeque<u8>, chunk_cap: usize) -> io::Result<usize> {
+    let mut wrote = 0;
+    while !buf.is_empty() {
+        let (head, _) = buf.as_slices();
+        if head.is_empty() {
+            buf.make_contiguous();
+            continue;
+        }
+        let want = head.len().min(chunk_cap);
+        // SAFETY: `head` has at least `want` readable bytes and `fd` is open.
+        let n = unsafe { libc::write(fd, head.as_ptr().cast(), want) };
+        if n > 0 {
+            let n = n as usize;
+            buf.drain(..n);
+            wrote += n;
+        } else if n == 0 {
+            return Err(io::Error::from(io::ErrorKind::WriteZero));
+        } else {
+            let e = io::Error::last_os_error();
+            match e.raw_os_error() {
+                Some(libc::EINTR) => continue,
+                Some(c) if c == libc::EAGAIN || c == libc::EWOULDBLOCK => break,
+                _ => return Err(e),
+            }
+        }
+    }
+    Ok(wrote)
+}
+
 /// Relays one guest engine-API stream to `serve` over a local `UnixStream`
-/// pair. Once `serve` exits (after `HEADER_TIMEOUT`, `Connection: close`, 400,
-/// 403, 413, or EOF) and any buffered response has been written to `guest`,
-/// both directions of `guest` are shut down (`SHUT_RDWR`) so a half-open guest
-/// connection can never leave `from_guest` blocked or pin a container permit.
+/// pair using a single-thread `O_NONBLOCK` `poll()` state machine (no `dup()`
+/// of `VZVirtioSocketConnection`, bounded 64 KiB buffers each way). Once
+/// `serve` exits (after `HEADER_TIMEOUT`, `Connection: close`, 400, 403, 413,
+/// or EOF) and any buffered response drains (or stalls past `TCP_STALL`),
+/// both directions of `guest` are shut down (`SHUT_RDWR`) so a half-open
+/// guest connection can never leave a relay blocked or pin a container permit.
 fn relay_engine_api(
     guest: &OwnedFd,
     serve: impl FnOnce(std::os::unix::net::UnixStream) + Send + 'static,
 ) -> io::Result<()> {
-    struct ShutdownWriteOnDrop(std::os::unix::net::UnixStream);
-    impl Drop for ShutdownWriteOnDrop {
+    relay_engine_api_with(guest, TCP_STALL, serve)
+}
+
+fn relay_engine_api_with(
+    guest: &OwnedFd,
+    stall: Duration,
+    serve: impl FnOnce(std::os::unix::net::UnixStream) + Send + 'static,
+) -> io::Result<()> {
+    struct DoneSignal {
+        ours: std::os::unix::net::UnixStream,
+        _done_w: OwnedFd,
+    }
+    impl Drop for DoneSignal {
         fn drop(&mut self) {
-            let _ = self.0.shutdown(Shutdown::Write);
+            let _ = self.ours.shutdown(Shutdown::Write);
         }
     }
 
-    let _ = vsock_stall(guest.as_raw_fd());
+    const CAP: usize = 64 * 1024;
+    let guest_fd = guest.as_raw_fd();
+    set_nonblocking_cloexec(guest_fd)?;
     let (api, ours) = std::os::unix::net::UnixStream::pair()?;
-    let ours_end = ShutdownWriteOnDrop(ours.try_clone()?);
-    let (mut api_read, from_guest, to_guest) = (api.try_clone()?, guest.try_clone()?, guest.try_clone()?);
-    let mut from_guest = std::fs::File::from(from_guest);
-    let mut to_guest = std::fs::File::from(to_guest);
-    let mut api_write = api;
-    let served = std::thread::Builder::new().name("kiri-api".into()).spawn(move || {
-        let _end = ours_end;
+    let api_fd = api.as_raw_fd();
+    set_nonblocking_cloexec(api_fd)?;
+    let (done_r, done_w) = pipe()?;
+    set_nonblocking_cloexec(done_r.as_raw_fd())?;
+    let signal = DoneSignal {
+        ours: ours.try_clone()?,
+        _done_w: done_w,
+    };
+    let served = match std::thread::Builder::new().name("kiri-api".into()).spawn(move || {
+        let _signal = signal;
         serve(ours);
-    })?;
-    let (served_tx, served_rx) = std::sync::mpsc::sync_channel::<JoinHandle<()>>(1);
-    let down = match std::thread::Builder::new().name("kiri-engine-api-down".into()).spawn(move || {
-        let copied = copy(&mut api_read, &mut to_guest);
-        if copied.is_err() {
-            // Guest stopped reading or disconnected: wake `kiri-api` and `from_guest`.
-            let _ = api_read.shutdown(Shutdown::Both);
-            // SAFETY: shutting down both directions on a socket we own.
-            unsafe { libc::shutdown(to_guest.as_raw_fd(), libc::SHUT_RDWR) };
-            if let Ok(served) = served_rx.recv() {
-                let _ = served.join();
-            }
-            return;
-        }
-        // `serve` shut down its write half (clean exit or `http::close`
-        // linger): signal write-EOF to the guest now, wait for `serve` to
-        // finish, then shut down both directions so a half-open guest cannot
-        // pin `from_guest` (and the container connection permit) forever.
-        // SAFETY: shutting down a socket we own.
-        unsafe { libc::shutdown(to_guest.as_raw_fd(), libc::SHUT_WR) };
-        if let Ok(served) = served_rx.recv() {
-            let _ = served.join();
-        }
-        // SAFETY: shutting down both directions wakes `from_guest`.
-        unsafe { libc::shutdown(to_guest.as_raw_fd(), libc::SHUT_RDWR) };
     }) {
         Ok(t) => t,
         Err(e) => {
-            // SAFETY: tear down both ends if the downlink thread could not spawn.
-            unsafe { libc::shutdown(guest.as_raw_fd(), libc::SHUT_RDWR) };
-            let _ = api_write.shutdown(Shutdown::Both);
-            let _ = served.join();
+            shutdown_fd(guest_fd, libc::SHUT_RDWR);
             return Err(e);
         }
     };
-    let _ = served_tx.send(served);
-    let _ = copy(&mut from_guest, &mut api_write);
-    let _ = api_write.shutdown(Shutdown::Write);
-    let _ = down.join();
+
+    let mut g2a: VecDeque<u8> = VecDeque::with_capacity(CAP);
+    let mut a2g: VecDeque<u8> = VecDeque::with_capacity(CAP);
+    let mut g_eof = false;
+    let mut a_eof = false;
+    let mut g_shut_wr = false;
+    let mut a_shut_wr = false;
+    let mut a_write_closed = false;
+    let mut done_closed = false;
+    let mut a2g_stall: Option<Instant> = None;
+    let mut tmp = [0u8; 32 * 1024];
+
+    loop {
+        if a_eof && a2g.is_empty() && done_closed {
+            break;
+        }
+        if !a2g.is_empty()
+            && let Some(since) = a2g_stall
+            && since.elapsed() >= stall
+        {
+            break;
+        }
+
+        let mut g_ev: libc::c_short = 0;
+        if !g_eof && !a_write_closed && g2a.len() < CAP {
+            g_ev |= libc::POLLIN;
+        }
+        if !a2g.is_empty() {
+            g_ev |= libc::POLLOUT;
+        }
+
+        let mut a_ev: libc::c_short = 0;
+        if !a_eof && a2g.len() < CAP {
+            a_ev |= libc::POLLIN;
+        }
+        if !g2a.is_empty() && !a_write_closed {
+            a_ev |= libc::POLLOUT;
+        }
+
+        let timeout_ms: libc::c_int = if !a2g.is_empty()
+            && let Some(since) = a2g_stall
+        {
+            let rem = stall.saturating_sub(since.elapsed());
+            if rem.is_zero() {
+                break;
+            }
+            rem.as_millis().clamp(1, 5_000) as libc::c_int
+        } else {
+            -1
+        };
+
+        let mut fds = [
+            libc::pollfd {
+                fd: if g_ev != 0 { guest_fd } else { -1 },
+                events: g_ev,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: if a_ev != 0 { api_fd } else { -1 },
+                events: a_ev,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: if done_closed { -1 } else { done_r.as_raw_fd() },
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        // SAFETY: polling descriptors we own (or -1 to skip).
+        let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout_ms) };
+        if n < 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            break;
+        }
+
+        if fds[2].revents != 0 {
+            let mut b = [0u8; 16];
+            // SAFETY: draining `done_r` we own to observe pipe closure.
+            let r = unsafe { libc::read(done_r.as_raw_fd(), b.as_mut_ptr().cast(), b.len()) };
+            if r == 0 || (fds[2].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0) {
+                done_closed = true;
+            }
+        }
+
+        let mut guest_dead = false;
+        let mut pushed_g2a = false;
+        let mut pushed_a2g = false;
+
+        if !g_eof && !a_write_closed && g2a.len() < CAP && fds[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+            let before = g2a.len();
+            match drain_nonblock(guest_fd, &mut g2a, CAP, &mut tmp) {
+                Ok(eof) => {
+                    g_eof = eof;
+                    pushed_g2a = g2a.len() > before;
+                }
+                Err(_) => guest_dead = true,
+            }
+        }
+
+        if !a_eof && a2g.len() < CAP && fds[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+            let before = a2g.len();
+            match drain_nonblock(api_fd, &mut a2g, CAP, &mut tmp) {
+                Ok(eof) => {
+                    a_eof = eof;
+                    pushed_a2g = a2g.len() > before;
+                }
+                Err(_) => a_eof = true,
+            }
+        }
+
+        if !g2a.is_empty() && !a_write_closed && (pushed_g2a || fds[1].revents & (libc::POLLOUT | libc::POLLHUP | libc::POLLERR) != 0) {
+            if flush_nonblock(api_fd, &mut g2a, CAP).is_err() {
+                a_write_closed = true;
+                g2a.clear();
+            }
+        }
+
+        if !guest_dead && !a2g.is_empty() && (pushed_a2g || fds[0].revents & (libc::POLLOUT | libc::POLLHUP | libc::POLLERR) != 0) {
+            match flush_nonblock(guest_fd, &mut a2g, CAP) {
+                Ok(wrote) => {
+                    if a2g.is_empty() {
+                        a2g_stall = None;
+                    } else if wrote > 0 || a2g_stall.is_none() {
+                        a2g_stall = Some(Instant::now());
+                    }
+                }
+                Err(_) => guest_dead = true,
+            }
+        }
+
+        if guest_dead {
+            break;
+        }
+
+        if g_eof && g2a.is_empty() && !a_shut_wr && !a_write_closed {
+            shutdown_fd(api_fd, libc::SHUT_WR);
+            a_shut_wr = true;
+        }
+        if a_eof && a2g.is_empty() && !g_shut_wr {
+            shutdown_fd(guest_fd, libc::SHUT_WR);
+            g_shut_wr = true;
+        }
+    }
+
+    // Close `api` before joining `served`: on macOS XNU, `shutdown(SHUT_RDWR)`
+    // alone does not wake a peer thread blocked writing to `ours`; closing `api`
+    // wakes both blocked reads and blocked writes on `ours` immediately.
+    drop(api);
+    shutdown_fd(guest_fd, libc::SHUT_RDWR);
+    let _ = served.join();
     Ok(())
 }
 
@@ -3909,5 +4290,284 @@ Wireless LAN adapter Wi-Fi:\r\n\
         super::set_shared_nat_active(Some(true));
         assert!(super::shared_nat_active());
         super::set_shared_nat_active(None);
+    }
+
+    #[test]
+    fn engine_api_relay_bidirectional_saturation_never_deadlocks_and_releases_permit() {
+        use std::io::{Read, Write};
+        use std::os::fd::{AsRawFd, OwnedFd};
+        use std::os::unix::net::UnixStream;
+        use std::time::{Duration, Instant};
+
+        const UP_BYTES: usize = 4 << 20;
+        const DOWN_BYTES: usize = 16 << 20;
+
+        let shrink_bufs = |fd: std::os::fd::RawFd| {
+            let small: libc::c_int = 4096;
+            for opt in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
+                // SAFETY: shrinking socket buffer on a descriptor we own for saturation testing.
+                unsafe { libc::setsockopt(fd, libc::SOL_SOCKET, opt, (&small as *const libc::c_int).cast(), std::mem::size_of::<libc::c_int>() as libc::socklen_t) };
+            }
+        };
+
+        let cap = super::super::ConnCap::for_test(1);
+        let permit = cap.try_acquire_for_test().unwrap();
+        let (mut guest_client_r, guest_server) = UnixStream::pair().unwrap();
+        shrink_bufs(guest_client_r.as_raw_fd());
+        shrink_bufs(guest_server.as_raw_fd());
+        guest_client_r.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        guest_client_r.set_write_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut guest_client_w = guest_client_r.try_clone().unwrap();
+
+        let guest_fd = OwnedFd::from(guest_server);
+        let t0 = Instant::now();
+        let relay = std::thread::spawn(move || {
+            let _permit = permit;
+            super::relay_engine_api(&guest_fd, move |mut ours_w| {
+                shrink_bufs(ours_w.as_raw_fd());
+                let mut ours_r = ours_w.try_clone().unwrap();
+                let reader = std::thread::spawn(move || {
+                    let mut buf = vec![0u8; 32 * 1024];
+                    let mut got = 0usize;
+                    loop {
+                        let n = ours_r.read(&mut buf).unwrap();
+                        if n == 0 {
+                            break;
+                        }
+                        for &b in &buf[..n] {
+                            assert_eq!(b, ((got % 251) as u8), "upload byte mismatch at {got}");
+                            got += 1;
+                        }
+                    }
+                    assert_eq!(got, UP_BYTES);
+                });
+                let down_chunk: Vec<u8> = (0..(64 * 1024)).map(|i| ((i * 7) % 253) as u8).collect();
+                let mut sent = 0usize;
+                while sent < DOWN_BYTES {
+                    let take = (DOWN_BYTES - sent).min(down_chunk.len());
+                    ours_w.write_all(&down_chunk[..take]).unwrap();
+                    sent += take;
+                }
+                let _ = ours_w.shutdown(std::net::Shutdown::Write);
+                reader.join().unwrap();
+            })
+            .unwrap();
+        });
+
+        let uploader = std::thread::spawn(move || {
+            let mut chunk = vec![0u8; 32 * 1024];
+            let mut sent = 0usize;
+            while sent < UP_BYTES {
+                let take = (UP_BYTES - sent).min(chunk.len());
+                for (i, b) in chunk[..take].iter_mut().enumerate() {
+                    *b = ((sent + i) % 251) as u8;
+                }
+                guest_client_w.write_all(&chunk[..take]).unwrap();
+                sent += take;
+            }
+            guest_client_w.shutdown(std::net::Shutdown::Write).unwrap();
+        });
+
+        let mut buf = vec![0u8; 32 * 1024];
+        let mut got_down = 0usize;
+        loop {
+            let n = guest_client_r.read(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            for &b in &buf[..n] {
+                let expected = (((got_down % (64 * 1024)) * 7) % 253) as u8;
+                assert_eq!(b, expected, "download byte mismatch at {got_down}");
+                got_down += 1;
+            }
+        }
+        assert_eq!(got_down, DOWN_BYTES);
+        uploader.join().unwrap();
+        relay.join().unwrap();
+        assert!(t0.elapsed() < Duration::from_secs(10), "bidirectional saturation took {:?}", t0.elapsed());
+        assert_eq!(cap.open(), 0, "container permit must be released after bidirectional saturation");
+    }
+
+    #[test]
+    fn engine_api_relay_tears_down_stalled_half_open_guest() {
+        use std::io::Write;
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
+        use std::time::{Duration, Instant};
+
+        let cap = super::super::ConnCap::for_test(1);
+        let permit = cap.try_acquire_for_test().unwrap();
+        let (guest_client, guest_server) = UnixStream::pair().unwrap();
+        let guest_fd = OwnedFd::from(guest_server);
+        let t0 = Instant::now();
+        let t = std::thread::spawn(move || {
+            let _permit = permit;
+            super::relay_engine_api_with(&guest_fd, Duration::from_millis(80), |mut ours| {
+                // Flood past socket + 64 KiB relay buffers while guest never reads.
+                let payload = vec![0x41u8; 512 * 1024];
+                for _ in 0..8 {
+                    if ours.write_all(&payload).is_err() {
+                        break;
+                    }
+                }
+            })
+            .unwrap();
+        });
+        t.join().unwrap();
+        assert!(t0.elapsed() < Duration::from_secs(2), "stalled guest relay hung for {:?}", t0.elapsed());
+        assert_eq!(cap.open(), 0, "container permit must be released after stall teardown");
+        drop(guest_client);
+    }
+
+    #[test]
+    fn netstat_holder_fallback_and_port53_bind_guidance() {
+        use std::io;
+
+        let udp_netstat = "\
+Proto Recv-Q Send-Q  Local Address          Foreign Address        (state)     rhiwat shiwat process:pid state\n\
+udp4       0      0  *.5353                 *.*                                786896   9216 mDNSResponder:111 0x0000\n\
+udp4       0      0  *.53                   *.*                                786896   9216 kiri-daemon:222 0x0000\n\
+udp4       0      0  192.168.64.1.53        *.*                                786896   9216 mDNSResponder:333 0x0000\n";
+        assert_eq!(super::holder_in_netstat(udp_netstat, 53, true, 999, |_| None).as_deref(), Some("mDNSResponder"));
+        assert_eq!(super::holder_in_netstat(udp_netstat, 53, true, 333, |_| None), None, "skips self pid and kiri*");
+
+        let tcp_netstat = "\
+Proto Recv-Q Send-Q  Local Address          Foreign Address        (state)     rhiwat shiwat    pid   epid  state\n\
+tcp4       0      0  127.0.0.1.53           127.0.0.1.51234        ESTABLISHED 131072 131072    444      0 0x0102\n\
+tcp4       0      0  *.53                   *.*                    LISTEN      131072 131072    555      0 0x0100\n";
+        assert_eq!(
+            super::holder_in_netstat(tcp_netstat, 53, false, 999, |pid| (pid == 555).then(|| "mDNSResponder".to_owned())).as_deref(),
+            Some("mDNSResponder")
+        );
+
+        let e_in_use = || io::Error::from(io::ErrorKind::AddrInUse);
+        let msg_shared = super::format_bind_error(e_in_use(), "0.0.0.0", "0.0.0.0", 53, None, true, true).to_string();
+        assert!(msg_shared.contains("kiri vm set --shared-nat off"), "{msg_shared}");
+        assert!(msg_shared.contains("/etc/resolver/<domain>"), "{msg_shared}");
+
+        let msg_mdns = super::format_bind_error(e_in_use(), "127.0.0.1", "127.0.0.1", 53, Some("mDNSResponder"), true, false).to_string();
+        assert!(msg_mdns.contains("(in use by mDNSResponder)"), "{msg_mdns}");
+        assert!(msg_mdns.contains("kiri vm set --shared-nat off"), "{msg_mdns}");
+
+        let msg_other = super::format_bind_error(e_in_use(), "127.0.0.1", "127.0.0.1", 53, Some("dnsmasq"), true, false).to_string();
+        assert!(msg_other.contains("(in use by dnsmasq)"), "{msg_other}");
+        assert!(!msg_other.contains("--shared-nat off"), "{msg_other}");
+
+        let msg_linux = super::format_bind_error(e_in_use(), "0.0.0.0", "0.0.0.0", 53, None, false, true).to_string();
+        assert!(!msg_linux.contains("--shared-nat off"), "{msg_linux}");
+
+        let e_notavail = || io::Error::from_raw_os_error(libc::EADDRNOTAVAIL);
+        let msg_alias = super::format_bind_error(e_notavail(), "127.0.0.53", "127.0.0.53", 53, None, true, false).to_string();
+        assert!(msg_alias.contains("sudo ifconfig lo0 alias 127.0.0.53"), "{msg_alias}");
+        assert!(msg_alias.contains("127.0.0.1"), "{msg_alias}");
+
+        let err_plain = super::format_bind_error(e_notavail(), "192.168.1.99", "192.168.1.99", 53, None, true, false);
+        assert_eq!(err_plain.raw_os_error(), Some(libc::EADDRNOTAVAIL));
+    }
+
+    #[test]
+    fn macos_loopback_only_udp_binds_lo0_interface_and_uses_short_dns_idle() {
+        use std::time::Duration;
+
+        assert_eq!(super::udp_idle_timeout(53, 53), Duration::from_secs(10));
+        assert_eq!(super::udp_idle_timeout(53, 8053), Duration::from_secs(10));
+        assert_eq!(super::udp_idle_timeout(5353, 53), Duration::from_secs(10));
+        assert_eq!(super::udp_idle_timeout(8080, 80), Duration::from_secs(60));
+
+        assert!(super::binds_host_dns_port(&[(super::Binding { host_ip: String::new(), host_port: 53, container_port: 53, proto: "udp".into() }, "0.0.0.0".into(), 53)]));
+        assert!(super::binds_host_dns_port(&[(super::Binding { host_ip: "127.0.0.1".into(), host_port: 53, container_port: 53, proto: "udp".into() }, "127.0.0.1".into(), 53)]));
+        assert!(super::binds_host_dns_port(&[(super::Binding { host_ip: "::1".into(), host_port: 53, container_port: 53, proto: "udp".into() }, "::1".into(), 53)]));
+        assert!(!super::binds_host_dns_port(&[(super::Binding { host_ip: "192.168.1.5".into(), host_port: 53, container_port: 53, proto: "udp".into() }, "192.168.1.5".into(), 53)]));
+        assert!(!super::binds_host_dns_port(&[(super::Binding { host_ip: "127.0.0.1".into(), host_port: 5353, container_port: 53, proto: "udp".into() }, "127.0.0.1".into(), 5353)]));
+
+        let before = super::HOST_PORT_53_BINDS.load(Ordering::Relaxed);
+        let guard = super::HostPort53Guard::acquire();
+        assert!(super::host_port_53_published());
+        assert_eq!(super::HOST_PORT_53_BINDS.load(Ordering::Relaxed), before + 1);
+        drop(guard);
+        assert_eq!(super::HOST_PORT_53_BINDS.load(Ordering::Relaxed), before);
+
+        #[cfg(target_os = "macos")]
+        {
+            use std::net::UdpSocket;
+            use std::os::fd::AsRawFd;
+
+            let lo0 = unsafe { libc::if_nametoindex(c"lo0".as_ptr()) };
+            assert_ne!(lo0, 0);
+
+            let bound_if = |fd: std::os::fd::RawFd, is_v6: bool| -> libc::c_uint {
+                let mut val: libc::c_uint = 0;
+                let mut len = std::mem::size_of::<libc::c_uint>() as libc::socklen_t;
+                let (lvl, opt) = if is_v6 { (libc::IPPROTO_IPV6, libc::IPV6_BOUND_IF) } else { (libc::IPPROTO_IP, libc::IP_BOUND_IF) };
+                // SAFETY: reading an int socket option from a descriptor we own.
+                assert_eq!(unsafe { libc::getsockopt(fd, lvl, opt, (&mut val as *mut libc::c_uint).cast(), &mut len) }, 0);
+                val
+            };
+
+            let fd_lo = super::bind_socket_on_if("0.0.0.0:0".parse().unwrap(), true, true).unwrap();
+            assert_eq!(bound_if(fd_lo.as_raw_fd(), false), lo0);
+            drop(fd_lo);
+
+            let fd_any = super::bind_socket_on_if("0.0.0.0:0".parse().unwrap(), true, false).unwrap();
+            assert_eq!(bound_if(fd_any.as_raw_fd(), false), 0);
+            drop(fd_any);
+
+            if let Ok(fd_v6) = super::bind_socket_on_if("[::]:0".parse().unwrap(), true, true) {
+                assert_eq!(bound_if(fd_v6.as_raw_fd(), true), lo0);
+            }
+
+            // Calling `udp_loop_with` with `loopback_only = true` also enforces `IP_BOUND_IF = lo0`,
+            // serves loopback peers, and reaps idle DNS sessions after `idle`.
+            let sock = UdpSocket::bind("0.0.0.0:0").unwrap();
+            sock.set_nonblocking(true).unwrap();
+            let port = sock.local_addr().unwrap().port();
+            assert_eq!(bound_if(sock.as_raw_fd(), false), 0);
+            let (wake_r, wake_w) = super::pipe().unwrap();
+            let sock_ref = sock.try_clone().unwrap();
+            let (closed_tx, closed_rx) = std::sync::mpsc::channel::<()>();
+            let t = std::thread::spawn(move || {
+                super::udp_loop_with(&sock_ref, &wake_r, true, Duration::from_millis(120), |s, peer| {
+                    use std::os::unix::net::UnixStream;
+                    let (a, b) = UnixStream::pair()?;
+                    let to_guest = std::fs::File::from(std::os::fd::OwnedFd::from(a));
+                    let mut from_guest = std::fs::File::from(std::os::fd::OwnedFd::from(b));
+                    let reply = s.try_clone()?;
+                    let closed_tx = closed_tx.clone();
+                    let reader = std::thread::spawn(move || {
+                        use std::io::Read as _;
+                        let mut len = [0u8; 2];
+                        let mut data = vec![0u8; 65_536];
+                        while from_guest.read_exact(&mut len).is_ok() {
+                            let n = u16::from_be_bytes(len) as usize;
+                            if from_guest.read_exact(&mut data[..n]).is_err() {
+                                break;
+                            }
+                            let _ = reply.send_to(&data[..n], peer);
+                        }
+                        let _ = closed_tx.send(());
+                    });
+                    Ok(super::UdpSession {
+                        to_guest,
+                        last: std::time::Instant::now(),
+                        reader,
+                        _guest: None,
+                    })
+                });
+            });
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while bound_if(sock.as_raw_fd(), false) != lo0 && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(bound_if(sock.as_raw_fd(), false), lo0);
+            let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+            client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            client.send_to(b"dns-q", ("127.0.0.1", port)).unwrap();
+            let mut reply_buf = [0u8; 16];
+            let (rn, _) = client.recv_from(&mut reply_buf).unwrap();
+            assert_eq!(&reply_buf[..rn], b"dns-q");
+            closed_rx.recv_timeout(Duration::from_secs(2)).expect("idle DNS UDP session should be reaped");
+            drop(wake_w);
+            t.join().unwrap();
+        }
     }
 }

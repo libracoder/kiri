@@ -202,7 +202,7 @@ fn job(sock: OwnedFd, chan: OwnedFd, running: &[(&str, libc::pid_t)], paths: &Pa
             match spec.op {
                 copy_op::IN => copy_in(&mut conn, &spec, &mounts),
                 copy_op::OUT | copy_op::STAT => copy_out(&mut conn, &spec),
-                copy_op::EXPORT => export(&mut conn),
+                copy_op::EXPORT => export(&mut conn, &spec),
                 op => Err(io::Error::new(io::ErrorKind::InvalidInput, format!("unknown copy op {op}"))),
             }
         }
@@ -687,6 +687,87 @@ impl<R: Read> Read for Chunks<R> {
     }
 }
 
+const PACED_CHUNK: usize = 64 * 1024;
+
+/// A `copy_flags::PACED` writer: sends the archive in `<= 64 KiB` chunks
+/// (`len: u32 LE | bytes`), waiting for a 1-byte credit ack from the host
+/// before sending each chunk, then an empty chunk at the end (#874).
+struct PacedWriter<S> {
+    conn: S,
+    buf: Vec<u8>,
+}
+
+impl<S: Read + Write> PacedWriter<S> {
+    fn new(conn: S) -> Self {
+        let mut buf = Vec::with_capacity(4 + PACED_CHUNK);
+        buf.resize(4, 0);
+        Self { conn, buf }
+    }
+
+    fn flush_chunk(&mut self) -> io::Result<()> {
+        let payload = self.buf.len() - 4;
+        if payload == 0 {
+            return Ok(());
+        }
+        let mut ack = [0u8; 1];
+        self.conn.read_exact(&mut ack)?;
+        self.buf[..4].copy_from_slice(&(payload as u32).to_le_bytes());
+        self.conn.write_all(&self.buf)?;
+        self.buf.truncate(4);
+        Ok(())
+    }
+
+    fn finish(mut self) -> io::Result<()> {
+        self.flush_chunk()?;
+        let mut ack = [0u8; 1];
+        self.conn.read_exact(&mut ack)?;
+        self.conn.write_all(&0u32.to_le_bytes())?;
+        Ok(())
+    }
+}
+
+impl<S: Read + Write> Write for PacedWriter<S> {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        if data.is_empty() {
+            return Ok(0);
+        }
+        if self.buf.len() - 4 == PACED_CHUNK {
+            self.flush_chunk()?;
+        }
+        let room = PACED_CHUNK - (self.buf.len() - 4);
+        let n = data.len().min(room);
+        self.buf.extend_from_slice(&data[..n]);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.flush_chunk()?;
+        self.conn.flush()
+    }
+}
+
+fn stream_tar(conn: &mut fs::File, paced: bool, build: impl FnOnce(&mut tar::Builder<&mut dyn Write>) -> io::Result<()>) -> io::Result<()> {
+    if paced {
+        let mut w = PacedWriter::new(&mut *conn);
+        {
+            let mut b = tar::Builder::new(&mut w as &mut dyn Write);
+            b.follow_symlinks(false);
+            build(&mut b)?;
+            b.finish()?;
+        }
+        w.finish()
+    } else {
+        let mut w = BufWriter::with_capacity(256 * 1024, &mut *conn);
+        {
+            let mut b = tar::Builder::new(&mut w as &mut dyn Write);
+            b.follow_symlinks(false);
+            build(&mut b)?;
+            b.finish()?;
+        }
+        w.flush()
+    }
+}
+
 /// Answers with the path's metadata; for `OUT` an archive of it follows.
 fn copy_out(conn: &mut fs::File, spec: &CopySpec<'_>) -> io::Result<()> {
     // Docker archives a path with its "." and ".." resolved by name, but
@@ -717,18 +798,14 @@ fn copy_out(conn: &mut fs::File, spec: &CopySpec<'_>) -> io::Result<()> {
     if spec.op == copy_op::STAT {
         return Ok(());
     }
-    let mut w = BufWriter::with_capacity(256 * 1024, &mut *conn);
-    {
-        let mut b = tar::Builder::new(&mut w);
-        b.follow_symlinks(false);
+    let paced = spec.flags & copy_flags::PACED != 0;
+    stream_tar(conn, paced, |b| {
         if meta.is_dir() {
-            append_tree(&mut b, path, std::path::Path::new(name))?;
+            append_tree(b, path, std::path::Path::new(name))
         } else {
-            append_one(&mut b, path, std::path::Path::new(name), &meta)?;
+            append_one(b, path, std::path::Path::new(name), &meta)
         }
-        b.finish()?;
-    }
-    w.flush()
+    })
 }
 
 /// The last component of `path` as Docker names it: "." and ".." are kept,
@@ -890,20 +967,17 @@ fn done(conn: &mut fs::File) -> io::Result<()> {
 
 /// `docker export`: everything under `/` (the chroot), entries named
 /// without a leading slash, as Docker writes them.
-fn export(conn: &mut fs::File) -> io::Result<()> {
+fn export(conn: &mut fs::File, spec: &CopySpec<'_>) -> io::Result<()> {
     done(conn)?;
-    let mut w = BufWriter::with_capacity(256 * 1024, &mut *conn);
-    {
-        let mut b = tar::Builder::new(&mut w);
-        b.follow_symlinks(false);
+    let paced = spec.flags & copy_flags::PACED != 0;
+    stream_tar(conn, paced, |b| {
         let mut children: Vec<_> = fs::read_dir("/")?.flatten().collect();
         children.sort_by_key(|e| e.file_name());
         for e in children {
-            append_tree(&mut b, &e.path(), std::path::Path::new(&e.file_name()))?;
+            append_tree(b, &e.path(), std::path::Path::new(&e.file_name()))?;
         }
-        b.finish()?;
-    }
-    w.flush()
+        Ok(())
+    })
 }
 
 /// An overlay whiteout: a 0:0 character device.
@@ -1645,5 +1719,38 @@ mod tests {
         assert_eq!(after.mode() & 0o777, 0o640);
 
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn paced_writer_waits_for_credit_and_bounds_chunks_to_64kib() {
+        use std::os::unix::net::UnixStream;
+        let (mut host, guest) = UnixStream::pair().unwrap();
+        let data = vec![0x5a_u8; PACED_CHUNK + 1234];
+        let expected = data.clone();
+        let t = std::thread::spawn(move || {
+            let mut w = PacedWriter::new(guest);
+            w.write_all(&data).unwrap();
+            w.finish().unwrap();
+        });
+
+        let mut received = Vec::new();
+        let mut sizes = Vec::new();
+        loop {
+            host.write_all(&[1]).unwrap();
+            let mut hdr = [0u8; 4];
+            host.read_exact(&mut hdr).unwrap();
+            let len = u32::from_le_bytes(hdr) as usize;
+            if len == 0 {
+                break;
+            }
+            assert!(len <= PACED_CHUNK, "chunk {len} exceeded {PACED_CHUNK}");
+            sizes.push(len);
+            let mut chunk = vec![0u8; len];
+            host.read_exact(&mut chunk).unwrap();
+            received.extend_from_slice(&chunk);
+        }
+        t.join().unwrap();
+        assert_eq!(sizes, vec![PACED_CHUNK, 1234]);
+        assert_eq!(received, expected);
     }
 }
