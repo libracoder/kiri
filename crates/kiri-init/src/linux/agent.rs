@@ -703,48 +703,68 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
                         let mac = kiri_proto::net_opts::values(n.opts, kiri_proto::net_opts::MAC).next().and_then(net::parse_mac);
                         let v6 = net::Ip6::from_opts(n.opts);
                         let plug = net::Plug::from_opts(n.opts);
-                        let attached = net::attach(&mut bridges, n.bridge, &host_if, pid, num, n.ip, n.prefix, n.gateway, mac, v6, plug)
+                        let is_user = n.bridge != "kiri0";
+                        let attached = net::attach(&mut bridges, n.bridge, &host_if, pid, num, n.ip, n.prefix, n.gateway, mac, v6, plug).and_then(|()| {
+                            if !is_user {
+                                if !plug.no_ipv4 && dns.relay {
+                                    dns.serve_or_warn(n.bridge, n.gateway);
+                                }
+                                return Ok(());
+                            }
                             // A gateway that won't take the listener doesn't
                             // stop the connect: names answer at 127.0.0.11 in
                             // the container (dns.rs `serve_or_warn`, #477).
-                            .map(|()| {
-                                if !plug.no_ipv4 {
-                                    dns.serve_or_warn(n.bridge, n.gateway);
-                                }
-                            })
-                            .and_then(|()| std::fs::File::open(format!("/proc/{pid}/ns/net")).and_then(|ns| dns.serve_in(&ns, pid, n.ip, n.bridge)));
+                            if !plug.no_ipv4 {
+                                dns.serve_or_warn(n.bridge, n.gateway);
+                            }
+                            let res = std::fs::File::open(format!("/proc/{pid}/ns/net")).and_then(|ns| dns.serve_in(&ns, pid, n.bridge));
+                            if res.is_err() {
+                                let _ = net::detach(&host_if);
+                            }
+                            res
+                        });
                         match attached {
                             Ok(()) => {
-                                if let Some(name) = kiri_proto::net_opts::values(n.opts, kiri_proto::net_opts::NETWORK).next() {
-                                    dns.name_network(n.bridge, name);
-                                }
-                                if !plug.no_ipv4 {
-                                    dns.register(n.bridge, n.dns_names.iter(), n.ip);
-                                }
-                                if let Some(v) = v6 {
-                                    dns.register6(n.bridge, n.dns_names.iter(), n.ip, v.ip);
+                                if is_user {
+                                    if let Some(name) = kiri_proto::net_opts::values(n.opts, kiri_proto::net_opts::NETWORK).next() {
+                                        dns.name_network(n.bridge, name);
+                                    }
+                                    if !plug.no_ipv4 {
+                                        dns.register(n.bridge, n.dns_names.iter(), n.ip);
+                                    }
+                                    if let Some(v) = v6 {
+                                        dns.register6(n.bridge, n.dns_names.iter(), n.ip, v.ip);
+                                    }
                                 }
                                 if let Some(p) = procs.get_mut(&pid) {
-                                    p.run.dns_entries.push((n.bridge.to_owned(), n.ip));
+                                    if is_user {
+                                        record_dns_entry(&mut p.run, n.bridge, n.ip);
+                                    }
                                     p.run.uplinks.retain(|u| u.veth != host_if);
                                     p.run.uplinks.extend(net::Uplink::of(&host_if, ifname, n.gateway, v6, plug));
-                                    p.run.veths.push(host_if.clone());
+                                    p.run.veths.retain(|(iface, _)| iface != ifname);
+                                    p.run.veths.push((ifname.to_owned(), host_if.clone()));
                                 }
                                 // A user network's names come from the embedded
                                 // DNS, which now answers in the container: its
                                 // resolv.conf names it from here on (#449).
-                                if n.bridge != "kiri0" && !plug.no_ipv4 {
+                                if is_user {
                                     let upstream = dhcp.as_ref().and_then(|d| d.lease.as_ref()).map_or(&host_dns[..], |l| &l.dns);
                                     let is_kiri = |a: [u8; 4]| upstream.contains(&a) || dns.serves_at(a) || a == [1, 1, 1, 1];
                                     match container::use_embedded_dns(id, is_kiri) {
                                         Ok(Some(servers)) if !servers.is_empty() => {
-                                            if let Some(owner) = dns.owner_of(pid) {
-                                                dns.set_upstream(owner, servers);
+                                            dns.set_container_upstream(pid, servers.clone());
+                                            dns.set_upstream(n.ip, servers);
+                                        }
+                                        Ok(_) => {
+                                            if let Some(servers) = dns.container_upstream(pid) {
+                                                dns.set_upstream(n.ip, servers);
                                             }
                                         }
-                                        Ok(_) => {}
                                         Err(e) => eprintln!("kiri-init: {id}: resolv.conf: {e}"),
                                     }
+                                } else {
+                                    attach_kiri0_upstream(&mut dns, procs, pid, n.bridge, n.ip);
                                 }
                                 Msg::Ack.encode(&mut out)
                             }
@@ -791,12 +811,15 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
                 Ok(Msg::NetDetach { id, ifname, bridge, ip }) => match netns_pid(procs, id) {
                     Some(pid) => {
                         let num: u32 = ifname.strip_prefix("eth").and_then(|v| v.parse().ok()).unwrap_or(1);
+                        let host_if = procs
+                            .get(&pid)
+                            .and_then(|p| p.run.veth_for(ifname).map(str::to_owned))
+                            .unwrap_or_else(|| extra_veth(id, num));
                         dns.unregister(bridge, ip);
                         dns.leave(pid, bridge);
-                        let host_if = extra_veth(id, num);
                         if let Some(p) = procs.get_mut(&pid) {
                             p.run.dns_entries.retain(|(b, a)| !(b == bridge && *a == ip));
-                            p.run.veths.retain(|v| *v != host_if);
+                            p.run.veths.retain(|(iface, _)| iface != ifname);
                         }
                         match net::detach(&host_if) {
                             Ok(()) => {
@@ -919,6 +942,25 @@ fn live_pid(procs: &HashMap<libc::pid_t, Proc>, id: &str) -> Option<libc::pid_t>
 /// and is not yet entered: its child has perhaps not joined it, and
 /// `/proc/<pid>/ns/net` could still be the host's. Answered as for a
 /// container that is not running.
+/// Records `(bridge, ip)` once in `run.dns_entries` so container exit (or
+/// `NetDetach`) cleans up any names and per-IP DNS upstreams registered for it.
+fn record_dns_entry(run: &mut Process, bridge: &str, ip: [u8; 4]) {
+    if !run.dns_entries.iter().any(|(b, a)| b == bridge && *a == ip) {
+        run.dns_entries.push((bridge.to_owned(), ip));
+    }
+}
+
+/// Applies the container's `--dns` upstreams to a newly attached `kiri0`
+/// address and records it in `dns_entries` so exit without `NetDetach` drops it.
+fn attach_kiri0_upstream(dns: &mut super::dns::Dns, procs: &mut HashMap<libc::pid_t, Proc>, pid: libc::pid_t, bridge: &str, ip: [u8; 4]) {
+    if let Some(servers) = dns.container_upstream(pid) {
+        dns.set_upstream(ip, servers);
+        if let Some(p) = procs.get_mut(&pid) {
+            record_dns_entry(&mut p.run, bridge, ip);
+        }
+    }
+}
+
 /// Whether a `DnsRename` may change names: `ip` on `bridge` is a live
 /// container's own entry, and the bridge is one of Kiri's user networks.
 fn rename_allowed(procs: &HashMap<libc::pid_t, Proc>, id: &str, bridge: &str, ip: [u8; 4]) -> bool {
@@ -1336,6 +1378,27 @@ mod running_tests {
     }
 
     #[test]
+    fn kiri0_upstream_is_recorded_in_dns_entries_and_cleaned_up_on_exit() {
+        let kiri0_ip = [172, 17, 0, 5];
+        let mut dns = super::super::dns::Dns::default();
+        let mut procs = HashMap::new();
+        procs.insert(100, new_proc(Process::for_test("c1", 100), 0, 0));
+        dns.set_container_upstream(100, vec![[8, 8, 8, 8]]);
+
+        super::attach_kiri0_upstream(&mut dns, &mut procs, 100, "kiri0", kiri0_ip);
+        assert_eq!(procs[&100].run.dns_entries, [("kiri0".to_owned(), kiri0_ip)]);
+        assert_eq!(dns.ip_upstream(kiri0_ip), Some(vec![[8, 8, 8, 8]]));
+        assert!(!rename_allowed(&procs, "c1", "kiri0", kiri0_ip), "kiri0 stays disallowed for DnsRename");
+
+        let (_host, mut conn) = pipe();
+        let mut exited = procs.remove(&100).unwrap();
+        exited.exited = Some((0, 0));
+        super::finish(&mut conn, &mut dns, &procs, exited, true).unwrap();
+        assert_eq!(dns.ip_upstream(kiri0_ip), None, "container exit cleans up kiri0 per-IP upstream");
+        assert_eq!(dns.container_upstream(100), None);
+    }
+
+    #[test]
     fn a_restarted_container_is_found_never_its_exited_run() {
         // Each map hashes with its own seed, so 20 of them walk the two
         // entries in both orders.
@@ -1691,6 +1754,22 @@ mod clock_tests {
         // An hour behind, after the Mac slept.
         assert!(off_by_more(now - 3_600_000_000_000, now, 250_000_000));
         assert!(off_by_more(now + 300_000_000, now, 250_000_000));
+    }
+}
+
+#[cfg(test)]
+mod veth_tests {
+    use super::extra_veth;
+    use super::super::container::Process;
+
+    #[test]
+    fn detach_looks_up_first_kv_and_fallback_kx_veths() {
+        let mut p = Process::for_test("0123456789abcdef", 10);
+        p.veths.push(("eth0".into(), "kv0123456780001".into()));
+        p.veths.push(("eth1".into(), extra_veth(&p.id, 1)));
+        assert_eq!(p.veth_for("eth0"), Some("kv0123456780001"));
+        assert_eq!(p.veth_for("eth1"), Some("kx0123456781"));
+        assert_eq!(p.veth_for("eth2"), None);
     }
 }
 

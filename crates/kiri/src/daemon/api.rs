@@ -2967,14 +2967,19 @@ fn list(req: &Request, engine: &Engine) -> Result<Value, Error> {
             return None;
         }
         let labels = if c.spec.labels.is_object() { c.spec.labels.clone() } else { json!({}) };
-        let net = networks.iter().find(|n| n.name == c.spec.network_mode || n.id == c.spec.network_mode || (c.spec.network_mode == "default" && n.name == "bridge"));
+        let first = (!c.spec.left_all_networks)
+            .then(|| networks.iter().find(|n| n.name == c.spec.network_mode || n.id == c.spec.network_mode || (c.spec.network_mode == "default" && n.name == "bridge")))
+            .flatten();
         let keep = f.any("id", |v| c.id.starts_with(v))
             && f.name(&c.name)
             && f.labels(&labels)
             && f.any("status", |v| v == state_word(c))
             && f.any("exited", |v| c.status == Status::Exited && v.parse() == Ok(c.exit_code))
             && ancestors.as_ref().is_none_or(|ids| ids.contains(&c.spec.image_id))
-            && f.any("network", |v| net.is_some_and(|n| n.name == v || n.id.starts_with(v)))
+            && f.any("network", |v| {
+                first.is_some_and(|n| n.name == v || n.id.starts_with(v))
+                    || c.spec.extra_networks.iter().any(|x| networks.iter().find(|n| n.name == x.name).is_some_and(|n| n.name == v || n.id.starts_with(v)))
+            })
             && f.any("volume", |v| c.spec.volumes.iter().chain(&c.spec.anon_volumes).any(|n| n == v) || c.spec.mount_info.iter().any(|m| m["Destination"] == v || m["Source"] == v))
             && f.any("health", |v| v == health.get(&c.id).map_or("none", |h| h.status.as_str()));
         if !keep {
@@ -6457,9 +6462,19 @@ mod leave_first_network_tests {
         let networks: Vec<super::super::network::Network> = engine.lock_net().all().to_vec();
         assert_eq!(names(&container_inspect(&engine, &id).unwrap()["NetworkSettings"]["Networks"]), ["probe-net"]);
         assert_eq!(names(&engine.with(&id, |c| network_settings(c, &networks)).unwrap()["Networks"]), ["probe-net"]);
+        let filter_has = |net: &str| {
+            let filters = format!(r#"{{"network":["{net}"]}}"#);
+            let req = Request::internal("GET", "/containers/json", &[("all", "1"), ("filters", &filters)], Vec::new());
+            list(&req, &engine).unwrap().as_array().unwrap().iter().any(|r| r["Id"] == id)
+        };
+        assert!(filter_has("probe-net"));
+        assert!(!filter_has("bridge"));
         engine.disconnect("probe-net", &id).unwrap();
         assert!(names(&container_inspect(&engine, &id).unwrap()["NetworkSettings"]["Networks"]).is_empty());
         assert!(names(&engine.with(&id, |c| network_settings(c, &networks)).unwrap()["Networks"]).is_empty());
+        assert!(!filter_has("probe-net"));
+        assert!(!filter_has("none"));
+        assert!(engine.network_members("none").is_empty());
         drop(engine);
         let _ = std::fs::remove_dir_all(root);
     }

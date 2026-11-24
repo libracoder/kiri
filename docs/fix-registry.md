@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #810 Networks: disconnect and reconnect a running container's first network cleanly at Layer 2/3, DNS, and port forwarding (unreleased)
+- Fixes: #789 A running container can't leave its first network, so its network aliases can't be changed (follow-up to #418)
+- Caused: none known
+- Caused by: -
+- Check: `leave-first-running-disconnect`, `leave-first-running-reconnect`, `leave-first-running-promote`
+
 ### #410 Import: containers keep the files they wrote outside their volumes (unreleased)
 - Fixes: #410 Docker Desktop import drops each container's writable layer (data outside volumes is lost); docker diff fails with chroot error
 - Caused: none known

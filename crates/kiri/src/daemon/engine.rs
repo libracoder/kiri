@@ -597,22 +597,23 @@ impl Spec {
         self.network_mode == network || (network == "bridge" && matches!(self.network_mode.as_str(), "default" | ""))
     }
 
-    /// Leaves the first network of a container that is not running, as
+    /// Leaves the first network of a container (running or stopped), as
     /// `docker network disconnect` does on Docker for any of its networks.
     /// Kiri keeps the first network apart (`network_mode`, `aliases`,
     /// `ipv4_address`, `ipv6_address`, `mac_address`) because only it gives
     /// the default route and the main address, so one of the others takes
     /// its place, with its own aliases, fixed addresses and MAC: none of the
     /// left network's settings follow, or a fixed `--ip` would be asked for
-    /// on a network it does not belong to. The one picked is the one Docker
-    /// gives the default route to: a network that reaches outside before an
-    /// `internal` one (which gives no default route), then by name, as
-    /// libnetwork orders a container's endpoints when none has a gateway
-    /// priority (Kiri keeps none), and as create picks the primary of
-    /// several endpoints. `internal` says whether a network is internal.
-    /// With no other network it is left with none, as with `--network none`.
+    /// on a network it does not belong to. The one picked is the first
+    /// remaining network in attachment order that reaches outside (not
+    /// `internal`), or the first one if every remaining network is
+    /// `internal`, matching `kiri-init`'s `route_holders` (which keeps the
+    /// first-plugged non-internal uplink on the default route) and
+    /// `start_on_vm` (which attaches `network_mode` then `extra_networks` in
+    /// order). `internal` says whether a network is internal. With no other
+    /// network it is left with none, as with `--network none`.
     pub fn leave_first_network(&mut self, internal: impl Fn(&str) -> bool) {
-        let next = self.extra_networks.iter().enumerate().min_by(|(_, a), (_, b)| internal(&a.name).cmp(&internal(&b.name)).then_with(|| a.name.cmp(&b.name))).map(|(i, _)| i);
+        let next = self.extra_networks.iter().position(|x| !internal(&x.name)).or_else(|| (!self.extra_networks.is_empty()).then_some(0));
         match next {
             Some(i) => {
                 let x = self.extra_networks.remove(i);
@@ -871,6 +872,11 @@ pub struct Container {
     pub paused: bool,
     /// Addresses on `spec.extra_networks` while running, as (network, ip).
     pub extra_ips: Vec<(String, [u8; 4])>,
+    /// The interface `spec.network_mode` is plugged in as while running, as
+    /// `n` for `eth{n}`: `Some(0)` at start on a bridge network, or the
+    /// promoted network's number after leaving the first; `None` when stopped
+    /// or after leaving all networks.
+    pub first_if: Option<u32>,
     /// The interface each extra network is plugged in as while running,
     /// as (network, n) for `eth{n}`. A disconnect leaves a gap, so the
     /// number can't be worked out from the network's place in the list.
@@ -1000,6 +1006,27 @@ struct Records {
     /// What is in `containers.json` after the read ([`fingerprint`]): what
     /// was read, or the recovered list written over the damaged one.
     on_disk: Option<(usize, u64)>,
+}
+
+/// Lowest unused `eth{n}` interface index at or above `min`.
+fn free_eth(c: &Container, min: u32) -> u32 {
+    (min..).find(|n| c.first_if != Some(*n) && !c.extra_ifs.iter().any(|(_, x)| x == n)).expect("a free number")
+}
+
+/// Reconstructs port bindings to target a newly promoted network IP while
+/// preserving ephemeral host ports already bound for `0` entries.
+fn rebind_bindings(ports: &[super::ports::Binding], bound: &[(super::ports::Binding, String, u16)]) -> Vec<super::ports::Binding> {
+    ports
+        .iter()
+        .map(|b| {
+            let host_port = if b.host_port == 0 {
+                bound.iter().find(|(bb, ..)| bb == b).map_or(0, |(_, _, p)| *p)
+            } else {
+                b.host_port
+            };
+            super::ports::Binding { host_port, ..b.clone() }
+        })
+        .collect()
 }
 
 /// Length and hash of a file's bytes, enough to tell whether it is the one
@@ -2357,6 +2384,7 @@ impl Engine {
                 start_owed: false,
                 paused: false,
                 extra_ips: Vec::new(),
+                first_if: None,
                 extra_ifs: Vec::new(),
                 ip6: None,
                 extra_ip6s: Vec::new(),
@@ -2624,6 +2652,7 @@ impl Engine {
                         for (net, ip) in std::mem::take(&mut c.extra_ips) {
                             self.release_ip(&net, ip);
                         }
+                        c.first_if = None;
                         c.extra_ifs.clear();
                         self.release_ip6s(c);
                         c.paused = false;
@@ -2752,6 +2781,7 @@ impl Engine {
                     for (net, ip) in std::mem::take(&mut c.extra_ips) {
                         self.release_ip(&net, ip);
                     }
+                    c.first_if = None;
                     c.extra_ifs.clear();
                     self.release_ip6s(c);
                     c.paused = false;
@@ -3257,6 +3287,7 @@ impl Engine {
                 start_owed: false,
                 paused: false,
                 extra_ips: Vec::new(),
+                first_if: None,
                 extra_ifs: Vec::new(),
                 ip6: None,
                 extra_ip6s: Vec::new(),
@@ -3569,6 +3600,7 @@ impl Engine {
         if ip != [0; 4] {
             if let Some(c) = self.lock().containers.get_mut(&id) {
                 c.ip = Some(ip);
+                c.first_if = Some(0);
             }
         }
         // A restarted container keeps its writable layer, so only --rm deletes it.
@@ -3677,8 +3709,20 @@ impl Engine {
         }
         if flags & (run_flags::NET_HOST | run_flags::NET_NONE) == 0 && joined.is_none() {
             for (i, extra) in spec.extra_networks.iter().enumerate() {
-                if let Err(e) = self.attach_extra(&vm, &id, i as u32 + 1, extra) {
-                    crate::diag::warn!("container not attached to a network", id = &id[..12], network = extra.name, error = format!("{e:?}"));
+                let n = i as u32 + 1;
+                let sync = self.names_sync(&id);
+                let _order = sync.as_ref().map(|m| m.lock().unwrap_or_else(|e| e.into_inner()));
+                match self.attach_network(&vm, &id, n, extra, false) {
+                    Ok((net, ip, ip6)) => {
+                        if let Some(c) = self.lock().containers.get_mut(&id) {
+                            c.extra_ips.push((net.name.clone(), ip));
+                            c.extra_ifs.push((net.name.clone(), n));
+                            if let Some(a) = ip6 {
+                                c.extra_ip6s.push((net.name, a));
+                            }
+                        }
+                    }
+                    Err(e) => crate::diag::warn!("container not attached to a network", id = &id[..12], network = extra.name, error = format!("{e:?}")),
                 }
             }
         }
@@ -4000,6 +4044,8 @@ impl Engine {
             for (net, ip) in std::mem::take(&mut c.extra_ips) {
                 self.release_ip(&net, ip);
             }
+            c.first_if = None;
+            c.extra_ifs.clear();
             self.release_ip6s(c);
         }
         if !spec.auto_remove && st.containers.get(id).is_some_and(|c| c.vm_stopped) {
@@ -4128,6 +4174,7 @@ impl Engine {
         let c = st.containers.get_mut(id).unwrap();
         c.status = Status::Running;
         c.ip = Some(ip);
+        c.first_if = Some(0);
     }
 
     /// For the Finder view (macOS).
@@ -4227,7 +4274,7 @@ impl Engine {
         let canonical = self.lock_networks().find(network).map(|n| n.name.clone()).unwrap_or_default();
         self.each(|c| {
             let theirs = self.lock_networks().find(&c.spec.network_mode).map(|n| n.name.clone()).unwrap_or_default();
-            if theirs == canonical {
+            if !c.spec.left_all_networks && theirs == canonical {
                 return Some((c.id.clone(), c.name.clone(), c.ip, c.ip6));
             }
             c.spec.extra_networks.iter().any(|x| x.name == canonical).then(|| {
@@ -4368,13 +4415,20 @@ impl Engine {
     }
 
     /// SIGTERM, then SIGKILL after `timeout` if it is still running.
-    /// Plugs a running container into one more network as `eth{n}`.
-    fn attach_extra(&self, vm: &VmLink, id: &str, n: u32, extra: &ExtraNetwork) -> Result<(), Error> {
-        // Held from the name read to the network being recorded, so a rename
-        // lands before (and the guest then has the new name) or after (and
-        // renames this network too).
-        let sync = self.names_sync(id);
-        let _order = sync.as_ref().map(|m| m.lock().unwrap_or_else(|e| e.into_inner()));
+    fn release_attached_ips(&self, net_name: &str, ip: Option<[u8; 4]>, ip6: Option<[u8; 16]>) {
+        if let Some(ip) = ip {
+            self.release_ip(net_name, ip);
+        }
+        if let Some(a) = ip6 {
+            self.lock_networks().release6(net_name, a);
+        }
+    }
+
+    /// Allocates addresses and plugs a running container into `extra` as
+    /// `eth{n}`. Caller must hold `names_sync` for `id`. Does not mutate
+    /// container state; returns `(net, ip, ip6)` so the caller can commit them
+    /// or roll back if the container exited or ports could not be bound.
+    fn attach_network(&self, vm: &VmLink, id: &str, n: u32, extra: &ExtraNetwork, is_first: bool) -> Result<(super::network::Network, [u8; 4], Option<[u8; 16]>), Error> {
         let net = {
             let mut nets = self.lock_networks();
             nets.settle(&extra.name).map_err(Error::Conflict)?;
@@ -4390,17 +4444,31 @@ impl Engine {
                 self.lock_networks().allocate_avoiding(&net.name, &avoid).ok_or_else(|| Error::Conflict(format!("no free address left on network {}", net.name)))?
             }
         };
-        let off6 = self.lock().containers.get(id).is_some_and(|c| c.spec.ipv6_disabled(&format!("eth{n}")));
+        let (off6, names) = {
+            let st = self.lock();
+            let Some(c) = st.containers.get(id).filter(|c| c.status == Status::Running) else {
+                drop(st);
+                self.release_ip(&net.name, ip);
+                return Err(Error::Conflict(format!("Container {} is not running", &id[..12])));
+            };
+            let off6 = c.spec.ipv6_disabled(&format!("eth{n}"));
+            let names = if net.builtin() {
+                Vec::new()
+            } else {
+                let host = if is_first && !c.spec.hostname.is_empty() { c.spec.hostname.clone() } else { c.short_id().to_owned() };
+                let mut v = vec![c.name.clone(), host];
+                v.extend(extra.aliases.iter().cloned());
+                v
+            };
+            (off6, names)
+        };
         let ip6 = match if off6 { Ok(None) } else { self.allocate_ip6(&net, &extra.ipv6_address) } {
             Ok(a) => a,
             Err(e) => {
-                self.lock_networks().release(&net.name, ip);
+                self.release_ip(&net.name, ip);
                 return Err(e);
             }
         };
-        let (name, hostname) = self.lock().containers.get(id).map(|c| (c.name.clone(), c.short_id().to_owned())).unwrap_or_default();
-        let mut names = vec![name, hostname];
-        names.extend(extra.aliases.iter().cloned());
         let mut opts: Vec<String> = if extra.mac_address.is_empty() { Vec::new() } else { vec![format!("{}={}", kiri_proto::net_opts::MAC, extra.mac_address)] };
         if let (Some(a), Some(v)) = (ip6, &net.v6) {
             opts.push(format!("{}={}/{}", kiri_proto::net_opts::IP6, super::network::ip6_str(a), v.prefix));
@@ -4414,21 +4482,10 @@ impl Engine {
         }
         opts.push(format!("{}={}", kiri_proto::net_opts::NETWORK, net.name));
         if let Err(e) = vm.net_attach(id, n, &net.bridge, ip, net.prefix, net.gateway, &names, &opts) {
-            let mut nets = self.lock_networks();
-            nets.release(&net.name, ip);
-            if let Some(a) = ip6 {
-                nets.release6(&net.name, a);
-            }
+            self.release_attached_ips(&net.name, Some(ip), ip6);
             return Err(Error::Io(e));
         }
-        if let Some(c) = self.lock().containers.get_mut(id) {
-            c.extra_ips.push((net.name.clone(), ip));
-            c.extra_ifs.push((net.name.clone(), n));
-            if let Some(a) = ip6 {
-                c.extra_ip6s.push((net.name.clone(), a));
-            }
-        }
-        Ok(())
+        Ok((net, ip, ip6))
     }
 
     /// `docker network connect`.
@@ -4436,57 +4493,93 @@ impl Engine {
         // After the start, as when the guest answered nothing else during
         // it, so this and the start's own networks are numbered in turn.
         let id = self.resolve_after_start(key)?;
+        // Serializes name reads/updates and runtime attachment with disconnect
+        // and rename so neither overwrites the other's DNS names or state.
+        let sync = self.names_sync(&id);
+        let _order = sync.as_ref().map(|m| m.lock().unwrap_or_else(|e| e.into_inner()));
         let net = self.lock_networks().find(network).cloned().ok_or_else(|| Error::NotFound(format!("network {network} not found")))?;
+        if net.driver != "bridge" {
+            return Err(Error::BadRequest(format!("only bridge networks can be connected, not {}", net.driver)));
+        }
         if let Some(ip) = super::network::parse_ip(&ipv4_address) {
             net.check_static(ip).map_err(Error::BadRequest)?;
         }
         if let Some(ip) = super::network::parse_ip6(&ipv6_address) {
             net.check_static6(ip).map_err(Error::BadRequest)?;
         }
-        let (n, running) = {
+        let extra = ExtraNetwork { name: net.name.clone(), aliases, ipv4_address, ipv6_address, mac_address };
+        let (n, was_left_all, ports) = {
             let mut st = self.lock();
             let c = st.containers.get_mut(&id).ok_or_else(|| gone(&id))?;
-            if c.spec.first_network_is(&net.name) || c.spec.extra_networks.iter().any(|x| x.name == net.name) {
+            if (!c.spec.left_all_networks && c.spec.first_network_is(&net.name)) || c.spec.extra_networks.iter().any(|x| x.name == net.name) {
                 return Err(Error::Conflict(format!("endpoint with name {} already exists in network {}", c.name, net.name)));
             }
-            // It left every network it had: the one it joins becomes its
-            // first, which a start sets up as such. A running one has only
-            // loopback and its resolver set for no network, which a plug-in
-            // alone would not change.
-            if c.spec.left_all_networks {
-                if c.status == Status::Running {
-                    return Err(Error::Conflict(format!("Kiri cannot connect a running container that left all its networks to {}; stop the container first", net.name)));
+            let was_left_all = c.spec.left_all_networks;
+            if !was_left_all && matches!(c.spec.network_mode.as_str(), "host" | "none") {
+                return Err(Error::BadRequest(format!("container cannot be connected to {} while on {}", net.name, c.spec.network_mode)));
+            }
+            if !was_left_all && c.spec.network_mode.starts_with("container:") {
+                return Err(Error::BadRequest("container sharing network namespace with another container or host cannot be connected to any other network".into()));
+            }
+            if c.status != Status::Running {
+                if was_left_all {
+                    c.spec.join_first_network(extra);
+                } else {
+                    c.spec.extra_networks.push(extra);
                 }
-                c.spec.join_first_network(ExtraNetwork { name: net.name.clone(), aliases, ipv4_address, ipv6_address, mac_address });
                 drop(st);
                 self.save();
                 self.emit_network("connect", &net, &id);
                 return Ok(());
             }
-            if matches!(c.spec.network_mode.as_str(), "host" | "none") {
-                return Err(Error::BadRequest(format!("container cannot be connected to {} while on {}", net.name, c.spec.network_mode)));
-            }
-            if c.spec.network_mode.starts_with("container:") {
-                return Err(Error::BadRequest("container sharing network namespace with another container or host cannot be connected to any other network".into()));
-            }
-            c.spec.extra_networks.push(ExtraNetwork { name: net.name.clone(), aliases, ipv4_address, ipv6_address, mac_address });
-            // The lowest eth number not in use: a disconnect may have freed
-            // one below the top.
-            let n = (1..).find(|n| !c.extra_ifs.iter().any(|(_, x)| x == n)).expect("a free number");
-            (n, c.status == Status::Running)
+            let min = if was_left_all { 0 } else { 1 };
+            let n = free_eth(c, min);
+            let ports = if was_left_all { c.spec.ports.clone() } else { Vec::new() };
+            (n, was_left_all, ports)
         };
-        self.save();
-        if running {
-            let extra = self.lock().containers.get(&id).and_then(|c| c.spec.extra_networks.last().cloned()).ok_or_else(|| gone(&id))?;
-            let vm = self.vm()?;
-            if let Err(e) = self.attach_extra(&vm, &id, n, &extra) {
-                if let Some(c) = self.lock().containers.get_mut(&id) {
-                    c.spec.extra_networks.retain(|x| x.name != net.name);
+        let vm = self.vm()?;
+        let (attached_net, ip, ip6) = self.attach_network(&vm, &id, n, &extra, was_left_all)?;
+        let fw = if was_left_all && !ports.is_empty() {
+            match super::ports::start(vm.clone(), &id, &ports, ip) {
+                Ok(fw) => Some(fw),
+                Err(e) => {
+                    let _ = vm.net_detach(&id, n, &attached_net.bridge, ip);
+                    self.release_attached_ips(&attached_net.name, Some(ip), ip6);
+                    return Err(Error::Conflict(e.to_string()));
                 }
-                return Err(e);
+            }
+        } else {
+            None
+        };
+        {
+            let mut st = self.lock();
+            if let Some(c) = st.containers.get_mut(&id).filter(|c| c.status == Status::Running && !vm.is_disconnected()) {
+                if was_left_all {
+                    c.spec.join_first_network(extra);
+                    c.ip = Some(ip);
+                    c.ip6 = ip6;
+                    c.first_if = Some(n);
+                    c.forwards = fw;
+                } else {
+                    c.spec.extra_networks.push(extra);
+                    c.extra_ips.push((attached_net.name.clone(), ip));
+                    c.extra_ifs.push((attached_net.name.clone(), n));
+                    if let Some(a) = ip6 {
+                        c.extra_ip6s.push((attached_net.name.clone(), a));
+                    }
+                }
+            } else {
+                drop(st);
+                drop(fw);
+                if !vm.is_disconnected() {
+                    let _ = vm.net_detach(&id, n, &attached_net.bridge, ip);
+                }
+                self.release_attached_ips(&attached_net.name, Some(ip), ip6);
+                return Err(Error::Conflict(format!("Container {} is not running", &id[..12])));
             }
         }
-        self.emit_network("connect", &net, &id);
+        self.save();
+        self.emit_network("connect", &attached_net, &id);
         Ok(())
     }
 
@@ -4499,7 +4592,22 @@ impl Engine {
         let sync = self.names_sync(&id);
         let _order = sync.as_ref().map(|m| m.lock().unwrap_or_else(|e| e.into_inner()));
         let net = self.lock_networks().find(network).cloned().ok_or_else(|| Error::NotFound(format!("network {network} not found")))?;
-        let (n, ip) = {
+        enum Detached {
+            Extra {
+                n: Option<u32>,
+                ip: Option<[u8; 4]>,
+            },
+            First {
+                n: Option<u32>,
+                ip: Option<[u8; 4]>,
+                ip6: Option<[u8; 16]>,
+                old_fw: Option<super::ports::Forwards>,
+                rebind_ports: Vec<super::ports::Binding>,
+                new_target: Option<[u8; 4]>,
+                running: bool,
+            },
+        }
+        let work = {
             let mut st = self.lock();
             let c = st.containers.get_mut(&id).ok_or_else(|| gone(&id))?;
             if c.spec.first_network_is(&net.name) && matches!(net.name.as_str(), "host" | "none") {
@@ -4509,52 +4617,91 @@ impl Engine {
                 return Err(Error::BadRequest(format!("container cannot be disconnected from {} network", net.name)));
             }
             if c.spec.first_network_is(&net.name) {
-                // A running container's first network holds its default
-                // route, its main address (which published ports go to) and
-                // its resolver: moving those to another network while it
-                // runs needs the guest to do more than unplug it.
-                if c.status == Status::Running {
-                    return Err(Error::Conflict(format!("Kiri cannot disconnect a running container from its first network ({}); stop the container first", net.name)));
-                }
-                let left = (c.ip.take(), c.ip6.take());
+                let ip = c.ip.take();
+                let ip6 = c.ip6.take();
+                let n = c.first_if.take();
                 let nets = self.lock_networks();
                 c.spec.leave_first_network(|name| nets.find(name).is_some_and(|n| n.internal));
                 drop(nets);
-                drop(st);
-                // Not running, it holds no address; one left from a run that
-                // did not hand it back goes back to the pool all the same.
-                if let Some(ip) = left.0 {
-                    self.release_ip(&net.name, ip);
+                if !c.spec.left_all_networks {
+                    let promoted = c.spec.network_mode.clone();
+                    if let Some(i) = c.extra_ips.iter().position(|(x, _)| *x == promoted) {
+                        c.ip = Some(c.extra_ips.remove(i).1);
+                    }
+                    if let Some(i) = c.extra_ip6s.iter().position(|(x, _)| *x == promoted) {
+                        c.ip6 = Some(c.extra_ip6s.remove(i).1);
+                    }
+                    if let Some(i) = c.extra_ifs.iter().position(|(x, _)| *x == promoted) {
+                        c.first_if = Some(c.extra_ifs.remove(i).1);
+                    }
                 }
-                if let Some(a) = left.1 {
+                let old_fw = c.forwards.take();
+                let new_target = c.ip;
+                let running = c.status == Status::Running;
+                let rebind_ports = match &old_fw {
+                    Some(fw) if running && new_target.is_some() && !c.spec.ports.is_empty() => rebind_bindings(&c.spec.ports, &fw.bound),
+                    _ => Vec::new(),
+                };
+                Detached::First { n, ip, ip6, old_fw, rebind_ports, new_target, running }
+            } else {
+                let Some(pos) = c.spec.extra_networks.iter().position(|x| x.name == net.name) else {
+                    return Err(Error::NotFound(format!("container {} is not connected to network {}", &id[..12], net.name)));
+                };
+                c.spec.extra_networks.remove(pos);
+                let ip = c.extra_ips.iter().position(|(x, _)| *x == net.name).map(|i| c.extra_ips.remove(i).1);
+                if let Some(i) = c.extra_ip6s.iter().position(|(x, _)| *x == net.name) {
+                    let (_, a) = c.extra_ip6s.remove(i);
                     self.lock_networks().release6(&net.name, a);
+                }
+                let n = c.extra_ifs.iter().position(|(x, _)| *x == net.name).map(|i| c.extra_ifs.remove(i).1);
+                Detached::Extra { n, ip }
+            }
+        };
+        match work {
+            Detached::Extra { n, ip } => {
+                self.save();
+                if let Some(ip) = ip {
+                    let unplugged = match (self.awake(), n) {
+                        (Some(vm), Some(n)) => vm.net_detach(&id, n, &net.bridge, ip),
+                        _ => Ok(()),
+                    };
+                    // The network is gone from the container either way: its
+                    // address goes back too, or the network can never be removed.
+                    self.release_ip(&net.name, ip);
+                    unplugged?;
+                }
+            }
+            Detached::First { n, ip, ip6, old_fw, rebind_ports, new_target, running } => {
+                // Closing listeners joins their threads: never under self.lock().
+                drop(old_fw);
+                let unplugged = match (self.awake(), n, ip) {
+                    (Some(vm), Some(n), Some(ip)) => vm.net_detach(&id, n, &net.bridge, ip),
+                    _ => Ok(()),
+                };
+                self.release_attached_ips(&net.name, ip, ip6);
+                if unplugged.is_ok()
+                    && running
+                    && !rebind_ports.is_empty()
+                    && let (Some(vm), Some(target)) = (self.awake(), new_target)
+                {
+                    match super::ports::start(vm.clone(), &id, &rebind_ports, target) {
+                        Ok(fw) => {
+                            let mut st = self.lock();
+                            if let Some(c) = st.containers.get_mut(&id).filter(|c| c.status == Status::Running && c.ip == Some(target) && !vm.is_disconnected()) {
+                                c.forwards = Some(fw);
+                            } else {
+                                drop(st);
+                                drop(fw);
+                            }
+                        }
+                        Err(e) => crate::diag::warn!("published ports could not be moved after network disconnect", id = &id[..12], error = e),
+                    }
                 }
                 self.save();
                 self.emit_network("disconnect", &net, &id);
+                unplugged?;
                 return Ok(());
             }
-            let Some(pos) = c.spec.extra_networks.iter().position(|x| x.name == net.name) else {
-                return Err(Error::NotFound(format!("container {} is not connected to network {}", &id[..12], net.name)));
-            };
-            c.spec.extra_networks.remove(pos);
-            let ip = c.extra_ips.iter().position(|(x, _)| *x == net.name).map(|i| c.extra_ips.remove(i).1);
-            if let Some(i) = c.extra_ip6s.iter().position(|(x, _)| *x == net.name) {
-                let (_, a) = c.extra_ip6s.remove(i);
-                self.lock_networks().release6(&net.name, a);
-            }
-            let n = c.extra_ifs.iter().position(|(x, _)| *x == net.name).map(|i| c.extra_ifs.remove(i).1);
-            (n, ip)
-        };
-        self.save();
-        if let Some(ip) = ip {
-            let unplugged = match (self.awake(), n) {
-                (Some(vm), Some(n)) => vm.net_detach(&id, n, &net.bridge, ip),
-                _ => Ok(()),
-            };
-            // The network is gone from the container either way: its
-            // address goes back too, or the network can never be removed.
-            self.release_ip(&net.name, ip);
-            unplugged?;
         }
         self.emit_network("disconnect", &net, &id);
         Ok(())
@@ -8284,25 +8431,25 @@ mod leave_first_network_tests {
         done(engine, dir);
     }
 
-    /// With two others, the next first is the one Docker gives the default
-    /// route to: one that reaches outside before an internal one, then by
-    /// name, whatever the order they were connected in. The other stays an
-    /// extra network with its settings.
+    /// With two others, the next first is the first network in attachment order
+    /// that reaches outside (not `internal`), falling back to the first
+    /// attached internal network when none reaches outside. The others stay as
+    /// extra networks with their settings.
     #[test]
-    fn with_two_others_the_first_by_name_that_reaches_outside_takes_its_place() {
-        let (engine, id, dir) = engine("two", &[("zeta", false), ("alpha", true), ("beta", false)]);
-        connect(&engine, "zeta", &id, &["z"], "10.98.0.7");
+    fn with_two_others_the_first_attached_that_reaches_outside_takes_its_place() {
+        let (engine, id, dir) = engine("two", &[("alpha", true), ("zeta", false), ("beta", false)]);
         connect(&engine, "alpha", &id, &["a"], "");
+        connect(&engine, "zeta", &id, &["z"], "10.98.1.7");
         connect(&engine, "beta", &id, &["b"], "10.98.2.9");
         engine.disconnect("bridge", &id).unwrap();
         let s = spec(&engine, &id);
-        assert_eq!(s.network_mode, "beta", "alpha is internal; beta comes before zeta");
-        assert_eq!((s.aliases.as_slice(), s.ipv4_address.as_str()), (&["b".to_owned()][..], "10.98.2.9"));
-        assert_eq!(s.extra_networks.iter().map(|x| (x.name.as_str(), x.ipv4_address.as_str())).collect::<Vec<_>>(), [("zeta", "10.98.0.7"), ("alpha", "")]);
-        // Leaving that one too: zeta reaches outside, alpha does not.
-        engine.disconnect("beta", &id).unwrap();
-        assert_eq!(spec(&engine, &id).network_mode, "zeta");
+        assert_eq!(s.network_mode, "zeta", "alpha is internal; zeta was attached before beta");
+        assert_eq!((s.aliases.as_slice(), s.ipv4_address.as_str()), (&["z".to_owned()][..], "10.98.1.7"));
+        assert_eq!(s.extra_networks.iter().map(|x| (x.name.as_str(), x.ipv4_address.as_str())).collect::<Vec<_>>(), [("alpha", ""), ("beta", "10.98.2.9")]);
+        // Leaving that one too: beta reaches outside, alpha does not.
         engine.disconnect("zeta", &id).unwrap();
+        assert_eq!(spec(&engine, &id).network_mode, "beta");
+        engine.disconnect("beta", &id).unwrap();
         assert_eq!(spec(&engine, &id).network_mode, "alpha", "an internal network when it is the only one left");
         done(engine, dir);
     }
@@ -8392,20 +8539,128 @@ mod leave_first_network_tests {
         done(engine, dir);
     }
 
-    /// A running container is refused, with what to do instead, and
-    /// nothing changes: moving its default route, address and resolver to
-    /// another network while it runs is more than an unplug.
+    /// Disconnecting the first network on a running container removes it,
+    /// promotes the surviving secondary network's runtime attachment (`ip`,
+    /// `ip6`, `first_if`), and releases the left network's address.
     #[test]
-    fn a_running_container_must_be_stopped_first() {
-        let (engine, id, dir) = engine("running", &[("probe-net", false)]);
-        connect(&engine, "probe-net", &id, &[], "");
-        engine.lock().containers.get_mut(&id).unwrap().status = Status::Running;
-        let r = engine.disconnect("bridge", &id);
-        assert!(matches!(&r, Err(Error::Conflict(m)) if m.contains("stop the container first")), "{r:?}");
-        let s = spec(&engine, &id);
-        assert_eq!(s.network_mode, "bridge");
-        assert_eq!(s.extra_networks.len(), 1);
+    fn running_disconnect_from_first_network_promotes_secondary() {
+        let (engine, id, dir) = engine("running-promote", &[("probe-net", false)]);
+        let bridge_ip = engine.lock_networks().allocate_avoiding("bridge", &[]).unwrap();
+        let probe_ip = engine.lock_networks().reserve("probe-net", [10, 98, 0, 20]).map(|()| [10, 98, 0, 20]).unwrap();
+        connect(&engine, "probe-net", &id, &["web"], "");
+        {
+            let mut st = engine.lock();
+            let c = st.containers.get_mut(&id).unwrap();
+            c.status = Status::Running;
+            c.ip = Some(bridge_ip);
+            c.first_if = Some(0);
+            c.extra_ips.push(("probe-net".into(), probe_ip));
+            c.extra_ifs.push(("probe-net".into(), 1));
+        }
+        engine.disconnect("bridge", &id).unwrap();
+        {
+            let st = engine.lock();
+            let c = &st.containers[&id];
+            assert_eq!(c.spec.network_mode, "probe-net");
+            assert_eq!(c.spec.aliases, ["web"]);
+            assert!(!c.spec.left_all_networks);
+            assert!(c.spec.extra_networks.is_empty());
+            assert_eq!(c.ip, Some(probe_ip));
+            assert_eq!(c.first_if, Some(1));
+            assert!(c.extra_ips.is_empty());
+            assert!(c.extra_ifs.is_empty());
+            assert_eq!(super::free_eth(c, 0), 0, "eth0 was freed");
+            assert_eq!(super::free_eth(c, 1), 2, "eth1 stays in use by probe-net");
+        }
+        assert_eq!(engine.lock_networks().allocate_avoiding("bridge", &[]), Some(bridge_ip), "left IP returned to pool");
+        engine.lock_networks().release("bridge", bridge_ip);
+        // Leaving the promoted last network leaves no network at all.
+        engine.disconnect("probe-net", &id).unwrap();
+        {
+            let st = engine.lock();
+            let c = &st.containers[&id];
+            assert!(c.spec.left_all_networks);
+            assert_eq!(c.spec.network_mode, "none");
+            assert_eq!(c.ip, None);
+            assert_eq!(c.first_if, None);
+            assert_eq!(super::free_eth(c, 0), 0);
+        }
+        engine.lock_networks().reserve("probe-net", probe_ip).expect("promoted IP returned to pool");
+        engine.lock_networks().release("probe-net", probe_ip);
         done(engine, dir);
+    }
+
+    /// With three external networks attached in order (`a` on eth0, `zeta` on
+    /// eth1, `beta` on eth2), disconnecting `a` promotes `zeta` (eth1, its IP
+    /// and gateway) rather than sorting `beta` ahead of `zeta`, matching
+    /// `kiri-init`'s `route_holders` and a subsequent `stop`/`start`.
+    #[test]
+    fn running_disconnect_with_three_networks_promotes_first_attached_ip_gateway_and_interface() {
+        let (engine, id, dir) = engine("three-promote", &[("a", false), ("zeta", false), ("beta", false)]);
+        let a_ip = [10, 98, 0, 10];
+        let zeta_ip = [10, 98, 1, 20];
+        let beta_ip = [10, 98, 2, 30];
+        engine.lock_networks().reserve("a", a_ip).unwrap();
+        engine.lock_networks().reserve("zeta", zeta_ip).unwrap();
+        engine.lock_networks().reserve("beta", beta_ip).unwrap();
+        connect(&engine, "a", &id, &["a-alias"], "");
+        engine.disconnect("bridge", &id).unwrap();
+        connect(&engine, "zeta", &id, &["z-alias"], "");
+        connect(&engine, "beta", &id, &["b-alias"], "");
+        {
+            let mut st = engine.lock();
+            let c = st.containers.get_mut(&id).unwrap();
+            c.status = Status::Running;
+            c.ip = Some(a_ip);
+            c.first_if = Some(0);
+            c.extra_ips = vec![("zeta".into(), zeta_ip), ("beta".into(), beta_ip)];
+            c.extra_ifs = vec![("zeta".into(), 1), ("beta".into(), 2)];
+        }
+        engine.disconnect("a", &id).unwrap();
+        {
+            let st = engine.lock();
+            let c = &st.containers[&id];
+            assert_eq!(c.spec.network_mode, "zeta");
+            assert_eq!(c.spec.aliases, ["z-alias"]);
+            assert_eq!(c.ip, Some(zeta_ip));
+            assert_eq!(c.first_if, Some(1), "eth1 matches kiri-init's promoted route holder");
+            assert_eq!(c.spec.extra_networks.iter().map(|x| x.name.as_str()).collect::<Vec<_>>(), ["beta"]);
+            assert_eq!(c.extra_ips, [("beta".to_owned(), beta_ip)]);
+            assert_eq!(c.extra_ifs, [("beta".to_owned(), 2)]);
+        }
+        assert_eq!(engine.lock_networks().find("zeta").unwrap().gateway, [10, 98, 1, 1]);
+
+        engine.disconnect("zeta", &id).unwrap();
+        {
+            let st = engine.lock();
+            let c = &st.containers[&id];
+            assert_eq!(c.spec.network_mode, "beta");
+            assert_eq!(c.spec.aliases, ["b-alias"]);
+            assert_eq!(c.ip, Some(beta_ip));
+            assert_eq!(c.first_if, Some(2));
+            assert!(c.spec.extra_networks.is_empty());
+            assert!(c.extra_ips.is_empty());
+            assert!(c.extra_ifs.is_empty());
+        }
+        assert_eq!(engine.lock_networks().find("beta").unwrap().gateway, [10, 98, 2, 1]);
+        done(engine, dir);
+    }
+
+    #[test]
+    fn rebind_bindings_preserves_ephemeral_host_ports() {
+        let bindings = vec![
+            super::super::ports::Binding { container_port: 80, proto: "tcp".into(), host_ip: String::new(), host_port: 0 },
+            super::super::ports::Binding { container_port: 443, proto: "tcp".into(), host_ip: "127.0.0.1".into(), host_port: 8443 },
+        ];
+        let bound = vec![
+            (bindings[0].clone(), "0.0.0.0".into(), 49152),
+            (bindings[0].clone(), "::".into(), 49152),
+            (bindings[1].clone(), "127.0.0.1".into(), 8443),
+        ];
+        let rebound = super::rebind_bindings(&bindings, &bound);
+        assert_eq!(rebound.len(), 2);
+        assert_eq!(rebound[0].host_port, 49152);
+        assert_eq!(rebound[1].host_port, 8443);
     }
 
     /// Records saved before a container could leave all its networks load,
@@ -8486,6 +8741,7 @@ mod layer_gc_tests {
                 start_owed: false,
                 paused: false,
                 extra_ips: Vec::new(),
+                first_if: None,
                 extra_ifs: Vec::new(),
                 ip6: None,
                 extra_ip6s: Vec::new(),

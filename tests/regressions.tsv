@@ -296,3 +296,6 @@ import-upper-imports	#410	Docker Desktop import dropped each container's writabl
 import-upper-nothing-left	#410	reading a container's writable layer must leave no container behind on the source
 import-upper-not-whole-etc	#410	a directory changed only because a file was added to it must not bring all of its unchanged files
 import-upper-runs-with-files	#410	an imported container started without the files it wrote outside its volumes
+leave-first-running-disconnect	#789	disconnecting a running container from its only network was refused (or left its veth, routes, and published ports active instead of isolating it)
+leave-first-running-reconnect	#789	reconnecting a running container after leaving its first network failed to restore veth connectivity, DNS aliases, or published ports
+leave-first-running-promote	#789	disconnecting a running container's first network when attached to a second network failed to isolate the left network, promote the default route, or rebind published ports

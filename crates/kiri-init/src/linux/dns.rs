@@ -80,6 +80,15 @@ const MAX_RELAYED: usize = 2 + 65_535;
 /// Docker's embedded DNS address, inside each container.
 pub const EMBEDDED: [u8; 4] = [127, 0, 0, 11];
 
+/// Who owns a forwarded DNS query (`Pending`) or `--dns` upstream list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum ClientKey {
+    /// A container queried a bridge's gateway from this source IP.
+    Ip([u8; 4]),
+    /// A container queried 127.0.0.11 in its own network namespace (PID 1).
+    Container(i32),
+}
+
 struct Server {
     /// Its own number, never reused: what a forwarded query names it by.
     id: u64,
@@ -87,9 +96,9 @@ struct Server {
     /// network of the container it is in.
     bridges: Vec<String>,
     sock: OwnedFd,
-    /// In a container's namespace: (its PID, the address its `--dns`
-    /// servers are kept under). Every query there comes from 127.0.0.1.
-    container: Option<(i32, [u8; 4])>,
+    /// PID of the container whose namespace this 127.0.0.11 server is in;
+    /// every query there comes from 127.0.0.1.
+    container: Option<i32>,
 }
 
 struct Pending {
@@ -101,8 +110,8 @@ struct Pending {
     sock: OwnedFd,
     /// The ID it went out with.
     our: u16,
-    /// Who asked, for `MAX_PER_CLIENT`: the container's address.
-    key: [u8; 4],
+    /// Who asked, for `MAX_PER_CLIENT`.
+    key: ClientKey,
     /// The server the query came in on (`Server::id`).
     server: u64,
     client: libc::sockaddr_in,
@@ -138,8 +147,11 @@ pub struct Dns {
     /// bridge → its Docker network's name: the order a container's server
     /// searches its networks in.
     networks: HashMap<String, String>,
-    /// Container address → its `--dns` servers, used instead of the VM's.
+    /// Container address → its `--dns` servers, used on a gateway listener.
     clients: HashMap<[u8; 4], Vec<[u8; 4]>>,
+    /// Container PID → its `--dns` servers, used on 127.0.0.11 so custom
+    /// resolvers survive disconnecting and reconnecting even the first network.
+    container_upstreams: HashMap<i32, Vec<[u8; 4]>>,
     pending: Vec<Pending>,
     /// Lookups the VM's resolver fails go through the host (in the VM; a
     /// Linux host's agent asks the host's resolvers itself).
@@ -239,31 +251,24 @@ impl Dns {
 
     /// Starts answering at 127.0.0.11:53 in container `pid`'s network
     /// namespace `netns` (lo up) for the names on `bridge`, or adds `bridge`
-    /// to the networks its server answers for. `owner` is the address its
-    /// `--dns` servers are kept under (`set_upstream`).
-    pub fn serve_in(&mut self, netns: &std::fs::File, pid: i32, owner: [u8; 4], bridge: &str) -> io::Result<()> {
-        if let Some(s) = self.servers.iter_mut().find(|s| s.container.is_some_and(|(p, _)| p == pid)) {
+    /// to the networks its server answers for.
+    pub fn serve_in(&mut self, netns: &std::fs::File, pid: i32, bridge: &str) -> io::Result<()> {
+        if let Some(s) = self.servers.iter_mut().find(|s| s.container == Some(pid)) {
             if !s.bridges.iter().any(|b| b == bridge) {
                 s.bridges.push(bridge.to_owned());
             }
             return Ok(());
         }
         let sock = super::netlink::in_netns(netns, embedded_socket)?;
-        self.servers.push(Server { id: server_id(), bridges: vec![bridge.to_owned()], sock, container: Some((pid, owner)) });
+        self.servers.push(Server { id: server_id(), bridges: vec![bridge.to_owned()], sock, container: Some(pid) });
         Ok(())
     }
 
     /// Container `pid` left `bridge` (`network disconnect`).
     pub fn leave(&mut self, pid: i32, bridge: &str) {
-        for s in self.servers.iter_mut().filter(|s| s.container.is_some_and(|(p, _)| p == pid)) {
+        for s in self.servers.iter_mut().filter(|s| s.container == Some(pid)) {
             s.bridges.retain(|b| b != bridge);
         }
-    }
-
-    /// The address container `pid`'s 127.0.0.11 server keeps its `--dns`
-    /// servers under (`set_upstream`), if it has one.
-    pub fn owner_of(&self, pid: i32) -> Option<[u8; 4]> {
-        self.servers.iter().find_map(|s| s.container.filter(|(p, _)| *p == pid).map(|(_, owner)| owner))
     }
 
     /// Whether the agent answers DNS at `ip` on a bridge (its gateway).
@@ -271,9 +276,11 @@ impl Dns {
         self.servers.iter().filter(|s| s.container.is_none()).any(|s| local_addr(&s.sock) == Some(ip))
     }
 
-    /// Container `pid` is gone: its 127.0.0.11 server goes.
+    /// Container `pid` is gone: its 127.0.0.11 server and `--dns` servers go.
     pub fn drop_container(&mut self, pid: i32) {
-        self.servers.retain(|s| !s.container.is_some_and(|(p, _)| p == pid));
+        self.servers.retain(|s| s.container != Some(pid));
+        self.container_upstreams.remove(&pid);
+        self.pending.retain(|p| p.key != ClientKey::Container(pid));
         self.forget_pending();
     }
 
@@ -335,11 +342,38 @@ impl Dns {
         }
     }
 
+    /// Where queries from container `pid`'s 127.0.0.11 listener go; kept per
+    /// container so disconnecting its first network does not erase `--dns`.
+    pub fn set_container_upstream(&mut self, pid: i32, mut servers: Vec<[u8; 4]>) {
+        servers.truncate(MAX_OWN_SERVERS);
+        if servers.is_empty() {
+            self.container_upstreams.remove(&pid);
+        } else {
+            self.container_upstreams.insert(pid, servers);
+        }
+    }
+
+    pub fn container_upstream(&self, pid: i32) -> Option<Vec<[u8; 4]>> {
+        self.container_upstreams.get(&pid).cloned()
+    }
+
+    #[cfg(test)]
+    pub fn ip_upstream(&self, ip: [u8; 4]) -> Option<Vec<[u8; 4]>> {
+        self.clients.get(&ip).cloned()
+    }
+
+    fn own_servers(&self, key: ClientKey) -> Option<&Vec<[u8; 4]>> {
+        match key {
+            ClientKey::Ip(ip) => self.clients.get(&ip),
+            ClientKey::Container(pid) => self.container_upstreams.get(&pid),
+        }
+    }
+
     pub fn unregister(&mut self, bridge: &str, ip: [u8; 4]) {
         self.clients.remove(&ip);
         // Its queries in flight go with it: a container given the address
         // next never gets them, or their answers.
-        self.pending.retain(|p| p.key != ip);
+        self.pending.retain(|p| p.key != ClientKey::Ip(ip));
         self.drop_names(bridge, ip);
     }
 
@@ -528,8 +562,8 @@ impl Dns {
                 self.fail(at);
             }
         }
-        let key = self.servers[server].container.map_or(client.sin_addr.s_addr.to_ne_bytes(), |(_, owner)| owner);
-        let own = self.clients.get(&key).map(|v| (v.len(), v.first().copied()));
+        let key = self.servers[server].container.map_or_else(|| ClientKey::Ip(client.sin_addr.s_addr.to_ne_bytes()), ClientKey::Container);
+        let own = self.own_servers(key).map(|v| (v.len(), v.first().copied()));
         let Some((_, _, end)) = parse_question(q) else {
             return;
         };
@@ -555,7 +589,7 @@ impl Dns {
         let sock = match own {
             // The first of its own servers that can be sent to.
             Some((len, _)) => (0..len).find_map(|i| {
-                let sock = self.clients.get(&key).and_then(|v| v.get(i)).and_then(|d| ask(*d, &msg))?;
+                let sock = self.own_servers(key).and_then(|v| v.get(i)).and_then(|d| ask(*d, &msg))?;
                 at = Some(i);
                 Some(sock)
             }),
@@ -620,7 +654,7 @@ impl Dns {
         let p = &self.pending[at];
         let Some(mut i) = p.own else { return false };
         let key = p.key;
-        if p.started.elapsed() >= OWN_DEADLINE || self.clients.get(&key).is_none_or(|v| i + 1 >= v.len()) {
+        if p.started.elapsed() >= OWN_DEADLINE || self.own_servers(key).is_none_or(|v| i + 1 >= v.len()) {
             return false;
         }
         let Some(our) = random_id() else { return false };
@@ -628,7 +662,7 @@ impl Dns {
         self.pending[at].query[0..2].copy_from_slice(&our.to_be_bytes());
         loop {
             i += 1;
-            let Some(dest) = self.clients.get(&key).and_then(|v| v.get(i)).copied() else { break };
+            let Some(dest) = self.own_servers(key).and_then(|v| v.get(i)).copied() else { break };
             if let Some(sock) = ask(dest, &self.pending[at].query) {
                 let p = &mut self.pending[at];
                 p.sock = sock;
@@ -1022,7 +1056,7 @@ mod tests {
     #[test]
     fn a_containers_server_answers_for_each_of_its_networks() {
         let mut dns = Dns::default();
-        dns.servers.push(Server { id: super::server_id(), bridges: vec!["kiri1".into(), "kiri2".into()], sock: udp_socket().unwrap(), container: Some((42, [10, 5, 0, 2])) });
+        dns.servers.push(Server { id: super::server_id(), bridges: vec!["kiri1".into(), "kiri2".into()], sock: udp_socket().unwrap(), container: Some(42) });
         dns.register("kiri1", ["web"].iter(), [10, 5, 0, 3]);
         dns.register("kiri2", ["db"].iter(), [10, 6, 0, 3]);
         let q = query("db", 1);
@@ -1184,7 +1218,7 @@ mod tests {
         // (shared network, project network, which one answers)
         for (shared, project, shared_answers) in [("kiri_shared_t", "kra_default", true), ("ddev_default", "ddev-a_default", false), ("zz_shared", "kca_default", false)] {
             let mut dns = Dns::default();
-            dns.servers.push(Server { id: super::server_id(), bridges: vec!["kiri1".into(), "kiri2".into()], sock: udp_socket().unwrap(), container: Some((42, [10, 1, 0, 2])) });
+            dns.servers.push(Server { id: super::server_id(), bridges: vec!["kiri1".into(), "kiri2".into()], sock: udp_socket().unwrap(), container: Some(42) });
             dns.name_network("kiri1", shared);
             dns.name_network("kiri2", project);
             // This project's db on both networks, another project's on the shared one.
@@ -1301,10 +1335,9 @@ mod tests {
         let from = super::sockaddr(addr.ip().octets(), addr.port());
         // One server still works; refusals move through the list in order.
         for servers in [vec![resolver_ip], vec![[127, 0, 0, 4], resolver_ip], vec![[127, 0, 0, 4], [127, 0, 0, 6], resolver_ip]] {
-            let owner = [10, 5, 0, 2];
             let mut dns = Dns { relay: true, ..Default::default() };
-            dns.servers.push(Server { id: super::server_id(), bridges: vec!["kiri1".into()], sock: udp_socket().unwrap(), container: Some((42, owner)) });
-            dns.set_upstream(owner, servers.clone());
+            dns.servers.push(Server { id: super::server_id(), bridges: vec!["kiri1".into()], sock: udp_socket().unwrap(), container: Some(42) });
+            dns.set_container_upstream(42, servers.clone());
             let q = query("example.com", 1);
             dns.forward(0, &q, from, &[]);
             assert_eq!(dns.pending.len(), 1);
@@ -1358,10 +1391,9 @@ mod tests {
         let client = UdpSocket::bind("127.0.0.1:0").unwrap();
         let std::net::SocketAddr::V4(addr) = client.local_addr().unwrap() else { panic!() };
         let from = super::sockaddr(addr.ip().octets(), addr.port());
-        let owner = [10, 5, 0, 2];
         let mut dns = Dns { relay: true, ..Default::default() };
-        dns.servers.push(Server { id: super::server_id(), bridges: vec!["kiri1".into()], sock: udp_socket().unwrap(), container: Some((42, owner)) });
-        dns.set_upstream(owner, vec![unsendable, resolver_ip]);
+        dns.servers.push(Server { id: super::server_id(), bridges: vec!["kiri1".into()], sock: udp_socket().unwrap(), container: Some(42) });
+        dns.set_container_upstream(42, vec![unsendable, resolver_ip]);
         dns.forward(0, &query("example.com", 1), from, &[]);
         assert_eq!(dns.pending.len(), 1);
         assert_eq!(peer(dns.pending[0].sock.as_raw_fd()), resolver_ip, "the server that can't be sent to was skipped");
@@ -1371,8 +1403,8 @@ mod tests {
         assert_eq!(&buf[..n], &dns.pending[0].query[..]);
         // With nothing to send to, no query is kept and the host is not asked.
         let mut dns = Dns { relay: true, ..Default::default() };
-        dns.servers.push(Server { id: super::server_id(), bridges: vec!["kiri1".into()], sock: udp_socket().unwrap(), container: Some((42, owner)) });
-        dns.set_upstream(owner, vec![unsendable]);
+        dns.servers.push(Server { id: super::server_id(), bridges: vec!["kiri1".into()], sock: udp_socket().unwrap(), container: Some(42) });
+        dns.set_container_upstream(42, vec![unsendable]);
         dns.forward(0, &query("example.com", 1), from, &[]);
         assert!(dns.pending.is_empty());
         assert!(dns.relay_down_until.is_none(), "no host relay was tried");
@@ -1396,7 +1428,6 @@ mod tests {
         let client = UdpSocket::bind("127.0.0.1:0").unwrap();
         let std::net::SocketAddr::V4(addr) = client.local_addr().unwrap() else { panic!() };
         let from = super::sockaddr(addr.ip().octets(), addr.port());
-        let owner = [10, 5, 0, 2];
         // Answers the query waiting at `server` with `rcode`.
         let reply = |server: &UdpSocket, rcode: u8| {
             let mut buf = [0u8; 512];
@@ -1409,8 +1440,8 @@ mod tests {
         };
         for (rcode, servers, answered_by) in [(5u8, vec![first_ip, second_ip], 1usize), (2, vec![first_ip, second_ip], 1), (5, vec![first_ip], 0)] {
             let mut dns = Dns { relay: true, ..Default::default() };
-            dns.servers.push(Server { id: super::server_id(), bridges: vec!["kiri1".into()], sock: udp_socket().unwrap(), container: Some((42, owner)) });
-            dns.set_upstream(owner, servers.clone());
+            dns.servers.push(Server { id: super::server_id(), bridges: vec!["kiri1".into()], sock: udp_socket().unwrap(), container: Some(42) });
+            dns.set_container_upstream(42, servers.clone());
             let q = query("example.com", 1);
             dns.forward(0, &q, from, &[]);
             reply(&first, rcode);
@@ -1464,10 +1495,9 @@ mod tests {
         let _silent = std::net::UdpSocket::from(super::bound(silent_ip, 53).unwrap());
         let next = std::net::UdpSocket::from(super::bound(next_ip, 53).unwrap());
         let (client, from) = client();
-        let owner = [10, 5, 0, 2];
         let mut dns = Dns { relay: true, ..Default::default() };
-        dns.servers.push(Server { id: super::server_id(), bridges: vec!["kiri1".into()], sock: udp_socket().unwrap(), container: Some((42, owner)) });
-        dns.set_upstream(owner, vec![silent_ip, next_ip]);
+        dns.servers.push(Server { id: super::server_id(), bridges: vec!["kiri1".into()], sock: udp_socket().unwrap(), container: Some(42) });
+        dns.set_container_upstream(42, vec![silent_ip, next_ip]);
         let q = query("example.com", 1);
         dns.forward(0, &q, from, &[]);
         let first_query = dns.pending[0].query.clone();
@@ -1510,10 +1540,9 @@ mod tests {
         let (client, from) = client();
         for servers in [vec![[127, 0, 0, 7]], vec![[127, 0, 0, 7], [127, 0, 0, 8]]] {
             let attempts = servers.len();
-            let owner = [10, 5, 0, 2];
             let mut dns = Dns { relay: true, ..Default::default() };
-            dns.servers.push(Server { id: super::server_id(), bridges: vec!["kiri1".into()], sock: udp_socket().unwrap(), container: Some((42, owner)) });
-            dns.set_upstream(owner, servers);
+            dns.servers.push(Server { id: super::server_id(), bridges: vec!["kiri1".into()], sock: udp_socket().unwrap(), container: Some(42) });
+            dns.set_container_upstream(42, servers);
             let q = query("example.com", 1);
             dns.forward(0, &q, from, &[vm_ip]);
             assert_eq!(dns.pending.len(), 1);
@@ -1550,10 +1579,9 @@ mod tests {
         let ips = [[127, 0, 0, 30], [127, 0, 0, 31], [127, 0, 0, 32]];
         let _held: Vec<_> = ips.iter().map(|ip| std::net::UdpSocket::from(super::bound(*ip, 53).unwrap())).collect();
         let (client, from) = client();
-        let owner = [10, 5, 0, 2];
         let mut dns = Dns::default();
-        dns.servers.push(Server { id: super::server_id(), bridges: vec!["kiri1".into()], sock: udp_socket().unwrap(), container: Some((42, owner)) });
-        dns.set_upstream(owner, ips.to_vec());
+        dns.servers.push(Server { id: super::server_id(), bridges: vec!["kiri1".into()], sock: udp_socket().unwrap(), container: Some(42) });
+        dns.set_container_upstream(42, ips.to_vec());
         dns.forward(0, &query("example.com", 1), from, &[]);
         dns.pending[0].started = Instant::now() - super::OWN_DEADLINE;
         dns.pending[0].sent = Instant::now();
@@ -1587,10 +1615,9 @@ mod tests {
         let _a = std::net::UdpSocket::from(super::bound(a, 53).unwrap());
         let _b = std::net::UdpSocket::from(super::bound(b, 53).unwrap());
         let (_client, from) = client();
-        let owner = [10, 5, 0, 2];
         let mut dns = Dns::default();
-        dns.servers.push(Server { id: super::server_id(), bridges: vec!["kiri1".into()], sock: udp_socket().unwrap(), container: Some((42, owner)) });
-        dns.set_upstream(owner, vec![a, b]);
+        dns.servers.push(Server { id: super::server_id(), bridges: vec!["kiri1".into()], sock: udp_socket().unwrap(), container: Some(42) });
+        dns.set_container_upstream(42, vec![a, b]);
         dns.forward(0, &query("example.com", 1), from, &[]);
         let first = dns.pending[0].our;
         assert_eq!(peer(dns.pending[0].sock.as_raw_fd()), a);
@@ -1605,9 +1632,16 @@ mod tests {
     fn own_servers_go_with_the_container() {
         let mut dns = Dns::default();
         dns.set_upstream([10, 5, 0, 2], vec![[8, 8, 8, 8]]);
+        dns.set_container_upstream(42, vec![[8, 8, 8, 8]]);
         assert_eq!(dns.clients.get(&[10, 5, 0, 2]), Some(&vec![[8, 8, 8, 8]]));
+        assert_eq!(dns.container_upstream(42), Some(vec![[8, 8, 8, 8]]));
         dns.unregister("kiri1", [10, 5, 0, 2]);
         assert!(dns.clients.is_empty());
+        assert_eq!(dns.container_upstream(42), Some(vec![[8, 8, 8, 8]]), "disconnection keeps 127.0.0.11 --dns servers");
+        dns.leave(42, "kiri1");
+        assert_eq!(dns.container_upstream(42), Some(vec![[8, 8, 8, 8]]));
+        dns.drop_container(42);
+        assert!(dns.container_upstreams.is_empty());
         dns.set_upstream([10, 5, 0, 3], vec![]);
         assert!(dns.clients.is_empty());
     }
@@ -1618,17 +1652,32 @@ mod tests {
     fn a_containers_queries_in_flight_go_with_it() {
         let owner = [10, 5, 0, 2];
         let mut dns = Dns::default();
+        let gw_id = super::server_id();
+        dns.servers.push(Server { id: gw_id, bridges: vec!["kiri1".into()], sock: udp_socket().unwrap(), container: None });
+        let c_id = super::server_id();
+        dns.servers.push(Server { id: c_id, bridges: vec!["kiri1".into()], sock: udp_socket().unwrap(), container: Some(42) });
         dns.set_upstream(owner, vec![[127, 0, 0, 1], [127, 0, 0, 2]]);
         let mut p = pending();
-        p.key = owner;
+        p.server = gw_id;
+        p.key = super::ClientKey::Ip(owner);
         p.own = Some(0);
         dns.pending.push(p);
         let mut other = pending();
-        other.key = [10, 5, 0, 3];
+        other.server = gw_id;
+        other.key = super::ClientKey::Ip([10, 5, 0, 3]);
         dns.pending.push(other);
+        let mut in_ns = pending();
+        in_ns.server = c_id;
+        in_ns.key = super::ClientKey::Container(42);
+        in_ns.own = Some(0);
+        dns.pending.push(in_ns);
         dns.unregister("kiri1", owner);
+        assert_eq!(dns.pending.len(), 2, "gateway queries for left IP go; 127.0.0.11 and another IP stay");
+        assert_eq!(dns.pending[0].key, super::ClientKey::Ip([10, 5, 0, 3]), "another container's stay");
+        assert_eq!(dns.pending[1].key, super::ClientKey::Container(42));
+        dns.drop_container(42);
         assert_eq!(dns.pending.len(), 1);
-        assert_eq!(dns.pending[0].key, [10, 5, 0, 3], "another container's stay");
+        assert_eq!(dns.pending[0].key, super::ClientKey::Ip([10, 5, 0, 3]));
     }
 
     /// A query names the server it came in on by a number that is never
@@ -1667,13 +1716,12 @@ mod tests {
         let ip = [127, 0, 0, 61];
         let _held = std::net::UdpSocket::from(super::bound(ip, 53).unwrap());
         let (client, from) = client();
-        let owner = [10, 5, 0, 2];
         let mut dns = Dns::default();
-        dns.servers.push(Server { id: super::server_id(), bridges: vec!["kiri1".into()], sock: udp_socket().unwrap(), container: Some((42, owner)) });
-        dns.set_upstream(owner, vec![ip]);
+        dns.servers.push(Server { id: super::server_id(), bridges: vec!["kiri1".into()], sock: udp_socket().unwrap(), container: Some(42) });
+        dns.set_container_upstream(42, vec![ip]);
         for _ in 0..super::MAX_OWN_PER_CLIENT {
             let mut p = pending();
-            p.key = owner;
+            p.key = super::ClientKey::Container(42);
             p.own = Some(0);
             p.server = dns.servers[0].id;
             p.client = from;
@@ -1694,10 +1742,9 @@ mod tests {
         let ip = [127, 0, 0, 62];
         let _held = std::net::UdpSocket::from(super::bound(ip, 53).unwrap());
         let (client, from) = client();
-        let owner = [10, 5, 0, 2];
         let mut dns = Dns::default();
-        dns.servers.push(Server { id: super::server_id(), bridges: vec!["kiri1".into()], sock: udp_socket().unwrap(), container: Some((42, owner)) });
-        dns.set_upstream(owner, vec![ip]);
+        dns.servers.push(Server { id: super::server_id(), bridges: vec!["kiri1".into()], sock: udp_socket().unwrap(), container: Some(42) });
+        dns.set_container_upstream(42, vec![ip]);
         for _ in 0..super::MAX_OWN_PER_CLIENT {
             dns.forward(0, &query("example.com", 1), from, &[]);
         }
@@ -1718,10 +1765,9 @@ mod tests {
         let next = std::net::UdpSocket::from(super::bound(b, 53).unwrap());
         next.set_nonblocking(true).unwrap();
         let (_client, from) = client();
-        let owner = [10, 5, 0, 2];
         let mut dns = Dns::default();
-        dns.servers.push(Server { id: super::server_id(), bridges: vec!["kiri1".into()], sock: udp_socket().unwrap(), container: Some((42, owner)) });
-        dns.set_upstream(owner, vec![a, b]);
+        dns.servers.push(Server { id: super::server_id(), bridges: vec!["kiri1".into()], sock: udp_socket().unwrap(), container: Some(42) });
+        dns.set_container_upstream(42, vec![a, b]);
         dns.forward(0, &query("example.com", 1), from, &[]);
         let sent = dns.pending[0].query.clone();
         dns.pending[0].started = Instant::now() - super::OWN_DEADLINE;
@@ -1880,7 +1926,7 @@ mod tests {
         Pending {
             sock: udp_socket().unwrap(),
             our: 1,
-            key: [0; 4],
+            key: super::ClientKey::Ip([0; 4]),
             server: 0,
             client: unsafe { std::mem::zeroed() },
             id: 7,
@@ -1917,7 +1963,7 @@ mod tests {
         let client = super::sockaddr([172, 17, 0, 2], 4000);
         for _ in 0..super::MAX_PER_CLIENT {
             let mut p = pending();
-            p.key = [172, 17, 0, 2];
+            p.key = super::ClientKey::Ip([172, 17, 0, 2]);
             dns.pending.push(p);
         }
         let q = query("example.com", 1);

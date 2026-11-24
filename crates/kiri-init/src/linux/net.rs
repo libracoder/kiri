@@ -1137,6 +1137,32 @@ fd00000000000000000000000000000000 40 00000000000000000000000000000000 00 000000
     }
 
     #[test]
+    fn leaving_first_of_three_networks_promotes_first_attached_external_gateway_and_ifname() {
+        let gw_a = [10, 98, 0, 1];
+        let gw_zeta = [10, 98, 1, 1];
+        let gw_beta = [10, 98, 2, 1];
+        let mut ups = Vec::new();
+        ups.extend(Uplink::of("kva0", "eth0", gw_a, None, Plug::default()));
+        // An internal network attached in between produces no uplink.
+        ups.extend(Uplink::of("kxi1", "eth1", [10, 98, 9, 1], None, Plug { internal: true, no_ipv4: false }));
+        ups.extend(Uplink::of("kxz2", "eth2", gw_zeta, None, Plug::default()));
+        ups.extend(Uplink::of("kxb3", "eth3", gw_beta, None, Plug::default()));
+
+        let (r4, _) = route_holders(&ups);
+        assert_eq!(r4.map(|u| (u.ifname.as_str(), u.v4)), Some(("eth0", Some(gw_a))));
+
+        // Disconnecting `a` promotes `zeta` on eth2 (first-plugged external), not `beta` on eth3.
+        ups.retain(|u| u.veth != "kva0");
+        let (r4, _) = route_holders(&ups);
+        assert_eq!(r4.map(|u| (u.ifname.as_str(), u.v4)), Some(("eth2", Some(gw_zeta))));
+
+        // Disconnecting `zeta` promotes `beta` on eth3.
+        ups.retain(|u| u.veth != "kxz2");
+        let (r4, _) = route_holders(&ups);
+        assert_eq!(r4.map(|u| (u.ifname.as_str(), u.v4)), Some(("eth3", Some(gw_beta))));
+    }
+
+    #[test]
     fn a_disconnect_that_takes_no_default_route_touches_nothing() {
         // The pid is never used: nothing to hand over, so no namespace is opened.
         let mut ups = vec![up("a", true, true), up("b", true, true)];

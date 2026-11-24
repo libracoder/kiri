@@ -86,10 +86,10 @@ pub struct Process {
     pub tty: bool,
     /// (bridge, ip) registered with the DNS server, to drop on exit.
     pub dns_entries: Vec<(String, [u8; 4])>,
-    /// Host sides of its veths. Deleted on exit: a container sharing this
-    /// network namespace would otherwise keep them, and the address that
-    /// goes back to the pool, alive.
-    pub veths: Vec<String>,
+    /// `(ifname, host_veth)` for each attached bridge interface. Deleted on
+    /// exit: a container sharing this network namespace would otherwise keep
+    /// them, and the address that goes back to the pool, alive.
+    pub veths: Vec<(String, String)>,
     /// Its non-internal networks, in the order they were plugged in: which
     /// one takes the default route when the one holding it is disconnected.
     pub uplinks: Vec<net::Uplink>,
@@ -135,6 +135,11 @@ pub enum Root {
 }
 
 impl Process {
+    /// Host-side veth currently plugged in as container interface `ifname`.
+    pub fn veth_for(&self, ifname: &str) -> Option<&str> {
+        self.veths.iter().find(|(iface, _)| iface == ifname).map(|(_, host)| host.as_str())
+    }
+
     /// Settles where its root stands, without waiting: the child's byte
     /// means ready, the pipe's end means it ended first, nothing yet means
     /// still starting.
@@ -764,7 +769,7 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
         net::attach_container(net.bridges, spec.net.bridge, &host_if, pid, spec.net.ip, spec.net.prefix, spec.net.gateway, mac, v6, plug)
             .map_err(|e| kill_child(io::Error::new(e.kind(), format!("network: {e}"))))?;
         uplinks.extend(net::Uplink::of(&host_if, "eth0", spec.net.gateway, v6, plug));
-        veths.push(host_if);
+        veths.push(("eth0".to_owned(), host_if));
         if embedded_dns {
             if let Some(name) = net_opts::values(spec.net.opts, net_opts::NETWORK).next() {
                 net.dns.name_network(spec.net.bridge, name);
@@ -787,11 +792,11 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
                 // not stand in for this container's own.
                 net.dns.drop_container(pid);
                 std::fs::File::open(format!("/proc/{pid}/ns/net")).and_then(|ns| {
-                    net.dns.serve_in(&ns, pid, spec.net.ip, spec.net.bridge)?;
+                    net.dns.serve_in(&ns, pid, spec.net.bridge)?;
                     // User networks it joins once it runs: their names
                     // answer from its first lookup (#449).
                     for b in net_opts::values(spec.net.opts, net_opts::DNS_BRIDGE) {
-                        net.dns.serve_in(&ns, pid, spec.net.ip, b)?;
+                        net.dns.serve_in(&ns, pid, b)?;
                     }
                     Ok(())
                 })
@@ -835,6 +840,7 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
         if let Some(ip) = v6 {
             net.dns.register6(spec.net.bridge, spec.net.dns_names.iter(), spec.net.ip, ip);
         }
+        net.dns.set_container_upstream(pid, servers.clone());
         net.dns.set_upstream(spec.net.ip, servers);
     }
     Ok(Process {
@@ -1115,11 +1121,12 @@ pub fn oom_killed(p: &Process) -> bool {
 /// deletes them (see `net::retire`).
 pub fn teardown(p: &Process, netns_shared: bool) {
     if netns_shared {
-        for v in &p.veths {
+        for (_, v) in &p.veths {
             let _ = net::detach(v);
         }
     } else {
-        net::retire(&p.veths);
+        let host_veths: Vec<String> = p.veths.iter().map(|(_, v)| v.clone()).collect();
+        net::retire(&host_veths);
     }
     if let Some(t) = &p.teardown {
         undo_now(t, t.remove);
@@ -1214,11 +1221,15 @@ pub fn sweep(paths: &Paths, cgroup: &std::path::Path) {
             remove_cgroup(&cg);
         }
     }
-    // Host-side veths are kv<9 characters of the id><4 hex digits>.
+    // Host-side veths are kv<9 characters of the id><4 hex digits> or kx<9><idx>.
     let Ok(links) = fs::read_dir("/sys/class/net") else { return };
     for link in links.flatten() {
         let Ok(name) = link.file_name().into_string() else { continue };
-        let ours = name.strip_prefix("kv").and_then(|rest| rest.get(..9)).is_some_and(|p| ids.iter().any(|id| id.starts_with(p)));
+        let ours = name
+            .strip_prefix("kv")
+            .or_else(|| name.strip_prefix("kx"))
+            .and_then(|rest| rest.get(..9))
+            .is_some_and(|p| ids.iter().any(|id| id.starts_with(p)));
         if ours {
             let _ = net::detach(&name);
         }
