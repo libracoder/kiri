@@ -5,8 +5,9 @@
 //! - a LaunchAgent that starts `kiri daemon` at login (`--no-agent` skips it)
 //! - the app's bundled `docker`, Compose and buildx, when run from Kiri.app
 //! - `docker` and `kiri` in `~/.kiri/bin`, which a marked line in the shell
-//!   profiles (zsh's, bash's, and fish's if used) adds to the end of PATH,
-//!   so a docker CLI already installed keeps priority; and
+//!   profiles (zsh's, bash's, and fish's if used) adds to the end of PATH
+//!   once (`--no-profiles` skips the profile edits and takes back any Kiri
+//!   added), so a docker CLI already installed keeps priority; and
 //!   `/usr/local/bin/kiri` when that directory is the user's
 //! - on a Mac with no other Docker engine, `kiri` as docker's default context
 //! - a buildx builder, `kiri-build`, that loads what it builds into Kiri,
@@ -93,7 +94,13 @@ pub fn first_launch() {
         false
     });
     if set_up {
-        // Set up by an older Kiri: make sure the commands are there too.
+        // Set up by an older Kiri: make sure the commands are there too,
+        // without re-adding shell profile lines the user removed (#556).
+        if !dev()
+            && let Ok(h) = home()
+        {
+            mark_profiles_configured(&h);
+        }
         if let Some(contents) = bundle_contents() {
             let _ = bundled_cli(&contents);
         }
@@ -188,6 +195,15 @@ pub fn run(args: &[String]) -> io::Result<()> {
         cfg["currentContext"] = CONTEXT.get().into();
         write_json(&path, &cfg).map_err(step("making kiri docker's current context"))?;
         println!("docker now uses Kiri by default (`docker context use default` to switch back)");
+    }
+    if !dev() {
+        let h = home().map_err(step("setting up the kiri and docker commands"))?;
+        let z = zdotdir(&h);
+        if flag("--no-profiles") {
+            opt_out_shell_path(&h, &z).map_err(step("setting up the kiri and docker commands"))?;
+        } else if bundle_contents().is_some() {
+            shell_path(&h, &z).map_err(step("setting up the kiri and docker commands"))?;
+        }
     }
     first_step("commands")?;
     if !flag("--no-agent") {
@@ -565,7 +581,7 @@ fn bundled_cli(contents: &Path) -> io::Result<()> {
     // Kiri Dev's commands are run by path: ~/.kiri-dev/bin/kiri.
     if !dev() {
         let h = home()?;
-        shell_path(&h, &zdotdir(&h))?;
+        shell_path_once(&h, &zdotdir(&h))?;
         system_link(&kiri);
     }
     let mut bin = contents.join("Resources/bin");
@@ -594,7 +610,11 @@ fn bundled_cli(contents: &Path) -> io::Result<()> {
     }
     cfg["cliPluginsExtraDirs"] = dirs.into();
     write_json(&path, &cfg)?;
-    println!("docker and kiri commands: {} (on PATH in new terminal windows)", ours.display());
+    if home().is_ok_and(|h| no_profiles_file(&h).exists()) {
+        println!("docker and kiri commands: {}", ours.display());
+    } else {
+        println!("docker and kiri commands: {} (on PATH in new terminal windows)", ours.display());
+    }
     Ok(())
 }
 
@@ -696,11 +716,39 @@ fn zdotdir(home: &Path) -> PathBuf {
     std::env::var_os("ZDOTDIR").filter(|d| !d.is_empty()).map_or_else(|| home.to_path_buf(), PathBuf::from)
 }
 
-/// Puts ~/.kiri/bin on the shell's PATH in each profile. A profile that
-/// can't be written is passed over (and logged), not the end of setup: a
-/// link to a dotfiles folder that moved made the app's first launch quit
-/// with only "No such file or directory" (#250).
+/// Recorded in `~/.kiri` once Kiri has edited shell profiles on initial setup,
+/// so subsequent app launches leave removed lines removed (#556).
+const PROFILES_CONFIGURED: &str = "profiles-configured";
+
+/// Recorded in `~/.kiri` by `kiri setup --no-profiles` so Kiri never edits
+/// shell profiles (#556).
+const NO_PROFILES: &str = "no-profiles";
+
+fn profiles_configured_file(home: &Path) -> PathBuf {
+    home.join(crate::flavor::STATE.get()).join(PROFILES_CONFIGURED)
+}
+
+fn no_profiles_file(home: &Path) -> PathBuf {
+    home.join(crate::flavor::STATE.get()).join(NO_PROFILES)
+}
+
+fn mark_profiles_configured(home: &Path) {
+    let path = profiles_configured_file(home);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, "");
+}
+
+/// Puts ~/.kiri/bin on the shell's PATH in each profile, unless the user has
+/// opted out with `kiri setup --no-profiles` or a profile already references
+/// `.kiri/bin` (#556). A profile that can't be written is passed over (and
+/// logged), not the end of setup: a link to a dotfiles folder that moved made
+/// the app's first launch quit with only "No such file or directory" (#250).
 fn shell_path(home: &Path, zdotdir: &Path) -> io::Result<()> {
+    if no_profiles_file(home).exists() {
+        return Ok(());
+    }
     for (file, line) in profiles(home, zdotdir) {
         // A link to nothing (or to a place Kiri can't reach): writing
         // through it fails when the target's folder is gone (#250), or makes
@@ -720,7 +768,7 @@ fn shell_path(home: &Path, zdotdir: &Path) -> io::Result<()> {
                 continue;
             }
         };
-        if text.contains(PROFILE_MARK) {
+        if text.contains(PROFILE_MARK) || text.contains(".kiri/bin") {
             continue;
         }
         let sep = if text.is_empty() || text.ends_with('\n') { "" } else { "\n" };
@@ -729,7 +777,30 @@ fn shell_path(home: &Path, zdotdir: &Path) -> io::Result<()> {
             crate::diag::warn!("shell profile skipped", file = file.display(), error = e);
         }
     }
+    mark_profiles_configured(home);
     Ok(())
+}
+
+/// Edits shell profiles only on the initial setup: once `profiles-configured`
+/// or `no-profiles` is recorded in `~/.kiri`, subsequent app launches leave
+/// the user's profiles untouched (#556).
+fn shell_path_once(home: &Path, zdotdir: &Path) -> io::Result<()> {
+    if profiles_configured_file(home).exists() || no_profiles_file(home).exists() {
+        return Ok(());
+    }
+    shell_path(home, zdotdir)
+}
+
+/// `kiri setup --no-profiles`: removes any profile lines Kiri added and
+/// records `no-profiles` in `~/.kiri` so future launches and `kiri setup`
+/// runs leave shell profiles alone (#556).
+fn opt_out_shell_path(home: &Path, zdotdir: &Path) -> io::Result<()> {
+    remove_shell_path(home, zdotdir)?;
+    let path = no_profiles_file(home);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(path, "")
 }
 
 fn remove_shell_path(home: &Path, zdotdir: &Path) -> io::Result<()> {
@@ -748,6 +819,8 @@ fn remove_shell_path(home: &Path, zdotdir: &Path) -> io::Result<()> {
             std::fs::write(&file, kept)?;
         }
     }
+    let _ = std::fs::remove_file(profiles_configured_file(home));
+    let _ = std::fs::remove_file(no_profiles_file(home));
     Ok(())
 }
 
@@ -1198,6 +1271,121 @@ mod tests {
         assert_eq!(read(".profile").trim_end(), "export B=2");
         assert_eq!(read(".zshrc").trim(), "");
         assert!(!read(".bashrc").contains("kiri"));
+        assert!(!super::profiles_configured_file(&h).exists());
+        assert!(!super::no_profiles_file(&h).exists());
+        let _ = std::fs::remove_dir_all(&h);
+    }
+
+    // #556: initial setup records `profiles-configured` in `~/.kiri` so
+    // subsequent app launches (`shell_path_once`) do not re-append Kiri's
+    // block after the user or a dotfiles manager removes it, until
+    // `kiri setup --uninstall` resets state.
+    #[test]
+    fn first_launch_edits_shell_profiles_only_once() {
+        let h = scratch("once");
+        std::fs::write(h.join(".zprofile"), "export A=1\n").unwrap();
+        std::fs::write(h.join(".zshrc"), "export B=2\n").unwrap();
+
+        super::shell_path_once(&h, &h).unwrap();
+        assert!(super::profiles_configured_file(&h).is_file());
+        assert!(std::fs::read_to_string(h.join(".zprofile")).unwrap().contains(super::PROFILE_MARK));
+        assert!(std::fs::read_to_string(h.join(".zshrc")).unwrap().contains(super::PROFILE_MARK));
+
+        // The user or a dotfiles manager restores the profiles without Kiri's block.
+        std::fs::write(h.join(".zprofile"), "export A=1\n").unwrap();
+        std::fs::write(h.join(".zshrc"), "export B=2\n").unwrap();
+
+        // Subsequent app launches leave the cleaned-up profiles untouched.
+        super::shell_path_once(&h, &h).unwrap();
+        assert_eq!(std::fs::read_to_string(h.join(".zprofile")).unwrap(), "export A=1\n");
+        assert_eq!(std::fs::read_to_string(h.join(".zshrc")).unwrap(), "export B=2\n");
+
+        // Explicit `kiri setup` from the CLI still adds the lines when asked.
+        super::shell_path(&h, &h).unwrap();
+        assert!(std::fs::read_to_string(h.join(".zprofile")).unwrap().contains(super::PROFILE_MARK));
+        assert!(std::fs::read_to_string(h.join(".zshrc")).unwrap().contains(super::PROFILE_MARK));
+
+        // Uninstall removes the lines and clears the marker so a fresh install sets up again.
+        super::remove_shell_path(&h, &h).unwrap();
+        assert!(!super::profiles_configured_file(&h).exists());
+        std::fs::write(h.join(".zprofile"), "export A=1\n").unwrap();
+        std::fs::write(h.join(".zshrc"), "export B=2\n").unwrap();
+        super::shell_path_once(&h, &h).unwrap();
+        assert!(std::fs::read_to_string(h.join(".zprofile")).unwrap().contains(super::PROFILE_MARK));
+        assert!(std::fs::read_to_string(h.join(".zshrc")).unwrap().contains(super::PROFILE_MARK));
+
+        let _ = std::fs::remove_dir_all(&h);
+    }
+
+    // #556: a profile that already puts `~/.kiri/bin` on PATH without Kiri's
+    // marker comment (such as a dotfiles-managed profile) is not given a
+    // duplicate block even on the first setup, and uninstall leaves the user's
+    // line alone.
+    #[test]
+    fn profile_already_referencing_kiri_bin_is_not_duplicated() {
+        let h = scratch("dotfiles-path");
+        let custom_zsh = "export PATH=\"$HOME/.kiri/bin:$PATH\"\n";
+        let custom_bash = "path_prepend ~/.kiri/bin\n";
+        let custom_fish = "fish_add_path ~/.kiri/bin\n";
+        std::fs::write(h.join(".zshrc"), custom_zsh).unwrap();
+        std::fs::write(h.join(".bashrc"), custom_bash).unwrap();
+        std::fs::create_dir_all(h.join(".config/fish/conf.d")).unwrap();
+        std::fs::write(h.join(".config/fish/conf.d/kiri.fish"), custom_fish).unwrap();
+
+        super::shell_path_once(&h, &h).unwrap();
+
+        // Profiles that already reference `.kiri/bin` are untouched.
+        assert_eq!(std::fs::read_to_string(h.join(".zshrc")).unwrap(), custom_zsh);
+        assert_eq!(std::fs::read_to_string(h.join(".bashrc")).unwrap(), custom_bash);
+        assert_eq!(std::fs::read_to_string(h.join(".config/fish/conf.d/kiri.fish")).unwrap(), custom_fish);
+        // Profiles without `.kiri/bin` still get the block on initial setup.
+        assert!(std::fs::read_to_string(h.join(".zprofile")).unwrap().contains(super::PROFILE_MARK));
+
+        // Uninstall removes only Kiri's marked block and preserves the user's own `.kiri/bin` lines.
+        super::remove_shell_path(&h, &h).unwrap();
+        assert_eq!(std::fs::read_to_string(h.join(".zshrc")).unwrap(), custom_zsh);
+        assert_eq!(std::fs::read_to_string(h.join(".bashrc")).unwrap(), custom_bash);
+        assert_eq!(std::fs::read_to_string(h.join(".config/fish/conf.d/kiri.fish")).unwrap(), custom_fish);
+        assert_eq!(std::fs::read_to_string(h.join(".zprofile")).unwrap().trim(), "");
+
+        let _ = std::fs::remove_dir_all(&h);
+    }
+
+    // #556: `kiri setup --no-profiles` removes any existing Kiri block, records
+    // `no-profiles` in `~/.kiri` so neither subsequent launches nor `kiri setup`
+    // touch shell profiles, and `kiri setup --uninstall` clears the opt-out.
+    #[test]
+    fn no_profiles_opt_out_removes_existing_lines_and_persists_until_uninstall() {
+        let h = scratch("no-profiles");
+        std::fs::write(h.join(".zprofile"), "export A=1\n").unwrap();
+        std::fs::write(h.join(".zshrc"), "export B=2\n").unwrap();
+
+        // Initial setup adds Kiri's lines.
+        super::shell_path_once(&h, &h).unwrap();
+        assert!(std::fs::read_to_string(h.join(".zprofile")).unwrap().contains(super::PROFILE_MARK));
+        assert!(std::fs::read_to_string(h.join(".zshrc")).unwrap().contains(super::PROFILE_MARK));
+
+        // Opting out with `kiri setup --no-profiles` removes Kiri's lines and persists `no-profiles`.
+        super::opt_out_shell_path(&h, &h).unwrap();
+        assert!(super::no_profiles_file(&h).is_file());
+        assert!(!super::profiles_configured_file(&h).exists());
+        assert_eq!(std::fs::read_to_string(h.join(".zprofile")).unwrap().trim_end(), "export A=1");
+        assert_eq!(std::fs::read_to_string(h.join(".zshrc")).unwrap().trim_end(), "export B=2");
+
+        // Neither subsequent app launches nor explicit `kiri setup` edit profiles while opted out.
+        super::shell_path_once(&h, &h).unwrap();
+        super::shell_path(&h, &h).unwrap();
+        assert_eq!(std::fs::read_to_string(h.join(".zprofile")).unwrap().trim_end(), "export A=1");
+        assert_eq!(std::fs::read_to_string(h.join(".zshrc")).unwrap().trim_end(), "export B=2");
+
+        // Uninstall clears `no-profiles` so a fresh install after uninstall sets up profiles again.
+        super::remove_shell_path(&h, &h).unwrap();
+        assert!(!super::no_profiles_file(&h).exists());
+        super::shell_path_once(&h, &h).unwrap();
+        assert!(std::fs::read_to_string(h.join(".zprofile")).unwrap().contains(super::PROFILE_MARK));
+        assert!(std::fs::read_to_string(h.join(".zshrc")).unwrap().contains(super::PROFILE_MARK));
+
+        let _ = std::fs::remove_dir_all(&h);
     }
 
     #[test]

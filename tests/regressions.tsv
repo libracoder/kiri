@@ -342,3 +342,4 @@ tls-company-root-login	#303	docker login to a registry signed by a root the syst
 tls-unknown-root-refused	#303	a root the system does not trust must still be refused
 crates/kiri-image/src/roots.rs	#303	root store merge, system distrust filtering (macOS Never Trust, Windows Disallowed and disabled Server Auth EKU), cross-cert preservation, caps, and KIRI_TLS_ROOTS=webpki escape hatch
 crates/kiri/src/daemon/hostroots.rs	#303	Windows host roots persistence in WSL must enforce Caller::Host, 0600 atomic writes, non-symlink/non-FIFO reads, and bounded sizes
+crates/kiri/src/setup.rs	#556	opening Kiri.app re-appended the ~/.kiri/bin PATH block to shell profiles on every launch even when removed or when a profile already put ~/.kiri/bin on PATH, with no kiri setup --no-profiles opt-out

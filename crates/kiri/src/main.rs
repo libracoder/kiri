@@ -101,7 +101,7 @@ const USAGE_LINES: &[&str] = &[
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     "       kiri ui [--start] [--view containers|images|volumes|networks|builds]",
     #[cfg(target_os = "macos")]
-    "       kiri setup [--use] [--no-agent] | kiri setup --uninstall",
+    "       kiri setup [--use] [--no-agent] [--no-profiles] | kiri setup --uninstall",
     #[cfg(unix)]
     "       kiri build-with [docker|kiri]   which builder docker build uses",
     "       kiri domains [set [--http N] [--https N] | reset]   the *.kiri.local routers' ports",
@@ -496,6 +496,10 @@ mod tests {
             for mac_cmd in ["setup", "update", "import", "bench", "boot"] {
                 assert!(cmds.contains(&mac_cmd), "macOS help missing `{mac_cmd}`:\n{help}");
             }
+            assert!(
+                help.contains("kiri setup [--use] [--no-agent] [--no-profiles] | kiri setup --uninstall"),
+                "macOS help missing `kiri setup` flags:\n{help}"
+            );
             assert!(help.contains("kiri update [--check]"), "macOS help missing `kiri update [--check]`:\n{help}");
             assert!(!cmds.contains(&"bridge"), "macOS help must not list Linux-only `bridge`:\n{help}");
         }
