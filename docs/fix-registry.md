@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #589 Mac: host.docker.internal reaches a server on ::1, such as Node's localhost (unreleased)
+- Fixes: #258 macOS: host.docker.internal reaches only the Mac's 127.0.0.1, not ::1, so localhost dev servers are unreachable
+- Caused: none known
+- Caused by: -
+- Check: none
+
 ### #454 Networks: ignore IPv6 IPAM subnets when IPv6 is disabled, as Docker does (unreleased)
 - Fixes: #433 `POST /networks/create` with `EnableIPv6: false` (or omitted) and an IPv6 subnet in `IPAM.Config` was refused instead of ignoring the IPv6 subnet as Docker does (`mailcow-dockerized`)
 - Caused: none known
