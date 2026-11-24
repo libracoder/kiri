@@ -331,3 +331,5 @@ crates/kiri-init/src/linux/mod.rs	#207	with panic=abort, a panic in PID 1 or the
 restart-policy-refused	#841	docker update stored unknown restart policies or enabled restarts on AutoRemove containers, and container create/update accepted negative or non-on-failure MaximumRetryCount values
 crates/kiri/src/ui/compose.rs	#770	on Windows, Compose projects started inside a WSL distro had Linux label paths (/home/...) rejected as non-absolute and \\wsl.localhost\<distro>\... rejected as remote UNC paths
 crates/kiri/src/daemon/api.rs	#770	containers created inside WSL did not expose their owning WSL distro on GET /containers/json for Windows Compose path mapping
+bind-nonroot-parallel	#796	concurrent non-root file and directory creation on a macOS bind mount raced with root stat/ls and /proc/kiri-fsnotify on the shared virtiofs inode's cached i_uid/i_gid, failing with EACCES/EPERM
+bind-nonroot-ro	#796	non-root writes to a read-only 0444 bind-mount file must still fail with EACCES, including inside an unprivileged unshare -Ur user namespace

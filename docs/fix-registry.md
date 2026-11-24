@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #796 Guest kernel: check caller owner mode bits and superblock capabilities on virtiofs (unreleased)
+- Fixes: #796 Concurrent non-root bind-mount file and directory creation on macOS fails intermittently with EACCES/EPERM when root or `/proc/kiri-fsnotify` touches the shared inode
+- Caused: none known
+- Caused by: -
+- Check: `bind-nonroot-parallel`, `bind-nonroot-ro`
+
 ### #770 Windows: map WSL Compose label paths to `\\wsl.localhost\<distro>\…` and Windows drives (unreleased)
 - Fixes: #770 Windows: Compose section says "Kiri can't find this project's compose file" for every project started inside the WSL distro
 - Caused: none known

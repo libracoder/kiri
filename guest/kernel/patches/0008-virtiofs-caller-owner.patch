@@ -1,0 +1,222 @@
+# Header: Apple's Virtualization.framework virtiofs server synthesizes each
+# FUSE reply's uid and gid from the caller's request header instead of keeping
+# real per-file ownership, and caches those attributes for 1 s on the shared
+# guest inode. When another UID touches the same share — kiri-init (uid 0)
+# mounting bind sources or walking /proc/kiri-fsnotify for inotify watchers,
+# or another container — it overwrites the shared inode's i_uid/i_gid to 0 or
+# that container's UID. Concurrent non-root operations then race in
+# fuse_permission() / setattr_prepare() and fail with EACCES / EPERM (#796).
+# On virtiofs, treat the calling task as the inode's owner/group when checking
+# mode bits, DAC capabilities, setattr, sticky directories, and cached stat,
+# matching what Apple's virtiofs server already reports to that caller.
+--- a/fs/fuse/fuse_i.h
++++ b/fs/fuse/fuse_i.h
+@@ -549,6 +549,7 @@
+ 	bool group_id_present:1;
+ 	bool default_permissions:1;
+ 	bool allow_other:1;
++	bool caller_owner:1;
+ 	bool destroy:1;
+ 	bool no_control:1;
+ 	bool no_force_umount:1;
+@@ -802,6 +803,9 @@
+ 
+ 	/** Allow other than the mounter user to access the filesystem ? */
+ 	unsigned allow_other:1;
++
++	/** Server synthesizes attr uid/gid from the caller's request header? */
++	unsigned caller_owner:1;
+ 
+ 	/** Does the filesystem support copy_file_range? */
+ 	unsigned no_copy_file_range:1;
+--- a/fs/fuse/virtio_fs.c
++++ b/fs/fuse/virtio_fs.c
+@@ -1532,6 +1532,7 @@
+ 	ctx->rootmode = S_IFDIR;
+ 	ctx->default_permissions = 1;
+ 	ctx->allow_other = 1;
++	ctx->caller_owner = 1;
+ 	ctx->max_read = UINT_MAX;
+ 	ctx->blksize = 512;
+ 	ctx->destroy = true;
+--- a/fs/fuse/inode.c
++++ b/fs/fuse/inode.c
+@@ -299,7 +299,7 @@
+ 	 * check in may_delete().
+ 	 */
+ 	fi->orig_i_mode = inode->i_mode;
+-	if (!fc->default_permissions)
++	if (!fc->default_permissions || fc->caller_owner)
+ 		inode->i_mode &= ~S_ISVTX;
+ 
+ 	fi->orig_ino = attr->ino;
+@@ -1886,6 +1886,7 @@
+ 
+ 	fc->default_permissions = ctx->default_permissions;
+ 	fc->allow_other = ctx->allow_other;
++	fc->caller_owner = ctx->caller_owner;
+ 	fc->user_id = ctx->user_id;
+ 	fc->group_id = ctx->group_id;
+ 	fc->legacy_opts_show = ctx->legacy_opts_show;
+--- a/fs/fuse/dir.c
++++ b/fs/fuse/dir.c
+@@ -1402,6 +1402,10 @@
+ 		stat->mode = fi->orig_i_mode;
+ 		stat->ino = fi->orig_ino;
+ 		stat->blksize = 1 << fi->cached_i_blkbits;
++		if (fc->caller_owner) {
++			stat->uid = vfsuid_into_kuid(make_vfsuid(idmap, fc->user_ns, current_fsuid()));
++			stat->gid = vfsgid_into_kgid(make_vfsgid(idmap, fc->user_ns, current_fsgid()));
++		}
+ 		if (test_bit(FUSE_I_BTIME, &fi->state)) {
+ 			stat->btime = fi->i_btime;
+ 			stat->result_mask |= STATX_BTIME;
+@@ -1568,6 +1572,49 @@
+ 	return fuse_do_getattr(&nop_mnt_idmap, inode, NULL, NULL);
+ }
+ 
++static bool fuse_caller_capable(struct fuse_conn *fc, int cap)
++{
++	struct user_namespace *ns = fc->user_ns;
++
++	return kuid_has_mapping(ns, current_fsuid()) &&
++	       kgid_has_mapping(ns, current_fsgid()) &&
++	       ns_capable(ns, cap);
++}
++
++/*
++ * Apple's virtiofs server echoes InHeader.uid/gid as the file's owner, so
++ * every caller is treated as the owner there. Check owner mode bits and
++ * DAC capabilities directly instead of racing on cached inode->i_uid/i_gid
++ * from other callers.
++ */
++static int fuse_caller_permission(struct inode *inode, int mask)
++{
++	struct fuse_conn *fc = get_fuse_conn(inode);
++	umode_t mode = inode->i_mode;
++	int m = mask & (MAY_READ | MAY_WRITE | MAY_EXEC);
++
++	if (!(m & ~(mode >> 6)))
++		return 0;
++
++	if (S_ISDIR(mode)) {
++		if (!(m & MAY_WRITE) &&
++		    fuse_caller_capable(fc, CAP_DAC_READ_SEARCH))
++			return 0;
++		if (fuse_caller_capable(fc, CAP_DAC_OVERRIDE))
++			return 0;
++		return -EACCES;
++	}
++
++	if (m == MAY_READ && fuse_caller_capable(fc, CAP_DAC_READ_SEARCH))
++		return 0;
++
++	if ((!(m & MAY_EXEC) || (mode & S_IXUGO)) &&
++	    fuse_caller_capable(fc, CAP_DAC_OVERRIDE))
++		return 0;
++
++	return -EACCES;
++}
++
+ /*
+  * Check permission.  The two basic access models of FUSE are:
+  *
+@@ -1600,7 +1647,9 @@
+ 	if (fc->default_permissions ||
+ 	    ((mask & MAY_EXEC) && S_ISREG(inode->i_mode))) {
+ 		struct fuse_inode *fi = get_fuse_inode(inode);
+-		u32 perm_mask = STATX_MODE | STATX_UID | STATX_GID;
++		u32 perm_mask = fc->caller_owner ?
++			STATX_MODE :
++			(STATX_MODE | STATX_UID | STATX_GID);
+ 
+ 		if (perm_mask & READ_ONCE(fi->inval_mask) ||
+ 		    time_before64(fi->i_time, get_jiffies_64())) {
+@@ -1613,7 +1662,9 @@
+ 	}
+ 
+ 	if (fc->default_permissions) {
+-		err = generic_permission(idmap, inode, mask);
++		err = fc->caller_owner ?
++			fuse_caller_permission(inode, mask) :
++			generic_permission(idmap, inode, mask);
+ 
+ 		/* If permission is denied, try to refresh file
+ 		   attributes.  This is also needed, because the root
+@@ -1621,8 +1672,10 @@
+ 		if (err == -EACCES && !refreshed) {
+ 			err = fuse_perm_getattr(inode, mask);
+ 			if (!err)
+-				err = generic_permission(idmap,
+-							 inode, mask);
++				err = fc->caller_owner ?
++					fuse_caller_permission(inode, mask) :
++					generic_permission(idmap,
++								 inode, mask);
+ 		}
+ 
+ 		/* Note: the opposite of the above test does not
+@@ -1961,6 +2014,51 @@
+  * vmtruncate() doesn't allow for this case, so do the rlimit checking
+  * and the actual truncation by hand.
+  */
++static int fuse_caller_setattr_check(struct mnt_idmap *idmap,
++				     struct fuse_conn *fc,
++				     struct iattr *attr)
++{
++	unsigned int ia_valid = attr->ia_valid;
++	vfsuid_t caller_uid = make_vfsuid(idmap, fc->user_ns, current_fsuid());
++	vfsgid_t caller_gid = make_vfsgid(idmap, fc->user_ns, current_fsgid());
++
++	if ((ia_valid & ATTR_UID) &&
++	    !(vfsuid_eq_kuid(caller_uid, current_fsuid()) &&
++	      vfsuid_eq(attr->ia_vfsuid, caller_uid)) &&
++	    !fuse_caller_capable(fc, CAP_CHOWN))
++		return -EPERM;
++
++	if ((ia_valid & ATTR_GID) &&
++	    !(vfsuid_eq_kuid(caller_uid, current_fsuid()) &&
++	      (vfsgid_eq(attr->ia_vfsgid, caller_gid) ||
++	       vfsgid_in_group_p(attr->ia_vfsgid))) &&
++	    !fuse_caller_capable(fc, CAP_CHOWN))
++		return -EPERM;
++
++	if (ia_valid & ATTR_MODE) {
++		vfsgid_t vfsgid = (ia_valid & ATTR_GID) ?
++			attr->ia_vfsgid : caller_gid;
++
++		if (!vfsuid_eq_kuid(caller_uid, current_fsuid()) &&
++		    !fuse_caller_capable(fc, CAP_FOWNER))
++			return -EPERM;
++
++		if (!vfsgid_eq(vfsgid, caller_gid) &&
++		    !vfsgid_in_group_p(vfsgid) &&
++		    !(vfsgid_has_mapping(fc->user_ns, vfsgid) &&
++		      fuse_caller_capable(fc, CAP_FSETID)))
++			attr->ia_mode &= ~S_ISGID;
++	}
++
++	if ((ia_valid & (ATTR_MTIME_SET | ATTR_ATIME_SET | ATTR_TIMES_SET)) &&
++	    !vfsuid_eq_kuid(caller_uid, current_fsuid()) &&
++	    !fuse_caller_capable(fc, CAP_FOWNER))
++		return -EPERM;
++
++	attr->ia_valid |= ATTR_FORCE;
++	return 0;
++}
++
+ int fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+ 		    struct iattr *attr, struct file *file)
+ {
+@@ -1982,6 +2080,11 @@
+ 
+ 	if (!fc->default_permissions)
+ 		attr->ia_valid |= ATTR_FORCE;
++	else if (fc->caller_owner && !(attr->ia_valid & ATTR_FORCE)) {
++		err = fuse_caller_setattr_check(idmap, fc, attr);
++		if (err)
++			return err;
++	}
+ 
+ 	err = setattr_prepare(idmap, dentry, attr);
+ 	if (err)
