@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #272 UI: Persian wording, consistent terms and half-spaces (unreleased)
+- Fixes: no issue
+- Caused: none known
+- Caused by: -
+- Check: none
+
 ### #512 Mac: the window drags from its strip from where the button went down (unreleased)
 - Fixes: #337 macOS 26: dragging the window from the top strip doesn't move the window
 - Caused: none known
