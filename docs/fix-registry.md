@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #382, #415 Guest kernel: persist explicit `chown` ownership on virtiofs inodes and enable close-to-open page/dir caching with 1 MiB read-ahead (unreleased)
+- Fixes: #382 `chown` on macOS bind mounts returns 0 without updating file owner, breaking subsequent `chmod` (`initdb`, PostgreSQL, npm) as that user; #415 Slow small-file read throughput on macOS virtiofs bind mounts
+- Caused: none known
+- Caused by: -
+- Check: `bind-chown-chmod`
+
 ### #734 Builder: load images built by containerized Docker CLIs into Kiri's store (unreleased)
 - Fixes: #734 `docker build` from a `docker` CLI inside a container leaves the image out of Kiri's store
 - Caused: none known
