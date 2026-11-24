@@ -258,6 +258,7 @@ userns-run-privileged	#597	when the Linux engine runs inside a user namespace, -
 limit-memory-swap-inspect	#523	containers with --memory reported HostConfig.MemorySwap 0 instead of 2x memory and dropped --memory-swap (#690)
 limit-memory-swap-refused	#523	invalid --memory-swap values on create and update were accepted instead of refused with Docker's error messages (#690)
 limit-memory-swap-update	#523	docker update dropped --memory-swap or failed to keep an existing custom or unlimited swap limit (#690)
+restart-policy-refused	#841	docker update stored unknown restart policies and docker run accepted a negative on-failure retry count
 limit-memory-swap	#523	every container with --memory was pinned to memory.swap.max = 0 instead of getting Docker's 2x default or --memory-swap (#690)
 stats-cpu-throttling	#537	container stats always reported zero for cpu_stats.throttling_data even when a CPU-limited container was throttled
 cp-created-volume-out	#245	GET /containers/{id}/archive (docker cp out) on a created or stopped container opened only the overlay rootfs without mounting named volumes, returning 404 for files in the volume (Supabase CLI PG_VERSION check)

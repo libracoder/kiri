@@ -2505,6 +2505,38 @@ pub(super) fn limits_from(h: &Value, base: super::engine::Limits) -> Result<supe
     Ok(l)
 }
 
+pub(super) fn restart_policy(v: &Value, creating: bool) -> Result<RestartPolicy, Error> {
+    let name = match v["Name"].as_str() {
+        Some("") | None => "no",
+        Some(n) => n,
+    };
+    if !matches!(name, "no" | "always" | "unless-stopped" | "on-failure") {
+        let message = if creating {
+            format!("invalid restart policy {name}")
+        } else {
+            format!(
+                "invalid restart policy: unknown policy '{name}'; use one of 'no', 'always', 'on-failure', or 'unless-stopped'"
+            )
+        };
+        return Err(Error::BadRequest(message));
+    }
+    let max_retries = v["MaximumRetryCount"].as_i64().unwrap_or(0);
+    if max_retries < 0 {
+        return Err(Error::BadRequest(
+            "invalid restart policy: maximum retry count cannot be negative".into(),
+        ));
+    }
+    if max_retries > 0 && name != "on-failure" {
+        return Err(Error::BadRequest(
+            "invalid restart policy: maximum retry count can only be used with 'on-failure'".into(),
+        ));
+    }
+    Ok(RestartPolicy {
+        name: name.to_owned(),
+        max_retries: max_retries as u32,
+    })
+}
+
 /// Returned in `POST /containers/create`'s `Warnings` when the caller asks for
 /// `--security-opt seccomp=unconfined` (or `seccomp:unconfined`). Kiri lifts
 /// the default syscall filter there, but `kiri-init` still installs the host
@@ -2644,6 +2676,13 @@ pub(super) fn create_for(req: &Request, engine: &Engine, wsl_distro: Option<&str
     // Checked before mounts, which may create volumes.
     let healthcheck = healthcheck_from(&body, &image_cfg)?;
     let (entrypoint, cmd) = command(strings(&body["Entrypoint"]), strings(&body["Cmd"]), &image.config.entrypoint, &image.config.cmd)?;
+    let restart = restart_policy(&host["RestartPolicy"], true)?;
+    let auto_remove = host["AutoRemove"].as_bool().unwrap_or(false);
+    if auto_remove && restart.name != "no" {
+        return Err(Error::BadRequest(
+            "can't create 'AutoRemove' container with restart policy".into(),
+        ));
+    }
     let mounts = mounts_for(&body, engine, &image, wsl_distro)?;
     let exposed = exposed_ports(&body, &image_cfg);
     let ports = port_bindings(&body, &exposed)?;
@@ -2681,7 +2720,7 @@ pub(super) fn create_for(req: &Request, engine: &Engine, wsl_distro: Option<&str
         env,
         cwd: pick("WorkingDir", &image.config.working_dir),
         user: pick("User", &image.config.user),
-        auto_remove: host["AutoRemove"].as_bool().unwrap_or(false),
+        auto_remove,
         privileged: host["Privileged"].as_bool().unwrap_or(false),
         limits,
         caps: caps_from(host)?,
@@ -2725,20 +2764,8 @@ pub(super) fn create_for(req: &Request, engine: &Engine, wsl_distro: Option<&str
         mount_request: mount_request(&body, &image_cfg),
         volumes: mounts.volumes,
         anon_volumes: mounts.anon,
-        restart: RestartPolicy {
-            name: match host["RestartPolicy"]["Name"].as_str() {
-                Some("") | None => "no".to_owned(),
-                Some(n) => n.to_owned(),
-            },
-            max_retries: host["RestartPolicy"]["MaximumRetryCount"].as_u64().unwrap_or(0) as u32,
-        },
+        restart,
     };
-    if !matches!(spec.restart.name.as_str(), "no" | "always" | "unless-stopped" | "on-failure") {
-        return Err(Error::BadRequest(format!("invalid restart policy {}", spec.restart.name)));
-    }
-    if spec.auto_remove && spec.restart.name != "no" {
-        return Err(Error::BadRequest("can't create 'AutoRemove' container with restart policy".into()));
-    }
     let id = engine.create(req.query("name").map(str::to_owned), spec, &image)?;
     Ok(json!({"Id": id, "Warnings": warnings}))
 }
@@ -4138,6 +4165,174 @@ mod tests {
             name: name.into(), digest: "sha256:0123".into(), index_digest: None, config_digest: "sha256:0123".into(),
             layers: Vec::new(), size: 0, platform: "linux/arm64".into(), created: String::new(), pulled_at: 0, config: Default::default(),
         }
+    }
+
+    #[test]
+    fn restart_policies_are_refused_like_docker() {
+        let retry_only =
+            "invalid restart policy: maximum retry count can only be used with 'on-failure'";
+        let negative = "invalid restart policy: maximum retry count cannot be negative";
+        let with_retries = |name, count| json!({"Name": name, "MaximumRetryCount": count});
+        for (policy, expected) in [
+            (
+                json!({"Name": "bogus"}),
+                Err("invalid restart policy bogus"),
+            ),
+            (with_retries("always", 3), Err(retry_only)),
+            (with_retries("on-failure", -1), Err(negative)),
+            (with_retries("no", 1), Err(retry_only)),
+            (with_retries("", 2), Err(retry_only)),
+            (with_retries("unless-stopped", 1), Err(retry_only)),
+            (json!({"Name": "always"}), Ok(("always", 0))),
+            (json!({"Name": "unless-stopped"}), Ok(("unless-stopped", 0))),
+            (json!({"Name": "no"}), Ok(("no", 0))),
+            (with_retries("on-failure", 0), Ok(("on-failure", 0))),
+            (with_retries("on-failure", 5), Ok(("on-failure", 5))),
+            (Value::Null, Ok(("no", 0))),
+            (json!({"Name": ""}), Ok(("no", 0))),
+        ] {
+            let result = restart_policy(&policy, true);
+            let actual = match &result {
+                Ok(p) => Ok((p.name.as_str(), p.max_retries)),
+                Err(Error::BadRequest(message)) => Err(message.as_str()),
+                other => panic!("{other:?}"),
+            };
+            assert_eq!(actual, expected, "{policy}");
+        }
+    }
+
+    #[test]
+    fn create_restart_policy_is_validated_before_container_creation() {
+        let (root, engine) = engine_in("create-restart", false);
+        let mut image = test_image("restart-create:1");
+        image.platform = format!("linux/{}", go_arch());
+        engine.store.put_image(image).unwrap();
+        let make = |name: &str, policy: Value| {
+            let body = json!({
+                "Image": "restart-create:1", "Cmd": ["true"],
+                "HostConfig": {"NetworkMode": "none", "RestartPolicy": policy}
+            });
+            let req = Request::internal(
+                "POST",
+                "/containers/create",
+                &[("name", name)],
+                serde_json::to_vec(&body).unwrap(),
+            );
+            create(&req, &engine)
+        };
+        let result = make(
+            "invalid-restart",
+            json!({"Name": "always", "MaximumRetryCount": 3}),
+        );
+        assert!(matches!(result, Err(Error::BadRequest(_))), "{result:?}");
+        assert!(engine.with("invalid-restart", |_| ()).is_err());
+        make(
+            "valid-restart",
+            json!({"Name": "on-failure", "MaximumRetryCount": 3}),
+        )
+        .unwrap();
+        let policy = engine
+            .with("valid-restart", |c| c.spec.restart.clone())
+            .unwrap();
+        assert_eq!(
+            (policy.name.as_str(), policy.max_retries),
+            ("on-failure", 3)
+        );
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn update_restart_policy_is_validated_before_it_is_stored() {
+        let (root, engine) = engine_in("update-restart", false);
+        let mut image = test_image("restart-test:1");
+        image.platform = format!("linux/{}", go_arch());
+        engine.store.put_image(image).unwrap();
+        for (name, auto_remove) in [("ordinary", false), ("auto-remove", true)] {
+            let body = json!({
+                "Image": "restart-test:1", "Cmd": ["true"], "HostConfig": {"AutoRemove": auto_remove, "NetworkMode": "none"}
+            });
+            let req = Request::internal(
+                "POST",
+                "/containers/create",
+                &[("name", name)],
+                serde_json::to_vec(&body).unwrap(),
+            );
+            create(&req, &engine).unwrap();
+            assert_eq!(
+                engine
+                    .with(name, |c| (c.spec.auto_remove, c.spec.restart.name.clone()))
+                    .unwrap(),
+                (auto_remove, "no".to_owned())
+            );
+        }
+        let update = |key: &str, body: Value| {
+            use std::io::Read;
+            let req = Request::internal(
+                "POST",
+                &format!("/containers/{key}/update"),
+                &[],
+                serde_json::to_vec(&body).unwrap(),
+            );
+            let (mut client, mut server) = UnixStream::pair().unwrap();
+            super::super::ops::route(&req, &engine, &mut server)
+                .unwrap()
+                .unwrap();
+            drop(server);
+            let mut result = String::new();
+            client.read_to_string(&mut result).unwrap();
+            result
+        };
+        let stored = |key| engine.with(key, |c| c.spec.restart.clone()).unwrap();
+        let auto_remove =
+            "Restart policy cannot be updated because AutoRemove is enabled for the container";
+        let unknown = "invalid restart policy: unknown policy 'bogus'; use one of 'no', 'always', 'on-failure', or 'unless-stopped'";
+        let retry_only = "maximum retry count can only be used with 'on-failure'";
+        let negative = "maximum retry count cannot be negative";
+        for (key, policy, status, message) in [
+            ("auto-remove", json!({"Name": "always"}), 409, auto_remove),
+            ("ordinary", json!({"Name": "bogus"}), 400, unknown),
+            (
+                "ordinary",
+                json!({"Name": "always", "MaximumRetryCount": 3}),
+                400,
+                retry_only,
+            ),
+            (
+                "ordinary",
+                json!({"Name": "on-failure", "MaximumRetryCount": -1}),
+                400,
+                negative,
+            ),
+        ] {
+            let before = stored(key);
+            let response = update(key, json!({"RestartPolicy": policy}));
+            assert!(
+                response.starts_with(&format!("HTTP/1.1 {status} ")) && response.contains(message),
+                "{policy}: {response}"
+            );
+            assert_eq!(stored(key), before, "{policy}");
+        }
+        let response = update("auto-remove", json!({"RestartPolicy": {"Name": "no"}}));
+        assert!(response.starts_with("HTTP/1.1 200 "), "{response}");
+        assert_eq!(stored("auto-remove").name, "no");
+        let response = update(
+            "ordinary",
+            json!({"RestartPolicy": {"Name": "on-failure", "MaximumRetryCount": 3}}),
+        );
+        assert!(response.starts_with("HTTP/1.1 200 "), "{response}");
+        let expected = RestartPolicy {
+            name: "on-failure".into(),
+            max_retries: 3,
+        };
+        assert_eq!(stored("ordinary"), expected);
+        for body in [json!({}), json!({"RestartPolicy": {"Name": ""}})] {
+            let response = update("ordinary", body);
+            assert!(response.starts_with("HTTP/1.1 200 "), "{response}");
+            assert_eq!(stored("ordinary"), expected);
+        }
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// A container using `volume` and `image`, in the list.

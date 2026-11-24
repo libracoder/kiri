@@ -152,10 +152,12 @@ fn update(req: &Request, engine: &Engine, key: &str) -> Result<Value, Error> {
     let b = body(req)?;
     let base = engine.with(key, |c| c.spec.limits)?;
     let limits = super::api::limits_from(&b, base)?;
-    let restart = b["RestartPolicy"]["Name"].as_str().filter(|n| !n.is_empty()).map(|n| super::engine::RestartPolicy {
-        name: n.to_owned(),
-        max_retries: b["RestartPolicy"]["MaximumRetryCount"].as_u64().unwrap_or(0) as u32,
-    });
+    let policy = &b["RestartPolicy"];
+    let restart = policy["Name"]
+        .as_str()
+        .filter(|name| !name.is_empty())
+        .map(|_| super::api::restart_policy(policy, false))
+        .transpose()?;
     engine.update(key, limits, restart)?;
     Ok(json!({"Warnings": []}))
 }
