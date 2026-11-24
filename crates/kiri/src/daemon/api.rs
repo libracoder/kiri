@@ -287,7 +287,7 @@ fn route(req: &Request, engine: &Arc<Engine>, caller: &Caller, w: &mut UnixStrea
             return image_save(engine, &names, w);
         }
         ("POST", "/containers/create") => {
-            if let Some(made) = super::builder::create_for_buildx(engine, req.query("name")) {
+            if let Some(made) = super::builder::create_for_buildx(engine, req) {
                 return reply(w, made, 201);
             }
             return reply(w, create_for(req, engine, caller.wsl_distro()), 201);

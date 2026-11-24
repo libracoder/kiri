@@ -1447,11 +1447,12 @@ fn embedded_dns(spec: &RunSpec<'_>, upstream: &[[u8; 4]], relay: bool) -> bool {
 /// container reaches it. As the default bridge's containers do, its
 /// lookups then go through the Mac when the Mac's resolver for the VM
 /// network doesn't answer (dns.rs), where asking that resolver directly
-/// would just fail. Not on a Linux host (the container has the host's own
-/// resolv.conf), nor with `--dns`. On a fresh VM before any bridged
-/// container has started, `kiri0` is brought up on demand with the default
-/// bridge's gateway and prefix. None, the VM's upstream as before, when
-/// the bridge can't be brought up or the agent can't listen there.
+/// would just fail. Not on a Linux host (the container runs in the host's
+/// network namespace and reaches `127.0.0.53` on host loopback directly),
+/// nor with `--dns`. On a fresh VM before any bridged container has
+/// started, `kiri0` is brought up on demand with the default bridge's
+/// gateway and prefix. None, the VM's upstream as before, when the bridge
+/// can't be brought up or the agent can't listen there.
 fn host_network_resolver(spec: &RunSpec<'_>, bridges: &mut net::Bridges, dns: &mut super::dns::Dns) -> Option<[u8; 4]> {
     if !host_network_uses_agent(spec, dns.relay) {
         return None;
@@ -1556,12 +1557,17 @@ fn resolv_conf(spec: &RunSpec<'_>, upstream: &[[u8; 4]], embedded: Option<[u8; 4
         for d in servers {
             resolv.push_str(&format!("nameserver {d}\n"));
         }
-    } else if upstream.is_empty() {
-        // The VM has no lease yet; a public resolver beats none.
-        resolv.push_str("nameserver 1.1.1.1\n");
     } else {
-        for d in upstream {
+        let host_net = spec.flags & run_flags::NET_HOST != 0;
+        let mut wrote = false;
+        for d in upstream.iter().filter(|d| host_net || d[0] != 127) {
             resolv.push_str(&format!("nameserver {}\n", net::ip_str(*d)));
+            wrote = true;
+        }
+        if !wrote {
+            // The VM has no lease yet, or only a loopback stub remained
+            // without an agent listener; a public resolver beats none.
+            resolv.push_str("nameserver 1.1.1.1\n");
         }
     }
     // `--dns-search .` means no search domains.
@@ -3733,6 +3739,17 @@ mod tests {
         // TEST-NET-3: no machine running the tests has it.
         assert!(!super::embedded_dns(&spec, &[[203, 0, 113, 53]], false), "a resolver elsewhere is asked directly");
         assert!(!super::embedded_dns(&spec, &[], false), "no resolver: the public fallback, not the agent");
+        // systemd-resolved's 127.0.0.53 stub and Tailscale's 100.100.100.100
+        // live in the host's network namespace: default-bridge containers ask
+        // the agent at the bridge gateway (172.17.0.1), never 127.0.0.53 (#330).
+        for stub in [&[[127, 0, 0, 53]][..], &[[127, 0, 0, 53], [168, 63, 129, 16]][..], &[[100, 100, 100, 100]][..]] {
+            assert!(super::embedded_dns(&spec, stub, false), "{stub:?} goes through the agent");
+            assert_eq!(super::resolv_conf(&spec, stub, Some(super::embedded_address(&spec))), "nameserver 172.17.0.1\n");
+        }
+        // Even if no agent listener could be made, a bridged container strips
+        // 127/8 stubs and keeps non-loopback fallbacks or 1.1.1.1.
+        assert_eq!(super::resolv_conf(&spec, &[[127, 0, 0, 53], [168, 63, 129, 16]], None), "nameserver 168.63.129.16\n");
+        assert_eq!(super::resolv_conf(&spec, &[[127, 0, 0, 53]], None), "nameserver 1.1.1.1\n");
     }
 
     #[test]
@@ -3753,7 +3770,10 @@ mod tests {
         // Mac too (#732); not with --dns, nor on a Linux host (no relay).
         spec_with(run_flags::NET_HOST, &[], &|s| assert!(super::host_network_uses_agent(s, true)));
         spec_with(run_flags::NET_HOST, &["nameserver=8.8.8.8"], &|s| assert!(!super::host_network_uses_agent(s, true), "--dns servers are asked directly"));
-        spec_with(run_flags::NET_HOST, &[], &|s| assert!(!super::host_network_uses_agent(s, false), "a Linux host keeps its own resolv.conf"));
+        spec_with(run_flags::NET_HOST, &[], &|s| {
+            assert!(!super::host_network_uses_agent(s, false), "a Linux host has its own resolv.conf");
+            assert_eq!(super::resolv_conf(s, &[[127, 0, 0, 53]], None), "nameserver 127.0.0.53\n", "Linux --network host keeps 127.0.0.53 directly");
+        });
         spec_with(0, &[], &|s| assert!(!super::host_network_uses_agent(s, true), "a bridged container has its own"));
         // Named by the bridge's gateway, not 127.0.0.11: builders keep it
         // for their steps rather than swapping in 8.8.8.8.
@@ -3778,7 +3798,9 @@ mod tests {
 
         let mut bridges = super::net::Bridges::default();
         let mut dns = super::super::dns::Dns::default();
-        check([172, 17, 0, 1], 16, &[], &mut |s| assert_eq!(super::host_network_resolver(s, &mut bridges, &mut dns), None, "no relay on a Linux host"));
+        check([172, 17, 0, 1], 16, &[], &mut |s| {
+            assert_eq!(super::host_network_resolver(s, &mut bridges, &mut dns), None, "no relay on a Linux host");
+        });
         dns.relay = true;
         check([172, 17, 0, 1], 16, &["nameserver=8.8.8.8"], &mut |s| {
             assert_eq!(super::host_network_resolver(s, &mut bridges, &mut dns), None, "--dns bypasses agent resolver");

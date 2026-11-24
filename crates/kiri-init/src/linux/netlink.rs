@@ -1046,21 +1046,22 @@ const EMBEDDED_DNS_TABLE: &str = "kiri_dns";
 /// ```text
 /// table ip kiri_dns {
 ///   chain output { type nat hook output priority -100;
-///     ip daddr 127.0.0.11 udp dport 53 dnat to 127.0.0.11:<port> }
+///     ip daddr 127.0.0.11 udp dport 53 dnat to 127.0.0.11:<udp_port>
+///     ip daddr 127.0.0.11 tcp dport 53 dnat to 127.0.0.11:<tcp_port> }
 /// }
 /// ```
 ///
-/// The embedded DNS listens on 127.0.0.11:`port`, a free high port, so port
-/// 53 stays free for a DNS server of the container's own (dnsmasq, Pi-hole,
-/// CoreDNS bind 0.0.0.0:53), while the container's lookups at 127.0.0.11:53
-/// still reach Kiri's. Replies are mapped back to port 53 by conntrack. TCP
-/// is not redirected: the embedded DNS answers over UDP only.
-pub fn redirect_embedded_dns(addr: [u8; 4], port: u16) -> io::Result<()> {
+/// The embedded DNS listens on 127.0.0.11's free high ports, so port 53 (UDP
+/// and TCP) stays free for a DNS server of the container's own (dnsmasq,
+/// Pi-hole, CoreDNS bind 0.0.0.0:53), while the container's lookups at
+/// 127.0.0.11:53 still reach Kiri's. Replies are mapped back to port 53 by
+/// conntrack.
+pub fn redirect_embedded_dns(addr: [u8; 4], udp_port: u16, tcp_port: Option<u16>) -> io::Result<()> {
     let mut nl = Netlink::open(libc::NETLINK_NETFILTER)?;
-    nl.request(&mut embedded_dns_batch(addr, port))
+    nl.request(&mut embedded_dns_batch(addr, udp_port, tcp_port))
 }
 
-fn embedded_dns_batch(addr: [u8; 4], port: u16) -> Vec<Msg> {
+fn embedded_dns_batch(addr: [u8; 4], udp_port: u16, tcp_port: Option<u16>) -> Vec<Msg> {
     let mut begin = Msg::new(NFNL_MSG_BATCH_BEGIN, 0);
     begin.raw(&nfgen(libc::AF_UNSPEC as u8, NFNL_SUBSYS_NFTABLES));
     let mut table = nft(NFT_MSG_NEWTABLE, NLM_F_ACK | NLM_F_CREATE);
@@ -1076,10 +1077,15 @@ fn embedded_dns_batch(addr: [u8; 4], port: u16) -> Vec<Msg> {
     // that took 15-30 ms of every container start.
     let mut flush = nft(NFT_MSG_DELRULE, NLM_F_ACK);
     flush.attr_str(1, EMBEDDED_DNS_TABLE).attr_str(2, "output");
-    let rule = dnat_rule_in(EMBEDDED_DNS_TABLE, "output", &Dnat { udp: true, host_ip: addr, host_port: 53, to_ip: addr, to_port: port }, None, None);
+    let udp_rule = dnat_rule_in(EMBEDDED_DNS_TABLE, "output", &Dnat { udp: true, host_ip: addr, host_port: 53, to_ip: addr, to_port: udp_port }, None, None);
+    let mut out = vec![begin, table, chain, flush, udp_rule];
+    if let Some(tp) = tcp_port {
+        out.push(dnat_rule_in(EMBEDDED_DNS_TABLE, "output", &Dnat { udp: false, host_ip: addr, host_port: 53, to_ip: addr, to_port: tp }, None, None));
+    }
     let mut end = Msg::new(NFNL_MSG_BATCH_END, 0);
     end.raw(&nfgen(libc::AF_UNSPEC as u8, NFNL_SUBSYS_NFTABLES));
-    vec![begin, table, chain, flush, rule, end]
+    out.push(end);
+    out
 }
 
 const NLM_F_DUMP: u16 = 0x300;
@@ -1433,16 +1439,16 @@ mod tests {
 
     /// The embedded DNS's redirect in a container's namespace: its own
     /// table (an engine inside the container replaces `kiri`), one output
-    /// nat chain emptied first, one rule that sends UDP for 127.0.0.11:53 to
-    /// the server's port.
+    /// nat chain emptied first, and UDP/TCP rules that send 127.0.0.11:53 to
+    /// the server's ports.
     #[test]
     fn the_embedded_dns_redirect_is_one_rule_in_a_table_of_its_own() {
-        let mut msgs = embedded_dns_batch([127, 0, 0, 11], 40123);
+        let mut msgs = embedded_dns_batch([127, 0, 0, 11], 40123, Some(40124));
         let types: Vec<u16> = msgs.iter().map(|m| u16::from_ne_bytes([m.buf[4], m.buf[5]])).collect();
         let t = |m: u16| (NFNL_SUBSYS_NFTABLES << 8) | m;
         // No DELTABLE: unregistering a hook waits for an RCU grace period.
-        assert_eq!(types, [NFNL_MSG_BATCH_BEGIN, t(NFT_MSG_NEWTABLE), t(NFT_MSG_NEWCHAIN), t(NFT_MSG_DELRULE), t(NFT_MSG_NEWRULE), NFNL_MSG_BATCH_END]);
-        for m in &msgs[1..5] {
+        assert_eq!(types, [NFNL_MSG_BATCH_BEGIN, t(NFT_MSG_NEWTABLE), t(NFT_MSG_NEWCHAIN), t(NFT_MSG_DELRULE), t(NFT_MSG_NEWRULE), t(NFT_MSG_NEWRULE), NFNL_MSG_BATCH_END]);
+        for m in &msgs[1..6] {
             assert_eq!(get(&attrs(&m.buf[20..]), 1), b"kiri_dns\0");
         }
         assert_eq!(get(&attrs(&msgs[3].buf[20..]), 2), b"output\0", "the chain's rules, no handle: all of them");
@@ -1450,9 +1456,13 @@ mod tests {
         let hook = attrs(get(&chain, 4));
         assert_eq!((be32(get(&hook, 1)), be32(get(&hook, 2)) as i32), (3, -100), "the output hook, at nat priority");
         assert_eq!(get(&chain, 7), b"nat\0");
-        let rule = msgs[4].finish(1).to_vec();
-        let has = |needle: &[u8]| rule.windows(needle.len()).any(|w| w == needle);
-        assert!(has(&[127, 0, 0, 11]) && has(&53u16.to_be_bytes()) && has(&40123u16.to_be_bytes()) && has(b"nat\0"));
+        let udp_rule = msgs[4].finish(1).to_vec();
+        let tcp_rule = msgs[5].finish(1).to_vec();
+        let has = |rule: &[u8], needle: &[u8]| rule.windows(needle.len()).any(|w| w == needle);
+        assert!(has(&udp_rule, &[127, 0, 0, 11]) && has(&udp_rule, &53u16.to_be_bytes()) && has(&udp_rule, &40123u16.to_be_bytes()) && has(&udp_rule, b"nat\0"));
+        assert!(has(&tcp_rule, &[127, 0, 0, 11]) && has(&tcp_rule, &53u16.to_be_bytes()) && has(&tcp_rule, &40124u16.to_be_bytes()) && has(&tcp_rule, b"nat\0"));
+        let udp_only = embedded_dns_batch([127, 0, 0, 11], 40123, None);
+        assert_eq!(udp_only.len(), 6, "UDP redirect proceeds alone when TCP bind fails");
     }
 
     /// The table is replaced with messages every kernel since 3.13 knows:

@@ -193,9 +193,11 @@ fn ensure_image(engine: &Engine, say: &mut dyn FnMut(&str)) -> Result<kiri_image
 
 /// The body of the builder's create: what buildx's docker-container driver
 /// makes (privileged, the state volume at /var/lib/buildkit, the same
-/// buildkitd flag), without a restart policy, since it starts on demand.
-fn create_body() -> Value {
-    json!({
+/// buildkitd flag), without a restart policy, since it starts on demand,
+/// keeping network, DNS and environment options when buildx creates the
+/// builder container (`--driver-opt network=host`, `env.*`, #209).
+fn create_body_from(requested: Option<&Value>) -> Value {
+    let mut body = json!({
         "Image": IMAGE,
         "Cmd": ["--allow-insecure-entitlement=network.host"],
         "Labels": {LABEL: "1"},
@@ -204,13 +206,32 @@ fn create_body() -> Value {
             "Mounts": [{"Type": "volume", "Source": volume_name(), "Target": "/var/lib/buildkit"}],
             "RestartPolicy": {"Name": "no"},
         },
-    })
+    });
+    if let Some(req) = requested {
+        if let Some(env) = req.get("Env").filter(|v| v.is_array()) {
+            body["Env"] = env.clone();
+        }
+        let host = &req["HostConfig"];
+        if let Some(mode) = host["NetworkMode"].as_str().filter(|m| !m.is_empty() && *m != "default") {
+            body["HostConfig"]["NetworkMode"] = json!(mode);
+        }
+        for key in ["Dns", "DnsSearch", "DnsOptions", "ExtraHosts"] {
+            if let Some(val) = host.get(key).filter(|v| v.is_array()) {
+                body["HostConfig"][key] = val.clone();
+            }
+        }
+    }
+    body
 }
 
 fn create(engine: &Engine, say: &mut dyn FnMut(&str)) -> Result<String, Error> {
+    create_with(engine, None, say)
+}
+
+fn create_with(engine: &Engine, requested: Option<&Value>, say: &mut dyn FnMut(&str)) -> Result<String, Error> {
     ensure_image(engine, say)?;
     let name = container_name();
-    let req = Request::internal("POST", "/containers/create", &[("name", &name)], create_body().to_string().into_bytes());
+    let req = Request::internal("POST", "/containers/create", &[("name", &name)], create_body_from(requested).to_string().into_bytes());
     let made = api::create(&req, engine)?;
     crate::diag::info!("builder created", name = name);
     let id = made["Id"].as_str().unwrap_or_default().to_owned();
@@ -257,28 +278,36 @@ fn start_with(
 }
 
 /// What the builder's registry tables come from: daemon.json's settings,
-/// and the registries the store's images came from that those settings
-/// reach without verified TLS (a network entry covers a registry only once
-/// an image from it is pulled).
+/// the registries mirrored from Kiri's store, those reached without verified
+/// TLS, and whether the builder runs on the host network.
 #[derive(Debug, PartialEq)]
 struct Registries {
     config: std::sync::Arc<kiri_image::RegistryConfig>,
+    mirrored: Vec<String>,
     unverified: Vec<String>,
+    host_net: bool,
 }
 
 impl Registries {
-    fn now(names: &[String]) -> Registries {
+    fn now(names: &[String], host_net: bool) -> Registries {
         let config = super::daemon_json::current();
+        let mut mirrored = names.to_vec();
+        mirrored.sort();
+        mirrored.dedup();
         let unverified = super::mirror::unverified(&config, names);
-        Registries { config, unverified }
+        Registries { config, mirrored, unverified, host_net }
     }
 }
 
+fn builder_host_net(engine: &Engine, id: &str) -> bool {
+    engine.with(id, |c| c.spec.network_mode == "host").unwrap_or(false)
+}
+
 /// [`Registries`] as the builder's config last had them, so a hand edit, or
-/// an image pulled from a registry inside a listed network, reaches a
-/// running builder at the next build. `None` until this daemon has written
-/// the file: a builder found running then (left from before the daemon
-/// started) may have anything, and is treated as stale.
+/// an image pulled from a new registry, reaches a running builder at the next
+/// build. `None` until this daemon has written the file: a builder found
+/// running then (left from before the daemon started) may have anything, and
+/// is treated as stale.
 static WRITTEN: std::sync::Mutex<Option<std::sync::Arc<Registries>>> = std::sync::Mutex::new(None);
 
 /// Whether a running builder's registry settings are not today's.
@@ -290,8 +319,9 @@ fn is_stale(written: Option<&Registries>, current: &Registries) -> bool {
 /// start. [`WRITTEN`] says so only once the file is in place.
 fn write_config(engine: &Engine, id: &str) -> Result<(), Error> {
     let names = super::mirror::registry_names(engine);
-    let current = Registries::now(&names);
-    let toml = config_toml(cache_limit(), &super::mirror::config(engine, &current.config, &names));
+    let host_net = builder_host_net(engine, id);
+    let current = Registries::now(&names, host_net);
+    let toml = config_toml(cache_limit(), &super::mirror::config_for(engine, &current.config, &names, host_net));
     let archive = tar(&[("buildkit/", None), ("buildkit/buildkitd.toml", Some(toml.as_bytes()))]);
     let written = copy_in(engine, id, "/etc", &mut io::Cursor::new(archive));
     *WRITTEN.lock().unwrap_or_else(|e| e.into_inner()) = written.is_ok().then(|| std::sync::Arc::new(current));
@@ -391,10 +421,10 @@ enum Step {
 const STOP_THEN_WRITE: [Step; 3] = [Step::Resume, Step::Stop, Step::Write];
 
 /// Whether the config the builder runs with is not today's: daemon.json
-/// edited by hand, or a registry in a listed network pulled from, since it
-/// was written.
+/// edited by hand, or a new registry pulled into the store since it was written.
 fn stale_now(engine: &Engine) -> bool {
-    is_stale(WRITTEN.lock().unwrap_or_else(|e| e.into_inner()).as_deref(), &Registries::now(&super::mirror::registry_names(engine)))
+    let host_net = find(engine).is_some_and(|(id, _)| builder_host_net(engine, &id));
+    is_stale(WRITTEN.lock().unwrap_or_else(|e| e.into_inner()).as_deref(), &Registries::now(&super::mirror::registry_names(engine), host_net))
 }
 
 /// Whether a builder is restarted with today's config now: only one that is
@@ -522,15 +552,23 @@ fn hide_amd64_qemu(engine: &Engine, id: &str) {
 /// ls`, `inspect`, the window's Builds view) makes and pulls nothing, so a
 /// fresh Kiri has no builder, image or cache volume until the first build.
 /// None for any other name, or when the builder exists (the usual 409).
-pub fn create_for_buildx(engine: &Engine, name: Option<&str>) -> Option<Result<Value, Error>> {
-    if name.map(|n| n.trim_start_matches('/')) != Some(container_name().as_str()) {
+pub fn create_for_buildx(engine: &Engine, req: &Request) -> Option<Result<Value, Error>> {
+    if req.query("name").map(|n| n.trim_start_matches('/')) != Some(container_name().as_str()) {
         return None;
     }
+    let requested = if req.body.is_empty() {
+        None
+    } else {
+        match serde_json::from_slice::<Value>(&req.body) {
+            Ok(v) => Some(v),
+            Err(e) => return Some(Err(Error::BadRequest(format!("invalid JSON: {e}")))),
+        }
+    };
     let _g = ENSURE.lock().unwrap_or_else(|e| e.into_inner());
     if find(engine).is_some() {
         return None;
     }
-    Some(create(engine, &mut |_| {}).map(|id| json!({"Id": id, "Warnings": []})))
+    Some(create_with(engine, requested.as_ref(), &mut |_| {}).map(|id| json!({"Id": id, "Warnings": []})))
 }
 
 /// Claims the builder for a build or prune after checking whether it must
@@ -1012,9 +1050,12 @@ pub fn build(req: &Request, engine: &Arc<Engine>, w: &mut UnixStream, r: &mut Bu
     };
     // `host-gateway` was parsed as the Mac's address; on WSL 2 with the Windows
     // host relay active it's 192.168.65.254, and on a plain Linux host it's the
-    // bridge gateway, as `docker run` gives (kiri-init maps it there).
+    // bridge gateway, or 127.0.0.1 for `--network host`, as `docker run` gives
+    // (kiri-init maps it there).
     let host = if crate::hostrelay::wsl_host_active() {
         crate::hostrelay::WSL_HOST_ADDR_STR.to_owned()
+    } else if cfg!(target_os = "linux") && o.network == "host" {
+        "127.0.0.1".to_owned()
     } else {
         super::mirror::host_addr(engine)
     };
@@ -1353,7 +1394,12 @@ mod tests {
     /// its recorded config is not advanced.
     #[test]
     fn a_builder_whose_config_is_unknown_or_old_is_stale() {
-        let r = |c: kiri_image::RegistryConfig, unverified: &[&str]| Registries { config: std::sync::Arc::new(c), unverified: unverified.iter().map(|s| s.to_string()).collect() };
+        let r = |c: kiri_image::RegistryConfig, unverified: &[&str]| Registries {
+            config: std::sync::Arc::new(c),
+            mirrored: vec!["docker.io".into()],
+            unverified: unverified.iter().map(|s| s.to_string()).collect(),
+            host_net: false,
+        };
         let none = r(kiri_image::RegistryConfig::default(), &[]);
         let some = r(kiri_image::RegistryConfig { insecure: vec![kiri_image::Insecure::parse("registry.lan:5000").unwrap()], ..Default::default() }, &[]);
         assert!(is_stale(None, &none), "never written by this daemon");
@@ -1361,19 +1407,84 @@ mod tests {
         assert!(!is_stale(Some(&some), &some));
     }
 
-    /// An image pulled from a registry inside a listed network, after the
-    /// builder started, makes it stale: its config has no table for it.
+    /// An image pulled from a new registry after the builder started makes it
+    /// stale so `buildkitd.toml` gets Kiri's mirror table (and unverified flags
+    /// when inside a listed network) for that registry; pulling again from an
+    /// already-mirrored registry changes nothing.
     #[test]
     fn a_registry_pulled_from_inside_a_listed_network_makes_the_builder_stale() {
         let c = std::sync::Arc::new(kiri_image::RegistryConfig { insecure: vec![kiri_image::Insecure::parse("10.0.0.0/8").unwrap()], ..Default::default() });
-        let names = |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        let before = Registries { config: c.clone(), unverified: super::super::mirror::unverified(&c, &names(&["docker.io"])) };
-        let after = Registries { config: c.clone(), unverified: super::super::mirror::unverified(&c, &names(&["docker.io", "ghcr.io", "10.1.2.3:5000"])) };
+        let make = |n: &[&str], host_net: bool| {
+            let mut mirrored: Vec<String> = n.iter().map(|s| s.to_string()).collect();
+            let unverified = super::super::mirror::unverified(&c, &mirrored);
+            mirrored.sort();
+            mirrored.dedup();
+            Registries { config: c.clone(), mirrored, unverified, host_net }
+        };
+        let before = make(&["docker.io", "ghcr.io"], false);
+        let after = make(&["docker.io", "ghcr.io", "10.1.2.3:5000"], false);
         assert_eq!(after.unverified, ["10.1.2.3:5000"]);
         assert!(is_stale(Some(&before), &after));
-        // A registry outside the list changes nothing.
-        let other = Registries { config: c.clone(), unverified: super::super::mirror::unverified(&c, &names(&["docker.io", "ghcr.io"])) };
-        assert!(!is_stale(Some(&before), &other));
+        // Pulling another image from an already-mirrored registry changes nothing.
+        let same = make(&["ghcr.io", "docker.io"], false);
+        assert!(!is_stale(Some(&before), &same));
+        // Switching the builder to `--driver-opt network=host` marks its mirror config stale.
+        assert!(is_stale(Some(&before), &make(&["docker.io", "ghcr.io"], true)));
+    }
+
+    #[test]
+    fn create_for_buildx_preserves_host_network_and_dns_options() {
+        use std::io::Write as _;
+        let def = create_body_from(None);
+        assert!(def["HostConfig"].get("NetworkMode").is_none());
+
+        let asked = json!({
+            "Image": "moby/buildkit:buildx-stable-1",
+            "Env": ["HTTP_PROXY=http://10.0.0.1:3128"],
+            "HostConfig": {
+                "NetworkMode": "host",
+                "Dns": ["10.0.0.53"],
+                "DnsSearch": ["corp.example"],
+                "DnsOptions": ["ndots:2"],
+                "ExtraHosts": ["reg.corp:10.0.0.9"],
+                "RestartPolicy": {"Name": "always"},
+            }
+        });
+        let merged = create_body_from(Some(&asked));
+        assert_eq!(merged["HostConfig"]["NetworkMode"], "host");
+        assert_eq!(merged["HostConfig"]["Dns"], json!(["10.0.0.53"]));
+        assert_eq!(merged["HostConfig"]["DnsSearch"], json!(["corp.example"]));
+        assert_eq!(merged["HostConfig"]["DnsOptions"], json!(["ndots:2"]));
+        assert_eq!(merged["HostConfig"]["ExtraHosts"], json!(["reg.corp:10.0.0.9"]));
+        assert_eq!(merged["Env"], json!(["HTTP_PROXY=http://10.0.0.1:3128"]));
+        assert_eq!(merged["HostConfig"]["RestartPolicy"]["Name"], "no", "managed builder starts on demand");
+
+        // Full create_for_buildx round-trip against Engine::boot with IMAGE pre-seeded.
+        let dir = std::env::temp_dir().join(format!("kiri-builder-hostnet-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = kiri_image::Store::open(&dir).unwrap();
+        let cfg = json!({"created": "2026-11-16T00:00:00Z", "architecture": "arm64", "os": "linux", "config": {"Cmd": ["buildkitd"]}});
+        let mut w = store.ingest().unwrap();
+        w.write_all(&serde_json::to_vec(&cfg).unwrap()).unwrap();
+        let (digest, _) = w.finish().unwrap();
+        store.put_image(kiri_image::archive::from_config(IMAGE.into(), &digest, &cfg, Vec::new())).unwrap();
+        let engine = Engine::boot(store).unwrap();
+
+        let other = Request::internal("POST", "/containers/create", &[("name", "not-builder")], serde_json::to_vec(&asked).unwrap());
+        assert!(create_for_buildx(&engine, &other).is_none());
+
+        let name = container_name();
+        let bad = Request::internal("POST", "/containers/create", &[("name", &name)], b"{not-json".to_vec());
+        assert!(matches!(create_for_buildx(&engine, &bad), Some(Err(Error::BadRequest(_)))));
+
+        let create_req = Request::internal("POST", "/containers/create", &[("name", &name)], serde_json::to_vec(&asked).unwrap());
+        let created = create_for_buildx(&engine, &create_req).expect("intercepted").expect("created");
+        let id = created["Id"].as_str().unwrap();
+        assert!(builder_host_net(&engine, id), "builder container kept HostConfig.NetworkMode = host");
+        assert!(create_for_buildx(&engine, &create_req).is_none(), "existing builder falls through to 409");
+
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A builder on an old config is restarted only when it is up and

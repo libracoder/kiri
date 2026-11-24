@@ -47,6 +47,30 @@ impl Proc {
 /// How long a hung-up terminal waits before it's polled again.
 const TTY_HUP_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
 
+type FileStamp = Option<(u64, u64, i64, i64)>;
+
+/// Caches the host's DNS servers by the metadata of `/etc/resolv.conf` and
+/// `/run/systemd/resolve/resolv.conf`, so DNS listener wake-ups only re-read
+/// them when either file's inode, size or modification time has changed.
+#[derive(Default)]
+struct HostDns {
+    stamp: Option<[FileStamp; 2]>,
+    servers: Vec<[u8; 4]>,
+}
+
+impl HostDns {
+    fn get(&mut self) -> &[[u8; 4]] {
+        use std::os::unix::fs::MetadataExt;
+        let stat = |p: &str| std::fs::metadata(p).ok().map(|m| (m.ino(), m.len(), m.mtime(), m.mtime_nsec()));
+        let now = [stat("/etc/resolv.conf"), stat("/run/systemd/resolve/resolv.conf")];
+        if self.stamp != Some(now) {
+            self.servers = super::transport::host_dns();
+            self.stamp = Some(now);
+        }
+        &self.servers
+    }
+}
+
 pub fn serve(conn: File, paths: &Paths) -> io::Result<()> {
     let mut procs: HashMap<libc::pid_t, Proc> = HashMap::new();
     let served = serve_loop(conn, paths, &mut procs);
@@ -78,7 +102,10 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
     // The published ports the kernel forwards, by container (on a Linux
     // host; in the VM, TCP ones reached over the NAT network).
     let mut published: Vec<(String, super::netlink::Dnat)> = Vec::new();
-    let host_dns = if host_process { super::transport::host_dns() } else { Vec::new() };
+    let mut host_dns = HostDns::default();
+    if host_process {
+        host_dns.get();
+    }
     let mut dhcp: Option<Dhcp> = if host_process {
         if let Err(e) = net::host_uplink() {
             eprintln!("kiri-init: no uplink: {e}");
@@ -147,9 +174,7 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
         fds.push(libc::pollfd { fd: sigfd.as_raw_fd(), events: libc::POLLIN, revents: 0 });
         // Always present (fd -1 is ignored by poll), so process fds start at 3.
         fds.push(libc::pollfd { fd: dhcp.as_ref().map_or(-1, Dhcp::fd), events: libc::POLLIN, revents: 0 });
-        for fd in dns.fds() {
-            fds.push(libc::pollfd { fd, events: libc::POLLIN, revents: 0 });
-        }
+        dns.interest(&mut fds);
         fds.push(libc::pollfd { fd: forward.as_raw_fd(), events: libc::POLLIN, revents: 0 });
         fds.push(libc::pollfd { fd: framed.as_raw_fd(), events: libc::POLLIN, revents: 0 });
         fds.push(libc::pollfd { fd: host_bound.as_ref().map_or(-1, |l| l.as_raw_fd()), events: libc::POLLIN, revents: 0 });
@@ -335,7 +360,10 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
                 continue;
             }
             if dns.owns(pfd.fd) {
-                let upstream = dhcp.as_ref().and_then(|d| d.lease.as_ref()).map_or(&host_dns[..], |l| &l.dns);
+                if host_process && dns.is_listener(pfd.fd) {
+                    host_dns.get();
+                }
+                let upstream = dhcp.as_ref().and_then(|d| d.lease.as_ref()).map_or(&host_dns.servers[..], |l| &l.dns);
                 dns.on_readable(pfd.fd, upstream);
                 continue;
             }
@@ -460,11 +488,14 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
                     let join_pid = kiri_proto::net_opts::values(spec.net.opts, kiri_proto::net_opts::NETNS).next().and_then(|t| netns_pid(procs, t));
                     // A PID namespace exists from clone too.
                     let pid_join_pid = kiri_proto::net_opts::values(spec.net.opts, kiri_proto::net_opts::PIDNS).next().and_then(|t| live_pid(procs, t));
+                    if host_process {
+                        host_dns.get();
+                    }
                     failed_starts.remove(spec.id);
                     container::spawn(
                     &spec,
                     paths,
-                    NetCtx { bridges: &mut bridges, dns: &mut dns, upstream_dns: dhcp.as_ref().and_then(|d| d.lease.as_ref()).map_or(&host_dns[..], |l| &l.dns), join_pid, pid_join_pid },
+                    NetCtx { bridges: &mut bridges, dns: &mut dns, upstream_dns: dhcp.as_ref().and_then(|d| d.lease.as_ref()).map_or(&host_dns.servers[..], |l| &l.dns), join_pid, pid_join_pid },
                 )
                 } {
                     Ok(run) => {
@@ -749,7 +780,10 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
                                 // DNS, which now answers in the container: its
                                 // resolv.conf names it from here on (#449).
                                 if is_user {
-                                    let upstream = dhcp.as_ref().and_then(|d| d.lease.as_ref()).map_or(&host_dns[..], |l| &l.dns);
+                                    if host_process {
+                                        host_dns.get();
+                                    }
+                                    let upstream = dhcp.as_ref().and_then(|d| d.lease.as_ref()).map_or(&host_dns.servers[..], |l| &l.dns);
                                     let is_kiri = |a: [u8; 4]| upstream.contains(&a) || dns.serves_at(a) || a == [1, 1, 1, 1];
                                     match container::use_embedded_dns(id, is_kiri) {
                                         Ok(Some(servers)) if !servers.is_empty() => {
