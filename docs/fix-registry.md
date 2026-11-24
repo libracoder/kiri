@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #456 Builds: include Kiri's default BuildKit builder from compose builds (unreleased)
+- Fixes: #456 Builds view misses `docker compose build` history from Kiri's `default` builder
+- Caused: none known
+- Caused by: -
+- Check: none
+
 ### #757 API: accept RFC 9112 §3.2.2 absolute-form HTTP request targets on the Docker socket (unreleased)
 - Fixes: #757 `GET http://127.0.0.1:2376/containers/json HTTP/1.1` over the Docker socket fails with 404 (dockerode / docker-modem / Lando)
 - Caused: none known
