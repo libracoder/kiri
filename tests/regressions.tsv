@@ -281,3 +281,5 @@ tests/disk-grow.py	#384	the macOS VM data disk stayed fixed at 64 GiB instead of
 tests/ui/resources-disk.js	#384	Settings -> Resources had no Disk image size control for macOS VM disk growth without shrinking
 tests/ui/storage-location.js	#355	Settings → Storage had no way to move images, containers, volumes and the VM disk to another folder or external drive, or recover when an external drive is unplugged
 network-ipv6-subnet-ignored-when-disabled	#433	POST /networks/create with EnableIPv6 false (or omitted) and an IPv6 subnet in IPAM.Config was refused instead of ignoring the IPv6 subnet as Docker does (mailcow-dockerized)
+absolute-form-ping	#757	an RFC 9112 §3.2.2 absolute-form request-target over the Docker socket left the scheme and authority in the path and answered 404
+absolute-form-containers	#757	docker-modem requests such as GET http://127.0.0.1:2376/containers/json HTTP/1.1 over the Docker socket answered 404 instead of routing /containers/json

@@ -24,7 +24,15 @@ use super::time;
 pub fn serve(stream: UnixStream, engine: Arc<Engine>, caller: Caller) -> io::Result<()> {
     let mut w = stream.try_clone()?;
     let mut r = BufReader::new(stream);
-    while let Some(req) = http::read_request(&mut r, streams_body)? {
+    loop {
+        let req = match http::read_request(&mut r, streams_body) {
+            Ok(Some(req)) => req,
+            Ok(None) => break,
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                return http::refuse_bad_request(&mut w, &mut r, &e.to_string()).or(Ok(()));
+            }
+            Err(e) => return Err(e),
+        };
         // A body too large to hold: answered and ended, never routed.
         if req.too_large() {
             return http::refuse_too_large(&req, &mut w, &mut r).or(Ok(()));
@@ -4566,6 +4574,27 @@ mod tests {
         // A close asked for on the second request ends it after that one.
         let (got, ended) = exchange("GET /_ping HTTP/1.1\r\nHost: d\r\n\r\nGET /_ping HTTP/1.1\r\nHost: d\r\nConnection: close\r\n\r\n");
         assert!(ended && got.matches("HTTP/1.1 200 ").count() == 2 && got.matches("Connection: close\r\n").count() == 1, "{got}");
+        // Absolute-form targets route as origin-form (#757), while malformed
+        // targets or request lines answer 400 Bad Request and close cleanly.
+        let (got, ended) = exchange("GET http://127.0.0.1:2376/_ping HTTP/1.1\r\nHost: 127.0.0.1:2376\r\nConnection: close\r\n\r\n");
+        assert!(ended && got.starts_with("HTTP/1.1 200 OK\r\n") && got.ends_with("OK"), "{got}");
+        for bad in [
+            "GET http:///containers/json HTTP/1.1\r\nHost: 127.0.0.1:2376\r\n\r\n",
+            "GET ftp://127.0.0.1:2376/_ping HTTP/1.1\r\nHost: 127.0.0.1:2376\r\n\r\n",
+            "GET  http://127.0.0.1:2376/_ping HTTP/1.1\r\nHost: 127.0.0.1:2376\r\n\r\n",
+            "GET\t/_ping HTTP/1.1\r\nHost: d\r\n\r\n",
+        ] {
+            let (got, ended) = exchange(bad);
+            assert!(
+                ended && got.starts_with("HTTP/1.1 400 Bad Request\r\n") && got.contains("Connection: close\r\n") && got.contains("\"message\":\"bad request "),
+                "{bad:?}: {got}"
+            );
+        }
+        let (got, ended) = exchange("GET /_ping HTTP/1.1\r\nHost: d\r\n\r\nGET http:///bad HTTP/1.1\r\nHost: d\r\n\r\nGET /_ping HTTP/1.1\r\nHost: d\r\n\r\n");
+        assert!(
+            ended && got.matches("HTTP/1.1 200 OK\r\n").count() == 1 && got.matches("HTTP/1.1 400 Bad Request\r\n").count() == 1 && got.matches("Connection: close\r\n").count() == 1,
+            "{got}"
+        );
         drop(engine);
         let _ = std::fs::remove_dir_all(root);
     }

@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #757 API: accept RFC 9112 §3.2.2 absolute-form HTTP request targets on the Docker socket (unreleased)
+- Fixes: #757 `GET http://127.0.0.1:2376/containers/json HTTP/1.1` over the Docker socket fails with 404 (dockerode / docker-modem / Lando)
+- Caused: none known
+- Caused by: -
+- Check: `absolute-form-ping`, `absolute-form-containers`
+
 ### #589 Mac: host.docker.internal reaches a server on ::1, such as Node's localhost (unreleased)
 - Fixes: #258 macOS: host.docker.internal reaches only the Mac's 127.0.0.1, not ::1, so localhost dev servers are unreachable
 - Caused: none known

@@ -126,6 +126,10 @@ t archive-directory-contents "PASS stopped docker cp of a parent into new direct
 for c in version cmd keepalive close follow follow-created timestamps endpoints; do
   t "testcontainers-$c" "ok $c" "for i in \$(seq 60); do command -v python3 >/dev/null && break; sleep 1; done; python3 /testcontainers-api.py /root/.kiri/run/docker.sock $c"
 done
+# docker-modem sends an RFC 9112 §3.2.2 absolute-form request-target over the
+# socket when configured with a default host and port (#757).
+t absolute-form-ping "200 OK" "python3 -c 'import socket; s = socket.socket(socket.AF_UNIX); s.connect(\"/root/.kiri/run/docker.sock\"); s.sendall(b\"GET http://127.0.0.1:2376/_ping HTTP/1.1\\r\\nHost: 127.0.0.1:2376\\r\\nConnection: close\\r\\n\\r\\n\"); r = b\"\".join(iter(lambda: s.recv(4096), b\"\")).decode(); print(r.split()[1], r.splitlines()[-1])'"
+t absolute-form-containers "200 [" "python3 -c 'import socket; s = socket.socket(socket.AF_UNIX); s.connect(\"/root/.kiri/run/docker.sock\"); s.sendall(b\"GET http://127.0.0.1:2376/containers/json HTTP/1.1\\r\\nHost: 127.0.0.1:2376\\r\\nConnection: close\\r\\n\\r\\n\"); r = b\"\".join(iter(lambda: s.recv(4096), b\"\")).decode(); print(r.split()[1], r.splitlines()[-1][:1])'"
 t socket-mount-reaches-kiri "Kiri" "docker run --rm -v /root/.kiri/run/docker.sock:/var/run/docker.sock docker:cli docker version --format '{{.Server.Platform.Name}}'"
 # A container given the engine's socket uses Docker's API, not Kiri's own
 # settings: the same CLI that changes them here is refused from inside one.

@@ -111,6 +111,8 @@ impl Request {
 /// When `stream(method, path)` is true the body stays unread: the handler
 /// reads it through [`Body`].
 pub fn read_request(r: &mut BufReader<UnixStream>, stream: impl Fn(&str, &str) -> bool) -> io::Result<Option<Request>> {
+    SERVING.with(|s| *s.borrow_mut() = (String::new(), String::new()));
+    CLOSING.with(|c| c.set(false));
     // The request line and headers are read through a cap, so a client
     // cannot exhaust memory with an endless line. The body is read after.
     let (method, path, api_version, query, headers, http10) = {
@@ -119,13 +121,24 @@ pub fn read_request(r: &mut BufReader<UnixStream>, stream: impl Fn(&str, &str) -
         if head.read_line(&mut line)? == 0 {
             return Ok(None);
         }
-        let mut parts = line.split_whitespace();
-        let (Some(method), Some(target)) = (parts.next(), parts.next()) else {
+        let Some(req_line) = line.strip_suffix('\n').map(|l| l.strip_suffix('\r').unwrap_or(l)) else {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "bad request line"));
         };
-        let http10 = parts.next().is_some_and(|v| v.eq_ignore_ascii_case("HTTP/1.0"));
+        let mut parts = req_line.split(' ');
+        let (Some(method), Some(target), Some(version), None) = (parts.next(), parts.next(), parts.next(), parts.next()) else {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "bad request line"));
+        };
+        if [method, target, version].iter().any(|p| p.is_empty() || p.chars().any(|c| c.is_ascii_control() || c.is_whitespace())) {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "bad request line"));
+        }
+        if !version.eq_ignore_ascii_case("HTTP/1.1") && !version.eq_ignore_ascii_case("HTTP/1.0") {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "bad request line"));
+        }
+        let http10 = version.eq_ignore_ascii_case("HTTP/1.0");
         let method = method.to_owned();
-        let (raw_path, raw_query) = target.split_once('?').unwrap_or((target, ""));
+        let Some((raw_path, raw_query)) = parse_target(target) else {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "bad request target"));
+        };
         // Decoded once, here, so every route that reads a name from the
         // path — an image's `%2F` repository slash above all — resolves the
         // name, not its encoding, as Docker's router does.
@@ -211,6 +224,15 @@ fn too_large(mut req: Request) -> Request {
 pub fn refuse_too_large(req: &Request, w: &mut UnixStream, r: &mut BufReader<UnixStream>) -> io::Result<()> {
     serving(req);
     let sent = error_closing(w, 413, &format!("request body too large: more than the {} MiB a request may send", MAX_BODY >> 20));
+    close(w, r);
+    sent
+}
+
+/// Answers a malformed request (bad request line, target, or chunk size)
+/// with `400 Bad Request` and ends the connection.
+pub fn refuse_bad_request(w: &mut UnixStream, r: &mut BufReader<UnixStream>, message: &str) -> io::Result<()> {
+    SERVING.with(|s| *s.borrow_mut() = (String::new(), String::new()));
+    let sent = error_closing(w, 400, message);
     close(w, r);
     sent
 }
@@ -336,6 +358,50 @@ impl Read for Body<'_> {
         }
         Ok(n)
     }
+}
+
+/// Splits an RFC 9112 §3.2.1 `origin-form` or §3.2.2 `absolute-form`
+/// request-target into `(path, query)`. Clients such as docker-modem send
+/// `GET http://127.0.0.1:2376/containers/json HTTP/1.1` over the Unix socket
+/// or named pipe when configured with a default host and port (#757).
+fn parse_target(target: &str) -> Option<(&str, &str)> {
+    if target.contains('#') {
+        return None;
+    }
+    if target.starts_with('/') {
+        return Some(target.split_once('?').unwrap_or((target, "")));
+    }
+    let (scheme, rest) = target.split_once("://")?;
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return None;
+    }
+    let (authority, tail) = match rest.find(['/', '?']) {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, ""),
+    };
+    if !valid_authority(authority) {
+        return None;
+    }
+    match tail.strip_prefix('?') {
+        Some(q) => Some(("/", q)),
+        None if tail.is_empty() => Some(("/", "")),
+        None => Some(tail.split_once('?').unwrap_or((tail, ""))),
+    }
+}
+
+fn valid_authority(authority: &str) -> bool {
+    let valid_port = |p: &str| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) && p.parse::<u16>().is_ok_and(|n| n > 0);
+    if let Some(rest) = authority.strip_prefix('[') {
+        let Some((v6, after)) = rest.split_once(']') else { return false };
+        return v6.parse::<std::net::Ipv6Addr>().is_ok() && (after.is_empty() || after.strip_prefix(':').is_some_and(valid_port));
+    }
+    let (host, port) = match authority.split_once(':') {
+        Some((h, p)) => (h, Some(p)),
+        None => (authority, None),
+    };
+    !host.is_empty()
+        && host.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+        && port.is_none_or(valid_port)
 }
 
 /// `/v1.47/containers/json` → `/containers/json`.
@@ -695,6 +761,93 @@ mod tests {
         assert_eq!(path_of("/images/a+b/json"), "/images/a+b/json");
         // An invalid escape stays written, as in query values.
         assert_eq!(path_of("/images/100%/json"), "/images/100%/json");
+    }
+
+    /// Clients such as docker-modem send an RFC 9112 §3.2.2 absolute-form
+    /// request-target over the Unix socket or named pipe when configured with
+    /// a default host and port (#757).
+    #[test]
+    fn reads_absolute_form_request_targets() {
+        use std::io::Write;
+        let try_parse = |target: &str| {
+            let (mut a, b) = UnixStream::pair().unwrap();
+            a.write_all(format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1:2376\r\n\r\n").as_bytes())
+                .unwrap();
+            drop(a);
+            read_request(&mut BufReader::new(b), |_, _| false)
+        };
+
+        let req = try_parse("http://127.0.0.1:2376/containers/json?all=1").unwrap().unwrap();
+        assert_eq!(req.path, "/containers/json");
+        assert_eq!(req.api_version, None);
+        assert_eq!(req.query("all"), Some("1"));
+
+        let req = try_parse("HTTP://[::1]:2375/v1.47/version").unwrap().unwrap();
+        assert_eq!(req.path, "/version");
+        assert_eq!(req.api_version, Some((1, 47)));
+
+        let req = try_parse("https://docker:2376/_ping").unwrap().unwrap();
+        assert_eq!(req.path, "/_ping");
+        assert_eq!(req.api_version, None);
+
+        let req = try_parse("http://localhost:2375").unwrap().unwrap();
+        assert_eq!(req.path, "/");
+        assert!(req.query.is_empty());
+
+        let req = try_parse("http://localhost:2375?foo=bar").unwrap().unwrap();
+        assert_eq!(req.path, "/");
+        assert_eq!(req.query("foo"), Some("bar"));
+
+        let req = try_parse("http://127.0.0.1:2376//v1.47/containers/json").unwrap().unwrap();
+        assert_eq!(req.path, "//v1.47/containers/json");
+        assert_eq!(req.api_version, None);
+
+        let req = try_parse("http://127.0.0.1:2376/v1.44/images/mongodb%2Fmongodb-atlas-local:8.0/json").unwrap().unwrap();
+        assert_eq!(req.path, "/images/mongodb/mongodb-atlas-local:8.0/json");
+        assert_eq!(req.api_version, Some((1, 44)));
+
+        for bad in [
+            "http:///containers/json",
+            "https:///containers/json",
+            "http://",
+            "http://?a=1",
+            "ftp://127.0.0.1:2376/_ping",
+            "unix:///var/run/docker.sock",
+            "http:/containers/json",
+            "containers/json",
+            "http://:2376/_ping",
+            "http://127.0.0.1:/_ping",
+            "http://127.0.0.1:99999/_ping",
+            "http://[::1/_ping",
+            "http://[not-an-ip]/_ping",
+            "http://user@127.0.0.1:2376/_ping",
+            "http://127.0.0.1:2376/_ping#frag",
+            "/_ping#frag",
+            "http://127.0.0.1:2376/containers/json extra",
+            "/_ping\u{00a0}extra",
+            "/_ping\x7f",
+        ] {
+            assert!(try_parse(bad).is_err(), "accepted malformed target: {bad}");
+        }
+
+        let try_raw = |raw: &str| {
+            let (mut a, b) = UnixStream::pair().unwrap();
+            a.write_all(raw.as_bytes()).unwrap();
+            drop(a);
+            read_request(&mut BufReader::new(b), |_, _| false)
+        };
+        for bad_line in [
+            "GET  http://127.0.0.1:2376/_ping HTTP/1.1\r\nHost: d\r\n\r\n",
+            "GET http://127.0.0.1:2376/_ping  HTTP/1.1\r\nHost: d\r\n\r\n",
+            " GET http://127.0.0.1:2376/_ping HTTP/1.1\r\nHost: d\r\n\r\n",
+            "GET http://127.0.0.1:2376/_ping HTTP/1.1 \r\nHost: d\r\n\r\n",
+            "GET\thttp://127.0.0.1:2376/_ping HTTP/1.1\r\nHost: d\r\n\r\n",
+            "GET http://127.0.0.1:2376/_ping\tHTTP/1.1\r\nHost: d\r\n\r\n",
+            "GET  HTTP/1.1\r\nHost: d\r\n\r\n",
+            "GET /_ping HTTP/2.0\r\nHost: d\r\n\r\n",
+        ] {
+            assert!(try_raw(bad_line).is_err(), "accepted malformed request line: {bad_line:?}");
+        }
     }
 
     /// `attach` and `exec` start answer `101` only to a client that asked to

@@ -286,6 +286,10 @@ t http10-start-closes "304 closed" python3 -c "$PROBE" "$SOCK" 'POST /v1.44/cont
 t keep-alive-start-stays "304 open" python3 -c "$PROBE" "$SOCK" 'POST /v1.44/containers/e2e-close/start HTTP/1.1\r\nHost: d\r\n\r\n'
 t connection-close-said "Connection: close" curl -s -m 5 -o /dev/null -D - --unix-socket "$SOCK" -H 'Connection: close' http://d/_ping
 t http10-ping-closes "200 closed" python3 -c "$PROBE" "$SOCK" 'GET /_ping HTTP/1.0\r\n\r\n'
+# docker-modem sends an RFC 9112 §3.2.2 absolute-form request-target over the
+# socket when configured with a default host and port (#757).
+t absolute-form-ping "200 closed" python3 -c "$PROBE" "$SOCK" 'GET http://127.0.0.1:2376/_ping HTTP/1.1\r\nHost: 127.0.0.1:2376\r\nConnection: close\r\n\r\n'
+t absolute-form-containers "200 closed" python3 -c "$PROBE" "$SOCK" 'GET http://127.0.0.1:2376/containers/json HTTP/1.1\r\nHost: 127.0.0.1:2376\r\nConnection: close\r\n\r\n'
 # A body past the 8 MiB a request read whole may send is answered (413, in
 # Docker's error shape) and the connection ends cleanly: it was dropped with
 # no answer, and curl, still sending, failed with "Send failure" (exit 55).
