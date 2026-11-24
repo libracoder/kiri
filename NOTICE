@@ -6375,9 +6375,9 @@ For more information, see https://www.bis.doc.gov
 See also https://www.apache.org/dev/crypto.html and/or seek legal counsel.
 
 
-Docker Compose 5.6.1 — Apache-2.0
+Docker Compose 5.8.0 — Apache-2.0
 ----------------------------------------------------------------------
-Source: https://raw.githubusercontent.com/docker/compose/v5.6.1/LICENSE
+Source: https://raw.githubusercontent.com/docker/compose/v5.8.0/LICENSE
 
 
                                  Apache License
@@ -6582,9 +6582,9 @@ Source: https://raw.githubusercontent.com/docker/compose/v5.6.1/LICENSE
    See the License for the specific language governing permissions and
    limitations under the License.
 
-Docker Compose 5.6.1 — upstream NOTICE
+Docker Compose 5.8.0 — upstream NOTICE
 ----------------------------------------------------------------------
-Source: https://raw.githubusercontent.com/docker/compose/v5.6.1/NOTICE
+Source: https://raw.githubusercontent.com/docker/compose/v5.8.0/NOTICE
 
 Docker Compose V2
 Copyright 2020 Docker Compose authors

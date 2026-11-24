@@ -14,8 +14,8 @@ notice() {
 }
 notice 'Docker CLI 29.9.2 — Apache-2.0' 'https://raw.githubusercontent.com/docker/cli/v29.9.2/LICENSE'
 notice 'Docker CLI 29.9.2 — upstream NOTICE' 'https://raw.githubusercontent.com/docker/cli/v29.9.2/NOTICE'
-notice 'Docker Compose 5.6.1 — Apache-2.0' 'https://raw.githubusercontent.com/docker/compose/v5.6.1/LICENSE'
-notice 'Docker Compose 5.6.1 — upstream NOTICE' 'https://raw.githubusercontent.com/docker/compose/v5.6.1/NOTICE'
+notice 'Docker Compose 5.8.0 — Apache-2.0' 'https://raw.githubusercontent.com/docker/compose/v5.8.0/LICENSE'
+notice 'Docker Compose 5.8.0 — upstream NOTICE' 'https://raw.githubusercontent.com/docker/compose/v5.8.0/NOTICE'
 notice 'Docker Buildx 0.38.1 — Apache-2.0' 'https://raw.githubusercontent.com/docker/buildx/v0.38.1/LICENSE'
 notice 'Grype 0.120.1 — Apache-2.0' 'https://raw.githubusercontent.com/anchore/grype/v0.120.1/LICENSE'
 notice 'Phosphor Icons 2.1.1 — MIT' 'https://unpkg.com/@phosphor-icons/core@2.1.1/LICENSE'

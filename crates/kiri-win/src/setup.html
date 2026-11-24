@@ -865,8 +865,8 @@ function trn(n, one, other, vars) { var s = isOne(n) ? one : other, v = { n: n }
       tasks: [T('Download Ubuntu', 'active', '156 / 418 MB'), T('Unpack it into WSL', 'todo', '≈ 1.6 GB*'), T('Start Ubuntu', 'todo', 'next')] },
     engine: { step: 'engine', linux: 'kiri', tasks: [T('Start the engine', 'done', 'ready in 33 ms'), T('Connect Windows to it', 'done', '\\\\.\\pipe\\kiri'), T('Run a test container', 'active', 'pulling alpine')],
       log: ['kiri daemon: ready in 33 ms', '$ docker run --rm alpine echo hello', 'latest: Pulling from library/alpine'] },
-    tools: { step: 'tools', linux: 'kiri', tasks: [T('docker', 'done', '29.9.2 · checked'), T('Compose', 'done', 'v5.6.1 · checked'), T('buildx', 'done', 'v0.38.1 · checked'), T('docker build on Kiri', 'active', 'builder kiri-build')] },
-    'tools-other': { step: 'tools', linux: 'kiri', otherDocker: true, otherEngine: 'Docker Desktop', makeDefault: false, buildKiri: false, tasks: [T('docker', 'done', '29.9.2 · checked'), T('Compose', 'active', 'v5.6.1'), T('buildx', 'todo', 'v0.38.1'), T('docker build on Kiri', 'todo', 'builder kiri-build')] },
+    tools: { step: 'tools', linux: 'kiri', tasks: [T('docker', 'done', '29.9.2 · checked'), T('Compose', 'done', 'v5.8.0 · checked'), T('buildx', 'done', 'v0.38.1 · checked'), T('docker build on Kiri', 'active', 'builder kiri-build')] },
+    'tools-other': { step: 'tools', linux: 'kiri', otherDocker: true, otherEngine: 'Docker Desktop', makeDefault: false, buildKiri: false, tasks: [T('docker', 'done', '29.9.2 · checked'), T('Compose', 'active', 'v5.8.0'), T('buildx', 'todo', 'v0.38.1'), T('docker build on Kiri', 'todo', 'builder kiri-build')] },
     ready: { step: 'ready', linux: 'kiri' },
     error: Object.assign({}, wsl, { progress: Object.assign({}, wsl.progress, { rate: 0, eta: null }), tasks: [wsl.tasks[0], T('Download WSL', 'error', 'stopped at 224 MB'), wsl.tasks[2], wsl.tasks[3]],
       error: 'The download from Microsoft stopped: this PC seems to be offline. Check the connection and try again.' })

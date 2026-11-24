@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #575 CLI: Kiri bundles Docker Compose 5.8.0 (unreleased)
+- Fixes: no issue
+- Caused: none known
+- Caused by: -
+- Check: none
+
 ### #207 Hardening: poison-tolerant Share locks, 0600 Share files, non-localhost Share warning, daemon connection cap and header timeout, and `kiri-init` panic hook (unreleased)
 - Fixes: no issue
 - Caused: none known

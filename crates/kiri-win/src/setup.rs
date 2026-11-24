@@ -910,7 +910,7 @@ fn tools() -> io::Result<()> {
     update(|s| {
         s.step = "tools";
         s.progress = None;
-        s.tasks = tasks(&["docker 29.9.2".to_owned(), "Compose v5.6.1".to_owned(), "buildx v0.38.1".to_owned(), tr("docker build on Kiri"), tr("Make Kiri the default")]);
+        s.tasks = tasks(&["docker 29.9.2".to_owned(), "Compose v5.8.0".to_owned(), "buildx v0.38.1".to_owned(), tr("docker build on Kiri"), tr("Make Kiri the default")]);
     });
     task(0, "active", "");
     for f in ["bin/docker.exe", "bin/kiri.exe", "bin/cli-plugins/docker-compose.exe", "bin/cli-plugins/docker-buildx.exe"] {
