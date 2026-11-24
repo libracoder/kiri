@@ -15,7 +15,7 @@ use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The commands passed to the engine in WSL.
-pub const COMMANDS: &[&str] = &["k8s", "machine", "diag", "usb", "domains", "registry", "scan"];
+pub const COMMANDS: &[&str] = &["k8s", "machine", "diag", "usb", "domains", "registry", "scan", "storage"];
 
 /// In Kiri Linux, kiri-start wakes the engine if it isn't up; in a distro
 /// of the user's own, systemd or wsl.conf runs it.

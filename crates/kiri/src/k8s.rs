@@ -14,6 +14,8 @@ use crate::client;
 use crate::flavor::CONTEXT;
 
 const IMAGE: (&str, &str) = ("rancher/k3s", "v1.37.1-k3s1");
+/// Default k3s image tag shown in Settings → Kubernetes.
+pub(crate) const DEFAULT_VERSION: &str = IMAGE.1;
 /// The node container; the window reads the cluster through it.
 pub(crate) const NAME: &str = "kiri-k8s";
 const VOLUME: &str = "kiri-k8s";
@@ -115,7 +117,7 @@ fn config_path() -> io::Result<PathBuf> {
     Ok(home()?.join(crate::flavor::STATE.get()).join("k8s.json"))
 }
 
-fn manifests_dir() -> io::Result<PathBuf> {
+pub(crate) fn manifests_dir() -> io::Result<PathBuf> {
     Ok(home()?.join(crate::flavor::STATE.get()).join("k8s-manifests"))
 }
 

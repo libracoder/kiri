@@ -180,6 +180,17 @@ pub fn headroom(bytes: u64) -> u64 {
     bytes / 10 + 1_000_000_000
 }
 
+/// Reclaimable bytes below 64 MiB are reported as 0 to avoid prompting
+/// pointless VHDX compaction over filesystem slack.
+pub const RECLAIM_THRESHOLD: u64 = 64 << 20;
+
+/// Reclaimable bytes from host `ext4.vhdx` allocated size vs in-use bytes
+/// inside WSL, applying [`RECLAIM_THRESHOLD`].
+pub fn reclaimable_bytes(disk_host: Option<u64>, disk_in_use: Option<u64>) -> Option<u64> {
+    let diff = disk_host?.saturating_sub(disk_in_use?);
+    Some(if diff > RECLAIM_THRESHOLD { diff } else { 0 })
+}
+
 fn format_gb(bytes: u64) -> String {
     format!("{:.1} GB", bytes as f64 / 1e9)
 }
@@ -264,6 +275,7 @@ mod imp {
 
     static MOVE: Mutex<Moving> = Mutex::new(Moving { to: None, phase: "", done: 0, total: 0, error: None });
     static ACTIVE: AtomicBool = AtomicBool::new(false);
+    static RECLAIMING: AtomicBool = AtomicBool::new(false);
 
     fn state() -> std::sync::MutexGuard<'static, Moving> {
         MOVE.lock().unwrap_or_else(PoisonError::into_inner)
@@ -271,6 +283,32 @@ mod imp {
 
     pub fn moving() -> bool {
         ACTIVE.load(Ordering::SeqCst)
+    }
+
+    fn vhdx_allocated(path: &Path) -> Option<u64> {
+        use windows_sys::Win32::Foundation::{GetLastError, NO_ERROR};
+        use windows_sys::Win32::Storage::FileSystem::GetCompressedFileSizeW;
+        if !path.is_file() {
+            return None;
+        }
+        let w = wide(path);
+        let mut high = 0u32;
+        // SAFETY: `w` is NUL-terminated UTF-16 and `high` is a valid out pointer.
+        let low = unsafe { GetCompressedFileSizeW(w.as_ptr(), &mut high) };
+        if low == u32::MAX && unsafe { GetLastError() } != NO_ERROR {
+            return fs::metadata(path).ok().map(|m| m.len());
+        }
+        Some(((high as u64) << 32) | (low as u64))
+    }
+
+    fn wsl_disk_usage() -> (Option<u64>, Option<u64>) {
+        if !crate::client::alive_quick() {
+            return (None, None);
+        }
+        let Ok(v) = crate::client::get_quick("/kiri/storage") else {
+            return (None, None);
+        };
+        (v["fs_in_use"].as_u64(), v["fs_capacity"].as_u64())
     }
 
     fn config_path() -> PathBuf {
@@ -388,6 +426,14 @@ mod imp {
         let active = moving();
         let m = state();
         let near = root.ancestors().find(|p| p.is_dir());
+        let (disk_host, disk_in_use, disk_limit, reclaimable) = if !is_missing && !active {
+            let host = vhdx_allocated(&root.join("ext4.vhdx"));
+            let (in_use, limit) = wsl_disk_usage();
+            let rec = reclaimable_bytes(host, in_use);
+            (host, in_use, limit, rec)
+        } else {
+            (None, None, None, None)
+        };
         json!({
             "type": "storage",
             "path": root,
@@ -398,6 +444,10 @@ mod imp {
             "used": (!is_missing && !active).then(|| dir_size(&root)),
             "free": if is_missing { None } else { near.and_then(|p| free_space(p).ok()) },
             "fs": if is_missing { None } else { near.and_then(|p| fs_name(p).ok()) },
+            "disk_host": disk_host,
+            "disk_in_use": disk_in_use,
+            "disk_limit": disk_limit,
+            "reclaimable": reclaimable,
             "moving": m.to.as_ref().filter(|_| active).map(|to| json!({"to": to, "phase": m.phase, "done": m.done, "total": m.total})),
             "error": m.error,
             "old": old,
@@ -684,6 +734,144 @@ mod imp {
             emit_report();
         });
     }
+
+    fn compact_vhdx(vhdx: &Path) -> io::Result<()> {
+        // First try Hyper-V's Optimize-VHD via PowerShell if installed.
+        let escaped = vhdx.to_string_lossy().replace('\'', "''");
+        let ps = crate::win::tool("powershell.exe")
+            .creation_flags(CREATE_NO_WINDOW)
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!("Optimize-VHD -Path '{escaped}' -Mode Full"),
+            ])
+            .output();
+        if ps.as_ref().is_ok_and(|o| o.status.success()) {
+            return Ok(());
+        }
+        // Fallback: diskpart compact vdisk on an offline VHDX.
+        let script = std::env::temp_dir().join(format!("kiri-compact-{}.txt", std::process::id()));
+        let vhdx_str = vhdx.to_string_lossy().replace('"', "");
+        let content = format!(
+            "select vdisk file=\"{vhdx_str}\"\r\nattach vdisk readonly\r\ncompact vdisk\r\ndetach vdisk\r\n"
+        );
+        fs::write(&script, content.as_bytes())?;
+        let res = crate::win::tool("diskpart.exe")
+            .creation_flags(CREATE_NO_WINDOW)
+            .arg("/s")
+            .arg(&script)
+            .output();
+        let _ = fs::remove_file(&script);
+        match res {
+            Ok(o) if o.status.success() => Ok(()),
+            Ok(o) => {
+                let text = crate::setup::wsl_output(&o.stdout, &o.stderr);
+                let line = text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("diskpart compact failed");
+                Err(io::Error::other(line.to_owned()))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Reclaims unused space in Kiri's WSL 2 `ext4.vhdx` via `fstrim` + sparse
+    /// mode or offline VHDX compact, restarting the engine and previously
+    /// running containers if offline compaction was needed.
+    pub fn reclaim() {
+        std::thread::Builder::new()
+            .name("kiri-storage-reclaim".into())
+            .spawn(|| {
+                if moving() {
+                    emit(json!({"type": "storagereclaimed", "error": tr("Kiri's data is moving already")}).to_string());
+                    return;
+                }
+                if RECLAIMING.swap(true, Ordering::SeqCst) {
+                    emit(json!({"type": "storagereclaimed", "error": tr("Disk reclaim is already running")}).to_string());
+                    return;
+                }
+                struct Guard;
+                impl Drop for Guard {
+                    fn drop(&mut self) {
+                        RECLAIMING.store(false, Ordering::SeqCst);
+                    }
+                }
+                let _guard = Guard;
+                let t0 = std::time::Instant::now();
+                let distro = distro_name();
+                let vhdx = current_vhdx();
+                let before = vhdx_allocated(&vhdx).unwrap_or(0);
+                let running: Vec<String> = if crate::client::alive_quick() {
+                    crate::client::get_quick("/containers/json")
+                        .ok()
+                        .and_then(|v| v.as_array().cloned())
+                        .map(|a| a.iter().filter_map(|c| c["Id"].as_str().map(str::to_owned)).collect())
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                // 1. Discard freed ext4 blocks inside WSL.
+                let _ = wsl_run(&[
+                    std::ffi::OsStr::new("-d"),
+                    std::ffi::OsStr::new(&distro),
+                    std::ffi::OsStr::new("-u"),
+                    std::ffi::OsStr::new("root"),
+                    std::ffi::OsStr::new("--"),
+                    std::ffi::OsStr::new("sh"),
+                    std::ffi::OsStr::new("-c"),
+                    std::ffi::OsStr::new("fstrim /var/lib/kiri 2>/dev/null || true; fstrim / 2>/dev/null || true"),
+                ]);
+                // 2. Enable sparse VHDX if WSL supports it (can reclaim immediately).
+                let _ = wsl_run(&[
+                    std::ffi::OsStr::new("--manage"),
+                    std::ffi::OsStr::new(&distro),
+                    std::ffi::OsStr::new("--set-sparse"),
+                    std::ffi::OsStr::new("true"),
+                    std::ffi::OsStr::new("--allow-unsafe"),
+                ]);
+                let mid = vhdx_allocated(&vhdx).unwrap_or(before);
+                let (in_use_before, _) = wsl_disk_usage();
+                let still_reclaimable = reclaimable_bytes(Some(mid), in_use_before).unwrap_or(0) > 0 || mid >= before;
+                let mut compact_err: Option<String> = None;
+                if still_reclaimable && vhdx.is_file() {
+                    if crate::client::alive_quick() {
+                        let _ = crate::client::request("POST", "/kiri/stop", None);
+                    }
+                    crate::serve::renew_bridge();
+                    let _ = wsl_run(&[std::ffi::OsStr::new("--terminate"), std::ffi::OsStr::new(&distro)]);
+                    if let Err(e) = compact_vhdx(&vhdx) {
+                        crate::serve::log(&format!("storage reclaim compact failed: {e}"));
+                        compact_err = Some(e.to_string());
+                    }
+                    crate::serve::renew_bridge();
+                    let _ = crate::engine::ensure_daemon();
+                    for id in &running {
+                        let _ = crate::client::request("POST", &format!("/containers/{id}/start"), None);
+                    }
+                }
+                let after = vhdx_allocated(&vhdx).unwrap_or(mid);
+                let reclaimed = before.saturating_sub(after);
+                let elapsed_ms = t0.elapsed().as_millis() as u64;
+                let (in_use, _) = wsl_disk_usage();
+                if let Some(err) = compact_err && reclaimed == 0 {
+                    emit(json!({"type": "storagereclaimed", "error": err}).to_string());
+                } else {
+                    emit(
+                        json!({
+                            "type": "storagereclaimed",
+                            "before": before,
+                            "after": after,
+                            "reclaimed": reclaimed,
+                            "in_use": in_use,
+                            "elapsed_ms": elapsed_ms,
+                        })
+                        .to_string(),
+                    );
+                }
+                emit_report();
+                send(Cmd::Refresh);
+            })
+            .ok();
+    }
 }
 
 #[cfg(windows)]
@@ -763,6 +951,10 @@ mod tests {
         assert!(validate_target(cur, r"C:\Users\u\AppData\Local\Kiri\wsl\kiri\sub", 0, true, ok_fs, plenty, writable).unwrap_err().contains("inside Kiri's data folder"));
         assert!(validate_target(cur, r"C:\Users\u\AppData\Local\Kiri", 0, true, ok_fs, plenty, writable).unwrap_err().contains("is inside"));
         assert_eq!(headroom(10_000_000_000), 2_000_000_000);
+        assert_eq!(reclaimable_bytes(Some(10_000_000_000), Some(10_000_000_000)), Some(0));
+        assert_eq!(reclaimable_bytes(Some(100 + RECLAIM_THRESHOLD), Some(100)), Some(0));
+        assert_eq!(reclaimable_bytes(Some(100 + RECLAIM_THRESHOLD + 1), Some(100)), Some(RECLAIM_THRESHOLD + 1));
+        assert_eq!(reclaimable_bytes(None, Some(100)), None);
         // On non-Windows hosts a Windows drive path like D:\ has no existing ancestor, so check the error cleanly.
         let r = validate_target(cur, r"D:\Kiri", 5_000_000_000, true, |_| Ok("exFAT".into()), plenty, writable);
         assert!(r.is_err());

@@ -37,6 +37,8 @@ pub enum Reply {
     Listening(Vec<String>),
     UsbNodes(Vec<String>),
     Uplink([u8; 4], [u8; 4]),
+    DiskUsage { in_use: u64, capacity: u64 },
+    DiskTrimmed { trimmed: u64, in_use: u64, capacity: u64 },
     Error(String),
 }
 
@@ -298,6 +300,8 @@ impl VmLink {
                     Ok(Msg::Listening(lines)) => Reply::Listening(lines.iter().map(str::to_owned).collect()),
                     Ok(Msg::UsbNodes(lines)) => Reply::UsbNodes(lines.iter().map(str::to_owned).collect()),
                     Ok(Msg::Uplink { ip, gateway }) => Reply::Uplink(ip, gateway),
+                    Ok(Msg::DiskUsage { in_use, capacity }) => Reply::DiskUsage { in_use, capacity },
+                    Ok(Msg::DiskTrimmed { trimmed, in_use, capacity }) => Reply::DiskTrimmed { trimmed, in_use, capacity },
                     Ok(Msg::Error(e)) => Reply::Error(e.to_owned()),
                     Ok(other) => Reply::Error(format!("unexpected message from guest: {other:?}")),
                     Err(e) => Reply::Error(format!("bad frame from guest: {e:?}")),
@@ -707,6 +711,20 @@ impl VmLink {
         match self.call(|o| Msg::StatsRequest.encode(o), None)? {
             Reply::Stats(s) => Ok(s),
             other => Err(io::Error::other(format!("expected Stats, got {other:?}"))),
+        }
+    }
+
+    pub fn disk_usage(&self) -> io::Result<(u64, u64)> {
+        match self.call(|o| Msg::DiskUsageQuery.encode(o), None)? {
+            Reply::DiskUsage { in_use, capacity } => Ok((in_use, capacity)),
+            other => Err(io::Error::other(format!("expected DiskUsage, got {other:?}"))),
+        }
+    }
+
+    pub fn trim_disk(&self) -> io::Result<(u64, u64, u64)> {
+        match self.call(|o| Msg::TrimDisk.encode(o), None)? {
+            Reply::DiskTrimmed { trimmed, in_use, capacity } => Ok((trimmed, in_use, capacity)),
+            other => Err(io::Error::other(format!("expected DiskTrimmed, got {other:?}"))),
         }
     }
 

@@ -803,6 +803,42 @@ fn opt_out_shell_path(home: &Path, zdotdir: &Path) -> io::Result<()> {
     std::fs::write(path, "")
 }
 
+/// Whether `~/.kiri/bin` is currently managed in the user's shell profiles
+/// (Settings → Appearance → Command-line tools in shell, #556).
+pub(crate) fn shell_path_enabled() -> bool {
+    let Ok(h) = home() else { return false };
+    shell_path_enabled_in(&h, &zdotdir(&h))
+}
+
+fn shell_path_enabled_in(home: &Path, zdotdir: &Path) -> bool {
+    if no_profiles_file(home).exists() {
+        return false;
+    }
+    if profiles_configured_file(home).exists() {
+        return true;
+    }
+    profiles(home, zdotdir).into_iter().any(|(file, _)| {
+        std::fs::read_to_string(&file).is_ok_and(|t| t.contains(PROFILE_MARK) || t.contains(".kiri/bin"))
+    })
+}
+
+/// Turns shell profile management on (`shell_path`) or off (`opt_out_shell_path`,
+/// equivalent to `kiri setup --no-profiles`) from Settings → Appearance (#556).
+pub(crate) fn set_shell_path(enabled: bool) -> io::Result<()> {
+    let h = home()?;
+    let z = zdotdir(&h);
+    set_shell_path_in(&h, &z, enabled)
+}
+
+fn set_shell_path_in(home: &Path, zdotdir: &Path, enabled: bool) -> io::Result<()> {
+    if enabled {
+        let _ = std::fs::remove_file(no_profiles_file(home));
+        shell_path(home, zdotdir)
+    } else {
+        opt_out_shell_path(home, zdotdir)
+    }
+}
+
 fn remove_shell_path(home: &Path, zdotdir: &Path) -> io::Result<()> {
     for (file, line) in profiles(home, zdotdir) {
         let Ok(text) = std::fs::read_to_string(&file) else { continue };
@@ -1367,6 +1403,7 @@ mod tests {
 
         // Opting out with `kiri setup --no-profiles` removes Kiri's lines and persists `no-profiles`.
         super::opt_out_shell_path(&h, &h).unwrap();
+        assert!(!super::shell_path_enabled_in(&h, &h));
         assert!(super::no_profiles_file(&h).is_file());
         assert!(!super::profiles_configured_file(&h).exists());
         assert_eq!(std::fs::read_to_string(h.join(".zprofile")).unwrap().trim_end(), "export A=1");
@@ -1377,6 +1414,15 @@ mod tests {
         super::shell_path(&h, &h).unwrap();
         assert_eq!(std::fs::read_to_string(h.join(".zprofile")).unwrap().trim_end(), "export A=1");
         assert_eq!(std::fs::read_to_string(h.join(".zshrc")).unwrap().trim_end(), "export B=2");
+
+        // Settings → Appearance toggling On re-enables profiles and clears `no-profiles`; Off opts out again.
+        super::set_shell_path_in(&h, &h, true).unwrap();
+        assert!(super::shell_path_enabled_in(&h, &h));
+        assert!(!super::no_profiles_file(&h).exists());
+        assert!(std::fs::read_to_string(h.join(".zprofile")).unwrap().contains(super::PROFILE_MARK));
+        super::set_shell_path_in(&h, &h, false).unwrap();
+        assert!(!super::shell_path_enabled_in(&h, &h));
+        assert!(super::no_profiles_file(&h).is_file());
 
         // Uninstall clears `no-profiles` so a fresh install after uninstall sets up profiles again.
         super::remove_shell_path(&h, &h).unwrap();

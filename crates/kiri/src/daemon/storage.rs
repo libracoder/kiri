@@ -378,6 +378,55 @@ struct Moving {
 
 static MOVE: Mutex<Moving> = Mutex::new(Moving { to: None, phase: "", done: 0, total: 0, error: None });
 static ACTIVE: AtomicBool = AtomicBool::new(false);
+static USED_CACHE: Mutex<Option<(PathBuf, Instant, u64)>> = Mutex::new(None);
+#[cfg(target_os = "macos")]
+static LAST_IN_USE: Mutex<Option<u64>> = Mutex::new(None);
+#[cfg(target_os = "macos")]
+static RECLAIMING: AtomicBool = AtomicBool::new(false);
+
+/// Reclaimable bytes under this threshold (64 MiB) are reported as 0 so
+/// filesystem metadata slack does not prompt pointless trims.
+pub const RECLAIM_THRESHOLD: u64 = 64 << 20;
+
+/// Reclaimable bytes from host-allocated disk size vs in-use bytes inside the
+/// VM, applying [`RECLAIM_THRESHOLD`].
+pub fn reclaimable_bytes(disk_host: Option<u64>, disk_in_use: Option<u64>) -> Option<u64> {
+    let diff = disk_host?.saturating_sub(disk_in_use?);
+    Some(if diff > RECLAIM_THRESHOLD { diff } else { 0 })
+}
+
+/// Allocated bytes of `<root>/vm/data.img` (`st_blocks * 512`), if present.
+pub fn data_img_allocated(root: &Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(root.join("vm/data.img")).ok().map(|m| m.blocks().saturating_mul(512))
+}
+
+#[cfg(target_os = "linux")]
+fn statvfs_usage(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: statvfs fills a zeroed struct for a valid NUL-terminated path.
+    let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut s) } != 0 {
+        return None;
+    }
+    let frsize = if s.f_frsize > 0 { s.f_frsize as u64 } else { s.f_bsize as u64 };
+    let blocks = s.f_blocks as u64;
+    let bavail = s.f_bavail as u64;
+    Some((blocks.saturating_sub(bavail).saturating_mul(frsize), blocks.saturating_mul(frsize)))
+}
+
+#[derive(Default)]
+struct DiskInfo {
+    disk_host: Option<u64>,
+    disk_in_use: Option<u64>,
+    disk_limit: Option<u64>,
+    reclaimable: Option<u64>,
+    #[cfg(target_os = "linux")]
+    fs_in_use: Option<u64>,
+    #[cfg(target_os = "linux")]
+    fs_capacity: Option<u64>,
+}
 
 fn moving_state() -> std::sync::MutexGuard<'static, Moving> {
     MOVE.lock().unwrap_or_else(|e| e.into_inner())
@@ -393,11 +442,15 @@ pub fn refuse_while_moving(w: &mut UnixStream) -> io::Result<()> {
     http::error(w, 503, MOVING_TEXT)
 }
 
+#[cfg(target_os = "macos")]
+fn invalidate_used_cache() {
+    *USED_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
 /// What the data folder takes, kept 30 s: walking a Linux host's layers
 /// takes a while.
 fn used(root: &Path) -> u64 {
-    static USED: Mutex<Option<(PathBuf, Instant, u64)>> = Mutex::new(None);
-    let mut cached = USED.lock().unwrap_or_else(|e| e.into_inner());
+    let mut cached = USED_CACHE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((p, at, n)) = cached.as_ref()
         && p == root
         && at.elapsed() < Duration::from_secs(30)
@@ -413,6 +466,10 @@ fn used(root: &Path) -> u64 {
 /// `GET /kiri/storage`: for the data folder `root`, or for the chosen
 /// folder `missing` that isn't there.
 fn status(root: &Path, missing: bool) -> Value {
+    status_with(root, missing, DiskInfo::default())
+}
+
+fn status_with(root: &Path, missing: bool, disk: DiskInfo) -> Value {
     let default = kiri_image::Store::os_default_root().ok();
     let choice = chosen::read().ok().flatten();
     let custom = choice.as_ref().is_some_and(|c| Some(&c.path) != default.as_ref());
@@ -420,7 +477,7 @@ fn status(root: &Path, missing: bool) -> Value {
     let active = moving();
     let m = moving_state();
     let near = treecopy::existing_ancestor(root);
-    json!({
+    let mut out = json!({
         "path": root,
         "default": default,
         "custom": custom,
@@ -429,15 +486,111 @@ fn status(root: &Path, missing: bool) -> Value {
         "used": (!missing && !active).then(|| used(root)),
         "free": if missing { None } else { near.and_then(|p| treecopy::free_space(p).ok()) },
         "fs": if missing { None } else { near.and_then(|p| treecopy::fs_name(p).ok()) },
+        "disk_host": if missing || active { None } else { disk.disk_host },
+        "disk_in_use": if missing || active { None } else { disk.disk_in_use },
+        "disk_limit": if missing || active { None } else { disk.disk_limit },
+        "reclaimable": if missing || active { None } else { disk.reclaimable },
         "moving": m.to.as_ref().filter(|_| active).map(|to| json!({"to": to, "phase": m.phase, "done": m.done, "total": m.total})),
         "error": m.error,
         "old": old,
-    })
+    });
+    #[cfg(target_os = "linux")]
+    if !missing && !active {
+        if let Some(u) = disk.fs_in_use {
+            out["fs_in_use"] = json!(u);
+        }
+        if let Some(c) = disk.fs_capacity {
+            out["fs_capacity"] = json!(c);
+        }
+    }
+    out
 }
 
 /// `GET /kiri/storage`.
 pub fn report(engine: &Engine) -> Value {
-    status(engine.store.root(), false)
+    let root = engine.store.root();
+    #[cfg(target_os = "macos")]
+    let disk = {
+        let disk_host = data_img_allocated(root);
+        let disk_in_use = match engine.disk_usage_if_awake() {
+            Some((in_use, _)) => {
+                *LAST_IN_USE.lock().unwrap_or_else(|e| e.into_inner()) = Some(in_use);
+                Some(in_use)
+            }
+            None => *LAST_IN_USE.lock().unwrap_or_else(|e| e.into_inner()),
+        };
+        let disk_limit = Some(super::engine::vm_disk_gb().saturating_mul(1 << 30));
+        let reclaimable = reclaimable_bytes(disk_host, disk_in_use);
+        DiskInfo { disk_host, disk_in_use, disk_limit, reclaimable }
+    };
+    #[cfg(target_os = "linux")]
+    let disk = {
+        let probe = Path::new(AGENT_DATA);
+        let target = if probe.is_dir() { probe } else { root };
+        let (fs_in_use, fs_capacity) = match statvfs_usage(target) {
+            Some((u, c)) => (Some(u), Some(c)),
+            None => (None, None),
+        };
+        DiskInfo { disk_host: None, disk_in_use: None, disk_limit: None, reclaimable: None, fs_in_use, fs_capacity }
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let disk = DiskInfo::default();
+    status_with(root, false, disk)
+}
+
+/// `POST /kiri/storage/reclaim`: trims unused blocks in the VM data disk and
+/// reports host `data.img` allocated bytes before and after.
+#[cfg(target_os = "macos")]
+pub fn reclaim(engine: &Engine) -> Result<Value, Error> {
+    if RECLAIMING.swap(true, Ordering::SeqCst) {
+        return Err(Error::Conflict("Disk reclaim is already running".into()));
+    }
+    struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            RECLAIMING.store(false, Ordering::SeqCst);
+        }
+    }
+    let _guard = Guard;
+    let t0 = Instant::now();
+    let root = engine.store.root();
+    let before = data_img_allocated(root).unwrap_or(0);
+    let (trimmed, in_use, _capacity) = engine.trim_disk().map_err(Error::Io)?;
+    *LAST_IN_USE.lock().unwrap_or_else(|e| e.into_inner()) = Some(in_use);
+    let after = data_img_allocated(root).unwrap_or(0);
+    invalidate_used_cache();
+    let reclaimed = before.saturating_sub(after);
+    let elapsed_ms = t0.elapsed().as_millis() as u64;
+    crate::diag::info!(
+        "reclaimed VM disk space",
+        before = before,
+        after = after,
+        reclaimed = reclaimed,
+        trimmed = trimmed,
+        in_use = in_use,
+        elapsed_ms = elapsed_ms
+    );
+    Ok(json!({
+        "before": before,
+        "after": after,
+        "reclaimed": reclaimed,
+        "in_use": in_use,
+        "elapsed_ms": elapsed_ms,
+    }))
+}
+
+/// `POST /kiri/storage/reclaim` on native Linux: no VM disk image to trim.
+#[cfg(not(target_os = "macos"))]
+pub fn reclaim(_engine: &Engine) -> Result<Value, Error> {
+    Ok(json!({
+        "before": 0,
+        "after": 0,
+        "reclaimed": 0,
+        "in_use": Value::Null,
+        "elapsed_ms": 0,
+        "native": true,
+        "message": "Native Linux uses the host filesystem directly — deleted images and volumes free space immediately.",
+    }))
 }
 
 /// The folder a request names (none or empty: the default one), and the
@@ -1019,6 +1172,42 @@ mod tests {
         client.read_to_string(&mut resp).unwrap();
         assert!(resp.starts_with("HTTP/1.1 503 "), "{resp}");
         assert!(resp.contains("Connection: close\r\n"), "{resp}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn reclaimable_threshold_and_data_img_allocated_bytes() {
+        assert_eq!(reclaimable_bytes(None, Some(100)), None);
+        assert_eq!(reclaimable_bytes(Some(100), None), None);
+        assert_eq!(reclaimable_bytes(Some(100), Some(200)), Some(0));
+        assert_eq!(reclaimable_bytes(Some(100 + RECLAIM_THRESHOLD), Some(100)), Some(0));
+        assert_eq!(
+            reclaimable_bytes(Some(100 + RECLAIM_THRESHOLD + 1), Some(100)),
+            Some(RECLAIM_THRESHOLD + 1)
+        );
+        let d = scratch("reclaim-alloc");
+        assert_eq!(data_img_allocated(&d), None);
+        data(&d);
+        let alloc = data_img_allocated(&d).unwrap();
+        assert!(alloc < 1 << 20, "sparse data.img should allocate < 1 MiB, got {alloc}");
+        let s = status_with(
+            &d,
+            false,
+            DiskInfo {
+                disk_host: Some(29_400_000_000),
+                disk_in_use: Some(17_300_000_000),
+                disk_limit: Some(64 << 30),
+                reclaimable: reclaimable_bytes(Some(29_400_000_000), Some(17_300_000_000)),
+                #[cfg(target_os = "linux")]
+                fs_in_use: None,
+                #[cfg(target_os = "linux")]
+                fs_capacity: None,
+            },
+        );
+        assert_eq!(s["disk_host"], 29_400_000_000u64);
+        assert_eq!(s["disk_in_use"], 17_300_000_000u64);
+        assert_eq!(s["disk_limit"], 64u64 << 30);
+        assert_eq!(s["reclaimable"], 12_100_000_000u64);
         let _ = std::fs::remove_dir_all(&d);
     }
 }

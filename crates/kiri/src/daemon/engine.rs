@@ -2739,6 +2739,20 @@ impl Engine {
         self.awake()
     }
 
+    /// Queries `(in_use, capacity)` of the guest data disk while the VM is
+    /// awake without waking a sleeping VM.
+    #[cfg(target_os = "macos")]
+    pub fn disk_usage_if_awake(&self) -> Option<(u64, u64)> {
+        self.awake()?.disk_usage().ok()
+    }
+
+    /// Wakes the VM if asleep and runs an online `FITRIM` on the guest data
+    /// disk without stopping containers. Returns `(trimmed, in_use, capacity)`.
+    #[cfg(target_os = "macos")]
+    pub fn trim_disk(&self) -> io::Result<(u64, u64, u64)> {
+        self.vm()?.trim_disk()
+    }
+
     /// Whether the VM is running right now.
     pub fn is_awake(&self) -> bool {
         self.awake().is_some()

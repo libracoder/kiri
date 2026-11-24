@@ -1384,6 +1384,30 @@ pub fn on_message(msg: &str) {
                 emit(crate::buildwith::event());
             });
         }
+        "buildprune" => {
+            std::thread::spawn(|| {
+                let e = match client::request("POST", "/build/prune?all=1", None) {
+                    Ok(r) if r.ok() => json!({"type": "buildpruned", "freed": r.json()["SpaceReclaimed"]}),
+                    Ok(r) => json!({"type": "buildpruned", "error": r.error()}),
+                    Err(e) => json!({"type": "buildpruned", "error": e.to_string()}),
+                };
+                emit(e.to_string());
+                send(Cmd::Refresh);
+            });
+        }
+        "buildersettings" => {
+            std::thread::spawn(|| builder_settings(None));
+        }
+        "setbuildersettings" => {
+            let body = c.value;
+            std::thread::spawn(move || builder_settings(Some(body)));
+        }
+        // macOS-only settings: report unsupported cleanly on Windows.
+        "vmnet" => emit(json!({"type": "vmnet", "supported": false}).to_string()),
+        "setvmnet" => {}
+        "shellpath" => emit(json!({"type": "shellpath", "supported": false}).to_string()),
+        "setshellpath" => {}
+        "uninstall" => emit(notice("error", &tr("Uninstall Kiri from Windows Settings → Apps"))),
         // Config update can be done synchronously or off-thread.
         "usecontext" => {
             std::thread::spawn(move || use_context(&c.name));
@@ -1668,6 +1692,10 @@ pub fn on_message(msg: &str) {
         "storagereset" => crate::storage::reset(),
         "storageretry" => crate::storage::retry(),
         "storageremoveold" => crate::storage::remove_old(),
+        "storagereclaim" => crate::storage::reclaim(),
+        "storageprune" => {
+            std::thread::spawn(storage_prune);
+        }
         // Settings → Diagnostics and an error's Details: crate::diag.
         cmd @ ("diaglogs" | "diagreport" | "diagsend" | "diagcrashes" | "diagsendcrash" | "diagfolder") => {
             crate::diag::handle(cmd, c.name, c.id, &c.value);
@@ -1867,6 +1895,60 @@ fn registry_config(set: Option<Value>) {
     if let Some(saved) = saved {
         ev["saved"] = json!(saved);
     }
+    emit(ev.to_string());
+}
+
+fn storage_prune() {
+    let mut freed = 0u64;
+    let mut containers = 0usize;
+    let mut images = 0usize;
+    let mut err: Option<String> = None;
+    for (endpoint, kind) in [("/containers/prune", "c"), ("/images/prune", "i"), ("/build/prune?all=1", "b")] {
+        match client::request("POST", endpoint, None) {
+            Ok(r) if r.ok() => {
+                let v = r.json();
+                freed = freed.saturating_add(v["SpaceReclaimed"].as_u64().unwrap_or(0));
+                if kind == "c" {
+                    containers = v["ContainersDeleted"].as_array().map_or(0, Vec::len);
+                } else if kind == "i" {
+                    images = v["ImagesDeleted"].as_array().map_or(0, Vec::len);
+                }
+            }
+            Ok(r) => {
+                err = Some(r.error());
+                break;
+            }
+            Err(e) => {
+                err = Some(e.to_string());
+                break;
+            }
+        }
+    }
+    let ev = match err {
+        Some(e) => json!({"type": "storagepruned", "error": e}),
+        None => json!({"type": "storagepruned", "freed": freed, "containers": containers, "images": images}),
+    };
+    emit(ev.to_string());
+    crate::storage::emit_report();
+    send(Cmd::Refresh);
+}
+
+fn builder_settings(save: Option<Value>) {
+    if let Some(body) = save {
+        match client::request("POST", "/kiri/builder", Some(&body)) {
+            Ok(r) if r.ok() => {
+                let mut v = r.json();
+                v["type"] = json!("buildersettings");
+                emit(v.to_string());
+                emit(notice("ok", &tr("Builder settings saved")));
+                return;
+            }
+            Ok(r) => emit(notice("error", &trf("Could not save builder settings: {error}", &[("error", &r.error())]))),
+            Err(e) => emit(notice("error", &trf("Could not save builder settings: {error}", &[("error", &e)]))),
+        }
+    }
+    let mut ev = client::get_background("/kiri/builder").unwrap_or_else(|e| json!({"error": e.to_string()}));
+    ev["type"] = json!("buildersettings");
     emit(ev.to_string());
 }
 

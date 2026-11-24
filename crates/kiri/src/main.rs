@@ -78,6 +78,8 @@ mod setup;
 mod usb;
 #[cfg(unix)]
 mod stale;
+#[cfg(unix)]
+mod storage_cli;
 #[cfg(target_os = "macos")]
 mod vm_cli;
 #[cfg(any(windows, test))]
@@ -107,6 +109,7 @@ const USAGE_LINES: &[&str] = &[
     #[cfg(unix)]
     "       kiri build-with [docker|kiri]   which builder docker build uses",
     "       kiri domains [set [--http N] [--https N] | reset]   the *.kiri.local routers' ports",
+    "       kiri storage [status | reclaim]   storage location, disk usage, and reclaiming VM disk space",
     "       kiri registry [insecure|mirror] [list | add X... | remove X...]   daemon.json's insecure registries and Docker Hub mirrors",
     "       kiri scan [--json] [--history] <image>   known vulnerabilities in an image, found by Grype",
     #[cfg(target_os = "macos")]
@@ -178,6 +181,8 @@ enum Command<'a> {
     #[cfg(unix)]
     Domains(&'a [String]),
     #[cfg(unix)]
+    Storage(&'a [String]),
+    #[cfg(unix)]
     Registry(&'a [String]),
     #[cfg(unix)]
     Scan(&'a [String]),
@@ -245,6 +250,8 @@ impl<'a> Command<'a> {
             Some("build-with") => Some(Command::BuildWith(&args[1..])),
             #[cfg(unix)]
             Some("domains") => Some(Command::Domains(&args[1..])),
+            #[cfg(unix)]
+            Some("storage") => Some(Command::Storage(&args[1..])),
             #[cfg(unix)]
             Some("registry") => Some(Command::Registry(&args[1..])),
             #[cfg(unix)]
@@ -329,6 +336,8 @@ fn main() -> ExitCode {
         Some(Command::BuildWith(rest)) => buildwith::cli(rest),
         #[cfg(unix)]
         Some(Command::Domains(rest)) => domains_cli::run(rest),
+        #[cfg(unix)]
+        Some(Command::Storage(rest)) => storage_cli::run(rest),
         #[cfg(unix)]
         Some(Command::Registry(rest)) => registry_cli::run(rest),
         #[cfg(unix)]
@@ -488,9 +497,10 @@ mod tests {
     fn usage_lists_only_commands_for_this_os() {
         let help = usage();
         let cmds = advertised_subcommands(&help);
-        for common in ["COMMAND", "start", "domains", "registry", "scan", "diag", "PORT", "share", "k8s", "usb", "machine"] {
+        for common in ["COMMAND", "start", "domains", "storage", "registry", "scan", "diag", "PORT", "share", "k8s", "usb", "machine"] {
             assert!(cmds.contains(&common), "help missing `{common}`:\n{help}");
         }
+        assert!(help.contains("kiri storage [status | reclaim]"), "help missing `kiri storage`:\n{help}");
         #[cfg(unix)]
         {
             for unix_cmd in ["daemon", "ui", "build-with", "update", "raw"] {

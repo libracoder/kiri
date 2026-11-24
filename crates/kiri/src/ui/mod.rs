@@ -889,6 +889,153 @@ fn storage_remove_old() {
     }
 }
 
+fn storage_reclaim(tx: Sender<Cmd>) {
+    match client::request("POST", "/kiri/storage/reclaim", None) {
+        Ok(r) if r.ok() => {
+            let mut v = r.json();
+            v["type"] = "storagereclaimed".into();
+            emit(v.to_string());
+            storage_status();
+            let _ = tx.send(Cmd::Refresh);
+        }
+        Ok(r) => {
+            emit(serde_json::json!({"type": "storagereclaimed", "error": r.error()}).to_string());
+            storage_status();
+        }
+        Err(e) => {
+            emit(serde_json::json!({"type": "storagereclaimed", "error": e.to_string()}).to_string());
+            storage_status();
+        }
+    }
+}
+
+fn storage_prune(tx: Sender<Cmd>) {
+    let mut freed = 0u64;
+    let mut containers = 0usize;
+    let mut images = 0usize;
+    let mut err: Option<String> = None;
+    for (endpoint, kind) in [("/containers/prune", "c"), ("/images/prune", "i"), ("/build/prune?all=1", "b")] {
+        match client::request("POST", endpoint, None) {
+            Ok(r) if r.ok() => {
+                let v = r.json();
+                freed = freed.saturating_add(v["SpaceReclaimed"].as_u64().unwrap_or(0));
+                if kind == "c" {
+                    containers = v["ContainersDeleted"].as_array().map_or(0, Vec::len);
+                } else if kind == "i" {
+                    images = v["ImagesDeleted"].as_array().map_or(0, Vec::len);
+                }
+            }
+            Ok(r) => {
+                err = Some(r.error());
+                break;
+            }
+            Err(e) => {
+                err = Some(e.to_string());
+                break;
+            }
+        }
+    }
+    let ev = match err {
+        Some(e) => serde_json::json!({"type": "storagepruned", "error": e}),
+        None => serde_json::json!({"type": "storagepruned", "freed": freed, "containers": containers, "images": images}),
+    };
+    emit(ev.to_string());
+    storage_status();
+    let _ = tx.send(Cmd::Refresh);
+}
+
+fn builder_settings(save: Option<serde_json::Value>) {
+    if let Some(body) = save {
+        match client::request("POST", "/kiri/builder", Some(&body)) {
+            Ok(r) if r.ok() => {
+                let mut v = r.json();
+                v["type"] = "buildersettings".into();
+                emit(v.to_string());
+                emit(notice("ok", &tr("Builder settings saved")));
+                return;
+            }
+            Ok(r) => emit(notice("error", &trf("Could not save builder settings: {error}", &[("error", &r.error())]))),
+            Err(e) => emit(notice("error", &trf("Could not save builder settings: {error}", &[("error", &e)]))),
+        }
+    }
+    let mut v = client::get_background("/kiri/builder").unwrap_or_else(|e| serde_json::json!({"error": e.to_string()}));
+    v["type"] = "buildersettings".into();
+    emit(v.to_string());
+}
+
+#[cfg(target_os = "macos")]
+fn vm_net(save: Option<serde_json::Value>) {
+    if let Some(body) = save {
+        if let Some(enabled) = body["shared_nat"].as_bool() {
+            match crate::vm_cli::set_shared_nat(enabled) {
+                Ok(()) => emit(notice("ok", &tr("Outbound VM traffic setting saved. Restart the VM to apply."))),
+                Err(e) => emit(notice("error", &trf("Could not save VM networking setting: {error}", &[("error", &e)]))),
+            }
+        }
+    }
+    let configured = crate::daemon::engine::vm_shared_nat_config();
+    let env_override = crate::daemon::engine::shared_nat_env();
+    let effective = env_override.or(configured).unwrap_or(true);
+    let info = client::get_background("/info").ok();
+    let awake = info.as_ref().is_some_and(|i| i["KiriVmAwake"] == true);
+    let running_shared_nat = awake.then(|| info.as_ref().and_then(|i| i["KiriVmUplink"]["mode"].as_str()).is_none_or(|m| m != "host-egress"));
+    emit(
+        serde_json::json!({
+            "type": "vmnet",
+            "supported": true,
+            "shared_nat": effective,
+            "configured": configured,
+            "env": env_override.is_some(),
+            "awake": awake,
+            "running_shared_nat": running_shared_nat,
+        })
+        .to_string(),
+    );
+}
+
+#[cfg(not(target_os = "macos"))]
+fn vm_net(_save: Option<serde_json::Value>) {
+    emit(serde_json::json!({"type": "vmnet", "supported": false}).to_string());
+}
+
+#[cfg(target_os = "macos")]
+fn shell_path(save: Option<serde_json::Value>) {
+    if let Some(body) = save {
+        if let Some(enabled) = body["enabled"].as_bool() {
+            match crate::setup::set_shell_path(enabled) {
+                Ok(()) => emit(notice("ok", &if enabled { tr("Added Kiri command-line tools to shell profiles") } else { tr("Removed Kiri command-line tools from shell profiles") })),
+                Err(e) => emit(notice("error", &trf("Could not update shell profiles: {error}", &[("error", &e)]))),
+            }
+        }
+    }
+    emit(serde_json::json!({"type": "shellpath", "supported": true, "enabled": crate::setup::shell_path_enabled()}).to_string());
+}
+
+#[cfg(not(target_os = "macos"))]
+fn shell_path(_save: Option<serde_json::Value>) {
+    emit(serde_json::json!({"type": "shellpath", "supported": false}).to_string());
+}
+
+#[cfg(target_os = "macos")]
+fn run_uninstall() {
+    match std::env::current_exe().and_then(|exe| {
+        std::process::Command::new(exe)
+            .args(["setup", "--uninstall"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+    }) {
+        Ok(_) => emit(notice("ok", &tr("Uninstalling Kiri…"))),
+        Err(e) => emit(notice("error", &trf("Could not uninstall Kiri: {error}", &[("error", &e)]))),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn run_uninstall() {
+    emit(notice("error", &tr("Uninstall Kiri using your system package manager")));
+}
+
 /// Reads (or saves, then reads) the VM's CPUs and memory for Settings.
 fn resources(save: Option<serde_json::Value>) {
     let saved = save.map(|body| client::request("POST", "/kiri/resources", Some(&body)));
@@ -1180,6 +1327,7 @@ fn about() {
             "memory": info["MemTotal"],
             "awake": info["KiriVmAwake"],
             "os": info["OperatingSystem"],
+            "can_uninstall": cfg!(target_os = "macos"),
         })
         .to_string(),
     );
@@ -2462,6 +2610,51 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
         }
         "storageremoveold" => {
             std::thread::spawn(storage_remove_old);
+            Ok(())
+        }
+        "storagereclaim" => {
+            let tx = tx.clone();
+            std::thread::spawn(move || storage_reclaim(tx));
+            Ok(())
+        }
+        "storageprune" => {
+            let tx = tx.clone();
+            std::thread::spawn(move || storage_prune(tx));
+            Ok(())
+        }
+        // Settings → Builds: cache limit and idle timeout (/kiri/builder).
+        "buildersettings" => {
+            std::thread::spawn(|| builder_settings(None));
+            Ok(())
+        }
+        "setbuildersettings" => {
+            let body = msg.value;
+            std::thread::spawn(move || builder_settings(Some(body)));
+            Ok(())
+        }
+        // Settings → Network: macOS outbound VM traffic (vm.json shared_nat).
+        "vmnet" => {
+            std::thread::spawn(|| vm_net(None));
+            Ok(())
+        }
+        "setvmnet" => {
+            let body = msg.value;
+            std::thread::spawn(move || vm_net(Some(body)));
+            Ok(())
+        }
+        // Settings → Appearance: macOS shell profile PATH (#556).
+        "shellpath" => {
+            std::thread::spawn(|| shell_path(None));
+            Ok(())
+        }
+        "setshellpath" => {
+            let body = msg.value;
+            std::thread::spawn(move || shell_path(Some(body)));
+            Ok(())
+        }
+        // Settings → About: Uninstall Kiri (macOS).
+        "uninstall" => {
+            std::thread::spawn(run_uninstall);
             Ok(())
         }
         // Settings → Resources.

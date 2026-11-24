@@ -850,6 +850,17 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
                     Some(l) => Msg::Uplink { ip: l.ip, gateway: l.gateway }.encode(&mut out),
                     None => Msg::Error("no uplink lease").encode(&mut out),
                 },
+                Ok(Msg::DiskUsageQuery) => match super::trim::stat(super::DATA) {
+                    Ok((in_use, capacity)) => Msg::DiskUsage { in_use, capacity }.encode(&mut out),
+                    Err(e) => Msg::Error(&format!("disk usage: {e}")).encode(&mut out),
+                },
+                Ok(Msg::TrimDisk) => match super::trim::trim(super::DATA) {
+                    Ok(trimmed) => {
+                        let (in_use, capacity) = super::trim::stat(super::DATA).unwrap_or((0, 0));
+                        Msg::DiskTrimmed { trimmed, in_use, capacity }.encode(&mut out);
+                    }
+                    Err(e) => Msg::Error(&format!("trim: {e}")).encode(&mut out),
+                },
                 Ok(Msg::SetUplink { ip, prefix, gateway, dns: dns_ip }) => match dhcp.as_mut() {
                     _ if host_process => Msg::Error("set uplink is only for the VM").encode(&mut out),
                     Some(d) => match d.apply_static(ip, prefix, gateway, dns_ip) {

@@ -249,6 +249,17 @@ pub enum Msg<'a> {
     /// security network extensions, or `0.0.0.0/0` under host egress). Empty
     /// clears the redirect rules. No reply.
     SetEgressRoutes(StrList<'a>),
+    /// Host → guest: query the guest data disk's (`DATA`) filesystem usage via
+    /// `statvfs`. Answered by `DiskUsage` or `Error`; an older agent answers `Error`.
+    DiskUsageQuery,
+    /// Guest → host: data disk bytes currently in use (`(blocks - bavail) * frsize`)
+    /// and total capacity (`blocks * frsize`).
+    DiskUsage { in_use: u64, capacity: u64 },
+    /// Host → guest: run `FITRIM` immediately on the guest data disk (`DATA`).
+    /// Answered by `DiskTrimmed` or `Error`; an older agent answers `Error`.
+    TrimDisk,
+    /// Guest → host: bytes discarded by `FITRIM`, plus updated `statvfs` usage.
+    DiskTrimmed { trimmed: u64, in_use: u64, capacity: u64 },
     /// Success, for requests with nothing else to say.
     Ack,
 }
@@ -886,6 +897,10 @@ mod kind {
     pub const FS_READ_LINK: u16 = 82;
     pub const SET_UPLINK: u16 = 83;
     pub const SET_EGRESS_ROUTES: u16 = 84;
+    pub const DISK_USAGE_QUERY: u16 = 85;
+    pub const DISK_USAGE: u16 = 86;
+    pub const TRIM_DISK: u16 = 87;
+    pub const DISK_TRIMMED: u16 = 88;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1286,6 +1301,17 @@ impl Msg<'_> {
                 put_u32(o, routes.count);
                 o.extend_from_slice(routes.raw);
             }),
+            Msg::DiskUsageQuery => frame(out, kind::DISK_USAGE_QUERY, |_| {}),
+            Msg::DiskUsage { in_use, capacity } => frame(out, kind::DISK_USAGE, |o| {
+                put_u64(o, in_use);
+                put_u64(o, capacity);
+            }),
+            Msg::TrimDisk => frame(out, kind::TRIM_DISK, |_| {}),
+            Msg::DiskTrimmed { trimmed, in_use, capacity } => frame(out, kind::DISK_TRIMMED, |o| {
+                put_u64(o, trimmed);
+                put_u64(o, in_use);
+                put_u64(o, capacity);
+            }),
             Msg::Listening(lines) => frame(out, kind::LISTENING, |o| {
                 put_u32(o, lines.count);
                 o.extend_from_slice(lines.raw);
@@ -1603,6 +1629,10 @@ pub fn decode(frame: &[u8]) -> Result<Msg<'_>, DecodeError> {
         kind::USB_NODES => Msg::UsbNodes(r.list()?),
         kind::FS_EVENTS => Msg::FsEvents(r.list()?),
         kind::SET_EGRESS_ROUTES => Msg::SetEgressRoutes(r.list()?),
+        kind::DISK_USAGE_QUERY => Msg::DiskUsageQuery,
+        kind::DISK_USAGE => Msg::DiskUsage { in_use: r.u64()?, capacity: r.u64()? },
+        kind::TRIM_DISK => Msg::TrimDisk,
+        kind::DISK_TRIMMED => Msg::DiskTrimmed { trimmed: r.u64()?, in_use: r.u64()?, capacity: r.u64()? },
         kind::NET_ATTACH => Msg::NetAttach {
             id: r.str()?,
             ifname: r.str()?,
@@ -1694,6 +1724,10 @@ mod tests {
         round(Msg::Stats(Stats { mem_balloon_kib: None, ..full }));
         round(Msg::Stats(Stats { mem_committed_kib: None, ..full }));
         round(Msg::Stats(Stats { mem_balloon_kib: None, mem_committed_kib: None, ..full }));
+        round(Msg::DiskUsageQuery);
+        round(Msg::DiskUsage { in_use: 17_300_000_000, capacity: 68_719_476_736 });
+        round(Msg::TrimDisk);
+        round(Msg::DiskTrimmed { trimmed: 12_100_000_000, in_use: 17_300_000_000, capacity: 68_719_476_736 });
         // Older agents' Stats, without the later words, still decode.
         let mut buf = Vec::new();
         Msg::Stats(full).encode(&mut buf);

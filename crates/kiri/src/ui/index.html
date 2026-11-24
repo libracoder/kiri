@@ -2804,7 +2804,7 @@ const VM = LINUX ? "Engine" : "Linux VM";
 const shareOn = () => !!(ui.status?.share ?? ui.status?.dev);
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 
-const ui = { acting: new Map(), gacting: new Map(), running: new Set(), launched: new Map(), runWatch: new Map(), need: null, probed: new Map(), probing: new Set(), why: new Map(), startErr: {}, fixed: null, openTab: null, listening: new Map(), starting: new Map(), scans: new Map(), scanf: { sev: "", fix: false, own: false }, view: "containers", vm: "stopped", containers: [], images: [], volumes: [], networks: [], sort: { images: { key: "pulled", desc: true } }, filter: "", suffix: "kiri.localhost", collapsed: new Set(), res: null, resDraft: {}, storage: null, stErr: "", proxy: null, pxDraft: {}, rports: null, rpDraft: {}, rpAt: 0, regcfg: null, regBase: null, regDraft: { insecure: [], mirrors: [] }, regAdd: { insecure: "", mirrors: "" }, dockersock: null, sockTaking: false, ctxSwitching: false,
+const ui = { acting: new Map(), gacting: new Map(), running: new Set(), launched: new Map(), runWatch: new Map(), need: null, probed: new Map(), probing: new Set(), why: new Map(), startErr: {}, fixed: null, openTab: null, listening: new Map(), starting: new Map(), scans: new Map(), scanf: { sev: "", fix: false, own: false }, view: "containers", vm: "stopped", containers: [], images: [], volumes: [], networks: [], sort: { images: { key: "pulled", desc: true } }, filter: "", suffix: "kiri.localhost", collapsed: new Set(), res: null, resDraft: {}, storage: null, stErr: "", stReclaiming: false, stReclaimed: null, stPruning: false, stPruned: null, bset: null, bsetDraft: null, vmnet: null, shellPath: null, shellPathBusy: false, proxy: null, pxDraft: {}, rports: null, rpDraft: {}, rpAt: 0, regcfg: null, regBase: null, regDraft: { insecure: [], mirrors: [] }, regAdd: { insecure: "", mirrors: "" }, dockersock: null, sockTaking: false, ctxSwitching: false,
   imp: { sources: null, source: null, inv: null, picked: { images: new Set(), volumes: new Set(), containers: new Set() }, steps: {}, running: false, summary: "" },
   upd: null, engineStale: null, staleHidden: false,
   // The Builds view: the list, the picked build and its detail, and how its steps show.
@@ -4395,6 +4395,22 @@ function builderPref() {
     <button class="btn sm" data-buildprune${ui.bwPruning ? " disabled" : ""}>${ui.bwPruning ? tr("Clearing…") : tr("Clear build cache")}</button></div>`;
 }
 
+/* Settings → Builds: cache limit and idle sleep (/kiri/builder). */
+function builderSettingsPrefs() {
+  const s = ui.bset;
+  if (!s || s.error) return "";
+  const cacheVal = Math.min(128, Math.max(2, Number(ui.bsetDraft?.cache_gb ?? s.cache_gb ?? s.default_cache_gb ?? 20)));
+  const idleVal = Number(ui.bsetDraft?.idle_secs ?? s.idle_secs ?? 300);
+  const idleOpts = [[300, tr("5 min")], [600, tr("10 min")], [1800, tr("30 min")], [0, tr("Never")]];
+  return `<div class="pref"><span class="t">${tr("Build cache limit")}</span>
+      <span class="d">${tr("Oldest cached layers are pruned automatically once BuildKit's cache passes this size.")}</span>
+      <div class="range"><input type="range" id="bld-cache" min="2" max="128" step="2" value="${cacheVal}" aria-label="${tr("Build cache limit")}" style="--fill:${rangeFill(cacheVal, 2, 128)}"><span class="num" id="bld-cache-v">${diskGb(cacheVal)}</span></div></div>
+    <div class="pref"><span class="t">${tr("Stop builder when idle")}</span>
+      <span class="d">${tr("Stops BuildKit between builds so it uses no memory while idle; the next build wakes it in under a second.")}</span>
+      <div class="seg" role="group" aria-label="${tr("Stop builder when idle")}">${idleOpts.map(([v, l]) => `<button data-bldidle="${v}" aria-pressed="${idleVal === v}">${l}</button>`).join("")}</div></div>
+    ${s.overridden ? `<p class="muted">${tr("KIRI_BUILD_CACHE_GB or KIRI_BUILDER_IDLE_SECS is set for the daemon, and it takes precedence over these.")}</p>` : ""}`;
+}
+
 /* Settings → Builds: Docker's builder or Kiri's for plain `docker build`, at once. */
 function buildsPane() {
   const b = ui.bw;
@@ -4413,6 +4429,7 @@ function buildsPane() {
       <div class="seg" role="group" aria-label="${tr("Build with")}"><button data-bw="docker" aria-pressed="${!kiri}">Docker</button><button data-bw="kiri" aria-pressed="${kiri}">Kiri</button></div></div>
     ${note}
     ${builderPref()}
+    ${builderSettingsPrefs()}
     <p class="muted">${tr("{cmd} always builds on Kiri. A switch applies at once, in terminals already open too. Switching back to Docker puts docker's build settings back as they were before Kiri changed them.", { cmd: cmd("kiri build") })}</p>
   </div>`;
 }
@@ -4465,16 +4482,30 @@ function dockerSockRows() {
   return sockRow + cliRow;
 }
 
+function vmNetRow() {
+  const v = ui.vmnet;
+  if (!v || v.supported === false) return "";
+  const nat = v.shared_nat !== false;
+  const desc = nat
+    ? tr("macOS NAT: fastest. Switch to Host relay if Cloudflare WARP or a corporate firewall blocks container HTTPS. Applies on VM restart.")
+    : tr("Host relay: connections leave from Kiri on macOS instead of Virtualization.framework NAT. Applies on VM restart.");
+  const envNote = v.env ? ` ${tr("KIRI_SHARED_NAT is set in the environment and takes precedence.")}` : "";
+  return `<div class="pref"><span class="t">${tr("Outbound VM traffic")}</span>
+    <span class="d">${desc}${envNote}</span>
+    <div class="seg" role="group" aria-label="${tr("Outbound VM traffic")}"><button data-vmnat="1" aria-pressed="${nat}"${v.env ? " disabled" : ""}>${tr("macOS NAT")}</button><button data-vmnat="0" aria-pressed="${!nat}"${v.env ? " disabled" : ""}>${tr("Host relay")}</button></div></div>`;
+}
+
 function networkPane() {
-  const p = ui.proxy, sock = dockerSockRows();
-  if (!p) return `<div class="pane"><h3>${tr("Network")}</h3>${sock}<p class="muted">${tr("Loading…")}</p></div>`;
-  if (p.error) return `<div class="pane"><h3>${tr("Network")}</h3>${sock}<p class="muted">${tr("Start Kiri to change its network settings. ({error})", { error: esc(p.error) })}</p></div>`;
+  const p = ui.proxy, sock = dockerSockRows(), vmnet = vmNetRow();
+  if (!p) return `<div class="pane"><h3>${tr("Network")}</h3>${sock}${vmnet}<p class="muted">${tr("Loading…")}</p></div>`;
+  if (p.error) return `<div class="pane"><h3>${tr("Network")}</h3>${sock}${vmnet}<p class="muted">${tr("Start Kiri to change its network settings. ({error})", { error: esc(p.error) })}</p></div>`;
   const d = ui.pxDraft, eff = p.effective;
   const seg = [["system", tr("{os} settings", { os: OS })], ["custom", tr("Custom")], ["none", tr("None")]].map(([v, l]) => `<button data-pxmode="${v}" aria-pressed="${d.mode === v}">${l}</button>`).join("");
   const now = eff.https || eff.http ? (eff.no_proxy.length ? tr("In use: {proxy}, except {hosts}.", { proxy: `<span class="mono">${esc(eff.https || eff.http)}</span>`, hosts: `<span class="mono">${esc(eff.no_proxy.join(", "))}</span>` }) : tr("In use: {proxy}.", { proxy: `<span class="mono">${esc(eff.https || eff.http)}</span>` })) : tr("No proxy is in use.");
   const field = (k, label, ph) => `<label class="pxf"><span>${label}</span><input class="field" id="px-${k}" value="${esc(d[k] || "")}" placeholder="${ph}" spellcheck="false" autocomplete="off"></label>`;
   return `<div class="pane"><h3>${tr("Network")}</h3>
     ${sock}
+    ${vmnet}
     <div class="pref"><span class="t">${tr("Proxy")}</span><span class="d">${tr("For pulling and pushing images.")} ${d.mode === p.settings.mode ? now : ""}</span>
       <div class="seg" role="group" aria-label="${tr("Proxy")}">${seg}</div></div>
     ${d.mode === "system" && eff.pac ? `<p class="muted">${tr("{os} uses an automatic proxy configuration (PAC) file, which Kiri can't follow. Choose Custom and enter the proxy.", { os: OS })}</p>` : ""}
@@ -4546,7 +4577,7 @@ function resourcesPane() {
       <div class="range"><input type="range" id="res-cpus" min="1" max="${r.max_cpus}" step="1" value="${d.cpus}" aria-label="${tr("CPUs")}" style="--fill:${rangeFill(d.cpus, 1, r.max_cpus)}"><span class="num" id="res-cpus-v">${cpuText(d.cpus)}</span></div></div>
     <div class="pref"><span class="t">${tr("Memory")}</span><span class="d">${LINUX ? tr("The most containers and the engine may take. Unused memory stays free on Linux.") : tr("The most the VM may take. It uses memory only as containers need it and gives the rest back to {os}.", { os: OS })}</span>
       <div class="range"><input type="range" id="res-mem" min="1024" max="${maxGb * 1024}" step="1024" value="${Math.min(d.memory_mib, maxGb * 1024)}" aria-label="${tr("Memory")}" style="--fill:${rangeFill(Math.min(d.memory_mib, maxGb * 1024), 1024, maxGb * 1024)}"><span class="num" id="res-mem-v">${gb(d.memory_mib)}</span></div></div>
-    ${hasDisk ? `<div class="pref"><span class="t">${tr("Disk image size")}</span><span class="d">${tr("The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.", { os: OS })}</span>
+    ${hasDisk ? `<div class="pref"><span class="t">${tr("Disk image size")}</span><span class="d">${tr("The most the VM disk may grow to. Space is used on {os} only as data is written, and unused space can be reclaimed in {storage}. Applies on restart.", { os: OS, storage: `<button class="linkbtn" data-stgoto>${tr("Settings → Storage")}</button>` })}</span>
       <div class="range"><input type="range" id="res-disk" min="${minDisk}" max="${maxDisk}" step="${diskStep}" value="${diskVal}" aria-label="${tr("Disk image size")}" style="--fill:${rangeFill(diskVal, minDisk, maxDisk)}"><span class="num" id="res-disk-v">${diskGb(diskVal)}</span></div></div>` : ""}
     ${r.overridden ? `<p class="muted">${hasDisk ? tr("KIRI_CPUS, KIRI_MEMORY_MIB or KIRI_DISK_GB is set for the daemon, and it takes precedence over these.") : tr("KIRI_CPUS or KIRI_MEMORY_MIB is set for the daemon, and it takes precedence over these.")}</p>` : ""}
     <div class="res-foot"><span class="muted">${r.awake ? (hasDisk ? tr("Running now with {cpus}, up to {mem}, and a {disk} disk.", { cpus: cpuText(r.running_cpus), mem: gb(r.running_memory_mib), disk: diskGb(r.running_disk_gb ?? r.disk_gb) }) : tr("Running now with {cpus} and up to {mem}.", { cpus: cpuText(r.running_cpus), mem: gb(r.running_memory_mib) })) : LINUX ? tr("The engine is off; it starts with these next time.") : tr("The VM is asleep; it starts with these next time.")}</span>
@@ -4608,6 +4639,94 @@ function renderStorageUnavailable() {
     </div></div></div>`;
 }
 
+function storageDiskRow(s, moving) {
+  if (LINUX) {
+    return `<div class="pref"><span class="t">${tr("VM disk space")}</span>
+      <span class="d">${tr("Native Linux uses your host filesystem directly — deleted images and volumes free space immediately.")}</span></div>`;
+  }
+  const vhdx = '<span class="mono">ext4.vhdx</span>';
+  const diskHost = s.disk_host, diskInUse = s.disk_in_use, reclaimable = s.reclaimable;
+  const btnLbl = WIN ? tr("Compact disk…") : tr("Reclaim space");
+  const busyLbl = WIN ? tr("Compacting…") : tr("Reclaiming…");
+  let d = "";
+  if (ui.stReclaiming) {
+    d = WIN
+      ? tr("Compacting {vhdx} and restarting the engine…", { vhdx })
+      : diskHost != null && diskInUse != null
+        ? tr("{host} on {os}, {inUse} in use inside the VM · trimming unused blocks…", { host: size(diskHost), os: OS, inUse: size(diskInUse) })
+        : tr("Trimming unused blocks inside the VM disk…");
+  } else if (ui.stReclaimed) {
+    const r = ui.stReclaimed, after = r.after ?? diskHost, inUse = r.in_use ?? diskInUse, freed = r.reclaimed || 0;
+    const freedHtml = `<span style="color:var(--moss)">${tr("Freed {size}", { size: size(freed) })}</span>`;
+    if (freed > 0) {
+      d = after != null && inUse != null
+        ? (WIN
+          ? tr("{host} on Windows ({vhdx}), {inUse} in use · {freed}.", { host: size(after), vhdx, inUse: size(inUse), freed: freedHtml })
+          : tr("{host} on {os}, {inUse} in use inside the VM · {freed}.", { host: size(after), os: OS, inUse: size(inUse), freed: freedHtml }))
+        : freedHtml;
+    } else {
+      d = after != null && inUse != null
+        ? (WIN
+          ? tr("{host} on Windows ({vhdx}), {inUse} in use · nothing to reclaim.", { host: size(after), vhdx, inUse: size(inUse) })
+          : tr("{host} on {os}, {inUse} in use inside the VM · nothing to reclaim.", { host: size(after), os: OS, inUse: size(inUse) }))
+        : tr("Nothing to reclaim.");
+    }
+  } else if (diskHost != null && diskInUse != null && reclaimable > 0) {
+    const can = `<b style="color:var(--text)">${tr("{size} can be given back", { size: size(reclaimable) })}</b>`;
+    d = WIN
+      ? tr("{host} on Windows ({vhdx}), {inUse} in use · {can}. Compacting restarts the engine.", { host: size(diskHost), vhdx, inUse: size(diskInUse), can })
+      : tr("{host} on {os}, {inUse} in use inside the VM · {can} without stopping containers.", { host: size(diskHost), os: OS, inUse: size(diskInUse), can });
+  } else if (diskHost != null && diskInUse != null) {
+    d = WIN
+      ? tr("{host} on Windows ({vhdx}), {inUse} in use · nothing to reclaim.", { host: size(diskHost), vhdx, inUse: size(diskInUse) })
+      : tr("{host} on {os}, {inUse} in use inside the VM · nothing to reclaim.", { host: size(diskHost), os: OS, inUse: size(diskInUse) });
+  } else if (diskHost != null) {
+    d = WIN
+      ? tr("{host} on Windows ({vhdx}). Compacting returns unused space and restarts the engine.", { host: size(diskHost), vhdx })
+      : tr("{host} on {os}. Reclaiming trims unused blocks in the VM disk without stopping containers.", { host: size(diskHost), os: OS });
+  } else {
+    d = WIN
+      ? tr("Returns unused space in {vhdx} to Windows. Compacting restarts the engine.", { vhdx })
+      : tr("Returns unused blocks in the VM disk to {os} without stopping containers.", { os: OS });
+  }
+  const dis = moving || (diskHost != null && diskInUse != null && !(reclaimable > 0));
+  const ctl = ui.stReclaiming
+    ? `<span class="st-acts"><span class="hbusy"><i class="hspin"></i>${busyLbl}</span></span>`
+    : `<span class="st-acts"><button class="btn" data-streclaim${dis ? " disabled" : ""}>${btnLbl}</button></span>`;
+  return `<div class="pref st-pref"><span class="t">${tr("VM disk space")}</span><span class="d num">${d}</span>${ctl}</div>`;
+}
+
+function storagePruneRow(moving) {
+  const stoppedN = ui.containers.filter((c) => c.State !== "running").length;
+  const danglingImgs = ui.images.filter((i) => !(i.RepoTags || []).some((t) => t && t !== "<none>:<none>" && !t.startsWith("sha256:")));
+  const danglingSize = danglingImgs.reduce((a, i) => a + (i.Size || 0), 0);
+  const hasCache = !!ui.builderVolume;
+  const hasUnused = stoppedN > 0 || danglingImgs.length > 0 || hasCache;
+  let d = "";
+  if (ui.stPruning) {
+    d = tr("Cleaning up stopped containers, untagged images, and build cache…");
+  } else if (hasUnused) {
+    const parts = [];
+    if (stoppedN > 0) parts.push(trn(stoppedN, "{n} stopped container", "{n} stopped containers"));
+    if (danglingImgs.length > 0) {
+      const cnt = trn(danglingImgs.length, "{n} untagged image", "{n} untagged images");
+      parts.push(danglingSize > 0 ? tr("{count} ({size})", { count: cnt, size: size(danglingSize) }) : cnt);
+    }
+    if (hasCache) parts.push(tr("build cache"));
+    d = `${parts.join(" · ")}.`;
+  } else if (ui.stPruned && ui.stPruned.freed > 0) {
+    d = tr("No stopped containers, untagged images or build cache · {freed}.", {
+      freed: `<span style="color:var(--moss)">${tr("Freed {size}", { size: size(ui.stPruned.freed) })}</span>`,
+    });
+  } else {
+    d = tr("No stopped containers, untagged images or build cache.");
+  }
+  const ctl = ui.stPruning
+    ? `<span class="st-acts"><span class="hbusy"><i class="hspin"></i>${tr("Cleaning up…")}</span></span>`
+    : `<span class="st-acts"><button class="btn" data-stprune${moving || !hasUnused ? " disabled" : ""}>${tr("Clean up…")}</button></span>`;
+  return `<div class="pref st-pref"><span class="t">${tr("Unused Docker data")}</span><span class="d num">${d}</span>${ctl}</div>`;
+}
+
 function storagePane() {
   const s = ui.storage;
   if (!s) return `<div class="pane"><h3>${tr("Storage")}</h3><p class="muted">${tr("Loading…")}</p></div>`;
@@ -4648,6 +4767,8 @@ function storagePane() {
     ${progressBox}
     ${errBox}
     ${oldRow}
+    ${!unavail ? storageDiskRow(s, moving) : ""}
+    ${!unavail ? storagePruneRow(moving) : ""}
     <p class="muted">${tr("Images, containers, and volumes live in this folder. External drives must use a native filesystem (APFS on macOS, ext4/xfs/btrfs on Linux, NTFS on Windows); FAT and exFAT drives aren't supported.")}</p>
   </div>`;
 }
@@ -4740,6 +4861,8 @@ function renderSettings() {
       <div class="seg" role="group" aria-label="${tr("Start Kiri at sign-in")}"><button data-startlogin="0" aria-pressed="${!startAtLogin}">${tr("Off")}</button><button data-startlogin="1" aria-pressed="${startAtLogin}">${tr("On")}</button></div></div>
     <div class="pref"><span class="t">${tr("Stop the engine when Kiri quits")}</span><span class="d">${tr("Quitting Kiri stops running containers and the engine. Opening Kiri starts it again.")}</span>
       <div class="seg" role="group" aria-label="${tr("Stop the engine when Kiri quits")}"><button data-stopquit="0" aria-pressed="${!stopOnQuit}">${tr("Off")}</button><button data-stopquit="1" aria-pressed="${stopOnQuit}">${tr("On")}</button></div></div>
+    ${ui.shellPath && ui.shellPath.supported !== false ? `<div class="pref"><span class="t">${tr("Command-line tools in shell")}</span><span class="d">${tr("Add {bin} to {zshrc} and {zprofile} so {docker}, {kubectl} and {kiri} work in new terminals.", { bin: '<span class="mono">~/.kiri/bin</span>', zshrc: '<span class="mono">.zshrc</span>', zprofile: '<span class="mono">.zprofile</span>', docker: '<span class="mono">docker</span>', kubectl: '<span class="mono">kubectl</span>', kiri: '<span class="mono">kiri</span>' })}</span>
+      <div class="seg" role="group" aria-label="${tr("Command-line tools in shell")}"><button data-shellpath="0" aria-pressed="${!ui.shellPath.enabled}"${ui.shellPathBusy ? " disabled" : ""}>${tr("Off")}</button><button data-shellpath="1" aria-pressed="${!!ui.shellPath.enabled}"${ui.shellPathBusy ? " disabled" : ""}>${tr("On")}</button></div></div>` : ""}
   </div>`;
   const portsPref = routerPortsPref();
   // On Linux: kiri.localhost only, for now; nothing to switch.
@@ -4770,6 +4893,7 @@ function renderSettings() {
   </div>`;
   const a = about;
   const mib = (b) => (b ? `${(b / 1073741824).toFixed(1)} GB` : "—");
+  const canUninstall = a?.can_uninstall ?? (!WIN && !LINUX);
   const aboutPane = `<div class="pane about"><div class="about-head">
       <svg viewBox="0 0 64 64" aria-hidden="true"><g transform="translate(6 0) skewX(-10)"><clipPath id="lid2"><rect x="22" y="12" width="34" height="40" rx="10"/></clipPath>
         <rect x="22" y="12" width="34" height="40" rx="10" fill="#E0B420"/><g clip-path="url(#lid2)"><rect x="10" y="0" width="60" height="21.5" fill="#F2CF5B"/></g>
@@ -4785,7 +4909,10 @@ function renderSettings() {
       <dt>${tr("Website")}</dt><dd><a data-open-site="https://runkiri.com">runkiri.com</a></dd>
       <dt>${tr("Made by")}</dt><dd><a data-open-site="https://canestack.com">Canestack Labs</a></dd>
     </dl>
-    <p class="muted">${tr("The name comes from the Igbo word ntakịrị, “small”.")}</p></div>`;
+    <p class="muted">${tr("The name comes from the Igbo word ntakịrị, “small”.")}</p>
+    ${canUninstall ? `<div class="pref"><span class="t">${tr("Uninstall Kiri")}</span>
+      <span class="d">${tr("Stops the engine, removes Kiri's background service, CLI links and shell profile entries, and restores your previous Docker context ({cmd}).", { cmd: '<span class="mono">kiri setup --uninstall</span>' })}</span>
+      <span class="pact"><button class="btn danger" data-uninstall>${tr("Uninstall Kiri…")}</button></span></div>` : ""}</div>`;
   const html = `<div class="settings"><div class="tabs">${tab("appearance", "textaa", tr("Appearance"))}${tab("resources", "stack", tr("Resources"))}${tab("storage", "harddrive", tr("Storage"))}${tab("network", "globe", tr("Network"))}${tab("builds", "hammer", tr("Builds"))}${tab("registries", "lock", tr("Registries"))}${tab("kubernetes", "pods", "Kubernetes")}${tab("import", "stack", tr("Import"))}${tab("domains", "network", tr("Domains"))}${tab("diagnostics", "bug", tr("Diagnostics"))}${tab("about", "info", tr("About"))}</div>
     ${prefs.tab === "diagnostics" ? diagPane() : prefs.tab === "about" ? aboutPane : prefs.tab === "domains" ? domainsPane : prefs.tab === "resources" ? `<div class="panes">${enginePane()}${resourcesPane()}${wslPane()}</div>` : prefs.tab === "storage" ? storagePane() : prefs.tab === "network" ? networkPane() : prefs.tab === "builds" ? buildsPane() : prefs.tab === "registries" ? `<div class="panes">${loginsOn() ? registriesPane() : ""}${regListPane("insecure")}${regListPane("mirrors")}</div>` : prefs.tab === "kubernetes" ? kubernetesPane() : prefs.tab === "import" ? importPane() : appearance}</div>`;
   // The container lists arrive every few seconds; rebuilding an unchanged page
@@ -4829,6 +4956,22 @@ function renderSettings() {
   // A list left open over a page that's gone (another view) closes; over the page drawn again, it stays.
   if (langPopState.close) $("pref-lang-btn")?.setAttribute("aria-expanded", "true");
   $("pref-mono")?.addEventListener("change", (ev) => setPref("mono", ev.target.value));
+  $("bld-cache")?.addEventListener("input", (ev) => {
+    const v = +ev.target.value;
+    ui.bsetDraft = { ...(ui.bsetDraft || {}), cache_gb: v };
+    ev.target.style.setProperty("--fill", rangeFill(v, +ev.target.min, +ev.target.max));
+    $("bld-cache-v").textContent = diskGb(v);
+  });
+  $("bld-cache")?.addEventListener("change", (ev) => {
+    const v = +ev.target.value;
+    ui.bsetDraft = { ...(ui.bsetDraft || {}), cache_gb: v };
+    if (ui.bset) ui.bset = { ...ui.bset, cache_gb: v };
+    send("setbuildersettings", { value: { cache_gb: v, idle_secs: ui.bsetDraft?.idle_secs ?? ui.bset?.idle_secs ?? 300 } });
+  });
+  $("k8s-ver")?.addEventListener("change", (ev) => {
+    const v = ev.target.value, c = k8s.config || {};
+    if (v !== (c.version || "")) k8sDo("set", { lan: !!c.lan, tls_san: c.tls_san || [], version: v || "default" });
+  });
 }
 /* i18n */ void [tr("Blue"), tr("Purple"), tr("Orange"), tr("Teal"), tr("Pink"), tr("Green"), tr("Small"), tr("Medium"), tr("Large")];
 
@@ -4842,7 +4985,7 @@ function show(view) {
   if (view === "compose") { cmp.open = null; cmp.asked = 0; cmpAsk(); }
   if (view === "usb") usbPoll();
   if (view === "share") { send("shares"); send("shareusage"); shPoll(); }
-  if (view === "settings") { if (!fontLists.families.length) send("fonts"); send("about"); send("logins"); send("resources"); send("storage"); send("dockersock"); send("proxy"); send("registryconfig"); send("routerports"); if (!ui.imp.sources) send("importsources"); if (prefs.tab === "diagnostics") diagOpen(); }
+  if (view === "settings") { if (!fontLists.families.length) send("fonts"); send("about"); send("logins"); send("resources"); send("storage"); send("dockersock"); send("proxy"); send("vmnet"); send("buildersettings"); send("shellpath"); send("registryconfig"); send("routerports"); if (!ui.imp.sources) send("importsources"); if (prefs.tab === "diagnostics") diagOpen(); }
   render();
   // From the top, as a container's or pod's page opens: leaving a page scrolled
   // down (a long Terminal or Logs tab) otherwise opened the next view below its rows.
@@ -8377,6 +8520,13 @@ window.kiri = {
       case "onboarding": onboarding(e); break;
       case "buildask": buildAsk(e.engine); break;
       case "buildwith": ui.bw = e; if (ui.view === "settings") render(); break;
+      case "buildersettings":
+        ui.bset = e;
+        if (!e.error) ui.bsetDraft = { cache_gb: e.cache_gb ?? e.default_cache_gb ?? 20, idle_secs: e.idle_secs ?? 300 };
+        if (ui.view === "settings") render();
+        break;
+      case "vmnet": ui.vmnet = e; if (ui.view === "settings") render(); break;
+      case "shellpath": ui.shellPath = e; ui.shellPathBusy = false; if (ui.view === "settings") render(); break;
       case "dockersock": ui.dockersock = e; ui.sockTaking = false; if (ui.view === "settings") render(); break;
       case "status":
         ui.status = e;
@@ -8470,9 +8620,33 @@ window.kiri = {
         const wasUnavail = ui.storage?.state === "unavailable";
         ui.storage = e;
         if (e.state === "moving") ui.stErr = "";
+        if (e.reclaimable > 0) ui.stReclaimed = null;
         if (ui.view === "settings" || e.state === "unavailable" || wasUnavail) render();
         break;
       }
+      case "storagereclaimed":
+        ui.stReclaiming = false;
+        if (e.error) {
+          toast("error", tr("Couldn't reclaim disk space: {error}", { error: e.error }));
+        } else {
+          ui.stReclaimed = e;
+          if (ui.storage && e.after != null) {
+            ui.storage = { ...ui.storage, disk_host: e.after, ...(e.in_use != null ? { disk_in_use: e.in_use } : {}), reclaimable: 0 };
+          }
+          toast("ok", e.reclaimed > 0 ? tr("Reclaimed {size} on {os}", { size: size(e.reclaimed), os: OS }) : tr("Nothing to reclaim"));
+        }
+        if (ui.view === "settings") render();
+        break;
+      case "storagepruned":
+        ui.stPruning = false;
+        if (e.error) {
+          toast("error", tr("Couldn't clean up unused Docker data: {error}", { error: e.error }));
+        } else {
+          ui.stPruned = e;
+          toast("ok", e.freed > 0 ? tr("Cleaned up {size} of unused Docker data", { size: size(e.freed) }) : tr("Cleaned up unused Docker data"));
+        }
+        if (ui.view === "settings") render();
+        break;
       case "storagecheck":
         if (e.error) { ui.stErr = e.error; if (ui.view === "settings") render(); else toast("error", e.error); }
         else { ui.stErr = ""; storageConfirm(e); }
@@ -8576,8 +8750,18 @@ $("content").addEventListener("click", (ev) => {
   else if ((el = t("[data-g]"))) projectAsk(el.dataset.project, el.dataset.g);
   else if ((el = t("[data-group]"))) toggleGroup(el);
   else if (composeClick(t)) {}
-  else if ((el = t("[data-stab]"))) { prefs.tab = el.dataset.stab; if (prefs.tab === "about") send("about"); if (prefs.tab === "storage") send("storage"); if (prefs.tab === "network") { send("proxy"); send("dockersock"); } if (prefs.tab === "builds") send("buildwith"); if (prefs.tab === "registries") { send("logins"); send("registryconfig"); } if (prefs.tab === "diagnostics") diagOpen(); render(); }
+  else if ((el = t("[data-stab]"))) { prefs.tab = el.dataset.stab; if (prefs.tab === "about") send("about"); if (prefs.tab === "storage") send("storage"); if (prefs.tab === "network") { send("proxy"); send("dockersock"); send("vmnet"); } if (prefs.tab === "builds") { send("buildwith"); send("buildersettings"); } if (prefs.tab === "appearance") send("shellpath"); if (prefs.tab === "registries") { send("logins"); send("registryconfig"); } if (prefs.tab === "diagnostics") diagOpen(); render(); }
   else if (t("[data-stpick]")) { ui.stErr = ""; send("storagepick"); }
+  else if (t("[data-streclaim]")) {
+    if (WIN) {
+      confirmRemove(tr("Compact WSL disk?"), tr("Compacting {vhdx} returns unused space to Windows and briefly restarts Kiri's engine and running containers.", { vhdx: '<span class="mono">ext4.vhdx</span>' }), tr("Compact disk"), () => { ui.stReclaiming = true; ui.stReclaimed = null; send("storagereclaim"); render(); }, "primary");
+    } else {
+      ui.stReclaiming = true; ui.stReclaimed = null; send("storagereclaim"); render();
+    }
+  }
+  else if (t("[data-stprune]")) {
+    confirmRemove(tr("Clean up unused Docker data?"), tr("Removes stopped containers, untagged images, and BuildKit's build cache. Running containers and tagged images are kept."), tr("Clean up"), () => { ui.stPruning = true; ui.stPruned = null; send("storageprune"); render(); });
+  }
   else if (t("[data-streset]")) {
     if (ui.storage?.state === "unavailable") {
       confirmRemove(tr("Reset storage location to default?"), tr("Kiri will switch back to its default folder and restart the engine. Data on the disconnected drive isn't deleted."), tr("Reset to default"), () => send("storagereset"), "primary");
@@ -8599,6 +8783,35 @@ $("content").addEventListener("click", (ev) => {
   else if ((el = t("[data-theme-pick]"))) setPref("theme", el.dataset.themePick);
   else if ((el = t("[data-accent]"))) setPref("accent", el.dataset.accent);
   else if (t("[data-buildprune]")) { ui.bwPruning = true; send("buildprune"); render(); }
+  else if ((el = t("[data-bldidle]"))) {
+    const secs = +el.dataset.bldidle;
+    if (ui.bset && !ui.bset.error && secs !== Number(ui.bsetDraft?.idle_secs ?? ui.bset.idle_secs)) {
+      ui.bsetDraft = { ...(ui.bsetDraft || {}), idle_secs: secs };
+      ui.bset = { ...ui.bset, idle_secs: secs };
+      send("setbuildersettings", { value: { idle_secs: secs } });
+      render();
+    }
+  }
+  else if ((el = t("[data-vmnat]"))) {
+    const shared_nat = el.dataset.vmnat === "1";
+    if (ui.vmnet && !ui.vmnet.env && !!ui.vmnet.shared_nat !== shared_nat) {
+      ui.vmnet = { ...ui.vmnet, shared_nat };
+      send("setvmnet", { value: { shared_nat } });
+      render();
+    }
+  }
+  else if ((el = t("[data-shellpath]"))) {
+    const enabled = el.dataset.shellpath === "1";
+    if (ui.shellPath && !ui.shellPathBusy && !!ui.shellPath.enabled !== enabled) {
+      ui.shellPath = { ...ui.shellPath, enabled };
+      ui.shellPathBusy = true;
+      send("setshellpath", { value: { enabled } });
+      render();
+    }
+  }
+  else if (t("[data-uninstall]")) {
+    confirmRemove(tr("Uninstall Kiri?"), tr("Stops the engine, removes Kiri's background service, CLI links and shell profile entries, and restores your previous Docker context. Your images and volumes stay in Kiri's data folder until you delete it."), tr("Uninstall Kiri"), () => send("uninstall"));
+  }
   else if ((el = t("[data-bw]"))) { const v = el.dataset.bw; if (ui.bw && !ui.bw.error && (v !== ui.bw.with || (v === "kiri" && !ui.bw.taken))) { ui.bw = { ...ui.bw, with: v }; send("buildwith", { value: v }); render(); } }
   else if ((el = t("[data-domains]"))) { if (!!+el.dataset.domains !== !!ui.domainsOn) send("domains", { value: !!+el.dataset.domains }); }
   else if ((el = t("[data-open-site]"))) send("open", { name: el.dataset.openSite });
@@ -8742,7 +8955,7 @@ document.addEventListener("dblclick", (ev) => {
    awake for it then anyway). Nothing here starts the cluster but Start. */
 const K8S_VIEWS = new Set(["pods", "services"]);
 const k8s = { state: null, ready: false, pods: [], services: [], icon: null, asked: 0, sig: "", detail: null, svc: null, partial: "",
-  op: "", opAt: 0, opLine: "", context: "", config: null, sanDraft: null, port: null, wantPort: 6443, portDraft: null };
+  op: "", opAt: 0, opLine: "", context: "", config: null, sanDraft: null, port: null, wantPort: 6443, portDraft: null, argsDraft: null, defaultVer: "", manifestsDir: "" };
 empty.pods = { title: "No pods", body: "Pods you create with <code>kubectl</code> show up here, grouped by namespace.", art: "pods" };
 empty.services = { title: "No services", body: "Services you create with <code>kubectl expose</code> show up here. LoadBalancer services answer on <code>localhost</code>.", art: "services" };
 /* i18n */ void [tr("No pods"), tr("Pods you create with <code>kubectl</code> show up here, grouped by namespace."), tr("No services"), tr("Services you create with <code>kubectl expose</code> show up here. LoadBalancer services answer on <code>localhost</code>.")];
@@ -8818,6 +9031,8 @@ function k8sOn(e) {
       Object.assign(k8s, { state: e.state, ready: !!e.ready, error: e.error || "", context: e.context || k8s.context, config: e.config || k8s.config });
       if ("port" in e) k8s.port = e.port;
       if (e.want_port) k8s.wantPort = e.want_port;
+      if (e.default_version) k8s.defaultVer = e.default_version;
+      if (e.manifests_dir) k8s.manifestsDir = e.manifests_dir;
       if (e.ready) { Object.assign(k8s, { pods: e.pods || [], services: e.services || [], icon: e.icon }); kGone(); }
       k8sCounts();
       k8sSide();
@@ -8835,7 +9050,7 @@ function k8sOn(e) {
         if (k8sShown()) { const el = $("k8s-step"); if (el) el.textContent = k8s.opLine; else render(); }
         break;
       }
-      k8s.op = ""; k8s.opLine = ""; k8s.opAt = 0; k8s.sanDraft = null; k8s.portDraft = null;
+      k8s.op = ""; k8s.opLine = ""; k8s.opAt = 0; k8s.sanDraft = null; k8s.portDraft = null; k8s.argsDraft = null;
       if (e.port) k8s.port = e.port;
       if (e.want_port) k8s.wantPort = e.want_port;
       if (e.state === "error") toast("error", tr("Kubernetes: {error}", { error: e.error }));
@@ -8953,6 +9168,29 @@ function kubernetesPane() {
     <div class="pref"><span class="t">${tr("Additional certificate names")}</span><span class="d">${tr("IP addresses or domain names, separated by commas, that the API server's certificate also covers, such as this {host}'s address on your network. Saving restarts the cluster.", { host: tr(HOST) })}</span>
       <div class="ksan"><input class="field mono" id="k8s-san" value="${esc(draft)}" placeholder="192.168.1.20, my-mac.local" spellcheck="false" autocomplete="off"${dis}>
         <button class="btn" data-k8ssan${dis || draft === (cfg.tls_san || []).join(", ") ? " disabled" : ""}>${tr("Save")}</button></div></div>
+    <h4 class="ksub">${tr("Cluster")}</h4>
+    ${(() => {
+      const defVer = k8s.defaultVer || "v1.37.1-k3s1";
+      const savedVer = cfg.version || "";
+      const presets = ["v1.37.1-k3s1", "v1.36.0-k3s1", "v1.35.0-k3s1", "v1.34.1-k3s1", "v1.33.1-k3s1", "v1.32.1-k3s1", "v1.31.4-k3s1"];
+      const list = [defVer, ...presets.filter((v) => v !== defVer)];
+      if (savedVer && !list.includes(savedVer)) list.push(savedVer);
+      const optsHtml = list.map((v, i) => {
+        const val = i === 0 ? "" : v;
+        const lbl = i === 0 ? `${v} (${tr("default")})` : v;
+        return `<option value="${esc(val)}"${savedVer === val ? " selected" : ""}>${esc(lbl)}</option>`;
+      }).join("");
+      const savedArgs = (cfg.k3s_args || []).join(" ");
+      const argsDraft = k8s.argsDraft ?? savedArgs;
+      const mdir = k8s.manifestsDir || (WIN ? "%LOCALAPPDATA%\\Kiri\\k8s-manifests" : "~/.kiri/k8s-manifests");
+      return `<div class="pref"><span class="t">${tr("k3s version")}</span><span class="d">${tr("Image version for the cluster node ({cmd}). Applies when recreated.", { cmd: '<span class="mono">kiri k8s set --version</span>' })}</span>
+        <select id="k8s-ver" aria-label="${tr("k3s version")}"${dis}>${optsHtml}</select></div>
+      <div class="pref"><span class="t">${tr("Extra server flags")}</span><span class="d">${tr("Passed to {srv} ({flag}), separated by spaces.", { srv: '<span class="mono">k3s server</span>', flag: '<span class="mono">--k3s-arg</span>' })}</span>
+        <div class="ksan"><input class="field mono" id="k8s-args" value="${esc(argsDraft)}" placeholder="--disable=servicelb" spellcheck="false" autocomplete="off"${dis}>
+          <button class="btn" data-k8sargs${dis || argsDraft === savedArgs ? " disabled" : ""}>${tr("Save")}</button></div></div>
+      <div class="pref"><span class="t">${tr("Startup manifests")}</span><span class="d">${tr("YAML files in {path} are applied whenever the cluster starts.", { path: `<span class="mono">${esc(mdir)}</span>` })}</span>
+        <span class="pact"><button class="btn" data-k8smanifests>${tr("Open folder")}</button></span></div>`;
+    })()}
     <div class="pref"><span class="t">${tr("Delete cluster")}</span><span class="d">${tr("Removes the cluster's container, everything in it (the {volume} volume) and the {context} kubectl context, as {cmd} does.", { volume: '<span class="mono">kiri-k8s</span>', context: `<span class="mono">${esc(k8sContext())}</span>`, cmd: '<span class="mono">kiri k8s delete</span>' })}</span>
       <button class="btn danger kdelete" data-k8sdelete${dis || !node ? " disabled" : ""}>${tr("Delete cluster")}</button></div>
   </div>`;
@@ -9463,6 +9701,8 @@ $("content").addEventListener("click", (ev) => {
     else k8sDo("set", { lan: !!c.lan, tls_san: c.tls_san || [], port });
   }
   else if (t("[data-k8ssan]")) { const c = k8s.config || {}; k8sDo("set", { lan: !!c.lan, tls_san: ($("k8s-san")?.value || "").split(",").map((x) => x.trim()).filter(Boolean) }); }
+  else if (t("[data-k8sargs]")) { const c = k8s.config || {}; const list = ($("k8s-args")?.value || "").trim().split(/\s+/).filter(Boolean); k8sDo("set", { lan: !!c.lan, tls_san: c.tls_san || [], k3s_args: list }); }
+  else if (t("[data-k8smanifests]")) send("k8s", { action: "manifests" });
   else if (t("[data-k8sdelete]")) deleteCluster();
   else if (t("[data-klogreload]")) podLogs(true);
   else if (t("[data-klogclear]")) { klogEl.textContent = ""; klogCount(); }
@@ -9475,6 +9715,12 @@ $("content").addEventListener("input", (ev) => {
     k8s.portDraft = ev.target.value;
     const b = document.querySelector("[data-k8sport]");
     if (b) b.disabled = !!k8s.op || ev.target.value === String(k8s.wantPort);
+    return;
+  }
+  if (ev.target.id === "k8s-args") {
+    k8s.argsDraft = ev.target.value;
+    const b = document.querySelector("[data-k8sargs]");
+    if (b) b.disabled = !!k8s.op || ev.target.value === (k8s.config?.k3s_args || []).join(" ");
     return;
   }
   if (ev.target.id !== "k8s-san") return;

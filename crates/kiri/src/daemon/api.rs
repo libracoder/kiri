@@ -275,6 +275,7 @@ fn route(req: &Request, engine: &Arc<Engine>, caller: &Caller, w: &mut UnixStrea
         ("POST", "/kiri/storage/check") => return reply(w, super::storage::check_request(req, engine), 200),
         ("POST", "/kiri/storage") => return reply(w, super::storage::start(req, engine), 202),
         ("POST", "/kiri/storage/reset") => return reply(w, super::storage::start_reset(engine), 202),
+        ("POST", "/kiri/storage/reclaim") => return reply(w, super::storage::reclaim(engine), 200),
         ("DELETE", "/kiri/storage/old") => return reply(w, super::storage::remove_old(engine), 200),
         ("GET", "/kiri/builder") => return reply(w, Ok(super::builder::settings_report(engine)), 200),
         ("POST", "/kiri/builder") => return reply(w, super::builder::set_settings(req).map(|()| super::builder::settings_report(engine)), 200),

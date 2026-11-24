@@ -82,6 +82,13 @@ fn save_shared_nat(path: &Path, enabled: bool) -> io::Result<Value> {
     Ok(cfg)
 }
 
+/// Saves `shared_nat` in `~/.kiri/vm.json` while preserving other keys (`cpus`,
+/// `memory_mib`, `disk_gb`). Used by Settings → Network.
+pub(crate) fn set_shared_nat(enabled: bool) -> io::Result<()> {
+    let path = engine::resources_path().ok_or_else(|| io::Error::other("HOME is not set"))?;
+    save_shared_nat(&path, enabled).map(|_| ())
+}
+
 fn on_off(b: bool) -> &'static str {
     if b { "on" } else { "off" }
 }

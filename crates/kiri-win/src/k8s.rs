@@ -79,12 +79,33 @@ pub fn handle(action: &str, value: &Value) {
         "start" => op("start", |say| start(say)),
         "stop" => op("stop", |say| stop(say)),
         "deletecluster" => op("deletecluster", |say| delete_cluster(say)),
-        // Settings → Kubernetes → Network: saved, and the node recreated with them.
+        // Settings → Kubernetes: saved, and the node recreated with them.
         "set" => {
             let sans: Vec<String> = value["tls_san"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect();
             let lan = value["lan"] == true;
             let port = value["port"].as_u64().and_then(|p| u16::try_from(p).ok());
-            op("set", move |say| set(lan, sans, port, say));
+            let version = value.get("version").map(|v| {
+                v.as_str()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("default"))
+                    .map(str::to_owned)
+            });
+            let k3s_args = value.get("k3s_args").and_then(Value::as_array).map(|arr| {
+                arr.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            });
+            op("set", move |say| set(lan, sans, port, version, k3s_args, say));
+        }
+        "manifests" => {
+            if let Ok(dir) = manifests_dir() {
+                let _ = std::fs::create_dir_all(&dir);
+                let mut cmd = crate::win::tool("explorer.exe");
+                let _ = cmd.arg(dir).spawn();
+            }
         }
         "delete" => delete(arg("ns"), arg("pod")),
         "logs" => logs(arg("ns"), arg("pod"), arg("container"), value["previous"] == true),
@@ -187,6 +208,10 @@ fn state_dir() -> io::Result<PathBuf> {
 
 fn config_path() -> io::Result<PathBuf> {
     Ok(state_dir()?.join("k8s.json"))
+}
+
+fn manifests_dir() -> io::Result<PathBuf> {
+    Ok(state_dir()?.join("k8s-manifests"))
 }
 
 fn config() -> Config {
@@ -361,6 +386,10 @@ fn read_lists() -> Value {
     v["op"] = json!(current_op());
     v["context"] = json!(context());
     v["config"] = json!(config());
+    v["default_version"] = json!(IMAGE.1);
+    if let Ok(dir) = manifests_dir() {
+        v["manifests_dir"] = json!(dir);
+    }
     v
 }
 
@@ -591,7 +620,14 @@ fn delete_cluster(say: &dyn Fn(&str)) -> io::Result<()> {
 
 /// `kiri k8s set`: saves the settings and, if the cluster exists and they
 /// changed, recreates its node with them.
-fn set(lan: bool, sans: Vec<String>, port: Option<u16>, say: &dyn Fn(&str)) -> io::Result<()> {
+fn set(
+    lan: bool,
+    sans: Vec<String>,
+    port: Option<u16>,
+    version: Option<Option<String>>,
+    k3s_args: Option<Vec<String>>,
+    say: &dyn Fn(&str),
+) -> io::Result<()> {
     let mut cfg = config();
     let before = cfg.clone();
     cfg.lan = lan;
@@ -605,6 +641,22 @@ fn set(lan: bool, sans: Vec<String>, port: Option<u16>, say: &dyn Fn(&str)) -> i
             return Err(io::Error::other(format!("the API server port must be a number from 1024 to 65535, not `{p}`")));
         }
         cfg.port = (p != API_PORT).then_some(p);
+    }
+    if let Some(ver) = version {
+        match ver {
+            None => cfg.version = None,
+            Some(tag) if valid_version(&tag) => cfg.version = Some(tag),
+            Some(tag) => return Err(io::Error::other(format!("invalid k3s version tag `{tag}`"))),
+        }
+    }
+    if let Some(args) = k3s_args {
+        if args.len() > 64 {
+            return Err(io::Error::other("too many --k3s-arg values (at most 64)"));
+        }
+        if let Some(bad) = args.iter().find(|a| !valid_k3s_arg(a)) {
+            return Err(io::Error::other(format!("invalid --k3s-arg `{bad}`")));
+        }
+        cfg.k3s_args = args;
     }
     let node = if exists()? { Some(client::get(&format!("/containers/{NAME}/json"))?) } else { None };
     // A port asked for that the node doesn't already hold must be free now.
