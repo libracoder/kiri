@@ -2857,11 +2857,13 @@ function exitWord(code) {
   if (code === 139) return tr("Crashed (139)");
   return tr("Failed ({code})", { code });
 }
+// Ended by the VM stopping, or by a stop or kill (an app often exits 143 on SIGTERM); 137 still reads Killed.
+const stoppedNotFailed = (c) => c.KiriVmStopped || (c.KiriStoppedByUser && exitCode(c) !== 137);
 function statusText(c) {
   if (c.State === "exited" && c.KiriOOMKilled) return tr("Out of memory");
   if (c.State === "running" && c.KiriStartedAt) return tr("Up {time}", { time: since(c.KiriStartedAt) });
   if (c.State === "paused" && c.KiriStartedAt) return tr("Up {time} (Paused)", { time: since(c.KiriStartedAt) });
-  if (c.State === "exited") return c.KiriVmStopped ? tr("Stopped") : exitWord(exitCode(c));
+  if (c.State === "exited") return stoppedNotFailed(c) ? tr("Stopped") : exitWord(exitCode(c));
   return shortStatus(c.Status);
 }
 /* The hover text: when it stopped, and Docker's own words for a failure. */
@@ -2877,7 +2879,7 @@ function statusTitle(c) {
 function exitClass(c) {
   if (c.State !== "exited") return "";
   if (c.KiriOOMKilled) return " failed";
-  if (c.KiriVmStopped) return "";
+  if (stoppedNotFailed(c)) return "";
   const code = exitCode(c);
   return code === 0 ? "" : code === 137 ? " killed" : " failed";
 }
