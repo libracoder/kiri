@@ -75,12 +75,13 @@ kiri_rm() {
     for v in $v; do [[ "$v" =~ ^[0-9a-f]{64}$ ]] && "${K[@]}" volume rm -f "$v" >/dev/null 2>&1; done
   done
 }
-OURS_C="imp-digest imp-net-joiner imp-net-target imp-vol-user imp-vol-writer imp-vol-idle imp-vol-cutter imp-vol-kiri-user imp-vol-kiri-paused imp-vol-kiri-again imp-vol-kiri-stopped"
+OURS_C="imp-digest imp-host-mnt imp-net-joiner imp-net-target imp-vol-user imp-vol-writer imp-vol-idle imp-vol-cutter imp-vol-kiri-user imp-vol-kiri-paused imp-vol-kiri-again imp-vol-kiri-stopped"
 # An image named like an official one, with a creation date ahead: its
 # sh, tar, rm and find leave a mark and refuse the work. Never to be run.
 LOOKALIKE=localhost/imp-x/library/busybox:9
 UNTAGGED_ID=
 LA_DIR=
+HM_DIR=
 OURS_V="imp-vol-la imp-vol-la-new imp-vol-data imp-vol-xattrs imp-vol-named imp-vol-keep imp-vol-busy imp-vol-huge imp-vol-cut imp-probe"
 cleanup() {
   kiri_rm $OURS_C
@@ -95,6 +96,7 @@ cleanup() {
   for ctx in "$SRC" "$DOCKER_CONTEXT"; do docker --context "$ctx" rmi "$LOOKALIKE" >/dev/null 2>&1; done
   [ -n "$UNTAGGED_ID" ] && "${K[@]}" rmi "$UNTAGGED_ID" >/dev/null 2>&1
   [ -n "$LA_DIR" ] && rm -rf "$LA_DIR"
+  [ -n "$HM_DIR" ] && rm -rf "$HM_DIR"
   rm -f /tmp/imp-cut-seen.$$
   [ -n "$PINNED_OURS" ] && "${S[@]}" rmi "$PINNED" >/dev/null 2>&1
   for i in ${FETCHED_SRC[@]+"${FETCHED_SRC[@]}"}; do "${S[@]}" rmi "$i" >/dev/null 2>&1; done
@@ -405,6 +407,22 @@ t digest-container-imports "container imp-digest: done" "$KIRI" import "$SRC" co
 t digest-kept-on-container "$PINNED" "${K[@]}" inspect -f '{{.Config.Image}}' imp-digest
 t digest-image-by-reference "[\"$PINNED\"]" "${K[@]}" image inspect -f '{{json .RepoTags}}' "$PINNED"
 t digest-runs "Hello from Docker" "${K[@]}" start -a imp-digest
+
+section "#411 Docker Desktop /host_mnt bind-mount sources"
+HM_DIR=$(mktemp -d /tmp/imp-hm.XXXXXX)
+printf 'from-host-mnt\n' > "$HM_DIR/a.txt"
+printf 'from-direct\n' > "$HM_DIR/b.txt"
+"${S[@]}" create --name imp-host-mnt --network none \
+  -v "/host_mnt${HM_DIR}:/from-host-mnt:ro,delegated" \
+  -v "${HM_DIR}/b.txt:/from-direct:ro" \
+  --entrypoint sh "$TOOL" -c 'echo "$(cat /from-host-mnt/a.txt) $(cat /from-direct)"' >/dev/null
+t import-host-mnt-container "container imp-host-mnt: done" "$KIRI" import "$SRC" container imp-host-mnt
+t import-host-mnt-binds "ok" bash -c '
+  got=$("$1" --context "$2" inspect -f "{{json .HostConfig.Binds}}" imp-host-mnt)
+  python3 -c "import json, sys; b = set(json.loads(sys.argv[1]) or []); d = sys.argv[2]; want = {f\"{d}:/from-host-mnt:ro,delegated\", f\"{d}/b.txt:/from-direct:ro\"}; print(\"ok\" if b == want else sorted(b))" "$got" "$3"
+' _ docker "$DOCKER_CONTEXT" "$HM_DIR"
+t import-host-mnt-reads "from-host-mnt from-direct" "${K[@]}" start -a imp-host-mnt
+kiri_rm imp-host-mnt
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || { printf 'failed: %s\n' "${FAILED[*]}"; exit 1; }

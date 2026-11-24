@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #411 Import: translate Docker Desktop `/host_mnt` and `/run/desktop/mnt/host` bind sources and report reasons for unimported containers (unreleased)
+- Fixes: #411 Docker Desktop import: containers with `/host_mnt` bind-mount sources are skipped silently
+- Caused: none known
+- Caused by: -
+- Check: `import-host-mnt-container`, `import-host-mnt-binds`, `import-host-mnt-reads`
+
 ### #456 Builds: include Kiri's default BuildKit builder from compose builds (unreleased)
 - Fixes: #456 Builds view misses `docker compose build` history from Kiri's `default` builder
 - Caused: none known

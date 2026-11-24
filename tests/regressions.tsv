@@ -283,3 +283,6 @@ tests/ui/storage-location.js	#355	Settings → Storage had no way to move images
 network-ipv6-subnet-ignored-when-disabled	#433	POST /networks/create with EnableIPv6 false (or omitted) and an IPv6 subnet in IPAM.Config was refused instead of ignoring the IPv6 subnet as Docker does (mailcow-dockerized)
 absolute-form-ping	#757	an RFC 9112 §3.2.2 absolute-form request-target over the Docker socket left the scheme and authority in the path and answered 404
 absolute-form-containers	#757	docker-modem requests such as GET http://127.0.0.1:2376/containers/json HTTP/1.1 over the Docker socket answered 404 instead of routing /containers/json
+import-host-mnt-container	#411	importing a container with a Docker Desktop /host_mnt bind-mount source did not translate the path to the host path
+import-host-mnt-binds	#411	imported container HostConfig.Binds kept the /host_mnt prefix or dropped bind mount options instead of stripping /host_mnt
+import-host-mnt-reads	#411	a container imported with a /host_mnt bind source mounted an empty VM directory instead of the host files

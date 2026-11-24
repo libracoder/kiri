@@ -833,7 +833,7 @@ pub fn container_with(source: &str, name: &str, force: bool, joining: &[&str]) -
     let info = json_lines(ctx, &["inspect", "--type", "container", "--format", "{{json .}}", name])?.into_iter().next().ok_or_else(|| io::Error::other(format!("{name}: not found in {ctx}")))?;
     let image = info["Config"]["Image"].as_str().unwrap_or("").to_owned();
     if !has(kiri, "image", &image) {
-        self::image(source, &image)?;
+        self::image(source, &image).map_err(|e| io::Error::other(format!("image {image}: {e}")))?;
     }
     // Else create would make them in Kiri, empty.
     for v in volumes_of(&info) {
@@ -869,9 +869,71 @@ pub fn container_with(source: &str, name: &str, force: bool, joining: &[&str]) -
     }
     let r = client::request("POST", &format!("/containers/create?name={name}"), Some(&create_body(&info, &mode, networks.into())))?;
     if !r.ok() {
-        return Err(io::Error::other(r.error()));
+        return Err(io::Error::other(create_error(r.status, &r.error())));
     }
     Ok(())
+}
+
+/// Non-empty reason for a failed `/containers/create` call, falling back to
+/// the HTTP status if the daemon returned an empty body (#411).
+fn create_error(status: u16, msg: &str) -> String {
+    let trimmed = msg.trim();
+    if trimmed.is_empty() { format!("HTTP {status}") } else { trimmed.to_owned() }
+}
+
+/// Translates Docker Desktop's VM-internal host-mount paths to host paths Kiri
+/// can bind directly (#411):
+/// - macOS Docker Desktop: `/host_mnt/<path>` -> `/<path>`
+/// - Windows Docker Desktop: `/run/desktop/mnt/host/<drive>/<path>` and
+///   `/host_mnt/<drive>/<path>` -> `<DRIVE>:/<path>`
+///
+/// Bare prefixes (`/host_mnt`, `/host_mnt/`, `/run/desktop/mnt/host/`),
+/// look-alike prefixes (`/host_mnt_other/...`), and paths containing `..`
+/// segments stay unchanged so normalization never collapses to `/` or
+/// traverses outside the intended path.
+fn translate_bind_source_for(src: &str, windows: bool) -> String {
+    let has_dotdot = |p: &str| p.split('/').any(|s| s == "..");
+    let drive_path = |rest: &str| -> Option<String> {
+        let trimmed = rest.trim_start_matches('/');
+        if trimmed.is_empty() || has_dotdot(trimmed) {
+            return None;
+        }
+        let (drive, tail) = trimmed.split_once('/').unwrap_or((trimmed, ""));
+        if drive.len() != 1 || !drive.as_bytes()[0].is_ascii_alphabetic() {
+            return None;
+        }
+        let tail = tail.trim_start_matches('/');
+        if tail.is_empty() { Some(format!("{}:/", drive.to_ascii_uppercase())) } else { Some(format!("{}:/{tail}", drive.to_ascii_uppercase())) }
+    };
+    if windows {
+        if let Some(rest) = src.strip_prefix("/run/desktop/mnt/host/") {
+            return drive_path(rest).unwrap_or_else(|| src.to_owned());
+        }
+        if let Some(rest) = src.strip_prefix("/host_mnt/") {
+            return drive_path(rest).unwrap_or_else(|| src.to_owned());
+        }
+        return src.to_owned();
+    }
+    if let Some(rest) = src.strip_prefix("/host_mnt/") {
+        let trimmed = rest.trim_start_matches('/');
+        if !has_dotdot(trimmed) && trimmed.split('/').any(|s| !s.is_empty() && s != ".") {
+            return format!("/{trimmed}");
+        }
+    }
+    src.to_owned()
+}
+
+/// Translates the source side of a `HostConfig.Binds` entry (`SRC:DST[:OPTS]`),
+/// preserving the destination and any mount options (`:ro`, `:delegated`, etc.).
+fn translate_bind_spec_for(spec: &str, windows: bool) -> String {
+    let Some((src, rest)) = spec.split_once(':') else {
+        return spec.to_owned();
+    };
+    if !rest.starts_with('/') {
+        return spec.to_owned();
+    }
+    let translated = translate_bind_source_for(src, windows);
+    if translated == src { spec.to_owned() } else { format!("{translated}:{rest}") }
 }
 
 /// The volumes a container has on the source, named and anonymous.
@@ -893,6 +955,10 @@ fn volumes_of(info: &Value) -> Vec<String> {
 /// new empty ones. Beside `container:` mode, what Docker and Kiri refuse
 /// there is left out: the source fills some of it in itself (#375).
 fn create_body(info: &Value, mode: &str, networks: Value) -> Value {
+    create_body_for(info, mode, networks, cfg!(windows))
+}
+
+fn create_body_for(info: &Value, mode: &str, networks: Value, windows: bool) -> Value {
     let (cfg, hc) = (&info["Config"], &info["HostConfig"]);
     let anon: Vec<(&str, &str, bool)> = info["Mounts"]
         .as_array()
@@ -902,12 +968,29 @@ fn create_body(info: &Value, mode: &str, networks: Value) -> Value {
         .filter_map(|m| Some((m["Name"].as_str().filter(|n| anonymous(n))?, m["Destination"].as_str()?, m["RW"] != false)))
         .collect();
     let mut mounts = hc["Mounts"].clone();
-    for m in mounts.as_array_mut().into_iter().flatten().filter(|m| m["Type"] == "volume" && m["Source"].as_str().unwrap_or("").is_empty()) {
-        if let Some((n, _, _)) = anon.iter().find(|(_, d, _)| m["Target"].as_str() == Some(d)) {
-            m["Source"] = (*n).into();
+    for m in mounts.as_array_mut().into_iter().flatten() {
+        if m["Type"] == "volume" && m["Source"].as_str().unwrap_or("").is_empty() {
+            if let Some((n, _, _)) = anon.iter().find(|(_, d, _)| m["Target"].as_str() == Some(d)) {
+                m["Source"] = (*n).into();
+            }
+        } else if m["Type"].as_str().unwrap_or("bind") == "bind"
+            && let Some(src) = m["Source"].as_str()
+        {
+            let translated = translate_bind_source_for(src, windows);
+            if translated != src {
+                m["Source"] = translated.into();
+            }
         }
     }
     let mut binds = hc["Binds"].clone();
+    for b in binds.as_array_mut().into_iter().flatten() {
+        if let Some(spec) = b.as_str() {
+            let translated = translate_bind_spec_for(spec, windows);
+            if translated != spec {
+                *b = translated.into();
+            }
+        }
+    }
     for (n, d, rw) in &anon {
         if !mounts.as_array().into_iter().flatten().any(|m| m["Target"].as_str() == Some(d)) {
             let bind = format!("{n}:{d}{}", if *rw { "" } else { ":ro" });
@@ -1049,12 +1132,14 @@ pub fn run(args: &[String]) -> io::Result<()> {
         }
         return Ok(());
     }
-    let mut failed = 0;
-    let mut step = |what: &str, name: &str, r: io::Result<()>| match r {
+    let mut failures: Vec<(&str, String, String)> = Vec::new();
+    let mut step = |what: &'static str, name: &str, r: io::Result<()>| match r {
         Ok(()) => println!("{what} {name}: done"),
         Err(e) => {
-            failed += 1;
-            println!("{what} {name}: {e}");
+            let reason = e.to_string();
+            let why = if reason.trim().is_empty() { "unknown error" } else { reason.trim() };
+            println!("{what} {name}: skipped ({why})");
+            failures.push((what, name.to_owned(), why.to_owned()));
         }
     };
     for v in list("images").iter().filter(|v| v["have"] != true) {
@@ -1065,14 +1150,41 @@ pub fn run(args: &[String]) -> io::Result<()> {
         let n = v["name"].as_str().unwrap_or("");
         step("volume", n, volume_with(source, n, force));
     }
-    for v in list("containers").iter().filter(|v| v["have"] != true) {
+    for v in list("containers") {
         let n = v["name"].as_str().unwrap_or("");
-        // Already brought as the one another joins the network of.
-        if !has(crate::flavor::CONTEXT.get(), "container", n) {
-            step("container", n, container_with(source, n, force, &[]));
+        let already_had = v["have"] == true;
+        let already_imported = !already_had && has(crate::flavor::CONTEXT.get(), "container", n);
+        if let Some(why) = container_skip_reason(already_had, already_imported) {
+            println!("container {n}: skipped ({why})");
+            continue;
         }
+        step("container", n, container_with(source, n, force, &[]));
     }
-    if failed > 0 { Err(io::Error::other(format!("{failed} items could not be imported"))) } else { Ok(()) }
+    if !failures.is_empty() { Err(io::Error::other(format_failures(&failures))) } else { Ok(()) }
+}
+
+/// Why a container in `kiri import` is skipped without calling `container_with` (#411).
+fn container_skip_reason(already_had: bool, already_imported: bool) -> Option<&'static str> {
+    if already_had {
+        Some("already in Kiri")
+    } else if already_imported {
+        Some("already imported as a network target")
+    } else {
+        None
+    }
+}
+
+/// Summary returned when one or more items could not be imported, naming each
+/// item and its reason so nothing is skipped silently (#411).
+fn format_failures(failures: &[(&str, String, String)]) -> String {
+    let n = failures.len();
+    let items = if n == 1 { "item" } else { "items" };
+    let mut out = format!("{n} {items} could not be imported:");
+    for (kind, name, reason) in failures {
+        let why = if reason.trim().is_empty() { "unknown error" } else { reason.trim() };
+        out.push_str(&format!("\n  {kind} {name}: {why}"));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1621,6 +1733,177 @@ mod tests {
             seen.push((e.path().unwrap().to_string_lossy().into_owned(), e.header().uid().unwrap(), data));
         }
         assert_eq!(seen, [("odd size=5 name".to_owned(), 3_000_000, body), ("next".to_owned(), 0, b"abc".to_vec())]);
+    }
+
+    // #411: Docker Desktop's `/host_mnt/<path>` bind-mount sources map to
+    // `/<path>` on macOS in both HostConfig.Binds (keeping mount options) and
+    // HostConfig.Mounts, while non-/host_mnt binds and edge cases stay intact.
+    #[test]
+    fn translates_docker_desktop_host_mnt_binds() {
+        use serde_json::json;
+        let info = json!({
+            "Config": {"Image": "postgres:16"},
+            "HostConfig": {
+                "Binds": [
+                    "/host_mnt/Users/alice/project/docker/volumes/db/data:/var/lib/postgresql/data",
+                    "/Users/alice/project/docker/volumes/db/pooler.sql:/docker-entrypoint-initdb.d/99-pooler.sql:ro",
+                    "/host_mnt/Users/alice/app:/app:delegated",
+                    "/host_mnt/private/tmp/x:/tmp/x:rw,cached",
+                    "/host_mnt/Users/alice/cfg:/cfg:ro",
+                    "/host_mnt/Users/alice/rw:/rw:rw",
+                    "/host_mnt/Users/alice/selinux:/selinux:z",
+                    "/host_mnt/Users/alice/selinux2:/selinux2:Z",
+                    "/host_mnt/Users/alice/dir..name/file:/file",
+                    "/host_mnt//Users/alice/double:/double",
+                    "/host_mnt:/bare",
+                    "/host_mnt/:/bare-slash",
+                    "/host_mnt///:/bare-slashes",
+                    "/host_mnt/.:/bare-dot",
+                    "/host_mnt/..:/dotdot",
+                    "/host_mnt/../etc:/escape",
+                    "/host_mnt/Users/../etc:/mid-dotdot",
+                    "/host_mnt_other/Users/alice:/other",
+                    "pgdata:/pgdata"
+                ],
+                "Mounts": [
+                    {"Type": "bind", "Source": "/host_mnt/Users/alice/data", "Target": "/data", "ReadOnly": true},
+                    {"Type": "bind", "Source": "/Users/alice/plain", "Target": "/plain"},
+                    {"Type": "bind", "Source": "/host_mnt", "Target": "/m-bare"},
+                    {"Type": "bind", "Source": "/host_mnt/", "Target": "/m-slash"},
+                    {"Type": "bind", "Source": "/host_mnt/.", "Target": "/m-dot"},
+                    {"Type": "bind", "Source": "/host_mnt/..", "Target": "/m-dotdot"},
+                    {"Type": "bind", "Source": "/host_mnt_other/x", "Target": "/m-other"},
+                    {"Type": "volume", "Source": "pgvol", "Target": "/vol"}
+                ]
+            },
+            "Mounts": []
+        });
+        let body = super::create_body_for(&info, "bridge", json!({}), false);
+        assert_eq!(
+            body["HostConfig"]["Binds"],
+            json!([
+                "/Users/alice/project/docker/volumes/db/data:/var/lib/postgresql/data",
+                "/Users/alice/project/docker/volumes/db/pooler.sql:/docker-entrypoint-initdb.d/99-pooler.sql:ro",
+                "/Users/alice/app:/app:delegated",
+                "/private/tmp/x:/tmp/x:rw,cached",
+                "/Users/alice/cfg:/cfg:ro",
+                "/Users/alice/rw:/rw:rw",
+                "/Users/alice/selinux:/selinux:z",
+                "/Users/alice/selinux2:/selinux2:Z",
+                "/Users/alice/dir..name/file:/file",
+                "/Users/alice/double:/double",
+                "/host_mnt:/bare",
+                "/host_mnt/:/bare-slash",
+                "/host_mnt///:/bare-slashes",
+                "/host_mnt/.:/bare-dot",
+                "/host_mnt/..:/dotdot",
+                "/host_mnt/../etc:/escape",
+                "/host_mnt/Users/../etc:/mid-dotdot",
+                "/host_mnt_other/Users/alice:/other",
+                "pgdata:/pgdata"
+            ])
+        );
+        assert_eq!(
+            body["HostConfig"]["Mounts"],
+            json!([
+                {"Type": "bind", "Source": "/Users/alice/data", "Target": "/data", "ReadOnly": true},
+                {"Type": "bind", "Source": "/Users/alice/plain", "Target": "/plain"},
+                {"Type": "bind", "Source": "/host_mnt", "Target": "/m-bare"},
+                {"Type": "bind", "Source": "/host_mnt/", "Target": "/m-slash"},
+                {"Type": "bind", "Source": "/host_mnt/.", "Target": "/m-dot"},
+                {"Type": "bind", "Source": "/host_mnt/..", "Target": "/m-dotdot"},
+                {"Type": "bind", "Source": "/host_mnt_other/x", "Target": "/m-other"},
+                {"Type": "volume", "Source": "pgvol", "Target": "/vol"}
+            ])
+        );
+    }
+
+    // #411: Windows Docker Desktop bind sources under `/run/desktop/mnt/host/<drive>/...`
+    // and `/host_mnt/<drive>/...` translate to `<DRIVE>:/...` so Kiri's WSL bind
+    // parser maps them to the active automount root; `/mnt/wsl/...`, look-alikes,
+    // non-drive prefixes and `..` traversals stay unchanged.
+    #[test]
+    fn translates_windows_docker_desktop_binds() {
+        use serde_json::json;
+        let info = json!({
+            "Config": {"Image": "alpine"},
+            "HostConfig": {
+                "Binds": [
+                    "/run/desktop/mnt/host/c/Users/alice/app:/app:ro",
+                    "/run/desktop/mnt/host/d/work/db:/data:delegated",
+                    "/run/desktop/mnt/host/c:/drive-root",
+                    "/host_mnt/c/Users/alice/legacy:/legacy:rw",
+                    "C:\\Users\\alice\\native:/native",
+                    "/mnt/wsl/shared:/shared",
+                    "/run/desktop/mnt/host:/bare",
+                    "/run/desktop/mnt/host/:/bare-slash",
+                    "/run/desktop/mnt/host/..:/dotdot",
+                    "/run/desktop/mnt/host/c/../d/secret:/escape",
+                    "/run/desktop/mnt/host/wsl/foo:/not-drive",
+                    "/run/desktop/mnt/host_other/c/foo:/lookalike",
+                    "/host_mnt/Users/alice:/non-drive-host-mnt",
+                    "/host_mnt_other/c/foo:/host-mnt-lookalike"
+                ],
+                "Mounts": [
+                    {"Type": "bind", "Source": "/run/desktop/mnt/host/c/Users/alice/cfg", "Target": "/cfg", "ReadOnly": true},
+                    {"Type": "bind", "Source": "/host_mnt/e/files", "Target": "/files"},
+                    {"Type": "bind", "Source": "/run/desktop/mnt/host/c/../x", "Target": "/bad"},
+                    {"Type": "bind", "Source": "/mnt/wsl/shared", "Target": "/shared2"}
+                ]
+            },
+            "Mounts": []
+        });
+        let body = super::create_body_for(&info, "bridge", json!({}), true);
+        assert_eq!(
+            body["HostConfig"]["Binds"],
+            json!([
+                "C:/Users/alice/app:/app:ro",
+                "D:/work/db:/data:delegated",
+                "C:/:/drive-root",
+                "C:/Users/alice/legacy:/legacy:rw",
+                "C:\\Users\\alice\\native:/native",
+                "/mnt/wsl/shared:/shared",
+                "/run/desktop/mnt/host:/bare",
+                "/run/desktop/mnt/host/:/bare-slash",
+                "/run/desktop/mnt/host/..:/dotdot",
+                "/run/desktop/mnt/host/c/../d/secret:/escape",
+                "/run/desktop/mnt/host/wsl/foo:/not-drive",
+                "/run/desktop/mnt/host_other/c/foo:/lookalike",
+                "/host_mnt/Users/alice:/non-drive-host-mnt",
+                "/host_mnt_other/c/foo:/host-mnt-lookalike"
+            ])
+        );
+        assert_eq!(
+            body["HostConfig"]["Mounts"],
+            json!([
+                {"Type": "bind", "Source": "C:/Users/alice/cfg", "Target": "/cfg", "ReadOnly": true},
+                {"Type": "bind", "Source": "E:/files", "Target": "/files"},
+                {"Type": "bind", "Source": "/run/desktop/mnt/host/c/../x", "Target": "/bad"},
+                {"Type": "bind", "Source": "/mnt/wsl/shared", "Target": "/shared2"}
+            ])
+        );
+    }
+
+    // #411: every container not imported has an explicit reason (never dropped
+    // silently or left with a blank error).
+    #[test]
+    fn reports_skip_and_failure_reasons() {
+        assert_eq!(super::container_skip_reason(true, false), Some("already in Kiri"));
+        assert_eq!(super::container_skip_reason(false, true), Some("already imported as a network target"));
+        assert_eq!(super::container_skip_reason(false, false), None);
+        assert_eq!(super::create_error(400, "bind source path does not exist"), "bind source path does not exist");
+        assert_eq!(super::create_error(500, "   "), "HTTP 500");
+        assert_eq!(
+            super::format_failures(&[("container", "db".into(), "bind source path does not exist".into())]),
+            "1 item could not be imported:\n  container db: bind source path does not exist"
+        );
+        assert_eq!(
+            super::format_failures(&[
+                ("container", "db".into(), "missing bind".into()),
+                ("container", "web".into(), "".into()),
+            ]),
+            "2 items could not be imported:\n  container db: missing bind\n  container web: unknown error"
+        );
     }
 
 }
