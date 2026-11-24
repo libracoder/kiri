@@ -247,6 +247,46 @@ impl Transport for TcpTransport {
         crate::cancel::watch(&self.stream)?;
         let started = Instant::now();
         let input = self.buffers.input_append_buf();
+        // Windows inside a cancellable pull: a cross-thread `shutdown` may
+        // leave the blocking recv asleep (verified: it waited out its whole
+        // timeout past the shutdown), so read nonblocking and check the
+        // cancel switch at most every POLL. `limit` stays the one full
+        // budget for this call: a poll that finds nothing loops on, it does
+        // not end the read; only `limit` running out does. Everywhere else
+        // the plain blocking read below keeps the socket timeout semantics
+        // unchanged.
+        if crate::cancel::polling() {
+            self.stream.set_nonblocking(true)?;
+            let result = loop {
+                if crate::cancel::current_cancelled() {
+                    break Err(Error::Io(io::Error::other("pull cancelled")));
+                }
+                match (&*self.stream).read(input) {
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    // Nothing yet: wait one poll, then check the switch again.
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        let left = limit.map(|l| l.saturating_sub(started.elapsed()));
+                        if left.is_some_and(|l| l.is_zero()) {
+                            break Err(Error::Timeout(timeout.reason));
+                        }
+                        std::thread::sleep(left.map_or(crate::cancel::POLL, |l| l.min(crate::cancel::POLL)));
+                    }
+                    // EOF, or a real error (a shutdown from the cancel side
+                    // reads as ConnectionAborted/Reset): restore the mode,
+                    // and report a cancelled pull as its own error.
+                    Ok(n) => break Ok(n),
+                    Err(_) if crate::cancel::current_cancelled() => {
+                        break Err(Error::Io(io::Error::other("pull cancelled")));
+                    }
+                    Err(e) => break Err(io_error(e, timeout.reason)),
+                }
+            };
+            let restore = self.stream.set_nonblocking(false);
+            let amount = result?;
+            restore?;
+            self.buffers.input_appended(amount);
+            return Ok(amount > 0);
+        }
         let amount = loop {
             match (&*self.stream).read(input) {
                 // A signal: Linux does not restart a socket read that has a
@@ -262,7 +302,24 @@ impl Transport for TcpTransport {
                     self.stream.set_read_timeout(Some(left))?;
                     self.timeout_read = Some(left);
                 }
-                result => break result.map_err(|e| io_error(e, timeout.reason))?,
+                result => {
+                    break result.map_err(|e| {
+                        if crate::cancel::current_cancelled()
+                            && matches!(
+                                e.kind(),
+                                io::ErrorKind::TimedOut
+                                    | io::ErrorKind::WouldBlock
+                                    | io::ErrorKind::ConnectionReset
+                                    | io::ErrorKind::ConnectionAborted
+                                    | io::ErrorKind::BrokenPipe
+                            )
+                        {
+                            Error::Io(io::Error::other("pull cancelled"))
+                        } else {
+                            io_error(e, timeout.reason)
+                        }
+                    })?;
+                }
             }
         };
         self.buffers.input_appended(amount);

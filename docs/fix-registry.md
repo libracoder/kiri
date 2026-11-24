@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #259 Windows: cancellable pull reads on Windows (unreleased)
+- Fixes: no issue
+- Caused: none known
+- Caused by: -
+- Check: none
+
 ### #493 Windows: open jsonfile for writing before sync so FlushFileBuffers succeeds (unreleased)
 - Fixes: no issue
 - Caused: none known

@@ -13,6 +13,24 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
+/// Windows does not reliably interrupt a blocking Winsock read when another
+/// thread calls `shutdown`, so a cancellable read must not block for longer
+/// than one poll: it runs nonblocking, and a poll with nothing to read waits
+/// [`POLL`]. Everywhere else (Linux, or a pull no one can cancel) reads stay
+/// blocking with the full budget, exactly as before.
+pub(crate) const POLL: Duration = Duration::from_millis(100);
+
+/// Whether the current thread is inside a cancellable pull, on Windows.
+/// Only there can a cross-thread `shutdown` leave the blocking recv asleep.
+pub(crate) fn polling() -> bool {
+    cfg!(windows) && active()
+}
+
+/// Whether the current thread is inside a cancellable pull.
+pub(crate) fn active() -> bool {
+    CURRENT.with(|c| c.borrow().is_some())
+}
+
 /// A pull's cancel switch. Clones share it.
 #[derive(Debug, Clone, Default)]
 pub struct Cancel(Arc<Inner>);
@@ -126,7 +144,23 @@ mod tests {
                 let _on = cancel.enter();
                 watch(&client).unwrap();
                 let started = Instant::now();
-                let n = (&*client).read(&mut [0u8; 16]).unwrap_or(0);
+                // The transport reads nonblocking under a cancellable pull on
+                // Windows (blocking Winsock reads ignore a cross-thread
+                // shutdown). A raw read must still end promptly once the
+                // switch flips, so poll the switch like await_input does.
+                let n = if polling() {
+                    client.set_nonblocking(true).unwrap();
+                    loop {
+                        match (&*client).read(&mut [0u8; 16]) {
+                            Err(e) if e.kind() == io::ErrorKind::WouldBlock && !cancel.is_cancelled() => {
+                                std::thread::sleep(Duration::from_millis(50));
+                            }
+                            res => break res.unwrap_or(0),
+                        }
+                    }
+                } else {
+                    (&*client).read(&mut [0u8; 16]).unwrap_or(0)
+                };
                 (n, started.elapsed())
             })
         };

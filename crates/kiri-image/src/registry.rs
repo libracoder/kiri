@@ -2659,6 +2659,40 @@ mod tests {
     }
 
     #[test]
+    fn a_cancellable_download_keeps_its_read_budget_for_slow_data() {
+        let (data, digest) = blob();
+        let body = data.clone();
+        let (host, served) = blob_server(move |_, c| {
+            // Both response headers and body data may take longer than a
+            // cancellation poll. Neither is a stall within the 2 s budget.
+            std::thread::sleep(Duration::from_millis(400));
+            let _ = write!(c, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+            let _ = c.write_all(&body[..body.len() / 2]);
+            std::thread::sleep(Duration::from_millis(400));
+            let _ = c.write_all(&body[body.len() / 2..]);
+        });
+        let root = std::env::temp_dir().join(format!("kiri-slow-cancel-test-{}", std::process::id()));
+        let store = Store::open(&root).unwrap();
+        let reference = Reference::parse(&format!("{host}/test/blob:1")).unwrap();
+        let config = ureq::Agent::config_builder().http_status_as_error(false).build();
+        let agent = ureq::Agent::with_parts(config, crate::connect::connector_with(Duration::from_secs(2)), ureq::unversioned::resolver::DefaultResolver::default());
+        let client = Client { agent, credentials: None, config: Default::default(), use_mirrors: true, mirror_scheme: None };
+        let _ = client.base(&host);
+        let cancel = Cancel::new();
+        let result = {
+            let _on = cancel.enter();
+            client.download_with(&store, &reference, &digest, u64::MAX, None, &|_| {}, &cancel)
+        };
+        quit(&host);
+        let requests = served.join().unwrap();
+        let saved = store.has_blob(&digest, data.len() as u64);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(result.unwrap(), data.len() as u64);
+        assert!(saved);
+        assert_eq!(requests, [0], "slow data must not start a retry");
+    }
+
+    #[test]
     fn a_cancelled_download_stops_at_once_and_leaves_nothing() {
         let (data, digest) = blob();
         let body = data.clone();
