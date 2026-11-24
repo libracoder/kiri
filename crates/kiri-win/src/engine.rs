@@ -234,6 +234,7 @@ fn engine(rx: &Receiver<Cmd>, tx: Sender<Cmd>) {
             Err(RecvTimeoutError::Disconnected) => return,
             Err(RecvTimeoutError::Timeout) => {
                 vm_panel();
+                emit_docker_state_if_changed();
                 if LISTED.lock().unwrap_or_else(|e| e.into_inner()).elapsed() >= LIST_EVERY {
                     refresh();
                 }
@@ -763,12 +764,59 @@ fn about() {
     );
 }
 
-/// The status bar's left side: this build, and which engine `docker` talks
-/// to by default, as `docker context show` says (it knows DOCKER_CONTEXT,
-/// DOCKER_HOST and wherever Docker Desktop keeps the CLI config).
-fn status_event() -> String {
-    let context = docker(&["context", "show"]).ok().map(|s| s.trim().to_owned()).filter(|c| !c.is_empty());
-    json!({"type": "status", "version": env!("CARGO_PKG_VERSION"), "share": true, "app": "Kiri", "ours": "kiri", "context": context.unwrap_or_else(|| "default".into())}).to_string()
+fn npipe_host(pipe: &str) -> String {
+    format!("npipe:{}", pipe.replace('\\', "/"))
+}
+
+fn context_meta(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+    use sha2::Digest as _;
+    let sum = sha2::Sha256::digest(name.as_bytes());
+    let hex: String = sum.iter().map(|b| format!("{b:02x}")).collect();
+    dir.join("contexts/meta").join(hex)
+}
+
+fn docker_state() -> (String, String) {
+    let endpoint = crate::serve::docker_engine_endpoint();
+    let pipe = crate::client::pipe();
+    let ours = npipe_host(&pipe);
+    let ctx = crate::flavor::CONTEXT.get();
+    let cli = crate::dockerctx::current_cli(ctx, &[&ours], &endpoint);
+    let status = crate::dockerctx::status_event(env!("CARGO_PKG_VERSION"), false, crate::flavor::APP.get(), ctx, &cli).to_string();
+    let sock = crate::dockerctx::sock_event(crate::serve::DOCKER_ENGINE, &endpoint, &ours, false).to_string();
+    (status, sock)
+}
+
+static LAST_DOCKER_STATE: Mutex<(String, String)> = Mutex::new((String::new(), String::new()));
+
+fn emit_docker_state() {
+    let (status, sock) = docker_state();
+    *LAST_DOCKER_STATE.lock().unwrap_or_else(PoisonError::into_inner) = (status.clone(), sock.clone());
+    emit(status);
+    emit(sock);
+}
+
+fn emit_docker_state_if_changed() {
+    let (status, sock) = docker_state();
+    let (send_status, send_sock) = {
+        let mut last = LAST_DOCKER_STATE.lock().unwrap_or_else(PoisonError::into_inner);
+        let ss = if last.0 != status { last.0 = status.clone(); true } else { false };
+        let sd = if last.1 != sock { last.1 = sock.clone(); true } else { false };
+        (ss, sd)
+    };
+    if send_status {
+        emit(status);
+    }
+    if send_sock {
+        emit(sock);
+    }
+}
+
+/// Ensures the `kiri` context exists and is plain `docker`'s current context,
+/// keeping logins, credential helpers and plugin folders untouched (#369).
+pub fn use_kiri_context() -> io::Result<()> {
+    let dir = crate::dockerctx::docker_dir().ok_or_else(|| io::Error::other("USERPROFILE is not set"))?;
+    let ours = crate::flavor::CONTEXT.get();
+    crate::dockerctx::use_ours(&dir, &context_meta(&dir, ours), ours, "Kiri (WSL2)", &npipe_host(&crate::client::pipe()))
 }
 
 /// The docker CLI on Kiri's context, without a console window, for Compose
@@ -783,18 +831,6 @@ fn compose_cli() -> io::Result<std::process::Command> {
 /// The compose files opened in the window: %LOCALAPPDATA%\Kiri\compose.json.
 fn compose_store() -> Option<std::path::PathBuf> {
     prefs_path().map(|p| p.with_file_name("compose.json"))
-}
-
-/// Runs the docker CLI without a console window: its output, or why it failed.
-fn docker(args: &[&str]) -> io::Result<String> {
-    let mut cmd = crate::win::tool(&crate::detail::docker_cli());
-    std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x0800_0000);
-    let out = cmd.args(args).output()?;
-    if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-    } else {
-        Err(io::Error::other(String::from_utf8_lossy(&out.stderr).trim().to_owned()))
-    }
 }
 
 fn builds_event() -> String {
@@ -833,10 +869,15 @@ fn build_with() {
     }
 }
 
-/// Which engine plain `docker` uses: Kiri, or back to the one before.
+/// Which engine plain `docker` uses: Kiri (made first if missing), "default",
+/// or another context that exists, keeping logins and plugin folders.
 fn use_context(name: &str) {
-    let result = if name.is_empty() { Err(io::Error::other("no context named")) } else { docker(&["context", "use", name]).map(drop) };
-    emit(status_event());
+    let result = (|| -> io::Result<()> {
+        let dir = crate::dockerctx::docker_dir().ok_or_else(|| io::Error::other("USERPROFILE is not set"))?;
+        let ours = crate::flavor::CONTEXT.get();
+        crate::dockerctx::switch(&dir, &context_meta(&dir, name), name, ours, "Kiri (WSL2)", &npipe_host(&crate::client::pipe()))
+    })();
+    emit_docker_state();
     emit(json!({"type": "usedcontext", "name": name, "error": result.as_ref().err().map(|e| e.to_string())}).to_string());
 }
 
@@ -1091,6 +1132,11 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn npipe_host_formats_pipe_url() {
+        assert_eq!(super::npipe_host(r"\\.\pipe\kiri"), "npipe:////./pipe/kiri");
+    }
 }
 
 /// The page's "fonts" event, made once (the window asks each time Settings
@@ -1126,7 +1172,7 @@ pub fn on_message(msg: &str) {
                 emit(r#"{"type":"starprompt"}"#.to_owned());
             }
             emit(domains_event());
-            emit(status_event());
+            emit_docker_state();
             ask_language();
             // The first time, offer <name>.kiri.local, as the Mac does.
             if !crate::dns::installed() && crate::dns::serving() && prefs()["domainsAsked"] != true {
@@ -1195,10 +1241,11 @@ pub fn on_message(msg: &str) {
                 emit(crate::buildwith::event());
             });
         }
-        // The docker CLI can take a moment: off the window's thread.
+        // Config update can be done synchronously or off-thread.
         "usecontext" => {
             std::thread::spawn(move || use_context(&c.name));
         }
+        "dockersock" => emit_docker_state(),
         // The Kubernetes section: Pods, Services, a pod's logs, Start.
         "k8s" => crate::k8s::handle(&c.action, &c.value),
         // Share: public links for a port or container, and the Share account.

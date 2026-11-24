@@ -37,6 +37,9 @@ mod daemon;
 mod diag;
 #[cfg(any(unix, windows))]
 mod docker;
+#[cfg(any(target_os = "macos", all(target_os = "linux", feature = "window"), test))]
+#[cfg_attr(not(any(target_os = "macos", all(target_os = "linux", feature = "window"))), allow(dead_code))]
+mod dockerctx;
 // `kiri domains`: the container-domain routers' ports (Windows: in WSL).
 #[cfg(unix)]
 mod domains_cli;

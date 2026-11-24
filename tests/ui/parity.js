@@ -27,4 +27,9 @@ for (const th of document.querySelectorAll("#content thead th")) { const h = th.
 prefs.tab = "appearance"; show("settings");
 for (const b of document.querySelectorAll("[data-stab]")) items.push(`settings ${b.dataset.stab}`);
 for (const el of document.querySelectorAll(".settings .pref > .t")) if (seen(el)) items.push(`setting appearance: ${el.textContent.trim()}`);
+prefs.tab = "network";
+kiri.on({ type: "status", version: "0.1.4", dev: false, share: true, app: "Kiri", ours: "kiri", context: "kiri", pinned: null });
+kiri.on({ type: "dockersock", path: "/var/run/docker.sock", owner: "kiri", engine: null, target: null, hint: "DOCKER_HOST=unix:///kiri", take: false });
+show("settings");
+for (const t of document.querySelectorAll("#content .pref .t")) items.push(`network ${t.textContent.trim()}`);
 report(items.map((x) => "ITEM " + x));

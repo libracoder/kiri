@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #577 Network: show default Docker socket owner and accurate CLI binding across macOS, Linux, Windows, and Windows setup (unreleased)
+- Fixes: #577 Settings → Network: show who owns the default Docker socket (`/var/run/docker.sock` / `\\.\pipe\docker_engine`), offer to link it when free on macOS, and show `DOCKER_HOST` hint when another engine owns it; #369 report plain `docker` CLI binding accurately when another context or `DOCKER_HOST`/`DOCKER_CONTEXT` overrides Kiri, and apply "Make Kiri the default for docker" in Windows setup
+- Caused: none known
+- Caused by: -
+- Check: none
+
 ### #368 Settings: add Start Kiri at sign-in and Stop the engine when Kiri quits (unreleased)
 - Fixes: #368 macOS: setting to stop the engine when Kiri quits; #703 Add "Launch at startup" toggle in app settings
 - Caused: none known

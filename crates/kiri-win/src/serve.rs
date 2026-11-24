@@ -146,6 +146,21 @@ pub const DOCKER_ENGINE: &str = r"\\.\pipe\docker_engine";
 /// while any instance of Kiri's is open).
 const OTHER_ENGINES: &[&str] = &["Docker Desktop.exe", "com.docker.backend.exe", "dockerd.exe", "Rancher Desktop.exe"];
 
+static DOCKER_ENGINE_OWNER: std::sync::LazyLock<Mutex<Option<crate::dockerctx::Endpoint>>> = std::sync::LazyLock::new(|| Mutex::new(None));
+
+fn set_docker_engine_owner(owner: crate::dockerctx::Endpoint) {
+    *DOCKER_ENGINE_OWNER.lock().unwrap_or_else(PoisonError::into_inner) = Some(owner);
+}
+
+/// Who currently serves `\\.\pipe\docker_engine`, for `docker` CLI detection
+/// (#369) and Settings → Network (#577).
+pub fn docker_engine_endpoint() -> crate::dockerctx::Endpoint {
+    if let Some(ep) = DOCKER_ENGINE_OWNER.lock().unwrap_or_else(PoisonError::into_inner).clone() {
+        return ep;
+    }
+    other_engine().map(|o| crate::dockerctx::Endpoint::Taken(o.to_owned())).unwrap_or(crate::dockerctx::Endpoint::Free)
+}
+
 /// Carries connections to `distro` from now on (setup has just made it);
 /// the bridge to the old one is left to end.
 pub fn set_distro(distro: &str) {
@@ -227,6 +242,7 @@ fn docker_engine(hub: &Arc<Hub>) {
     };
     loop {
         if let Some(other) = other_engine() {
+            set_docker_engine_owner(crate::dockerctx::Endpoint::Taken(other.to_owned()));
             say(format!("{DOCKER_ENGINE} left to {other}"));
             thread::sleep(std::time::Duration::from_secs(5));
             continue;
@@ -234,14 +250,27 @@ fn docker_engine(hub: &Arc<Hub>) {
         let first = match Pipe::create(DOCKER_ENGINE, true) {
             Ok(p) => p,
             Err(e) => {
+                set_docker_engine_owner(crate::dockerctx::Endpoint::Taken(other_engine().unwrap_or("").to_owned()));
                 say(format!("{DOCKER_ENGINE} left to whatever serves it: {e}"));
                 thread::sleep(std::time::Duration::from_secs(5));
                 continue;
             }
         };
+        set_docker_engine_owner(crate::dockerctx::Endpoint::Kiri);
         say(format!("serving {DOCKER_ENGINE} as well (no other engine has it)"));
         let (h, mut new) = (hub.clone(), NewEngines::default());
-        serve_while_free(DOCKER_ENGINE, first, move || new.find(), move |p| serve_shared(&h, p));
+        serve_while_free(
+            DOCKER_ENGINE,
+            first,
+            move || {
+                let found = new.find();
+                if let Some(other) = found {
+                    set_docker_engine_owner(crate::dockerctx::Endpoint::Taken(other.to_owned()));
+                }
+                found
+            },
+            move |p| serve_shared(&h, p),
+        );
     }
 }
 

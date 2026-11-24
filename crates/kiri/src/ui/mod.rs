@@ -91,6 +91,8 @@ enum Cmd {
     About,
     /// Settings → Domains: turn `*.kiri.local` on or off (asks for the password).
     Domains(bool),
+    /// Settings → Network: link `/var/run/docker.sock` to Kiri when free (macOS).
+    TakeSocket,
     /// New published ports for a container: `[{container_port, host_port, proto, host_ip}]`.
     Ports { id: String, ports: serde_json::Value },
     Env { id: String, env: Vec<String> },
@@ -111,6 +113,7 @@ impl Cmd {
             Cmd::Ports { id, .. } => ("ports", id.chars().take(12).collect()),
             Cmd::Env { id, .. } => ("env", id.chars().take(12).collect()),
             Cmd::Domains(on) => ("domains", on.to_string()),
+            Cmd::TakeSocket => ("takesocket", String::new()),
             Cmd::Quit | Cmd::Refresh | Cmd::About | Cmd::Connect => return None,
         })
     }
@@ -345,7 +348,24 @@ fn engine(rx: Receiver<Cmd>, tx: Sender<Cmd>) {
                     emit(notice("ok", &note));
                 }
                 emit(domains_event());
+                emit_docker_state();
                 refresh(&mut connected);
+            }
+            Ok(Cmd::TakeSocket) => {
+                match setup::docker_socket() {
+                    Ok(()) if setup::docker_sock() == crate::dockerctx::Endpoint::Kiri => {
+                        emit(notice("ok", &tr("/var/run/docker.sock now points to Kiri")));
+                    }
+                    Ok(()) => {
+                        if let Some(note) = setup::docker_socket_note() {
+                            emit(notice("ok", &note));
+                        }
+                    }
+                    // Cancelling macOS's password prompt is a choice, not an error.
+                    Err(e) if !e.to_string().contains("-128") => emit(notice("error", &trf("Could not link /var/run/docker.sock: {error}", &[("error", &e)]))),
+                    Err(_) => {}
+                }
+                emit_docker_state();
             }
             Ok(Cmd::RemoveNetwork(id)) => act("rmnet", expect_ok(client::request("DELETE", &format!("/networks/{id}"), None))),
             Ok(Cmd::Quit) | Err(RecvTimeoutError::Disconnected) => {
@@ -360,6 +380,7 @@ fn engine(rx: Receiver<Cmd>, tx: Sender<Cmd>) {
             }
             Err(RecvTimeoutError::Timeout) => {
                 vm_panel(&mut connected);
+                emit_docker_state_if_changed();
                 if connected && LISTED.lock().unwrap_or_else(|e| e.into_inner()).elapsed() >= LIST_EVERY {
                     refresh(&mut connected);
                 }
@@ -937,19 +958,44 @@ fn reopen_after_exit() {
     let _ = std::process::Command::new("/bin/sh").args(["-c", script, "sh", &std::process::id().to_string()]).arg(&app).spawn();
 }
 
-fn status_event() -> String {
-    let context = std::env::var("DOCKER_CONTEXT").ok().filter(|c| !c.is_empty()).or_else(|| {
-        let home = std::env::var_os("HOME")?;
-        let cfg: serde_json::Value = serde_json::from_slice(&std::fs::read(std::path::Path::new(&home).join(".docker/config.json")).ok()?).ok()?;
-        cfg["currentContext"].as_str().map(str::to_owned)
-    });
-    // Linux: docker's default endpoint is the standard socket, which leads to
-    // Kiri while no Docker engine has it (the package links it), and the
-    // package's docker goes to Kiri's socket: that is docker using Kiri, as
-    // the setup checklist says, not "Docker's default engine".
+fn docker_state() -> (String, String) {
+    #[cfg(target_os = "macos")]
+    let cli = {
+        let endpoint = setup::docker_sock();
+        let ours = crate::daemon::socket_path().map(|p| format!("unix://{}", p.display())).unwrap_or_default();
+        let hosts: Vec<&str> = (!ours.is_empty()).then_some(ours.as_str()).into_iter().collect();
+        crate::dockerctx::current_cli(crate::flavor::CONTEXT.get(), &hosts, &endpoint)
+    };
     #[cfg(target_os = "linux")]
-    let context = if context.as_deref().is_none_or(|c| c == "default") && linux::onboarding::docker_uses_kiri() { Some(crate::flavor::CONTEXT.get().to_owned()) } else { context };
-    serde_json::json!({"type": "status", "version": env!("CARGO_PKG_VERSION"), "dev": crate::flavor::dev(), "share": true, "app": crate::flavor::APP.get(), "ours": crate::flavor::CONTEXT.get(), "context": context.unwrap_or_else(|| "default".into())}).to_string()
+    let cli = setup::current_cli(&setup::docker_sock());
+    let status = crate::dockerctx::status_event(env!("CARGO_PKG_VERSION"), crate::flavor::dev(), crate::flavor::APP.get(), crate::flavor::CONTEXT.get(), &cli).to_string();
+    let sock = setup::docker_sock_event().to_string();
+    (status, sock)
+}
+
+static LAST_DOCKER_STATE: std::sync::Mutex<(String, String)> = std::sync::Mutex::new((String::new(), String::new()));
+
+fn emit_docker_state() {
+    let (status, sock) = docker_state();
+    *LAST_DOCKER_STATE.lock().unwrap_or_else(|e| e.into_inner()) = (status.clone(), sock.clone());
+    emit(status);
+    emit(sock);
+}
+
+fn emit_docker_state_if_changed() {
+    let (status, sock) = docker_state();
+    let (send_status, send_sock) = {
+        let mut last = LAST_DOCKER_STATE.lock().unwrap_or_else(|e| e.into_inner());
+        let ss = if last.0 != status { last.0 = status.clone(); true } else { false };
+        let sd = if last.1 != sock { last.1 = sock.clone(); true } else { false };
+        (ss, sd)
+    };
+    if send_status {
+        emit(status);
+    }
+    if send_sock {
+        emit(sock);
+    }
 }
 
 /// Which names containers answer at now.
@@ -2085,10 +2131,16 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
         // Which engine plain `docker` uses: Kiri, or back to the one before.
         "usecontext" => {
             let result = setup::use_context(&msg.name);
-            emit(status_event());
+            emit_docker_state();
             emit(serde_json::json!({"type": "usedcontext", "name": msg.name, "error": result.as_ref().err().map(|e| e.to_string())}).to_string());
             Ok(())
         }
+        // Settings → Network: Docker socket state and taking /var/run/docker.sock when free.
+        "dockersock" => {
+            emit_docker_state();
+            Ok(())
+        }
+        "takesocket" => tx.send(Cmd::TakeSocket),
         // Settings → Builds: clear Kiri's builder cache (`docker builder
         // prune --all`), which Images and Volumes don't list.
         "buildprune" => {
@@ -2437,7 +2489,7 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
                 setup_tools();
             }
             emit(domains_event());
-            emit(status_event());
+            emit_docker_state();
             // A crash since the window last opened, for the page to
             // offer a report; crash files go if the person allowed it.
             std::thread::spawn(|| {

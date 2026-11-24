@@ -1165,6 +1165,8 @@ tr.row:hover td.actions .acts-row { background: linear-gradient(var(--fwd), tran
 .rports input:disabled { color: var(--faint); }
 .rports .btn { height: 32px; }
 .pref + .rp-notes { margin-top: -6px; }
+.pref .sockhint { display: inline-flex; align-items: center; gap: 4px; flex-wrap: wrap; margin-top: 4px; color: var(--text); }
+.pref .sockhint code { padding: 1px 6px; border-radius: 5px; background: var(--panel); border: 1px solid var(--line); font: var(--fs-mono) var(--mono-font); user-select: text; -webkit-user-select: text; }
 /* Chinese and Japanese break between any two characters: a short choice (关闭, 开启)
    stays on one line, as an English word does; Korean's too. Only in a CJK window,
    so English lays out as it did. */
@@ -2778,7 +2780,7 @@ const VM = LINUX ? "Engine" : "Linux VM";
 const shareOn = () => !!(ui.status?.share ?? ui.status?.dev);
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 
-const ui = { acting: new Map(), gacting: new Map(), running: new Set(), launched: new Map(), runWatch: new Map(), need: null, probed: new Map(), probing: new Set(), why: new Map(), startErr: {}, fixed: null, openTab: null, listening: new Map(), starting: new Map(), scans: new Map(), scanf: { sev: "", fix: false, own: false }, view: "containers", vm: "stopped", containers: [], images: [], volumes: [], networks: [], sort: { images: { key: "pulled", desc: true } }, filter: "", suffix: "kiri.localhost", collapsed: new Set(), res: null, resDraft: {}, proxy: null, pxDraft: {}, rports: null, rpDraft: {}, rpAt: 0, regcfg: null, regBase: null, regDraft: { insecure: [], mirrors: [] }, regAdd: { insecure: "", mirrors: "" },
+const ui = { acting: new Map(), gacting: new Map(), running: new Set(), launched: new Map(), runWatch: new Map(), need: null, probed: new Map(), probing: new Set(), why: new Map(), startErr: {}, fixed: null, openTab: null, listening: new Map(), starting: new Map(), scans: new Map(), scanf: { sev: "", fix: false, own: false }, view: "containers", vm: "stopped", containers: [], images: [], volumes: [], networks: [], sort: { images: { key: "pulled", desc: true } }, filter: "", suffix: "kiri.localhost", collapsed: new Set(), res: null, resDraft: {}, proxy: null, pxDraft: {}, rports: null, rpDraft: {}, rpAt: 0, regcfg: null, regBase: null, regDraft: { insecure: [], mirrors: [] }, regAdd: { insecure: "", mirrors: "" }, dockersock: null, sockTaking: false, ctxSwitching: false,
   imp: { sources: null, source: null, inv: null, picked: { images: new Set(), volumes: new Set(), containers: new Set() }, steps: {}, running: false, summary: "" },
   upd: null, engineStale: null, staleHidden: false,
   // The Builds view: the list, the picked build and its detail, and how its steps show.
@@ -4064,6 +4066,7 @@ const CTX_NAMES = { orbstack: "OrbStack", "desktop-linux": "Docker Desktop", def
 const CTX_SNOOZE = 7 * 864e5;
 const ctx = { card: null };
 const ctxOther = () => !!ui.status && ui.status.context !== ui.status.ours;
+const ctxPinned = () => ui.status?.pinned || "";
 const ctxLabel = (c) => (CTX_NAMES[c] ? tr(CTX_NAMES[c]) : c);
 const ctxWarn = (cls = "") => `<svg class="${cls}" viewBox="0 0 256 256" aria-hidden="true"><path d="${PH.warning}"/></svg>`;
 // "1.2GB", "187MB", "5.6kB" (docker's image sizes) in bytes.
@@ -4072,16 +4075,25 @@ const ctxBytes = (v) => { const m = /^([\d.]+)\s*([kMGT]?)B$/i.exec(String(v || 
 function ctxStatusItem() {
   if (!ui.status) return "";
   if (!ctxOther()) return `<span class="sep">·</span><span class="item ctx-ok" title="${tr("The docker command uses {app}", { app: esc(ui.status.app || "Kiri") })}"><i></i>docker → ${esc(ui.status.app || "Kiri")}</span>`;
+  const pinned = ctxPinned();
+  if (pinned) return `<span class="sep">·</span><button class="item ctx-warn" data-ctxswitch title="${tr("{env} is set, so docker uses another engine instead of {app}", { env: esc(pinned), app: esc(ui.status.app || "Kiri") })}">${ctxWarn()}docker → ${esc(pinned)}</button>`;
   return `<span class="sep">·</span><button class="item ctx-warn" data-ctxswitch title="${tr("The docker command uses {engine}. Switch it to {app}", { engine: esc(ctxLabel(ui.status.context)), app: esc(ui.status.app || "Kiri") })}">${ctxWarn()}docker → ${esc(rtl() ? island(ctxLabel(ui.status.context)) : ctxLabel(ui.status.context))}</button>`;
 }
 
 function renderCtxStrip() {
   const el = $("impstrip");
   if (!ctxOther() || !["containers", "images"].includes(ui.view) || Date.now() < (prefs.ctxSnooze || 0) || ctx.card) return false;
-  el.innerHTML = `${ctxWarn("is-warn")}
-    <span class="is-text">${tr("<b>docker still uses {engine}</b>, so what you run in the terminal won't show up here. Your images can come along.", { engine: esc(ctxLabel(ui.status.context)) })}</span>
-    <button class="btn sm primary" data-ctxswitch>${tr("Switch to {app}", { app: esc(ui.status.app || "Kiri") })}</button>
-    <button class="is-x" data-ctxsnooze title="${tr("Not now: ask again in a week")}" aria-label="${tr("Not now")}">×</button>`;
+  const pinned = ctxPinned();
+  if (pinned) {
+    el.innerHTML = `${ctxWarn("is-warn")}
+      <span class="is-text">${tr("{env} is set, so {docker} uses another engine instead of {app}. Unset it in your shell to use {app}.", { env: `<code>${esc(pinned)}</code>`, docker: "<code>docker</code>", app: esc(ui.status.app || "Kiri") })}</span>
+      <button class="is-x" data-ctxsnooze title="${tr("Not now: ask again in a week")}" aria-label="${tr("Not now")}">×</button>`;
+  } else {
+    el.innerHTML = `${ctxWarn("is-warn")}
+      <span class="is-text">${tr("<b>docker still uses {engine}</b>, so what you run in the terminal won't show up here. Your images can come along.", { engine: esc(ctxLabel(ui.status.context)) })}</span>
+      <button class="btn sm primary" data-ctxswitch>${tr("Switch to {app}", { app: esc(ui.status.app || "Kiri") })}</button>
+      <button class="is-x" data-ctxsnooze title="${tr("Not now: ask again in a week")}" aria-label="${tr("Not now")}">×</button>`;
+  }
   el.classList.add("ctx");
   el.hidden = false;
   return true;
@@ -4096,7 +4108,21 @@ function ctxImages(from) {
 function ctxDialog() {
   if (!ctxOther()) return;
   $("ctx-dlg")?.remove();
-  const from = ui.status.context, label = ctxLabel(from), app = ui.status.app || "Kiri";
+  const pinned = ctxPinned(), app = ui.status.app || "Kiri";
+  if (pinned) {
+    const cmd = WIN ? `Remove-Item Env:${esc(pinned)}` : `unset ${esc(pinned)}`;
+    const scrim = document.createElement("div");
+    scrim.className = "scrim"; scrim.id = "ctx-dlg";
+    scrim.innerHTML = `<div class="dialog ctx-dlg" role="dialog" aria-modal="true" aria-labelledby="ctx-h">
+      <h3 id="ctx-h">${tr("{env} is set", { env: esc(pinned) })}</h3>
+      <p class="muted" style="font-size:var(--fs);margin:8px 0 14px">${tr("{env} overrides docker's context in this session, so switching context won't move {docker} to {app}. Clear it with {cmd} or remove it from your profile.", { env: `<span class="mono">${esc(pinned)}</span>`, docker: "<code>docker</code>", app: esc(app), cmd: `<code>${cmd}</code>` })}</p>
+      <div class="ctx-foot"><span></span><span><button class="btn primary" data-close>${tr("OK")}</button></span></div></div>`;
+    document.body.append(scrim);
+    scrim.addEventListener("click", (ev) => { if (ev.target === scrim || ev.target.closest("[data-close]")) scrim.remove(); });
+    scrim.querySelector("[data-close]").focus();
+    return;
+  }
+  const from = ui.status.context, label = ctxLabel(from);
   const src = ui.imp.sources?.find((s) => s.id === from), imgs = ctxImages(from), inv = ui.imp.inv;
   if (src?.running && !imgs) send("inventory", { name: from });
   const bytes = (imgs || []).reduce((a, v) => a + ctxBytes(v.size), 0);
@@ -4367,16 +4393,64 @@ function buildsPane() {
   </div>`;
 }
 
-/* Settings → Network: the proxy for pulls and, if wanted, for containers. */
+/* Settings → Network: Docker's default socket + CLI binding, and the proxy. */
+function dockerSockRows() {
+  const app = ui.status?.app || "Kiri";
+  const mono = (t) => `<span class="mono">${esc(String(t))}</span>`;
+  const s = ui.dockersock;
+  let sockRow = "";
+  if (s) {
+    let desc = "", pact = "";
+    if (s.owner === "kiri") {
+      desc = tr("{path} leads to {app}. Tools like Testcontainers, IDE plugins and SDKs use it directly.", { path: mono(s.path), app: esc(app) });
+      pact = `<span class="pact kstate"><i class="on"></i>${esc(app)}</span>`;
+    } else if (s.owner === "other") {
+      const who = s.engine ? (s.target?.includes("/") ? `${esc(s.engine)} (${mono(s.target)})` : esc(s.engine)) : s.target ? mono(s.target) : tr("another engine");
+      desc = `${tr("{path} belongs to {engine} and stays so.", { path: mono(s.path), engine: who })}<br><span class="sockhint">${tr("Tools that ignore docker contexts can use {hint}", { hint: `<code>${esc(s.hint)}</code>` })}${copyBtn(s.hint, tr("command"))}</span>`;
+      pact = `<span class="pact kstate"><i></i>${s.engine ? esc(s.engine) : tr("In use")}</span>`;
+    } else {
+      desc = s.take
+        ? tr("{path} is free. Link it to {app} so tools that ignore docker contexts find {app} there.", { path: mono(s.path), app: esc(app) })
+        : WIN
+          ? tr("{path} is free. {app} serves it whenever it runs and no other Docker engine does.", { path: mono(s.path), app: esc(app) })
+          : LINUX
+            ? tr("{path} is free. {service} links it when Kiri starts while no other Docker engine has it.", { path: mono(s.path), service: mono("kiri.service") })
+            : tr("{path} is free. {app} leaves it for the installed Kiri.", { path: mono(s.path), app: esc(app) });
+      pact = s.take
+        ? `<span class="pact"><button class="btn primary" data-takesock${ui.sockTaking ? " disabled" : ""}>${ui.sockTaking ? tr("Linking…") : tr("Use {app}", { app: esc(app) })}</button></span>`
+        : `<span class="pact kstate"><i></i>${tr("Free")}</span>`;
+    }
+    sockRow = `<div class="pref"><span class="t">${tr("Docker socket")}</span><span class="d">${desc}</span>${pact}</div>`;
+  }
+  let cliRow = "";
+  if (ui.status) {
+    const pinned = ctxPinned();
+    let desc = "", pact = "";
+    if (!ctxOther()) {
+      desc = tr("The {docker} command uses {app}.", { docker: mono("docker"), app: esc(app) });
+      pact = `<span class="pact kstate"><i class="on"></i>${esc(app)}</span>`;
+    } else if (pinned) {
+      desc = tr("{env} is set in this session, so {docker} uses another engine.", { env: mono(pinned), docker: mono("docker") });
+      pact = `<span class="pact kstate"><i class="busy"></i>${esc(pinned)}</span>`;
+    } else {
+      desc = tr("The {docker} command uses {engine}.", { docker: mono("docker"), engine: esc(ctxLabel(ui.status.context)) });
+      pact = `<span class="pact"><button class="btn primary" data-usekiri${ui.ctxSwitching ? " disabled" : ""}>${ui.ctxSwitching ? tr("Switching…") : tr("Use {app}", { app: esc(app) })}</button></span>`;
+    }
+    cliRow = `<div class="pref"><span class="t">${tr("{docker} command", { docker: mono("docker") })}</span><span class="d">${desc}</span>${pact}</div>`;
+  }
+  return sockRow + cliRow;
+}
+
 function networkPane() {
-  const p = ui.proxy;
-  if (!p) return `<div class="pane"><h3>${tr("Network")}</h3><p class="muted">${tr("Loading…")}</p></div>`;
-  if (p.error) return `<div class="pane"><h3>${tr("Network")}</h3><p class="muted">${tr("Start Kiri to change its network settings. ({error})", { error: esc(p.error) })}</p></div>`;
+  const p = ui.proxy, sock = dockerSockRows();
+  if (!p) return `<div class="pane"><h3>${tr("Network")}</h3>${sock}<p class="muted">${tr("Loading…")}</p></div>`;
+  if (p.error) return `<div class="pane"><h3>${tr("Network")}</h3>${sock}<p class="muted">${tr("Start Kiri to change its network settings. ({error})", { error: esc(p.error) })}</p></div>`;
   const d = ui.pxDraft, eff = p.effective;
   const seg = [["system", tr("{os} settings", { os: OS })], ["custom", tr("Custom")], ["none", tr("None")]].map(([v, l]) => `<button data-pxmode="${v}" aria-pressed="${d.mode === v}">${l}</button>`).join("");
   const now = eff.https || eff.http ? (eff.no_proxy.length ? tr("In use: {proxy}, except {hosts}.", { proxy: `<span class="mono">${esc(eff.https || eff.http)}</span>`, hosts: `<span class="mono">${esc(eff.no_proxy.join(", "))}</span>` }) : tr("In use: {proxy}.", { proxy: `<span class="mono">${esc(eff.https || eff.http)}</span>` })) : tr("No proxy is in use.");
   const field = (k, label, ph) => `<label class="pxf"><span>${label}</span><input class="field" id="px-${k}" value="${esc(d[k] || "")}" placeholder="${ph}" spellcheck="false" autocomplete="off"></label>`;
   return `<div class="pane"><h3>${tr("Network")}</h3>
+    ${sock}
     <div class="pref"><span class="t">${tr("Proxy")}</span><span class="d">${tr("For pulling and pushing images.")} ${d.mode === p.settings.mode ? now : ""}</span>
       <div class="seg" role="group" aria-label="${tr("Proxy")}">${seg}</div></div>
     ${d.mode === "system" && eff.pac ? `<p class="muted">${tr("{os} uses an automatic proxy configuration (PAC) file, which Kiri can't follow. Choose Custom and enter the proxy.", { os: OS })}</p>` : ""}
@@ -4619,7 +4693,7 @@ function show(view) {
   if (view === "compose") { cmp.open = null; cmp.asked = 0; cmpAsk(); }
   if (view === "usb") usbPoll();
   if (view === "share") { send("shares"); send("shareusage"); shPoll(); }
-  if (view === "settings") { if (!fontLists.families.length) send("fonts"); send("about"); send("logins"); send("resources"); send("proxy"); send("registryconfig"); send("routerports"); if (!ui.imp.sources) send("importsources"); if (prefs.tab === "diagnostics") diagOpen(); }
+  if (view === "settings") { if (!fontLists.families.length) send("fonts"); send("about"); send("logins"); send("resources"); send("dockersock"); send("proxy"); send("registryconfig"); send("routerports"); if (!ui.imp.sources) send("importsources"); if (prefs.tab === "diagnostics") diagOpen(); }
   render();
   // From the top, as a container's or pod's page opens: leaving a page scrolled
   // down (a long Terminal or Logs tab) otherwise opened the next view below its rows.
@@ -8153,6 +8227,7 @@ window.kiri = {
       case "onboarding": onboarding(e); break;
       case "buildask": buildAsk(e.engine); break;
       case "buildwith": ui.bw = e; if (ui.view === "settings") render(); break;
+      case "dockersock": ui.dockersock = e; ui.sockTaking = false; if (ui.view === "settings") render(); break;
       case "status":
         ui.status = e;
         document.body.classList.toggle("dev", !!e.dev);
@@ -8206,7 +8281,7 @@ window.kiri = {
       case "imagelayers": if (ui.imgd?.name === e.name) { ui.imgd.layers = e; if (ui.view === "images") render(); } break;
       case "buildlayers": if (ui.bl.sel?.id === e.id) { ui.bl.layers = e; if (ui.view === "builds") renderBuilds(); } break;
       case "build": if (ui.bl.sel?.id === e.id) { ui.bl.d = e; if (ui.view === "builds") renderBuilds(); } break;
-      case "usedcontext": if (e.error) toast("error", tr("Couldn't switch docker: {error}", { error: e.error })); break;
+      case "usedcontext": ui.ctxSwitching = false; if (e.error) toast("error", tr("Couldn't switch docker: {error}", { error: e.error })); if (ui.view === "settings") render(); break;
       case "importsources": ui.imp.sources = e.sources; { const s = e.sources.find((x) => x.id === ui.imp.source) || e.sources.find((x) => x.running && x.id === ui.status?.context) || e.sources.find((x) => x.running) || e.sources[0]; if (s) { ui.imp.source = s.id; if (s.running) send("inventory", { name: s.id }); } } if (ui.view === "settings") render(); break;
       case "inventory": ui.imp.inv = e; if (ui.view === "settings") render(); renderImportStrip(); drawImportModal(); break;
       case "importstep": ctxStep(e); ui.imp.steps[`${e.kind}/${e.name}`] = e; if (e.state !== "running") ui.imp.picked[e.kind].delete(e.name); if (ui.view === "settings") render(); drawImportModal(); break;
@@ -8340,7 +8415,7 @@ $("content").addEventListener("click", (ev) => {
   else if ((el = t("[data-g]"))) projectAsk(el.dataset.project, el.dataset.g);
   else if ((el = t("[data-group]"))) toggleGroup(el);
   else if (composeClick(t)) {}
-  else if ((el = t("[data-stab]"))) { prefs.tab = el.dataset.stab; if (prefs.tab === "about") send("about"); if (prefs.tab === "builds") send("buildwith"); if (prefs.tab === "registries") { send("logins"); send("registryconfig"); } if (prefs.tab === "diagnostics") diagOpen(); render(); }
+  else if ((el = t("[data-stab]"))) { prefs.tab = el.dataset.stab; if (prefs.tab === "about") send("about"); if (prefs.tab === "network") { send("proxy"); send("dockersock"); } if (prefs.tab === "builds") send("buildwith"); if (prefs.tab === "registries") { send("logins"); send("registryconfig"); } if (prefs.tab === "diagnostics") diagOpen(); render(); }
   else if (diagClick(t)) {}
   else if ((el = t("[data-scale]"))) setPref("scale", +el.dataset.scale);
   else if ((el = t("[data-logsize]"))) setPref("logSize", +el.dataset.logsize);
@@ -8362,6 +8437,8 @@ $("content").addEventListener("click", (ev) => {
   else if ((el = t("[data-pxmode]"))) { ui.pxDraft.mode = el.dataset.pxmode; render(); }
   else if ((el = t("[data-pxc]"))) { ui.pxDraft.containers = !!+el.dataset.pxc; render(); }
   else if ((el = t("[data-savepx]"))) send("setproxy", { value: ui.pxDraft });
+  else if (t("[data-takesock]")) { ui.sockTaking = true; send("takesocket"); render(); }
+  else if (t("[data-usekiri]")) { ui.ctxSwitching = true; send("usecontext", { name: ui.status.ours }); render(); }
   else if ((el = t("[data-regadd]"))) regListAdd(el.dataset.regadd);
   else if ((el = t("[data-regdel]"))) { const [k, i] = el.dataset.regdel.split(":"); ui.regDraft[k].splice(+i, 1); render(); }
   else if ((el = t("[data-regsave]"))) { ui.regSaving = el.dataset.regsave; send("setregistryconfig", { value: { [REG_KEY[el.dataset.regsave]]: ui.regDraft[el.dataset.regsave] } }); }
@@ -9280,7 +9357,7 @@ setInterval(() => {
 }, 4000);
 // Animations rest while another window is in front, or this one is hidden.
 const away = () => document.body.classList.toggle("away", document.hidden || !document.hasFocus());
-addEventListener("focus", away); addEventListener("blur", away); document.addEventListener("visibilitychange", away);
+addEventListener("focus", () => { away(); send("dockersock"); }); addEventListener("blur", away); document.addEventListener("visibilitychange", away);
 // The crane's sway (.is-art), once every 20 s while Kiri is the window in use.
 setInterval(() => {
   document.body.classList.remove("sway");

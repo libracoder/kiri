@@ -907,6 +907,10 @@ fn tools() -> io::Result<()> {
         verified(f)?;
     }
     let make_default = STATE.lock().unwrap_or_else(PoisonError::into_inner).as_ref().is_some_and(|s| s.make_default);
+    let before_ctx = crate::dockerctx::docker_dir().and_then(|d| {
+        let cfg: Value = crate::dockerctx::read_json(&d.join("config.json")).ok()?;
+        cfg["currentContext"].as_str().map(str::to_owned)
+    });
     // setup-tools.ps1 (contrib/windows), checked like the bundle's other
     // files and run from its file with its parameters as arguments. Not a
     // copy in this binary run through [scriptblock]::Create from Base64:
@@ -951,6 +955,20 @@ fn tools() -> io::Result<()> {
             .unwrap_or_else(|| "installing the Docker tools failed".to_owned());
         return Err(io::Error::other(why));
     }
+    // The user may have toggled "Make Kiri the default for docker" while
+    // setup-tools.ps1 ran, after `make_default` above was already read (#369).
+    let want_default = STATE.lock().unwrap_or_else(PoisonError::into_inner).as_ref().is_some_and(|s| s.make_default);
+    if want_default {
+        crate::engine::use_kiri_context()?;
+        if !make_default {
+            task(4, "done", "");
+        }
+    } else if make_default
+        && let Some(dir) = crate::dockerctx::docker_dir()
+    {
+        let _ = crate::dockerctx::set_current(&dir.join("config.json"), before_ctx.as_deref().unwrap_or("default"));
+        task(4, "done", &tr("skipped"));
+    }
     // From here on Kiri runs from %LOCALAPPDATA%\Kiri, not the download folder.
     if let Ok(exe) = std::env::current_exe() {
         let installed = dir().join("kiri-win.exe");
@@ -968,6 +986,12 @@ fn tools() -> io::Result<()> {
 /// Ready → Open Kiri: remember setup is done, start at sign-in if asked.
 fn finish() {
     let autostart = STATE.lock().unwrap_or_else(PoisonError::into_inner).as_ref().is_none_or(|s| s.autostart);
+    // Apply "Make Kiri the default for docker" on finish too (e.g. if checked after tools finished).
+    if STATE.lock().unwrap_or_else(PoisonError::into_inner).as_ref().is_some_and(|s| s.make_default)
+        && let Err(e) = crate::engine::use_kiri_context()
+    {
+        crate::serve::log(&format!("docker context: could not make kiri default ({e})"));
+    }
     // Which builder docker build uses: asked with another engine here, Kiri's without.
     let asked = STATE.lock().unwrap_or_else(PoisonError::into_inner).as_ref().filter(|s| s.other_docker).map(|s| s.build_kiri);
     let built = match asked {

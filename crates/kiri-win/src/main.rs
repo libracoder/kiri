@@ -45,6 +45,9 @@ mod relay;
 #[path = "../../kiri/src/hostrelay.rs"]
 mod hostrelay;
 #[cfg(windows)]
+#[path = "../../kiri/src/dockerctx.rs"]
+mod dockerctx;
+#[cfg(windows)]
 mod win;
 // The window's USB view, through usbipd-win.
 #[cfg(windows)]

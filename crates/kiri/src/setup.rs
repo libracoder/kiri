@@ -33,7 +33,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use serde_json::{Value, json};
+use serde_json::Value;
 
 // The bundle identifier (`APP_ID`) named in the LaunchAgent makes macOS
 // say "Kiri" in Login Items, rather than the name on the signing
@@ -48,39 +48,20 @@ fn bin_dir() -> io::Result<PathBuf> {
     Ok(home()?.join(crate::flavor::STATE.get()).join("bin"))
 }
 
+use crate::dockerctx::{Endpoint, read_json, write_json};
+
 fn home() -> io::Result<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| io::Error::other("HOME is not set"))
 }
 
 fn docker_dir() -> io::Result<PathBuf> {
-    match std::env::var_os("DOCKER_CONFIG") {
-        Some(d) => Ok(PathBuf::from(d)),
-        None => Ok(home()?.join(".docker")),
-    }
+    crate::dockerctx::docker_dir().ok_or_else(|| io::Error::other("HOME is not set"))
 }
 
 /// The docker CLI's directory for a context: named by the SHA-256 of its name.
 fn context_dir(name: &str) -> io::Result<PathBuf> {
     let digest = kiri_image::store::sha256_digest(name.as_bytes());
     Ok(docker_dir()?.join("contexts/meta").join(digest.trim_start_matches("sha256:")))
-}
-
-fn read_json(path: &Path) -> io::Result<Value> {
-    match std::fs::read(path) {
-        Ok(b) => serde_json::from_slice(&b).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{}: {e}", path.display()))),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(json!({})),
-        Err(e) => Err(e),
-    }
-}
-
-/// Writes JSON through a temporary file, so a crash never leaves half a config.
-fn write_json(path: &Path, v: &Value) -> io::Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let tmp = path.with_extension("kiri-tmp");
-    std::fs::write(&tmp, serde_json::to_vec_pretty(v).map_err(io::Error::other)?)?;
-    std::fs::rename(tmp, path)
 }
 
 /// Kiri.app's `Contents`, when this binary runs from the app.
@@ -280,13 +261,23 @@ const DOCKER_SOCK: &str = "/var/run/docker.sock";
 const SOCKET_LABEL: &str = "dev.kiri.docker-socket";
 const SOCKET_DAEMON: &str = "/Library/LaunchDaemons/dev.kiri.docker-socket.plist";
 
-/// Who has /var/run/docker.sock.
-#[derive(Debug, PartialEq)]
-enum DockerSock {
-    Kiri,
-    Free,
-    /// Another engine: what it points at.
-    Taken(String),
+/// Who has `/var/run/docker.sock`.
+pub fn docker_sock() -> Endpoint {
+    let Ok(ours) = crate::daemon::socket_path() else { return Endpoint::Free };
+    docker_sock_at_ours(&ours)
+}
+
+fn docker_sock_at_ours(ours: &Path) -> Endpoint {
+    crate::dockerctx::sock_at(Path::new(DOCKER_SOCK), ours, &other_engine_dirs())
+}
+
+/// Settings → Network's Docker socket row for the Mac.
+pub fn docker_sock_event() -> Value {
+    let (endpoint, hint) = match crate::daemon::socket_path() {
+        Ok(ours) => (docker_sock_at_ours(&ours), format!("unix://{}", ours.display())),
+        Err(_) => (Endpoint::Free, format!("unix://~/{}/run/docker.sock", crate::flavor::STATE.get())),
+    };
+    crate::dockerctx::sock_event(DOCKER_SOCK, &endpoint, &hint, !dev())
 }
 
 /// The engines whose links stay theirs while the app is installed, running
@@ -298,27 +289,6 @@ fn other_engine_dirs() -> Vec<PathBuf> {
         .filter(|(app, _)| Path::new(app).exists())
         .map(|(_, dir)| h.join(dir))
         .collect()
-}
-
-fn docker_sock(ours: &Path) -> DockerSock {
-    docker_sock_at(Path::new(DOCKER_SOCK), ours, &other_engine_dirs())
-}
-
-fn docker_sock_at(path: &Path, ours: &Path, engines: &[PathBuf]) -> DockerSock {
-    let Ok(meta) = std::fs::symlink_metadata(path) else { return DockerSock::Free };
-    if meta.file_type().is_symlink() {
-        let Ok(target) = std::fs::read_link(path) else { return DockerSock::Taken(path.display().to_string()) };
-        if target == ours {
-            return DockerSock::Kiri;
-        }
-        if target.exists() || engines.iter().any(|e| target.starts_with(e)) {
-            return DockerSock::Taken(target.display().to_string());
-        }
-        // Left behind by an engine that has been removed.
-        return DockerSock::Free;
-    }
-    // A socket (or anything else) of its own: an engine's, serving or not.
-    DockerSock::Taken(path.display().to_string())
 }
 
 /// `'…'` for sh.
@@ -344,7 +314,7 @@ impl std::fmt::Display for LinkScript {
 /// Kiri's already or another engine's, or for Kiri Dev.
 fn docker_socket_script() -> io::Result<Option<LinkScript>> {
     let ours = crate::daemon::socket_path()?;
-    if dev() || docker_sock(&ours) != DockerSock::Free {
+    if dev() || docker_sock_at_ours(&ours) != Endpoint::Free {
         return Ok(None);
     }
     let esc = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;");
@@ -389,16 +359,16 @@ pub fn docker_socket() -> io::Result<()> {
 /// `~/.testcontainers.properties` for when /var/run/docker.sock is not
 /// Kiri's but could be (a declined password, not yet asked).
 fn docker_socket_fallback(ours: &Path) -> String {
-    match docker_sock(ours) {
-        DockerSock::Kiri => {
+    match docker_sock_at_ours(ours) {
+        Endpoint::Kiri => {
             let _ = testcontainers(ours, false);
             format!("{DOCKER_SOCK} → Kiri (docker-py, Testcontainers and other tools that ignore docker contexts)")
         }
-        DockerSock::Taken(t) => {
+        Endpoint::Taken(t) => {
             let _ = testcontainers(ours, false);
             format!("{DOCKER_SOCK} is another engine's ({t}) and stays so; DOCKER_HOST=unix://{} points a tool at Kiri", ours.display())
         }
-        DockerSock::Free => match testcontainers(ours, true) {
+        Endpoint::Free => match testcontainers(ours, true) {
             Ok(true) => format!("{DOCKER_SOCK} is not Kiri's yet (`kiri setup --docker-socket` asks for the password); Testcontainers finds Kiri through ~/.testcontainers.properties"),
             _ => format!("{DOCKER_SOCK} is not Kiri's yet (`kiri setup --docker-socket` asks for the password); until then DOCKER_HOST=unix://{} points a tool at Kiri", ours.display()),
         },
@@ -450,8 +420,8 @@ fn testcontainers_at(path: &Path, ours: &Path, on: bool) -> io::Result<bool> {
 /// went, if it is not Kiri's.
 pub fn docker_socket_note() -> Option<String> {
     let ours = crate::daemon::socket_path().ok()?;
-    match docker_sock(&ours) {
-        DockerSock::Free if !dev() => Some(docker_socket_fallback(&ours)),
+    match docker_sock_at_ours(&ours) {
+        Endpoint::Free if !dev() => Some(docker_socket_fallback(&ours)),
         _ => None,
     }
 }
@@ -461,7 +431,7 @@ pub fn docker_socket_note() -> Option<String> {
 fn remove_docker_socket() -> io::Result<()> {
     let ours = crate::daemon::socket_path()?;
     let _ = testcontainers(&ours, false);
-    let linked = docker_sock(&ours) == DockerSock::Kiri;
+    let linked = docker_sock_at_ours(&ours) == Endpoint::Kiri;
     if !linked && !Path::new(SOCKET_DAEMON).exists() {
         return Ok(());
     }
@@ -533,31 +503,15 @@ pub fn after_tools() -> io::Result<()> {
 
 /// The context, as `docker context create kiri --docker host=…` writes it.
 fn context(socket: &Path) -> io::Result<()> {
-    let meta = json!({
-        "Name": CONTEXT.get(),
-        "Metadata": {"Description": crate::flavor::APP.get()},
-        "Endpoints": {"docker": {"Host": format!("unix://{}", socket.display()), "SkipTLSVerify": false}},
-    });
-    write_json(&context_dir(CONTEXT.get())?.join("meta.json"), &meta)
+    crate::dockerctx::write_context(&context_dir(CONTEXT.get())?, CONTEXT.get(), crate::flavor::APP.get(), &format!("unix://{}", socket.display()))
 }
 
 /// Makes `name` the context plain `docker` uses: Kiri's own (made first if
 /// missing), "default", or another context that exists, to switch back to.
 pub fn use_context(name: &str) -> io::Result<()> {
-    if name == CONTEXT.get() {
-        context(&crate::daemon::socket_path()?)?;
-    } else if name != "default" && !context_dir(name)?.join("meta.json").is_file() {
-        return Err(io::Error::other(format!("there is no docker context `{name}`")));
-    }
-    let path = docker_dir()?.join("config.json");
-    let mut cfg = read_json(&path)?;
-    match cfg.as_object_mut() {
-        Some(o) if name == "default" => {
-            o.remove("currentContext");
-        }
-        _ => cfg["currentContext"] = name.into(),
-    }
-    write_json(&path, &cfg)
+    let dir = docker_dir()?;
+    let host = format!("unix://{}", crate::daemon::socket_path()?.display());
+    crate::dockerctx::switch(&dir, &context_dir(name)?, name, CONTEXT.get(), crate::flavor::APP.get(), &host)
 }
 
 /// Links `kiri` and the app's `docker` into `~/.kiri/bin`, puts that
@@ -768,7 +722,7 @@ fn default_context() -> io::Result<()> {
     let h = home()?;
     // Kiri's own /var/run/docker.sock is not another engine.
     let ours = crate::daemon::socket_path()?;
-    let system = !matches!(docker_sock(&ours), DockerSock::Kiri) && Path::new(DOCKER_SOCK).exists();
+    let system = !matches!(docker_sock_at_ours(&ours), Endpoint::Kiri) && Path::new(DOCKER_SOCK).exists();
     let other = system
         || [h.join(".orbstack/run/docker.sock"), h.join(".docker/run/docker.sock")].iter().any(|p| p.exists())
         || Path::new("/Applications/OrbStack.app").exists()
@@ -1069,11 +1023,11 @@ mod tests {
 
     #[test]
     fn docker_sock_owner() {
-        use super::DockerSock::*;
+        use crate::dockerctx::Endpoint::*;
         let d = scratch("sock");
         let ours = d.join("kiri/run/docker.sock");
         let link = d.join("docker.sock");
-        let at = |engines: &[std::path::PathBuf]| super::docker_sock_at(&link, &ours, engines);
+        let at = |engines: &[std::path::PathBuf]| crate::dockerctx::sock_at(&link, &ours, engines);
         assert_eq!(at(&[]), Free);
         std::os::unix::fs::symlink(&ours, &link).unwrap();
         assert_eq!(at(&[]), Kiri, "Kiri's link, even with the daemon stopped");
