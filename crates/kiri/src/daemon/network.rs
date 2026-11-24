@@ -97,7 +97,12 @@ pub fn parse_ip6(s: &str) -> Option<[u8; 16]> {
 }
 
 fn mask6(prefix: u8) -> u128 {
-    if prefix == 0 { 0 } else { u128::MAX << (128 - prefix as u32) }
+    match prefix {
+        // Not parsed this way (and never serialized), but `networks.json`
+        // holds plain bytes and a bad one must not panic the shifts.
+        0 | 129.. => 0,
+        p => u128::MAX << (128 - p as u32),
+    }
 }
 
 pub fn in_subnet6(ip: [u8; 16], subnet: [u8; 16], prefix: u8) -> bool {
@@ -139,8 +144,13 @@ impl V6 {
         let base = u128::from_be_bytes(self.subnet);
         let (first, last) = match self.ip_range {
             Some((r, p)) => {
-                let start = u128::from_be_bytes(r) - base;
-                (start.max(1), (start + !mask6(p)).min(self.last()))
+                // `wrapping_sub` and `saturating_add` because `networks.json`
+                // holds plain bytes: an ip-range outside the subnet, or a span
+                // past the top of the address space, must not panic or wrap
+                // into a wrong range (the request path checks both; an old or
+                // hand-edited file may not).
+                let start = u128::from_be_bytes(r).wrapping_sub(base);
+                (start.max(1), start.saturating_add(!mask6(p)).min(self.last()))
             }
             None => (1, self.last()),
         };
@@ -193,18 +203,29 @@ impl Network {
     /// The next free address, skipping the network, broadcast, gateway and
     /// auxiliary addresses and `avoid`; only from `--ip-range` when one is set.
     fn allocate_avoiding(&mut self, avoid: &[[u8; 4]]) -> Option<[u8; 4]> {
-        let base = u32::from_be_bytes(self.subnet);
-        let size = 1u32 << (32 - self.prefix as u32);
+        let base = u32::from_be_bytes(self.subnet) as u64;
+        // In `u64`, with the size clamped, because `networks.json` holds plain
+        // bytes: a prefix past /32 (or the /0 the request path refuses) must
+        // not panic the shift, and a subnet too small for host parts must run
+        // out of addresses, not underflow. The request path already checks
+        // both (`parse_ipam`, /8..=/30).
+        let size = 1u64 << (32 - self.prefix.min(32) as u32);
         let (first, last) = match self.ip_range {
             Some((r, p)) => {
-                let start = u32::from_be_bytes(r) - base;
-                (start.max(1), (start + (1u32 << (32 - p as u32)) - 1).min(size - 2))
+                let start = (u32::from_be_bytes(r).wrapping_sub(base as u32)) as u64;
+                (start.max(1), (start + (1u64 << (32 - p.min(32) as u32)) - 1).min(size.saturating_sub(2)))
             }
-            None => (1, size - 2),
+            None => (1, size.saturating_sub(2)),
         };
-        let host = (first..=last).find(|h| !self.used.contains(h) && !self.reserved((base + h).to_be_bytes()) && !avoid.contains(&(base + h).to_be_bytes()))?;
+        let host = (first..=last).find(|h| {
+            // An address past the end of the space (`base + h` over u32) is no
+            // address to hand out.
+            let Ok(ip) = u32::try_from(base + h).map(|a| a.to_be_bytes()) else { return false };
+            !self.used.contains(&(*h as u32)) && !self.reserved(ip) && !avoid.contains(&ip)
+        })?;
+        let host = host as u32;
         self.used.insert(host);
-        Some((base + host).to_be_bytes())
+        u32::try_from(base + host as u64).ok().map(|a| a.to_be_bytes())
     }
 
     /// Whether a container may ask for `ip` here (`--ip`, Compose
@@ -220,8 +241,8 @@ impl Network {
         if !self.user_subnet {
             return Err("user specified IP address is supported only when connecting to networks with user configured subnets".into());
         }
-        let size = 1u32 << (32 - self.prefix as u32);
-        let host = u32::from_be_bytes(ip).wrapping_sub(u32::from_be_bytes(self.subnet));
+        let size = 1u64 << (32 - self.prefix.min(32) as u32);
+        let host = u32::from_be_bytes(ip).wrapping_sub(u32::from_be_bytes(self.subnet)) as u64;
         if !self.contains(ip) || host == 0 || host == size - 1 {
             return Err(format!("no configured subnet or ip-range contain the IP address {}", ip_str(ip)));
         }
@@ -418,7 +439,9 @@ pub struct Ipam {
 }
 
 pub fn in_subnet(ip: [u8; 4], subnet: [u8; 4], prefix: u8) -> bool {
-    let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix as u32) };
+    // `min(32)` because `networks.json` holds plain bytes; a prefix past /32
+    // must not panic the shift (the request path already refuses one).
+    let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix.min(32) as u32) };
     u32::from_be_bytes(ip) & mask == u32::from_be_bytes(subnet)
 }
 
@@ -1187,6 +1210,24 @@ mod tests {
         assert!(bad(serde_json::json!({"Subnet": "10.5.0.0/24", "IPRange": "10.5.0.0/16"})).contains("ip-range"));
         assert!(bad(serde_json::json!({"Subnet": "10.5.0.0/24", "AuxiliaryAddresses": {"a": "10.9.0.1"}})).contains("auxiliary address a"));
         assert!(parse_ipam(&serde_json::json!({"Driver": "other"})).is_err());
+        // A subnet too small for the arithmetic (a /0 could panic the size
+        // shift; a /31 or /32 has no room for a gateway and a container) and
+        // an ip-range outside the subnet are refused, as Docker does.
+        assert_eq!(bad(serde_json::json!({"Subnet": "0.0.0.0/0"})), "invalid subnet 0.0.0.0/0: Kiri supports prefixes from /8 to /30");
+        assert_eq!(bad(serde_json::json!({"Subnet": "10.5.0.0/31"})), "invalid subnet 10.5.0.0/31: Kiri supports prefixes from /8 to /30");
+        assert!(bad(serde_json::json!({"Subnet": "10.5.0.0/24", "IPRange": "10.6.0.0/24"})).contains("parent subnet 10.5.0.0/24 does not contain ip-range"));
+    }
+
+    /// A /30, the smallest user subnet the request path takes, still creates
+    /// and hands out its one container address; its `--ip-range` picks it.
+    #[test]
+    fn the_smallest_allowed_subnet_still_creates_and_allocates() {
+        let (mut n, dir) = nets();
+        let ipam = parse_ipam(&serde_json::json!({"Config": [{"Subnet": "10.6.0.0/30", "IPRange": "10.6.0.2/32"}]})).unwrap().unwrap();
+        let net = n.create("tiny", Settings { ipam: Some(ipam), ..Default::default() }).unwrap();
+        assert_eq!((net.subnet, net.prefix), ([10, 6, 0, 0], 30));
+        assert_eq!(n.allocate_avoiding("tiny", &[]), Some([10, 6, 0, 2]));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

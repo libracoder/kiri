@@ -126,7 +126,12 @@ fn status_of(e: Error) -> (u16, String) {
         Error::BadRequest(m) => (400, m),
         Error::Unauthorized(m) => (401, m),
         Error::Forbidden(m) => (403, m),
-        Error::Io(e) => (500, e.to_string()),
+        // The client gets a generic fixed message; the real error, which can
+        // hold host paths and syscall text, goes to the diagnostics only.
+        Error::Io(e) => {
+            crate::diag::warn!("daemon request failed", error = e);
+            (500, "internal error".into())
+        }
     }
 }
 
@@ -2554,14 +2559,15 @@ pub(super) fn limits_from(h: &Value, base: super::engine::Limits) -> Result<supe
     }
     if let Some(q) = h["CpuQuota"].as_i64().filter(|q| *q > 0) {
         l.cpu_quota = q as u64;
-        l.cpu_period = h["CpuPeriod"].as_u64().filter(|p| *p > 0).unwrap_or(100_000) as u32;
+        l.cpu_period = u32::try_from(h["CpuPeriod"].as_u64().filter(|p| *p > 0).unwrap_or(100_000))
+            .map_err(|_| Error::BadRequest("CpuPeriod is too large".into()))?;
     }
     if let Some(shares) = h["CpuShares"].as_u64().filter(|s| *s > 0) {
         l.cpu_shares = shares;
         l.cpu_weight = cpu_weight(shares);
     }
     if let Some(p) = h["PidsLimit"].as_i64().filter(|p| *p > 0) {
-        l.pids_max = p as u32;
+        l.pids_max = u32::try_from(p).map_err(|_| Error::BadRequest("PidsLimit is too large".into()))?;
     }
     Ok(l)
 }
@@ -2592,9 +2598,11 @@ pub(super) fn restart_policy(v: &Value, creating: bool) -> Result<RestartPolicy,
             "invalid restart policy: maximum retry count can only be used with 'on-failure'".into(),
         ));
     }
+    let max_retries = u32::try_from(max_retries)
+        .map_err(|_| Error::BadRequest("invalid restart policy: maximum retry count is too large".into()))?;
     Ok(RestartPolicy {
         name: name.to_owned(),
-        max_retries: max_retries as u32,
+        max_retries,
     })
 }
 
@@ -6065,6 +6073,18 @@ mod tests {
         assert_eq!(status_of(copy_error("notdir: extraction point is not a directory: /x")), (400, "extraction point is not a directory: /x".to_owned()));
     }
 
+    /// An I/O error used to reach API clients with `e.to_string()`, which can
+    /// hold host paths and syscall text; they get a generic fixed message now
+    /// and the detail only goes to the diagnostics.
+    #[test]
+    fn an_io_error_is_reported_as_a_generic_internal_error() {
+        let (status, m) = status_of(Error::Io(io::Error::other("/Users/jake/.kiri/containers.json: permission denied (os error 13)")));
+        assert_eq!(status, 500);
+        assert_eq!(m, "internal error");
+        assert!(!m.contains('/'), "an absolute path leaked: {m:?}");
+        assert!(!m.contains("io::"), "io::Error text leaked: {m:?}");
+    }
+
     #[test]
     fn intel_macs_refuse_images_without_amd64() {
         let p = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
@@ -6530,6 +6550,13 @@ mod network_option_tests {
         }
         let l = super::limits_from(&json!({"CpuShares": 1024}), Default::default()).unwrap();
         assert_eq!((l.cpu_shares, l.cpu_weight), (1024, 100));
+        // Limits above `u32::MAX` were silently truncated (`as u32`); they are
+        // a 400 now, while a legal `CpuPeriod` still round-trips.
+        let big = (u32::MAX as u64) + 1;
+        assert!(matches!(limits_from(&json!({"CpuQuota": 100_000, "CpuPeriod": big}), Default::default()), Err(Error::BadRequest(_))));
+        assert!(matches!(limits_from(&json!({"PidsLimit": big}), Default::default()), Err(Error::BadRequest(_))));
+        assert!(matches!(restart_policy(&json!({"Name": "on-failure", "MaximumRetryCount": big as i64}), true), Err(Error::BadRequest(_))));
+        assert_eq!(limits_from(&json!({"CpuQuota": 100_000, "CpuPeriod": 50_000}), Default::default()).unwrap().cpu_period, 50_000);
         // Rises with the shares, never backwards.
         let mut last = 0;
         for s in 2..5000 {

@@ -1090,9 +1090,16 @@ struct Records {
     on_disk: Option<(usize, u64)>,
 }
 
-/// Lowest unused `eth{n}` interface index at or above `min`.
-fn free_eth(c: &Container, min: u32) -> u32 {
-    (min..).find(|n| c.first_if != Some(*n) && !c.extra_ifs.iter().any(|(_, x)| x == n)).expect("a free number")
+/// The highest interface `free_eth` will scan to (there is never more than
+/// one per network, but a damaged `containers.json` could claim any number:
+/// the bound keeps a broken file from a near-u32 scan under the engine lock).
+/// The caller turns running out into a Conflict, so `connect` fails, not hangs.
+const MAX_ETH_IFS: u32 = 4095;
+
+/// The lowest unused `eth{n}` interface index at or above `min`; `None` when
+/// nothing in the range is free.
+fn free_eth(c: &Container, min: u32) -> Option<u32> {
+    (min..=MAX_ETH_IFS).find(|n| c.first_if != Some(*n) && !c.extra_ifs.iter().any(|(_, x)| x == n))
 }
 
 /// Reconstructs port bindings to target a newly promoted network IP while
@@ -4672,7 +4679,9 @@ impl Engine {
                 return Ok(());
             }
             let min = if was_left_all { 0 } else { 1 };
-            let n = free_eth(c, min);
+            let Some(n) = free_eth(c, min) else {
+                return Err(Error::Conflict(format!("container {} has no free interface number left to attach network {}", c.name, net.name)));
+            };
             let ports = if was_left_all { c.spec.ports.clone() } else { Vec::new() };
             (n, was_left_all, ports)
         };
@@ -8741,8 +8750,8 @@ mod leave_first_network_tests {
             assert_eq!(c.first_if, Some(1));
             assert!(c.extra_ips.is_empty());
             assert!(c.extra_ifs.is_empty());
-            assert_eq!(super::free_eth(c, 0), 0, "eth0 was freed");
-            assert_eq!(super::free_eth(c, 1), 2, "eth1 stays in use by probe-net");
+            assert_eq!(super::free_eth(c, 0), Some(0), "eth0 was freed");
+            assert_eq!(super::free_eth(c, 1), Some(2), "eth1 stays in use by probe-net");
         }
         assert_eq!(engine.lock_networks().allocate_avoiding("bridge", &[]), Some(bridge_ip), "left IP returned to pool");
         engine.lock_networks().release("bridge", bridge_ip);
@@ -8755,10 +8764,32 @@ mod leave_first_network_tests {
             assert_eq!(c.spec.network_mode, "none");
             assert_eq!(c.ip, None);
             assert_eq!(c.first_if, None);
-            assert_eq!(super::free_eth(c, 0), 0);
+            assert_eq!(super::free_eth(c, 0), Some(0));
         }
         engine.lock_networks().reserve("probe-net", probe_ip).expect("promoted IP returned to pool");
         engine.lock_networks().release("probe-net", probe_ip);
+        done(engine, dir);
+    }
+
+    /// Every interface number taken (as a damaged `containers.json` could
+    /// claim): connecting reports a Conflict instead of scanning (or hanging,
+    /// before the bound) for a free one under the engine lock.
+    #[test]
+    fn connecting_with_every_interface_taken_is_a_conflict_not_a_hang() {
+        let (engine, id, dir) = engine("eths-exhaust", &[("x", false)]);
+        connect(&engine, "x", &id, &["web"], "");
+        {
+            let mut st = engine.lock();
+            let c = st.containers.get_mut(&id).unwrap();
+            c.status = Status::Running;
+            c.first_if = Some(0);
+            c.extra_ifs = (1..=MAX_ETH_IFS).map(|n| (format!("n{n}"), n)).collect();
+        }
+        let ipam = parse_ipam(&serde_json::json!({"Config": [{"Subnet": "10.98.9.0/24"}]})).unwrap();
+        engine.lock_networks().create("y", Settings { ipam, ..Default::default() }).unwrap();
+        let e = engine.connect("y", &id, Vec::new(), String::new(), String::new(), String::new()).unwrap_err();
+        let Error::Conflict(m) = &e else { panic!("a Conflict was expected, got {e:?}") };
+        assert!(m.contains("no free interface number"), "got {e:?}");
         done(engine, dir);
     }
 
