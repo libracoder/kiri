@@ -243,7 +243,11 @@ fn watch(tx: Sender<Cmd>) {
             }
             // A Kubernetes node already running gets its kubectl context.
             crate::k8s::sync_soon();
-            let _ = client::events(|_| tx.send(Cmd::Refresh).is_ok());
+            crate::watch::notify_containers_changed();
+            let _ = client::events(|_| {
+                crate::watch::notify_containers_changed();
+                tx.send(Cmd::Refresh).is_ok()
+            });
         }
         std::thread::sleep(Duration::from_secs(1));
     });
@@ -899,6 +903,7 @@ pub fn prefs() -> Value {
     if p.get("theme").is_none() {
         p["theme"] = "dark".into();
     }
+    p["watchBindMounts"] = json!(crate::watch::is_enabled());
     p
 }
 
@@ -914,6 +919,15 @@ pub fn trf(en: &str, vars: &[(&str, &dyn std::fmt::Display)]) -> String {
 }
 
 fn set_pref(name: &str, value: Value) {
+    if name == "watchBindMounts" {
+        let on = value.as_bool().unwrap_or(false);
+        if crate::watch::save_enabled(on).is_err() {
+            emit(notice("error", &trf("Could not save the setting to {path}", &[("path", &"%LOCALAPPDATA%\\Kiri\\settings.json")])));
+            return;
+        }
+        crate::watch::set_enabled(crate::watch::is_enabled());
+        return;
+    }
     if !matches!(name, "font" | "mono" | "scale" | "termH" | "termFs" | "termFont" | "domainsAsked" | "theme" | "accent" | "starAsked" | "updateAuto" | "lang" | "langAsked") {
         return;
     }

@@ -244,6 +244,8 @@ fn route(req: &Request, engine: &Arc<Engine>, caller: Caller, w: &mut UnixStream
         ("POST", "/build/prune") => return reply(w, super::builder::prune(req, engine), 200),
         ("GET", "/kiri/builder") => return reply(w, Ok(super::builder::settings_report(engine)), 200),
         ("POST", "/kiri/builder") => return reply(w, super::builder::set_settings(req).map(|()| super::builder::settings_report(engine)), 200),
+        ("GET", "/kiri/watch-roots") => return reply(w, Ok(watch_roots(engine)), 200),
+        ("POST", "/kiri/fs-events") => return reply(w, fs_events(req, engine), 204),
         ("GET", "/images/json") => return reply(w, images(req, engine), 200),
         ("POST", "/images/create") if req.query("fromSrc").is_some_and(|s| !s.is_empty()) => return image_import(req, engine, w, r),
         ("POST", "/images/create") => return pull(req, engine, w),
@@ -1064,6 +1066,48 @@ fn set_env(req: &Request, engine: &Engine, id: &str) -> Result<Value, Error> {
         engine.wait(id, "not-running")?;
         engine.start(id)?;
     }
+    Ok(Value::Null)
+}
+
+/// Active WSL drive bind sources of running containers, for `kiri-win`'s
+/// opt-in bind-mount watcher.
+fn watch_roots(engine: &Engine) -> Value {
+    let root = super::binds::wsl().map_or("/mnt/", |w| w.root.as_str());
+    json!({
+        "automount_root": root,
+        "roots": engine.wsl_bind_sources(root),
+    })
+}
+
+/// Parses `POST /kiri/fs-events` (`{"events": ["OP\tPATH", ...]}` or newline-
+/// separated `OP\tPATH` text), filters to valid WSL automount paths under
+/// `automount_root` with no `..` traversal, and caps per-request volume. OP is
+/// a change (`C`, `M`, `A`, `D`) or a watched root's pin (`P`) or unpin (`U`).
+fn parse_fs_events(body: &[u8], automount_root: &str) -> Result<Vec<String>, Error> {
+    const MAX_EVENTS: usize = 4096;
+    let raw: Vec<String> = if body.iter().find(|b| !b.is_ascii_whitespace()) == Some(&b'{') {
+        let v: Value = serde_json::from_slice(body).map_err(|e| Error::BadRequest(format!("invalid JSON: {e}")))?;
+        strings(&v["events"]).ok_or_else(|| Error::BadRequest("events must be a list of OP\\tPATH lines".into()))?
+    } else {
+        let text = std::str::from_utf8(body).map_err(|_| Error::BadRequest("invalid UTF-8 body".into()))?;
+        text.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect()
+    };
+    if raw.len() > MAX_EVENTS {
+        return Err(Error::BadRequest(format!("too many events ({}, limit is {MAX_EVENTS})", raw.len())));
+    }
+    Ok(raw
+        .into_iter()
+        .filter(|line| {
+            let Some((op, path)) = line.split_once('\t') else { return false };
+            matches!(op, "C" | "M" | "A" | "D" | "P" | "U") && super::binds::is_wsl_drive_path(path, automount_root, false)
+        })
+        .collect())
+}
+
+fn fs_events(req: &Request, engine: &Engine) -> Result<Value, Error> {
+    let root = super::binds::wsl().map_or("/mnt/", |w| w.root.as_str());
+    let lines = parse_fs_events(&req.body, root)?;
+    engine.send_fs_events(&lines);
     Ok(Value::Null)
 }
 
@@ -4465,7 +4509,7 @@ mod tests {
         };
         let mut routes = kiri_routes(body_of(include_str!("api.rs"), "\nfn route("));
         routes.extend(kiri_routes(body_of(include_str!("ops.rs"), "\npub fn route(")));
-        for known in [("POST", "/kiri/stop"), ("POST", "/kiri/sleep"), ("POST", "/kiri/registries"), ("PUT", "/kiri/proxy/system"), ("POST", "/kiri/builder"), ("POST", "/kiri/containers/1/ports"), ("DELETE", "/kiri/k8s/forward/1")] {
+        for known in [("POST", "/kiri/stop"), ("POST", "/kiri/sleep"), ("POST", "/kiri/registries"), ("PUT", "/kiri/proxy/system"), ("POST", "/kiri/builder"), ("POST", "/kiri/containers/1/ports"), ("DELETE", "/kiri/k8s/forward/1"), ("GET", "/kiri/watch-roots"), ("POST", "/kiri/fs-events")] {
             assert!(routes.iter().any(|(m, p)| (m.as_str(), p.as_str()) == known), "{known:?} not found in route(): {routes:?}");
         }
         for (m, p) in &routes {
@@ -4484,13 +4528,60 @@ mod tests {
         }
     }
 
+    #[test]
+    fn fs_events_parsing_validates_paths_and_rejects_traversal() {
+        let json_body = br#"{"events":["M\t/mnt/c/Users/me/app.js","D\t/etc/passwd","C\t/mnt/c/../etc/shadow","X\t/mnt/c/a","C\t/mnt/d/new.ts"]}"#;
+        assert_eq!(parse_fs_events(json_body, "/mnt/").unwrap(), vec!["M\t/mnt/c/Users/me/app.js", "C\t/mnt/d/new.ts"]);
+        let text_body = b"M\t/mnt/c/test/app.js\nD\t/mnt/mac/Users/a\nP\t/mnt/c/test\nU\t/etc\n";
+        assert_eq!(parse_fs_events(text_body, "/mnt/").unwrap(), vec!["M\t/mnt/c/test/app.js", "P\t/mnt/c/test"]);
+        assert!(parse_fs_events(b"{not json", "/mnt/").is_err());
+        let too_many = vec!["M\t/mnt/c/a"; 4097].join("\n");
+        assert!(parse_fs_events(too_many.as_bytes(), "/mnt/").is_err());
+    }
+
+    #[test]
+    fn watch_roots_and_fs_events_endpoints_work_without_waking_vm() {
+        use std::io::{Read, Write};
+        let (root, engine) = engine_in("watch-roots", false);
+        // GET /kiri/watch-roots
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let served = std::thread::spawn({
+            let engine = engine.clone();
+            move || serve(server, engine, Caller::Host)
+        });
+        client.write_all(b"GET /kiri/watch-roots HTTP/1.1\r\nHost: d\r\nX-Kiri-Background: 1\r\nConnection: close\r\n\r\n").unwrap();
+        let mut got = String::new();
+        client.read_to_string(&mut got).unwrap();
+        served.join().unwrap().unwrap();
+        assert!(got.starts_with("HTTP/1.1 200 "), "{got}");
+        assert!(got.contains("\"automount_root\":\"/mnt/\""), "{got}");
+        assert!(got.contains("\"roots\":[]"), "{got}");
+
+        // POST /kiri/fs-events from Host returns 204 and does not wake VM
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let served = std::thread::spawn({
+            let engine = engine.clone();
+            move || serve(server, engine, Caller::Host)
+        });
+        let body = r#"{"events":["M\t/mnt/c/test/app.js"]}"#;
+        client.write_all(format!("POST /kiri/fs-events HTTP/1.1\r\nHost: d\r\nX-Kiri-Background: 1\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes()).unwrap();
+        let mut got = String::new();
+        client.read_to_string(&mut got).unwrap();
+        served.join().unwrap().unwrap();
+        assert!(got.starts_with("HTTP/1.1 204 "), "{got}");
+        assert!(!engine.is_awake());
+
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     /// Through the API itself: a container's Stop and settings are refused,
     /// and the engine stays as it was.
     #[test]
     fn a_containers_stop_and_settings_are_refused() {
         use std::io::{Read, Write};
         let (root, engine) = engine_in("container-gate", false);
-        for req in ["POST /v1.47/kiri/stop", "POST /kiri/sleep", "POST /kiri/registries", "POST /kiri/proxy", "POST /kiri/resources", "POST /kiri/domains", "DELETE /kiri/domains"] {
+        for req in ["POST /v1.47/kiri/stop", "POST /kiri/sleep", "POST /kiri/registries", "POST /kiri/proxy", "POST /kiri/resources", "POST /kiri/domains", "DELETE /kiri/domains", "POST /kiri/fs-events"] {
             let (mut client, server) = UnixStream::pair().unwrap();
             let served = std::thread::spawn({
                 let engine = engine.clone();

@@ -110,6 +110,10 @@ mod update;
 mod wslsync;
 #[cfg(any(windows, test))]
 mod refuse;
+// Opt-in Windows bind-mount watcher (ReadDirectoryChangesW -> /kiri/fs-events):
+// path mapping, buffer decoding and coalescing tested on any host.
+#[cfg(any(windows, test))]
+mod watch;
 // Settings → Import from Docker Desktop: the Mac's and Linux's own
 // crates/kiri/src/import.rs, through the docker CLI's contexts.
 #[cfg(windows)]
@@ -182,6 +186,7 @@ fn main() -> std::process::ExitCode {
         serve::log(&format!("dns on 127.0.0.1:53: {e}"));
     }
     engine::start(engine::Env { distro: cfg.distro.clone(), pipe: cfg.pipe.clone() });
+    watch::start_if_enabled();
     // Its folder renamed, moved or deleted around it (Windows won't delete
     // a running program itself): docker build handed back as it was before
     // Kiri took it, the choice kept for when Kiri runs again, and Kiri quits.

@@ -171,6 +171,40 @@ fn drive(wsl: &Wsl, letter: u8, rest: &str) -> String {
     clean(&format!("{}{}/{}", wsl.root, letter.to_ascii_lowercase() as char, rest.replace('\\', "/")))
 }
 
+/// Whether `path` is under WSL's automount root (`<automount_root><drive>/...`,
+/// or `<automount_root><drive>` when `allow_drive_root` is true), with no
+/// control characters and no `.` or `..` traversal components.
+pub fn is_wsl_drive_path(path: &str, automount_root: &str, allow_drive_root: bool) -> bool {
+    if !automount_root.starts_with('/') || !automount_root.ends_with('/') {
+        return false;
+    }
+    if path.contains(['\n', '\r', '\0']) {
+        return false;
+    }
+    let Some(rest) = path.strip_prefix(automount_root) else { return false };
+    let bytes = rest.as_bytes();
+    if bytes.is_empty() || !bytes[0].is_ascii_alphabetic() {
+        return false;
+    }
+    if bytes.len() == 1 {
+        return allow_drive_root;
+    }
+    if bytes[1] != b'/' {
+        return false;
+    }
+    let mut has_component = false;
+    for part in rest[2..].split('/') {
+        if part.is_empty() {
+            continue;
+        }
+        if part == "." || part == ".." {
+            return false;
+        }
+        has_component = true;
+    }
+    has_component || allow_drive_root
+}
+
 /// Single slashes, none at the end.
 fn clean(p: &str) -> String {
     let mut out = String::with_capacity(p.len());
@@ -534,5 +568,18 @@ mod tests {
         }
         assert_eq!(engine_socket_for("/srv/app.sock", "/x/docker.sock", none), None);
         assert_eq!(engine_socket_for("/srv/app.sock", "/x/docker.sock", &itself), None);
+    }
+
+    #[test]
+    fn wsl_drive_path_validation() {
+        assert!(is_wsl_drive_path("/mnt/c/Users/me/app", "/mnt/", false));
+        assert!(is_wsl_drive_path("/mnt/c", "/mnt/", true));
+        assert!(!is_wsl_drive_path("/mnt/c", "/mnt/", false));
+        assert!(!is_wsl_drive_path("/mnt/c/", "/mnt/", false));
+        assert!(!is_wsl_drive_path("/mnt/mac/Users/a", "/mnt/", true));
+        assert!(!is_wsl_drive_path("/etc/passwd", "/mnt/", true));
+        assert!(!is_wsl_drive_path("/mnt/c/../etc/passwd", "/mnt/", true));
+        assert!(!is_wsl_drive_path("/mnt/c/a\nb", "/mnt/", true));
+        assert!(is_wsl_drive_path("/windows/d/proj", "/windows/", false));
     }
 }

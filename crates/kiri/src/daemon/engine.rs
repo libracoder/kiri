@@ -2190,6 +2190,38 @@ impl Engine {
         out
     }
 
+    /// The WSL drive bind sources (`/mnt/<drive>` or `/mnt/<drive>/...`) of
+    /// running containers, under `automount_root` (e.g. `/mnt/`).
+    pub fn wsl_bind_sources(&self, automount_root: &str) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .lock()
+            .containers
+            .values()
+            .filter(|c| c.status == Status::Running)
+            .flat_map(|c| c.spec.mounts.iter())
+            .filter_map(|m| {
+                let src = m.split('\t').next()?;
+                super::binds::is_wsl_drive_path(src, automount_root, true).then(|| src.to_owned())
+            })
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// Forwards host file-change lines (`OP\tPATH`) to the running agent
+    /// without waking a sleeping or stopped VM/agent.
+    pub fn send_fs_events(&self, lines: &[String]) {
+        if lines.is_empty() {
+            return;
+        }
+        if let Some(vm) = self.awake() {
+            for chunk in lines.chunks(512) {
+                let _ = vm.fs_events(chunk);
+            }
+        }
+    }
+
     /// The VM's link while it runs, without waking it.
     #[cfg(target_os = "macos")]
     pub fn awake_link(&self) -> Option<Arc<VmLink>> {
