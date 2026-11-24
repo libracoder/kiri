@@ -24,6 +24,14 @@ rcgen = { version = "0.14", default-features = false, features = ["ring", "pem",
 # The `name` filter is a regular expression in Docker (k3d sends `^[/]?name$`).
 # regex-lite: RE2 syntax like Go's regexp, without the Unicode tables' size.
 regex-lite = "0.1"
+# The built-in builder (daemon/grpc.rs): buildx's docker driver speaks gRPC
+# over HTTP/2 cleartext. The control path is a raw byte tunnel; the session
+# path needs h2 to open buildkitd's Control.Session stream. `tokio` runs only
+# these sessions; the engine stays thread-based, without a full runtime.
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "io-util", "time", "sync"] }
+h2 = "0.4"
+http = "1"
+bytes = "1"
 
 [target.'cfg(any(unix, windows))'.dependencies]
 libc = "0.2"

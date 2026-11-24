@@ -129,6 +129,32 @@ fn config_toml(limit: u64, registries: &str) -> String {
     )
 }
 
+/// buildkitd.toml for the built-in builder (grpc.rs): the same content the
+/// builder container gets at each start, so both builders share the cache
+/// limits and the `FROM` mirror.
+pub(crate) fn guest_config(engine: &Engine) -> String {
+    let names = super::mirror::registry_names(engine);
+    // On a Linux host buildkitd runs on the host itself, so the build mirror
+    // must be at 127.0.0.1, not at the address the guest would use.
+    let host_net = cfg!(target_os = "linux");
+    let current = Registries::now(&names, host_net);
+    config_toml(cache_limit(), &super::mirror::config_for(engine, &current.config, &names, host_net))
+}
+
+/// The pinned BuildKit image's layers, newest first, for `BuildkitStart`.
+/// Pulls the image if needed and unpacks the layers into the guest: the relay
+/// cannot point buildkitd at layer directories that are not there yet (PR #89
+/// review).
+pub(crate) fn guest_layers(engine: &Engine, say: &mut dyn FnMut(&str)) -> Result<Vec<String>, Error> {
+    let image = ensure_image(engine, say)?;
+    let _pin = engine.pin_layers(image.layers.iter().map(|l| l.digest.as_str()));
+    if !image.layers.is_empty() {
+        let vm = engine.vm()?;
+        engine.ensure_layers(&vm, image.layers.iter().map(|l| (l.digest.as_str(), l.media_type.as_str())))?;
+    }
+    Ok(image.layers.iter().rev().map(|l| l.digest.clone()).collect())
+}
+
 /// `GET /kiri/builder`: the settings and the builder's state.
 pub fn settings_report(engine: &Engine) -> Value {
     let s = settings();
@@ -167,7 +193,7 @@ pub fn set_settings(req: &Request) -> Result<(), Error> {
 // --- The container -------------------------------------------------------
 
 /// The BuildKit image, pulled (by [`PINNED`]) if it isn't here yet.
-fn ensure_image(engine: &Engine, say: &mut dyn FnMut(&str)) -> Result<kiri_image::Image, Error> {
+pub(crate) fn ensure_image(engine: &Engine, say: &mut dyn FnMut(&str)) -> Result<kiri_image::Image, Error> {
     if let Some(i) = engine.image(IMAGE)? {
         return Ok(i);
     }

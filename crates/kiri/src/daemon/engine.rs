@@ -3309,7 +3309,7 @@ impl Engine {
 
     /// Sends the guest every layer of these (digest, media type) it doesn't
     /// have unpacked, from the blob store.
-    fn ensure_layers<'a>(&self, vm: &VmLink, layers: impl Iterator<Item = (&'a str, &'a str)>) -> io::Result<()> {
+    pub(super) fn ensure_layers<'a>(&self, vm: &VmLink, layers: impl Iterator<Item = (&'a str, &'a str)>) -> io::Result<()> {
         let _one_at_a_time = self.layers.lock().unwrap_or_else(|e| e.into_inner());
         for (digest, media_type) in layers {
             if !vm.has_layer(digest)? {
@@ -4395,6 +4395,27 @@ impl Engine {
         kiri_proto::encode_copy(&mut out, op, &id, path, flags, &layers, &mounts);
         std::io::Write::write_all(&mut std::fs::File::from(stream.fd.try_clone()?), &out)?;
         Ok(stream)
+    }
+
+    /// A new stream into the guest's BuildKit relay (daemon/grpc.rs), which
+    /// the agent keeps pointing at buildkitd. Boots the VM if it is asleep.
+    pub fn buildkit_connect(&self) -> Result<kiri_vmm::VsockStream, Error> {
+        Ok(self.vm()?.connect(kiri_proto::BUILDKIT_PORT)?)
+    }
+
+    /// Tells the guest buildkitd (its builder root process) must be running
+    /// and has today's config. Boots the VM if it is asleep.
+    pub fn buildkit_start(&self, layers: &[String], config: &str) -> Result<(), Error> {
+        Ok(self.vm()?.buildkit_start(layers, config)?)
+    }
+
+    /// Tells the guest buildkitd is not needed any more: its sessions are
+    /// idle. Answers `Ok` even if the VM is asleep (it stopped with it).
+    pub fn buildkit_stop(&self) -> io::Result<()> {
+        match self.awake() {
+            Some(vm) => vm.buildkit_stop(),
+            None => Ok(()),
+        }
     }
 
     /// Running containers' domains, for the router's "not found" page.

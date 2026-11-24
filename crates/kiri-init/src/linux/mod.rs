@@ -1,4 +1,5 @@
 mod agent;
+mod buildkit;
 mod cgroup;
 mod container;
 mod devices;

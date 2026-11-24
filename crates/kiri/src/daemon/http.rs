@@ -97,6 +97,12 @@ impl Request {
         self.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)).map(|(_, v)| v.as_str())
     }
 
+    /// All headers, for the BuildKit session proxy: buildkitd registers a
+    /// session from the `X-Docker-Expose-Session-*` headers of the upgrade.
+    pub fn headers(&self) -> &[(String, String)] {
+        &self.headers
+    }
+
     /// The connection closes after this request's response: the client
     /// sent `Connection: close` (Docker.DotNet does on every request), or
     /// spoke HTTP/1.0 without `Connection: keep-alive` (RFC 9112 §9.3), as
@@ -909,6 +915,13 @@ pub fn upgrade_if_asked(req: &Request, w: &mut impl Write) -> io::Result<()> {
         return upgrade(w);
     }
     head(w, 200, "Content-Type: application/vnd.docker.raw-stream\r\n")?;
+    w.flush()
+}
+
+/// Answers buildx's `Upgrade: h2c` on `/grpc` or `/session` with `101`. After
+/// this the connection is HTTP/2 cleartext and belongs to the BuildKit relay.
+pub fn h2c_upgrade(w: &mut impl Write) -> io::Result<()> {
+    head(w, 101, "Connection: Upgrade\r\nUpgrade: h2c\r\n")?;
     w.flush()
 }
 

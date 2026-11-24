@@ -147,6 +147,11 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
     // USB passthrough (VM only: on a Linux host containers see the host's devices).
     let usb = if host_process { None } else { super::usb::listen().inspect_err(|e| eprintln!("kiri-init: no USB passthrough: {e}")).ok() };
     let udp = super::relay::listen_udp()?;
+    // BuildKit: the daemon's sessions to its builder root process (buildkit.rs).
+    // Kept even if listening fails (an older guest image): builds then fail
+    // with a clear message instead of the whole agent.
+    let buildkit_listener = super::relay::listen_buildkit().inspect_err(|e| eprintln!("kiri-init: no buildkit listener: {e}")).ok();
+    let mut buildkit = super::buildkit::Buildkit::default();
     let pressure = memory_pressure_trigger();
     let mut last_pressure = std::time::Instant::now() - std::time::Duration::from_secs(1);
     // `docker system df`: measured in a child process (never a thread: see
@@ -184,6 +189,7 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
         fds.push(libc::pollfd { fd: copies.as_raw_fd(), events: libc::POLLIN, revents: 0 });
         fds.push(libc::pollfd { fd: usb.as_ref().map_or(-1, |l| l.as_raw_fd()), events: libc::POLLIN, revents: 0 });
         fds.push(libc::pollfd { fd: udp.as_raw_fd(), events: libc::POLLIN, revents: 0 });
+        fds.push(libc::pollfd { fd: buildkit_listener.as_ref().map_or(-1, |l| l.as_raw_fd()), events: libc::POLLIN, revents: 0 });
         fds.push(libc::pollfd { fd: pressure.as_ref().map_or(-1, |f| f.as_raw_fd()), events: libc::POLLPRI, revents: 0 });
         fds.push(libc::pollfd { fd: term.as_ref().map_or(-1, |f| f.as_raw_fd()), events: libc::POLLIN, revents: 0 });
         fds.push(libc::pollfd { fd: firewall.as_ref().map_or(-1, |f| f.as_raw_fd()), events: libc::POLLIN, revents: 0 });
@@ -315,6 +321,12 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
                 super::usb::accept(l);
                 continue;
             }
+            if let Some(l) = buildkit_listener.as_ref().filter(|l| l.as_raw_fd() == pfd.fd) {
+                while let Some(r) = super::relay::accept_buildkit(l) {
+                    relays.push(r);
+                }
+                continue;
+            }
             if pfd.fd == copies.as_raw_fd() {
                 // Nothing may enter a container before its root is in
                 // place: one still making it is copied through its mounted
@@ -404,7 +416,10 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
 
         if fds[1].revents != 0 {
             drain_signals(&sigfd);
-            reap(procs);
+            for pid in reap(procs) {
+                // Not a container this time: the builder root process.
+                buildkit.reaped(pid);
+            }
         }
 
         // Report processes that have exited and whose output is fully read,
@@ -904,6 +919,14 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
                     },
                     None => Msg::Error(&format!("container {id} is not running")).encode(&mut out),
                 },
+                Ok(Msg::BuildkitStart { layers, config }) => match buildkit.ensure(&paths.layers, layers, config) {
+                    Ok(()) => Msg::Ack.encode(&mut out),
+                    Err(e) => Msg::Error(&format!("buildkit: {e}")).encode(&mut out),
+                },
+                Ok(Msg::BuildkitStop) => {
+                    buildkit.stop();
+                    Msg::Ack.encode(&mut out)
+                }
                 Ok(other) => Msg::Error(&format!("unexpected {other:?}")).encode(&mut out),
                 // A frame the host expects no reply to gets none, decoded
                 // or not: an answer would be read as the next one's reply.
@@ -1358,13 +1381,14 @@ fn running<'a>(procs: &'a HashMap<libc::pid_t, Proc>, id: &str) -> Option<&'a Pr
     procs.values().find(|p| p.run.id == id && p.exited.is_none())
 }
 
-fn reap(procs: &mut HashMap<libc::pid_t, Proc>) {
+fn reap(procs: &mut HashMap<libc::pid_t, Proc>) -> Vec<libc::pid_t> {
+    let mut unknown: Vec<libc::pid_t> = Vec::new();
     loop {
         let mut status = 0;
         // SAFETY: plain waitpid on any child.
         let pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
         if pid <= 0 {
-            return;
+            return unknown;
         }
         let code = if libc::WIFEXITED(status) {
             libc::WEXITSTATUS(status)
@@ -1379,6 +1403,8 @@ fn reap(procs: &mut HashMap<libc::pid_t, Proc>) {
             // Nobody will read input any more.
             p.input.clear();
             p.run.stdin = None;
+        } else {
+            unknown.push(pid);
         }
     }
 }
