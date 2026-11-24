@@ -563,7 +563,7 @@ const IDLE: Duration = Duration::from_secs(90);
 /// hop is checked (never from HTTPS down to plain HTTP to a host the list
 /// does not allow, credentials only to the origin first asked).
 fn shared_agent() -> ureq::Agent {
-    static AGENT: Mutex<Option<(ProxyChoice, ureq::Agent)>> = Mutex::new(None);
+    static AGENT: Mutex<Option<(ProxyChoice, u64, ureq::Agent)>> = Mutex::new(None);
     cached_agent(&AGENT, false)
 }
 
@@ -573,15 +573,19 @@ fn shared_agent() -> ureq::Agent {
 /// goes to a verified connection. Made the first time a listed host is
 /// asked, never otherwise.
 fn insecure_agent() -> ureq::Agent {
-    static AGENT: Mutex<Option<(ProxyChoice, ureq::Agent)>> = Mutex::new(None);
+    static AGENT: Mutex<Option<(ProxyChoice, u64, ureq::Agent)>> = Mutex::new(None);
     cached_agent(&AGENT, true)
 }
 
-fn cached_agent(slot: &Mutex<Option<(ProxyChoice, ureq::Agent)>>, insecure: bool) -> ureq::Agent {
+fn cached_agent(slot: &Mutex<Option<(ProxyChoice, u64, ureq::Agent)>>, insecure: bool) -> ureq::Agent {
     let chosen = PROXY_SOURCE.get().and_then(|f| f());
+    // A host's roots arriving (kiri-win, from the Windows store) builds the
+    // verified agent again too.
+    let roots = if insecure { 0 } else { crate::roots::generation() };
     let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((c, agent)) = slot.as_ref()
+    if let Some((c, g, agent)) = slot.as_ref()
         && *c == chosen
+        && *g == roots
     {
         return agent.clone();
     }
@@ -597,9 +601,12 @@ fn cached_agent(slot: &Mutex<Option<(ProxyChoice, ureq::Agent)>>, insecure: bool
         // Redirects are followed by hand, hop by hop ([`Client::get_following`]).
         .max_redirects(0);
     // A listed host's certificate is not checked, as Docker reaches an
-    // insecure registry; every other agent keeps ureq's verified TLS.
+    // insecure registry; every other agent verifies against the merged roots
+    // so corporate proxies and private CAs trusted by the OS work (#303).
     if insecure {
         cfg = cfg.tls_config(crate::connect::unverified_tls_config());
+    } else {
+        cfg = cfg.tls_config(crate::tls_config(&crate::roots::trusted()));
     }
     if let Some(p) = proxy(chosen.clone()) {
         cfg = cfg.proxy(p);
@@ -607,7 +614,7 @@ fn cached_agent(slot: &Mutex<Option<(ProxyChoice, ureq::Agent)>>, insecure: bool
     // Happy Eyeballs rather than ureq's one address after another, so an
     // IPv6 address without a working route does not stall the pull.
     let agent = ureq::Agent::with_parts(cfg.build(), crate::connect::connector(), ureq::unversioned::resolver::DefaultResolver::default());
-    *slot = Some((chosen, agent.clone()));
+    *slot = Some((chosen, roots, agent.clone()));
     agent
 }
 
@@ -2445,7 +2452,11 @@ mod tests {
     }
 
     fn test_client() -> Client {
-        let cfg = ureq::Agent::config_builder().http_status_as_error(false).max_redirects(0).build();
+        let cfg = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .max_redirects(0)
+            .tls_config(crate::tls_config(&crate::roots::trusted()))
+            .build();
         let agent = ureq::Agent::with_parts(cfg, crate::connect::connector_with(Duration::from_millis(300)), ureq::unversioned::resolver::DefaultResolver::default());
         Client { agent, credentials: None, config: Default::default(), use_mirrors: true, mirror_scheme: None }
     }
@@ -2694,7 +2705,10 @@ mod tests {
         let root = std::env::temp_dir().join(format!("kiri-slow-cancel-test-{}", std::process::id()));
         let store = Store::open(&root).unwrap();
         let reference = Reference::parse(&format!("{host}/test/blob:1")).unwrap();
-        let config = ureq::Agent::config_builder().http_status_as_error(false).build();
+        let config = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .tls_config(crate::tls_config(&crate::roots::trusted()))
+            .build();
         let agent = ureq::Agent::with_parts(config, crate::connect::connector_with(Duration::from_secs(2)), ureq::unversioned::resolver::DefaultResolver::default());
         let client = Client { agent, credentials: None, config: Default::default(), use_mirrors: true, mirror_scheme: None };
         let _ = client.base(&host);
@@ -2726,7 +2740,10 @@ mod tests {
         let store = Store::open(&root).unwrap();
         let r = Reference::parse(&format!("{host}/test/blob:1")).unwrap();
         // Stalls only give up after 10 s: the cancel must not wait for that.
-        let cfg = ureq::Agent::config_builder().http_status_as_error(false).build();
+        let cfg = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .tls_config(crate::tls_config(&crate::roots::trusted()))
+            .build();
         let agent = ureq::Agent::with_parts(cfg, crate::connect::connector_with(Duration::from_secs(10)), ureq::unversioned::resolver::DefaultResolver::default());
         let client = Client { agent, credentials: None, config: Default::default(), use_mirrors: true, mirror_scheme: None };
         // A loopback registry's scheme is asked once (HTTPS, then HTTP):
@@ -4127,5 +4144,18 @@ mod tests {
             seen
         });
         (host, served)
+    }
+
+    /// The shared pull agent verifies against the merged roots, every one
+    /// of them and in order, not the bundled set only (#303).
+    #[test]
+    fn the_shared_agent_trusts_the_merged_roots() {
+        let agent = shared_agent();
+        let ureq::tls::RootCerts::Specific(certs) = agent.config().tls_config().root_certs() else {
+            panic!("the shared agent must trust a list of roots of its own");
+        };
+        let roots = crate::roots::trusted();
+        assert_eq!(certs.len(), roots.len());
+        assert!(certs.iter().zip(roots.iter()).all(|(a, b)| a.der() == b.as_ref()));
     }
 }

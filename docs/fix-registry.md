@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #303 TLS: trust the system certificate store across macOS, Linux and Windows, respecting distrusted roots and `KIRI_TLS_ROOTS=webpki` (unreleased)
+- Fixes: #303 Trust system certificate store (corporate / private CA roots) for image pulls, logins, updates, tool downloads and Share
+- Caused: none known
+- Caused by: -
+- Check: `tls-company-root-pull`, `tls-company-root-login`, `tls-unknown-root-refused`, `crates/kiri-image/src/roots.rs`, `crates/kiri/src/daemon/hostroots.rs`
+
 ### #768 Storage & WSL: detect read-only / `emergency_ro` storage filesystems and report actionable recovery steps (unreleased)
 - Fixes: #768 Windows (WSL 2) / Linux: when `ext4.vhdx` or `/var/lib/kiri` is remounted read-only (`emergency_ro`), overlayfs mounts container rootfs read-only or daemon startup fails with opaque `EROFS` errors instead of actionable `e2fsck` / storage recovery guidance
 - Caused: none known

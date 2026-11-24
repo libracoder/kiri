@@ -11,12 +11,14 @@ pub mod jsonfile;
 pub mod mirror;
 pub mod reference;
 pub mod registry;
+pub mod roots;
 pub mod storage;
 pub mod store;
 pub mod tags;
 
 pub use cancel::Cancel;
 pub use config::{Insecure, RegistryConfig};
+pub use connect::tls_config;
 pub use mirror::Mirror;
 pub use reference::Reference;
 pub use registry::{

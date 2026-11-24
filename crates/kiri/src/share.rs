@@ -401,15 +401,60 @@ fn server(cfg: &Config) -> Server {
     Server { host, port, dial }
 }
 
-fn tls_config(alpn: &[u8]) -> io::Result<Arc<rustls::ClientConfig>> {
+/// Largest `KIRI_SHARE_CA` PEM file accepted (2 MiB) and most certificates
+/// read from it, bounding memory even on hostile or misconfigured paths.
+const MAX_SHARE_CA_BYTES: u64 = 2 << 20;
+const MAX_SHARE_CA_CERTS: usize = 1024;
+
+/// The roots a Share tunnel verifies against: the system's roots merged
+/// with webpki's (like the registry client, #303), plus `share_ca`
+/// (`KIRI_SHARE_CA`), skipping any certificate rustls refuses to add —
+/// the same quiet skip as `platform_certs()` skipping load errors. The
+/// merged list comes from places the user doesn't curate (the keychain,
+/// `/etc/ssl`), so one anchor rustls won't take shouldn't take every
+/// tunnel down. `share_ca`, unlike the merged roots, is chosen on
+/// purpose: an explicit CA that doesn't parse is a misconfiguration
+/// worth reporting.
+fn root_store(
+    trusted: &[rustls::pki_types::CertificateDer<'static>],
+    share_ca: Option<&std::path::Path>,
+) -> io::Result<rustls::RootCertStore> {
     let mut roots = rustls::RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    if let Some(ca) = std::env::var_os("KIRI_SHARE_CA") {
-        let certs = rustls::pki_types::CertificateDer::pem_file_iter(&ca).map_err(|e| io::Error::other(format!("KIRI_SHARE_CA: {e}")))?;
-        for c in certs {
-            roots.add(c.map_err(|e| io::Error::other(format!("KIRI_SHARE_CA: {e}")))?).map_err(|e| io::Error::other(format!("KIRI_SHARE_CA: {e}")))?;
+    roots.add_parsable_certificates(trusted.to_vec());
+    if let Some(ca) = share_ca {
+        use std::io::Read as _;
+        let f = std::fs::File::open(ca).map_err(|e| io::Error::other(format!("KIRI_SHARE_CA: {e}")))?;
+        if !f.metadata().map_err(|e| io::Error::other(format!("KIRI_SHARE_CA: {e}")))?.is_file() {
+            return Err(io::Error::other("KIRI_SHARE_CA: not a regular file"));
+        }
+        let mut bytes = Vec::new();
+        f.take(MAX_SHARE_CA_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| io::Error::other(format!("KIRI_SHARE_CA: {e}")))?;
+        if bytes.len() as u64 > MAX_SHARE_CA_BYTES {
+            return Err(io::Error::other(format!(
+                "KIRI_SHARE_CA: file exceeds {} MiB",
+                MAX_SHARE_CA_BYTES >> 20
+            )));
+        }
+        for (i, c) in rustls::pki_types::CertificateDer::pem_slice_iter(&bytes).enumerate() {
+            if i >= MAX_SHARE_CA_CERTS {
+                return Err(io::Error::other(format!(
+                    "KIRI_SHARE_CA: more than {MAX_SHARE_CA_CERTS} certificates"
+                )));
+            }
+            roots
+                .add(c.map_err(|e| io::Error::other(format!("KIRI_SHARE_CA: {e}")))?)
+                .map_err(|e| io::Error::other(format!("KIRI_SHARE_CA: {e}")))?;
         }
     }
+    Ok(roots)
+}
+
+fn tls_config(alpn: &[u8]) -> io::Result<Arc<rustls::ClientConfig>> {
+    // KIRI_SHARE_CA, if set, is added on top of the merged roots, last.
+    let share_ca = std::env::var_os("KIRI_SHARE_CA").map(std::path::PathBuf::from);
+    let roots = root_store(&crate::roots::trusted(), share_ca.as_deref())?;
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut c = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
@@ -2314,6 +2359,60 @@ mod tests {
         assert_eq!(parse_server("edge.runkiri.com"), ("edge.runkiri.com".into(), 443));
         assert_eq!(parse_server("https://Edge.Example:8443/"), ("edge.example".into(), 8443));
         assert_eq!(parse_server("localhost:"), ("localhost:".into(), 443));
+    }
+
+    /// A malformed anchor in the trusted list is skipped, not fatal: the
+    /// store still holds every certificate that parses.
+    #[test]
+    fn merged_roots_skip_a_cert_that_fails_to_add() {
+        // The bundled set, not this machine's store: every one of them
+        // parses, where a store may hold one rustls skips already.
+        let certs = crate::roots::bundled().to_vec();
+        let mut with_bad = certs.clone();
+        let good: &[u8] = certs[0].as_ref();
+        let bad = rustls::pki_types::CertificateDer::from(good[..good.len() / 2].to_vec());
+        with_bad.push(bad);
+        let no_ca = None;
+        let roots = root_store(&with_bad, no_ca).unwrap();
+        assert_eq!(
+            roots.len(),
+            certs.len(),
+            "the truncated cert is skipped, the rest land"
+        );
+        assert_eq!(roots.len(), with_bad.len() - 1);
+    }
+
+    /// KIRI_SHARE_CA stays loud: a PEM section that doesn't decode fails
+    /// `root_store` (what `tls_config` builds from the variable), a
+    /// parseable CA is added and passes. (A file with no PEM sections at
+    /// all iterates as empty upstream, pki-types 1.15.) `root_store` is
+    /// called with the file, not through the variable: setting one races
+    /// every other test reading the environment.
+    #[test]
+    fn kiri_share_ca_fails_loud_but_a_valid_ca_is_added() {
+        let dir = std::env::temp_dir();
+        let bad = dir.join(format!("kiri-share-ca-bad-{}.pem", std::process::id()));
+        std::fs::write(
+            &bad,
+            "-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+        let ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let ca = ca_params.self_signed(&key).unwrap();
+        let good = dir.join(format!("kiri-share-ca-good-{}.pem", std::process::id()));
+        std::fs::write(&good, ca.pem()).unwrap();
+        let oversized = dir.join(format!("kiri-share-ca-big-{}.pem", std::process::id()));
+        std::fs::write(&oversized, vec![b'A'; MAX_SHARE_CA_BYTES as usize + 1]).unwrap();
+        let loud = root_store(&[], Some(&bad)).is_err();
+        let added = root_store(&[], Some(&good)).is_ok_and(|r| r.len() == 1);
+        let too_big = root_store(&[], Some(&oversized)).is_err();
+        let _ = std::fs::remove_file(&bad);
+        let _ = std::fs::remove_file(&good);
+        let _ = std::fs::remove_file(&oversized);
+        assert!(loud, "an undecodable KIRI_SHARE_CA fails loudly");
+        assert!(added, "a parseable KIRI_SHARE_CA is added");
+        assert!(too_big, "an oversized KIRI_SHARE_CA is refused");
     }
 
     #[test]

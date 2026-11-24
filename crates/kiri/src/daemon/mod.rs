@@ -17,6 +17,10 @@ mod engine;
 mod filters;
 mod health;
 mod hostetc;
+// A Windows host's roots, for the engine in WSL.
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod hostroots;
 mod hostopts;
 mod mirror;
 mod http;
@@ -308,6 +312,15 @@ pub fn run(_args: &[String]) -> io::Result<()> {
     // daemon.json's insecure-registries and registry-mirrors, read again
     // whenever the file changes.
     kiri_image::set_config_source(daemon_json::current);
+    // The system's root certificates are read once, here while nothing
+    // waits for them, and not by the first pull: asking the macOS keychain
+    // about each of its certificates takes a moment (#303).
+    let _ = std::thread::Builder::new().name("kiri-tls-roots".into()).spawn(|| {
+        // In WSL, the Windows roots kiri-win sent last time (#303).
+        #[cfg(target_os = "linux")]
+        hostroots::load();
+        let _ = kiri_image::roots::trusted();
+    });
     // The managed BuildKit stops itself when builds have been idle a while.
     builder::watch(engine.clone());
     // A Kubernetes node the engine restarted gets its kubectl context.

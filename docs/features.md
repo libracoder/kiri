@@ -177,6 +177,31 @@ bundles the docker CLI, Compose and buildx; `Kiri-Lite-<version>-arm64.dmg`
 versions on first launch (`crates/kiri/src/cli_pins.rs`, checked by SHA-256)
 unless the Mac already has a docker CLI.
 
+## Company certificates
+
+Kiri trusts the root certificates of the operating system and the Mozilla set that Kiri bundles. This applies to pulls, pushes, `docker login`, the update check, CLI and grype downloads, and Kiri Share. A registry signed by a company root certificate works when the system trusts that certificate.
+
+- **macOS**: Kiri reads the trust settings of the user, admin and system keychains. Mark the root certificate as trusted, for example: `sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain ca.pem`
+- **Linux**: Kiri reads the system CA bundle, for example in `/etc/ssl/certs`.
+- **Windows**: pulls run in the engine in WSL 2, away from the Windows certificate store, so the Kiri window copies the store into the engine: the root certificates of the current user (which include the machine's and those Group Policy adds) that the bundled set lacks, and the certificates in the Disallowed store (as well as bundled roots disabled for Server Authentication). It sends them when the engine starts and every minute while Kiri runs, and the engine keeps them for its next start. Kiri Share uses the Windows certificate store of the current user. Trust the company root certificate in Windows, for example `certutil -user -addstore Root ca.cer`; pulls trust it within a minute.
+
+A root certificate that an administrator distrusts stays distrusted, even though the bundled Mozilla set has it:
+
+- **macOS**: "Never Trust" in the user or admin trust settings. Settings in the system domain are not read.
+- **Windows**: the certificates in the Disallowed store (and bundled roots disabled for Server Authentication in `ROOT`), for Kiri Share and for pulls in the engine (only the engine in WSL accepts Windows roots, and only from Kiri on Windows; a native Linux engine, containers, and other WSL distros are refused). A re-issued copy of a distrusted self-issued root, with the same subject and public key, is distrusted too; a distrusted cross-certificate leaves the self-signed root it shares a key with trusted.
+- **Linux**: there is no list of distrusted certificates to read. A Mozilla root certificate that you remove from the system bundle (for example with `!` in `/etc/ca-certificates.conf`) is still trusted through the bundled set.
+
+Kiri does not check online revocation (CRL or OCSP).
+
+NOTE: If `SSL_CERT_FILE` or `SSL_CERT_DIR` is set, Kiri reads the root certificates there instead of the system store, as OpenSSL does. The bundled Mozilla set stays in use, so these variables add root certificates and cannot limit trust to a private CA only. Kiri writes a warning when this occurs, and a company CA trusted in the keychain or system store is then not trusted.
+
+If the system store causes a problem, set `KIRI_TLS_ROOTS=webpki`. Kiri then trusts only the bundled Mozilla set, as before: nothing is read from the system, so the roots an administrator distrusted are trusted again too. The Kiri app and the daemon do not read your shell environment; set the variable for them and restart Kiri:
+
+- **macOS**: `launchctl setenv KIRI_TLS_ROOTS webpki`
+- **Linux**: `sudo systemctl edit kiri`, add `Environment=KIRI_TLS_ROOTS=webpki` under `[Service]`, then `sudo systemctl restart kiri`.
+
+To trust a private certificate authority at a Kiri Share edge only, set `KIRI_SHARE_CA` to a PEM file of extra root certificates. Kiri adds them to the trusted roots for that edge only; a file that does not parse is an error, not a silent skip.
+
 ## Known issues
 
 - **Mac: an attached USB device leaves your containers while the Mac

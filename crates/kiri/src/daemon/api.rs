@@ -191,6 +191,9 @@ fn route(req: &Request, engine: &Arc<Engine>, caller: &Caller, w: &mut UnixStrea
         ("GET", "/kiri/proxy") => return reply(w, Ok(super::proxy::report()), 200),
         ("POST", "/kiri/proxy") => return reply(w, set_proxy(req), 200),
         ("PUT", "/kiri/proxy/system") => return reply(w, set_host_proxy(req), 200),
+        // kiri-win's Windows roots, for the engine in WSL (#303).
+        #[cfg(target_os = "linux")]
+        ("PUT", "/kiri/roots/host") => return reply(w, set_host_roots(req, caller), 200),
         // daemon.json's registry keys: Settings → Registries, `kiri registry`.
         ("GET", "/kiri/registries") => return reply(w, Ok(super::daemon_json::report()), 200),
         ("POST", "/kiri/registries") => return reply(w, set_registries(req, engine), 200),
@@ -1088,6 +1091,22 @@ fn set_host_proxy(req: &Request) -> Result<Value, Error> {
         super::proxy::set_relay(relay.iter().filter_map(|(k, v)| Some((k.parse().ok()?, u16::try_from(v.as_u64()?).ok()?))).collect());
     }
     Ok(super::proxy::report())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn set_host_roots(req: &Request, caller: &Caller) -> Result<Value, Error> {
+    // Only the Windows host (via kiri-win over the daemon's own socket) may
+    // supply host roots: never a container or an integrated WSL distro (#303).
+    if *caller != Caller::Host {
+        return Err(Error::Forbidden("the Windows roots can only be set from Kiri on Windows".into()));
+    }
+    // Only the engine in WSL takes them: a native Linux daemon has its own
+    // certificate store.
+    if !super::hostroots::in_wsl() {
+        return Err(Error::BadRequest("the Windows roots are for the engine in WSL".into()));
+    }
+    let body: Value = serde_json::from_slice(&req.body).map_err(|e| Error::BadRequest(format!("invalid JSON: {e}")))?;
+    super::hostroots::set(&body).map_err(Error::Io)
 }
 
 fn set_proxy(req: &Request) -> Result<Value, Error> {
@@ -5376,7 +5395,7 @@ mod tests {
         };
         let mut routes = kiri_routes(body_of(include_str!("api.rs"), "\nfn route("));
         routes.extend(kiri_routes(body_of(include_str!("ops.rs"), "\npub fn route(")));
-        for known in [("POST", "/kiri/stop"), ("POST", "/kiri/sleep"), ("POST", "/kiri/registries"), ("PUT", "/kiri/proxy/system"), ("POST", "/kiri/builder"), ("POST", "/kiri/containers/1/ports"), ("POST", "/kiri/containers/1/upper"), ("DELETE", "/kiri/k8s/forward/1"), ("GET", "/kiri/watch-roots"), ("POST", "/kiri/fs-events")] {
+        for known in [("POST", "/kiri/stop"), ("POST", "/kiri/sleep"), ("POST", "/kiri/registries"), ("PUT", "/kiri/proxy/system"), ("PUT", "/kiri/roots/host"), ("POST", "/kiri/builder"), ("POST", "/kiri/containers/1/ports"), ("POST", "/kiri/containers/1/upper"), ("DELETE", "/kiri/k8s/forward/1"), ("GET", "/kiri/watch-roots"), ("POST", "/kiri/fs-events")] {
             assert!(routes.iter().any(|(m, p)| (m.as_str(), p.as_str()) == known), "{known:?} not found in route(): {routes:?}");
         }
         for (m, p) in &routes {
@@ -5448,7 +5467,7 @@ mod tests {
     fn a_containers_stop_and_settings_are_refused() {
         use std::io::{Read, Write};
         let (root, engine) = engine_in("container-gate", false);
-        for req in ["POST /v1.47/kiri/stop", "POST /kiri/sleep", "POST /kiri/registries", "POST /kiri/proxy", "POST /kiri/resources", "POST /kiri/domains", "DELETE /kiri/domains", "POST /kiri/fs-events"] {
+        for req in ["POST /v1.47/kiri/stop", "POST /kiri/sleep", "POST /kiri/registries", "POST /kiri/proxy", "PUT /kiri/roots/host", "POST /kiri/resources", "POST /kiri/domains", "DELETE /kiri/domains", "POST /kiri/fs-events"] {
             let (mut client, server) = UnixStream::pair().unwrap();
             let served = std::thread::spawn({
                 let engine = engine.clone();
@@ -5487,6 +5506,40 @@ mod tests {
         assert!(got.starts_with("HTTP/1.1 200 "), "{got}");
         drop(engine);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// `PUT /kiri/roots/host` accepts only `Caller::Host` (kiri-win): neither a
+    /// container nor an integrated WSL distro may inject root CAs (#303).
+    #[test]
+    fn host_roots_endpoint_requires_host_caller() {
+        let req = Request::internal("PUT", "/kiri/roots/host", &[], br#"{"certs":["3001"],"distrusted":[]}"#.to_vec());
+        assert!(matches!(set_host_roots(&req, &Caller::Container), Err(Error::Forbidden(_))));
+        assert!(matches!(set_host_roots(&req, &Caller::Wsl("Ubuntu".into())), Err(Error::Forbidden(_))));
+        if !crate::daemon::hostroots::in_wsl() {
+            assert!(matches!(set_host_roots(&req, &Caller::Host), Err(Error::BadRequest(_))));
+        }
+
+        // Over the live HTTP handler: a WSL distro receives 403 on Linux.
+        #[cfg(target_os = "linux")]
+        {
+            use std::io::{Read, Write};
+            let (root, engine) = engine_in("wsl-host-roots-gate", false);
+            let (mut client, server) = UnixStream::pair().unwrap();
+            let served = std::thread::spawn({
+                let engine = engine.clone();
+                move || serve(server, engine, Caller::Wsl("Ubuntu".into()))
+            });
+            let body = r#"{"certs":["3001"],"distrusted":[]}"#;
+            client
+                .write_all(format!("PUT /kiri/roots/host HTTP/1.1\r\nHost: d\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes())
+                .unwrap();
+            let mut got = String::new();
+            client.read_to_string(&mut got).unwrap();
+            served.join().unwrap().unwrap();
+            assert!(got.starts_with("HTTP/1.1 403 "), "{got}");
+            drop(engine);
+            let _ = std::fs::remove_dir_all(root);
+        }
     }
 
     /// `POST /kiri/registries` refreshes synchronously on the request thread
