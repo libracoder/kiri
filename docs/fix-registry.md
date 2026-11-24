@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #840 CLI: `kiri update --help` prints usage without checking for updates (unreleased)
+- Fixes: no issue
+- Caused: none known
+- Caused by: -
+- Check: `crates/kiri/src/update.rs`
+
 ### #743 CLI: `kiri --help` lists only commands compiled for this OS (unreleased)
 - Fixes: #743 Linux: `kiri --help` lists macOS-only commands (`setup`, `update`, `import`, `bench`, `boot`) that immediately fail
 - Caused: none known

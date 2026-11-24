@@ -416,12 +416,24 @@ fn has_cpu(head: &[u8], want: u32) -> bool {
     }
 }
 
+#[cfg(target_os = "macos")]
+const USAGE: &str = "usage: kiri update [--check]";
+#[cfg(target_os = "linux")]
+const USAGE: &str = "usage: kiri update --check";
+
 pub fn run(args: &[String]) -> io::Result<()> {
-    if crate::flavor::dev() {
+    run_with_lookup(args, crate::flavor::dev(), env!("CARGO_PKG_VERSION"), &mut io::stdout(), latest)
+}
+
+fn run_with_lookup(args: &[String], dev: bool, current: &str, out: &mut dyn Write, lookup: impl FnOnce() -> io::Result<Release>) -> io::Result<()> {
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        return writeln!(out, "{USAGE}");
+    }
+    if dev {
         return Err(io::Error::other(format!("{} doesn't update itself: rebuild it with `cargo xtask app-dev`", crate::flavor::APP)));
     }
-    let release = latest()?;
-    run_release(args, &release, env!("CARGO_PKG_VERSION"), &mut io::stdout())
+    let release = lookup()?;
+    run_release(args, &release, current, out)
 }
 
 fn run_release(args: &[String], release: &Release, current: &str, out: &mut dyn Write) -> io::Result<()> {
@@ -466,11 +478,10 @@ mod tests {
     use std::io::{self, Read, Write};
     use std::net::TcpListener;
 
-    use super::{Release, bundle_version, has_cpu, latest_from, newer, run_release, runs_here};
+    use super::{Release, USAGE, bundle_version, has_cpu, latest_from, newer, run_with_lookup, runs_here};
 
     fn run_with(args: &[String], url: &str, current: &str, out: &mut dyn Write) -> io::Result<()> {
-        let release = latest_from(url)?;
-        run_release(args, &release, current, out)
+        run_with_lookup(args, false, current, out, || latest_from(url))
     }
 
     fn serve_feed(status: &'static str, body: &'static str) -> String {
@@ -486,6 +497,43 @@ mod tests {
             }
         });
         format!("http://{addr}/latest.json")
+    }
+
+    #[test]
+    fn help_skips_release_lookup() {
+        #[cfg(target_os = "macos")]
+        assert_eq!(USAGE, "usage: kiri update [--check]");
+        #[cfg(target_os = "linux")]
+        assert_eq!(USAGE, "usage: kiri update --check");
+
+        for dev in [false, true] {
+            for (args, help) in [
+                (&["--help"][..], true),
+                (&["-h"], true),
+                (&["--check", "--help"], true),
+                (&[], false),
+                (&["--check"], false),
+            ] {
+                let args = args.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>();
+                let mut out = Vec::new();
+                let mut looked_up = false;
+                let result = run_with_lookup(&args, dev, "0.2.0", &mut out, || {
+                    looked_up = true;
+                    Err(io::Error::other("feed unavailable"))
+                });
+                if help {
+                    assert!(!looked_up, "help must not look up release for {args:?} (dev={dev})");
+                    result.unwrap();
+                    assert_eq!(String::from_utf8(out).unwrap(), format!("{USAGE}\n"));
+                } else if dev {
+                    assert!(!looked_up, "dev guard must not look up release for {args:?}");
+                    assert!(result.unwrap_err().to_string().contains("doesn't update itself"));
+                } else {
+                    assert!(looked_up, "expected release lookup for {args:?}");
+                    assert_eq!(result.unwrap_err().to_string(), "feed unavailable");
+                }
+            }
+        }
     }
 
     #[test]
@@ -556,6 +604,10 @@ mod tests {
         assert!(text.starts_with(&format!("Kiri 99.0.0 is available (this is {})\n", env!("CARGO_PKG_VERSION"))), "got {text:?}");
         if cfg!(target_os = "linux") {
             assert!(text.contains("download the new .deb or .rpm from https://runkiri.com/releases/ and install it as before\n"), "got {text:?}");
+            let url = serve_feed("200 OK", r#"{"version":"99.0.0","url":"https://runkiri.com/download","sha256":""}"#);
+            let mut bare_out = Vec::new();
+            run_with(&[], &url, env!("CARGO_PKG_VERSION"), &mut bare_out).unwrap();
+            assert_eq!(String::from_utf8(bare_out).unwrap(), text);
         }
     }
 
@@ -575,6 +627,8 @@ mod tests {
         assert!(crate::docker::is_container_update(&a(&["--memory", "128m", "c1"])));
         assert!(crate::docker::is_container_update(&a(&["--cpus", "2", "my-ctr"])));
         assert!(!crate::docker::is_container_update(&a(&["--check"])));
+        assert!(!crate::docker::is_container_update(&a(&["--help"])));
+        assert!(!crate::docker::is_container_update(&a(&["-h"])));
         assert!(!crate::docker::is_container_update(&a(&[])));
     }
 }
