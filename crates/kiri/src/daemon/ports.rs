@@ -739,8 +739,7 @@ pub fn start(vm: Arc<VmLink>, id: &str, bindings: &[Binding], target_ip: [u8; 4]
     // On a Linux host the daemon shares the kernel with the containers, so
     // the kernel can rewrite the packets (nftables DNAT) instead of two
     // user-space relays copying every byte; that serves every address but
-    // loopback. The listeners below relay the rest. A target on loopback (a
-    // --network host container) stays relayed: that is a local socket.
+    // loopback. The listeners below relay the rest.
     if cfg!(target_os = "linux") && target_ip != [127, 0, 0, 1] {
         let all = udp
             .iter()

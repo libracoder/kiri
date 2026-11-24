@@ -5943,6 +5943,37 @@ mod network_option_tests {
         let target = engine.route("dnsdom.kiri.localhost").expect("running container domain target");
         assert_eq!(target.exposed, [53]);
 
+        // With NetworkMode: "host" and PortBindings (#764), HostConfig.PortBindings
+        // and Config.ExposedPorts are preserved in inspect, while NetworkSettings.Ports
+        // is {} and ps Ports is [] when no host-side port forwarder is bound.
+        let host_bindings = json!({"18081/tcp": [{"HostIp": "", "HostPort": "18081"}]});
+        let host_body = json!({
+            "Image": "demo:dns",
+            "HostConfig": {
+                "NetworkMode": "host",
+                "PortBindings": host_bindings
+            }
+        });
+        let created = create(&Request::internal("POST", "/containers/create", &[("name", "hostweb")], serde_json::to_vec(&host_body).unwrap()), &engine).unwrap();
+        let host_id = created["Id"].as_str().unwrap();
+        let inspected_created = container_inspect(&engine, host_id).unwrap();
+        assert_eq!(inspected_created["HostConfig"]["NetworkMode"], "host");
+        assert_eq!(inspected_created["HostConfig"]["PortBindings"], host_bindings);
+        assert_eq!(inspected_created["NetworkSettings"]["Ports"], json!({}));
+
+        engine.mark_running_for_test(host_id, [0; 4]);
+        let inspected_running = container_inspect(&engine, host_id).unwrap();
+        assert_eq!(inspected_running["HostConfig"]["NetworkMode"], "host");
+        assert_eq!(inspected_running["HostConfig"]["PortBindings"], host_bindings);
+        assert_eq!(inspected_running["Config"]["ExposedPorts"]["18081/tcp"], json!({}));
+        assert_eq!(inspected_running["NetworkSettings"]["Ports"], json!({}));
+        let listed = list(&Request::internal("GET", "/containers/json", &[], Vec::new()), &engine).unwrap();
+        let row = listed.as_array().unwrap().iter().find(|r| r["Id"] == host_id).expect("hostweb listed");
+        assert_eq!(row["Ports"], json!([]));
+        let host_route = engine.route("hostweb.kiri.localhost").expect("host network domain target");
+        assert_eq!(host_route.ip, [127, 0, 0, 1]);
+        assert_eq!(host_route.published, [18081]);
+
         drop(engine);
         let _ = std::fs::remove_dir_all(dir);
     }

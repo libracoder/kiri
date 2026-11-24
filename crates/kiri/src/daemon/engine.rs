@@ -1029,6 +1029,25 @@ fn rebind_bindings(ports: &[super::ports::Binding], bound: &[(super::ports::Bind
         .collect()
 }
 
+/// The guest IPv4 address that host-side port forwards for a running container
+/// target, or `None` when the container's network mode publishes no host forwards.
+///
+/// On macOS (`!host_shares_netns`), a `--network host` container runs inside the
+/// Linux VM's network namespace rather than macOS's own kernel, so Mac-side `-p`
+/// listeners still bind on the Mac and forward to `127.0.0.1` in the guest (#732).
+/// On Linux (`host_shares_netns`), `--network host` is the daemon's own network
+/// namespace, so published `PortBindings` are discarded at runtime as Docker does
+/// and the container binds its ports directly without `EADDRINUSE` (#764).
+fn port_forward_target(network_mode: &str, ip: Option<[u8; 4]>, host_shares_netns: bool) -> Option<[u8; 4]> {
+    if network_mode == "none" || network_mode.starts_with("container:") {
+        None
+    } else if network_mode == "host" {
+        (!host_shares_netns).then_some([127, 0, 0, 1])
+    } else {
+        ip.filter(|&a| a != [0; 4])
+    }
+}
+
 /// Length and hash of a file's bytes, enough to tell whether it is the one
 /// this engine last read or wrote.
 fn fingerprint(bytes: &[u8]) -> (usize, u64) {
@@ -3757,8 +3776,20 @@ impl Engine {
         }
         // A container that left all its networks keeps its `-p` bindings
         // but has no address for them, as on Docker, where it publishes none.
-        if !spec.ports.is_empty() && flags & run_flags::NET_NONE == 0 {
-            let target = if flags & run_flags::NET_HOST != 0 { [127, 0, 0, 1] } else { ip };
+        // On a Linux host, `--network host` is the daemon's own network
+        // namespace, so published ports are discarded at start as on Docker
+        // and the container binds them itself (#764); on macOS it runs in the
+        // VM's network namespace, so the Mac still forwards to 127.0.0.1 there.
+        let forward_mode = if flags & run_flags::NET_HOST != 0 {
+            "host"
+        } else if flags & run_flags::NET_NONE != 0 || joined.is_some() {
+            "none"
+        } else {
+            spec.network_mode.as_str()
+        };
+        if !spec.ports.is_empty()
+            && let Some(target) = port_forward_target(forward_mode, Some(ip), cfg!(target_os = "linux"))
+        {
             match super::ports::start(vm.clone(), &id, &spec.ports, target) {
                 Ok(fw) => {
                     let mut st = self.lock();
@@ -4823,8 +4854,10 @@ impl Engine {
         let mode = self.lock().containers.get(&id).map(|c| c.spec.network_mode.clone()).unwrap_or_default();
         let lines = self.vm()?.listening(&id)?;
         let (reach, local) = super::ports::listening(&lines, mode == "host");
-        // With no network at all (or another container's), nothing can be published.
-        if mode == "none" || mode.starts_with("container:") {
+        // With no network of its own to forward into (none, another container's,
+        // or host networking on Linux where the container is already in the
+        // host's network namespace), nothing can be published.
+        if mode == "none" || mode.starts_with("container:") || (cfg!(target_os = "linux") && mode == "host") {
             return Ok((Vec::new(), [reach, local].concat()));
         }
         Ok((reach, local))
@@ -4845,15 +4878,17 @@ impl Engine {
             if c.spec.network_mode.starts_with("container:") && !ports.is_empty() {
                 return Err(Error::BadRequest("conflicting options: port publishing and the container type network mode".into()));
             }
-            let target = if c.spec.network_mode == "host" { Some([127, 0, 0, 1]) } else { c.ip };
+            let target = port_forward_target(&c.spec.network_mode, c.ip, cfg!(target_os = "linux"));
             let old = std::mem::replace(&mut c.spec.ports, ports.clone());
             (old, c.forwards.take(), c.status == Status::Running, target)
         };
         // Closing listeners joins their threads: never under the lock.
         drop(old_fw);
-        if running && !ports.is_empty() {
+        if running
+            && !ports.is_empty()
+            && let Some(target) = target
+        {
             let vm = self.vm()?;
-            let target = target.unwrap_or([127, 0, 0, 1]);
             match super::ports::start(vm.clone(), &id, &ports, target) {
                 Ok(fw) => {
                     if let Some(c) = self.lock().containers.get_mut(&id) {
@@ -4862,7 +4897,7 @@ impl Engine {
                 }
                 Err(e) => {
                     crate::diag::warn!("new ports not published; the old ones are kept", id = &id[..12], error = e);
-                    let back = super::ports::start(vm, &id, &old_ports, target).ok();
+                    let back = (!old_ports.is_empty()).then(|| super::ports::start(vm, &id, &old_ports, target).ok()).flatten();
                     if let Some(c) = self.lock().containers.get_mut(&id) {
                         c.spec.ports = old_ports;
                         c.forwards = back;
@@ -8705,6 +8740,28 @@ mod leave_first_network_tests {
         assert_eq!(rebound.len(), 2);
         assert_eq!(rebound[0].host_port, 49152);
         assert_eq!(rebound[1].host_port, 8443);
+    }
+
+    #[test]
+    fn port_forward_target_skips_host_network_only_on_linux() {
+        // On Linux (host_shares_netns = true), --network host shares the daemon's
+        // own network namespace, so published PortBindings are not bound by the
+        // host relay (#764); on macOS (host_shares_netns = false), --network host
+        // runs inside the Linux VM's netns so the Mac relay forwards to 127.0.0.1 (#732).
+        assert_eq!(super::port_forward_target("host", None, true), None);
+        assert_eq!(super::port_forward_target("host", Some([0; 4]), true), None);
+        assert_eq!(super::port_forward_target("host", None, false), Some([127, 0, 0, 1]));
+        assert_eq!(super::port_forward_target("host", Some([0; 4]), false), Some([127, 0, 0, 1]));
+
+        // Bridge and user networks forward to their assigned IPv4 on both platforms.
+        for linux in [false, true] {
+            assert_eq!(super::port_forward_target("bridge", Some([172, 17, 0, 2]), linux), Some([172, 17, 0, 2]));
+            assert_eq!(super::port_forward_target("app-net", Some([10, 88, 0, 3]), linux), Some([10, 88, 0, 3]));
+            assert_eq!(super::port_forward_target("bridge", None, linux), None);
+            assert_eq!(super::port_forward_target("bridge", Some([0; 4]), linux), None);
+            assert_eq!(super::port_forward_target("none", Some([172, 17, 0, 2]), linux), None);
+            assert_eq!(super::port_forward_target("container:abc", Some([172, 17, 0, 2]), linux), None);
+        }
     }
 
     /// Records saved before a container could leave all its networks load,

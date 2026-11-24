@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #764 Linux: discard published ports for `--network host` containers at runtime so container listeners don't fail with `EADDRINUSE` (unreleased)
+- Fixes: #764 Linux: `ports` are applied with `network_mode: host`, so the container's listener fails with EADDRINUSE
+- Caused: none known
+- Caused by: -
+- Check: `hostnet-ports-discarded`
+
 ### #836 CLI & Daemon: discover WSL 2 integration sockets, fail fast on non-root Linux daemon, grant invoking sudo user access, and distinguish socket permission errors (unreleased)
 - Fixes: #836 Kiri isn't running. Open Kiri, or start it with `kiri daemon`
 - Caused: none known
