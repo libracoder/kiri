@@ -125,12 +125,80 @@ fn sample(pid: libc::pid_t, part: &'static str) -> Option<Proc> {
     Some(Proc { pid: pid as u32, part, mem: info.ri_phys_footprint, cpu_ns: ns })
 }
 
+/// One process entry from an OS snapshot, for filtering the descendant tree.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProcRow {
+    pid: u32,
+    ppid: u32,
+    start_time: Option<u64>,
+}
+
+/// Returns `root_pid` and its descendants from `(pid, ppid)` snapshot links,
+/// querying `start_time(pid)` only for `root_pid` and candidate children.
+///
+/// A candidate `C` with `ppid == P` is linked under `P` only when both `P` and
+/// `C` have known creation times and `C.start_time >= P.start_time`. That stops
+/// PID reuse from pulling an older unrelated process (and its subtree) into
+/// Kiri's usage when Windows reassigns its dead parent's PID to a Kiri child.
+/// A candidate whose creation time cannot be read (`None`, such as an elevated
+/// or protected process that denies `PROCESS_QUERY_LIMITED_INFORMATION`) is
+/// excluded; Kiri's own children run as the same user and can always be
+/// queried. `visited` guards against cycles when timestamps tie.
+#[cfg(any(windows, target_os = "linux", test))]
+fn descendants_with(root_pid: u32, links: &[(u32, u32)], mut start_time: impl FnMut(u32) -> Option<u64>) -> Vec<u32> {
+    use std::collections::HashSet;
+
+    let mut by_parent: HashMap<u32, Vec<u32>> = HashMap::new();
+    for &(pid, ppid) in links {
+        if pid != ppid {
+            by_parent.entry(ppid).or_default().push(pid);
+        }
+    }
+    let mut visited = HashSet::from([root_pid]);
+    let mut tree = vec![root_pid];
+    let Some(root_start) = start_time(root_pid) else {
+        return tree;
+    };
+    let mut queue = vec![(root_pid, root_start)];
+    let mut i = 0;
+    while i < queue.len() {
+        let (parent_pid, parent_start) = queue[i];
+        i += 1;
+        let Some(children) = by_parent.get(&parent_pid) else {
+            continue;
+        };
+        for &child_pid in children {
+            if visited.contains(&child_pid) {
+                continue;
+            }
+            if let Some(child_start) = start_time(child_pid)
+                && child_start >= parent_start
+            {
+                visited.insert(child_pid);
+                tree.push(child_pid);
+                queue.push((child_pid, child_start));
+            }
+        }
+    }
+    tree
+}
+
+/// Pure descendant selection over a snapshot of `(pid, ppid, start_time)` rows.
+#[cfg(any(target_os = "linux", test))]
+fn descendants(root_pid: u32, rows: &[ProcRow]) -> Vec<u32> {
+    let links: Vec<(u32, u32)> = rows.iter().map(|r| (r.pid, r.ppid)).collect();
+    let starts: HashMap<u32, Option<u64>> = rows.iter().map(|r| (r.pid, r.start_time)).collect();
+    descendants_with(root_pid, &links, |pid| starts.get(&pid).copied().flatten())
+}
+
 /// This process and its children: WebKitGTK's page and network processes.
 #[cfg(target_os = "linux")]
 fn procs() -> Vec<Proc> {
     let me = std::process::id();
-    // pid, parent, name: field 2 of /proc/<pid>/stat is the name in brackets, then state and parent.
-    let all: Vec<(u32, u32, String)> = std::fs::read_dir("/proc")
+    // pid, parent, starttime, name: field 2 of /proc/<pid>/stat is the name in
+    // brackets, followed by state (0), ppid (1), ..., starttime (19).
+    let all: Vec<(ProcRow, String)> = std::fs::read_dir("/proc")
         .into_iter()
         .flatten()
         .flatten()
@@ -138,21 +206,19 @@ fn procs() -> Vec<Proc> {
         .filter_map(|pid| {
             let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
             let (name, rest) = stat.split_once(" (")?.1.rsplit_once(") ")?;
-            Some((pid, rest.split(' ').nth(1)?.parse().ok()?, name.to_owned()))
+            let fields: Vec<&str> = rest.split(' ').collect();
+            let ppid = fields.get(1)?.parse().ok()?;
+            let start_time = fields.get(19).and_then(|s| s.parse().ok());
+            Some((ProcRow { pid, ppid, start_time }, name.to_owned()))
         })
         .collect();
-    let mut tree = vec![me];
-    let mut i = 0;
-    while i < tree.len() {
-        let parent = tree[i];
-        tree.extend(all.iter().filter(|p| p.1 == parent && !tree.contains(&p.0)).map(|p| p.0).collect::<Vec<_>>());
-        i += 1;
-    }
+    let rows: Vec<ProcRow> = all.iter().map(|(r, _)| *r).collect();
+    let tree = descendants(me, &rows);
     // SAFETY: sysconf has no preconditions.
     let tick_ns = 1_000_000_000 / u64::try_from(unsafe { libc::sysconf(libc::_SC_CLK_TCK) }).unwrap_or(100).max(1);
     tree.into_iter()
         .filter_map(|pid| {
-            let name = &all.iter().find(|p| p.0 == pid)?.2;
+            let name = &all.iter().find(|(r, _)| r.pid == pid)?.1;
             let part = if pid == me {
                 "Window"
             } else if name.starts_with("WebKitWebProces") {
@@ -183,7 +249,7 @@ fn procs() -> Vec<Proc> {
     use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
     use windows_sys::Win32::System::Threading::{GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 
-    // Every process and its parent, then the tree under this one.
+    // Every process and its parent, then the creation-time-checked tree under this one.
     let mut all: Vec<(u32, u32, String)> = Vec::new();
     // SAFETY: a snapshot handle walked with a sized PROCESSENTRY32W and closed.
     unsafe {
@@ -202,16 +268,37 @@ fn procs() -> Vec<Proc> {
         CloseHandle(snap);
     }
     let me = std::process::id();
-    let mut tree = vec![me];
-    let mut i = 0;
-    while i < tree.len() {
-        let parent = tree[i];
-        tree.extend(all.iter().filter(|p| p.1 == parent && p.0 != parent && !tree.contains(&p.0)).map(|p| p.0).collect::<Vec<_>>());
-        i += 1;
-    }
-    let ft = |f: FILETIME| (u64::from(f.dwHighDateTime) << 32 | u64::from(f.dwLowDateTime)) * 100;
+    let links: Vec<(u32, u32)> = all.iter().map(|&(pid, ppid, _)| (pid, ppid)).collect();
+    let filetime_ticks = |f: FILETIME| (u64::from(f.dwHighDateTime) << 32) | u64::from(f.dwLowDateTime);
+    // Open each candidate process once so creation time, memory, and CPU come
+    // from the same process instance (no PID-reuse window between check and sample).
+    let mut samples: HashMap<u32, (u64, u64)> = HashMap::new();
+    let tree = descendants_with(me, &links, |pid| {
+        // SAFETY: a query-only handle, read and closed.
+        unsafe {
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if h == 0 {
+                return None;
+            }
+            let (mut c, mut x, mut k, mut u) = (std::mem::zeroed(), std::mem::zeroed(), std::mem::zeroed(), std::mem::zeroed());
+            let times_ok = GetProcessTimes(h, &mut c, &mut x, &mut k, &mut u) != 0;
+            let mut m: PROCESS_MEMORY_COUNTERS_EX = std::mem::zeroed();
+            m.cb = size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
+            let mem = if GetProcessMemoryInfo(h, (&raw mut m).cast(), m.cb) != 0 { m.PrivateUsage as u64 } else { 0 };
+            CloseHandle(h);
+            if !times_ok {
+                return None;
+            }
+            let cpu_ns = filetime_ticks(k).saturating_add(filetime_ticks(u)).saturating_mul(100);
+            samples.insert(pid, (mem, cpu_ns));
+            Some(filetime_ticks(c))
+        }
+    });
     let mut out = Vec::new();
     for pid in tree {
+        let Some(&(mem, cpu_ns)) = samples.get(&pid) else {
+            continue;
+        };
         let name = all.iter().find(|p| p.0 == pid).map(|p| p.2.to_ascii_lowercase()).unwrap_or_default();
         let part = if pid == me {
             "Window"
@@ -220,20 +307,90 @@ fn procs() -> Vec<Proc> {
         } else {
             "Helpers"
         };
-        // SAFETY: a query-only handle, read and closed.
-        unsafe {
-            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-            if h == 0 {
-                continue;
-            }
-            let mut m: PROCESS_MEMORY_COUNTERS_EX = std::mem::zeroed();
-            m.cb = size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
-            let mem = if GetProcessMemoryInfo(h, (&raw mut m).cast(), m.cb) != 0 { m.PrivateUsage as u64 } else { 0 };
-            let (mut c, mut x, mut k, mut u) = (std::mem::zeroed(), std::mem::zeroed(), std::mem::zeroed(), std::mem::zeroed());
-            let cpu_ns = if GetProcessTimes(h, &mut c, &mut x, &mut k, &mut u) != 0 { ft(k) + ft(u) } else { 0 };
-            CloseHandle(h);
-            out.push(Proc { pid, part, mem, cpu_ns });
-        }
+        out.push(Proc { pid, part, mem, cpu_ns });
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ProcRow, descendants, descendants_with};
+
+    #[test]
+    fn includes_genuine_children_and_grandchildren() {
+        let rows = [
+            ProcRow { pid: 100, ppid: 1, start_time: Some(1_000) },
+            ProcRow { pid: 200, ppid: 100, start_time: Some(1_010) },
+            ProcRow { pid: 201, ppid: 100, start_time: Some(1_020) },
+            ProcRow { pid: 300, ppid: 200, start_time: Some(1_030) },
+            ProcRow { pid: 999, ppid: 1, start_time: Some(1_050) },
+        ];
+        assert_eq!(descendants(100, &rows), vec![100, 200, 201, 300]);
+    }
+
+    #[test]
+    fn excludes_recycled_pid_false_child_and_its_newer_grandchildren() {
+        // Issue #190: kiri-win (1000) spawns conhost/wsl with recycled PID 41400
+        // at t=2009. An older unrelated process (5000, started at t=1000) has
+        // stale ppid=41400, and later spawned children (5001, 5002) at t=2100+.
+        let rows = [
+            ProcRow { pid: 1000, ppid: 500, start_time: Some(2_000) },
+            ProcRow { pid: 41400, ppid: 1000, start_time: Some(2_009) },
+            ProcRow { pid: 5000, ppid: 41400, start_time: Some(1_000) },
+            ProcRow { pid: 5001, ppid: 5000, start_time: Some(2_100) },
+            ProcRow { pid: 5002, ppid: 5001, start_time: Some(2_105) },
+            // A real child of 41400 created after it is still included.
+            ProcRow { pid: 41401, ppid: 41400, start_time: Some(2_010) },
+        ];
+        assert_eq!(descendants(1000, &rows), vec![1000, 41400, 41401]);
+    }
+
+    #[test]
+    fn same_tick_creation_and_synthetic_cycles_terminate() {
+        let rows = [
+            ProcRow { pid: 10, ppid: 20, start_time: Some(500) },
+            ProcRow { pid: 20, ppid: 10, start_time: Some(500) },
+            ProcRow { pid: 30, ppid: 20, start_time: Some(500) },
+            ProcRow { pid: 20, ppid: 30, start_time: Some(500) },
+            ProcRow { pid: 40, ppid: 40, start_time: Some(500) },
+        ];
+        assert_eq!(descendants(10, &rows), vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn excludes_unreadable_child_start_time_and_its_subtree() {
+        let rows = [
+            ProcRow { pid: 100, ppid: 1, start_time: Some(1_000) },
+            ProcRow { pid: 200, ppid: 100, start_time: None },
+            ProcRow { pid: 201, ppid: 200, start_time: Some(1_500) },
+            ProcRow { pid: 300, ppid: 100, start_time: Some(1_100) },
+        ];
+        assert_eq!(descendants(100, &rows), vec![100, 300]);
+    }
+
+    #[test]
+    fn unreadable_root_start_time_returns_only_root() {
+        let rows = [
+            ProcRow { pid: 100, ppid: 1, start_time: None },
+            ProcRow { pid: 200, ppid: 100, start_time: Some(1_000) },
+        ];
+        assert_eq!(descendants(100, &rows), vec![100]);
+    }
+
+    #[test]
+    fn only_queries_candidate_processes() {
+        let links = [(10, 1), (20, 10), (30, 999), (40, 20), (50, 40)];
+        let mut queried = Vec::new();
+        let tree = descendants_with(10, &links, |pid| {
+            queried.push(pid);
+            match pid {
+                10 => Some(1_000),
+                20 => Some(1_010),
+                40 => Some(500), // older than 20 -> rejected, so 50 must not be queried
+                _ => Some(2_000),
+            }
+        });
+        assert_eq!(tree, vec![10, 20]);
+        assert_eq!(queried, vec![10, 20, 40]);
+    }
 }
