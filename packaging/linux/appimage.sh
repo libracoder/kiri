@@ -9,6 +9,7 @@ for b in "$bindir/kiri" "$bindir/kiri-init" "$window"; do
   [ -x "$b" ] || { echo "no $b" >&2; exit 1; }
 done
 mkdir -p "$outdir" "$cache"
+outdir=$(cd "$outdir" && pwd) cache=$(cd "$cache" && pwd)
 get() { # url file sum
   local f=$cache/$2
   if [ ! -f "$f" ]; then
@@ -34,6 +35,9 @@ install -m 755 "$window" "$app/usr/bin/kiri-window"
 install -m 755 "$here/AppRun" "$app/AppRun"
 # The launcher runs the AppImage itself; the icon is the AppDir's kiri.svg.
 sed -e 's|^Exec=.*|Exec=kiri|' -e 's|^Icon=.*|Icon=kiri|' "$root/contrib/linux/kiri.desktop" > "$app/kiri.desktop"
+# AppImageUpdate and other update tools read this, and the .zsync file next to each release's AppImage.
+update="gh-releases-zsync|libracoder|kiri|latest|Kiri-*-$arch.AppImage.zsync"
+printf 'X-AppImage-Name=Kiri\nX-AppImage-Version=%s\nX-AppImage-Arch=%s\nX-AppImage-UpdateInformation=%s\n' "$version" "$arch" "$update" >> "$app/kiri.desktop"
 install -m 644 "$root/brand/icon/kiri-app-icon.svg" "$app/kiri.svg"
 mkdir -p "$app/usr/share/metainfo"
 sed -e "s/@VERSION@/$version/" -e "s/@DATE@/$(date -u +%Y-%m-%d)/" "$root/contrib/linux/dev.kiri.Kiri.metainfo.xml" > "$app/usr/share/metainfo/dev.kiri.Kiri.metainfo.xml"
@@ -43,5 +47,8 @@ tool=$work/appimagetool
 install -m 755 "$cache/appimagetool-1.9.1-$arch.AppImage" "$tool"
 out=$outdir/Kiri-$version-$arch.AppImage
 # Extract-and-run: build machines and containers often have no FUSE.
-ARCH=$arch APPIMAGE_EXTRACT_AND_RUN=1 "$tool" --no-appstream --runtime-file "$cache/runtime-20251108-$arch" "$app" "$out" >&2
+# appimagetool writes the .zsync file in OWD when that is set, else in the current directory.
+cd "$outdir"
+ARCH=$arch OWD=$outdir APPIMAGE_EXTRACT_AND_RUN=1 "$tool" --no-appstream --updateinformation "$update" --runtime-file "$cache/runtime-20251108-$arch" "$app" "$out" >&2
+[ -f "$out.zsync" ] || { echo "appimagetool made no $out.zsync" >&2; exit 1; }
 echo "$out"
