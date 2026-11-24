@@ -30,6 +30,7 @@ top-aux-master	#588	docker top aux did not give ps's columns (#348)
 top-eo	#588	docker top -eo did not give the columns asked for (#348)
 top-eo-rss	#588	docker top -eo rss gave no memory column (#348)
 top-ps-args-refused	#588	unsupported ps_args were silently ignored instead of refused (#348)
+ps-limit-latest	#839	docker ps -l and -n ignored the requested limit and skipped stopped containers
 ij-setup	#588	sets up the damaged image list check below (#440)
 ij-info-warns	#588	a repaired images.json gave no docker info warning (#440)
 ij-info-names-lost	#588	the repair warning did not name the images it lost (#440)
