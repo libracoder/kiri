@@ -234,39 +234,58 @@ pub fn parse_mac(s: &str) -> Option<[u8; 6]> {
     parts.next().is_none().then_some(mac)
 }
 
-/// On a Linux host: the interface of the default route, already configured
-/// by the host, gets the masquerade and the host.docker.internal redirect.
-pub fn host_uplink() -> io::Result<()> {
-    let routes = std::fs::read_to_string("/proc/net/route")?;
-    // Iface Destination Gateway …: the default route has destination 0.
-    let iface = routes
-        .lines()
-        .skip(1)
-        .filter_map(|l| {
-            let f: Vec<&str> = l.split_whitespace().collect();
-            (f.len() > 2 && f[1] == "00000000").then(|| f[0].to_owned())
+/// Resolves active default-route interface names across all routing tables and
+/// address families (primary NICs, failover NICs, Tailscale/WireGuard VPNs, etc.).
+fn default_route_ifaces() -> Vec<String> {
+    netlink::default_route_ifindices().unwrap_or_default().into_iter().filter_map(netlink::name_of).collect()
+}
+
+/// Scans `sys_net` (`/sys/class/net`) for non-Kiri Linux bridges that are not
+/// themselves holding a default route (e.g. Proxmox `vmbr0`), returning a
+/// sorted list of local bridges (`docker0`, `br-*`, `virbr*`, etc.) to isolate.
+fn collect_foreign_bridges(sys_net: &std::path::Path, default_ifaces: &[String]) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(sys_net) else { return Vec::new() };
+    let mut out: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let name = e.file_name().to_str()?.to_owned();
+            if name.starts_with("kiri") || default_ifaces.iter().any(|u| u == &name) {
+                return None;
+            }
+            e.path().join("bridge").is_dir().then_some(name)
         })
-        .next()
-        .ok_or_else(|| io::Error::other("no default route"))?;
-    let index = netlink::index_of(&iface)?;
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Refreshes `netlink::FOREIGN_BRIDGES`, returning `true` if the set changed.
+fn update_foreign_bridges() -> bool {
+    let default_ifaces = default_route_ifaces();
+    let bridges = collect_foreign_bridges(std::path::Path::new("/sys/class/net"), &default_ifaces);
+    let mut g = netlink::FOREIGN_BRIDGES.lock().unwrap_or_else(|e| e.into_inner());
+    if *g == bridges {
+        false
+    } else {
+        *g = bridges;
+        true
+    }
+}
+
+/// On a Linux host: enables IPv4 forwarding, detects foreign local bridges,
+/// installs Kiri's nftables table, and adapts to any host firewall. Does not
+/// require a main-table default route at boot (policy-routed VPNs such as
+/// Tailscale or delayed interfaces work as routes appear).
+pub fn host_uplink() -> io::Result<()> {
     sys::write_file("/proc/sys/net/ipv4/ip_forward", "1")?;
     // No host.docker.internal loopback redirect on a Linux host: it would
     // let containers reach the real machine's 127.0.0.1 services. host.docker
     // .internal maps to the bridge gateway instead (write_etc_files).
-    let _ = HOST_UPLINK_INDEX.set(index);
-    let uplink6 = std::fs::read_to_string("/proc/net/ipv6_route").ok().and_then(|r| default_route6_iface(&r));
-    firewall::set_uplinks(iface.clone(), uplink6.unwrap_or(iface));
+    let _ = HOST_UPLINK_INDEX.set(0);
+    let _ = update_foreign_bridges();
     through_firewall(firewall::Why::Start);
-    install_nat(Nat { uplink: index, redirect: false, dnat: Vec::new(), gateway: [0; 4] })
-}
-
-/// The interface of the IPv6 default route in /proc/net/ipv6_route (dest
-/// `::/0`), but not `lo`, which holds the unreachable default.
-fn default_route6_iface(routes: &str) -> Option<String> {
-    routes.lines().find_map(|l| {
-        let f: Vec<&str> = l.split_whitespace().collect();
-        (f.len() == 10 && f[0].bytes().all(|b| b == b'0') && f[1] == "00" && f[9] != "lo").then(|| f[9].to_owned())
-    })
+    install_nat(Nat { uplink: 0, redirect: false, dnat: Vec::new(), gateway: [0; 4] })
 }
 
 /// Linux host: a socket that hears of every nf_tables change, so a firewall
@@ -276,11 +295,43 @@ pub fn firewall_events() -> Option<OwnedFd> {
     netlink::nftables_events().inspect_err(|e| eprintln!("kiri-init: not watching the host's firewall: {e}")).ok()
 }
 
+/// Linux host: a socket that hears of link and route changes so dynamic
+/// foreign bridges (`docker0`, `br-*`, `virbr*`) and default-route bridges
+/// stay current in Kiri's forward filters.
+pub fn link_route_events() -> Option<OwnedFd> {
+    netlink::link_route_events().inspect_err(|e| eprintln!("kiri-init: not watching host links/routes: {e}")).ok()
+}
+
 /// `firewall_events` heard of a change: reads it and brings the host's
 /// firewall, and Kiri's own tables, in line.
 pub fn firewall_changed(events: &OwnedFd) {
     netlink::drain(events);
+    let foreign_changed = update_foreign_bridges();
     through_firewall(firewall::Why::Event);
+    if foreign_changed {
+        rebuild_nat_all();
+    }
+}
+
+/// `link_route_events` heard a link or route change: updates foreign-bridge
+/// isolation and rebuilds Kiri's forward filters when the bridge set changed.
+pub fn link_route_changed(events: &OwnedFd) {
+    netlink::drain(events);
+    if update_foreign_bridges() {
+        rebuild_nat_all();
+    }
+}
+
+fn rebuild_nat_all() {
+    if let Err(e) = refresh_nat() {
+        eprintln!("kiri-init: NAT: {e}");
+    }
+    let nat6 = NAT6.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if !nat6.0.is_empty()
+        && let Err(e) = refresh_nat6(&nat6.0, &nat6.1)
+    {
+        eprintln!("kiri-init: IPv6 NAT: {e}");
+    }
 }
 
 /// `firewall::sync`, with Kiri's own tables built again as last built when
@@ -405,6 +456,12 @@ fn install_nat(nat: Nat) -> io::Result<()> {
     let skip = if egress.is_empty() { Vec::new() } else { egress_skip_subnets() };
     let any_addr = nat.dnat.iter().any(|d| d.host_ip == [0; 4]);
     let wsl_host = (!nat.redirect && is_wsl()).then_some(WSL_HOST_ADDR);
+    let bridge_subnets: Vec<([u8; 4], u8)> = if nat.redirect {
+        Vec::new()
+    } else {
+        BRIDGE_SUBNETS.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|&(_, net, prefix)| (net, prefix)).collect()
+    };
+    let allow_prerouting_dnat = nat.redirect || !firewall::forwarding_blocked();
     let install = |local: Option<&[[u8; 4]]>| {
         netlink::install_nat_full(
             nat.uplink,
@@ -419,6 +476,8 @@ fn install_nat(nat: Nat) -> io::Result<()> {
             &egress,
             &skip,
             wsl_host,
+            &bridge_subnets,
+            allow_prerouting_dnat,
         )
     };
     let r = if any_addr && NO_FIB4.load(Ordering::Relaxed) {
@@ -539,10 +598,32 @@ fn local_addrs() -> Vec<[u8; 4]> {
 static HOST_UPLINK_INDEX: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
 
 /// Linux host: makes these, and only these, the published ports the kernel
-/// forwards (see `netlink::Dnat`).
+/// forwards (see `netlink::Dnat`). Returns an error when host firewall
+/// `FORWARD` chains block kernel forwarding so the daemon serves them via
+/// user-space `INPUT` relays instead of blackholing SYNs in `prerouting`.
 pub fn publish(dnat: &[netlink::Dnat]) -> io::Result<()> {
     let index = *HOST_UPLINK_INDEX.get().ok_or_else(|| io::Error::other("no uplink"))?;
+    if !dnat.is_empty() && firewall::forwarding_blocked() {
+        return Err(io::Error::other("kernel forwarding is blocked by host firewall"));
+    }
     install_nat(Nat { uplink: index, redirect: false, dnat: dnat.to_vec(), gateway: [0; 4] })
+}
+
+/// Linux host: updates Kiri's nftables table after unpublishing a container's
+/// ports, even while `firewall::forwarding_blocked()` is true, so exiting
+/// containers never leave stale `output` DNAT rules behind when other
+/// containers remain published.
+pub fn unpublish(dnat: &[netlink::Dnat]) -> io::Result<()> {
+    let index = *HOST_UPLINK_INDEX.get().ok_or_else(|| io::Error::other("no uplink"))?;
+    install_nat(Nat { uplink: index, redirect: false, dnat: dnat.to_vec(), gateway: [0; 4] })
+}
+
+/// Raises a numeric sysctl file to at least `min`, ignoring missing entries.
+fn raise_sysctl_min(path: &std::path::Path, min: u64) {
+    let Ok(raw) = std::fs::read_to_string(path) else { return };
+    if raw.trim().parse::<u64>().is_ok_and(|cur| cur < min) {
+        let _ = std::fs::write(path, min.to_string());
+    }
 }
 
 /// Brings the uplink up and returns a DHCP client for it, or None if the VM
@@ -555,6 +636,12 @@ pub fn uplink() -> io::Result<Option<Dhcp>> {
     // device (tunl0, gre0, sit0, ip6tnl0...) to every container's network:
     // they stay in the VM's own, as on a machine that loads them as modules.
     let _ = sys::write_file("/proc/sys/net/core/fb_tunnels_only_for_init_net", "1");
+    // In the VM root netns, bypass L2 bridge-netfilter hooks and conntrack for
+    // same-bridge container-to-container packets (such as Kong -> PostgREST on
+    // a user network), and raise `nf_conntrack_max` for sustained load (#509).
+    let _ = sys::write_file("/proc/sys/net/bridge/bridge-nf-call-iptables", "0");
+    let _ = sys::write_file("/proc/sys/net/bridge/bridge-nf-call-ip6tables", "0");
+    raise_sysctl_min(std::path::Path::new("/proc/sys/net/netfilter/nf_conntrack_max"), 262_144);
     match netlink::index_of(UPLINK) {
         Ok(index) => {
             let mut nl = Netlink::open(libc::NETLINK_ROUTE)?;
@@ -939,6 +1026,7 @@ impl Bridges {
             // DNATed from 127.0.0.1, so the bridge needs no `route_localnet`;
             // an older engine set it on bridges that may still exist.
             let _ = sys::write_file(&format!("/proc/sys/net/ipv4/conf/{name}/route_localnet"), "0");
+            let _ = update_foreign_bridges();
             // A firewall started after the engine, in iptables-legacy
             // (which makes no nf_tables event) too.
             through_firewall(firewall::Why::Bridge);
@@ -1199,15 +1287,33 @@ mod tests {
     }
 
     #[test]
-    fn the_ipv6_uplink_is_the_default_routes_interface() {
-        let routes = "\
-fd00000000000000000000000000000000 40 00000000000000000000000000000000 00 00000000000000000000000000000000 00000100 00000001 00000000 00000001     eth0
-00000000000000000000000000000000 00 00000000000000000000000000000000 00 fe800000000000000000000000000001 00000400 00000002 00000000 00000003    wlan0
-00000000000000000000000000000000 00 00000000000000000000000000000000 00 00000000000000000000000000000000 ffffffff 00000001 00000000 00200200       lo
-";
-        assert_eq!(default_route6_iface(routes).as_deref(), Some("wlan0"));
-        // Only the unreachable default on lo: no IPv6 uplink.
-        assert_eq!(default_route6_iface(&routes.lines().skip(2).collect::<Vec<_>>().join("\n")), None);
+    fn collect_foreign_bridges_skips_kiri_non_bridges_and_default_route_bridges() {
+        let dir = std::env::temp_dir().join(format!("kiri-net-foreign-bridges-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for dev in ["kiri0", "kiri1", "docker0", "br-1234", "virbr0", "vmbr0"] {
+            std::fs::create_dir_all(dir.join(dev).join("bridge")).unwrap();
+        }
+        for dev in ["eth0", "tailscale0", "wg0", "lo"] {
+            std::fs::create_dir_all(dir.join(dev)).unwrap();
+        }
+        let defaults = vec!["eth0".to_owned(), "tailscale0".to_owned(), "vmbr0".to_owned()];
+        assert_eq!(collect_foreign_bridges(&dir, &defaults), vec!["br-1234", "docker0", "virbr0"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn raise_sysctl_min_raises_only_below_threshold() {
+        let path = std::env::temp_dir().join(format!("kiri-net-sysctl-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        raise_sysctl_min(&path, 262_144);
+        assert!(!path.exists());
+        std::fs::write(&path, "65536\n").unwrap();
+        raise_sysctl_min(&path, 262_144);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "262144");
+        std::fs::write(&path, "524288\n").unwrap();
+        raise_sysctl_min(&path, 262_144);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "524288\n");
+        let _ = std::fs::remove_file(&path);
     }
 
     fn up(veth: &str, v4: bool, v6: bool) -> Uplink {

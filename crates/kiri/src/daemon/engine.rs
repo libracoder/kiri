@@ -3002,89 +3002,103 @@ impl Engine {
                 }
             }
             Event::Exited { id, code, oom } => {
-                let mut st = self.lock();
-                if let Some(e) = st.execs.get_mut(id) {
-                    e.running = false;
-                    e.exit_code = Some(code);
-                    e.pid = 0;
-                    e.attached.clear();
-                    let (container, exec_id, internal) = (e.container_id.clone(), e.id.clone(), e.config.internal);
+                // Drop and unpublish `c.forwards` outside `self.state` BEFORE
+                // transitioning `c.status` to `Exited` or notifying
+                // `self.changed`, so a rapid `docker restart` / `stop && start`
+                // never binds against still-open sockets or has its new DNAT
+                // rules wiped by a delayed `Forwards::drop` -> `Unpublish`
+                // (#649). Loop in case a concurrent `start`/`connect`/
+                // `set_ports` installed forwards while the lock was released.
+                let (restart_in, persist, exited_name, actor, start_owed, remove, anon, removed_log, removed_layers) = loop {
+                    let mut st = self.lock();
+                    if let Some(e) = st.execs.get_mut(id) {
+                        e.running = false;
+                        e.exit_code = Some(code);
+                        e.pid = 0;
+                        e.attached.clear();
+                        let (container, exec_id, internal) = (e.container_id.clone(), e.id.clone(), e.config.internal);
+                        drop(st);
+                        self.changed.notify_all();
+                        if !internal {
+                            self.emit_container("exec_die", &container, &[("execID", exec_id), ("exitCode", code.to_string())]);
+                        }
+                        return;
+                    }
+                    if let Some(closed_ports) = st.containers.get_mut(id).and_then(|c| c.forwards.take()) {
+                        drop(st);
+                        // Closing listeners joins their threads: never under the lock.
+                        drop(closed_ports);
+                        continue;
+                    }
+                    let mut restart_in = None;
+                    let mut persist = false;
+                    let mut exited_name = None;
+                    let actor = st.containers.get(id).map(|c| (c.spec.image.clone(), container_attrs(c)));
+                    // Exited before its start made it live: its `start` first.
+                    let start_owed = st.containers.get_mut(id).is_some_and(|c| std::mem::take(&mut c.start_owed));
+                    // Docker stops a container's healthcheck when it exits.
+                    if let Some(h) = st.health.get_mut(id) {
+                        close_monitor(h);
+                    }
+                    let remove = match st.containers.get_mut(id) {
+                        Some(c) => {
+                            c.status = Status::Exited;
+                            c.exit_code = code;
+                            c.pid = 0;
+                            c.oom_killed = oom;
+                            // Stopped by the daemon's shutdown, not by the app.
+                            c.vm_stopped = SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst);
+                            exited_name = Some(c.name.clone());
+                            c.exits += 1;
+                            c.live = false;
+                            if let Some(ip) = c.ip.take() {
+                                self.release_ip(&c.spec.network_mode, ip);
+                            }
+                            for (net, ip) in std::mem::take(&mut c.extra_ips) {
+                                self.release_ip(&net, ip);
+                            }
+                            c.first_if = None;
+                            c.extra_ifs.clear();
+                            self.release_ip6s(c);
+                            c.paused = false;
+                            c.finished = Some(SystemTime::now());
+                            // Dropping the senders ends every attach stream.
+                            c.attached.clear();
+                            lock_log(&c.log).end_follow();
+                            persist = !c.spec.auto_remove;
+                            let p = &c.spec.restart;
+                            let wants = match p.name.as_str() {
+                                "always" | "unless-stopped" => !c.stopped_by_user,
+                                "on-failure" => code != 0 && !c.stopped_by_user && (p.max_retries == 0 || c.restart_count < p.max_retries),
+                                _ => false,
+                            };
+                            // Not for the engine's own stop (Stop, the VM's sleep on
+                            // request): Start brings those back.
+                            let engine_stop = SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) || self.parking.load(std::sync::atomic::Ordering::SeqCst) || self.is_stopped();
+                            if wants && !c.spec.auto_remove && !engine_stop {
+                                let backoff = restart_backoff(c.restart_count);
+                                c.restart_count = c.restart_count.saturating_add(1);
+                                c.restart_pending = true;
+                                restart_in = Some(backoff);
+                            }
+                            c.spec.auto_remove
+                        }
+                        None => false,
+                    };
+                    let mut anon = Vec::new();
+                    let mut removed_log = None;
+                    let mut removed_layers = Vec::new();
+                    if remove {
+                        if let Some(c) = st.containers.remove(id) {
+                            anon = c.spec.anon_volumes;
+                            removed_log = Some(c.log);
+                            removed_layers = c.layers;
+                        }
+                        note_removed(&mut st, id, code);
+                    }
                     drop(st);
-                    self.changed.notify_all();
-                    if !internal {
-                        self.emit_container("exec_die", &container, &[("execID", exec_id), ("exitCode", code.to_string())]);
-                    }
-                    return;
-                }
-                let mut restart_in = None;
-                let mut persist = false;
-                let mut closed_ports = None;
-                let mut exited_name = None;
-                let actor = st.containers.get(id).map(|c| (c.spec.image.clone(), container_attrs(c)));
-                // Exited before its start made it live: its `start` first.
-                let start_owed = st.containers.get_mut(id).is_some_and(|c| std::mem::take(&mut c.start_owed));
-                // Docker stops a container's healthcheck when it exits.
-                if let Some(h) = st.health.get_mut(id) {
-                    close_monitor(h);
-                }
-                let remove = match st.containers.get_mut(id) {
-                    Some(c) => {
-                        c.status = Status::Exited;
-                        c.exit_code = code;
-                        c.pid = 0;
-                        c.oom_killed = oom;
-                        // Stopped by the daemon's shutdown, not by the app.
-                        c.vm_stopped = SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst);
-                        exited_name = Some(c.name.clone());
-                        c.exits += 1;
-                        c.live = false;
-                        if let Some(ip) = c.ip.take() {
-                            self.release_ip(&c.spec.network_mode, ip);
-                        }
-                        for (net, ip) in std::mem::take(&mut c.extra_ips) {
-                            self.release_ip(&net, ip);
-                        }
-                        c.first_if = None;
-                        c.extra_ifs.clear();
-                        self.release_ip6s(c);
-                        c.paused = false;
-                        closed_ports = c.forwards.take();
-                        c.finished = Some(SystemTime::now());
-                        // Dropping the senders ends every attach stream.
-                        c.attached.clear();
-                        lock_log(&c.log).end_follow();
-                        persist = !c.spec.auto_remove;
-                        let p = &c.spec.restart;
-                        let wants = match p.name.as_str() {
-                            "always" | "unless-stopped" => !c.stopped_by_user,
-                            "on-failure" => code != 0 && !c.stopped_by_user && (p.max_retries == 0 || c.restart_count < p.max_retries),
-                            _ => false,
-                        };
-                        // Not for the engine's own stop (Stop, the VM's sleep on
-                        // request): Start brings those back.
-                        let engine_stop = SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) || self.parking.load(std::sync::atomic::Ordering::SeqCst) || self.is_stopped();
-                        if wants && !c.spec.auto_remove && !engine_stop {
-                            let backoff = restart_backoff(c.restart_count);
-                            c.restart_count = c.restart_count.saturating_add(1);
-                            c.restart_pending = true;
-                            restart_in = Some(backoff);
-                        }
-                        c.spec.auto_remove
-                    }
-                    None => false,
+                    break (restart_in, persist, exited_name, actor, start_owed, remove, anon, removed_log, removed_layers);
                 };
-                let mut anon = Vec::new();
-                let mut removed_log = None;
-                let mut removed_layers = Vec::new();
-                if remove {
-                    if let Some(c) = st.containers.remove(id) {
-                        anon = c.spec.anon_volumes;
-                        removed_log = Some(c.log);
-                        removed_layers = c.layers;
-                    }
-                    note_removed(&mut st, id, code);
-                }
-                drop(st);
                 // Relieve the balloon and log the exit outside `self.state` so
                 // neither `memory_target`, `link` nor `stopping_ops` is ever
                 // nested under it, and before the exit is reported to waiters.
@@ -3102,8 +3116,6 @@ impl Engine {
                         self.emit_container_with("destroy", id, &image, attrs, &[]);
                     }
                 }
-                // Closing listeners joins their threads: never under the lock.
-                drop(closed_ports);
                 if let Some(log) = removed_log {
                     lock_log(&log).remove();
                 }
@@ -5309,17 +5321,31 @@ impl Engine {
             let vm = self.vm()?;
             match super::ports::start(vm.clone(), &id, &ports, target) {
                 Ok(fw) => {
-                    if let Some(c) = self.lock().containers.get_mut(&id) {
-                        c.forwards = Some(fw);
-                    }
+                    let mut st = self.lock();
+                    let stale = if let Some(c) = st.containers.get_mut(&id).filter(|c| c.status == Status::Running && !vm.is_disconnected()) {
+                        c.forwards.replace(fw)
+                    } else {
+                        Some(fw)
+                    };
+                    drop(st);
+                    drop(stale);
                 }
                 Err(e) => {
                     crate::diag::warn!("new ports not published; the old ones are kept", id = &id[..12], error = e);
-                    let back = (!old_ports.is_empty()).then(|| super::ports::start(vm, &id, &old_ports, target).ok()).flatten();
-                    if let Some(c) = self.lock().containers.get_mut(&id) {
+                    let back = (!old_ports.is_empty()).then(|| super::ports::start(vm.clone(), &id, &old_ports, target).ok()).flatten();
+                    let mut st = self.lock();
+                    let stale = if let Some(c) = st.containers.get_mut(&id) {
                         c.spec.ports = old_ports;
-                        c.forwards = back;
-                    }
+                        if c.status == Status::Running && !vm.is_disconnected() {
+                            std::mem::replace(&mut c.forwards, back)
+                        } else {
+                            back
+                        }
+                    } else {
+                        back
+                    };
+                    drop(st);
+                    drop(stale);
                     return Err(Error::Conflict(e.to_string()));
                 }
             }
@@ -5666,7 +5692,7 @@ impl Engine {
         *removing = removing.wrapping_add(1);
         self.emit_container("destroy", &id, &[]);
         let mut st = self.lock();
-        let removed = st.containers.remove(&id);
+        let mut removed = st.containers.remove(&id);
         // A `--rm` container that exited while the kill above waited has
         // removed itself and noted its code (137 when this kill ended it);
         // noting it again, with no record to read, told its waiters 0.
@@ -5675,6 +5701,9 @@ impl Engine {
         }
         st.execs.retain(|_, e| e.container_id != id);
         drop(st);
+        // Closing listeners joins their threads: never under the lock, and
+        // before waking waiters or returning to callers that may rebind ports.
+        drop(removed.as_mut().and_then(|c| c.forwards.take()));
         self.clear_stopping_op(&id);
         self.changed.notify_all();
         let anon = self.unshared(removed.as_ref().map(|c| c.spec.anon_volumes.clone()).unwrap_or_default());
@@ -10196,6 +10225,141 @@ mod volume_remove_tests {
         let decoded: Saved = serde_json::from_slice(&ref_bytes).unwrap();
         assert_eq!(decoded, saved_owned);
 
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod exit_forwards_tests {
+    use super::*;
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    fn engine_running(name: &str) -> (Arc<Engine>, String, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("kiri-exit-fwd-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let engine = Engine::boot(Store::open(&dir).unwrap()).unwrap();
+        engine.stopped.store(true, Ordering::SeqCst);
+        let image = Image {
+            mirror: None,
+            name: "test:local".into(),
+            digest: "sha256:test".into(),
+            index_digest: None,
+            config_digest: "sha256:test".into(),
+            layers: Vec::new(),
+            size: 0,
+            platform: "linux/arm64".into(),
+            created: String::new(),
+            pulled_at: 0,
+            config: Default::default(),
+        };
+        let spec: Spec = serde_json::from_value(serde_json::json!({
+            "image": "test:local", "image_id": "sha256:test", "entrypoint": [], "cmd": ["sleep", "60"],
+            "env": [], "cwd": "/", "user": "", "auto_remove": false, "network_mode": "none", "labels": {},
+            "restart": {"name": "no", "max_retries": 0}
+        }))
+        .unwrap();
+        let id = engine.create(Some(name.into()), spec, &image).unwrap();
+        engine.lock().containers.get_mut(&id).unwrap().status = Status::Running;
+        (engine, id, dir)
+    }
+
+    /// `Event::Exited` must drop (unpublish + close listeners + join threads)
+    /// `c.forwards` outside `self.state` BEFORE setting `c.status = Exited`
+    /// and notifying `self.changed`, so a rapid `docker restart` (`wait("not-running")`
+    /// -> `start`) never binds against still-open sockets or has its new DNAT
+    /// rules wiped by a delayed `Forwards::drop` (#649).
+    #[test]
+    fn event_exited_drops_forwards_before_marking_exited_or_waking_restart() {
+        let (engine, id, dir) = engine_running("ordered");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let saw_running_on_drop = Arc::new(AtomicBool::new(false));
+        let second_dropped = Arc::new(AtomicBool::new(false));
+        let drop_count = Arc::new(AtomicUsize::new(0));
+
+        let fw = {
+            let engine = engine.clone();
+            let id = id.clone();
+            let dropped = dropped.clone();
+            let saw_running = saw_running_on_drop.clone();
+            let second_dropped = second_dropped.clone();
+            let drop_count = drop_count.clone();
+            super::super::ports::Forwards::test_dummy(Vec::new(), Some(listener), move || {
+                // Acquiring `engine.lock()` proves `Forwards::drop` runs outside `self.state`.
+                let mut st = engine.lock();
+                let c = st.containers.get_mut(&id).unwrap();
+                assert!(c.forwards.is_none(), "c.forwards must already be taken");
+                saw_running.store(c.status == Status::Running, Ordering::SeqCst);
+                // Simulate a concurrent start/connect/set_ports installing a second
+                // `Forwards` while the lock was released: `Event::Exited` must drop
+                // it too before transitioning to `Exited`.
+                let count = drop_count.clone();
+                let second = second_dropped.clone();
+                c.forwards = Some(super::super::ports::Forwards::test_dummy(Vec::new(), None, move || {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    second.store(true, Ordering::SeqCst);
+                }));
+                drop(st);
+                // Widen any window where a racing `wait("not-running")` could wake early.
+                std::thread::sleep(Duration::from_millis(40));
+                drop_count.fetch_add(1, Ordering::SeqCst);
+                dropped.store(true, Ordering::SeqCst);
+            })
+        };
+        engine.lock().containers.get_mut(&id).unwrap().forwards = Some(fw);
+
+        let waiter = {
+            let (engine, id) = (engine.clone(), id.clone());
+            let (dropped, second_dropped) = (dropped.clone(), second_dropped.clone());
+            std::thread::spawn(move || {
+                let code = engine.wait(&id, "not-running").unwrap();
+                assert_eq!(code, 0);
+                // The instant `docker restart`'s `wait("not-running")` wakes up,
+                // every old `Forwards` has ALREADY finished dropping/unpublishing
+                // and the bound port is free to rebind immediately.
+                assert!(dropped.load(Ordering::SeqCst), "old Forwards must drop before wait wakes");
+                assert!(second_dropped.load(Ordering::SeqCst), "raced Forwards must also drop before wait wakes");
+                let rebound = TcpListener::bind(("127.0.0.1", port));
+                assert!(rebound.is_ok(), "port {port} must already be closed when wait returns: {rebound:?}");
+            })
+        };
+        // Let the waiter enter `self.changed.wait`.
+        std::thread::sleep(Duration::from_millis(30));
+        engine.on_event(Event::Exited { id: &id, code: 0, oom: false });
+        waiter.join().unwrap();
+
+        assert!(saw_running_on_drop.load(Ordering::SeqCst), "c.status must still be Running while old Forwards drops");
+        assert_eq!(drop_count.load(Ordering::SeqCst), 2);
+        let st = engine.lock();
+        assert_eq!(st.containers[&id].status, Status::Exited);
+        assert!(st.containers[&id].forwards.is_none());
+        drop(st);
+        drop(engine);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `remove()` must also drop any leftover `c.forwards` outside `self.state`.
+    #[test]
+    fn remove_drops_forwards_outside_state_lock() {
+        let (engine, id, dir) = engine_running("rm-outside-lock");
+        let dropped = Arc::new(AtomicBool::new(false));
+        {
+            let engine_ref = engine.clone();
+            let dropped_ref = dropped.clone();
+            let mut st = engine.lock();
+            let c = st.containers.get_mut(&id).unwrap();
+            c.status = Status::Exited;
+            c.forwards = Some(super::super::ports::Forwards::test_dummy(Vec::new(), None, move || {
+                // Must not deadlock: `self.state` is not held when `Forwards` drops.
+                let _st = engine_ref.lock();
+                dropped_ref.store(true, Ordering::SeqCst);
+            }));
+        }
+        engine.remove(&id, false, false).unwrap();
+        assert!(dropped.load(Ordering::SeqCst), "remove() must drop leftover Forwards before returning");
+        drop(engine);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

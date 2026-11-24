@@ -122,8 +122,10 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
     };
     // On a Linux host, SIGTERM or SIGINT stops the agent as Shutdown does.
     let term = if host_process { Some(term_signals()?) } else { None };
-    // On a Linux host, its firewall may start, reload or flush after the engine.
+    // On a Linux host, its firewall may start, reload or flush after the engine,
+    // and interfaces/routes (foreign bridges, default-route bridges, VPNs) may appear or change.
     let firewall = if host_process { net::firewall_events() } else { None };
+    let link_events = if host_process { net::link_route_events() } else { None };
     let mut bridges = Bridges::default();
     // In the VM, lookups the gateway's resolver fails go through the host.
     let mut dns = super::dns::Dns::default();
@@ -187,6 +189,7 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
         fds.push(libc::pollfd { fd: pressure.as_ref().map_or(-1, |f| f.as_raw_fd()), events: libc::POLLPRI, revents: 0 });
         fds.push(libc::pollfd { fd: term.as_ref().map_or(-1, |f| f.as_raw_fd()), events: libc::POLLIN, revents: 0 });
         fds.push(libc::pollfd { fd: firewall.as_ref().map_or(-1, |f| f.as_raw_fd()), events: libc::POLLIN, revents: 0 });
+        fds.push(libc::pollfd { fd: link_events.as_ref().map_or(-1, |f| f.as_raw_fd()), events: libc::POLLIN, revents: 0 });
         fds.push(libc::pollfd { fd: measuring.as_ref().map_or(-1, super::usage::Job::fd), events: libc::POLLIN, revents: 0 });
         super::copy::interest(&mut fds);
         for r in &relays {
@@ -269,6 +272,10 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
             }
             if let Some(f) = firewall.as_ref().filter(|f| f.as_raw_fd() == pfd.fd) {
                 net::firewall_changed(f);
+                continue;
+            }
+            if let Some(l) = link_events.as_ref().filter(|l| l.as_raw_fd() == pfd.fd) {
+                net::link_route_changed(l);
                 continue;
             }
             if measuring.as_ref().is_some_and(|j| j.fd() == pfd.fd) {
@@ -618,7 +625,7 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
                     if published.len() != before {
                         let all = published.iter().map(|(_, d)| *d).collect::<Vec<_>>();
                         let gateway = dhcp.as_ref().and_then(|d| d.lease.as_ref()).map_or([0; 4], |l| l.gateway);
-                        if let Err(e) = if host_process { net::publish(&all) } else { net::publish_vm(&all, gateway) } {
+                        if let Err(e) = if host_process { net::unpublish(&all) } else { net::publish_vm(&all, gateway) } {
                             eprintln!("kiri-init: unpublish {id}: {e}");
                         }
                     }
@@ -686,12 +693,26 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
                 Ok(Msg::SetTime(ns)) => {
                     // A host process shares the host's clock; only the VM needs
                     // telling. The host sends it again every minute and after
-                    // the Mac wakes: stepped only when off by more than a
-                    // quarter second, so the clock is not nudged back and forth.
-                    if !host_process && clock_off(ns) {
-                        let ts = libc::timespec { tv_sec: (ns / 1_000_000_000) as _, tv_nsec: (ns % 1_000_000_000) as _ };
-                        // SAFETY: `ts` is a valid timespec.
-                        unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &ts) };
+                    // the Mac wakes: slew sub-second drift smoothly with
+                    // adjtimex (#509) and hard-step only large jumps (> 1 s).
+                    if !host_process {
+                        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
+                        match clock_adjustment(now, ns) {
+                            ClockAdjust::None => {}
+                            ClockAdjust::Slew(offset_us) => {
+                                // SAFETY: zeroed `libc::timex` is valid; only plain scalar fields are set.
+                                let mut tx: libc::timex = unsafe { std::mem::zeroed() };
+                                tx.modes = libc::ADJ_OFFSET_SINGLESHOT;
+                                tx.offset = offset_us as _;
+                                // SAFETY: `tx` is a valid initialized `libc::timex`.
+                                unsafe { libc::adjtimex(&mut tx) };
+                            }
+                            ClockAdjust::Step => {
+                                let ts = libc::timespec { tv_sec: (ns / 1_000_000_000) as _, tv_nsec: (ns % 1_000_000_000) as _ };
+                                // SAFETY: `ts` is a valid timespec.
+                                unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &ts) };
+                            }
+                        }
                     }
                     continue;
                 }
@@ -1169,15 +1190,31 @@ fn self_rss_kib() -> u64 {
     pages * unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64 / 1024
 }
 
-/// Whether the guest's clock is more than a quarter second from `ns`
-/// (Unix nanoseconds, the host's time).
-fn clock_off(ns: u64) -> bool {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
-    off_by_more(now, ns, 250_000_000)
+const CLOCK_SLOP_NS: u64 = 250_000_000;
+const CLOCK_STEP_NS: u64 = 1_000_000_000;
+const ADJ_MAX_PHASE_US: i64 = 500_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClockAdjust {
+    None,
+    /// Smoothly slew `offset_us` microseconds via `adjtimex(ADJ_OFFSET_SINGLESHOT)`.
+    Slew(i64),
+    /// Hard-step `CLOCK_REALTIME` after large jumps (e.g. VM wake from sleep).
+    Step,
 }
 
-fn off_by_more(a: u64, b: u64, limit: u64) -> bool {
-    a.abs_diff(b) > limit
+/// Decides how the guest clock should correct drift toward `target_ns` (Unix ns):
+/// ignore `<= 250 ms`, slew `(250 ms, 1 s]` smoothly, and hard-step `> 1 s` (#509).
+fn clock_adjustment(now_ns: u64, target_ns: u64) -> ClockAdjust {
+    let diff = now_ns.abs_diff(target_ns);
+    if diff <= CLOCK_SLOP_NS {
+        return ClockAdjust::None;
+    }
+    if diff > CLOCK_STEP_NS {
+        return ClockAdjust::Step;
+    }
+    let signed_us = if target_ns >= now_ns { (diff / 1_000) as i64 } else { -((diff / 1_000) as i64) };
+    ClockAdjust::Slew(signed_us.clamp(-ADJ_MAX_PHASE_US, ADJ_MAX_PHASE_US))
 }
 
 /// Reads one frame into `buf`. Returns false on a clean end of stream.
@@ -1781,17 +1818,22 @@ mod running_tests {
 
 #[cfg(test)]
 mod clock_tests {
-    use super::off_by_more;
+    use super::{ClockAdjust, clock_adjustment};
 
     #[test]
-    fn steps_only_when_the_clock_is_off() {
+    fn slews_subsecond_drift_and_steps_only_large_jumps() {
         let now = 1_792_800_000_000_000_000;
-        assert!(!off_by_more(now, now, 250_000_000));
-        assert!(!off_by_more(now, now + 200_000_000, 250_000_000));
-        assert!(!off_by_more(now + 200_000_000, now, 250_000_000));
-        // An hour behind, after the Mac slept.
-        assert!(off_by_more(now - 3_600_000_000_000, now, 250_000_000));
-        assert!(off_by_more(now + 300_000_000, now, 250_000_000));
+        assert_eq!(clock_adjustment(now, now), ClockAdjust::None);
+        assert_eq!(clock_adjustment(now, now + 200_000_000), ClockAdjust::None);
+        assert_eq!(clock_adjustment(now + 200_000_000, now), ClockAdjust::None);
+        // Sub-second drift (> 250 ms, <= 1 s) slews smoothly via adjtimex instead of stepping.
+        assert_eq!(clock_adjustment(now, now + 300_000_000), ClockAdjust::Slew(300_000));
+        assert_eq!(clock_adjustment(now + 300_000_000, now), ClockAdjust::Slew(-300_000));
+        assert_eq!(clock_adjustment(now, now + 800_000_000), ClockAdjust::Slew(500_000));
+        assert_eq!(clock_adjustment(now + 800_000_000, now), ClockAdjust::Slew(-500_000));
+        // An hour behind, after the Mac slept, still hard-steps.
+        assert_eq!(clock_adjustment(now - 3_600_000_000_000, now), ClockAdjust::Step);
+        assert_eq!(clock_adjustment(now, now + 1_500_000_000), ClockAdjust::Step);
     }
 }
 

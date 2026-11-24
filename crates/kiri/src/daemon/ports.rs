@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -472,6 +472,15 @@ pub fn wsl_ipv4() -> Option<std::net::Ipv4Addr> {
         .map(|(_, ip)| ip)
 }
 
+/// Monotonic generation tagging each `Forwards` publish batch so a stale
+/// `Forwards::drop` -> `Msg::Unpublish` can never wipe the DNAT rules of a
+/// newly restarted container with the same ID (#649).
+static PUBLISH_GEN: AtomicU64 = AtomicU64::new(1);
+
+fn publish_key(id: &str) -> String {
+    format!("{id}:{}", PUBLISH_GEN.fetch_add(1, Ordering::Relaxed))
+}
+
 /// A running forward for one container; dropping it closes every listener.
 pub struct Forwards {
     wake: Vec<OwnedFd>,
@@ -490,6 +499,43 @@ pub struct Forwards {
     host_port_53: Option<HostPort53Guard>,
     /// What was actually bound: (binding, host address, host port).
     pub bound: Vec<(Binding, String, u16)>,
+    #[cfg(test)]
+    on_drop: Option<Box<dyn FnOnce() + Send>>,
+}
+
+#[cfg(test)]
+impl Forwards {
+    /// Test helper: builds a `Forwards` that runs `on_drop` (after joining any
+    /// listener thread and closing any bound socket) when dropped.
+    pub(super) fn test_dummy(bound: Vec<(Binding, String, u16)>, listener: Option<TcpListener>, on_drop: impl FnOnce() + Send + 'static) -> Forwards {
+        let mut wake = Vec::new();
+        let mut threads = Vec::new();
+        if let Some(l) = listener {
+            let (wake_r, wake_w) = pipe().unwrap();
+            wake.push(wake_w);
+            threads.push(
+                std::thread::Builder::new()
+                    .name("kiri-test-port".into())
+                    .spawn(move || {
+                        let _keep = l;
+                        let mut pfd = libc::pollfd { fd: wake_r.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+                        // SAFETY: polling a single owned pipe descriptor until its write end closes.
+                        unsafe { libc::poll(&mut pfd, 1, -1) };
+                    })
+                    .unwrap(),
+            );
+        }
+        Forwards {
+            wake,
+            threads,
+            kernel: None,
+            nat: None,
+            loopback: None,
+            host_port_53: None,
+            bound,
+            on_drop: Some(Box::new(on_drop)),
+        }
+    }
 }
 
 impl std::fmt::Debug for Forwards {
@@ -518,6 +564,10 @@ impl Drop for Forwards {
         self.wake.clear();
         for t in self.threads.drain(..) {
             let _ = t.join();
+        }
+        #[cfg(test)]
+        if let Some(f) = self.on_drop.take() {
+            f();
         }
     }
 }
@@ -840,6 +890,85 @@ fn bind_with_macos_low_loopback_with<T>(
     }
 }
 
+/// Result of attempting Linux-host kernel DNAT publication for a container's
+/// bound sockets (`publish_linux_host`).
+struct LinuxPublish<T, U> {
+    any_published: bool,
+    kernel_bound: Vec<(Binding, String, u16)>,
+    kernel_tcp: Vec<T>,
+    kernel_udp: Vec<U>,
+    relay_tcp: Vec<(Binding, Option<String>, String, u16, bool, T)>,
+    relay_udp: Vec<(Binding, Option<String>, String, u16, bool, U)>,
+    fallback_error: Option<io::Error>,
+}
+
+/// Linux host: installs kernel DNAT rules for every non-loopback IPv4 binding
+/// and separates kernel-only sockets (kept bound to reserve the ports) from
+/// user-space relayed ones (`relay_direct` / `udp_loop`). If any `publish`
+/// fails — notably when the host firewall blocks kernel `FORWARD` (#649) —
+/// unpublishes `publish_id` and leaves every socket in the user-space relay
+/// lists so remote connections are accepted on `INPUT` via `relay_direct`
+/// instead of being blackholed by `prerouting` DNAT.
+fn publish_linux_host<T, U>(
+    publish_id: &str,
+    target_ip: [u8; 4],
+    tcp: Vec<(Binding, Option<String>, String, u16, bool, T)>,
+    udp: Vec<(Binding, Option<String>, String, u16, bool, U)>,
+    mut publish: impl FnMut(kiri_proto::Publish<'_>) -> io::Result<()>,
+    mut unpublish: impl FnMut(&str),
+) -> LinuxPublish<T, U> {
+    let all = udp
+        .iter()
+        .map(|(b, _, bind_ip, port, _, _)| (b, bind_ip, *port, true))
+        .chain(tcp.iter().map(|(b, _, bind_ip, port, _, _)| (b, bind_ip, *port, false)));
+    let mut published = Ok(false);
+    for (b, bind_ip, port, is_udp) in all.filter(|(_, bind_ip, ..)| kernel_forwards(bind_ip)) {
+        let p = kiri_proto::Publish {
+            id: publish_id,
+            udp: is_udp,
+            host_ip: kernel_host_ip(bind_ip).expect("checked IPv4 binding"),
+            host_port: port,
+            to_ip: target_ip,
+            to_port: b.container_port,
+        };
+        published = publish(p).map(|()| true);
+        if published.is_err() {
+            break;
+        }
+    }
+    match published {
+        Ok(any_published) => {
+            // Sockets only the kernel serves stay bound, so the ports read as taken.
+            let (kernel_udp, relay_udp): (Vec<_>, Vec<_>) = udp.into_iter().partition(|(_, _, bind_ip, ..)| !relays_too(bind_ip));
+            let (kernel_tcp, relay_tcp): (Vec<_>, Vec<_>) = tcp.into_iter().partition(|(_, _, bind_ip, ..)| !relays_too(bind_ip));
+            let mut kernel_bound = Vec::with_capacity(kernel_udp.len() + kernel_tcp.len());
+            kernel_bound.extend(kernel_udp.iter().filter_map(|(b, rep_ip, _, port, _, _)| rep_ip.as_ref().map(|ip| (b.clone(), ip.clone(), *port))));
+            kernel_bound.extend(kernel_tcp.iter().filter_map(|(b, rep_ip, _, port, _, _)| rep_ip.as_ref().map(|ip| (b.clone(), ip.clone(), *port))));
+            LinuxPublish {
+                any_published,
+                kernel_bound,
+                kernel_tcp: kernel_tcp.into_iter().map(|(.., s)| s).collect(),
+                kernel_udp: kernel_udp.into_iter().map(|(.., s)| s).collect(),
+                relay_tcp,
+                relay_udp,
+                fallback_error: None,
+            }
+        }
+        Err(e) => {
+            unpublish(publish_id);
+            LinuxPublish {
+                any_published: false,
+                kernel_bound: Vec::new(),
+                kernel_tcp: Vec::new(),
+                kernel_udp: Vec::new(),
+                relay_tcp: tcp,
+                relay_udp: udp,
+                fallback_error: Some(e),
+            }
+        }
+    }
+}
+
 /// Binds every port first (so a clash fails the start cleanly), then starts
 /// one accept thread per listener.
 pub fn start(vm: Arc<VmLink>, id: &str, bindings: &[Binding], target_ip: [u8; 4]) -> io::Result<Forwards> {
@@ -947,49 +1076,44 @@ pub fn start(vm: Arc<VmLink>, id: &str, bindings: &[Binding], target_ip: [u8; 4]
             }
         }
     }
-    let mut fw = Forwards { wake: Vec::new(), threads: Vec::new(), kernel: None, nat: None, loopback: None, host_port_53: None, bound: Vec::new() };
+    let publish_id = publish_key(id);
+    let mut fw = Forwards {
+        wake: Vec::new(),
+        threads: Vec::new(),
+        kernel: None,
+        nat: None,
+        loopback: None,
+        host_port_53: None,
+        bound: Vec::new(),
+        #[cfg(test)]
+        on_drop: None,
+    };
     // On a Linux host the daemon shares the kernel with the containers, so
     // the kernel can rewrite the packets (nftables DNAT) instead of two
     // user-space relays copying every byte; that serves every address but
-    // loopback. The listeners below relay the rest.
+    // loopback. The listeners below relay the rest (and everything when the
+    // host firewall blocks kernel FORWARD, #649).
     if cfg!(target_os = "linux") && target_ip != [127, 0, 0, 1] {
-        let all = udp
-            .iter()
-            .map(|(b, _, bind_ip, port, _, _)| (b, bind_ip, *port, true))
-            .chain(listeners.iter().map(|(b, _, bind_ip, port, _, _)| (b, bind_ip, *port, false)));
-        let mut published = Ok(false);
-        for (b, bind_ip, port, is_udp) in all.filter(|(_, bind_ip, ..)| kernel_forwards(bind_ip)) {
-            let p = kiri_proto::Publish {
-                id,
-                udp: is_udp,
-                host_ip: kernel_host_ip(bind_ip).expect("checked IPv4 binding"),
-                host_port: port,
-                to_ip: target_ip,
-                to_port: b.container_port,
-            };
-            published = vm.publish(p).map(|()| true);
-            if published.is_err() {
-                break;
+        let res = publish_linux_host(
+            &publish_id,
+            target_ip,
+            listeners,
+            udp,
+            |p| vm.publish(p),
+            |pid| {
+                let _ = vm.unpublish(pid);
+            },
+        );
+        if let Some(e) = res.fallback_error {
+            crate::diag::warn!("kernel port forwarding failed; relaying in user space", id = &id[..id.len().min(12)], error = e);
+        } else {
+            fw.bound.extend(res.kernel_bound);
+            if res.any_published {
+                fw.kernel = Some((vm.clone(), publish_id.clone(), res.kernel_tcp, res.kernel_udp));
             }
         }
-        match published {
-            Ok(any) => {
-                // Sockets only the kernel serves stay bound, so the ports read as taken.
-                let (kernel_udp, relay_udp): (Vec<_>, Vec<_>) = udp.into_iter().partition(|(_, _, bind_ip, ..)| !relays_too(bind_ip));
-                let (kernel_tcp, relay_tcp): (Vec<_>, Vec<_>) = listeners.into_iter().partition(|(_, _, bind_ip, ..)| !relays_too(bind_ip));
-                fw.bound.extend(kernel_udp.iter().filter_map(|(b, rep_ip, _, port, _, _)| rep_ip.as_ref().map(|ip| (b.clone(), ip.clone(), *port))));
-                fw.bound.extend(kernel_tcp.iter().filter_map(|(b, rep_ip, _, port, _, _)| rep_ip.as_ref().map(|ip| (b.clone(), ip.clone(), *port))));
-                if any {
-                    fw.kernel = Some((vm.clone(), id.to_owned(), kernel_tcp.into_iter().map(|(.., s)| s).collect(), kernel_udp.into_iter().map(|(.., s)| s).collect()));
-                }
-                udp = relay_udp;
-                listeners = relay_tcp;
-            }
-            Err(e) => {
-                let _ = vm.unpublish(id);
-                crate::diag::warn!("kernel port forwarding failed; relaying in user space", id = &id[..id.len().min(12)], error = e);
-            }
-        }
+        udp = res.relay_udp;
+        listeners = res.relay_tcp;
     }
     for (b, rep_ip, _bind_ip, port, loopback_only, sock) in udp {
         let (wake_r, wake_w) = pipe()?;
@@ -1008,10 +1132,10 @@ pub fn start(vm: Arc<VmLink>, id: &str, bindings: &[Binding], target_ip: [u8; 4]
     // shared NAT) stays relayed over vsock.
     let mut nat = vec![None; listeners.len()];
     if cfg!(target_os = "macos") && shared_nat_active() && target_ip != [127, 0, 0, 1] && !listeners.is_empty() {
-        match publish_nat(&vm, id, &listeners.iter().map(|(b, ..)| b.container_port).collect::<Vec<_>>(), target_ip) {
+        match publish_nat(&vm, &publish_id, &listeners.iter().map(|(b, ..)| b.container_port).collect::<Vec<_>>(), target_ip) {
             Ok((addrs, ports)) => {
                 nat = addrs.into_iter().map(Some).collect();
-                fw.nat = Some((vm.clone(), id.to_owned(), ports));
+                fw.nat = Some((vm.clone(), publish_id.clone(), ports));
             }
             Err(e) => crate::diag::warn!("NAT port forwarding unavailable; relaying over vsock", id = &id[..id.len().min(12)], error = e),
         }
@@ -1026,14 +1150,14 @@ pub fn start(vm: Arc<VmLink>, id: &str, bindings: &[Binding], target_ip: [u8; 4]
         let ports = loopback_ports(listeners.iter().filter_map(|(b, rep_ip, _, port, _, _)| rep_ip.as_deref().map(|ip| (b.container_port, ip, *port))));
         let mut published = false;
         for (to_port, host_port) in ports {
-            let p = kiri_proto::Publish { id, udp: false, host_ip: [127, 0, 0, 1], host_port, to_ip: target_ip, to_port };
+            let p = kiri_proto::Publish { id: &publish_id, udp: false, host_ip: [127, 0, 0, 1], host_port, to_ip: target_ip, to_port };
             match vm.publish(p) {
                 Ok(()) => published = true,
                 Err(e) => crate::diag::warn!("published port not reachable from host-network containers", port = host_port, error = e),
             }
         }
         if published {
-            fw.loopback = Some((vm.clone(), id.to_owned()));
+            fw.loopback = Some((vm.clone(), publish_id.clone()));
         }
     }
     for ((b, rep_ip, _bind_ip, port, loopback_only, listener), nat) in listeners.into_iter().zip(nat) {
@@ -4569,5 +4693,104 @@ tcp4       0      0  *.53                   *.*                    LISTEN      1
             drop(wake_w);
             t.join().unwrap();
         }
+    }
+
+    #[test]
+    fn linux_host_publish_falls_back_to_user_space_relay_when_forwarding_blocked() {
+        use super::{Binding, publish_key, publish_linux_host};
+        use std::io;
+
+        let tcp_entry = |host_ip: &str, host_port: u16, container_port: u16, tag: &'static str| {
+            let b = Binding { container_port, proto: "tcp".into(), host_ip: host_ip.into(), host_port };
+            (b, Some(host_ip.to_owned()), host_ip.to_owned(), host_port, false, tag)
+        };
+        let udp_entry = |host_ip: &str, host_port: u16, container_port: u16, tag: &'static str| {
+            let b = Binding { container_port, proto: "udp".into(), host_ip: host_ip.into(), host_port };
+            (b, Some(host_ip.to_owned()), host_ip.to_owned(), host_port, false, tag)
+        };
+
+        // 1. Open forwarding: wildcard stays relayed (for loopback) + published,
+        //    specific LAN IP moves to kernel-only, loopback & IPv6 stay relayed only.
+        let mut published = Vec::new();
+        let mut unpublished = Vec::new();
+        let open = publish_linux_host(
+            "cid:1",
+            [172, 17, 0, 2],
+            vec![
+                tcp_entry("0.0.0.0", 8080, 80, "tcp-any"),
+                tcp_entry("192.168.1.5", 8443, 443, "tcp-lan"),
+                tcp_entry("127.0.0.1", 9000, 90, "tcp-lo"),
+                tcp_entry("::", 8080, 80, "tcp-v6"),
+            ],
+            vec![
+                udp_entry("0.0.0.0", 5353, 53, "udp-any"),
+                udp_entry("192.168.1.5", 5354, 54, "udp-lan"),
+            ],
+            |p| {
+                published.push((p.id.to_owned(), p.udp, p.host_ip, p.host_port, p.to_ip, p.to_port));
+                Ok(())
+            },
+            |id| unpublished.push(id.to_owned()),
+        );
+        assert!(open.fallback_error.is_none());
+        assert!(open.any_published);
+        assert!(unpublished.is_empty());
+        assert_eq!(published.len(), 4, "only non-loopback IPv4 bindings are DNATed");
+        assert!(published.iter().all(|(id, ..)| id == "cid:1"));
+        assert_eq!(open.kernel_tcp, vec!["tcp-lan"]);
+        assert_eq!(open.kernel_udp, vec!["udp-lan"]);
+        assert_eq!(open.relay_tcp.iter().map(|t| t.5).collect::<Vec<_>>(), vec!["tcp-any", "tcp-lo", "tcp-v6"]);
+        assert_eq!(open.relay_udp.iter().map(|u| u.5).collect::<Vec<_>>(), vec!["udp-any"]);
+        assert_eq!(open.kernel_bound.len(), 2);
+
+        // 2. Host firewall blocks kernel FORWARD (#649): agent rejects publish,
+        //    unpublish rolls back, and EVERY socket (including specific LAN IP)
+        //    stays in user-space relay lists (`relay_direct` / `udp_loop`).
+        let mut unpublished = Vec::new();
+        let blocked = publish_linux_host(
+            "cid:2",
+            [172, 17, 0, 2],
+            vec![
+                tcp_entry("0.0.0.0", 8080, 80, "tcp-any"),
+                tcp_entry("192.168.1.5", 8443, 443, "tcp-lan"),
+                tcp_entry("127.0.0.1", 9000, 90, "tcp-lo"),
+            ],
+            vec![udp_entry("192.168.1.5", 5354, 54, "udp-lan")],
+            |_| Err(io::Error::other("kernel forwarding is blocked by host firewall")),
+            |id| unpublished.push(id.to_owned()),
+        );
+        assert!(blocked.fallback_error.is_some());
+        assert!(!blocked.any_published);
+        assert_eq!(unpublished, vec!["cid:2"]);
+        assert!(blocked.kernel_tcp.is_empty());
+        assert!(blocked.kernel_udp.is_empty());
+        assert!(blocked.kernel_bound.is_empty());
+        assert_eq!(blocked.relay_tcp.iter().map(|t| t.5).collect::<Vec<_>>(), vec!["tcp-any", "tcp-lan", "tcp-lo"]);
+        assert_eq!(blocked.relay_udp.iter().map(|u| u.5).collect::<Vec<_>>(), vec!["udp-lan"]);
+
+        // 3. Partial multi-binding failure rolls back the first publish too.
+        let mut calls = 0usize;
+        let mut unpublished = Vec::new();
+        let partial = publish_linux_host(
+            "cid:3",
+            [172, 17, 0, 2],
+            vec![tcp_entry("0.0.0.0", 8080, 80, "tcp-1"), tcp_entry("192.168.1.5", 8443, 443, "tcp-2")],
+            Vec::<(Binding, Option<String>, String, u16, bool, &'static str)>::new(),
+            |_| {
+                calls += 1;
+                if calls == 1 { Ok(()) } else { Err(io::Error::other("nftables error")) }
+            },
+            |id| unpublished.push(id.to_owned()),
+        );
+        assert!(partial.fallback_error.is_some());
+        assert_eq!(unpublished, vec!["cid:3"]);
+        assert_eq!(partial.relay_tcp.iter().map(|t| t.5).collect::<Vec<_>>(), vec!["tcp-1", "tcp-2"]);
+
+        // 4. Restarting the same container gets a distinct publish key so a stale
+        //    `Unpublish` can never wipe the restarted container's DNAT rules.
+        let k1 = publish_key("same-container");
+        let k2 = publish_key("same-container");
+        assert_ne!(k1, k2);
+        assert!(k1.starts_with("same-container:") && k2.starts_with("same-container:"));
     }
 }
