@@ -1417,6 +1417,8 @@ fn engine_stopped() -> bool {
     client::alive() && client::get_background("/info").is_ok_and(|i| i["KiriStopped"] == true)
 }
 
+static STORAGE_RO_SHOWN: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
 /// The sidebar's VM panel: awake, asleep (wakes on the next request) or
 /// stopped (off until Start), and memory.
 fn vm_panel(connected: &mut bool) {
@@ -1441,10 +1443,19 @@ fn vm_panel(connected: &mut bool) {
                 "daemon_kib": info["KiriAgentMemory"].as_u64().unwrap_or(0) >> 10,
             }).to_string());
             emit(state(if awake { "running" } else if stopped { "stopped" } else { "asleep" }, None));
+            let ro = info["KiriStorageReadOnly"].as_str().map(str::to_owned);
+            let mut shown = STORAGE_RO_SHOWN.lock().unwrap_or_else(|e| e.into_inner());
+            if ro.as_deref() != shown.as_deref() {
+                if let Some(ref msg) = ro {
+                    emit(notice("error", msg));
+                }
+                *shown = ro;
+            }
         }
         Err(_) => {
             if *connected {
                 *connected = false;
+                *STORAGE_RO_SHOWN.lock().unwrap_or_else(|e| e.into_inner()) = None;
             }
             emit(state("stopped", None));
             if client::alive()

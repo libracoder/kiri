@@ -21,13 +21,9 @@ pub const WSL_HOST_ADDR: [u8; 4] = [192, 168, 65, 254];
 /// Where the redirect lands: the agent's listener for host-bound connections.
 pub const HOST_RELAY_PORT: u16 = 1026;
 
-/// True when running under Microsoft's WSL 2 kernel.
+/// True when running inside WSL 2.
 pub fn is_wsl() -> bool {
-    static WSL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *WSL.get_or_init(|| {
-        std::fs::read_to_string("/proc/sys/kernel/osrelease")
-            .is_ok_and(|r| r.to_ascii_lowercase().contains("microsoft"))
-    })
+    sys::is_wsl()
 }
 
 const HOST_RELAY_PID_FILE: &str = "/run/kiri-hostrelay.pid";

@@ -257,6 +257,8 @@ pub struct Facts {
     pub containers: Option<String>,
     /// VM uplink / DHCP status and (on macOS) bridge & UDP port 67 summary.
     pub vm_network: Option<String>,
+    /// Read-only / `emergency_ro` storage warning when detected (#768).
+    pub storage_warning: Option<String>,
 }
 
 /// The engine as the report describes it (plus its `/info` payload), asked
@@ -425,6 +427,9 @@ fn assemble_inner(home: &Path, state: &Path, facts: &Facts, redactor: &Redactor,
     let _ = writeln!(s, "App:      {} {} ({}), made by the {}", crate::flavor::APP, env!("CARGO_PKG_VERSION"), crate::flavor::CONTEXT, super::part().name());
     let _ = writeln!(s, "System:   {}", super::system().line());
     let _ = writeln!(s, "Engine:   {}", facts.engine);
+    if let Some(ro) = &facts.storage_warning {
+        let _ = writeln!(s, "Storage:  {ro}");
+    }
     let _ = writeln!(s, "Crash reports: {}", if facts.crash_reports { "sent automatically" } else { "not sent automatically" });
     if let Some(net) = &facts.vm_network {
         for line in net.lines() {
@@ -491,12 +496,17 @@ pub fn report_text(containers: bool) -> io::Result<String> {
     let bridge = crate::daemon::vmnet::current_bridge();
     let udp67 = crate::daemon::vmnet::udp67_holder();
     let vm_network = vm_network_summary(info.as_ref(), bridge.as_ref(), udp67.as_deref());
+    let storage_warning = info
+        .as_ref()
+        .and_then(|i| i["KiriStorageReadOnly"].as_str().map(str::to_owned))
+        .or_else(|| crate::daemon::rofs::check_daemon_storage(None));
     let facts = Facts {
         engine,
         crash_reports: crash_reports_on(),
         created: SystemTime::now(),
         containers: containers.then(container_lines),
         vm_network,
+        storage_warning,
     };
     Ok(assemble(&home, &state, &facts, &Redactor::for_user()))
 }
@@ -976,7 +986,7 @@ mod tests {
         std::fs::write(state.join("crashes/1792700000-ui.sent.txt"), "Kiri crash report\nMessage:  older\n").unwrap();
         std::fs::write(reports.join("kiri-2026-10-28-094107.ips"), format!("{{\"app_name\":\"kiri\",\"crashReporterKey\":\"ABCD-1234\"}}\n{{\"procPath\":\"{h}/Applications/Kiri.app\"}}")).unwrap();
         std::fs::write(reports.join("Safari-2026-10-28-094107.ips"), "not ours").unwrap();
-        let facts = Facts { engine: "not running".into(), crash_reports: false, created: UNIX_EPOCH + Duration::from_secs(1_792_800_000), containers: Some("web  nginx:alpine  Up 2 hours\n".into()), vm_network: None };
+        let facts = Facts { engine: "not running".into(), crash_reports: false, created: UNIX_EPOCH + Duration::from_secs(1_792_800_000), containers: Some("web  nginx:alpine  Up 2 hours\n".into()), vm_network: None, storage_warning: None };
         let redactor = Redactor::new(Some(h.clone()), Vec::new());
         let text = assemble(&home, &state, &facts, &redactor);
 
@@ -1090,8 +1100,9 @@ mod tests {
         let state = home.join(".kiri");
         std::fs::create_dir_all(state.join("logs")).unwrap();
         std::fs::write(state.join("logs/guest-console.log"), "kiri-init: DHCP did not answer; configured eth0 statically as 192.168.64.2/24 via 192.168.64.1 from host\n").unwrap();
-        let facts = Facts { engine: "running".into(), crash_reports: false, created: UNIX_EPOCH + Duration::from_secs(1_792_800_000), containers: None, vm_network: Some(summary) };
+        let facts = Facts { engine: "running".into(), crash_reports: false, created: UNIX_EPOCH + Duration::from_secs(1_792_800_000), containers: None, vm_network: Some(summary), storage_warning: Some("Kiri's WSL2 disk (ext4.vhdx) was remounted read-only by Linux (emergency_ro)".into()) };
         let text = assemble(&home, &state, &facts, &Redactor::new(Some(home.display().to_string()), Vec::new()));
+        assert!(text.contains("Storage:  Kiri's WSL2 disk (ext4.vhdx) was remounted read-only by Linux (emergency_ro)"), "{text}");
         assert!(text.contains("VM uplink: static fallback on bridge100") && text.contains("Host UDP port 67: kavd (pid 412)"), "{text}");
         assert!(text.contains("==== Guest console (~/.kiri/logs/guest-console.log) ====") && text.contains("configured eth0 statically as 192.168.64.2/24"), "{text}");
         let _ = std::fs::remove_dir_all(&home);

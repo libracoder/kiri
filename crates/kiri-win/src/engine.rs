@@ -351,6 +351,24 @@ pub(crate) fn ensure_daemon() -> io::Result<()> {
     Ok(())
 }
 
+/// Checks `/proc/mounts` inside `distro` for a read-only `/` or `/var/lib/kiri`
+/// (`ro` or ext4 `emergency_ro`, #768) and formats recovery steps naming the
+/// configured `ext4.vhdx` path.
+pub(crate) fn probe_wsl_readonly(distro: Option<&str>) -> Option<String> {
+    let mut cmd = crate::win::tool("wsl.exe");
+    if let Some(d) = distro {
+        cmd.args(["-d", d]);
+    }
+    std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x0800_0000);
+    let out = crate::update::output_within(cmd.args(["-u", "root", "-e", "cat", "/proc/mounts"]), Duration::from_secs(10)).ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = crate::wslsync::wsl_text(&out.stdout);
+    let kind = crate::wslsync::parse_wsl_readonly_mounts(&text)?;
+    Some(crate::wslsync::wsl_readonly_message(kind, Some(&crate::storage::current_vhdx())))
+}
+
 /// Starts the daemon in WSL, this app's engine copied in first.
 fn start_daemon() -> io::Result<()> {
     if let Some(missing) = crate::storage::unavailable() {
@@ -376,16 +394,31 @@ fn start_daemon() -> io::Result<()> {
     std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x0800_0000);
     // Each killed after WSL_LIMIT: a wsl.exe right after Windows wakes can hang.
     let started = crate::update::output_within(cmd.args(["-u", "root", "--", "systemctl", "start", "kiri"]), crate::update::WSL_LIMIT);
+    let mut fatal_exit = false;
+    let mut start_err = None;
     if !started.is_ok_and(|o| o.status.success()) {
         let mut cmd = crate::win::tool("wsl.exe");
         if let Some(d) = &distro {
             cmd.args(["-d", d]);
         }
         std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x0800_0000);
-        let _ = crate::update::output_within(cmd.args(["-u", "root", "--", "/usr/local/bin/kiri-start"]), crate::update::WSL_LIMIT);
+        if let Ok(out) = crate::update::output_within(cmd.args(["-u", "root", "--", "/usr/local/bin/kiri-start"]), crate::update::WSL_LIMIT)
+            && !out.status.success()
+        {
+            fatal_exit = out.status.code() == Some(2);
+            start_err = crate::wslsync::wsl_text(&out.stderr).lines().map(str::trim).rfind(|l| !l.is_empty()).map(str::to_owned);
+        }
     }
-    if client::wait_alive(Duration::from_secs(10), Duration::from_millis(100)) {
+    let wait = if fatal_exit { Duration::from_millis(200) } else { Duration::from_secs(10) };
+    if client::wait_alive(wait, Duration::from_millis(100)) {
         return Ok(());
+    }
+    if let Some(ro_msg) = probe_wsl_readonly(distro.as_deref()) {
+        crate::serve::log(&format!("engine: {ro_msg}"));
+        return Err(io::Error::other(ro_msg));
+    }
+    if let Some(err) = start_err {
+        return Err(io::Error::other(format!("Kiri's engine did not start in WSL: {err}")));
     }
     Err(io::Error::other("Kiri's engine did not start in WSL: run contrib\\windows\\kiri.ps1 to install it"))
 }
@@ -460,6 +493,8 @@ fn refresh() {
     }
 }
 
+static STORAGE_RO_SHOWN: Mutex<Option<String>> = Mutex::new(None);
+
 /// The sidebar's engine panel and the tray menu's state.
 fn vm_panel() {
     match client::get_quick("/info") {
@@ -481,6 +516,14 @@ fn vm_panel() {
             let stopped = info["KiriStopped"] == true;
             let awake = awake && !stopped;
             emit(state(if awake { "running" } else if stopped { "stopped" } else { "asleep" }, None));
+            let ro = info["KiriStorageReadOnly"].as_str().map(str::to_owned);
+            let mut shown = STORAGE_RO_SHOWN.lock().unwrap_or_else(PoisonError::into_inner);
+            if ro.as_deref() != shown.as_deref() {
+                if let Some(ref msg) = ro {
+                    emit(notice("error", msg));
+                }
+                *shown = ro;
+            }
             let running = RUNNING.lock().unwrap_or_else(PoisonError::into_inner).clone();
             Handle.set_menu(Menu { vm: if awake { "Running" } else if stopped { "Stopped" } else { "Asleep" }.into(), running });
         }
@@ -497,6 +540,7 @@ fn no_answer(e: &io::Error) {
     match unanswered(e.kind(), SHOWN.load(Ordering::SeqCst)) {
         Some("stopped") => {
             RUNNING.lock().unwrap_or_else(PoisonError::into_inner).clear();
+            *STORAGE_RO_SHOWN.lock().unwrap_or_else(PoisonError::into_inner) = None;
             Handle.set_menu(Menu { vm: "Not running".into(), running: Vec::new() });
             emit(state("stopped", None));
         }

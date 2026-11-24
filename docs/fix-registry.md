@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #768 Storage & WSL: detect read-only / `emergency_ro` storage filesystems and report actionable recovery steps (unreleased)
+- Fixes: #768 Windows (WSL 2) / Linux: when `ext4.vhdx` or `/var/lib/kiri` is remounted read-only (`emergency_ro`), overlayfs mounts container rootfs read-only or daemon startup fails with opaque `EROFS` errors instead of actionable `e2fsck` / storage recovery guidance
+- Caused: none known
+- Caused by: -
+- Check: `crates/kiri/src/daemon/rofs.rs`, `crates/kiri-init/src/linux/sys.rs`, `crates/kiri-win/src/wslsync.rs`, `crates/kiri-win/src/refuse.rs`
+
 ### #783 Engine: serialize `containers.json` by reference without cloning container specs (unreleased)
 - Fixes: no issue
 - Caused: none known

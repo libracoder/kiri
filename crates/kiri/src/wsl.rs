@@ -24,7 +24,7 @@ const SCRIPT: &str = r#"export HOME=/var/lib/kiri-daemon; [ -x /usr/local/bin/ki
 /// Generates the engine's diagnostics report inside WSL into a temporary file
 /// and streams the report text back to `kiri.exe` on Windows so `kiri.exe` can
 /// write the output file directly on the Windows filesystem.
-const REPORT_SCRIPT: &str = r#"export HOME=/var/lib/kiri-daemon; [ -x /usr/local/bin/kiri-start ] && /usr/local/bin/kiri-start >/dev/null 2>&1; tmp="$(mktemp /tmp/kiri-report.XXXXXX)" || exit $?; trap 'rm -f "$tmp"' EXIT; if [ "$1" = "--send" ]; then /usr/local/bin/kiri diag report --out "$tmp" --send | grep -v '^saved the report to ' >&2 || exit $?; else /usr/local/bin/kiri diag report --out "$tmp" >/dev/null || exit $?; fi; cat "$tmp""#;
+const REPORT_SCRIPT: &str = r#"export HOME=/var/lib/kiri-daemon; [ -x /usr/local/bin/kiri-start ] && /usr/local/bin/kiri-start >/dev/null 2>&1; tmp="$(mktemp /tmp/kiri-report.XXXXXX 2>/dev/null || mktemp /run/kiri-report.XXXXXX)" || exit $?; trap 'rm -f "$tmp"' EXIT; if [ "$1" = "--send" ]; then /usr/local/bin/kiri diag report --out "$tmp" --send | grep -v '^saved the report to ' >&2 || exit $?; else /usr/local/bin/kiri diag report --out "$tmp" >/dev/null || exit $?; fi; cat "$tmp""#;
 
 /// Parses `kiri diag report` arguments (`[--out PATH | -o PATH | --out=PATH] [--send]`).
 /// Returns `None` if unrecognized flags are present so WSL's `kiri diag report`

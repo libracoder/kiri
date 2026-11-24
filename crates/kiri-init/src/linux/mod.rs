@@ -224,6 +224,9 @@ fn host_dirs() -> io::Result<container::Paths> {
     if let Some(data) = std::env::var_os("KIRI_AGENT_DATA").map(PathBuf::from).filter(|p| p.is_absolute() && p != &root) {
         mount_agent_data(&data, &root)?;
     }
+    if let Some(kind) = sys::detect_readonly_fs(&root) {
+        return Err(sys::readonly_storage_error(kind));
+    }
     let mkdir = |p: &std::path::Path, mode: u32| -> io::Result<()> {
         std::fs::create_dir_all(p)?;
         std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode))
@@ -397,23 +400,7 @@ fn cgroup2_rel(proc_cgroup: &str) -> String {
 
 /// Unescapes `/proc/self/mountinfo` octal escapes (`\040`, `\011`, `\012`, `\134`).
 fn unescape_mount_path(raw: &str) -> String {
-    let bytes = raw.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'\\'
-            && i + 3 < bytes.len()
-            && bytes[i + 1..i + 4].iter().all(|b| (b'0'..=b'7').contains(b))
-        {
-            let val = ((bytes[i + 1] - b'0') << 6) | ((bytes[i + 2] - b'0') << 3) | (bytes[i + 3] - b'0');
-            out.push(val);
-            i += 4;
-        } else {
-            out.push(bytes[i]);
-            i += 1;
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
+    sys::unescape_mount_path(raw)
 }
 
 /// Writable `cgroup2` mounts visible in `/proc/self/mountinfo`, ordered by
@@ -645,8 +632,13 @@ fn data_dirs() -> io::Result<container::Paths> {
     if let Err(ref e) = disk {
         eprintln!("kiri-init: no data disk ({e}); keeping images in memory");
         mount(c"kiri", c"/var/lib/kiri", c"tmpfs", libc::MS_NOATIME, Some(c"mode=0755"))?;
-    } else if let Err(e) = disk::grow() {
-        eprintln!("kiri-init: growing data disk: {e}");
+    } else {
+        if let Err(e) = disk::grow() {
+            eprintln!("kiri-init: growing data disk: {e}");
+        }
+        if let Some(kind) = sys::detect_readonly_fs(std::path::Path::new(DATA)) {
+            return Err(sys::readonly_storage_error(kind));
+        }
     }
     // The Mac's filesystem over virtiofs, for bind mounts.
     sys::mkdir(c"/mnt", 0o755);

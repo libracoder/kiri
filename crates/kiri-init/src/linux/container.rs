@@ -495,7 +495,8 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "no command to run"));
     }
     let layers: Vec<&str> = spec.layers.iter().collect();
-    let rootfs = super::roots::acquire(paths, spec.id, &layers)?;
+    let writable_rootfs = spec.flags & run_flags::READONLY_ROOTFS == 0;
+    let rootfs = super::roots::acquire(paths, spec.id, &layers, writable_rootfs)?;
     let base = paths.containers.join(spec.id);
 
     let cgroup = paths.cgroup.join(spec.id);
@@ -874,7 +875,7 @@ pub(super) const PLAIN_UPPER: &str = "upper-plain";
 /// anything. One written under a kernel's own defaults before Kiri chose
 /// (Arch turns redirects and metacopy on) isn't, and stays readable only
 /// with those defaults.
-fn plain_upper(base: &Path) -> io::Result<bool> {
+fn plain_upper(base: &Path, writable: bool) -> io::Result<bool> {
     let marker = base.join(PLAIN_UPPER);
     if marker.exists() {
         return Ok(true);
@@ -884,8 +885,11 @@ fn plain_upper(base: &Path) -> io::Result<bool> {
         // written into it since this one looked for the marker.
         return Ok(marker.exists());
     }
-    fs::write(marker, b"")?;
-    Ok(true)
+    match fs::write(marker, b"") {
+        Ok(()) => Ok(true),
+        Err(e) if !writable && e.raw_os_error() == Some(libc::EROFS) => Ok(true),
+        Err(e) => Err(e),
+    }
 }
 
 /// Marks a writable layer that `kiri import` brought in whole as plain
@@ -913,16 +917,47 @@ fn overlay_features(plain: bool) -> &'static str {
     if plain { "index=off,redirect_dir=nofollow,metacopy=off" } else { "index=off" }
 }
 
+/// Verifies that a writable container's backing directory and mounted overlay
+/// root are not read-only (`ST_RDONLY` / `emergency_ro`). Linux `overlayfs`
+/// silently falls back to mounting read-only (returning 0 from `mount(2)`)
+/// when `work/work` fails on `EROFS` or `EEXIST` (#768).
+pub(super) fn ensure_writable_rootfs(base: &Path, rootfs: &Path) -> io::Result<()> {
+    let kind = match (sys::detect_readonly_fs(base), sys::detect_readonly_fs(rootfs)) {
+        (Some(a), Some(b)) => Some(a.merge(b)),
+        (Some(a), None) | (None, Some(a)) => Some(a),
+        (None, None) => None,
+    };
+    match kind {
+        Some(k) => Err(sys::readonly_storage_error(k)),
+        None => Ok(()),
+    }
+}
+
+fn map_rofs_error(base: &Path, writable: bool, err: io::Error) -> io::Error {
+    if writable && err.raw_os_error() == Some(libc::EROFS) {
+        let kind = sys::detect_readonly_fs(base).unwrap_or(sys::ReadOnlyKind::ReadOnly);
+        return sys::readonly_storage_error(kind);
+    }
+    err
+}
+
 /// Mounts a container's root: its image layers under its writable layer,
 /// at `<containers>/<id>/rootfs`. Returns that path. Only `roots` calls
 /// this, which keeps it to one mount per container.
-pub(super) fn mount_rootfs(paths: &Paths, id: &str, image_layers: &[&str]) -> io::Result<PathBuf> {
+pub(super) fn mount_rootfs(paths: &Paths, id: &str, image_layers: &[&str], writable: bool) -> io::Result<PathBuf> {
     valid_id(id)?;
     let base = paths.containers.join(id);
+    if writable
+        && let Some(kind) = sys::detect_readonly_fs(&base)
+    {
+        return Err(sys::readonly_storage_error(kind));
+    }
     let (upper, work, rootfs) = (base.join("upper"), base.join("work"), base.join("rootfs"));
     let _ = sys::umount_lazy(&rootfs);
     for d in [&upper, &work, &rootfs] {
-        fs::create_dir_all(d)?;
+        if !d.is_dir() {
+            fs::create_dir_all(d).map_err(|e| map_rofs_error(&base, writable, e))?;
+        }
     }
     // Lower dirs are relative to the agent's working directory (the layer
     // store), which keeps the option string short enough for many layers.
@@ -947,11 +982,20 @@ pub(super) fn mount_rootfs(paths: &Paths, id: &str, image_layers: &[&str]) -> io
     // fails at exec, as Docker's does, instead of failing to mount.
     if lower.is_empty() {
         let empty = base.join("empty");
-        fs::create_dir_all(&empty)?;
+        if !empty.is_dir() {
+            fs::create_dir_all(&empty).map_err(|e| map_rofs_error(&base, writable, e))?;
+        }
         lower.push(empty.to_str().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "container folder is not UTF-8"))?.to_owned());
     }
-    let rest = format!(",upperdir={},workdir={},{}", upper.display(), work.display(), overlay_features(plain_upper(&base)?));
-    sys::mount_overlay(&rootfs, &lower, &rest, 0)?;
+    let plain = plain_upper(&base, writable).map_err(|e| map_rofs_error(&base, writable, e))?;
+    let rest = format!(",upperdir={},workdir={},{}", upper.display(), work.display(), overlay_features(plain));
+    sys::mount_overlay(&rootfs, &lower, &rest, 0).map_err(|e| map_rofs_error(&base, writable, e))?;
+    if writable
+        && let Err(e) = ensure_writable_rootfs(&base, &rootfs)
+    {
+        super::roots::unmount(&rootfs);
+        return Err(e);
+    }
     Ok(rootfs)
 }
 
@@ -1987,7 +2031,7 @@ fn bind_file(root: BorrowedFd<'_>, src: &CStr, target: &CStr) -> io::Result<()> 
 /// image (or an earlier start) has there stays as it is: O_EXCL never
 /// follows a link, so one that points out of the container is not written
 /// through, and a link or directory there does not fail the start.
-fn make_marker(root: BorrowedFd<'_>) -> io::Result<()> {
+fn make_marker(root: BorrowedFd<'_>, readonly_rootfs: bool) -> io::Result<()> {
     // SAFETY: valid directory fd and NUL-terminated name.
     let fd = unsafe { libc::openat(root.as_raw_fd(), MARKER.as_ptr(), libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC, 0o755) };
     if fd >= 0 {
@@ -2001,6 +2045,7 @@ fn make_marker(root: BorrowedFd<'_>) -> io::Result<()> {
     }
     match io::Error::last_os_error() {
         e if e.raw_os_error() == Some(libc::EEXIST) => Ok(()),
+        e if readonly_rootfs && e.raw_os_error() == Some(libc::EROFS) => Ok(()),
         e => Err(e),
     }
 }
@@ -2125,7 +2170,7 @@ fn container_child(p: &Prepared, rootfs: &CStr, io: &ChildStdio, close_first: &[
     // SDKs use Docker's marker to detect container execution when cgroup
     // namespaces hide the host's cgroup path. Made before changing user or
     // making the root filesystem read-only.
-    make_marker(root).unwrap_or_else(|e| fail("container marker", e));
+    make_marker(root, p.readonly_rootfs).unwrap_or_else(|e| fail("container marker", e));
     // The image's tree without the mounts made on it, for filling new
     // volumes; closed (and so unmounted) once they are all in place.
     let image = if p.mounts.iter().any(|m| m.copy_up) { image_tree() } else { None };

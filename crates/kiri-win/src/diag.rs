@@ -172,9 +172,16 @@ fn windows_version() -> String {
     cmd.args(["/c", "ver"]).output().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned()).ok().filter(|v| !v.is_empty()).unwrap_or_else(|| "Windows".into())
 }
 
-/// The report: versions, the container list if asked, and both logs.
+/// The report: versions, storage health, the container list if asked, and both logs.
 fn report_text(containers: bool) -> String {
     let mut out = format!("Kiri for Windows {}\n{}\n{}\n", env!("CARGO_PKG_VERSION"), windows_version(), std::env::consts::ARCH);
+    let storage_ro = crate::client::get_quick("/info")
+        .ok()
+        .and_then(|i| i["KiriStorageReadOnly"].as_str().map(str::to_owned))
+        .or_else(|| crate::engine::probe_wsl_readonly(crate::engine::distro().as_deref()));
+    if let Some(ro) = storage_ro {
+        out.push_str(&format!("Storage: {ro}\n"));
+    }
     if containers {
         out.push_str("\n== Containers ==\n");
         match crate::client::get("/containers/json?all=1") {

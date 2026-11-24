@@ -334,3 +334,6 @@ crates/kiri/src/ui/compose.rs	#770	on Windows, Compose projects started inside a
 crates/kiri/src/daemon/api.rs	#770	containers created inside WSL did not expose their owning WSL distro on GET /containers/json for Windows Compose path mapping
 bind-nonroot-parallel	#796	concurrent non-root file and directory creation on a macOS bind mount raced with root stat/ls and /proc/kiri-fsnotify on the shared virtiofs inode's cached i_uid/i_gid, failing with EACCES/EPERM
 bind-nonroot-ro	#796	non-root writes to a read-only 0444 bind-mount file must still fail with EACCES, including inside an unprivileged unshare -Ur user namespace
+crates/kiri/src/daemon/rofs.rs	#768	when Kiri's WSL 2 ext4.vhdx or Linux storage filesystem was remounted read-only (emergency_ro), daemon startup, /info and diagnostics lacked actionable fsck / storage recovery steps
+crates/kiri-init/src/linux/sys.rs	#768	on a read-only or emergency_ro storage filesystem, overlayfs silently mounted writable container rootfs read-only instead of refusing with actionable recovery steps
+crates/kiri-win/src/wslsync.rs	#768	kiri-start and kiri-win reported a generic WSL install failure instead of ext4.vhdx emergency_ro e2fsck recovery steps when Kiri's WSL 2 disk was remounted read-only

@@ -120,7 +120,7 @@ pub fn on_readable(fd: i32, paths: &Paths) -> bool {
         let id = lines.next().unwrap_or("");
         let layers: Vec<&str> = lines.collect();
         let got = match kind {
-            "m" => super::roots::acquire(paths, id, &layers),
+            "m" => super::roots::acquire(paths, id, &layers, false),
             "h" => super::roots::hold(paths, id),
             _ => Err(io::Error::new(io::ErrorKind::InvalidInput, "unknown request")),
         };
