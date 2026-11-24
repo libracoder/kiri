@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #816 Kubernetes: support custom k3s version, extra `k3s server` arguments, and `~/.kiri/k8s-manifests` auto-deploy manifests in `kiri k8s` (unreleased)
+- Fixes: #816 Kiri Kubernetes - support more k3s arguments
+- Caused: none known
+- Caused by: -
+- Check: `crates/kiri/src/k8s.rs`, `crates/kiri-win/src/k8s.rs`
+
 ### #556 macOS: edit shell profiles only once on initial setup, skip profiles that already reference `.kiri/bin`, and support `kiri setup --no-profiles` (unreleased)
 - Fixes: #556 macOS: shell profile lines come back on every launch, with no way to opt out
 - Caused: none known

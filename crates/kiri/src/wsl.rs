@@ -141,6 +141,44 @@ fn diag_report(rest: &[String]) -> io::Result<bool> {
     Ok(true)
 }
 
+/// Normalizes `kiri k8s set` arguments before passing them through `wsl.exe`,
+/// combining `["--flag", ""]` into `["--flag="]` so `wsl.exe` on Windows never
+/// receives a bare empty string token that its command-line splitter could drop.
+pub(crate) fn forward_args(args: &[String]) -> Vec<String> {
+    if args.first().map(String::as_str) != Some("k8s") || args.get(1).map(String::as_str) != Some("set") {
+        return args.to_vec();
+    }
+    let mut out = vec![args[0].clone(), args[1].clone()];
+    let mut it = args[2..].iter();
+    while let Some(a) = it.next() {
+        if matches!(a.as_str(), "--version" | "--k3s-arg" | "--tls-san" | "--port" | "--lan") {
+            if let Some(val) = it.next() {
+                if val.is_empty() {
+                    out.push(format!("{a}="));
+                } else {
+                    out.push(a.clone());
+                    out.push(val.clone());
+                }
+            } else {
+                out.push(a.clone());
+            }
+        } else {
+            out.push(a.clone());
+        }
+    }
+    out
+}
+
+/// Builds the full `wsl.exe` argument vector for forwarding `kiri <args>` into WSL.
+pub(crate) fn wsl_command_args(distro: &str, args: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = ["-d", distro, "-u", "root", "-e", "sh", "-c", SCRIPT, "kiri"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    out.extend(forward_args(args));
+    out
+}
+
 /// Runs `kiri <args>` in WSL and exits with its exit code.
 pub fn run(args: &[String]) -> io::Result<()> {
     if let [m, verb, name, rest @ ..] = args
@@ -160,8 +198,7 @@ pub fn run(args: &[String]) -> io::Result<()> {
     // wsl.exe from System32, never one found in the current folder.
     let system = std::env::var_os("SystemRoot").map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
     let status = Command::new(system.join("System32").join("wsl.exe"))
-        .args(["-d", &distro, "-u", "root", "-e", "sh", "-c", SCRIPT, "kiri"])
-        .args(args)
+        .args(wsl_command_args(&distro, args))
         .status()
         .map_err(|e| io::Error::other(format!("could not run wsl.exe ({e})")))?;
     std::process::exit(status.code().unwrap_or(1))
@@ -194,12 +231,62 @@ fn machine_shell(name: &str, rest: &[String]) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{COMMANDS, parse_diag_report_args};
+    use super::{COMMANDS, SCRIPT, forward_args, parse_diag_report_args, wsl_command_args};
     use std::path::PathBuf;
 
     #[test]
     fn forwards_scan_to_wsl() {
         assert!(COMMANDS.contains(&"scan"));
+    }
+
+    #[test]
+    fn forwards_k8s_set_version_and_k3s_args_to_wsl() {
+        assert!(COMMANDS.contains(&"k8s"));
+        let s = |list: &[&str]| list.iter().map(|x| (*x).to_owned()).collect::<Vec<String>>();
+        let args = s(&[
+            "k8s",
+            "set",
+            "--version",
+            "v1.31.4-k3s1",
+            "--k3s-arg",
+            "--flannel-backend=none",
+            "--k3s-arg",
+            "--disable=traefik",
+            "--clear-k3s-args",
+        ]);
+        assert_eq!(
+            wsl_command_args("Kiri", &args),
+            s(&[
+                "-d",
+                "Kiri",
+                "-u",
+                "root",
+                "-e",
+                "sh",
+                "-c",
+                SCRIPT,
+                "kiri",
+                "k8s",
+                "set",
+                "--version",
+                "v1.31.4-k3s1",
+                "--k3s-arg",
+                "--flannel-backend=none",
+                "--k3s-arg",
+                "--disable=traefik",
+                "--clear-k3s-args",
+            ])
+        );
+        // Empty string values (`--version ""`, `--tls-san ""`, `--k3s-arg ""`) are combined into
+        // `--flag=` so wsl.exe on Windows cannot drop a bare empty token.
+        assert_eq!(
+            forward_args(&s(&["k8s", "set", "--version", "", "--tls-san", ""])),
+            s(&["k8s", "set", "--version=", "--tls-san="])
+        );
+        assert_eq!(
+            forward_args(&s(&["k8s", "set", "--version", "default"])),
+            s(&["k8s", "set", "--version", "default"])
+        );
     }
 
     #[test]

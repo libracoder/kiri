@@ -115,7 +115,7 @@ const USAGE_LINES: &[&str] = &[
     "       kiri diag report [--out PATH] [--send]   (a file to send us, tokens taken out)",
     "       kiri PORT [NAME]           share a local port on the internet (same as kiri share PORT)",
     "       kiri share PORT|CONTAINER [--name N] | share login | logout | status",
-    "       kiri k8s start [--use] | stop | status | delete | set [--lan on|off] [--tls-san NAME,…] [--port N]",
+    "       kiri k8s start [--use] | stop | status | delete | set [--lan on|off] [--tls-san NAME,…] [--port N] [--version TAG|default] [--k3s-arg ARG]… [--clear-k3s-args]",
     "       kiri usb [list] | attach DEVICE | detach DEVICE   USB devices for containers, beta (Mac: pass through to the VM)",
     "       kiri machine create NAME [--distro D] | list | shell NAME | stop | delete NAME",
     #[cfg(target_os = "macos")]

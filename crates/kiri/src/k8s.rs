@@ -24,10 +24,12 @@ fn home() -> io::Result<PathBuf> {
 
 /// The cluster's settings, in `~/.kiri/k8s.json`: whether its API server
 /// (and, through the daemon, its LoadBalancer services) answers on every
-/// interface rather than 127.0.0.1, and extra names for its certificate.
-/// They are applied when the node container is created, so `kiri k8s set`
-/// recreates it; the cluster's state is in the volume and stays.
-#[derive(Default, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+/// interface rather than 127.0.0.1, extra names for its certificate, its API
+/// server port, an optional custom k3s image tag, and optional extra arguments
+/// passed to `k3s server`. They are applied when the node container is
+/// created, so `kiri k8s set` recreates it; the cluster's state is in the
+/// volume and stays.
+#[derive(Clone, Default, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Config {
     #[serde(default)]
     pub lan: bool,
@@ -37,16 +39,39 @@ pub(crate) struct Config {
     /// taken the node takes the next free one; `port` in its container says which.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
+    /// Custom k3s image tag (`rancher/k3s:<version>`), or `None` for `IMAGE.1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// Extra arguments appended to `k3s server`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub k3s_args: Vec<String>,
 }
 
 /// The API server's port in the node, and the Mac port it is published on by default.
 pub(crate) const API_PORT: u16 = 6443;
 /// How many ports after the asked-for one a start tries before giving up.
 const PORT_TRIES: u16 = 20;
+/// Maximum byte length of a single custom `--k3s-arg` value.
+const MAX_K3S_ARG_LEN: usize = 512;
+/// Maximum number of custom `--k3s-arg` values.
+const MAX_K3S_ARGS: usize = 64;
+/// Maximum size in bytes of an auto-deployed manifest in `~/.kiri/k8s-manifests`.
+const MAX_MANIFEST_BYTES: u64 = 4 << 20;
+
+const USAGE_SET: &str = "usage: kiri k8s set [--lan on|off] [--tls-san NAME,…] [--port N] [--version TAG|default] [--k3s-arg ARG]… [--clear-k3s-args]";
+const USAGE_K8S: &str = "usage: kiri k8s start [--use] | stop | status | delete | set [--lan on|off] [--tls-san NAME,…] [--port N] [--version TAG|default] [--k3s-arg ARG]… [--clear-k3s-args]";
 
 impl Config {
     pub(crate) fn api_port(&self) -> u16 {
         self.port.unwrap_or(API_PORT)
+    }
+
+    pub(crate) fn version_tag(&self) -> &str {
+        self.version.as_deref().filter(|v| valid_version(v)).unwrap_or(IMAGE.1)
+    }
+
+    pub(crate) fn image(&self) -> String {
+        format!("{}:{}", IMAGE.0, self.version_tag())
     }
 }
 
@@ -90,8 +115,23 @@ fn config_path() -> io::Result<PathBuf> {
     Ok(home()?.join(crate::flavor::STATE.get()).join("k8s.json"))
 }
 
+fn manifests_dir() -> io::Result<PathBuf> {
+    Ok(home()?.join(crate::flavor::STATE.get()).join("k8s-manifests"))
+}
+
+fn load_config_from(path: &std::path::Path) -> Config {
+    std::fs::read(path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+}
+
+fn save_config_to(path: &std::path::Path, cfg: &Config) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, serde_json::to_vec(cfg).map_err(io::Error::other)?)
+}
+
 pub(crate) fn config() -> Config {
-    config_path().ok().and_then(|p| std::fs::read(p).ok()).and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+    config_path().ok().map(|p| load_config_from(&p)).unwrap_or_default()
 }
 
 /// An extra certificate name: an IP address or a DNS name (`*.` allowed).
@@ -102,45 +142,191 @@ fn valid_san(name: &str) -> bool {
             && name.trim_start_matches("*.").split('.').all(|l| !l.is_empty() && l.len() <= 63 && !l.starts_with('-') && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')))
 }
 
-/// `kiri k8s set [--lan on|off] [--tls-san a,b] [--port N]`: saves the settings and, if
-/// the cluster exists and they changed, recreates its node with them.
-fn set(args: &[String]) -> io::Result<()> {
-    let mut cfg = config();
-    let before = (cfg.lan, cfg.tls_san.clone(), cfg.api_port());
+/// A k3s image tag for `rancher/k3s:<tag>`: 1..=128 ASCII letters, digits,
+/// `.`, `_` or `-`, starting with a letter or digit, with no `..`, spaces,
+/// slashes, `@`, `:`, or control characters.
+pub(crate) fn valid_version(tag: &str) -> bool {
+    !tag.is_empty()
+        && tag.len() <= 128
+        && !tag.eq_ignore_ascii_case("default")
+        && !tag.contains("..")
+        && tag.as_bytes()[0].is_ascii_alphanumeric()
+        && tag.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// An extra argument for `k3s server`: non-empty, bounded length, and free of
+/// NUL or control characters.
+pub(crate) fn valid_k3s_arg(arg: &str) -> bool {
+    !arg.trim().is_empty()
+        && arg.len() <= MAX_K3S_ARG_LEN
+        && !arg.bytes().any(|b| b < 0x20 || b == 0x7f)
+        && !arg.chars().any(char::is_control)
+}
+
+/// Applies `kiri k8s set` CLI flags to `cfg` without mutating `cfg` on error.
+pub(crate) fn apply_set_args(cfg: &mut Config, args: &[String]) -> io::Result<()> {
+    let mut next = cfg.clone();
+    let mut custom_args: Option<Vec<String>> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
-        match a.as_str() {
-            "--lan" => cfg.lan = matches!(it.next().map(String::as_str), Some("on" | "true" | "1")),
-            "--tls-san" => {
-                let list: Vec<String> = it.next().map(String::as_str).unwrap_or("").split(',').map(|n| n.trim().to_owned()).filter(|n| !n.is_empty()).collect();
-                if let Some(bad) = list.iter().find(|n| !valid_san(n)) {
-                    return Err(io::Error::other(format!("not an IP address or domain name: {bad}")));
-                }
-                cfg.tls_san = list;
+        let s = a.as_str();
+        if s == "--lan" || s.starts_with("--lan=") {
+            let Some(raw) = s.strip_prefix("--lan=").or_else(|| it.next().map(String::as_str)) else {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, USAGE_SET));
+            };
+            next.lan = matches!(raw, "on" | "true" | "1");
+        } else if s == "--tls-san" || s.starts_with("--tls-san=") {
+            let raw = s.strip_prefix("--tls-san=").or_else(|| it.next().map(String::as_str)).unwrap_or("");
+            let list: Vec<String> = raw.split(',').map(|n| n.trim().to_owned()).filter(|n| !n.is_empty()).collect();
+            if let Some(bad) = list.iter().find(|n| !valid_san(n)) {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("not an IP address or domain name: {bad}")));
             }
-            "--port" => {
-                let raw = it.next().map(String::as_str).unwrap_or("");
-                let Some(port) = valid_port(raw) else {
-                    return Err(io::Error::other(format!("the API server port must be a number from 1024 to 65535, not `{raw}`")));
-                };
-                cfg.port = (port != API_PORT).then_some(port);
+            next.tls_san = list;
+        } else if s == "--port" || s.starts_with("--port=") {
+            let raw = s.strip_prefix("--port=").or_else(|| it.next().map(String::as_str)).unwrap_or("");
+            let Some(port) = valid_port(raw) else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("the API server port must be a number from 1024 to 65535, not `{raw}`"),
+                ));
+            };
+            next.port = (port != API_PORT).then_some(port);
+        } else if s == "--version" || s.starts_with("--version=") {
+            let Some(raw) = s.strip_prefix("--version=").or_else(|| it.next().map(String::as_str)) else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "--version requires a k3s image tag (for example `v1.31.4-k3s1`, or `default` to reset)",
+                ));
+            };
+            if raw.is_empty() || raw.eq_ignore_ascii_case("default") {
+                next.version = None;
+            } else if valid_version(raw) {
+                next.version = Some(raw.to_owned());
+            } else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("invalid k3s version tag `{raw}`: expected a clean image tag such as `v1.31.4-k3s1`, or `default`"),
+                ));
             }
-            _ => return Err(io::Error::other("usage: kiri k8s set [--lan on|off] [--tls-san NAME,…] [--port N]")),
+        } else if s == "--k3s-arg" || s.starts_with("--k3s-arg=") {
+            let Some(raw) = s.strip_prefix("--k3s-arg=").or_else(|| it.next().map(String::as_str)) else {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "--k3s-arg requires a k3s server argument"));
+            };
+            if !valid_k3s_arg(raw) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("invalid --k3s-arg `{raw}`: arguments must be non-empty, free of control characters, and at most {MAX_K3S_ARG_LEN} bytes"),
+                ));
+            }
+            let list = custom_args.get_or_insert_with(Vec::new);
+            if list.len() >= MAX_K3S_ARGS {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("too many --k3s-arg values (at most {MAX_K3S_ARGS})"),
+                ));
+            }
+            list.push(raw.to_owned());
+        } else if s == "--clear-k3s-args" {
+            custom_args = Some(Vec::new());
+        } else {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, USAGE_SET));
         }
     }
+    if let Some(args) = custom_args {
+        next.k3s_args = args;
+    }
+    *cfg = next;
+    Ok(())
+}
+
+/// Builds the `k3s server` command vector for the node container.
+pub(crate) fn server_cmd(cfg: &Config) -> Vec<String> {
+    let mut cmd: Vec<String> = [
+        "server",
+        "--disable",
+        "traefik",
+        "--tls-san",
+        "127.0.0.1",
+        "--tls-san",
+        "localhost",
+        "--write-kubeconfig-mode",
+        "644",
+    ]
+    .map(String::from)
+    .to_vec();
+    for name in cfg.tls_san.iter().filter(|n| valid_san(n)) {
+        cmd.extend(["--tls-san".to_owned(), name.clone()]);
+    }
+    for arg in cfg.k3s_args.iter().filter(|a| valid_k3s_arg(a)) {
+        cmd.push(arg.clone());
+    }
+    cmd
+}
+
+/// Formats the cluster's saved settings line printed by `kiri k8s set`.
+pub(crate) fn format_settings(cfg: &Config) -> String {
+    let port = cfg.api_port();
+    let host = if cfg.lan { "every interface" } else { "127.0.0.1" };
+    let san = if cfg.tls_san.is_empty() { "none".to_owned() } else { cfg.tls_san.join(", ") };
+    let version = match cfg.version.as_deref().filter(|v| valid_version(v)) {
+        Some(v) => format!("{v} (custom)"),
+        None => format!("{} (default)", IMAGE.1),
+    };
+    let args = if cfg.k3s_args.is_empty() { "none".to_owned() } else { cfg.k3s_args.join(" ") };
+    format!("API server on {host}:{port}; extra certificate names: {san}; k3s version: {version}; extra k3s args: {args}")
+}
+
+/// Formats the status summary line printed by `kiri k8s status`.
+pub(crate) fn format_status(info: Option<&serde_json::Value>, cfg: &Config) -> String {
+    let Some(info) = info else {
+        let mut out = format!("Kubernetes: not created (kiri k8s start), k3s {}", cfg.version_tag());
+        if !cfg.k3s_args.is_empty() {
+            out.push_str(&format!(", k3s args: {}", cfg.k3s_args.join(" ")));
+        }
+        return out;
+    };
+    let state = info["State"]["Status"].as_str().unwrap_or("unknown");
+    let port = bound_port(info).unwrap_or(API_PORT);
+    let want = cfg.api_port();
+    let moved = if port != want { format!(" ({want} was in use)") } else { String::new() };
+    let version = if state == "running" {
+        info["Config"]["Image"]
+            .as_str()
+            .and_then(|img| img.split_once(':').map(|(_, tag)| tag))
+            .unwrap_or_else(|| cfg.version_tag())
+    } else {
+        cfg.version_tag()
+    };
+    let mut out = format!("Kubernetes: {state}, k3s {version}, API on 127.0.0.1:{port}{moved}");
+    if !cfg.k3s_args.is_empty() {
+        out.push_str(&format!(", k3s args: {}", cfg.k3s_args.join(" ")));
+    }
+    out
+}
+
+/// `kiri k8s set [--lan on|off] [--tls-san a,b] [--port N] [--version TAG|default] [--k3s-arg ARG]… [--clear-k3s-args]`:
+/// saves the settings and, if the cluster exists and they changed, recreates its node with them.
+fn set(args: &[String]) -> io::Result<()> {
+    let mut cfg = config();
+    let before = cfg.clone();
+    apply_set_args(&mut cfg, args)?;
     ensure_daemon()?;
     let node = if exists()? { Some(client::get(&format!("/containers/{NAME}/json"))?) } else { None };
     // A port asked for that the node doesn't already hold must be free now.
     let port = cfg.api_port();
-    if port != before.2 && node.as_ref().and_then(bound_port) != Some(port) && !port_free(port, cfg.lan) {
+    if port != before.api_port() && node.as_ref().and_then(bound_port) != Some(port) && !port_free(port, cfg.lan) {
         return Err(io::Error::other(format!("port {port} is in use on this Mac; choose another")));
     }
     let path = config_path()?;
-    std::fs::create_dir_all(path.parent().expect("has a parent"))?;
-    std::fs::write(&path, serde_json::to_vec(&cfg).map_err(io::Error::other)?)?;
-    println!("API server on {}:{port}; extra certificate names: {}", if cfg.lan { "every interface" } else { "127.0.0.1" }, if cfg.tls_san.is_empty() { "none".to_owned() } else { cfg.tls_san.join(", ") });
-    let Some(node) = node else { return Ok(()) };
-    if (cfg.lan, cfg.tls_san.clone(), port) == before {
+    save_config_to(&path, &cfg)?;
+    println!("{}", format_settings(&cfg));
+    let Some(node) = node else {
+        if cfg != before {
+            println!("they apply when the cluster next starts");
+        }
+        return Ok(());
+    };
+    if cfg == before {
         return Ok(());
     }
     if node["State"]["Running"] != true {
@@ -160,7 +346,11 @@ const CONFIG_LABEL: &str = "dev.kiri.k8s.config";
 /// host folders are in it too, so a node made before it had them (or before
 /// one existed) is made again at its next start.
 fn made_with(cfg: &Config) -> String {
-    serde_json::to_string(&(cfg.lan, &cfg.tls_san, cfg.api_port(), host_folders())).unwrap_or_default()
+    if cfg.version.is_none() && cfg.k3s_args.is_empty() {
+        serde_json::to_string(&(cfg.lan, &cfg.tls_san, cfg.api_port(), host_folders())).unwrap_or_default()
+    } else {
+        serde_json::to_string(&(cfg.lan, &cfg.tls_san, cfg.api_port(), host_folders(), cfg.version_tag(), &cfg.k3s_args)).unwrap_or_default()
+    }
 }
 
 /// The folders of this computer the node sees at their own paths, so a pod's
@@ -226,7 +416,7 @@ fn run_inner(args: &[String]) -> io::Result<()> {
         Some("status") => status(),
         Some("delete") => delete(),
         Some("set") => set(&args[1..]),
-        _ => Err(io::Error::other("usage: kiri k8s start [--use] | stop | status | delete | set [--lan on|off] [--tls-san NAME,…] [--port N]")),
+        _ => Err(io::Error::other(USAGE_K8S)),
     }
 }
 
@@ -269,18 +459,16 @@ fn start(use_context: bool) -> io::Result<()> {
         if port != want {
             println!("port {want} is in use; the API server takes {port}");
         }
-        let (repo, tag) = IMAGE;
+        let repo = IMAGE.0;
+        let tag = cfg.version_tag();
         println!("pulling {repo}:{tag}…");
         let pulled = ok(client::request("POST", &format!("/images/create?fromImage={repo}&tag={tag}"), None))?;
         if let Some(e) = String::from_utf8_lossy(&pulled.body).lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok()).find_map(|v| v["error"].as_str().map(str::to_owned)) {
             return Err(io::Error::other(e));
         }
-        let mut cmd: Vec<String> = ["server", "--disable", "traefik", "--tls-san", "127.0.0.1", "--tls-san", "localhost", "--write-kubeconfig-mode", "644"].map(String::from).to_vec();
-        for name in cfg.tls_san.iter().filter(|n| valid_san(n)) {
-            cmd.extend(["--tls-san".to_owned(), name.clone()]);
-        }
+        let cmd = server_cmd(&cfg);
         let body = json!({
-            "Image": format!("{repo}:{tag}"),
+            "Image": cfg.image(),
             "Cmd": cmd,
             "Hostname": "kiri",
             "Labels": {"dev.kiri.k8s": "1", PORT_LABEL: port.to_string(), CONFIG_LABEL: made_with(&cfg)},
@@ -299,11 +487,14 @@ fn start(use_context: bool) -> io::Result<()> {
     if !started.ok() && started.status != 304 {
         return Err(io::Error::other(started.error()));
     }
-    // Early, so a new cluster's CoreDNS can start with it.
+    // Early, so a new cluster's CoreDNS and user manifests (e.g. a custom CNI) apply right away.
     let host_names_written = host_names().unwrap_or_else(|e| {
         println!("pods may not resolve host.docker.internal: {e}");
         false
     });
+    if let Err(e) = sync_user_manifests() {
+        println!("user manifests from ~/.kiri/k8s-manifests were not synced: {e}");
+    }
     println!("waiting for the node…");
     let deadline = Instant::now() + Duration::from_secs(180);
     loop {
@@ -348,6 +539,96 @@ const HOST_NAMES: [&str; 3] = ["host.docker.internal", "host.kiri.internal", "ga
 /// and k3s upgrades (they replace only k3s' own manifests).
 const MANIFESTS: &str = "/var/lib/rancher/k3s/server/manifests";
 const HOST_MANIFEST: &str = "kiri-host-names.yaml";
+/// Isolated subdirectory under k3s's manifests folder for user manifests from
+/// `~/.kiri/k8s-manifests`, so syncing user manifests never hides or clobbers
+/// k3s's own built-in manifests (`coredns.yaml`, `local-storage.yaml`, etc.)
+/// or `kiri-host-names.yaml`.
+const USER_MANIFESTS: &str = "/var/lib/rancher/k3s/server/manifests/kiri-user";
+
+/// A safe filename in `~/.kiri/k8s-manifests`: `*.yaml`, `*.yml`, or `*.json`
+/// with only ASCII letters, digits, `.`, `_`, or `-`, not starting with `.` or `-`.
+pub(crate) fn valid_manifest_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > 128 || name.starts_with('.') || name.starts_with('-') || name.contains("..") {
+        return false;
+    }
+    if !name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')) {
+        return false;
+    }
+    let lower = name.to_ascii_lowercase();
+    lower.ends_with(".yaml") || lower.ends_with(".yml") || lower.ends_with(".json")
+}
+
+/// Reads valid manifest files (`*.yaml`, `*.yml`, `*.json`) from `dir`, sorted by filename.
+pub(crate) fn collect_user_manifests(dir: &std::path::Path) -> io::Result<Vec<(String, String)>> {
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let ft = entry.file_type()?;
+        if !ft.is_file() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !valid_manifest_name(&name) {
+            continue;
+        }
+        if entry.metadata()?.len() > MAX_MANIFEST_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("manifest `{name}` exceeds {} MiB", MAX_MANIFEST_BYTES >> 20),
+            ));
+        }
+        let body = std::fs::read_to_string(entry.path())?;
+        out.push((name, body));
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out)
+}
+
+/// Syncs `~/.kiri/k8s-manifests` into `/var/lib/rancher/k3s/server/manifests/kiri-user`
+/// inside the running k3s node container without touching k3s's built-in manifests.
+fn sync_user_manifests() -> io::Result<()> {
+    let dir = manifests_dir()?;
+    let items = collect_user_manifests(&dir)?;
+    if items.is_empty() {
+        let (code, out) = client::exec(NAME, &["rm", "-rf", USER_MANIFESTS])?;
+        if code != 0 {
+            return Err(io::Error::other(format!("could not clean {USER_MANIFESTS}: {}", out.trim())));
+        }
+        return Ok(());
+    }
+    // Remove any previous user manifests not in the current list, then write changed ones atomically.
+    let clean_script = format!(
+        "set -e; d={USER_MANIFESTS}; mkdir -p \"$d\"; \
+         for f in \"$d\"/*; do [ -e \"$f\" ] || continue; b=$(basename \"$f\"); keep=0; \
+         for w in \"$@\"; do [ \"$b\" = \"$w\" ] && keep=1 && break; done; \
+         [ \"$keep\" = 1 ] || rm -f \"$f\"; done"
+    );
+    let mut clean_cmd: Vec<&str> = vec!["sh", "-c", &clean_script, "sh"];
+    for (name, _) in &items {
+        clean_cmd.push(name.as_str());
+    }
+    let (code, out) = client::exec(NAME, &clean_cmd)?;
+    if code != 0 {
+        return Err(io::Error::other(format!("could not prepare {USER_MANIFESTS}: {}", out.trim())));
+    }
+    let write_script = format!(
+        "set -e; d={USER_MANIFESTS}; f=\"$d/$1\"; t=\"$d/.$1.tmp\"; \
+         printf '%s' \"$2\" > \"$t\"; \
+         if cmp -s \"$t\" \"$f\"; then rm -f \"$t\"; else mv \"$t\" \"$f\"; fi"
+    );
+    for (name, body) in &items {
+        let (code, out) = client::exec(NAME, &["sh", "-c", &write_script, "sh", name.as_str(), body.as_str()])?;
+        if code != 0 {
+            return Err(io::Error::other(format!("could not write {USER_MANIFESTS}/{name}: {}", out.trim())));
+        }
+    }
+    Ok(())
+}
 
 /// k3s' CoreDNS imports `*.server` from the `coredns-custom` ConfigMap as
 /// server blocks of their own: one for the host's names answers them with
@@ -498,16 +779,14 @@ pub(crate) fn forget() {
 
 fn status() -> io::Result<()> {
     ensure_daemon()?;
+    let cfg = config();
     if !exists()? {
-        println!("Kubernetes: not created (kiri k8s start)");
+        println!("{}", format_status(None, &cfg));
         return Ok(());
     }
     let info = client::get(&format!("/containers/{NAME}/json"))?;
     let state = info["State"]["Status"].as_str().unwrap_or("unknown").to_owned();
-    let port = bound_port(&info).unwrap_or(API_PORT);
-    let want = config().api_port();
-    let moved = if port != want { format!(" ({want} was in use)") } else { String::new() };
-    println!("Kubernetes: {state}, API on 127.0.0.1:{port}{moved}");
+    println!("{}", format_status(Some(&info), &cfg));
     if state == "running" {
         // A context missing or out of date (written by an older Kiri, or not at all) is put right.
         if let Err(e) = sync(Duration::ZERO) {
@@ -593,5 +872,225 @@ mod tests {
         for bad in ["", "a b", "-x.com", "a..b", "x/y", "--flag"] {
             assert!(!super::valid_san(bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn k3s_version_tags_are_strictly_validated() {
+        for ok in ["v1.31.4-k3s1", "v1.21.14-k3s1", "v1.37.1-k3s1", "v1.31.4-rc1-k3s1", "1.31.4-k3s1", "v1.30.0_k3s1"] {
+            assert!(super::valid_version(ok), "{ok}");
+        }
+        let too_long = format!("v{}", "1".repeat(128));
+        for bad in [
+            "",
+            "default",
+            "DEFAULT",
+            "v1.31.4 k3s1",
+            " v1.31.4-k3s1",
+            "v1.31.4-k3s1 ",
+            "v1.31.4/k3s1",
+            "rancher/k3s:v1.31.4-k3s1",
+            "v1.31.4:k3s1",
+            "v1.31.4@sha256:1234",
+            "v1.31.4?tag=evil",
+            "v1.31.4&fromImage=evil",
+            "v1.31.4#frag",
+            "-v1.31.4-k3s1",
+            ".v1.31.4-k3s1",
+            "_v1.31.4-k3s1",
+            "v1..31-k3s1",
+            "v1.31.4\n",
+            "v1.31.4\0",
+            "v1.31.4\x1b[31m",
+            too_long.as_str(),
+        ] {
+            assert!(!super::valid_version(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn k3s_server_args_reject_empty_control_and_overlong_values() {
+        for ok in [
+            "--flannel-backend=none",
+            "--disable=traefik",
+            "--disable-network-policy",
+            "--cluster-cidr=10.42.0.0/16",
+            "--kube-apiserver-arg=enable-admission-plugins=NodeRestriction",
+        ] {
+            assert!(super::valid_k3s_arg(ok), "{ok}");
+        }
+        let max_ok = format!("--{}", "a".repeat(super::MAX_K3S_ARG_LEN - 2));
+        assert!(super::valid_k3s_arg(&max_ok));
+        let too_long = format!("--{}", "a".repeat(super::MAX_K3S_ARG_LEN - 1));
+        for bad in ["", "   ", "\t", "--arg\0evil", "--arg\nevil", "--arg\revil", "--arg\tevil", "--arg\x7f", "--arg\x1b[31m", too_long.as_str()] {
+            assert!(!super::valid_k3s_arg(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn set_parses_persists_resets_and_builds_k3s_server_command() {
+        let s = |items: &[&str]| items.iter().map(|x| (*x).to_owned()).collect::<Vec<String>>();
+        let mut cfg = super::Config::default();
+        assert_eq!(cfg.version_tag(), super::IMAGE.1);
+        assert_eq!(cfg.image(), format!("rancher/k3s:{}", super::IMAGE.1));
+
+        // Configure custom version and repeatable --k3s-arg flags.
+        super::apply_set_args(
+            &mut cfg,
+            &s(&[
+                "--version",
+                "v1.31.4-k3s1",
+                "--k3s-arg",
+                "--flannel-backend=none",
+                "--k3s-arg",
+                "--disable-network-policy",
+                "--tls-san",
+                "192.168.1.20",
+                "--port",
+                "6445",
+                "--lan",
+                "on",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(cfg.version.as_deref(), Some("v1.31.4-k3s1"));
+        assert_eq!(cfg.version_tag(), "v1.31.4-k3s1");
+        assert_eq!(cfg.image(), "rancher/k3s:v1.31.4-k3s1");
+        assert_eq!(cfg.k3s_args, vec!["--flannel-backend=none", "--disable-network-policy"]);
+        assert!(cfg.lan);
+        assert_eq!(cfg.api_port(), 6445);
+
+        let cmd = super::server_cmd(&cfg);
+        assert_eq!(
+            cmd,
+            vec![
+                "server",
+                "--disable",
+                "traefik",
+                "--tls-san",
+                "127.0.0.1",
+                "--tls-san",
+                "localhost",
+                "--write-kubeconfig-mode",
+                "644",
+                "--tls-san",
+                "192.168.1.20",
+                "--flannel-backend=none",
+                "--disable-network-policy",
+            ]
+        );
+        assert_ne!(super::made_with(&cfg), super::made_with(&super::Config::default()));
+
+        // Persistence round-trip through k8s.json.
+        let dir = std::env::temp_dir().join(format!("kiri-k8s-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("k8s.json");
+        super::save_config_to(&path, &cfg).unwrap();
+        let loaded = super::load_config_from(&path);
+        assert_eq!(loaded, cfg);
+
+        // Updating another flag preserves version and k3s_args.
+        let mut updated = loaded;
+        super::apply_set_args(&mut updated, &s(&["--lan", "off"])).unwrap();
+        assert!(!updated.lan);
+        assert_eq!(updated.version.as_deref(), Some("v1.31.4-k3s1"));
+        assert_eq!(updated.k3s_args, vec!["--flannel-backend=none", "--disable-network-policy"]);
+
+        // Invalid input does not partially mutate config.
+        let snapshot = updated.clone();
+        assert!(super::apply_set_args(&mut updated, &s(&["--version", "v1.31.4-k3s1", "--k3s-arg", ""])).is_err());
+        assert_eq!(updated, snapshot);
+        assert!(super::apply_set_args(&mut updated, &s(&["--version", "bad/tag"])).is_err());
+        assert!(super::apply_set_args(&mut updated, &s(&["--version"])).is_err());
+        assert!(super::apply_set_args(&mut updated, &s(&["--k3s-arg"])).is_err());
+
+        // Exceeding MAX_K3S_ARGS is rejected.
+        let mut many = Vec::new();
+        for i in 0..=super::MAX_K3S_ARGS {
+            many.push("--k3s-arg".to_owned());
+            many.push(format!("--arg-{i}"));
+        }
+        assert!(super::apply_set_args(&mut updated, &many).is_err());
+
+        // Reset version with "default" and "", and clear custom k3s args with --clear-k3s-args.
+        super::apply_set_args(&mut updated, &s(&["--version", "default", "--clear-k3s-args"])).unwrap();
+        assert_eq!(updated.version, None);
+        assert_eq!(updated.version_tag(), super::IMAGE.1);
+        assert!(updated.k3s_args.is_empty());
+
+        super::apply_set_args(&mut updated, &s(&["--version=v1.30.2-k3s1", "--k3s-arg=--disable=servicelb"])).unwrap();
+        assert_eq!(updated.version.as_deref(), Some("v1.30.2-k3s1"));
+        assert_eq!(updated.k3s_args, vec!["--disable=servicelb"]);
+
+        super::apply_set_args(&mut updated, &s(&["--version", ""])).unwrap();
+        assert_eq!(updated.version, None);
+
+        super::apply_set_args(&mut updated, &s(&["--version=v1.30.2-k3s1"])).unwrap();
+        super::apply_set_args(&mut updated, &s(&["--version="])).unwrap();
+        assert_eq!(updated.version, None);
+
+        super::save_config_to(&path, &super::Config::default()).unwrap();
+        let raw_json = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw_json.contains("version") && !raw_json.contains("k3s_args"), "{raw_json}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn formats_settings_and_status_with_version_and_k3s_args() {
+        let mut cfg = super::Config::default();
+        assert_eq!(
+            super::format_settings(&cfg),
+            format!("API server on 127.0.0.1:6443; extra certificate names: none; k3s version: {} (default); extra k3s args: none", super::IMAGE.1)
+        );
+        assert_eq!(
+            super::format_status(None, &cfg),
+            format!("Kubernetes: not created (kiri k8s start), k3s {}", super::IMAGE.1)
+        );
+
+        cfg.version = Some("v1.31.4-k3s1".into());
+        cfg.k3s_args = vec!["--flannel-backend=none".into(), "--disable=traefik".into()];
+        assert_eq!(
+            super::format_settings(&cfg),
+            "API server on 127.0.0.1:6443; extra certificate names: none; k3s version: v1.31.4-k3s1 (custom); extra k3s args: --flannel-backend=none --disable=traefik"
+        );
+        let running = serde_json::json!({
+            "State": {"Status": "running"},
+            "Config": {"Image": "rancher/k3s:v1.31.4-k3s1", "Labels": {"dev.kiri.k8s.port": "6443"}},
+            "NetworkSettings": {"Ports": {"6443/tcp": [{"HostIp": "127.0.0.1", "HostPort": "6443"}]}}
+        });
+        assert_eq!(
+            super::format_status(Some(&running), &cfg),
+            "Kubernetes: running, k3s v1.31.4-k3s1, API on 127.0.0.1:6443, k3s args: --flannel-backend=none --disable=traefik"
+        );
+    }
+
+    #[test]
+    fn collects_user_manifests_without_clobbering_builtin_manifests() {
+        assert_eq!(super::USER_MANIFESTS, "/var/lib/rancher/k3s/server/manifests/kiri-user");
+        assert_ne!(super::USER_MANIFESTS, super::MANIFESTS);
+        for ok in ["cilium.yaml", "01-cni.yml", " policy_v1.json".trim()] {
+            assert!(super::valid_manifest_name(ok), "{ok}");
+        }
+        for bad in ["", ".hidden.yaml", "-flag.yaml", "../evil.yaml", "a/b.yaml", "notes.txt", "a b.yaml"] {
+            assert!(!super::valid_manifest_name(bad), "{bad}");
+        }
+
+        let dir = std::env::temp_dir().join(format!("kiri-k8s-manifests-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(super::collect_user_manifests(&dir).unwrap(), Vec::<(String, String)>::new());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("b-app.yml"), "kind: Service\n").unwrap();
+        std::fs::write(dir.join("a-cilium.yaml"), "kind: DaemonSet\n").unwrap();
+        std::fs::write(dir.join(".ignored.yaml"), "ignored\n").unwrap();
+        std::fs::write(dir.join("README.md"), "ignored\n").unwrap();
+
+        let items = super::collect_user_manifests(&dir).unwrap();
+        assert_eq!(
+            items,
+            vec![
+                ("a-cilium.yaml".to_owned(), "kind: DaemonSet\n".to_owned()),
+                ("b-app.yml".to_owned(), "kind: Service\n".to_owned()),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
