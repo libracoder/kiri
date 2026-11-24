@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #744 CLI: `kiri domains` says when the daemon is not running (unreleased)
+- Fixes: #744 kiri domains prints "No such file or directory (os error 2)" with no engine
+- Caused: none known
+- Caused by: -
+- Check: none
+
 ### #290 Linux: use GTK clipboard for Kubernetes Settings Copy buttons (unreleased)
 - Fixes: no issue
 - Caused: none known
