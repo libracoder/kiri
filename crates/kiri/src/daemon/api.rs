@@ -1206,7 +1206,13 @@ fn save_resources(
     let body: Value = serde_json::from_slice(raw_body).map_err(|e| Error::BadRequest(format!("invalid JSON: {e}")))?;
     let cpus = body["cpus"].as_u64().filter(|c| (1..=max_cpus).contains(c)).ok_or_else(|| Error::BadRequest(format!("cpus must be 1 to {max_cpus}")))?;
     let mem = body["memory_mib"].as_u64().filter(|m| (1024..=max_mem).contains(m)).ok_or_else(|| Error::BadRequest(format!("memory_mib must be 1024 to {max_mem}")))?;
-    let mut out = json!({"cpus": cpus, "memory_mib": mem});
+    let mut out = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    out["cpus"] = json!(cpus);
+    out["memory_mib"] = json!(mem);
     if let Some(val) = body.get("disk_gb").filter(|v| !v.is_null()) {
         let current = current_disk_gb.unwrap_or(crate::guest::disk::DEFAULT_GB);
         let (min_disk, max_disk) = crate::guest::disk::ui_bounds(current, existing_disk_gb.unwrap_or(current));
@@ -7838,6 +7844,20 @@ mod resources_disk_tests {
         save_resources(body3.as_bytes(), &path, 12, 32768, Some(64), Some(128), Some(false)).unwrap();
         let saved3: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(saved3, json!({"cpus": 6, "memory_mib": 4096, "disk_gb": 128, "shared_nat": true}));
+
+        // Existing balloon / memory_min_mib fields in vm.json survive save_resources updates.
+        std::fs::write(
+            &path,
+            json!({"cpus": 6, "memory_mib": 4096, "disk_gb": 128, "shared_nat": true, "balloon": false, "memory_min_mib": 2048}).to_string(),
+        )
+        .unwrap();
+        let body4 = json!({"cpus": 8, "memory_mib": 8192}).to_string();
+        save_resources(body4.as_bytes(), &path, 12, 32768, Some(64), Some(128), Some(true)).unwrap();
+        let saved4: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            saved4,
+            json!({"cpus": 8, "memory_mib": 8192, "disk_gb": 128, "shared_nat": true, "balloon": false, "memory_min_mib": 2048})
+        );
 
         let bad_nat = json!({"cpus": 4, "memory_mib": 8192, "shared_nat": "off"}).to_string();
         match save_resources(bad_nat.as_bytes(), &path, 12, 32768, Some(64), None, None) {

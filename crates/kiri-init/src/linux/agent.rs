@@ -297,7 +297,7 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
                 // At most ten a second: the host reacts to the first one.
                 if last_pressure.elapsed() >= std::time::Duration::from_millis(100) {
                     last_pressure = std::time::Instant::now();
-                    let (_, mem_available_kib, _) = meminfo_full();
+                    let (_, mem_available_kib, _, _) = meminfo_full();
                     let (mem_stall, _) = super::cgroup::memory_trouble();
                     out.clear();
                     Msg::MemoryPressure(MemoryPressure { mem_available_kib, mem_stall }).encode(&mut out);
@@ -453,7 +453,7 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
                     return Ok(());
                 }
                 Ok(Msg::StatsRequest) => {
-                    let (mem_total_kib, mem_available_kib, mem_balloon_kib) = meminfo_full();
+                    let (mem_total_kib, mem_available_kib, mem_balloon_kib, mem_committed_kib) = meminfo_full();
                     let agent_rss_kib = self_rss_kib();
                     let (mem_stall, oom_kills) = super::cgroup::memory_trouble();
                     Msg::Stats(Stats {
@@ -465,6 +465,7 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
                         mem_stall,
                         oom_kills,
                         mem_balloon_kib,
+                        mem_committed_kib,
                     })
                     .encode(&mut out)
                 }

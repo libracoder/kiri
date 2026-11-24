@@ -732,23 +732,29 @@ fn dial_host() -> io::Result<File> {
     Err(io::Error::new(last.kind(), format!("dial host: {last}")))
 }
 
-/// MemTotal, MemAvailable and (when the kernel reports it) Balloon in KiB.
-fn meminfo_full() -> (u64, u64, Option<u64>) {
-    let Ok(s) = std::fs::read_to_string("/proc/meminfo") else { return (0, 0, None) };
-    let (total, avail, balloon) = parse_meminfo(&s);
+/// MemTotal, MemAvailable and (when the kernel reports them) Balloon and
+/// Committed_AS in KiB.
+fn meminfo_full() -> (u64, u64, Option<u64>, Option<u64>) {
+    let Ok(s) = std::fs::read_to_string("/proc/meminfo") else { return (0, 0, None, None) };
+    let (total, avail, balloon, committed) = parse_meminfo(&s);
     // Older kernels without `Balloon:` in /proc/meminfo still expose
     // balloon_inflate / balloon_deflate in /proc/vmstat inside the VM.
     let balloon = balloon.or_else(|| (std::process::id() == 1).then(vmstat_balloon_kib).flatten());
-    (total, avail, balloon)
+    (total, avail, balloon, committed)
 }
 
-fn parse_meminfo(s: &str) -> (u64, u64, Option<u64>) {
+fn parse_meminfo(s: &str) -> (u64, u64, Option<u64>, Option<u64>) {
     let field = |name: &str| {
         s.lines()
             .find_map(|l| l.strip_prefix(name))
             .and_then(|rest| rest.trim().trim_end_matches("kB").trim().parse().ok())
     };
-    (field("MemTotal:").unwrap_or(0), field("MemAvailable:").unwrap_or(0), field("Balloon:"))
+    (
+        field("MemTotal:").unwrap_or(0),
+        field("MemAvailable:").unwrap_or(0),
+        field("Balloon:"),
+        field("Committed_AS:"),
+    )
 }
 
 fn vmstat_balloon_kib() -> Option<u64> {
@@ -773,7 +779,7 @@ fn parse_vmstat_balloon_kib(s: &str, page_kib: u64) -> Option<u64> {
 
 /// MemTotal and MemAvailable in KiB.
 fn meminfo() -> (u64, u64) {
-    let (total, avail, _) = meminfo_full();
+    let (total, avail, _, _) = meminfo_full();
     (total, avail)
 }
 
@@ -841,13 +847,15 @@ mod take_over_tests {
 #[cfg(test)]
 mod meminfo_tests {
     #[test]
-    fn meminfo_reads_balloon_when_present() {
-        let with = "MemTotal:       24656160 kB\nMemFree:        24297640 kB\nMemAvailable:   24122580 kB\nBalloon:          262144 kB\n";
-        assert_eq!(super::parse_meminfo(with), (24_656_160, 24_122_580, Some(262_144)));
-        let zero = "MemTotal:       8211244 kB\nMemAvailable:   8000000 kB\nBalloon:              0 kB\n";
-        assert_eq!(super::parse_meminfo(zero), (8_211_244, 8_000_000, Some(0)));
+    fn meminfo_reads_balloon_and_committed_as_when_present() {
+        let with = "MemTotal:       24656160 kB\nMemFree:        24297640 kB\nMemAvailable:   24122580 kB\nCommitLimit:    12328080 kB\nCommitted_AS:    2097152 kB\nBalloon:          262144 kB\n";
+        assert_eq!(super::parse_meminfo(with), (24_656_160, 24_122_580, Some(262_144), Some(2_097_152)));
+        let zero = "MemTotal:       8211244 kB\nMemAvailable:   8000000 kB\nCommitted_AS:         0 kB\nBalloon:              0 kB\n";
+        assert_eq!(super::parse_meminfo(zero), (8_211_244, 8_000_000, Some(0), Some(0)));
+        let only_committed = "MemTotal:       8211244 kB\nMemAvailable:   8000000 kB\nCommitted_AS:   2148352 kB\n";
+        assert_eq!(super::parse_meminfo(only_committed), (8_211_244, 8_000_000, None, Some(2_148_352)));
         let without = "MemTotal:       8211244 kB\nMemAvailable:   8000000 kB\n";
-        assert_eq!(super::parse_meminfo(without), (8_211_244, 8_000_000, None));
+        assert_eq!(super::parse_meminfo(without), (8_211_244, 8_000_000, None, None));
     }
 
     #[test]
