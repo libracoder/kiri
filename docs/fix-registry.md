@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #745, #134 HTTP: drain bounded chunked trailers, handle `Expect: 100-continue`, and reject conflicting request framing (unreleased)
+- Fixes: #745 Chunked HTTP/1.1 request bodies with trailers corrupt subsequent requests on keep-alive connections; #134 Handle `Expect: 100-continue` before reading request bodies and reject ambiguous `Transfer-Encoding` + `Content-Length` framing per RFC 9112
+- Caused: none known
+- Caused by: -
+- Check: `crates/kiri/src/daemon/http.rs`
+
 ### #746 Images: validate image reference characters and TOML-escape `buildkitd.toml` registry tables (unreleased)
 - Fixes: #746 A loaded image whose name has a quote in it breaks buildkitd.toml, and every build after it
 - Caused: none known

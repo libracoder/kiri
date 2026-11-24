@@ -826,9 +826,11 @@ fn image_import(req: &Request, engine: &Engine, w: &mut UnixStream, r: &mut BufR
             http::end(w)?;
         }
         Err(e) => {
-            // The CLI is still sending the archive: read it out, or it gets
-            // a broken pipe instead of the message.
-            let _ = io::copy(&mut body, &mut io::sink());
+            // The CLI may still be sending the archive: read it out unless it
+            // is still waiting on an unsent `100 Continue`.
+            if !req.needs_continue() {
+                let _ = io::copy(&mut body, &mut io::sink());
+            }
             error_closing(w, e)?;
         }
     }
@@ -3839,6 +3841,15 @@ fn archive_put(req: &Request, engine: &Engine, id: &str, w: &mut UnixStream, r: 
     if req.flag("noOverwriteDirNonDir") {
         flags |= copy_flags::NO_OVERWRITE_DIR_NON_DIR;
     }
+    // Resolve the container and open the guest copy session before reading the
+    // body so missing containers fail with 404 without emitting `100 Continue`.
+    let stream = match engine.copy(id, kiri_proto::copy_op::IN, &path, flags) {
+        Ok(s) => s,
+        Err(e) => {
+            error_closing(w, e)?;
+            return Ok(Next::Close);
+        }
+    };
     // Docker takes the archive plain or compressed; the guest unpacks tar.
     use std::io::Read;
     let mut body = http::Body::new(req, r);
@@ -3847,13 +3858,6 @@ fn archive_put(req: &Request, engine: &Engine, id: &str, w: &mut UnixStream, r: 
     let gzip = upload_compression(&head) == Upload::Gzip;
     let mut archive = match upload_reader(head, body) {
         Ok(a) => a,
-        Err(e) => {
-            error_closing(w, e)?;
-            return Ok(Next::Close);
-        }
-    };
-    let stream = match engine.copy(id, kiri_proto::copy_op::IN, &path, flags) {
-        Ok(s) => s,
         Err(e) => {
             error_closing(w, e)?;
             return Ok(Next::Close);
@@ -5134,6 +5138,141 @@ mod tests {
             }
         }));
         assert!(answered(&got) && !sent && took < Duration::from_secs(4), "endless: sent {sent}, took {took:?}: {got}");
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// End-to-end check through `serve`: TE+CL smuggling returns 400 and closes
+    /// without running a smuggled request; chunked trailers leave keep-alive
+    /// intact; `Expect: 100-continue` gets `100 Continue` before body upload.
+    #[test]
+    fn serve_handles_chunked_trailers_expect_continue_and_rejects_smuggling() {
+        use std::io::{Read, Write};
+        let (root, engine) = engine_in("http-framing", false);
+
+        // 1. Conflicting framing, malformed header lines (obs-fold, space before ':'),
+        //    and bare-LF chunk size lines -> 400 Bad Request, Connection: close, no second reply.
+        for smuggle in [
+            &b"POST /auth HTTP/1.1\r\nHost: d\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n0\r\n\r\nGET /_ping HTTP/1.1\r\nHost: d\r\n\r\n"[..],
+            &b"POST /auth HTTP/1.1\r\nHost: d\r\n Transfer-Encoding: chunked\r\n\r\n0\r\n\r\nGET /_ping HTTP/1.1\r\nHost: d\r\n\r\n"[..],
+            &b"POST /auth HTTP/1.1\r\nHost: d\r\nTransfer-Encoding : chunked\r\n\r\n0\r\n\r\nGET /_ping HTTP/1.1\r\nHost: d\r\n\r\n"[..],
+            &b"POST /auth HTTP/1.1\r\nHost: d\r\nTransfer-Encoding: chunked\r\n\r\n2\n{}\r\n0\r\n\r\nGET /_ping HTTP/1.1\r\nHost: d\r\n\r\n"[..],
+        ] {
+            let (mut client, server) = UnixStream::pair().unwrap();
+            let served = std::thread::spawn({
+                let engine = engine.clone();
+                move || serve(server, engine, Caller::Host)
+            });
+            client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            client.write_all(smuggle).unwrap();
+            let mut got = Vec::new();
+            client.read_to_end(&mut got).unwrap();
+            drop(client);
+            served.join().unwrap().unwrap();
+            let got = String::from_utf8_lossy(&got);
+            assert!(got.starts_with("HTTP/1.1 400 Bad Request\r\n"), "{got}");
+            assert!(got.contains("Connection: close\r\n"), "{got}");
+            assert_eq!(got.matches("HTTP/1.1 ").count(), 1, "{got}");
+        }
+
+        // 2. Chunked request with trailers followed by GET /_ping on the same connection.
+        {
+            let (mut client, server) = UnixStream::pair().unwrap();
+            let served = std::thread::spawn({
+                let engine = engine.clone();
+                move || serve(server, engine, Caller::Host)
+            });
+            client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            client
+                .write_all(
+                    b"POST /auth HTTP/1.1\r\nHost: d\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\nX-Checksum: 1\r\n\r\nGET /_ping HTTP/1.1\r\nHost: d\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+            let mut got = Vec::new();
+            client.read_to_end(&mut got).unwrap();
+            drop(client);
+            served.join().unwrap().unwrap();
+            let got = String::from_utf8_lossy(&got);
+            assert!(got.contains("HTTP/1.1 200 OK\r\n") && got.ends_with("OK"), "{got}");
+            assert_eq!(got.matches("HTTP/1.1 ").count(), 2, "{got}");
+        }
+
+        // 3. Buffered Expect: 100-continue sends 100 Continue before reading body, then answers normally.
+        {
+            let (mut client, server) = UnixStream::pair().unwrap();
+            let served = std::thread::spawn({
+                let engine = engine.clone();
+                move || serve(server, engine, Caller::Host)
+            });
+            client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            client
+                .write_all(b"POST /auth HTTP/1.1\r\nHost: d\r\nExpect: 100-continue\r\nContent-Length: 2\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            let mut interim = [0u8; 25];
+            client.read_exact(&mut interim).unwrap();
+            assert_eq!(&interim, b"HTTP/1.1 100 Continue\r\n\r\n");
+            client.write_all(b"{}").unwrap();
+            let mut rest = Vec::new();
+            client.read_to_end(&mut rest).unwrap();
+            drop(client);
+            served.join().unwrap().unwrap();
+            let rest = String::from_utf8_lossy(&rest);
+            assert!(rest.starts_with("HTTP/1.1 400 ") || rest.starts_with("HTTP/1.1 200 "), "{rest}");
+        }
+
+        // 4. Streamed 404 (PUT /archive on missing container) and early 400 (bad import repo)
+        //    with Expect: 100-continue must NOT emit 100 Continue and must close cleanly.
+        for (req_head, want_status) in [
+            ("PUT /containers/no-such-container/archive?path=/tmp HTTP/1.1\r\nHost: d\r\nExpect: 100-continue\r\nContent-Length: 1073741824\r\n\r\n", "HTTP/1.1 404 Not Found\r\n"),
+            ("POST /images/create?fromSrc=-&repo=INVALID_UPPERCASE HTTP/1.1\r\nHost: d\r\nExpect: 100-continue\r\nContent-Length: 1073741824\r\n\r\n", "HTTP/1.1 400 Bad Request\r\n"),
+        ] {
+            let (mut client, server) = UnixStream::pair().unwrap();
+            let served = std::thread::spawn({
+                let engine = engine.clone();
+                move || serve(server, engine, Caller::Host)
+            });
+            client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            client.write_all(req_head.as_bytes()).unwrap();
+            let mut got = Vec::new();
+            client.read_to_end(&mut got).unwrap();
+            drop(client);
+            served.join().unwrap().unwrap();
+            let got = String::from_utf8_lossy(&got);
+            assert!(got.starts_with(want_status), "expected {want_status:?} for {req_head:?}, got: {got}");
+            assert!(got.contains("Connection: close\r\n"), "{got}");
+            assert!(!got.contains("100 Continue"), "{got}");
+            assert_eq!(got.matches("HTTP/1.1 ").count(), 1, "{got}");
+        }
+
+        // 5. Valid streamed upload (POST /images/create?fromSrc=-) with Expect: 100-continue
+        //    DOES emit 100 Continue before reading the body, then completes with 200 OK.
+        {
+            let (mut client, server) = UnixStream::pair().unwrap();
+            let served = std::thread::spawn({
+                let engine = engine.clone();
+                move || serve(server, engine, Caller::Host)
+            });
+            client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            client
+                .write_all(b"POST /images/create?fromSrc=- HTTP/1.1\r\nHost: d\r\nExpect: 100-continue\r\nTransfer-Encoding: chunked\r\n\r\n")
+                .unwrap();
+            let mut interim = [0u8; 25];
+            client.read_exact(&mut interim).unwrap();
+            assert_eq!(&interim, b"HTTP/1.1 100 Continue\r\n\r\n");
+            // Two 512-byte zero blocks form a valid empty tar archive.
+            let empty_tar = [0u8; 1024];
+            write!(client, "{:x}\r\n", empty_tar.len()).unwrap();
+            client.write_all(&empty_tar).unwrap();
+            client.write_all(b"\r\n0\r\nX-Digest: ok\r\n\r\n").unwrap();
+            let mut rest = Vec::new();
+            client.read_to_end(&mut rest).unwrap();
+            drop(client);
+            served.join().unwrap().unwrap();
+            let rest = String::from_utf8_lossy(&rest);
+            assert!(rest.starts_with("HTTP/1.1 200 OK\r\n"), "{rest}");
+            assert!(rest.contains("sha256:"), "{rest}");
+        }
+
         drop(engine);
         let _ = std::fs::remove_dir_all(root);
     }

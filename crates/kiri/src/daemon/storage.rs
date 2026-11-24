@@ -695,7 +695,15 @@ pub fn serve_unavailable(stream: UnixStream, missing: &Path) -> io::Result<()> {
     let mut w = stream.try_clone()?;
     let mut r = BufReader::new(stream);
     let unavailable = chosen::Unavailable(missing.to_owned()).to_string();
-    while let Some(req) = http::read_request(&mut r, |_, _| false)? {
+    loop {
+        let req = match http::read_request(&mut r, |_, _| false) {
+            Ok(Some(req)) => req,
+            Ok(None) => break,
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                return http::refuse_bad_request(&mut w, &mut r, &e.to_string()).or(Ok(()));
+            }
+            Err(e) => return Err(e),
+        };
         if req.too_large() {
             return http::refuse_too_large(&req, &mut w, &mut r).or(Ok(()));
         }

@@ -18,9 +18,20 @@ pub const MIN_API_VERSION: (u32, u32) = (1, 24);
 /// Largest request body read into memory (container create, etc.). Archives
 /// and image loads are streamed with [`Body`] instead, at any size.
 const MAX_BODY: usize = 8 << 20;
+/// Cap on upfront buffer reservation for buffered request bodies so headers or
+/// a chunk size line alone never pre-allocate [`MAX_BODY`] before bytes arrive.
+const INITIAL_BODY_CAP: usize = 64 << 10;
 /// The request line and headers together may not exceed this: an endless
 /// header line must not grow memory without bound.
 const MAX_HEAD: u64 = 64 << 10;
+/// Maximum size of a single chunk-size line (hex length plus optional `;ext`).
+const MAX_CHUNK_LINE: u64 = 1024;
+/// Maximum total bytes in a chunked body's trailer section (including its
+/// terminating blank line), so an endless trailer cannot exhaust memory or
+/// hold a connection open forever.
+const MAX_TRAILERS: u64 = 8 << 10;
+/// Maximum number of trailer header lines before the terminating blank line.
+const MAX_TRAILER_LINES: usize = 128;
 /// Most of a streamed body its handler left unread that is read out so the
 /// connection can serve the next request; past this it closes. Go's
 /// net/http server, so Docker's, reads out as much.
@@ -46,6 +57,9 @@ pub struct Request {
     /// Sent as HTTP/1.0: its connection closes after the response unless it
     /// asks to keep it.
     http10: bool,
+    /// Whether `HTTP/1.1 100 Continue` still needs to be sent before reading a
+    /// streamed body (RFC 9110 §10.1.1). Cleared once written.
+    needs_continue: Cell<bool>,
     /// How much of a streamed body has been read, through [`Body`].
     streamed: Cell<Streamed>,
 }
@@ -93,11 +107,23 @@ impl Request {
         has("close") || (self.http10 && !has("keep-alive"))
     }
 
+    fn expects_continue(&self) -> bool {
+        self.headers
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("expect"))
+            .any(|(_, v)| v.split(',').any(|t| t.trim().eq_ignore_ascii_case("100-continue")))
+    }
+
     /// A request the daemon makes of itself (the managed builder's
     /// container create), so it goes through the same code as a client's.
     pub fn internal(method: &str, path: &str, query: &[(&str, &str)], body: Vec<u8>) -> Request {
         let query = query.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect();
-        Request { method: method.to_owned(), path: path.to_owned(), api_version: None, query, headers: Vec::new(), body, http10: false, streamed: Cell::new(Streamed::No) }
+        Request { method: method.to_owned(), path: path.to_owned(), api_version: None, query, headers: Vec::new(), body, http10: false, needs_continue: Cell::new(false), streamed: Cell::new(Streamed::No) }
+    }
+
+    /// Whether a streamed body is still waiting for `HTTP/1.1 100 Continue`.
+    pub fn needs_continue(&self) -> bool {
+        self.needs_continue.get()
     }
 
     #[cfg(test)]
@@ -113,6 +139,7 @@ impl Request {
 pub fn read_request(r: &mut BufReader<UnixStream>, stream: impl Fn(&str, &str) -> bool) -> io::Result<Option<Request>> {
     SERVING.with(|s| *s.borrow_mut() = (String::new(), String::new()));
     CLOSING.with(|c| c.set(false));
+    PENDING_CONTINUE.with(|c| c.set(false));
     // The request line and headers are read through a cap, so a client
     // cannot exhaust memory with an endless line. The body is read after.
     let (method, path, api_version, query, headers, http10) = {
@@ -157,53 +184,239 @@ pub fn read_request(r: &mut BufReader<UnixStream>, stream: impl Fn(&str, &str) -
         loop {
             line.clear();
             if head.read_line(&mut line)? == 0 {
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "headers too large or cut short"));
+                let kind = if head.limit() == 0 { io::ErrorKind::InvalidData } else { io::ErrorKind::UnexpectedEof };
+                return Err(io::Error::new(kind, "headers too large or cut short"));
             }
-            let l = line.trim_end();
+            let Some(l) = line.strip_suffix('\n').map(|l| l.strip_suffix('\r').unwrap_or(l)) else {
+                let kind = if head.limit() == 0 { io::ErrorKind::InvalidData } else { io::ErrorKind::UnexpectedEof };
+                return Err(io::Error::new(kind, "headers too large or cut short"));
+            };
             if l.is_empty() {
                 break;
             }
-            if let Some((k, v)) = l.split_once(':') {
-                headers.push((k.trim().to_owned(), v.trim().to_owned()));
+            // RFC 9112 §5.1 / §5.2: reject obs-fold (leading whitespace),
+            // lines without ':', empty or non-token field-names (including
+            // whitespace before ':'), and control characters in values.
+            if l.starts_with([' ', '\t']) {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "bad header"));
             }
+            let Some((k, v)) = l.split_once(':') else {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "bad header"));
+            };
+            if k.is_empty() || !k.bytes().all(is_tchar) || v.bytes().any(is_ctl) {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "bad header"));
+            }
+            headers.push((k.to_owned(), v.trim_matches([' ', '\t']).to_owned()));
         }
         (method, path, api_version, query, headers, http10)
     };
     let streamed = stream(&method, &path);
-    let mut req = Request { method, path, api_version, query, headers, body: Vec::new(), http10, streamed: Cell::new(Streamed::No) };
+    let mut req = Request { method, path, api_version, query, headers, body: Vec::new(), http10, needs_continue: Cell::new(false), streamed: Cell::new(Streamed::No) };
+    let body_framing = framing(&req)?;
+    if !streamed && matches!(body_framing, Framing::Length(len) if len > MAX_BODY as u64) {
+        return Ok(Some(too_large(req)));
+    }
+    let wants_continue = !req.http10 && req.expects_continue() && !matches!(body_framing, Framing::None);
     if streamed {
-        req.streamed.set(Streamed::Unread);
+        // Defer `100 Continue` until the handler actually reads the streamed
+        // body (RFC 9110 §10.1.1), so early 4xx rejections close without
+        // asking the client to upload a multi-GB archive.
+        req.needs_continue.set(wants_continue);
+        req.streamed.set(if matches!(body_framing, Framing::None) { Streamed::Done } else { Streamed::Unread });
         return Ok(Some(req));
     }
-    if req.header("transfer-encoding").is_some_and(|v| v.eq_ignore_ascii_case("chunked")) {
-        let mut line = String::new();
-        loop {
-            line.clear();
-            // A chunk-size line is short hex (plus an optional ;extension).
-            (&mut *r).take(64).read_line(&mut line)?;
-            let size = line.trim().split(';').next().unwrap_or("");
-            let n = usize::from_str_radix(size, 16)
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad chunk size"))?;
-            if n > MAX_BODY || req.body.len().checked_add(n).is_none_or(|t| t > MAX_BODY) {
-                return Ok(Some(too_large(req)));
-            }
-            let start = req.body.len();
-            req.body.resize(start + n, 0);
-            r.read_exact(&mut req.body[start..])?;
-            let mut crlf = [0u8; 2];
-            r.read_exact(&mut crlf)?;
+    // RFC 9110 §10.1.1: an HTTP/1.1 client sending `Expect: 100-continue`
+    // waits for `100 Continue` before transmitting the body (as .NET's
+    // HttpClient and curl do on large uploads). HTTP/1.0 requests, bodiless
+    // requests, and already-rejected requests must not get a 100 response.
+    if wants_continue {
+        let w = r.get_mut();
+        w.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
+        w.flush()?;
+    }
+    match body_framing {
+        Framing::None => {}
+        Framing::Chunked => loop {
+            let n = read_chunk_len(r)?;
+            // A zero chunk has no data and no CRLF of its own: its line's
+            // CRLF is already read, and the trailer section follows
+            // (RFC 9112 §7.1.2).
             if n == 0 {
+                read_trailers(r)?;
                 break;
             }
+            if n > MAX_BODY as u64 || req.body.len().checked_add(n as usize).is_none_or(|t| t > MAX_BODY) {
+                return Ok(Some(too_large(req)));
+            }
+            let want = n as usize;
+            req.body.reserve(want.min(INITIAL_BODY_CAP));
+            let got = (&mut *r).take(n).read_to_end(&mut req.body)?;
+            if got != want {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "request body cut short"));
+            }
+            read_chunk_crlf(r)?;
+        },
+        Framing::Length(len) => {
+            let want = len as usize;
+            req.body = Vec::with_capacity(want.min(INITIAL_BODY_CAP));
+            let got = (&mut *r).take(len).read_to_end(&mut req.body)?;
+            if got != want {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "request body cut short"));
+            }
         }
-    } else if let Some(len) = req.header("content-length").and_then(|v| v.parse::<usize>().ok()) {
-        if len > MAX_BODY {
-            return Ok(Some(too_large(req)));
-        }
-        req.body.resize(len, 0);
-        r.read_exact(&mut req.body)?;
     }
     Ok(Some(req))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Framing {
+    None,
+    Chunked,
+    Length(u64),
+}
+
+/// Validates and determines request body framing per RFC 9112 §6.1 & §6.3.
+/// Rejects conflicting `Transfer-Encoding` + `Content-Length` headers,
+/// unsupported transfer codings, and malformed or conflicting `Content-Length`
+/// values with `InvalidData` so the connection answers 400 and closes.
+fn framing(req: &Request) -> io::Result<Framing> {
+    let mut has_te = false;
+    let mut te = Vec::new();
+    for (_, raw) in req.headers.iter().filter(|(k, _)| k.eq_ignore_ascii_case("transfer-encoding")) {
+        has_te = true;
+        for part in raw.split(',') {
+            let s = part.trim();
+            if !s.is_empty() {
+                te.push(s);
+            }
+        }
+    }
+    let has_cl = req.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-length"));
+    if has_te {
+        if has_cl {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "conflicting transfer-encoding and content-length"));
+        }
+        if req.http10 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "transfer-encoding is not valid in HTTP/1.0"));
+        }
+        if te.len() == 1 && te[0].eq_ignore_ascii_case("chunked") {
+            return Ok(Framing::Chunked);
+        }
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "unsupported transfer-encoding"));
+    }
+    let mut len: Option<u64> = None;
+    for (_, raw) in req.headers.iter().filter(|(k, _)| k.eq_ignore_ascii_case("content-length")) {
+        for part in raw.split(',') {
+            let s = part.trim();
+            if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "bad content-length"));
+            }
+            let n = s.parse::<u64>().map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad content-length"))?;
+            if let Some(prev) = len && prev != n {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "conflicting content-length"));
+            }
+            len = Some(n);
+        }
+    }
+    Ok(match len {
+        None | Some(0) => Framing::None,
+        Some(n) => Framing::Length(n),
+    })
+}
+
+fn read_chunk_len(r: &mut BufReader<UnixStream>) -> io::Result<u64> {
+    let mut line = Vec::new();
+    let mut lim = (&mut *r).take(MAX_CHUNK_LINE);
+    if lim.read_until(b'\n', &mut line)? == 0 {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "request body cut short"));
+    }
+    let Some(raw) = line.strip_suffix(b"\n") else {
+        let (kind, msg) = if lim.limit() == 0 {
+            (io::ErrorKind::InvalidData, "chunk size line too large")
+        } else {
+            (io::ErrorKind::UnexpectedEof, "request body cut short")
+        };
+        return Err(io::Error::new(kind, msg));
+    };
+    let Some(raw) = raw.strip_suffix(b"\r") else {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "bad chunk size line"));
+    };
+    // A chunk size may carry extensions after a semicolon (RFC 9112 §7.1.1);
+    // reject control characters (including NUL and bare CR) in any extension.
+    let (size, ext) = match raw.iter().position(|&b| b == b';') {
+        Some(i) => (&raw[..i], Some(&raw[i + 1..])),
+        None => (raw, None),
+    };
+    if let Some(ext) = ext && ext.iter().any(|&b| is_ctl(b)) {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "bad chunk extension"));
+    }
+    let size = &size[..size.iter().rposition(|b| !matches!(b, b' ' | b'\t')).map_or(0, |i| i + 1)];
+    if size.is_empty() || !size.iter().all(|b| b.is_ascii_hexdigit()) {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "bad chunk size"));
+    }
+    let s = std::str::from_utf8(size).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad chunk size"))?;
+    u64::from_str_radix(s, 16).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad chunk size"))
+}
+
+fn read_chunk_crlf(r: &mut BufReader<UnixStream>) -> io::Result<()> {
+    let mut crlf = [0u8; 2];
+    r.read_exact(&mut crlf)?;
+    if crlf != *b"\r\n" {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "bad chunk delimiter"));
+    }
+    Ok(())
+}
+
+fn is_tchar(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(b, b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~')
+}
+
+/// Control characters disallowed in HTTP field values and chunk extensions:
+/// C0 controls except HTAB (`0x09`), plus DEL (`0x7F`).
+fn is_ctl(b: u8) -> bool {
+    (b < 0x20 && b != b'\t') || b == 0x7f
+}
+
+/// Reads out a chunked body's trailer section: trailer header lines until the
+/// terminating blank line (RFC 9112 §7.1.2). Bounded in total bytes and line
+/// count so an endless trailer section cannot exhaust memory or hang.
+fn read_trailers(r: &mut BufReader<UnixStream>) -> io::Result<()> {
+    let mut lim = (&mut *r).take(MAX_TRAILERS);
+    let mut line = Vec::new();
+    let mut count = 0usize;
+    loop {
+        line.clear();
+        if lim.read_until(b'\n', &mut line)? == 0 {
+            let (kind, msg) = if lim.limit() == 0 {
+                (io::ErrorKind::InvalidData, "trailers too large")
+            } else {
+                (io::ErrorKind::UnexpectedEof, "trailers cut short")
+            };
+            return Err(io::Error::new(kind, msg));
+        }
+        let Some(raw) = line.strip_suffix(b"\n") else {
+            let (kind, msg) = if lim.limit() == 0 {
+                (io::ErrorKind::InvalidData, "trailers too large")
+            } else {
+                (io::ErrorKind::UnexpectedEof, "trailers cut short")
+            };
+            return Err(io::Error::new(kind, msg));
+        };
+        let Some(raw) = raw.strip_suffix(b"\r") else {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "bad trailer line"));
+        };
+        if raw.is_empty() {
+            return Ok(());
+        }
+        count += 1;
+        if count > MAX_TRAILER_LINES {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "too many trailer headers"));
+        }
+        if !raw.iter().position(|&b| b == b':').is_some_and(|i| i > 0 && raw[..i].iter().all(|&b| is_tchar(b)) && !raw[i + 1..].iter().any(|&b| is_ctl(b))) {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "bad trailer header"));
+        }
+    }
 }
 
 /// A request whose body is past [`MAX_BODY`]: what was read of it is dropped
@@ -237,17 +450,32 @@ pub fn refuse_bad_request(w: &mut UnixStream, r: &mut BufReader<UnixStream>, mes
     sent
 }
 
+/// Sends `HTTP/1.1 100 Continue` if this request is still waiting on one,
+/// clearing the pending flag so it is emitted at most once. Handlers that
+/// stream a final response header before reading [`Body`] (such as `POST /build`)
+/// call this right before starting the response.
+pub fn send_continue(req: &Request, r: &mut BufReader<UnixStream>) -> io::Result<()> {
+    if req.needs_continue.get() {
+        let w = r.get_mut();
+        w.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
+        w.flush()?;
+        req.needs_continue.set(false);
+        PENDING_CONTINUE.with(|c| c.set(false));
+    }
+    Ok(())
+}
+
 /// After a streamed request's response: whether the connection can serve
 /// the client's next request. A body its handler left unread (a pull sent
 /// with one, as docker-modem sends its options) is read out first, up to
 /// [`MAX_UNREAD`], or its bytes would be taken for the next request's head.
-/// One read partly, too large, or held back for a `100 Continue` the daemon
-/// never sends cannot be; the connection closes.
+/// One read partly, too large, or waiting on an unsent `100 Continue` cannot
+/// be; the connection closes.
 pub fn finish_body(req: &Request, r: &mut BufReader<UnixStream>) -> bool {
     match req.streamed.get() {
         Streamed::No | Streamed::Done => true,
         Streamed::Started | Streamed::TooLarge => false,
-        Streamed::Unread if req.header("expect").is_some_and(|v| v.eq_ignore_ascii_case("100-continue")) => false,
+        Streamed::Unread if req.needs_continue.get() => false,
         Streamed::Unread => {
             let mut body = Body::new(req, r);
             io::copy(&mut (&mut body).take(MAX_UNREAD), &mut io::sink()).is_ok() && body.read(&mut [0; 1]).is_ok_and(|n| n == 0)
@@ -303,38 +531,64 @@ pub struct Body<'a> {
     /// Bytes left in the body (or in the current chunk).
     left: u64,
     done: bool,
+    bad: Option<io::ErrorKind>,
     /// The request's record of how far its body was read.
     progress: &'a Cell<Streamed>,
+    /// Whether `100 Continue` still needs to be written on first read.
+    needs_continue: &'a Cell<bool>,
 }
 
 impl<'a> Body<'a> {
     pub fn new(req: &'a Request, r: &'a mut BufReader<UnixStream>) -> Body<'a> {
-        let chunked = req.header("transfer-encoding").is_some_and(|v| v.eq_ignore_ascii_case("chunked"));
-        let left = if chunked { 0 } else { req.header("content-length").and_then(|v| v.parse().ok()).unwrap_or(0) };
-        let done = !chunked && left == 0;
-        req.streamed.set(if done { Streamed::Done } else { Streamed::Started });
-        Body { r, chunked, left, done, progress: &req.streamed }
+        match framing(req) {
+            Ok(Framing::None) => {
+                req.streamed.set(Streamed::Done);
+                Body { r, chunked: false, left: 0, done: true, bad: None, progress: &req.streamed, needs_continue: &req.needs_continue }
+            }
+            Ok(Framing::Chunked) => {
+                Body { r, chunked: true, left: 0, done: false, bad: None, progress: &req.streamed, needs_continue: &req.needs_continue }
+            }
+            Ok(Framing::Length(n)) => {
+                Body { r, chunked: false, left: n, done: false, bad: None, progress: &req.streamed, needs_continue: &req.needs_continue }
+            }
+            Err(e) => {
+                req.streamed.set(Streamed::Started);
+                Body { r, chunked: false, left: 0, done: false, bad: Some(e.kind()), progress: &req.streamed, needs_continue: &req.needs_continue }
+            }
+        }
     }
 }
 
 impl Read for Body<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if let Some(kind) = self.bad {
+            return Err(io::Error::new(kind, "bad request framing"));
+        }
         if self.done || buf.is_empty() {
             return Ok(0);
         }
+        self.progress.set(Streamed::Started);
+        if self.needs_continue.get() {
+            let w = self.r.get_mut();
+            if let Err(e) = w.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").and_then(|()| w.flush()) {
+                self.bad = Some(e.kind());
+                return Err(e);
+            }
+            self.needs_continue.set(false);
+            PENDING_CONTINUE.with(|c| c.set(false));
+        }
         if self.chunked && self.left == 0 {
-            let mut line = String::new();
-            self.r.read_line(&mut line)?;
-            // A chunk size may carry extensions after a semicolon.
-            let size = line.trim().split(';').next().unwrap_or("");
-            self.left = u64::from_str_radix(size, 16).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad chunk size"))?;
+            self.left = match read_chunk_len(self.r) {
+                Ok(n) => n,
+                Err(e) => {
+                    self.bad = Some(e.kind());
+                    return Err(e);
+                }
+            };
             if self.left == 0 {
-                // Trailers, then the blank line.
-                loop {
-                    line.clear();
-                    if self.r.read_line(&mut line)? == 0 || line.trim().is_empty() {
-                        break;
-                    }
+                if let Err(e) = read_trailers(self.r) {
+                    self.bad = Some(e.kind());
+                    return Err(e);
                 }
                 self.done = true;
                 self.progress.set(Streamed::Done);
@@ -344,13 +598,16 @@ impl Read for Body<'_> {
         let want = buf.len().min(self.left.min(usize::MAX as u64) as usize);
         let n = self.r.read(&mut buf[..want])?;
         if n == 0 {
+            self.bad = Some(io::ErrorKind::UnexpectedEof);
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "request body cut short"));
         }
         self.left -= n as u64;
         if self.left == 0 {
             if self.chunked {
-                let mut crlf = [0u8; 2];
-                self.r.read_exact(&mut crlf)?;
+                if let Err(e) = read_chunk_crlf(self.r) {
+                    self.bad = Some(e.kind());
+                    return Err(e);
+                }
             } else {
                 self.done = true;
                 self.progress.set(Streamed::Done);
@@ -476,6 +733,9 @@ thread_local! {
     /// Whether the connection closes after the request being answered: its
     /// response then says so (`Connection: close`), as Docker's does.
     static CLOSING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Whether the streamed request being answered still has an unsent
+    /// `100 Continue`: answering before reading the body closes the connection.
+    static PENDING_CONTINUE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Notes the request being answered: a failure status written for it is
@@ -484,6 +744,7 @@ thread_local! {
 pub fn serving(req: &Request) {
     SERVING.with(|s| *s.borrow_mut() = (req.method.clone(), req.path.clone()));
     CLOSING.with(|c| c.set(req.wants_close()));
+    PENDING_CONTINUE.with(|c| c.set(req.needs_continue.get()));
 }
 
 /// Engine API failures in the log: 5xx as errors, 4xx as warnings, except
@@ -504,7 +765,7 @@ fn head(w: &mut impl Write, status: u16, extra: &str) -> io::Result<()> {
         note_failure(status);
     }
     // A response that names its own Connection (an upgrade, `CLOSE`) keeps it.
-    let closing = if CLOSING.with(std::cell::Cell::get) && !extra.contains("Connection:") { CLOSE } else { "" };
+    let closing = if (CLOSING.with(std::cell::Cell::get) || PENDING_CONTINUE.with(std::cell::Cell::get)) && !extra.contains("Connection:") { CLOSE } else { "" };
     write!(
         w,
         "HTTP/1.1 {status} {}\r\nApi-Version: {API_VERSION}\r\nDocker-Experimental: false\r\nOstype: linux\r\nServer: Kiri/{} (linux)\r\n{extra}{closing}\r\n",
@@ -627,7 +888,7 @@ mod tests {
 
     fn with_connection(value: Option<&str>) -> Request {
         let headers = value.map(|v| vec![("connection".to_owned(), v.to_owned())]).unwrap_or_default();
-        Request { method: "POST".to_owned(), path: "/containers/x/start".to_owned(), api_version: None, query: Vec::new(), headers, body: Vec::new(), http10: false, streamed: Cell::new(Streamed::No) }
+        Request { method: "POST".to_owned(), path: "/containers/x/start".to_owned(), api_version: None, query: Vec::new(), headers, body: Vec::new(), http10: false, needs_continue: Cell::new(false), streamed: Cell::new(Streamed::No) }
     }
 
     /// A request as `read_request` reads it off the wire.
@@ -856,7 +1117,7 @@ mod tests {
     #[test]
     fn upgrades_only_when_asked() {
         let reply = |headers: Vec<(String, String)>| {
-            let req = Request { method: "POST".into(), path: "/exec/x/start".into(), api_version: None, query: Vec::new(), headers, body: Vec::new(), http10: false, streamed: Cell::new(Streamed::No) };
+            let req = Request { method: "POST".into(), path: "/exec/x/start".into(), api_version: None, query: Vec::new(), headers, body: Vec::new(), http10: false, needs_continue: Cell::new(false), streamed: Cell::new(Streamed::No) };
             let mut out = Vec::new();
             upgrade_if_asked(&req, &mut out).unwrap();
             String::from_utf8(out).unwrap()
@@ -870,5 +1131,354 @@ mod tests {
         assert!(plain.starts_with("HTTP/1.1 200 OK\r\n"), "{plain}");
         assert!(plain.contains("Content-Type: application/vnd.docker.raw-stream\r\n"), "{plain}");
         assert!(!plain.contains("Upgrade"), "{plain}");
+    }
+
+    fn sock(bytes: &[u8]) -> BufReader<UnixStream> {
+        let (mut a, b) = UnixStream::pair().unwrap();
+        let data = bytes.to_vec();
+        // Write on a helper thread so payloads larger than macOS's 8 KiB
+        // UnixStream socket buffer never deadlock before the reader starts.
+        std::thread::spawn(move || {
+            let _ = a.write_all(&data);
+        });
+        BufReader::new(b)
+    }
+
+    /// Chunked bodies (both buffered and streamed) consume their full trailer
+    /// section and closing blank line (RFC 9112 §7.1.2) so pipelined keep-alive
+    /// requests start at the exact next request line (#745).
+    #[test]
+    fn chunked_trailers_preserve_keep_alive_boundaries() {
+        let head = "POST /containers/create HTTP/1.1\r\nHost: d\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n";
+        let ping = "GET /_ping HTTP/1.1\r\nHost: d\r\n\r\n";
+        for tail in [
+            "\r\n",
+            "X-Checksum: 1\r\n\r\n",
+            "X-Checksum: deadbeef\r\nX-Signature: sig-v1\r\nX-Time: 12:34:56\r\n\r\n",
+        ] {
+            let raw = format!("{head}{tail}{ping}");
+            let mut r = sock(raw.as_bytes());
+            let first = read_request(&mut r, |_, _| false).unwrap().unwrap();
+            assert_eq!(first.body, b"{}", "{tail:?}");
+            let second = read_request(&mut r, |_, _| false).unwrap().unwrap();
+            assert_eq!((second.method.as_str(), second.path.as_str()), ("GET", "/_ping"), "{tail:?}");
+        }
+
+        // Chunk extensions + multiple chunks + multi-line trailers on both
+        // buffered and streamed endpoints, plus a zero-length chunked body.
+        let streamed_raw = concat!(
+            "PUT /containers/abc/archive?path=/tmp HTTP/1.1\r\nHost: d\r\nTransfer-Encoding: chunked\r\n\r\n",
+            "5;ext=1\r\nhello\r\n",
+            "6\r\n world\r\n",
+            "0;last=yes\r\n",
+            "X-Checksum: sha256:abc\r\n",
+            "X-Trailer-Two: ok\r\n",
+            "\r\n",
+            "GET /_ping HTTP/1.1\r\nHost: d\r\n\r\n",
+        );
+        let mut r = sock(streamed_raw.as_bytes());
+        let first = read_request(&mut r, |m, p| m == "PUT" && p.ends_with("/archive")).unwrap().unwrap();
+        let mut data = Vec::new();
+        Body::new(&first, &mut r).read_to_end(&mut data).unwrap();
+        assert_eq!(data, b"hello world");
+        assert!(finish_body(&first, &mut r));
+        let second = read_request(&mut r, |_, _| false).unwrap().unwrap();
+        assert_eq!((second.method.as_str(), second.path.as_str()), ("GET", "/_ping"));
+
+        let empty_chunked = "POST /images/load HTTP/1.1\r\nHost: d\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nX-Empty: 1\r\n\r\nGET /_ping HTTP/1.1\r\nHost: d\r\n\r\n";
+        let mut r = sock(empty_chunked.as_bytes());
+        let first = read_request(&mut r, |_, p| p == "/images/load").unwrap().unwrap();
+        let mut data = Vec::new();
+        Body::new(&first, &mut r).read_to_end(&mut data).unwrap();
+        assert!(data.is_empty());
+        assert!(finish_body(&first, &mut r));
+        let second = read_request(&mut r, |_, _| false).unwrap().unwrap();
+        assert_eq!((second.method.as_str(), second.path.as_str()), ("GET", "/_ping"));
+    }
+
+    /// Trailer sections and chunk framing are bounded and validated in both
+    /// buffered and streamed paths so endless, oversized, truncated, or
+    /// malformed trailers and chunk delimiters fail cleanly (#745).
+    #[test]
+    fn chunked_trailers_and_delimiters_are_bounded_and_validated() {
+        let prefix = "POST /containers/create HTTP/1.1\r\nHost: d\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n";
+
+        // Single giant trailer line past MAX_TRAILERS -> InvalidData.
+        let giant = format!("{prefix}X-Big: {}\r\n\r\n", "a".repeat(MAX_TRAILERS as usize + 64));
+        assert_eq!(read_request(&mut sock(giant.as_bytes()), |_, _| false).unwrap_err().kind(), io::ErrorKind::InvalidData);
+
+        // Many trailer lines summing past MAX_TRAILERS -> InvalidData.
+        let mut many_bytes = String::from(prefix);
+        for i in 0..100 {
+            many_bytes.push_str(&format!("X-Pad-{i:03}: {}\r\n", "b".repeat(100)));
+        }
+        many_bytes.push_str("\r\n");
+        assert_eq!(read_request(&mut sock(many_bytes.as_bytes()), |_, _| false).unwrap_err().kind(), io::ErrorKind::InvalidData);
+
+        // Exceeding MAX_TRAILER_LINES even while well under MAX_TRAILERS -> InvalidData.
+        let mut many_lines = String::from(prefix);
+        for i in 0..=MAX_TRAILER_LINES {
+            many_lines.push_str(&format!("X-{i}: 1\r\n"));
+        }
+        many_lines.push_str("\r\n");
+        assert!(many_lines.len() < MAX_TRAILERS as usize + prefix.len());
+        assert_eq!(read_request(&mut sock(many_lines.as_bytes()), |_, _| false).unwrap_err().kind(), io::ErrorKind::InvalidData);
+
+        // Same oversized-trailer rejection on the streamed Body path.
+        let streamed_big = format!(
+            "POST /images/load HTTP/1.1\r\nHost: d\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\nX-Big: {}\r\n\r\n",
+            "z".repeat(MAX_TRAILERS as usize + 16),
+        );
+        let mut r = sock(streamed_big.as_bytes());
+        let req = read_request(&mut r, |_, p| p == "/images/load").unwrap().unwrap();
+        assert_eq!(Body::new(&req, &mut r).read_to_end(&mut Vec::new()).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert!(!finish_body(&req, &mut r));
+
+        // Truncated trailers hit UnexpectedEof and prevent keep-alive reuse.
+        for cut_raw in [
+            "POST /images/load HTTP/1.1\r\nHost: d\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\nX-Incomplete: 1",
+            "POST /images/load HTTP/1.1\r\nHost: d\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\nX-Incomplete: 1\r\n",
+            "POST /images/load HTTP/1.1\r\nHost: d\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n",
+        ] {
+            let mut r = sock(cut_raw.as_bytes());
+            let req = read_request(&mut r, |_, p| p == "/images/load").unwrap().unwrap();
+            assert_eq!(Body::new(&req, &mut r).read_to_end(&mut Vec::new()).unwrap_err().kind(), io::ErrorKind::UnexpectedEof, "{cut_raw:?}");
+            assert!(!finish_body(&req, &mut r));
+        }
+
+        // Malformed trailer headers, bad chunk delimiters, funky-chunk bare LF
+        // lines, control characters in chunk extensions/trailers, and invalid sizes.
+        let huge_ext = format!(
+            "POST /x HTTP/1.1\r\nHost: d\r\nTransfer-Encoding: chunked\r\n\r\n0;{}\r\n\r\n",
+            "e".repeat(MAX_CHUNK_LINE as usize + 16),
+        );
+        for bad in [
+            format!("{prefix}GET /_ping HTTP/1.1\r\n\r\n"),
+            format!("{prefix}: missing-name\r\n\r\n"),
+            format!("{prefix}X-T: 1\n\r\n"),
+            format!("{prefix}\n"),
+            format!("{prefix}X-T: a\rb\r\n\r\n"),
+            format!("{prefix}X-T: a\0b\r\n\r\n"),
+            "POST /x HTTP/1.1\r\nHost: d\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhelloXX0\r\n\r\n".to_owned(),
+            "POST /x HTTP/1.1\r\nHost: d\r\nTransfer-Encoding: chunked\r\n\r\n+5\r\nhello\r\n0\r\n\r\n".to_owned(),
+            "POST /x HTTP/1.1\r\nHost: d\r\nTransfer-Encoding: chunked\r\n\r\n 5\r\nhello\r\n0\r\n\r\n".to_owned(),
+            "POST /x HTTP/1.1\r\nHost: d\r\nTransfer-Encoding: chunked\r\n\r\n5\nhello\r\n0\r\n\r\n".to_owned(),
+            "POST /x HTTP/1.1\r\nHost: d\r\nTransfer-Encoding: chunked\r\n\r\n0\n\r\n".to_owned(),
+            "POST /x HTTP/1.1\r\nHost: d\r\nTransfer-Encoding: chunked\r\n\r\n5;ext=1\nhello\r\n0\r\n\r\n".to_owned(),
+            "POST /x HTTP/1.1\r\nHost: d\r\nTransfer-Encoding: chunked\r\n\r\n5;ext=a\rb\r\nhello\r\n0\r\n\r\n".to_owned(),
+            "POST /x HTTP/1.1\r\nHost: d\r\nTransfer-Encoding: chunked\r\n\r\n5;ext\r\r\nhello\r\n0\r\n\r\n".to_owned(),
+            "POST /x HTTP/1.1\r\nHost: d\r\nTransfer-Encoding: chunked\r\n\r\n5;ext=\0x\r\nhello\r\n0\r\n\r\n".to_owned(),
+            "POST /x HTTP/1.1\r\nHost: d\r\nTransfer-Encoding: chunked\r\n\r\n5;ext=\x01\r\nhello\r\n0\r\n\r\n".to_owned(),
+            "POST /x HTTP/1.1\r\nHost: d\r\nTransfer-Encoding: chunked\r\n\r\n5;ext=\x1f\r\nhello\r\n0\r\n\r\n".to_owned(),
+            "POST /x HTTP/1.1\r\nHost: d\r\nTransfer-Encoding: chunked\r\n\r\n5;ext=\x7f\r\nhello\r\n0\r\n\r\n".to_owned(),
+            huge_ext,
+        ] {
+            assert_eq!(read_request(&mut sock(bad.as_bytes()), |_, _| false).unwrap_err().kind(), io::ErrorKind::InvalidData, "buffered: {bad:?}");
+            let mut r = sock(bad.as_bytes());
+            let req = read_request(&mut r, |_, _| true).unwrap().unwrap();
+            assert_eq!(Body::new(&req, &mut r).read_to_end(&mut Vec::new()).unwrap_err().kind(), io::ErrorKind::InvalidData, "streamed: {bad:?}");
+        }
+
+        // HTAB in chunk extensions remains valid per RFC 9112 §7.1.1.
+        let htab_ext = "POST /x HTTP/1.1\r\nHost: d\r\nTransfer-Encoding: chunked\r\n\r\n5;ext=\t1\r\nhello\r\n0\r\n\r\n";
+        let req = read_request(&mut sock(htab_ext.as_bytes()), |_, _| false).unwrap().unwrap();
+        assert_eq!(req.body, b"hello");
+
+        // Truncated buffered Content-Length and chunked bodies return UnexpectedEof.
+        for short in [
+            "POST /x HTTP/1.1\r\nHost: d\r\nContent-Length: 10\r\n\r\nabc",
+            "POST /x HTTP/1.1\r\nHost: d\r\nContent-Length: 8388608\r\n\r\n",
+            "POST /x HTTP/1.1\r\nHost: d\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhel",
+        ] {
+            assert_eq!(read_request(&mut sock(short.as_bytes()), |_, _| false).unwrap_err().kind(), io::ErrorKind::UnexpectedEof, "{short:?}");
+        }
+    }
+
+    /// RFC 9112 §5.1 / §5.2: malformed header lines (obs-fold leading whitespace,
+    /// missing ':', whitespace before ':', empty or non-token field names, and
+    /// control characters in values) are rejected with InvalidData.
+    #[test]
+    fn rejects_malformed_header_lines() {
+        for bad in [
+            "POST /x HTTP/1.1\r\nHost: d\r\n Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+            "POST /x HTTP/1.1\r\nHost: d\r\n\tTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+            "POST /x HTTP/1.1\r\nHost: d\r\nTransfer-Encoding : chunked\r\n\r\n0\r\n\r\n",
+            "POST /x HTTP/1.1\r\nHost: d\r\nTransfer-Encoding\t: chunked\r\n\r\n0\r\n\r\n",
+            "GET /_ping HTTP/1.1\r\nHost: d\r\nNoColonHeader\r\n\r\n",
+            "GET /_ping HTTP/1.1\r\nHost: d\r\n   \r\n\r\n",
+            "GET /_ping HTTP/1.1\r\nHost: d\r\n: value\r\n\r\n",
+            "GET /_ping HTTP/1.1\r\nHost: d\r\nBad Name: value\r\n\r\n",
+            "GET /_ping HTTP/1.1\r\nHost: d\r\nBad(Name): value\r\n\r\n",
+            "GET /_ping HTTP/1.1\r\nHost: d\r\nBad\0Name: value\r\n\r\n",
+            "GET /_ping HTTP/1.1\r\nHost: d\r\nX-Foo: a\rb\r\n\r\n",
+            "GET /_ping HTTP/1.1\r\nHost: d\r\nX-Foo: a\0b\r\n\r\n",
+            "GET /_ping HTTP/1.1\r\nHost: d\r\nX-Foo: a\x7fb\r\n\r\n",
+        ] {
+            assert_eq!(read_request(&mut sock(bad.as_bytes()), |_, _| false).unwrap_err().kind(), io::ErrorKind::InvalidData, "buffered: {bad:?}");
+            assert_eq!(read_request(&mut sock(bad.as_bytes()), |_, _| true).unwrap_err().kind(), io::ErrorKind::InvalidData, "streamed: {bad:?}");
+        }
+
+        // Valid headers with OWS tabs/spaces around values and empty values pass.
+        let ok = parsed("GET /_ping HTTP/1.1\r\nHost: d\r\nX-Empty:\r\nX-Tab: \tval \t\r\n\r\n");
+        assert_eq!(ok.header("X-Empty"), Some(""));
+        assert_eq!(ok.header("X-Tab"), Some("val"));
+    }
+
+    /// HTTP/1.1 requests with `Expect: 100-continue` receive `HTTP/1.1 100 Continue`
+    /// eagerly for buffered bodies and lazily on first `Body` read for streamed
+    /// routes (so early 4xx rejections never ask the client to upload), while
+    /// HTTP/1.0, bodiless, and oversized requests never receive 100 Continue (#134).
+    #[test]
+    fn expect_100_continue_handshakes_before_reading_body() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        // 1. Buffered Content-Length: client waits for 100 Continue before writing body.
+        {
+            let (mut client, server) = UnixStream::pair().unwrap();
+            client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let t = std::thread::spawn(move || {
+                let mut r = BufReader::new(server);
+                let first = read_request(&mut r, |_, _| false).unwrap().unwrap();
+                let second = read_request(&mut r, |_, _| false).unwrap().unwrap();
+                (first.body, second.method, second.path)
+            });
+            client.write_all(b"POST /containers/create HTTP/1.1\r\nHost: d\r\nExpect: 100-continue\r\nContent-Length: 11\r\n\r\n").unwrap();
+            let mut interim = [0u8; 25];
+            client.read_exact(&mut interim).unwrap();
+            assert_eq!(&interim, b"HTTP/1.1 100 Continue\r\n\r\n");
+            client.write_all(b"{\"a\":12345}GET /_ping HTTP/1.1\r\nHost: d\r\n\r\n").unwrap();
+            drop(client);
+            let (body, m, p) = t.join().unwrap();
+            assert_eq!(body, b"{\"a\":12345}");
+            assert_eq!((m.as_str(), p.as_str()), ("GET", "/_ping"));
+        }
+
+        // 2. Streamed chunked upload (as .NET/curl send for PUT /archive) with trailers:
+        //    read_request does NOT emit 100 Continue; Body::read emits it lazily.
+        {
+            let (mut client, server) = UnixStream::pair().unwrap();
+            client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let (head_done_tx, head_done_rx) = mpsc::channel();
+            let (go_read_tx, go_read_rx) = mpsc::channel();
+            let t = std::thread::spawn(move || {
+                let mut r = BufReader::new(server);
+                let req = read_request(&mut r, |m, p| m == "PUT" && p.ends_with("/archive")).unwrap().unwrap();
+                assert!(req.needs_continue());
+                head_done_tx.send(()).unwrap();
+                go_read_rx.recv().unwrap();
+                let mut data = Vec::new();
+                Body::new(&req, &mut r).read_to_end(&mut data).unwrap();
+                assert!(!req.needs_continue());
+                assert!(finish_body(&req, &mut r));
+                let next = read_request(&mut r, |_, _| false).unwrap().unwrap();
+                (data, next.path)
+            });
+            client.write_all(b"PUT /containers/c/archive?path=/tmp HTTP/1.1\r\nHost: d\r\nExpect: 100-Continue\r\nTransfer-Encoding: chunked\r\n\r\n").unwrap();
+            head_done_rx.recv().unwrap();
+            // Confirm nothing was written before the handler reads Body.
+            client.set_nonblocking(true).unwrap();
+            let mut peek = [0u8; 1];
+            assert_eq!(client.read(&mut peek).unwrap_err().kind(), io::ErrorKind::WouldBlock);
+            client.set_nonblocking(false).unwrap();
+            client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            go_read_tx.send(()).unwrap();
+            let mut interim = [0u8; 25];
+            client.read_exact(&mut interim).unwrap();
+            assert_eq!(&interim, b"HTTP/1.1 100 Continue\r\n\r\n");
+            client.write_all(b"7\r\ntarball\r\n0\r\nX-Hash: abc\r\n\r\nGET /_ping HTTP/1.1\r\nHost: d\r\n\r\n").unwrap();
+            drop(client);
+            let (data, next_path) = t.join().unwrap();
+            assert_eq!(data, b"tarball");
+            assert_eq!(next_path, "/_ping");
+        }
+
+        // 3. Streamed unread body with Expect: 100-continue does NOT emit 100 Continue;
+        //    answering adds Connection: close and finish_body closes the connection.
+        {
+            let (mut client, server) = UnixStream::pair().unwrap();
+            client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let t = std::thread::spawn(move || {
+                let mut w = server.try_clone().unwrap();
+                let mut r = BufReader::new(server);
+                let req = read_request(&mut r, |m, p| m == "PUT" && p.ends_with("/archive")).unwrap().unwrap();
+                assert!(req.needs_continue());
+                serving(&req);
+                error(&mut w, 404, "No such container").unwrap();
+                assert!(!finish_body(&req, &mut r));
+                close(&w, &mut r);
+            });
+            client.write_all(b"PUT /containers/missing/archive?path=/tmp HTTP/1.1\r\nHost: d\r\nExpect: 100-continue\r\nContent-Length: 1073741824\r\n\r\n").unwrap();
+            let mut reply = Vec::new();
+            client.read_to_end(&mut reply).unwrap();
+            drop(client);
+            t.join().unwrap();
+            let reply = String::from_utf8_lossy(&reply);
+            assert!(reply.starts_with("HTTP/1.1 404 Not Found\r\n"), "{reply}");
+            assert!(reply.contains("Connection: close\r\n"), "{reply}");
+            assert!(!reply.contains("100 Continue"), "{reply}");
+        }
+
+        // 4. Oversized buffered body, HTTP/1.0, and bodiless requests must NOT send 100 Continue.
+        for (raw, check_too_large) in [
+            (format!("POST /x HTTP/1.1\r\nHost: d\r\nExpect: 100-continue\r\nContent-Length: {}\r\n\r\n", MAX_BODY + 1), true),
+            ("POST /x HTTP/1.0\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\n{}".to_owned(), false),
+            ("GET /_ping HTTP/1.1\r\nHost: d\r\nExpect: 100-continue\r\n\r\n".to_owned(), false),
+            ("POST /x HTTP/1.1\r\nHost: d\r\nExpect: 100-continue\r\nContent-Length: 0\r\n\r\n".to_owned(), false),
+        ] {
+            let (mut client, server) = UnixStream::pair().unwrap();
+            client.write_all(raw.as_bytes()).unwrap();
+            client.shutdown(std::net::Shutdown::Write).unwrap();
+            let req = read_request(&mut BufReader::new(server), |_, _| false).unwrap().unwrap();
+            assert_eq!(req.too_large(), check_too_large, "{raw:?}");
+            let mut reply = Vec::new();
+            client.read_to_end(&mut reply).unwrap();
+            assert!(reply.is_empty(), "unexpected 100 Continue for {raw:?}: {:?}", String::from_utf8_lossy(&reply));
+        }
+    }
+
+    /// Ambiguous Transfer-Encoding + Content-Length combinations and malformed
+    /// or conflicting Content-Length headers are rejected with InvalidData so
+    /// the server responds 400 Bad Request and closes the connection (#134).
+    #[test]
+    fn rejects_ambiguous_transfer_encoding_and_content_length_framing() {
+        for bad in [
+            "POST /x HTTP/1.1\r\nHost: d\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n0\r\n\r\n",
+            "POST /x HTTP/1.1\r\nHost: d\r\nTransfer-Encoding: chunked\r\nContent-Length: 0\r\n\r\n0\r\n\r\n",
+            "POST /x HTTP/1.1\r\nHost: d\r\nTransfer-Encoding: \r\nContent-Length: 5\r\n\r\nhello",
+            "POST /x HTTP/1.1\r\nHost: d\r\nTransfer-Encoding: chunked, chunked\r\n\r\n0\r\n\r\n",
+            "POST /x HTTP/1.1\r\nHost: d\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n",
+            "POST /x HTTP/1.1\r\nHost: d\r\nTransfer-Encoding: identity\r\n\r\n",
+            "POST /x HTTP/1.1\r\nHost: d\r\nTransfer-Encoding: \r\n\r\n",
+            "POST /x HTTP/1.0\r\nHost: d\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+            "POST /x HTTP/1.1\r\nHost: d\r\nContent-Length: 4\r\nContent-Length: 8\r\n\r\nabcd",
+            "POST /x HTTP/1.1\r\nHost: d\r\nContent-Length: 4, 8\r\n\r\nabcd",
+            "POST /x HTTP/1.1\r\nHost: d\r\nContent-Length: 99999999999999999999999999999\r\n\r\n",
+            "POST /x HTTP/1.1\r\nHost: d\r\nContent-Length: -1\r\n\r\n",
+            "POST /x HTTP/1.1\r\nHost: d\r\nContent-Length: +4\r\n\r\nabcd",
+            "POST /x HTTP/1.1\r\nHost: d\r\nContent-Length: abc\r\n\r\n",
+            "POST /x HTTP/1.1\r\nHost: d\r\nContent-Length: \r\n\r\n",
+        ] {
+            assert_eq!(read_request(&mut sock(bad.as_bytes()), |_, _| false).unwrap_err().kind(), io::ErrorKind::InvalidData, "buffered accepted: {bad:?}");
+            assert_eq!(read_request(&mut sock(bad.as_bytes()), |_, _| true).unwrap_err().kind(), io::ErrorKind::InvalidData, "streamed accepted: {bad:?}");
+        }
+
+        // TE+CL with Expect: 100-continue must reject without sending 100 Continue.
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client.write_all(b"POST /x HTTP/1.1\r\nHost: d\r\nExpect: 100-continue\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n").unwrap();
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+        assert_eq!(read_request(&mut BufReader::new(server), |_, _| false).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        let mut reply = Vec::new();
+        client.read_to_end(&mut reply).unwrap();
+        assert!(reply.is_empty());
+
+        // Identical duplicate Content-Length values remain valid per RFC 9112 §6.3.
+        for dup in [
+            "POST /x HTTP/1.1\r\nHost: d\r\nContent-Length: 4\r\nContent-Length: 4\r\n\r\nabcd",
+            "POST /x HTTP/1.1\r\nHost: d\r\nContent-Length: 4, 4\r\n\r\nabcd",
+        ] {
+            let req = read_request(&mut sock(dup.as_bytes()), |_, _| false).unwrap().unwrap();
+            assert_eq!(req.body, b"abcd", "{dup:?}");
+        }
     }
 }

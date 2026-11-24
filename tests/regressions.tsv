@@ -312,3 +312,4 @@ vol-rm-force-in-use	#773	docker volume rm --force (and DELETE /volumes/{name}?fo
 vol-rm-force-missing	#773	DELETE /volumes/{name}?force=1 (and docker volume rm -f) returned 404 Not Found for a missing volume instead of 204 No Content as Docker does
 crates/kiri-image/src/reference.rs	#746	Reference::parse and archive::load accepted quotes, backslashes, queries and fragments in image names, storing unparseable or hostile RepoTags from docker load
 crates/kiri/src/daemon/mirror.rs	#746	registry and mirror names were written into buildkitd.toml without TOML string escaping, so a quote or backslash broke buildkitd startup on every build
+crates/kiri/src/daemon/http.rs	#745	chunked request bodies left trailer headers on keep-alive connections, Expect: 100-continue never sent 100 Continue before reading bodies, and conflicting Transfer-Encoding + Content-Length headers were not rejected with 400 Bad Request (#134)

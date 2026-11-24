@@ -1065,6 +1065,12 @@ pub fn build(req: &Request, engine: &Arc<Engine>, w: &mut UnixStream, r: &mut Bu
             *h = format!("{}={host}", &h[..h.len() - mac.len()]);
         }
     }
+    // Emit `100 Continue` before the streamed 200 OK header when the build will
+    // read its context from the request body, so `send_context` never writes
+    // an interim response after `200 OK`.
+    if o.remote.is_none() {
+        http::send_continue(req, r)?;
+    }
     // The context may be left partly unread: the connection closes after.
     http::begin_stream_with(w, 200, "application/json", http::CLOSE)?;
     let probe = w.try_clone()?;
