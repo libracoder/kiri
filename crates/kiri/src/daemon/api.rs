@@ -5363,6 +5363,99 @@ mod tests {
         drop(engine);
         let _ = std::fs::remove_dir_all(root);
     }
+
+    #[test]
+    fn network_create_ignores_ipv6_ipam_when_ipv6_disabled() {
+        let root = std::env::temp_dir().join(format!("kiri-net-ipv6-off-api-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let engine = super::super::engine::boot_without_vm(&root);
+        let post = |body: Value| network_create(&Request::internal("POST", "/networks/create", &[], serde_json::to_vec(&body).unwrap()), &engine);
+
+        // 1a. Explicit EnableIPv6: false + IPv4 & IPv6 subnets (mailcow-dockerized).
+        post(json!({
+            "Name": "mailcow",
+            "EnableIPv6": false,
+            "IPAM": {
+                "Driver": "default",
+                "Config": [
+                    {"Subnet": "172.22.1.0/24"},
+                    {"Subnet": "fd4d:6169:6c63:6f77::/64"}
+                ]
+            }
+        }))
+        .unwrap();
+        let ins = network_inspect(&engine, "mailcow").unwrap();
+        assert_eq!(ins["EnableIPv4"], json!(true));
+        assert_eq!(ins["EnableIPv6"], json!(false));
+        assert_eq!(ins["IPAM"]["Config"], json!([{"Subnet": "172.22.1.0/24", "Gateway": "172.22.1.1"}]));
+
+        // 1b. EnableIPv6 omitted + IPv4 & IPv6 subnets.
+        post(json!({
+            "Name": "mailcow-omitted",
+            "IPAM": {
+                "Config": [
+                    {"Subnet": "172.22.2.0/24"},
+                    {"Subnet": "fd4d:6169:6c63:6f77::/64"}
+                ]
+            }
+        }))
+        .unwrap();
+        let ins = network_inspect(&engine, "mailcow-omitted").unwrap();
+        assert_eq!(ins["EnableIPv6"], json!(false));
+        assert_eq!(ins["IPAM"]["Config"], json!([{"Subnet": "172.22.2.0/24", "Gateway": "172.22.2.1"}]));
+
+        // 2. EnableIPv6: false + ONLY an IPv6 subnet: auto-allocates IPv4 subnet.
+        post(json!({
+            "Name": "v6-only-cfg",
+            "EnableIPv6": false,
+            "IPAM": {"Config": [{"Subnet": "fd4d:6169:6c63:6f77::/64"}]}
+        }))
+        .unwrap();
+        let ins = network_inspect(&engine, "v6-only-cfg").unwrap();
+        assert_eq!(ins["EnableIPv4"], json!(true));
+        assert_eq!(ins["EnableIPv6"], json!(false));
+        let cfg = ins["IPAM"]["Config"].as_array().unwrap();
+        assert_eq!(cfg.len(), 1);
+        let sub = cfg[0]["Subnet"].as_str().unwrap();
+        assert!(sub.contains('.') && !sub.contains(':'), "expected auto IPv4 subnet, got {sub}");
+
+        // 3. Malformed subnet strings with EnableIPv6: false are still 400 BadRequest.
+        for bad in [
+            json!([{"Subnet": "fd4d::not-a-cidr"}]),
+            json!([{"Subnet": "172.22.3.0/24"}, {"Subnet": "fd4d::not-a-cidr"}]),
+            json!([{"Subnet": "not-an-ip/64"}]),
+            json!([{"Subnet": "172.22.3.0/24"}, {"Subnet": "not-an-ip/64"}]),
+        ] {
+            let res = post(json!({"Name": "bad-cidr", "EnableIPv6": false, "IPAM": {"Config": bad}}));
+            assert!(matches!(res, Err(Error::BadRequest(ref m)) if m.contains("invalid CIDR block notation")), "{bad} -> {res:?}");
+        }
+
+        // 4. EnableIPv6: true + valid IPv6 subnet still works identically.
+        post(json!({
+            "Name": "mailcow-on",
+            "EnableIPv6": true,
+            "IPAM": {
+                "Config": [
+                    {"Subnet": "172.22.4.0/24"},
+                    {"Subnet": "fd4d:6169:6c63:6f77::/64"}
+                ]
+            }
+        }))
+        .unwrap();
+        let ins = network_inspect(&engine, "mailcow-on").unwrap();
+        assert_eq!(ins["EnableIPv6"], json!(true));
+        assert_eq!(
+            ins["IPAM"]["Config"],
+            json!([
+                {"Subnet": "172.22.4.0/24", "Gateway": "172.22.4.1"},
+                {"Subnet": "fd4d:6169:6c63:6f77::/64", "Gateway": "fd4d:6169:6c63:6f77::1"}
+            ])
+        );
+
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
 
 #[cfg(test)]

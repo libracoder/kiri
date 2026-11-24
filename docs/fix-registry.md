@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #454 Networks: ignore IPv6 IPAM subnets when IPv6 is disabled, as Docker does (unreleased)
+- Fixes: #433 `POST /networks/create` with `EnableIPv6: false` (or omitted) and an IPv6 subnet in `IPAM.Config` was refused instead of ignoring the IPv6 subnet as Docker does (`mailcow-dockerized`)
+- Caused: none known
+- Caused by: -
+- Check: `network-ipv6-subnet-ignored-when-disabled`
+
 ### #355 Settings → Storage: move Kiri's data folder to another drive (unreleased)
 - Fixes: #355 Custom storage directory (Settings → Storage location)
 - Caused: none known

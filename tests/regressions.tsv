@@ -280,3 +280,4 @@ socket-container-uid-group	#127	a standalone root-run Linux daemon put its 0600 
 tests/disk-grow.py	#384	the macOS VM data disk stayed fixed at 64 GiB instead of growing via KIRI_DISK_GB / vm.json and online ext4 resize
 tests/ui/resources-disk.js	#384	Settings -> Resources had no Disk image size control for macOS VM disk growth without shrinking
 tests/ui/storage-location.js	#355	Settings → Storage had no way to move images, containers, volumes and the VM disk to another folder or external drive, or recover when an external drive is unplugged
+network-ipv6-subnet-ignored-when-disabled	#433	POST /networks/create with EnableIPv6 false (or omitted) and an IPv6 subnet in IPAM.Config was refused instead of ignoring the IPv6 subnet as Docker does (mailcow-dockerized)

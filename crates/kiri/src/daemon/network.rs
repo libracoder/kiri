@@ -527,10 +527,11 @@ pub fn parse_ipam_both(v: &serde_json::Value) -> Result<(Option<Ipam>, Option<Ip
         let field = |k: &str| c[k].as_str().unwrap_or("").to_owned();
         let subnet = field("Subnet");
         if subnet.contains(':') {
+            let parsed = parse_ipam6(c, &subnet)?;
             if out6.is_some() {
                 return Err("Kiri supports one IPv6 subnet per network".into());
             }
-            out6 = Some(parse_ipam6(c, &subnet)?);
+            out6 = Some(parsed);
             continue;
         }
         if subnet.is_empty() {
@@ -539,10 +540,10 @@ pub fn parse_ipam_both(v: &serde_json::Value) -> Result<(Option<Ipam>, Option<Ip
             }
             return Err("invalid network config: an IP range or gateway needs a subnet".into());
         }
+        let (net, prefix) = parse_cidr(&subnet, "subnet")?;
         if out.is_some() {
             return Err("Kiri supports one IPv4 subnet per network".into());
         }
-        let (net, prefix) = parse_cidr(&subnet, "subnet")?;
         if prefix > 30 || prefix < 8 {
             return Err(format!("invalid subnet {subnet}: Kiri supports prefixes from /8 to /30"));
         }
@@ -748,9 +749,7 @@ impl Networks {
                 used: BTreeSet::new(),
             })
         } else {
-            if s.ipam6.is_some() {
-                return Err("invalid network config: an IPv6 subnet needs IPv6 enabled (--ipv6, Compose enable_ipv6: true)".into());
-            }
+            // An IPv6 IPAM entry without --ipv6 is ignored, as Docker does (#433).
             None
         };
         let index = (1..).find(|i| !self.list.iter().any(|n| n.bridge == format!("kiri{i}"))).expect("unbounded");
@@ -1284,9 +1283,9 @@ mod tests {
         assert_eq!(kv.subnet_str(), "fc00:f853:ccd:e793::/64");
         assert_eq!(ip6_str(kv.gateway), "fc00:f853:ccd:e793::1");
         assert!(n.create("again", v6(ipam("fc00:f853:ccd:e793::/80"))).unwrap_err().contains("Pool overlaps"));
-        // A subnet without --ipv6 is refused, not dropped.
-        let no = Settings { ipam6: ipam("fd00:9::/64"), ..Default::default() };
-        assert!(n.create("no", no).unwrap_err().contains("IPv6 enabled"));
+        // A subnet without --ipv6 is ignored, not refused (#433).
+        let no = n.create("no", Settings { ipam6: ipam("fd00:9::/64"), ..Default::default() }).unwrap();
+        assert!(no.v6.is_none());
         // Fixed addresses: in the subnet, free, not the gateway.
         let want = parse_ip6("fc00:f853:ccd:e793::10");
         assert_eq!(n.allocate6("kind", want, &[]), Ok(want));
@@ -1308,6 +1307,64 @@ mod tests {
         let got: Vec<String> = (0..4).filter_map(|_| n.allocate6("ranged", None, &[]).unwrap()).map(ip6_str).collect();
         assert_eq!(got, ["fd00:7::40", "fd00:7::41", "fd00:7::42", "fd00:7::43"]);
         assert!(n.allocate6("ranged", None, &[]).unwrap_err().contains("no free IPv6 address"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn ipv6_ipam_subnet_is_ignored_when_ipv6_disabled() {
+        let (mut n, dir) = nets();
+        // 1. mailcow-dockerized shape: EnableIPv6=false with IPv4 + IPv6 subnets.
+        let (ipam, ipam6) = parse_ipam_both(&serde_json::json!({
+            "Driver": "default",
+            "Config": [
+                {"Subnet": "172.22.1.0/24"},
+                {"Subnet": "fd4d:6169:6c63:6f77::/64"},
+            ]
+        }))
+        .unwrap();
+        let mailcow = n.create("mailcow", Settings { ipam, ipam6, ipv6: false, ..Default::default() }).unwrap();
+        assert_eq!(mailcow.subnet_str(), "172.22.1.0/24");
+        assert_eq!(ip_str(mailcow.gateway), "172.22.1.1");
+        assert!(mailcow.user_subnet);
+        assert!(mailcow.v6.is_none());
+
+        // 2. EnableIPv6=false with ONLY an IPv6 subnet: auto-allocates IPv4 from pool.
+        let (ipam, ipam6) = parse_ipam_both(&serde_json::json!({
+            "Config": [{"Subnet": "fd4d:6169:6c63:6f77::/64"}]
+        }))
+        .unwrap();
+        assert!(ipam.is_none() && ipam6.is_some());
+        let auto = n.create("v6only-config-off", Settings { ipam, ipam6, ipv6: false, ..Default::default() }).unwrap();
+        assert!(auto.v6.is_none());
+        assert!(!auto.user_subnet);
+        assert_ne!(auto.subnet, [0; 4]);
+        assert!(auto.contains(auto.gateway));
+        assert!(!overlaps((auto.subnet, auto.prefix), (mailcow.subnet, mailcow.prefix)));
+
+        // 3. Malformed IPv6/non-IP subnet strings are still rejected as invalid CIDRs.
+        for cfg in [
+            serde_json::json!({"Config": [{"Subnet": "fd4d::not-a-cidr"}]}),
+            serde_json::json!({"Config": [{"Subnet": "172.22.1.0/24"}, {"Subnet": "fd4d::not-a-cidr"}]}),
+            serde_json::json!({"Config": [{"Subnet": "not-an-ip/64"}]}),
+            serde_json::json!({"Config": [{"Subnet": "172.22.1.0/24"}, {"Subnet": "not-an-ip/64"}]}),
+        ] {
+            let err = parse_ipam_both(&cfg).unwrap_err();
+            assert!(err.contains("invalid CIDR block notation"), "{cfg} -> {err}");
+        }
+
+        // 4. EnableIPv6=true with the same IPv6 subnet still works (was not claimed above).
+        let (ipam, ipam6) = parse_ipam_both(&serde_json::json!({
+            "Config": [
+                {"Subnet": "172.22.2.0/24"},
+                {"Subnet": "fd4d:6169:6c63:6f77::/64"},
+            ]
+        }))
+        .unwrap();
+        let enabled = n.create("mailcow-v6", Settings { ipam, ipam6, ipv6: true, ..Default::default() }).unwrap();
+        assert_eq!(enabled.subnet_str(), "172.22.2.0/24");
+        let kv = enabled.v6.unwrap();
+        assert_eq!(kv.subnet_str(), "fd4d:6169:6c63:6f77::/64");
+        assert_eq!(ip6_str(kv.gateway), "fd4d:6169:6c63:6f77::1");
         let _ = std::fs::remove_dir_all(dir);
     }
 
