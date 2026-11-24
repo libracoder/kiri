@@ -33,6 +33,11 @@ impl Reference {
         if input.is_empty() || input.chars().any(char::is_whitespace) {
             return Err(bad());
         }
+        let valid_tag = |t: &str| {
+            t.as_bytes().first().is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+                && t.len() <= 128
+                && t.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+        };
         let (name, reference) = if let Some((name, digest)) = input.split_once('@') {
             if crate::store::digest_hex(digest).is_err() {
                 return Err(bad());
@@ -41,8 +46,7 @@ impl Reference {
             // in Docker, but it must still be a valid one.
             let name = match name.rfind(':') {
                 Some(i) if !name[i..].contains('/') => {
-                    let tag = &name[i + 1..];
-                    if tag.is_empty() || !tag.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b)) {
+                    if !valid_tag(&name[i + 1..]) {
                         return Err(bad());
                     }
                     &name[..i]
@@ -52,13 +56,17 @@ impl Reference {
             (name, digest.to_owned())
         } else {
             // A colon after the last slash is a tag; one before it is a port.
-            match input.rfind(':') {
-                Some(i) if !input[i..].contains('/') => (&input[..i], input[i + 1..].to_owned()),
-                _ => (input, "latest".to_owned()),
+            let (name, tag) = match input.rfind(':') {
+                Some(i) if !input[i..].contains('/') => (&input[..i], &input[i + 1..]),
+                _ => (input, "latest"),
+            };
+            if !valid_tag(tag) {
+                return Err(bad());
             }
+            (name, tag.to_owned())
         };
         // Repository names are lowercase; tags may use any case.
-        if name.is_empty() || reference.is_empty() || name.chars().any(|c| c.is_ascii_uppercase()) {
+        if name.is_empty() || name.chars().any(|c| c.is_ascii_uppercase()) {
             return Err(bad());
         }
         // The first component is a registry only if it looks like a host.
@@ -73,7 +81,18 @@ impl Reference {
         } else {
             repository
         };
-        if repository.split('/').any(str::is_empty) {
+        // A reference names a registry on the network and a path in a store, and
+        // is written into buildkitd.toml, log lines and other programs' arguments.
+        // Only a real host[:port], clean repository path segments and a valid tag
+        // or digest are accepted: a quote or a backslash in a name a `docker load`
+        // archive supplies would close a string wherever it is written.
+        let alnum = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit();
+        let valid_seg = |s: &str| {
+            s.as_bytes().first().is_some_and(|&b| alnum(b))
+                && s.as_bytes().last().is_some_and(|&b| alnum(b))
+                && s.bytes().all(|b| alnum(b) || b".-_".contains(&b))
+        };
+        if crate::config::canonical(&registry).is_none() || repository.is_empty() || !repository.split('/').all(valid_seg) {
             return Err(bad());
         }
         Ok(Reference { registry, repository, reference })
@@ -151,8 +170,13 @@ mod tests {
         assert_eq!(r("bitnami/redis:7"), s("docker.io", "bitnami/redis", "7"));
         assert_eq!(r("ghcr.io/o/r:v1"), s("ghcr.io", "o/r", "v1"));
         assert_eq!(r("localhost:5000/app"), s("localhost:5000", "app", "latest"));
+        assert_eq!(r("[::1]:5000/app:1"), s("[::1]:5000", "app", "1"));
+        assert_eq!(r("[::1]:5000/app"), s("[::1]:5000", "app", "latest"));
+        assert_eq!(r("localhost:5000/my_app-1.2/sub.repo:v1.0_build-2"), s("localhost:5000", "my_app-1.2/sub.repo", "v1.0_build-2"));
+        assert_eq!(r("localhost:5000/a__b--c.d:_tag-1.0"), s("localhost:5000", "a__b--c.d", "_tag-1.0"));
         let d = format!("sha256:{}", "a".repeat(64));
         assert_eq!(r(&format!("alpine@{d}")), s("docker.io", "library/alpine", &d));
+        assert_eq!(r(&format!("[::1]:5000/my_app-1.2/sub.repo:v1.0_build-2@{d}")), s("[::1]:5000", "my_app-1.2/sub.repo", &d));
     }
 
     #[test]
@@ -183,7 +207,36 @@ mod tests {
     fn rejects_garbage() {
         let non_hex = format!("alpine@sha256:{}", "g".repeat(64));
         let traversal = format!("alpine@sha256:{}", "../".repeat(21) + "ab");
-        for s in ["", "a b", "alpine:", "alpine@sha256:short", "/x", "Alpine", &non_hex, &traversal] {
+        for s in [
+            "",
+            "a b",
+            "alpine:",
+            "alpine:1:2",
+            "ghcr.io/o/r:1:2",
+            "alpine@sha256:short",
+            "/x",
+            "Alpine",
+            "evil\".com/x:1",
+            "evil\\com/x:1",
+            "host/x:ta\"g",
+            "host/x?y:1",
+            "h#x/y:1",
+            "docker.io/a/../b:1",
+            "docker.io/./a:1",
+            "alpine:..",
+            "alpine:.x",
+            "alpine:-x",
+            "-bad/app:1",
+            "bad-/app:1",
+            "_bad/app:1",
+            "bad_/app:1",
+            "docker.io/.bad:1",
+            "docker.io/bad.:1",
+            "[not-ipv6]:5000/app:1",
+            "host:99999/app:1",
+            &non_hex,
+            &traversal,
+        ] {
             assert!(Reference::parse(s).is_err(), "{s}");
         }
     }

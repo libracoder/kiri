@@ -310,3 +310,5 @@ crates/kiri/src/main.rs	#743	kiri --help listed commands not compiled for the cu
 crates/kiri/src/update.rs	#840	kiri update --help and kiri update -h entered the updater and tried the release feed (or failed the dev-build check) instead of printing OS-appropriate usage offline
 vol-rm-force-in-use	#773	docker volume rm --force (and DELETE /volumes/{name}?force=1) removed a volume still used by a container instead of returning 409 Conflict and keeping its data
 vol-rm-force-missing	#773	DELETE /volumes/{name}?force=1 (and docker volume rm -f) returned 404 Not Found for a missing volume instead of 204 No Content as Docker does
+crates/kiri-image/src/reference.rs	#746	Reference::parse and archive::load accepted quotes, backslashes, queries and fragments in image names, storing unparseable or hostile RepoTags from docker load
+crates/kiri/src/daemon/mirror.rs	#746	registry and mirror names were written into buildkitd.toml without TOML string escaping, so a quote or backslash broke buildkitd startup on every build

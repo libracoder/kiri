@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #746 Images: validate image reference characters and TOML-escape `buildkitd.toml` registry tables (unreleased)
+- Fixes: #746 A loaded image whose name has a quote in it breaks buildkitd.toml, and every build after it
+- Caused: none known
+- Caused by: -
+- Check: `crates/kiri-image/src/reference.rs`, `crates/kiri/src/daemon/mirror.rs`
+
 ### #773 Volumes: `docker volume rm --force` refuses volumes in use and succeeds when missing, as Docker does (unreleased)
 - Fixes: #773 `docker volume rm --force` removes a volume that a container still uses
 - Caused: none known

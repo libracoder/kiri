@@ -51,44 +51,49 @@ pub fn load(store: &Store, archive: impl Read) -> io::Result<Vec<Image>> {
         }
         files.insert(path, (digest, size));
     }
-    let manifest = manifest.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "not an image archive: no manifest.json"))?;
-    let entries: Vec<Value> = serde_json::from_slice(&manifest).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("manifest.json: {e}")))?;
-    let lookup = |p: &str| files.get(p.trim_start_matches("./")).cloned().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("archive is missing {p}")));
-    let mut loaded = Vec::new();
-    for m in &entries {
-        let (config_digest, _) = lookup(m["Config"].as_str().unwrap_or_default())?;
-        let config: Value = serde_json::from_slice(&store.read_config(&config_digest)?)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("image config: {e}")))?;
-        let mut layers = Vec::new();
-        for l in m["Layers"].as_array().into_iter().flatten() {
-            let (digest, size) = lookup(l.as_str().unwrap_or_default())?;
-            let media_type = media_type_of(&store.blob_path(&digest)?)?;
-            layers.push(Layer { digest, size, media_type: media_type.to_owned() });
+    let read = (|| -> io::Result<Vec<Image>> {
+        let manifest = manifest.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "not an image archive: no manifest.json"))?;
+        let entries: Vec<Value> = serde_json::from_slice(&manifest).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("manifest.json: {e}")))?;
+        let lookup = |p: &str| files.get(p.trim_start_matches("./")).cloned().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("archive is missing {p}")));
+        let mut loaded = Vec::new();
+        for m in &entries {
+            let (config_digest, _) = lookup(m["Config"].as_str().unwrap_or_default())?;
+            let config: Value = serde_json::from_slice(&store.read_config(&config_digest)?)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("image config: {e}")))?;
+            let mut layers = Vec::new();
+            for l in m["Layers"].as_array().into_iter().flatten() {
+                let (digest, size) = lookup(l.as_str().unwrap_or_default())?;
+                let media_type = media_type_of(&store.blob_path(&digest)?)?;
+                layers.push(Layer { digest, size, media_type: media_type.to_owned() });
+            }
+            let mut names = Vec::new();
+            for t in m["RepoTags"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+                let r = Reference::parse(t).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                if t.contains('@') || r.is_digest() {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, format!("invalid repo tag: {t}")));
+                }
+                names.push(r.short());
+            }
+            // An untagged image is known by its id.
+            let names = if names.is_empty() { vec![config_digest.clone()] } else { names };
+            for name in names {
+                loaded.push(from_config(name, &config_digest, &config, layers.clone()));
+            }
         }
-        let names: Vec<String> = m["RepoTags"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .map(|t| Reference::parse(t).map(|r| r.short()).unwrap_or_else(|_| t.to_owned()))
-            .collect();
-        // An untagged image is known by its id.
-        let names = if names.is_empty() { vec![config_digest.clone()] } else { names };
-        for name in names {
-            let image = from_config(name, &config_digest, &config, layers.clone());
+        for image in &loaded {
             store.put_image(image.clone())?;
-            loaded.push(image);
         }
-    }
-    // Files no image uses (OCI index blobs and the like) do not stay.
-    let used = |d: &str| loaded.iter().any(|i| i.config_digest == d || i.layers.iter().any(|l| l.digest == d));
+        Ok(loaded)
+    })();
+    // Files no image uses (OCI index blobs, or all of a refused archive) do not stay.
+    let used = |d: &str| read.as_ref().is_ok_and(|loaded| loaded.iter().any(|i| i.config_digest == d || i.layers.iter().any(|l| l.digest == d)));
     // The images are recorded: what they name is safe, and what nothing
     // names goes unless another image or writer has it now.
     drop(pins);
     for d in ingested.iter().filter(|d| !used(d)) {
         store.remove_if_unused(d)?;
     }
-    Ok(loaded)
+    read
 }
 
 /// Holds every blob `images` name ([`Store::pin`]) and checks each is
@@ -394,5 +399,32 @@ mod tests {
         assert_eq!(tagged("alpine"), "alpine:latest");
         assert_eq!(tagged("localhost:5000/app"), "localhost:5000/app:latest");
         assert_eq!(tagged("app:1"), "app:1");
+    }
+
+    #[test]
+    fn rejects_invalid_repo_tags_and_cleans_up_blobs() {
+        let dir = scratch();
+        let store = Store::open(&dir).unwrap();
+        let add = |b: &mut tar::Builder<Vec<u8>>, name: &str, data: &[u8]| {
+            let mut h = tar::Header::new_ustar();
+            h.set_size(data.len() as u64);
+            h.set_mode(0o644);
+            h.set_entry_type(tar::EntryType::Regular);
+            b.append_data(&mut h, name, data).unwrap();
+        };
+        let config = br#"{"architecture":"amd64","os":"linux","config":{},"rootfs":{"type":"layers","diff_ids":[]}}"#;
+        let digest_tag = format!("alpine@sha256:{}", "a".repeat(64));
+        for bad_tag in ["evil\".com/x:1", digest_tag.as_str()] {
+            let manifest = json!([{"Config": "cfg.json", "RepoTags": [bad_tag], "Layers": []}]);
+            let mut b = tar::Builder::new(Vec::new());
+            add(&mut b, "cfg.json", config);
+            add(&mut b, "manifest.json", &serde_json::to_vec(&manifest).unwrap());
+            let bytes = b.into_inner().unwrap();
+
+            assert!(load(&store, bytes.as_slice()).is_err(), "{bad_tag}");
+            assert!(store.images().unwrap().is_empty(), "{bad_tag}");
+            assert_eq!(std::fs::read_dir(dir.join("blobs/sha256")).unwrap().count(), 0, "{bad_tag}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

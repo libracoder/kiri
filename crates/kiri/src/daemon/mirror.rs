@@ -233,6 +233,47 @@ pub fn unverified(c: &kiri_image::RegistryConfig, names: &[String]) -> Vec<Strin
     out
 }
 
+/// A TOML basic string. A name or a mirror goes into buildkitd.toml, and one
+/// with a quote, a backslash or a control character in it would close or
+/// break the string: buildkitd would refuse the whole file, so every build
+/// would fail, and the image that carried the name is recorded, so it would
+/// keep failing.
+fn quoted(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => out.push_str(&format!("\\u{:04X}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn format_tables(tables: &[(String, Table)]) -> String {
+    let mut out = String::new();
+    for (registry, t) in tables {
+        out.push_str(&format!("[registry.{}]\n", quoted(registry)));
+        if !t.mirrors.is_empty() {
+            let list = t.mirrors.iter().map(|m| quoted(m)).collect::<Vec<_>>().join(", ");
+            out.push_str(&format!("  mirrors = [{list}]\n"));
+        }
+        if let Some(http) = t.http {
+            out.push_str(&format!("  http = {http}\n"));
+        }
+        if t.insecure {
+            out.push_str("  insecure = true\n");
+        }
+    }
+    out
+}
+
 /// buildkitd.toml's registry tables, for `c` (daemon.json's settings) and
 /// `names` ([`registry_names`]), with `host_net` selecting `127.0.0.1` on
 /// Linux when the builder runs in the host network namespace (`--driver-opt
@@ -250,21 +291,7 @@ pub fn config_for(engine: &Engine, c: &kiri_image::RegistryConfig, names: &[Stri
         table(&mut tables, &host).http = Some(true);
     }
     registries(&mut tables, c, names);
-    let mut out = String::new();
-    for (registry, t) in tables {
-        out.push_str(&format!("[registry.\"{registry}\"]\n"));
-        if !t.mirrors.is_empty() {
-            let list = t.mirrors.iter().map(|m| format!("\"{m}\"")).collect::<Vec<_>>().join(", ");
-            out.push_str(&format!("  mirrors = [{list}]\n"));
-        }
-        if let Some(http) = t.http {
-            out.push_str(&format!("  http = {http}\n"));
-        }
-        if t.insecure {
-            out.push_str("  insecure = true\n");
-        }
-    }
-    out
+    format_tables(&tables)
 }
 
 /// daemon.json's part of buildkitd.toml, so a build reaches each registry
@@ -754,5 +781,29 @@ mod tests {
         assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "0123456789abcdef0123456789abcdef");
         let _ = std::fs::remove_file(&p);
+    }
+
+    /// A registry name from an image reaches buildkitd.toml. A quote, a
+    /// backslash or a newline in it must not close the string or inject a
+    /// table: buildkitd refuses the whole file, and every build fails until
+    /// the image is removed (#746).
+    #[test]
+    fn names_are_quoted_for_toml() {
+        assert_eq!(super::quoted("registry.corp"), "\"registry.corp\"");
+        assert_eq!(super::quoted("evil\".com"), "\"evil\\\".com\"");
+        assert_eq!(super::quoted("a\\b"), "\"a\\\\b\"");
+        assert_eq!(super::quoted("a\nb\rc\td"), "\"a\\nb\\rc\\td\"");
+        assert_eq!(super::quoted("a\u{7}b\u{7f}c"), "\"a\\u0007b\\u007Fc\"");
+        let mut tables = Vec::new();
+        add_mirror(&mut tables, "evil\"].com\n[worker.oci]", "127.0.0.1:47391/tok/evil\"].com\n[worker.oci]".into());
+        let toml = super::format_tables(&tables);
+        assert_eq!(
+            toml,
+            "[registry.\"evil\\\"].com\\n[worker.oci]\"]\n  mirrors = [\"127.0.0.1:47391/tok/evil\\\"].com\\n[worker.oci]\"]\n"
+        );
+        // A name that could have carried one is not a reference any more.
+        for bad in ["evil\".com/x:1", "evil\\com/x:1", "host/x:ta\"g", "host/x?y:1", "h#x/y:1"] {
+            assert!(kiri_image::Reference::parse(bad).is_err(), "{bad:?}");
+        }
     }
 }
