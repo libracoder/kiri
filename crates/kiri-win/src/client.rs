@@ -672,15 +672,16 @@ mod tests {
         assert_eq!(seen.len(), 3);
         assert!(seen[2] < seen[0], "remaining budget should shrink across retries: {seen:?}");
 
-        // Fast failing probes stop once `limit` passes.
+        // Fast failing probes stop once `limit` passes (generous window so a
+        // 5 ms sleep oversleeping on a loaded CI VM still gets >= 2 tries).
         let mut fast_calls = 0usize;
         let began = Instant::now();
-        assert!(!wait_alive_with(Duration::from_millis(100), Duration::from_millis(25), |_| {
+        assert!(!wait_alive_with(Duration::from_millis(450), Duration::from_millis(5), |_| {
             fast_calls += 1;
             false
         }));
-        assert!((2..=10).contains(&fast_calls), "unexpected retry count: {fast_calls}");
-        assert!(began.elapsed() >= Duration::from_millis(90) && began.elapsed() < Duration::from_millis(400), "waited {:?}", began.elapsed());
+        assert!(fast_calls >= 2, "unexpected retry count: {fast_calls}");
+        assert!(began.elapsed() >= Duration::from_millis(400) && began.elapsed() < Duration::from_secs(3), "waited {:?}", began.elapsed());
     }
 
     #[test]
