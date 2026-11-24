@@ -186,6 +186,7 @@ mirror-docker-info	#118	docker info listed no Registry Mirrors
 mirror-build	#118	docker build FROM a Docker Hub image did not use the configured mirror
 insecure-cli-remove	#329	kiri registry insecure remove must take a host off the list
 mirror-cli-add	#118	there was no way to add a Docker Hub mirror from the terminal into daemon.json
+update-help-offline	#840	kiri update --help entered the updater and tried the release feed instead of printing usage offline
 hub-downgrade-refused	#329	Docker Hub must stay on verified HTTPS when its name resolves into a listed network, with a plain-HTTP registry on port 80 there
 socket-mount-settings-refused	#329	a container given the engine's socket could change Kiri's registry settings
 access-directory-accounts	#349	directory accounts and NSS groups outside /etc/passwd and /etc/group could not use a Linux host engine socket

@@ -1795,6 +1795,11 @@ t pause-exec-refused "is paused" $D exec lim true
 t pause-filter "lim" $D ps --filter status=paused --format '{{.Names}}'
 t unpause "running" bash -c "$D unpause lim >/dev/null && $D inspect -f '{{.State.Status}}' lim"
 t unpause-works "Welcome" $D exec lim wget -qO- http://127.0.0.1
+if [ -x "$KIRI" ]; then
+  t update-help-offline $'usage: kiri update [--check]\nexit=0' bash -c 'out=$(KIRI_UPDATE_URL=not-a-url "$1" update --help); printf "%s\nexit=%s\n" "$out" "$?"' _ "$KIRI"
+else
+  skip_setup update-help-offline "no kiri CLI found: set KIRI=/path/to/kiri"
+fi
 t update-memory "268435456" bash -c "$D update --memory 256m lim >/dev/null && $D exec lim cat /sys/fs/cgroup/memory.max"
 t update-cpus "200000 100000" bash -c "$D update --cpus 2 lim >/dev/null && $D exec lim cat /sys/fs/cgroup/cpu.max"
 t update-kept "268435456" bash -c "$D restart -t 1 lim >/dev/null && $D exec lim cat /sys/fs/cgroup/memory.max"

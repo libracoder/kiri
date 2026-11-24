@@ -417,11 +417,28 @@ fn has_cpu(head: &[u8], want: u32) -> bool {
 }
 
 pub fn run(args: &[String]) -> io::Result<()> {
-    if crate::flavor::dev() {
-        return Err(io::Error::other(format!("{} doesn't update itself: rebuild it with `cargo xtask app-dev`", crate::flavor::APP)));
+    run_with_lookup(args, env!("CARGO_PKG_VERSION"), &mut io::stdout(), || {
+        if crate::flavor::dev() {
+            return Err(io::Error::other(format!(
+                "{} doesn't update itself: rebuild it with `cargo xtask app-dev`",
+                crate::flavor::APP
+            )));
+        }
+        latest()
+    })
+}
+
+fn run_with_lookup(
+    args: &[String],
+    current: &str,
+    out: &mut dyn Write,
+    lookup: impl FnOnce() -> io::Result<Release>,
+) -> io::Result<()> {
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        return writeln!(out, "usage: kiri update [--check]");
     }
-    let release = latest()?;
-    run_release(args, &release, env!("CARGO_PKG_VERSION"), &mut io::stdout())
+    let release = lookup()?;
+    run_release(args, &release, current, out)
 }
 
 fn run_release(args: &[String], release: &Release, current: &str, out: &mut dyn Write) -> io::Result<()> {
@@ -466,11 +483,10 @@ mod tests {
     use std::io::{self, Read, Write};
     use std::net::TcpListener;
 
-    use super::{Release, bundle_version, has_cpu, latest_from, newer, run_release, runs_here};
+    use super::{Release, bundle_version, has_cpu, latest_from, newer, run_with_lookup, runs_here};
 
     fn run_with(args: &[String], url: &str, current: &str, out: &mut dyn Write) -> io::Result<()> {
-        let release = latest_from(url)?;
-        run_release(args, &release, current, out)
+        run_with_lookup(args, current, out, || latest_from(url))
     }
 
     fn serve_feed(status: &'static str, body: &'static str) -> String {
@@ -486,6 +502,32 @@ mod tests {
             }
         });
         format!("http://{addr}/latest.json")
+    }
+
+    #[test]
+    fn help_skips_release_lookup() {
+        for (args, help) in [
+            (&["--help"][..], true),
+            (&["-h"], true),
+            (&["--check", "--help"], true),
+            (&[], false),
+            (&["--check"], false),
+        ] {
+            let args = args.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>();
+            let mut out = Vec::new();
+            let mut looked_up = false;
+            let result = run_with_lookup(&args, "0.2.0", &mut out, || {
+                looked_up = true;
+                Err(io::Error::other("feed unavailable"))
+            });
+            assert_eq!(looked_up, !help, "release lookup for {args:?}");
+            if help {
+                result.unwrap();
+                assert_eq!(out, b"usage: kiri update [--check]\n");
+            } else {
+                assert_eq!(result.unwrap_err().to_string(), "feed unavailable");
+            }
+        }
     }
 
     #[test]
