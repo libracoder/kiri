@@ -1932,5 +1932,19 @@
   "Kiri's data is moving already": "Data Kiri se již přesouvají",
   "Kiri's data moved to {path}": "Data Kiri byla přesunuta do {path}",
   "Storage is available again": "Úložiště je opět dostupné",
-  "Old data removed": "Stará data odstraněna"
+  "Old data removed": "Stará data odstraněna",
+  "A proxy on this computer is reached as {host}.": "Proxy na tomto počítači je dostupná jako {host}.",
+  "VPNs need no setting: container traffic leaves through Linux.": "VPN není třeba nastavovat: provoz kontejnerů odchází přes Linux.",
+  "Shared with Linux: containers only use them while busy.": "Sdíleno se systémem Linux: kontejnery je používají, jen když pracují.",
+  "The most containers and the engine may take. Unused memory stays free on Linux.": "Nejvíc, kolik si kontejnery a engine mohou vzít. Nepoužitá paměť zůstává v Linuxu volná.",
+  "The engine is off; it starts with these next time.": "Engine je vypnutý; příště se spustí s těmito hodnotami.",
+  "Restart engine to apply": "Pro použití restartujte engine",
+  "Windows bind-mount file events": "Události souborů připojených složek Windows",
+  "Forward file changes on Windows drives (like {path}) into containers for live reload. Uses no CPU when idle.": "Předává změny souborů na discích Windows (jako {path}) do kontejnerů pro živé obnovování. V nečinnosti nezatěžuje CPU.",
+  "One text file, redacted, saved to your Desktop. Read it before you share it.": "Jeden textový soubor, s odstraněnými citlivými údaji, uložený na plochu. Než ho budete sdílet, přečtěte si ho.",
+  "The 5 newest crash reports for Kiri": "5 nejnovějších hlášení o pádech Kiri",
+  "Kiri and this PC": "Kiri a toto PC",
+  "Kiri and this computer": "Kiri a tento počítač",
+  "Versions, {os}, whether the engine runs, how many containers and images": "Verze, {os}, zda běží engine, kolik je kontejnerů a obrazů",
+  "Saved. The engine uses these from its next start": "Uloženo. Engine je použije od příštího spuštění"
 }

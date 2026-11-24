@@ -1932,5 +1932,19 @@
   "Kiri's data is moving already": "Данните на Kiri вече се местят",
   "Kiri's data moved to {path}": "Данните на Kiri са преместени в {path}",
   "Storage is available again": "Хранилището отново е достъпно",
-  "Old data removed": "Старите данни са премахнати"
+  "Old data removed": "Старите данни са премахнати",
+  "A proxy on this computer is reached as {host}.": "Прокси сървър на този компютър е достъпен като {host}.",
+  "VPNs need no setting: container traffic leaves through Linux.": "VPN не изисква настройка: трафикът на контейнерите излиза през Linux.",
+  "Shared with Linux: containers only use them while busy.": "Споделени с Linux: контейнерите ги използват само докато работят.",
+  "The most containers and the engine may take. Unused memory stays free on Linux.": "Максимумът, който контейнерите и двигателят могат да заемат. Неизползваната памет остава свободна в Linux.",
+  "The engine is off; it starts with these next time.": "Двигателят е изключен; следващия път ще стартира с тези настройки.",
+  "Restart engine to apply": "Рестартиране на двигателя за прилагане",
+  "Windows bind-mount file events": "Файлови събития при монтиране от Windows",
+  "Forward file changes on Windows drives (like {path}) into containers for live reload. Uses no CPU when idle.": "Препраща промени по файлове на дискове в Windows (като {path}) към контейнерите за презареждане на живо. Не използва процесор в покой.",
+  "One text file, redacted, saved to your Desktop. Read it before you share it.": "Един текстов файл с премахнати лични данни, запазен на работния плот. Прочетете го, преди да го споделите.",
+  "The 5 newest crash reports for Kiri": "Последните 5 отчета за сривове на Kiri",
+  "Kiri and this PC": "Kiri и този PC",
+  "Kiri and this computer": "Kiri и този компютър",
+  "Versions, {os}, whether the engine runs, how many containers and images": "Версии, {os}, дали двигателят работи, колко контейнера и образа има",
+  "Saved. The engine uses these from its next start": "Запазено. Двигателят ги използва от следващото си стартиране"
 }

@@ -1932,5 +1932,19 @@
   "Kiri's data is moving already": "Kiri duomenys jau perkeliami",
   "Kiri's data moved to {path}": "Kiri duomenys perkelti į {path}",
   "Storage is available again": "Saugykla vėl pasiekiama",
-  "Old data removed": "Seni duomenys pašalinti"
+  "Old data removed": "Seni duomenys pašalinti",
+  "A proxy on this computer is reached as {host}.": "Šio kompiuterio tarpinis serveris pasiekiamas kaip {host}.",
+  "VPNs need no setting: container traffic leaves through Linux.": "VPN nustatyti nereikia: konteinerių srautas išeina per Linux.",
+  "Shared with Linux: containers only use them while busy.": "Bendrinama su Linux: konteineriai juos naudoja tik tada, kai užimti.",
+  "The most containers and the engine may take. Unused memory stays free on Linux.": "Daugiausia, kiek konteineriai ir variklis gali užimti. Nepanaudota atmintis lieka laisva Linux sistemoje.",
+  "The engine is off; it starts with these next time.": "Variklis išjungtas; kitą kartą jis pasileis su šiais nustatymais.",
+  "Restart engine to apply": "Paleisti variklį iš naujo, kad būtų pritaikyta",
+  "Windows bind-mount file events": "Windows prijungtų aplankų failų įvykiai",
+  "Forward file changes on Windows drives (like {path}) into containers for live reload. Uses no CPU when idle.": "Perduoda failų pakeitimus Windows diskuose (pvz., {path}) į konteinerius tiesioginiam perkrovimui. Kai nenaudojama, procesoriaus neapkrauna.",
+  "One text file, redacted, saved to your Desktop. Read it before you share it.": "Vienas tekstinis failas su paslėptais duomenimis, įrašytas darbalaukyje. Perskaitykite jį prieš bendrindami.",
+  "The 5 newest crash reports for Kiri": "5 naujausios Kiri strigčių ataskaitos",
+  "Kiri and this PC": "Kiri ir šis PK",
+  "Kiri and this computer": "Kiri ir šis kompiuteris",
+  "Versions, {os}, whether the engine runs, how many containers and images": "Versijos, {os}, ar veikia variklis, kiek yra konteinerių ir atvaizdų",
+  "Saved. The engine uses these from its next start": "Įrašyta. Variklis juos naudos nuo kito paleidimo"
 }

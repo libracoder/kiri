@@ -1932,5 +1932,19 @@
   "Kiri's data is moving already": "Les dades del Kiri ja s'estan movent",
   "Kiri's data moved to {path}": "Les dades del Kiri s'han mogut a {path}",
   "Storage is available again": "L'emmagatzematge torna a estar disponible",
-  "Old data removed": "Dades antigues eliminades"
+  "Old data removed": "Dades antigues eliminades",
+  "A proxy on this computer is reached as {host}.": "S'accedeix a un proxy d'aquest ordinador com a {host}.",
+  "VPNs need no setting: container traffic leaves through Linux.": "Les VPN no necessiten cap configuració: el trànsit dels contenidors surt per Linux.",
+  "Shared with Linux: containers only use them while busy.": "Compartits amb Linux: els contenidors només els fan servir mentre treballen.",
+  "The most containers and the engine may take. Unused memory stays free on Linux.": "El màxim que poden ocupar els contenidors i el motor. La memòria no utilitzada queda lliure a Linux.",
+  "The engine is off; it starts with these next time.": "El motor està aturat; s'iniciarà amb aquests valors la propera vegada.",
+  "Restart engine to apply": "Reinicia el motor per aplicar-ho",
+  "Windows bind-mount file events": "Esdeveniments de fitxers en muntatges de Windows",
+  "Forward file changes on Windows drives (like {path}) into containers for live reload. Uses no CPU when idle.": "Reenvia els canvis de fitxers a les unitats de Windows (com {path}) cap als contenidors per a la recàrrega en viu. No consumeix CPU en repòs.",
+  "One text file, redacted, saved to your Desktop. Read it before you share it.": "Un fitxer de text, amb les dades sensibles ocultes, desat a l'escriptori. Llegeix-lo abans de compartir-lo.",
+  "The 5 newest crash reports for Kiri": "Els 5 informes d'error més recents de Kiri",
+  "Kiri and this PC": "Kiri i aquest PC",
+  "Kiri and this computer": "Kiri i aquest ordinador",
+  "Versions, {os}, whether the engine runs, how many containers and images": "Versions, {os}, si el motor s'executa, quants contenidors i imatges",
+  "Saved. The engine uses these from its next start": "Desat. El motor els fa servir a partir del proper inici"
 }

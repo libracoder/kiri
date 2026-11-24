@@ -1932,5 +1932,19 @@
   "Kiri's data is moving already": "Les données de Kiri sont déjà en cours de déplacement",
   "Kiri's data moved to {path}": "Les données de Kiri ont été déplacées vers {path}",
   "Storage is available again": "Le stockage est de nouveau disponible",
-  "Old data removed": "Anciennes données supprimées"
+  "Old data removed": "Anciennes données supprimées",
+  "A proxy on this computer is reached as {host}.": "Un proxy sur cet ordinateur est joignable via {host}.",
+  "VPNs need no setting: container traffic leaves through Linux.": "Les VPN ne demandent aucun réglage : le trafic des conteneurs sort par Linux.",
+  "Shared with Linux: containers only use them while busy.": "Partagés avec Linux : les conteneurs ne les utilisent que quand ils travaillent.",
+  "The most containers and the engine may take. Unused memory stays free on Linux.": "Le maximum que les conteneurs et le moteur peuvent prendre. La mémoire inutilisée reste libre sous Linux.",
+  "The engine is off; it starts with these next time.": "Le moteur est arrêté ; il démarrera avec ces réglages la prochaine fois.",
+  "Restart engine to apply": "Redémarrer le moteur pour appliquer",
+  "Windows bind-mount file events": "Événements de fichiers des montages Windows",
+  "Forward file changes on Windows drives (like {path}) into containers for live reload. Uses no CPU when idle.": "Transmet les modifications de fichiers sur les disques Windows (comme {path}) aux conteneurs pour le rechargement à chaud. N’utilise aucun CPU au repos.",
+  "One text file, redacted, saved to your Desktop. Read it before you share it.": "Un fichier texte expurgé, enregistré sur votre Bureau. Lisez-le avant de le partager.",
+  "The 5 newest crash reports for Kiri": "Les 5 rapports de plantage les plus récents pour Kiri",
+  "Kiri and this PC": "Kiri et ce PC",
+  "Kiri and this computer": "Kiri et cet ordinateur",
+  "Versions, {os}, whether the engine runs, how many containers and images": "Versions, {os}, état du moteur, nombre de conteneurs et d’images",
+  "Saved. The engine uses these from its next start": "Enregistré. Le moteur les utilise dès son prochain démarrage"
 }

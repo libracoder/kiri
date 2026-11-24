@@ -1932,5 +1932,19 @@
   "Kiri's data is moving already": "Kiri-এর ডেটা ইতিমধ্যে সরানো হচ্ছে",
   "Kiri's data moved to {path}": "Kiri-এর ডেটা {path}-এ সরানো হয়েছে",
   "Storage is available again": "স্টোরেজ আবার পাওয়া যাচ্ছে",
-  "Old data removed": "পুরনো ডেটা সরানো হয়েছে"
+  "Old data removed": "পুরনো ডেটা সরানো হয়েছে",
+  "A proxy on this computer is reached as {host}.": "এই কম্পিউটারের একটি প্রক্সিতে {host} দিয়ে পৌঁছানো যায়।",
+  "VPNs need no setting: container traffic leaves through Linux.": "VPN-এর জন্য কোনো সেটিং লাগে না: কন্টেইনারের ট্রাফিক Linux দিয়ে বের হয়।",
+  "Shared with Linux: containers only use them while busy.": "Linux-এর সঙ্গে ভাগাভাগি: কন্টেইনার ব্যস্ত থাকলেই শুধু এগুলো ব্যবহার করে।",
+  "The most containers and the engine may take. Unused memory stays free on Linux.": "কন্টেইনার ও ইঞ্জিন সর্বোচ্চ যতটা নিতে পারে। অব্যবহৃত মেমরি Linux-এ ফাঁকা থাকে।",
+  "The engine is off; it starts with these next time.": "ইঞ্জিন বন্ধ আছে; পরের বার এগুলো নিয়ে চালু হবে।",
+  "Restart engine to apply": "প্রয়োগ করতে ইঞ্জিন রিস্টার্ট করুন",
+  "Windows bind-mount file events": "Windows বাইন্ড-মাউন্ট ফাইল ইভেন্ট",
+  "Forward file changes on Windows drives (like {path}) into containers for live reload. Uses no CPU when idle.": "লাইভ রিলোডের জন্য Windows ড্রাইভের ({path}-এর মতো) ফাইল পরিবর্তন কন্টেইনারে পাঠায়। নিষ্ক্রিয় থাকলে কোনো CPU ব্যবহার করে না।",
+  "One text file, redacted, saved to your Desktop. Read it before you share it.": "একটি টেক্সট ফাইল, সংবেদনশীল তথ্য মুছে, আপনার Desktop-এ সেভ করা হয়। শেয়ার করার আগে পড়ে নিন।",
+  "The 5 newest crash reports for Kiri": "Kiri-র সবচেয়ে নতুন 5টি ক্র্যাশ রিপোর্ট",
+  "Kiri and this PC": "Kiri ও এই PC",
+  "Kiri and this computer": "Kiri ও এই কম্পিউটার",
+  "Versions, {os}, whether the engine runs, how many containers and images": "ভার্সন, {os}, ইঞ্জিন চলছে কি না, কতগুলো কন্টেইনার ও ইমেজ",
+  "Saved. The engine uses these from its next start": "সেভ হয়েছে। ইঞ্জিন পরের বার চালু হওয়া থেকে এগুলো ব্যবহার করবে"
 }

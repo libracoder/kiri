@@ -1932,5 +1932,19 @@
   "Kiri's data is moving already": "Dữ liệu Kiri đang được di chuyển",
   "Kiri's data moved to {path}": "Đã di chuyển dữ liệu Kiri đến {path}",
   "Storage is available again": "Lưu trữ đã khả dụng trở lại",
-  "Old data removed": "Đã xóa dữ liệu cũ"
+  "Old data removed": "Đã xóa dữ liệu cũ",
+  "A proxy on this computer is reached as {host}.": "Proxy trên máy tính này được truy cập qua {host}.",
+  "VPNs need no setting: container traffic leaves through Linux.": "VPN không cần thiết lập: lưu lượng container đi ra qua Linux.",
+  "Shared with Linux: containers only use them while busy.": "Dùng chung với Linux: container chỉ dùng chúng khi đang bận.",
+  "The most containers and the engine may take. Unused memory stays free on Linux.": "Mức tối đa container và engine được dùng. Bộ nhớ chưa dùng vẫn trống trên Linux.",
+  "The engine is off; it starts with these next time.": "Engine đang tắt; lần khởi động tới sẽ dùng các giá trị này.",
+  "Restart engine to apply": "Khởi động lại engine để áp dụng",
+  "Windows bind-mount file events": "Sự kiện tệp thư mục gắn kết Windows",
+  "Forward file changes on Windows drives (like {path}) into containers for live reload. Uses no CPU when idle.": "Chuyển tiếp thay đổi tệp trên ổ đĩa Windows (như {path}) vào container để tự nạp lại trực tiếp. Không tốn CPU khi nghỉ.",
+  "One text file, redacted, saved to your Desktop. Read it before you share it.": "Một tệp văn bản đã ẩn thông tin nhạy cảm, lưu vào Desktop. Hãy đọc trước khi chia sẻ.",
+  "The 5 newest crash reports for Kiri": "5 báo cáo sự cố mới nhất cho Kiri",
+  "Kiri and this PC": "Kiri và PC này",
+  "Kiri and this computer": "Kiri và máy tính này",
+  "Versions, {os}, whether the engine runs, how many containers and images": "Phiên bản, {os}, engine có chạy không, số container và image",
+  "Saved. The engine uses these from its next start": "Đã lưu. Engine dùng các giá trị này từ lần khởi động tới"
 }

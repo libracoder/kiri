@@ -1932,5 +1932,19 @@
   "Kiri's data is moving already": "داتاکانی Kiri ئێستا دەگوازرێنەوە",
   "Kiri's data moved to {path}": "داتاکانی Kiri گواسترانەوە بۆ {path}",
   "Storage is available again": "بیرگە دووبارە بەردەستە",
-  "Old data removed": "داتای کۆن سڕدرایەوە"
+  "Old data removed": "داتای کۆن سڕدرایەوە",
+  "A proxy on this computer is reached as {host}.": "پرۆکسییەک لەسەر ئەم کۆمپیوتەرە بە {host} دەگاتێ.",
+  "VPNs need no setting: container traffic leaves through Linux.": "VPN ەکان پێویستیان بە ڕێکخستن نییە: ترافیکی کۆنتەینەرەکان لە ڕێگەی Linux ەوە دەردەچێت.",
+  "Shared with Linux: containers only use them while busy.": "لەگەڵ Linux هاوبەشە: کۆنتەینەرەکان تەنها کاتێک بەکاریان دەهێنن کە سەرقاڵن.",
+  "The most containers and the engine may take. Unused memory stays free on Linux.": "زۆرترین بڕ کە کۆنتەینەرەکان و بزوێنەر دەتوانن وەریبگرن. بیرگەی بەکارنەهاتوو لەسەر Linux بەتاڵ دەمێنێتەوە.",
+  "The engine is off; it starts with these next time.": "بزوێنەر کوژاوەتەوە؛ جاری داهاتوو بەمانە دەست پێدەکات.",
+  "Restart engine to apply": "بزوێنەر دەستپێبکەرەوە بۆ جێبەجێکردن",
+  "Windows bind-mount file events": "ڕووداوەکانی فایلی بەستنەوەی Windows",
+  "Forward file changes on Windows drives (like {path}) into containers for live reload. Uses no CPU when idle.": "گۆڕانکارییەکانی فایل لەسەر درایڤەکانی Windows (وەک {path}) دەنێرێت بۆ کۆنتەینەرەکان بۆ نوێبوونەوەی ڕاستەوخۆ. لە کاتی بێکاریدا هیچ CPU بەکارناهێنێت.",
+  "One text file, redacted, saved to your Desktop. Read it before you share it.": "یەک فایلی دەق، زانیارییە هەستیارەکانی شاراوەتەوە، لەسەر ڕووی مێز پاشەکەوت دەکرێت. پێش هاوبەشکردن بیخوێنەوە.",
+  "The 5 newest crash reports for Kiri": "5 نوێترین ڕاپۆرتی تێکشکان بۆ Kiri",
+  "Kiri and this PC": "Kiri و ئەم کۆمپیوتەرە",
+  "Kiri and this computer": "Kiri و ئەم کۆمپیوتەرە",
+  "Versions, {os}, whether the engine runs, how many containers and images": "وەشانەکان، {os}، ئایا بزوێنەر کاردەکات، چەند کۆنتەینەر و ئیمەیج",
+  "Saved. The engine uses these from its next start": "پاشەکەوت کرا. بزوێنەر لە دەستپێکردنی داهاتوویەوە بەکاریان دەهێنێت"
 }

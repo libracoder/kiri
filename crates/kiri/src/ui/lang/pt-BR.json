@@ -1932,5 +1932,19 @@
   "Kiri's data is moving already": "Os dados do Kiri já estão sendo movidos",
   "Kiri's data moved to {path}": "Dados do Kiri movidos para {path}",
   "Storage is available again": "Armazenamento disponível novamente",
-  "Old data removed": "Dados antigos removidos"
+  "Old data removed": "Dados antigos removidos",
+  "A proxy on this computer is reached as {host}.": "Um proxy neste computador é acessado como {host}.",
+  "VPNs need no setting: container traffic leaves through Linux.": "VPNs não precisam de configuração: o tráfego dos contêineres sai pelo Linux.",
+  "Shared with Linux: containers only use them while busy.": "Compartilhados com o Linux: os contêineres só os usam enquanto estão ocupados.",
+  "The most containers and the engine may take. Unused memory stays free on Linux.": "O máximo que os contêineres e a engine podem usar. A memória não usada fica livre no Linux.",
+  "The engine is off; it starts with these next time.": "A engine está desligada; ela inicia com isso na próxima vez.",
+  "Restart engine to apply": "Reiniciar a engine para aplicar",
+  "Windows bind-mount file events": "Eventos de arquivos em montagens do Windows",
+  "Forward file changes on Windows drives (like {path}) into containers for live reload. Uses no CPU when idle.": "Encaminha alterações de arquivos em unidades do Windows (como {path}) aos contêineres para recarregamento ao vivo. Não usa CPU quando ocioso.",
+  "One text file, redacted, saved to your Desktop. Read it before you share it.": "Um arquivo de texto, com dados sensíveis ocultos, salvo na sua Área de Trabalho. Leia antes de compartilhar.",
+  "The 5 newest crash reports for Kiri": "Os 5 relatórios de falha mais recentes do Kiri",
+  "Kiri and this PC": "O Kiri e este PC",
+  "Kiri and this computer": "O Kiri e este computador",
+  "Versions, {os}, whether the engine runs, how many containers and images": "Versões, {os}, se a engine está rodando, quantos contêineres e imagens",
+  "Saved. The engine uses these from its next start": "Salvo. A engine usa isso a partir da próxima inicialização"
 }

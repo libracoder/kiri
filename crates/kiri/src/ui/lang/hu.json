@@ -1932,5 +1932,19 @@
   "Kiri's data is moving already": "A Kiri adatai már áthelyezés alatt állnak",
   "Kiri's data moved to {path}": "A Kiri adatai áthelyezve ide: {path}",
   "Storage is available again": "A tárhely újra elérhető",
-  "Old data removed": "Régi adatok eltávolítva"
+  "Old data removed": "Régi adatok eltávolítva",
+  "A proxy on this computer is reached as {host}.": "A gépen futó proxy ezen a címen érhető el: {host}.",
+  "VPNs need no setting: container traffic leaves through Linux.": "A VPN-ekhez nem kell beállítás: a konténerforgalom a Linuxon keresztül távozik.",
+  "Shared with Linux: containers only use them while busy.": "Megosztva a Linuxszal: a konténerek csak akkor használják, amikor dolgoznak.",
+  "The most containers and the engine may take. Unused memory stays free on Linux.": "A konténerek és a motor által foglalható maximum. A nem használt memória szabad marad Linuxon.",
+  "The engine is off; it starts with these next time.": "A motor ki van kapcsolva; legközelebb ezekkel indul.",
+  "Restart engine to apply": "A motor újraindítása az alkalmazáshoz",
+  "Windows bind-mount file events": "Windows csatolt mappák fájleseményei",
+  "Forward file changes on Windows drives (like {path}) into containers for live reload. Uses no CPU when idle.": "Továbbítja a Windows-meghajtókon (például {path}) történt fájlváltozásokat a konténereknek az élő újratöltéshez. Üresjáratban nem használ CPU-t.",
+  "One text file, redacted, saved to your Desktop. Read it before you share it.": "Egyetlen, kitakart szövegfájl, amely az Asztalra kerül. Olvasd el, mielőtt megosztod.",
+  "The 5 newest crash reports for Kiri": "A Kiri legutóbbi 5 összeomlási jelentése",
+  "Kiri and this PC": "A Kiri és ez a PC",
+  "Kiri and this computer": "A Kiri és ez a számítógép",
+  "Versions, {os}, whether the engine runs, how many containers and images": "Verziók, {os}, fut-e a motor, hány konténer és image van",
+  "Saved. The engine uses these from its next start": "Mentve. A motor a következő indításától használja ezeket"
 }

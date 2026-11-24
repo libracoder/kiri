@@ -1932,5 +1932,19 @@
   "Kiri's data is moving already": "Kiri 데이터가 이미 이동 중입니다",
   "Kiri's data moved to {path}": "Kiri 데이터가 {path}(으)로 이동되었습니다",
   "Storage is available again": "저장소를 다시 사용할 수 있습니다",
-  "Old data removed": "이전 데이터가 삭제되었습니다"
+  "Old data removed": "이전 데이터가 삭제되었습니다",
+  "A proxy on this computer is reached as {host}.": "이 컴퓨터의 프록시는 {host}(으)로 접근합니다.",
+  "VPNs need no setting: container traffic leaves through Linux.": "VPN은 설정할 필요 없습니다: 컨테이너 트래픽은 Linux를 통해 나갑니다.",
+  "Shared with Linux: containers only use them while busy.": "Linux와 공유: 컨테이너가 작업 중일 때만 사용합니다.",
+  "The most containers and the engine may take. Unused memory stays free on Linux.": "컨테이너와 엔진이 사용할 수 있는 최대치입니다. 사용하지 않는 메모리는 Linux에 여유 상태로 남습니다.",
+  "The engine is off; it starts with these next time.": "엔진이 꺼져 있습니다. 다음에 시작할 때 이 값으로 시작합니다.",
+  "Restart engine to apply": "적용하려면 엔진 다시 시작",
+  "Windows bind-mount file events": "Windows 바인드 마운트 파일 이벤트",
+  "Forward file changes on Windows drives (like {path}) into containers for live reload. Uses no CPU when idle.": "라이브 리로드를 위해 Windows 드라이브({path} 등)의 파일 변경 사항을 컨테이너로 전달합니다. 유휴 상태에서는 CPU를 사용하지 않습니다.",
+  "One text file, redacted, saved to your Desktop. Read it before you share it.": "민감 정보를 가린 텍스트 파일 하나를 데스크톱에 저장합니다. 공유하기 전에 읽어 보세요.",
+  "The 5 newest crash reports for Kiri": "Kiri의 최근 충돌 보고서 5개",
+  "Kiri and this PC": "Kiri와 이 PC",
+  "Kiri and this computer": "Kiri와 이 컴퓨터",
+  "Versions, {os}, whether the engine runs, how many containers and images": "버전, {os}, 엔진 실행 여부, 컨테이너와 이미지 개수",
+  "Saved. The engine uses these from its next start": "저장했습니다. 엔진은 다음 시작부터 이 값을 사용합니다"
 }

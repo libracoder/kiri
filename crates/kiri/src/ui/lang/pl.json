@@ -1932,5 +1932,19 @@
   "Kiri's data is moving already": "Dane Kiri są już przenoszone",
   "Kiri's data moved to {path}": "Przeniesiono dane Kiri do {path}",
   "Storage is available again": "Pamięć jest ponownie dostępna",
-  "Old data removed": "Stare dane usunięto"
+  "Old data removed": "Stare dane usunięto",
+  "A proxy on this computer is reached as {host}.": "Proxy na tym komputerze jest dostępne jako {host}.",
+  "VPNs need no setting: container traffic leaves through Linux.": "Sieci VPN nie wymagają ustawień: ruch kontenerów wychodzi przez Linux.",
+  "Shared with Linux: containers only use them while busy.": "Współdzielone z systemem Linux: kontenery używają ich tylko wtedy, gdy pracują.",
+  "The most containers and the engine may take. Unused memory stays free on Linux.": "Najwięcej, ile kontenery i silnik mogą zająć. Nieużywana pamięć pozostaje wolna w systemie Linux.",
+  "The engine is off; it starts with these next time.": "Silnik jest wyłączony; przy następnym starcie użyje tych ustawień.",
+  "Restart engine to apply": "Uruchom ponownie silnik, aby zastosować",
+  "Windows bind-mount file events": "Zdarzenia plików zamontowanych z Windows",
+  "Forward file changes on Windows drives (like {path}) into containers for live reload. Uses no CPU when idle.": "Przekazuje zmiany plików na dyskach Windows (jak {path}) do kontenerów na potrzeby przeładowania na żywo. Nie obciąża CPU w spoczynku.",
+  "One text file, redacted, saved to your Desktop. Read it before you share it.": "Jeden plik tekstowy z usuniętymi danymi wrażliwymi, zapisany na pulpicie. Przeczytaj go przed udostępnieniem.",
+  "The 5 newest crash reports for Kiri": "5 najnowszych raportów o awariach Kiri",
+  "Kiri and this PC": "Kiri i ten PC",
+  "Kiri and this computer": "Kiri i ten komputer",
+  "Versions, {os}, whether the engine runs, how many containers and images": "Wersje, {os}, czy silnik działa, liczba kontenerów i obrazów",
+  "Saved. The engine uses these from its next start": "Zapisano. Silnik użyje tego od następnego uruchomienia"
 }

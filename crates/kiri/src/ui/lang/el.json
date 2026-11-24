@@ -1932,5 +1932,19 @@
   "Kiri's data is moving already": "Τα δεδομένα του Kiri μετακινούνται ήδη",
   "Kiri's data moved to {path}": "Τα δεδομένα του Kiri μετακινήθηκαν στο {path}",
   "Storage is available again": "Η αποθήκευση είναι ξανά διαθέσιμη",
-  "Old data removed": "Τα παλιά δεδομένα αφαιρέθηκαν"
+  "Old data removed": "Τα παλιά δεδομένα αφαιρέθηκαν",
+  "A proxy on this computer is reached as {host}.": "Ένας διακομιστής μεσολάβησης σε αυτόν τον υπολογιστή είναι προσβάσιμος ως {host}.",
+  "VPNs need no setting: container traffic leaves through Linux.": "Τα VPN δεν χρειάζονται ρύθμιση: η κίνηση των κοντέινερ βγαίνει μέσω του Linux.",
+  "Shared with Linux: containers only use them while busy.": "Κοινόχρηστα με το Linux: τα κοντέινερ τα χρησιμοποιούν μόνο όσο είναι απασχολημένα.",
+  "The most containers and the engine may take. Unused memory stays free on Linux.": "Το μέγιστο που μπορούν να πάρουν τα κοντέινερ και η μηχανή. Η αχρησιμοποίητη μνήμη μένει ελεύθερη στο Linux.",
+  "The engine is off; it starts with these next time.": "Η μηχανή είναι ανενεργή· θα ξεκινήσει με αυτά την επόμενη φορά.",
+  "Restart engine to apply": "Επανεκκίνηση μηχανής για εφαρμογή",
+  "Windows bind-mount file events": "Συμβάντα αρχείων προσαρτήσεων Windows",
+  "Forward file changes on Windows drives (like {path}) into containers for live reload. Uses no CPU when idle.": "Προωθεί αλλαγές αρχείων σε δίσκους Windows (όπως το {path}) στα κοντέινερ για άμεση επαναφόρτωση. Δεν χρησιμοποιεί CPU σε αδράνεια.",
+  "One text file, redacted, saved to your Desktop. Read it before you share it.": "Ένα αρχείο κειμένου, με απαλειμμένα στοιχεία, αποθηκευμένο στην Επιφάνεια εργασίας. Διαβάστε το πριν το μοιραστείτε.",
+  "The 5 newest crash reports for Kiri": "Οι 5 νεότερες αναφορές σφαλμάτων για το Kiri",
+  "Kiri and this PC": "Το Kiri και αυτό το PC",
+  "Kiri and this computer": "Το Kiri και αυτός ο υπολογιστής",
+  "Versions, {os}, whether the engine runs, how many containers and images": "Εκδόσεις, {os}, αν εκτελείται η μηχανή, πόσα κοντέινερ και εικόνες",
+  "Saved. The engine uses these from its next start": "Αποθηκεύτηκε. Η μηχανή τα χρησιμοποιεί από την επόμενη εκκίνησή της"
 }

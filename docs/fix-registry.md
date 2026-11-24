@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #487 UI & Diagnostics: add Windows bind-watch toggle, fix narrow socket layout, and remove macOS copy on Linux/Windows (unreleased)
+- Fixes: #487 Windows: `C:\` bind-mount file changes don't trigger inotify inside containers (Settings UI toggle)
+- Caused: none known
+- Caused by: -
+- Check: `tests/ui/watch-bind-mounts.js`, `tests/ui/dockersock-narrow.js`, `crates/kiri/src/diag/report.rs`, `crates/kiri/src/daemon/storage.rs`, `crates/kiri-win/src/main.rs`
+
 ### #645 Localization: Ukrainian's Share is a button, and other wording fixes (unreleased)
 - Fixes: no issue
 - Caused: none known

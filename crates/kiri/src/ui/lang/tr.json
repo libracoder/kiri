@@ -1932,5 +1932,19 @@
   "Kiri's data is moving already": "Kiri verileri zaten taşınıyor",
   "Kiri's data moved to {path}": "Kiri verileri {path} konumuna taşındı",
   "Storage is available again": "Depolama yeniden kullanılabilir",
-  "Old data removed": "Eski veriler kaldırıldı"
+  "Old data removed": "Eski veriler kaldırıldı",
+  "A proxy on this computer is reached as {host}.": "Bu bilgisayardaki bir proxy'ye şu adresle erişilir: {host}.",
+  "VPNs need no setting: container traffic leaves through Linux.": "VPN'ler ayar gerektirmez: kapsayıcı trafiği Linux üzerinden çıkar.",
+  "Shared with Linux: containers only use them while busy.": "Linux ile paylaşılır: kapsayıcılar bunları yalnızca meşgulken kullanır.",
+  "The most containers and the engine may take. Unused memory stays free on Linux.": "Kapsayıcıların ve motorun alabileceği en fazla bellek. Kullanılmayan bellek Linux'ta boş kalır.",
+  "The engine is off; it starts with these next time.": "Motor kapalı; bir sonraki sefer bunlarla başlar.",
+  "Restart engine to apply": "Uygulamak için motoru yeniden başlat",
+  "Windows bind-mount file events": "Windows bağlama noktası dosya olayları",
+  "Forward file changes on Windows drives (like {path}) into containers for live reload. Uses no CPU when idle.": "Canlı yenileme için Windows sürücülerindeki ({path} gibi) dosya değişikliklerini kapsayıcılara iletir. Boştayken CPU kullanmaz.",
+  "One text file, redacted, saved to your Desktop. Read it before you share it.": "Masaüstünüze kaydedilen, hassas bilgileri ayıklanmış tek bir metin dosyası. Paylaşmadan önce okuyun.",
+  "The 5 newest crash reports for Kiri": "Kiri için en yeni 5 çökme raporu",
+  "Kiri and this PC": "Kiri ve bu PC",
+  "Kiri and this computer": "Kiri ve bu bilgisayar",
+  "Versions, {os}, whether the engine runs, how many containers and images": "Sürümler, {os}, motorun çalışıp çalışmadığı, kapsayıcı ve görüntü sayısı",
+  "Saved. The engine uses these from its next start": "Kaydedildi. Motor bunları bir sonraki başlatmada kullanır"
 }

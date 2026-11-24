@@ -1932,5 +1932,19 @@
   "Kiri's data is moving already": "Kiri のデータはすでに移動中です",
   "Kiri's data moved to {path}": "Kiri のデータを {path} に移動しました",
   "Storage is available again": "ストレージが再び利用可能になりました",
-  "Old data removed": "古いデータを削除しました"
+  "Old data removed": "古いデータを削除しました",
+  "A proxy on this computer is reached as {host}.": "このコンピュータのプロキシには {host} でアクセスします。",
+  "VPNs need no setting: container traffic leaves through Linux.": "VPN の設定は不要です：コンテナのトラフィックは Linux を経由して外に出ます。",
+  "Shared with Linux: containers only use them while busy.": "Linux と共有：コンテナがビジーなときだけ使用します。",
+  "The most containers and the engine may take. Unused memory stays free on Linux.": "コンテナとエンジンが使用できる上限。未使用のメモリは Linux で空いたままになります。",
+  "The engine is off; it starts with these next time.": "エンジンはオフです。次回の起動時にこの設定が使用されます。",
+  "Restart engine to apply": "エンジンを再起動して適用",
+  "Windows bind-mount file events": "Windows バインドマウントのファイルイベント",
+  "Forward file changes on Windows drives (like {path}) into containers for live reload. Uses no CPU when idle.": "Windows ドライブ（{path} など）のファイル変更をライブリロード用にコンテナへ転送します。アイドル時は CPU を使用しません。",
+  "One text file, redacted, saved to your Desktop. Read it before you share it.": "機密情報を除いた 1 つのテキストファイルをデスクトップに保存します。共有する前に内容を確認してください。",
+  "The 5 newest crash reports for Kiri": "Kiri の最新 5 件のクラッシュレポート",
+  "Kiri and this PC": "Kiri とこの PC",
+  "Kiri and this computer": "Kiri とこのコンピュータ",
+  "Versions, {os}, whether the engine runs, how many containers and images": "バージョン、{os}、エンジンの実行状況、コンテナとイメージの数",
+  "Saved. The engine uses these from its next start": "保存しました。エンジンは次回の起動時からこの設定を使用します"
 }

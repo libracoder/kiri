@@ -155,8 +155,12 @@ fn start(distro: Option<String>, kiri: String) -> io::Result<Arc<Relay>> {
         );
         r.dead.store(true, Ordering::SeqCst);
         r.changed.notify_all();
-        let status = child.wait();
-        log_once(format!("host relay ended: {end:?}, {status:?}"));
+        let end = match end {
+            Ok(()) => "closed".to_owned(),
+            Err(e) => format!("{e}"),
+        };
+        let status = crate::format_wait_status(child.wait());
+        log_once(format!("host relay ended: {end}, {status}"));
     });
     Ok(relay)
 }

@@ -1932,5 +1932,19 @@
   "Kiri's data is moving already": "Дані Kiri вже переносяться",
   "Kiri's data moved to {path}": "Дані Kiri перенесено до {path}",
   "Storage is available again": "Сховище знову доступне",
-  "Old data removed": "Старі дані видалено"
+  "Old data removed": "Старі дані видалено",
+  "A proxy on this computer is reached as {host}.": "Проксі на цьому комп’ютері доступний як {host}.",
+  "VPNs need no setting: container traffic leaves through Linux.": "VPN не потребує налаштування: трафік контейнерів виходить через Linux.",
+  "Shared with Linux: containers only use them while busy.": "Спільні з Linux: контейнери використовують їх, лише поки зайняті роботою.",
+  "The most containers and the engine may take. Unused memory stays free on Linux.": "Максимум, який можуть зайняти контейнери та рушій. Невикористана пам’ять залишається вільною в Linux.",
+  "The engine is off; it starts with these next time.": "Рушій вимкнено; під час наступного запуску він застосує ці налаштування.",
+  "Restart engine to apply": "Перезапустити рушій, щоб застосувати",
+  "Windows bind-mount file events": "Події файлів змонтованих папок Windows",
+  "Forward file changes on Windows drives (like {path}) into containers for live reload. Uses no CPU when idle.": "Передає зміни файлів на дисках Windows (як-от {path}) у контейнери для миттєвого перезавантаження. Не навантажує процесор у простої.",
+  "One text file, redacted, saved to your Desktop. Read it before you share it.": "Один текстовий файл з вилученими особистими даними зберігається на Робочий стіл. Прочитайте його, перш ніж комусь надсилати.",
+  "The 5 newest crash reports for Kiri": "5 найновіших звітів про збої Kiri",
+  "Kiri and this PC": "Kiri і цей ПК",
+  "Kiri and this computer": "Kiri і цей комп’ютер",
+  "Versions, {os}, whether the engine runs, how many containers and images": "Версії, {os}, чи працює рушій, кількість контейнерів і образів",
+  "Saved. The engine uses these from its next start": "Збережено. Рушій застосує це під час наступного запуску"
 }

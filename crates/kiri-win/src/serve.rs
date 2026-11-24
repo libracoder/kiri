@@ -1451,10 +1451,7 @@ impl Process for Wsl {
     }
 
     fn exited(&mut self) -> Option<String> {
-        match self.0.try_wait() {
-            Ok(None) => None,
-            status => Some(format!("{status:?}")),
-        }
+        crate::format_try_wait(self.0.try_wait())
     }
 }
 

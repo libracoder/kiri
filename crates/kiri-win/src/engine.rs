@@ -1001,9 +1001,11 @@ fn set_pref(name: &str, value: Value) {
         let on = value.as_bool().unwrap_or(false);
         if crate::watch::save_enabled(on).is_err() {
             emit(notice("error", &trf("Could not save the setting to {path}", &[("path", &"%LOCALAPPDATA%\\Kiri\\settings.json")])));
+            emit(json!({"type": "prefs", "prefs": prefs()}).to_string());
             return;
         }
         crate::watch::set_enabled(crate::watch::is_enabled());
+        emit(json!({"type": "prefs", "prefs": prefs()}).to_string());
         return;
     }
     if !matches!(name, "font" | "mono" | "scale" | "termH" | "termFs" | "termFont" | "domainsAsked" | "theme" | "accent" | "starAsked" | "updateAuto" | "lang" | "langAsked" | "closeButton" | "startAtLogin" | "stopOnQuit") {

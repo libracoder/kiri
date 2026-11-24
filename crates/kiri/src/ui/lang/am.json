@@ -1932,5 +1932,19 @@
   "Kiri's data is moving already": "የKiri ውሂብ አሁን እየተዛወረ ነው",
   "Kiri's data moved to {path}": "የKiri ውሂብ ወደ {path} ተዛውሯል",
   "Storage is available again": "ማከማቻው እንደገና ይገኛል",
-  "Old data removed": "የቆየ ውሂብ ተወግዷል"
+  "Old data removed": "የቆየ ውሂብ ተወግዷል",
+  "A proxy on this computer is reached as {host}.": "በዚህ ኮምፒውተር ላይ ያለ ፕሮክሲ በ{host} ይደረስበታል።",
+  "VPNs need no setting: container traffic leaves through Linux.": "VPNዎች ቅንብር አያስፈልጋቸውም፦ የኮንቴይነር ትራፊክ በLinux በኩል ይወጣል።",
+  "Shared with Linux: containers only use them while busy.": "ከLinux ጋር የተጋራ፦ ኮንቴይነሮች የሚጠቀሙባቸው ሥራ ላይ ሲሆኑ ብቻ ነው።",
+  "The most containers and the engine may take. Unused memory stays free on Linux.": "ኮንቴይነሮች እና ሞተሩ ሊወስዱት የሚችሉት ከፍተኛ መጠን። ጥቅም ላይ ያልዋለ ማህደረ ትውስታ በLinux ላይ ነፃ ሆኖ ይቆያል።",
+  "The engine is off; it starts with these next time.": "ሞተሩ ጠፍቷል፤ በሚቀጥለው ጊዜ በእነዚህ ይጀምራል።",
+  "Restart engine to apply": "ለመተግበር ሞተሩን ዳግም አስጀምር",
+  "Windows bind-mount file events": "የWindows bind-mount የፋይል ክስተቶች",
+  "Forward file changes on Windows drives (like {path}) into containers for live reload. Uses no CPU when idle.": "ለቀጥታ ዳግም ጭነት በWindows አንጻፊዎች (እንደ {path}) ላይ ያሉ የፋይል ለውጦችን ወደ ኮንቴይነሮች ያስተላልፋል። ሥራ ላይ ካልሆነ ምንም CPU አይጠቀምም።",
+  "One text file, redacted, saved to your Desktop. Read it before you share it.": "ስሱ መረጃ የተሰረዘበት አንድ የጽሑፍ ፋይል፣ በዴስክቶፕዎ ላይ ይቀመጣል። ከማጋራትዎ በፊት ያንብቡት።",
+  "The 5 newest crash reports for Kiri": "5ቱ አዳዲስ የKiri የብልሽት ሪፖርቶች",
+  "Kiri and this PC": "Kiri እና ይህ PC",
+  "Kiri and this computer": "Kiri እና ይህ ኮምፒውተር",
+  "Versions, {os}, whether the engine runs, how many containers and images": "ስሪቶች፣ {os}፣ ሞተሩ እየሠራ እንደሆነ፣ ስንት ኮንቴይነሮች እና ኢሜጆች",
+  "Saved. The engine uses these from its next start": "ተቀምጧል። ሞተሩ እነዚህን ከሚቀጥለው ጅምሩ ጀምሮ ይጠቀማል"
 }

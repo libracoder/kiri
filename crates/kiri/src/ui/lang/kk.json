@@ -1932,5 +1932,19 @@
   "Kiri's data is moving already": "Kiri деректері қазірдің өзінде жылжытылуда",
   "Kiri's data moved to {path}": "Kiri деректері {path} ішіне жылжытылды",
   "Storage is available again": "Сақтау орны қайта қолжетімді",
-  "Old data removed": "Ескі деректер жойылды"
+  "Old data removed": "Ескі деректер жойылды",
+  "A proxy on this computer is reached as {host}.": "Осы компьютердегі прокси {host} ретінде қолжетімді.",
+  "VPNs need no setting: container traffic leaves through Linux.": "VPN баптауды қажет етпейді: контейнер трафигі Linux арқылы шығады.",
+  "Shared with Linux: containers only use them while busy.": "Linux жүйесімен ортақ: контейнерлер оларды тек жұмыс істегенде пайдаланады.",
+  "The most containers and the engine may take. Unused memory stays free on Linux.": "Контейнерлер мен қозғалтқыш ала алатын ең көп көлем. Пайдаланылмаған жад Linux жүйесінде бос қалады.",
+  "The engine is off; it starts with these next time.": "Қозғалтқыш өшірулі; келесі жолы осы баптаулармен іске қосылады.",
+  "Restart engine to apply": "Қолдану үшін қозғалтқышты қайта іске қосу",
+  "Windows bind-mount file events": "Windows байланыстырылған бума файл оқиғалары",
+  "Forward file changes on Windows drives (like {path}) into containers for live reload. Uses no CPU when idle.": "Windows дискілеріндегі ({path} сияқты) файл өзгерістерін тікелей жаңарту үшін контейнерлерге жібереді. Бос тұрғанда процессорды жүктемейді.",
+  "One text file, redacted, saved to your Desktop. Read it before you share it.": "Жеке деректері алынып тасталған бір мәтіндік файл жұмыс үстеліне сақталады. Бөліспес бұрын оны оқып шығыңыз.",
+  "The 5 newest crash reports for Kiri": "Kiri ақаулары туралы соңғы 5 есеп",
+  "Kiri and this PC": "Kiri және осы ДК",
+  "Kiri and this computer": "Kiri және осы компьютер",
+  "Versions, {os}, whether the engine runs, how many containers and images": "Нұсқалар, {os}, қозғалтқыштың жұмыс істеп тұрғаны, контейнерлер мен образдар саны",
+  "Saved. The engine uses these from its next start": "Сақталды. Қозғалтқыш оларды келесі іске қосылғанда пайдаланады"
 }

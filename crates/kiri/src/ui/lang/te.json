@@ -1932,5 +1932,19 @@
   "Kiri's data is moving already": "Kiri డేటా ఇప్పటికే తరలించబడుతోంది",
   "Kiri's data moved to {path}": "Kiri డేటా {path} కు తరలించబడింది",
   "Storage is available again": "స్టోరేజీ మళ్ళీ అందుబాటులో ఉంది",
-  "Old data removed": "పాత డేటా తొలగించబడింది"
+  "Old data removed": "పాత డేటా తొలగించబడింది",
+  "A proxy on this computer is reached as {host}.": "ఈ కంప్యూటర్‌లోని ప్రాక్సీని {host}గా చేరుకోవచ్చు.",
+  "VPNs need no setting: container traffic leaves through Linux.": "VPNలకు సెట్టింగ్ అక్కర్లేదు: కంటైనర్ ట్రాఫిక్ Linux ద్వారా బయటకు వెళ్తుంది.",
+  "Shared with Linux: containers only use them while busy.": "Linuxతో పంచుకోబడతాయి: కంటైనర్‌లు బిజీగా ఉన్నప్పుడు మాత్రమే వాటిని వాడతాయి.",
+  "The most containers and the engine may take. Unused memory stays free on Linux.": "కంటైనర్‌లు, ఇంజిన్ తీసుకోగల గరిష్టం. వాడని మెమరీ Linuxలో ఖాళీగా ఉంటుంది.",
+  "The engine is off; it starts with these next time.": "ఇంజిన్ ఆఫ్‌లో ఉంది; తదుపరిసారి వీటితో ప్రారంభమవుతుంది.",
+  "Restart engine to apply": "వర్తింపజేయడానికి ఇంజిన్ రీస్టార్ట్ చేయి",
+  "Windows bind-mount file events": "Windows బైండ్-మౌంట్ ఫైల్ ఈవెంట్‌లు",
+  "Forward file changes on Windows drives (like {path}) into containers for live reload. Uses no CPU when idle.": "లైవ్ రీలోడ్ కోసం Windows డ్రైవ్‌లలో ({path} వంటివి) ఫైల్ మార్పులను కంటైనర్‌లకు పంపుతుంది. ఖాళీగా ఉన్నప్పుడు CPU వాడదు.",
+  "One text file, redacted, saved to your Desktop. Read it before you share it.": "ఒక టెక్స్ట్ ఫైల్, సున్నితమైన వివరాలు తీసివేసి, మీ డెస్క్‌టాప్‌లో సేవ్ చేయబడుతుంది. షేర్ చేసే ముందు దాన్ని చదవండి.",
+  "The 5 newest crash reports for Kiri": "Kiri కోసం 5 సరికొత్త క్రాష్ రిపోర్ట్‌లు",
+  "Kiri and this PC": "Kiri, ఈ PC",
+  "Kiri and this computer": "Kiri, ఈ కంప్యూటర్",
+  "Versions, {os}, whether the engine runs, how many containers and images": "వెర్షన్‌లు, {os}, ఇంజిన్ రన్ అవుతోందా, ఎన్ని కంటైనర్‌లు, ఇమేజ్‌లు",
+  "Saved. The engine uses these from its next start": "సేవ్ అయింది. ఇంజిన్ తదుపరి ప్రారంభం నుండి వీటిని వాడుతుంది"
 }

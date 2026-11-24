@@ -1932,5 +1932,19 @@
   "Kiri's data is moving already": "Kiris Daten werden bereits verschoben",
   "Kiri's data moved to {path}": "Kiris Daten wurden nach {path} verschoben",
   "Storage is available again": "Speicher ist wieder verfügbar",
-  "Old data removed": "Alte Daten entfernt"
+  "Old data removed": "Alte Daten entfernt",
+  "A proxy on this computer is reached as {host}.": "Ein Proxy auf diesem Computer ist als {host} erreichbar.",
+  "VPNs need no setting: container traffic leaves through Linux.": "VPNs brauchen keine Einstellung: Container-Traffic geht über Linux raus.",
+  "Shared with Linux: containers only use them while busy.": "Geteilt mit Linux: Container nutzen sie nur, während sie arbeiten.",
+  "The most containers and the engine may take. Unused memory stays free on Linux.": "Das Maximum, das Container und Engine nehmen dürfen. Ungenutzter Speicher bleibt unter Linux frei.",
+  "The engine is off; it starts with these next time.": "Die Engine ist aus; sie startet beim nächsten Mal damit.",
+  "Restart engine to apply": "Engine neu starten zum Übernehmen",
+  "Windows bind-mount file events": "Dateiereignisse für Windows-Bind-Mounts",
+  "Forward file changes on Windows drives (like {path}) into containers for live reload. Uses no CPU when idle.": "Leitet Dateiänderungen auf Windows-Laufwerken (wie {path}) für Live-Reload an Container weiter. Verbraucht im Leerlauf keine CPU.",
+  "One text file, redacted, saved to your Desktop. Read it before you share it.": "Eine Textdatei, geschwärzt, auf deinem Schreibtisch gespeichert. Lies sie, bevor du sie teilst.",
+  "The 5 newest crash reports for Kiri": "Die 5 neuesten Absturzberichte zu Kiri",
+  "Kiri and this PC": "Kiri und dieser PC",
+  "Kiri and this computer": "Kiri und dieser Computer",
+  "Versions, {os}, whether the engine runs, how many containers and images": "Versionen, {os}, ob die Engine läuft, wie viele Container und Images",
+  "Saved. The engine uses these from its next start": "Gespeichert. Die Engine nutzt sie ab dem nächsten Start"
 }

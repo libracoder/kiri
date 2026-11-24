@@ -752,12 +752,25 @@ pub fn serving(req: &Request) {
 fn note_failure(status: u16) {
     SERVING.with(|s| {
         let (method, path) = &*s.borrow();
-        match status {
-            404 => crate::diag::debug!("request failed", method = method, path = path, status = status),
-            400..=499 => crate::diag::warn!("request failed", method = method, path = path, status = status),
-            _ => crate::diag::error!("request failed", method = method, path = path, status = status),
+        if method.is_empty() && path.is_empty() {
+            match status {
+                404 => crate::diag::debug!("request failed", status = status),
+                400..=499 => crate::diag::warn!("request failed", status = status),
+                _ => crate::diag::error!("request failed", status = status),
+            }
+        } else {
+            match status {
+                404 => crate::diag::debug!("request failed", method = method, path = path, status = status),
+                400..=499 => crate::diag::warn!("request failed", method = method, path = path, status = status),
+                _ => crate::diag::error!("request failed", method = method, path = path, status = status),
+            }
         }
     });
+}
+
+#[cfg(test)]
+pub fn current_serving() -> (String, String) {
+    SERVING.with(|s| s.borrow().clone())
 }
 
 fn head(w: &mut impl Write, status: u16, extra: &str) -> io::Result<()> {

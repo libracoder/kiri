@@ -1932,5 +1932,19 @@
   "Kiri's data is moving already": "Datele Kiri se mută deja",
   "Kiri's data moved to {path}": "Datele Kiri au fost mutate în {path}",
   "Storage is available again": "Stocarea este din nou disponibilă",
-  "Old data removed": "Datele vechi au fost eliminate"
+  "Old data removed": "Datele vechi au fost eliminate",
+  "A proxy on this computer is reached as {host}.": "Un proxy de pe acest computer este accesibil ca {host}.",
+  "VPNs need no setting: container traffic leaves through Linux.": "VPN-urile nu necesită setări: traficul containerelor iese prin Linux.",
+  "Shared with Linux: containers only use them while busy.": "Partajate cu Linux: containerele le folosesc doar cât timp lucrează.",
+  "The most containers and the engine may take. Unused memory stays free on Linux.": "Maximul pe care îl pot ocupa containerele și motorul. Memoria nefolosită rămâne liberă pe Linux.",
+  "The engine is off; it starts with these next time.": "Motorul este oprit; pornește cu acestea data viitoare.",
+  "Restart engine to apply": "Repornește motorul pentru a aplica",
+  "Windows bind-mount file events": "Evenimente de fișiere pentru montările din Windows",
+  "Forward file changes on Windows drives (like {path}) into containers for live reload. Uses no CPU when idle.": "Redirecționează modificările fișierelor de pe unitățile Windows (precum {path}) către containere pentru reîncărcare live. Nu consumă CPU în repaus.",
+  "One text file, redacted, saved to your Desktop. Read it before you share it.": "Un fișier text, cu datele sensibile ascunse, salvat pe Desktop. Citește-l înainte să-l partajezi.",
+  "The 5 newest crash reports for Kiri": "Cele mai noi 5 rapoarte de blocare pentru Kiri",
+  "Kiri and this PC": "Kiri și acest PC",
+  "Kiri and this computer": "Kiri și acest computer",
+  "Versions, {os}, whether the engine runs, how many containers and images": "Versiuni, {os}, dacă motorul rulează, câte containere și imagini",
+  "Saved. The engine uses these from its next start": "Salvat. Motorul le folosește de la următoarea pornire"
 }

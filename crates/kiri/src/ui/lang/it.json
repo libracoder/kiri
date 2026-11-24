@@ -1932,5 +1932,19 @@
   "Kiri's data is moving already": "I dati di Kiri sono già in fase di spostamento",
   "Kiri's data moved to {path}": "Dati di Kiri spostati in {path}",
   "Storage is available again": "Archiviazione di nuovo disponibile",
-  "Old data removed": "Vecchi dati rimossi"
+  "Old data removed": "Vecchi dati rimossi",
+  "A proxy on this computer is reached as {host}.": "Un proxy su questo computer è raggiungibile come {host}.",
+  "VPNs need no setting: container traffic leaves through Linux.": "Le VPN non richiedono impostazioni: il traffico dei container esce tramite Linux.",
+  "Shared with Linux: containers only use them while busy.": "Condivisi con Linux: i container li usano solo mentre lavorano.",
+  "The most containers and the engine may take. Unused memory stays free on Linux.": "Il massimo che i container e il motore possono occupare. La memoria inutilizzata resta libera su Linux.",
+  "The engine is off; it starts with these next time.": "Il motore è spento; la prossima volta si avvia con questi valori.",
+  "Restart engine to apply": "Riavvia il motore per applicare",
+  "Windows bind-mount file events": "Eventi file dei bind mount di Windows",
+  "Forward file changes on Windows drives (like {path}) into containers for live reload. Uses no CPU when idle.": "Inoltra le modifiche ai file sulle unità Windows (come {path}) ai container per il ricaricamento dal vivo. Non usa CPU quando inattivo.",
+  "One text file, redacted, saved to your Desktop. Read it before you share it.": "Un file di testo, con i dati sensibili oscurati, salvato sulla Scrivania. Leggilo prima di condividerlo.",
+  "The 5 newest crash reports for Kiri": "Le 5 segnalazioni di crash più recenti per Kiri",
+  "Kiri and this PC": "Kiri e questo PC",
+  "Kiri and this computer": "Kiri e questo computer",
+  "Versions, {os}, whether the engine runs, how many containers and images": "Versioni, {os}, se il motore è in esecuzione, quanti container e immagini",
+  "Saved. The engine uses these from its next start": "Salvato. Il motore li usa dal prossimo avvio"
 }

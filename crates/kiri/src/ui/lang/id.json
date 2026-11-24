@@ -1932,5 +1932,19 @@
   "Kiri's data is moving already": "Data Kiri sedang dipindahkan",
   "Kiri's data moved to {path}": "Data Kiri dipindahkan ke {path}",
   "Storage is available again": "Penyimpanan tersedia kembali",
-  "Old data removed": "Data lama dihapus"
+  "Old data removed": "Data lama dihapus",
+  "A proxy on this computer is reached as {host}.": "Proxy di komputer ini dijangkau sebagai {host}.",
+  "VPNs need no setting: container traffic leaves through Linux.": "VPN tidak perlu diatur: trafik kontainer keluar melalui Linux.",
+  "Shared with Linux: containers only use them while busy.": "Dipakai bersama Linux: kontainer hanya memakainya saat sibuk.",
+  "The most containers and the engine may take. Unused memory stays free on Linux.": "Batas maksimum yang boleh dipakai kontainer dan engine. Memori yang tidak dipakai tetap bebas di Linux.",
+  "The engine is off; it starts with these next time.": "Engine sedang mati; pengaturan ini dipakai saat dimulai berikutnya.",
+  "Restart engine to apply": "Restart engine untuk menerapkan",
+  "Windows bind-mount file events": "Peristiwa file bind-mount Windows",
+  "Forward file changes on Windows drives (like {path}) into containers for live reload. Uses no CPU when idle.": "Meneruskan perubahan file di drive Windows (seperti {path}) ke kontainer untuk muat ulang langsung. Tidak memakai CPU saat menganggur.",
+  "One text file, redacted, saved to your Desktop. Read it before you share it.": "Satu file teks, sudah disensor, disimpan ke Desktop. Baca dulu sebelum Anda membagikannya.",
+  "The 5 newest crash reports for Kiri": "5 laporan crash terbaru untuk Kiri",
+  "Kiri and this PC": "Kiri dan PC ini",
+  "Kiri and this computer": "Kiri dan komputer ini",
+  "Versions, {os}, whether the engine runs, how many containers and images": "Versi, {os}, apakah engine berjalan, berapa banyak kontainer dan image",
+  "Saved. The engine uses these from its next start": "Disimpan. Engine memakainya mulai start berikutnya"
 }

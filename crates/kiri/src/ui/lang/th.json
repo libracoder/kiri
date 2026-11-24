@@ -1932,5 +1932,19 @@
   "Kiri's data is moving already": "กำลังย้ายข้อมูลของ Kiri อยู่แล้ว",
   "Kiri's data moved to {path}": "ย้ายข้อมูลของ Kiri ไปยัง {path} แล้ว",
   "Storage is available again": "ที่เก็บข้อมูลพร้อมใช้งานอีกครั้ง",
-  "Old data removed": "ลบข้อมูลเก่าแล้ว"
+  "Old data removed": "ลบข้อมูลเก่าแล้ว",
+  "A proxy on this computer is reached as {host}.": "พร็อกซีบนคอมพิวเตอร์เครื่องนี้เข้าถึงได้ที่ {host}",
+  "VPNs need no setting: container traffic leaves through Linux.": "VPN ไม่ต้องตั้งค่า: ทราฟฟิกของคอนเทนเนอร์ออกผ่าน Linux",
+  "Shared with Linux: containers only use them while busy.": "ใช้ร่วมกับ Linux: คอนเทนเนอร์จะใช้เฉพาะเมื่อทำงานหนัก",
+  "The most containers and the engine may take. Unused memory stays free on Linux.": "ปริมาณสูงสุดที่คอนเทนเนอร์และเอนจินใช้ได้ หน่วยความจำที่ไม่ได้ใช้จะยังว่างอยู่ใน Linux",
+  "The engine is off; it starts with these next time.": "เอนจินปิดอยู่ จะเริ่มด้วยค่าเหล่านี้ครั้งถัดไป",
+  "Restart engine to apply": "รีสตาร์ทเอนจินเพื่อใช้การตั้งค่า",
+  "Windows bind-mount file events": "เหตุการณ์ไฟล์ของไบน์เมานต์ Windows",
+  "Forward file changes on Windows drives (like {path}) into containers for live reload. Uses no CPU when idle.": "ส่งต่อการเปลี่ยนแปลงไฟล์บนไดรฟ์ Windows (เช่น {path}) เข้าสู่คอนเทนเนอร์เพื่อโหลดซ้ำทันที ไม่ใช้ CPU ขณะว่าง",
+  "One text file, redacted, saved to your Desktop. Read it before you share it.": "ไฟล์ข้อความหนึ่งไฟล์ที่ปิดบังข้อมูลแล้ว บันทึกไว้บนเดสก์ท็อป อ่านก่อนแชร์",
+  "The 5 newest crash reports for Kiri": "รายงานข้อขัดข้อง 5 รายการล่าสุดสำหรับ Kiri",
+  "Kiri and this PC": "Kiri และ PC เครื่องนี้",
+  "Kiri and this computer": "Kiri และคอมพิวเตอร์เครื่องนี้",
+  "Versions, {os}, whether the engine runs, how many containers and images": "เวอร์ชัน {os} เอนจินทำงานอยู่หรือไม่ จำนวนคอนเทนเนอร์และอิมเมจ",
+  "Saved. The engine uses these from its next start": "บันทึกแล้ว เอนจินจะใช้ค่าเหล่านี้ตั้งแต่เริ่มครั้งถัดไป"
 }

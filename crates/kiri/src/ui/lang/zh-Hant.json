@@ -1932,5 +1932,19 @@
   "Kiri's data is moving already": "Kiri 的資料已在移動中",
   "Kiri's data moved to {path}": "Kiri 的資料已移動到 {path}",
   "Storage is available again": "儲存位置已恢復可用",
-  "Old data removed": "舊資料已移除"
+  "Old data removed": "舊資料已移除",
+  "A proxy on this computer is reached as {host}.": "這台電腦上的 Proxy 可透過 {host} 連線。",
+  "VPNs need no setting: container traffic leaves through Linux.": "VPN 不需任何設定：容器流量經由 Linux 送出。",
+  "Shared with Linux: containers only use them while busy.": "與 Linux 共用：只有在容器忙碌時才會使用它們。",
+  "The most containers and the engine may take. Unused memory stays free on Linux.": "容器與引擎最多可占用的記憶體。未使用的記憶體在 Linux 上保持可用。",
+  "The engine is off; it starts with these next time.": "引擎已關閉，下次啟動時會使用這些設定。",
+  "Restart engine to apply": "重新啟動引擎以套用",
+  "Windows bind-mount file events": "Windows 綁定掛載檔案事件",
+  "Forward file changes on Windows drives (like {path}) into containers for live reload. Uses no CPU when idle.": "將 Windows 磁碟機（如 {path}）上的檔案變更轉發到容器中以支援即時重新載入。閒置時不占用 CPU。",
+  "One text file, redacted, saved to your Desktop. Read it before you share it.": "一個已遮蔽敏感資訊的文字檔，會儲存到桌面。分享前請先閱讀。",
+  "The 5 newest crash reports for Kiri": "Kiri 最新 5 份當機報告",
+  "Kiri and this PC": "Kiri 和這台電腦",
+  "Kiri and this computer": "Kiri 和這台電腦",
+  "Versions, {os}, whether the engine runs, how many containers and images": "版本、{os}、引擎是否正在執行、容器和映像檔數量",
+  "Saved. The engine uses these from its next start": "已儲存。引擎下次啟動時生效"
 }

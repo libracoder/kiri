@@ -1932,5 +1932,19 @@
   "Kiri's data is moving already": "ຂໍ້ມູນຂອງ Kiri ກຳລັງຖືກຍ້າຍຢູ່ແລ້ວ",
   "Kiri's data moved to {path}": "ຍ້າຍຂໍ້ມູນຂອງ Kiri ໄປຍັງ {path} ແລ້ວ",
   "Storage is available again": "ບ່ອນຈັດເກັບຂໍ້ມູນພ້ອມໃຊ້ງານອີກຄັ້ງ",
-  "Old data removed": "ລຶບຂໍ້ມູນເກົ່າແລ້ວ"
+  "Old data removed": "ລຶບຂໍ້ມູນເກົ່າແລ້ວ",
+  "A proxy on this computer is reached as {host}.": "ພຣັອກຊີໃນຄອມພິວເຕີນີ້ເຂົ້າເຖິງໄດ້ທີ່ {host}.",
+  "VPNs need no setting: container traffic leaves through Linux.": "VPN ບໍ່ຕ້ອງຕັ້ງຄ່າ: ທຣາຟຟິກຂອງຄອນເທນເນີອອກຜ່ານ Linux.",
+  "Shared with Linux: containers only use them while busy.": "ແບ່ງກັບ Linux: ຄອນເທນເນີໃຊ້ພວກມັນສະເພາະເມື່ອເຮັດວຽກ.",
+  "The most containers and the engine may take. Unused memory stays free on Linux.": "ຂະໜາດສູງສຸດທີ່ຄອນເທນເນີ ແລະ ເອນຈິນອາດໃຊ້. ໜ່ວຍຄວາມຈຳທີ່ບໍ່ໄດ້ໃຊ້ຈະຍັງວ່າງຢູ່ໃນ Linux.",
+  "The engine is off; it starts with these next time.": "ເອນຈິນປິດຢູ່; ມັນຈະເລີ່ມດ້ວຍຄ່າເຫຼົ່ານີ້ໃນຄັ້ງຕໍ່ໄປ.",
+  "Restart engine to apply": "ເລີ່ມເອນຈິນໃໝ່ເພື່ອນຳໃຊ້",
+  "Windows bind-mount file events": "ເຫດການໄຟລ໌ bind-mount ຂອງ Windows",
+  "Forward file changes on Windows drives (like {path}) into containers for live reload. Uses no CPU when idle.": "ສົ່ງຕໍ່ການປ່ຽນແປງໄຟລ໌ໃນໄດຣຟ໌ Windows (ເຊັ່ນ {path}) ເຂົ້າສູ່ຄອນເທນເນີເພື່ອໂຫຼດຄືນໃໝ່ທັນທີ. ບໍ່ໃຊ້ CPU ເມື່ອວ່າງ.",
+  "One text file, redacted, saved to your Desktop. Read it before you share it.": "ໄຟລ໌ຂໍ້ຄວາມດຽວ, ປົກປິດຂໍ້ມູນແລ້ວ, ບັນທຶກໃສ່ Desktop. ອ່ານມັນກ່ອນແບ່ງປັນ.",
+  "The 5 newest crash reports for Kiri": "ລາຍງານການຂັດຂ້ອງ 5 ອັນໃໝ່ສຸດສຳລັບ Kiri",
+  "Kiri and this PC": "Kiri ແລະ PC ນີ້",
+  "Kiri and this computer": "Kiri ແລະ ຄອມພິວເຕີນີ້",
+  "Versions, {os}, whether the engine runs, how many containers and images": "ເວີຊັນ, {os}, ເອນຈິນແລ່ນຢູ່ຫຼືບໍ່, ຈຳນວນຄອນເທນເນີ ແລະ ອິມເມຈ",
+  "Saved. The engine uses these from its next start": "ບັນທຶກແລ້ວ. ເອນຈິນຈະໃຊ້ຄ່າເຫຼົ່ານີ້ຕັ້ງແຕ່ການເລີ່ມຄັ້ງຕໍ່ໄປ"
 }

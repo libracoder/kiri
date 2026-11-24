@@ -1932,5 +1932,19 @@
   "Kiri's data is moving already": "Kirin tietoja siirretään jo",
   "Kiri's data moved to {path}": "Kirin tiedot siirrettiin sijaintiin {path}",
   "Storage is available again": "Tallennussijainti on taas käytettävissä",
-  "Old data removed": "Vanhat tiedot poistettu"
+  "Old data removed": "Vanhat tiedot poistettu",
+  "A proxy on this computer is reached as {host}.": "Tämän tietokoneen välityspalvelimeen päästään osoitteella {host}.",
+  "VPNs need no setting: container traffic leaves through Linux.": "VPN:t eivät vaadi asetuksia: konttien liikenne kulkee Linuxin kautta.",
+  "Shared with Linux: containers only use them while busy.": "Jaettu Linuxin kanssa: kontit käyttävät niitä vain, kun ne ovat työssä.",
+  "The most containers and the engine may take. Unused memory stays free on Linux.": "Enimmäismäärä, jonka kontit ja moottori voivat viedä. Käyttämätön muisti pysyy vapaana Linuxissa.",
+  "The engine is off; it starts with these next time.": "Moottori on pois päältä; se käynnistyy näillä ensi kerralla.",
+  "Restart engine to apply": "Ota käyttöön käynnistämällä moottori uudelleen",
+  "Windows bind-mount file events": "Windowsin liitoskansioiden tiedostotapahtumat",
+  "Forward file changes on Windows drives (like {path}) into containers for live reload. Uses no CPU when idle.": "Välittää tiedostomuutokset Windows-asemilla (kuten {path}) kontteihin välitöntä uudelleenlatausta varten. Ei käytä suoritinta jouten ollessa.",
+  "One text file, redacted, saved to your Desktop. Read it before you share it.": "Yksi sensuroitu tekstitiedosto, joka tallennetaan työpöydällesi. Lue se ennen kuin jaat sen.",
+  "The 5 newest crash reports for Kiri": "5 uusinta Kirin kaatumisraporttia",
+  "Kiri and this PC": "Kiri ja tämä PC",
+  "Kiri and this computer": "Kiri ja tämä tietokone",
+  "Versions, {os}, whether the engine runs, how many containers and images": "Versiot, {os}, onko moottori käynnissä, konttien ja levykuvien määrä",
+  "Saved. The engine uses these from its next start": "Tallennettu. Moottori käyttää näitä seuraavasta käynnistyksestä alkaen"
 }

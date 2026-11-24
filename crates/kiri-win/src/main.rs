@@ -124,6 +124,23 @@ mod ports;
 // Settings → Storage: custom WSL distro location in %LOCALAPPDATA%\Kiri\storage.json.
 #[cfg(any(windows, test))]
 mod storage;
+
+#[cfg(any(windows, test))]
+pub(crate) fn format_try_wait(res: std::io::Result<Option<std::process::ExitStatus>>) -> Option<String> {
+    match res {
+        Ok(None) => None,
+        Ok(Some(status)) => Some(format!("{status}")),
+        Err(e) => Some(format!("{e}")),
+    }
+}
+
+#[cfg(any(windows, test))]
+pub(crate) fn format_wait_status(res: std::io::Result<std::process::ExitStatus>) -> String {
+    match res {
+        Ok(status) => format!("{status}"),
+        Err(e) => format!("{e}"),
+    }
+}
 // Settings → Import from Docker Desktop: the Mac's and Linux's own
 // crates/kiri/src/import.rs, through the docker CLI's contexts.
 #[cfg(windows)]
@@ -250,4 +267,34 @@ fn main() -> std::process::ExitCode {
 fn main() -> std::process::ExitCode {
     eprintln!("kiri-win runs on Windows only");
     std::process::ExitCode::FAILURE
+}
+
+#[cfg(test)]
+mod exit_status_tests {
+    #[test]
+    fn formats_exit_status_with_display_instead_of_nested_debug() {
+        let run = |code: i32| {
+            #[cfg(windows)]
+            let mut cmd = {
+                let mut c = std::process::Command::new("cmd");
+                c.args(["/C", &format!("exit {code}")]);
+                c
+            };
+            #[cfg(not(windows))]
+            let mut cmd = {
+                let mut c = std::process::Command::new("sh");
+                c.args(["-c", &format!("exit {code}")]);
+                c
+            };
+            cmd.status().unwrap()
+        };
+        let status = run(15);
+        let waited = super::format_wait_status(Ok(status));
+        assert!(!waited.contains("Ok(") && !waited.contains("ExitStatus("), "nested Debug leaked: {waited}");
+        assert!(waited.contains("15"), "{waited}");
+        let polled = super::format_try_wait(Ok(Some(status))).unwrap();
+        assert_eq!(polled, waited);
+        assert_eq!(super::format_try_wait(Ok(None)), None);
+        assert_eq!(super::format_wait_status(Err(std::io::Error::other("wait failed"))), "wait failed");
+    }
 }

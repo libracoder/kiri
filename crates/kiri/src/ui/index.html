@@ -1091,7 +1091,7 @@ tr.row:hover td.actions .acts-row { background: linear-gradient(var(--fwd), tran
 .linkbtn { background: none; border: 0; padding: 0; color: var(--blue-light); font: inherit; cursor: pointer; }
 .pref { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 20px; align-items: center; padding-bottom: 18px; border-bottom: 1px solid var(--line); }
 .pref .t { font-weight: 600; }
-.pref .d { color: var(--muted); font-size: var(--fs); grid-column: 1; }
+.pref .d { color: var(--muted); font-size: var(--fs); grid-column: 1; min-width: 0; }
 .pref select { grid-row: 1 / span 2; grid-column: 2; height: 32px; width: 240px; padding: 0 10px; border-radius: 7px; border: 1px solid var(--line);
                background: var(--panel); color: var(--text); font: var(--fs) var(--ui-font); }
 /* Every other <select>: a button and its list (ssOpen); the select stays, hidden. */
@@ -1165,8 +1165,9 @@ tr.row:hover td.actions .acts-row { background: linear-gradient(var(--fwd), tran
 .rports input:disabled { color: var(--faint); }
 .rports .btn { height: 32px; }
 .pref + .rp-notes { margin-top: -6px; }
-.pref .sockhint { display: inline-flex; align-items: center; gap: 4px; flex-wrap: wrap; margin-top: 4px; color: var(--text); }
-.pref .sockhint code { padding: 1px 6px; border-radius: 5px; background: var(--panel); border: 1px solid var(--line); font: var(--fs-mono) var(--mono-font); user-select: text; -webkit-user-select: text; }
+.pref .sockhint { display: inline-flex; align-items: center; gap: 4px; flex-wrap: wrap; max-width: 100%; min-width: 0; margin-top: 4px; color: var(--text); }
+.pref .sockhint code { min-width: 0; max-width: calc(100% - 22px); box-sizing: border-box; overflow-wrap: anywhere; word-break: break-all; padding: 1px 6px; border-radius: 5px; background: var(--panel); border: 1px solid var(--line); font: var(--fs-mono) var(--mono-font); user-select: text; -webkit-user-select: text; }
+.pref .sockhint .copy { flex: none; margin-inline-start: 0; }
 /* Settings → Storage */
 .st-t { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .st-badge { font-size: var(--fs-small); font-weight: 500; padding: 1px 7px; border-radius: 99px; background: color-mix(in srgb, var(--blue) 16%, transparent); color: var(--text); }
@@ -4478,9 +4479,9 @@ function networkPane() {
       <div class="seg" role="group" aria-label="${tr("Proxy")}">${seg}</div></div>
     ${d.mode === "system" && eff.pac ? `<p class="muted">${tr("{os} uses an automatic proxy configuration (PAC) file, which Kiri can't follow. Choose Custom and enter the proxy.", { os: OS })}</p>` : ""}
     ${d.mode === "custom" ? `<div class="pxgrid">${field("http", tr("HTTP proxy"), "proxy.example.com:3128")}${field("https", tr("HTTPS proxy"), "proxy.example.com:3128")}${field("no_proxy", tr("Bypass for"), "*.internal, registry.corp")}</div>` : ""}
-    <div class="pref"><span class="t">${tr("Pass to containers")}</span><span class="d">${tr("New containers get {http}, {https} and {no}.", { http: `<span class="mono">HTTP_PROXY</span>`, https: `<span class="mono">HTTPS_PROXY</span>`, no: `<span class="mono">NO_PROXY</span>` })}${WIN ? "" : ` ${tr("A proxy on this Mac is reached as {host}.", { host: `<span class="mono">host.docker.internal</span>` })}`}</span>
+    <div class="pref"><span class="t">${tr("Pass to containers")}</span><span class="d">${tr("New containers get {http}, {https} and {no}.", { http: `<span class="mono">HTTP_PROXY</span>`, https: `<span class="mono">HTTPS_PROXY</span>`, no: `<span class="mono">NO_PROXY</span>` })}${WIN ? "" : ` ${LINUX ? tr("A proxy on this computer is reached as {host}.", { host: `<span class="mono">host.docker.internal</span>` }) : tr("A proxy on this Mac is reached as {host}.", { host: `<span class="mono">host.docker.internal</span>` })}`}</span>
       <div class="seg" role="group" aria-label="${tr("Pass to containers")}"><button data-pxc="0" aria-pressed="${!d.containers}">${tr("Off")}</button><button data-pxc="1" aria-pressed="${!!d.containers}">${tr("On")}</button></div></div>
-    <div class="res-foot"><span class="muted">${WIN ? tr("Container traffic leaves through WSL's network.") : tr("VPNs need no setting: container traffic leaves through macOS.")}</span><span style="flex:1"></span><button class="btn primary" data-savepx>${tr("Save")}</button></div>
+    <div class="res-foot"><span class="muted">${WIN ? tr("Container traffic leaves through WSL's network.") : LINUX ? tr("VPNs need no setting: container traffic leaves through Linux.") : tr("VPNs need no setting: container traffic leaves through macOS.")}</span><span style="flex:1"></span><button class="btn primary" data-savepx>${tr("Save")}</button></div>
   </div>`;
 }
 
@@ -4541,16 +4542,16 @@ function resourcesPane() {
   const diskStep = minDisk % 8 === 0 && diskVal % 8 === 0 && maxDisk % 8 === 0 ? 8 : 1;
   const pending = r.awake && (r.running_cpus !== r.cpus || Math.abs(r.running_memory_mib - r.memory_mib) > 64 || (hasDisk && r.running_disk_gb != null && r.running_disk_gb !== r.disk_gb));
   return `<div class="pane"><h3>${tr("Resources")}</h3>
-    <div class="pref"><span class="t">${tr("CPUs")}</span><span class="d">${tr("Shared with {os}: the VM only uses them while containers are busy.", { os: OS })}</span>
+    <div class="pref"><span class="t">${tr("CPUs")}</span><span class="d">${LINUX ? tr("Shared with Linux: containers only use them while busy.") : tr("Shared with {os}: the VM only uses them while containers are busy.", { os: OS })}</span>
       <div class="range"><input type="range" id="res-cpus" min="1" max="${r.max_cpus}" step="1" value="${d.cpus}" aria-label="${tr("CPUs")}" style="--fill:${rangeFill(d.cpus, 1, r.max_cpus)}"><span class="num" id="res-cpus-v">${cpuText(d.cpus)}</span></div></div>
-    <div class="pref"><span class="t">${tr("Memory")}</span><span class="d">${tr("The most the VM may take. It uses memory only as containers need it and gives the rest back to {os}.", { os: OS })}</span>
+    <div class="pref"><span class="t">${tr("Memory")}</span><span class="d">${LINUX ? tr("The most containers and the engine may take. Unused memory stays free on Linux.") : tr("The most the VM may take. It uses memory only as containers need it and gives the rest back to {os}.", { os: OS })}</span>
       <div class="range"><input type="range" id="res-mem" min="1024" max="${maxGb * 1024}" step="1024" value="${Math.min(d.memory_mib, maxGb * 1024)}" aria-label="${tr("Memory")}" style="--fill:${rangeFill(Math.min(d.memory_mib, maxGb * 1024), 1024, maxGb * 1024)}"><span class="num" id="res-mem-v">${gb(d.memory_mib)}</span></div></div>
     ${hasDisk ? `<div class="pref"><span class="t">${tr("Disk image size")}</span><span class="d">${tr("The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.", { os: OS })}</span>
       <div class="range"><input type="range" id="res-disk" min="${minDisk}" max="${maxDisk}" step="${diskStep}" value="${diskVal}" aria-label="${tr("Disk image size")}" style="--fill:${rangeFill(diskVal, minDisk, maxDisk)}"><span class="num" id="res-disk-v">${diskGb(diskVal)}</span></div></div>` : ""}
     ${r.overridden ? `<p class="muted">${hasDisk ? tr("KIRI_CPUS, KIRI_MEMORY_MIB or KIRI_DISK_GB is set for the daemon, and it takes precedence over these.") : tr("KIRI_CPUS or KIRI_MEMORY_MIB is set for the daemon, and it takes precedence over these.")}</p>` : ""}
-    <div class="res-foot"><span class="muted">${r.awake ? (hasDisk ? tr("Running now with {cpus}, up to {mem}, and a {disk} disk.", { cpus: cpuText(r.running_cpus), mem: gb(r.running_memory_mib), disk: diskGb(r.running_disk_gb ?? r.disk_gb) }) : tr("Running now with {cpus} and up to {mem}.", { cpus: cpuText(r.running_cpus), mem: gb(r.running_memory_mib) })) : tr("The VM is asleep; it starts with these next time.")}</span>
+    <div class="res-foot"><span class="muted">${r.awake ? (hasDisk ? tr("Running now with {cpus}, up to {mem}, and a {disk} disk.", { cpus: cpuText(r.running_cpus), mem: gb(r.running_memory_mib), disk: diskGb(r.running_disk_gb ?? r.disk_gb) }) : tr("Running now with {cpus} and up to {mem}.", { cpus: cpuText(r.running_cpus), mem: gb(r.running_memory_mib) })) : LINUX ? tr("The engine is off; it starts with these next time.") : tr("The VM is asleep; it starts with these next time.")}</span>
       <span style="flex:1"></span>
-      ${pending ? `<button class="btn" id="res-restart" data-restartvm>${tr("Restart VM to apply")}</button>` : ""}
+      ${pending ? `<button class="btn" id="res-restart" data-restartvm>${LINUX ? tr("Restart engine to apply") : tr("Restart VM to apply")}</button>` : ""}
       <button class="btn primary" id="res-save" data-saveres${resChanged() ? "" : " disabled"}>${tr("Save")}</button></div>
     ${pending ? `<p class="muted">${esc(r.restart_note || tr("Restarting stops the running containers; start them again afterwards."))}</p>` : ""}
   </div>`;
@@ -4558,12 +4559,18 @@ function resourcesPane() {
 
 function wslPane() {
   const list = ui.res?.wsl_distros;
-  if (!WIN && !Array.isArray(list)) return "";
-  if (!Array.isArray(list)) return `<div class="pane"><h3>${tr("WSL integration")}</h3><p class="muted">${tr("Loading…")}</p></div>`;
-  if (!list.length) return `<div class="pane"><h3>${tr("WSL integration")}</h3><p class="muted">${tr("No other WSL distros installed.")}</p></div>`;
-  const rows = list.map((w) => `<div class="pref"><span class="t">${esc(w.name)}</span><span class="d">${tr("docker, Compose and Docker-socket tools reach Kiri")}</span>
-    <div class="seg" role="group" aria-label="${esc(w.name)}"><button data-wsldistro="${esc(w.name)}" data-wslon="0" aria-pressed="${!w.on}">${tr("Off")}</button><button data-wsldistro="${esc(w.name)}" data-wslon="1" aria-pressed="${!!w.on}">${tr("On")}</button></div></div>`).join("");
-  return `<div class="pane"><h3>${tr("WSL integration")}</h3>${rows}</div>`;
+  const hasWatch = prefs.watchBindMounts != null || ui.res?.watch_bind_mounts != null;
+  if (!WIN && !Array.isArray(list) && !hasWatch) return "";
+  const watchOn = !!(prefs.watchBindMounts ?? ui.res?.watch_bind_mounts);
+  const watchRow = `<div class="pref"><span class="t">${tr("Windows bind-mount file events")}</span><span class="d">${tr("Forward file changes on Windows drives (like {path}) into containers for live reload. Uses no CPU when idle.", { path: '<span class="mono">C:\\</span>' })}</span>
+    <div class="seg" role="group" aria-label="${tr("Windows bind-mount file events")}"><button data-watchbinds="0" aria-pressed="${!watchOn}">${tr("Off")}</button><button data-watchbinds="1" aria-pressed="${watchOn}">${tr("On")}</button></div></div>`;
+  const distros = Array.isArray(list)
+    ? (list.length
+      ? list.map((w) => `<div class="pref"><span class="t">${esc(w.name)}</span><span class="d">${tr("docker, Compose and Docker-socket tools reach Kiri")}</span>
+    <div class="seg" role="group" aria-label="${esc(w.name)}"><button data-wsldistro="${esc(w.name)}" data-wslon="0" aria-pressed="${!w.on}">${tr("Off")}</button><button data-wsldistro="${esc(w.name)}" data-wslon="1" aria-pressed="${!!w.on}">${tr("On")}</button></div></div>`).join("")
+      : `<p class="muted">${tr("No other WSL distros installed.")}</p>`)
+    : WIN ? `<p class="muted">${tr("Loading…")}</p>` : "";
+  return `<div class="pane"><h3>${tr("WSL integration")}</h3>${watchRow}${distros}</div>`;
 }
 
 /* Settings → Storage: where Kiri keeps images, containers, and volumes. */
@@ -8161,10 +8168,10 @@ function drawReport() {
   const item = (t, d) => `<div class="rp-item">${dgIcon("check")}<span class="t">${t}</span><span class="d">${d}</span></div>`;
   scrim.innerHTML = `<div class="dialog rp-dialog" role="dialog" aria-modal="true" aria-labelledby="rp-t">
     <h3 id="rp-t">${send_ ? tr("Send a report to Kiri") : tr("Create a diagnostics report")}</h3>
-    <p>${send_ ? tr("We get the file below, redacted, and you get an ID to quote when you write to us. If you're signed in to Kiri Cloud, it says it's from you, so we can reply.") : tr("One text file, redacted, saved to your Desktop and shown in Finder. Read it before you share it.")}</p>
+    <p>${send_ ? tr("We get the file below, redacted, and you get an ID to quote when you write to us. If you're signed in to Kiri Cloud, it says it's from you, so we can reply.") : WIN || LINUX ? tr("One text file, redacted, saved to your Desktop. Read it before you share it.") : tr("One text file, redacted, saved to your Desktop and shown in Finder. Read it before you share it.")}</p>
     <div class="rp-list">${item(tr("Kiri's logs"), tr("The last 300 lines from the window, the engine and kiri commands, and the engine's own output"))}
-      ${item(tr("Crash reports"), tr("The 5 newest, and macOS's own crash reports for Kiri from the last 30 days"))}
-      ${item(tr("Kiri and this Mac"), tr("Versions, macOS, whether the engine runs, how many containers and images"))}
+      ${item(tr("Crash reports"), WIN || LINUX ? tr("The 5 newest crash reports for Kiri") : tr("The 5 newest, and macOS's own crash reports for Kiri from the last 30 days"))}
+      ${item(WIN ? tr("Kiri and this PC") : LINUX ? tr("Kiri and this computer") : tr("Kiri and this Mac"), WIN || LINUX ? tr("Versions, {os}, whether the engine runs, how many containers and images", { os: OS }) : tr("Versions, macOS, whether the engine runs, how many containers and images"))}
       <label class="rp-item opt"><input type="checkbox" data-rpopt${rp.containers ? " checked" : ""}${rp.state ? " disabled" : ""}><span class="t">${tr("Container list")}</span><span class="d">${tr("Names, images and status. Not their files, logs or environment.")}</span></label></div>
     <div class="rp-red">${dgIcon("shieldcheck")}<span>${tr("Your home folder's path, tokens, passwords and other secrets are blanked before anything is written.")}</span></div>
     ${done ? `<div class="rp-id"><span class="lab">${tr("Report ID")}</span><span class="val">${esc(rp.id)}</span><button class="btn sm" data-rpcopy>${dgIcon("copy")}${tr("Copy")}</button></div>` : ""}
@@ -8458,7 +8465,7 @@ window.kiri = {
         if (ui.view === "settings") render();
         break;
       }
-      case "resources": ui.res = e; ui.resDraft = { cpus: e.cpus, memory_mib: e.memory_mib, ...(e.disk_gb != null ? { disk_gb: e.disk_gb } : {}) }; if (ui.view === "settings") render(); break;
+      case "resources": ui.res = e; if (e.watch_bind_mounts != null && prefs.watchBindMounts == null) prefs.watchBindMounts = !!e.watch_bind_mounts; ui.resDraft = { cpus: e.cpus, memory_mib: e.memory_mib, ...(e.disk_gb != null ? { disk_gb: e.disk_gb } : {}) }; if (ui.view === "settings") render(); break;
       case "storage": {
         const wasUnavail = ui.storage?.state === "unavailable";
         ui.storage = e;
@@ -8611,6 +8618,10 @@ $("content").addEventListener("click", (ev) => {
   else if ((el = t("[data-regsave]"))) { ui.regSaving = el.dataset.regsave; send("setregistryconfig", { value: { [REG_KEY[el.dataset.regsave]]: ui.regDraft[el.dataset.regsave] } }); }
   else if ((el = t("[data-saverp]")) && ui.rports && !ui.rports.error) send("setrouterports", { value: { http: +(ui.rpDraft.http ?? ui.rports.http.port), https: +(ui.rpDraft.https ?? ui.rports.https.port) } });
   else if ((el = t("[data-saveres]"))) send("setresources", { value: ui.resDraft });
+  else if ((el = t("[data-watchbinds]"))) {
+    const on = el.dataset.watchbinds === "1";
+    if (!!(prefs.watchBindMounts ?? ui.res?.watch_bind_mounts) !== on) setPref("watchBindMounts", on);
+  }
   else if ((el = t("[data-wsldistro]"))) {
     const name = el.dataset.wsldistro, on = el.dataset.wslon === "1";
     const cur = ui.res?.wsl_distros?.find((d) => d.name === name);

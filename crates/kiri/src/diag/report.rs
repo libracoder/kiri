@@ -62,7 +62,9 @@ const CRASHES: usize = 5;
 /// Log lines a crash upload carries: its part's last ones before it.
 const CRASH_LOG_LINES: usize = 200;
 const CRASH_BUDGET: usize = 48 << 10;
+#[cfg(any(target_os = "macos", test))]
 const MAC_REPORTS: usize = 3;
+#[cfg(any(target_os = "macos", test))]
 const MAC_REPORT_BUDGET: usize = 24 << 10;
 
 pub fn run(args: &[String]) -> io::Result<()> {
@@ -388,9 +390,35 @@ fn crash_name(name: &str) -> Option<(u64, Part)> {
     Some((secs, part))
 }
 
-/// The report's text, redacted. `home` holds `Library/Logs/DiagnosticReports`;
-/// `state` is `~/.kiri`.
+#[cfg(any(target_os = "macos", test))]
+fn append_macos_crash_reports(s: &mut String, home: &Path) {
+    // What macOS wrote down itself: crashes our hook can't see (a signal, a
+    // hang the system killed, an abort inside a framework).
+    let reports = home.join("Library/Logs/DiagnosticReports");
+    let month = SystemTime::now() - Duration::from_secs(30 * 86_400);
+    let ips: Vec<_> = newest(&reports, |n| n.to_ascii_lowercase().starts_with("kiri") && n.ends_with(".ips")).into_iter().filter(|(_, t)| *t >= month).collect();
+    let _ = writeln!(s, "\n==== macOS crash reports ({}, last 30 days: {}) ====", reports.display(), ips.len());
+    for (path, _) in ips.iter().take(MAC_REPORTS) {
+        let text = String::from_utf8_lossy(&std::fs::read(path).unwrap_or_default()).into_owned();
+        let _ = writeln!(s, "--- {} ---", path.file_name().unwrap_or_default().to_string_lossy());
+        s.push_str(&first_bytes(&text, MAC_REPORT_BUDGET));
+        s.push('\n');
+    }
+}
+
+/// The report's text, redacted. `home` holds `Library/Logs/DiagnosticReports`
+/// on macOS; `state` is `~/.kiri`.
 pub fn assemble(home: &Path, state: &Path, facts: &Facts, redactor: &Redactor) -> String {
+    #[cfg(target_os = "macos")]
+    return assemble_inner(home, state, facts, redactor, true);
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = home;
+        assemble_inner(home, state, facts, redactor, false)
+    }
+}
+
+fn assemble_inner(home: &Path, state: &Path, facts: &Facts, redactor: &Redactor, include_macos_reports: bool) -> String {
     let mut s = String::new();
     let _ = writeln!(s, "Kiri diagnostics report");
     let _ = writeln!(s, "Created:  {}", time::rfc3339(facts.created));
@@ -445,18 +473,12 @@ pub fn assemble(home: &Path, state: &Path, facts: &Facts, redactor: &Redactor) -
         s.push_str(&first_bytes(&text, CRASH_BUDGET));
     }
 
-    // What macOS wrote down itself: crashes our hook can't see (a signal, a
-    // hang the system killed, an abort inside a framework).
-    let reports = home.join("Library/Logs/DiagnosticReports");
-    let month = SystemTime::now() - Duration::from_secs(30 * 86_400);
-    let ips: Vec<_> = newest(&reports, |n| n.to_ascii_lowercase().starts_with("kiri") && n.ends_with(".ips")).into_iter().filter(|(_, t)| *t >= month).collect();
-    let _ = writeln!(s, "\n==== macOS crash reports ({}, last 30 days: {}) ====", reports.display(), ips.len());
-    for (path, _) in ips.iter().take(MAC_REPORTS) {
-        let text = String::from_utf8_lossy(&std::fs::read(path).unwrap_or_default()).into_owned();
-        let _ = writeln!(s, "--- {} ---", path.file_name().unwrap_or_default().to_string_lossy());
-        s.push_str(&first_bytes(&text, MAC_REPORT_BUDGET));
-        s.push('\n');
+    #[cfg(any(target_os = "macos", test))]
+    if include_macos_reports {
+        append_macos_crash_reports(&mut s, home);
     }
+    #[cfg(not(any(target_os = "macos", test)))]
+    let _ = (home, include_macos_reports);
     redactor.apply(&s)
 }
 
@@ -955,7 +977,8 @@ mod tests {
         std::fs::write(reports.join("kiri-2026-10-28-094107.ips"), format!("{{\"app_name\":\"kiri\",\"crashReporterKey\":\"ABCD-1234\"}}\n{{\"procPath\":\"{h}/Applications/Kiri.app\"}}")).unwrap();
         std::fs::write(reports.join("Safari-2026-10-28-094107.ips"), "not ours").unwrap();
         let facts = Facts { engine: "not running".into(), crash_reports: false, created: UNIX_EPOCH + Duration::from_secs(1_792_800_000), containers: Some("web  nginx:alpine  Up 2 hours\n".into()), vm_network: None };
-        let text = assemble(&home, &state, &facts, &Redactor::new(Some(h.clone()), Vec::new()));
+        let redactor = Redactor::new(Some(h.clone()), Vec::new());
+        let text = assemble(&home, &state, &facts, &redactor);
 
         assert!(text.starts_with("Kiri diagnostics report\nCreated:  2026-10-24T00:00:00"), "{text}");
         assert!(text.contains("Engine:   not running") && text.contains("Crash reports: not sent automatically"));
@@ -967,7 +990,16 @@ mod tests {
         assert!(text.contains("==== Containers (names, images and status only) ====\nweb  nginx:alpine  Up 2 hours\n"));
         assert!(text.contains("2 in all") && text.contains("--- 1792800000-daemon.txt ---") && text.contains("boom with Bearer [redacted]"));
         assert!(text.find("1792800000-daemon").unwrap() < text.find("1792700000-ui").unwrap(), "newest crash first");
-        assert!(text.contains("--- kiri-2026-10-28-094107.ips ---") && text.contains("~/Applications/Kiri.app") && !text.contains("Safari"));
+        let mac_text = assemble_inner(&home, &state, &facts, &redactor, true);
+        assert!(mac_text.contains("--- kiri-2026-10-28-094107.ips ---") && mac_text.contains("~/Applications/Kiri.app") && !mac_text.contains("Safari"));
+        assert!(!mac_text.contains("ABCD-1234") && !mac_text.contains(&h), "{mac_text}");
+        let non_mac_text = assemble_inner(&home, &state, &facts, &redactor, false);
+        assert!(!non_mac_text.contains("macOS crash reports") && !non_mac_text.contains("DiagnosticReports") && !non_mac_text.contains(".ips"), "{non_mac_text}");
+        if cfg!(target_os = "macos") {
+            assert!(text.contains("==== macOS crash reports") && text.contains("--- kiri-2026-10-28-094107.ips ---"), "{text}");
+        } else {
+            assert!(!text.contains("macOS crash reports") && !text.contains("DiagnosticReports") && !text.contains(".ips"), "{text}");
+        }
         assert!(!text.contains("ABCD-1234") && !text.contains(&h), "{text}");
         assert!(text.len() < MAX_BODY);
         let _ = std::fs::remove_dir_all(&home);

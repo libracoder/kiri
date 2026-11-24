@@ -1932,5 +1932,19 @@
   "Kiri's data is moving already": "Данные Kiri уже переносятся",
   "Kiri's data moved to {path}": "Данные Kiri перенесены в {path}",
   "Storage is available again": "Хранилище снова доступно",
-  "Old data removed": "Старые данные удалены"
+  "Old data removed": "Старые данные удалены",
+  "A proxy on this computer is reached as {host}.": "Прокси на этом компьютере доступен как {host}.",
+  "VPNs need no setting: container traffic leaves through Linux.": "VPN не требуют настройки: трафик контейнеров выходит через Linux.",
+  "Shared with Linux: containers only use them while busy.": "Общие с Linux: контейнеры используют их, только пока заняты работой.",
+  "The most containers and the engine may take. Unused memory stays free on Linux.": "Максимум, который могут занять контейнеры и движок. Неиспользуемая память остаётся свободной в Linux.",
+  "The engine is off; it starts with these next time.": "Движок выключен; при следующем запуске он применит эти настройки.",
+  "Restart engine to apply": "Перезапустить движок, чтобы применить",
+  "Windows bind-mount file events": "События файлов примонтированных папок Windows",
+  "Forward file changes on Windows drives (like {path}) into containers for live reload. Uses no CPU when idle.": "Передаёт изменения файлов на дисках Windows (например, {path}) в контейнеры для горячей перезагрузки. Не нагружает процессор в простое.",
+  "One text file, redacted, saved to your Desktop. Read it before you share it.": "Один текстовый файл, очищенный от секретов и личных данных, сохраняется на Рабочий стол. Прочитайте его, прежде чем кому-то отправлять.",
+  "The 5 newest crash reports for Kiri": "5 самых свежих отчётов о сбоях Kiri",
+  "Kiri and this PC": "Kiri и этот ПК",
+  "Kiri and this computer": "Kiri и этот компьютер",
+  "Versions, {os}, whether the engine runs, how many containers and images": "Версии, {os}, работает ли движок, количество контейнеров и образов",
+  "Saved. The engine uses these from its next start": "Сохранено. Движок применит эти настройки при следующем запуске"
 }

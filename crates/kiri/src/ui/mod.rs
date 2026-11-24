@@ -897,7 +897,11 @@ fn resources(save: Option<serde_json::Value>) {
         // While the VM runs, the toast offers to restart it now.
         Some(Ok(r)) if r.ok() => {
             let awake = now.as_ref().is_ok_and(|v| v["awake"] == true);
-            emit(serde_json::json!({"type": "notice", "kind": "ok", "text": tr("Saved. The VM uses these from its next start"), "act": if awake { "restartvm" } else { "" }}).to_string());
+            #[cfg(target_os = "linux")]
+            let text = tr("Saved. The engine uses these from its next start");
+            #[cfg(not(target_os = "linux"))]
+            let text = tr("Saved. The VM uses these from its next start");
+            emit(serde_json::json!({"type": "notice", "kind": "ok", "text": text, "act": if awake { "restartvm" } else { "" }}).to_string());
         }
         Some(Ok(r)) => emit(notice("error", &r.error())),
         Some(Err(e)) => emit(notice("error", &e.to_string())),

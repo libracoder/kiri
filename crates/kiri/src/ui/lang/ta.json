@@ -1932,5 +1932,19 @@
   "Kiri's data is moving already": "Kiri தரவு ஏற்கனவே நகர்த்தப்படுகிறது",
   "Kiri's data moved to {path}": "Kiri தரவு {path} க்கு நகர்த்தப்பட்டது",
   "Storage is available again": "சேமிப்பகம் மீண்டும் கிடைக்கிறது",
-  "Old data removed": "பழைய தரவு அகற்றப்பட்டது"
+  "Old data removed": "பழைய தரவு அகற்றப்பட்டது",
+  "A proxy on this computer is reached as {host}.": "இந்தக் கணினியில் உள்ள ப்ராக்ஸியை {host} என அணுகலாம்.",
+  "VPNs need no setting: container traffic leaves through Linux.": "VPN-களுக்கு அமைப்பு தேவையில்லை: கன்டெய்னர் டிராஃபிக் Linux வழியாக வெளியேறும்.",
+  "Shared with Linux: containers only use them while busy.": "Linux உடன் பகிரப்படுகிறது: கன்டெய்னர்கள் பிஸியாக இருக்கும்போது மட்டுமே இவற்றைப் பயன்படுத்தும்.",
+  "The most containers and the engine may take. Unused memory stays free on Linux.": "கன்டெய்னர்களும் இன்ஜினும் எடுக்கக்கூடிய அதிகபட்சம். பயன்படுத்தப்படாத நினைவகம் Linux-இல் காலியாக இருக்கும்.",
+  "The engine is off; it starts with these next time.": "இன்ஜின் ஆஃப் ஆக உள்ளது; அடுத்த முறை இவற்றுடன் தொடங்கும்.",
+  "Restart engine to apply": "பொருத்த இன்ஜினை மறுதொடக்கு",
+  "Windows bind-mount file events": "Windows பைண்ட்-மவுண்ட் கோப்பு நிகழ்வுகள்",
+  "Forward file changes on Windows drives (like {path}) into containers for live reload. Uses no CPU when idle.": "நேரடி மறுஏற்றத்திற்காக Windows டிரைவ்களில் ({path} போன்றவை) உள்ள கோப்பு மாற்றங்களை கன்டெய்னர்களுக்கு அனுப்பும். ஓய்வில் CPU பயன்படுத்தாது.",
+  "One text file, redacted, saved to your Desktop. Read it before you share it.": "ஒரு உரைக் கோப்பு, முக்கியத் தகவல் மறைக்கப்பட்டு, உங்கள் Desktop-இல் சேமிக்கப்படும். பகிரும் முன் படிக்கவும்.",
+  "The 5 newest crash reports for Kiri": "Kiri-க்கான புதிய 5 செயலிழப்பு அறிக்கைகள்",
+  "Kiri and this PC": "Kiri-யும் இந்த PC-யும்",
+  "Kiri and this computer": "Kiri-யும் இந்தக் கணினியும்",
+  "Versions, {os}, whether the engine runs, how many containers and images": "பதிப்புகள், {os}, இன்ஜின் இயங்குகிறதா, எத்தனை கன்டெய்னர்கள், இமேஜ்கள்",
+  "Saved. The engine uses these from its next start": "சேமிக்கப்பட்டது. இன்ஜின் அடுத்த தொடக்கத்திலிருந்து இவற்றைப் பயன்படுத்தும்"
 }

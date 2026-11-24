@@ -707,6 +707,7 @@ pub fn serve_unavailable(stream: UnixStream, missing: &Path) -> io::Result<()> {
         if req.too_large() {
             return http::refuse_too_large(&req, &mut w, &mut r).or(Ok(()));
         }
+        http::serving(&req);
         match (req.method.as_str(), req.path.as_str()) {
             ("GET" | "HEAD", "/_ping") => http::respond(&mut w, 200, "text/plain; charset=utf-8", if req.method == "HEAD" { b"" } else { b"OK" })?,
             ("GET", "/version") => http::json(&mut w, 200, &super::api::version().to_string())?,
@@ -997,6 +998,27 @@ mod tests {
         assert_eq!(s["path"], gone.to_string_lossy().as_ref());
         assert!(s["used"].is_null() && s["free"].is_null());
         assert!(!gone.exists());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Requests refused with 503 while storage is unavailable record their
+    /// HTTP method and path on the connection thread so failure logs carry
+    /// `method=GET path=/containers/json status=503` instead of empty fields.
+    #[test]
+    fn serve_unavailable_populates_method_and_path_on_503() {
+        use std::io::{Read, Write};
+        let d = scratch("unavailable-503");
+        let gone = d.join("Volumes/External/kiri");
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client
+            .write_all(b"GET /v1.47/containers/json HTTP/1.1\r\nHost: docker\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        serve_unavailable(server, &gone).unwrap();
+        assert_eq!(http::current_serving(), ("GET".to_owned(), "/containers/json".to_owned()));
+        let mut resp = String::new();
+        client.read_to_string(&mut resp).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 503 "), "{resp}");
+        assert!(resp.contains("Connection: close\r\n"), "{resp}");
         let _ = std::fs::remove_dir_all(&d);
     }
 }

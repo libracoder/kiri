@@ -1932,5 +1932,19 @@
   "Kiri's data is moving already": "Los datos de Kiri ya se están moviendo",
   "Kiri's data moved to {path}": "Los datos de Kiri se movieron a {path}",
   "Storage is available again": "El almacenamiento está disponible de nuevo",
-  "Old data removed": "Datos anteriores eliminados"
+  "Old data removed": "Datos anteriores eliminados",
+  "A proxy on this computer is reached as {host}.": "Un proxy en este equipo se alcanza como {host}.",
+  "VPNs need no setting: container traffic leaves through Linux.": "Las VPN no necesitan ajustes: el tráfico de los contenedores sale por Linux.",
+  "Shared with Linux: containers only use them while busy.": "Compartidos con Linux: los contenedores solo los usan mientras están ocupados.",
+  "The most containers and the engine may take. Unused memory stays free on Linux.": "Lo máximo que pueden ocupar los contenedores y el motor. La memoria sin usar queda libre en Linux.",
+  "The engine is off; it starts with these next time.": "El motor está apagado; se inicia con estos valores la próxima vez.",
+  "Restart engine to apply": "Reiniciar el motor para aplicar",
+  "Windows bind-mount file events": "Eventos de archivos en montajes de Windows",
+  "Forward file changes on Windows drives (like {path}) into containers for live reload. Uses no CPU when idle.": "Reenvía cambios de archivos en unidades de Windows (como {path}) a los contenedores para recarga en vivo. No usa CPU en reposo.",
+  "One text file, redacted, saved to your Desktop. Read it before you share it.": "Un archivo de texto, censurado, guardado en tu Escritorio. Léelo antes de compartirlo.",
+  "The 5 newest crash reports for Kiri": "Los 5 informes de fallos más recientes de Kiri",
+  "Kiri and this PC": "Kiri y este PC",
+  "Kiri and this computer": "Kiri y este equipo",
+  "Versions, {os}, whether the engine runs, how many containers and images": "Versiones, {os}, si el motor está en marcha, cuántos contenedores e imágenes",
+  "Saved. The engine uses these from its next start": "Guardado. El motor los usa a partir de su próximo inicio"
 }

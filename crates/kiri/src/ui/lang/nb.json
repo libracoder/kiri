@@ -1932,5 +1932,19 @@
   "Kiri's data is moving already": "Kiris data flyttes allerede",
   "Kiri's data moved to {path}": "Kiris data ble flyttet til {path}",
   "Storage is available again": "Lagring er tilgjengelig igjen",
-  "Old data removed": "Gamle data fjernet"
+  "Old data removed": "Gamle data fjernet",
+  "A proxy on this computer is reached as {host}.": "En proxy på denne datamaskinen nås som {host}.",
+  "VPNs need no setting: container traffic leaves through Linux.": "VPN-er trenger ingen innstilling: containertrafikk går ut gjennom Linux.",
+  "Shared with Linux: containers only use them while busy.": "Delt med Linux: containere bruker dem bare mens de er i arbeid.",
+  "The most containers and the engine may take. Unused memory stays free on Linux.": "Det meste containere og motoren kan ta. Ubrukt minne forblir ledig på Linux.",
+  "The engine is off; it starts with these next time.": "Motoren er av; den starter med disse neste gang.",
+  "Restart engine to apply": "Start motoren på nytt for å bruke",
+  "Windows bind-mount file events": "Filhendelser for Windows-bindmonteringer",
+  "Forward file changes on Windows drives (like {path}) into containers for live reload. Uses no CPU when idle.": "Videresender filendringer på Windows-stasjoner (som {path}) til containere for direkte omlasting. Bruker ingen CPU i hvile.",
+  "One text file, redacted, saved to your Desktop. Read it before you share it.": "Én tekstfil, sensurert, lagret på skrivebordet. Les den før du deler den.",
+  "The 5 newest crash reports for Kiri": "De 5 nyeste krasjrapportene for Kiri",
+  "Kiri and this PC": "Kiri og denne PC-en",
+  "Kiri and this computer": "Kiri og denne datamaskinen",
+  "Versions, {os}, whether the engine runs, how many containers and images": "Versjoner, {os}, om motoren kjører, hvor mange containere og bilder",
+  "Saved. The engine uses these from its next start": "Lagret. Motoren bruker disse fra neste start"
 }

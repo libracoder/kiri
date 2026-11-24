@@ -1932,5 +1932,19 @@
   "Kiri's data is moving already": "Të dhënat e Kiri po zhvendosen tashmë",
   "Kiri's data moved to {path}": "Të dhënat e Kiri u zhvendosën në {path}",
   "Storage is available again": "Ruajtja është sërish e disponueshme",
-  "Old data removed": "Të dhënat e vjetra u hoqën"
+  "Old data removed": "Të dhënat e vjetra u hoqën",
+  "A proxy on this computer is reached as {host}.": "Një proxy në këtë kompjuter arrihet si {host}.",
+  "VPNs need no setting: container traffic leaves through Linux.": "VPN-të nuk kërkojnë cilësim: trafiku i kontejnerëve del përmes Linux.",
+  "Shared with Linux: containers only use them while busy.": "Të përbashkëta me Linux: kontejnerët i përdorin vetëm kur janë të zënë.",
+  "The most containers and the engine may take. Unused memory stays free on Linux.": "Maksimumi që mund të marrin kontejnerët dhe motori. Memoria e papërdorur mbetet e lirë në Linux.",
+  "The engine is off; it starts with these next time.": "Motori është i fikur; herën tjetër niset me këto.",
+  "Restart engine to apply": "Rinis motorin për ta zbatuar",
+  "Windows bind-mount file events": "Ngjarjet e skedarëve të montimeve Windows",
+  "Forward file changes on Windows drives (like {path}) into containers for live reload. Uses no CPU when idle.": "Përcjell ndryshimet e skedarëve në disqet Windows (si {path}) te kontejnerët për ringarkim të drejtpërdrejtë. Nuk përdor CPU kur rri kot.",
+  "One text file, redacted, saved to your Desktop. Read it before you share it.": "Një skedar teksti, i redaktuar, i ruajtur në Desktop. Lexojeni para se ta ndani.",
+  "The 5 newest crash reports for Kiri": "5 raportet më të reja të rrëzimeve për Kiri",
+  "Kiri and this PC": "Kiri dhe ky PC",
+  "Kiri and this computer": "Kiri dhe ky kompjuter",
+  "Versions, {os}, whether the engine runs, how many containers and images": "Versionet, {os}, nëse motori është në punë, sa kontejnerë dhe imazhe",
+  "Saved. The engine uses these from its next start": "U ruajt. Motori i përdor që nga nisja e tij e ardhshme"
 }

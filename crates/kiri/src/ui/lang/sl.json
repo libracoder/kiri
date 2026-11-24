@@ -1932,5 +1932,19 @@
   "Kiri's data is moving already": "Podatki Kiri se že premikajo",
   "Kiri's data moved to {path}": "Podatki Kiri so bili premaknjeni v {path}",
   "Storage is available again": "Shramba je spet na voljo",
-  "Old data removed": "Stari podatki odstranjeni"
+  "Old data removed": "Stari podatki odstranjeni",
+  "A proxy on this computer is reached as {host}.": "Proxy na tem računalniku je dosegljiv kot {host}.",
+  "VPNs need no setting: container traffic leaves through Linux.": "VPN-ji ne potrebujejo nastavitve: promet kontejnerjev gre ven prek Linuxa.",
+  "Shared with Linux: containers only use them while busy.": "Deljeno z Linuxom: kontejnerji jih uporabljajo le, ko so zaposleni.",
+  "The most containers and the engine may take. Unused memory stays free on Linux.": "Največ, kar lahko zasedejo kontejnerji in pogon. Neporabljen pomnilnik ostane prost v Linuxu.",
+  "The engine is off; it starts with these next time.": "Pogon je izklopljen; naslednjič se zažene s temi nastavitvami.",
+  "Restart engine to apply": "Za uveljavitev znova zaženite pogon",
+  "Windows bind-mount file events": "Dogodki datotek priklopljenih map Windows",
+  "Forward file changes on Windows drives (like {path}) into containers for live reload. Uses no CPU when idle.": "Posreduje spremembe datotek na pogonih Windows (kot je {path}) v kontejnerje za sprotno osveževanje. V mirovanju ne porablja CPE.",
+  "One text file, redacted, saved to your Desktop. Read it before you share it.": "Ena besedilna datoteka, z odstranjenimi občutljivimi podatki, shranjena na namizje. Preberite jo, preden jo delite.",
+  "The 5 newest crash reports for Kiri": "5 najnovejših poročil o zrušitvah Kirija",
+  "Kiri and this PC": "Kiri in ta PC",
+  "Kiri and this computer": "Kiri in ta računalnik",
+  "Versions, {os}, whether the engine runs, how many containers and images": "Različice, {os}, ali pogon teče, koliko je kontejnerjev in slik",
+  "Saved. The engine uses these from its next start": "Shranjeno. Pogon jih uporablja od naslednjega zagona"
 }

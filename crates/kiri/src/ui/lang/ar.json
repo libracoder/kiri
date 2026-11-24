@@ -1932,5 +1932,19 @@
   "Kiri's data is moving already": "بيانات Kiri قيد النقل بالفعل",
   "Kiri's data moved to {path}": "تم نقل بيانات Kiri إلى {path}",
   "Storage is available again": "التخزين متاح مرة أخرى",
-  "Old data removed": "تمت إزالة البيانات القديمة"
+  "Old data removed": "تمت إزالة البيانات القديمة",
+  "A proxy on this computer is reached as {host}.": "الوكيل الموجود على هذا الكمبيوتر عنوانه {host}.",
+  "VPNs need no setting: container traffic leaves through Linux.": "شبكات VPN لا تحتاج إلى أي إعداد: حركة بيانات الحاويات تخرج عبر Linux.",
+  "Shared with Linux: containers only use them while busy.": "مشتركة مع Linux: لا تستخدمها الحاويات إلا حين تنشغل.",
+  "The most containers and the engine may take. Unused memory stays free on Linux.": "أقصى ما قد تأخذه الحاويات والمحرّك. الذاكرة غير المستخدمة تبقى حرّة على Linux.",
+  "The engine is off; it starts with these next time.": "المحرّك متوقف؛ سيبدأ بهذه الإعدادات في المرة القادمة.",
+  "Restart engine to apply": "إعادة تشغيل المحرّك للتطبيق",
+  "Windows bind-mount file events": "أحداث ملفات ربط المجلدات في Windows",
+  "Forward file changes on Windows drives (like {path}) into containers for live reload. Uses no CPU when idle.": "توجيه تغييرات الملفات على أقراص Windows (مثل {path}) إلى الحاويات لإعادة التحميل الفوري. لا يستهلك أي معالج عند الخمول.",
+  "One text file, redacted, saved to your Desktop. Read it before you share it.": "ملف نصي واحد، محجوبة بياناته الحساسة، يُحفظ على سطح المكتب. اقرأه قبل مشاركته.",
+  "The 5 newest crash reports for Kiri": "أحدث 5 تقارير تعطّل لـ Kiri",
+  "Kiri and this PC": "Kiri وهذا الكمبيوتر",
+  "Kiri and this computer": "Kiri وهذا الكمبيوتر",
+  "Versions, {os}, whether the engine runs, how many containers and images": "الإصدارات، {os}، هل يعمل المحرّك، وعدد الحاويات والصور",
+  "Saved. The engine uses these from its next start": "تم الحفظ. يستخدمها المحرّك عند بدئه القادم"
 }
