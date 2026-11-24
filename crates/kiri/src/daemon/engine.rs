@@ -252,6 +252,40 @@ pub fn resources() -> serde_json::Value {
     resources_path().and_then(|p| std::fs::read(p).ok()).and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(serde_json::Value::Null)
 }
 
+/// Parses a boolean environment flag (`1`/`on`/`true`/`yes` or `0`/`off`/`false`/`no`).
+pub fn parse_bool_env(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "on" | "true" | "yes" => Some(true),
+        "0" | "off" | "false" | "no" => Some(false),
+        _ => None,
+    }
+}
+
+/// Configured `shared_nat` from `vm.json`, if present.
+pub fn vm_shared_nat_config() -> Option<bool> {
+    resources()["shared_nat"].as_bool()
+}
+
+/// Explicit `KIRI_SHARED_NAT` override from the environment, if valid.
+pub fn shared_nat_env() -> Option<bool> {
+    std::env::var("KIRI_SHARED_NAT").ok().and_then(|v| parse_bool_env(&v))
+}
+
+pub fn shared_nat_for(env: Option<&str>, configured: Option<bool>) -> bool {
+    env.and_then(parse_bool_env).or(configured).unwrap_or(true)
+}
+
+/// Whether the macOS VM attaches `VZNATNetworkDeviceAttachment` (`KIRI_SHARED_NAT`,
+/// else `vm.json`'s `shared_nat`, else `true`). Setting this to `false` avoids
+/// starting macOS `InternetSharing` (#383, #350).
+pub fn shared_nat() -> bool {
+    if !cfg!(target_os = "macos") {
+        return false;
+    }
+    let env = std::env::var("KIRI_SHARED_NAT").ok();
+    shared_nat_for(env.as_deref(), vm_shared_nat_config())
+}
+
 /// The VM's persistent data disk size from `vm.json`, if valid.
 pub fn vm_disk_gb_config() -> Option<u64> {
     resources()["disk_gb"]
@@ -1456,6 +1490,8 @@ pub struct Engine {
     cpus: std::sync::atomic::AtomicUsize,
     /// Data disk capacity in GiB the running VM booted with (macOS).
     disk_gb: std::sync::atomic::AtomicU64,
+    /// Whether the running macOS VM booted with `VZNATNetworkDeviceAttachment`.
+    shared_nat: std::sync::atomic::AtomicBool,
     memory_target: Mutex<u64>,
     /// What the guest last used, in bytes (0 while asleep): the balloon's
     /// measure, without the pages the balloon itself holds.
@@ -1610,6 +1646,7 @@ impl Engine {
             ceiling: std::sync::atomic::AtomicU64::new(ceiling),
             cpus: std::sync::atomic::AtomicUsize::new(vm_cpus()),
             disk_gb: std::sync::atomic::AtomicU64::new(vm_disk_gb()),
+            shared_nat: std::sync::atomic::AtomicBool::new(shared_nat()),
             memory_target: Mutex::new(ceiling),
             memory_used: std::sync::atomic::AtomicU64::new(0),
             mem_available_kib: std::sync::atomic::AtomicU64::new(0),
@@ -1777,9 +1814,11 @@ impl Engine {
         if recovery && !self.lock().containers.values().any(recover_after_vm_loss) {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "VM recovery was canceled"));
         }
-        let (ceiling, cpus, disk_cfg) = (memory_ceiling(), vm_cpus(), vm_disk_gb_config());
+        let (ceiling, cpus, disk_cfg, shared_nat) = (memory_ceiling(), vm_cpus(), vm_disk_gb_config(), shared_nat());
         self.ceiling.store(ceiling, std::sync::atomic::Ordering::Relaxed);
         self.cpus.store(cpus, std::sync::atomic::Ordering::Relaxed);
+        self.shared_nat.store(shared_nat, std::sync::atomic::Ordering::Relaxed);
+        super::ports::set_shared_nat_active(Some(shared_nat));
         let t0 = std::time::Instant::now();
         #[cfg(test)]
         self.boot_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1789,13 +1828,17 @@ impl Engine {
             memory_mib: Some(ceiling >> 20),
             cpus: Some(cpus),
             disk_gb: disk_cfg,
+            shared_nat: Some(shared_nat),
             ..Default::default()
         })
         .map_err(|e| match self.storage_readonly() {
             Some(ro) => io::Error::new(e.kind(), ro),
             None => e,
         })
-        .inspect_err(|e| crate::diag::error!("VM did not boot", error = e))?;
+        .inspect_err(|e| {
+            super::ports::set_shared_nat_active(None);
+            crate::diag::error!("VM did not boot", error = e);
+        })?;
         self.disk_gb.store(crate::guest::disk::current_gb(), std::sync::atomic::Ordering::Relaxed);
         let (vm, conn) = guest.into_parts();
         let me = self.me.get().cloned().unwrap_or_default();
@@ -1823,8 +1866,9 @@ impl Engine {
         }
         // The VM's own NAT subnet, which the host egress dialer must refuse
         // (VM only). Without a lease yet the default subnet still covers it,
-        // and publishing a port learns it again.
-        if cfg!(target_os = "macos") {
+        // and publishing a port learns it again. Skipped when shared NAT is
+        // disabled (no `VZNATNetworkDeviceAttachment` / `eth0`).
+        if cfg!(target_os = "macos") && shared_nat {
             match vm.uplink() {
                 Ok((_ip, gateway)) => super::ports::set_vm_subnet(gateway, super::ports::VM_UPLINK_PREFIX),
                 Err(e) => crate::diag::debug!("VM uplink not known yet", error = e),
@@ -1851,9 +1895,13 @@ impl Engine {
         self.sleeping.store(false, std::sync::atomic::Ordering::SeqCst);
         self.lock().vm_booted_at = Some(std::time::Instant::now());
         #[cfg(target_os = "macos")]
-        self.ensure_uplink(&vm);
+        if shared_nat {
+            self.ensure_uplink(&vm);
+        } else {
+            *self.uplink.lock().unwrap_or_else(|e| e.into_inner()) = serde_json::json!({"mode": "host-egress"});
+        }
         *self.link.lock().unwrap_or_else(|e| e.into_inner()) = Some(vm.clone());
-        crate::diag::info!("VM booted", ms = t0.elapsed().as_millis(), cpus = cpus, memory_mib = ceiling >> 20);
+        crate::diag::info!("VM booted", ms = t0.elapsed().as_millis(), cpus = cpus, memory_mib = ceiling >> 20, shared_nat = shared_nat);
         drop(waking);
         self.recover_vm();
         Ok(vm)
@@ -2388,6 +2436,12 @@ impl Engine {
     /// Data disk capacity in GiB the VM has (or will boot with).
     pub fn disk_gb(&self) -> u64 {
         self.disk_gb.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whether the running macOS VM booted with `VZNATNetworkDeviceAttachment`.
+    #[allow(dead_code)]
+    pub fn shared_nat(&self) -> bool {
+        self.shared_nat.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The Mac folders and files that running containers bind-mount, as
@@ -2948,6 +3002,7 @@ impl Engine {
                 self.k8s_fwd.lock().unwrap_or_else(|e| e.into_inner()).clear();
                 self.k8s_routes.lock().unwrap_or_else(|e| e.into_inner()).take();
                 *self.uplink.lock().unwrap_or_else(|e| e.into_inner()) = serde_json::Value::Null;
+                super::ports::set_shared_nat_active(None);
                 self.changed.notify_all();
                 match end {
                     // sleep_if_idle says why it slept.

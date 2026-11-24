@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -77,6 +77,26 @@ static NAT_DOWN_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
 static NAT_TIMEOUTS: AtomicUsize = AtomicUsize::new(0);
 /// Set once this run has warned that the NAT network is unreachable.
 static NAT_WARNED: AtomicBool = AtomicBool::new(false);
+/// Running VM's shared NAT state on macOS (`0` = not booted / read config,
+/// `1` = booted without `VZNATNetworkDeviceAttachment`, `2` = booted with it).
+static SHARED_NAT_STATE: AtomicU8 = AtomicU8::new(0);
+
+pub fn set_shared_nat_active(active: Option<bool>) {
+    let val = match active {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    };
+    SHARED_NAT_STATE.store(val, Ordering::Relaxed);
+}
+
+pub fn shared_nat_active() -> bool {
+    match SHARED_NAT_STATE.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => super::engine::shared_nat(),
+    }
+}
 /// New connections over the NAT network: a burst of `NAT_BURST`, then
 /// `NAT_RATE` a second; the rest go over vsock, which takes thousands a
 /// second (bulk transfers are what the NAT network is for). Each connection
@@ -618,6 +638,69 @@ fn holder_in(lsof: &str) -> Option<String> {
     lsof.lines().filter_map(|l| l.strip_prefix('c')).map(str::trim).find(|c| !c.is_empty() && !c.to_ascii_lowercase().starts_with("kiri")).map(str::to_owned)
 }
 
+fn wildcard_of(addr: SocketAddr) -> SocketAddr {
+    let ip = if addr.is_ipv6() {
+        IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
+    } else {
+        IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+    };
+    SocketAddr::new(ip, addr.port())
+}
+
+/// Whether `peer` may use a listener or UDP socket: when a macOS low-port
+/// loopback binding (`127.0.0.1:<port>` or `[::1]:<port>`, `port < 1024`) fell
+/// back to the wildcard address (`loopback_only`), only loopback peers
+/// (`127.0.0.0/8`, `::1`, `::ffff:127.0.0.0/104`) are accepted (#473).
+fn peer_allowed(peer: IpAddr, loopback_only: bool) -> bool {
+    !loopback_only || peer.to_canonical().is_loopback()
+}
+
+fn bind_with_macos_low_loopback(
+    addr: SocketAddr,
+    port: u16,
+    is_udp: bool,
+    step_aside: impl FnMut(u16) -> bool,
+) -> io::Result<(OwnedFd, bool)> {
+    bind_with_macos_low_loopback_with(addr, port, is_udp, cfg!(target_os = "macos"), bind_socket, step_aside)
+}
+
+fn bind_with_macos_low_loopback_with<T>(
+    addr: SocketAddr,
+    port: u16,
+    is_udp: bool,
+    is_macos: bool,
+    mut bind: impl FnMut(SocketAddr, bool) -> io::Result<T>,
+    mut step_aside: impl FnMut(u16) -> bool,
+) -> io::Result<(T, bool)> {
+    let mut try_bind = |a: SocketAddr| {
+        bind(a, is_udp).or_else(|e| {
+            if e.kind() == io::ErrorKind::AddrInUse && !is_udp && port != 0 && step_aside(port) {
+                bind(a, false)
+            } else {
+                Err(e)
+            }
+        })
+    };
+    match try_bind(addr) {
+        Ok(s) => Ok((s, false)),
+        // On macOS XNU, unprivileged processes get EACCES (`PermissionDenied`)
+        // when binding `127.0.0.1:<port>` or `[::1]:<port>` for `port < 1024`,
+        // even though XNU lets unprivileged processes bind `0.0.0.0:<port>` and
+        // `[::]:<port>` (#473). Fall back to the wildcard of the same family
+        // (stepping the container-domain router aside on AddrInUse via
+        // `try_bind`) and filter non-loopback peers in `accept_loop`/`udp_loop`.
+        Err(e)
+            if is_macos
+                && e.kind() == io::ErrorKind::PermissionDenied
+                && addr.ip().is_loopback()
+                && (1..1024).contains(&port) =>
+        {
+            try_bind(wildcard_of(addr)).map(|s| (s, true))
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Binds every port first (so a clash fails the start cleanly), then starts
 /// one accept thread per listener.
 pub fn start(vm: Arc<VmLink>, id: &str, bindings: &[Binding], target_ip: [u8; 4]) -> io::Result<Forwards> {
@@ -631,8 +714,8 @@ pub fn start(vm: Arc<VmLink>, id: &str, bindings: &[Binding], target_ip: [u8; 4]
     } else {
         None
     };
-    let mut listeners: Vec<(Binding, Option<String>, String, u16, TcpListener)> = Vec::with_capacity(bindings.len());
-    let mut udp: Vec<(Binding, Option<String>, String, u16, UdpSocket)> = Vec::new();
+    let mut listeners: Vec<(Binding, Option<String>, String, u16, bool, TcpListener)> = Vec::with_capacity(bindings.len());
+    let mut udp: Vec<(Binding, Option<String>, String, u16, bool, UdpSocket)> = Vec::new();
     for b in bindings {
         // A port picked by the kernel (0) is picked once: the `::` listener
         // takes the one 0.0.0.0 got.
@@ -650,19 +733,9 @@ pub fn start(vm: Arc<VmLink>, id: &str, bindings: &[Binding], target_ip: [u8; 4]
                 }
             };
             let is_udp = b.proto == "udp";
-            // Kiri's own container-domain router on this port lets it go
-            // (domains::step_aside), and the bind goes again.
-            let try_bind = |a: SocketAddr| {
-                bind_socket(a, is_udp).or_else(|e| {
-                    if e.kind() == io::ErrorKind::AddrInUse && !is_udp && port != 0 && super::domains::step_aside(port) {
-                        bind_socket(a, false)
-                    } else {
-                        Err(e)
-                    }
-                })
-            };
-            let (bound, bind_ip) = match try_bind(addr) {
-                Ok(s) => (Ok(s), ip.clone()),
+            let (bound, bind_ip, loopback_only) = match bind_with_macos_low_loopback(addr, port, is_udp, super::domains::step_aside) {
+                Ok((s, true)) => (Ok(s), wildcard_of(addr).ip().to_string(), true),
+                Ok((s, false)) => (Ok(s), ip.clone(), false),
                 // In WSL 2, a Windows host interface IP (`-p <WinLANIP>:port:cport`)
                 // is not assigned inside the Linux VM (`EADDRNOTAVAIL` / os error 99).
                 // When the IP belongs to a Windows host interface and WSL has a
@@ -677,12 +750,16 @@ pub fn start(vm: Arc<VmLink>, id: &str, bindings: &[Binding], target_ip: [u8; 4]
                 {
                     if let Some(fallback_ip) = wsl_eth0 {
                         let fallback_addr = SocketAddr::new(IpAddr::V4(fallback_ip), port);
-                        (try_bind(fallback_addr), fallback_ip.to_string())
+                        (
+                            bind_with_macos_low_loopback(fallback_addr, port, is_udp, super::domains::step_aside).map(|(s, _)| s),
+                            fallback_ip.to_string(),
+                            false,
+                        )
                     } else {
-                        (Err(e), ip.clone())
+                        (Err(e), ip.clone(), false)
                     }
                 }
-                Err(e) => (Err(e), ip.clone()),
+                Err(e) => (Err(e), ip.clone(), false),
             };
             let sock = match bound {
                 Ok(s) => s,
@@ -698,7 +775,7 @@ pub fn start(vm: Arc<VmLink>, id: &str, bindings: &[Binding], target_ip: [u8; 4]
                 let s = UdpSocket::from(sock);
                 s.set_nonblocking(true)?;
                 port = s.local_addr()?.port();
-                udp.push((b.clone(), Some(ip), bind_ip.clone(), port, s));
+                udp.push((b.clone(), Some(ip), bind_ip.clone(), port, loopback_only, s));
                 // WSL 2's localhostForwarding never forwards UDP, so `kiri-win`
                 // forwards Windows UDP ports (including 127.0.0.1:port/udp) to
                 // `<wsl_eth0>:<port>/udp`. Ensure `<wsl_eth0>:<port>/udp` is
@@ -708,12 +785,12 @@ pub fn start(vm: Arc<VmLink>, id: &str, bindings: &[Binding], target_ip: [u8; 4]
                     let eth0_str = eth0.to_string();
                     if bind_ip != "0.0.0.0"
                         && bind_ip != eth0_str
-                        && !udp.iter().any(|(_, _, bip, p, _)| *p == port && (bip == "0.0.0.0" || bip == &eth0_str))
+                        && !udp.iter().any(|(_, _, bip, p, _, _)| *p == port && (bip == "0.0.0.0" || bip == &eth0_str))
                         && let Ok(aux_fd) = bind_socket(SocketAddr::new(IpAddr::V4(eth0), port), true)
                     {
                         let aux = UdpSocket::from(aux_fd);
                         let _ = aux.set_nonblocking(true);
-                        udp.push((b.clone(), None, eth0_str, port, aux));
+                        udp.push((b.clone(), None, eth0_str, port, false, aux));
                     }
                 }
                 continue;
@@ -721,16 +798,16 @@ pub fn start(vm: Arc<VmLink>, id: &str, bindings: &[Binding], target_ip: [u8; 4]
             let l = TcpListener::from(sock);
             l.set_nonblocking(true)?;
             port = l.local_addr()?.port();
-            listeners.push((b.clone(), Some(ip.clone()), bind_ip.clone(), port, l));
+            listeners.push((b.clone(), Some(ip.clone()), bind_ip.clone(), port, loopback_only, l));
             if let Some(eth0) = wsl_eth0 {
                 let eth0_str = eth0.to_string();
                 if ip == "::"
-                    && !listeners.iter().any(|(_, _, bip, p, _)| *p == port && (bip == "0.0.0.0" || bip == &eth0_str))
+                    && !listeners.iter().any(|(_, _, bip, p, _, _)| *p == port && (bip == "0.0.0.0" || bip == &eth0_str))
                     && let Ok(aux_fd) = bind_socket(SocketAddr::new(IpAddr::V4(eth0), port), false)
                 {
                     let aux = TcpListener::from(aux_fd);
                     let _ = aux.set_nonblocking(true);
-                    listeners.push((b.clone(), None, eth0_str, port, aux));
+                    listeners.push((b.clone(), None, eth0_str, port, false, aux));
                 }
             }
         }
@@ -743,8 +820,8 @@ pub fn start(vm: Arc<VmLink>, id: &str, bindings: &[Binding], target_ip: [u8; 4]
     if cfg!(target_os = "linux") && target_ip != [127, 0, 0, 1] {
         let all = udp
             .iter()
-            .map(|(b, _, bind_ip, port, _)| (b, bind_ip, *port, true))
-            .chain(listeners.iter().map(|(b, _, bind_ip, port, _)| (b, bind_ip, *port, false)));
+            .map(|(b, _, bind_ip, port, _, _)| (b, bind_ip, *port, true))
+            .chain(listeners.iter().map(|(b, _, bind_ip, port, _, _)| (b, bind_ip, *port, false)));
         let mut published = Ok(false);
         for (b, bind_ip, port, is_udp) in all.filter(|(_, bind_ip, ..)| kernel_forwards(bind_ip)) {
             let p = kiri_proto::Publish {
@@ -765,8 +842,8 @@ pub fn start(vm: Arc<VmLink>, id: &str, bindings: &[Binding], target_ip: [u8; 4]
                 // Sockets only the kernel serves stay bound, so the ports read as taken.
                 let (kernel_udp, relay_udp): (Vec<_>, Vec<_>) = udp.into_iter().partition(|(_, _, bind_ip, ..)| !relays_too(bind_ip));
                 let (kernel_tcp, relay_tcp): (Vec<_>, Vec<_>) = listeners.into_iter().partition(|(_, _, bind_ip, ..)| !relays_too(bind_ip));
-                fw.bound.extend(kernel_udp.iter().filter_map(|(b, rep_ip, _, port, _)| rep_ip.as_ref().map(|ip| (b.clone(), ip.clone(), *port))));
-                fw.bound.extend(kernel_tcp.iter().filter_map(|(b, rep_ip, _, port, _)| rep_ip.as_ref().map(|ip| (b.clone(), ip.clone(), *port))));
+                fw.bound.extend(kernel_udp.iter().filter_map(|(b, rep_ip, _, port, _, _)| rep_ip.as_ref().map(|ip| (b.clone(), ip.clone(), *port))));
+                fw.bound.extend(kernel_tcp.iter().filter_map(|(b, rep_ip, _, port, _, _)| rep_ip.as_ref().map(|ip| (b.clone(), ip.clone(), *port))));
                 if any {
                     fw.kernel = Some((vm.clone(), id.to_owned(), kernel_tcp.into_iter().map(|(.., s)| s).collect(), kernel_udp.into_iter().map(|(.., s)| s).collect()));
                 }
@@ -779,22 +856,23 @@ pub fn start(vm: Arc<VmLink>, id: &str, bindings: &[Binding], target_ip: [u8; 4]
             }
         }
     }
-    for (b, rep_ip, _bind_ip, port, sock) in udp {
+    for (b, rep_ip, _bind_ip, port, loopback_only, sock) in udp {
         let (wake_r, wake_w) = pipe()?;
         fw.wake.push(wake_w);
         let vm = vm.clone();
         let container_port = b.container_port;
         fw.threads.push(std::thread::Builder::new().name(format!("kiri-udp-{port}")).spawn(move || {
-            udp_loop(&sock, &wake_r, &vm, target_ip, container_port);
+            udp_loop(&sock, &wake_r, &vm, target_ip, container_port, loopback_only);
         })?);
         if let Some(ip) = rep_ip {
             fw.bound.push((b, ip, port));
         }
     }
     // In the VM: the guest kernel forwards each TCP binding from a port of
-    // its own on the NAT network. A target on loopback stays relayed.
+    // its own on the NAT network. A target on loopback (or a VM booted without
+    // shared NAT) stays relayed over vsock.
     let mut nat = vec![None; listeners.len()];
-    if cfg!(target_os = "macos") && target_ip != [127, 0, 0, 1] && !listeners.is_empty() {
+    if cfg!(target_os = "macos") && shared_nat_active() && target_ip != [127, 0, 0, 1] && !listeners.is_empty() {
         match publish_nat(&vm, id, &listeners.iter().map(|(b, ..)| b.container_port).collect::<Vec<_>>(), target_ip) {
             Ok((addrs, ports)) => {
                 nat = addrs.into_iter().map(Some).collect();
@@ -810,7 +888,7 @@ pub fn start(vm: Arc<VmLink>, id: &str, bindings: &[Binding], target_ip: [u8; 4]
     // listener. As on Docker, where a published port is bound in the host's
     // namespace. A target on loopback is itself a host-network container.
     if cfg!(target_os = "macos") && target_ip != [127, 0, 0, 1] {
-        let ports = loopback_ports(listeners.iter().filter_map(|(b, rep_ip, _, port, _)| rep_ip.as_deref().map(|ip| (b.container_port, ip, *port))));
+        let ports = loopback_ports(listeners.iter().filter_map(|(b, rep_ip, _, port, _, _)| rep_ip.as_deref().map(|ip| (b.container_port, ip, *port))));
         let mut published = false;
         for (to_port, host_port) in ports {
             let p = kiri_proto::Publish { id, udp: false, host_ip: [127, 0, 0, 1], host_port, to_ip: target_ip, to_port };
@@ -823,13 +901,13 @@ pub fn start(vm: Arc<VmLink>, id: &str, bindings: &[Binding], target_ip: [u8; 4]
             fw.loopback = Some((vm.clone(), id.to_owned()));
         }
     }
-    for ((b, rep_ip, _bind_ip, port, listener), nat) in listeners.into_iter().zip(nat) {
+    for ((b, rep_ip, _bind_ip, port, loopback_only, listener), nat) in listeners.into_iter().zip(nat) {
         let (wake_r, wake_w) = pipe()?;
         fw.wake.push(wake_w);
         let vm = vm.clone();
         let container_port = b.container_port;
         fw.threads.push(std::thread::Builder::new().name(format!("kiri-port-{port}")).spawn(move || {
-            accept_loop(&listener, &wake_r, &vm, target_ip, container_port, nat);
+            accept_loop(&listener, &wake_r, &vm, target_ip, container_port, nat, loopback_only);
         })?);
         if let Some(ip) = rep_ip {
             fw.bound.push((b, ip, port));
@@ -893,7 +971,7 @@ impl UdpSession {
 
 /// Datagrams from each client go to the container over its own session;
 /// replies come back to that client. Quiet sessions close.
-fn udp_loop(sock: &UdpSocket, wake: &OwnedFd, vm: &Arc<VmLink>, ip: [u8; 4], port: u16) {
+fn udp_loop(sock: &UdpSocket, wake: &OwnedFd, vm: &Arc<VmLink>, ip: [u8; 4], port: u16, loopback_only: bool) {
     let mut sessions: std::collections::HashMap<SocketAddr, UdpSession> = std::collections::HashMap::new();
     let mut buf = vec![0u8; 65_536];
     loop {
@@ -918,6 +996,9 @@ fn udp_loop(sock: &UdpSocket, wake: &OwnedFd, vm: &Arc<VmLink>, ip: [u8; 4], por
             break; // the container stopped
         }
         while let Ok((len, peer)) = sock.recv_from(&mut buf) {
+            if !peer_allowed(peer.ip(), loopback_only) {
+                continue;
+            }
             if !sessions.contains_key(&peer) {
                 // Cap sessions so a source-spoofing flood cannot exhaust
                 // threads and guest connections; drop the oldest to make room.
@@ -988,7 +1069,7 @@ fn open_udp_session(sock: &UdpSocket, vm: &VmLink, ip: [u8; 4], port: u16, peer:
     })
 }
 
-fn accept_loop(listener: &TcpListener, wake: &OwnedFd, vm: &Arc<VmLink>, ip: [u8; 4], port: u16, nat: Option<SocketAddr>) {
+fn accept_loop(listener: &TcpListener, wake: &OwnedFd, vm: &Arc<VmLink>, ip: [u8; 4], port: u16, nat: Option<SocketAddr>, loopback_only: bool) {
     loop {
         let mut fds = [
             libc::pollfd {
@@ -1013,6 +1094,11 @@ fn accept_loop(listener: &TcpListener, wake: &OwnedFd, vm: &Arc<VmLink>, ip: [u8
             return; // the container stopped
         }
         while let Ok((client, from)) = listener.accept() {
+            if !peer_allowed(from.ip(), loopback_only)
+                || (loopback_only && !client.local_addr().is_ok_and(|a| peer_allowed(a.ip(), true)))
+            {
+                continue;
+            }
             let Some(permit) = tcp_permit(from.ip()) else {
                 continue;
             };
@@ -1064,7 +1150,7 @@ fn relay(client: TcpStream, vm: &VmLink, ip: [u8; 4], port: u16, nat: Option<Soc
     if cfg!(target_os = "linux") {
         return relay_direct(client, ip, port);
     }
-    if let Some(addr) = nat.filter(|_| nat_usable() && nat_budget()) {
+    if let Some(addr) = nat.filter(|_| shared_nat_active() && nat_usable() && nat_budget()) {
         match TcpStream::connect_timeout(&addr, NAT_CONNECT) {
             Ok(guest) => {
                 NAT_TIMEOUTS.store(0, Ordering::Relaxed);
@@ -1912,11 +1998,13 @@ fn parse_cidr_str(s: &str) -> Option<([u8; 4], u8)> {
 
 /// Computes the egress CIDR strings to send to the guest given:
 /// - `env_mode`: `KIRI_HOST_EGRESS` (`auto`, `always`, `off`, or comma-separated CIDRs)
+/// - `shared_nat`: whether the macOS VM attached `VZNATNetworkDeviceAttachment`
 /// - `has_net_ext`: whether an active third-party macOS NetworkExtension filter/proxy is enabled
 /// - `tunnel_routes`: IPv4 prefixes routed over tunnel interfaces (`utun*`, `ipsec*`, `ppp*`, `gpd*`, `feth*`)
 /// - `is_macos`: whether the host is macOS
-pub fn host_egress_routes_for(
+pub fn host_egress_routes_with_nat(
     env_mode: Option<&str>,
+    shared_nat: bool,
     has_net_ext: bool,
     tunnel_routes: &[([u8; 4], u8)],
     is_macos: bool,
@@ -1938,7 +2026,7 @@ pub fn host_egress_routes_for(
     if !is_macos {
         return Vec::new();
     }
-    if has_net_ext {
+    if !shared_nat || has_net_ext {
         return vec!["0.0.0.0/0".into()];
     }
     let mut all = tunnel_routes.to_vec();
@@ -1947,6 +2035,16 @@ pub fn host_egress_routes_for(
         .into_iter()
         .map(|(ip, p)| format!("{}.{}.{}.{}/{p}", ip[0], ip[1], ip[2], ip[3]))
         .collect()
+}
+
+#[cfg(test)]
+pub fn host_egress_routes_for(
+    env_mode: Option<&str>,
+    has_net_ext: bool,
+    tunnel_routes: &[([u8; 4], u8)],
+    is_macos: bool,
+) -> Vec<String> {
+    host_egress_routes_with_nat(env_mode, true, has_net_ext, tunnel_routes, is_macos)
 }
 
 #[cfg(target_os = "macos")]
@@ -1994,7 +2092,7 @@ pub fn current_egress_routes() -> Vec<String> {
     };
     #[cfg(not(target_os = "macos"))]
     let (has_ext, tunnel_routes) = (false, Vec::new());
-    host_egress_routes_for(env_mode.as_deref(), has_ext, &tunnel_routes, cfg!(target_os = "macos"))
+    host_egress_routes_with_nat(env_mode.as_deref(), shared_nat_active(), has_ext, &tunnel_routes, cfg!(target_os = "macos"))
 }
 
 /// Sends the initial egress routes to `vm` and, on macOS, watches `PF_ROUTE`
@@ -3629,5 +3727,187 @@ Wireless LAN adapter Wi-Fi:\r\n\
 
         super::clear_preferred_ssh_auth_sock();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn macos_low_loopback_fallback_and_step_aside() {
+        use std::io;
+        use std::net::SocketAddr;
+
+        let eacces = || io::Error::from(io::ErrorKind::PermissionDenied);
+        let eaddrinuse = || io::Error::from(io::ErrorKind::AddrInUse);
+
+        // 1. macOS 127.0.0.1:80 EACCES -> falls back to 0.0.0.0:80 with loopback_only = true.
+        let mut tried = Vec::new();
+        let (bound, lo_only) = super::bind_with_macos_low_loopback_with(
+            "127.0.0.1:80".parse().unwrap(),
+            80,
+            false,
+            true,
+            |a, udp| {
+                tried.push((a, udp));
+                if a == "127.0.0.1:80".parse::<SocketAddr>().unwrap() { Err(eacces()) } else { Ok(a) }
+            },
+            |_| panic!("should not step aside when wildcard is free"),
+        )
+        .unwrap();
+        assert_eq!(bound, "0.0.0.0:80".parse().unwrap());
+        assert!(lo_only);
+        assert_eq!(tried, vec![("127.0.0.1:80".parse().unwrap(), false), ("0.0.0.0:80".parse().unwrap(), false)]);
+
+        // 2. macOS 127.0.0.1:80 EACCES, then 0.0.0.0:80 EADDRINUSE (domain router) ->
+        //    steps router aside and retries 0.0.0.0:80 cleanly.
+        let mut stepped = Vec::new();
+        let mut wildcard_attempts = 0usize;
+        let (bound, lo_only) = super::bind_with_macos_low_loopback_with(
+            "127.0.0.1:80".parse().unwrap(),
+            80,
+            false,
+            true,
+            |a, _| {
+                if a.ip().is_loopback() {
+                    Err(eacces())
+                } else {
+                    wildcard_attempts += 1;
+                    if wildcard_attempts == 1 { Err(eaddrinuse()) } else { Ok(a) }
+                }
+            },
+            |p| {
+                stepped.push(p);
+                true
+            },
+        )
+        .unwrap();
+        assert_eq!(bound, "0.0.0.0:80".parse().unwrap());
+        assert!(lo_only);
+        assert_eq!(stepped, vec![80]);
+        assert_eq!(wildcard_attempts, 2);
+
+        // 3. macOS [::1]:443 EACCES -> falls back to [::]:443 with loopback_only = true.
+        let (bound, lo_only) = super::bind_with_macos_low_loopback_with(
+            "[::1]:443".parse().unwrap(),
+            443,
+            false,
+            true,
+            |a, _| if a.ip().is_loopback() { Err(eacces()) } else { Ok(a) },
+            |_| false,
+        )
+        .unwrap();
+        assert_eq!(bound, "[::]:443".parse().unwrap());
+        assert!(lo_only);
+
+        // 4. macOS 127.0.0.1:53 UDP EACCES -> falls back to 0.0.0.0:53 UDP.
+        let (bound, lo_only) = super::bind_with_macos_low_loopback_with(
+            "127.0.0.1:53".parse().unwrap(),
+            53,
+            true,
+            true,
+            |a, udp| {
+                assert!(udp);
+                if a.ip().is_loopback() { Err(eacces()) } else { Ok(a) }
+            },
+            |_| panic!("UDP must never step aside TCP domain router"),
+        )
+        .unwrap();
+        assert_eq!(bound, "0.0.0.0:53".parse().unwrap());
+        assert!(lo_only);
+
+        // 5. High port (>= 1024), non-loopback IP, port 0, and non-macOS do NOT fall back.
+        for (addr, port, is_macos) in [
+            ("127.0.0.1:1024", 1024, true),
+            ("127.0.0.1:8080", 8080, true),
+            ("127.0.0.1:0", 0, true),
+            ("192.168.1.5:80", 80, true),
+            ("127.0.0.1:80", 80, false),
+        ] {
+            let mut calls = 0usize;
+            let err = super::bind_with_macos_low_loopback_with(
+                addr.parse().unwrap(),
+                port,
+                false,
+                is_macos,
+                |_, _| {
+                    calls += 1;
+                    Err::<SocketAddr, _>(eacces())
+                },
+                |_| false,
+            )
+            .unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{addr} mac={is_macos}");
+            assert_eq!(calls, 1, "must not retry wildcard for {addr} mac={is_macos}");
+        }
+
+        // 6. Direct bind succeeding keeps loopback_only = false.
+        let (bound, lo_only) = super::bind_with_macos_low_loopback_with(
+            "127.0.0.1:81".parse().unwrap(),
+            81,
+            false,
+            true,
+            |a, _| Ok(a),
+            |_| false,
+        )
+        .unwrap();
+        assert_eq!(bound, "127.0.0.1:81".parse().unwrap());
+        assert!(!lo_only);
+    }
+
+    #[test]
+    fn peer_allowed_enforces_loopback_only_when_fallback_active() {
+        for lo in ["127.0.0.1", "127.0.0.2", "::1", "::ffff:127.0.0.1", "::ffff:127.0.0.2"] {
+            let ip: IpAddr = lo.parse().unwrap();
+            assert!(super::peer_allowed(ip, true), "loopback {lo} must be allowed");
+            assert!(super::peer_allowed(ip, false), "loopback {lo} must be allowed without filter");
+        }
+        for remote in ["192.168.1.10", "10.0.0.5", "0.0.0.0", "2001:db8::1", "fe80::1", "::", "::ffff:192.168.1.10", "::ffff:10.0.0.1"] {
+            let ip: IpAddr = remote.parse().unwrap();
+            assert!(!super::peer_allowed(ip, true), "non-loopback {remote} must be rejected under loopback_only");
+            assert!(super::peer_allowed(ip, false), "non-loopback {remote} must be allowed when not loopback_only");
+        }
+    }
+
+    #[test]
+    fn shared_nat_disabled_forces_full_host_egress_and_tracks_state() {
+        use super::super::engine::{parse_bool_env, shared_nat_for};
+
+        for t in ["1", "on", "ON", "true", "True", "yes", " yes "] {
+            assert_eq!(parse_bool_env(t), Some(true), "{t}");
+        }
+        for f in ["0", "off", "OFF", "false", "False", "no", " no "] {
+            assert_eq!(parse_bool_env(f), Some(false), "{f}");
+        }
+        for bad in ["", "maybe", "2", "auto"] {
+            assert_eq!(parse_bool_env(bad), None, "{bad}");
+        }
+
+        // Env overrides vm.json, vm.json overrides default (true), invalid env falls back.
+        assert!(shared_nat_for(None, None));
+        assert!(!shared_nat_for(None, Some(false)));
+        assert!(shared_nat_for(None, Some(true)));
+        assert!(!shared_nat_for(Some("0"), Some(true)));
+        assert!(shared_nat_for(Some("on"), Some(false)));
+        assert!(!shared_nat_for(Some("bogus"), Some(false)));
+        assert!(shared_nat_for(Some("bogus"), None));
+
+        // When shared_nat is false on macOS, auto mode routes all IPv4 TCP through host egress.
+        assert_eq!(
+            super::host_egress_routes_with_nat(None, false, false, &[], true),
+            vec!["0.0.0.0/0"]
+        );
+        assert_eq!(
+            super::host_egress_routes_with_nat(Some("auto"), false, false, &[([10, 0, 5, 0], 24)], true),
+            vec!["0.0.0.0/0"]
+        );
+        assert_eq!(
+            super::host_egress_routes_with_nat(Some("auto"), true, false, &[([10, 0, 5, 0], 24)], true),
+            vec!["198.18.0.0/15", "10.0.5.0/24"]
+        );
+        assert!(super::host_egress_routes_with_nat(Some("off"), false, false, &[], true).is_empty());
+        assert!(super::host_egress_routes_with_nat(None, false, false, &[], false).is_empty());
+
+        super::set_shared_nat_active(Some(false));
+        assert!(!super::shared_nat_active());
+        super::set_shared_nat_active(Some(true));
+        assert!(super::shared_nat_active());
+        super::set_shared_nat_active(None);
     }
 }

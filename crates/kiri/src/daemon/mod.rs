@@ -13,7 +13,7 @@ pub mod dns;
 pub mod tls;
 pub mod proxy;
 mod domains;
-mod engine;
+pub(crate) mod engine;
 mod filters;
 mod grpc;
 mod health;

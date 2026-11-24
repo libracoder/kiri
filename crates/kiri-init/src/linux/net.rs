@@ -546,30 +546,55 @@ pub fn publish(dnat: &[netlink::Dnat]) -> io::Result<()> {
 }
 
 /// Brings the uplink up and returns a DHCP client for it, or None if the VM
-/// has no network card.
+/// has no network card (shared NAT disabled: installs the VM nftables table
+/// and a fallback default route on `lo` so host-network and bridged containers
+/// route outbound TCP through the host egress relay over vsock).
 pub fn uplink() -> io::Result<Option<Dhcp>> {
-    let Ok(index) = netlink::index_of(UPLINK) else { return Ok(None) };
-    let mut nl = Netlink::open(libc::NETLINK_ROUTE)?;
-    netlink::set_up(&mut nl, index)?;
     sys::write_file("/proc/sys/net/ipv4/ip_forward", "1")?;
     // The tunnel drivers are built in, and each would add its idle fallback
     // device (tunl0, gre0, sit0, ip6tnl0...) to every container's network:
     // they stay in the VM's own, as on a machine that loads them as modules.
     let _ = sys::write_file("/proc/sys/net/core/fb_tunnels_only_for_init_net", "1");
-    install_nat(Nat { uplink: index, redirect: true, dnat: Vec::new(), gateway: [0; 4] })?;
-    let _ = VM_UPLINK_INDEX.set(index);
-    Ok(Some(Dhcp::start(index)?))
+    match netlink::index_of(UPLINK) {
+        Ok(index) => {
+            let mut nl = Netlink::open(libc::NETLINK_ROUTE)?;
+            netlink::set_up(&mut nl, index)?;
+            install_nat(Nat { uplink: index, redirect: true, dnat: Vec::new(), gateway: [0; 4] })?;
+            let _ = VM_UPLINK_INDEX.set(index);
+            Ok(Some(Dhcp::start(index)?))
+        }
+        Err(_) => {
+            // Without an `eth0` NIC, locally originated connects in the VM root
+            // netns (`--network host` containers) perform IPv4 route lookup
+            // before NF_INET_LOCAL_OUT nftables redirect rules run. Add a
+            // fallback default route on `lo` so `connect()` reaches the output
+            // egress/host-relay redirect rules instead of failing ENETUNREACH.
+            if let Ok(lo) = netlink::index_of("lo")
+                && let Ok(mut nl) = Netlink::open(libc::NETLINK_ROUTE)
+                && let Err(e) = netlink::add_device_default_route(&mut nl, lo, Some(netlink::LOOPBACK))
+            {
+                eprintln!("kiri-init: fallback default route on lo: {e}");
+            }
+            install_nat(Nat { uplink: 0, redirect: true, dnat: Vec::new(), gateway: [0; 4] })?;
+            let _ = VM_UPLINK_INDEX.set(0);
+            Ok(None)
+        }
+    }
 }
 
-/// The VM's uplink (eth0), once `uplink` brought it up.
+/// The VM's uplink (eth0), or 0 when booted without a NIC (shared NAT off).
 static VM_UPLINK_INDEX: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
 
 /// In the VM: makes these the published ports the kernel forwards from the
 /// uplink, for connections the Mac makes from `gateway` (its address on the
-/// NAT network). The table is rebuilt whole, so the host.docker.internal
-/// redirect stays.
+/// NAT network), and loopback redirects for `--network host` containers.
+/// The table is rebuilt whole, so the host.docker.internal and egress
+/// redirects stay.
 pub fn publish_vm(dnat: &[netlink::Dnat], gateway: [u8; 4]) -> io::Result<()> {
     let index = *VM_UPLINK_INDEX.get().ok_or_else(|| io::Error::other("no uplink"))?;
+    if index == 0 && dnat.iter().any(|d| d.host_ip != netlink::LOOPBACK) {
+        return Err(io::Error::other("no uplink"));
+    }
     install_nat(Nat { uplink: index, redirect: true, dnat: dnat.to_vec(), gateway })
 }
 

@@ -1189,6 +1189,7 @@ fn set_resources(req: &Request) -> Result<(), Error> {
         e::physical_memory_bytes() >> 20,
         current_disk,
         e::vm_disk_gb_config(),
+        e::vm_shared_nat_config(),
     )
 }
 
@@ -1199,6 +1200,7 @@ fn save_resources(
     max_mem: u64,
     current_disk_gb: Option<u64>,
     existing_disk_gb: Option<u64>,
+    existing_shared_nat: Option<bool>,
 ) -> Result<(), Error> {
     let body: Value = serde_json::from_slice(raw_body).map_err(|e| Error::BadRequest(format!("invalid JSON: {e}")))?;
     let cpus = body["cpus"].as_u64().filter(|c| (1..=max_cpus).contains(c)).ok_or_else(|| Error::BadRequest(format!("cpus must be 1 to {max_cpus}")))?;
@@ -1214,6 +1216,12 @@ fn save_resources(
         out["disk_gb"] = json!(disk_gb);
     } else if let Some(prev) = existing_disk_gb {
         out["disk_gb"] = json!(prev);
+    }
+    if let Some(val) = body.get("shared_nat").filter(|v| !v.is_null()) {
+        let shared_nat = val.as_bool().ok_or_else(|| Error::BadRequest("shared_nat must be a boolean".into()))?;
+        out["shared_nat"] = json!(shared_nat);
+    } else if let Some(prev) = existing_shared_nat {
+        out["shared_nat"] = json!(prev);
     }
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(Error::Io)?;
@@ -7708,19 +7716,32 @@ mod resources_disk_tests {
 
         // Save CPUs, memory and disk_gb; verify vm.json contents.
         let body = json!({"cpus": 4, "memory_mib": 8192, "disk_gb": 128}).to_string();
-        save_resources(body.as_bytes(), &path, 12, 32768, Some(64), None).unwrap();
+        save_resources(body.as_bytes(), &path, 12, 32768, Some(64), None, None).unwrap();
         let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(saved, json!({"cpus": 4, "memory_mib": 8192, "disk_gb": 128}));
 
-        // Omitting disk_gb preserves the existing disk_gb in vm.json.
+        // Omitting disk_gb preserves the existing disk_gb in vm.json, and omitting
+        // shared_nat preserves an existing shared_nat flag in vm.json.
         let body2 = json!({"cpus": 6, "memory_mib": 4096}).to_string();
-        save_resources(body2.as_bytes(), &path, 12, 32768, Some(64), saved["disk_gb"].as_u64()).unwrap();
+        save_resources(body2.as_bytes(), &path, 12, 32768, Some(64), saved["disk_gb"].as_u64(), Some(false)).unwrap();
         let saved2: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(saved2, json!({"cpus": 6, "memory_mib": 4096, "disk_gb": 128}));
+        assert_eq!(saved2, json!({"cpus": 6, "memory_mib": 4096, "disk_gb": 128, "shared_nat": false}));
+
+        // Explicitly updating shared_nat works and non-boolean values are rejected with 400.
+        let body3 = json!({"cpus": 6, "memory_mib": 4096, "shared_nat": true}).to_string();
+        save_resources(body3.as_bytes(), &path, 12, 32768, Some(64), Some(128), Some(false)).unwrap();
+        let saved3: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved3, json!({"cpus": 6, "memory_mib": 4096, "disk_gb": 128, "shared_nat": true}));
+
+        let bad_nat = json!({"cpus": 4, "memory_mib": 8192, "shared_nat": "off"}).to_string();
+        match save_resources(bad_nat.as_bytes(), &path, 12, 32768, Some(64), None, None) {
+            Err(Error::BadRequest(msg)) => assert!(msg.contains("shared_nat must be a boolean"), "{msg}"),
+            other => panic!("expected BadRequest for non-bool shared_nat, got {other:?}"),
+        }
 
         // Shrinking below current data.img size (128 GiB) is rejected with 400.
         let shrink = json!({"cpus": 4, "memory_mib": 8192, "disk_gb": 96}).to_string();
-        match save_resources(shrink.as_bytes(), &path, 12, 32768, Some(128), Some(128)) {
+        match save_resources(shrink.as_bytes(), &path, 12, 32768, Some(128), Some(128), None) {
             Err(Error::BadRequest(msg)) => assert!(msg.contains("disk_gb must be 128 to 1024"), "{msg}"),
             other => panic!("expected BadRequest for shrink, got {other:?}"),
         }
@@ -7728,7 +7749,7 @@ mod resources_disk_tests {
         // Below 64 GiB template floor, zero, negative, and oversized values are rejected.
         for bad in [json!(0), json!(32), json!(-1), json!(2048), json!("128")] {
             let raw = json!({"cpus": 4, "memory_mib": 8192, "disk_gb": bad}).to_string();
-            match save_resources(raw.as_bytes(), &path, 12, 32768, Some(64), None) {
+            match save_resources(raw.as_bytes(), &path, 12, 32768, Some(64), None, None) {
                 Err(Error::BadRequest(msg)) => assert!(msg.contains("disk_gb must be"), "{msg}"),
                 other => panic!("expected BadRequest for {bad}, got {other:?}"),
             }

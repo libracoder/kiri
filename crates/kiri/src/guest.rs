@@ -73,6 +73,9 @@ pub struct BootOptions {
     /// The VM's persistent data disk size in GiB (`vm.json`'s `disk_gb`);
     /// `KIRI_DISK_GB` overrides this when set.
     pub disk_gb: Option<u64>,
+    /// Whether to attach `VZNATNetworkDeviceAttachment` (`InternetSharing`) on
+    /// macOS (`None` reads `KIRI_SHARED_NAT` / `vm.json`'s `shared_nat`).
+    pub shared_nat: Option<bool>,
 }
 
 fn console_output(opts: &BootOptions) -> io::Result<Option<OwnedFd>> {
@@ -178,6 +181,7 @@ impl Guest {
             // Keep warnings and oopses even in release builds.
             cmdline.push_str(" quiet loglevel=4");
         }
+        let shared_nat = opts.shared_nat.unwrap_or_else(crate::daemon::engine::shared_nat);
         let cfg = Config {
             cpus: opts.cpus.unwrap_or(2),
             memory_mib: opts.memory_mib.unwrap_or(1024),
@@ -187,7 +191,7 @@ impl Guest {
             console: console_output(opts)?,
             agent_port: kiri_proto::HOST_PORT,
             disk: if opts.data_disk { Some(data_disk(&dir, opts.disk_gb)?) } else { None },
-            nat_mac: if opts.data_disk { Some(mac_address()?) } else { None },
+            nat_mac: if opts.data_disk && shared_nat { Some(mac_address()?) } else { None },
             // The Mac's folders a bind mount may name: /mnt/mac in the guest.
             share: opts.data_disk.then(mac_share),
             rosetta_tag: opts.data_disk.then(|| "rosetta".to_owned()),

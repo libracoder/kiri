@@ -34,6 +34,7 @@ const IFA_LOCAL: u16 = 2;
 const RTA_DST: u16 = 1;
 const RTA_GATEWAY: u16 = 5;
 const RTA_OIF: u16 = 4;
+const RTA_PREFSRC: u16 = 7;
 
 /// One netlink message under construction.
 pub struct Msg {
@@ -386,6 +387,34 @@ fn default_route(nl: &mut Netlink, family: i32, gateway: &[u8], index: i32, flag
     }
 }
 
+/// Adds an IPv4 default route on device `index` with no gateway (`default dev
+/// <iface> scope link [src <prefsrc>]`). Used in a VM booted without an `eth0`
+/// NIC (shared NAT disabled) so locally originated connections (`--network host`
+/// containers) succeed route lookup and reach nftables `output` redirect rules
+/// instead of failing immediately with `ENETUNREACH`.
+pub fn add_device_default_route(nl: &mut Netlink, index: i32, prefsrc: Option<[u8; 4]>) -> io::Result<()> {
+    let mut m = device_default_route_msg(index, prefsrc);
+    match nl.request(&mut [m]) {
+        Err(e) if e.raw_os_error() == Some(libc::EEXIST) => Ok(()),
+        r => r,
+    }
+}
+
+fn device_default_route_msg(index: i32, prefsrc: Option<[u8; 4]>) -> Msg {
+    let mut m = Msg::new(RTM_NEWROUTE, NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL);
+    let mut rt = [0u8; 12];
+    rt[0] = libc::AF_INET as u8;
+    rt[4] = libc::RT_TABLE_MAIN;
+    rt[5] = libc::RTPROT_BOOT;
+    rt[6] = libc::RT_SCOPE_LINK;
+    rt[7] = libc::RTN_UNICAST;
+    m.raw(&rt).attr_u32(RTA_OIF, index as u32);
+    if let Some(src) = prefsrc {
+        m.attr(RTA_PREFSRC, &src);
+    }
+    m
+}
+
 /// Adds (or replaces) the route `dst/prefix via gateway`, or removes it.
 /// Removing one that isn't there is fine.
 pub fn set_route(nl: &mut Netlink, dst: [u8; 4], prefix: u8, gateway: [u8; 4], add: bool) -> io::Result<()> {
@@ -721,8 +750,13 @@ const CT_STATUS_DNAT: u32 = 1 << 5;
 /// and it passes. A container on two networks talks to each over its own
 /// interface there; a published port on another network is still reached
 /// through the host's address (ct status dnat), as with Docker.
+#[cfg(test)]
 fn forward_filter(bridges: &[String], guard: Option<&str>) -> Vec<Msg> {
-    forward_filter_in(libc::NFPROTO_IPV4 as u8, bridges, guard)
+    forward_filter_in(libc::NFPROTO_IPV4 as u8, bridges, guard, false)
+}
+
+fn forward_filter_v4(bridges: &[String], guard: Option<&str>, drop_lo: bool) -> Vec<Msg> {
+    forward_filter_in(libc::NFPROTO_IPV4 as u8, bridges, guard, drop_lo)
 }
 
 /// While Kiri's bridges are in firewalld's trusted zone (`firewall.rs`),
@@ -771,7 +805,9 @@ fn tcp_mss_clamp_rule(family: u8) -> Msg {
 
 /// `forward_filter` for a table of `family`: the same rules hold for IPv6.
 /// `guard`: the uplink, while `FORWARD_GUARD` holds one.
-fn forward_filter_in(family: u8, bridges: &[String], guard: Option<&str>) -> Vec<Msg> {
+/// `drop_lo`: drop forwarded packets routed out `lo` (when a VM has no `eth0`
+/// and installs a fallback `default dev lo` route for host-network egress).
+fn forward_filter_in(family: u8, bridges: &[String], guard: Option<&str>, drop_lo: bool) -> Vec<Msg> {
     let nft = |msg, flags| nft_in(family, msg, flags);
     let mut chain = nft(NFT_MSG_NEWCHAIN, NLM_F_ACK | NLM_F_CREATE);
     chain.attr_str(1, "kiri").attr_str(3, "forward");
@@ -841,6 +877,17 @@ fn forward_filter_in(family: u8, bridges: &[String], guard: Option<&str>) -> Vec
         ));
     }
     msgs.push(tcp_mss_clamp_rule(family));
+    if drop_lo {
+        let mut lo = [0u8; 16];
+        lo[..2].copy_from_slice(b"lo");
+        msgs.push(rule(
+            &|r| {
+                r.nest(1).attr_str(1, "meta").nest(2).attr_be32(1, 1).attr_be32(2, 7).end().end();
+                r.nest(1).attr_str(1, "cmp").nest(2).attr_be32(1, 1).attr_be32(2, 0).nest(3).attr(1, &lo).end().end().end();
+            },
+            drop,
+        ));
+    }
     msgs.extend([
         rule(&ifname(7, 1), accept),                           // NFT_CMP_NEQ
         rule(&ct_any(0, CT_ESTABLISHED | CT_RELATED), accept), // NFT_CT_STATE
@@ -1014,7 +1061,7 @@ pub fn install_nat6(subnets: &[([u8; 16], u8)], bridges: &[String], host_port: u
         chain.attr_be32(5, 1).attr_str(7, "nat");
         msgs.push(chain);
         msgs.extend(subnets.iter().map(|(s, p)| masq6_rule(*s, *p)));
-        msgs.extend(forward_filter_in(v6, bridges, forward_guard(v6).as_deref()));
+        msgs.extend(forward_filter_in(v6, bridges, forward_guard(v6).as_deref(), false));
     }
     if redirect {
         let mut input = nft_in(v6, NFT_MSG_NEWCHAIN, NLM_F_ACK | NLM_F_CREATE);
@@ -1262,6 +1309,38 @@ pub fn install_nat_full(
     wsl_host: Option<[u8; 4]>,
 ) -> io::Result<()> {
     let mut nl = Netlink::open(libc::NETLINK_NETFILTER)?;
+    let mut msgs = build_nat_batch(
+        uplink_index,
+        host_addr,
+        host_port,
+        redirect,
+        dnat,
+        gateway,
+        bridges,
+        local,
+        egress_port,
+        egress_routes,
+        egress_skip,
+        wsl_host,
+    );
+    nl.request(&mut msgs)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_nat_batch(
+    uplink_index: i32,
+    host_addr: [u8; 4],
+    host_port: u16,
+    redirect: bool,
+    dnat: &[Dnat],
+    gateway: [u8; 4],
+    bridges: &[String],
+    local: Option<&[[u8; 4]]>,
+    egress_port: u16,
+    egress_routes: &[([u8; 4], u8)],
+    egress_skip: &[([u8; 4], u8)],
+    wsl_host: Option<[u8; 4]>,
+) -> Vec<Msg> {
     // The table is replaced, not appended to (on a Linux host it outlives
     // the agent and changes with every published port), in one batch:
     // see clear_table.
@@ -1272,22 +1351,28 @@ pub fn install_nat_full(
     let mut table = nft(NFT_MSG_NEWTABLE, NLM_F_ACK | NLM_F_CREATE);
     table.attr_str(1, "kiri"); // NFTA_TABLE_NAME
 
-    let mut chain = nft(NFT_MSG_NEWCHAIN, NLM_F_ACK | NLM_F_CREATE);
-    chain.attr_str(1, "kiri").attr_str(3, "postrouting"); // NFTA_CHAIN_TABLE, NFTA_CHAIN_NAME
-    chain.nest(4).attr_be32(1, 4).attr_be32(2, 100).end(); // NFTA_CHAIN_HOOK: hooknum POSTROUTING, priority
-    chain.attr_be32(5, 1).attr_str(7, "nat"); // NFTA_CHAIN_POLICY accept, NFTA_CHAIN_TYPE
+    let has_uplink = uplink_index > 0;
+    let mut msgs = vec![begin, add, delete, table];
+    if has_uplink {
+        let mut chain = nft(NFT_MSG_NEWCHAIN, NLM_F_ACK | NLM_F_CREATE);
+        chain.attr_str(1, "kiri").attr_str(3, "postrouting"); // NFTA_CHAIN_TABLE, NFTA_CHAIN_NAME
+        chain.nest(4).attr_be32(1, 4).attr_be32(2, 100).end(); // NFTA_CHAIN_HOOK: hooknum POSTROUTING, priority
+        chain.attr_be32(5, 1).attr_str(7, "nat"); // NFTA_CHAIN_POLICY accept, NFTA_CHAIN_TYPE
 
-    let mut rule = nft(NFT_MSG_NEWRULE, NLM_F_ACK | NLM_F_CREATE | 0x800); // NLM_F_APPEND
-    rule.attr_str(1, "kiri").attr_str(2, "postrouting"); // NFTA_RULE_TABLE, NFTA_RULE_CHAIN
-    rule.nest(4); // NFTA_RULE_EXPRESSIONS
-    // meta load oif => reg 1 (NFTA_META_DREG, NFTA_META_KEY = NFT_META_OIF, which is 5)
-    rule.nest(1).attr_str(1, "meta").nest(2).attr_be32(1, 1).attr_be32(2, 5).end().end();
-    // cmp eq reg 1, uplink index
-    rule.nest(1).attr_str(1, "cmp").nest(2).attr_be32(1, 1).attr_be32(2, 0);
-    rule.nest(3).attr(1, &(uplink_index as u32).to_ne_bytes()).end().end().end();
-    // masquerade
-    rule.nest(1).attr_str(1, "masq").end();
-    rule.end();
+        let mut rule = nft(NFT_MSG_NEWRULE, NLM_F_ACK | NLM_F_CREATE | 0x800); // NLM_F_APPEND
+        rule.attr_str(1, "kiri").attr_str(2, "postrouting"); // NFTA_RULE_TABLE, NFTA_RULE_CHAIN
+        rule.nest(4); // NFTA_RULE_EXPRESSIONS
+        // meta load oif => reg 1 (NFTA_META_DREG, NFTA_META_KEY = NFT_META_OIF, which is 5)
+        rule.nest(1).attr_str(1, "meta").nest(2).attr_be32(1, 1).attr_be32(2, 5).end().end();
+        // cmp eq reg 1, uplink index
+        rule.nest(1).attr_str(1, "cmp").nest(2).attr_be32(1, 1).attr_be32(2, 0);
+        rule.nest(3).attr(1, &(uplink_index as u32).to_ne_bytes()).end().end().end();
+        // masquerade
+        rule.nest(1).attr_str(1, "masq").end();
+        rule.end();
+        msgs.push(chain);
+        msgs.push(rule);
+    }
 
     let mut end = Msg::new(NFNL_MSG_BATCH_END, 0);
     end.raw(&nfgen(libc::AF_UNSPEC as u8, NFNL_SUBSYS_NFTABLES));
@@ -1296,8 +1381,7 @@ pub fn install_nat_full(
         // A Linux host: no host.docker.internal redirect, but its published
         // ports are DNATed here (prerouting for the LAN, output for the host
         // itself), the whole table rebuilt on every change, atomically.
-        let mut msgs = vec![begin, add, delete, table, chain, rule];
-        msgs.extend(forward_filter(bridges, forward_guard(libc::NFPROTO_IPV4 as u8).as_deref()));
+        msgs.extend(forward_filter_v4(bridges, forward_guard(libc::NFPROTO_IPV4 as u8).as_deref(), false));
         msgs.extend(localnet_guard());
         if have_egress {
             msgs.push(host_relay_guard(egress_port));
@@ -1322,7 +1406,7 @@ pub fn install_nat_full(
             }
         }
         msgs.push(end);
-        return nl.request(&mut msgs);
+        return msgs;
     }
     let pre = nat_chain("prerouting", 0, -100); // NF_INET_PRE_ROUTING
     let out = nat_chain("output", 3, -100); // NF_INET_LOCAL_OUT
@@ -1330,8 +1414,8 @@ pub fn install_nat_full(
     let pre_rule = redirect_rule("prerouting", host_addr, host_port, true);
     // The host's own connections (and `--network host` containers).
     let out_rule = redirect_rule("output", host_addr, host_port, false);
-    let mut msgs = vec![begin, add, delete, table, chain, rule, pre, out, dns_redirect_rule(host_addr), pre_rule, out_rule];
-    msgs.extend(forward_filter(bridges, forward_guard(libc::NFPROTO_IPV4 as u8).as_deref()));
+    msgs.extend([pre, out, dns_redirect_rule(host_addr), pre_rule, out_rule]);
+    msgs.extend(forward_filter_v4(bridges, forward_guard(libc::NFPROTO_IPV4 as u8).as_deref(), !has_uplink));
     msgs.extend(localnet_guard());
     msgs.push(host_relay_guard(host_port));
     if have_egress {
@@ -1347,7 +1431,7 @@ pub fn install_nat_full(
             if d.host_port != host_port {
                 msgs.push(loopback_published_rule(d.host_port, host_port));
             }
-        } else {
+        } else if has_uplink {
             msgs.push(dnat_rule_from("prerouting", d, Some((uplink_index, gateway)), None));
         }
     }
@@ -1361,11 +1445,11 @@ pub fn install_nat_full(
             msgs.push(redirect_prefix_rule("output", dst, prefix, egress_port, false));
         }
     }
-    if dnat.iter().any(|d| !d.udp && d.host_ip != LOOPBACK) {
+    if has_uplink && dnat.iter().any(|d| !d.udp && d.host_ip != LOOPBACK) {
         msgs.push(published_masq_rule(uplink_index, gateway));
     }
     msgs.push(end);
-    nl.request(&mut msgs)
+    msgs
 }
 
 /// A published port's `host_ip` in the VM that means "the Mac's loopback":
@@ -1623,7 +1707,7 @@ mod tests {
         assert_eq!(get(&attrs(get(&e[1].1, 4)), 1)[..8], [255, 255, 255, 255, 255, 255, 255, 0xf8]);
         // the IPv6 forward filter is the IPv4 one in another family
         let bridges = ["kiri3".to_owned()];
-        let f = forward_filter_in(libc::NFPROTO_IPV6 as u8, &bridges, None);
+        let f = forward_filter_in(libc::NFPROTO_IPV6 as u8, &bridges, None, false);
         assert_eq!(f.len(), forward_filter(&bridges, None).len());
         assert!(f[1..].iter().all(|m| !names(m).contains(&"fib".to_owned())), "no nft_fib_ipv6 needed");
         assert!(f.iter().all(|m| m.buf[16] == libc::NFPROTO_IPV6 as u8));
@@ -1692,5 +1776,73 @@ mod tests {
         let e = exprs(&wsl);
         assert_eq!(be32(get(&e[3].1, 2)), 1, "cmp neq");
         assert_eq!(get(&attrs(get(&e[3].1, 3)), 1), &[192, 168, 65, 254]);
+    }
+
+    #[test]
+    fn device_default_route_and_no_uplink_nat_batch() {
+        // Fallback default route on lo (`default dev lo scope link src 127.0.0.1`).
+        let m = device_default_route_msg(1, Some(LOOPBACK));
+        assert_eq!(u16::from_ne_bytes([m.buf[4], m.buf[5]]), RTM_NEWROUTE);
+        assert_eq!(m.buf[16], libc::AF_INET as u8);
+        assert_eq!(m.buf[17], 0, "dst_len 0 (default route)");
+        assert_eq!(m.buf[20], libc::RT_TABLE_MAIN);
+        assert_eq!(m.buf[22], libc::RT_SCOPE_LINK);
+        assert_eq!(m.buf[23], libc::RTN_UNICAST);
+        let a = attrs(&m.buf[28..]); // nlmsghdr (16) + rtmsg (12)
+        assert_eq!(get(&a, RTA_OIF), &1u32.to_ne_bytes());
+        assert_eq!(get(&a, RTA_PREFSRC), &LOOPBACK);
+
+        // VM NAT table with uplink_index == 0 (no eth0): no postrouting chain/masq,
+        // forward drops oifname "lo", egress 0.0.0.0/0 redirects in prerouting+output,
+        // loopback published port rule still installed in output.
+        let lb = Dnat { udp: false, host_ip: LOOPBACK, host_port: 8080, to_ip: [172, 17, 0, 2], to_port: 80 };
+        let batch = build_nat_batch(
+            0,
+            [198, 19, 248, 254],
+            1026,
+            true,
+            &[lb],
+            [0; 4],
+            &["kiri0".to_owned()],
+            None,
+            1038,
+            &[([0, 0, 0, 0], 0)],
+            &[([127, 0, 0, 0], 8)],
+            None,
+        );
+        let msg_ty = |m: &Msg| u16::from_ne_bytes([m.buf[4], m.buf[5]]);
+        let newchain = (NFNL_SUBSYS_NFTABLES << 8) | NFT_MSG_NEWCHAIN;
+        let newrule = (NFNL_SUBSYS_NFTABLES << 8) | NFT_MSG_NEWRULE;
+        let chains: Vec<&[u8]> = batch.iter().filter(|m| msg_ty(m) == newchain).map(|m| get(&attrs(&m.buf[20..]), 3)).collect();
+        assert!(!chains.contains(&&b"postrouting\0"[..]), "no postrouting chain when uplink_index == 0");
+        assert!(chains.contains(&&b"prerouting\0"[..]) && chains.contains(&&b"output\0"[..]) && chains.contains(&&b"forward\0"[..]) && chains.contains(&&b"input\0"[..]));
+
+        let rules: Vec<&Msg> = batch.iter().filter(|m| msg_ty(m) == newrule).collect();
+        assert!(rules.iter().all(|r| !names(r).contains(&"masq".to_owned())), "no masquerade rule without eth0");
+
+        let mut lo_full = [0u8; 16];
+        lo_full[..2].copy_from_slice(b"lo");
+        let has_lo_drop = rules.iter().any(|r| {
+            get(&attrs(&r.buf[20..]), 2) == b"forward\0"
+                && names(r) == ["meta", "cmp", "immediate"]
+                && be32(get(&exprs(r)[0].1, 2)) == 7
+                && get(&attrs(get(&exprs(r)[1].1, 3)), 1) == &lo_full
+                && verdict(r) == libc::NF_DROP as u32
+        });
+        assert!(has_lo_drop, "forward chain must drop packets routed out lo when uplink_index == 0");
+
+        let has_egress_out = rules.iter().any(|r| {
+            get(&attrs(&r.buf[20..]), 2) == b"output\0"
+                && names(r) == ["meta", "cmp", "immediate", "redir"]
+                && get(&attrs(get(&exprs(r)[2].1, 2)), 1) == &1038u16.to_be_bytes()
+        });
+        assert!(has_egress_out, "output chain must redirect 0.0.0.0/0 TCP to egress port 1038");
+
+        let has_lb_rule = rules.iter().any(|r| {
+            get(&attrs(&r.buf[20..]), 2) == b"output\0"
+                && names(r) == ["meta", "cmp", "payload", "cmp", "payload", "cmp", "immediate", "redir"]
+                && get(&attrs(get(&exprs(r)[5].1, 3)), 1) == &8080u16.to_be_bytes()
+        });
+        assert!(has_lb_rule, "loopback published port rule must still be installed without eth0");
     }
 }

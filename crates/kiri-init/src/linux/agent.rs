@@ -591,15 +591,18 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
                     continue;
                 }
                 Ok(Msg::Publish(p)) => {
-                    // In the VM: from the Mac over the NAT network, TCP only.
+                    // In the VM: from the Mac over the NAT network (TCP only),
+                    // or on loopback (127.0.0.1) so `--network host` containers
+                    // reach published ports via the host relay even without eth0.
                     let gateway = dhcp.as_ref().and_then(|d| d.lease.as_ref()).map(|l| l.gateway);
-                    if !host_process && (p.udp || gateway.is_none()) {
+                    let loopback = p.host_ip == super::netlink::LOOPBACK;
+                    if !host_process && (p.udp || (!loopback && gateway.is_none())) {
                         Msg::Error("published ports are relayed on this platform").encode(&mut out);
                     } else {
                         let d = super::netlink::Dnat { udp: p.udp, host_ip: p.host_ip, host_port: p.host_port, to_ip: p.to_ip, to_port: p.to_port };
                         published.push((p.id.to_owned(), d));
                         let all = published.iter().map(|(_, d)| *d).collect::<Vec<_>>();
-                        match if host_process { net::publish(&all) } else { net::publish_vm(&all, gateway.expect("checked")) } {
+                        match if host_process { net::publish(&all) } else { net::publish_vm(&all, gateway.unwrap_or([0; 4])) } {
                             Ok(()) => Msg::Ack.encode(&mut out),
                             Err(e) => {
                                 published.pop();

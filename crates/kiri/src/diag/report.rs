@@ -289,6 +289,7 @@ pub fn vm_network_summary(info: Option<&Value>, bridge: Option<&crate::daemon::v
         let (ip, gw) = (u["ip"].as_str().unwrap_or("?"), u["gateway"].as_str().unwrap_or("?"));
         match u["mode"].as_str().unwrap_or("") {
             "dhcp" => lines.push(format!("VM uplink: DHCP ({ip} via {gw})")),
+            "host-egress" => lines.push("VM uplink: host egress over vsock (shared NAT disabled)".into()),
             "static-fallback" => {
                 dhcp_failed = true;
                 let (br, dns) = (u["bridge"].as_str().unwrap_or("bridge100"), u["dns"].as_str().unwrap_or("?"));
@@ -1091,6 +1092,9 @@ mod tests {
 
         let ok = vm_network_summary(Some(&json!({"KiriVmUplink": {"mode": "dhcp", "ip": "192.168.64.28", "gateway": "192.168.64.1"}})), Some(&bridge), None).unwrap();
         assert!(ok.contains("VM uplink: DHCP (192.168.64.28 via 192.168.64.1)") && !ok.contains("UDP port 67"), "{ok}");
+
+        let host_egress = vm_network_summary(Some(&json!({"KiriVmUplink": {"mode": "host-egress"}})), None, None).unwrap();
+        assert!(host_egress.contains("VM uplink: host egress over vsock (shared NAT disabled)") && !host_egress.contains("UDP port 67"), "{host_egress}");
 
         let fail = vm_network_summary(Some(&json!({"KiriVmUplink": {"mode": "fallback-failed", "reason": "no bridge100"}})), None, None).unwrap();
         assert!(fail.contains("DHCP did not answer and fallback failed (no bridge100)") && fail.contains("Host UDP port 67: none visible"), "{fail}");

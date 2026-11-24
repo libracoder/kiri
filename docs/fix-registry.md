@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #473 Mac: bind unprivileged low ports (`<1024`) on loopback and allow disabling `VZNATNetworkDeviceAttachment` (`kiri vm set --shared-nat off`) for Cloudflare WARP and strict TLS firewalls (unreleased)
+- Fixes: #473 Port forwarding for ports `<1024` fails without root on macOS even when binding `127.0.0.1`, #383 Cloudflare WARP breaks container networking on macOS (`InternetSharing` conflict), #350 TLS 1.3 handshake hangs when corporate firewall drops non-DF packets from macOS `InternetSharing` NAT
+- Caused: none known
+- Caused by: -
+- Check: `crates/kiri/src/vm_cli.rs`, `crates/kiri/src/daemon/ports.rs`
+
 ### #382, #415 Guest kernel: persist explicit `chown` ownership on virtiofs inodes and enable close-to-open page/dir caching with 1 MiB read-ahead (unreleased)
 - Fixes: #382 `chown` on macOS bind mounts returns 0 without updating file owner, breaking subsequent `chmod` (`initdb`, PostgreSQL, npm) as that user; #415 Slow small-file read throughput on macOS virtiofs bind mounts
 - Caused: none known

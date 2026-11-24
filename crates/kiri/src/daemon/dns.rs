@@ -132,7 +132,7 @@ fn relay_one(stream: &kiri_vmm::VsockStream) {
         return;
     }
     static SAID: AtomicBool = AtomicBool::new(false);
-    if !SAID.swap(true, Ordering::Relaxed) {
+    if should_warn_gateway_dns(super::ports::shared_nat_active(), &SAID) {
         crate::diag::warn!("the VM's DNS at its gateway did not answer; container lookups go through the Mac");
     }
     let name = question_name(query).unwrap_or_default();
@@ -141,6 +141,10 @@ fn relay_one(stream: &kiri_vmm::VsockStream) {
     let rlen = reply.len().min(usize::from(u16::MAX));
     let hdr = (rlen as u16).to_be_bytes();
     let _ = conn.write_all(&hdr).and_then(|()| conn.write_all(&reply[..rlen]));
+}
+
+fn should_warn_gateway_dns(shared_nat_active: bool, said: &AtomicBool) -> bool {
+    shared_nat_active && !said.swap(true, Ordering::Relaxed)
 }
 
 /// Whether `q` is a standard DNS query with one well-formed question: the
@@ -442,5 +446,15 @@ mod tests {
         assert_eq!((&r[..2], r[2] & 0x80, r[3] & 0x0f), (&q[..2], 0x80, 2));
         assert_eq!((&r[4..12], &r[12..]), (&[0, 1, 0, 0, 0, 0, 0, 0][..], &q[12..]));
         assert_eq!(super::servfail(&[0x12, 0x34, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0])[3], 0x82);
+    }
+
+    #[test]
+    fn gateway_dns_warning_suppressed_when_shared_nat_is_disabled() {
+        use std::sync::atomic::AtomicBool;
+        let said = AtomicBool::new(false);
+        assert!(!super::should_warn_gateway_dns(false, &said));
+        assert!(!super::should_warn_gateway_dns(false, &said));
+        assert!(super::should_warn_gateway_dns(true, &said), "still warns once when shared NAT is active");
+        assert!(!super::should_warn_gateway_dns(true, &said), "only once per run");
     }
 }

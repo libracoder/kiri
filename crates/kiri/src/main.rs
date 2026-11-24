@@ -78,6 +78,8 @@ mod setup;
 mod usb;
 #[cfg(unix)]
 mod stale;
+#[cfg(target_os = "macos")]
+mod vm_cli;
 #[cfg(any(windows, test))]
 mod wsl;
 #[cfg(any(unix, windows))]
@@ -118,6 +120,8 @@ const USAGE_LINES: &[&str] = &[
     "       kiri k8s start [--use] | stop | status | delete | set [--lan on|off] [--tls-san NAME,…] [--port N] [--version TAG|default] [--k3s-arg ARG]… [--clear-k3s-args]",
     "       kiri usb [list] | attach DEVICE | detach DEVICE   USB devices for containers, beta (Mac: pass through to the VM)",
     "       kiri machine create NAME [--distro D] | list | shell NAME | stop | delete NAME",
+    #[cfg(target_os = "macos")]
+    "       kiri vm [status | set --shared-nat on|off]   VM networking (off avoids macOS InternetSharing)",
     #[cfg(target_os = "macos")]
     "       kiri import [orbstack | desktop-linux] [--list | [--force] [image|volume|container NAME]]",
     #[cfg(target_os = "macos")]
@@ -185,6 +189,8 @@ enum Command<'a> {
     Usb(&'a [String]),
     #[cfg(target_os = "macos")]
     Import(&'a [String]),
+    #[cfg(target_os = "macos")]
+    Vm(&'a [String]),
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     Update(&'a [String]),
     #[cfg(unix)]
@@ -251,6 +257,8 @@ impl<'a> Command<'a> {
             Some("usb") => Some(Command::Usb(&args[1..])),
             #[cfg(target_os = "macos")]
             Some("import") => Some(Command::Import(&args[1..])),
+            #[cfg(target_os = "macos")]
+            Some("vm") => Some(Command::Vm(&args[1..])),
             #[cfg(any(target_os = "macos", target_os = "linux"))]
             Some("update") if !docker::is_container_update(&args[1..]) => Some(Command::Update(&args[1..])),
             #[cfg(unix)]
@@ -333,6 +341,8 @@ fn main() -> ExitCode {
         Some(Command::Usb(rest)) => usb::run(rest),
         #[cfg(target_os = "macos")]
         Some(Command::Import(rest)) => import::run(rest),
+        #[cfg(target_os = "macos")]
+        Some(Command::Vm(rest)) => vm_cli::run(rest),
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         Some(Command::Update(rest)) => update::run(rest),
         #[cfg(unix)]
@@ -493,7 +503,7 @@ mod tests {
         }
         #[cfg(target_os = "macos")]
         {
-            for mac_cmd in ["setup", "update", "import", "bench", "boot"] {
+            for mac_cmd in ["setup", "update", "vm", "import", "bench", "boot"] {
                 assert!(cmds.contains(&mac_cmd), "macOS help missing `{mac_cmd}`:\n{help}");
             }
             assert!(
@@ -509,13 +519,13 @@ mod tests {
             assert!(cmds.contains(&"update"), "Linux help missing `update`:\n{help}");
             assert!(help.contains("kiri update --check"), "Linux help missing `kiri update --check`:\n{help}");
             assert!(!help.contains("kiri update [--check]"), "Linux help must not list macOS `kiri update [--check]`:\n{help}");
-            for mac_cmd in ["setup", "import", "bench", "boot"] {
+            for mac_cmd in ["setup", "vm", "import", "bench", "boot"] {
                 assert!(!cmds.contains(&mac_cmd), "Linux help must not list macOS-only `{mac_cmd}`:\n{help}");
             }
         }
         #[cfg(windows)]
         {
-            for unix_or_mac in ["daemon", "bridge", "ui", "setup", "build-with", "update", "import", "bench", "boot", "raw"] {
+            for unix_or_mac in ["daemon", "bridge", "ui", "setup", "build-with", "update", "vm", "import", "bench", "boot", "raw"] {
                 assert!(!cmds.contains(&unix_or_mac), "Windows help must not list `{unix_or_mac}`:\n{help}");
             }
         }
@@ -582,12 +592,12 @@ mod tests {
         #[cfg(target_os = "macos")]
         assert!(parse(&["bridge"]).is_none());
         #[cfg(target_os = "linux")]
-        for mac_cmd in ["setup", "import", "bench", "boot"] {
+        for mac_cmd in ["setup", "vm", "import", "bench", "boot"] {
             assert!(parse(&[mac_cmd]).is_none(), "`kiri {mac_cmd}` should not dispatch on Linux");
         }
         #[cfg(windows)]
         {
-            for unix_cmd in ["bridge", "ui", "setup", "build-with", "import", "bench", "boot", "raw"] {
+            for unix_cmd in ["bridge", "ui", "setup", "build-with", "vm", "import", "bench", "boot", "raw"] {
                 assert!(parse(&[unix_cmd]).is_none(), "`kiri {unix_cmd}` should not dispatch on Windows");
             }
             let daemon_args = ["daemon".to_owned()];
