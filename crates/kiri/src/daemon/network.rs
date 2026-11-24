@@ -97,7 +97,12 @@ pub fn parse_ip6(s: &str) -> Option<[u8; 16]> {
 }
 
 fn mask6(prefix: u8) -> u128 {
-    if prefix == 0 { 0 } else { u128::MAX << (128 - prefix as u32) }
+    match prefix {
+        // Not parsed this way (and never serialized), but `networks.json`
+        // holds plain bytes and a bad one must not panic the shifts.
+        0 | 129.. => 0,
+        p => u128::MAX << (128 - p as u32),
+    }
 }
 
 pub fn in_subnet6(ip: [u8; 16], subnet: [u8; 16], prefix: u8) -> bool {
@@ -139,8 +144,13 @@ impl V6 {
         let base = u128::from_be_bytes(self.subnet);
         let (first, last) = match self.ip_range {
             Some((r, p)) => {
-                let start = u128::from_be_bytes(r) - base;
-                (start.max(1), (start + !mask6(p)).min(self.last()))
+                // `wrapping_sub` and `saturating_add` because `networks.json`
+                // holds plain bytes: an ip-range outside the subnet, or a span
+                // past the top of the address space, must not panic or wrap
+                // into a wrong range (the request path checks both; an old or
+                // hand-edited file may not).
+                let start = u128::from_be_bytes(r).wrapping_sub(base);
+                (start.max(1), start.saturating_add(!mask6(p)).min(self.last()))
             }
             None => (1, self.last()),
         };
@@ -150,7 +160,7 @@ impl V6 {
             if h > last {
                 return None;
             }
-            let ip = (base + h).to_be_bytes();
+            let ip = base.checked_add(h)?.to_be_bytes();
             if !self.used.contains(&h) && !self.reserved(ip) && !avoid.contains(&ip) {
                 self.used.insert(h);
                 return Some(ip);
@@ -193,18 +203,30 @@ impl Network {
     /// The next free address, skipping the network, broadcast, gateway and
     /// auxiliary addresses and `avoid`; only from `--ip-range` when one is set.
     fn allocate_avoiding(&mut self, avoid: &[[u8; 4]]) -> Option<[u8; 4]> {
-        let base = u32::from_be_bytes(self.subnet);
-        let size = 1u32 << (32 - self.prefix as u32);
+        let base = u32::from_be_bytes(self.subnet) as u64;
+        // In `u64`, with the size clamped, because `networks.json` holds plain
+        // bytes: a prefix past /32 (or the /0 the request path refuses) must
+        // not panic the shift, and a subnet too small for host parts must run
+        // out of addresses, not underflow. The request path already checks
+        // both (`parse_ipam`, /8..=/30).
+        let size = 1u64 << (32 - self.prefix.min(32) as u32);
+        let max_host = size.saturating_sub(2).min((u32::MAX as u64).saturating_sub(base));
         let (first, last) = match self.ip_range {
             Some((r, p)) => {
-                let start = u32::from_be_bytes(r) - base;
-                (start.max(1), (start + (1u32 << (32 - p as u32)) - 1).min(size - 2))
+                let start = (u32::from_be_bytes(r).wrapping_sub(base as u32)) as u64;
+                (start.max(1), (start + (1u64 << (32 - p.min(32) as u32)) - 1).min(max_host))
             }
-            None => (1, size - 2),
+            None => (1, max_host),
         };
-        let host = (first..=last).find(|h| !self.used.contains(h) && !self.reserved((base + h).to_be_bytes()) && !avoid.contains(&(base + h).to_be_bytes()))?;
+        let host = (first..=last).find(|h| {
+            // An address past the end of the space (`base + h` over u32) is no
+            // address to hand out.
+            let Ok(ip) = u32::try_from(base + h).map(|a| a.to_be_bytes()) else { return false };
+            !self.used.contains(&(*h as u32)) && !self.reserved(ip) && !avoid.contains(&ip)
+        })?;
+        let host = u32::try_from(host).ok()?;
         self.used.insert(host);
-        Some((base + host).to_be_bytes())
+        u32::try_from(base + host as u64).ok().map(|a| a.to_be_bytes())
     }
 
     /// Whether a container may ask for `ip` here (`--ip`, Compose
@@ -220,8 +242,8 @@ impl Network {
         if !self.user_subnet {
             return Err("user specified IP address is supported only when connecting to networks with user configured subnets".into());
         }
-        let size = 1u32 << (32 - self.prefix as u32);
-        let host = u32::from_be_bytes(ip).wrapping_sub(u32::from_be_bytes(self.subnet));
+        let size = 1u64 << (32 - self.prefix.min(32) as u32);
+        let host = u32::from_be_bytes(ip).wrapping_sub(u32::from_be_bytes(self.subnet)) as u64;
         if !self.contains(ip) || host == 0 || host == size - 1 {
             return Err(format!("no configured subnet or ip-range contain the IP address {}", ip_str(ip)));
         }
@@ -261,7 +283,7 @@ impl Network {
     /// Takes `ip` for a container that asked for it.
     fn reserve(&mut self, ip: [u8; 4]) -> Result<(), String> {
         self.check_static(ip)?;
-        let host = u32::from_be_bytes(ip) - u32::from_be_bytes(self.subnet);
+        let host = u32::from_be_bytes(ip).wrapping_sub(u32::from_be_bytes(self.subnet));
         if self.reserved(ip) || !self.used.insert(host) {
             return Err(format!("Address already in use: {}", ip_str(ip)));
         }
@@ -418,7 +440,9 @@ pub struct Ipam {
 }
 
 pub fn in_subnet(ip: [u8; 4], subnet: [u8; 4], prefix: u8) -> bool {
-    let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix as u32) };
+    // `min(32)` because `networks.json` holds plain bytes; a prefix past /32
+    // must not panic the shift (the request path already refuses one).
+    let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix.min(32) as u32) };
     u32::from_be_bytes(ip) & mask == u32::from_be_bytes(subnet)
 }
 
@@ -883,7 +907,7 @@ impl PartialEq for HostNet {
 }
 
 fn mask4(prefix: u8) -> u32 {
-    if prefix == 0 { 0 } else { u32::MAX << (32 - prefix as u32) }
+    if prefix == 0 { 0 } else { u32::MAX << (32 - prefix.min(32) as u32) }
 }
 
 impl HostNet {
@@ -1187,6 +1211,106 @@ mod tests {
         assert!(bad(serde_json::json!({"Subnet": "10.5.0.0/24", "IPRange": "10.5.0.0/16"})).contains("ip-range"));
         assert!(bad(serde_json::json!({"Subnet": "10.5.0.0/24", "AuxiliaryAddresses": {"a": "10.9.0.1"}})).contains("auxiliary address a"));
         assert!(parse_ipam(&serde_json::json!({"Driver": "other"})).is_err());
+        // A subnet too small for the arithmetic (a /0 could panic the size
+        // shift; a /31 or /32 has no room for a gateway and a container) and
+        // an ip-range outside the subnet are refused, as Docker does.
+        assert_eq!(bad(serde_json::json!({"Subnet": "0.0.0.0/0"})), "invalid subnet 0.0.0.0/0: Kiri supports prefixes from /8 to /30");
+        assert_eq!(bad(serde_json::json!({"Subnet": "10.5.0.0/31"})), "invalid subnet 10.5.0.0/31: Kiri supports prefixes from /8 to /30");
+        assert_eq!(bad(serde_json::json!({"Subnet": "10.5.0.0/32"})), "invalid subnet 10.5.0.0/32: Kiri supports prefixes from /8 to /30");
+        assert!(bad(serde_json::json!({"Subnet": "10.5.0.0/24", "IPRange": "10.6.0.0/24"})).contains("parent subnet 10.5.0.0/24 does not contain ip-range"));
+    }
+
+    /// A /30, the smallest user subnet the request path takes, still creates
+    /// and hands out its one container address; its `--ip-range` picks it.
+    #[test]
+    fn the_smallest_allowed_subnet_still_creates_and_allocates() {
+        let (mut n, dir) = nets();
+        let ipam = parse_ipam(&serde_json::json!({"Config": [{"Subnet": "10.6.0.0/30", "IPRange": "10.6.0.2/32"}]})).unwrap().unwrap();
+        let net = n.create("tiny", Settings { ipam: Some(ipam), ..Default::default() }).unwrap();
+        assert_eq!((net.subnet, net.prefix), ([10, 6, 0, 0], 30));
+        assert!(net.check_static([10, 6, 0, 2]).is_ok());
+        assert!(net.check_static([10, 6, 0, 0]).is_err());
+        assert!(net.check_static([10, 6, 0, 3]).is_err());
+        assert_eq!(n.allocate_avoiding("tiny", &[]), Some([10, 6, 0, 2]));
+        assert_eq!(n.allocate_avoiding("tiny", &[]), None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Malformed or hand-edited `networks.json` records (prefixes at 0 or past
+    /// /32 and /128, out-of-subnet `ip_range`s, or unaligned subnets near
+    /// `u32::MAX` / `u128::MAX`) never panic shifts or wrap into bad addresses.
+    #[test]
+    fn malformed_saved_network_fields_do_not_panic_or_hand_out_bad_ips() {
+        assert_eq!(mask6(0), 0);
+        assert_eq!(mask6(64), u128::MAX << 64);
+        assert_eq!(mask6(128), u128::MAX);
+        assert_eq!(mask6(129), 0);
+        assert_eq!(mask6(255), 0);
+        assert!(!in_subnet6([0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1], [0xfd, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 200));
+
+        assert!(in_subnet([10, 5, 0, 1], [10, 5, 0, 1], 33));
+        assert!(!in_subnet([10, 5, 0, 2], [10, 5, 0, 1], 200));
+        assert_eq!(mask4(200), u32::MAX);
+
+        // IPv4: prefixes /31, /32, /33, /255 never underflow `size - 2` or panic shifts.
+        for bad_prefix in [31u8, 32, 33, 255] {
+            let mut n = net(Some(Ipam { subnet: [10, 5, 0, 0], prefix: 24, gateway: None, ip_range: None, aux: BTreeMap::new() }));
+            n.prefix = bad_prefix;
+            assert_eq!(n.allocate_avoiding(&[]), None, "prefix /{bad_prefix}");
+            assert!(n.check_static([10, 5, 0, 0]).is_err(), "prefix /{bad_prefix}");
+            assert!(n.check_static([10, 5, 0, 1]).is_err(), "prefix /{bad_prefix}");
+        }
+
+        // IPv4: /0 and unaligned subnet near `u32::MAX` never panic, wrap, or spin.
+        let mut slash0 = net(Some(Ipam { subnet: [0, 0, 0, 0], prefix: 24, gateway: Some([0, 0, 0, 1]), ip_range: None, aux: BTreeMap::new() }));
+        slash0.subnet = [0, 0, 0, 0];
+        slash0.prefix = 0;
+        assert_eq!(slash0.allocate_avoiding(&[]), Some([0, 0, 0, 2]));
+        assert!(slash0.check_static([0, 0, 0, 0]).is_err());
+        assert!(slash0.check_static([255, 255, 255, 255]).is_err());
+        assert!(slash0.check_static([0, 0, 0, 2]).is_ok());
+
+        let mut high4 = net(Some(Ipam { subnet: [10, 5, 0, 0], prefix: 24, gateway: None, ip_range: None, aux: BTreeMap::new() }));
+        high4.subnet = [255, 255, 255, 253];
+        high4.gateway = [255, 255, 255, 254];
+        high4.prefix = 0;
+        assert_eq!(high4.allocate_avoiding(&[]), Some([255, 255, 255, 255]));
+        assert_eq!(high4.allocate_avoiding(&[]), None, "stops at u32::MAX without wrapping or spinning");
+
+        // IPv4: `ip_range` below or above `subnet`, or with prefix > 32.
+        for range in [([10, 4, 0, 0], 24), ([10, 6, 0, 0], 24)] {
+            let mut n = net(Some(Ipam { subnet: [10, 5, 0, 0], prefix: 24, gateway: None, ip_range: Some(range), aux: BTreeMap::new() }));
+            assert_eq!(n.allocate_avoiding(&[]), None, "{range:?}");
+        }
+        let mut bad_rp = net(Some(Ipam { subnet: [10, 5, 0, 0], prefix: 24, gateway: None, ip_range: Some(([10, 5, 0, 9], 200)), aux: BTreeMap::new() }));
+        assert_eq!(bad_rp.allocate_avoiding(&[]), Some([10, 5, 0, 9]));
+        assert_eq!(bad_rp.allocate_avoiding(&[]), None);
+
+        // IPv6: `ip_range` outside `subnet` (below and above, including /0 and /200)
+        // and unaligned `subnet` near `u128::MAX` (`base.checked_add(h)` guard).
+        let mk_v6 = |subnet: [u8; 16], prefix: u8, gateway: [u8; 16], ip_range: Option<([u8; 16], u8)>| V6 {
+            subnet,
+            prefix,
+            gateway,
+            user_subnet: true,
+            ip_range,
+            aux: BTreeMap::new(),
+            used: BTreeSet::new(),
+        };
+        let s5 = parse_ip6("fd00:5::").unwrap();
+        let g5 = parse_ip6("fd00:5::1").unwrap();
+        let s4 = parse_ip6("fd00:4::").unwrap();
+        let s6 = parse_ip6("fd00:6::").unwrap();
+        assert_eq!(mk_v6(s5, 128, g5, None).allocate_avoiding(&[]), None);
+        assert_eq!(mk_v6(s5, 64, g5, Some((s4, 64))).allocate_avoiding(&[]), None);
+        assert_eq!(mk_v6(s5, 0, g5, Some((s4, 64))).allocate_avoiding(&[]), None);
+        assert_eq!(mk_v6(s5, 200, g5, Some((s4, 200))).allocate_avoiding(&[]), None);
+        assert_eq!(mk_v6(s5, 64, g5, Some((s6, 64))).allocate_avoiding(&[]), None);
+
+        let mut near_max = mk_v6((u128::MAX - 2).to_be_bytes(), 64, (u128::MAX - 1).to_be_bytes(), None);
+        assert_eq!(near_max.allocate_avoiding(&[]), Some(u128::MAX.to_be_bytes()));
+        assert_eq!(near_max.allocate_avoiding(&[]), None, "checked_add stops past u128::MAX");
+        assert_eq!(mk_v6([0xff; 16], 64, [0; 16], None).allocate_avoiding(&[]), None);
     }
 
     #[test]

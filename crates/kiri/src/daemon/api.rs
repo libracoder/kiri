@@ -2660,14 +2660,15 @@ pub(super) fn limits_from(h: &Value, base: super::engine::Limits) -> Result<supe
     }
     if let Some(q) = h["CpuQuota"].as_i64().filter(|q| *q > 0) {
         l.cpu_quota = q as u64;
-        l.cpu_period = h["CpuPeriod"].as_u64().filter(|p| *p > 0).unwrap_or(100_000) as u32;
+        l.cpu_period = u32::try_from(h["CpuPeriod"].as_u64().filter(|p| *p > 0).unwrap_or(100_000))
+            .map_err(|_| Error::BadRequest("CpuPeriod is too large".into()))?;
     }
     if let Some(shares) = h["CpuShares"].as_u64().filter(|s| *s > 0) {
         l.cpu_shares = shares;
         l.cpu_weight = cpu_weight(shares);
     }
-    if let Some(p) = h["PidsLimit"].as_i64().filter(|p| *p > 0) {
-        l.pids_max = p as u32;
+    if let Some(p) = h["PidsLimit"].as_u64().filter(|p| *p > 0) {
+        l.pids_max = u32::try_from(p).map_err(|_| Error::BadRequest("PidsLimit is too large".into()))?;
     }
     Ok(l)
 }
@@ -2687,20 +2688,22 @@ pub(super) fn restart_policy(v: &Value, creating: bool) -> Result<RestartPolicy,
         };
         return Err(Error::BadRequest(message));
     }
-    let max_retries = v["MaximumRetryCount"].as_i64().unwrap_or(0);
-    if max_retries < 0 {
+    if v["MaximumRetryCount"].as_i64().is_some_and(|n| n < 0) {
         return Err(Error::BadRequest(
             "invalid restart policy: maximum retry count cannot be negative".into(),
         ));
     }
+    let max_retries = v["MaximumRetryCount"].as_u64().unwrap_or(0);
     if max_retries > 0 && name != "on-failure" {
         return Err(Error::BadRequest(
             "invalid restart policy: maximum retry count can only be used with 'on-failure'".into(),
         ));
     }
+    let max_retries = u32::try_from(max_retries)
+        .map_err(|_| Error::BadRequest("invalid restart policy: maximum retry count is too large".into()))?;
     Ok(RestartPolicy {
         name: name.to_owned(),
-        max_retries: max_retries as u32,
+        max_retries,
     })
 }
 
@@ -6775,6 +6778,25 @@ mod network_option_tests {
         }
         let l = super::limits_from(&json!({"CpuShares": 1024}), Default::default()).unwrap();
         assert_eq!((l.cpu_shares, l.cpu_weight), (1024, 100));
+        // Limits above `u32::MAX` were silently truncated (`as u32`); they are
+        // a 400 now, while legal values and `0`/`-1` sentinels stay intact.
+        let big = (u32::MAX as u64) + 1;
+        assert!(matches!(limits_from(&json!({"CpuQuota": 100_000, "CpuPeriod": big}), Default::default()), Err(Error::BadRequest(_))));
+        assert!(matches!(limits_from(&json!({"CpuQuota": 100_000, "CpuPeriod": u64::MAX}), Default::default()), Err(Error::BadRequest(_))));
+        assert_eq!(limits_from(&json!({"CpuQuota": 100_000, "CpuPeriod": 50_000}), Default::default()).unwrap().cpu_period, 50_000);
+        assert_eq!(limits_from(&json!({"CpuQuota": 100_000, "CpuPeriod": 0}), Default::default()).unwrap().cpu_period, 100_000);
+        assert_eq!(limits_from(&json!({"CpuQuota": 100_000, "CpuPeriod": -1}), Default::default()).unwrap().cpu_period, 100_000);
+        assert!(matches!(limits_from(&json!({"PidsLimit": big}), Default::default()), Err(Error::BadRequest(_))));
+        assert!(matches!(limits_from(&json!({"PidsLimit": u64::MAX}), Default::default()), Err(Error::BadRequest(_))));
+        let pids_set = limits_from(&json!({"PidsLimit": 256}), Default::default()).unwrap();
+        assert_eq!(pids_set.pids_max, 256);
+        assert_eq!(limits_from(&json!({"PidsLimit": 0}), Default::default()).unwrap().pids_max, 0);
+        assert_eq!(limits_from(&json!({"PidsLimit": -1}), Default::default()).unwrap().pids_max, 0);
+        assert_eq!(limits_from(&json!({"PidsLimit": 0}), pids_set).unwrap().pids_max, 256);
+        assert_eq!(limits_from(&json!({"PidsLimit": -1}), pids_set).unwrap().pids_max, 256);
+        assert!(matches!(restart_policy(&json!({"Name": "on-failure", "MaximumRetryCount": big}), true), Err(Error::BadRequest(_))));
+        assert!(matches!(restart_policy(&json!({"Name": "on-failure", "MaximumRetryCount": u64::MAX}), false), Err(Error::BadRequest(_))));
+        assert_eq!(restart_policy(&json!({"Name": "on-failure", "MaximumRetryCount": 5}), true).unwrap().max_retries, 5);
         // Rises with the shares, never backwards.
         let mut last = 0;
         for s in 2..5000 {

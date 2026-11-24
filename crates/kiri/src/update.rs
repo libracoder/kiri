@@ -68,9 +68,15 @@ pub fn newer(candidate: &str, current: &str) -> bool {
     false
 }
 
+/// The same guard the registry client (`kiri-image/src/connect.rs`) uses: a
+/// read that sits silent this long fails, so a stalled server cannot hang
+/// `kiri update`'s feed check or download forever.
+const STALL: std::time::Duration = std::time::Duration::from_secs(60);
+
 fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_connect(Some(std::time::Duration::from_secs(10)))
+        .timeout_per_read(Some(STALL))
         .user_agent(concat!("kiri/", env!("CARGO_PKG_VERSION")))
         // The system's roots merged with webpki's, like the registry client
         // (#303); the feed often sits behind a corporate proxy's CA.

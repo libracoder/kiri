@@ -33,9 +33,15 @@ pub fn lite() -> bool {
         .is_some_and(|r| r.join("guest/Image").is_file() && !r.join("bin/docker").is_file())
 }
 
+/// The longest one read may sit silent, the same guard the registry client
+/// (`kiri-image/src/connect.rs`) puts on pulls: a server that stops sending
+/// mid-download fails the download instead of hanging it forever.
+const STALL: Duration = Duration::from_secs(60);
+
 pub(crate) fn agent() -> ureq::Agent {
     let mut cfg = ureq::Agent::config_builder()
         .timeout_connect(Some(Duration::from_secs(15)))
+        .timeout_per_read(Some(STALL))
         .user_agent(concat!("kiri/", env!("CARGO_PKG_VERSION")))
         // The system's roots merged with webpki's, like the registry client
         // (#303); downloads run behind the same corporate proxies.
