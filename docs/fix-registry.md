@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #652 Tests: kiri-win's tests pass on Windows (unreleased)
+- Fixes: no issue
+- Caused: none known
+- Caused by: -
+- Check: none
+
 ### #259 Windows: cancellable pull reads on Windows (unreleased)
 - Fixes: no issue
 - Caused: none known
