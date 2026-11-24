@@ -30,6 +30,7 @@ mod http;
 mod logfile;
 mod names;
 mod network;
+mod secrets;
 #[cfg(target_os = "macos")]
 pub(crate) mod nfs;
 mod ops;

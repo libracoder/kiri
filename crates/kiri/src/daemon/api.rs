@@ -88,6 +88,8 @@ pub fn serve(stream: UnixStream, engine: Arc<Engine>, caller: Caller) -> io::Res
 fn streams_body(method: &str, path: &str) -> bool {
     matches!((method, path), ("PUT", p) if p.starts_with("/containers/") && p.ends_with("/archive"))
         || matches!((method, path), ("POST", p) if p.starts_with("/kiri/containers/") && p.ends_with("/upper"))
+        // A secret's value can be a cert or a key.
+        || (method == "POST" && path == "/kiri/secrets")
         || (method == "POST" && matches!(path, "/images/load" | "/images/create" | "/build"))
 }
 
@@ -176,6 +178,12 @@ fn route(req: &Request, engine: &Arc<Engine>, caller: &Caller, w: &mut UnixStrea
             http::respond_with(w, 200, "text/plain; charset=utf-8", "Builder-Version: 1\r\n", if m == "HEAD" { b"" } else { b"OK" })?;
             return Ok(Next::KeepAlive);
         }
+        // Prometheus-style metrics for a scraper: counts read from the state
+        // the daemon already holds, never a round-trip to the guest.
+        ("GET", "/metrics") => {
+            http::respond_with(w, 200, "text/plain; version=0.0.4; charset=utf-8", "", &metrics(engine).into_bytes())?;
+            return Ok(Next::KeepAlive);
+        }
         ("GET", "/version") => return reply(w, Ok(version()), 200),
         ("POST", "/auth") => return reply(w, auth(req), 200),
         // Kiri's own: the window's Start and Stop.
@@ -188,6 +196,18 @@ fn route(req: &Request, engine: &Arc<Engine>, caller: &Caller, w: &mut UnixStrea
         ("POST", "/kiri/stop") => return reply(w, engine.stop_all().map(|()| Value::Null), 204),
         ("POST", "/kiri/sleep") => return reply(w, engine.sleep_now().map(|()| Value::Null), 204),
         ("GET", "/kiri/proxy") => return reply(w, Ok(super::proxy::report()), 200),
+        // Kiri's own secrets: values sealed at rest under the engine's own
+        // key (`secrets.key`), listed and read by name, never with a value
+        // back. A container start names one in its env with
+        // `secret:<name>`; that is the only place a value goes.
+        ("GET", "/kiri/secrets") => return reply(w, secrets_list(engine), 200),
+        ("POST", "/kiri/secrets") => return reply(w, secrets_set(req, engine), 201),
+        ("GET", p) if p.strip_prefix("/kiri/secrets/").is_some_and(|n| !n.is_empty() && !n.contains('/')) => {
+            return reply(w, secret_info(engine, p.strip_prefix("/kiri/secrets/").unwrap_or_default()), 200);
+        }
+        ("DELETE", p) if p.strip_prefix("/kiri/secrets/").is_some_and(|n| !n.is_empty() && !n.contains('/')) => {
+            return reply(w, secret_remove(engine, p.strip_prefix("/kiri/secrets/").unwrap_or_default()), 204);
+        }
         ("POST", "/kiri/proxy") => return reply(w, set_proxy(req), 200),
         ("PUT", "/kiri/proxy/system") => return reply(w, set_host_proxy(req), 200),
         // kiri-win's Windows roots, for the engine in WSL (#303).
@@ -245,6 +265,15 @@ fn route(req: &Request, engine: &Arc<Engine>, caller: &Caller, w: &mut UnixStrea
         ("POST", p) if p.strip_prefix("/kiri/containers/").and_then(|r| r.strip_suffix("/upper")).is_some_and(|id| !id.is_empty()) => {
             let id = p.strip_prefix("/kiri/containers/").and_then(|r| r.strip_suffix("/upper")).unwrap_or_default();
             return upper_put(req, engine, id, w, r);
+        }
+        // Kiri's own: a checkpoint of a container's writable files as an
+        // image (its `upper` layer plus the image under it), named by the
+        // body's `image` or by a default `checkpoint:<shortid>-<time>`.
+        // Restoring is running the image: a checkpoint holds files, not
+        // the process table.
+        ("POST", p) if p.strip_prefix("/kiri/containers/").and_then(|r| r.strip_suffix("/checkpoint")).is_some_and(|id| !id.is_empty()) => {
+            let id = p.strip_prefix("/kiri/containers/").and_then(|r| r.strip_suffix("/checkpoint")).unwrap_or_default();
+            return reply(w, super::ops::checkpoint(req, engine, id), 201);
         }
         // An image's page for kiri-win, whose window can't read the store
         // inside WSL: its layers and its Grype scans (crate::scan), as the
@@ -3564,6 +3593,98 @@ fn network_settings(c: &Container, nets: &[super::network::Network]) -> Value {
         networks.insert(x.name.clone(), json!({"IPAddress": ip, "IPPrefixLen": prefix, "IPAMConfig": ipam_config(&x.ipv4_address, &x.ipv6_address), "Aliases": x.aliases, "NetworkID": "", "MacAddress": x.mac_address, "GlobalIPv6Address": xip6, "GlobalIPv6PrefixLen": xprefix6, "IPv6Gateway": xgateway6}));
     }
     json!({"IPAddress": ip, "IPPrefixLen": prefix_of(&c.spec.network_mode, !ip.is_empty()), "MacAddress": c.spec.mac_address, "GlobalIPv6Address": ip6, "GlobalIPv6PrefixLen": prefix6, "IPv6Gateway": gateway6, "Ports": ports_map(c), "Networks": networks})
+}
+
+/// A Prometheus-style `/metrics` snapshot: the engine's counts without a
+/// round-trip to the guest, so a scraper can poll as often as it likes
+/// while a container is busy.
+fn metrics(engine: &Engine) -> String {
+    let mut states: std::collections::BTreeMap<&'static str, u64> = std::collections::BTreeMap::new();
+    engine.each(|c| {
+        *states.entry(state_word(c)).or_insert(0) += 1;
+        Some(())
+    });
+    let images = engine.store.images().unwrap_or_default();
+    let image_bytes: u64 = images.iter().map(|i| i.size).sum();
+    let total: u64 = states.values().sum();
+    let mut out = String::new();
+    out.push_str("# HELP kiri_containers Containers by state.\n# TYPE kiri_containers gauge\n");
+    for (word, count) in &states {
+        out.push_str(&format!(r#"kiri_containers{{state="{word}"}} {count}"#));
+        out.push('\n');
+    }
+    out.push_str("# HELP kiri_containers_total Containers known to the engine.\n# TYPE kiri_containers_total gauge\n");
+    out.push_str(&format!("kiri_containers_total {total}\n"));
+    out.push_str("# HELP kiri_images Images in the store.\n# TYPE kiri_images gauge\n");
+    out.push_str(&format!("kiri_images {}\n", images.len()));
+    out.push_str("# HELP kiri_image_bytes Bytes held by the images in the store.\n# TYPE kiri_image_bytes gauge\n");
+    out.push_str(&format!("kiri_image_bytes {image_bytes}\n"));
+    out.push_str("# HELP kiri_volumes Named volumes.\n# TYPE kiri_volumes gauge\n");
+    out.push_str(&format!("kiri_volumes {}\n", engine.volume_list().len()));
+    out.push_str("# HELP kiri_networks Networks besides the built-in ones.\n# TYPE kiri_networks gauge\n");
+    out.push_str(&format!("kiri_networks {}\n", engine.lock_net().all().len()));
+    out
+}
+
+/// Kiri's secrets, as the list answers them: names with when each was
+/// last set, no values — the values exist only at a start that names
+/// them, and the sealed file is the only other place they live.
+fn secrets_list(engine: &Engine) -> Result<Value, Error> {
+    let list = engine
+        .secrets
+        .lock()
+        .map_err(|_| Error::Conflict("the secrets lock was poisoned".into()))?
+        .names()
+        .into_iter()
+        .map(|(name, created)| json!({"Name": name, "Created": created}))
+        .collect::<Vec<_>>();
+    Ok(Value::Array(list))
+}
+
+/// A secret's metadata, still with no value.
+fn secret_info(engine: &Engine, name: &str) -> Result<Value, Error> {
+    let (_, created) = engine
+        .secrets
+        .lock()
+        .map_err(|_| Error::Conflict("the secrets lock was poisoned".into()))?
+        .names()
+        .into_iter()
+        .find(|(n, _)| n == name)
+        .ok_or_else(|| Error::NotFound(format!("no secret named {name}")))?;
+    Ok(json!({"Name": name, "Created": created}))
+}
+
+/// Seals a body's `{"name", "data"}` and saves it; the data is plain text
+/// in this request and sealed on its way to the file.
+fn secrets_set(req: &Request, engine: &Engine) -> Result<Value, Error> {
+    let b: Value = serde_json::from_slice(&req.body).map_err(|e| Error::BadRequest(format!("invalid JSON: {e}")))?;
+    let name = b["name"].as_str().unwrap_or_default();
+    let data = b["data"].as_str().unwrap_or_default();
+    if name.is_empty() || data.is_empty() {
+        return Err(Error::BadRequest("a secret needs a name and some data".into()));
+    }
+    engine
+        .secrets
+        .lock()
+        .map_err(|_| Error::Conflict("the secrets lock was poisoned".into()))?
+        .set(name, data.as_bytes())
+        .map_err(Error::Io)?;
+    Ok(Value::Null)
+}
+
+/// Removes a secret for good; a name already gone is the error.
+fn secret_remove(engine: &Engine, name: &str) -> Result<Value, Error> {
+    let removed = engine
+        .secrets
+        .lock()
+        .map_err(|_| Error::Conflict("the secrets lock was poisoned".into()))?
+        .remove(name)
+        .map_err(Error::Io)?;
+    if removed {
+        Ok(Value::Null)
+    } else {
+        Err(Error::NotFound(format!("no secret named {name}")))
+    }
 }
 
 /// Docker's state word: `paused` is a running container that is frozen.
@@ -7204,6 +7325,125 @@ mod network_option_tests {
             };
             assert_eq!(super::status_of(make(json!({"CgroupnsMode": bad})).unwrap_err()), (400, want));
         }
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `GET /metrics`: a Prometheus-style text snapshot whose counts match
+    /// the state the engine holds, without touching the guest.
+    #[test]
+    fn metrics_snapshots_the_engine_without_touching_the_guest() {
+        let dir = std::env::temp_dir().join(format!("kiri-metrics-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = super::super::engine::boot_without_vm(&dir);
+        let cfg = json!({"created": "2026-11-16T00:00:00Z", "architecture": "arm64", "os": "linux", "config": {"Cmd": ["true"]}});
+        let mut w = engine.store.ingest().unwrap();
+        io::Write::write_all(&mut w, &serde_json::to_vec(&cfg).unwrap()).unwrap();
+        let (digest, _) = w.finish().unwrap();
+        engine.store.put_image(kiri_image::archive::from_config("demo:local".into(), &digest, &cfg, Vec::new())).unwrap();
+        let body = serde_json::to_vec(&json!({"Image": "demo:local"})).unwrap();
+        let created = super::create(&Request::internal("POST", "/containers/create", &[], body), &engine).unwrap();
+        assert!(created["Id"].as_str().unwrap_or_default().len() >= 32);
+        let m = super::metrics(&engine);
+        let nets = engine.lock_net().all().len();
+        let vols = engine.volume_list().len();
+        assert!(m.contains("kiri_containers{state=\"created\"} 1"), "{m}");
+        assert!(!m.contains("state=\"running\""), "{m}");
+        assert!(m.contains("kiri_containers_total 1\n"), "{m}");
+        assert!(m.contains("kiri_images 1\n"), "{m}");
+        assert!(m.contains(&format!("kiri_volumes {vols}\n")), "{m}");
+        assert!(m.contains(&format!("kiri_networks {nets}\n")), "{m}");
+        assert!(m.contains("# TYPE kiri_containers gauge\n"), "{m}");
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Kiri's secrets, end to end through the API: set with a body, listed
+    /// by name only, a single view without the value, resolved when a
+    /// container's env names them (the created record still holds the
+    /// reference), removed twice (once fine, then not found).
+    #[test]
+    fn kiris_secrets_api_lists_names_and_resolves_only_at_a_start() {
+        use super::secret_info;
+        use super::secret_remove;
+        use super::secrets_list;
+        use super::secrets_set;
+        let dir = std::env::temp_dir().join(format!("kiri-secrets-api-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = super::super::engine::boot_without_vm(&dir);
+        // A value that no view hands back.
+        secrets_set(&Request::internal("POST", "/kiri/secrets", &[], serde_json::to_vec(&json!({"name": "db-password", "data": "hunter2"})).unwrap()), &engine).unwrap();
+        let list = secrets_list(&engine).unwrap();
+        assert_eq!(list[0]["Name"], json!("db-password"), "{list}");
+        assert!(list[0]["Created"].is_u64(), "{list}");
+        assert!(!serde_json::to_string(&list).unwrap().contains("hunter2"), "{list}");
+        assert_eq!(secret_info(&engine, "db-password").unwrap()["Name"], json!("db-password"));
+        assert!(secret_info(&engine, "nope").is_err());
+        // A created record keeps the reference, not the value; only the
+        // daemon's resolve (a container's start) turns it.
+        let cfg = json!({"created": "2026-11-16T00:00:00Z", "architecture": "arm64", "os": "linux", "config": {"Cmd": ["true"]}});
+        let mut w = engine.store.ingest().unwrap();
+        io::Write::write_all(&mut w, &serde_json::to_vec(&cfg).unwrap()).unwrap();
+        let (digest, _) = w.finish().unwrap();
+        engine.store.put_image(kiri_image::archive::from_config("demo:local".into(), &digest, &cfg, Vec::new())).unwrap();
+        let body = serde_json::to_vec(&json!({"Image": "demo:local", "Env": ["DB=secret:db-password"]})).unwrap();
+        super::create(&Request::internal("POST", "/containers/create", &[], body), &engine).unwrap();
+        let env = engine.each(|c| Some(c.spec.env.clone())).into_iter().flatten().next().unwrap();
+        assert_eq!(env, "DB=secret:db-password", "the record keeps the reference");
+        assert_eq!(engine.secrets.lock().unwrap().resolve(&[env]).unwrap()[0], "DB=hunter2");
+        // Removed, then gone: the second remove is the error.
+        secret_remove(&engine, "db-password").unwrap();
+        assert!(secret_remove(&engine, "db-password").is_err());
+        assert!(secrets_list(&engine).unwrap().as_array().unwrap().is_empty());
+        // An empty name or data is a refusal.
+        assert!(secrets_set(&Request::internal("POST", "/kiri/secrets", &[], serde_json::to_vec(&json!({"name": "", "data": "x"})).unwrap()), &engine).is_err());
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `POST /kiri/containers/<id>/checkpoint`: an unknown container is a
+    /// 404, a container the engine can't reach its VM for says so without
+    /// pretending, and the name rules stack without overwriting.
+    #[test]
+    fn a_checkpoint_becomes_a_named_or_stacking_image() {
+        use super::super::ops::checkpoint_name;
+        // A name given with no tag, a repo:port reference (its colon is not
+        // a tag's), a full reference, and the default that stacks.
+        assert_eq!(checkpoint_name(Some("snap:one"), "0123456789abcdef"), ("snap".to_owned(), Some("one".to_owned())));
+        assert_eq!(checkpoint_name(Some("plain"), "0123456789abcdef"), ("plain".to_owned(), None));
+        assert_eq!(checkpoint_name(Some("localhost:5000/repo"), "0123456789abcdef"), ("localhost:5000/repo".to_owned(), None));
+        let (repo, tag) = checkpoint_name(None, "0123456789abcdef");
+        assert_eq!(repo, "checkpoint");
+        assert!(tag.as_deref().is_some_and(|t| t.starts_with("0123456789ab-") && t.matches('-').count() == 1), "{tag:?}");
+
+        let dir = std::env::temp_dir().join(format!("kiri-checkpoint-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = super::super::engine::boot_without_vm(&dir);
+        let cfg = json!({"created": "2026-11-16T00:00:00Z", "architecture": "arm64", "os": "linux", "config": {"Cmd": ["true"]}});
+        let mut w = engine.store.ingest().unwrap();
+        io::Write::write_all(&mut w, &serde_json::to_vec(&cfg).unwrap()).unwrap();
+        let (digest, _) = w.finish().unwrap();
+        engine.store.put_image(kiri_image::archive::from_config("demo:local".into(), &digest, &cfg, Vec::new())).unwrap();
+        let body = serde_json::to_vec(&json!({"Image": "demo:local"})).unwrap();
+        let created = super::create(&Request::internal("POST", "/containers/create", &[], body), &engine).unwrap();
+        let id = created["Id"].as_str().unwrap_or_default().to_owned();
+        let path = format!("/kiri/containers/{id}/checkpoint");
+        match super::super::ops::checkpoint(&Request::internal("POST", &path, &[], serde_json::to_vec(&json!({"image": "snap:one"})).unwrap()), &engine, &id) {
+            Err(e) => {
+                let (status, msg) = super::status_of(e);
+                assert_eq!(status, 500, "{msg}");
+                assert!(msg.contains("Kiri is stopped"), "{msg}");
+            }
+            other => panic!("checkpoint of a container with no VM up: {other:?}"),
+        }
+        match super::super::ops::checkpoint(&Request::internal("POST", "/kiri/containers/nope/checkpoint", &[], Vec::new()), &engine, "nope") {
+            Err(e) => assert_eq!(super::status_of(e).0, 404),
+            other => panic!("checkpoint of a missing container: {other:?}"),
+        }
+        assert_eq!(engine.each(|c| Some(c.id.clone())).len(), 1, "the container is untouched");
         drop(engine);
         let _ = std::fs::remove_dir_all(&dir);
     }
