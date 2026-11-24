@@ -3104,12 +3104,13 @@ fn ipam_config(want4: &str, want6: &str) -> Value {
 /// networks and healthcheck state.
 fn container_inspect(engine: &Engine, key: &str) -> Result<Value, Error> {
     let id = engine.resolve(key)?;
-    let networks: Vec<super::network::Network> = engine.lock_net().all().to_vec();
     let health = engine.health(&id);
     let anon_vols: Vec<String> = engine.volume_list().into_iter().filter(|v| v.anonymous).map(|v| v.name).collect();
     engine.with(&id, |c| {
-        let mut v = inspect(c, &networks, &anon_vols);
-        v["NetworkSettings"]["Networks"] = endpoints(c, &networks);
+        let net = engine.lock_net();
+        let networks = net.all();
+        let mut v = inspect(c, networks, &anon_vols);
+        v["NetworkSettings"]["Networks"] = endpoints(c, networks);
         // The old top-level fields describe the default bridge only.
         if c.spec.network_mode == "bridge" {
             let ep = v["NetworkSettings"]["Networks"]["bridge"].clone();
@@ -3163,13 +3164,24 @@ fn list(req: &Request, engine: &Engine) -> Result<Value, Error> {
     if let Some(bad) = f.values("health").and_then(|v| v.iter().find(|v| !super::health::valid_filter(v))) {
         return Err(Error::BadRequest(format!("Unrecognised filter value for health: {bad}")));
     }
+    let limit = match req.query("limit").filter(|v| !v.is_empty()) {
+        Some(v) => {
+            let n = v
+                .parse::<isize>()
+                .map_err(|_| Error::BadRequest(format!("invalid limit: {v}")))?;
+            usize::try_from(n).ok().filter(|n| *n > 0)
+        }
+        None => None,
+    };
     let health = engine.health_statuses();
     // Docker matches the image each `ancestor` value names, by ID (#442).
     let ancestors = f.values("ancestor").map(|v| engine.ancestor_ids(v)).transpose()?;
-    // A status filter lists stopped containers without --all, as Docker does.
-    let all = req.flag("all") || f.values("status").is_some() || f.values("exited").is_some();
-    let networks: Vec<super::network::Network> = engine.lock_net().all().to_vec();
-    let mut rows = engine.each(|c| {
+    // A status filter or a limit lists stopped containers without --all, as Docker does.
+    let all = req.flag("all")
+        || limit.is_some()
+        || f.values("status").is_some()
+        || f.values("exited").is_some();
+    let mut rows = engine.each_with_networks(|c, networks| {
         if !all && c.status != Status::Running {
             return None;
         }
@@ -3211,15 +3223,21 @@ fn list(req: &Request, engine: &Engine) -> Result<Value, Error> {
             "Ports": ports_list(c),
             "Labels": if c.spec.labels.is_object() { c.spec.labels.clone() } else { json!({}) },
             "HostConfig": {"NetworkMode": c.spec.network_mode},
-            "NetworkSettings": {"Networks": endpoints(c, &networks)},
+            "NetworkSettings": {"Networks": endpoints(c, networks)},
             "Mounts": c.spec.mount_info,
         });
         if let Some(distro) = spec_wsl_distro(&c.spec) {
             row["KiriWslDistro"] = json!(distro);
         }
-        Some((time::unix(c.created), row))
+        Some((c.created, row))
     });
-    rows.sort_by_key(|r| std::cmp::Reverse(r.0));
+    rows.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| a.1["Id"].as_str().cmp(&b.1["Id"].as_str()))
+    });
+    if let Some(limit) = limit {
+        rows.truncate(limit);
+    }
     Ok(Value::Array(rows.into_iter().map(|(_, v)| v).collect()))
 }
 
@@ -4285,6 +4303,62 @@ mod tests {
             other => panic!("network prune: {other:?}"),
         }
         assert!(engine.lock_net().find("lost-net").is_some(), "the network is kept");
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ps_limit_lists_the_latest_containers_in_any_state() {
+        let (root, engine) = engine_in("ps-limit", false);
+        let image = test_image("local:1");
+        let spec: super::super::engine::Spec = serde_json::from_value(json!({
+            "image": image.name, "image_id": image.config_digest, "entrypoint": [], "cmd": ["true"],
+            "env": [], "cwd": "/", "user": "", "auto_remove": false, "network_mode": "none", "labels": {},
+            "restart": {"name": "no", "max_retries": 0}
+        })).unwrap();
+        for name in ["first", "second", "third"] {
+            engine
+                .create(Some(name.into()), spec.clone(), &image)
+                .unwrap();
+        }
+        drop(engine);
+
+        // Give the containers distinct creation times within the same second.
+        let records = root.join("containers.json");
+        let mut saved: Vec<Value> =
+            serde_json::from_slice(&std::fs::read(&records).unwrap()).unwrap();
+        saved.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+        for (i, record) in saved.iter_mut().enumerate() {
+            record["created_ns"] = json!(1_000_000_000 + i);
+        }
+        std::fs::write(&records, serde_json::to_vec(&saved).unwrap()).unwrap();
+        let engine = super::super::engine::boot_without_vm(&root);
+
+        let names = |query: &[(&str, &str)]| {
+            let req = Request::internal("GET", "/containers/json", query, Vec::new());
+            let rows = list(&req, &engine).unwrap();
+            rows.as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["Names"][0].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&[("limit", "1")]), ["/third"]);
+        assert_eq!(names(&[("limit", "2")]), ["/third", "/second"]);
+        assert!(names(&[]).is_empty());
+        for limit in ["0", "-1"] {
+            assert!(names(&[("limit", limit)]).is_empty(), "limit={limit}");
+        }
+        let bad = Request::internal("GET", "/containers/json", &[("limit", "abc")], Vec::new());
+        assert!(matches!(list(&bad, &engine), Err(Error::BadRequest(_))));
+        assert_eq!(
+            names(&[("all", "1"), ("limit", "2")]),
+            ["/third", "/second"]
+        );
+        assert_eq!(
+            names(&[("limit", "1"), ("filters", r#"{"name":["first"]}"#)]),
+            ["/first"]
+        );
         drop(engine);
         let _ = std::fs::remove_dir_all(root);
     }

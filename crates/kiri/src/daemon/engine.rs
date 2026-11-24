@@ -5578,6 +5578,15 @@ impl Engine {
         self.lock().containers.values().filter_map(&mut f).collect()
     }
 
+    /// Runs `f` over every container alongside the current networks slice,
+    /// locking container state before networks.
+    pub fn each_with_networks<T>(&self, mut f: impl FnMut(&Container, &[super::network::Network]) -> Option<T>) -> Vec<T> {
+        let s = self.lock();
+        let net = self.lock_net();
+        let networks = net.all();
+        s.containers.values().filter_map(|c| f(c, networks)).collect()
+    }
+
     pub fn with<T>(&self, key: &str, f: impl FnOnce(&Container) -> T) -> Result<T, Error> {
         let st = self.lock();
         let id = resolve(&st, key)?;

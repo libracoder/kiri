@@ -526,6 +526,12 @@ t exec-session-own "own" $D exec web sh -c 's=$(cut -d" " -f6 /proc/$$/stat); [ 
 t exec-same-fs "shared" bash -c "$D exec web sh -c 'echo shared > /tmp/x' && $D exec web cat /tmp/x"
 t stop "web" $D stop web
 t stopped-status "Exited" $D ps -a --format '{{.Status}}' --filter name=web
+t ps-limit-latest "latest=ps-new recent=ps-new ps-old." bash -c "$D run --name ps-old alpine true >/dev/null &&
+  $D run --name ps-new alpine true >/dev/null &&
+  latest=\$($D ps -l --format '{{.Names}}') &&
+  recent=\$($D ps -n 2 --format '{{.Names}}') &&
+  echo \"latest=\$latest recent=\$(printf '%s' \"\$recent\" | tr '\\n' ' ').\";
+  $D rm -f ps-old ps-new >/dev/null 2>&1"
 code exec-stopped 1 $D exec web true
 t start "web" $D start web
 t restarted-running "true" $D inspect -f '{{.State.Running}}' web

@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #839, #784 API: support `limit` on `GET /containers/json` (`docker ps -l` / `-n`) across all states and borrow networks without cloning (unreleased)
+- Fixes: no issue
+- Caused: none known
+- Caused by: -
+- Check: `ps-limit-latest`, `crates/kiri/src/daemon/api.rs`
+
 ### #796 Guest kernel: check caller owner mode bits and superblock capabilities on virtiofs (unreleased)
 - Fixes: #796 Concurrent non-root bind-mount file and directory creation on macOS fails intermittently with EACCES/EPERM when root or `/proc/kiri-fsnotify` touches the shared inode
 - Caused: none known
