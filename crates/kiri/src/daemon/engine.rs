@@ -488,6 +488,10 @@ pub struct Spec {
     /// `container:<full id>`.
     #[serde(default)]
     pub pid_mode: String,
+    /// WSL 2 distro that created this container (`Caller::Wsl` or the engine's
+    /// own WSL distro on `Caller::Host`), when created in WSL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wsl_distro: Option<String>,
 }
 
 /// Normalizes an ExposedPorts key (`"53"`, `"53/UDP"`, `"132/sctp"`) to

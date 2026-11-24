@@ -329,3 +329,5 @@ load-oci-buildx	#465	docker buildx build --output type=oci archives use io.conta
 crates/kiri/src/share.rs	#207	Share mutex locks panicked on poisoning under panic=abort, traffic/state writes used shared .tmp names without create_new/0600 or Ended serialization, and sharing a non-localhost target gave no warning
 crates/kiri-init/src/linux/mod.rs	#207	with panic=abort, a panic in PID 1 or the host agent aborted silently without writing its message and location directly to stderr from a stack buffer
 restart-policy-refused	#841	docker update stored unknown restart policies or enabled restarts on AutoRemove containers, and container create/update accepted negative or non-on-failure MaximumRetryCount values
+crates/kiri/src/ui/compose.rs	#770	on Windows, Compose projects started inside a WSL distro had Linux label paths (/home/...) rejected as non-absolute and \\wsl.localhost\<distro>\... rejected as remote UNC paths
+crates/kiri/src/daemon/api.rs	#770	containers created inside WSL did not expose their owning WSL distro on GET /containers/json for Windows Compose path mapping

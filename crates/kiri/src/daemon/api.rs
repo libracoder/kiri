@@ -290,7 +290,7 @@ fn route(req: &Request, engine: &Arc<Engine>, caller: &Caller, w: &mut UnixStrea
             if let Some(made) = super::builder::create_for_buildx(engine, req) {
                 return reply(w, made, 201);
             }
-            return reply(w, create_for(req, engine, caller.wsl_distro()), 201);
+            return reply(w, create_by(req, engine, caller), 201);
         }
         ("GET", "/containers/json") => return reply(w, list(req, engine), 200),
         ("GET", "/networks") => return reply(w, networks(req, engine), 200),
@@ -2591,7 +2591,80 @@ pub(super) fn create(req: &Request, engine: &Engine) -> Result<Value, Error> {
     create_for(req, engine, None)
 }
 
+fn unc_wsl_distro(s: &str) -> Option<String> {
+    if s.bytes().any(|b| b.is_ascii_control()) {
+        return None;
+    }
+    let rest = if let Some(after_q) = s.strip_prefix(r"\\?\") {
+        if s.contains('/') || after_q.len() < 4 || !after_q[..4].eq_ignore_ascii_case(r"UNC\") {
+            return None;
+        }
+        after_q[4..].to_owned()
+    } else {
+        let norm = s.replace('/', "\\");
+        if norm.starts_with(r"\\?\") || norm.starts_with(r"\\.\") {
+            return None;
+        }
+        norm.strip_prefix(r"\\")?.to_owned()
+    };
+    let (host, after_host) = rest.split_once('\\')?;
+    if !(host.eq_ignore_ascii_case("wsl.localhost") || host.eq_ignore_ascii_case("wsl$")) {
+        return None;
+    }
+    let (distro, _) = after_host.split_once('\\').unwrap_or((after_host, ""));
+    super::binds::valid_distro_name(distro).then(|| distro.to_owned())
+}
+
+fn looks_windows_drive_path(s: &str) -> bool {
+    let s = s.strip_prefix(r"\\?\").unwrap_or(s);
+    let b = s.as_bytes();
+    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'\\' | b'/')
+}
+
+fn created_wsl_distro(caller: &Caller, engine_distro: Option<&str>, labels: &Value) -> Option<String> {
+    match caller {
+        Caller::Wsl(d) if super::binds::valid_distro_name(d) => Some(d.clone()),
+        Caller::Host => {
+            let paths = [
+                "com.docker.compose.project.working_dir",
+                "com.docker.compose.project.config_files",
+                "com.docker.compose.project.environment_file",
+            ]
+            .into_iter()
+            .filter_map(|k| labels[k].as_str())
+            .flat_map(|v| v.split(',').map(str::trim))
+            .filter(|v| !v.is_empty());
+            let mut saw_drive = false;
+            for p in paths {
+                if let Some(d) = unc_wsl_distro(p) {
+                    return Some(d);
+                }
+                if looks_windows_drive_path(p) {
+                    saw_drive = true;
+                }
+            }
+            if saw_drive {
+                None
+            } else {
+                engine_distro.filter(|d| super::binds::valid_distro_name(d)).map(str::to_owned)
+            }
+        }
+        _ => None,
+    }
+}
+
+fn create_by(req: &Request, engine: &Engine, caller: &Caller) -> Result<Value, Error> {
+    let body_labels = serde_json::from_slice::<Value>(&req.body).ok().map(|b| b["Labels"].clone()).unwrap_or(Value::Null);
+    let record_distro = created_wsl_distro(caller, super::binds::wsl().and_then(|w| w.distro.as_deref()), &body_labels);
+    create_inner(req, engine, caller.wsl_distro(), record_distro)
+}
+
 pub(super) fn create_for(req: &Request, engine: &Engine, wsl_distro: Option<&str>) -> Result<Value, Error> {
+    let record_distro = wsl_distro.filter(|d| super::binds::valid_distro_name(d)).map(str::to_owned);
+    create_inner(req, engine, wsl_distro, record_distro)
+}
+
+fn create_inner(req: &Request, engine: &Engine, wsl_distro: Option<&str>, record_wsl_distro: Option<String>) -> Result<Value, Error> {
     let body: Value = serde_json::from_slice(&req.body).map_err(|e| Error::BadRequest(format!("invalid JSON: {e}")))?;
     let image_name = body["Image"].as_str().unwrap_or_default();
     if image_name.is_empty() {
@@ -2800,6 +2873,7 @@ pub(super) fn create_for(req: &Request, engine: &Engine, wsl_distro: Option<&str
         host_opts,
         volumes_from: strings(&host["VolumesFrom"]).unwrap_or_default(),
         pid_mode,
+        wsl_distro: record_wsl_distro,
         mounts: mounts.guest,
         mount_info: mounts.info,
         mount_request: mount_request(&body, &image_cfg),
@@ -3062,6 +3136,28 @@ fn container_inspect(engine: &Engine, key: &str) -> Result<Value, Error> {
     })
 }
 
+fn spec_wsl_distro(spec: &super::engine::Spec) -> Option<String> {
+    if let Some(d) = spec.wsl_distro.as_deref().filter(|d| super::binds::valid_distro_name(d)) {
+        return Some(d.to_owned());
+    }
+    if spec.mount_info.is_empty() {
+        return None;
+    }
+    let custom = format!("{}/roots/", super::binds::wsl_kiri_dir());
+    for m in &spec.mount_info {
+        let Some(src) = m["Source"].as_str() else { continue };
+        for prefix in [custom.as_str(), "/mnt/wsl/kiri/roots/"] {
+            if let Some(rest) = src.strip_prefix(prefix) {
+                let d = rest.split('/').next().unwrap_or(rest);
+                if super::binds::valid_distro_name(d) {
+                    return Some(d.to_owned());
+                }
+            }
+        }
+    }
+    None
+}
+
 fn list(req: &Request, engine: &Engine) -> Result<Value, Error> {
     let f = filters(req, &["id", "name", "label", "label!", "status", "ancestor", "network", "exited", "volume", "health"])?;
     if let Some(bad) = f.values("health").and_then(|v| v.iter().find(|v| !super::health::valid_filter(v))) {
@@ -3096,31 +3192,32 @@ fn list(req: &Request, engine: &Engine) -> Result<Value, Error> {
         if !keep {
             return None;
         }
-        Some((
-            time::unix(c.created),
-            json!({
-                "Id": c.id,
-                "Names": [format!("/{}", c.name)],
-                "Image": c.spec.image,
-                "ImageID": c.spec.image_id,
-                "Command": c.argv().join(" "),
-                "Created": time::unix(c.created),
-                "State": state_word(c),
-                "Status": ps_status(c, health.get(&c.id)),
-                // Kiri's own: the window counts "Up 3 s" from these every second.
-                // Docker clients ignore fields they don't know.
-                "KiriStartedAt": c.started.map(time::unix),
-                "KiriFinishedAt": c.finished.map(time::unix),
-                "KiriExitCode": c.exit_code,
-                "KiriOOMKilled": c.oom_killed,
-                "KiriVmStopped": c.vm_stopped,
-                "Ports": ports_list(c),
-                "Labels": if c.spec.labels.is_object() { c.spec.labels.clone() } else { json!({}) },
-                "HostConfig": {"NetworkMode": c.spec.network_mode},
-                "NetworkSettings": {"Networks": endpoints(c, &networks)},
-                "Mounts": c.spec.mount_info,
-            }),
-        ))
+        let mut row = json!({
+            "Id": c.id,
+            "Names": [format!("/{}", c.name)],
+            "Image": c.spec.image,
+            "ImageID": c.spec.image_id,
+            "Command": c.argv().join(" "),
+            "Created": time::unix(c.created),
+            "State": state_word(c),
+            "Status": ps_status(c, health.get(&c.id)),
+            // Kiri's own: the window counts "Up 3 s" from these every second.
+            // Docker clients ignore fields they don't know.
+            "KiriStartedAt": c.started.map(time::unix),
+            "KiriFinishedAt": c.finished.map(time::unix),
+            "KiriExitCode": c.exit_code,
+            "KiriOOMKilled": c.oom_killed,
+            "KiriVmStopped": c.vm_stopped,
+            "Ports": ports_list(c),
+            "Labels": if c.spec.labels.is_object() { c.spec.labels.clone() } else { json!({}) },
+            "HostConfig": {"NetworkMode": c.spec.network_mode},
+            "NetworkSettings": {"Networks": endpoints(c, &networks)},
+            "Mounts": c.spec.mount_info,
+        });
+        if let Some(distro) = spec_wsl_distro(&c.spec) {
+            row["KiriWslDistro"] = json!(distro);
+        }
+        Some((time::unix(c.created), row))
     });
     rows.sort_by_key(|r| std::cmp::Reverse(r.0));
     Ok(Value::Array(rows.into_iter().map(|(_, v)| v).collect()))
@@ -7294,5 +7391,95 @@ mod resources_disk_tests {
             vec![format!("{}\tmyhost", super::super::ports::HOST_ADDR), "10.0.0.2\tdb".to_owned()]
         );
         assert!(extra_hosts_from(&["bad:not-an-ip".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn wsl_distro_is_recorded_from_caller_and_inferred_from_legacy_mounts() {
+        let empty = json!({});
+        assert_eq!(created_wsl_distro(&Caller::Wsl("Debian".into()), Some("kiri"), &empty), Some("Debian".into()));
+        assert_eq!(created_wsl_distro(&Caller::Host, Some("Ubuntu"), &empty), Some("Ubuntu".into()));
+        assert_eq!(
+            created_wsl_distro(
+                &Caller::Host,
+                Some("kiri"),
+                &json!({"com.docker.compose.project.config_files": r"\\wsl.localhost\Ubuntu-24.04\home\simone\services\docker-compose.yml"})
+            ),
+            Some("Ubuntu-24.04".into())
+        );
+        assert_eq!(
+            created_wsl_distro(
+                &Caller::Host,
+                Some("kiri"),
+                &json!({"com.docker.compose.project.working_dir": r"C:\Users\me\shop"})
+            ),
+            None
+        );
+        assert_eq!(created_wsl_distro(&Caller::Host, None, &empty), None);
+        assert_eq!(created_wsl_distro(&Caller::Container, Some("Ubuntu"), &empty), None);
+        assert_eq!(created_wsl_distro(&Caller::Wsl("../evil".into()), Some("kiri"), &empty), None);
+
+        let base_spec = || -> super::super::engine::Spec {
+            serde_json::from_value(json!({
+                "image": "alpine:1", "image_id": "sha256:0123", "entrypoint": [], "cmd": ["true"], "env": [],
+                "cwd": "/", "user": "", "auto_remove": false, "labels": {}, "network_mode": "bridge",
+                "restart": {"name": "no", "max_retries": 0},
+            }))
+            .unwrap()
+        };
+        assert!(serde_json::to_value(base_spec()).unwrap().get("wsl_distro").is_none(), "omitted when None");
+
+        let mut recorded = base_spec();
+        recorded.wsl_distro = Some("Debian".into());
+        assert_eq!(spec_wsl_distro(&recorded), Some("Debian".into()));
+        assert_eq!(serde_json::to_value(&recorded).unwrap()["wsl_distro"], "Debian");
+
+        let mut legacy = base_spec();
+        legacy.mount_info = vec![json!({"Type": "bind", "Source": "/mnt/wsl/kiri/roots/Ubuntu-24.04/home/simone/services/data", "Destination": "/data"})];
+        assert_eq!(spec_wsl_distro(&legacy), Some("Ubuntu-24.04".into()));
+        assert_eq!(spec_wsl_distro(&base_spec()), None);
+
+        // End-to-end through Engine and GET /containers/json?all=1.
+        let root = std::env::temp_dir().join(format!("kiri-wsl-distro-api-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let engine = super::super::engine::boot_without_vm(&root);
+        let image = kiri_image::Image {
+            mirror: None,
+            name: "alpine:1".into(),
+            digest: "sha256:0123".into(),
+            index_digest: None,
+            config_digest: "sha256:0123".into(),
+            layers: Vec::new(),
+            size: 0,
+            platform: "linux/amd64".into(),
+            created: String::new(),
+            pulled_at: 0,
+            config: Default::default(),
+        };
+        engine.store.put_image(image.clone()).unwrap();
+        let create_req = Request::internal(
+            "POST",
+            "/containers/create",
+            &[("name", "from-debian")],
+            serde_json::to_vec(&json!({"Image": "alpine:1", "Cmd": ["true"]})).unwrap(),
+        );
+        create_by(&create_req, &engine, &Caller::Wsl("Debian".into())).unwrap();
+        engine.create(Some("legacy-ubuntu".into()), legacy, &image).unwrap();
+        engine.create(Some("plain-host".into()), base_spec(), &image).unwrap();
+
+        let rows = list(&Request::internal("GET", "/containers/json", &[("all", "1")], Vec::new()), &engine).unwrap();
+        let by_name = |name: &str| {
+            rows.as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["Names"][0] == format!("/{name}"))
+                .cloned()
+                .unwrap()
+        };
+        assert_eq!(by_name("from-debian")["KiriWslDistro"], "Debian");
+        assert_eq!(by_name("legacy-ubuntu")["KiriWslDistro"], "Ubuntu-24.04");
+        assert!(by_name("plain-host").get("KiriWslDistro").is_none());
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
     }
 }

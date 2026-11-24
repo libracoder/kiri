@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #770 Windows: map WSL Compose label paths to `\\wsl.localhost\<distro>\…` and Windows drives (unreleased)
+- Fixes: #770 Windows: Compose section says "Kiri can't find this project's compose file" for every project started inside the WSL distro
+- Caused: none known
+- Caused by: -
+- Check: `crates/kiri/src/ui/compose.rs`, `crates/kiri/src/daemon/api.rs`
+
 ### #841 API: refuse invalid restart policies on create and update (unreleased)
 - Fixes: no issue
 - Caused: none known
