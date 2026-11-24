@@ -123,9 +123,10 @@ Apple silicon and Intel Macs (macOS 14+), Windows 10 and 11 (x86-64 and Arm, thr
   container has its own page with details, live logs (find, level filter),
   a command line (and "Open in Terminal" for a full shell) and its files
   (preview, Save to Downloads, Show in Finder); Settings for fonts, text
-  size, the VM's CPUs, memory and disk image size (`~/.kiri/vm.json`, used from
-  the VM's next start; `KIRI_CPUS`, `KIRI_MEMORY_MIB` and `KIRI_DISK_GB`
-  override it; the disk grows online on boot and never shrinks) and local names
+  size, starting at sign-in, stopping the engine when Kiri quits, the VM's
+  CPUs, memory and disk image size (`~/.kiri/vm.json`, used from the VM's next
+  start; `KIRI_CPUS`, `KIRI_MEMORY_MIB` and `KIRI_DISK_GB` override it; the
+  disk grows online on boot and never shrinks) and local names
 - **Menu bar**: Kiri stays in the menu bar (or the tray on Windows and Linux)
   when its window closes, with the VM's state, running containers (click one
   to open it) and Start/Stop; Settings → Appearance → Closing the window can

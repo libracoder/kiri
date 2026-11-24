@@ -1859,5 +1859,9 @@
   "WSL integration": "Integrasi WSL",
   "Close: the memory the window uses is freed. It takes a moment to open again, and open terminals end.": "Tutup: memori yang dipakai jendela dibebaskan. Perlu sesaat untuk membukanya lagi, dan terminal yang terbuka ditutup.",
   "Closing the window": "Saat menutup jendela",
-  "Hide: the window stays ready and opens again at once.": "Sembunyikan: jendela tetap siap dan langsung terbuka lagi."
+  "Hide: the window stays ready and opens again at once.": "Sembunyikan: jendela tetap siap dan langsung terbuka lagi.",
+  "Start Kiri at sign-in": "Mulai Kiri saat masuk",
+  "Start Kiri in the background when you sign in.": "Mulai Kiri di latar belakang saat Anda masuk.",
+  "Stop the engine when Kiri quits": "Hentikan engine saat keluar dari Kiri",
+  "Quitting Kiri stops running containers and the engine. Opening Kiri starts it again.": "Keluar dari Kiri menghentikan kontainer yang berjalan dan engine. Membuka Kiri akan memulainya lagi."
 }

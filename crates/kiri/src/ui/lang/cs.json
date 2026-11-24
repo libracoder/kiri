@@ -1859,5 +1859,9 @@
   "WSL integration": "Integrace s WSL",
   "Close: the memory the window uses is freed. It takes a moment to open again, and open terminals end.": "Zavřít: paměť, kterou okno používá, se uvolní. Znovu se otevře až po chvilce a otevřené terminály se ukončí.",
   "Closing the window": "Zavření okna",
-  "Hide: the window stays ready and opens again at once.": "Skrýt: okno zůstane připravené a znovu se otevře hned."
+  "Hide: the window stays ready and opens again at once.": "Skrýt: okno zůstane připravené a znovu se otevře hned.",
+  "Start Kiri at sign-in": "Spouštět Kiri při přihlášení",
+  "Start Kiri in the background when you sign in.": "Spustit Kiri na pozadí, když se přihlásíte.",
+  "Stop the engine when Kiri quits": "Zastavit engine při ukončení Kiri",
+  "Quitting Kiri stops running containers and the engine. Opening Kiri starts it again.": "Ukončení Kiri zastaví běžící kontejnery a engine. Otevření Kiri ho znovu spustí."
 }

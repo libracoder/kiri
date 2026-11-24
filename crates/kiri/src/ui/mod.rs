@@ -348,7 +348,16 @@ fn engine(rx: Receiver<Cmd>, tx: Sender<Cmd>) {
                 refresh(&mut connected);
             }
             Ok(Cmd::RemoveNetwork(id)) => act("rmnet", expect_ok(client::request("DELETE", &format!("/networks/{id}"), None))),
-            Ok(Cmd::Quit) | Err(RecvTimeoutError::Disconnected) => return,
+            Ok(Cmd::Quit) | Err(RecvTimeoutError::Disconnected) => {
+                quit_with(
+                    stop_on_quit(),
+                    sharing::close_all,
+                    stop_engine,
+                    write_stopped_marker,
+                    stop_daemon_on_quit,
+                );
+                return;
+            }
             Err(RecvTimeoutError::Timeout) => {
                 vm_panel(&mut connected);
                 if connected && LISTED.lock().unwrap_or_else(|e| e.into_inner()).elapsed() >= LIST_EVERY {
@@ -471,7 +480,98 @@ pub(crate) fn prefs() -> serde_json::Value {
     if p.get("theme").is_none() {
         p["theme"] = "dark".into();
     }
+    if p.get("startAtLogin").is_none() {
+        p["startAtLogin"] = setup::start_at_login().into();
+    }
+    if p.get("stopOnQuit").is_none() {
+        p["stopOnQuit"] = false.into();
+    }
     p
+}
+
+pub(crate) fn stop_on_quit() -> bool {
+    prefs()["stopOnQuit"] == true
+}
+
+/// The XDG configuration directory: `$XDG_CONFIG_HOME`, else `$HOME/.config`.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub(crate) fn xdg_config_dir(xdg: Option<&std::path::Path>, home: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
+    if let Some(dir) = xdg.filter(|p| !p.as_os_str().is_empty()) {
+        return Some(dir.to_path_buf());
+    }
+    home.filter(|p| !p.as_os_str().is_empty()).map(|h| h.join(".config"))
+}
+
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub(crate) const AUTOSTART_DESKTOP: &str = "\
+[Desktop Entry]
+Type=Application
+Name=Kiri
+GenericName=Containers
+Comment=Run and share containers
+Exec=kiri ui
+Icon=kiri
+Terminal=false
+Categories=Development;
+StartupWMClass=kiri
+";
+
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub(crate) fn linux_autostart_at(config_dir: &std::path::Path) -> bool {
+    config_dir.join("autostart/kiri.desktop").is_file()
+}
+
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub(crate) fn set_linux_autostart_at(config_dir: &std::path::Path, on: bool) -> io::Result<()> {
+    let path = config_dir.join("autostart/kiri.desktop");
+    if on {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(path, AUTOSTART_DESKTOP)
+    } else {
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+fn quit_with(
+    stop_on_quit: bool,
+    close_shares: impl FnOnce(),
+    stop_containers: impl FnOnce() -> io::Result<()>,
+    mark_stopped: impl FnOnce(),
+    stop_daemon: impl FnOnce(),
+) {
+    if !stop_on_quit {
+        return;
+    }
+    close_shares();
+    let _ = stop_containers();
+    mark_stopped();
+    stop_daemon();
+}
+
+fn write_stopped_marker() {
+    if let Some(dir) = state_dir() {
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(dir.join("stopped"), b"");
+    }
+}
+
+fn clear_stopped_marker() {
+    if let Some(dir) = state_dir() {
+        let _ = std::fs::remove_file(dir.join("stopped"));
+    }
+}
+
+fn stop_daemon_on_quit() {
+    if let Err(e) = update::stop_engine() {
+        diag::warn!("engine did not stop on quit", error = e);
+    }
+    setup::bootout_agent();
 }
 
 /// The USB view's note under the list, in the window's language
@@ -520,7 +620,7 @@ fn page_gone() {
 }
 
 fn set_pref(name: &str, value: serde_json::Value) {
-    if !matches!(name, "font" | "mono" | "scale" | "termH" | "termFs" | "termFont" | "domainsAsked" | "theme" | "accent" | "importSeen" | "updateAuto" | "updateSkip" | "updateSnoozeUntil" | "columnWidths" | "crashReports" | "ctxSnooze" | "ctxBack" | "logSize" | "starAsked" | "setupSkip" | "lang" | "langAsked" | "closeButton") {
+    if !matches!(name, "font" | "mono" | "scale" | "termH" | "termFs" | "termFont" | "domainsAsked" | "theme" | "accent" | "importSeen" | "updateAuto" | "updateSkip" | "updateSnoozeUntil" | "columnWidths" | "crashReports" | "ctxSnooze" | "ctxBack" | "logSize" | "starAsked" | "setupSkip" | "lang" | "langAsked" | "closeButton" | "startAtLogin" | "stopOnQuit") {
         return;
     }
     let Some(path) = prefs_path() else { return };
@@ -1040,11 +1140,16 @@ fn free_on_mac(port: u16, proto: &str) -> bool {
 #[cfg_attr(target_os = "linux", allow(unreachable_code))]
 fn ensure_daemon() -> io::Result<()> {
     if client::alive() {
+        if stop_on_quit() && engine_stopped() {
+            clear_stopped_marker();
+            let _ = client::request("POST", "/kiri/wake", None);
+        }
         return Ok(());
     }
     // Linux: the engine is a system service, started by systemd, not by the window.
     #[cfg(target_os = "linux")]
     return Err(linux::engine_down());
+    clear_stopped_marker();
     update::start_engine()
 }
 
@@ -1470,6 +1575,18 @@ mod tests {
         // Check for updates automatically stays off across launches.
         super::set_pref("updateAuto", false.into());
         assert_eq!(super::prefs()["updateAuto"], false);
+        // Start at sign-in and Stop engine on quit persist in ui.json.
+        assert_eq!(super::prefs()["stopOnQuit"], false);
+        super::set_pref("stopOnQuit", true.into());
+        assert_eq!(super::prefs()["stopOnQuit"], true);
+        assert!(super::stop_on_quit());
+        super::set_pref("stopOnQuit", false.into());
+        assert_eq!(super::prefs()["stopOnQuit"], false);
+        assert!(!super::stop_on_quit());
+        super::set_pref("startAtLogin", false.into());
+        assert_eq!(super::prefs()["startAtLogin"], false);
+        super::set_pref("startAtLogin", true.into());
+        assert_eq!(super::prefs()["startAtLogin"], true);
         // Crash reports remember when they were turned on, and only the
         // setting itself can say so.
         super::set_pref("crashReportsSince", 1.into());
@@ -1483,6 +1600,79 @@ mod tests {
         super::set_pref("crashReports", false.into());
         assert_eq!(super::prefs().get("crashReportsSince"), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stop_on_quit_handler_runs_steps_in_order_only_when_enabled() {
+        let steps = std::cell::RefCell::new(Vec::new());
+        super::quit_with(
+            false,
+            || steps.borrow_mut().push("shares"),
+            || {
+                steps.borrow_mut().push("stop_containers");
+                Ok(())
+            },
+            || steps.borrow_mut().push("mark_stopped"),
+            || steps.borrow_mut().push("stop_daemon"),
+        );
+        assert!(steps.borrow().is_empty(), "off by default: quit leaves the engine running");
+
+        super::quit_with(
+            true,
+            || steps.borrow_mut().push("shares"),
+            || {
+                steps.borrow_mut().push("stop_containers");
+                Ok(())
+            },
+            || steps.borrow_mut().push("mark_stopped"),
+            || steps.borrow_mut().push("stop_daemon"),
+        );
+        assert_eq!(*steps.borrow(), ["shares", "stop_containers", "mark_stopped", "stop_daemon"]);
+    }
+
+    #[test]
+    fn linux_xdg_autostart_creates_and_removes_desktop_file() {
+        let dir = std::env::temp_dir().join(format!("kiri-xdg-autostart-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let xdg = dir.join("xdg");
+        let home = dir.join("home");
+        assert_eq!(super::xdg_config_dir(Some(&xdg), Some(&home)), Some(xdg.clone()));
+        assert_eq!(super::xdg_config_dir(None, Some(&home)), Some(home.join(".config")));
+        assert_eq!(super::xdg_config_dir(Some(std::path::Path::new("")), Some(&home)), Some(home.join(".config")));
+
+        assert!(!super::linux_autostart_at(&xdg));
+        super::set_linux_autostart_at(&xdg, true).unwrap();
+        assert!(super::linux_autostart_at(&xdg));
+        let desktop = std::fs::read_to_string(xdg.join("autostart/kiri.desktop")).unwrap();
+        assert!(desktop.contains("[Desktop Entry]") && desktop.contains("Exec=kiri ui\n"), "{desktop}");
+
+        super::set_linux_autostart_at(&xdg, false).unwrap();
+        assert!(!super::linux_autostart_at(&xdg));
+        assert!(!xdg.join("autostart/kiri.desktop").exists());
+        // Removing again when already absent succeeds.
+        super::set_linux_autostart_at(&xdg, false).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn windows_registry_run_args_and_query_parsing() {
+        let run_key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+        let exe = r"C:\Users\me\AppData\Local\Kiri\kiri-win.exe";
+        let val = format!("\"{exe}\" --background");
+        let add = ["add", run_key, "/v", "Kiri", "/t", "REG_SZ", "/d", &val, "/f"];
+        assert_eq!(add[5], "REG_SZ");
+        assert_eq!(add[7], r#""C:\Users\me\AppData\Local\Kiri\kiri-win.exe" --background"#);
+        let parse = |ok: bool, stdout: &str, name: &str| {
+            ok && stdout.lines().any(|l| {
+                let mut parts = l.split_whitespace();
+                parts.next().is_some_and(|n| n.eq_ignore_ascii_case(name))
+                    && parts.next().is_some_and(|t| t.eq_ignore_ascii_case("REG_SZ"))
+            })
+        };
+        let out = "\r\nHKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\r\n    Kiri    REG_SZ    \"C:\\Users\\me\\AppData\\Local\\Kiri\\kiri-win.exe\" --background\r\n\r\n";
+        assert!(parse(true, out, "Kiri"));
+        assert!(!parse(false, out, "Kiri"));
+        assert!(!parse(true, "", "Kiri"));
     }
 
     #[test]
@@ -1626,6 +1816,15 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
         "setpref" => {
             if msg.name == "theme" {
                 window::set_appearance(msg.value.as_str().unwrap_or("system"));
+            }
+            if msg.name == "startAtLogin"
+                && let Some(on) = msg.value.as_bool()
+                && let Err(e) = setup::set_start_at_login(on)
+            {
+                diag::warn!("could not change start at sign-in", on = on, error = e);
+                emit(notice("error", &e.to_string()));
+                emit(serde_json::json!({"type": "prefs", "prefs": prefs()}).to_string());
+                return;
             }
             set_pref(&msg.name, msg.value);
             Ok(())
@@ -2290,8 +2489,8 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
             // Opening the window reaches the engine (starting its service if it
             // isn't running) but doesn't wake it: asleep, it reads Ready, and the
             // next docker command or action wakes it. One someone stopped waits
-            // for Start.
-            if autostart && !engine_stopped() { tx.send(Cmd::Connect) } else { Ok(()) }
+            // for Start, unless quitting stopped it (stopOnQuit).
+            if (autostart || cfg!(target_os = "macos") || stop_on_quit()) && (!engine_stopped() || stop_on_quit()) { tx.send(Cmd::Connect) } else { Ok(()) }
         }
         // The Linux setup checklist: check again, fix one or "all", open the
         // window once it's ready, or sign in again for the group to apply.

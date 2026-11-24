@@ -584,7 +584,12 @@ fn tray_menu(hwnd: HWND) {
             ID_START => tray_cmd("start"),
             ID_STOP => tray_cmd("stop"),
             ID_UPDATE => tray_cmd("update"),
-            ID_QUIT => PostQuitMessage(0),
+            ID_QUIT => {
+                if crate::engine::prefs()["stopOnQuit"] == true {
+                    crate::engine::stop();
+                }
+                PostQuitMessage(0);
+            }
             n if n >= ID_CONTAINER => {
                 if let Some((id, _)) = menu.running.get(n - ID_CONTAINER) {
                     show();

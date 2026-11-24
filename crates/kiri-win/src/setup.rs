@@ -985,18 +985,81 @@ fn finish() {
     save(&s);
     crate::serve::set_setup_pending(false);
     let exe = dir().join("kiri-win.exe");
-    let run_key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
     if autostart {
         if exe.is_file() {
-            let _ = quiet("reg.exe").args(["add", run_key, "/v", "Kiri", "/t", "REG_SZ", "/d", &format!("\"{}\" --background", exe.display()), "/f"]).status();
+            let _ = set_start_at_login_named(RUN_VALUE, true, &exe);
         } else {
             crate::serve::log("not set to start at sign-in: kiri-win.exe is not installed");
         }
     } else {
-        let _ = quiet("reg.exe").args(["delete", run_key, "/v", "Kiri", "/f"]).status();
+        let _ = set_start_at_login_named(RUN_VALUE, false, &exe);
     }
     let _ = quiet("reg.exe").args(["delete", r"HKCU\Software\Microsoft\Windows\CurrentVersion\RunOnce", "/v", "KiriSetup", "/f"]).status();
     Handle.run(|ui| ui.navigate_main());
+}
+
+pub const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+pub const RUN_VALUE: &str = "Kiri";
+
+pub fn run_reg_value(exe: &Path) -> String {
+    format!("\"{}\" --background", exe.display())
+}
+
+pub fn run_reg_args(value_name: &str, on: bool, exe: &Path) -> Vec<String> {
+    if on {
+        vec![
+            "add".into(),
+            RUN_KEY.into(),
+            "/v".into(),
+            value_name.into(),
+            "/t".into(),
+            "REG_SZ".into(),
+            "/d".into(),
+            run_reg_value(exe),
+            "/f".into(),
+        ]
+    } else {
+        vec!["delete".into(), RUN_KEY.into(), "/v".into(), value_name.into(), "/f".into()]
+    }
+}
+
+pub fn parse_run_reg_query(status_ok: bool, stdout: &str, value_name: &str) -> bool {
+    status_ok
+        && stdout.lines().any(|l| {
+            let mut parts = l.split_whitespace();
+            parts.next().is_some_and(|n| n.eq_ignore_ascii_case(value_name))
+                && parts.next().is_some_and(|t| t.eq_ignore_ascii_case("REG_SZ"))
+        })
+}
+
+pub fn start_at_login_named(value_name: &str) -> bool {
+    quiet("reg.exe")
+        .args(["query", RUN_KEY, "/v", value_name])
+        .output()
+        .is_ok_and(|o| parse_run_reg_query(o.status.success(), &String::from_utf8_lossy(&o.stdout), value_name))
+}
+
+pub fn start_at_login() -> bool {
+    start_at_login_named(RUN_VALUE)
+}
+
+pub fn set_start_at_login_named(value_name: &str, on: bool, exe: &Path) -> io::Result<()> {
+    if !on && !start_at_login_named(value_name) {
+        return Ok(());
+    }
+    let args = run_reg_args(value_name, on, exe);
+    let out = quiet("reg.exe").args(&args).output()?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(String::from_utf8_lossy(&out.stderr).trim().to_owned()))
+    }
+}
+
+pub fn set_start_at_login(on: bool) -> io::Result<()> {
+    let installed = dir().join("kiri-win.exe");
+    let exe = if installed.is_file() { installed } else { std::env::current_exe()? };
+    set_start_at_login_named(RUN_VALUE, on, &exe)
 }
 
 fn copy_to_clipboard(text: &str) {
@@ -1380,5 +1443,41 @@ mod tests {
         assert!(!on.components_off && on.distros == Some(vec!["kiri".to_owned()]));
         let silent = listing_by(quiet("cmd.exe").raw_arg("/c echo Error code: Wsl/Service/WSAETIMEDOUT 1>&2 & exit 1"), ten);
         assert!(!silent.components_off && silent.distros.is_none());
+    }
+
+    #[test]
+    fn start_at_login_registry_commands_and_query_parsing() {
+        let exe = std::path::Path::new(r"C:\Users\me\AppData\Local\Kiri\kiri-win.exe");
+        assert_eq!(super::run_reg_value(exe), r#""C:\Users\me\AppData\Local\Kiri\kiri-win.exe" --background"#);
+        assert_eq!(
+            super::run_reg_args("Kiri", true, exe),
+            vec![
+                "add",
+                r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+                "/v",
+                "Kiri",
+                "/t",
+                "REG_SZ",
+                "/d",
+                r#""C:\Users\me\AppData\Local\Kiri\kiri-win.exe" --background"#,
+                "/f",
+            ]
+        );
+        assert_eq!(
+            super::run_reg_args("Kiri", false, exe),
+            vec!["delete", r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run", "/v", "Kiri", "/f"]
+        );
+        let out = "\r\nHKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\r\n    Kiri    REG_SZ    \"C:\\Users\\me\\AppData\\Local\\Kiri\\kiri-win.exe\" --background\r\n\r\n";
+        assert!(super::parse_run_reg_query(true, out, "Kiri"));
+        assert!(!super::parse_run_reg_query(false, out, "Kiri"));
+        assert!(!super::parse_run_reg_query(true, "", "Kiri"));
+
+        let test_val = format!("KiriTest368_{}", std::process::id());
+        let _ = super::set_start_at_login_named(&test_val, false, exe);
+        assert!(!super::start_at_login_named(&test_val));
+        super::set_start_at_login_named(&test_val, true, exe).unwrap();
+        assert!(super::start_at_login_named(&test_val));
+        super::set_start_at_login_named(&test_val, false, exe).unwrap();
+        assert!(!super::start_at_login_named(&test_val));
     }
 }

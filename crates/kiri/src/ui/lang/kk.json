@@ -1859,5 +1859,9 @@
   "WSL integration": "WSL интеграциясы",
   "Close: the memory the window uses is freed. It takes a moment to open again, and open terminals end.": "Жабу: терезе пайдаланатын жад босатылады. Қайта ашылуына біраз уақыт кетеді, ал ашық терминалдар жабылады.",
   "Closing the window": "Терезені жапқанда",
-  "Hide: the window stays ready and opens again at once.": "Жасыру: терезе дайын күйде қалады және бірден қайта ашылады."
+  "Hide: the window stays ready and opens again at once.": "Жасыру: терезе дайын күйде қалады және бірден қайта ашылады.",
+  "Start Kiri at sign-in": "Жүйеге кіргенде Kiri-ді іске қосу",
+  "Start Kiri in the background when you sign in.": "Жүйеге кірген кезде Kiri-ді фонда іске қосады.",
+  "Stop the engine when Kiri quits": "Kiri-ден шыққанда қозғалтқышты тоқтату",
+  "Quitting Kiri stops running containers and the engine. Opening Kiri starts it again.": "Kiri-ден шығу жұмыс істеп тұрған контейнерлер мен қозғалтқышты тоқтатады. Kiri-ді ашу оны қайта іске қосады."
 }

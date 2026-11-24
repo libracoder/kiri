@@ -1859,5 +1859,9 @@
   "WSL integration": "WSL-integrering",
   "Close: the memory the window uses is freed. It takes a moment to open again, and open terminals end.": "Lukk: minnet vinduet bruker, frigjøres. Det tar et øyeblikk å åpne det igjen, og åpne terminaler avsluttes.",
   "Closing the window": "Når vinduet lukkes",
-  "Hide: the window stays ready and opens again at once.": "Skjul: vinduet holdes klart og åpnes igjen med en gang."
+  "Hide: the window stays ready and opens again at once.": "Skjul: vinduet holdes klart og åpnes igjen med en gang.",
+  "Start Kiri at sign-in": "Start Kiri ved pålogging",
+  "Start Kiri in the background when you sign in.": "Start Kiri i bakgrunnen når du logger inn.",
+  "Stop the engine when Kiri quits": "Stopp motoren når Kiri avsluttes",
+  "Quitting Kiri stops running containers and the engine. Opening Kiri starts it again.": "Å avslutte Kiri stopper kjørende containere og motoren. Å åpne Kiri starter den igjen."
 }

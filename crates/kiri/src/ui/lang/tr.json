@@ -1859,5 +1859,9 @@
   "WSL integration": "WSL entegrasyonu",
   "Close: the memory the window uses is freed. It takes a moment to open again, and open terminals end.": "Kapat: pencerenin kullandığı bellek boşaltılır. Yeniden açılması biraz sürer ve açık terminaller kapanır.",
   "Closing the window": "Pencere kapatılınca",
-  "Hide: the window stays ready and opens again at once.": "Gizle: pencere hazır bekler ve hemen yeniden açılır."
+  "Hide: the window stays ready and opens again at once.": "Gizle: pencere hazır bekler ve hemen yeniden açılır.",
+  "Start Kiri at sign-in": "Oturum açıldığında Kiri'yi başlat",
+  "Start Kiri in the background when you sign in.": "Oturum açtığınızda Kiri'yi arka planda başlatır.",
+  "Stop the engine when Kiri quits": "Kiri'den çıkıldığında motoru durdur",
+  "Quitting Kiri stops running containers and the engine. Opening Kiri starts it again.": "Kiri'den çıkmak çalışan kapsayıcıları ve motoru durdurur. Kiri'yi açmak onu yeniden başlatır."
 }

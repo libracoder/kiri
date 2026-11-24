@@ -1859,5 +1859,9 @@
   "WSL integration": "WSL ఇంటిగ్రేషన్",
   "Close: the memory the window uses is freed. It takes a moment to open again, and open terminals end.": "మూసివేయి: విండో వాడే మెమరీ విడుదల అవుతుంది. మళ్లీ తెరవడానికి కొంత సమయం పడుతుంది, తెరిచి ఉన్న టెర్మినల్స్ ముగుస్తాయి.",
   "Closing the window": "విండోను మూసినప్పుడు",
-  "Hide: the window stays ready and opens again at once.": "దాచు: విండో సిద్ధంగా ఉండి వెంటనే మళ్లీ తెరుచుకుంటుంది."
+  "Hide: the window stays ready and opens again at once.": "దాచు: విండో సిద్ధంగా ఉండి వెంటనే మళ్లీ తెరుచుకుంటుంది.",
+  "Start Kiri at sign-in": "సైన్ ఇన్ అయినప్పుడు Kiriని ప్రారంభించు",
+  "Start Kiri in the background when you sign in.": "మీరు సైన్ ఇన్ అయినప్పుడు నేపథ్యంలో Kiriని ప్రారంభిస్తుంది.",
+  "Stop the engine when Kiri quits": "Kiri నుండి నిష్క్రమించినప్పుడు ఇంజిన్‌ను ఆపు",
+  "Quitting Kiri stops running containers and the engine. Opening Kiri starts it again.": "Kiri నుండి నిష్క్రమిస్తే రన్ అవుతున్న కంటైనర్‌లు మరియు ఇంజిన్ ఆగిపోతాయి. Kiriని తెరిస్తే అది మళ్లీ ప్రారంభమవుతుంది."
 }

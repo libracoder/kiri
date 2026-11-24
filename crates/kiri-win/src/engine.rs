@@ -915,7 +915,28 @@ pub fn prefs() -> Value {
         p["theme"] = "dark".into();
     }
     p["watchBindMounts"] = json!(crate::watch::is_enabled());
+    if p.get("startAtLogin").is_none() {
+        p["startAtLogin"] = crate::setup::start_at_login().into();
+    }
+    if p.get("stopOnQuit").is_none() {
+        p["stopOnQuit"] = false.into();
+    }
     p
+}
+
+/// Stops running containers and terminates Kiri's WSL distro when quitting
+/// with "Stop the engine when Kiri quits" on.
+pub fn stop() {
+    sharing::close_all();
+    let _ = match expect_ok(client::request("POST", "/kiri/stop", None)) {
+        Err(e) if e.to_string().contains("404") => expect_ok(client::request("POST", "/kiri/sleep", None)),
+        r => r,
+    };
+    if let Some(d) = distro() {
+        let mut cmd = crate::win::tool("wsl.exe");
+        std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x0800_0000);
+        let _ = crate::update::output_within(cmd.args(["--terminate", &d]), crate::update::WSL_LIMIT);
+    }
 }
 
 /// `en` in the window's language (lang.rs), for words sent to the page:
@@ -939,7 +960,7 @@ fn set_pref(name: &str, value: Value) {
         crate::watch::set_enabled(crate::watch::is_enabled());
         return;
     }
-    if !matches!(name, "font" | "mono" | "scale" | "termH" | "termFs" | "termFont" | "domainsAsked" | "theme" | "accent" | "starAsked" | "updateAuto" | "lang" | "langAsked" | "closeButton") {
+    if !matches!(name, "font" | "mono" | "scale" | "termH" | "termFs" | "termFont" | "domainsAsked" | "theme" | "accent" | "starAsked" | "updateAuto" | "lang" | "langAsked" | "closeButton" | "startAtLogin" | "stopOnQuit") {
         return;
     }
     let Some(path) = prefs_path() else { return };
@@ -1046,6 +1067,30 @@ mod tests {
         assert!(get_req.starts_with("GET /kiri/proxy HTTP/1.1\r\n") && get_req.contains("\r\nX-Kiri-Background: 1\r\n"), "{get_req}");
         assert!(put_req.starts_with("PUT /kiri/proxy/system HTTP/1.1\r\n") && put_req.contains("\r\nX-Kiri-Background: 1\r\n"), "{put_req}");
     }
+
+    #[test]
+    fn saves_stop_on_quit_and_start_at_login_prefs() {
+        let dir = std::env::temp_dir().join(format!("kiri-win-prefs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = std::env::var_os("LOCALAPPDATA");
+        // SAFETY: serialized within this test binary's prefs test.
+        unsafe { std::env::set_var("LOCALAPPDATA", &dir) };
+        assert_eq!(super::prefs()["stopOnQuit"], false);
+        super::set_pref("stopOnQuit", serde_json::json!(true));
+        assert_eq!(super::prefs()["stopOnQuit"], true);
+        super::set_pref("stopOnQuit", serde_json::json!(false));
+        assert_eq!(super::prefs()["stopOnQuit"], false);
+        super::set_pref("startAtLogin", serde_json::json!(false));
+        assert_eq!(super::prefs()["startAtLogin"], false);
+        super::set_pref("startAtLogin", serde_json::json!(true));
+        assert_eq!(super::prefs()["startAtLogin"], true);
+        match old {
+            Some(v) => unsafe { std::env::set_var("LOCALAPPDATA", v) },
+            None => unsafe { std::env::remove_var("LOCALAPPDATA") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// The page's "fonts" event, made once (the window asks each time Settings
@@ -1098,8 +1143,9 @@ pub fn on_message(msg: &str) {
                 emit(crate::buildwith::event());
             });
             send(Cmd::Refresh);
-            // Opening the window starts Kiri, unless it was stopped: that waits for Start.
-            send(Cmd::Launch);
+            // Opening the window starts Kiri, unless it was stopped: that waits
+            // for Start (except when quitting stopped it with stopOnQuit).
+            send(if prefs()["stopOnQuit"] == true { Cmd::Start } else { Cmd::Launch });
             // Anything newer than this build, and a staged update not yet in.
             crate::update::check_now(false);
             // For checking the page by hand in a debug build.
@@ -1255,6 +1301,15 @@ pub fn on_message(msg: &str) {
             if c.name == "theme" {
                 let theme = c.value.as_str().unwrap_or("").to_owned();
                 Handle.run(move |ui| ui.set_theme(&theme));
+            }
+            if c.name == "startAtLogin"
+                && let Some(on) = c.value.as_bool()
+                && let Err(e) = crate::setup::set_start_at_login(on)
+            {
+                crate::serve::log(&format!("start at sign-in: {e}"));
+                emit(notice("error", &e.to_string()));
+                emit(json!({"type": "prefs", "prefs": prefs()}).to_string());
+                return;
             }
             set_pref(&c.name, c.value);
         }

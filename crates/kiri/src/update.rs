@@ -288,7 +288,7 @@ fn spawn_daemon() -> io::Result<()> {
 /// VM off and removes the socket), then SIGKILL if it is still there after
 /// 30 seconds.
 #[cfg(target_os = "macos")]
-fn stop_engine() -> io::Result<()> {
+pub fn stop_engine() -> io::Result<()> {
     let Some(pid) = engine_pid() else { return Ok(()) };
     crate::diag::info!("stopping the engine", pid = pid);
     for (sig, wait) in [(libc::SIGTERM, 30_000u64), (libc::SIGKILL, 5_000)] {

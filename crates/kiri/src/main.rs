@@ -251,6 +251,13 @@ fn window(args: &[String]) -> std::io::Result<()> {
 /// come back. On an engine that wasn't stopped it only wakes the VM.
 #[cfg(unix)]
 fn engine_start() -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    if !client::alive() {
+        if let Ok(d) = daemon::state_dir() {
+            let _ = std::fs::remove_file(d.join("stopped"));
+        }
+        update::start_engine()?;
+    }
     if !client::alive() {
         return Err(std::io::Error::other("Kiri's engine isn't running. Open Kiri, or start it with `kiri daemon`"));
     }

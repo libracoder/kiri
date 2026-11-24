@@ -1859,5 +1859,9 @@
   "WSL integration": "የWSL ውህደት",
   "Close: the memory the window uses is freed. It takes a moment to open again, and open terminals end.": "ዝጋ፦ መስኮቱ የሚጠቀመው ማህደረ ትውስታ ይለቀቃል። እንደገና ለመክፈት ትንሽ ጊዜ ይወስዳል፣ የተከፈቱ ተርሚናሎችም ይዘጋሉ።",
   "Closing the window": "መስኮቱን ሲዘጉ",
-  "Hide: the window stays ready and opens again at once.": "ደብቅ፦ መስኮቱ ዝግጁ ሆኖ ይቆያል፣ ወዲያውኑም እንደገና ይከፈታል።"
+  "Hide: the window stays ready and opens again at once.": "ደብቅ፦ መስኮቱ ዝግጁ ሆኖ ይቆያል፣ ወዲያውኑም እንደገና ይከፈታል።",
+  "Start Kiri at sign-in": "ሲገቡ Kiriን ጀምር",
+  "Start Kiri in the background when you sign in.": "ሲገቡ Kiriን ከበስተጀርባ ጀምር።",
+  "Stop the engine when Kiri quits": "ከKiri ሲወጡ ሞተሩን አቁም",
+  "Quitting Kiri stops running containers and the engine. Opening Kiri starts it again.": "ከKiri መውጣት የሚሠሩ ኮንቴይነሮችን እና ሞተሩን ያቆማል። Kiriን መክፈት እንደገና ያስጀምረዋል።"
 }

@@ -1859,5 +1859,9 @@
   "WSL integration": "Integració amb WSL",
   "Close: the memory the window uses is freed. It takes a moment to open again, and open terminals end.": "Tanca: s’allibera la memòria que fa servir la finestra. Tarda un moment a tornar-se a obrir, i els terminals oberts es tanquen.",
   "Closing the window": "En tancar la finestra",
-  "Hide: the window stays ready and opens again at once.": "Amaga: la finestra es manté a punt i es torna a obrir a l’instant."
+  "Hide: the window stays ready and opens again at once.": "Amaga: la finestra es manté a punt i es torna a obrir a l’instant.",
+  "Start Kiri at sign-in": "Inicia Kiri en iniciar la sessió",
+  "Start Kiri in the background when you sign in.": "Inicia Kiri en segon pla quan inicies la sessió.",
+  "Stop the engine when Kiri quits": "Atura el motor en sortir de Kiri",
+  "Quitting Kiri stops running containers and the engine. Opening Kiri starts it again.": "En sortir de Kiri s'aturen els contenidors en execució i el motor. En obrir Kiri es torna a iniciar."
 }

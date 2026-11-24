@@ -793,13 +793,12 @@ fn uid() -> u32 {
     unsafe { libc::getuid() }
 }
 
-/// A LaunchAgent for `kiri daemon`: started at login, restarted if it
-/// crashes, never restarted after a clean exit.
-fn agent() -> io::Result<PathBuf> {
-    let exe = std::env::current_exe()?.canonicalize()?;
-    let log = home()?.join(crate::flavor::STATE.get()).join("daemon.log");
+/// A LaunchAgent for `kiri daemon`: started at login when `run_at_load` is
+/// true, restarted if it crashes, never restarted after a clean exit.
+pub(crate) fn agent_plist_xml(exe: &Path, log: &Path, run_at_load: bool) -> String {
     let esc = |p: &Path| p.to_string_lossy().replace('&', "&amp;").replace('<', "&lt;");
-    let plist = format!(
+    let run = if run_at_load { "true" } else { "false" };
+    format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -807,7 +806,7 @@ fn agent() -> io::Result<PathBuf> {
   <key>Label</key><string>{AGENT}</string>
   <key>AssociatedBundleIdentifiers</key><array><string>{APP_ID}</string></array>
   <key>ProgramArguments</key><array><string>{}</string><string>daemon</string></array>
-  <key>RunAtLoad</key><true/>
+  <key>RunAtLoad</key><{run}/>
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
   <key>ProcessType</key><string>Interactive</string>
   <key>StandardOutPath</key><string>{}</string>
@@ -815,10 +814,95 @@ fn agent() -> io::Result<PathBuf> {
 </dict>
 </plist>
 "#,
-        esc(&exe),
-        esc(&log),
-        esc(&log)
-    );
+        esc(exe),
+        esc(log),
+        esc(log)
+    )
+}
+
+/// Reads `<key>RunAtLoad</key>` from a LaunchAgent plist.
+pub(crate) fn plist_run_at_load(xml: &str) -> Option<bool> {
+    let rest = xml.split_once("<key>RunAtLoad</key>")?.1.trim_start();
+    if rest.starts_with("<true/>") {
+        Some(true)
+    } else if rest.starts_with("<false/>") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Flips `<key>RunAtLoad</key>` in a LaunchAgent plist between `<true/>` and `<false/>`.
+pub(crate) fn set_plist_run_at_load(xml: &str, on: bool) -> Option<String> {
+    let key = "<key>RunAtLoad</key>";
+    let at = xml.find(key)? + key.len();
+    let after = &xml[at..];
+    let ws = after.len() - after.trim_start().len();
+    let tag_at = at + ws;
+    let old_tag = if xml[tag_at..].starts_with("<true/>") {
+        "<true/>"
+    } else if xml[tag_at..].starts_with("<false/>") {
+        "<false/>"
+    } else {
+        return None;
+    };
+    let new_tag = if on { "<true/>" } else { "<false/>" };
+    let mut out = String::with_capacity(xml.len() + 1);
+    out.push_str(&xml[..tag_at]);
+    out.push_str(new_tag);
+    out.push_str(&xml[tag_at + old_tag.len()..]);
+    Some(out)
+}
+
+/// Whether the LaunchAgent is set to start Kiri at sign-in (`RunAtLoad`).
+pub fn start_at_login() -> bool {
+    agent_plist()
+        .ok()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|xml| plist_run_at_load(&xml))
+        .unwrap_or(true)
+}
+
+/// Updates `RunAtLoad` in `path` (or writes a valid LaunchAgent plist when missing).
+pub(crate) fn set_start_at_login_at(path: &Path, exe: &Path, log: &Path, on: bool) -> io::Result<()> {
+    if let Ok(xml) = std::fs::read_to_string(path)
+        && let Some(updated) = set_plist_run_at_load(&xml, on)
+    {
+        return std::fs::write(path, updated);
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    if let Some(dir) = log.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(path, agent_plist_xml(exe, log, on))
+}
+
+/// Settings → Appearance → Start Kiri at sign-in: updates `RunAtLoad` in the
+/// LaunchAgent plist while keeping the plist valid for on-demand launchd.
+pub fn set_start_at_login(on: bool) -> io::Result<()> {
+    let path = agent_plist()?;
+    let exe = std::env::current_exe()?.canonicalize()?;
+    let log = home()?.join(crate::flavor::STATE.get()).join("daemon.log");
+    set_start_at_login_at(&path, &exe, &log, on)
+}
+
+/// Unloads the LaunchAgent from launchd, stopping `kiri daemon` if launchd runs it.
+pub fn bootout_agent() {
+    let _ = Command::new("/bin/launchctl")
+        .args(["bootout", &format!("gui/{}/{AGENT}", uid())])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+/// A LaunchAgent for `kiri daemon`: started at login, restarted if it
+/// crashes, never restarted after a clean exit.
+fn agent() -> io::Result<PathBuf> {
+    let exe = std::env::current_exe()?.canonicalize()?;
+    let log = home()?.join(crate::flavor::STATE.get()).join("daemon.log");
+    let plist = agent_plist_xml(&exe, &log, true);
     let path = agent_plist()?;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -858,12 +942,15 @@ pub fn start_agent() -> io::Result<bool> {
     if kicked {
         return Ok(true);
     }
-    // Not loaded: bootstrap it, and RunAtLoad starts it.
+    // Not loaded: bootstrap it, then kickstart it (when RunAtLoad is false,
+    // bootstrap loads the job without starting it).
     let loaded = Command::new("/bin/launchctl").args(["bootstrap", &format!("gui/{}", uid())]).arg(agent_plist()?).stderr(std::process::Stdio::null()).status()?.success();
     if !loaded {
         crate::diag::info!("the LaunchAgent would not load; starting the engine directly");
+        return Ok(false);
     }
-    Ok(loaded)
+    let _ = Command::new("/bin/launchctl").args(["kickstart", &job]).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+    Ok(true)
 }
 
 /// Whether the LaunchAgent starts this copy of Kiri. One left by another
@@ -1121,5 +1208,41 @@ mod tests {
             .output()
             .unwrap();
         assert_eq!(String::from_utf8_lossy(&out.stdout), "/usr/bin:/bin:/h/.kiri/bin");
+    }
+
+    #[test]
+    fn launch_agent_plist_run_at_load_generates_parses_and_toggles() {
+        let d = scratch("plist");
+        let exe = std::path::Path::new("/Applications/Kiri.app/Contents/MacOS/kiri");
+        let log = d.join(".kiri/daemon.log");
+        let plist_path = d.join("Library/LaunchAgents/dev.kiri.daemon.plist");
+
+        let xml_on = super::agent_plist_xml(exe, &log, true);
+        assert_eq!(super::plist_run_at_load(&xml_on), Some(true));
+        assert!(xml_on.contains("<key>RunAtLoad</key><true/>"));
+
+        let xml_off = super::agent_plist_xml(exe, &log, false);
+        assert_eq!(super::plist_run_at_load(&xml_off), Some(false));
+        assert!(xml_off.contains("<key>RunAtLoad</key><false/>"));
+
+        let flipped_off = super::set_plist_run_at_load(&xml_on, false).unwrap();
+        assert_eq!(flipped_off, xml_off);
+        assert_eq!(super::plist_run_at_load(&flipped_off), Some(false));
+
+        let flipped_on = super::set_plist_run_at_load(&flipped_off, true).unwrap();
+        assert_eq!(flipped_on, xml_on);
+        assert_eq!(super::plist_run_at_load(&flipped_on), Some(true));
+
+        // File creation and in-place toggling keep the rest of the plist valid.
+        super::set_start_at_login_at(&plist_path, exe, &log, true).unwrap();
+        assert_eq!(super::plist_run_at_load(&std::fs::read_to_string(&plist_path).unwrap()), Some(true));
+        super::set_start_at_login_at(&plist_path, exe, &log, false).unwrap();
+        let saved = std::fs::read_to_string(&plist_path).unwrap();
+        assert_eq!(super::plist_run_at_load(&saved), Some(false));
+        assert!(saved.contains("<string>/Applications/Kiri.app/Contents/MacOS/kiri</string><string>daemon</string>"));
+        super::set_start_at_login_at(&plist_path, exe, &log, true).unwrap();
+        assert_eq!(super::plist_run_at_load(&std::fs::read_to_string(&plist_path).unwrap()), Some(true));
+
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

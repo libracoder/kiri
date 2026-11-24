@@ -1859,5 +1859,9 @@
   "WSL integration": "WSL ஒருங்கிணைப்பு",
   "Close: the memory the window uses is freed. It takes a moment to open again, and open terminals end.": "மூடு: சாளரம் பயன்படுத்தும் நினைவகம் விடுவிக்கப்படும். மீண்டும் திறக்கச் சற்று நேரமாகும், திறந்திருக்கும் டெர்மினல்கள் முடிவடையும்.",
   "Closing the window": "சாளரத்தை மூடும்போது",
-  "Hide: the window stays ready and opens again at once.": "மறை: சாளரம் தயாராக இருந்து உடனே மீண்டும் திறக்கும்."
+  "Hide: the window stays ready and opens again at once.": "மறை: சாளரம் தயாராக இருந்து உடனே மீண்டும் திறக்கும்.",
+  "Start Kiri at sign-in": "உள்நுழையும்போது Kiri-ஐத் தொடங்கு",
+  "Start Kiri in the background when you sign in.": "நீங்கள் உள்நுழையும்போது பின்னணியில் Kiri-ஐத் தொடங்கும்.",
+  "Stop the engine when Kiri quits": "Kiri-ஐ மூடும்போது இன்ஜினை நிறுத்து",
+  "Quitting Kiri stops running containers and the engine. Opening Kiri starts it again.": "Kiri-ஐ மூடினால் இயங்கும் கன்டெய்னர்களும் இன்ஜினும் நிற்கும். Kiri-ஐத் திறந்தால் மீண்டும் தொடங்கும்."
 }

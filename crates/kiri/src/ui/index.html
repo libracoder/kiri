@@ -4489,6 +4489,8 @@ function renderSettings() {
   };
   const inUse = darkNow();
   const sysName = LANGS.find(([id]) => id === resolveLang("system"))?.[1] || "English";
+  const startAtLogin = prefs.startAtLogin ?? !LINUX;
+  const stopOnQuit = prefs.stopOnQuit === true;
   const appearance = `<div class="pane"><h3>${tr("Appearance")}</h3>
     <div class="pref"><span class="t" id="pref-lang-t">${tr("Language")}</span><span class="d">${tr("Follow {os} (now {lang}), or always use one language.", { os: OS, lang: sysName })}</span>
       ${langButton(sysName)}
@@ -4511,6 +4513,10 @@ function renderSettings() {
       : tr("Hide: the window stays ready and opens again at once.")}</span>
       <div class="seg" role="group" aria-label="${tr("Closing the window")}"><button data-closebtn="hide" aria-pressed="${prefs.closeButton !== "close"}">${tr("Hide")}</button><button data-closebtn="close" aria-pressed="${prefs.closeButton === "close"}">${tr("Close")}</button></div></div>
     <div class="preview"><div class="p-title">web · nginx:alpine</div><div>Up 3 minutes · 26.3 MB · localhost:8080 → 80</div><div class="p-mono">ef9a6e2b45c2  docker run -p 8080:80 nginx</div></div>
+    <div class="pref"><span class="t">${tr("Start Kiri at sign-in")}</span><span class="d">${tr("Start Kiri in the background when you sign in.")}</span>
+      <div class="seg" role="group" aria-label="${tr("Start Kiri at sign-in")}"><button data-startlogin="0" aria-pressed="${!startAtLogin}">${tr("Off")}</button><button data-startlogin="1" aria-pressed="${startAtLogin}">${tr("On")}</button></div></div>
+    <div class="pref"><span class="t">${tr("Stop the engine when Kiri quits")}</span><span class="d">${tr("Quitting Kiri stops running containers and the engine. Opening Kiri starts it again.")}</span>
+      <div class="seg" role="group" aria-label="${tr("Stop the engine when Kiri quits")}"><button data-stopquit="0" aria-pressed="${!stopOnQuit}">${tr("Off")}</button><button data-stopquit="1" aria-pressed="${stopOnQuit}">${tr("On")}</button></div></div>
   </div>`;
   const portsPref = routerPortsPref();
   // On Linux: kiri.localhost only, for now; nothing to switch.
@@ -8339,6 +8345,8 @@ $("content").addEventListener("click", (ev) => {
   else if ((el = t("[data-scale]"))) setPref("scale", +el.dataset.scale);
   else if ((el = t("[data-logsize]"))) setPref("logSize", +el.dataset.logsize);
   else if ((el = t("[data-closebtn]"))) setPref("closeButton", el.dataset.closebtn);
+  else if ((el = t("[data-startlogin]"))) setPref("startAtLogin", el.dataset.startlogin === "1");
+  else if ((el = t("[data-stopquit]"))) setPref("stopOnQuit", el.dataset.stopquit === "1");
   else if ((el = t("[data-theme-pick]"))) setPref("theme", el.dataset.themePick);
   else if ((el = t("[data-accent]"))) setPref("accent", el.dataset.accent);
   else if (t("[data-buildprune]")) { ui.bwPruning = true; send("buildprune"); render(); }

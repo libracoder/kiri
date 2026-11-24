@@ -635,7 +635,9 @@ define_class!(
             if crate::update::staged().is_some() {
                 match crate::update::install_staged() {
                     Ok(version) => {
-                        if let Err(e) = crate::update::restart_engine(&version) {
+                        if !super::stop_on_quit()
+                            && let Err(e) = crate::update::restart_engine(&version)
+                        {
                             diag::error!("the engine did not restart on the update", version = version, error = e);
                         }
                     }

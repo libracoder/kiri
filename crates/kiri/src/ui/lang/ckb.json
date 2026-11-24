@@ -1859,5 +1859,9 @@
   "WSL integration": "ئاوێتەکردنی WSL",
   "Close: the memory the window uses is freed. It takes a moment to open again, and open terminals end.": "داخستن: ئەو بیرگەیەی پەنجەرەکە بەکاری دەهێنێت ئازاد دەکرێت. کردنەوەی دووبارەی کەمێک کات دەبات، و تێرمیناڵە کراوەکان کۆتاییان دێت.",
   "Closing the window": "داخستنی پەنجەرە",
-  "Hide: the window stays ready and opens again at once.": "شاردنەوە: پەنجەرەکە ئامادە دەمێنێتەوە و دەستبەجێ دەکرێتەوە."
+  "Hide: the window stays ready and opens again at once.": "شاردنەوە: پەنجەرەکە ئامادە دەمێنێتەوە و دەستبەجێ دەکرێتەوە.",
+  "Start Kiri at sign-in": "لە کاتی چوونەژوورەوە Kiri دەست پێبکە",
+  "Start Kiri in the background when you sign in.": "کاتێک دەچیتە ژوورەوە Kiri لە پاشبنەمادا دەست پێبکە.",
+  "Stop the engine when Kiri quits": "کاتێک لە Kiri دەردەچیت بزوێنەر ڕابگرە",
+  "Quitting Kiri stops running containers and the engine. Opening Kiri starts it again.": "دەرچوون لە Kiri کۆنتەینەرە کاراکان و بزوێنەر ڕادەگرێت. کردنەوەی Kiri دووبارە دەستی پێدەکاتەوە."
 }

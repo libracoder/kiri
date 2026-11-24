@@ -1859,5 +1859,9 @@
   "WSL integration": "Tích hợp WSL",
   "Close: the memory the window uses is freed. It takes a moment to open again, and open terminals end.": "Đóng: giải phóng bộ nhớ cửa sổ đang dùng. Mở lại sẽ mất một lúc, và các terminal đang mở sẽ bị đóng.",
   "Closing the window": "Khi đóng cửa sổ",
-  "Hide: the window stays ready and opens again at once.": "Ẩn: cửa sổ luôn sẵn sàng và mở lại ngay."
+  "Hide: the window stays ready and opens again at once.": "Ẩn: cửa sổ luôn sẵn sàng và mở lại ngay.",
+  "Start Kiri at sign-in": "Khởi động Kiri khi đăng nhập",
+  "Start Kiri in the background when you sign in.": "Khởi động Kiri dưới nền khi bạn đăng nhập.",
+  "Stop the engine when Kiri quits": "Dừng engine khi thoát Kiri",
+  "Quitting Kiri stops running containers and the engine. Opening Kiri starts it again.": "Thoát Kiri sẽ dừng các container đang chạy và engine. Mở Kiri sẽ khởi động lại nó."
 }

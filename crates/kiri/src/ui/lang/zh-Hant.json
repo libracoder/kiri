@@ -1859,5 +1859,9 @@
   "WSL integration": "WSL 整合",
   "Close: the memory the window uses is freed. It takes a moment to open again, and open terminals end.": "關閉：釋放視窗占用的記憶體。重新開啟需要片刻，已開啟的終端機會結束。",
   "Closing the window": "關閉視窗時",
-  "Hide: the window stays ready and opens again at once.": "隱藏：視窗保持就緒，可立即重新開啟。"
+  "Hide: the window stays ready and opens again at once.": "隱藏：視窗保持就緒，可立即重新開啟。",
+  "Start Kiri at sign-in": "登入時啟動 Kiri",
+  "Start Kiri in the background when you sign in.": "登入時在背景啟動 Kiri。",
+  "Stop the engine when Kiri quits": "結束 Kiri 時停止引擎",
+  "Quitting Kiri stops running containers and the engine. Opening Kiri starts it again.": "結束 Kiri 會停止正在執行的容器與引擎。開啟 Kiri 會再次啟動它。"
 }

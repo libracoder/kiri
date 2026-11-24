@@ -1859,5 +1859,9 @@
   "WSL integration": "یکپارچه‌سازی WSL",
   "Close: the memory the window uses is freed. It takes a moment to open again, and open terminals end.": "بستن: حافظه‌ای که پنجره مصرف می‌کند آزاد می‌شود. باز شدن دوباره‌اش کمی طول می‌کشد و ترمینال‌های باز بسته می‌شوند.",
   "Closing the window": "بستن پنجره",
-  "Hide: the window stays ready and opens again at once.": "پنهان کردن: پنجره آماده می‌ماند و بی‌درنگ دوباره باز می‌شود."
+  "Hide: the window stays ready and opens again at once.": "پنهان کردن: پنجره آماده می‌ماند و بی‌درنگ دوباره باز می‌شود.",
+  "Start Kiri at sign-in": "شروع Kiri هنگام ورود",
+  "Start Kiri in the background when you sign in.": "هنگام ورود شما، Kiri را در پس‌زمینه شروع کند.",
+  "Stop the engine when Kiri quits": "توقف موتور هنگام خروج از Kiri",
+  "Quitting Kiri stops running containers and the engine. Opening Kiri starts it again.": "خروج از Kiri کانتینرهای در حال اجرا و موتور را متوقف می‌کند. باز کردن Kiri دوباره آن را شروع می‌کند."
 }

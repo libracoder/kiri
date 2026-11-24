@@ -1859,5 +1859,9 @@
   "WSL integration": "WSL-integráció",
   "Close: the memory the window uses is freed. It takes a moment to open again, and open terminals end.": "Bezárás: az ablak által használt memória felszabadul. Újbóli megnyitása egy pillanatig tart, a nyitott terminálok pedig bezárulnak.",
   "Closing the window": "Az ablak bezárásakor",
-  "Hide: the window stays ready and opens again at once.": "Elrejtés: az ablak készenlétben marad, és azonnal újra megnyílik."
+  "Hide: the window stays ready and opens again at once.": "Elrejtés: az ablak készenlétben marad, és azonnal újra megnyílik.",
+  "Start Kiri at sign-in": "A Kiri indítása bejelentkezéskor",
+  "Start Kiri in the background when you sign in.": "A Kiri indítása a háttérben bejelentkezéskor.",
+  "Stop the engine when Kiri quits": "A motor leállítása a Kiriből való kilépéskor",
+  "Quitting Kiri stops running containers and the engine. Opening Kiri starts it again.": "A Kiriből való kilépés leállítja a futó konténereket és a motort. A Kiri megnyitása újra elindítja."
 }

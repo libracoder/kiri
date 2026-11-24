@@ -1859,5 +1859,9 @@
   "WSL integration": "Integrimi me WSL",
   "Close: the memory the window uses is freed. It takes a moment to open again, and open terminals end.": "Mbyll: memoria që përdor dritarja lirohet. Rihapja zgjat një çast dhe terminalet e hapura mbyllen.",
   "Closing the window": "Kur mbyllet dritarja",
-  "Hide: the window stays ready and opens again at once.": "Fshih: dritarja mbetet gati dhe hapet sërish menjëherë."
+  "Hide: the window stays ready and opens again at once.": "Fshih: dritarja mbetet gati dhe hapet sërish menjëherë.",
+  "Start Kiri at sign-in": "Nis Kiri gjatë identifikimit",
+  "Start Kiri in the background when you sign in.": "Nis Kiri në sfond kur identifikoheni.",
+  "Stop the engine when Kiri quits": "Ndal motorin kur dilni nga Kiri",
+  "Quitting Kiri stops running containers and the engine. Opening Kiri starts it again.": "Dalja nga Kiri ndal kontejnerët në punë dhe motorin. Hapja e Kiri e nis sërish."
 }

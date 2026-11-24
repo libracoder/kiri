@@ -47,6 +47,23 @@ pub mod setup {
         let out = std::process::Command::new("docker").args(["context", "use", name]).output()?;
         if out.status.success() { Ok(()) } else { Err(io::Error::other(String::from_utf8_lossy(&out.stderr).trim().to_owned())) }
     }
+
+    fn config_dir() -> Option<std::path::PathBuf> {
+        let xdg = std::env::var_os("XDG_CONFIG_HOME").map(std::path::PathBuf::from);
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        crate::ui::xdg_config_dir(xdg.as_deref(), home.as_deref())
+    }
+
+    pub fn start_at_login() -> bool {
+        config_dir().is_some_and(|d| crate::ui::linux_autostart_at(&d))
+    }
+
+    pub fn set_start_at_login(on: bool) -> io::Result<()> {
+        let dir = config_dir().ok_or_else(|| io::Error::other("HOME is not set"))?;
+        crate::ui::set_linux_autostart_at(&dir, on)
+    }
+
+    pub fn bootout_agent() {}
 }
 
 pub mod update {
@@ -113,6 +130,10 @@ pub mod update {
     /// Never called: the window doesn't start Linux's engine (systemd does).
     pub fn start_engine() -> io::Result<()> {
         Err(super::engine_down())
+    }
+
+    pub fn stop_engine() -> io::Result<()> {
+        Ok(())
     }
 }
 

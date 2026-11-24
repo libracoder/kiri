@@ -1859,5 +1859,9 @@
   "WSL integration": "Ενσωμάτωση WSL",
   "Close: the memory the window uses is freed. It takes a moment to open again, and open terminals end.": "Κλείσιμο: η μνήμη που χρησιμοποιεί το παράθυρο ελευθερώνεται. Χρειάζεται μια στιγμή για να ανοίξει ξανά, και τα ανοιχτά τερματικά τερματίζονται.",
   "Closing the window": "Κλείσιμο του παραθύρου",
-  "Hide: the window stays ready and opens again at once.": "Απόκρυψη: το παράθυρο μένει έτοιμο και ανοίγει ξανά αμέσως."
+  "Hide: the window stays ready and opens again at once.": "Απόκρυψη: το παράθυρο μένει έτοιμο και ανοίγει ξανά αμέσως.",
+  "Start Kiri at sign-in": "Εκκίνηση του Kiri κατά τη σύνδεση",
+  "Start Kiri in the background when you sign in.": "Εκκίνηση του Kiri στο παρασκήνιο όταν συνδέεστε.",
+  "Stop the engine when Kiri quits": "Διακοπή της μηχανής κατά τον τερματισμό του Kiri",
+  "Quitting Kiri stops running containers and the engine. Opening Kiri starts it again.": "Ο τερματισμός του Kiri σταματά τα κοντέινερ που εκτελούνται και τη μηχανή. Το άνοιγμα του Kiri την ξεκινά ξανά."
 }

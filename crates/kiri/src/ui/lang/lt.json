@@ -1859,5 +1859,9 @@
   "WSL integration": "WSL integracija",
   "Close: the memory the window uses is freed. It takes a moment to open again, and open terminals end.": "Uždaryti: lango naudojama atmintis atlaisvinama. Vėl atsidaryti užtrunka akimirką, o atviri terminalai užbaigiami.",
   "Closing the window": "Uždarant langą",
-  "Hide: the window stays ready and opens again at once.": "Slėpti: langas lieka paruoštas ir iškart atsidaro vėl."
+  "Hide: the window stays ready and opens again at once.": "Slėpti: langas lieka paruoštas ir iškart atsidaro vėl.",
+  "Start Kiri at sign-in": "Paleisti Kiri prisijungus",
+  "Start Kiri in the background when you sign in.": "Paleisti Kiri fone, kai prisijungiate.",
+  "Stop the engine when Kiri quits": "Sustabdyti variklį išėjus iš Kiri",
+  "Quitting Kiri stops running containers and the engine. Opening Kiri starts it again.": "Išėjus iš Kiri sustabdomi veikiantys konteineriai ir variklis. Atidarius Kiri jis paleidžiamas vėl."
 }

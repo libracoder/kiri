@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #368 Settings: add Start Kiri at sign-in and Stop the engine when Kiri quits (unreleased)
+- Fixes: #368 macOS: setting to stop the engine when Kiri quits; #703 Add "Launch at startup" toggle in app settings
+- Caused: none known
+- Caused by: -
+- Check: none
+
 ### #706, #539 UI: Linux tray icon and unified window-close setting (Hide vs Close) across macOS, Windows and Linux (unreleased)
 - Fixes: #405 Linux: close the window to the tray, as on Windows; #168 Release or suspend WebView2 memory when window is closed to tray (Lightweight background mode)
 - Caused: none known
@@ -45,10 +51,6 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 - Caused: none known
 - Caused by: -
 - Check: none
-
-
-
-
 
 ### #735 macOS: reach loopback-published ports and Kiri's resolver from `--network host` containers (unreleased)
 - Fixes: #732 macOS: `--network host` containers have no DNS and can't reach ports published on 127.0.0.1, so a host-network BuildKit can't push to a local registry

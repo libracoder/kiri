@@ -1859,5 +1859,9 @@
   "WSL integration": "Integrare WSL",
   "Close: the memory the window uses is freed. It takes a moment to open again, and open terminals end.": "Închide: memoria folosită de fereastră este eliberată. Redeschiderea durează o clipă, iar terminalele deschise se închid.",
   "Closing the window": "La închiderea ferestrei",
-  "Hide: the window stays ready and opens again at once.": "Ascunde: fereastra rămâne pregătită și se redeschide imediat."
+  "Hide: the window stays ready and opens again at once.": "Ascunde: fereastra rămâne pregătită și se redeschide imediat.",
+  "Start Kiri at sign-in": "Pornește Kiri la conectare",
+  "Start Kiri in the background when you sign in.": "Pornește Kiri în fundal când te conectezi.",
+  "Stop the engine when Kiri quits": "Oprește motorul la ieșirea din Kiri",
+  "Quitting Kiri stops running containers and the engine. Opening Kiri starts it again.": "Ieșirea din Kiri oprește containerele care rulează și motorul. Deschiderea Kiri îl pornește din nou."
 }

@@ -1859,5 +1859,9 @@
   "WSL integration": "ການເຊື່ອມໂຍງ WSL",
   "Close: the memory the window uses is freed. It takes a moment to open again, and open terminals end.": "ປິດ: ໜ່ວຍຄວາມຈຳທີ່ໜ້າຕ່າງໃຊ້ຈະຖືກປ່ອຍຄືນ. ການເປີດຄືນຈະໃຊ້ເວລາໜ້ອຍໜຶ່ງ ແລະ ເທີມິນອນທີ່ເປີດຢູ່ຈະຖືກປິດ.",
   "Closing the window": "ເມື່ອປິດໜ້າຕ່າງ",
-  "Hide: the window stays ready and opens again at once.": "ເຊື່ອງ: ໜ້າຕ່າງຈະກຽມພ້ອມໄວ້ ແລະ ເປີດຄືນໄດ້ທັນທີ."
+  "Hide: the window stays ready and opens again at once.": "ເຊື່ອງ: ໜ້າຕ່າງຈະກຽມພ້ອມໄວ້ ແລະ ເປີດຄືນໄດ້ທັນທີ.",
+  "Start Kiri at sign-in": "ເລີ່ມ Kiri ເມື່ອເຂົ້າສູ່ລະບົບ",
+  "Start Kiri in the background when you sign in.": "ເລີ່ມ Kiri ໃນພື້ນຫຼັງເມື່ອທ່ານເຂົ້າສູ່ລະບົບ.",
+  "Stop the engine when Kiri quits": "ຢຸດເອນຈິນເມື່ອອອກຈາກ Kiri",
+  "Quitting Kiri stops running containers and the engine. Opening Kiri starts it again.": "ການອອກຈາກ Kiri ຈະຢຸດຄອນເທນເນີທີ່ແລ່ນຢູ່ ແລະ ເອນຈິນ. ການເປີດ Kiri ຈະເລີ່ມມັນໃໝ່."
 }

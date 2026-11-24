@@ -1859,5 +1859,9 @@
   "WSL integration": "WSL ইন্টিগ্রেশন",
   "Close: the memory the window uses is freed. It takes a moment to open again, and open terminals end.": "বন্ধ করুন: উইন্ডোর ব্যবহৃত মেমরি মুক্ত হয়। আবার খুলতে একটু সময় লাগে, এবং খোলা টার্মিনালগুলো বন্ধ হয়ে যায়।",
   "Closing the window": "উইন্ডো বন্ধ করলে",
-  "Hide: the window stays ready and opens again at once.": "লুকান: উইন্ডো প্রস্তুত থাকে এবং সঙ্গে সঙ্গে আবার খোলে।"
+  "Hide: the window stays ready and opens again at once.": "লুকান: উইন্ডো প্রস্তুত থাকে এবং সঙ্গে সঙ্গে আবার খোলে।",
+  "Start Kiri at sign-in": "সাইন ইন করার সময় Kiri চালু করুন",
+  "Start Kiri in the background when you sign in.": "আপনি সাইন ইন করলে পটভূমিতে Kiri চালু করুন।",
+  "Stop the engine when Kiri quits": "Kiri বন্ধ করলে ইঞ্জিন থামান",
+  "Quitting Kiri stops running containers and the engine. Opening Kiri starts it again.": "Kiri বন্ধ করলে চলমান কন্টেইনার এবং ইঞ্জিন থেমে যায়। Kiri খুললে এটি আবার চালু হয়।"
 }
