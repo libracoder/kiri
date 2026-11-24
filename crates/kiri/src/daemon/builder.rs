@@ -105,11 +105,15 @@ fn default_cache(disk: u64) -> u64 {
     if disk == 0 { 20 * GB } else { (disk / 10).clamp(GB, 20 * GB) }
 }
 
+fn cache_limit_from(gb: Option<u64>, disk: impl FnOnce() -> u64) -> u64 {
+    gb.filter(|g| *g > 0).map_or_else(|| default_cache(disk()), |g| g.saturating_mul(GB))
+}
+
 /// The build cache's cap in bytes: `KIRI_BUILD_CACHE_GB`, else Settings,
 /// else [`default_cache`]. BuildKit's garbage collector keeps the cache under it.
 pub fn cache_limit() -> u64 {
     let gb = std::env::var("KIRI_BUILD_CACHE_GB").ok().and_then(|v| v.parse::<u64>().ok()).or_else(|| settings()["cache_gb"].as_u64());
-    gb.filter(|g| *g > 0).map_or_else(|| default_cache(disk_total()), |g| g * GB)
+    cache_limit_from(gb, disk_total)
 }
 
 /// Seconds without a build before the builder stops: `KIRI_BUILDER_IDLE_SECS`,
@@ -819,7 +823,7 @@ fn json_query(req: &Request, key: &str) -> Result<Value, Error> {
 
 /// `a/b/Dockerfile` stays; a leading `./` or `/` goes; `..` is refused.
 fn clean_path(p: &str) -> Result<String, Error> {
-    let parts: Vec<&str> = p.split('/').filter(|s| !s.is_empty() && *s != ".").collect();
+    let parts: Vec<&str> = p.split(['/', '\\']).filter(|s| !s.is_empty() && *s != ".").collect();
     if parts.contains(&"..") {
         return Err(Error::BadRequest(format!("the Dockerfile ({p}) must be within the build context")));
     }
@@ -1026,15 +1030,34 @@ enum Context {
     Dockerfile,
 }
 
+/// Whether `head` begins a tar archive: an empty body, `ustar` magic, an
+/// all-zero end-of-archive block, or a V7 header whose octal checksum matches.
+fn tar_header(head: &[u8]) -> bool {
+    if head.is_empty() || head.get(257..262) == Some(b"ustar") {
+        return true;
+    }
+    if head.len() < 512 {
+        return false;
+    }
+    if head[..512].iter().all(|&b| b == 0) {
+        return true;
+    }
+    let Some(s) = std::str::from_utf8(&head[148..156]).ok().map(|s| s.trim_matches([' ', '\0'])).filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    let Ok(want) = u32::from_str_radix(s, 8) else { return false };
+    let unsigned = head[..148].iter().chain(&head[156..512]).map(|&b| u32::from(b)).sum::<u32>() + 8 * 32;
+    let signed = head[..148].iter().chain(&head[156..512]).map(|&b| i32::from(b as i8)).sum::<i32>() + 8 * 32;
+    want == unsigned || i32::try_from(want).ok() == Some(signed)
+}
+
 fn sniff(head: &[u8]) -> Context {
     match head {
         [0x1f, 0x8b, ..] => Context::Compressed("-z"),
         [b'B', b'Z', b'h', ..] => Context::Compressed("-j"),
         [0xfd, b'7', b'z', b'X', b'Z', 0, ..] => Context::Compressed("-J"),
         [0x28, 0xb5, 0x2f, 0xfd, ..] => Context::Zstd,
-        // Every tar Docker clients write is ustar or PAX (`ustar` at 257);
-        // an empty body is an empty context.
-        h if h.is_empty() || h.get(257..262) == Some(b"ustar") => Context::Tar,
+        h if tar_header(h) => Context::Tar,
         _ => Context::Dockerfile,
     }
 }
@@ -1138,6 +1161,15 @@ fn run(req: &Request, engine: &Engine, o: &mut Options, r: &mut BufReader<UnixSt
     built
 }
 
+fn read_dockerfile(mut text: Vec<u8>, body: impl Read) -> Result<Vec<u8>, String> {
+    let limit = (MAX_DOCKERFILE + 1).saturating_sub(text.len() as u64);
+    body.take(limit).read_to_end(&mut text).map_err(|e| format!("reading the Dockerfile: {e}"))?;
+    if text.len() as u64 > MAX_DOCKERFILE {
+        return Err(format!("the Dockerfile exceeds {} MiB", MAX_DOCKERFILE >> 20));
+    }
+    Ok(text)
+}
+
 /// The request body, unpacked into `dir/context` in the builder.
 fn send_context(engine: &Engine, id: &str, dir: &str, req: &Request, r: &mut BufReader<UnixStream>, o: &mut Options) -> Result<(), String> {
     let mut body = http::Body::new(req, r);
@@ -1158,8 +1190,7 @@ fn send_context(engine: &Engine, id: &str, dir: &str, req: &Request, r: &mut Buf
         }
         Context::Zstd => Err("a zstd-compressed build context isn't supported: send it as tar, gzip, bzip2 or xz".into()),
         Context::Dockerfile => {
-            let mut text = head;
-            body.take(MAX_DOCKERFILE).read_to_end(&mut text).map_err(|e| format!("reading the Dockerfile: {e}"))?;
+            let text = read_dockerfile(head, body)?;
             o.dockerfile = "Dockerfile".into();
             copy_in(engine, id, &ctx, &mut io::Cursor::new(tar(&[("Dockerfile", Some(&text))]))).map_err(|e| format!("{e:?}"))
         }
@@ -2020,8 +2051,82 @@ mod tests {
         assert_eq!(default_cache(0), 20 * GB);
         assert_eq!(default_cache(100 * GB), 10 * GB);
         assert_eq!(default_cache(2000 * GB), 20 * GB);
+        assert_eq!(cache_limit_from(None, || 100 * GB), 10 * GB);
+        assert_eq!(cache_limit_from(Some(0), || 100 * GB), 10 * GB);
+        assert_eq!(cache_limit_from(Some(12), || panic!("disk_total not needed when gb > 0")), 12 * GB);
+        assert_eq!(cache_limit_from(Some((u64::MAX / GB) + 1), || 100 * GB), u64::MAX);
+        assert_eq!(cache_limit_from(Some(u64::MAX), || 100 * GB), u64::MAX);
         assert!(config_toml(8 * GB, "").contains(&format!("maxUsedSpace = {}", 8 * GB)));
         assert_eq!(failure(&["#5 ERROR: boom".into(), "error: failed to solve: boom".into()], 1), "failed to solve: boom");
         assert_eq!(failure(&[], 2), "buildctl exited with code 2");
+    }
+
+    #[test]
+    fn sniffs_empty_and_v7_tars_and_bounds_dockerfiles_and_paths() {
+        let empty = ::tar::Builder::new(Vec::new()).into_inner().unwrap();
+        assert_eq!(empty.len(), 1024);
+        assert_eq!(sniff(&empty[..512]), Context::Tar);
+        assert_eq!(sniff(&[0u8; 512]), Context::Tar);
+        assert_eq!(sniff(&[0u8; 64]), Context::Dockerfile);
+
+        // Unsigned-checksum V7 tar header (no `ustar` magic at 257..262).
+        let mut b = ::tar::Builder::new(Vec::new());
+        let mut h = ::tar::Header::new_old();
+        h.set_path("sub/Dockerfile.dev").unwrap();
+        h.set_size(12);
+        h.set_mode(0o644);
+        h.set_cksum();
+        b.append(&h, &b"FROM alpine\n"[..]).unwrap();
+        let v7 = b.into_inner().unwrap();
+        assert_ne!(&v7[257..262], b"ustar");
+        assert_eq!(sniff(&v7[..512]), Context::Tar);
+
+        // Signed-checksum V7 tar header (legacy signed-char sum with non-ASCII bytes).
+        let mut signed_v7 = [0u8; 512];
+        let name = "café/Dockerfile".as_bytes();
+        signed_v7[..name.len()].copy_from_slice(name);
+        signed_v7[100..108].copy_from_slice(b"0000644\0");
+        signed_v7[124..136].copy_from_slice(b"00000000014\0");
+        signed_v7[136..148].copy_from_slice(b"14700000000\0");
+        signed_v7[156] = b'0';
+        let signed_sum: i32 = signed_v7[..148].iter().chain(&signed_v7[156..512]).map(|&b| i32::from(b as i8)).sum::<i32>() + 8 * 32;
+        assert!(signed_sum > 0);
+        signed_v7[148..156].copy_from_slice(format!("{signed_sum:06o}\0 ").as_bytes());
+        assert_eq!(sniff(&signed_v7), Context::Tar);
+
+        // Corrupted V7 header and raw Dockerfiles with fake or invalid octal text at 148..156.
+        let mut bad_v7 = v7[..512].to_vec();
+        bad_v7[0] ^= 0x01;
+        assert_eq!(sniff(&bad_v7), Context::Dockerfile);
+
+        let mut fake = b"FROM alpine\n# ".to_vec();
+        fake.resize(148, b'a');
+        fake.extend_from_slice(b"000777\0 ");
+        fake.resize(512, b'\n');
+        assert_eq!(sniff(&fake), Context::Dockerfile);
+
+        let mut non_octal = fake.clone();
+        non_octal[148..156].copy_from_slice(b"000888\0 ");
+        assert_eq!(sniff(&non_octal), Context::Dockerfile);
+
+        // Raw Dockerfile cap: exact MAX_DOCKERFILE succeeds; MAX_DOCKERFILE + 1 and unbounded streams fail.
+        assert_eq!(read_dockerfile(vec![b'#'; 512], io::repeat(b'x').take(MAX_DOCKERFILE - 512)).unwrap().len() as u64, MAX_DOCKERFILE);
+        assert_eq!(read_dockerfile(vec![b'#'; 512], io::repeat(b'x').take(MAX_DOCKERFILE - 511)).unwrap_err(), "the Dockerfile exceeds 8 MiB");
+        assert_eq!(read_dockerfile(vec![b'#'; 512], io::repeat(b'x')).unwrap_err(), "the Dockerfile exceeds 8 MiB");
+
+        // Windows backslash traversal refusals and path normalization.
+        assert!(Options::parse(&req(&[("dockerfile", r"..\Dockerfile")])).is_err());
+        assert!(Options::parse(&req(&[("dockerfile", r"a/b\..\..\..")])).is_err());
+        assert!(Options::parse(&req(&[("dockerfile", r"docker\..\Dockerfile")])).is_err());
+
+        let o = Options::parse(&req(&[("dockerfile", r".\docker\Dockerfile.dev")])).unwrap();
+        assert_eq!(o.dockerfile, "docker/Dockerfile.dev");
+        let a = o.argv("/d");
+        assert!(a.windows(2).any(|w| w == ["--opt", "filename=Dockerfile.dev"]));
+        assert!(a.windows(2).any(|w| w == ["--local", "dockerfile=/d/context/docker"]));
+
+        let root_df = Options::parse(&req(&[("dockerfile", r".\Dockerfile")])).unwrap();
+        assert_eq!(root_df.dockerfile, "Dockerfile");
+        assert_eq!(Options::parse(&req(&[("dockerfile", r".\")])).unwrap().dockerfile, "Dockerfile");
     }
 }
