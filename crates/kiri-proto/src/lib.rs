@@ -579,7 +579,7 @@ pub struct RunSpec<'a> {
     /// HostConfig settings applied at start, one per line, tab-separated:
     /// `rlimit res soft hard`, `sysctl ns path value`, `device host
     /// container perms`, `devrule type major minor perms`, `group name`,
-    /// `masked path…`, `readonly path…`.
+    /// `masked path…`, `readonly path…`, `cgroupns host`.
     /// Empty from an older daemon.
     pub opts: StrList<'a>,
     /// The container's own seccomp profile, compiled by the daemon to a

@@ -118,19 +118,64 @@ pub fn umount_lazy(target: &Path) -> io::Result<()> {
     check(unsafe { libc::umount2(t.as_ptr(), libc::MNT_DETACH) } as _, "umount").map(drop)
 }
 
+/// Linux's `CGROUP_SUPER_MAGIC` (`<linux/magic.h>`).
+const CGROUP_SUPER_MAGIC: i64 = 0x27_e0eb;
 /// Linux's `CGROUP2_SUPER_MAGIC` (`<linux/magic.h>`).
 const CGROUP2_SUPER_MAGIC: i64 = 0x6367_7270;
 
 /// OpenZFS's `ZFS_SUPER_MAGIC` (`zpl_super.c`).
 pub const ZFS_SUPER_MAGIC: i64 = 0x2fc1_2fc1;
 
-/// Whether `path` sits on a mounted `cgroup2` filesystem.
-pub fn is_cgroup2(path: &Path) -> bool {
-    let Ok(c) = cstr(path) else { return false };
+fn fs_magic(path: &Path) -> Option<i64> {
+    let c = cstr(path).ok()?;
     // SAFETY: `st` is plain zero-initialized data; `c` is a valid C string.
     let mut st: libc::statfs = unsafe { std::mem::zeroed() };
     // SAFETY: statfs writes into `st`.
-    unsafe { libc::statfs(c.as_ptr(), &mut st) == 0 && st.f_type as i64 == CGROUP2_SUPER_MAGIC }
+    (unsafe { libc::statfs(c.as_ptr(), &mut st) } == 0).then_some(st.f_type as i64)
+}
+
+/// Whether `path` sits on a mounted `cgroup2` filesystem.
+pub fn is_cgroup2(path: &Path) -> bool {
+    fs_magic(path) == Some(CGROUP2_SUPER_MAGIC)
+}
+
+/// Whether `path` sits on a mounted cgroup v1 or v2 filesystem.
+pub fn is_cgroup(path: &Path) -> bool {
+    matches!(fs_magic(path), Some(CGROUP_SUPER_MAGIC | CGROUP2_SUPER_MAGIC))
+}
+
+/// Linux `<linux/mount.h>` `mount_attr` for `mount_setattr(2)` (Linux 5.12+).
+#[repr(C)]
+#[derive(Default)]
+struct MountAttr {
+    attr_set: u64,
+    attr_clr: u64,
+    propagation: u64,
+    userns_fd: u64,
+}
+
+pub const MOUNT_ATTR_RDONLY: u64 = 0x0000_0001;
+pub const MOUNT_ATTR_NOSUID: u64 = 0x0000_0002;
+pub const MOUNT_ATTR_NODEV: u64 = 0x0000_0004;
+pub const MOUNT_ATTR_NOEXEC: u64 = 0x0000_0008;
+
+/// Recursively sets `attr_set` mount attributes on `target` and every mount
+/// beneath it via `mount_setattr(2)`.
+pub fn mount_setattr_recursive(target: &CStr, attr_set: u64) -> io::Result<()> {
+    let attr = MountAttr { attr_set, ..Default::default() };
+    // SAFETY: `target` is a valid NUL-terminated path and `attr` is a valid
+    // `mount_attr` struct of the passed size.
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_mount_setattr,
+            libc::AT_FDCWD,
+            target.as_ptr(),
+            libc::AT_RECURSIVE as libc::c_uint,
+            &attr as *const MountAttr,
+            std::mem::size_of::<MountAttr>(),
+        )
+    };
+    check(ret as _, &format!("mount_setattr {}", target.to_string_lossy())).map(drop)
 }
 
 /// Whether `statfs(2)` reports `ZFS_SUPER_MAGIC` on `path`.

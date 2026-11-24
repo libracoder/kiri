@@ -315,7 +315,7 @@ fn enter(spec: &CopySpec<'_>, running: &[(&str, libc::pid_t)], paths: &Paths, ch
                 let root = inroot::open_root(Path::new("."))?;
                 let image = if mounts.iter().any(container::Mount::is_copy_up) { container::image_tree() } else { None };
                 for m in &mounts {
-                    container::apply_mount(root.as_fd(), image.as_ref().map(|f| f.as_fd()), m)?;
+                    container::apply_mount(root.as_fd(), image.as_ref().map(|f| f.as_fd()), m, false)?;
                 }
                 drop(image);
                 drop(root);

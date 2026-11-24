@@ -3463,6 +3463,7 @@ fn inspect(c: &Container, nets: &[super::network::Network], anon_vols: &[String]
     for key in ["MaskedPaths", "ReadonlyPaths"] {
         v["HostConfig"][key] = super::hostopts::system_paths(&c.spec.host_opts, key, c.spec.privileged);
     }
+    v["HostConfig"]["CgroupnsMode"] = super::hostopts::inspect(&c.spec.host_opts, "CgroupnsMode");
     // Set apart: more keys in the macro above pass its recursion limit.
     v["HostConfig"]["MemorySwap"] = json!(c.spec.limits.memory_swap());
     let mounts = inspect_mounts(&c.spec, |name| anon_vols.iter().any(|a| a == name));
@@ -7057,6 +7058,52 @@ mod network_option_tests {
         let (status, message) = create(json!({}), "demo:nosuch");
         assert_eq!(status, 404);
         assert!(message.starts_with("No such image: demo:nosuch"));
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cgroupns_mode_is_kept_in_inspect_and_bad_modes_are_refused() {
+        let dir = std::env::temp_dir().join(format!("kiri-cgroupns-api-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = super::super::engine::boot_without_vm(&dir);
+        let cfg = json!({"created": "2026-11-23T00:00:00Z", "architecture": "arm64", "os": "linux", "config": {"Cmd": ["true"]}});
+        let mut w = engine.store.ingest().unwrap();
+        io::Write::write_all(&mut w, &serde_json::to_vec(&cfg).unwrap()).unwrap();
+        let (digest, _) = w.finish().unwrap();
+        engine.store.put_image(kiri_image::archive::from_config("demo:local".into(), &digest, &cfg, Vec::new())).unwrap();
+
+        let make = |host: Value| {
+            let body = json!({"Image": "demo:local", "HostConfig": host});
+            super::create(&Request::internal("POST", "/containers/create", &[], serde_json::to_vec(&body).unwrap()), &engine)
+        };
+        let default_id = make(json!({})).unwrap()["Id"].as_str().unwrap().to_owned();
+        assert_eq!(super::container_inspect(&engine, &default_id).unwrap()["HostConfig"]["CgroupnsMode"], "private");
+        let null_id = make(json!({"CgroupnsMode": Value::Null})).unwrap()["Id"].as_str().unwrap().to_owned();
+        assert_eq!(super::container_inspect(&engine, &null_id).unwrap()["HostConfig"]["CgroupnsMode"], "private");
+        let empty_id = make(json!({"CgroupnsMode": ""})).unwrap()["Id"].as_str().unwrap().to_owned();
+        assert_eq!(super::container_inspect(&engine, &empty_id).unwrap()["HostConfig"]["CgroupnsMode"], "private");
+        let priv_id = make(json!({"CgroupnsMode": "private"})).unwrap()["Id"].as_str().unwrap().to_owned();
+        assert_eq!(super::container_inspect(&engine, &priv_id).unwrap()["HostConfig"]["CgroupnsMode"], "private");
+        let host_id = make(json!({"CgroupnsMode": "host"})).unwrap()["Id"].as_str().unwrap().to_owned();
+        let host_inspected = super::container_inspect(&engine, &host_id).unwrap();
+        assert_eq!(host_inspected["HostConfig"]["CgroupnsMode"], "host");
+        // Recreating from inspect keeps CgroupnsMode persisted.
+        let mut recreate = host_inspected["Config"].clone();
+        recreate["HostConfig"] = host_inspected["HostConfig"].clone();
+        let host_id2 = super::create(&Request::internal("POST", "/containers/create", &[], serde_json::to_vec(&recreate).unwrap()), &engine).unwrap()["Id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(super::container_inspect(&engine, &host_id2).unwrap()["HostConfig"]["CgroupnsMode"], "host");
+        for bad in [json!("bogus"), json!("container:abc"), json!(123)] {
+            let want = match &bad {
+                Value::String(s) => format!("invalid cgroup namespace mode: {s}"),
+                other => format!("invalid cgroup namespace mode: {other}"),
+            };
+            assert_eq!(super::status_of(make(json!({"CgroupnsMode": bad})).unwrap_err()), (400, want));
+        }
         drop(engine);
         let _ = std::fs::remove_dir_all(&dir);
     }

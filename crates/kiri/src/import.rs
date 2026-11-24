@@ -1643,6 +1643,7 @@ fn create_body_for(info: &Value, mode: &str, networks: Value, windows: bool) -> 
         "NanoCpus": hc["NanoCpus"], "ShmSize": hc["ShmSize"], "PublishAllPorts": hc["PublishAllPorts"],
         "Devices": hc["Devices"], "DeviceCgroupRules": hc["DeviceCgroupRules"], "GroupAdd": hc["GroupAdd"], "Ulimits": hc["Ulimits"],
         "Sysctls": hc["Sysctls"], "Dns": hc["Dns"], "DnsSearch": hc["DnsSearch"], "DnsOptions": hc["DnsOptions"], "PidMode": hc["PidMode"],
+        "CgroupnsMode": hc["CgroupnsMode"],
         "Init": hc["Init"], "LogConfig": hc["LogConfig"], "AutoRemove": hc["AutoRemove"], "CpuShares": hc["CpuShares"],
         "CpuQuota": hc["CpuQuota"], "CpuPeriod": hc["CpuPeriod"], "PidsLimit": hc["PidsLimit"],
     });
@@ -2258,7 +2259,7 @@ mod tests {
                            "Healthcheck": {"Test": ["CMD", "true"], "Interval": 1_000_000_000_u64}, "Domainname": "lan", "StopTimeout": 5},
                 "HostConfig": {"NetworkMode": mode, "PortBindings": {"80/tcp": [{"HostPort": "8080"}]}, "Dns": ["1.1.1.1"], "ExtraHosts": ["h:1.2.3.4"],
                                "Devices": [{"PathOnHost": "/dev/net/tun", "PathInContainer": "/dev/net/tun", "CgroupPermissions": "rwm"}],
-                               "GroupAdd": ["audio"], "PidMode": "", "CapAdd": ["NET_ADMIN"], "Binds": null, "Mounts": null, "Ulimits": [{"Name": "nofile", "Soft": 1024, "Hard": 2048}]},
+                               "GroupAdd": ["audio"], "PidMode": "", "CgroupnsMode": "host", "CapAdd": ["NET_ADMIN"], "Binds": null, "Mounts": null, "Ulimits": [{"Name": "nofile", "Soft": 1024, "Hard": 2048}]},
                 "Mounts": []
             })
         };
@@ -2272,6 +2273,7 @@ mod tests {
         assert_eq!(joined["HostConfig"]["NetworkMode"], "container:vpn");
         assert_eq!(joined["HostConfig"]["Devices"][0]["PathOnHost"], "/dev/net/tun");
         assert_eq!(joined["HostConfig"]["GroupAdd"], json!(["audio"]));
+        assert_eq!(joined["HostConfig"]["CgroupnsMode"], "host");
         assert_eq!(joined["HostConfig"]["CapAdd"], json!(["NET_ADMIN"]));
         assert_eq!(joined["Healthcheck"]["Test"], json!(["CMD", "true"]));
         assert_eq!(joined["Domainname"], "lan");

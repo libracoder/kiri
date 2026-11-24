@@ -464,6 +464,23 @@ t pid-container-stopped "cannot join PID of a non running container" bash -c "$D
 # missing image and pulls for: the output is shown only when no pull was.
 t pid-container-unknown "No such container: pid-nosuch" bash -c "o=\$($D run --rm --pid container:pid-nosuch busybox:1.37 true 2>&1); grep -q 'Unable to find image' <<<\"\$o\" || echo \"\$o\""
 $D rm -f pid-a pid-b pid-h >/dev/null 2>&1
+# `--cgroupns`: `private` (the default) unshares a cgroup namespace rooted at
+# the container's cgroup (`0::/`); `host` shares the VM's (or Linux host's)
+# cgroup namespace (`0::/.../<id>`), keeps `/sys/fs/cgroup` and any cgroup
+# submounts (including parent binds like `-v /sys:/hostsys`) read-only for an
+# unprivileged container, and lets a privileged init such as systemd manage
+# sub-cgroups with `-v /sys/fs/cgroup:/sys/fs/cgroup` (#413).
+$D rm -f cgns-d cgns-p cgns-h cgns-sd >/dev/null 2>&1
+$D create --name cgns-d alpine true >/dev/null
+$D create --name cgns-p --cgroupns private alpine true >/dev/null
+$D create --name cgns-h --cgroupns host alpine true >/dev/null
+t cgroupns-mode-inspect "private private host" $D inspect -f '{{.HostConfig.CgroupnsMode}}' cgns-d cgns-p cgns-h
+$D rm -f cgns-d cgns-p cgns-h >/dev/null 2>&1
+t cgroupns-mode-invalid "invalid cgroup namespace mode: bogus" curl -s --unix-socket "$SOCK" -H 'Content-Type: application/json' -d '{"Image":"alpine","Cmd":["true"],"HostConfig":{"CgroupnsMode":"bogus"}}' http://d/v1.47/containers/create
+t cgroupns-private-default "0::/" $D run --rm alpine cat /proc/1/cgroup
+t cgroupns-host-view "host-ok" bash -c "a=\$($D run --rm --cgroupns host alpine sh -c 'printf \"%s %s\" \"\$(readlink /proc/1/ns/cgroup)\" \"\$(cat /proc/1/cgroup)\"'); b=\$($D run --rm --cgroupns host alpine readlink /proc/1/ns/cgroup); p=\$($D run --rm --cgroupns private alpine readlink /proc/1/ns/cgroup); ns=\${a%% *}; cg=\${a#* }; [ -n \"\$ns\" ] && [ \"\$ns\" = \"\$b\" ] && [ \"\$ns\" != \"\$p\" ] && [ \"\$cg\" != '0::/' ] && case \"\$cg\" in 0::/*) echo host-ok ;; *) echo \"bad:\$a\" ;; esac || echo \"ns=\$a b=\$b p=\$p\""
+t cgroupns-host-unpriv-ro "ro1 ro2 ro3 ro4 67108864" $D run --rm --memory 64m --cgroupns host -v /sys/fs/cgroup:/sys/fs/cgroup -v /sys/fs/cgroup:/mnt -v /sys:/hostsys -v /sys/fs/./cgroup:/mnt2 alpine sh -c 'cg=$(sed -n "s/^0:://p" /proc/1/cgroup); probe() { [ -d "$1/unified" ] && d="$1/unified" || d="$1"; (echo max > "$d${cg%/}/memory.max") 2>/dev/null || (mkdir "$d/roprobe" 2>/dev/null && rmdir "$d/roprobe" 2>/dev/null); }; probe /sys/fs/cgroup && r1=rw || r1=ro1; probe /mnt && r2=rw || r2=ro2; probe /hostsys/fs/cgroup && r3=rw || r3=ro3; probe /mnt2 && r4=rw || r4=ro4; echo "$r1 $r2 $r3 $r4 $(cat /sys/fs/cgroup${cg%/}/memory.max)"'
+t cgroupns-host-systemd-bind "host=init.scope:exec-ok ro=ro subro=ro priv=0::/init.scope" bash -c "id=\$($D run -d --name cgns-sd --privileged --cgroupns host -v /sys/fs/cgroup:/sys/fs/cgroup --tmpfs /run --tmpfs /run/lock --security-opt label=disable --stop-signal SIGRTMIN+3 alpine sh -c 'cg=/sys/fs/cgroup\$(sed -n \"s/^0:://p\" /proc/1/cgroup); mkdir -p \"\$cg/init.scope\" && echo 1 > \"\$cg/init.scope/cgroup.procs\" && echo +pids > \"\$cg/cgroup.subtree_control\" && sleep 60'); for _ in \$(seq 30); do $D exec cgns-sd cat /proc/1/cgroup 2>/dev/null | grep -q '/init.scope\$' && break; sleep 0.1; done; c1=\$($D exec cgns-sd cat /proc/1/cgroup 2>/dev/null); ce=\$($D exec cgns-sd cat /proc/self/cgroup 2>/dev/null); $D rm -f cgns-sd >/dev/null 2>&1; [ \"\${c1##*/}\" = init.scope ] && [ \"\$c1\" = \"\$ce\" ] && h=init.scope:exec-ok || h=\"c1=\$c1:ce=\$ce\"; ro=\$($D run --rm --privileged --cgroupns host -v /sys/fs/cgroup:/sys/fs/cgroup:ro alpine sh -c 'cg=/sys/fs/cgroup\$(sed -n \"s/^0:://p\" /proc/1/cgroup); mkdir \"\$cg/roprobe\" 2>/dev/null && echo rw || echo ro'); subro=\$($D run --rm --privileged --cgroupns host -v /sys:/hostsys:ro alpine sh -c 'cg=/hostsys/fs/cgroup\$(sed -n \"s/^0:://p\" /proc/1/cgroup); [ -d /hostsys/fs/cgroup/unified ] && cg=/hostsys/fs/cgroup/unified\$(sed -n \"s/^0:://p\" /proc/1/cgroup); mkdir \"\$cg/roprobe\" 2>/dev/null && echo rw || echo ro'); pv=\$($D run --rm --privileged -v /sys/fs/cgroup:/sys/fs/cgroup alpine sh -c 'mkdir -p /sys/fs/cgroup/init.scope && echo 1 > /sys/fs/cgroup/init.scope/cgroup.procs && cat /proc/1/cgroup'); echo \"host=\$h ro=\$ro subro=\$subro priv=\$pv\""
 t python "3.13" $D run --rm python:3.13-alpine python -c 'import sys;print(sys.version)'
 t node "v22" $D run --rm node:22-alpine node -v
 t debian-image "Valkey server" $D run --rm valkey/valkey valkey-server --version

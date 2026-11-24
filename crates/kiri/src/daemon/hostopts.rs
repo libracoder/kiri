@@ -1,13 +1,13 @@
 //! HostConfig settings the guest applies when a container starts:
 //! `--ulimit`, `--sysctl`, `--device`, `--device-cgroup-rule`,
-//! `--group-add`, `MaskedPaths` and `ReadonlyPaths`. They are kept as the API gave them (for inspect), checked
+//! `--group-add`, `--cgroupns`, `MaskedPaths` and `ReadonlyPaths`. They are kept as the API gave them (for inspect), checked
 //! at create with Docker's errors, and handed to the guest at every start as
 //! the `opts` lines of `Run` and `Exec` (see [`kiri_proto::RunSpec::opts`]).
 
 use serde_json::{Value, json};
 
 /// The HostConfig keys kept with a container.
-const KEYS: [&str; 7] = ["Ulimits", "Sysctls", "Devices", "DeviceCgroupRules", "GroupAdd", "MaskedPaths", "ReadonlyPaths"];
+const KEYS: [&str; 8] = ["Ulimits", "Sysctls", "Devices", "DeviceCgroupRules", "GroupAdd", "MaskedPaths", "ReadonlyPaths", "CgroupnsMode"];
 
 /// Docker's default `MaskedPaths` and `ReadonlyPaths`, as inspect shows them.
 const MASKED: [&str; 12] = [
@@ -85,6 +85,8 @@ pub fn from_host(host: &Value) -> Value {
 pub fn inspect(opts: &Value, key: &str) -> Value {
     match (&opts[key], key) {
         (Value::Null, "Ulimits" | "Devices") => json!([]),
+        (Value::Null, "CgroupnsMode") => json!("private"),
+        (Value::String(s), "CgroupnsMode") if s.is_empty() => json!("private"),
         (Value::Null, _) => Value::Null,
         (v, _) => v.clone(),
     }
@@ -194,6 +196,13 @@ pub fn guest_lines(opts: &Value, net_host: bool) -> Result<Vec<String>, String> 
         };
         let paths = paths.ok_or_else(|| format!("invalid {key}: each entry must be an absolute path"))?;
         out.push(std::iter::once(kind).chain(paths).collect::<Vec<_>>().join("\t"));
+    }
+    match &opts["CgroupnsMode"] {
+        Value::Null => {}
+        Value::String(m) if m.is_empty() || m == "private" => {}
+        Value::String(m) if m == "host" => out.push("cgroupns\thost".to_owned()),
+        Value::String(m) => return Err(format!("invalid cgroup namespace mode: {m}")),
+        other => return Err(format!("invalid cgroup namespace mode: {other}")),
     }
     Ok(out)
 }
@@ -398,5 +407,26 @@ mod tests {
         assert_eq!(system_paths(&json!({}), "ReadonlyPaths", false), json!(READONLY));
         assert_eq!(system_paths(&json!({}), "MaskedPaths", true), json!([]));
         assert_eq!(system_paths(&kept, "MaskedPaths", true), json!([]));
+    }
+
+    #[test]
+    fn cgroupns_mode() {
+        assert_eq!(inspect(&json!({}), "CgroupnsMode"), json!("private"));
+        assert_eq!(inspect(&from_host(&json!({"CgroupnsMode": Value::Null})), "CgroupnsMode"), json!("private"));
+        assert_eq!(inspect(&from_host(&json!({"CgroupnsMode": ""})), "CgroupnsMode"), json!("private"));
+        assert_eq!(inspect(&from_host(&json!({"CgroupnsMode": "private"})), "CgroupnsMode"), json!("private"));
+        assert_eq!(inspect(&from_host(&json!({"CgroupnsMode": "host"})), "CgroupnsMode"), json!("host"));
+        assert_eq!(guest_lines(&from_host(&json!({"CgroupnsMode": Value::Null})), false).unwrap(), ["rlimit\t7\t1048576\t1048576"]);
+        assert_eq!(guest_lines(&from_host(&json!({"CgroupnsMode": ""})), false).unwrap(), ["rlimit\t7\t1048576\t1048576"]);
+        assert_eq!(guest_lines(&from_host(&json!({"CgroupnsMode": "private"})), false).unwrap(), ["rlimit\t7\t1048576\t1048576"]);
+        assert_eq!(guest_lines(&from_host(&json!({"CgroupnsMode": "host"})), false).unwrap()[1..], ["cgroupns\thost"]);
+        for bad in ["bogus", "container:abc", "none"] {
+            assert_eq!(
+                guest_lines(&from_host(&json!({"CgroupnsMode": bad})), false).unwrap_err(),
+                format!("invalid cgroup namespace mode: {bad}")
+            );
+        }
+        assert!(guest_lines(&from_host(&json!({"CgroupnsMode": 123})), false).is_err());
+        assert!(guest_lines(&from_host(&json!({"CgroupnsMode": true})), false).is_err());
     }
 }
