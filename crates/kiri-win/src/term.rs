@@ -46,16 +46,26 @@ impl Console {
     }
 }
 
+static NEXT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+enum State {
+    Opening { size: (u16, u16), pending: Vec<Vec<u8>> },
+    Running { console: Arc<Console>, process: Arc<OwnedHandle>, input: Sender<Vec<u8>> },
+}
+
 struct Session {
-    console: Arc<Console>,
-    process: Arc<OwnedHandle>,
-    input: Sender<Vec<u8>>,
+    seq: u64,
+    state: State,
 }
 
 static SESSIONS: Mutex<Option<HashMap<String, Session>>> = Mutex::new(None);
 
 fn with<R>(f: impl FnOnce(&mut HashMap<String, Session>) -> R) -> R {
     f(SESSIONS.lock().unwrap_or_else(PoisonError::into_inner).get_or_insert_with(HashMap::new))
+}
+
+fn live(id: &str, seq: u64) -> bool {
+    with(|s| s.get(id).is_some_and(|s| s.seq == seq))
 }
 
 /// One `term` command from the page (copy, paste and links are engine.rs's).
@@ -68,30 +78,34 @@ pub fn handle(action: &str, id: &str, value: &Value, emit: fn(String)) {
                 emit(termwire::shells(&list, &default));
             });
         }
-        "open" if termwire::valid_id(id) => {
-            let (cols, rows) = termwire::size(value);
-            let asked = value["shell"].as_str().unwrap_or("").to_owned();
-            let id = id.to_owned();
-            // Listing WSL's distros runs wsl.exe: not on the window's thread.
-            std::thread::spawn(move || {
-                let list = shells();
-                // Only a shell from the list: the page never names a program.
-                let Some(shell) = list.iter().find(|s| s.id == asked).or(list.first()) else {
-                    return emit(termwire::exit(&id, None, Some("No shell found")));
-                };
-                if let Err(e) = open(&id, &command_line(&shell.id), cols, rows, emit) {
-                    emit(termwire::exit(&id, None, Some(&e.to_string())));
-                }
-            });
-        }
+        "open" if termwire::valid_id(id) => start_open(id, value, emit, shells),
         "input" => {
             if let Some(bytes) = value.as_str().and_then(termwire::unb64) {
-                with(|s| s.get(id).map(|s| s.input.send(bytes)));
+                with(|s| {
+                    if let Some(slot) = s.get_mut(id) {
+                        match &mut slot.state {
+                            State::Opening { pending, .. } => pending.push(bytes),
+                            State::Running { input, .. } => {
+                                let _ = input.send(bytes);
+                            }
+                        }
+                    }
+                });
             }
         }
         "resize" => {
             let (cols, rows) = termwire::size(value);
-            with(|s| s.get(id).map(|s| s.console.resize(cols, rows)));
+            let console = with(|s| match s.get_mut(id).map(|slot| &mut slot.state) {
+                Some(State::Opening { size, .. }) => {
+                    *size = (cols, rows);
+                    None
+                }
+                Some(State::Running { console, .. }) => Some(console.clone()),
+                None => None,
+            });
+            if let Some(c) = console {
+                c.resize(cols, rows);
+            }
         }
         "close" => {
             if let Some(s) = with(|s| s.remove(id)) {
@@ -109,11 +123,45 @@ pub fn handle(action: &str, id: &str, value: &Value, emit: fn(String)) {
 
 /// Closes a session's console, which ends what runs in it, and its shell.
 fn end(s: Session) {
+    let State::Running { console, process, .. } = s.state else { return };
+    end_running(console, process);
+}
+
+fn start_open(id: &str, value: &Value, emit: fn(String), list_shells: impl FnOnce() -> Vec<Shell> + Send + 'static) {
+    let (cols, rows) = termwire::size(value);
+    let asked = value["shell"].as_str().unwrap_or("").to_owned();
+    let seq = NEXT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if let Some(old) = with(|s| s.insert(id.to_owned(), Session { seq, state: State::Opening { size: (cols, rows), pending: Vec::new() } })) {
+        end(old);
+    }
+    let id = id.to_owned();
+    // Listing WSL's distros runs wsl.exe: not on the window's thread.
+    std::thread::spawn(move || {
+        let list = list_shells();
+        if !live(&id, seq) {
+            return;
+        }
+        // Only a shell from the list: the page never names a program.
+        let Some(shell) = list.iter().find(|s| s.id == asked).or(list.first()) else {
+            if with(|s| s.get(&id).is_some_and(|s| s.seq == seq) && s.remove(&id).is_some()) {
+                emit(termwire::exit(&id, None, Some("No shell found")));
+            }
+            return;
+        };
+        if let Err(e) = open(&id, seq, &command_line(&shell.id), emit)
+            && with(|s| s.get(&id).is_some_and(|s| s.seq == seq) && s.remove(&id).is_some())
+        {
+            emit(termwire::exit(&id, None, Some(&e.to_string())));
+        }
+    });
+}
+
+fn end_running(console: Arc<Console>, process: Arc<OwnedHandle>) {
     // ClosePseudoConsole can wait for its output to be read: off the window's thread.
     std::thread::spawn(move || {
-        s.console.close();
-        // SAFETY: the process handle is open while s holds it.
-        unsafe { TerminateProcess(s.process.as_raw_handle() as HANDLE, 1) };
+        console.close();
+        // SAFETY: the process handle is open while process holds it.
+        unsafe { TerminateProcess(process.as_raw_handle() as HANDLE, 1) };
     });
 }
 
@@ -264,10 +312,13 @@ fn pipe() -> std::io::Result<(OwnedHandle, OwnedHandle)> {
     }
 }
 
-fn open(id: &str, command: &str, cols: u16, rows: u16, emit: fn(String)) -> std::io::Result<()> {
-    if let Some(old) = with(|s| s.remove(id)) {
-        end(old);
-    }
+fn open(id: &str, seq: u64, command: &str, emit: fn(String)) -> std::io::Result<()> {
+    let Some((cols, rows)) = with(|s| match s.get(id) {
+        Some(Session { seq: cur, state: State::Opening { size, .. } }) if *cur == seq => Some(*size),
+        _ => None,
+    }) else {
+        return Ok(());
+    };
     // The console reads what's typed from one pipe and writes the screen to the other.
     let (con_in, typed_w) = pipe()?;
     let (screen_r, con_out) = pipe()?;
@@ -289,7 +340,25 @@ fn open(id: &str, command: &str, cols: u16, rows: u16, emit: fn(String)) -> std:
     };
 
     let (input, typed) = channel::<Vec<u8>>();
-    with(|s| s.insert(id.to_owned(), Session { console: console.clone(), process: process.clone(), input }));
+    let attached = with(|s| {
+        let slot = s.get_mut(id).filter(|slot| slot.seq == seq)?;
+        let (latest_size, pending) = match &mut slot.state {
+            State::Opening { size, pending } => (*size, std::mem::take(pending)),
+            _ => ((cols, rows), Vec::new()),
+        };
+        for bytes in pending {
+            let _ = input.send(bytes);
+        }
+        slot.state = State::Running { console: console.clone(), process: process.clone(), input };
+        Some(latest_size)
+    });
+    let Some(latest_size) = attached else {
+        end_running(console, process);
+        return Ok(());
+    };
+    if latest_size != (cols, rows) {
+        console.resize(latest_size.0, latest_size.1);
+    }
 
     let mut writer = File::from(typed_w);
     std::thread::spawn(move || {
@@ -324,12 +393,13 @@ fn open(id: &str, command: &str, cols: u16, rows: u16, emit: fn(String)) -> std:
         loop {
             match screen.read(&mut buf) {
                 Ok(0) | Err(_) => break,
-                Ok(n) => emit(termwire::data(&id, &buf[..n])),
+                Ok(n) if live(&id, seq) => emit(termwire::data(&id, &buf[..n])),
+                Ok(_) => break,
             }
         }
         let _ = waiter.join();
         let mine = with(|s| {
-            let mine = s.get(&id).is_some_and(|s| Arc::ptr_eq(&s.process, &process));
+            let mine = s.get(&id).is_some_and(|s| s.seq == seq);
             if mine {
                 s.remove(&id);
             }
@@ -537,5 +607,59 @@ mod tests {
         assert!(list.iter().any(|s| s.id == "cmd"));
         assert!(!list.iter().any(|s| s.id.to_ascii_lowercase().starts_with("wsl:kiri")));
         assert!(command_line("wsl:Ubuntu").ends_with("-d Ubuntu --cd ~"));
+    }
+
+    #[test]
+    fn closing_or_replacing_a_shell_while_it_opens_drops_the_stale_open() {
+        let (tx, rx) = channel();
+        EVENTS.lock().unwrap().push(tx);
+        let cmd_shell = || vec![Shell { id: "cmd".into(), label: "Command Prompt".into(), group: "" }];
+
+        // 1. Open -> close while shells() is still running -> release stale open -> no shell spawned.
+        let (entered1, entered1_rx) = channel();
+        let (release1, release1_rx) = channel();
+        let (done1, done1_rx) = channel();
+        start_open("w2", &serde_json::json!({"shell": "cmd", "cols": 80, "rows": 20}), record, move || {
+            entered1.send(()).unwrap();
+            release1_rx.recv().unwrap();
+            let list = cmd_shell();
+            let _ = done1.send(());
+            list
+        });
+        entered1_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        handle("close", "w2", &serde_json::json!({}), record);
+        release1.send(()).unwrap();
+        done1_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        // 2. Stale open#1 finishing after newer open#2 must not replace open#2; early input while opening arrives.
+        let (entered_a, entered_a_rx) = channel();
+        let (release_a, release_a_rx) = channel();
+        start_open("w3", &serde_json::json!({"shell": "cmd", "cols": 80, "rows": 20}), record, move || {
+            entered_a.send(()).unwrap();
+            release_a_rx.recv().unwrap();
+            cmd_shell()
+        });
+        entered_a_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        let (entered_b, entered_b_rx) = channel();
+        let (release_b, release_b_rx) = channel();
+        start_open("w3", &serde_json::json!({"shell": "cmd", "cols": 100, "rows": 25}), record, move || {
+            entered_b.send(()).unwrap();
+            release_b_rx.recv().unwrap();
+            cmd_shell()
+        });
+        entered_b_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        handle("input", "w3", &Value::String(termwire::b64(b"echo EARLY_OK\r")), record);
+        release_b.send(()).unwrap();
+        output_until(&rx, "w3", "EARLY_OK");
+
+        // Now release stale open#1 and verify open#2 still answers on w3.
+        release_a.send(()).unwrap();
+        handle("input", "w3", &Value::String(termwire::b64(b"set /a 19+23 & echo KEPT_W3\r")), record);
+        let (out, _) = output_until(&rx, "w3", "KEPT_W3");
+        assert!(out.contains("42"), "{out}");
+        handle("close", "w3", &serde_json::json!({}), record);
+
+        assert!(!with(|s| s.contains_key("w2")), "closed pending w2 must not remain in SESSIONS");
     }
 }
