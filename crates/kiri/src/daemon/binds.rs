@@ -8,6 +8,125 @@ use std::sync::OnceLock;
 
 use super::engine::Error;
 
+/// Shared `/mnt/wsl/kiri` directory across all WSL 2 distros.
+pub const WSL_KIRI_DIR: &str = "/mnt/wsl/kiri";
+
+/// Active WSL integration base directory (`KIRI_WSL_DIR` override or `/mnt/wsl/kiri`).
+pub fn wsl_kiri_dir() -> String {
+    std::env::var("KIRI_WSL_DIR")
+        .ok()
+        .map(|s| s.trim_end_matches('/').to_owned())
+        .filter(|s| s.starts_with('/'))
+        .unwrap_or_else(|| WSL_KIRI_DIR.to_owned())
+}
+
+fn wsl_roots_dir() -> String {
+    format!("{}/roots", wsl_kiri_dir())
+}
+
+fn wsl_sockets_dir() -> String {
+    format!("{}/sockets", wsl_kiri_dir())
+}
+
+/// Whether `name` is a safe single-component WSL distro name.
+pub fn valid_distro_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains(['/', '\\', '\0'])
+        && !name.bytes().any(|b| b.is_ascii_control())
+}
+
+/// Normalizes a path into `/a/b/c`, clamping `..` at `/` so traversal can never
+/// climb above the root.
+fn lexical_clean(p: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    for c in p.split('/') {
+        match c {
+            "" | "." => {}
+            ".." => {
+                out.pop();
+            }
+            c => out.push(c),
+        }
+    }
+    format!("/{}", out.join("/"))
+}
+
+/// Joins `inner` under `root` (`/mnt/wsl/kiri/roots/<distro>`), clamping any
+/// `..` traversal so the result cannot escape `root`.
+pub fn confine_to_root(root: &str, inner: &str) -> String {
+    let root = root.trim_end_matches('/');
+    let rel = lexical_clean(inner);
+    if rel == "/" {
+        root.to_owned()
+    } else {
+        format!("{root}{rel}")
+    }
+}
+
+/// When `distro_root` exists on disk, verifies that no existing symlink along
+/// `target` escapes `distro_root`.
+fn verify_on_disk_confinement(src: &str, distro: &str, distro_root: &Path, target: &Path) -> Result<(), Error> {
+    if !distro_root.exists() {
+        return Ok(());
+    }
+    let Ok(canon_root) = std::fs::canonicalize(distro_root) else {
+        return Ok(());
+    };
+    let Ok(rel) = target.strip_prefix(distro_root) else {
+        return Err(Error::BadRequest(format!("invalid mount source {src}: escapes WSL distro {distro}")));
+    };
+    let mut cur = distro_root.to_path_buf();
+    for comp in rel.components() {
+        cur.push(comp);
+        if let Ok(link) = std::fs::read_link(&cur) {
+            let link_str = link.to_string_lossy();
+            if !cur.exists() && (link.is_absolute() || link_str.split('/').any(|c| c == "..")) {
+                return Err(Error::BadRequest(format!("invalid mount source {src}: escapes WSL distro {distro}")));
+            }
+        }
+        if cur.exists() {
+            let canon = std::fs::canonicalize(&cur).map_err(Error::Io)?;
+            if !canon.starts_with(&canon_root) {
+                return Err(Error::BadRequest(format!("invalid mount source {src}: escapes WSL distro {distro}")));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Finds `<wsl_kiri_dir>/roots/<distro>` on disk if `<distro>` is integrated and mounted.
+fn mounted_distro_root(distro: &str) -> Option<String> {
+    if !valid_distro_name(distro) {
+        return None;
+    }
+    let roots_dir = wsl_roots_dir();
+    let exact = format!("{roots_dir}/{distro}");
+    if Path::new(&exact).is_dir() {
+        return Some(exact);
+    }
+    let entries = std::fs::read_dir(&roots_dir).ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.eq_ignore_ascii_case(distro) && entry.path().is_dir() {
+            return Some(entry.path().to_string_lossy().into_owned());
+        }
+    }
+    None
+}
+
+fn is_wsl_engine_socket(p: &str) -> bool {
+    let sockets_dir = wsl_sockets_dir();
+    let matches_prefix = |prefix: &str| {
+        p.strip_prefix(prefix)
+            .and_then(|rest| rest.strip_suffix("/docker.sock"))
+            .is_some_and(valid_distro_name)
+    };
+    matches_prefix(&format!("{sockets_dir}/")) || matches_prefix(&format!("{WSL_KIRI_DIR}/sockets/"))
+}
+
 /// Where WSL mounts the Windows drives, and which distro the daemon runs in.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Wsl {
@@ -83,14 +202,20 @@ fn distro_of(unc: &str) -> Option<String> {
 /// One `-v` spec (HostConfig.Binds) as source, target and options. In WSL a
 /// drive letter's colon belongs to the source (`C:\src:/app:ro`), and the
 /// source is made a path in this Linux.
+#[cfg(test)]
 pub fn split(spec: &str, wsl: Option<&Wsl>) -> Result<(String, String, String), Error> {
+    split_for(spec, wsl, None)
+}
+
+/// [`split`], translating Linux paths from an integrated WSL distro
+/// (`wsl_distro = Some("<NAME>")`) into `/mnt/wsl/kiri/roots/<NAME>/…`.
+pub fn split_for(spec: &str, wsl: Option<&Wsl>, wsl_distro: Option<&str>) -> Result<(String, String, String), Error> {
     let bad = || Error::BadRequest(format!("invalid volume specification: {spec}"));
     // `c:/app` is the volume `c` at /app, as in moby's Windows parser: a
     // drive is the source only when an absolute target follows it.
-    let skip = match wsl {
-        Some(_) if spec[drive_prefix(spec)..].split(':').nth(1).is_some_and(|d| d.starts_with('/')) => drive_prefix(spec),
-        _ => 0,
-    };
+    let has_drive = (wsl.is_some() || wsl_distro.is_some())
+        && spec[drive_prefix(spec)..].split(':').nth(1).is_some_and(|d| d.starts_with('/'));
+    let skip = if has_drive { drive_prefix(spec) } else { 0 };
     let Some(i) = spec[skip..].find(':').map(|i| skip + i) else { return Err(bad()) };
     let (src, rest) = (&spec[..i], &spec[i + 1..]);
     let (dst, opts) = match rest.split(':').collect::<Vec<_>>().as_slice() {
@@ -98,12 +223,77 @@ pub fn split(spec: &str, wsl: Option<&Wsl>) -> Result<(String, String, String), 
         [d, o] => (*d, *o),
         _ => return Err(bad()),
     };
-    let src = match wsl {
+    let src = match (wsl, wsl_distro) {
+        (_, Some(d)) if src.starts_with('/') || looks_windows(src) => distro_source(src, d, wsl)?,
         // A volume name stays a name; only paths are translated.
-        Some(w) if looks_windows(src) => source(src, w)?,
+        (Some(w), None) if looks_windows(src) => source(src, w)?,
         _ => src.to_owned(),
     };
     Ok((src, dst.to_owned(), opts.to_owned()))
+}
+
+/// Translates a bind mount source from an integrated WSL distro `<distro>`:
+/// - `/var/run/docker.sock` (and engine socket aliases) stays the engine socket
+/// - `/mnt/c/proj` (under the Windows automount root) stays `/mnt/c/proj`
+/// - `/home/alice/app` becomes `/mnt/wsl/kiri/roots/<distro>/home/alice/app`
+/// - `..` traversal is confined so it can never escape `<distro>`'s root
+pub fn distro_source(src: &str, distro: &str, wsl: Option<&Wsl>) -> Result<String, Error> {
+    if !valid_distro_name(distro) {
+        return Err(Error::BadRequest(format!("invalid WSL distro: {distro}")));
+    }
+    let kiri_dir = wsl_kiri_dir();
+    let roots_dir = format!("{kiri_dir}/roots");
+    if looks_windows(src) {
+        let default_wsl = Wsl { root: "/mnt/".into(), distro: None };
+        let w = wsl.unwrap_or(&default_wsl);
+        return source_with_roots(src, w, |d| {
+            if d.eq_ignore_ascii_case(distro) {
+                Some(format!("{roots_dir}/{distro}"))
+            } else {
+                mounted_distro_root(d)
+            }
+        });
+    }
+    if !src.starts_with('/') {
+        return Ok(src.to_owned());
+    }
+    let distro_root = format!("{roots_dir}/{distro}");
+    let cleaned = clean(src);
+    if ENGINE_SOCKS.contains(&cleaned.as_str()) || is_wsl_engine_socket(&cleaned) {
+        return Ok(cleaned);
+    }
+    if cleaned == distro_root || cleaned.strip_prefix(&distro_root).is_some_and(|r| r.starts_with('/')) {
+        let rest = cleaned.strip_prefix(&distro_root).unwrap_or("");
+        let target = confine_to_root(&distro_root, rest);
+        verify_on_disk_confinement(src, distro, Path::new(&distro_root), Path::new(&target))?;
+        return Ok(target);
+    }
+    let lex = lexical_clean(src);
+    if ENGINE_SOCKS.contains(&lex.as_str()) || is_wsl_engine_socket(&lex) {
+        return Ok(lex);
+    }
+    let is_internal_wsl = |p: &str| {
+        p == kiri_dir
+            || p.starts_with(&format!("{kiri_dir}/"))
+            || p == WSL_KIRI_DIR
+            || p.starts_with(&format!("{WSL_KIRI_DIR}/"))
+    };
+    if is_internal_wsl(&lex) {
+        return Err(Error::BadRequest(format!(
+            "invalid mount source {src}: cannot mount Kiri's internal WSL directory"
+        )));
+    }
+    let mnt = wsl.map_or("/mnt/", |w| w.root.as_str());
+    let mnt_trimmed = mnt.trim_end_matches('/');
+    if (!mnt_trimmed.is_empty() && (lex == mnt_trimmed || lex.starts_with(mnt)))
+        && lex != "/mnt/wsl"
+        && !is_internal_wsl(&lex)
+    {
+        return Ok(lex);
+    }
+    let target = confine_to_root(&distro_root, &lex);
+    verify_on_disk_confinement(src, distro, Path::new(&distro_root), Path::new(&target))?;
+    Ok(target)
 }
 
 /// How many leading bytes hold a colon that is not a separator: `C:` and
@@ -130,6 +320,10 @@ fn looks_windows(src: &str) -> bool {
 /// Anything else (a network share, another distro's files, a relative
 /// path) is refused: WSL can't reach it as a path here.
 pub fn source(src: &str, wsl: &Wsl) -> Result<String, Error> {
+    source_with_roots(src, wsl, mounted_distro_root)
+}
+
+pub fn source_with_roots(src: &str, wsl: &Wsl, distro_root: impl Fn(&str) -> Option<String>) -> Result<String, Error> {
     let bad = |why: &str| Error::BadRequest(format!("invalid mount source {src}: {why}"));
     if !looks_windows(src) {
         return Ok(src.to_owned());
@@ -152,6 +346,11 @@ pub fn source(src: &str, wsl: &Wsl) -> Result<String, Error> {
             return Err(bad("no WSL distro named"));
         }
         if let Some(ours) = wsl.distro.as_deref().filter(|d| !d.eq_ignore_ascii_case(distro)) {
+            if let Some(root) = distro_root(distro) {
+                let target = confine_to_root(&root, inner);
+                verify_on_disk_confinement(src, distro, Path::new(&root), Path::new(&target))?;
+                return Ok(target);
+            }
             return Err(bad(&format!("it is in the WSL distro {distro}, and Kiri runs in {ours}; use a path on a Windows drive or in {ours}")));
         }
         return Ok(clean(&format!("/{inner}")));
@@ -275,6 +474,27 @@ pub fn engine_socket(src: &str) -> Option<String> {
     engine_socket_with_alias(src, &own, alias, real)
 }
 
+/// [`engine_socket`] for a create request that arrived from `wsl_distro`:
+/// inside an integrated WSL distro, `/var/run/docker.sock` (and `/run/docker.sock`)
+/// refers to Kiri's engine socket regardless of whether the host or engine
+/// distro has another socket at `/var/run/docker.sock`.
+pub fn engine_socket_for_distro(src: &str, wsl_distro: Option<&str>) -> Option<String> {
+    if wsl_distro.is_some() {
+        let text = clean(src);
+        if ENGINE_SOCKS.contains(&text.as_str()) || is_wsl_engine_socket(&text) {
+            let own = super::socket_path().ok()?;
+            #[cfg(target_os = "macos")]
+            {
+                let _ = own;
+                return Some(VM_ENGINE_SOCK.to_owned());
+            }
+            #[cfg(not(target_os = "macos"))]
+            return Some(super::caller::container_socket(&own).to_string_lossy().into_owned());
+        }
+    }
+    engine_socket(src)
+}
+
 /// [`engine_socket`], with `resolve` giving where a path that exists
 /// really is. The path as given is followed first, as the kernel will
 /// follow it; only a path that is not there is compared as text.
@@ -285,11 +505,12 @@ fn engine_socket_for(src: &str, own: &str, resolve: impl Fn(&str) -> Option<Real
 
 fn engine_socket_with_alias(src: &str, own: &str, alias: Option<&str>, resolve: impl Fn(&str) -> Option<Real>) -> Option<String> {
     let found = resolve(src);
-    let is_own = found.as_ref().is_some_and(|a| {
-        resolve(own).is_some_and(|b| a.same(&b)) || alias.and_then(&resolve).is_some_and(|b| a.same(&b))
-    });
     let text = clean(src);
     let matches_text = |p: &str| text == clean(p);
+    let is_own = found.as_ref().is_some_and(|a| {
+        resolve(own).is_some_and(|b| a.same(&b)) || alias.and_then(&resolve).is_some_and(|b| a.same(&b))
+    }) || is_wsl_engine_socket(&text)
+        || found.as_ref().is_some_and(|r| is_wsl_engine_socket(&r.path));
     #[cfg(target_os = "macos")]
     {
         let named = ENGINE_SOCKS.contains(&text.as_str()) || found.as_ref().is_some_and(|r| ENGINE_SOCKS.contains(&r.path.as_str()));
@@ -300,7 +521,7 @@ fn engine_socket_with_alias(src: &str, own: &str, alias: Option<&str>, resolve: 
         let given = || super::caller::container_socket(Path::new(own)).to_string_lossy().into_owned();
         match found {
             Some(_) => is_own.then(given),
-            None => (matches_text(own) || alias.is_some_and(matches_text) || ENGINE_SOCKS.contains(&text.as_str())).then(given),
+            None => (is_own || matches_text(own) || alias.is_some_and(matches_text) || ENGINE_SOCKS.contains(&text.as_str())).then(given),
         }
     }
 }
@@ -581,5 +802,64 @@ mod tests {
         assert!(!is_wsl_drive_path("/mnt/c/../etc/passwd", "/mnt/", true));
         assert!(!is_wsl_drive_path("/mnt/c/a\nb", "/mnt/", true));
         assert!(is_wsl_drive_path("/windows/d/proj", "/windows/", false));
+    }
+
+    #[test]
+    fn wsl_distro_path_translation_and_confinement() {
+        let w = wsl();
+        assert_eq!(
+            split_for("/home/me/app:/app", Some(&w), Some("Ubuntu")).unwrap(),
+            t("/mnt/wsl/kiri/roots/Ubuntu/home/me/app", "/app", "")
+        );
+        assert_eq!(
+            split_for("/home/me/app:/app:ro", None, Some("Ubuntu")).unwrap(),
+            t("/mnt/wsl/kiri/roots/Ubuntu/home/me/app", "/app", "ro")
+        );
+        assert_eq!(
+            split_for("/mnt/c/proj:/app", Some(&w), Some("Ubuntu")).unwrap(),
+            t("/mnt/c/proj", "/app", "")
+        );
+        assert_eq!(
+            split_for("/var/run/docker.sock:/var/run/docker.sock", Some(&w), Some("Ubuntu")).unwrap(),
+            t("/var/run/docker.sock", "/var/run/docker.sock", "")
+        );
+        assert_eq!(
+            split_for("/run/docker.sock:/var/run/docker.sock", Some(&w), Some("Ubuntu")).unwrap(),
+            t("/run/docker.sock", "/var/run/docker.sock", "")
+        );
+        assert_eq!(
+            split_for("myvol:/data", Some(&w), Some("Ubuntu")).unwrap(),
+            t("myvol", "/data", "")
+        );
+        // `..` traversal confinement: cannot escape `<NAME>`'s root.
+        for traversal in [
+            "/mnt/wsl/kiri/roots/Ubuntu/../../etc",
+            "/mnt/wsl/kiri/roots/Ubuntu/../../../../etc",
+            "/../../etc",
+            "/home/me/../../../etc",
+            "/mnt/c/../../etc",
+        ] {
+            assert_eq!(
+                distro_source(traversal, "Ubuntu", Some(&w)).unwrap(),
+                "/mnt/wsl/kiri/roots/Ubuntu/etc",
+                "{traversal}"
+            );
+        }
+        // Mounting another distro's root or Kiri's internal WSL dir is refused.
+        assert!(distro_source("/mnt/wsl/kiri/roots/Debian/etc", "Ubuntu", Some(&w)).is_err());
+        assert!(distro_source("/mnt/wsl/kiri/sockets/Ubuntu", "Ubuntu", Some(&w)).is_err());
+        assert!(distro_source("/home/me", "../evil", Some(&w)).is_err());
+
+        // From Windows: `\\wsl.localhost\<NAME>\...` is allowed when `<NAME>`'s root is mounted.
+        let with_ubuntu = |d: &str| d.eq_ignore_ascii_case("Ubuntu").then(|| "/mnt/wsl/kiri/roots/Ubuntu".to_owned());
+        assert_eq!(
+            source_with_roots(r"\\wsl.localhost\Ubuntu\home\alice\app", &w, with_ubuntu).unwrap(),
+            "/mnt/wsl/kiri/roots/Ubuntu/home/alice/app"
+        );
+        assert_eq!(
+            source_with_roots(r"\\wsl$\ubuntu\home\alice\..\..\etc", &w, with_ubuntu).unwrap(),
+            "/mnt/wsl/kiri/roots/Ubuntu/etc"
+        );
+        assert!(source_with_roots(r"\\wsl.localhost\Debian\home\alice", &w, with_ubuntu).is_err());
     }
 }

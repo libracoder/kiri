@@ -150,7 +150,12 @@ Apple silicon and Intel Macs (macOS 14+), Windows 10 and 11 (x86-64 and Arm, thr
   around `target/kiri-windows-x86_64`; `kiri.ps1` in that folder installs
   the same without an MSI). Not TCP:
   WSL's localhost relay drops half-closes, and `docker run` loses its
-  output
+  output. Settings → Resources → WSL integration exposes per-distro engine
+  sockets under `/mnt/wsl/kiri/sockets/<distro>/docker.sock` (linked from
+  `/var/run/docker.sock` and a `kiri` Docker context when no `dockerd` is
+  running in that distro) and translates bind mounts from each enabled WSL 2
+  distro's Linux filesystem through `/mnt/wsl/kiri/roots/<distro>` (off by
+  default; Windows paths like `\\wsl.localhost\<distro>\…` work too)
 
 Kubernetes LoadBalancer services are published on `localhost`, and
 `kiri machine create NAME --systemd` boots systemd as the machine's init.

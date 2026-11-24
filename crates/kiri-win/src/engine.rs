@@ -244,6 +244,7 @@ fn watch(tx: Sender<Cmd>) {
             // A Kubernetes node already running gets its kubectl context.
             crate::k8s::sync_soon();
             crate::watch::notify_containers_changed();
+            crate::wslconfig::sync_wsl_integration_soon();
             let _ = client::events(|_| {
                 crate::watch::notify_containers_changed();
                 tx.send(Cmd::Refresh).is_ok()
@@ -333,6 +334,7 @@ pub(crate) fn ensure_daemon() -> io::Result<()> {
         start_daemon()?;
     }
     std::thread::spawn(crate::update::catch_up_engine);
+    crate::wslconfig::sync_wsl_integration_soon();
     Ok(())
 }
 

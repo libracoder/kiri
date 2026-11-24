@@ -1854,5 +1854,7 @@
   "Disk image size": "Størrelse på diskbilde",
   "KIRI_CPUS, KIRI_MEMORY_MIB or KIRI_DISK_GB is set for the daemon, and it takes precedence over these.": "KIRI_CPUS, KIRI_MEMORY_MIB eller KIRI_DISK_GB er satt for daemonen og har forrang foran disse.",
   "Running now with {cpus}, up to {mem}, and a {disk} disk.": "Kjører nå med {cpus}, opptil {mem} og en disk på {disk}.",
-  "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "Det meste VM-disken kan vokse til. Plass på {os} brukes bare etter hvert som data skrives; den krymper aldri. Gjelder ved omstart."
+  "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "Det meste VM-disken kan vokse til. Plass på {os} brukes bare etter hvert som data skrives; den krymper aldri. Gjelder ved omstart.",
+  "No other WSL distros installed.": "Ingen andre WSL-distribusjoner er installert.",
+  "WSL integration": "WSL-integrering"
 }

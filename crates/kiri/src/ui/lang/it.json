@@ -1854,5 +1854,7 @@
   "Disk image size": "Dimensione immagine disco",
   "KIRI_CPUS, KIRI_MEMORY_MIB or KIRI_DISK_GB is set for the daemon, and it takes precedence over these.": "KIRI_CPUS, KIRI_MEMORY_MIB o KIRI_DISK_GB è impostata per il daemon e ha la precedenza su questi valori.",
   "Running now with {cpus}, up to {mem}, and a {disk} disk.": "Ora in esecuzione con {cpus}, fino a {mem} e un disco da {disk}.",
-  "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "La dimensione massima a cui può crescere il disco della VM. Lo spazio su {os} viene usato solo man mano che si scrivono dati; non si riduce mai. Si applica al riavvio."
+  "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "La dimensione massima a cui può crescere il disco della VM. Lo spazio su {os} viene usato solo man mano che si scrivono dati; non si riduce mai. Si applica al riavvio.",
+  "No other WSL distros installed.": "Nessun’altra distribuzione WSL installata.",
+  "WSL integration": "Integrazione WSL"
 }

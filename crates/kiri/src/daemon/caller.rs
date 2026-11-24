@@ -26,12 +26,23 @@
 use std::path::{Path, PathBuf};
 
 /// Who is at the other end of an API connection.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Caller {
     /// This machine's programs, on the daemon's own socket.
     Host,
     /// A container, through the VM's relay or its own socket.
     Container,
+    /// Another WSL 2 distro, on `/mnt/wsl/kiri/sockets/<distro>/docker.sock`.
+    Wsl(String),
+}
+
+impl Caller {
+    pub fn wsl_distro(&self) -> Option<&str> {
+        match self {
+            Caller::Wsl(distro) => Some(distro),
+            Caller::Host | Caller::Container => None,
+        }
+    }
 }
 
 /// The socket containers that mount the engine's are given, beside the

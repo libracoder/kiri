@@ -38,7 +38,7 @@ pub fn serve(stream: UnixStream, engine: Arc<Engine>, caller: Caller) -> io::Res
         if req.header("X-Kiri-Background").is_none() {
             engine.touch();
         }
-        match route(&req, &engine, caller, &mut w, &mut r) {
+        match route(&req, &engine, &caller, &mut w, &mut r) {
             // `Connection: close` or HTTP/1.0: the client reads to the end of
             // the stream (a 204 has no length to read by), which `close`
             // gives it cleanly.
@@ -134,7 +134,7 @@ fn container_may(method: &str, path: &str) -> bool {
     !kiri || matches!(method, "GET" | "HEAD") || CONTAINER_MAY.contains(&(method, path))
 }
 
-fn route(req: &Request, engine: &Arc<Engine>, caller: Caller, w: &mut UnixStream, r: &mut BufReader<UnixStream>) -> io::Result<Next> {
+fn route(req: &Request, engine: &Arc<Engine>, caller: &Caller, w: &mut UnixStream, r: &mut BufReader<UnixStream>) -> io::Result<Next> {
     if req.api_version.is_some_and(|v| v < http::MIN_API_VERSION) {
         let (major, minor) = req.api_version.unwrap_or_default();
         let (min_major, min_minor) = http::MIN_API_VERSION;
@@ -144,7 +144,7 @@ fn route(req: &Request, engine: &Arc<Engine>, caller: Caller, w: &mut UnixStream
     let m = req.method.as_str();
     // Kiri's own endpoints that change something are for this machine's
     // programs (caller.rs), not for a container given the socket.
-    if caller == Caller::Container && !container_may(m, p) {
+    if *caller == Caller::Container && !container_may(m, p) {
         // Closed after the answer: a body the request carried is not left
         // on the connection to be read as the next request.
         http::error(w, 403, "this is changed in Kiri's window or with the kiri command on this machine, not from a container")?;
@@ -185,6 +185,9 @@ fn route(req: &Request, engine: &Arc<Engine>, caller: Caller, w: &mut UnixStream
         ("POST", "/kiri/domains") => return reply(w, set_domain_ports(req, engine), 200),
         // Back to the ports a start gives (a test copy's routers stop).
         ("DELETE", "/kiri/domains") => return reply(w, super::domains::reset(engine).map_err(Error::Conflict), 200),
+        // Settings → Resources → WSL integration: per-distro sockets in /mnt/wsl/kiri.
+        ("GET", "/kiri/wsl") => return reply(w, Ok(super::wsl_report()), 200),
+        ("POST", "/kiri/wsl") => return reply(w, set_wsl(req, caller), 200),
         // USB passthrough (macOS: the root helper `kiri usb serve` connects here).
         #[cfg(target_os = "macos")]
         ("POST", "/kiri/usb") => return super::usb::attach(req, engine, w, r),
@@ -258,7 +261,7 @@ fn route(req: &Request, engine: &Arc<Engine>, caller: Caller, w: &mut UnixStream
             if let Some(made) = super::builder::create_for_buildx(engine, req.query("name")) {
                 return reply(w, made, 201);
             }
-            return reply(w, create(req, engine), 201);
+            return reply(w, create_for(req, engine, caller.wsl_distro()), 201);
         }
         ("GET", "/containers/json") => return reply(w, list(req, engine), 200),
         ("GET", "/networks") => return reply(w, networks(req, engine), 200),
@@ -1059,6 +1062,27 @@ fn set_domain_ports(req: &Request, engine: &Arc<Engine>) -> Result<Value, Error>
     super::domains::set_ports(engine, port("http")?, port("https")?).map_err(Error::Conflict)
 }
 
+fn set_wsl(req: &Request, caller: &Caller) -> Result<Value, Error> {
+    if caller.wsl_distro().is_some() {
+        return Err(Error::Forbidden("WSL integration settings can only be changed from Kiri on Windows".into()));
+    }
+    let body: Value = serde_json::from_slice(&req.body).map_err(|e| Error::BadRequest(format!("invalid JSON: {e}")))?;
+    let mut distros = Vec::new();
+    for item in body["distros"].as_array().ok_or_else(|| Error::BadRequest("distros must be an array".into()))? {
+        let name = item["name"].as_str().unwrap_or_default();
+        if !super::binds::valid_distro_name(name) {
+            return Err(Error::BadRequest(format!("invalid WSL distro name: {name}")));
+        }
+        let gid = item["gid"]
+            .as_u64()
+            .and_then(|g| u32::try_from(g).ok())
+            .ok_or_else(|| Error::BadRequest(format!("invalid gid for WSL distro {name}")))?;
+        distros.push(super::WslDistroConfig { name: name.to_owned(), gid });
+    }
+    super::sync_wsl_sockets(&distros).map_err(Error::Io)?;
+    Ok(super::wsl_report())
+}
+
 fn set_resources(req: &Request) -> Result<(), Error> {
     use super::engine as e;
     let path = e::resources_path().ok_or_else(|| Error::Io(io::Error::other("HOME is not set")))?;
@@ -1755,7 +1779,12 @@ fn volumes_from_mounts(guest: &[String], info: &[Value], ro: bool) -> Vec<(Strin
 
 /// `-v`, `--mount`, `--tmpfs`, `--volumes-from`, `-v /path` and the image's
 /// VOLUME lines.
+#[cfg(test)]
 fn mounts(body: &Value, engine: &Engine, image: &kiri_image::Image) -> Result<Mounts, Error> {
+    mounts_for(body, engine, image, None)
+}
+
+fn mounts_for(body: &Value, engine: &Engine, image: &kiri_image::Image, wsl_distro: Option<&str>) -> Result<Mounts, Error> {
     let host = &body["HostConfig"];
     let mut out = Mounts { guest: Vec::new(), info: Vec::new(), volumes: Vec::new(), anon: Vec::new() };
     let check_target = |t: &str| -> Result<(), Error> {
@@ -1789,7 +1818,7 @@ fn mounts(body: &Value, engine: &Engine, image: &kiri_image::Image) -> Result<Mo
         };
         // The engine's own socket (Testcontainers' Ryuk, CI runners): the VM's
         // relay to this daemon on a Mac, or Kiri's socket on a Linux host.
-        let engine_sock = if kind == "bind" { super::binds::engine_socket(src) } else { None };
+        let engine_sock = if kind == "bind" { super::binds::engine_socket_for_distro(src, wsl_distro) } else { None };
         match kind {
             "bind" if engine_sock.is_some() => {
                 out.guest.push(format!("{}\t{dst}\t{}", engine_sock.as_deref().unwrap_or_default(), flag("")));
@@ -1858,10 +1887,11 @@ fn mounts(body: &Value, engine: &Engine, image: &kiri_image::Image) -> Result<Mo
         }
         Ok(())
     };
-    // From the docker CLI on Windows (into WSL), `C:\src:/app` and the like.
+    // From the docker CLI on Windows (into WSL), `C:\src:/app` and the like,
+    // or from an integrated WSL distro (`wsl_distro`).
     let wsl = super::binds::wsl();
     for b in strings(&host["Binds"]).unwrap_or_default() {
-        let (src, dst, opts) = super::binds::split(&b, wsl)?;
+        let (src, dst, opts) = super::binds::split_for(&b, wsl, wsl_distro)?;
         let (src, dst, opts) = (src.as_str(), dst.as_str(), opts.as_str());
         let ro = opts.split(',').any(|o| o == "ro");
         let kind = if src.starts_with('/') { "bind" } else { "volume" };
@@ -1871,8 +1901,9 @@ fn mounts(body: &Value, engine: &Engine, image: &kiri_image::Image) -> Result<Mo
     for m in host["Mounts"].as_array().into_iter().flatten() {
         let kind = m["Type"].as_str().unwrap_or("bind");
         let src = m["Source"].as_str().unwrap_or("");
-        let src = match wsl {
-            Some(w) if kind == "bind" => super::binds::source(src, w)?,
+        let src = match (wsl, wsl_distro) {
+            (_, Some(d)) if kind == "bind" => super::binds::distro_source(src, d, wsl)?,
+            (Some(w), None) if kind == "bind" => super::binds::source(src, w)?,
             _ => src.to_owned(),
         };
         let src = src.as_str();
@@ -2403,6 +2434,10 @@ const SECCOMP_UNCONFINED_WARNING: &str =
     "seccomp=unconfined lifts the default syscall filter, but Kiri keeps its host boundary: io_uring and vsock sockets stay blocked";
 
 pub(super) fn create(req: &Request, engine: &Engine) -> Result<Value, Error> {
+    create_for(req, engine, None)
+}
+
+pub(super) fn create_for(req: &Request, engine: &Engine, wsl_distro: Option<&str>) -> Result<Value, Error> {
     let body: Value = serde_json::from_slice(&req.body).map_err(|e| Error::BadRequest(format!("invalid JSON: {e}")))?;
     let image_name = body["Image"].as_str().unwrap_or_default();
     if image_name.is_empty() {
@@ -2539,7 +2574,7 @@ pub(super) fn create(req: &Request, engine: &Engine) -> Result<Value, Error> {
     // Checked before mounts, which may create volumes.
     let healthcheck = healthcheck_from(&body, &image_cfg)?;
     let (entrypoint, cmd) = command(strings(&body["Entrypoint"]), strings(&body["Cmd"]), &image.config.entrypoint, &image.config.cmd)?;
-    let mounts = mounts(&body, engine, &image)?;
+    let mounts = mounts_for(&body, engine, &image, wsl_distro)?;
     let exposed = exposed_ports(&body, &image_cfg);
     let ports = port_bindings(&body, &exposed)?;
     if !ports.is_empty() && network_mode == "none" {

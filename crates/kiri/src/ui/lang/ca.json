@@ -1854,5 +1854,7 @@
   "Disk image size": "Mida de la imatge de disc",
   "KIRI_CPUS, KIRI_MEMORY_MIB or KIRI_DISK_GB is set for the daemon, and it takes precedence over these.": "KIRI_CPUS, KIRI_MEMORY_MIB o KIRI_DISK_GB estan definits per al dimoni i tenen prioritat sobre aquests valors.",
   "Running now with {cpus}, up to {mem}, and a {disk} disk.": "Ara s'executa amb {cpus}, fins a {mem} i un disc de {disk}.",
-  "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "El màxim que pot créixer el disc de la VM. Només ocupa espai a {os} a mesura que s'escriuen dades; no s'encongeix mai. S'aplica en reiniciar."
+  "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "El màxim que pot créixer el disc de la VM. Només ocupa espai a {os} a mesura que s'escriuen dades; no s'encongeix mai. S'aplica en reiniciar.",
+  "No other WSL distros installed.": "No hi ha cap altra distribució de WSL instal·lada.",
+  "WSL integration": "Integració amb WSL"
 }

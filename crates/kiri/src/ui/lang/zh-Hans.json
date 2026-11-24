@@ -1854,5 +1854,7 @@
   "Disk image size": "磁盘镜像大小",
   "KIRI_CPUS, KIRI_MEMORY_MIB or KIRI_DISK_GB is set for the daemon, and it takes precedence over these.": "守护进程设置了 KIRI_CPUS、KIRI_MEMORY_MIB 或 KIRI_DISK_GB，其优先级高于这里的设置。",
   "Running now with {cpus}, up to {mem}, and a {disk} disk.": "当前运行使用 {cpus}、内存最多 {mem}、{disk} 磁盘。",
-  "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "虚拟机磁盘最多可扩展到的大小。仅在写入数据时才会占用 {os} 上的空间，且永不缩小。重启后生效。"
+  "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "虚拟机磁盘最多可扩展到的大小。仅在写入数据时才会占用 {os} 上的空间，且永不缩小。重启后生效。",
+  "No other WSL distros installed.": "未安装其他 WSL 发行版。",
+  "WSL integration": "WSL 集成"
 }

@@ -1854,5 +1854,7 @@
   "Disk image size": "ডিস্ক ইমেজের আকার",
   "KIRI_CPUS, KIRI_MEMORY_MIB or KIRI_DISK_GB is set for the daemon, and it takes precedence over these.": "ডেমনের জন্য KIRI_CPUS, KIRI_MEMORY_MIB বা KIRI_DISK_GB সেট করা আছে, এবং সেগুলো এগুলোর চেয়ে অগ্রাধিকার পায়।",
   "Running now with {cpus}, up to {mem}, and a {disk} disk.": "এখন {cpus}, সর্বোচ্চ {mem} ও {disk} ডিস্ক নিয়ে চলছে।",
-  "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "VM ডিস্ক সর্বোচ্চ যতটা বড় হতে পারে। ডেটা লেখা হলেই কেবল {os}-এ জায়গা ব্যবহার হয়; এটি কখনো ছোট হয় না। রিস্টার্ট করলে প্রয়োগ হয়।"
+  "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "VM ডিস্ক সর্বোচ্চ যতটা বড় হতে পারে। ডেটা লেখা হলেই কেবল {os}-এ জায়গা ব্যবহার হয়; এটি কখনো ছোট হয় না। রিস্টার্ট করলে প্রয়োগ হয়।",
+  "No other WSL distros installed.": "অন্য কোনো WSL ডিস্ট্রো ইনস্টল করা নেই।",
+  "WSL integration": "WSL ইন্টিগ্রেশন"
 }

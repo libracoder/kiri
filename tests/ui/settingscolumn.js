@@ -27,4 +27,22 @@ t("Resources: both sliders beside the tabs, not under them", () => {
     if (r.left < tabs.right) throw new Error(`${id} starts at ${Math.round(r.left)}, under the tabs`);
   }
 });
+t("Resources: WSL integration toggles distros and sits beside the tabs", () => {
+  kiri.on({
+    type: "resources", cpus: 24, memory_mib: 65536, running_cpus: 24, running_memory_mib: 65536,
+    awake: true, max_cpus: 32, max_memory_mib: 130048, overridden: false,
+    wsl_distros: [{ name: "Ubuntu", on: false }, { name: "NixOS", on: true }],
+  });
+  document.querySelector('[data-stab="resources"]').click();
+  const tabs = document.querySelector(".settings .tabs").getBoundingClientRect();
+  const btn = document.querySelector('[data-wsldistro="Ubuntu"][data-wslon="1"]');
+  if (!btn || btn.getAttribute("aria-pressed") !== "false") throw new Error("Ubuntu On button missing or already pressed");
+  if (btn.getBoundingClientRect().left < tabs.right) throw new Error("WSL integration pane is under the tabs");
+  btn.click();
+  const after = document.querySelector('[data-wsldistro="Ubuntu"][data-wslon="1"]');
+  if (after?.getAttribute("aria-pressed") !== "true") throw new Error("Ubuntu toggle did not flip to On");
+  if (!sent.some((m) => m.type === "setresources" && m.value?.wsl_distro === "Ubuntu" && m.value?.on === true)) {
+    throw new Error("did not send setresources for Ubuntu");
+  }
+});
 report(R);

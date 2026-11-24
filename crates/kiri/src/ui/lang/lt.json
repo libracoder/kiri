@@ -1854,5 +1854,7 @@
   "Disk image size": "Disko atvaizdo dydis",
   "KIRI_CPUS, KIRI_MEMORY_MIB or KIRI_DISK_GB is set for the daemon, and it takes precedence over these.": "Tarnybai nustatytas KIRI_CPUS, KIRI_MEMORY_MIB arba KIRI_DISK_GB, ir jie turi pirmenybę prieš šiuos nustatymus.",
   "Running now with {cpus}, up to {mem}, and a {disk} disk.": "Dabar veikia su {cpus}, iki {mem} ir {disk} disku.",
-  "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "Didžiausias dydis, iki kurio gali išaugti VM diskas. Vieta {os} naudojama tik rašant duomenis; diskas niekada nesumažėja. Pritaikoma paleidus iš naujo."
+  "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "Didžiausias dydis, iki kurio gali išaugti VM diskas. Vieta {os} naudojama tik rašant duomenis; diskas niekada nesumažėja. Pritaikoma paleidus iš naujo.",
+  "No other WSL distros installed.": "Kitų WSL distribucijų neįdiegta.",
+  "WSL integration": "WSL integracija"
 }

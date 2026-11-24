@@ -1854,5 +1854,7 @@
   "Disk image size": "வட்டுப் பட அளவு",
   "KIRI_CPUS, KIRI_MEMORY_MIB or KIRI_DISK_GB is set for the daemon, and it takes precedence over these.": "டீமனுக்கு KIRI_CPUS, KIRI_MEMORY_MIB அல்லது KIRI_DISK_GB அமைக்கப்பட்டுள்ளது, அது இவற்றை விட முன்னுரிமை பெறும்.",
   "Running now with {cpus}, up to {mem}, and a {disk} disk.": "இப்போது {cpus}, அதிகபட்சம் {mem} மற்றும் {disk} வட்டுடன் இயங்குகிறது.",
-  "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "VM வட்டு அதிகபட்சம் வளரக்கூடிய அளவு. தரவு எழுதப்படும்போது மட்டுமே {os}-இல் இடம் பயன்படுத்தப்படும்; இது ஒருபோதும் சுருங்காது. மறுதொடக்கத்தில் நடைமுறைக்கு வரும்."
+  "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "VM வட்டு அதிகபட்சம் வளரக்கூடிய அளவு. தரவு எழுதப்படும்போது மட்டுமே {os}-இல் இடம் பயன்படுத்தப்படும்; இது ஒருபோதும் சுருங்காது. மறுதொடக்கத்தில் நடைமுறைக்கு வரும்.",
+  "No other WSL distros installed.": "வேறு எந்த WSL விநியோகங்களும் நிறுவப்படவில்லை.",
+  "WSL integration": "WSL ஒருங்கிணைப்பு"
 }

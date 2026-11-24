@@ -15,6 +15,145 @@ fn path() -> Option<PathBuf> {
     std::env::var_os("USERPROFILE").map(|h| PathBuf::from(h).join(".wslconfig"))
 }
 
+fn integration_path() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("Kiri").join("wsl-integration.json"))
+}
+
+/// Enabled WSL integration distros from `%LOCALAPPDATA%\Kiri\wsl-integration.json`
+/// (off by default).
+pub fn enabled_distros() -> Vec<String> {
+    integration_path()
+        .and_then(|p| std::fs::read(p).ok())
+        .map(|b| crate::wslsync::parse_enabled_distros(&b))
+        .unwrap_or_default()
+}
+
+fn save_enabled_distros(distros: &[String]) -> io::Result<()> {
+    let p = integration_path().ok_or_else(|| io::Error::other("LOCALAPPDATA is not set"))?;
+    if let Some(parent) = p.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = p.with_extension("json.tmp");
+    std::fs::write(&tmp, crate::wslsync::encode_enabled_distros(distros))?;
+    std::fs::rename(&tmp, &p)
+}
+
+/// User WSL distros discovered by `wsl.exe --list --quiet` (excluding `kiri`
+/// and `docker-desktop*`).
+fn user_distros() -> Vec<String> {
+    let mut cmd = crate::win::tool("wsl.exe");
+    std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x0800_0000);
+    let Ok(out) = crate::update::output_within(cmd.args(["-l", "-q"]), std::time::Duration::from_secs(15)) else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    crate::wslsync::parse_wsl_distros(&out.stdout, crate::engine::distro().as_deref())
+}
+
+fn run_distro_script(distro: &str, script: &str) -> io::Result<String> {
+    let mut cmd = crate::win::tool("wsl.exe");
+    std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x0800_0000);
+    let out = crate::update::output_within(
+        cmd.args(crate::wslsync::wsl_sh(distro, script)),
+        crate::update::WSL_LIMIT,
+    )?;
+    if !out.status.success() {
+        let err = crate::wslsync::wsl_text(&out.stderr);
+        let msg = err.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("WSL command failed");
+        return Err(io::Error::other(format!("{distro}: {msg}")));
+    }
+    Ok(crate::wslsync::wsl_text(&out.stdout).trim().to_owned())
+}
+
+static WSL_SYNC_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Applies the current WSL integration settings to all enabled distros and updates
+/// the daemon's per-distro sockets in `/mnt/wsl/kiri/sockets/<NAME>/docker.sock`.
+pub fn apply_wsl_integration(disabled: Option<&str>, background: bool) -> io::Result<()> {
+    let _guard = WSL_SYNC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let enabled = enabled_distros();
+    if enabled.is_empty() && disabled.is_none() {
+        if background && crate::client::alive_quick() {
+            if let Ok(v) = crate::client::get_background("/kiri/wsl")
+                && v["distros"].as_array().is_some_and(|a| !a.is_empty())
+            {
+                let _ = crate::client::request_with("POST", "/kiri/wsl", Some(&json!({"distros": []})), true);
+            }
+        }
+        return Ok(());
+    }
+    if !background {
+        crate::engine::ensure_daemon()?;
+    } else if !crate::client::alive_quick() {
+        return Ok(());
+    }
+    let available = user_distros();
+    let mut active = Vec::new();
+    let mut first_err: Option<io::Error> = None;
+    for want in &enabled {
+        let Some(name) = available.iter().find(|a| a.eq_ignore_ascii_case(want)) else {
+            continue;
+        };
+        let script = crate::wslsync::wsl_enable_script(name, "");
+        match run_distro_script(name, &script) {
+            Ok(out) => {
+                let gid = out.lines().next_back().and_then(|l| l.trim().parse::<u32>().ok()).unwrap_or(0);
+                active.push(json!({"name": name, "gid": gid}));
+            }
+            Err(e) => {
+                crate::serve::log(&format!("wsl integration ({name}): {e}"));
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+    }
+    let res = crate::client::request_with("POST", "/kiri/wsl", Some(&json!({"distros": active})), background);
+    if let Err(e) = crate::engine::expect_ok(res)
+        && first_err.is_none()
+    {
+        first_err = Some(e);
+    }
+    if let Some(off) = disabled {
+        let script = crate::wslsync::wsl_disable_script(off, "");
+        if let Err(e) = run_distro_script(off, &script) {
+            crate::serve::log(&format!("wsl integration disable ({off}): {e}"));
+            if first_err.is_none() {
+                first_err = Some(e);
+            }
+        }
+    }
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// Re-applies enabled WSL distros in the background when Kiri starts or
+/// reconnects to the engine (handling `wsl --shutdown`).
+pub fn sync_wsl_integration_soon() {
+    std::thread::spawn(|| {
+        if let Err(e) = apply_wsl_integration(None, true) {
+            crate::serve::log(&format!("wsl integration sync: {e}"));
+        }
+    });
+}
+
+fn toggle_distro(distro: &str, on: bool) -> io::Result<()> {
+    if !crate::wslsync::valid_distro_name(distro) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid WSL distro name"));
+    }
+    let mut list = enabled_distros();
+    list.retain(|d| !d.eq_ignore_ascii_case(distro));
+    if on {
+        list.push(distro.to_owned());
+    }
+    save_enabled_distros(&list)?;
+    apply_wsl_integration((!on).then_some(distro), false)
+}
+
 /// `32GB`, `8192MB`, `512m` → MiB.
 fn mib(v: &str) -> Option<u64> {
     let v = v.trim().to_ascii_uppercase();
@@ -129,6 +268,14 @@ fn event() -> Value {
     let cpus = get(&text, "processors").and_then(|v| v.parse().ok()).unwrap_or(max_cpus).clamp(1, max_cpus);
     let memory = get(&text, "memory").and_then(|v| mib(&v)).unwrap_or(max_mib / 2);
     let now = running();
+    let enabled = enabled_distros();
+    let wsl_distros: Vec<Value> = user_distros()
+        .into_iter()
+        .map(|name| {
+            let on = enabled.iter().any(|e| e.eq_ignore_ascii_case(&name));
+            json!({ "name": name, "on": on })
+        })
+        .collect();
     json!({
         "type": "resources",
         "cpus": cpus,
@@ -140,6 +287,7 @@ fn event() -> Value {
         "max_memory_mib": max_mib,
         "overridden": false,
         "restart_note": "Restarting restarts WSL: every WSL distro stops, not only Kiri's, and Kiri's containers start again as they're set to.",
+        "wsl_distros": wsl_distros,
     })
 }
 
@@ -155,9 +303,19 @@ fn save(body: &Value) -> io::Result<()> {
     std::fs::write(&p, text)
 }
 
-/// Reads (or saves, then reads) the CPUs and memory for Settings.
+/// Reads (or saves, then reads) the CPUs, memory and WSL integration for Settings.
 pub fn resources(body: Option<Value>) {
     std::thread::spawn(move || {
+        if let Some(b) = &body
+            && let Some(distro) = b["wsl_distro"].as_str()
+        {
+            let on = b["on"].as_bool().unwrap_or(false);
+            if let Err(e) = toggle_distro(distro, on) {
+                emit(notice("error", &e.to_string()));
+            }
+            emit(event().to_string());
+            return;
+        }
         let saved = body.map(|b| save(&b));
         let ev = event();
         match saved {
@@ -176,6 +334,9 @@ pub fn restart() {
         let mut cmd = crate::win::tool("wsl.exe");
         std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x0800_0000);
         let r = cmd.arg("--shutdown").status().and_then(|s| if s.success() { Ok(()) } else { Err(io::Error::other("wsl --shutdown failed")) }).and_then(|()| crate::engine::ensure_daemon());
+        if r.is_ok() {
+            let _ = apply_wsl_integration(None, true);
+        }
         emit(match r {
             Ok(()) => notice("ok", &tr("WSL restarted with the new resources")),
             Err(e) => notice("error", &trf("Could not restart WSL: {error}", &[("error", &e)])),

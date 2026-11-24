@@ -1854,5 +1854,7 @@
   "Disk image size": "డిస్క్ ఇమేజ్ పరిమాణం",
   "KIRI_CPUS, KIRI_MEMORY_MIB or KIRI_DISK_GB is set for the daemon, and it takes precedence over these.": "డెమన్‌కు KIRI_CPUS, KIRI_MEMORY_MIB లేదా KIRI_DISK_GB సెట్ చేయబడింది, అది వీటి కంటే ప్రాధాన్యం పొందుతుంది.",
   "Running now with {cpus}, up to {mem}, and a {disk} disk.": "ఇప్పుడు {cpus}, గరిష్టంగా {mem}, {disk} డిస్క్‌తో రన్ అవుతోంది.",
-  "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "VM డిస్క్ పెరగగల గరిష్ట పరిమాణం. డేటా రాసినప్పుడు మాత్రమే {os}లో స్థలం వాడబడుతుంది; ఇది ఎప్పుడూ తగ్గదు. రీస్టార్ట్ చేసినప్పుడు వర్తిస్తుంది."
+  "The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.": "VM డిస్క్ పెరగగల గరిష్ట పరిమాణం. డేటా రాసినప్పుడు మాత్రమే {os}లో స్థలం వాడబడుతుంది; ఇది ఎప్పుడూ తగ్గదు. రీస్టార్ట్ చేసినప్పుడు వర్తిస్తుంది.",
+  "No other WSL distros installed.": "ఇతర WSL డిస్ట్రోలు ఏవీ ఇన్‌స్టాల్ చేయబడలేదు.",
+  "WSL integration": "WSL ఇంటిగ్రేషన్"
 }
