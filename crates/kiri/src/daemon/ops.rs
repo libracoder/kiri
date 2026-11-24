@@ -271,13 +271,19 @@ pub(super) fn apply_change(cfg: &mut Value, line: &str) -> Result<(), Error> {
 fn commit(req: &Request, engine: &Engine) -> Result<Value, Error> {
     let key = req.query("container").unwrap_or_default();
     let (id, spec, running) = engine.with(key, |c| (c.id.clone(), c.spec.clone(), c.status == Status::Running))?;
-    let base = engine
+    let (base, cfg_pin, _base_layer_pins) = engine
         .store
-        .images()?
-        .into_iter()
-        .find(|i| i.config_digest == spec.image_id)
+        .with_images(|images| {
+            let base = images.iter().find(|i| i.config_digest == spec.image_id)?.clone();
+            let cfg_pin = engine.store.pin(&base.config_digest);
+            let layer_pins: Vec<_> = base.layers.iter().map(|l| engine.store.pin(&l.digest)).collect();
+            Some((base, cfg_pin, layer_pins))
+        })?
         .ok_or_else(|| Error::NotFound(format!("the image of container {} is gone", &id[..12])))?;
     let mut cfg: Value = serde_json::from_slice(&engine.store.read_config(&base.config_digest)?).map_err(|e| Error::Io(io::Error::other(e)))?;
+    // Release the old config blob before `put_image` so committing back onto
+    // the base tag frees its unreferenced config blob.
+    drop(cfg_pin);
     // What the container ran with becomes the image's config.
     cfg["config"]["Cmd"] = json!(spec.cmd);
     cfg["config"]["Entrypoint"] = if spec.entrypoint.is_empty() { Value::Null } else { json!(spec.entrypoint) };
@@ -307,17 +313,17 @@ fn commit(req: &Request, engine: &Engine) -> Result<Value, Error> {
     if pause {
         engine.pause(&id, true)?;
     }
-    let layer = (|| -> Result<(String, u64), Error> {
+    let layer = (|| -> Result<(String, u64, kiri_image::store::Pin), Error> {
         let (_stream, mut f) = layer_job(engine, &id, kiri_proto::copy_op::COMMIT)?;
         let mut w = engine.store.ingest()?;
         io::copy(&mut f, &mut w)?;
-        Ok(w.finish()?)
+        Ok(w.finish_pinned()?)
     })();
     if pause {
         let _ = engine.pause(&id, false);
     }
     // An uncompressed layer: its digest is its diff id.
-    let (digest, size) = layer?;
+    let (digest, size, _layer_pin) = layer?;
     if !cfg["rootfs"]["diff_ids"].is_array() {
         cfg["rootfs"] = json!({"type": "layers", "diff_ids": []});
     }
@@ -334,7 +340,7 @@ fn commit(req: &Request, engine: &Engine) -> Result<Value, Error> {
     let bytes = serde_json::to_vec(&cfg).map_err(|e| Error::Io(io::Error::other(e)))?;
     let mut w = engine.store.ingest()?;
     io::Write::write_all(&mut w, &bytes)?;
-    let (config_digest, _) = w.finish()?;
+    let (config_digest, _, _config_pin) = w.finish_pinned()?;
     let mut layers = base.layers.clone();
     layers.push(kiri_image::Layer { digest, size, media_type: "application/vnd.oci.image.layer.v1.tar".into() });
     let repo = req.query("repo").unwrap_or_default();
@@ -550,7 +556,7 @@ fn system_df(engine: &Engine) -> Result<Value, Error> {
 /// `docker history`: the config's history, newest first, with each
 /// layer-making step's size.
 fn history(engine: &Engine, name: &str) -> Result<Value, Error> {
-    let i = engine.image(name)?.ok_or_else(|| Error::NotFound(format!("No such image: {name}")))?;
+    let (i, _blob_pins) = engine.image_pinned(name)?.ok_or_else(|| Error::NotFound(format!("No such image: {name}")))?;
     let cfg: Value = serde_json::from_slice(&engine.store.read_config(&i.config_digest)?).unwrap_or(Value::Null);
     let mut layers = i.layers.iter();
     let mut rows: Vec<Value> = cfg["history"]

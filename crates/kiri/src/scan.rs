@@ -160,6 +160,7 @@ fn ensure_grype_in(root: &Path, progress: &mut dyn FnMut(u8)) -> io::Result<()> 
 /// The image as an OCI layout Grype can read: hard links to the store's
 /// blobs (a copy if they can't be linked) and a manifest written for it.
 fn layout(store: &kiri_image::Store, i: &kiri_image::Image, to: &Path) -> io::Result<()> {
+    let _held = store.hold_image(i);
     let blobs = to.join("blobs/sha256");
     std::fs::create_dir_all(&blobs)?;
     let put = |digest: &str| -> io::Result<u64> {
@@ -199,7 +200,7 @@ pub fn scan(name: &str, progress: &mut dyn FnMut(&str, u8)) -> io::Result<Value>
 
 fn scan_in(root: &Path, name: &str, progress: &mut dyn FnMut(&str, u8)) -> io::Result<Value> {
     let store = kiri_image::Store::open(root)?;
-    let (i, ..) = crate::builds::stored(&store, name)?;
+    let (i, _, _, _blob_pins) = crate::builds::stored_pinned(&store, name)?;
     {
         let mut r = RUNNING.lock().unwrap();
         if !r.get_or_insert_with(HashSet::new).insert(i.config_digest.clone()) {

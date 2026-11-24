@@ -254,18 +254,31 @@ pub fn image_layers(name: &str) -> io::Result<Value> {
 /// and its config.
 #[cfg(not(windows))]
 pub(crate) fn stored(store: &kiri_image::Store, name: &str) -> io::Result<(kiri_image::Image, Value, Value)> {
-    let found = match store.find(name)? {
-        Some(i) => Some(i),
-        // An untagged image goes by its ID, whole or the window's short form.
-        None => {
-            let id = name.trim_start_matches("sha256:");
-            store.images()?.into_iter().find(|i| !id.is_empty() && i.config_digest.trim_start_matches("sha256:").starts_with(id))
-        }
-    };
-    let i = found.ok_or_else(|| io::Error::other(format!("no image {name} in Kiri")))?;
+    let (i, manifest, config, _pins) = stored_pinned(store, name)?;
+    Ok((i, manifest, config))
+}
+
+/// As [`stored`], keeping every blob the image references pinned until the
+/// returned pins are dropped.
+#[cfg(not(windows))]
+pub(crate) fn stored_pinned(store: &kiri_image::Store, name: &str) -> io::Result<(kiri_image::Image, Value, Value, Vec<kiri_image::store::Pin>)> {
+    let r = kiri_image::Reference::parse(name).ok();
+    let id = name.trim_start_matches("sha256:");
+    let (i, pins) = store
+        .with_images(|images| {
+            let found = images
+                .iter()
+                .find(|i| i.name == name || i.digest == name || r.as_ref().is_some_and(|r| i.matches(r)))
+                // An untagged image goes by its ID, whole or the window's short form.
+                .or_else(|| images.iter().find(|i| !id.is_empty() && i.config_digest.trim_start_matches("sha256:").starts_with(id)))
+                .cloned()?;
+            let pins = store.hold_image(&found);
+            Some((found, pins))
+        })?
+        .ok_or_else(|| io::Error::other(format!("no image {name} in Kiri")))?;
     let manifest = json!({"config": {"digest": i.config_digest}, "layers": i.layers.iter().map(|l| json!({"size": l.size, "digest": l.digest})).collect::<Vec<_>>()});
     let config: Value = serde_json::from_slice(&store.read_config(&i.config_digest)?).map_err(io::Error::other)?;
-    Ok((i, manifest, config))
+    Ok((i, manifest, config, pins))
 }
 
 /// One platform's image: the config's history lines paired with the

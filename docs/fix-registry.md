@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #864 Images: free unreferenced blobs on tag overwrite with race-free blob pinning (unreleased)
+- Fixes: #864 An image replaced under its name disappears, but its blobs stay on the Mac and nothing can remove them
+- Caused: none known
+- Caused by: #877 (`Store::pin` updated `PINNED` without `BLOB_LOCK`, allowing `remove_unpinned` past its check to race with `archive::load`'s fast path)
+- Check: `crates/kiri-image/src/store.rs`, `crates/kiri-image/src/archive.rs`
+
 ### #734 Builder: load images built by containerized Docker CLIs into Kiri's store (unreleased)
 - Fixes: #734 `docker build` from a `docker` CLI inside a container leaves the image out of Kiri's store
 - Caused: none known
@@ -93,7 +99,7 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ### #465 Images: load OCI image-layout archives and verify existing content-addressed blobs in memory (unreleased)
 - Fixes: #465 Load OCI image-layout archives (`index.json` + `blobs/sha256/...`) in `docker load`
-- Caused: none known
+- Caused: #864 (`Store::pin` in #877 did not acquire `BLOB_LOCK`, leaving a narrow window where `remove_unpinned` deleted a shared blob after `archive::load` pinned it; caught by `loads_and_removals_of_images_sharing_a_layer_do_not_race` in CI)
 - Caused by: -
 - Check: `load-oci-ref`, `load-oci-ref-runs`, `load-oci-untagged`, `load-oci-tampered`, `load-oci-native`, `load-oci-platform`, `load-oci-platform-json`, `load-oci-no-platform`, `load-oci-buildx`, `load-oci-buildx-runs`, `load-oci-buildx-multi`, `load-oci-buildx-multi-runs`
 

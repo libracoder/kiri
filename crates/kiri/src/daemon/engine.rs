@@ -3193,6 +3193,18 @@ impl Engine {
         Ok(image_named(self.store.images()?, name))
     }
 
+    /// Finds an image by the name a client used, holding every blob it
+    /// references ([`kiri_image::Store::hold_image`]) before releasing the
+    /// index lock so a concurrent tag replacement or removal cannot delete
+    /// them before the caller reads the config or sends layers.
+    pub fn image_pinned(&self, name: &str) -> io::Result<Option<(Image, Vec<kiri_image::store::Pin>)>> {
+        self.store.with_images(|images| {
+            let image = image_named(images.to_vec(), name)?;
+            let pins = self.store.hold_image(&image);
+            Some((image, pins))
+        })
+    }
+
     /// The config Labels of each of `images`, which must be the whole image
     /// list (`store.images()`): a config is read from disk only the first
     /// time it is seen, and entries for images not in the list are dropped.
@@ -3312,6 +3324,7 @@ impl Engine {
     fn ensure_layers<'a>(&self, vm: &VmLink, layers: impl Iterator<Item = (&'a str, &'a str)>) -> io::Result<()> {
         let _one_at_a_time = self.layers.lock().unwrap_or_else(|e| e.into_inner());
         for (digest, media_type) in layers {
+            let _blob_pin = self.store.pin(digest);
             if !vm.has_layer(digest)? {
                 vm.send_layer(digest, media_type, &self.store.blob_path(digest)?)?;
             }
@@ -3336,21 +3349,26 @@ impl Engine {
         if missing.is_empty() {
             return Ok(());
         }
-        let images = self.store.images()?;
-        let mut wanted = Vec::with_capacity(missing.len());
-        for digest in missing {
-            let Some(l) = images.iter().flat_map(|i| &i.layers).find(|l| &l.digest == digest) else {
-                return Err(Error::Conflict(format!("layer {digest} is gone from the engine and no image has it any more: remove this container and create it again")));
-            };
-            wanted.push((l.digest.as_str(), l.media_type.as_str()));
-        }
-        Ok(self.ensure_layers(vm, wanted.into_iter())?)
+        let (wanted, _blob_pins) = self.store.with_images(|images| -> Result<_, Error> {
+            let mut wanted = Vec::with_capacity(missing.len());
+            let mut pins = Vec::with_capacity(missing.len());
+            for digest in &missing {
+                let Some(l) = images.iter().flat_map(|i| &i.layers).find(|l| &l.digest == *digest) else {
+                    return Err(Error::Conflict(format!("layer {digest} is gone from the engine and no image has it any more: remove this container and create it again")));
+                };
+                pins.push(self.store.pin(&l.digest));
+                wanted.push((l.digest.clone(), l.media_type.clone()));
+            }
+            Ok((wanted, pins))
+        })??;
+        Ok(self.ensure_layers(vm, wanted.iter().map(|(d, m)| (d.as_str(), m.as_str())))?)
     }
 
     /// Records a container and makes sure its layers are in the guest, so
     /// `start` has nothing left to do but run it.
     pub fn create(&self, name: Option<String>, spec: Spec, image: &Image) -> Result<String, Error> {
         let _pin = self.pin_layers(image.layers.iter().map(|l| l.digest.as_str()));
+        let _blob_pins = self.store.hold_image(image);
         if !image.layers.is_empty() {
             let vm = self.vm()?;
             self.ensure_layers(&vm, image.layers.iter().map(|l| (l.digest.as_str(), l.media_type.as_str())))?;

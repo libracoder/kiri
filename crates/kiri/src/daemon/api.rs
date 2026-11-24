@@ -709,7 +709,7 @@ fn image_list_dangling(f: &Filters) -> Result<Option<bool>, Error> {
 }
 
 fn image_inspect(engine: &Engine, name: &str) -> Result<Value, Error> {
-    let i = engine.image(name)?.ok_or_else(|| Error::NotFound(format!("No such image: {name}")))?;
+    let (i, _blob_pins) = engine.image_pinned(name)?.ok_or_else(|| Error::NotFound(format!("No such image: {name}")))?;
     let cfg = image_config_json(engine, &i.config_digest);
     // Docker's RootFS.Layers are the image config's uncompressed diff_ids,
     // not the manifest's compressed blob digests (scanners like Trivy match
@@ -771,7 +771,7 @@ fn image_remove(engine: &Engine, name: &str, force: bool) -> Result<Value, Error
 
 /// `docker tag SOURCE TARGET`: another name for the same image.
 fn image_tag(req: &Request, engine: &Engine, source: &str) -> Result<(), Error> {
-    let i = engine.image(source)?.ok_or_else(|| Error::NotFound(format!("No such image: {source}")))?;
+    let (i, _blob_pins) = engine.image_pinned(source)?.ok_or_else(|| Error::NotFound(format!("No such image: {source}")))?;
     let repo = req.query("repo").unwrap_or_default();
     if repo.is_empty() {
         return Err(Error::BadRequest("repository name must have at least one component".into()));
@@ -925,12 +925,12 @@ fn import(req: &Request, engine: &Engine, stdin: &mut dyn io::Read) -> Result<St
     // An uncompressed layer: its digest is its diff id.
     let mut layer = engine.store.ingest()?;
     io::copy(&mut io::Cursor::new(block).chain(tar), &mut layer).map_err(|e| upload_error(gzip, e))?;
-    let (digest, size) = layer.finish()?;
+    let (digest, size, _layer_pin) = layer.finish_pinned()?;
     cfg["rootfs"]["diff_ids"] = json!([digest]);
     let bytes = serde_json::to_vec(&cfg).map_err(|e| Error::Io(io::Error::other(e)))?;
     let mut w = engine.store.ingest()?;
     io::Write::write_all(&mut w, &bytes)?;
-    let (config_digest, _) = w.finish()?;
+    let (config_digest, _, _config_pin) = w.finish_pinned()?;
     let layers = vec![kiri_image::Layer { digest, size, media_type: "application/vnd.oci.image.layer.v1.tar".into() }];
     let name = name.unwrap_or_else(|| config_digest.clone());
     engine.store.put_image(kiri_image::archive::from_config(name.clone(), &config_digest, &cfg, layers))?;
@@ -970,9 +970,13 @@ fn tar_header(block: &[u8]) -> bool {
 /// `docker save`: the named images as one archive.
 fn image_save(engine: &Engine, names: &[String], w: &mut UnixStream) -> io::Result<Next> {
     let mut images = Vec::new();
+    let mut _lookup_pins = Vec::new();
     for n in names {
-        match engine.image(n) {
-            Ok(Some(i)) => images.push(i),
+        match engine.image_pinned(n) {
+            Ok(Some((i, pins))) => {
+                images.push(i);
+                _lookup_pins.extend(pins);
+            }
             Ok(None) => return reply(w, Err(Error::NotFound(format!("No such image: {n}"))), 200),
             Err(e) => return reply(w, Err(Error::Io(e)), 200),
         }
@@ -1359,8 +1363,8 @@ fn auth(req: &Request) -> Result<Value, Error> {
 fn push(req: &Request, engine: &Engine, name: &str, w: &mut UnixStream) -> io::Result<Next> {
     let tag = req.query("tag").unwrap_or_default();
     let full = if tag.is_empty() { name.to_owned() } else { format!("{name}:{tag}") };
-    let (image, target) = match (engine.image(&full), Reference::parse(&full)) {
-        (Ok(Some(i)), Ok(r)) => (i, r),
+    let (image, _blob_pins, target) = match (engine.image_pinned(&full), Reference::parse(&full)) {
+        (Ok(Some((i, pins))), Ok(r)) => (i, pins, r),
         (Ok(None), _) => return reply(w, Err(Error::NotFound(format!("An image does not exist locally with the tag: {full}"))), 200),
         (Err(e), _) => return reply(w, Err(Error::Io(e)), 200),
         (_, Err(e)) => return reply(w, Err(Error::BadRequest(e.to_string())), 200),
@@ -2892,7 +2896,7 @@ fn create_inner(req: &Request, engine: &Engine, caller: &Caller, record_wsl_dist
         parse_signal(s)?;
     }
 
-    let image = engine.image(image_name)?.ok_or_else(|| Error::NotFound(format!("No such image: {image_name}")))?;
+    let (image, _blob_pins) = engine.image_pinned(image_name)?.ok_or_else(|| Error::NotFound(format!("No such image: {image_name}")))?;
     let _layer_pin = engine.pin_layers(image.layers.iter().map(|l| l.digest.as_str()));
     if let Some(why) = intel_mac_refusal(image_name, std::slice::from_ref(&image.platform)) {
         return Err(Error::BadRequest(why));

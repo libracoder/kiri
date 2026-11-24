@@ -347,3 +347,4 @@ crates/kiri/src/k8s.rs	#816	kiri k8s set had no --version or --k3s-arg/--clear-k
 crates/kiri-win/src/k8s.rs	#816	Windows k8s.json config and container creation did not preserve or apply custom k3s version tags and extra k3s server arguments
 mac-gpg-ssh-agent-mount	#763	macOS launchd-started daemons used Apple's empty default Listeners SSH socket instead of GnuPG's S.gpg-agent.ssh when enable-ssh-support was set, and direct host SSH agent socket bind mounts failed across virtiofs
 crates/kiri/src/daemon/grpc.rs	#734	docker build run from a Docker CLI inside a socket-mounted container auto-created a buildx docker-container builder without default-load=true and never stored the built image in Kiri's image store
+crates/kiri-image/src/store.rs	#864	an image put under a name another image had dropped the old record without freeing its unreferenced blobs, and Store::pin updated PINNED without BLOB_LOCK

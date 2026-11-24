@@ -77,8 +77,7 @@ pub fn load_platforms(store: &Store, archive: impl Read, platforms: &[Platform])
             {
                 let size = entry.header().size()?;
                 let digest = format!("sha256:{hex}");
-                let pin = store.pin(&digest);
-                if store.has_blob(&digest, size) {
+                if let Some(pin) = store.pin_existing(&digest, size) {
                     let (computed_digest, computed_size) = crate::store::hash_stream(&mut entry)?;
                     if computed_size != size || computed_digest != digest {
                         return Err(invalid(format!("archive blob {digest} is damaged: its bytes hash to {computed_digest}")));

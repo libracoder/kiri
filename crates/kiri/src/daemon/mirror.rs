@@ -770,7 +770,7 @@ fn answer_stream<R: BufRead, W: Write>(r: &mut R, w: &mut W, engine: &Engine) ->
                 w.write_all(&bytes)?;
             }
         }
-        Some(Found::Blob(path, digest)) => {
+        Some(Found::Blob(path, digest, _pin)) => {
             let mut f = std::fs::File::open(&path)?;
             let len = f.metadata()?.len();
             head(w, "200 OK", &format!("Content-Type: application/octet-stream\r\nDocker-Content-Digest: {digest}\r\n"), len)?;
@@ -1114,7 +1114,7 @@ const MAX_MANIFEST: u64 = 4 << 20;
 #[derive(Debug)]
 enum Found {
     Manifest(Vec<u8>, String, String),
-    Blob(std::path::PathBuf, String),
+    Blob(std::path::PathBuf, String, kiri_image::store::Pin),
 }
 
 /// Content-Type for raw manifest or index JSON `bytes`.
@@ -1183,20 +1183,37 @@ fn serve_tag(i: &Image) -> bool {
 
 fn lookup(store: &kiri_image::Store, path: &str, token: &str) -> Option<Found> {
     let (registry, repo, is_manifest, reference) = parse(path, token)?;
-    let images = store.images().ok()?;
     let in_repo = |i: &&Image| Reference::parse(&i.name).is_ok_and(|n| n.registry == registry && n.repository == repo);
     if is_manifest {
         if reference.starts_with("sha256:") {
+            // Pin owned raw manifest/index and repo config blobs under the
+            // index lock so a concurrent `put_image` overwrite cannot delete
+            // them before `stored_manifest` / `manifest` reads them.
+            let (raw_pin, repo_images) = store
+                .with_images(|images| {
+                    let raw_pin = images
+                        .iter()
+                        .filter(in_repo)
+                        .any(|i| i.digest == reference || i.index_digest.as_deref() == Some(reference.as_str()))
+                        .then(|| store.pin(&reference));
+                    let repo_images: Vec<(Image, kiri_image::store::Pin)> =
+                        images.iter().filter(in_repo).map(|i| (i.clone(), store.pin(&i.config_digest))).collect();
+                    (raw_pin, repo_images)
+                })
+                .ok()?;
             // Serve the exact raw manifest or multi-arch index bytes saved
             // during `docker pull` when an image in this repository owns that
             // digest, so digest-pinned builds (`FROM repo:tag@sha256:…` or
             // `FROM repo@sha256:…`) verify cleanly from Kiri's store (#288, #330).
-            if images.iter().filter(in_repo).any(|i| i.digest == reference || i.index_digest.as_deref() == Some(reference.as_str()))
+            if raw_pin.is_some()
                 && let Some((b, mt)) = stored_manifest(store, &reference)
             {
                 return Some(Found::Manifest(b, mt, reference));
             }
-            return images.iter().filter(in_repo).find_map(|i| manifest(store, i).filter(|(_, d)| *d == reference)).map(|(b, d)| Found::Manifest(b, OCI_MANIFEST.to_owned(), d));
+            return repo_images
+                .iter()
+                .find_map(|(i, _)| manifest(store, i).filter(|(_, d)| *d == reference))
+                .map(|(b, d)| Found::Manifest(b, OCI_MANIFEST.to_owned(), d));
         }
         let wanted = Reference::parse(&format!("{registry}/{repo}:{reference}")).ok()?.short();
         // A tag a registry published is the registry's to answer: Kiri holds
@@ -1204,14 +1221,29 @@ fn lookup(store: &kiri_image::Store, path: &str, token: &str) -> Option<Found> {
         // other, so a build for another platform takes these binaries and
         // fails on them (issue #57). 404 here makes the builder skip this
         // mirror and pull the platform it asked for.
-        let i = images.iter().find(|i| i.name == wanted && serve_tag(i))?;
-        let (b, d) = manifest(store, i)?;
+        let (i, _pin) = store
+            .with_images(|images| {
+                let i = images.iter().find(|i| i.name == wanted && serve_tag(i))?.clone();
+                let pin = store.pin(&i.config_digest);
+                Some((i, pin))
+            })
+            .ok()??;
+        let (b, d) = manifest(store, &i)?;
         return Some(Found::Manifest(b, OCI_MANIFEST.to_owned(), d));
     }
-    // Only blobs of that repository's images.
-    let owned = images.iter().filter(in_repo).any(|i| i.referenced_digests().any(|d| d == reference));
+    // Only blobs of that repository's images. Keep the pin inside `Found::Blob`
+    // until `answer` finishes opening and streaming the file.
+    let pin = store
+        .with_images(|images| {
+            images
+                .iter()
+                .filter(in_repo)
+                .any(|i| i.referenced_digests().any(|d| d == reference))
+                .then(|| store.pin(&reference))
+        })
+        .ok()??;
     let path = store.blob_path(&reference).ok()?;
-    (owned && path.is_file()).then_some(Found::Blob(path, reference))
+    path.is_file().then_some(Found::Blob(path, reference, pin))
 }
 
 #[cfg(test)]
@@ -1381,11 +1413,11 @@ mod tests {
         ));
         assert!(matches!(
             lookup(&store, &format!("/v2/tok/docker.io/library/alpine/blobs/{layer_digest}"), "tok"),
-            Some(Found::Blob(_, d)) if d == layer_digest
+            Some(Found::Blob(_, d, _)) if d == layer_digest
         ));
         assert!(matches!(
             lookup(&store, &format!("/v2/tok/docker.io/library/alpine/blobs/{cfg_digest}"), "tok"),
-            Some(Found::Blob(_, d)) if d == cfg_digest
+            Some(Found::Blob(_, d, _)) if d == cfg_digest
         ));
         // Another repository cannot read alpine's blobs.
         assert!(lookup(&store, &format!("/v2/tok/docker.io/library/other/blobs/{layer_digest}"), "tok").is_none());
@@ -1399,7 +1431,7 @@ mod tests {
         ));
         assert!(matches!(
             lookup(&store, &format!("/v2/tok/docker.io/library/mybase/blobs/{layer_digest}"), "tok"),
-            Some(Found::Blob(_, d)) if d == layer_digest
+            Some(Found::Blob(_, d, _)) if d == layer_digest
         ));
 
         // 3. Built, loaded or committed here: served by tag until pushed to a registry.

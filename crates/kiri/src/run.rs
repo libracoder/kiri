@@ -58,19 +58,24 @@ fn parse(args: &[String]) -> io::Result<Options> {
     Ok(o)
 }
 
-/// Finds the image locally, pulling it first if needed.
-pub fn image(store: &Store, name: &str) -> io::Result<Image> {
+/// Finds the image locally, pulling it first if needed, and holds every blob
+/// it references ([`Store::hold_image`]) so a concurrent tag replacement or
+/// removal cannot delete them before layers are sent to the guest.
+pub fn image(store: &Store, name: &str) -> io::Result<(Image, Vec<kiri_image::store::Pin>)> {
     let reference = Reference::parse(name).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
-    if let Some(i) = store.find(&reference.short())? {
-        return Ok(i);
+    if let Some(found) = store.find_pinned(&reference.short())? {
+        return Ok(found);
     }
     eprintln!("Unable to find image '{}' locally; pulling", reference.short());
-    Client::new().pull(store, &reference, &Platform::host_linux(), &|_| {}).map_err(io::Error::other)
+    let pulled = Client::new().pull(store, &reference, &Platform::host_linux(), &|_| {}).map_err(io::Error::other)?;
+    let pins = store.hold_image(&pulled);
+    Ok((pulled, pins))
 }
 
 /// Makes sure every layer of `image` is unpacked in the guest. Returns how
 /// many had to be sent.
 pub fn ensure_layers(guest: &mut Guest, store: &Store, image: &Image) -> io::Result<usize> {
+    let _held = store.hold_image(image);
     let mut sent = 0;
     for layer in &image.layers {
         if !guest.has_layer(&layer.digest)? {
@@ -107,7 +112,7 @@ pub fn run(args: &[String]) -> io::Result<()> {
     let o = parse(args)?;
     let t0 = Instant::now();
     let store = Store::open(Store::default_root()?)?;
-    let image = image(&store, &o.image)?;
+    let (image, _blob_pins) = image(&store, &o.image)?;
     let argv = argv(&image, &o.command);
     if argv.is_empty() {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{} has no default command; give one", image.name)));
