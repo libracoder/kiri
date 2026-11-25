@@ -215,6 +215,26 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
+/// Docker's wording for how long ago something happened (go-units `HumanDuration`).
+/// Seconds and minutes truncate, hours round half up, years count whole hours.
+pub fn human_duration(secs: u64) -> String {
+    let minutes = secs / 60;
+    let hours = secs / 3600 + u64::from(secs % 3600 >= 1800);
+    match secs {
+        0 => "Less than a second".to_owned(),
+        1 => "1 second".to_owned(),
+        2..=59 => format!("{secs} seconds"),
+        _ if minutes == 1 => "About a minute".to_owned(),
+        _ if minutes < 60 => format!("{minutes} minutes"),
+        _ if hours == 1 => "About an hour".to_owned(),
+        _ if hours < 48 => format!("{hours} hours"),
+        _ if hours < 24 * 7 * 2 => format!("{} days", hours / 24),
+        _ if hours < 24 * 30 * 2 => format!("{} weeks", hours / 24 / 7),
+        _ if hours < 24 * 365 * 2 => format!("{} months", hours / 24 / 30),
+        _ => format!("{} years", secs / 3600 / 24 / 365),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,6 +274,46 @@ mod tests {
         assert_eq!(ts("2024-02-29T12"), Some(1_709_208_000.0 - off));
         for bad in ["", "1d", "yesterday", "2024-02-30", "2024-13-01", "2024-02-29T25", "2024-02-29T12:00.5Z", "2024-2-29", "12.x", "h", "1.2.3s"] {
             assert_eq!(ts(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn status_durations_read_like_docker() {
+        const H: u64 = 3600;
+        const D: u64 = 86_400;
+        for (secs, want) in [
+            (0, "Less than a second"),
+            (1, "1 second"),
+            (2, "2 seconds"),
+            (59, "59 seconds"),
+            (60, "About a minute"),
+            (119, "About a minute"),
+            (120, "2 minutes"),
+            (3599, "59 minutes"),
+            (H, "About an hour"),
+            (H + 1799, "About an hour"),
+            (H + 1800, "2 hours"),
+            (D - 1, "24 hours"),
+            (D, "24 hours"),
+            (47 * H, "47 hours"),
+            (48 * H - 1801, "47 hours"),
+            (48 * H - 1800, "2 days"),
+            (48 * H, "2 days"),
+            (13 * D, "13 days"),
+            (14 * D - 1801, "13 days"),
+            (14 * D - 1800, "2 weeks"),
+            (14 * D, "2 weeks"),
+            (60 * D - 1801, "8 weeks"),
+            (60 * D - 1800, "2 months"),
+            (60 * D, "2 months"),
+            (365 * D, "12 months"),
+            (730 * D - 1801, "24 months"),
+            (730 * D - 1800, "1 years"),
+            (730 * D - 1, "1 years"),
+            (730 * D, "2 years"),
+            (u64::MAX, "584942417355 years"),
+        ] {
+            assert_eq!(human_duration(secs), want, "{secs} s");
         }
     }
 }
