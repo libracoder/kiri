@@ -2148,7 +2148,7 @@ fn run_ran(mut cmd: Command, input: Option<&str>, secs: u64) -> Ran {
 
 /// Kills `child` and every process it started (its own process group; on
 /// Windows, its tree).
-fn kill_tree(child: &mut std::process::Child) {
+fn kill_group(child: &mut std::process::Child) {
     #[cfg(unix)]
     if let Ok(pid) = i32::try_from(child.id()) {
         // SAFETY: a plain signal to the group this child leads (`process_group(0)`).
@@ -2162,6 +2162,10 @@ fn kill_tree(child: &mut std::process::Child) {
         let _ = Command::new("taskkill").args(["/F", "/T", "/PID", &child.id().to_string()]).creation_flags(0x0800_0000).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
     }
     let _ = child.kill();
+}
+
+fn kill_tree(child: &mut std::process::Child) {
+    kill_group(child);
     let _ = child.wait();
 }
 
@@ -4147,9 +4151,10 @@ static UPS: LazyLock<Mutex<HashMap<String, Up>>> = LazyLock::new(|| Mutex::new(H
 pub fn cancel(name: &str) -> bool {
     let mut ups = UPS.lock().unwrap_or_else(|e| e.into_inner());
     let Some(up) = ups.get_mut(name) else { return false };
-    up.cancelled = true;
-    if let Some(c) = up.child.as_mut() {
-        let _ = c.kill();
+    if !std::mem::replace(&mut up.cancelled, true)
+        && let Some(c) = up.child.as_mut()
+    {
+        kill_group(c);
     }
     true
 }
@@ -4194,8 +4199,7 @@ struct Applying(String);
 impl Drop for Applying {
     fn drop(&mut self) {
         if let Some(mut c) = UPS.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.0).and_then(|u| u.child) {
-            let _ = c.kill();
-            let _ = c.wait();
+            kill_tree(&mut c);
         }
     }
 }
@@ -4211,6 +4215,23 @@ pub fn restore(name: &str, store: Store) -> Result<(), String> {
     write_over(Path::new(&file), &bytes, &wrote).map_err(|e| if changed(&e) { "The file changed outside Kiri since Apply saved it".to_owned() } else { e.to_string() })?;
     BEFORE.lock().unwrap_or_else(|e| e.into_inner()).remove(name);
     Ok(())
+}
+
+fn spawn_up(mut cmd: Command, name: &str) -> io::Result<(Option<std::process::ChildStdout>, Option<std::process::ChildStderr>)> {
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    let mut child = cmd.spawn()?;
+    let out = child.stdout.take();
+    let err = child.stderr.take();
+    let mut ups = UPS.lock().unwrap_or_else(|e| e.into_inner());
+    let up = ups.entry(name.to_owned()).or_default();
+    // Cancel came while the file was being saved: `up` stops at once.
+    if up.cancelled {
+        kill_group(&mut child);
+    }
+    up.child = Some(child);
+    Ok((out, err))
 }
 
 /// Apply: checks the draft, saves it, and runs `docker compose up -d
@@ -4311,22 +4332,11 @@ pub fn apply(cli: Cli, store: Store, name: &str, draft: &str, base: Option<&str>
         Ok(c) => c,
         Err(e) => return done(false, own(&e.to_string()), true, &hidden, Some(&hash)),
     };
-    cmd.args(project_args(&p, None)).args(profile_args(&profs)).args(["--progress", "plain", "up", "-d", "--remove-orphans"]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
+    cmd.args(project_args(&p, None)).args(profile_args(&profs)).args(["--progress", "plain", "up", "-d", "--remove-orphans"]);
+    let (out, err) = match spawn_up(cmd, name) {
+        Ok(pipes) => pipes,
         Err(e) => return done(false, own(&format!("couldn't run docker compose: {e}")), true, &hidden, Some(&hash)),
     };
-    let out = child.stdout.take();
-    let err = child.stderr.take();
-    {
-        let mut ups = UPS.lock().unwrap_or_else(|e| e.into_inner());
-        let up = ups.entry(name.to_owned()).or_default();
-        // Cancel came while the file was being saved: `up` stops at once.
-        if up.cancelled {
-            let _ = child.kill();
-        }
-        up.child = Some(child);
-    }
     let reader = std::thread::spawn(move || {
         let mut s = String::new();
         if let Some(mut o) = out {
@@ -6341,6 +6351,77 @@ mod tests {
         assert!(cancelled("c1"));
         drop(g);
         assert!(!cancelled("c1") && !UPS.lock().unwrap().contains_key("c1"), "gone once Apply ends");
+    }
+
+    #[test]
+    fn cancelling_apply_stops_the_compose_plugin_tree() {
+        if let Ok(addr) = std::env::var("KIRI_T_PLUGIN_GATE") {
+            let mut conn = std::net::TcpStream::connect(addr).unwrap();
+            let _ = writeln!(io::stderr(), " Container celtree-web-1 Creating ");
+            let _ = io::stderr().flush();
+            let mut b = [0u8; 1];
+            if io::Read::read_exact(&mut conn, &mut b).is_ok() && b[0] == b'P' {
+                let _ = conn.write_all(b"A");
+                let _ = conn.flush();
+                let _ = io::Read::read(&mut conn, &mut b);
+            }
+            std::process::exit(1);
+        }
+        let wrapper = |gate: &str| {
+            let exe = std::env::current_exe().unwrap();
+            #[cfg(unix)]
+            let mut c = {
+                let mut c = Command::new("sh");
+                c.args(["-c", "\"$KIRI_T_EXE\" cancelling_apply_stops_the_compose_plugin_tree --nocapture; exit $?", "sh"]);
+                c
+            };
+            #[cfg(windows)]
+            let mut c = {
+                use std::os::windows::process::CommandExt as _;
+                let mut c = Command::new("cmd");
+                c.args(["/d", "/c"]).raw_arg("\"%KIRI_T_EXE%\" cancelling_apply_stops_the_compose_plugin_tree --nocapture");
+                c
+            };
+            c.env("KIRI_T_EXE", exe).env("KIRI_T_PLUGIN_GATE", gate);
+            c
+        };
+
+        // 1. Cancel during `up`: kills wrapper and plugin child, closing inherited pipes immediately.
+        let gate = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = gate.local_addr().unwrap().to_string();
+        UPS.lock().unwrap().insert("celtree".into(), Up::default());
+        let applying = Applying("celtree".into());
+        let (out, err) = spawn_up(wrapper(&addr), "celtree").unwrap();
+        let (mut conn, _) = gate.accept().unwrap();
+        let mut lines = io::BufReader::new(err.unwrap()).lines();
+        assert_eq!(lines.next().unwrap().unwrap(), " Container celtree-web-1 Creating ");
+        assert!(cancel("celtree"));
+        assert!(cancel("celtree"));
+        let _ = conn.write_all(b"P");
+        let _ = conn.flush();
+        let mut ack = [0u8; 1];
+        assert!(!(io::Read::read_exact(&mut conn, &mut ack).is_ok() && ack[0] == b'A'), "compose plugin survived cancel");
+        drop(conn);
+        assert!(lines.next().is_none(), "stderr pipe closed once plugin tree stopped");
+        let mut stdout_rest = String::new();
+        let _ = io::Read::read_to_string(&mut out.unwrap(), &mut stdout_rest);
+        let child = UPS.lock().unwrap().get_mut("celtree").and_then(|u| u.child.take());
+        assert!(child.unwrap().wait().is_ok());
+        drop(applying);
+        assert!(!cancel("celtree"));
+
+        // 2. Cancel arrived while saving (before `spawn_up` registers `child`): stops tree at once.
+        let gate2 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr2 = gate2.local_addr().unwrap().to_string();
+        UPS.lock().unwrap().insert("celtree2".into(), Up { child: None, cancelled: true });
+        let applying2 = Applying("celtree2".into());
+        let (out2, err2) = spawn_up(wrapper(&addr2), "celtree2").unwrap();
+        let mut rest_err = String::new();
+        let mut rest_out = String::new();
+        let _ = io::Read::read_to_string(&mut err2.unwrap(), &mut rest_err);
+        let _ = io::Read::read_to_string(&mut out2.unwrap(), &mut rest_out);
+        drop(applying2);
+        assert!(!cancel("celtree2"));
     }
 
     #[test]
