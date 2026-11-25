@@ -93,22 +93,86 @@ fn home(user: &str) -> String {
     if user == "root" { "/root".to_owned() } else { format!("{HOMES}/{user}") }
 }
 
-fn create(name: &str, pick: &str, systemd: bool) -> io::Result<()> {
-    if !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') || name.starts_with('-') {
-        return Err(io::Error::other("a machine name is letters, digits and dashes"));
+/// A parsed image reference for `kiri machine create`: the full reference
+/// passed to `/images/{ref}/json` and `POST /containers/create`, plus the
+/// `fromImage` and `tag` query values for `POST /images/create` when pulling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MachineImage {
+    full: String,
+    from_image: String,
+    tag: String,
+}
+
+impl MachineImage {
+    fn inspect_path(&self) -> String {
+        format!("/images/{}/json", percent_encode_image_ref(&self.full))
     }
+
+    fn pull_path(&self) -> String {
+        format!("/images/create?fromImage={}&tag={}", urlish(&self.from_image), urlish(&self.tag))
+    }
+}
+
+fn percent_encode_image_ref(reference: &str) -> String {
+    urlish(reference)
+}
+
+fn parse_machine_image(pick: &str) -> MachineImage {
     let image = DISTROS.iter().find(|(d, _)| *d == pick).map_or(pick, |(_, i)| *i);
+    if let Some((repo, digest)) = image.split_once('@').filter(|(_, d)| d.starts_with("sha256:")) {
+        // Strip an optional `:tag` label before `@sha256:...` for `fromImage`,
+        // keeping any registry `:port` before the last `/`.
+        let from_image = match repo.rsplit_once(':') {
+            Some((r, t)) if !t.contains('/') && !t.is_empty() => r,
+            _ => repo,
+        };
+        return MachineImage {
+            full: image.to_owned(),
+            from_image: from_image.to_owned(),
+            tag: digest.to_owned(),
+        };
+    }
     let (repo, tag) = match image.rsplit_once(':') {
-        Some((r, t)) if !t.contains('/') => (r, t),
+        Some((r, t)) if !t.contains('/') && !t.is_empty() => (r, t),
         _ => (image, "latest"),
     };
-    println!("pulling {repo}:{tag}…");
-    let pulled = ok(client::request("POST", &format!("/images/create?fromImage={repo}&tag={tag}"), None))?;
-    if let Some(e) = String::from_utf8_lossy(&pulled.body).lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok()).find_map(|v| v["error"].as_str().map(str::to_owned)) {
+    MachineImage {
+        full: format!("{repo}:{tag}"),
+        from_image: repo.to_owned(),
+        tag: tag.to_owned(),
+    }
+}
+
+/// Ensures `image` is present in the daemon's image store, matching
+/// `docker run --pull=missing`: probes `GET /images/{ref}/json` first and only
+/// pulls via `POST /images/create` on `404`. Returns `Ok(true)` if it pulled,
+/// or `Ok(false)` if the image was already local.
+fn ensure_machine_image_with<F, P>(image: &MachineImage, mut req: F, mut on_pull: P) -> io::Result<bool>
+where
+    F: FnMut(&str, &str, Option<&serde_json::Value>) -> io::Result<client::Response>,
+    P: FnMut(&str),
+{
+    let probe = req("GET", &image.inspect_path(), None)?;
+    if probe.status == 200 {
+        return Ok(false);
+    }
+    if probe.status != 404 {
+        return Err(io::Error::other(probe.error()));
+    }
+    on_pull(&image.full);
+    let pulled = ok(req("POST", &image.pull_path(), None))?;
+    if let Some(e) = String::from_utf8_lossy(&pulled.body)
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find_map(|v| v["error"].as_str().map(str::to_owned))
+    {
         return Err(io::Error::other(e));
     }
-    let (user, uid, gid) = user();
-    let home = home(&user);
+    Ok(true)
+}
+
+fn create_body_for(name: &str, image: &str, user: &str, uid: u32, gid: u32, systemd: bool) -> serde_json::Value {
+    let home = home(user);
     // The host user, made once; every distro has one of these tools. An
     // image user that already has the uid (Ubuntu's `ubuntu` is 1000, the
     // first user's uid on most Linux hosts) is renamed to the host user.
@@ -132,7 +196,7 @@ command -v sudo >/dev/null 2>&1 || (apt-get update -qq && DEBIAN_FRONTEND=nonint
         }
     );
     let mut body = json!({
-        "Image": format!("{repo}:{tag}"),
+        "Image": image,
         "Cmd": ["/bin/sh", "-c", init],
         "Hostname": name,
         "Labels": {LABEL: name},
@@ -143,21 +207,51 @@ command -v sudo >/dev/null 2>&1 || (apt-get update -qq && DEBIAN_FRONTEND=nonint
         },
     });
     if systemd {
-        // systemd needs its own cgroup tree, tmpfs /run and /tmp, and stops
-        // on SIGRTMIN+3.
+        // systemd needs its own cgroup tree, tmpfs /run and /tmp (with exec so
+        // scripts and helpers in /tmp and /run can run instead of inheriting
+        // Docker's default noexec tmpfs flag), and stops on SIGRTMIN+3.
         body["StopSignal"] = "SIGRTMIN+3".into();
         body["Env"] = json!(["container=docker"]);
         body["HostConfig"]["Privileged"] = true.into();
-        body["HostConfig"]["Tmpfs"] = json!({"/run": "", "/run/lock": "", "/tmp": ""});
+        body["HostConfig"]["Tmpfs"] = json!({"/run": "exec", "/run/lock": "", "/tmp": "exec"});
     }
-    ok(client::request("POST", &format!("/containers/create?name={}", container(name)), Some(&body)))?;
-    ok(client::request("POST", &format!("/containers/{}/start", container(name)), None))?;
+    body
+}
+
+fn create_with<Req, Exec, OnPull>(
+    name: &str,
+    pick: &str,
+    systemd: bool,
+    (user, uid, gid): (&str, u32, u32),
+    mut req: Req,
+    mut exec: Exec,
+    on_pull: OnPull,
+) -> io::Result<String>
+where
+    Req: FnMut(&str, &str, Option<&serde_json::Value>) -> io::Result<client::Response>,
+    Exec: FnMut(&str, &[&str]) -> io::Result<(i64, String)>,
+    OnPull: FnMut(&str),
+{
+    if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') || name.starts_with('-') {
+        return Err(io::Error::other("a machine name is letters, digits and dashes"));
+    }
+    let image = parse_machine_image(pick);
+    ensure_machine_image_with(&image, &mut req, on_pull)?;
+    let body = create_body_for(name, &image.full, user, uid, gid, systemd);
+    ok(req("POST", &format!("/containers/create?name={}", container(name)), Some(&body)))?;
+    ok(req("POST", &format!("/containers/{}/start", container(name)), None))?;
     // The user is made by the machine's own first command: wait for it, or
     // a `machine shell` straight after was "unknown user" (seen on Fedora).
     let wait = format!("for i in $(seq 300); do id -u {user} >/dev/null 2>&1 && exit 0; sleep 0.1; done; exit 1");
-    if client::exec(&container(name), &["sh", "-c", &wait])?.0 != 0 {
+    if exec(&container(name), &["sh", "-c", &wait])?.0 != 0 {
         return Err(io::Error::other(format!("machine {name} is running, but the user {user} could not be added to it")));
     }
+    Ok(image.full)
+}
+
+fn create(name: &str, pick: &str, systemd: bool) -> io::Result<()> {
+    let (user, uid, gid) = user();
+    let image = create_with(name, pick, systemd, (&user, uid, gid), client::request, client::exec, |img| println!("pulling {img}…"))?;
     println!("machine {name} ({image}) is running: kiri machine shell {name}");
     Ok(())
 }
@@ -204,4 +298,256 @@ fn shell(name: &str, cmd: &[&str]) -> io::Result<()> {
         std::process::exit(status.code().unwrap_or(1));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn resp(status: u16, body: &[u8]) -> client::Response {
+        client::Response { status, body: body.to_vec() }
+    }
+
+    #[test]
+    fn parse_machine_image_handles_distros_tags_ports_and_digests() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let cases = [
+            ("ubuntu", "ubuntu:24.04", "ubuntu", "24.04", "/images/ubuntu%3A24.04/json", "/images/create?fromImage=ubuntu&tag=24.04"),
+            (
+                "opensuse",
+                "opensuse/tumbleweed:latest",
+                "opensuse/tumbleweed",
+                "latest",
+                "/images/opensuse%2Ftumbleweed%3Alatest/json",
+                "/images/create?fromImage=opensuse%2Ftumbleweed&tag=latest",
+            ),
+            ("pmb-copy", "pmb-copy:latest", "pmb-copy", "latest", "/images/pmb-copy%3Alatest/json", "/images/create?fromImage=pmb-copy&tag=latest"),
+            ("pmb-copy:latest", "pmb-copy:latest", "pmb-copy", "latest", "/images/pmb-copy%3Alatest/json", "/images/create?fromImage=pmb-copy&tag=latest"),
+            (
+                "ghcr.io/org/devbox:1",
+                "ghcr.io/org/devbox:1",
+                "ghcr.io/org/devbox",
+                "1",
+                "/images/ghcr.io%2Forg%2Fdevbox%3A1/json",
+                "/images/create?fromImage=ghcr.io%2Forg%2Fdevbox&tag=1",
+            ),
+            (
+                "localhost:5000/pmb:latest",
+                "localhost:5000/pmb:latest",
+                "localhost:5000/pmb",
+                "latest",
+                "/images/localhost%3A5000%2Fpmb%3Alatest/json",
+                "/images/create?fromImage=localhost%3A5000%2Fpmb&tag=latest",
+            ),
+            (
+                "localhost:5000/pmb",
+                "localhost:5000/pmb:latest",
+                "localhost:5000/pmb",
+                "latest",
+                "/images/localhost%3A5000%2Fpmb%3Alatest/json",
+                "/images/create?fromImage=localhost%3A5000%2Fpmb&tag=latest",
+            ),
+        ];
+        for (pick, full, from, tag, inspect, pull) in cases {
+            let parsed = parse_machine_image(pick);
+            assert_eq!(parsed.full, full, "{pick}");
+            assert_eq!(parsed.from_image, from, "{pick}");
+            assert_eq!(parsed.tag, tag, "{pick}");
+            assert_eq!(parsed.inspect_path(), inspect, "{pick}");
+            assert_eq!(parsed.pull_path(), pull, "{pick}");
+            assert!(kiri_image::Reference::parse(&parsed.full).is_ok(), "{pick}");
+        }
+
+        // Digest references: bare repo@sha256:..., tag+digest, and registry:port@sha256:...
+        let digest_cases = [
+            (format!("org/box@{digest}"), "org/box"),
+            (format!("ghcr.io/org/box:v1@{digest}"), "ghcr.io/org/box"),
+            (format!("localhost:5000/org/box@{digest}"), "localhost:5000/org/box"),
+        ];
+        for (pick, expected_from) in digest_cases {
+            let parsed = parse_machine_image(&pick);
+            assert_eq!(parsed.full, pick);
+            assert_eq!(parsed.from_image, expected_from);
+            assert_eq!(parsed.tag, digest);
+            assert_eq!(parsed.inspect_path(), format!("/images/{}/json", urlish(&pick)));
+            assert_eq!(parsed.pull_path(), format!("/images/create?fromImage={}&tag={}", urlish(expected_from), urlish(&digest)));
+            assert!(kiri_image::Reference::parse(&parsed.full).is_ok(), "{pick}");
+            // Matches daemon/api.rs `pull()` reconstruction for `sha256:` tags.
+            let daemon_pull_name = format!("{}@{}", parsed.from_image, parsed.tag);
+            assert!(kiri_image::Reference::parse(&daemon_pull_name).is_ok(), "{daemon_pull_name}");
+        }
+    }
+
+    #[test]
+    fn local_image_skips_pull_and_creates_container_immediately() {
+        let digest = format!("sha256:{}", "b".repeat(64));
+        let digest_ref = format!("org/box@{digest}");
+        let digest_inspect = format!("/images/{}/json", urlish(&digest_ref));
+        for (pick, expected_image, expected_inspect) in [
+            ("pmb-copy:latest", "pmb-copy:latest", "/images/pmb-copy%3Alatest/json"),
+            ("pmb-copy", "pmb-copy:latest", "/images/pmb-copy%3Alatest/json"),
+            ("ghcr.io/org/devbox:1", "ghcr.io/org/devbox:1", "/images/ghcr.io%2Forg%2Fdevbox%3A1/json"),
+            ("localhost:5000/pmb:latest", "localhost:5000/pmb:latest", "/images/localhost%3A5000%2Fpmb%3Alatest/json"),
+            (digest_ref.as_str(), digest_ref.as_str(), digest_inspect.as_str()),
+        ] {
+            let mut calls: Vec<(String, String, Option<serde_json::Value>)> = Vec::new();
+            let mut pulled_notices: Vec<String> = Vec::new();
+            let created_image = create_with(
+                "devbox",
+                pick,
+                true,
+                ("alice", 1000, 1000),
+                |method, path, body| {
+                    calls.push((method.to_owned(), path.to_owned(), body.cloned()));
+                    match (method, path) {
+                        ("GET", p) if p == expected_inspect => Ok(resp(200, br#"{"Id":"sha256:local"}"#)),
+                        ("POST", "/containers/create?name=machine-devbox") => Ok(resp(201, br#"{"Id":"c1"}"#)),
+                        ("POST", "/containers/machine-devbox/start") => Ok(resp(204, b"")),
+                        other => panic!("unexpected daemon call for {pick}: {other:?}"),
+                    }
+                },
+                |cname, _| {
+                    assert_eq!(cname, "machine-devbox");
+                    Ok((0, String::new()))
+                },
+                |img| pulled_notices.push(img.to_owned()),
+            )
+            .unwrap();
+
+            assert_eq!(created_image, expected_image);
+            assert!(pulled_notices.is_empty(), "must not announce pulling when image is local: {pick}");
+            assert!(!calls.iter().any(|(m, p, _)| m == "POST" && p.starts_with("/images/create")), "must skip /images/create: {calls:?}");
+            assert_eq!(calls.len(), 3, "{calls:?}");
+            assert_eq!((calls[0].0.as_str(), calls[0].1.as_str()), ("GET", expected_inspect));
+            assert_eq!((calls[1].0.as_str(), calls[1].1.as_str()), ("POST", "/containers/create?name=machine-devbox"));
+            let create_body = calls[1].2.as_ref().unwrap();
+            assert_eq!(create_body["Image"], expected_image);
+            assert_eq!(create_body["HostConfig"]["Tmpfs"], json!({"/run": "exec", "/run/lock": "", "/tmp": "exec"}));
+            assert_eq!((calls[2].0.as_str(), calls[2].1.as_str()), ("POST", "/containers/machine-devbox/start"));
+        }
+    }
+
+    #[test]
+    fn missing_image_pulls_on_404_and_surfaces_errors() {
+        // 1. 404 -> pulls via POST /images/create and creates container.
+        let image = parse_machine_image("ghcr.io/org/devbox:1");
+        let mut calls = Vec::new();
+        let mut pulled_notices = Vec::new();
+        let pulled = ensure_machine_image_with(
+            &image,
+            |method, path, _| {
+                calls.push((method.to_owned(), path.to_owned()));
+                match (method, path) {
+                    ("GET", "/images/ghcr.io%2Forg%2Fdevbox%3A1/json") => Ok(resp(404, br#"{"message":"No such image"}"#)),
+                    ("POST", "/images/create?fromImage=ghcr.io%2Forg%2Fdevbox&tag=1") => {
+                        Ok(resp(200, b"{\"status\":\"Pulling from org/devbox\"}\n{\"status\":\"Status: Downloaded newer image\"}\n"))
+                    }
+                    other => panic!("unexpected call: {other:?}"),
+                }
+            },
+            |img| pulled_notices.push(img.to_owned()),
+        )
+        .unwrap();
+        assert!(pulled);
+        assert_eq!(pulled_notices, vec!["ghcr.io/org/devbox:1"]);
+        assert_eq!(
+            calls,
+            vec![
+                ("GET".to_owned(), "/images/ghcr.io%2Forg%2Fdevbox%3A1/json".to_owned()),
+                ("POST".to_owned(), "/images/create?fromImage=ghcr.io%2Forg%2Fdevbox&tag=1".to_owned()),
+            ]
+        );
+
+        // 2. Pull stream JSON error is surfaced.
+        let err = ensure_machine_image_with(
+            &image,
+            |method, _, _| match method {
+                "GET" => Ok(resp(404, br#"{"message":"No such image"}"#)),
+                "POST" => Ok(resp(200, b"{\"status\":\"Pulling\"}\n{\"error\":\"pull access denied for ghcr.io/org/devbox\"}\n")),
+                _ => unreachable!(),
+            },
+            |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(err.to_string(), "pull access denied for ghcr.io/org/devbox");
+
+        // 3. Non-2xx pull HTTP error is surfaced.
+        let err = ensure_machine_image_with(
+            &image,
+            |method, _, _| match method {
+                "GET" => Ok(resp(404, br#"{"message":"No such image"}"#)),
+                "POST" => Ok(resp(400, br#"{"message":"invalid image reference"}"#)),
+                _ => unreachable!(),
+            },
+            |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(err.to_string(), "invalid image reference");
+
+        // 4. Transport error on GET fails immediately without pulling.
+        let mut pull_called = false;
+        let err = ensure_machine_image_with(
+            &image,
+            |method, _, _| {
+                assert_eq!(method, "GET");
+                Err(io::Error::new(io::ErrorKind::ConnectionRefused, "daemon gone"))
+            },
+            |_| pull_called = true,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused);
+        assert!(!pull_called);
+
+        // 5. Unexpected non-404 status on GET fails without attempting to pull.
+        let err = ensure_machine_image_with(
+            &image,
+            |method, _, _| {
+                assert_eq!(method, "GET");
+                Ok(resp(500, br#"{"message":"image store unreadable"}"#))
+            },
+            |_| pull_called = true,
+        )
+        .unwrap_err();
+        assert_eq!(err.to_string(), "image store unreadable");
+        assert!(!pull_called);
+    }
+
+    #[test]
+    fn systemd_create_body_sets_exec_tmpfs_and_systemd_options() {
+        let sd = create_body_for("dev", "ubuntu:24.04", "alice", 1000, 1000, true);
+        assert_eq!(sd["Image"], "ubuntu:24.04");
+        assert_eq!(sd["Hostname"], "dev");
+        assert_eq!(sd["Labels"], json!({LABEL: "dev"}));
+        assert_eq!(sd["StopSignal"], "SIGRTMIN+3");
+        assert_eq!(sd["Env"], json!(["container=docker"]));
+        assert_eq!(sd["HostConfig"]["Privileged"], true);
+        assert_eq!(sd["HostConfig"]["Tmpfs"], json!({"/run": "exec", "/run/lock": "", "/tmp": "exec"}));
+        assert_eq!(sd["HostConfig"]["Binds"], json!([format!("{HOMES}:{HOMES}")]));
+        assert_eq!(sd["HostConfig"]["CapAdd"], json!(["NET_ADMIN", "SYS_PTRACE"]));
+        assert!(sd["Cmd"][2].as_str().unwrap().contains("/lib/systemd/systemd"));
+
+        let plain = create_body_for("dev", "ubuntu:24.04", "alice", 1000, 1000, false);
+        assert!(plain["StopSignal"].is_null());
+        assert!(plain["Env"].is_null());
+        assert!(plain["HostConfig"]["Privileged"].is_null());
+        assert!(plain["HostConfig"]["Tmpfs"].is_null());
+        assert!(plain["Cmd"][2].as_str().unwrap().contains("sleep 3600"));
+    }
+
+    #[test]
+    fn create_with_rejects_invalid_names_before_talking_to_daemon() {
+        for bad in ["", "-leading", "bad_name!", "with space"] {
+            let err = create_with(
+                bad,
+                "ubuntu",
+                false,
+                ("alice", 1000, 1000),
+                |_, _, _| panic!("daemon must not be called for invalid name {bad:?}"),
+                |_, _| panic!("exec must not be called"),
+                |_| panic!("pull must not be called"),
+            )
+            .unwrap_err();
+            assert_eq!(err.to_string(), "a machine name is letters, digits and dashes");
+        }
+    }
 }

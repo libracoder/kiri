@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #935 Machines: use local images before pulling and mount `--systemd` `/tmp` and `/run` with `exec` (unreleased)
+- Fixes: #935 `kiri machine create`: `--systemd` machines get a `noexec` `/tmp`, and `--image` always pulls instead of using a local image
+- Caused: none known
+- Caused by: -
+- Check: `crates/kiri/src/machine.rs`
+
 ### #934 Guest kernel: enable ext2/ext3 and FAT/vfat for loop-mounted disk images (unreleased)
 - Fixes: #934 Guest kernel has no ext2 or FAT/vfat, so loop-mounted disk images can't be mounted (`pmbootstrap install`, SD-card/EFI images)
 - Caused: none known

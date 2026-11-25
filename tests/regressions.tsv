@@ -352,3 +352,4 @@ bind-chown-chmod	#382	chown on a macOS virtiofs bind mount returned 0 while leav
 crates/kiri/src/vm_cli.rs	#473	macOS low ports (<1024) on 127.0.0.1/::1 failed without root instead of falling back to dual-stack with strict loopback peer filtering, and macOS VM had no shared_nat=false option (`kiri vm set --shared-nat off`) to omit VZNATNetworkDeviceAttachment and route egress/DNS over vsock under Cloudflare WARP (#383) or non-DF firewall drops (#350)
 finder-mount-nobrowse	#929	Finder showed an automatic < sidebar entry for the local NFS socket mount
 guest-kernel-ext2-vfat	#934	guest kernel lacked CONFIG_EXT4_USE_FOR_EXT2 and CONFIG_VFAT_FS so loop-mounted ext2 and FAT/EFI disk images failed to mount
+crates/kiri/src/machine.rs	#935	kiri machine create always pulled --image instead of probing local images first, and --systemd machines mounted /tmp and /run with noexec
