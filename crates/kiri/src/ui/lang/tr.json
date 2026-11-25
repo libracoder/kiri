@@ -2033,5 +2033,7 @@
   "Could not update shell profiles: {error}": "Kabuk profilleri güncellenemedi: {error}",
   "Uninstalling Kiri…": "Kiri kaldırılıyor…",
   "Could not uninstall Kiri: {error}": "Kiri kaldırılamadı: {error}",
-  "Uninstall Kiri using your system package manager": "Kiri'yi sistem paket yöneticinizi kullanarak kaldırın"
+  "Uninstall Kiri using your system package manager": "Kiri'yi sistem paket yöneticinizi kullanarak kaldırın",
+  "Swap": "Takas (swap)",
+  "Disk space the VM may use when its memory runs out, so containers slow down instead of being stopped. Applies on restart.": "VM'nin belleği tükendiğinde kullanabileceği disk alanı; böylece kapsayıcılar durdurulmak yerine yavaşlar. Yeniden başlatınca uygulanır."
 }

@@ -1938,6 +1938,18 @@ t limit-memory-swap-refused "nomem=ok small=ok over=ok" bash -c "
   echo \"nomem=\$nm small=\$sm over=\$ov\"
 "
 t oom-kill "137" bash -c "$D run --rm --memory 32m alpine sh -c 'tail /dev/zero' >/dev/null 2>&1; echo \$?"
+# The VM has the swap Settings → Resources names, on its data disk, and a
+# container's --memory-swap reaches it: zswap's shrinker moves the pages on
+# to the file rather than keeping them in the container's memory (#326).
+only mac t vm-swap-as-set "ok" bash -c "
+  want=\$(curl -s --unix-socket '$SOCK' http://d/kiri/resources | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"running_swap_mib\"])')
+  got=\$($D run --rm alpine awk 'NR>1 && \$1==\"/var/lib/kiri/swapfile\" {print int((\$3+4)/1024)}' /proc/swaps)
+  [ \"\${got:-0}\" = \"\$want\" ] && echo ok || echo \"swap \${got:-none} MiB, resources say \$want\"
+"
+only mac t vm-swap-container-over-memory "dd=0 oom_kill=0" bash -c "
+  [ \"\$(curl -s --unix-socket '$SOCK' http://d/kiri/resources | python3 -c 'import json,sys; print(json.load(sys.stdin).get(\"running_swap_mib\", 1024))')\" -ge 256 ] || { echo 'dd=0 oom_kill=0 (the VM has less than 256 MiB of swap: nothing to check)'; exit; }
+  $D run --rm -m 64m --memory-swap 512m --tmpfs /t:size=400m alpine sh -c 'dd if=/dev/urandom of=/t/x bs=1M count=200 2>/dev/null; echo \"dd=\$? oom_kill=\$(grep oom_kill /sys/fs/cgroup/memory.events | cut -d\" \" -f2)\"'
+"
 t stats "128MiB" $D stats --no-stream --format '{{.MemUsage}}' lim
 t stats-pids "PIDS" $D stats --no-stream lim
 t stats-stream "lim" bash -c "perl -e 'alarm 3; exec @ARGV' $D stats --format '{{.Name}}' lim 2>/dev/null | head -1"

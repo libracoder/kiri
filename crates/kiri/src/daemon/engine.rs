@@ -427,6 +427,20 @@ pub fn shared_nat() -> bool {
     shared_nat_for(env.as_deref(), vm_shared_nat_config())
 }
 
+/// The most swap Settings → Resources offers, in MiB.
+pub const MAX_SWAP_MIB: u64 = 16 << 10;
+
+/// The VM's swap file on its data disk, in MiB (#326): `KIRI_SWAP_MIB`,
+/// else Settings → Resources (`vm.json`'s `swap_mib`), else 1 GiB, as
+/// Docker Desktop has. 0 is no swap.
+pub fn vm_swap_mib() -> u64 {
+    swap_mib_for(std::env::var("KIRI_SWAP_MIB").ok().as_deref(), resources()["swap_mib"].as_u64())
+}
+
+pub fn swap_mib_for(env: Option<&str>, configured: Option<u64>) -> u64 {
+    env.and_then(|v| v.trim().parse().ok()).or(configured).unwrap_or(1024).min(MAX_SWAP_MIB)
+}
+
 /// Configured `balloon` from `vm.json`, if present.
 pub fn vm_balloon_config() -> Option<bool> {
     resources()["balloon"].as_bool()
@@ -1687,6 +1701,8 @@ pub struct Engine {
     cpus: std::sync::atomic::AtomicUsize,
     /// Data disk capacity in GiB the running VM booted with (macOS).
     disk_gb: std::sync::atomic::AtomicU64,
+    /// Swap in MiB the running VM booted with (macOS).
+    swap_mib: std::sync::atomic::AtomicU64,
     /// Whether the running macOS VM booted with `VZNATNetworkDeviceAttachment`.
     shared_nat: std::sync::atomic::AtomicBool,
     /// Whether the running macOS VM dynamically adjusts its memory balloon
@@ -1863,6 +1879,7 @@ impl Engine {
             ceiling: std::sync::atomic::AtomicU64::new(ceiling),
             cpus: std::sync::atomic::AtomicUsize::new(vm_cpus()),
             disk_gb: std::sync::atomic::AtomicU64::new(vm_disk_gb()),
+            swap_mib: std::sync::atomic::AtomicU64::new(vm_swap_mib()),
             shared_nat: std::sync::atomic::AtomicBool::new(shared_nat()),
             balloon_enabled: std::sync::atomic::AtomicBool::new(balloon_enabled()),
             memory_min: std::sync::atomic::AtomicU64::new(memory_min_bytes(ceiling)),
@@ -2040,10 +2057,11 @@ impl Engine {
         if recovery && !self.lock().containers.values().any(recover_after_vm_loss) {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "VM recovery was canceled"));
         }
-        let (ceiling, cpus, disk_cfg, shared_nat, balloon) = (memory_ceiling(), vm_cpus(), vm_disk_gb_config(), shared_nat(), balloon_enabled());
+        let (ceiling, cpus, disk_cfg, shared_nat, balloon, swap) = (memory_ceiling(), vm_cpus(), vm_disk_gb_config(), shared_nat(), balloon_enabled(), vm_swap_mib());
         let memory_min = memory_min_bytes(ceiling);
         self.ceiling.store(ceiling, std::sync::atomic::Ordering::Relaxed);
         self.cpus.store(cpus, std::sync::atomic::Ordering::Relaxed);
+        self.swap_mib.store(swap, std::sync::atomic::Ordering::Relaxed);
         self.shared_nat.store(shared_nat, std::sync::atomic::Ordering::Relaxed);
         self.balloon_enabled.store(balloon, std::sync::atomic::Ordering::Relaxed);
         self.memory_min.store(memory_min, std::sync::atomic::Ordering::Relaxed);
@@ -2058,6 +2076,7 @@ impl Engine {
             cpus: Some(cpus),
             disk_gb: disk_cfg,
             shared_nat: Some(shared_nat),
+            swap_mib: Some(swap),
             ..Default::default()
         })
         .map_err(|e| match self.storage_readonly() {
@@ -2665,6 +2684,11 @@ impl Engine {
     /// Data disk capacity in GiB the VM has (or will boot with).
     pub fn disk_gb(&self) -> u64 {
         self.disk_gb.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Swap in MiB the VM has (or will boot with).
+    pub fn swap_mib(&self) -> u64 {
+        self.swap_mib.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Whether the running macOS VM booted with `VZNATNetworkDeviceAttachment`.
@@ -6512,7 +6536,7 @@ mod memory_target_tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        balloon_enabled_for, boot_without_vm, estimate_used, memory_floor, memory_headroom, memory_min_bytes_for, next_memory_target, BalloonPolicy,
+        balloon_enabled_for, boot_without_vm, swap_mib_for, MAX_SWAP_MIB, estimate_used, memory_floor, memory_headroom, memory_min_bytes_for, next_memory_target, BalloonPolicy,
         BalloonState, MemorySample, MEMORY_DEADBAND, MEMORY_FLOOR_ACTIVE_MIN, MEMORY_FLOOR_IDLE, MEMORY_GROW, MEMORY_HEADROOM_MAX,
         MEMORY_HEADROOM_MIN, MEMORY_SHRINK_STEP, SHRINK_COOLDOWN, WS_PEAK_DECAY_INTERVAL, WS_PEAK_DECAY_STEP,
     };
@@ -7101,6 +7125,19 @@ mod memory_target_tests {
         assert_eq!(settle_guest_with(pinned_4g, MEM_TOTAL, USED, 200 * MIB, None), 4 * GIB);
         let clamped_ceiling = BalloonPolicy { ceiling: CEILING, active_containers: 0, memory_min: memory_min_bytes_for(Some(16_384), CEILING) };
         assert_eq!(settle_guest_with(clamped_ceiling, MEM_TOTAL, USED, 200 * MIB, None), CEILING);
+    }
+
+    /// The VM's swap (#326): `KIRI_SWAP_MIB`, else `vm.json`, else 1 GiB
+    /// as in Docker Desktop, never above the most Settings offers.
+    #[test]
+    fn swap_is_the_environment_then_the_setting_then_one_gib() {
+        assert_eq!(swap_mib_for(None, None), 1024);
+        assert_eq!(swap_mib_for(None, Some(0)), 0);
+        assert_eq!(swap_mib_for(None, Some(4096)), 4096);
+        assert_eq!(swap_mib_for(Some("512"), Some(4096)), 512);
+        assert_eq!(swap_mib_for(Some(" 0 "), None), 0);
+        assert_eq!(swap_mib_for(Some("lots"), Some(2048)), 2048, "an unreadable variable is ignored");
+        assert_eq!(swap_mib_for(None, Some(1 << 30)), MAX_SWAP_MIB);
     }
 
     /// `"balloon": false` in `vm.json` and `KIRI_NO_BALLOON=1` disable

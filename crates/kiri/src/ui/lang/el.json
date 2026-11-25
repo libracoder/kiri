@@ -2033,5 +2033,7 @@
   "Could not update shell profiles: {error}": "Δεν ήταν δυνατή η ενημέρωση των προφίλ κελύφους: {error}",
   "Uninstalling Kiri…": "Απεγκατάσταση Kiri…",
   "Could not uninstall Kiri: {error}": "Δεν ήταν δυνατή η απεγκατάσταση του Kiri: {error}",
-  "Uninstall Kiri using your system package manager": "Απεγκαταστήστε το Kiri μέσω του διαχειριστή πακέτων του συστήματός σας"
+  "Uninstall Kiri using your system package manager": "Απεγκαταστήστε το Kiri μέσω του διαχειριστή πακέτων του συστήματός σας",
+  "Swap": "Swap",
+  "Disk space the VM may use when its memory runs out, so containers slow down instead of being stopped. Applies on restart.": "Χώρος στον δίσκο που μπορεί να χρησιμοποιήσει η VM όταν εξαντληθεί η μνήμη της, ώστε τα containers να επιβραδύνονται αντί να σταματούν. Εφαρμόζεται κατά την επανεκκίνηση."
 }

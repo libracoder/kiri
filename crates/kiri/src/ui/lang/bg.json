@@ -2033,5 +2033,7 @@
   "Could not update shell profiles: {error}": "Неуспешно обновяване на профилите на обвивката: {error}",
   "Uninstalling Kiri…": "Деинсталиране на Kiri…",
   "Could not uninstall Kiri: {error}": "Неуспешно деинсталиране на Kiri: {error}",
-  "Uninstall Kiri using your system package manager": "Деинсталирайте Kiri чрез пакетния мениджър на системата си"
+  "Uninstall Kiri using your system package manager": "Деинсталирайте Kiri чрез пакетния мениджър на системата си",
+  "Swap": "Swap",
+  "Disk space the VM may use when its memory runs out, so containers slow down instead of being stopped. Applies on restart.": "Дисково пространство, което VM може да използва, когато паметта ѝ свърши, така че контейнерите да се забавят, вместо да бъдат спрени. Прилага се при рестартиране."
 }

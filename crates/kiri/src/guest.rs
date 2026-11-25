@@ -76,6 +76,9 @@ pub struct BootOptions {
     /// Whether to attach `VZNATNetworkDeviceAttachment` (`InternetSharing`) on
     /// macOS (`None` reads `KIRI_SHARED_NAT` / `vm.json`'s `shared_nat`).
     pub shared_nat: Option<bool>,
+    /// The swap file the guest keeps on the data disk, in MiB; 0 removes
+    /// it, and `None` leaves it as it is.
+    pub swap_mib: Option<u64>,
 }
 
 fn console_output(opts: &BootOptions) -> io::Result<Option<OwnedFd>> {
@@ -180,6 +183,10 @@ impl Guest {
         } else if !opts.console {
             // Keep warnings and oopses even in release builds.
             cmdline.push_str(" quiet loglevel=4");
+        }
+        // How much swap the agent keeps on the data disk (#326).
+        if let Some(mib) = opts.swap_mib.filter(|_| opts.data_disk) {
+            cmdline.push_str(&format!(" kiri.swap={mib}"));
         }
         let shared_nat = opts.shared_nat.unwrap_or_else(crate::daemon::engine::shared_nat);
         let cfg = Config {

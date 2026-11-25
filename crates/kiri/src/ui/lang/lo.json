@@ -2033,5 +2033,7 @@
   "Could not update shell profiles: {error}": "ອັບເດດໂປຣໄຟລ໌ shell ບໍ່ໄດ້: {error}",
   "Uninstalling Kiri…": "ກຳລັງຖອນການຕິດຕັ້ງ Kiri…",
   "Could not uninstall Kiri: {error}": "ຖອນການຕິດຕັ້ງ Kiri ບໍ່ໄດ້: {error}",
-  "Uninstall Kiri using your system package manager": "ຖອນການຕິດຕັ້ງ Kiri ໂດຍໃຊ້ຕົວຈັດການແພັກເກັດຂອງລະບົບທ່ານ"
+  "Uninstall Kiri using your system package manager": "ຖອນການຕິດຕັ້ງ Kiri ໂດຍໃຊ້ຕົວຈັດການແພັກເກັດຂອງລະບົບທ່ານ",
+  "Swap": "ສະວັບ",
+  "Disk space the VM may use when its memory runs out, so containers slow down instead of being stopped. Applies on restart.": "ພື້ນທີ່ດິສກ໌ທີ່ VM ໃຊ້ໄດ້ເມື່ອໜ່ວຍຄວາມຈຳໝົດ ເພື່ອໃຫ້ຄອນເທນເນີຊ້າລົງແທນທີ່ຈະຖືກຢຸດ. ມີຜົນເມື່ອເລີ່ມໃໝ່."
 }

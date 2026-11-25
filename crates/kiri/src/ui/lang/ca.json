@@ -2033,5 +2033,7 @@
   "Could not update shell profiles: {error}": "No s'han pogut actualitzar els perfils de l'intèrpret: {error}",
   "Uninstalling Kiri…": "S'està desinstal·lant Kiri…",
   "Could not uninstall Kiri: {error}": "No s'ha pogut desinstal·lar Kiri: {error}",
-  "Uninstall Kiri using your system package manager": "Desinstal·la Kiri amb el gestor de paquets del sistema"
+  "Uninstall Kiri using your system package manager": "Desinstal·la Kiri amb el gestor de paquets del sistema",
+  "Swap": "Intercanvi (swap)",
+  "Disk space the VM may use when its memory runs out, so containers slow down instead of being stopped. Applies on restart.": "Espai de disc que la VM pot fer servir quan se li acaba la memòria, perquè els contenidors s’alenteixin en lloc d’aturar-se. S’aplica en reiniciar."
 }

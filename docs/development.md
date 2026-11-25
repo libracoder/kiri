@@ -79,6 +79,11 @@ removing the setting never shrinks an existing disk. The extra capacity uses
 space on the Mac only as it is written. Linux and WSL use their host's storage
 instead of this disk image.
 
+The VM also keeps a swap file on that disk, 1 GiB unless Settings → Resources
+says otherwise (`"swap_mib"` in `~/.kiri/vm.json`, 0 for none) or `KIRI_SWAP_MIB`
+overrides it. The guest makes, resizes or removes `/var/lib/kiri/swapfile` at
+boot; freed swap is discarded, so it too uses space on the Mac only while in use.
+
 `python3 tests/disk-grow.py` checks growth and data preservation across
 restarts in a disposable VM, after building the host and guest above.
 

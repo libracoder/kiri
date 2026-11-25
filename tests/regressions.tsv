@@ -363,3 +363,5 @@ crates/kiri-init/src/linux/dns.rs	#932	IPv4-only container networks forwarded ex
 tests/ui/volumes-size.js	#936	Volumes view did not show each volume's disk size, and loading sizes synchronously or via GET /system/df could stall list refreshes or wake a sleeping VM
 crates/kiri/src/builds.rs	#923	a running build's steps were read with `buildx history logs`, which follows the build until it ends: the Builds pane stayed on "Loading the steps..." and each 2 s ask left a docker and buildx process running
 tests/ui/builds-running.js	#923	the Builds view asked for a running build's steps on every tick, not once the last ask was answered
+vm-swap-as-set	#326	the VM had no swap, so a container that outgrew the VM's memory was killed instead of slowing down
+vm-swap-container-over-memory	#326	a container over its --memory with --memory-swap room left was killed: the VM had no swap for its pages

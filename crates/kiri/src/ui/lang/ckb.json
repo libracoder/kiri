@@ -2033,5 +2033,7 @@
   "Could not update shell profiles: {error}": "نەتوانرا پرۆفایلەکانی شێڵ نوێ بکرێنەوە: {error}",
   "Uninstalling Kiri…": "سڕینەوەی Kiri…",
   "Could not uninstall Kiri: {error}": "نەتوانرا Kiri بسڕدرێتەوە: {error}",
-  "Uninstall Kiri using your system package manager": "Kiri بە بەڕێوەبەری پاکێجی سیستەمەکەت بسڕەوە"
+  "Uninstall Kiri using your system package manager": "Kiri بە بەڕێوەبەری پاکێجی سیستەمەکەت بسڕەوە",
+  "Swap": "سواپ",
+  "Disk space the VM may use when its memory runs out, so containers slow down instead of being stopped. Applies on restart.": "شوێنی دیسک کە VM دەتوانێت بەکاری بهێنێت کاتێک بیرگەکەی تەواو دەبێت، بۆ ئەوەی کۆنتەینەرەکان خاو ببنەوە لەجیاتی ڕاگیران. لە دەستپێکردنەوەدا جێبەجێ دەبێت."
 }

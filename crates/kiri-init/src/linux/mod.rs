@@ -18,6 +18,7 @@ mod pid1;
 mod relay;
 mod roots;
 mod seccomp;
+mod swap;
 mod sys;
 mod tarnum;
 mod transport;
@@ -676,6 +677,8 @@ fn data_dirs() -> io::Result<container::Paths> {
     // Overlay lower dirs are given relative to the layer store.
     std::env::set_current_dir(&paths.layers)?;
     if disk.is_ok() {
+        // On the data disk only: swap in the tmpfs fallback would be memory.
+        swap::start();
         trim::start(DATA);
     }
     Ok(paths)
