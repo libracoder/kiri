@@ -190,6 +190,7 @@ Kiri's own commands:
 | `kiri usb [list [--json]] \| attach DEVICE \| detach DEVICE` | USB devices for containers (beta) |
 | `kiri build-with [docker \| kiri]` | Which builder `docker build` uses |
 | `kiri update [--check]` | Install the newest release |
+| `kiri doctor [--json]` | Whether Kiri works here, one line per part, and what to run when one doesn't |
 | `kiri diag logs \| report` | Logs, and a report file to send with a bug |
 | `kiri bench [--runs N] [--network none\|bridge]` | Measure container start on your machine |
 | `kiri ui` | Open the window |

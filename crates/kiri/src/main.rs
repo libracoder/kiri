@@ -44,6 +44,9 @@ mod docker;
 #[cfg(any(target_os = "macos", all(target_os = "linux", feature = "window"), test))]
 #[cfg_attr(not(any(target_os = "macos", all(target_os = "linux", feature = "window"))), allow(dead_code))]
 mod dockerctx;
+// `kiri doctor`: whether this installation works (Windows: docker here, the engine in WSL).
+#[cfg(any(unix, windows))]
+mod doctor;
 // `kiri domains`: the container-domain routers' ports (Windows: in WSL).
 #[cfg(unix)]
 mod domains_cli;
@@ -116,6 +119,7 @@ const USAGE_LINES: &[&str] = &[
     "       kiri update [--check]      update Kiri (with a container: docker's update)",
     #[cfg(target_os = "linux")]
     "       kiri update --check        check for a newer Kiri (with a container: docker's update)",
+    "       kiri doctor [--json]       whether Kiri works here, and what to run when a part doesn't",
     "       kiri diag logs [-f] [--ui|--engine|--cli] [--errors] [-n N]",
     "       kiri diag report [--out PATH] [--send]   (a file to send us, tokens taken out)",
     "       kiri PORT [NAME]           share a local port on the internet (same as kiri share PORT)",
@@ -180,6 +184,8 @@ enum Command<'a> {
     BuildWith(&'a [String]),
     #[cfg(unix)]
     Domains(&'a [String]),
+    #[cfg(any(unix, windows))]
+    Doctor(&'a [String]),
     #[cfg(unix)]
     Storage(&'a [String]),
     #[cfg(unix)]
@@ -250,6 +256,8 @@ impl<'a> Command<'a> {
             Some("build-with") => Some(Command::BuildWith(&args[1..])),
             #[cfg(unix)]
             Some("domains") => Some(Command::Domains(&args[1..])),
+            #[cfg(any(unix, windows))]
+            Some("doctor") => Some(Command::Doctor(&args[1..])),
             #[cfg(unix)]
             Some("storage") => Some(Command::Storage(&args[1..])),
             #[cfg(unix)]
@@ -336,6 +344,8 @@ fn main() -> ExitCode {
         Some(Command::BuildWith(rest)) => buildwith::cli(rest),
         #[cfg(unix)]
         Some(Command::Domains(rest)) => domains_cli::run(rest),
+        #[cfg(any(unix, windows))]
+        Some(Command::Doctor(rest)) => doctor::run(rest),
         #[cfg(unix)]
         Some(Command::Storage(rest)) => storage_cli::run(rest),
         #[cfg(unix)]
@@ -497,7 +507,7 @@ mod tests {
     fn usage_lists_only_commands_for_this_os() {
         let help = usage();
         let cmds = advertised_subcommands(&help);
-        for common in ["COMMAND", "start", "domains", "storage", "registry", "scan", "diag", "PORT", "share", "k8s", "usb", "machine"] {
+        for common in ["COMMAND", "start", "doctor", "domains", "storage", "registry", "scan", "diag", "PORT", "share", "k8s", "usb", "machine"] {
             assert!(cmds.contains(&common), "help missing `{common}`:\n{help}");
         }
         assert!(help.contains("kiri storage [status | reclaim]"), "help missing `kiri storage`:\n{help}");

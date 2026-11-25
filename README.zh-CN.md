@@ -188,6 +188,7 @@ Kiri 自有命令：
 | `kiri usb [list [--json]] \| attach DEVICE \| detach DEVICE` | 容器的 USB 设备（beta） |
 | `kiri build-with [docker \| kiri]` | 选择 `docker build` 使用的构建器 |
 | `kiri update [--check]` | 安装最新版本 |
+| `kiri doctor [--json]` | 检查 Kiri 各组件是否正常工作，异常时给出修复命令 |
 | `kiri diag logs \| report` | 日志，以及随 bug 报告提交的报告文件 |
 | `kiri bench [--runs N] [--network none\|bridge]` | 在你的机器上测量容器启动速度 |
 | `kiri ui` | 打开窗口 |
