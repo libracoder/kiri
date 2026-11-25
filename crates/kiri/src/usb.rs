@@ -25,11 +25,13 @@ mod usbip;
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 pub mod sysfs;
 
-const USAGE: &str = "usage: kiri usb [list] | attach DEVICE | detach DEVICE | helper remove\n\
+const USAGE: &str = "usage: kiri usb [list [--json]] | attach DEVICE | detach DEVICE | helper remove\n\
     DEVICE is a location (0x02114000), vendor:product (1532:00d7) or part of the name";
 
 pub fn run(args: &[String]) -> io::Result<()> {
     match (args.first().map(String::as_str), args.get(1)) {
+        // The window's own list: each device's key, name, id, state, paths…
+        (None | Some("list" | "ls" | "--json"), _) if args.iter().any(|a| a == "--json") => list_json(),
         (None | Some("list" | "ls"), _) => list(),
         (Some("attach"), Some(d)) => attach(d),
         (Some("detach"), Some(d)) => detach(d),
@@ -44,6 +46,16 @@ pub fn run(args: &[String]) -> io::Result<()> {
         (Some("fake"), _) => fake::run(&args[1..]),
         _ => Err(io::Error::other(USAGE)),
     }
+}
+
+/// `kiri usb list --json`: the devices as the window's USB view has them.
+fn list_json() -> io::Result<()> {
+    let v = ui_list();
+    if let Some(e) = v["error"].as_str() {
+        return Err(io::Error::other(e.to_owned()));
+    }
+    println!("{}", v["devices"]);
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]

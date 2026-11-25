@@ -10,7 +10,8 @@ use crate::client;
 
 const USAGE: &str = "usage: kiri domains                          the routers' ports, and whether each runs
        kiri domains set [--http N] [--https N]   move them (no restart)
-       kiri domains reset                    back to the ports a start gives (a test copy's: off)";
+       kiri domains reset                    back to the ports a start gives (a test copy's: off)
+       --json, with any of them, prints the engine's answer as one line of JSON";
 
 #[derive(Debug, PartialEq)]
 enum Cmd {
@@ -80,7 +81,9 @@ pub fn run(args: &[String]) -> io::Result<()> {
 }
 
 fn run_with(args: &[String], alive: impl FnOnce() -> bool) -> io::Result<()> {
-    let cmd = parse(args).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let json = args.iter().any(|a| a == "--json");
+    let args: Vec<String> = args.iter().filter(|a| *a != "--json").cloned().collect();
+    let cmd = parse(&args).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     if !alive() {
         return Err(io::Error::other("kiri daemon is not running: open Kiri or run `kiri daemon`"));
     }
@@ -94,7 +97,11 @@ fn run_with(args: &[String], alive: impl FnOnce() -> bool) -> io::Result<()> {
         }
         Cmd::Reset => answer(client::request("DELETE", "/kiri/domains", None)?)?,
     };
-    print!("{}", format(&v));
+    if json {
+        println!("{v}");
+    } else {
+        print!("{}", format(&v));
+    }
     Ok(())
 }
 
@@ -142,7 +149,7 @@ mod tests {
 
     #[test]
     fn bad_arguments_fail_before_touching_the_socket() {
-        for bad in ["set --http nope", "set --http 0", "set --https 70000", "set --http", "set", "set --port 80", "reset now", "show", "--unknown"] {
+        for bad in ["set --http nope", "set --http 0", "set --https 70000", "set --http", "set", "set --port 80", "reset now", "show", "--unknown", "--json show"] {
             let err = run_with(&args(bad), || panic!("checked daemon before arguments: {bad}")).unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{bad}: {err}");
         }
@@ -150,7 +157,7 @@ mod tests {
 
     #[test]
     fn says_when_the_daemon_is_not_running() {
-        for cmd in ["", "set --http 8080 --https 8443", "set --http 8080", "reset"] {
+        for cmd in ["", "--json", "set --http 8080 --https 8443", "set --http 8080 --json", "reset"] {
             let err = run_with(&args(cmd), || false).unwrap_err();
             assert_eq!(err.to_string(), "kiri daemon is not running: open Kiri or run `kiri daemon`", "{cmd}");
         }

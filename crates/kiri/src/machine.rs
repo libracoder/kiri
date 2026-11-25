@@ -47,7 +47,7 @@ pub fn run(args: &[String]) -> io::Result<()> {
             let pick = args.iter().position(|a| a == "--distro" || a == "--image").and_then(|i| args.get(i + 1)).map_or("ubuntu", String::as_str);
             create(name, pick, args.iter().any(|a| a == "--systemd"))
         }
-        Some("list" | "ls") => list(),
+        Some("list" | "ls") => list(args.iter().any(|a| a == "--json")),
         Some("shell") => {
             need_name()?;
             let cmd: Vec<&str> = args.iter().position(|a| a == "--").map(|i| args[i + 1..].iter().map(String::as_str).collect()).unwrap_or_default();
@@ -70,7 +70,7 @@ pub fn run(args: &[String]) -> io::Result<()> {
             Ok(())
         }
         _ => Err(io::Error::other(
-            "usage: kiri machine create NAME [--distro ubuntu|debian|alpine|fedora|arch|rocky|opensuse | --image IMAGE] [--systemd]\n       kiri machine list | shell NAME [-- CMD...] | start | stop | restart | delete NAME",
+            "usage: kiri machine create NAME [--distro ubuntu|debian|alpine|fedora|arch|rocky|opensuse | --image IMAGE] [--systemd]\n       kiri machine list [--json] | shell NAME [-- CMD...] | start | stop | restart | delete NAME",
         )),
     }
 }
@@ -162,14 +162,28 @@ command -v sudo >/dev/null 2>&1 || (apt-get update -qq && DEBIAN_FRONTEND=nonint
     Ok(())
 }
 
-fn list() -> io::Result<()> {
+fn list(json: bool) -> io::Result<()> {
     let filters = format!("{{\"label\":[\"{LABEL}\"]}}");
     let rows = client::get(&format!("/containers/json?all=1&filters={}", urlish(&filters)))?;
+    if json {
+        println!("{}", list_json(&rows));
+        return Ok(());
+    }
     println!("{:<16} {:<28} {}", "NAME", "IMAGE", "STATE");
     for c in rows.as_array().into_iter().flatten() {
         println!("{:<16} {:<28} {}", c["Labels"][LABEL].as_str().unwrap_or("?"), c["Image"].as_str().unwrap_or(""), c["Status"].as_str().unwrap_or(""));
     }
     Ok(())
+}
+
+/// `kiri machine list --json`: each machine's name, image, state (Docker's
+/// `running`, `exited`…) and status (`Up 2 hours`…).
+fn list_json(rows: &serde_json::Value) -> serde_json::Value {
+    rows.as_array()
+        .into_iter()
+        .flatten()
+        .map(|c| json!({"name": c["Labels"][LABEL], "image": c["Image"], "state": c["State"], "status": c["Status"]}))
+        .collect()
 }
 
 fn urlish(s: &str) -> String {
@@ -204,4 +218,16 @@ fn shell(name: &str, cmd: &[&str]) -> io::Result<()> {
         std::process::exit(status.code().unwrap_or(1));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    #[test]
+    fn list_json_has_each_machines_name_image_and_state() {
+        let rows = json!([{"Labels": {(super::LABEL): "dev"}, "Image": "ubuntu:24.04", "State": "running", "Status": "Up 2 hours"}]);
+        assert_eq!(super::list_json(&rows), json!([{"name": "dev", "image": "ubuntu:24.04", "state": "running", "status": "Up 2 hours"}]));
+        assert_eq!(super::list_json(&json!([])), json!([]));
+    }
 }

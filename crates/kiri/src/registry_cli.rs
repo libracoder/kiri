@@ -26,7 +26,9 @@ usage: kiri registry                                  both lists and the file th
                              registries without a verified certificate (self-signed
                              or plain HTTP): registry.lan:5000, 10.0.0.0/8
        kiri registry mirror [list] | add URL... | remove URL...
-                             Docker Hub mirrors, tried in order before Docker Hub";
+                             Docker Hub mirrors, tried in order before Docker Hub
+       --json, with any of them: one line of JSON, the daemon's report for
+                             `kiri registry`, the list itself for the others";
 
 /// Checks an entry and writes it the way daemon.json keeps it.
 type Check = fn(&str) -> Result<String, String>;
@@ -35,6 +37,8 @@ const INSECURE: &str = "insecure-registries";
 const MIRRORS: &str = "registry-mirrors";
 
 pub fn run(args: &[String]) -> io::Result<()> {
+    let json = args.iter().any(|a| a == "--json");
+    let args: Vec<String> = args.iter().filter(|a| *a != "--json").cloned().collect();
     let arg = |i: usize| args.get(i).map(String::as_str);
     if matches!(arg(0), Some("-h" | "--help" | "help")) {
         println!("{USAGE}");
@@ -44,7 +48,7 @@ pub fn run(args: &[String]) -> io::Result<()> {
         return Err(io::Error::other("kiri daemon is not running: open Kiri or run `kiri daemon`"));
     }
     let (key, check): (&str, Check) = match arg(0) {
-        None => return show(&client::get("/kiri/registries")?),
+        None => return show(&client::get("/kiri/registries")?, json),
         Some("insecure") => (INSECURE, |s| Insecure::parse(s).map(|e| e.as_string())),
         Some("mirror" | "mirrors") => (MIRRORS, |s| Mirror::parse(s).map(|m| m.as_url())),
         _ => return Err(io::Error::other(USAGE)),
@@ -59,7 +63,7 @@ pub fn run(args: &[String]) -> io::Result<()> {
     match arg(1) {
         Some("list" | "ls") | None => {
             let now = client::get("/kiri/registries")?;
-            list(key, &strings(&now[key]));
+            list(key, &strings(&now[key]), json);
             problems(&now);
             Ok(())
         }
@@ -70,7 +74,7 @@ pub fn run(args: &[String]) -> io::Result<()> {
                     now.push(n);
                 }
             }
-            save(key, &now)
+            save(key, &now, json)
         }
         Some("remove" | "rm") => {
             let mut now = strings(&client::get("/kiri/registries")?[key]);
@@ -81,7 +85,7 @@ pub fn run(args: &[String]) -> io::Result<()> {
                     return Err(io::Error::other(format!("{n} is not in {key}")));
                 }
             }
-            save(key, &now)
+            save(key, &now, json)
         }
         _ => Err(io::Error::other(USAGE)),
     }
@@ -91,7 +95,11 @@ fn strings(v: &Value) -> Vec<String> {
     v.as_array().into_iter().flatten().filter_map(|s| s.as_str()).map(str::to_owned).collect()
 }
 
-fn list(key: &str, entries: &[String]) {
+fn list(key: &str, entries: &[String], json: bool) {
+    if json {
+        println!("{}", json!(entries));
+        return;
+    }
     match (key, entries.is_empty()) {
         (INSECURE, true) => println!("no insecure registries: every registry is reached over verified HTTPS"),
         (INSECURE, false) => println!("insecure registries (no verified certificate; HTTPS first, then plain HTTP):"),
@@ -109,9 +117,13 @@ fn problems(report: &Value) {
     }
 }
 
-fn show(report: &Value) -> io::Result<()> {
-    list(INSECURE, &strings(&report[INSECURE]));
-    list(MIRRORS, &strings(&report[MIRRORS]));
+fn show(report: &Value, json: bool) -> io::Result<()> {
+    if json {
+        println!("{report}");
+        return Ok(());
+    }
+    list(INSECURE, &strings(&report[INSECURE]), false);
+    list(MIRRORS, &strings(&report[MIRRORS]), false);
     if let Some(p) = report["path"].as_str() {
         println!("in {p}");
     }
@@ -119,12 +131,12 @@ fn show(report: &Value) -> io::Result<()> {
     Ok(())
 }
 
-fn save(key: &str, entries: &[String]) -> io::Result<()> {
+fn save(key: &str, entries: &[String], json: bool) -> io::Result<()> {
     let r = client::request("POST", "/kiri/registries", Some(&json!({ key: entries })))?;
     if !r.ok() {
         return Err(io::Error::other(r.error()));
     }
     let now = client::get("/kiri/registries")?;
-    list(key, &strings(&now[key]));
+    list(key, &strings(&now[key]), json);
     Ok(())
 }

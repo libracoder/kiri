@@ -61,7 +61,7 @@ const MAX_K3S_ARGS: usize = 64;
 const MAX_MANIFEST_BYTES: u64 = 4 << 20;
 
 const USAGE_SET: &str = "usage: kiri k8s set [--lan on|off] [--tls-san NAME,…] [--port N] [--version TAG|default] [--k3s-arg ARG]… [--clear-k3s-args]";
-const USAGE_K8S: &str = "usage: kiri k8s start [--use] | stop | status | delete | set [--lan on|off] [--tls-san NAME,…] [--port N] [--version TAG|default] [--k3s-arg ARG]… [--clear-k3s-args]";
+const USAGE_K8S: &str = "usage: kiri k8s start [--use] | stop | status [--json] | delete | set [--lan on|off] [--tls-san NAME,…] [--port N] [--version TAG|default] [--k3s-arg ARG]… [--clear-k3s-args]";
 
 impl Config {
     pub(crate) fn api_port(&self) -> u16 {
@@ -337,19 +337,36 @@ pub(crate) fn format_status(info: Option<&serde_json::Value>, cfg: &Config) -> S
     let port = bound_port(info).unwrap_or(API_PORT);
     let want = cfg.api_port();
     let moved = if port != want { format!(" ({want} was in use)") } else { String::new() };
-    let version = if state == "running" {
-        info["Config"]["Image"]
-            .as_str()
-            .and_then(|img| img.split_once(':').map(|(_, tag)| tag))
-            .unwrap_or_else(|| cfg.version_tag())
-    } else {
-        cfg.version_tag()
-    };
+    let version = node_version(info, cfg);
     let mut out = format!("Kubernetes: {state}, k3s {version}, API on 127.0.0.1:{port}{moved}");
     if !cfg.k3s_args.is_empty() {
         out.push_str(&format!(", k3s args: {}", cfg.k3s_args.join(" ")));
     }
     out
+}
+
+/// The k3s a running node runs (its image's tag), else the one a start runs.
+fn node_version<'a>(info: &'a serde_json::Value, cfg: &'a Config) -> &'a str {
+    if info["State"]["Status"] == "running" {
+        info["Config"]["Image"].as_str().and_then(|img| img.split_once(':').map(|(_, tag)| tag)).unwrap_or_else(|| cfg.version_tag())
+    } else {
+        cfg.version_tag()
+    }
+}
+
+/// `kiri k8s status --json`: what `format_status` says, as one object. A
+/// cluster not created has `state` null and no `port` yet.
+pub(crate) fn status_json(info: Option<&serde_json::Value>, cfg: &Config) -> serde_json::Value {
+    serde_json::json!({
+        "state": info.map(|i| i["State"]["Status"].as_str().unwrap_or("unknown")),
+        "version": info.map_or_else(|| cfg.version_tag(), |i| node_version(i, cfg)),
+        "port": info.map(|i| bound_port(i).unwrap_or(API_PORT)),
+        "requested_port": cfg.api_port(),
+        "lan": cfg.lan,
+        "tls_san": cfg.tls_san,
+        "k3s_args": cfg.k3s_args,
+        "context": CONTEXT.get(),
+    })
 }
 
 /// `kiri k8s set [--lan on|off] [--tls-san a,b] [--port N] [--version TAG|default] [--k3s-arg ARG]… [--clear-k3s-args]`:
@@ -493,7 +510,7 @@ fn run_inner(args: &[String]) -> io::Result<()> {
             println!("Kubernetes stopped (its state is kept; `kiri k8s start` resumes it)");
             Ok(())
         }
-        Some("status") => status(),
+        Some("status") => status(flag("--json")),
         Some("delete") => delete(),
         Some("set") => set(&args[1..]),
         _ => Err(io::Error::other(USAGE_K8S)),
@@ -1005,15 +1022,23 @@ pub(crate) fn forget() {
     }
 }
 
-fn status() -> io::Result<()> {
+fn status(json: bool) -> io::Result<()> {
     ensure_daemon()?;
     let cfg = config();
     if !exists()? {
-        println!("{}", format_status(None, &cfg));
+        println!("{}", if json { status_json(None, &cfg).to_string() } else { format_status(None, &cfg) });
         return Ok(());
     }
     let info = client::get(&format!("/containers/{NAME}/json"))?;
     let state = info["State"]["Status"].as_str().unwrap_or("unknown").to_owned();
+    if json {
+        // The context is put right as below, quietly: the line stays JSON.
+        if state == "running" {
+            let _ = sync(Duration::ZERO);
+        }
+        println!("{}", status_json(Some(&info), &cfg));
+        return Ok(());
+    }
     println!("{}", format_status(Some(&info), &cfg));
     if state == "running" {
         // A context missing or out of date (written by an older Kiri, or not at all) is put right.
@@ -1289,6 +1314,12 @@ mod tests {
             super::format_status(Some(&running), &cfg),
             "Kubernetes: running, k3s v1.31.4-k3s1, API on 127.0.0.1:6443, k3s args: --flannel-backend=none --disable=traefik"
         );
+        let j = super::status_json(Some(&running), &cfg);
+        assert_eq!((&j["state"], &j["version"], &j["port"], &j["requested_port"]), (&"running".into(), &"v1.31.4-k3s1".into(), &6443.into(), &6443.into()));
+        assert_eq!(j["k3s_args"], serde_json::json!(["--flannel-backend=none", "--disable=traefik"]));
+        let none = super::status_json(None, &super::Config::default());
+        assert!(none["state"].is_null() && none["port"].is_null(), "{none}");
+        assert_eq!(none["version"], super::IMAGE.1);
     }
 
     #[test]
