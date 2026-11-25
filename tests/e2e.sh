@@ -1057,6 +1057,7 @@ needs finder t finder-symlink-is-link "link . Alpine Linux" bash -c "$D exec fsv
 needs finder t finder-no-proc-sys "hidden" bash -c "! ls $KFQ/fsv | grep -qxE 'proc|sys' && ! ls $KFQ/fsv/proc >/dev/null 2>&1 && ! ls $KFQ/fsv/sys >/dev/null 2>&1 && echo hidden"
 needs finder code finder-readonly 1 bash -c "echo x > $KFQ/fsv/tmp/written"
 t finder-mounted "nfs" bash -c "mount | grep -F \" on $KF \""
+t finder-mount-nobrowse ", nobrowse" bash -c 'mount | grep -F " on $1 "' _ "$KF"
 # A file rewritten in place (same path, same size) must never read stale.
 needs finder t finder-fresh "match match match" bash -c "for i in 1 2 3; do $D exec fsv sh -c 'head -c 100000 /dev/urandom > /tmp/same.bin'; a=\$($D exec fsv sha256sum /tmp/same.bin | cut -c1-64); b=\$($SHA $KFQ/fsv/tmp/same.bin | cut -c1-64); [ \"\$a\" = \"\$b\" ] && printf 'match '; done"
 needs finder t finder-new-file "late" bash -c "$D exec fsv sh -c 'echo late > /tmp/late.txt'; cat $KFQ/fsv/tmp/late.txt"

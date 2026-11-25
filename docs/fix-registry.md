@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #929 macOS: hide the automatic `<` Finder entry for the Kiri NFS mount (unreleased)
+- Fixes: #929 Kiri appears as `<` in the Finder sidebar on macOS
+- Caused: none known
+- Caused by: -
+- Check: `finder-mount-nobrowse`
+
 ### #473 Mac: bind unprivileged low ports (`<1024`) on loopback and allow disabling `VZNATNetworkDeviceAttachment` (`kiri vm set --shared-nat off`) for Cloudflare WARP and strict TLS firewalls (unreleased)
 - Fixes: #473 Port forwarding for ports `<1024` fails without root on macOS even when binding `127.0.0.1`, #383 Cloudflare WARP breaks container networking on macOS (`InternetSharing` conflict), #350 TLS 1.3 handshake hangs when corporate firewall drops non-DF packets from macOS `InternetSharing` NAT
 - Caused: none known

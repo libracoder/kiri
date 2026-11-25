@@ -126,8 +126,9 @@ pub fn mount(socket: &Path) -> io::Result<PathBuf> {
     // ticotsord with socket paths: mount_nfs's local transport ("<>" is the
     // host). noac: attributes are never reused, so every read sees the
     // current file. soft: if the daemon is gone, Finder gets an error
-    // instead of hanging.
-    let opts = format!("vers=3,proto=ticotsord,port={socket},mountport={socket},rdonly,nolocks,soft,intr,timeo=10,retrans=2,noac");
+    // instead of hanging. nobrowse: open ~/Kiri directly without Finder's
+    // automatic "<" entry for the Unix socket mount.
+    let opts = format!("vers=3,proto=ticotsord,port={socket},mountport={socket},rdonly,nobrowse,nolocks,soft,intr,timeo=10,retrans=2,noac");
     let status = std::process::Command::new("/sbin/mount_nfs").args(["-o", &opts, "<>:/"]).arg(&dir).status()?;
     if !status.success() {
         return Err(io::Error::other(format!("mount_nfs failed: {status}")));
