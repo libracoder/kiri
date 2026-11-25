@@ -397,7 +397,11 @@ pub fn save(store: &Store, images: &[Image], out: impl Write) -> io::Result<()> 
     let mut by_config: Vec<(&Image, Vec<String>)> = Vec::new();
     for i in images {
         match by_config.iter_mut().find(|(first, _)| first.config_digest == i.config_digest) {
-            Some((_, tags)) => tags.push(i.name.clone()),
+            Some((_, tags)) => {
+                if !i.name.starts_with("sha256:") {
+                    tags.push(i.name.clone());
+                }
+            }
             None => by_config.push((i, if i.name.starts_with("sha256:") { vec![] } else { vec![i.name.clone()] })),
         }
     }
@@ -1175,6 +1179,44 @@ mod tests {
             assert!(store.images().unwrap().is_empty(), "{bad_tag}");
             assert_eq!(std::fs::read_dir(dir.join("blobs/sha256")).unwrap().count(), 0, "{bad_tag}");
         }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn failed_loads_remove_ingested_blobs_and_save_skips_untagged_ids() {
+        let dir = scratch();
+        let store = Store::open(&dir).unwrap();
+        let mut b = tar::Builder::new(Vec::new());
+        for (name, body) in [("layer1.tar", &b"one"[..]), ("layer2.tar", &b"two"[..])] {
+            let mut h = tar::Header::new_ustar();
+            h.set_size(body.len() as u64);
+            h.set_mode(0o644);
+            h.set_entry_type(tar::EntryType::Regular);
+            b.append_data(&mut h, name, body).unwrap();
+        }
+        let mut cut = b.into_inner().unwrap();
+        cut.truncate(512 + 300);
+        assert!(load(&store, cut.as_slice()).is_err());
+        assert_eq!(std::fs::read_dir(dir.join("blobs/sha256")).unwrap().count(), 0);
+
+        let put = |bytes: &[u8]| {
+            let mut w = store.ingest().unwrap();
+            w.write_all(bytes).unwrap();
+            w.finish().unwrap()
+        };
+        let cfg = json!({"os": "linux", "architecture": "arm64", "config": {}});
+        let (cfg_digest, _) = put(&serde_json::to_vec(&cfg).unwrap());
+        let (layer, size) = put(b"layer");
+        let layers = vec![Layer { digest: layer, size, media_type: "application/vnd.oci.image.layer.v1.tar".into() }];
+        let named = from_config("demo:1".into(), &cfg_digest, &cfg, layers.clone());
+        let untagged = from_config(cfg_digest.clone(), &cfg_digest, &cfg, layers);
+        let mut tarball = Vec::new();
+        save(&store, &[named, untagged], &mut tarball).unwrap();
+
+        let other = Store::open(dir.join("other")).unwrap();
+        let loaded = load(&other, tarball.as_slice()).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, "demo:1");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -1894,7 +1894,10 @@ fn printable(text: &str) -> String {
 
 /// Parses `Bearer realm="…",service="…",scope="…"`.
 fn parse_challenge(header: &str) -> HashMap<String, String> {
-    let rest = header.strip_prefix("Bearer ").unwrap_or(header);
+    let rest = match header.get(..7) {
+        Some(p) if p.eq_ignore_ascii_case("bearer ") => &header[7..],
+        _ => header,
+    };
     let mut out = HashMap::new();
     let mut s = rest;
     while let Some(eq) = s.find('=') {
@@ -2278,6 +2281,9 @@ mod tests {
         assert_eq!(p["realm"], "https://auth.docker.io/token");
         assert_eq!(p["service"], "registry.docker.io");
         assert_eq!(p["scope"], "repository:library/alpine:pull");
+        let lower = parse_challenge(r#"bearer realm="https://ghcr.io/token",service="ghcr.io""#);
+        assert_eq!(lower["realm"], "https://ghcr.io/token");
+        assert_eq!(lower["service"], "ghcr.io");
     }
 
     #[test]
