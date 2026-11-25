@@ -3178,14 +3178,7 @@ fn links_from(list: &[String], engine: &Engine) -> Result<Vec<super::engine::Lin
 
 fn status_text(c: &Container) -> String {
     let ago = |t: Option<std::time::SystemTime>| {
-        let s = t.and_then(|t| t.elapsed().ok()).map_or(0, |d| d.as_secs());
-        match s {
-            0..=1 => "Less than a second".to_owned(),
-            2..=59 => format!("{s} seconds"),
-            60..=3599 => format!("{} minutes", s / 60),
-            3600..=86399 => format!("{} hours", s / 3600),
-            _ => format!("{} days", s / 86400),
-        }
+        super::time::human_duration(t.and_then(|t| t.elapsed().ok()).map_or(0, |d| d.as_secs()))
     };
     match c.status {
         Status::Created => "Created".into(),
