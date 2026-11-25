@@ -2371,6 +2371,15 @@ main { position: relative; }
 .htctx .mi { display: flex; align-items: center; gap: 8px; width: 100%; height: 28px; padding: 0 8px; border: 0; border-radius: 6px; background: none; cursor: pointer; color: var(--text); font: var(--fs) var(--ui-font); text-align: var(--start); }
 .htctx .mi:hover { background: var(--blue); color: #fff; }
 .htctx .mi:disabled { color: var(--faint); background: none; cursor: default; }
+.appctx { position: fixed; z-index: 120; min-width: 160px; padding: 5px; background: var(--raised); border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 14px 40px rgb(0 0 0 / .45); }
+.appctx[hidden] { display: none; }
+.appctx .mi { display: flex; align-items: center; justify-content: space-between; gap: 16px; width: 100%; height: 28px; padding-block: 0; padding-inline: 8px; border: 0; border-radius: 6px; background: none; cursor: pointer; color: var(--text); font: var(--fs) var(--ui-font); text-align: var(--start); }
+.appctx .mi:hover { background: var(--blue); color: #fff; }
+.appctx .mi:hover .k { color: rgb(255 255 255 / .8); }
+.appctx .mi:disabled { color: var(--faint); background: none; cursor: default; }
+.appctx .mi:disabled .k { color: var(--faint); }
+.appctx .mi .k { color: var(--faint); font-size: var(--fs-xs); }
+.appctx hr { border: 0; border-top: 1px solid var(--line); margin: 4px 2px; }
 .httab .x:hover { background: color-mix(in srgb, var(--text) 10%, transparent); color: var(--text); }
 .hthead .grow { flex: 1; min-width: 10px; align-self: stretch; }
 .hthead .sep { width: 1px; height: 16px; background: var(--line); margin: 0 4px; }
@@ -3017,12 +3026,129 @@ function applyPrefs() {
   r.setProperty("--blue-light", `color-mix(in srgb, ${accent} 60%, white)`);
   window.htApply?.();
 }
-/* A right-click gets no browser menu (Reload, Back, Inspect): this is an app,
-   not a web page. Text fields and selected text keep theirs, for Copy and Paste. */
+/* Right-click never opens the WebView's browser menu (Safari's Search with
+   Google, Look Up, Translate, Copy Link with Highlight, Share…): Kiri draws
+   its own app menu with only editing actions (Copy on selected text, Cut /
+   Copy / Paste / Select All in text fields, Copy / Paste in the terminal). */
+const appCtxEl = document.createElement("div");
+appCtxEl.id = "app-ctx";
+appCtxEl.className = "appctx";
+appCtxEl.setAttribute("role", "menu");
+appCtxEl.hidden = true;
+document.body.append(appCtxEl);
+let ctxTarget = null, ctxPasteField = null;
+function hideAppCtx() { appCtxEl.hidden = true; ctxTarget = null; }
+function isTextField(el) {
+  if (!el) return false;
+  if (el.tagName === "TEXTAREA") return true;
+  if (el.tagName === "INPUT") {
+    const t = (el.type || "text").toLowerCase();
+    return ["text", "search", "url", "tel", "password", "email", "number"].includes(t);
+  }
+  return false;
+}
+function fieldRange(el) {
+  try {
+    if (typeof el.selectionStart === "number" && typeof el.selectionEnd === "number") return [el.selectionStart, el.selectionEnd, true];
+  } catch {}
+  const len = (el.value || "").length;
+  return [0, len, false];
+}
+function replaceFieldText(el, text, start, end, hasRange) {
+  el.focus();
+  if (hasRange) {
+    try { el.setRangeText(text, start, end, "end"); }
+    catch { el.value = (el.value || "").slice(0, start) + text + (el.value || "").slice(end); }
+  } else {
+    el.value = text;
+  }
+  el.dispatchEvent(new Event("input", { bubbles: true }));
+}
+function ctxItem(act, label, key, disabled) {
+  return `<button type="button" class="mi" role="menuitem" data-ctx="${act}"${disabled ? " disabled" : ""}><span>${label}</span>${key ? `<span class="k">${esc(key)}</span>` : ""}</button>`;
+}
+function openAppCtx(ev, html) {
+  setHTML(appCtxEl, html);
+  appCtxEl.hidden = false;
+  const zoom = Number(prefs.scale) || 1, vw = (innerWidth || 800) / zoom, vh = (innerHeight || 600) / zoom;
+  const rect = appCtxEl.getBoundingClientRect(), mw = (rect.width || 168) / zoom, mh = (rect.height || 38) / zoom;
+  const x = Math.max(6, Math.min((ev.clientX || 0) / zoom, vw - mw - 6));
+  const y = Math.max(6, Math.min((ev.clientY || 0) / zoom, vh - mh - 6));
+  appCtxEl.style.left = `${x}px`;
+  appCtxEl.style.top = `${y}px`;
+}
 document.addEventListener("contextmenu", (ev) => {
-  const editable = ev.target.closest?.("input, textarea, [contenteditable]");
-  if (!editable && !String(getSelection()).trim()) ev.preventDefault();
+  ev.preventDefault();
+  const htMenuEl = document.querySelector(".htctx");
+  if (htMenuEl) htMenuEl.hidden = true;
+  const modKey = WIN || LINUX ? "Ctrl+" : "⌘";
+  const field = ev.target.closest?.("input, textarea");
+  if (isTextField(field) && !field.disabled) {
+    if (document.activeElement !== field) field.focus();
+    const [start, end, hasRange] = fieldRange(field);
+    const isPwd = (field.type || "").toLowerCase() === "password";
+    const writable = !field.readOnly;
+    const selected = !isPwd && hasRange && end > start ? (field.value || "").slice(start, end) : (!isPwd && !hasRange ? (field.value || "") : "");
+    const hasText = (field.value || "").length > 0;
+    ctxTarget = { kind: "field", el: field, start, end, hasRange, text: selected, writable };
+    const items = writable
+      ? [
+          ctxItem("cut", tr("Cut"), `${modKey}X`, !selected),
+          ctxItem("copy", tr("Copy"), `${modKey}C`, !selected),
+          ctxItem("paste", tr("Paste"), `${modKey}V`, false),
+          "<hr>",
+          ctxItem("selectall", tr("Select All"), `${modKey}A`, !hasText),
+        ]
+      : [
+          ctxItem("copy", tr("Copy"), `${modKey}C`, !selected),
+          ctxItem("selectall", tr("Select All"), `${modKey}A`, !hasText),
+        ];
+    openAppCtx(ev, items.join(""));
+    return;
+  }
+  const paneEl = ev.target.closest?.(".htpane");
+  if (paneEl && ev.target.closest?.(".htx, .xterm") && typeof htPane === "function") {
+    const p = htPane(paneEl.dataset.id);
+    if (!p) { hideAppCtx(); return; }
+    const selected = p.term?.getSelection() || "";
+    ctxTarget = { kind: "term", pane: p, text: selected };
+    const tk = WIN || LINUX ? "Ctrl+Shift+" : "⌘";
+    openAppCtx(ev, [
+      ctxItem("copy", tr("Copy"), `${tk}C`, !selected),
+      ctxItem("paste", tr("Paste"), `${tk}V`, Boolean(p.exited)),
+    ].join(""));
+    return;
+  }
+  const selected = String(getSelection());
+  if (!selected.trim()) { hideAppCtx(); return; }
+  ctxTarget = { kind: "selection", text: selected };
+  openAppCtx(ev, ctxItem("copy", tr("Copy"), `${modKey}C`, false));
 });
+appCtxEl.addEventListener("mousedown", (ev) => ev.preventDefault());
+appCtxEl.addEventListener("click", (ev) => {
+  const btn = ev.target.closest?.("[data-ctx]");
+  if (!btn || btn.disabled) return;
+  const act = btn.dataset.ctx, t = ctxTarget;
+  hideAppCtx();
+  if (!t) return;
+  if (act === "copy") {
+    if (t.kind === "term") htCopy(t.pane);
+    else if (t.text) send("term", { name: "copy", value: t.text });
+  } else if (act === "cut" && t.kind === "field" && t.writable && t.text) {
+    send("term", { name: "copy", value: t.text });
+    replaceFieldText(t.el, "", t.start, t.end, t.hasRange);
+  } else if (act === "paste") {
+    if (t.kind === "term") send("term", { name: "paste", id: t.pane.id });
+    else if (t.kind === "field" && t.writable) { ctxPasteField = t.el; send("term", { name: "paste", id: "__field" }); }
+  } else if (act === "selectall" && t.kind === "field") {
+    t.el.focus();
+    try { t.el.select(); } catch {}
+  }
+});
+document.addEventListener("mousedown", (ev) => { if (!ev.target.closest?.("#app-ctx")) hideAppCtx(); });
+document.addEventListener("keydown", (ev) => { if (ev.key === "Escape" && !appCtxEl.hidden) hideAppCtx(); });
+document.addEventListener("scroll", hideAppCtx, true);
+addEventListener("blur", hideAppCtx);
 /* Copy with the keyboard: selected text (a log, a row's value) goes to the
    clipboard the way the terminal's does. On the Mac, Edit → Copy does it.
    Text fields and the terminal keep their own handling. */
@@ -12323,6 +12449,17 @@ function htOn(e) {
     ht.def = e.default || ht.shells[0]?.id || "";
     if (!htQ(".htmenu").hidden) htMenu();
     if (ht.wantTab) { const want = ht.wantTab; ht.wantTab = false; htNewTab(want === true ? undefined : want); }
+    return;
+  }
+  if (e.ev === "paste" && e.id === "__field") {
+    const el = ctxPasteField;
+    ctxPasteField = null;
+    if (el && el.isConnected && !el.readOnly && !el.disabled) {
+      const raw = String(e.text || "");
+      const text = el.tagName === "INPUT" ? raw.replace(/[\r\n]+/g, " ") : raw;
+      const [s, end, hasRange] = fieldRange(el);
+      replaceFieldText(el, text, s, end, hasRange);
+    }
     return;
   }
   const p = htPane(e.id);
