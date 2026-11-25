@@ -8,7 +8,6 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::ops::Not;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -62,9 +61,41 @@ fn err(e: rcgen::Error) -> io::Error {
     io::Error::other(e.to_string())
 }
 
+fn valid_ca_der(der: &[u8], key: &KeyPair) -> bool {
+    if der.len() < 4 || der[0] != 0x30 {
+        return false;
+    }
+    let total = match der[1] {
+        n if n < 0x80 => 2 + n as usize,
+        0x81 => 3 + *der.get(2).unwrap_or(&0) as usize,
+        0x82 if der.len() >= 4 => 4 + u16::from_be_bytes([der[2], der[3]]) as usize,
+        0x83 if der.len() >= 5 => 5 + u32::from_be_bytes([0, der[2], der[3], der[4]]) as usize,
+        _ => return false,
+    };
+    let Some(spki) = pem_to_der(&key.public_key_pem()) else { return false };
+    total == der.len() && !spki.is_empty() && der.windows(spki.len()).any(|w| w == &*spki)
+}
+
+fn write_private_atomic(path: &std::path::Path, bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt;
+    let tmp = path.with_extension("tmp");
+    let _ = std::fs::remove_file(&tmp);
+    std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?.write_all(bytes)?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
+}
+
 /// The authority: loaded from `~/.kiri/tls`, or made there the first time.
 fn authority() -> io::Result<(Issuer<'static, KeyPair>, CertificateDer<'static>)> {
     let dir = dir().ok_or_else(|| io::Error::other("HOME is not set"))?;
+    authority_in(&dir)
+}
+
+fn authority_in(dir: &std::path::Path) -> io::Result<(Issuer<'static, KeyPair>, CertificateDer<'static>)> {
     let (cert_path, key_path) = (dir.join("ca.pem"), dir.join("ca-key.pem"));
     // The authority's format version: 2 added the exclusion of IP addresses
     // from its name constraints. An older authority is replaced (the user
@@ -72,28 +103,37 @@ fn authority() -> io::Result<(Issuer<'static, KeyPair>, CertificateDer<'static>)
     // that already had one.
     const CA_VERSION: &str = "2";
     let version_path = dir.join("ca.version");
-    if key_path.is_file() && std::fs::read_to_string(&version_path).is_ok_and(|v| v.trim() == CA_VERSION).not() {
-        let _ = std::fs::remove_file(&key_path);
-        let _ = std::fs::remove_file(&cert_path);
-    }
-    let key = match std::fs::read_to_string(&key_path) {
-        Ok(pem) if cert_path.is_file() => KeyPair::from_pem(&pem).map_err(err)?,
-        _ => {
-            std::fs::create_dir_all(&dir)?;
-            std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
+    let loaded = std::fs::read_to_string(&version_path)
+        .ok()
+        .filter(|v| v.trim() == CA_VERSION)
+        .and_then(|_| std::fs::read_to_string(&key_path).ok())
+        .and_then(|pem| KeyPair::from_pem(&pem).ok())
+        .and_then(|key| {
+            let pem = std::fs::read_to_string(&cert_path).ok()?;
+            let der = pem_to_der(&pem)?;
+            valid_ca_der(&der, &key).then_some((key, der))
+        });
+    let (key, der) = match loaded {
+        Some(pair) => pair,
+        None => {
+            std::fs::create_dir_all(dir)?;
+            std::fs::set_permissions(dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
+            let _ = std::fs::remove_file(&key_path);
+            let _ = std::fs::remove_file(&cert_path);
+            let _ = std::fs::remove_file(&version_path);
             let key = KeyPair::generate().map_err(err)?;
             let cert = ca_params().map_err(err)?.self_signed(&key).map_err(err)?;
-            let tmp = key_path.with_extension("tmp");
-            std::fs::write(&tmp, key.serialize_pem())?;
-            std::fs::set_permissions(&tmp, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
-            std::fs::rename(&tmp, &key_path)?;
-            std::fs::write(&cert_path, cert.pem())?;
+            let cert_pem = cert.pem();
+            let der = pem_to_der(&cert_pem).ok_or_else(|| io::Error::other("ca.pem is not a certificate"))?;
+            write_private_atomic(&key_path, key.serialize_pem().as_bytes())?;
+            let cert_tmp = cert_path.with_extension("pem.tmp");
+            let _ = std::fs::remove_file(&cert_tmp);
+            std::fs::write(&cert_tmp, cert_pem)?;
+            std::fs::rename(&cert_tmp, &cert_path)?;
             std::fs::write(&version_path, CA_VERSION)?;
-            key
+            (key, der)
         }
     };
-    let pem = std::fs::read_to_string(&cert_path)?;
-    let der = pem_to_der(&pem).ok_or_else(|| io::Error::other("ca.pem is not a certificate"))?;
     Ok((Issuer::new(ca_params().map_err(err)?, key), der))
 }
 
@@ -117,8 +157,19 @@ fn civil(days: i64) -> (i32, u8, u8) {
 
 /// Whether `host` is a name this authority may vouch for.
 pub fn ours(host: &str) -> bool {
-    let h = host.trim_end_matches('.').to_ascii_lowercase();
-    SUFFIXES.iter().any(|s| h.ends_with(&format!(".{s}"))) && h.split('.').all(|l| !l.is_empty() && l.len() <= 63)
+    let h = host.strip_suffix('.').unwrap_or(host);
+    if h.is_empty() || h.len() > 253 {
+        return false;
+    }
+    let h = h.to_ascii_lowercase();
+    SUFFIXES.iter().any(|s| h.ends_with(&format!(".{s}")))
+        && h.split('.').all(|l| {
+            !l.is_empty()
+                && l.len() <= 63
+                && !l.starts_with('-')
+                && !l.ends_with('-')
+                && l.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        })
 }
 
 /// Certificates for container names, made on first use and kept while the
@@ -431,9 +482,69 @@ mod tests {
     #[test]
     fn only_kiri_names() {
         assert!(super::ours("myapp.kiri.local"));
+        assert!(super::ours("myapp.kiri.local."));
         assert!(super::ours("web.shop.kiri.localhost"));
         assert!(!super::ours("kiri.local"));
         assert!(!super::ours("example.com"));
         assert!(!super::ours("evil.kiri.local.example.com"));
+        for bad in [
+            "*.kiri.local",
+            "-bad.kiri.local",
+            "bad-.kiri.local",
+            "foo/bar.kiri.local",
+            "myapp.kiri.local..",
+            &format!("{}.{}.{}.{}.kiri.localhost", "a".repeat(63), "b".repeat(63), "c".repeat(63), "d".repeat(47)),
+        ] {
+            assert!(!super::ours(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn authority_regenerates_damaged_or_mismatched_files_privately() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("kiri-tls-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = base.join("tls");
+        std::fs::create_dir_all(&dir).unwrap();
+        let sentinel = base.join("sentinel.txt");
+        std::fs::write(&sentinel, "untouched").unwrap();
+        std::os::unix::fs::symlink(&sentinel, dir.join("ca-key.tmp")).unwrap();
+
+        let (_, first_der) = super::authority_in(&dir).unwrap();
+        assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "untouched");
+        assert_eq!(std::fs::metadata(dir.join("ca-key.pem")).unwrap().permissions().mode() & 0o777, 0o600);
+        let (_, same_der) = super::authority_in(&dir).unwrap();
+        assert_eq!(first_der.as_ref(), same_der.as_ref());
+
+        // Mismatched ca-key.pem with existing ca.pem + ca.version regenerates cleanly.
+        let other_key = rcgen::KeyPair::generate().unwrap();
+        std::fs::write(dir.join("ca-key.pem"), other_key.serialize_pem()).unwrap();
+        let (issuer, rotated_der) = super::authority_in(&dir).unwrap();
+        assert_ne!(first_der.as_ref(), rotated_der.as_ref());
+
+        // Verify leaf certificate signed by `issuer` chains validly to `rotated_der`.
+        let leaf_key = rcgen::KeyPair::generate().unwrap();
+        let leaf_params = rcgen::CertificateParams::new(vec!["myapp.kiri.local".into()]).unwrap();
+        let leaf = leaf_params.signed_by(&leaf_key, &issuer).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(rotated_der).unwrap();
+        let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+        let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(std::sync::Arc::new(roots), provider).build().unwrap();
+        rustls::client::danger::ServerCertVerifier::verify_server_cert(
+            &*verifier,
+            leaf.der(),
+            &[],
+            &rustls::pki_types::ServerName::try_from("myapp.kiri.local").unwrap(),
+            &[],
+            rustls::pki_types::UnixTime::now(),
+        )
+        .unwrap();
+
+        // Empty ca.pem regenerates cleanly as well.
+        std::fs::write(dir.join("ca.pem"), "").unwrap();
+        let (_, healed_der) = super::authority_in(&dir).unwrap();
+        assert!(!healed_der.is_empty());
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
