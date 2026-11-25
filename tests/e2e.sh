@@ -474,7 +474,7 @@ $D rm -f cgns-d cgns-p cgns-h cgns-sd >/dev/null 2>&1
 $D create --name cgns-d alpine true >/dev/null
 $D create --name cgns-p --cgroupns private alpine true >/dev/null
 $D create --name cgns-h --cgroupns host alpine true >/dev/null
-t cgroupns-mode-inspect "private private host" $D inspect -f '{{.HostConfig.CgroupnsMode}}' cgns-d cgns-p cgns-h
+t cgroupns-mode-inspect "private private host" bash -c "$D inspect -f '{{.HostConfig.CgroupnsMode}}' cgns-d cgns-p cgns-h | paste -sd' ' -"
 $D rm -f cgns-d cgns-p cgns-h >/dev/null 2>&1
 t cgroupns-mode-invalid "invalid cgroup namespace mode: bogus" curl -s --unix-socket "$SOCK" -H 'Content-Type: application/json' -d '{"Image":"alpine","Cmd":["true"],"HostConfig":{"CgroupnsMode":"bogus"}}' http://d/v1.47/containers/create
 t cgroupns-private-default "0::/" $D run --rm alpine cat /proc/1/cgroup
@@ -1667,23 +1667,25 @@ bu = sx(-100, b\"/upper.lock\", 0)
 print(\"btime-ok\" if b1 == b2 == b3 and b1[:3] == (0, (0, 0), (1700000000, 0)) and bu[:3] == (0, (0, 0), (1700000001, 0)) else (b1, b2, b3, bu))'); $D rmi kiri-test/btime:1 >/dev/null 2>&1; echo \"\$out\""
 # Guest kernel supports ext2/ext3 (via ext4) and FAT/vfat for loop-mounted boot
 # and EFI/SD-card disk images (#934).
-only mac t guest-kernel-ext2-vfat "fs=ext2,ext3,ext4,vfat ext2=hello-ext2 vfat=hello-vfat" bash -c "$D run --rm --privileged alpine:3.20 sh -c '
+only mac t guest-kernel-ext2-vfat "fs=ext2,ext3,ext4,vfat ext2=hello-ext2 vfat=hello-vfat" bash -c "$D run --rm --privileged alpine sh -c '
   set -e
   fs=\$(awk \"{print \\\$NF}\" /proc/filesystems | grep -xE \"ext2|ext3|ext4|vfat\" | sort -u | paste -sd, -)
-  apk add -q --no-cache e2fsprogs dosfstools
+  apk add -q --no-cache e2fsprogs dosfstools util-linux
   dd if=/dev/zero of=/tmp/e2.img bs=1M count=4 status=none
   mkfs.ext2 -q -F /tmp/e2.img
   mkdir -p /mnt/e2 /mnt/vf
-  mount -t ext2 -o loop /tmp/e2.img /mnt/e2
+  l1=\$(losetup -f --show /tmp/e2.img)
+  mount -t ext2 \"\$l1\" /mnt/e2
   echo hello-ext2 > /mnt/e2/ok
   e2=\$(cat /mnt/e2/ok)
-  umount /mnt/e2
+  umount /mnt/e2 && losetup -d \"\$l1\"
   dd if=/dev/zero of=/tmp/vf.img bs=1M count=4 status=none
   mkfs.vfat /tmp/vf.img >/dev/null
-  mount -t vfat -o loop /tmp/vf.img /mnt/vf
+  l2=\$(losetup -f --show /tmp/vf.img)
+  mount -t vfat \"\$l2\" /mnt/vf
   echo hello-vfat > /mnt/vf/ok
   vf=\$(cat /mnt/vf/ok)
-  umount /mnt/vf
+  umount /mnt/vf && losetup -d \"\$l2\"
   echo \"fs=\$fs ext2=\$e2 vfat=\$vf\"
 '"
 # Images of 59 to 125 layers start, with their top and lowest layers in the
