@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #936 Volumes view: show each volume's disk size loaded asynchronously with daemon caching (unreleased)
+- Fixes: #936 Volumes view: show each volume's size, loaded asynchronously
+- Caused: none known
+- Caused by: -
+- Check: `tests/ui/volumes-size.js`, `crates/kiri/src/daemon/ops.rs`
+
 ### #932 Networking: return `NODATA` for external `AAAA` queries on IPv4-only networks and relay enterprise macOS VPN tunnels through the host (unreleased)
 - Fixes: #932 Containers and the Kubernetes node fail to reach Docker Hub with IPv6 `Network unreachable` and `TLS handshake timeout` under macOS VPN / packet-tunnel extensions
 - Caused: none known

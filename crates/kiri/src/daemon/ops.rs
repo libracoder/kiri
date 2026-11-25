@@ -27,6 +27,7 @@ pub fn route(req: &Request, engine: &Arc<Engine>, caller: &Caller, w: &mut UnixS
     Some(match (m, p) {
         ("GET", "/events") => events(req, engine, w),
         ("GET", "/system/df") => reply(w, system_df(engine), 200),
+        ("GET", "/kiri/volumes/sizes") => reply(w, volume_sizes(engine), 200),
         ("POST", "/containers/prune") => reply(w, container_prune(req, engine), 200),
         ("POST", "/images/prune") => reply(w, image_prune(req, engine), 200),
         ("GET", "/images/search") => reply(w, search(req), 200),
@@ -473,6 +474,9 @@ fn system_df(engine: &Engine) -> Result<Value, Error> {
     let used: Vec<String> = engine.each(|c| Some(c.spec.image_id.clone()));
     let measured = engine.vm().ok().and_then(|vm| vm.usage(std::time::Duration::from_secs(120)));
     let du = measured.as_deref().map(DiskUsage::parse);
+    if let Some(d) = &du {
+        engine.cache_volume_sizes(None, d.volumes.clone());
+    }
     let layer_size = |l: &kiri_image::Layer| du.as_ref().and_then(|d| d.layers.get(l.digest.trim_start_matches("sha256:")).copied()).unwrap_or(l.size);
     // How many images use each layer, for each image's shared size.
     let mut users: HashMap<&str, usize> = HashMap::new();
@@ -547,6 +551,54 @@ fn system_df(engine: &Engine) -> Result<Value, Error> {
         })
         .collect();
     Ok(json!({"LayersSize": layers_size, "Images": image_rows, "Containers": containers, "Volumes": volumes, "BuildCache": super::builder::cache(engine)}))
+}
+
+/// How long `GET /kiri/volumes/sizes` reuses guest-measured volume sizes so
+/// tab switches do not re-walk the guest disk (`GET /system/df` stays live).
+const VOLUME_SIZES_TTL: Duration = Duration::from_secs(30);
+
+fn volume_sizes_map(volumes: &[super::volumes::Volume], du: &HashMap<String, u64>) -> serde_json::Map<String, Value> {
+    let mut out = serde_json::Map::with_capacity(volumes.len());
+    for v in volumes {
+        let size = match du.get(&v.name) {
+            Some(&b) => i64::try_from(b).unwrap_or(i64::MAX),
+            // A plain local volume never mounted yet has no directory in the
+            // guest and takes 0 bytes; one backed by driver options (NFS/bind/
+            // tmpfs) is not measured on the guest data disk.
+            None if v.options.is_empty() => 0,
+            None => -1,
+        };
+        out.insert(v.name.clone(), json!(size));
+    }
+    out
+}
+
+/// Each volume's size in bytes for the Volumes view (`GET /kiri/volumes/sizes`).
+/// Uses a short cache invalidated on volume/container changes and never wakes
+/// a sleeping or stopped VM.
+fn volume_sizes(engine: &Engine) -> Result<Value, Error> {
+    volume_sizes_with_ttl(engine, VOLUME_SIZES_TTL)
+}
+
+fn volume_sizes_with_ttl(engine: &Engine, ttl: Duration) -> Result<Value, Error> {
+    let volumes = engine.volume_list();
+    if volumes.is_empty() {
+        return Ok(json!({"sizes": {}}));
+    }
+    let (generation, cached) = engine.volume_sizes_cached(ttl);
+    if let Some(du) = cached {
+        return Ok(json!({"sizes": volume_sizes_map(&volumes, &du)}));
+    }
+    let Some(vm) = engine.awake_link() else {
+        return Ok(json!({"sizes": {}}));
+    };
+    let Some(measured) = vm.usage(Duration::from_secs(120)) else {
+        return Ok(json!({"sizes": {}}));
+    };
+    let du = DiskUsage::parse(&measured);
+    engine.cache_volume_sizes(Some(generation), du.volumes.clone());
+    let current = engine.volume_list();
+    Ok(json!({"sizes": volume_sizes_map(&current, &du.volumes)}))
 }
 
 /// `docker history`: the config's history, newest first, with each
@@ -805,6 +857,63 @@ mod disk_usage_tests {
         assert_eq!(du.containers.get("c1"), Some(&8192));
         assert_eq!(du.volumes.get("data"), Some(&12288));
         assert_eq!((du.layers.len(), du.containers.len(), du.volumes.len()), (1, 1, 1));
+    }
+
+    #[test]
+    fn volume_sizes_never_wakes_asleep_vm_and_honors_cache_and_invalidation() {
+        use serde_json::json;
+        use std::collections::{BTreeMap, HashMap};
+        use std::time::{Duration, Instant};
+
+        let root = std::env::temp_dir().join(format!("kiri-vol-sizes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let engine = super::super::engine::boot_without_vm(&root);
+
+        engine.volume_ensure("pg_data", json!({}), false).unwrap();
+        engine.volume_ensure("empty_vol", json!({}), false).unwrap();
+        let mut nfs_opts = BTreeMap::new();
+        nfs_opts.insert("type".into(), "nfs".into());
+        nfs_opts.insert("device".into(), ":/export".into());
+        engine.volume_ensure_with("nfs_vol", json!({}), nfs_opts).unwrap();
+
+        // With no awake VM and an empty cache, returns {} without attempting to boot a VM.
+        let unmeasured = super::volume_sizes(&engine).unwrap();
+        assert_eq!(unmeasured, json!({"sizes": {}}));
+        assert!(!engine.is_awake());
+
+        // Populate cache as if an awake measurement just completed.
+        let mut measured = HashMap::new();
+        measured.insert("pg_data".into(), 807_700_000u64);
+        let (gen_before, _) = engine.volume_sizes_cached(Duration::from_secs(30));
+        engine.cache_volume_sizes(Some(gen_before), measured.clone());
+
+        let hit = super::volume_sizes_with_ttl(&engine, Duration::from_secs(30)).unwrap();
+        assert_eq!(hit, json!({"sizes": {"pg_data": 807_700_000, "empty_vol": 0, "nfs_vol": -1}}));
+
+        // Stale cache entry (> TTL) misses and still does not wake the VM.
+        engine.set_volume_sizes_cache_at(Instant::now() - Duration::from_secs(31), measured.clone());
+        let expired = super::volume_sizes_with_ttl(&engine, Duration::from_secs(30)).unwrap();
+        assert_eq!(expired, json!({"sizes": {}}));
+
+        // Creating a new volume invalidates the cache and bumps generation so
+        // an in-flight measurement from before creation cannot repopulate it.
+        engine.cache_volume_sizes(None, measured.clone());
+        let (old_gen, cached) = engine.volume_sizes_cached(Duration::from_secs(30));
+        assert!(cached.is_some());
+        engine.volume_ensure("new_vol", json!({}), false).unwrap();
+        assert!(engine.volume_sizes_cached(Duration::from_secs(30)).1.is_none());
+        engine.cache_volume_sizes(Some(old_gen), measured.clone());
+        assert!(engine.volume_sizes_cached(Duration::from_secs(30)).1.is_none(), "stale generation write ignored");
+
+        // Removing a volume also invalidates the cache.
+        engine.cache_volume_sizes(None, measured);
+        assert!(engine.volume_sizes_cached(Duration::from_secs(30)).1.is_some());
+        engine.volume_remove("new_vol", false).unwrap();
+        assert!(engine.volume_sizes_cached(Duration::from_secs(30)).1.is_none());
+
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
     }
 }
 

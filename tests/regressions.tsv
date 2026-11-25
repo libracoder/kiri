@@ -357,3 +357,4 @@ crates/kiri/src/daemon/localtime.rs	#938	Kiri WSL lacked /etc/localtime so `-v /
 crates/kiri-init/src/linux/localtime.rs	#938	kiri-init on WSL did not self-heal a missing or empty-directory /etc/localtime on startup and parse_mounts could create a directory at /etc/localtime or /etc/timezone
 scripts/kiri-linux.sh	#938	Kiri Linux WSL rootfs omitted /usr/share/zoneinfo, /etc/localtime and /etc/timezone, preventing WSL 2 Windows-to-Linux timezone sync and leaving /etc/localtime missing on fresh installs
 crates/kiri-init/src/linux/dns.rs	#932	IPv4-only container networks forwarded external AAAA queries returning unreachable IPv6 addresses, and enterprise macOS packet-tunnel / RTF_IFSCOPE VPNs bypassed host egress relay causing TLS handshake timeouts
+tests/ui/volumes-size.js	#936	Volumes view did not show each volume's disk size, and loading sizes synchronously or via GET /system/df could stall list refreshes or wake a sleeping VM

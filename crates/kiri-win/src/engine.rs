@@ -1671,6 +1671,9 @@ pub fn on_message(msg: &str) {
         "storage" => {
             std::thread::spawn(crate::storage::emit_report);
         }
+        "volumesizes" => {
+            spawn_volume_sizes();
+        }
         "storagepick" => {
             crate::app::pick_folder(&tr("Choose a storage folder"), |path| {
                 if let Some(p) = path {
@@ -1950,6 +1953,44 @@ fn builder_settings(save: Option<Value>) {
     let mut ev = client::get_background("/kiri/builder").unwrap_or_else(|e| json!({"error": e.to_string()}));
     ev["type"] = json!("buildersettings");
     emit(ev.to_string());
+}
+
+/// Volumes view: reads each volume's disk usage asynchronously without waking
+/// a sleeping VM or touching WSL while stopped. Single-flight with coalesced
+/// re-run so repeated UI messages never accumulate background threads.
+fn spawn_volume_sizes() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static BUSY: AtomicBool = AtomicBool::new(false);
+    static RERUN: AtomicBool = AtomicBool::new(false);
+
+    if BUSY.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        RERUN.store(true, Ordering::Release);
+        return;
+    }
+    std::thread::spawn(|| {
+        struct Guard<'a>(&'a AtomicBool);
+        impl Drop for Guard<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let _guard = Guard(&BUSY);
+        loop {
+            RERUN.store(false, Ordering::Release);
+            let sizes = if crate::serve::is_stopped() {
+                json!({})
+            } else {
+                client::get_background("/kiri/volumes/sizes")
+                    .ok()
+                    .and_then(|v| v.get("sizes").filter(|s| s.is_object()).cloned())
+                    .unwrap_or_else(|| json!({}))
+            };
+            emit(json!({"type": "volumesizes", "sizes": sizes}).to_string());
+            if !RERUN.swap(false, Ordering::AcqRel) {
+                break;
+            }
+        }
+    });
 }
 
 /// The tray's commands.

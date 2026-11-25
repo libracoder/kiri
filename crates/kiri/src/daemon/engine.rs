@@ -1735,6 +1735,17 @@ pub struct Engine {
     image_labels: Mutex<HashMap<String, serde_json::Value>>,
     /// The running VM's uplink status for `/info` and `kiri diag report` (#435).
     uplink: Mutex<serde_json::Value>,
+    /// Short-lived cache of guest-measured volume sizes (`GET /kiri/volumes/sizes`),
+    /// invalidated on volume create/remove and container remove while leaving
+    /// `GET /system/df` live.
+    volume_sizes_cache: Mutex<VolumeSizesCache>,
+}
+
+#[derive(Default)]
+struct VolumeSizesCache {
+    generation: u64,
+    measured_at: Option<std::time::Instant>,
+    sizes: HashMap<String, u64>,
 }
 
 /// k3s's pod and service ranges, which `kiri k8s` leaves at their defaults.
@@ -1869,6 +1880,7 @@ impl Engine {
             k8s_fwd: Mutex::new(HashMap::new()),
             image_labels: Mutex::new(HashMap::new()),
             uplink: Mutex::new(serde_json::Value::Null),
+            volume_sizes_cache: Mutex::default(),
         });
         let _ = engine.me.set(Arc::downgrade(&engine));
         engine.start_syncer();
@@ -2734,9 +2746,42 @@ impl Engine {
     }
 
     /// The VM's link while it runs, without waking it.
-    #[cfg(target_os = "macos")]
     pub fn awake_link(&self) -> Option<Arc<VmLink>> {
         self.awake()
+    }
+
+    /// Cached guest volume disk usage if younger than `ttl`, plus the cache
+    /// generation so an in-flight measurement does not overwrite an invalidation.
+    pub(super) fn volume_sizes_cached(&self, ttl: Duration) -> (u64, Option<HashMap<String, u64>>) {
+        let c = self.volume_sizes_cache.lock().unwrap_or_else(|e| e.into_inner());
+        let hit = c.measured_at.is_some_and(|at| at.elapsed() < ttl).then(|| c.sizes.clone());
+        (c.generation, hit)
+    }
+
+    /// Stores freshly measured volume sizes. When `expected_gen` is `Some(g)`,
+    /// skips writing if the cache was invalidated since generation `g`.
+    pub(super) fn cache_volume_sizes(&self, expected_gen: Option<u64>, sizes: HashMap<String, u64>) {
+        let mut c = self.volume_sizes_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if expected_gen.is_some_and(|g| g != c.generation) {
+            return;
+        }
+        c.measured_at = Some(std::time::Instant::now());
+        c.sizes = sizes;
+    }
+
+    /// Drops cached volume sizes and advances the generation counter.
+    pub(super) fn invalidate_volume_sizes(&self) {
+        let mut c = self.volume_sizes_cache.lock().unwrap_or_else(|e| e.into_inner());
+        c.generation = c.generation.wrapping_add(1);
+        c.measured_at = None;
+        c.sizes.clear();
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_volume_sizes_cache_at(&self, at: std::time::Instant, sizes: HashMap<String, u64>) {
+        let mut c = self.volume_sizes_cache.lock().unwrap_or_else(|e| e.into_inner());
+        c.measured_at = Some(at);
+        c.sizes = sizes;
     }
 
     /// Queries `(in_use, capacity)` of the guest data disk while the VM is
@@ -5750,6 +5795,7 @@ impl Engine {
                 self.delete_volume_data(&v);
             }
         }
+        self.invalidate_volume_sizes();
         Ok(())
     }
 
@@ -5763,6 +5809,7 @@ impl Engine {
         let new = self.volume_get(name).is_none();
         let v = self.lock_volumes().ensure(name, labels, anonymous).map_err(Error::BadRequest)?;
         if new {
+            self.invalidate_volume_sizes();
             self.emit_volume("create", name);
         }
         Ok(v)
@@ -5774,6 +5821,7 @@ impl Engine {
         let new = self.volume_get(name).is_none();
         let v = self.lock_volumes().ensure_with(name, labels, false, options).map_err(Error::BadRequest)?;
         if new {
+            self.invalidate_volume_sizes();
             self.emit_volume("create", name);
         }
         Ok(v)
@@ -5838,6 +5886,7 @@ impl Engine {
     fn forget_volume(&self, name: &str) -> bool {
         let forgot = self.lock_volumes().forget(name);
         if forgot {
+            self.invalidate_volume_sizes();
             self.emit_volume("destroy", name);
         }
         forgot

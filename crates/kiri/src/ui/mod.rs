@@ -744,6 +744,40 @@ fn storage_status() {
     }
 }
 
+/// Volumes view: reads each volume's disk usage asynchronously without waking
+/// a sleeping VM or blocking `refresh()`. Single-flight with coalesced re-run
+/// so repeated UI messages never accumulate background threads.
+fn spawn_volume_sizes() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static BUSY: AtomicBool = AtomicBool::new(false);
+    static RERUN: AtomicBool = AtomicBool::new(false);
+
+    if BUSY.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        RERUN.store(true, Ordering::Release);
+        return;
+    }
+    std::thread::spawn(|| {
+        struct Guard<'a>(&'a AtomicBool);
+        impl Drop for Guard<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let _guard = Guard(&BUSY);
+        loop {
+            RERUN.store(false, Ordering::Release);
+            let sizes = client::get_background("/kiri/volumes/sizes")
+                .ok()
+                .and_then(|v| v.get("sizes").filter(|s| s.is_object()).cloned())
+                .unwrap_or_else(|| serde_json::json!({}));
+            emit(serde_json::json!({"type": "volumesizes", "sizes": sizes}).to_string());
+            if !RERUN.swap(false, Ordering::AcqRel) {
+                break;
+            }
+        }
+    });
+}
+
 /// Validates a proposed storage folder and emits `storagecheck` to the page.
 fn storage_check(path: Option<String>, fresh: bool, reset: bool) {
     let mut body = serde_json::json!({"fresh": fresh});
@@ -2574,6 +2608,10 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
         // Settings → Storage: data directory location, validation, and moving.
         "storage" => {
             std::thread::spawn(storage_status);
+            Ok(())
+        }
+        "volumesizes" => {
+            spawn_volume_sizes();
             Ok(())
         }
         "storagepick" => {

@@ -348,9 +348,9 @@ pub fn get_quick(path: &str) -> io::Result<Value> {
 }
 
 /// A GET marked as the window's own, which doesn't count as use (as the
-/// Mac's `get_background`, for crates/kiri/src/builds.rs).
+/// Mac's `get_background`, for crates/kiri/src/builds.rs), bounded by 120 s.
 pub fn get_background(path: &str) -> io::Result<Value> {
-    let r = request_with("GET", path, None, true)?;
+    let r = request_within("GET", path, None, true, Some(Duration::from_secs(120)))?;
     if !r.ok() {
         return Err(io::Error::other(r.error()));
     }

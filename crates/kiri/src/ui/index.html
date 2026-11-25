@@ -2804,7 +2804,7 @@ const VM = LINUX ? "Engine" : "Linux VM";
 const shareOn = () => !!(ui.status?.share ?? ui.status?.dev);
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 
-const ui = { acting: new Map(), gacting: new Map(), running: new Set(), launched: new Map(), runWatch: new Map(), need: null, probed: new Map(), probing: new Set(), why: new Map(), startErr: {}, fixed: null, openTab: null, listening: new Map(), starting: new Map(), scans: new Map(), scanf: { sev: "", fix: false, own: false }, view: "containers", vm: "stopped", containers: [], images: [], volumes: [], networks: [], sort: { images: { key: "pulled", desc: true } }, filter: "", suffix: "kiri.localhost", collapsed: new Set(), res: null, resDraft: {}, storage: null, stErr: "", stReclaiming: false, stReclaimed: null, stPruning: false, stPruned: null, bset: null, bsetDraft: null, vmnet: null, shellPath: null, shellPathBusy: false, proxy: null, pxDraft: {}, rports: null, rpDraft: {}, rpAt: 0, regcfg: null, regBase: null, regDraft: { insecure: [], mirrors: [] }, regAdd: { insecure: "", mirrors: "" }, dockersock: null, sockTaking: false, ctxSwitching: false,
+const ui = { acting: new Map(), gacting: new Map(), running: new Set(), launched: new Map(), runWatch: new Map(), need: null, probed: new Map(), probing: new Set(), why: new Map(), startErr: {}, fixed: null, openTab: null, listening: new Map(), starting: new Map(), scans: new Map(), scanf: { sev: "", fix: false, own: false }, view: "containers", vm: "stopped", containers: [], images: [], volumes: [], volSizes: {}, volSizesLoading: false, volSizesAt: 0, volSizesKey: "", volSizesInFlight: 0, networks: [], sort: { images: { key: "pulled", desc: true } }, filter: "", suffix: "kiri.localhost", collapsed: new Set(), res: null, resDraft: {}, storage: null, stErr: "", stReclaiming: false, stReclaimed: null, stPruning: false, stPruned: null, bset: null, bsetDraft: null, vmnet: null, shellPath: null, shellPathBusy: false, proxy: null, pxDraft: {}, rports: null, rpDraft: {}, rpAt: 0, regcfg: null, regBase: null, regDraft: { insecure: [], mirrors: [] }, regAdd: { insecure: "", mirrors: "" }, dockersock: null, sockTaking: false, ctxSwitching: false,
   imp: { sources: null, source: null, inv: null, picked: { images: new Set(), volumes: new Set(), containers: new Set() }, steps: {}, running: false, summary: "" },
   upd: null, engineStale: null, staleHidden: false,
   // The Builds view: the list, the picked build and its detail, and how its steps show.
@@ -4982,6 +4982,7 @@ function show(view) {
   needClose();
   ui.view = view; ui.filter = ""; $("gq").value = "";
   if (view === "builds") send("builds");
+  if (view === "volumes") requestVolumeSizes();
   if (view === "compose") { cmp.open = null; cmp.asked = 0; cmpAsk(); }
   if (view === "usb") usbPoll();
   if (view === "share") { send("shares"); send("shareusage"); shPoll(); }
@@ -6508,13 +6509,47 @@ function renderImageDetail() {
     ${d.tab === "security" ? scanView(i, { own: tr("this image") }) : layersView(d.layers, null, { own: tr("Added in this image"), base: tr("From its base image") })}`;
 }
 
+const VOL_SIZES_TTL = 30000;
+function volumeListKey() {
+  return kept("volumes").map((v) => v.Name).sort().join("\0");
+}
+function requestVolumeSizes(force = false) {
+  if (ui.vm === "stopped" || !kept("volumes").length) return;
+  const key = volumeListKey();
+  const changed = key !== ui.volSizesKey;
+  const stale = !ui.volSizesAt || Date.now() - ui.volSizesAt >= VOL_SIZES_TTL;
+  if (!force && !changed && !stale) return;
+  if (ui.volSizesLoading && !changed && !force) return;
+  ui.volSizesKey = key;
+  ui.volSizesInFlight++;
+  ui.volSizesLoading = true;
+  send("volumesizes");
+}
+function volumeSizeOf(v) {
+  if (Object.prototype.hasOwnProperty.call(ui.volSizes, v.Name)) return ui.volSizes[v.Name];
+  if (typeof v.UsageData?.Size === "number") return v.UsageData.Size;
+  return null;
+}
+function volumeSizeCell(v) {
+  const s = volumeSizeOf(v);
+  if (typeof s === "number" && Number.isFinite(s) && s >= 0) return `<td class="r muted num">${esc(size(s))}</td>`;
+  if (ui.volSizesLoading && s === null) return '<td class="r muted num">…</td>';
+  return '<td class="r muted num">—</td>';
+}
+const VOLUME_SORT = {
+  name: (v) => v.Name || "",
+  driver: (v) => v.Driver || "",
+  size: (v) => { const s = volumeSizeOf(v); return typeof s === "number" && Number.isFinite(s) && s >= 0 ? s : -1; },
+  created: (v) => (v.CreatedAt ? Date.parse(v.CreatedAt) || 0 : 0),
+};
 function renderVolumes() {
-  const items = listed("volumes");
+  const items = sortBy(listed("volumes"), "volumes", VOLUME_SORT);
   if (!kept("volumes").length) return renderEmpty("volumes");
   if (!items.length) return noMatch();
-  table([[tr("Name")], [tr("Driver")], [tr("Created")]], items.map((v) => `<tr class="row${chosen("volumes", v)}" data-key="${esc(v.Name)}"${pickAt("volumes", v)}>
+  table([[tr("Name"), "", "name"], [tr("Driver"), "", "driver"], [tr("Size"), "r", "size"], [tr("Created"), "", "created"]], items.map((v) => `<tr class="row${chosen("volumes", v)}" data-key="${esc(v.Name)}"${pickAt("volumes", v)}>
     ${pickCell("volumes", v)}<td><div class="name">${tile(null, "database")}<span class="${v.Name.length > 40 ? "mono" : ""}">${esc(v.Name.length > 40 ? short(v.Name) : v.Name)}</span></div></td>
     <td class="muted">${esc(v.Driver)}</td>
+    ${volumeSizeCell(v)}
     <td class="muted">${v.CreatedAt ? ago(Date.parse(v.CreatedAt) / 1000) : ""}</td>
     <td class="actions"><div class="acts-row">${ibtn("trash", tr("Remove"), `data-rmvol="${esc(v.Name)}"`, "danger")}</div></td></tr>`), "volumes");
 }
@@ -7372,6 +7407,8 @@ function setVm(state, error) {
     if (ui.view === "settings" && prefs.tab === "resources") render();
     // Asleep, the VM holds no memory and the vm event says so (0 MB); off, there's nothing to read.
     if (state === "stopped" || state === "stopping") ["vm-mem"].forEach((id) => ($(id).textContent = "—")), ($("vm-meter").style.width = "0");
+    if (state === "stopped") { ui.volSizesInFlight = 0; ui.volSizesLoading = false; ui.volSizesAt = 0; }
+    if (state === "running" && was !== "running") { ui.volSizesAt = 0; if (ui.view === "volumes") { requestVolumeSizes(); render(); } }
     if (state === "stopped" || was === "stopped") render();
   }
   if (error) toast("error", error);
@@ -8461,12 +8498,21 @@ window.kiri = {
         // rest of the builder (its image, its cache volume) in Images and Volumes.
         ui.containers = (e.containers || []).filter((c) => !c.Labels?.["io.kiri.probe"] && !isBuildWorker(c)); oomCheck(); starCheck(); ui.builderImage = (e.images || []).find(isBuilderImage) || null; ui.builderVolume = (e.volumes || []).find(isBuilderVolume) || null;
         ui.images = (e.images || []).filter((i) => !isBuilderImage(i)); ui.volumes = (e.volumes || []).filter((v) => !isBuilderVolume(v)); ui.networks = e.networks || [];
+        if (!kept("volumes").length) { ui.volSizes = {}; ui.volSizesKey = ""; ui.volSizesAt = 0; ui.volSizesInFlight = 0; ui.volSizesLoading = false; }
+        else if (ui.view === "volumes") requestVolumeSizes();
         shPublished(); ctrActed(); groupActed();
         fixWatch();
         if (ui.view === "compose") cmpAsk();
         render();
         paintEngine();
         if (ui.openAfter && ui.containers.some((c) => c.Id === ui.openAfter)) { openDetail(ui.openAfter); ui.openAfter = null; openedTab(); }
+        break;
+      case "volumesizes":
+        ui.volSizes = e.sizes && typeof e.sizes === "object" ? e.sizes : {};
+        ui.volSizesInFlight = Math.max(0, ui.volSizesInFlight - 1);
+        ui.volSizesLoading = ui.volSizesInFlight > 0;
+        ui.volSizesAt = Date.now();
+        if (ui.view === "volumes") render();
         break;
       case "pull": pullEvent(e); break;
       case "composeprojects": case "composefile": case "composeplan": case "composelogs": case "composeapply": case "composeopened": case "composerestored": case "composeaction": cmpEvent(e); break;
