@@ -3407,6 +3407,7 @@ fn list(req: &Request, engine: &Engine) -> Result<Value, Error> {
             "KiriExitCode": c.exit_code,
             "KiriOOMKilled": c.oom_killed,
             "KiriVmStopped": c.vm_stopped,
+            "KiriStoppedByUser": c.stopped_by_user,
             "Ports": ports_list(c),
             "Labels": if c.spec.labels.is_object() { c.spec.labels.clone() } else { json!({}) },
             "HostConfig": {"NetworkMode": c.spec.network_mode},
