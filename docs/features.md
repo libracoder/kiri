@@ -48,7 +48,11 @@ Apple silicon and Intel Macs (macOS 14+), Windows 10 and 11 (x86-64 and Arm, thr
   `kiri domains reset` puts back 80 and 443
 - **Storage**: named and anonymous volumes, bind mounts of Mac paths
   (virtiofs), `--tmpfs`, `--mount`, `volume` commands; local volumes that
-  bind a folder (`driver_opts: {type: none, o: bind, device: /path}`)
+  bind a folder (`driver_opts: {type: none, o: bind, device: /path}`);
+  local-driver volumes with `driver_opts` `type=nfs` mount a remote NFS
+  export — NFSv4 (minorversion 4.0 and 4.1) and NFSv3, honouring `addr=`,
+  `nfsvers=`, `hard`/`soft`, `timeo`, `retrans`, `ro`/`rw` and `noatime`;
+  LUKS / `dm-crypt` in the guest kernel (`CONFIG_DM_CRYPT`)
 - **Images**: `pull` (with `docker login` credentials), `push`, `tag`,
   `save`, `load`, `history`, `search`, `image prune`, `system df`;
   **amd64 images run through Rosetta**, `--platform` honoured
@@ -246,3 +250,8 @@ To trust a private certificate authority at a Kiri Share edge only, set `KIRI_SH
   registry-1.docker.io ...`). The builder runs on the default bridge, so
   check from a container there:
   `docker run --rm alpine nslookup registry-1.docker.io`.
+
+- **`type=cifs` (SMB) volumes don't mount yet.** Kiri's guest kernel has no
+  CIFS client, so a local-driver volume with `driver_opts: {type: cifs}`
+  fails the same way NFS-backed volumes did before NFS support landed.
+  SMB support is a separate change.
