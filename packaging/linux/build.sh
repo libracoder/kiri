@@ -48,6 +48,17 @@ if [ -n "$window" ]; then
   [ -x "$window" ] || { echo "no $window" >&2; exit 1; }
   window=$(cd "$(dirname "$window")" && pwd)/$(basename "$window")
 fi
+# The strongest glibc the window binary really needs: the highest non-weak
+# GLIBC_ version it references. Weak refs (pidfd_spawnp, pidfd_getpid at
+# 2.39) only warn on older systems, so they must not raise the floor.
+# Reading the build host's glibc instead did exactly that and broke Ubuntu
+# 22.04 (#252). Empty when objdump is missing or finds nothing; the caller
+# then falls back to the host's version.
+glibc_floor() { # binary -> e.g. 2.34
+  local v
+  v=$(command -v objdump >/dev/null 2>&1 && objdump -T "$1" 2>/dev/null | grep -v ' w ' | grep -o 'GLIBC_2\.[0-9]*' | sed 's/GLIBC_//' | sort -Vu | tail -1)
+  [ -n "$v" ] && printf '%s' "$v"
+}
 mkdir -p "$outdir"
 outdir=$(cd "$outdir" && pwd)
 work=$(mktemp -d)
@@ -135,7 +146,7 @@ Homepage: https://runkiri.com
 Conflicts: $other
 Replaces: $other
 $([ "$full" = 1 ] || echo "Suggests: docker-cli | docker.io")
-$([ "$full" = 1 ] && [ -n "$window" ] && echo "Depends: libc6 (>= $(ldd --version | sed -n '1s/.* //p')), libgtk-3-0t64 | libgtk-3-0, libwebkit2gtk-4.1-0")
+$([ "$full" = 1 ] && [ -n "$window" ] && echo "Depends: libc6 (>= $(glibc_floor "$window" || ldd --version | sed -n '1s/.* //p')), libgtk-3-0t64 | libgtk-3-0, libwebkit2gtk-4.1-0")
 $([ "$full" = 1 ] && [ -n "$window" ] && echo "Recommends: pkexec | policykit-1")
 Description: Tiny, fast container runtime (Docker API)$([ "$full" = 1 ] || echo ", engine only")
  Kiri runs containers on this machine's kernel and speaks the Docker API on
