@@ -2503,6 +2503,13 @@ if [ "${K8S:-0}" = 1 ]; then
   t k8s-context-gone "0" bash -c "env HOME=$KH kubectl config get-contexts -o name | grep -c kiri"
   rm -rf "$KH"
 fi
+# A k8s.json that can't be parsed is reported, not replaced with the defaults.
+# The first `set` (no file yet) saves one, which shows where it lives.
+if [ -x "$KIRI" ]; then
+  t k8s-set-keeps-malformed-config "malformed-settings-kept" bash -c 'h=$(mktemp -d); k() { env HOME="$h" KIRI_SOCKET="$2" "$1" k8s set --lan off; }; k "$@" >/dev/null 2>&1 || exit; for f in "$h"/.kiri*/k8s.json; do :; done; [ -f "$f" ] || exit; printf %s "{\"lan\":true,\"port\":6445,\"tls_san\":[" > "$f"; cp "$f" "$h/before"; out=$(k "$@" 2>&1) || case $out in *"$f is not valid Kubernetes settings ("*"); fix or remove it"*) cmp -s "$h/before" "$f" && echo malformed-settings-kept ;; esac; rm -rf "$h"' _ "$KIRI" "$SOCK"
+else
+  skip_setup k8s-set-keeps-malformed-config "no kiri CLI found: set KIRI=/path/to/kiri"
+fi
 
 section "the API's answers, as Docker gives them"
 API="curl -s -m 20 --unix-socket $SOCK"

@@ -125,6 +125,30 @@ fn load_config_from(path: &std::path::Path) -> Config {
     std::fs::read(path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
 }
 
+/// The settings `kiri k8s set` changes and saves back. Only a missing file is
+/// the defaults: one that can't be read or parsed is an error, not replaced.
+fn load_config_for_edit(path: &std::path::Path) -> io::Result<Config> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Config::default()),
+        Err(e) => {
+            return Err(io::Error::new(
+                e.kind(),
+                format!("cannot read {}: {e}", path.display()),
+            ));
+        }
+    };
+    serde_json::from_slice(&bytes).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{} is not valid Kubernetes settings ({e}); fix or remove it",
+                path.display()
+            ),
+        )
+    })
+}
+
 fn save_config_to(path: &std::path::Path, cfg: &Config) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -355,7 +379,8 @@ pub(crate) fn format_status(info: Option<&serde_json::Value>, cfg: &Config) -> S
 /// `kiri k8s set [--lan on|off] [--tls-san a,b] [--port N] [--version TAG|default] [--k3s-arg ARG]… [--clear-k3s-args]`:
 /// saves the settings and, if the cluster exists and they changed, recreates its node with them.
 fn set(args: &[String]) -> io::Result<()> {
-    let mut cfg = config();
+    let path = config_path()?;
+    let mut cfg = load_config_for_edit(&path)?;
     let before = cfg.clone();
     apply_set_args(&mut cfg, args)?;
     ensure_daemon()?;
@@ -365,7 +390,6 @@ fn set(args: &[String]) -> io::Result<()> {
     if port != before.api_port() && node.as_ref().and_then(bound_port) != Some(port) && !port_free(port, cfg.lan) {
         return Err(io::Error::other(format!("port {port} is in use on this Mac; choose another")));
     }
-    let path = config_path()?;
     save_config_to(&path, &cfg)?;
     println!("{}", format_settings(&cfg));
     let Some(node) = node else {
@@ -1045,6 +1069,41 @@ fn delete() -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn editing_rejects_malformed_settings() {
+        let dir = std::env::temp_dir().join(format!("kiri-k8s-edit-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("k8s.json");
+        let bad = br#"{"lan":true,"port":6445,"tls_san":["#;
+        std::fs::write(&path, bad).unwrap();
+        let err = super::load_config_for_edit(&path)
+            .expect_err("malformed settings must not load as defaults");
+        assert!(
+            err.to_string().contains(&path.display().to_string()),
+            "{err}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bad);
+
+        // No file yet: the defaults, so a first `kiri k8s set` still saves.
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            super::load_config_for_edit(&path).unwrap(),
+            super::Config::default()
+        );
+
+        std::fs::write(
+            &path,
+            br#"{"lan":true,"port":6445,"tls_san":["k8s.example"]}"#,
+        )
+        .unwrap();
+        let cfg = super::load_config_for_edit(&path).unwrap();
+        assert_eq!(
+            (cfg.port, cfg.tls_san),
+            (Some(6445), vec!["k8s.example".to_owned()])
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn the_port_comes_from_the_binding_then_the_label() {
         let running = serde_json::json!({"NetworkSettings": {"Ports": {"6443/tcp": [{"HostIp": "127.0.0.1", "HostPort": "6444"}]}}, "Config": {"Labels": {"dev.kiri.k8s.port": "6450"}}});
