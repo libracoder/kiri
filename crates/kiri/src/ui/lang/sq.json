@@ -2033,5 +2033,7 @@
   "Could not update shell profiles: {error}": "Profilet e shell-it nuk u përditësuan dot: {error}",
   "Uninstalling Kiri…": "Po çinstalohet Kiri…",
   "Could not uninstall Kiri: {error}": "Kiri nuk u çinstalua dot: {error}",
-  "Uninstall Kiri using your system package manager": "Çinstaloni Kiri duke përdorur menaxherin e paketave të sistemit"
+  "Uninstall Kiri using your system package manager": "Çinstaloni Kiri duke përdorur menaxherin e paketave të sistemit",
+  "Swap": "Swap",
+  "Disk space the VM may use when its memory runs out, so containers slow down instead of being stopped. Applies on restart.": "Hapësirë në disk që VM mund ta përdorë kur i mbaron memoria, që kontejnerët të ngadalësohen në vend që të ndalen. Zbatohet pas rinisjes."
 }

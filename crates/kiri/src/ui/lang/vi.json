@@ -2033,5 +2033,7 @@
   "Could not update shell profiles: {error}": "Không thể cập nhật hồ sơ shell: {error}",
   "Uninstalling Kiri…": "Đang gỡ cài đặt Kiri…",
   "Could not uninstall Kiri: {error}": "Không thể gỡ cài đặt Kiri: {error}",
-  "Uninstall Kiri using your system package manager": "Hãy gỡ cài đặt Kiri bằng trình quản lý gói của hệ thống"
+  "Uninstall Kiri using your system package manager": "Hãy gỡ cài đặt Kiri bằng trình quản lý gói của hệ thống",
+  "Swap": "Swap",
+  "Disk space the VM may use when its memory runs out, so containers slow down instead of being stopped. Applies on restart.": "Dung lượng đĩa mà VM có thể dùng khi hết bộ nhớ, để container chạy chậm lại thay vì bị dừng. Áp dụng khi khởi động lại."
 }

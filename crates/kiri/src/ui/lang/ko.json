@@ -2033,5 +2033,7 @@
   "Could not update shell profiles: {error}": "셸 프로필을 업데이트할 수 없습니다: {error}",
   "Uninstalling Kiri…": "Kiri 제거 중…",
   "Could not uninstall Kiri: {error}": "Kiri를 제거할 수 없습니다: {error}",
-  "Uninstall Kiri using your system package manager": "시스템 패키지 관리자로 Kiri를 제거하세요"
+  "Uninstall Kiri using your system package manager": "시스템 패키지 관리자로 Kiri를 제거하세요",
+  "Swap": "스왑",
+  "Disk space the VM may use when its memory runs out, so containers slow down instead of being stopped. Applies on restart.": "VM의 메모리가 부족할 때 사용할 수 있는 디스크 공간입니다. 컨테이너가 중지되지 않고 느려지기만 합니다. 다시 시작하면 적용됩니다."
 }

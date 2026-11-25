@@ -2033,5 +2033,7 @@
   "Could not update shell profiles: {error}": "無法更新 Shell 設定檔：{error}",
   "Uninstalling Kiri…": "正在解除安裝 Kiri…",
   "Could not uninstall Kiri: {error}": "無法解除安裝 Kiri：{error}",
-  "Uninstall Kiri using your system package manager": "請使用系統套件管理員解除安裝 Kiri"
+  "Uninstall Kiri using your system package manager": "請使用系統套件管理員解除安裝 Kiri",
+  "Swap": "交換空間",
+  "Disk space the VM may use when its memory runs out, so containers slow down instead of being stopped. Applies on restart.": "虛擬機記憶體用盡時可使用的磁碟空間，容器會變慢而不是被停止。重新啟動後生效。"
 }

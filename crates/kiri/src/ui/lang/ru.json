@@ -2033,5 +2033,7 @@
   "Could not update shell profiles: {error}": "Не удалось обновить профили оболочки: {error}",
   "Uninstalling Kiri…": "Удаление Kiri…",
   "Could not uninstall Kiri: {error}": "Не удалось удалить Kiri: {error}",
-  "Uninstall Kiri using your system package manager": "Удалите Kiri с помощью системного пакетного менеджера"
+  "Uninstall Kiri using your system package manager": "Удалите Kiri с помощью системного пакетного менеджера",
+  "Swap": "Подкачка (swap)",
+  "Disk space the VM may use when its memory runs out, so containers slow down instead of being stopped. Applies on restart.": "Место на диске, которое VM может использовать, когда заканчивается память: контейнеры замедляются, а не останавливаются. Применяется после перезапуска."
 }

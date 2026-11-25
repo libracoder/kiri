@@ -1039,8 +1039,8 @@ fn resources(engine: &Engine) -> Value {
     let disk: Option<(u64, u64, u64)> = None;
     let overridden = std::env::var_os("KIRI_CPUS").is_some()
         || std::env::var_os("KIRI_MEMORY_MIB").is_some()
-        || (cfg!(target_os = "macos") && std::env::var_os("KIRI_DISK_GB").is_some());
-    resources_payload(
+        || (cfg!(target_os = "macos") && (std::env::var_os("KIRI_DISK_GB").is_some() || std::env::var_os("KIRI_SWAP_MIB").is_some()));
+    let mut v = resources_payload(
         e::vm_cpus(),
         e::memory_ceiling() >> 20,
         engine.cpus(),
@@ -1050,7 +1050,19 @@ fn resources(engine: &Engine) -> Value {
         e::physical_memory_bytes() >> 20,
         overridden,
         disk,
-    )
+    );
+    // Swap is the VM's, on its data disk: a Linux host has its own.
+    if cfg!(target_os = "macos") {
+        swap_payload(&mut v, e::vm_swap_mib(), engine.swap_mib());
+    }
+    v
+}
+
+/// The swap the VM boots with next, what it has now, and the most it may have.
+fn swap_payload(v: &mut Value, swap_mib: u64, running_swap_mib: u64) {
+    v["swap_mib"] = json!(swap_mib);
+    v["running_swap_mib"] = json!(running_swap_mib);
+    v["max_swap_mib"] = json!(super::engine::MAX_SWAP_MIB);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1214,6 +1226,12 @@ fn save_resources(
         .unwrap_or_else(|| json!({}));
     out["cpus"] = json!(cpus);
     out["memory_mib"] = json!(mem);
+    // Left out, the saved swap stays (#326).
+    if let Some(val) = body.get("swap_mib").filter(|v| !v.is_null()) {
+        let max = super::engine::MAX_SWAP_MIB;
+        let swap = val.as_u64().filter(|s| *s <= max).ok_or_else(|| Error::BadRequest(format!("swap_mib must be 0 to {max}")))?;
+        out["swap_mib"] = json!(swap);
+    }
     if let Some(val) = body.get("disk_gb").filter(|v| !v.is_null()) {
         let current = current_disk_gb.unwrap_or(crate::guest::disk::DEFAULT_GB);
         let (min_disk, max_disk) = crate::guest::disk::ui_bounds(current, existing_disk_gb.unwrap_or(current));
@@ -8151,5 +8169,35 @@ mod resources_disk_tests {
         assert!(root.join("srv/app").is_dir());
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Settings → Resources keeps the VM's swap (#326): 0 to 16 GiB, kept
+    /// when a save leaves it out.
+    #[test]
+    fn swap_is_saved_checked_and_kept() {
+        let dir = std::env::temp_dir().join(format!("kiri-res-swap-{}", std::process::id()));
+        let path = dir.join("vm.json");
+        let _ = std::fs::remove_dir_all(&dir);
+        let save = |body: Value| save_resources(body.to_string().as_bytes(), &path, 12, 32768, Some(64), None, None);
+        let saved = || serde_json::from_slice::<Value>(&std::fs::read(&path).unwrap()).unwrap();
+
+        save(json!({"cpus": 4, "memory_mib": 8192, "swap_mib": 2048})).unwrap();
+        assert_eq!(saved()["swap_mib"], 2048);
+        save(json!({"cpus": 4, "memory_mib": 4096})).unwrap();
+        assert_eq!(saved()["swap_mib"], 2048, "left out, the swap stays");
+        save(json!({"cpus": 4, "memory_mib": 4096, "swap_mib": 0})).unwrap();
+        assert_eq!(saved()["swap_mib"], 0, "0 is no swap");
+        for bad in [json!(-1), json!(16 * 1024 + 1), json!("1024"), json!(1.5)] {
+            match save(json!({"cpus": 4, "memory_mib": 4096, "swap_mib": bad})) {
+                Err(Error::BadRequest(msg)) => assert!(msg.contains("swap_mib must be 0 to 16384"), "{msg}"),
+                other => panic!("expected BadRequest for {bad}, got {other:?}"),
+            }
+        }
+        assert_eq!(saved()["swap_mib"], 0, "a refused save changes nothing");
+
+        let mut v = json!({});
+        swap_payload(&mut v, 2048, 1024);
+        assert_eq!(v, json!({"swap_mib": 2048, "running_swap_mib": 1024, "max_swap_mib": 16384}));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

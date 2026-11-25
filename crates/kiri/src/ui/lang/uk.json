@@ -2033,5 +2033,7 @@
   "Could not update shell profiles: {error}": "Не вдалося оновити профілі оболонки: {error}",
   "Uninstalling Kiri…": "Видалення Kiri…",
   "Could not uninstall Kiri: {error}": "Не вдалося видалити Kiri: {error}",
-  "Uninstall Kiri using your system package manager": "Видаліть Kiri за допомогою системного менеджера пакунків"
+  "Uninstall Kiri using your system package manager": "Видаліть Kiri за допомогою системного менеджера пакунків",
+  "Swap": "Підкачка (swap)",
+  "Disk space the VM may use when its memory runs out, so containers slow down instead of being stopped. Applies on restart.": "Місце на диску, яке VM може використовувати, коли закінчується пам'ять: контейнери сповільнюються, а не зупиняються. Застосовується після перезапуску."
 }

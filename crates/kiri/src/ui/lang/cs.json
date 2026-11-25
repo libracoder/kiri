@@ -2033,5 +2033,7 @@
   "Could not update shell profiles: {error}": "Profily shellu se nepodařilo aktualizovat: {error}",
   "Uninstalling Kiri…": "Odinstalovávání Kiri…",
   "Could not uninstall Kiri: {error}": "Kiri se nepodařilo odinstalovat: {error}",
-  "Uninstall Kiri using your system package manager": "Odinstalujte Kiri pomocí správce balíčků vašeho systému"
+  "Uninstall Kiri using your system package manager": "Odinstalujte Kiri pomocí správce balíčků vašeho systému",
+  "Swap": "Swap",
+  "Disk space the VM may use when its memory runs out, so containers slow down instead of being stopped. Applies on restart.": "Místo na disku, které VM může použít, když jí dojde paměť, takže se kontejnery zpomalí, místo aby byly zastaveny. Projeví se po restartu."
 }

@@ -4540,13 +4540,14 @@ function routerPortsPref() {
 const gb = (mib) => `${Math.round(mib / 1024)} GB`;
 const diskGb = (g) => `${g} GB`;
 const cpuText = (n) => trn(n, "{n} CPU", "{n} CPUs");
+const swapText = (mib) => mib ? (mib % 1024 ? `${(mib / 1024).toFixed(1)} GB` : gb(mib)) : tr("Off");
 /* How far along its track a slider's blue fill reaches, as CSS: to the
    middle of the thumb, which travels the track less its own 26 px. */
 const rangeFill = (v, min, max) => {
   const f = max > min ? (v - min) / (max - min) : 0;
   return `calc(13px + (100% - 26px) * ${f.toFixed(4)})`;
 };
-const resChanged = () => ui.res && (ui.resDraft.cpus !== ui.res.cpus || ui.resDraft.memory_mib !== ui.res.memory_mib || (ui.res.disk_gb != null && ui.resDraft.disk_gb !== ui.res.disk_gb));
+const resChanged = () => ui.res && (ui.resDraft.cpus !== ui.res.cpus || ui.resDraft.memory_mib !== ui.res.memory_mib || (ui.res.disk_gb != null && ui.resDraft.disk_gb !== ui.res.disk_gb) || (ui.res.swap_mib != null && ui.resDraft.swap_mib !== ui.res.swap_mib));
 /* Settings › Resources: the engine's on/off, the same switch as the card. */
 function enginePane() {
   const { shown } = engineShown(), off = shown === "stopped";
@@ -4571,12 +4572,17 @@ function resourcesPane() {
   const maxDisk = Math.max(minDisk, r.max_disk_gb ?? 1024);
   const diskVal = hasDisk ? Math.min(Math.max(d.disk_gb ?? r.disk_gb, minDisk), maxDisk) : minDisk;
   const diskStep = minDisk % 8 === 0 && diskVal % 8 === 0 && maxDisk % 8 === 0 ? 8 : 1;
-  const pending = r.awake && (r.running_cpus !== r.cpus || Math.abs(r.running_memory_mib - r.memory_mib) > 64 || (hasDisk && r.running_disk_gb != null && r.running_disk_gb !== r.disk_gb));
+  const hasSwap = r.swap_mib != null;
+  const maxSwap = r.max_swap_mib ?? 16384;
+  const swapVal = hasSwap ? Math.min(d.swap_mib ?? r.swap_mib, maxSwap) : 0;
+  const pending = r.awake && (r.running_cpus !== r.cpus || Math.abs(r.running_memory_mib - r.memory_mib) > 64 || (hasDisk && r.running_disk_gb != null && r.running_disk_gb !== r.disk_gb) || (hasSwap && r.running_swap_mib != null && r.running_swap_mib !== r.swap_mib));
   return `<div class="pane"><h3>${tr("Resources")}</h3>
     <div class="pref"><span class="t">${tr("CPUs")}</span><span class="d">${LINUX ? tr("Shared with Linux: containers only use them while busy.") : tr("Shared with {os}: the VM only uses them while containers are busy.", { os: OS })}</span>
       <div class="range"><input type="range" id="res-cpus" min="1" max="${r.max_cpus}" step="1" value="${d.cpus}" aria-label="${tr("CPUs")}" style="--fill:${rangeFill(d.cpus, 1, r.max_cpus)}"><span class="num" id="res-cpus-v">${cpuText(d.cpus)}</span></div></div>
     <div class="pref"><span class="t">${tr("Memory")}</span><span class="d">${LINUX ? tr("The most containers and the engine may take. Unused memory stays free on Linux.") : tr("The most the VM may take. It uses memory only as containers need it and gives the rest back to {os}.", { os: OS })}</span>
       <div class="range"><input type="range" id="res-mem" min="1024" max="${maxGb * 1024}" step="1024" value="${Math.min(d.memory_mib, maxGb * 1024)}" aria-label="${tr("Memory")}" style="--fill:${rangeFill(Math.min(d.memory_mib, maxGb * 1024), 1024, maxGb * 1024)}"><span class="num" id="res-mem-v">${gb(d.memory_mib)}</span></div></div>
+    ${hasSwap ? `<div class="pref"><span class="t">${tr("Swap")}</span><span class="d">${tr("Disk space the VM may use when its memory runs out, so containers slow down instead of being stopped. Applies on restart.")}</span>
+      <div class="range"><input type="range" id="res-swap" min="0" max="${maxSwap}" step="512" value="${swapVal}" aria-label="${tr("Swap")}" style="--fill:${rangeFill(swapVal, 0, maxSwap)}"><span class="num" id="res-swap-v">${swapText(swapVal)}</span></div></div>` : ""}
     ${hasDisk ? `<div class="pref"><span class="t">${tr("Disk image size")}</span><span class="d">${tr("The most the VM disk may grow to. Space is used on {os} only as data is written, and unused space can be reclaimed in {storage}. Applies on restart.", { os: OS, storage: `<button class="linkbtn" data-stgoto>${tr("Settings → Storage")}</button>` })}</span>
       <div class="range"><input type="range" id="res-disk" min="${minDisk}" max="${maxDisk}" step="${diskStep}" value="${diskVal}" aria-label="${tr("Disk image size")}" style="--fill:${rangeFill(diskVal, minDisk, maxDisk)}"><span class="num" id="res-disk-v">${diskGb(diskVal)}</span></div></div>` : ""}
     ${r.overridden ? `<p class="muted">${hasDisk ? tr("KIRI_CPUS, KIRI_MEMORY_MIB or KIRI_DISK_GB is set for the daemon, and it takes precedence over these.") : tr("KIRI_CPUS or KIRI_MEMORY_MIB is set for the daemon, and it takes precedence over these.")}</p>` : ""}
@@ -4942,11 +4948,11 @@ function renderSettings() {
     const go = document.querySelector("#content [data-impgo]"), n = importCount();
     if (go) { go.disabled = !n; go.textContent = n ? trn(n, "Import {n} item", "Import {n} items") : tr("Import"); }
   }));
-  for (const id of ["res-cpus", "res-mem", "res-disk"]) $(id)?.addEventListener("input", (ev) => {
+  for (const id of ["res-cpus", "res-mem", "res-disk", "res-swap"]) $(id)?.addEventListener("input", (ev) => {
     const v = +ev.target.value;
-    ui.resDraft[id === "res-cpus" ? "cpus" : id === "res-mem" ? "memory_mib" : "disk_gb"] = v;
+    ui.resDraft[{ "res-cpus": "cpus", "res-mem": "memory_mib", "res-disk": "disk_gb", "res-swap": "swap_mib" }[id]] = v;
     ev.target.style.setProperty("--fill", rangeFill(v, +ev.target.min, +ev.target.max));
-    $(`${id}-v`).textContent = id === "res-cpus" ? cpuText(v) : id === "res-mem" ? gb(v) : diskGb(v);
+    $(`${id}-v`).textContent = id === "res-cpus" ? cpuText(v) : id === "res-mem" ? gb(v) : id === "res-swap" ? swapText(v) : diskGb(v);
     $("res-save").disabled = !resChanged();
   });
   $("pref-font")?.addEventListener("change", (ev) => setPref("font", ev.target.value));
@@ -8661,7 +8667,7 @@ window.kiri = {
         if (ui.view === "settings") render();
         break;
       }
-      case "resources": ui.res = e; if (e.watch_bind_mounts != null && prefs.watchBindMounts == null) prefs.watchBindMounts = !!e.watch_bind_mounts; ui.resDraft = { cpus: e.cpus, memory_mib: e.memory_mib, ...(e.disk_gb != null ? { disk_gb: e.disk_gb } : {}) }; if (ui.view === "settings") render(); break;
+      case "resources": ui.res = e; if (e.watch_bind_mounts != null && prefs.watchBindMounts == null) prefs.watchBindMounts = !!e.watch_bind_mounts; ui.resDraft = { cpus: e.cpus, memory_mib: e.memory_mib, ...(e.disk_gb != null ? { disk_gb: e.disk_gb } : {}), ...(e.swap_mib != null ? { swap_mib: e.swap_mib } : {}) }; if (ui.view === "settings") render(); break;
       case "storage": {
         const wasUnavail = ui.storage?.state === "unavailable";
         ui.storage = e;

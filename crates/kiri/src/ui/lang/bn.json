@@ -2033,5 +2033,7 @@
   "Could not update shell profiles: {error}": "শেল প্রোফাইল আপডেট করা যায়নি: {error}",
   "Uninstalling Kiri…": "Kiri আনইনস্টল হচ্ছে…",
   "Could not uninstall Kiri: {error}": "Kiri আনইনস্টল করা যায়নি: {error}",
-  "Uninstall Kiri using your system package manager": "আপনার সিস্টেমের প্যাকেজ ম্যানেজার দিয়ে Kiri আনইনস্টল করুন"
+  "Uninstall Kiri using your system package manager": "আপনার সিস্টেমের প্যাকেজ ম্যানেজার দিয়ে Kiri আনইনস্টল করুন",
+  "Swap": "সোয়াপ",
+  "Disk space the VM may use when its memory runs out, so containers slow down instead of being stopped. Applies on restart.": "মেমরি ফুরিয়ে গেলে VM যে ডিস্ক স্পেস ব্যবহার করতে পারে, ফলে কন্টেইনার বন্ধ না হয়ে ধীর হয়ে যায়। রিস্টার্টে প্রযোজ্য হয়।"
 }

@@ -2033,5 +2033,7 @@
   "Could not update shell profiles: {error}": "Profilov lupine ni bilo mogoče posodobiti: {error}",
   "Uninstalling Kiri…": "Odstranjevanje Kirija …",
   "Could not uninstall Kiri: {error}": "Kirija ni bilo mogoče odstraniti: {error}",
-  "Uninstall Kiri using your system package manager": "Odstranite Kiri z upraviteljem paketov svojega sistema"
+  "Uninstall Kiri using your system package manager": "Odstranite Kiri z upraviteljem paketov svojega sistema",
+  "Swap": "Swap",
+  "Disk space the VM may use when its memory runs out, so containers slow down instead of being stopped. Applies on restart.": "Prostor na disku, ki ga VM lahko uporabi, ko ji zmanjka pomnilnika, da se vsebniki upočasnijo, namesto da bi se ustavili. Velja po ponovnem zagonu."
 }

@@ -2033,5 +2033,7 @@
   "Could not update shell profiles: {error}": "به‌روزرسانی پروفایل‌های شل ممکن نشد: {error}",
   "Uninstalling Kiri…": "در حال حذف نصب Kiri…",
   "Could not uninstall Kiri: {error}": "حذف نصب Kiri ممکن نشد: {error}",
-  "Uninstall Kiri using your system package manager": "Kiri را با مدیر بستهٔ سیستم خود حذف نصب کنید"
+  "Uninstall Kiri using your system package manager": "Kiri را با مدیر بستهٔ سیستم خود حذف نصب کنید",
+  "Swap": "سواپ",
+  "Disk space the VM may use when its memory runs out, so containers slow down instead of being stopped. Applies on restart.": "فضای دیسکی که VM هنگام تمام شدن حافظه‌اش می‌تواند استفاده کند تا کانتینرها به‌جای متوقف شدن کند شوند. پس از راه‌اندازی مجدد اعمال می‌شود."
 }
