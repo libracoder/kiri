@@ -331,12 +331,33 @@ fn names(installed: bool) -> Check {
 
 /// Whether a docker host is this Kiri's socket: `Some(false)` only when
 /// both are local sockets and resolve to different files (another Kiri,
-/// such as the installed one next to Kiri Dev).
+/// such as the installed one next to Kiri Dev). On Linux, a root daemon
+/// without `KIRI_SOCKET` binds both `/run/kiri/docker.sock` and
+/// `~/.kiri/run/docker.sock`, so both belong to this Kiri.
 #[cfg(unix)]
 fn ours_unix(host: &str) -> Option<bool> {
-    let theirs = std::fs::canonicalize(host.strip_prefix("unix://")?).ok()?;
+    let raw = std::path::Path::new(host.strip_prefix("unix://")?);
+    let theirs = std::fs::canonicalize(raw).ok()?;
     let ours = std::fs::canonicalize(crate::client::socket().ok()?).ok()?;
-    Some(theirs == ours)
+    if theirs == ours {
+        return Some(true);
+    }
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("KIRI_SOCKET").is_none() {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        if let Ok(home_sock) = crate::daemon::home_socket_path()
+            && let Ok(md) = std::fs::symlink_metadata(&home_sock)
+            && !md.file_type().is_symlink()
+            && md.file_type().is_socket()
+            && md.uid() == 0
+            && std::fs::symlink_metadata(crate::client::SERVICE_SOCKET)
+                .is_ok_and(|smd| !smd.file_type().is_symlink() && smd.file_type().is_socket() && smd.uid() == 0)
+            && std::fs::canonicalize(&home_sock).ok().as_ref() == Some(&theirs)
+        {
+            return Some(true);
+        }
+    }
+    Some(false)
 }
 
 enum Reached {

@@ -428,9 +428,26 @@ pub fn run(_args: &[String]) -> io::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
+#[cfg(test)]
 fn admit_connection(gate: &Option<std::sync::Arc<access::Gate>>, conn: &UnixStream) -> Result<Option<access::Seat>, ()> {
+    admit_connection_for(gate, conn, None, &None)
+}
+
+#[cfg(target_os = "linux")]
+fn admit_connection_for(
+    gate: &Option<std::sync::Arc<access::Gate>>,
+    conn: &UnixStream,
+    pinned: Option<access::PinnedPeer>,
+    container_engine: &Option<std::sync::Arc<engine::Engine>>,
+) -> Result<Option<access::Seat>, ()> {
     match gate {
-        Some(gate) => gate.admit(conn).map(Some).ok_or(()),
+        Some(gate) => {
+            let seat = match container_engine {
+                Some(eng) => gate.admit_container(conn, pinned, |cg| eng.has_running_container_cgroup(cg)),
+                None => gate.admit(conn),
+            };
+            seat.map(Some).ok_or(())
+        }
         None => Ok(None),
     }
 }
@@ -443,12 +460,16 @@ fn accept(
     who: caller::Caller,
 ) {
     let cap = open_conns_for(&who);
+    #[cfg(target_os = "linux")]
+    let container_engine = matches!(who, caller::Caller::Container).then(|| engine.clone());
     let engine = engine.clone();
-    serve_each_with(
+    serve_each_inner(
         listener,
         cap,
         #[cfg(target_os = "linux")]
         gate,
+        #[cfg(target_os = "linux")]
+        container_engine,
         std::sync::Arc::new(move |conn| {
             let _ = api::serve(conn, engine.clone(), who.clone());
         }),
@@ -583,6 +604,24 @@ fn serve_each_with(
     #[cfg(target_os = "linux")] gate: &Option<std::sync::Arc<access::Gate>>,
     serve: std::sync::Arc<dyn Fn(UnixStream) + Send + Sync>,
 ) {
+    serve_each_inner(
+        listener,
+        cap,
+        #[cfg(target_os = "linux")]
+        gate,
+        #[cfg(target_os = "linux")]
+        None,
+        serve,
+    );
+}
+
+fn serve_each_inner(
+    listener: &UnixListener,
+    cap: &std::sync::Arc<ConnCap>,
+    #[cfg(target_os = "linux")] gate: &Option<std::sync::Arc<access::Gate>>,
+    #[cfg(target_os = "linux")] container_engine: Option<std::sync::Arc<engine::Engine>>,
+    serve: std::sync::Arc<dyn Fn(UnixStream) + Send + Sync>,
+) {
     for conn in listener.incoming() {
         let Ok(conn) = conn else { continue };
         let Some(permit) = cap.try_acquire() else {
@@ -590,15 +629,26 @@ fn serve_each_with(
             drop(conn);
             continue;
         };
+        // Capture `/proc/<pid>` credentials + cgroup synchronously at `accept()`
+        // before spawning `kiri-api`, preventing short-lived client exit races
+        // and PID-reuse TOCTOU (#127).
+        #[cfg(target_os = "linux")]
+        let pinned = if gate.is_some() && container_engine.is_some() {
+            access::PinnedPeer::capture(&conn)
+        } else {
+            None
+        };
         let serve = serve.clone();
         #[cfg(target_os = "linux")]
         let gate = gate.clone();
+        #[cfg(target_os = "linux")]
+        let container_engine = container_engine.clone();
         let spawned = std::thread::Builder::new().name("kiri-api".into()).spawn(move || {
             let _permit = permit;
             // Checked here, not in the accept loop: a slow user lookup holds up
             // this connection only.
             #[cfg(target_os = "linux")]
-            let Ok(_seat) = admit_connection(&gate, &conn) else {
+            let Ok(_seat) = admit_connection_for(&gate, &conn, pinned, &container_engine) else {
                 return;
             };
             serve(conn);

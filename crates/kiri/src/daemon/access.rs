@@ -269,19 +269,44 @@ enum GetentRaw {
     Ran(std::process::ExitStatus, Vec<u8>),
 }
 
-/// Runs `program -- <args...>` with a sanitized environment, bounded duration,
+#[derive(Clone, Copy)]
+enum GetentDb {
+    Passwd,
+    Group,
+    Initgroups,
+}
+
+impl GetentDb {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Passwd => "passwd",
+            Self::Group => "group",
+            Self::Initgroups => "initgroups",
+        }
+    }
+}
+
+/// Runs `program <db> <keys...>` with a sanitized environment, bounded duration,
 /// and bounded stdout capture. Kills the child process group and reaps it on
 /// timeout or oversized output.
-fn exec_getent(program: &Path, args: &[&OsStr], timeout: Duration, max_bytes: usize) -> io::Result<GetentRaw> {
+///
+/// `db` is a closed enum (`passwd`, `group`, `initgroups`) and every element of
+/// `keys` is validated against empty or dash-prefixed values so no option flag
+/// can be injected without needing `"--"` (which `musl-utils` `getent` rejects).
+fn exec_getent(program: &Path, db: GetentDb, keys: &[&OsStr], timeout: Duration, max_bytes: usize) -> io::Result<GetentRaw> {
     use std::io::Read;
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
 
+    if keys.is_empty() || keys.iter().any(|a| a.as_bytes().is_empty() || a.as_bytes()[0] == b'-') {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid getent argument"));
+    }
+
     let mut cmd = Command::new(program);
     cmd.env_clear()
         .env("LC_ALL", "C")
-        .arg("--")
-        .args(args)
+        .arg(db.as_str())
+        .args(keys)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -394,8 +419,8 @@ fn getent_account_lookup_with(program: &Path, key: &[u8], timeout: Duration, max
     if !valid_key(key) {
         return Ok(LookupResult::NotFound);
     }
-    let args = [OsStr::new("passwd"), OsStr::from_bytes(key)];
-    match exec_getent(program, &args, timeout, max_bytes)? {
+    let keys = [OsStr::from_bytes(key)];
+    match exec_getent(program, GetentDb::Passwd, &keys, timeout, max_bytes)? {
         GetentRaw::NoBinary => Ok(LookupResult::NotFound),
         GetentRaw::Ran(status, stdout) => match status.code() {
             Some(0) => passwd_line(&stdout)
@@ -453,12 +478,8 @@ fn getent_accounts_batch_with(program: &Path, keys: &[&CStr], timeout: Duration,
     if keys.is_empty() {
         return Ok(BatchAccounts::default());
     }
-    let mut args: Vec<&OsStr> = Vec::with_capacity(1 + keys.len());
-    args.push(OsStr::new("passwd"));
-    for k in keys {
-        args.push(OsStr::from_bytes(k.to_bytes()));
-    }
-    match exec_getent(program, &args, timeout, max_bytes)? {
+    let args: Vec<&OsStr> = keys.iter().map(|k| OsStr::from_bytes(k.to_bytes())).collect();
+    match exec_getent(program, GetentDb::Passwd, &args, timeout, max_bytes)? {
         GetentRaw::NoBinary => Ok(BatchAccounts::default()),
         GetentRaw::Ran(status, stdout) => match status.code() {
             Some(0) => {
@@ -508,8 +529,8 @@ fn getent_group_lookup_with(program: &Path, key: &[u8]) -> io::Result<Option<Loo
     if !valid_key(key) {
         return Ok(Some(LookupResult::NotFound));
     }
-    let args = [OsStr::new("group"), OsStr::from_bytes(key)];
-    match exec_getent(program, &args, GETENT_TIMEOUT, GETENT_MAX_STDOUT)? {
+    let keys = [OsStr::from_bytes(key)];
+    match exec_getent(program, GetentDb::Group, &keys, GETENT_TIMEOUT, GETENT_MAX_STDOUT)? {
         GetentRaw::NoBinary => Ok(None),
         GetentRaw::Ran(status, stdout) => match status.code() {
             Some(0) => group_line(&stdout)
@@ -557,8 +578,8 @@ fn initgroups_has_detailed_with_limits(program: &Path, user: &CStr, gid: u32, ti
     if !valid_key(key) {
         return Ok(InitgroupsResult::NotMember);
     }
-    let args = [OsStr::new("initgroups"), OsStr::from_bytes(key)];
-    match exec_getent(program, &args, timeout, max_bytes)? {
+    let keys = [OsStr::from_bytes(key)];
+    match exec_getent(program, GetentDb::Initgroups, &keys, timeout, max_bytes)? {
         GetentRaw::NoBinary => Ok(InitgroupsResult::NotMember),
         GetentRaw::Ran(status, stdout) => match status.code() {
             Some(0) => {
@@ -833,6 +854,93 @@ fn peer_uid(conn: &UnixStream) -> io::Result<u32> {
     Ok(cred.uid)
 }
 
+/// Parses a `/proc/<pid>/status` `Groups:` line into GIDs.
+fn parse_status_groups(status: &str) -> Vec<u32> {
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("Groups:"))
+        .map(|line| line.split_whitespace().filter_map(|tok| tok.parse::<u32>().ok()).collect())
+        .unwrap_or_default()
+}
+
+fn status_groups_contain(status: &str, want_gid: u32) -> bool {
+    parse_status_groups(status).contains(&want_gid)
+}
+
+/// Verifies that the effective UID in `/proc/<pid>/status` (`Uid:\treal\teff...`)
+/// matches `want_uid` from `SO_PEERCRED`, defeating PID-reuse races.
+fn status_euid_matches(status: &str, want_uid: u32) -> bool {
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("Uid:"))
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|tok| tok.parse::<u32>().ok())
+        == Some(want_uid)
+}
+
+fn read_proc_file_at(dir_fd: std::os::fd::RawFd, name: &CStr) -> Option<String> {
+    use std::io::Read;
+    use std::os::fd::FromRawFd;
+    // SAFETY: `dir_fd` is a valid open directory fd and `name` is NUL-terminated.
+    let raw = unsafe { libc::openat(dir_fd, name.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW) };
+    if raw < 0 {
+        return None;
+    }
+    // SAFETY: `raw` is a freshly opened descriptor owned here.
+    let mut f = unsafe { std::fs::File::from_raw_fd(raw) };
+    let mut out = String::new();
+    f.take(64 * 1024).read_to_string(&mut out).ok()?;
+    Some(out)
+}
+
+/// Snapshot of a peer's credentials and `/proc/<pid>` state captured
+/// synchronously at `accept()` time through a single pinned `/proc/<pid>`
+/// directory descriptor before spawning `kiri-api` (prevents short-lived client
+/// exit races and multi-step `/proc/<pid>` PID-reuse TOCTOU).
+pub struct PinnedPeer {
+    uid: u32,
+    gid: u32,
+    groups: Vec<u32>,
+    cgroup: String,
+}
+
+impl PinnedPeer {
+    pub fn capture(conn: &UnixStream) -> Option<Self> {
+        use std::os::fd::FromRawFd;
+        // SAFETY: connected socket and zeroed `ucred` storage.
+        let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        // SAFETY: valid output pointers and buffer length.
+        let r = unsafe { libc::getsockopt(conn.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PEERCRED, (&mut cred as *mut libc::ucred).cast(), &mut len) };
+        if r != 0 || len as usize != std::mem::size_of::<libc::ucred>() || cred.pid <= 0 {
+            return None;
+        }
+        let proc_path = CString::new(format!("/proc/{}", cred.pid)).ok()?;
+        // SAFETY: valid NUL-terminated path; pins the `/proc/<pid>` directory inode.
+        let raw_dir = unsafe { libc::open(proc_path.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+        if raw_dir < 0 {
+            return None;
+        }
+        // SAFETY: `raw_dir` is a freshly opened directory descriptor owned here.
+        let dir_fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw_dir) };
+        let status = read_proc_file_at(dir_fd.as_raw_fd(), c"status")?;
+        if !status_euid_matches(&status, cred.uid) {
+            return None;
+        }
+        let cgroup = read_proc_file_at(dir_fd.as_raw_fd(), c"cgroup")?;
+        Some(PinnedPeer {
+            uid: cred.uid,
+            gid: cred.gid,
+            groups: parse_status_groups(&status),
+            cgroup,
+        })
+    }
+
+    fn holds_gid(&self, want_gid: u32) -> bool {
+        self.gid == want_gid || self.groups.contains(&want_gid)
+    }
+}
+
 /// Whether the account is in the group by name or as its primary group.
 fn group_member(user: &CStr, primary_gid: libc::gid_t, group: &Group) -> bool {
     primary_gid == group.gid || group.members.iter().any(|m| m.as_c_str() == user)
@@ -1025,6 +1133,17 @@ impl AclState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum PeerSubject {
+    HostUser(u32),
+    /// Containerized client on `docker.container.sock` verified to belong to a
+    /// live Kiri container cgroup and holding `gid`, whose numeric `uid` had no
+    /// host account at connect time (#127). Retains `uid` so sweeps re-verify
+    /// both group GID validity (with `DIRECTORY_MISS_GRACE`) and host user
+    /// absence.
+    ContainerGroup { uid: u32, gid: u32 },
+}
+
 /// Who may use the engine's socket: root, the account the daemon runs as, and
 /// the members of one group, checked when they connect and again while they
 /// stay connected.
@@ -1033,18 +1152,23 @@ pub struct Gate {
     /// The daemon's socket, and the one containers are given (caller.rs).
     sockets: Vec<PathBuf>,
     owner: u32,
-    open: Mutex<HashMap<u64, (u32, UnixStream)>>,
+    open: Mutex<HashMap<u64, (PeerSubject, UnixStream)>>,
     next: AtomicU64,
     failing: AtomicBool,
     /// Recent per-uid decisions, in-flight coalescing, and concurrency cap so
     /// bursts of connections or local lookup storms stay bounded.
     lookup: Mutex<LookupState>,
     lookup_slot: Condvar,
+    /// Bounded/cached host-account absence checks for container UIDs (#127) so
+    /// bursts of container socket connections never spawn unthrottled `getent`.
+    container_uid_absent: Mutex<HashMap<u32, (bool, Instant)>>,
     /// Short-TTL group lookup cache for the accept path, invalidated when
     /// `/etc/group` changes.
     group_cache: Mutex<Option<CachedGroup>>,
     /// Consecutive ambiguous exit-2 misses per connected uid.
     misses: Mutex<HashMap<u32, u32>>,
+    /// Consecutive ambiguous exit-2 group misses per container subject.
+    container_misses: Mutex<HashMap<PeerSubject, u32>>,
     /// UIDs written by `grant()` at startup, used to seed `watch()` so an
     /// outage right after boot does not shrink the initial ACL on tick 1.
     startup_uids: Mutex<Option<Vec<u32>>>,
@@ -1076,8 +1200,10 @@ impl Gate {
             failing: AtomicBool::new(false),
             lookup: Mutex::default(),
             lookup_slot: Condvar::new(),
+            container_uid_absent: Mutex::default(),
             group_cache: Mutex::default(),
             misses: Mutex::default(),
+            container_misses: Mutex::default(),
             startup_uids: Mutex::default(),
         }))
     }
@@ -1223,13 +1349,30 @@ impl Gate {
         }
 
         let closed_uids = if connected {
-            self.sweep_membership_with(|uid| {
-                if uid == 0 || uid == self.owner {
-                    return Ok(Membership::Allowed);
-                }
-                let g = group.as_ref().map_err(|e| io::Error::new(e.kind(), e.to_string()))?;
-                check_member(uid, g)
-            })
+            self.sweep_subjects_with(
+                |uid| {
+                    if uid == 0 || uid == self.owner {
+                        return Ok(Membership::Allowed);
+                    }
+                    let g = group.as_ref().map_err(|e| io::Error::new(e.kind(), e.to_string()))?;
+                    check_member(uid, g)
+                },
+                |uid, gid| {
+                    let g = group.as_ref().map_err(|e| io::Error::new(e.kind(), e.to_string()))?;
+                    match g {
+                        LookupResult::Found(found) if found.gid == gid => {
+                            // Re-verify `uid` is still not a revoked host account
+                            // (e.g., if NSS recovered after an ambiguous connect-time miss).
+                            match account_by_uid_detailed(uid)? {
+                                LookupResult::Found(_) => check_member(uid, g),
+                                LookupResult::NotFound | LookupResult::UnavailableOrNotFound => Ok(Membership::Allowed),
+                            }
+                        }
+                        LookupResult::Found(_) | LookupResult::NotFound => Ok(Membership::Revoked),
+                        LookupResult::UnavailableOrNotFound => Ok(Membership::MissingFromDirectory),
+                    }
+                },
+            )
         } else {
             HashSet::new()
         };
@@ -1434,9 +1577,106 @@ impl Gate {
         set_each(&self.sockets, uids, set)
     }
 
-    /// Checks a new connection. `None`: refused, and the reason logged.
+    /// Checks a new host connection. `None`: refused, and the reason logged.
     pub fn admit(self: &Arc<Self>, conn: &UnixStream) -> Option<Seat> {
         self.admit_with(conn, |uid| self.allowed(uid))
+    }
+
+    /// Checks a new connection on `docker.container.sock`: admits host group
+    /// members as usual, and also admits containerized clients inside a live
+    /// Kiri container cgroup holding the access group's GID whose numeric UID
+    /// has no host account (#127).
+    pub fn admit_container(
+        self: &Arc<Self>,
+        conn: &UnixStream,
+        pinned: Option<PinnedPeer>,
+        is_running_container_cgroup: impl FnOnce(&str) -> bool,
+    ) -> Option<Seat> {
+        let uid = match pinned.as_ref().map(|p| Ok(p.uid)).unwrap_or_else(|| peer_uid(conn)) {
+            Ok(u) => u,
+            Err(e) => {
+                crate::diag::warn!("socket connection refused: access check failed", group = self.name(), error = e);
+                return None;
+            }
+        };
+        let subject = match self.allowed(uid) {
+            Ok(true) => PeerSubject::HostUser(uid),
+            Ok(false) => match self.container_group_subject(pinned, is_running_container_cgroup) {
+                Ok(Some(sub)) => sub,
+                Ok(None) => {
+                    crate::diag::warn!("socket connection refused: user is not in the access group", group = self.name(), uid = uid);
+                    return None;
+                }
+                Err(e) => {
+                    crate::diag::warn!("socket connection refused: access check failed", group = self.name(), error = e);
+                    return None;
+                }
+            },
+            Err(e) => {
+                crate::diag::warn!("socket connection refused: access check failed", group = self.name(), error = e);
+                return None;
+            }
+        };
+        self.track_seat(conn, subject)
+    }
+
+    fn uid_absent_throttled(&self, uid: u32) -> io::Result<bool> {
+        {
+            let mut cache = self.container_uid_absent.lock().unwrap_or_else(|e| e.into_inner());
+            cache.retain(|_, (_, at)| at.elapsed() < RECHECK);
+            if let Some(&(absent, _)) = cache.get(&uid) {
+                return Ok(absent);
+            }
+        }
+        // Acquire one of Gate's bounded lookup slots (MAX_CONCURRENT_LOOKUPS = 4)
+        // so container connection bursts never spawn unthrottled `getent` children.
+        {
+            let mut state = self.lookup.lock().unwrap_or_else(|e| e.into_inner());
+            while state.active >= MAX_CONCURRENT_LOOKUPS {
+                if state.waiting >= MAX_WAITING_LOOKUPS {
+                    return Err(io::Error::new(io::ErrorKind::WouldBlock, "too many concurrent access checks"));
+                }
+                state.waiting += 1;
+                state = self.lookup_slot.wait(state).unwrap_or_else(|e| e.into_inner());
+                state.waiting -= 1;
+            }
+            state.active += 1;
+        }
+        let lookup_res = account_by_uid_detailed(uid);
+        {
+            let mut state = self.lookup.lock().unwrap_or_else(|e| e.into_inner());
+            state.active = state.active.saturating_sub(1);
+            self.lookup_slot.notify_all();
+        }
+        let absent = match lookup_res? {
+            LookupResult::NotFound | LookupResult::UnavailableOrNotFound => true,
+            LookupResult::Found(_) => false,
+        };
+        let mut cache = self.container_uid_absent.lock().unwrap_or_else(|e| e.into_inner());
+        if cache.len() >= MAX_RECENT_ENTRIES
+            && !cache.contains_key(&uid)
+            && let Some(&oldest) = cache.iter().min_by_key(|(_, (_, at))| *at).map(|(k, _)| k)
+        {
+            cache.remove(&oldest);
+        }
+        cache.insert(uid, (absent, Instant::now()));
+        Ok(absent)
+    }
+
+    fn container_group_subject(
+        &self,
+        pinned: Option<PinnedPeer>,
+        is_running_container_cgroup: impl FnOnce(&str) -> bool,
+    ) -> io::Result<Option<PeerSubject>> {
+        let Some(peer) = pinned else { return Ok(None) };
+        let LookupResult::Found(group) = self.cached_group()? else { return Ok(None) };
+        if !peer.holds_gid(group.gid) || !is_running_container_cgroup(&peer.cgroup) {
+            return Ok(None);
+        }
+        if !self.uid_absent_throttled(peer.uid)? {
+            return Ok(None);
+        }
+        Ok(Some(PeerSubject::ContainerGroup { uid: peer.uid, gid: group.gid }))
     }
 
     fn admit_with(self: &Arc<Self>, conn: &UnixStream, check: impl Fn(u32) -> io::Result<bool>) -> Option<Seat> {
@@ -1452,6 +1692,10 @@ impl Gate {
                 return None;
             }
         };
+        self.track_seat(conn, PeerSubject::HostUser(uid))
+    }
+
+    fn track_seat(self: &Arc<Self>, conn: &UnixStream, subject: PeerSubject) -> Option<Seat> {
         let keep = match conn.try_clone() {
             Ok(c) => c,
             Err(e) => {
@@ -1460,44 +1704,88 @@ impl Gate {
             }
         };
         let id = self.next.fetch_add(1, Ordering::Relaxed);
-        self.open.lock().unwrap_or_else(|e| e.into_inner()).insert(id, (uid, keep));
+        self.open.lock().unwrap_or_else(|e| e.into_inner()).insert(id, (subject, keep));
         Some(Seat { gate: self.clone(), id })
     }
 
-    /// Checks everyone still connected, once per account, and closes the
+    #[cfg(test)]
+    fn sweep_membership_with(&self, check: impl Fn(u32) -> io::Result<Membership>) -> HashSet<u32> {
+        self.sweep_subjects_with(check, |_, _| Ok(Membership::Allowed))
+    }
+
+    /// Checks everyone still connected, once per subject, and closes the
     /// connections of anyone no longer allowed. A failed lookup leaves the
     /// connections open (new ones are refused until lookups work again).
     /// Ambiguous directory exit-2 misses use a grace window before closing.
-    fn sweep_membership_with(&self, check: impl Fn(u32) -> io::Result<Membership>) -> HashSet<u32> {
-        let uids: HashSet<u32> = self.open.lock().unwrap_or_else(|e| e.into_inner()).values().map(|(u, _)| *u).collect();
-        let mut removed = HashSet::new();
+    fn sweep_subjects_with(
+        &self,
+        check_user: impl Fn(u32) -> io::Result<Membership>,
+        check_container: impl Fn(u32, u32) -> io::Result<Membership>,
+    ) -> HashSet<u32> {
+        let subjects: HashSet<PeerSubject> = self.open.lock().unwrap_or_else(|e| e.into_inner()).values().map(|(s, _)| *s).collect();
+        let host_uids: HashSet<u32> = subjects
+            .iter()
+            .filter_map(|s| match s {
+                PeerSubject::HostUser(u) => Some(*u),
+                PeerSubject::ContainerGroup { .. } => None,
+            })
+            .collect();
+        let mut removed_subjects = HashSet::new();
+        let mut removed_uids = HashSet::new();
+        let mut removed_container_uids = HashSet::new();
         let mut failed = None;
-        let mut misses = self.misses.lock().unwrap_or_else(|e| e.into_inner());
-        misses.retain(|u, _| uids.contains(u));
-        drop(misses);
+        self.misses.lock().unwrap_or_else(|e| e.into_inner()).retain(|u, _| host_uids.contains(u));
+        self.container_misses.lock().unwrap_or_else(|e| e.into_inner()).retain(|s, _| subjects.contains(s));
 
-        for uid in uids {
-            match check(uid) {
-                Ok(Membership::Allowed) => {
-                    self.misses.lock().unwrap_or_else(|e| e.into_inner()).remove(&uid);
-                    self.remember_decision(uid, CachedDecision::Allowed);
-                }
-                Ok(Membership::Revoked) => {
-                    self.misses.lock().unwrap_or_else(|e| e.into_inner()).remove(&uid);
-                    self.remember_decision(uid, CachedDecision::Denied);
-                    removed.insert(uid);
-                }
-                Ok(Membership::MissingFromDirectory) => {
-                    self.remember_decision(uid, CachedDecision::Denied);
-                    let mut misses = self.misses.lock().unwrap_or_else(|e| e.into_inner());
-                    let count = misses.entry(uid).or_insert(0);
-                    *count = count.saturating_add(1);
-                    if *count >= DIRECTORY_MISS_GRACE {
-                        misses.remove(&uid);
-                        removed.insert(uid);
+        for subject in subjects {
+            match subject {
+                PeerSubject::HostUser(uid) => match check_user(uid) {
+                    Ok(Membership::Allowed) => {
+                        self.misses.lock().unwrap_or_else(|e| e.into_inner()).remove(&uid);
+                        self.remember_decision(uid, CachedDecision::Allowed);
                     }
-                }
-                Err(e) => failed = Some(e),
+                    Ok(Membership::Revoked) => {
+                        self.misses.lock().unwrap_or_else(|e| e.into_inner()).remove(&uid);
+                        self.remember_decision(uid, CachedDecision::Denied);
+                        removed_subjects.insert(subject);
+                        removed_uids.insert(uid);
+                    }
+                    Ok(Membership::MissingFromDirectory) => {
+                        self.remember_decision(uid, CachedDecision::Denied);
+                        let mut misses = self.misses.lock().unwrap_or_else(|e| e.into_inner());
+                        let count = misses.entry(uid).or_insert(0);
+                        *count = count.saturating_add(1);
+                        if *count >= DIRECTORY_MISS_GRACE {
+                            misses.remove(&uid);
+                            removed_subjects.insert(subject);
+                            removed_uids.insert(uid);
+                        }
+                    }
+                    Err(e) => failed = Some(e),
+                },
+                PeerSubject::ContainerGroup { uid, gid } => match check_container(uid, gid) {
+                    Ok(Membership::Allowed) => {
+                        self.container_misses.lock().unwrap_or_else(|e| e.into_inner()).remove(&subject);
+                    }
+                    Ok(Membership::Revoked) => {
+                        self.container_misses.lock().unwrap_or_else(|e| e.into_inner()).remove(&subject);
+                        self.container_uid_absent.lock().unwrap_or_else(|e| e.into_inner()).remove(&uid);
+                        removed_subjects.insert(subject);
+                        removed_container_uids.insert(uid);
+                    }
+                    Ok(Membership::MissingFromDirectory) => {
+                        let mut misses = self.container_misses.lock().unwrap_or_else(|e| e.into_inner());
+                        let count = misses.entry(subject).or_insert(0);
+                        *count = count.saturating_add(1);
+                        if *count >= DIRECTORY_MISS_GRACE {
+                            misses.remove(&subject);
+                            self.container_uid_absent.lock().unwrap_or_else(|e| e.into_inner()).remove(&uid);
+                            removed_subjects.insert(subject);
+                            removed_container_uids.insert(uid);
+                        }
+                    }
+                    Err(e) => failed = Some(e),
+                },
             }
         }
         match failed {
@@ -1505,13 +1793,13 @@ impl Gate {
             None if self.failing.swap(false, Ordering::Relaxed) => crate::diag::info!("access check works again", group = self.name()),
             _ => {}
         }
-        if removed.is_empty() {
-            return removed;
+        if removed_subjects.is_empty() {
+            return removed_uids;
         }
         // Taken out as they're closed, so a thread that takes a while to
         // notice isn't closed and logged again on every recheck.
-        self.open.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, (uid, conn)| {
-            if !removed.contains(uid) {
+        self.open.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, (subject, conn)| {
+            if !removed_subjects.contains(subject) {
                 return true;
             }
             // Ends the connection for every thread using it: reads see the
@@ -1519,10 +1807,10 @@ impl Gate {
             let _ = conn.shutdown(Shutdown::Both);
             false
         });
-        for uid in &removed {
+        for uid in removed_uids.iter().chain(removed_container_uids.iter()) {
             crate::diag::warn!("connections closed: user is no longer in the access group", group = self.name(), uid = uid);
         }
-        removed
+        removed_uids
     }
 
     #[cfg(test)]
@@ -1964,8 +2252,7 @@ mod tests {
         let touched = dir.join("touched");
         let script = format!(
             "#!/bin/sh\n\
-             [ \"$1\" = \"--\" ] || exit 9\n\
-             shift\n\
+             [ \"$1\" = \"--\" ] && exit 1\n\
              db=\"$1\"; key=\"$2\"\n\
              case \"$key\" in -*) echo bad > \"{}\"; exit 9 ;; esac\n\
              case \"$db:$key\" in\n\
@@ -2087,8 +2374,7 @@ mod tests {
             "fake-getent",
             &format!(
                 "#!/bin/sh\n\
-                 [ \"$1\" = \"--\" ] || exit 9\n\
-                 shift\n\
+                 [ \"$1\" = \"--\" ] && exit 1\n\
                  case \"$1\" in\n\
                    passwd) export -p > \"{}\"; echo 'alice:x:5001:5001::/:/bin/sh'; exit 0 ;;\n\
                    initgroups) export -p > \"{}\"; echo 'alice 998'; exit 0 ;;\n\
@@ -2128,8 +2414,7 @@ mod tests {
             &dir,
             "fake-getent",
             "#!/bin/sh\n\
-             [ \"$1\" = \"--\" ] || exit 9\n\
-             shift\n\
+             [ \"$1\" = \"--\" ] && exit 1\n\
              case \"$2\" in\n\
                hang) [ -x /bin/sleep ] && /bin/sleep 30 || /usr/bin/sleep 30; exit 0 ;;\n\
                hang_closed) exec >&-; [ -x /bin/sleep ] && /bin/sleep 30 || /usr/bin/sleep 30; exit 0 ;;\n\
@@ -2193,8 +2478,7 @@ mod tests {
             &dir,
             "fake-getent",
             "#!/bin/sh\n\
-             [ \"$1\" = \"--\" ] || exit 9\n\
-             shift\n\
+             [ \"$1\" = \"--\" ] && exit 1\n\
              case \"$1:$2\" in\n\
                passwd:alice|passwd:Alice@corp.example) echo 'alice@corp.example:x:5001:5001::/home/alice:/bin/sh'; exit 0 ;;\n\
                passwd:0|'passwd:+0'|'passwd: 0'|'passwd: -0') echo 'root:x:0:0:root:/root:/bin/sh'; exit 0 ;;\n\
@@ -2245,8 +2529,7 @@ mod tests {
             &dir,
             "fake-getent",
             "#!/bin/sh\n\
-             [ \"$1\" = \"--\" ] || exit 9\n\
-             shift\n\
+             [ \"$1\" = \"--\" ] && exit 1\n\
              case \"$1:$2\" in\n\
                initgroups:alice) echo 'alice -2147483648 -1000 998'; exit 0 ;;\n\
                *) exit 2 ;;\n\
@@ -2267,8 +2550,7 @@ mod tests {
             "fake-getent",
             &format!(
                 "#!/bin/sh\n\
-                 [ \"$1\" = \"--\" ] || exit 9\n\
-                 shift\n\
+                 [ \"$1\" = \"--\" ] && exit 1\n\
                  db=\"$1\"; shift\n\
                  echo x >> \"{}\"\n\
                  [ \"$db\" = \"passwd\" ] || exit 2\n\
@@ -3036,5 +3318,29 @@ mod tests {
         );
         assert_eq!(state.uids, Some(vec![1001, 5002]), "bob must get a fresh grace window after alice was dropped");
         assert_eq!(state.shrink_streak, 1);
+    }
+
+    #[test]
+    fn container_group_subject_parses_supplementary_groups_and_revokes_on_gid_change() {
+        let status = "Name:\tpython3\nUid:\t54321\t54321\t54321\t54321\nGid:\t54321\t54321\t54321\t54321\nGroups:\t100 998 65534 \n";
+        assert!(status_groups_contain(status, 998));
+        assert!(!status_groups_contain(status, 999));
+        assert!(status_euid_matches(status, 54321));
+        assert!(!status_euid_matches(status, 1000));
+        assert!(exec_getent(Path::new("/usr/bin/getent"), GetentDb::Passwd, &[OsStr::new("-V")], Duration::from_secs(1), 1024).is_err());
+
+        let g = gate();
+        let (a, _b) = UnixStream::pair().unwrap();
+        let _seat = g.track_seat(&a, PeerSubject::ContainerGroup { uid: 54321, gid: 998 }).unwrap();
+        // Matching GID keeps the container connection open across sweeps.
+        assert!(g.sweep_subjects_with(|_| unreachable!(), |u, gid| Ok(if u == 54321 && gid == 998 { Membership::Allowed } else { Membership::Revoked })).is_empty());
+        assert_eq!(g.open.lock().unwrap().len(), 1);
+        // Transient directory exit-2 misses honor DIRECTORY_MISS_GRACE before closing.
+        for _ in 1..DIRECTORY_MISS_GRACE {
+            assert!(g.sweep_subjects_with(|_| unreachable!(), |_, _| Ok(Membership::MissingFromDirectory)).is_empty());
+            assert_eq!(g.open.lock().unwrap().len(), 1);
+        }
+        assert!(g.sweep_subjects_with(|_| unreachable!(), |_, _| Ok(Membership::MissingFromDirectory)).is_empty());
+        assert!(g.open.lock().unwrap().is_empty());
     }
 }

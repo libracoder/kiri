@@ -297,20 +297,31 @@ fn make_abstract_sockaddr(name: &[u8]) -> io::Result<(libc::sockaddr_un, libc::s
     Ok((addr, addr_len))
 }
 
-/// Checks whether an active listener on `name` belongs to `owner` (prevents an
-/// unprivileged local process from squatting the abstract socket name to deny
-/// service to a root `kiri-init`).
-fn abstract_lock_owned_by(name: &[u8], owner: u32) -> bool {
-    let Ok((addr, addr_len)) = make_abstract_sockaddr(name) else { return false };
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LockProbe {
+    /// Connected and `SO_PEERCRED.uid == owner`.
+    OwnedByOwner,
+    /// Connected and `SO_PEERCRED.uid != owner` (unprivileged squatter).
+    OwnedByOther,
+    /// `connect()` failed transiently (`EAGAIN` backlog full, `ECONNREFUSED`
+    /// bind-to-listen window or closing holder, `EINTR`, etc.). Never treated
+    /// as an unprivileged squatter.
+    TransientBusy,
+}
+
+/// Probes an active listener on `name` to distinguish a legitimate `owner`
+/// engine from an unprivileged squatter or transient backlog/startup state.
+fn probe_abstract_lock(name: &[u8], owner: u32) -> LockProbe {
+    let Ok((addr, addr_len)) = make_abstract_sockaddr(name) else { return LockProbe::TransientBusy };
     let raw = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK, 0) };
     if raw < 0 {
-        return false;
+        return LockProbe::TransientBusy;
     }
     // SAFETY: `raw` is a freshly created socket descriptor owned here.
     let fd = unsafe { OwnedFd::from_raw_fd(raw) };
     // SAFETY: `addr` is initialized through `addr_len` bytes.
     if unsafe { libc::connect(fd.as_raw_fd(), (&raw const addr).cast(), addr_len) } != 0 {
-        return false;
+        return LockProbe::TransientBusy;
     }
     // SAFETY: zeroed `ucred` is valid for `getsockopt(SO_PEERCRED)`.
     let mut peer: libc::ucred = unsafe { std::mem::zeroed() };
@@ -324,12 +335,19 @@ fn abstract_lock_owned_by(name: &[u8], owner: u32) -> bool {
             &mut len,
         )
     };
-    rc == 0 && len == std::mem::size_of::<libc::ucred>() as libc::socklen_t && peer.uid == owner
+    if rc != 0 || len != std::mem::size_of::<libc::ucred>() as libc::socklen_t {
+        return LockProbe::TransientBusy;
+    }
+    if peer.uid == owner {
+        LockProbe::OwnedByOwner
+    } else {
+        LockProbe::OwnedByOther
+    }
 }
 
 fn try_bind_abstract_socket(name: &[u8]) -> Result<OwnedFd, i32> {
     let (addr, addr_len) = make_abstract_sockaddr(name).map_err(|_| libc::EINVAL)?;
-    let raw = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    let raw = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK, 0) };
     if raw < 0 {
         return Err(io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO));
     }
@@ -339,49 +357,108 @@ fn try_bind_abstract_socket(name: &[u8]) -> Result<OwnedFd, i32> {
     if unsafe { libc::bind(fd.as_raw_fd(), (&raw const addr).cast(), addr_len) } != 0 {
         return Err(io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO));
     }
-    // Listen so peer engines can verify ownership without `accept()`.
     // SAFETY: `fd` is a bound `SOCK_STREAM` socket owned here.
-    let _ = unsafe { libc::listen(fd.as_raw_fd(), 16) };
+    if unsafe { libc::listen(fd.as_raw_fd(), 128) } != 0 {
+        return Err(io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO));
+    }
     Ok(fd)
+}
+
+/// Descriptor of the held abstract netns lock socket, polled by the
+/// single-threaded `agent::serve_loop` (`kiri-init` never spawns threads, so
+/// `signalfd` and `clone3` stay single-threaded).
+pub fn netns_lock_fd() -> Option<std::os::fd::RawFd> {
+    HOST_NETNS_LOCK.get().map(AsRawFd::as_raw_fd)
+}
+
+/// Drains up to 64 pending `SO_PEERCRED` probe connections per `poll()` tick so
+/// `sk_max_ack_backlog` does not fill under normal retries while a local
+/// `connect()` flood can never starve `agent::serve_loop`.
+pub fn drain_netns_lock(fd: std::os::fd::RawFd) {
+    for _ in 0..64 {
+        // SAFETY: `fd` is a non-blocking listening `AF_UNIX` socket.
+        let cfd = unsafe { libc::accept4(fd, std::ptr::null_mut(), std::ptr::null_mut(), libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK) };
+        if cfd >= 0 {
+            // SAFETY: `cfd` is a freshly accepted descriptor owned here.
+            unsafe { libc::close(cfd) };
+            continue;
+        }
+        let err = io::Error::last_os_error().raw_os_error().unwrap_or(libc::EAGAIN);
+        if err == libc::EMFILE || err == libc::ENFILE {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        break;
+    }
 }
 
 const NETNS_BUSY_MSG: &str =
     "another Kiri engine is already running in this network namespace (for example in another WSL 2 distribution): stop it first";
+const MAX_NETNS_LOCK_SLOTS: usize = 64;
+
+fn netns_slot_name(base: &[u8], idx: usize) -> Vec<u8> {
+    if idx == 0 {
+        base.to_vec()
+    } else {
+        let mut v = Vec::with_capacity(base.len() + 8);
+        v.extend_from_slice(base);
+        v.extend_from_slice(format!("-{idx}").as_bytes());
+        v
+    }
+}
 
 /// Claims ownership of Kiri's bridge and firewall tables in the current Linux
 /// network namespace (#443). All WSL 2 distributions share one network
 /// namespace; refusing early prevents a second engine from overwriting
 /// `nft table ip kiri` or deleting `kiri0` when stopping.
 pub fn claim_host_netns() -> io::Result<()> {
+    claim_host_netns_on(HOST_NETNS_LOCK_NAME, &HOST_NETNS_LOCK, &HOST_NETNS_CLAIMED)
+}
+
+fn claim_host_netns_on(
+    base: &[u8],
+    slot: &std::sync::OnceLock<OwnedFd>,
+    claimed: &std::sync::atomic::AtomicBool,
+) -> io::Result<()> {
     use std::sync::atomic::Ordering;
-    if HOST_NETNS_CLAIMED.load(Ordering::Acquire) {
+    if claimed.load(Ordering::Acquire) {
         return Ok(());
     }
     // SAFETY: `geteuid` has no preconditions.
     let me = unsafe { libc::geteuid() };
-    let start = Instant::now();
-    loop {
-        match try_bind_abstract_socket(HOST_NETNS_LOCK_NAME) {
-            Ok(fd) => {
-                let _ = HOST_NETNS_LOCK.set(fd);
-                HOST_NETNS_CLAIMED.store(true, Ordering::Release);
-                return Ok(());
-            }
-            Err(code) if code == libc::EADDRINUSE => {
-                if !abstract_lock_owned_by(HOST_NETNS_LOCK_NAME, me) {
-                    eprintln!("kiri-init: ignoring unprivileged holder on abstract netns socket");
-                    HOST_NETNS_CLAIMED.store(true, Ordering::Release);
+    let mut idx = 0usize;
+    while idx < MAX_NETNS_LOCK_SLOTS {
+        let candidate = netns_slot_name(base, idx);
+        let start = Instant::now();
+        loop {
+            match try_bind_abstract_socket(&candidate) {
+                Ok(fd) => {
+                    let _ = slot.set(fd);
+                    claimed.store(true, Ordering::Release);
                     return Ok(());
                 }
-                if start.elapsed() < Duration::from_millis(500) {
-                    std::thread::sleep(Duration::from_millis(25));
-                    continue;
-                }
-                return Err(io::Error::new(io::ErrorKind::AddrInUse, NETNS_BUSY_MSG));
+                Err(code) if code == libc::EADDRINUSE => match probe_abstract_lock(&candidate, me) {
+                    LockProbe::OwnedByOther => {
+                        // Unprivileged squatter on `candidate`: advance to the next
+                        // deterministic slot so the first root engine still binds a
+                        // real lock and a second root engine hits that bound slot
+                        // (preventing split-brain without arming `claimed` unlocked).
+                        eprintln!("kiri-init: skipping unprivileged squatter on abstract netns socket slot {idx}");
+                        idx += 1;
+                        break;
+                    }
+                    LockProbe::OwnedByOwner | LockProbe::TransientBusy => {
+                        if start.elapsed() < Duration::from_millis(500) {
+                            std::thread::sleep(Duration::from_millis(25));
+                            continue;
+                        }
+                        return Err(io::Error::new(io::ErrorKind::AddrInUse, NETNS_BUSY_MSG));
+                    }
+                },
+                Err(code) => return Err(io::Error::from_raw_os_error(code)),
             }
-            Err(code) => return Err(io::Error::from_raw_os_error(code)),
         }
     }
+    Err(io::Error::new(io::ErrorKind::AddrInUse, NETNS_BUSY_MSG))
 }
 
 /// On a Linux host: claims the network namespace, enables IPv4 forwarding,
@@ -1582,15 +1659,34 @@ mod tests {
     }
 
     #[test]
-    fn abstract_netns_lock_rejects_second_holder_until_first_drops() {
+    fn abstract_netns_lock_rejects_second_holder_across_full_retry_loop() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::OnceLock;
         let name = format!("kiri-netns-test-{}", std::process::id());
-        let first = try_bind_abstract_socket(name.as_bytes()).expect("first holder binds abstract netns lock");
-        let code = try_bind_abstract_socket(name.as_bytes()).expect_err("second holder in same netns must fail");
-        assert_eq!(code, libc::EADDRINUSE);
+        let slot1 = OnceLock::new();
+        let claimed1 = AtomicBool::new(false);
+        claim_host_netns_on(name.as_bytes(), &slot1, &claimed1).expect("first holder claims abstract netns lock");
+
+        // Run 8 full 500ms `claim_host_netns_on` retry loops (> 160 probes,
+        // exceeding `listen(128)` when drained between ticks as `agent::serve_loop`
+        // does) to verify `drain_netns_lock` prevents `EAGAIN` false negatives.
+        for _ in 0..8 {
+            let slot2 = OnceLock::new();
+            let claimed2 = AtomicBool::new(false);
+            let err = claim_host_netns_on(name.as_bytes(), &slot2, &claimed2)
+                .expect_err("second holder in same netns must fail after full retry window");
+            assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
+            assert!(!claimed2.load(std::sync::atomic::Ordering::Acquire));
+            drain_netns_lock(slot1.get().unwrap().as_raw_fd());
+        }
+
         let me = unsafe { libc::geteuid() };
-        assert!(abstract_lock_owned_by(name.as_bytes(), me));
-        assert!(!abstract_lock_owned_by(name.as_bytes(), me.wrapping_add(1)));
-        drop(first);
+        assert_eq!(probe_abstract_lock(name.as_bytes(), me), LockProbe::OwnedByOwner);
+        assert_eq!(probe_abstract_lock(name.as_bytes(), me.wrapping_add(1)), LockProbe::OwnedByOther);
+
+        drop(slot1);
+        // Unbound socket returns TransientBusy (`ECONNREFUSED`), never OwnedByOther.
+        assert_eq!(probe_abstract_lock(name.as_bytes(), me), LockProbe::TransientBusy);
         let rebound = try_bind_abstract_socket(name.as_bytes()).expect("rebind succeeds once first fd closes");
         drop(rebound);
     }

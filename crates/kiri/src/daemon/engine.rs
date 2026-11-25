@@ -4712,7 +4712,7 @@ impl Engine {
     /// Names are the container name, or `<service>.<project>` for Compose
     /// services.
     pub fn route(&self, host: &str) -> Option<super::domains::Target> {
-        let host = host.split(':').next()?.to_ascii_lowercase();
+        let host = super::domains::parse_host_name(host)?;
         let name = host.strip_suffix(".kiri.localhost").or_else(|| host.strip_suffix(".kiri.local"))?.to_owned();
         let st = self.lock();
         let c = st.containers.values().find(|c| {
@@ -4741,6 +4741,41 @@ impl Engine {
         c.status = Status::Running;
         c.ip = Some(ip);
         c.first_if = Some(0);
+    }
+
+    /// Checks whether a `/proc/<pid>/cgroup` snapshot belongs to one of this
+    /// engine's currently running containers under a root-owned `kiri/<id>`
+    /// cgroup directory (#127). Prevents unprivileged host `unshare -Um` +
+    /// `newuidmap` processes from impersonating containers on `docker.container.sock`.
+    #[cfg(target_os = "linux")]
+    pub fn has_running_container_cgroup(&self, cgroup_text: &str) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        for line in cgroup_text.lines() {
+            let Some((_, rest)) = line.split_once(':') else { continue };
+            let Some((_, rel_path)) = rest.split_once(':') else { continue };
+            if !rel_path.starts_with('/') {
+                continue;
+            }
+            let segs: Vec<&str> = rel_path.split('/').filter(|s| !s.is_empty()).collect();
+            for i in 1..segs.len() {
+                let id = segs[i];
+                if segs[i - 1] != "kiri" || id.len() != 64 || !id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+                    continue;
+                }
+                let is_running = self.lock().containers.get(id).is_some_and(|c| c.status == Status::Running);
+                if !is_running {
+                    continue;
+                }
+                let prefix = format!("/sys/fs/cgroup/{}", segs[..=i].join("/"));
+                let parent = format!("/sys/fs/cgroup/{}", segs[..i].join("/"));
+                if std::fs::symlink_metadata(&prefix).is_ok_and(|m| m.is_dir() && m.uid() == 0)
+                    && std::fs::symlink_metadata(&parent).is_ok_and(|m| m.is_dir() && m.uid() == 0)
+                {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// For the Finder view (macOS).

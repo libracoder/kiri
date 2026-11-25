@@ -134,6 +134,7 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
     // and interfaces/routes (foreign bridges, default-route bridges, VPNs) may appear or change.
     let firewall = if host_process { net::firewall_events() } else { None };
     let link_events = if host_process { net::link_route_events() } else { None };
+    let netns_lock = if host_process { net::netns_lock_fd() } else { None };
     let mut bridges = Bridges::default();
     // In the VM, lookups the gateway's resolver fails go through the host.
     let mut dns = super::dns::Dns::default();
@@ -198,6 +199,7 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
         fds.push(libc::pollfd { fd: term.as_ref().map_or(-1, |f| f.as_raw_fd()), events: libc::POLLIN, revents: 0 });
         fds.push(libc::pollfd { fd: firewall.as_ref().map_or(-1, |f| f.as_raw_fd()), events: libc::POLLIN, revents: 0 });
         fds.push(libc::pollfd { fd: link_events.as_ref().map_or(-1, |f| f.as_raw_fd()), events: libc::POLLIN, revents: 0 });
+        fds.push(libc::pollfd { fd: netns_lock.unwrap_or(-1), events: libc::POLLIN, revents: 0 });
         fds.push(libc::pollfd { fd: measuring.as_ref().map_or(-1, super::usage::Job::fd), events: libc::POLLIN, revents: 0 });
         super::copy::interest(&mut fds);
         for r in &relays {
@@ -284,6 +286,10 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
             }
             if let Some(l) = link_events.as_ref().filter(|l| l.as_raw_fd() == pfd.fd) {
                 net::link_route_changed(l);
+                continue;
+            }
+            if netns_lock == Some(pfd.fd) {
+                net::drain_netns_lock(pfd.fd);
                 continue;
             }
             if measuring.as_ref().is_some_and(|j| j.fd() == pfd.fd) {
