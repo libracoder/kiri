@@ -1,5 +1,6 @@
 //! `kiri k8s`, `kiri machine`, `kiri diag`, `kiri usb`, `kiri domains`,
-//! `kiri registry` and `kiri scan` on Windows: the engine's own
+//! `kiri registry`, `kiri scan` and `kiri storage` on Windows (and the
+//! engine's half of `kiri doctor`, doctor.rs): the engine's own
 //! commands, run by the Linux `kiri` in the WSL distro Kiri's engine lives
 //! in, as the engine runs (root, with its HOME), so it finds the daemon's
 //! socket and store. `kiri diag report [--out PATH]` writes the report file
@@ -335,7 +336,7 @@ pub fn run(args: &[String]) -> io::Result<()> {
 }
 
 /// The distro setup put the engine in (crates/kiri-win/src/setup.rs).
-fn distro() -> Option<String> {
+pub(crate) fn distro() -> Option<String> {
     let dir = PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join("Kiri");
     let v: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("setup.json")).ok()?).ok()?;
     v["distro"].as_str().map(str::to_owned)
