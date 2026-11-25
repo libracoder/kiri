@@ -5,6 +5,7 @@
 connection-close-start	#588	a start sent with Connection: close was never closed, so Docker.DotNet hung until its timeout (#520)
 http10-start-closes	#588	an HTTP/1.0 request stayed open after its answer (#479)
 keep-alive-start-stays	#588	the connection-close fix must not close a kept-alive connection
+crates/kiri/src/daemon/ops.rs	#925	docker events --until without --since printed none of the kept events; Docker replays them up to --until
 connection-close-said	#588	the answer to Connection: close did not say Connection: close
 http10-ping-closes	#588	an HTTP/1.0 ping stayed open after its answer (#479)
 pid-mode-inspect	#588	--pid was accepted and ignored; inspect lost HostConfig.PidMode (#347)
