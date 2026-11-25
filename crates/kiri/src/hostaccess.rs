@@ -262,7 +262,7 @@ mod tests {
                     assert!(v == "'C'" || v == "C" || v == "\"C\"", "unexpected LC_ALL: {line}");
                     saw_lc_all = true;
                 }
-                "PWD" | "SHLVL" | "_" => {}
+                "PWD" | "OLDPWD" | "SHLVL" | "_" => {}
                 _ => panic!("unexpected inherited env var in usermod: {line}"),
             }
         }

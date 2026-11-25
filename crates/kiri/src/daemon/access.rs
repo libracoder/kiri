@@ -2112,7 +2112,7 @@ mod tests {
                     assert!(v == "'C'" || v == "C" || v == "\"C\"", "unexpected LC_ALL: {line}");
                     saw_lc_all = true;
                 } else {
-                    assert!(matches!(k, "PWD" | "SHLVL" | "_"), "unexpected inherited env var in getent: {line}");
+                    assert!(matches!(k, "PWD" | "OLDPWD" | "SHLVL" | "_"), "unexpected inherited env var in getent: {line}");
                 }
             }
             assert!(saw_lc_all, "LC_ALL=C not set in {text}");
