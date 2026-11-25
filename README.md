@@ -25,7 +25,8 @@
     <a href="https://docs.runkiri.com">Docs</a> ·
     <a href="docs/features.md">Features</a> ·
     <a href="https://runkiri.com/releases/">Download</a> ·
-    <a href="SECURITY.md">Security</a>
+    <a href="SECURITY.md">Security</a> ·
+    <a href="README.zh-CN.md">简体中文</a>
   </strong>
 </p>
 
