@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #934 Guest kernel: enable ext2/ext3 and FAT/vfat for loop-mounted disk images (unreleased)
+- Fixes: #934 Guest kernel has no ext2 or FAT/vfat, so loop-mounted disk images can't be mounted (`pmbootstrap install`, SD-card/EFI images)
+- Caused: none known
+- Caused by: -
+- Check: `guest-kernel-ext2-vfat`
+
 ### #929 macOS: hide the automatic `<` Finder entry for the Kiri NFS mount (unreleased)
 - Fixes: #929 Kiri appears as `<` in the Finder sidebar on macOS
 - Caused: none known

@@ -1665,6 +1665,27 @@ os.close(os.open(\"/upper.lock\", os.O_CREAT | os.O_WRONLY, 0o644))
 os.utime(\"/upper.lock\", (1700000001, 1700000001))
 bu = sx(-100, b\"/upper.lock\", 0)
 print(\"btime-ok\" if b1 == b2 == b3 and b1[:3] == (0, (0, 0), (1700000000, 0)) and bu[:3] == (0, (0, 0), (1700000001, 0)) else (b1, b2, b3, bu))'); $D rmi kiri-test/btime:1 >/dev/null 2>&1; echo \"\$out\""
+# Guest kernel supports ext2/ext3 (via ext4) and FAT/vfat for loop-mounted boot
+# and EFI/SD-card disk images (#934).
+only mac t guest-kernel-ext2-vfat "fs=ext2,ext3,ext4,vfat ext2=hello-ext2 vfat=hello-vfat" bash -c "$D run --rm --privileged alpine:3.20 sh -c '
+  set -e
+  fs=\$(awk \"{print \\\$NF}\" /proc/filesystems | grep -xE \"ext2|ext3|ext4|vfat\" | sort -u | paste -sd, -)
+  apk add -q --no-cache e2fsprogs dosfstools
+  dd if=/dev/zero of=/tmp/e2.img bs=1M count=4 status=none
+  mkfs.ext2 -q -F /tmp/e2.img
+  mkdir -p /mnt/e2 /mnt/vf
+  mount -t ext2 -o loop /tmp/e2.img /mnt/e2
+  echo hello-ext2 > /mnt/e2/ok
+  e2=\$(cat /mnt/e2/ok)
+  umount /mnt/e2
+  dd if=/dev/zero of=/tmp/vf.img bs=1M count=4 status=none
+  mkfs.vfat /tmp/vf.img >/dev/null
+  mount -t vfat -o loop /tmp/vf.img /mnt/vf
+  echo hello-vfat > /mnt/vf/ok
+  vf=\$(cat /mnt/vf/ok)
+  umount /mnt/vf
+  echo \"fs=\$fs ext2=\$e2 vfat=\$vf\"
+'"
 # Images of 59 to 125 layers start, with their top and lowest layers in the
 # container (#253: from 60 the overlay's options did not fit in a page). The
 # 125-layer one is also the next check's.
