@@ -11,6 +11,7 @@ mod fsview;
 mod hostopts;
 mod inroot;
 mod layers;
+mod localtime;
 mod net;
 mod netlink;
 mod pid1;

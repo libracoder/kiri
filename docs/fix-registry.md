@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #938 Windows (WSL 2): bundle `zoneinfo`, self-heal `/etc/localtime`, and prevent bind mounts from creating timezone directories (unreleased)
+- Fixes: #938 Windows: `/etc/localtime` is a directory in Kiri WSL, breaking common bind mounts
+- Caused: none known
+- Caused by: -
+- Check: `crates/kiri/src/daemon/localtime.rs`, `crates/kiri-init/src/linux/localtime.rs`, `scripts/kiri-linux.sh`
+
 ### #935 Machines: use local images before pulling and mount `--systemd` `/tmp` and `/run` with `exec` (unreleased)
 - Fixes: #935 `kiri machine create`: `--systemd` machines get a `noexec` `/tmp`, and `--image` always pulls instead of using a local image
 - Caused: none known

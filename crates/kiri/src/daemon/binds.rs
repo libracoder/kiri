@@ -535,6 +535,16 @@ fn engine_socket_with_alias(src: &str, own: &str, alias: Option<&str>, resolve: 
 /// folders 0750 and shut out the user whose mount it is. Folders already
 /// there are left as they are.
 pub fn make_source(path: &Path) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    if path.is_absolute() {
+        let norm = lexical_clean(&path.to_string_lossy());
+        if norm == "/etc/localtime" {
+            return super::localtime::ensure_localtime();
+        }
+        if norm == "/etc/timezone" {
+            return super::localtime::ensure_timezone();
+        }
+    }
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     let missing: Vec<&Path> = path.ancestors().take_while(|a| std::fs::symlink_metadata(a).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)).collect();
     if missing.is_empty() {

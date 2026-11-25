@@ -23,6 +23,8 @@ mod hostetc;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod hostroots;
 mod hostopts;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) mod localtime;
 mod mirror;
 mod http;
 mod logfile;
@@ -217,6 +219,12 @@ pub fn run(_args: &[String]) -> io::Result<()> {
         }
     }
     let _ = BOUND_SOCKET.set(socket.clone());
+    #[cfg(target_os = "linux")]
+    if rofs::is_wsl()
+        && let Err(e) = localtime::ensure_localtime()
+    {
+        diag::warn!("could not repair /etc/localtime", error = e);
+    }
     if let Some(ref msg) = rofs::check_daemon_storage(None) {
         diag::error!("storage filesystem is read-only", detail = msg);
     }

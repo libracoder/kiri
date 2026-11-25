@@ -34,6 +34,10 @@ if [ -n "$ro_state" ]; then
   exit 2
 fi
 mkdir -p "$HOME" /var/log
+# Clear an empty /etc/localtime or /etc/timezone directory left by pre-fix
+# `-v` bind mounts before the daemon starts and restores valid files (#938).
+[ -d /etc/localtime ] && [ ! -L /etc/localtime ] && rmdir /etc/localtime 2>/dev/null || true
+[ -d /etc/timezone ] && [ ! -L /etc/timezone ] && rmdir /etc/timezone 2>/dev/null || true
 # One at a time: the boot command, the bridge, kiri-win and `kiri`
 # (crates/kiri/src/wsl.rs) can each start it at once, and two would each
 # remove the socket and start a daemon. busybox flock has no time limit of

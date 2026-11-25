@@ -105,6 +105,11 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
     let mut host_dns = HostDns::default();
     if host_process {
         host_dns.get();
+        if super::sys::is_wsl()
+            && let Err(e) = super::localtime::ensure_localtime()
+        {
+            eprintln!("kiri-init: localtime: {e}");
+        }
     }
     let mut dhcp: Option<Dhcp> = if host_process {
         if let Err(e) = net::host_uplink() {

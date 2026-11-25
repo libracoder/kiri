@@ -2022,6 +2022,57 @@ fn volumes_from_mounts(guest: &[String], info: &[Value], ro: bool) -> Vec<(Strin
         .collect()
 }
 
+/// Prepares a host bind-mount source path before adding it to a container spec.
+/// On Linux/WSL, `/etc/localtime` and `/etc/timezone` are never created as
+/// directories: if missing (for `-v`) or an empty directory (left by an earlier
+/// version before #938), they are created/repaired as valid timezone files.
+fn prepare_bind_source(src: &str, here: &str, create_missing: bool) -> Result<(), Error> {
+    let tz = std::env::var("TZ").ok();
+    prepare_bind_source_at(std::path::Path::new("/"), src, here, create_missing, !cfg!(target_os = "macos"), tz.as_deref())
+}
+
+fn prepare_bind_source_at(
+    root: &std::path::Path,
+    src: &str,
+    here: &str,
+    create_missing: bool,
+    linux_tz_guard: bool,
+    tz_env: Option<&str>,
+) -> Result<(), Error> {
+    let norm = lexical_path(here);
+    let p = if root == std::path::Path::new("/") {
+        std::path::PathBuf::from(here)
+    } else {
+        root.join(norm.trim_start_matches('/'))
+    };
+    if linux_tz_guard && matches!(norm.as_str(), "/etc/localtime" | "/etc/timezone") {
+        let heal = || match norm.as_str() {
+            "/etc/localtime" => super::localtime::ensure_localtime_at(root, tz_env).map_err(Error::Io),
+            _ => super::localtime::ensure_timezone_at(root, tz_env).map_err(Error::Io),
+        };
+        let is_dir = std::fs::symlink_metadata(&p).is_ok_and(|m| m.file_type().is_dir());
+        if is_dir {
+            return heal();
+        }
+        if !super::localtime::is_valid_timezone_file_at(root, &p) {
+            if !create_missing && !std::fs::symlink_metadata(&p).is_ok_and(|m| m.file_type().is_file()) {
+                return Err(Error::BadRequest(format!(
+                    "invalid mount config for type \"bind\": bind source path does not exist: {src}"
+                )));
+            }
+            return heal();
+        }
+        return Ok(());
+    }
+    if !p.exists() {
+        if !create_missing {
+            return Err(Error::BadRequest(format!("invalid mount config for type \"bind\": bind source path does not exist: {src}")));
+        }
+        super::binds::make_source(&p).map_err(Error::Io)?;
+    }
+    Ok(())
+}
+
 /// `-v`, `--mount`, `--tmpfs`, `--volumes-from`, `-v /path` and the image's
 /// VOLUME lines.
 #[cfg(test)]
@@ -2097,13 +2148,7 @@ fn mounts_for(body: &Value, engine: &Engine, image: &kiri_image::Image, caller: 
                     out.info.push(json!({"Type": "bind", "Source": src, "Destination": dst, "Mode": "", "RW": !ro, "Propagation": "rprivate"}));
                     return Ok(());
                 };
-                let p = std::path::Path::new(&here);
-                if !p.exists() {
-                    if !create_missing {
-                        return Err(Error::BadRequest(format!("invalid mount config for type \"bind\": bind source path does not exist: {src}")));
-                    }
-                    super::binds::make_source(p).map_err(Error::Io)?;
-                }
+                prepare_bind_source(src, &here, create_missing)?;
                 // After a missing source was made, so its links are followed too.
                 out.guest.push(format!("{}\t{dst}\t{}", guest_bind_source(src), flag("")));
                 out.info.push(json!({"Type": "bind", "Source": src, "Destination": dst, "Mode": "", "RW": !ro, "Propagation": "rprivate"}));
@@ -8060,5 +8105,51 @@ mod resources_disk_tests {
         let err = super::stream_copy_out(&mut host_bad, &mut sink, true).unwrap_err();
         bad_guest.join().unwrap();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn bind_mount_preparation_never_creates_localtime_or_timezone_directory() {
+        let root = std::env::temp_dir().join(format!("kiri-api-localtime-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("etc")).unwrap();
+
+        // `--mount type=bind` (`create_missing = false`) refuses missing /etc/localtime without creating a directory.
+        let err = super::prepare_bind_source_at(&root, "/etc/localtime", "/etc/localtime", false, true, None).unwrap_err();
+        assert!(matches!(err, super::Error::BadRequest(ref m) if m.contains("bind source path does not exist")), "{err:?}");
+        assert!(std::fs::symlink_metadata(root.join("etc/localtime")).is_err());
+
+        // `-v /etc/localtime:/etc/localtime:ro` (`create_missing = true`) creates a valid TZif2 file, never a directory.
+        super::prepare_bind_source_at(&root, "/etc/localtime", "/etc//localtime", true, true, None).unwrap();
+        let lt = root.join("etc/localtime");
+        assert!(std::fs::symlink_metadata(&lt).unwrap().file_type().is_file());
+        let bytes = std::fs::read(&lt).unwrap();
+        assert!(bytes.starts_with(b"TZif2") && bytes.ends_with(b"\nUTC0\n"));
+
+        // Existing empty directory at /etc/localtime is repaired into a file for both `-v` and `--mount`.
+        std::fs::remove_file(&lt).unwrap();
+        std::fs::create_dir(&lt).unwrap();
+        super::prepare_bind_source_at(&root, "/etc/localtime", "/etc/./localtime", false, true, None).unwrap();
+        assert!(std::fs::symlink_metadata(&lt).unwrap().file_type().is_file());
+
+        // Non-empty directory at /etc/localtime is refused without deleting its contents.
+        std::fs::remove_file(&lt).unwrap();
+        std::fs::create_dir(&lt).unwrap();
+        std::fs::write(lt.join("keep"), b"keep").unwrap();
+        assert!(super::prepare_bind_source_at(&root, "/etc/localtime", "/etc/localtime", true, true, None).is_err());
+        assert_eq!(std::fs::read(lt.join("keep")).unwrap(), b"keep");
+        std::fs::remove_dir_all(&lt).unwrap();
+
+        // `-v /etc/timezone:/etc/timezone:ro` creates/repairs a regular file, never a directory.
+        let tz = root.join("etc/timezone");
+        let _ = std::fs::remove_file(&tz);
+        super::prepare_bind_source_at(&root, "/etc/timezone", "/etc/timezone", true, true, Some("Asia/Shanghai")).unwrap();
+        assert!(std::fs::symlink_metadata(&tz).unwrap().file_type().is_file());
+        assert_eq!(std::fs::read_to_string(&tz).unwrap(), "Asia/Shanghai\n");
+
+        // Regular missing bind paths still become directories under `-v`.
+        super::prepare_bind_source_at(&root, "/srv/app", "/srv/app", true, true, None).unwrap();
+        assert!(root.join("srv/app").is_dir());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

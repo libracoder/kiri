@@ -353,3 +353,6 @@ crates/kiri/src/vm_cli.rs	#473	macOS low ports (<1024) on 127.0.0.1/::1 failed w
 finder-mount-nobrowse	#929	Finder showed an automatic < sidebar entry for the local NFS socket mount
 guest-kernel-ext2-vfat	#934	guest kernel lacked CONFIG_EXT4_USE_FOR_EXT2 and CONFIG_VFAT_FS so loop-mounted ext2 and FAT/EFI disk images failed to mount
 crates/kiri/src/machine.rs	#935	kiri machine create always pulled --image instead of probing local images first, and --systemd machines mounted /tmp and /run with noexec
+crates/kiri/src/daemon/localtime.rs	#938	Kiri WSL lacked /etc/localtime so `-v /etc/localtime:/etc/localtime:ro` created an empty directory there, breaking timezone bind mounts until self-healed and guarded against directory creation
+crates/kiri-init/src/linux/localtime.rs	#938	kiri-init on WSL did not self-heal a missing or empty-directory /etc/localtime on startup and parse_mounts could create a directory at /etc/localtime or /etc/timezone
+scripts/kiri-linux.sh	#938	Kiri Linux WSL rootfs omitted /usr/share/zoneinfo, /etc/localtime and /etc/timezone, preventing WSL 2 Windows-to-Linux timezone sync and leaving /etc/localtime missing on fresh installs

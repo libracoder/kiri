@@ -19,9 +19,41 @@ mkdir -p "$cache"
 # The .part is this process's own: CI jobs on one machine share the cache.
 [ -f "$cache/$ALPINE" ] || { curl -fsSL --retry 3 -o "$cache/$ALPINE.$$.part" "$ALPINE_URL" && mv -f "$cache/$ALPINE.$$.part" "$cache/$ALPINE"; } || rm -f "$cache/$ALPINE.$$.part"
 echo "$ALPINE_SHA256  $cache/$ALPINE" | sha256sum -c - >/dev/null || { rm -f "$cache/$ALPINE"; echo "$ALPINE: SHA-256 mismatch" >&2; exit 1; }
+write_utc_tzif() {
+  # Canonical RFC 8536 TZif2 binary for UTC (UTC0): v1 header+data (54 B),
+  # v2 header+data (54 B), POSIX TZ footer ("\nUTC0\n", 6 B).
+  for _ in 1 2; do
+    printf 'TZif2'
+    printf '\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000'
+    printf '\001\000\000\000\004\000\000\000\000\000\000UTC\000'
+  done
+  printf '\nUTC0\n'
+}
 root=$(mktemp -d)
 trap 'rm -rf "$root"' EXIT
 tar --no-same-owner -xzf "$cache/$ALPINE" -C "$root"
 install -m 755 "$bin/kiri" "$bin/kiri-init" "$repo/contrib/wsl/kiri-linux/kiri-start" "$root/usr/local/bin/"
 install -m 644 "$repo/contrib/wsl/kiri-linux/wsl.conf" "$root/etc/wsl.conf"
+# Bundle zoneinfo and /etc/localtime so WSL 2's Windows-to-Linux timezone sync
+# finds /usr/share/zoneinfo and common `-v /etc/localtime:...` bind mounts
+# never turn /etc/localtime into a directory (#938).
+if [ -d /usr/share/zoneinfo ]; then
+  mkdir -p "$root/usr/share/zoneinfo"
+  cp -a /usr/share/zoneinfo/. "$root/usr/share/zoneinfo"
+fi
+if [ -L "$root/usr/share/zoneinfo/Etc/UTC" ] || [ ! -f "$root/usr/share/zoneinfo/Etc/UTC" ]; then
+  mkdir -p "$root/usr/share/zoneinfo/Etc"
+  rm -f "$root/usr/share/zoneinfo/Etc/UTC"
+  write_utc_tzif > "$root/usr/share/zoneinfo/Etc/UTC"
+  chmod 644 "$root/usr/share/zoneinfo/Etc/UTC"
+fi
+if [ -L "$root/usr/share/zoneinfo/UTC" ] || [ ! -f "$root/usr/share/zoneinfo/UTC" ]; then
+  rm -f "$root/usr/share/zoneinfo/UTC"
+  write_utc_tzif > "$root/usr/share/zoneinfo/UTC"
+  chmod 644 "$root/usr/share/zoneinfo/UTC"
+fi
+ln -snf /usr/share/zoneinfo/Etc/UTC "$root/etc/localtime"
+rm -f "$root/etc/timezone"
+printf 'Etc/UTC\n' > "$root/etc/timezone"
+chmod 644 "$root/etc/timezone"
 tar -C "$root" --numeric-owner --owner=0 --group=0 -czf "$out" .

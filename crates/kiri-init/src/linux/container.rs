@@ -1754,7 +1754,21 @@ pub(super) fn parse_mounts(list: StrList<'_>) -> io::Result<Vec<Mount>> {
             }
             // A missing source becomes a directory, as Docker does; one that is
             // there already (a file such as /etc/hostname, too) is used as it is.
-            if flags.contains(&"create") && fs::symlink_metadata(src).is_err() {
+            // Never create a directory at /etc/localtime or /etc/timezone (#938).
+            let norm = lexical_normalize(Path::new(src));
+            if norm == Path::new("/etc/localtime") {
+                if fs::symlink_metadata(src).is_ok_and(|m| m.file_type().is_dir())
+                    || (flags.contains(&"create") && fs::metadata(src).is_err())
+                {
+                    super::localtime::ensure_localtime()?;
+                }
+            } else if norm == Path::new("/etc/timezone") {
+                if fs::symlink_metadata(src).is_ok_and(|m| m.file_type().is_dir())
+                    || (flags.contains(&"create") && fs::metadata(src).is_err())
+                {
+                    super::localtime::ensure_timezone()?;
+                }
+            } else if flags.contains(&"create") && fs::symlink_metadata(src).is_err() {
                 fs::create_dir_all(src)?;
             }
             let mut loop_mount = None;
