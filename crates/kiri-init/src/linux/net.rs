@@ -941,6 +941,11 @@ enum BridgePlan {
 }
 
 impl Bridges {
+    /// Whether `name` currently exists with an IPv6 subnet configured.
+    pub fn has_ipv6(&self, name: &str) -> bool {
+        matches!(self.made.get(name), Some((.., Some(_))))
+    }
+
     fn plan(&self, name: &str, gateway: Option<[u8; 4]>, prefix: u8, want6: Bridge6) -> BridgePlan {
         match self.made.get(name) {
             Some(&(i, g, p, b6)) if (g, p) == (gateway, prefix) => match (b6, want6) {

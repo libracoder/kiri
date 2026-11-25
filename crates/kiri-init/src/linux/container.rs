@@ -785,6 +785,7 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
         uplinks.extend(net::Uplink::of(&host_if, "eth0", spec.net.gateway, v6, plug));
         veths.push(("eth0".to_owned(), host_if));
         if embedded_dns {
+            net.dns.set_bridge_ipv6(spec.net.bridge, net.bridges.has_ipv6(spec.net.bridge));
             if let Some(name) = net_opts::values(spec.net.opts, net_opts::NETWORK).next() {
                 net.dns.name_network(spec.net.bridge, name);
             }

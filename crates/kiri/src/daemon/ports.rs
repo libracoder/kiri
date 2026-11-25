@@ -1855,8 +1855,9 @@ pub fn is_tunnel_iface(name: &str) -> bool {
         .any(|prefix| name.strip_prefix(prefix).is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())))
 }
 
-/// Collapses a set of IPv4 CIDRs, removing duplicates and any sub-prefix
-/// already covered by a broader prefix in the set.
+/// Collapses a set of IPv4 CIDRs, removing duplicates, sub-prefixes already
+/// covered by a broader prefix, and merging aligned sibling halves (such as
+/// OpenVPN `def1`'s `0.0.0.0/1` + `128.0.0.0/1` → `0.0.0.0/0`).
 pub fn collapse_cidrs(cidrs: impl IntoIterator<Item = ([u8; 4], u8)>) -> Vec<([u8; 4], u8)> {
     let mut list: Vec<([u8; 4], u8)> = cidrs
         .into_iter()
@@ -1867,20 +1868,89 @@ pub fn collapse_cidrs(cidrs: impl IntoIterator<Item = ([u8; 4], u8)>) -> Vec<([u
         .collect();
     list.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
     list.dedup();
-    let mut out: Vec<([u8; 4], u8)> = Vec::with_capacity(list.len());
+    let mut disjoint: Vec<([u8; 4], u8)> = Vec::with_capacity(list.len());
     for (net, prefix) in list {
-        if !out.iter().any(|&(broader_net, broader_prefix)| broader_prefix <= prefix && cidr_contains(broader_net, broader_prefix, net)) {
-            out.push((net, prefix));
+        if !disjoint.iter().any(|&(broader_net, broader_prefix)| broader_prefix <= prefix && cidr_contains(broader_net, broader_prefix, net)) {
+            disjoint.push((net, prefix));
         }
     }
+    disjoint.sort_by_key(|&(net, prefix)| (u32::from_be_bytes(net), prefix));
+    let mut merged: Vec<(u32, u8)> = Vec::with_capacity(disjoint.len());
+    for (net, prefix) in disjoint {
+        let mut cur = (u32::from_be_bytes(net), prefix);
+        while let Some(&(prev_net, prev_prefix)) = merged.last() {
+            if prev_prefix != cur.1 || prev_prefix == 0 {
+                break;
+            }
+            let parent_prefix = prev_prefix - 1;
+            let parent_mask = ipv4_mask(parent_prefix);
+            if (prev_net & parent_mask) == (cur.0 & parent_mask) {
+                merged.pop();
+                cur = (prev_net & parent_mask, parent_prefix);
+            } else {
+                break;
+            }
+        }
+        merged.push(cur);
+    }
+    let mut out: Vec<([u8; 4], u8)> = merged.into_iter().map(|(net, prefix)| (net.to_be_bytes(), prefix)).collect();
+    out.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
     out
+}
+
+/// An active (`IFF_UP | IFF_RUNNING`) macOS tunnel interface (`utun*`,
+/// `ipsec*`, `ppp*`, `gpd*`, `feth*`) carrying a non-loopback, non-link-local
+/// IPv4 address (distinguishing active VPN tunnels from macOS's dormant
+/// IDS/iCloud `utun*` interfaces, which only carry `fe80::` link-local IPv6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveTunnel {
+    pub name: String,
+    pub ip: [u8; 4],
+    pub prefix: u8,
+    pub peer: Option<[u8; 4]>,
+    pub point_to_point: bool,
+}
+
+fn is_routable_tunnel_ipv4(ip: [u8; 4]) -> bool {
+    ip[0] != 0 && ip[0] != 127 && !(ip[0] == 169 && ip[1] == 254) && ip[0] < 224
+}
+
+fn is_tunnel_route_skippable(dst: [u8; 4], prefix: u8) -> bool {
+    dst[0] == 127
+        || (dst[0] == 169 && dst[1] == 254)
+        || dst[0] >= 224
+        || (dst == [0, 0, 0, 0] && prefix == 32)
 }
 
 /// Parses a macOS `sysctl([CTL_NET, PF_ROUTE, 0, AF_INET, NET_RT_DUMP, 0])`
 /// binary routing table buffer and returns the collapsed IPv4 CIDR prefixes
 /// whose outgoing interface is a tunnel (`is_tunnel_iface`), skipping
 /// loopback, link-local and multicast/reserved destinations.
+#[cfg(test)]
 pub fn parse_macos_routes(buf: &[u8], ifname_of: impl Fn(u16) -> Option<String>) -> Vec<([u8; 4], u8)> {
+    parse_macos_routes_with_tunnels(buf, ifname_of, &[])
+}
+
+/// Parses a macOS `NET_RT_DUMP` buffer together with active IPv4 tunnel
+/// interfaces (`active_tunnels` from `getifaddrs`), returning the collapsed
+/// IPv4 CIDR prefixes that must route through the host egress dialer (#932):
+/// - Unscoped routes on any tunnel interface (`is_tunnel_iface`) are kept.
+/// - `RTF_IFSCOPE` routes on non-tunnel interfaces and dormant tunnels
+///   without an IPv4 address are ignored.
+/// - On an active IPv4 tunnel, non-default `RTF_IFSCOPE` split routes are
+///   kept, and an `RTF_IFSCOPE` default route (`0.0.0.0/0`) is promoted when
+///   that tunnel has no explicit non-endpoint narrower routes (catching
+///   macOS 15+ `includeAllNetworks` / built-in IKEv2 / IPSec / PPP full
+///   tunnels without misclassifying split-tunnel OpenVPN/Tailscale/WireGuard).
+/// - An active IPv4 tunnel with no explicit non-endpoint routes in the route
+///   table contributes `0.0.0.0/0` when it is a `/32` (or `/0`)
+///   point-to-point tunnel (NECP policy-routed VPN), or its own subnet when
+///   it has a `1..=31` netmask.
+pub fn parse_macos_routes_with_tunnels(
+    buf: &[u8],
+    ifname_of: impl Fn(u16) -> Option<String>,
+    active_tunnels: &[ActiveTunnel],
+) -> Vec<([u8; 4], u8)> {
     const RTM_HDR_LEN: usize = 92;
     const RTM_VERSION: u8 = 5;
     const RTF_UP: i32 = 0x1;
@@ -1893,7 +1963,7 @@ pub fn parse_macos_routes(buf: &[u8], ifname_of: impl Fn(u16) -> Option<String>)
     #[cfg(target_os = "macos")]
     const _: () = assert!(std::mem::size_of::<libc::rt_msghdr>() == RTM_HDR_LEN);
 
-    let mut entries: Vec<([u8; 4], u8, String)> = Vec::new();
+    let mut entries: Vec<([u8; 4], u8, String, bool)> = Vec::new();
     let mut off = 0;
     while off + RTM_HDR_LEN <= buf.len() {
         let msglen = u16::from_ne_bytes([buf[off], buf[off + 1]]) as usize;
@@ -1910,9 +1980,10 @@ pub fn parse_macos_routes(buf: &[u8], ifname_of: impl Fn(u16) -> Option<String>)
         let ifindex = u16::from_ne_bytes([msg[4], msg[5]]);
         let flags = i32::from_ne_bytes([msg[8], msg[9], msg[10], msg[11]]);
         let addrs = i32::from_ne_bytes([msg[12], msg[13], msg[14], msg[15]]);
-        if flags & RTF_UP == 0 || flags & (RTF_WASCLONED | RTF_LLINFO | RTF_IFSCOPE) != 0 || addrs & 0x1 == 0 {
+        if flags & RTF_UP == 0 || flags & (RTF_WASCLONED | RTF_LLINFO) != 0 || addrs & 0x1 == 0 {
             continue;
         }
+        let is_ifscope = flags & RTF_IFSCOPE != 0;
         let mut pos = RTM_HDR_LEN;
         let mut dst: Option<[u8; 4]> = None;
         let mut mask_prefix: Option<u8> = None;
@@ -1957,43 +2028,75 @@ pub fn parse_macos_routes(buf: &[u8], ifname_of: impl Fn(u16) -> Option<String>)
             mask_prefix.unwrap_or(0)
         };
         let Some(ifname) = ifname_of(ifindex).filter(|s| !s.is_empty()) else { continue };
-        entries.push((mask_ipv4(dst_ip, prefix), prefix, ifname));
-    }
-
-    let mut routes = Vec::new();
-    for (dst, prefix, ifname) in entries {
         if !is_tunnel_iface(&ifname) {
             continue;
         }
-        // Every tunnel route is kept, the default route too when a full
-        // tunnel VPN replaced the primary interface. Skip loopback, link-local, multicast/reserved and 0.0.0.0/32.
-        if dst[0] == 127
-            || (dst[0] == 169 && dst[1] == 254)
-            || dst[0] >= 224
-            || (dst == [0, 0, 0, 0] && prefix == 32)
-        {
+        let net = mask_ipv4(dst_ip, prefix);
+        if is_tunnel_route_skippable(net, prefix) {
             continue;
         }
-        routes.push((dst, prefix));
+        entries.push((net, prefix, ifname, is_ifscope));
+    }
+
+    let is_active_tunnel = |name: &str| active_tunnels.iter().any(|t| t.name == name && is_tunnel_iface(&t.name) && is_routable_tunnel_ipv4(t.ip));
+    let mut routes = Vec::new();
+    for &(dst, prefix, ref ifname, is_ifscope) in &entries {
+        if !is_ifscope || (prefix > 0 && is_active_tunnel(ifname)) {
+            routes.push((dst, prefix));
+        }
+    }
+    for t in active_tunnels {
+        if !is_tunnel_iface(&t.name) || !is_routable_tunnel_ipv4(t.ip) {
+            continue;
+        }
+        let is_endpoint = |dst: [u8; 4], prefix: u8| prefix == 32 && (dst == t.ip || t.peer == Some(dst));
+        let mut has_unscoped_default = false;
+        let mut has_ifscope_default = false;
+        let mut has_explicit_narrower = false;
+        for &(dst, prefix, ref ifname, is_ifscope) in &entries {
+            if ifname != &t.name {
+                continue;
+            }
+            if prefix == 0 {
+                if is_ifscope {
+                    has_ifscope_default = true;
+                } else {
+                    has_unscoped_default = true;
+                }
+            } else if !is_endpoint(dst, prefix) {
+                has_explicit_narrower = true;
+            }
+        }
+        if has_unscoped_default {
+            continue;
+        }
+        if has_ifscope_default && !has_explicit_narrower {
+            routes.push(([0, 0, 0, 0], 0));
+        } else if !has_explicit_narrower {
+            if t.point_to_point && (t.prefix == 0 || t.prefix == 32) {
+                routes.push(([0, 0, 0, 0], 0));
+            } else if (1..=31).contains(&t.prefix) {
+                let net = mask_ipv4(t.ip, t.prefix);
+                if !is_tunnel_route_skippable(net, t.prefix) {
+                    routes.push((net, t.prefix));
+                }
+            }
+        }
     }
     collapse_cidrs(routes)
 }
 
-/// Whether `identifier` (and optional extension points blob/text) is a pure
-/// packet-tunnel VPN extension whose routes live in the kernel routing table
-/// on `utun*`, rather than a transparent proxy, content filter or DNS proxy.
-fn is_pure_packet_tunnel_ext(identifier: &str, ext_points_haystack: &[u8]) -> bool {
-    if identifier.starts_with("io.tailscale.") || identifier.starts_with("com.wireguard.") {
-        return true;
-    }
-    let has_bytes = |needle: &[u8]| ext_points_haystack.windows(needle.len()).any(|w| w == needle);
-    let has_packet_tunnel = has_bytes(b"com.apple.networkextension.packet-tunnel");
-    let has_filter_or_proxy = has_bytes(b"com.apple.networkextension.filter-data")
-        || has_bytes(b"com.apple.networkextension.filter-packet")
-        || has_bytes(b"com.apple.networkextension.app-proxy")
-        || has_bytes(b"com.apple.networkextension.dns-proxy")
-        || has_bytes(b"com.apple.networkextension.transparent-proxy");
-    has_packet_tunnel && !has_filter_or_proxy
+/// Whether `identifier` is a split-tunnel/mesh packet-tunnel extension known to
+/// coexist cleanly with macOS `vmnet` NAT via standard unscoped kernel subnet
+/// routes on `utun*` (Tailscale, WireGuard). All other activated third-party
+/// `networkextension` SystemExtensions — including enterprise SASE / VPN
+/// `com.apple.networkextension.packet-tunnel` extensions (GlobalProtect,
+/// Zscaler, Netskope, Cisco Secure Client, Cloudflare WARP, FortiClient,
+/// Jamf Trust, Twingate) whose tunnels use `RTF_IFSCOPE` routes or sub-1500
+/// MTUs that break `vmnet` PMTUD / TLS 1.3 ClientHello (#350, #932) — enable
+/// host egress relay.
+fn is_pure_packet_tunnel_ext(identifier: &str) -> bool {
+    identifier.starts_with("io.tailscale.") || identifier.starts_with("com.wireguard.")
 }
 
 fn is_network_ext_category(cat: &str) -> bool {
@@ -2035,7 +2138,7 @@ fn has_active_network_extension_xml(xml: &str) -> bool {
         if !has_net_cat {
             continue;
         }
-        if is_pure_packet_tunnel_ext(id, dict.as_bytes()) {
+        if is_pure_packet_tunnel_ext(id) {
             continue;
         }
         return true;
@@ -2125,7 +2228,6 @@ fn xml_key_string<'a>(dict: &'a str, key: &str) -> Option<&'a str> {
 #[derive(Debug)]
 enum BplistObj<'a> {
     Str(&'a str),
-    Data(&'a [u8]),
     Array(Vec<usize>),
     Dict(Vec<(usize, usize)>),
     Other,
@@ -2186,7 +2288,8 @@ fn parse_bplist(buf: &[u8]) -> Option<(usize, Vec<BplistObj<'_>>)> {
         let obj = match kind {
             0x4 => {
                 let (len, start) = bplist_len(buf, obj_off + 1, low)?;
-                BplistObj::Data(buf.get(start..start.checked_add(len)?)?)
+                let _ = buf.get(start..start.checked_add(len)?)?;
+                BplistObj::Other
             }
             0x5 => {
                 let (len, start) = bplist_len(buf, obj_off + 1, low)?;
@@ -2259,13 +2362,7 @@ fn has_active_network_extension_bplist(buf: &[u8]) -> bool {
         if !has_net_cat {
             continue;
         }
-        let launchd_data = get_dict_field(pairs, "additionalLaunchdPlistEntries")
-            .and_then(|didx| match objs.get(didx) {
-                Some(BplistObj::Data(d)) => Some(*d),
-                _ => None,
-            })
-            .unwrap_or(&[]);
-        if is_pure_packet_tunnel_ext(id, launchd_data) {
+        if is_pure_packet_tunnel_ext(id) {
             continue;
         }
         return true;
@@ -2362,6 +2459,86 @@ fn macos_ifname(index: u16) -> Option<String> {
     Some(unsafe { std::ffi::CStr::from_ptr(ptr) }.to_string_lossy().into_owned())
 }
 
+#[cfg(target_os = "macos")]
+fn macos_active_ipv4_tunnels() -> Vec<ActiveTunnel> {
+    let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs allocates `list`, freed below.
+    if unsafe { libc::getifaddrs(&mut list) } != 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut cur = list;
+    while !cur.is_null() {
+        // SAFETY: `cur` is a valid node from `getifaddrs`.
+        let ifa = unsafe { &*cur };
+        cur = ifa.ifa_next;
+        if ifa.ifa_name.is_null() || ifa.ifa_addr.is_null() {
+            continue;
+        }
+        let flags = ifa.ifa_flags as i32;
+        if flags & (libc::IFF_UP | libc::IFF_RUNNING) != (libc::IFF_UP | libc::IFF_RUNNING)
+            || flags & libc::IFF_LOOPBACK != 0
+        {
+            continue;
+        }
+        // SAFETY: `ifa_addr` is non-null.
+        if i32::from(unsafe { (*ifa.ifa_addr).sa_family }) != libc::AF_INET {
+            continue;
+        }
+        // SAFETY: `ifa_name` is NUL-terminated by `getifaddrs`.
+        let name = unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) }.to_string_lossy().into_owned();
+        if !is_tunnel_iface(&name) {
+            continue;
+        }
+        // SAFETY: `sa_family == AF_INET` guarantees a `sockaddr_in`.
+        let ip = unsafe { (*(ifa.ifa_addr as *const libc::sockaddr_in)).sin_addr.s_addr }.to_ne_bytes();
+        if !is_routable_tunnel_ipv4(ip) {
+            continue;
+        }
+        let prefix = if !ifa.ifa_netmask.is_null() {
+            // SAFETY: `ifa_netmask` is non-null; `sa_len` gives its valid byte length.
+            let sa_len = unsafe { (*ifa.ifa_netmask).sa_len } as usize;
+            let sa_family = i32::from(unsafe { (*ifa.ifa_netmask).sa_family });
+            if sa_family == libc::AF_INET || sa_family == 0 {
+                let avail = sa_len.saturating_sub(4).min(4);
+                let mut mask = [0u8; 4];
+                if avail > 0 {
+                    // SAFETY: `4 + avail <= sa_len`, within the kernel-allocated sockaddr.
+                    let bytes = unsafe { std::slice::from_raw_parts(ifa.ifa_netmask.cast::<u8>(), sa_len) };
+                    mask[..avail].copy_from_slice(&bytes[4..4 + avail]);
+                }
+                u32::from_be_bytes(mask).leading_ones() as u8
+            } else {
+                32
+            }
+        } else {
+            32
+        };
+        let point_to_point = flags & libc::IFF_POINTOPOINT != 0;
+        let peer = if point_to_point && !ifa.ifa_dstaddr.is_null() {
+            // SAFETY: `ifa_dstaddr` is non-null.
+            let sa_family = i32::from(unsafe { (*ifa.ifa_dstaddr).sa_family });
+            let sa_len = unsafe { (*ifa.ifa_dstaddr).sa_len } as usize;
+            if sa_family == libc::AF_INET && sa_len >= 8 {
+                // SAFETY: `sa_family == AF_INET` and `sa_len >= 8` guarantees `sin_addr` is readable.
+                let bytes = unsafe { std::slice::from_raw_parts(ifa.ifa_dstaddr.cast::<u8>(), 8) };
+                Some([bytes[4], bytes[5], bytes[6], bytes[7]])
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let tunnel = ActiveTunnel { name, ip, prefix, peer, point_to_point };
+        if !out.contains(&tunnel) {
+            out.push(tunnel);
+        }
+    }
+    // SAFETY: `list` came from `getifaddrs` and is freed once.
+    unsafe { libc::freeifaddrs(list) };
+    out
+}
+
 pub fn current_egress_routes() -> Vec<String> {
     let env_mode = std::env::var("KIRI_HOST_EGRESS").ok();
     #[cfg(target_os = "macos")]
@@ -2369,9 +2546,9 @@ pub fn current_egress_routes() -> Vec<String> {
         let ext = std::fs::read("/Library/SystemExtensions/db.plist")
             .ok()
             .is_some_and(|b| has_active_network_extension(&b));
-        let routes = dump_macos_route_table()
-            .map(|b| parse_macos_routes(&b, macos_ifname))
-            .unwrap_or_default();
+        let active_tunnels = macos_active_ipv4_tunnels();
+        let dump = dump_macos_route_table().unwrap_or_default();
+        let routes = parse_macos_routes_with_tunnels(&dump, macos_ifname, &active_tunnels);
         (ext, routes)
     };
     #[cfg(not(target_os = "macos"))]
@@ -4792,5 +4969,37 @@ tcp4       0      0  *.53                   *.*                    LISTEN      1
         let k2 = publish_key("same-container");
         assert_ne!(k1, k2);
         assert!(k1.starts_with("same-container:") && k2.starts_with("same-container:"));
+    }
+
+    #[test]
+    fn enterprise_packet_tunnel_and_ifscope_vpn_routes_trigger_host_egress() {
+        use super::{ActiveTunnel, collapse_cidrs, has_active_network_extension, parse_macos_routes_with_tunnels};
+
+        // 1. OpenVPN `def1` sibling halves `0.0.0.0/1` + `128.0.0.0/1` collapse to `0.0.0.0/0`.
+        assert_eq!(collapse_cidrs([([0, 0, 0, 0], 1), ([128, 0, 0, 0], 1)]), vec![([0, 0, 0, 0], 0)]);
+
+        // 2. Enterprise packet-tunnel SystemExtensions (GlobalProtect, Cloudflare WARP, Zscaler)
+        //    enable host egress relay, while Tailscale / WireGuard stay route-driven (#932).
+        let make_xml = |id: &str| format!(
+            "<plist version=\"1.0\"><dict><key>extensions</key><array><dict>\
+             <key>identifier</key><string>{id}</string>\
+             <key>state</key><string>activated_enabled</string>\
+             <key>categories</key><array><string>com.apple.system_extension.network_extension</string></array>\
+             <key>additionalLaunchdPlistEntries</key><data>com.apple.networkextension.packet-tunnel</data>\
+             </dict></array></dict></plist>"
+        );
+        assert!(has_active_network_extension(make_xml("com.paloaltonetworks.GlobalProtect.client.extension").as_bytes()));
+        assert!(has_active_network_extension(make_xml("com.cloudflare.1dot1dot1dot1.macos.warp.extension").as_bytes()));
+        assert!(has_active_network_extension(make_xml("com.zscaler.zenith.tunnel").as_bytes()));
+        assert!(!has_active_network_extension(make_xml("io.tailscale.ipn.macsys.network-extension").as_bytes()));
+        assert!(!has_active_network_extension(make_xml("com.wireguard.macos.network-extension").as_bytes()));
+
+        // 3. Active IPv4 point-to-point tunnel (`utun7`) with NECP policy routing or `RTF_IFSCOPE`
+        //    default route promotes `0.0.0.0/0`, whereas a split-tunnel with an explicit subnet
+        //    only routes its subnet, and dormant system `utun` without IPv4 contributes nothing.
+        let p2p = ActiveTunnel { name: "utun7".into(), ip: [10, 66, 0, 2], prefix: 32, peer: Some([10, 66, 0, 1]), point_to_point: true };
+        assert_eq!(parse_macos_routes_with_tunnels(&[], |_| None, &[p2p]), vec![([0, 0, 0, 0], 0)]);
+        let sub = ActiveTunnel { name: "utun8".into(), ip: [100, 64, 1, 5], prefix: 10, peer: None, point_to_point: false };
+        assert_eq!(parse_macos_routes_with_tunnels(&[], |_| None, &[sub]), vec![([100, 64, 0, 0], 10)]);
     }
 }

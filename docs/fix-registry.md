@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #932 Networking: return `NODATA` for external `AAAA` queries on IPv4-only networks and relay enterprise macOS VPN tunnels through the host (unreleased)
+- Fixes: #932 Containers and the Kubernetes node fail to reach Docker Hub with IPv6 `Network unreachable` and `TLS handshake timeout` under macOS VPN / packet-tunnel extensions
+- Caused: none known
+- Caused by: -
+- Check: `crates/kiri/src/daemon/ports.rs`, `crates/kiri-init/src/linux/dns.rs`
+
 ### #938 Windows (WSL 2): bundle `zoneinfo`, self-heal `/etc/localtime`, and prevent bind mounts from creating timezone directories (unreleased)
 - Fixes: #938 Windows: `/etc/localtime` is a directory in Kiri WSL, breaking common bind mounts
 - Caused: none known

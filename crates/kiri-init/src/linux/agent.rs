@@ -786,6 +786,7 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
                         });
                         match attached {
                             Ok(()) => {
+                                dns.set_bridge_ipv6(n.bridge, bridges.has_ipv6(n.bridge));
                                 if is_user {
                                     if let Some(name) = kiri_proto::net_opts::values(n.opts, kiri_proto::net_opts::NETWORK).next() {
                                         dns.name_network(n.bridge, name);

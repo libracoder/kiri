@@ -171,6 +171,11 @@ pub struct Dns {
     /// bridge → name → (the container's IPv4 address there, its IPv6 one):
     /// the IPv4 address is what `unregister` names the container by.
     names6: HashMap<String, HashMap<String, Owned6>>,
+    /// Bridges with IPv6 enabled: external `AAAA` queries on a server whose
+    /// bridges are all IPv4-only are answered `NODATA` locally (matching
+    /// Docker's libnetwork) instead of returning unreachable global IPv6
+    /// addresses (#932).
+    ipv6_bridges: std::collections::HashSet<String>,
     /// bridge → its Docker network's name: the order a container's server
     /// searches its networks in.
     networks: HashMap<String, String>,
@@ -340,6 +345,7 @@ impl Dns {
 
     /// The IPv6 address of the container that has `owner` on this network.
     pub fn register6(&mut self, bridge: &str, names: impl Iterator<Item = impl AsRef<str>>, owner: [u8; 4], ip: [u8; 16]) {
+        self.ipv6_bridges.insert(bridge.to_owned());
         let table = self.names6.entry(bridge.to_owned()).or_default();
         for n in names {
             let list = table.entry(n.as_ref().to_ascii_lowercase()).or_default();
@@ -347,6 +353,25 @@ impl Dns {
                 list.push((owner, ip));
             }
         }
+    }
+
+    /// Records whether `bridge` has IPv6 enabled, controlling whether external
+    /// `AAAA` queries on servers attached to it are forwarded upstream or
+    /// answered `NODATA` locally (#932).
+    pub fn set_bridge_ipv6(&mut self, bridge: &str, enabled: bool) {
+        if enabled {
+            self.ipv6_bridges.insert(bridge.to_owned());
+        } else {
+            self.ipv6_bridges.remove(bridge);
+        }
+    }
+
+    /// Whether any network served by `server` has IPv6 enabled.
+    fn server_has_ipv6(&self, server: usize) -> bool {
+        self.servers[server]
+            .bridges
+            .iter()
+            .any(|b| self.ipv6_bridges.contains(b) || self.names6.get(b).is_some_and(|m| !m.is_empty()))
     }
 
     /// `bridge` is Docker network `name` (`net_opts::NETWORK`).
@@ -364,6 +389,7 @@ impl Dns {
         }
         self.names.remove(bridge);
         self.names6.remove(bridge);
+        self.ipv6_bridges.remove(bridge);
         self.networks.remove(bridge);
         self.refused.remove(bridge);
         self.forget_pending();
@@ -685,9 +711,19 @@ impl Dns {
             }
         }
         let own = self.own_servers(key).map(|v| v.len());
-        let Some((_, _, end)) = parse_question(q) else {
+        let Some((_, qtype, end)) = parse_question(q) else {
             return;
         };
+        // On IPv4-only networks (no bridge on this server has IPv6 enabled),
+        // return NOERROR/NODATA for external AAAA queries instead of forwarding
+        // upstream and returning unreachable global IPv6 records (matching
+        // Docker Engine's libnetwork resolver, #932). Containers with custom
+        // `--dns` servers keep forwarding unmodified.
+        if qtype == 28 && own.is_none() && !self.server_has_ipv6(server) {
+            let reply = nodata(id_of(q), rd(q), &q[12..end]);
+            self.reply_now(server, client, tcp_client, &reply);
+            return;
+        }
         let (mut mine, mut mine_own) = (0, 0);
         for p in self.pending.iter().filter(|p| p.key == key) {
             mine += 1;
@@ -1278,6 +1314,18 @@ fn id_of(q: &[u8]) -> u16 {
 /// Whether query `q` asked for recursion (RD), which a reply copies.
 fn rd(q: &[u8]) -> bool {
     q.get(2).is_some_and(|f| f & 0x01 != 0)
+}
+
+/// A NOERROR reply with zero answers (NODATA) for a query with this `id`, RD
+/// flag and `question` section.
+fn nodata(id: u16, rd: bool, question: &[u8]) -> Vec<u8> {
+    let mut r = Vec::with_capacity(12 + question.len());
+    r.extend_from_slice(&id.to_be_bytes());
+    r.extend_from_slice(&[0x80 | u8::from(rd), 0x80]); // response, RD as asked, recursion available, NOERROR
+    r.extend_from_slice(&1u16.to_be_bytes());
+    r.extend_from_slice(&[0; 6]);
+    r.extend_from_slice(question);
+    r
 }
 
 /// A SERVFAIL for a query with this `id`, RD flag and `question` section.
@@ -2851,5 +2899,40 @@ mod tests {
         assert!(!super::answer_has_fake_ip(&msg), "host.docker.internal is not a Fake-IP");
         msg[rdata_off..].copy_from_slice(&[104, 16, 25, 34]);
         assert!(!super::answer_has_fake_ip(&msg), "real public IP is not a Fake-IP");
+    }
+
+    #[test]
+    fn ipv4_only_server_answers_external_aaaa_with_nodata_while_ipv6_forwards() {
+        use std::net::UdpSocket;
+        use std::os::fd::AsRawFd;
+
+        let mut dns = Dns::default();
+        let gw = UdpSocket::bind("127.0.0.1:0").unwrap();
+        gw.set_nonblocking(true).unwrap();
+        let gw_addr = gw.local_addr().unwrap();
+        dns.servers.push(super::Server { id: super::server_id(), bridges: vec!["kiri0".into()], sock: gw.into(), container: None });
+
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        client.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+
+        // 1. IPv4-only bridge: external AAAA gets immediate NOERROR/NODATA without upstream traffic.
+        let q_aaaa = query("registry-1.docker.io", 28);
+        client.send_to(&q_aaaa, gw_addr).unwrap();
+        let srv_fd = dns.servers[0].sock.as_raw_fd();
+        wait_readable(srv_fd);
+        dns.on_readable(srv_fd, &[[127, 0, 0, 71]]);
+        assert!(dns.pending.is_empty(), "IPv4-only server must not forward external AAAA upstream");
+        let mut reply = [0u8; 512];
+        let n = client.recv(&mut reply).unwrap();
+        assert_eq!(reply[3] & 0x0f, 0, "NOERROR");
+        assert_eq!(u16::from_be_bytes([reply[6], reply[7]]), 0, "zero answers (NODATA)");
+        assert!(n >= q_aaaa.len());
+
+        // 2. Enabling IPv6 on the bridge allows external AAAA queries to forward upstream.
+        dns.set_bridge_ipv6("kiri0", true);
+        client.send_to(&q_aaaa, gw_addr).unwrap();
+        wait_readable(srv_fd);
+        dns.on_readable(srv_fd, &[[127, 0, 0, 71]]);
+        assert_eq!(dns.pending.len(), 1, "IPv6-enabled bridge forwards external AAAA upstream");
     }
 }
