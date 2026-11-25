@@ -182,17 +182,19 @@ Kiri's own commands:
 | Command | What it does |
 |---------|--------------|
 | `kiri start` | Start Kiri again after a Stop, as Start in the window does |
-| `kiri k8s start \| stop \| status \| delete` | A single-node Kubernetes cluster |
-| `kiri machine create NAME [--distro D] \| list \| shell NAME \| stop \| delete NAME` | Linux machines |
+| `kiri k8s start \| stop \| status [--json] \| delete` | A single-node Kubernetes cluster |
+| `kiri machine create NAME [--distro D] \| list [--json] \| shell NAME \| stop \| delete NAME` | Linux machines |
 | `kiri share PORT\|CONTAINER [--name N]` | Share a local port or container on the internet |
 | `kiri import [orbstack \| desktop-linux]` | Bring images, volumes and containers over |
-| `kiri domains [set --http N --https N \| reset]` | The ports local domains answer on |
-| `kiri usb [list] \| attach DEVICE \| detach DEVICE` | USB devices for containers (beta) |
+| `kiri domains [set --http N --https N \| reset] [--json]` | The ports local domains answer on |
+| `kiri usb [list [--json]] \| attach DEVICE \| detach DEVICE` | USB devices for containers (beta) |
 | `kiri build-with [docker \| kiri]` | Which builder `docker build` uses |
 | `kiri update [--check]` | Install the newest release |
 | `kiri diag logs \| report` | Logs, and a report file to send with a bug |
 | `kiri bench [--runs N] [--network none\|bridge]` | Measure container start on your machine |
 | `kiri ui` | Open the window |
+
+`--json` prints one line of JSON for scripts, as the window gets it; `kiri registry` and `kiri share status` take it too.
 
 ---
 

@@ -180,12 +180,12 @@ Kiri 自有命令：
 | 命令 | 作用 |
 |------|------|
 | `kiri start` | 在 Stop 之后重新启动 Kiri，等同于窗口中的 Start |
-| `kiri k8s start \| stop \| status \| delete` | 单节点 Kubernetes 集群 |
-| `kiri machine create NAME [--distro D] \| list \| shell NAME \| stop \| delete NAME` | Linux 虚拟机 |
+| `kiri k8s start \| stop \| status [--json] \| delete` | 单节点 Kubernetes 集群 |
+| `kiri machine create NAME [--distro D] \| list [--json] \| shell NAME \| stop \| delete NAME` | Linux 虚拟机 |
 | `kiri share PORT\|CONTAINER [--name N]` | 将本地端口或容器分享到互联网 |
 | `kiri import [orbstack \| desktop-linux]` | 迁移镜像、卷和容器 |
-| `kiri domains [set --http N --https N \| reset]` | 本地域名监听的端口 |
-| `kiri usb [list] \| attach DEVICE \| detach DEVICE` | 容器的 USB 设备（beta） |
+| `kiri domains [set --http N --https N \| reset] [--json]` | 本地域名监听的端口 |
+| `kiri usb [list [--json]] \| attach DEVICE \| detach DEVICE` | 容器的 USB 设备（beta） |
 | `kiri build-with [docker \| kiri]` | 选择 `docker build` 使用的构建器 |
 | `kiri update [--check]` | 安装最新版本 |
 | `kiri diag logs \| report` | 日志，以及随 bug 报告提交的报告文件 |
