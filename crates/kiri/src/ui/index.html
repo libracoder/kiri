@@ -6734,7 +6734,7 @@ const blSpan = (a, b) => (a && b ? Date.parse(b) - Date.parse(a) : a ? Date.now(
 // Dockerfile steps are "[stage 3/9] …" or "[2/4] …"; the rest is BuildKit's own work.
 const blInternal = (name) => !/^\[([^\]]* )?\d+\/\d+\]/.test(name || "");
 function pickBuild(b) {
-  ui.bl.sel = b; ui.bl.d = null; ui.bl.open = new Set(); ui.bl.confirm = null; ui.bl.layers = null; ui.bl.plat = null;
+  ui.bl.sel = b; ui.bl.d = null; ui.bl.open = new Set(); ui.bl.confirm = null; ui.bl.layers = null; ui.bl.plat = null; ui.bl.asking = b.id;
   send("build", { name: b.builder, id: b.id });
   if (ui.bl.tab === "layers" || ui.bl.tab === "security") send("buildlayers", { name: b.builder, id: b.id });
 }
@@ -8609,7 +8609,8 @@ window.kiri = {
         b.items = (e.builds || b.items || []).filter((x) => !seen.has(x.id) && seen.add(x.id)); b.error = e.error || "";
         const sel = b.sel && b.items.find((x) => x.id === b.sel.id);
         if (!sel && b.items.length) pickBuild(b.items[0]);
-        else if (sel && (sel.status === "Running" || sel.status !== b.sel.status)) { b.sel = sel; send("build", { name: sel.builder, id: sel.id }); }
+        // One ask at a time for a running build: each reads its log for a moment (#923).
+        else if (sel && (sel.status !== b.sel.status || (sel.status === "Running" && b.asking !== sel.id))) { b.sel = sel; b.asking = sel.id; send("build", { name: sel.builder, id: sel.id }); }
         if (ui.view === "builds") render(); else if ($("n-builds")) $("n-builds").textContent = b.items.length;
         break;
       }
@@ -8626,7 +8627,7 @@ window.kiri = {
       case "scanhistory": { const x = ui.scans.get(e.name) || {}; x.history = e.scans || []; x.histErr = e.error || null; ui.scans.set(e.name, x); rerenderScan(); break; }
       case "imagelayers": if (ui.imgd?.name === e.name) { ui.imgd.layers = e; if (ui.view === "images") render(); } break;
       case "buildlayers": if (ui.bl.sel?.id === e.id) { ui.bl.layers = e; if (ui.view === "builds") renderBuilds(); } break;
-      case "build": if (ui.bl.sel?.id === e.id) { ui.bl.d = e; if (ui.view === "builds") renderBuilds(); } break;
+      case "build": if (ui.bl.asking === e.id) ui.bl.asking = null; if (ui.bl.sel?.id === e.id) { ui.bl.d = e; if (ui.view === "builds") renderBuilds(); } break;
       case "usedcontext": ui.ctxSwitching = false; if (e.error) toast("error", tr("Couldn't switch docker: {error}", { error: e.error })); if (ui.view === "settings") render(); break;
       case "importsources": ui.imp.sources = e.sources; { const s = e.sources.find((x) => x.id === ui.imp.source) || e.sources.find((x) => x.running && x.id === ui.status?.context) || e.sources.find((x) => x.running) || e.sources[0]; if (s) { ui.imp.source = s.id; if (s.running) send("inventory", { name: s.id }); } } if (ui.view === "settings") render(); break;
       case "inventory": ui.imp.inv = e; if (ui.view === "settings") render(); renderImportStrip(); drawImportModal(); break;

@@ -358,3 +358,5 @@ crates/kiri-init/src/linux/localtime.rs	#938	kiri-init on WSL did not self-heal 
 scripts/kiri-linux.sh	#938	Kiri Linux WSL rootfs omitted /usr/share/zoneinfo, /etc/localtime and /etc/timezone, preventing WSL 2 Windows-to-Linux timezone sync and leaving /etc/localtime missing on fresh installs
 crates/kiri-init/src/linux/dns.rs	#932	IPv4-only container networks forwarded external AAAA queries returning unreachable IPv6 addresses, and enterprise macOS packet-tunnel / RTF_IFSCOPE VPNs bypassed host egress relay causing TLS handshake timeouts
 tests/ui/volumes-size.js	#936	Volumes view did not show each volume's disk size, and loading sizes synchronously or via GET /system/df could stall list refreshes or wake a sleeping VM
+crates/kiri/src/builds.rs	#923	a running build's steps were read with `buildx history logs`, which follows the build until it ends: the Builds pane stayed on "Loading the steps..." and each 2 s ask left a docker and buildx process running
+tests/ui/builds-running.js	#923	the Builds view asked for a running build's steps on every tick, not once the last ask was answered
