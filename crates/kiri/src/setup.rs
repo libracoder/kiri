@@ -575,14 +575,18 @@ fn bundled_cli(contents: &Path) -> io::Result<()> {
     let ours = bin_dir()?;
     std::fs::create_dir_all(&ours)?;
     // `kiri` itself, for `kiri k8s`, `kiri machine`, `kiri import`…
+    let app_kiri = contents.join("MacOS/kiri");
     let kiri = ours.join("kiri");
     let _ = std::fs::remove_file(&kiri);
-    std::os::unix::fs::symlink(contents.join("MacOS/kiri"), &kiri)?;
+    std::os::unix::fs::symlink(&app_kiri, &kiri)?;
+    let brew_linked = !dev() && homebrew_links_this_app(&app_kiri);
     // Kiri Dev's commands are run by path: ~/.kiri-dev/bin/kiri.
-    if !dev() {
+    // When Homebrew's cask `binary` stanza already links `kiri` on PATH to
+    // this app (#733), leave shell profiles and Homebrew's symlink untouched.
+    if !dev() && !brew_linked {
         let h = home()?;
         shell_path_once(&h, &zdotdir(&h))?;
-        system_link(&kiri);
+        system_link(&kiri, &app_kiri);
     }
     let mut bin = contents.join("Resources/bin");
     if !bin.join("docker").is_file() {
@@ -610,7 +614,7 @@ fn bundled_cli(contents: &Path) -> io::Result<()> {
     }
     cfg["cliPluginsExtraDirs"] = dirs.into();
     write_json(&path, &cfg)?;
-    if home().is_ok_and(|h| no_profiles_file(&h).exists()) {
+    if brew_linked || home().is_ok_and(|h| no_profiles_file(&h).exists()) {
         println!("docker and kiri commands: {}", ours.display());
     } else {
         println!("docker and kiri commands: {} (on PATH in new terminal windows)", ours.display());
@@ -618,17 +622,57 @@ fn bundled_cli(contents: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Candidate Homebrew `bin/kiri` symlink paths on Apple silicon, Intel Macs,
+/// and custom `$HOMEBREW_PREFIX` installations (#733).
+fn homebrew_kiri_candidates(homebrew_prefix: Option<&std::ffi::OsStr>) -> Vec<PathBuf> {
+    let mut out = vec![PathBuf::from("/opt/homebrew/bin/kiri"), PathBuf::from(SYSTEM_LINK)];
+    if let Some(prefix) = homebrew_prefix.filter(|p| !p.is_empty()) {
+        let cand = PathBuf::from(prefix).join("bin/kiri");
+        if !out.contains(&cand) {
+            out.push(cand);
+        }
+    }
+    out
+}
+
+/// True when any candidate symlink points directly to `app_kiri` (rather than
+/// going through `~/.kiri/bin/kiri`, which `system_link` makes on Intel Macs).
+fn homebrew_links_app_in(candidates: &[PathBuf], app_kiri: &Path) -> bool {
+    let Ok(ours) = std::fs::canonicalize(app_kiri) else { return false };
+    let state_bin = format!("/{}/bin/", crate::flavor::STATE.get());
+    candidates.iter().any(|cand| {
+        let Ok(raw) = std::fs::read_link(cand) else { return false };
+        let raw_str = raw.to_string_lossy();
+        if raw_str.contains("/.kiri/bin/") || raw_str.contains(&state_bin) {
+            return false;
+        }
+        std::fs::canonicalize(cand).is_ok_and(|real| real == ours)
+    })
+}
+
+fn homebrew_links_this_app(app_kiri: &Path) -> bool {
+    homebrew_links_app_in(&homebrew_kiri_candidates(std::env::var_os("HOMEBREW_PREFIX").as_deref()), app_kiri)
+}
+
 /// `/usr/local/bin/kiri`, when the user can write there (Homebrew on Intel
 /// Macs makes it theirs). That directory is on every shell's PATH already,
 /// so `kiri` works even in a terminal opened before Kiri was. A `kiri`
-/// there that isn't Kiri's is left alone.
+/// there that isn't Kiri's (or that Homebrew's cask already linked directly to
+/// this app) is left alone.
 const SYSTEM_LINK: &str = "/usr/local/bin/kiri";
 
-fn system_link(kiri: &Path) {
-    let link = Path::new(SYSTEM_LINK);
+fn system_link(kiri: &Path, app_kiri: &Path) {
+    system_link_at(Path::new(SYSTEM_LINK), kiri, app_kiri);
+}
+
+fn system_link_at(link: &Path, kiri: &Path, app_kiri: &Path) {
     // Missing, or a link an older Kiri left (to a Kiri.app or ~/.kiri/bin
-    // that moved, or to nothing): made again to this one. Anything else there
-    // isn't Kiri's to replace; stale::stale_kiri() names it.
+    // that moved, or to nothing): made again to this one. If Homebrew's cask
+    // already linked `/usr/local/bin/kiri` directly to `app_kiri`, keep
+    // Homebrew's link so `brew uninstall` owns it (#733).
+    if homebrew_links_app_in(&[link.to_path_buf()], app_kiri) {
+        return;
+    }
     let replace = match std::fs::read_link(link) {
         Ok(target) => target != kiri && (kiri_link(&target) || !link.exists()),
         Err(_) => link.symlink_metadata().is_err(),
@@ -1478,6 +1522,53 @@ mod tests {
         assert!(saved.contains("<string>/Applications/Kiri.app/Contents/MacOS/kiri</string><string>daemon</string>"));
         super::set_start_at_login_at(&plist_path, exe, &log, true).unwrap();
         assert_eq!(super::plist_run_at_load(&std::fs::read_to_string(&plist_path).unwrap()), Some(true));
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // #733: when Homebrew's cask `binary` stanza links `$(brew --prefix)/bin/kiri`
+    // directly to `Kiri.app/Contents/MacOS/kiri`, setup recognizes it, skips
+    // shell profile edits, and preserves Homebrew's `/usr/local/bin/kiri` link,
+    // while Kiri's own `~/.kiri/bin/kiri` indirect link is not mistaken for Homebrew's.
+    #[test]
+    fn homebrew_cask_binary_link_is_detected_and_preserved() {
+        let d = scratch("homebrew-link");
+        let app_kiri = d.join("Applications/Kiri.app/Contents/MacOS/kiri");
+        let other_app = d.join("Downloads/Kiri.app/Contents/MacOS/kiri");
+        let our_bin_kiri = d.join(".kiri/bin/kiri");
+        let opt_brew_kiri = d.join("opt/homebrew/bin/kiri");
+        let usr_local_kiri = d.join("usr/local/bin/kiri");
+        for p in [&app_kiri, &other_app, &our_bin_kiri, &opt_brew_kiri, &usr_local_kiri] {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        }
+        std::fs::write(&app_kiri, "#!/bin/sh\n").unwrap();
+        std::fs::write(&other_app, "#!/bin/sh\n").unwrap();
+        std::os::unix::fs::symlink(&app_kiri, &our_bin_kiri).unwrap();
+
+        // No Homebrew link yet.
+        assert!(!super::homebrew_links_app_in(&[opt_brew_kiri.clone(), usr_local_kiri.clone()], &app_kiri));
+
+        // Kiri's own `system_link` (`/usr/local/bin/kiri -> ~/.kiri/bin/kiri`) is NOT a Homebrew cask link.
+        super::system_link_at(&usr_local_kiri, &our_bin_kiri, &app_kiri);
+        assert_eq!(std::fs::read_link(&usr_local_kiri).unwrap(), our_bin_kiri);
+        assert!(!super::homebrew_links_app_in(&[opt_brew_kiri.clone(), usr_local_kiri.clone()], &app_kiri));
+
+        // Homebrew cask link on Apple silicon (`/opt/homebrew/bin/kiri -> .../Kiri.app/Contents/MacOS/kiri`).
+        std::os::unix::fs::symlink(&app_kiri, &opt_brew_kiri).unwrap();
+        assert!(super::homebrew_links_app_in(&[opt_brew_kiri.clone()], &app_kiri));
+        assert!(!super::homebrew_links_app_in(&[opt_brew_kiri.clone()], &other_app));
+
+        // Homebrew cask link on Intel (`/usr/local/bin/kiri -> .../Kiri.app/Contents/MacOS/kiri`) is preserved by `system_link_at`.
+        std::fs::remove_file(&usr_local_kiri).unwrap();
+        std::os::unix::fs::symlink(&app_kiri, &usr_local_kiri).unwrap();
+        assert!(super::homebrew_links_app_in(&[usr_local_kiri.clone()], &app_kiri));
+        super::system_link_at(&usr_local_kiri, &our_bin_kiri, &app_kiri);
+        assert_eq!(std::fs::read_link(&usr_local_kiri).unwrap(), app_kiri, "Homebrew's direct cask link stays untouched");
+
+        // Custom `$HOMEBREW_PREFIX` adds `<prefix>/bin/kiri` without duplicating standard prefixes.
+        let cands = super::homebrew_kiri_candidates(Some(std::ffi::OsStr::new("/custom/brew")));
+        assert!(cands.contains(&std::path::PathBuf::from("/custom/brew/bin/kiri")));
+        assert_eq!(super::homebrew_kiri_candidates(Some(std::ffi::OsStr::new("/opt/homebrew"))).len(), 2);
 
         let _ = std::fs::remove_dir_all(&d);
     }

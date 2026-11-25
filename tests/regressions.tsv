@@ -344,7 +344,7 @@ tls-company-root-login	#303	docker login to a registry signed by a root the syst
 tls-unknown-root-refused	#303	a root the system does not trust must still be refused
 crates/kiri-image/src/roots.rs	#303	root store merge, system distrust filtering (macOS Never Trust, Windows Disallowed and disabled Server Auth EKU), cross-cert preservation, caps, and KIRI_TLS_ROOTS=webpki escape hatch
 crates/kiri/src/daemon/hostroots.rs	#303	Windows host roots persistence in WSL must enforce Caller::Host, 0600 atomic writes, non-symlink/non-FIFO reads, and bounded sizes
-crates/kiri/src/setup.rs	#556	opening Kiri.app re-appended the ~/.kiri/bin PATH block to shell profiles on every launch even when removed or when a profile already put ~/.kiri/bin on PATH, with no kiri setup --no-profiles opt-out
+crates/kiri/src/setup.rs	#556	opening Kiri.app re-appended the ~/.kiri/bin PATH block on every launch, and modified shell profiles or replaced /usr/local/bin/kiri even when Homebrew's cask binary stanza already linked kiri directly to the running app (#733)
 crates/kiri/src/k8s.rs	#816	kiri k8s set had no --version or --k3s-arg/--clear-k3s-args options to pin a k3s image tag or pass custom k3s server flags, and kiri k8s start did not sync ~/.kiri/k8s-manifests into k3s
 crates/kiri-win/src/k8s.rs	#816	Windows k8s.json config and container creation did not preserve or apply custom k3s version tags and extra k3s server arguments
 k8s-set-keeps-malformed-config	#926	kiri k8s set replaced a k8s.json it could not parse with defaults, losing every other setting, and reported success
