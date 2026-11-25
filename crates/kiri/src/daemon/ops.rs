@@ -706,7 +706,31 @@ pub(super) fn gone(w: &UnixStream) -> bool {
     r == 0 || pfd.revents & (libc::POLLHUP | libc::POLLERR) != 0
 }
 
-/// `docker events`: kept events since `since`, then live ones until `until`.
+fn event_time(ev: &Value) -> f64 {
+    ev["timeNano"].as_u64().map_or(0.0, |n| n as f64 / 1e9)
+}
+
+/// The kept events a subscription replays first: those inside the bounds.
+fn replayed<'a>(
+    recent: &'a [Value],
+    f: &super::filters::Filters,
+    since: Option<f64>,
+    until: Option<f64>,
+) -> Vec<&'a Value> {
+    if since.is_none() && until.is_none() {
+        return Vec::new();
+    }
+    recent
+        .iter()
+        .filter(|ev| {
+            since.is_none_or(|s| event_time(ev) >= s)
+                && until.is_none_or(|u| event_time(ev) <= u)
+                && event_matches(f, ev)
+        })
+        .collect()
+}
+
+/// `docker events`: kept events inside the bounds, then live ones until `until`.
 fn events(req: &Request, engine: &Engine, w: &mut UnixStream) -> io::Result<Next> {
     let f = match filters(req, &["type", "event", "container", "image", "network", "volume", "label", "label!", "daemon", "scope"]) {
         Ok(f) => f,
@@ -721,11 +745,8 @@ fn events(req: &Request, engine: &Engine, w: &mut UnixStream) -> io::Result<Next
     let (recent, rx) = engine.subscribe();
     http::begin_stream(w, 200, "application/json")?;
     let send = |w: &mut UnixStream, ev: &Value| -> io::Result<()> { http::chunk(w, format!("{ev}\n").as_bytes()) };
-    let at = |ev: &Value| ev["timeNano"].as_u64().map_or(0.0, |n| n as f64 / 1e9);
-    if let Some(s) = since {
-        for ev in recent.iter().filter(|ev| at(ev) >= s && until.is_none_or(|u| at(ev) <= u) && event_matches(&f, ev)) {
-            send(w, ev)?;
-        }
+    for ev in replayed(&recent, &f, since, until) {
+        send(w, ev)?;
     }
     loop {
         if until.is_some_and(|u| now() >= u) {
@@ -733,7 +754,7 @@ fn events(req: &Request, engine: &Engine, w: &mut UnixStream) -> io::Result<Next
         }
         match rx.recv_timeout(Duration::from_millis(500)) {
             Ok(ev) => {
-                if until.is_some_and(|u| at(&ev) > u) {
+                if until.is_some_and(|u| event_time(&ev) > u) {
                     break;
                 }
                 if event_matches(&f, &ev) {
@@ -750,6 +771,40 @@ fn events(req: &Request, engine: &Engine, w: &mut UnixStream) -> io::Result<Next
     }
     http::end(w)?;
     Ok(Next::KeepAlive)
+}
+
+#[cfg(test)]
+mod events_tests {
+    use super::super::filters::Filters;
+    use super::replayed;
+    use serde_json::{Value, json};
+
+    fn ev(secs: u64) -> Value {
+        json!({"Type": "container", "Action": "create", "Actor": {"ID": format!("c{secs}"), "Attributes": {}}, "timeNano": secs * 1_000_000_000})
+    }
+
+    fn ids(v: Vec<&Value>) -> Vec<&str> {
+        v.into_iter()
+            .map(|e| e["Actor"]["ID"].as_str().unwrap())
+            .collect()
+    }
+
+    /// `docker events --until` alone replays the kept events up to it, as
+    /// Docker does; both bounds are inclusive and no bounds replays nothing.
+    #[test]
+    fn events_until_without_since_replays_matching_history() {
+        let recent = [ev(1), ev(2), ev(3)];
+        let all = Filters::default();
+        assert_eq!(ids(replayed(&recent, &all, None, Some(2.5))), ["c1", "c2"]);
+        assert_eq!(ids(replayed(&recent, &all, Some(1.5), None)), ["c2", "c3"]);
+        assert_eq!(ids(replayed(&recent, &all, Some(1.5), Some(2.5))), ["c2"]);
+        assert!(replayed(&recent, &all, None, None).is_empty());
+        assert_eq!(ids(replayed(&recent, &all, None, Some(2.0))), ["c1", "c2"]);
+        assert_eq!(ids(replayed(&recent, &all, Some(2.0), Some(2.0))), ["c2"]);
+        let only_c3 = Filters::parse(Some(r#"{"container":["c3"]}"#)).unwrap();
+        assert!(replayed(&recent, &only_c3, None, Some(2.5)).is_empty());
+        assert_eq!(ids(replayed(&recent, &only_c3, None, Some(3.0))), ["c3"]);
+    }
 }
 
 #[cfg(test)]
