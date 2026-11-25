@@ -27,7 +27,7 @@ fn kiri_host() -> io::Result<String> {
     Ok(format!("npipe://{}", crate::client::pipe().replace('\\', "/")))
 }
 
-fn buildx(args: &[&str]) -> io::Result<(String, String)> {
+fn buildx_command(args: &[&str]) -> io::Result<Command> {
     let docker = crate::client::docker_cli().ok_or_else(|| io::Error::other("no docker CLI found (Kiri.app bundles one)"))?;
     let host = kiri_host()?;
     let mut cmd = Command::new(docker);
@@ -37,13 +37,70 @@ fn buildx(args: &[&str]) -> io::Result<(String, String)> {
     // Clear DOCKER_CONTEXT and point DOCKER_HOST at Kiri's socket/pipe so the
     // implicit "default" builder (used by `docker compose build`) resolves to
     // Kiri's engine while named builders on Kiri's context still work.
-    let out = cmd.env_remove("DOCKER_CONTEXT").env("DOCKER_HOST", host).arg("buildx").args(args).stdin(Stdio::null()).output()?;
+    cmd.env_remove("DOCKER_CONTEXT").env("DOCKER_HOST", host).arg("buildx").args(args).stdin(Stdio::null());
+    Ok(cmd)
+}
+
+fn buildx(args: &[&str]) -> io::Result<(String, String)> {
+    let out = buildx_command(args)?.output()?;
     let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout).into_owned(), String::from_utf8_lossy(&out.stderr).into_owned());
     if !out.status.success() {
         let msg = stderr.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("buildx failed").trim_start_matches("ERROR: ").to_owned();
         return Err(io::Error::other(msg));
     }
     Ok((stdout, stderr))
+}
+
+/// What `buildx` prints to stderr within `limit`, then the command and the
+/// plugin it started are stopped. `history logs` on a running build follows
+/// it until it ends: waiting for that left the steps unshown and, with the
+/// window asking again every 2 s, a reader piling up per ask (#923).
+fn buildx_stderr_for(args: &[&str], limit: std::time::Duration) -> io::Result<String> {
+    stderr_for(buildx_command(args)?, limit)
+}
+
+fn stderr_for(mut cmd: Command, limit: std::time::Duration) -> io::Result<String> {
+    cmd.stdout(Stdio::null()).stderr(Stdio::piped());
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    let mut child = cmd.spawn()?;
+    let mut err = child.stderr.take().ok_or_else(|| io::Error::other("no stderr"))?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = io::Read::read_to_end(&mut err, &mut b);
+        let _ = tx.send(b);
+    });
+    let until = std::time::Instant::now() + limit;
+    while child.try_wait()?.is_none() {
+        if std::time::Instant::now() >= until {
+            kill_tree(&mut child);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // The tree is gone, so the pipe closes; the wait only covers a straggler.
+    let b = rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap_or_default();
+    Ok(String::from_utf8_lossy(&b).into_owned())
+}
+
+/// Kills `child` and what it started: docker runs buildx as a child of its
+/// own. As ui/compose.rs's, which the Windows build of this file can't reach.
+fn kill_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    if let Ok(pid) = i32::try_from(child.id()) {
+        // SAFETY: a plain signal to the group this child leads (`process_group(0)`).
+        unsafe {
+            libc::killpg(pid, libc::SIGKILL);
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        let _ = Command::new("taskkill").args(["/F", "/T", "/PID", &child.id().to_string()]).creation_flags(0x0800_0000).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Every JSON value in `s`, whether one per line or run together.
@@ -133,8 +190,14 @@ pub fn detail(builder: &str, id: &str) -> io::Result<Value> {
     }
     let (info, _) = buildx(&["history", "inspect", "--builder", builder, id, "--format", "json"])?;
     let info: Value = serde_json::from_str(&info).map_err(io::Error::other)?;
-    // The raw progress stream goes to stderr.
-    let (_, raw) = buildx(&["history", "logs", "--builder", builder, "--progress", "rawjson", id]).unwrap_or_default();
+    // The raw progress stream goes to stderr. A running build's is what it
+    // has printed so far: the window asks again for the rest.
+    let logs_args = ["history", "logs", "--builder", builder, "--progress", "rawjson", id];
+    let raw = if info["Status"] == "Running" {
+        buildx_stderr_for(&logs_args, std::time::Duration::from_secs(2)).unwrap_or_default()
+    } else {
+        buildx(&logs_args).map(|(_, e)| e).unwrap_or_default()
+    };
 
     let mut order: Vec<String> = Vec::new();
     let mut steps: HashMap<String, Value> = HashMap::new();
@@ -464,6 +527,22 @@ fn failure(what: &str, stderr: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A follower that never exits (a running build's `history logs`, its
+    /// plugin a child of docker) gives what it printed and is gone (#923).
+    #[cfg(unix)]
+    #[test]
+    fn a_follower_gives_what_it_printed_and_is_stopped_with_its_children() {
+        let marker = format!("kiri-builds-follow-{}", std::process::id());
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", &format!("echo '{{\"a\":1}}' >&2; sh -c 'exec sleep 30 {marker}' 2>/dev/null & sleep 30; wait")]);
+        let started = std::time::Instant::now();
+        let out = stderr_for(cmd, std::time::Duration::from_millis(500)).unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(3), "{:?}", started.elapsed());
+        assert_eq!(values(&out), vec![json!({"a": 1})]);
+        let left = Command::new("pgrep").args(["-f", &marker]).output().unwrap();
+        assert!(left.stdout.is_empty(), "left running: {}", String::from_utf8_lossy(&left.stdout));
+    }
 
     /// A build already removed (a second click, or several removed at once)
     /// is removed: BuildKit's "lease not found" isn't an error to show. But
