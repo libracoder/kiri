@@ -113,6 +113,9 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
     }
     let mut dhcp: Option<Dhcp> = if host_process {
         if let Err(e) = net::host_uplink() {
+            if e.kind() == io::ErrorKind::AddrInUse {
+                return Err(e);
+            }
             eprintln!("kiri-init: no uplink: {e}");
         }
         None

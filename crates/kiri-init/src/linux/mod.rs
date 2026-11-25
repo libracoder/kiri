@@ -250,6 +250,7 @@ fn host_dirs() -> io::Result<container::Paths> {
         }
     };
     take_over(&root, leftovers)?;
+    net::claim_host_netns()?;
     let (cgroup_root, cgroup) = host_cgroup()?;
     let paths = container::Paths {
         layers: root.join("layers"),

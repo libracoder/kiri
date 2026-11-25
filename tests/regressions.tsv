@@ -366,3 +366,4 @@ crates/kiri/src/builds.rs	#923	a running build's steps were read with `buildx hi
 tests/ui/builds-running.js	#923	the Builds view asked for a running build's steps on every tick, not once the last ask was answered
 vm-swap-as-set	#326	the VM had no swap, so a container that outgrew the VM's memory was killed instead of slowing down
 vm-swap-container-over-memory	#326	a container over its --memory with --memory-swap room left was killed: the VM had no swap for its pages
+crates/kiri-init/src/linux/net.rs	#443	a second Kiri engine starting in a shared Linux/WSL 2 network namespace overwrote nft table ip kiri, claimed existing kiri0 bridges, and tore down the first engine's network on exit

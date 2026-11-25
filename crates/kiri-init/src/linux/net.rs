@@ -273,11 +273,124 @@ fn update_foreign_bridges() -> bool {
     }
 }
 
-/// On a Linux host: enables IPv4 forwarding, detects foreign local bridges,
-/// installs Kiri's nftables table, and adapts to any host firewall. Does not
-/// require a main-table default route at boot (policy-routed VPNs such as
-/// Tailscale or delayed interfaces work as routes appear).
+/// Abstract Unix-domain socket name guarding Kiri's host networking (`kiri0`
+/// and `nft table ip/ip6 kiri`) within a Linux network namespace (#443).
+/// Abstract socket addresses are scoped per network namespace and released by
+/// the kernel automatically when the agent exits or crashes.
+const HOST_NETNS_LOCK_NAME: &[u8] = b"kiri-engine-netns";
+
+static HOST_NETNS_LOCK: std::sync::OnceLock<OwnedFd> = std::sync::OnceLock::new();
+static HOST_NETNS_CLAIMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn make_abstract_sockaddr(name: &[u8]) -> io::Result<(libc::sockaddr_un, libc::socklen_t)> {
+    // SAFETY: zeroed `sockaddr_un` is valid; `sun_path[0] = 0` followed by `name`
+    // forms a Linux abstract socket address of length `offsetof(sun_path) + 1 + name.len()`.
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    if 1 + name.len() > addr.sun_path.len() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "netns lock name too long"));
+    }
+    for (dst, &src) in addr.sun_path[1..1 + name.len()].iter_mut().zip(name) {
+        *dst = src as libc::c_char;
+    }
+    let addr_len = (std::mem::offset_of!(libc::sockaddr_un, sun_path) + 1 + name.len()) as libc::socklen_t;
+    Ok((addr, addr_len))
+}
+
+/// Checks whether an active listener on `name` belongs to `owner` (prevents an
+/// unprivileged local process from squatting the abstract socket name to deny
+/// service to a root `kiri-init`).
+fn abstract_lock_owned_by(name: &[u8], owner: u32) -> bool {
+    let Ok((addr, addr_len)) = make_abstract_sockaddr(name) else { return false };
+    let raw = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK, 0) };
+    if raw < 0 {
+        return false;
+    }
+    // SAFETY: `raw` is a freshly created socket descriptor owned here.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    // SAFETY: `addr` is initialized through `addr_len` bytes.
+    if unsafe { libc::connect(fd.as_raw_fd(), (&raw const addr).cast(), addr_len) } != 0 {
+        return false;
+    }
+    // SAFETY: zeroed `ucred` is valid for `getsockopt(SO_PEERCRED)`.
+    let mut peer: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&raw mut peer).cast(),
+            &mut len,
+        )
+    };
+    rc == 0 && len == std::mem::size_of::<libc::ucred>() as libc::socklen_t && peer.uid == owner
+}
+
+fn try_bind_abstract_socket(name: &[u8]) -> Result<OwnedFd, i32> {
+    let (addr, addr_len) = make_abstract_sockaddr(name).map_err(|_| libc::EINVAL)?;
+    let raw = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    if raw < 0 {
+        return Err(io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO));
+    }
+    // SAFETY: `raw` is a freshly created socket descriptor owned here.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    // SAFETY: `addr` is initialized through `addr_len` bytes.
+    if unsafe { libc::bind(fd.as_raw_fd(), (&raw const addr).cast(), addr_len) } != 0 {
+        return Err(io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO));
+    }
+    // Listen so peer engines can verify ownership without `accept()`.
+    // SAFETY: `fd` is a bound `SOCK_STREAM` socket owned here.
+    let _ = unsafe { libc::listen(fd.as_raw_fd(), 16) };
+    Ok(fd)
+}
+
+const NETNS_BUSY_MSG: &str =
+    "another Kiri engine is already running in this network namespace (for example in another WSL 2 distribution): stop it first";
+
+/// Claims ownership of Kiri's bridge and firewall tables in the current Linux
+/// network namespace (#443). All WSL 2 distributions share one network
+/// namespace; refusing early prevents a second engine from overwriting
+/// `nft table ip kiri` or deleting `kiri0` when stopping.
+pub fn claim_host_netns() -> io::Result<()> {
+    use std::sync::atomic::Ordering;
+    if HOST_NETNS_CLAIMED.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    // SAFETY: `geteuid` has no preconditions.
+    let me = unsafe { libc::geteuid() };
+    let start = Instant::now();
+    loop {
+        match try_bind_abstract_socket(HOST_NETNS_LOCK_NAME) {
+            Ok(fd) => {
+                let _ = HOST_NETNS_LOCK.set(fd);
+                HOST_NETNS_CLAIMED.store(true, Ordering::Release);
+                return Ok(());
+            }
+            Err(code) if code == libc::EADDRINUSE => {
+                if !abstract_lock_owned_by(HOST_NETNS_LOCK_NAME, me) {
+                    eprintln!("kiri-init: ignoring unprivileged holder on abstract netns socket");
+                    HOST_NETNS_CLAIMED.store(true, Ordering::Release);
+                    return Ok(());
+                }
+                if start.elapsed() < Duration::from_millis(500) {
+                    std::thread::sleep(Duration::from_millis(25));
+                    continue;
+                }
+                return Err(io::Error::new(io::ErrorKind::AddrInUse, NETNS_BUSY_MSG));
+            }
+            Err(code) => return Err(io::Error::from_raw_os_error(code)),
+        }
+    }
+}
+
+/// On a Linux host: claims the network namespace, enables IPv4 forwarding,
+/// detects foreign local bridges, installs Kiri's nftables table, and adapts
+/// to any host firewall. Does not require a main-table default route at boot
+/// (policy-routed VPNs such as Tailscale or delayed interfaces work as routes
+/// appear).
 pub fn host_uplink() -> io::Result<()> {
+    claim_host_netns()?;
     sys::write_file("/proc/sys/net/ipv4/ip_forward", "1")?;
     // No host.docker.internal loopback redirect on a Linux host: it would
     // let containers reach the real machine's 127.0.0.1 services. host.docker
@@ -976,9 +1089,10 @@ impl Bridges {
             BridgePlan::Recreate => self.remove(name),
             BridgePlan::Create => {}
         }
-        let r = self.bring_up(name, gateway, prefix, v6);
+        let mut created = false;
+        let r = self.bring_up(name, gateway, prefix, v6, &mut created);
         if r.is_err() {
-            if let Ok(mut nl) = Netlink::open(libc::NETLINK_ROUTE) {
+            if created && let Ok(mut nl) = Netlink::open(libc::NETLINK_ROUTE) {
                 let _ = netlink::delete_link(&mut nl, name);
             }
             MADE_BRIDGES.lock().unwrap_or_else(|e| e.into_inner()).retain(|m| m != name);
@@ -1003,9 +1117,9 @@ impl Bridges {
         Ok(index)
     }
 
-    fn bring_up(&mut self, name: &str, gateway: Option<[u8; 4]>, prefix: u8, v6: Option<Ip6>) -> io::Result<i32> {
+    fn bring_up(&mut self, name: &str, gateway: Option<[u8; 4]>, prefix: u8, v6: Option<Ip6>, created: &mut bool) -> io::Result<i32> {
         let mut nl = Netlink::open(libc::NETLINK_ROUTE)?;
-        netlink::create_bridge(&mut nl, name)?;
+        *created = netlink::create_bridge(&mut nl, name)?;
         let mut made = MADE_BRIDGES.lock().unwrap_or_else(|e| e.into_inner());
         if !made.iter().any(|m| m == name) {
             made.push(name.to_owned());
@@ -1140,6 +1254,9 @@ static MADE_BRIDGES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::
 /// those: another engine's may share the network namespace) and Kiri's
 /// nftables table, so nothing of the engine is left in the host's network.
 pub fn remove_host_network() {
+    if !HOST_NETNS_CLAIMED.load(std::sync::atomic::Ordering::Acquire) {
+        return;
+    }
     let names = std::mem::take(&mut *MADE_BRIDGES.lock().unwrap_or_else(|e| e.into_inner()));
     BRIDGE_SUBNETS.lock().unwrap_or_else(|e| e.into_inner()).clear();
     EGRESS_ROUTES.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -1462,5 +1579,19 @@ mod tests {
         assert!(pid_file_alive(&pid_path, |_| true));
         assert!(!pid_file_alive(&pid_path, |_| false));
         let _ = std::fs::remove_file(&pid_path);
+    }
+
+    #[test]
+    fn abstract_netns_lock_rejects_second_holder_until_first_drops() {
+        let name = format!("kiri-netns-test-{}", std::process::id());
+        let first = try_bind_abstract_socket(name.as_bytes()).expect("first holder binds abstract netns lock");
+        let code = try_bind_abstract_socket(name.as_bytes()).expect_err("second holder in same netns must fail");
+        assert_eq!(code, libc::EADDRINUSE);
+        let me = unsafe { libc::geteuid() };
+        assert!(abstract_lock_owned_by(name.as_bytes(), me));
+        assert!(!abstract_lock_owned_by(name.as_bytes(), me.wrapping_add(1)));
+        drop(first);
+        let rebound = try_bind_abstract_socket(name.as_bytes()).expect("rebind succeeds once first fd closes");
+        drop(rebound);
     }
 }

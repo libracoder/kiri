@@ -251,19 +251,23 @@ fn ifinfo(index: i32, flags: u32, change: u32) -> [u8; 16] {
 /// broke mid-TLS until it was asked again. Docker gives its bridges an
 /// address for the same reason. A bridge left by an earlier run without
 /// one (a Linux host) gets one too.
-pub fn create_bridge(nl: &mut Netlink, name: &str) -> io::Result<()> {
+/// Returns `Ok(true)` when a new bridge was created, or `Ok(false)` when an
+/// interface named `name` already existed.
+pub fn create_bridge(nl: &mut Netlink, name: &str) -> io::Result<bool> {
     match nl.request(&mut [new_bridge(name, bridge_mac(random_bytes()))]) {
+        Ok(()) => Ok(true),
         Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
             // NET_ADDR_SET (3): someone set it, so it no longer follows the ports.
             let kind = std::fs::read_to_string(format!("/sys/class/net/{name}/addr_assign_type")).unwrap_or_default();
             if kind.trim() == "3" {
-                return Ok(());
+                return Ok(false);
             }
             let mut m = Msg::new(RTM_NEWLINK, NLM_F_ACK);
             m.raw(&ifinfo(index_of(name)?, 0, 0)).attr(IFLA_ADDRESS, &bridge_mac(random_bytes()));
-            nl.request(&mut [m])
+            nl.request(&mut [m])?;
+            Ok(false)
         }
-        r => r,
+        Err(e) => Err(e),
     }
 }
 
