@@ -2035,5 +2035,6 @@
   "Could not uninstall Kiri: {error}": "Kirin asennusta ei voitu poistaa: {error}",
   "Uninstall Kiri using your system package manager": "Poista Kirin asennus järjestelmän paketinhallinnalla",
   "Swap": "Swap",
-  "Disk space the VM may use when its memory runs out, so containers slow down instead of being stopped. Applies on restart.": "Levytilaa, jota VM voi käyttää, kun sen muisti loppuu, jolloin kontit hidastuvat pysäyttämisen sijaan. Tulee voimaan uudelleenkäynnistyksessä."
+  "Disk space the VM may use when its memory runs out, so containers slow down instead of being stopped. Applies on restart.": "Levytilaa, jota VM voi käyttää, kun sen muisti loppuu, jolloin kontit hidastuvat pysäyttämisen sijaan. Tulee voimaan uudelleenkäynnistyksessä.",
+  "Community": "Yhteisö"
 }

@@ -2035,5 +2035,6 @@
   "Could not uninstall Kiri: {error}": "Kiri अनइंस्टॉल नहीं कर सके: {error}",
   "Uninstall Kiri using your system package manager": "अपने सिस्टम पैकेज मैनेजर से Kiri अनइंस्टॉल करें",
   "Swap": "स्वैप",
-  "Disk space the VM may use when its memory runs out, so containers slow down instead of being stopped. Applies on restart.": "डिस्क स्थान जिसे VM अपनी मेमोरी खत्म होने पर उपयोग कर सकता है, ताकि कंटेनर रुकने के बजाय धीमे हो जाएं। रीस्टार्ट पर लागू होता है।"
+  "Disk space the VM may use when its memory runs out, so containers slow down instead of being stopped. Applies on restart.": "डिस्क स्थान जिसे VM अपनी मेमोरी खत्म होने पर उपयोग कर सकता है, ताकि कंटेनर रुकने के बजाय धीमे हो जाएं। रीस्टार्ट पर लागू होता है।",
+  "Community": "समुदाय"
 }

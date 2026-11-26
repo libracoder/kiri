@@ -2035,5 +2035,6 @@
   "Could not uninstall Kiri: {error}": "无法卸载 Kiri：{error}",
   "Uninstall Kiri using your system package manager": "请使用系统包管理器卸载 Kiri",
   "Swap": "交换空间",
-  "Disk space the VM may use when its memory runs out, so containers slow down instead of being stopped. Applies on restart.": "虚拟机内存用尽时可使用的磁盘空间，容器会变慢而不是被停止。重启后生效。"
+  "Disk space the VM may use when its memory runs out, so containers slow down instead of being stopped. Applies on restart.": "虚拟机内存用尽时可使用的磁盘空间，容器会变慢而不是被停止。重启后生效。",
+  "Community": "社区"
 }

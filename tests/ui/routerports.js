@@ -64,6 +64,22 @@ t("a router that couldn't start says its port is in use", () => {
   const n = document.querySelector("#content .rp-notes").textContent;
   if (!/off: port 80 is in use/.test(n) || /paused/.test(n)) throw new Error(n);
 });
+t("localUrl hides dead domain links when the router is off or paused, keeping published host ports", () => {
+  const ctr = { Id: "c1", Names: ["/web"], Image: "nginx:alpine", State: "running", Status: "Up 1m", Created: 1,
+    Ports: [{ IP: "0.0.0.0", PublicPort: 62720, PrivatePort: 80, Type: "tcp" }], Labels: {} };
+  kiri.on({ type: "lists", containers: [ctr], images: [], volumes: [], networks: [] });
+  show("containers");
+  for (const state of [{ running: false, serving: false }, { running: true, serving: false }]) {
+    kiri.on(rpEvent(80, 443, { http: state }));
+    if (localUrl(ctr, "web") !== "") throw new Error("expected empty localUrl, got " + localUrl(ctr, "web"));
+    if (document.querySelector(".sub-addr") || document.querySelector('[data-open*="kiri.local"]')) throw new Error("dead domain link rendered");
+    if (!document.querySelector("#content").textContent.includes("62720")) throw new Error("published host port missing");
+  }
+  kiri.on(rpEvent(80, 443, { http: { running: true, serving: true } }));
+  if (!localUrl(ctr, "web").endsWith("web.kiri.localhost")) throw new Error("restored localUrl: " + localUrl(ctr, "web"));
+  if (!document.querySelector(".sub-addr")) throw new Error("domain link not restored");
+  kiri.on({ type: "lists", containers: [], images: [], volumes: [], networks: [] });
+});
 t("with no engine, the row says to start Kiri", () => {
   kiri.on({ type: "routerports", error: "connection refused" });
   domains();

@@ -2035,5 +2035,6 @@
   "Could not uninstall Kiri: {error}": "Kunne ikke avinstallere Kiri: {error}",
   "Uninstall Kiri using your system package manager": "Avinstaller Kiri med systemets pakkebehandler",
   "Swap": "Swap",
-  "Disk space the VM may use when its memory runs out, so containers slow down instead of being stopped. Applies on restart.": "Diskplass VM-en kan bruke når minnet går tomt, slik at containere går tregere i stedet for å bli stoppet. Brukes ved omstart."
+  "Disk space the VM may use when its memory runs out, so containers slow down instead of being stopped. Applies on restart.": "Diskplass VM-en kan bruke når minnet går tomt, slik at containere går tregere i stedet for å bli stoppet. Brukes ved omstart.",
+  "Community": "Fellesskap"
 }

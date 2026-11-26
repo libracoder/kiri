@@ -2035,5 +2035,6 @@
   "Could not uninstall Kiri: {error}": "Kiriን ማራገፍ አልተቻለም፦ {error}",
   "Uninstall Kiri using your system package manager": "የሥርዓትዎን የጥቅል አስተዳዳሪ በመጠቀም Kiriን ያራግፉ",
   "Swap": "ስዋፕ",
-  "Disk space the VM may use when its memory runs out, so containers slow down instead of being stopped. Applies on restart.": "የVM ማህደረ ትውስታ ሲያልቅ VM ሊጠቀምበት የሚችል የዲስክ ቦታ፣ ስለዚህ ኮንቴይነሮች ከመቆም ይልቅ ይዘገያሉ። ዳግም ሲጀመር ይተገበራል።"
+  "Disk space the VM may use when its memory runs out, so containers slow down instead of being stopped. Applies on restart.": "የVM ማህደረ ትውስታ ሲያልቅ VM ሊጠቀምበት የሚችል የዲስክ ቦታ፣ ስለዚህ ኮንቴይነሮች ከመቆም ይልቅ ይዘገያሉ። ዳግም ሲጀመር ይተገበራል።",
+  "Community": "ማኅበረሰብ"
 }

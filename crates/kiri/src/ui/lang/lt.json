@@ -2035,5 +2035,6 @@
   "Could not uninstall Kiri: {error}": "Nepavyko pašalinti Kiri: {error}",
   "Uninstall Kiri using your system package manager": "Pašalinkite Kiri naudodami sistemos paketų tvarkyklę",
   "Swap": "Sukeitimų sritis (swap)",
-  "Disk space the VM may use when its memory runs out, so containers slow down instead of being stopped. Applies on restart.": "Disko vieta, kurią VM gali naudoti pritrūkusi atminties, kad konteineriai sulėtėtų, o ne būtų sustabdyti. Įsigalioja paleidus iš naujo."
+  "Disk space the VM may use when its memory runs out, so containers slow down instead of being stopped. Applies on restart.": "Disko vieta, kurią VM gali naudoti pritrūkusi atminties, kad konteineriai sulėtėtų, o ne būtų sustabdyti. Įsigalioja paleidus iš naujo.",
+  "Community": "Bendruomenė"
 }

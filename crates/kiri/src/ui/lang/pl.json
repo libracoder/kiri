@@ -2035,5 +2035,6 @@
   "Could not uninstall Kiri: {error}": "Nie udało się odinstalować Kiri: {error}",
   "Uninstall Kiri using your system package manager": "Odinstaluj Kiri za pomocą systemowego menedżera pakietów",
   "Swap": "Swap",
-  "Disk space the VM may use when its memory runs out, so containers slow down instead of being stopped. Applies on restart.": "Miejsce na dysku, którego VM może używać, gdy zabraknie jej pamięci, dzięki czemu kontenery zwalniają zamiast zostać zatrzymane. Obowiązuje po ponownym uruchomieniu."
+  "Disk space the VM may use when its memory runs out, so containers slow down instead of being stopped. Applies on restart.": "Miejsce na dysku, którego VM może używać, gdy zabraknie jej pamięci, dzięki czemu kontenery zwalniają zamiast zostać zatrzymane. Obowiązuje po ponownym uruchomieniu.",
+  "Community": "Społeczność"
 }

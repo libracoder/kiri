@@ -2035,5 +2035,6 @@
   "Could not uninstall Kiri: {error}": "Kiri-ді өшіру мүмкін болмады: {error}",
   "Uninstall Kiri using your system package manager": "Kiri-ді жүйенің пакет менеджері арқылы өшіріңіз",
   "Swap": "Своп",
-  "Disk space the VM may use when its memory runs out, so containers slow down instead of being stopped. Applies on restart.": "VM жадысы таусылғанда пайдалана алатын диск кеңістігі: контейнерлер тоқтатылмай, баяулайды. Қайта іске қосқанда қолданылады."
+  "Disk space the VM may use when its memory runs out, so containers slow down instead of being stopped. Applies on restart.": "VM жадысы таусылғанда пайдалана алатын диск кеңістігі: контейнерлер тоқтатылмай, баяулайды. Қайта іске қосқанда қолданылады.",
+  "Community": "Қауымдастық"
 }

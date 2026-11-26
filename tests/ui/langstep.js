@@ -41,12 +41,12 @@ t("Suggested: the system's language first, its other languages, then up to five"
   if (sug?.querySelector(".lsect")?.textContent !== "Suggested") throw new Error("first section: " + sug?.querySelector(".lsect")?.textContent);
   const got = ids(`#${sug.id}`).join(" ");
   if (got !== "en de pt-BR es fr") throw new Error("suggested: " + got);
-  if (all?.querySelector(".lsect")?.textContent !== "All languages · 40") throw new Error("second section: " + all?.querySelector(".lsect")?.textContent);
+  if (all?.querySelector(".lsect")?.textContent !== "All languages · 42") throw new Error("second section: " + all?.querySelector(".lsect")?.textContent);
 });
 t("All languages: every one, by its English name", () => {
   const all = groups()[1];
   const got = rows(`#${all.id}`);
-  if (got.length !== 40 || new Set(got.map((r) => r.dataset.lang)).size !== 40) throw new Error(got.length + " rows");
+  if (got.length !== 42 || new Set(got.map((r) => r.dataset.lang)).size !== 42) throw new Error(got.length + " rows");
   const names = got.map((r) => (r.querySelector(".le") || r.querySelector(".ln")).textContent);
   const sorted = [...names].sort((a, b) => a.localeCompare(b, "en"));
   if (names.join() !== sorted.join()) throw new Error("not sorted: " + names.join(", "));
@@ -100,7 +100,7 @@ t("nothing found says so", () => {
 });
 t("clearing the search brings the sections back", () => {
   type("");
-  if (groups().length !== 2 || rows().length !== 45) throw new Error(`${groups().length} sections, ${rows().length} rows`);
+  if (groups().length !== 2 || rows().length !== 47) throw new Error(`${groups().length} sections, ${rows().length} rows`);
 });
 
 t("Up and Down move through the rows, from the one picked", () => {
@@ -329,8 +329,8 @@ t("Page Down, Page Up, Home and End move the highlight", () => {
   type("");
 });
 
-t("other names: farsi, mandarin, chinese, castellano, हिंदी, Uzbek spellings, नेपाली", () => {
-  for (const [s, want] of [["farsi", "fa"], ["Farsi", "fa"], ["mandarin", "zh-Hans zh-Hant"], ["chinese", "zh-Hans zh-Hant"], ["castellano", "es"], ["हिंदी", "hi"], ["हिन्दी", "hi"], ["ozbek", "uz"], ["o'zbek", "uz"], ["oʻzbekcha", "uz"], ["ōzbekça", "uz"], ["ўзбекча", "uz"], ["uz", "uz"], ["नेपाली", "ne"], ["nepali", "ne"]]) {
+t("other names: farsi, mandarin, chinese, castellano, हिंदी, Uzbek spellings, नेपाली, Azərbaycanca, Հայերեն", () => {
+  for (const [s, want] of [["farsi", "fa"], ["Farsi", "fa"], ["mandarin", "zh-Hans zh-Hant"], ["chinese", "zh-Hans zh-Hant"], ["castellano", "es"], ["हिंदी", "hi"], ["हिन्दी", "hi"], ["ozbek", "uz"], ["o'zbek", "uz"], ["oʻzbekcha", "uz"], ["ōzbekça", "uz"], ["ўзбекча", "uz"], ["uz", "uz"], ["नेपाली", "ne"], ["nepali", "ne"], ["azeri", "az"], ["azerbaycan", "az"], ["azərbaycanca", "az"], ["hayeren", "hy"], ["հայերեն", "hy"]]) {
     type(s);
     const got = ids().slice(0, want.split(" ").length).join(" ");
     if (got !== want) throw new Error(`"${s}" found ${ids().join(" ")}`);
@@ -364,7 +364,7 @@ t("a language without an English name or a hello still shows, by its own name", 
   if (!opened) throw new Error("the step didn't open");
   const xx = list().querySelector('#lg-a [data-lang="xx"]');
   if (!xx || xx.querySelector(".ln").textContent !== "Xxish" || xx.querySelector(".le")) throw new Error(xx?.outerHTML || "no row");
-  if (list().querySelector("#lg-a .lsect").textContent !== "All languages · 41") throw new Error(list().querySelector("#lg-a .lsect").textContent);
+  if (list().querySelector("#lg-a .lsect").textContent !== "All languages · 43") throw new Error(list().querySelector("#lg-a .lsect").textContent);
   type("xxi");
   if (ids().join() !== "xx") throw new Error("found " + ids());
   type("");

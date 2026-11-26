@@ -2035,5 +2035,6 @@
   "Could not uninstall Kiri: {error}": "Kiri-ஐ நிறுவல் நீக்க முடியவில்லை: {error}",
   "Uninstall Kiri using your system package manager": "உங்கள் கணினி தொகுப்பு மேலாளரைப் பயன்படுத்தி Kiri-ஐ நிறுவல் நீக்கவும்",
   "Swap": "ஸ்வாப்",
-  "Disk space the VM may use when its memory runs out, so containers slow down instead of being stopped. Applies on restart.": "நினைவகம் தீர்ந்தால் VM பயன்படுத்தக்கூடிய வட்டு இடம்; இதனால் கண்டெய்னர்கள் நிறுத்தப்படாமல் மெதுவாகும். மறுதொடக்கத்தில் பொருந்தும்."
+  "Disk space the VM may use when its memory runs out, so containers slow down instead of being stopped. Applies on restart.": "நினைவகம் தீர்ந்தால் VM பயன்படுத்தக்கூடிய வட்டு இடம்; இதனால் கண்டெய்னர்கள் நிறுத்தப்படாமல் மெதுவாகும். மறுதொடக்கத்தில் பொருந்தும்.",
+  "Community": "சமூகம்"
 }
