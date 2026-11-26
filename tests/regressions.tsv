@@ -368,3 +368,5 @@ vm-swap-as-set	#326	the VM had no swap, so a container that outgrew the VM's mem
 vm-swap-container-over-memory	#326	a container over its --memory with --memory-swap room left was killed: the VM had no swap for its pages
 crates/kiri-init/src/linux/net.rs	#443	a second Kiri engine starting in a shared Linux/WSL 2 network namespace overwrote nft table ip kiri, claimed existing kiri0 bridges, and tore down the first engine's network on exit
 machine-prune-keeps	#975	docker container prune and docker system prune deleted a stopped kiri machine and everything in its writable layer
+crates/kiri/src/daemon/vmlink.rs	#948	VmLink::call waited without a timeout and Writer::write blocked indefinitely holding the writer mutex when the guest wedged, deadlocking hundreds of kiri-api threads
+crates/kiri-init/src/linux/container.rs	#948	finish_stdio called recv_fd with no timeout on single-threaded kiri-init and exec did not reap a killed child when TTY setup failed

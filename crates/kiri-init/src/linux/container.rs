@@ -475,21 +475,68 @@ fn stdio(p: &Prepared) -> io::Result<(ParentStdio, ChildStdio)> {
     ))
 }
 
+/// Maximum wait for a spawned/exec'd TTY child to open `/dev/ptmx` and send
+/// its master fd back over the control socket. Prevents a child cloned into a
+/// frozen cgroup or wedged before `open_pty` from blocking single-threaded
+/// `kiri-init` forever (#948).
+const TTY_READY_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// After clone: collect the agent's ends. For a TTY this waits for the child
 /// to send the pty master, or the reason it could not.
 fn finish_stdio(parent: ParentStdio, child: ChildStdio) -> io::Result<(Option<OwnedFd>, Option<OwnedFd>, Option<OwnedFd>)> {
+    finish_stdio_timeout(parent, child, TTY_READY_WAIT)
+}
+
+fn finish_stdio_timeout(
+    parent: ParentStdio,
+    child: ChildStdio,
+    wait: std::time::Duration,
+) -> io::Result<(Option<OwnedFd>, Option<OwnedFd>, Option<OwnedFd>)> {
     drop(child);
     match parent {
         ParentStdio::Pipes { stdin, stdout, stderr } => Ok((stdin, Some(stdout), Some(stderr))),
-        ParentStdio::Tty { sock } => match sys::recv_fd(sock.as_raw_fd())? {
-            Received::Fd(master) => {
-                sys::set_nonblocking(master.as_raw_fd())?;
-                let input = master.try_clone()?;
-                Ok((Some(input), Some(master), None))
+        ParentStdio::Tty { sock } => {
+            sys::set_nonblocking(sock.as_raw_fd())?;
+            let deadline = std::time::Instant::now() + wait;
+            let received = loop {
+                let timeout = deadline
+                    .saturating_duration_since(std::time::Instant::now())
+                    .as_micros()
+                    .div_ceil(1000)
+                    .min(i32::MAX as u128) as i32;
+                let mut pfd = libc::pollfd { fd: sock.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+                // SAFETY: one valid pollfd.
+                let n = unsafe { libc::poll(&mut pfd, 1, timeout) };
+                if n == 0 {
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "timed out waiting for container terminal"));
+                }
+                if n < 0 {
+                    let e = io::Error::last_os_error();
+                    if e.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(e);
+                }
+                match sys::recv_fd(sock.as_raw_fd()) {
+                    Ok(r) => break r,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted || e.kind() == io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() >= deadline {
+                            return Err(io::Error::new(io::ErrorKind::TimedOut, "timed out waiting for container terminal"));
+                        }
+                    }
+                    Err(e) => return Err(e),
+                }
+            };
+            match received {
+                Received::Fd(master) => {
+                    sys::set_nonblocking(master.as_raw_fd())?;
+                    let input = master.try_clone()?;
+                    Ok((Some(input), Some(master), None))
+                }
+                Received::Message(m) if m.is_empty() => Err(io::Error::other("container exited before its terminal was ready")),
+                Received::Message(m) => Err(io::Error::other(m)),
             }
-            Received::Message(m) if m.is_empty() => Err(io::Error::other("container exited before its terminal was ready")),
-            Received::Message(m) => Err(io::Error::other(m)),
-        },
+        }
     }
 }
 
@@ -760,11 +807,23 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
     match word {
         Ok(RootWord::Ready) => {}
         Ok(RootWord::Ended) => return Err(kill_child(io::Error::other(NOT_READY))),
-        Ok(RootWord::NotYet) if prepared.tty => match root_word(root_ready.as_raw_fd(), None, &mut began_fill) {
-            Ok(RootWord::Ready) => {}
-            Ok(_) => return Err(kill_child(io::Error::other(NOT_READY))),
-            Err(e) => return Err(kill_child(e)),
-        },
+        Ok(RootWord::NotYet) if prepared.tty => {
+            let word = if began_fill {
+                root_word(root_ready.as_raw_fd(), None, &mut began_fill)
+            } else {
+                match root_word(root_ready.as_raw_fd(), Some(TTY_READY_WAIT), &mut began_fill) {
+                    Ok(RootWord::NotYet) if began_fill => root_word(root_ready.as_raw_fd(), None, &mut began_fill),
+                    other => other,
+                }
+            };
+            filling.set(began_fill);
+            match word {
+                Ok(RootWord::Ready) => {}
+                Ok(RootWord::NotYet) => return Err(kill_child(io::Error::new(io::ErrorKind::TimedOut, "timed out waiting for container root"))),
+                Ok(RootWord::Ended) => return Err(kill_child(io::Error::other(NOT_READY))),
+                Err(e) => return Err(kill_child(e)),
+            }
+        }
         Ok(RootWord::NotYet) => starting.set(true),
         Err(e) => return Err(kill_child(e)),
     }
@@ -1158,8 +1217,12 @@ pub fn exec(spec: &ExecSpec<'_>, target_pid: libc::pid_t, paths: &Paths, profile
     drop(cgroup_go);
     drop(cgroup_fd);
     let (stdin, stdout, stderr) = finish_stdio(parent_io, child_io).map_err(|e| {
-        // SAFETY: killing the child we just cloned.
-        unsafe { libc::kill(pid, libc::SIGKILL) };
+        // SAFETY: killing and reaping the child we just cloned so a failed or
+        // timed-out TTY setup never leaks a stuck or zombie process (#948).
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+            libc::waitpid(pid, std::ptr::null_mut(), 0);
+        }
         e
     })?;
     Ok(Process {
@@ -4692,5 +4755,72 @@ mod tests {
         assert!(!prepared.cgroupns_host);
         prepared.cgroupns_host = parsed.cgroupns_host;
         assert!(prepared.cgroupns_host);
+    }
+
+    #[test]
+    fn finish_stdio_times_out_when_tty_child_never_sends_pty_and_reaps_child() {
+        use std::os::fd::AsRawFd;
+        use std::time::{Duration, Instant};
+
+        // 1. Stuck child holding its socket end open: times out promptly instead of blocking forever.
+        let (p_sock, hold_child) = super::sys::socketpair().unwrap();
+        let dup_child = hold_child.try_clone().unwrap();
+        let began = Instant::now();
+        let err = super::finish_stdio_timeout(
+            super::ParentStdio::Tty { sock: p_sock },
+            super::ChildStdio::Tty { sock: dup_child },
+            Duration::from_millis(30),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "{err}");
+        assert!(began.elapsed() < Duration::from_secs(2));
+        drop(hold_child);
+
+        // 2. Child exits without sending an fd: reports premature exit.
+        let (p_sock, c_sock) = super::sys::socketpair().unwrap();
+        let err = super::finish_stdio_timeout(
+            super::ParentStdio::Tty { sock: p_sock },
+            super::ChildStdio::Tty { sock: c_sock },
+            Duration::from_secs(1),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("exited before its terminal was ready"), "{err}");
+
+        // 3. Child sends a valid fd: returns non-blocking input + master fds.
+        let (p_sock, c_sock) = super::sys::socketpair().unwrap();
+        let (r_pipe, _w_pipe) = super::sys::pipe().unwrap();
+        super::sys::send_fd(c_sock.as_raw_fd(), r_pipe.as_raw_fd()).unwrap();
+        let (stdin, stdout, stderr) = super::finish_stdio_timeout(
+            super::ParentStdio::Tty { sock: p_sock },
+            super::ChildStdio::Tty { sock: c_sock },
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert!(stdin.is_some() && stdout.is_some() && stderr.is_none());
+
+        // 4. Real forked child that pauses before sending pty: timeout + SIGKILL + waitpid leaves no zombie.
+        let (p_sock, c_sock) = super::sys::socketpair().unwrap();
+        // SAFETY: child only calls pause() and _exit(0), both async-signal-safe.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            unsafe {
+                libc::pause();
+                libc::_exit(0);
+            }
+        }
+        let res = super::finish_stdio_timeout(
+            super::ParentStdio::Tty { sock: p_sock },
+            super::ChildStdio::Tty { sock: c_sock },
+            Duration::from_millis(25),
+        );
+        assert_eq!(res.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        // SAFETY: killing and reaping the child we just forked.
+        unsafe {
+            assert_eq!(libc::kill(pid, libc::SIGKILL), 0);
+            assert_eq!(libc::waitpid(pid, std::ptr::null_mut(), 0), pid);
+            assert_eq!(libc::kill(pid, 0), -1);
+            assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+        }
     }
 }

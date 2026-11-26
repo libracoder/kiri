@@ -5993,14 +5993,26 @@ impl Engine {
         let exec_security;
         let (container_id, config, env) = {
             let mut st = self.lock();
-            let e = st.execs.get_mut(exec_id).ok_or_else(|| Error::NotFound(format!("No such exec instance: {exec_id}")))?;
-            if e.running || e.exit_code.is_some() {
+            let (already_ran, container_id) = {
+                let e = st.execs.get(exec_id).ok_or_else(|| Error::NotFound(format!("No such exec instance: {exec_id}")))?;
+                (e.running || e.exit_code.is_some(), e.container_id.clone())
+            };
+            if already_ran {
                 return Err(Error::Conflict("exec has already run".into()));
             }
+            match st.containers.get(&container_id) {
+                None => return Err(Error::Conflict(format!("container {} is not running", &container_id[..12]))),
+                Some(c) if c.status != Status::Running => return Err(Error::Conflict(format!("container {} is not running", &container_id[..12]))),
+                Some(c) if c.paused && !is_builder(c) => {
+                    return Err(Error::Conflict(format!("Container {} is paused, unpause the container before exec", &container_id[..12])));
+                }
+                _ => {}
+            }
+            let e = st.execs.get_mut(exec_id).expect("checked above");
             e.running = true;
             // Subscribe before the process exists, so no output is missed.
             e.attached.push(tx);
-            let (container_id, config) = (e.container_id.clone(), e.config.clone());
+            let config = e.config.clone();
             let (security, caps) = st.containers.get(&container_id).map(|c| (c.spec.security_flags() & !run_flags::READONLY_ROOTFS, c.spec.caps)).unwrap_or_default();
             // Execs get the container's ulimits and groups, as with runc.
             let opts = st.containers.get(&container_id).map(|c| c.spec.guest_opts(false).unwrap_or_default()).unwrap_or_default();
@@ -10494,6 +10506,44 @@ mod exit_forwards_tests {
         }
         engine.remove(&id, false, false).unwrap();
         assert!(dropped.load(Ordering::SeqCst), "remove() must drop leftover Forwards before returning");
+        drop(engine);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Refusing `exec_create` and `exec_start` on a paused non-builder container
+    /// returns 409 Conflict instead of cloning a child into a frozen cgroup (#948).
+    #[test]
+    fn exec_create_and_start_refuse_paused_non_builder_container() {
+        let (engine, id, dir) = engine_running("exec-paused-conflict");
+        let cfg = || ExecConfig {
+            console_size: None,
+            argv: vec!["true".into()],
+            env: Vec::new(),
+            cwd: "/".into(),
+            user: String::new(),
+            tty: true,
+            stdin: false,
+            privileged: false,
+            internal: false,
+        };
+
+        engine.lock().containers.get_mut(&id).unwrap().paused = true;
+        match engine.exec_create(&id, cfg()) {
+            Err(Error::Conflict(msg)) => assert!(msg.contains("is paused, unpause the container before exec"), "{msg}"),
+            other => panic!("expected Conflict on paused exec_create, got {other:?}"),
+        }
+
+        engine.lock().containers.get_mut(&id).unwrap().paused = false;
+        let exec_id = engine.exec_create(&id, cfg()).unwrap();
+        engine.lock().containers.get_mut(&id).unwrap().paused = true;
+        let attempts_before = engine.boot_attempts.load(Ordering::SeqCst);
+        match engine.exec_start(&exec_id) {
+            Err(Error::Conflict(msg)) => assert!(msg.contains("is paused, unpause the container before exec"), "{msg}"),
+            other => panic!("expected Conflict on paused exec_start, got {other:?}"),
+        }
+        assert_eq!(engine.boot_attempts.load(Ordering::SeqCst), attempts_before, "paused exec_start must not touch VM");
+        assert!(engine.with_exec(&exec_id, |e| !e.running && e.exit_code.is_none()).unwrap());
+
         drop(engine);
         let _ = std::fs::remove_dir_all(dir);
     }

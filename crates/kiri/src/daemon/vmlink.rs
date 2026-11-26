@@ -10,7 +10,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::path::Path;
 use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Condvar, Mutex};
@@ -72,13 +72,12 @@ pub enum Event<'a> {
     Lost,
 }
 
+const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const FAST_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const LONG_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
 pub struct VmLink {
-    writer: Mutex<Writer>,
-    /// Stdin credit per running process; see `input`.
-    windows: Arc<Windows>,
-    /// The guest's latest `Usage` lines, for `usage`.
-    usage: Arc<UsageSlot>,
-    pending: Arc<Mutex<VecDeque<SyncSender<Reply>>>>,
+    rpc: Channel,
     /// Layer digests confirmed unpacked in this guest instance, avoiding
     /// repeated `LayerQuery` round-trips across `create` and `start`.
     layers: Mutex<std::collections::HashSet<String>>,
@@ -87,10 +86,6 @@ pub struct VmLink {
     _vm: Mutex<Vm>,
     /// Opens vsock streams without that mutex, so connects run side by side.
     connector: kiri_vmm::Connector,
-    /// A copy of the connection, shut down when the agent process exits
-    /// (see `new`); only while the link lives.
-    #[cfg(target_os = "linux")]
-    _stop_conn: Arc<File>,
     /// The agent's folder on a Linux host, where it leaves what `docker
     /// info` should warn about (`host_warnings`).
     #[cfg(target_os = "linux")]
@@ -103,13 +98,74 @@ impl std::fmt::Debug for VmLink {
     }
 }
 
+/// Transport state and reader loop for the single guest control stream,
+/// separated from `kiri_vmm::Vm` so socket timeout and FIFO loss invariants
+/// can be unit-tested over a `UnixStream` pair.
+struct Channel {
+    writer: Mutex<Writer>,
+    /// Duplicate of the stream socket used to `shutdown(SHUT_RDWR)` without
+    /// acquiring `writer` when a call times out or (on Linux) the agent exits.
+    abort_conn: Arc<File>,
+    /// Stdin credit per running process; see `input`.
+    windows: Arc<Windows>,
+    /// The guest's latest `Usage` lines, for `usage`.
+    usage: Arc<UsageSlot>,
+    pending: Arc<Mutex<VecDeque<SyncSender<Reply>>>>,
+    fast_timeout: std::time::Duration,
+    long_timeout: std::time::Duration,
+    /// Count of long RPCs (`send_layer`, `run`, `AwaitStart`, `trim_disk`)
+    /// currently in flight so concurrent fast RPCs queued behind them on the
+    /// single-threaded guest do not time out prematurely.
+    long_in_flight: std::sync::atomic::AtomicUsize,
+}
+
+struct LongCallGuard<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl Drop for LongCallGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Release);
+    }
+}
+
 struct Writer {
     conn: File,
     out: Vec<u8>,
     blob: Vec<u8>,
+    write_timeout: std::time::Duration,
 }
 
 impl Writer {
+    fn new(conn: File, write_timeout: std::time::Duration) -> Writer {
+        use std::os::fd::AsRawFd;
+        let fd = conn.as_raw_fd();
+        // SAFETY: setting O_NONBLOCK on the stream socket so `write_all_timeout`
+        // never blocks indefinitely in the kernel (macOS XNU ignores MSG_DONTWAIT
+        // on blocking AF_UNIX/AF_VSOCK sockets); `read_frame` polls POLLIN on
+        // the reader's dup.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            if flags >= 0 {
+                libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let one: libc::c_int = 1;
+            // SAFETY: sets SO_NOSIGPIPE on a descriptor we own so writes return
+            // EPIPE instead of raising SIGPIPE when the peer is gone.
+            unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_NOSIGPIPE,
+                    (&one as *const libc::c_int).cast(),
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+            }
+        }
+        Writer { conn, out: Vec::with_capacity(4096), blob: vec![0; 256 * 1024], write_timeout }
+    }
+
     /// Whether the encoded request is within the agent's frame limit: one
     /// over it ends the agent, and every container with it, so it fails
     /// here alone, before anything is queued or sent.
@@ -135,7 +191,9 @@ impl Writer {
     }
 
     fn write_request(&mut self, body: Option<(File, u64)>) -> io::Result<()> {
-        self.conn.write_all(&self.out)?;
+        use std::os::fd::AsRawFd;
+        let fd = self.conn.as_raw_fd();
+        write_all_timeout(fd, &self.out, self.write_timeout)?;
         if let Some((mut file, size)) = body {
             let mut left = size;
             while left > 0 {
@@ -144,12 +202,74 @@ impl Writer {
                 if n == 0 {
                     return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "layer blob shrank while sending"));
                 }
-                self.conn.write_all(&self.blob[..n])?;
+                write_all_timeout(fd, &self.blob[..n], self.write_timeout)?;
                 left -= n as u64;
             }
         }
         Ok(())
     }
+}
+
+/// Writes `buf` to non-blocking stream socket `fd`, bounding any single stall
+/// with `chunk_timeout` so `Writer`'s mutex can never be held forever when the
+/// guest agent wedges (#948).
+fn write_all_timeout(fd: std::os::fd::RawFd, mut buf: &[u8], chunk_timeout: std::time::Duration) -> io::Result<()> {
+    let mut deadline = std::time::Instant::now() + chunk_timeout;
+    let mut polled_would_block = false;
+    while !buf.is_empty() {
+        let step = buf.len().min(64 * 1024);
+        #[cfg(target_os = "linux")]
+        // SAFETY: `fd` is a live stream socket owned by `Writer`; `buf` is valid.
+        let n = unsafe { libc::send(fd, buf.as_ptr().cast(), step, libc::MSG_NOSIGNAL) };
+        #[cfg(not(target_os = "linux"))]
+        // SAFETY: `fd` is a live non-blocking socket owned by `Writer`; `buf` is valid.
+        let n = unsafe { libc::write(fd, buf.as_ptr().cast(), step) };
+        if n > 0 {
+            buf = &buf[n as usize..];
+            polled_would_block = false;
+            if !buf.is_empty() {
+                deadline = std::time::Instant::now() + chunk_timeout;
+            }
+            continue;
+        }
+        if n == 0 {
+            return Err(io::Error::new(io::ErrorKind::WriteZero, "failed to write whole buffer"));
+        }
+        let e = io::Error::last_os_error();
+        match e.kind() {
+            io::ErrorKind::Interrupted => continue,
+            io::ErrorKind::WouldBlock => {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "timed out writing to guest agent"));
+                }
+                if polled_would_block {
+                    std::thread::sleep((deadline - now).min(std::time::Duration::from_millis(1)));
+                }
+                let timeout_ms = deadline
+                    .saturating_duration_since(std::time::Instant::now())
+                    .as_micros()
+                    .div_ceil(1000)
+                    .min(i32::MAX as u128) as i32;
+                let mut pfd = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
+                // SAFETY: one valid pollfd.
+                let ready = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+                if ready == 0 {
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "timed out writing to guest agent"));
+                }
+                if ready < 0 {
+                    let pe = io::Error::last_os_error();
+                    if pe.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(pe);
+                }
+                polled_would_block = true;
+            }
+            _ => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 /// How much stdin each running process may still be sent before the guest
@@ -233,21 +353,17 @@ struct UsageSlot {
     arrived: Condvar,
 }
 
-impl VmLink {
-    pub fn is_lost(&self) -> bool {
-        self.windows.is_lost()
-    }
-
-    /// Observes disconnection without waiting for the reader's cleanup.
-    pub fn is_disconnected(&self) -> bool {
-        self.windows.lock().lost
-    }
-
-    /// Starts the reader thread. `on_event` runs on that thread, so it must
-    /// not block for long: it holds up every reply behind it.
-    pub fn new(vm: Vm, conn: File, on_event: impl Fn(Event<'_>) + Send + 'static) -> io::Result<VmLink> {
+impl Channel {
+    fn new(
+        conn: File,
+        write_timeout: std::time::Duration,
+        fast_timeout: std::time::Duration,
+        long_timeout: std::time::Duration,
+        on_event: impl Fn(Event<'_>) + Send + 'static,
+    ) -> io::Result<Channel> {
         let pending: Arc<Mutex<VecDeque<SyncSender<Reply>>>> = Arc::new(Mutex::new(VecDeque::new()));
         let mut reader = conn.try_clone()?;
+        let abort_conn = Arc::new(conn.try_clone()?);
         let queue = pending.clone();
         let windows = Arc::new(Windows::default());
         let wins = windows.clone();
@@ -322,48 +438,47 @@ impl VmLink {
             on_event(Event::Lost);
             wins.finish_loss();
         })?;
-        // On a Linux host the connection is a socket the agent process
-        // shares with its children: one that hung before closing its copy
-        // kept it open after the agent was gone, so the reader never saw
-        // the end, nothing waiting for a reply ever got one, and the agent
-        // was never restarted. Its exit ends the connection here instead.
-        // (A VM's vsock ends with the VM.)
-        #[cfg(target_os = "linux")]
-        let stop_conn = {
-            let stop_conn = Arc::new(conn.try_clone()?);
-            let weak = Arc::downgrade(&stop_conn);
-            vm.on_stop(Box::new(move || {
-                if let Some(c) = weak.upgrade() {
-                    use std::os::fd::AsRawFd;
-                    // SAFETY: shutdown on a socket this link still owns.
-                    unsafe { libc::shutdown(c.as_raw_fd(), libc::SHUT_RDWR) };
-                }
-            }));
-            stop_conn
-        };
-        Ok(VmLink {
-            #[cfg(target_os = "linux")]
-            _stop_conn: stop_conn,
-            #[cfg(target_os = "linux")]
-            agent_dir: vm.agent_dir().to_owned(),
-            writer: Mutex::new(Writer { conn, out: Vec::with_capacity(4096), blob: vec![0; 256 * 1024] }),
-            pending,
-            layers: Mutex::new(std::collections::HashSet::new()),
+        Ok(Channel {
+            writer: Mutex::new(Writer::new(conn, write_timeout)),
+            abort_conn,
             windows,
             usage,
-            connector: vm.connector(),
-            _vm: Mutex::new(vm),
+            pending,
+            fast_timeout,
+            long_timeout,
+            long_in_flight: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
-    /// Sends one request and waits for its reply.
-    /// A body is opened by the caller, before anything is sent: a blob that
-    /// can't be read fails this call alone, not the connection (a request
-    /// cut off after its header can't be taken back, and loses the VM).
-    fn call(&self, encode: impl FnOnce(&mut Vec<u8>), body: Option<(File, u64)>) -> io::Result<Reply> {
+    /// Marks the link lost and shuts down the socket without locking `writer`,
+    /// waking `kiri-vm-reader` (and any stalled writer) so `pending` drains and
+    /// `Event::Lost` fires.
+    fn disconnect(&self) {
+        self.windows.lose();
+        use std::os::fd::AsRawFd;
+        // SAFETY: `abort_conn` owns a live stream socket for the lifetime of `Channel`.
+        unsafe {
+            libc::shutdown(self.abort_conn.as_raw_fd(), libc::SHUT_RDWR);
+        }
+    }
+
+    fn call_with(
+        &self,
+        timeout: std::time::Duration,
+        is_long: bool,
+        encode: impl FnOnce(&mut Vec<u8>),
+        body: Option<(File, u64)>,
+    ) -> io::Result<Reply> {
+        let _long = is_long.then(|| {
+            self.long_in_flight.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            LongCallGuard(&self.long_in_flight)
+        });
         let (tx, rx) = mpsc::sync_channel(1);
         {
             let mut w = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+            if self.windows.lock().lost {
+                return Err(io::Error::other("the VM stopped"));
+            }
             w.out.clear();
             encode(&mut w.out);
             // Too large: refused before a reply slot is queued for it.
@@ -378,29 +493,119 @@ impl VmLink {
             }
             w.write(&self.windows, body)?;
         }
-        match rx.recv() {
-            Ok(Reply::Error(e)) => Err(io::Error::other(e)),
-            Ok(r) => Ok(r),
-            Err(_) => Err(io::Error::other("the VM stopped")),
+        let began = std::time::Instant::now();
+        let mut deadline = began + timeout;
+        loop {
+            let wait = deadline.saturating_duration_since(std::time::Instant::now());
+            match rx.recv_timeout(wait) {
+                Ok(Reply::Error(e)) => return Err(io::Error::other(e)),
+                Ok(r) => return Ok(r),
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Err(io::Error::other("the VM stopped")),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    let extended = began + self.long_timeout;
+                    if !is_long
+                        && self.long_in_flight.load(std::sync::atomic::Ordering::Acquire) > 0
+                        && std::time::Instant::now() < extended
+                    {
+                        deadline = deadline.max(extended);
+                        continue;
+                    }
+                    // `pending` is a positional FIFO: never leave the stream
+                    // open after abandoning a reply slot (#948).
+                    self.disconnect();
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "guest agent timed out"));
+                }
+            }
         }
+    }
+
+    fn call(&self, encode: impl FnOnce(&mut Vec<u8>), body: Option<(File, u64)>) -> io::Result<Reply> {
+        self.call_with(self.fast_timeout, false, encode, body)
+    }
+
+    fn call_long(&self, encode: impl FnOnce(&mut Vec<u8>), body: Option<(File, u64)>) -> io::Result<Reply> {
+        self.call_with(self.long_timeout, true, encode, body)
+    }
+
+    fn send(&self, encode: impl FnOnce(&mut Vec<u8>)) -> io::Result<()> {
+        let mut w = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        if self.windows.lock().lost {
+            return Err(io::Error::other("the VM stopped"));
+        }
+        w.out.clear();
+        encode(&mut w.out);
+        w.write(&self.windows, None)
+    }
+}
+
+impl VmLink {
+    pub fn is_lost(&self) -> bool {
+        self.rpc.windows.is_lost()
+    }
+
+    /// Observes disconnection without waiting for the reader's cleanup.
+    pub fn is_disconnected(&self) -> bool {
+        self.rpc.windows.lock().lost
+    }
+
+    /// Starts the reader thread. `on_event` runs on that thread, so it must
+    /// not block for long: it holds up every reply behind it.
+    pub fn new(vm: Vm, conn: File, on_event: impl Fn(Event<'_>) + Send + 'static) -> io::Result<VmLink> {
+        let rpc = Channel::new(conn, WRITE_TIMEOUT, FAST_CALL_TIMEOUT, LONG_CALL_TIMEOUT, on_event)?;
+        // On a Linux host the connection is a socket the agent process
+        // shares with its children: one that hung before closing its copy
+        // kept it open after the agent was gone, so the reader never saw
+        // the end, nothing waiting for a reply ever got one, and the agent
+        // was never restarted. Its exit ends the connection here instead.
+        // (A VM's vsock ends with the VM.)
+        #[cfg(target_os = "linux")]
+        {
+            let weak = Arc::downgrade(&rpc.abort_conn);
+            vm.on_stop(Box::new(move || {
+                if let Some(c) = weak.upgrade() {
+                    use std::os::fd::AsRawFd;
+                    // SAFETY: shutdown on a socket this link still owns.
+                    unsafe { libc::shutdown(c.as_raw_fd(), libc::SHUT_RDWR) };
+                }
+            }));
+        }
+        Ok(VmLink {
+            #[cfg(target_os = "linux")]
+            agent_dir: vm.agent_dir().to_owned(),
+            rpc,
+            layers: Mutex::new(std::collections::HashSet::new()),
+            connector: vm.connector(),
+            _vm: Mutex::new(vm),
+        })
+    }
+
+    /// Sends one fast request and waits up to `FAST_CALL_TIMEOUT` for its reply.
+    /// A body is opened by the caller, before anything is sent: a blob that
+    /// can't be read fails this call alone, not the connection (a request
+    /// cut off after its header can't be taken back, and loses the VM).
+    fn call(&self, encode: impl FnOnce(&mut Vec<u8>), body: Option<(File, u64)>) -> io::Result<Reply> {
+        self.rpc.call(encode, body)
+    }
+
+    /// Sends a potentially long-running request (`send_layer`, `run`,
+    /// `AwaitStart`, `trim_disk`) with `LONG_CALL_TIMEOUT`.
+    fn call_long(&self, encode: impl FnOnce(&mut Vec<u8>), body: Option<(File, u64)>) -> io::Result<Reply> {
+        self.rpc.call_long(encode, body)
     }
 
     /// Sends a message that has no reply.
     fn send(&self, encode: impl FnOnce(&mut Vec<u8>)) -> io::Result<()> {
-        let mut w = self.writer.lock().unwrap_or_else(|e| e.into_inner());
-        w.out.clear();
-        encode(&mut w.out);
-        w.write(&self.windows, None)
+        self.rpc.send(encode)
     }
 
     /// What the guest's layers, containers and volumes take on disk: the
     /// `KIND NAME BYTES` lines of `Msg::Usage`, or None if they don't come
     /// within `wait` or the VM stops.
     pub fn usage(&self, wait: std::time::Duration) -> Option<Vec<String>> {
-        let asked = self.usage.lines.lock().unwrap_or_else(|e| e.into_inner()).0;
+        let asked = self.rpc.usage.lines.lock().unwrap_or_else(|e| e.into_inner()).0;
         self.send(|o| Msg::UsageQuery.encode(o)).ok()?;
-        let g = self.usage.lines.lock().unwrap_or_else(|e| e.into_inner());
-        let (g, _) = self.usage.arrived.wait_timeout_while(g, wait, |g| g.0 == asked).unwrap_or_else(|e| e.into_inner());
+        let g = self.rpc.usage.lines.lock().unwrap_or_else(|e| e.into_inner());
+        let (g, _) = self.rpc.usage.arrived.wait_timeout_while(g, wait, |g| g.0 == asked).unwrap_or_else(|e| e.into_inner());
         if g.0 == asked { None } else { g.1.clone() }
     }
 
@@ -424,7 +629,7 @@ impl VmLink {
         // fails here rather than half-way through the request.
         let file = File::open(blob)?;
         let size = file.metadata()?.len();
-        self.call(|o| Msg::LayerBegin(LayerBegin { digest, media_type, size }).encode(o), Some((file, size)))?;
+        self.call_long(|o| Msg::LayerBegin(LayerBegin { digest, media_type, size }).encode(o), Some((file, size)))?;
         self.layers.lock().unwrap_or_else(|e| e.into_inner()).insert(digest.to_owned());
         Ok(())
     }
@@ -448,13 +653,13 @@ impl VmLink {
         seccomp: &[u8],
         cancel: &std::sync::atomic::AtomicBool,
     ) -> io::Result<u32> {
-        self.windows.open(id);
+        self.rpc.windows.open(id);
         // Its process runs, but its root may not be in place yet (a new
         // volume is being filled): the agent answered at once rather than
         // stall every other container meanwhile. The start is reported only
         // once an exec can enter it (#311), or fails as a start.
         let r = self
-            .call(|o| kiri_proto::encode_run(o, id, layers, argv, env, cwd, user, hostname, flags, net, mounts, limits, caps, opts, seccomp), None)
+            .call_long(|o| kiri_proto::encode_run(o, id, layers, argv, env, cwd, user, hostname, flags, net, mounts, limits, caps, opts, seccomp), None)
             .and_then(started)
             .and_then(|(pid, starting)| {
                 if starting {
@@ -467,14 +672,14 @@ impl VmLink {
                             told = true;
                             self.cancel_start(id)?;
                         }
-                        self.call(|o| Msg::AwaitStart { id }.encode(o), None)
+                        self.call_long(|o| Msg::AwaitStart { id }.encode(o), None)
                     };
                     wait_started(ask, std::thread::sleep)?;
                 }
                 Ok(pid)
             });
         if r.is_err() {
-            self.windows.close(id);
+            self.rpc.windows.close(id);
         }
         r
     }
@@ -554,10 +759,10 @@ impl VmLink {
 
     #[allow(clippy::too_many_arguments)]
     pub fn exec(&self, container_id: &str, exec_id: &str, argv: &[String], env: &[String], cwd: &str, user: &str, flags: u32, caps: u64, opts: &[String]) -> io::Result<u32> {
-        self.windows.open(exec_id);
+        self.rpc.windows.open(exec_id);
         let r = self.call(|o| kiri_proto::encode_exec(o, container_id, exec_id, argv, env, cwd, user, flags, caps, opts), None).and_then(started).map(|(pid, _)| pid);
         if r.is_err() {
-            self.windows.close(exec_id);
+            self.rpc.windows.close(exec_id);
         }
         r
     }
@@ -568,7 +773,7 @@ impl VmLink {
     pub fn input(&self, id: &str, data: &[u8]) -> io::Result<()> {
         // Frames are bounded, so large writes go in pieces.
         for piece in data.chunks(kiri_proto::MAX_OUTPUT_CHUNK) {
-            if !self.windows.take(id, piece.len())? {
+            if !self.rpc.windows.take(id, piece.len())? {
                 return Ok(());
             }
             self.send(|o| Msg::Input { id, data: piece }.encode(o))?;
@@ -739,7 +944,7 @@ impl VmLink {
     }
 
     pub fn trim_disk(&self) -> io::Result<(u64, u64, u64)> {
-        match self.call(|o| Msg::TrimDisk.encode(o), None)? {
+        match self.call_long(|o| Msg::TrimDisk.encode(o), None)? {
             Reply::DiskTrimmed { trimmed, in_use, capacity } => Ok((trimmed, in_use, capacity)),
             other => Err(io::Error::other(format!("expected DiskTrimmed, got {other:?}"))),
         }
@@ -841,13 +1046,46 @@ fn wait_started(mut ask: impl FnMut() -> io::Result<Reply>, mut sleep: impl FnMu
     unreachable!("the backoff never ends")
 }
 
+fn read_exact_blocking(fd: std::os::fd::RawFd, mut buf: &mut [u8]) -> io::Result<()> {
+    while !buf.is_empty() {
+        // SAFETY: `fd` is a valid descriptor and `buf` is owned mutable memory.
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+        if n > 0 {
+            buf = &mut buf[n as usize..];
+            continue;
+        }
+        if n == 0 {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "failed to fill whole buffer"));
+        }
+        let e = io::Error::last_os_error();
+        match e.kind() {
+            io::ErrorKind::Interrupted => continue,
+            io::ErrorKind::WouldBlock => {
+                let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+                // SAFETY: one valid pollfd; wakes on incoming bytes or SHUT_RDWR/EOF.
+                let ready = unsafe { libc::poll(&mut pfd, 1, -1) };
+                if ready < 0 {
+                    let pe = io::Error::last_os_error();
+                    if pe.kind() != io::ErrorKind::Interrupted {
+                        return Err(pe);
+                    }
+                }
+            }
+            _ => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 fn read_frame(conn: &mut File, buf: &mut Vec<u8>) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let fd = conn.as_raw_fd();
     buf.resize(4, 0);
-    conn.read_exact(&mut buf[..4])?;
+    read_exact_blocking(fd, &mut buf[..4])?;
     let len = kiri_proto::frame_len(buf[..4].try_into().expect("4 bytes"))
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e:?}")))?;
     buf.resize(len.max(HEADER), 0);
-    conn.read_exact(&mut buf[4..])
+    read_exact_blocking(fd, &mut buf[4..])
 }
 
 #[cfg(test)]
@@ -877,7 +1115,8 @@ mod tests {
     fn a_failed_write_disconnects_before_the_reader_accounts_loss() {
         let (socket, peer) = UnixStream::pair().unwrap();
         socket.shutdown(std::net::Shutdown::Write).unwrap();
-        let mut writer = Writer { conn: std::os::fd::OwnedFd::from(socket).into(), out: vec![1], blob: vec![0; 16] };
+        let mut writer = Writer::new(std::os::fd::OwnedFd::from(socket).into(), std::time::Duration::from_millis(50));
+        writer.out = vec![1];
         let windows = Windows::default();
         assert!(writer.write(&windows, None).is_err());
         assert!(windows.lock().lost, "a writer failure must publish loss before a start can record an ordinary failure");
@@ -896,7 +1135,8 @@ mod tests {
         // Never blocks on a peer that does not read: a request that were
         // sent fills the socket and fails with WouldBlock instead.
         socket.set_nonblocking(true).unwrap();
-        let mut writer = Writer { conn: std::os::fd::OwnedFd::from(socket).into(), out: vec![0; kiri_proto::MAX_FRAME + 1], blob: vec![0; 16] };
+        let mut writer = Writer::new(std::os::fd::OwnedFd::from(socket).into(), std::time::Duration::from_millis(50));
+        writer.out = vec![0; kiri_proto::MAX_FRAME + 1];
         let windows = Windows::default();
         let e = writer.write(&windows, None).unwrap_err();
         assert!(e.to_string().contains("too large"), "{e}");
@@ -914,9 +1154,121 @@ mod tests {
     #[test]
     fn a_request_at_the_agents_frame_limit_fits() {
         let (socket, _peer) = UnixStream::pair().unwrap();
-        let mut writer = Writer { conn: std::os::fd::OwnedFd::from(socket).into(), out: vec![0; kiri_proto::MAX_FRAME], blob: vec![0; 16] };
+        let mut writer = Writer::new(std::os::fd::OwnedFd::from(socket).into(), std::time::Duration::from_millis(50));
+        writer.out = vec![0; kiri_proto::MAX_FRAME];
         assert!(writer.fits().is_ok());
         writer.out.push(0);
         assert!(writer.fits().is_err());
+    }
+
+    /// Regression test for #948(a): when the peer reads a request frame and
+    /// never replies, `call` times out instead of blocking forever, shuts down
+    /// the socket (preserving the positional `pending` FIFO invariant), marks
+    /// `windows.lost`, wakes `kiri-vm-reader` to emit `Event::Lost`, and wakes
+    /// any concurrent callers without deadlocking.
+    #[test]
+    fn wedged_peer_that_never_replies_times_out_and_closes_transport() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+
+        let (socket, peer) = UnixStream::pair().unwrap();
+        let mut peer_file: File = std::os::fd::OwnedFd::from(peer).into();
+        let lost_events = Arc::new(AtomicUsize::new(0));
+        let lost_events_cb = lost_events.clone();
+        let channel = Arc::new(
+            Channel::new(
+                std::os::fd::OwnedFd::from(socket).into(),
+                Duration::from_millis(200),
+                Duration::from_millis(60),
+                Duration::from_millis(250),
+                move |ev| {
+                    if matches!(ev, Event::Lost) {
+                        lost_events_cb.fetch_add(1, Ordering::SeqCst);
+                    }
+                },
+            )
+            .unwrap(),
+        );
+
+        let reader_peer = std::thread::spawn(move || {
+            let mut frame = Vec::new();
+            read_frame(&mut peer_file, &mut frame).unwrap();
+            assert!(matches!(kiri_proto::decode(&frame), Ok(Msg::Ping(0))));
+            let mut sink = [0u8; 64];
+            while peer_file.read(&mut sink).unwrap() > 0 {}
+        });
+
+        let ch2 = channel.clone();
+        let second = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            ch2.call_with(Duration::from_secs(5), false, |o| Msg::StatsRequest.encode(o), None)
+        });
+
+        let began = Instant::now();
+        let err = channel.call(|o| Msg::Ping(0).encode(o), None).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
+        assert!(began.elapsed() < Duration::from_secs(2));
+        assert!(channel.windows.lock().lost, "timeout must mark windows.lost immediately");
+
+        let second_err = second.join().unwrap().unwrap_err();
+        assert!(
+            second_err.to_string().contains("the VM stopped"),
+            "second caller woken by pending drain without waiting 5s: {second_err}"
+        );
+        assert!(began.elapsed() < Duration::from_secs(2));
+        reader_peer.join().unwrap();
+        assert!(channel.windows.is_lost(), "reader finished loss accounting without deadlock");
+        assert_eq!(lost_events.load(Ordering::SeqCst), 1, "Event::Lost emitted exactly once");
+    }
+
+    /// Regression test for #948(b): when the socket send buffer is full and
+    /// the peer never reads, `Writer::write` fails within `write_timeout`
+    /// instead of holding `Channel::writer` mutex forever and piling up
+    /// hundreds of `kiri-api` threads.
+    #[test]
+    fn full_socket_buffer_times_out_write_and_releases_writer_mutex() {
+        use std::time::{Duration, Instant};
+
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let channel = Arc::new(
+            Channel::new(
+                std::os::fd::OwnedFd::from(socket).into(),
+                Duration::from_millis(50),
+                Duration::from_millis(200),
+                Duration::from_millis(400),
+                |_| {},
+            )
+            .unwrap(),
+        );
+
+        {
+            use std::os::fd::AsRawFd;
+            let fd = channel.abort_conn.as_raw_fd();
+            let chunk = [0xabu8; 4096];
+            loop {
+                // SAFETY: valid buffer and non-blocking stream socket fd.
+                let n = unsafe { libc::write(fd, chunk.as_ptr().cast(), chunk.len()) };
+                if n <= 0 {
+                    break;
+                }
+            }
+        }
+
+        let ch2 = channel.clone();
+        let contender = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            ch2.send(|o| Msg::Ping(1).encode(o))
+        });
+
+        let began = Instant::now();
+        let big = vec![b'x'; 256 * 1024];
+        let err = channel.send(|o| Msg::Input { id: "c1", data: &big }.encode(o)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
+        assert!(began.elapsed() < Duration::from_secs(2), "writer mutex released promptly");
+        assert!(channel.windows.lock().lost, "stalled write marks link lost");
+
+        let contender_err = contender.join().unwrap().unwrap_err();
+        assert!(contender_err.to_string().contains("the VM stopped") || contender_err.kind() == io::ErrorKind::TimedOut, "{contender_err}");
+        assert!(channel.windows.is_lost(), "reader exited after SHUT_RDWR");
     }
 }
