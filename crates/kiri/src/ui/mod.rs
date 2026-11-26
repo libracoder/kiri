@@ -1021,9 +1021,10 @@ fn vm_net(save: Option<serde_json::Value>) {
     let effective = env_override.or(configured).unwrap_or(true);
     let info = client::get_background("/info").ok();
     let awake = info.as_ref().is_some_and(|i| i["KiriVmAwake"] == true);
+    let running = info.as_ref().is_some_and(|i| awake || i["KiriStopped"] != true);
     let running_shared_nat = awake.then(|| info.as_ref().and_then(|i| i["KiriVmUplink"]["mode"].as_str()).is_none_or(|m| m != "host-egress"));
     match saved {
-        Some(Ok(())) => emit(serde_json::json!({"type": "notice", "kind": "ok", "text": tr("Outbound VM traffic setting saved. Restart the VM to apply."), "act": if awake { "restartvm" } else { "" }}).to_string()),
+        Some(Ok(())) => emit(serde_json::json!({"type": "notice", "kind": "ok", "text": tr("Outbound VM traffic setting saved. Restart the VM to apply."), "act": if running { "restartvm" } else { "" }}).to_string()),
         Some(Err(e)) => emit(notice("error", &trf("Could not save VM networking setting: {error}", &[("error", &e)]))),
         None => {}
     }
@@ -1089,14 +1090,14 @@ fn resources(save: Option<serde_json::Value>) {
     let saved = save.map(|body| client::request("POST", "/kiri/resources", Some(&body)));
     let now = client::get("/kiri/resources");
     match saved {
-        // While the VM runs, the toast offers to restart it now.
+        // While the engine is on (awake or resting), the toast offers to restart it now.
         Some(Ok(r)) if r.ok() => {
-            let awake = now.as_ref().is_ok_and(|v| v["awake"] == true);
+            let running = now.as_ref().is_ok_and(|v| v["awake"] == true || !engine_stopped());
             #[cfg(target_os = "linux")]
             let text = tr("Saved. The engine uses these from its next start");
             #[cfg(not(target_os = "linux"))]
             let text = tr("Saved. The VM uses these from its next start");
-            emit(serde_json::json!({"type": "notice", "kind": "ok", "text": text, "act": if awake { "restartvm" } else { "" }}).to_string());
+            emit(serde_json::json!({"type": "notice", "kind": "ok", "text": text, "act": if running { "restartvm" } else { "" }}).to_string());
         }
         Some(Ok(r)) => emit(notice("error", &r.error())),
         Some(Err(e)) => emit(notice("error", &e.to_string())),

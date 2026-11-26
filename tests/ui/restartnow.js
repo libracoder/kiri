@@ -34,9 +34,33 @@ t("toast Restart now opens universal Restarting overlay with .rspin and syncs VM
   eq(document.body.dataset.vm, "running", "restored to running");
 });
 
-t("no Restart now link while the VM is asleep", () => {
+t("no Restart now link while the engine is off", () => {
   kiri.on({ type: "notice", kind: "ok", text: "Saved. The VM uses these from its next start", act: "" });
   if (document.querySelector("#toasts [data-trestart]")) throw new Error("link shown");
+});
+
+t("Saving resources or VM traffic while the VM is resting (engine on, awake false) still offers Restart VM to apply", () => {
+  kiri.on({ type: "state", state: "asleep" });
+  kiri.on({
+    type: "resources", cpus: 2, memory_mib: 12288, disk_gb: 64,
+    running_cpus: 2, running_memory_mib: 12288, running_disk_gb: 64,
+    awake: false, max_cpus: 12, max_memory_mib: 32768, min_disk_gb: 64, max_disk_gb: 1024, overridden: false,
+  });
+  prefs.tab = "resources";
+  show("settings");
+  const cpuSlider = document.getElementById("res-cpus");
+  cpuSlider.value = "4";
+  cpuSlider.dispatchEvent(new Event("input", { bubbles: true }));
+  document.getElementById("res-save").click();
+  kiri.on({
+    type: "resources", cpus: 4, memory_mib: 12288, disk_gb: 64,
+    running_cpus: 4, running_memory_mib: 12288, running_disk_gb: 64,
+    awake: false, max_cpus: 12, max_memory_mib: 32768, min_disk_gb: 64, max_disk_gb: 1024, overridden: false,
+  });
+  if (!document.getElementById("res-restart")) throw new Error("missing #res-restart after saving while VM is resting");
+  kiri.on({ type: "vmrestarted", ok: true });
+  if (document.getElementById("res-restart")) throw new Error("#res-restart stayed after vmrestarted");
+  kiri.on({ type: "state", state: "running" });
 });
 
 t("Resources Restart VM to apply and Network Restart VM to apply open Restarting overlay", () => {

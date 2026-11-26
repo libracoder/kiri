@@ -4718,8 +4718,9 @@ function dockerSockRows() {
 function vmNetRow() {
   const v = ui.vmnet;
   if (!v || v.supported === false) return "";
-  const nat = v.shared_nat !== false;
-  const pending = v.awake && v.running_shared_nat != null && v.running_shared_nat !== nat;
+  const nat = v.shared_nat !== false, on = v.awake || engineShown().on;
+  if (v.awake && v.running_shared_nat === nat) ui.vmNetSaved = false;
+  const pending = on && ((v.awake && v.running_shared_nat != null && v.running_shared_nat !== nat) || (!v.awake && ui.vmNetSaved));
   const desc = nat
     ? tr("macOS NAT: fastest. Switch to Host relay if Cloudflare WARP or a corporate firewall blocks container HTTPS. Applies on VM restart.")
     : tr("Host relay: connections leave from Kiri on macOS instead of Virtualization.framework NAT. Applies on VM restart.");
@@ -4809,7 +4810,9 @@ function resourcesPane() {
   const hasSwap = r.swap_mib != null;
   const maxSwap = r.max_swap_mib ?? 16384;
   const swapVal = hasSwap ? Math.min(d.swap_mib ?? r.swap_mib, maxSwap) : 0;
-  const pending = r.awake && (r.running_cpus !== r.cpus || Math.abs(r.running_memory_mib - r.memory_mib) > 64 || (hasDisk && r.running_disk_gb != null && r.running_disk_gb !== r.disk_gb) || (hasSwap && r.running_swap_mib != null && r.running_swap_mib !== r.swap_mib));
+  const diff = r.running_cpus !== r.cpus || Math.abs(r.running_memory_mib - r.memory_mib) > 64 || (hasDisk && r.running_disk_gb != null && r.running_disk_gb !== r.disk_gb) || (hasSwap && r.running_swap_mib != null && r.running_swap_mib !== r.swap_mib);
+  if (r.awake && !diff) ui.resSaved = false;
+  const pending = (r.awake || engineShown().on) && (diff || (!r.awake && ui.resSaved));
   return `<div class="pane"><h3>${tr("Resources")}</h3>
     <div class="pref"><span class="t">${tr("CPUs")}</span><span class="d">${LINUX ? tr("Shared with Linux: containers only use them while busy.") : tr("Shared with {os}: the VM only uses them while containers are busy.", { os: OS })}</span>
       <div class="range"><input type="range" id="res-cpus" min="1" max="${r.max_cpus}" step="1" value="${d.cpus}" aria-label="${tr("CPUs")}" style="--fill:${rangeFill(d.cpus, 1, r.max_cpus)}"><span class="num" id="res-cpus-v">${cpuText(d.cpus)}</span></div></div>
@@ -7667,7 +7670,7 @@ function setVm(state, error) {
     if (ui.view === "settings" && prefs.tab === "resources") render();
     // Asleep, the VM holds no memory and the vm event says so (0 MB); off, there's nothing to read.
     if (state === "stopped" || state === "stopping") ["vm-mem"].forEach((id) => ($(id).textContent = "—")), ($("vm-meter").style.width = "0");
-    if (state === "stopped") { ui.volSizesInFlight = 0; ui.volSizesLoading = false; ui.volSizesAt = 0; }
+    if (state === "stopped") { ui.volSizesInFlight = 0; ui.volSizesLoading = false; ui.volSizesAt = 0; ui.resSaved = false; ui.vmNetSaved = false; }
     if (state === "running" && was !== "running") { ui.volSizesAt = 0; if (ui.view === "volumes") { requestVolumeSizes(); render(); } }
     if (state === "stopped" || was === "stopped") render();
   }
@@ -8838,7 +8841,7 @@ window.kiri = {
       case "textsize": if (htHasFocus()) htStep(e.step); else stepTextSize(e.step); break;
       case "term": htOn(e); break;
       case "closekey": htCloseKey(); break;
-      case "vmrestarted": if (ui.restarting?.kind === "vm") stopRestartOverlay(); break;
+      case "vmrestarted": if (e.ok) { ui.resSaved = false; ui.vmNetSaved = false; } if (ui.restarting?.kind === "vm") stopRestartOverlay(); if (ui.view === "settings") render(); break;
       case "enginerestarted": if (ui.restarting?.kind === "engine") stopRestartOverlay(); if (!e.error) engineToast(e); break;
       case "view": if (empty[e.view] || e.view === "settings") show(e.view); break;
       case "prefs": { const was = prefs.lang; Object.assign(prefs, e.prefs || {}); prefsIn = true; if (prefs.lang !== was) relang(); applyPrefs(); render(); paintEngine(); renderStatus(); break; }
@@ -9133,6 +9136,7 @@ $("content").addEventListener("click", (ev) => {
   else if ((el = t("[data-vmnat]"))) {
     const shared_nat = el.dataset.vmnat === "1";
     if (ui.vmnet && !ui.vmnet.env && !!ui.vmnet.shared_nat !== shared_nat) {
+      if (engineShown().on) ui.vmNetSaved = true;
       ui.vmnet = { ...ui.vmnet, shared_nat };
       send("setvmnet", { value: { shared_nat } });
       render();
@@ -9168,7 +9172,7 @@ $("content").addEventListener("click", (ev) => {
   else if ((el = t("[data-regdel]"))) { const [k, i] = el.dataset.regdel.split(":"); ui.regDraft[k].splice(+i, 1); render(); }
   else if ((el = t("[data-regsave]"))) { ui.regSaving = el.dataset.regsave; send("setregistryconfig", { value: { [REG_KEY[el.dataset.regsave]]: ui.regDraft[el.dataset.regsave] } }); }
   else if ((el = t("[data-saverp]")) && ui.rports && !ui.rports.error) send("setrouterports", { value: { http: +(ui.rpDraft.http ?? ui.rports.http.port), https: +(ui.rpDraft.https ?? ui.rports.https.port) } });
-  else if ((el = t("[data-saveres]"))) send("setresources", { value: ui.resDraft });
+  else if ((el = t("[data-saveres]"))) { if (engineShown().on) ui.resSaved = true; send("setresources", { value: ui.resDraft }); render(); }
   else if ((el = t("[data-watchbinds]"))) {
     const on = el.dataset.watchbinds === "1";
     if (!!(prefs.watchBindMounts ?? ui.res?.watch_bind_mounts) !== on) setPref("watchBindMounts", on);

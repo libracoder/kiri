@@ -321,9 +321,10 @@ pub fn resources(body: Option<Value>) {
         }
         let saved = body.map(|b| save(&b));
         let ev = event();
+        let running = ev["awake"] == true || !crate::serve::is_stopped();
         match saved {
-            // While Kiri's engine runs, the toast offers to restart WSL now.
-            Some(Ok(())) => emit(json!({"type": "notice", "kind": "ok", "text": tr("Saved in .wslconfig. WSL uses these from its next start"), "act": if ev["awake"] == true { "restartvm" } else { "" }}).to_string()),
+            // While Kiri's engine is on, the toast offers to restart WSL now.
+            Some(Ok(())) => emit(json!({"type": "notice", "kind": "ok", "text": tr("Saved in .wslconfig. WSL uses these from its next start"), "act": if running { "restartvm" } else { "" }}).to_string()),
             Some(Err(e)) => emit(notice("error", &trf("Could not save .wslconfig: {error}", &[("error", &e)]))),
             None => {}
         }
