@@ -265,24 +265,49 @@ pub fn restart_engine(expect: &str) -> io::Result<String> {
 }
 
 /// Starts the engine if it is not running: through the LaunchAgent when it
-/// starts this copy of Kiri, so launchd owns the one engine there is, else
-/// as a child of its own session. Returns once it answers.
+/// starts this copy of Kiri, so launchd owns the one engine there is, falling
+/// back to spawning the daemon directly when `launchctl kickstart` exits 0
+/// without bringing the engine up (#602). Returns once it answers.
 #[cfg(target_os = "macos")]
 pub fn start_engine() -> io::Result<()> {
-    if crate::client::alive() {
+    start_engine_with(
+        crate::client::alive,
+        crate::setup::start_agent,
+        spawn_daemon,
+        std::thread::sleep,
+        || log_path().display().to_string(),
+    )
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn start_engine_with(
+    mut alive: impl FnMut() -> bool,
+    start_agent: impl FnOnce() -> io::Result<bool>,
+    spawn_daemon: impl FnOnce() -> io::Result<()>,
+    mut sleep: impl FnMut(std::time::Duration),
+    log_display: impl FnOnce() -> String,
+) -> io::Result<()> {
+    if alive() {
         return Ok(());
     }
     crate::diag::info!("starting the engine");
-    if !crate::setup::start_agent().unwrap_or(false) {
-        spawn_daemon()?;
+    if start_agent().unwrap_or(false) {
+        for _ in 0..50 {
+            if alive() {
+                return Ok(());
+            }
+            sleep(std::time::Duration::from_millis(50));
+        }
+        crate::diag::warn!("LaunchAgent kickstart did not bring up engine; starting daemon directly");
     }
+    spawn_daemon()?;
     for _ in 0..200 {
-        if crate::client::alive() {
+        if alive() {
             return Ok(());
         }
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        sleep(std::time::Duration::from_millis(50));
     }
-    Err(io::Error::other(format!("kiri daemon did not start; see {}", log_path().display())))
+    Err(io::Error::other(format!("kiri daemon did not start; see {}", log_display())))
 }
 
 #[cfg(target_os = "macos")]
@@ -680,5 +705,68 @@ mod tests {
         assert!(!crate::docker::is_container_update(&a(&["--help"])));
         assert!(!crate::docker::is_container_update(&a(&["-h"])));
         assert!(!crate::docker::is_container_update(&a(&[])));
+    }
+
+    /// Regression test for #602: when `launchctl kickstart` exits 0 without
+    /// actually starting the daemon, `start_engine` waits 2.5s (`50 * 50ms`),
+    /// then spawns the daemon directly and polls for up to 10s (`200 * 50ms`).
+    #[test]
+    fn start_engine_falls_back_to_direct_spawn_when_kickstart_leaves_daemon_down() {
+        use std::cell::Cell;
+        use std::time::Duration;
+
+        let polls = Cell::new(0usize);
+        let spawned = Cell::new(false);
+        let sleeps = Cell::new(0usize);
+        super::start_engine_with(
+            || {
+                let n = polls.get() + 1;
+                polls.set(n);
+                n >= 4
+            },
+            || Ok(true),
+            || {
+                spawned.set(true);
+                Ok(())
+            },
+            |_| sleeps.set(sleeps.get() + 1),
+            || "/tmp/daemon.log".into(),
+        )
+        .unwrap();
+        assert!(!spawned.get(), "healthy LaunchAgent must not spawn a second daemon");
+        assert_eq!(sleeps.get(), 2);
+
+        let polls = Cell::new(0usize);
+        let spawned = Cell::new(false);
+        let total_ms = Cell::new(0u64);
+        super::start_engine_with(
+            || {
+                let n = polls.get() + 1;
+                polls.set(n);
+                spawned.get() && n >= 55
+            },
+            || Ok(true),
+            || {
+                assert_eq!(total_ms.get(), 2500, "fallback runs after 50 * 50ms");
+                spawned.set(true);
+                Ok(())
+            },
+            |d: Duration| total_ms.set(total_ms.get() + d.as_millis() as u64),
+            || "/tmp/daemon.log".into(),
+        )
+        .unwrap();
+        assert!(spawned.get());
+
+        let total_ms = Cell::new(0u64);
+        let err = super::start_engine_with(
+            || false,
+            || Ok(true),
+            || Ok(()),
+            |d: Duration| total_ms.set(total_ms.get() + d.as_millis() as u64),
+            || "/custom/daemon.log".into(),
+        )
+        .unwrap_err();
+        assert_eq!(total_ms.get(), 12_500);
+        assert!(err.to_string().contains("/custom/daemon.log"), "{err}");
     }
 }

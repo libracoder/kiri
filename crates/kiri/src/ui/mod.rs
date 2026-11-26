@@ -1546,7 +1546,7 @@ fn ensure_daemon() -> io::Result<()> {
     if client::alive() {
         if stop_on_quit() && engine_stopped() {
             clear_stopped_marker();
-            let _ = client::request("POST", "/kiri/wake", None);
+            expect_ok(client::request("POST", "/kiri/wake", None))?;
         }
         return Ok(());
     }

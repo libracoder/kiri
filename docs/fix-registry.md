@@ -13,6 +13,24 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #602 macOS: spawn daemon directly when LaunchAgent `kickstart` exits 0 without starting engine (unreleased)
+- Fixes: #602 Clicking Start on macOS does nothing when `launchctl kickstart` exits 0 without starting `kiri daemon`
+- Caused: none known
+- Caused by: -
+- Check: `crates/kiri/src/update.rs`
+
+### #936 follow-up Volumes: persist measured volume byte sizes across VM sleep and restarts (unreleased)
+- Fixes: #936 Volumes view shows `—` whenever the Linux VM is asleep or more than 30s after idle sleep
+- Caused: none known
+- Caused by: #936
+- Check: `crates/kiri/src/daemon/ops.rs`, `tests/ui/volumes-size.js`
+
+### #948 Engine & Guest: bound `VmLink` write/RPC waits and `kiri-init` TTY `recv_fd`, and refuse `exec_start` on paused containers (unreleased)
+- Fixes: #948 macOS/guest `VmLink` deadlock where hundreds of `kiri-api` threads block forever on a wedged guest or frozen TTY child
+- Caused: none known
+- Caused by: -
+- Check: `crates/kiri/src/daemon/vmlink.rs`, `crates/kiri-init/src/linux/container.rs`, `crates/kiri/src/daemon/engine.rs`
+
 ### #981 Engine: docker container prune and system prune keep stopped machines (unreleased)
 - Fixes: #975 A stopped machine is deleted by docker container prune / docker system prune, with everything in it
 - Caused: none known
@@ -21,7 +39,7 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ### #936 Volumes view: show each volume's disk size loaded asynchronously with daemon caching (unreleased)
 - Fixes: #936 Volumes view: show each volume's size, loaded asynchronously
-- Caused: none known
+- Caused: Volume sizes were cached only in memory with a 30s TTL and skipped asleep VMs, causing the Volumes tab to show `—` whenever the VM was asleep (fixed in #936 follow-up)
 - Caused by: -
 - Check: `tests/ui/volumes-size.js`, `crates/kiri/src/daemon/ops.rs`
 
