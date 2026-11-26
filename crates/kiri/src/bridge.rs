@@ -103,9 +103,32 @@ const LOG: &str = "/var/log/kiri.log";
 
 type Out = Arc<Mutex<dyn Write + Send>>;
 
+const USAGE: &str = "usage: kiri bridge [--socket PATH]";
+
 pub fn run(args: &[String]) -> io::Result<()> {
-    let socket = match args.iter().position(|a| a == "--socket").and_then(|i| args.get(i + 1)) {
-        Some(s) => PathBuf::from(s),
+    if args.iter().any(|a| matches!(a.as_str(), "-h" | "--help"))
+        || matches!(args.first().map(String::as_str), Some("help"))
+    {
+        println!("{USAGE}");
+        return Ok(());
+    }
+    let mut socket_opt = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--socket" => {
+                socket_opt = Some(
+                    it.next()
+                        .filter(|s| !s.is_empty())
+                        .map(PathBuf::from)
+                        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, USAGE))?,
+                );
+            }
+            _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, USAGE)),
+        }
+    }
+    let socket = match socket_opt {
+        Some(s) => s,
         None => crate::daemon::socket_path()?,
     };
     let out: Out = Arc::new(Mutex::new(BufWriter::with_capacity(64 * 1024, io::stdout())));

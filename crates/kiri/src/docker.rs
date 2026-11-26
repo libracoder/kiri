@@ -55,6 +55,7 @@ pub fn run(args: &[String]) -> io::Result<()> {
 /// Exits with docker's exit code.
 #[cfg(windows)]
 pub fn run(args: &[String]) -> io::Result<()> {
+    crate::setup_win::heal_quietly();
     let beside = std::env::current_exe().ok().and_then(|e| Some(e.parent()?.join("docker.exe"))).filter(|d| d.is_file());
     let status = std::process::Command::new(beside.unwrap_or_else(|| "docker.exe".into()))
         .args(["--context", crate::flavor::CONTEXT.get()])

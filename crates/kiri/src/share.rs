@@ -2043,8 +2043,14 @@ fn printer(target: String) -> impl Fn(Event) + Send + Sync + 'static {
 }
 
 pub fn run(args: &[String]) -> io::Result<()> {
+    if args.iter().any(|a| matches!(a.as_str(), "-h" | "--help"))
+        || matches!(args.first().map(String::as_str), Some("help"))
+    {
+        println!("{USAGE}");
+        return Ok(());
+    }
     match args.first().map(String::as_str) {
-        None | Some("-h" | "--help" | "help") => Err(io::Error::other(USAGE)),
+        None => Err(io::Error::other(USAGE)),
         Some("login") => login_cli(&args[1..]),
         Some("logout") => {
             logout()?;

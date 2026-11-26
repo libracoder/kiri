@@ -81,6 +81,12 @@ pub fn run(args: &[String]) -> io::Result<()> {
 }
 
 fn run_with(args: &[String], alive: impl FnOnce() -> bool) -> io::Result<()> {
+    if args.iter().any(|a| matches!(a.as_str(), "-h" | "--help"))
+        || matches!(args.first().map(String::as_str), Some("help"))
+    {
+        println!("{USAGE}");
+        return Ok(());
+    }
     let json = args.iter().any(|a| a == "--json");
     let args: Vec<String> = args.iter().filter(|a| *a != "--json").cloned().collect();
     let cmd = parse(&args).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
@@ -145,6 +151,13 @@ mod tests {
         assert_eq!(format(&off), "HTTP   80     off\nHTTPS  443    off\n");
         let moved = json!({"http": {"port": 18780, "running": true, "serving": false, "env": "KIRI_HTTP_PORT"}, "https": {"port": 18743, "running": true, "serving": true, "env": null}});
         assert_eq!(format(&moved), "HTTP   18780  on, a container has the port for now (set by KIRI_HTTP_PORT)\nHTTPS  18743  on\n");
+    }
+
+    #[test]
+    fn help_succeeds_without_touching_the_socket() {
+        for h in ["--help", "-h", "help", "set --help", "reset -h"] {
+            run_with(&args(h), || panic!("help must not check daemon: {h}")).unwrap();
+        }
     }
 
     #[test]

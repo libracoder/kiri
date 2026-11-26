@@ -426,6 +426,21 @@ pub fn alive() -> bool {
     alive_within(PING_WAIT)
 }
 
+/// Probes the engine pipe for CLI-shared callers (`import.rs`), surfacing the
+/// pipe's refusal message when Kiri is stopped or setup is unfinished.
+#[allow(dead_code)]
+pub fn check_alive() -> io::Result<()> {
+    match request_within("GET", "/_ping", None, true, Some(PING_WAIT)) {
+        Ok(r) if r.ok() => Ok(()),
+        Ok(r) => {
+            let err = r.error();
+            let msg = if err.trim().is_empty() { "Kiri isn't running. Open Kiri, or start it with `kiri start`" } else { err.trim() };
+            Err(io::Error::new(io::ErrorKind::NotConnected, msg.to_owned()))
+        }
+        Err(_) => Err(io::Error::new(io::ErrorKind::NotConnected, "Kiri isn't running. Open Kiri, or start it with `kiri start`")),
+    }
+}
+
 /// `alive`, for the event watcher: false after QUICK without an answer.
 pub fn alive_quick() -> bool {
     alive_within(QUICK)

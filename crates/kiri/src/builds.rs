@@ -462,25 +462,32 @@ pub fn builder() -> io::Result<bool> {
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
     let quiet = || std::process::Stdio::null();
-    if !Command::new(&docker).args(["buildx", "version"]).stdout(quiet()).stderr(quiet()).status()?.success() {
+    let new_docker = || {
+        #[allow(unused_mut)]
+        let mut cmd = Command::new(&docker);
+        #[cfg(windows)]
+        std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x0800_0000);
+        cmd
+    };
+    if !new_docker().args(["buildx", "version"]).stdout(quiet()).stderr(quiet()).status()?.success() {
         println!("docker build: no buildx plugin here, so docker builds with Kiri's classic builder API (the same BuildKit, run by the daemon)");
         return Ok(false);
     }
-    let inspect = Command::new(&docker).args(["buildx", "inspect", BUILDER.get()]).stderr(quiet()).output()?;
+    let inspect = new_docker().args(["buildx", "inspect", BUILDER.get()]).stderr(quiet()).output()?;
     let mut exists = inspect.status.success();
     // Without default-load a docker-container builder keeps what it builds
     // to itself: `docker build -t x .` builds and `docker run x` finds
     // nothing. One made without it is made again; --keep-state keeps its
     // cache volume, which the daemon's builder container reuses.
     if exists && !String::from_utf8_lossy(&inspect.stdout).contains("default-load") {
-        exists = !Command::new(&docker).args(["buildx", "rm", "--keep-state", BUILDER.get()]).stdout(quiet()).stderr(quiet()).status()?.success();
+        exists = !new_docker().args(["buildx", "rm", "--keep-state", BUILDER.get()]).stdout(quiet()).stderr(quiet()).status()?.success();
     }
     if !exists {
         // buildx create takes the Kiri context's name; without that context
         // (Linux makes it only in the optional "docker uses Kiri" step) buildx
         // reads the name as a host and fails on tcp://kiri:2375.
         ensure_context(&docker)?;
-        let made = Command::new(&docker)
+        let made = new_docker()
             .args(["buildx", "create", "--name", BUILDER.get(), "--driver", "docker-container", "--driver-opt", "default-load=true", CONTEXT.get()])
             .stdout(quiet())
             .output()?;
@@ -496,13 +503,24 @@ pub fn builder() -> io::Result<bool> {
     Ok(true)
 }
 
-/// The docker context named CONTEXT, pointing at Kiri's socket, made when
-/// missing. It is only made, never made current: which engine plain docker
-/// uses stays the user's choice.
-/// On Windows, setup (kiri.ps1) makes the context, on the pipe.
-#[cfg(not(unix))]
-fn ensure_context(_docker: impl AsRef<std::ffi::OsStr>) -> io::Result<()> {
-    Ok(())
+/// The docker context named CONTEXT, pointing at Kiri's socket or Windows
+/// named pipe, made when missing. It is only made, never made current: which
+/// engine plain docker uses stays the user's choice.
+#[cfg(windows)]
+fn ensure_context(docker: impl AsRef<std::ffi::OsStr>) -> io::Result<()> {
+    let docker = docker.as_ref();
+    let quiet = || std::process::Stdio::null();
+    let new_cmd = || {
+        let mut cmd = Command::new(docker);
+        std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x0800_0000);
+        cmd
+    };
+    if new_cmd().args(["context", "inspect", CONTEXT.get()]).stdout(quiet()).stderr(quiet()).status()?.success() {
+        return Ok(());
+    }
+    let host = format!("host=npipe://{}", crate::client::pipe().replace('\\', "/"));
+    let out = new_cmd().args(["context", "create", CONTEXT.get(), "--description", "Kiri (WSL2)", "--docker", &host]).stdout(quiet()).output()?;
+    if out.status.success() { Ok(()) } else { Err(io::Error::other(failure("docker context create failed", &out.stderr))) }
 }
 
 #[cfg(unix)]

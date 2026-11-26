@@ -996,6 +996,7 @@ fn tools() -> io::Result<()> {
 /// Ready → Open Kiri: remember setup is done, start at sign-in if asked.
 fn finish() {
     let autostart = STATE.lock().unwrap_or_else(PoisonError::into_inner).as_ref().is_none_or(|s| s.autostart);
+    crate::engine::heal_docker_config(&crate::client::pipe());
     // Apply "Make Kiri the default for docker" on finish too (e.g. if checked after tools finished).
     if STATE.lock().unwrap_or_else(PoisonError::into_inner).as_ref().is_some_and(|s| s.make_default)
         && let Err(e) = crate::engine::use_kiri_context()

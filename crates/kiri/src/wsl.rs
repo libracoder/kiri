@@ -294,8 +294,63 @@ fn wake_via_pipe(_pipe_name: &str) -> Option<io::Result<()>> {
     None
 }
 
+/// Usage text for WSL-forwarded commands when `-h` / `--help` is passed on
+/// Windows, so asking for help never wakes WSL or executes side effects (#982).
+/// For `kiri machine shell NAME -- <cmd> --help`, stops scanning at `--` so
+/// `--help` meant for the container command passes through untouched.
+pub(crate) fn help_for(args: &[String]) -> Option<&'static str> {
+    let cmd = args.first()?.as_str();
+    let sub = &args[1..];
+    let scan_end = if cmd == "machine" && sub.first().map(String::as_str) == Some("shell") {
+        sub.iter().position(|a| a == "--").unwrap_or(sub.len())
+    } else {
+        sub.len()
+    };
+    let has_flag = sub[..scan_end].iter().any(|a| matches!(a.as_str(), "-h" | "--help"));
+    let help_word = sub.first().map(String::as_str) == Some("help")
+        && matches!(cmd, "k8s" | "machine" | "diag" | "usb" | "domains" | "registry" | "storage");
+    if !has_flag && !help_word {
+        return None;
+    }
+    match cmd {
+        "start" => Some("usage: kiri start                 start Kiri after a Stop (the window's Start)"),
+        "k8s" if sub.first().map(String::as_str) == Some("set") => Some(
+            "usage: kiri k8s set [--lan on|off] [--tls-san NAME,…] [--port N] [--version TAG|default] [--k3s-arg ARG]… [--clear-k3s-args]",
+        ),
+        "k8s" => Some(
+            "usage: kiri k8s start [--use] | stop | status [--json] | delete | set [--lan on|off] [--tls-san NAME,…] [--port N] [--version TAG|default] [--k3s-arg ARG]… [--clear-k3s-args]",
+        ),
+        "machine" => Some(
+            "usage: kiri machine create NAME [--distro ubuntu|debian|alpine|fedora|arch|rocky|opensuse | --image IMAGE] [--systemd]\n       kiri machine list [--json] | shell NAME [-- CMD...] | start | stop | restart | delete NAME",
+        ),
+        "diag" => Some(
+            "usage: kiri diag logs [-f] [--ui|--engine|--cli] [--errors] [--op ID] [-n N]\n       kiri diag report [--out PATH] [--send]",
+        ),
+        "usb" => Some(
+            "usage: kiri usb [list [--json]] | attach DEVICE | detach DEVICE\n    DEVICE is a location (0x02114000), vendor:product (1532:00d7) or part of the name",
+        ),
+        "domains" => Some(
+            "usage: kiri domains                          the routers' ports, and whether each runs\n       kiri domains set [--http N] [--https N]   move them (no restart)\n       kiri domains reset                    back to the ports a start gives (a test copy's: off)\n       --json, with any of them, prints the engine's answer as one line of JSON",
+        ),
+        "registry" => Some(
+            "usage: kiri registry                                  both lists and the file they are in\n       kiri registry insecure [list] | add HOST... | remove HOST...\n       kiri registry mirror [list] | add URL... | remove URL...\n       --json, with any of them: one line of JSON",
+        ),
+        "scan" => Some(
+            "usage: kiri scan [--json] [--history] <image>\n       --json     the full report, as JSON\n       --history  the image's kept scans, newest first, without scanning again",
+        ),
+        "storage" => Some(
+            "usage: kiri storage [status]   show storage location, disk usage, and reclaimable space\n       kiri storage reclaim    reclaim unused VM disk space back to the host",
+        ),
+        _ => None,
+    }
+}
+
 /// Runs `kiri <args>` in WSL and exits with its exit code.
 pub fn run(args: &[String]) -> io::Result<()> {
+    if let Some(help) = help_for(args) {
+        println!("{help}");
+        return Ok(());
+    }
     if let [m, verb, name, rest @ ..] = args
         && m == "machine"
         && verb == "shell"
@@ -507,5 +562,51 @@ mod tests {
         );
         assert_eq!(parse_diag_report_args(&s(&["--out"])), None);
         assert_eq!(parse_diag_report_args(&s(&["--unknown"])), None);
+    }
+
+    #[test]
+    fn help_for_intercepts_wsl_commands_without_intercepting_container_help() {
+        use super::help_for;
+        let s = |list: &[&str]| list.iter().map(|x| (*x).to_owned()).collect::<Vec<String>>();
+        for cmd in [
+            &["start", "--help"][..],
+            &["start", "-h"],
+            &["k8s", "--help"],
+            &["k8s", "-h"],
+            &["k8s", "help"],
+            &["k8s", "set", "--help"],
+            &["machine", "--help"],
+            &["machine", "create", "-h"],
+            &["machine", "shell", "--help"],
+            &["machine", "shell", "dev", "--help"],
+            &["diag", "--help"],
+            &["diag", "report", "--help"],
+            &["diag", "logs", "-h"],
+            &["usb", "--help"],
+            &["usb", "attach", "-h"],
+            &["domains", "--help"],
+            &["registry", "--help"],
+            &["scan", "--help"],
+            &["storage", "--help"],
+            &["storage", "reclaim", "-h"],
+        ] {
+            let text = help_for(&s(cmd)).unwrap_or_else(|| panic!("expected help for {cmd:?}"));
+            assert!(text.starts_with("usage: kiri "), "{cmd:?}: {text}");
+        }
+        assert!(help_for(&s(&["k8s", "set", "--help"])).unwrap().contains("kiri k8s set"));
+
+        // Must NOT intercept container commands after `--` or non-help invocations.
+        for pass_through in [
+            &["start"][..],
+            &["k8s", "status"],
+            &["machine", "list"],
+            &["machine", "shell", "dev", "--", "uname", "--help"],
+            &["machine", "shell", "dev", "--", "-h"],
+            &["scan", "alpine"],
+            &["scan", "help"],
+            &["diag", "report"],
+        ] {
+            assert_eq!(help_for(&s(pass_through)), None, "must not intercept {pass_through:?}");
+        }
     }
 }

@@ -34,6 +34,7 @@ fn cli() -> io::Result<Command> {
     let mut cmd = Command::new(docker()?);
     #[cfg(windows)]
     std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x0800_0000);
+    cmd.env_remove("DOCKER_HOST").env_remove("DOCKER_CONTEXT");
     Ok(cmd)
 }
 
@@ -1698,13 +1699,28 @@ fn pick(given: Option<&str>, answers: impl Fn(&str) -> bool) -> io::Result<&'sta
 }
 
 const KINDS: [&str; 3] = ["image", "volume", "container"];
-const USAGE: &str = "usage: kiri import [orbstack|desktop-linux] [--list | [--force] [image|volume|container NAME]]";
+#[cfg(windows)]
+const USAGE: &str = "usage: kiri import [desktop-linux] [--images] [--volumes] [--containers] [--list | [--force] [image|volume|container NAME]]";
+#[cfg(not(windows))]
+const USAGE: &str = "usage: kiri import [orbstack|desktop-linux] [--images] [--volumes] [--containers] [--list | [--force] [image|volume|container NAME]]";
+
+/// Which resource kinds a bulk `kiri import` or `kiri import --list` includes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct KindFilter {
+    images: bool,
+    volumes: bool,
+    containers: bool,
+}
+
+impl KindFilter {
+    const ALL: Self = Self { images: true, volumes: true, containers: true };
+}
 
 /// What `kiri import` was asked to do.
 #[derive(Debug, PartialEq)]
 enum Ask<'a> {
-    Everything,
-    List,
+    Everything(KindFilter),
+    List(KindFilter),
     One(&'a str, &'a str),
 }
 
@@ -1715,38 +1731,80 @@ enum Ask<'a> {
 fn parse<'a>(args: &[&'a str]) -> io::Result<(Option<&'a str>, Ask<'a>, bool)> {
     let usage = || io::Error::other(USAGE);
     let (mut list, mut force) = (false, false);
+    let (mut f_images, mut f_volumes, mut f_containers) = (false, false, false);
     let mut words = Vec::new();
     for a in args {
         match *a {
             "--list" => list = true,
             "--force" => force = true,
+            "--images" => f_images = true,
+            "--volumes" => f_volumes = true,
+            "--containers" => f_containers = true,
             f if f.starts_with('-') => return Err(usage()),
             w => words.push(w),
         }
     }
+    let explicit_filter = f_images || f_volumes || f_containers;
+    let filter = if explicit_filter {
+        KindFilter { images: f_images, volumes: f_volumes, containers: f_containers }
+    } else {
+        KindFilter::ALL
+    };
     let (given, rest) = match words.split_first() {
         Some((first, rest)) if !KINDS.contains(first) => (Some(*first), rest),
         _ => (None, &words[..]),
     };
     let ask = match (rest, list) {
-        ([], false) => Ask::Everything,
-        ([], true) if !force => Ask::List,
-        ([kind, name], false) if KINDS.contains(kind) => Ask::One(kind, name),
+        ([], false) => Ask::Everything(filter),
+        ([], true) if !force => Ask::List(filter),
+        ([kind, name], false) if !explicit_filter && KINDS.contains(kind) => Ask::One(kind, name),
         _ => return Err(usage()),
     };
     Ok((given, ask, force))
 }
 
-/// `kiri import [orbstack|desktop-linux] [--list | [--force] [image|volume|container NAME]]`:
+#[cfg(windows)]
+fn ensure_windows_kiri_context() {
+    let Some(dir) = crate::dockerctx::docker_dir() else { return };
+    let exe = std::env::current_exe().ok();
+    let local = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    let plugins = crate::dockerctx::find_windows_cli_plugins(exe.as_deref(), local.as_deref());
+    let desktop = std::env::var_os("ProgramFiles")
+        .is_some_and(|p| std::path::Path::new(&p).join(r"Docker\Docker\Docker Desktop.exe").is_file());
+    let host = format!("npipe:{}", client::pipe().replace('\\', "/"));
+    let _ = crate::dockerctx::repair_windows_config(
+        &dir,
+        crate::dockerctx::WindowsRepairOpts {
+            ours: crate::flavor::CONTEXT.get(),
+            description: "Kiri (WSL2)",
+            host: &host,
+            plugins_dir: plugins.as_deref(),
+            force_context_write: false,
+            set_current_if_empty: false,
+            force_use: false,
+            desktop_installed: desktop,
+        },
+    );
+}
+
+/// `kiri import [orbstack|desktop-linux] [--images] [--volumes] [--containers] [--list | [--force] [image|volume|container NAME]]`:
 /// one item, or every image, named volume and container Kiri lacks.
+#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
 pub fn run(args: &[String]) -> io::Result<()> {
-    if args.iter().any(|a| a == "-h" || a == "--help") {
+    if args.iter().any(|a| matches!(a.as_str(), "-h" | "--help"))
+        || matches!(args.first().map(String::as_str), Some("help"))
+    {
         println!("{USAGE}");
         return Ok(());
     }
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let (given, ask, force) = parse(&args)?;
+    #[cfg(windows)]
+    ensure_windows_kiri_context();
     let source = pick(given, answers)?;
+    if !matches!(ask, Ask::List(_)) {
+        client::check_alive()?;
+    }
     if given.is_none() {
         println!("from {} ({source})", label(source));
     }
@@ -1760,8 +1818,11 @@ pub fn run(args: &[String]) -> io::Result<()> {
     }
     let inv = inventory(source)?;
     let list = |k: &str| inv[k].as_array().cloned().unwrap_or_default();
-    if ask == Ask::List {
-        for k in ["images", "volumes", "containers"] {
+    if let Ask::List(filter) = ask {
+        for (k, on) in [("images", filter.images), ("volumes", filter.volumes), ("containers", filter.containers)] {
+            if !on {
+                continue;
+            }
             println!("{k}:");
             for v in list(k) {
                 println!("  {}{}", v["name"].as_str().unwrap_or(""), if v["have"] == true { "  (already in Kiri)" } else { "" });
@@ -1769,6 +1830,7 @@ pub fn run(args: &[String]) -> io::Result<()> {
         }
         return Ok(());
     }
+    let Ask::Everything(filter) = ask else { unreachable!() };
     let mut failures: Vec<(&str, String, String)> = Vec::new();
     let mut step = |what: &'static str, name: &str, r: io::Result<()>| match r {
         Ok(()) => println!("{what} {name}: done"),
@@ -1779,23 +1841,29 @@ pub fn run(args: &[String]) -> io::Result<()> {
             failures.push((what, name.to_owned(), why.to_owned()));
         }
     };
-    for v in list("images").iter().filter(|v| v["have"] != true) {
-        let n = v["name"].as_str().unwrap_or("");
-        step("image", n, image(source, n));
-    }
-    for v in list("volumes").iter().filter(|v| v["have"] != true && v["anonymous"] != true) {
-        let n = v["name"].as_str().unwrap_or("");
-        step("volume", n, volume_with(source, n, force));
-    }
-    for v in list("containers") {
-        let n = v["name"].as_str().unwrap_or("");
-        let already_had = v["have"] == true;
-        let already_imported = !already_had && has(crate::flavor::CONTEXT.get(), "container", n);
-        if let Some(why) = container_skip_reason(already_had, already_imported) {
-            println!("container {n}: skipped ({why})");
-            continue;
+    if filter.images {
+        for v in list("images").iter().filter(|v| v["have"] != true) {
+            let n = v["name"].as_str().unwrap_or("");
+            step("image", n, image(source, n));
         }
-        step("container", n, container_with(source, n, force, &[]));
+    }
+    if filter.volumes {
+        for v in list("volumes").iter().filter(|v| v["have"] != true && v["anonymous"] != true) {
+            let n = v["name"].as_str().unwrap_or("");
+            step("volume", n, volume_with(source, n, force));
+        }
+    }
+    if filter.containers {
+        for v in list("containers") {
+            let n = v["name"].as_str().unwrap_or("");
+            let already_had = v["have"] == true;
+            let already_imported = !already_had && has(crate::flavor::CONTEXT.get(), "container", n);
+            if let Some(why) = container_skip_reason(already_had, already_imported) {
+                println!("container {n}: skipped ({why})");
+                continue;
+            }
+            step("container", n, container_with(source, n, force, &[]));
+        }
     }
     if !failures.is_empty() { Err(io::Error::other(format_failures(&failures))) } else { Ok(()) }
 }
@@ -1990,17 +2058,31 @@ mod tests {
     // everything"; the source may be left out before a kind.
     #[test]
     fn parses_what_to_import() {
-        use super::{Ask, parse};
-        assert_eq!(parse(&[]).unwrap(), (None, Ask::Everything, false));
-        assert_eq!(parse(&["orbstack"]).unwrap(), (Some("orbstack"), Ask::Everything, false));
-        assert_eq!(parse(&["--list"]).unwrap(), (None, Ask::List, false));
-        assert_eq!(parse(&["orbstack", "--list"]).unwrap(), (Some("orbstack"), Ask::List, false));
+        use super::{Ask, KindFilter, parse};
+        let all = KindFilter::ALL;
+        assert_eq!(parse(&[]).unwrap(), (None, Ask::Everything(all), false));
+        assert_eq!(parse(&["orbstack"]).unwrap(), (Some("orbstack"), Ask::Everything(all), false));
+        assert_eq!(parse(&["--list"]).unwrap(), (None, Ask::List(all), false));
+        assert_eq!(parse(&["orbstack", "--list"]).unwrap(), (Some("orbstack"), Ask::List(all), false));
         assert_eq!(parse(&["image", "nginx"]).unwrap(), (None, Ask::One("image", "nginx"), false));
         assert_eq!(parse(&["desktop-linux", "volume", "pg"]).unwrap(), (Some("desktop-linux"), Ask::One("volume", "pg"), false));
         // #345: --force copies volumes running containers use, one or all.
         assert_eq!(parse(&["orbstack", "volume", "pg", "--force"]).unwrap(), (Some("orbstack"), Ask::One("volume", "pg"), true));
         assert_eq!(parse(&["--force", "container", "db"]).unwrap(), (None, Ask::One("container", "db"), true));
-        assert_eq!(parse(&["orbstack", "--force"]).unwrap(), (Some("orbstack"), Ask::Everything, true));
+        assert_eq!(parse(&["orbstack", "--force"]).unwrap(), (Some("orbstack"), Ask::Everything(all), true));
+        // #984: --images, --volumes, --containers filter bulk import and --list.
+        assert_eq!(
+            parse(&["desktop-linux", "--images"]).unwrap(),
+            (Some("desktop-linux"), Ask::Everything(KindFilter { images: true, volumes: false, containers: false }), false)
+        );
+        assert_eq!(
+            parse(&["--volumes", "--containers"]).unwrap(),
+            (None, Ask::Everything(KindFilter { images: false, volumes: true, containers: true }), false)
+        );
+        assert_eq!(
+            parse(&["--list", "--containers"]).unwrap(),
+            (None, Ask::List(KindFilter { images: false, volumes: false, containers: true }), false)
+        );
         for bad in [
             &["orbstack", "image"][..],
             &["image"],
@@ -2010,13 +2092,14 @@ mod tests {
             &["--list", "image", "nginx"],
             &["image", "nginx", "--list"],
             &["--list", "--force"],
+            &["--images", "image", "nginx"],
             // An unknown flag must not start a full import.
             &["--dry-run"],
             &["orbstack", "-l"],
         ] {
             assert!(parse(bad).unwrap_err().to_string().starts_with("usage:"), "{bad:?}");
         }
-        assert_eq!(parse(&["podman"]).unwrap(), (Some("podman"), Ask::Everything, false));
+        assert_eq!(parse(&["podman"]).unwrap(), (Some("podman"), Ask::Everything(all), false));
     }
 
     // Volume helpers run only an image the engine pulled from an official

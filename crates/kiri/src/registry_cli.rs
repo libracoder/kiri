@@ -37,13 +37,15 @@ const INSECURE: &str = "insecure-registries";
 const MIRRORS: &str = "registry-mirrors";
 
 pub fn run(args: &[String]) -> io::Result<()> {
-    let json = args.iter().any(|a| a == "--json");
-    let args: Vec<String> = args.iter().filter(|a| *a != "--json").cloned().collect();
-    let arg = |i: usize| args.get(i).map(String::as_str);
-    if matches!(arg(0), Some("-h" | "--help" | "help")) {
+    if args.iter().any(|a| matches!(a.as_str(), "-h" | "--help"))
+        || matches!(args.first().map(String::as_str), Some("help"))
+    {
         println!("{USAGE}");
         return Ok(());
     }
+    let json = args.iter().any(|a| a == "--json");
+    let args: Vec<String> = args.iter().filter(|a| *a != "--json").cloned().collect();
+    let arg = |i: usize| args.get(i).map(String::as_str);
     if !client::alive() {
         return Err(io::Error::other("kiri daemon is not running: open Kiri or run `kiri daemon`"));
     }

@@ -127,12 +127,23 @@ fn run_with(
     }
 }
 
+const USAGE: &str = "usage: kiri host-access [--restart] USER";
+
 pub fn run(args: &[String]) -> io::Result<u8> {
+    if args.iter().any(|a| matches!(a.as_str(), "-h" | "--help"))
+        || matches!(args.first().map(String::as_str), Some("help"))
+    {
+        println!("{USAGE}");
+        return Ok(0);
+    }
     let (restart, args) = match args {
         [flag, rest @ ..] if flag == "--restart" => (true, rest),
         _ => (false, args),
     };
-    let [user] = args else { return Err(io::Error::other("usage: kiri host-access [--restart] USER")) };
+    let [user] = args else { return Err(io::Error::other(USAGE)) };
+    if user.starts_with('-') {
+        return Err(io::Error::other(USAGE));
+    }
     // SAFETY: geteuid has no preconditions.
     if unsafe { libc::geteuid() } != 0 {
         return Err(io::Error::other(format!("needs root: sudo kiri host-access {}{user}", if restart { "--restart " } else { "" })));

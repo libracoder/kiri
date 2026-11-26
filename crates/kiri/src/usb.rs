@@ -29,6 +29,12 @@ const USAGE: &str = "usage: kiri usb [list [--json]] | attach DEVICE | detach DE
     DEVICE is a location (0x02114000), vendor:product (1532:00d7) or part of the name";
 
 pub fn run(args: &[String]) -> io::Result<()> {
+    if args.iter().any(|a| matches!(a.as_str(), "-h" | "--help"))
+        || matches!(args.first().map(String::as_str), Some("help"))
+    {
+        println!("{USAGE}");
+        return Ok(());
+    }
     match (args.first().map(String::as_str), args.get(1)) {
         // The window's own list: each device's key, name, id, state, paths…
         (None | Some("list" | "ls" | "--json"), _) if args.iter().any(|a| a == "--json") => list_json(),

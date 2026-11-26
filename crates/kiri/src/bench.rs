@@ -39,6 +39,12 @@ const ENGINES: [(&str, &str, &str); 3] = [
 ];
 
 pub fn run(args: &[String]) -> io::Result<()> {
+    if args.iter().any(|a| matches!(a.as_str(), "-h" | "--help"))
+        || matches!(args.first().map(String::as_str), Some("help"))
+    {
+        println!("{USAGE}");
+        return Ok(());
+    }
     let mut o = Opts { runs: 50, image: "alpine:latest".into(), bridge: false, only: None };
     let mut it = args.iter();
     while let Some(a) = it.next() {

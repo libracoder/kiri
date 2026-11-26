@@ -43,6 +43,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 - Caused by: -
 - Check: `tests/ui/volumes-size.js`, `crates/kiri/src/daemon/ops.rs`
 
+### #982, #984 CLI & Windows: exit 0 without side effects on `--help` / `-h` and `--version` / `-V` / `-v`, enable Windows `kiri import` / `setup` / `build-with`, self-heal `~/.docker/config.json`, and allow `runkiri.com` / `canestack.com` About links (unreleased)
+- Fixes: #982 `--help` / `-h` executes commands instead of printing usage, #984 Windows 0.2.2: `kiri import` missing from Windows CLI, uninstalling Docker Desktop wipes `~/.docker/config.json`, and `kiri setup` / `kiri build-with` / `kiri --version` fail
+- Caused: none known
+- Caused by: -
+- Check: `crates/kiri/src/main.rs`, `crates/kiri/src/setup_win.rs`, `crates/kiri/src/dockerctx.rs`, `crates/kiri-win/src/engine.rs`
+
 ### #932 Networking: return `NODATA` for external `AAAA` queries on IPv4-only networks and relay enterprise macOS VPN tunnels through the host (unreleased)
 - Fixes: #932 Containers and the Kubernetes node fail to reach Docker Hub with IPv6 `Network unreachable` and `TLS handshake timeout` under macOS VPN / packet-tunnel extensions
 - Caused: none known

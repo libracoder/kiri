@@ -15,7 +15,15 @@ fn invalid(msg: impl Into<String>) -> io::Error {
 }
 
 pub fn pull(args: &[String]) -> io::Result<()> {
-    let name = args.first().ok_or_else(|| invalid("usage: kiri raw pull <image>"))?;
+    const USAGE: &str = "usage: kiri raw pull <image>";
+    if args.iter().any(|a| matches!(a.as_str(), "-h" | "--help")) {
+        println!("{USAGE}");
+        return Ok(());
+    }
+    if args.len() != 1 || args[0].starts_with('-') {
+        return Err(invalid(USAGE));
+    }
+    let name = &args[0];
     let reference = Reference::parse(name).map_err(|e| invalid(e.to_string()))?;
     let store = store()?;
     let platform = Platform::host_linux();
@@ -54,7 +62,15 @@ pub fn pull(args: &[String]) -> io::Result<()> {
     Ok(())
 }
 
-pub fn list(_args: &[String]) -> io::Result<()> {
+pub fn list(args: &[String]) -> io::Result<()> {
+    const USAGE: &str = "usage: kiri raw images";
+    if args.iter().any(|a| matches!(a.as_str(), "-h" | "--help")) {
+        println!("{USAGE}");
+        return Ok(());
+    }
+    if !args.is_empty() {
+        return Err(invalid(USAGE));
+    }
     let mut images = store()?.images()?;
     images.sort_by(|a, b| a.name.cmp(&b.name));
     let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
@@ -74,8 +90,13 @@ pub fn list(_args: &[String]) -> io::Result<()> {
 }
 
 pub fn remove(args: &[String]) -> io::Result<()> {
-    if args.is_empty() {
-        return Err(invalid("usage: kiri raw rmi <image>..."));
+    const USAGE: &str = "usage: kiri raw rmi <image>...";
+    if args.iter().any(|a| matches!(a.as_str(), "-h" | "--help")) {
+        println!("{USAGE}");
+        return Ok(());
+    }
+    if args.is_empty() || args.iter().any(|a| a.starts_with('-')) {
+        return Err(invalid(USAGE));
     }
     let store = store()?;
     for name in args {

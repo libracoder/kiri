@@ -35,12 +35,35 @@ fn ok(r: io::Result<client::Response>) -> io::Result<client::Response> {
     if r.ok() { Ok(r) } else { Err(io::Error::other(r.error())) }
 }
 
+pub(crate) const USAGE: &str = "usage: kiri machine create NAME [--distro ubuntu|debian|alpine|fedora|arch|rocky|opensuse | --image IMAGE] [--systemd]\n       kiri machine list [--json] | shell NAME [-- CMD...] | start | stop | restart | delete NAME";
+
+/// True when `args` asks for `kiri machine`'s own help rather than passing
+/// `--help` to a command inside `kiri machine shell NAME -- <cmd> --help`.
+pub(crate) fn wants_help(args: &[String]) -> bool {
+    if matches!(args.first().map(String::as_str), Some("help")) {
+        return true;
+    }
+    let scan_end = if args.first().map(String::as_str) == Some("shell") {
+        args.iter().position(|a| a == "--").unwrap_or(args.len())
+    } else {
+        args.len()
+    };
+    args[..scan_end].iter().any(|a| matches!(a.as_str(), "-h" | "--help"))
+}
+
 pub fn run(args: &[String]) -> io::Result<()> {
+    if wants_help(args) {
+        println!("{USAGE}");
+        return Ok(());
+    }
+    if args.is_empty() {
+        return Err(io::Error::other(USAGE));
+    }
     if !client::alive() {
         return Err(io::Error::other("kiri daemon is not running: open Kiri.app or run `kiri daemon`"));
     }
     let name = args.get(1).map(String::as_str).unwrap_or_default();
-    let need_name = || if name.is_empty() { Err(io::Error::other("name a machine")) } else { Ok(()) };
+    let need_name = || if name.is_empty() || name.starts_with('-') { Err(io::Error::other("name a machine")) } else { Ok(()) };
     match args.first().map(String::as_str) {
         Some("create") => {
             need_name()?;
@@ -69,9 +92,7 @@ pub fn run(args: &[String]) -> io::Result<()> {
             println!("deleted machine {name}");
             Ok(())
         }
-        _ => Err(io::Error::other(
-            "usage: kiri machine create NAME [--distro ubuntu|debian|alpine|fedora|arch|rocky|opensuse | --image IMAGE] [--systemd]\n       kiri machine list [--json] | shell NAME [-- CMD...] | start | stop | restart | delete NAME",
-        )),
+        _ => Err(io::Error::other(USAGE)),
     }
 }
 
@@ -563,6 +584,20 @@ mod tests {
             .unwrap_err();
             assert_eq!(err.to_string(), "a machine name is letters, digits and dashes");
         }
+    }
+
+    #[test]
+    fn wants_help_stops_at_double_dash_for_shell_commands() {
+        let s = |v: &[&str]| v.iter().map(|x| (*x).to_owned()).collect::<Vec<String>>();
+        assert!(super::wants_help(&s(&["--help"])));
+        assert!(super::wants_help(&s(&["-h"])));
+        assert!(super::wants_help(&s(&["help"])));
+        assert!(super::wants_help(&s(&["create", "--help"])));
+        assert!(super::wants_help(&s(&["shell", "--help"])));
+        assert!(super::wants_help(&s(&["shell", "dev", "-h"])));
+        assert!(!super::wants_help(&s(&["shell", "dev", "--", "ls", "--help"])));
+        assert!(!super::wants_help(&s(&["shell", "dev", "--", "-h"])));
+        assert!(!super::wants_help(&s(&[])));
     }
 
     #[test]

@@ -44,7 +44,8 @@ mod relay;
 #[cfg(windows)]
 #[path = "../../kiri/src/hostrelay.rs"]
 mod hostrelay;
-#[cfg(windows)]
+#[cfg(any(windows, test))]
+#[cfg_attr(not(windows), allow(dead_code))]
 #[path = "../../kiri/src/dockerctx.rs"]
 mod dockerctx;
 #[cfg(windows)]
@@ -73,6 +74,7 @@ mod builds;
 // and Linux's own crates/kiri/src/buildwith.rs.
 #[cfg(windows)]
 #[path = "../../kiri/src/buildwith.rs"]
+#[allow(dead_code)]
 mod buildwith;
 // Kiri's program moved or deleted from where it started: the Mac's and
 // Linux's own crates/kiri/src/appwatch.rs.
@@ -217,6 +219,9 @@ fn main() -> std::process::ExitCode {
         return std::process::ExitCode::FAILURE;
     }
     client::set_pipe(&cfg.pipe);
+    if !setup {
+        engine::heal_docker_config(&cfg.pipe);
+    }
     ports::start();
     if let Err(e) = dns::start() {
         serve::log(&format!("dns on 127.0.0.1:53: {e}"));

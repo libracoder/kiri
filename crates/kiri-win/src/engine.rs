@@ -962,6 +962,40 @@ fn emit_docker_state_if_changed() {
     }
 }
 
+/// Ensures Kiri's `cliPluginsExtraDirs` and `kiri` context in
+/// `%USERPROFILE%\.docker`, repairing `config.json` if another engine's
+/// uninstaller (such as Docker Desktop's) removed it (#984).
+pub fn heal_docker_config(pipe: &str) {
+    let Some(dir) = crate::dockerctx::docker_dir() else { return };
+    let exe = std::env::current_exe().ok();
+    let local = std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from);
+    let plugins = crate::dockerctx::find_windows_cli_plugins(exe.as_deref(), local.as_deref());
+    let desktop = std::env::var_os("ProgramFiles").is_some_and(|p| std::path::Path::new(&p).join(r"Docker\Docker\Docker Desktop.exe").is_file());
+    let host = npipe_host(pipe);
+    match crate::dockerctx::repair_windows_config(
+        &dir,
+        crate::dockerctx::WindowsRepairOpts {
+            ours: crate::flavor::CONTEXT.get(),
+            description: "Kiri (WSL2)",
+            host: &host,
+            plugins_dir: plugins.as_deref(),
+            force_context_write: false,
+            set_current_if_empty: false,
+            force_use: false,
+            desktop_installed: desktop,
+        },
+    ) {
+        Ok(r) if r.context_written || r.plugins_added || r.current_context_set => {
+            crate::serve::log(&format!(
+                "docker config self-healed (context={}, plugins={}, current={})",
+                r.context_written, r.plugins_added, r.current_context_set
+            ));
+        }
+        Ok(_) => {}
+        Err(e) => crate::serve::log(&format!("docker config: could not self-heal ({e})")),
+    }
+}
+
 /// Ensures the `kiri` context exists and is plain `docker`'s current context,
 /// keeping logins, credential helpers and plugin folders untouched (#369).
 pub fn use_kiri_context() -> io::Result<()> {
@@ -1169,7 +1203,27 @@ fn set_pref(name: &str, value: Value) {
 
 /// A page link: only Kiri's own addresses, as on the Mac.
 fn allowed_url(url: &str) -> bool {
-    if url == "https://kiri.canestack.com" || url == "https://learn.microsoft.com/windows/wsl/about" || url == "https://github.com/libracoder/kiri/issues/new" || url == "https://github.com/libracoder/kiri" || url == "https://login.docker.com/activate" || url == "https://github.com/login/device" {
+    if matches!(
+        url,
+        "https://kiri.canestack.com"
+            | "https://runkiri.com"
+            | "https://runkiri.com/releases/"
+            | "https://runkiri.com/share/notice"
+            | "https://canestack.com"
+            | "https://learn.microsoft.com/windows/wsl/about"
+            | "https://github.com/libracoder/kiri/issues/new"
+            | "https://github.com/libracoder/kiri"
+            | "https://github.com/anchore/grype"
+            | "https://login.docker.com/activate"
+            | "https://github.com/login/device"
+    ) {
+        return true;
+    }
+    // A build warning's rule page (docs.docker.com/go/dockerfile/rule/…).
+    if url
+        .strip_prefix("https://docs.docker.com/go/")
+        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_alphanumeric() || b"-/".contains(&b)))
+    {
         return true;
     }
     let Some(rest) = url.strip_prefix("http://").or_else(|| url.strip_prefix("https://")) else { return false };
@@ -1239,8 +1293,17 @@ mod tests {
         assert!(allowed_url("http://localhost:8080/app"));
         assert!(allowed_url("https://web.kiri.localhost/"));
         assert!(allowed_url("http://api.kiri.local"));
+        assert!(allowed_url("https://runkiri.com"));
+        assert!(allowed_url("https://runkiri.com/releases/"));
+        assert!(allowed_url("https://runkiri.com/share/notice"));
+        assert!(allowed_url("https://canestack.com"));
+        assert!(allowed_url("https://kiri.canestack.com"));
         assert!(allowed_url("https://github.com/libracoder/kiri"));
+        assert!(allowed_url("https://github.com/libracoder/kiri/issues/new"));
+        assert!(allowed_url("https://github.com/anchore/grype"));
+        assert!(allowed_url("https://docs.docker.com/go/dockerfile/rule/from-as-casing/"));
         assert!(!allowed_url("http://evil.example/"));
+        assert!(!allowed_url("https://runkiri.com.evil.com"));
         // Bypass attempts the audit found.
         assert!(!allowed_url("http://localhost:1@evil.example/"));
         assert!(!allowed_url("http://evil.example\\x.kiri.localhost"));

@@ -170,7 +170,23 @@ fn step(what: &'static str) -> impl Fn(io::Error) -> io::Error {
     move |e| io::Error::new(e.kind(), format!("{what}: {e}"))
 }
 
+const USAGE: &str = "usage: kiri setup [--use] [--no-agent] [--no-profiles] [--no-domains]\n       kiri setup --domains | --docker-socket | --uninstall";
+
 pub fn run(args: &[String]) -> io::Result<()> {
+    if args.iter().any(|a| matches!(a.as_str(), "-h" | "--help"))
+        || matches!(args.first().map(String::as_str), Some("help"))
+    {
+        println!("{USAGE}");
+        return Ok(());
+    }
+    for a in args {
+        if !matches!(
+            a.as_str(),
+            "--uninstall" | "--domains" | "--docker-socket" | "--use" | "--no-profiles" | "--no-agent" | "--no-domains"
+        ) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, USAGE));
+        }
+    }
     let flag = |f: &str| args.iter().any(|a| a == f);
     if flag("--uninstall") {
         return uninstall();

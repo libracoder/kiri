@@ -437,13 +437,27 @@ pub fn ask() -> Option<&'static str> {
     places().ok().filter(|p| p.ask(other)).and(other)
 }
 
-/// `kiri build-with [docker|kiri]`: says which, or switches.
-#[cfg(unix)]
+const USAGE: &str = "usage: kiri build-with [docker|kiri|status]";
+
+/// `kiri build-with [docker|kiri|status]`: says which, or switches.
+#[cfg(any(unix, windows))]
 pub fn cli(args: &[String]) -> io::Result<()> {
+    if args.iter().any(|a| matches!(a.as_str(), "-h" | "--help"))
+        || matches!(args.first().map(String::as_str), Some("help"))
+    {
+        println!("{USAGE}");
+        return Ok(());
+    }
+    if args.len() > 1 {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, USAGE));
+    }
+    let choice = match args.first().map(String::as_str) {
+        None | Some("status") => None,
+        Some(a) => Some(With::parse(a).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, USAGE))?),
+    };
     let p = places()?;
     let other = other_engine();
-    if let Some(a) = args.first() {
-        let with = With::parse(a).ok_or_else(|| io::Error::other("usage: kiri build-with [docker|kiri]"))?;
+    if let Some(with) = choice {
         p.choose(with)?;
         if with == With::Kiri && !p.ready() {
             crate::builds::ensure_builder();

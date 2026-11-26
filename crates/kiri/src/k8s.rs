@@ -504,6 +504,10 @@ fn ok(r: io::Result<client::Response>) -> io::Result<client::Response> {
 
 pub fn run(args: &[String]) -> io::Result<()> {
     let what = args.first().map(String::as_str).unwrap_or("");
+    if args.iter().any(|a| matches!(a.as_str(), "-h" | "--help")) || what == "help" {
+        println!("{}", if what == "set" { USAGE_SET } else { USAGE_K8S });
+        return Ok(());
+    }
     let logged = matches!(what, "start" | "stop" | "delete" | "set");
     // A recreate from the command line (`kiri k8s set`) is attributed to this
     // op, so the node's stop is logged as `k8s set`, not as a memory kill. A

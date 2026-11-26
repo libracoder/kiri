@@ -5,7 +5,15 @@ use std::time::Duration;
 
 use crate::guest::{BootOptions, Guest};
 
+const USAGE: &str = "usage: kiri boot [--console] [--pings N]";
+
 pub fn run(args: &[String]) -> io::Result<()> {
+    if args.iter().any(|a| matches!(a.as_str(), "-h" | "--help"))
+        || matches!(args.first().map(String::as_str), Some("help"))
+    {
+        println!("{USAGE}");
+        return Ok(());
+    }
     let mut opts = BootOptions::default();
     let mut pings = 1000usize;
     let mut it = args.iter();

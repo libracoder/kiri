@@ -14,7 +14,7 @@ const USAGE: &str = "usage: kiri raw run [--rm] [-e KEY=VALUE]... [-u USER] [-w 
 Containers get their own network namespace with only loopback for now
 (like docker run --network none); bridged networking comes next.";
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq, Eq)]
 struct Options {
     remove: bool,
     env: Vec<String>,
@@ -25,7 +25,7 @@ struct Options {
     command: Vec<String>,
 }
 
-fn parse(args: &[String]) -> io::Result<Options> {
+fn parse(args: &[String]) -> io::Result<Option<Options>> {
     let bad = |m: String| io::Error::new(io::ErrorKind::InvalidInput, format!("{m}\n\n{USAGE}"));
     let mut o = Options::default();
     let mut it = args.iter();
@@ -43,7 +43,14 @@ fn parse(args: &[String]) -> io::Result<Options> {
                     return Err(bad(format!("--network {v} is not supported yet; only none")));
                 }
             }
-            "-h" | "--help" => return Err(bad(String::new())),
+            "-h" | "--help" => return Ok(None),
+            "--" => {
+                if let Some(img) = it.next() {
+                    o.image = img.clone();
+                    o.command = it.cloned().collect();
+                }
+                break;
+            }
             s if s.starts_with('-') => return Err(bad(format!("unknown option {s}"))),
             _ => {
                 o.image = a.clone();
@@ -55,7 +62,7 @@ fn parse(args: &[String]) -> io::Result<Options> {
     if o.image.is_empty() {
         return Err(bad("no image given".into()));
     }
-    Ok(o)
+    Ok(Some(o))
 }
 
 /// Finds the image locally, pulling it first if needed, and holds every blob
@@ -109,7 +116,10 @@ pub fn new_id() -> String {
 }
 
 pub fn run(args: &[String]) -> io::Result<()> {
-    let o = parse(args)?;
+    let Some(o) = parse(args)? else {
+        println!("{USAGE}");
+        return Ok(());
+    };
     let t0 = Instant::now();
     let store = Store::open(Store::default_root()?)?;
     let (image, _blob_pins) = image(&store, &o.image)?;
@@ -162,4 +172,38 @@ pub fn run(args: &[String]) -> io::Result<()> {
         eprintln!("kiri: shutdown: {e}");
     }
     std::process::exit(r.code);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Options, parse};
+
+    fn s(words: &[&str]) -> Vec<String> {
+        words.iter().map(|w| (*w).to_owned()).collect()
+    }
+
+    #[test]
+    fn help_before_image_returns_none_while_help_after_image_stays_in_command() {
+        assert_eq!(parse(&s(&["--help"])).unwrap(), None);
+        assert_eq!(parse(&s(&["-h"])).unwrap(), None);
+        assert_eq!(parse(&s(&["--rm", "--help"])).unwrap(), None);
+
+        let with_cmd_help = parse(&s(&["--rm", "alpine:latest", "ls", "--help"])).unwrap().unwrap();
+        assert!(with_cmd_help.remove);
+        assert_eq!(with_cmd_help.image, "alpine:latest");
+        assert_eq!(with_cmd_help.command, s(&["ls", "--help"]));
+
+        let direct_help = parse(&s(&["alpine", "--help"])).unwrap().unwrap();
+        assert_eq!(direct_help.image, "alpine");
+        assert_eq!(direct_help.command, s(&["--help"]));
+
+        let double_dash = parse(&s(&["--", "alpine", "-h"])).unwrap().unwrap();
+        assert_eq!(
+            double_dash,
+            Options { image: "alpine".into(), command: s(&["-h"]), ..Options::default() }
+        );
+
+        assert!(parse(&[]).is_err());
+        assert!(parse(&s(&["--unknown", "alpine"])).is_err());
+    }
 }

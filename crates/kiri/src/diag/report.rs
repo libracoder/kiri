@@ -69,6 +69,10 @@ const MAC_REPORT_BUDGET: usize = 24 << 10;
 
 pub fn run(args: &[String]) -> io::Result<()> {
     match args.first().map(String::as_str) {
+        Some("-h" | "--help" | "help") => {
+            println!("{USAGE}");
+            Ok(())
+        }
         Some("logs") => logs_cli(&args[1..]),
         Some("report") => report_cli(&args[1..]),
         _ => Err(io::Error::other(USAGE)),
@@ -175,6 +179,10 @@ pub fn render(v: &Value, utc: bool, color: bool) -> String {
 }
 
 fn logs_cli(args: &[String]) -> io::Result<()> {
+    if args.iter().any(|a| matches!(a.as_str(), "-h" | "--help")) {
+        println!("{USAGE}");
+        return Ok(());
+    }
     let (mut parts, mut follow, mut errors, mut n, mut op) = (Vec::new(), false, false, 50usize, None);
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -556,6 +564,10 @@ pub fn reveal(path: &Path) {
 }
 
 fn report_cli(args: &[String]) -> io::Result<()> {
+    if args.iter().any(|a| matches!(a.as_str(), "-h" | "--help")) {
+        println!("{USAGE}");
+        return Ok(());
+    }
     let (mut out, mut send_it) = (None, false);
     let mut it = args.iter();
     while let Some(a) = it.next() {

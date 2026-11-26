@@ -13,7 +13,7 @@ mod boot;
 // builds, cli_pins, scan and tools on Linux too: the daemon reads an
 // image's layers and scans it for kiri-win, whose window can't reach the
 // store inside WSL (daemon/api.rs).
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod builds;
 // The engine stops when its app is deleted under it (kiri-win includes it
@@ -21,7 +21,7 @@ mod builds;
 #[cfg(unix)]
 mod appwatch;
 // Which builder plain `docker build` uses: Docker's or Kiri's.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod buildwith;
 // Linux only, but its tests run anywhere with unix sockets.
@@ -33,15 +33,23 @@ mod bridge;
 mod hostrelay;
 #[cfg(unix)]
 mod cli_pins;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod client;
 #[cfg(unix)]
 mod daemon;
+#[cfg(windows)]
+#[path = "daemon/time.rs"]
+#[allow(dead_code)]
+mod daemon_time;
+#[cfg(windows)]
+mod daemon {
+    pub(crate) use super::daemon_time as time;
+}
 #[cfg(unix)]
 mod diag;
 #[cfg(any(unix, windows))]
 mod docker;
-#[cfg(any(target_os = "macos", all(target_os = "linux", feature = "window"), test))]
+#[cfg(any(target_os = "macos", all(target_os = "linux", feature = "window"), windows, test))]
 #[cfg_attr(not(any(target_os = "macos", all(target_os = "linux", feature = "window"))), allow(dead_code))]
 mod dockerctx;
 // `kiri doctor`: whether this installation works (Windows: docker here, the engine in WSL).
@@ -51,12 +59,14 @@ mod doctor;
 #[cfg(unix)]
 mod domains_cli;
 mod flavor;
+#[cfg(unix)]
 mod images;
 #[cfg(unix)]
 mod guest;
 #[cfg(target_os = "linux")]
 mod hostaccess;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod import;
 #[cfg(unix)]
 mod k8s;
@@ -77,6 +87,8 @@ mod scan;
 mod scan_cli;
 #[cfg(target_os = "macos")]
 mod setup;
+#[cfg(any(windows, test))]
+mod setup_win;
 #[cfg(unix)]
 mod usb;
 #[cfg(unix)]
@@ -109,8 +121,10 @@ const USAGE_LINES: &[&str] = &[
     "       kiri ui [--start] [--view containers|images|volumes|networks|builds]",
     #[cfg(target_os = "macos")]
     "       kiri setup [--use] [--no-agent] [--no-profiles] | kiri setup --uninstall",
-    #[cfg(unix)]
-    "       kiri build-with [docker|kiri]   which builder docker build uses",
+    #[cfg(windows)]
+    "       kiri setup [--use]         ensure Kiri's docker context and CLI plugins in ~/.docker",
+    #[cfg(any(unix, windows))]
+    "       kiri build-with [docker|kiri|status]   which builder docker build uses",
     "       kiri domains [set [--http N] [--https N] | reset]   the *.kiri.local routers' ports",
     "       kiri storage [status | reclaim]   storage location, disk usage, and reclaiming VM disk space",
     "       kiri registry [insecure|mirror] [list | add X... | remove X...]   daemon.json's insecure registries and Docker Hub mirrors",
@@ -130,7 +144,9 @@ const USAGE_LINES: &[&str] = &[
     #[cfg(target_os = "macos")]
     "       kiri vm [status | set --shared-nat on|off]   VM networking (off avoids macOS InternetSharing)",
     #[cfg(target_os = "macos")]
-    "       kiri import [orbstack | desktop-linux] [--list | [--force] [image|volume|container NAME]]",
+    "       kiri import [orbstack | desktop-linux] [--images] [--volumes] [--containers] [--list | [--force] [image|volume|container NAME]]",
+    #[cfg(windows)]
+    "       kiri import [desktop-linux] [--images] [--volumes] [--containers] [--list | [--force] [image|volume|container NAME]]",
     #[cfg(target_os = "macos")]
     "       kiri bench [--runs N] [--image IMAGE] [--network none|bridge]",
     #[cfg(target_os = "macos")]
@@ -148,18 +164,55 @@ fn usage() -> String {
 #[cfg(any(windows, test))]
 const WINDOWS_DAEMON_ERROR: &str = "on Windows, Kiri's engine runs in WSL without `kiri daemon`: run `kiri start` or open Kiri";
 
+const START_USAGE: &str = "usage: kiri start                 start Kiri after a Stop (the window's Start)";
+#[cfg(unix)]
+const DAEMON_USAGE: &str = "usage: kiri daemon";
+#[cfg(unix)]
+const RAW_USAGE: &str = "usage: kiri raw run [--rm] [-e KEY=VALUE]... [-u USER] [-w DIR] [--timings] IMAGE [COMMAND...]\n       kiri raw pull <image> | raw images | raw rmi <image>...";
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+const UI_USAGE: &str = "usage: kiri ui [--start] [--view containers|images|volumes|networks|builds]";
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn parse_ui_args(rest: &[String]) -> std::io::Result<Option<(bool, Option<String>)>> {
+    if rest.iter().any(|a| matches!(a.as_str(), "-h" | "--help"))
+        || matches!(rest.first().map(String::as_str), Some("help"))
+    {
+        return Ok(None);
+    }
+    let mut start = false;
+    let mut view = None;
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--start" => start = true,
+            "--view" => {
+                let v = it
+                    .next()
+                    .filter(|s| !s.is_empty() && !s.starts_with('-'))
+                    .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, UI_USAGE))?;
+                view = Some(v.clone());
+            }
+            _ => return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, UI_USAGE)),
+        }
+    }
+    Ok(Some((start, view)))
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum Command<'a> {
-    #[cfg(unix)]
+    Help,
+    Version,
     Daemon(&'a [String]),
-    #[cfg(windows)]
-    Daemon,
     #[cfg(target_os = "linux")]
     Bridge(&'a [String]),
     #[cfg(target_os = "linux")]
-    HostRelay,
+    HostRelay(&'a [String]),
     #[cfg(target_os = "linux")]
     HostAccess(&'a [String]),
+    #[cfg(unix)]
+    RawHelp,
+    #[cfg(unix)]
+    RawInvalid,
     #[cfg(unix)]
     RawRun(&'a [String]),
     #[cfg(unix)]
@@ -172,15 +225,12 @@ enum Command<'a> {
     Bench(&'a [String]),
     #[cfg(target_os = "macos")]
     Boot(&'a [String]),
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     Setup(&'a [String]),
     #[cfg(any(unix, windows))]
     Share(&'a [String]),
-    #[cfg(unix)]
-    Start,
-    #[cfg(windows)]
     Start(&'a [String]),
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     BuildWith(&'a [String]),
     #[cfg(unix)]
     Domains(&'a [String]),
@@ -198,7 +248,7 @@ enum Command<'a> {
     Machine(&'a [String]),
     #[cfg(unix)]
     Usb(&'a [String]),
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     Import(&'a [String]),
     #[cfg(target_os = "macos")]
     Vm(&'a [String]),
@@ -217,14 +267,13 @@ enum Command<'a> {
 impl<'a> Command<'a> {
     fn parse(args: &'a [String]) -> Option<Command<'a>> {
         match args.first().map(String::as_str) {
-            #[cfg(unix)]
+            Some("-h" | "--help" | "help") => Some(Command::Help),
+            Some("--version" | "-V" | "-v") if args.len() == 1 => Some(Command::Version),
             Some("daemon") => Some(Command::Daemon(&args[1..])),
-            #[cfg(windows)]
-            Some("daemon") => Some(Command::Daemon),
             #[cfg(target_os = "linux")]
             Some("bridge") => Some(Command::Bridge(&args[1..])),
             #[cfg(target_os = "linux")]
-            Some("hostrelay") => Some(Command::HostRelay),
+            Some("hostrelay") => Some(Command::HostRelay(&args[1..])),
             #[cfg(target_os = "linux")]
             Some("host-access") => Some(Command::HostAccess(&args[1..])),
             #[cfg(unix)]
@@ -233,26 +282,27 @@ impl<'a> Command<'a> {
                 Some("pull") => Some(Command::RawPull(&args[2..])),
                 Some("images") => Some(Command::RawImages(&args[2..])),
                 Some("rmi") => Some(Command::RawRmi(&args[2..])),
-                _ => None,
+                Some("-h" | "--help" | "help") => Some(Command::RawHelp),
+                _ => Some(Command::RawInvalid),
             },
             #[cfg(target_os = "macos")]
             Some("bench") => Some(Command::Bench(&args[1..])),
             #[cfg(target_os = "macos")]
             Some("boot") => Some(Command::Boot(&args[1..])),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", windows))]
             Some("setup") => Some(Command::Setup(&args[1..])),
             #[cfg(any(unix, windows))]
             Some("share") => Some(Command::Share(&args[1..])),
             // `kiri 3000`: share a port straight away.
             #[cfg(any(unix, windows))]
             Some(a) if share::is_shorthand(a) => Some(Command::Share(args)),
-            // Bare: the window's Start (`kiri start NAME` is docker's start).
+            // Bare (or `-h`/`--help`): the window's Start (`kiri start NAME` is docker's start).
             #[cfg(unix)]
-            Some("start") if args.len() == 1 => Some(Command::Start),
+            Some("start") if args[1..].iter().all(|a| matches!(a.as_str(), "-h" | "--help")) => Some(Command::Start(&args[1..])),
             // On Windows, by the `kiri` in WSL, once kiri-start has the daemon up.
             #[cfg(windows)]
-            Some("start") if args.len() == 1 => Some(Command::Start(args)),
-            #[cfg(unix)]
+            Some("start") if args[1..].iter().all(|a| matches!(a.as_str(), "-h" | "--help")) => Some(Command::Start(args)),
+            #[cfg(any(unix, windows))]
             Some("build-with") => Some(Command::BuildWith(&args[1..])),
             #[cfg(unix)]
             Some("domains") => Some(Command::Domains(&args[1..])),
@@ -270,7 +320,7 @@ impl<'a> Command<'a> {
             Some("machine") => Some(Command::Machine(&args[1..])),
             #[cfg(unix)]
             Some("usb") => Some(Command::Usb(&args[1..])),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", windows))]
             Some("import") => Some(Command::Import(&args[1..])),
             #[cfg(target_os = "macos")]
             Some("vm") => Some(Command::Vm(&args[1..])),
@@ -293,33 +343,89 @@ impl<'a> Command<'a> {
 fn main() -> ExitCode {
     flavor::init();
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let parsed = Command::parse(&args);
+    match parsed {
+        Some(Command::Help) => {
+            println!("{}", usage());
+            return ExitCode::SUCCESS;
+        }
+        Some(Command::Version) => {
+            println!("kiri {}", env!("CARGO_PKG_VERSION"));
+            return ExitCode::SUCCESS;
+        }
+        _ => {}
+    }
     // Which process this is, for its log and crash reports.
     #[cfg(unix)]
-    diag::init(match args.first().map(String::as_str) {
-        Some("daemon") => diag::Part::Daemon,
-        // Only a build with the window: elsewhere `kiri ui` is a plain
-        // command whose message must reach the terminal, not the log's pipe.
-        #[cfg(any(target_os = "macos", all(target_os = "linux", feature = "window")))]
-        Some("ui") => diag::Part::Ui,
-        #[cfg(target_os = "macos")]
-        None if setup::launched_from_app() => diag::Part::Ui,
-        _ => diag::Part::Cli,
-    });
-    let result: std::io::Result<()> = match Command::parse(&args) {
+    {
+        let asking_help = args.iter().any(|a| matches!(a.as_str(), "-h" | "--help"))
+            || matches!(args.get(1).map(String::as_str), Some("help"));
+        diag::init(match args.first().map(String::as_str) {
+            Some("daemon") if !asking_help && args.len() == 1 => diag::Part::Daemon,
+            // Only a build with the window: elsewhere `kiri ui` is a plain
+            // command whose message must reach the terminal, not the log's pipe.
+            #[cfg(any(target_os = "macos", all(target_os = "linux", feature = "window")))]
+            Some("ui") if !asking_help => diag::Part::Ui,
+            #[cfg(target_os = "macos")]
+            None if setup::launched_from_app() => diag::Part::Ui,
+            _ => diag::Part::Cli,
+        });
+    }
+    let result: std::io::Result<()> = match parsed {
+        Some(Command::Help | Command::Version) => unreachable!(),
         #[cfg(unix)]
-        Some(Command::Daemon(rest)) => daemon::run(rest),
+        Some(Command::Daemon(rest)) => {
+            if rest.iter().any(|a| matches!(a.as_str(), "-h" | "--help"))
+                || matches!(rest.first().map(String::as_str), Some("help"))
+            {
+                println!("{DAEMON_USAGE}");
+                Ok(())
+            } else if !rest.is_empty() {
+                Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, DAEMON_USAGE))
+            } else {
+                daemon::run(rest)
+            }
+        }
         #[cfg(windows)]
-        Some(Command::Daemon) => Err(std::io::Error::other(WINDOWS_DAEMON_ERROR)),
+        Some(Command::Daemon(rest)) => {
+            if rest.iter().any(|a| matches!(a.as_str(), "-h" | "--help"))
+                || matches!(rest.first().map(String::as_str), Some("help"))
+            {
+                println!("{START_USAGE}");
+                Ok(())
+            } else {
+                Err(std::io::Error::other(WINDOWS_DAEMON_ERROR))
+            }
+        }
         #[cfg(target_os = "linux")]
         Some(Command::Bridge(rest)) => bridge::run(rest),
         #[cfg(target_os = "linux")]
-        Some(Command::HostRelay) => hostrelay::run(),
+        Some(Command::HostRelay(rest)) => {
+            const HOSTRELAY_USAGE: &str = "usage: kiri hostrelay";
+            if rest.iter().any(|a| matches!(a.as_str(), "-h" | "--help"))
+                || matches!(rest.first().map(String::as_str), Some("help"))
+            {
+                println!("{HOSTRELAY_USAGE}");
+                Ok(())
+            } else if !rest.is_empty() {
+                Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, HOSTRELAY_USAGE))
+            } else {
+                hostrelay::run()
+            }
+        }
         // Linux hosts: what the window's onboarding needs root for (through pkexec).
         #[cfg(target_os = "linux")]
         Some(Command::HostAccess(rest)) => match hostaccess::run(rest) {
             Ok(code) => return ExitCode::from(code),
             Err(e) => Err(e),
         },
+        #[cfg(unix)]
+        Some(Command::RawHelp) => {
+            println!("{RAW_USAGE}");
+            Ok(())
+        }
+        #[cfg(unix)]
+        Some(Command::RawInvalid) => Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, RAW_USAGE)),
         #[cfg(unix)]
         Some(Command::RawRun(rest)) => run::run(rest),
         #[cfg(unix)]
@@ -334,13 +440,22 @@ fn main() -> ExitCode {
         Some(Command::Boot(rest)) => boot::run(rest),
         #[cfg(target_os = "macos")]
         Some(Command::Setup(rest)) => setup::run(rest),
+        #[cfg(windows)]
+        Some(Command::Setup(rest)) => setup_win::run(rest),
         #[cfg(any(unix, windows))]
         Some(Command::Share(rest)) => share::run(rest),
         #[cfg(unix)]
-        Some(Command::Start) => engine_start(),
+        Some(Command::Start(rest)) => {
+            if !rest.is_empty() {
+                println!("{START_USAGE}");
+                Ok(())
+            } else {
+                engine_start()
+            }
+        }
         #[cfg(windows)]
         Some(Command::Start(all)) => wsl::run(all),
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         Some(Command::BuildWith(rest)) => buildwith::cli(rest),
         #[cfg(unix)]
         Some(Command::Domains(rest)) => domains_cli::run(rest),
@@ -358,7 +473,7 @@ fn main() -> ExitCode {
         Some(Command::Machine(rest)) => machine::run(rest),
         #[cfg(unix)]
         Some(Command::Usb(rest)) => usb::run(rest),
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         Some(Command::Import(rest)) => import::run(rest),
         #[cfg(target_os = "macos")]
         Some(Command::Vm(rest)) => vm_cli::run(rest),
@@ -367,13 +482,24 @@ fn main() -> ExitCode {
         #[cfg(unix)]
         Some(Command::Diag(rest)) => diag::run(rest),
         #[cfg(any(target_os = "macos", all(target_os = "linux", feature = "window")))]
-        Some(Command::Ui(all)) => ui::run(
-            all.iter().any(|a| a == "--start"),
-            all.iter().position(|a| a == "--view").and_then(|i| all.get(i + 1)).cloned(),
-        ),
+        Some(Command::Ui(all)) => match parse_ui_args(&all[1..]) {
+            Ok(None) => {
+                println!("{UI_USAGE}");
+                Ok(())
+            }
+            Ok(Some((start, view))) => ui::run(start, view),
+            Err(e) => Err(e),
+        },
         // The static engine has no window: the package's own build of it.
         #[cfg(all(target_os = "linux", not(feature = "window")))]
-        Some(Command::Ui(all)) => window(all),
+        Some(Command::Ui(all)) => match parse_ui_args(&all[1..]) {
+            Ok(None) => {
+                println!("{UI_USAGE}");
+                Ok(())
+            }
+            Ok(Some(_)) => window(all),
+            Err(e) => Err(e),
+        },
         #[cfg(any(unix, windows))]
         Some(Command::Docker(all)) => {
             engine_version_check();
@@ -545,7 +671,14 @@ mod tests {
         }
         #[cfg(windows)]
         {
-            for unix_or_mac in ["daemon", "bridge", "ui", "setup", "build-with", "update", "vm", "import", "bench", "boot", "raw"] {
+            for win_cmd in ["setup", "build-with", "import"] {
+                assert!(cmds.contains(&win_cmd), "Windows help missing `{win_cmd}`:\n{help}");
+            }
+            assert!(
+                help.contains("kiri import [desktop-linux] [--images] [--volumes] [--containers]"),
+                "Windows help missing `kiri import [desktop-linux] [--images] [--volumes] [--containers]`:\n{help}"
+            );
+            for unix_or_mac in ["daemon", "bridge", "ui", "update", "vm", "bench", "boot", "raw"] {
                 assert!(!cmds.contains(&unix_or_mac), "Windows help must not list `{unix_or_mac}`:\n{help}");
             }
         }
@@ -596,8 +729,28 @@ mod tests {
             }
         }
         assert!(count > 0);
-        assert!(parse(&["--help"]).is_none());
-        assert!(parse(&["-h"]).is_none());
+        for h in ["--help", "-h", "help"] {
+            assert_eq!(Command::parse(&[h.to_owned()]), Some(Command::Help), "{h}");
+        }
+        for v in ["--version", "-V", "-v"] {
+            assert_eq!(Command::parse(&[v.to_owned()]), Some(Command::Version), "{v}");
+        }
+        // `kiri version` (without leading dash) remains Docker's `version` passthrough.
+        assert!(matches!(Command::parse(&["version".to_owned()]), Some(Command::Docker(_))));
+        // `kiri start --help` / `-h` dispatches to Kiri's Start, while `kiri start web --help` stays Docker's.
+        assert!(matches!(Command::parse(&["start".to_owned(), "--help".to_owned()]), Some(Command::Start(_))));
+        assert!(matches!(Command::parse(&["start".to_owned(), "-h".to_owned()]), Some(Command::Start(_))));
+        assert!(matches!(Command::parse(&["start".to_owned(), "web".to_owned(), "--help".to_owned()]), Some(Command::Docker(_))));
+        assert!(matches!(Command::parse(&["run".to_owned(), "alpine".to_owned(), "--help".to_owned()]), Some(Command::Docker(_))));
+        assert!(matches!(Command::parse(&["ps".to_owned(), "--help".to_owned()]), Some(Command::Docker(_))));
+
+        #[cfg(unix)]
+        {
+            assert_eq!(Command::parse(&["raw".to_owned(), "--help".to_owned()]), Some(Command::RawHelp));
+            assert_eq!(Command::parse(&["raw".to_owned(), "-h".to_owned()]), Some(Command::RawHelp));
+            assert_eq!(Command::parse(&["raw".to_owned()]), Some(Command::RawInvalid));
+        }
+
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         for args in [
             vec!["update".to_owned()],
@@ -617,15 +770,153 @@ mod tests {
         }
         #[cfg(windows)]
         {
-            for unix_cmd in ["bridge", "ui", "setup", "build-with", "vm", "import", "bench", "boot", "raw"] {
+            for unix_cmd in ["bridge", "ui", "vm", "bench", "boot", "raw"] {
                 assert!(parse(&[unix_cmd]).is_none(), "`kiri {unix_cmd}` should not dispatch on Windows");
             }
+            for win_cmd in ["setup", "build-with", "import"] {
+                assert!(parse(&[win_cmd]).is_some(), "`kiri {win_cmd}` must dispatch on Windows");
+            }
             let daemon_args = ["daemon".to_owned()];
-            assert_eq!(Command::parse(&daemon_args), Some(Command::Daemon));
+            assert_eq!(Command::parse(&daemon_args), Some(Command::Daemon(&[])));
         }
         assert_eq!(
             super::WINDOWS_DAEMON_ERROR,
             "on Windows, Kiri's engine runs in WSL without `kiri daemon`: run `kiri start` or open Kiri"
         );
+    }
+
+    #[test]
+    fn parse_ui_args_handles_help_views_and_invalid_flags() {
+        let s = |v: &[&str]| v.iter().map(|x| (*x).to_owned()).collect::<Vec<String>>();
+        assert_eq!(super::parse_ui_args(&s(&["--help"])).unwrap(), None);
+        assert_eq!(super::parse_ui_args(&s(&["-h"])).unwrap(), None);
+        assert_eq!(super::parse_ui_args(&s(&["--start", "--help"])).unwrap(), None);
+        assert_eq!(super::parse_ui_args(&s(&[])).unwrap(), Some((false, None)));
+        assert_eq!(
+            super::parse_ui_args(&s(&["--start", "--view", "containers"])).unwrap(),
+            Some((true, Some("containers".into())))
+        );
+        assert!(super::parse_ui_args(&s(&["--view"])).is_err());
+        assert!(super::parse_ui_args(&s(&["--bogus"])).is_err());
+    }
+
+    #[test]
+    fn cli_help_and_version_exit_zero_on_stdout_without_side_effects() {
+        let Some(bin) = option_env!("CARGO_BIN_EXE_kiri").map(std::path::PathBuf::from).or_else(|| {
+            // In `cargo test --bin kiri`, the `kiri` binary sits in the parent of `deps/`.
+            let test_exe = std::env::current_exe().ok()?;
+            let dir = test_exe.parent()?.parent()?;
+            let name = if cfg!(windows) { "kiri.exe" } else { "kiri" };
+            Some(dir.join(name)).filter(|p| p.is_file())
+        }) else {
+            return;
+        };
+        let run_kiri = |args: &[&str]| {
+            std::process::Command::new(&bin)
+                .args(args)
+                .env("KIRI_SOCKET", "/nonexistent/kiri-test.sock")
+                .output()
+                .expect("spawn kiri")
+        };
+
+        // Bare `kiri` prints usage to stderr and exits 1.
+        let bare = run_kiri(&[]);
+        assert!(!bare.status.success());
+        assert!(bare.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&bare.stderr).starts_with("usage: kiri COMMAND"));
+
+        // Top-level help flags print usage to stdout and exit 0.
+        for flag in ["--help", "-h", "help"] {
+            let out = run_kiri(&[flag]);
+            assert!(out.status.success(), "`kiri {flag}` failed: {:?}", String::from_utf8_lossy(&out.stderr));
+            assert!(out.stderr.is_empty(), "`kiri {flag}` wrote stderr: {:?}", String::from_utf8_lossy(&out.stderr));
+            assert_eq!(String::from_utf8_lossy(&out.stdout).trim_end(), usage());
+        }
+
+        // Top-level version flags print `kiri <version>` to stdout and exit 0.
+        for flag in ["--version", "-V", "-v"] {
+            let out = run_kiri(&[flag]);
+            assert!(out.status.success(), "`kiri {flag}` failed");
+            assert!(out.stderr.is_empty());
+            assert_eq!(String::from_utf8_lossy(&out.stdout), format!("kiri {}\n", env!("CARGO_PKG_VERSION")));
+        }
+
+        // Every Kiri subcommand prints usage to stdout and exits 0 on `--help` and `-h` with zero side effects.
+        let mut subcommands: Vec<&[&str]> = vec![
+            &["daemon"],
+            &["start"],
+            &["share"],
+            &["3000"],
+            &["build-with"],
+            &["domains"],
+            &["doctor"],
+            &["storage"],
+            &["storage", "reclaim"],
+            &["registry"],
+            &["registry", "insecure"],
+            &["scan"],
+            &["k8s"],
+            &["k8s", "set"],
+            &["machine"],
+            &["machine", "create"],
+            &["machine", "shell"],
+            &["usb"],
+            &["usb", "attach"],
+            &["diag"],
+            &["diag", "logs"],
+            &["diag", "report"],
+        ];
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            subcommands.extend([&["ui"][..], &["update"]]);
+        }
+        #[cfg(unix)]
+        {
+            subcommands.extend([
+                &["raw"][..],
+                &["raw", "run"],
+                &["raw", "pull"],
+                &["raw", "images"],
+                &["raw", "rmi"],
+            ]);
+        }
+        #[cfg(any(target_os = "macos", windows))]
+        {
+            subcommands.extend([&["setup"][..], &["import"]]);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            subcommands.extend([&["vm"][..], &["vm", "set"], &["bench"], &["boot"]]);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            subcommands.extend([&["bridge"][..], &["hostrelay"], &["host-access"]]);
+        }
+        for sub in subcommands {
+            for flag in ["--help", "-h"] {
+                let mut argv: Vec<&str> = sub.to_vec();
+                argv.push(flag);
+                let out = run_kiri(&argv);
+                assert!(
+                    out.status.success(),
+                    "`kiri {}` exited {:?}, stderr: {}",
+                    argv.join(" "),
+                    out.status.code(),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                assert!(
+                    out.stderr.is_empty(),
+                    "`kiri {}` wrote unexpected stderr: {}",
+                    argv.join(" "),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                assert!(
+                    stdout.starts_with("usage: kiri "),
+                    "`kiri {}` stdout did not start with usage: {stdout:?}",
+                    argv.join(" ")
+                );
+            }
+        }
     }
 }
