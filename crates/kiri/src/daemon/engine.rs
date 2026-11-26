@@ -1074,9 +1074,8 @@ impl Drop for StartGuard {
 pub struct Container {
     /// Serializes start with stop/kill/remove through guest creation.
     lifecycle: Arc<Mutex<u64>>,
-    /// Orders the changes to the container's DNS names in the guest: a
-    /// rename, a network joined and one left each read the names and tell
-    /// the guest under it, so none is applied over another's.
+    /// Orders DNS, network attachment and port-forward changes for this
+    /// container across start, rename, connect, disconnect and port updates.
     names_sync: Arc<Mutex<()>>,
     /// See `StartGate`.
     start_gate: Arc<StartGate>,
@@ -1354,6 +1353,34 @@ fn rebind_bindings(ports: &[super::ports::Binding], bound: &[(super::ports::Bind
             super::ports::Binding { host_port, ..b.clone() }
         })
         .collect()
+}
+
+/// Restores the request identity after rebinding to allocated host ports.
+/// The address and port reported by the listener stay as bound.
+fn restore_binding_host_ports(
+    requested: &[super::ports::Binding],
+    effective: &[super::ports::Binding],
+    bound: &mut [(super::ports::Binding, String, u16)],
+) {
+    for (binding, ..) in bound {
+        if let Some((original, _)) = requested.iter().zip(effective).find(|(_, effective)| *effective == &*binding) {
+            binding.host_port = original.host_port;
+        }
+    }
+}
+
+/// The host address a container's published ports without one of their own
+/// bind on `net` (its `host_binding_ipv4`); None off bridge networks or when
+/// every binding names its address. A bad stored value is an error, never
+/// every address.
+fn bridge_host_binding(net: Option<&super::network::Network>, ports: &[super::ports::Binding]) -> Result<Option<std::net::IpAddr>, String> {
+    if !ports.iter().any(|b| b.host_ip.is_empty()) {
+        return Ok(None);
+    }
+    match net {
+        Some(n) if n.driver == "bridge" => n.host_binding_ip(),
+        _ => Ok(None),
+    }
 }
 
 /// The guest IPv4 address that host-side port forwards for a running container
@@ -2337,7 +2364,7 @@ impl Engine {
                     continue;
                 }
                 let b = super::ports::Binding { container_port: port, proto: proto.clone(), host_ip: host_ip.into(), host_port: port };
-                match super::ports::start(vm.clone(), &format!("lb-{port}-{proto}"), &[b], ip) {
+                match super::ports::start(vm.clone(), &format!("lb-{port}-{proto}"), &[b], ip, None) {
                     Ok(fw) => {
                         crate::diag::info!("Kubernetes service published", at = format!("{host_ip}:{port}/{proto}"));
                         lb.insert((port, proto), fw);
@@ -2382,7 +2409,7 @@ impl Engine {
         self.route_k8s(node);
         let vm = self.vm()?;
         let b = super::ports::Binding { container_port: port, proto: "tcp".into(), host_ip: "127.0.0.1".into(), host_port: 0 };
-        let fw = super::ports::start(vm.clone(), &format!("k8s-share-{port}"), &[b], ip)?;
+        let fw = super::ports::start(vm.clone(), &format!("k8s-share-{port}"), &[b], ip, None)?;
         let mac = fw.bound.first().map(|(_, _, p)| *p).unwrap_or(0);
         crate::diag::info!("Kubernetes address forwarded for sharing", to = format!("{}:{port}", std::net::Ipv4Addr::from(ip)), at = format!("127.0.0.1:{mac}"));
         let mut forwards = self.k8s_fwd.lock().unwrap_or_else(|e| e.into_inner());
@@ -3856,7 +3883,7 @@ impl Engine {
         resolve(&st, key)
     }
 
-    /// The lock that orders a container's DNS name changes (see `names_sync`).
+    /// The lock that orders a container's network changes (see `names_sync`).
     fn names_sync(&self, id: &str) -> Option<Arc<Mutex<()>>> {
         self.lock().containers.get(id).map(|c| c.names_sync.clone())
     }
@@ -4058,6 +4085,14 @@ impl Engine {
                 return Err(e);
             }
         };
+        let host_binding = match bridge_host_binding(net.as_ref(), &spec.ports) {
+            Ok(d) => d,
+            Err(e) => {
+                let e = Error::BadRequest(e);
+                self.fail_start(&id, &spec, &e);
+                return Err(e);
+            }
+        };
         let mut dns_names: Vec<String> = Vec::new();
         let mut net6_opts: Vec<String> = Vec::new();
         let (bridge, ip, prefix, gateway) = match net.as_ref().map(|n| n.driver.as_str()) {
@@ -4255,8 +4290,10 @@ impl Engine {
             }
             return Err(cancelled_start_error(gate.0.cancelled_by(), &id).unwrap_or(Error::Io(e)));
         }
-        // Before anything below, which may itself exec (a health probe),
-        // and after the pid is set.
+        // Order the remaining network setup against operations waiting on
+        // the start gate, which opens after the pid is set.
+        let sync = self.names_sync(&id);
+        let order = sync.as_ref().map(|m| m.lock().unwrap_or_else(|e| e.into_inner()));
         drop(gate);
         if let (true, Some((rows, cols))) = (spec.tty, size) {
             let _ = vm.resize(&id, rows, cols);
@@ -4264,8 +4301,6 @@ impl Engine {
         if flags & (run_flags::NET_HOST | run_flags::NET_NONE) == 0 && joined.is_none() {
             for (i, extra) in spec.extra_networks.iter().enumerate() {
                 let n = i as u32 + 1;
-                let sync = self.names_sync(&id);
-                let _order = sync.as_ref().map(|m| m.lock().unwrap_or_else(|e| e.into_inner()));
                 match self.attach_network(&vm, &id, n, extra, false) {
                     Ok((net, ip, ip6)) => {
                         if let Some(c) = self.lock().containers.get_mut(&id) {
@@ -4296,7 +4331,7 @@ impl Engine {
         if !spec.ports.is_empty()
             && let Some(target) = port_forward_target(forward_mode, Some(ip), cfg!(target_os = "linux"))
         {
-            match super::ports::start(vm.clone(), &id, &spec.ports, target) {
+            match super::ports::start(vm.clone(), &id, &spec.ports, target, host_binding) {
                 Ok(fw) => {
                     let mut st = self.lock();
                     if let Some(c) = st.containers.get_mut(&id).filter(|c| c.status == Status::Running && !vm.is_disconnected()) {
@@ -4318,6 +4353,7 @@ impl Engine {
                 }
             }
         }
+        drop(order);
         if vm.is_disconnected() {
             self.fail_start(&id, &spec, &"the VM stopped");
             return Err(Error::Io(io::Error::other("the VM stopped")));
@@ -5143,12 +5179,13 @@ impl Engine {
         let vm = self.vm()?;
         let (attached_net, ip, ip6) = self.attach_network(&vm, &id, n, &extra, was_left_all)?;
         let fw = if was_left_all && !ports.is_empty() {
-            match super::ports::start(vm.clone(), &id, &ports, ip) {
+            let started = bridge_host_binding(Some(&attached_net), &ports).map_err(Error::BadRequest).and_then(|d| super::ports::start(vm.clone(), &id, &ports, ip, d).map_err(|e| Error::Conflict(e.to_string())));
+            match started {
                 Ok(fw) => Some(fw),
                 Err(e) => {
                     let _ = vm.net_detach(&id, n, &attached_net.bridge, ip);
                     self.release_attached_ips(&attached_net.name, Some(ip), ip6);
-                    return Err(Error::Conflict(e.to_string()));
+                    return Err(e);
                 }
             }
         } else {
@@ -5206,6 +5243,7 @@ impl Engine {
                 ip6: Option<[u8; 16]>,
                 old_fw: Option<super::ports::Forwards>,
                 rebind_ports: Vec<super::ports::Binding>,
+                rebind_default: Result<Option<std::net::IpAddr>, String>,
                 new_target: Option<[u8; 4]>,
                 running: bool,
             },
@@ -5225,6 +5263,8 @@ impl Engine {
                 let n = c.first_if.take();
                 let nets = self.lock_networks();
                 c.spec.leave_first_network(|name| nets.find(name).is_some_and(|n| n.internal));
+                // The network the ports move to, not the one left.
+                let promoted_net = (!c.spec.left_all_networks).then(|| nets.find(&c.spec.network_mode).cloned()).flatten();
                 drop(nets);
                 if !c.spec.left_all_networks {
                     let promoted = c.spec.network_mode.clone();
@@ -5245,7 +5285,8 @@ impl Engine {
                     Some(fw) if running && new_target.is_some() && !c.spec.ports.is_empty() => rebind_bindings(&c.spec.ports, &fw.bound),
                     _ => Vec::new(),
                 };
-                Detached::First { n, ip, ip6, old_fw, rebind_ports, new_target, running }
+                let rebind_default = bridge_host_binding(promoted_net.as_ref(), &rebind_ports);
+                Detached::First { n, ip, ip6, old_fw, rebind_ports, rebind_default, new_target, running }
             } else {
                 let Some(pos) = c.spec.extra_networks.iter().position(|x| x.name == net.name) else {
                     return Err(Error::NotFound(format!("container {} is not connected to network {}", &id[..12], net.name)));
@@ -5274,7 +5315,7 @@ impl Engine {
                     unplugged?;
                 }
             }
-            Detached::First { n, ip, ip6, old_fw, rebind_ports, new_target, running } => {
+            Detached::First { n, ip, ip6, old_fw, rebind_ports, rebind_default, new_target, running } => {
                 // Closing listeners joins their threads: never under self.lock().
                 drop(old_fw);
                 let unplugged = match (self.awake(), n, ip) {
@@ -5287,10 +5328,11 @@ impl Engine {
                     && !rebind_ports.is_empty()
                     && let (Some(vm), Some(target)) = (self.awake(), new_target)
                 {
-                    match super::ports::start(vm.clone(), &id, &rebind_ports, target) {
-                        Ok(fw) => {
+                    match rebind_default.map_err(io::Error::other).and_then(|d| super::ports::start(vm.clone(), &id, &rebind_ports, target, d)) {
+                        Ok(mut fw) => {
                             let mut st = self.lock();
                             if let Some(c) = st.containers.get_mut(&id).filter(|c| c.status == Status::Running && c.ip == Some(target) && !vm.is_disconnected()) {
+                                restore_binding_host_ports(&c.spec.ports, &rebind_ports, &mut fw.bound);
                                 c.forwards = Some(fw);
                             } else {
                                 drop(st);
@@ -5414,10 +5456,12 @@ impl Engine {
     /// `docker rename`.
     /// Kiri's own: new published ports for a container. A running one keeps
     /// running: its ports are relays on the Mac, so only they are replaced.
-    /// If the new ones cannot be bound, the old ones are put back.
+    /// If the new ones cannot be bound, try to restore the old listeners.
     pub fn set_ports(&self, key: &str, ports: Vec<super::ports::Binding>) -> Result<(), Error> {
-        let id = self.resolve(key)?;
-        let (old_ports, old_fw, running, target) = {
+        let id = self.resolve_after_start(key)?;
+        let sync = self.names_sync(&id).ok_or_else(|| gone(&id))?;
+        let _order = sync.lock().unwrap_or_else(|e| e.into_inner());
+        let (old_ports, mut old_fw, forwarding) = {
             let mut st = self.lock();
             let c = st.containers.get_mut(&id).ok_or_else(|| gone(&id))?;
             if c.spec.network_mode == "none" && !ports.is_empty() {
@@ -5427,17 +5471,26 @@ impl Engine {
                 return Err(Error::BadRequest("conflicting options: port publishing and the container type network mode".into()));
             }
             let target = port_forward_target(&c.spec.network_mode, c.ip, cfg!(target_os = "linux"));
+            // One snapshot of the network the ports forward into, for the new
+            // ports and the old ones put back. State, then networks.
+            let forwarding = if c.status == Status::Running && !ports.is_empty() && let Some(target) = target {
+                let nets = self.lock_networks();
+                let net = nets.find(&c.spec.network_mode);
+                let new_default = bridge_host_binding(net, &ports).map_err(Error::BadRequest)?;
+                let old_default = bridge_host_binding(net, &c.spec.ports);
+                Some((target, new_default, old_default))
+            } else {
+                None
+            };
             let old = std::mem::replace(&mut c.spec.ports, ports.clone());
-            (old, c.forwards.take(), c.status == Status::Running, target)
+            (old, c.forwards.take(), forwarding)
         };
+        let old_bound = old_fw.as_mut().map(|fw| std::mem::take(&mut fw.bound)).unwrap_or_default();
         // Closing listeners joins their threads: never under the lock.
         drop(old_fw);
-        if running
-            && !ports.is_empty()
-            && let Some(target) = target
-        {
+        if let Some((target, new_default, old_default)) = forwarding {
             let vm = self.vm()?;
-            match super::ports::start(vm.clone(), &id, &ports, target) {
+            match super::ports::start(vm.clone(), &id, &ports, target, new_default) {
                 Ok(fw) => {
                     let mut st = self.lock();
                     let stale = if let Some(c) = st.containers.get_mut(&id).filter(|c| c.status == Status::Running && !vm.is_disconnected()) {
@@ -5449,8 +5502,27 @@ impl Engine {
                     drop(stale);
                 }
                 Err(e) => {
-                    crate::diag::warn!("new ports not published; the old ones are kept", id = &id[..12], error = e);
-                    let back = (!old_ports.is_empty()).then(|| super::ports::start(vm.clone(), &id, &old_ports, target).ok()).flatten();
+                    crate::diag::warn!("new ports not published", id = &id[..12], error = e);
+                    let back = match old_default {
+                        Ok(default) if !old_ports.is_empty() => {
+                            let rebind_ports = rebind_bindings(&old_ports, &old_bound);
+                            match super::ports::start(vm.clone(), &id, &rebind_ports, target, default) {
+                                Ok(mut fw) => {
+                                    restore_binding_host_ports(&old_ports, &rebind_ports, &mut fw.bound);
+                                    Some(fw)
+                                }
+                                Err(e) => {
+                                    crate::diag::warn!("could not rebind old published ports", id = &id[..12], error = e);
+                                    None
+                                }
+                            }
+                        }
+                        Ok(_) => None,
+                        Err(e) => {
+                            crate::diag::warn!("could not restore old published ports with invalid bridge host default", id = &id[..12], error = e);
+                            None
+                        }
+                    };
                     let mut st = self.lock();
                     let stale = if let Some(c) = st.containers.get_mut(&id) {
                         c.spec.ports = old_ports;
@@ -9717,6 +9789,44 @@ mod leave_first_network_tests {
         assert_eq!(rebound.len(), 2);
         assert_eq!(rebound[0].host_port, 49152);
         assert_eq!(rebound[1].host_port, 8443);
+    }
+
+    #[test]
+    fn rebind_bindings_keeps_fixed_and_ephemeral_ports_across_repeat_moves() {
+        let dynamic = super::super::ports::Binding { container_port: 80, proto: "tcp".into(), host_ip: String::new(), host_port: 0 };
+        let fixed = super::super::ports::Binding { host_port: 8080, ..dynamic.clone() };
+        let spec = [fixed.clone(), dynamic.clone()];
+        let initial = [(fixed.clone(), "127.0.0.1".into(), 8080), (dynamic.clone(), "127.0.0.1".into(), 49152)];
+        let first = super::rebind_bindings(&spec, &initial);
+        assert_eq!(first[0], fixed);
+        assert_eq!(first[1].host_port, 49152);
+        assert_eq!(first[1].host_ip, "", "the network default still applies");
+
+        let mut promoted = [(first[0].clone(), "127.0.0.2".into(), 8080), (first[1].clone(), "127.0.0.2".into(), 49152)];
+        super::restore_binding_host_ports(&spec, &first, &mut promoted);
+        assert_eq!(promoted, [(fixed, String::from("127.0.0.2"), 8080), (dynamic, String::from("127.0.0.2"), 49152)]);
+        assert_eq!(super::rebind_bindings(&spec, &promoted), first);
+    }
+
+    /// Only bindings without an address of their own take a bridge network's
+    /// `host_binding_ipv4`, and a bad stored value is an error, not 0.0.0.0.
+    #[test]
+    fn bridge_host_binding_is_read_only_when_a_binding_needs_it() {
+        let b = |ip: &str| super::super::ports::Binding { container_port: 80, proto: "tcp".into(), host_ip: ip.into(), host_port: 8080 };
+        let mut net: super::super::network::Network = serde_json::from_value(serde_json::json!({
+            "id": "x", "name": "lo", "driver": "bridge", "bridge": "kiri1", "subnet": [10, 9, 0, 0], "prefix": 24, "gateway": [10, 9, 0, 1], "created_ns": 0,
+            "options": {super::super::network::HOST_BINDING_OPT: "127.0.0.1"}
+        }))
+        .unwrap();
+        let lo = Some("127.0.0.1".parse().unwrap());
+        assert_eq!(super::bridge_host_binding(Some(&net), &[b("")]), Ok(lo));
+        assert_eq!(super::bridge_host_binding(Some(&net), &[b("0.0.0.0")]), Ok(None));
+        assert_eq!(super::bridge_host_binding(None, &[b("")]), Ok(None));
+        net.options[super::super::network::HOST_BINDING_OPT] = "nope".into();
+        assert!(super::bridge_host_binding(Some(&net), &[b("")]).is_err());
+        assert_eq!(super::bridge_host_binding(Some(&net), &[b("10.0.0.1")]), Ok(None), "unused, so not in the way");
+        net.driver = "host".into();
+        assert_eq!(super::bridge_host_binding(Some(&net), &[b("")]), Ok(None));
     }
 
     #[test]

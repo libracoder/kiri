@@ -176,6 +176,13 @@ impl V6 {
 }
 
 impl Network {
+    /// The host address published ports bind when they name none; checked
+    /// again on use, so a bad value kept by an older Kiri fails rather than
+    /// binding every address.
+    pub fn host_binding_ip(&self) -> Result<Option<std::net::IpAddr>, String> {
+        host_binding_in(&self.options)
+    }
+
     pub fn builtin(&self) -> bool {
         matches!(self.name.as_str(), "bridge" | "host" | "none")
     }
@@ -371,9 +378,24 @@ fn builtin(name: &str, driver: &str, bridge: &str, subnet: [u8; 4], gateway: [u8
 /// than reported and not applied.
 pub const BRIDGE_NAME_OPT: &str = "com.docker.network.bridge.name";
 
+/// `--opt com.docker.network.bridge.host_binding_ipv4=…`: the host address
+/// a published port of this network binds when it names none itself.
+pub const HOST_BINDING_OPT: &str = "com.docker.network.bridge.host_binding_ipv4";
+
+/// The default host address `options` give published ports: None when the
+/// option is absent, an error when it is not an IP address string. An
+/// IPv4-mapped IPv6 address is its IPv4 address.
+pub fn host_binding_in(options: &serde_json::Value) -> Result<Option<std::net::IpAddr>, String> {
+    let Some(v) = options.as_object().and_then(|m| m.get(HOST_BINDING_OPT)) else { return Ok(None) };
+    let bad = || format!("invalid value for network option {HOST_BINDING_OPT}: {v} is not an IP address");
+    let ip = v.as_str().filter(|s| !s.is_empty()).ok_or_else(bad)?.parse::<std::net::IpAddr>().map_err(|_| bad())?;
+    Ok(Some(ip.to_canonical()))
+}
+
 /// The options a network keeps, or why one of them cannot be applied. An
 /// empty bridge name is Docker's "unset" and is dropped.
 fn checked_options(options: serde_json::Value) -> Result<serde_json::Value, String> {
+    host_binding_in(&options)?;
     let serde_json::Value::Object(mut map) = options else { return Ok(serde_json::json!({})) };
     match map.get(BRIDGE_NAME_OPT).map(|v| v.as_str().unwrap_or("?")) {
         None => {}
@@ -1376,6 +1398,29 @@ mod tests {
         assert_eq!(shown_options(&old), made.options);
         old.options[BRIDGE_NAME_OPT] = old.bridge.clone().into();
         assert_eq!(shown_options(&old)[BRIDGE_NAME_OPT], old.bridge.as_str(), "its own name is true");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn host_binding_option_is_checked_and_kept_as_given() {
+        let (mut n, dir) = nets();
+        let opts = |v: serde_json::Value| Settings { options: serde_json::json!({HOST_BINDING_OPT: v}), ..Default::default() };
+        let made = n.create("lo", opts("127.0.0.1".into())).unwrap();
+        assert_eq!(made.options, serde_json::json!({HOST_BINDING_OPT: "127.0.0.1"}));
+        assert_eq!(made.host_binding_ip(), Ok(Some("127.0.0.1".parse().unwrap())));
+        let mapped = n.create("mapped", opts("::ffff:10.0.0.1".into())).unwrap();
+        assert_eq!(mapped.options[HOST_BINDING_OPT], "::ffff:10.0.0.1", "inspect shows what was given");
+        assert_eq!(mapped.host_binding_ip(), Ok(Some("10.0.0.1".parse().unwrap())));
+        assert_eq!(n.create("v6", opts("::1".into())).unwrap().host_binding_ip(), Ok(Some("::1".parse().unwrap())));
+        for bad in [serde_json::json!(""), serde_json::json!("nope"), serde_json::json!("[::1]"), serde_json::json!(" 127.0.0.1"), serde_json::json!(1), serde_json::Value::Null] {
+            let e = n.create("bad", opts(bad.clone())).unwrap_err();
+            assert!(e.contains(HOST_BINDING_OPT), "{bad}: {e}");
+            assert!(n.find("bad").is_none());
+        }
+        assert_eq!(n.create("plain", Settings::default()).unwrap().host_binding_ip(), Ok(None));
+        let mut old = made.clone();
+        old.options[HOST_BINDING_OPT] = "garbage".into();
+        assert!(old.host_binding_ip().is_err(), "a stored bad value fails closed");
         let _ = std::fs::remove_dir_all(dir);
     }
 
