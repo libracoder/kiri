@@ -904,6 +904,7 @@ t ipv6-rm "v6sub" $D network rm v6sub
 $D network rm v6net >/dev/null
 
 section "published ports"
+t publish-bridge-default-host-ip bridge-default-host-ip-ok python3 "$(dirname "$0")/lib/publish-bridge-default-host-ip.py" "$D"
 $D run -d --name pub -p 18180:80 nginx:alpine >/dev/null; ready http://localhost:18180
 t port-curl "Welcome to nginx" curl -s -m 5 http://localhost:18180
 t port-ps "0.0.0.0:18180->80/tcp" $D ps --filter name=pub --format '{{.Ports}}'

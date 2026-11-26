@@ -718,13 +718,16 @@ fn host_addr(ip: &str, port: u16) -> io::Result<SocketAddr> {
     bare.parse::<IpAddr>().map(|a| SocketAddr::new(a, port)).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, format!("bad host address {ip}")))
 }
 
-/// What one binding listens on: its own address, or with no address both
-/// 0.0.0.0 and `::` (the IPv6 one only when the host has IPv6), as Docker
-/// binds them and lists them in `docker port`.
-fn listen_addrs(b: &Binding) -> Vec<(String, bool)> {
-    match b.host_ip.as_str() {
-        "" => vec![("0.0.0.0".to_owned(), true), ("::".to_owned(), false)],
-        ip => vec![(ip.strip_prefix('[').and_then(|i| i.strip_suffix(']')).unwrap_or(ip).to_owned(), true)],
+/// What one binding listens on: its own address, or with no address the
+/// network's default (`host_binding_ipv4`), or with neither (or a default of
+/// 0.0.0.0) both 0.0.0.0 and `::` (the IPv6 one only when the host has
+/// IPv6), as Docker binds them and lists them in `docker port`. A default
+/// of `::` binds IPv6 alone; any other address binds only itself.
+fn listen_addrs(b: &Binding, default: Option<IpAddr>) -> Vec<(String, bool)> {
+    match (b.host_ip.as_str(), default) {
+        ("", Some(ip)) if ip != IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED) => vec![(ip.to_string(), true)],
+        ("", _) => vec![("0.0.0.0".to_owned(), true), ("::".to_owned(), false)],
+        (ip, _) => vec![(ip.strip_prefix('[').and_then(|i| i.strip_suffix(']')).unwrap_or(ip).to_owned(), true)],
     }
 }
 
@@ -970,8 +973,9 @@ fn publish_linux_host<T, U>(
 }
 
 /// Binds every port first (so a clash fails the start cleanly), then starts
-/// one accept thread per listener.
-pub fn start(vm: Arc<VmLink>, id: &str, bindings: &[Binding], target_ip: [u8; 4]) -> io::Result<Forwards> {
+/// one accept thread per listener. `default_ip` is the address a binding
+/// with none of its own listens on (the network's `host_binding_ipv4`).
+pub fn start(vm: Arc<VmLink>, id: &str, bindings: &[Binding], target_ip: [u8; 4], default_ip: Option<IpAddr>) -> io::Result<Forwards> {
     let in_wsl = super::binds::wsl().is_some();
     // In WSL 2 NAT mode, `wsl_ipv4()` is WSL's dedicated internal `eth0` IP.
     // In mirrored/bridged mode, `wsl_ipv4()` is itself one of the Windows host
@@ -988,7 +992,7 @@ pub fn start(vm: Arc<VmLink>, id: &str, bindings: &[Binding], target_ip: [u8; 4]
         // A port picked by the kernel (0) is picked once: the `::` listener
         // takes the one 0.0.0.0 got.
         let mut port = b.host_port;
-        for (ip, required) in listen_addrs(b) {
+        for (ip, required) in listen_addrs(b, default_ip) {
             let addr = host_addr(&ip, port)?;
             let taken = |e: io::Error| {
                 let shown = if addr.is_ipv6() { format!("[{ip}]") } else { ip.clone() };
@@ -3523,6 +3527,24 @@ mod tests {
     use super::{MAX_PEER_SESSIONS, MAX_REMOTE_SESSIONS, MAX_TCP_SESSIONS, NAT_PORTS, REMOTE_SESSIONS, TCP_SESSIONS, dial_loopback, host_bound_allowed, kernel_forwards, kernel_host_ip, listening, nat_port, relays_too, tcp_permit};
     use std::net::IpAddr;
     use std::sync::atomic::Ordering;
+
+    /// A network's `host_binding_ipv4` is used only by a binding that names
+    /// no address: an explicit one (0.0.0.0 too) wins; 0.0.0.0 as the default
+    /// is the usual dual-stack wildcard; `::` is IPv6 alone.
+    #[test]
+    fn the_network_default_host_address_applies_only_to_bindings_without_one() {
+        let b = |ip: &str| super::Binding { container_port: 80, proto: "tcp".into(), host_ip: ip.into(), host_port: 8080 };
+        let ip = |s: &str| Some(s.parse::<IpAddr>().unwrap());
+        let both = vec![("0.0.0.0".to_owned(), true), ("::".to_owned(), false)];
+        assert_eq!(super::listen_addrs(&b(""), None), both);
+        assert_eq!(super::listen_addrs(&b(""), ip("0.0.0.0")), both);
+        assert_eq!(super::listen_addrs(&b(""), ip("127.0.0.1")), vec![("127.0.0.1".to_owned(), true)]);
+        assert_eq!(super::listen_addrs(&b(""), ip("::")), vec![("::".to_owned(), true)]);
+        assert_eq!(super::listen_addrs(&b(""), ip("::1")), vec![("::1".to_owned(), true)]);
+        assert_eq!(super::listen_addrs(&b("0.0.0.0"), ip("127.0.0.1")), vec![("0.0.0.0".to_owned(), true)]);
+        assert_eq!(super::listen_addrs(&b("[::1]"), ip("127.0.0.1")), vec![("::1".to_owned(), true)]);
+        assert_eq!(super::listen_addrs(&b("10.0.0.2"), None), vec![("10.0.0.2".to_owned(), true)]);
+    }
 
     /// host.docker.internal reaches the Mac's loopback, but never the
     /// container-domain router there: its Host header would take a container

@@ -18,6 +18,7 @@ pid-container-unknown	#588	--pid container:missing was not refused with Docker's
 bridge-name-refused	#588	a network's own bridge name was reported but never applied (#423)
 bridge-name-nothing-made	#588	a refused bridge name still made the network (#423)
 bridge-name-empty	#588	an empty bridge name, Docker's unset, must still be accepted (#423)
+publish-bridge-default-host-ip	#125	dynamically published TCP and UDP ports ignored the bridge's default host binding address
 port-exposed-null	#588	an exposed port that is not published was missing from inspect, so Traefik found no port (#492)
 port-exposed-stopped	#588	a stopped container's exposed ports were shown wrongly in inspect (#492)
 volumes-from-running	#588	--volumes-from was accepted and ignored (#450)
