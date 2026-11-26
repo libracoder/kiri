@@ -221,44 +221,83 @@ pub fn add_net_defaults(sysctls: &mut Vec<Sysctl>) {
     sysctls.splice(0..0, mine);
 }
 
+thread_local! {
+    static OWN_NS: std::cell::RefCell<[Option<(fs::File, (u64, u64))>; 3]> = const { std::cell::RefCell::new([None, None, None]) };
+}
+
+fn own_ns_entry(ns: Ns) -> io::Result<(std::os::fd::RawFd, (u64, u64))> {
+    let (slot, name) = match ns {
+        Ns::Net => (0, "net"),
+        Ns::Ipc => (1, "ipc"),
+        Ns::Uts => (2, "uts"),
+    };
+    OWN_NS.with(|arr| {
+        let mut arr = arr.borrow_mut();
+        if let Some((f, id)) = &arr[slot] {
+            return Ok((f.as_raw_fd(), *id));
+        }
+        let f = fs::File::open(format!("/proc/self/ns/{name}"))?;
+        let m = f.metadata()?;
+        let id = (m.dev(), m.ino());
+        let raw = f.as_raw_fd();
+        arr[slot] = Some((f, id));
+        Ok((raw, id))
+    })
+}
+
 /// Writes the sysctls from the agent, inside the container's namespaces:
 /// /proc/sys shows the calling task's network, IPC and UTS namespace, so
 /// the agent joins the one each key belongs to, writes, and comes back.
 /// Runs after the network is set up, so per-interface keys (eth0) exist.
-pub fn apply_sysctls(pid: libc::pid_t, sysctls: &[Sysctl]) -> io::Result<()> {
-    for s in sysctls {
-        let (name, kind) = match s.ns {
+pub fn apply_sysctls(pid: libc::pid_t, netns: Option<&fs::File>, sysctls: &[Sysctl]) -> io::Result<()> {
+    let mut i = 0;
+    while i < sysctls.len() {
+        let ns = sysctls[i].ns;
+        let mut end = i + 1;
+        while end < sysctls.len() && sysctls[end].ns == ns {
+            end += 1;
+        }
+        let (name, kind) = match ns {
             Ns::Net => ("net", libc::CLONE_NEWNET),
             Ns::Ipc => ("ipc", libc::CLONE_NEWIPC),
             Ns::Uts => ("uts", libc::CLONE_NEWUTS),
         };
-        let own = fs::File::open(format!("/proc/self/ns/{name}"))?;
-        let theirs = fs::File::open(format!("/proc/{pid}/ns/{name}"))?;
+        let (own_fd, own_id) = own_ns_entry(ns)?;
+        let opened;
+        let theirs = match (ns, netns) {
+            (Ns::Net, Some(f)) => f,
+            _ => {
+                opened = fs::File::open(format!("/proc/{pid}/ns/{name}"))?;
+                &opened
+            }
+        };
+        let tm = theirs.metadata()?;
         // The container shares the agent's own namespace (host network,
         // directly or through `--network container:`): the key would change
         // the whole VM or Linux host. The daemon refuses this first.
-        if same_namespace(&own, &theirs)? {
+        if (tm.dev(), tm.ino()) == own_id {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                format!("sysctl {:?} not allowed in host {name} namespace", s.path.replace('/', ".")),
+                format!("sysctl {:?} not allowed in host {name} namespace", sysctls[i].path.replace('/', ".")),
             ));
         }
         sys::setns(theirs.as_raw_fd(), kind)?;
-        let written = fs::write(format!("/proc/sys/{}", s.path), &s.value);
+        let mut result = Ok(());
+        for s in &sysctls[i..end] {
+            if let Err(e) = fs::write(format!("/proc/sys/{}", s.path), &s.value) {
+                result = Err(io::Error::new(e.kind(), format!("write sysctl key {}: {}", s.path.replace('/', "."), errno_text(&e))));
+                break;
+            }
+        }
         // Coming back must work, or the agent itself is in the container.
-        if let Err(e) = sys::setns(own.as_raw_fd(), kind) {
+        if let Err(e) = sys::setns(own_fd, kind) {
             eprintln!("kiri-init: cannot leave a container's {name} namespace: {e}");
             std::process::abort();
         }
-        written.map_err(|e| io::Error::new(e.kind(), format!("write sysctl key {}: {}", s.path.replace('/', "."), errno_text(&e))))?;
+        result?;
+        i = end;
     }
     Ok(())
-}
-
-/// Two /proc/*/ns files name the same namespace when their inodes match.
-fn same_namespace(a: &fs::File, b: &fs::File) -> io::Result<bool> {
-    let (a, b) = (a.metadata()?, b.metadata()?);
-    Ok((a.dev(), a.ino()) == (b.dev(), b.ino()))
 }
 
 /// The limits the engine's agent sets on itself as it starts, before it
@@ -453,11 +492,13 @@ mod tests {
     fn own_namespace_is_refused() {
         // A "container" that is this very process shares every namespace.
         let me = std::process::id() as libc::pid_t;
-        let own = fs::File::open("/proc/self/ns/net").unwrap();
-        assert!(same_namespace(&own, &fs::File::open(format!("/proc/{me}/ns/net")).unwrap()).unwrap());
-        assert!(!same_namespace(&own, &fs::File::open("/proc/self/ns/ipc").unwrap()).unwrap());
+        let (_, own_net) = own_ns_entry(Ns::Net).unwrap();
+        let me_net = fs::File::open(format!("/proc/{me}/ns/net")).unwrap().metadata().unwrap();
+        let me_ipc = fs::File::open("/proc/self/ns/ipc").unwrap().metadata().unwrap();
+        assert_eq!(own_net, (me_net.dev(), me_net.ino()));
+        assert_ne!(own_net, (me_ipc.dev(), me_ipc.ino()));
         let s = Sysctl { ns: Ns::Net, path: "net/ipv4/ip_unprivileged_port_start".into(), value: "77".into() };
-        let e = apply_sysctls(me, &[s]).unwrap_err();
+        let e = apply_sysctls(me, None, &[s]).unwrap_err();
         assert_eq!(e.to_string(), "sysctl \"net.ipv4.ip_unprivileged_port_start\" not allowed in host net namespace");
     }
 }

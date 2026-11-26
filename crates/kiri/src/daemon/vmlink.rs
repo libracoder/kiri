@@ -79,6 +79,9 @@ pub struct VmLink {
     /// The guest's latest `Usage` lines, for `usage`.
     usage: Arc<UsageSlot>,
     pending: Arc<Mutex<VecDeque<SyncSender<Reply>>>>,
+    /// Layer digests confirmed unpacked in this guest instance, avoiding
+    /// repeated `LayerQuery` round-trips across `create` and `start`.
+    layers: Mutex<std::collections::HashSet<String>>,
     /// Kept so the VM lives as long as the link. Behind a mutex only so the
     /// link can be shared between threads; nothing touches it after boot.
     _vm: Mutex<Vm>,
@@ -345,6 +348,7 @@ impl VmLink {
             agent_dir: vm.agent_dir().to_owned(),
             writer: Mutex::new(Writer { conn, out: Vec::with_capacity(4096), blob: vec![0; 256 * 1024] }),
             pending,
+            layers: Mutex::new(std::collections::HashSet::new()),
             windows,
             usage,
             connector: vm.connector(),
@@ -401,8 +405,16 @@ impl VmLink {
     }
 
     pub fn has_layer(&self, digest: &str) -> io::Result<bool> {
+        if self.layers.lock().unwrap_or_else(|e| e.into_inner()).contains(digest) {
+            return Ok(true);
+        }
         match self.call(|o| Msg::LayerQuery(digest).encode(o), None)? {
-            Reply::LayerStatus(have) => Ok(have),
+            Reply::LayerStatus(have) => {
+                if have {
+                    self.layers.lock().unwrap_or_else(|e| e.into_inner()).insert(digest.to_owned());
+                }
+                Ok(have)
+            }
             other => Err(io::Error::other(format!("expected LayerStatus, got {other:?}"))),
         }
     }
@@ -412,8 +424,9 @@ impl VmLink {
         // fails here rather than half-way through the request.
         let file = File::open(blob)?;
         let size = file.metadata()?.len();
-        self.call(|o| Msg::LayerBegin(LayerBegin { digest, media_type, size }).encode(o), Some((file, size)))
-            .map(drop)
+        self.call(|o| Msg::LayerBegin(LayerBegin { digest, media_type, size }).encode(o), Some((file, size)))?;
+        self.layers.lock().unwrap_or_else(|e| e.into_inner()).insert(digest.to_owned());
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -638,6 +651,10 @@ impl VmLink {
 
     /// Tells the guest which unpacked layers are still used; it deletes the rest.
     pub fn retain_layers(&self, digests: &[String]) -> io::Result<()> {
+        {
+            let keep: std::collections::HashSet<&str> = digests.iter().map(String::as_str).collect();
+            self.layers.lock().unwrap_or_else(|e| e.into_inner()).retain(|d| keep.contains(d.as_str()));
+        }
         self.send(|o| kiri_proto::encode_retain_layers(o, digests))
     }
 

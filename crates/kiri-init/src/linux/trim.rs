@@ -84,8 +84,10 @@ pub(super) fn trim(mountpoint: &str) -> io::Result<u64> {
 }
 
 /// Reports `(in_use, capacity)` in bytes for the filesystem mounted at
-/// `mountpoint`, using `statvfs` (`in_use = (blocks - bavail) * frsize`,
-/// `capacity = blocks * frsize`).
+/// `mountpoint`, using `statvfs` (`in_use = (blocks - bfree) * frsize`,
+/// `capacity = blocks * frsize`). Uses `f_bfree` rather than `f_bavail`
+/// because `FITRIM` discards free blocks (`f_bfree`), never root-reserved
+/// non-free blocks.
 pub(super) fn stat(mountpoint: &str) -> io::Result<(u64, u64)> {
     let path = std::ffi::CString::new(mountpoint).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
     // SAFETY: statvfs fills a zero-initialized struct for a valid NUL-terminated path.
@@ -95,8 +97,8 @@ pub(super) fn stat(mountpoint: &str) -> io::Result<(u64, u64)> {
     }
     let frsize = if s.f_frsize > 0 { s.f_frsize as u64 } else { s.f_bsize as u64 };
     let blocks = s.f_blocks as u64;
-    let bavail = s.f_bavail as u64;
-    let in_use = blocks.saturating_sub(bavail).saturating_mul(frsize);
+    let bfree = s.f_bfree as u64;
+    let in_use = blocks.saturating_sub(bfree).saturating_mul(frsize);
     let capacity = blocks.saturating_mul(frsize);
     Ok((in_use, capacity))
 }

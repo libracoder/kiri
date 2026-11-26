@@ -1110,10 +1110,11 @@ fn mac_of(name: &str) -> io::Result<[u8; 6]> {
 type Bridge6 = Option<([u8; 16], u8)>;
 
 /// Bridges that exist so far: name → (index, gateway (none when
-/// IPv6-only), prefix, IPv6).
+/// IPv6-only), prefix, IPv6), plus a persistent host `NETLINK_ROUTE` socket.
 #[derive(Default)]
 pub struct Bridges {
     made: HashMap<String, (i32, Option<[u8; 4]>, u8, Bridge6)>,
+    route: Option<Netlink>,
 }
 
 /// What `Bridges::ensure` needs to do for a bridge given its cached state.
@@ -1131,6 +1132,13 @@ enum BridgePlan {
 }
 
 impl Bridges {
+    fn route_nl(&mut self) -> io::Result<&mut Netlink> {
+        if self.route.is_none() {
+            self.route = Some(Netlink::open(libc::NETLINK_ROUTE)?);
+        }
+        Ok(self.route.as_mut().expect("opened above"))
+    }
+
     /// Whether `name` currently exists with an IPv6 subnet configured.
     pub fn has_ipv6(&self, name: &str) -> bool {
         matches!(self.made.get(name), Some((.., Some(_))))
@@ -1359,6 +1367,7 @@ pub fn attach_container(
     bridge: &str,
     host_ifname: &str,
     pid: libc::pid_t,
+    netns: Option<&std::fs::File>,
     ip: [u8; 4],
     prefix: u8,
     gateway: [u8; 4],
@@ -1366,7 +1375,7 @@ pub fn attach_container(
     v6: Option<Ip6>,
     plug: Plug,
 ) -> io::Result<()> {
-    attach(bridges, bridge, host_ifname, pid, 0, ip, prefix, gateway, mac, v6, plug)
+    attach_with_ns(bridges, bridge, host_ifname, pid, netns, 0, ip, prefix, gateway, mac, v6, plug)
 }
 
 /// Plugs the container into `bridge` as `eth{n}`. The first non-internal
@@ -1381,31 +1390,73 @@ pub fn attach_container(
 /// MAC is made from it): neither the interface nor the bridge gets it.
 #[allow(clippy::too_many_arguments)]
 pub fn attach(bridges: &mut Bridges, bridge: &str, host_ifname: &str, pid: libc::pid_t, n: u32, ip: [u8; 4], prefix: u8, gateway: [u8; 4], mac: Option<[u8; 6]>, v6: Option<Ip6>, plug: Plug) -> io::Result<()> {
+    attach_with_ns(bridges, bridge, host_ifname, pid, None, n, ip, prefix, gateway, mac, v6, plug)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn attach_with_ns(
+    bridges: &mut Bridges,
+    bridge: &str,
+    host_ifname: &str,
+    pid: libc::pid_t,
+    netns_fd: Option<&std::fs::File>,
+    n: u32,
+    ip: [u8; 4],
+    prefix: u8,
+    gateway: [u8; 4],
+    mac: Option<[u8; 6]>,
+    v6: Option<Ip6>,
+    plug: Plug,
+) -> io::Result<()> {
     let Plug { internal, no_ipv4 } = plug;
     let mac = Some(mac.unwrap_or_else(|| mac_for(ip)));
     let bridge_index = bridges.ensure(bridge, (!no_ipv4).then_some(gateway), prefix, v6)?;
-    let netns = std::fs::File::open(format!("/proc/{pid}/ns/net"))?;
-    let mut host = Netlink::open(libc::NETLINK_ROUTE)?;
-    // A stopped container's veth may still hold this address and MAC.
-    delete_retired(&mut host);
+    let opened_ns;
+    let netns = match netns_fd {
+        Some(f) => f,
+        None => {
+            opened_ns = std::fs::File::open(format!("/proc/{pid}/ns/net"))?;
+            &opened_ns
+        }
+    };
     let ifname = format!("eth{n}");
-    netlink::create_veth(&mut host, host_ifname, bridge_index, &netns, CONTAINER_MTU, &ifname, mac)?;
-    // By name: a new namespace may have tunl0, gre0 … before it.
-    let index = netlink::index_in(&netns, &ifname)?;
-    if v6.is_none() {
-        // Before it is up, so it never gets a link-local address. A kernel
-        // without IPv6 has no such file, and nothing to turn off.
-        let _ = netlink::in_netns(&netns, || sys::write_file(&format!("/proc/sys/net/ipv6/conf/{ifname}/disable_ipv6"), "1"));
+    {
+        let host = bridges.route_nl()?;
+        // A stopped container's veth may still hold this address and MAC.
+        delete_retired(host);
+        netlink::create_veth(host, host_ifname, bridge_index, netns, CONTAINER_MTU, &ifname, mac)?;
     }
-    let mut inner = Netlink::open_in(&netns)?;
-    netlink::set_up(&mut inner, 1)?; // lo
-    if !no_ipv4 {
-        netlink::add_address(&mut inner, index, ip, prefix)?;
+    // Enter the container's network namespace once to resolve the peer index,
+    // disable IPv6 link-local when IPv6 is off, and open the inner route socket.
+    let (index, mut inner) = netlink::in_netns(netns, || {
+        let idx = netlink::index_of(&ifname)?;
+        if v6.is_none() {
+            let _ = sys::write_file(&format!("/proc/sys/net/ipv6/conf/{ifname}/disable_ipv6"), "1");
+        }
+        let nl = Netlink::open(libc::NETLINK_ROUTE)?;
+        Ok((idx, nl))
+    })?;
+    if n == 0 {
+        let mut batch = Vec::with_capacity(4);
+        batch.push(netlink::set_up_msg(1)); // lo
+        if !no_ipv4 {
+            batch.push(netlink::add_address_msg(index, ip, prefix));
+        }
+        if let Some(v) = v6 {
+            batch.push(netlink::add_address6_msg(index, v.ip, v.prefix));
+        }
+        batch.push(netlink::set_up_msg(index));
+        inner.request(&mut batch)?;
+    } else {
+        netlink::set_up(&mut inner, 1)?; // lo
+        if !no_ipv4 {
+            netlink::add_address(&mut inner, index, ip, prefix)?;
+        }
+        if let Some(v) = v6 {
+            netlink::add_address6(&mut inner, index, v.ip, v.prefix)?;
+        }
+        netlink::set_up(&mut inner, index)?;
     }
-    if let Some(v) = v6 {
-        netlink::add_address6(&mut inner, index, v.ip, v.prefix)?;
-    }
-    netlink::set_up(&mut inner, index)?;
     if !internal && !no_ipv4 {
         netlink::add_default_route(&mut inner, index, gateway)?;
     }
@@ -1417,6 +1468,7 @@ pub fn attach(bridges: &mut Bridges, bridge: &str, host_ifname: &str, pid: libc:
 
 /// Host-side veths of stopped containers, deleted by the next `attach`.
 static RETIRED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+static HAS_RETIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Notes a stopped container's host-side veths for the next `attach` to
 /// delete. Deleting one waits out RCU, 15-40 ms that every request after
@@ -1427,12 +1479,19 @@ static RETIRED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new()
 /// to the old namespace, and that answered with resets (a download that
 /// broke mid-TLS or stalled).
 pub fn retire(veths: &[String]) {
+    if veths.is_empty() {
+        return;
+    }
     RETIRED.lock().unwrap_or_else(|e| e.into_inner()).extend_from_slice(veths);
+    HAS_RETIRED.store(true, std::sync::atomic::Ordering::Release);
 }
 
 /// Deletes the veths `retire` noted. Gone already (the kernel took them
 /// with their namespace) is fine.
 fn delete_retired(nl: &mut Netlink) {
+    if !HAS_RETIRED.swap(false, std::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
     for v in std::mem::take(&mut *RETIRED.lock().unwrap_or_else(|e| e.into_inner())) {
         let _ = netlink::delete_link(nl, &v);
     }

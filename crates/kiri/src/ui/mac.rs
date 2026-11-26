@@ -13,8 +13,8 @@ use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
 use objc2::sel;
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSBackingStoreType, NSMenu, NSMenuDelegate, NSMenuItem,
-    NSWindow, NSWindowStyleMask, NSWindowTitleVisibility,
+    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSBackingStoreType, NSEvent, NSMenu, NSMenuDelegate, NSMenuItem,
+    NSResponder, NSView, NSWindow, NSWindowStyleMask, NSWindowTitleVisibility,
 };
 use objc2_foundation::{NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
 use objc2_web_kit::{WKScriptMessage, WKScriptMessageHandler, WKUserContentController, WKWebView, WKWebViewConfiguration};
@@ -141,7 +141,8 @@ fn make_webview(mtm: MainThreadMarker, frame: NSRect, tx: Sender<Cmd>, autostart
         config
             .userContentController()
             .addScriptMessageHandler_name(ProtocolObject::from_ref(&*handler), &NSString::from_str("kiri"));
-        let webview = WKWebView::initWithFrame_configuration(WKWebView::alloc(mtm), frame, &config);
+        let webview = WebView::new(mtm, frame, &config);
+        webview.setAllowsLinkPreview(false);
         if cfg!(debug_assertions) {
             webview.setInspectable(true);
         }
@@ -149,7 +150,7 @@ fn make_webview(mtm: MainThreadMarker, frame: NSRect, tx: Sender<Cmd>, autostart
         let no: Retained<AnyObject> = msg_send![objc2::class!(NSNumber), numberWithBool: false];
         let _: () = msg_send![&webview, setValue: &*no, forKey: &*NSString::from_str("drawsBackground")];
         webview.loadHTMLString_baseURL(&NSString::from_str(&super::assemble::page(PAGE, prefs()["lang"].as_str())), None);
-        webview
+        Retained::into_super(webview)
     }
 }
 
@@ -635,6 +636,38 @@ struct HandlerIvars {
     tx: Sender<Cmd>,
     autostart: bool,
     view: Option<String>,
+}
+
+define_class!(
+    // SAFETY: WKWebView is a main-thread AppKit view safe to subclass without Drop.
+    #[unsafe(super(WKWebView, NSView, NSResponder, NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "KiriWebView"]
+    struct WebView;
+
+    unsafe impl NSObjectProtocol for WebView {}
+
+    impl WebView {
+        /// Kiri renders its own app editing menu (`#app-ctx` in `index.html`).
+        /// Clearing any AppKit `NSMenu` items WebKit builds guarantees Safari /
+        /// browser items (`Search with Google`, `Look Up`, `Translate`,
+        /// `Copy Link with Highlight`, `Share…`, `Speech`, `Services`) never
+        /// appear on macOS right-click or Ctrl-click.
+        #[unsafe(method(willOpenMenu:withEvent:))]
+        fn will_open_menu(&self, menu: &NSMenu, event: &NSEvent) {
+            menu.removeAllItems();
+            // SAFETY: forwarding `willOpenMenu:withEvent:` to `WKWebView` with valid args.
+            let _: () = unsafe { msg_send![super(self), willOpenMenu: menu, withEvent: event] };
+        }
+    }
+);
+
+impl WebView {
+    fn new(mtm: MainThreadMarker, frame: NSRect, config: &WKWebViewConfiguration) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(());
+        // SAFETY: `WKWebView`'s designated initializer on a freshly allocated subclass instance.
+        unsafe { msg_send![super(this), initWithFrame: frame, configuration: config] }
+    }
 }
 
 define_class!(

@@ -3506,8 +3506,12 @@ window.kiriWords = (p) => {
 /* A container's page: Overview, Logs, Terminal, Files. The log console and
    the terminal are kept as live elements, so a list refresh never wipes
    them or what is being typed. */
-const logEl = Object.assign(document.createElement("div"), { className: "console numbered", tabIndex: 0 });
-logEl.setAttribute("role", "log");
+function makeLogConsole() {
+  const el = Object.assign(document.createElement("div"), { className: "console numbered", tabIndex: 0 });
+  el.setAttribute("role", "log");
+  return el;
+}
+const logEl = makeLogConsole();
 const termEl = document.createElement("div");
 termEl.className = "term";
 termEl.innerHTML = `<div class="console" id="term-out" tabindex="0"></div>
@@ -3661,21 +3665,29 @@ function levelOf(line) {
   return "";
 }
 const shown = (div, f, lvl) => (!f || div.textContent.toLowerCase().includes(f)) && (!lvl || div.dataset.lvl === lvl);
-function logCount() {
-  const el = $("log-count");
-  if (!el) return;
-  const all = logEl.childElementCount, d = ui.detail;
-  const showing = d.logFilter || d.logLevel ? [...logEl.children].filter((x) => !x.classList.contains("hide")).length : all;
-  el.textContent = d.logFilter || d.logLevel ? tr("{showing} of {all} lines", { showing: showing.toLocaleString(), all: all.toLocaleString() }) : tr("{all} lines", { all: all.toLocaleString() });
+const LOG_LEVEL_OPTS = () => [["", tr("All levels")], ["error", tr("Error")], ["warn", tr("Warn")], ["info", tr("Info")], ["debug", tr("Debug")]];
+function logToolbarHtml({ prefix, filter, level, follow, left = "", right = "", reloadAttr = "", clearAttr }) {
+  return `<div class="logbar">${left}<input class="field" id="${prefix}-filter" placeholder="${tr("Find in logs")}" spellcheck="false" value="${esc(filter)}">
+    <select id="${prefix}-level" aria-label="${tr("Level")}">${LOG_LEVEL_OPTS().map(([v, l]) => `<option value="${v}"${level === v ? " selected" : ""}>${l}</option>`).join("")}</select>
+    <span class="logcount" id="${prefix}-count"></span>
+    <span class="spacer" style="flex:1"></span>
+    ${right}<label class="toggle"><input type="checkbox" id="${prefix}-follow"${follow ? " checked" : ""}> ${tr("Follow")}</label>${reloadAttr ? btn(tr("Reload"), reloadAttr) : ""}${btn(tr("Clear"), clearAttr)}</div>`;
 }
-
-function addLogs(parts) {
-  const atEnd = logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 40;
-  const filter = ui.detail.logFilter.toLowerCase(), level = ui.detail.logLevel;
+function updateLogCount(el, countId, d) {
+  const cnt = $(countId);
+  if (!cnt || !d) return;
+  const all = el.childElementCount;
+  const showing = d.logFilter || d.logLevel ? [...el.children].filter((x) => !x.classList.contains("hide")).length : all;
+  cnt.textContent = d.logFilter || d.logLevel ? tr("{showing} of {all} lines", { showing: showing.toLocaleString(), all: all.toLocaleString() }) : tr("{all} lines", { all: all.toLocaleString() });
+}
+function appendLogParts(el, countId, d, partial, nextN, parts) {
+  const atEnd = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+  const filter = d.logFilter.toLowerCase(), level = d.logLevel;
   const frag = document.createDocumentFragment();
   for (const p of parts) {
-    const lines = (ui.partial[p.e] + p.t.replace(ansi, "").replace(/\r\n/g, "\n")).split("\n");
-    ui.partial[p.e] = lines.pop();
+    const key = Boolean(p.e);
+    const lines = ((partial[key] || "") + p.t.replace(ansi, "").replace(/\r\n/g, "\n")).split("\n");
+    partial[key] = lines.pop();
     for (const line of lines) {
       const div = document.createElement("div");
       const lvl = levelOf(line);
@@ -3683,22 +3695,37 @@ function addLogs(parts) {
       if (lvl && lvl !== "info") div.className = `lvl-${lvl}`;
       else if (p.e) div.className = "err";
       div.textContent = line || " ";
-      div.dataset.n = ++ui.logN;
+      div.dataset.n = nextN();
       if (!shown(div, filter, level)) div.classList.add("hide");
       frag.append(div);
     }
   }
-  logEl.append(frag);
-  while (logEl.childElementCount > LOG_MAX) logEl.firstElementChild.remove();
-  if (ui.detail.follow && atEnd || ui.detail.follow && parts.length > 50) logEl.scrollTop = logEl.scrollHeight;
-  logCount();
+  el.append(frag);
+  while (el.childElementCount > LOG_MAX) el.firstElementChild.remove();
+  if (d.follow && atEnd || d.follow && parts.length > 50) el.scrollTop = el.scrollHeight;
+  updateLogCount(el, countId, d);
 }
-
-function filterLogs() {
-  const d = ui.detail, f = d.logFilter.toLowerCase();
-  for (const div of logEl.children) div.classList.toggle("hide", !shown(div, f, d.logLevel));
-  logCount();
+function applyLogFilter(el, countId, d) {
+  const f = d.logFilter.toLowerCase();
+  for (const div of el.children) div.classList.toggle("hide", !shown(div, f, d.logLevel));
+  updateLogCount(el, countId, d);
 }
+function appendLogEnd(el, text) {
+  const div = document.createElement("div");
+  div.className = "quiet";
+  div.textContent = text;
+  el.append(div);
+}
+function clearLogConsole(el, countId, d, partial, resetN) {
+  el.textContent = "";
+  partial.false = "";
+  partial.true = "";
+  resetN();
+  updateLogCount(el, countId, d);
+}
+function logCount() { updateLogCount(logEl, "log-count", ui.detail); }
+function addLogs(parts) { appendLogParts(logEl, "log-count", ui.detail, ui.partial, () => ++ui.logN, parts); }
+function filterLogs() { applyLogFilter(logEl, "log-count", ui.detail); }
 
 /* The prompt, as a shell shows it: user@host:dir# (or $ for other users).
    Until the container has answered, it comes from the inspect data. */
@@ -3848,12 +3875,7 @@ function renderDetail() {
   else if (d.tab === "logs" && keepLogs) logCount();
   else if (d.tab === "logs") {
     body.dataset.logs = c.Id;
-    const levels = [["", tr("All levels")], ["error", tr("Error")], ["warn", tr("Warn")], ["info", tr("Info")], ["debug", tr("Debug")]];
-    body.innerHTML = `<div class="logbar"><input class="field" id="log-filter" placeholder="${tr("Find in logs")}" spellcheck="false" value="${esc(d.logFilter)}">
-      <select id="log-level" aria-label="${tr("Level")}">${levels.map(([v, l]) => `<option value="${v}"${d.logLevel === v ? " selected" : ""}>${l}</option>`).join("")}</select>
-      <span class="logcount" id="log-count"></span>
-      <span class="spacer" style="flex:1"></span>
-      <label class="toggle"><input type="checkbox" id="log-follow"${d.follow ? " checked" : ""}> ${tr("Follow")}</label>${btn(tr("Clear"), "data-logclear")}</div>`;
+    body.innerHTML = logToolbarHtml({ prefix: "log", filter: d.logFilter, level: d.logLevel, follow: d.follow, clearAttr: "data-logclear" });
     body.append(logEl);
     logCount();
     $("log-filter").addEventListener("input", (ev) => { d.logFilter = ev.target.value; filterLogs(); });
@@ -8812,7 +8834,7 @@ window.kiri = {
         } else {
           ui.stReclaimed = e;
           if (ui.storage && e.after != null) {
-            ui.storage = { ...ui.storage, disk_host: e.after, ...(e.in_use != null ? { disk_in_use: e.in_use } : {}), reclaimable: 0 };
+            ui.storage = { ...ui.storage, disk_host: e.after, ...(e.in_use != null ? { disk_in_use: e.in_use } : {}), reclaimable: e.reclaimable ?? 0 };
           }
           toast("ok", e.reclaimed > 0 ? tr("Reclaimed {size} on {os}", { size: size(e.reclaimed), os: OS }) : tr("Nothing to reclaim"));
         }
@@ -8862,7 +8884,7 @@ window.kiri = {
       case "stats": if (ui.detail?.id === e.id) { e.at = Date.now(); addSample(e); } break;
       case "stats-end": if (ui.detail?.id === e.id) ui.detail.statsOn = false; break;
       case "logs": if (ui.detail?.id === e.id) addLogs(e.parts); break;
-      case "logs-end": if (ui.detail?.id === e.id) { const d = document.createElement("div"); d.className = "quiet"; d.textContent = tr("— the log stream ended —"); logEl.append(d); ui.detail.logsOn = false; } break;
+      case "logs-end": if (ui.detail?.id === e.id) { appendLogEnd(logEl, tr("— the log stream ended —")); ui.detail.logsOn = false; } break;
       case "exec": if (ui.detail?.id === e.id) finishExec(e); break;
       case "files": if (ui.detail?.name === e.name) { Object.assign(ui.detail.files, { path: e.path, entries: e.entries, error: e.error, loading: false }); render(); } break;
       case "preview": if (ui.detail?.name === e.name && ui.detail.files.selected === e.path) { ui.detail.files.preview = e; render(); } break;
@@ -9051,7 +9073,7 @@ $("content").addEventListener("click", (ev) => {
   else if ((el = t("[data-file]"))) { ui.detail.files.selected = el.dataset.file; ui.detail.files.preview = null; send("preview", { name: ui.detail.name, path: el.dataset.file }); render(); }
   else if ((el = t("[data-reveal]"))) send("reveal", { name: ui.detail.name, path: el.dataset.reveal });
   else if ((el = t("[data-terminal]"))) send("terminal", { name: ui.detail.name });
-  else if ((el = t("[data-logclear]"))) { logEl.textContent = ""; logCount(); }
+  else if ((el = t("[data-logclear]"))) clearLogConsole(logEl, "log-count", ui.detail, ui.partial, () => { ui.logN = 0; });
   else if ((el = t("[data-save]"))) send("download", { name: ui.detail.name, path: el.dataset.save });
 });
 $("impstrip").addEventListener("click", (ev) => {
@@ -9135,7 +9157,7 @@ document.addEventListener("dblclick", (ev) => {
    the sidebar's counts, every 30 s, and only while the node runs (the VM is
    awake for it then anyway). Nothing here starts the cluster but Start. */
 const K8S_VIEWS = new Set(["pods", "services"]);
-const k8s = { state: null, ready: false, pods: [], services: [], icon: null, asked: 0, sig: "", detail: null, svc: null, partial: "",
+const k8s = { state: null, ready: false, pods: [], services: [], icon: null, asked: 0, sig: "", detail: null, svc: null, partial: { false: "", true: "" }, logN: 0,
   op: "", opAt: 0, opLine: "", context: "", config: null, sanDraft: null, port: null, wantPort: 6443, portDraft: null, argsDraft: null, defaultVer: "", manifestsDir: "" };
 empty.pods = { title: "No pods", body: "Pods you create with <code>kubectl</code> show up here, grouped by namespace.", art: "pods" };
 empty.services = { title: "No services", body: "Services you create with <code>kubectl expose</code> show up here. LoadBalancer services answer on <code>localhost</code>.", art: "services" };
@@ -9246,10 +9268,7 @@ function k8sOn(e) {
     case "k8slogs": if (d?.logKey === e.key) addKLogs(e.parts); break;
     case "k8slogs-end":
       if (d?.logKey === e.key) {
-        const div = document.createElement("div");
-        div.className = "quiet";
-        div.textContent = d.previous ? tr("— the end of the run before the last restart —") : tr("— the log stream ended —");
-        klogEl.append(div);
+        appendLogEnd(klogEl, d.previous ? tr("— the end of the run before the last restart —") : tr("— the log stream ended —"));
         d.logsOn = false;
       }
       break;
@@ -9471,15 +9490,14 @@ function deletePod(key) {
   scrim.querySelector("[data-go]")?.focus();
 }
 
-/* A pod's page: Info and Logs. The log console is kept as a live element,
-   as the container page's is. */
-const klogEl = Object.assign(document.createElement("div"), { className: "console", tabIndex: 0 });
-klogEl.setAttribute("role", "log");
+/* A pod's page: Info and Logs. Shares the numbered log console component with
+   container logs (`makeLogConsole`, `appendLogParts`, `logToolbarHtml`). */
+const klogEl = makeLogConsole();
 function openPod(key, tab = "info") {
   closePod();
   const [ns, name] = key.split("/");
   k8s.detail = { ns, name, tab: "info", container: "", previous: false, follow: true, logFilter: "", logLevel: "", logsOn: false, logKey: "" };
-  klogEl.textContent = "";
+  clearLogConsole(klogEl, "klog-count", k8s.detail, k8s.partial, () => { k8s.logN = 0; });
   if (tab === "logs") podTab("logs"); else render();
   $("content").scrollTop = 0;
 }
@@ -9502,42 +9520,12 @@ function podLogs(again = false) {
   const key = `${d.ns}/${d.name}/${d.container}${d.previous ? "/previous" : ""}`;
   if (!again && d.logKey === key && (d.logsOn || d.previous)) return;
   Object.assign(d, { logKey: key, logsOn: !d.previous });
-  klogEl.textContent = "";
-  k8s.partial = "";
+  clearLogConsole(klogEl, "klog-count", d, k8s.partial, () => { k8s.logN = 0; });
   send("k8s", { action: "logs", value: { ns: d.ns, pod: d.name, container: d.container, previous: d.previous } });
 }
-function addKLogs(parts) {
-  const d = k8s.detail, atEnd = klogEl.scrollHeight - klogEl.scrollTop - klogEl.clientHeight < 40;
-  const filter = d.logFilter.toLowerCase(), frag = document.createDocumentFragment();
-  for (const p of parts) {
-    const lines = (k8s.partial + p.t.replace(ansi, "")).split("\n");
-    k8s.partial = lines.pop();
-    for (const line of lines) {
-      const div = document.createElement("div"), lvl = levelOf(line);
-      div.dataset.lvl = lvl || "none";
-      if (lvl && lvl !== "info") div.className = `lvl-${lvl}`;
-      div.textContent = line || " ";
-      if (!shown(div, filter, d.logLevel)) div.classList.add("hide");
-      frag.append(div);
-    }
-  }
-  klogEl.append(frag);
-  while (klogEl.childElementCount > LOG_MAX) klogEl.firstElementChild.remove();
-  if (d.follow && atEnd || d.follow && parts.length > 50) klogEl.scrollTop = klogEl.scrollHeight;
-  klogCount();
-}
-function klogCount() {
-  const el = $("klog-count"), d = k8s.detail;
-  if (!el || !d) return;
-  const all = klogEl.childElementCount;
-  const showing = d.logFilter || d.logLevel ? [...klogEl.children].filter((x) => !x.classList.contains("hide")).length : all;
-  el.textContent = d.logFilter || d.logLevel ? tr("{showing} of {all} lines", { showing: showing.toLocaleString(), all: all.toLocaleString() }) : tr("{all} lines", { all: all.toLocaleString() });
-}
-function filterKLogs() {
-  const d = k8s.detail, f = d.logFilter.toLowerCase();
-  for (const div of klogEl.children) div.classList.toggle("hide", !shown(div, f, d.logLevel));
-  klogCount();
-}
+function addKLogs(parts) { appendLogParts(klogEl, "klog-count", k8s.detail, k8s.partial, () => ++k8s.logN, parts); }
+function klogCount() { updateLogCount(klogEl, "klog-count", k8s.detail); }
+function filterKLogs() { applyLogFilter(klogEl, "klog-count", k8s.detail); }
 
 function renderPod() {
   const d = k8s.detail, p = podOf(d);
@@ -9556,15 +9544,10 @@ function renderPod() {
     <div id="dbody"></div>`;
   const body = $("dbody");
   if (d.tab === "info") { body.innerHTML = podInfo(p); return; }
-  const levels = [["", tr("All levels")], ["error", tr("Error")], ["warn", tr("Warn")], ["info", tr("Info")], ["debug", tr("Debug")]];
   const picker = p.containers.length > 1 ? `<select id="klog-container" aria-label="${tr("Container")}">${p.containers.map((c) => `<option${c.name === d.container ? " selected" : ""}>${esc(c.name)}</option>`).join("")}</select>` : "";
   const restarted = p.containers.find((c) => c.name === d.container)?.restarts > 0;
-  body.innerHTML = `<div class="logbar">${picker}<input class="field" id="klog-filter" placeholder="${tr("Find in logs")}" spellcheck="false" value="${esc(d.logFilter)}">
-    <select id="klog-level" aria-label="${tr("Level")}">${levels.map(([v, l]) => `<option value="${v}"${d.logLevel === v ? " selected" : ""}>${l}</option>`).join("")}</select>
-    <span class="logcount" id="klog-count"></span>
-    <span class="spacer" style="flex:1"></span>
-    ${restarted || d.previous ? `<label class="toggle" title="${tr("The run before the container's last restart")}"><input type="checkbox" id="klog-previous"${d.previous ? " checked" : ""}> ${tr("Previous run")}</label>` : ""}
-    <label class="toggle"><input type="checkbox" id="klog-follow"${d.follow ? " checked" : ""}> ${tr("Follow")}</label>${btn(tr("Reload"), "data-klogreload")}${btn(tr("Clear"), "data-klogclear")}</div>`;
+  const prevToggle = restarted || d.previous ? `<label class="toggle" title="${tr("The run before the container's last restart")}"><input type="checkbox" id="klog-previous"${d.previous ? " checked" : ""}> ${tr("Previous run")}</label>` : "";
+  body.innerHTML = logToolbarHtml({ prefix: "klog", filter: d.logFilter, level: d.logLevel, follow: d.follow, left: picker, right: prevToggle, reloadAttr: "data-klogreload", clearAttr: "data-klogclear" });
   body.append(klogEl);
   klogCount();
   $("klog-container")?.addEventListener("change", (ev) => { d.container = ev.target.value; podLogs(); });
@@ -9886,7 +9869,7 @@ $("content").addEventListener("click", (ev) => {
   else if (t("[data-k8smanifests]")) send("k8s", { action: "manifests" });
   else if (t("[data-k8sdelete]")) deleteCluster();
   else if (t("[data-klogreload]")) podLogs(true);
-  else if (t("[data-klogclear]")) { klogEl.textContent = ""; klogCount(); }
+  else if (t("[data-klogclear]")) clearLogConsole(klogEl, "klog-count", k8s.detail, k8s.partial, () => { k8s.logN = 0; });
 });
 $("title").addEventListener("click", (ev) => { if (ev.target.closest("[data-kback]")) { closePod(); render(); } });
 $("content").addEventListener("paste", envPaste);

@@ -55,12 +55,18 @@ type FileStamp = Option<(u64, u64, i64, i64)>;
 #[derive(Default)]
 struct HostDns {
     stamp: Option<[FileStamp; 2]>,
+    checked_at: Option<std::time::Instant>,
     servers: Vec<[u8; 4]>,
 }
 
 impl HostDns {
     fn get(&mut self) -> &[[u8; 4]] {
         use std::os::unix::fs::MetadataExt;
+        let now_inst = std::time::Instant::now();
+        if self.checked_at.is_some_and(|t| now_inst.saturating_duration_since(t) < std::time::Duration::from_millis(250)) {
+            return &self.servers;
+        }
+        self.checked_at = Some(now_inst);
         let stat = |p: &str| std::fs::metadata(p).ok().map(|m| (m.ino(), m.len(), m.mtime(), m.mtime_nsec()));
         let now = [stat("/etc/resolv.conf"), stat("/run/systemd/resolve/resolv.conf")];
         if self.stamp != Some(now) {

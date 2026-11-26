@@ -555,17 +555,29 @@ fn clone_flags(args: &CloneArgs) -> libc::c_ulong {
 /// # Safety
 /// The caller must be single-threaded, as with fork(): the child gets a copy
 /// of this thread only, so no other thread may hold a lock it needs.
+static CLONE3_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// True once `clone3(..., CLONE_INTO_CGROUP)` has succeeded in this process,
+/// allowing later spawns/execs to skip creating the fallback `cgroup_ready` pipe.
+pub fn clone3_works() -> bool {
+    CLONE3_STATE.load(std::sync::atomic::Ordering::Relaxed) == 1
+}
+
 pub unsafe fn clone3(args: &CloneArgs) -> io::Result<Cloned> {
     // SAFETY: `args` is a valid clone_args of the size passed; the caller
     // upholds the single-thread requirement.
     let ret = unsafe { libc::syscall(libc::SYS_clone3, args as *const CloneArgs, std::mem::size_of::<CloneArgs>()) };
     if ret >= 0 {
+        if ret > 0 {
+            CLONE3_STATE.store(1, std::sync::atomic::Ordering::Relaxed);
+        }
         return Ok(Cloned { pid: ret as libc::pid_t, into_cgroup: true });
     }
     let e = io::Error::last_os_error();
     if !clone3_unavailable(e.raw_os_error()) {
         return Err(io::Error::new(e.kind(), format!("clone3: {e}")));
     }
+    CLONE3_STATE.store(2, std::sync::atomic::Ordering::Relaxed);
     // SAFETY: as above. clone(2) has no cgroup, pidfd, set_tid, stack or tls
     // arguments here: the child runs on a copy of this thread's stack, like
     // fork(). Passing 0 for the four arguments after `flags` is identical on

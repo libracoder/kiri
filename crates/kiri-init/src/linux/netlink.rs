@@ -126,11 +126,7 @@ impl Netlink {
     /// A route socket inside another network namespace: entered just long
     /// enough to create the socket, which stays bound to that namespace.
     pub fn open_in(netns: &std::fs::File) -> io::Result<Netlink> {
-        let own = std::fs::File::open("/proc/self/ns/net")?;
-        sys::setns(netns.as_raw_fd(), libc::CLONE_NEWNET)?;
-        let nl = Netlink::open(libc::NETLINK_ROUTE);
-        sys::setns(own.as_raw_fd(), libc::CLONE_NEWNET)?;
-        nl
+        in_netns(netns, || Netlink::open(libc::NETLINK_ROUTE))
     }
 
     /// Sends messages (one batch) and waits for every acknowledgement.
@@ -314,13 +310,17 @@ pub fn delete_link(nl: &mut Netlink, name: &str) -> io::Result<()> {
     nl.request(&mut [m])
 }
 
-pub fn set_up(nl: &mut Netlink, index: i32) -> io::Result<()> {
+pub fn set_up_msg(index: i32) -> Msg {
     let mut m = Msg::new(RTM_NEWLINK, NLM_F_ACK);
     m.raw(&ifinfo(index, libc::IFF_UP as u32, libc::IFF_UP as u32));
-    nl.request(&mut [m])
+    m
 }
 
-pub fn add_address(nl: &mut Netlink, index: i32, addr: [u8; 4], prefix: u8) -> io::Result<()> {
+pub fn set_up(nl: &mut Netlink, index: i32) -> io::Result<()> {
+    nl.request(&mut [set_up_msg(index)])
+}
+
+pub fn add_address_msg(index: i32, addr: [u8; 4], prefix: u8) -> Msg {
     let mut m = Msg::new(RTM_NEWADDR, NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL);
     // struct ifaddrmsg: family, prefixlen, flags, scope, index.
     let mut ifa = [0u8; 8];
@@ -328,7 +328,11 @@ pub fn add_address(nl: &mut Netlink, index: i32, addr: [u8; 4], prefix: u8) -> i
     ifa[1] = prefix;
     ifa[4..8].copy_from_slice(&(index as u32).to_ne_bytes());
     m.raw(&ifa).attr(IFA_LOCAL, &addr).attr(IFA_ADDRESS, &addr);
-    match nl.request(&mut [m]) {
+    m
+}
+
+pub fn add_address(nl: &mut Netlink, index: i32, addr: [u8; 4], prefix: u8) -> io::Result<()> {
+    match nl.request(&mut [add_address_msg(index, addr, prefix)]) {
         Err(e) if e.raw_os_error() == Some(libc::EEXIST) => Ok(()),
         r => r,
     }
@@ -337,7 +341,7 @@ pub fn add_address(nl: &mut Netlink, index: i32, addr: [u8; 4], prefix: u8) -> i
 /// An IPv6 address, usable at once: no duplicate address detection, which
 /// would leave it tentative (not usable as a source) for about a second.
 /// Kiri hands out every address on its networks, so none can be taken.
-pub fn add_address6(nl: &mut Netlink, index: i32, addr: [u8; 16], prefix: u8) -> io::Result<()> {
+pub fn add_address6_msg(index: i32, addr: [u8; 16], prefix: u8) -> Msg {
     const IFA_F_NODAD: u8 = 0x02;
     let mut m = Msg::new(RTM_NEWADDR, NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL);
     let mut ifa = [0u8; 8];
@@ -346,7 +350,11 @@ pub fn add_address6(nl: &mut Netlink, index: i32, addr: [u8; 16], prefix: u8) ->
     ifa[2] = IFA_F_NODAD;
     ifa[4..8].copy_from_slice(&(index as u32).to_ne_bytes());
     m.raw(&ifa).attr(IFA_LOCAL, &addr).attr(IFA_ADDRESS, &addr);
-    match nl.request(&mut [m]) {
+    m
+}
+
+pub fn add_address6(nl: &mut Netlink, index: i32, addr: [u8; 16], prefix: u8) -> io::Result<()> {
+    match nl.request(&mut [add_address6_msg(index, addr, prefix)]) {
         Err(e) if e.raw_os_error() == Some(libc::EEXIST) => Ok(()),
         r => r,
     }
@@ -397,7 +405,7 @@ fn default_route(nl: &mut Netlink, family: i32, gateway: &[u8], index: i32, flag
 /// containers) succeed route lookup and reach nftables `output` redirect rules
 /// instead of failing immediately with `ENETUNREACH`.
 pub fn add_device_default_route(nl: &mut Netlink, index: i32, prefsrc: Option<[u8; 4]>) -> io::Result<()> {
-    let mut m = device_default_route_msg(index, prefsrc);
+    let m = device_default_route_msg(index, prefsrc);
     match nl.request(&mut [m]) {
         Err(e) if e.raw_os_error() == Some(libc::EEXIST) => Ok(()),
         r => r,
@@ -445,12 +453,32 @@ pub fn index_in(netns: &std::fs::File, name: &str) -> io::Result<i32> {
     in_netns(netns, || index_of(name))
 }
 
+thread_local! {
+    static OWN_NETNS: std::cell::RefCell<Option<std::fs::File>> = const { std::cell::RefCell::new(None) };
+}
+
+fn own_netns_fd() -> io::Result<i32> {
+    OWN_NETNS.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if let Some(f) = slot.as_ref() {
+            return Ok(f.as_raw_fd());
+        }
+        let f = std::fs::File::open("/proc/self/ns/net")?;
+        let raw = f.as_raw_fd();
+        *slot = Some(f);
+        Ok(raw)
+    })
+}
+
 /// Runs `f` with this thread in `netns`, then back in its own.
 pub fn in_netns<T>(netns: &std::fs::File, f: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
-    let own = std::fs::File::open("/proc/self/ns/net")?;
+    let own = own_netns_fd()?;
     sys::setns(netns.as_raw_fd(), libc::CLONE_NEWNET)?;
     let r = f();
-    sys::setns(own.as_raw_fd(), libc::CLONE_NEWNET)?;
+    if let Err(e) = sys::setns(own, libc::CLONE_NEWNET) {
+        eprintln!("kiri-init: cannot return to own network namespace: {e}");
+        std::process::abort();
+    }
     r
 }
 

@@ -915,6 +915,16 @@ impl PinnedPeer {
         if r != 0 || len as usize != std::mem::size_of::<libc::ucred>() || cred.pid <= 0 {
             return None;
         }
+        // `uid == 0` is unconditionally admitted by `Gate::check_subject`
+        // without inspecting supplementary groups or container cgroups.
+        if cred.uid == 0 {
+            return Some(PinnedPeer {
+                uid: 0,
+                gid: cred.gid,
+                groups: Vec::new(),
+                cgroup: String::new(),
+            });
+        }
         let proc_path = CString::new(format!("/proc/{}", cred.pid)).ok()?;
         // SAFETY: valid NUL-terminated path; pins the `/proc/<pid>` directory inode.
         let raw_dir = unsafe { libc::open(proc_path.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };

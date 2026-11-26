@@ -384,7 +384,17 @@ static USED_CACHE: Mutex<Option<(PathBuf, Instant, u64)>> = Mutex::new(None);
 #[cfg(target_os = "macos")]
 static LAST_IN_USE: Mutex<Option<u64>> = Mutex::new(None);
 #[cfg(target_os = "macos")]
+static LAST_CAPACITY: Mutex<Option<u64>> = Mutex::new(None);
+#[cfg(target_os = "macos")]
 static RECLAIMING: AtomicBool = AtomicBool::new(false);
+
+/// Persisted non-trimmable VM disk allocation (`<root>/vm/disk-overhead`),
+/// measured right after `FITRIM` so ext4's own journal, bitmaps, and
+/// initialized inode tables (up to ~2.5% of disk size, excluded from
+/// `statvfs.f_blocks`) are counted as in-use VM disk rather than promised as
+/// reclaimable space that `FITRIM` can never free.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+const DISK_OVERHEAD_FILE: &str = "vm/disk-overhead";
 
 /// Reclaimable bytes under this threshold (64 MiB) are reported as 0 so
 /// filesystem metadata slack does not prompt pointless trims.
@@ -397,10 +407,94 @@ pub fn reclaimable_bytes(disk_host: Option<u64>, disk_in_use: Option<u64>) -> Op
     Some(if diff > RECLAIM_THRESHOLD { diff } else { 0 })
 }
 
+/// Allocated bytes (`st_blocks * 512`) and logical byte length (`st_size`) of
+/// `<root>/vm/data.img`, if present.
+pub fn data_img_stats(root: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(root.join("vm/data.img")).ok()?;
+    Some((m.blocks().saturating_mul(512), m.len()))
+}
+
 /// Allocated bytes of `<root>/vm/data.img` (`st_blocks * 512`), if present.
 pub fn data_img_allocated(root: &Path) -> Option<u64> {
-    use std::os::unix::fs::MetadataExt;
-    std::fs::metadata(root.join("vm/data.img")).ok().map(|m| m.blocks().saturating_mul(512))
+    data_img_stats(root).map(|(alloc, _)| alloc)
+}
+
+/// Upper bound on ext4's static metadata overhead (`logical_len - capacity`:
+/// superblocks, group descriptors, bitmaps, journal, and inode tables), capped
+/// to 1/16th of `capacity` + 512 MiB so an online-grown `data.img` whose guest
+/// filesystem has not resized yet never treats the unmounted tail as overhead.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+fn max_ext4_overhead(logical_len: u64, capacity: u64) -> u64 {
+    if capacity == 0 || logical_len <= capacity {
+        return 0;
+    }
+    let cap = (capacity >> 4).saturating_add(512 << 20);
+    logical_len.saturating_sub(capacity).min(cap)
+}
+
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+fn read_disk_overhead(root: &Path) -> Option<u64> {
+    std::fs::read_to_string(root.join(DISK_OVERHEAD_FILE))
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+}
+
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+fn write_disk_overhead(root: &Path, bytes: u64) {
+    let path = root.join(DISK_OVERHEAD_FILE);
+    let tmp = root.join("vm/disk-overhead.tmp");
+    if std::fs::write(&tmp, format!("{bytes}\n")).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
+}
+
+/// Effective bytes in use inside `data.img`, combining occupied filesystem
+/// data blocks (`raw_in_use`) with allocated non-trimmable ext4 metadata so
+/// `reclaimable_bytes(disk_host, effective_in_use)` matches what `FITRIM` can
+/// actually return to macOS.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+fn effective_vm_in_use(
+    disk_host: Option<u64>,
+    logical_len: Option<u64>,
+    raw_in_use: Option<u64>,
+    capacity: Option<u64>,
+    recorded_overhead: Option<u64>,
+) -> (Option<u64>, Option<u64>) {
+    let Some(raw) = raw_in_use else {
+        return (None, None);
+    };
+    let ext4_meta = match (logical_len, capacity) {
+        (Some(len), Some(cap)) => max_ext4_overhead(len, cap),
+        _ => 0,
+    };
+    let overhead = match recorded_overhead {
+        Some(saved) => match disk_host {
+            // If host allocation minus used data shrank below the saved floor
+            // (e.g. newly written files reused previously-allocated blocks),
+            // clamp downward and update the saved floor.
+            Some(host) => saved.min(host.saturating_sub(raw)),
+            None => saved,
+        },
+        None => {
+            // Before the first explicit reclaim records an exact post-FITRIM
+            // floor: a fresh disk (< 1 GiB of files) has near-zero initialized
+            // inode tables, whereas a mature populated disk (>= 1 GiB of files)
+            // has already completed `ext4lazyinit` across its block groups.
+            if raw >= (1 << 30) {
+                match disk_host {
+                    Some(host) => ext4_meta.min(host.saturating_sub(raw)),
+                    None => ext4_meta,
+                }
+            } else {
+                0
+            }
+        }
+    };
+    let clamped_update = recorded_overhead.filter(|&saved| overhead < saved).map(|_| overhead);
+    (Some(raw.saturating_add(overhead)), clamped_update)
 }
 
 #[cfg(target_os = "linux")]
@@ -513,14 +607,24 @@ pub fn report(engine: &Engine) -> Value {
     let root = engine.store.root();
     #[cfg(target_os = "macos")]
     let disk = {
-        let disk_host = data_img_allocated(root);
-        let disk_in_use = match engine.disk_usage_if_awake() {
-            Some((in_use, _)) => {
+        let stats = data_img_stats(root);
+        let (disk_host, logical_len) = (stats.map(|(a, _)| a), stats.map(|(_, l)| l));
+        let (raw_in_use, capacity) = match engine.disk_usage_if_awake() {
+            Some((in_use, cap)) => {
                 *LAST_IN_USE.lock().unwrap_or_else(|e| e.into_inner()) = Some(in_use);
-                Some(in_use)
+                *LAST_CAPACITY.lock().unwrap_or_else(|e| e.into_inner()) = Some(cap);
+                (Some(in_use), Some(cap))
             }
-            None => *LAST_IN_USE.lock().unwrap_or_else(|e| e.into_inner()),
+            None => (
+                *LAST_IN_USE.lock().unwrap_or_else(|e| e.into_inner()),
+                *LAST_CAPACITY.lock().unwrap_or_else(|e| e.into_inner()),
+            ),
         };
+        let recorded = read_disk_overhead(root);
+        let (disk_in_use, clamped) = effective_vm_in_use(disk_host, logical_len, raw_in_use, capacity, recorded);
+        if let Some(updated) = clamped {
+            write_disk_overhead(root, updated);
+        }
         let disk_limit = Some(super::engine::vm_disk_gb().saturating_mul(1 << 30));
         let reclaimable = reclaimable_bytes(disk_host, disk_in_use);
         DiskInfo { disk_host, disk_in_use, disk_limit, reclaimable }
@@ -557,9 +661,18 @@ pub fn reclaim(engine: &Engine) -> Result<Value, Error> {
     let t0 = Instant::now();
     let root = engine.store.root();
     let before = data_img_allocated(root).unwrap_or(0);
-    let (trimmed, in_use, _capacity) = engine.trim_disk().map_err(Error::Io)?;
-    *LAST_IN_USE.lock().unwrap_or_else(|e| e.into_inner()) = Some(in_use);
+    let (trimmed, raw_in_use, capacity) = engine.trim_disk().map_err(Error::Io)?;
+    // Flush pending VirtioBlock DISCARD hole-punches through XNU/APFS before
+    // sampling `st_blocks` so `after` reflects every reclaimed block immediately.
+    if let Ok(f) = std::fs::File::open(root.join("vm/data.img")) {
+        let _ = f.sync_all();
+    }
+    *LAST_IN_USE.lock().unwrap_or_else(|e| e.into_inner()) = Some(raw_in_use);
+    *LAST_CAPACITY.lock().unwrap_or_else(|e| e.into_inner()) = Some(capacity);
     let after = data_img_allocated(root).unwrap_or(0);
+    let overhead = after.saturating_sub(raw_in_use);
+    write_disk_overhead(root, overhead);
+    let in_use = raw_in_use.saturating_add(overhead);
     invalidate_used_cache();
     let reclaimed = before.saturating_sub(after);
     let elapsed_ms = t0.elapsed().as_millis() as u64;
@@ -570,6 +683,8 @@ pub fn reclaim(engine: &Engine) -> Result<Value, Error> {
         reclaimed = reclaimed,
         trimmed = trimmed,
         in_use = in_use,
+        raw_in_use = raw_in_use,
+        overhead = overhead,
         elapsed_ms = elapsed_ms
     );
     Ok(json!({
@@ -577,6 +692,7 @@ pub fn reclaim(engine: &Engine) -> Result<Value, Error> {
         "after": after,
         "reclaimed": reclaimed,
         "in_use": in_use,
+        "reclaimable": 0,
         "elapsed_ms": elapsed_ms,
     }))
 }
@@ -1233,6 +1349,56 @@ mod tests {
         assert_eq!(s["disk_in_use"], 17_300_000_000u64);
         assert_eq!(s["disk_limit"], 64u64 << 30);
         assert_eq!(s["reclaimable"], 12_100_000_000u64);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn ext4_metadata_overhead_is_excluded_from_reclaimable_space() {
+        // Mature 128 GiB disk (`137.44 GB` logical, `134.15 GB` statvfs capacity ->
+        // `3.29 GB` ext4 journal + inode table overhead): `104.0 GB` on macOS with
+        // `98.4 GB` of files promises only the `2.31 GB` that FITRIM can free, and
+        // reports 0 reclaimable once `101.69 GB` remains after FITRIM.
+        let logical = 128u64 << 30;
+        let capacity = logical - 3_290_000_000;
+        let raw_used = 98_400_000_000u64;
+        let (in_use_before, clamped) = effective_vm_in_use(
+            Some(104_000_000_000),
+            Some(logical),
+            Some(raw_used),
+            Some(capacity),
+            None,
+        );
+        assert_eq!(clamped, None);
+        assert_eq!(in_use_before, Some(101_690_000_000));
+        assert_eq!(reclaimable_bytes(Some(104_000_000_000), in_use_before), Some(2_310_000_000));
+
+        // After FITRIM leaves `101.69 GB` on host, recorded overhead is `3.29 GB` and reclaimable is 0.
+        let d = scratch("reclaim-overhead");
+        std::fs::create_dir_all(d.join("vm")).unwrap();
+        write_disk_overhead(&d, 3_290_000_000);
+        assert_eq!(read_disk_overhead(&d), Some(3_290_000_000));
+        let (in_use_after, _) = effective_vm_in_use(
+            Some(101_690_000_000),
+            Some(logical),
+            Some(raw_used),
+            Some(capacity),
+            read_disk_overhead(&d),
+        );
+        assert_eq!(reclaimable_bytes(Some(101_690_000_000), in_use_after), Some(0));
+
+        // Fresh sparse disk (< 1 GiB of files) before first trim does not over-subtract lazy overhead.
+        let (fresh_used, _) = effective_vm_in_use(
+            Some(2_020_000_000),
+            Some(logical),
+            Some(20_000_000),
+            Some(capacity),
+            None,
+        );
+        assert_eq!(fresh_used, Some(20_000_000));
+        assert_eq!(reclaimable_bytes(Some(2_020_000_000), fresh_used), Some(2_000_000_000));
+
+        // Online-grown un-resized disk (`logical >> capacity`) caps static overhead safely.
+        assert!(max_ext4_overhead(256 << 30, 64 << 30) <= (4 << 30) + (512 << 20));
         let _ = std::fs::remove_dir_all(&d);
     }
 }

@@ -1,0 +1,63 @@
+# Head-to-head Linux benchmark comparing Kiri Engine against Docker Engine
+# (`dockerd`) on the same runner (#776): ephemeral alpine lifecycle, multi-layer
+# PHP app cold start & warm restart, container exec, 1,000-file bind-mount I/O,
+# published-port HTTP latency, teardown, and engine RSS.
+name: Linux Benchmark
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-benchmark-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  linux-benchmark:
+    name: Kiri vs Docker (Linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build static Linux engine
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          docker run --rm -v "$PWD:/src" -v "$RUNNER_TEMP/bin:/out" \
+            -w /src -e CARGO_TARGET_DIR=/tmp/target rust:1-alpine sh -c \
+            'apk add -q musl-dev && cargo build --release --locked -p kiri -p kiri-init && cp /tmp/target/release/kiri /tmp/target/release/kiri-init /out/'
+      - name: Run head-to-head Kiri vs Docker benchmark
+        env:
+          VERSION: ${{ github.event.release.tag_name || github.sha }}
+        run: |
+          set -eu
+          WORK="$RUNNER_TEMP/vs-docker"
+          mkdir -p "$WORK/data" "$WORK/run"
+          sudo env KIRI_DATA_DIR="$WORK/data" \
+            KIRI_SOCKET="$WORK/run/docker.sock" KIRI_HTTP_PORT=18080 KIRI_HTTPS_PORT=18443 \
+            "$RUNNER_TEMP/bin/kiri" daemon >"$WORK/daemon.log" 2>&1 &
+          KIRI_PID=$!
+          trap 'sudo kill -TERM $KIRI_PID 2>/dev/null || true' EXIT
+          for _ in $(seq 1 100); do
+            [ -S "$WORK/run/docker.sock" ] && break
+            sleep 0.2
+          done
+          sudo python3 scripts/bench-linux-docker.py \
+            --docker-sock /var/run/docker.sock \
+            --kiri-sock "$WORK/run/docker.sock" \
+            --kiri-pid "$KIRI_PID" \
+            --version "${VERSION}" \
+            --out "$WORK/benchmark.json" \
+            --report "$WORK/report.md"
+          cat "$WORK/report.md" >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: linux-benchmark-results
+          path: ${{ runner.temp }}/vs-docker/benchmark.json
