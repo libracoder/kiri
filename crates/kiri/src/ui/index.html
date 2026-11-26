@@ -160,7 +160,7 @@ body.rail .vm .dot { width: 6px; height: 6px; position: relative; box-shadow: no
 body.rail[data-vm=running] .vm .dot::after { content: ""; position: absolute; inset: 0; border-radius: 50%; background: var(--moss); --ring: 2.8; animation: var(--beat); pointer-events: none; }
 .mark .speed { fill: currentColor; opacity: .35; transition: opacity .3s; }
 [data-vm=running] .mark .speed { opacity: .9; }
-[data-vm=booting] .mark .speed { animation: zoom .25s infinite alternate; }
+[data-vm=booting] .mark .speed, [data-vm=restarting] .mark .speed { animation: zoom .25s infinite alternate; }
 
 [data-vm=stopped] .mark .eyes, [data-vm=asleep] .mark .eyes { transform: scaleY(.25); transform-origin: 46px 29px; }
 .navlabel { font-size: var(--fs); font-weight: 600; color: var(--faint); padding: 10px 8px 4px; text-transform: uppercase; letter-spacing: .06em; }
@@ -180,7 +180,7 @@ nav .count { margin-inline-start: auto; font-size: var(--fs); color: var(--faint
 .vm-head { display: flex; align-items: center; gap: 7px; font-weight: 600; }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); flex: none; }
 [data-vm=running] .dot { background: var(--moss); box-shadow: 0 0 0 3px color-mix(in srgb, var(--moss) 25%, transparent); }
-[data-vm=booting] .dot, [data-vm=waking] .dot, [data-vm=stopping] .dot { background: var(--sun); animation: pulse .8s infinite alternate; }
+[data-vm=booting] .dot, [data-vm=waking] .dot, [data-vm=stopping] .dot, [data-vm=restarting] .dot { background: var(--sun); animation: pulse .8s infinite alternate; }
 [data-vm=asleep] .dot { background: transparent; box-shadow: inset 0 0 0 2px var(--moss); }
 .vm-sub { color: var(--faint); font-size: var(--fs-small); margin-top: -6px; }
 #vm-state { margin-inline-start: auto; font-weight: 500; color: var(--muted); font-size: var(--fs); }
@@ -868,7 +868,7 @@ tr[data-rowopen] .sel, .sel { cursor: text; -webkit-user-select: text; user-sele
 .statusbar .k8s { width: 13px; height: 13px; fill: #326CE5; flex: none; }
 .statusbar .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--faint); }
 .statusbar .dot.running { background: var(--moss); }
-.statusbar .dot.booting, .statusbar .dot.stopping { background: var(--sun); }
+.statusbar .dot.booting, .statusbar .dot.stopping, .statusbar .dot.restarting { background: var(--sun); }
 .statusbar .dot.asleep { background: transparent; box-shadow: inset 0 0 0 1.5px var(--moss); }
 .statusbar .sep { color: var(--faint); }
 /* Kiri Dev, after the version: solid amber with near-black text, the same in either theme. */
@@ -1234,7 +1234,7 @@ tr.row:hover td.actions .acts-row { background: linear-gradient(var(--fwd), tran
 #onb .st.no, #onb .st.restart { background: rgba(255, 194, 61, .15); color: var(--sun-text); }
 #onb .st.bad { background: rgba(220, 53, 69, .16); color: var(--red-text); }
 #onb .st.off { background: var(--raised); color: var(--faint); }
-#onb .st.wait { border: 2px solid var(--line); border-top-color: var(--blue); animation: onbspin .8s linear infinite; }
+#onb .st.wait { border: 2px solid color-mix(in srgb, var(--sun) 20%, var(--line)); border-top-color: var(--sun); border-right-color: color-mix(in srgb, var(--sun) 65%, transparent); animation: onbspin .8s linear infinite; }
 @keyframes onbspin { to { transform: rotate(360deg); } }
 #onb .btn svg.i { width: 13px; height: 13px; }
 #onb .onb-ft { display: flex; align-items: center; gap: 8px; margin-top: 14px; }
@@ -1249,6 +1249,26 @@ tr.row:hover td.actions .acts-row { background: linear-gradient(var(--fwd), tran
 #onb .onb-rs p { color: var(--muted); font-size: var(--fs-small); margin: 2px 0 8px; }
 #onb .onb-rs .a { display: flex; gap: 6px; }
 .scrim { position: fixed; inset: 0; background: rgba(0, 0, 0, .45); display: grid; place-items: center; z-index: 8; }
+/* Universal Restarting overlay & shared restarting spinner (.rspin). */
+.rspin { --sz: 40px; position: relative; width: var(--sz); height: var(--sz); display: inline-grid; place-items: center; flex: none; }
+.rspin::before { content: ""; position: absolute; inset: 0; border-radius: 50%; border: 2.5px solid color-mix(in srgb, var(--sun) 20%, var(--line)); border-top-color: var(--sun); border-right-color: color-mix(in srgb, var(--sun) 65%, transparent); animation: spin .85s cubic-bezier(.42, .15, .58, .85) infinite; }
+.rspin.sm { --sz: 16px; }
+.rspin.sm::before { border-width: 2px; }
+.rspin.md { --sz: 28px; }
+.rspin.md::before { border-width: 2.2px; }
+.rspin .kdot { width: 16px; height: 17px; animation: bob 1.5s ease-in-out infinite; }
+.rspin.md .kdot { width: 12px; height: 13px; }
+.rspin.plain .kdot { display: none; }
+.rscrim { position: fixed; inset: 0; z-index: 25; background: rgba(8, 12, 16, .58); -webkit-backdrop-filter: blur(3px); backdrop-filter: blur(3px); display: grid; place-items: center; animation: sh-fade .16s ease-out; }
+@media (prefers-color-scheme: light) { :root:not([data-theme="dark"]) .rscrim { background: rgba(15, 20, 25, .36); } }
+:root[data-theme="light"] .rscrim { background: rgba(15, 20, 25, .36); }
+.rdlg { width: min(360px, calc(100% - 32px)); background: var(--panel); border: 1px solid color-mix(in srgb, var(--sun) 32%, var(--line)); border-radius: 14px; padding: 24px 22px 20px; display: grid; justify-items: center; text-align: center; gap: 8px; box-shadow: 0 24px 60px rgba(0, 0, 0, .48); animation: sh-rise .2s ease-out; }
+.rdlg h3 { font-size: var(--fs-head); font-weight: 700; letter-spacing: -.01em; margin-top: 4px; }
+.rdlg .rwhat { color: var(--muted); font-size: var(--fs); max-width: 300px; line-height: 1.45; overflow-wrap: anywhere; }
+.rdlg .rstep { margin-top: 4px; display: inline-flex; align-items: center; gap: 7px; padding: 4px 11px; border-radius: 999px; background: var(--raised); border: 1px solid var(--line); font-size: var(--fs-small); color: var(--muted); font-variant-numeric: tabular-nums; max-width: 100%; }
+.rdlg .rstep i { width: 6px; height: 6px; border-radius: 50%; background: var(--sun); flex: none; animation: pulse .75s infinite alternate; }
+.rdlg .rbar { width: 100%; height: 4px; border-radius: 99px; background: var(--raised); overflow: hidden; margin-top: 6px; }
+.rdlg .rbar span { display: block; height: 100%; background: var(--sun); border-radius: 99px; transition: width .35s ease; }
 /* The language step's dialog takes its height from this box, not the window's:
    Text size zooms the page, and 100vh would be the unzoomed window. */
 .scrim.langstep { z-index: 40; grid-template: minmax(0, 1fr) / minmax(0, 1fr); }
@@ -2610,6 +2630,7 @@ tr.usb-more > td { padding: 0; background: var(--panel); }
 <div class="toasts" id="toasts" aria-live="polite"></div>
 <div id="updcard" aria-live="polite"></div>
 <div id="ctxcard" class="updcard" aria-live="polite" hidden></div>
+<div class="rscrim" id="rscrim" role="alertdialog" aria-modal="true" aria-live="assertive" aria-busy="true" hidden></div>
 
 <script>/*ICONS*/</script>
 <!-- The built-in terminal's emulator: xterm.js and its add-ons (xterm/, spliced in by assemble.rs). -->
@@ -2815,15 +2836,15 @@ const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&
 
 const ui = { acting: new Map(), gacting: new Map(), running: new Set(), launched: new Map(), runWatch: new Map(), need: null, probed: new Map(), probing: new Set(), why: new Map(), startErr: {}, fixed: null, openTab: null, listening: new Map(), starting: new Map(), scans: new Map(), scanf: { sev: "", fix: false, own: false }, view: "containers", vm: "stopped", containers: [], images: [], volumes: [], volSizes: {}, volSizesLoading: false, volSizesAt: 0, volSizesKey: "", volSizesInFlight: 0, networks: [], sort: { images: { key: "pulled", desc: true } }, filter: "", suffix: "kiri.localhost", collapsed: new Set(), res: null, resDraft: {}, storage: null, stErr: "", stReclaiming: false, stReclaimed: null, stPruning: false, stPruned: null, bset: null, bsetDraft: null, vmnet: null, shellPath: null, shellPathBusy: false, proxy: null, pxDraft: {}, rports: null, rpDraft: {}, rpAt: 0, regcfg: null, regBase: null, regDraft: { insecure: [], mirrors: [] }, regAdd: { insecure: "", mirrors: "" }, dockersock: null, sockTaking: false, ctxSwitching: false,
   imp: { sources: null, source: null, inv: null, picked: { images: new Set(), volumes: new Set(), containers: new Set() }, steps: {}, running: false, summary: "" },
-  upd: null, engineStale: null, staleHidden: false,
+  upd: null, engineStale: null, staleHidden: false, restarting: null,
   // The Builds view: the list, the picked build and its detail, and how its steps show.
   bl: { items: null, error: "", sel: null, d: null, steps: "all", internal: false, open: new Set(), confirm: null, tab: "steps", layers: null, plat: null } };
 function resetPicks() { ui.imp.picked = { images: new Set(), volumes: new Set(), containers: new Set() }; ui.imp.steps = {}; ui.imp.summary = ""; }
 // Asleep is ready: the VM sleeps after a minute with nothing running and the next
 // request wakes it in milliseconds, so it reads as Ready with Stop, never as stopped
 // with Start. Start is for an engine someone stopped (Stop, `kiri stop`).
-const vmLabels = { stopped: "Off", booting: "Starting…", running: "Running", stopping: "Stopping…" };
-/* i18n */ void [tr("Off"), tr("Starting…"), tr("Running"), tr("Stopping…")];
+const vmLabels = { stopped: "Off", booting: "Starting…", running: "Running", stopping: "Stopping…", restarting: "Restarting…" };
+/* i18n */ void [tr("Off"), tr("Starting…"), tr("Running"), tr("Stopping…"), tr("Restarting…")];
 /* i18n */ void [tr("Mac"), tr("PC"), tr("computer"), tr("Linux VM"), tr("Engine")];
 
 function size(b) {
@@ -3967,6 +3988,40 @@ const KIRI_MARK = `<svg class="mark" viewBox="0 0 64 64" aria-hidden="true"><g t
 const KDOT = `<svg class="kdot" viewBox="0 0 30 32" aria-hidden="true"><g transform="skewX(-10) translate(5 0)"><rect x="2" y="1" width="26" height="30" rx="8" fill="#E0B420"/>
   <path d="M2 9a8 8 0 0 1 8-8h10a8 8 0 0 1 8 8v-.5H2z" fill="#F2CF5B"/>
   <ellipse cx="12" cy="15" rx="2.6" ry="3" fill="#0F1419"/><ellipse cx="20" cy="15" rx="2.6" ry="3" fill="#0F1419"/></g></svg>`;
+const rspin = (cls = "") => `<span class="rspin${cls ? ` ${cls}` : ""}" aria-hidden="true">${cls.includes("plain") ? "" : KDOT}</span>`;
+function drawRestartOverlay() {
+  const el = $("rscrim"), r = ui.restarting;
+  if (!el) return;
+  if (!r) { el.hidden = true; el.innerHTML = ""; return; }
+  el.hidden = false;
+  setHTML(el, `<div class="rdlg">${rspin()}<h3>${tr("Restarting…")}</h3>${r.what ? `<p class="rwhat">${r.what}</p>` : ""}${r.step ? `<span class="rstep"><i></i><span>${esc(r.step)}</span></span>` : ""}${r.pct != null ? `<div class="rbar"><span style="width:${r.pct}%"></span></div>` : ""}</div>`);
+}
+function startRestartOverlay(kind, what, step, pct = null) {
+  ui.restarting = { kind, what: what || "", step: step || tr("Restarting…"), pct };
+  drawRestartOverlay();
+  paintEngine();
+  renderStatus();
+  if (ui.view === "settings" && prefs.tab === "resources") render();
+}
+function setRestartStep(step, pct = ui.restarting?.pct ?? null) {
+  if (!ui.restarting) return;
+  ui.restarting.step = step;
+  ui.restarting.pct = pct;
+  drawRestartOverlay();
+}
+function stopRestartOverlay() {
+  if (!ui.restarting) return;
+  ui.restarting = null;
+  drawRestartOverlay();
+  paintEngine();
+  renderStatus();
+  if (ui.view === "settings") render();
+}
+function restartVm() {
+  const note = esc(ui.res?.restart_note || tr("Restarting stops the running containers; start them again afterwards."));
+  startRestartOverlay("vm", note, tr("Stopping containers…"));
+  send("restartvm");
+}
 const localChip = (url) => `<button class="local" data-open="${esc(url)}" title="${tr("Open {url}", { url: esc(url) })}"><span>${esc(url.replace(/^https?:\/\//, ""))}</span></button>`;
 
 /* First open: two small pictures of the same app, by port and by name. */
@@ -4013,6 +4068,7 @@ const ONB_MAC = [
   tr("The engine runs from the app for now"), tr("Show log"), tr("Continue anyway"), tr("One step didn't work. Everything else is ready."), tr("Some steps didn't work. Everything else is ready.")];
 const onbIcon = (name) => `<svg class="i" viewBox="0 0 256 256" aria-hidden="true"><path d="${PH[name]}"/></svg>`;
 function onboarding(e) {
+  if (ui.restarting?.kind === "onb") stopRestartOverlay();
   ui.onb = { ...e, busy: null };
   let el = $("onb");
   if (!el) {
@@ -4064,17 +4120,19 @@ function onbClick(ev) {
     o.error = "";
     send("onbskip", { name: b.dataset.onbskip, value: !b.dataset.undo });
   } else if (b.dataset.onbfix) {
+    if (b.dataset.onbfix === "running" && o.checks?.running === "bad") startRestartOverlay("onb", "", tr("Restarting engine…"));
     o.busy = b.dataset.onbfix;
     o.error = "";
     drawOnb();
     send("onbfix", { name: b.dataset.onbfix });
   } else if (b.dataset.onb === "open") {
+    if (ui.restarting?.kind === "onb") stopRestartOverlay();
     $("onb")?.remove();
     ui.onb = null;
     send("onbopen");
   } else if (b.dataset.onb === "log") send("diagfolder");
   else if (b.dataset.onb === "logout") send("onblogout");
-  else if (b.dataset.onb === "restart") send("onbrestart");
+  else if (b.dataset.onb === "restart") { startRestartOverlay("onb", "", tr("Restarting…")); send("onbrestart"); }
 }
 
 /* The first start: which language, before anything else: langStep
@@ -4636,13 +4694,14 @@ function vmNetRow() {
   const v = ui.vmnet;
   if (!v || v.supported === false) return "";
   const nat = v.shared_nat !== false;
+  const pending = v.awake && v.running_shared_nat != null && v.running_shared_nat !== nat;
   const desc = nat
     ? tr("macOS NAT: fastest. Switch to Host relay if Cloudflare WARP or a corporate firewall blocks container HTTPS. Applies on VM restart.")
     : tr("Host relay: connections leave from Kiri on macOS instead of Virtualization.framework NAT. Applies on VM restart.");
   const envNote = v.env ? ` ${tr("KIRI_SHARED_NAT is set in the environment and takes precedence.")}` : "";
   return `<div class="pref"><span class="t">${tr("Outbound VM traffic")}</span>
     <span class="d">${desc}${envNote}</span>
-    <div class="seg" role="group" aria-label="${tr("Outbound VM traffic")}"><button data-vmnat="1" aria-pressed="${nat}"${v.env ? " disabled" : ""}>${tr("macOS NAT")}</button><button data-vmnat="0" aria-pressed="${!nat}"${v.env ? " disabled" : ""}>${tr("Host relay")}</button></div></div>`;
+    <div class="pact">${pending ? `<button class="btn" data-restartvm>${tr("Restart VM to apply")}</button>` : ""}<div class="seg" role="group" aria-label="${tr("Outbound VM traffic")}"><button data-vmnat="1" aria-pressed="${nat}"${v.env ? " disabled" : ""}>${tr("macOS NAT")}</button><button data-vmnat="0" aria-pressed="${!nat}"${v.env ? " disabled" : ""}>${tr("Host relay")}</button></div></div></div>`;
 }
 
 function networkPane() {
@@ -4703,8 +4762,8 @@ function enginePane() {
   const { shown } = engineShown(), off = shown === "stopped";
   const d = off ? tr("Off: press Start engine to run containers. It stays off after a restart until you start it.")
     : shown === "running" ? tr("Running: it rests by itself when nothing runs and wakes when you use it.")
-    : shown === "booting" ? tr("Starting…") : shown === "stopping" ? tr("Stopping…") : "";
-  const busy = shown === "booting" || shown === "stopping";
+    : shown === "booting" ? tr("Starting…") : shown === "stopping" ? tr("Stopping…") : shown === "restarting" ? tr("Restarting…") : "";
+  const busy = shown === "booting" || shown === "stopping" || shown === "restarting";
   const btn = off ? `<button class="btn primary" data-vmpower="start"${busy ? " disabled" : ""}>${tr("Start engine")}</button>`
     : `<button class="btn" data-vmpower="stop"${busy ? " disabled" : ""}>${tr("Turn off engine")}</button>`;
   return `<div class="pane"><h3>${tr(VM)}</h3><div class="pref"><span class="t">${vmLabels[shown] != null ? tr(vmLabels[shown]) : "—"}</span><span class="d">${d}</span><span class="pact">${btn}</span></div></div>`;
@@ -4893,7 +4952,7 @@ function storagePane() {
   const m = s.moving;
   const pct = m && m.total > 0 ? Math.min(100, Math.round((m.done / m.total) * 100)) : null;
   const progressBox = moving && m ? `<div class="st-box" role="status">
-    <div class="st-hd"><span>${stPhaseText(m.phase)}</span></div>
+    <div class="st-hd">${rspin("sm plain")}<span>${stPhaseText(m.phase)}</span></div>
     <p>${tr("Moving Kiri's data to {path}.", { path: `<span class="mono st-path">${esc(m.to || "")}</span>` })}</p>
     ${pct != null ? `<div class="st-bar"><span style="width:${pct}%"></span></div><p class="num">${size(m.done)} / ${size(m.total)} (${pct}%)</p>` : ""}
     <p>${tr("Running containers pause while Kiri copies its data and start again once it's done.")}</p>
@@ -4961,6 +5020,7 @@ function storageConfirm(c) {
     if (ev.target.closest("[data-stgo]")) {
       const fresh = scrim.querySelector('input[name="st-mode"]:checked')?.value === "fresh";
       ui.stErr = "";
+      startRestartOverlay("storage", c.reset ? tr("Kiri will switch to this folder and restart the engine.") : tr("Moving Kiri's data to {path}.", { path: `<span class="mono st-path">${esc(c.path)}</span>` }), tr("Stopping containers…"));
       if (c.reset) send("storagereset");
       else send("storagemove", { path: c.path, value: { fresh } });
       close();
@@ -7266,7 +7326,7 @@ function renderStatus() {
   const k8s = ui.containers.find((c) => c.Names?.[0] === "/kiri-k8s" && c.State === "running");
   const k8sVersion = k8s ? (k8s.Image.split(":")[1] || "").replace(/-k3s\d+$/, "") : "";
   const { shown: vshown } = engineShown();
-  const vmText = { running: tr("{vm} running", { vm: tr(VM) }), stopped: tr("{vm} off", { vm: tr(VM) }), booting: tr("Starting…"), stopping: tr("Stopping…") }[vshown] || vshown;
+  const vmText = { running: tr("{vm} running", { vm: tr(VM) }), stopped: tr("{vm} off", { vm: tr(VM) }), booting: tr("Starting…"), stopping: tr("Stopping…"), restarting: tr("Restarting…") }[vshown] || vshown;
   const mem = ui.mem ? tr("{used} of {total}", { used: memText(ui.mem.used), total: `${Math.round(ui.mem.ceiling / 1024)} GB` }) : "";
   const parts = [
     `<span class="item">${KDOT}<span>Kiri ${esc(ui.status?.version || "")}</span>${ui.status?.dev ? `<span class="dev" title="${tr("{app}: its own engine, containers and settings", { app: esc(ui.status?.app || "Kiri Dev") })}">DEV</span>` : ""}</span>`,
@@ -7333,7 +7393,7 @@ function aboutUpdate(version) {
   } else if (u?.phase === "ready") {
     row = `<span>${tr("Kiri {version} is downloaded", { version: esc(u.version) })}</span>${btn(tr("Restart to update"), 'data-upd="restart"', "primary")}`;
   } else if (u?.phase === "available") {
-    const whatsNew = u.notes.trim() || NOTES_URL.test(u.notesUrl) ? `<button class="linkbtn" data-upd="notes">${tr("What's new")}</button>` : "";
+    const whatsNew = (u.notes || "").trim() || NOTES_URL.test(u.notesUrl) ? `<button class="linkbtn" data-upd="notes">${tr("What's new")}</button>` : "";
     row = `<span>${tr("Version {version}", { version: v })}</span><span class="updpill new">${tr("{version} available", { version: esc(u.version) })}</span>${btn(u.error ? tr("Try again") : tr("Download"), 'data-upd="download"', "primary")}${whatsNew}`;
   } else if (s?.state === "available") {
     row = `<span>${tr("Version {version}", { version: v })}</span><span class="updpill new">${tr("{version} available", { version: esc(s.latest) })}</span>${btn(tr("Show"), "data-updcheck", "primary")}`;
@@ -7346,7 +7406,7 @@ function aboutUpdate(version) {
   } else if (s?.state === "error") {
     row = `<span>${tr("Version {version}", { version: v })}</span><span class="faint">${tr("Couldn't check: {error}", { error: esc(s.error || "") })}</span>${check}`;
   } else row = `<span>${tr("Version {version}", { version: v })}</span>${check}`;
-  const notes = u?.phase === "available" && u.notes.trim() ? `<div class="updnotes"><b>${tr("What's new in {version}", { version: esc(u.version) })}</b>${notesHtml(u.notes)}</div>` : "";
+  const notes = u?.phase === "available" && (u.notes || "").trim() ? `<div class="updnotes"><b>${tr("What's new in {version}", { version: esc(u.version) })}</b>${notesHtml(u.notes)}</div>` : "";
   const fixed = s?.state === "test" || s?.state === "dev";
   const auto = prefs.updateAuto !== false;
   return `<div class="updrow">${row}</div>${notes}${fixed ? "" : `<div class="pref"><span class="t">${tr("Check for updates automatically")}</span><span class="d">${auto ? tr("On: Kiri checks each time it opens. It never updates without asking.") : tr("Off: Kiri checks only when you click Check now.")}</span>
@@ -7362,8 +7422,8 @@ function renderUpdate() {
     <div class="head"><div class="ic ${ic === "ok" ? "ok" : ""}">${UPD_ICON[ic]}</div><div class="txt"><h4>${esc(title)}</h4><div class="sub">${sub}</div></div>
     ${close ? `<button class="close" data-upd="${close}" aria-label="${tr("Close")}" title="${tr("Hide until Kiri next opens")}">${UPD_ICON.x}</button>` : ""}</div>${body}</div>`;
   if (u && !u.hidden && u.phase === "available") {
-    const whatsNew = u.notes.trim() || NOTES_URL.test(u.notesUrl) ? ` · <button data-upd="notes">${tr("What's new")}</button>` : "";
-    const sub = `${tr("You have {version}", { version: esc(u.current) })}${whatsNew}${u.error ? `<div class="err">${tr("Couldn't download it: {error}", { error: esc(u.error) })}</div>` : ""}`;
+    const whatsNew = (u.notes || "").trim() || NOTES_URL.test(u.notesUrl) ? ` · <button data-upd="notes">${tr("What's new")}</button>` : "";
+    const sub = `${tr("You have {version}", { version: esc(u.current || "") })}${whatsNew}${u.error ? `<div class="err">${tr("Couldn't download it: {error}", { error: esc(u.error) })}</div>` : ""}`;
     el.innerHTML = card("up", tr("Kiri {version} is available", { version: u.version }), sub, "hide", `<div class="row">
       ${btn(u.error ? tr("Try again") : tr("Download"), 'data-upd="download"', "primary")}
       ${u.snoozing ? `<span class="snooze">${btn(tr("Tomorrow"), 'data-upd="snooze1"')}${btn(tr("In a week"), 'data-upd="snooze7"')}</span>` : btn(tr("Snooze ▾"), 'data-upd="snooze" aria-haspopup="true"')}
@@ -7388,9 +7448,9 @@ function updateAction(a) {
     case "snooze1": snooze(1); break;
     case "snooze7": snooze(7); break;
     case "skip": setPref("updateSkip", u.version); ui.upd = null; break;
-    case "notes": if (u.notes.trim()) openNotes(); else send("updatenotes", { name: u.notesUrl }); break;
-    case "restart": send("updaterestart"); break;
-    case "engine": send("restartengine"); ui.engineStale = null; break;
+    case "notes": if ((u?.notes || "").trim()) openNotes(); else send("updatenotes", { name: u?.notesUrl || "" }); break;
+    case "restart": startRestartOverlay("update", tr("Finish updating to Kiri {version}", { version: esc(u?.version || "") }), tr("Restarting…")); send("updaterestart"); break;
+    case "engine": startRestartOverlay("engine", tr("Finish updating to Kiri {version}", { version: esc(ui.status?.version || "") }), tr("Restarting engine…")); send("restartengine"); ui.engineStale = null; break;
     case "enginelater": ui.staleHidden = true; break;
     case "showengine": ui.staleHidden = false; break;
   }
@@ -7553,6 +7613,10 @@ function render() {
 }
 
 function setVm(state, error) {
+  if (ui.restarting && ["vm", "engine", "reclaim"].includes(ui.restarting.kind)) {
+    if (state === "stopping") setRestartStep(tr("Stopping containers…"));
+    else if (state === "booting") setRestartStep(tr("Starting…"));
+  }
   if (ui.vm !== state) {
     const was = ui.vm;
     ui.vm = state;
@@ -7576,6 +7640,7 @@ function setVm(state, error) {
    VM rests to save memory and the next docker command wakes it, so it reads
    Running, and waking does too. Off is only Stop (or no engine at all). */
 function engineShown() {
+  if (ui.restarting && ui.restarting.kind !== "k8s") return { look: "restarting", on: false, shown: "restarting" };
   const look = ui.vmLook || ui.vm;
   const shown = ui.vm === "stopped" ? "stopped"
     : ui.vm === "stopping" ? "stopping"
@@ -7595,7 +7660,7 @@ function paintEngine() {
   const { shown } = engineShown();
   document.body.dataset.vm = shown;
   const label = tr(vmLabels[shown] ?? shown);
-  /* i18n */ void [tr("Off"), tr("Starting…"), tr("Running"), tr("Stopping…")];
+  /* i18n */ void [tr("Off"), tr("Starting…"), tr("Running"), tr("Stopping…"), tr("Restarting…")];
   $("vm-state").textContent = label;
   const sub = $("vm-sub");
   sub.textContent = ""; sub.hidden = true;
@@ -7605,9 +7670,9 @@ function paintEngine() {
   /* When it last turned into a Stop button: see the press guard below. */
   const act = shown === "running" ? "stop" : "start";
   if (b.dataset.act !== act) { b.dataset.act = act; b.dataset.flipped = String(Date.now()); }
-  b.textContent = shown === "running" ? tr("Stop") : shown === "booting" ? tr("Starting…") : shown === "stopping" ? tr("Stopping…") : tr("Start");
-  b.classList.toggle("primary", shown !== "running");
-  b.disabled = shown === "booting" || shown === "stopping";
+  b.textContent = shown === "running" ? tr("Stop") : shown === "booting" ? tr("Starting…") : shown === "stopping" ? tr("Stopping…") : shown === "restarting" ? tr("Restarting…") : tr("Start");
+  b.classList.toggle("primary", shown !== "running" && shown !== "restarting");
+  b.disabled = shown === "booting" || shown === "stopping" || shown === "restarting";
   headTitles();
 }
 /* The name or state says itself on hover only when it is cut. */
@@ -7739,7 +7804,7 @@ function toast(kind, text, op, open, act, why) {
   // Resources saved while the VM runs: restart it now to use them.
   if (!error && act === "restartvm") {
     el.querySelector(".txt").insertAdjacentHTML("beforeend", `<div class="dg-tacts"><button class="lnk" data-trestart>${tr("Restart now")}</button></div>`);
-    el.querySelector("[data-trestart]").addEventListener("click", () => { el.remove(); send("restartvm"); });
+    el.querySelector("[data-trestart]").addEventListener("click", () => { el.remove(); restartVm(); });
   }
   $("toasts").append(el);
   retire(el, ms);
@@ -8513,7 +8578,7 @@ function drawReport() {
     ${done ? `<div class="rp-id"><span class="lab">${tr("Report ID")}</span><span class="val">${esc(rp.id)}</span><button class="btn sm" data-rpcopy>${dgIcon("copy")}${tr("Copy")}</button></div>` : ""}
     ${rp.error ? `<p class="err">${send_ ? tr("Couldn't send it: {error}", { error: esc(rp.error) }) : tr("Couldn't save it: {error}", { error: esc(rp.error) })}</p>` : ""}
     <div class="row-end"><span></span><span>${done ? `<button class="btn primary" data-close>${tr("Done")}</button>`
-      : `<button class="btn" data-close>${tr("Cancel")}</button> <button class="btn primary" data-rpgo${rp.state === "busy" ? " disabled" : ""}>${rp.state === "busy" ? (send_ ? tr("Sending…") : tr("Saving…")) : rp.error ? tr("Try again") : send_ ? tr("Send") : tr("Save to Desktop")}</button>`}</span></div></div>`;
+      : `<button class="btn" data-close>${tr("Cancel")}</button> <button class="btn primary" data-rpgo${rp.state === "busy" ? " disabled" : ""}>${rp.state === "busy" ? `${rspin("sm plain")}${send_ ? tr("Sending…") : tr("Saving…")}` : rp.error ? tr("Try again") : send_ ? tr("Send") : tr("Save to Desktop")}</button>`}</span></div></div>`;
 }
 
 /* The card after a crash, in the update card's place (an update offer goes
@@ -8683,6 +8748,7 @@ window.kiri = {
         if (e.kind === "search" && [...ui.pulls.values()].some((p) => p.kind === "notfound")) pullsChanged();
         break;
       case "notice":
+        if (ui.restarting && (ui.restarting.kind === "vm" || (e.kind === "error" && ["storage", "engine", "update", "reclaim"].includes(ui.restarting.kind)))) stopRestartOverlay();
         // Each pod a batch deletes says so; the batch's own toast already has.
         if (e.kind === "ok" && /^Deleting pod /.test(e.text) && ui.batches.some((b) => b.view === "pods" && b.phase === "going")) break;
         if (e.kind === "ok" && e.image && e.open) { ui.launched.set(e.image, e.open); runHold(e.image, e.text, e.open, e.ms); break; }
@@ -8712,7 +8778,8 @@ window.kiri = {
       case "textsize": if (htHasFocus()) htStep(e.step); else stepTextSize(e.step); break;
       case "term": htOn(e); break;
       case "closekey": htCloseKey(); break;
-      case "enginerestarted": engineToast(e); break;
+      case "vmrestarted": if (ui.restarting?.kind === "vm") stopRestartOverlay(); break;
+      case "enginerestarted": if (ui.restarting?.kind === "engine") stopRestartOverlay(); if (!e.error) engineToast(e); break;
       case "view": if (empty[e.view] || e.view === "settings") show(e.view); break;
       case "prefs": { const was = prefs.lang; Object.assign(prefs, e.prefs || {}); prefsIn = true; if (prefs.lang !== was) relang(); applyPrefs(); render(); paintEngine(); renderStatus(); break; }
       case "starprompt": starCard(tr("Kiri started your container.")); break;
@@ -8752,10 +8819,10 @@ window.kiri = {
         if (ui.upd.phase !== "downloading") Object.assign(ui.upd, { phase: "downloading", t0: Date.now(), g0: e.got });
         Object.assign(ui.upd, { got: e.got, total: e.total }); renderUpdate(); break;
       case "updatestate": ui.updState = { ...e, checking: false }; if (ui.view === "settings" && prefs.tab === "about") render(); break;
-      case "updateready": if (ui.upd?.phase === "ready" && ui.upd.version === e.version && ui.upd.hidden) break; ui.upd = { ...(ui.upd || {}), phase: "ready", version: e.version, hidden: false, error: "" }; renderUpdate(); break;
+      case "updateready": if (ui.upd?.phase === "ready" && ui.upd.version === e.version && ui.upd.hidden) break; ui.upd = { notes: "", notesUrl: "", ...(ui.upd || {}), phase: "ready", version: e.version, hidden: false, error: "" }; renderUpdate(); break;
       case "updatecancelled": if (ui.upd) Object.assign(ui.upd, { phase: "available", hidden: true }); renderUpdate(); break;
-      case "updateerror": if (ui.upd) Object.assign(ui.upd, { phase: "available", hidden: false, error: e.error }); else toast("error", e.error); renderUpdate(); break;
-      case "enginestale": ui.engineStale = e.version; ui.staleHidden = false; renderUpdate(); break;
+      case "updateerror": if (ui.restarting?.kind === "update") stopRestartOverlay(); if (ui.upd) Object.assign(ui.upd, { phase: "available", hidden: false, error: e.error }); else toast("error", e.error); renderUpdate(); break;
+      case "enginestale": if (e.version && ui.restarting?.kind === "engine") stopRestartOverlay(); ui.engineStale = e.version; ui.staleHidden = false; renderUpdate(); break;
       case "tools": toolsBar(e); break;
       case "share": case "shares": case "shareaccount": case "sharelogin": case "shareusage": case "sharetunnels": case "sharetraffic": shEvent(e); break;
       case "builds": {
@@ -8822,13 +8889,20 @@ window.kiri = {
       case "storage": {
         const wasUnavail = ui.storage?.state === "unavailable";
         ui.storage = e;
-        if (e.state === "moving") ui.stErr = "";
+        if (e.state === "moving") {
+          ui.stErr = "";
+          const m = e.moving, pct = m && m.total > 0 ? Math.min(100, Math.round((m.done / m.total) * 100)) : null;
+          startRestartOverlay("storage", m?.to ? tr("Moving Kiri's data to {path}.", { path: `<span class="mono st-path">${esc(m.to)}</span>` }) : tr("Kiri will switch to this folder and restart the engine."), stPhaseText(m?.phase), pct);
+        } else if (ui.restarting?.kind === "storage") {
+          stopRestartOverlay();
+        }
         if (e.reclaimable > 0) ui.stReclaimed = null;
         if (ui.view === "settings" || e.state === "unavailable" || wasUnavail) render();
         break;
       }
       case "storagereclaimed":
         ui.stReclaiming = false;
+        if (ui.restarting?.kind === "reclaim") stopRestartOverlay();
         if (e.error) {
           toast("error", tr("Couldn't reclaim disk space: {error}", { error: e.error }));
         } else {
@@ -8851,6 +8925,7 @@ window.kiri = {
         if (ui.view === "settings") render();
         break;
       case "storagecheck":
+        if (ui.restarting?.kind === "storage") stopRestartOverlay();
         if (e.error) { ui.stErr = e.error; if (ui.view === "settings") render(); else toast("error", e.error); }
         else { ui.stErr = ""; storageConfirm(e); }
         break;
@@ -8957,7 +9032,7 @@ $("content").addEventListener("click", (ev) => {
   else if (t("[data-stpick]")) { ui.stErr = ""; send("storagepick"); }
   else if (t("[data-streclaim]")) {
     if (WIN) {
-      confirmRemove(tr("Compact WSL disk?"), tr("Compacting {vhdx} returns unused space to Windows and briefly restarts Kiri's engine and running containers.", { vhdx: '<span class="mono">ext4.vhdx</span>' }), tr("Compact disk"), () => { ui.stReclaiming = true; ui.stReclaimed = null; send("storagereclaim"); render(); }, "primary");
+      confirmRemove(tr("Compact WSL disk?"), tr("Compacting {vhdx} returns unused space to Windows and briefly restarts Kiri's engine and running containers.", { vhdx: '<span class="mono">ext4.vhdx</span>' }), tr("Compact disk"), () => { ui.stReclaiming = true; ui.stReclaimed = null; startRestartOverlay("reclaim", tr("Compacting {vhdx} and restarting the engine…", { vhdx: '<span class="mono">ext4.vhdx</span>' }), tr("Restarting engine…")); send("storagereclaim"); render(); }, "primary");
     } else {
       ui.stReclaiming = true; ui.stReclaimed = null; send("storagereclaim"); render();
     }
@@ -8967,7 +9042,7 @@ $("content").addEventListener("click", (ev) => {
   }
   else if (t("[data-streset]")) {
     if (ui.storage?.state === "unavailable") {
-      confirmRemove(tr("Reset storage location to default?"), tr("Kiri will switch back to its default folder and restart the engine. Data on the disconnected drive isn't deleted."), tr("Reset to default"), () => send("storagereset"), "primary");
+      confirmRemove(tr("Reset storage location to default?"), tr("Kiri will switch back to its default folder and restart the engine. Data on the disconnected drive isn't deleted."), tr("Reset to default"), () => { startRestartOverlay("storage", tr("Kiri will switch to this folder and restart the engine."), tr("Restarting engine…")); send("storagereset"); }, "primary");
     } else {
       ui.stErr = "";
       send("storagecheck", { path: "", value: { reset: true } });
@@ -9044,7 +9119,7 @@ $("content").addEventListener("click", (ev) => {
     if (cur && !!cur.on !== on) { cur.on = on; send("setresources", { value: { wsl_distro: name, on } }); render(); }
   }
   else if ((el = t("[data-vmpower]"))) { el.disabled = true; powerEngine(el.dataset.vmpower); }
-  else if ((el = t("[data-restartvm]"))) { el.disabled = true; el.textContent = tr("Restarting…"); send("restartvm"); }
+  else if ((el = t("[data-restartvm]"))) { el.disabled = true; el.textContent = tr("Restarting…"); restartVm(); }
   else if ((el = t("[data-detail]"))) openDetail(el.dataset.detail);
   else if (t("[data-ctrcompose]")) show("compose");
   else if ((el = t("[data-img]"))) openImage(el.dataset.img);
@@ -9250,9 +9325,11 @@ function k8sOn(e) {
     case "k8sop":
       if (e.state === "progress") {
         k8s.opLine = e.line.endsWith("…") || e.line.endsWith(".") || e.line.endsWith(")") ? e.line : `${e.line}…`;
+        if (ui.restarting?.kind === "k8s") setRestartStep(k8s.opLine);
         if (k8sShown()) { const el = $("k8s-step"); if (el) el.textContent = k8s.opLine; else render(); }
         break;
       }
+      if (ui.restarting?.kind === "k8s") stopRestartOverlay();
       k8s.op = ""; k8s.opLine = ""; k8s.opAt = 0; k8s.sanDraft = null; k8s.portDraft = null; k8s.argsDraft = null;
       if (e.port) k8s.port = e.port;
       if (e.want_port) k8s.wantPort = e.want_port;
@@ -9279,6 +9356,9 @@ function k8sOn(e) {
 function k8sDo(op, value) {
   if (k8s.op) return;
   Object.assign(k8s, { op, opAt: Date.now(), opLine: op === "start" ? tr("Starting Kubernetes…") : tr(OP_WORDS[op]) });
+  if (op === "set" && (k8sNode()?.State === "running" || k8s.state === "running")) {
+    startRestartOverlay("k8s", esc(tr("Kiri's Kubernetes cluster")), tr("Restarting…"));
+  }
   send("k8s", { action: op, value });
   k8sSide();
   render();

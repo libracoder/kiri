@@ -334,17 +334,23 @@ pub fn resources(body: Option<Value>) {
 /// Restart to apply: WSL stops and Kiri's engine starts again.
 pub fn restart() {
     std::thread::spawn(|| {
+        emit(json!({"type": "state", "state": "stopping"}).to_string());
         let mut cmd = crate::win::tool("wsl.exe");
         std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x0800_0000);
-        let r = cmd.arg("--shutdown").status().and_then(|s| if s.success() { Ok(()) } else { Err(io::Error::other("wsl --shutdown failed")) }).and_then(|()| crate::engine::ensure_daemon());
+        let r = cmd.arg("--shutdown").status().and_then(|s| if s.success() { Ok(()) } else { Err(io::Error::other("wsl --shutdown failed")) }).and_then(|()| {
+            emit(json!({"type": "state", "state": "booting"}).to_string());
+            crate::engine::ensure_daemon()
+        });
         if r.is_ok() {
             let _ = apply_wsl_integration(None, true);
         }
+        emit(json!({"type": "vmrestarted", "ok": r.is_ok()}).to_string());
         emit(match r {
             Ok(()) => notice("ok", &tr("WSL restarted with the new resources")),
             Err(e) => notice("error", &trf("Could not restart WSL: {error}", &[("error", &e)])),
         });
         emit(event().to_string());
+        crate::engine::send(crate::engine::Cmd::Refresh);
     });
 }
 

@@ -726,6 +726,7 @@ fn restart_and_report() {
         }
         Err(e) => {
             crate::serve::log(&format!("engine: did not restart ({e})"));
+            emit(json!({"type": "enginerestarted", "error": e.to_string()}).to_string());
             emit(notice("error", &trf("Could not restart the engine: {error}", &[("error", &e)])));
             if let Some(v) = engine_version()
                 && newer(CURRENT, &v)

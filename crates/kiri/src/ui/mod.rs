@@ -999,20 +999,18 @@ fn builder_settings(save: Option<serde_json::Value>) {
 
 #[cfg(target_os = "macos")]
 fn vm_net(save: Option<serde_json::Value>) {
-    if let Some(body) = save {
-        if let Some(enabled) = body["shared_nat"].as_bool() {
-            match crate::vm_cli::set_shared_nat(enabled) {
-                Ok(()) => emit(notice("ok", &tr("Outbound VM traffic setting saved. Restart the VM to apply."))),
-                Err(e) => emit(notice("error", &trf("Could not save VM networking setting: {error}", &[("error", &e)]))),
-            }
-        }
-    }
+    let saved = save.and_then(|body| body["shared_nat"].as_bool().map(crate::vm_cli::set_shared_nat));
     let configured = crate::daemon::engine::vm_shared_nat_config();
     let env_override = crate::daemon::engine::shared_nat_env();
     let effective = env_override.or(configured).unwrap_or(true);
     let info = client::get_background("/info").ok();
     let awake = info.as_ref().is_some_and(|i| i["KiriVmAwake"] == true);
     let running_shared_nat = awake.then(|| info.as_ref().and_then(|i| i["KiriVmUplink"]["mode"].as_str()).is_none_or(|m| m != "host-egress"));
+    match saved {
+        Some(Ok(())) => emit(serde_json::json!({"type": "notice", "kind": "ok", "text": tr("Outbound VM traffic setting saved. Restart the VM to apply."), "act": if awake { "restartvm" } else { "" }}).to_string()),
+        Some(Err(e)) => emit(notice("error", &trf("Could not save VM networking setting: {error}", &[("error", &e)]))),
+        None => {}
+    }
     emit(
         serde_json::json!({
             "type": "vmnet",
@@ -1178,6 +1176,7 @@ fn restart_engine_now() {
         }
         Err(e) => {
             diag::error!("the engine did not restart", error = e);
+            emit(serde_json::json!({"type": "enginerestarted", "error": e.to_string()}).to_string());
             emit(notice("error", &trf("Could not restart the engine: {error}", &[("error", &e)])));
             if let Some(v) = client::request("GET", "/version", None).ok().filter(|r| r.ok()).and_then(|r| client::kiri_version(&r.json()).map(str::to_owned))
                 && update::newer(env!("CARGO_PKG_VERSION"), &v)
@@ -2706,14 +2705,22 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
             Ok(())
         }
         "restartvm" => {
-            std::thread::spawn(|| {
+            let tx = tx.clone();
+            std::thread::spawn(move || {
                 let _op = diag::enter_op(diag::new_op("restartvm"));
-                let result = expect_ok(client::request("POST", "/kiri/sleep", None)).and_then(|()| expect_ok(client::request("POST", "/kiri/wake", None)));
+                emit(state("stopping", None));
+                let result = expect_ok(client::request("POST", "/kiri/sleep", None)).and_then(|()| {
+                    emit(state("booting", None));
+                    expect_ok(client::request("POST", "/kiri/wake", None))
+                });
+                emit(serde_json::json!({"type": "vmrestarted", "ok": result.is_ok()}).to_string());
                 match result {
                     Ok(()) => emit(notice("ok", &tr("The Linux VM restarted with the new resources"))),
                     Err(e) => emit(notice("error", &trf("Could not restart the VM: {error}", &[("error", &e)]))),
                 }
                 resources(None);
+                vm_net(None);
+                let _ = tx.send(Cmd::Refresh);
             });
             Ok(())
         }
