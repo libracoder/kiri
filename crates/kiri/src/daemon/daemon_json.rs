@@ -125,10 +125,16 @@ fn parse(bytes: &[u8]) -> (RegistryConfig, Vec<String>) {
     (config, problems)
 }
 
+/// `bytes` past a leading UTF-8 byte order mark, which dockerd skips when it
+/// reads daemon.json (Windows PowerShell and older Notepad write one).
+fn without_bom(bytes: &[u8]) -> &[u8] {
+    bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes)
+}
+
 /// [`parse`], and every mirror the file lists, the unused ones included.
 fn parse_all(bytes: &[u8]) -> (RegistryConfig, Vec<String>, Vec<Mirror>) {
     let mut problems = Problems::default();
-    let v: Value = match serde_json::from_slice(bytes) {
+    let v: Value = match serde_json::from_slice(without_bom(bytes)) {
         Ok(v @ Value::Object(_)) => v,
         Ok(_) => return (RegistryConfig::default(), vec!["daemon.json is not a JSON object".into()], Vec::new()),
         Err(e) => return (RegistryConfig::default(), vec![format!("daemon.json is not valid JSON: {e}")], Vec::new()),
@@ -325,8 +331,8 @@ fn set_with(body: &Value, path: &std::path::Path, current: impl Fn() -> Arc<Regi
 fn save_at(path: &std::path::Path, body: &Value) -> Result<(), String> {
     let existing_mode = std::fs::metadata(path).ok().map(|m| mode_of(&m));
     let mut file = match read_limited(path) {
-        Ok(b) if b.iter().all(u8::is_ascii_whitespace) => Map::new(),
-        Ok(b) => match serde_json::from_slice::<Value>(&b) {
+        Ok(b) if without_bom(&b).iter().all(u8::is_ascii_whitespace) => Map::new(),
+        Ok(b) => match serde_json::from_slice::<Value>(without_bom(&b)) {
             Ok(Value::Object(m)) => m,
             _ => return Err(format!("{} is not a JSON object; fix it or remove it, then save again", path.display())),
         },
@@ -635,5 +641,24 @@ mod tests {
         assert!(normalize(&json!(["a.lan", "b.lan"]), INSECURE, 1, |s| Insecure::parse(s).map(|e| e.as_string())).is_err());
         let mirrors = normalize(&json!(["mirror.example.com", "https://mirror.example.com/", "http://mirror.lan:5000"]), MIRRORS, 8, |s| Mirror::parse(s).map(|m| m.as_url())).unwrap();
         assert_eq!(mirrors, ["https://mirror.example.com", "http://mirror.lan:5000"]);
+    }
+
+    #[test]
+    fn a_file_with_a_utf8_bom_is_read_and_saved() {
+        let (c, problems) = parse(b"\xEF\xBB\xBF{\"insecure-registries\": [\"registry.lan:5000\"], \"registry-mirrors\": [\"https://mirror.example.com\"]}");
+        assert!(problems.is_empty(), "{problems:?}");
+        assert!(c.is_insecure("registry.lan:5000"));
+        assert_eq!(c.mirrors.iter().map(Mirror::as_url).collect::<Vec<_>>(), ["https://mirror.example.com"]);
+
+        let d = scratch("bom");
+        let f = d.join("daemon.json");
+        std::fs::write(&f, b"\xEF\xBB\xBF{\"debug\": true}").unwrap();
+        save_at(&f, &json!({INSECURE: ["registry.lan:5000"]})).unwrap();
+        let saved: Value = serde_json::from_slice(&std::fs::read(&f).unwrap()).unwrap();
+        assert_eq!(saved["debug"], json!(true));
+        assert_eq!(saved[INSECURE], json!(["registry.lan:5000"]));
+        std::fs::write(&f, b"\xEF\xBB\xBF\n").unwrap();
+        save_at(&f, &json!({INSECURE: ["registry.lan:5000"]})).unwrap();
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

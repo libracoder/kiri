@@ -125,12 +125,15 @@ pub fn guest_lines(opts: &Value, net_host: bool) -> Result<Vec<String>, String> 
     for u in opts["Ulimits"].as_array().into_iter().flatten() {
         let name = u["Name"].as_str().unwrap_or("");
         let res = RLIMITS.iter().find(|(n, _)| *n == name).map(|(_, r)| *r).ok_or_else(|| format!("invalid ulimit type: {name}"))?;
-        let value = |k: &str| match u[k].as_i64() {
-            Some(v) if v < 0 => UNLIMITED,
-            Some(v) => v as u64,
-            None => u[k].as_u64().unwrap_or(0),
+        // Docker decodes Soft and Hard as int64: a missing one is 0, and a
+        // string or fraction is refused rather than read as 0.
+        let value = |k: &str| match (&u[k], u[k].as_i64()) {
+            (_, Some(v)) if v < 0 => Ok(UNLIMITED),
+            (_, Some(v)) => Ok(v as u64),
+            (Value::Null, None) => Ok(0),
+            (v, None) => v.as_u64().ok_or_else(|| format!("invalid ulimit {name} {k}: {v} is not an integer")),
         };
-        let (soft, hard) = (value("Soft"), value("Hard"));
+        let (soft, hard) = (value("Soft")?, value("Hard")?);
         if soft > hard {
             return Err(format!("ulimit soft limit must be less than or equal to hard limit: {} > {}", u["Soft"], u["Hard"]));
         }
@@ -428,5 +431,16 @@ mod tests {
         }
         assert!(guest_lines(&from_host(&json!({"CgroupnsMode": 123})), false).is_err());
         assert!(guest_lines(&from_host(&json!({"CgroupnsMode": true})), false).is_err());
+    }
+
+    #[test]
+    fn a_ulimit_that_is_not_an_integer_is_refused() {
+        let opts = json!({"Ulimits": [{"Name": "nofile", "Soft": "65536", "Hard": "65536"}]});
+        assert_eq!(guest_lines(&opts, false).unwrap_err(), "invalid ulimit nofile Soft: \"65536\" is not an integer");
+        let opts = json!({"Ulimits": [{"Name": "nproc", "Soft": 10, "Hard": 65536.5}]});
+        assert_eq!(guest_lines(&opts, false).unwrap_err(), "invalid ulimit nproc Hard: 65536.5 is not an integer");
+        // A missing value is Docker's zero, as before.
+        let opts = json!({"Ulimits": [{"Name": "core", "Hard": 0}]});
+        assert_eq!(guest_lines(&opts, false).unwrap(), ["rlimit\t4\t0\t0", "rlimit\t7\t1048576\t1048576"]);
     }
 }
