@@ -277,7 +277,10 @@ pub fn migrate_fresh(parts: &[Part], config: &Path, choice: &Choice, step: &mut 
                 chosen::write_marker(&p.from)?;
             }
             std::fs::create_dir_all(&p.to)?;
-            let mut done = Placed { to: p.to.clone(), moved_in: Vec::new(), set_aside: Vec::new(), had_marker: chosen::has_marker(&p.to) };
+            // Recorded before anything is set aside, so a failure partway
+            // through this folder is undone along with the ones before it.
+            placed.push(Placed { to: p.to.clone(), moved_in: Vec::new(), set_aside: Vec::new(), had_marker: chosen::has_marker(&p.to) });
+            let done = placed.last_mut().expect("just pushed");
             for e in std::fs::read_dir(&p.to)? {
                 let name = e?.file_name();
                 if IGNORED.iter().any(|n| name == *n) || p.skip.iter().any(|n| name == *n) {
@@ -288,7 +291,6 @@ pub fn migrate_fresh(parts: &[Part], config: &Path, choice: &Choice, step: &mut 
                 done.set_aside.push(name);
             }
             chosen::write_marker(&p.to)?;
-            placed.push(done);
         }
         chosen::write_at(config, choice)
     })();
@@ -1120,6 +1122,29 @@ mod tests {
         let choice2 = Choice { path: target2.clone(), previous: Some(target.clone()) };
         assert!(migrate_fresh(&one(&target, &target2), &bad_cfg, &choice2, &mut |_, _| Ok(())).is_err());
         assert!(!target2.exists(), "newly made fresh folder is removed on rollback");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Starting fresh in a folder that holds earlier Kiri data sets that data
+    /// aside; when setting one entry aside fails, the ones already set aside
+    /// come back.
+    #[test]
+    fn start_fresh_failing_partway_brings_back_what_it_set_aside() {
+        let d = scratch("fresh-partial");
+        let (root, target, config) = (d.join("kiri"), d.join("external/kiri"), d.join("state/storage.json"));
+        data(&root);
+        data(&target);
+        // In the order migrate_fresh will meet them.
+        let names: Vec<_> = std::fs::read_dir(&target).unwrap().map(|e| e.unwrap().file_name()).collect();
+        let last = names.last().unwrap();
+        // What an interrupted earlier move left set aside under that name.
+        std::fs::create_dir_all(target.join(REPLACED).join(last).join("left")).unwrap();
+        let choice = Choice { path: target.clone(), previous: Some(root.clone()) };
+        assert!(migrate_fresh(&one(&root, &target), &config, &choice, &mut |_, _| Ok(())).is_err());
+        for n in &names {
+            assert!(target.join(n).exists(), "{n:?} not brought back");
+        }
+        assert!(!config.exists(), "nothing committed");
         let _ = std::fs::remove_dir_all(&d);
     }
 

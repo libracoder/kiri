@@ -82,6 +82,10 @@ impl Volumes {
         if let Some(v) = self.get(name) {
             return Ok(v.clone());
         }
+        // Docker's local driver refuses a new one-character name.
+        if name.len() == 1 {
+            return Err("volume name is too short, names should be at least two alphanumeric characters".into());
+        }
         let v = Volume {
             name: name.to_owned(),
             created_ns: SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0),
@@ -209,7 +213,9 @@ pub fn guest_mount_fields(options: &BTreeMap<String, String>, host_path: impl Fn
     } else {
         device
     };
-    if kind.starts_with("nfs") {
+    // Docker resolves `addr=` for nfs and cifs alike; the kernel takes only
+    // an address there.
+    if kind.starts_with("nfs") || kind == "cifs" {
         data = data
             .split(',')
             .map(|w| match w.strip_prefix("addr=") {
@@ -287,5 +293,37 @@ mod tests {
             guest_mount_fields(&opts(json!({"type": "cifs", "device": "//nas.local/share", "o": "username=u,password=p"})), mac, dns),
             "\tcifs\t//10.0.0.9/share\t0\tusername=u,password=p"
         );
+    }
+
+    #[test]
+    fn a_cifs_addr_is_resolved_like_an_nfs_one() {
+        let opts = |v: serde_json::Value| local_options(&v).unwrap();
+        let dns = |h: &str| (h == "nas.local").then(|| "10.0.0.9".to_owned());
+        assert_eq!(
+            guest_mount_fields(&opts(json!({"type": "cifs", "device": "//nas.local/share", "o": "addr=nas.local,username=u,password=p"})), str::to_owned, dns),
+            "\tcifs\t//10.0.0.9/share\t0\taddr=10.0.0.9,username=u,password=p"
+        );
+        assert_eq!(
+            guest_mount_fields(&opts(json!({"type": "cifs", "device": "//10.0.0.9/share", "o": "addr=gone,username=u"})), str::to_owned, dns),
+            "\tcifs\t//10.0.0.9/share\t0\taddr=gone,username=u"
+        );
+    }
+
+    #[test]
+    fn a_new_one_character_name_is_refused_as_docker_does() {
+        let d = std::env::temp_dir().join(format!("kiri-volumes-short-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let mut v = Volumes::load(&d).unwrap();
+        assert_eq!(v.ensure("a", json!({}), false).unwrap_err(), "volume name is too short, names should be at least two alphanumeric characters");
+        assert!(v.get("a").is_none());
+        v.ensure("ab", json!({}), false).unwrap();
+        // One made before this rule keeps working.
+        let file = d.join("volumes.json");
+        let saved = std::fs::read_to_string(&file).unwrap().replace("\"ab\"", "\"a\"");
+        std::fs::write(&file, saved).unwrap();
+        let mut v = Volumes::load(&d).unwrap();
+        assert_eq!(v.ensure("a", json!({}), false).unwrap().name, "a");
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

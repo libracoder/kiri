@@ -306,6 +306,10 @@ pub fn verify_tree(src: &Path, dst: &Path, skip: &[&str], progress: &mut Progres
         }
         let (s, d) = (entry.path(), dst.join(&name));
         let m = fs::symlink_metadata(&s)?;
+        if m.file_type().is_socket() {
+            // `copy_tree` leaves sockets out.
+            continue;
+        }
         let differs = |what: &str| io::Error::other(format!("the copy of {} {what}", s.display()));
         let got = fs::symlink_metadata(&d).map_err(|_| differs("is missing"))?;
         if m.is_dir() {
@@ -544,6 +548,22 @@ mod tests {
         verify_tree(&src, &dst, &[".kiri-moving"], &mut none).unwrap();
         fs::write(dst.join("blobs/sha256").join(&hex), b"LAYER").unwrap();
         assert!(verify_tree(&src, &dst, &[".kiri-moving"], &mut none).unwrap_err().to_string().contains("digest"));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_socket_is_left_out_of_the_copy_and_its_check() {
+        let d = scratch("socket");
+        let src = d.join("src");
+        fs::create_dir_all(src.join("run")).unwrap();
+        fs::write(src.join("images.json"), b"[]").unwrap();
+        let _listening = std::os::unix::net::UnixListener::bind(src.join("run/app.sock")).unwrap();
+        let dst = d.join("dst");
+        copy_tree(&src, &dst, &[], &mut none).unwrap();
+        assert!(fs::symlink_metadata(dst.join("run/app.sock")).is_err());
+        verify_tree(&src, &dst, &[], &mut none).unwrap();
+        fs::remove_file(dst.join("images.json")).unwrap();
+        assert!(verify_tree(&src, &dst, &[], &mut none).unwrap_err().to_string().contains("missing"));
         let _ = fs::remove_dir_all(&d);
     }
 
