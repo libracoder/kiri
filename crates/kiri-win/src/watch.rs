@@ -98,7 +98,7 @@ pub fn wsl_to_windows(wsl_path: &str, automount_root: &str) -> Option<String> {
     if !automount_root.starts_with('/') || !automount_root.ends_with('/') {
         return None;
     }
-    if wsl_path.contains(['\n', '\r', '\0']) {
+    if wsl_path.contains(['\n', '\r', '\0', '\t']) {
         return None;
     }
     let rest = wsl_path.strip_prefix(automount_root)?;
@@ -118,7 +118,7 @@ pub fn wsl_to_windows(wsl_path: &str, automount_root: &str) -> Option<String> {
         if part.is_empty() {
             continue;
         }
-        if part == "." || part == ".." || part.contains('\\') {
+        if part == "." || part == ".." || part.contains(['\\', ':']) {
             return None;
         }
         parts.push(part);
@@ -133,12 +133,12 @@ pub fn wsl_to_windows(wsl_path: &str, automount_root: &str) -> Option<String> {
 /// Translates a watched Windows root (`C:\Users\me\app`) plus a relative path
 /// from `ReadDirectoryChangesW` (`src\main.js`) back to a WSL automount path
 /// (`/mnt/c/Users/me/app/src/main.js`). Rejects `..`, `.`, control characters,
-/// or malformed roots.
+/// NTFS Alternate Data Streams (`:`), or malformed roots.
 pub fn windows_to_wsl(win_root: &str, rel_win: &str, automount_root: &str) -> Option<String> {
     if !automount_root.starts_with('/') || !automount_root.ends_with('/') {
         return None;
     }
-    if win_root.contains(['\n', '\r', '\0']) || rel_win.contains(['\n', '\r', '\0']) {
+    if win_root.contains(['\n', '\r', '\0', '\t']) || rel_win.contains(['\n', '\r', '\0', '\t']) {
         return None;
     }
     let b = win_root.as_bytes();
@@ -151,7 +151,7 @@ pub fn windows_to_wsl(win_root: &str, rel_win: &str, automount_root: &str) -> Op
         if part.is_empty() {
             continue;
         }
-        if part == "." || part == ".." {
+        if part == "." || part == ".." || part.contains(':') {
             return None;
         }
         comps.push(part);
@@ -161,7 +161,7 @@ pub fn windows_to_wsl(win_root: &str, rel_win: &str, automount_root: &str) -> Op
         if part.is_empty() {
             continue;
         }
-        if part == "." || part == ".." {
+        if part == "." || part == ".." || part.contains(':') {
             return None;
         }
         comps.push(part);
@@ -239,9 +239,9 @@ pub fn decode_notify_buffer(buf: &[u8]) -> Vec<(char, String)> {
 /// Merges two ops for the same path arriving within one 50 ms debounce window.
 fn merge_op(prev: char, next: char) -> char {
     match (prev, next) {
-        (_, 'D') => 'D',
-        ('C', 'M') | ('M', 'C') | ('C', 'C') => 'C',
-        ('D', 'C') | ('D', 'M') | ('M', 'M') => 'M',
+        (_, 'D') | ('D', 'A') => 'D',
+        ('C', 'M') | ('M', 'C') | ('C', 'C') | ('C', 'A') | ('A', 'C') => 'C',
+        ('D', 'C') | ('D', 'M') | ('M', 'M') | ('M', 'A') | ('A', 'M') => 'M',
         _ => next,
     }
 }
@@ -417,37 +417,40 @@ mod runtime {
         }
     }
 
-    struct DirWatcher {
+    pub(super) struct DirWatcher {
         /// Manual-reset event: once set, the worker's wait returns at once,
         /// whether it is waiting already or not yet.
         stop: HANDLE,
         thread: Option<JoinHandle<()>>,
+        /// Whether `watch_dir_loop` opened the directory and emitted `P`.
+        pinned: Arc<AtomicBool>,
         /// The root's WSL path and the channel its `U` line goes out on.
         unpin: Option<(String, mpsc::Sender<(char, String)>)>,
     }
 
     impl DirWatcher {
-        fn start(spec: WatchSpec, automount_root: String, tx: mpsc::Sender<(char, String)>) -> Option<Self> {
+        pub(super) fn start(spec: WatchSpec, automount_root: String, tx: mpsc::Sender<(char, String)>) -> Option<Self> {
             // SAFETY: an unnamed manual-reset event, initially not set.
             let stop = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
             if stop == 0 {
                 return None;
             }
             let pin = if spec.recursive { wsl_dir(&spec.dir, &automount_root) } else { None };
+            let pinned = Arc::new(AtomicBool::new(false));
+            let pinned_w = pinned.clone();
+            let pin_w = pin.clone();
             let tx_c = tx.clone();
-            let thread = std::thread::Builder::new().name("kiri-win-dirwatch".into()).spawn(move || watch_dir_loop(spec, automount_root, tx_c, stop));
+            let thread =
+                std::thread::Builder::new().name("kiri-win-dirwatch".into()).spawn(move || watch_dir_loop(spec, automount_root, tx_c, stop, pin_w, pinned_w));
             let Ok(thread) = thread else {
                 // SAFETY: our own event, never shared.
                 unsafe { CloseHandle(stop) };
                 return None;
             };
-            if let Some(root) = &pin {
-                let _ = tx.send(('P', root.clone()));
-            }
-            Some(DirWatcher { stop, thread: Some(thread), unpin: pin.map(|root| (root, tx)) })
+            Some(DirWatcher { stop, thread: Some(thread), pinned, unpin: pin.map(|root| (root, tx)) })
         }
 
-        fn stop(mut self) {
+        pub(super) fn stop(mut self) {
             // SAFETY: `self.stop` stays open until after the join below.
             unsafe { SetEvent(self.stop) };
             if let Some(t) = self.thread.take() {
@@ -455,7 +458,9 @@ mod runtime {
             }
             // SAFETY: the worker has exited; nothing else uses the event.
             unsafe { CloseHandle(self.stop) };
-            if let Some((root, tx)) = self.unpin.take() {
+            if self.pinned.load(Ordering::Acquire)
+                && let Some((root, tx)) = self.unpin.take()
+            {
                 let _ = tx.send(('U', root));
             }
         }
@@ -463,7 +468,7 @@ mod runtime {
 
     /// Reads changes with overlapped `ReadDirectoryChangesW`, waiting on the
     /// read and `stop` together, so a stop ends the wait at once.
-    fn watch_dir_loop(spec: WatchSpec, automount_root: String, tx: mpsc::Sender<(char, String)>, stop: HANDLE) {
+    fn watch_dir_loop(spec: WatchSpec, automount_root: String, tx: mpsc::Sender<(char, String)>, stop: HANDLE, pin: Option<String>, pinned: Arc<AtomicBool>) {
         let wide: Vec<u16> = OsStr::new(&spec.dir).encode_wide().chain(std::iter::once(0)).collect();
         // SAFETY: valid NUL-terminated UTF-16 path with standard directory flags.
         let h = unsafe {
@@ -486,6 +491,17 @@ mod runtime {
             // SAFETY: our own handle.
             unsafe { CloseHandle(h) };
             return;
+        }
+        if let Some(root) = &pin {
+            if tx.send(('P', root.clone())).is_err() {
+                // SAFETY: closing our own handles before any read is started.
+                unsafe {
+                    CloseHandle(io);
+                    CloseHandle(h);
+                }
+                return;
+            }
+            pinned.store(true, Ordering::Release);
         }
 
         // 64 KiB DWORD-aligned buffer as required by ReadDirectoryChangesW.
@@ -791,5 +807,85 @@ mod tests {
                 WatchSpec { dir: r"C:\Users\me".into(), recursive: false, only_file: Some(".env".into()) },
             ]
         );
+    }
+
+    #[test]
+    fn preserves_mutations_across_attribute_events_and_rejects_ads_and_tabs() {
+        let expected_pairs = [
+            (('C', 'C'), 'C'),
+            (('C', 'M'), 'C'),
+            (('C', 'A'), 'C'),
+            (('C', 'D'), 'D'),
+            (('M', 'C'), 'C'),
+            (('M', 'M'), 'M'),
+            (('M', 'A'), 'M'),
+            (('M', 'D'), 'D'),
+            (('A', 'C'), 'C'),
+            (('A', 'M'), 'M'),
+            (('A', 'A'), 'A'),
+            (('A', 'D'), 'D'),
+            (('D', 'C'), 'M'),
+            (('D', 'M'), 'M'),
+            (('D', 'A'), 'D'),
+            (('D', 'D'), 'D'),
+        ];
+        for ((first, second), want) in expected_pairs {
+            assert_eq!(coalesce_events(&[(first, "/mnt/c/app/f.js".into()), (second, "/mnt/c/app/f.js".into())]), vec![format!("{want}\t/mnt/c/app/f.js")]);
+        }
+
+        assert_eq!(windows_to_wsl(r"C:\Users\me\app", r"assets\logo.png:Zone.Identifier:$DATA", "/mnt/"), None);
+        assert_eq!(windows_to_wsl(r"C:\Users\bad:ads", r"a.js", "/mnt/"), None);
+        assert_eq!(windows_to_wsl(r"C:\Users\me\app", "src\\bad\tname.js", "/mnt/"), None);
+        assert_eq!(windows_to_wsl("C:\\Users\\bad\troot", r"a.js", "/mnt/"), None);
+        assert_eq!(wsl_to_windows("/mnt/c/Users/me/bad\tname", "/mnt/"), None);
+        assert_eq!(wsl_to_windows("/mnt/c/Users/me/file:Zone.Identifier", "/mnt/"), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn dir_watcher_emits_pin_before_events_and_skips_unopened_roots() {
+        let (vtx, vrx) = std::sync::mpsc::channel();
+        let vanished = WatchSpec { dir: format!(r"C:\kiri-nonexistent-watch-{}", std::process::id()), recursive: true, only_file: None };
+        if let Some(w) = runtime::DirWatcher::start(vanished, "/mnt/".into(), vtx) {
+            w.stop();
+        }
+        assert!(vrx.try_recv().is_err(), "unopened directory must emit neither P nor U");
+
+        let dir = std::env::temp_dir().join(format!("kiri-win-watch-pin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let win_dir = dir.to_string_lossy().replace('/', "\\");
+        let wsl_root = wsl_dir(&win_dir, "/mnt/").unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spec = WatchSpec { dir: win_dir, recursive: true, only_file: None };
+        let watcher = runtime::DirWatcher::start(spec, "/mnt/".into(), tx).unwrap();
+
+        let first = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert_eq!(first, ('P', wsl_root.clone()));
+
+        let file = dir.join("app.js");
+        std::fs::write(&file, b"1\n").unwrap();
+        let _ = std::fs::write(format!("{}:Zone.Identifier", file.display()), b"[ZoneTransfer]\r\nZoneId=3\r\n");
+
+        let want_file = format!("{wsl_root}/app.js");
+        let mut saw_file = false;
+        while !saw_file {
+            let (op, path) = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            assert!(!path.contains(":Zone.Identifier"), "ADS event leaked: {path}");
+            if path == want_file {
+                assert!(matches!(op, 'C' | 'M'));
+                saw_file = true;
+            }
+        }
+
+        watcher.stop();
+        let mut tail = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            assert!(!ev.1.contains(":Zone.Identifier"));
+            tail.push(ev);
+        }
+        assert_eq!(tail.last(), Some(&('U', wsl_root)));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

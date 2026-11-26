@@ -92,7 +92,8 @@ pub fn plan_forwards(
         }
         let target_addr = SocketAddr::V4(SocketAddrV4::new(wsl_ip, p.host_port));
         let host_ip = p.host_ip.trim();
-        match p.proto.as_str() {
+        let proto = p.proto.to_ascii_lowercase();
+        match proto.as_str() {
             "udp" => {
                 if host_ip.is_empty() || host_ip == "0.0.0.0" {
                     specs.insert(ForwardSpec {
@@ -307,9 +308,10 @@ fn copy_stream(from: &mut impl Read, to: &mut impl Write) -> io::Result<()> {
 
 struct UdpClientSession {
     backend: UdpSocket,
+    target_addr: SocketAddr,
     last: Arc<Mutex<Instant>>,
     stop: Arc<AtomicBool>,
-    reader: JoinHandle<()>,
+    reader: Option<JoinHandle<()>>,
 }
 
 impl UdpClientSession {
@@ -321,7 +323,6 @@ impl UdpClientSession {
         };
         let backend = UdpSocket::bind(bind_any)?;
         disable_udp_connreset(&backend);
-        backend.connect(target_addr)?;
         let backend_read = backend.try_clone()?;
         backend_read.set_read_timeout(Some(UDP_POLL))?;
         let reply_sock = listener.try_clone()?;
@@ -331,13 +332,23 @@ impl UdpClientSession {
         let stop_r = stop.clone();
         let reader = std::thread::Builder::new().name("kiri-win-udp-reply".into()).spawn(move || {
             let mut rbuf = vec![0u8; 65_536];
-            while !stop_r.load(Ordering::Relaxed) {
-                match backend_read.recv(&mut rbuf) {
-                    Ok(n) => {
-                        *last_r.lock().unwrap_or_else(PoisonError::into_inner) = Instant::now();
-                        let _ = reply_sock.send_to(&rbuf[..n], client_addr);
+            while !stop_r.load(Ordering::SeqCst) {
+                match backend_read.recv_from(&mut rbuf) {
+                    Ok((n, from)) => {
+                        if stop_r.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        if from == target_addr {
+                            *last_r.lock().unwrap_or_else(PoisonError::into_inner) = Instant::now();
+                            let _ = reply_sock.send_to(&rbuf[..n], client_addr);
+                        }
                     }
-                    Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted) => {
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::ConnectionReset | io::ErrorKind::Interrupted
+                        ) =>
+                    {
                         if last_r.lock().unwrap_or_else(PoisonError::into_inner).elapsed() >= UDP_IDLE {
                             break;
                         }
@@ -346,12 +357,15 @@ impl UdpClientSession {
                 }
             }
         })?;
-        Ok(UdpClientSession {
-            backend,
-            last,
-            stop,
-            reader,
-        })
+        Ok(UdpClientSession { backend, target_addr, last, stop, reader: Some(reader) })
+    }
+
+    fn send(&self, payload: &[u8]) -> io::Result<usize> {
+        self.backend.send_to(payload, self.target_addr)
+    }
+
+    fn is_finished(&self) -> bool {
+        self.reader.as_ref().is_none_or(JoinHandle::is_finished)
     }
 
     fn last_active(&self) -> Instant {
@@ -362,14 +376,34 @@ impl UdpClientSession {
         *self.last.lock().unwrap_or_else(PoisonError::into_inner) = Instant::now();
     }
 
-    fn close(self) {
+    fn stop_inner(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
+        if let Some(r) = self.reader.take() {
+            if !r.is_finished()
+                && let Ok(local) = self.backend.local_addr()
+            {
+                let wake_target = wake_connect_addr(local);
+                let bind_any = if wake_target.is_ipv6() {
+                    SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 0, 0, 0))
+                } else {
+                    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+                };
+                if let Ok(waker) = UdpSocket::bind(bind_any) {
+                    let _ = waker.send_to(&[], wake_target);
+                }
+            }
+            let _ = r.join();
+        }
+    }
+
+    fn close(mut self) {
+        self.stop_inner();
     }
 }
 
 impl Drop for UdpClientSession {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
+        self.stop_inner();
     }
 }
 
@@ -439,7 +473,7 @@ fn udp_forward_loop(listener: UdpSocket, target_addr: SocketAddr, stop: Arc<Atom
                 if stop.load(Ordering::SeqCst) {
                     break;
                 }
-                let stale = sessions.get(&peer).is_some_and(|s| s.reader.is_finished());
+                let stale = sessions.get(&peer).is_some_and(UdpClientSession::is_finished);
                 if stale && let Some(old) = sessions.remove(&peer) {
                     old.close();
                 }
@@ -459,7 +493,7 @@ fn udp_forward_loop(listener: UdpSocket, target_addr: SocketAddr, stop: Arc<Atom
                 }
                 if let Some(s) = sessions.get(&peer) {
                     s.touch();
-                    if s.backend.send(&buf[..len]).is_err()
+                    if s.send(&buf[..len]).is_err()
                         && let Some(dead) = sessions.remove(&peer)
                     {
                         dead.close();
@@ -475,11 +509,7 @@ fn udp_forward_loop(listener: UdpSocket, target_addr: SocketAddr, stop: Arc<Atom
         }
         if last_reap.elapsed() >= Duration::from_secs(1) {
             last_reap = Instant::now();
-            let expired: Vec<SocketAddr> = sessions
-                .iter()
-                .filter(|(_, s)| s.last_active().elapsed() >= UDP_IDLE || s.reader.is_finished())
-                .map(|(k, _)| *k)
-                .collect();
+            let expired: Vec<SocketAddr> = sessions.iter().filter(|(_, s)| s.last_active().elapsed() >= UDP_IDLE || s.is_finished()).map(|(k, _)| *k).collect();
             for k in expired {
                 if let Some(s) = sessions.remove(&k) {
                     s.close();
@@ -981,5 +1011,47 @@ mod tests {
         // Port is immediately free to bind again after stop().
         let rebound = TcpListener::bind(fwd_addr);
         assert!(rebound.is_ok(), "port should be released after TcpForwarder::stop()");
+    }
+
+    #[test]
+    fn udp_forwarder_releases_bound_port_on_stop_and_plans_uppercase_protos() {
+        for explicit_stop in [true, false] {
+            let backend = UdpSocket::bind("127.0.0.1:0").unwrap();
+            backend.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let backend_addr = backend.local_addr().unwrap();
+            let spoofer = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let echo = std::thread::spawn(move || {
+                let mut buf = [0u8; 64];
+                let (n, peer) = backend.recv_from(&mut buf).unwrap();
+                spoofer.send_to(b"spoofed", peer).unwrap();
+                backend.send_to(&buf[..n], peer).unwrap();
+            });
+
+            let fwd = UdpForwarder::start("127.0.0.1:0".parse().unwrap(), backend_addr).unwrap();
+            let fwd_addr = fwd.local_addr();
+            let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+            client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            client.send_to(b"ping", fwd_addr).unwrap();
+            let mut rbuf = [0u8; 64];
+            let (n, from) = client.recv_from(&mut rbuf).unwrap();
+            assert_eq!(&rbuf[..n], b"ping");
+            assert_eq!(from, fwd_addr);
+            echo.join().unwrap();
+
+            if explicit_stop {
+                fwd.stop();
+            } else {
+                drop(fwd);
+            }
+            let rebound = UdpSocket::bind(fwd_addr);
+            assert!(rebound.is_ok(), "port should be released immediately after UdpForwarder shutdown");
+        }
+
+        let upper = vec![
+            PublishedPort { proto: "UDP".into(), host_ip: "127.0.0.1".into(), host_port: 19123 },
+            PublishedPort { proto: "TCP".into(), host_ip: "192.0.2.50".into(), host_port: 19124 },
+        ];
+        let specs = plan_forwards(Ipv4Addr::new(198, 51, 100, 107), &upper, &[Ipv4Addr::new(192, 0, 2, 50)], &[]);
+        assert_eq!(specs.len(), 2);
     }
 }
