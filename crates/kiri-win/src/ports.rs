@@ -1027,7 +1027,12 @@ mod tests {
                 backend.send_to(&buf[..n], peer).unwrap();
             });
 
-            let fwd = UdpForwarder::start("127.0.0.1:0".parse().unwrap(), backend_addr).unwrap();
+            // Pick a port outside the OS ephemeral range (49152..65535) so a concurrent
+            // `:0` bind in another parallel test thread never steals `fwd_addr` right
+            // after `fwd.stop()` releases it.
+            let fwd = (38100..38900)
+                .find_map(|port| UdpForwarder::start(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)), backend_addr).ok())
+                .expect("free loopback UDP port in 38100..38900");
             let fwd_addr = fwd.local_addr();
             let client = UdpSocket::bind("127.0.0.1:0").unwrap();
             client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
@@ -1043,8 +1048,17 @@ mod tests {
             } else {
                 drop(fwd);
             }
-            let rebound = UdpSocket::bind(fwd_addr);
-            assert!(rebound.is_ok(), "port should be released immediately after UdpForwarder shutdown");
+            // Allow brief retries in case a concurrent test's `Command::spawn` on Unix
+            // is mid-fork/exec when the socket fd closes.
+            let mut rebound = UdpSocket::bind(fwd_addr);
+            for _ in 0..50 {
+                if rebound.is_ok() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+                rebound = UdpSocket::bind(fwd_addr);
+            }
+            assert!(rebound.is_ok(), "port should be released after UdpForwarder shutdown: {:?}", rebound.err());
         }
 
         let upper = vec![

@@ -261,38 +261,57 @@ fn engine(rx: &Receiver<Cmd>, tx: Sender<Cmd>) {
             }
             Ok(Cmd::Pull(name)) => pull(name),
             Ok(Cmd::Run(name, env)) => {
-                // The page shows its spinner until this says how it went.
-                let result = run_image(&name, &env);
-                emit(json!({"type": "ran", "name": name, "error": result.is_err()}).to_string());
-                act(result)
+                std::thread::spawn(move || {
+                    // The page shows its spinner until this says how it went.
+                    let result = run_image(&name, &env);
+                    emit(json!({"type": "ran", "name": name, "error": result.is_err()}).to_string());
+                    act(result);
+                });
             }
-            Ok(Cmd::RemoveImage(name)) => match client::request("DELETE", &format!("/images/{}", path_escape(&name)), None) {
-                Ok(r) if r.ok() => {
-                    // Only untagged when another name still points at it: nothing freed.
-                    let deleted = r.json().as_array().is_some_and(|a| a.iter().any(|v| v.get("Deleted").is_some()));
-                    emit(json!({"type": "removed", "name": name, "deleted": deleted}).to_string());
-                }
-                Ok(r) => emit(notice("error", &r.error())),
-                Err(e) => emit(notice("error", &e.to_string())),
-            },
+            Ok(Cmd::RemoveImage(name)) => {
+                std::thread::spawn(move || {
+                    match client::request("DELETE", &format!("/images/{}", path_escape(&name)), None) {
+                        Ok(r) if r.ok() => {
+                            // Only untagged when another name still points at it: nothing freed.
+                            let deleted = r.json().as_array().is_some_and(|a| a.iter().any(|v| v.get("Deleted").is_some()));
+                            emit(json!({"type": "removed", "name": name, "deleted": deleted}).to_string());
+                        }
+                        Ok(r) => emit(notice("error", &r.error())),
+                        Err(e) => emit(notice("error", &e.to_string())),
+                    }
+                    send(Cmd::Refresh);
+                });
+            }
             Ok(Cmd::Container { action, id }) => {
                 let (method, path) = match action.as_str() {
                     "remove" => ("DELETE", format!("/containers/{id}?force=1&v=1")),
                     a @ ("start" | "stop" | "restart" | "pause" | "unpause") => ("POST", format!("/containers/{id}/{a}")),
                     _ => continue,
                 };
-                let result = expect_done(client::request(method, &path, None));
-                // Refused to start (a port taken): the container's page says why.
-                if let (Err(e), "start") = (&result, action.as_str()) {
-                    emit(json!({"type": "startfailed", "id": id, "error": e.to_string()}).to_string());
-                }
-                act(result);
+                std::thread::spawn(move || {
+                    let result = expect_done(client::request(method, &path, None));
+                    // Refused to start (a port taken): the container's page says why.
+                    if let (Err(e), "start") = (&result, action.as_str()) {
+                        emit(json!({"type": "startfailed", "id": id, "error": e.to_string()}).to_string());
+                    }
+                    act(result);
+                });
             }
-            Ok(Cmd::RemoveVolume(name)) => act(expect_ok(client::request("DELETE", &format!("/volumes/{}", path_escape(&name)), None))),
-            Ok(Cmd::RemoveNetwork(id)) => act(expect_ok(client::request("DELETE", &format!("/networks/{id}"), None))),
-            Ok(Cmd::Ports { id, ports }) => act(set_ports(&id, ports)),
-            Ok(Cmd::Env { id, env }) => act(set_env(&id, env)),
-            Ok(Cmd::About) => about(),
+            Ok(Cmd::RemoveVolume(name)) => {
+                std::thread::spawn(move || act(expect_ok(client::request("DELETE", &format!("/volumes/{}", path_escape(&name)), None))));
+            }
+            Ok(Cmd::RemoveNetwork(id)) => {
+                std::thread::spawn(move || act(expect_ok(client::request("DELETE", &format!("/networks/{id}"), None))));
+            }
+            Ok(Cmd::Ports { id, ports }) => {
+                std::thread::spawn(move || act(set_ports(&id, ports)));
+            }
+            Ok(Cmd::Env { id, env }) => {
+                std::thread::spawn(move || act(set_env(&id, env)));
+            }
+            Ok(Cmd::About) => {
+                std::thread::spawn(about);
+            }
             Err(RecvTimeoutError::Disconnected) => return,
             Err(RecvTimeoutError::Timeout) => {
                 emit_docker_state_if_changed();
@@ -1516,16 +1535,18 @@ pub fn on_message(msg: &str) {
                 let theme = c.value.as_str().unwrap_or("").to_owned();
                 Handle.run(move |ui| ui.set_theme(&theme));
             }
-            if c.name == "startAtLogin"
-                && let Some(on) = c.value.as_bool()
-                && let Err(e) = crate::setup::set_start_at_login(on)
-            {
-                crate::serve::log(&format!("start at sign-in: {e}"));
-                emit(notice("error", &e.to_string()));
-                emit(json!({"type": "prefs", "prefs": prefs()}).to_string());
-                return;
-            }
+            let start_login = (c.name == "startAtLogin").then(|| c.value.as_bool()).flatten();
             set_pref(&c.name, c.value);
+            if let Some(on) = start_login {
+                std::thread::spawn(move || {
+                    if let Err(e) = crate::setup::set_start_at_login(on) {
+                        crate::serve::log(&format!("start at sign-in: {e}"));
+                        set_pref("startAtLogin", (!on).into());
+                        emit(notice("error", &e.to_string()));
+                        emit(json!({"type": "prefs", "prefs": prefs()}).to_string());
+                    }
+                });
+            }
         }
         // A language the page doesn't carry yet (the main window and setup open
         // with one; setup's langwords comes here too, not being a setup- command):
@@ -1677,7 +1698,8 @@ pub fn on_message(msg: &str) {
         "storagepick" => {
             crate::app::pick_folder(&tr("Choose a storage folder"), |path| {
                 if let Some(p) = path {
-                    crate::storage::check_and_emit(Some(p.to_string_lossy().into_owned()), false, false);
+                    let s = p.to_string_lossy().into_owned();
+                    std::thread::spawn(move || crate::storage::check_and_emit(Some(s), false, false));
                 }
             });
         }

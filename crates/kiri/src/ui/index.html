@@ -1065,9 +1065,12 @@ tr.row:hover td.actions .acts-row { background: linear-gradient(var(--fwd), tran
                font: 500 var(--fs) var(--ui-font); text-align: var(--start); cursor: pointer; }
 .menu button:hover, .menu button:focus-visible { background: var(--raised); outline: none; }
 .menu button.danger { color: var(--red); }
-/* Settings */
-.settings { display: grid; grid-template-columns: 180px 1fr; gap: 28px; align-items: start; max-width: 860px; }
-.settings .tabs { display: grid; gap: 2px; }
+/* Settings: the left tab rail stays static while the pane body scrolls. */
+.content:has(> .settings) { display: flex; flex-direction: column; overflow: hidden; padding-block: 0; padding-inline-end: 0; }
+.settings { flex: 1; min-height: 0; display: grid; grid-template-columns: 180px minmax(0, 1fr); gap: 28px; align-items: stretch; }
+.settings .tabs { display: grid; gap: 2px; align-content: start; padding-block: 4px 20px; overflow-y: auto; }
+.settings-body { min-width: 0; height: 100%; overflow-y: auto; overflow-x: hidden; padding-block: 4px calc(20px + var(--hold, 0px)); padding-inline-end: 24px; }
+.settings-body > :is(.pane, .panes) { max-width: 652px; }
 .settings .tabs button { display: flex; align-items: center; gap: 9px; height: 31px; padding: 0 10px; border: 0; border-radius: 7px; background: transparent;
                          color: var(--muted); font: 500 var(--fs) var(--ui-font); text-align: var(--start); cursor: pointer; }
 .settings .tabs button:hover { background: var(--row-hover); color: var(--text); }
@@ -3023,7 +3026,7 @@ function themeBtn() {
   b.firstElementChild.innerHTML = `<path d="${PH[dark ? "sun" : "moon"]}"/>`;
 }
 const fontLists = { families: [], mono: [] };
-const optsMemo = {}, settingsShown = { html: "", el: null };
+const optsMemo = {}, settingsShown = { html: "", el: null, tab: "" };
 let about = null;
 const SIZES = [0.9, 1, 1.1, 1.25];
 /* Logs are small unless you choose otherwise: they're long and wide. */
@@ -3346,12 +3349,20 @@ function ssScan() {
   for (const s of ssSels) if (s.ssb) ssSync(s); else if (!s.classList.contains("lsrc")) ssWrap(s);
   ss.open?.check();
 }
+function ssMut(records) {
+  for (const b of ss.btns) if (!b.isConnected || b.nextSibling !== b.ssOf) return ssScan();
+  for (const s of ssSels) if (!s.ssb && !s.classList.contains("lsrc")) return ssScan();
+  for (const r of records) {
+    const t = r.target;
+    if (t.nodeType === 1 && (t.tagName === "SELECT" || t.closest?.("select, label"))) return ssScan();
+  }
+}
 // A value set from code shows on the button too.
 for (const p of ["value", "selectedIndex"]) {
   const d = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, p);
   Object.defineProperty(HTMLSelectElement.prototype, p, { ...d, set(v) { d.set.call(this, v); if (this.ssb) ssSync(this); } });
 }
-new MutationObserver(ssScan).observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ["disabled", "selected", "aria-label"] });
+new MutationObserver(ssMut).observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ["disabled", "selected", "aria-label"] });
 ssScan();
 function ssOpen(b) {
   if (ss.open) { const was = ss.open.b; ss.open.close(true); if (was === b) return; }
@@ -3528,7 +3539,7 @@ window.kiriWords = (p) => {
    the terminal are kept as live elements, so a list refresh never wipes
    them or what is being typed. */
 function makeLogConsole() {
-  const el = Object.assign(document.createElement("div"), { className: "console numbered", tabIndex: 0 });
+  const el = Object.assign(document.createElement("div"), { className: "console numbered", tabIndex: 0, _shown: 0 });
   el.setAttribute("role", "log");
   return el;
 }
@@ -3565,7 +3576,7 @@ function openDetail(id) {
   const name = c.Names[0].replace(/^\//, "");
   ui.detail = { id, name, tab: "overview", info: null, logsOn: false, follow: true, logFilter: "", logLevel: "",
                 term: { history: [], at: -1, user: "", host: "", cwd: "", probed: false }, files: { path: "/", entries: null, selected: null, preview: null } };
-  logEl.textContent = "";
+  logEl.textContent = ""; logEl._shown = 0;
   termEl.querySelector("#term-out").textContent = "";
   ui.partial = { false: "", true: "" }; ui.logN = 0;
   ui.detail.stats = [];
@@ -3661,7 +3672,7 @@ function closeDetail() {
 function setTab(tab) {
   const d = ui.detail;
   d.tab = tab;
-  if (tab === "logs" && !d.logsOn) { d.logsOn = true; logEl.textContent = ""; ui.partial = { false: "", true: "" }; ui.logN = 0; send("logs", { id: d.id }); }
+  if (tab === "logs" && !d.logsOn) { d.logsOn = true; logEl.textContent = ""; logEl._shown = 0; ui.partial = { false: "", true: "" }; ui.logN = 0; send("logs", { id: d.id }); }
   if (tab === "files" && !d.files.entries) browse("/");
   if (tab === "overview") send("inspect", { id: d.id });
   watchStats();
@@ -3698,13 +3709,14 @@ function updateLogCount(el, countId, d) {
   const cnt = $(countId);
   if (!cnt || !d) return;
   const all = el.childElementCount;
-  const showing = d.logFilter || d.logLevel ? [...el.children].filter((x) => !x.classList.contains("hide")).length : all;
+  const showing = d.logFilter || d.logLevel ? (el._shown ?? all) : all;
   cnt.textContent = d.logFilter || d.logLevel ? tr("{showing} of {all} lines", { showing: showing.toLocaleString(), all: all.toLocaleString() }) : tr("{all} lines", { all: all.toLocaleString() });
 }
 function appendLogParts(el, countId, d, partial, nextN, parts) {
   const atEnd = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
   const filter = d.logFilter.toLowerCase(), level = d.logLevel;
   const frag = document.createDocumentFragment();
+  let addedShown = 0;
   for (const p of parts) {
     const key = Boolean(p.e);
     const lines = ((partial[key] || "") + p.t.replace(ansi, "").replace(/\r\n/g, "\n")).split("\n");
@@ -3717,28 +3729,41 @@ function appendLogParts(el, countId, d, partial, nextN, parts) {
       else if (p.e) div.className = "err";
       div.textContent = line || " ";
       div.dataset.n = nextN();
-      if (!shown(div, filter, level)) div.classList.add("hide");
+      if (shown(div, filter, level)) addedShown++;
+      else div.classList.add("hide");
       frag.append(div);
     }
   }
+  el._shown = (el._shown ?? el.childElementCount) + addedShown;
   el.append(frag);
-  while (el.childElementCount > LOG_MAX) el.firstElementChild.remove();
+  while (el.childElementCount > LOG_MAX) {
+    if (!el.firstElementChild.classList.contains("hide")) el._shown--;
+    el.firstElementChild.remove();
+  }
   if (d.follow && atEnd || d.follow && parts.length > 50) el.scrollTop = el.scrollHeight;
   updateLogCount(el, countId, d);
 }
 function applyLogFilter(el, countId, d) {
   const f = d.logFilter.toLowerCase();
-  for (const div of el.children) div.classList.toggle("hide", !shown(div, f, d.logLevel));
+  let visCount = 0;
+  for (const div of el.children) {
+    const vis = shown(div, f, d.logLevel);
+    div.classList.toggle("hide", !vis);
+    if (vis) visCount++;
+  }
+  el._shown = visCount;
   updateLogCount(el, countId, d);
 }
 function appendLogEnd(el, text) {
   const div = document.createElement("div");
   div.className = "quiet";
   div.textContent = text;
+  el._shown = (el._shown ?? el.childElementCount) + 1;
   el.append(div);
 }
 function clearLogConsole(el, countId, d, partial, resetN) {
   el.textContent = "";
+  el._shown = 0;
   partial.false = "";
   partial.true = "";
   resetN();
@@ -5031,27 +5056,28 @@ function storageConfirm(c) {
 
 function renderSettings() {
   const tab = (id, icon, label) => `<button data-stab="${id}" aria-current="${prefs.tab === id}"><svg class="i" viewBox="0 0 256 256"><path d="${PH[icon]}"/></svg>${label}</button>`;
-  const opts = (list, current, system) => {
-    const memo = optsMemo[system];
-    if (memo?.list !== list || memo.current !== current) optsMemo[system] = { list, current, html: [system, ...list].map((f) =>
-      `<option value="${esc(f)}"${f === current ? " selected" : ""}>${f !== system ? esc(f) : f === "System" ? tr("System|font") : tr("System Mono|font")}</option>`).join("") };
-    return optsMemo[system].html;
-  };
-  /* A tiny window in each theme's colours, for the Theme choice. */
-  const mini = (dark) => {
-    const c = dark ? { bg: "#0F1419", side: "#121920", line: "#2A313A", bar: "#66707C", text: "#98A1AC" } : { bg: "#FFFFFF", side: "#EDF0F5", line: "#DDE3EB", bar: "#8A929C", text: "#5E6773" };
-    const accent = (ACCENTS.find(([id]) => id === prefs.accent) || ACCENTS[0])[2];
-    const rows = [0, 1, 2, 3].map((i) => `<rect x="46" y="${22 + i * 11}" width="${[40, 32, 44, 30][i]}" height="3" rx="1.5" fill="${i === 1 ? accent : c.text}"/><rect x="${96}" y="${22 + i * 11}" width="${[18, 24, 14, 20][i]}" height="3" rx="1.5" fill="${["#3FB68B", "#3FB68B", "#FFC23D", "#3FB68B"][i]}"/>`).join("");
-    return `<svg viewBox="0 0 132 74" aria-hidden="true"><rect x=".5" y=".5" width="131" height="73" rx="6" fill="${c.bg}" stroke="${c.line}"/>
-      <path d="M6.5 .5h32v73h-32a6 6 0 0 1-6-6v-61a6 6 0 0 1 6-6z" fill="${c.side}"/>${[0, 1, 2].map((i) => `<circle cx="${7 + i * 5}" cy="7" r="1.6" fill="${c.bar}"/>`).join("")}
-      ${[0, 1, 2, 3].map((i) => `<rect x="7" y="${18 + i * 9}" width="${[22, 18, 24, 16][i]}" height="3" rx="1.5" fill="${i === 0 ? accent : c.bar}"/>`).join("")}
-      <rect x="44" y="30.5" width="84" height="9" rx="2" fill="${accent}" fill-opacity=".14"/>${rows}<rect x="106" y="62" width="20" height="6" rx="2" fill="${accent}"/></svg>`;
-  };
-  const inUse = darkNow();
-  const sysName = LANGS.find(([id]) => id === resolveLang("system"))?.[1] || "English";
-  const startAtLogin = prefs.startAtLogin ?? !LINUX;
-  const stopOnQuit = prefs.stopOnQuit === true;
-  const appearance = `<div class="pane"><h3>${tr("Appearance")}</h3>
+  const appearancePane = () => {
+    const opts = (list, current, system) => {
+      const memo = optsMemo[system];
+      if (memo?.list !== list || memo.current !== current) optsMemo[system] = { list, current, html: [system, ...list].map((f) =>
+        `<option value="${esc(f)}"${f === current ? " selected" : ""}>${f !== system ? esc(f) : f === "System" ? tr("System|font") : tr("System Mono|font")}</option>`).join("") };
+      return optsMemo[system].html;
+    };
+    /* A tiny window in each theme's colours, for the Theme choice. */
+    const mini = (dark) => {
+      const c = dark ? { bg: "#0F1419", side: "#121920", line: "#2A313A", bar: "#66707C", text: "#98A1AC" } : { bg: "#FFFFFF", side: "#EDF0F5", line: "#DDE3EB", bar: "#8A929C", text: "#5E6773" };
+      const accent = (ACCENTS.find(([id]) => id === prefs.accent) || ACCENTS[0])[2];
+      const rows = [0, 1, 2, 3].map((i) => `<rect x="46" y="${22 + i * 11}" width="${[40, 32, 44, 30][i]}" height="3" rx="1.5" fill="${i === 1 ? accent : c.text}"/><rect x="${96}" y="${22 + i * 11}" width="${[18, 24, 14, 20][i]}" height="3" rx="1.5" fill="${["#3FB68B", "#3FB68B", "#FFC23D", "#3FB68B"][i]}"/>`).join("");
+      return `<svg viewBox="0 0 132 74" aria-hidden="true"><rect x=".5" y=".5" width="131" height="73" rx="6" fill="${c.bg}" stroke="${c.line}"/>
+        <path d="M6.5 .5h32v73h-32a6 6 0 0 1-6-6v-61a6 6 0 0 1 6-6z" fill="${c.side}"/>${[0, 1, 2].map((i) => `<circle cx="${7 + i * 5}" cy="7" r="1.6" fill="${c.bar}"/>`).join("")}
+        ${[0, 1, 2, 3].map((i) => `<rect x="7" y="${18 + i * 9}" width="${[22, 18, 24, 16][i]}" height="3" rx="1.5" fill="${i === 0 ? accent : c.bar}"/>`).join("")}
+        <rect x="44" y="30.5" width="84" height="9" rx="2" fill="${accent}" fill-opacity=".14"/>${rows}<rect x="106" y="62" width="20" height="6" rx="2" fill="${accent}"/></svg>`;
+    };
+    const inUse = darkNow();
+    const sysName = LANGS.find(([id]) => id === resolveLang("system"))?.[1] || "English";
+    const startAtLogin = prefs.startAtLogin ?? !LINUX;
+    const stopOnQuit = prefs.stopOnQuit === true;
+    return `<div class="pane"><h3>${tr("Appearance")}</h3>
     <div class="pref"><span class="t" id="pref-lang-t">${tr("Language")}</span><span class="d">${tr("Follow {os} (now {lang}), or always use one language.", { os: OS, lang: sysName })}</span>
       ${langButton(sysName)}
       <select id="pref-lang" class="lsrc" aria-label="${tr("Language")}" aria-hidden="true" tabindex="-1" inert>${[["system", `${tr("System")} (${sysName})`], ...LANGS].map(([v, l]) => `<option value="${v}"${(prefs.lang || "system") === v ? " selected" : ""}${v === "system" ? "" : ` lang="${v}"`}>${l}</option>`).join("")}</select></div>
@@ -5080,9 +5106,11 @@ function renderSettings() {
     ${ui.shellPath && ui.shellPath.supported !== false ? `<div class="pref"><span class="t">${tr("Command-line tools in shell")}</span><span class="d">${tr("Add {bin} to {zshrc} and {zprofile} so {docker}, {kubectl} and {kiri} work in new terminals.", { bin: '<span class="mono">~/.kiri/bin</span>', zshrc: '<span class="mono">.zshrc</span>', zprofile: '<span class="mono">.zprofile</span>', docker: '<span class="mono">docker</span>', kubectl: '<span class="mono">kubectl</span>', kiri: '<span class="mono">kiri</span>' })}</span>
       <div class="seg" role="group" aria-label="${tr("Command-line tools in shell")}"><button data-shellpath="0" aria-pressed="${!ui.shellPath.enabled}"${ui.shellPathBusy ? " disabled" : ""}>${tr("Off")}</button><button data-shellpath="1" aria-pressed="${!!ui.shellPath.enabled}"${ui.shellPathBusy ? " disabled" : ""}>${tr("On")}</button></div></div>` : ""}
   </div>`;
-  const portsPref = routerPortsPref();
-  // On Linux: kiri.localhost only, for now; nothing to switch.
-  const domainsPane = LINUX ? `<div class="pane"><h3>${tr("Domains")}</h3>
+  };
+  const domainsPane = () => {
+    const portsPref = routerPortsPref();
+    // On Linux: kiri.localhost only, for now; nothing to switch.
+    return LINUX ? `<div class="pane"><h3>${tr("Domains")}</h3>
     <div class="pref"><span class="t">${tr("Local names")}</span><span class="d">${tr("Running containers answer at <span class=mono>&lt;name&gt;.kiri.localhost</span>, which needs no setup.")}</span></div>
     ${portsPref}
     <p class="muted">${tr("Compose services answer at {addr}.", { addr: `<span class="mono">&lt;service&gt;.&lt;project&gt;.kiri.localhost</span>` })} ${tr("{local} names and HTTPS aren't on Linux yet.", { local: `<span class="mono">.kiri.local</span>` })}</p>
@@ -5107,10 +5135,12 @@ function renderSettings() {
     ${portsPref}
     <p class="muted">${tr("Compose services answer at {addr}.", { addr: `<span class="mono">&lt;service&gt;.&lt;project&gt;.${ui.suffix}</span>` })} ${tr("Changing this needs admin rights (an administrator password), since it adds or removes {path}.", { path: `<span class="mono">/etc/resolver/kiri.local</span>` })}</p>
   </div>`;
-  const a = about;
-  const mib = (b) => (b ? `${(b / 1073741824).toFixed(1)} GB` : "—");
-  const canUninstall = a?.can_uninstall ?? (!WIN && !LINUX);
-  const aboutPane = `<div class="pane about"><div class="about-head">
+  };
+  const aboutPane = () => {
+    const a = about;
+    const mib = (b) => (b ? `${(b / 1073741824).toFixed(1)} GB` : "—");
+    const canUninstall = a?.can_uninstall ?? (!WIN && !LINUX);
+    return `<div class="pane about"><div class="about-head">
       <svg viewBox="0 0 64 64" aria-hidden="true"><g transform="translate(6 0) skewX(-10)"><clipPath id="lid2"><rect x="22" y="12" width="34" height="40" rx="10"/></clipPath>
         <rect x="22" y="12" width="34" height="40" rx="10" fill="#E0B420"/><g clip-path="url(#lid2)"><rect x="10" y="0" width="60" height="21.5" fill="#F2CF5B"/></g>
         <g fill="#0F1419"><ellipse cx="41.5" cy="29" rx="3.1" ry="3.6"/><ellipse cx="50.5" cy="29" rx="3.1" ry="3.6"/></g></g>
@@ -5129,18 +5159,25 @@ function renderSettings() {
     ${canUninstall ? `<div class="pref"><span class="t">${tr("Uninstall Kiri")}</span>
       <span class="d">${tr("Stops the engine, removes Kiri's background service, CLI links and shell profile entries, and restores your previous Docker context ({cmd}).", { cmd: '<span class="mono">kiri setup --uninstall</span>' })}</span>
       <span class="pact"><button class="btn danger" data-uninstall>${tr("Uninstall Kiri…")}</button></span></div>` : ""}</div>`;
+  };
+  const body = prefs.tab === "diagnostics" ? diagPane() : prefs.tab === "about" ? aboutPane() : prefs.tab === "domains" ? domainsPane() : prefs.tab === "resources" ? `<div class="panes">${enginePane()}${resourcesPane()}${wslPane()}</div>` : prefs.tab === "storage" ? storagePane() : prefs.tab === "network" ? networkPane() : prefs.tab === "builds" ? buildsPane() : prefs.tab === "registries" ? `<div class="panes">${loginsOn() ? registriesPane() : ""}${regListPane("insecure")}${regListPane("mirrors")}</div>` : prefs.tab === "kubernetes" ? kubernetesPane() : prefs.tab === "import" ? importPane() : appearancePane();
   const html = `<div class="settings"><div class="tabs">${tab("appearance", "textaa", tr("Appearance"))}${tab("resources", "stack", tr("Resources"))}${tab("storage", "harddrive", tr("Storage"))}${tab("network", "globe", tr("Network"))}${tab("builds", "hammer", tr("Builds"))}${tab("registries", "lock", tr("Registries"))}${tab("kubernetes", "pods", "Kubernetes")}${tab("import", "stack", tr("Import"))}${tab("domains", "network", tr("Domains"))}${tab("diagnostics", "bug", tr("Diagnostics"))}${tab("about", "info", tr("About"))}</div>
-    ${prefs.tab === "diagnostics" ? diagPane() : prefs.tab === "about" ? aboutPane : prefs.tab === "domains" ? domainsPane : prefs.tab === "resources" ? `<div class="panes">${enginePane()}${resourcesPane()}${wslPane()}</div>` : prefs.tab === "storage" ? storagePane() : prefs.tab === "network" ? networkPane() : prefs.tab === "builds" ? buildsPane() : prefs.tab === "registries" ? `<div class="panes">${loginsOn() ? registriesPane() : ""}${regListPane("insecure")}${regListPane("mirrors")}</div>` : prefs.tab === "kubernetes" ? kubernetesPane() : prefs.tab === "import" ? importPane() : appearance}</div>`;
+    <div class="settings-body">${body}</div></div>`;
   // The container lists arrive every few seconds; rebuilding an unchanged page
   // closes an open menu. The font menus list names in the interface font: an
   // option in its own font made WebKit load every installed font (438 here)
   // the first time Appearance showed, freezing the window for about 3 s. The
   // preview below them shows the chosen fonts.
   if (html === settingsShown.html && settingsShown.el?.isConnected) return;
-  const kept = signinKeep($("content"));
-  $("content").innerHTML = html;
-  signinPut($("content"), kept);
-  settingsShown.html = html; settingsShown.el = $("content").firstElementChild;
+  const c = $("content"), sameTab = settingsShown.el?.isConnected && settingsShown.tab === prefs.tab;
+  const tscroll = c.querySelector(".settings .tabs")?.scrollTop || 0;
+  const bscroll = sameTab ? (c.querySelector(".settings-body")?.scrollTop || 0) : 0;
+  const kept = signinKeep(c);
+  c.innerHTML = html;
+  signinPut(c, kept);
+  if (tscroll) c.querySelector(".settings .tabs").scrollTop = tscroll;
+  if (bscroll) c.querySelector(".settings-body").scrollTop = bscroll;
+  settingsShown.html = html; settingsShown.el = c.firstElementChild; settingsShown.tab = prefs.tab;
   diagDrawn();
   for (const k of ["http", "https", "no_proxy"]) $(`px-${k}`)?.addEventListener("input", (ev) => { ui.pxDraft[k] = ev.target.value; });
   for (const k of ["insecure", "mirrors"]) {
@@ -5207,6 +5244,8 @@ function show(view) {
   // From the top, as a container's or pod's page opens: leaving a page scrolled
   // down (a long Terminal or Logs tab) otherwise opened the next view below its rows.
   $("content").scrollTop = 0;
+  const sb = $("content").querySelector(".settings-body");
+  if (sb) sb.scrollTop = 0;
 }
 
 const empty = {
@@ -7556,6 +7595,7 @@ function navTags() {
 addEventListener("resize", navTags);
 function render() {
   if (held(render)) return;
+  schedulePlaceFloats();
   if (ui.view !== "compose") cmpHWait(false);
   if (langPopState.close) queueMicrotask(() => { if (langPopState.close && !$("pref-lang-btn")) langPopState.close(false); });
   themeBtn();
@@ -7901,8 +7941,8 @@ function runTip(image, text, id) {
     // Before the button in reading order: on its left, or on its right right to left (.run-tip's transform).
     el.style.left = `${rtl() ? r.right : r.left}px`;
     el.style.top = `${r.top + r.height / 2}px`;
-    requestAnimationFrame(place);
   };
+  el._place = place;
   place();
   el.timer = setTimeout(() => el.remove(), 8000);
   return true;
@@ -7921,6 +7961,7 @@ function runTipFailed(id) {
   el.innerHTML = `<svg viewBox="0 0 256 256" aria-hidden="true"><path d="${PH.warning}"/></svg><span class="t">${why.short ? tr("{name} stopped: {why}", { name: `<b>${esc(name)}</b>`, why: esc(why.short) }) : tr("{name} stopped", { name: `<b>${esc(name)}</b>` })}</span>`
     + (why.kind === "env" ? `<button class="lnk" data-tfix>${tr("Set it and start")}</button>` : `<button class="lnk" data-tview>${tr("See why")}</button>`)
     + `<span class="sep">·</span><button class="lnk" data-tlogs>${tr("Logs")}</button>`;
+  el._place?.();
 }
 
 /* Why a container stopped, from its own words: the last lines of its log
@@ -8048,7 +8089,19 @@ function needClose(done) {
   p.el.remove();
   if (ui.view === "images") render();
 }
-// Below the Run button, or above it when there's no room; it follows the list as it redraws.
+// Below the Run button, or above it when there's no room; it follows the list on scroll, resize and redraw.
+let floatRaf = 0;
+function placeFloats() {
+  floatRaf = 0;
+  document.querySelector(".run-tip")?._place?.();
+  if (ui.need) needPlace();
+}
+function schedulePlaceFloats() {
+  if (floatRaf || (!ui.need && !document.querySelector(".run-tip"))) return;
+  floatRaf = requestAnimationFrame(placeFloats);
+}
+addEventListener("scroll", schedulePlaceFloats, { capture: true, passive: true });
+addEventListener("resize", schedulePlaceFloats, { passive: true });
 function needPlace() {
   const p = ui.need;
   if (!p || !p.el.isConnected) return;
@@ -8063,7 +8116,6 @@ function needPlace() {
   const up = h > roomBelow && roomAbove > roomBelow;
   el.classList.toggle("above", up); el.classList.toggle("below", !up);
   el.style.top = `${up ? Math.max(8, r.top - 9 - h) : r.bottom + 9}px`;
-  requestAnimationFrame(needPlace);
 }
 // What Run sends, or null while something it needs is missing.
 function needEnv() {
@@ -8093,6 +8145,7 @@ function needCheck() {
   }
   p.el.classList.toggle("sec-off", !!p.el.querySelector("[data-needoff]")?.checked);
   p.el.querySelector("[data-needgo]").disabled = !needEnv();
+  needPlace();
 }
 document.addEventListener("input", (ev) => { if (ev.target.closest(".need")) needCheck(); });
 document.addEventListener("change", (ev) => { if (ev.target.closest(".need")) needCheck(); });
@@ -8122,6 +8175,7 @@ document.addEventListener("click", (ev) => {
   } else if (b?.matches("[data-needdisc]")) {
     const x = b.getAttribute("aria-expanded") !== "true";
     b.setAttribute("aria-expanded", x); b.nextElementSibling.hidden = !x;
+    needPlace();
   }
 });
 const appName = (image) => { const b = (image || "").split("@")[0].split(":")[0].split("/").pop(); return APPS[b] || (b ? b[0].toUpperCase() + b.slice(1) : tr("This image")); };
@@ -8438,9 +8492,9 @@ function dgMark(text) {
 }
 const dgFields = (l) => Object.entries(l.fields || {}).map(([k, v]) => ` ${k}=${typeof v === "string" ? (/\s/.test(v) || !v ? JSON.stringify(v) : v) : JSON.stringify(v)}`);
 const dgText = (l) => `${l.msg || ""}${dgFields(l).join("")}`;
-function dgRow(l) {
+function dgRow(l, key = "") {
   const lv = ["error", "warn", "info", "debug"].includes(l.level) ? l.level : "info";
-  return `<div class="dg-row ${lv}${lv === "error" ? " hit" : ""}"><span class="t">${esc(dgTime(l.time))}</span><span class="lv">${lv.toUpperCase()}</span><span class="p">${(DG_PART[l.part] && tr(DG_PART[l.part])) || esc(l.part || "")}</span><span class="m">${dgMark(l.msg || "")}${dgFields(l).map((f) => `<span class="k">${dgMark(f)}</span>`).join("")}</span></div>`;
+  return `<div class="dg-row ${lv}${lv === "error" ? " hit" : ""}"${key ? ` data-key="${esc(key)}"` : ""}><span class="t">${esc(dgTime(l.time))}</span><span class="lv">${lv.toUpperCase()}</span><span class="p">${(DG_PART[l.part] && tr(DG_PART[l.part])) || esc(l.part || "")}</span><span class="m">${dgMark(l.msg || "")}${dgFields(l).map((f) => `<span class="k">${dgMark(f)}</span>`).join("")}</span></div>`;
 }
 // A line as text, for Copy: local time, level, part, message and fields.
 const dgPlain = (l) => `${dgTime(l.time)} ${(l.level || "").toUpperCase().padEnd(5)} ${(DG_PART[l.part] || l.part || "").padEnd(6)} ${dgText(l)}`;
@@ -8464,10 +8518,16 @@ function drawDiagLog() {
   const key = `${rows.length}|${rows.at(-1)?.time}|${rows[0]?.time}|${dg.find}`;
   $("dg-count").textContent = dg.lines ? trn(rows.length, "{n} line", "{n} lines") : "";
   if (key === dg.shown && el.childElementCount) return;
+  const sel = getSelection();
+  if (dg.shown && sel && !sel.isCollapsed && (el.contains(sel.anchorNode) || el.contains(sel.focusNode))) return;
   dg.shown = key;
-  const top = el.scrollTop;
-  el.innerHTML = !dg.lines ? `<div class="dg-empty">${tr("Reading the log…")}</div>` : rows.length ? rows.map(dgRow).join("")
-    : `<div class="dg-empty">${dg.find || dg.level || dg.part || dg.op ? tr("No lines match.") : tr("Nothing logged yet.")}</div>`;
+  const top = el.scrollTop, seen = new Map();
+  const html = !dg.lines ? `<div class="dg-empty">${tr("Reading the log…")}</div>` : rows.length ? rows.map((l) => {
+    const base = `${l.time}|${l.level}|${l.part}|${l.msg || ""}`, n = (seen.get(base) || 0) + 1;
+    seen.set(base, n);
+    return dgRow(l, `${base}#${n}`);
+  }).join("") : `<div class="dg-empty">${dg.find || dg.level || dg.part || dg.op ? tr("No lines match.") : tr("Nothing logged yet.")}</div>`;
+  morph(el, html);
   el.scrollTop = dg.follow ? el.scrollHeight : top;
 }
 
@@ -9264,7 +9324,6 @@ function k8sSettings() {
   closePod();
   prefs.tab = "kubernetes";
   show("settings");
-  document.querySelector("#content .pane")?.scrollIntoView({ block: "start" });
 }
 /* Short enough for the group label's row: a restart is a start there. */
 const SIDE_WORDS = { start: "Starting", stop: "Stopping", set: "Starting", deletecluster: "Deleting" };

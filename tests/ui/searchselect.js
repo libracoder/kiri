@@ -116,7 +116,7 @@ t("a short list has no search box; letters jump, Tab closes and moves on", () =>
   need(!pop() && document.activeElement === mbtn(), "Tab didn't close to the button");
 });
 t("near the bottom the list opens upwards, all of it in the window", () => {
-  const c = document.getElementById("content");
+  const c = document.querySelector(".settings-body") || document.getElementById("content");
   c.scrollTop = 0;
   const y = box(fbtn()).bottom;
   c.scrollTop = Math.max(0, y - innerHeight + 24);

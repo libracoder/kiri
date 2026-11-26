@@ -180,9 +180,48 @@ pub fn headroom(bytes: u64) -> u64 {
     bytes / 10 + 1_000_000_000
 }
 
+/// Persisted non-compactable VHDX + ext4 metadata floor (`<root>/vhdx-overhead`),
+/// measured right after `fstrim` + VHDX compaction so WSL2's VHDX header/BAT and
+/// allocated ext4 metadata aren't repeatedly advertised as reclaimable space.
+pub const VHDX_OVERHEAD_FILE: &str = "vhdx-overhead";
+
 /// Reclaimable bytes below 64 MiB are reported as 0 to avoid prompting
 /// pointless VHDX compaction over filesystem slack.
 pub const RECLAIM_THRESHOLD: u64 = 64 << 20;
+
+/// Effective bytes occupied inside `ext4.vhdx`, adding the measured post-compact
+/// metadata floor (`recorded_overhead`, clamped downward if blocks were reused)
+/// without guessing from WSL's 1 TB virtual capacity on an uncompacted dynamic VHDX.
+pub fn effective_vhdx_in_use(
+    disk_host: Option<u64>,
+    raw_in_use: Option<u64>,
+    recorded_overhead: Option<u64>,
+) -> (Option<u64>, Option<u64>) {
+    let Some(raw) = raw_in_use else {
+        return (None, None);
+    };
+    let Some(saved) = recorded_overhead else {
+        return (Some(raw), None);
+    };
+    let overhead = match disk_host {
+        Some(host) => saved.min(host.saturating_sub(raw)),
+        None => saved,
+    };
+    let clamped = (overhead < saved).then_some(overhead);
+    (Some(raw.saturating_add(overhead)), clamped)
+}
+
+pub fn read_vhdx_overhead(root: &Path) -> Option<u64> {
+    fs::read_to_string(root.join(VHDX_OVERHEAD_FILE)).ok()?.trim().parse::<u64>().ok()
+}
+
+pub fn write_vhdx_overhead(root: &Path, bytes: u64) {
+    let path = root.join(VHDX_OVERHEAD_FILE);
+    let tmp = root.join("vhdx-overhead.tmp");
+    if fs::write(&tmp, format!("{bytes}\n")).is_ok() {
+        let _ = fs::rename(&tmp, &path);
+    }
+}
 
 /// Reclaimable bytes from host `ext4.vhdx` allocated size vs in-use bytes
 /// inside WSL, applying [`RECLAIM_THRESHOLD`].
@@ -428,7 +467,12 @@ mod imp {
         let near = root.ancestors().find(|p| p.is_dir());
         let (disk_host, disk_in_use, disk_limit, reclaimable) = if !is_missing && !active {
             let host = vhdx_allocated(&root.join("ext4.vhdx"));
-            let (in_use, limit) = wsl_disk_usage();
+            let (raw_in_use, limit) = wsl_disk_usage();
+            let recorded = read_vhdx_overhead(&root);
+            let (in_use, clamped) = effective_vhdx_in_use(host, raw_in_use, recorded);
+            if let Some(updated) = clamped {
+                write_vhdx_overhead(&root, updated);
+            }
             let rec = reclaimable_bytes(host, in_use);
             (host, in_use, limit, rec)
         } else {
@@ -851,7 +895,14 @@ mod imp {
                 let after = vhdx_allocated(&vhdx).unwrap_or(mid);
                 let reclaimed = before.saturating_sub(after);
                 let elapsed_ms = t0.elapsed().as_millis() as u64;
-                let (in_use, _) = wsl_disk_usage();
+                let (raw_in_use, _) = wsl_disk_usage();
+                if compact_err.is_none()
+                    && let (Some(raw), Some(root)) = (raw_in_use, vhdx.parent())
+                {
+                    write_vhdx_overhead(root, after.saturating_sub(raw));
+                }
+                let recorded = vhdx.parent().and_then(read_vhdx_overhead);
+                let (in_use, _) = effective_vhdx_in_use(Some(after), raw_in_use, recorded);
                 if let Some(err) = compact_err && reclaimed == 0 {
                     emit(json!({"type": "storagereclaimed", "error": err}).to_string());
                 } else {
@@ -959,5 +1010,27 @@ mod tests {
         let r = validate_target(cur, r"D:\Kiri", 5_000_000_000, true, |_| Ok("exFAT".into()), plenty, writable);
         assert!(r.is_err());
         let _ = (Checked { needed: 0, free: 0, replaces: false }, IGNORED, MOVING, format_gb(1_000_000_000));
+    }
+
+    #[test]
+    fn vhdx_overhead_floor_prevents_phantom_reclaimable_and_clamps_downward() {
+        let d = scratch("vhdx-overhead");
+        assert_eq!(read_vhdx_overhead(&d), None);
+        // Before first compaction: dynamic VHDX never guesses overhead from 1 TB virtual limit.
+        let (eff0, clamp0) = effective_vhdx_in_use(Some(20_000_000_000), Some(15_000_000_000), None);
+        assert_eq!((eff0, clamp0), (Some(15_000_000_000), None));
+        assert_eq!(reclaimable_bytes(Some(20_000_000_000), eff0), Some(5_000_000_000));
+
+        // After compaction leaves 2.4 GB of non-compactable VHDX + ext4 metadata:
+        write_vhdx_overhead(&d, 2_400_000_000);
+        assert_eq!(read_vhdx_overhead(&d), Some(2_400_000_000));
+        let (eff1, clamp1) = effective_vhdx_in_use(Some(17_400_000_000), Some(15_000_000_000), read_vhdx_overhead(&d));
+        assert_eq!((eff1, clamp1), (Some(17_400_000_000), None));
+        assert_eq!(reclaimable_bytes(Some(17_400_000_000), eff1), Some(0));
+
+        // If new container files reuse preallocated blocks so host - raw < saved floor, clamp downward.
+        let (eff2, clamp2) = effective_vhdx_in_use(Some(17_400_000_000), Some(16_000_000_000), read_vhdx_overhead(&d));
+        assert_eq!((eff2, clamp2), (Some(17_400_000_000), Some(1_400_000_000)));
+        let _ = fs::remove_dir_all(&d);
     }
 }
