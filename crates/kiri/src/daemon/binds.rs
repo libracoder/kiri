@@ -285,15 +285,57 @@ pub fn distro_source(src: &str, distro: &str, wsl: Option<&Wsl>) -> Result<Strin
     }
     let mnt = wsl.map_or("/mnt/", |w| w.root.as_str());
     let mnt_trimmed = mnt.trim_end_matches('/');
-    if (!mnt_trimmed.is_empty() && (lex == mnt_trimmed || lex.starts_with(mnt)))
-        && lex != "/mnt/wsl"
-        && !is_internal_wsl(&lex)
-    {
+    let on_drive = |p: &str| (!mnt_trimmed.is_empty() && (p == mnt_trimmed || p.starts_with(mnt))) && p != "/mnt/wsl" && !is_internal_wsl(p);
+    if on_drive(&lex) {
         return Ok(lex);
     }
-    let target = confine_to_root(&distro_root, &lex);
+    // An absolute link in the distro (`/etc/localtime -> /usr/share/zoneinfo/...`)
+    // means the distro's own file: follow it inside the distro's root. With
+    // only relative links on the way the source stays as given; the kernel
+    // follows those inside the root itself.
+    let target = match resolve_in_root(Path::new(&distro_root), &lex) {
+        Some((inside, true)) if on_drive(&inside) => return Ok(inside),
+        Some((inside, true)) => confine_to_root(&distro_root, &inside),
+        Some((_, false)) => confine_to_root(&distro_root, &lex),
+        None => return Err(Error::BadRequest(format!("invalid mount source {src}: too many levels of symbolic links"))),
+    };
     verify_on_disk_confinement(src, distro, Path::new(&distro_root), Path::new(&target))?;
     Ok(target)
+}
+
+/// `path` (absolute, in a distro whose `/` is `root` on disk) with every
+/// symlink on the way followed as the distro would: an absolute target
+/// from `root`, `..` stopping at it. The path returned is the distro's
+/// spelling, with whether an absolute link was on the way; None after 40
+/// links, as Linux gives up.
+fn resolve_in_root(root: &Path, path: &str) -> Option<(String, bool)> {
+    if !root.is_dir() {
+        return Some((lexical_clean(path), false));
+    }
+    let parts = |p: &str| p.split('/').filter(|c| !c.is_empty() && *c != ".").map(str::to_owned).rev().collect::<Vec<_>>();
+    let (mut todo, mut done, mut links, mut absolute) = (parts(path), Vec::<String>::new(), 0, false);
+    while let Some(c) = todo.pop() {
+        if c == ".." {
+            done.pop();
+            continue;
+        }
+        match std::fs::read_link(root.join(done.join("/")).join(&c)) {
+            Ok(link) => {
+                links += 1;
+                if links > 40 {
+                    return None;
+                }
+                let link = link.to_string_lossy().into_owned();
+                if link.starts_with('/') {
+                    done.clear();
+                    absolute = true;
+                }
+                todo.extend(parts(&link));
+            }
+            Err(_) => done.push(c),
+        }
+    }
+    Some((format!("/{}", done.join("/")), absolute))
 }
 
 /// How many leading bytes hold a colon that is not a separator: `C:` and
@@ -365,9 +407,10 @@ pub fn source_with_roots(src: &str, wsl: &Wsl, distro_root: impl Fn(&str) -> Opt
     Err(bad("Kiri's WSL can reach the Windows drives (C:\\…) and its own files, not network shares or devices"))
 }
 
-/// A path on drive `letter`, under WSL's automount root.
+/// A path on drive `letter`, under WSL's automount root. `..` stops at the
+/// drive's root, as Windows resolves `C:\..` to `C:\`.
 fn drive(wsl: &Wsl, letter: u8, rest: &str) -> String {
-    clean(&format!("{}{}/{}", wsl.root, letter.to_ascii_lowercase() as char, rest.replace('\\', "/")))
+    confine_to_root(&format!("{}{}", wsl.root, letter.to_ascii_lowercase() as char), &rest.replace('\\', "/"))
 }
 
 /// Whether `path` is under WSL's automount root (`<automount_root><drive>/...`,
@@ -871,5 +914,33 @@ mod tests {
             "/mnt/wsl/kiri/roots/Ubuntu/etc"
         );
         assert!(source_with_roots(r"\\wsl.localhost\Debian\home\alice", &w, with_ubuntu).is_err());
+    }
+
+    #[test]
+    fn dotdot_on_a_drive_stops_at_its_root() {
+        assert_eq!(ok(r"C:\..\..\etc:/x:ro"), t("/mnt/c/etc", "/x", "ro"));
+        assert_eq!(ok("//c/../../etc:/x"), t("/mnt/c/etc", "/x", ""));
+        assert_eq!(ok(r"C:\Users\me\proj\..\other:/x"), t("/mnt/c/Users/me/other", "/x", ""));
+    }
+
+    #[test]
+    fn a_link_in_a_distro_is_followed_inside_it() {
+        let root = std::env::temp_dir().join(format!("kiri-binds-distro-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("usr/share/zoneinfo/Europe")).unwrap();
+        std::fs::create_dir_all(root.join("etc")).unwrap();
+        std::fs::write(root.join("usr/share/zoneinfo/Europe/Berlin"), b"TZif").unwrap();
+        std::os::unix::fs::symlink("/usr/share/zoneinfo/Europe/Berlin", root.join("etc/localtime")).unwrap();
+        std::os::unix::fs::symlink("../../../..", root.join("etc/up")).unwrap();
+        std::os::unix::fs::symlink("/mnt/c/Users/me", root.join("etc/win")).unwrap();
+        std::os::unix::fs::symlink("loop", root.join("loop")).unwrap();
+        let followed = |p: &str| resolve_in_root(&root, p);
+        assert_eq!(followed("/etc/localtime").unwrap(), ("/usr/share/zoneinfo/Europe/Berlin".to_owned(), true));
+        assert_eq!(followed("/etc/up/etc").unwrap(), ("/etc".to_owned(), false));
+        assert_eq!(followed("/etc/win/src").unwrap(), ("/mnt/c/Users/me/src".to_owned(), true));
+        assert_eq!(followed("/home/me/app").unwrap(), ("/home/me/app".to_owned(), false));
+        assert_eq!(followed("/loop"), None);
+        assert_eq!(resolve_in_root(&root.join("missing"), "/etc/../x").unwrap(), ("/x".to_owned(), false));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
