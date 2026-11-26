@@ -383,7 +383,10 @@ fn container_prune(req: &Request, engine: &Engine) -> Result<Value, Error> {
     let doomed = engine.each(|c| {
         let labels = if c.spec.labels.is_object() { c.spec.labels.clone() } else { json!({}) };
         let created = c.created.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
-        (c.status != Status::Running && f.labels(&labels) && before(until, created)).then(|| c.id.clone())
+        // A `kiri machine` keeps its work in its writable layer: a stopped one
+        // stays, as on OrbStack; `kiri machine delete` or `docker rm` removes it.
+        let machine = labels.get(crate::machine::LABEL).is_some();
+        (c.status != Status::Running && !machine && f.labels(&labels) && before(until, created)).then(|| c.id.clone())
     });
     let mut deleted = Vec::new();
     for id in doomed {
@@ -831,6 +834,38 @@ mod disk_usage_tests {
             other => panic!("image prune: {other:?}"),
         }
         assert_eq!(engine.store.images().unwrap().len(), 1, "the image is kept");
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// `docker container prune` (and `system prune`) keeps a stopped
+    /// `kiri machine` and removes a stopped plain container (#975).
+    #[test]
+    fn container_prune_keeps_machines() {
+        use super::Request;
+        use serde_json::json;
+        let root = std::env::temp_dir().join(format!("kiri-container-prune-machines-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let engine = super::super::engine::boot_without_vm(&root);
+        let image = kiri_image::Image { mirror: None,
+            name: "local:1".into(), digest: "sha256:0123".into(), index_digest: None, config_digest: "sha256:0123".into(),
+            layers: Vec::new(), size: 0, platform: "linux/arm64".into(), created: String::new(), pulled_at: 0, config: Default::default(),
+        };
+        let spec = |labels| -> super::super::engine::Spec {
+            serde_json::from_value(json!({
+                "image": "local:1", "image_id": "sha256:0123", "entrypoint": [], "cmd": ["true"],
+                "env": [], "cwd": "/", "user": "", "auto_remove": false, "network_mode": "none", "labels": labels,
+                "restart": {"name": "no", "max_retries": 0}
+            }))
+            .unwrap()
+        };
+        let machine = engine.create(Some("machine-dev".into()), spec(json!({crate::machine::LABEL: "dev"})), &image).unwrap();
+        let plain = engine.create(Some("plain".into()), spec(json!({})), &image).unwrap();
+        let out = super::container_prune(&Request::internal("POST", "/containers/prune", &[], Vec::new()), &engine).unwrap();
+        assert_eq!(out["ContainersDeleted"], json!([plain]));
+        let left: Vec<String> = engine.each(|c| Some(c.id.clone()));
+        assert_eq!(left, [machine]);
         drop(engine);
         let _ = std::fs::remove_dir_all(root);
     }

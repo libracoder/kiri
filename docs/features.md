@@ -138,7 +138,9 @@ Apple silicon and Intel Macs (macOS 14+), Windows 10 and 11 (x86-64 and Arm, thr
 - **Kubernetes**: `kiri k8s start` — a single-node k3s cluster in one
   container, ready in ~20 s, as the `kiri` kubectl context
 - **Linux machines**: `kiri machine create dev --distro ubuntu` and
-  `kiri machine shell dev` — your user, sudo, and `/Users` at the same path
+  `kiri machine shell dev` — your user, sudo, and `/Users` at the same path;
+  `docker container prune` and `docker system prune` leave a stopped machine
+  alone (`kiri machine delete` removes it)
 - **The app**: `cargo xtask app` builds `Kiri.app` with the `docker` CLI,
   Compose and buildx inside; opening it runs `kiri setup` (docker context,
   LaunchAgent, build builder) and the window; `kiri update` installs new

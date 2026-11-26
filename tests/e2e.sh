@@ -2480,7 +2480,7 @@ code udp-port-free-after 0 bash -c "python3 -c 'import socket; s=socket.socket(s
 
 section "Linux machines"
 # The `kiri` CLI is $KIRI, found at the top.
-MACHINE_TESTS="machine-create machine-list machine-user machine-mac-files machine-cwd machine-hostname machine-sudo machine-stop machine-stop-again machine-start machine-start-again machine-delete machine-bad-name"
+MACHINE_TESTS="machine-create machine-list machine-user machine-mac-files machine-cwd machine-hostname machine-sudo machine-stop machine-prune-keeps machine-stop-again machine-start machine-start-again machine-delete machine-bad-name"
 # The binary as one shell word, for commands passed to bash -c (app paths have spaces).
 KQ=$(printf %q "$KIRI")
 if [ -x "$KIRI" ]; then
@@ -2502,6 +2502,8 @@ needs homes-dir t machine-cwd "$MD" bash -c "cd $MD && $KQ machine shell e2e-m -
 t machine-hostname "e2e-m" bash -c "$KQ machine shell e2e-m -- hostname < /dev/null"
 t machine-sudo "root" bash -c "for i in \$(seq 30); do out=\$($KQ machine shell e2e-m -- sudo -n whoami < /dev/null 2>/dev/null); [ \"\$out\" = root ] && break; sleep 1; done; echo \$out"
 t machine-stop "Exited" bash -c "$KQ machine stop e2e-m && $KQ machine list"
+# A stopped machine survives a prune, even one aimed at its label (#975).
+t machine-prune-keeps "Exited" bash -c "$D container prune -f --filter label=dev.kiri.machine >/dev/null && $KQ machine list"
 # Stopped already, or running already: done, not an empty `kiri: ` and a failure.
 code machine-stop-again 0 "$KIRI" machine stop e2e-m
 t machine-start "Up" bash -c "$KQ machine start e2e-m && $KQ machine list"

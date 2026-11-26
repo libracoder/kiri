@@ -13,7 +13,7 @@ use serde_json::json;
 
 use crate::client;
 
-const LABEL: &str = "dev.kiri.machine";
+pub(crate) const LABEL: &str = "dev.kiri.machine";
 
 /// `kiri machine create NAME --distro ubuntu` picks one of these.
 const DISTROS: [(&str, &str); 7] = [
