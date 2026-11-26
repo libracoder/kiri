@@ -1210,6 +1210,8 @@ fn allowed_url(url: &str) -> bool {
             | "https://runkiri.com/releases/"
             | "https://runkiri.com/share/notice"
             | "https://canestack.com"
+            | "https://discord.gg/K5A8wuqcC"
+            | "https://x.com/runkiri"
             | "https://learn.microsoft.com/windows/wsl/about"
             | "https://github.com/libracoder/kiri/issues/new"
             | "https://github.com/libracoder/kiri"
@@ -1297,6 +1299,8 @@ mod tests {
         assert!(allowed_url("https://runkiri.com/releases/"));
         assert!(allowed_url("https://runkiri.com/share/notice"));
         assert!(allowed_url("https://canestack.com"));
+        assert!(allowed_url("https://discord.gg/K5A8wuqcC"));
+        assert!(allowed_url("https://x.com/runkiri"));
         assert!(allowed_url("https://kiri.canestack.com"));
         assert!(allowed_url("https://github.com/libracoder/kiri"));
         assert!(allowed_url("https://github.com/libracoder/kiri/issues/new"));
