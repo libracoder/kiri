@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #981 Engine: docker container prune and system prune keep stopped machines (unreleased)
+- Fixes: #975 A stopped machine is deleted by docker container prune / docker system prune, with everything in it
+- Caused: none known
+- Caused by: -
+- Check: `machine-prune-keeps`, `crates/kiri/src/daemon/ops.rs`
+
 ### #936 Volumes view: show each volume's disk size loaded asynchronously with daemon caching (unreleased)
 - Fixes: #936 Volumes view: show each volume's size, loaded asynchronously
 - Caused: none known
