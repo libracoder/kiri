@@ -1,4 +1,7 @@
 /target
+/packaging/arch/src/
+/packaging/arch/pkg/
+/packaging/arch/*.pkg.tar.zst
 # Raw benchmark output: kept outside this repository.
 /bench/results/
 /guest/out/

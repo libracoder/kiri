@@ -1,0 +1,47 @@
+pkgname=kiri-ui
+pkgver=0.2.2
+pkgrel=1
+pkgdesc='Desktop window for the Kiri container runtime'
+arch=('x86_64' 'aarch64')
+options=('!lto')
+url='https://runkiri.com'
+license=('Apache-2.0')
+depends=('gtk3' 'webkit2gtk-4.1')
+makedepends=('rust' 'pkgconf')
+optdepends=(
+  'kiri: Kiri engine and CLI, required to manage containers'
+  'polkit: graphical password prompt for engine setup'
+)
+source=("https://github.com/libracoder/kiri/archive/refs/tags/v${pkgver}.tar.gz")
+sha256sums=('aaa88911bdfc8e83253cefc9cfd884c3d0aa55ee9dc1f67a19b94564dde6fbbf')
+
+prepare() {
+  cd "kiri-${pkgver}"
+
+  # Release archives keep 0.0.0 in the workspace manifest; stamp pkgver into
+  # Cargo.toml and sync workspace member entries in Cargo.lock offline.
+  sed -i "0,/^version = \"0.0.0\"$/s//version = \"${pkgver}\"/" Cargo.toml
+  cargo update --workspace --offline
+}
+
+build() {
+  cd "kiri-${pkgver}"
+  cargo build --locked --release -p kiri --features window
+}
+
+package() {
+  cd "kiri-${pkgver}"
+
+  install -Dm755 target/release/kiri "$pkgdir/usr/lib/kiri/kiri-window"
+  install -Dm644 contrib/linux/kiri.desktop "$pkgdir/usr/share/applications/kiri.desktop"
+  install -Dm644 brand/icon/kiri-app-icon.svg \
+    "$pkgdir/usr/share/icons/hicolor/scalable/apps/kiri.svg"
+
+  for size in 16 32 64 128 256 512; do
+    install -Dm644 "brand/icon/png/kiri-app-icon-${size}.png" \
+      "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/kiri.png"
+  done
+
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/${pkgname}/LICENSE"
+  install -Dm644 NOTICE "$pkgdir/usr/share/licenses/${pkgname}/NOTICE"
+}
