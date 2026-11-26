@@ -106,6 +106,7 @@ fn read(path: &Path) -> io::Result<Option<String>> {
 /// The new text by a temporary file and a rename, 0600; the one before it
 /// kept as `config.bak.kiri`.
 fn write(path: &Path, before: Option<&str>, text: &str) -> io::Result<()> {
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
     std::fs::create_dir_all(dir)?;
     let file = path.file_name().and_then(|n| n.to_str()).unwrap_or("config");
@@ -114,7 +115,8 @@ fn write(path: &Path, before: Option<&str>, text: &str) -> io::Result<()> {
         std::fs::write(&backup, before)?;
         private(&backup)?;
     }
-    let tmp = dir.join(format!(".{file}.kiri-{}", std::process::id()));
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = dir.join(format!(".{file}.kiri-{}-{seq}", std::process::id()));
     let done = std::fs::write(&tmp, text).and_then(|()| private(&tmp)).and_then(|()| std::fs::rename(&tmp, path));
     if done.is_err() {
         let _ = std::fs::remove_file(&tmp);
@@ -149,16 +151,52 @@ fn blank(l: &str) -> bool {
     t.is_empty() || t.starts_with('#')
 }
 
-fn tops(text: &str) -> Vec<Top<'_>> {
+/// Strips a YAML `#` comment starting at index 0 or preceded by whitespace.
+fn uncomment(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'#' && (i == 0 || matches!(bytes[i - 1], b' ' | b'\t')) {
+            return &s[..i];
+        }
+    }
+    s
+}
+
+fn is_doc_marker(l: &str, marker: &str) -> bool {
+    uncomment(l).trim_end() == marker
+}
+
+fn tops(text: &str) -> Result<Vec<Top<'_>>, String> {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let mut tops = vec![Top { key: "", lines: Vec::new() }];
+    let mut seen_content = false;
+    let mut seen_end = false;
     for l in text.lines() {
+        if seen_end && !blank(l) {
+            return Err("a multi-document kubeconfig; not changing it".into());
+        }
+        if is_doc_marker(l, "---") {
+            if seen_content {
+                return Err("a multi-document kubeconfig; not changing it".into());
+            }
+            tops.last_mut().expect("there is one").lines.push(l);
+            continue;
+        }
+        if is_doc_marker(l, "...") {
+            seen_end = true;
+            tops.push(Top { key: "...", lines: vec![l] });
+            continue;
+        }
+        if !blank(l) {
+            seen_content = true;
+        }
         let top = !l.starts_with([' ', '\t', '-', '#']) && !l.trim().is_empty();
         match l.split_once(':').filter(|_| top) {
             Some((key, _)) => tops.push(Top { key: key.trim(), lines: vec![l] }),
             None => tops.last_mut().expect("there is one").lines.push(l),
         }
     }
-    tops
+    Ok(tops)
 }
 
 /// The lines before a list's first item, its items (each its lines), and their indent.
@@ -166,7 +204,7 @@ type Items<'a> = (Vec<&'a str>, Vec<Vec<&'a str>>, usize);
 
 /// A list's items; an error for a list that isn't a block list.
 fn items<'a>(top: &Top<'a>) -> Result<Items<'a>, String> {
-    let value = top.lines[0].split_once(':').map_or("", |(_, v)| v).split(" #").next().unwrap_or("").trim();
+    let value = uncomment(top.lines[0].split_once(':').map_or("", |(_, v)| v)).trim();
     if !matches!(value, "" | "[]" | "null" | "~") {
         return Err(format!("`{}` is not a list kubectl writes; not changing it", top.key));
     }
@@ -185,13 +223,25 @@ fn items<'a>(top: &Top<'a>) -> Result<Items<'a>, String> {
     Ok((body[..at].to_vec(), items, dash))
 }
 
-/// An item's `name`, the key at the column after its dash.
+/// An item's `name`, the key at the column after its dash (or on the lines below a bare `-`).
 fn item_name<'a>(item: &[&'a str], dash: usize) -> Option<&'a str> {
     let rest = &item[0][dash + 1..];
-    let col = dash + 1 + indent(rest);
     let first = rest.trim_start();
-    let line = if first.starts_with("name:") { Some(first) } else { item[1..].iter().find(|l| indent(l) == col && l.trim_start().starts_with("name:")).map(|l| l.trim_start()) };
-    line.map(|l| scalar(&l["name:".len()..]))
+    let has_inline_key = !blank(rest);
+    let col = if has_inline_key {
+        dash + 1 + indent(rest)
+    } else {
+        item[1..].iter().find(|l| !blank(l)).map(|l| indent(l)).filter(|&c| c > dash)?
+    };
+    let match_name = |s: &'a str| {
+        s.strip_prefix("name:")
+            .filter(|after| after.is_empty() || after.starts_with([' ', '\t', '#']))
+            .map(scalar)
+    };
+    if has_inline_key && let Some(n) = match_name(first) {
+        return Some(n);
+    }
+    item[1..].iter().filter(|l| indent(l) == col).find_map(|l| match_name(l.trim_start()))
 }
 
 /// A plain or quoted YAML scalar, without a trailing comment.
@@ -202,11 +252,11 @@ fn scalar(v: &str) -> &str {
             return inner;
         }
     }
-    v.split(" #").next().unwrap_or("").trim()
+    uncomment(v).trim()
 }
 
 fn not_json(text: &str) -> Result<(), String> {
-    if text.trim_start().starts_with('{') {
+    if text.strip_prefix('\u{feff}').unwrap_or(text).trim_start().starts_with('{') {
         return Err("a JSON kubeconfig; not changing it".into());
     }
     Ok(())
@@ -232,7 +282,7 @@ pub fn merge(existing: &str, ours: &str, name: &str, use_context: bool) -> Resul
         return Ok(ours.to_owned());
     }
     // Ours, per list: the item called `name`, its lines from its dash on.
-    let theirs = tops(ours);
+    let theirs = tops(ours)?;
     let mut new: Vec<(&str, Vec<String>)> = Vec::new();
     for list in LISTS {
         let Some(top) = theirs.iter().find(|t| t.key == list) else { continue };
@@ -243,9 +293,14 @@ pub fn merge(existing: &str, ours: &str, name: &str, use_context: bool) -> Resul
     }
     let nl = newline(existing);
     let mut out: Vec<String> = Vec::new();
+    let mut doc_end: Vec<String> = Vec::new();
     let mut seen: Vec<&str> = Vec::new();
     let mut current = false;
-    for top in tops(existing) {
+    for top in tops(existing)? {
+        if top.key == "..." {
+            doc_end.extend(top.lines.iter().map(|l| l.to_string()));
+            continue;
+        }
         if top.key == "current-context" && use_context {
             out.push(format!("current-context: {name}"));
             out.extend(top.lines[1..].iter().map(|l| l.to_string()));
@@ -259,7 +314,8 @@ pub fn merge(existing: &str, ours: &str, name: &str, use_context: bool) -> Resul
         seen.push(top.key);
         let (before, items, dash) = items(&top)?;
         let dash = if items.is_empty() { 0 } else { dash };
-        out.push(format!("{}:", top.key));
+        let header_val = uncomment(top.lines[0].split_once(':').map_or("", |(_, v)| v)).trim();
+        out.push(if header_val.is_empty() { top.lines[0].to_owned() } else { format!("{}:", top.key) });
         out.extend(before.iter().map(|l| l.to_string()));
         let kept: Vec<&Vec<&str>> = items.iter().filter(|i| item_name(i, dash) != Some(name)).collect();
         let mut body: Vec<String> = kept.iter().flat_map(|i| i.iter().map(|l| l.to_string())).collect();
@@ -279,6 +335,7 @@ pub fn merge(existing: &str, ours: &str, name: &str, use_context: bool) -> Resul
     if use_context && !current {
         out.push(format!("current-context: {name}"));
     }
+    out.extend(doc_end);
     Ok(join(&out, nl))
 }
 
@@ -291,7 +348,7 @@ pub fn remove(existing: &str, name: &str) -> Result<String, String> {
     }
     let mut out: Vec<String> = Vec::new();
     let mut changed = false;
-    for top in tops(existing) {
+    for top in tops(existing)? {
         if top.key == "current-context" && scalar(top.lines[0].split_once(':').map_or("", |(_, v)| v)) == name {
             out.push("current-context: \"\"".into());
             out.extend(top.lines[1..].iter().map(|l| l.to_string()));
@@ -383,7 +440,7 @@ users:
 ";
 
     fn names(text: &str, list: &str) -> Vec<String> {
-        let tops = tops(text);
+        let tops = tops(text).unwrap();
         let top = tops.iter().find(|t| t.key == list).unwrap();
         let (_, items, dash) = items(top).unwrap();
         items.iter().map(|i| item_name(i, dash).unwrap().to_owned()).collect()
@@ -494,5 +551,27 @@ users:
         // No temporary files left beside it.
         assert_eq!(std::fs::read_dir(dir.join(".kube")).unwrap().count(), 2);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn handles_bare_dashes_document_markers_and_comments() {
+        let ours = from_k3s(K3S, "kiri", 6445);
+        let bare_dash = "apiVersion: v1\nclusters:\n-\n  cluster:\n    server: https://127.0.0.1:6443\n  name: kiri\n-\n  cluster:\n    server: https://prod\n  name: prod\ncontexts:\n-\n  context:\n    cluster: kiri\n    user: kiri\n  name: kiri\n-\n  context:\n    cluster: prod\n    user: prod\n  name: prod\ncurrent-context: prod\nkind: Config\nusers:\n-\n  name: kiri\n  user: {}\n-\n  name: prod\n  user: {}\n";
+        let merged = merge(bare_dash, &ours, "kiri", false).unwrap();
+        assert_eq!(merged.matches("name: kiri").count(), 3);
+        assert!(merged.contains("https://127.0.0.1:6445"));
+        let removed = remove(&merged, "kiri").unwrap();
+        assert!(!removed.contains("name: kiri"));
+        assert_eq!(removed.matches("name: prod").count(), 3);
+
+        let markers = "\u{feff}---\napiVersion: v1\nclusters:\t# managed\n- cluster:\n    server: https://x\n  name: prod\ncontexts:# ctxs\n- context:\n    cluster: prod\n    user: prod\n  name: prod\nkind: Config\n...\n";
+        let merged_doc = merge(markers, &ours, "kiri", true).unwrap();
+        assert!(merged_doc.trim_end().ends_with("\n..."), "{merged_doc:?}");
+        assert!(merged_doc.contains("clusters:\t# managed\n"));
+        assert!(merged_doc.contains("contexts:# ctxs\n"));
+        assert!(merged_doc.contains("users:\n- name: kiri\n"));
+        assert!(merged_doc.contains("current-context: kiri\n"));
+
+        assert!(merge("apiVersion: v1\nclusters: []\n---\napiVersion: v1\n", &ours, "kiri", false).is_err());
     }
 }

@@ -86,14 +86,28 @@ fn read_json(path: &Path) -> io::Result<Value> {
     }
 }
 
+fn read_object(path: &Path) -> io::Result<Value> {
+    let v = read_json(path)?;
+    if v.is_object() {
+        Ok(v)
+    } else {
+        Err(io::Error::new(io::ErrorKind::InvalidData, format!("{}: not a JSON object", path.display())))
+    }
+}
+
 /// Through a temporary file, so a crash never leaves half a file.
 fn write_bytes(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    let file = path.file_name().and_then(|n| n.to_str()).unwrap_or("tmp");
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = dir.join(format!(".{file}.kiri-tmp-{}-{seq}", std::process::id()));
+    let res = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
-    let tmp = path.with_extension("kiri-tmp");
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(tmp, path)
+    res
 }
 
 fn write_json(path: &Path, v: &Value) -> io::Result<()> {
@@ -114,7 +128,7 @@ impl Places {
     }
 
     fn state(&self) -> Value {
-        read_json(&self.state).unwrap_or_else(|_| json!({}))
+        read_json(&self.state).ok().filter(Value::is_object).unwrap_or_else(|| json!({}))
     }
 
     /// What was chosen (or set for a machine with no other engine).
@@ -163,10 +177,16 @@ impl Places {
         Ok(())
     }
 
-    /// Whether a builder is Kiri's copy: its nodes are Kiri's builder's.
+    /// Whether a builder is Kiri's copy: its nodes are Kiri's builder's (`<builder>0`, …).
     fn copied(&self, instance: &Value) -> bool {
         let nodes = instance["Nodes"].as_array().map(Vec::as_slice).unwrap_or_default();
-        !nodes.is_empty() && nodes.iter().all(|n| n["Name"].as_str().is_some_and(|name| name.starts_with(&self.builder)))
+        !nodes.is_empty()
+            && nodes.iter().all(|n| {
+                n["Name"]
+                    .as_str()
+                    .and_then(|name| name.strip_prefix(&self.builder))
+                    .is_some_and(|idx| !idx.is_empty() && idx.bytes().all(|b| b.is_ascii_digit()))
+            })
     }
 
     fn save(&self, with: With, auto: bool) -> io::Result<()> {
@@ -185,7 +205,7 @@ impl Places {
         }
         let mut s = self.state();
         if s["before"].is_null() {
-            let cfg = read_json(&self.config())?;
+            let cfg = read_object(&self.config())?;
             let current = match std::fs::read_to_string(self.current()) {
                 Ok(t) => Value::String(t),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => Value::Null,
@@ -194,7 +214,7 @@ impl Places {
             s["before"] = json!({"alias": cfg["aliases"]["builder"], "aliases": cfg.get("aliases").is_some(), "current": current});
             write_json(&self.state, &s)?;
         }
-        let mut cfg = read_json(&self.config())?;
+        let mut cfg = read_object(&self.config())?;
         if !cfg["aliases"].is_object() {
             cfg["aliases"] = json!({});
         }
@@ -217,7 +237,7 @@ impl Places {
         if before.is_null() {
             return Ok(());
         }
-        let mut cfg = read_json(&self.config())?;
+        let mut cfg = read_object(&self.config())?;
         if cfg["aliases"]["builder"] == "buildx" {
             match &before["alias"] {
                 Value::Null => {
@@ -597,5 +617,38 @@ mod tests {
         p.uninstall().unwrap();
         assert_eq!(read_json(&p.config()).unwrap(), json!({}));
         assert!(!p.current().exists() && !p.instance("kiri").exists() && !p.state.exists());
+    }
+
+    #[test]
+    fn rejects_non_object_configs_without_panicking_and_preserves_prefix_builders() {
+        let d = scratch("non-obj");
+        let p = places(&d);
+        builder(&p);
+        std::fs::create_dir_all(&p.docker).unwrap();
+        for bad in ["[1, 2]", "\"str\"", "true", "null"] {
+            std::fs::write(p.config(), bad).unwrap();
+            assert_eq!(p.choose(With::Kiri).unwrap_err().kind(), io::ErrorKind::InvalidData, "{bad}");
+            assert_eq!(std::fs::read_to_string(p.config()).unwrap(), bad);
+        }
+        std::fs::remove_file(p.config()).unwrap();
+
+        // Corrupt non-object build.json recovers as `{}` without panicking.
+        std::fs::create_dir_all(p.state.parent().unwrap()).unwrap();
+        std::fs::write(&p.state, "[1, 2]").unwrap();
+        p.choose(With::Kiri).unwrap();
+        assert!(p.taken());
+        p.choose(With::Docker).unwrap();
+        assert!(!p.taken());
+
+        // Foreign builders whose node names share prefix `kiri-build` (`kiri-builder0`, `kiri-build-dev0`) stay untouched.
+        for node_name in ["kiri-builder0", "kiri-build-dev0", "kiri-build"] {
+            let foreign = json!({"Name": "kiri", "Driver": "docker-container", "Nodes": [{"Name": node_name, "Endpoint": "desktop-linux"}]});
+            write_json(&p.instance("kiri"), &foreign).unwrap();
+            p.choose(With::Docker).unwrap();
+            assert_eq!(read_json(&p.instance("kiri")).unwrap(), foreign, "{node_name}");
+            p.uninstall().unwrap();
+            assert!(p.instance("kiri").is_file(), "{node_name}");
+        }
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

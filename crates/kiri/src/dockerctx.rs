@@ -83,18 +83,25 @@ pub fn cli(env: &Env, ours: &str, our_hosts: &[&str], endpoint: &Endpoint) -> Cl
     Cli { context, pinned, kiri }
 }
 
+fn strip_bom(bytes: &[u8]) -> &[u8] {
+    bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes)
+}
+
 /// config.json's `currentContext`, when it names one.
 fn current(config: Option<&[u8]>) -> Option<String> {
-    let cfg: Value = serde_json::from_slice(config?).ok()?;
+    let cfg: Value = serde_json::from_slice(strip_bom(config?)).ok()?;
     cfg["currentContext"].as_str().map(str::trim).filter(|c| !c.is_empty()).map(str::to_owned)
 }
 
 /// Two docker hosts that are the same endpoint: `npipe:////./pipe/x` and
 /// `npipe://./pipe/x`, any case, are one pipe.
 fn same_host(a: &str, b: &str) -> bool {
-    let norm = |h: &str| match h.get(..6) {
-        Some(s) if s.eq_ignore_ascii_case("npipe:") => format!("npipe:{}", h[6..].replace('\\', "/").trim_start_matches('/').to_ascii_lowercase()),
-        _ => h.trim_end_matches('/').to_owned(),
+    let norm = |h: &str| match h.split_once(':') {
+        Some((scheme, rest)) if scheme.eq_ignore_ascii_case("npipe") => {
+            format!("npipe:{}", rest.replace('\\', "/").trim_matches('/').to_ascii_lowercase())
+        }
+        Some((scheme, rest)) => format!("{}:{}", scheme.to_ascii_lowercase(), rest.trim_end_matches('/')),
+        None => h.trim_end_matches('/').to_owned(),
     };
     norm(a) == norm(b)
 }
@@ -187,7 +194,7 @@ fn dir_in(config: Option<OsString>, home: Option<OsString>) -> Option<PathBuf> {
 
 pub fn read_json(path: &Path) -> io::Result<Value> {
     match std::fs::read(path) {
-        Ok(b) => serde_json::from_slice(&b).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{}: {e}", path.display()))),
+        Ok(b) => serde_json::from_slice(strip_bom(&b)).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{}: {e}", path.display()))),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(json!({})),
         Err(e) => Err(e),
     }
@@ -195,12 +202,18 @@ pub fn read_json(path: &Path) -> io::Result<Value> {
 
 /// Writes JSON through a temporary file, so a crash never leaves half a config.
 pub fn write_json(path: &Path, v: &Value) -> io::Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    let file = path.file_name().and_then(|n| n.to_str()).unwrap_or("config.json");
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = dir.join(format!(".{file}.kiri-tmp-{}-{seq}", std::process::id()));
+    let bytes = serde_json::to_vec_pretty(v).map_err(io::Error::other)?;
+    let res = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
-    let tmp = path.with_extension("kiri-tmp");
-    std::fs::write(&tmp, serde_json::to_vec_pretty(v).map_err(io::Error::other)?)?;
-    std::fs::rename(tmp, path)
+    res
 }
 
 /// A context's meta.json, as `docker context create NAME --docker
@@ -458,6 +471,32 @@ mod tests {
         let k = cli(&Env { host: Some(KIRI_HOST), ..Env::default() }, OURS, &[KIRI_HOST], &Endpoint::Free);
         let sk = status_event("0.1.4", false, "Kiri", OURS, &k);
         assert_eq!((sk["context"].as_str(), sk["pinned"].is_null()), (Some("kiri"), true));
+    }
+
+    #[test]
+    fn reads_bom_configs_normalizes_host_schemes_and_isolates_temp_files() {
+        let mut bom_cfg = vec![0xEF, 0xBB, 0xBF];
+        bom_cfg.extend_from_slice(br#"{"currentContext":"desktop-linux","auths":{"ghcr.io":{}}}"#);
+        let c = cli(&Env { config: Some(&bom_cfg), ..Env::default() }, OURS, &[KIRI_HOST], &Endpoint::Kiri);
+        assert_eq!((c.context.as_str(), c.kiri), ("desktop-linux", false));
+
+        let home = scratch_home("bom-tmp");
+        let cfg_path = home.join("config.json");
+        std::fs::write(&cfg_path, &bom_cfg).unwrap();
+        set_current(&cfg_path, "kiri").unwrap();
+        assert_eq!(read_json(&cfg_path).unwrap()["currentContext"], "kiri");
+
+        write_json(&home.join("ctx.one"), &json!({"n": 1})).unwrap();
+        write_json(&home.join("ctx.two"), &json!({"n": 2})).unwrap();
+        assert_eq!(read_json(&home.join("ctx.one")).unwrap()["n"], 1);
+        assert_eq!(read_json(&home.join("ctx.two")).unwrap()["n"], 2);
+        assert_eq!(std::fs::read_dir(&home).unwrap().count(), 3);
+
+        for h in ["UNIX:///var/run/docker.sock", "NPIPE:////./PIPE/DOCKER_ENGINE/", r"npipe://\\.\pipe\docker_engine\"] {
+            assert!(cli(&Env { host: Some(h), ..Env::default() }, OURS, &[KIRI_HOST], &Endpoint::Kiri).kiri, "{h}");
+        }
+        assert!(cli(&Env { host: Some("npipe:////./pipe/kiri/"), ..Env::default() }, OURS, &["npipe:////./pipe/kiri"], &Endpoint::Free).kiri);
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[cfg(unix)]
