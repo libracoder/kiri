@@ -55,8 +55,27 @@ pub struct Release {
     pub notes_url: String,
 }
 
-/// `1.2.10` > `1.2.9`; a missing part counts as 0.
+/// Whether `v` reads as a version: `[v]N(.N)*`, optionally `-` and
+/// dot-separated alphanumeric identifiers (`0.1.8-dev.42`).
+fn is_version(v: &str) -> bool {
+    let s = v.strip_prefix('v').unwrap_or(v);
+    let (core, pre) = match s.split_once('-') {
+        Some((c, p)) => (c, Some(p)),
+        None => (s, None),
+    };
+    let numeric = |seg: &str| !seg.is_empty() && seg.bytes().all(|b| b.is_ascii_digit());
+    let ident = |id: &str| !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+    core.split('.').all(numeric) && pre.is_none_or(|p| p.split('.').all(ident))
+}
+
+/// `1.2.10` > `1.2.9`; a missing part counts as 0, and a test build
+/// (`0.1.8-dev.42`, scripts/ci/test-version.sh) sorts above its release.
+/// A string that isn't a version is never newer, and nothing is newer
+/// than one.
 pub fn newer(candidate: &str, current: &str) -> bool {
+    if !is_version(candidate) || !is_version(current) {
+        return false;
+    }
     let parts = |v: &str| -> Vec<u64> { v.trim_start_matches('v').split(['.', '-']).map(|p| p.parse().unwrap_or(0)).collect() };
     let (a, b) = (parts(candidate), parts(current));
     for i in 0..a.len().max(b.len()) {
@@ -563,8 +582,17 @@ mod tests {
         assert!(newer("0.2.0", "0.1.9"));
         assert!(newer("1.2.10", "1.2.9"));
         assert!(newer("v1.0.1", "1.0"));
+        assert!(!newer("1.0.0", "1.0"));
         assert!(!newer("0.1.0", "0.1.0"));
         assert!(!newer("0.1.0", "0.2.0"));
+        // A test build (scripts/ci/test-version.sh) sorts above its release.
+        assert!(newer("0.1.8-dev.42", "0.1.8"));
+        assert!(!newer("0.1.8", "0.1.8-dev.42"));
+        assert!(newer("0.1.8-dev.43", "0.1.8-dev.42"));
+        for bad in ["", "vv1.0.0", "1.+2.0", "1.2.", "1.2.0-", "1.2.0-rc..1", "99.0.0/../../evil", "99.0.0\\evil"] {
+            assert!(!newer(bad, "0.2.0"), "accepted invalid candidate {bad:?}");
+            assert!(!newer("99.0.0", bad), "accepted invalid current {bad:?}");
+        }
     }
 
     #[test]

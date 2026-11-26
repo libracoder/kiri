@@ -58,8 +58,9 @@ fn boot_command() -> &'static str {
 /// spaces, a `#` comment, or the `\r` of a file saved with CRLF
 /// ([[:space:]] has it). On one line, with no backslash, as the rest of
 /// the script.
-const BOOT_AWK: &str = "function key(l) { sub(/#.*/, \"\", l); gsub(/[[:space:]]/, \"\", l); return l } \
+const BOOT_AWK: &str = "function key(l) { if (NR == 1) sub(/^\u{feff}/, \"\", l); sub(/[#;].*/, \"\", l); gsub(/[[:space:]]/, \"\", l); return tolower(l) } \
      function flush() { if (boot && !done) { print want; done = 1 } } \
+     NR == 1 { sub(/^\u{feff}/, \"\") } \
      substr(key($0), 1, 1) == \"[\" { flush(); boot = key($0) == \"[boot]\"; print; next } \
      boot && index(key($0), \"command=\") == 1 { if (!done) { print want; done = 1 } next } \
      { print } \
@@ -134,7 +135,8 @@ pub fn valid_distro_name(name: &str) -> bool {
     !name.is_empty()
         && name != "."
         && name != ".."
-        && !name.contains(['/', '\\', '\0'])
+        && !name.starts_with('-')
+        && !name.contains(['/', '\\', '\0', ':', '*', '?', '"', '<', '>', '|'])
         && !name.bytes().any(|b| b.is_ascii_control())
 }
 
@@ -505,6 +507,16 @@ mod tests {
         assert_eq!(run(Some("[boot] # Kiri's\ncommand=/old # mine\n")), format!("[boot] # Kiri's\n{want}\n"));
         // A commented-out command is left, and one added.
         assert_eq!(run(Some("[boot]\n# command = /off\n")), format!("[boot]\n# command = /off\n{want}\n"));
+        // Case-insensitive [Boot]/Command, UTF-8 BOM, and ';' comments.
+        assert_eq!(run(Some("[Boot]\nCommand = /old\nsystemd = false\n")), format!("[Boot]\n{want}\nsystemd = false\n"));
+        assert_eq!(
+            run(Some("\u{feff}[BOOT]\nCOMMAND = /old\n[automount]\noptions = metadata;umask=22\n")),
+            format!("[BOOT]\n{want}\n[automount]\noptions = metadata;umask=22\n")
+        );
+        assert_eq!(
+            run(Some("; [boot]\n[boot] ; header\n; command = /off\ncommand = /old ; inline\n")),
+            format!("; [boot]\n[boot] ; header\n; command = /off\n{want}\n")
+        );
         assert_eq!(run(None), format!("[boot]\n{want}\n"));
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
@@ -752,5 +764,17 @@ mod ro_tests {
         let msg = wsl_readonly_message(WslReadOnly::EmergencyRo, Some(Path::new(r"D:\KiriData\ext4.vhdx")));
         assert!(msg.contains(r#"wsl --mount "D:\KiriData\ext4.vhdx" --vhd --bare"#), "{msg}");
         assert!(msg.contains("wsl --shutdown") && msg.contains("e2fsck -f -y -D") && msg.contains("Settings -> Storage"), "{msg}");
+    }
+
+    #[test]
+    fn validates_distro_names_and_sync_script_has_no_backslash() {
+        for bad in ["", ".", "..", "-e", "--shutdown", "a/b", r"a\b", "bad:distro", "bad*distro", "bad?distro", "bad\"distro", "bad|distro"] {
+            assert!(!valid_distro_name(bad), "expected false for {bad:?}");
+        }
+        for good in ["Ubuntu", "Ubuntu-24.04", "NixOS", "Arch_Linux", "my.distro"] {
+            assert!(valid_distro_name(good), "expected true for {good:?}");
+        }
+        assert_eq!(parse_enabled_distros(br#"{"distros":["Ubuntu","--shutdown","bad:name","NixOS"]}"#), vec!["Ubuntu".to_owned(), "NixOS".to_owned()]);
+        assert!(!sync_script(Path::new("C:/Users/x/AppData/Local/Kiri"), "", true).contains('\\'));
     }
 }
