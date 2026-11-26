@@ -5,7 +5,7 @@
 //! ps -a` survives a daemon restart. Every state change notifies one
 //! condition variable, which is what `wait` blocks on.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -1751,17 +1751,52 @@ pub struct Engine {
     image_labels: Mutex<HashMap<String, serde_json::Value>>,
     /// The running VM's uplink status for `/info` and `kiri diag report` (#435).
     uplink: Mutex<serde_json::Value>,
-    /// Short-lived cache of guest-measured volume sizes (`GET /kiri/volumes/sizes`),
-    /// invalidated on volume create/remove and container remove while leaving
-    /// `GET /system/df` live.
+    /// Persisted and short-TTL cached volume byte sizes (`GET /kiri/volumes/sizes`
+    /// and `<state_dir>/volume-sizes.json`), tracking volumes dirtied since the
+    /// last guest disk measurement while leaving `GET /system/df` live.
     volume_sizes_cache: Mutex<VolumeSizesCache>,
 }
 
-#[derive(Default)]
 struct VolumeSizesCache {
+    path: PathBuf,
     generation: u64,
     measured_at: Option<std::time::Instant>,
     sizes: HashMap<String, u64>,
+    dirty: HashSet<String>,
+}
+
+pub(super) struct VolumeSizesSnapshot {
+    pub generation: u64,
+    pub fresh_ttl: bool,
+    pub sizes: HashMap<String, u64>,
+    pub dirty: HashSet<String>,
+}
+
+impl VolumeSizesCache {
+    fn load(root: &std::path::Path, current: &[super::volumes::Volume]) -> VolumeSizesCache {
+        let path = root.join("volume-sizes.json");
+        let mut sizes: HashMap<String, u64> = match std::fs::read(&path) {
+            Ok(b) => serde_json::from_slice(&b).unwrap_or_default(),
+            Err(_) => HashMap::new(),
+        };
+        sizes.retain(|k, _| current.iter().any(|v| v.name == *k && v.options.is_empty()));
+        VolumeSizesCache {
+            path,
+            generation: 0,
+            measured_at: None,
+            sizes,
+            dirty: HashSet::new(),
+        }
+    }
+
+    fn save(&self) {
+        if let Ok(json) = serde_json::to_vec(&self.sizes) {
+            let tmp = self.path.with_extension("json.tmp");
+            if let Err(e) = std::fs::write(&tmp, json).and_then(|()| std::fs::rename(&tmp, &self.path)) {
+                crate::diag::error!("saving volume sizes failed", error = e);
+            }
+        }
+    }
 }
 
 /// k3s's pod and service ranges, which `kiri k8s` leaves at their defaults.
@@ -1850,7 +1885,9 @@ impl Engine {
         let records = store.root().join("containers.json");
         let ceiling = memory_ceiling();
         let networks = Mutex::new(Networks::load(store.root())?);
-        let volumes = Mutex::new(super::volumes::Volumes::load(store.root())?);
+        let loaded_volumes = super::volumes::Volumes::load(store.root())?;
+        let volume_sizes_cache = Mutex::new(VolumeSizesCache::load(store.root(), loaded_volumes.all()));
+        let volumes = Mutex::new(loaded_volumes);
         let engine = Arc::new(Engine {
             volumes,
             link: Mutex::new(None),
@@ -1897,7 +1934,7 @@ impl Engine {
             k8s_fwd: Mutex::new(HashMap::new()),
             image_labels: Mutex::new(HashMap::new()),
             uplink: Mutex::new(serde_json::Value::Null),
-            volume_sizes_cache: Mutex::default(),
+            volume_sizes_cache,
         });
         let _ = engine.me.set(Arc::downgrade(&engine));
         engine.start_syncer();
@@ -2463,6 +2500,11 @@ impl Engine {
             return false;
         }
         let Some(vm) = self.link.lock().unwrap_or_else(|e| e.into_inner()).clone() else { return false };
+        if self.volume_list().iter().any(|v| v.options.is_empty())
+            && let Some(lines) = vm.usage(Duration::from_secs(15))
+        {
+            self.cache_volume_sizes(None, super::ops::parse_volume_usage(&lines));
+        }
         self.sleeping.store(true, std::sync::atomic::Ordering::SeqCst);
         self.memory_used.store(0, std::sync::atomic::Ordering::Relaxed);
         self.mem_available_kib.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -2774,38 +2816,104 @@ impl Engine {
         self.awake()
     }
 
-    /// Cached guest volume disk usage if younger than `ttl`, plus the cache
-    /// generation so an in-flight measurement does not overwrite an invalidation.
-    pub(super) fn volume_sizes_cached(&self, ttl: Duration) -> (u64, Option<HashMap<String, u64>>) {
+    /// Snapshot of persisted + cached volume disk usage, TTL freshness, dirty
+    /// set, and generation counter.
+    pub(super) fn volume_sizes_snapshot(&self, ttl: Duration) -> VolumeSizesSnapshot {
         let c = self.volume_sizes_cache.lock().unwrap_or_else(|e| e.into_inner());
-        let hit = c.measured_at.is_some_and(|at| at.elapsed() < ttl).then(|| c.sizes.clone());
-        (c.generation, hit)
+        VolumeSizesSnapshot {
+            generation: c.generation,
+            fresh_ttl: c.measured_at.is_some_and(|at| at.elapsed() < ttl),
+            sizes: c.sizes.clone(),
+            dirty: c.dirty.clone(),
+        }
     }
 
-    /// Stores freshly measured volume sizes. When `expected_gen` is `Some(g)`,
-    /// skips writing if the cache was invalidated since generation `g`.
-    pub(super) fn cache_volume_sizes(&self, expected_gen: Option<u64>, sizes: HashMap<String, u64>) {
+    /// Stores freshly measured volume sizes and persists `<state_dir>/volume-sizes.json`.
+    /// When `expected_gen` is `Some(g)`, skips writing if invalidated since `g`.
+    pub(super) fn cache_volume_sizes(&self, expected_gen: Option<u64>, du_volumes: HashMap<String, u64>) {
+        let volumes = self.volume_list();
         let mut c = self.volume_sizes_cache.lock().unwrap_or_else(|e| e.into_inner());
         if expected_gen.is_some_and(|g| g != c.generation) {
             return;
         }
+        let mut next = HashMap::with_capacity(volumes.len());
+        for v in &volumes {
+            if v.options.is_empty() {
+                next.insert(v.name.clone(), du_volumes.get(&v.name).copied().unwrap_or(0));
+            }
+        }
         c.measured_at = Some(std::time::Instant::now());
-        c.sizes = sizes;
+        c.sizes = next;
+        c.dirty.clear();
+        c.save();
     }
 
-    /// Drops cached volume sizes and advances the generation counter.
-    pub(super) fn invalidate_volume_sizes(&self) {
+    /// Initializes a newly created local volume's persisted size to `0` (unless
+    /// already measured) while bumping generation so an earlier in-flight scan
+    /// cannot clobber it.
+    fn record_new_volume(&self, v: &super::volumes::Volume) {
         let mut c = self.volume_sizes_cache.lock().unwrap_or_else(|e| e.into_inner());
         c.generation = c.generation.wrapping_add(1);
         c.measured_at = None;
-        c.sizes.clear();
+        c.dirty.remove(&v.name);
+        if v.options.is_empty() {
+            c.sizes.entry(v.name.clone()).or_insert(0);
+            c.save();
+        }
+    }
+
+    /// Removes a deleted volume from the persisted size map and bumps generation.
+    fn forget_volume_size(&self, name: &str) {
+        let mut c = self.volume_sizes_cache.lock().unwrap_or_else(|e| e.into_inner());
+        c.generation = c.generation.wrapping_add(1);
+        c.measured_at = None;
+        c.dirty.remove(name);
+        if c.sizes.remove(name).is_some() {
+            c.save();
+        }
+    }
+
+    /// Marks mounted local volumes dirty when a container using them starts,
+    /// exits, is removed, or receives `docker cp` writes.
+    pub(super) fn mark_volumes_dirty<'a>(&self, names: impl IntoIterator<Item = &'a String>) {
+        let names: Vec<String> = names.into_iter().cloned().collect();
+        if names.is_empty() {
+            return;
+        }
+        let local_set: HashSet<String> = self
+            .volume_list()
+            .into_iter()
+            .filter(|v| v.options.is_empty())
+            .map(|v| v.name)
+            .collect();
+        let mut c = self.volume_sizes_cache.lock().unwrap_or_else(|e| e.into_inner());
+        let mut any = false;
+        for name in names {
+            if local_set.contains(&name) {
+                c.dirty.insert(name);
+                any = true;
+            }
+        }
+        if any {
+            c.generation = c.generation.wrapping_add(1);
+            c.measured_at = None;
+        }
     }
 
     #[cfg(test)]
-    pub(super) fn set_volume_sizes_cache_at(&self, at: std::time::Instant, sizes: HashMap<String, u64>) {
+    pub(super) fn set_volume_sizes_cache_at(&self, at: std::time::Instant, du_volumes: HashMap<String, u64>) {
+        let volumes = self.volume_list();
         let mut c = self.volume_sizes_cache.lock().unwrap_or_else(|e| e.into_inner());
+        let mut next = HashMap::with_capacity(volumes.len());
+        for v in &volumes {
+            if v.options.is_empty() {
+                next.insert(v.name.clone(), du_volumes.get(&v.name).copied().unwrap_or(0));
+            }
+        }
         c.measured_at = Some(at);
-        c.sizes = sizes;
+        c.sizes = next;
+        c.dirty.clear();
+        c.save();
     }
 
     /// Queries `(in_use, capacity)` of the guest data disk while the VM is
@@ -3092,7 +3200,7 @@ impl Engine {
                 // rules wiped by a delayed `Forwards::drop` -> `Unpublish`
                 // (#649). Loop in case a concurrent `start`/`connect`/
                 // `set_ports` installed forwards while the lock was released.
-                let (restart_in, persist, exited_name, actor, start_owed, remove, anon, removed_log, removed_layers) = loop {
+                let (restart_in, persist, exited_name, actor, start_owed, remove, anon, removed_log, removed_layers, touched_volumes) = loop {
                     let mut st = self.lock();
                     if let Some(e) = st.execs.get_mut(id) {
                         e.running = false;
@@ -3123,8 +3231,10 @@ impl Engine {
                     if let Some(h) = st.health.get_mut(id) {
                         close_monitor(h);
                     }
+                    let mut touched_volumes = Vec::new();
                     let remove = match st.containers.get_mut(id) {
                         Some(c) => {
+                            touched_volumes = c.spec.volumes.iter().chain(&c.spec.anon_volumes).cloned().collect();
                             c.status = Status::Exited;
                             c.exit_code = code;
                             c.pid = 0;
@@ -3180,7 +3290,7 @@ impl Engine {
                         note_removed(&mut st, id, code);
                     }
                     drop(st);
-                    break (restart_in, persist, exited_name, actor, start_owed, remove, anon, removed_log, removed_layers);
+                    break (restart_in, persist, exited_name, actor, start_owed, remove, anon, removed_log, removed_layers, touched_volumes);
                 };
                 // Relieve the balloon and log the exit outside `self.state` so
                 // neither `memory_target`, `link` nor `stopping_ops` is ever
@@ -3207,6 +3317,7 @@ impl Engine {
                 // reader), since that asks the VM, and vm() waits for this
                 // reader when the VM was just lost.
                 let forgotten: Vec<String> = self.unshared(anon).into_iter().filter(|v| self.forget_volume(v)).collect();
+                self.mark_volumes_dirty(&touched_volumes);
                 if !forgotten.is_empty() && let Some(me) = self.me.get().and_then(Weak::upgrade) {
                     let _ = std::thread::Builder::new().name("kiri-volume-rm".into()).spawn(move || {
                         if let Ok(vm) = me.vm() {
@@ -3998,6 +4109,7 @@ impl Engine {
             (out.0, out.1, out.2, out.3, out.4, (out.5.0, out.5.1, earlier, halted))
         };
         self.clear_stopping_op(&id);
+        self.mark_volumes_dirty(spec.volumes.iter().chain(&spec.anon_volumes));
         let (gate, exits, earlier, halted_at_claim) = gate;
         // A bind source that is a link is followed again at every start, as
         // Docker does: re-pointing it between runs (a `current` release
@@ -4856,6 +4968,9 @@ impl Engine {
         let mut out = Vec::new();
         kiri_proto::encode_copy(&mut out, op, &id, path, flags, &layers, &mounts);
         std::io::Write::write_all(&mut std::fs::File::from(stream.fd.try_clone()?), &out)?;
+        if op == kiri_proto::copy_op::IN {
+            self.mark_volumes_dirty(spec.volumes.iter().chain(&spec.anon_volumes));
+        }
         Ok(stream)
     }
 
@@ -5854,7 +5969,9 @@ impl Engine {
                 self.delete_volume_data(&v);
             }
         }
-        self.invalidate_volume_sizes();
+        if let Some(c) = &removed {
+            self.mark_volumes_dirty(c.spec.volumes.iter().chain(&c.spec.anon_volumes));
+        }
         Ok(())
     }
 
@@ -5868,7 +5985,7 @@ impl Engine {
         let new = self.volume_get(name).is_none();
         let v = self.lock_volumes().ensure(name, labels, anonymous).map_err(Error::BadRequest)?;
         if new {
-            self.invalidate_volume_sizes();
+            self.record_new_volume(&v);
             self.emit_volume("create", name);
         }
         Ok(v)
@@ -5880,7 +5997,7 @@ impl Engine {
         let new = self.volume_get(name).is_none();
         let v = self.lock_volumes().ensure_with(name, labels, false, options).map_err(Error::BadRequest)?;
         if new {
-            self.invalidate_volume_sizes();
+            self.record_new_volume(&v);
             self.emit_volume("create", name);
         }
         Ok(v)
@@ -5945,7 +6062,7 @@ impl Engine {
     fn forget_volume(&self, name: &str) -> bool {
         let forgot = self.lock_volumes().forget(name);
         if forgot {
-            self.invalidate_volume_sizes();
+            self.forget_volume_size(name);
             self.emit_volume("destroy", name);
         }
         forgot
@@ -6047,6 +6164,25 @@ impl Engine {
         flags |= exec_security.0;
         let console = config.console_size;
         self.wait_for_start(&container_id);
+        let conflict = {
+            let st = self.lock();
+            match st.containers.get(&container_id) {
+                None => Some(format!("container {} is not running", &container_id[..12])),
+                Some(c) if c.status != Status::Running => Some(format!("container {} is not running", &container_id[..12])),
+                Some(c) if c.paused && !is_builder(c) => Some(format!("Container {} is paused, unpause the container before exec", &container_id[..12])),
+                _ => None,
+            }
+        };
+        if let Some(msg) = conflict {
+            let mut st = self.lock();
+            if let Some(x) = st.execs.get_mut(exec_id) {
+                x.running = false;
+                x.attached.clear();
+            }
+            drop(st);
+            self.changed.notify_all();
+            return Err(Error::Conflict(msg));
+        }
         let started = self.vm()?.exec(&container_id, exec_id, &config.argv, &env, &config.cwd, &config.user, flags, exec_security.1, &exec_security.2);
         if let Ok(pid) = started {
             if let Some(x) = self.lock().execs.get_mut(exec_id).filter(|x| x.exit_code.is_none()) {

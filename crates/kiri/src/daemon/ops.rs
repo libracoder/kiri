@@ -556,29 +556,50 @@ fn system_df(engine: &Engine) -> Result<Value, Error> {
     Ok(json!({"LayersSize": layers_size, "Images": image_rows, "Containers": containers, "Volumes": volumes, "BuildCache": super::builder::cache(engine)}))
 }
 
-/// How long `GET /kiri/volumes/sizes` reuses guest-measured volume sizes so
-/// tab switches do not re-walk the guest disk (`GET /system/df` stays live).
+/// How long `GET /kiri/volumes/sizes` reuses guest-measured volume sizes while
+/// the VM is awake so tab switches do not re-walk the guest disk (`GET /system/df`
+/// stays live).
 const VOLUME_SIZES_TTL: Duration = Duration::from_secs(30);
 
-fn volume_sizes_map(volumes: &[super::volumes::Volume], du: &HashMap<String, u64>) -> serde_json::Map<String, Value> {
+pub(super) fn parse_volume_usage(lines: &[String]) -> HashMap<String, u64> {
+    DiskUsage::parse(lines).volumes
+}
+
+fn volume_sizes_map(
+    volumes: &[super::volumes::Volume],
+    du: &HashMap<String, u64>,
+    dirty: &HashSet<String>,
+    complete_scan: bool,
+) -> serde_json::Map<String, Value> {
     let mut out = serde_json::Map::with_capacity(volumes.len());
     for v in volumes {
-        let size = match du.get(&v.name) {
-            Some(&b) => i64::try_from(b).unwrap_or(i64::MAX),
+        if !v.options.is_empty() {
+            // Backed by driver options (NFS/bind/tmpfs): not on the guest data disk.
+            out.insert(v.name.clone(), json!(-1));
+            continue;
+        }
+        if !complete_scan && dirty.contains(&v.name) {
+            continue;
+        }
+        match du.get(&v.name) {
+            Some(&b) => {
+                out.insert(v.name.clone(), json!(i64::try_from(b).unwrap_or(i64::MAX)));
+            }
             // A plain local volume never mounted yet has no directory in the
-            // guest and takes 0 bytes; one backed by driver options (NFS/bind/
-            // tmpfs) is not measured on the guest data disk.
-            None if v.options.is_empty() => 0,
-            None => -1,
-        };
-        out.insert(v.name.clone(), json!(size));
+            // guest and takes 0 bytes.
+            None if complete_scan => {
+                out.insert(v.name.clone(), json!(0));
+            }
+            None => {}
+        }
     }
     out
 }
 
 /// Each volume's size in bytes for the Volumes view (`GET /kiri/volumes/sizes`).
-/// Uses a short cache invalidated on volume/container changes and never wakes
-/// a sleeping or stopped VM.
+/// Uses persisted `<state_dir>/volume-sizes.json` across VM sleep and daemon
+/// restarts without waking the VM unless an active (`!is_stopped()`) engine has
+/// dirty or unmeasured local volumes.
 fn volume_sizes(engine: &Engine) -> Result<Value, Error> {
     volume_sizes_with_ttl(engine, VOLUME_SIZES_TTL)
 }
@@ -588,20 +609,43 @@ fn volume_sizes_with_ttl(engine: &Engine, ttl: Duration) -> Result<Value, Error>
     if volumes.is_empty() {
         return Ok(json!({"sizes": {}}));
     }
-    let (generation, cached) = engine.volume_sizes_cached(ttl);
-    if let Some(du) = cached {
-        return Ok(json!({"sizes": volume_sizes_map(&volumes, &du)}));
+    let snap = engine.volume_sizes_snapshot(ttl);
+    let any_missing_or_dirty = volumes
+        .iter()
+        .any(|v| v.options.is_empty() && (snap.dirty.contains(&v.name) || !snap.sizes.contains_key(&v.name)));
+
+    if let Some(vm) = engine.awake_link() {
+        if snap.fresh_ttl && !any_missing_or_dirty {
+            return Ok(json!({"sizes": volume_sizes_map(&volumes, &snap.sizes, &snap.dirty, false)}));
+        }
+        let Some(measured) = vm.usage(Duration::from_secs(120)) else {
+            return Ok(json!({"sizes": {}}));
+        };
+        let du = DiskUsage::parse(&measured);
+        engine.cache_volume_sizes(Some(snap.generation), du.volumes.clone());
+        let current = engine.volume_list();
+        return Ok(json!({"sizes": volume_sizes_map(&current, &du.volumes, &HashSet::new(), true)}));
     }
-    let Some(vm) = engine.awake_link() else {
-        return Ok(json!({"sizes": {}}));
-    };
-    let Some(measured) = vm.usage(Duration::from_secs(120)) else {
-        return Ok(json!({"sizes": {}}));
-    };
-    let du = DiskUsage::parse(&measured);
-    engine.cache_volume_sizes(Some(generation), du.volumes.clone());
-    let current = engine.volume_list();
-    Ok(json!({"sizes": volume_sizes_map(&current, &du.volumes)}))
+
+    if !any_missing_or_dirty {
+        return Ok(json!({"sizes": volume_sizes_map(&volumes, &snap.sizes, &snap.dirty, false)}));
+    }
+    if !engine.is_stopped()
+        && let Some(measured) = engine.vm().ok().and_then(|vm| vm.usage(Duration::from_secs(120)))
+    {
+        let du = DiskUsage::parse(&measured);
+        engine.cache_volume_sizes(Some(snap.generation), du.volumes.clone());
+        let current = engine.volume_list();
+        return Ok(json!({"sizes": volume_sizes_map(&current, &du.volumes, &HashSet::new(), true)}));
+    }
+
+    let has_any_clean_local = volumes
+        .iter()
+        .any(|v| v.options.is_empty() && !snap.dirty.contains(&v.name) && snap.sizes.contains_key(&v.name));
+    if has_any_clean_local {
+        return Ok(json!({"sizes": volume_sizes_map(&volumes, &snap.sizes, &snap.dirty, false)}));
+    }
+    Ok(json!({"sizes": {}}))
 }
 
 /// `docker history`: the config's history, newest first, with each
@@ -950,7 +994,7 @@ mod disk_usage_tests {
     }
 
     #[test]
-    fn volume_sizes_never_wakes_asleep_vm_and_honors_cache_and_invalidation() {
+    fn volume_sizes_persists_across_sleep_and_restart_without_waking_vm() {
         use serde_json::json;
         use std::collections::{BTreeMap, HashMap};
         use std::time::{Duration, Instant};
@@ -967,42 +1011,53 @@ mod disk_usage_tests {
         nfs_opts.insert("device".into(), ":/export".into());
         engine.volume_ensure_with("nfs_vol", json!({}), nfs_opts).unwrap();
 
-        // With no awake VM and an empty cache, returns {} without attempting to boot a VM.
-        let unmeasured = super::volume_sizes(&engine).unwrap();
-        assert_eq!(unmeasured, json!({"sizes": {}}));
+        let initial = super::volume_sizes(&engine).unwrap();
+        assert_eq!(initial, json!({"sizes": {"pg_data": 0, "empty_vol": 0, "nfs_vol": -1}}));
         assert!(!engine.is_awake());
 
-        // Populate cache as if an awake measurement just completed.
         let mut measured = HashMap::new();
         measured.insert("pg_data".into(), 807_700_000u64);
-        let (gen_before, _) = engine.volume_sizes_cached(Duration::from_secs(30));
+        let gen_before = engine.volume_sizes_snapshot(Duration::from_secs(30)).generation;
         engine.cache_volume_sizes(Some(gen_before), measured.clone());
+        assert!(root.join("volume-sizes.json").is_file(), "volume-sizes.json persisted");
 
-        let hit = super::volume_sizes_with_ttl(&engine, Duration::from_secs(30)).unwrap();
-        assert_eq!(hit, json!({"sizes": {"pg_data": 807_700_000, "empty_vol": 0, "nfs_vol": -1}}));
-
-        // Stale cache entry (> TTL) misses and still does not wake the VM.
         engine.set_volume_sizes_cache_at(Instant::now() - Duration::from_secs(31), measured.clone());
-        let expired = super::volume_sizes_with_ttl(&engine, Duration::from_secs(30)).unwrap();
-        assert_eq!(expired, json!({"sizes": {}}));
+        let after_ttl = super::volume_sizes_with_ttl(&engine, Duration::from_secs(30)).unwrap();
+        assert_eq!(after_ttl, json!({"sizes": {"pg_data": 807_700_000, "empty_vol": 0, "nfs_vol": -1}}));
 
-        // Creating a new volume invalidates the cache and bumps generation so
-        // an in-flight measurement from before creation cannot repopulate it.
         engine.cache_volume_sizes(None, measured.clone());
-        let (old_gen, cached) = engine.volume_sizes_cached(Duration::from_secs(30));
-        assert!(cached.is_some());
+        let old_gen = engine.volume_sizes_snapshot(Duration::from_secs(30)).generation;
         engine.volume_ensure("new_vol", json!({}), false).unwrap();
-        assert!(engine.volume_sizes_cached(Duration::from_secs(30)).1.is_none());
-        engine.cache_volume_sizes(Some(old_gen), measured.clone());
-        assert!(engine.volume_sizes_cached(Duration::from_secs(30)).1.is_none(), "stale generation write ignored");
+        assert!(!engine.volume_sizes_snapshot(Duration::from_secs(30)).fresh_ttl);
+        let mut stale = HashMap::new();
+        stale.insert("pg_data".into(), 1u64);
+        engine.cache_volume_sizes(Some(old_gen), stale);
+        assert_eq!(
+            super::volume_sizes(&engine).unwrap(),
+            json!({"sizes": {"pg_data": 807_700_000, "empty_vol": 0, "new_vol": 0, "nfs_vol": -1}}),
+            "stale generation write ignored and new_vol initialized to 0"
+        );
 
-        // Removing a volume also invalidates the cache.
-        engine.cache_volume_sizes(None, measured);
-        assert!(engine.volume_sizes_cached(Duration::from_secs(30)).1.is_some());
         engine.volume_remove("new_vol", false).unwrap();
-        assert!(engine.volume_sizes_cached(Duration::from_secs(30)).1.is_none());
+        let saved_raw: HashMap<String, u64> =
+            serde_json::from_slice(&std::fs::read(root.join("volume-sizes.json")).unwrap()).unwrap();
+        assert!(!saved_raw.contains_key("new_vol"));
+        assert_eq!(saved_raw.get("pg_data"), Some(&807_700_000));
 
+        engine.mark_volumes_dirty([&"pg_data".to_owned()]);
+        assert_eq!(super::volume_sizes(&engine).unwrap(), json!({"sizes": {"empty_vol": 0, "nfs_vol": -1}}));
+
+        engine.cache_volume_sizes(None, measured);
         drop(engine);
+
+        let asleep_engine = super::super::engine::Engine::boot(kiri_image::store::Store::open(&root).unwrap()).unwrap();
+        assert!(!asleep_engine.is_stopped(), "engine is asleep, not stopped");
+        assert!(!asleep_engine.is_awake(), "VM starts asleep");
+        let asleep_sizes = super::volume_sizes(&asleep_engine).unwrap();
+        assert_eq!(asleep_sizes, json!({"sizes": {"pg_data": 807_700_000, "empty_vol": 0, "nfs_vol": -1}}));
+        assert!(!asleep_engine.is_awake(), "persisted volume sizes returned without waking asleep VM");
+
+        drop(asleep_engine);
         let _ = std::fs::remove_dir_all(root);
     }
 }
