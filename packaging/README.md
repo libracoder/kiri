@@ -95,6 +95,15 @@ application-menu launcher and icons, without replacing an installed Kiri engine,
 CLI, systemd service, Docker context, or container store. See `arch/README.md`
 for build and install steps.
 
+## Nix and NixOS
+
+`flake.nix` builds `kiri` and `kiri-init` on `x86_64-linux` and `aarch64-linux`
+(`nix build .#kiri`), and exports `nixosModules.default` (`services.kiri.enable = true;`),
+which creates the `kiri` group, configures NetworkManager to leave Kiri's
+bridges and veths unmanaged, and runs `kiri.service` with the same cgroup
+delegation, resource limits, and `/run/docker.sock` fallback link as the `.deb`
+and `.rpm` packages.
+
 ## Homebrew (planned, not built)
 
 The Mac already has the app and the dmg; Homebrew is the third way in, for
