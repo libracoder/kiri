@@ -445,10 +445,7 @@ fn read_disk_overhead(root: &Path) -> Option<u64> {
 #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
 fn write_disk_overhead(root: &Path, bytes: u64) {
     let path = root.join(DISK_OVERHEAD_FILE);
-    let tmp = root.join("vm/disk-overhead.tmp");
-    if std::fs::write(&tmp, format!("{bytes}\n")).is_ok() {
-        let _ = std::fs::rename(&tmp, &path);
-    }
+    let _ = super::write_atomic_mode(&path, format!("{bytes}\n").as_bytes(), 0o600);
 }
 
 /// Effective bytes in use inside `data.img`, combining occupied filesystem

@@ -550,6 +550,47 @@ fn find_load_slot(nonce: &str) -> Option<Arc<LoadSlot>> {
     LOADS.lock().unwrap_or_else(|e| e.into_inner()).as_ref()?.get(nonce).cloned()
 }
 
+const MIRROR_HEADER_DEADLINE: Duration = Duration::from_secs(10);
+const MIRROR_BODY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Bounds total elapsed time while reading HTTP request headers on a mirror
+/// TCP connection so an unauthenticated Slowloris client cannot pin workers.
+struct DeadlineTcpBuf<'a> {
+    inner: &'a mut BufReader<TcpStream>,
+    deadline: std::time::Instant,
+}
+
+impl DeadlineTcpBuf<'_> {
+    fn apply_remaining(&self) -> io::Result<()> {
+        let Some(rem) = self.deadline.checked_duration_since(std::time::Instant::now()).filter(|d| !d.is_zero()) else {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "mirror header deadline exceeded"));
+        };
+        self.inner.get_ref().set_read_timeout(Some(rem))
+    }
+}
+
+impl Read for DeadlineTcpBuf<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.inner.buffer().is_empty() {
+            self.apply_remaining()?;
+        }
+        self.inner.read(buf)
+    }
+}
+
+impl BufRead for DeadlineTcpBuf<'_> {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        if self.inner.buffer().is_empty() {
+            self.apply_remaining()?;
+        }
+        self.inner.fill_buf()
+    }
+
+    fn consume(&mut self, amt: usize) {
+        self.inner.consume(amt);
+    }
+}
+
 fn serve(listener: TcpListener, engine: Weak<Engine>) {
     for conn in listener.incoming() {
         let Ok(conn) = conn else { continue };
@@ -563,7 +604,8 @@ fn serve(listener: TcpListener, engine: Weak<Engine>) {
         let guard = WorkerGuard;
         let _ = std::thread::Builder::new().name("kiri-build-mirror".into()).spawn(move || {
             let _guard = guard;
-            let _ = conn.set_read_timeout(Some(Duration::from_secs(30)));
+            let _ = conn.set_read_timeout(Some(MIRROR_HEADER_DEADLINE));
+            let _ = conn.set_write_timeout(Some(MIRROR_BODY_TIMEOUT));
             let _ = answer(conn, &engine);
         });
     }
@@ -663,87 +705,143 @@ fn percent_decode(s: &str) -> String {
 
 /// One request, then the connection closes.
 fn answer(conn: TcpStream, engine: &Engine) -> io::Result<()> {
-    let mut w = conn.try_clone()?;
-    let mut r = BufReader::new(conn);
-    answer_stream(&mut r, &mut w, engine)
+    answer_with_header_deadline(conn, engine, MIRROR_HEADER_DEADLINE)
 }
 
+fn answer_with_header_deadline(conn: TcpStream, engine: &Engine, header_deadline: Duration) -> io::Result<()> {
+    let mut w = conn.try_clone()?;
+    let mut r = BufReader::new(conn);
+    let deadline = std::time::Instant::now() + header_deadline;
+    let res = answer_stream_with(&mut r, &mut w, engine, Some(deadline));
+    res
+}
+
+#[cfg(test)]
 fn answer_stream<R: BufRead, W: Write>(r: &mut R, w: &mut W, engine: &Engine) -> io::Result<()> {
-    let head = |w: &mut W, status: &str, extra: &str, len: u64| write!(w, "HTTP/1.1 {status}\r\nConnection: close\r\nContent-Length: {len}\r\n{extra}\r\n");
-    let (method, target, framing, expect_continue) = {
-        let mut head_reader = (&mut *r).take(16 << 10);
-        let mut raw_line = Vec::new();
-        if head_reader.read_until(b'\n', &mut raw_line)? == 0 {
-            return Ok(());
-        }
-        let Ok(line) = std::str::from_utf8(&raw_line) else {
-            head(w, "400 Bad Request", "", 0)?;
-            return w.flush();
-        };
-        if !line.ends_with('\n') {
-            head(w, "400 Bad Request", "", 0)?;
-            return w.flush();
-        }
-        let mut parts = line.split_whitespace();
-        let (method, target) = (parts.next().unwrap_or_default().to_owned(), parts.next().unwrap_or_default().to_owned());
-        let mut content_length: Option<u64> = None;
-        let mut chunked = false;
-        let mut expect_continue = false;
-        let mut saw_end = false;
-        loop {
-            let mut raw_h = Vec::new();
-            if head_reader.read_until(b'\n', &mut raw_h)? == 0 {
-                break;
-            }
-            let Ok(h) = std::str::from_utf8(&raw_h) else {
-                head(w, "400 Bad Request", "", 0)?;
-                return w.flush();
-            };
-            if !h.ends_with('\n') {
-                head(w, "400 Bad Request", "", 0)?;
-                return w.flush();
-            }
-            if h.trim().is_empty() {
-                saw_end = true;
-                break;
-            }
-            if let Some((k, v)) = h.split_once(':') {
-                let k = k.trim();
-                let v = v.trim();
-                if k.eq_ignore_ascii_case("content-length") {
-                    let Ok(parsed) = v.parse::<u64>() else {
-                        head(w, "400 Bad Request", "", 0)?;
-                        return w.flush();
-                    };
-                    if content_length.is_some_and(|prev| prev != parsed) {
-                        head(w, "400 Bad Request", "", 0)?;
-                        return w.flush();
-                    }
-                    content_length = Some(parsed);
-                } else if k.eq_ignore_ascii_case("transfer-encoding") && v.to_ascii_lowercase().contains("chunked") {
-                    chunked = true;
-                } else if k.eq_ignore_ascii_case("expect") && v.to_ascii_lowercase().contains("100-continue") {
-                    expect_continue = true;
-                }
-            }
-        }
-        if !saw_end || (chunked && content_length.is_some()) {
-            head(w, "400 Bad Request", "", 0)?;
-            return w.flush();
-        }
-        let framing = if chunked {
-            BodyFraming::Chunked
-        } else if let Some(n) = content_length.filter(|n| *n > 0) {
-            BodyFraming::Length(n)
-        } else {
-            BodyFraming::None
-        };
-        (method, target, framing, expect_continue)
+    answer_stream_inner(r, w, engine, None)
+}
+
+fn answer_stream_with(r: &mut BufReader<TcpStream>, w: &mut TcpStream, engine: &Engine, header_deadline: Option<std::time::Instant>) -> io::Result<()> {
+    let head = |w: &mut TcpStream, status: &str, extra: &str, len: u64| write!(w, "HTTP/1.1 {status}\r\nConnection: close\r\nContent-Length: {len}\r\n{extra}\r\n");
+    let parsed = if let Some(deadline) = header_deadline {
+        let mut dl = DeadlineTcpBuf { inner: r, deadline };
+        let res = read_request_head(&mut dl, w, head)?;
+        let _ = dl.inner.get_ref().set_read_timeout(Some(MIRROR_BODY_TIMEOUT));
+        res
+    } else {
+        read_request_head(r, w, head)?
     };
-    let (path, query) = target.split_once('?').unwrap_or((&target, ""));
+    let Some((method, target, framing, expect_continue)) = parsed else {
+        return Ok(());
+    };
+    dispatch_request(r, w, engine, &method, &target, framing, expect_continue)
+}
+
+#[cfg(test)]
+fn answer_stream_inner<R: BufRead, W: Write>(r: &mut R, w: &mut W, engine: &Engine, _unused: Option<()>) -> io::Result<()> {
+    let head = |w: &mut W, status: &str, extra: &str, len: u64| write!(w, "HTTP/1.1 {status}\r\nConnection: close\r\nContent-Length: {len}\r\n{extra}\r\n");
+    let Some((method, target, framing, expect_continue)) = read_request_head(r, w, head)? else {
+        return Ok(());
+    };
+    dispatch_request(r, w, engine, &method, &target, framing, expect_continue)
+}
+
+fn read_request_head<R: BufRead, W: Write>(
+    r: &mut R,
+    w: &mut W,
+    head: impl Fn(&mut W, &str, &str, u64) -> io::Result<()>,
+) -> io::Result<Option<(String, String, BodyFraming, bool)>> {
+    let mut head_reader = (&mut *r).take(16 << 10);
+    let mut raw_line = Vec::new();
+    if head_reader.read_until(b'\n', &mut raw_line)? == 0 {
+        return Ok(None);
+    }
+    let Ok(line) = std::str::from_utf8(&raw_line) else {
+        head(w, "400 Bad Request", "", 0)?;
+        w.flush()?;
+        return Ok(None);
+    };
+    if !line.ends_with('\n') {
+        head(w, "400 Bad Request", "", 0)?;
+        w.flush()?;
+        return Ok(None);
+    }
+    let mut parts = line.split_whitespace();
+    let (method, target) = (parts.next().unwrap_or_default().to_owned(), parts.next().unwrap_or_default().to_owned());
+    let mut content_length: Option<u64> = None;
+    let mut chunked = false;
+    let mut expect_continue = false;
+    let mut saw_end = false;
+    loop {
+        let mut raw_h = Vec::new();
+        if head_reader.read_until(b'\n', &mut raw_h)? == 0 {
+            break;
+        }
+        let Ok(h) = std::str::from_utf8(&raw_h) else {
+            head(w, "400 Bad Request", "", 0)?;
+            w.flush()?;
+            return Ok(None);
+        };
+        if !h.ends_with('\n') {
+            head(w, "400 Bad Request", "", 0)?;
+            w.flush()?;
+            return Ok(None);
+        }
+        if h.trim().is_empty() {
+            saw_end = true;
+            break;
+        }
+        if let Some((k, v)) = h.split_once(':') {
+            let k = k.trim();
+            let v = v.trim();
+            if k.eq_ignore_ascii_case("content-length") {
+                let Ok(parsed) = v.parse::<u64>() else {
+                    head(w, "400 Bad Request", "", 0)?;
+                    w.flush()?;
+                    return Ok(None);
+                };
+                if content_length.is_some_and(|prev| prev != parsed) {
+                    head(w, "400 Bad Request", "", 0)?;
+                    w.flush()?;
+                    return Ok(None);
+                }
+                content_length = Some(parsed);
+            } else if k.eq_ignore_ascii_case("transfer-encoding") && v.to_ascii_lowercase().contains("chunked") {
+                chunked = true;
+            } else if k.eq_ignore_ascii_case("expect") && v.to_ascii_lowercase().contains("100-continue") {
+                expect_continue = true;
+            }
+        }
+    }
+    if !saw_end || (chunked && content_length.is_some()) {
+        head(w, "400 Bad Request", "", 0)?;
+        w.flush()?;
+        return Ok(None);
+    }
+    let framing = if chunked {
+        BodyFraming::Chunked
+    } else if let Some(n) = content_length.filter(|n| *n > 0) {
+        BodyFraming::Length(n)
+    } else {
+        BodyFraming::None
+    };
+    Ok(Some((method, target, framing, expect_continue)))
+}
+
+fn dispatch_request<R: BufRead, W: Write>(
+    r: &mut R,
+    w: &mut W,
+    engine: &Engine,
+    method: &str,
+    target: &str,
+    framing: BodyFraming,
+    expect_continue: bool,
+) -> io::Result<()> {
+    let head = |w: &mut W, status: &str, extra: &str, len: u64| write!(w, "HTTP/1.1 {status}\r\nConnection: close\r\nContent-Length: {len}\r\n{extra}\r\n");
+    let (path, query) = target.split_once('?').unwrap_or((target, ""));
 
     // Registry v2 ping (`GET /v2/` / `HEAD /v2/`).
-    if matches!(method.as_str(), "GET" | "HEAD") && (path == "/v2/" || path == "/v2") {
+    if matches!(method, "GET" | "HEAD") && (path == "/v2/" || path == "/v2") {
         let body = if method == "GET" { b"{}".as_slice() } else { b"".as_slice() };
         head(w, "200 OK", "Docker-Distribution-Api-Version: registry/2.0\r\nContent-Type: application/json\r\n", body.len() as u64)?;
         w.write_all(body)?;
@@ -753,7 +851,7 @@ fn answer_stream<R: BufRead, W: Write>(r: &mut R, w: &mut W, engine: &Engine) ->
     // Ephemeral one-shot image upload for BuildKit's `docker` driver.
     if let Some(rest) = path.strip_prefix("/v2/load/") {
         if let Some((nonce, sub)) = rest.split_once("/image/") {
-            return handle_load(engine, nonce, sub, &method, query, framing, expect_continue, r, w);
+            return handle_load(engine, nonce, sub, method, query, framing, expect_continue, r, w);
         }
         head(w, "404 Not Found", "", 0)?;
         return w.flush();
@@ -1159,9 +1257,24 @@ fn manifest(store: &kiri_image::Store, i: &Image) -> Option<(Vec<u8>, String)> {
     Some((bytes, digest))
 }
 
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 /// `/v2/<token>/<registry>/<repo…>/manifests/<tag|digest>` or `…/blobs/<digest>`.
 fn parse(path: &str, token: &str) -> Option<(String, String, bool, String)> {
-    let rest = path.strip_prefix("/v2/")?.strip_prefix(token)?.strip_prefix('/')?;
+    let after_v2 = path.strip_prefix("/v2/")?;
+    let (seg, rest) = after_v2.split_once('/')?;
+    if token.is_empty() || !ct_eq(seg.as_bytes(), token.as_bytes()) {
+        return None;
+    }
     let (registry, rest) = rest.split_once('/')?;
     let (repo, kind, reference) = if let Some((repo, r)) = rest.rsplit_once("/manifests/") {
         (repo, true, r)
@@ -1693,6 +1806,38 @@ mod tests {
         assert!(engine.store.find(&cfg_digest).unwrap().is_some(), "untagged image stored under config digest");
         drop(untagged);
 
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mirror_enforces_header_deadline_and_constant_time_token_match() {
+        assert!(ct_eq(b"0123456789abcdef", b"0123456789abcdef"));
+        assert!(!ct_eq(b"0123456789abcdef", b"0123456789abcdee"));
+        assert!(!ct_eq(b"0123456789abcdef", b"0123456789abcde"));
+        assert!(parse("/v2/tok123/docker.io/library/alpine/manifests/latest", "tok123").is_some());
+        assert!(parse("/v2/tok124/docker.io/library/alpine/manifests/latest", "tok123").is_none());
+        assert!(parse("/v2//docker.io/library/alpine/manifests/latest", "").is_none());
+
+        let dir = std::env::temp_dir().join(format!("kiri-mirror-slowloris-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = kiri_image::Store::open(&dir).unwrap();
+        let engine = Engine::boot(store).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let trickle = std::thread::spawn(move || {
+            let mut c = TcpStream::connect(addr).unwrap();
+            for &b in b"GET /v2/ HTTP/1.1\r\nHost: d\r\nX-Slow: 1\r\n\r\n" {
+                if c.write_all(&[b]).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        });
+        let (srv, _) = listener.accept().unwrap();
+        let err = answer_with_header_deadline(srv, &engine, Duration::from_millis(120)).unwrap_err();
+        assert!(matches!(err.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut), "expected slowloris deadline timeout, got {err:?}");
+        let _ = trickle.join();
         drop(engine);
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -374,13 +374,32 @@ impl Log {
 
     /// `records` in a file of their own, deleted as soon as it is open.
     fn memory_file(&self, records: &[u8]) -> io::Result<File> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
         fs::create_dir_all(&self.dir)?;
-        let p = self.dir.join(format!("{FILE}.memory"));
-        let mut f = OpenOptions::new().create(true).truncate(true).write(true).read(true).open(&p)?;
-        let _ = fs::remove_file(&p);
-        f.write_all(records)?;
-        io::Seek::seek(&mut f, io::SeekFrom::Start(0))?;
-        Ok(f)
+        let pid = std::process::id();
+        for _ in 0..16 {
+            let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+            let p = self.dir.join(format!(".{FILE}.{pid}.{seq}.memory"));
+            let mut opts = OpenOptions::new();
+            opts.create_new(true).write(true).read(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            match opts.open(&p) {
+                Ok(mut f) => {
+                    let _ = fs::remove_file(&p);
+                    f.write_all(records)?;
+                    io::Seek::seek(&mut f, io::SeekFrom::Start(0))?;
+                    return Ok(f);
+                }
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(io::Error::new(io::ErrorKind::AlreadyExists, "could not create temporary log file"))
     }
 
     fn file_path(&self, i: u32) -> PathBuf {

@@ -40,9 +40,7 @@ pub fn settings() -> Value {
 
 pub fn save(v: &Value) -> std::io::Result<()> {
     let path = path().ok_or_else(|| std::io::Error::other("HOME is not set"))?;
-    let tmp = path.with_extension("json.tmp");
-    write_private(&tmp, v.to_string().as_bytes())?;
-    std::fs::rename(&tmp, &path)?;
+    write_private_atomic(&path, v.to_string().as_bytes())?;
     *CACHE.lock().unwrap_or_else(|e| e.into_inner()) = None;
     Ok(())
 }
@@ -199,23 +197,28 @@ pub fn report() -> Value {
 
 
 /// Writes a file only this user can read: proxy settings may carry a
-/// `http://user:pass@host` credential.
-fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?;
-        f.write_all(bytes)
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, bytes)
-    }
+/// `http://user:pass@host` credential. Uses `create_new(true)` + `0o600` +
+/// atomic rename so a pre-existing temp file or symlink cannot weaken permissions.
+fn write_private_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    super::write_atomic_mode(path, bytes, 0o600)
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn write_private_atomic_creates_0600_even_with_existing_permissive_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("kiri-proxy-priv-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("proxy.json");
+        std::fs::write(&target, b"old").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        super::write_private_atomic(&target, br#"{"http":"http://u:p@host:3128"}"#).unwrap();
+        let mode = std::fs::symlink_metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     #[test]
     fn a_proxy_is_shown_without_its_password() {
         let shown = |u: &str| super::without_password(u.into());

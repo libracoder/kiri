@@ -72,13 +72,40 @@ pub fn start(engine: Arc<Engine>) -> io::Result<PathBuf> {
             if !allowed(&conn) {
                 continue;
             }
+            let Some(permit) = acquire_nfs_conn() else {
+                continue;
+            };
+            let _ = conn.set_read_timeout(Some(NFS_IO_TIMEOUT));
+            let _ = conn.set_write_timeout(Some(NFS_IO_TIMEOUT));
             let (engine, handles) = (engine.clone(), handles.clone());
             let _ = std::thread::Builder::new().name("kiri-nfs-conn".into()).spawn(move || {
+                let _permit = permit;
                 let _ = Server { engine: &engine, handles: &handles, listing: None }.serve(conn);
             });
         }
     })?;
     Ok(path)
+}
+
+const MAX_NFS_CONNS: usize = 32;
+const MAX_RPC_FRAGMENTS: usize = 64;
+const NFS_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+static ACTIVE_NFS_CONNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+struct NfsConnGuard;
+
+impl Drop for NfsConnGuard {
+    fn drop(&mut self) {
+        ACTIVE_NFS_CONNS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+fn acquire_nfs_conn() -> Option<NfsConnGuard> {
+    ACTIVE_NFS_CONNS
+        .try_update(std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire, |n| (n < MAX_NFS_CONNS).then_some(n + 1))
+        .ok()
+        .map(|_| NfsConnGuard)
 }
 
 /// Whether the peer is the Mac's NFS client, which connects as root, or this
@@ -432,28 +459,45 @@ struct Server<'a> {
     listing: Option<([u8; 16], Vec<FileInfo>)>,
 }
 
+/// Reads one RFC 5531 record-marked RPC message, rejecting zero-length
+/// non-final fragments and excessive fragment counts that would otherwise spin CPU.
+fn read_record(conn: &mut impl Read, record: &mut Vec<u8>) -> io::Result<()> {
+    record.clear();
+    let mut fragments = 0usize;
+    loop {
+        let mut mark = [0u8; 4];
+        conn.read_exact(&mut mark)?;
+        let mark = u32::from_be_bytes(mark);
+        let last = mark & 0x8000_0000 != 0;
+        let len = (mark & 0x7fff_ffff) as usize;
+        if len == 0 && !last {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "empty non-final RPC fragment"));
+        }
+        fragments += 1;
+        if fragments > MAX_RPC_FRAGMENTS {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "too many RPC fragments"));
+        }
+        if record.len().saturating_add(len) > MAX_RECORD {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "RPC record too large"));
+        }
+        let at = record.len();
+        record.resize(at + len, 0);
+        conn.read_exact(&mut record[at..])?;
+        if last {
+            return Ok(());
+        }
+    }
+}
+
 impl Server<'_> {
     fn serve(mut self, mut conn: UnixStream) -> io::Result<()> {
         let mut record = Vec::new();
         loop {
-            record.clear();
-            // Record marking: fragments until one has the last bit set.
-            loop {
-                let mut mark = [0u8; 4];
-                conn.read_exact(&mut mark)?;
-                let mark = u32::from_be_bytes(mark);
-                let len = (mark & 0x7fff_ffff) as usize;
-                if record.len() + len > MAX_RECORD {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "RPC record too large"));
-                }
-                let at = record.len();
-                record.resize(at + len, 0);
-                conn.read_exact(&mut record[at..])?;
-                if mark & 0x8000_0000 != 0 {
-                    break;
-                }
-            }
+            read_record(&mut conn, &mut record)?;
             let Some(reply) = self.call(&record) else { continue };
+            if reply.len() >= 0x8000_0000 {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "RPC reply too large"));
+            }
             let mut framed = Vec::with_capacity(reply.len() + 4);
             framed.extend_from_slice(&(0x8000_0000 | reply.len() as u32).to_be_bytes());
             framed.extend_from_slice(&reply);
@@ -1081,5 +1125,25 @@ mod tests {
         let d = scratch("table");
         assert_eq!(mounted_at(&d), None);
         std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn read_record_rejects_empty_non_final_fragments_and_fragment_floods() {
+        // Zero-length non-final fragment must fail immediately instead of spinning forever.
+        let zeros = vec![0u8; 400];
+        let mut buf = Vec::new();
+        let err = read_record(&mut &zeros[..], &mut buf).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        // Excessive 1-byte non-final fragments exceed MAX_RPC_FRAGMENTS.
+        let mut many = Vec::new();
+        for _ in 0..=MAX_RPC_FRAGMENTS {
+            many.extend_from_slice(&1u32.to_be_bytes());
+            many.push(b'a');
+        }
+        many.extend_from_slice(&(0x8000_0000u32 | 1).to_be_bytes());
+        many.push(b'z');
+        let err = read_record(&mut &many[..], &mut buf).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }

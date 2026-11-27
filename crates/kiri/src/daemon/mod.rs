@@ -258,6 +258,12 @@ pub fn run(_args: &[String]) -> io::Result<()> {
         if UnixStream::connect(&path).is_ok() {
             return None;
         }
+        // When running as root, never bind or apply POSIX ACLs to a socket
+        // inside a non-root-owned directory (prevents symlink ACL escalation).
+        if !safe_root_socket_dir(&path) {
+            diag::warn!("skipping extra home socket in non-root-owned directory", path = path.display());
+            return None;
+        }
         bind_daemon_socket(&path, access_group.as_deref()).ok().map(|l| (l, path))
     });
     // Each member by name too, so one just added needn't sign in again; and
@@ -738,11 +744,92 @@ fn finder(engine: &std::sync::Arc<engine::Engine>) {
     }
 }
 
+/// Atomically writes `bytes` to `path` via a unique sibling temp file created
+/// with `O_EXCL` (`create_new(true)`) and Unix mode `mode` (never following
+/// symlinks at a predictable temp path).
+pub(super) fn write_atomic_mode(path: &std::path::Path, bytes: &[u8], mode: u32) -> io::Result<()> {
+    use std::io::Write;
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("tmp");
+    let pid = std::process::id();
+    for _ in 0..16 {
+        let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = dir.join(format!(".{name}.{pid}.{seq}.tmp"));
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(mode);
+        }
+        match opts.open(&tmp) {
+            Ok(mut f) => {
+                if let Err(e) = f.write_all(bytes) {
+                    drop(f);
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(e);
+                }
+                drop(f);
+                if let Err(e) = std::fs::rename(&tmp, path) {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(e);
+                }
+                return Ok(());
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(io::ErrorKind::AlreadyExists, "could not create unique temporary file"))
+}
+
+/// Whether `socket`'s parent directory is safe for a root-run daemon to place a
+/// gated socket in: every existing ancestor up to the parent must be owned by
+/// root and not writable by group/other (when running as root).
+#[cfg(target_os = "linux")]
+fn safe_root_socket_dir(socket: &std::path::Path) -> bool {
+    // SAFETY: geteuid cannot fail.
+    safe_root_socket_dir_for_euid(socket, unsafe { libc::geteuid() })
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn safe_root_socket_dir_for_euid(socket: &std::path::Path, euid: u32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    if euid != 0 {
+        return true;
+    }
+    let Some(dir) = socket.parent() else { return false };
+    let mut cur = dir;
+    loop {
+        if let Ok(meta) = std::fs::symlink_metadata(cur) {
+            if meta.file_type().is_symlink() {
+                return false;
+            }
+            if meta.uid() != 0 || (meta.mode() & 0o022) != 0 {
+                return false;
+            }
+            break;
+        }
+        let Some(parent) = cur.parent() else { return false };
+        if parent == cur {
+            break;
+        }
+        cur = parent;
+    }
+    true
+}
+
 fn bind_daemon_socket(socket: &std::path::Path, access_group: Option<&std::ffi::OsStr>) -> io::Result<UnixListener> {
     if let Some(dir) = socket.parent() {
         std::fs::create_dir_all(dir)?;
         if dir == std::path::Path::new("/run/kiri") {
             std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755))?;
+        } else if !cfg!(target_os = "linux") {
+            // Protect the socket directory before bind(2) so there is no brief
+            // window where another local user can reach the socket prior to chmod(0600).
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
         }
     }
     let _ = std::fs::remove_file(socket); // stale, from a daemon that died
@@ -1472,6 +1559,30 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(cap.open(), 0, "all connection slots must be released");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_atomic_mode_replaces_symlink_and_enforces_private_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("kiri-atomic-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let canary = dir.join("canary");
+        std::fs::write(&canary, b"keep-me").unwrap();
+        let target = dir.join("secret.json");
+        std::os::unix::fs::symlink(&canary, &target).unwrap();
+        write_atomic_mode(&target, br#"{"secret":1}"#, 0o600).unwrap();
+        assert_eq!(std::fs::read(&canary).unwrap(), b"keep-me");
+        let meta = std::fs::symlink_metadata(&target).unwrap();
+        assert!(meta.file_type().is_file());
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        // Root must refuse binding a gated socket inside a non-root or symlinked directory.
+        assert!(!safe_root_socket_dir_for_euid(&dir.join("docker.sock"), 0));
+        let link_dir = dir.join("linkdir");
+        std::os::unix::fs::symlink(&dir, &link_dir).unwrap();
+        assert!(!safe_root_socket_dir_for_euid(&link_dir.join("docker.sock"), 0));
+        assert!(safe_root_socket_dir_for_euid(&dir.join("docker.sock"), 1000));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

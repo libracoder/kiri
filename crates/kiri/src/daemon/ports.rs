@@ -642,7 +642,7 @@ fn bind_socket(addr: SocketAddr, udp: bool) -> io::Result<OwnedFd> {
     bind_socket_on_if(addr, udp, false)
 }
 
-fn bind_socket_on_if(addr: SocketAddr, udp: bool, bind_lo0: bool) -> io::Result<OwnedFd> {
+pub(super) fn bind_socket_on_if(addr: SocketAddr, udp: bool, bind_lo0: bool) -> io::Result<OwnedFd> {
     let (family, ty) = (if addr.is_ipv6() { libc::AF_INET6 } else { libc::AF_INET }, if udp { libc::SOCK_DGRAM } else { libc::SOCK_STREAM });
     // SAFETY: plain socket creation; owned at once.
     let fd = unsafe { libc::socket(family, ty, 0) };
@@ -1662,6 +1662,55 @@ fn relayed_tcp(s: &TcpStream) -> io::Result<()> {
     set(libc::IPPROTO_TCP, libc::TCP_KEEPCNT, KEEPALIVE_PROBES)
 }
 
+/// Dedicated concurrency pools decoupled from published-port `TCP_SESSIONS` so
+/// container egress or host-bound traffic cannot starve host published ports,
+/// and SSH-agent / host-bound relays cannot spawn unbounded host threads.
+const MAX_HOST_BOUND_SESSIONS: usize = 256;
+const MAX_EGRESS_SESSIONS: usize = 512;
+const MAX_SSH_AGENT_SESSIONS: usize = 64;
+const VSOCK_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
+
+static HOST_BOUND_SESSIONS: AtomicUsize = AtomicUsize::new(0);
+static EGRESS_SESSIONS: AtomicUsize = AtomicUsize::new(0);
+static SSH_AGENT_SESSIONS: AtomicUsize = AtomicUsize::new(0);
+
+struct SlotPermit {
+    counter: &'static AtomicUsize,
+}
+
+impl Drop for SlotPermit {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn try_acquire_slot(counter: &'static AtomicUsize, max: usize) -> Option<SlotPermit> {
+    counter
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < max).then_some(n + 1))
+        .ok()
+        .map(|_| SlotPermit { counter })
+}
+
+/// Sets or clears `SO_RCVTIMEO` on `fd` (used to bound the initial 6-byte
+/// vsock relay header read without imposing a read deadline on idle streams).
+fn set_sock_rcvtimeo(fd: std::os::fd::RawFd, timeout: Option<Duration>) -> io::Result<()> {
+    let tv = libc::timeval {
+        tv_sec: timeout.map_or(0, |d| d.as_secs()) as _,
+        tv_usec: 0,
+    };
+    // SAFETY: `tv` is valid for the duration of the call on an owned socket.
+    let r = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
+            (&tv as *const libc::timeval).cast(),
+            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+        )
+    };
+    if r == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+}
+
 /// The vsock end: no read deadline, so a quiet connection stays (#388). The
 /// client's end has keepalive; when it fails, the relay ends this one too.
 fn vsock_stall(fd: std::os::fd::RawFd) -> io::Result<()> {
@@ -1683,15 +1732,23 @@ pub const HOST_BOUND_PORT: u32 = 1026;
 /// `ip[4] port[2]` (always 127.0.0.1 today), and we connect to the Mac's
 /// loopback at that port.
 pub fn serve_host_bound(stream: kiri_vmm::VsockStream) {
+    let Some(permit) = try_acquire_slot(&HOST_BOUND_SESSIONS, MAX_HOST_BOUND_SESSIONS) else {
+        return;
+    };
     let _ = std::thread::Builder::new().name("kiri-host-bound".into()).spawn(move || {
+        let _permit = permit;
         let _ = host_bound(stream);
     });
 }
 
 fn host_bound(stream: kiri_vmm::VsockStream) -> io::Result<()> {
+    vsock_stall(stream.fd.as_raw_fd())?;
     let mut from_guest = std::fs::File::from(stream.fd.try_clone()?);
     let mut header = [0u8; 6];
-    from_guest.read_exact(&mut header)?;
+    let _ = set_sock_rcvtimeo(stream.fd.as_raw_fd(), Some(VSOCK_HEADER_TIMEOUT));
+    let read_res = from_guest.read_exact(&mut header);
+    let _ = set_sock_rcvtimeo(stream.fd.as_raw_fd(), None);
+    read_res?;
     let ip = std::net::Ipv4Addr::new(header[0], header[1], header[2], header[3]);
     let port = u16::from_be_bytes([header[4], header[5]]);
     if !host_bound_allowed(ip, port, super::domains::routes) {
@@ -1701,7 +1758,7 @@ fn host_bound(stream: kiri_vmm::VsockStream) -> io::Result<()> {
     // Refused or unreachable: dropping closes the container's connection,
     // which is what it would see from a real host too.
     let target = dial_loopback(port)?;
-    target.set_nodelay(true)?;
+    relayed_tcp(&target)?;
     let mut to_guest = std::fs::File::from(stream.fd.try_clone()?);
     let mut target_read = target.try_clone()?;
     let mut target_write = target;
@@ -1807,7 +1864,7 @@ fn egress_target_allowed(ip: std::net::Ipv4Addr, port: u16) -> bool {
 /// routes (`utun*`, `ipsec*`, `ppp*`, #319) and NetworkExtension socket
 /// filters (#367, #616) carry the connection.
 pub fn serve_egress(stream: kiri_vmm::VsockStream) {
-    let Some(permit) = tcp_permit(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)) else {
+    let Some(permit) = try_acquire_slot(&EGRESS_SESSIONS, MAX_EGRESS_SESSIONS) else {
         return;
     };
     let _ = std::thread::Builder::new().name("kiri-egress".into()).spawn(move || {
@@ -1820,7 +1877,10 @@ fn egress(stream: kiri_vmm::VsockStream) -> io::Result<()> {
     vsock_stall(stream.fd.as_raw_fd())?;
     let mut from_guest = std::fs::File::from(stream.fd.try_clone()?);
     let mut header = [0u8; 6];
-    from_guest.read_exact(&mut header)?;
+    let _ = set_sock_rcvtimeo(stream.fd.as_raw_fd(), Some(VSOCK_HEADER_TIMEOUT));
+    let read_res = from_guest.read_exact(&mut header);
+    let _ = set_sock_rcvtimeo(stream.fd.as_raw_fd(), None);
+    read_res?;
     let ip = std::net::Ipv4Addr::new(header[0], header[1], header[2], header[3]);
     let port = u16::from_be_bytes([header[4], header[5]]);
     if !egress_target_allowed(ip, port) {
@@ -3057,10 +3117,38 @@ fn gather_ssh_auth_inputs(include_preferred: bool) -> SshAuthInputs {
     }
 }
 
+/// Validates a macOS SSH agent socket candidate immediately before connecting:
+/// canonicalizes it, verifies it is an owned Unix socket, ensures it never
+/// resolves to Kiri's own daemon socket, and (for a stored `preferred` path)
+/// rejects symlink swaps and re-verifies the SSH agent allowlist.
+pub(crate) fn validate_ssh_agent_connect(path: &std::path::Path, is_preferred: bool) -> Option<std::path::PathBuf> {
+    if is_preferred {
+        let sym = std::fs::symlink_metadata(path).ok()?;
+        if sym.file_type().is_symlink() {
+            return None;
+        }
+    }
+    let canon = std::fs::canonicalize(path).ok()?;
+    if !is_owned_unix_socket(&canon) || is_kiri_socket_path(&canon) {
+        return None;
+    }
+    if is_preferred && !(is_known_mac_ssh_agent_sock_path(&canon) || matches_default_ssh_auth_sock(&canon)) {
+        return None;
+    }
+    Some(canon)
+}
+
 fn ssh_auth_sock_candidates_for(include_preferred: bool) -> Vec<std::path::PathBuf> {
     let inputs = gather_ssh_auth_inputs(include_preferred);
     if cfg!(target_os = "macos") {
+        let preferred = inputs.preferred.clone();
         resolve_ssh_auth_sock_candidates(&inputs, is_owned_unix_socket)
+            .into_iter()
+            .filter_map(|p| {
+                let is_pref = preferred.as_deref().is_some_and(|pref| pref == p);
+                validate_ssh_agent_connect(&p, is_pref)
+            })
+            .collect()
     } else {
         // On Linux the daemon may run as root while $SSH_AUTH_SOCK belongs
         // to a non-root user, so keep the existing env behavior.
@@ -3144,27 +3232,35 @@ pub(crate) fn clear_preferred_ssh_auth_sock() {
 
 /// One container connection to the SSH agent, relayed to the Mac's agent.
 pub fn serve_ssh_agent(stream: kiri_vmm::VsockStream) {
+    let Some(permit) = try_acquire_slot(&SSH_AGENT_SESSIONS, MAX_SSH_AGENT_SESSIONS) else {
+        return;
+    };
     let _ = std::thread::Builder::new().name("kiri-ssh-agent".into()).spawn(move || {
+        let _permit = permit;
+        let _ = vsock_stall(stream.fd.as_raw_fd());
         let Some(agent) = ssh_auth_sock_candidates_for(true)
             .into_iter()
             .find_map(|path| std::os::unix::net::UnixStream::connect(path).ok())
         else {
             return;
         };
+        let _ = agent.set_write_timeout(Some(TCP_STALL));
         let (Ok(mut agent_read), Ok(from_guest), Ok(to_guest)) = (agent.try_clone(), stream.fd.try_clone(), stream.fd.try_clone()) else {
             return;
         };
         let mut from_guest = std::fs::File::from(from_guest);
         let mut to_guest = std::fs::File::from(to_guest);
         let mut agent_write = agent;
-        let down = std::thread::spawn(move || {
+        let down = std::thread::Builder::new().name("kiri-ssh-agent-down".into()).spawn(move || {
             let _ = copy(&mut agent_read, &mut to_guest);
             // SAFETY: half-closing a socket we own.
             unsafe { libc::shutdown(to_guest.as_raw_fd(), libc::SHUT_WR) };
         });
         let _ = copy(&mut from_guest, &mut agent_write);
         let _ = agent_write.shutdown(Shutdown::Write);
-        let _ = down.join();
+        if let Ok(down) = down {
+            let _ = down.join();
+        }
         drop(stream);
     });
 }
@@ -5001,5 +5097,56 @@ tcp4       0      0  *.53                   *.*                    LISTEN      1
         assert_eq!(parse_macos_routes_with_tunnels(&[], |_| None, &[p2p]), vec![([0, 0, 0, 0], 0)]);
         let sub = ActiveTunnel { name: "utun8".into(), ip: [100, 64, 1, 5], prefix: 10, peer: None, point_to_point: false };
         assert_eq!(parse_macos_routes_with_tunnels(&[], |_| None, &[sub]), vec![([100, 64, 0, 0], 10)]);
+    }
+
+    #[test]
+    fn ssh_agent_connect_rejects_symlink_swap_and_kiri_socket() {
+        use std::os::unix::net::UnixListener;
+        let dir = std::env::temp_dir().join(format!("kiri-ssh-connect-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let fake_kiri_run = dir.join(".kiri").join("run");
+        std::fs::create_dir_all(&fake_kiri_run).unwrap();
+        let fake_kiri_sock = fake_kiri_run.join("docker.sock");
+        let _kiri_listener = UnixListener::bind(&fake_kiri_sock).unwrap();
+
+        let other_sock = dir.join("other.sock");
+        let _other_listener = UnixListener::bind(&other_sock).unwrap();
+
+        // Legitimate GPG SSH agent socket passes both preferred and non-preferred validation.
+        let gpg_sock = dir.join("S.gpg-agent.ssh");
+        let gpg_listener = UnixListener::bind(&gpg_sock).unwrap();
+        assert!(super::validate_ssh_agent_connect(&gpg_sock, true).is_some());
+        assert!(super::validate_ssh_agent_connect(&gpg_sock, false).is_some());
+
+        // Replacing the stored preferred path with a symlink to another owned socket is rejected.
+        drop(gpg_listener);
+        std::fs::remove_file(&gpg_sock).unwrap();
+        std::os::unix::fs::symlink(&other_sock, &gpg_sock).unwrap();
+        assert!(super::validate_ssh_agent_connect(&gpg_sock, true).is_none());
+
+        // Replacing with a symlink to Kiri's own socket (or /var/run/docker.sock) is rejected
+        // for BOTH preferred and non-preferred (env/gpg) candidates.
+        std::fs::remove_file(&gpg_sock).unwrap();
+        std::os::unix::fs::symlink(&fake_kiri_sock, &gpg_sock).unwrap();
+        assert!(super::validate_ssh_agent_connect(&gpg_sock, true).is_none());
+        let env_link = dir.join("env-agent.sock");
+        std::os::unix::fs::symlink(&fake_kiri_sock, &env_link).unwrap();
+        // Also check direct symlink to socket_path() if creatable, or at least non-preferred
+        // symlink to a known Kiri path.
+        assert!(super::validate_ssh_agent_connect(&fake_kiri_sock, true).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn egress_and_host_bound_permits_are_bounded_and_decoupled_from_published_ports() {
+        let mut egress_permits = Vec::new();
+        for _ in 0..super::MAX_EGRESS_SESSIONS {
+            egress_permits.push(super::try_acquire_slot(&super::EGRESS_SESSIONS, super::MAX_EGRESS_SESSIONS).unwrap());
+        }
+        assert!(super::try_acquire_slot(&super::EGRESS_SESSIONS, super::MAX_EGRESS_SESSIONS).is_none());
+        // Published-port loopback permits must remain available even when egress is saturated.
+        assert!(super::tcp_permit(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)).is_some());
+        drop(egress_permits);
+        assert!(super::try_acquire_slot(&super::EGRESS_SESSIONS, super::MAX_EGRESS_SESSIONS).is_some());
     }
 }

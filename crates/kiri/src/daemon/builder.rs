@@ -164,8 +164,7 @@ pub fn set_settings(req: &Request) -> Result<(), Error> {
         s["idle_secs"] = body["idle_secs"].as_u64().filter(|v| *v <= 7 * 86400).ok_or_else(|| Error::BadRequest("idle_secs must be 0 to 604800".into()))?.into();
     }
     let path = settings_path().ok_or_else(|| Error::Io(io::Error::other("HOME is not set")))?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, s.to_string()).and_then(|()| std::fs::rename(&tmp, &path)).map_err(Error::Io)
+    super::write_atomic_mode(&path, s.to_string().as_bytes(), 0o600).map_err(Error::Io)
 }
 
 // --- The container -------------------------------------------------------
@@ -556,7 +555,7 @@ fn hide_amd64_qemu(engine: &Engine, id: &str) {
 /// ls`, `inspect`, the window's Builds view) makes and pulls nothing, so a
 /// fresh Kiri has no builder, image or cache volume until the first build.
 /// None for any other name, or when the builder exists (the usual 409).
-pub fn create_for_buildx(engine: &Engine, req: &Request) -> Option<Result<Value, Error>> {
+pub fn create_for_buildx(engine: &Engine, req: &Request, caller: &super::caller::Caller) -> Option<Result<Value, Error>> {
     if req.query("name").map(|n| n.trim_start_matches('/')) != Some(container_name().as_str()) {
         return None;
     }
@@ -568,6 +567,9 @@ pub fn create_for_buildx(engine: &Engine, req: &Request) -> Option<Result<Value,
             Err(e) => return Some(Err(Error::BadRequest(format!("invalid JSON: {e}")))),
         }
     };
+    // Only a host caller may customize Env/Dns/ExtraHosts/NetworkMode on the
+    // shared privileged BuildKit container.
+    let requested = if *caller == super::caller::Caller::Host { requested } else { None };
     let _g = ENSURE.lock().unwrap_or_else(|e| e.into_inner());
     if find(engine).is_some() {
         return None;
@@ -715,13 +717,21 @@ pub(super) fn internal_exec(argv: &[String], stdin: bool, env: Vec<String>) -> E
 /// A tar archive, as `docker cp` takes it, from (path, contents) entries; a
 /// path ending in `/` with no contents is a directory.
 fn tar(entries: &[(&str, Option<&[u8]>)]) -> Vec<u8> {
+    let entries: Vec<(&str, Option<&[u8]>, u32)> = entries
+        .iter()
+        .map(|(n, d)| (*n, *d, if d.is_some() { 0o644 } else { 0o755 }))
+        .collect();
+    tar_with_modes(&entries)
+}
+
+fn tar_with_modes(entries: &[(&str, Option<&[u8]>, u32)]) -> Vec<u8> {
     let mut out = Vec::new();
-    for (name, data) in entries {
+    for &(name, data, mode) in entries {
         let mut h = [0u8; 512];
         let field = |h: &mut [u8; 512], at: usize, len: usize, v: &[u8]| h[at..at + v.len().min(len)].copy_from_slice(&v[..v.len().min(len)]);
         field(&mut h, 0, 100, name.as_bytes());
         let size = data.map_or(0, <[u8]>::len);
-        field(&mut h, 100, 8, if data.is_some() { b"0000644\0" } else { b"0000755\0" });
+        field(&mut h, 100, 8, format!("{mode:07o}\0").as_bytes());
         field(&mut h, 108, 8, b"0000000\0");
         field(&mut h, 116, 8, b"0000000\0");
         field(&mut h, 124, 12, format!("{size:011o}\0").as_bytes());
@@ -867,12 +877,33 @@ impl Options {
             .flatten()
             .filter_map(|u| Some(format!("{}={}:{}", u["Name"].as_str()?, u["Soft"].as_i64()?, u["Hard"].as_i64()?)))
             .collect();
-        let cache_from = json_query(req, "cachefrom")?.as_array().into_iter().flatten().filter_map(|c| c.as_str().map(str::to_owned)).filter(|c| !c.is_empty()).collect();
+        let mut cache_from = Vec::new();
+        for c in json_query(req, "cachefrom")?.as_array().into_iter().flatten().filter_map(|c| c.as_str()).filter(|c| !c.is_empty()) {
+            // `--import-cache` takes RFC-4180 CSV `key=value` pairs; reject CSV
+            // delimiters/controls and require a valid image reference so callers
+            // cannot inject `,type=local,src=...` into BuildKit.
+            if c.contains([',', '"', '\r', '\n', '\0']) || Reference::parse(c).is_err() {
+                return Err(Error::BadRequest(format!("invalid cachefrom reference: {c:?}")));
+            }
+            cache_from.push(c.to_owned());
+        }
+        let remote = match req.query("remote").filter(|r| !r.is_empty()) {
+            Some(r) => {
+                if r.contains([',', '"', '\r', '\n', '\0'])
+                    || r.starts_with('-')
+                    || !(r.starts_with("http://") || r.starts_with("https://") || r.starts_with("git://") || r.starts_with("github.com/"))
+                {
+                    return Err(Error::BadRequest(format!("invalid remote build context: {r:?}")));
+                }
+                Some(r.to_owned())
+            }
+            None => None,
+        };
         let dockerfile = clean_path(req.query("dockerfile").filter(|d| !d.is_empty()).unwrap_or("Dockerfile"))?;
         Ok(Options {
             tags,
             dockerfile: if dockerfile.is_empty() { "Dockerfile".into() } else { dockerfile },
-            remote: req.query("remote").filter(|r| !r.is_empty()).map(str::to_owned),
+            remote,
             target: req.query("target").unwrap_or_default().to_owned(),
             build_args: pairs(json_query(req, "buildargs")?),
             labels: pairs(json_query(req, "labels")?),
@@ -1147,7 +1178,13 @@ fn run(req: &Request, engine: &Engine, o: &mut Options, r: &mut BufReader<UnixSt
     let built = (|| {
         let env = match req.header("X-Registry-Config").and_then(registry_config) {
             Some(config) => {
-                copy_in(engine, &id, &dir, &mut io::Cursor::new(tar(&[("docker/", None), ("docker/config.json", Some(&config))]))).map_err(|e| format!("{e:?}"))?;
+                copy_in(
+                    engine,
+                    &id,
+                    &dir,
+                    &mut io::Cursor::new(tar_with_modes(&[("docker/", None, 0o700), ("docker/config.json", Some(&config), 0o600)])),
+                )
+                .map_err(|e| format!("{e:?}"))?;
                 vec![format!("DOCKER_CONFIG={dir}/docker")]
             }
             None => Vec::new(),
@@ -1508,17 +1545,24 @@ mod tests {
         let engine = Engine::boot(store).unwrap();
 
         let other = Request::internal("POST", "/containers/create", &[("name", "not-builder")], serde_json::to_vec(&asked).unwrap());
-        assert!(create_for_buildx(&engine, &other).is_none());
+        assert!(create_for_buildx(&engine, &other, &super::super::caller::Caller::Host).is_none());
 
         let name = container_name();
         let bad = Request::internal("POST", "/containers/create", &[("name", &name)], b"{not-json".to_vec());
-        assert!(matches!(create_for_buildx(&engine, &bad), Some(Err(Error::BadRequest(_)))));
+        assert!(matches!(create_for_buildx(&engine, &bad, &super::super::caller::Caller::Host), Some(Err(Error::BadRequest(_)))));
+
+        // Non-Host callers must not be able to inject custom Env/Dns/NetworkMode onto the shared builder.
+        let non_host_req = Request::internal("POST", "/containers/create", &[("name", &name)], serde_json::to_vec(&asked).unwrap());
+        let non_host_created = create_for_buildx(&engine, &non_host_req, &super::super::caller::Caller::Container).expect("intercepted").expect("created");
+        let nh_id = non_host_created["Id"].as_str().unwrap();
+        assert!(!builder_host_net(&engine, nh_id), "Caller::Container must not customize shared builder NetworkMode");
+        engine.remove(nh_id, true, false).unwrap();
 
         let create_req = Request::internal("POST", "/containers/create", &[("name", &name)], serde_json::to_vec(&asked).unwrap());
-        let created = create_for_buildx(&engine, &create_req).expect("intercepted").expect("created");
+        let created = create_for_buildx(&engine, &create_req, &super::super::caller::Caller::Host).expect("intercepted").expect("created");
         let id = created["Id"].as_str().unwrap();
         assert!(builder_host_net(&engine, id), "builder container kept HostConfig.NetworkMode = host");
-        assert!(create_for_buildx(&engine, &create_req).is_none(), "existing builder falls through to 409");
+        assert!(create_for_buildx(&engine, &create_req, &super::super::caller::Caller::Host).is_none(), "existing builder falls through to 409");
 
         drop(engine);
         let _ = std::fs::remove_dir_all(&dir);
@@ -2128,5 +2172,18 @@ mod tests {
         let root_df = Options::parse(&req(&[("dockerfile", r".\Dockerfile")])).unwrap();
         assert_eq!(root_df.dockerfile, "Dockerfile");
         assert_eq!(Options::parse(&req(&[("dockerfile", r".\")])).unwrap().dockerfile, "Dockerfile");
+
+        // cachefrom CSV option injection and unsafe remote build context URLs are rejected.
+        assert!(Options::parse(&req(&[("cachefrom", r#"["alpine:3,type=local,src=/etc"]"#)])).is_err());
+        assert!(Options::parse(&req(&[("cachefrom", r#"["\"bad\""]"#)])).is_err());
+        assert!(Options::parse(&req(&[("cachefrom", r#"["alpine:3.20"]"#)])).is_ok());
+        assert!(Options::parse(&req(&[("remote", "file:///etc/passwd")])).is_err());
+        assert!(Options::parse(&req(&[("remote", "https://example.com/repo.git,foo=bar")])).is_err());
+        assert!(Options::parse(&req(&[("remote", "https://github.com/org/repo.git")])).is_ok());
+
+        // docker/config.json archive uses 0700 dir and 0600 file mode.
+        let priv_tar = tar_with_modes(&[("docker/", None, 0o700), ("docker/config.json", Some(b"{}"), 0o600)]);
+        assert_eq!(&priv_tar[100..108], b"0000700\0");
+        assert_eq!(&priv_tar[512 + 100..512 + 108], b"0000600\0");
     }
 }

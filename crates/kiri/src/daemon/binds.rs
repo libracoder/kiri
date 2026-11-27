@@ -243,21 +243,52 @@ pub fn distro_source(src: &str, distro: &str, wsl: Option<&Wsl>) -> Result<Strin
     }
     let kiri_dir = wsl_kiri_dir();
     let roots_dir = format!("{kiri_dir}/roots");
+    let distro_root = format!("{roots_dir}/{distro}");
+    // Only handle true Windows paths (drive letters, WSL UNC paths, Docker
+    // named pipe, backslash paths) as Windows spellings. Slash-only `//...`
+    // paths (except `//c/...` Git Bash drives and `//wsl$...` / `//wsl.localhost...`)
+    // fall through to POSIX confinement so `//etc/shadow` or `//mnt/wsl/kiri/...`
+    // can never bypass distro confinement.
     if looks_windows(src) {
         let default_wsl = Wsl { root: "/mnt/".into(), distro: None };
         let w = wsl.unwrap_or(&default_wsl);
-        return source_with_roots(src, w, |d| {
-            if d.eq_ignore_ascii_case(distro) {
-                Some(format!("{roots_dir}/{distro}"))
-            } else {
-                mounted_distro_root(d)
+        let long = src.strip_prefix(r"\\?\").or_else(|| src.strip_prefix("//?/")).unwrap_or(src);
+        if drive_prefix(long) == 2 {
+            return Ok(drive(w, long.as_bytes()[0], &long[3..]));
+        }
+        let s = src.replace('\\', "/");
+        if let Some(rest) = s.strip_prefix("//") {
+            let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
+            if host.len() == 1 && host.as_bytes()[0].is_ascii_alphabetic() {
+                return Ok(drive(w, host.as_bytes()[0], path));
             }
-        });
+            if host.eq_ignore_ascii_case("wsl$") || host.eq_ignore_ascii_case("wsl.localhost") {
+                let (target_distro, inner) = path.split_once('/').unwrap_or((path, ""));
+                if target_distro.is_empty() {
+                    return Err(Error::BadRequest(format!("invalid mount source {src}: no WSL distro named")));
+                }
+                if !target_distro.eq_ignore_ascii_case(distro) {
+                    return Err(Error::BadRequest(format!(
+                        "invalid mount source {src}: cannot mount files outside WSL distro {distro}"
+                    )));
+                }
+                let target = confine_to_root(&distro_root, inner);
+                verify_on_disk_confinement(src, distro, Path::new(&distro_root), Path::new(&target))?;
+                return Ok(target);
+            }
+            if host == "." && path.eq_ignore_ascii_case("pipe/docker_engine") {
+                return Ok("/var/run/docker.sock".to_owned());
+            }
+        }
+        if src.contains('\\') {
+            return Err(Error::BadRequest(format!(
+                "invalid mount source {src}: Kiri's WSL can reach Windows drives and WSL distro {distro}, not network shares or devices"
+            )));
+        }
     }
     if !src.starts_with('/') {
         return Ok(src.to_owned());
     }
-    let distro_root = format!("{roots_dir}/{distro}");
     let cleaned = clean(src);
     if ENGINE_SOCKS.contains(&cleaned.as_str()) || is_wsl_engine_socket(&cleaned) {
         return Ok(cleaned);
@@ -588,29 +619,79 @@ pub fn make_source(path: &Path) -> std::io::Result<()> {
             return super::localtime::ensure_timezone();
         }
     }
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     let missing: Vec<&Path> = path.ancestors().take_while(|a| std::fs::symlink_metadata(a).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)).collect();
     if missing.is_empty() {
-        // There but not a folder (a link to nowhere): refused as before.
+        // There already: refuse symlinks / non-directories without modifying targets.
+        let meta = std::fs::symlink_metadata(path)?;
+        if meta.file_type().is_dir() {
+            return Ok(());
+        }
         return std::fs::create_dir_all(path);
     }
+    // Open the deepest existing ancestor once, then create and chown/chmod each
+    // new component strictly via dirfd (`mkdirat` + `openat(O_DIRECTORY|O_NOFOLLOW)`
+    // + `fchown` + `fchmod`) so a local race swapping a new directory for a symlink
+    // can never redirect `chown`/`chmod` onto an arbitrary host file.
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    let base = missing.last().and_then(|p| p.parent()).filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+    let base_c = CString::new(base.as_os_str().as_bytes()).map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    // SAFETY: `base_c` is a valid NUL-terminated path; returned fd is immediately owned.
+    let base_fd = unsafe { libc::open(base_c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+    if base_fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `base_fd >= 0` is a fresh open descriptor owned exclusively here.
+    let mut parent = unsafe { OwnedFd::from_raw_fd(base_fd) };
     // SAFETY: geteuid only reads this process's effective user.
     let root = unsafe { libc::geteuid() } == 0;
     for dir in missing.into_iter().rev() {
-        match std::fs::DirBuilder::new().mode(0o755).create(dir) {
-            Ok(()) => {}
-            // Made at the same moment by another container's start: its own.
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && dir.is_dir() => continue,
-            Err(e) => return Err(e),
+        let Some(name) = dir.file_name() else {
+            return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+        };
+        let name_c = CString::new(name.as_bytes()).map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+        // SAFETY: `parent` is a valid directory fd and `name_c` is NUL-terminated.
+        let mk = unsafe { libc::mkdirat(parent.as_raw_fd(), name_c.as_ptr(), 0o755) };
+        let created = if mk == 0 {
+            true
+        } else {
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EEXIST) {
+                false
+            } else {
+                return Err(e);
+            }
+        };
+        // SAFETY: `parent` is a valid directory fd; O_NOFOLLOW refuses any symlink race.
+        let child_raw = unsafe { libc::openat(parent.as_raw_fd(), name_c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+        if child_raw < 0 {
+            return Err(std::io::Error::last_os_error());
         }
-        if root {
-            std::os::unix::fs::chown(dir, Some(0), Some(0))?;
+        // SAFETY: `child_raw >= 0` is a fresh open descriptor owned exclusively here.
+        let child = unsafe { OwnedFd::from_raw_fd(child_raw) };
+        if created {
+            if root {
+                // SAFETY: `child` is a valid open directory fd (never a symlink).
+                if unsafe { libc::fchown(child.as_raw_fd(), 0, 0) } != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            // SAFETY: `child` is a valid fd and `st` is writable.
+            if unsafe { libc::fstat(child.as_raw_fd(), &mut st) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let mode = (st.st_mode as u32) & 0o7777;
+            let want = 0o755 | (mode & 0o2000);
+            if mode != want {
+                // SAFETY: `child` is a valid open directory fd.
+                if unsafe { libc::fchmod(child.as_raw_fd(), want as libc::mode_t) } != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
         }
-        let mode = std::fs::metadata(dir)?.permissions().mode() & 0o7777;
-        let want = 0o755 | (mode & 0o2000);
-        if mode != want {
-            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(want))?;
-        }
+        parent = child;
     }
     Ok(())
 }
@@ -902,6 +983,21 @@ mod tests {
         assert!(distro_source("/mnt/wsl/kiri/roots/Debian/etc", "Ubuntu", Some(&w)).is_err());
         assert!(distro_source("/mnt/wsl/kiri/sockets/Ubuntu", "Ubuntu", Some(&w)).is_err());
         assert!(distro_source("/home/me", "../evil", Some(&w)).is_err());
+        // Double-slash (`//...`) and cross-distro / engine UNC paths must not bypass confinement.
+        assert_eq!(distro_source("//etc/shadow", "Ubuntu", Some(&w)).unwrap(), "/mnt/wsl/kiri/roots/Ubuntu/etc/shadow");
+        assert_eq!(distro_source("//var/lib/kiri", "Ubuntu", Some(&w)).unwrap(), "/mnt/wsl/kiri/roots/Ubuntu/var/lib/kiri");
+        assert!(distro_source("//mnt/wsl/kiri/roots/Debian/etc", "Ubuntu", Some(&w)).is_err());
+        assert!(distro_source("//mnt/wsl/kiri/sockets/Ubuntu", "Ubuntu", Some(&w)).is_err());
+        assert!(distro_source(r"\\wsl$\kiri\etc\shadow", "Ubuntu", Some(&w)).is_err());
+        assert!(distro_source(r"\\wsl.localhost\kiri\var\lib\kiri", "Ubuntu", Some(&w)).is_err());
+        assert!(distro_source(r"\\wsl$\Debian\etc\shadow", "Ubuntu", Some(&w)).is_err());
+        assert!(distro_source(r"\\wsl.localhost\Debian\home\me", "Ubuntu", Some(&w)).is_err());
+        assert_eq!(
+            distro_source(r"\\wsl.localhost\Ubuntu\home\me", "Ubuntu", Some(&w)).unwrap(),
+            "/mnt/wsl/kiri/roots/Ubuntu/home/me"
+        );
+        assert_eq!(distro_source(r"C:\proj", "Ubuntu", Some(&w)).unwrap(), "/mnt/c/proj");
+        assert_eq!(distro_source("//c/proj", "Ubuntu", Some(&w)).unwrap(), "/mnt/c/proj");
 
         // From Windows: `\\wsl.localhost\<NAME>\...` is allowed when `<NAME>`'s root is mounted.
         let with_ubuntu = |d: &str| d.eq_ignore_ascii_case("Ubuntu").then(|| "/mnt/wsl/kiri/roots/Ubuntu".to_owned());
@@ -942,5 +1038,22 @@ mod tests {
         assert_eq!(followed("/loop"), None);
         assert_eq!(resolve_in_root(&root.join("missing"), "/etc/../x").unwrap(), ("/x".to_owned(), false));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn make_source_refuses_symlinks_without_changing_target_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("kiri-make-source-symlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let secret = base.join("secret.txt");
+        std::fs::write(&secret, b"private").unwrap();
+        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+
+        assert!(make_source(&link).is_err());
+        assert_eq!(std::fs::metadata(&secret).unwrap().permissions().mode() & 0o777, 0o600);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

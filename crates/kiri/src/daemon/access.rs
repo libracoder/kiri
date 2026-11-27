@@ -1848,11 +1848,38 @@ impl Gate {
 
 /// Writes the socket's access list: its owner and group (rw, as the mode
 /// says), each of `uids` (rw), nobody else.
+///
+/// Opens `socket` with `O_PATH | O_NOFOLLOW | O_CLOEXEC`, verifies via `fstat`
+/// that it is a Unix domain socket owned by our effective UID, and applies the
+/// xattr through `/proc/self/fd/<fd>` so a symlink planted at `socket` can
+/// never redirect root `setxattr(2)` onto an arbitrary host file.
 pub fn set(socket: &Path, uids: &[u32]) -> io::Result<()> {
+    use std::os::fd::{FromRawFd, OwnedFd};
     let blob = acl(uids);
     let path = CString::new(socket.as_os_str().as_bytes()).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    // SAFETY: `path` is valid NUL-terminated; O_PATH | O_NOFOLLOW opens the
+    // inode itself without connecting or following symlinks.
+    let raw = unsafe { libc::open(path.as_ptr(), libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `raw >= 0` is a fresh descriptor owned exclusively here.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `fd` is valid and `st` is writable.
+    if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if (st.st_mode & libc::S_IFMT) != libc::S_IFSOCK {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "refusing to set socket ACL on non-socket path"));
+    }
+    // SAFETY: geteuid has no preconditions.
+    if st.st_uid != unsafe { libc::geteuid() } {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "refusing to set socket ACL on socket owned by another user"));
+    }
+    let proc_fd = CString::new(format!("/proc/self/fd/{}", fd.as_raw_fd())).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
     // SAFETY: both strings are valid and NUL-terminated; blob outlives the call.
-    let r = unsafe { libc::setxattr(path.as_ptr(), c"system.posix_acl_access".as_ptr(), blob.as_ptr().cast(), blob.len(), 0) };
+    let r = unsafe { libc::setxattr(proc_fd.as_ptr(), c"system.posix_acl_access".as_ptr(), blob.as_ptr().cast(), blob.len(), 0) };
     if r == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
 }
 
@@ -3352,5 +3379,20 @@ mod tests {
         }
         assert!(g.sweep_subjects_with(|_| unreachable!(), |_, _| Ok(Membership::MissingFromDirectory)).is_empty());
         assert!(g.open.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn set_refuses_symlinks_and_regular_files() {
+        let dir = std::env::temp_dir().join(format!("kiri-access-symlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let regular = dir.join("target.txt");
+        std::fs::write(&regular, b"secret").unwrap();
+        let link = dir.join("fake.sock");
+        std::os::unix::fs::symlink(&regular, &link).unwrap();
+
+        assert!(set(&regular, &[1000]).is_err());
+        assert!(set(&link, &[1000]).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

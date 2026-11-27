@@ -172,12 +172,79 @@ pub fn ours(host: &str) -> bool {
         })
 }
 
+/// Maximum cached multi-level leaf certificates before oldest-entry eviction.
+const MAX_ISSUED_CERTS: usize = 512;
+/// Burst capacity and per-second refill rate for dynamic multi-level cert
+/// issuance so untrusted browser pages cannot DoS CPU with random subdomains.
+const CERT_RATE_BURST: f64 = 32.0;
+const CERT_RATE_PER_SEC: f64 = 1.0;
+
+struct IssuedCache {
+    certs: HashMap<String, (Arc<CertifiedKey>, i64)>,
+    order: std::collections::VecDeque<String>,
+    tokens: f64,
+    last_refill: std::time::Instant,
+}
+
+impl IssuedCache {
+    fn new() -> Self {
+        Self {
+            certs: HashMap::new(),
+            order: std::collections::VecDeque::new(),
+            tokens: CERT_RATE_BURST,
+            last_refill: std::time::Instant::now(),
+        }
+    }
+
+    fn take_rate_token(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        let elapsed = now.saturating_duration_since(self.last_refill).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * CERT_RATE_PER_SEC).min(CERT_RATE_BURST);
+        self.last_refill = now;
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn insert(&mut self, key: String, cert: Arc<CertifiedKey>, not_after: i64) {
+        if !self.certs.contains_key(&key) {
+            while self.certs.len() >= MAX_ISSUED_CERTS {
+                if let Some(oldest) = self.order.pop_front() {
+                    self.certs.remove(&oldest);
+                } else {
+                    break;
+                }
+            }
+            self.order.push_back(key.clone());
+        }
+        self.certs.insert(key, (cert, not_after));
+    }
+}
+
+/// Maps a validated container hostname to its leaf certificate key: single-level
+/// names (`app.kiri.local`, `app.kiri.localhost`) share one cached wildcard cert
+/// (`*.kiri.local` / `*.kiri.localhost`), preventing per-subdomain keygen DoS.
+fn cert_key_for(host: &str) -> String {
+    let clean = host.trim_end_matches('.');
+    for suffix in [".kiri.local", ".kiri.localhost"] {
+        if let Some(sub) = clean.strip_suffix(suffix) {
+            if !sub.contains('.') {
+                return format!("*{suffix}");
+            }
+        }
+    }
+    clean.to_owned()
+}
+
 /// Certificates for container names, made on first use and kept while the
 /// daemon runs.
 pub struct Certs {
     ca: Mutex<Option<(Arc<Issuer<'static, KeyPair>>, CertificateDer<'static>)>>,
     /// Per name: the certificate and the day (since the epoch) it expires.
-    issued: Mutex<HashMap<String, (Arc<CertifiedKey>, i64)>>,
+    issued: Mutex<IssuedCache>,
 }
 
 /// Days since the epoch, the unit certificate dates are made in.
@@ -193,7 +260,7 @@ impl std::fmt::Debug for Certs {
 
 impl Certs {
     pub fn new() -> Certs {
-        Certs { ca: Mutex::new(None), issued: Mutex::new(HashMap::new()) }
+        Certs { ca: Mutex::new(None), issued: Mutex::new(IssuedCache::new()) }
     }
 
     /// A certificate for `host` and the day it expires.
@@ -232,20 +299,24 @@ impl ResolvesServerCert for Certs {
         if !ours(&host) {
             return None;
         }
+        let key = cert_key_for(&host);
+        let is_wildcard = key.starts_with("*.");
         // Reissue within 30 days of expiry: a daemon that runs for a year
         // would otherwise keep serving a certificate browsers reject.
-        if let Some((c, not_after)) = self.issued.lock().unwrap_or_else(|e| e.into_inner()).get(&host) {
-            if today() + 30 < *not_after {
-                return Some(c.clone());
+        {
+            let mut cache = self.issued.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((c, not_after)) = cache.certs.get(&key) {
+                if today() + 30 < *not_after {
+                    return Some(c.clone());
+                }
+            }
+            if !is_wildcard && !cache.take_rate_token() {
+                return None;
             }
         }
-        let (cert, not_after) = self.issue(&host).ok()?;
-        let mut issued = self.issued.lock().unwrap_or_else(|e| e.into_inner());
-        // Bound the cache: a client can ask for unlimited distinct SNI names.
-        if issued.len() >= 512 {
-            issued.clear();
-        }
-        issued.insert(host, (cert.clone(), not_after));
+        let (cert, not_after) = self.issue(&key).ok()?;
+        let mut cache = self.issued.lock().unwrap_or_else(|e| e.into_inner());
+        cache.insert(key, cert.clone(), not_after);
         Some(cert)
     }
 }
@@ -399,10 +470,22 @@ fn trust_for_websites(der: &[u8]) -> i32 {
             } else {
                 let (keys, values) = ([k_policy, k_result], [policy, result]);
                 let dict = CFDictionaryCreate(std::ptr::null(), keys.as_ptr(), values.as_ptr(), 2, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-                let array = CFArrayCreate(std::ptr::null(), &dict, 1, &kCFTypeArrayCallBacks);
-                let status = SecTrustSettingsSetTrustSettings(cert, DOMAIN_USER, array);
-                CFRelease(array);
-                CFRelease(dict);
+                let array = if dict.is_null() {
+                    std::ptr::null()
+                } else {
+                    CFArrayCreate(std::ptr::null(), &dict, 1, &kCFTypeArrayCallBacks)
+                };
+                let status = if array.is_null() {
+                    -1
+                } else {
+                    SecTrustSettingsSetTrustSettings(cert, DOMAIN_USER, array)
+                };
+                if !array.is_null() {
+                    CFRelease(array);
+                }
+                if !dict.is_null() {
+                    CFRelease(dict);
+                }
                 status
             };
             for r in made.into_iter().filter(|r| !r.is_null()) {
@@ -546,5 +629,19 @@ mod tests {
         assert!(!healed_der.is_empty());
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn single_level_names_share_wildcard_and_cache_evicts_fifo_without_clearing() {
+        assert_eq!(super::cert_key_for("a.kiri.local"), "*.kiri.local");
+        assert_eq!(super::cert_key_for("random-123.kiri.localhost."), "*.kiri.localhost");
+        assert_eq!(super::cert_key_for("web.shop.kiri.localhost"), "web.shop.kiri.localhost");
+
+        // Multi-level rate bucket caps burst issuance to CERT_RATE_BURST.
+        let mut cache = super::IssuedCache::new();
+        for _ in 0..32 {
+            assert!(cache.take_rate_token());
+        }
+        assert!(!cache.take_rate_token());
     }
 }

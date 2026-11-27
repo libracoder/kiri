@@ -1791,8 +1791,7 @@ impl VolumeSizesCache {
 
     fn save(&self) {
         if let Ok(json) = serde_json::to_vec(&self.sizes) {
-            let tmp = self.path.with_extension("json.tmp");
-            if let Err(e) = std::fs::write(&tmp, json).and_then(|()| std::fs::rename(&tmp, &self.path)) {
+            if let Err(e) = super::write_atomic_mode(&self.path, &json, 0o600) {
                 crate::diag::error!("saving volume sizes failed", error = e);
             }
         }
@@ -2299,7 +2298,13 @@ impl Engine {
     /// boots in a tenth of a second can afford to sleep, and sleeping is the
     /// one thing that gives all its memory back to macOS: Apple's balloon
     /// device takes pages from the guest but does not release them.
-    /// Runs a command in a running container and collects its output.
+    /// Maximum output collected by [`Self::exec_capture`] so a misbehaving
+    /// container cannot exhaust host daemon memory.
+    const MAX_EXEC_CAPTURE: usize = 1024 * 1024;
+    /// Maximum LoadBalancer ports reconciled for `kiri-k8s`.
+    const MAX_K8S_LB_PORTS: usize = 256;
+
+    /// Runs a command in a running container and collects its output (bounded).
     pub fn exec_capture(&self, key: &str, argv: &[&str]) -> Result<(i32, String), Error> {
         let config = ExecConfig {
             console_size: None,
@@ -2316,7 +2321,10 @@ impl Engine {
         let (_, rx) = self.exec_start(&id)?;
         let mut out = Vec::new();
         for (_, data) in rx {
-            out.extend_from_slice(&data);
+            let room = Self::MAX_EXEC_CAPTURE.saturating_sub(out.len());
+            if room > 0 {
+                out.extend_from_slice(&data[..data.len().min(room)]);
+            }
         }
         let code = self.with_exec(&id, |e| e.exit_code.unwrap_or(-1)).unwrap_or(-1);
         self.lock().execs.remove(&id);
@@ -2336,7 +2344,12 @@ impl Engine {
         let _ = std::thread::Builder::new().name("kiri-k8s-lb".into()).spawn(move || loop {
             std::thread::sleep(Duration::from_secs(3));
             let Some(engine) = me.upgrade() else { return };
-            let node = engine.lock().containers.values().find(|c| c.status == Status::Running && is_k8s_node(&c.spec)).map(|c| (c.id.clone(), c.ip));
+            let node = engine
+                .lock()
+                .containers
+                .values()
+                .find(|c| c.status == Status::Running && is_k8s_node_container(c))
+                .map(|c| (c.id.clone(), c.ip));
             let Some((id, Some(ip))) = node else {
                 engine.clear_k8s_lb();
                 continue;
@@ -2418,8 +2431,14 @@ impl Engine {
             .split_whitespace()
             .filter_map(|p| {
                 let (port, proto) = p.split_once('/')?;
-                Some((port.parse().ok()?, proto.to_ascii_lowercase()))
+                let proto = proto.to_ascii_lowercase();
+                if proto != "tcp" && proto != "udp" {
+                    return None;
+                }
+                let port: u16 = port.parse().ok()?;
+                (port != 0).then_some((port, proto))
             })
+            .take(Self::MAX_K8S_LB_PORTS)
             .collect();
         let Some(vm) = self.awake() else { return false };
         let host_ip = if crate::k8s::config().lan { "0.0.0.0" } else { "127.0.0.1" };
@@ -5153,6 +5172,11 @@ impl Engine {
         lock_log(&c.log).path()
     }
 
+    /// Maximum stdin bytes buffered for a `Created` container before it starts
+    /// (`attach?stdin=1`), matching `vmlink::INPUT_WINDOW` so an unstarted
+    /// container cannot OOM-kill the host daemon.
+    const MAX_EARLY_INPUT: usize = 256 * 1024;
+
     pub fn input(&self, id: &str, data: &[u8]) -> io::Result<()> {
         {
             let mut st = self.lock();
@@ -5160,6 +5184,9 @@ impl Engine {
                 if !c.live {
                     if c.status == Status::Exited {
                         return Err(io::Error::new(io::ErrorKind::BrokenPipe, "container has exited"));
+                    }
+                    if c.early_input.len().saturating_add(data.len()) > Self::MAX_EARLY_INPUT {
+                        return Err(io::Error::new(io::ErrorKind::WriteZero, "container pre-start stdin buffer full"));
                     }
                     c.early_input.extend_from_slice(data);
                     return Ok(());
@@ -10872,6 +10899,60 @@ mod exit_forwards_tests {
         drop(engine);
         let _ = std::fs::remove_dir_all(dir);
     }
+
+    #[test]
+    fn early_input_is_bounded_and_k8s_node_requires_canonical_name() {
+        let (engine, id, dir) = engine_running("early-input-and-k8s-name");
+        // Mark back to Created/not-live so `Engine::input` exercises `early_input`.
+        {
+            let mut st = engine.lock();
+            let c = st.containers.get_mut(&id).unwrap();
+            c.status = Status::Created;
+            c.live = false;
+        }
+        let exact = vec![b'x'; Engine::MAX_EARLY_INPUT];
+        engine.input(&id, &exact).unwrap();
+        let err = engine.input(&id, &[b'y']).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WriteZero);
+        {
+            let st = engine.lock();
+            let c = st.containers.get(&id).unwrap();
+            assert_eq!(c.early_input.len(), Engine::MAX_EARLY_INPUT);
+            assert!(!super::is_k8s_node_container(c));
+        }
+
+        // An arbitrary container carrying `dev.kiri.k8s` must NOT qualify as the managed k8s node.
+        let image = Image {
+            mirror: None,
+            name: "test:local".into(),
+            digest: "sha256:test".into(),
+            index_digest: None,
+            config_digest: "sha256:test".into(),
+            layers: Vec::new(),
+            size: 0,
+            platform: "linux/arm64".into(),
+            created: String::new(),
+            pulled_at: 0,
+            config: Default::default(),
+        };
+        let fake_k8s_spec: Spec = serde_json::from_value(serde_json::json!({
+            "image": "test:local", "image_id": "sha256:test", "entrypoint": [], "cmd": ["sleep", "60"],
+            "env": [], "cwd": "/", "user": "", "auto_remove": false, "network_mode": "none",
+            "labels": {"dev.kiri.k8s": "1"},
+            "restart": {"name": "no", "max_retries": 0}
+        }))
+        .unwrap();
+        let fake_id = engine.create(Some("evil-k8s".into()), fake_k8s_spec.clone(), &image).unwrap();
+        let real_id = engine.create(Some("kiri-k8s".into()), fake_k8s_spec, &image).unwrap();
+        {
+            let st = engine.lock();
+            assert!(!super::is_k8s_node_container(st.containers.get(&fake_id).unwrap()));
+            assert!(super::is_k8s_node_container(st.containers.get(&real_id).unwrap()));
+        }
+
+        drop(engine);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 
 /// 10 ms timer slack applied to `kiri-k8s` (`dev.kiri.k8s`) so `k3s`'s dozens of
@@ -10881,6 +10962,13 @@ const K8S_TIMER_SLACK_NS: u64 = 10_000_000;
 
 fn is_k8s_node(spec: &Spec) -> bool {
     spec.labels.get("dev.kiri.k8s").is_some()
+}
+
+/// Canonical managed Kubernetes node container (`kiri-k8s` with `dev.kiri.k8s`
+/// label), so an arbitrary user container carrying label `dev.kiri.k8s` cannot
+/// hijack `reconcile_k8s_lb` host port publishing.
+fn is_k8s_node_container(c: &Container) -> bool {
+    c.name == "kiri-k8s" && is_k8s_node(&c.spec)
 }
 
 fn watches_host_binds(c: &Container) -> bool {

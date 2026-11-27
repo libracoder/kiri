@@ -138,10 +138,27 @@ fn status_of(e: Error) -> (u16, String) {
 /// Docker's API has nothing that changes the engine's own settings.
 const CONTAINER_MAY: &[(&str, &str)] = &[("POST", "/kiri/wake")];
 
+/// Kiri read endpoints that return host-only secrets (such as proxy URLs with
+/// embedded `user:pass@` credentials) and are restricted to `Caller::Host`.
+const HOST_ONLY_KIRI_READS: &[&str] = &["/kiri/proxy"];
+
 /// Whether a container's connection may make this request.
 fn container_may(method: &str, path: &str) -> bool {
     let kiri = path == "/kiri" || path.starts_with("/kiri/");
-    !kiri || matches!(method, "GET" | "HEAD") || CONTAINER_MAY.contains(&(method, path))
+    !kiri
+        || (matches!(method, "GET" | "HEAD") && !HOST_ONLY_KIRI_READS.contains(&path))
+        || CONTAINER_MAY.contains(&(method, path))
+}
+
+/// Whether `caller` may make this request. Privileged `/kiri/*` mutations and
+/// secret-bearing reads (`GET /kiri/proxy`) are restricted to `Caller::Host`;
+/// both `Caller::Container` and integrated `Caller::Wsl` distros share the same
+/// narrow allowlist on `/kiri/*`.
+fn caller_may(caller: &Caller, method: &str, path: &str) -> bool {
+    match caller {
+        Caller::Host => true,
+        Caller::Container | Caller::Wsl(_) => container_may(method, path),
+    }
 }
 
 fn route(req: &Request, engine: &Arc<Engine>, caller: &Caller, w: &mut UnixStream, r: &mut BufReader<UnixStream>) -> io::Result<Next> {
@@ -152,12 +169,18 @@ fn route(req: &Request, engine: &Arc<Engine>, caller: &Caller, w: &mut UnixStrea
     }
     let p = req.path.as_str();
     let m = req.method.as_str();
-    // Kiri's own endpoints that change something are for this machine's
-    // programs (caller.rs), not for a container given the socket.
-    if *caller == Caller::Container && !container_may(m, p) {
+    // Kiri's own management endpoints (and secret-bearing reads like /kiri/proxy)
+    // are for this machine's host programs (caller.rs), not for a container or
+    // integrated WSL distro.
+    if !caller_may(caller, m, p) {
         // Closed after the answer: a body the request carried is not left
         // on the connection to be read as the next request.
-        http::error(w, 403, "this is changed in Kiri's window or with the kiri command on this machine, not from a container")?;
+        let why = match caller {
+            Caller::Container => "this is changed in Kiri's window or with the kiri command on this machine, not from a container",
+            Caller::Wsl(_) => "this is only available from Kiri on the host, not from an integrated WSL distro",
+            Caller::Host => unreachable!(),
+        };
+        http::error(w, 403, why)?;
         return Ok(Next::Close);
     }
     // While Settings → Storage moves the data, nothing may change it.
@@ -292,7 +315,7 @@ fn route(req: &Request, engine: &Arc<Engine>, caller: &Caller, w: &mut UnixStrea
             return image_save(engine, &names, w);
         }
         ("POST", "/containers/create") => {
-            if let Some(made) = super::builder::create_for_buildx(engine, req) {
+            if let Some(made) = super::builder::create_for_buildx(engine, req, caller) {
                 return reply(w, made, 201);
             }
             return reply(w, create_by(req, engine, caller), 201);
@@ -302,7 +325,7 @@ fn route(req: &Request, engine: &Arc<Engine>, caller: &Caller, w: &mut UnixStrea
         ("POST", "/networks/create") => return reply(w, network_create(req, engine), 201),
         ("POST", "/networks/prune") => return reply(w, network_prune(req, engine), 200),
         ("GET", "/volumes") => return reply(w, volumes(req, engine), 200),
-        ("POST", "/volumes/create") => return reply(w, volume_create(req, engine), 201),
+        ("POST", "/volumes/create") => return reply(w, volume_create(req, engine, caller), 201),
         ("POST", "/volumes/prune") => return reply(w, volume_prune(req, engine), 200),
         _ => {}
     }
@@ -1249,11 +1272,7 @@ fn save_resources(
     } else if let Some(prev) = existing_shared_nat {
         out["shared_nat"] = json!(prev);
     }
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(Error::Io)?;
-    }
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, out.to_string()).and_then(|()| std::fs::rename(&tmp, path)).map_err(Error::Io)
+    super::write_atomic_mode(path, out.to_string().as_bytes(), 0o600).map_err(Error::Io)
 }
 
 fn set_ports(req: &Request, engine: &Engine, id: &str) -> Result<Value, Error> {
@@ -1805,14 +1824,27 @@ fn mac_shared(src: &str) -> bool {
 /// - anything else the Mac has there (/etc/hosts, /etc/localtime) is the
 ///   Mac's.
 /// - what the Mac lacks stays the VM's.
-fn mac_source(src: &str) -> Option<String> {
-    let real = std::fs::canonicalize(src).ok().and_then(|p| p.into_os_string().into_string().ok()).filter(|p| mac_shared(p));
-    if mac_shared(src) {
-        return Some(real.unwrap_or_else(|| src.to_owned()));
+/// Whether `src` names one of the synthetic macOS `/etc` paths backed by
+/// `~/.kiri/etc` (`hostetc`).
+fn is_mac_hostetc(src: &str) -> bool {
+    if !cfg!(target_os = "macos") {
+        return false;
     }
-    let kept = match src.strip_prefix("/etc/") {
+    let norm = lexical_path(src);
+    norm == "/etc" || norm.strip_prefix("/etc/").is_some_and(|name| super::hostetc::FILES.contains(&name))
+}
+
+fn mac_source(src: &str) -> Option<String> {
+    let norm = lexical_path(src);
+    let real = std::fs::canonicalize(src).ok().and_then(|p| p.into_os_string().into_string().ok()).filter(|p| mac_shared(p));
+    // Check the lexically normalized path so `/Users/..` (which normalizes to `/`)
+    // never falls back to `/mnt/mac/Users/..` inside the VM.
+    if mac_shared(&norm) {
+        return Some(real.unwrap_or(norm));
+    }
+    let kept = match norm.strip_prefix("/etc/") {
         Some(name) if super::hostetc::FILES.contains(&name) => Some(super::hostetc::file(name)),
-        None if src == "/etc" => Some(super::hostetc::all()),
+        None if norm == "/etc" => Some(super::hostetc::all()),
         _ => None,
     };
     if let Some(kept) = kept {
@@ -1820,7 +1852,7 @@ fn mac_source(src: &str) -> Option<String> {
         // it cannot be written, the path is the VM's, as it was.
         return kept.ok().and_then(|p| p.into_os_string().into_string().ok()).filter(|p| mac_shared(p));
     }
-    if src.strip_prefix("/etc").is_some_and(|rest| rest.is_empty() || rest.starts_with('/')) { real } else { None }
+    if norm.strip_prefix("/etc").is_some_and(|rest| rest.is_empty() || rest.starts_with('/')) { real } else { None }
 }
 
 /// Where the guest finds a host path given for a bind: the Mac's own under
@@ -1916,15 +1948,23 @@ fn resolve_server(host: &str) -> Option<String> {
     addrs.iter().find(|a| a.is_ipv4()).or(addrs.first()).map(|a| a.ip().to_string())
 }
 
-/// Whether `src` names the mount point the guest keeps the Mac's folders at.
+/// Whether `src` names the mount point the guest keeps the Mac's folders at,
+/// or an ancestor of it (`/` or `/mnt`) whose recursive bind (`MS_BIND | MS_REC`)
+/// would expose `/mnt/mac` inside the container.
 ///
 /// `root` is empty on a Linux host, where the agent sees the host's own
 /// paths and there is no share to name.
 fn guest_share_path(src: &str, root: &str) -> bool {
-    // Compared as the guest kernel will read it: `/mnt//mac`, `/mnt/./mac`
-    // and `/mnt/x/../mac` all name the share.
+    if !root.starts_with('/') || !src.starts_with('/') {
+        return false;
+    }
+    // Compared as the guest kernel will read it: `/mnt//mac`, `/mnt/./mac`,
+    // `/mnt/x/../mac`, `/mnt`, and `/` all reach the share.
     let src = lexical_path(src);
-    root.starts_with('/') && (src == root || src.strip_prefix(root).is_some_and(|rest| rest.starts_with('/')))
+    src == root
+        || src.strip_prefix(root).is_some_and(|rest| rest.starts_with('/'))
+        || src == "/"
+        || root.strip_prefix(&src).is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// An absolute path with empty and `.` components dropped and `..` applied.
@@ -1942,24 +1982,99 @@ fn lexical_path(p: &str) -> String {
     format!("/{}", out.join("/"))
 }
 
-/// Refuses volume driver options that would mount the VM's own shares.
-///
-/// The guest mounts a volume's `device` itself, as root, before the container
-/// starts, so a `type=virtiofs` volume (`device=kiri-mac`) or a bind of
-/// `/mnt/mac` would hand the container the share without `-v` naming it.
-fn check_volume_device(options: &std::collections::BTreeMap<String, String>) -> Result<(), Error> {
-    let kind = options.get("type").map_or("", String::as_str);
-    if kind.eq_ignore_ascii_case("virtiofs") {
-        return Err(Error::BadRequest("invalid volume option type=virtiofs: the VM's shares cannot be mounted as a volume".into()));
+/// Filesystem types permitted for local volume `DriverOpts` (`type=`).
+const ALLOWED_VOLUME_TYPES: &[&str] = &["", "none", "nfs", "nfs4", "cifs", "smb3", "tmpfs"];
+
+/// Whether `src` is a parent/ancestor directory of Kiri's own host Unix socket
+/// (such as `/run/kiri`, `/run`, or `/`), which would let a non-Host caller
+/// reach the host-privileged socket without going through `engine_socket_for_distro`.
+fn is_host_socket_ancestor(src: &str) -> bool {
+    let norm = lexical_path(src);
+    let mut candidates = Vec::new();
+    if let Ok(p) = super::socket_path() {
+        if let Some(s) = p.to_str() {
+            candidates.push(lexical_path(s));
+        }
     }
-    let device = options.get("device").map_or("", String::as_str);
-    let (flags, _) = super::volumes::mount_options(options.get("o").map_or("", String::as_str));
-    if flags & 4096 != 0 && guest_share_path(device, MAC_ROOT) {
+    if let Ok(p) = super::home_socket_path() {
+        if let Some(s) = p.to_str() {
+            candidates.push(lexical_path(s));
+        }
+    }
+    candidates.into_iter().any(|sock| {
+        if let Some((parent, _)) = sock.rsplit_once('/') {
+            let parent = if parent.is_empty() { "/" } else { parent };
+            norm == "/" || norm == parent || parent.strip_prefix(&norm).is_some_and(|r| r.starts_with('/'))
+        } else {
+            false
+        }
+    })
+}
+
+/// Resolves and validates a local bind volume's `device` option with the exact
+/// same caller-aware confinement and socket substitution as regular binds.
+fn resolve_volume_bind_device(device: &str, caller: &Caller, wsl: Option<&super::binds::Wsl>) -> Result<String, Error> {
+    if device.is_empty() {
+        return Err(Error::BadRequest("invalid volume option device: bind device cannot be empty".into()));
+    }
+    let resolved = match (wsl, caller.wsl_distro()) {
+        (_, Some(d)) => super::binds::distro_source(device, d, wsl)?,
+        (Some(w), None) => super::binds::source(device, w)?,
+        (None, None) => device.to_owned(),
+    };
+    if !resolved.starts_with('/') {
+        return Err(Error::BadRequest(format!("invalid volume option device={device}: must be an absolute path")));
+    }
+    if guest_share_path(&resolved, MAC_ROOT) {
         return Err(Error::BadRequest(format!(
             "invalid volume option device={device}: {MAC_ROOT} exists only inside the VM; name the Mac's own path, such as /Users/…"
         )));
     }
-    Ok(())
+    if let Some(sock) = super::binds::engine_socket_for_distro(&resolved, caller.wsl_distro()) {
+        return Ok(sock);
+    }
+    if *caller != Caller::Host && is_host_socket_ancestor(&resolved) {
+        return Err(Error::BadRequest(format!(
+            "invalid volume option device={device}: cannot mount a directory containing Kiri's host socket"
+        )));
+    }
+    let mapped = guest_bind_source(&resolved);
+    if !MAC_ROOT.is_empty() && (lexical_path(&mapped) == MAC_ROOT || !mapped.starts_with(&format!("{MAC_ROOT}/")) && guest_share_path(&mapped, MAC_ROOT)) {
+        return Err(Error::BadRequest(format!(
+            "invalid volume option device={device}: {MAC_ROOT} exists only inside the VM; name the Mac's own path, such as /Users/…"
+        )));
+    }
+    Ok(mapped)
+}
+
+/// Refuses volume driver options that would mount the VM's own shares,
+/// unsupported kernel filesystems, or paths outside the caller's isolation boundary.
+#[cfg(test)]
+fn check_volume_device(options: &std::collections::BTreeMap<String, String>) -> Result<(), Error> {
+    check_volume_device_for(options, &Caller::Host, None).map(|_| ())
+}
+
+fn check_volume_device_for(
+    options: &std::collections::BTreeMap<String, String>,
+    caller: &Caller,
+    wsl: Option<&super::binds::Wsl>,
+) -> Result<Option<String>, Error> {
+    let kind = options.get("type").map_or("", String::as_str);
+    if kind.eq_ignore_ascii_case("virtiofs") {
+        return Err(Error::BadRequest("invalid volume option type=virtiofs: the VM's shares cannot be mounted as a volume".into()));
+    }
+    if !ALLOWED_VOLUME_TYPES.iter().any(|allowed| kind.eq_ignore_ascii_case(allowed)) {
+        return Err(Error::BadRequest(format!(
+            "invalid volume option type={kind}: unsupported local volume filesystem type"
+        )));
+    }
+    let device = options.get("device").map_or("", String::as_str);
+    let (flags, _) = super::volumes::mount_options(options.get("o").map_or("", String::as_str));
+    if flags & 4096 != 0 {
+        let mapped = resolve_volume_bind_device(device, caller, wsl)?;
+        return Ok(Some(mapped));
+    }
+    Ok(None)
 }
 
 /// Refuses text that would forge a field in the tab-separated mount line the
@@ -2157,19 +2272,30 @@ fn mounts_for(body: &Value, engine: &Engine, image: &kiri_image::Image, caller: 
                 if !src.starts_with('/') {
                     return Err(Error::BadRequest(format!("invalid mount source {src}: must be an absolute path")));
                 }
+                // Synthetic macOS `/etc` files live in shared `~/.kiri/etc`: always
+                // mount read-only so a container cannot plant symlinks or poison
+                // shared `/etc` entries for other containers.
+                let bind_ro = ro || is_mac_hostetc(src);
+                let bind_flag = |more: &str| {
+                    let mut f: Vec<&str> = more.split(',').filter(|x| !x.is_empty()).collect();
+                    if bind_ro {
+                        f.push("ro");
+                    }
+                    f.join(",")
+                };
                 // Where the source is on this machine: itself, or on a Mac
                 // the path it leads to (a file Kiri keeps for /etc/passwd).
                 let here = if cfg!(target_os = "macos") { mac_source(src) } else { Some(src.to_owned()) };
                 let Some(here) = here else {
                     // The guest makes a missing source itself, as Docker does on Linux.
-                    out.guest.push(format!("{src}\t{dst}\t{}", flag(if create_missing { "create" } else { "" })));
-                    out.info.push(json!({"Type": "bind", "Source": src, "Destination": dst, "Mode": "", "RW": !ro, "Propagation": "rprivate"}));
+                    out.guest.push(format!("{src}\t{dst}\t{}", bind_flag(if create_missing { "create" } else { "" })));
+                    out.info.push(json!({"Type": "bind", "Source": src, "Destination": dst, "Mode": "", "RW": !bind_ro, "Propagation": "rprivate"}));
                     return Ok(());
                 };
                 prepare_bind_source(src, &here, create_missing)?;
                 // After a missing source was made, so its links are followed too.
-                out.guest.push(format!("{}\t{dst}\t{}", guest_bind_source(src), flag("")));
-                out.info.push(json!({"Type": "bind", "Source": src, "Destination": dst, "Mode": "", "RW": !ro, "Propagation": "rprivate"}));
+                out.guest.push(format!("{}\t{dst}\t{}", guest_bind_source(src), bind_flag("")));
+                out.info.push(json!({"Type": "bind", "Source": src, "Destination": dst, "Mode": "", "RW": !bind_ro, "Propagation": "rprivate"}));
             }
             "volume" => {
                 let (name, anonymous) = if src.is_empty() { (super::engine::random_hex(32), true) } else { (src.to_owned(), false) };
@@ -2179,15 +2305,19 @@ fn mounts_for(body: &Value, engine: &Engine, image: &kiri_image::Image, caller: 
                 for (k, val) in &v.options {
                     wire_text(&format!("volume option {k}"), val)?;
                 }
-                // The guest mounts a volume's device as root, so the share
-                // must not be reachable this way either: not as a virtiofs
-                // tag, and not as a bind of /mnt/mac.
-                check_volume_device(&v.options)?;
+                // The guest mounts a volume's device as root, so enforce the
+                // filesystem allowlist, caller confinement (WSL/Container),
+                // socket substitution, and `/mnt/mac` share guard.
+                let mapped_bind = check_volume_device_for(&v.options, caller, super::binds::wsl())?;
                 let path = super::volumes::guest_path(&name);
                 let copy = if extra.contains("nocopy") { "create" } else { "create,copyup" };
                 // A volume with driver options (`type=nfs`, `o=bind` …) is
                 // mounted at its path by the guest at start, then bound in.
-                let vol = super::volumes::guest_mount_fields(&v.options, guest_bind_source, resolve_server);
+                let vol = super::volumes::guest_mount_fields(
+                    &v.options,
+                    |dev| mapped_bind.clone().unwrap_or_else(|| guest_bind_source(dev)),
+                    resolve_server,
+                );
                 out.guest.push(format!("{path}\t{dst}\t{}{vol}", flag(copy)));
                 out.info.push(json!({"Type": "volume", "Name": name, "Source": path, "Destination": dst, "Driver": "local", "Mode": "z", "RW": !ro, "Propagation": ""}));
                 if anonymous {
@@ -2258,6 +2388,7 @@ fn mounts_for(body: &Value, engine: &Engine, image: &kiri_image::Image, caller: 
                 d => return Err(Error::BadRequest(format!("Kiri supports only local volumes, not {d}"))),
             }
             let options = super::volumes::local_options(&driver_opts["Options"]).map_err(Error::BadRequest)?;
+            check_volume_device_for(&options, caller, wsl)?;
             engine.volume_ensure_with(src, m["VolumeOptions"]["Labels"].clone(), options)?;
         }
         add(kind, src, dst, ro, &extra, false, &mut out)?;
@@ -2398,7 +2529,7 @@ fn volume_json(v: &super::volumes::Volume) -> Value {
     })
 }
 
-fn volume_create(req: &Request, engine: &Engine) -> Result<Value, Error> {
+fn volume_create(req: &Request, engine: &Engine, caller: &Caller) -> Result<Value, Error> {
     let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
     match body["Driver"].as_str().unwrap_or("local") {
         "" | "local" => {}
@@ -2409,6 +2540,7 @@ fn volume_create(req: &Request, engine: &Engine) -> Result<Value, Error> {
         n => n.to_owned(),
     };
     let options = super::volumes::local_options(&body["DriverOpts"]).map_err(Error::BadRequest)?;
+    check_volume_device_for(&options, caller, super::binds::wsl())?;
     let v = engine.volume_ensure_with(&name, body["Labels"].clone(), options)?;
     Ok(volume_json(&v))
 }
@@ -2857,16 +2989,6 @@ fn create_by(req: &Request, engine: &Engine, caller: &Caller) -> Result<Value, E
     let body_labels = serde_json::from_slice::<Value>(&req.body).ok().map(|b| b["Labels"].clone()).unwrap_or(Value::Null);
     let record_distro = created_wsl_distro(caller, super::binds::wsl().and_then(|w| w.distro.as_deref()), &body_labels);
     create_inner(req, engine, caller, record_distro)
-}
-
-#[cfg(test)]
-pub(super) fn create_for(req: &Request, engine: &Engine, wsl_distro: Option<&str>) -> Result<Value, Error> {
-    let record_distro = wsl_distro.filter(|d| super::binds::valid_distro_name(d)).map(str::to_owned);
-    let caller = match wsl_distro {
-        Some(d) => Caller::Wsl(d.to_owned()),
-        None => Caller::Host,
-    };
-    create_inner(req, engine, &caller, record_distro)
 }
 
 fn create_inner(req: &Request, engine: &Engine, caller: &Caller, record_wsl_distro: Option<String>) -> Result<Value, Error> {
@@ -5749,9 +5871,22 @@ mod tests {
             assert!(routes.iter().any(|(m, p)| (m.as_str(), p.as_str()) == known), "{known:?} not found in route(): {routes:?}");
         }
         for (m, p) in &routes {
-            let open = matches!(m.as_str(), "GET" | "HEAD") || CONTAINER_MAY.contains(&(m.as_str(), p.as_str()));
+            let open = (matches!(m.as_str(), "GET" | "HEAD") && !HOST_ONLY_KIRI_READS.contains(&p.as_str()))
+                || CONTAINER_MAY.contains(&(m.as_str(), p.as_str()));
             assert_eq!(container_may(m, p), open, "{m} {p}");
         }
+        assert!(!container_may("GET", "/kiri/proxy"));
+        assert!(!caller_may(&Caller::Wsl("Ubuntu".into()), "GET", "/kiri/proxy"));
+        assert!(caller_may(&Caller::Host, "GET", "/kiri/proxy"));
+        assert!(!caller_may(&Caller::Wsl("Ubuntu".into()), "PUT", "/kiri/proxy/system"));
+        assert!(!caller_may(&Caller::Wsl("Ubuntu".into()), "POST", "/kiri/proxy"));
+        assert!(!caller_may(&Caller::Wsl("Ubuntu".into()), "POST", "/kiri/registries"));
+        assert!(!caller_may(&Caller::Wsl("Ubuntu".into()), "POST", "/kiri/storage"));
+        assert!(!caller_may(&Caller::Wsl("Ubuntu".into()), "DELETE", "/kiri/storage/old"));
+        assert!(!caller_may(&Caller::Wsl("Ubuntu".into()), "POST", "/kiri/win-ports"));
+        assert!(!caller_may(&Caller::Wsl("Ubuntu".into()), "POST", "/kiri/fs-events"));
+        assert!(!caller_may(&Caller::Wsl("Ubuntu".into()), "POST", "/kiri/builder"));
+        assert!(caller_may(&Caller::Wsl("Ubuntu".into()), "POST", "/kiri/wake"));
         assert!(!container_may("PATCH", "/kiri/anything/new"));
         assert!(!container_may("POST", "/kiri"));
         assert!(container_may("POST", "/containers/create") && container_may("GET", "/kiri/registries") && container_may("HEAD", "/kiri/registries"));
@@ -7646,23 +7781,50 @@ mod network_option_tests {
         assert!(!super::guest_share_path("/Users/me", "/mnt/mac"));
         assert!(!super::guest_share_path("/mnt/mac", ""), "a Linux host has no share");
         // Other spellings of the same path name the share too.
-        for p in ["/mnt//mac", "/mnt/./mac", "/mnt/x/../mac/Users", "//mnt/mac/", "/mnt/mac/."] {
+        for p in ["/mnt//mac", "/mnt/./mac", "/mnt/x/../mac/Users", "//mnt/mac/", "/mnt/mac/.", "/mnt", "/", "/Users/..", "/Users/../.."] {
             assert!(super::guest_share_path(p, "/mnt/mac"), "{p}");
         }
         assert!(!super::guest_share_path("/mnt/mac/../macintosh", "/mnt/mac"));
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(super::mac_source("/Users/.."), None);
+            assert_eq!(super::mac_source("/Users/../.."), None);
+            assert_eq!(super::mac_source("/Users/me/../../.."), None);
+            assert!(super::is_mac_hostetc("/etc"));
+            assert!(super::is_mac_hostetc("/etc/passwd"));
+            assert!(!super::is_mac_hostetc("/etc/hosts"));
+        }
     }
 
     /// A volume's device is mounted by the guest as root, so it must not
-    /// reach the share either.
+    /// reach the share, arbitrary kernel filesystems, or other WSL distros.
     #[test]
     fn a_volume_cannot_mount_the_share() {
         let opts = |kv: &[(&str, &str)]| kv.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect::<std::collections::BTreeMap<_, _>>();
         assert!(super::check_volume_device(&opts(&[("type", "virtiofs"), ("device", "kiri-mac")])).is_err());
         assert!(super::check_volume_device(&opts(&[("type", "VirtioFS"), ("device", "rosetta")])).is_err());
+        assert!(super::check_volume_device(&opts(&[("type", "overlay"), ("device", "overlay"), ("o", "lowerdir=/mnt/mac:/tmp")])).is_err());
+        assert!(super::check_volume_device(&opts(&[("type", "ext4"), ("device", "/dev/vda")])).is_err());
+        assert!(super::check_volume_device(&opts(&[("type", "proc"), ("device", "proc")])).is_err());
         if cfg!(target_os = "macos") {
             assert!(super::check_volume_device(&opts(&[("type", "none"), ("o", "bind"), ("device", "/mnt/mac")])).is_err());
             assert!(super::check_volume_device(&opts(&[("type", "none"), ("o", "bind"), ("device", "/mnt//mac/Users")])).is_err());
+            assert!(super::check_volume_device(&opts(&[("type", "none"), ("o", "bind"), ("device", "/Users/..")])).is_err());
+            assert!(super::check_volume_device(&opts(&[("type", "none"), ("o", "rbind"), ("device", "/mnt")])).is_err());
+            assert!(super::check_volume_device(&opts(&[("type", "none"), ("o", "rbind"), ("device", "/")])).is_err());
         }
+        // Integrated WSL distro bind volumes are confined to that distro.
+        let wsl = super::super::binds::Wsl { root: "/mnt/".into(), distro: Some("kiri".into()) };
+        assert!(super::check_volume_device_for(
+            &opts(&[("type", "none"), ("o", "bind"), ("device", "/mnt/wsl/kiri/roots/Debian/etc")]),
+            &Caller::Wsl("Ubuntu".into()),
+            Some(&wsl),
+        ).is_err());
+        assert!(super::check_volume_device_for(
+            &opts(&[("type", "none"), ("o", "bind"), ("device", r"\\wsl$\Debian\etc")]),
+            &Caller::Wsl("Ubuntu".into()),
+            Some(&wsl),
+        ).is_err());
         // Ordinary volumes are untouched.
         assert!(super::check_volume_device(&opts(&[("type", "none"), ("o", "bind"), ("device", "/Users/me/data")])).is_ok());
         assert!(super::check_volume_device(&opts(&[("type", "nfs"), ("o", "addr=10.0.0.1"), ("device", ":/export")])).is_ok());
