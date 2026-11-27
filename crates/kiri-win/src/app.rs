@@ -802,10 +802,9 @@ unsafe fn serve_page(wv: &ICoreWebView2, env: &ICoreWebView2Environment) -> wind
     // SAFETY: the caller's live webview and environment, on their thread.
     unsafe {
         let mut token = 0;
-        // Every request to the page's host comes here, from any frame
-        // (WebView2 before 124 has only the main frame's filter), and is
-        // answered from memory: it never reaches the network.
-        let filter = HSTRING::from(crate::page::FILTER);
+        // Every request (any origin, any frame) comes here: only PAGE_URL is
+        // answered from memory, and everything else gets 404 without touching the network.
+        let filter = HSTRING::from(crate::page::ALL_RESOURCES_FILTER);
         match wv.cast::<ICoreWebView2_22>() {
             Ok(wv22) => wv22.AddWebResourceRequestedFilterWithRequestSourceKinds(&filter, COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL, COREWEBVIEW2_WEB_RESOURCE_REQUEST_SOURCE_KINDS_ALL)?,
             Err(_) => wv.AddWebResourceRequestedFilter(&filter, COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL)?,
@@ -879,6 +878,16 @@ unsafe fn serve_page(wv: &ICoreWebView2, env: &ICoreWebView2Environment) -> wind
                     } else if a.NavigationId(&mut id).is_ok() {
                         LATEST.set(id);
                     }
+                }
+                Ok(())
+            })),
+            &mut token,
+        )?;
+        // Cancel all subframe navigations: Kiri's UI never uses iframes.
+        wv.add_FrameNavigationStarting(
+            &NavigationStartingEventHandler::create(Box::new(|_, args: Option<ICoreWebView2NavigationStartingEventArgs>| {
+                if let Some(a) = args {
+                    let _ = a.SetCancel(true);
                 }
                 Ok(())
             })),

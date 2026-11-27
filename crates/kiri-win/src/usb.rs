@@ -15,13 +15,43 @@ use crate::engine::{emit, notice};
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-fn usbipd_path() -> Option<PathBuf> {
-    let installed = std::env::var_os("ProgramFiles").map(|p| PathBuf::from(p).join("usbipd-win").join("usbipd.exe"));
-    if let Some(p) = installed.filter(|p| p.is_file()) {
-        return Some(p);
+/// Resolves `usbipd.exe` exclusively under a known `Program Files` directory
+/// returned by Windows' shell API — never the mutable `ProgramFiles` env var or
+/// `PATH`, because `attach()` elevates this executable via UAC (`runas`).
+fn trusted_usbipd_in(program_files_dirs: &[PathBuf]) -> Option<PathBuf> {
+    program_files_dirs
+        .iter()
+        .map(|d| d.join("usbipd-win").join("usbipd.exe"))
+        .find(|p| p.is_file())
+}
+
+fn known_program_files() -> Vec<PathBuf> {
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::{FOLDERID_ProgramFiles, SHGetKnownFolderPath};
+    let mut dirs = Vec::new();
+    let mut ptr: windows_sys::core::PWSTR = std::ptr::null_mut();
+    // SAFETY: known folder GUID; `ptr` is freed with `CoTaskMemFree`.
+    let hr = unsafe { SHGetKnownFolderPath(&FOLDERID_ProgramFiles, 0, 0, &mut ptr) };
+    if hr == 0 && !ptr.is_null() {
+        // SAFETY: `SHGetKnownFolderPath` returns a NUL-terminated UTF-16 string.
+        let path = unsafe {
+            let mut n = 0usize;
+            while *ptr.add(n) != 0 {
+                n += 1;
+            }
+            String::from_utf16_lossy(std::slice::from_raw_parts(ptr, n))
+        };
+        // SAFETY: allocated by `SHGetKnownFolderPath`.
+        unsafe { CoTaskMemFree(ptr.cast()) };
+        if !path.is_empty() {
+            dirs.push(PathBuf::from(path));
+        }
     }
-    // On PATH, from another install.
-    std::env::var_os("PATH").and_then(|path| std::env::split_paths(&path).map(|d| d.join("usbipd.exe")).find(|p| p.is_file()))
+    dirs
+}
+
+fn usbipd_path() -> Option<PathBuf> {
+    trusted_usbipd_in(&known_program_files())
 }
 
 fn run(args: &[&str]) -> io::Result<String> {
@@ -231,5 +261,20 @@ mod tests {
     fn bus_ids_are_checked() {
         assert!(valid("1-3") && valid("12-10"));
         assert!(!valid("") && !valid("1-3 & calc") && !valid("--busid"));
+    }
+
+    #[test]
+    fn trusted_usbipd_only_resolves_inside_known_program_files() {
+        let base = std::env::temp_dir().join(format!("kiri-usb-trust-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let pf = base.join("Program Files");
+        let dir = pf.join("usbipd-win");
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("usbipd.exe");
+        std::fs::write(&exe, b"stub").unwrap();
+        assert_eq!(trusted_usbipd_in(&[pf.clone()]), Some(exe));
+        assert_eq!(trusted_usbipd_in(&[base.join("Other")]), None);
+        assert_eq!(trusted_usbipd_in(&[]), None);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

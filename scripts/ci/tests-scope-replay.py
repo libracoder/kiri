@@ -16,11 +16,13 @@ which makes the check stricter). Prints UNSOUND and exits 1 if a skipped
 system's code changed.
 """
 import argparse
+import contextlib
 import importlib.util
 import os
 import posixpath
 import subprocess
 import sys
+import tempfile
 
 _here = os.path.dirname(os.path.abspath(__file__))
 _spec = importlib.util.spec_from_file_location("tests_scope", os.path.join(_here, "tests-scope.py"))
@@ -225,29 +227,31 @@ def main():
     args = ap.parse_args()
     git = ts.Git()
     revs = git.run("rev-list", "--no-merges", f"--max-count={args.count}", args.ref).decode().split()
-    old_script = None
-    if args.old:
-        old_script = os.path.join(os.environ.get("TMPDIR", "/tmp"), "tests-scope-old.sh")
-        with open(old_script, "wb") as f:
-            f.write(git.run("show", f"{args.old}:scripts/ci/tests-scope.sh"))
-    letter = {"linux": "L", "windows": "W", "mac": "M"}
-    fmt = lambda s: "".join(letter[x] if x in s else "-" for x in ts.SYSTEMS)
-    totals = {"old": 0, "new": 0, "all": 0, "scripts": 0}
-    narrowed = []
-    print(f"{'commit':8}  {'old':3}  {'new':3}  {'files':>5}  subject")
-    for rev in revs:
-        subject = git.run("log", "-1", "--format=%s", rev).decode().strip()
-        changes, _ = ts.scope(git.snapshot(f"{rev}^"), git.snapshot(rev))
-        res = ts.outputs(changes)
-        new = {s for s in ts.SYSTEMS if res[s]}
-        old = old_scope(git, old_script, rev) if old_script else set(ts.SYSTEMS)
-        totals["old"] += len(old)
-        totals["new"] += len(new)
-        totals["all"] += 3
-        totals["scripts"] += res["scripts"]
-        print(f"{rev[:8]}  {fmt(old)}  {fmt(new)}  {len(changes):5}  {subject[:90]}")
-        if new != set(ts.SYSTEMS):
-            narrowed.append((rev, subject, old, new, changes))
+    with contextlib.ExitStack() as stack:
+        old_script = None
+        if args.old:
+            td = stack.enter_context(tempfile.TemporaryDirectory(prefix="kiri-scope-old-"))
+            old_script = os.path.join(td, "tests-scope-old.sh")
+            with open(old_script, "wb") as f:
+                f.write(git.run("show", f"{args.old}:scripts/ci/tests-scope.sh"))
+        letter = {"linux": "L", "windows": "W", "mac": "M"}
+        fmt = lambda s: "".join(letter[x] if x in s else "-" for x in ts.SYSTEMS)
+        totals = {"old": 0, "new": 0, "all": 0, "scripts": 0}
+        narrowed = []
+        print(f"{'commit':8}  {'old':3}  {'new':3}  {'files':>5}  subject")
+        for rev in revs:
+            subject = git.run("log", "-1", "--format=%s", rev).decode().strip()
+            changes, _ = ts.scope(git.snapshot(f"{rev}^"), git.snapshot(rev))
+            res = ts.outputs(changes)
+            new = {s for s in ts.SYSTEMS if res[s]}
+            old = old_scope(git, old_script, rev) if old_script else set(ts.SYSTEMS)
+            totals["old"] += len(old)
+            totals["new"] += len(new)
+            totals["all"] += 3
+            totals["scripts"] += res["scripts"]
+            print(f"{rev[:8]}  {fmt(old)}  {fmt(new)}  {len(changes):5}  {subject[:90]}")
+            if new != set(ts.SYSTEMS):
+                narrowed.append((rev, subject, old, new, changes))
     print()
     print(f"job-starts over {len(revs)} commits: every job {totals['all']}, old list {totals['old']}, tests-scope.py {totals['new']}"
           f" (plus the scripts job {totals['scripts']} times)")

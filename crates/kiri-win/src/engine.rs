@@ -1201,6 +1201,9 @@ fn set_pref(name: &str, value: Value) {
     if !matches!(name, "font" | "mono" | "scale" | "termH" | "termFs" | "termFont" | "domainsAsked" | "theme" | "accent" | "starAsked" | "updateAuto" | "lang" | "langAsked" | "closeButton" | "startAtLogin" | "stopOnQuit") {
         return;
     }
+    if name == "lang" && !value.as_str().is_some_and(crate::lang::valid_pick) {
+        return;
+    }
     let Some(path) = prefs_path() else { return };
     let mut p = prefs();
     p[name] = value;

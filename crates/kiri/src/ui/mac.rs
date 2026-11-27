@@ -25,6 +25,9 @@ thread_local! {
     /// The page, reachable from closures the engine thread schedules on the
     /// main queue. Only ever touched on the main thread.
     static WEBVIEW: RefCell<Option<Retained<WKWebView>>> = const { RefCell::new(None) };
+    /// Retained navigation/UI delegate for the live `WKWebView` (WebKit holds
+    /// weak references to its delegates).
+    static NAV_DELEGATE: RefCell<Option<Retained<NavigationDelegate>>> = const { RefCell::new(None) };
     /// The window, so the page can ask to be dragged or zoomed.
     static WINDOW: RefCell<Option<Retained<NSWindow>>> = const { RefCell::new(None) };
     /// The menu bar item; AppKit removes it once it is released.
@@ -134,22 +137,32 @@ fn make_window(mtm: MainThreadMarker, tx: Sender<Cmd>, autostart: bool, view: Op
 
 /// The page, in a new WebKit view of `frame`'s size.
 fn make_webview(mtm: MainThreadMarker, frame: NSRect, tx: Sender<Cmd>, autostart: bool, view: Option<String>) -> Retained<WKWebView> {
+    let nonce = super::generate_ipc_nonce();
     // SAFETY: WebKit objects created and configured on the main thread.
     unsafe {
         let config = WKWebViewConfiguration::new(mtm);
-        let handler = MessageHandler::new(mtm, tx, autostart, view);
+        let handler = MessageHandler::new(mtm, tx, autostart, view, nonce.clone());
         config
             .userContentController()
             .addScriptMessageHandler_name(ProtocolObject::from_ref(&*handler), &NSString::from_str("kiri"));
         let webview = WebView::new(mtm, frame, &config);
         webview.setAllowsLinkPreview(false);
+        let nav = NavigationDelegate::new(mtm);
+        let _: () = msg_send![&webview, setNavigationDelegate: &*nav];
+        let _: () = msg_send![&webview, setUIDelegate: &*nav];
+        NAV_DELEGATE.with(|d| *d.borrow_mut() = Some(nav));
         if cfg!(debug_assertions) {
             webview.setInspectable(true);
         }
         // Let the page paint its own background instead of white.
         let no: Retained<AnyObject> = msg_send![objc2::class!(NSNumber), numberWithBool: false];
         let _: () = msg_send![&webview, setValue: &*no, forKey: &*NSString::from_str("drawsBackground")];
-        webview.loadHTMLString_baseURL(&NSString::from_str(&super::assemble::page(PAGE, prefs()["lang"].as_str())), None);
+        let html = super::assemble::page(PAGE, prefs()["lang"].as_str())
+            .replacen("window.KIRI_LANG =", &format!("window.KIRI_NONCE=\"{nonce}\";window.KIRI_LANG ="), 1);
+        let base: Option<Retained<AnyObject>> =
+            msg_send![objc2::class!(NSURL), URLWithString: &*NSString::from_str(super::APP_ORIGIN_URL)];
+        let _: Option<Retained<AnyObject>> =
+            msg_send![&webview, loadHTMLString: &*NSString::from_str(&html), baseURL: base.as_deref()];
         Retained::into_super(webview)
     }
 }
@@ -165,7 +178,12 @@ fn release_page() {
     QUEUED.with(|q| *q.borrow_mut() = None);
     // SAFETY: main thread; the content controller holds the message
     // handler, which goes with the name it was added under.
-    unsafe { webview.configuration().userContentController().removeScriptMessageHandlerForName(&NSString::from_str("kiri")) };
+    unsafe {
+        let _: () = msg_send![&webview, setNavigationDelegate: Option::<&AnyObject>::None];
+        let _: () = msg_send![&webview, setUIDelegate: Option::<&AnyObject>::None];
+        webview.configuration().userContentController().removeScriptMessageHandlerForName(&NSString::from_str("kiri"));
+    }
+    NAV_DELEGATE.with(|d| *d.borrow_mut() = None);
     WINDOW.with(|w| {
         if let Some(window) = w.borrow().as_ref() {
             window.setContentView(None);
@@ -632,10 +650,23 @@ pub(super) fn font_families(mono: bool) -> Vec<String> {
     names
 }
 
+/// Whether `WKNavigationDelegate` permits navigating to `url` in `is_main_frame`.
+/// Only the initial embedded page load at `APP_ORIGIN_URL` is allowed; all
+/// external URLs, `file://` drops, `data:` URLs, and subframe navigations are cancelled.
+fn allow_navigation(is_main_frame: bool, url: Option<&str>) -> bool {
+    is_main_frame && url == Some(super::APP_ORIGIN_URL)
+}
+
+/// Whether a `WKScriptMessage` originates from our main-frame embedded document.
+fn allow_ipc_origin(is_main_frame: bool, protocol: Option<&str>, host: Option<&str>, port: isize) -> bool {
+    is_main_frame && protocol == Some("https") && host == Some("kiri.invalid") && port == 0
+}
+
 struct HandlerIvars {
     tx: Sender<Cmd>,
     autostart: bool,
     view: Option<String>,
+    nonce: String,
 }
 
 define_class!(
@@ -659,6 +690,18 @@ define_class!(
             // SAFETY: forwarding `willOpenMenu:withEvent:` to `WKWebView` with valid args.
             let _: () = unsafe { msg_send![super(self), willOpenMenu: menu, withEvent: event] };
         }
+
+        /// Blocks external file/URL drag-and-drop onto the WebView so a dropped
+        /// `.html` file or link can never navigate the privileged UI view.
+        #[unsafe(method(draggingEntered:))]
+        fn dragging_entered(&self, _sender: &AnyObject) -> usize {
+            0 // NSDragOperationNone
+        }
+
+        #[unsafe(method(performDragOperation:))]
+        fn perform_drag_operation(&self, _sender: &AnyObject) -> bool {
+            false
+        }
     }
 );
 
@@ -666,7 +709,62 @@ impl WebView {
     fn new(mtm: MainThreadMarker, frame: NSRect, config: &WKWebViewConfiguration) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(());
         // SAFETY: `WKWebView`'s designated initializer on a freshly allocated subclass instance.
-        unsafe { msg_send![super(this), initWithFrame: frame, configuration: config] }
+        let webview: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame, configuration: config] };
+        // SAFETY: AppKit `NSView::unregisterDraggedTypes` on our own view.
+        unsafe {
+            let _: () = msg_send![&webview, unregisterDraggedTypes];
+        }
+        webview
+    }
+}
+
+define_class!(
+    // SAFETY: NSObject has no subclassing requirements and this type has no Drop.
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "KiriNavigationDelegate"]
+    struct NavigationDelegate;
+
+    unsafe impl NSObjectProtocol for NavigationDelegate {}
+
+    impl NavigationDelegate {
+        #[unsafe(method(webView:decidePolicyForNavigationAction:decisionHandler:))]
+        fn decide_policy(&self, _web_view: &WKWebView, action: &AnyObject, decision_handler: &block2::DynBlock<dyn Fn(isize)>) {
+            // SAFETY: reading WKNavigationAction's targetFrame and request.URL on the main thread.
+            let allowed = unsafe {
+                let target: Option<Retained<AnyObject>> = msg_send![action, targetFrame];
+                let is_main = target.as_deref().is_some_and(|f| {
+                    let m: bool = msg_send![f, isMainFrame];
+                    m
+                });
+                let request: Option<Retained<AnyObject>> = msg_send![action, request];
+                let url: Option<Retained<AnyObject>> = request.as_deref().and_then(|r| msg_send![r, URL]);
+                let abs: Option<Retained<NSString>> = url.as_deref().and_then(|u| msg_send![u, absoluteString]);
+                allow_navigation(is_main, abs.as_ref().map(|s| s.to_string()).as_deref())
+            };
+            // WKNavigationActionPolicyCancel = 0, WKNavigationActionPolicyAllow = 1.
+            decision_handler.call((if allowed { 1 } else { 0 },));
+        }
+
+        /// Refuses `window.open` / `target="_blank"` popup WebViews.
+        #[unsafe(method(webView:createWebViewWithConfiguration:forNavigationAction:windowFeatures:))]
+        fn create_web_view(
+            &self,
+            _web_view: &WKWebView,
+            _config: &WKWebViewConfiguration,
+            _action: &AnyObject,
+            _features: &AnyObject,
+        ) -> *mut WKWebView {
+            std::ptr::null_mut()
+        }
+    }
+);
+
+impl NavigationDelegate {
+    fn new(mtm: MainThreadMarker) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(());
+        // SAFETY: NSObject's init on a freshly allocated object.
+        unsafe { msg_send![super(this), init] }
     }
 }
 
@@ -683,11 +781,34 @@ define_class!(
     unsafe impl WKScriptMessageHandler for MessageHandler {
         #[unsafe(method(userContentController:didReceiveScriptMessage:))]
         fn did_receive(&self, _controller: &WKUserContentController, message: &WKScriptMessage) {
+            // SAFETY: inspecting WKScriptMessage's frameInfo and securityOrigin on the main thread.
+            let origin_ok = unsafe {
+                let frame: Option<Retained<AnyObject>> = msg_send![message, frameInfo];
+                let Some(frame) = frame else { return };
+                let is_main: bool = msg_send![&*frame, isMainFrame];
+                let origin: Option<Retained<AnyObject>> = msg_send![&*frame, securityOrigin];
+                let Some(origin) = origin else { return };
+                let protocol: Option<Retained<NSString>> = msg_send![&*origin, protocol];
+                let host: Option<Retained<NSString>> = msg_send![&*origin, host];
+                let port: isize = msg_send![&*origin, port];
+                allow_ipc_origin(
+                    is_main,
+                    protocol.as_ref().map(|s| s.to_string()).as_deref(),
+                    host.as_ref().map(|s| s.to_string()).as_deref(),
+                    port,
+                )
+            };
+            if !origin_ok {
+                return;
+            }
             // SAFETY: reading the body of a message WebKit just delivered.
             let body = unsafe { message.body() };
             let Ok(text) = body.downcast::<NSString>() else { return };
             let ivars = self.ivars();
             let text = text.to_string();
+            if !super::check_ipc_nonce(&text, &ivars.nonce) {
+                return;
+            }
             // A page made again has loaded: what was sent meanwhile goes in now.
             if serde_json::from_str::<serde_json::Value>(&text).is_ok_and(|m| m["cmd"] == "ready") {
                 for js in QUEUED.with(|q| q.borrow_mut().take()).unwrap_or_default() {
@@ -700,8 +821,8 @@ define_class!(
 );
 
 impl MessageHandler {
-    fn new(mtm: MainThreadMarker, tx: Sender<Cmd>, autostart: bool, view: Option<String>) -> Retained<Self> {
-        let this = Self::alloc(mtm).set_ivars(HandlerIvars { tx, autostart, view });
+    fn new(mtm: MainThreadMarker, tx: Sender<Cmd>, autostart: bool, view: Option<String>, nonce: String) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(HandlerIvars { tx, autostart, view, nonce });
         // SAFETY: NSObject's init on a freshly allocated object.
         unsafe { msg_send![super(this), init] }
     }
@@ -848,9 +969,10 @@ define_class!(
             let tag: isize = sender.map_or(-1, |s| unsafe { msg_send![s, tag] });
             let Some((id, url)) = usize::try_from(tag).ok().and_then(|i| self.ivars().shown.borrow().get(i).cloned()) else { return };
             match url {
-                Some(url) => {
-                    let _ = std::process::Command::new("/usr/bin/open").arg(url).spawn();
+                Some(url) if super::allowed_open_url(&url) => {
+                    super::open(&url);
                 }
+                Some(_) => {}
                 None => {
                     show_window(self.mtm());
                     let mut ev = String::from(r#"{"type":"detail","id":"#);
@@ -983,5 +1105,31 @@ mod tests {
         assert!(press_for_drag(7, 1, || None).is_none());
         let fallback = press_for_drag(7, 1, || Some(down)).expect("current mouse-down fallback");
         assert_eq!(fallback.eventNumber(), 104);
+    }
+
+    #[test]
+    fn navigation_and_ipc_origin_are_locked_to_app_origin() {
+        assert!(super::allow_navigation(true, Some(super::super::APP_ORIGIN_URL)));
+        assert!(!super::allow_navigation(false, Some(super::super::APP_ORIGIN_URL)));
+        for bad in [
+            None,
+            Some(""),
+            Some("about:blank"),
+            Some("file:///tmp/evil.html"),
+            Some("https://example.com/"),
+            Some("https://kiri.invalid/other"),
+            Some("http://kiri.invalid/"),
+            Some("data:text/html,<script>1</script>"),
+        ] {
+            assert!(!super::allow_navigation(true, bad), "navigation allowed: {bad:?}");
+        }
+
+        assert!(super::allow_ipc_origin(true, Some("https"), Some("kiri.invalid"), 0));
+        assert!(!super::allow_ipc_origin(false, Some("https"), Some("kiri.invalid"), 0));
+        assert!(!super::allow_ipc_origin(true, Some("http"), Some("kiri.invalid"), 0));
+        assert!(!super::allow_ipc_origin(true, Some("file"), Some(""), 0));
+        assert!(!super::allow_ipc_origin(true, Some("https"), Some("evil.example"), 0));
+        assert!(!super::allow_ipc_origin(true, Some("https"), Some("kiri.invalid"), 443));
+        assert!(!super::allow_ipc_origin(true, None, None, 0));
     }
 }

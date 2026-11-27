@@ -120,14 +120,28 @@ fn curl() -> Command {
     c
 }
 
-/// Only HTTPS carries a release; in a debug build, `file:` is for trying a
-/// feed on disk.
+/// Official Kiri release host prefix enforced in release builds.
+const RELEASE_PREFIX: &str = "https://download.runkiri.com/";
+
+/// Only official HTTPS Kiri download URLs carry a release; in debug builds,
+/// `https://` and `file:///` are allowed for local testing.
 fn allowed_url(url: &str) -> io::Result<()> {
-    if url.starts_with("https://") || (cfg!(debug_assertions) && url.starts_with("file:///")) {
+    allowed_url_for(url, cfg!(debug_assertions))
+}
+
+fn allowed_url_for(url: &str, debug: bool) -> io::Result<()> {
+    if url.bytes().any(|b| b <= 0x20 || b == 0x7f || b == b'@' || b == b'\\') {
+        return Err(io::Error::other(format!("the update feed points at {url}, which contains invalid characters")));
+    }
+    if url.starts_with(RELEASE_PREFIX) || (debug && (url.starts_with("https://") || url.starts_with("file:///"))) {
         Ok(())
     } else {
-        Err(io::Error::other(format!("the update feed points at {url}, which is not https")))
+        Err(io::Error::other(format!("the update feed points at {url}, which is not an official Kiri HTTPS URL")))
     }
+}
+
+fn is_sha256(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 fn first_line(bytes: &[u8], fallback: &str) -> String {
@@ -135,7 +149,11 @@ fn first_line(bytes: &[u8], fallback: &str) -> String {
 }
 
 pub fn latest() -> io::Result<Release> {
-    let env_val = std::env::var("KIRI_UPDATE_URL").ok();
+    let env_val = if cfg!(debug_assertions) {
+        std::env::var("KIRI_UPDATE_URL").ok()
+    } else {
+        None
+    };
     let url = env_val.as_deref().map(str::trim).filter(|u| !u.is_empty()).unwrap_or(FEED);
     allowed_url(url)?;
     let out = curl().args(["-fsSL", "--max-time", "20", "--max-filesize", "65536", "--"]).arg(url).output()?;
@@ -212,12 +230,14 @@ fn fetch_and_check(release: &Release, dir: &Path, progress: &mut dyn FnMut(u64, 
     }
     progress(got, Some(total.unwrap_or(got)));
     let sum = crate::setup::sha256(&part)?;
-    if !sum.eq_ignore_ascii_case(release.sha256.trim()) {
+    let expected = release.sha256.trim().to_ascii_lowercase();
+    if !is_sha256(&expected) || !sum.eq_ignore_ascii_case(&expected) {
         return Err(io::Error::new(io::ErrorKind::InvalidData, format!("download does not match its SHA-256 (got {sum})")));
     }
     check(&part, &release.version)?;
     let msi = dir.join(format!("Kiri-{}.msi", release.version.trim_start_matches('v')));
     std::fs::rename(&part, &msi)?;
+    std::fs::write(dir.join("sha256"), &sum)?;
     std::fs::write(dir.join("version"), release.version.trim_start_matches('v'))?;
     // A fresh stage: an earlier helper's failure no longer counts against it.
     let _ = std::fs::remove_file(dir.join("attempted"));
@@ -231,7 +251,8 @@ fn staged_msi(version: &str) -> PathBuf {
 fn staged_in(dir: &Path) -> Option<String> {
     let raw = std::fs::read_to_string(dir.join("version")).ok()?;
     let version = raw.trim().strip_prefix('v').unwrap_or(raw.trim()).to_owned();
-    (is_version(&version) && dir.join(format!("Kiri-{version}.msi")).is_file() && newer(&version, CURRENT)).then_some(version)
+    let sha_ok = std::fs::read_to_string(dir.join("sha256")).ok().is_some_and(|s| is_sha256(s.trim()));
+    (is_version(&version) && sha_ok && dir.join(format!("Kiri-{version}.msi")).is_file() && newer(&version, CURRENT)).then_some(version)
 }
 
 /// The staged update's version, when there is one newer than this build.
@@ -239,14 +260,25 @@ pub fn staged() -> Option<String> {
     staged_in(&stage_dir())
 }
 
-/// The staged MSI, checked again (it sat on disk since the download).
-fn verify_staged() -> io::Result<(String, PathBuf)> {
+/// The staged MSI, checked again (SHA-256, Authenticode, and MSI metadata)
+/// because it sat in user-writable `%LOCALAPPDATA%\Kiri\update` since download.
+fn verify_staged() -> io::Result<(String, PathBuf, String)> {
     let Some(version) = staged() else {
         return Err(io::Error::other("no update is staged"));
     };
+    let expected = std::fs::read_to_string(stage_dir().join("sha256"))
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "staged update is missing its SHA-256"))?;
+    let expected = expected.trim().to_ascii_lowercase();
+    if !is_sha256(&expected) {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "staged update SHA-256 is invalid"));
+    }
     let msi = staged_msi(&version);
+    let actual = crate::setup::sha256(&msi)?;
+    if !actual.eq_ignore_ascii_case(&expected) {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("staged update SHA-256 mismatch (got {actual})")));
+    }
     check(&msi, &version)?;
-    Ok((version, msi))
+    Ok((version, msi, expected))
 }
 
 /// A helper was left to install the staged update; it removes the stage
@@ -261,15 +293,13 @@ pub fn attempted() -> bool {
 /// it as soon as this process has quit and opens the new Kiri. The caller
 /// quits. Returns the version.
 pub fn install_staged() -> io::Result<String> {
-    let (version, msi) = verify_staged()?;
+    let (version, msi, sha256) = verify_staged()?;
     std::fs::write(stage_dir().join("attempted"), "")?;
     // The helper is kiri.ps1 -Update, installed beside this exe: it waits
-    // for this process, upgrades silently and opens the new Kiri, logging
-    // to helper.log in the stage. A script file, not a script in this
-    // binary: a hidden PowerShell fed an encoded script that runs msiexec
-    // is what malware droppers do, and Defender's heuristics quarantined a
-    // kiri-win.exe that carried one. Checked against this build's SHA-256
-    // first, as setup checks the bundle's other files.
+    // for this process, re-verifies SHA-256 (+ Authenticode in release builds),
+    // upgrades silently and opens the new Kiri, logging to helper.log in the
+    // stage. Checked against this build's SHA-256 first, as setup checks the
+    // bundle's other files.
     let script = crate::setup::verified("kiri.ps1")?;
     // A hidden console of its own (CREATE_NO_WINDOW), not none: Windows
     // PowerShell does not come up without one. Out of any job this process
@@ -282,7 +312,11 @@ pub fn install_staged() -> io::Result<String> {
             .arg(&script)
             .args(["-Update", "-Msi"])
             .arg(&msi)
-            .arg("-WaitFor")
+            .args(["-Sha256", &sha256]);
+        if !cfg!(debug_assertions) || std::env::var_os("KIRI_ALLOW_UNSIGNED_UPDATE").is_none() {
+            cmd.arg("-RequireSigned");
+        }
+        cmd.arg("-WaitFor")
             .arg(std::process::id().to_string())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -299,6 +333,10 @@ pub fn install_staged() -> io::Result<String> {
 /// binary). Running containers stop; those with a restart policy start again.
 pub fn restart_engine() -> io::Result<()> {
     let distro = crate::setup::saved_distro().ok_or_else(|| io::Error::other("Kiri's Linux is not set up"))?;
+    // Verify bundled binaries against embedded KIRI_BUNDLE_SHA256 before copying
+    // or executing as root inside WSL.
+    crate::setup::verified("kiri")?;
+    crate::setup::verified("kiri-init")?;
     // The pkill patterns spell "kiri" as "[k]iri": `sh -c` runs with this
     // whole script on its command line, and a plain pattern would match
     // that too and kill the shell before it starts the daemon again.
@@ -309,7 +347,8 @@ pub fn restart_engine() -> io::Result<()> {
         format!("( {} ) >/dev/null || exit 1; pkill -f '/usr/local/bin/[k]iri bridge'; /usr/local/bin/kiri-start --restart", crate::wslsync::sync_script(&dir(), "", true))
     } else {
         // Ubuntu: install.sh installs the binaries and restarts the service.
-        let install = crate::setup::to_wsl(&distro, &dir().join("install.sh"))?;
+        let install_sh = crate::setup::verified("install.sh")?;
+        let install = crate::setup::to_wsl(&distro, &install_sh)?;
         format!("sh {} && pkill -f '/usr/local/bin/[k]iri bridge'; true", crate::wslsync::sh_quote(&install))
     };
     let mut cmd = crate::win::tool("wsl.exe");
@@ -340,10 +379,60 @@ pub fn restart_engine() -> io::Result<()> {
     }))
 }
 
+/// Verifies the Authenticode signature of `msi` via `WinVerifyTrust`.
+/// Release builds fail closed on any missing or invalid signature; debug builds
+/// allow `KIRI_ALLOW_UNSIGNED_UPDATE=1` for local installer testing.
+fn verify_authenticode(msi: &Path) -> io::Result<()> {
+    if cfg!(debug_assertions) && std::env::var_os("KIRI_ALLOW_UNSIGNED_UPDATE").is_some() {
+        return Ok(());
+    }
+    use windows_sys::Win32::Security::WinTrust::{
+        WinVerifyTrust, WINTRUST_ACTION_GENERIC_VERIFY_V2, WINTRUST_DATA, WINTRUST_DATA_0, WINTRUST_FILE_INFO, WTD_CHOICE_FILE,
+        WTD_REVOKE_WHOLECHAIN, WTD_STATEACTION_CLOSE, WTD_STATEACTION_VERIFY, WTD_UI_NONE,
+    };
+    let wide: Vec<u16> = msi.to_string_lossy().encode_utf16().chain([0]).collect();
+    let mut file_info = WINTRUST_FILE_INFO {
+        cbStruct: std::mem::size_of::<WINTRUST_FILE_INFO>() as u32,
+        pcwszFilePath: wide.as_ptr(),
+        hFile: 0,
+        pgKnownSubject: std::ptr::null_mut(),
+    };
+    let mut data = WINTRUST_DATA {
+        cbStruct: std::mem::size_of::<WINTRUST_DATA>() as u32,
+        pPolicyCallbackData: std::ptr::null_mut(),
+        pSIPClientData: std::ptr::null_mut(),
+        dwUIChoice: WTD_UI_NONE,
+        fdwRevocationChecks: WTD_REVOKE_WHOLECHAIN,
+        dwUnionChoice: WTD_CHOICE_FILE,
+        Anonymous: WINTRUST_DATA_0 { pFile: &mut file_info },
+        dwStateAction: WTD_STATEACTION_VERIFY,
+        hWVTStateData: 0,
+        pwszURLReference: std::ptr::null_mut(),
+        dwProvFlags: 0,
+        dwUIContext: 0,
+        pSignatureSettings: std::ptr::null_mut(),
+    };
+    let mut action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    // SAFETY: `wide`, `file_info`, `data`, and `action` live across both WinVerifyTrust calls.
+    let status = unsafe {
+        let res = WinVerifyTrust(-1isize, &mut action, (&mut data as *mut WINTRUST_DATA).cast());
+        data.dwStateAction = WTD_STATEACTION_CLOSE;
+        let _ = WinVerifyTrust(-1isize, &mut action, (&mut data as *mut WINTRUST_DATA).cast());
+        res
+    };
+    if status != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("the update installer does not have a valid Authenticode signature (0x{:08x})", status as u32),
+        ));
+    }
+    Ok(())
+}
+
 /// Whether `msi` is a Kiri installer of the version `promised`, newer than
-/// this build: a swapped feed could otherwise point at any MSI, or at an
-/// older, genuine one and its known bugs.
+/// this build, with a valid Authenticode signature.
 fn check(msi: &Path, promised: &str) -> io::Result<()> {
+    verify_authenticode(msi)?;
     let upgrade = msi_property(msi, "UpgradeCode")?;
     if !upgrade.trim().eq_ignore_ascii_case(UPGRADE_CODE) {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "the update is not a Kiri installer"));
@@ -615,6 +704,8 @@ pub fn sync_engine() -> io::Result<bool> {
     if !dir().join("kiri").is_file() || !dir().join("kiri-init").is_file() {
         return Ok(false); // a development build run from elsewhere
     }
+    crate::setup::verified("kiri")?;
+    crate::setup::verified("kiri-init")?;
     let distro = crate::setup::saved_distro().ok_or_else(|| io::Error::other("Kiri's Linux is not set up"))?;
     let script = crate::wslsync::sync_script(&dir(), "", distro == crate::setup::KIRI_DISTRO);
     let mut cmd = crate::win::tool("wsl.exe");
@@ -773,6 +864,10 @@ mod tests {
 
         std::fs::write(stage.join("Kiri-99.1.2.msi"), b"msi").unwrap();
         std::fs::write(stage.join("version"), "v99.1.2\n").unwrap();
+        assert_eq!(super::staged_in(&stage), None, "missing sha256 file must reject staged update");
+        std::fs::write(stage.join("sha256"), "not-a-hash").unwrap();
+        assert_eq!(super::staged_in(&stage), None, "invalid sha256 must reject staged update");
+        std::fs::write(stage.join("sha256"), "a".repeat(64)).unwrap();
         assert_eq!(super::staged_in(&stage).as_deref(), Some("99.1.2"));
         let _ = std::fs::remove_dir_all(&tmp);
 
@@ -798,6 +893,18 @@ mod tests {
         assert_eq!(super::allowed_url("file:///C:/t/latest.json").is_ok(), cfg!(debug_assertions));
         assert!(super::allowed_url("http://download.runkiri.com/latest-windows-x86_64.json").is_err());
         assert!(super::allowed_url("ftp://x/y").is_err());
+        // Release-mode host pinning rejects arbitrary HTTPS hosts, file://, userinfo, and backslashes.
+        assert!(super::allowed_url_for("https://download.runkiri.com/Kiri-0.3.0-x86_64.msi", false).is_ok());
+        for bad in [
+            "https://evil.example/Kiri-0.3.0-x86_64.msi",
+            "https://download.runkiri.com.evil.example/Kiri.msi",
+            "file:///C:/t/latest.json",
+            "https://download.runkiri.com/@evil",
+            r"https://download.runkiri.com\evil",
+            "https://download.runkiri.com/a b",
+        ] {
+            assert!(super::allowed_url_for(bad, false).is_err(), "release build accepted {bad:?}");
+        }
     }
 
     #[test]

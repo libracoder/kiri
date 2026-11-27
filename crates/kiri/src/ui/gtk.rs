@@ -20,7 +20,10 @@ use gtk::gdk_pixbuf::{Pixbuf, PixbufLoader};
 use gtk::glib;
 use gtk::prelude::*;
 use javascriptcore::ValueExt;
-use webkit2gtk::{SettingsExt, UserContentInjectedFrames, UserContentManager, UserContentManagerExt, UserScript, UserScriptInjectionTime, WebView, WebViewExt};
+use webkit2gtk::{
+    NavigationPolicyDecision, NavigationPolicyDecisionExt, PolicyDecisionExt, PolicyDecisionType, SettingsExt, URIRequestExt, UserContentInjectedFrames,
+    UserContentManager, UserContentManagerExt, UserScript, UserScriptInjectionTime, WebView, WebViewExt,
+};
 
 use super::{Cmd, PAGE, engine, prefs};
 
@@ -93,14 +96,33 @@ pub fn run(autostart: bool, view: Option<String>) -> io::Result<()> {
     Ok(())
 }
 
+/// Whether WebKitGTK may navigate to `uri` (only our embedded page origin).
+fn allow_navigation(uri: Option<&str>) -> bool {
+    uri == Some(super::APP_ORIGIN_URL)
+}
+
+/// Whether an IPC script message came from our embedded page.
+fn allow_ipc_uri(uri: Option<&str>) -> bool {
+    uri == Some(super::APP_ORIGIN_URL)
+}
+
 /// The page, in a new WebKitGTK view.
 fn make_webview(tx: mpsc::Sender<Cmd>, autostart: bool, view: Option<String>) -> WebView {
+    let nonce = super::generate_ipc_nonce();
     let content = UserContentManager::new();
-    content.add_script(&UserScript::new(SHIM, UserContentInjectedFrames::TopFrame, UserScriptInjectionTime::Start, &[], &[]));
+    let shim = format!("{SHIM}window.KIRI_NONCE=\"{nonce}\";");
+    content.add_script(&UserScript::new(&shim, UserContentInjectedFrames::TopFrame, UserScriptInjectionTime::Start, &[], &[]));
     content.register_script_message_handler("kiri");
     content.connect_script_message_received(Some("kiri"), move |_, message| {
+        let uri_ok = WEBVIEW.with(|v| v.borrow().as_ref().is_some_and(|wv| allow_ipc_uri(wv.uri().as_deref())));
+        if !uri_ok {
+            return;
+        }
         if let Some(text) = message.js_value().map(|v| v.to_str()) {
             let text = text.to_string();
+            if !super::check_ipc_nonce(&text, &nonce) {
+                return;
+            }
             // A page made again has loaded: what was sent meanwhile goes in now.
             if serde_json::from_str::<serde_json::Value>(&text).is_ok_and(|m| m["cmd"] == "ready") {
                 for js in QUEUED.with(|q| q.borrow_mut().take()).unwrap_or_default() {
@@ -111,6 +133,26 @@ fn make_webview(tx: mpsc::Sender<Cmd>, autostart: bool, view: Option<String>) ->
         }
     });
     let webview = WebView::with_user_content_manager(&content);
+    webview.connect_decide_policy(|_, decision, kind| match kind {
+        PolicyDecisionType::NewWindowAction => {
+            decision.ignore();
+            true
+        }
+        PolicyDecisionType::NavigationAction => {
+            let uri = decision
+                .downcast_ref::<NavigationPolicyDecision>()
+                .and_then(|d| d.navigation_action())
+                .and_then(|a| a.request())
+                .and_then(|r| r.uri());
+            if !allow_navigation(uri.as_deref()) {
+                decision.ignore();
+                return true;
+            }
+            false
+        }
+        _ => false,
+    });
+    webview.connect_create(|_, _| None);
     if let Some(settings) = WebViewExt::settings(&webview) {
         settings.set_enable_developer_extras(cfg!(debug_assertions));
         // Drawn on the CPU, not through OpenGL: a page of lists needs no GPU,
@@ -127,7 +169,7 @@ fn make_webview(tx: mpsc::Sender<Cmd>, autostart: bool, view: Option<String>) ->
         _ => desktop_dark(),
     };
     webview.set_background_color(&page_background(dark));
-    webview.load_html(&super::assemble::page(PAGE, super::prefs()["lang"].as_str()), None);
+    webview.load_html(&super::assemble::page(PAGE, super::prefs()["lang"].as_str()), Some(super::APP_ORIGIN_URL));
     webview
 }
 

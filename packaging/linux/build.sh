@@ -66,8 +66,9 @@ trap 'rm -rf "$work"' EXIT
 
 # The files both packages share, into a staging root.
 stage_engine() { # root unitdir
-  mkdir -p "$1/usr/bin" "$1/$2"
+  mkdir -p "$1/usr/bin" "$1/$2" "$1/usr/libexec/kiri"
   install -m 755 "$bindir/kiri" "$bindir/kiri-init" "$1/usr/bin/"
+  install -m 755 "$here/host-access-wrapper" "$1/usr/libexec/kiri/host-access"
   install -m 644 "$here/kiri.service" "$1/$2/kiri.service"
   # The password prompt for `kiri host-access` (the window's setup checklist).
   install -D -m 644 "$here/dev.kiri.host-access.policy" "$1/usr/share/polkit-1/actions/dev.kiri.host-access.policy"
@@ -174,7 +175,7 @@ EOF
 build_rpm() { # name full(0|1)
   local top=$work/rpm-$1
   mkdir -p "$top"/{SOURCES,BUILD,RPMS,SRPMS,SPECS}
-  cp "$bindir/kiri" "$bindir/kiri-init" "$here/kiri.service" "$here/dev.kiri.host-access.policy" "$here/kiri-nm.conf" "$root/LICENSE" "$root/NOTICE" "$top/SOURCES/"
+  cp "$bindir/kiri" "$bindir/kiri-init" "$here/kiri.service" "$here/dev.kiri.host-access.policy" "$here/host-access-wrapper" "$here/kiri-nm.conf" "$root/LICENSE" "$root/NOTICE" "$top/SOURCES/"
   local with=()
   if [ "$2" = 1 ]; then
     cp "$clidir/docker" "$top/SOURCES/docker"

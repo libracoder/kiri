@@ -58,7 +58,14 @@ if [ ! -d "$tdir" ] && [ -d "$old/release" -o -d "$old/x86_64-unknown-linux-musl
   for d in "$old"/*; do case "$(basename "$d")" in ????????????) ;; *) mv "$d" "$take/" ;; esac; done
   mv "$take" "$tdir"
 fi
+lock_args=()
+if [ "$profile" = release ]; then
+  if grep -m1 -q '^version = ".*-dev\.' Cargo.toml; then
+    cargo update --workspace --offline
+  fi
+  lock_args=(--locked)
+fi
 env "CC_${target//-/_}=$cc" "${link[@]}" CARGO_TARGET_DIR="$tdir" \
-  cargo build --profile "$profile" -p kiri -p kiri-init --target "$target"
+  cargo build --profile "$profile" "${lock_args[@]}" -p kiri -p kiri-init --target "$target"
 mkdir -p "$out"
 install -m 755 "$tdir/$target/$profile/kiri" "$tdir/$target/$profile/kiri-init" "$out/"

@@ -24,23 +24,36 @@ param(
   [switch]$IfSetUp,
   [switch]$Update,
   [string]$Msi,
+  [string]$Sha256,
+  [switch]$RequireSigned,
   [int]$WaitFor
 )
 $ErrorActionPreference = "Stop"
 
 # -Update: waits for the kiri-win that downloaded the MSI to quit (its files
-# are in use until then), upgrades silently (per user, no prompt; 3010 is
-# "done, restart Windows later"), clears the stage when that went through,
-# and opens the new Kiri. Each step goes to helper.log beside the MSI, which
-# stays, with msiexec's install.log, when the upgrade failed.
+# are in use until then), re-verifies SHA-256 (and Authenticode when required)
+# to close any disk-swap TOCTOU window, upgrades silently (per user, no prompt;
+# 3010 is "done, restart Windows later"), clears the stage when that went
+# through, and opens the new Kiri. Each step goes to helper.log beside the MSI,
+# which stays, with msiexec's install.log, when the upgrade failed.
 if ($Update) {
   if (-not $Msi) { throw "-Update needs -Msi" }
+  if (-not $Sha256 -or $Sha256 -notmatch '^[0-9a-fA-F]{64}$') { throw "-Update needs a valid 64-hex -Sha256" }
   $stage = Split-Path $Msi -Parent
   $helperLog = Join-Path $stage "helper.log"
   function Say($m) { Add-Content -LiteralPath $helperLog -Value "$(Get-Date -Format s) $m" }
   try {
     Say "waiting for kiri-win $WaitFor"
     while ($WaitFor -and (Get-Process -Id $WaitFor -ErrorAction SilentlyContinue)) { Start-Sleep -Milliseconds 200 }
+    if (-not (Test-Path -LiteralPath $Msi -PathType Leaf)) { throw "staged MSI is missing" }
+    $item = Get-Item -LiteralPath $Msi -Force
+    if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "staged MSI cannot be a reparse point" }
+    $gotHash = (Get-FileHash -LiteralPath $Msi -Algorithm SHA256).Hash
+    if ($gotHash -ine $Sha256) { throw "staged MSI SHA-256 mismatch (got $gotHash)" }
+    if ($RequireSigned) {
+      $sig = Get-AuthenticodeSignature -LiteralPath $Msi
+      if ($sig.Status -ne "Valid") { throw "staged MSI Authenticode signature invalid ($($sig.Status))" }
+    }
     Say "installing $Msi"
     $p = Start-Process -FilePath (Join-Path $env:SystemRoot "System32\msiexec.exe") -ArgumentList "/i", "`"$Msi`"", "/qn", "/norestart", "/L*V", "`"$(Join-Path $stage 'install.log')`"" -Wait -PassThru
     Say "msiexec exit $($p.ExitCode)"

@@ -52,7 +52,7 @@ host_test() { # name full(0|1)
   # starts the engine and lets an account in at once, by name on the socket's
   # access list, without it signing in again. Checked as that user with no
   # groups at all, as a session started before the change would be.
-  check "polkit action for the password prompt" "test -f /usr/share/polkit-1/actions/dev.kiri.host-access.policy"
+  check "polkit action points at dedicated host-access helper without auth_admin_keep" "test -f /usr/share/polkit-1/actions/dev.kiri.host-access.policy && test -x /usr/libexec/kiri/host-access && grep -q '/usr/libexec/kiri/host-access' /usr/share/polkit-1/actions/dev.kiri.host-access.policy && ! grep -q '/usr/bin/kiri' /usr/share/polkit-1/actions/dev.kiri.host-access.policy && ! grep -q 'auth_admin_keep' /usr/share/polkit-1/actions/dev.kiri.host-access.policy"
   check "NetworkManager leaves Kiri's interfaces alone" "grep -Fqx '[device-kiri]' /usr/lib/NetworkManager/conf.d/kiri.conf && grep -Fqx 'match-device=interface-name:kiri*,interface-name:kv?????????????,interface-name:kx??????????*' /usr/lib/NetworkManager/conf.d/kiri.conf && grep -Fqx 'managed=0' /usr/lib/NetworkManager/conf.d/kiri.conf && ! grep -Fqx '[keyfile]' /usr/lib/NetworkManager/conf.d/kiri.conf"
   userdel kiri-acl-test >/dev/null 2>&1; useradd --system --no-create-home kiri-acl-test
   userdel kiri-acl-other >/dev/null 2>&1; useradd --system --no-create-home kiri-acl-other

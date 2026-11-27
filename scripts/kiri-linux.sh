@@ -17,7 +17,7 @@ ALPINE_URL=https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/$arch/$ALPINE
 cache=${XDG_CACHE_HOME:-$HOME/.cache}/kiri-build
 mkdir -p "$cache"
 # The .part is this process's own: CI jobs on one machine share the cache.
-[ -f "$cache/$ALPINE" ] || { curl -fsSL --retry 3 -o "$cache/$ALPINE.$$.part" "$ALPINE_URL" && mv -f "$cache/$ALPINE.$$.part" "$cache/$ALPINE"; } || rm -f "$cache/$ALPINE.$$.part"
+[ -f "$cache/$ALPINE" ] || { curl -fsSL --proto '=https' --proto-redir '=https' --retry 3 -o "$cache/$ALPINE.$$.part" "$ALPINE_URL" && mv -f "$cache/$ALPINE.$$.part" "$cache/$ALPINE"; } || rm -f "$cache/$ALPINE.$$.part"
 echo "$ALPINE_SHA256  $cache/$ALPINE" | sha256sum -c - >/dev/null || { rm -f "$cache/$ALPINE"; echo "$ALPINE: SHA-256 mismatch" >&2; exit 1; }
 write_utc_tzif() {
   # Canonical RFC 8536 TZif2 binary for UTC (UTC0): v1 header+data (54 B),

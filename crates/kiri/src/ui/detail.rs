@@ -32,7 +32,7 @@ fn spawn(name: &str, f: impl FnOnce() + Send + 'static) {
 }
 
 pub fn inspect(id: String) {
-    spawn("kiri-inspect", move || match client::get(&format!("/containers/{id}/json")) {
+    spawn("kiri-inspect", move || match client::get(&format!("/containers/{}/json", super::segment_escape(&id))) {
         Ok(info) => emit(json!({"type": "inspect", "id": id, "info": info}).to_string()),
         Err(e) => emit(notice("error", &e.to_string())),
     });
@@ -44,8 +44,9 @@ pub fn logs(id: String) {
     stop_logs();
     let generation = LOGS_GEN.load(Ordering::SeqCst);
     spawn("kiri-logs", move || {
-        let tty = client::get(&format!("/containers/{id}/json")).is_ok_and(|v| v["Config"]["Tty"] == true);
-        let mut stream = match client::Stream::open(&format!("/containers/{id}/logs?follow=1&stdout=1&stderr=1&tail={}", super::lastlogs::LIVE_TAIL)) {
+        let esc = super::segment_escape(&id);
+        let tty = client::get(&format!("/containers/{esc}/json")).is_ok_and(|v| v["Config"]["Tty"] == true);
+        let mut stream = match client::Stream::open(&format!("/containers/{esc}/logs?follow=1&stdout=1&stderr=1&tail={}", super::lastlogs::LIVE_TAIL)) {
             Ok(s) => s,
             Err(e) => return emit(notice("error", &super::trf("Logs: {error}", &[("error", &e)]))),
         };
@@ -114,8 +115,9 @@ fn send_batch(id: &str, batch: &mut Vec<(bool, Vec<u8>)>) {
 /// `{type: "lastlogs", id, lines}`; no lines if the log can't be read.
 pub fn last_logs(id: String) {
     spawn("kiri-lastlogs", move || {
-        let tty = client::get(&format!("/containers/{id}/json")).is_ok_and(|v| v["Config"]["Tty"] == true);
-        let lines = client::request("GET", &format!("/containers/{id}/logs?stdout=1&stderr=1&tail={}", super::lastlogs::KEEP), None)
+        let esc = super::segment_escape(&id);
+        let tty = client::get(&format!("/containers/{esc}/json")).is_ok_and(|v| v["Config"]["Tty"] == true);
+        let lines = client::request("GET", &format!("/containers/{esc}/logs?stdout=1&stderr=1&tail={}", super::lastlogs::KEEP), None)
             .map(|r| super::lastlogs::lines(&r.body, tty, super::lastlogs::KEEP))
             .unwrap_or_default();
         emit(json!({"type": "lastlogs", "id": id, "lines": lines}).to_string());
@@ -136,7 +138,7 @@ pub fn stats(id: String) {
     stop_stats();
     let generation = STATS_GEN.load(Ordering::SeqCst);
     spawn("kiri-stats", move || {
-        let Ok(mut stream) = client::Stream::open(&format!("/containers/{id}/stats?stream=1")) else { return };
+        let Ok(mut stream) = client::Stream::open(&format!("/containers/{}/stats?stream=1", super::segment_escape(&id))) else { return };
         if let Ok(closer) = stream.closer() {
             *STATS.lock().unwrap_or_else(|e| e.into_inner()) = Some(closer);
         }
@@ -200,13 +202,25 @@ pub fn exec(id: String, cmd: String) {
     });
 }
 
+fn valid_terminal_container(name: &str) -> bool {
+    !name.is_empty() && !name.starts_with('-') && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+}
+
+fn terminal_command_line(docker: &Path, name: &str) -> io::Result<String> {
+    if !valid_terminal_container(name) {
+        return Err(io::Error::other("not a container name"));
+    }
+    let quoted_docker = docker.to_string_lossy().replace('\'', "'\\''");
+    Ok(format!("'{quoted_docker}' --context kiri exec -it -- {name} sh -c 'exec $(command -v bash || command -v sh)'"))
+}
+
 /// A full interactive shell in a terminal window (Terminal.app on the Mac), through the docker CLI.
 pub fn terminal(name: &str) -> io::Result<()> {
-    if !name.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b)) {
+    if !valid_terminal_container(name) {
         return Err(io::Error::other("not a container name"));
     }
     let docker = client::docker_cli().ok_or_else(|| io::Error::other("no docker CLI found"))?;
-    let line = format!("'{}' --context kiri exec -it {name} sh -c 'exec $(command -v bash || command -v sh)'", docker.display());
+    let line = terminal_command_line(&docker, name)?;
     // A .command file Terminal opens, rather than scripting Terminal, which
     // would make macOS ask for permission to control it. It removes itself.
     let dir = super::state_dir().ok_or_else(|| io::Error::other("HOME is not set"))?.join("run");
@@ -245,11 +259,18 @@ fn linux_terminal(file: &std::path::Path) -> io::Result<()> {
 /// never be listed as the container's.
 fn shown_path(name: &str, path: &str) -> io::Result<PathBuf> {
     #[cfg(target_os = "macos")]
-    if !crate::daemon::nfs::is_mounted() {
-        let dir = crate::daemon::nfs::mount_point().map_or_else(|_| "~/Kiri".into(), |d| d.display().to_string());
-        return Err(io::Error::other(format!("Container files show through {dir}, and the engine has nothing mounted there now. If {dir} has your own files in it, Kiri leaves them alone: move them and restart the engine.")));
+    {
+        if !crate::daemon::nfs::is_mounted() {
+            let dir = crate::daemon::nfs::mount_point().map_or_else(|_| "~/Kiri".into(), |d| d.display().to_string());
+            return Err(io::Error::other(format!("Container files show through {dir}, and the engine has nothing mounted there now. If {dir} has your own files in it, Kiri leaves them alone: move them and restart the engine.")));
+        }
+        host_path(name, path)
     }
-    host_path(name, path)
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (name, path);
+        Err(io::Error::other("Container file browsing is not available on Linux."))
+    }
 }
 
 fn host_path(name: &str, path: &str) -> io::Result<PathBuf> {
@@ -383,5 +404,15 @@ mod tests {
         assert!(super::host_path("web", "/etc/../../other").is_err());
         assert!(super::host_path("../web", "/").is_err());
         assert!(super::host_path("", "/").is_err());
+    }
+
+    #[test]
+    fn terminal_rejects_empty_and_option_like_names_and_quotes_single_quotes() {
+        assert!(super::terminal("").is_err());
+        assert!(super::terminal("-u").is_err());
+        assert!(super::terminal("--privileged").is_err());
+        assert!(super::terminal("a;id").is_err());
+        let line = super::terminal_command_line(std::path::Path::new("/Users/o'neil/docker"), "web_1").unwrap();
+        assert!(line.starts_with("'/Users/o'\\''neil/docker' --context kiri exec -it -- web_1 "), "{line}");
     }
 }

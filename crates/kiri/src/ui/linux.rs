@@ -229,7 +229,10 @@ pub mod onboarding {
     use std::process::{Command, Stdio};
 
     const SOCKET: &str = crate::client::SERVICE_SOCKET;
-    /// The package's command; pkexec wants a full path.
+    /// Dedicated polkit helper wrapper installed by the Linux packages; pkexec
+    /// authorizes only this path so other `kiri` subcommands cannot run as root.
+    const HOST_ACCESS_HELPER: &str = "/usr/libexec/kiri/host-access";
+    /// Fallback for unpackaged dev checkouts without the helper wrapper.
     const KIRI: &str = "/usr/bin/kiri";
 
     /// Each check's state for the page: "ok", "no" (fix it), "bad" (broken:
@@ -323,7 +326,13 @@ pub mod onboarding {
         if which("pkexec").is_none() {
             return Err(io::Error::other(format!("this system has no pkexec to ask for your password: in a terminal, run  sudo kiri host-access {}{user}", flags.iter().map(|f| format!("{f} ")).collect::<String>())));
         }
-        let out = Command::new("pkexec").arg(KIRI).arg("host-access").args(flags).arg(&user).stdin(Stdio::null()).output()?;
+        let mut cmd = Command::new("pkexec");
+        if Path::new(HOST_ACCESS_HELPER).is_file() {
+            cmd.arg(HOST_ACCESS_HELPER);
+        } else {
+            cmd.arg(KIRI).arg("host-access");
+        }
+        let out = cmd.args(flags).arg(&user).stdin(Stdio::null()).output()?;
         match out.status.code() {
             Some(0) | Some(10) => Ok(()),
             // pkexec: 126 the dialog was dismissed or the password refused, 127 not allowed.

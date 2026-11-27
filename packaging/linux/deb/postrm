@@ -17,7 +17,9 @@ case "$1" in
     # first, deepest first, so rm does not reach through a mount into the
     # live filesystem it came from; --one-file-system is the second guard.
     if command -v findmnt >/dev/null; then
-      findmnt -lrno TARGET 2>/dev/null | grep -E "^/var/lib/kiri(/|$)" | tac | xargs -r -n1 umount 2>/dev/null || true
+      findmnt -lrno TARGET 2>/dev/null | grep -E "^/var/lib/kiri(/|$)" | tac | while IFS= read -r target; do
+        [ -n "$target" ] && umount -- "$target" 2>/dev/null || true
+      done
     fi
     rm -rf --one-file-system /var/lib/kiri /var/lib/kiri-daemon /run/kiri
     getent group kiri >/dev/null && groupdel kiri || true

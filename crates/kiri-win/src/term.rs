@@ -170,8 +170,10 @@ fn end_running(console: Arc<Console>, process: Arc<OwnedHandle>) {
 /// its exit code.
 #[allow(clippy::type_complexity)]
 pub fn captured(program: &std::path::Path, args: &[&str]) -> std::io::Result<(std::sync::mpsc::Receiver<Vec<u8>>, Sender<Vec<u8>>, Box<dyn Fn() + Send + Sync>, std::sync::mpsc::Receiver<Option<i32>>)> {
-    let quote = |s: &str| if s.is_empty() || s.contains([' ', '\t', '"']) { format!("\"{}\"", s.replace('"', "\\\"")) } else { s.to_owned() };
-    let command = std::iter::once(quote(&program.to_string_lossy())).chain(args.iter().map(|a| quote(a))).collect::<Vec<_>>().join(" ");
+    let command = std::iter::once(crate::win::quote(&program.to_string_lossy()))
+        .chain(args.iter().map(|a| crate::win::quote(a)))
+        .collect::<Vec<_>>()
+        .join(" ");
     let (con_in, typed_w) = pipe()?;
     let (screen_r, con_out) = pipe()?;
     let mut hpc: HPCON = 0;
@@ -237,8 +239,7 @@ pub fn captured(program: &std::path::Path, args: &[&str]) -> std::io::Result<(st
 }
 
 fn system32(exe: &str) -> PathBuf {
-    let root = std::env::var_os("SystemRoot").map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
-    root.join("System32").join(exe)
+    crate::win::resolve(exe)
 }
 
 fn pwsh() -> Option<PathBuf> {
@@ -257,7 +258,7 @@ fn shells() -> Vec<Shell> {
     // Kiri's own distro runs the engine; Docker Desktop's aren't for logging into.
     for d in crate::setup::distros().unwrap_or_default() {
         let lower = d.to_ascii_lowercase();
-        if !lower.starts_with("kiri") && !lower.starts_with("docker-desktop") && d.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)) {
+        if !lower.starts_with("kiri") && !lower.starts_with("docker-desktop") && crate::wslsync::valid_distro_name(&d) {
             list.push(Shell { id: format!("wsl:{d}"), label: format!("WSL · {d}"), group: "WSL" });
         }
     }
@@ -266,11 +267,11 @@ fn shells() -> Vec<Shell> {
 
 /// The command line for a listed shell's id.
 fn command_line(id: &str) -> String {
-    let quoted = |p: PathBuf| format!("\"{}\"", p.display());
+    let quoted = |p: PathBuf| crate::win::quote(&p.to_string_lossy());
     match id {
-        "pwsh" => pwsh().map_or_else(|| quoted(system32(r"WindowsPowerShell\v1.0\powershell.exe")), quoted) + " -NoLogo",
-        "powershell" => quoted(system32(r"WindowsPowerShell\v1.0\powershell.exe")) + " -NoLogo",
-        // Distro names were checked to be plain in shells().
+        "pwsh" => pwsh().map_or_else(|| quoted(system32("powershell.exe")), quoted) + " -NoLogo",
+        "powershell" => quoted(system32("powershell.exe")) + " -NoLogo",
+        // Distro names were checked by wslsync::valid_distro_name in shells().
         _ if id.starts_with("wsl:") => format!("{} -d {} --cd ~", quoted(system32("wsl.exe")), &id[4..]),
         _ => quoted(system32("cmd.exe")),
     }
@@ -465,11 +466,12 @@ fn spawn(command: &str, hpc: HPCON) -> std::io::Result<OwnedHandle> {
 /// The clipboard's text, handed to `done` on a thread of its own.
 pub fn paste(done: impl FnOnce(String) + Send + 'static) {
     use windows_sys::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
-    use windows_sys::Win32::System::Memory::{GlobalLock, GlobalUnlock};
+    use windows_sys::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
     const CF_UNICODETEXT: u32 = 13;
     std::thread::spawn(move || {
-        // SAFETY: the clipboard is opened, read and closed here; the locked
-        // memory is a NUL-terminated UTF-16 string while it stays locked.
+        // SAFETY: the clipboard is opened, read and closed here; we bound the
+        // UTF-16 scan by both `GlobalSize(h) / 2` and `COPY_MAX` so malformed
+        // non-NUL-terminated or oversized clipboard data cannot OOB-read or OOM.
         let text = unsafe {
             // Another program may have it open for a moment.
             let mut opened = false;
@@ -486,10 +488,12 @@ pub fn paste(done: impl FnOnce(String) + Send + 'static) {
             let h = GetClipboardData(CF_UNICODETEXT);
             let mut text = String::new();
             if h != 0 {
+                let max_units = (GlobalSize(h as _) / 2).min(termwire::COPY_MAX);
                 let p = GlobalLock(h as _) as *const u16;
                 if !p.is_null() {
-                    let len = (0..).take_while(|&i| *p.add(i) != 0).count();
-                    text = String::from_utf16_lossy(std::slice::from_raw_parts(p, len));
+                    let slice = std::slice::from_raw_parts(p, max_units);
+                    let len = slice.iter().position(|&u| u == 0).unwrap_or(slice.len());
+                    text = String::from_utf16_lossy(&slice[..len]);
                     GlobalUnlock(h as _);
                 }
             }

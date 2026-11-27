@@ -27,15 +27,19 @@ grep -qs "^buildarch_compat: $(uname -m):" "$HOME/.rpmrc" || echo "buildarch_com
 bins=$(mktemp -d)
 trap 'rm -rf "$bins"' EXIT
 # Its own target dir: the same crate with another feature set would otherwise
-# rebuild over the engine's build each time. No --locked, as for the engine:
-# a test build sets Cargo.toml to <release>-dev.N, which changes the lock file.
+# rebuild over the engine's build each time. Refresh workspace member versions
+# offline first when a test build stamped Cargo.toml to <release>-dev.N, then
+# build with --locked so third-party dependencies cannot drift.
 window=
 if pkg-config --exists webkit2gtk-4.1 2>/dev/null; then
   [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
   # In ~/.cache, as the engine's is (scripts/windows-engine.sh): under WSL a
   # checkout on C: is slow for cargo's many small files.
   wtarget=$HOME/.cache/kiri-window-target/$(printf %s "$PWD" | sha256sum | cut -c1-12)
-  CARGO_TARGET_DIR=$wtarget cargo build --release -p kiri --features window
+  if grep -m1 -q '^version = ".*-dev\.' Cargo.toml; then
+    cargo update --workspace --offline
+  fi
+  CARGO_TARGET_DIR=$wtarget cargo build --release --locked -p kiri --features window
   window=$wtarget/release/kiri
 else
   echo "no libwebkit2gtk-4.1-dev: the packages have no window" >&2

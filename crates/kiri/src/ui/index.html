@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; font-src data:; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'">
 <title>Kiri</title>
 <style>
 /* Kiri window. Hand-written, no framework: only the rules this page uses. */
@@ -2642,7 +2643,9 @@ tr.usb-more > td { padding: 0; background: var(--panel); }
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);
-const send = (cmd, extra = {}) => window.webkit?.messageHandlers?.kiri?.postMessage(JSON.stringify({ cmd, ...extra }));
+const send = (cmd, extra = {}) => window.webkit?.messageHandlers?.kiri?.postMessage(JSON.stringify(window.KIRI_NONCE ? { cmd, ...extra, _n: window.KIRI_NONCE } : { cmd, ...extra }));
+window.addEventListener("dragover", (e) => e.preventDefault());
+window.addEventListener("drop", (e) => e.preventDefault());
 /* The window's language. Every word a person reads goes through tr(): the
    English text is the key, and lang/<tag>.json (spliced in by assemble.rs)
    maps it to the language picked in Settings → Appearance, or the system's
@@ -4002,7 +4005,8 @@ function filesView(d) {
 function localUrl(c, name) {
   const scheme = ui.https ? "https" : "http", r = ui.rports?.[scheme];
   if (r && (r.running === false || r.serving === false)) return "";
-  const chosen = (c.Labels?.["dev.kiri.domain"] || "").split(",")[0].trim().replace(/\.kiri\.local(host)?$/, "");
+  const rawChosen = (c.Labels?.["dev.kiri.domain"] || "").split(",")[0].trim().replace(/\.kiri\.local(host)?$/, "");
+  const chosen = /^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)*$/.test(rawChosen) ? rawChosen : "";
   const project = c.Labels?.["com.docker.compose.project"];
   const port = r && r.port !== r.default ? `:${r.port}` : "";
   return `${scheme}://${chosen || (project ? `${c.Labels["com.docker.compose.service"]}.${project}` : name)}.${ui.suffix}${port}`;

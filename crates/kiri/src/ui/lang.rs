@@ -81,6 +81,21 @@ fn words(tag: &str) -> Option<serde_json::Value> {
     Some(keys().iter().map(|k| m.get(*k).map_or(serde_json::Value::Null, |w| w.as_str().into())).collect())
 }
 
+/// Whether `pick` is a valid saved language setting: `"system"`, `"en"`, or one of [`FILES`].
+pub fn valid_pick(pick: &str) -> bool {
+    pick == "system" || pick == "en" || FILES.iter().any(|(tag, _)| *tag == pick)
+}
+
+/// Escapes JSON for safe splicing into an inline `<script>` tag: prevents
+/// `</script>` breakout (`<`/`>`) and JS line-separator syntax errors.
+/// Output remains valid RFC 8259 JSON.
+fn safe_inline_json(json: String) -> String {
+    json.replace('<', "\\u003c")
+        .replace('>', "\\u003e")
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029")
+}
+
 /// The words a page opens with, as one JS object literal: `{"en": [every
 /// English key], "<tag>": [its words, in the keys' order]}`, for the language
 /// `lang` (a tag [`resolve`] gave; "en" sends the keys alone). The keys go in
@@ -91,7 +106,7 @@ pub fn strings_js(lang: &str) -> String {
     if let Some(w) = words(lang) {
         out.insert(lang.into(), w);
     }
-    serde_json::Value::Object(out).to_string()
+    safe_inline_json(serde_json::Value::Object(out).to_string())
 }
 
 /// The host's answer to a page's `langwords`: JS that hands the page `tag`'s
@@ -167,8 +182,14 @@ pub fn should_ask(fresh: bool, prefs: &serde_json::Value, os: &[String]) -> bool
 /// Before the page's script: the system's languages and the saved pick, so
 /// the first paint is already in the right language.
 pub fn boot_js(pick: Option<&str>) -> String {
-    let v = serde_json::json!({ "os": os_languages(), "pick": pick.unwrap_or("system") });
-    format!("window.KIRI_LANG = {v};")
+    let os: Vec<String> = os_languages()
+        .into_iter()
+        .map(|s| s.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_')).collect::<String>())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let pick = pick.filter(|p| valid_pick(p)).unwrap_or("system");
+    let v = serde_json::json!({ "os": os, "pick": pick });
+    format!("window.KIRI_LANG = {};", safe_inline_json(v.to_string()))
 }
 
 /// Whether the language `tag` (one of [`FILES`]' or "en") is written right to left.
@@ -525,5 +546,26 @@ mod tests {
         assert_eq!(fill("تم بدء {name} على {ports}".into(), &[("name", &"web"), ("ports", &8080)]), "تم بدء \u{2068}web\u{2069} على 8080");
         assert_eq!(fill("من {cap}".into(), &[("cap", &"5.0 GB")]), "من \u{2068}5.0 GB\u{2069}");
         assert_eq!(fill("Started {name}".into(), &[("name", &"web")]), "Started web");
+    }
+
+    #[test]
+    fn boot_js_validates_pick_and_escapes_script_tags() {
+        assert!(valid_pick("system"));
+        assert!(valid_pick("en"));
+        assert!(valid_pick("pt-BR"));
+        assert!(!valid_pick("</script><script>alert(1)</script>"));
+        assert!(!valid_pick("klingon"));
+
+        let js = boot_js(Some("</script><script>alert(1)</script>"));
+        assert!(!js.contains("</script>"), "boot_js must not contain closing script tag: {js}");
+        assert!(!js.contains('<') && !js.contains('>'), "boot_js must not contain raw angle brackets: {js}");
+        let body = js.strip_prefix("window.KIRI_LANG = ").and_then(|s| s.strip_suffix(';')).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(parsed["pick"], "system");
+
+        let escaped = safe_inline_json("{\"x\":\"</script>\u{2028}\u{2029}\"}".into());
+        assert!(!escaped.contains('<') && !escaped.contains('>') && !escaped.contains('\u{2028}') && !escaped.contains('\u{2029}'));
+        let reparsed: serde_json::Value = serde_json::from_str(&escaped).unwrap();
+        assert_eq!(reparsed["x"], "</script>\u{2028}\u{2029}");
     }
 }

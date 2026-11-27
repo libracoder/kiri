@@ -164,6 +164,112 @@ fn menu_state() -> std::sync::MutexGuard<'static, MenuState> {
     MENU.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// The fixed RFC 6761 `.invalid` origin every platform's WebView serves the
+/// embedded UI page under: never resolves, provides a secure context, and lets
+/// navigation and IPC handlers reject any external or local-file document.
+pub(super) const APP_ORIGIN_URL: &str = "https://kiri.invalid/";
+
+/// Per-launch random hex nonce bound to a single WebView instance so even if a
+/// script somehow reached the message handler without the embedded page, it
+/// cannot invoke host IPC commands.
+pub(super) fn generate_ipc_nonce() -> String {
+    use std::io::Read;
+    let mut bytes = [0u8; 16];
+    let ok = std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut bytes)).is_ok();
+    if !ok {
+        static FALLBACK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
+        let n = FALLBACK.fetch_add(1, Ordering::Relaxed);
+        let pid = u64::from(std::process::id());
+        bytes[..8].copy_from_slice(&(t ^ (pid << 32)).to_le_bytes());
+        bytes[8..].copy_from_slice(&n.wrapping_mul(0x9e37_79b9_7f4a_7c15).to_le_bytes());
+    }
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Constant-time check that a WebView IPC message carries the expected nonce.
+pub(super) fn check_ipc_nonce(text: &str, expected: &str) -> bool {
+    if expected.is_empty() {
+        return false;
+    }
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else { return false };
+    let Some(got) = v.get("_n").and_then(|n| n.as_str()) else { return false };
+    let (a, b) = (got.as_bytes(), expected.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Whether `host` consists solely of valid RFC 1035/1123 DNS labels (`a-z`,
+/// `A-Z`, `0-9`, `-`, separated by `.`), preventing userinfo (`@`), ports (`:`),
+/// paths (`/`), queries (`?`), fragments (`#`), or backslashes in container labels.
+fn valid_dns_host(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 253
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
+}
+
+/// Whether `url` is allowed to be opened in the user's browser from the UI or
+/// menu bar: strict local container domains (`localhost`, `*.kiri.localhost`,
+/// `*.kiri.local` with optional numeric port and no `@` userinfo or `\`),
+/// Docker build-rule docs, or Kiri's fixed allowlist of links.
+pub(super) fn allowed_open_url(url: &str) -> bool {
+    if url.is_empty() || url.bytes().any(|b| b <= 0x20 || b == 0x7f || b == b'@' || b == b'\\') {
+        return false;
+    }
+    let local = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .map(|rest| rest.split(['/', '?', '#']).next().unwrap_or(""))
+        .is_some_and(|authority| {
+            let (host, port_ok) = match authority.split_once(':') {
+                Some((h, p)) => (h, !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) && p.parse::<u16>().is_ok_and(|n| n >= 1)),
+                None => (authority, true),
+            };
+            port_ok && (host == "localhost" || (valid_dns_host(host) && (host.ends_with(".kiri.localhost") || host.ends_with(".kiri.local"))))
+        });
+    let docs = url
+        .strip_prefix("https://docs.docker.com/go/")
+        .is_some_and(|rest| !rest.is_empty() && !rest.contains("..") && rest.bytes().all(|b| b.is_ascii_alphanumeric() || b"-/".contains(&b)));
+    local
+        || docs
+        || matches!(
+            url,
+            "https://runkiri.com"
+                | "https://runkiri.com/releases/"
+                | "https://runkiri.com/share/notice"
+                | "https://canestack.com"
+                | "https://discord.gg/K5A8wuqcC"
+                | "https://x.com/runkiri"
+                | "https://github.com/libracoder/kiri/issues/new"
+                | "https://github.com/libracoder/kiri"
+                | "https://github.com/anchore/grype"
+                | "https://login.docker.com/activate"
+                | "https://github.com/login/device"
+        )
+}
+
+/// Validates a USB device key coming from the UI before handing it to
+/// `crate::usb::ui_attach` / `ui_detach` (which interpolates it into an API path).
+fn valid_usb_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= 64
+        && !key.starts_with('-')
+        && !key.contains("..")
+        && key.bytes().all(|b| b.is_ascii_alphanumeric() || b":._-".contains(&b))
+}
+
 /// A container's local address, as the page builds it: its chosen
 /// `dev.kiri.domain`, else Compose's service.project, else its name.
 fn local_url(c: &serde_json::Value) -> Option<String> {
@@ -174,12 +280,16 @@ fn local_url(c: &serde_json::Value) -> Option<String> {
     let suffix = if crate::daemon::dns::installed() { "kiri.local" } else { "kiri.localhost" };
     let chosen = label("dev.kiri.domain").split(',').next().unwrap_or("").trim();
     let chosen = chosen.strip_suffix(".kiri.localhost").or_else(|| chosen.strip_suffix(".kiri.local")).unwrap_or(chosen);
+    let chosen = if valid_dns_host(chosen) { chosen } else { "" };
     let name = c["Names"][0].as_str().unwrap_or("").trim_start_matches('/');
     let host = match (chosen, label("com.docker.compose.project")) {
         (c, _) if !c.is_empty() => c.to_owned(),
         (_, p) if !p.is_empty() => format!("{}.{p}", label("com.docker.compose.service")),
         _ => name.to_owned(),
     };
+    if !valid_dns_host(&host) {
+        return None;
+    }
     let scheme = if crate::daemon::tls::trusted() { "https" } else { "http" };
     Some(format!("{scheme}://{host}.{suffix}"))
 }
@@ -329,9 +439,10 @@ fn engine(rx: Receiver<Cmd>, tx: Sender<Cmd>) {
                 });
             }
             Ok(Cmd::Container { action, id }) => {
+                let esc = segment_escape(&id);
                 let (method, path) = match action.as_str() {
-                    "remove" => ("DELETE", format!("/containers/{id}?force=1&v=1")),
-                    a @ ("start" | "stop" | "restart" | "pause" | "unpause") => ("POST", format!("/containers/{id}/{a}")),
+                    "remove" => ("DELETE", format!("/containers/{esc}?force=1&v=1")),
+                    a @ ("start" | "stop" | "restart" | "pause" | "unpause") => ("POST", format!("/containers/{esc}/{a}")),
                     _ => continue,
                 };
                 spawn_op(move || {
@@ -383,7 +494,7 @@ fn engine(rx: Receiver<Cmd>, tx: Sender<Cmd>) {
                 }
                 emit_docker_state();
             }),
-            Ok(Cmd::RemoveNetwork(id)) => spawn_op(move || act("rmnet", expect_ok(client::request("DELETE", &format!("/networks/{id}"), None)))),
+            Ok(Cmd::RemoveNetwork(id)) => spawn_op(move || act("rmnet", expect_ok(client::request("DELETE", &format!("/networks/{}", segment_escape(&id)), None)))),
             Ok(Cmd::Quit) | Err(RecvTimeoutError::Disconnected) => {
                 quit_with(
                     stop_on_quit(),
@@ -446,6 +557,29 @@ fn path_escape(s: &str) -> String {
     s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-._~:/@".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
 }
 
+/// Percent-encodes a single URL path segment (container/network IDs), escaping
+/// `/`, `:`, `@`, whitespace, and control characters so an ID cannot alter the
+/// HTTP request line or traverse to another endpoint.
+pub(super) fn segment_escape(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-._~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
+}
+
+/// Formats `path` as a `file://` URI with `'`, `\`, whitespace, `%`, `?`, `#`,
+/// and non-unreserved bytes percent-encoded so it is safe inside a D-Bus
+/// GVariant string literal (`['<uri>']`).
+fn file_uri(path: &std::path::Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    let mut out = String::from("file://");
+    for &b in path.as_os_str().as_bytes() {
+        if b.is_ascii_alphanumeric() || b"/-._~".contains(&b) {
+            out.push(b as char);
+        } else {
+            let _ = write!(out, "%{b:02X}");
+        }
+    }
+    out
+}
+
 /// Opens a URL, file or folder the way the system would on a double-click.
 pub(crate) fn open(target: impl AsRef<std::ffi::OsStr>) {
     let opener = if cfg!(target_os = "macos") { "/usr/bin/open" } else { "xdg-open" };
@@ -459,7 +593,7 @@ pub(crate) fn reveal(path: &std::path::Path) {
         let _ = std::process::Command::new("/usr/bin/open").arg("-R").arg(path).spawn();
         return;
     }
-    let uri = format!("file://{}", path.display());
+    let uri = file_uri(path);
     let shown = std::process::Command::new("gdbus")
         .args(["call", "--session", "--dest", "org.freedesktop.FileManager1", "--object-path", "/org/freedesktop/FileManager1"])
         .args(["--method", "org.freedesktop.FileManager1.ShowItems", &format!("['{uri}']"), ""])
@@ -658,6 +792,9 @@ fn page_gone() {
 
 fn set_pref(name: &str, value: serde_json::Value) {
     if !matches!(name, "font" | "mono" | "scale" | "termH" | "termFs" | "termFont" | "domainsAsked" | "theme" | "accent" | "importSeen" | "updateAuto" | "updateSkip" | "updateSnoozeUntil" | "columnWidths" | "crashReports" | "ctxSnooze" | "ctxBack" | "logSize" | "starAsked" | "setupSkip" | "lang" | "langAsked" | "closeButton" | "startAtLogin" | "stopOnQuit") {
+        return;
+    }
+    if name == "lang" && !value.as_str().is_some_and(lang::valid_pick) {
         return;
     }
     let Some(path) = prefs_path() else { return };
@@ -1396,8 +1533,9 @@ fn published(b: &serde_json::Value) -> Option<String> {
 
 /// Saves a container's ports and says where it is reachable now.
 fn set_ports(id: &str, ports: serde_json::Value) -> io::Result<()> {
-    expect_ok(client::request("POST", &format!("/kiri/containers/{id}/ports"), Some(&serde_json::json!({"ports": ports}))))?;
-    let info = client::get(&format!("/containers/{id}/json"))?;
+    let esc = segment_escape(id);
+    expect_ok(client::request("POST", &format!("/kiri/containers/{esc}/ports"), Some(&serde_json::json!({"ports": ports}))))?;
+    let info = client::get(&format!("/containers/{esc}/json"))?;
     let mut now: Vec<String> = Vec::new();
     if let Some(map) = info["NetworkSettings"]["Ports"].as_object() {
         for (inner, list) in map {
@@ -1416,12 +1554,13 @@ fn set_ports(id: &str, ports: serde_json::Value) -> io::Result<()> {
 /// A container's new environment. The engine keeps the container, files and
 /// all, and restarts it if it was running.
 fn set_env(id: &str, env: Vec<String>) -> io::Result<()> {
-    let r = client::request("POST", &format!("/kiri/containers/{id}/env"), Some(&serde_json::json!({"env": env})))?;
+    let esc = segment_escape(id);
+    let r = client::request("POST", &format!("/kiri/containers/{esc}/env"), Some(&serde_json::json!({"env": env})))?;
     if r.status == 404 && !r.error().contains("No such container") {
         return Err(io::Error::other("This engine can't change a container's environment yet. Restart the engine (Settings → Engine) and try again."));
     }
     expect_ok(Ok(r))?;
-    let info = client::get(&format!("/containers/{id}/json"))?;
+    let info = client::get(&format!("/containers/{esc}/json"))?;
     let name = info["Name"].as_str().unwrap_or_default().trim_start_matches('/');
     let text = if info["State"]["Running"].as_bool() == Some(true) { trf("{name} restarted with the new environment", &[("name", &name)]) } else { trf("{name} has the new environment", &[("name", &name)]) };
     emit(notice("ok", &text));
@@ -1443,7 +1582,7 @@ fn run_image(image: &str, env: &[String]) -> io::Result<()> {
         Err(e) if !own.is_empty() && e.to_string().contains("already allocated") => create_and_start(image, &[], env)?,
         r => r?,
     };
-    let info = client::get(&format!("/containers/{id}/json"))?;
+    let info = client::get(&format!("/containers/{}/json", segment_escape(&id)))?;
     let name = info["Name"].as_str().unwrap_or_default().trim_start_matches('/').to_owned();
     // Just the name: the container's page says where it answers.
     let published = info["NetworkSettings"]["Ports"].as_object().is_some_and(|m| m.values().any(|l| l.as_array().is_some_and(|l| !l.is_empty())));
@@ -2144,6 +2283,80 @@ mod tests {
         assert!(super::brands::IMAGES.windows(2).all(|w| w[0].0 < w[1].0));
         assert!(super::brands::BRANDS.windows(2).all(|w| w[0].0 < w[1].0));
     }
+
+    #[test]
+    fn allowed_open_url_blocks_userinfo_backslash_and_bad_ports() {
+        for good in [
+            "http://localhost",
+            "http://localhost:8080/path?x=1#top",
+            "https://web.kiri.local",
+            "http://api.kiri.localhost:8080/",
+            "https://docs.docker.com/go/dockerfile/rule/from-as-casing/",
+            "https://runkiri.com",
+            "https://github.com/libracoder/kiri",
+        ] {
+            assert!(super::allowed_open_url(good), "expected allowed: {good}");
+        }
+        for bad in [
+            "",
+            "http://localhost:80@evil.example/",
+            "https://a.kiri.local:x@evil.example/phish#",
+            "http://a.kiri.local:x@evil.example/phish#.kiri.localhost",
+            r"http://localhost\evil.example",
+            "http://localhost:notaport/",
+            "http://localhost:0/",
+            "http://localhost:99999/",
+            "http://evil.example/a.kiri.local",
+            "https://docs.docker.com/go/../evil",
+            "javascript:alert(1)",
+            "file:///etc/passwd",
+            "http://web.kiri.local\nX-Inject: 1",
+        ] {
+            assert!(!super::allowed_open_url(bad), "expected blocked: {bad}");
+        }
+    }
+
+    #[test]
+    fn local_url_ignores_malicious_domain_labels() {
+        let evil = serde_json::json!({
+            "Names": ["/web"],
+            "Ports": [{"PublicPort": 8080}],
+            "Labels": {"dev.kiri.domain": "a.kiri.local:x@evil.example/phish#"}
+        });
+        let u = super::local_url(&evil).unwrap();
+        assert!(!u.contains('@') && !u.contains("evil.example"), "got {u}");
+        assert!(u.contains("://web.kiri."), "got {u}");
+
+        let ok = serde_json::json!({
+            "Names": ["/web"],
+            "Ports": [{"PublicPort": 8080}],
+            "Labels": {"dev.kiri.domain": "app.team.kiri.local"}
+        });
+        let u = super::local_url(&ok).unwrap();
+        assert!(u.contains("://app.team.kiri."), "got {u}");
+    }
+
+    #[test]
+    fn ipc_nonce_and_usb_key_and_file_uri_are_hardened() {
+        let nonce = super::generate_ipc_nonce();
+        assert_eq!(nonce.len(), 32);
+        let good = serde_json::json!({"cmd": "refresh", "_n": nonce}).to_string();
+        assert!(super::check_ipc_nonce(&good, &nonce));
+        assert!(!super::check_ipc_nonce(r#"{"cmd":"refresh"}"#, &nonce));
+        assert!(!super::check_ipc_nonce(r#"{"cmd":"refresh","_n":"wrong"}"#, &nonce));
+
+        assert!(super::valid_usb_key("0x02114000"));
+        assert!(super::valid_usb_key("1532:00d7"));
+        for bad in ["", "-x", "../other", "0x1/../../x", "0x1?a=1", "0x1 a", "0x1\r\n"] {
+            assert!(!super::valid_usb_key(bad), "accepted bad usb key: {bad:?}");
+        }
+
+        let uri = super::file_uri(std::path::Path::new("/tmp/o'neil\\a b.txt"));
+        assert_eq!(uri, "file:///tmp/o%27neil%5Ca%20b.txt");
+        assert!(!uri.contains('\'') && !uri.contains('\\') && !uri.contains(' '));
+
+        assert_eq!(super::segment_escape("a/../b c\r\n"), "a%2F..%2Fb%20c%0D%0A");
+    }
 }
 
 /// A command from the page. `autostart` and `view` are the window's: the
@@ -2286,6 +2499,10 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
         // Attach asks for the password the first time (the USB helper).
         "usbattach" | "usbdetach" => {
             let (attach, key) = (msg.cmd == "usbattach", msg.name);
+            if !valid_usb_key(&key) {
+                emit(serde_json::json!({"type": "usbdone", "key": key, "error": "invalid USB device identifier"}).to_string());
+                return;
+            }
             std::thread::spawn(move || {
                 let r = if attach { crate::usb::ui_attach(&key) } else { crate::usb::ui_detach(&key) };
                 match r {
@@ -2853,10 +3070,7 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
         }
         // Only the container's own addresses: a page cannot open arbitrary URLs.
         "open" => {
-            let local = msg.name.strip_prefix("http://").or_else(|| msg.name.strip_prefix("https://")).and_then(|r| r.split(['/', ':']).next()).is_some_and(|h| h == "localhost" || h.ends_with(".kiri.localhost") || h.ends_with(".kiri.local"));
-            // A build warning's rule page (docs.docker.com/go/dockerfile/rule/…).
-            let docs = msg.name.strip_prefix("https://docs.docker.com/go/").is_some_and(|rest| rest.bytes().all(|b| b.is_ascii_alphanumeric() || b"-/".contains(&b)));
-            if local || docs || msg.name == "https://runkiri.com" || msg.name == "https://runkiri.com/releases/" || msg.name == "https://runkiri.com/share/notice" || msg.name == "https://canestack.com" || msg.name == "https://discord.gg/K5A8wuqcC" || msg.name == "https://x.com/runkiri" || msg.name == "https://github.com/libracoder/kiri/issues/new" || msg.name == "https://github.com/libracoder/kiri" || msg.name == "https://github.com/anchore/grype" || msg.name == "https://login.docker.com/activate" || msg.name == "https://github.com/login/device" {
+            if allowed_open_url(&msg.name) {
                 open(&msg.name);
             }
             Ok(())

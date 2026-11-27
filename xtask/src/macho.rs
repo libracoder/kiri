@@ -22,15 +22,25 @@ pub fn restamp_uuid(bin: &mut [u8], bundle_id: &str) -> io::Result<()> {
         m @ (0xcafe_babe | 0xcafe_babf) => {
             let wide = m == 0xcafe_babf;
             let n = be(4)? as usize;
+            let entry_size = if wide { 32usize } else { 20usize };
+            let table_end = n
+                .checked_mul(entry_size)
+                .and_then(|bytes| 8usize.checked_add(bytes))
+                .ok_or_else(|| bad("fat header count overflow"))?;
+            if table_end > bin.len() {
+                return Err(bad("fat header truncated"));
+            }
             let mut slices = Vec::with_capacity(n);
             for i in 0..n {
-                let e = 8 + i * if wide { 32 } else { 20 };
+                let e = 8 + i * entry_size;
                 let (off, size) = if wide {
                     (read_u64(bin, e + 8)?, read_u64(bin, e + 16)?)
                 } else {
                     (u64::from(be(e + 8)?), u64::from(be(e + 12)?))
                 };
-                slices.push((off as usize, size as usize));
+                let off = usize::try_from(off).map_err(|_| bad("fat slice offset overflow"))?;
+                let size = usize::try_from(size).map_err(|_| bad("fat slice size overflow"))?;
+                slices.push((off, size));
             }
             for (off, size) in slices {
                 let end = off.checked_add(size).filter(|&e| e <= bin.len()).ok_or_else(|| bad("fat slice out of range"))?;
@@ -44,24 +54,31 @@ pub fn restamp_uuid(bin: &mut [u8], bundle_id: &str) -> io::Result<()> {
 
 fn restamp_thin(bin: &mut [u8], bundle_id: &str) -> io::Result<()> {
     let header = match read_u32(bin, 0, false)? {
-        0xfeed_facf => 32,
-        0xfeed_face => 28,
+        0xfeed_facf => 32usize,
+        0xfeed_face => 28usize,
         _ => return Err(bad("not a little-endian Mach-O")),
     };
     let ncmds = read_u32(bin, 16, false)?;
     let mut at = header;
     for _ in 0..ncmds {
-        let (cmd, size) = (read_u32(bin, at, false)?, read_u32(bin, at + 4, false)? as usize);
+        let size_at = at.checked_add(4).ok_or_else(|| bad("load command offset overflow"))?;
+        let (cmd, size) = (read_u32(bin, at, false)?, read_u32(bin, size_at, false)? as usize);
         if size < 8 {
             return Err(bad("load command too small"));
         }
+        let next = at.checked_add(size).ok_or_else(|| bad("load command size overflow"))?;
+        if next > bin.len() {
+            return Err(bad("load command out of range"));
+        }
         if cmd == LC_UUID {
-            let uuid = bin.get_mut(at + 8..at + 24).ok_or_else(|| bad("LC_UUID out of range"))?;
+            let start = at.checked_add(8).ok_or_else(|| bad("LC_UUID offset overflow"))?;
+            let end = at.checked_add(24).ok_or_else(|| bad("LC_UUID offset overflow"))?;
+            let uuid = bin.get_mut(start..end).ok_or_else(|| bad("LC_UUID out of range"))?;
             let new = derive(uuid.try_into().expect("16 bytes"), bundle_id);
             uuid.copy_from_slice(&new);
             return Ok(());
         }
-        at += size;
+        at = next;
     }
     Err(bad("no LC_UUID"))
 }
@@ -82,12 +99,14 @@ fn derive(old: [u8; 16], bundle_id: &str) -> [u8; 16] {
 }
 
 fn read_u32(b: &[u8], at: usize, big: bool) -> io::Result<u32> {
-    let v: [u8; 4] = b.get(at..at + 4).ok_or_else(|| bad("truncated"))?.try_into().expect("4 bytes");
+    let end = at.checked_add(4).ok_or_else(|| bad("truncated"))?;
+    let v: [u8; 4] = b.get(at..end).ok_or_else(|| bad("truncated"))?.try_into().expect("4 bytes");
     Ok(if big { u32::from_be_bytes(v) } else { u32::from_le_bytes(v) })
 }
 
 fn read_u64(b: &[u8], at: usize) -> io::Result<u64> {
-    let v: [u8; 8] = b.get(at..at + 8).ok_or_else(|| bad("truncated"))?.try_into().expect("8 bytes");
+    let end = at.checked_add(8).ok_or_else(|| bad("truncated"))?;
+    let v: [u8; 8] = b.get(at..end).ok_or_else(|| bad("truncated"))?.try_into().expect("8 bytes");
     Ok(u64::from_be_bytes(v))
 }
 
@@ -99,20 +118,25 @@ fn bad(why: &str) -> io::Error {
 /// The UUID of a thin Mach-O, for tests and the build's log line.
 pub fn uuid_of(bin: &[u8]) -> Option<[u8; 16]> {
     let header = match read_u32(bin, 0, false).ok()? {
-        0xfeed_facf => 32,
-        0xfeed_face => 28,
+        0xfeed_facf => 32usize,
+        0xfeed_face => 28usize,
         _ => return None,
     };
     let mut at = header;
     for _ in 0..read_u32(bin, 16, false).ok()? {
-        let (cmd, size) = (read_u32(bin, at, false).ok()?, read_u32(bin, at + 4, false).ok()? as usize);
-        if cmd == LC_UUID {
-            return bin.get(at + 8..at + 24)?.try_into().ok();
-        }
+        let size_at = at.checked_add(4)?;
+        let (cmd, size) = (read_u32(bin, at, false).ok()?, read_u32(bin, size_at, false).ok()? as usize);
         if size < 8 {
             return None;
         }
-        at += size;
+        let next = at.checked_add(size)?;
+        if next > bin.len() {
+            return None;
+        }
+        if cmd == LC_UUID {
+            return bin.get(at.checked_add(8)?..at.checked_add(24)?)?.try_into().ok();
+        }
+        at = next;
     }
     None
 }
@@ -196,6 +220,18 @@ mod tests {
         let mut no_uuid = thin();
         no_uuid[32 + 16..32 + 20].copy_from_slice(&0x2u32.to_le_bytes()); // LC_UUID -> LC_SYMTAB
         assert!(restamp_uuid(&mut no_uuid, "x").is_err());
+    }
+
+    #[test]
+    fn corrupt_fat_header_and_overflowing_load_command_are_refused() {
+        let mut huge_fat = vec![0xca, 0xfe, 0xba, 0xbe, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0];
+        assert!(restamp_uuid(&mut huge_fat, "dev.kiri.app.test").is_err());
+        let mut huge_fat64 = vec![0xca, 0xfe, 0xba, 0xbf, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0];
+        assert!(restamp_uuid(&mut huge_fat64, "dev.kiri.app.test").is_err());
+
+        let mut bad_cmd = thin();
+        bad_cmd[36..40].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(restamp_uuid(&mut bad_cmd, "dev.kiri.app.test").is_err());
     }
 
     /// The xtask binary itself is a real Mach-O on a Mac: restamping it keeps

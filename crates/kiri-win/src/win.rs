@@ -131,7 +131,7 @@ pub fn elevated(program: &Path, args: &[&str]) -> io::Result<u32> {
 /// One argument as Windows' command-line parsing (CommandLineToArgvW, and
 /// PowerShell's) reads it back: quoted when it has a space, tab or quote,
 /// with backslashes doubled only before a quote.
-fn quote(arg: &str) -> String {
+pub(crate) fn quote(arg: &str) -> String {
     if !arg.is_empty() && !arg.contains([' ', '\t', '"']) {
         return arg.to_owned();
     }

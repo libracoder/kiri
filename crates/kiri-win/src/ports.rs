@@ -17,7 +17,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, SocketAddrV4, SocketAddrV6, TcpListener, TcpStream, UdpSocket};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -31,6 +31,8 @@ const UDP_POLL: Duration = Duration::from_millis(250);
 const TCP_ACCEPT_POLL: Duration = Duration::from_millis(100);
 /// Maximum concurrent UDP client sessions per published UDP port.
 const MAX_UDP_SESSIONS: usize = 1024;
+/// Maximum concurrent relayed TCP connections per published TCP port.
+const MAX_TCP_CONNS: usize = 512;
 /// Connect timeout when dialing the WSL 2 `eth0` target for a forwarded TCP connection.
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -203,16 +205,111 @@ pub struct TcpForwarder {
     thread: Option<JoinHandle<()>>,
 }
 
+#[cfg(windows)]
+fn bind_winsock_exclusive(bind_addr: SocketAddr, sock_type: i32, proto: i32, listen_backlog: Option<i32>) -> io::Result<std::os::windows::io::RawSocket> {
+    use windows_sys::Win32::Networking::WinSock::{
+        bind, closesocket, listen, setsockopt, socket, WSAStartup, AF_INET, AF_INET6, IN6_ADDR, IN6_ADDR_0, INVALID_SOCKET, IN_ADDR, IN_ADDR_0,
+        SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_IN6_0, SOL_SOCKET, SO_REUSEADDR, WSADATA,
+    };
+    const SO_EXCLUSIVEADDRUSE: i32 = !SO_REUSEADDR;
+    // SAFETY: plain Winsock calls; socket is closed on every error path.
+    unsafe {
+        let mut data: WSADATA = std::mem::zeroed();
+        if WSAStartup(0x0202, &mut data) != 0 {
+            return Err(io::Error::other("Winsock did not start"));
+        }
+        let family = if bind_addr.is_ipv6() { AF_INET6 } else { AF_INET };
+        let s = socket(i32::from(family), sock_type, proto);
+        if s == INVALID_SOCKET {
+            return Err(io::Error::last_os_error());
+        }
+        let one: i32 = 1;
+        if setsockopt(s, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (&one as *const i32).cast(), 4) != 0 {
+            let e = io::Error::last_os_error();
+            closesocket(s);
+            return Err(e);
+        }
+        let bound = match bind_addr {
+            SocketAddr::V4(v4) => {
+                let addr = SOCKADDR_IN {
+                    sin_family: AF_INET,
+                    sin_port: v4.port().to_be(),
+                    sin_addr: IN_ADDR { S_un: IN_ADDR_0 { S_addr: u32::from_ne_bytes(v4.ip().octets()) } },
+                    sin_zero: [0; 8],
+                };
+                bind(s, (&addr as *const SOCKADDR_IN).cast::<SOCKADDR>(), std::mem::size_of::<SOCKADDR_IN>() as i32)
+            }
+            SocketAddr::V6(v6) => {
+                let addr = SOCKADDR_IN6 {
+                    sin6_family: AF_INET6,
+                    sin6_port: v6.port().to_be(),
+                    sin6_flowinfo: v6.flowinfo(),
+                    sin6_addr: IN6_ADDR { u: IN6_ADDR_0 { Byte: v6.ip().octets() } },
+                    Anonymous: SOCKADDR_IN6_0 { sin6_scope_id: v6.scope_id() },
+                };
+                bind(s, (&addr as *const SOCKADDR_IN6).cast::<SOCKADDR>(), std::mem::size_of::<SOCKADDR_IN6>() as i32)
+            }
+        };
+        if bound != 0 {
+            let e = io::Error::last_os_error();
+            closesocket(s);
+            return Err(e);
+        }
+        if let Some(backlog) = listen_backlog
+            && listen(s, backlog) != 0
+        {
+            let e = io::Error::last_os_error();
+            closesocket(s);
+            return Err(e);
+        }
+        Ok(s as std::os::windows::io::RawSocket)
+    }
+}
+
+fn bind_tcp_exclusive(bind_addr: SocketAddr) -> io::Result<TcpListener> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::FromRawSocket;
+        use windows_sys::Win32::Networking::WinSock::{IPPROTO_TCP, SOCK_STREAM};
+        let s = bind_winsock_exclusive(bind_addr, SOCK_STREAM, IPPROTO_TCP, Some(128))?;
+        // SAFETY: `bind_winsock_exclusive` returns a bound, listening TCP socket owned solely by us.
+        Ok(unsafe { TcpListener::from_raw_socket(s) })
+    }
+    #[cfg(not(windows))]
+    {
+        TcpListener::bind(bind_addr)
+    }
+}
+
+fn bind_udp_exclusive(bind_addr: SocketAddr) -> io::Result<UdpSocket> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::FromRawSocket;
+        use windows_sys::Win32::Networking::WinSock::{IPPROTO_UDP, SOCK_DGRAM};
+        let s = bind_winsock_exclusive(bind_addr, SOCK_DGRAM, IPPROTO_UDP, None)?;
+        // SAFETY: `bind_winsock_exclusive` returns a bound UDP socket owned solely by us.
+        Ok(unsafe { UdpSocket::from_raw_socket(s) })
+    }
+    #[cfg(not(windows))]
+    {
+        UdpSocket::bind(bind_addr)
+    }
+}
+
 impl TcpForwarder {
     pub fn start(bind_addr: SocketAddr, target_addr: SocketAddr) -> io::Result<Self> {
-        let listener = TcpListener::bind(bind_addr)?;
+        Self::start_with_cap(bind_addr, target_addr, MAX_TCP_CONNS)
+    }
+
+    fn start_with_cap(bind_addr: SocketAddr, target_addr: SocketAddr, max_conns: usize) -> io::Result<Self> {
+        let listener = bind_tcp_exclusive(bind_addr)?;
         listener.set_nonblocking(true)?;
         let local_addr = listener.local_addr()?;
         let stop = Arc::new(AtomicBool::new(false));
         let stop_loop = stop.clone();
         let thread = std::thread::Builder::new()
             .name(format!("kiri-win-tcp-{}", local_addr.port()))
-            .spawn(move || tcp_accept_loop(listener, target_addr, stop_loop))?;
+            .spawn(move || tcp_accept_loop(listener, target_addr, stop_loop, max_conns))?;
         Ok(TcpForwarder {
             local_addr,
             stop,
@@ -243,7 +340,29 @@ impl Drop for TcpForwarder {
     }
 }
 
-fn tcp_accept_loop(listener: TcpListener, target_addr: SocketAddr, stop: Arc<AtomicBool>) {
+struct ActiveGuard(Arc<AtomicUsize>);
+
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn try_acquire_conn(active: &Arc<AtomicUsize>, max_conns: usize) -> Option<ActiveGuard> {
+    let mut cur = active.load(Ordering::Acquire);
+    loop {
+        if cur >= max_conns {
+            return None;
+        }
+        match active.compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return Some(ActiveGuard(active.clone())),
+            Err(next) => cur = next,
+        }
+    }
+}
+
+fn tcp_accept_loop(listener: TcpListener, target_addr: SocketAddr, stop: Arc<AtomicBool>, max_conns: usize) {
+    let active = Arc::new(AtomicUsize::new(0));
     while !stop.load(Ordering::SeqCst) {
         let (client, _) = match listener.accept() {
             Ok(pair) => pair,
@@ -262,8 +381,14 @@ fn tcp_accept_loop(listener: TcpListener, target_addr: SocketAddr, stop: Arc<Ato
         if stop.load(Ordering::SeqCst) {
             break;
         }
+        let Some(guard) = try_acquire_conn(&active, max_conns) else {
+            // Connection cap reached: close immediately without spawning threads.
+            drop(client);
+            continue;
+        };
         let _ = client.set_nonblocking(false);
         let _ = std::thread::Builder::new().name("kiri-win-tcp-conn".into()).spawn(move || {
+            let _guard = guard;
             let _ = relay_tcp_conn(client, target_addr);
         });
     }
@@ -415,7 +540,7 @@ pub struct UdpForwarder {
 
 impl UdpForwarder {
     pub fn start(bind_addr: SocketAddr, target_addr: SocketAddr) -> io::Result<Self> {
-        let listener = UdpSocket::bind(bind_addr)?;
+        let listener = bind_udp_exclusive(bind_addr)?;
         disable_udp_connreset(&listener);
         listener.set_read_timeout(Some(UDP_POLL))?;
         let local_addr = listener.local_addr()?;
@@ -558,7 +683,7 @@ mod runtime {
     use std::sync::Condvar;
     use serde_json::json;
     use windows_sys::Win32::Networking::WinSock::{
-        AF_INET, AF_INET6, SIO_ADDRESS_LIST_QUERY, SOCKADDR_IN, SOCKADDR_IN6, SOCKET, SOCKET_ADDRESS_LIST, WSAIoctl,
+        AF_INET, AF_INET6, SIO_ADDRESS_LIST_QUERY, SOCKADDR_IN, SOCKADDR_IN6, SOCKET, SOCKET_ADDRESS, SOCKET_ADDRESS_LIST, WSAIoctl,
     };
 
     const RESYNC_INTERVAL: Duration = Duration::from_secs(3);
@@ -609,13 +734,17 @@ mod runtime {
                 )
             };
             if rc == 0 && (returned as usize) >= std::mem::size_of::<SOCKET_ADDRESS_LIST>() {
-                // SAFETY: WSAIoctl succeeded and filled ` SOCKET_ADDRESS_LIST` inside `buf`.
+                // SAFETY: WSAIoctl succeeded and filled `SOCKET_ADDRESS_LIST` inside `buf`;
+                // `count` is bounded by `returned` bytes so `from_raw_parts` stays within `buf`.
                 unsafe {
                     let list = &*(buf.as_ptr() as *const SOCKET_ADDRESS_LIST);
-                    let count = (list.iAddressCount.max(0) as usize).min(256);
+                    let hdr = std::mem::offset_of!(SOCKET_ADDRESS_LIST, Address);
+                    let max_fit = (returned as usize).saturating_sub(hdr) / std::mem::size_of::<SOCKET_ADDRESS>();
+                    let count = (list.iAddressCount.max(0) as usize).min(max_fit).min(256);
                     let addrs = std::slice::from_raw_parts(list.Address.as_ptr(), count);
                     for entry in addrs {
                         if !entry.lpSockaddr.is_null()
+                            && entry.iSockaddrLength > 0
                             && (entry.iSockaddrLength as usize) >= std::mem::size_of::<SOCKADDR_IN>()
                             && (*entry.lpSockaddr).sa_family == AF_INET
                         {
@@ -652,13 +781,17 @@ mod runtime {
                 )
             };
             if rc == 0 && (returned as usize) >= std::mem::size_of::<SOCKET_ADDRESS_LIST>() {
-                // SAFETY: WSAIoctl succeeded and filled `SOCKET_ADDRESS_LIST` inside `buf`.
+                // SAFETY: WSAIoctl succeeded and filled `SOCKET_ADDRESS_LIST` inside `buf`;
+                // `count` is bounded by `returned` bytes so `from_raw_parts` stays within `buf`.
                 unsafe {
                     let list = &*(buf.as_ptr() as *const SOCKET_ADDRESS_LIST);
-                    let count = (list.iAddressCount.max(0) as usize).min(256);
+                    let hdr = std::mem::offset_of!(SOCKET_ADDRESS_LIST, Address);
+                    let max_fit = (returned as usize).saturating_sub(hdr) / std::mem::size_of::<SOCKET_ADDRESS>();
+                    let count = (list.iAddressCount.max(0) as usize).min(max_fit).min(256);
                     let addrs = std::slice::from_raw_parts(list.Address.as_ptr(), count);
                     for entry in addrs {
                         if !entry.lpSockaddr.is_null()
+                            && entry.iSockaddrLength > 0
                             && (entry.iSockaddrLength as usize) >= std::mem::size_of::<SOCKADDR_IN6>()
                             && (*entry.lpSockaddr).sa_family == AF_INET6
                         {
@@ -1067,5 +1200,36 @@ mod tests {
         ];
         let specs = plan_forwards(Ipv4Addr::new(198, 51, 100, 107), &upper, &[Ipv4Addr::new(192, 0, 2, 50)], &[]);
         assert_eq!(specs.len(), 2);
+    }
+
+    #[test]
+    fn tcp_forwarder_enforces_max_concurrent_connections() {
+        let backend = TcpListener::bind("127.0.0.1:0").unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+        let hold = std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for _ in 0..2 {
+                if let Ok((s, _)) = backend.accept() {
+                    held.push(s);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(400));
+            drop(held);
+        });
+        let fwd = TcpForwarder::start_with_cap("127.0.0.1:0".parse().unwrap(), backend_addr, 2).unwrap();
+        let addr = fwd.local_addr();
+        let _c1 = TcpStream::connect(addr).unwrap();
+        let _c2 = TcpStream::connect(addr).unwrap();
+        // Give the accept loop a moment to register both active connections.
+        std::thread::sleep(Duration::from_millis(120));
+        // The 3rd connection must be closed immediately without spawning threads.
+        let mut c3 = TcpStream::connect(addr).unwrap();
+        c3.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut buf = [0u8; 8];
+        let n = c3.read(&mut buf).unwrap_or(0);
+        assert_eq!(n, 0, "excess TCP connection past cap must be closed immediately");
+        drop((_c1, _c2, c3));
+        fwd.stop();
+        hold.join().unwrap();
     }
 }

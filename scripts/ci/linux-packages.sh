@@ -15,7 +15,7 @@ docker run --rm --platform linux/arm64 \
   -v kiri-linux-cache:/root/.cache \
   -v kiri-linux-cargo:/usr/local/cargo/registry \
   -e HOME=/root \
-  rust:1-bookworm sh -euc '
+  rust:1-bookworm@sha256:75d26c23c24cc6ea1cdabf0714a6bff8fd7bf3248716043fd7ae86dac7f41b94 sh -euc '
     apt-get update -qq
     apt-get install -y -qq --no-install-recommends python3 python3-venv rpm pkg-config libwebkit2gtk-4.1-dev >/dev/null
     sh scripts/ci/linux-build.sh

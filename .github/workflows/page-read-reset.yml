@@ -1,0 +1,28 @@
+# Removes the `page-read` approval label whenever new commits are pushed to a
+# pull request, so a review of an earlier commit cannot approve JS added later
+# in `crates/kiri/src/ui/index.html` or `crates/kiri-win/src/setup.html`.
+#
+# Runs on `pull_request_target` with no checkout of PR code and minimal
+# `pull-requests: write` permission (only deletes one fixed label name).
+name: Reset page-read label
+
+on:
+  pull_request_target:
+    types: [synchronize]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  reset:
+    if: contains(github.event.pull_request.labels.*.name, 'page-read')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Remove page-read label after new commits
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          gh api -X DELETE "repos/$REPO/issues/$PR_NUMBER/labels/page-read" || true

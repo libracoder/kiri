@@ -94,13 +94,41 @@ fn current_distro_and_kiri() -> Option<(String, String)> {
     Some((distro, crate::serve::kiri()))
 }
 
+/// Sensitive internal loopback ports (e.g. Kiri's Kubernetes API on 6443) that
+/// are never exposed via the catch-all `host.docker.internal` relay unless
+/// explicitly listed in `allowed`.
+const INTERNAL_DENY_PORTS: &[u16] = &[6443];
+
+/// Whether a container connection to Windows loopback `port` is permitted.
+fn port_allowed(port: u16, host_enabled: bool, allowed: &HashSet<u16>) -> bool {
+    if port == 0 {
+        return false;
+    }
+    if allowed.contains(&port) {
+        return true;
+    }
+    host_enabled && !INTERNAL_DENY_PORTS.contains(&port)
+}
+
+/// Toggles catch-all `host.docker.internal` forwarding to Windows loopback
+/// (explicit static proxy ports in `allowed` continue to work).
+#[allow(dead_code)]
+pub fn set_host_enabled(on: bool) {
+    HOST_ENABLED_DEFAULT.store(on, Ordering::SeqCst);
+    if let Some(r) = lock(&RELAY).as_ref() {
+        r.host_enabled.store(on, Ordering::SeqCst);
+    }
+}
+
+static HOST_ENABLED_DEFAULT: AtomicBool = AtomicBool::new(true);
+
 fn start(distro: Option<String>, kiri: String) -> io::Result<Arc<Relay>> {
     let mut cmd = crate::win::tool("wsl.exe");
     if let Some(d) = &distro {
         cmd.args(["-d", d]);
     }
     let mut child = cmd
-        .args(["-u", "root", "--", &kiri, "hostrelay"])
+        .args(["-u", "root", "-e", &kiri, "hostrelay"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -116,7 +144,7 @@ fn start(distro: Option<String>, kiri: String) -> io::Result<Arc<Relay>> {
         stdin,
         distro,
         kiri,
-        host_enabled: AtomicBool::new(true),
+        host_enabled: AtomicBool::new(HOST_ENABLED_DEFAULT.load(Ordering::SeqCst)),
         host_port: AtomicU16::new(0),
         allowed: Mutex::new(HashSet::new()),
         ports: Mutex::new(HashMap::new()),
@@ -132,7 +160,7 @@ fn start(distro: Option<String>, kiri: String) -> io::Result<Arc<Relay>> {
         let end = hostrelay::dial_side_with_host(
             output,
             &r.out,
-            move |port| port != 0 && (a.host_enabled.load(Ordering::SeqCst) || lock(&a.allowed).contains(&port)),
+            move |port| port_allowed(port, a.host_enabled.load(Ordering::SeqCst), &lock(&a.allowed)),
             move |target, local| {
                 lock(&p.ports).insert(target, local);
                 p.changed.notify_all();
@@ -285,4 +313,24 @@ pub fn ports(targets: &[u16]) -> HashMap<u16, u16> {
         log_once(format!("proxy relay: no answer for {targets:?}"));
     }
     map
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn port_allowed_enforces_host_toggle_and_internal_deny_list() {
+        let empty = HashSet::new();
+        assert!(!port_allowed(0, true, &empty));
+        assert!(port_allowed(8080, true, &empty));
+        assert!(!port_allowed(8080, false, &empty));
+        // Kiri's k8s API port (6443) is denied unless explicitly allowlisted.
+        assert!(!port_allowed(6443, true, &empty));
+        let mut explicit = HashSet::new();
+        explicit.insert(6443);
+        explicit.insert(8080);
+        assert!(port_allowed(6443, true, &explicit));
+        assert!(port_allowed(8080, false, &explicit));
+    }
 }

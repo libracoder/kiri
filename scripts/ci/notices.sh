@@ -9,7 +9,7 @@ cargo about generate --all-features --workspace --locked about.hbs -o "$tmp"
 notice() {
   title=$1 url=$2
   printf '\n%s\n%s\nSource: %s\n\n' "$title" '----------------------------------------------------------------------' "$url" >> "$tmp"
-  curl -fsSL --retry 3 "$url" >> "$tmp"
+  curl -fsSL --proto '=https' --proto-redir '=https' --retry 3 "$url" >> "$tmp"
   printf '\n' >> "$tmp"
 }
 notice 'Docker CLI 29.9.2 — Apache-2.0' 'https://raw.githubusercontent.com/docker/cli/v29.9.2/LICENSE'
