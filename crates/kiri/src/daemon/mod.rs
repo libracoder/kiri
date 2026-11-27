@@ -797,22 +797,39 @@ fn safe_root_socket_dir(socket: &std::path::Path) -> bool {
 #[cfg(any(target_os = "linux", test))]
 fn safe_root_socket_dir_for_euid(socket: &std::path::Path, euid: u32) -> bool {
     use std::os::unix::fs::MetadataExt;
+    safe_root_socket_dir_with(socket, euid, |p| {
+        let meta = std::fs::symlink_metadata(p)?;
+        Ok((meta.file_type().is_symlink(), meta.file_type().is_dir(), meta.uid(), meta.mode()))
+    })
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn safe_root_socket_dir_with(
+    socket: &std::path::Path,
+    euid: u32,
+    stat: impl Fn(&std::path::Path) -> io::Result<(bool, bool, u32, u32)>,
+) -> bool {
     if euid != 0 {
         return true;
     }
     let Some(dir) = socket.parent() else { return false };
+    if !dir.is_absolute() {
+        return false;
+    }
     let mut cur = dir;
     loop {
-        if let Ok(meta) = std::fs::symlink_metadata(cur) {
-            if meta.file_type().is_symlink() {
-                return false;
+        match stat(cur) {
+            Ok((is_symlink, is_dir, uid, mode)) => {
+                if is_symlink || !is_dir || uid != 0 || (mode & 0o022) != 0 {
+                    return false;
+                }
             }
-            if meta.uid() != 0 || (meta.mode() & 0o022) != 0 {
-                return false;
-            }
-            break;
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => return false,
         }
-        let Some(parent) = cur.parent() else { return false };
+        let Some(parent) = cur.parent() else {
+            break;
+        };
         if parent == cur {
             break;
         }
@@ -1577,12 +1594,42 @@ mod tests {
         let meta = std::fs::symlink_metadata(&target).unwrap();
         assert!(meta.file_type().is_file());
         assert_eq!(meta.permissions().mode() & 0o777, 0o600);
-        // Root must refuse binding a gated socket inside a non-root or symlinked directory.
+        // Root must refuse binding a gated socket inside a non-root or symlinked directory,
+        // and must validate every ancestor all the way up to `/` (never stopping at a root-owned leaf).
         assert!(!safe_root_socket_dir_for_euid(&dir.join("docker.sock"), 0));
         let link_dir = dir.join("linkdir");
         std::os::unix::fs::symlink(&dir, &link_dir).unwrap();
         assert!(!safe_root_socket_dir_for_euid(&link_dir.join("docker.sock"), 0));
         assert!(safe_root_socket_dir_for_euid(&dir.join("docker.sock"), 1000));
+        // Leaf `/home/alice/.kiri/run` owned by root 0755, but ancestor `/home/alice/.kiri` owned by uid 1000 -> refused.
+        assert!(!safe_root_socket_dir_with(
+            std::path::Path::new("/home/alice/.kiri/run/docker.sock"),
+            0,
+            |p| match p.to_str() {
+                Some("/home/alice/.kiri/run") => Ok((false, true, 0, 0o755)),
+                Some("/home/alice/.kiri") | Some("/home/alice") => Ok((false, true, 1000, 0o755)),
+                Some("/home") | Some("/") => Ok((false, true, 0, 0o755)),
+                _ => Err(io::Error::from(io::ErrorKind::NotFound)),
+            },
+        ));
+        // Non-NotFound stat error fails closed.
+        assert!(!safe_root_socket_dir_with(
+            std::path::Path::new("/run/kiri/docker.sock"),
+            0,
+            |p| match p.to_str() {
+                Some("/run/kiri") => Ok((false, true, 0, 0o755)),
+                _ => Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+            },
+        ));
+        // Full root-owned non-group/world-writable chain -> allowed.
+        assert!(safe_root_socket_dir_with(
+            std::path::Path::new("/run/kiri/docker.sock"),
+            0,
+            |p| match p.to_str() {
+                Some("/run/kiri") | Some("/run") | Some("/") => Ok((false, true, 0, 0o755)),
+                _ => Err(io::Error::from(io::ErrorKind::NotFound)),
+            },
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

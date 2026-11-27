@@ -1824,14 +1824,31 @@ fn mac_shared(src: &str) -> bool {
 /// - anything else the Mac has there (/etc/hosts, /etc/localtime) is the
 ///   Mac's.
 /// - what the Mac lacks stays the VM's.
+
 /// Whether `src` names one of the synthetic macOS `/etc` paths backed by
-/// `~/.kiri/etc` (`hostetc`).
+/// `~/.kiri/etc` (`hostetc`), either via `/etc` or directly via `~/.kiri/etc`.
 fn is_mac_hostetc(src: &str) -> bool {
     if !cfg!(target_os = "macos") {
         return false;
     }
     let norm = lexical_path(src);
-    norm == "/etc" || norm.strip_prefix("/etc/").is_some_and(|name| super::hostetc::FILES.contains(&name))
+    if norm == "/etc" || norm.strip_prefix("/etc/").is_some_and(|name| super::hostetc::FILES.contains(&name)) {
+        return true;
+    }
+    if let Ok(state) = super::state_dir() {
+        let etc_dir = state.join("etc");
+        let etc_lex = lexical_path(&etc_dir.to_string_lossy());
+        let etc_canon = canonical_or_ancestor(&etc_dir.to_string_lossy());
+        let matches_etc = |p: &str| {
+            p == etc_lex
+                || p.strip_prefix(&etc_lex).is_some_and(|r| r.starts_with('/'))
+                || etc_canon.as_deref().is_some_and(|c| p == c || p.strip_prefix(c).is_some_and(|r| r.starts_with('/')))
+        };
+        if matches_etc(&norm) || canonical_or_ancestor(src).as_deref().is_some_and(matches_etc) {
+            return true;
+        }
+    }
+    false
 }
 
 fn mac_source(src: &str) -> Option<String> {
@@ -1985,35 +2002,80 @@ fn lexical_path(p: &str) -> String {
 /// Filesystem types permitted for local volume `DriverOpts` (`type=`).
 const ALLOWED_VOLUME_TYPES: &[&str] = &["", "none", "nfs", "nfs4", "cifs", "smb3", "tmpfs"];
 
-/// Whether `src` is a parent/ancestor directory of Kiri's own host Unix socket
-/// (such as `/run/kiri`, `/run`, or `/`), which would let a non-Host caller
-/// reach the host-privileged socket without going through `engine_socket_for_distro`.
+/// Canonicalizes `p` if it exists, or canonicalizes its deepest existing ancestor
+/// and re-appends the remaining tail components so symlinked parents (such as
+/// `/var/run/kiri -> /run/kiri`) are resolved even when the leaf does not exist.
+fn canonical_or_ancestor(p: &str) -> Option<String> {
+    let path = std::path::Path::new(p);
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut cur = path;
+    loop {
+        if let Ok(canon) = std::fs::canonicalize(cur) {
+            let mut full = canon;
+            for seg in tail.into_iter().rev() {
+                full.push(seg);
+            }
+            return full.into_os_string().into_string().ok().map(|s| lexical_path(&s));
+        }
+        let name = cur.file_name()?;
+        tail.push(name.to_os_string());
+        cur = cur.parent()?;
+    }
+}
+
+/// Whether `src` (either lexically or after resolving symlinks) is a parent or
+/// ancestor directory of Kiri's own host Unix socket (such as `/run/kiri`,
+/// `/var/run/kiri`, `/run`, or `/`), which would let a non-Host caller reach
+/// the host-privileged socket without going through `engine_socket_for_distro`.
 fn is_host_socket_ancestor(src: &str) -> bool {
-    let norm = lexical_path(src);
     let mut candidates = Vec::new();
-    if let Ok(p) = super::socket_path() {
-        if let Some(s) = p.to_str() {
-            candidates.push(lexical_path(s));
-        }
+    if let Ok(p) = super::socket_path()
+        && let Some(s) = p.to_str()
+    {
+        candidates.push(s.to_owned());
     }
-    if let Ok(p) = super::home_socket_path() {
-        if let Some(s) = p.to_str() {
-            candidates.push(lexical_path(s));
-        }
+    if let Ok(p) = super::home_socket_path()
+        && let Some(s) = p.to_str()
+    {
+        candidates.push(s.to_owned());
     }
-    candidates.into_iter().any(|sock| {
-        if let Some((parent, _)) = sock.rsplit_once('/') {
-            let parent = if parent.is_empty() { "/" } else { parent };
-            norm == "/" || norm == parent || parent.strip_prefix(&norm).is_some_and(|r| r.starts_with('/'))
-        } else {
-            false
+    is_host_socket_ancestor_against(src, &candidates)
+}
+
+fn is_host_socket_ancestor_against(src: &str, socket_candidates: &[String]) -> bool {
+    let mut src_forms = vec![lexical_path(src)];
+    if let Some(canon) = canonical_or_ancestor(src)
+        && !src_forms.contains(&canon)
+    {
+        src_forms.push(canon);
+    }
+    let parent_of = |sock: &str| -> Option<String> {
+        let (parent, _) = sock.rsplit_once('/')?;
+        Some(if parent.is_empty() { "/".to_owned() } else { parent.to_owned() })
+    };
+    socket_candidates.iter().any(|sock| {
+        let mut parents = Vec::new();
+        if let Some(p) = parent_of(&lexical_path(sock)) {
+            parents.push(p);
         }
+        if let Some(canon_sock) = canonical_or_ancestor(sock)
+            && let Some(p) = parent_of(&canon_sock)
+            && !parents.contains(&p)
+        {
+            parents.push(p);
+        }
+        src_forms.iter().any(|sp| {
+            parents
+                .iter()
+                .any(|parent| sp == "/" || sp == parent || parent.strip_prefix(sp.as_str()).is_some_and(|r| r.starts_with('/')))
+        })
     })
 }
 
 /// Resolves and validates a local bind volume's `device` option with the exact
 /// same caller-aware confinement and socket substitution as regular binds.
-fn resolve_volume_bind_device(device: &str, caller: &Caller, wsl: Option<&super::binds::Wsl>) -> Result<String, Error> {
+/// Returns `(guest_device_path, force_ro)`.
+fn resolve_volume_bind_device(device: &str, caller: &Caller, wsl: Option<&super::binds::Wsl>) -> Result<(String, bool), Error> {
     if device.is_empty() {
         return Err(Error::BadRequest("invalid volume option device: bind device cannot be empty".into()));
     }
@@ -2031,20 +2093,21 @@ fn resolve_volume_bind_device(device: &str, caller: &Caller, wsl: Option<&super:
         )));
     }
     if let Some(sock) = super::binds::engine_socket_for_distro(&resolved, caller.wsl_distro()) {
-        return Ok(sock);
+        return Ok((sock, false));
     }
     if *caller != Caller::Host && is_host_socket_ancestor(&resolved) {
         return Err(Error::BadRequest(format!(
             "invalid volume option device={device}: cannot mount a directory containing Kiri's host socket"
         )));
     }
+    let force_ro = is_mac_hostetc(&resolved);
     let mapped = guest_bind_source(&resolved);
     if !MAC_ROOT.is_empty() && (lexical_path(&mapped) == MAC_ROOT || !mapped.starts_with(&format!("{MAC_ROOT}/")) && guest_share_path(&mapped, MAC_ROOT)) {
         return Err(Error::BadRequest(format!(
             "invalid volume option device={device}: {MAC_ROOT} exists only inside the VM; name the Mac's own path, such as /Users/…"
         )));
     }
-    Ok(mapped)
+    Ok((mapped, force_ro))
 }
 
 /// Refuses volume driver options that would mount the VM's own shares,
@@ -2058,7 +2121,7 @@ fn check_volume_device_for(
     options: &std::collections::BTreeMap<String, String>,
     caller: &Caller,
     wsl: Option<&super::binds::Wsl>,
-) -> Result<Option<String>, Error> {
+) -> Result<Option<(String, bool)>, Error> {
     let kind = options.get("type").map_or("", String::as_str);
     if kind.eq_ignore_ascii_case("virtiofs") {
         return Err(Error::BadRequest("invalid volume option type=virtiofs: the VM's shares cannot be mounted as a volume".into()));
@@ -2272,6 +2335,11 @@ fn mounts_for(body: &Value, engine: &Engine, image: &kiri_image::Image, caller: 
                 if !src.starts_with('/') {
                     return Err(Error::BadRequest(format!("invalid mount source {src}: must be an absolute path")));
                 }
+                if *caller != super::caller::Caller::Host && is_host_socket_ancestor(src) {
+                    return Err(Error::BadRequest(format!(
+                        "invalid mount source {src}: cannot mount a directory containing Kiri's host socket"
+                    )));
+                }
                 // Synthetic macOS `/etc` files live in shared `~/.kiri/etc`: always
                 // mount read-only so a container cannot plant symlinks or poison
                 // shared `/etc` entries for other containers.
@@ -2307,19 +2375,39 @@ fn mounts_for(body: &Value, engine: &Engine, image: &kiri_image::Image, caller: 
                 }
                 // The guest mounts a volume's device as root, so enforce the
                 // filesystem allowlist, caller confinement (WSL/Container),
-                // socket substitution, and `/mnt/mac` share guard.
+                // socket substitution, `/mnt/mac` share guard, and hostetc RO.
                 let mapped_bind = check_volume_device_for(&v.options, caller, super::binds::wsl())?;
+                let force_ro = mapped_bind.as_ref().is_some_and(|(_, r)| *r);
+                let vol_ro = ro || force_ro;
+                let vol_flag = |more: &str| {
+                    let mut f: Vec<&str> = more.split(',').filter(|x| !x.is_empty()).collect();
+                    if vol_ro {
+                        f.push("ro");
+                    }
+                    f.join(",")
+                };
+                let effective_opts;
+                let opts_for_guest = if force_ro {
+                    let mut o = v.options.clone();
+                    let existing = o.get("o").map_or("", String::as_str);
+                    let next = if existing.is_empty() { "ro".to_owned() } else { format!("{existing},ro") };
+                    o.insert("o".into(), next);
+                    effective_opts = o;
+                    &effective_opts
+                } else {
+                    &v.options
+                };
                 let path = super::volumes::guest_path(&name);
                 let copy = if extra.contains("nocopy") { "create" } else { "create,copyup" };
                 // A volume with driver options (`type=nfs`, `o=bind` …) is
                 // mounted at its path by the guest at start, then bound in.
                 let vol = super::volumes::guest_mount_fields(
-                    &v.options,
-                    |dev| mapped_bind.clone().unwrap_or_else(|| guest_bind_source(dev)),
+                    opts_for_guest,
+                    |dev| mapped_bind.as_ref().map(|(m, _)| m.clone()).unwrap_or_else(|| guest_bind_source(dev)),
                     resolve_server,
                 );
-                out.guest.push(format!("{path}\t{dst}\t{}{vol}", flag(copy)));
-                out.info.push(json!({"Type": "volume", "Name": name, "Source": path, "Destination": dst, "Driver": "local", "Mode": "z", "RW": !ro, "Propagation": ""}));
+                out.guest.push(format!("{path}\t{dst}\t{}{vol}", vol_flag(copy)));
+                out.info.push(json!({"Type": "volume", "Name": name, "Source": path, "Destination": dst, "Driver": "local", "Mode": "z", "RW": !vol_ro, "Propagation": ""}));
                 if anonymous {
                     out.anon.push(name);
                 } else {
@@ -7830,6 +7918,68 @@ mod network_option_tests {
         assert!(super::check_volume_device(&opts(&[("type", "nfs"), ("o", "addr=10.0.0.1"), ("device", ":/export")])).is_ok());
         assert!(super::check_volume_device(&opts(&[("type", "tmpfs"), ("device", "tmpfs")])).is_ok());
         assert!(super::check_volume_device(&opts(&[])).is_ok());
+
+        // Host socket ancestor guard catches direct parent, ancestors, and symlinked parents.
+        let tmp = std::env::temp_dir().join(format!("kiri-sock-anc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let real_sock_dir = tmp.join("real_run/kiri");
+        std::fs::create_dir_all(&real_sock_dir).unwrap();
+        let sym_sock_dir = tmp.join("var_run_kiri");
+        std::os::unix::fs::symlink(&real_sock_dir, &sym_sock_dir).unwrap();
+        let sibling_dir = tmp.join("other");
+        std::fs::create_dir_all(&sibling_dir).unwrap();
+        let cands = vec![real_sock_dir.join("docker.sock").to_string_lossy().into_owned()];
+        assert!(super::is_host_socket_ancestor_against(&real_sock_dir.to_string_lossy(), &cands));
+        assert!(super::is_host_socket_ancestor_against(&tmp.join("real_run").to_string_lossy(), &cands));
+        assert!(super::is_host_socket_ancestor_against(&sym_sock_dir.to_string_lossy(), &cands));
+        assert!(!super::is_host_socket_ancestor_against(&sibling_dir.to_string_lossy(), &cands));
+
+        // Regular binds from Caller::Container cannot bind the host socket parent directory or a symlink to it.
+        let engine = super::super::engine::boot_without_vm(&tmp.join("store"));
+        let img = kiri_image::Image {
+            mirror: None,
+            name: "demo:local".into(),
+            digest: "sha256:test".into(),
+            index_digest: None,
+            config_digest: "sha256:test".into(),
+            layers: Vec::new(),
+            size: 0,
+            platform: "linux/arm64".into(),
+            created: String::new(),
+            pulled_at: 0,
+            config: Default::default(),
+        };
+        if let Ok(sock) = super::super::socket_path()
+            && let Some(parent) = sock.parent()
+        {
+            let body = json!({"HostConfig": {"Binds": [format!("{}:/host-sock", parent.display())]}});
+            assert!(super::mounts_for(&body, &engine, &img, &Caller::Container).is_err());
+            if parent.exists() {
+                let sym_to_parent = tmp.join("sym-sock-parent");
+                std::os::unix::fs::symlink(parent, &sym_to_parent).unwrap();
+                let sym_body = json!({"HostConfig": {"Binds": [format!("{}:/host-sock", sym_to_parent.display())]}});
+                assert!(super::mounts_for(&sym_body, &engine, &img, &Caller::Container).is_err());
+            }
+        }
+
+        // On macOS, a local bind volume targeting `/etc` or `/etc/passwd` must be forced read-only
+        // on both the container mount (`ro`, `RW: false`) and the volume mount flags (`MS_RDONLY`).
+        #[cfg(target_os = "macos")]
+        {
+            let vol_opts = opts(&[("type", "none"), ("o", "bind,rw"), ("device", "/etc")]);
+            engine.volume_ensure_with("etc-bind", json!({}), vol_opts).unwrap();
+            let body = json!({"HostConfig": {"Binds": ["etc-bind:/mnt/etc"]}});
+            let mounts = super::mounts_for(&body, &engine, &img, &Caller::Host).unwrap();
+            assert_eq!(mounts.info.len(), 1);
+            assert_eq!(mounts.info[0]["RW"], json!(false));
+            let parts: Vec<&str> = mounts.guest[0].split('\t').collect();
+            assert!(parts[2].split(',').any(|f| f == "ro"), "container mount must carry ro: {}", mounts.guest[0]);
+            let vol_flags = u64::from_str_radix(parts[5], 16).unwrap();
+            assert_ne!(vol_flags & 1, 0, "volume mount flags must set MS_RDONLY: {}", mounts.guest[0]);
+        }
+
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
