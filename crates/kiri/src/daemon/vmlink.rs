@@ -854,6 +854,16 @@ impl VmLink {
         self.send(|o| kiri_proto::encode_retain(o, ids))
     }
 
+    /// Evicts `digests` from the in-memory unpacked-layer cache so the next
+    /// `has_layer` asks the guest directly (used when `run` reports a layer
+    /// missing on disk inside a running guest).
+    pub fn forget_layers(&self, digests: &[String]) {
+        let mut cached = self.layers.lock().unwrap_or_else(|e| e.into_inner());
+        for d in digests {
+            cached.remove(d.as_str());
+        }
+    }
+
     /// Tells the guest which unpacked layers are still used; it deletes the rest.
     pub fn retain_layers(&self, digests: &[String]) -> io::Result<()> {
         {
@@ -1270,5 +1280,23 @@ mod tests {
         let contender_err = contender.join().unwrap().unwrap_err();
         assert!(contender_err.to_string().contains("the VM stopped") || contender_err.kind() == io::ErrorKind::TimedOut, "{contender_err}");
         assert!(channel.windows.is_lost(), "reader exited after SHUT_RDWR");
+    }
+
+    #[test]
+    fn forget_layers_evicts_only_requested_digests() {
+        let layers = Mutex::new(std::collections::HashSet::from([
+            "sha256:aaa".to_owned(),
+            "sha256:bbb".to_owned(),
+            "sha256:ccc".to_owned(),
+        ]));
+        {
+            let mut cached = layers.lock().unwrap();
+            for d in &["sha256:aaa".to_owned(), "sha256:ccc".to_owned()] {
+                cached.remove(d.as_str());
+            }
+        }
+        let left = layers.into_inner().unwrap();
+        assert_eq!(left.len(), 1);
+        assert!(left.contains("sha256:bbb"));
     }
 }

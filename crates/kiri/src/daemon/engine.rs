@@ -4296,7 +4296,6 @@ impl Engine {
         let mut opts = net_opts(&spec, joined.as_deref(), &domainname);
         opts.extend(net6_opts);
         opts.extend(pid_joined.map(|t| format!("{}={t}", kiri_proto::net_opts::PIDNS)));
-        let net_args = kiri_proto::Net { bridge: &bridge, ip, prefix, gateway, extra_hosts: &hosts, dns_names: &dns_names, opts: &opts };
         // Joining a host-network container is the host's namespace too: its
         // net.* sysctls would change the whole VM (or Linux host).
         let joined_host = joined_mode.is_some_and(|m| self.lock_networks().find(&m).is_some_and(|n| n.driver == "host"));
@@ -4340,11 +4339,34 @@ impl Engine {
             return Err(e);
         }
         let cancelled = || gate.0.cancel.load(std::sync::atomic::Ordering::SeqCst);
-        let started = if cancelled() {
-            Err(io::Error::other("cancelled before it reached the guest"))
-        } else {
+        let run_once = || {
+            let net_args = kiri_proto::Net { bridge: &bridge, ip, prefix, gateway, extra_hosts: &hosts, dns_names: &dns_names, opts: &opts };
             vm.run(&id, &layers, &argv, &spec.env, &spec.cwd, &spec.user, &hostname, flags, net_args, &spec.mounts, &spec.limits.wire(), spec.caps, &host_opts, &seccomp, &gate.0.cancel)
         };
+        let mut started = if cancelled() {
+            Err(io::Error::other("cancelled before it reached the guest"))
+        } else {
+            run_once()
+        };
+        // `VmLink::layers` avoids redundant `LayerQuery` round-trips on hot starts;
+        // if an unpacked layer was deleted on the guest's disk while the VM stayed
+        // up (`start-restores-layer`), evict its cached digests, re-query/re-send
+        // the missing layer(s), and retry once.
+        if let Err(ref e) = started
+            && !cancelled()
+            && is_missing_unpacked_layer_error(&e.to_string())
+        {
+            vm.forget_layers(&layers);
+            if let Err(restore_err) = self.restore_layers(&vm, &layers) {
+                self.fail_start(&id, &spec, &restore_err);
+                return Err(restore_err);
+            }
+            started = if cancelled() {
+                Err(io::Error::other("cancelled before it reached the guest"))
+            } else {
+                run_once()
+            };
+        }
         if let Ok(pid) = started
             && let Some(c) = self.lock().containers.get_mut(&id).filter(|c| c.status == Status::Running)
         {
@@ -10683,4 +10705,21 @@ mod exit_forwards_tests {
         drop(engine);
         let _ = std::fs::remove_dir_all(dir);
     }
+
+    #[test]
+    fn detects_guest_missing_unpacked_layer_error() {
+        assert!(super::is_missing_unpacked_layer_error(
+            "run f0991bd92f25: layer sha256:821d9dafb26dc8e4afce2273366520f49e38f8f679a72fc512f2a83e62f442b7 is not unpacked"
+        ));
+        assert!(super::is_missing_unpacked_layer_error("layer sha256:0123 is not unpacked"));
+        assert!(!super::is_missing_unpacked_layer_error("run c1: mount /payload: No space left on device"));
+        assert!(!super::is_missing_unpacked_layer_error("the VM stopped"));
+    }
+}
+
+/// Whether a guest `Run` error reports that an image layer was missing under
+/// `/var/lib/kiri/layers` (`kiri-init`'s `roots::acquire` formats this as
+/// `"layer <digest> is not unpacked"`).
+fn is_missing_unpacked_layer_error(msg: &str) -> bool {
+    msg.contains("layer sha256:") && msg.ends_with(" is not unpacked")
 }

@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### Start: evict stale `VmLink::layers` entries and re-send layers when `run` reports `"is not unpacked"` (unreleased)
+- Fixes: `start-restores-layer` (`docker start` failed with `layer sha256:… is not unpacked` when an unpacked layer directory disappeared on the guest's disk without a VM restart)
+- Caused: none known
+- Caused by: #776
+- Check: `start-restores-layer`, `crates/kiri/src/daemon/engine.rs`
+
 ### #602 macOS: spawn daemon directly when LaunchAgent `kickstart` exits 0 without starting engine (unreleased)
 - Fixes: #602 Clicking Start on macOS does nothing when `launchctl kickstart` exits 0 without starting `kiri daemon`
 - Caused: none known
