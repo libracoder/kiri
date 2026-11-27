@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -1650,8 +1650,9 @@ pub struct Engine {
     /// a file in the state dir (`stopped`).
     stopped: std::sync::atomic::AtomicBool,
     pub store: Store,
-    pub networks: Mutex<Networks>,
-    state: Mutex<State>,
+    pub networks: RwLock<Networks>,
+    state: RwLock<State>,
+    changed_seq: Mutex<u64>,
     changed: Condvar,
     /// Serialises sending layers, so two creates of a new image don't send
     /// the same layers twice.
@@ -1883,7 +1884,7 @@ impl Engine {
     pub fn boot(store: Store) -> io::Result<Arc<Engine>> {
         let records = store.root().join("containers.json");
         let ceiling = memory_ceiling();
-        let networks = Mutex::new(Networks::load(store.root())?);
+        let networks = RwLock::new(Networks::load(store.root())?);
         let loaded_volumes = super::volumes::Volumes::load(store.root())?;
         let volume_sizes_cache = Mutex::new(VolumeSizesCache::load(store.root(), loaded_volumes.all()));
         let volumes = Mutex::new(loaded_volumes);
@@ -1898,7 +1899,8 @@ impl Engine {
             stopped: std::sync::atomic::AtomicBool::new(stopped_marker().is_some_and(|f| f.exists())),
             networks,
             store,
-            state: Mutex::default(),
+            state: RwLock::default(),
+            changed_seq: Mutex::new(0),
             changed: Condvar::new(),
             layers: Mutex::new(()),
             records,
@@ -2240,7 +2242,7 @@ impl Engine {
             }
             let delay = st.vm_recovery_at.map_or(Duration::ZERO, |at| at.saturating_duration_since(std::time::Instant::now()));
             if !delay.is_zero() {
-                drop(self.changed.wait_timeout(st, delay).unwrap_or_else(|e| e.into_inner()));
+                drop(self.wait_changed_timeout(st, delay));
                 continue;
             }
             let generation = st.vm_recovery_generation;
@@ -3021,8 +3023,34 @@ impl Engine {
         self.awake().is_some()
     }
 
-    fn lock(&self) -> MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    fn read(&self) -> RwLockReadGuard<'_, State> {
+        self.state.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn lock(&self) -> RwLockWriteGuard<'_, State> {
+        self.state.write().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn notify_changed(&self) {
+        let mut seq = self.changed_seq.lock().unwrap_or_else(|e| e.into_inner());
+        *seq = seq.wrapping_add(1);
+        self.changed.notify_all();
+    }
+
+    fn wait_changed<'a>(&'a self, st: RwLockWriteGuard<'a, State>) -> RwLockWriteGuard<'a, State> {
+        let seq = self.changed_seq.lock().unwrap_or_else(|e| e.into_inner());
+        let cur = *seq;
+        drop(st);
+        drop(self.changed.wait_while(seq, |s| *s == cur).unwrap_or_else(|e| e.into_inner()));
+        self.lock()
+    }
+
+    fn wait_changed_timeout<'a>(&'a self, st: RwLockWriteGuard<'a, State>, dur: Duration) -> RwLockWriteGuard<'a, State> {
+        let seq = self.changed_seq.lock().unwrap_or_else(|e| e.into_inner());
+        let cur = *seq;
+        drop(st);
+        drop(self.changed.wait_timeout_while(seq, dur, |s| *s == cur).unwrap_or_else(|e| e.into_inner()));
+        self.lock()
     }
 
     /// Restores saved containers. Ones that were running when the daemon
@@ -3295,7 +3323,7 @@ impl Engine {
                         e.attached.clear();
                         let (container, exec_id, internal) = (e.container_id.clone(), e.id.clone(), e.config.internal);
                         drop(st);
-                        self.changed.notify_all();
+                        self.notify_changed();
                         if !internal {
                             self.emit_container("exec_die", &container, &[("execID", exec_id), ("exitCode", code.to_string())]);
                         }
@@ -3423,7 +3451,7 @@ impl Engine {
                         me.prune_layers();
                     });
                 }
-                self.changed.notify_all();
+                self.notify_changed();
                 if persist {
                     self.save();
                 }
@@ -3513,7 +3541,7 @@ impl Engine {
                 self.k8s_routes.lock().unwrap_or_else(|e| e.into_inner()).take();
                 *self.uplink.lock().unwrap_or_else(|e| e.into_inner()) = serde_json::Value::Null;
                 super::ports::set_shared_nat_active(None);
-                self.changed.notify_all();
+                self.notify_changed();
                 match end {
                     // sleep_if_idle says why it slept.
                     VmEnd::Slept => {}
@@ -4049,7 +4077,7 @@ impl Engine {
 
     /// Resolves an id, an id prefix or a name to the full id.
     pub fn resolve(&self, key: &str) -> Result<String, Error> {
-        let st = self.lock();
+        let st = self.read();
         resolve(&st, key)
     }
 
@@ -4864,7 +4892,7 @@ impl Engine {
             note_removed(&mut st, id, code);
         }
         drop(st);
-        self.changed.notify_all();
+        self.notify_changed();
         if let Some(c) = removed {
             if let Some(vm) = self.awake() {
                 let _ = vm.remove(id);
@@ -4882,12 +4910,16 @@ impl Engine {
         }
     }
 
-    pub fn lock_net(&self) -> MutexGuard<'_, Networks> {
+    pub fn read_net(&self) -> RwLockReadGuard<'_, Networks> {
+        self.networks.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn lock_net(&self) -> RwLockWriteGuard<'_, Networks> {
         self.lock_networks()
     }
 
-    fn lock_networks(&self) -> MutexGuard<'_, Networks> {
-        self.networks.lock().unwrap_or_else(|e| e.into_inner())
+    fn lock_networks(&self) -> RwLockWriteGuard<'_, Networks> {
+        self.networks.write().unwrap_or_else(|e| e.into_inner())
     }
 
     fn release_ip(&self, network: &str, ip: [u8; 4]) {
@@ -5249,7 +5281,7 @@ impl Engine {
                     _ => {}
                 },
             }
-            st = self.changed.wait(st).unwrap_or_else(|e| e.into_inner());
+            st = self.wait_changed(st);
         }
     }
 
@@ -5575,7 +5607,7 @@ impl Engine {
             if let Some(h) = self.lock().health.get_mut(&id) {
                 close_monitor(h);
             }
-            self.changed.notify_all();
+            self.notify_changed();
         } else {
             self.health_resume(&id);
         }
@@ -5885,13 +5917,13 @@ impl Engine {
                     if left.is_zero() {
                         return Err(Error::Io(io::Error::other(format!("cannot stop container: {}: it did not exit after SIGKILL", &id[..12]))));
                     }
-                    exited = self.changed.wait_timeout(exited, left).unwrap_or_else(|e| e.into_inner()).0;
+                    exited = self.wait_changed_timeout(exited, left);
                 }
                 drop(exited);
                 self.emit_container("stop", &id, &[]);
                 return Ok(true);
             }
-            st = self.changed.wait_timeout(st, left).unwrap_or_else(|e| e.into_inner()).0;
+            st = self.wait_changed_timeout(st, left);
         }
         drop(st);
         self.emit_container("stop", &id, &[]);
@@ -6012,7 +6044,7 @@ impl Engine {
                 if left.is_zero() {
                     break;
                 }
-                st = self.changed.wait_timeout(st, left).unwrap_or_else(|e| e.into_inner()).0;
+                st = self.wait_changed_timeout(st, left);
             }
         }
         Ok(())
@@ -6042,7 +6074,7 @@ impl Engine {
             }
             let mut st = self.lock();
             while st.containers.get(&id).is_some_and(|c| c.status == Status::Running) {
-                st = self.changed.wait_timeout(st, Duration::from_secs(5)).unwrap_or_else(|e| e.into_inner()).0;
+                st = self.wait_changed_timeout(st, Duration::from_secs(5));
             }
         }
         *removing = removing.wrapping_add(1);
@@ -6061,7 +6093,7 @@ impl Engine {
         // before waking waiters or returning to callers that may rebind ports.
         drop(removed.as_mut().and_then(|c| c.forwards.take()));
         self.clear_stopping_op(&id);
-        self.changed.notify_all();
+        self.notify_changed();
         let anon = self.unshared(removed.as_ref().map(|c| c.spec.anon_volumes.clone()).unwrap_or_default());
         if let Some(c) = &removed {
             lock_log(&c.log).remove();
@@ -6303,7 +6335,7 @@ impl Engine {
                 x.attached.clear();
             }
             drop(st);
-            self.changed.notify_all();
+            self.notify_changed();
             return Err(Error::Conflict(msg));
         }
         let started = self.vm()?.exec(&container_id, exec_id, &config.argv, &env, &config.cwd, &config.user, flags, exec_security.1, &exec_security.2);
@@ -6320,7 +6352,7 @@ impl Engine {
                 x.attached.clear();
             }
             drop(st);
-            self.changed.notify_all();
+            self.notify_changed();
             return Err(Error::Io(e));
         }
         if let (true, Some((rows, cols))) = (config.tty, console) {
@@ -6340,14 +6372,14 @@ impl Engine {
     }
 
     pub fn with_exec<T>(&self, exec_id: &str, f: impl FnOnce(&Exec) -> T) -> Result<T, Error> {
-        let st = self.lock();
+        let st = self.read();
         st.execs.get(exec_id).map(f).ok_or_else(|| Error::NotFound(format!("No such exec instance: {exec_id}")))
     }
 
     /// Execs running in a container now (buildx's `buildctl dial-stdio`
     /// while it builds, for one): the managed builder isn't idle while any are.
     pub fn running_execs(&self, container_id: &str) -> usize {
-        self.lock().execs.values().filter(|e| e.container_id == container_id && e.running).count()
+        self.read().execs.values().filter(|e| e.container_id == container_id && e.running).count()
     }
 
     /// Drops a finished exec's record: Kiri's own, which nobody inspects.
@@ -6356,7 +6388,7 @@ impl Engine {
     }
 
     fn is_running(&self, id: &str) -> bool {
-        self.lock().containers.get(id).is_some_and(|c| c.status == Status::Running)
+        self.read().containers.get(id).is_some_and(|c| c.status == Status::Running)
     }
 
     /// Remembers the op under which these containers are being stopped, so
@@ -6397,29 +6429,29 @@ impl Engine {
                 None => (false, false),
             }
         };
-        self.changed.notify_all();
+        self.notify_changed();
         if persist {
             self.save();
         }
         cancelled
     }
 
-    /// Runs `f` over every container, under the lock.
+    /// Runs `f` over every container, under the shared read lock.
     pub fn each<T>(&self, mut f: impl FnMut(&Container) -> Option<T>) -> Vec<T> {
-        self.lock().containers.values().filter_map(&mut f).collect()
+        self.read().containers.values().filter_map(&mut f).collect()
     }
 
     /// Runs `f` over every container alongside the current networks slice,
-    /// locking container state before networks.
+    /// taking shared read locks (container state before networks).
     pub fn each_with_networks<T>(&self, mut f: impl FnMut(&Container, &[super::network::Network]) -> Option<T>) -> Vec<T> {
-        let s = self.lock();
-        let net = self.lock_net();
+        let s = self.read();
+        let net = self.read_net();
         let networks = net.all();
         s.containers.values().filter_map(|c| f(c, networks)).collect()
     }
 
     pub fn with<T>(&self, key: &str, f: impl FnOnce(&Container) -> T) -> Result<T, Error> {
-        let st = self.lock();
+        let st = self.read();
         let id = resolve(&st, key)?;
         Ok(f(st.containers.get(&id).expect("resolved")))
     }
@@ -7615,7 +7647,7 @@ impl Engine {
                 break;
             }
             let next = pending.iter().filter(|(_, _, k)| k.is_none()).map(|(_, d, _)| d.saturating_duration_since(now)).min().unwrap_or(Duration::from_millis(100));
-            st = self.changed.wait_timeout(st, next.clamp(Duration::from_millis(10), Duration::from_millis(250))).unwrap_or_else(|e| e.into_inner()).0;
+            st = self.wait_changed_timeout(st, next.clamp(Duration::from_millis(10), Duration::from_millis(250)));
         }
         drop(st);
         if engine {
@@ -7628,12 +7660,12 @@ impl Engine {
 
     /// `State.Health` of a container with a healthcheck.
     pub fn health(&self, id: &str) -> Option<super::health::Health> {
-        self.lock().health.get(id).map(|h| h.health.clone())
+        self.read().health.get(id).map(|h| h.health.clone())
     }
 
     /// Health status by container id, for `docker ps`.
     pub fn health_statuses(&self) -> HashMap<String, super::health::Health> {
-        self.lock().health.iter().map(|(id, h)| (id.clone(), h.health.clone())).collect()
+        self.read().health.iter().map(|(id, h)| (id.clone(), h.health.clone())).collect()
     }
 
     /// Docker's `initHealthMonitor` at every start: status back to
@@ -7707,7 +7739,7 @@ impl Engine {
                     if left.is_zero() {
                         break;
                     }
-                    st = self.changed.wait_timeout(st, left).unwrap_or_else(|e| e.into_inner()).0;
+                    st = self.wait_changed_timeout(st, left);
                 }
             }
             let start = SystemTime::now();
@@ -7725,7 +7757,7 @@ impl Engine {
                 (run.health.status != before).then(|| (run.health.status.clone(), auto_remove))
             };
             if let Some((status, auto_remove)) = changed {
-                self.changed.notify_all();
+                self.notify_changed();
                 self.emit_container(&format!("health_status: {status}"), id, &[]);
                 if !auto_remove {
                     self.save();
@@ -7829,7 +7861,7 @@ mod vm_recovery_tests {
             while !ids[..2].iter().all(|id| st.containers[id].status == Status::Running && st.containers[id].restart_count == count) {
                 let left = until.saturating_duration_since(std::time::Instant::now());
                 assert!(!left.is_zero(), "policy containers stayed down without a new VM request");
-                st = engine.changed.wait_timeout(st, left.min(Duration::from_millis(100))).unwrap().0;
+                st = engine.wait_changed_timeout(st, left.min(Duration::from_millis(100)));
             }
             for id in &ids[2..] {
                 assert_eq!(st.containers[id].status, Status::Exited);
@@ -7885,7 +7917,7 @@ mod vm_recovery_tests {
             while !ids[..2].iter().all(|id| st.containers[id].status == Status::Running && st.containers[id].restart_count == count) {
                 let left = until.saturating_duration_since(std::time::Instant::now());
                 assert!(!left.is_zero(), "retirement must allow recovery after confirmed stop");
-                st = engine.changed.wait_timeout(st, left.min(Duration::from_millis(100))).unwrap().0;
+                st = engine.wait_changed_timeout(st, left.min(Duration::from_millis(100)));
             }
             assert!(st.containers[&canceled[0]].stopped_by_user);
             assert_eq!(st.containers[&canceled[0]].status, Status::Exited);
@@ -7912,7 +7944,7 @@ mod vm_recovery_tests {
         while ids[..2].iter().any(|id| st.containers[id].status == Status::Running) {
             let left = until.saturating_duration_since(std::time::Instant::now());
             assert!(!left.is_zero(), "the lost VM must finish exit accounting");
-            st = engine.changed.wait_timeout(st, left).unwrap().0;
+            st = engine.wait_changed_timeout(st, left);
         }
         assert!(st.vm_recovery_at.unwrap() > std::time::Instant::now() + Duration::from_secs(50));
         let spec = st.containers[&ids[0]].spec.clone();
@@ -7934,7 +7966,7 @@ mod vm_recovery_tests {
         while st.vm_recovery_running {
             let left = until.saturating_duration_since(std::time::Instant::now());
             assert!(!left.is_zero(), "stopping the candidates cancels the recovery worker");
-            st = engine.changed.wait_timeout(st, left.min(Duration::from_millis(100))).unwrap().0;
+            st = engine.wait_changed_timeout(st, left.min(Duration::from_millis(100)));
         }
         drop(st);
         assert!(!engine.is_awake(), "no eligible containers means the VM stays down");
@@ -8100,14 +8132,14 @@ mod vm_recovery_tests {
                         if left.is_zero() {
                             return;
                         }
-                        st = engine.changed.wait_timeout(st, left).unwrap().0;
+                        st = engine.wait_changed_timeout(st, left);
                     }
                     let c = st.containers.get_mut(&id).unwrap();
                     c.status = Status::Exited;
                     c.exit_code = 137;
                     c.exits += 1;
                     drop(st);
-                    engine.changed.notify_all();
+                    engine.notify_changed();
                 })
             };
             let r = match op {

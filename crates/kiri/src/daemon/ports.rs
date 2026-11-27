@@ -500,7 +500,7 @@ pub struct Forwards {
     /// What was actually bound: (binding, host address, host port).
     pub bound: Vec<(Binding, String, u16)>,
     #[cfg(test)]
-    on_drop: Option<Box<dyn FnOnce() + Send>>,
+    on_drop: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 #[cfg(test)]
@@ -533,7 +533,7 @@ impl Forwards {
             loopback: None,
             host_port_53: None,
             bound,
-            on_drop: Some(Box::new(on_drop)),
+            on_drop: Mutex::new(Some(Box::new(on_drop))),
         }
     }
 }
@@ -566,7 +566,7 @@ impl Drop for Forwards {
             let _ = t.join();
         }
         #[cfg(test)]
-        if let Some(f) = self.on_drop.take() {
+        if let Some(f) = self.on_drop.lock().unwrap_or_else(|e| e.into_inner()).take() {
             f();
         }
     }
@@ -1086,7 +1086,7 @@ pub fn start(vm: Arc<VmLink>, id: &str, bindings: &[Binding], target_ip: [u8; 4]
         host_port_53: None,
         bound: Vec::new(),
         #[cfg(test)]
-        on_drop: None,
+        on_drop: Mutex::new(None),
     };
     // On a Linux host the daemon shares the kernel with the containers, so
     // the kernel can rewrite the packets (nftables DNAT) instead of two

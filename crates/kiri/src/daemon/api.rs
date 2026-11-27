@@ -3553,7 +3553,7 @@ fn container_inspect(engine: &Engine, key: &str) -> Result<Value, Error> {
     let health = engine.health(&id);
     let anon_vols: Vec<String> = engine.volume_list().into_iter().filter(|v| v.anonymous).map(|v| v.name).collect();
     engine.with(&id, |c| {
-        let net = engine.lock_net();
+        let net = engine.read_net();
         let networks = net.all();
         let mut v = inspect(c, networks, &anon_vols);
         v["NetworkSettings"]["Networks"] = endpoints(c, networks);
@@ -3627,23 +3627,27 @@ fn list(req: &Request, engine: &Engine) -> Result<Value, Error> {
         || limit.is_some()
         || f.values("status").is_some()
         || f.values("exited").is_some();
+    let empty_obj = Value::Object(serde_json::Map::new());
+    let has_net_filter = f.values("network").is_some();
     let mut rows = engine.each_with_networks(|c, networks| {
         if !all && c.status != Status::Running {
             return None;
         }
-        let labels = if c.spec.labels.is_object() { c.spec.labels.clone() } else { json!({}) };
-        let first = (!c.spec.left_all_networks)
-            .then(|| networks.iter().find(|n| n.name == c.spec.network_mode || n.id == c.spec.network_mode || (c.spec.network_mode == "default" && n.name == "bridge")))
-            .flatten();
+        let labels_ref = if c.spec.labels.is_object() { &c.spec.labels } else { &empty_obj };
         let keep = f.any("id", |v| c.id.starts_with(v))
-            && f.name(&c.name)
-            && f.labels(&labels)
             && f.any("status", |v| v == state_word(c))
             && f.any("exited", |v| c.status == Status::Exited && v.parse() == Ok(c.exit_code))
+            && f.labels(labels_ref)
+            && f.name(&c.name)
             && ancestors.as_ref().is_none_or(|ids| ids.contains(&c.spec.image_id))
-            && f.any("network", |v| {
-                first.is_some_and(|n| n.name == v || n.id.starts_with(v))
-                    || c.spec.extra_networks.iter().any(|x| networks.iter().find(|n| n.name == x.name).is_some_and(|n| n.name == v || n.id.starts_with(v)))
+            && (!has_net_filter || {
+                let first = (!c.spec.left_all_networks)
+                    .then(|| networks.iter().find(|n| n.name == c.spec.network_mode || n.id == c.spec.network_mode || (c.spec.network_mode == "default" && n.name == "bridge")))
+                    .flatten();
+                f.any("network", |v| {
+                    first.is_some_and(|n| n.name == v || n.id.starts_with(v))
+                        || c.spec.extra_networks.iter().any(|x| networks.iter().find(|n| n.name == x.name).is_some_and(|n| n.name == v || n.id.starts_with(v)))
+                })
             })
             && f.any("volume", |v| c.spec.volumes.iter().chain(&c.spec.anon_volumes).any(|n| n == v) || c.spec.mount_info.iter().any(|m| m["Destination"] == v || m["Source"] == v))
             && f.any("health", |v| v == health.get(&c.id).map_or("none", |h| h.status.as_str()));
@@ -3668,7 +3672,7 @@ fn list(req: &Request, engine: &Engine) -> Result<Value, Error> {
             "KiriVmStopped": c.vm_stopped,
             "KiriStoppedByUser": c.stopped_by_user,
             "Ports": ports_list(c),
-            "Labels": if c.spec.labels.is_object() { c.spec.labels.clone() } else { json!({}) },
+            "Labels": labels_ref,
             "HostConfig": {"NetworkMode": c.spec.network_mode},
             "NetworkSettings": {"Networks": endpoints(c, networks)},
             "Mounts": c.spec.mount_info,
@@ -3906,12 +3910,12 @@ const NETWORK_FILTERS: &[&str] = &["name", "id", "driver", "label", "label!", "s
 
 fn networks(req: &Request, engine: &Engine) -> Result<Value, Error> {
     let f = filters(req, NETWORK_FILTERS)?;
-    let list: Vec<super::network::Network> = engine.lock_net().all().to_vec();
+    let list: Vec<super::network::Network> = engine.read_net().all().to_vec();
     Ok(Value::Array(list.iter().filter(|n| network_matches(&f, engine, n)).map(|n| network_json(engine, n, false)).collect()))
 }
 
 fn network_inspect(engine: &Engine, key: &str) -> Result<Value, Error> {
-    let n = engine.lock_net().find(key).cloned().ok_or_else(|| Error::NotFound(format!("network {key} not found")))?;
+    let n = engine.read_net().find(key).cloned().ok_or_else(|| Error::NotFound(format!("network {key} not found")))?;
     Ok(network_json(engine, &n, true))
 }
 

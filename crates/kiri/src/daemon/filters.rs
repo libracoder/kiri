@@ -70,8 +70,19 @@ impl Filters {
             return true;
         }
         let bare = name.trim_start_matches('/');
+        if self.names.iter().any(|p| p.matches(bare)) {
+            return true;
+        }
+        if bare.len() < 255 {
+            let mut buf = [0u8; 256];
+            buf[0] = b'/';
+            buf[1..1 + bare.len()].copy_from_slice(bare.as_bytes());
+            if let Ok(slashed) = std::str::from_utf8(&buf[..1 + bare.len()]) {
+                return self.names.iter().any(|p| p.matches(slashed));
+            }
+        }
         let slashed = format!("/{bare}");
-        self.names.iter().any(|p| p.matches(bare) || p.matches(&slashed))
+        self.names.iter().any(|p| p.matches(&slashed))
     }
 
     /// A network's `id` filter, which Docker matches like `name`: exactly,
