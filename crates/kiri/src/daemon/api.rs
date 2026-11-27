@@ -1828,6 +1828,11 @@ fn mac_shared(src: &str) -> bool {
 /// Whether `src` names one of the synthetic macOS `/etc` paths backed by
 /// `~/.kiri/etc` (`hostetc`), either via `/etc` or directly via `~/.kiri/etc`.
 fn is_mac_hostetc(src: &str) -> bool {
+    let etc_dir = super::state_dir().ok().map(|s| s.join("etc"));
+    is_mac_hostetc_with(src, etc_dir.as_deref())
+}
+
+fn is_mac_hostetc_with(src: &str, etc_dir: Option<&std::path::Path>) -> bool {
     if !cfg!(target_os = "macos") {
         return false;
     }
@@ -1835,16 +1840,19 @@ fn is_mac_hostetc(src: &str) -> bool {
     if norm == "/etc" || norm.strip_prefix("/etc/").is_some_and(|name| super::hostetc::FILES.contains(&name)) {
         return true;
     }
-    if let Ok(state) = super::state_dir() {
-        let etc_dir = state.join("etc");
-        let etc_lex = lexical_path(&etc_dir.to_string_lossy());
-        let etc_canon = canonical_or_ancestor(&etc_dir.to_string_lossy());
+    if let Some(etc_dir) = etc_dir {
+        let etc_str = etc_dir.to_string_lossy();
+        let etc_lex = lexical_path(&etc_str);
+        let etc_canon = canonical_or_ancestor(&etc_str);
         let matches_etc = |p: &str| {
             p == etc_lex
                 || p.strip_prefix(&etc_lex).is_some_and(|r| r.starts_with('/'))
                 || etc_canon.as_deref().is_some_and(|c| p == c || p.strip_prefix(c).is_some_and(|r| r.starts_with('/')))
         };
-        if matches_etc(&norm) || canonical_or_ancestor(src).as_deref().is_some_and(matches_etc) {
+        if matches_etc(&norm)
+            || canonical_or_ancestor(src).as_deref().is_some_and(matches_etc)
+            || canonical_or_ancestor(&norm).as_deref().is_some_and(matches_etc)
+        {
             return true;
         }
     }
@@ -2003,24 +2011,47 @@ fn lexical_path(p: &str) -> String {
 const ALLOWED_VOLUME_TYPES: &[&str] = &["", "none", "nfs", "nfs4", "cifs", "smb3", "tmpfs"];
 
 /// Canonicalizes `p` if it exists, or canonicalizes its deepest existing ancestor
-/// and re-appends the remaining tail components so symlinked parents (such as
-/// `/var/run/kiri -> /run/kiri`) are resolved even when the leaf does not exist.
+/// (following dangling symlinks up to 40 hops) and re-appends the remaining tail
+/// components so symlinked parents (such as `/var/run/kiri -> /run/kiri` or
+/// `/tmp/evil/nonexistent/..`) are resolved even when the leaf does not exist
+/// or ends in `..`.
 fn canonical_or_ancestor(p: &str) -> Option<String> {
-    let path = std::path::Path::new(p);
-    let mut tail: Vec<std::ffi::OsString> = Vec::new();
-    let mut cur = path;
-    loop {
-        if let Ok(canon) = std::fs::canonicalize(cur) {
-            let mut full = canon;
-            for seg in tail.into_iter().rev() {
-                full.push(seg);
-            }
-            return full.into_os_string().into_string().ok().map(|s| lexical_path(&s));
-        }
-        let name = cur.file_name()?;
-        tail.push(name.to_os_string());
-        cur = cur.parent()?;
+    if let Ok(canon) = std::fs::canonicalize(p) {
+        return canon.into_os_string().into_string().ok().map(|s| lexical_path(&s));
     }
+    let walk = |start: &std::path::Path| -> Option<String> {
+        let mut cur = start.to_path_buf();
+        let mut tail: Vec<std::ffi::OsString> = Vec::new();
+        let mut hops = 0usize;
+        loop {
+            if let Ok(canon) = std::fs::canonicalize(&cur) {
+                let mut full = canon;
+                for seg in tail.into_iter().rev() {
+                    full.push(seg);
+                }
+                return full.into_os_string().into_string().ok().map(|s| lexical_path(&s));
+            }
+            if hops < 40
+                && let Ok(target) = std::fs::read_link(&cur)
+            {
+                hops += 1;
+                let next = if target.is_absolute() {
+                    target
+                } else {
+                    cur.parent().map_or(target.clone(), |p| p.join(&target))
+                };
+                cur = next;
+                continue;
+            }
+            let name = cur.file_name()?.to_os_string();
+            tail.push(name);
+            cur = cur.parent()?.to_path_buf();
+        }
+    };
+    walk(std::path::Path::new(p)).or_else(|| {
+        let norm = lexical_path(p);
+        walk(std::path::Path::new(&norm))
+    })
 }
 
 /// Whether `src` (either lexically or after resolving symlinks) is a parent or
@@ -2043,11 +2074,12 @@ fn is_host_socket_ancestor(src: &str) -> bool {
 }
 
 fn is_host_socket_ancestor_against(src: &str, socket_candidates: &[String]) -> bool {
-    let mut src_forms = vec![lexical_path(src)];
-    if let Some(canon) = canonical_or_ancestor(src)
-        && !src_forms.contains(&canon)
-    {
-        src_forms.push(canon);
+    let norm = lexical_path(src);
+    let mut src_forms = vec![norm.clone()];
+    for candidate in [canonical_or_ancestor(src), canonical_or_ancestor(&norm)].into_iter().flatten() {
+        if !src_forms.contains(&candidate) {
+            src_forms.push(candidate);
+        }
     }
     let parent_of = |sock: &str| -> Option<String> {
         let (parent, _) = sock.rsplit_once('/')?;
@@ -7932,6 +7964,10 @@ mod network_option_tests {
         assert!(super::is_host_socket_ancestor_against(&real_sock_dir.to_string_lossy(), &cands));
         assert!(super::is_host_socket_ancestor_against(&tmp.join("real_run").to_string_lossy(), &cands));
         assert!(super::is_host_socket_ancestor_against(&sym_sock_dir.to_string_lossy(), &cands));
+        assert!(super::is_host_socket_ancestor_against(
+            &format!("{}/nonexistent/..", sym_sock_dir.display()),
+            &cands,
+        ));
         assert!(!super::is_host_socket_ancestor_against(&sibling_dir.to_string_lossy(), &cands));
 
         // Regular binds from Caller::Container cannot bind the host socket parent directory or a symlink to it.
@@ -7976,6 +8012,18 @@ mod network_option_tests {
             assert!(parts[2].split(',').any(|f| f == "ro"), "container mount must carry ro: {}", mounts.guest[0]);
             let vol_flags = u64::from_str_radix(parts[5], 16).unwrap();
             assert_ne!(vol_flags & 1, 0, "volume mount flags must set MS_RDONLY: {}", mounts.guest[0]);
+            let fake_etc = tmp.join("state/etc");
+            std::fs::create_dir_all(&fake_etc).unwrap();
+            let etc_link = tmp.join("evil-etc-link");
+            std::os::unix::fs::symlink(&fake_etc, &etc_link).unwrap();
+            assert!(super::is_mac_hostetc_with(&etc_link.to_string_lossy(), Some(&fake_etc)));
+            assert!(super::is_mac_hostetc_with(&format!("{}/nonexistent/..", etc_link.display()), Some(&fake_etc)));
+            // Also catches dangling symlinks pointing at a not-yet-created `state/etc`.
+            let missing_etc = tmp.join("missing-state/etc");
+            let dangling_link = tmp.join("dangling-etc-link");
+            std::os::unix::fs::symlink(&missing_etc, &dangling_link).unwrap();
+            assert!(super::is_mac_hostetc_with(&dangling_link.to_string_lossy(), Some(&missing_etc)));
+            assert!(super::is_mac_hostetc_with(&format!("{}/nonexistent/..", dangling_link.display()), Some(&missing_etc)));
         }
 
         drop(engine);

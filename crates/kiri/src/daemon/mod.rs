@@ -812,6 +812,9 @@ fn safe_root_socket_dir_with(
     if euid != 0 {
         return true;
     }
+    if socket.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        return false;
+    }
     let Some(dir) = socket.parent() else { return false };
     if !dir.is_absolute() {
         return false;
@@ -1619,6 +1622,16 @@ mod tests {
             |p| match p.to_str() {
                 Some("/run/kiri") => Ok((false, true, 0, 0o755)),
                 _ => Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+            },
+        ));
+        // Any `..` traversal component is rejected even if existing prefixes are root-owned.
+        assert!(!safe_root_socket_dir_with(
+            std::path::Path::new("/run/kiri/nonexistent/../../home/alice/docker.sock"),
+            0,
+            |p| match p.to_str() {
+                Some("/run/kiri") | Some("/run") | Some("/") => Ok((false, true, 0, 0o755)),
+                Some("/home/alice") => Ok((false, true, 1000, 0o755)),
+                _ => Err(io::Error::from(io::ErrorKind::NotFound)),
             },
         ));
         // Full root-owned non-group/world-writable chain -> allowed.
