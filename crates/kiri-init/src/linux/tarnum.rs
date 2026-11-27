@@ -86,9 +86,15 @@ impl<R: Read> GoNumbers<R> {
         let realsize: &[(usize, usize)] = if sparse { &REALSIZE } else { &[] };
         let mut changed = false;
         for &(a, b) in std::iter::once(&SIZE).chain(entry).chain(devices).chain(realsize) {
-            if h[a..b].iter().all(|&c| c == 0 || c == b' ') {
+            let lead = h[a..b].iter().take_while(|&&c| c == 0 || c == b' ').count();
+            if lead == b - a {
                 h[a..b - 1].fill(b'0');
                 h[b - 1] = 0;
+                changed = true;
+            } else if h[a..a + lead].contains(&0) {
+                // Leading NULs before the digits: Go skips them (parseOctal
+                // trims " \x00"); tar-rs would stop at the first one.
+                h[a..a + lead].fill(b'0');
                 changed = true;
             }
         }
@@ -557,5 +563,50 @@ mod tests {
         assert_eq!(got[0].0, "sparse.bin");
         assert_eq!(got[0].2, fake.as_bytes());
         assert_eq!(got[1].0, "after");
+    }
+}
+
+#[cfg(test)]
+mod leading_nul_tests {
+    use super::*;
+
+    /// One file entry whose header bytes `range` are `bytes`, as written.
+    fn with_field(range: std::ops::Range<usize>, bytes: &[u8]) -> Vec<u8> {
+        let mut h = tar::Header::new_ustar();
+        h.set_path("f").unwrap();
+        h.set_size(1);
+        h.set_mode(0o644);
+        h.set_uid(1000);
+        h.set_gid(1000);
+        h.set_mtime(1);
+        h.as_mut_bytes()[range].copy_from_slice(bytes);
+        h.set_cksum();
+        let mut out = h.as_bytes().to_vec();
+        out.push(b'x');
+        out.resize(2048, 0);
+        out
+    }
+
+    fn header(t: &[u8]) -> tar::Header {
+        let mut a = tar::Archive::new(GoNumbers::new(t));
+        a.entries().unwrap().next().unwrap().unwrap().header().clone()
+    }
+
+    /// Go's parseOctal trims leading NULs and spaces, so `\0000644` is 0644;
+    /// tar-rs alone stops at the first NUL and reads no number at all.
+    #[test]
+    fn numbers_after_leading_nuls_read_as_go_reads_them() {
+        assert_eq!(header(&with_field(100..108, b"\x000000644")).mode().unwrap(), 0o644);
+        assert_eq!(header(&with_field(108..116, b"\x00\x00001750")).uid().unwrap(), 1000);
+        assert_eq!(header(&with_field(108..116, b"\x00 \x00 1750")).uid().unwrap(), 1000);
+        assert_eq!(header(&with_field(136..148, b"\x0000000000017")).mtime().unwrap(), 0o17);
+        // A NUL after the digits ends them, as Go's parseString.
+        assert_eq!(header(&with_field(100..108, b"\x00006\x0044\0")).mode().unwrap(), 6);
+        // The size too: the data still lines up.
+        let t = with_field(124..136, b"\x0000000000001");
+        let mut a = tar::Archive::new(GoNumbers::new(&t[..]));
+        let mut s = String::new();
+        a.entries().unwrap().next().unwrap().unwrap().read_to_string(&mut s).unwrap();
+        assert_eq!(s, "x");
     }
 }

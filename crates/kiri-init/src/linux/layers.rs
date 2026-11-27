@@ -211,11 +211,45 @@ fn unpack(blob: &mut impl Read, media_type: &str, dest: &Path, compressed: u64) 
     if media_type.ends_with("gzip") {
         untar(Capped { inner: flate2::read::MultiGzDecoder::new(buffered), left }, dest)
     } else if media_type.ends_with("zstd") {
-        let decoder = ruzstd::decoding::StreamingDecoder::new(buffered)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("zstd: {e}")))?;
-        untar(Capped { inner: decoder, left }, dest)
+        // The first frame at once, so a blob that is none is refused as before.
+        let first = ruzstd::decoding::StreamingDecoder::new(buffered).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("zstd: {e}")))?;
+        untar(Capped { inner: ZstdFrames { frame: Some(first), source: None }, left }, dest)
     } else {
         untar(Capped { inner: buffered, left }, dest)
+    }
+}
+
+/// A zstd blob, decompressed: every frame of it, one after the other (RFC
+/// 8878 3.1; zstd:chunked and pzstd write several). ruzstd's decoder reads
+/// one frame and stops.
+struct ZstdFrames<R: io::BufRead> {
+    /// None between frames and at the end.
+    frame: Option<ruzstd::decoding::StreamingDecoder<R, ruzstd::decoding::FrameDecoder>>,
+    /// The source, while no frame holds it.
+    source: Option<R>,
+}
+
+impl<R: io::BufRead> Read for ZstdFrames<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let zstd = |e: String| io::Error::new(io::ErrorKind::InvalidData, format!("zstd: {e}"));
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            if let Some(frame) = &mut self.frame {
+                let n = frame.read(buf).map_err(|e| zstd(e.to_string()))?;
+                if n > 0 {
+                    return Ok(n);
+                }
+                // This frame is done: the source goes back for the next one.
+                self.source = self.frame.take().map(ruzstd::decoding::StreamingDecoder::into_inner);
+            }
+            let Some(mut source) = self.source.take() else { return Ok(0) };
+            if source.fill_buf()?.is_empty() {
+                return Ok(0);
+            }
+            self.frame = Some(ruzstd::decoding::StreamingDecoder::new(source).map_err(|e| zstd(e.to_string()))?);
+        }
     }
 }
 
@@ -511,7 +545,9 @@ fn uid_map_in_user_namespace(first_line: &str) -> bool {
 /// what a container reads must be what the archive says. Folders are left
 /// alone: what is unpacked into one changes its time afterwards anyway.
 pub(crate) fn keep_zero_time(dest: &Path, path: &Path, h: &tar::Header) -> io::Result<()> {
-    if h.mtime()? != 0 || h.entry_type().is_dir() || h.entry_type().is_hard_link() {
+    // A pax global header is no file: tar-rs says it unpacked one but made
+    // nothing, and Docker ignores it.
+    if h.entry_type() == tar::EntryType::XGlobalHeader || h.mtime()? != 0 || h.entry_type().is_dir() || h.entry_type().is_hard_link() {
         return Ok(());
     }
     let root = inroot::open_root(dest)?;
@@ -1798,5 +1834,86 @@ mod tests {
         let _ = fs::remove_dir_all(&fresh);
         assert_eq!(expansion_cap(1), 1 << 30);
         assert_eq!(expansion_cap(1 << 40), 64 << 30);
+    }
+}
+
+#[cfg(test)]
+mod zstd_frames_and_global_header_tests {
+    use super::*;
+
+    /// A file owned by whoever runs the test, so it unpacks without root.
+    fn file(b: &mut tar::Builder<Vec<u8>>, name: &str, data: &[u8], mtime: u64) {
+        let mut h = tar::Header::new_ustar();
+        h.set_size(data.len() as u64);
+        h.set_mode(0o644);
+        // SAFETY: plain getters.
+        h.set_uid(unsafe { libc::getuid() } as u64);
+        // SAFETY: plain getters.
+        h.set_gid(unsafe { libc::getgid() } as u64);
+        h.set_mtime(mtime);
+        b.append_data(&mut h, name, data).unwrap();
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("kiri-layers-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// A zstd layer is every frame of it, one after the other (RFC 8878
+    /// 3.1), as zstd:chunked and pzstd write them: none is left out.
+    #[test]
+    fn a_zstd_layer_of_several_frames_unpacks_whole() {
+        let mut b = tar::Builder::new(Vec::new());
+        file(&mut b, "a", b"first", 1_000_000);
+        file(&mut b, "b", b"second", 1_000_000);
+        file(&mut b, "c", b"third", 1_000_000);
+        let tar = b.into_inner().unwrap();
+        let zstd = |d: &[u8]| ruzstd::encoding::compress_to_vec(d, ruzstd::encoding::CompressionLevel::Fastest);
+        let mt = "application/vnd.oci.image.layer.v1.tar+zstd";
+        // One frame per entry (header and data), the end blocks in a last one;
+        // and one frame for all of it.
+        let mut frames: Vec<u8> = [&tar[..1024], &tar[1024..2048], &tar[2048..3072], &tar[3072..]].iter().flat_map(|p| zstd(p)).collect();
+        for (what, blob) in [("several frames", std::mem::take(&mut frames)), ("one frame", zstd(&tar))] {
+            let d = scratch("zstd-frames");
+            unpack(&mut &blob[..], mt, &d, blob.len() as u64).unwrap_or_else(|e| panic!("{what}: {e}"));
+            for (name, want) in [("a", "first"), ("b", "second"), ("c", "third")] {
+                assert_eq!(fs::read_to_string(d.join(name)).ok().as_deref(), Some(want), "{what}: {name}");
+            }
+            let _ = fs::remove_dir_all(&d);
+        }
+        // A blob cut inside a frame is still an error, not a short layer.
+        let whole = zstd(&tar);
+        let d = scratch("zstd-cut");
+        assert!(unpack(&mut &whole[..whole.len() - 3], mt, &d, whole.len() as u64 - 3).is_err());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// A pax global header ('g') is no file, whatever its time: Docker
+    /// ignores it, and the entries after it still unpack.
+    #[test]
+    fn a_pax_global_header_is_no_file_even_with_time_zero() {
+        for mtime in [0, 1] {
+            let mut b = tar::Builder::new(Vec::new());
+            let data = b"19 comment=abcdefg\n";
+            let mut h = tar::Header::new_ustar();
+            h.set_entry_type(tar::EntryType::XGlobalHeader);
+            h.set_size(data.len() as u64);
+            h.set_mode(0o644);
+            h.set_uid(0);
+            h.set_gid(0);
+            h.set_mtime(mtime);
+            b.append_data(&mut h, "pax_global_header", &data[..]).unwrap();
+            file(&mut b, "f", b"x", 0);
+            let tar = b.into_inner().unwrap();
+            let d = scratch("pax-global");
+            untar_in(&tar[..], &d, || false).unwrap_or_else(|e| panic!("mtime {mtime}: {e}"));
+            assert!(!d.join("pax_global_header").exists(), "mtime {mtime}");
+            // The file after it keeps its time of 0.
+            let m = fs::symlink_metadata(d.join("f")).unwrap();
+            assert_eq!(std::os::unix::fs::MetadataExt::mtime(&m), 0, "mtime {mtime}");
+            let _ = fs::remove_dir_all(&d);
+        }
     }
 }
