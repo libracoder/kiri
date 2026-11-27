@@ -4223,19 +4223,32 @@ mod tests {
     #[test]
     fn manifest_retries_transient_429_before_succeeding() {
         use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicBool, Ordering};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let host = listener.local_addr().unwrap().to_string();
+        let addr = listener.local_addr().unwrap();
+        let host = addr.to_string();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let stop_srv = stop.clone();
         let body = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v2+json"}"#.to_vec();
         let server = std::thread::spawn(move || {
             let mut manifests = 0u32;
             for c in listener.incoming().flatten() {
+                if stop_srv.load(Ordering::Relaxed) {
+                    break;
+                }
                 let mut c = c;
                 let mut buf = [0u8; 2048];
                 let n = c.read(&mut buf).unwrap_or(0);
                 let head = String::from_utf8_lossy(&buf[..n]);
+                if !head.starts_with("GET ") && !head.starts_with("HEAD ") {
+                    continue;
+                }
                 let path = head.lines().next().and_then(|l| l.split_whitespace().nth(1)).unwrap_or("");
                 if path == "/v2/" {
                     let _ = c.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
+                    continue;
+                }
+                if !path.contains("/manifests/") {
                     continue;
                 }
                 manifests += 1;
@@ -4254,14 +4267,16 @@ mod tests {
                     );
                     let _ = c.write_all(reply.as_bytes());
                     let _ = c.write_all(&body);
-                    break;
                 }
+                let _ = c.flush();
             }
             manifests
         });
         let client = Client::new();
         let r = Reference::parse(&format!("{host}/library/alpine:3.18")).unwrap();
         let (got, media_type) = client.manifest(&r, &r.reference).unwrap();
+        stop.store(true, Ordering::Relaxed);
+        let _ = std::net::TcpStream::connect(addr);
         assert_eq!(media_type, "application/vnd.oci.image.manifest.v2+json");
         assert!(got.starts_with(b"{\"schemaVersion\":2"));
         assert_eq!(server.join().unwrap(), 3);
