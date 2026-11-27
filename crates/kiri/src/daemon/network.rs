@@ -587,6 +587,12 @@ pub fn parse_ipam_both(v: &serde_json::Value) -> Result<(Option<Ipam>, Option<Ip
             if !inside(ip) {
                 return Err(format!("invalid {what} {s}: parent subnet {subnet} does not contain ip address {s}"));
             }
+            // The subnet's own address and its broadcast address are no
+            // host's, as for containers (`check_static`) and in Docker.
+            let host = u32::from_be_bytes(ip) - u32::from_be_bytes(net);
+            if host == 0 || host == (u32::MAX >> prefix) {
+                return Err(format!("invalid {what} {s}: it is the network or broadcast address of subnet {subnet}"));
+            }
             Ok(ip)
         };
         let gateway = match field("Gateway") {
@@ -720,6 +726,11 @@ impl Networks {
     pub fn create(&mut self, name: &str, s: Settings) -> Result<Network, String> {
         if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b)) {
             return Err(format!("invalid network name {name:?}"));
+        }
+        // `find` takes `default` for `bridge`, so a network by that name could
+        // never be reached or removed; Docker refuses it as predefined.
+        if name == "default" {
+            return Err("operation is not permitted on predefined default network".into());
         }
         if self.find(name).is_some_and(|n| n.name == name) {
             return Err(format!("network with name {name} already exists"));
@@ -1338,6 +1349,33 @@ mod tests {
         assert!(bad(serde_json::json!({"Subnet": "fd00:5::/64", "IPRange": "fd00:5::/48"})).contains("ip-range"));
         let two = serde_json::json!({"Config": [{"Subnet": "fd00:5::/64"}, {"Subnet": "fd00:6::/64"}]});
         assert!(parse_ipam_both(&two).unwrap_err().contains("one IPv6 subnet"));
+    }
+
+    #[test]
+    fn gateway_and_aux_are_never_the_network_or_broadcast_address() {
+        let bad = |cfg: serde_json::Value| parse_ipam(&serde_json::json!({"Config": [cfg]})).unwrap_err();
+        assert!(bad(serde_json::json!({"Subnet": "10.5.0.0/24", "Gateway": "10.5.0.255"})).contains("broadcast"));
+        assert!(bad(serde_json::json!({"Subnet": "10.5.0.0/24", "Gateway": "10.5.0.0"})).contains("broadcast"));
+        assert!(bad(serde_json::json!({"Subnet": "10.5.0.0/24", "AuxiliaryAddresses": {"r": "10.5.0.0"}})).contains("auxiliary address r"));
+        assert!(bad(serde_json::json!({"Subnet": "10.4.0.0/30", "Gateway": "10.4.0.3"})).contains("broadcast"));
+        // The first and last usable addresses still are.
+        let ok = |g: &str, s: &str| parse_ipam(&serde_json::json!({"Config": [{"Subnet": s, "Gateway": g}]})).unwrap().unwrap().gateway;
+        assert_eq!(ok("10.5.0.1", "10.5.0.0/24"), Some([10, 5, 0, 1]));
+        assert_eq!(ok("10.5.0.254", "10.5.0.0/24"), Some([10, 5, 0, 254]));
+        assert_eq!(ok("10.4.0.2", "10.4.0.0/30"), Some([10, 4, 0, 2]));
+    }
+
+    #[test]
+    fn a_network_cannot_be_named_default() {
+        let (mut n, dir) = nets();
+        let e = n.create("default", Settings::default()).unwrap_err();
+        assert!(e.contains("predefined default network"), "{e}");
+        assert!(!n.all().iter().any(|x| x.name == "default"));
+        // Names merely starting with it are ordinary names.
+        n.create("default2", Settings::default()).unwrap();
+        assert_eq!(n.find("default2").map(|x| x.name.as_str()), Some("default2"));
+        n.remove("default2").unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     fn nets() -> (Networks, std::path::PathBuf) {
