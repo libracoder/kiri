@@ -222,12 +222,25 @@ fn mount_kernel_filesystems() -> io::Result<()> {
 fn host_dirs() -> io::Result<container::Paths> {
     // SAFETY: umask only changes this process's file-creation mask.
     unsafe { libc::umask(0o022) };
-    // Claim the network namespace BEFORE touching `/var/lib/kiri` mounts so a
-    // second engine never detaches a running engine's mount before failing.
-    net::claim_host_netns()?;
     let root = PathBuf::from(DATA);
-    if let Some(data) = std::env::var_os("KIRI_AGENT_DATA").map(PathBuf::from).filter(|p| p.is_absolute() && p != &root) {
-        mount_agent_data(&data, &root)?;
+    let data = std::env::var_os("KIRI_AGENT_DATA").map(PathBuf::from).filter(|p| p.is_absolute() && p != &root);
+    let own_root = data.as_deref().unwrap_or(&root);
+    // Claim the network namespace BEFORE touching `/var/lib/kiri` mounts so a
+    // second engine never detaches a running engine's mount before failing (#443).
+    // When this data directory's own `agent.lock` is held (for example by a
+    // frozen container child that inherited `@kiri-engine-netns` before closing
+    // descriptors when the old agent died), reclaim our own lock and sweep our
+    // own recorded cgroup first, then claim the network namespace.
+    if let Err(e) = net::claim_host_netns() {
+        if e.kind() == io::ErrorKind::AddrInUse && is_file_locked(&own_root.join("agent.lock")) {
+            take_over(own_root, || sweep_recorded_cgroup(own_root))?;
+            net::claim_host_netns()?;
+        } else {
+            return Err(e);
+        }
+    }
+    if let Some(data) = &data {
+        mount_agent_data(data, &root)?;
     } else {
         detach_deleted_bind_mount(&root);
     }
@@ -241,20 +254,9 @@ fn host_dirs() -> io::Result<container::Paths> {
     mkdir(&root, 0o710)?;
     mkdir(&root.join("volumes"), 0o700)?;
     // What a dead agent left running can hold its lock (see `take_over`).
-    let leftovers = || {
-        let Ok(old) = std::fs::read_to_string(root.join("agent.cgroup")) else { return };
-        let old = PathBuf::from(old.trim());
-        if is_cgroup2_dir(&old) {
-            let paths = container::Paths {
-                layers: root.join("layers"),
-                containers: root.join("containers"),
-                cgroup: old.clone(),
-                cgroup_root: old.clone(),
-            };
-            container::sweep(&paths, &old);
-        }
-    };
-    take_over(&root, leftovers)?;
+    if AGENT_LOCK.get().is_none() {
+        take_over(&root, || sweep_recorded_cgroup(&root))?;
+    }
     let (cgroup_root, cgroup) = host_cgroup()?;
     let paths = container::Paths {
         layers: root.join("layers"),
@@ -340,6 +342,38 @@ fn is_mounted_at(mountinfo: &str, target: &std::path::Path) -> bool {
 
 /// The lock on a Linux host's data directory, held while the agent runs.
 static AGENT_LOCK: std::sync::OnceLock<File> = std::sync::OnceLock::new();
+
+/// Whether `path` exists and another open file description currently holds an
+/// exclusive `flock` on it, without creating `path` or keeping a lock.
+fn is_file_locked(path: &std::path::Path) -> bool {
+    use std::os::fd::AsRawFd;
+    let Ok(file) = File::open(path) else {
+        return false;
+    };
+    // SAFETY: non-blocking `flock` probe on a descriptor we own.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        false
+    } else {
+        io::Error::last_os_error().raw_os_error() == Some(libc::EWOULDBLOCK)
+    }
+}
+
+/// Sweeps containers recorded in `root/agent.cgroup` by a previous agent of
+/// this data directory.
+fn sweep_recorded_cgroup(root: &std::path::Path) {
+    let Ok(old) = std::fs::read_to_string(root.join("agent.cgroup")) else { return };
+    let old = PathBuf::from(old.trim());
+    if is_cgroup2_dir(&old) {
+        let paths = container::Paths {
+            layers: root.join("layers"),
+            containers: root.join("containers"),
+            cgroup: old.clone(),
+            cgroup_root: old.clone(),
+        };
+        container::sweep(&paths, &old);
+    }
+}
 
 /// One agent per data directory on a Linux host: takes `agent.lock` (an
 /// flock, released when the process ends however it ends). An agent that
@@ -990,6 +1024,25 @@ mod cgroup_discovery_tests {
         assert!(super::is_mounted_at(mountinfo, Path::new("/var/lib/kiri")));
         assert!(!super::is_mounted_at(mountinfo, Path::new("/var/lib")));
         assert!(!super::is_mounted_at(mountinfo, Path::new("/media/ssd")));
+    }
+
+    #[test]
+    fn is_file_locked_detects_held_flock_without_creating_missing_file() {
+        use std::os::fd::AsRawFd;
+        let dir = std::env::temp_dir().join(format!("kiri-lock-probe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock_path = dir.join("agent.lock");
+        assert!(!super::is_file_locked(&lock_path));
+        assert!(!lock_path.exists(), "missing lock file must not be created");
+
+        let holder = std::fs::File::create(&lock_path).unwrap();
+        assert!(!super::is_file_locked(&lock_path));
+        assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
+        assert!(super::is_file_locked(&lock_path));
+        drop(holder);
+        assert!(!super::is_file_locked(&lock_path));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

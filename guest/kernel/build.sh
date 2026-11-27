@@ -20,13 +20,9 @@ cd /build
 cd "linux-$KVER"
 # Kiri's kernel patches. Reverse-apply in reverse order first so stacked
 # patches on a cached tree stay clean.
-unapply() {
-  [ "$#" -eq 0 ] && return 0
-  p=$1; shift
-  unapply "$@"
+printf '%s\n' /src/patches/*.patch | sort -r | while IFS= read -r p; do
   patch -p1 -R -s -f --dry-run < "$p" >/dev/null 2>&1 && patch -p1 -R -s < "$p" || true
-}
-unapply /src/patches/*.patch
+done
 for p in /src/patches/*.patch; do
   patch -p1 -s < "$p"
 done

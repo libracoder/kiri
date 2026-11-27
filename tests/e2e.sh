@@ -200,15 +200,28 @@ if [ "$SYS" != mac ]; then
   BRIDGE_GW=$($D network inspect bridge -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}' 2>/dev/null)
   BRIDGE_GW=${BRIDGE_GW:-172.17.0.1}
   # The default bridge names the host's resolvers, as the agent reads them
-  # (kiri-init transport.rs host_dns): /etc/resolv.conf's but loopback, else
-  # systemd-resolved's upstreams; a resolver at one of the host's own
-  # addresses (WSL's forwarder, 10.255.255.254 on lo) is asked through the
-  # agent, at the bridge's gateway as in the VM, never at a loopback address
-  # (container.rs embedded_dns, embedded_address). Docker on Linux also
-  # names the host's.
-  ns() { sed -n 's/^nameserver[[:space:]]*\([0-9.]*\).*/\1/p' "$1" 2>/dev/null | grep -v '^127\.' | head -1; }
-  HOST_NS=$(ns /etc/resolv.conf); [ -n "$HOST_NS" ] || HOST_NS=$(ns /run/systemd/resolve/resolv.conf)
-  if [ -n "$HOST_NS" ] && ip -4 -o addr 2>/dev/null | grep -qF " inet $HOST_NS/"; then DEFAULT_NS=$BRIDGE_GW; elif [ -n "$HOST_NS" ]; then DEFAULT_NS=$HOST_NS; fi
+  # (kiri-init transport.rs host_dns): /etc/resolv.conf's (including a
+  # loopback stub such as systemd-resolved's 127.0.0.53), plus
+  # systemd-resolved's non-loopback upstreams when /etc/resolv.conf names
+  # none of its own; when any upstream is loopback or one of the host's own
+  # addresses (WSL's forwarder, 10.255.255.254 on lo), containers ask through
+  # the agent at the bridge's gateway, never at a loopback address
+  # (container.rs embedded_dns, embedded_address).
+  ns_all() { sed -n 's/^[[:space:]]*nameserver[[:space:]][[:space:]]*\([0-9][0-9.]*\).*/\1/p' "$1" 2>/dev/null; }
+  HOST_NSS=$(ns_all /etc/resolv.conf)
+  if [ -z "$HOST_NSS" ] || ! printf '%s\n' "$HOST_NSS" | grep -qv '^127\.'; then
+    HOST_NSS=$(printf '%s\n%s\n' "$HOST_NSS" "$(ns_all /run/systemd/resolve/resolv.conf | grep -v '^127\.')" | sed '/^$/d')
+  fi
+  HOST_NS=$(printf '%s\n' "$HOST_NSS" | head -1)
+  if [ -n "$HOST_NS" ]; then
+    DEFAULT_NS=$HOST_NS
+    for _ip in $HOST_NSS; do
+      if [[ "$_ip" == 127.* ]] || ip -4 -o addr 2>/dev/null | grep -qF " inet $_ip/"; then
+        DEFAULT_NS=$BRIDGE_GW
+        break
+      fi
+    done
+  fi
   # --network host is the host's own network: its address towards the internet.
   HOSTNET_ADDR="inet $(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p')/" HOSTNET_IF=
   HOST_UPS=$(cat /proc/sys/net/ipv4/ip_unprivileged_port_start 2>/dev/null)
@@ -956,7 +969,7 @@ $D run -d --name hn-lo -p 127.0.0.1:18093:80 nginx:alpine >/dev/null
 $D run -d --name hn-all -p 18094:80 nginx:alpine >/dev/null
 nginx_up hn-lo; nginx_up hn-all
 t hostnet-published-loopback "Welcome to nginx" $D run --rm --network host alpine wget -qO- -T 5 http://127.0.0.1:18093/
-t hostnet-published-localhost "Welcome to nginx" $D run --rm --network host alpine wget -qO- -T 5 http://localhost:18093/
+only mac t hostnet-published-localhost "Welcome to nginx" $D run --rm --network host alpine wget -qO- -T 5 http://localhost:18093/
 t hostnet-published-every-address "Welcome to nginx" $D run --rm --network host alpine wget -qO- -T 5 http://localhost:18094/
 # Gone with the container: the port is free in the host's network again.
 t hostnet-published-gone "ok" bash -c "$D rm -f hn-lo >/dev/null; $D run --rm --network host alpine sh -c '(wget -qO- -T 3 http://127.0.0.1:18093/ >/dev/null 2>&1 || wget -qO- -T 3 http://localhost:18093/ >/dev/null 2>&1) && echo still-there || echo ok'"

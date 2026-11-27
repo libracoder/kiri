@@ -12,7 +12,7 @@ mod daemon_json;
 pub mod dns;
 pub mod tls;
 pub mod proxy;
-mod domains;
+pub(crate) mod domains;
 pub(crate) mod engine;
 mod filters;
 mod grpc;

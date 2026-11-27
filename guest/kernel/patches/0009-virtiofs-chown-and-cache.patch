@@ -169,7 +169,17 @@
  		fuse_invalidate_attr_mask(inode, STATX_ATIME);
  }
  
-@@ -713,6 +715,8 @@
+@@ -212,7 +214,8 @@
+ 	if (inode && fuse_is_bad(inode))
+ 		goto invalid;
+ 	else if (time_before64(fuse_dentry_time(entry), get_jiffies_64()) ||
+-		 (flags & (LOOKUP_EXCL | LOOKUP_REVAL | LOOKUP_RENAME_TARGET))) {
++		 (flags & (LOOKUP_EXCL | LOOKUP_REVAL | LOOKUP_RENAME_TARGET)) ||
++		 (fc->caller_owner && (flags & LOOKUP_CREATE))) {
+ 		struct fuse_entry_out outarg;
+ 		FUSE_ARGS(args);
+ 		struct fuse_forget_link *forget;
+@@ -713,6 +716,8 @@
  	ff->fh = outopenp->fh;
  	ff->nodeid = outentry.nodeid;
  	ff->open_flags = outopenp->open_flags;
@@ -178,7 +188,7 @@
  	inode = fuse_iget(dir->i_sb, outentry.nodeid, outentry.generation,
  			  &outentry.attr, ATTR_TIMEOUT(&outentry), 0, 0);
  	if (!inode) {
-@@ -1199,11 +1203,24 @@
+@@ -1199,10 +1204,23 @@
  {
  	unsigned int blkbits;
  	struct fuse_conn *fc = get_fuse_conn(inode);
@@ -191,7 +201,7 @@
 +	kgid_t kgid = make_kgid(fc->user_ns, attr->gid);
 +	vfsuid_t vfsuid;
 +	vfsgid_t vfsgid;
- 
++
 +	if (fc->caller_owner) {
 +		kuid_t cuid;
 +		kgid_t cgid;
@@ -203,11 +213,10 @@
 +	}
 +	vfsuid = make_vfsuid(idmap, fc->user_ns, kuid);
 +	vfsgid = make_vfsgid(idmap, fc->user_ns, kgid);
-+
+ 
  	stat->dev = inode->i_sb->s_dev;
  	stat->ino = attr->ino;
- 	stat->mode = (inode->i_mode & S_IFMT) | (attr->mode & 07777);
-@@ -1309,8 +1326,8 @@
+@@ -1309,8 +1327,8 @@
  	return 0;
  }
  
@@ -218,7 +227,7 @@
  {
  	int err;
  	struct fuse_getattr_in inarg;
-@@ -1403,8 +1420,15 @@
+@@ -1403,8 +1421,15 @@
  		stat->ino = fi->orig_ino;
  		stat->blksize = 1 << fi->cached_i_blkbits;
  		if (fc->caller_owner) {
@@ -236,7 +245,7 @@
  		}
  		if (test_bit(FUSE_I_BTIME, &fi->state)) {
  			stat->btime = fi->i_btime;
-@@ -1583,20 +1607,40 @@
+@@ -1583,20 +1608,40 @@
  
  /*
   * Apple's virtiofs server echoes InHeader.uid/gid as the file's owner, so
@@ -283,7 +292,7 @@
  		if (!(m & MAY_WRITE) &&
  		    fuse_caller_capable(fc, CAP_DAC_READ_SEARCH))
  			return 0;
-@@ -1608,7 +1652,7 @@
+@@ -1608,7 +1653,7 @@
  	if (m == MAY_READ && fuse_caller_capable(fc, CAP_DAC_READ_SEARCH))
  		return 0;
  
@@ -292,7 +301,7 @@
  	    fuse_caller_capable(fc, CAP_DAC_OVERRIDE))
  		return 0;
  
-@@ -1663,7 +1707,7 @@
+@@ -1663,7 +1708,7 @@
  
  	if (fc->default_permissions) {
  		err = fc->caller_owner ?
@@ -301,7 +310,7 @@
  			generic_permission(idmap, inode, mask);
  
  		/* If permission is denied, try to refresh file
-@@ -1673,7 +1717,7 @@
+@@ -1673,7 +1718,7 @@
  			err = fuse_perm_getattr(inode, mask);
  			if (!err)
  				err = fc->caller_owner ?
@@ -310,7 +319,7 @@
  					generic_permission(idmap,
  								 inode, mask);
  		}
-@@ -1784,6 +1828,7 @@
+@@ -1784,6 +1829,7 @@
  	err = fuse_do_open(fm, get_node_id(inode), file, true);
  	if (!err) {
  		struct fuse_file *ff = file->private_data;
@@ -318,7 +327,7 @@
  
  		/*
  		 * Keep handling FOPEN_STREAM and FOPEN_NONSEEKABLE for
-@@ -1792,8 +1837,15 @@
+@@ -1792,8 +1838,19 @@
  		 */
  		if (ff->open_flags & (FOPEN_STREAM | FOPEN_NONSEEKABLE))
  			nonseekable_open(inode, file);
@@ -332,10 +341,14 @@
 +			    fuse_do_getattr(&nop_mnt_idmap, inode, NULL, NULL))
 +				fuse_invalidate_dir_cache(inode);
 +		}
++	} else if (fm->fc->caller_owner && (err == -ENOENT || err == -ESTALE)) {
++		fuse_invalidate_entry_cache(file_dentry(file));
++		d_drop(file_dentry(file));
++		err = -EOPENSTALE;
  	}
  
  	return err;
-@@ -2015,44 +2067,54 @@
+@@ -2015,44 +2072,54 @@
   * and the actual truncation by hand.
   */
  static int fuse_caller_setattr_check(struct mnt_idmap *idmap,
@@ -353,7 +366,7 @@
 +	vfsuid_t owner_uid;
 +	vfsgid_t owner_gid;
 +	bool is_owner;
- 
++
 +	if (!fuse_inode_chown_uid(fi, &kuid))
 +		kuid = current_fsuid();
 +	if (!fuse_inode_chown_gid(fi, &kgid))
@@ -362,7 +375,7 @@
 +	owner_uid = make_vfsuid(idmap, fc->user_ns, kuid);
 +	owner_gid = make_vfsgid(idmap, fc->user_ns, kgid);
 +	is_owner = vfsuid_eq_kuid(owner_uid, current_fsuid());
-+
+ 
  	if ((ia_valid & ATTR_UID) &&
 -	    !(vfsuid_eq_kuid(caller_uid, current_fsuid()) &&
 -	      vfsuid_eq(attr->ia_vfsuid, caller_uid)) &&
@@ -404,7 +417,7 @@
  		return -EPERM;
  
  	attr->ia_valid |= ATTR_FORCE;
-@@ -2072,6 +2134,9 @@
+@@ -2072,6 +2139,9 @@
  	struct fuse_attr_out outarg;
  	bool is_truncate = false;
  	bool is_wb = fc->writeback_cache && S_ISREG(inode->i_mode);
@@ -414,7 +427,7 @@
  	loff_t oldsize;
  	int err;
  	bool trust_local_cmtime = is_wb;
-@@ -2081,7 +2146,7 @@
+@@ -2081,7 +2151,7 @@
  	if (!fc->default_permissions)
  		attr->ia_valid |= ATTR_FORCE;
  	else if (fc->caller_owner && !(attr->ia_valid & ATTR_FORCE)) {
@@ -423,11 +436,10 @@
  		if (err)
  			return err;
  	}
-@@ -2089,6 +2154,25 @@
- 	err = setattr_prepare(idmap, dentry, attr);
+@@ -2090,6 +2160,25 @@
  	if (err)
  		return err;
-+
+ 
 +	if (fc->caller_owner) {
 +		if (attr->ia_valid & ATTR_UID) {
 +			new_uid = from_vfsuid(idmap, fc->user_ns, attr->ia_vfsuid);
@@ -446,15 +458,14 @@
 +				set_gid = true;
 +		}
 +	}
- 
++
  	if (attr->ia_valid & ATTR_SIZE) {
  		if (WARN_ON(!S_ISREG(inode->i_mode)))
-@@ -2163,6 +2247,28 @@
- 		/* Kill suid/sgid for truncate only if no CAP_FSETID */
- 		if (fc->handle_killpriv_v2 && !capable(CAP_FSETID))
+ 			return -EIO;
+@@ -2165,6 +2254,28 @@
  			inarg.valid |= FATTR_KILL_SUIDGID;
-+	}
-+
+ 	}
+ 
 +	if (fc->caller_owner && (set_uid || set_gid)) {
 +		inarg.valid &= ~(FATTR_UID | FATTR_GID);
 +		if (!(inarg.valid & ~FATTR_FH)) {
@@ -475,10 +486,12 @@
 +			spin_unlock(&fi->lock);
 +			goto out;
 +		}
- 	}
- 
++	}
++
  	attr_version = fuse_get_attr_version(fm->fc);
-@@ -2182,6 +2288,18 @@
+ 	fuse_setattr_fill(fc, &args, inode, &inarg, &outarg);
+ 	err = fuse_simple_request(fm, &args);
+@@ -2182,6 +2293,18 @@
  	}
  
  	spin_lock(&fi->lock);
@@ -512,7 +525,18 @@
  		} else if (err != -ENOSYS) {
  			fuse_file_free(ff);
  			return ERR_PTR(err);
-@@ -290,6 +296,14 @@
+@@ -281,6 +287,10 @@
+ 			fuse_sync_release(fi, ff, file->f_flags);
+ 		else if (is_truncate)
+ 			fuse_truncate_update_attr(inode, file);
++	} else if (fc->caller_owner && (err == -ENOENT || err == -ESTALE)) {
++		fuse_invalidate_entry_cache(file_dentry(file));
++		d_drop(file_dentry(file));
++		err = -EOPENSTALE;
+ 	}
+ 
+ 	if (is_wb_truncate || dax_truncate)
+@@ -290,6 +300,14 @@
  			truncate_pagecache(inode, 0);
  		else if (!(ff->open_flags & FOPEN_KEEP_CACHE))
  			invalidate_inode_pages2(inode->i_mapping);
@@ -527,7 +551,7 @@
  	}
  out_unlock:
  	if (dax_truncate)
-@@ -380,7 +394,7 @@
+@@ -380,7 +398,7 @@
  	 * before commencing with fs shutdown doesn't work if submounts are
  	 * used.
  	 */
@@ -536,7 +560,7 @@
  }
  
  void fuse_release_common(struct file *file, bool isdir)
-@@ -474,6 +488,10 @@
+@@ -474,6 +492,10 @@
  	if (ff->open_flags & FOPEN_NOFLUSH && !fm->fc->writeback_cache)
  		return 0;
  
@@ -650,10 +674,10 @@
  			case 'A':
 -				kiri_drop_cached(share.dentry, rel, false);
 +				kiri_drop_cached(share.dentry, rel, false, false);
- 				break;
++				break;
 +			case 'M':
 +				kiri_drop_cached(share.dentry, rel, false, true);
-+				break;
+ 				break;
  			case 'C':
 -				kiri_drop_cached(share.dentry, rel, true);
 +				kiri_drop_cached(share.dentry, rel, true, false);

@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #190, #269, #399, #744 Release gate fixes: virtiofs deleted-file revalidation across `docker run --rm`, offline `kiri domains set/reset`, netns lock takeover after stuck container start, transient `429` manifest retries, WSL `statvfs` `f_bfree` usage, and WSL `kiri` context hash (unreleased)
+- Fixes: #399 (back-to-back `docker run --rm -v` sees 1 s `ENOENT` recreating a host-deleted file), #744 (`kiri domains set` and `kiri domains reset` failed when the daemon was stopped), #190 (`statvfs_usage` used `f_bavail` instead of `f_bfree`, counting ~55 GB of ext4 reserved blocks on WSL's sparse `ext4.vhdx` as used), #269 (`wslsync.rs` hardcoded the wrong SHA-256 for Docker context `kiri`), `agent-dies-beside-stuck-start` (`claim_host_netns` failed when a dead agent's frozen child still held `@kiri-engine-netns`), `pulls-of-different-images-at-once-leave-a-sound-index` (`Client::manifest` did not retry HTTP `429` / transient registry errors)
+- Caused: none known
+- Caused by: #825, #846, #852, #970
+- Check: `agent-dies-beside-stuck-start`, `pulls-of-different-images-at-once-leave-a-sound-index`, `crates/kiri/src/domains_cli.rs`, `crates/kiri-image/src/registry.rs`, `crates/kiri-win/src/wslsync.rs`
+
 ### #983 CLI: add `kiri engine start | stop | restart | status [--json]` across macOS, Linux, and Windows (unreleased)
 - Fixes: #983 Add CLI commands to start, stop and inspect the Kiri engine
 - Caused: none known

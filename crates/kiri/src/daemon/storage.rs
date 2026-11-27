@@ -508,8 +508,8 @@ fn statvfs_usage(path: &Path) -> Option<(u64, u64)> {
     }
     let frsize = if s.f_frsize > 0 { s.f_frsize as u64 } else { s.f_bsize as u64 };
     let blocks = s.f_blocks as u64;
-    let bavail = s.f_bavail as u64;
-    Some((blocks.saturating_sub(bavail).saturating_mul(frsize), blocks.saturating_mul(frsize)))
+    let bfree = s.f_bfree as u64;
+    Some((blocks.saturating_sub(bfree).saturating_mul(frsize), blocks.saturating_mul(frsize)))
 }
 
 #[derive(Default)]

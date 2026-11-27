@@ -305,7 +305,7 @@ pub fn wsl_readonly_message(kind: WslReadOnly, vhdx_path: Option<&Path>) -> Stri
 }
 
 /// SHA-256 of `"kiri"`, used by the Docker CLI for `~/.docker/contexts/meta/<hash>/meta.json`.
-const KIRI_CONTEXT_HASH: &str = "c288b06224b0bc4af8a3d80f683a27a8fc72e45f901a7e6766109e2fc1d5c2b9";
+const KIRI_CONTEXT_HASH: &str = "80d7688032dda428a5d1e0eea7ad434d219b770b7d3a0646fd58695e40107755";
 
 const DEFAULT_USER_AWK: &str = "function k(s) { sub(/#.*/, \"\", s); gsub(/[[:space:]]/, \"\", s); return s } \
     substr(k($0), 1, 1) == \"[\" { u = tolower(k($0)) == \"[user]\"; next } \
@@ -662,6 +662,8 @@ mod tests {
     fn wsl_integration_scripts_have_no_backslash() {
         assert!(!wsl_enable_script("Ubuntu", "").contains('\\'));
         assert!(!wsl_disable_script("Ubuntu", "").contains('\\'));
+        assert_eq!(KIRI_CONTEXT_HASH.len(), 64);
+        assert!(KIRI_CONTEXT_HASH.starts_with("80d7688032dda428"));
     }
 
     #[test]

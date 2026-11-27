@@ -244,9 +244,104 @@ fn settings_path() -> Option<std::path::PathBuf> {
     super::state_dir().ok().map(|d| d.join("domains.json"))
 }
 
-fn saved_port(kind: Kind) -> Option<u16> {
-    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(settings_path()?).ok()?).ok()?;
+/// Settings file path for offline `kiri domains set` and `kiri domains reset`
+/// when the daemon is not running (#744). On Linux as root, `kiri.service`
+/// sets `HOME=/var/lib/kiri-daemon` while interactive root shells have
+/// `HOME=/root`; use `/var/lib/kiri-daemon` when present and no custom `HOME`
+/// or `KIRI_SOCKET` overrides it.
+fn offline_settings_path() -> io::Result<std::path::PathBuf> {
+    // SAFETY: `geteuid` has no preconditions.
+    #[cfg(target_os = "linux")]
+    if unsafe { libc::geteuid() } == 0
+        && std::env::var_os("KIRI_SOCKET").is_none()
+        && std::env::var_os("HOME").is_none_or(|h| h == "/root")
+        && std::path::Path::new("/var/lib/kiri-daemon").is_dir()
+    {
+        return Ok(std::path::PathBuf::from("/var/lib/kiri-daemon").join(crate::flavor::STATE.get()).join("domains.json"));
+    }
+    Ok(super::state_dir()?.join("domains.json"))
+}
+
+fn saved_port_at(path: &std::path::Path, kind: Kind) -> Option<u16> {
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
     v[kind.key()].as_u64().and_then(|p| u16::try_from(p).ok()).filter(|&p| p != 0)
+}
+
+fn saved_port(kind: Kind) -> Option<u16> {
+    saved_port_at(&settings_path()?, kind)
+}
+
+fn offline_report_at(path: &std::path::Path, env: impl Fn(Kind) -> Option<u16>) -> serde_json::Value {
+    let mut v = serde_json::json!({});
+    for kind in [Kind::Http, Kind::Https] {
+        let env_p = env(kind);
+        let port = env_p.or_else(|| saved_port_at(path, kind)).unwrap_or(kind.default());
+        v[kind.key()] = serde_json::json!({
+            "port": port,
+            "default": kind.default(),
+            "running": false,
+            "serving": false,
+            "env": env_p.map(|_| kind.var()),
+        });
+    }
+    v
+}
+
+fn set_ports_offline_at(
+    path: &std::path::Path,
+    http: Option<u16>,
+    https: Option<u16>,
+    env: impl Fn(Kind) -> Option<u16>,
+) -> Result<serde_json::Value, String> {
+    let cur_http = env(Kind::Http).or_else(|| saved_port_at(path, Kind::Http)).unwrap_or(Kind::Http.default());
+    let cur_https = env(Kind::Https).or_else(|| saved_port_at(path, Kind::Https)).unwrap_or(Kind::Https.default());
+    let http = http.unwrap_or(cur_http);
+    let https = https.unwrap_or(cur_https);
+    if http == 0 || https == 0 {
+        return Err("ports must be 1 to 65535".into());
+    }
+    if http == https {
+        return Err("HTTP and HTTPS need different ports".into());
+    }
+    for (kind, want) in [(Kind::Http, http), (Kind::Https, https)] {
+        if let Some(p) = env(kind)
+            && p != want
+        {
+            return Err(format!("{} sets this port to {p}; remove it to choose the port here", kind.var()));
+        }
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::json!({"http": http, "https": https}).to_string())
+        .and_then(|()| std::fs::rename(&tmp, path))
+        .map_err(|e| e.to_string())?;
+    Ok(offline_report_at(path, env))
+}
+
+fn reset_offline_at(
+    path: &std::path::Path,
+    env: impl Fn(Kind) -> Option<u16>,
+) -> Result<serde_json::Value, String> {
+    if let Err(e) = std::fs::remove_file(path)
+        && e.kind() != io::ErrorKind::NotFound
+    {
+        return Err(e.to_string());
+    }
+    Ok(offline_report_at(path, env))
+}
+
+/// Updates saved router ports on disk when the daemon is not running (#744).
+pub fn set_ports_offline(http: Option<u16>, https: Option<u16>) -> Result<serde_json::Value, String> {
+    let path = offline_settings_path().map_err(|e| e.to_string())?;
+    set_ports_offline_at(&path, http, https, |k| env_port(k.var()))
+}
+
+/// Resets saved router ports on disk when the daemon is not running (#744).
+pub fn reset_offline() -> Result<serde_json::Value, String> {
+    let path = offline_settings_path().map_err(|e| e.to_string())?;
+    reset_offline_at(&path, |k| env_port(k.var()))
 }
 
 /// Whether this engine has router ports of its own: Kiri Dev starts its
@@ -772,5 +867,38 @@ mod tests {
         for bad in ["", "web.kiri.local:0", "web.kiri.local:65536", "web.kiri.local:abc", "web.kiri.local:", "web.kiri.local:+80", "a:b:80", "[web.kiri.local]:80", "[localhost]", "web.kiri.local.."] {
             assert_eq!(super::parse_host_name(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn offline_set_and_reset_update_saved_ports_and_validate() {
+        let dir = std::env::temp_dir().join(format!("kiri-domains-offline-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("domains.json");
+        let no_env = |_: Kind| None;
+
+        let r1 = super::set_ports_offline_at(&path, Some(8080), None, no_env).unwrap();
+        assert_eq!(r1["http"]["port"], 8080);
+        assert_eq!(r1["https"]["port"], 443);
+        assert_eq!(r1["http"]["running"], false);
+
+        let r2 = super::set_ports_offline_at(&path, None, Some(8443), no_env).unwrap();
+        assert_eq!(r2["http"]["port"], 8080);
+        assert_eq!(r2["https"]["port"], 8443);
+
+        assert_eq!(
+            super::set_ports_offline_at(&path, Some(8443), None, no_env).unwrap_err(),
+            "HTTP and HTTPS need different ports"
+        );
+        assert!(
+            super::set_ports_offline_at(&path, Some(9000), None, |k| (k == Kind::Http).then_some(18080))
+                .unwrap_err()
+                .contains("KIRI_HTTP_PORT sets this port to 18080")
+        );
+
+        let reset = super::reset_offline_at(&path, no_env).unwrap();
+        assert!(!path.exists());
+        assert_eq!(reset["http"]["port"], 80);
+        assert_eq!(reset["https"]["port"], 443);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

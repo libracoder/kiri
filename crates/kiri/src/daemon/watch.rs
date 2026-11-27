@@ -20,8 +20,8 @@ use std::collections::HashMap;
 use std::ffi::{CStr, c_char, c_void};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
-use std::sync::{Arc, Weak};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::time::{Duration, Instant};
 
 use super::engine::Engine;
 
@@ -29,23 +29,58 @@ use super::engine::Engine;
 const MAC_ROOT: &str = "/mnt/mac";
 /// How often the set of bind sources is looked at again.
 const RESCAN: Duration = Duration::from_secs(1);
+/// Keep watching a bind source across back-to-back `docker run --rm -v` gaps
+/// longer than virtiofs's 1 s dentry cache timeout (#399).
+const KEEP_RECENT: Duration = Duration::from_secs(3);
 /// FSEvents' latency: changes within it arrive together.
 const LATENCY: f64 = 0.05;
 /// At most this many lines per message to the guest.
 const BATCH: usize = 512;
 
+static WAKE: OnceLock<Mutex<Option<Sender<Vec<(String, u32)>>>>> = OnceLock::new();
+
+/// Wakes `kiri-watch` immediately when a container with Mac bind mounts starts,
+/// so short-lived `docker run --rm -v` containers begin watching right away.
+pub fn notify() {
+    if let Some(lock) = WAKE.get()
+        && let Ok(guard) = lock.lock()
+        && let Some(tx) = guard.as_ref()
+    {
+        let _ = tx.send(Vec::new());
+    }
+}
+
 pub fn start(engine: Weak<Engine>) {
     let _ = std::thread::Builder::new().name("kiri-watch".into()).spawn(move || run(engine));
 }
 
+fn active_sources(now: Vec<String>, recent: &mut HashMap<String, Instant>, at: Instant) -> Vec<String> {
+    recent.retain(|_, seen| at.saturating_duration_since(*seen) < KEEP_RECENT);
+    for p in &now {
+        recent.insert(p.clone(), at);
+    }
+    let mut all: Vec<String> = now;
+    for p in recent.keys() {
+        if !all.contains(p) {
+            all.push(p.clone());
+        }
+    }
+    all.sort();
+    all
+}
+
 fn run(engine: Weak<Engine>) {
     let (tx, rx) = channel::<Vec<(String, u32)>>();
+    if let Ok(mut slot) = WAKE.get_or_init(|| Mutex::new(None)).lock() {
+        *slot = Some(tx.clone());
+    }
     let mut stream: Option<Stream> = None;
     let mut roots: Vec<Root> = Vec::new();
+    let mut recent: HashMap<String, Instant> = HashMap::new();
     let mut known = Known::new();
     loop {
         let Some(e) = engine.upgrade() else { return };
-        let now = e.mac_bind_sources();
+        let now = active_sources(e.mac_bind_sources(), &mut recent, Instant::now());
         if !roots.iter().map(|r| &r.path).eq(now.iter()) {
             // The new stream picks up where the old one stopped, so changes
             // made in between are not lost; Known is kept with it.
@@ -750,5 +785,16 @@ mod tests {
         k.sync(&[root(&old_root.display().to_string(), false, 0)]);
         assert!(!k.paths.contains_key(&fnw) && k.paths.contains_key(&fo));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn keeps_recently_unmounted_sources_across_short_container_gaps() {
+        let mut recent = std::collections::HashMap::new();
+        let t0 = std::time::Instant::now();
+        assert_eq!(super::active_sources(vec!["/tmp/d".into()], &mut recent, t0), vec!["/tmp/d"]);
+        // Container exited 50 ms later (`docker run --rm -v`): still watched.
+        assert_eq!(super::active_sources(Vec::new(), &mut recent, t0 + std::time::Duration::from_millis(50)), vec!["/tmp/d"]);
+        // Expired past KEEP_RECENT (3 s): dropped.
+        assert!(super::active_sources(Vec::new(), &mut recent, t0 + std::time::Duration::from_secs(4)).is_empty());
     }
 }

@@ -1137,7 +1137,7 @@ impl Client {
         let _on = cancel.enter();
         let stopped = |e: Error| if cancel.is_cancelled() { Error::Cancelled } else { e };
         self.warm_up(r, "pull").map_err(stopped)?;
-        let (bytes, media_type) = self.manifest(r, &r.reference).map_err(stopped)?;
+        let (bytes, media_type) = self.manifest_with(r, &r.reference, Some(cancel)).map_err(stopped)?;
         // A pull by digest must get exactly that content, whether it is a
         // single manifest or a multi-arch index. Without this, a registry
         // could answer a pinned digest with any index naming any children.
@@ -1163,7 +1163,7 @@ impl Client {
                         .collect(),
                 });
             };
-            let (entry_bytes, _) = self.manifest(r, &entry.digest).map_err(stopped)?;
+            let (entry_bytes, _) = self.manifest_with(r, &entry.digest, Some(cancel)).map_err(stopped)?;
             if sha256_digest(&entry_bytes) != entry.digest {
                 return Err(Error::Manifest(format!("manifest {} failed digest check", entry.digest)));
             }
@@ -1358,24 +1358,54 @@ impl Client {
     }
 
     fn manifest(&self, r: &Reference, reference: &str) -> Result<(Vec<u8>, String), Error> {
+        self.manifest_with(r, reference, None)
+    }
+
+    fn manifest_with(&self, r: &Reference, reference: &str, cancel: Option<&Cancel>) -> Result<(Vec<u8>, String), Error> {
         let by_digest = reference.starts_with("sha256:");
         let key = self.manifest_key(r, reference);
         if by_digest && let Some(hit) = MANIFESTS.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
             return Ok(hit);
         }
         let url = format!("{}/v2/{}/manifests/{reference}", self.base(r.api_host()), r.repository);
-        let mut resp = self.get(r, &url, Some(ACCEPT))?;
-        let media_type = resp
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_default()
-            .to_owned();
-        let bytes = resp.body_mut().with_config().limit(4 << 20).read_to_vec()?;
-        if by_digest {
-            MANIFESTS.lock().unwrap_or_else(|e| e.into_inner()).put(&key, reference, &bytes, &media_type);
+        let mut failed = 0;
+        loop {
+            if cancel.is_some_and(Cancel::is_cancelled) {
+                return Err(Error::Cancelled);
+            }
+            let attempt = (|| -> Result<(Vec<u8>, String), Error> {
+                let mut resp = self.get(r, &url, Some(ACCEPT))?;
+                let media_type = resp
+                    .headers()
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default()
+                    .to_owned();
+                let bytes = resp.body_mut().with_config().limit(4 << 20).read_to_vec()?;
+                Ok((bytes, media_type))
+            })();
+            match attempt {
+                Ok((bytes, media_type)) => {
+                    if by_digest {
+                        MANIFESTS.lock().unwrap_or_else(|e| e.into_inner()).put(&key, reference, &bytes, &media_type);
+                    }
+                    return Ok((bytes, media_type));
+                }
+                Err(_) if cancel.is_some_and(Cancel::is_cancelled) => return Err(Error::Cancelled),
+                Err(e) if transient(&e) => {
+                    failed += 1;
+                    if failed >= BLOB_TRIES {
+                        return Err(e);
+                    }
+                    let wait = Duration::from_millis(500 << (failed - 1).min(4));
+                    match cancel {
+                        Some(c) => c.sleep(wait),
+                        None => std::thread::sleep(wait),
+                    }
+                }
+                Err(e) => return Err(e),
+            }
         }
-        Ok((bytes, media_type))
     }
 
     /// Streams one blob into the store, verifying its digest. Returns its size.
@@ -4188,5 +4218,52 @@ mod tests {
         let roots = crate::roots::trusted();
         assert_eq!(certs.len(), roots.len());
         assert!(certs.iter().zip(roots.iter()).all(|(a, b)| a.der() == b.as_ref()));
+    }
+
+    #[test]
+    fn manifest_retries_transient_429_before_succeeding() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let host = listener.local_addr().unwrap().to_string();
+        let body = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v2+json"}"#.to_vec();
+        let server = std::thread::spawn(move || {
+            let mut manifests = 0u32;
+            for c in listener.incoming().flatten() {
+                let mut c = c;
+                let mut buf = [0u8; 2048];
+                let n = c.read(&mut buf).unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]);
+                let path = head.lines().next().and_then(|l| l.split_whitespace().nth(1)).unwrap_or("");
+                if path == "/v2/" {
+                    let _ = c.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
+                    continue;
+                }
+                manifests += 1;
+                if manifests < 3 {
+                    let msg = br#"{"errors":[{"code":"TOO_MANY_REQUEST"}]}"#;
+                    let reply = format!(
+                        "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        msg.len()
+                    );
+                    let _ = c.write_all(reply.as_bytes());
+                    let _ = c.write_all(msg);
+                } else {
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.oci.image.manifest.v2+json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = c.write_all(reply.as_bytes());
+                    let _ = c.write_all(&body);
+                    break;
+                }
+            }
+            manifests
+        });
+        let client = Client::new();
+        let r = Reference::parse(&format!("{host}/library/alpine:3.18")).unwrap();
+        let (got, media_type) = client.manifest(&r, &r.reference).unwrap();
+        assert_eq!(media_type, "application/vnd.oci.image.manifest.v2+json");
+        assert!(got.starts_with(b"{\"schemaVersion\":2"));
+        assert_eq!(server.join().unwrap(), 3);
     }
 }

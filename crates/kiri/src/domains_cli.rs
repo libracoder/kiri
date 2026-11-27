@@ -90,18 +90,25 @@ fn run_with(args: &[String], alive: impl FnOnce() -> bool) -> io::Result<()> {
     let json = args.iter().any(|a| a == "--json");
     let args: Vec<String> = args.iter().filter(|a| *a != "--json").cloned().collect();
     let cmd = parse(&args).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    if !alive() {
-        return Err(io::Error::other("kiri daemon is not running: open Kiri or run `kiri daemon`"));
-    }
-    let v = match cmd {
-        Cmd::Show => client::get("/kiri/domains")?,
-        Cmd::Set { http, https } => {
-            let now = if http.is_none() || https.is_none() { client::get("/kiri/domains")? } else { Value::Null };
-            let keep = |k: &str| now[k]["port"].as_u64().unwrap_or(0);
-            let body = json!({"http": http.map_or_else(|| keep("http"), u64::from), "https": https.map_or_else(|| keep("https"), u64::from)});
-            answer(client::request("POST", "/kiri/domains", Some(&body))?)?
+    let v = if !alive() {
+        match cmd {
+            Cmd::Show => {
+                return Err(io::Error::other("kiri daemon is not running: open Kiri or run `kiri daemon`"));
+            }
+            Cmd::Set { http, https } => crate::daemon::domains::set_ports_offline(http, https).map_err(io::Error::other)?,
+            Cmd::Reset => crate::daemon::domains::reset_offline().map_err(io::Error::other)?,
         }
-        Cmd::Reset => answer(client::request("DELETE", "/kiri/domains", None)?)?,
+    } else {
+        match cmd {
+            Cmd::Show => client::get("/kiri/domains")?,
+            Cmd::Set { http, https } => {
+                let now = if http.is_none() || https.is_none() { client::get("/kiri/domains")? } else { Value::Null };
+                let keep = |k: &str| now[k]["port"].as_u64().unwrap_or(0);
+                let body = json!({"http": http.map_or_else(|| keep("http"), u64::from), "https": https.map_or_else(|| keep("https"), u64::from)});
+                answer(client::request("POST", "/kiri/domains", Some(&body))?)?
+            }
+            Cmd::Reset => answer(client::request("DELETE", "/kiri/domains", None)?)?,
+        }
     };
     if json {
         println!("{v}");
@@ -170,7 +177,7 @@ mod tests {
 
     #[test]
     fn says_when_the_daemon_is_not_running() {
-        for cmd in ["", "--json", "set --http 8080 --https 8443", "set --http 8080 --json", "reset"] {
+        for cmd in ["", "--json"] {
             let err = run_with(&args(cmd), || false).unwrap_err();
             assert_eq!(err.to_string(), "kiri daemon is not running: open Kiri or run `kiri daemon`", "{cmd}");
         }
