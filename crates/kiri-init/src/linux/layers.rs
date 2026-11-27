@@ -374,15 +374,27 @@ fn apply_xattrs(dest: &Path, path: &Path, xattrs: &[(CString, Vec<u8>)]) -> io::
     if xattrs.is_empty() {
         return Ok(());
     }
-    let root = inroot::open_root(dest)?;
-    let (parent, name) = hardlink_parent(root.as_fd(), path)?;
-    // SAFETY: confined parent directory fd and NUL-terminated leaf name.
-    let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
+    let mut has_normal = false;
+    for c in path.components() {
+        match c {
+            std::path::Component::Normal(_) => has_normal = true,
+            std::path::Component::CurDir | std::path::Component::RootDir => {}
+            std::path::Component::ParentDir | std::path::Component::Prefix(_) => return Err(escapes()),
+        }
     }
-    // SAFETY: fresh descriptor owned only here.
-    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let root = inroot::open_root(dest)?;
+    let fd = if has_normal {
+        let (parent, name) = hardlink_parent(root.as_fd(), path)?;
+        // SAFETY: confined parent directory fd and NUL-terminated leaf name.
+        let raw = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+        if raw < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: fresh descriptor owned only here.
+        unsafe { OwnedFd::from_raw_fd(raw) }
+    } else {
+        root
+    };
     // SAFETY: zeroed stat filled from our own descriptor.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     sys::check(unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } as _, "fstat xattr target")?;
@@ -1923,6 +1935,29 @@ mod tests {
             let n = unsafe { libc::lgetxattr(c.as_ptr(), attr.as_ptr(), std::ptr::null_mut(), 0) };
             assert!(n < 0, "forbidden xattr {:?} persisted on disk", attr);
         }
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn root_dot_entry_with_allowed_xattr_unpacks_cleanly() {
+        let mut b = tar::Builder::new(Vec::new());
+        b.append_pax_extensions([("SCHILY.xattr.user.root_tag", &b"ok"[..])]).unwrap();
+        let mut h = tar::Header::new_ustar();
+        h.set_entry_type(tar::EntryType::Directory);
+        h.set_path(".").unwrap();
+        h.set_size(0);
+        h.set_mode(0o755);
+        h.set_cksum();
+        b.append(&h, &[][..]).unwrap();
+        b.append_data(&mut header(2, 0o644), "ok", &b"hi"[..]).unwrap();
+        let bytes = b.into_inner().unwrap();
+        let dest = scratch("xattr-root-dot");
+        untar(Capped::new(&bytes[..], u64::MAX), &dest).unwrap();
+        assert_eq!(fs::read(dest.join("ok")).unwrap(), b"hi");
+        // Direct apply_xattrs on `.` succeeds while `..` is rejected as an escape.
+        let allowed = vec![(CString::new("user.root_tag").unwrap(), b"v".to_vec())];
+        apply_xattrs(&dest, Path::new("."), &allowed).unwrap();
+        assert!(apply_xattrs(&dest, Path::new("../escape"), &allowed).is_err());
         let _ = fs::remove_dir_all(&dest);
     }
 }

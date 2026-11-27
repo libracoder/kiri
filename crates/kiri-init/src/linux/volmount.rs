@@ -459,8 +459,8 @@ fn validate_mount(path: &str, kind: &str, device: &str, flags: libc::c_ulong, ho
 /// In VM mode, binding `/` or `/mnt` recursively (`MS_REC`) would expose
 /// `/mnt/mac` and `/var/lib/kiri` past the macOS share guard.
 pub(super) fn is_vm_share_ancestor(path: &str) -> bool {
-    let trimmed = path.trim_end_matches('/');
-    matches!(trimmed, "" | "/mnt" | "/mnt/mac")
+    let segs: Vec<&str> = path.split('/').filter(|c| !c.is_empty() && *c != ".").collect();
+    matches!(segs.as_slice(), [] | ["mnt"] | ["mnt", "mac"])
 }
 
 /// Mounts the volume at `path` unless something already is: `kind` is the
@@ -618,9 +618,9 @@ mod tests {
         assert!(validate_mount(vol, "overlay", "/tmp/a", libc::MS_BIND, true).is_err());
         assert!(validate_mount(vol, "none", "relative/path", libc::MS_BIND, true).is_err());
         assert!(validate_mount(vol, "none", "/mnt/mac/Users/..", libc::MS_BIND, false).is_err());
-        assert!(validate_mount(vol, "none", "/", libc::MS_BIND | libc::MS_REC, false).is_err());
-        assert!(validate_mount(vol, "none", "/mnt", libc::MS_BIND | libc::MS_REC, false).is_err());
-        assert!(validate_mount(vol, "none", "/mnt/mac", libc::MS_BIND, false).is_err());
+        for ancestor in ["/", "/.", "///", "/mnt", "/mnt/", "/mnt/.", "//mnt", "/mnt//mac", "/mnt/./mac", "/mnt/mac", "/mnt/mac/."] {
+            assert!(validate_mount(vol, "none", ancestor, libc::MS_BIND | libc::MS_REC, false).is_err(), "{ancestor:?}");
+        }
         assert!(validate_mount(vol, "none", "/tmp/a", libc::MS_BIND | libc::MS_REMOUNT, true).is_err());
     }
 

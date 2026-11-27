@@ -5056,9 +5056,9 @@ mod tests {
         assert!(valid_bind_source("/var/lib/kiri/volumes/v/_data", false));
         assert!(!valid_bind_source("relative/path", true));
         assert!(!valid_bind_source("/mnt/mac/Users/..", false));
-        assert!(!valid_bind_source("/", false));
-        assert!(!valid_bind_source("/mnt", false));
-        assert!(!valid_bind_source("/mnt/mac", false));
+        for ancestor in ["/", "/.", "///", "/mnt", "/mnt/", "/mnt/.", "//mnt", "/mnt//mac", "/mnt/./mac", "/mnt/mac", "/mnt/mac/."] {
+            assert!(!valid_bind_source(ancestor, false), "{ancestor:?}");
+        }
         assert!(valid_bind_source("/srv/app", true));
     }
 }
