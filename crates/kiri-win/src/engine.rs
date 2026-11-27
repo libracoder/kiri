@@ -926,7 +926,7 @@ fn about() {
 }
 
 fn npipe_host(pipe: &str) -> String {
-    format!("npipe:{}", pipe.replace('\\', "/"))
+    format!("npipe://{}", pipe.replace('\\', "/"))
 }
 
 fn context_meta(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
@@ -1374,6 +1374,7 @@ mod tests {
     #[test]
     fn npipe_host_formats_pipe_url() {
         assert_eq!(super::npipe_host(r"\\.\pipe\kiri"), "npipe:////./pipe/kiri");
+        assert_eq!(super::npipe_host(r"\\.\pipe\kiri-dev"), "npipe:////./pipe/kiri-dev");
     }
 }
 
