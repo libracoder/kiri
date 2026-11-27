@@ -6,7 +6,16 @@
 # Runs inside a Debian container and writes /out/Image or /out/bzImage.
 set -eu
 KVER="${KVER:-6.18.58}"
+KSHA256="${KSHA256:-069b19f9032c4dac8149ae4b6520c35debca0f42a9f6d52ee55ba6ca9b818013}"
 KARCH="${KARCH:-arm64}"
+if [ "$KVER" != "6.18.58" ] && [ "$KSHA256" = "069b19f9032c4dac8149ae4b6520c35debca0f42a9f6d52ee55ba6ca9b818013" ]; then
+  echo "KSHA256 must be updated when overriding KVER=$KVER" >&2
+  exit 1
+fi
+if [ -z "$KSHA256" ]; then
+  echo "KSHA256 must not be empty" >&2
+  exit 1
+fi
 case "$KARCH-$(uname -m)" in
   arm64-aarch64) cross="" pkgs="" ;;
   x86_64-x86_64) cross="" pkgs=lz4 ;;
@@ -16,7 +25,13 @@ case "$KARCH-$(uname -m)" in
 esac
 apt-get update -qq && apt-get install -y -qq build-essential flex bison bc libssl-dev libelf-dev dwarves curl xz-utils python3 $pkgs >/dev/null
 cd /build
-[ -f "linux-$KVER/Makefile" ] && [ -f "linux-$KVER/scripts/Kbuild.include" ] || { rm -rf "linux-$KVER"; curl -fsSL "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$KVER.tar.xz" | tar xJ; }
+if [ ! -f "linux-$KVER/Makefile" ] || [ ! -f "linux-$KVER/scripts/Kbuild.include" ]; then
+  rm -rf "linux-$KVER" "linux-$KVER.tar.xz.tmp"
+  curl -fsSL -o "linux-$KVER.tar.xz.tmp" "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$KVER.tar.xz"
+  printf '%s  %s\n' "$KSHA256" "linux-$KVER.tar.xz.tmp" | sha256sum -c -
+  tar xJf "linux-$KVER.tar.xz.tmp"
+  rm -f "linux-$KVER.tar.xz.tmp"
+fi
 cd "linux-$KVER"
 # Kiri's kernel patches. Reverse-apply in reverse order first so stacked
 # patches on a cached tree stay clean.

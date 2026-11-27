@@ -46,8 +46,9 @@
  	 */
  	fi->orig_i_mode = inode->i_mode;
 -	if (!fc->default_permissions)
+-		inode->i_mode &= ~S_ISVTX;
 +	if (!fc->default_permissions || fc->caller_owner)
- 		inode->i_mode &= ~S_ISVTX;
++		inode->i_mode &= fc->caller_owner ? ~(S_ISVTX | S_ISUID | S_ISGID) : ~S_ISVTX;
  
  	fi->orig_ino = attr->ino;
 @@ -1886,6 +1886,7 @@
@@ -156,7 +157,7 @@
  		}
  
  		/* Note: the opposite of the above test does not
-@@ -1961,6 +2014,51 @@
+@@ -1961,6 +2014,46 @@
   * vmtruncate() doesn't allow for this case, so do the rlimit checking
   * and the actual truncation by hand.
   */
@@ -182,18 +183,13 @@
 +		return -EPERM;
 +
 +	if (ia_valid & ATTR_MODE) {
-+		vfsgid_t vfsgid = (ia_valid & ATTR_GID) ?
-+			attr->ia_vfsgid : caller_gid;
-+
 +		if (!vfsuid_eq_kuid(caller_uid, current_fsuid()) &&
 +		    !fuse_caller_capable(fc, CAP_FOWNER))
 +			return -EPERM;
 +
-+		if (!vfsgid_eq(vfsgid, caller_gid) &&
-+		    !vfsgid_in_group_p(vfsgid) &&
-+		    !(vfsgid_has_mapping(fc->user_ns, vfsgid) &&
-+		      fuse_caller_capable(fc, CAP_FSETID)))
-+			attr->ia_mode &= ~S_ISGID;
++		/* Synthetic caller_owner semantics cannot safely support
++		 * POSIX setuid/setgid execution on host-backed files. */
++		attr->ia_mode &= ~(S_ISUID | S_ISGID);
 +	}
 +
 +	if ((ia_valid & (ATTR_MTIME_SET | ATTR_ATIME_SET | ATTR_TIMES_SET)) &&
@@ -208,7 +204,7 @@
  int fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
  		    struct iattr *attr, struct file *file)
  {
-@@ -1982,6 +2080,11 @@
+@@ -1982,6 +2075,11 @@
  
  	if (!fc->default_permissions)
  		attr->ia_valid |= ATTR_FORCE;

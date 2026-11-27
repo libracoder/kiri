@@ -379,7 +379,7 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
                 }
                 continue;
             }
-            if super::copy::on_readable(pfd.fd, paths) {
+            if super::copy::on_readable(pfd.fd, paths, |id| running_pid(procs, id)) {
                 continue;
             }
             if let Some(r) = relays.iter_mut().find(|r| r.owns(pfd.fd)) {
@@ -541,9 +541,11 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
                     // Its namespaces are entered through /proc/<pid>: only a
                     // container still running, never one exited under a freed pid.
                     // The container's own seccomp profile goes with it, if it has one.
-                    match running_pid(procs, spec.container_id).and_then(|pid| procs.get(&pid).map(|p| (pid, p.run.seccomp.clone()))) {
+                    match running_pid(procs, spec.container_id)
+                        .and_then(|pid| procs.get(&pid).map(|p| (pid, p.run.seccomp.clone(), p.run.device_filtered)))
+                    {
                         None => Msg::Error(&format!("container {} is not running", spec.container_id)).encode(&mut out),
-                        Some((pid, profile)) => match container::exec(&spec, pid, paths, &profile) {
+                        Some((pid, profile, device_filtered)) => match container::exec(&spec, pid, paths, &profile, device_filtered) {
                             Ok(run) => {
                                 let cloned_ns = sys::boottime_ns();
                                 Msg::Started { id: &run.id, pid: run.pid as u32, starting: false }.encode(&mut out);

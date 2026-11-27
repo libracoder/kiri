@@ -1163,6 +1163,10 @@ impl Client {
                         .collect(),
                 });
             };
+            // Validate the digest from the untrusted index before interpolating
+            // it into an authenticated manifest URL.
+            crate::store::digest_hex(&entry.digest)
+                .map_err(|_| Error::Manifest(format!("invalid manifest digest {:?}", entry.digest)))?;
             let (entry_bytes, _) = self.manifest_with(r, &entry.digest, Some(cancel)).map_err(stopped)?;
             if sha256_digest(&entry_bytes) != entry.digest {
                 return Err(Error::Manifest(format!("manifest {} failed digest check", entry.digest)));
@@ -1701,7 +1705,7 @@ impl Client {
     /// `postgres` gives `latest`, `17-alpine`, `17`… Hub's own API, since
     /// the registry's tag list is unordered and has no dates.
     pub fn hub_tags(&self, repo: &str, limit: u32) -> Result<Vec<String>, Error> {
-        let repo = if repo.contains('/') { repo.to_owned() } else { format!("library/{repo}") };
+        let repo = validate_hub_repo(repo)?;
         let url = format!("https://hub.docker.com/v2/repositories/{repo}/tags");
         let mut resp = self.agent.get(&url).query("page_size", limit.to_string()).query("ordering", "last_updated").config().max_redirects(5).https_only(true).build().call()?;
         if resp.status().as_u16() != 200 {
@@ -2062,6 +2066,27 @@ fn not_found(e: Error, r: &Reference) -> Error {
         }
         Error::Status { status: 404, .. } => Error::NotFound(format!("manifest for {} not found: manifest unknown", r.short())),
         e => e,
+    }
+}
+
+/// Validates a Docker Hub repository name (`alpine` or `namespace/name`) before
+/// interpolating it into a `hub.docker.com` API URL (`SEC-V-13`).
+fn validate_hub_repo(repo: &str) -> Result<String, Error> {
+    if repo.is_empty() || repo.len() > 255 {
+        return Err(Error::Manifest(format!("invalid Docker Hub repository {repo:?}")));
+    }
+    let alnum = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit();
+    let valid_seg = |s: &str| {
+        !s.is_empty()
+            && s.as_bytes().first().is_some_and(|&b| alnum(b))
+            && s.as_bytes().last().is_some_and(|&b| alnum(b))
+            && s.bytes().all(|b| alnum(b) || b".-_".contains(&b))
+    };
+    let mut parts = repo.split('/');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(name), None, None) if valid_seg(name) => Ok(format!("library/{name}")),
+        (Some(ns), Some(name), None) if valid_seg(ns) && valid_seg(name) => Ok(format!("{ns}/{name}")),
+        _ => Err(Error::Manifest(format!("invalid Docker Hub repository {repo:?}"))),
     }
 }
 
@@ -4280,5 +4305,93 @@ mod tests {
         assert_eq!(media_type, "application/vnd.oci.image.manifest.v2+json");
         assert!(got.starts_with(b"{\"schemaVersion\":2"));
         assert_eq!(server.join().unwrap(), 3);
+    }
+
+    #[test]
+    fn resolve_rejects_malformed_index_entry_digest_without_requesting_it() {
+        let index = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.docker.distribution.manifest.list.v2+json",
+            "manifests": [{
+                "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+                "size": 10,
+                "digest": "sha256:../../other-repo/manifests/secret?foo=bar",
+                "platform": {"architecture": "amd64", "os": "linux"},
+            }],
+        })
+        .to_string();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let host = listener.local_addr().unwrap().to_string();
+        let served = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            'conns: for c in listener.incoming() {
+                let mut c = c.unwrap();
+                let mut first = [0u8; 1];
+                if c.peek(&mut first).unwrap_or(0) == 1 && first[0] == 0x16 {
+                    let _ = c.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    continue;
+                }
+                let mut head = Vec::new();
+                let mut b = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") && c.read(&mut b).unwrap_or(0) == 1 {
+                    head.push(b[0]);
+                }
+                let head = String::from_utf8_lossy(&head).to_string();
+                if head.starts_with("QUIT") {
+                    break 'conns;
+                }
+                if head.is_empty() {
+                    continue 'conns;
+                }
+                let path = head.lines().next().and_then(|l| l.split_whitespace().nth(1)).unwrap_or("").to_string();
+                seen.push(path.clone());
+                let (status, body, kind) = if path == "/v2/" {
+                    (200, b"{}".as_slice(), "application/json")
+                } else {
+                    (200, index.as_bytes(), "application/vnd.oci.image.index.v1+json")
+                };
+                let resp = format!("HTTP/1.1 {status} OK\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                let _ = c.write_all(resp.as_bytes());
+                let _ = c.write_all(body);
+            }
+            seen
+        });
+
+        let client = test_client();
+        let r = Reference::parse(&format!("{host}/app/test:latest")).unwrap();
+        let platform = Platform::parse("linux/amd64").unwrap();
+        let err = match client.resolve(&r, &platform, &Cancel::new()) {
+            Ok(_) => panic!("malformed index digest should be rejected"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, Error::Manifest(_)), "unexpected error: {err:?}");
+        quit(&host);
+        let seen = served.join().unwrap();
+        assert!(!seen.iter().any(|p| p.contains("other-repo") || p.contains("..")), "malformed digest was requested: {seen:?}");
+    }
+
+    #[test]
+    fn hub_tags_rejects_malformed_repository_names() {
+        assert_eq!(validate_hub_repo("postgres").unwrap(), "library/postgres");
+        assert_eq!(validate_hub_repo("bitnami/redis").unwrap(), "bitnami/redis");
+        assert_eq!(validate_hub_repo("my_org/my-app.1").unwrap(), "my_org/my-app.1");
+        let client = Client::new();
+        for bad in [
+            "",
+            "../users/me#",
+            "library/alpine?page_size=999",
+            "library/alpine#frag",
+            "a/b/c",
+            "/alpine",
+            "alpine/",
+            "..",
+            ".",
+            "library/..",
+            "Alpine",
+            "foo bar",
+        ] {
+            assert!(validate_hub_repo(bad).is_err(), "{bad:?}");
+            assert!(matches!(client.hub_tags(bad, 10), Err(Error::Manifest(_))), "{bad:?}");
+        }
     }
 }

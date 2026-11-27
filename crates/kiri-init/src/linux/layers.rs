@@ -188,10 +188,20 @@ fn expansion_cap(compressed: u64) -> u64 {
     compressed.saturating_mul(256).clamp(1 << 30, 64 << 30)
 }
 
+/// Maximum uncompressed bytes accepted by `copy::import_upper` (matches
+/// `expansion_cap`'s 64 GiB ceiling).
+pub(super) const MAX_IMPORT_BYTES: u64 = 64 << 30;
+
 /// A reader that fails once more than `left` bytes have come through.
-struct Capped<R> {
-    inner: R,
-    left: u64,
+pub(super) struct Capped<R> {
+    pub(super) inner: R,
+    pub(super) left: u64,
+}
+
+impl<R: Read> Capped<R> {
+    pub(super) fn new(inner: R, max_bytes: u64) -> Self {
+        Self { inner, left: max_bytes }
+    }
 }
 
 impl<R: Read> Read for Capped<R> {
@@ -237,7 +247,9 @@ fn untar_in(reader: impl Read, dest: &Path, detect_userns: fn() -> bool) -> io::
     archive.set_preserve_permissions(true);
     archive.set_preserve_ownerships(true);
     archive.set_preserve_mtime(true);
-    archive.set_unpack_xattrs(true);
+    // Unpack xattrs selectively via `allowed_xattrs` so untrusted OCI layers
+    // cannot plant `trusted.overlay.*` or `user.kiri.*` xattrs as root.
+    archive.set_unpack_xattrs(false);
     archive.set_overwrite(true);
     let mut total = 0u64;
     // Each directory's time, set once the layer is unpacked: tar-rs gives a
@@ -304,20 +316,92 @@ fn untar_in(reader: impl Read, dest: &Path, detect_userns: fn() -> bool) -> io::
                 }
             }
             make_special(dest, &path, entry.header(), kind, userns)?;
-        } else if unpack_replacing(&mut entry, dest, &path)? {
-            keep_zero_time(dest, &path, entry.header())?;
-            if entry.header().entry_type().is_dir()
-                && let Ok(mtime) = entry.header().mtime()
-            {
-                // By its plain names: `./usr` and `usr` are one directory.
-                let plain = path.components().filter(|c| matches!(c, std::path::Component::Normal(_))).collect();
-                dir_times.push((plain, mtime));
+        } else {
+            let xattrs = if entry.header().entry_type().is_symlink() { Vec::new() } else { allowed_xattrs(&mut entry)? };
+            if unpack_replacing(&mut entry, dest, &path)? {
+                apply_xattrs(dest, &path, &xattrs)?;
+                keep_zero_time(dest, &path, entry.header())?;
+                if entry.header().entry_type().is_dir()
+                    && let Ok(mtime) = entry.header().mtime()
+                {
+                    // By its plain names: `./usr` and `usr` are one directory.
+                    let plain = path.components().filter(|c| matches!(c, std::path::Component::Normal(_))).collect();
+                    dir_times.push((plain, mtime));
+                }
             }
         }
     }
     let root = inroot::open_root(dest)?;
     set_dir_times(root.as_fd(), dir_times);
     Ok(total)
+}
+
+/// Whether a PAX `SCHILY.xattr.<name>` extended attribute from an untrusted
+/// archive is permitted on an unpacked layer entry (`SEC-V-05`).
+///
+/// Only `security.capability` and non-Kiri `user.*` xattrs are allowed;
+/// `trusted.*` (including `trusted.overlay.*`) and `user.kiri.*` are rejected
+/// so untrusted OCI layers cannot forge overlayfs or Kiri internal metadata.
+fn xattr_allowed(name: &[u8]) -> bool {
+    if name == b"security.capability" {
+        return true;
+    }
+    name.starts_with(b"user.") && !name.starts_with(b"user.kiri.") && name.len() > b"user.".len()
+}
+
+fn allowed_xattrs<R: Read>(entry: &mut tar::Entry<'_, R>) -> io::Result<Vec<(CString, Vec<u8>)>> {
+    let mut out = Vec::new();
+    let Some(exts) = entry.pax_extensions()? else {
+        return Ok(out);
+    };
+    for ext in exts {
+        let ext = ext?;
+        let Some(name) = ext.key_bytes().strip_prefix(b"SCHILY.xattr.") else {
+            continue;
+        };
+        if !xattr_allowed(name) {
+            continue;
+        }
+        let Ok(cname) = CString::new(name) else {
+            continue;
+        };
+        out.push((cname, ext.value_bytes().to_vec()));
+    }
+    Ok(out)
+}
+
+fn apply_xattrs(dest: &Path, path: &Path, xattrs: &[(CString, Vec<u8>)]) -> io::Result<()> {
+    if xattrs.is_empty() {
+        return Ok(());
+    }
+    let root = inroot::open_root(dest)?;
+    let (parent, name) = hardlink_parent(root.as_fd(), path)?;
+    // SAFETY: confined parent directory fd and NUL-terminated leaf name.
+    let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fresh descriptor owned only here.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    // SAFETY: zeroed stat filled from our own descriptor.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    sys::check(unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } as _, "fstat xattr target")?;
+    if st.st_mode & libc::S_IFMT == libc::S_IFLNK {
+        return Ok(());
+    }
+    let proc_path = CString::new(format!("/proc/self/fd/{}", fd.as_raw_fd())).expect("no NUL");
+    for (attr, val) in xattrs {
+        // SAFETY: `proc_path` resolves directly to our pinned non-symlink inode;
+        // `attr` is NUL-terminated and `val` is valid for `val.len()` bytes.
+        let ret = unsafe { libc::setxattr(proc_path.as_ptr(), attr.as_ptr(), val.as_ptr().cast(), val.len(), 0) };
+        if ret != 0 {
+            let e = io::Error::last_os_error();
+            if !matches!(e.raw_os_error(), Some(libc::EOPNOTSUPP | libc::EPERM | libc::EACCES)) {
+                return Err(io::Error::new(e.kind(), format!("setxattr {}: {e}", attr.to_string_lossy())));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Sets each directory's time once the layer is unpacked (#676): deepest
@@ -1798,5 +1882,47 @@ mod tests {
         let _ = fs::remove_dir_all(&fresh);
         assert_eq!(expansion_cap(1), 1 << 30);
         assert_eq!(expansion_cap(1 << 40), 64 << 30);
+    }
+
+    #[test]
+    fn xattr_allowlist_blocks_overlay_and_kiri_internal_xattrs() {
+        assert!(xattr_allowed(b"security.capability"));
+        assert!(xattr_allowed(b"user.app.tag"));
+        for bad in [
+            &b"trusted.overlay.redirect"[..],
+            b"trusted.overlay.metacopy",
+            b"trusted.overlay.origin",
+            b"trusted.overlay.impure",
+            b"trusted.overlay.opaque",
+            b"trusted.anything",
+            b"user.kiri.mountpoint",
+            b"user.kiri.other",
+            b"user.",
+            b"security.selinux",
+            b"system.posix_acl_access",
+        ] {
+            assert!(!xattr_allowed(bad), "{:?}", String::from_utf8_lossy(bad));
+        }
+
+        // Unpacking an archive carrying forged overlay/kiri xattrs never writes them to disk.
+        let mut b = tar::Builder::new(Vec::new());
+        b.append_pax_extensions([
+            ("SCHILY.xattr.trusted.overlay.redirect", &b"/etc"[..]),
+            ("SCHILY.xattr.trusted.overlay.metacopy", &b""[..]),
+            ("SCHILY.xattr.trusted.overlay.opaque", &b"y"[..]),
+            ("SCHILY.xattr.user.kiri.mountpoint", &b"1"[..]),
+        ])
+        .unwrap();
+        b.append_data(&mut header(4, 0o644), "file", &b"data"[..]).unwrap();
+        let bytes = b.into_inner().unwrap();
+        let dest = scratch("xattr-filter");
+        untar(Capped::new(&bytes[..], u64::MAX), &dest).unwrap();
+        let c = sys::cstr(dest.join("file")).unwrap();
+        for attr in [c"trusted.overlay.redirect", c"trusted.overlay.metacopy", c"trusted.overlay.opaque", c"user.kiri.mountpoint"] {
+            // SAFETY: valid NUL-terminated path and xattr name; size query.
+            let n = unsafe { libc::lgetxattr(c.as_ptr(), attr.as_ptr(), std::ptr::null_mut(), 0) };
+            assert!(n < 0, "forbidden xattr {:?} persisted on disk", attr);
+        }
+        let _ = fs::remove_dir_all(&dest);
     }
 }

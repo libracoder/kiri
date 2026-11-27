@@ -384,17 +384,94 @@ pub fn ensure_k8s_ext4(data_path: &str) -> io::Result<bool> {
     Ok(true)
 }
 
+/// Allowed non-bind volume filesystem types (`SEC-D-04`). Any other fstype
+/// (e.g. `overlay`, `ext4`, `devtmpfs`, `proc`, `sysfs`, `virtiofs`) is refused.
+const ALLOWED_FS_TYPES: [&str; 5] = ["nfs", "nfs4", "cifs", "smb3", "tmpfs"];
+
+/// Safe mount(2) flags accepted for bind volumes. Propagation and remount/move
+/// flags are rejected.
+const ALLOWED_BIND_FLAGS: libc::c_ulong = libc::MS_BIND
+    | libc::MS_REC
+    | libc::MS_RDONLY
+    | libc::MS_NOSUID
+    | libc::MS_NODEV
+    | libc::MS_NOEXEC
+    | libc::MS_NOATIME
+    | libc::MS_NODIRATIME
+    | libc::MS_RELATIME
+    | libc::MS_STRICTATIME;
+
+/// Safe mount(2) flags accepted for non-bind local driver volumes.
+const ALLOWED_FS_FLAGS: libc::c_ulong = libc::MS_RDONLY
+    | libc::MS_NOSUID
+    | libc::MS_NODEV
+    | libc::MS_NOEXEC
+    | libc::MS_NOATIME
+    | libc::MS_NODIRATIME
+    | libc::MS_RELATIME
+    | libc::MS_STRICTATIME
+    | libc::MS_SYNCHRONOUS
+    | libc::MS_DIRSYNC
+    | libc::MS_MANDLOCK
+    | libc::MS_SILENT;
+
+/// Flags applied during the bind remount step.
+const BIND_REMOUNT_ATTRS: libc::c_ulong = libc::MS_RDONLY
+    | libc::MS_NOSUID
+    | libc::MS_NODEV
+    | libc::MS_NOEXEC
+    | libc::MS_NOATIME
+    | libc::MS_NODIRATIME
+    | libc::MS_RELATIME
+    | libc::MS_STRICTATIME;
+
+/// Validates volume mount target, filesystem type, device, and flags before
+/// calling `mount(2)`.
+fn validate_mount(path: &str, kind: &str, device: &str, flags: libc::c_ulong, host_process: bool) -> io::Result<bool> {
+    if !path.starts_with(ROOT) || path.split('/').any(|c| c == "..") {
+        return Err(invalid("volume mount outside the volume store"));
+    }
+    let bind = flags & libc::MS_BIND != 0;
+    if bind {
+        if kind != "none" && !kind.is_empty() {
+            return Err(invalid(&format!("bind volume cannot specify filesystem type {kind:?}")));
+        }
+        if flags & !ALLOWED_BIND_FLAGS != 0 {
+            return Err(invalid(&format!("disallowed bind volume mount flags 0x{flags:x}")));
+        }
+        if !device.starts_with('/') || device.split('/').any(|c| c == "..") {
+            return Err(invalid(&format!("invalid bind volume device path {device:?}")));
+        }
+        if !host_process && is_vm_share_ancestor(device) {
+            return Err(invalid(&format!("bind volume device {device:?} exposes protected VM mount hierarchy")));
+        }
+    } else {
+        if !ALLOWED_FS_TYPES.contains(&kind) {
+            return Err(invalid(&format!("unsupported volume filesystem type {kind:?}")));
+        }
+        if flags & !ALLOWED_FS_FLAGS != 0 {
+            return Err(invalid(&format!("disallowed volume mount flags 0x{flags:x}")));
+        }
+    }
+    Ok(bind)
+}
+
+/// In VM mode, binding `/` or `/mnt` recursively (`MS_REC`) would expose
+/// `/mnt/mac` and `/var/lib/kiri` past the macOS share guard.
+pub(super) fn is_vm_share_ancestor(path: &str) -> bool {
+    let trimmed = path.trim_end_matches('/');
+    matches!(trimmed, "" | "/mnt" | "/mnt/mac")
+}
+
 /// Mounts the volume at `path` unless something already is: `kind` is the
 /// filesystem (`none` for a bind), `flags_hex` and `data` are `o` split as
 /// mount(2) takes it. Errors read as Docker's.
 pub fn ensure(path: &str, kind: &str, device: &str, flags_hex: &str, data: &str) -> io::Result<()> {
-    if !path.starts_with(ROOT) || path.split('/').any(|c| c == "..") {
-        return Err(invalid("volume mount outside the volume store"));
-    }
+    let flags = u64::from_str_radix(flags_hex, 16).map_err(|_| invalid("bad volume mount flags"))? as libc::c_ulong;
+    let bind = validate_mount(path, kind, device, flags, super::transport::is_host_process())?;
     if mounted(path) {
         return Ok(());
     }
-    let flags = u64::from_str_radix(flags_hex, 16).map_err(|_| invalid("bad volume mount flags"))? as libc::c_ulong;
     let fail = |msg: String| io::Error::other(format!("error while mounting volume '{path}': {msg}"));
     if kind.starts_with("nfs") {
         // The daemon resolved the server; one it could not is reported here,
@@ -405,7 +482,6 @@ pub fn ensure(path: &str, kind: &str, device: &str, flags_hex: &str, data: &str)
             }
         }
     }
-    let bind = flags & libc::MS_BIND != 0;
     let c = |s: &str| CString::new(s).map_err(|_| invalid("volume option contains NUL"));
     let (src, target, fstype) = (c(device)?, c(path)?, c(if bind { "none" } else { kind })?);
     let data_c = c(data)?;
@@ -415,12 +491,18 @@ pub fn ensure(path: &str, kind: &str, device: &str, flags_hex: &str, data: &str)
         if r == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
     };
     let result = if bind {
-        // A bind takes no other flags at first; read-only is a remount.
+        // A bind takes no other flags at first; attributes such as ro/nosuid/nodev/noexec are applied by remount.
+        let remount_attrs = flags & BIND_REMOUNT_ATTRS;
         mount(flags & (libc::MS_BIND | libc::MS_REC), None).and_then(|()| {
-            if flags & libc::MS_RDONLY != 0 { mount(libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY | (flags & libc::MS_REC), None) } else { Ok(()) }
+            if remount_attrs != 0 {
+                mount(libc::MS_BIND | libc::MS_REMOUNT | remount_attrs | (flags & libc::MS_REC), None)
+            } else {
+                Ok(())
+            }
         })
     } else {
-        mount(flags, (!data.is_empty()).then_some(&data_c))
+        // Enforce MS_NOSUID | MS_NODEV on network/tmpfs volumes for defense in depth.
+        mount(flags | libc::MS_NOSUID | libc::MS_NODEV, (!data.is_empty()).then_some(&data_c))
     };
     result.map_err(|e| {
         // As Docker's mount error: `mount src:target, flags: 0x…, data: …: errno`,
@@ -513,6 +595,33 @@ mod tests {
     fn only_inside_the_volume_store() {
         assert!(ensure("/etc", "tmpfs", "tmpfs", "0", "").is_err());
         assert!(ensure("/var/lib/kiri/volumes/../../etc/_data", "tmpfs", "tmpfs", "0", "").is_err());
+    }
+
+    #[test]
+    fn volume_mount_validation_rejects_disallowed_fstypes_flags_and_devices() {
+        let vol = "/var/lib/kiri/volumes/v1/_data";
+        // Allowed non-bind fstypes.
+        for kind in ["nfs", "nfs4", "cifs", "smb3", "tmpfs"] {
+            assert!(!validate_mount(vol, kind, "src", libc::MS_RDONLY | libc::MS_NOATIME, false).unwrap(), "{kind}");
+        }
+        // Disallowed non-bind fstypes (SEC-D-04).
+        for bad in ["overlay", "ext4", "devtmpfs", "proc", "sysfs", "virtiofs", "none", ""] {
+            assert!(validate_mount(vol, bad, "src", 0, false).is_err(), "{bad:?}");
+        }
+        // Disallowed flags on non-bind mounts.
+        assert!(validate_mount(vol, "tmpfs", "tmpfs", libc::MS_REMOUNT, false).is_err());
+        assert!(validate_mount(vol, "tmpfs", "tmpfs", libc::MS_MOVE, false).is_err());
+        // Bind volumes: valid under /mnt/mac/Users or host paths.
+        assert!(validate_mount(vol, "none", "/mnt/mac/Users/alice/app", libc::MS_BIND | libc::MS_RDONLY, false).unwrap());
+        assert!(validate_mount(vol, "none", "/srv/data", libc::MS_BIND | libc::MS_REC, true).unwrap());
+        // Bind volumes: reject non-none fstype, relative/traversal device, disallowed flags, and VM share ancestors.
+        assert!(validate_mount(vol, "overlay", "/tmp/a", libc::MS_BIND, true).is_err());
+        assert!(validate_mount(vol, "none", "relative/path", libc::MS_BIND, true).is_err());
+        assert!(validate_mount(vol, "none", "/mnt/mac/Users/..", libc::MS_BIND, false).is_err());
+        assert!(validate_mount(vol, "none", "/", libc::MS_BIND | libc::MS_REC, false).is_err());
+        assert!(validate_mount(vol, "none", "/mnt", libc::MS_BIND | libc::MS_REC, false).is_err());
+        assert!(validate_mount(vol, "none", "/mnt/mac", libc::MS_BIND, false).is_err());
+        assert!(validate_mount(vol, "none", "/tmp/a", libc::MS_BIND | libc::MS_REMOUNT, true).is_err());
     }
 
     #[test]
