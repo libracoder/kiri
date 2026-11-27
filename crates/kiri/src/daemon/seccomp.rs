@@ -81,7 +81,8 @@
 //! boundary the guest keeps. Anything Kiri cannot do is an error that names
 //! it, never a fallback.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
+use std::sync::Mutex;
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -424,7 +425,7 @@ impl Rule {
 /// Compiles a profile for the guest's architecture and a container that
 /// keeps `caps` (one bit per capability, as the kernel numbers them).
 pub fn compile(json: &str, caps: u64) -> Result<Vec<u8>, String> {
-    compile_with(Arch::native(), json, caps, &guest_kernel)
+    compile_cached(Arch::native(), json, caps, &guest_kernel)
 }
 
 /// For the tests: the macOS VM's kernel.
@@ -438,7 +439,95 @@ pub fn compile_for_kernel(arch: Arch, json: &str, caps: u64, kernel: (u32, u32))
     compile_with(arch, json, caps, &|| Ok(kernel))
 }
 
+const MAX_SECCOMP_CACHE: usize = 64;
+const MAX_CACHED_PROFILE_BYTES: usize = 256 << 10;
+
+struct CachedBpf {
+    arch: Arch,
+    caps: u64,
+    kernel: Option<(u32, u32)>,
+    json: Box<str>,
+    prog: Vec<u8>,
+}
+
+static BPF_CACHE: Mutex<VecDeque<CachedBpf>> = Mutex::new(VecDeque::new());
+
 /// `kernel` is asked only when a rule has a `minKernel`.
+fn compile_cached(arch: Arch, json: &str, caps: u64, kernel: &dyn Fn() -> Result<(u32, u32), String>) -> Result<Vec<u8>, String> {
+    if json.len() <= MAX_CACHED_PROFILE_BYTES {
+        let mut cache = BPF_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut matched: Option<usize> = None;
+        for (idx, entry) in cache.iter().enumerate() {
+            if entry.arch == arch && entry.caps == caps && entry.json.len() == json.len() && entry.json.as_ref() == json {
+                match entry.kernel {
+                    None => {
+                        matched = Some(idx);
+                        break;
+                    }
+                    Some(_) => {
+                        drop(cache);
+                        let cur_k = kernel()?;
+                        cache = BPF_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+                        if let Some(pos) = cache.iter().position(|e| {
+                            e.arch == arch
+                                && e.caps == caps
+                                && e.kernel == Some(cur_k)
+                                && e.json.len() == json.len()
+                                && e.json.as_ref() == json
+                        }) {
+                            matched = Some(pos);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(idx) = matched {
+            let prog = cache[idx].prog.clone();
+            if idx != 0
+                && let Some(entry) = cache.remove(idx)
+            {
+                cache.push_front(entry);
+            }
+            return Ok(prog);
+        }
+    }
+
+    let kernel_seen = std::cell::Cell::new(None);
+    let tracked_kernel = || -> Result<(u32, u32), String> {
+        if let Some(k) = kernel_seen.get() {
+            return Ok(k);
+        }
+        let k = kernel()?;
+        kernel_seen.set(Some(k));
+        Ok(k)
+    };
+    let prog = compile_with(arch, json, caps, &tracked_kernel)?;
+    if json.len() <= MAX_CACHED_PROFILE_BYTES {
+        let used_k = kernel_seen.get();
+        let mut cache = BPF_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pos) = cache.iter().position(|e| {
+            e.arch == arch
+                && e.caps == caps
+                && e.kernel == used_k
+                && e.json.len() == json.len()
+                && e.json.as_ref() == json
+        }) {
+            cache.remove(pos);
+        } else if cache.len() >= MAX_SECCOMP_CACHE {
+            cache.pop_back();
+        }
+        cache.push_front(CachedBpf {
+            arch,
+            caps,
+            kernel: used_k,
+            json: json.into(),
+            prog: prog.clone(),
+        });
+    }
+    Ok(prog)
+}
+
 fn compile_with(arch: Arch, json: &str, caps: u64, kernel: &dyn Fn() -> Result<(u32, u32), String>) -> Result<Vec<u8>, String> {
     let profile: Profile = serde_json::from_str(json).map_err(|e| format!("invalid seccomp profile: {e}"))?;
     if profile.listener_path.as_deref().is_some_and(|p| !p.is_empty()) {
@@ -1909,5 +1998,28 @@ mod spec_tests {
         assert_ne!(spec(&["seccomp=unconfined"], 0, false).security_flags() & NO_SECCOMP, 0);
         assert_eq!(spec(&[DENY_MKDIR], 0, false).security_flags() & NO_SECCOMP, 0);
         assert_eq!(spec(&[], 0, false).security_flags() & NO_SECCOMP, 0);
+    }
+
+    #[test]
+    fn bpf_cache_distinguishes_profile_bytes_caps_kernel_and_stays_bounded() {
+        let p1 = r#"{"defaultAction":"SCMP_ACT_ERRNO","syscalls":[{"names":["read"],"action":"SCMP_ACT_ALLOW"}]}"#;
+        let p2 = r#"{"defaultAction":"SCMP_ACT_ERRNO","syscalls":[{"names":["stat"],"action":"SCMP_ACT_ALLOW"}]}"#;
+        assert_eq!(p1.len(), p2.len());
+        let b1 = super::compile_cached(Arch::native(), p1, 0, &|| Ok((6, 18))).unwrap();
+        let b1_again = super::compile_cached(Arch::native(), p1, 0, &|| Ok((6, 18))).unwrap();
+        let b2 = super::compile_cached(Arch::native(), p2, 0, &|| Ok((6, 18))).unwrap();
+        assert_eq!(b1, b1_again);
+        assert_ne!(b1, b2, "same-length profiles must not collide in cache");
+
+        let min_k = r#"{"defaultAction":"SCMP_ACT_ERRNO","syscalls":[{"names":["read"],"action":"SCMP_ACT_ALLOW","includes":{"minKernel":"6.0"}}]}"#;
+        let old_k = super::compile_cached(Arch::native(), min_k, 0, &|| Ok((5, 15))).unwrap();
+        let new_k = super::compile_cached(Arch::native(), min_k, 0, &|| Ok((6, 18))).unwrap();
+        assert_ne!(old_k, new_k, "minKernel profiles must distinguish kernel version");
+
+        for i in 0..(super::MAX_SECCOMP_CACHE + 16) {
+            let p = format!(r#"{{"defaultAction":"SCMP_ACT_ERRNO","defaultErrnoRet":{},"syscalls":[{{"names":["read"],"action":"SCMP_ACT_ALLOW"}}]}}"#, (i % 100) + 1);
+            let _ = super::compile_cached(Arch::native(), &p, i as u64, &|| Ok((6, 18))).unwrap();
+        }
+        assert!(super::BPF_CACHE.lock().unwrap().len() <= super::MAX_SECCOMP_CACHE);
     }
 }
