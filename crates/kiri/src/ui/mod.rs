@@ -3118,3 +3118,6 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
         _ => Ok(()),
     };
 }
+
+#[cfg(test)]
+mod hillclimb_bench;
