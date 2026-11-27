@@ -965,9 +965,7 @@ fn host_names() -> io::Result<bool> {
 fn kubeconfig(use_context: bool, port: u16) -> io::Result<bool> {
     let ours = crate::kubeconfig::from_k3s(&k3s_yaml()?, CONTEXT.get(), port);
     let own = home()?.join(crate::flavor::STATE.get()).join("kubeconfig");
-    std::fs::create_dir_all(own.parent().expect("has a parent"))?;
-    std::fs::write(&own, &ours)?;
-    std::fs::set_permissions(&own, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+    crate::kubeconfig::write_private_atomic(&own, &ours)?;
     let Some(kube) = crate::kubeconfig::path() else {
         println!("kubeconfig: {} (HOME is not set, so not in ~/.kube/config)", own.display());
         return Ok(false);

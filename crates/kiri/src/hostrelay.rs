@@ -153,10 +153,13 @@ pub fn wsl_host_active() -> bool {
 /// before it is allocated.
 const CHUNK: usize = 64 * 1024;
 const MAX_FRAME: usize = 1 << 20;
-/// Frames waiting for one connection's writer. When it is full the reader
-/// waits, which slows the other connections too; a proxy relay has a few
-/// connections that all keep reading, and nothing grows without bound.
+/// Frames waiting for one connection's writer. Dispatched non-blockingly so a
+/// stalled peer closes only its own connection rather than freezing the relay.
 const QUEUE: usize = 64;
+/// Maximum concurrent connections multiplexed over one relay.
+const MAX_CONNS: usize = 512;
+/// Write timeout on relayed TCP sockets so a wedged peer cannot pin a writer thread forever.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub type Out = Arc<Mutex<dyn Write + Send>>;
 
@@ -222,18 +225,27 @@ impl Drop for CloseAll {
     }
 }
 
+enum OpenOutcome {
+    Opened(Receiver<Op>),
+    Full,
+    Closed,
+}
+
 impl Conns {
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// A new connection: what arrives for it waits here until it is made.
-    fn open(&self, id: u32) -> Option<Receiver<Op>> {
+    fn open(&self, id: u32) -> OpenOutcome {
         let (tx, rx) = sync_channel(QUEUE);
         let prev = {
             let mut s = self.state();
             if s.closed {
-                return None;
+                return OpenOutcome::Closed;
+            }
+            if s.entries.len() >= MAX_CONNS && !s.entries.contains_key(&id) {
+                return OpenOutcome::Full;
             }
             s.entries.insert(id, Entry { tx, stream: None })
         };
@@ -242,7 +254,7 @@ impl Conns {
         {
             let _ = stream.shutdown(Shutdown::Both);
         }
-        Some(rx)
+        OpenOutcome::Opened(rx)
     }
 
     fn close(&self, id: u32) -> bool {
@@ -266,8 +278,9 @@ impl Conns {
         }
     }
 
-    /// A frame for one of the connections.
-    fn dispatch(&self, kind: u8, id: u32, data: Vec<u8>) {
+    /// A frame for one of the connections. Never blocks the multiplexer loop:
+    /// if a connection's bounded queue is full, only that stalled connection is closed.
+    fn dispatch(&self, out: &Out, kind: u8, id: u32, data: Vec<u8>) {
         let op = match kind {
             DATA => Op::Data(data),
             EOF => Op::Eof,
@@ -277,18 +290,49 @@ impl Conns {
             }
             _ => return,
         };
-        // Sent outside the lock: a full queue waits for its own writer only.
         let tx = self.state().entries.get(&id).map(|e| e.tx.clone());
         if let Some(tx) = tx {
-            let _ = tx.send(op);
+            match tx.try_send(op) {
+                Ok(()) => {}
+                Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                    if self.close(id) {
+                        let _ = send(out, CLOSE, id, &[]);
+                    }
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                    self.close(id);
+                }
+            }
         }
     }
+}
+
+fn enable_keepalive(stream: &TcpStream) {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let on: libc::c_int = 1;
+        // SAFETY: SO_KEEPALIVE on a live TCP socket we own.
+        unsafe {
+            libc::setsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_KEEPALIVE,
+                (&raw const on).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = stream;
 }
 
 /// Joins `stream` to connection `id`: what it reads goes to the other end
 /// as DATA, then EOF; what arrives for it (`rx`) is written to it.
 fn attach(conns: &Arc<Conns>, out: &Out, id: u32, rx: Receiver<Op>, stream: TcpStream) {
     let _ = stream.set_nodelay(true);
+    let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
+    enable_keepalive(&stream);
     let (Ok(reader), Ok(writer)) = (stream.try_clone(), stream.try_clone()) else {
         conns.close(id);
         let _ = send(out, CLOSE, id, &[]);
@@ -321,57 +365,73 @@ fn attach(conns: &Arc<Conns>, out: &Out, id: u32, rx: Receiver<Op>, stream: TcpS
     };
     let done2 = done.clone();
     let (c, o) = (conns.clone(), out.clone());
-    std::thread::spawn(move || {
-        let mut writer = writer;
-        for op in rx {
-            match op {
-                Op::Data(d) => {
-                    if writer.write_all(&d).is_err() {
-                        let _ = writer.shutdown(Shutdown::Both);
-                        c.close(id);
-                        let _ = send(&o, CLOSE, id, &[]);
-                        return;
+    if std::thread::Builder::new()
+        .name("kiri-relay-w".into())
+        .spawn(move || {
+            let mut writer = writer;
+            for op in rx {
+                match op {
+                    Op::Data(d) => {
+                        if writer.write_all(&d).is_err() {
+                            let _ = writer.shutdown(Shutdown::Both);
+                            c.close(id);
+                            let _ = send(&o, CLOSE, id, &[]);
+                            return;
+                        }
                     }
-                }
-                Op::Eof => {
-                    let _ = writer.shutdown(Shutdown::Write);
-                    break;
-                }
-            }
-        }
-        done2();
-    });
-    let o = out.clone();
-    let c = conns.clone();
-    std::thread::spawn(move || {
-        let mut reader = reader;
-        let mut buf = vec![0u8; CHUNK];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) => {
-                    if send(&o, EOF, id, &[]).is_err() {
-                        c.close(id);
-                    }
-                    break;
-                }
-                Ok(n) => {
-                    if send(&o, DATA, id, &buf[..n]).is_err() {
-                        c.close(id);
+                    Op::Eof => {
+                        let _ = writer.shutdown(Shutdown::Write);
                         break;
                     }
                 }
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(_) => {
-                    // Gone while the other end may still be sending: say so.
-                    if c.close(id) {
-                        let _ = send(&o, CLOSE, id, &[]);
+            }
+            done2();
+        })
+        .is_err()
+    {
+        if conns.close(id) {
+            let _ = send(out, CLOSE, id, &[]);
+        }
+        return;
+    }
+    let o = out.clone();
+    let c = conns.clone();
+    if std::thread::Builder::new()
+        .name("kiri-relay-r".into())
+        .spawn(move || {
+            let mut reader = reader;
+            let mut buf = vec![0u8; CHUNK];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => {
+                        if send(&o, EOF, id, &[]).is_err() {
+                            c.close(id);
+                        }
+                        break;
                     }
-                    break;
+                    Ok(n) => {
+                        if send(&o, DATA, id, &buf[..n]).is_err() {
+                            c.close(id);
+                            break;
+                        }
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(_) => {
+                        // Gone while the other end may still be sending: say so.
+                        if c.close(id) {
+                            let _ = send(&o, CLOSE, id, &[]);
+                        }
+                        break;
+                    }
                 }
             }
-        }
-        done();
-    });
+            done();
+        })
+        .is_err()
+        && conns.close(id)
+    {
+        let _ = send(out, CLOSE, id, &[]);
+    }
 }
 
 /// The WSL end (`kiri hostrelay`): listens as kiri-win asks and sends each
@@ -424,7 +484,7 @@ pub fn listen_side(input: impl Read, out: &Out) -> io::Result<()> {
                 let port: u16 = 0;
                 send(out, LISTENING_HOST, 0, &port.to_be_bytes())?;
             }
-            _ => conns.dispatch(kind, id, data),
+            _ => conns.dispatch(out, kind, id, data),
         }
     }
     Ok(())
@@ -451,9 +511,16 @@ fn listen(target: u16, conns: &Arc<Conns>, out: &Out, next: &Arc<AtomicU32>) -> 
                 }
             };
             let id = next.fetch_add(1, Ordering::SeqCst);
-            let Some(rx) = conns.open(id) else {
-                let _ = s.shutdown(Shutdown::Both);
-                return;
+            let rx = match conns.open(id) {
+                OpenOutcome::Opened(rx) => rx,
+                OpenOutcome::Full => {
+                    let _ = s.shutdown(Shutdown::Both);
+                    continue;
+                }
+                OpenOutcome::Closed => {
+                    let _ = s.shutdown(Shutdown::Both);
+                    return;
+                }
             };
             if send(&out, OPEN, id, &target.to_be_bytes()).is_err() {
                 conns.close(id);
@@ -628,9 +695,16 @@ fn start_host_gateway(addr: [u8; 4], conns: &Arc<Conns>, out: &Out, next: &Arc<A
                 continue;
             };
             let id = next.fetch_add(1, Ordering::SeqCst);
-            let Some(rx) = conns.open(id) else {
-                let _ = s.shutdown(Shutdown::Both);
-                return;
+            let rx = match conns.open(id) {
+                OpenOutcome::Opened(rx) => rx,
+                OpenOutcome::Full => {
+                    let _ = s.shutdown(Shutdown::Both);
+                    continue;
+                }
+                OpenOutcome::Closed => {
+                    let _ = s.shutdown(Shutdown::Both);
+                    return;
+                }
             };
             if send(&out, OPEN, id, &target.to_be_bytes()).is_err() {
                 conns.close(id);
@@ -1011,15 +1085,28 @@ pub fn dial_side_with_host(
                     continue;
                 };
                 // Data that arrives while it dials waits in the queue.
-                let Some(rx) = conns.open(id) else { continue };
-                let (c, o) = (conns.clone(), out.clone());
-                std::thread::spawn(move || match dial(target) {
-                    Ok(s) => attach(&c, &o, id, rx, s),
-                    Err(_) => {
-                        c.close(id);
-                        let _ = send(&o, CLOSE, id, &[]);
+                let rx = match conns.open(id) {
+                    OpenOutcome::Opened(rx) => rx,
+                    OpenOutcome::Full | OpenOutcome::Closed => {
+                        let _ = send(out, CLOSE, id, &[]);
+                        continue;
                     }
-                });
+                };
+                let (c, o) = (conns.clone(), out.clone());
+                if std::thread::Builder::new()
+                    .name("kiri-relay-dial".into())
+                    .spawn(move || match dial(target) {
+                        Ok(s) => attach(&c, &o, id, rx, s),
+                        Err(_) => {
+                            c.close(id);
+                            let _ = send(&o, CLOSE, id, &[]);
+                        }
+                    })
+                    .is_err()
+                {
+                    conns.close(id);
+                    let _ = send(out, CLOSE, id, &[]);
+                }
             }
             LISTENING => {
                 if let (Some(target), Some(local)) = (port_of(&data, 0), port_of(&data, 2)) {
@@ -1031,7 +1118,7 @@ pub fn dial_side_with_host(
                     listening_host(local);
                 }
             }
-            _ => conns.dispatch(kind, id, data),
+            _ => conns.dispatch(out, kind, id, data),
         }
     }
     Ok(())
@@ -1301,7 +1388,7 @@ mod tests {
         let conns = Arc::new(Conns::default());
         let (_out_rx, out_tx) = io::pipe().unwrap();
         let out: Out = Arc::new(Mutex::new(out_tx));
-        let rx = conns.open(1).unwrap();
+        let OpenOutcome::Opened(rx) = conns.open(1) else { panic!("expected Opened") };
         let client = TcpStream::connect(("127.0.0.1", port)).unwrap();
         let (mut peer, _) = proxy.accept().unwrap();
         attach(&conns, &out, 1, rx, client);
@@ -1313,7 +1400,7 @@ mod tests {
         drop(tx);
         conns.close_all();
         assert!(conns.state().entries.is_empty());
-        assert!(conns.open(2).is_none());
+        assert!(matches!(conns.open(2), OpenOutcome::Closed));
         peer.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
         loop {
             match peer.read(&mut buf) {
@@ -1356,7 +1443,7 @@ mod tests {
         let (out_rx, out_tx) = io::pipe().unwrap();
         drop(out_rx);
         let out: Out = Arc::new(Mutex::new(out_tx));
-        let rx = conns.open(1).unwrap();
+        let OpenOutcome::Opened(rx) = conns.open(1) else { panic!("expected Opened") };
         let client = TcpStream::connect(("127.0.0.1", port)).unwrap();
         let (mut peer, _) = proxy.accept().unwrap();
         attach(&conns, &out, 1, rx, client);
@@ -1375,7 +1462,7 @@ mod tests {
 
         // 1. An in-flight connection opened before close_all() that reaches attach() after close_all().
         let conns = Arc::new(Conns::default());
-        let rx = conns.open(1).unwrap();
+        let OpenOutcome::Opened(rx) = conns.open(1) else { panic!("expected Opened") };
         conns.close_all();
         let client = TcpStream::connect(("127.0.0.1", port)).unwrap();
         let (mut peer, _) = proxy.accept().unwrap();
@@ -1567,6 +1654,60 @@ mod tests {
         assert!(!is_hostrelay_cmdline(b"\0hostrelay\0"));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stalled_connection_does_not_freeze_multiplexer_and_conn_cap_is_enforced() {
+        let conns = Arc::new(Conns::default());
+        let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        struct SharedVec(Arc<Mutex<Vec<u8>>>);
+        impl Write for SharedVec {
+            fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(data);
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let out: Out = Arc::new(Mutex::new(SharedVec(buf.clone())));
+
+        let OpenOutcome::Opened(_rx1_stalled) = conns.open(1) else {
+            panic!("conn 1 should open");
+        };
+        let OpenOutcome::Opened(rx2_healthy) = conns.open(2) else {
+            panic!("conn 2 should open");
+        };
+
+        // Flood conn 1 past QUEUE (64 frames) with nobody reading _rx1_stalled:
+        // dispatch MUST NOT block, must close conn 1 and emit a CLOSE frame for id 1.
+        for _ in 0..(QUEUE + 8) {
+            conns.dispatch(&out, DATA, 1, vec![0xaa; 16]);
+        }
+        // Conn 2 must still receive frames immediately.
+        conns.dispatch(&out, DATA, 2, b"ok".to_vec());
+        match rx2_healthy.recv_timeout(Duration::from_secs(1)).unwrap() {
+            Op::Data(d) => assert_eq!(d, b"ok"),
+            Op::Eof => panic!("unexpected EOF on conn 2"),
+        }
+        // Verify CLOSE frame for conn 1 was emitted.
+        let wire = buf.lock().unwrap().clone();
+        let mut cursor = io::Cursor::new(wire);
+        let (kind, id, data) = read_frame(&mut cursor).unwrap().unwrap();
+        assert_eq!((kind, id, data.len()), (CLOSE, 1, 0));
+
+        // Verify MAX_CONNS cap rejects excess opens without closing existing ones.
+        let mut held = Vec::new();
+        for id in 10..(10 + MAX_CONNS as u32) {
+            match conns.open(id) {
+                OpenOutcome::Opened(rx) => held.push(rx),
+                OpenOutcome::Full => break,
+                OpenOutcome::Closed => panic!("unexpected closed"),
+            }
+        }
+        assert!(matches!(conns.open(999_999), OpenOutcome::Full));
+        conns.close_all();
+        assert!(matches!(conns.open(1_000_000), OpenOutcome::Closed));
     }
 
     #[cfg(target_os = "linux")]

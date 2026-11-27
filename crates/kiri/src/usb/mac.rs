@@ -15,7 +15,7 @@ use std::io::{self, Write};
 use std::os::unix::net::UnixStream;
 use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use block2::{Block, RcBlock};
@@ -59,6 +59,10 @@ unsafe extern "C" {}
 
 /// An io_object_t, released when dropped.
 struct IoObj(u32);
+// SAFETY: IOKit object handles (Mach port names) are safe to pass and release across threads.
+unsafe impl Send for IoObj {}
+// SAFETY: IOKit object handles are thread-safe to query with IOKit registry APIs.
+unsafe impl Sync for IoObj {}
 
 impl Drop for IoObj {
     fn drop(&mut self) {
@@ -308,29 +312,41 @@ fn open(class: &str, service: u32, options: usize, handler: Option<&InterestHand
     obj.map(Obj).ok_or_else(|| describe(err))
 }
 
-fn mutable_data(len: usize) -> Retained<AnyObject> {
-    // SAFETY: NSMutableData's class constructor.
+fn mutable_data(len: usize) -> Option<Retained<AnyObject>> {
+    // SAFETY: NSMutableData's class constructor returns nil on allocation failure.
     unsafe { msg_send![objc2::class!(NSMutableData), dataWithLength: len] }
 }
 
 fn data_bytes(d: &AnyObject, n: usize) -> Vec<u8> {
-    // SAFETY: NSMutableData's buffer holds at least its length, and n is
-    // capped to it.
+    // SAFETY: NSMutableData's buffer holds at least its length, and `take` is
+    // capped to it; zero-length and null buffers short-circuit before slicing.
     unsafe {
         let len: usize = msg_send![d, length];
-        let p: *const u8 = msg_send![d, mutableBytes];
-        std::slice::from_raw_parts(p, n.min(len)).to_vec()
+        let take = n.min(len);
+        if take == 0 {
+            return Vec::new();
+        }
+        let p: *mut c_void = msg_send![d, mutableBytes];
+        if p.is_null() {
+            return Vec::new();
+        }
+        std::slice::from_raw_parts(p.cast::<u8>(), take).to_vec()
     }
 }
 
-fn data_with(bytes: &[u8]) -> Retained<AnyObject> {
-    let d = mutable_data(bytes.len());
-    // SAFETY: the buffer is bytes.len() long.
-    unsafe {
-        let p: *mut u8 = msg_send![&*d, mutableBytes];
-        ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
+fn data_with(bytes: &[u8]) -> Option<Retained<AnyObject>> {
+    let d = mutable_data(bytes.len())?;
+    if !bytes.is_empty() {
+        // SAFETY: the buffer is bytes.len() long and checked non-null.
+        unsafe {
+            let p: *mut c_void = msg_send![&*d, mutableBytes];
+            if p.is_null() {
+                return None;
+            }
+            ptr::copy_nonoverlapping(bytes.as_ptr(), p.cast::<u8>(), bytes.len());
+        }
     }
-    d
+    Some(d)
 }
 
 
@@ -358,12 +374,16 @@ const UNDERRUN: u32 = 0xe00002e7;
 
 struct HostDevice {
     device: Obj,
-    service: u32,
+    /// Retained IOService handle so it stays valid for the lifetime of HostDevice.
+    service: IoObj,
     /// Open IOUSBHostInterfaces by interface number.
     interfaces: Mutex<HashMap<u8, Obj>>,
     /// Pipes by endpoint address, with their interface number.
     pipes: Mutex<HashMap<u8, (u8, Obj)>>,
     gone: Arc<AtomicBool>,
+    /// Read-locked by active transfers/aborts; write-locked by final teardown so
+    /// `[iface destroy]` and `[device destroy]` never race an in-flight worker.
+    destroyed: RwLock<bool>,
 }
 
 impl HostDevice {
@@ -373,8 +393,8 @@ impl HostDevice {
         let mut ifs = self.interfaces.lock().unwrap_or_else(|e| e.into_inner());
         for _ in 0..40 {
             let mut it = 0u32;
-            // SAFETY: a valid registry entry; the iterator is ours.
-            if unsafe { IORegistryEntryGetChildIterator(self.service, c"IOService".as_ptr(), &mut it) } == 0 {
+            // SAFETY: a valid retained registry entry; the iterator is ours.
+            if unsafe { IORegistryEntryGetChildIterator(self.service.0, c"IOService".as_ptr(), &mut it) } == 0 {
                 let it = IoObj(it);
                 loop {
                     // SAFETY: a valid iterator.
@@ -449,17 +469,55 @@ impl HostDevice {
             _ => Done::wrote(done),
         }
     }
+    /// Waits for all in-flight worker operations to exit, then destroys open
+    /// interfaces and resets/destroys the captured device.
+    fn teardown(&self) {
+        let mut destroyed = self.destroyed.write().unwrap_or_else(|e| e.into_inner());
+        if *destroyed {
+            return;
+        }
+        *destroyed = true;
+        self.close_interfaces();
+        // Hand the device back: a reset makes macOS enumerate it again and
+        // match its own drivers. An unplugged device has nothing to reset.
+        let mut err: *mut AnyObject = ptr::null_mut();
+        // SAFETY: exclusive write lock ensures no worker thread is still calling
+        // into `self.device` or any interface/pipe when destroy runs.
+        unsafe {
+            if !self.gone.load(Ordering::SeqCst) {
+                let _: Bool = msg_send![&*self.device.0, resetWithError: &mut err];
+            }
+            let _: () = msg_send![&*self.device.0, destroy];
+        }
+    }
 }
 
 impl usbip::Backend for HostDevice {
     fn control(&self, _seq: u32, s: &Setup, out: &[u8]) -> Done {
-        if self.gone.load(Ordering::SeqCst) {
+        let guard = self.destroyed.read().unwrap_or_else(|e| e.into_inner());
+        if *guard || self.gone.load(Ordering::SeqCst) {
             return Done::fail(usbip::ENODEV);
         }
         autoreleasepool(|_| {
             let req = DeviceRequest { request_type: s.request_type, request: s.request, value: s.value, index: s.index, length: s.length };
             let dir_in = s.request_type & 0x80 != 0;
-            let data = if dir_in { Some(mutable_data(s.length as usize)) } else { (!out.is_empty()).then(|| data_with(out)) };
+            let data = if dir_in {
+                if s.length == 0 {
+                    None
+                } else {
+                    match mutable_data(s.length as usize) {
+                        Some(d) => Some(d),
+                        None => return Done::fail(usbip::ENOMEM),
+                    }
+                }
+            } else if out.is_empty() {
+                None
+            } else {
+                match data_with(out) {
+                    Some(d) => Some(d),
+                    None => return Done::fail(usbip::ENOMEM),
+                }
+            };
             let (mut done, mut err) = (0usize, ptr::null_mut::<AnyObject>());
             let d: Option<&AnyObject> = data.as_deref();
             // SAFETY: a synchronous request on the default control endpoint.
@@ -469,6 +527,10 @@ impl usbip::Backend for HostDevice {
     }
 
     fn set_configuration(&self, value: u8) -> i32 {
+        let guard = self.destroyed.read().unwrap_or_else(|e| e.into_inner());
+        if *guard || self.gone.load(Ordering::SeqCst) {
+            return -usbip::ENODEV;
+        }
         self.close_interfaces();
         let mut err: *mut AnyObject = ptr::null_mut();
         // SAFETY: configureWithValue on the captured device; no macOS
@@ -481,6 +543,10 @@ impl usbip::Backend for HostDevice {
     }
 
     fn set_interface(&self, interface: u8, alt: u8) -> i32 {
+        let guard = self.destroyed.read().unwrap_or_else(|e| e.into_inner());
+        if *guard || self.gone.load(Ordering::SeqCst) {
+            return -usbip::ENODEV;
+        }
         if !self.interfaces.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&interface) {
             self.open_interfaces();
         }
@@ -496,6 +562,10 @@ impl usbip::Backend for HostDevice {
     }
 
     fn clear_halt(&self, endpoint: u8) -> i32 {
+        let guard = self.destroyed.read().unwrap_or_else(|e| e.into_inner());
+        if *guard || self.gone.load(Ordering::SeqCst) {
+            return -usbip::ENODEV;
+        }
         let Some(p) = self.pipe(endpoint) else { return -usbip::EPIPE };
         let mut err: *mut AnyObject = ptr::null_mut();
         // SAFETY: clearStall on a pipe we hold.
@@ -504,13 +574,30 @@ impl usbip::Backend for HostDevice {
     }
 
     fn transfer(&self, _seq: u32, endpoint: u8, out: &[u8], len: usize) -> Done {
-        if self.gone.load(Ordering::SeqCst) {
+        let guard = self.destroyed.read().unwrap_or_else(|e| e.into_inner());
+        if *guard || self.gone.load(Ordering::SeqCst) {
             return Done::fail(usbip::ENODEV);
         }
         let Some(p) = self.pipe(endpoint) else { return Done::fail(usbip::EPIPE) };
         autoreleasepool(|_| {
             let dir_in = endpoint & 0x80 != 0;
-            let data = if dir_in { Some(mutable_data(len)) } else { (!out.is_empty()).then(|| data_with(out)) };
+            let data = if dir_in {
+                if len == 0 {
+                    None
+                } else {
+                    match mutable_data(len) {
+                        Some(d) => Some(d),
+                        None => return Done::fail(usbip::ENOMEM),
+                    }
+                }
+            } else if out.is_empty() {
+                None
+            } else {
+                match data_with(out) {
+                    Some(d) => Some(d),
+                    None => return Done::fail(usbip::ENOMEM),
+                }
+            };
             let (mut done, mut err) = (0usize, ptr::null_mut::<AnyObject>());
             let d: Option<&AnyObject> = data.as_deref();
             // SAFETY: a synchronous transfer; 0 is no timeout, as interrupt
@@ -521,6 +608,10 @@ impl usbip::Backend for HostDevice {
     }
 
     fn abort(&self, _seq: u32, endpoint: u8) {
+        let guard = self.destroyed.read().unwrap_or_else(|e| e.into_inner());
+        if *guard {
+            return;
+        }
         let mut err: *mut AnyObject = ptr::null_mut();
         if endpoint == 0 {
             // SAFETY: abort on the device we hold.
@@ -532,6 +623,10 @@ impl usbip::Backend for HostDevice {
     }
 
     fn close(&self) {
+        let guard = self.destroyed.read().unwrap_or_else(|e| e.into_inner());
+        if *guard {
+            return;
+        }
         let pipes: Vec<Obj> = self.pipes.lock().unwrap_or_else(|e| e.into_inner()).values().map(|(_, p)| p.clone()).collect();
         for p in pipes {
             let mut err: *mut AnyObject = ptr::null_mut();
@@ -558,6 +653,25 @@ extern "C" fn on_signal(_: libc::c_int) {
     }
 }
 
+fn is_socket_fd(fd: i32) -> bool {
+    // SAFETY: fstat into a zeroed stat buffer.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    unsafe { libc::fstat(fd, &mut st) == 0 && (st.st_mode & libc::S_IFMT) == libc::S_IFSOCK }
+}
+
+fn validate_serve_fds(uid: u32, fd: i32, status: i32, is_sock: impl Fn(i32) -> bool) -> io::Result<()> {
+    if uid != 0 {
+        return Err(io::Error::other("kiri usb serve needs root (the USB helper runs it)"));
+    }
+    if fd == status {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "--fd and --status must be distinct descriptors"));
+    }
+    if !is_sock(fd) || !is_sock(status) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "--fd and --status must be open sockets"));
+    }
+    Ok(())
+}
+
 /// `kiri usb serve LOCATION --fd N --status M`, started by the helper as
 /// root: capture the device and serve it over fd N, the connection its
 /// requester made to the daemon, until either side lets go. "ok" (or
@@ -566,7 +680,10 @@ pub fn serve(location: &str, fd: Option<&String>, status: Option<&String>) -> io
     use std::os::fd::FromRawFd;
     let parse = |v: Option<&String>, what: &str| v.and_then(|s| s.parse::<i32>().ok()).filter(|&n| n > 2).ok_or_else(|| io::Error::other(format!("{what} is required")));
     let (fd, status) = (parse(fd, "--fd")?, parse(status, "--status")?);
-    // SAFETY: the helper passed these two descriptors to this process.
+    // SAFETY: getuid has no preconditions.
+    let uid = unsafe { libc::getuid() };
+    validate_serve_fds(uid, fd, status, is_socket_fd)?;
+    // SAFETY: validated distinct open socket descriptors handed to this root process.
     let (stream, mut status) = unsafe { (UnixStream::from_raw_fd(fd), UnixStream::from_raw_fd(status)) };
     let r = capture_and_serve(location, stream, &mut status);
     if let Err(e) = &r {
@@ -603,7 +720,14 @@ fn capture_and_serve(location: &str, stream: UnixStream, status: &mut UnixStream
 
     // Take the device from macOS: every driver on it is terminated.
     let device = open("IOUSBHostDevice", svc.0, CAPTURE, Some(&handler)).map_err(|e| io::Error::other(format!("could not capture {}: {e}", info.name)))?;
-    let host = Arc::new(HostDevice { device: device.clone(), service: svc.0, interfaces: Mutex::new(HashMap::new()), pipes: Mutex::new(HashMap::new()), gone: gone.clone() });
+    let host = Arc::new(HostDevice {
+        device,
+        service: svc,
+        interfaces: Mutex::new(HashMap::new()),
+        pipes: Mutex::new(HashMap::new()),
+        gone: gone.clone(),
+        destroyed: RwLock::new(false),
+    });
 
     let result = (|| -> io::Result<()> {
         if STOP.load(Ordering::SeqCst) {
@@ -624,18 +748,7 @@ fn capture_and_serve(location: &str, stream: UnixStream, status: &mut UnixStream
         SESSION_FD.store(-1, Ordering::SeqCst);
         r
     })();
-    host.close_interfaces();
-
-    // Hand the device back: a reset makes macOS enumerate it again and
-    // match its own drivers. An unplugged device has nothing to reset.
-    let mut err: *mut AnyObject = ptr::null_mut();
-    // SAFETY: calls on the device we captured, then its destroy.
-    unsafe {
-        if !gone.load(Ordering::SeqCst) {
-            let _: Bool = msg_send![&*device.0, resetWithError: &mut err];
-        }
-        let _: () = msg_send![&*device.0, destroy];
-    }
+    host.teardown();
     if gone.load(Ordering::SeqCst) {
         log(&format!("{} left the bus (unplugged, or it reset and enumerated again)", info.name));
     } else {
@@ -648,4 +761,33 @@ fn capture_and_serve(location: &str, stream: UnixStream, status: &mut UnixStream
 /// as much as that it did.
 pub(super) fn log(msg: &str) {
     eprintln!("{} kiri usb: {msg}", crate::daemon::time::rfc3339(std::time::SystemTime::now()));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn data_bytes_and_data_with_handle_zero_length_without_ub() {
+        autoreleasepool(|_| {
+            let empty = mutable_data(0).expect("NSMutableData(0)");
+            assert!(data_bytes(&empty, 0).is_empty());
+            assert!(data_bytes(&empty, 16).is_empty());
+
+            let empty_copy = data_with(&[]).expect("data_with empty");
+            assert!(data_bytes(&empty_copy, 0).is_empty());
+
+            let filled = data_with(b"hello").expect("data_with bytes");
+            assert_eq!(data_bytes(&filled, 3), b"hel");
+            assert_eq!(data_bytes(&filled, 10), b"hello");
+        });
+    }
+
+    #[test]
+    fn validate_serve_fds_rejects_non_root_duplicate_and_non_socket_fds() {
+        assert!(validate_serve_fds(501, 3, 4, |_| true).is_err());
+        assert!(validate_serve_fds(0, 3, 3, |_| true).is_err());
+        assert!(validate_serve_fds(0, 3, 4, |fd| fd == 3).is_err());
+        assert!(validate_serve_fds(0, 3, 4, |_| true).is_ok());
+    }
 }

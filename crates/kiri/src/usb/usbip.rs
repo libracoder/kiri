@@ -23,7 +23,8 @@ use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::sync::mpsc::{self, Sender};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -33,6 +34,7 @@ const RET_SUBMIT: u32 = 3;
 const RET_UNLINK: u32 = 4;
 const DIR_IN: u32 = 1;
 
+pub const ENOMEM: i32 = 12;
 pub const EPIPE: i32 = 32;
 pub const EINVAL: i32 = 22;
 pub const ENODEV: i32 = 19;
@@ -45,6 +47,10 @@ pub const MAX_TRANSFER: usize = 16 << 20;
 /// Isochronous packets in one URB, at most (Linux allows 128 per URB on
 /// full speed, 1024 on high): more is a broken peer.
 const MAX_PACKETS: usize = 1024;
+/// Maximum queued URBs per endpoint thread.
+const MAX_EP_QUEUE: usize = 256;
+/// Maximum total URB transfer bytes queued across all endpoints at once.
+const MAX_QUEUED_BYTES: usize = 32 << 20;
 
 /// A USB setup packet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -137,9 +143,30 @@ struct Session<B: ?Sized> {
     backend: Arc<B>,
     states: Mutex<HashMap<u32, State>>,
     out: Mutex<Box<dyn Write + Send>>,
+    queued_bytes: AtomicUsize,
 }
 
 impl<B: Backend + ?Sized> Session<B> {
+    fn try_reserve_bytes(&self, bytes: usize) -> bool {
+        let mut cur = self.queued_bytes.load(Ordering::Acquire);
+        loop {
+            let Some(next) = cur.checked_add(bytes) else {
+                return false;
+            };
+            if next > MAX_QUEUED_BYTES {
+                return false;
+            }
+            match self.queued_bytes.compare_exchange(cur, next, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return true,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
+    fn release_bytes(&self, bytes: usize) {
+        self.queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
+    }
+
     fn send(&self, msg: &[u8]) {
         // A closed peer ends the read loop; nothing to do here.
         let _ = self.out.lock().unwrap_or_else(|e| e.into_inner()).write_all(msg);
@@ -240,8 +267,13 @@ impl<B: Backend + ?Sized> Session<B> {
 /// stream breaks, or the guest breaks the protocol). On the way out the
 /// backend is closed and its endpoint threads are given 2 s to finish.
 pub fn serve<B: Backend + ?Sized>(backend: Arc<B>, mut input: impl Read, output: impl Write + Send + 'static) -> io::Result<()> {
-    let session = Arc::new(Session { backend: backend.clone(), states: Mutex::new(HashMap::new()), out: Mutex::new(Box::new(output)) });
-    let mut workers: HashMap<u8, Sender<Urb>> = HashMap::new();
+    let session = Arc::new(Session {
+        backend: backend.clone(),
+        states: Mutex::new(HashMap::new()),
+        out: Mutex::new(Box::new(output)),
+        queued_bytes: AtomicUsize::new(0),
+    });
+    let mut workers: HashMap<u8, SyncSender<Urb>> = HashMap::new();
     let (finished_tx, finished) = mpsc::channel::<()>();
     let result = read_loop(&session, &mut input, &mut workers, &finished_tx);
     backend.close();
@@ -258,7 +290,7 @@ pub fn serve<B: Backend + ?Sized>(backend: Arc<B>, mut input: impl Read, output:
 fn read_loop<B: Backend + ?Sized>(
     session: &Arc<Session<B>>,
     input: &mut impl Read,
-    workers: &mut HashMap<u8, Sender<Urb>>,
+    workers: &mut HashMap<u8, SyncSender<Urb>>,
     finished: &Sender<()>,
 ) -> io::Result<()> {
     let mut head = [0u8; 48];
@@ -294,16 +326,23 @@ fn read_loop<B: Backend + ?Sized>(
                     session.ret_submit(seq, &Done::fail(EINVAL));
                     continue;
                 }
+                let urb_bytes = len as usize;
+                if !session.try_reserve_bytes(urb_bytes) {
+                    session.ret_submit(seq, &Done::fail(ENOMEM));
+                    continue;
+                }
                 session.states.lock().unwrap_or_else(|e| e.into_inner()).insert(seq, State::Queued);
-                let urb = Urb { seq, dir_in, ep: ep as u8, len: len as usize, setup, data };
+                let urb = Urb { seq, dir_in, ep: ep as u8, len: urb_bytes, setup, data };
                 let key = urb.address();
                 let tx = workers.entry(key).or_insert_with(|| {
-                    let (tx, rx) = mpsc::channel::<Urb>();
+                    let (tx, rx) = mpsc::sync_channel::<Urb>(MAX_EP_QUEUE);
                     let s = session.clone();
                     let done = finished.clone();
                     let spawned = std::thread::Builder::new().name(format!("kiri-usb-ep{key:02x}")).spawn(move || {
                         for u in rx {
+                            let bytes = u.len;
                             s.run(u);
+                            s.release_bytes(bytes);
                         }
                         let _ = done.send(());
                     });
@@ -312,9 +351,18 @@ fn read_loop<B: Backend + ?Sized>(
                     }
                     tx
                 });
-                if tx.send(urb).is_err() {
-                    session.states.lock().unwrap_or_else(|e| e.into_inner()).remove(&seq);
-                    session.ret_submit(seq, &Done::fail(ESHUTDOWN));
+                match tx.try_send(urb) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(_)) => {
+                        session.release_bytes(urb_bytes);
+                        session.states.lock().unwrap_or_else(|e| e.into_inner()).remove(&seq);
+                        session.ret_submit(seq, &Done::fail(ENOMEM));
+                    }
+                    Err(TrySendError::Disconnected(_)) => {
+                        session.release_bytes(urb_bytes);
+                        session.states.lock().unwrap_or_else(|e| e.into_inner()).remove(&seq);
+                        session.ret_submit(seq, &Done::fail(ESHUTDOWN));
+                    }
                 }
             }
             CMD_UNLINK => session.unlink(seq, be(20)),
@@ -327,6 +375,9 @@ fn read_loop<B: Backend + ?Sized>(
 /// upgraded connection that carries its USB/IP. `speed` is the kernel's
 /// USB_SPEED_*, `devid` USB/IP's bus << 16 | address.
 pub fn connect(socket: &Path, location: &str, name: &str, speed: u32, devid: u32) -> io::Result<(UnixStream, BufReader<UnixStream>)> {
+    if !super::valid_location(location) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("bad USB location {location:?}")));
+    }
     let stream = UnixStream::connect(socket)?;
     // Never hold a device on a daemon that doesn't answer.
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
@@ -601,5 +652,23 @@ mod tests {
         p.server.take().unwrap().join().unwrap().unwrap();
         assert!(t.elapsed() < Duration::from_secs(2));
         assert!(p.toy.inner.lock().unwrap().closed);
+    }
+
+    #[test]
+    fn zero_length_in_urb_succeeds_and_bounded_queue_rejects_byte_flood() {
+        let mut p = start();
+        // Zero-length control IN URB must complete cleanly.
+        p.submit(1, true, 0, 0, [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00], &[]);
+        let (cmd, seq, status, actual, data) = p.reply_in(true);
+        assert_eq!((cmd, seq, status, actual), (RET_SUBMIT, 1, 0, 0));
+        assert!(data.is_empty());
+
+        // Block endpoint 0x81 with three large IN URBs exceeding MAX_QUEUED_BYTES (32 MiB):
+        // the third 16 MiB URB (total 48 MiB > 32 MiB) must be immediately rejected with -ENOMEM.
+        p.submit(10, true, 1, MAX_TRANSFER as u32, [0; 8], &[]);
+        p.submit(11, true, 1, MAX_TRANSFER as u32, [0; 8], &[]);
+        p.submit(12, true, 1, MAX_TRANSFER as u32, [0; 8], &[]);
+        let (cmd, seq, status, _, _) = p.reply();
+        assert_eq!((cmd, seq, status), (RET_SUBMIT, 12, -ENOMEM));
     }
 }

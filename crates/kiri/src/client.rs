@@ -317,6 +317,27 @@ pub fn get_background(path: &str) -> io::Result<Value> {
     Ok(r.json())
 }
 
+/// Validates an HTTP/1.1 request target before formatting a raw request line
+/// onto the daemon socket/pipe (rejects missing leading `/`, `..` traversal
+/// segments, whitespace, CRLF, and ASCII control characters).
+pub(crate) fn validate_request_path(path: &str) -> io::Result<()> {
+    if !path.starts_with('/') || path.bytes().any(|b| b <= 0x20 || b == 0x7f) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid HTTP request path"));
+    }
+    let path_only = path.split('?').next().unwrap_or(path);
+    if path_only.split('/').any(|seg| seg == "..") {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "HTTP request path must not contain traversal segments"));
+    }
+    Ok(())
+}
+
+fn validate_header_value(value: &str) -> io::Result<()> {
+    if value.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "header contains a line break"));
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn send(method: &str, path: &str, body: Option<&Value>, extra: &str) -> io::Result<Response> {
     send_to(&socket()?, method, path, body, extra)
@@ -324,6 +345,7 @@ fn send(method: &str, path: &str, body: Option<&Value>, extra: &str) -> io::Resu
 
 #[cfg(unix)]
 fn send_to(sock: &Path, method: &str, path: &str, body: Option<&Value>, extra: &str) -> io::Result<Response> {
+    validate_request_path(path)?;
     let mut s = connect_to(sock, Some(Duration::from_secs(120)))?;
     let payload = body.map(Value::to_string).unwrap_or_default();
     // The window's action this is part of, for the engine's log lines.
@@ -343,6 +365,7 @@ fn send(method: &str, path: &str, body: Option<&Value>, extra: &str) -> io::Resu
 
 #[cfg(windows)]
 fn send_to_pipe(name: &str, method: &str, path: &str, body: Option<&Value>, extra: &str) -> io::Result<Response> {
+    validate_request_path(path)?;
     let mut s = WinPipe::open(name)?;
     let payload = body.map(Value::to_string).unwrap_or_default();
     let op = op_header();
@@ -384,6 +407,8 @@ fn answer(s: impl Read) -> io::Result<Response> {
 /// refused the request), its answer is returned, which says why.
 #[cfg(unix)]
 pub fn post_stream(path: &str, content_type: &str, write: impl FnOnce(&mut dyn Write) -> io::Result<()>) -> io::Result<Response> {
+    validate_request_path(path)?;
+    validate_header_value(content_type)?;
     let s = connect(Some(Duration::from_secs(300)))?;
     let op = op_header();
     (&s).write_all(format!("POST {path} HTTP/1.1\r\nHost: kiri\r\nConnection: close\r\n{op}Content-Type: {content_type}\r\nTransfer-Encoding: chunked\r\n\r\n").as_bytes())?;
@@ -399,6 +424,8 @@ pub fn post_stream(path: &str, content_type: &str, write: impl FnOnce(&mut dyn W
 
 #[cfg(windows)]
 pub fn post_stream(path: &str, content_type: &str, write: impl FnOnce(&mut dyn Write) -> io::Result<()>) -> io::Result<Response> {
+    validate_request_path(path)?;
+    validate_header_value(content_type)?;
     let mut s = WinPipe::open(&pipe())?;
     let op = op_header();
     write!(
@@ -585,8 +612,9 @@ pub fn post_lines_unbounded(path: &str, on_line: impl FnMut(Value)) -> io::Resul
 
 #[cfg(unix)]
 fn post_lines_inner(path: &str, auth: Option<&str>, timeout: Option<Duration>, opened: impl FnOnce(&UnixStream), mut on_line: impl FnMut(Value)) -> io::Result<u16> {
-    if auth.is_some_and(|a| a.contains(['\r', '\n'])) {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "header contains a line break"));
+    validate_request_path(path)?;
+    if let Some(a) = auth {
+        validate_header_value(a)?;
     }
     let auth = auth.map(|a| format!("X-Registry-Auth: {a}\r\n")).unwrap_or_default();
     let mut s = connect(timeout)?;
@@ -655,6 +683,7 @@ pub struct Stream {
 #[cfg(unix)]
 impl Stream {
     pub fn open(path: &str) -> io::Result<Stream> {
+        validate_request_path(path)?;
         let mut s = connect(None)?;
         write!(s, "GET {path} HTTP/1.1\r\nHost: kiri\r\n\r\n")?;
         let mut reader = BufReader::new(s);
@@ -679,16 +708,20 @@ impl Stream {
 /// through the exec API with a terminal, so output arrives unframed.
 #[cfg(unix)]
 pub fn exec(container: &str, cmd: &[&str]) -> io::Result<(i64, String)> {
-    let created = request("POST", &format!("/containers/{container}/exec"), Some(&serde_json::json!({"Cmd": cmd, "AttachStdout": true, "AttachStderr": true, "Tty": true})))?;
+    let create_path = format!("/containers/{container}/exec");
+    validate_request_path(&create_path)?;
+    let created = request("POST", &create_path, Some(&serde_json::json!({"Cmd": cmd, "AttachStdout": true, "AttachStderr": true, "Tty": true})))?;
     if !created.ok() {
         return Err(io::Error::other(created.error()));
     }
     let id = created.json()["Id"].as_str().unwrap_or_default().to_owned();
+    let start_path = format!("/exec/{id}/start");
+    validate_request_path(&start_path)?;
     let mut s = connect(Some(Duration::from_secs(120)))?;
     let body = r#"{"Detach":false,"Tty":true}"#;
     write!(
         s,
-        "POST /exec/{id}/start HTTP/1.1\r\nHost: kiri\r\nConnection: Upgrade\r\nUpgrade: tcp\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        "POST {start_path} HTTP/1.1\r\nHost: kiri\r\nConnection: Upgrade\r\nUpgrade: tcp\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
         body.len()
     )?;
     let mut r = BufReader::new(s);
@@ -947,5 +980,37 @@ mod tests {
         assert!(super::is_wsl_env(None, &[&interop]));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn request_path_and_header_validation_blocks_crlf_and_smuggling() {
+        assert!(super::validate_request_path("/containers/abc/json?all=1").is_ok());
+        for bad in [
+            "",
+            "containers/abc",
+            "/containers/a b/json",
+            "/containers/a\r\nPOST /kiri/stop HTTP/1.1",
+            "/containers/a\n/json",
+            "/containers/a\x00/json",
+            "/containers/a\x7f/json",
+            "/containers/../kiri/stop",
+            "/../kiri/stop",
+        ] {
+            assert_eq!(super::validate_request_path(bad).unwrap_err().kind(), io::ErrorKind::InvalidInput, "{bad:?}");
+        }
+        assert!(super::validate_header_value("application/json").is_ok());
+        assert!(super::validate_header_value("application/json\r\nX-Injected: 1").is_err());
+
+        #[cfg(unix)]
+        {
+            match super::send_to(Path::new("/nonexistent"), "GET", "/bad path\r\n", None, "") {
+                Err(err) => assert_eq!(err.kind(), io::ErrorKind::InvalidInput),
+                Ok(_) => panic!("expected InvalidInput"),
+            }
+            match super::Stream::open("/bad\r\npath") {
+                Err(err) => assert_eq!(err.kind(), io::ErrorKind::InvalidInput),
+                Ok(_) => panic!("expected InvalidInput"),
+            }
+        }
     }
 }

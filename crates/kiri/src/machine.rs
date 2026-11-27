@@ -51,6 +51,21 @@ pub(crate) fn wants_help(args: &[String]) -> bool {
     args[..scan_end].iter().any(|a| matches!(a.as_str(), "-h" | "--help"))
 }
 
+/// Validates a machine name (letters, digits, dashes; non-empty, no leading dash).
+fn valid_machine_name(name: &str) -> bool {
+    !name.is_empty() && name.len() <= 63 && !name.starts_with('-') && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
+fn require_machine_name(name: &str) -> io::Result<()> {
+    if name.is_empty() || name.starts_with('-') {
+        return Err(io::Error::other("name a machine"));
+    }
+    if !valid_machine_name(name) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "a machine name is letters, digits and dashes"));
+    }
+    Ok(())
+}
+
 pub fn run(args: &[String]) -> io::Result<()> {
     if wants_help(args) {
         println!("{USAGE}");
@@ -63,7 +78,7 @@ pub fn run(args: &[String]) -> io::Result<()> {
         return Err(io::Error::other("kiri daemon is not running: open Kiri.app or run `kiri daemon`"));
     }
     let name = args.get(1).map(String::as_str).unwrap_or_default();
-    let need_name = || if name.is_empty() || name.starts_with('-') { Err(io::Error::other("name a machine")) } else { Ok(()) };
+    let need_name = || require_machine_name(name);
     match args.first().map(String::as_str) {
         Some("create") => {
             need_name()?;
@@ -99,13 +114,49 @@ pub fn run(args: &[String]) -> io::Result<()> {
 /// The host's homes folder, mounted at the same path in every machine.
 const HOMES: &str = if cfg!(target_os = "macos") { "/Users" } else { "/home" };
 
+/// Strict POSIX username validation (`[a-z_][a-z0-9_-]*`, max 32 chars).
+fn valid_posix_username(name: &str) -> bool {
+    let b = name.as_bytes();
+    !b.is_empty()
+        && b.len() <= 32
+        && (b[0].is_ascii_lowercase() || b[0] == b'_')
+        && b[1..].iter().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'_' || *c == b'-')
+}
+
+fn pw_username(uid: u32) -> Option<String> {
+    use std::ffi::CStr;
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut buf = vec![0u8; 4096];
+    let mut res: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: `getpwuid_r` writes into stack/heap buffers we own.
+    let rc = unsafe { libc::getpwuid_r(uid as libc::uid_t, &mut pwd, buf.as_mut_ptr().cast(), buf.len(), &mut res) };
+    if rc != 0 || res.is_null() || pwd.pw_name.is_null() {
+        return None;
+    }
+    // SAFETY: `pw_name` points to a NUL-terminated string inside `buf`.
+    Some(unsafe { CStr::from_ptr(pwd.pw_name) }.to_string_lossy().into_owned())
+}
+
+fn resolve_username(uid: u32, env_user: Option<&str>, pw_user: Option<&str>) -> String {
+    if uid == 0 {
+        return "root".to_owned();
+    }
+    env_user
+        .filter(|u| valid_posix_username(u))
+        .or_else(|| pw_user.filter(|u| valid_posix_username(u)))
+        .unwrap_or("user")
+        .to_owned()
+}
+
 /// The host user's name, uid and gid. root is always `root`: under
 /// `wsl -u root` (Windows) USER is not set, and a made-up name with uid 0
 /// was a user no machine had ("unknown user user").
 fn user() -> (String, u32, u32) {
     // SAFETY: getuid/getgid cannot fail.
     let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
-    let name = if uid == 0 { "root".to_owned() } else { std::env::var("USER").ok().filter(|u| !u.is_empty()).unwrap_or_else(|| "user".to_owned()) };
+    let env_user = std::env::var("USER").ok();
+    let pw_user = if uid == 0 { None } else { pw_username(uid) };
+    let name = resolve_username(uid, env_user.as_deref(), pw_user.as_deref());
     (name, uid, gid)
 }
 
@@ -193,19 +244,24 @@ where
 }
 
 fn create_body_for(name: &str, image: &str, user: &str, uid: u32, gid: u32, systemd: bool) -> serde_json::Value {
-    let home = home(user);
+    let safe_user = resolve_username(uid, Some(user), None);
+    let home = home(&safe_user);
     // The host user, made once; every distro has one of these tools. An
     // image user that already has the uid (Ubuntu's `ubuntu` is 1000, the
     // first user's uid on most Linux hosts) is renamed to the host user.
+    // Username and home are passed as positional arguments ($1, $2) so no
+    // shell or sudoers metacharacter can ever break out of the init script.
     let init = format!(
         r#"set -e
-if ! id -u {user} >/dev/null 2>&1; then
-  getent group {gid} >/dev/null 2>&1 || groupadd -g {gid} {user} 2>/dev/null || addgroup -g {gid} {user} 2>/dev/null || true
+u="$1"
+h="$2"
+if ! id -u "$u" >/dev/null 2>&1; then
+  getent group {gid} >/dev/null 2>&1 || groupadd -g {gid} "$u" 2>/dev/null || addgroup -g {gid} "$u" 2>/dev/null || true
   g=$(getent group {gid} | cut -d: -f1)
   old=$(getent passwd {uid} | cut -d: -f1)
-  {{ [ -n "$old" ] && usermod -l {user} -d {home} "$old" 2>/dev/null; }} || useradd -o -M -u {uid} -g "${{g:-{gid}}}" -d {home} -s /bin/sh {user} 2>/dev/null || adduser -D -H -u {uid} -G "${{g:-{user}}}" -h {home} {user} 2>/dev/null || true
+  {{ [ -n "$old" ] && usermod -l "$u" -d "$h" "$old" 2>/dev/null; }} || useradd -o -M -u {uid} -g "${{g:-{gid}}}" -d "$h" -s /bin/sh "$u" 2>/dev/null || adduser -D -H -u {uid} -G "${{g:-$u}}" -h "$h" "$u" 2>/dev/null || true
 fi
-mkdir -p /etc/sudoers.d && echo '{user} ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/kiri && chmod 440 /etc/sudoers.d/kiri
+mkdir -p /etc/sudoers.d && printf '%s ALL=(ALL) NOPASSWD:ALL\n' "$u" > /etc/sudoers.d/kiri && chmod 440 /etc/sudoers.d/kiri
 # Slim images have no sudo: fetch it once, in the background.
 command -v sudo >/dev/null 2>&1 || (apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq sudo || apk add -q sudo || dnf -y -q install sudo || pacman -Sy --noconfirm sudo || zypper -n -q in sudo) >/dev/null 2>&1 &
 {tail}"#,
@@ -218,7 +274,7 @@ command -v sudo >/dev/null 2>&1 || (apt-get update -qq && DEBIAN_FRONTEND=nonint
     );
     let mut body = json!({
         "Image": image,
-        "Cmd": ["/bin/sh", "-c", init],
+        "Cmd": ["/bin/sh", "-c", init, "kiri-machine-init", safe_user, home],
         "Hostname": name,
         "Labels": {LABEL: name},
         "HostConfig": {
@@ -253,19 +309,20 @@ where
     Exec: FnMut(&str, &[&str]) -> io::Result<(i64, String)>,
     OnPull: FnMut(&str),
 {
-    if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') || name.starts_with('-') {
+    if !valid_machine_name(name) {
         return Err(io::Error::other("a machine name is letters, digits and dashes"));
     }
+    let safe_user = resolve_username(uid, Some(user), None);
     let image = parse_machine_image(pick);
     ensure_machine_image_with(&image, &mut req, on_pull)?;
-    let body = create_body_for(name, &image.full, user, uid, gid, systemd);
+    let body = create_body_for(name, &image.full, &safe_user, uid, gid, systemd);
     ok(req("POST", &format!("/containers/create?name={}", container(name)), Some(&body)))?;
     ok(req("POST", &format!("/containers/{}/start", container(name)), None))?;
     // The user is made by the machine's own first command: wait for it, or
     // a `machine shell` straight after was "unknown user" (seen on Fedora).
-    let wait = format!("for i in $(seq 300); do id -u {user} >/dev/null 2>&1 && exit 0; sleep 0.1; done; exit 1");
-    if exec(&container(name), &["sh", "-c", &wait])?.0 != 0 {
-        return Err(io::Error::other(format!("machine {name} is running, but the user {user} could not be added to it")));
+    const WAIT_SCRIPT: &str = "for i in $(seq 300); do id -u \"$1\" >/dev/null 2>&1 && exit 0; sleep 0.1; done; exit 1";
+    if exec(&container(name), &["sh", "-c", WAIT_SCRIPT, "kiri-wait", &safe_user])?.0 != 0 {
+        return Err(io::Error::other(format!("machine {name} is running, but the user {safe_user} could not be added to it")));
     }
     Ok(image.full)
 }
@@ -605,5 +662,26 @@ mod tests {
         let rows = json!([{"Labels": {(super::LABEL): "dev"}, "Image": "ubuntu:24.04", "State": "running", "Status": "Up 2 hours"}]);
         assert_eq!(super::list_json(&rows), json!([{"name": "dev", "image": "ubuntu:24.04", "state": "running", "status": "Up 2 hours"}]));
         assert_eq!(super::list_json(&json!([])), json!([]));
+    }
+
+    #[test]
+    fn rejects_traversal_machine_names_and_sanitizes_user_env_into_positional_args() {
+        for bad in ["../other", "dev?force=1", "dev\r\nPOST /x", "dev/sub", "dev name", ""] {
+            assert!(super::require_machine_name(bad).is_err(), "should reject {bad:?}");
+        }
+        assert!(super::require_machine_name("dev-box1").is_ok());
+
+        // Malicious $USER values are sanitized via POSIX rules and passed as positional args.
+        for bad_user in ["alice'; id #", "$(whoami)", "alice bob", "Alice", "0bad", "a\nb"] {
+            assert_eq!(super::resolve_username(1000, Some(bad_user), Some("fallback_u")), "fallback_u");
+            let body = create_body_for("dev", "ubuntu:24.04", bad_user, 1000, 1000, false);
+            let cmd = body["Cmd"].as_array().unwrap();
+            assert_eq!(cmd[0], "/bin/sh");
+            assert_eq!(cmd[1], "-c");
+            assert!(!cmd[2].as_str().unwrap().contains(bad_user), "init script must not interpolate raw USER");
+            assert_eq!(cmd[3], "kiri-machine-init");
+            assert_eq!(cmd[4], "user");
+            assert_eq!(cmd[5], format!("{HOMES}/user"));
+        }
     }
 }

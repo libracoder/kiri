@@ -103,36 +103,59 @@ fn read(path: &Path) -> io::Result<Option<String>> {
     }
 }
 
-/// The new text by a temporary file and a rename, 0600; the one before it
-/// kept as `config.bak.kiri`.
-fn write(path: &Path, before: Option<&str>, text: &str) -> io::Result<()> {
+/// Atomically writes `text` to `path` via a unique sibling temp file created
+/// with mode `0o600` on Unix (inside a `0o700` directory when newly created),
+/// so kubeconfig private keys are never exposed world-readably even transiently
+/// and pre-existing symlinks at `path` are replaced rather than followed.
+pub(crate) fn write_private_atomic(path: &Path, text: &str) -> io::Result<()> {
+    use std::io::Write;
     static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+    }
+    #[cfg(not(unix))]
     std::fs::create_dir_all(dir)?;
     let file = path.file_name().and_then(|n| n.to_str()).unwrap_or("config");
-    if let Some(before) = before {
-        let backup = dir.join(format!("{file}.bak.kiri"));
-        std::fs::write(&backup, before)?;
-        private(&backup)?;
-    }
-    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp = dir.join(format!(".{file}.kiri-{}-{seq}", std::process::id()));
-    let done = std::fs::write(&tmp, text).and_then(|()| private(&tmp)).and_then(|()| std::fs::rename(&tmp, path));
+    let mut attempt = 0u32;
+    let (tmp, mut f) = loop {
+        let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let candidate = dir.join(format!(".{file}.kiri-{}-{seq}", std::process::id()));
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        match opts.open(&candidate) {
+            Ok(f) => break (candidate, f),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists && attempt < 32 => attempt += 1,
+            Err(e) => return Err(e),
+        }
+    };
+    let done = f.write_all(text.as_bytes()).and_then(|()| f.flush()).and_then(|()| {
+        drop(f);
+        std::fs::rename(&tmp, path)
+    });
     if done.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
     done
 }
 
-#[cfg(unix)]
-fn private(path: &Path) -> io::Result<()> {
-    std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
-}
-
-// %USERPROFILE% is the user's own already.
-#[cfg(not(unix))]
-fn private(_: &Path) -> io::Result<()> {
-    Ok(())
+/// The new text by a temporary file and a rename, 0600; the one before it
+/// kept as `config.bak.kiri` (also written atomically with 0600).
+fn write(path: &Path, before: Option<&str>, text: &str) -> io::Result<()> {
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let file = path.file_name().and_then(|n| n.to_str()).unwrap_or("config");
+    if let Some(before) = before {
+        let backup = dir.join(format!("{file}.bak.kiri"));
+        write_private_atomic(&backup, before)?;
+    }
+    write_private_atomic(path, text)
 }
 
 /// One top-level key and the lines under it (the first is the key's own);
@@ -573,5 +596,33 @@ users:
         assert!(merged_doc.contains("current-context: kiri\n"));
 
         assert!(merge("apiVersion: v1\nclusters: []\n---\napiVersion: v1\n", &ours, "kiri", false).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kubeconfig_and_backup_are_created_privately_without_following_backup_symlink() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("kiri-kubeconfig-sec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let kube = dir.join(".kube");
+        let path = kube.join("config");
+        let backup = kube.join("config.bak.kiri");
+        let canary = dir.join("outside.txt");
+        let ours = from_k3s(K3S, "kiri", 6445);
+
+        assert!(install(&path, &ours, "kiri", false).unwrap());
+        assert_eq!(std::fs::metadata(&kube).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+
+        // Pre-existing world-readable backup or symlink at config.bak.kiri must be atomically replaced with 0600.
+        std::fs::write(&canary, "untouched").unwrap();
+        std::os::unix::fs::symlink(&canary, &backup).unwrap();
+        std::fs::write(&path, MINE).unwrap();
+        assert!(install(&path, &ours, "kiri", false).unwrap());
+        assert_eq!(std::fs::read_to_string(&canary).unwrap(), "untouched");
+        let meta = std::fs::symlink_metadata(&backup).unwrap();
+        assert!(!meta.file_type().is_symlink());
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

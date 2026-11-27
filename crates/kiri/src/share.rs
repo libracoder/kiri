@@ -48,6 +48,12 @@ const DEFAULT_SERVER: &str = "edge.runkiri.com:443";
 const IDLE: Duration = Duration::from_secs(90);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const LOCAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// Maximum size of an HTTP API response read from the remote Share edge.
+const MAX_API_RESPONSE: u64 = 4 << 20;
+/// Maximum concurrent visitor streams per Share tunnel session.
+const MAX_STREAMS: usize = 256;
+/// Maximum queued inbound frames per stream before resetting a non-draining peer.
+const STREAM_QUEUE_CHUNKS: usize = 256;
 
 // From build.rs: the release's build key, if this is an official build.
 include!(concat!(env!("OUT_DIR"), "/share_build_key.rs"));
@@ -490,8 +496,61 @@ fn dial(srv: &Server, alpn: &[u8]) -> io::Result<(TcpStream, rustls::ClientConne
     Ok((sock, conn))
 }
 
+/// Percent-encodes a single URI path segment or query value.
+fn encode_uri_component(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// Validates HTTP/1.1 request line and headers before sending to the Share edge.
+fn validate_api_request(method: &str, path: &str, host: &str, token: Option<&str>) -> io::Result<()> {
+    if method.is_empty() || !method.bytes().all(|b| b.is_ascii_uppercase()) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid HTTP method"));
+    }
+    if !path.starts_with('/') || path.bytes().any(|b| b <= 0x20 || b == 0x7f) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid Share API path"));
+    }
+    let path_only = path.split('?').next().unwrap_or(path);
+    if path_only.split('/').any(|seg| seg == "..") {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "Share API path must not contain traversal segments"));
+    }
+    if host.is_empty() || host.bytes().any(|b| b <= 0x20 || b == 0x7f) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid Share server host"));
+    }
+    if let Some(t) = token
+        && t.bytes().any(|b| b < 0x20 || b == 0x7f)
+    {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid Share auth token"));
+    }
+    Ok(())
+}
+
+/// Reads an HTTP response up to `limit` bytes, failing cleanly if the remote
+/// edge sends more than `limit` bytes.
+fn read_bounded_response(r: impl Read, limit: u64) -> io::Result<Vec<u8>> {
+    let mut raw = Vec::new();
+    match r.take(limit.saturating_add(1)).read_to_end(&mut raw) {
+        Ok(_) => {}
+        // Servers often close without TLS close_notify after `Connection: close`.
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof && !raw.is_empty() => {}
+        Err(e) => return Err(e),
+    }
+    if raw.len() as u64 > limit {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "the Kiri Share server sent a response that is too large"));
+    }
+    Ok(raw)
+}
+
 /// One HTTPS request to the edge's API. Returns the status and JSON body.
 fn api(srv: &Server, method: &str, path: &str, body: Option<&Value>, token: Option<&str>) -> io::Result<(u16, Value)> {
+    validate_api_request(method, path, &srv.host, token)?;
     let (sock, conn) = dial(srv, b"http/1.1")?;
     sock.set_read_timeout(Some(Duration::from_secs(30)))?;
     let mut s = rustls::StreamOwned::new(conn, sock);
@@ -505,13 +564,7 @@ fn api(srv: &Server, method: &str, path: &str, body: Option<&Value>, token: Opti
         payload.len()
     )?;
     s.flush()?;
-    let mut raw = Vec::new();
-    match s.read_to_end(&mut raw) {
-        Ok(_) => {}
-        // Servers often close without TLS close_notify after `Connection: close`.
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof && !raw.is_empty() => {}
-        Err(e) => return Err(e),
-    }
+    let raw = read_bounded_response(&mut s, MAX_API_RESPONSE)?;
     parse_http_response(&raw)
 }
 
@@ -586,16 +639,52 @@ pub struct DeviceCode {
     device_code: String,
 }
 
+/// Validates the remote `verification_uri` returned by `/v1/login/start`.
+/// Requires `https://`, an allowlisted GitHub host (`github.com`), and rejects
+/// control characters, whitespace, leading `-` flags, and shell metacharacters.
+pub fn validate_verification_uri(uri: &str) -> io::Result<String> {
+    if uri.is_empty() || uri.len() > 2048 || uri.starts_with('-') {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid verification_uri from Kiri Share server"));
+    }
+    if uri.bytes().any(|b| {
+        b <= 0x20
+            || b >= 0x7f
+            || matches!(
+                b,
+                b'\\' | b'&' | b'|' | b'<' | b'>' | b'^' | b'%' | b'"' | b'\'' | b'`' | b';' | b'(' | b')'
+            )
+    }) {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "verification_uri contains unsafe characters"));
+    }
+    let rest = uri
+        .strip_prefix("https://")
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "verification_uri must use https://"))?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() || authority.contains('@') {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "verification_uri has an invalid authority"));
+    }
+    let host = match authority.split_once(':') {
+        Some((h, "443")) => h,
+        Some(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, "verification_uri uses an unexpected port")),
+        None => authority,
+    };
+    if !host.eq_ignore_ascii_case("github.com") {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "verification_uri host is not github.com"));
+    }
+    Ok(uri.to_owned())
+}
+
 pub fn login_start() -> io::Result<DeviceCode> {
     let cfg = load()?;
     let (status, v) = api(&server(&cfg), "POST", "/v1/login/start", Some(&json!({})), None)?;
     let (Some(device_code), Some(user_code), Some(uri)) = (v["device_code"].as_str(), v["user_code"].as_str(), v["verification_uri"].as_str()) else {
         return Err(api_error(&v, status));
     };
+    let verification_uri = validate_verification_uri(uri)?;
     Ok(DeviceCode {
         device_code: device_code.to_owned(),
         user_code: user_code.to_owned(),
-        verification_uri: uri.to_owned(),
+        verification_uri,
         interval: Duration::from_secs(v["interval"].as_u64().unwrap_or(5).clamp(1, MAX_DEVICE_CODE_SECS)),
         expires: device_code_deadline(Instant::now(), v["expires_in"].as_u64().unwrap_or(900)),
     })
@@ -735,7 +824,11 @@ pub fn reserve(name: &str) -> io::Result<ReservedName> {
 }
 
 pub fn release(name: &str) -> io::Result<()> {
-    let (status, v) = signed_in("DELETE", &format!("/v1/names/{}", name.to_ascii_lowercase()), None)?;
+    if name.is_empty() || name == "." || name == ".." {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid reserved name"));
+    }
+    let encoded = encode_uri_component(&name.to_ascii_lowercase());
+    let (status, v) = signed_in("DELETE", &format!("/v1/names/{encoded}"), None)?;
     match status {
         200 | 204 => Ok(()),
         404 => Err(io::Error::other(format!("`{name}` isn't one of your reserved names"))),
@@ -801,7 +894,11 @@ pub fn tunnels() -> io::Result<LiveTunnels> {
 /// Closes one of the account's tunnels, wherever it runs. The edge tells
 /// the computer running it that it was stopped from this one.
 pub fn close_tunnel(name: &str) -> io::Result<()> {
-    let (status, v) = signed_in("DELETE", &format!("/v1/tunnels/{name}"), Some(&json!({ "host": host_name() })))?;
+    if name.is_empty() || name == "." || name == ".." {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid tunnel name"));
+    }
+    let encoded = encode_uri_component(name);
+    let (status, v) = signed_in("DELETE", &format!("/v1/tunnels/{encoded}"), Some(&json!({ "host": host_name() })))?;
     match status {
         200 | 204 => Ok(()),
         404 => Err(io::Error::other(format!("{name} isn't live any more"))),
@@ -840,7 +937,7 @@ fn auto_reserve(name: &str) -> io::Result<AutoReserve> {
     {
         return Ok(AutoReserve::Full(limit));
     }
-    let (status, v) = signed_in("GET", &format!("/v1/names/check?name={name}"), None)?;
+    let (status, v) = signed_in("GET", &format!("/v1/names/check?name={}", encode_uri_component(&name)), None)?;
     if status != 200 || v["available"].as_bool() != Some(true) {
         return Ok(AutoReserve::Unavailable);
     }
@@ -968,11 +1065,24 @@ pub fn resolve_via(arg: &str, inspect: impl FnOnce(&str) -> io::Result<Option<Va
 }
 
 #[cfg(unix)]
+fn container_inspect_path(arg: &str) -> io::Result<String> {
+    if arg.is_empty()
+        || arg == "."
+        || arg == ".."
+        || arg.bytes().any(|b| b <= 0x20 || b == 0x7f || matches!(b, b'/' | b'\\' | b'?' | b'#'))
+    {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("invalid container name `{arg}`")));
+    }
+    Ok(format!("/containers/{}/json", encode_uri_component(arg)))
+}
+
+#[cfg(unix)]
 fn container_target(arg: &str) -> io::Result<Target> {
+    let path = container_inspect_path(arg)?;
     if !client::alive() {
         return Err(io::Error::other(format!("`{arg}` isn't a port, and Kiri isn't running to look up a container by that name")));
     }
-    let r = client::request("GET", &format!("/containers/{arg}/json"), None)?;
+    let r = client::request("GET", &path, None)?;
     if r.status == 404 {
         return Err(io::Error::other(format!("no port or container named `{arg}`")));
     }
@@ -1348,8 +1458,12 @@ fn write_all_tls(tls: &Mutex<rustls::ClientConnection>, sock: &TcpStream, mut by
     Ok(())
 }
 
+type StreamRx = mpsc::Receiver<Option<Vec<u8>>>;
+
 struct Stream {
-    to_local: mpsc::Sender<Option<Vec<u8>>>,
+    to_local: mpsc::SyncSender<Option<Vec<u8>>>,
+    inbound_queued: AtomicUsize,
+    eof: AtomicBool,
     credit: Mutex<u32>,
     cv: Condvar,
     reset: AtomicBool,
@@ -1502,8 +1616,9 @@ impl Session {
     fn end_all(&self) {
         self.lanes.end();
         for (_, s) in self.streams.lock().unwrap_or_else(PoisonError::into_inner).drain() {
+            s.eof.store(true, Ordering::Release);
             s.kill();
-            let _ = s.to_local.send(None);
+            let _ = s.to_local.try_send(None);
         }
     }
 
@@ -1530,11 +1645,16 @@ impl Session {
             Msg::Data { stream, data } => {
                 let s = self.streams.lock().unwrap_or_else(PoisonError::into_inner).get(&stream).cloned();
                 if let Some(s) = s {
-                    s.bytes_in.fetch_add(data.len() as u64, Ordering::Relaxed);
-                    if s.to_local.send(Some(data.to_vec())).is_err() {
+                    let max_win = (self.lanes.window() as usize).max(proto::INITIAL_WINDOW as usize);
+                    let prev = s.inbound_queued.fetch_add(data.len(), Ordering::AcqRel);
+                    let over_window = prev.checked_add(data.len()).is_none_or(|n| n > max_win);
+                    if over_window || s.to_local.try_send(Some(data.to_vec())).is_err() {
+                        s.inbound_queued.fetch_sub(data.len(), Ordering::AcqRel);
                         self.streams.lock().unwrap_or_else(PoisonError::into_inner).remove(&stream);
                         s.kill();
                         let _ = self.send(Msg::Reset { stream });
+                    } else {
+                        s.bytes_in.fetch_add(data.len() as u64, Ordering::Relaxed);
                     }
                 }
             }
@@ -1547,13 +1667,15 @@ impl Session {
             }
             Msg::Close { stream } => {
                 if let Some(s) = self.streams.lock().unwrap_or_else(PoisonError::into_inner).get(&stream) {
-                    let _ = s.to_local.send(None);
+                    s.eof.store(true, Ordering::Release);
+                    let _ = s.to_local.try_send(None);
                 }
             }
             Msg::Reset { stream } => {
                 if let Some(s) = self.streams.lock().unwrap_or_else(PoisonError::into_inner).remove(&stream) {
+                    s.eof.store(true, Ordering::Release);
                     s.kill();
-                    let _ = s.to_local.send(None);
+                    let _ = s.to_local.try_send(None);
                 }
             }
             Msg::Ping(v) => {
@@ -1582,12 +1704,18 @@ impl Session {
         None
     }
 
-    /// A visitor connected: register the stream at once (data may follow
-    /// before the local connection is up), then connect on its own thread.
-    fn open(self: &Arc<Self>, id: u32) {
-        let (tx, rx) = mpsc::channel();
+    /// Registers a new visitor stream if under `MAX_STREAMS` and `id` is not a
+    /// duplicate; returns `None` when rejected so the caller can emit `Msg::Reset`.
+    fn try_register_stream(&self, id: u32) -> Option<(Arc<Stream>, StreamRx)> {
+        let mut streams = self.streams.lock().unwrap_or_else(PoisonError::into_inner);
+        if streams.len() >= MAX_STREAMS || streams.contains_key(&id) {
+            return None;
+        }
+        let (tx, rx) = mpsc::sync_channel(STREAM_QUEUE_CHUNKS);
         let stream = Arc::new(Stream {
             to_local: tx,
+            inbound_queued: AtomicUsize::new(0),
+            eof: AtomicBool::new(false),
             credit: Mutex::new(self.lanes.window()),
             cv: Condvar::new(),
             reset: AtomicBool::new(false),
@@ -1597,7 +1725,17 @@ impl Session {
             request: Mutex::new(None),
             status: Mutex::new(0),
         });
-        self.streams.lock().unwrap_or_else(PoisonError::into_inner).insert(id, stream.clone());
+        streams.insert(id, stream.clone());
+        Some((stream, rx))
+    }
+
+    /// A visitor connected: register the stream at once (data may follow
+    /// before the local connection is up), then connect on its own thread.
+    fn open(self: &Arc<Self>, id: u32) {
+        let Some((stream, rx)) = self.try_register_stream(id) else {
+            let _ = self.send(Msg::Reset { stream: id });
+            return;
+        };
         let sess = self.clone();
         let spawned = std::thread::Builder::new().name("share-stream".into()).spawn(move || sess.carry(id, stream, rx));
         if spawned.is_err() {
@@ -1748,11 +1886,26 @@ impl Session {
     fn to_local(&self, id: u32, stream: Arc<Stream>, rx: mpsc::Receiver<Option<Vec<u8>>>, mut local: TcpStream) {
         let mut unacked = 0u32;
         let mut first = true;
-        while let Ok(msg) = rx.recv() {
+        loop {
+            let msg = match rx.try_recv() {
+                Ok(m) => m,
+                Err(mpsc::TryRecvError::Empty) => {
+                    if stream.eof.load(Ordering::Acquire) {
+                        let _ = local.shutdown(Shutdown::Write);
+                        break;
+                    }
+                    match rx.recv() {
+                        Ok(m) => m,
+                        Err(_) => break,
+                    }
+                }
+                Err(mpsc::TryRecvError::Disconnected) => break,
+            };
             let Some(data) = msg else {
                 let _ = local.shutdown(Shutdown::Write);
                 break;
             };
+            stream.inbound_queued.fetch_sub(data.len(), Ordering::AcqRel);
             if first {
                 first = false;
                 *stream.request.lock().unwrap_or_else(PoisonError::into_inner) = parse_request_line(&data);
@@ -1985,34 +2138,70 @@ fn shorten(path: &str, max: usize) -> String {
     s
 }
 
+/// Neutralizes C0 (`< 0x20`), DEL (`0x7f`), and C1 (`U+0080..=U+009F`) control
+/// characters so untrusted Share visitor paths or edge notices cannot inject
+/// ANSI/OSC escape sequences or overwrite terminal lines.
+fn sanitize_terminal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        if ch.is_control() {
+            out.push_str(&format!("\\x{:02x}", ch as u32));
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn format_request_line(p: &Paint, r: &Request) -> String {
+    let method = sanitize_terminal(&r.method);
+    let path = shorten(&sanitize_terminal(&r.path), 40);
+    format!(
+        "  {}  {:<7} {}  {:<40} {:>7}  {:>9}",
+        p.dim(&clock(r.at)),
+        p.bold(&method),
+        p.status(r.status),
+        path,
+        format!("{} ms", r.ms),
+        human_bytes(r.bytes_out),
+    )
+}
+
+fn format_notice_line(p: &Paint, n: &str) -> String {
+    format!("  {}  {}", p.accent("!"), sanitize_terminal(n))
+}
+
 /// Prints events the way `kiri share` shows them.
 fn printer(target: String) -> impl Fn(Event) + Send + Sync + 'static {
     let p = Paint::new();
     let shown_url = Mutex::new(None::<String>);
     let header_done = AtomicBool::new(false);
+    let safe_target = sanitize_terminal(&target);
     move |e| match e {
         Event::Connecting { server } => {
             if !header_done.swap(true, Ordering::Relaxed) {
+                let server = sanitize_terminal(&server);
                 println!();
                 println!("  {}  {}", p.accent(&p.bold("◆ Kiri Share")), p.dim(&format!("connecting to {server}…")));
             }
         }
         Event::Live { url, rate, remaining, warning, domains } => {
+            let safe_url = sanitize_terminal(&url);
             let mut shown = shown_url.lock().unwrap_or_else(PoisonError::into_inner);
-            if shown.as_deref() == Some(url.as_str()) {
+            if shown.as_deref() == Some(safe_url.as_str()) {
                 println!("  {}  {}", p.accent("●"), p.dim("back online"));
                 return;
             }
             let first = shown.is_none();
-            *shown = Some(url.clone());
+            *shown = Some(safe_url.clone());
             if !first {
-                println!("  {}  {} {}", p.accent("●"), p.dim("new address:"), p.bold(&url));
+                println!("  {}  {} {}", p.accent("●"), p.dim("new address:"), p.bold(&safe_url));
                 return;
             }
-            println!("  {}  {:<9}{}", p.accent("●"), "linked", target);
-            println!("  {}  {:<9}{}", p.accent("●"), "live", p.accent(&p.bold(&url)));
+            println!("  {}  {:<9}{}", p.accent("●"), "linked", safe_target);
+            println!("  {}  {:<9}{}", p.accent("●"), "live", p.accent(&p.bold(&safe_url)));
             for d in &domains {
-                println!("  {}  {:<9}{}", p.accent("●"), "domain", p.accent(&p.bold(d)));
+                println!("  {}  {:<9}{}", p.accent("●"), "domain", p.accent(&p.bold(&sanitize_terminal(d))));
             }
             println!("     {:<9}{}", "", p.dim(&limits_line(rate, remaining, warning)));
             println!();
@@ -2020,23 +2209,16 @@ fn printer(target: String) -> impl Fn(Event) + Send + Sync + 'static {
             println!();
         }
         Event::Request(r) => {
-            println!(
-                "  {}  {:<7} {}  {:<40} {:>7}  {:>9}",
-                p.dim(&clock(r.at)),
-                p.bold(&r.method),
-                p.status(r.status),
-                shorten(&r.path, 40),
-                format!("{} ms", r.ms),
-                human_bytes(r.bytes_out),
-            );
+            println!("{}", format_request_line(&p, &r));
         }
-        Event::Notice(n) => println!("  {}  {n}", p.accent("!")),
+        Event::Notice(n) => println!("{}", format_notice_line(&p, &n)),
         Event::Reconnecting { reason, delay } => {
+            let reason = sanitize_terminal(&reason);
             println!("  {}  {} {}", p.dim("↻"), p.dim(&reason), p.dim(&format!("— reconnecting in {:.1}s", delay.as_secs_f32())))
         }
         Event::Ended { reason, error } => {
             if error {
-                eprintln!("  {}  {reason}", p.wrap("31", "✕"));
+                eprintln!("  {}  {}", p.wrap("31", "✕"), sanitize_terminal(&reason));
             }
         }
     }
@@ -2163,25 +2345,62 @@ pub fn run(args: &[String]) -> io::Result<()> {
     }
 }
 
+/// Opens a validated `https://github.com/...` URL in the user's browser without
+/// invoking a shell (`ShellExecuteW` on Windows, `/usr/bin/open --` on macOS).
+fn open_browser_url(uri: &str) {
+    let Ok(safe) = validate_verification_uri(uri) else {
+        return;
+    };
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("/usr/bin/open")
+            .args(["--", &safe])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    #[cfg(windows)]
+    {
+        #[link(name = "shell32")]
+        unsafe extern "system" {
+            fn ShellExecuteW(
+                hwnd: *mut std::ffi::c_void,
+                lp_operation: *const u16,
+                lp_file: *const u16,
+                lp_parameters: *const u16,
+                lp_directory: *const u16,
+                n_show_cmd: i32,
+            ) -> isize;
+        }
+        let op: Vec<u16> = "open\0".encode_utf16().collect();
+        let url_w: Vec<u16> = safe.encode_utf16().chain(std::iter::once(0)).collect();
+        // SAFETY: NUL-terminated UTF-16 strings outlive the ShellExecuteW call;
+        // SW_SHOWNORMAL = 1; no shell (`cmd.exe`) is invoked.
+        unsafe {
+            ShellExecuteW(std::ptr::null_mut(), op.as_ptr(), url_w.as_ptr(), std::ptr::null(), std::ptr::null(), 1);
+        }
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    let _ = safe;
+}
+
 fn login_cli(args: &[String]) -> io::Result<()> {
     let p = Paint::new();
     if let Some(i) = args.iter().position(|a| a == "--dev") {
         let login = args.get(i + 1).map_or("dev", String::as_str);
         let who = login_dev(login)?;
-        println!("Signed in to Kiri Share as {} (development edge).", p.bold(&who));
+        println!("Signed in to Kiri Share as {} (development edge).", p.bold(&sanitize_terminal(&who)));
         return Ok(());
     }
     let code = login_start()?;
+    let safe_uri = validate_verification_uri(&code.verification_uri)?;
     println!();
     println!("  {}  Sign in to Kiri Share with GitHub", p.accent(&p.bold("◆")));
-    println!("     Open {} and enter", p.bold(&code.verification_uri));
+    println!("     Open {} and enter", p.bold(&sanitize_terminal(&safe_uri)));
     println!();
-    println!("         {}", p.accent(&p.bold(&code.user_code)));
+    println!("         {}", p.accent(&p.bold(&sanitize_terminal(&code.user_code))));
     println!();
-    #[cfg(target_os = "macos")]
-    let _ = std::process::Command::new("open").arg(&code.verification_uri).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
-    #[cfg(windows)]
-    let _ = std::process::Command::new("cmd").args(["/c", "start", "", &code.verification_uri]).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+    open_browser_url(&safe_uri);
     println!("     {}", p.dim("Waiting for you to approve…"));
     let mut wait = code.interval;
     loop {
@@ -2189,7 +2408,7 @@ fn login_cli(args: &[String]) -> io::Result<()> {
         match login_poll(&code)? {
             LoginPoll::Pending(next) => wait = next,
             LoginPoll::Done(who) => {
-                println!("  {}  Signed in as {}.", p.accent("●"), p.bold(&who));
+                println!("  {}  Signed in as {}.", p.accent("●"), p.bold(&sanitize_terminal(&who)));
                 return Ok(());
             }
         }
@@ -2650,5 +2869,129 @@ mod tests {
         assert!(!leftover_tmp());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_verification_uri_enforces_https_github_allowlist_and_blocks_shell_chars() {
+        assert_eq!(
+            validate_verification_uri("https://github.com/login/device").unwrap(),
+            "https://github.com/login/device"
+        );
+        assert_eq!(
+            validate_verification_uri("https://github.com:443/login/device?user_code=ABCD-1234").unwrap(),
+            "https://github.com:443/login/device?user_code=ABCD-1234"
+        );
+        for bad in [
+            "",
+            "http://github.com/login/device",
+            "file:///Applications/Calculator.app",
+            "smb://evil.example/share",
+            "javascript:alert(1)",
+            "https://evil.com/login/device",
+            "https://github.com@evil.com/login/device",
+            "https://github.com:8443/login/device",
+            "-aCalculator",
+            "https://github.com/login/device&calc.exe",
+            "https://github.com/login/device|whoami",
+            "https://github.com/login/device^&calc",
+            "https://github.com/login/device%TEMP%",
+            "https://github.com/login/device\r\n",
+            "https://github.com/login/device with space",
+            "https://github.com/login/device\u{009b}2J",
+        ] {
+            assert!(validate_verification_uri(bad).is_err(), "should reject {bad:?}");
+        }
+    }
+
+    #[test]
+    fn api_request_validation_and_bounded_response_prevent_smuggling_and_oom() {
+        assert!(validate_api_request("GET", "/v1/whoami", "edge.runkiri.com", Some("ks_tok")).is_ok());
+        for bad_path in [
+            "v1/whoami",
+            "/v1/names/foo\r\nPOST /v1/evil HTTP/1.1",
+            "/v1/names/foo bar",
+            "/v1/names/../admin",
+            "/v1/names/foo\x00",
+        ] {
+            assert!(validate_api_request("GET", bad_path, "edge.runkiri.com", None).is_err(), "path: {bad_path:?}");
+        }
+        assert!(validate_api_request("GET", "/v1/whoami", "edge.runkiri.com\r\nX-Evil: 1", None).is_err());
+        assert!(validate_api_request("GET", "/v1/whoami", "edge.runkiri.com", Some("tok\r\nX-Evil: 1")).is_err());
+        assert_eq!(encode_uri_component("a/b?c#d\r\n"), "a%2Fb%3Fc%23d%0D%0A");
+
+        #[cfg(unix)]
+        {
+            assert_eq!(container_inspect_path("my-app").unwrap(), "/containers/my-app/json");
+            for bad in ["", ".", "..", "../kiri/stop", "a/b", "a?b=1", "a\r\nPOST /x"] {
+                assert!(container_inspect_path(bad).is_err(), "container: {bad:?}");
+            }
+        }
+
+        // Bounded response reader succeeds at exact limit and rejects limit + 1.
+        let ok = read_bounded_response(io::Cursor::new(vec![b'a'; 16]), 16).unwrap();
+        assert_eq!(ok.len(), 16);
+        let err = read_bounded_response(io::Cursor::new(vec![b'a'; 17]), 16).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn terminal_output_sanitizes_ansi_osc_and_control_sequences() {
+        let p = Paint { on: false };
+        let req = Request {
+            method: "GET\x1b[31m".into(),
+            path: "/ok\x1b]52;c;YQ==\x07\rspoof\u{009b}2J".into(),
+            status: 200,
+            ms: 5,
+            bytes_in: 10,
+            bytes_out: 20,
+            at: SystemTime::UNIX_EPOCH,
+        };
+        let line = format_request_line(&p, &req);
+        assert!(!line.chars().any(char::is_control), "control char leaked in request line: {line:?}");
+        assert!(line.contains("\\x1b"), "{line:?}");
+
+        let notice = format_notice_line(&p, "hello\x1b]0;pwned\x07\r\nfake");
+        assert!(!notice.chars().any(char::is_control), "control char leaked in notice: {notice:?}");
+        assert!(notice.contains("\\x1b") && notice.contains("\\x0d"), "{notice:?}");
+    }
+
+    #[test]
+    fn share_session_enforces_max_streams_and_rejects_duplicate_stream_ids() {
+        // Build a minimal Session backed by a dummy loopback socket to test stream cap & dedup.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = std::thread::spawn(move || listener.accept().unwrap().0);
+        let sock = TcpStream::connect(addr).unwrap();
+        let _peer = accept.join().unwrap();
+        let tls_cfg = tls_config(b"http/1.1").unwrap();
+        let conn = rustls::ClientConnection::new(tls_cfg, ServerName::try_from("localhost").unwrap()).unwrap();
+        let sess = Session {
+            tls: Mutex::new(conn),
+            sock,
+            streams: Mutex::new(HashMap::new()),
+            target: Target { addr: "127.0.0.1:1".into(), label: String::new(), display: "127.0.0.1:1".into() },
+            on_event: Arc::new(|_| {}),
+            offline_notice: Mutex::new(None),
+            token: String::new(),
+            device: String::new(),
+            srv: Server { host: "localhost".into(), port: 443, dial: "127.0.0.1:443".into() },
+            lanes: Lanes::default(),
+        };
+
+        let mut rxs = Vec::new();
+        for id in 1..=(MAX_STREAMS as u32) {
+            let (_s, rx) = sess.try_register_stream(id).expect("under MAX_STREAMS");
+            rxs.push(rx);
+        }
+        // Duplicate ID is rejected.
+        assert!(sess.try_register_stream(1).is_none());
+        // Exceeding MAX_STREAMS is rejected.
+        assert!(sess.try_register_stream((MAX_STREAMS as u32) + 1).is_none());
+        // Inbound window accounting caps per-stream queued bytes.
+        let s1 = sess.streams.lock().unwrap().get(&1).unwrap().clone();
+        let max_win = proto::INITIAL_WINDOW as usize;
+        assert_eq!(s1.inbound_queued.fetch_add(max_win, Ordering::AcqRel), 0);
+        assert!(s1.inbound_queued.load(Ordering::Acquire) + 1 > max_win);
+        sess.end_all();
     }
 }

@@ -140,11 +140,135 @@ pub fn app() -> io::Result<PathBuf> {
     app.ok_or_else(|| io::Error::other("Kiri updates replace Kiri.app; this binary is not running from one"))
 }
 
-/// `.kiri-update/` beside the app: on the same volume, so installing is a
-/// rename.
+/// Prefix for private per-user staging directories beside `Kiri.app`.
 #[cfg(target_os = "macos")]
-fn stage_dir(app: &Path) -> io::Result<PathBuf> {
-    Ok(app.parent().ok_or_else(|| io::Error::other("Kiri.app has no parent directory"))?.join(".kiri-update"))
+const STAGE_PREFIX: &str = ".kiri-update-";
+
+#[cfg(target_os = "macos")]
+fn is_loopback_http(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("http://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() || authority.contains('@') {
+        return false;
+    }
+    let (host, port) = if let Some(h) = authority.strip_prefix('[') {
+        let Some((addr, after)) = h.split_once(']') else {
+            return false;
+        };
+        let port = if after.is_empty() {
+            None
+        } else if let Some(p) = after.strip_prefix(':') {
+            Some(p)
+        } else {
+            return false;
+        };
+        (addr, port)
+    } else {
+        match authority.split_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (authority, None),
+        }
+    };
+    if port.is_some_and(|p| p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit())) {
+        return false;
+    }
+    host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
+}
+
+/// Validates a release download URL: requires `https://` (unless both the feed
+/// override `KIRI_UPDATE_URL` and `url` are explicit loopback `http://` test URLs),
+/// and rejects control characters or whitespace.
+#[cfg(target_os = "macos")]
+fn validate_download_url(url: &str, feed_override: Option<&str>) -> io::Result<bool> {
+    if url.is_empty() || url.bytes().any(|b| b <= 0x20 || b == 0x7f) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid release download URL"));
+    }
+    if url.starts_with("https://") {
+        return Ok(true);
+    }
+    if feed_override.is_some_and(is_loopback_http) && is_loopback_http(url) {
+        return Ok(false);
+    }
+    Err(io::Error::new(io::ErrorKind::InvalidInput, "release download URL must use https://"))
+}
+
+/// Creates a unique, owner-only (`0o700`) staging directory beside `app` so
+/// another local admin sharing `/Applications` cannot pre-create or swap files.
+#[cfg(target_os = "macos")]
+fn create_stage_dir(app: &Path) -> io::Result<PathBuf> {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    use std::os::unix::fs::DirBuilderExt;
+
+    let parent = app.parent().ok_or_else(|| io::Error::other("Kiri.app has no parent directory"))?;
+    for attempt in 0..32u32 {
+        let mut h = RandomState::new().build_hasher();
+        h.write_u32(std::process::id());
+        h.write_u32(attempt);
+        let dir = parent.join(format!("{STAGE_PREFIX}{:016x}", h.finish()));
+        match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(io::ErrorKind::AlreadyExists, "could not create private update staging directory"))
+}
+
+/// True when `dir` is a non-symlink directory owned by this UID with no group
+/// or world permissions (`mode & 0o077 == 0`).
+#[cfg(target_os = "macos")]
+fn is_own_private_dir(dir: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(meta) = std::fs::symlink_metadata(dir) else {
+        return false;
+    };
+    // SAFETY: geteuid has no preconditions.
+    let euid = unsafe { libc::geteuid() };
+    meta.file_type().is_dir() && meta.uid() == euid && (meta.mode() & 0o077) == 0
+}
+
+/// Finds our private staged update directory beside `app`, if any.
+#[cfg(target_os = "macos")]
+fn find_stage_dir(app: &Path) -> Option<PathBuf> {
+    let parent = app.parent()?;
+    let entries = std::fs::read_dir(parent).ok()?;
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with(STAGE_PREFIX) {
+            continue;
+        }
+        let path = entry.path();
+        if !is_own_private_dir(&path) {
+            continue;
+        }
+        let mtime = std::fs::symlink_metadata(&path).and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
+        if best.as_ref().is_none_or(|(t, _)| mtime >= *t) {
+            best = Some((mtime, path));
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
+#[cfg(target_os = "macos")]
+fn cleanup_own_stage_dirs(app: &Path) {
+    let Some(parent) = app.parent() else { return };
+    if let Ok(entries) = std::fs::read_dir(parent) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if name == ".kiri-update" || name.starts_with(STAGE_PREFIX) {
+                let path = entry.path();
+                if is_own_private_dir(&path) {
+                    let _ = std::fs::remove_dir_all(&path);
+                }
+            }
+        }
+    }
 }
 
 /// Downloads `release`, checks it and stages it for `install_staged`.
@@ -156,9 +280,8 @@ pub fn download(release: &Release, progress: &mut dyn FnMut(u64, Option<u64>), c
     if !newer(&release.version, env!("CARGO_PKG_VERSION")) {
         return Err(io::Error::other(format!("Kiri {} is not newer than this {}", release.version, env!("CARGO_PKG_VERSION"))));
     }
-    let dir = stage_dir(&app)?;
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir)?;
+    cleanup_own_stage_dirs(&app);
+    let dir = create_stage_dir(&app)?;
     crate::diag::info!("update download started", version = release.version);
     let result = fetch_and_check(release, &app, &dir, progress, cancel);
     match &result {
@@ -174,9 +297,11 @@ pub fn download(release: &Release, progress: &mut dyn FnMut(u64, Option<u64>), c
 
 #[cfg(target_os = "macos")]
 fn fetch_and_check(release: &Release, app: &Path, dir: &Path, progress: &mut dyn FnMut(u64, Option<u64>), cancel: &AtomicBool) -> io::Result<()> {
-    // Download, hashing as it streams to disk.
+    let feed_override = std::env::var("KIRI_UPDATE_URL").ok();
+    let https_only = validate_download_url(&release.url, feed_override.as_deref())?;
+    // Download, hashing as it streams to disk. Reject HTTPS→HTTP downgrades on redirects.
     let tgz = dir.join("Kiri.tar.gz");
-    let mut resp = agent().get(&release.url).call().map_err(io::Error::other)?;
+    let mut resp = agent().get(&release.url).config().https_only(https_only).build().call().map_err(io::Error::other)?;
     let total = resp.headers().get("content-length").and_then(|v| v.to_str().ok()?.parse::<u64>().ok());
     let mut body = resp.body_mut().with_config().limit(MAX_DOWNLOAD).reader();
     let mut out = std::fs::File::create(&tgz)?;
@@ -219,7 +344,7 @@ fn fetch_and_check(release: &Release, app: &Path, dir: &Path, progress: &mut dyn
 /// The staged update's version, when there is one newer than this build.
 #[cfg(target_os = "macos")]
 pub fn staged() -> Option<String> {
-    let dir = stage_dir(&app().ok()?).ok()?;
+    let dir = find_stage_dir(&app().ok()?)?;
     let version = std::fs::read_to_string(dir.join("version")).ok()?.trim().to_owned();
     (dir.join("Kiri.app").is_dir() && newer(&version, env!("CARGO_PKG_VERSION"))).then_some(version)
 }
@@ -229,8 +354,14 @@ pub fn staged() -> Option<String> {
 #[cfg(target_os = "macos")]
 pub fn install_staged() -> io::Result<String> {
     let app = app()?;
-    let dir = stage_dir(&app)?;
-    let Some(version) = staged() else {
+    let Some(dir) = find_stage_dir(&app) else {
+        return Err(io::Error::other("no update is staged"));
+    };
+    let Some(version) = std::fs::read_to_string(dir.join("version"))
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|v| dir.join("Kiri.app").is_dir() && newer(v, env!("CARGO_PKG_VERSION")))
+    else {
         return Err(io::Error::other("no update is staged"));
     };
     let new_app = dir.join("Kiri.app");
@@ -328,15 +459,25 @@ fn log_path() -> PathBuf {
     crate::client::socket().ok().and_then(|s| Some(s.parent()?.parent()?.join("daemon.log"))).unwrap_or_else(|| PathBuf::from("daemon.log"))
 }
 
+#[cfg(target_os = "macos")]
+fn open_private_daemon_log(log_file: &Path) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+    if let Some(dir) = log_file.parent() {
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+    }
+    let log = std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(log_file)?;
+    if log.metadata().is_ok_and(|m| m.is_file()) {
+        let _ = log.set_permissions(std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(log)
+}
+
 /// `kiri daemon` in its own session, so quitting the window does not take
 /// it down; its output goes to daemon.log.
 #[cfg(target_os = "macos")]
 fn spawn_daemon() -> io::Result<()> {
     let log_file = log_path();
-    if let Some(dir) = log_file.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let log = std::fs::OpenOptions::new().create(true).append(true).open(&log_file)?;
+    let log = open_private_daemon_log(&log_file)?;
     let mut cmd = Command::new(std::env::current_exe()?);
     cmd.arg("daemon").stdin(std::process::Stdio::null()).stdout(log.try_clone()?).stderr(log);
     // SAFETY: setsid is async-signal-safe and runs in the child before exec.
@@ -799,5 +940,40 @@ mod tests {
         .unwrap_err();
         assert_eq!(total_ms.get(), 12_500);
         assert!(err.to_string().contains("/custom/daemon.log"), "{err}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn update_download_url_requires_https_and_stage_dir_and_log_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        use super::{STAGE_PREFIX, create_stage_dir, find_stage_dir, open_private_daemon_log, validate_download_url};
+
+        assert!(validate_download_url("https://download.runkiri.com/Kiri.tar.gz", None).unwrap());
+        assert!(validate_download_url("http://download.runkiri.com/Kiri.tar.gz", None).is_err());
+        assert!(validate_download_url("http://127.0.0.1:8080/Kiri.tar.gz", None).is_err());
+        assert!(validate_download_url("file:///tmp/Kiri.tar.gz", None).is_err());
+        assert!(validate_download_url("https://download.runkiri.com/Kiri\r\n.tar.gz", None).is_err());
+        // Local test override permits loopback http only when feed override is also loopback http.
+        assert!(!validate_download_url("http://127.0.0.1:8080/Kiri.tar.gz", Some("http://127.0.0.1:8080/latest.json")).unwrap());
+        assert!(!validate_download_url("http://[::1]:8080/Kiri.tar.gz", Some("http://[::1]:8080/latest.json")).unwrap());
+        assert!(validate_download_url("http://[::1]@evil.com/Kiri.tar.gz", Some("http://127.0.0.1:8080/latest.json")).is_err());
+        assert!(validate_download_url("http://127.0.0.1@evil.com/Kiri.tar.gz", Some("http://127.0.0.1:8080/latest.json")).is_err());
+        assert!(validate_download_url("http://[::1]evil.com/Kiri.tar.gz", Some("http://127.0.0.1:8080/latest.json")).is_err());
+
+        let root = std::env::temp_dir().join(format!("kiri-update-sec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let fake_app = root.join("Kiri.app");
+        let stage = create_stage_dir(&fake_app).unwrap();
+        assert_eq!(std::fs::metadata(&stage).unwrap().permissions().mode() & 0o777, 0o700);
+        assert!(stage.file_name().unwrap().to_str().unwrap().starts_with(STAGE_PREFIX));
+        assert_eq!(find_stage_dir(&fake_app).as_deref(), Some(stage.as_path()));
+
+        let log = root.join("state/daemon.log");
+        let _f = open_private_daemon_log(&log).unwrap();
+        assert_eq!(std::fs::metadata(&log).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::metadata(log.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

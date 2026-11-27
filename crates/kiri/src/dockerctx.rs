@@ -201,15 +201,42 @@ pub fn read_json(path: &Path) -> io::Result<Value> {
 }
 
 /// Writes JSON through a temporary file, so a crash never leaves half a config.
+/// Creates missing parent directories with `0o700` and temp files with `0o600`
+/// on Unix so `~/.docker/config.json` registry credentials stay owner-only.
 pub fn write_json(path: &Path, v: &Value) -> io::Result<()> {
+    use std::io::Write;
     static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+    }
+    #[cfg(not(unix))]
     std::fs::create_dir_all(dir)?;
     let file = path.file_name().and_then(|n| n.to_str()).unwrap_or("config.json");
-    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp = dir.join(format!(".{file}.kiri-tmp-{}-{seq}", std::process::id()));
     let bytes = serde_json::to_vec_pretty(v).map_err(io::Error::other)?;
-    let res = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
+    let mut attempt = 0u32;
+    let (tmp, mut f) = loop {
+        let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let candidate = dir.join(format!(".{file}.kiri-tmp-{}-{seq}", std::process::id()));
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        match opts.open(&candidate) {
+            Ok(f) => break (candidate, f),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists && attempt < 32 => attempt += 1,
+            Err(e) => return Err(e),
+        }
+    };
+    let res = f.write_all(&bytes).and_then(|()| f.flush()).and_then(|()| {
+        drop(f);
+        std::fs::rename(&tmp, path)
+    });
     if res.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
@@ -852,5 +879,20 @@ mod tests {
         assert_eq!(sock_at(&link, &ours, &[d.join(".orbstack")]), Endpoint::Taken(orb.display().to_string()));
         assert_eq!(sock_at(&link, &ours, &[]), Endpoint::Free);
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_json_enforces_0600_config_and_0700_new_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch_home("mode-0600");
+        let docker = root.join(".docker");
+        let cfg = docker.join("config.json");
+        write_json(&cfg, &json!({"auths": {"https://index.docker.io/v1/": {"auth": "c2VjcmV0"}}})).unwrap();
+        assert_eq!(std::fs::metadata(&docker).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(std::fs::metadata(&cfg).unwrap().permissions().mode() & 0o777, 0o600);
+        set_current(&cfg, "kiri").unwrap();
+        assert_eq!(std::fs::metadata(&cfg).unwrap().permissions().mode() & 0o777, 0o600);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -26,14 +26,14 @@ impl Redactor {
         Redactor { homes, secrets: secrets.into_iter().filter(|s| s.len() >= 8).collect() }
     }
 
-    /// `$HOME` → `~`, and the patterns.
+    /// `$HOME` (or `%USERPROFILE%` on Windows) → `~`, and the patterns.
     pub fn home_only() -> Redactor {
-        Redactor::new(std::env::var("HOME").ok(), Vec::new())
+        Redactor::new(user_home(), Vec::new())
     }
 
     /// For a report: also the Kiri Cloud token, when signed in.
     pub fn for_user() -> Redactor {
-        Redactor::new(std::env::var("HOME").ok(), crate::share::read_config().token.into_iter().collect())
+        Redactor::new(user_home(), crate::share::read_config().token.into_iter().collect())
     }
 
     pub fn apply(&self, text: &str) -> String {
@@ -70,13 +70,28 @@ fn is_word(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
+fn user_home() -> Option<String> {
+    #[cfg(windows)]
+    {
+        std::env::var("USERPROFILE")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| std::env::var("HOME").ok().filter(|s| !s.is_empty()))
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var("HOME").ok().filter(|s| !s.is_empty())
+    }
+}
+
 /// A key whose value is secret: `token`, `access_token`, `PASSWORD`,
-/// `client_secret`, `API-KEY`, `PGPASS`, docker's `auth`, `identitytoken`…
+/// `client_secret`, `API-KEY`, `PGPASS`, docker's `auth`, `identitytoken`,
+/// kubeconfig's `client-key-data`…
 fn sensitive(key: &str) -> bool {
     let k = key.trim_start_matches('-').to_ascii_lowercase().replace(['-', '.'], "_");
     matches!(k.as_str(), "auth" | "authorization" | "pass" | "pgpass")
         || k.ends_with("_pass")
-        || ["token", "password", "passwd", "passphrase", "secret", "apikey", "api_key", "access_key", "private_key", "credential", "crashreporterkey", "cookie", "session"].iter().any(|w| k.contains(w))
+        || ["token", "password", "passwd", "passphrase", "secret", "apikey", "api_key", "access_key", "private_key", "client_key", "credential", "crashreporterkey", "cookie", "session"].iter().any(|w| k.contains(w))
 }
 
 /// The home folder as logs may write it. A Windows one (`C:\Users\Ada`) is
@@ -749,5 +764,18 @@ mod tests {
     fn leaves_other_text_and_unicode_alone() {
         let text = "VM booted in 112 ms → 4 CPUs, café=ok, a = b";
         assert_eq!(patterns(text), text);
+    }
+
+    #[test]
+    fn redacts_kubeconfig_client_key_data() {
+        let yaml = "  user:\n    client-certificate-data: Y2VydA==\n    client-key-data: LS0tLS1CRUdJTiBSU0EgUFJJVkFURSBLRVktLS0tLQ==\n";
+        let out = patterns(yaml);
+        assert!(!out.contains("LS0tLS1CRUdJTi"), "{out}");
+        assert!(out.contains("client-key-data: [redacted]"), "{out}");
+
+        let json = r#"{"user":{"client-key-data":"LS0tLS1CRUdJTiBSU0EgUFJJVkFURSBLRVktLS0tLQ=="}}"#;
+        let out_json = patterns(json);
+        assert!(!out_json.contains("LS0tLS1CRUdJTi"), "{out_json}");
+        assert!(out_json.contains(r#""client-key-data":"[redacted]""#), "{out_json}");
     }
 }

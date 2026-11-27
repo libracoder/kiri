@@ -145,9 +145,22 @@ pub fn attach_device(d: &mac::Device) -> io::Result<()> {
     helper::attach(&d.location(), &d.name, d.linux_speed(), d.devid()).map_err(|e| io::Error::other(format!("{} was not attached: {e}", d.name)))
 }
 
+/// Validates a USB location identifier before interpolating it into a daemon
+/// API path or query string (`0x<hex>` or `[A-Za-z0-9][A-Za-z0-9-]*`).
+pub(crate) fn valid_location(location: &str) -> bool {
+    let b = location.as_bytes();
+    !b.is_empty()
+        && b.len() <= 64
+        && b[0].is_ascii_alphanumeric()
+        && b.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'-')
+}
+
 /// Gives a device back to macOS.
 #[cfg(target_os = "macos")]
 pub fn detach_location(location: &str) -> io::Result<()> {
+    if !valid_location(location) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("bad USB location {location:?}")));
+    }
     let r = crate::client::request("DELETE", &format!("/kiri/usb/{location}"), None)?;
     if !r.ok() {
         return Err(io::Error::other(r.error()));
@@ -287,6 +300,17 @@ mod kind_tests {
         assert_eq!(kind_of(0, &[(0, 14, 1, 0), (1, 14, 2, 0)], 0x046d, "C920"), "camera");
         assert_eq!(kind_of(0, &[(0, 8, 6, 80)], 0x0781, "Ultra"), "storage");
         assert_eq!(kind_of(0, &[(0, 3, 0, 0)], 0x0bda, "USB2.0 HID"), "");
+    }
+
+    #[test]
+    fn valid_location_rejects_traversal_crlf_and_query_injection() {
+        assert!(super::valid_location("0x01100000"));
+        assert!(super::valid_location("fake-1"));
+        for bad in ["", "-bad", "..", "../containers/foo", "0x1?force=1", "0x1#frag", "0x1 HTTP/1.1\r\n", "0x1/extra"] {
+            assert!(!super::valid_location(bad), "should reject {bad:?}");
+            #[cfg(target_os = "macos")]
+            assert_eq!(super::detach_location(bad).unwrap_err().kind(), std::io::ErrorKind::InvalidInput, "{bad:?}");
+        }
     }
 }
 

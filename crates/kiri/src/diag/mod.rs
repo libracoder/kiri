@@ -416,6 +416,21 @@ fn fd_path(fd: i32) -> Option<PathBuf> {
     Some(PathBuf::from(format!("/proc/self/fd/{fd}")))
 }
 
+/// Tightens a regular-file stderr target (such as `~/.kiri/daemon.log`) to
+/// owner-only `0o600` permissions so mirrored stderr lines are not world-readable.
+fn tighten_stderr_file(fd: i32, file: &File) {
+    if file.metadata().is_ok_and(|m| m.is_file()) {
+        // SAFETY: `fd` is a valid regular-file descriptor owned by this module.
+        unsafe { libc::fchmod(fd, 0o600) };
+    }
+}
+
+/// Formats and redacts a captured stderr line before mirroring it to the
+/// original stderr file (`~/.kiri/daemon.log`).
+fn format_stderr_echo(time: &str, line: &str) -> String {
+    format!("{time} {}", redact::patterns(line))
+}
+
 /// Sends fd 2 through a pipe: every line written to stderr (an
 /// `eprintln!`, a library's complaint, a child's output) lands in this
 /// part's log with a timestamp, and goes on to the original stderr with one.
@@ -447,6 +462,7 @@ pub fn capture_stderr() {
     };
     // SAFETY: `orig` is this module's; ManuallyDrop keeps it open.
     let file = ManuallyDrop::new(unsafe { File::from_raw_fd(orig) });
+    tighten_stderr_file(orig, &file);
     if let Some((size, read)) = appended_file(orig, &file) {
         let _ = ECHO_READ.set(read);
         ECHO_SIZE.store(size as i64, Ordering::Relaxed);
@@ -482,7 +498,7 @@ pub fn capture_stderr() {
                 continue;
             }
             let time = now();
-            echo(&format!("{time} {line}"));
+            echo(&format_stderr_echo(&time, line));
             if enabled(Level::Info) {
                 let _ = append(part(), &json_line(&time, Level::Info, part(), line, &[("src", "stderr".into())]));
             }
@@ -800,6 +816,28 @@ mod tests {
         let text = crash_text(t, "kiri-api", "src/x.rs:1:2", "boom", "0: main");
         assert!(text.contains("Message:  boom") && text.contains("Thread:   kiri-api") && text.contains("Backtrace:\n0: main"), "{text}");
         assert!(text.contains(&format!("Version:  Kiri {}", env!("CARGO_PKG_VERSION"))));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn captured_stderr_echo_redacts_secrets_and_tightens_mode() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::PermissionsExt;
+
+        let line = format_stderr_echo(
+            "2026-11-27T00:00:00.000Z",
+            "proxy http://alice:s3cr3t@proxy.corp:3128 Authorization: Bearer tok_1234567890",
+        );
+        assert!(!line.contains("s3cr3t"), "{line}");
+        assert!(!line.contains("tok_1234567890"), "{line}");
+        assert!(line.contains("[redacted]"), "{line}");
+
+        let dir = temp("stderr-mode");
+        let path = dir.join("daemon.log");
+        let file = std::fs::OpenOptions::new().create(true).append(true).open(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        tighten_stderr_file(file.as_raw_fd(), &file);
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
