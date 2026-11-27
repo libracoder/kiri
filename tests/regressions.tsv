@@ -310,7 +310,7 @@ dns-default-bridge-stub	#330	on a Linux host whose /etc/resolv.conf names only 1
 build-pinned-digest	#288	a digest-pinned FROM image (@sha256:...) already pulled into Kiri's store was re-serialized instead of served with its upstream manifest and index bytes, failing BuildKit's digest check (#330)
 build-host-network-dns	#209	build steps under docker build and docker build --network=host (or a host-network builder) could not resolve names through a loopback stub resolver on the host (#330)
 crates/kiri/src/main.rs	#743	kiri --help listed commands not compiled for the current OS (such as macOS-only setup, import, bench and boot on Linux, or Linux-only bridge on macOS)
-crates/kiri/src/update.rs	#840	kiri update --help and kiri update -h entered the updater and tried the release feed (or failed the dev-build check) instead of printing OS-appropriate usage offline
+crates/kiri/src/update.rs	#840	kiri update --help and kiri update -h entered the updater and tried the release feed (or failed the dev-build check) instead of printing OS-appropriate usage offline, and on Windows kiri update --check fell through to docker update --check (#984)
 vol-rm-force-in-use	#773	docker volume rm --force (and DELETE /volumes/{name}?force=1) removed a volume still used by a container instead of returning 409 Conflict and keeping its data
 vol-rm-force-missing	#773	DELETE /volumes/{name}?force=1 (and docker volume rm -f) returned 404 Not Found for a missing volume instead of 204 No Content as Docker does
 crates/kiri-image/src/reference.rs	#746	Reference::parse and archive::load accepted quotes, backslashes, queries and fragments in image names, storing unparseable or hostile RepoTags from docker load

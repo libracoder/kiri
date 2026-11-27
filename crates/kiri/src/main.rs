@@ -109,7 +109,7 @@ mod ui;
 #[cfg(unix)]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod tools;
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 mod update;
 
 const USAGE_LINES: &[&str] = &[
@@ -135,7 +135,7 @@ const USAGE_LINES: &[&str] = &[
     "       kiri scan [--json] [--history] <image>   known vulnerabilities in an image, found by Grype",
     #[cfg(target_os = "macos")]
     "       kiri update [--check]      update Kiri (with a container: docker's update)",
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     "       kiri update --check        check for a newer Kiri (with a container: docker's update)",
     "       kiri doctor [--json]       whether Kiri works here, and what to run when a part doesn't",
     "       kiri diag logs [-f] [--ui|--engine|--cli] [--errors] [-n N]",
@@ -258,7 +258,7 @@ enum Command<'a> {
     Import(&'a [String]),
     #[cfg(target_os = "macos")]
     Vm(&'a [String]),
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     Update(&'a [String]),
     #[cfg(unix)]
     Diag(&'a [String]),
@@ -332,7 +332,7 @@ impl<'a> Command<'a> {
             Some("import") => Some(Command::Import(&args[1..])),
             #[cfg(target_os = "macos")]
             Some("vm") => Some(Command::Vm(&args[1..])),
-            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            #[cfg(any(target_os = "macos", target_os = "linux", windows))]
             Some("update") if !docker::is_container_update(&args[1..]) => Some(Command::Update(&args[1..])),
             #[cfg(unix)]
             Some("diag") => Some(Command::Diag(&args[1..])),
@@ -487,7 +487,7 @@ fn main() -> ExitCode {
         Some(Command::Import(rest)) => import::run(rest),
         #[cfg(target_os = "macos")]
         Some(Command::Vm(rest)) => vm_cli::run(rest),
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        #[cfg(any(target_os = "macos", target_os = "linux", windows))]
         Some(Command::Update(rest)) => update::run(rest),
         #[cfg(unix)]
         Some(Command::Diag(rest)) => diag::run(rest),
@@ -647,14 +647,16 @@ mod tests {
         }
         #[cfg(windows)]
         {
-            for win_cmd in ["setup", "build-with", "import"] {
+            for win_cmd in ["setup", "build-with", "import", "update"] {
                 assert!(cmds.contains(&win_cmd), "Windows help missing `{win_cmd}`:\n{help}");
             }
+            assert!(help.contains("kiri update --check"), "Windows help missing `kiri update --check`:\n{help}");
+            assert!(!help.contains("kiri update [--check]"), "Windows help must not list macOS `kiri update [--check]`:\n{help}");
             assert!(
                 help.contains("kiri import [desktop-linux] [--images] [--volumes] [--containers]"),
                 "Windows help missing `kiri import [desktop-linux] [--images] [--volumes] [--containers]`:\n{help}"
             );
-            for unix_or_mac in ["daemon", "bridge", "ui", "update", "vm", "bench", "boot", "raw"] {
+            for unix_or_mac in ["daemon", "bridge", "ui", "vm", "bench", "boot", "raw"] {
                 assert!(!cmds.contains(&unix_or_mac), "Windows help must not list `{unix_or_mac}`:\n{help}");
             }
         }
@@ -729,7 +731,7 @@ mod tests {
             assert_eq!(Command::parse(&["raw".to_owned()]), Some(Command::RawInvalid));
         }
 
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        #[cfg(any(target_os = "macos", target_os = "linux", windows))]
         for args in [
             vec!["update".to_owned()],
             vec!["update".to_owned(), "--check".to_owned()],
@@ -751,7 +753,7 @@ mod tests {
             for unix_cmd in ["bridge", "ui", "vm", "bench", "boot", "raw"] {
                 assert!(parse(&[unix_cmd]).is_none(), "`kiri {unix_cmd}` should not dispatch on Windows");
             }
-            for win_cmd in ["setup", "build-with", "import"] {
+            for win_cmd in ["setup", "build-with", "import", "update"] {
                 assert!(parse(&[win_cmd]).is_some(), "`kiri {win_cmd}` must dispatch on Windows");
             }
             let daemon_args = ["daemon".to_owned()];
@@ -844,9 +846,11 @@ mod tests {
             &["diag", "logs"],
             &["diag", "report"],
         ];
+        #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+        subcommands.push(&["update"]);
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
-            subcommands.extend([&["ui"][..], &["update"]]);
+            subcommands.push(&["ui"]);
         }
         #[cfg(unix)]
         {

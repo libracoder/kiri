@@ -31,15 +31,21 @@ use sha2::{Digest, Sha256};
 
 /// Each Mac reads its own feed, so a release for one never reaches the other
 /// (and check() refuses an app without code for this CPU anyway).
-#[cfg(all(not(target_os = "linux"), not(target_arch = "x86_64")))]
+#[cfg(all(target_os = "macos", not(target_arch = "x86_64")))]
 const FEED: &str = "https://download.runkiri.com/latest-mac-arm64.json";
 /// Intel Macs get the Intel app (`cargo xtask release --arch x86_64`).
-#[cfg(all(not(target_os = "linux"), target_arch = "x86_64"))]
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 const FEED: &str = "https://download.runkiri.com/latest-mac-x86_64.json";
 /// Linux reads only the version: its kiri is a .deb or .rpm installed from
 /// runkiri.com, so nothing is downloaded from the feed.
 #[cfg(target_os = "linux")]
 const FEED: &str = "https://download.runkiri.com/latest.json";
+/// Windows CLI checks the architecture's Windows release feed (`kiri-win`
+/// performs background MSI updates from the window).
+#[cfg(all(windows, not(target_arch = "aarch64")))]
+const FEED: &str = "https://download.runkiri.com/latest-windows-x86_64.json";
+#[cfg(all(windows, target_arch = "aarch64"))]
+const FEED: &str = "https://download.runkiri.com/latest-windows-arm64.json";
 /// The biggest download accepted (the app is about 60 MB packed).
 #[cfg(target_os = "macos")]
 const MAX_DOWNLOAD: u64 = 2 << 30;
@@ -114,6 +120,7 @@ fn latest_from(url: &str) -> io::Result<Release> {
         let body = agent().get(url).call().map_err(io::Error::other)?.body_mut().with_config().limit(64 << 10).read_to_vec().map_err(io::Error::other)?;
         serde_json::from_slice(&body).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{url}: {e}")))
     })();
+    #[cfg(unix)]
     match &release {
         Ok(r) => crate::diag::info!("update check", latest = r.version, current = env!("CARGO_PKG_VERSION")),
         Err(e) => crate::diag::warn!("update check failed", error = e),
@@ -290,6 +297,7 @@ fn start_engine_with(
     if alive() {
         return Ok(());
     }
+    #[cfg(unix)]
     crate::diag::info!("starting the engine");
     if start_agent().unwrap_or(false) {
         for _ in 0..50 {
@@ -298,6 +306,7 @@ fn start_engine_with(
             }
             sleep(std::time::Duration::from_millis(50));
         }
+        #[cfg(unix)]
         crate::diag::warn!("LaunchAgent kickstart did not bring up engine; starting daemon directly");
     }
     spawn_daemon()?;
@@ -471,7 +480,7 @@ fn has_cpu(head: &[u8], want: u32) -> bool {
 
 #[cfg(target_os = "macos")]
 const USAGE: &str = "usage: kiri update [--check]";
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 const USAGE: &str = "usage: kiri update --check";
 
 pub fn run(args: &[String]) -> io::Result<()> {
@@ -499,6 +508,12 @@ fn run_release(args: &[String], release: &Release, current: &str, out: &mut dyn 
     {
         let _ = args;
         writeln!(out, "download the new .deb or .rpm from https://runkiri.com/releases/ and install it as before")?;
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        let _ = args;
+        writeln!(out, "update from Kiri's window, or download the new installer from https://runkiri.com/releases/")?;
         Ok(())
     }
     #[cfg(target_os = "macos")]
@@ -556,7 +571,7 @@ mod tests {
     fn help_skips_release_lookup() {
         #[cfg(target_os = "macos")]
         assert_eq!(USAGE, "usage: kiri update [--check]");
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", windows))]
         assert_eq!(USAGE, "usage: kiri update --check");
 
         for dev in [false, true] {
@@ -679,6 +694,13 @@ mod tests {
         assert!(text.starts_with(&format!("Kiri 99.0.0 is available (this is {})\n", env!("CARGO_PKG_VERSION"))), "got {text:?}");
         if cfg!(target_os = "linux") {
             assert!(text.contains("download the new .deb or .rpm from https://runkiri.com/releases/ and install it as before\n"), "got {text:?}");
+            let url = serve_feed("200 OK", r#"{"version":"99.0.0","url":"https://runkiri.com/download","sha256":""}"#);
+            let mut bare_out = Vec::new();
+            run_with(&[], &url, env!("CARGO_PKG_VERSION"), &mut bare_out).unwrap();
+            assert_eq!(String::from_utf8(bare_out).unwrap(), text);
+        }
+        if cfg!(windows) {
+            assert!(text.contains("update from Kiri's window, or download the new installer from https://runkiri.com/releases/\n"), "got {text:?}");
             let url = serve_feed("200 OK", r#"{"version":"99.0.0","url":"https://runkiri.com/download","sha256":""}"#);
             let mut bare_out = Vec::new();
             run_with(&[], &url, env!("CARGO_PKG_VERSION"), &mut bare_out).unwrap();
