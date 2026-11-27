@@ -17,10 +17,11 @@
 //! aside as `images.json.corrupt-*` and what can be read from it is kept.
 
 use std::fs::{self, File};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::time::SystemTime;
 
 /// The most an image config may be: real ones are a few KB.
 pub const MAX_CONFIG: u64 = 16 << 20;
@@ -135,9 +136,21 @@ impl Image {
     }
 }
 
+/// Identifies one on-disk version of `images.json`: `(mtime, len, ino)`.
+type IndexStamp = (SystemTime, u64, u64);
+
+fn stamp_of(m: &fs::Metadata) -> IndexStamp {
+    #[cfg(unix)]
+    let ino = std::os::unix::fs::MetadataExt::ino(m);
+    #[cfg(not(unix))]
+    let ino = 0;
+    (m.modified().unwrap_or(SystemTime::UNIX_EPOCH), m.len(), ino)
+}
+
 #[derive(Debug)]
 pub struct Store {
     root: PathBuf,
+    index_cache: Mutex<Option<(Option<IndexStamp>, Arc<Vec<Image>>)>>,
 }
 
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -214,6 +227,12 @@ struct IndexLock {
 /// What `images.json` holds.
 enum Index {
     Valid(Vec<Image>),
+    Corrupt(Vec<u8>, serde_json::Error),
+}
+
+/// [`Index`] paired with the file stamp read from the same file descriptor.
+enum StampedIndex {
+    Valid(Option<IndexStamp>, Vec<Image>),
     Corrupt(Vec<u8>, serde_json::Error),
 }
 
@@ -306,7 +325,10 @@ impl Store {
         if !tmp.is_dir() {
             fs::create_dir_all(tmp)?;
         }
-        Ok(Store { root })
+        Ok(Store {
+            root,
+            index_cache: Mutex::new(None),
+        })
     }
 
     pub fn root(&self) -> &Path {
@@ -355,16 +377,48 @@ impl Store {
         Ok(Ingest { file: File::create(&tmp)?, hasher: Sha256::new(), tmp, root: self.root.clone(), written: 0 })
     }
 
+    /// The image index, shared via `Arc` from an mtime/size/inode-validated
+    /// in-memory cache so repeated reads (`/info`, `/images/json`) avoid
+    /// re-reading and re-parsing `images.json` when unchanged.
+    pub fn images_arc(&self) -> io::Result<Arc<Vec<Image>>> {
+        let path = self.root.join("images.json");
+        let stamp = match fs::metadata(&path) {
+            Ok(m) => Some(stamp_of(&m)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        };
+        if let Some((cached_stamp, cached)) = self.index_cache.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
+            && *cached_stamp == stamp
+        {
+            return Ok(Arc::clone(cached));
+        }
+        match self.read_index_stamped()? {
+            StampedIndex::Valid(read_stamp, images) => {
+                let arc = Arc::new(images);
+                *self.index_cache.lock().unwrap_or_else(|e| e.into_inner()) = Some((read_stamp, Arc::clone(&arc)));
+                Ok(arc)
+            }
+            StampedIndex::Corrupt(..) => {
+                *self.index_cache.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                let _lock = self.lock_index()?;
+                let images = self.read_locked()?;
+                let arc = Arc::new(images);
+                let new_stamp = fs::metadata(&path).ok().map(|m| stamp_of(&m));
+                *self.index_cache.lock().unwrap_or_else(|e| e.into_inner()) = Some((new_stamp, Arc::clone(&arc)));
+                Ok(arc)
+            }
+        }
+    }
+
+    /// Number of images in the index without cloning image entries.
+    pub fn image_count(&self) -> io::Result<usize> {
+        Ok(self.images_arc()?.len())
+    }
+
     /// The image index. One that does not parse is repaired first, see
     /// [`Store::recover`], rather than failing every caller from then on.
     pub fn images(&self) -> io::Result<Vec<Image>> {
-        match self.read_index()? {
-            Index::Valid(images) => Ok(images),
-            Index::Corrupt(..) => {
-                let _lock = self.lock_index()?;
-                self.read_locked()
-            }
-        }
+        Ok((*self.images_arc()?).clone())
     }
 
     /// Reads the image index under the in-process index lock and passes it to
@@ -374,9 +428,26 @@ impl Store {
     /// `f` must not call methods that re-acquire the index lock.
     pub fn with_images<T>(&self, f: impl FnOnce(&[Image]) -> T) -> io::Result<T> {
         let guard = INDEX_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let images = match self.read_index()? {
-            Index::Valid(images) => images,
-            Index::Corrupt(..) => {
+        let path = self.root.join("images.json");
+        let stamp = match fs::metadata(&path) {
+            Ok(m) => Some(stamp_of(&m)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        };
+        if let Some((cached_stamp, cached)) = self.index_cache.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
+            && *cached_stamp == stamp
+        {
+            let arc = Arc::clone(cached);
+            return Ok(f(&arc));
+        }
+        let images = match self.read_index_stamped()? {
+            StampedIndex::Valid(read_stamp, images) => {
+                let arc = Arc::new(images);
+                *self.index_cache.lock().unwrap_or_else(|e| e.into_inner()) = Some((read_stamp, Arc::clone(&arc)));
+                arc
+            }
+            StampedIndex::Corrupt(..) => {
+                *self.index_cache.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 drop(guard);
                 let _lock = self.lock_index()?;
                 let images = self.read_locked()?;
@@ -386,14 +457,26 @@ impl Store {
         Ok(f(&images))
     }
 
+    fn read_index_stamped(&self) -> io::Result<StampedIndex> {
+        let path = self.root.join("images.json");
+        let mut file = match File::open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(StampedIndex::Valid(None, Vec::new())),
+            Err(e) => return Err(e),
+        };
+        let stamp = Some(stamp_of(&file.metadata()?));
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Ok(match serde_json::from_slice(&bytes) {
+            Ok(images) => StampedIndex::Valid(stamp, images),
+            Err(e) => StampedIndex::Corrupt(bytes, e),
+        })
+    }
+
     fn read_index(&self) -> io::Result<Index> {
-        match fs::read(self.root.join("images.json")) {
-            Ok(bytes) => Ok(match serde_json::from_slice(&bytes) {
-                Ok(images) => Index::Valid(images),
-                Err(e) => Index::Corrupt(bytes, e),
-            }),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Index::Valid(Vec::new())),
-            Err(e) => Err(e),
+        match self.read_index_stamped()? {
+            StampedIndex::Valid(_, images) => Ok(Index::Valid(images)),
+            StampedIndex::Corrupt(bytes, e) => Ok(Index::Corrupt(bytes, e)),
         }
     }
 
@@ -489,7 +572,8 @@ impl Store {
 
     pub fn find(&self, name: &str) -> io::Result<Option<Image>> {
         let r = Reference::parse(name).ok();
-        Ok(self.images()?.into_iter().find(|i| i.name == name || i.digest == name || r.as_ref().is_some_and(|r| i.matches(r))))
+        let images = self.images_arc()?;
+        Ok(images.iter().find(|i| i.name == name || i.digest == name || r.as_ref().is_some_and(|r| i.matches(r))).cloned())
     }
 
     /// As [`Store::find`], holding every blob the found image references
@@ -617,8 +701,12 @@ impl Store {
     /// Replaces the index with `images`, see [`crate::jsonfile::replace`].
     /// Callers hold the index lock.
     fn write_index(&self, images: &[Image]) -> io::Result<()> {
+        let path = self.root.join("images.json");
         let bytes = serde_json::to_vec_pretty(images).map_err(io::Error::other)?;
-        crate::jsonfile::replace(&self.root.join("images.json"), &bytes, crate::jsonfile::Durable::Now)
+        crate::jsonfile::replace(&path, &bytes, crate::jsonfile::Durable::Now)?;
+        let stamp = fs::metadata(&path).ok().map(|m| stamp_of(&m));
+        *self.index_cache.lock().unwrap_or_else(|e| e.into_inner()) = stamp.map(|s| (Some(s), Arc::new(images.to_vec())));
+        Ok(())
     }
 }
 
@@ -1386,6 +1474,46 @@ mod tests {
                 assert!(reads > 0);
             });
         });
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn images_arc_caches_unchanged_index_and_invalidates_on_external_write() {
+        let root = std::env::temp_dir().join(format!("kiri-store-cache-{}-{}", std::process::id(), TMP_SEQ.fetch_add(1, Ordering::Relaxed)));
+        let _ = fs::remove_dir_all(&root);
+        let store1 = Store::open(&root).unwrap();
+        let store2 = Store::open(&root).unwrap();
+
+        let empty1 = store1.images_arc().unwrap();
+        let empty2 = store1.images_arc().unwrap();
+        assert_eq!(store1.image_count().unwrap(), 0);
+        assert!(Arc::ptr_eq(&empty1, &empty2));
+
+        let mk = |name: &str| Image {
+            name: name.into(),
+            digest: "sha256:0000000000000000000000000000000000000000000000000000000000000001".into(),
+            index_digest: None,
+            config_digest: "sha256:0000000000000000000000000000000000000000000000000000000000000001".into(),
+            layers: Vec::new(),
+            size: 1024,
+            platform: "linux/arm64".into(),
+            created: "2026-11-27T00:00:00Z".into(),
+            pulled_at: 1,
+            config: RunConfig::default(),
+            mirror: None,
+        };
+        store2.put_image(mk("alpine:3.21")).unwrap();
+        let after_ext = store1.images_arc().unwrap();
+        assert_eq!(after_ext.len(), 1);
+        assert_eq!(store1.image_count().unwrap(), 1);
+        assert!(Arc::ptr_eq(&after_ext, &store1.images_arc().unwrap()));
+
+        store1.put_image(mk("redis:7")).unwrap();
+        let after_local = store1.images_arc().unwrap();
+        assert_eq!(after_local.len(), 2);
+        assert!(!Arc::ptr_eq(&after_ext, &after_local));
+        assert!(Arc::ptr_eq(&after_local, &store1.images_arc().unwrap()));
 
         fs::remove_dir_all(&root).unwrap();
     }

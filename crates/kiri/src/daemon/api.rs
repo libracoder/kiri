@@ -539,7 +539,7 @@ pub(super) fn version() -> Value {
 fn info(engine: &Engine) -> Value {
     let states = engine.each(|c| Some(c.status));
     let running = states.iter().filter(|s| **s == Status::Running).count();
-    let images = engine.store.images().map(|v| v.len()).unwrap_or(0);
+    let images = engine.store.image_count().unwrap_or(0);
     let (mem_total, _) = engine.guest_memory().unwrap_or((0, 0));
     json!({
         "ID": "kiri",
@@ -645,9 +645,10 @@ fn merge_labels(image_cfg: &Value, body_labels: &Value) -> Value {
 
 fn images(req: &Request, engine: &Engine) -> Result<Value, Error> {
     let f = filters(req, &["reference", "dangling", "label", "label!", "before", "since", "until"])?;
-    let mut list = engine.store.images()?;
-    // Newest first, as Docker lists them (#364).
-    list.sort_by_key(|i| std::cmp::Reverse(time::parse_unix(&i.created)));
+    let list = engine.store.images_arc()?;
+    // Newest first, as Docker lists them (#364). Parse each timestamp once and sort indices.
+    let mut order: Vec<(i64, usize)> = list.iter().enumerate().map(|(idx, i)| (time::parse_unix(&i.created), idx)).collect();
+    order.sort_by_key(|&(t, _)| std::cmp::Reverse(t));
     let now = std::time::SystemTime::now();
     let created = |i: &kiri_image::Image| time::docker_timestamp(&i.created, now);
     // Docker's rules (moby daemon/images/image_list.go): `dangling` is a
@@ -674,10 +675,13 @@ fn images(req: &Request, engine: &Engine) -> Result<Value, Error> {
         before = Some(before.map_or(t, |b| b.min(t)));
     }
     let labels = engine.image_labels(&list);
+    let need_ts = before.is_some() || since.is_some();
     Ok(Value::Array(
-        list.iter()
-            .zip(labels)
-            .filter_map(|(i, labels)| {
+        order
+            .into_iter()
+            .filter_map(|(created_unix, idx)| {
+                let i = &list[idx];
+                let labels = &labels[idx];
                 // Kiri keeps an untagged image under its ID.
                 let untagged = i.name.starts_with("sha256:") && !list.iter().any(|o| o.config_digest == i.config_digest && !o.name.starts_with("sha256:"));
                 if i.name.starts_with("sha256:") && !untagged {
@@ -689,12 +693,14 @@ fn images(req: &Request, engine: &Engine) -> Result<Value, Error> {
                 if (untagged && f.values("reference").is_some()) || (!untagged && !f.any("reference", |p| reference_matches(p, &i.name))) {
                     return None;
                 }
-                if !f.labels(&labels) {
+                if !f.labels(labels) {
                     return None;
                 }
-                let t = created(i);
-                if before.is_some_and(|b| !t.is_some_and(|t| t < b)) || since.is_some_and(|s| !t.is_some_and(|t| t > s)) {
-                    return None;
+                if need_ts {
+                    let t = created(i);
+                    if before.is_some_and(|b| !t.is_some_and(|t| t < b)) || since.is_some_and(|s| !t.is_some_and(|t| t > s)) {
+                        return None;
+                    }
                 }
                 // Untagged: no names; before API 1.43 Docker wrote `<none>` ones.
                 let (tags, digests) = match (untagged, req.api_version.is_some_and(|v| v < (1, 43))) {
@@ -707,7 +713,7 @@ fn images(req: &Request, engine: &Engine) -> Result<Value, Error> {
                     "ParentId": "",
                     "RepoTags": tags,
                     "RepoDigests": digests,
-                    "Created": time::parse_unix(&i.created),
+                    "Created": created_unix,
                     "Size": i.size,
                     "SharedSize": -1,
                     "VirtualSize": i.size,
