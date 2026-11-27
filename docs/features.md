@@ -133,7 +133,9 @@ Apple silicon and Intel Macs (macOS 14+), Windows 10 and 11 (x86-64 and Arm, thr
   override it; the disk grows online on boot and never shrinks) and local names
 - **Menu bar**: Kiri stays in the menu bar (or the tray on Windows and Linux)
   when its window closes, with the VM's state, running containers (click one
-  to open it) and Start/Stop; Settings → Appearance → Closing the window can
+  to open it) and Start/Stop (`kiri engine start | stop | restart | status [--json]`
+  controls and inspects the engine from the terminal without waking a sleeping VM);
+  Settings → Appearance → Closing the window can
   either keep the window hidden or free its page's memory until opened again
 - **Kubernetes**: `kiri k8s start` — a single-node k3s cluster in one
   container, ready in ~20 s, as the `kiri` kubectl context

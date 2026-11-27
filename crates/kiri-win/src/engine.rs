@@ -200,6 +200,16 @@ pub(crate) fn on_external_wake() {
     send(Cmd::Refresh);
 }
 
+/// Called after an external `POST /kiri/stop` (`kiri engine stop`) stops the
+/// WSL daemon through the named pipe: marks `kiri-win` stopped immediately so
+/// subsequent pipe/status checks see the stopped gate without a race, then
+/// tells the engine thread to tear down bridges/relays, terminate Kiri's
+/// dedicated WSL distro, and update the window and tray (#983).
+pub(crate) fn on_external_stop() {
+    crate::serve::set_stopped(true);
+    send(Cmd::Stop);
+}
+
 fn engine(rx: &Receiver<Cmd>, tx: Sender<Cmd>) {
     watch(tx);
     // Windows' proxy and root certificates for the daemon, now and every

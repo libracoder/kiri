@@ -328,6 +328,8 @@ struct Prepared {
     init: bool,
     /// `--cgroupns host`: no cgroup namespace of its own.
     cgroupns_host: bool,
+    /// Timer slack in nanoseconds for the container's PID 1 (`timerslack_ns`).
+    timer_slack_ns: Option<u64>,
     /// Ulimits, groups and device nodes from the `opts` lines.
     host: HostApplied,
     /// The child's end of the pipe that says its root is in place (mounts
@@ -618,6 +620,7 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
     }
     let (masked, readonly) = (host.masked.take(), host.readonly.take());
     prepared.cgroupns_host = host.cgroupns_host;
+    prepared.timer_slack_ns = host.timer_slack_ns;
     prepared.host = HostApplied { rlimits: host.rlimits.clone(), groups: host.groups.clone(), nodes, masked, readonly };
     // Small, short-lived files: kept in memory (/run is tmpfs), not on the data disk.
     let etc_dir = PathBuf::from("/run/kiri").join(spec.id);
@@ -1525,6 +1528,7 @@ fn prepare(argv: StrList<'_>, env: StrList<'_>, cwd: &str, user: &str, hostname:
         shm_size: 64 << 20,
         init: flags & run_flags::INIT != 0,
         cgroupns_host: false,
+        timer_slack_ns: None,
         host: HostApplied::default(),
         root_ready: None,
         cgroup_ready: None,
@@ -2541,6 +2545,7 @@ fn child_fds(p: &Prepared, io: &ChildStdio) -> Vec<RawFd> {
         shm_size: _,
         init: _,
         cgroupns_host: _,
+        timer_slack_ns: _,
         // Paths, numbers and names only.
         host: HostApplied { rlimits: _, groups: _, nodes: _, masked: _, readonly: _ },
         root_ready,
@@ -2779,6 +2784,11 @@ fn finish_child(p: &Prepared, io: &ChildStdio, console: bool) -> ! {
     // While still root with every capability: raising a hard limit needs
     // CAP_SYS_RESOURCE.
     apply_rlimits(&p.host.rlimits).unwrap_or_else(|e| fail("ulimits", e));
+    if console
+        && let Some(ns) = p.timer_slack_ns
+    {
+        apply_timer_slack(ns);
+    }
 
     for cap in 0..=LAST_CAP {
         if !p.privileged && p.caps & (1 << cap) == 0 {
@@ -2879,6 +2889,22 @@ fn finish_child(p: &Prepared, io: &ChildStdio, console: bool) -> ! {
     // SAFETY: NULL-terminated arrays of valid C strings that outlive the call.
     unsafe { libc::execve(exe.as_ptr(), argv.as_ptr(), envp.as_ptr()) };
     sys::exec_fail(2, &exe, io::Error::last_os_error(), false)
+}
+
+/// Applies timer slack (`ns`) to the container's PID 1 before `execve`.
+/// Writing `/proc/self/timerslack_ns` updates both `timer_slack_ns` and
+/// `default_timer_slack_ns` in Linux (`fs/proc/base.c`), so the slack survives
+/// `execve` into `/bin/k3s` and coalesces staggered sub-100 ms tickers (#989).
+fn apply_timer_slack(ns: u64) {
+    let _ = apply_timer_slack_to(Path::new("/proc/self/timerslack_ns"), ns);
+    // SAFETY: `PR_SET_TIMERSLACK` takes the slack in nanoseconds as `arg2`.
+    unsafe {
+        libc::prctl(libc::PR_SET_TIMERSLACK, ns as libc::c_ulong, 0, 0, 0);
+    }
+}
+
+fn apply_timer_slack_to(path: &Path, ns: u64) -> io::Result<()> {
+    fs::write(path, ns.to_string())
 }
 
 /// How the container's root is remounted once it is `/`, if at all:
@@ -4747,14 +4773,22 @@ mod tests {
     fn hostopts_cgroupns_host_is_parsed_cleanly() {
         let mut buf = Vec::new();
         let net = Net { bridge: "", ip: [0; 4], prefix: 0, gateway: [0; 4], extra_hosts: &[], dns_names: &[], opts: &[] };
-        encode_run(&mut buf, "c1", &[], &["sh"], &[], "/", "", "c1", 0, net, &[], &Limits::default(), 0, &["cgroupns\thost"], &[]);
+        encode_run(&mut buf, "c1", &[], &["sh"], &[], "/", "", "c1", 0, net, &[], &Limits::default(), 0, &["cgroupns\thost", "timerslack\t10000000"], &[]);
         let Ok(Msg::Run(spec)) = decode(&buf) else { panic!() };
         let parsed = super::super::hostopts::parse(spec.opts).unwrap();
         assert!(parsed.cgroupns_host);
+        assert_eq!(parsed.timer_slack_ns, Some(10_000_000));
         let mut prepared = super::prepare(spec.argv, spec.env, spec.cwd, spec.user, Some(spec.hostname), spec.flags, spec.caps).unwrap();
         assert!(!prepared.cgroupns_host);
+        assert_eq!(prepared.timer_slack_ns, None);
         prepared.cgroupns_host = parsed.cgroupns_host;
+        prepared.timer_slack_ns = parsed.timer_slack_ns;
         assert!(prepared.cgroupns_host);
+        assert_eq!(prepared.timer_slack_ns, Some(10_000_000));
+        let tmp = std::env::temp_dir().join(format!("kiri-timerslack-{}", std::process::id()));
+        super::apply_timer_slack_to(&tmp, 10_000_000).unwrap();
+        assert_eq!(std::fs::read_to_string(&tmp).unwrap(), "10000000");
+        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]

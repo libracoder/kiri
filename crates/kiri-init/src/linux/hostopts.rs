@@ -69,6 +69,9 @@ pub struct HostOpts {
     /// `--cgroupns host`: share the agent's cgroup namespace instead of
     /// unsharing one rooted at the container's cgroup.
     pub cgroupns_host: bool,
+    /// Timer slack (`timerslack_ns`, in nanoseconds) applied to the container's
+    /// init process so high-frequency background pollers coalesce cleanly (#989).
+    pub timer_slack_ns: Option<u64>,
 }
 
 fn bad(line: &str) -> io::Error {
@@ -131,6 +134,13 @@ pub fn parse(list: StrList<'_>) -> io::Result<HostOpts> {
                 *(if *kind == "masked" { &mut o.masked } else { &mut o.readonly }) = Some(paths);
             }
             ["cgroupns", "host"] => o.cgroupns_host = true,
+            ["timerslack", ns] => {
+                let ns: u64 = ns.parse().map_err(|_| bad(line))?;
+                if ns == 0 || ns > 1_000_000_000 {
+                    return Err(bad(line));
+                }
+                o.timer_slack_ns = Some(ns);
+            }
             _ => return Err(bad(line)),
         }
     }
@@ -466,6 +476,10 @@ mod tests {
         assert_eq!(o.masked, Some(vec![]));
         assert_eq!(o.readonly, Some(vec![c"/proc/sys".to_owned(), c"/data".to_owned()]));
         assert!(o.cgroupns_host);
+        assert_eq!(o.timer_slack_ns, None);
+        let buf = list(&["timerslack\t10000000"]);
+        let kiri_proto::Msg::Retain(l) = kiri_proto::decode(&buf).unwrap() else { panic!() };
+        assert_eq!(parse(l).unwrap().timer_slack_ns, Some(10_000_000));
         for bad_path in ["masked\tproc/kcore", "masked\t/../etc", "readonly\t/proc/../etc"] {
             let buf = list(&[bad_path]);
             let kiri_proto::Msg::Retain(l) = kiri_proto::decode(&buf).unwrap() else { panic!() };
@@ -480,6 +494,10 @@ mod tests {
             "cgroupns",
             "cgroupns\tprivate",
             "cgroupns\tbogus",
+            "timerslack",
+            "timerslack\t0",
+            "timerslack\t1000000001",
+            "timerslack\tnope",
             "nope",
         ] {
             let buf = list(&[bad]);

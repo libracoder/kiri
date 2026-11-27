@@ -1816,6 +1816,15 @@ fn serve_shared(hub: &Hub, pipe: Arc<Pipe>) {
                 prefetched = Some(first);
                 woke = true;
             }
+            crate::refuse::GateDecision::AlreadyStopped => {
+                if pipe.write(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").is_ok() {
+                    pipe.flush();
+                    if !pipe.is_aborted() && pipe.write(&[]).is_ok() {
+                        linger(pipe);
+                    }
+                }
+                return;
+            }
             crate::refuse::GateDecision::Refuse => {
                 if refuse(pipe, is_head(&first), crate::refuse::STOPPED) {
                     linger(pipe);
@@ -1981,6 +1990,7 @@ fn serve_shared(hub: &Hub, pipe: Arc<Pipe>) {
     let writer = thread::spawn(move || to_client(&p, &rx, &queued, &b, w.as_deref().map(|w| (id, w)), &r, &po));
     let mut buf = vec![0u8; 64 * 1024];
     let mut first_chunk = true;
+    let mut stopped_req = false;
     let end = loop {
         let from_prefetch = prefetched.take();
         let chunk: &[u8] = match from_prefetch.as_deref() {
@@ -1995,6 +2005,9 @@ fn serve_shared(hub: &Hub, pipe: Arc<Pipe>) {
         let n = chunk.len();
         if first_chunk {
             first_chunk = false;
+            if crate::refuse::is_stop_request(chunk) {
+                stopped_req = true;
+            }
             if crate::ports::is_port_affecting_request(chunk) {
                 port_op.store(true, Ordering::SeqCst);
                 crate::ports::before_container_op();
@@ -2032,6 +2045,8 @@ fn serve_shared(hub: &Hub, pipe: Arc<Pipe>) {
     let replies_ended = writer.join().unwrap_or(false);
     if woke && HUB.get().is_some() {
         crate::engine::on_external_wake();
+    } else if stopped_req && HUB.get().is_some() {
+        crate::engine::on_external_stop();
     }
     if port_op.load(Ordering::Relaxed) {
         crate::ports::notify();

@@ -372,3 +372,7 @@ crates/kiri-init/src/linux/net.rs	#443	a second Kiri engine starting in a shared
 machine-prune-keeps	#975	docker container prune and docker system prune deleted a stopped kiri machine and everything in its writable layer
 crates/kiri/src/daemon/vmlink.rs	#948	VmLink::call waited without a timeout and Writer::write blocked indefinitely holding the writer mutex when the guest wedged, deadlocking hundreds of kiri-api threads
 crates/kiri-init/src/linux/container.rs	#948	finish_stdio called recv_fd with no timeout on single-threaded kiri-init and exec did not reap a killed child when TTY setup failed
+crates/kiri/src/daemon/engine.rs	#989	kiri-k8s caused mac_bind_sources to watch all of /Users and /Volumes via FSEvents, spawned kubectl every 3s for LoadBalancer polling, and lacked timer coalescing for k3s's 100ms watch_progress tickers
+crates/kiri-init/src/linux/hostopts.rs	#989	kiri-init hostopts lacked timerslack_ns support to coalesce k3s background pollers across execve
+crates/kiri/src/engine_cli.rs	#983	kiri CLI had no `kiri engine start | stop | restart | status [--json]` commands to stop, restart, or inspect the engine without waking a sleeping VM
+crates/kiri-win/src/refuse.rs	#983	Windows pipe gate did not handle `POST /kiri/stop` idempotently while stopped or synchronize `kiri-win` on external CLI stops

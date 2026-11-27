@@ -2326,8 +2326,9 @@ impl Engine {
     /// `kiri k8s`: every LoadBalancer service gets its port on the Mac's
     /// localhost, as OrbStack and Docker Desktop do. k3s's service load
     /// balancer already serves the port on the node, so a forward to the
-    /// node container is all it takes. Checked every few seconds while the
-    /// cluster runs; forwards go when services or the cluster do.
+    /// node container is all it takes. Reconciled once on cluster start and
+    /// then driven by a single `kubectl get svc -A --watch-only` stream so an
+    /// idle cluster never spawns periodic `/bin/k3s` processes (#989).
     fn start_k8s_lb(self: &Arc<Self>) {
         let me = Arc::downgrade(self);
         // `kiri k8s set --lan on` puts them on every interface; a change rebinds them.
@@ -2335,54 +2336,116 @@ impl Engine {
         let _ = std::thread::Builder::new().name("kiri-k8s-lb".into()).spawn(move || loop {
             std::thread::sleep(Duration::from_secs(3));
             let Some(engine) = me.upgrade() else { return };
-            let node = engine.lock().containers.values().find(|c| c.status == Status::Running && c.spec.labels.get("dev.kiri.k8s").is_some()).map(|c| (c.id.clone(), c.ip));
+            let node = engine.lock().containers.values().find(|c| c.status == Status::Running && is_k8s_node(&c.spec)).map(|c| (c.id.clone(), c.ip));
             let Some((id, Some(ip))) = node else {
-                engine.k8s_lb.lock().unwrap_or_else(|e| e.into_inner()).clear();
-                engine.k8s_fwd.lock().unwrap_or_else(|e| e.into_inner()).clear();
-                if let Some((_, via)) = engine.k8s_routes.lock().unwrap_or_else(|e| e.into_inner()).take()
-                    && let Some(vm) = engine.awake()
-                {
-                    for (net, bits) in K8S_RANGES {
-                        let _ = vm.route(net, bits, via, false);
-                    }
-                }
+                engine.clear_k8s_lb();
                 continue;
             };
-            engine.route_k8s(ip);
-            let query = r#"jsonpath={range .items[?(@.spec.type=="LoadBalancer")]}{range .spec.ports[*]}{.port}/{.protocol} {end}{end}"#;
-            let Ok((0, out)) = engine.exec_capture(&id, &["timeout", "-s", "KILL", "20", "kubectl", "get", "svc", "-A", "-o", query]) else { continue };
-            let wanted: Vec<(u16, String)> = out
-                .split_whitespace()
-                .filter_map(|p| {
-                    let (port, proto) = p.split_once('/')?;
-                    Some((port.parse().ok()?, proto.to_ascii_lowercase()))
-                })
-                .collect();
-            let Some(vm) = engine.awake() else { continue };
-            let host_ip = if crate::k8s::config().lan { "0.0.0.0" } else { "127.0.0.1" };
-            let mut lb = engine.k8s_lb.lock().unwrap_or_else(|e| e.into_inner());
-            if vm.is_disconnected() {
+            if !engine.reconcile_k8s_lb(&id, ip, &mut bound_on) {
                 continue;
             }
-            if bound_on != host_ip {
-                lb.clear();
-                bound_on = host_ip.to_owned();
-            }
-            lb.retain(|k, _| wanted.contains(k));
-            for (port, proto) in wanted {
-                if lb.contains_key(&(port, proto.clone())) {
-                    continue;
-                }
-                let b = super::ports::Binding { container_port: port, proto: proto.clone(), host_ip: host_ip.into(), host_port: port };
-                match super::ports::start(vm.clone(), &format!("lb-{port}-{proto}"), &[b], ip) {
-                    Ok(fw) => {
-                        crate::diag::info!("Kubernetes service published", at = format!("{host_ip}:{port}/{proto}"));
-                        lb.insert((port, proto), fw);
+            let watch_cfg = ExecConfig {
+                console_size: None,
+                argv: ["kubectl", "get", "svc", "-A", "--watch-only", "--no-headers"].map(String::from).to_vec(),
+                env: Vec::new(),
+                cwd: "/".into(),
+                user: String::new(),
+                tty: false,
+                stdin: false,
+                privileged: false,
+                internal: true,
+            };
+            let Ok(watch_id) = engine.exec_create(&id, watch_cfg) else { continue };
+            let Ok((_, rx)) = engine.exec_start(&watch_id) else {
+                engine.lock().execs.remove(&watch_id);
+                continue;
+            };
+            loop {
+                match rx.recv_timeout(Duration::from_secs(5)) {
+                    Ok(_) => {
+                        // Coalesce bursts of service updates into a single reconciliation.
+                        while rx.recv_timeout(Duration::from_millis(150)).is_ok() {}
+                        let Some(engine) = me.upgrade() else { return };
+                        let still_up = engine.lock().containers.get(&id).is_some_and(|c| c.status == Status::Running && c.ip == Some(ip));
+                        if !still_up {
+                            engine.clear_k8s_lb();
+                            break;
+                        }
+                        let _ = engine.reconcile_k8s_lb(&id, ip, &mut bound_on);
                     }
-                    Err(e) => crate::diag::warn!("Kubernetes service port not published", port = format!("{port}/{proto}"), error = e),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        let Some(engine) = me.upgrade() else { return };
+                        let still_up = engine.lock().containers.get(&id).is_some_and(|c| c.status == Status::Running && c.ip == Some(ip));
+                        if !still_up {
+                            engine.clear_k8s_lb();
+                            break;
+                        }
+                        let want_ip = if crate::k8s::config().lan { "0.0.0.0" } else { "127.0.0.1" };
+                        if bound_on != want_ip {
+                            let _ = engine.reconcile_k8s_lb(&id, ip, &mut bound_on);
+                        }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                 }
+            }
+            if let Some(engine) = me.upgrade() {
+                engine.lock().execs.remove(&watch_id);
+            } else {
+                return;
             }
         });
+    }
+
+    fn clear_k8s_lb(&self) {
+        self.k8s_lb.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.k8s_fwd.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        if let Some((_, via)) = self.k8s_routes.lock().unwrap_or_else(|e| e.into_inner()).take()
+            && let Some(vm) = self.awake()
+        {
+            for (net, bits) in K8S_RANGES {
+                let _ = vm.route(net, bits, via, false);
+            }
+        }
+    }
+
+    fn reconcile_k8s_lb(&self, id: &str, ip: [u8; 4], bound_on: &mut String) -> bool {
+        self.route_k8s(ip);
+        let query = r#"jsonpath={range .items[?(@.spec.type=="LoadBalancer")]}{range .spec.ports[*]}{.port}/{.protocol} {end}{end}"#;
+        let Ok((0, out)) = self.exec_capture(id, &["timeout", "-s", "KILL", "20", "kubectl", "get", "svc", "-A", "-o", query]) else {
+            return false;
+        };
+        let wanted: Vec<(u16, String)> = out
+            .split_whitespace()
+            .filter_map(|p| {
+                let (port, proto) = p.split_once('/')?;
+                Some((port.parse().ok()?, proto.to_ascii_lowercase()))
+            })
+            .collect();
+        let Some(vm) = self.awake() else { return false };
+        let host_ip = if crate::k8s::config().lan { "0.0.0.0" } else { "127.0.0.1" };
+        let mut lb = self.k8s_lb.lock().unwrap_or_else(|e| e.into_inner());
+        if vm.is_disconnected() {
+            return false;
+        }
+        if bound_on != host_ip {
+            lb.clear();
+            *bound_on = host_ip.to_owned();
+        }
+        lb.retain(|k, _| wanted.contains(k));
+        for (port, proto) in wanted {
+            if lb.contains_key(&(port, proto.clone())) {
+                continue;
+            }
+            let b = super::ports::Binding { container_port: port, proto: proto.clone(), host_ip: host_ip.into(), host_port: port };
+            match super::ports::start(vm.clone(), &format!("lb-{port}-{proto}"), &[b], ip) {
+                Ok(fw) => {
+                    crate::diag::info!("Kubernetes service published", at = format!("{host_ip}:{port}/{proto}"));
+                    lb.insert((port, proto), fw);
+                }
+                Err(e) => crate::diag::warn!("Kubernetes service port not published", port = format!("{port}/{proto}"), error = e),
+            }
+        }
+        true
     }
 
     /// Routes the cluster's pod and service ranges to the node, so the
@@ -2740,14 +2803,17 @@ impl Engine {
     }
 
     /// The Mac folders and files that running containers bind-mount, as
-    /// the Mac keeps them (the guest sees them under /mnt/mac).
+    /// the Mac keeps them (the guest sees them under /mnt/mac). Excludes the
+    /// `kiri-k8s` node container (`dev.kiri.k8s`), which mounts `/Users` and
+    /// `/Volumes` whole for pod `hostPath` access and would otherwise attach a
+    /// 50 ms `FSEvents` stream across the entire Mac filesystem (#989).
     #[cfg(target_os = "macos")]
     pub fn mac_bind_sources(&self) -> Vec<String> {
         let mut out: Vec<String> = self
             .lock()
             .containers
             .values()
-            .filter(|c| c.status == Status::Running)
+            .filter(|c| watches_host_binds(c))
             .flat_map(|c| c.spec.mounts.iter())
             .filter_map(|m| m.split('\t').next()?.strip_prefix("/mnt/mac").filter(|p| p.starts_with('/')).map(str::to_owned))
             .collect();
@@ -2780,13 +2846,14 @@ impl Engine {
     }
 
     /// The WSL drive bind sources (`/mnt/<drive>` or `/mnt/<drive>/...`) of
-    /// running containers, under `automount_root` (e.g. `/mnt/`).
+    /// running containers, under `automount_root` (e.g. `/mnt/`). Excludes the
+    /// `kiri-k8s` node container (`dev.kiri.k8s`), which mounts `/mnt` whole.
     pub fn wsl_bind_sources(&self, automount_root: &str) -> Vec<String> {
         let mut out: Vec<String> = self
             .lock()
             .containers
             .values()
-            .filter(|c| c.status == Status::Running)
+            .filter(|c| watches_host_binds(c))
             .flat_map(|c| c.spec.mounts.iter())
             .filter_map(|m| {
                 let src = m.split('\t').next()?;
@@ -4299,13 +4366,16 @@ impl Engine {
         // Joining a host-network container is the host's namespace too: its
         // net.* sysctls would change the whole VM (or Linux host).
         let joined_host = joined_mode.is_some_and(|m| self.lock_networks().find(&m).is_some_and(|n| n.driver == "host"));
-        let host_opts = match spec.guest_opts(flags & run_flags::NET_HOST != 0 || joined_host) {
+        let mut host_opts = match spec.guest_opts(flags & run_flags::NET_HOST != 0 || joined_host) {
             Ok(o) => o,
             Err(e) => {
                 self.fail_start(&id, &spec, &e);
                 return Err(e);
             }
         };
+        if let Some(opt) = k8s_timer_slack_opt(&spec) {
+            host_opts.push(opt);
+        }
         if let Err(e) = self.restore_layers(&vm, &layers) {
             self.fail_start(&id, &spec, &e);
             return Err(e);
@@ -10715,6 +10785,106 @@ mod exit_forwards_tests {
         assert!(!super::is_missing_unpacked_layer_error("run c1: mount /payload: No space left on device"));
         assert!(!super::is_missing_unpacked_layer_error("the VM stopped"));
     }
+
+    /// Regression test for #989: `kiri-k8s` (`dev.kiri.k8s`) bind-mounts `/Users`
+    /// and `/Volumes` on macOS (and `/mnt` on Linux/WSL) for pod `hostPath`
+    /// access, which must NOT cause `mac_bind_sources` or `wsl_bind_sources` to
+    /// watch the entire host filesystem, while ordinary containers keep theirs;
+    /// and `k8s_timer_slack_opt` sets 10 ms timer coalescing only for `kiri-k8s`.
+    #[test]
+    fn k8s_node_skips_host_bind_watchers_and_gets_timer_slack() {
+        let (engine, app_id, dir) = engine_running("k8s-bind-watch");
+        {
+            let mut st = engine.lock();
+            let app = st.containers.get_mut(&app_id).unwrap();
+            app.spec.mounts = vec![
+                "/mnt/mac/Users/alice/app\t/app\t".into(),
+                "/mnt/c/Users/alice/app\t/win\t".into(),
+            ];
+            assert_eq!(super::k8s_timer_slack_opt(&app.spec), None);
+
+            let mut k8s = Container {
+                lifecycle: Arc::new(Mutex::new(0)),
+                names_sync: Arc::default(),
+                start_gate: Arc::default(),
+                id: "k8s00000000000000000000000000000".into(),
+                name: "kiri-k8s".into(),
+                layers: Vec::new(),
+                spec: app.spec.clone(),
+                created: SystemTime::now(),
+                status: Status::Running,
+                started: Some(SystemTime::now()),
+                finished: None,
+                exit_code: 0,
+                oom_killed: false,
+                vm_stopped: false,
+                stopped_by_user: false,
+                restart_count: 0,
+                restart_pending: false,
+                exits: 0,
+                size: None,
+                ip: None,
+                pid: 42,
+                forwards: None,
+                paused: false,
+                extra_ips: Vec::new(),
+                first_if: None,
+                extra_ifs: Vec::new(),
+                ip6: None,
+                extra_ip6s: Vec::new(),
+                live: true,
+                early_input: Vec::new(),
+                early_close: false,
+                start_owed: false,
+                log: Arc::new(Mutex::new(super::super::logfile::Log::new(
+                    super::super::logfile::dir(engine.store.root(), "k8s00000000000000000000000000000"),
+                    &app.spec.log_config,
+                ))),
+                attached: Vec::new(),
+            };
+            k8s.spec.labels = serde_json::json!({"dev.kiri.k8s": "1"});
+            k8s.spec.mounts = vec![
+                "/mnt/mac/Users\t/Users\t".into(),
+                "/mnt/mac/Volumes\t/Volumes\t".into(),
+                "/mnt/c\t/mnt/c\t".into(),
+            ];
+            assert_eq!(
+                super::k8s_timer_slack_opt(&k8s.spec).as_deref(),
+                Some("timerslack\t10000000")
+            );
+            st.containers.insert(k8s.id.clone(), k8s);
+        }
+
+        #[cfg(target_os = "macos")]
+        assert_eq!(engine.mac_bind_sources(), vec!["/Users/alice/app".to_owned()]);
+        assert_eq!(engine.wsl_bind_sources("/mnt/"), vec!["/mnt/c/Users/alice/app".to_owned()]);
+
+        // When only `kiri-k8s` runs, no host bind watcher roots remain at all.
+        engine.lock().containers.get_mut(&app_id).unwrap().status = Status::Exited;
+        #[cfg(target_os = "macos")]
+        assert!(engine.mac_bind_sources().is_empty());
+        assert!(engine.wsl_bind_sources("/mnt/").is_empty());
+
+        drop(engine);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+/// 10 ms timer slack applied to `kiri-k8s` (`dev.kiri.k8s`) so `k3s`'s dozens of
+/// staggered 100 ms `watch_progress` / `kine` / `cAdvisor` timers coalesce
+/// cleanly instead of waking virtual CPUs thousands of times per second (#989).
+const K8S_TIMER_SLACK_NS: u64 = 10_000_000;
+
+fn is_k8s_node(spec: &Spec) -> bool {
+    spec.labels.get("dev.kiri.k8s").is_some()
+}
+
+fn watches_host_binds(c: &Container) -> bool {
+    c.status == Status::Running && !is_k8s_node(&c.spec)
+}
+
+fn k8s_timer_slack_opt(spec: &Spec) -> Option<String> {
+    is_k8s_node(spec).then(|| format!("timerslack\t{K8S_TIMER_SLACK_NS}"))
 }
 
 /// Whether a guest `Run` error reports that an image layer was missing under

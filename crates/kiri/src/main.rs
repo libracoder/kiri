@@ -55,6 +55,9 @@ mod dockerctx;
 // `kiri doctor`: whether this installation works (Windows: docker here, the engine in WSL).
 #[cfg(any(unix, windows))]
 mod doctor;
+// `kiri engine`: start, stop, restart and inspect Kiri's engine (#983).
+#[cfg(any(unix, windows))]
+mod engine_cli;
 // `kiri domains`: the container-domain routers' ports (Windows: in WSL).
 #[cfg(unix)]
 mod domains_cli;
@@ -113,6 +116,7 @@ const USAGE_LINES: &[&str] = &[
     "usage: kiri COMMAND          docker's commands, on Kiri: kiri run, ps, exec,",
     "                             logs, stop, rm, images, pull, build, compose…",
     "       kiri start                 start Kiri after a Stop (the window's Start)",
+    "       kiri engine start | stop | restart | status [--json]   start, stop, restart or inspect Kiri's engine",
     #[cfg(unix)]
     "       kiri daemon",
     #[cfg(target_os = "linux")]
@@ -231,6 +235,8 @@ enum Command<'a> {
     Share(&'a [String]),
     Start(&'a [String]),
     #[cfg(any(unix, windows))]
+    Engine(&'a [String]),
+    #[cfg(any(unix, windows))]
     BuildWith(&'a [String]),
     #[cfg(unix)]
     Domains(&'a [String]),
@@ -302,6 +308,8 @@ impl<'a> Command<'a> {
             // On Windows, by the `kiri` in WSL, once kiri-start has the daemon up.
             #[cfg(windows)]
             Some("start") if args[1..].iter().all(|a| matches!(a.as_str(), "-h" | "--help")) => Some(Command::Start(args)),
+            #[cfg(any(unix, windows))]
+            Some("engine") => Some(Command::Engine(&args[1..])),
             #[cfg(any(unix, windows))]
             Some("build-with") => Some(Command::BuildWith(&args[1..])),
             #[cfg(unix)]
@@ -450,11 +458,13 @@ fn main() -> ExitCode {
                 println!("{START_USAGE}");
                 Ok(())
             } else {
-                engine_start()
+                engine_cli::start_legacy()
             }
         }
         #[cfg(windows)]
         Some(Command::Start(all)) => wsl::run(all),
+        #[cfg(any(unix, windows))]
+        Some(Command::Engine(rest)) => engine_cli::run(rest),
         #[cfg(any(unix, windows))]
         Some(Command::BuildWith(rest)) => buildwith::cli(rest),
         #[cfg(unix)]
@@ -552,40 +562,6 @@ fn window(args: &[String]) -> std::io::Result<()> {
     Err(std::process::Command::new(WINDOW).args(args).exec())
 }
 
-#[cfg(unix)]
-fn engine_start_not_running_message() -> &'static str {
-    #[cfg(target_os = "macos")]
-    {
-        "Kiri's engine isn't running. Open Kiri, or start it with `kiri daemon`"
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        client::not_running_message()
-    }
-}
-
-/// `kiri start`: Kiri on again after a Stop (the window's, the tray's or
-/// the menu bar's), as the window's Start does; the containers Stop held
-/// come back. On an engine that wasn't stopped it only wakes the VM.
-#[cfg(unix)]
-fn engine_start() -> std::io::Result<()> {
-    #[cfg(target_os = "macos")]
-    if !client::alive() {
-        if let Ok(d) = daemon::state_dir() {
-            let _ = std::fs::remove_file(d.join("stopped"));
-        }
-        update::start_engine()?;
-    }
-    client::check_alive_with(engine_start_not_running_message())?;
-    let r = client::request("POST", "/kiri/wake", None)?;
-    // 404: a Linux host's engine, which has no VM to wake and no Stop.
-    if !r.ok() && r.status != 404 {
-        return Err(std::io::Error::other(r.error()));
-    }
-    println!("Kiri is started");
-    Ok(())
-}
-
 #[cfg(not(unix))]
 fn engine_version_check() {}
 
@@ -633,7 +609,7 @@ mod tests {
     fn usage_lists_only_commands_for_this_os() {
         let help = usage();
         let cmds = advertised_subcommands(&help);
-        for common in ["COMMAND", "start", "doctor", "domains", "storage", "registry", "scan", "diag", "PORT", "share", "k8s", "usb", "machine"] {
+        for common in ["COMMAND", "start", "engine", "doctor", "domains", "storage", "registry", "scan", "diag", "PORT", "share", "k8s", "usb", "machine"] {
             assert!(cmds.contains(&common), "help missing `{common}`:\n{help}");
         }
         assert!(help.contains("kiri storage [status | reclaim]"), "help missing `kiri storage`:\n{help}");
@@ -740,6 +716,8 @@ mod tests {
         // `kiri start --help` / `-h` dispatches to Kiri's Start, while `kiri start web --help` stays Docker's.
         assert!(matches!(Command::parse(&["start".to_owned(), "--help".to_owned()]), Some(Command::Start(_))));
         assert!(matches!(Command::parse(&["start".to_owned(), "-h".to_owned()]), Some(Command::Start(_))));
+        assert!(matches!(Command::parse(&["engine".to_owned(), "status".to_owned()]), Some(Command::Engine(_))));
+        assert!(matches!(Command::parse(&["engine".to_owned(), "--help".to_owned()]), Some(Command::Engine(_))));
         assert!(matches!(Command::parse(&["start".to_owned(), "web".to_owned(), "--help".to_owned()]), Some(Command::Docker(_))));
         assert!(matches!(Command::parse(&["run".to_owned(), "alpine".to_owned(), "--help".to_owned()]), Some(Command::Docker(_))));
         assert!(matches!(Command::parse(&["ps".to_owned(), "--help".to_owned()]), Some(Command::Docker(_))));

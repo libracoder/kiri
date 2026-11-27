@@ -13,6 +13,18 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #983 CLI: add `kiri engine start | stop | restart | status [--json]` across macOS, Linux, and Windows (unreleased)
+- Fixes: #983 Add CLI commands to start, stop and inspect the Kiri engine
+- Caused: none known
+- Caused by: -
+- Check: `crates/kiri/src/engine_cli.rs`, `crates/kiri-win/src/refuse.rs`
+
+### #989 macOS & Kubernetes: stop watching `/Users` and `/Volumes` on `kiri-k8s`, coalesce `k3s` timers with `10 ms` `timerslack_ns`, and watch LoadBalancer services instead of polling `kubectl` every 3 s (unreleased)
+- Fixes: #989 macOS: idle VM burns a full host core while the Kubernetes cluster is running
+- Caused: none known
+- Caused by: -
+- Check: `crates/kiri/src/daemon/engine.rs`, `crates/kiri-init/src/linux/hostopts.rs`, `crates/kiri-init/src/linux/container.rs`
+
 ### Start: evict stale `VmLink::layers` entries and re-send layers when `run` reports `"is not unpacked"` (unreleased)
 - Fixes: `start-restores-layer` (`docker start` failed with `layer sha256:… is not unpacked` when an unpacked layer directory disappeared on the guest's disk without a VM restart)
 - Caused: none known

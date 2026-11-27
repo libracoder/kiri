@@ -194,17 +194,33 @@ pub(crate) fn clear_stopped_marker_at(path: &Path) {
     let _ = std::fs::remove_file(path);
 }
 
-fn clear_stopped_marker() {
+pub(crate) fn write_stopped_marker_at(path: &Path) {
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, b"");
+}
+
+pub(crate) fn clear_stopped_marker() {
     if let Some(dir) = std::env::var_os("LOCALAPPDATA") {
         clear_stopped_marker_at(&stopped_marker_in(&PathBuf::from(dir)));
     }
 }
 
-/// Sends `POST /kiri/wake` over an open pipe/stream so a running `kiri-win.exe`
-/// clears its in-memory `STOPPED` gate, removes `%LOCALAPPDATA%\Kiri\stopped`,
-/// boots WSL, and updates the window/tray immediately.
-pub(crate) fn wake_over_stream(mut stream: impl Read + Write) -> io::Result<()> {
-    stream.write_all(b"POST /kiri/wake HTTP/1.1\r\nHost: kiri\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")?;
+pub(crate) fn write_stopped_marker() {
+    if let Some(dir) = std::env::var_os("LOCALAPPDATA") {
+        write_stopped_marker_at(&stopped_marker_in(&PathBuf::from(dir)));
+    }
+}
+
+/// Sends a control `POST` (`POST /kiri/wake` or `POST /kiri/stop`) over an open
+/// pipe/stream so a running `kiri-win.exe` updates its stopped gate, marker,
+/// WSL distro, and window/tray immediately.
+pub(crate) fn post_over_stream(mut stream: impl Read + Write, endpoint: &str) -> io::Result<()> {
+    write!(
+        stream,
+        "POST {endpoint} HTTP/1.1\r\nHost: kiri\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+    )?;
     stream.flush()?;
     let mut r = BufReader::new(stream);
     let mut status_line = String::new();
@@ -266,8 +282,16 @@ pub(crate) fn wake_over_stream(mut stream: impl Read + Write) -> io::Result<()> 
     Err(io::Error::other(msg))
 }
 
+pub(crate) fn wake_over_stream(stream: impl Read + Write) -> io::Result<()> {
+    post_over_stream(stream, "/kiri/wake")
+}
+
+pub(crate) fn stop_over_stream(stream: impl Read + Write) -> io::Result<()> {
+    post_over_stream(stream, "/kiri/stop")
+}
+
 #[cfg(windows)]
-fn wake_via_pipe(pipe_name: &str) -> Option<io::Result<()>> {
+fn post_via_pipe(pipe_name: &str, endpoint: &str) -> Option<io::Result<()>> {
     use std::os::windows::fs::OpenOptionsExt;
     const ERROR_PIPE_BUSY: i32 = 231;
     const SECURITY_IDENTIFICATION: u32 = 0x0001_0000;
@@ -279,7 +303,7 @@ fn wake_via_pipe(pipe_name: &str) -> Option<io::Result<()>> {
             .security_qos_flags(SECURITY_IDENTIFICATION)
             .open(pipe_name)
         {
-            Ok(file) => return Some(wake_over_stream(file)),
+            Ok(file) => return Some(post_over_stream(file, endpoint)),
             Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
@@ -289,8 +313,23 @@ fn wake_via_pipe(pipe_name: &str) -> Option<io::Result<()>> {
     None
 }
 
+#[cfg(windows)]
+pub(crate) fn wake_via_pipe(pipe_name: &str) -> Option<io::Result<()>> {
+    post_via_pipe(pipe_name, "/kiri/wake")
+}
+
+#[cfg(windows)]
+pub(crate) fn stop_via_pipe(pipe_name: &str) -> Option<io::Result<()>> {
+    post_via_pipe(pipe_name, "/kiri/stop")
+}
+
 #[cfg(not(windows))]
-fn wake_via_pipe(_pipe_name: &str) -> Option<io::Result<()>> {
+pub(crate) fn wake_via_pipe(_pipe_name: &str) -> Option<io::Result<()>> {
+    None
+}
+
+#[cfg(not(windows))]
+pub(crate) fn stop_via_pipe(_pipe_name: &str) -> Option<io::Result<()>> {
     None
 }
 
@@ -485,6 +524,14 @@ mod tests {
         let mut eof = MockPipe::new(b"");
         let err = wake_over_stream(&mut eof).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+
+        // Stop marker write + POST /kiri/stop over pipe.
+        super::write_stopped_marker_at(&marker);
+        assert!(marker.is_file());
+        let mut stop_pipe = MockPipe::new(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n");
+        super::stop_over_stream(&mut stop_pipe).unwrap();
+        let stop_wire = String::from_utf8(stop_pipe.sent).unwrap();
+        assert!(stop_wire.starts_with("POST /kiri/stop HTTP/1.1\r\n"), "{stop_wire}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

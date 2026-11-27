@@ -526,6 +526,20 @@ fn check_alive_at(sock: &Path, not_running: &str) -> io::Result<()> {
     }
 }
 
+#[cfg(unix)]
+pub(crate) fn probe_socket(sock: &Path) -> io::Result<()> {
+    check_alive_at(sock, not_running_message())
+}
+
+#[cfg(unix)]
+pub(crate) fn get_background_at(sock: &Path, path: &str) -> io::Result<Value> {
+    let r = send_to(sock, "GET", path, None, "X-Kiri-Background: 1\r\n")?;
+    if !r.ok() {
+        return Err(io::Error::other(r.error()));
+    }
+    Ok(r.json())
+}
+
 /// Probes the engine socket, distinguishing `PermissionDenied` (`EACCES`) from
 /// the daemon not running and formatting OS-appropriate guidance.
 pub fn check_alive() -> io::Result<()> {

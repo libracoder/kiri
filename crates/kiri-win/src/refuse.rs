@@ -28,9 +28,7 @@ fn strip_version(path: &str) -> &str {
     path
 }
 
-/// Whether the first HTTP request line in `request` is `POST /kiri/wake`
-/// (or versioned `POST /v*/kiri/wake`).
-pub fn is_wake_request(request: &[u8]) -> bool {
+fn matches_post_endpoint(request: &[u8], endpoint: &str) -> bool {
     let line_end = request.iter().position(|&b| b == b'\r' || b == b'\n').unwrap_or(request.len().min(1024));
     let Ok(line) = std::str::from_utf8(&request[..line_end]) else {
         return false;
@@ -48,7 +46,19 @@ pub fn is_wake_request(request: &[u8]) -> bool {
         return false;
     }
     let path = target.split('?').next().unwrap_or(target);
-    strip_version(path) == "/kiri/wake"
+    strip_version(path) == endpoint
+}
+
+/// Whether the first HTTP request line in `request` is `POST /kiri/wake`
+/// (or versioned `POST /v*/kiri/wake`).
+pub fn is_wake_request(request: &[u8]) -> bool {
+    matches_post_endpoint(request, "/kiri/wake")
+}
+
+/// Whether the first HTTP request line in `request` is `POST /kiri/stop`
+/// (or versioned `POST /v*/kiri/stop`).
+pub fn is_stop_request(request: &[u8]) -> bool {
+    matches_post_endpoint(request, "/kiri/stop")
 }
 
 /// Returns `Some(d)` only when `distro` is Kiri's dedicated bundled distro
@@ -66,6 +76,9 @@ pub enum GateDecision {
     /// Engine was stopped and the request is `POST /kiri/wake` (or `/v*/kiri/wake`):
     /// gate and marker are now cleared; forward the already-read request bytes.
     Wake,
+    /// Engine is already stopped and the request is `POST /kiri/stop`: reply
+    /// HTTP 204 No Content immediately without spawning `wsl.exe`.
+    AlreadyStopped,
     /// Engine is stopped and the request is not a wake: reply HTTP 503 with
     /// [`STOPPED`] without spawning `wsl.exe`.
     Refuse,
@@ -121,6 +134,8 @@ impl StoppedGate {
         if is_wake_request(first_request) {
             self.set(false, marker);
             GateDecision::Wake
+        } else if is_stop_request(first_request) {
+            GateDecision::AlreadyStopped
         } else {
             GateDecision::Refuse
         }
@@ -288,6 +303,12 @@ mod tests {
         let after_start = StoppedGate::new();
         assert!(!after_start.init_from(Some(&marker)));
 
+        // POST /kiri/stop while already stopped returns AlreadyStopped and keeps the marker.
+        gate.set(true, Some(&marker));
+        assert_eq!(gate.inspect_request(b"POST /kiri/stop HTTP/1.1\r\nHost: kiri\r\n\r\n", Some(&marker)), GateDecision::AlreadyStopped);
+        assert!(gate.is_stopped());
+        assert!(marker.is_file());
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -309,6 +330,10 @@ mod tests {
         assert!(!is_wake_request(b"GET /v1.47/containers/json HTTP/1.1\r\n\r\n"));
         assert!(!is_wake_request(b"POST /containers/create HTTP/1.1\r\n\r\n"));
         assert!(!is_wake_request(b"POST /kiri/stop HTTP/1.1\r\n\r\n"));
+        assert!(is_stop_request(b"POST /kiri/stop HTTP/1.1\r\nHost: kiri\r\n\r\n"));
+        assert!(is_stop_request(b"POST /v1.47/kiri/stop HTTP/1.1\r\nHost: kiri\r\n\r\n"));
+        assert!(!is_stop_request(b"GET /kiri/stop HTTP/1.1\r\n\r\n"));
+        assert!(!is_stop_request(b"POST /kiri/wake HTTP/1.1\r\n\r\n"));
         assert!(!is_wake_request(b"POST /kiri/wake/extra HTTP/1.1\r\n\r\n"));
         assert!(!is_wake_request(b"POST /v/kiri/wake HTTP/1.1\r\n\r\n"));
         assert!(!is_wake_request(b"POST /v./kiri/wake HTTP/1.1\r\n\r\n"));
@@ -351,6 +376,12 @@ mod tests {
         assert_eq!(gate.inspect_request(b"POST /v1.47/kiri/wake HTTP/1.1\r\nHost: kiri\r\n\r\n", Some(&marker)), GateDecision::Wake);
         assert!(!gate.is_stopped());
         assert!(!marker.exists());
+
+        // POST /kiri/stop while already stopped returns AlreadyStopped and keeps the marker.
+        gate.set(true, Some(&marker));
+        assert_eq!(gate.inspect_request(b"POST /kiri/stop HTTP/1.1\r\nHost: kiri\r\n\r\n", Some(&marker)), GateDecision::AlreadyStopped);
+        assert!(gate.is_stopped());
+        assert!(marker.is_file());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
