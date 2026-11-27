@@ -180,6 +180,12 @@ impl Network {
         matches!(self.name.as_str(), "bridge" | "host" | "none")
     }
 
+    /// `--opt com.docker.network.bridge.enable_icc=false`: containers on
+    /// this network cannot reach each other (#213).
+    pub fn icc_disabled(&self) -> bool {
+        self.options.get(ENABLE_ICC_OPT).and_then(|v| v.as_str()).and_then(parse_go_bool) == Some(false)
+    }
+
     /// Docker's `"172.17.0.0/16"`.
     pub fn subnet_str(&self) -> String {
         format!("{}/{}", ip_str(self.subnet), self.prefix)
@@ -371,10 +377,31 @@ fn builtin(name: &str, driver: &str, bridge: &str, subnet: [u8; 4], gateway: [u8
 /// than reported and not applied.
 pub const BRIDGE_NAME_OPT: &str = "com.docker.network.bridge.name";
 
+/// `--opt com.docker.network.bridge.enable_icc=false`: no traffic between
+/// the network's containers, enforced by isolating each one's bridge port.
+pub const ENABLE_ICC_OPT: &str = "com.docker.network.bridge.enable_icc";
+
+/// A boolean as Go's `strconv.ParseBool` reads it, as Docker reads bridge
+/// options.
+fn parse_go_bool(s: &str) -> Option<bool> {
+    match s {
+        "1" | "t" | "T" | "true" | "TRUE" | "True" => Some(true),
+        "0" | "f" | "F" | "false" | "FALSE" | "False" => Some(false),
+        _ => None,
+    }
+}
+
 /// The options a network keeps, or why one of them cannot be applied. An
-/// empty bridge name is Docker's "unset" and is dropped.
+/// empty bridge name is Docker's "unset" and is dropped. An `enable_icc`
+/// that is not a boolean is refused, as Docker does, rather than left to
+/// mean the containers may reach each other.
 fn checked_options(options: serde_json::Value) -> Result<serde_json::Value, String> {
     let serde_json::Value::Object(mut map) = options else { return Ok(serde_json::json!({})) };
+    if let Some(v) = map.get(ENABLE_ICC_OPT)
+        && v.as_str().and_then(parse_go_bool).is_none()
+    {
+        return Err(format!("invalid value {v} for the network option {ENABLE_ICC_OPT}: expected true or false"));
+    }
     match map.get(BRIDGE_NAME_OPT).map(|v| v.as_str().unwrap_or("?")) {
         None => {}
         Some("") => {
@@ -1376,6 +1403,23 @@ mod tests {
         assert_eq!(shown_options(&old), made.options);
         old.options[BRIDGE_NAME_OPT] = old.bridge.clone().into();
         assert_eq!(shown_options(&old)[BRIDGE_NAME_OPT], old.bridge.as_str(), "its own name is true");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `enable_icc` reads as Docker reads it: false in any of Go's
+    /// spellings turns container-to-container traffic off, and a value
+    /// that is no boolean is refused instead of leaving it on (#213).
+    #[test]
+    fn enable_icc_false_is_read_and_a_bad_value_refused() {
+        let (mut n, dir) = nets();
+        let opts = |v: &str| Settings { options: serde_json::json!({ENABLE_ICC_OPT: v}), ..Default::default() };
+        assert!(n.create("iccoff", opts("false")).unwrap().icc_disabled());
+        assert!(n.create("iccoff0", opts("0")).unwrap().icc_disabled());
+        assert!(!n.create("iccon", opts("true")).unwrap().icc_disabled());
+        assert!(!n.create("plain", Settings::default()).unwrap().icc_disabled());
+        let e = n.create("iccbad", opts("no")).unwrap_err();
+        assert!(e.contains("invalid value \"no\" for the network option com.docker.network.bridge.enable_icc"), "{e}");
+        assert!(n.find("iccbad").is_none(), "nothing made");
         let _ = std::fs::remove_dir_all(dir);
     }
 

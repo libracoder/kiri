@@ -775,6 +775,19 @@ t ipam-bad-gateway "no matching subnet for gateway" $D network create --subnet 1
 t bridge-name-refused "does not support the network option com.docker.network.bridge.name" $D network create -o com.docker.network.bridge.name=cp-isolated --subnet 10.234.0.0/24 bridgename
 code bridge-name-nothing-made 1 $D network inspect bridgename
 t bridge-name-empty "map[]" bash -c "$D network create -o com.docker.network.bridge.name= bridgename >/dev/null && $D network inspect -f '{{.Options}}' bridgename; $D network rm bridgename >/dev/null"
+# enable_icc=false: the network's containers don't reach each other, joined
+# at start or by network connect (each is an isolated bridge port), while the
+# gateway's DNS still names them. A value that is no boolean is refused (#213).
+$D network create -o com.docker.network.bridge.enable_icc=false noicc >/dev/null
+$D run -d --name noiccweb --network noicc nginx:alpine >/dev/null
+nginx_up noiccweb
+t icc-off-no-peer "blocked" $D run --rm --network noicc alpine sh -c 'wget -qO- -T 3 http://noiccweb >/dev/null 2>&1 && echo reached || echo blocked'
+t icc-off-names "$(ipon noiccweb noicc)" $D run --rm --network noicc alpine sh -c 'getent hosts noiccweb | cut -d" " -f1'
+$D run -d --name noiccjoin alpine sleep 300 >/dev/null
+$D network connect noicc noiccjoin
+t icc-off-connect-no-peer "blocked" $D exec noiccjoin sh -c "wget -qO- -T 3 http://$(ipon noiccweb noicc) >/dev/null 2>&1 && echo reached || echo blocked"
+t icc-off-bad-value "invalid value \"no\" for the network option com.docker.network.bridge.enable_icc" $D network create -o com.docker.network.bridge.enable_icc=no noiccbad
+$D rm -f noiccweb noiccjoin >/dev/null; $D network rm noicc >/dev/null
 # Fixed addresses (--ip, Compose ipv4_address) and MAC addresses.
 $D run -d --name fixed --network ipamnet --ip 10.231.0.10 --mac-address 02:42:0a:e7:00:0a nginx:alpine >/dev/null
 t static-ip "10.231.0.10" $D inspect -f '{{.NetworkSettings.Networks.ipamnet.IPAddress}}' fixed

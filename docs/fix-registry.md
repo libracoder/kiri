@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### Networks: enforce `com.docker.network.bridge.enable_icc=false` by isolating each container's bridge port (unreleased)
+- Fixes: #213 `enable_icc=false` was accepted but not enforced: containers on the same user-defined network still reached each other
+- Caused: none known
+- Caused by: -
+- Check: `icc-off-no-peer`, `icc-off-connect-no-peer`, `crates/kiri/src/daemon/network.rs`, `crates/kiri-init/src/linux/netlink.rs`
+
 ### #983 CLI: add `kiri engine start | stop | restart | status [--json]` across macOS, Linux, and Windows (unreleased)
 - Fixes: #983 Add CLI commands to start, stop and inspect the Kiri engine
 - Caused: none known

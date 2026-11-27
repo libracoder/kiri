@@ -139,12 +139,17 @@ pub struct Plug {
     pub internal: bool,
     /// IPv6-only: no IPv4 address on the container or the bridge.
     pub no_ipv4: bool,
+    /// `com.docker.network.bridge.enable_icc=false`: the container's veth
+    /// is an isolated bridge port, so it reaches no other container on the
+    /// network, only the gateway and beyond.
+    pub no_icc: bool,
 }
 
 impl Plug {
     pub fn from_opts(opts: kiri_proto::StrList<'_>) -> Plug {
         use kiri_proto::net_opts as k;
-        Plug { internal: k::values(opts, k::INTERNAL).next().is_some(), no_ipv4: k::values(opts, k::NO_IPV4).next().is_some() }
+        let has = |key| k::values(opts, key).next().is_some();
+        Plug { internal: has(k::INTERNAL), no_ipv4: has(k::NO_IPV4), no_icc: has(k::NO_ICC) }
     }
 }
 
@@ -1408,7 +1413,7 @@ fn attach_with_ns(
     v6: Option<Ip6>,
     plug: Plug,
 ) -> io::Result<()> {
-    let Plug { internal, no_ipv4 } = plug;
+    let Plug { internal, no_ipv4, no_icc } = plug;
     let mac = Some(mac.unwrap_or_else(|| mac_for(ip)));
     let bridge_index = bridges.ensure(bridge, (!no_ipv4).then_some(gateway), prefix, v6)?;
     let opened_ns;
@@ -1424,7 +1429,7 @@ fn attach_with_ns(
         let host = bridges.route_nl()?;
         // A stopped container's veth may still hold this address and MAC.
         delete_retired(host);
-        netlink::create_veth(host, host_ifname, bridge_index, netns, CONTAINER_MTU, &ifname, mac)?;
+        netlink::create_veth(host, host_ifname, bridge_index, netns, CONTAINER_MTU, &ifname, mac, no_icc)?;
     }
     // Enter the container's network namespace once to resolve the peer index,
     // disable IPv6 link-local when IPv6 is off, and open the inner route socket.
@@ -1581,10 +1586,10 @@ mod tests {
     #[test]
     fn internal_networks_are_no_uplink() {
         let v6 = Some(Ip6 { ip: [0xfd; 16], prefix: 64, gateway: [0xfd; 16] });
-        assert_eq!(Uplink::of("kv1", "eth0", [10, 0, 0, 1], v6, Plug { internal: true, no_ipv4: false }), None);
+        assert_eq!(Uplink::of("kv1", "eth0", [10, 0, 0, 1], v6, Plug { internal: true, ..Plug::default() }), None);
         let u = Uplink::of("kv1", "eth1", [10, 0, 0, 1], None, Plug::default()).unwrap();
         assert_eq!((u.ifname.as_str(), u.v4, u.v6), ("eth1", Some([10, 0, 0, 1]), None));
-        let u = Uplink::of("kv1", "eth1", [10, 0, 0, 1], v6, Plug { internal: false, no_ipv4: true }).unwrap();
+        let u = Uplink::of("kv1", "eth1", [10, 0, 0, 1], v6, Plug { no_ipv4: true, ..Plug::default() }).unwrap();
         assert_eq!((u.v4, u.v6), (None, Some([0xfd; 16])));
     }
 
@@ -1604,7 +1609,7 @@ mod tests {
         let mut ups = Vec::new();
         ups.extend(Uplink::of("kva0", "eth0", gw_a, None, Plug::default()));
         // An internal network attached in between produces no uplink.
-        ups.extend(Uplink::of("kxi1", "eth1", [10, 98, 9, 1], None, Plug { internal: true, no_ipv4: false }));
+        ups.extend(Uplink::of("kxi1", "eth1", [10, 98, 9, 1], None, Plug { internal: true, ..Plug::default() }));
         ups.extend(Uplink::of("kxz2", "eth2", gw_zeta, None, Plug::default()));
         ups.extend(Uplink::of("kxb3", "eth3", gw_beta, None, Plug::default()));
 

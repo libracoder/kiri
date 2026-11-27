@@ -28,6 +28,9 @@ const IFLA_LINKINFO: u16 = 18;
 const IFLA_NET_NS_FD: u16 = 28;
 const IFLA_INFO_KIND: u16 = 1;
 const IFLA_INFO_DATA: u16 = 2;
+const IFLA_INFO_SLAVE_KIND: u16 = 4;
+const IFLA_INFO_SLAVE_DATA: u16 = 5;
+const IFLA_BRPORT_ISOLATED: u16 = 33;
 const VETH_INFO_PEER: u16 = 1;
 const IFA_ADDRESS: u16 = 1;
 const IFA_LOCAL: u16 = 2;
@@ -290,7 +293,10 @@ fn random_bytes() -> [u8; 6] {
 /// peer is created straight inside `netns` as `peer`. The kernel picks the
 /// peer's interface index: a new namespace is not always only lo (with ipip
 /// or gre loaded it has tunl0, gre0 … too), so it is looked up by name.
-pub fn create_veth(nl: &mut Netlink, host: &str, bridge_index: i32, netns: &std::fs::File, mtu: u32, peer: &str, peer_mac: Option<[u8; 6]>) -> io::Result<()> {
+/// With `isolated` the host side becomes an isolated bridge port in the same
+/// request, before the container runs.
+#[allow(clippy::too_many_arguments)]
+pub fn create_veth(nl: &mut Netlink, host: &str, bridge_index: i32, netns: &std::fs::File, mtu: u32, peer: &str, peer_mac: Option<[u8; 6]>, isolated: bool) -> io::Result<()> {
     let mut m = Msg::new(RTM_NEWLINK, NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL);
     m.raw(&ifinfo(0, libc::IFF_UP as u32, libc::IFF_UP as u32)).attr_str(IFLA_IFNAME, host).attr_u32(IFLA_MASTER, bridge_index as u32);
     m.attr_u32(IFLA_MTU, mtu);
@@ -301,7 +307,24 @@ pub fn create_veth(nl: &mut Netlink, host: &str, bridge_index: i32, netns: &std:
         m.attr(IFLA_ADDRESS, &mac);
     }
     m.end().end().end();
-    nl.request(&mut [m])
+    if isolated {
+        nl.request(&mut [m, isolate_port_msg(host)])
+    } else {
+        nl.request(&mut [m])
+    }
+}
+
+/// `ip link set dev <name> type bridge_slave isolated on`: the bridge port
+/// forwards nothing to another isolated port, so containers on the same
+/// network cannot reach each other (Docker's `enable_icc=false`), while the
+/// bridge itself (the gateway, DNS, published ports, egress) still can.
+fn isolate_port_msg(name: &str) -> Msg {
+    let mut m = Msg::new(RTM_NEWLINK, NLM_F_ACK);
+    m.raw(&ifinfo(0, 0, 0)).attr_str(IFLA_IFNAME, name);
+    m.nest(IFLA_LINKINFO).attr_str(IFLA_INFO_SLAVE_KIND, "bridge");
+    m.nest(IFLA_INFO_SLAVE_DATA).attr(IFLA_BRPORT_ISOLATED, &[1]);
+    m.end().end();
+    m
 }
 
 pub fn delete_link(nl: &mut Netlink, name: &str) -> io::Result<()> {
@@ -1731,6 +1754,21 @@ mod tests {
 
     fn be32(d: &[u8]) -> u32 {
         u32::from_be_bytes(d.try_into().unwrap())
+    }
+
+    /// `enable_icc=false` (#213): the host-side veth, found by name, gets
+    /// the bridge's port attribute `isolated` set, as
+    /// `ip link set dev kv1 type bridge_slave isolated on` sends it.
+    #[test]
+    fn isolate_port_marks_the_veth_an_isolated_bridge_port() {
+        let m = isolate_port_msg("kv1");
+        assert_eq!(u16::from_ne_bytes([m.buf[4], m.buf[5]]), RTM_NEWLINK);
+        // nlmsghdr (16) + ifinfomsg (16), then the attributes.
+        let top = attrs(&m.buf[32..]);
+        assert_eq!(get(&top, IFLA_IFNAME), b"kv1\0");
+        let info = attrs(get(&top, IFLA_LINKINFO));
+        assert_eq!(get(&info, IFLA_INFO_SLAVE_KIND), b"bridge\0");
+        assert_eq!(attrs(get(&info, IFLA_INFO_SLAVE_DATA)), vec![(IFLA_BRPORT_ISOLATED, &[1u8][..])]);
     }
 
     /// The embedded DNS's redirect in a container's namespace: its own

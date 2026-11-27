@@ -376,3 +376,5 @@ crates/kiri/src/daemon/engine.rs	#989	kiri-k8s caused mac_bind_sources to watch 
 crates/kiri-init/src/linux/hostopts.rs	#989	kiri-init hostopts lacked timerslack_ns support to coalesce k3s background pollers across execve
 crates/kiri/src/engine_cli.rs	#983	kiri CLI had no `kiri engine start | stop | restart | status [--json]` commands to stop, restart, or inspect the engine without waking a sleeping VM
 crates/kiri-win/src/refuse.rs	#983	Windows pipe gate did not handle `POST /kiri/stop` idempotently while stopped or synchronize `kiri-win` on external CLI stops
+icc-off-no-peer	#213	com.docker.network.bridge.enable_icc=false was accepted but not enforced: containers on the network still reached each other
+icc-off-connect-no-peer	#213	a container joined by network connect to an enable_icc=false network still reached the others on it
