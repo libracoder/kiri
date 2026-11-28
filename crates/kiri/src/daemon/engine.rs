@@ -730,6 +730,11 @@ pub struct Spec {
     /// own WSL distro on `Caller::Host`), when created in WSL.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wsl_distro: Option<String>,
+    /// Whether this container was created by a non-Host caller (`Caller::Container`
+    /// or `Caller::Wsl`), so start-time symlink re-resolution keeps rejecting
+    /// binds that resolve to an ancestor of Kiri's host socket.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub non_host_creator: bool,
 }
 
 /// Normalizes an ExposedPorts key (`"53"`, `"53/UDP"`, `"132/sctp"`) to
@@ -4227,8 +4232,15 @@ impl Engine {
         let (gate, exits, earlier, halted_at_claim) = gate;
         // A bind source that is a link is followed again at every start, as
         // Docker does: re-pointing it between runs (a `current` release
-        // link) mounts the new target.
-        spec.mounts = super::api::fresh_bind_sources(&spec.mounts, &spec.mount_info);
+        // link) mounts the new target. Re-verify macOS hostetc RO and
+        // non-Host socket-ancestor confinement on the freshly resolved path.
+        spec.mounts = match super::api::fresh_bind_sources(&spec.mounts, &spec.mount_info, spec.non_host_creator) {
+            Ok(m) => m,
+            Err(e) => {
+                self.fail_start(&id, &spec, &e);
+                return Err(e);
+            }
+        };
         super::api::refresh_ssh_agent_mounts(&spec.mount_info);
         #[cfg(target_os = "macos")]
         if spec.mounts.iter().any(|m| m.starts_with("/mnt/mac/")) {
@@ -5109,7 +5121,7 @@ impl Engine {
             let c = st.containers.get(&id).expect("resolved");
             (id, c.layers.clone(), c.spec.clone())
         };
-        let (mounts, flags) = copy_mounts_and_flags(&spec, op, flags);
+        let (mounts, flags) = copy_mounts_and_flags(&spec, op, flags)?;
         let vm = self.vm()?;
         let stream = vm.connect(kiri_proto::COPY_PORT)?;
         let mut out = Vec::new();
@@ -7568,17 +7580,17 @@ fn close_monitor(h: &mut HealthRun) {
 /// `STAT`) carry the container's mounts (with refreshed bind sources) and
 /// `READONLY_ROOTFS` for `IN`; `EXPORT`, `DIFF`, `COMMIT` and `UPPER` operate
 /// on the container's rootfs/layer alone, without mounts.
-fn copy_mounts_and_flags(spec: &Spec, op: u8, flags: u32) -> (Vec<String>, u32) {
+fn copy_mounts_and_flags(spec: &Spec, op: u8, flags: u32) -> Result<(Vec<String>, u32), Error> {
     if !matches!(op, kiri_proto::copy_op::IN | kiri_proto::copy_op::OUT | kiri_proto::copy_op::STAT) {
-        return (Vec::new(), flags);
+        return Ok((Vec::new(), flags));
     }
-    let mounts = super::api::fresh_bind_sources(&spec.mounts, &spec.mount_info);
+    let mounts = super::api::fresh_bind_sources(&spec.mounts, &spec.mount_info, spec.non_host_creator)?;
     let flags = if op == kiri_proto::copy_op::IN && spec.readonly_rootfs {
         flags | kiri_proto::copy_flags::READONLY_ROOTFS
     } else {
         flags
     };
-    (mounts, flags)
+    Ok((mounts, flags))
 }
 
 fn error_text(e: &Error) -> String {
@@ -9177,16 +9189,16 @@ mod start_wait_tests {
             "tmpfs\t/tmp\ttmpfs,noexec,nosuid,nodev".into(),
         ];
         s.readonly_rootfs = true;
-        let (mounts, flags) = copy_mounts_and_flags(&s, kiri_proto::copy_op::IN, kiri_proto::copy_flags::CHUNKED);
+        let (mounts, flags) = copy_mounts_and_flags(&s, kiri_proto::copy_op::IN, kiri_proto::copy_flags::CHUNKED).unwrap();
         assert_eq!(mounts, s.mounts);
         assert_eq!(flags, kiri_proto::copy_flags::CHUNKED | kiri_proto::copy_flags::READONLY_ROOTFS);
         for op in [kiri_proto::copy_op::OUT, kiri_proto::copy_op::STAT] {
-            let (mounts, flags) = copy_mounts_and_flags(&s, op, 0);
+            let (mounts, flags) = copy_mounts_and_flags(&s, op, 0).unwrap();
             assert_eq!(mounts, s.mounts);
             assert_eq!(flags, 0);
         }
         for op in [kiri_proto::copy_op::EXPORT, kiri_proto::copy_op::DIFF, kiri_proto::copy_op::COMMIT, kiri_proto::copy_op::UPPER] {
-            let (mounts, flags) = copy_mounts_and_flags(&s, op, 0);
+            let (mounts, flags) = copy_mounts_and_flags(&s, op, 0).unwrap();
             assert!(mounts.is_empty(), "op {op} must not mount volumes/binds");
             assert_eq!(flags, 0);
         }
@@ -10600,6 +10612,7 @@ mod volume_remove_tests {
             volumes_from: vec!["seed-data:ro".into()],
             pid_mode: "host".into(),
             wsl_distro: Some("Ubuntu".into()),
+            non_host_creator: false,
         };
 
         let log_dir = dir.join("containers").join("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");

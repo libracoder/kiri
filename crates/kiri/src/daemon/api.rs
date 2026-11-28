@@ -2052,6 +2052,21 @@ fn guest_bind_source(src: &str) -> String {
     mac_source(src).map_or_else(|| src.to_owned(), |real| format!("{MAC_ROOT}{real}"))
 }
 
+fn ensure_ro_in_rest(rest: &str) -> String {
+    let Some((dst, tail)) = rest.split_once('\t') else {
+        return rest.to_owned();
+    };
+    let (flags, after) = tail.split_once('\t').map_or((tail, None), |(f, a)| (f, Some(a)));
+    let mut parts: Vec<&str> = flags.split(',').filter(|x| !x.is_empty()).collect();
+    if !parts.contains(&"ro") {
+        parts.push("ro");
+    }
+    match after {
+        Some(a) => format!("{dst}\t{}\t{a}", parts.join(",")),
+        None => format!("{dst}\t{}", parts.join(",")),
+    }
+}
+
 /// The guest mount lines with each Mac bind source followed again from the
 /// path the person gave (kept in `info`, one entry per line). Links are
 /// resolved when the container is made; this redoes it at start, so a link
@@ -2061,39 +2076,64 @@ fn guest_bind_source(src: &str) -> String {
 /// it now: by the path the person gave, or else by the path mounted when
 /// it was made, every line, whether or not `info` has one for it. Other
 /// lines stay as they are.
-pub(super) fn fresh_bind_sources(guest: &[String], info: &[Value]) -> Vec<String> {
-    fresh_bind_sources_with(guest, info, super::binds::engine_socket, cfg!(target_os = "macos"))
+pub(super) fn fresh_bind_sources(guest: &[String], info: &[Value], non_host: bool) -> Result<Vec<String>, Error> {
+    fresh_bind_sources_with(guest, info, super::binds::engine_socket, cfg!(target_os = "macos"), non_host, is_mac_hostetc, is_host_socket_ancestor)
 }
 
-fn fresh_bind_sources_with(guest: &[String], info: &[Value], engine_socket: impl Fn(&str) -> Option<String>, mac: bool) -> Vec<String> {
+fn fresh_bind_sources_with(
+    guest: &[String],
+    info: &[Value],
+    engine_socket: impl Fn(&str) -> Option<String>,
+    mac: bool,
+    non_host: bool,
+    hostetc: impl Fn(&str) -> bool,
+    socket_ancestor: impl Fn(&str) -> bool,
+) -> Result<Vec<String>, Error> {
     let paired = guest.len() == info.len();
     if mac && !paired {
-        return guest.to_vec();
+        return Ok(guest.to_vec());
     }
     guest
         .iter()
         .enumerate()
         .map(|(idx, line)| {
-            let Some((old, rest)) = line.split_once('\t') else { return line.clone() };
+            let Some((old, rest)) = line.split_once('\t') else { return Ok(line.clone()) };
             let src = info.get(idx).filter(|i| paired && i["Type"] == "bind").and_then(|i| i["Source"].as_str());
             if !mac {
                 if is_ssh_agent_sock(old) || src.is_some_and(is_ssh_agent_sock) {
-                    return format!("{}\t{rest}", ssh_agent_source_for(!mac));
+                    return Ok(format!("{}\t{rest}", ssh_agent_source_for(!mac)));
                 }
                 let given = src.and_then(&engine_socket).or_else(|| old.starts_with('/').then(|| engine_socket(old)).flatten());
-                return given.map_or_else(|| line.clone(), |given| format!("{given}\t{rest}"));
+                return Ok(given.map_or_else(|| line.clone(), |given| format!("{given}\t{rest}")));
             }
-            let Some(src) = src else { return line.clone() };
+            let Some(src) = src else { return Ok(line.clone()) };
             if engine_socket(src).is_some() {
-                return line.clone();
+                return Ok(line.clone());
             }
             if ssh_agent_bind_for(src, mac).is_some() {
-                return format!("{}\t{rest}", ssh_agent_source_for(!mac));
+                return Ok(format!("{}\t{rest}", ssh_agent_source_for(!mac)));
             }
             if !old.strip_prefix(MAC_ROOT).is_some_and(|p| p.starts_with('/')) {
-                return line.clone();
+                return Ok(line.clone());
             }
-            format!("{}\t{rest}", guest_bind_source(src))
+            if non_host && socket_ancestor(src) {
+                return Err(Error::BadRequest(format!(
+                    "invalid mount source {src}: cannot mount a directory containing Kiri's host socket"
+                )));
+            }
+            let resolved = guest_bind_source(src);
+            let resolved_host = resolved.strip_prefix(MAC_ROOT).unwrap_or(&resolved);
+            if non_host && socket_ancestor(resolved_host) {
+                return Err(Error::BadRequest(format!(
+                    "invalid mount source {src}: cannot mount a directory containing Kiri's host socket"
+                )));
+            }
+            let rest = if hostetc(src) || hostetc(resolved_host) {
+                ensure_ro_in_rest(rest)
+            } else {
+                rest.to_owned()
+            };
+            Ok(format!("{resolved}\t{rest}"))
         })
         .collect()
 }
@@ -3477,6 +3517,7 @@ fn create_inner(req: &Request, engine: &Engine, caller: &Caller, record_wsl_dist
         volumes_from: strings(&host["VolumesFrom"]).unwrap_or_default(),
         pid_mode,
         wsl_distro: record_wsl_distro,
+        non_host_creator: *caller != Caller::Host,
         mounts: mounts.guest,
         mount_info: mounts.info,
         mount_request: mount_request(&body, &image_cfg),
@@ -5850,9 +5891,9 @@ mod tests {
             "/run/host-services/docker.sock\t/var/run/docker.sock\t".to_owned(),
         ];
         let sock = |s: &str| (s == "/Users/alice/.kiri/run/docker.sock").then(|| "/run/host-services/docker.sock".to_owned());
-        assert_eq!(super::fresh_bind_sources_with(&restarted, &gpg_info, sock, true), restarted);
+        assert_eq!(super::fresh_bind_sources_with(&restarted, &gpg_info, sock, true, false, |_| false, |_| false).unwrap(), restarted);
         assert_eq!(
-            super::fresh_bind_sources_with(&legacy, &gpg_info, sock, true),
+            super::fresh_bind_sources_with(&legacy, &gpg_info, sock, true, false, |_| false, |_| false).unwrap(),
             [
                 "/run/host-services/ssh-auth.sock\t/ssh-agent\tro",
                 "/run/host-services/docker.sock\t/var/run/docker.sock\t",
@@ -7112,18 +7153,18 @@ mod tests {
         let info = vec![json!({"Type": "bind", "Source": "/var/run/docker.sock"}), json!({"Type": "bind", "Source": "/srv/app"}), json!({"Type": "tmpfs", "Source": ""})];
         let sock = |s: &str| matches!(s, "/var/run/docker.sock" | "/run/kiri/docker.sock").then(|| "/run/kiri/docker.container.sock".to_owned());
         let given = ["/run/kiri/docker.container.sock\t/var/run/docker.sock\t", "/srv/app\t/x\tro", "tmpfs\t/t\ttmpfs"];
-        assert_eq!(fresh_bind_sources_with(&guest, &info, sock, false), given);
+        assert_eq!(fresh_bind_sources_with(&guest, &info, sock, false, false, |_| false, |_| false).unwrap(), given);
         // The path the person gave no longer leads to the socket (a link
         // removed or re-pointed): the path mounted when it was made does.
         let moved = vec![json!({"Type": "bind", "Source": "/home/me/sock-link"}), info[1].clone(), info[2].clone()];
-        assert_eq!(fresh_bind_sources_with(&guest, &moved, sock, false), given);
+        assert_eq!(fresh_bind_sources_with(&guest, &moved, sock, false, false, |_| false, |_| false).unwrap(), given);
         // Records that don't pair one to one with the mount lines: each
         // line is still looked at by the path it mounts.
-        assert_eq!(fresh_bind_sources_with(&guest, &info[1..], sock, false), given);
-        assert_eq!(fresh_bind_sources_with(&guest, &[], sock, false), given);
+        assert_eq!(fresh_bind_sources_with(&guest, &info[1..], sock, false, false, |_| false, |_| false).unwrap(), given);
+        assert_eq!(fresh_bind_sources_with(&guest, &[], sock, false, false, |_| false, |_| false).unwrap(), given);
         // A Mac follows binds from the records only, so it leaves unpaired
         // lines as they are.
-        assert_eq!(fresh_bind_sources_with(&guest, &info[1..], sock, true), guest);
+        assert_eq!(fresh_bind_sources_with(&guest, &info[1..], sock, true, false, |_| false, |_| false).unwrap(), guest);
     }
 
     /// A linked bind source is followed again at each start: re-pointing the
@@ -7145,12 +7186,63 @@ mod tests {
         let guest = vec![made, "tmpfs\t/t\tnoexec".to_owned()];
         let info = vec![json!({"Type": "bind", "Source": src}), json!({"Type": "tmpfs", "Source": ""})];
         // Unchanged link: the same lines.
-        assert_eq!(fresh_bind_sources(&guest, &info), guest);
+        assert_eq!(fresh_bind_sources(&guest, &info, false).unwrap(), guest);
         // Re-pointed: the new target; other mounts as they were.
         std::fs::remove_file(&link).unwrap();
         std::os::unix::fs::symlink("r2", &link).unwrap();
-        assert_eq!(fresh_bind_sources(&guest, &info), [at("r2"), guest[1].clone()]);
+        assert_eq!(fresh_bind_sources(&guest, &info, false).unwrap(), [at("r2"), guest[1].clone()]);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Re-pointing a macOS bind symlink between container create and start
+    /// must re-enforce `is_mac_hostetc` (forcing `ro`) and reject
+    /// `is_host_socket_ancestor` for non-Host callers.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn bind_links_recheck_hostetc_ro_and_socket_ancestor_at_start() {
+        let dir = std::env::temp_dir().join(format!("kiri-fresh-binds-sec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let safe = dir.join("safe");
+        let fake_etc = dir.join("state/etc");
+        let fake_sock_dir = dir.join("state/run");
+        for d in [&safe, &fake_etc, &fake_sock_dir] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let fake_sock = fake_sock_dir.join("docker.sock").to_string_lossy().into_owned();
+        let link = dir.join("current");
+        std::os::unix::fs::symlink(&safe, &link).unwrap();
+        let src = link.to_str().unwrap().to_owned();
+        let guest = vec![format!("{}\t/app\t", guest_bind_source(&src))];
+        let guest_with_flag = vec![format!("{}\t/app\tcreate", guest_bind_source(&src))];
+        let info = vec![json!({"Type": "bind", "Source": src})];
+        let hostetc = |p: &str| is_mac_hostetc_with(p, Some(&fake_etc));
+        let sock_anc = |p: &str| is_host_socket_ancestor_against(p, std::slice::from_ref(&fake_sock));
+
+        // 1. Re-point symlink to synthetic hostetc dir: start must force `ro`.
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&fake_etc, &link).unwrap();
+        let etc_real = std::fs::canonicalize(&fake_etc).unwrap();
+        assert_eq!(
+            fresh_bind_sources_with(&guest, &info, |_| None, true, false, hostetc, sock_anc).unwrap(),
+            [format!("/mnt/mac{}\t/app\tro", etc_real.display())]
+        );
+        assert_eq!(
+            fresh_bind_sources_with(&guest_with_flag, &info, |_| None, true, false, hostetc, sock_anc).unwrap(),
+            [format!("/mnt/mac{}\t/app\tcreate,ro", etc_real.display())]
+        );
+
+        // 2. Re-point symlink to host socket ancestor dir: non-Host caller is rejected, Host still works.
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&fake_sock_dir, &link).unwrap();
+        let err = fresh_bind_sources_with(&guest, &info, |_| None, true, true, hostetc, sock_anc).unwrap_err();
+        assert!(matches!(err, Error::BadRequest(ref m) if m.contains("host socket")), "unexpected error: {err:?}");
+        let sock_real = std::fs::canonicalize(&fake_sock_dir).unwrap();
+        assert_eq!(
+            fresh_bind_sources_with(&guest, &info, |_| None, true, false, hostetc, sock_anc).unwrap(),
+            [format!("/mnt/mac{}\t/app\t", sock_real.display())]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -8431,16 +8523,19 @@ mod network_option_tests {
         let guest = vec!["/run/host-services/ssh-auth.sock\t/run/host-services/ssh-auth.sock\tro".to_owned()];
         let info = vec![serde_json::json!({"Type": "bind", "Source": "/run/host-services/ssh-auth.sock"})];
         assert_eq!(
-            super::fresh_bind_sources_with(&guest, &info, |_| None, false),
+            super::fresh_bind_sources_with(&guest, &info, |_| None, false, false, |_| false, |_| false).unwrap(),
             ["/run/kiri/host-services/ssh-auth.sock\t/run/host-services/ssh-auth.sock\tro"]
         );
-        assert_eq!(super::fresh_bind_sources_with(&guest, &[], |_| None, false), ["/run/kiri/host-services/ssh-auth.sock\t/run/host-services/ssh-auth.sock\tro"]);
+        assert_eq!(
+            super::fresh_bind_sources_with(&guest, &[], |_| None, false, false, |_| false, |_| false).unwrap(),
+            ["/run/kiri/host-services/ssh-auth.sock\t/run/host-services/ssh-auth.sock\tro"]
+        );
         let slash_guest = vec!["/run/host-services//ssh-auth.sock\t/run/host-services/ssh-auth.sock\tro".to_owned()];
         assert_eq!(
-            super::fresh_bind_sources_with(&slash_guest, &[], |_| None, false),
+            super::fresh_bind_sources_with(&slash_guest, &[], |_| None, false, false, |_| false, |_| false).unwrap(),
             ["/run/kiri/host-services/ssh-auth.sock\t/run/host-services/ssh-auth.sock\tro"]
         );
-        assert_eq!(super::fresh_bind_sources_with(&guest, &info, |_| None, true), guest);
+        assert_eq!(super::fresh_bind_sources_with(&guest, &info, |_| None, true, false, |_| false, |_| false).unwrap(), guest);
     }
 
     /// `--add-host name:ip` and `--hostname` are written into the container's
