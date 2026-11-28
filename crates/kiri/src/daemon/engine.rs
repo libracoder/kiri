@@ -2134,6 +2134,9 @@ impl Engine {
         })?);
         // host.docker.internal: the guest dials back for each connection.
         vm.listen(super::ports::HOST_BOUND_PORT, Box::new(super::ports::serve_host_bound))?;
+        if !super::ports::host_loopback() {
+            crate::diag::info!("containers don't reach this Mac's loopback through host.docker.internal (KIRI_HOST_LOOPBACK=off)");
+        }
         // Outbound container TCP to VPN tunnel routes or under host egress.
         vm.listen(kiri_proto::EGRESS_TCP_PORT, Box::new(super::ports::serve_egress))?;
         // SSH agent forwarding, for containers that mount /run/host-services/ssh-auth.sock.

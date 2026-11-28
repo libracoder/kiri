@@ -1698,6 +1698,13 @@ fn host_bound(stream: kiri_vmm::VsockStream) -> io::Result<()> {
         crate::diag::warn!("refused a host-bound connection; only 127.0.0.1 is relayed, and never to a container-domain router", to = format!("{ip}:{port}"));
         return Err(io::Error::new(io::ErrorKind::PermissionDenied, "not relayed"));
     }
+    if !loopback_relayed(host_loopback(), port, |p| super::mirror::port() == Some(p)) {
+        // Once a daemon: a CI job probing host.docker.internal would fill the log.
+        if !LOOPBACK_REFUSAL_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            crate::diag::info!("refused a container's connection to this Mac's loopback: KIRI_HOST_LOOPBACK is off (logged once)", port = port);
+        }
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "host loopback is off"));
+    }
     // Refused or unreachable: dropping closes the container's connection,
     // which is what it would see from a real host too.
     let target = dial_loopback(port)?;
@@ -1720,6 +1727,33 @@ fn host_bound(stream: kiri_vmm::VsockStream) -> io::Result<()> {
 /// The Mac's loopback at `port`: IPv4, then IPv6 for a server on `::1` only (#258).
 fn dial_loopback(port: u16) -> io::Result<TcpStream> {
     TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).or_else(|e| TcpStream::connect((std::net::Ipv6Addr::LOCALHOST, port)).map_err(|_| e))
+}
+
+/// Whether containers reach this Mac's loopback through `host.docker.internal`
+/// (`host.kiri.internal`, `host-gateway`). On by default, as with Docker
+/// Desktop and OrbStack (#258). `KIRI_HOST_LOOPBACK=off` (or `0`, `false`,
+/// `no`) in the daemon's environment turns it off, for workloads that must
+/// not reach the services listening on 127.0.0.1 and ::1, such as CI jobs
+/// (#995): pf can't stop the engine's own connections there, since macOS
+/// skips lo0 while a VM runs. Read once, when the daemon starts.
+pub fn host_loopback() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| host_loopback_from(std::env::var("KIRI_HOST_LOOPBACK").ok().as_deref()))
+}
+
+/// `KIRI_HOST_LOOPBACK`'s value: only an explicit off turns it off, so a
+/// typo leaves Kiri as it was.
+fn host_loopback_from(v: Option<&str>) -> bool {
+    !v.map(str::trim).is_some_and(|v| ["off", "0", "false", "no"].iter().any(|o| v.eq_ignore_ascii_case(o)))
+}
+
+static LOOPBACK_REFUSAL_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a host-bound connection to `port` is relayed to the Mac's
+/// loopback. With it off, only Kiri's own server there is: the image
+/// mirror builds pull through (token-checked, and the engine's own).
+fn loopback_relayed(on: bool, port: u16, kiris_own: impl Fn(u16) -> bool) -> bool {
+    on || kiris_own(port)
 }
 
 /// The guest's relay only ever asks for the Mac's loopback; anything else is
@@ -3520,7 +3554,7 @@ pub fn listening<S: AsRef<str>>(lines: &[S], host_network: bool) -> (Vec<u16>, V
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_PEER_SESSIONS, MAX_REMOTE_SESSIONS, MAX_TCP_SESSIONS, NAT_PORTS, REMOTE_SESSIONS, TCP_SESSIONS, dial_loopback, host_bound_allowed, kernel_forwards, kernel_host_ip, listening, nat_port, relays_too, tcp_permit};
+    use super::{MAX_PEER_SESSIONS, MAX_REMOTE_SESSIONS, MAX_TCP_SESSIONS, NAT_PORTS, REMOTE_SESSIONS, TCP_SESSIONS, dial_loopback, host_bound_allowed, host_loopback_from, kernel_forwards, kernel_host_ip, listening, loopback_relayed, nat_port, relays_too, tcp_permit};
     use std::net::IpAddr;
     use std::sync::atomic::Ordering;
 
@@ -3535,6 +3569,24 @@ mod tests {
         assert!(!host_bound_allowed(local, 443, router));
         assert!(host_bound_allowed(local, 5432, router), "other loopback services stay reachable");
         assert!(!host_bound_allowed(std::net::Ipv4Addr::new(10, 0, 0, 1), 5432, router), "loopback only");
+    }
+
+    /// `KIRI_HOST_LOOPBACK=off` keeps containers away from the Mac's
+    /// loopback (#995), all but the engine's own image mirror, which builds
+    /// pull through. Unset, or anything but an off, leaves it as it was.
+    #[test]
+    fn host_loopback_off_refuses_all_but_the_mirror() {
+        for off in ["off", "OFF", " 0 ", "false", "no"] {
+            assert!(!host_loopback_from(Some(off)), "{off:?}");
+        }
+        for on in [None, Some(""), Some("on"), Some("1"), Some("yes"), Some("of")] {
+            assert!(host_loopback_from(on), "{on:?}");
+        }
+        let mirror = |p: u16| p == 5050;
+        assert!(loopback_relayed(true, 5432, mirror), "on: every port");
+        assert!(!loopback_relayed(false, 5432, mirror), "off: a Mac service is refused");
+        assert!(loopback_relayed(false, 5050, mirror), "off: Kiri's own mirror still answers builds");
+        assert!(!loopback_relayed(false, 5050, |_| false), "off, with no mirror: nothing");
     }
 
     /// A Mac server on `::1` only (Node's `localhost`) is reached; one on
