@@ -297,6 +297,12 @@ pub fn distro_source(src: &str, distro: &str, wsl: Option<&Wsl>) -> Result<Strin
     distro_unix_source(src, unix_or_win, distro, &kiri_dir, &distro_root, wsl)
 }
 
+fn is_allowed_wslg_socket_path(p: &str) -> bool {
+    matches!(p, "/mnt/wslg/.X11-unix" | "/mnt/wslg/runtime-dir" | "/mnt/wslg/PulseServer")
+        || p.starts_with("/mnt/wslg/.X11-unix/")
+        || p.starts_with("/mnt/wslg/runtime-dir/")
+}
+
 fn distro_unix_source(
     raw_src: &str,
     src: &str,
@@ -329,15 +335,22 @@ fn distro_unix_source(
             || p.starts_with(&format!("{kiri_dir}/"))
             || p == WSL_KIRI_DIR
             || p.starts_with(&format!("{WSL_KIRI_DIR}/"))
+            || p == "/mnt/wsl"
+            || p.starts_with("/mnt/wsl/")
     };
+    let is_forbidden_wslg = |p: &str| (p == "/mnt/wslg" || p.starts_with("/mnt/wslg/")) && !is_allowed_wslg_socket_path(p);
     if is_internal_wsl(&lex) {
         return Err(Error::BadRequest(format!(
             "invalid mount source {raw_src}: cannot mount Kiri's internal WSL directory"
         )));
     }
+    if is_forbidden_wslg(&lex) {
+        return Err(Error::BadRequest(format!(
+            "invalid mount source {raw_src}: only WSLg display and audio sockets under /mnt/wslg may be mounted"
+        )));
+    }
     let mnt = wsl.map_or("/mnt/", |w| w.root.as_str());
-    let mnt_trimmed = mnt.trim_end_matches('/');
-    let on_drive = |p: &str| (!mnt_trimmed.is_empty() && (p == mnt_trimmed || p.starts_with(mnt))) && p != "/mnt/wsl" && !is_internal_wsl(p);
+    let on_drive = |p: &str| is_wsl_drive_path(p, mnt, true) || is_allowed_wslg_socket_path(p);
     if on_drive(&lex) {
         return Ok(lex);
     }
@@ -346,6 +359,11 @@ fn distro_unix_source(
     // only relative links on the way the source stays as given; the kernel
     // follows those inside the root itself.
     let target = match resolve_in_root(Path::new(distro_root), &lex) {
+        Some((inside, true)) if is_internal_wsl(&inside) || is_forbidden_wslg(&inside) => {
+            return Err(Error::BadRequest(format!(
+                "invalid mount source {raw_src}: symlink target {inside} is not allowed from WSL distro {distro}"
+            )));
+        }
         Some((inside, true)) if on_drive(&inside) => return Ok(inside),
         Some((inside, true)) => confine_to_root(distro_root, &inside),
         Some((_, false)) => confine_to_root(distro_root, &lex),
@@ -971,11 +989,45 @@ mod tests {
                 "{traversal}"
             );
         }
-        // Mounting another distro's root or Kiri's internal WSL dir is refused.
-        assert!(distro_source("/mnt/wsl/kiri/roots/Debian/etc", "Ubuntu", Some(&w)).is_err());
-        assert!(distro_source("//mnt/wsl/kiri/roots/Debian/etc", "Ubuntu", Some(&w)).is_err());
-        assert!(distro_source("///mnt/wsl/kiri/roots/Debian/etc", "Ubuntu", Some(&w)).is_err());
-        assert!(distro_source("/mnt/wsl/kiri/sockets/Ubuntu", "Ubuntu", Some(&w)).is_err());
+        // Mounting another distro's root, `/mnt/wsl`, or `/mnt/wslg/distro` (which in Kiri's
+        // engine distro binds Kiri's own `/` rootfs) is refused, while WSLg display/audio
+        // sockets and `/mnt/<drive>` remain allowed and bare `/mnt` stays confined to `<distro>`.
+        for forbidden in [
+            "/mnt/wsl/kiri/roots/Debian/etc",
+            "//mnt/wsl/kiri/roots/Debian/etc",
+            "///mnt/wsl/kiri/roots/Debian/etc",
+            "/mnt/wsl/kiri/sockets/Ubuntu",
+            "/mnt/wsl",
+            "//mnt/wsl",
+            "/mnt/wsl/other",
+            "/mnt/wslg",
+            "//mnt/wslg",
+            "/mnt/wslg/distro",
+            "//mnt/wslg/distro",
+            "/mnt/wslg/distro/etc/shadow",
+            r"\\wsl.localhost\Ubuntu\mnt\wslg\distro",
+            r"\\wsl$\Ubuntu\mnt\wsl\kiri",
+        ] {
+            assert!(distro_source(forbidden, "Ubuntu", Some(&w)).is_err(), "{forbidden} should be refused");
+            assert!(distro_source(forbidden, "Ubuntu", None).is_err(), "{forbidden} (None) should be refused");
+        }
+        for allowed_wslg in [
+            "/mnt/wslg/.X11-unix",
+            "/mnt/wslg/.X11-unix/X0",
+            "/mnt/wslg/runtime-dir",
+            "/mnt/wslg/runtime-dir/wayland-0",
+            "/mnt/wslg/PulseServer",
+        ] {
+            assert_eq!(distro_source(allowed_wslg, "Ubuntu", Some(&w)).unwrap(), allowed_wslg);
+        }
+        assert_eq!(
+            distro_source("/mnt", "Ubuntu", Some(&w)).unwrap(),
+            "/mnt/wsl/kiri/roots/Ubuntu/mnt"
+        );
+        assert_eq!(
+            distro_source("/mnt/custom-share", "Ubuntu", Some(&w)).unwrap(),
+            "/mnt/wsl/kiri/roots/Ubuntu/mnt/custom-share"
+        );
         assert!(distro_source("/home/me", "../evil", Some(&w)).is_err());
 
         // Redundant leading slashes on Unix paths stay confined to `<distro>`.
@@ -1059,7 +1111,17 @@ mod tests {
         std::os::unix::fs::symlink("/usr/share/zoneinfo/Europe/Berlin", root.join("etc/localtime")).unwrap();
         std::os::unix::fs::symlink("../../../..", root.join("etc/up")).unwrap();
         std::os::unix::fs::symlink("/mnt/c/Users/me", root.join("etc/win")).unwrap();
+        std::os::unix::fs::symlink("/mnt/wslg/.X11-unix", root.join("etc/x11")).unwrap();
+        std::os::unix::fs::symlink("/mnt/wslg/distro", root.join("etc/wslg-escape")).unwrap();
         std::os::unix::fs::symlink("loop", root.join("loop")).unwrap();
+        let w = wsl();
+        assert_eq!(
+            distro_unix_source("/etc/x11", "/etc/x11", "Ubuntu", "/mnt/wsl/kiri", &root.to_string_lossy(), Some(&w)).unwrap(),
+            "/mnt/wslg/.X11-unix"
+        );
+        assert!(
+            distro_unix_source("/etc/wslg-escape", "/etc/wslg-escape", "Ubuntu", "/mnt/wsl/kiri", &root.to_string_lossy(), Some(&w)).is_err()
+        );
         let followed = |p: &str| resolve_in_root(&root, p);
         assert_eq!(followed("/etc/localtime").unwrap(), ("/usr/share/zoneinfo/Europe/Berlin".to_owned(), true));
         assert_eq!(followed("/etc/up/etc").unwrap(), ("/etc".to_owned(), false));
