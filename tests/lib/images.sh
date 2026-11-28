@@ -59,7 +59,8 @@ kiri_image_sources() {
     curlimages/curl:*) echo "mirror.gcr.io/$_kis_img quay.io/curl/curl:${_kis_img#*:}" ;;
     # Valkey publishes to Amazon's registry itself.
     valkey/valkey:*) echo "public.ecr.aws/$_kis_img mirror.gcr.io/$_kis_img" ;;
-    # buildx's BuildKit image, and the amd64-only alpine repository.
+    # Kiri's pinned BuildKit image (crates/kiri/src/daemon/builder.rs), and the amd64-only alpine repository.
+    moby/buildkit:buildx-stable-1) echo "mirror.gcr.io/moby/buildkit@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea" ;;
     moby/buildkit:* | amd64/*) echo "mirror.gcr.io/$_kis_img" ;;
     # Not an official image and no source known outside Docker Hub.
     */*) ;;

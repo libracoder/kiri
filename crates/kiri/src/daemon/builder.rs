@@ -28,13 +28,25 @@ use super::api::{self, Next};
 use super::engine::{Engine, Error, ExecConfig, Status};
 use super::http::{self, Request};
 
-/// The image buildx's docker-container driver runs, by the tag it uses: an
-/// image already pulled under it is used as it is.
+/// The image buildx's docker-container driver runs, by the tag it uses.
 pub const IMAGE: &str = "moby/buildkit:buildx-stable-1";
 /// What a fresh pull fetches: that tag's index on 2026-10-30 (BuildKit
 /// 0.2x), pinned so every Kiri builds with the same BuildKit. Stored under
-/// [`IMAGE`]. Moving the pin changes nothing for an image already pulled.
+/// [`IMAGE`].
 const PINNED: &str = "moby/buildkit@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea";
+/// Verified `linux/amd64` and `linux/arm64` config digests of [`PINNED`].
+const PINNED_CONFIGS: [&str; 2] = [
+    "sha256:27933730df224df80c41f4e5a9b33fa78831a79fd31903df3bb7deb49363422f",
+    "sha256:f27f9c00a3aca2c219642d1500610eade3ddcb6b873ea8847852ab156663d32f",
+];
+
+fn is_pinned(store: &kiri_image::Store, i: &kiri_image::Image) -> bool {
+    PINNED_CONFIGS.contains(&i.config_digest.as_str()) && store.check_image(i).is_ok()
+}
+
+fn container_is_pinned(engine: &Engine, id: &str) -> bool {
+    engine.with(id, |c| PINNED_CONFIGS.contains(&c.spec.image_id.as_str())).unwrap_or(false)
+}
 /// Marks the container as Kiri's builder. It stays in `docker ps`, as
 /// buildx's does on any engine.
 const LABEL: &str = "dev.kiri.builder";
@@ -170,14 +182,15 @@ pub fn set_settings(req: &Request) -> Result<(), Error> {
 
 // --- The container -------------------------------------------------------
 
-/// The BuildKit image, pulled (by [`PINNED`]) if it isn't here yet.
+/// The BuildKit image, pulled (by [`PINNED`]) if missing or if any local
+/// [`IMAGE`] tag does not match [`PINNED_CONFIGS`] and its verified layers.
 fn ensure_image(engine: &Engine, say: &mut dyn FnMut(&str)) -> Result<kiri_image::Image, Error> {
-    if let Some(i) = engine.image(IMAGE)? {
+    if let Some(i) = engine.image(IMAGE)?.filter(|i| is_pinned(&engine.store, i)) {
         return Ok(i);
     }
     let _p = PULL.lock().unwrap_or_else(|e| e.into_inner());
     // Pulled meanwhile by whoever had the lock.
-    if let Some(i) = engine.image(IMAGE)? {
+    if let Some(i) = engine.image(IMAGE)?.filter(|i| is_pinned(&engine.store, i)) {
         return Ok(i);
     }
     say(&format!("Pulling {IMAGE} for Kiri's builder"));
@@ -185,14 +198,21 @@ fn ensure_image(engine: &Engine, say: &mut dyn FnMut(&str)) -> Result<kiri_image
     let pulled = Client::new()
         .pull(&engine.store, &reference, &Platform::host_linux(), &|_| {})
         .map_err(|e| Error::Io(io::Error::other(format!("pulling {IMAGE}: {e}"))))?;
+    if !is_pinned(&engine.store, &pulled) {
+        let _ = engine.store.remove_image(&pulled.name);
+        return Err(Error::Io(io::Error::other(format!("pulled {PINNED} did not match pinned BuildKit config"))));
+    }
     let name = Reference::parse(IMAGE).map(|r| r.short()).unwrap_or_else(|_| IMAGE.to_owned());
-    engine.store.put_image(kiri_image::Image { name: name.clone(), ..pulled.clone() })?;
+    engine.store.put_image(pulled.tagged(name.clone()))?;
     // Known by its tag only: the blobs stay, the tagged record uses them.
     if pulled.name != name {
         let _ = engine.store.remove_image(&pulled.name);
     }
     engine.emit_image("pull", &pulled.config_digest, &name);
-    engine.image(IMAGE)?.ok_or_else(|| Error::Io(io::Error::other(format!("{IMAGE} vanished after its pull"))))
+    engine
+        .image(IMAGE)?
+        .filter(|i| is_pinned(&engine.store, i))
+        .ok_or_else(|| Error::Io(io::Error::other(format!("{IMAGE} vanished after its pull"))))
 }
 
 /// The body of the builder's create: what buildx's docker-container driver
@@ -237,8 +257,12 @@ fn create_with(engine: &Engine, requested: Option<&Value>, say: &mut dyn FnMut(&
     let name = container_name();
     let req = Request::internal("POST", "/containers/create", &[("name", &name)], create_body_from(requested).to_string().into_bytes());
     let made = api::create(&req, engine)?;
-    crate::diag::info!("builder created", name = name);
     let id = made["Id"].as_str().unwrap_or_default().to_owned();
+    if !container_is_pinned(engine, &id) {
+        let _ = engine.remove(&id, true, false);
+        return Err(Error::Conflict(format!("builder container {name} did not resolve to pinned {IMAGE}")));
+    }
+    crate::diag::info!("builder created", name = name);
     // Before its first start, whoever starts it (buildx, for one).
     let _ = write_config(engine, &id);
     Ok(id)
@@ -253,9 +277,22 @@ fn create_with(engine: &Engine, requested: Option<&Value>, say: &mut dyn FnMut(&
 pub fn start(engine: &Engine, key: &str) -> Option<Result<(), Error>> {
     // One lookup for a start of any other container.
     let Ok(true) = engine.with(key, |c| c.name == container_name()) else { return None };
+    if !container_is_pinned(engine, key)
+        && let Err(e) = ensure_image(engine, &mut |_| {})
+    {
+        return Some(Err(e));
+    }
     start_with(
         &ENSURE,
-        || find(engine).map(|(id, st)| (id, st == Status::Running)),
+        || {
+            let (id, st) = find(engine)?;
+            if container_is_pinned(engine, &id) {
+                return Some(Ok((id, st == Status::Running)));
+            }
+            crate::diag::warn!("replacing unpinned builder container before start", id = &id[..id.len().min(12)]);
+            let _ = engine.remove(&id, true, false);
+            Some(create(engine, &mut |_| {}).map(|new_id| (new_id, false)))
+        },
         |id| write_config(engine, id),
         |id| {
             let started = engine.start(id);
@@ -269,12 +306,15 @@ pub fn start(engine: &Engine, key: &str) -> Option<Result<(), Error>> {
 
 fn start_with(
     lock: &Mutex<()>,
-    find: impl FnOnce() -> Option<(String, bool)>,
+    find: impl FnOnce() -> Option<Result<(String, bool), Error>>,
     write: impl FnOnce(&str) -> Result<(), Error>,
     start: impl FnOnce(&str) -> Result<(), Error>,
 ) -> Option<Result<(), Error>> {
     let _g = lock.lock().unwrap_or_else(|e| e.into_inner());
-    let (id, running) = find()?;
+    let (id, running) = match find()? {
+        Ok(found) => found,
+        Err(e) => return Some(Err(e)),
+    };
     if !running && let Err(e) = write(&id) {
         return Some(Err(e));
     }
@@ -569,8 +609,11 @@ pub fn create_for_buildx(engine: &Engine, req: &Request) -> Option<Result<Value,
         }
     };
     let _g = ENSURE.lock().unwrap_or_else(|e| e.into_inner());
-    if find(engine).is_some() {
-        return None;
+    if let Some((id, _)) = find(engine) {
+        if container_is_pinned(engine, &id) {
+            return None;
+        }
+        let _ = engine.remove(&id, true, false);
     }
     Some(create_with(engine, requested.as_ref(), &mut |_| {}).map(|id| json!({"Id": id, "Warnings": []})))
 }
@@ -587,13 +630,18 @@ fn claim_for_build(up: bool, execs: usize, stale: bool) -> (bool, Busy) {
 /// The builder, made if need be, started and answering. `say` hears what
 /// takes a while (a pull, a start).
 pub(super) fn ensure_running(engine: &Engine, say: &mut dyn FnMut(&str)) -> Result<(String, Busy), Error> {
-    if find(engine).is_none() {
+    if find(engine).is_none_or(|(id, _)| !container_is_pinned(engine, &id)) {
         // Before the lock: a pull must not hold the builder up for others.
         ensure_image(engine, say)?;
     }
     let _g = ENSURE.lock().unwrap_or_else(|e| e.into_inner());
     let (id, status) = match find(engine) {
-        Some(found) => found,
+        Some((id, status)) if container_is_pinned(engine, &id) => (id, status),
+        Some((old_id, _)) => {
+            crate::diag::warn!("replacing unpinned builder container", id = &old_id[..old_id.len().min(12)]);
+            let _ = engine.remove(&old_id, true, false);
+            (create(engine, say)?, Status::Created)
+        }
         None => (create(engine, say)?, Status::Created),
     };
     // daemon.json edited by hand, or a setting saved while the builder ran:
@@ -830,6 +878,22 @@ fn clean_path(p: &str) -> Result<String, Error> {
     Ok(parts.join("/"))
 }
 
+fn parse_extra_host(h: &str) -> Result<String, Error> {
+    let sep = match (h.find(':'), h.find('=')) {
+        (Some(a), Some(b)) => a.min(b),
+        (Some(a), None) | (None, Some(a)) => a,
+        (None, None) => return Err(Error::BadRequest(format!("invalid extra host {h}"))),
+    };
+    let (name, ip) = (&h[..sep], &h[sep + 1..]);
+    let valid_name = !name.is_empty() && !name.bytes().any(|b| b.is_ascii_control() || matches!(b, b'=' | b',' | b' ' | b'\t'));
+    let valid_ip = ip == "host-gateway" || ip.parse::<std::net::IpAddr>().is_ok();
+    if !valid_name || !valid_ip {
+        return Err(Error::BadRequest(format!("invalid extra host {h}")));
+    }
+    let ip = if ip == "host-gateway" { super::ports::HOST_ADDR } else { ip };
+    Ok(format!("{name}={ip}"))
+}
+
 impl Options {
     fn parse(req: &Request) -> Result<Options, Error> {
         if req.query("version") == Some("2") {
@@ -856,10 +920,13 @@ impl Options {
             m => return Err(Error::BadRequest(format!("network mode \"{m}\" not supported by buildkit"))),
         };
         let mut extra_hosts = Vec::new();
-        for h in req.queries("extrahosts").flat_map(|h| h.split(',')).map(str::trim).filter(|h| !h.is_empty()) {
-            let (name, ip) = h.split_once(':').or_else(|| h.split_once('=')).ok_or_else(|| Error::BadRequest(format!("invalid extra host {h}: name:ip")))?;
-            let ip = if ip == "host-gateway" { super::ports::HOST_ADDR } else { ip };
-            extra_hosts.push(format!("{name}={ip}"));
+        for raw in req.queries("extrahosts").filter(|h| !h.is_empty()) {
+            if raw.bytes().any(|b| b.is_ascii_control()) {
+                return Err(Error::BadRequest(format!("invalid extra host {raw}")));
+            }
+            for h in raw.split(',').map(|s| s.trim_matches(' ')) {
+                extra_hosts.push(parse_extra_host(h)?);
+            }
         }
         let ulimits = json_query(req, "ulimits")?
             .as_array()
@@ -1471,7 +1538,6 @@ mod tests {
 
     #[test]
     fn create_for_buildx_preserves_host_network_and_dns_options() {
-        use std::io::Write as _;
         let def = create_body_from(None);
         assert!(def["HostConfig"].get("NetworkMode").is_none());
 
@@ -1496,15 +1562,18 @@ mod tests {
         assert_eq!(merged["Env"], json!(["HTTP_PROXY=http://10.0.0.1:3128"]));
         assert_eq!(merged["HostConfig"]["RestartPolicy"]["Name"], "no", "managed builder starts on demand");
 
-        // Full create_for_buildx round-trip against Engine::boot with IMAGE pre-seeded.
+        // Full create_for_buildx round-trip against Engine::boot with pinned IMAGE pre-seeded.
         let dir = std::env::temp_dir().join(format!("kiri-builder-hostnet-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let store = kiri_image::Store::open(&dir).unwrap();
-        let cfg = json!({"created": "2026-11-16T00:00:00Z", "architecture": "arm64", "os": "linux", "config": {"Cmd": ["buildkitd"]}});
-        let mut w = store.ingest().unwrap();
-        w.write_all(&serde_json::to_vec(&cfg).unwrap()).unwrap();
-        let (digest, _) = w.finish().unwrap();
-        store.put_image(kiri_image::archive::from_config(IMAGE.into(), &digest, &cfg, Vec::new())).unwrap();
+        let cfg = json!({
+            "created": "2026-11-16T00:00:00Z", "architecture": "arm64", "os": "linux",
+            "config": {"Cmd": ["buildkitd"]},
+            "rootfs": {"type": "layers", "diff_ids": []},
+        });
+        let pinned_digest = PINNED_CONFIGS[1];
+        std::fs::write(store.blob_path(pinned_digest).unwrap(), serde_json::to_vec(&cfg).unwrap()).unwrap();
+        store.put_image(kiri_image::archive::from_config(IMAGE.into(), pinned_digest, &cfg, Vec::new())).unwrap();
         let engine = Engine::boot(store).unwrap();
 
         let other = Request::internal("POST", "/containers/create", &[("name", "not-builder")], serde_json::to_vec(&asked).unwrap());
@@ -1786,7 +1855,7 @@ mod tests {
         let log = std::cell::RefCell::new(Vec::new());
         let res = start_with(
             &lock,
-            || Some(("b1".into(), false)),
+            || Some(Ok(("b1".into(), false))),
             |id| {
                 assert!(lock.try_lock().is_err(), "ENSURE must be held during write");
                 log.borrow_mut().push(format!("write:{id}"));
@@ -1804,7 +1873,7 @@ mod tests {
         log.borrow_mut().clear();
         let res = start_with(
             &lock,
-            || Some(("b1".into(), true)),
+            || Some(Ok(("b1".into(), true))),
             |id| {
                 log.borrow_mut().push(format!("write:{id}"));
                 Ok(())
@@ -1828,7 +1897,7 @@ mod tests {
         let mut started = false;
         let res = start_with(
             &lock,
-            || Some(("b1".into(), false)),
+            || Some(Ok(("b1".into(), false))),
             |_| Err(Error::Io(io::Error::other("copy_in failed"))),
             |_| {
                 started = true;
@@ -2128,5 +2197,117 @@ mod tests {
         let root_df = Options::parse(&req(&[("dockerfile", r".\Dockerfile")])).unwrap();
         assert_eq!(root_df.dockerfile, "Dockerfile");
         assert_eq!(Options::parse(&req(&[("dockerfile", r".\")])).unwrap().dockerfile, "Dockerfile");
+    }
+
+    #[test]
+    fn builder_image_pin_rejects_spoofed_and_accepts_retagged_genuine() {
+        use std::io::Write as _;
+        let dir = std::env::temp_dir().join(format!("kiri-builder-pin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = kiri_image::Store::open(&dir).unwrap();
+
+        let real_tar = tar(&[("usr/bin/buildkitd", Some(b"real-buildkitd"))]);
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(&real_tar).unwrap();
+        let real_gz = gz.finish().unwrap();
+        let mut w = store.ingest().unwrap();
+        w.write_all(&real_gz).unwrap();
+        let (real_layer_digest, real_layer_size) = w.finish().unwrap();
+        let real_diff_id = kiri_image::store::sha256_digest(&real_tar);
+
+        // (a) Spoofed `moby/buildkit:buildx-stable-1` with unpinned config digest: rejected!
+        let spoof_cfg = json!({
+            "architecture": "arm64", "os": "linux", "config": {"Cmd": ["/bin/evil"]},
+            "rootfs": {"type": "layers", "diff_ids": [&real_diff_id]},
+        });
+        let mut w = store.ingest().unwrap();
+        w.write_all(&serde_json::to_vec(&spoof_cfg).unwrap()).unwrap();
+        let (spoof_cfg_digest, _) = w.finish().unwrap();
+        let spoof_img = kiri_image::archive::from_config(
+            IMAGE.into(),
+            &spoof_cfg_digest,
+            &spoof_cfg,
+            vec![kiri_image::Layer { digest: real_layer_digest.clone(), size: real_layer_size, media_type: "application/vnd.oci.image.layer.v1.tar+gzip".into() }],
+        );
+        assert!(!is_pinned(&store, &spoof_img), "unpinned config_digest must be rejected");
+
+        // Spoofed layer under a pinned config digest (diff_ids mismatch): rejected!
+        let evil_tar = tar(&[("usr/bin/buildkitd", Some(b"evil-payload"))]);
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(&evil_tar).unwrap();
+        let mut w = store.ingest().unwrap();
+        w.write_all(&gz.finish().unwrap()).unwrap();
+        let (evil_layer_digest, evil_layer_size) = w.finish().unwrap();
+
+        let pinned_cfg = json!({
+            "architecture": "amd64", "os": "linux", "config": {"Cmd": ["buildkitd"]},
+            "rootfs": {"type": "layers", "diff_ids": [&real_diff_id]},
+        });
+        std::fs::write(store.blob_path(PINNED_CONFIGS[0]).unwrap(), serde_json::to_vec(&pinned_cfg).unwrap()).unwrap();
+
+        let mismatched_layers = kiri_image::archive::from_config(
+            IMAGE.into(),
+            PINNED_CONFIGS[0],
+            &pinned_cfg,
+            vec![kiri_image::Layer { digest: evil_layer_digest, size: evil_layer_size, media_type: "application/vnd.oci.image.layer.v1.tar+gzip".into() }],
+        );
+        assert!(!is_pinned(&store, &mismatched_layers), "mismatched layer diff_id under pinned config must be rejected");
+
+        // (b) Genuine pinned config + verified layer is accepted, including after
+        // `Image::tagged` from a mirror repository clears `index_digest`.
+        let mut from_mirror = kiri_image::archive::from_config(
+            "mirror.gcr.io/moby/buildkit@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea".into(),
+            PINNED_CONFIGS[0],
+            &pinned_cfg,
+            vec![kiri_image::Layer { digest: real_layer_digest, size: real_layer_size, media_type: "application/vnd.oci.image.layer.v1.tar+gzip".into() }],
+        );
+        from_mirror.index_digest = Some("sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea".into());
+        assert!(is_pinned(&store, &from_mirror));
+        let retagged = from_mirror.tagged(IMAGE.into());
+        assert_eq!(retagged.index_digest, None, "cross-repo Image::tagged clears index_digest");
+        assert!(is_pinned(&store, &retagged), "genuine config+layer still accepted after Image::tagged");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extrahosts_rejects_control_chars_commas_and_invalid_ips() {
+        let ok = Options::parse(&req(&[
+            ("extrahosts", "db:10.0.0.2, cache=192.168.1.9"),
+            ("extrahosts", "v6a:2001:db8::1"),
+            ("extrahosts", "v6b=fd00::42"),
+            ("extrahosts", "gw:host-gateway"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            ok.extra_hosts,
+            [
+                "db=10.0.0.2".to_owned(),
+                "cache=192.168.1.9".to_owned(),
+                "v6a=2001:db8::1".to_owned(),
+                "v6b=fd00::42".to_owned(),
+                format!("gw={}", super::super::ports::HOST_ADDR),
+            ]
+        );
+
+        for bad in [
+            "db:not-an-ip",
+            "db:999.0.0.1",
+            "db:10.0.0.2,force-network-mode=host",
+            "db:10.0.0.2,",
+            ",db:10.0.0.2",
+            ":10.0.0.2",
+            "a=b:10.0.0.2",
+            "bad host:10.0.0.2",
+            "bad\thost:10.0.0.2",
+            "bad\nhost:10.0.0.2",
+            "db:10.0.0.2\n",
+            "\rdb:10.0.0.2",
+            "db\0:10.0.0.2",
+        ] {
+            let err = Options::parse(&req(&[("extrahosts", bad)])).unwrap_err();
+            assert!(matches!(err, Error::BadRequest(ref m) if m.starts_with("invalid extra host ")), "{bad:?}: {err:?}");
+        }
+        assert!(matches!(parse_extra_host("a,b:10.0.0.2"), Err(Error::BadRequest(_))));
     }
 }

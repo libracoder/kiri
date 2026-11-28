@@ -496,10 +496,18 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
                     })
                     .encode(&mut out)
                 }
-                Ok(Msg::LayerQuery(digest)) => Msg::LayerStatus(layers::present(&paths.layers, digest)).encode(&mut out),
+                Ok(Msg::LayerQuery(digest)) => {
+                    let diff_id = layers::recorded_diff_id(&paths.layers, digest);
+                    Msg::LayerStatus { present: layers::present(&paths.layers, digest), diff_id: diff_id.as_deref().unwrap_or("") }.encode(&mut out)
+                }
                 // The blob follows the frame on the same stream.
                 Ok(Msg::LayerBegin(begin)) => match layers::receive(&mut conn, &begin, &paths.layers) {
-                    Ok(stored) => Msg::LayerStored(stored).encode(&mut out),
+                    Ok(stored) => Msg::LayerStored(kiri_proto::LayerStored {
+                        unpacked_bytes: stored.unpacked_bytes,
+                        elapsed_ns: stored.elapsed_ns,
+                        diff_id: &stored.diff_id,
+                    })
+                    .encode(&mut out),
                     Err(e) => Msg::Error(&format!("unpack {}: {e}", begin.digest)).encode(&mut out),
                 },
                 Ok(Msg::Run(spec)) => match {

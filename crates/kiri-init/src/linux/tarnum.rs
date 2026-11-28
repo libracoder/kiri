@@ -86,9 +86,15 @@ impl<R: Read> GoNumbers<R> {
         let realsize: &[(usize, usize)] = if sparse { &REALSIZE } else { &[] };
         let mut changed = false;
         for &(a, b) in std::iter::once(&SIZE).chain(entry).chain(devices).chain(realsize) {
-            if h[a..b].iter().all(|&c| c == 0 || c == b' ') {
+            let lead = h[a..b].iter().take_while(|&&c| c == 0 || c == b' ').count();
+            if lead == b - a {
                 h[a..b - 1].fill(b'0');
                 h[b - 1] = 0;
+                changed = true;
+            } else if h[a..a + lead].contains(&0) {
+                // Leading NULs before the digits: Go skips them (parseOctal
+                // trims " \x00"); tar-rs would stop at the first one.
+                h[a..a + lead].fill(b'0');
                 changed = true;
             }
         }
@@ -557,5 +563,41 @@ mod tests {
         assert_eq!(got[0].0, "sparse.bin");
         assert_eq!(got[0].2, fake.as_bytes());
         assert_eq!(got[1].0, "after");
+    }
+
+    #[test]
+    fn leading_nuls_before_octal_digits_parse_as_in_go() {
+        // #993: Go's archive/tar trims both spaces and NULs from the left of
+        // numeric fields (`\0\0\00644\0` -> 0o644), whereas tar-rs stops at the
+        // first NUL and reads 0.
+        let mut h = tar::Header::new_gnu();
+        h.set_path("hello.txt").unwrap();
+        h.set_entry_type(tar::EntryType::Regular);
+        h.as_mut_bytes()[100..108].copy_from_slice(b"\x00\x00\x000644\x00");
+        h.as_mut_bytes()[108..116].copy_from_slice(b"\x00\x0001750\x00");
+        h.as_mut_bytes()[116..124].copy_from_slice(b"\x00\x0001750\x00");
+        h.as_mut_bytes()[124..136].copy_from_slice(b"\x00\x00\x00\x00\x00\x00\x00\x00005\x00");
+        h.as_mut_bytes()[136..148].copy_from_slice(b"\x000000001750\x00");
+        h.set_cksum();
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(h.as_bytes());
+        let mut payload = [0u8; BLOCK];
+        payload[..5].copy_from_slice(b"world");
+        bytes.extend_from_slice(&payload);
+        bytes.extend_from_slice(&[0u8; 2 * BLOCK]);
+
+        let mut archive = tar::Archive::new(GoNumbers::new(&bytes[..]));
+        let mut list = archive.entries().unwrap();
+        let mut entry = list.next().unwrap().unwrap();
+        assert_eq!(entry.header().mode().unwrap(), 0o644);
+        assert_eq!(entry.header().uid().unwrap(), 0o1750);
+        assert_eq!(entry.header().gid().unwrap(), 0o1750);
+        assert_eq!(entry.header().size().unwrap(), 5);
+        assert_eq!(entry.header().mtime().unwrap(), 0o1750);
+        let mut body = Vec::new();
+        entry.read_to_end(&mut body).unwrap();
+        assert_eq!(body, b"world");
+        assert!(list.next().is_none());
     }
 }

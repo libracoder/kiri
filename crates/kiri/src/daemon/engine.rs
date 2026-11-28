@@ -3905,49 +3905,52 @@ impl Engine {
         send(&keep)
     }
 
-    /// Sends the guest every layer of these (digest, media type) it doesn't
-    /// have unpacked, from the blob store.
+    /// Sends the guest every layer of these `(digest, expected_diff_id)` it
+    /// doesn't already have unpacked with the matching `diff_id`.
     fn ensure_layers<'a>(&self, vm: &VmLink, layers: impl Iterator<Item = (&'a str, &'a str)>) -> io::Result<()> {
         let _one_at_a_time = self.layers.lock().unwrap_or_else(|e| e.into_inner());
-        for (digest, media_type) in layers {
+        for (digest, expected_diff_id) in layers {
             let _blob_pin = self.store.pin(digest);
-            if !vm.has_layer(digest)? {
-                vm.send_layer(digest, media_type, &self.store.blob_path(digest)?)?;
+            if !vm.has_layer(digest, expected_diff_id)? {
+                vm.send_layer(digest, expected_diff_id, &self.store.blob_path(digest)?)?;
             }
         }
         Ok(())
     }
 
-    /// A container's layers back in the guest before it runs again: the
-    /// guest deletes an unpacked layer at boot when it isn't whole (an unpack
-    /// cut short, or one from before layers were marked whole), and a
-    /// container created before that would otherwise fail to start with
-    /// "layer ... is not unpacked". The media type comes from any image with
-    /// the layer; a layer no image has any more can't be sent again.
+    /// Ensures a container's layers are unpacked in the guest with their
+    /// verified `diff_id`s before it starts again or is copied from.
     fn restore_layers(&self, vm: &VmLink, layers: &[String]) -> Result<(), Error> {
-        let mut missing = Vec::new();
+        let mut missing: Vec<(&str, String)> = Vec::new();
         for digest in layers {
-            if !vm.has_layer(digest)? {
-                missing.push(digest);
+            let expected = match self.store.known_diff_id(digest) {
+                Some(d) => Some(d),
+                None if self.store.blob_path(digest).is_ok_and(|p| p.is_file()) => Some(self.store.diff_id(digest).map_err(io::Error::from)?),
+                None => None,
+            };
+            let want = expected.as_deref().unwrap_or("");
+            if !vm.has_layer(digest, want)? {
+                let Some(want) = expected else {
+                    return Err(Error::Conflict(format!(
+                        "layer {digest} is gone from the engine and no image has it any more: remove this container and create it again"
+                    )));
+                };
+                missing.push((digest.as_str(), want));
             }
         }
-        // The usual case: nothing to send, and no need to read the image index.
         if missing.is_empty() {
             return Ok(());
         }
-        let (wanted, _blob_pins) = self.store.with_images(|images| -> Result<_, Error> {
-            let mut wanted = Vec::with_capacity(missing.len());
-            let mut pins = Vec::with_capacity(missing.len());
-            for digest in &missing {
-                let Some(l) = images.iter().flat_map(|i| &i.layers).find(|l| &l.digest == *digest) else {
-                    return Err(Error::Conflict(format!("layer {digest} is gone from the engine and no image has it any more: remove this container and create it again")));
-                };
-                pins.push(self.store.pin(&l.digest));
-                wanted.push((l.digest.clone(), l.media_type.clone()));
+        let mut pins = Vec::with_capacity(missing.len());
+        for (digest, _) in &missing {
+            pins.push(self.store.pin(digest));
+            if !self.store.blob_path(digest)?.is_file() {
+                return Err(Error::Conflict(format!(
+                    "layer {digest} is gone from the engine and no image has it any more: remove this container and create it again"
+                )));
             }
-            Ok((wanted, pins))
-        })??;
-        Ok(self.ensure_layers(vm, wanted.iter().map(|(d, m)| (d.as_str(), m.as_str())))?)
+        }
+        Ok(self.ensure_layers(vm, missing.iter().map(|(d, w)| (*d, w.as_str())))?)
     }
 
     /// Records a container and makes sure its layers are in the guest, so
@@ -3956,8 +3959,9 @@ impl Engine {
         let _pin = self.pin_layers(image.layers.iter().map(|l| l.digest.as_str()));
         let _blob_pins = self.store.hold_image(image);
         if !image.layers.is_empty() {
+            let diff_ids = self.store.checked_diff_ids(image)?;
             let vm = self.vm()?;
-            self.ensure_layers(&vm, image.layers.iter().map(|l| (l.digest.as_str(), l.media_type.as_str())))?;
+            self.ensure_layers(&vm, image.layers.iter().zip(&diff_ids).map(|(l, d)| (l.digest.as_str(), d.as_str())))?;
         }
         let id = random_hex(32);
         let persist = !spec.auto_remove;
@@ -5069,6 +5073,7 @@ impl Engine {
         };
         let (mounts, flags) = copy_mounts_and_flags(&spec, op, flags);
         let vm = self.vm()?;
+        self.restore_layers(&vm, &layers)?;
         let stream = vm.connect(kiri_proto::COPY_PORT)?;
         let mut out = Vec::new();
         kiri_proto::encode_copy(&mut out, op, &id, path, flags, &layers, &mounts);
@@ -7836,7 +7841,7 @@ mod vm_recovery_tests {
         {
             let vm = engine.awake().unwrap();
             let missing = root.join("retirement-missing.blob");
-            assert!(vm.send_layer("sha256:0000000000000000000000000000000000000000000000000000000000000000", "application/vnd.oci.image.layer.v1.tar+gzip", &missing).is_err());
+            assert!(vm.send_layer("sha256:0000000000000000000000000000000000000000000000000000000000000000", "", &missing).is_err());
             assert!(!vm.is_disconnected(), "a missing blob must not cost the VM");
             assert!(vm.stats().is_ok(), "the link still answers after a missing blob");
             println!("PASS: missing layer blob fails before the header; the VM carries on");

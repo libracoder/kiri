@@ -7,6 +7,7 @@ pub mod b64;
 pub mod cancel;
 pub mod config;
 mod connect;
+pub mod diffid;
 pub mod jsonfile;
 pub mod mirror;
 pub mod reference;

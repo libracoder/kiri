@@ -1160,7 +1160,7 @@ fn import_upper(mut reader: impl Read, base: &Path) -> io::Result<()> {
     let upper = base.join("upper");
     let staging = base.join("upper.import");
     fs::create_dir_all(base)?;
-    match fs::remove_dir_all(&staging) {
+    match super::rmtree::remove_tree(&staging) {
         Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
         _ => {}
     }
@@ -1181,7 +1181,7 @@ fn import_upper(mut reader: impl Read, base: &Path) -> io::Result<()> {
         fs::rename(&staging, &upper)
     })();
     if let Err(e) = unpacked {
-        let _ = fs::remove_dir_all(&staging);
+        let _ = super::rmtree::remove_tree(&staging);
         return Err(e);
     }
     container::mark_plain_upper(base)

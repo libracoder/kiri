@@ -1361,7 +1361,7 @@ fn undo_now(t: &Teardown, remove_files: bool) {
     // container's files, until it ends.
     super::roots::release(&t.base);
     if let Some(id) = t.base.file_name() {
-        let _ = fs::remove_dir_all(PathBuf::from("/run/kiri").join(id));
+        let _ = super::rmtree::remove_tree(&PathBuf::from("/run/kiri").join(id));
     }
     remove_cgroup(&t.cgroup);
     if t.cgroup.exists() {
@@ -1393,7 +1393,7 @@ pub fn remove_volume(name: &str) {
             eprintln!("kiri-init: volume {name}: {data} is still mounted, not deleting it");
             return;
         }
-        let _ = fs::remove_dir_all(PathBuf::from(VOLUMES).join(name));
+        let _ = super::rmtree::remove_tree(&PathBuf::from(VOLUMES).join(name));
     }
 }
 
@@ -1428,7 +1428,7 @@ pub fn sweep(paths: &Paths, cgroup: &std::path::Path) {
         }
         // systemd removes a stopped service's cgroups (#230), so this runs
         // whether or not the container's cgroup is still there.
-        let _ = fs::remove_dir_all(PathBuf::from("/run/kiri").join(id));
+        let _ = super::rmtree::remove_tree(&PathBuf::from("/run/kiri").join(id));
         if cg.is_dir() {
             remove_cgroup(&cg);
         }

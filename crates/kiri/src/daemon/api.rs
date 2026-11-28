@@ -746,8 +746,11 @@ fn image_inspect(engine: &Engine, name: &str) -> Result<Value, Error> {
 fn image_remove(engine: &Engine, name: &str, force: bool) -> Result<Value, Error> {
     let i = engine.image(name)?.ok_or_else(|| Error::NotFound(format!("No such image: {name}")))?;
     // With another tag on the same image, removing this one only untags it.
-    let other_tags = engine.store.images()?.iter().any(|o| o.config_digest == i.config_digest && o.name != i.name);
-    let in_use = if other_tags { Vec::new() } else { engine.each(|c| (c.spec.image_id == i.config_digest).then(|| c.short_id().to_owned())) };
+    // Another image sharing `config_digest` with different layer blobs is NOT
+    // another tag on these blobs, so removing this one still checks containers.
+    let other_tags = engine.store.images()?.iter().any(|o| o.config_digest == i.config_digest && o.name != i.name && o.layers == i.layers);
+    let mine = |c: &super::engine::Container| c.layers.is_empty() || c.layers.iter().eq(i.layers.iter().rev().map(|l| &l.digest));
+    let in_use = if other_tags { Vec::new() } else { engine.each(|c| (c.spec.image_id == i.config_digest && mine(c)).then(|| c.short_id().to_owned())) };
     if let Some(c) = in_use.first() {
         return Err(Error::Conflict(format!(
             "conflict: unable to remove repository reference \"{name}\" (must force) - container {c} is using its referenced image"
@@ -6280,9 +6283,23 @@ mod tests {
             w.write_all(bytes).unwrap();
             w.finish().unwrap()
         };
-        let config = json!({"os": "linux", "architecture": "amd64", "created": "2026-01-01T00:00:00Z", "config": {"Cmd": ["echo", "hi"]}});
+        let mut raw_tar = tar::Builder::new(Vec::new());
+        let mut h = tar::Header::new_ustar();
+        h.set_size(3);
+        h.set_mode(0o644);
+        h.set_entry_type(tar::EntryType::Regular);
+        raw_tar.append_data(&mut h, "etc/hi", &b"hi\n"[..]).unwrap();
+        let raw_tar = raw_tar.into_inner().unwrap();
+        let mut layer_gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        layer_gz.write_all(&raw_tar).unwrap();
+        let layer_gz = layer_gz.finish().unwrap();
+        let config = json!({
+            "os": "linux", "architecture": "amd64", "created": "2026-01-01T00:00:00Z",
+            "config": {"Cmd": ["echo", "hi"]},
+            "rootfs": {"type": "layers", "diff_ids": [kiri_image::store::sha256_digest(&raw_tar)]},
+        });
         let (cfg, _) = put(&serde_json::to_vec(&config).unwrap());
-        let (layer, size) = put(b"\x1f\x8bnot really gzip");
+        let (layer, size) = put(&layer_gz);
         let layers = vec![kiri_image::Layer { digest: layer, size, media_type: "application/vnd.docker.image.rootfs.diff.tar.gzip".into() }];
         let image = kiri_image::archive::from_config("demo:gz".into(), &cfg, &config, layers);
         let mut plain = Vec::new();
@@ -6337,9 +6354,22 @@ mod tests {
             w.finish().unwrap()
         };
         let make_manifest = |arch: &str| {
-            let cfg_bytes = serde_json::to_vec(&json!({"os": "linux", "architecture": arch, "created": "2026-01-01T00:00:00Z", "config": {"Cmd": [arch]}})).unwrap();
+            let mut lb = tar::Builder::new(Vec::new());
+            let payload = format!("layer-{arch}").into_bytes();
+            let mut h = tar::Header::new_ustar();
+            h.set_size(payload.len() as u64);
+            h.set_mode(0o644);
+            h.set_entry_type(tar::EntryType::Regular);
+            lb.append_data(&mut h, "etc/arch", payload.as_slice()).unwrap();
+            let layer_bytes = lb.into_inner().unwrap();
+            let (layer, layer_sz) = put(&layer_bytes);
+            let cfg_bytes = serde_json::to_vec(&json!({
+                "os": "linux", "architecture": arch, "created": "2026-01-01T00:00:00Z",
+                "config": {"Cmd": [arch]},
+                "rootfs": {"type": "layers", "diff_ids": [&layer]},
+            }))
+            .unwrap();
             let (cfg, cfg_sz) = put(&cfg_bytes);
-            let (layer, layer_sz) = put(format!("layer-{arch}").as_bytes());
             let man_bytes = serde_json::to_vec(&json!({
                 "schemaVersion": 2,
                 "config": {"mediaType": "application/vnd.oci.image.config.v1+json", "digest": cfg, "size": cfg_sz},
@@ -6347,7 +6377,7 @@ mod tests {
             }))
             .unwrap();
             let (man, man_sz) = put(&man_bytes);
-            (cfg, cfg_bytes, layer, format!("layer-{arch}").into_bytes(), man, man_bytes, man_sz)
+            (cfg, cfg_bytes, layer, layer_bytes, man, man_bytes, man_sz)
         };
         let amd = make_manifest("amd64");
         let arm = make_manifest("arm64");

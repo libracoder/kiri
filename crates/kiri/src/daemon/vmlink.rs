@@ -21,8 +21,8 @@ use kiri_vmm::Vm;
 /// A reply to one request.
 #[derive(Debug)]
 pub enum Reply {
-    LayerStatus(bool),
-    LayerStored,
+    LayerStatus(bool, String),
+    LayerStored(String),
     /// The process's PID, as the agent's kernel numbers it, and whether
     /// its root is still being made (see `VmLink::run`).
     Started(u32, bool),
@@ -78,9 +78,9 @@ const LONG_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60
 
 pub struct VmLink {
     rpc: Channel,
-    /// Layer digests confirmed unpacked in this guest instance, avoiding
-    /// repeated `LayerQuery` round-trips across `create` and `start`.
-    layers: Mutex<std::collections::HashSet<String>>,
+    /// Layer `digest -> diff_id` confirmed unpacked in this guest instance,
+    /// avoiding repeated `LayerQuery` round-trips across `create` and `start`.
+    layers: Mutex<HashMap<String, String>>,
     /// Kept so the VM lives as long as the link. Behind a mutex only so the
     /// link can be shared between threads; nothing touches it after boot.
     _vm: Mutex<Vm>,
@@ -401,8 +401,8 @@ impl Channel {
                         on_event(Event::Pressure { mem_available_kib: p.mem_available_kib, mem_stall: p.mem_stall });
                         continue;
                     }
-                    Ok(Msg::LayerStatus(have)) => Reply::LayerStatus(have),
-                    Ok(Msg::LayerStored(_)) => Reply::LayerStored,
+                    Ok(Msg::LayerStatus { present, diff_id }) => Reply::LayerStatus(present, diff_id.to_owned()),
+                    Ok(Msg::LayerStored(s)) => Reply::LayerStored(s.diff_id.to_owned()),
                     Ok(Msg::Started { pid, starting, .. }) => Reply::Started(pid, starting),
                     Ok(Msg::Stats(s)) => Reply::Stats(s),
                     Ok(Msg::Pong(_)) => Reply::Pong,
@@ -573,7 +573,7 @@ impl VmLink {
             #[cfg(target_os = "linux")]
             agent_dir: vm.agent_dir().to_owned(),
             rpc,
-            layers: Mutex::new(std::collections::HashSet::new()),
+            layers: Mutex::new(HashMap::new()),
             connector: vm.connector(),
             _vm: Mutex::new(vm),
         })
@@ -609,28 +609,54 @@ impl VmLink {
         if g.0 == asked { None } else { g.1.clone() }
     }
 
-    pub fn has_layer(&self, digest: &str) -> io::Result<bool> {
-        if self.layers.lock().unwrap_or_else(|e| e.into_inner()).contains(digest) {
-            return Ok(true);
+    /// Checks whether `digest` is unpacked in the guest with verified `expected_diff_id`
+    /// (or any non-empty recorded `diff_id` when `expected_diff_id` is empty).
+    /// Returns `Ok(false)` if missing, legacy (empty marker), or `diff_id` mismatches
+    /// so the caller re-unpacks the layer.
+    pub fn has_layer(&self, digest: &str, expected_diff_id: &str) -> io::Result<bool> {
+        {
+            let cached = self.layers.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(recorded) = cached.get(digest)
+                && !recorded.is_empty()
+                && (expected_diff_id.is_empty() || recorded == expected_diff_id)
+            {
+                return Ok(true);
+            }
         }
         match self.call(|o| Msg::LayerQuery(digest).encode(o), None)? {
-            Reply::LayerStatus(have) => {
-                if have {
-                    self.layers.lock().unwrap_or_else(|e| e.into_inner()).insert(digest.to_owned());
+            Reply::LayerStatus(present, diff_id) => {
+                let matches = present && !diff_id.is_empty() && (expected_diff_id.is_empty() || diff_id == expected_diff_id);
+                let mut cached = self.layers.lock().unwrap_or_else(|e| e.into_inner());
+                if matches {
+                    cached.insert(digest.to_owned(), diff_id);
+                } else {
+                    cached.remove(digest);
                 }
-                Ok(have)
+                Ok(matches)
             }
             other => Err(io::Error::other(format!("expected LayerStatus, got {other:?}"))),
         }
     }
 
-    pub fn send_layer(&self, digest: &str, media_type: &str, blob: &Path) -> io::Result<()> {
+    pub fn send_layer(&self, digest: &str, expected_diff_id: &str, blob: &Path) -> io::Result<()> {
         // Opened first, its size from the open file, so a missing blob
         // fails here rather than half-way through the request.
         let file = File::open(blob)?;
         let size = file.metadata()?.len();
-        self.call_long(|o| Msg::LayerBegin(LayerBegin { digest, media_type, size }).encode(o), Some((file, size)))?;
-        self.layers.lock().unwrap_or_else(|e| e.into_inner()).insert(digest.to_owned());
+        let got_diff_id = match self.call_long(|o| Msg::LayerBegin(LayerBegin { digest, size }).encode(o), Some((file, size)))? {
+            Reply::LayerStored(diff_id) => diff_id,
+            other => return Err(io::Error::other(format!("expected LayerStored, got {other:?}"))),
+        };
+        if !expected_diff_id.is_empty() && got_diff_id != expected_diff_id {
+            self.layers.lock().unwrap_or_else(|e| e.into_inner()).remove(digest);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("layer {digest} unpacked to {got_diff_id} in guest, expected {expected_diff_id}"),
+            ));
+        }
+        if !got_diff_id.is_empty() {
+            self.layers.lock().unwrap_or_else(|e| e.into_inner()).insert(digest.to_owned(), got_diff_id);
+        }
         Ok(())
     }
 
@@ -872,7 +898,7 @@ impl VmLink {
     pub fn retain_layers(&self, digests: &[String]) -> io::Result<()> {
         {
             let keep: std::collections::HashSet<&str> = digests.iter().map(String::as_str).collect();
-            self.layers.lock().unwrap_or_else(|e| e.into_inner()).retain(|d| keep.contains(d.as_str()));
+            self.layers.lock().unwrap_or_else(|e| e.into_inner()).retain(|d, _| keep.contains(d.as_str()));
         }
         self.send(|o| kiri_proto::encode_retain_layers(o, digests))
     }
@@ -997,7 +1023,7 @@ impl VmLink {
     pub(super) fn interrupted_layer(&self, blob: &Path) -> io::Result<()> {
         self.call(|out| Msg::LayerBegin(LayerBegin {
             digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-            media_type: "application/vnd.oci.image.layer.v1.tar+gzip", size: 1,
+            size: 1,
         }).encode(out), Some((File::open(blob)?, 1))).map(|_| ())
     }
 
@@ -1288,10 +1314,10 @@ mod tests {
 
     #[test]
     fn forget_layers_evicts_only_requested_digests() {
-        let layers = Mutex::new(std::collections::HashSet::from([
-            "sha256:aaa".to_owned(),
-            "sha256:bbb".to_owned(),
-            "sha256:ccc".to_owned(),
+        let layers = Mutex::new(HashMap::from([
+            ("sha256:aaa".to_owned(), "sha256:111".to_owned()),
+            ("sha256:bbb".to_owned(), "sha256:222".to_owned()),
+            ("sha256:ccc".to_owned(), "sha256:333".to_owned()),
         ]));
         {
             let mut cached = layers.lock().unwrap();
@@ -1301,6 +1327,6 @@ mod tests {
         }
         let left = layers.into_inner().unwrap();
         assert_eq!(left.len(), 1);
-        assert!(left.contains("sha256:bbb"));
+        assert_eq!(left.get("sha256:bbb").map(String::as_str), Some("sha256:222"));
     }
 }

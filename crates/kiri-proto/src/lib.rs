@@ -57,11 +57,137 @@ pub const INPUT_WINDOW: usize = 4 << 20;
 /// has neither field, so decode rejects it as truncated. 11 added
 /// `SetEgressRoutes`, another no-reply message (sent on every VM boot): an
 /// older agent's "unexpected" error would be taken as the reply to the next
-/// request.
-pub const PROTOCOL: u16 = 11;
+/// request. 12 removed `media_type` from `LayerBegin` (both host and guest
+/// sniff format from the blob's first bytes) and added verified `diff_id` to
+/// `LayerStatus` and `LayerStored` so the host verifies unpacked guest layers.
+pub const PROTOCOL: u16 = 12;
 
 /// Most names a `DnsRename` may carry: a name, its aliases and a hostname.
 pub const MAX_DNS_NAMES: usize = 256;
+
+/// How a layer blob is packed, decided strictly from its own magic bytes and
+/// never from a manifest's declared media type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum LayerFormat {
+    Gzip,
+    Zstd,
+    Tar,
+}
+
+impl LayerFormat {
+    /// Sniffs the format from `head` (the blob's first 4 bytes, or fewer if shorter).
+    pub fn sniff(head: &[u8]) -> LayerFormat {
+        match head {
+            [0x1f, 0x8b, ..] => LayerFormat::Gzip,
+            // Standard zstd data frame or skippable frame (`0x184D2A50..=0x184D2A5F`).
+            [0x28, 0xb5, 0x2f, 0xfd, ..] | [0x50..=0x5f, 0x2a, 0x4d, 0x18, ..] => LayerFormat::Zstd,
+            _ => LayerFormat::Tar,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            LayerFormat::Gzip => "gzip",
+            LayerFormat::Zstd => "zstd",
+            LayerFormat::Tar => "tar",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<LayerFormat> {
+        [LayerFormat::Gzip, LayerFormat::Zstd, LayerFormat::Tar].into_iter().find(|f| f.name() == name)
+    }
+}
+
+/// Maximum unpacked size of any single layer (64 GiB).
+pub const LAYER_UNPACK_MAX: u64 = 64 << 30;
+
+/// Maximum total unpacked size across all layers of an image (64 GiB).
+pub const MAX_IMAGE_UNPACK_BYTES: u64 = 64 << 30;
+
+/// Maximum bytes a layer of `format` may unpack to given `compressed` bytes read so far:
+/// - `Gzip`: `2048 * read` clamped to `[1 GiB, 64 GiB]`
+/// - `Zstd`: `32768 * read` clamped to `[1 GiB, 64 GiB]`
+/// - `Tar`: `read` (capped at `64 GiB`)
+pub const fn layer_unpack_cap(format: LayerFormat, compressed: u64) -> u64 {
+    match format {
+        LayerFormat::Gzip => {
+            let scaled = compressed.saturating_mul(2048);
+            if scaled < (1 << 30) {
+                1 << 30
+            } else if scaled > LAYER_UNPACK_MAX {
+                LAYER_UNPACK_MAX
+            } else {
+                scaled
+            }
+        }
+        LayerFormat::Zstd => {
+            let scaled = compressed.saturating_mul(32768);
+            if scaled < (1 << 30) {
+                1 << 30
+            } else if scaled > LAYER_UNPACK_MAX {
+                LAYER_UNPACK_MAX
+            } else {
+                scaled
+            }
+        }
+        LayerFormat::Tar => {
+            if compressed > LAYER_UNPACK_MAX {
+                LAYER_UNPACK_MAX
+            } else {
+                compressed
+            }
+        }
+    }
+}
+
+/// Tracks compressed bytes read vs decompressed tar bytes produced against [`layer_unpack_cap`].
+#[derive(Debug)]
+pub struct UnpackMeter {
+    read: core::cell::Cell<u64>,
+    out: core::cell::Cell<u64>,
+    over: core::cell::Cell<bool>,
+    cap: Cap,
+}
+
+#[derive(Debug)]
+enum Cap {
+    Format(LayerFormat),
+    Other(fn(u64) -> u64),
+}
+
+impl UnpackMeter {
+    pub fn new(format: LayerFormat) -> UnpackMeter {
+        UnpackMeter { read: 0.into(), out: 0.into(), over: false.into(), cap: Cap::Format(format) }
+    }
+
+    pub fn with_cap(cap: fn(u64) -> u64) -> UnpackMeter {
+        UnpackMeter { read: 0.into(), out: 0.into(), over: false.into(), cap: Cap::Other(cap) }
+    }
+
+    pub fn packed(&self, n: usize) {
+        self.read.set(self.read.get().saturating_add(n as u64));
+    }
+
+    #[must_use]
+    pub fn unpacked(&self, n: usize) -> bool {
+        self.out.set(self.out.get().saturating_add(n as u64));
+        if self.out.get() > self.cap() {
+            self.over.set(true);
+        }
+        !self.over.get()
+    }
+
+    pub fn over_cap(&self) -> bool {
+        self.over.get()
+    }
+
+    pub fn cap(&self) -> u64 {
+        match self.cap {
+            Cap::Format(f) => layer_unpack_cap(f, self.read.get()),
+            Cap::Other(cap) => cap(self.read.get()),
+        }
+    }
+}
 
 // `Run` is the one big message and is built and read once per container.
 #[allow(clippy::large_enum_variant)]
@@ -82,11 +208,13 @@ pub enum Msg<'a> {
     Stats(Stats),
     /// Host → guest: is this layer already unpacked? Answered by `LayerStatus`.
     LayerQuery(&'a str),
-    LayerStatus(bool),
+    /// Guest → host: whether the layer is unpacked whole and the `diff_id`
+    /// recorded in its `.done` marker (empty if missing or legacy).
+    LayerStatus { present: bool, diff_id: &'a str },
     /// Host → guest: the next `size` raw bytes on the stream are this layer's
     /// blob. Answered by `LayerStored` or `Error`.
     LayerBegin(LayerBegin<'a>),
-    LayerStored(LayerStored),
+    LayerStored(LayerStored<'a>),
     /// Host → guest: start a container. Answered by `Started` (or `Error`),
     /// then any number of `Output`, then `Exited`.
     Run(RunSpec<'a>),
@@ -472,14 +600,14 @@ pub struct Hello {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LayerBegin<'a> {
     pub digest: &'a str,
-    pub media_type: &'a str,
     pub size: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LayerStored {
+pub struct LayerStored<'a> {
     pub unpacked_bytes: u64,
     pub elapsed_ns: u64,
+    pub diff_id: &'a str,
 }
 
 pub mod run_flags {
@@ -1134,15 +1262,18 @@ impl Msg<'_> {
                 put_u64(o, st.mem_committed_kib.unwrap_or(u64::MAX));
             }),
             Msg::LayerQuery(d) => frame(out, kind::LAYER_QUERY, |o| put_str(o, d)),
-            Msg::LayerStatus(have) => frame(out, kind::LAYER_STATUS, |o| o.push(have as u8)),
+            Msg::LayerStatus { present, diff_id } => frame(out, kind::LAYER_STATUS, |o| {
+                o.push(u8::from(present));
+                put_str(o, diff_id);
+            }),
             Msg::LayerBegin(l) => frame(out, kind::LAYER_BEGIN, |o| {
                 put_str(o, l.digest);
-                put_str(o, l.media_type);
                 put_u64(o, l.size);
             }),
             Msg::LayerStored(l) => frame(out, kind::LAYER_STORED, |o| {
                 put_u64(o, l.unpacked_bytes);
                 put_u64(o, l.elapsed_ns);
+                put_str(o, l.diff_id);
             }),
             Msg::Run(r) => frame(out, kind::RUN, |o| {
                 put_str(o, r.id);
@@ -1495,9 +1626,9 @@ pub fn decode(frame: &[u8]) -> Result<Msg<'_>, DecodeError> {
             },
         }),
         kind::LAYER_QUERY => Msg::LayerQuery(r.str()?),
-        kind::LAYER_STATUS => Msg::LayerStatus(r.u8()? != 0),
-        kind::LAYER_BEGIN => Msg::LayerBegin(LayerBegin { digest: r.str()?, media_type: r.str()?, size: r.u64()? }),
-        kind::LAYER_STORED => Msg::LayerStored(LayerStored { unpacked_bytes: r.u64()?, elapsed_ns: r.u64()? }),
+        kind::LAYER_STATUS => Msg::LayerStatus { present: r.u8()? != 0, diff_id: r.str()? },
+        kind::LAYER_BEGIN => Msg::LayerBegin(LayerBegin { digest: r.str()?, size: r.u64()? }),
+        kind::LAYER_STORED => Msg::LayerStored(LayerStored { unpacked_bytes: r.u64()?, elapsed_ns: r.u64()?, diff_id: r.str()? }),
         kind::RUN => Msg::Run({
             let mut run = RunSpec {
                 id: r.str()?,
@@ -1750,9 +1881,10 @@ mod tests {
         assert_eq!(decode(&buf[..buf.len() - 40]).unwrap(), Msg::Stats(Stats { mem_used_kib: 0, ..no_memory_words }));
         round(Msg::LayerQuery("sha256:ab"));
         round(Msg::StartExec { id: "ctr-123" });
-        round(Msg::LayerStatus(true));
-        round(Msg::LayerBegin(LayerBegin { digest: "sha256:ab", media_type: "x+gzip", size: 9 }));
-        round(Msg::LayerStored(LayerStored { unpacked_bytes: 1, elapsed_ns: 2 }));
+        round(Msg::LayerStatus { present: false, diff_id: "" });
+        round(Msg::LayerStatus { present: true, diff_id: "sha256:cd" });
+        round(Msg::LayerBegin(LayerBegin { digest: "sha256:ab", size: 9 }));
+        round(Msg::LayerStored(LayerStored { unpacked_bytes: 1, elapsed_ns: 2, diff_id: "sha256:cd" }));
         round(Msg::Started { id: "c1", pid: 42, starting: false });
         round(Msg::Started { id: "c1", pid: 42, starting: true });
         // A normal start's frame is the one older agents send; and an older
@@ -1984,6 +2116,37 @@ mod tests {
         let mut buf = Vec::new();
         encode_set_egress_routes(&mut buf, &["10.0.5.0/24"]);
         assert!(takes_no_reply(&buf));
+    }
+
+    #[test]
+    fn layer_format_and_unpack_caps() {
+        use LayerFormat::{Gzip, Tar, Zstd};
+        const { assert!(PROTOCOL >= 12) };
+        assert_eq!(LayerFormat::sniff(&[0x1f, 0x8b, 8, 0]), Gzip);
+        assert_eq!(LayerFormat::sniff(&[0x28, 0xb5, 0x2f, 0xfd]), Zstd);
+        assert_eq!(LayerFormat::sniff(&[0x50, 0x2a, 0x4d, 0x18]), Zstd);
+        assert_eq!(LayerFormat::sniff(&[0x5f, 0x2a, 0x4d, 0x18]), Zstd);
+        assert_eq!(LayerFormat::sniff(&[0x60, 0x2a, 0x4d, 0x18]), Tar);
+        assert_eq!(LayerFormat::sniff(b"etc/"), Tar);
+
+        assert_eq!(layer_unpack_cap(Gzip, 0), 1 << 30);
+        assert_eq!(layer_unpack_cap(Gzip, 1 << 20), 2 << 30);
+        assert_eq!(layer_unpack_cap(Zstd, 0), 1 << 30);
+        assert_eq!(layer_unpack_cap(Zstd, 64 << 10), 2 << 30);
+        assert_eq!(layer_unpack_cap(Tar, 0), 0);
+        assert_eq!(layer_unpack_cap(Tar, 5 << 30), 5 << 30);
+        for f in [Gzip, Zstd, Tar] {
+            assert_eq!(layer_unpack_cap(f, u64::MAX), LAYER_UNPACK_MAX);
+        }
+
+        fn double(read: u64) -> u64 {
+            read * 2
+        }
+        let meter = UnpackMeter::with_cap(double);
+        meter.packed(8);
+        assert_eq!(meter.cap(), 16);
+        assert!(meter.unpacked(16) && !meter.over_cap());
+        assert!(!meter.unpacked(1) && meter.over_cap());
     }
 
     #[test]

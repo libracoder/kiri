@@ -151,6 +151,7 @@ fn load_docker(store: &Store, files: &HashMap<String, (String, u64)>, manifest: 
             let media_type = media_type_of(&store.blob_path(&digest)?)?;
             layers.push(Layer { digest, size, media_type: media_type.to_owned() });
         }
+        store.check_diff_ids_with(&config, &layers, &|| false)?;
         let mut names = Vec::new();
         for t in m["RepoTags"].as_array().into_iter().flatten().filter_map(Value::as_str) {
             names.push(parse_repo_tag(t)?);
@@ -350,15 +351,26 @@ fn load_oci(
         let mut layers = Vec::new();
         for l in manifest["layers"].as_array().into_iter().flatten() {
             let (digest, size) = descriptor_blob(files, l)?;
-            let media_type = match l["mediaType"]
-                .as_str()
-                .filter(|m| m.starts_with("application/vnd.") && !m.bytes().any(|b| b.is_ascii_control() || b.is_ascii_whitespace()))
-            {
-                Some(m) => m.to_owned(),
-                None => media_type_of(&store.blob_path(&digest)?)?.to_owned(),
-            };
+            let blob_path = store.blob_path(&digest)?;
+            let sniffed = crate::diffid::sniff(&blob_path)?;
+            if let Some(declared) = l["mediaType"].as_str().filter(|s| !s.is_empty()) {
+                if !declared.starts_with("application/vnd.") || declared.bytes().any(|b| b.is_ascii_control() || b.is_ascii_whitespace()) {
+                    return Err(invalid(format!("invalid layer mediaType {declared:?}")));
+                }
+                if let Some(expected_fmt) = declared_layer_format(declared)
+                    && expected_fmt != sniffed
+                {
+                    return Err(invalid(format!(
+                        "OCI layer {digest} declares mediaType {declared} ({}) but its magic bytes are {}",
+                        expected_fmt.name(),
+                        sniffed.name()
+                    )));
+                }
+            }
+            let media_type = format_media_type(sniffed).to_owned();
             layers.push(Layer { digest, size, media_type });
         }
+        store.check_diff_ids_with(&config, &layers, &|| false)?;
         let name = candidate.tag.unwrap_or_else(|| config_digest.clone());
         loaded.push(from_config(name, &config_digest, &config, layers));
     }
@@ -443,15 +455,29 @@ fn tagged(name: &str) -> String {
     if last.contains(':') || name.contains('@') { name.to_owned() } else { format!("{name}:latest") }
 }
 
+fn declared_layer_format(media_type: &str) -> Option<crate::diffid::LayerFormat> {
+    if media_type.ends_with("+gzip") || media_type.ends_with(".gzip") {
+        Some(crate::diffid::LayerFormat::Gzip)
+    } else if media_type.ends_with("+zstd") || media_type.ends_with(".zstd") {
+        Some(crate::diffid::LayerFormat::Zstd)
+    } else if media_type.ends_with(".tar") {
+        Some(crate::diffid::LayerFormat::Tar)
+    } else {
+        None
+    }
+}
+
+fn format_media_type(format: crate::diffid::LayerFormat) -> &'static str {
+    match format {
+        crate::diffid::LayerFormat::Gzip => "application/vnd.oci.image.layer.v1.tar+gzip",
+        crate::diffid::LayerFormat::Zstd => "application/vnd.oci.image.layer.v1.tar+zstd",
+        crate::diffid::LayerFormat::Tar => "application/vnd.oci.image.layer.v1.tar",
+    }
+}
+
 /// What kind of tar a layer file is, from its first bytes.
 fn media_type_of(path: &std::path::Path) -> io::Result<&'static str> {
-    let mut magic = [0u8; 4];
-    let n = std::fs::File::open(path)?.read(&mut magic)?;
-    Ok(match &magic[..n] {
-        [0x1f, 0x8b, ..] => "application/vnd.oci.image.layer.v1.tar+gzip",
-        [0x28, 0xb5, 0x2f, 0xfd] => "application/vnd.oci.image.layer.v1.tar+zstd",
-        _ => "application/vnd.oci.image.layer.v1.tar",
-    })
+    Ok(format_media_type(crate::diffid::sniff(path)?))
 }
 
 /// An image record from its config JSON.
@@ -509,10 +535,10 @@ mod tests {
             w.write_all(bytes).unwrap();
             w.finish().unwrap()
         };
-        let config = json!({"os": "linux", "architecture": "amd64", "config": {}, "rootfs": {"type": "layers", "diff_ids": []}});
-        let (cfg, _) = put(&serde_json::to_vec(&config).unwrap());
         let (a, sa) = put(&[1u8; 4096]);
         let (b, sb) = put(&[2u8; 4096]);
+        let config = json!({"os": "linux", "architecture": "amd64", "config": {}, "rootfs": {"type": "layers", "diff_ids": [&a, &b]}});
+        let (cfg, _) = put(&serde_json::to_vec(&config).unwrap());
         let gz = "application/vnd.docker.image.rootfs.diff.tar.gzip";
         let image = from_config("solo:1".into(), &cfg, &config, vec![Layer { digest: a, size: sa, media_type: gz.into() }, Layer { digest: b, size: sb, media_type: gz.into() }]);
         store.put_image(image.clone()).unwrap();
@@ -557,9 +583,9 @@ mod tests {
                 w.write_all(bytes).unwrap();
                 w.finish().unwrap()
             };
-            let config = json!({"os": "linux", "architecture": "amd64", "created": "2026-01-01T00:00:00Z", "config": {"Cmd": [cmd]}, "rootfs": {"type": "layers", "diff_ids": []}});
-            let (cfg, _) = put(&serde_json::to_vec(&config).unwrap());
             let (layer, size) = put(&vec![7u8; 64 * 1024]);
+            let config = json!({"os": "linux", "architecture": "amd64", "created": "2026-01-01T00:00:00Z", "config": {"Cmd": [cmd]}, "rootfs": {"type": "layers", "diff_ids": [&layer]}});
+            let (cfg, _) = put(&serde_json::to_vec(&config).unwrap());
             let image = from_config(name.into(), &cfg, &config, vec![Layer { digest: layer, size, media_type: "application/vnd.oci.image.layer.v1.tar".into() }]);
             src.put_image(image.clone()).unwrap();
             let mut tarball = Vec::new();
@@ -593,14 +619,18 @@ mod tests {
             w.write_all(bytes).unwrap();
             w.finish().unwrap()
         };
-        let config = json!({"os": "linux", "architecture": "arm64", "created": "2026-01-01T00:00:00Z", "config": {"Cmd": ["echo", "hi"], "Env": ["A=1"]}});
+        let raw_tar = crate::diffid::testing::layer_tar("etc/hi", b"hi\n");
+        let gz_layer = crate::diffid::testing::gzip(&raw_tar);
+        let config = json!({"os": "linux", "architecture": "arm64", "created": "2026-01-01T00:00:00Z",
+            "config": {"Cmd": ["echo", "hi"], "Env": ["A=1"]},
+            "rootfs": {"type": "layers", "diff_ids": [crate::store::sha256_digest(&raw_tar)]}});
         let (cfg, _) = put(&serde_json::to_vec(&config).unwrap());
-        let (layer, size) = put(b"\x1f\x8bnot really gzip");
+        let (layer, size) = put(&gz_layer);
         let image = from_config("demo:1".into(), &cfg, &config, vec![Layer { digest: layer.clone(), size, media_type: media_type_of(&store.blob_path(&layer).unwrap()).unwrap().into() }]);
         store.put_image(image.clone()).unwrap();
 
         let mut tarball = Vec::new();
-        save(&store, &[image.clone()], &mut tarball).unwrap();
+        save(&store, std::slice::from_ref(&image), &mut tarball).unwrap();
 
         let other = Store::open(dir.join("other")).unwrap();
         let loaded = load(&other, tarball.as_slice()).unwrap();
@@ -646,7 +676,7 @@ mod tests {
         let layer = layer.into_inner().unwrap();
         let config = json!({"architecture": "arm64", "os": "linux", "created": "2026-11-09T00:00:00Z",
             "config": {"Env": ["PATH=/usr/bin"], "Cmd": ["/bin/true"]},
-            "rootfs": {"type": "layers", "diff_ids": ["sha256:00"]}});
+            "rootfs": {"type": "layers", "diff_ids": [crate::store::sha256_digest(&layer)]}});
         let config = serde_json::to_vec(&config).unwrap();
         let manifest = json!([{"Config": "91df036f.json", "RepoTags": ["minirepro:flat"], "Layers": ["5e1a.tar"]}]);
 
@@ -691,10 +721,10 @@ mod tests {
 
     /// One image manifest and its config/layer blobs, in `b`. Returns the
     /// descriptor an OCI index would use to point at it.
-    fn add_image_with_layer(b: &mut tar::Builder<Vec<u8>>, store: &Store, arch: &str, layer: &[u8], media_type: &str) -> Value {
+    fn add_image_with_layer(b: &mut tar::Builder<Vec<u8>>, store: &Store, arch: &str, layer: &[u8], diff_id: &str, media_type: &str) -> Value {
         let config = serde_json::to_vec(&json!({
             "architecture": arch, "os": "linux", "created": "2026-01-01T00:00:00Z",
-            "config": {"Cmd": ["echo", "hi"], "Env": ["A=1"]}, "rootfs": {"type": "layers", "diff_ids": []},
+            "config": {"Cmd": ["echo", "hi"], "Env": ["A=1"]}, "rootfs": {"type": "layers", "diff_ids": [diff_id]},
         }))
         .unwrap();
         let (config_digest, config_size) = put(store, &config);
@@ -719,7 +749,8 @@ mod tests {
         let mut layer = tar::Builder::new(Vec::new());
         add_file(&mut layer, "etc/hi", b"hi");
         let layer = layer.into_inner().unwrap();
-        add_image_with_layer(b, store, arch, &layer, "application/vnd.oci.image.layer.v1.tar")
+        let diff_id = crate::store::sha256_digest(&layer);
+        add_image_with_layer(b, store, arch, &layer, &diff_id, "application/vnd.oci.image.layer.v1.tar")
     }
 
     fn add_index(b: &mut tar::Builder<Vec<u8>>, descriptors: Vec<Value>) {
@@ -802,17 +833,21 @@ mod tests {
 
     #[test]
     fn loads_oci_layers_with_gzip_zstd_and_uncompressed() {
+        use crate::diffid::testing::{gzip, layer_tar, sha256, skippable, zstd};
         let dir = scratch();
         let store = Store::open(&dir).unwrap();
+        let (t1, t2, t3) = (layer_tar("a", b"plain"), layer_tar("b", b"gzipped"), layer_tar("c", &[b'z'; 8192]));
+        let (t3_a, t3_b) = t3.split_at(1024);
+        let multi_zstd = [skippable(b"hdr"), zstd(t3_a), zstd(t3_b), skippable(b"toc")].concat();
         let config = serde_json::to_vec(&json!({
             "architecture": "amd64", "os": "linux", "created": "2026-01-01T00:00:00Z",
-            "config": {"Cmd": ["true"]}, "rootfs": {"type": "layers", "diff_ids": []},
+            "config": {"Cmd": ["true"]}, "rootfs": {"type": "layers", "diff_ids": [sha256(&t1), sha256(&t2), sha256(&t3)]},
         }))
         .unwrap();
         let (cfg, cfg_sz) = put(&store, &config);
-        let (raw, raw_sz) = put(&store, b"plain tar bytes");
-        let (gz, gz_sz) = put(&store, b"\x1f\x8bgzip bytes");
-        let (zst, zst_sz) = put(&store, b"\x28\xb5\x2f\xfdzstd bytes");
+        let (raw, raw_sz) = put(&store, &t1);
+        let (gz, gz_sz) = put(&store, &gzip(&t2));
+        let (zst, zst_sz) = put(&store, &multi_zstd);
         let manifest = serde_json::to_vec(&json!({
             "schemaVersion": 2,
             "config": {"mediaType": "application/vnd.oci.image.config.v1+json", "digest": cfg, "size": cfg_sz},
@@ -997,7 +1032,7 @@ mod tests {
 
         let config = json!({"architecture": "arm64", "os": "linux", "created": "2026-11-23T00:00:00Z",
             "config": {"Cmd": ["/bin/sh"]},
-            "rootfs": {"type": "layers", "diff_ids": []}});
+            "rootfs": {"type": "layers", "diff_ids": [&layer_digest]}});
         let config_bytes = serde_json::to_vec(&config).unwrap();
         let config_digest = crate::store::sha256_digest(&config_bytes);
         let config_hex = config_digest.strip_prefix("sha256:").unwrap();
@@ -1204,9 +1239,9 @@ mod tests {
             w.write_all(bytes).unwrap();
             w.finish().unwrap()
         };
-        let cfg = json!({"os": "linux", "architecture": "arm64", "config": {}});
-        let (cfg_digest, _) = put(&serde_json::to_vec(&cfg).unwrap());
         let (layer, size) = put(b"layer");
+        let cfg = json!({"os": "linux", "architecture": "arm64", "config": {}, "rootfs": {"type": "layers", "diff_ids": [&layer]}});
+        let (cfg_digest, _) = put(&serde_json::to_vec(&cfg).unwrap());
         let layers = vec![Layer { digest: layer, size, media_type: "application/vnd.oci.image.layer.v1.tar".into() }];
         let named = from_config("demo:1".into(), &cfg_digest, &cfg, layers.clone());
         let untagged = from_config(cfg_digest.clone(), &cfg_digest, &cfg, layers);
@@ -1217,6 +1252,51 @@ mod tests {
         let loaded = load(&other, tarball.as_slice()).unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].name, "demo:1");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn refuses_mismatched_diff_ids_and_oci_polyglots_and_cleans_up_blobs() {
+        use crate::diffid::testing::{gzip, layer_tar, polyglot, sha256};
+        let dir = scratch();
+        let staging = Store::open(dir.join("staging")).unwrap();
+        let target = Store::open(dir.join("target")).unwrap();
+
+        let real = layer_tar("etc/os-release", b"real\n");
+        let evil = layer_tar("etc/os-release", b"evil\n");
+        let real_cfg = serde_json::to_vec(&json!({
+            "architecture": "amd64", "os": "linux", "config": {"Cmd": ["sh"]},
+            "rootfs": {"type": "layers", "diff_ids": [sha256(&real)]},
+        }))
+        .unwrap();
+
+        // 1. Docker archive with stolen config + evil layer: rejected and blobs removed.
+        let mut docker_bad = tar::Builder::new(Vec::new());
+        add_file(&mut docker_bad, "cfg.json", &real_cfg);
+        add_file(&mut docker_bad, "evil.tar.gz", &gzip(&evil));
+        add_file(&mut docker_bad, "manifest.json", &serde_json::to_vec(&json!([{"Config": "cfg.json", "RepoTags": ["spoof:docker"], "Layers": ["evil.tar.gz"]}])).unwrap());
+        assert!(load(&target, docker_bad.into_inner().unwrap().as_slice()).is_err());
+        assert!(target.images().unwrap().is_empty());
+        assert_eq!(std::fs::read_dir(dir.join("target/blobs/sha256")).unwrap().count(), 0);
+
+        // 2. OCI archive with stolen config + evil layer: rejected and blobs removed.
+        let mut oci_bad = tar::Builder::new(Vec::new());
+        let mut d = add_image_with_layer(&mut oci_bad, &staging, "amd64", &gzip(&evil), &sha256(&real), "application/vnd.oci.image.layer.v1.tar+gzip");
+        d["annotations"] = json!({"org.opencontainers.image.ref.name": "spoof:oci"});
+        add_index(&mut oci_bad, vec![d]);
+        assert!(load(&target, oci_bad.into_inner().unwrap().as_slice()).is_err());
+        assert!(target.images().unwrap().is_empty());
+        assert_eq!(std::fs::read_dir(dir.join("target/blobs/sha256")).unwrap().count(), 0);
+
+        // 3. OCI archive with gzip+tar polyglot declared as plain `.tar` mediaType: rejected!
+        let poly = polyglot(&real, b"evil-tar\n");
+        let mut oci_poly = tar::Builder::new(Vec::new());
+        let d_poly = add_image_with_layer(&mut oci_poly, &staging, "amd64", &poly, &sha256(&real), "application/vnd.oci.image.layer.v1.tar");
+        add_index(&mut oci_poly, vec![d_poly]);
+        let err = load(&target, oci_poly.into_inner().unwrap().as_slice()).unwrap_err();
+        assert!(err.to_string().contains("magic bytes"), "{err}");
+        assert_eq!(std::fs::read_dir(dir.join("target/blobs/sha256")).unwrap().count(), 0);
+
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

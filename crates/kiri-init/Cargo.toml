@@ -11,8 +11,10 @@ kiri-proto = { path = "../kiri-proto" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 flate2 = "1"
+kiri-zstd = { path = "../kiri-zstd" }
 libc = "0.2"
 ruzstd = "0.9"
+sha2 = "0.11"
 tar = "0.4"
 
 [lints]
