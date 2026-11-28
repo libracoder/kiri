@@ -5,6 +5,7 @@
 #[cfg(target_os = "linux")]
 pub mod access;
 mod api;
+mod apparmor;
 pub(crate) mod binds;
 mod builder;
 mod caller;
@@ -304,6 +305,10 @@ pub fn run(_args: &[String]) -> io::Result<()> {
         },
     };
     let store = kiri_image::Store::open(&root).map_err(|e| enrich_rofs(e, Some(&root)))?;
+    // Before any container starts (the boot restarts some): on a Linux host
+    // with AppArmor, Kiri's profile is loaded now, once.
+    #[cfg(target_os = "linux")]
+    apparmor::init(&state_dir()?);
     let engine = engine::Engine::boot(store)
         .map_err(|e| enrich_rofs(e, Some(&root)))
         .inspect_err(|e| diag::error!("engine did not start", error = e))?;

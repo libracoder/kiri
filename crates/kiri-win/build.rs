@@ -14,9 +14,11 @@ include!("../kiri/build_share_key.rs");
 fn main() {
     println!("cargo:rerun-if-changed=../kiri/build_share_key.rs");
     write_share_build_key();
-    // The bundle files' SHA-256s, set by `cargo xtask windows`.
+    // The bundle files' SHA-256s, set by `cargo xtask windows`, and optional update Ed25519 key.
     println!("cargo:rerun-if-env-changed=KIRI_BUNDLE_SHA256");
+    println!("cargo:rerun-if-env-changed=KIRI_UPDATE_PUBLIC_KEY");
     println!("cargo:rerun-if-env-changed=CARGO_PKG_VERSION");
+    println!("cargo:rerun-if-changed=../../contrib/windows/kiri.ps1");
     println!("cargo:rerun-if-changed=../../brand/icon/windows/kiri.ico");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;

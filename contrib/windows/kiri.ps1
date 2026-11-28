@@ -6,7 +6,7 @@
 # network settings.
 #   powershell -ExecutionPolicy Bypass -File kiri.ps1 [-Distro Ubuntu] [-Bundle C:\path\to\kiri-windows-x86_64 (or -aarch64)] [-Default]
 #   powershell -ExecutionPolicy Bypass -File kiri.ps1 -Uninstall [-Distro Ubuntu]
-#   powershell -ExecutionPolicy Bypass -File kiri.ps1 -Update -Msi <staged .msi> [-WaitFor <pid>]
+#   powershell -ExecutionPolicy Bypass -File kiri.ps1 -Update -Msi <staged .msi> -Sha256 <hex> [-WaitFor <pid>]
 # The MSI (installer/windows) lays the same files in %LOCALAPPDATA%\Kiri and
 # runs `-Uninstall -IfSetUp` when removed: nothing happens unless first-run
 # setup completed, and the distro setup chose is taken from setup.json.
@@ -24,28 +24,49 @@ param(
   [switch]$IfSetUp,
   [switch]$Update,
   [string]$Msi,
+  [string]$Sha256,
   [int]$WaitFor
 )
 $ErrorActionPreference = "Stop"
 
 # -Update: waits for the kiri-win that downloaded the MSI to quit (its files
-# are in use until then), upgrades silently (per user, no prompt; 3010 is
-# "done, restart Windows later"), clears the stage when that went through,
-# and opens the new Kiri. Each step goes to helper.log beside the MSI, which
-# stays, with msiexec's install.log, when the upgrade failed.
+# are in use until then), verifies the staged MSI's SHA-256 and Authenticode
+# signature (matching kiri-win.exe's SignerCertificate.Thumbprint when
+# kiri-win.exe is signed, refusing silent /qn install of unsigned MSIs),
+# upgrades silently (per user, no prompt; 3010 is "done, restart Windows
+# later"), clears the stage when that went through, and opens the new Kiri.
 if ($Update) {
   if (-not $Msi) { throw "-Update needs -Msi" }
+  if (-not $Sha256 -or $Sha256 -notmatch '^[0-9a-fA-F]{64}$') { throw "-Update needs a 64-character hex -Sha256" }
   $stage = Split-Path $Msi -Parent
   $helperLog = Join-Path $stage "helper.log"
   function Say($m) { Add-Content -LiteralPath $helperLog -Value "$(Get-Date -Format s) $m" }
   try {
     Say "waiting for kiri-win $WaitFor"
     while ($WaitFor -and (Get-Process -Id $WaitFor -ErrorAction SilentlyContinue)) { Start-Sleep -Milliseconds 200 }
-    Say "installing $Msi"
+    if (-not (Test-Path -LiteralPath $Msi -PathType Leaf)) { throw "staged MSI not found: $Msi" }
+    $actualHash = (Get-FileHash -LiteralPath $Msi -Algorithm SHA256).Hash
+    if ($actualHash -notlike $Sha256 -or $actualHash.ToLowerInvariant() -ne $Sha256.ToLowerInvariant()) {
+      throw "refusing silent install: SHA-256 mismatch for $Msi (expected $Sha256, got $actualHash)"
+    }
+    $msiSig = Get-AuthenticodeSignature -LiteralPath $Msi
+    if ($msiSig.Status -ne 'Valid' -or -not $msiSig.SignerCertificate) {
+      throw "refusing silent install: $Msi does not have a valid Authenticode signature (status: $($msiSig.Status))"
+    }
+    $installedExe = Join-Path $env:LOCALAPPDATA "Kiri\kiri-win.exe"
+    if (Test-Path -LiteralPath $installedExe -PathType Leaf) {
+      $exeSig = Get-AuthenticodeSignature -LiteralPath $installedExe
+      if ($exeSig.Status -eq 'Valid' -and $exeSig.SignerCertificate) {
+        if ($msiSig.SignerCertificate.Thumbprint -ne $exeSig.SignerCertificate.Thumbprint) {
+          throw "refusing silent install: MSI signer thumbprint $($msiSig.SignerCertificate.Thumbprint) does not match installed kiri-win.exe ($($exeSig.SignerCertificate.Thumbprint))"
+        }
+      }
+    }
+    Say "installing verified $Msi (sha256=$($actualHash.ToLowerInvariant()), signer=$($msiSig.SignerCertificate.Thumbprint))"
     $p = Start-Process -FilePath (Join-Path $env:SystemRoot "System32\msiexec.exe") -ArgumentList "/i", "`"$Msi`"", "/qn", "/norestart", "/L*V", "`"$(Join-Path $stage 'install.log')`"" -Wait -PassThru
     Say "msiexec exit $($p.ExitCode)"
     if ($p.ExitCode -eq 0 -or $p.ExitCode -eq 3010) { Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue }
-    Start-Process -FilePath (Join-Path $env:LOCALAPPDATA "Kiri\kiri-win.exe")
+    Start-Process -FilePath $installedExe
   } catch { Say "failed: $_" }
   return
 }

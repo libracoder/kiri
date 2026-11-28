@@ -367,6 +367,7 @@ struct HostApplied {
     nodes: Vec<super::hostopts::Node>,
     masked: Option<Vec<CString>>,
     readonly: Option<Vec<CString>>,
+    apparmor: Option<String>,
 }
 
 /// Docker's default capability set as a mask.
@@ -639,7 +640,7 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
     let (masked, readonly) = (host.masked.take(), host.readonly.take());
     prepared.cgroupns_host = host.cgroupns_host;
     prepared.timer_slack_ns = host.timer_slack_ns;
-    prepared.host = HostApplied { rlimits: host.rlimits.clone(), groups: host.groups.clone(), nodes, masked, readonly };
+    prepared.host = HostApplied { rlimits: host.rlimits.clone(), groups: host.groups.clone(), nodes, masked, readonly, apparmor: host.apparmor.clone() };
     // Small, short-lived files: kept in memory (/run is tmpfs), not on the data disk.
     let etc_dir = PathBuf::from("/run/kiri").join(spec.id);
     let embedded_dns = embedded_dns(spec, net.upstream_dns, net.dns.relay);
@@ -1168,9 +1169,10 @@ pub fn exec(spec: &ExecSpec<'_>, target_pid: libc::pid_t, paths: &Paths, profile
     let cgroup_fd = fs::File::open(paths.cgroup.join(spec.container_id))?;
 
     let mut prepared = prepare(spec.argv, spec.env, spec.cwd, spec.user, None, spec.flags, spec.caps)?;
-    // The container's ulimits and groups apply to its execs too, as with runc.
+    // The container's ulimits, groups and AppArmor profile apply to its
+    // execs too, as with runc.
     let host = super::hostopts::parse(spec.opts)?;
-    prepared.host = HostApplied { rlimits: host.rlimits, groups: host.groups, ..Default::default() };
+    prepared.host = HostApplied { rlimits: host.rlimits, groups: host.groups, apparmor: host.apparmor, ..Default::default() };
     // An exec runs under its container's profile, not the default.
     prepared.profile = profile.to_vec();
     let (parent_io, child_io) = stdio(&prepared)?;
@@ -2576,7 +2578,7 @@ fn child_fds(p: &Prepared, io: &ChildStdio) -> Vec<RawFd> {
         cgroupns_host: _,
         timer_slack_ns: _,
         // Paths, numbers and names only.
-        host: HostApplied { rlimits: _, groups: _, nodes: _, masked: _, readonly: _ },
+        host: HostApplied { rlimits: _, groups: _, nodes: _, masked: _, readonly: _, apparmor: _ },
         root_ready,
         cgroup_ready,
         exec_ready,
@@ -2837,6 +2839,18 @@ fn finish_child(p: &Prepared, io: &ChildStdio, console: bool) -> ! {
             // capabilities this kernel does not know is fine to ignore.
             unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap as libc::c_ulong, 0, 0, 0) };
         }
+    }
+
+    // The AppArmor profile (a Linux host with AppArmor only): asked for
+    // here, after every mount (the profile refuses mounts) and before
+    // no-new-privileges and seccomp. The kernel lets a process outside any
+    // profile change profile under no-new-privileges too, but a confined
+    // one only into a narrower one: asked first, it does not matter which
+    // the agent is. The program takes it on at its execve; the agent's own
+    // init (--init), which runs on as PID 1 without one, takes it at once,
+    // as docker-init runs under Docker's profile.
+    if let Some(profile) = &p.host.apparmor {
+        super::apparmor::apply(profile, console && p.init).unwrap_or_else(|e| fail("apparmor", e));
     }
 
     if p.no_new_privs {

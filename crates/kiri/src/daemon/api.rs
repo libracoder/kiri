@@ -540,7 +540,7 @@ fn info(engine: &Engine) -> Value {
         "CgroupVersion": "2",
         "DefaultRuntime": "kiri",
         "Runtimes": {"kiri": {"path": "kiri-init"}},
-        "SecurityOptions": ["name=seccomp,profile=builtin", "name=cgroupns"],
+        "SecurityOptions": super::apparmor::info_option().into_iter().chain(["name=seccomp,profile=builtin", "name=cgroupns"]).collect::<Vec<_>>(),
         // Compose needs it to attach in `up` and `logs -f` (#346).
         "SystemTime": time::rfc3339(std::time::SystemTime::now()),
         // Not in Docker's /info (the ping's Builder-Version header is), but
@@ -2927,6 +2927,8 @@ fn create_inner(req: &Request, engine: &Engine, caller: &Caller, record_wsl_dist
         super::seccomp::Choice::Unconfined => true,
         super::seccomp::Choice::Default => false,
     };
+    // So is an AppArmor profile name the kernel could not be asked for.
+    super::apparmor::choice(&security_opt).map_err(Error::BadRequest)?;
     // NetworkMode `bridge` too: Docker joins only the endpoints' networks
     // when there are any, whatever the mode names (k3d sends `bridge` with
     // its cluster network, #727), unless they list bridge.
@@ -3564,6 +3566,12 @@ fn inspect(c: &Container, nets: &[super::network::Network], anon_vols: &[String]
         "NetworkSettings": network_settings(c, nets),
         "Mounts": c.spec.mount_info,
     });
+    v["AppArmorProfile"] = json!(super::apparmor::inspect_profile(
+        &c.spec.security_opt,
+        c.spec.privileged,
+        c.started.is_some(),
+        super::apparmor::host(),
+    ));
     for key in ["MaskedPaths", "ReadonlyPaths"] {
         v["HostConfig"][key] = super::hostopts::system_paths(&c.spec.host_opts, key, c.spec.privileged);
     }

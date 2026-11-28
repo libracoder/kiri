@@ -908,6 +908,38 @@ impl Spec {
         super::seccomp::compile(json, super::api::profile_caps(self.caps, self.privileged)).map_err(Error::BadRequest)
     }
 
+    /// The guest's `opts` lines for its start: [`Self::guest_opts`], and the
+    /// AppArmor profile on a Linux host that confines containers (an error
+    /// when the profile it needs is not loaded).
+    pub fn start_opts(&self, net_host: bool) -> Result<Vec<String>, Error> {
+        let mut lines = self.guest_opts(net_host)?;
+        let host = super::apparmor::host();
+        if host.confines() {
+            let loaded = |name: &str| super::apparmor::listed(&super::apparmor::loaded_profiles(), name);
+            if let Some(p) = super::apparmor::profile_for(&self.security_opt, self.privileged, host, loaded).map_err(Error::BadRequest)? {
+                lines.push(super::apparmor::guest_line(&p));
+            }
+        }
+        Ok(lines)
+    }
+
+    /// The guest's `opts` lines for an exec: the container's ulimits and
+    /// groups, and its AppArmor profile. Never unconfined by mistake: a
+    /// profile that cannot be worked out is asked for as the default, which
+    /// the guest then refuses if it is not loaded.
+    pub fn exec_opts(&self) -> Vec<String> {
+        let mut lines = self.guest_opts(false).unwrap_or_default();
+        let host = super::apparmor::host();
+        if host.confines() {
+            match super::apparmor::profile_for(&self.security_opt, self.privileged, host, |_| true) {
+                Ok(None) => {}
+                Ok(Some(p)) => lines.push(super::apparmor::guest_line(&p)),
+                Err(_) => lines.push(super::apparmor::guest_line(super::apparmor::DEFAULT_PROFILE)),
+            }
+        }
+        lines
+    }
+
     /// The security flags for the guest: seccomp, no-new-privileges, read-only root.
     pub fn security_flags(&self) -> u32 {
         let mut f = 0;
@@ -4376,7 +4408,7 @@ impl Engine {
         // Joining a host-network container is the host's namespace too: its
         // net.* sysctls would change the whole VM (or Linux host).
         let joined_host = joined_mode.is_some_and(|m| self.lock_networks().find(&m).is_some_and(|n| n.driver == "host"));
-        let mut host_opts = match spec.guest_opts(flags & run_flags::NET_HOST != 0 || joined_host) {
+        let mut host_opts = match spec.start_opts(flags & run_flags::NET_HOST != 0 || joined_host) {
             Ok(o) => o,
             Err(e) => {
                 self.fail_start(&id, &spec, &e);
@@ -4937,7 +4969,7 @@ impl Engine {
                 let label = |k: &str| c.spec.labels.get(k).and_then(|v| v.as_str()).unwrap_or("");
                 let service = format!("{}.{}", label("com.docker.compose.service"), label("com.docker.compose.project"));
                 // `dev.kiri.domain=api.myapp` (comma-separated for several) picks the names.
-                let chosen = label(DOMAIN_LABEL).split(',').map(|d| own_name(d.trim())).any(|d| !d.is_empty() && d.eq_ignore_ascii_case(&name));
+                let chosen = label(DOMAIN_LABEL).split(',').map(own_name).any(|d| !d.is_empty() && d.eq_ignore_ascii_case(&name));
                 chosen || c.name.eq_ignore_ascii_case(&name) || service.eq_ignore_ascii_case(&name) || (name.len() >= 12 && c.id.starts_with(&name))
             }
         })?;
@@ -5083,7 +5115,7 @@ impl Engine {
     pub fn domains(&self) -> Vec<String> {
         let suffix = if super::dns::installed() { "kiri.local" } else { "kiri.localhost" };
         let mut v = self.each(|c| {
-            let chosen = c.spec.labels.get(DOMAIN_LABEL).and_then(|v| v.as_str()).map(|d| own_name(d.split(',').next().unwrap_or("").trim()).to_owned());
+            let chosen = c.spec.labels.get(DOMAIN_LABEL).and_then(|v| v.as_str()).map(own_name);
             (c.status == Status::Running).then(|| format!("{}.{suffix}", chosen.filter(|d| !d.is_empty()).unwrap_or_else(|| c.name.clone())))
         });
         v.sort();
@@ -6246,8 +6278,8 @@ impl Engine {
             e.attached.push(tx);
             let config = e.config.clone();
             let (security, caps) = st.containers.get(&container_id).map(|c| (c.spec.security_flags() & !run_flags::READONLY_ROOTFS, c.spec.caps)).unwrap_or_default();
-            // Execs get the container's ulimits and groups, as with runc.
-            let opts = st.containers.get(&container_id).map(|c| c.spec.guest_opts(false).unwrap_or_default()).unwrap_or_default();
+            // Execs get the container's ulimits, groups and AppArmor profile, as with runc.
+            let opts = st.containers.get(&container_id).map(|c| c.spec.exec_opts()).unwrap_or_default();
             exec_security = (security, caps, opts);
             let mut env = st.containers.get(&container_id).map(|c| c.spec.env.clone()).unwrap_or_default();
             for e in &config.env {
@@ -6665,9 +6697,10 @@ pub fn random_hex(bytes: usize) -> String {
 pub const DOMAIN_LABEL: &str = "dev.kiri.domain";
 
 /// `api.myapp`, from any of `api.myapp`, `api.myapp.kiri.local` or
-/// `api.myapp.kiri.localhost`.
-fn own_name(d: &str) -> &str {
-    d.strip_suffix(".kiri.localhost").or_else(|| d.strip_suffix(".kiri.local")).unwrap_or(d)
+/// `api.myapp.kiri.localhost`; "" when it is not a plain host name
+/// (weburl::plain_name), so a hostile label names nothing.
+fn own_name(d: &str) -> String {
+    crate::weburl::chosen_domain(d)
 }
 
 /// Docker's container-name rule: `[a-zA-Z0-9][a-zA-Z0-9_.-]*`. A name is a
@@ -6715,6 +6748,22 @@ fn ancestor_ids(images: &[Image], values: &[String]) -> Vec<String> {
         images.iter().find(|i| is_id && i.config_digest.strip_prefix("sha256:").is_some_and(|h| h.starts_with(hex))).cloned()
     };
     values.iter().filter_map(|v| image_named(images.to_vec(), v).or_else(|| by_id(v))).map(|i| i.config_digest).collect()
+}
+
+#[cfg(test)]
+mod domain_label_tests {
+    /// `dev.kiri.domain` names a container only when it is a plain host
+    /// name: anything else is no name, so it neither routes nor shows on
+    /// the router's list.
+    #[test]
+    fn only_a_plain_name_is_a_chosen_domain() {
+        assert_eq!(super::own_name("api.myapp"), "api.myapp");
+        assert_eq!(super::own_name("API.myapp.kiri.localhost"), "api.myapp");
+        assert_eq!(super::own_name("web.kiri.local"), "web");
+        for hostile in ["outside.example/#", "x@outside.example", "<b>x</b>", "web .x", "web\tx", "-web", "web.", "a..b", "bücher"] {
+            assert_eq!(super::own_name(hostile), "", "{hostile:?}");
+        }
+    }
 }
 
 #[cfg(test)]

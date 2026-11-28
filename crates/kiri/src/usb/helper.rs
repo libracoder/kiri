@@ -71,47 +71,68 @@ fn install() -> io::Result<()> {
     let (bin, plist, label) = (binary(), plist(), LABEL.get());
     // SAFETY: getuid has no preconditions.
     let uid = unsafe { libc::getuid() };
-    let esc = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;");
-    let body = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>{label}</string>
-  <key>ProgramArguments</key><array><string>{}</string><string>usb</string><string>helper</string><string>{label}</string><string>{uid}</string></array>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>ProcessType</key><string>Interactive</string>
-  <key>StandardErrorPath</key><string>/var/log/{label}.log</string>
-</dict>
-</plist>
-"#,
-        esc(&bin.to_string_lossy())
-    );
-    let tmp = std::env::temp_dir().join(format!("{label}.{}.plist", std::process::id()));
-    std::fs::write(&tmp, body)?;
     let sum = digest(&me)?;
+    let command = install_script(&me, &bin, &source(), &plist, label, uid, &sum)?;
+    crate::setup::as_admin(&command, "Kiri wants to install its USB helper, so it can connect USB devices to its Linux VM. It asks once.")
+}
+
+fn install_script(me: &Path, bin: &Path, src: &Path, plist: &Path, label: &str, uid: libc::uid_t, sum: &str) -> io::Result<String> {
+    let Some(me_s) = me.to_str() else {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "executable path is not valid UTF-8"));
+    };
+    if me_s.is_empty() || me_s.contains(['\0', '\n', '\r']) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "executable path contains control characters"));
+    }
+    if sum.len() != 64 || !sum.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid helper SHA-256 digest"));
+    }
+    if !label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-') {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid helper label"));
+    }
+    let esc = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    let bin_s = bin.to_string_lossy();
+    let plist_lines = [
+        r#"<?xml version="1.0" encoding="UTF-8"?>"#.to_owned(),
+        r#"<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">"#.to_owned(),
+        r#"<plist version="1.0">"#.to_owned(),
+        r#"<dict>"#.to_owned(),
+        format!("  <key>Label</key><string>{label}</string>"),
+        format!(
+            "  <key>ProgramArguments</key><array><string>{}</string><string>usb</string><string>helper</string><string>{label}</string><string>{uid}</string></array>",
+            esc(&bin_s)
+        ),
+        r#"  <key>RunAtLoad</key><true/>"#.to_owned(),
+        r#"  <key>KeepAlive</key><true/>"#.to_owned(),
+        r#"  <key>ProcessType</key><string>Interactive</string>"#.to_owned(),
+        format!("  <key>StandardErrorPath</key><string>/var/log/{label}.log</string>"),
+        r#"</dict>"#.to_owned(),
+        r#"</plist>"#.to_owned(),
+    ];
+    let quoted_plist = plist_lines.iter().map(|l| sh_quote(l)).collect::<Vec<_>>().join(" ");
     let q = |p: &Path| sh_quote(&p.to_string_lossy());
-    // The copy is root's: a helper that ran a binary in the user's app
-    // bundle would run whatever replaced it, as root. Kiri's own signature
-    // seals the app's Info.plist, which the copy is without, so macOS
-    // wouldn't run it: it gets a signature of its own (ad hoc, no
-    // entitlements; it needs none). Then which Kiri it came from.
-    let command = format!(
-        "set -e; mkdir -p /Library/PrivilegedHelperTools; cp {me} {bin}.new; \
-         /usr/bin/codesign --force --sign - --identifier {label} {bin}.new; \
-         chown root:wheel {bin}.new; chmod 755 {bin}.new; mv -f {bin}.new {bin}; echo {sum} > {src}; chmod 644 {src}; \
-         cp {tmp} {plist}; chown root:wheel {plist}; chmod 644 {plist}; \
+    let bin_new = sh_quote(&format!("{}.new", bin.display()));
+    let src_new = sh_quote(&format!("{}.new", src.display()));
+    let plist_new = sh_quote(&format!("{}.new", plist.display()));
+    let sum_lower = sum.to_ascii_lowercase();
+    // Copy as root (`install -o root -g wheel -m 755`), verify `/usr/bin/shasum -a 256`
+    // of the root-owned `.new` copy against the SHA-256 computed in Rust BEFORE signing
+    // and renaming into place, and write the LaunchDaemon plist directly as root without
+    // staging anything in $TMPDIR.
+    Ok(format!(
+        "set -e; mkdir -p /Library/PrivilegedHelperTools /Library/LaunchDaemons; \
+         /usr/bin/install -o root -g wheel -m 755 {me} {bin_new}; \
+         set -- $(/usr/bin/shasum -a 256 {bin_new}); \
+         if [ \"$1\" != '{sum_lower}' ]; then rm -f {bin_new}; echo 'USB helper binary changed during install' >&2; exit 1; fi; \
+         /usr/bin/codesign --force --sign - --identifier {label} {bin_new}; \
+         mv -f {bin_new} {bin}; \
+         printf '%s\\n' '{sum_lower}' > {src_new}; chown root:wheel {src_new}; chmod 644 {src_new}; mv -f {src_new} {src}; \
+         printf '%s\\n' {quoted_plist} > {plist_new}; chown root:wheel {plist_new}; chmod 644 {plist_new}; mv -f {plist_new} {plist}; \
          launchctl bootout system/{label} 2>/dev/null || true; launchctl bootstrap system {plist}",
-        me = q(&me),
-        bin = q(&bin),
-        src = q(&source()),
-        tmp = q(&tmp),
-        plist = q(&plist)
-    );
-    let r = crate::setup::as_admin(&command, "Kiri wants to install its USB helper, so it can connect USB devices to its Linux VM. It asks once.");
-    let _ = std::fs::remove_file(&tmp);
-    r
+        me = q(me),
+        bin = q(bin),
+        src = q(src),
+        plist = q(plist),
+    ))
 }
 
 /// Removes the helper (`kiri usb helper remove`, and uninstalling Kiri).
@@ -400,5 +421,27 @@ mod tests {
         let (line, fd) = recv_fd(&b).unwrap();
         assert_eq!(line, b"attach 0x1\n");
         assert!(fd.is_none());
+    }
+
+    #[test]
+    fn install_script_verifies_shasum_before_codesign_and_avoids_tmpdir() {
+        let sum = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let cmd = install_script(
+            Path::new("/Applications/Kiri.app/Contents/MacOS/kiri"),
+            Path::new("/Library/PrivilegedHelperTools/dev.kiri.usb"),
+            Path::new("/Library/PrivilegedHelperTools/dev.kiri.usb.source"),
+            Path::new("/Library/LaunchDaemons/dev.kiri.usb.plist"),
+            "dev.kiri.usb",
+            501,
+            sum,
+        )
+        .unwrap();
+        assert!(!cmd.contains("/tmp/") && !cmd.contains("TMPDIR") && !cmd.contains('\n'), "{cmd}");
+        let install_idx = cmd.find("/usr/bin/install -o root -g wheel -m 755").unwrap();
+        let shasum_idx = cmd.find("/usr/bin/shasum -a 256 '/Library/PrivilegedHelperTools/dev.kiri.usb.new'").unwrap();
+        let codesign_idx = cmd.find("/usr/bin/codesign --force --sign -").unwrap();
+        let mv_bin_idx = cmd.find("mv -f '/Library/PrivilegedHelperTools/dev.kiri.usb.new' '/Library/PrivilegedHelperTools/dev.kiri.usb'").unwrap();
+        assert!(install_idx < shasum_idx && shasum_idx < codesign_idx && codesign_idx < mv_bin_idx, "{cmd}");
+        assert!(cmd.contains("'/Library/LaunchDaemons/dev.kiri.usb.plist.new'"), "{cmd}");
     }
 }

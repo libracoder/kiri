@@ -1,4 +1,5 @@
 mod agent;
+mod apparmor;
 mod cgroup;
 mod container;
 mod devices;

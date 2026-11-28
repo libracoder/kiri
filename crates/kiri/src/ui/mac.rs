@@ -17,7 +17,7 @@ use objc2_app_kit::{
     NSResponder, NSView, NSWindow, NSWindowStyleMask, NSWindowTitleVisibility,
 };
 use objc2_foundation::{NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
-use objc2_web_kit::{WKScriptMessage, WKScriptMessageHandler, WKUserContentController, WKWebView, WKWebViewConfiguration};
+use objc2_web_kit::{WKNavigationAction, WKNavigationActionPolicy, WKNavigationDelegate, WKScriptMessage, WKScriptMessageHandler, WKUserContentController, WKWebView, WKWebViewConfiguration};
 
 use super::{Cmd, PAGE, diag, emit, engine, json_str, menu_state, prefs, reopen_after_exit, update_check};
 
@@ -27,6 +27,10 @@ thread_local! {
     static WEBVIEW: RefCell<Option<Retained<WKWebView>>> = const { RefCell::new(None) };
     /// The window, so the page can ask to be dragged or zoomed.
     static WINDOW: RefCell<Option<Retained<NSWindow>>> = const { RefCell::new(None) };
+    /// The page's navigation rule (the web view holds its delegate weakly).
+    static NAVIGATION: RefCell<Option<Retained<NavigationPolicy>>> = const { RefCell::new(None) };
+    /// The host just started loading the page: the one navigation let through.
+    static HOST_LOAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// The menu bar item; AppKit removes it once it is released.
     static STATUS_ITEM: RefCell<Option<Retained<AnyObject>>> = const { RefCell::new(None) };
     /// Where a page made again (after the window let go of its own) sends
@@ -149,6 +153,12 @@ fn make_webview(mtm: MainThreadMarker, frame: NSRect, tx: Sender<Cmd>, autostart
         // Let the page paint its own background instead of white.
         let no: Retained<AnyObject> = msg_send![objc2::class!(NSNumber), numberWithBool: false];
         let _: () = msg_send![&webview, setValue: &*no, forKey: &*NSString::from_str("drawsBackground")];
+        // Only the page itself loads; a link, a dropped file or a script
+        // sending the window elsewhere is cancelled, as on Windows.
+        let navigation = NavigationPolicy::new(mtm);
+        webview.setNavigationDelegate(Some(ProtocolObject::from_ref(&*navigation)));
+        NAVIGATION.with(|n| *n.borrow_mut() = Some(navigation));
+        HOST_LOAD.with(|h| h.set(true));
         webview.loadHTMLString_baseURL(&NSString::from_str(&super::assemble::page(PAGE, prefs()["lang"].as_str())), None);
         Retained::into_super(webview)
     }
@@ -163,6 +173,7 @@ fn release_page() {
     }
     let Some(webview) = WEBVIEW.with(|w| w.borrow_mut().take()) else { return };
     QUEUED.with(|q| *q.borrow_mut() = None);
+    NAVIGATION.with(|n| *n.borrow_mut() = None);
     // SAFETY: main thread; the content controller holds the message
     // handler, which goes with the name it was added under.
     unsafe { webview.configuration().userContentController().removeScriptMessageHandlerForName(&NSString::from_str("kiri")) };
@@ -916,6 +927,38 @@ impl AppDelegate {
 impl AppDelegate {
     fn new(mtm: MainThreadMarker, tx: Sender<Cmd>, engine: JoinHandle<()>) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(AppIvars { tx, engine: RefCell::new(Some(engine)), shown: RefCell::new(Vec::new()) });
+        // SAFETY: NSObject's init on a freshly allocated object.
+        unsafe { msg_send![super(this), init] }
+    }
+}
+
+define_class!(
+    // SAFETY: NSObject has no subclassing requirements and this type has no Drop.
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "KiriNavigationPolicy"]
+    struct NavigationPolicy;
+
+    unsafe impl NSObjectProtocol for NavigationPolicy {}
+
+    unsafe impl WKNavigationDelegate for NavigationPolicy {
+        #[unsafe(method(webView:decidePolicyForNavigationAction:decisionHandler:))]
+        fn decide(&self, _webview: &WKWebView, action: &WKNavigationAction, decision: &block2::DynBlock<dyn Fn(WKNavigationActionPolicy)>) {
+            // SAFETY: reading the action WebKit just handed us, on the main thread.
+            let (main_frame, url) = unsafe {
+                let main_frame = action.targetFrame().is_some_and(|f| f.isMainFrame());
+                let url = action.request().URL().and_then(|u| u.absoluteString()).map(|s| s.to_string()).unwrap_or_default();
+                (main_frame, url)
+            };
+            let allow = super::may_navigate(HOST_LOAD.with(|h| h.replace(false)), main_frame, &url);
+            decision.call((if allow { WKNavigationActionPolicy::Allow } else { WKNavigationActionPolicy::Cancel },));
+        }
+    }
+);
+
+impl NavigationPolicy {
+    fn new(mtm: MainThreadMarker) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(());
         // SAFETY: NSObject's init on a freshly allocated object.
         unsafe { msg_send![super(this), init] }
     }

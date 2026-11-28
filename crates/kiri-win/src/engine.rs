@@ -1211,48 +1211,9 @@ fn set_pref(name: &str, value: Value) {
     }
 }
 
-/// A page link: only Kiri's own addresses, as on the Mac.
-fn allowed_url(url: &str) -> bool {
-    if matches!(
-        url,
-        "https://kiri.canestack.com"
-            | "https://runkiri.com"
-            | "https://runkiri.com/releases/"
-            | "https://runkiri.com/share/notice"
-            | "https://canestack.com"
-            | "https://discord.gg/K5A8wuqcC"
-            | "https://x.com/runkiri"
-            | "https://learn.microsoft.com/windows/wsl/about"
-            | "https://github.com/libracoder/kiri/issues/new"
-            | "https://github.com/libracoder/kiri"
-            | "https://github.com/anchore/grype"
-            | "https://login.docker.com/activate"
-            | "https://github.com/login/device"
-    ) {
-        return true;
-    }
-    // A build warning's rule page (docs.docker.com/go/dockerfile/rule/…).
-    if url
-        .strip_prefix("https://docs.docker.com/go/")
-        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_alphanumeric() || b"-/".contains(&b)))
-    {
-        return true;
-    }
-    let Some(rest) = url.strip_prefix("http://").or_else(|| url.strip_prefix("https://")) else { return false };
-    // The authority is up to the first path/query/fragment. Reject credentials
-    // (user@host, so the real host is after the @) and backslashes (which some
-    // parsers treat as a separator), then take the host before the port.
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    if authority.contains('@') || authority.contains('\\') {
-        return false;
-    }
-    let host = authority.split(':').next().unwrap_or("");
-    host == "localhost" || host.ends_with(".kiri.localhost") || host.ends_with(".kiri.local")
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{allowed_url, unanswered, wakes};
+    use super::{unanswered, wakes};
     use std::io::ErrorKind;
 
     #[test]
@@ -1298,31 +1259,6 @@ mod tests {
         assert_eq!(unanswered(ErrorKind::NotFound, true), Some("stopped"));
         assert_eq!(unanswered(ErrorKind::ConnectionRefused, false), Some("stopped"));
         assert_eq!(unanswered(ErrorKind::Other, true), Some("stopped"));
-    }
-
-    #[test]
-    fn only_kiris_own_urls_open() {
-        assert!(allowed_url("http://localhost:8080/app"));
-        assert!(allowed_url("https://web.kiri.localhost/"));
-        assert!(allowed_url("http://api.kiri.local"));
-        assert!(allowed_url("https://runkiri.com"));
-        assert!(allowed_url("https://runkiri.com/releases/"));
-        assert!(allowed_url("https://runkiri.com/share/notice"));
-        assert!(allowed_url("https://canestack.com"));
-        assert!(allowed_url("https://discord.gg/K5A8wuqcC"));
-        assert!(allowed_url("https://x.com/runkiri"));
-        assert!(allowed_url("https://kiri.canestack.com"));
-        assert!(allowed_url("https://github.com/libracoder/kiri"));
-        assert!(allowed_url("https://github.com/libracoder/kiri/issues/new"));
-        assert!(allowed_url("https://github.com/anchore/grype"));
-        assert!(allowed_url("https://docs.docker.com/go/dockerfile/rule/from-as-casing/"));
-        assert!(!allowed_url("http://evil.example/"));
-        assert!(!allowed_url("https://runkiri.com.evil.com"));
-        // Bypass attempts the audit found.
-        assert!(!allowed_url("http://localhost:1@evil.example/"));
-        assert!(!allowed_url("http://evil.example\\x.kiri.localhost"));
-        assert!(!allowed_url("https://evil.example/#.kiri.localhost"));
-        assert!(!allowed_url("ftp://localhost/"));
     }
 
     #[test]
@@ -1603,7 +1539,7 @@ pub fn on_message(msg: &str) {
         "reveal" => emit(notice("error", &tr("Container files are not on Windows' disk: use Save to Downloads"))),
         "terminal" => detail::terminal(&c.name, &env().pipe),
         "open" => {
-            if allowed_url(&c.name) {
+            if crate::weburl::allowed(&c.name) {
                 crate::app::open_url(&c.name);
             }
         }

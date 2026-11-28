@@ -6,12 +6,15 @@ English is the key: the pages' tr("…") and trn(n, "…", "…") (index.html, l
 kiri-win's setup.html), index.html's data-i18n* attributes, and the Rust's
 tr("…") and trf("…") (the Mac's menus, the Windows tray, setup steps and the
 notices the app sends the page). Each language file must have every key, no
-key nothing uses, the same {placeholders} and tags as its key, and no ASCII
-double quote (the words go into HTML attributes).
+key nothing uses, the same {placeholders} as its key, the same tags as its
+key, each written exactly as there (the words go into the page as HTML: no
+attribute, event handler, style, link or tag the English does not have), and
+no ASCII double quote (the words go into HTML attributes).
 
     python3 scripts/i18n-check.py              # check
     python3 scripts/i18n-check.py --missing    # print the keys a file lacks, as JSON
     python3 scripts/i18n-check.py --since REF  # check, with notes against REF rather than main
+    python3 scripts/i18n-check.py --lang-dir DIR  # check other files (tests/i18n-markup.py)
 
 It also notes, without failing, the short words where a language you added or
 changed is longer than every other language: those are the ones most likely
@@ -68,8 +71,60 @@ def holes(s):
     return sorted(re.findall(r"\{\w+\}", s))
 
 
+TAG = re.compile(r"<[^<>]*>")
+# Markup that runs code, loads something or restyles the window: never in a
+# translation unless its English key has the same.
+RISKY = [(re.compile(r"\bon[a-z]+\s*=", re.I), "an event handler (on…=)"), (re.compile(r"\bstyle\s*=", re.I), "style="),
+         (re.compile(r"\bhref\s*=", re.I), "href="), (re.compile(r"\bsrc\s*=", re.I), "src="), (re.compile(r"javascript\s*:", re.I), "javascript:")]
+
+
 def tags(s):
-    return sorted(re.findall(r"</?([a-zA-Z][\w-]*)", s))
+    """Each tag's full text, attributes and all, as the page's safeWords compares them."""
+    return sorted(TAG.findall(s))
+
+
+def markup_problems(k, v):
+    """What in the words `v` is not markup its English key `k` has."""
+    out = []
+    have = set(tags(k))
+    for t in tags(v):
+        if t in have:
+            continue
+        name = re.match(r"</?\s*([a-zA-Z][\w-]*)", t)
+        if name and any(re.match(rf"</?\s*{re.escape(name.group(1))}\b", e, re.I) for e in have):
+            out.append(f"tag {t} has attributes its English {sorted(e for e in have if re.match(rf'</?{re.escape(name.group(1))}\b', e, re.I))} does not")
+        else:
+            out.append(f"tag {t} is not in the English")
+    if tags(v) != tags(k) and not out:
+        out.append(f"tags {tags(v)} should be {tags(k)}")
+    if TAG.sub("", v).count("<") > TAG.sub("", k).count("<"):
+        out.append("a < that does not close into one of the English tags")
+    for rx, what in RISKY:
+        if rx.search(v) and not rx.search(k):
+            out.append(f"{what} the English does not have")
+    return out
+
+
+def self_test():
+    """The markup rule on words made to slip past it: run with every check, so
+    a change that lets one through fails here, not in the window."""
+    k = "Run <code>kiri run</code> or <span class=mono>{x}</span>"
+    caught = [
+        "Starte <code onclick=alert(1)>kiri run</code> oder <span class=mono>{x}</span>",
+        "Starte <code>kiri run</code> oder <span class=mono style=color:red>{x}</span>",
+        "Starte <code>kiri run</code> oder <span class=mono>{x}</span><img src=x onerror=alert(1)>",
+        "Starte <code>kiri run</code> oder <span class=mono>{x}</span><a href=javascript:alert(1)>x</a>",
+        "Starte <code>kiri run</code> oder <span class=mono>{x}</span> <img src=x onerror=alert(1) ",
+        "Starte <code>kiri run</code> oder <span class=mono>{x}</span> <b>x</b>",
+        "Starte <code>kiri run</code> oder <span class=mono>{x}</span> <CODE>x</CODE>",
+        "Starte <code>kiri run</code> oder <span class='mono' onmouseover=alert(1)>{x}</span>",
+    ]
+    for v in caught:
+        if not markup_problems(k, v):
+            return f"the markup check let through {v!r}"
+    if markup_problems(k, "Starte <code>kiri run</code> oder <span class=mono>{x}</span>"):
+        return "the markup check refused words with the English tags"
+    return None
 
 
 # Words up to this long sit in buttons, badges and headers; longer ones wrap.
@@ -132,6 +187,12 @@ def length_notes(files, langs):
 
 
 def main():
+    broken = self_test()
+    if broken:
+        print("FAIL " + broken)
+        return 1
+    custom_dir = "--lang-dir" in sys.argv
+    lang_dir = sys.argv[sys.argv.index("--lang-dir") + 1] if custom_dir else os.path.join(UI, "lang")
     keys = {}
     for page in PAGES:
         with open(page, encoding="utf-8") as fh:
@@ -140,16 +201,16 @@ def main():
             keys.setdefault(k, (os.path.relpath(page, ROOT), line))
     for k, v in native_keys().items():
         keys.setdefault(k, v)
-    files = sorted(f for f in os.listdir(os.path.join(UI, "lang")) if f.endswith(".json"))
+    files = sorted(f for f in os.listdir(lang_dir) if f.endswith(".json"))
     if "--missing" in sys.argv:
         for f in files:
-            with open(os.path.join(UI, "lang", f), encoding="utf-8") as fh:
+            with open(os.path.join(lang_dir, f), encoding="utf-8") as fh:
                 have = json.load(fh)
             print(json.dumps({k: "" for k in keys if k not in have}, ensure_ascii=False, indent=2))
         return 0
     bad, langs = [], {}
     for f in files:
-        path = os.path.join(UI, "lang", f)
+        path = os.path.join(lang_dir, f)
         try:
             with open(path, encoding="utf-8") as fh:
                 have = json.load(fh)
@@ -168,19 +229,20 @@ def main():
             else:
                 if holes(v) != holes(k):
                     bad.append(f"{f}: {json.dumps(k, ensure_ascii=False)}: placeholders {holes(v)} should be {holes(k)}")
-                if tags(v) != tags(k):
-                    bad.append(f"{f}: {json.dumps(k, ensure_ascii=False)}: tags {tags(v)} should be {tags(k)}")
+                for problem in markup_problems(k, v):
+                    bad.append(f"{f}: {json.dumps(k, ensure_ascii=False)}: {problem}")
                 if '"' in v and '"' not in k:
                     bad.append(f"{f}: {json.dumps(k, ensure_ascii=False)}: use “ ” rather than \" in the words")
     for line in bad:
         print("FAIL " + line)
     print(f"{'FAIL' if bad else 'PASS'} {len(keys)} keys, {len(files)} language file(s), {len(bad)} problem(s)")
-    # Advice only: never changes the result. On GitHub it also shows on the pull request.
-    for path, line, text in length_notes(changed_files(), langs):
-        print(f"NOTE {path}:{line}: {text}")
-        if os.environ.get("GITHUB_ACTIONS"):
-            title = gha_escape_prop("May be cut off")
-            print(f"::notice file={gha_escape_prop(path.replace(os.sep, '/'))},line={gha_escape_prop(line)},title={title}::{gha_escape_data(text)}")
+    if not custom_dir:
+        # Advice only: never changes the result. On GitHub it also shows on the pull request.
+        for path, line, text in length_notes(changed_files(), langs):
+            print(f"NOTE {path}:{line}: {text}")
+            if os.environ.get("GITHUB_ACTIONS"):
+                title = gha_escape_prop("May be cut off")
+                print(f"::notice file={gha_escape_prop(path.replace(os.sep, '/'))},line={gha_escape_prop(line)},title={title}::{gha_escape_data(text)}")
     return 1 if bad else 0
 
 
