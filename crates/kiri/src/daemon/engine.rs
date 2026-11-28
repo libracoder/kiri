@@ -237,6 +237,11 @@ impl BalloonState {
     }
 
     fn age_churn(&mut self, now: std::time::Instant) {
+        // Keep the current reversal count while the latest shrink's reversal
+        // detection window is still open so a qualifying regrow escalates cleanly.
+        if self.last_shrink.is_some_and(|t| now.saturating_duration_since(t) <= CHURN_WINDOW) {
+            return;
+        }
         while self.churn_reversals > 0 {
             let Some(anchor) = self.last_reversal else {
                 self.churn_reversals = 0;
@@ -7668,6 +7673,36 @@ mod memory_target_tests {
             "non-churn grows must allow capped backoff to step down, got {:?}",
             calm.effective_cooldown()
         );
+
+        // Regression: at 120 s cooldown, a shrink at +140 s followed by a
+        // qualifying regrow 295 s later (+435 s, still within CHURN_WINDOW)
+        // must escalate to 240 s rather than stepping down at +430 s.
+        let mut late_regrow = BalloonState::default();
+        let mut lt = Instant::now();
+        let mut l_target = 6 * GIB;
+        for _ in 0..2 {
+            if let Some(n) = poll_with(&mut late_regrow, policy, l_target, 4 * GIB, true, lt) {
+                l_target = n;
+            }
+            lt += late_regrow.effective_cooldown() + late_regrow.effective_decay_interval();
+            if let Some(n) = poll_with(&mut late_regrow, policy, l_target, 2 * GIB, false, lt) {
+                l_target = n;
+            }
+            lt += Duration::from_secs(10);
+            l_target = (l_target + MEMORY_GROW).min(CEILING);
+        }
+        if let Some(n) = poll_with(&mut late_regrow, policy, l_target, 4 * GIB, true, lt) {
+            l_target = n;
+        }
+        assert_eq!(late_regrow.effective_cooldown(), SHRINK_COOLDOWN * 2);
+        lt += Duration::from_secs(140);
+        let shrunk = poll_with(&mut late_regrow, policy, l_target, 2 * GIB, false, lt).expect("shrink at +140 s");
+        assert!(shrunk < l_target);
+        l_target = shrunk;
+        lt += Duration::from_secs(295);
+        l_target = (l_target + MEMORY_GROW).min(CEILING);
+        let _ = poll_with(&mut late_regrow, policy, l_target, 4 * GIB, true, lt);
+        assert_eq!(late_regrow.effective_cooldown(), SHRINK_COOLDOWN * 4);
         assert!(headroom > 0);
     }
 
