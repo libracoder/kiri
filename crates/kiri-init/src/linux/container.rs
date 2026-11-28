@@ -1580,7 +1580,17 @@ fn write_etc_files(spec: &RunSpec<'_>, base: &std::path::Path, upstream: &[[u8; 
         }
         return Ok(out);
     }
+    let check_etc_line = |what: &str, s: &str| -> io::Result<()> {
+        if s.contains(['\n', '\r', '\0']) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("invalid {what}: contains control character")));
+        }
+        Ok(())
+    };
+    check_etc_line("hostname", spec.hostname)?;
     let domain = net_opts::values(spec.net.opts, net_opts::DOMAINNAME).next().filter(|d| !d.is_empty());
+    if let Some(d) = domain {
+        check_etc_line("domainname", d)?;
+    }
     let mut hosts = String::from("127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n");
     // On an IPv6-only network the IPv4 address is Kiri's own name for it.
     let v4 = spec.net.ip != [0; 4] && !net::Plug::from_opts(spec.net.opts).no_ipv4;
@@ -1609,6 +1619,7 @@ fn write_etc_files(spec: &RunSpec<'_>, base: &std::path::Path, upstream: &[[u8; 
     let host_net = spec.flags & run_flags::NET_HOST != 0;
     let mapped = host_etc_target(super::transport::is_host_process(), net::wsl_host_relay_active(), host_net, spec.net.gateway);
     for line in spec.net.extra_hosts.iter() {
+        check_etc_line("extra_hosts", line)?;
         if let Some(target) = mapped.as_deref() {
             hosts.push_str(&line.replace(&host_addr, target));
         } else {
@@ -1616,7 +1627,7 @@ fn write_etc_files(spec: &RunSpec<'_>, base: &std::path::Path, upstream: &[[u8; 
         }
         hosts.push('\n');
     }
-    let resolv = resolv_conf(spec, upstream, embedded);
+    let resolv = resolv_conf_checked(spec, upstream, embedded)?;
     let files = [("hosts", hosts), ("resolv.conf", resolv), ("hostname", format!("{}\n", spec.hostname))];
     let mut out = Vec::with_capacity(files.len());
     for (name, text) in files {
@@ -1767,6 +1778,19 @@ fn settle_resolver(wanted: [u8; 4], gateway: Option<[u8; 4]>, serve_in: impl FnO
 }
 
 fn resolv_conf(spec: &RunSpec<'_>, upstream: &[[u8; 4]], embedded: Option<[u8; 4]>) -> String {
+    resolv_conf_checked(spec, upstream, embedded).unwrap_or_default()
+}
+
+fn resolv_conf_checked(spec: &RunSpec<'_>, upstream: &[[u8; 4]], embedded: Option<[u8; 4]>) -> io::Result<String> {
+    let check_field = |what: &str, s: &str| -> io::Result<()> {
+        if s.contains(['\n', '\r', '\0']) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("invalid {what}: contains control character")));
+        }
+        Ok(())
+    };
+    for d in net_opts::values(spec.net.opts, net_opts::NAMESERVER) {
+        check_field("nameserver", d)?;
+    }
     let mut resolv = String::new();
     let mut servers = net_opts::values(spec.net.opts, net_opts::NAMESERVER).peekable();
     if let Some(ns) = embedded {
@@ -1789,15 +1813,25 @@ fn resolv_conf(spec: &RunSpec<'_>, upstream: &[[u8; 4]], embedded: Option<[u8; 4
         }
     }
     // `--dns-search .` means no search domains.
-    let search: Vec<&str> = net_opts::values(spec.net.opts, net_opts::SEARCH).filter(|s| *s != ".").collect();
+    let mut search = Vec::new();
+    for s in net_opts::values(spec.net.opts, net_opts::SEARCH) {
+        check_field("dns search", s)?;
+        if s != "." {
+            search.push(s);
+        }
+    }
     if !search.is_empty() {
         resolv.push_str(&format!("search {}\n", search.join(" ")));
     }
-    let options: Vec<&str> = net_opts::values(spec.net.opts, net_opts::OPTION).collect();
+    let mut options = Vec::new();
+    for o in net_opts::values(spec.net.opts, net_opts::OPTION) {
+        check_field("dns option", o)?;
+        options.push(o);
+    }
     if !options.is_empty() {
         resolv.push_str(&format!("options {}\n", options.join(" ")));
     }
-    resolv
+    Ok(resolv)
 }
 
 /// A running container's resolv.conf once it has joined a user network
@@ -1861,6 +1895,119 @@ impl Mount {
     }
 }
 
+/// Resolves `raw` by canonicalizing its deepest existing prefix on disk (following
+/// dangling symlinks up to 40 hops) and lexically appending remaining missing
+/// components (`..` collapsed).
+fn resolve_deepest_mount_path(raw: &Path) -> io::Result<PathBuf> {
+    use std::path::Component;
+    let mut cur = lexical_normalize(raw);
+    let mut hops = 0usize;
+    loop {
+        let mut prefix = cur.clone();
+        let mut tail: Vec<std::ffi::OsString> = Vec::new();
+        while prefix != Path::new("/") {
+            match fs::symlink_metadata(&prefix) {
+                Ok(_) => break,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    let Some(name) = prefix.file_name().map(std::ffi::OsStr::to_os_string) else { break };
+                    tail.push(name);
+                    if !prefix.pop() {
+                        break;
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        match fs::canonicalize(&prefix) {
+            Ok(mut real) => {
+                for comp in tail.into_iter().rev() {
+                    real.push(comp);
+                }
+                return Ok(real);
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                // A component along `prefix` is a dangling symlink: expand the
+                // first symlink along `cur` and continue.
+                let mut built = PathBuf::from("/");
+                let comps: Vec<std::ffi::OsString> = cur
+                    .components()
+                    .filter_map(|c| match c {
+                        Component::Normal(n) => Some(n.to_os_string()),
+                        _ => None,
+                    })
+                    .collect();
+                let mut expanded = false;
+                for (i, comp) in comps.iter().enumerate() {
+                    let next = built.join(comp);
+                    if let Ok(link) = fs::read_link(&next) {
+                        hops += 1;
+                        if hops > 40 {
+                            return Err(io::Error::from_raw_os_error(libc::ELOOP));
+                        }
+                        let mut target = if link.is_absolute() { link } else { built.join(link) };
+                        for rest in &comps[i + 1..] {
+                            target.push(rest);
+                        }
+                        cur = lexical_normalize(&target);
+                        expanded = true;
+                        break;
+                    }
+                    built = next;
+                }
+                if !expanded {
+                    return Ok(lexical_normalize(&cur));
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Guards container and volume bind mount sources inside the macOS VM so
+/// `/`, `/mnt`, `/mnt/mac`, indirect `/proc/<pid>/root/mnt/mac` or VM symlinks
+/// into `/mnt/mac`, and symlinks escaping `/mnt/mac/{Users,Volumes,private}`
+/// are refused before directory creation or `mount(2)`.
+pub(super) fn check_vm_mount_source(raw: &str) -> io::Result<()> {
+    check_vm_mount_source_for(raw, !super::transport::is_host_process(), Path::new("/"))
+}
+
+fn check_vm_mount_source_for(raw: &str, in_vm: bool, vm_root: &Path) -> io::Result<()> {
+    if !raw.starts_with('/') {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("mount source {raw:?} must be absolute")));
+    }
+    if !in_vm {
+        return Ok(());
+    }
+    let deny = |why: &str| io::Error::new(io::ErrorKind::PermissionDenied, format!("mount source {raw}: {why}"));
+    let base = if vm_root == Path::new("/") {
+        PathBuf::from("/")
+    } else {
+        fs::canonicalize(vm_root).unwrap_or_else(|_| lexical_normalize(vm_root))
+    };
+    let disk_raw = if vm_root == Path::new("/") {
+        PathBuf::from(raw)
+    } else {
+        base.join(raw.trim_start_matches('/'))
+    };
+    let resolved = resolve_deepest_mount_path(&disk_raw)?;
+    let mnt = base.join("mnt");
+    let mnt_mac = base.join("mnt/mac");
+    if resolved == base || resolved == mnt || resolved == mnt_mac {
+        return Err(deny("mounting the VM root or Mac share mountpoint is not permitted"));
+    }
+    let from_mac = raw.starts_with("/mnt/mac/") && !raw.split('/').any(|c| c == "..");
+    if !from_mac && (resolved == mnt_mac || resolved.starts_with(&mnt_mac)) {
+        return Err(deny("indirect mount of /mnt/mac is not permitted"));
+    }
+    if from_mac {
+        let allowed = [mnt_mac.join("Users"), mnt_mac.join("Volumes"), mnt_mac.join("private")];
+        if !allowed.iter().any(|dir| resolved == *dir || resolved.starts_with(dir)) {
+            return Err(deny("mount source escapes shared Mac directories"));
+        }
+    }
+    Ok(())
+}
+
 /// `source\ttarget\tflags` entries. Flags: `ro`, `create` (make the source
 /// directory), `copyup`, `tmpfs` (source ignored) and tmpfs options and
 /// flags (`noexec`, `exec`, `nosuid`, …; later ones win). A volume with
@@ -1878,6 +2025,9 @@ pub(super) fn parse_mounts(list: StrList<'_>) -> io::Result<Vec<Mount>> {
     let parsed = (|| -> io::Result<()> {
         for m in list.iter() {
             let bad = || io::Error::new(io::ErrorKind::InvalidInput, format!("bad mount {m:?}"));
+            if m.contains(['\n', '\r', '\0']) {
+                return Err(bad());
+            }
             // Three fields: source, target, flags. Seven: the same, then a
             // volume's driver options (`type`, `device`, flags, data). Any other
             // count is a separator inside a field — a target alone comes from an
@@ -1902,6 +2052,7 @@ pub(super) fn parse_mounts(list: StrList<'_>) -> io::Result<Vec<Mount>> {
                 out.push(Mount { source: None, target, ro, dir: true, copy_up: false, tmpfs_opts: Some(CString::new(opts)?), tmpfs_flags, loop_mount: None });
                 continue;
             }
+            check_vm_mount_source(src)?;
             // A missing source becomes a directory, as Docker does; one that is
             // there already (a file such as /etc/hostname, too) is used as it is.
             // Never create a directory at /etc/localtime or /etc/timezone (#938).
@@ -1967,6 +2118,102 @@ pub(super) fn parse_mounts(list: StrList<'_>) -> io::Result<Vec<Mount>> {
     // would be hidden by it. The sort is stable, so equal depths keep theirs.
     out.sort_by_key(|m| depth(&m.target));
     Ok(out)
+}
+
+#[cfg(test)]
+mod mount_and_etc_security_tests {
+    use super::*;
+    use kiri_proto::{Limits, Msg, Net, decode, encode_run};
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn vm_mount_source_guard_blocks_share_escapes_and_indirect_mac_mounts() {
+        let vm = std::env::temp_dir().join(format!("kiri-vm-guard-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&vm);
+        fs::create_dir_all(vm.join("mnt/mac/Users/alice/proj")).unwrap();
+        fs::create_dir_all(vm.join("mnt/mac/Volumes/ext")).unwrap();
+        fs::create_dir_all(vm.join("mnt/mac/private/tmp")).unwrap();
+        fs::create_dir_all(vm.join("mnt/mac/unshared")).unwrap();
+        fs::create_dir_all(vm.join("opt")).unwrap();
+        fs::create_dir_all(vm.join("var/lib/kiri/volumes/v1/_data")).unwrap();
+
+        // Symlink outside /mnt/mac pointing into /mnt/mac (indirect mount).
+        symlink(vm.join("mnt/mac/Users/alice"), vm.join("opt/mac_link")).unwrap();
+        // Symlinks inside /mnt/mac/Users escaping to /, /mnt, /mnt/mac, or VM /var/lib/kiri.
+        symlink("../../../..", vm.join("mnt/mac/Users/alice/proj/to_mac")).unwrap();
+        symlink("../../../../..", vm.join("mnt/mac/Users/alice/proj/to_mnt")).unwrap();
+        symlink("../../../../../..", vm.join("mnt/mac/Users/alice/proj/to_root")).unwrap();
+        symlink("../../../../../../var/lib/kiri", vm.join("mnt/mac/Users/alice/proj/to_vm")).unwrap();
+        symlink("../../../../../../nonexistent_vm_dir", vm.join("mnt/mac/Users/alice/proj/dangling_escape")).unwrap();
+        symlink("../ok_sub/missing", vm.join("mnt/mac/Users/alice/proj/dangling_inside")).unwrap();
+
+        // Allowed VM and Mac share sources.
+        for ok in [
+            "/mnt/mac/Users",
+            "/mnt/mac/Users/alice/proj",
+            "/mnt/mac/Users/alice/proj/missing_child",
+            "/mnt/mac/Users/alice/proj/dangling_inside",
+            "/mnt/mac/Volumes/ext",
+            "/mnt/mac/private/tmp/work",
+            "/var/lib/kiri/volumes/v1/_data",
+            "/opt/plain_vm_dir",
+        ] {
+            check_vm_mount_source_for(ok, true, &vm).unwrap_or_else(|e| panic!("{ok} should pass: {e}"));
+        }
+
+        // Denied VM root, share mountpoint, indirect /mnt/mac, and escaping symlinks.
+        for bad in [
+            "/",
+            "/mnt",
+            "/mnt/mac",
+            "/mnt//mac",
+            "/mnt/mac/Users/..",
+            "/mnt/mac/Users/alice/proj/../../../../",
+            "/mnt/mac/unshared",
+            "/opt/mac_link",
+            "/opt/mac_link/proj",
+            "/mnt/mac/Users/alice/proj/to_mac",
+            "/mnt/mac/Users/alice/proj/to_mnt",
+            "/mnt/mac/Users/alice/proj/to_root",
+            "/mnt/mac/Users/alice/proj/to_vm",
+            "/mnt/mac/Users/alice/proj/dangling_escape",
+        ] {
+            let err = check_vm_mount_source_for(bad, true, &vm).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{bad}: {err}");
+        }
+
+        // Relative paths are always InvalidInput; host processes (`in_vm = false`) allow `/mnt`.
+        assert_eq!(check_vm_mount_source_for("rel/path", false, &vm).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        assert!(check_vm_mount_source_for("/mnt", false, &vm).is_ok());
+
+        let _ = fs::remove_dir_all(&vm);
+    }
+
+    #[test]
+    fn write_etc_files_and_resolv_conf_reject_control_characters() {
+        let dir = std::env::temp_dir().join(format!("kiri-etc-ctrl-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let run_etc = |hostname: &str, extra_hosts: &[&str], opts: &[&str]| -> io::Result<()> {
+            let mut buf = Vec::new();
+            let net = Net { bridge: "kiri0", ip: [172, 17, 0, 2], prefix: 16, gateway: [172, 17, 0, 1], extra_hosts, dns_names: &[], opts };
+            encode_run(&mut buf, "c1", &[], &["sh"], &[], "/", "", hostname, 0, net, &[], &Limits::default(), 0, &[] as &[&str], &[]);
+            let Ok(Msg::Run(spec)) = decode(&buf) else { panic!("decode Run") };
+            write_etc_files(&spec, &dir, &[[1, 1, 1, 1]], None).map(|_| ())
+        };
+
+        assert!(run_etc("web", &["10.0.0.2\tdb"], &["nameserver=8.8.8.8", "search=corp.local", "option=ndots:2", "domainname=corp.local"]).is_ok());
+        assert_eq!(run_etc("web\nevil", &[], &[]).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(run_etc("web\revil", &[], &[]).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(run_etc("web", &["10.0.0.2\tdb\n1.2.3.4\tevil"], &[]).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(run_etc("web", &[], &["domainname=corp\n1.2.3.4 evil"]).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(run_etc("web", &[], &["nameserver=8.8.8.8\noptions debug"]).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(run_etc("web", &[], &["search=corp.local\nnameserver 1.2.3.4"]).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(run_etc("web", &[], &["option=ndots:2\rnameserver 1.2.3.4"]).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
 
 /// How deep a mount target is: `.` is 0, `app` 1, `app/node_modules` 2.

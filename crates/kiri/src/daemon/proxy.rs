@@ -193,8 +193,34 @@ pub fn container_env() -> Vec<String> {
 }
 
 pub fn report() -> Value {
+    report_for(&super::caller::Caller::Host)
+}
+
+/// Proxy settings and effective URLs for `GET /kiri/proxy`. Credentials
+/// (`user:password@`) are preserved only for `Caller::Host` (the Settings UI)
+/// and stripped for `Caller::Container` and `Caller::Wsl`.
+pub fn report_for(caller: &super::caller::Caller) -> Value {
+    redact_report(report_raw(), *caller != super::caller::Caller::Host)
+}
+
+fn report_raw() -> Value {
     let e = effective();
     json!({"settings": settings(), "effective": {"http": e.http, "https": e.https, "no_proxy": e.no_proxy, "pac": e.pac}})
+}
+
+fn redact_report(mut v: Value, strip_credentials: bool) -> Value {
+    if !strip_credentials {
+        return v;
+    }
+    for k in ["http", "https"] {
+        if let Some(s) = v["settings"][k].as_str().filter(|s| !s.is_empty()) {
+            v["settings"][k] = Value::String(without_password(s.to_owned()));
+        }
+        if let Some(s) = v["effective"][k].as_str() {
+            v["effective"][k] = Value::String(without_password(s.to_owned()));
+        }
+    }
+    v
 }
 
 
@@ -222,6 +248,17 @@ mod tests {
         assert_eq!(shown("http://me:se@cret@127.0.0.1:7892"), "http://127.0.0.1:7892");
         assert_eq!(shown("me:pw@proxy.corp:3128"), "proxy.corp:3128");
         assert_eq!(shown("http://proxy.corp:3128/a@b"), "http://proxy.corp:3128/a@b");
+
+        let raw = serde_json::json!({
+            "settings": {"mode": "custom", "http": "http://alice:s3cr3t@127.0.0.1:8080", "https": "user:pw@proxy.corp:8443", "no_proxy": "localhost", "containers": false},
+            "effective": {"http": "http://alice:s3cr3t@127.0.0.1:8080", "https": "http://user:pw@proxy.corp:8443", "no_proxy": ["localhost"], "pac": false}
+        });
+        assert_eq!(super::redact_report(raw.clone(), false), raw);
+        let redacted = super::redact_report(raw, true);
+        assert_eq!(redacted["settings"]["http"], "http://127.0.0.1:8080");
+        assert_eq!(redacted["settings"]["https"], "proxy.corp:8443");
+        assert_eq!(redacted["effective"]["http"], "http://127.0.0.1:8080");
+        assert_eq!(redacted["effective"]["https"], "http://proxy.corp:8443");
     }
 
     #[test]

@@ -232,6 +232,21 @@ pub fn split_for(spec: &str, wsl: Option<&Wsl>, wsl_distro: Option<&str>) -> Res
     Ok((src, dst.to_owned(), opts.to_owned()))
 }
 
+/// Whether `src` is a Windows UNC spelling for WSL or Docker pipe (`//wsl$/…`,
+/// `//wsl.localhost/…`, `//./pipe/…`) rather than a Linux path with redundant
+/// leading slashes (`//etc/shadow`, `///var/lib/kiri`).
+fn is_distro_unc(src: &str) -> bool {
+    if src.contains('\\') {
+        return true;
+    }
+    let Some(rest) = src.strip_prefix("//") else { return false };
+    if rest.starts_with('/') {
+        return false;
+    }
+    let (host, _) = rest.split_once('/').unwrap_or((rest, ""));
+    host.eq_ignore_ascii_case("wsl$") || host.eq_ignore_ascii_case("wsl.localhost") || host == "." || host == "?"
+}
+
 /// Translates a bind mount source from an integrated WSL distro `<distro>`:
 /// - `/var/run/docker.sock` (and engine socket aliases) stays the engine socket
 /// - `/mnt/c/proj` (under the Windows automount root) stays `/mnt/c/proj`
@@ -243,29 +258,61 @@ pub fn distro_source(src: &str, distro: &str, wsl: Option<&Wsl>) -> Result<Strin
     }
     let kiri_dir = wsl_kiri_dir();
     let roots_dir = format!("{kiri_dir}/roots");
-    if looks_windows(src) {
+    let distro_root = mounted_distro_root(distro).unwrap_or_else(|| format!("{roots_dir}/{distro}"));
+    // Collapse redundant leading slashes on Unix paths (`//etc/shadow` -> `/etc/shadow`,
+    // `///var/lib/kiri` -> `/var/lib/kiri`) before checking `looks_windows` so they
+    // cannot escape confinement through `source_with_roots`.
+    let collapsed;
+    let unix_or_win = if src.starts_with('/') && drive_prefix(src) == 0 && !is_distro_unc(src) {
+        collapsed = format!("/{}", src.trim_start_matches('/'));
+        collapsed.as_str()
+    } else {
+        src
+    };
+    if looks_windows(unix_or_win) {
+        let s = unix_or_win.replace('\\', "/");
+        if let Some(rest) = s.strip_prefix("//").filter(|r| !r.starts_with('/')) {
+            let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
+            if host.eq_ignore_ascii_case("wsl$") || host.eq_ignore_ascii_case("wsl.localhost") {
+                let (d, inner) = path.split_once('/').unwrap_or((path, ""));
+                if d.is_empty() {
+                    return Err(Error::BadRequest(format!("invalid mount source {src}: no WSL distro named")));
+                }
+                if !d.eq_ignore_ascii_case(distro) {
+                    return Err(Error::BadRequest(format!(
+                        "invalid mount source {src}: WSL distro {distro} cannot mount files from WSL distro {d}"
+                    )));
+                }
+                let inner_abs = format!("/{inner}");
+                return distro_unix_source(src, &inner_abs, distro, &kiri_dir, &distro_root, wsl);
+            }
+        }
         let default_wsl = Wsl { root: "/mnt/".into(), distro: None };
         let w = wsl.unwrap_or(&default_wsl);
-        return source_with_roots(src, w, |d| {
-            if d.eq_ignore_ascii_case(distro) {
-                Some(format!("{roots_dir}/{distro}"))
-            } else {
-                mounted_distro_root(d)
-            }
-        });
+        return source_with_roots(unix_or_win, w, |_| None);
     }
-    if !src.starts_with('/') {
-        return Ok(src.to_owned());
+    if !unix_or_win.starts_with('/') {
+        return Ok(unix_or_win.to_owned());
     }
-    let distro_root = format!("{roots_dir}/{distro}");
+    distro_unix_source(src, unix_or_win, distro, &kiri_dir, &distro_root, wsl)
+}
+
+fn distro_unix_source(
+    raw_src: &str,
+    src: &str,
+    distro: &str,
+    kiri_dir: &str,
+    distro_root: &str,
+    wsl: Option<&Wsl>,
+) -> Result<String, Error> {
     let cleaned = clean(src);
     if ENGINE_SOCKS.contains(&cleaned.as_str()) || is_wsl_engine_socket(&cleaned) || cleaned == SSH_AGENT_SOCK {
         return Ok(cleaned);
     }
-    if cleaned == distro_root || cleaned.strip_prefix(&distro_root).is_some_and(|r| r.starts_with('/')) {
-        let rest = cleaned.strip_prefix(&distro_root).unwrap_or("");
-        let target = confine_to_root(&distro_root, rest);
-        verify_on_disk_confinement(src, distro, Path::new(&distro_root), Path::new(&target))?;
+    if cleaned == distro_root || cleaned.strip_prefix(distro_root).is_some_and(|r| r.starts_with('/')) {
+        let rest = cleaned.strip_prefix(distro_root).unwrap_or("");
+        let target = confine_to_root(distro_root, rest);
+        verify_on_disk_confinement(raw_src, distro, Path::new(distro_root), Path::new(&target))?;
         return Ok(target);
     }
     let lex = lexical_clean(src);
@@ -285,7 +332,7 @@ pub fn distro_source(src: &str, distro: &str, wsl: Option<&Wsl>) -> Result<Strin
     };
     if is_internal_wsl(&lex) {
         return Err(Error::BadRequest(format!(
-            "invalid mount source {src}: cannot mount Kiri's internal WSL directory"
+            "invalid mount source {raw_src}: cannot mount Kiri's internal WSL directory"
         )));
     }
     let mnt = wsl.map_or("/mnt/", |w| w.root.as_str());
@@ -298,13 +345,13 @@ pub fn distro_source(src: &str, distro: &str, wsl: Option<&Wsl>) -> Result<Strin
     // means the distro's own file: follow it inside the distro's root. With
     // only relative links on the way the source stays as given; the kernel
     // follows those inside the root itself.
-    let target = match resolve_in_root(Path::new(&distro_root), &lex) {
+    let target = match resolve_in_root(Path::new(distro_root), &lex) {
         Some((inside, true)) if on_drive(&inside) => return Ok(inside),
-        Some((inside, true)) => confine_to_root(&distro_root, &inside),
-        Some((_, false)) => confine_to_root(&distro_root, &lex),
-        None => return Err(Error::BadRequest(format!("invalid mount source {src}: too many levels of symbolic links"))),
+        Some((inside, true)) => confine_to_root(distro_root, &inside),
+        Some((_, false)) => confine_to_root(distro_root, &lex),
+        None => return Err(Error::BadRequest(format!("invalid mount source {raw_src}: too many levels of symbolic links"))),
     };
-    verify_on_disk_confinement(src, distro, Path::new(&distro_root), Path::new(&target))?;
+    verify_on_disk_confinement(raw_src, distro, Path::new(distro_root), Path::new(&target))?;
     Ok(target)
 }
 
@@ -926,8 +973,61 @@ mod tests {
         }
         // Mounting another distro's root or Kiri's internal WSL dir is refused.
         assert!(distro_source("/mnt/wsl/kiri/roots/Debian/etc", "Ubuntu", Some(&w)).is_err());
+        assert!(distro_source("//mnt/wsl/kiri/roots/Debian/etc", "Ubuntu", Some(&w)).is_err());
+        assert!(distro_source("///mnt/wsl/kiri/roots/Debian/etc", "Ubuntu", Some(&w)).is_err());
         assert!(distro_source("/mnt/wsl/kiri/sockets/Ubuntu", "Ubuntu", Some(&w)).is_err());
         assert!(distro_source("/home/me", "../evil", Some(&w)).is_err());
+
+        // Redundant leading slashes on Unix paths stay confined to `<distro>`.
+        assert_eq!(
+            distro_source("//etc/shadow", "Ubuntu", Some(&w)).unwrap(),
+            "/mnt/wsl/kiri/roots/Ubuntu/etc/shadow"
+        );
+        assert_eq!(
+            distro_source("///var/lib/kiri", "Ubuntu", Some(&w)).unwrap(),
+            "/mnt/wsl/kiri/roots/Ubuntu/var/lib/kiri"
+        );
+        assert_eq!(
+            distro_source("//var/lib/kiri", "Ubuntu", None).unwrap(),
+            "/mnt/wsl/kiri/roots/Ubuntu/var/lib/kiri"
+        );
+        assert_eq!(
+            distro_source("//mnt/wsl/kiri/roots/Ubuntu/etc", "Ubuntu", Some(&w)).unwrap(),
+            "/mnt/wsl/kiri/roots/Ubuntu/etc"
+        );
+
+        // `\\wsl.localhost\<d>` and `//wsl$/<d>` in `distro_source`: only `<d> == <distro>`
+        // is allowed (refusing both other user distros and the engine distro `kiri`).
+        for own_unc in [
+            r"\\wsl.localhost\Ubuntu\home\alice\app",
+            r"\\wsl$\ubuntu\home\alice\app",
+            "//wsl.localhost/Ubuntu/home/alice/app",
+            "//wsl$/UBUNTU/home/alice/app",
+        ] {
+            assert_eq!(
+                distro_source(own_unc, "Ubuntu", Some(&w)).unwrap(),
+                "/mnt/wsl/kiri/roots/Ubuntu/home/alice/app",
+                "{own_unc}"
+            );
+        }
+        assert_eq!(
+            distro_source(r"\\wsl.localhost\Ubuntu\home\alice\..\..\..\etc\shadow", "Ubuntu", Some(&w)).unwrap(),
+            "/mnt/wsl/kiri/roots/Ubuntu/etc/shadow"
+        );
+        for cross_unc in [
+            r"\\wsl.localhost\Debian\etc\shadow",
+            r"\\wsl$\Debian\home\bob",
+            "//wsl.localhost/Debian/etc/shadow",
+            r"\\wsl.localhost\kiri\var\lib\kiri",
+            r"\\wsl$\kiri\etc\shadow",
+            "//wsl.localhost/kiri/var/lib/kiri",
+            "//wsl$/kiri/etc/shadow",
+            r"\\?\UNC\wsl.localhost\kiri\etc\shadow",
+            r"\\server\share\dir",
+        ] {
+            assert!(distro_source(cross_unc, "Ubuntu", Some(&w)).is_err(), "{cross_unc} with Some(&w)");
+            assert!(distro_source(cross_unc, "Ubuntu", None).is_err(), "{cross_unc} with None");
+        }
 
         // From Windows: `\\wsl.localhost\<NAME>\...` is allowed when `<NAME>`'s root is mounted.
         let with_ubuntu = |d: &str| d.eq_ignore_ascii_case("Ubuntu").then(|| "/mnt/wsl/kiri/roots/Ubuntu".to_owned());
