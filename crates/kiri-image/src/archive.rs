@@ -7,8 +7,8 @@
 //! content-addressed blobs already in the store are verified in memory without
 //! rewriting disk files.
 
-use std::collections::HashMap;
-use std::io::{self, Read, Write};
+use std::collections::{HashMap, HashSet};
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
@@ -36,15 +36,15 @@ pub fn load_with_platform(store: &Store, archive: impl Read, platform: Option<&P
 
 /// As [`load`], filtering a multi-platform OCI index to `platforms` when non-empty.
 pub fn load_platforms(store: &Store, archive: impl Read, platforms: &[Platform]) -> io::Result<Vec<Image>> {
-    let mut tar = tar::Archive::new(archive);
+    let mut tar = tar::Archive::new(BufReader::with_capacity(128 << 10, archive));
     // Archive path → blob digest and size, for every regular file.
     let mut files: HashMap<String, (String, u64)> = HashMap::new();
     let mut manifest: Option<Vec<u8>> = None;
     let mut index: Option<Vec<u8>> = None;
     let mut oci_layout: Option<Vec<u8>> = None;
-    let before: Vec<Image> = store.images()?;
-    let existed = |d: &str| before.iter().any(|i| i.referenced_digests().any(|r| r == d));
-    let mut ingested: Vec<String> = Vec::new();
+    let before = store.images_arc()?;
+    let before_digests: HashSet<&str> = before.iter().flat_map(|i| i.referenced_digests()).collect();
+    let mut ingested: HashSet<String> = HashSet::new();
     let mut pins = Vec::new();
     let read = (|| -> io::Result<Vec<Image>> {
         for entry in tar.entries()? {
@@ -96,8 +96,8 @@ pub fn load_platforms(store: &Store, archive: impl Read, platforms: &[Platform])
             // that shares the blob must not delete it meanwhile.
             let (digest, size, pin) = w.finish_pinned()?;
             pins.push(pin);
-            if !existed(&digest) && !ingested.contains(&digest) {
-                ingested.push(digest.clone());
+            if !before_digests.contains(digest.as_str()) {
+                ingested.insert(digest.clone());
             }
             files.insert(path, (digest, size));
         }
@@ -161,9 +161,7 @@ fn load_docker(store: &Store, files: &HashMap<String, (String, u64)>, manifest: 
             loaded.push(from_config(name, &config_digest, &config, layers.clone()));
         }
     }
-    for image in &loaded {
-        store.put_image(image.clone())?;
-    }
+    store.put_images(loaded.clone())?;
     Ok(loaded)
 }
 
@@ -362,9 +360,7 @@ fn load_oci(
         let name = candidate.tag.unwrap_or_else(|| config_digest.clone());
         loaded.push(from_config(name, &config_digest, &config, layers));
     }
-    for image in &loaded {
-        store.put_image(image.clone())?;
-    }
+    store.put_images(loaded.clone())?;
     Ok(loaded)
 }
 
@@ -390,8 +386,8 @@ pub fn hold(store: &Store, images: &[Image]) -> io::Result<Vec<crate::store::Pin
 /// Writes `images` as one archive `docker load` reads back.
 pub fn save(store: &Store, images: &[Image], out: impl Write) -> io::Result<()> {
     let _held = hold(store, images)?;
-    let mut tar = tar::Builder::new(out);
-    let mut written: Vec<String> = Vec::new();
+    let mut tar = tar::Builder::new(BufWriter::with_capacity(128 << 10, out));
+    let mut written: HashSet<&str> = HashSet::new();
     let mut manifest = Vec::new();
     // Images that share a config are one entry with several tags.
     let mut by_config: Vec<(&Image, Vec<String>)> = Vec::new();
@@ -408,18 +404,18 @@ pub fn save(store: &Store, images: &[Image], out: impl Write) -> io::Result<()> 
     for (image, tags) in &by_config {
         let blob = |d: &str| format!("blobs/sha256/{}", d.strip_prefix("sha256:").unwrap_or(d));
         for d in std::iter::once(&image.config_digest).chain(image.layers.iter().map(|l| &l.digest)) {
-            if written.contains(d) {
+            if !written.insert(d.as_str()) {
                 continue;
             }
             let path = store.blob_path(d)?;
-            let mut f = std::fs::File::open(&path)?;
+            let f = std::fs::File::open(&path)?;
             let mut h = tar::Header::new_ustar();
             h.set_size(f.metadata()?.len());
             h.set_mode(0o644);
             h.set_mtime(0);
             h.set_entry_type(tar::EntryType::Regular);
-            tar.append_data(&mut h, blob(d), &mut f)?;
-            written.push(d.clone());
+            let mut br = BufReader::with_capacity(128 << 10, f);
+            tar.append_data(&mut h, blob(d), &mut br)?;
         }
         manifest.push(json!({
             "Config": blob(&image.config_digest),

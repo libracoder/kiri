@@ -361,7 +361,7 @@ impl Store {
     pub fn blob_writer(&self, digest: &str) -> io::Result<BlobWriter> {
         let tmp = self.root.join("tmp").join(format!("{}.{}.{}", digest_hex(digest)?, std::process::id(), TMP_SEQ.fetch_add(1, Ordering::Relaxed)));
         Ok(BlobWriter {
-            file: File::create(&tmp)?,
+            file: io::BufWriter::with_capacity(BLOB_WRITE_BUF, File::create(&tmp)?),
             hasher: Sha256::new(),
             tmp,
             dest: self.blob_path(digest)?,
@@ -374,7 +374,13 @@ impl Store {
     /// it is named after what was written once `finish` is called.
     pub fn ingest(&self) -> io::Result<Ingest> {
         let tmp = self.root.join("tmp").join(format!("ingest.{}.{}", std::process::id(), TMP_SEQ.fetch_add(1, Ordering::Relaxed)));
-        Ok(Ingest { file: File::create(&tmp)?, hasher: Sha256::new(), tmp, root: self.root.clone(), written: 0 })
+        Ok(Ingest {
+            file: io::BufWriter::with_capacity(BLOB_WRITE_BUF, File::create(&tmp)?),
+            hasher: Sha256::new(),
+            tmp,
+            root: self.root.clone(),
+            written: 0,
+        })
     }
 
     /// The image index, shared via `Arc` from an mtime/size/inode-validated
@@ -595,9 +601,29 @@ impl Store {
     /// the replaced image used go, as [`Store::remove_image`] deletes them:
     /// nothing would name them any more (#864).
     pub fn put_image(&self, image: Image) -> io::Result<()> {
+        self.put_images(vec![image])
+    }
+
+    /// Adds every image in `new_images` in a single atomic index rewrite so
+    /// multi-image `docker load` archives pay one index lock + fsync instead of N.
+    pub fn put_images(&self, new_images: Vec<Image>) -> io::Result<()> {
+        if new_images.is_empty() {
+            return Ok(());
+        }
         let _lock = self.lock_index()?;
-        let (replaced, mut images): (Vec<Image>, Vec<Image>) = self.read_locked()?.into_iter().partition(|i| i.name == image.name);
-        images.push(image);
+        let mut images = self.read_locked()?;
+        let mut replaced = Vec::new();
+        for image in new_images {
+            let mut i = 0;
+            while i < images.len() {
+                if images[i].name == image.name {
+                    replaced.push(images.remove(i));
+                } else {
+                    i += 1;
+                }
+            }
+            images.push(image);
+        }
         self.write_index(&images)?;
         for old in &replaced {
             self.remove_unused_blobs(old, &images);
@@ -710,11 +736,13 @@ impl Store {
     }
 }
 
+const BLOB_WRITE_BUF: usize = 128 << 10;
+
 /// Writes a blob to a temporary file, hashing as it goes, and only moves it
 /// into the store if the digest matches.
 #[derive(Debug)]
 pub struct BlobWriter {
-    file: File,
+    file: io::BufWriter<File>,
     hasher: Sha256,
     tmp: PathBuf,
     dest: PathBuf,
@@ -755,7 +783,8 @@ impl BlobWriter {
                 format!("digest mismatch: expected {}, got {actual}", self.expected),
             ));
         }
-        self.file.sync_all()?;
+        self.file.flush()?;
+        self.file.get_ref().sync_all()?;
         let _one = BLOB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let pin = Pin::take(self.dest.clone());
         if blob_ready(&self.dest, self.written) {
@@ -778,7 +807,7 @@ impl Drop for BlobWriter {
 /// See [`Store::ingest`].
 #[derive(Debug)]
 pub struct Ingest {
-    file: File,
+    file: io::BufWriter<File>,
     hasher: Sha256,
     tmp: PathBuf,
     root: PathBuf,
@@ -811,7 +840,8 @@ impl Ingest {
             let _ = fs::remove_file(&self.tmp);
             return Ok((format!("sha256:{hex}"), self.written));
         }
-        self.file.sync_all()?;
+        self.file.flush()?;
+        self.file.get_ref().sync_all()?;
         fs::rename(&self.tmp, dest)?;
         Ok((format!("sha256:{hex}"), self.written))
     }
@@ -829,7 +859,8 @@ impl Ingest {
             let _ = fs::remove_file(&self.tmp);
             return Ok((format!("sha256:{hex}"), self.written, pin));
         }
-        self.file.sync_all()?;
+        self.file.flush()?;
+        self.file.get_ref().sync_all()?;
         fs::rename(&self.tmp, &dest)?;
         Ok((format!("sha256:{hex}"), self.written, pin))
     }
