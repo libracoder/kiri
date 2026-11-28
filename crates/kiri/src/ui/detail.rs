@@ -79,6 +79,7 @@ pub fn logs(id: String) {
             }
         });
         let mut pending = Vec::new();
+        let mut pos = 0usize;
         while let Some(c) = stream.next() {
             if LOGS_GEN.load(Ordering::SeqCst) != generation {
                 break;
@@ -89,15 +90,22 @@ pub fn logs(id: String) {
             }
             // Docker's 8-byte frame headers: stream, 3 zero bytes, big-endian length.
             pending.extend_from_slice(&c);
-            while pending.len() >= 8 {
-                let len = u32::from_be_bytes([pending[4], pending[5], pending[6], pending[7]]) as usize;
-                if pending.len() < 8 + len {
+            while pending.len() - pos >= 8 {
+                let len = u32::from_be_bytes([pending[pos + 4], pending[pos + 5], pending[pos + 6], pending[pos + 7]]) as usize;
+                if pending.len() - pos < 8 + len {
                     break;
                 }
-                let err = pending[0] == 2;
-                let data = pending[8..8 + len].to_vec();
-                pending.drain(..8 + len);
+                let err = pending[pos] == 2;
+                let data = pending[pos + 8..pos + 8 + len].to_vec();
+                pos += 8 + len;
                 let _ = tx.send((err, data));
+            }
+            if pos == pending.len() {
+                pending.clear();
+                pos = 0;
+            } else if pos >= 64 * 1024 || pos * 2 >= pending.len() {
+                pending.drain(..pos);
+                pos = 0;
             }
         }
     });
@@ -143,16 +151,25 @@ pub fn stats(id: String) {
             *STATS.lock().unwrap_or_else(|e| e.into_inner()) = Some(closer);
         }
         let mut pending = Vec::new();
+        let mut pos = 0usize;
         while let Some(c) = stream.next() {
             if STATS_GEN.load(Ordering::SeqCst) != generation {
                 return;
             }
             pending.extend_from_slice(&c);
-            while let Some(i) = pending.iter().position(|&b| b == b'\n') {
-                let line: Vec<u8> = pending.drain(..=i).collect();
-                if let Ok(s) = serde_json::from_slice::<Value>(&line) {
+            while let Some(rel) = pending[pos..].iter().position(|&b| b == b'\n') {
+                let end = pos + rel + 1;
+                if let Ok(s) = serde_json::from_slice::<Value>(&pending[pos..end]) {
                     emit(sample(&id, &s).to_string());
                 }
+                pos = end;
+            }
+            if pos == pending.len() {
+                pending.clear();
+                pos = 0;
+            } else if pos >= 64 * 1024 || pos * 2 >= pending.len() {
+                pending.drain(..pos);
+                pos = 0;
             }
         }
         if STATS_GEN.load(Ordering::SeqCst) == generation {
