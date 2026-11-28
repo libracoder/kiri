@@ -338,7 +338,7 @@ bind-nonroot-parallel	#796	concurrent non-root file and directory creation on a 
 bind-nonroot-ro	#796	non-root writes to a read-only 0444 bind-mount file must still fail with EACCES, including inside an unprivileged unshare -Ur user namespace
 crates/kiri/src/daemon/rofs.rs	#768	when Kiri's WSL 2 ext4.vhdx or Linux storage filesystem was remounted read-only (emergency_ro), daemon startup, /info and diagnostics lacked actionable fsck / storage recovery steps
 crates/kiri-init/src/linux/sys.rs	#768	on a read-only or emergency_ro storage filesystem, overlayfs silently mounted writable container rootfs read-only instead of refusing with actionable recovery steps
-crates/kiri-win/src/wslsync.rs	#768	kiri-start and kiri-win reported a generic WSL install failure instead of ext4.vhdx emergency_ro e2fsck recovery steps when Kiri's WSL 2 disk was remounted read-only, and KIRI_CONTEXT_HASH did not match sha256("kiri") (#269)
+crates/kiri-win/src/wslsync.rs	#768	kiri-start and kiri-win reported a generic WSL install failure instead of ext4.vhdx emergency_ro e2fsck recovery steps when Kiri's WSL 2 disk was remounted read-only, KIRI_CONTEXT_HASH did not match sha256("kiri"), and wsl_enable_script overwrote Windows's npipe kiri context when ~/.docker/contexts in WSL was symlinked into /mnt/ (#269)
 tls-company-root-pull	#303	a registry signed by a root the system trusts failed UnknownIssuer: only the bundled roots were trusted
 tls-company-root-login	#303	docker login to a registry signed by a root the system trusts failed UnknownIssuer
 tls-unknown-root-refused	#303	a root the system does not trust must still be refused
@@ -379,3 +379,4 @@ crates/kiri-win/src/refuse.rs	#983	Windows pipe gate did not handle `POST /kiri/
 crates/kiri/src/domains_cli.rs	#744	`kiri domains set` and `kiri domains reset` failed with a daemon-not-running error instead of updating `domains.json` offline when the daemon was stopped
 crates/kiri-image/src/registry.rs	#611	`Client::manifest` did not retry transient registry responses such as HTTP 429 during concurrent image pulls
 crates/kiri/src/daemon/storage.rs	#190	`statvfs_usage` subtracted `f_bavail` instead of `f_bfree`, counting ~55 GB of ext4 root-reserved free blocks on WSL's sparse `ext4.vhdx` as used disk space
+crates/kiri/src/dockerctx.rs	#269	Windows `repair_windows_config` did not self-heal `%USERPROFILE%\.docker\contexts\meta\<sha256(kiri)>\meta.json` when overwritten with a WSL `unix://` socket endpoint

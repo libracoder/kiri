@@ -135,9 +135,10 @@ fn first_line(bytes: &[u8], fallback: &str) -> String {
 }
 
 pub fn latest() -> io::Result<Release> {
-    let url = std::env::var("KIRI_UPDATE_URL").unwrap_or_else(|_| FEED.to_owned());
-    allowed_url(&url)?;
-    let out = curl().args(["-fsSL", "--max-time", "20", "--max-filesize", "65536", "--"]).arg(&url).output()?;
+    let env_val = std::env::var("KIRI_UPDATE_URL").ok();
+    let url = env_val.as_deref().map(str::trim).filter(|u| !u.is_empty()).unwrap_or(FEED);
+    allowed_url(url)?;
+    let out = curl().args(["-fsSL", "--max-time", "20", "--max-filesize", "65536", "--"]).arg(url).output()?;
     if !out.status.success() {
         return Err(io::Error::other(first_line(&out.stderr, "could not fetch the update feed")));
     }

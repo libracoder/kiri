@@ -110,9 +110,13 @@ fn agent() -> ureq::Agent {
         .into()
 }
 
+fn feed_url(env_override: Option<&str>) -> &str {
+    env_override.map(str::trim).filter(|u| !u.is_empty()).unwrap_or(FEED)
+}
+
 pub fn latest() -> io::Result<Release> {
-    let url = std::env::var("KIRI_UPDATE_URL").unwrap_or_else(|_| FEED.to_owned());
-    latest_from(&url)
+    let env_val = std::env::var("KIRI_UPDATE_URL").ok();
+    latest_from(feed_url(env_val.as_deref()))
 }
 
 fn latest_from(url: &str) -> io::Result<Release> {
@@ -710,6 +714,11 @@ mod tests {
 
     #[test]
     fn rejects_malformed_json_and_http_500() {
+        assert_eq!(super::feed_url(None), super::FEED);
+        assert_eq!(super::feed_url(Some("")), super::FEED);
+        assert_eq!(super::feed_url(Some("   ")), super::FEED);
+        assert_eq!(super::feed_url(Some("https://example.com/feed.json")), "https://example.com/feed.json");
+
         let bad_json = serve_feed("200 OK", "{not json");
         let err = latest_from(&bad_json).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);

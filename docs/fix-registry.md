@@ -13,15 +13,21 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #269, #984 Windows & WSL: avoid clobbering `%USERPROFILE%\.docker\contexts` through Docker Desktop's WSL symlink, self-heal `unix://` `kiri` context on Windows, and ignore empty `KIRI_UPDATE_URL` (unreleased)
+- Fixes: #269 (enabling WSL integration when `~/.docker/contexts` in WSL was symlinked to `/mnt/c/Users/<user>/.docker/contexts` overwrote Windows's `npipe:////./pipe/kiri` `kiri` context with a Linux `unix://` socket), #984 (`KIRI_UPDATE_URL=""` from `setx` caused `kiri update --check` to fail with `http: empty string` instead of using the default feed)
+- Caused: none known
+- Caused by: #1002
+- Check: `crates/kiri-win/src/wslsync.rs`, `crates/kiri/src/dockerctx.rs`, `crates/kiri/src/update.rs`
+
 ### #984 Windows CLI: support `kiri update --check` against the Windows release feed (unreleased)
 - Fixes: #984 (`kiri.exe update --check` fell through to `docker update --check` with `unknown flag: --check` on Windows)
 - Caused: none known
 - Caused by: -
 - Check: `crates/kiri/src/update.rs`, `crates/kiri/src/main.rs`
 
-### #190, #269, #399, #744 Release gate fixes: virtiofs deleted-file revalidation across `docker run --rm`, offline `kiri domains set/reset`, netns lock takeover after stuck container start, transient `429` manifest retries, WSL `statvfs` `f_bfree` usage, and WSL `kiri` context hash (unreleased)
+### #1002 Release gate fixes: virtiofs deleted-file revalidation across `docker run --rm`, offline `kiri domains set/reset`, netns lock takeover after stuck container start, transient `429` manifest retries, WSL `statvfs` `f_bfree` usage, and WSL `kiri` context hash (unreleased)
 - Fixes: #399 (back-to-back `docker run --rm -v` sees 1 s `ENOENT` recreating a host-deleted file), #744 (`kiri domains set` and `kiri domains reset` failed when the daemon was stopped), #190 (`statvfs_usage` used `f_bavail` instead of `f_bfree`, counting ~55 GB of ext4 reserved blocks on WSL's sparse `ext4.vhdx` as used), #269 (`wslsync.rs` hardcoded the wrong SHA-256 for Docker context `kiri`), `agent-dies-beside-stuck-start` (`claim_host_netns` failed when a dead agent's frozen child still held `@kiri-engine-netns`), `pulls-of-different-images-at-once-leave-a-sound-index` (`Client::manifest` did not retry HTTP `429` / transient registry errors)
-- Caused: none known
+- Caused: Enabling WSL integration in a distro where Docker Desktop had symlinked `~/.docker/contexts` to `/mnt/c/Users/<user>/.docker/contexts` overwrote Windows's `npipe:////./pipe/kiri` `kiri` context with `unix:///mnt/wsl/kiri/sockets/<distro>/docker.sock` (found during 0.2.3 release-gate restore on Windows)
 - Caused by: #825, #846, #852, #970
 - Check: `agent-dies-beside-stuck-start`, `pulls-of-different-images-at-once-leave-a-sound-index`, `crates/kiri/src/domains_cli.rs`, `crates/kiri-image/src/registry.rs`, `crates/kiri-win/src/wslsync.rs`
 

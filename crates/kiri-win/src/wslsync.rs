@@ -372,10 +372,20 @@ pub fn wsl_enable_script(distro: &str, root: &str) -> String {
            elif pgrep -x dockerd >/dev/null 2>&1 || pidof dockerd >/dev/null 2>&1; then busy=1; fi; \
          fi; \
          [ \"$busy\" = 0 ] && ln -sfn {sock_target} \"$vr/docker.sock\"; \
-         if [ -n \"$uhome\" ] && [ -d {host_prefix}\"$uhome\" ]; then \
-           cdir={host_prefix}\"$uhome/.docker/contexts/meta/{KIRI_CONTEXT_HASH}\"; \
-           mkdir -p \"$cdir\" 2>/dev/null && printf %s {} | base64 -d >\"$cdir/meta.json\" 2>/dev/null; \
-           [ -n \"$uuid\" ] && [ -n \"$ugid\" ] && chown -R \"$uuid:$ugid\" {host_prefix}\"$uhome/.docker\" 2>/dev/null || true; \
+         if [ -n \"$uhome\" ] && [ -d {host_prefix}\"$uhome\" ] && [ ! -L {host_prefix}\"$uhome/.docker\" ]; then \
+           dctx={host_prefix}\"$uhome/.docker/contexts\"; \
+           if [ -L \"$dctx\" ]; then \
+             dt=$(readlink \"$dctx\" 2>/dev/null || true); \
+             case \"$dt\" in */mnt/*) \
+               tmp=\"$dctx.kiri.$$\"; rm -rf \"$tmp\"; mkdir -p \"$tmp\" && cp -r \"$dctx/.\" \"$tmp/\" 2>/dev/null || true; \
+               rm -f \"$dctx\" && mv \"$tmp\" \"$dctx\" ;; \
+             esac; \
+           fi; \
+           if [ ! -L \"$dctx\" ]; then \
+             cdir=\"$dctx/meta/{KIRI_CONTEXT_HASH}\"; \
+             mkdir -p \"$cdir\" 2>/dev/null && printf %s {} | base64 -d >\"$cdir/meta.json\" 2>/dev/null; \
+             [ -n \"$uuid\" ] && [ -n \"$ugid\" ] && chown -R \"$uuid:$ugid\" {host_prefix}\"$uhome/.docker\" 2>/dev/null || true; \
+           fi; \
          fi; \
          echo \"$gid\"",
         sh_quote(DEFAULT_USER_AWK),
@@ -728,7 +738,34 @@ mod tests {
         assert!(std::fs::symlink_metadata(root.join("var/run/docker.sock")).is_err(), "symlink must be removed");
         assert!(!sock_dir.exists(), "socket dir must be removed");
 
-        // 4. When a live dockerd owns /var/run/docker.sock, enable leaves it untouched.
+        // 4. When Docker Desktop symlinked ~/.docker/contexts -> /mnt/c/Users/<WinUser>/.docker/contexts,
+        //    enable materializes a local Linux contexts dir instead of overwriting Windows's npipe kiri context.
+        let win_ctx = root.join("mnt/c/Users/Alice/.docker/contexts");
+        let win_kiri = win_ctx.join("meta").join(KIRI_CONTEXT_HASH);
+        let win_colima = win_ctx.join("meta/colima-hash");
+        std::fs::create_dir_all(&win_kiri).unwrap();
+        std::fs::create_dir_all(&win_colima).unwrap();
+        let win_meta_json = r#"{"Name":"kiri","Endpoints":{"docker":{"Host":"npipe:////./pipe/kiri"}}}"#;
+        std::fs::write(win_kiri.join("meta.json"), win_meta_json).unwrap();
+        std::fs::write(win_colima.join("meta.json"), r#"{"Name":"colima"}"#).unwrap();
+        let linux_ctx = root.join("home/alice/.docker/contexts");
+        std::fs::remove_dir_all(&linux_ctx).unwrap();
+        std::os::unix::fs::symlink(&win_ctx, &linux_ctx).unwrap();
+        let out = Command::new("sh").args(["-c", &enable]).env("PATH", &path).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(
+            std::fs::read_to_string(win_kiri.join("meta.json")).unwrap(),
+            win_meta_json,
+            "Windows npipe kiri context must not be overwritten through a /mnt/* symlink"
+        );
+        assert!(!std::fs::symlink_metadata(&linux_ctx).unwrap().file_type().is_symlink());
+        assert!(linux_ctx.join("meta/colima-hash/meta.json").is_file(), "existing contexts are preserved");
+        let linux_kiri = std::fs::read_to_string(linux_ctx.join("meta").join(KIRI_CONTEXT_HASH).join("meta.json")).unwrap();
+        assert!(linux_kiri.contains("/mnt/wsl/kiri/sockets/NixOS/docker.sock"), "{linux_kiri}");
+        let out = Command::new("sh").args(["-c", &disable]).env("PATH", &path).output().unwrap();
+        assert!(out.status.success());
+
+        // 5. When a live dockerd owns /var/run/docker.sock, enable leaves it untouched.
         let own_sock = root.join("var/run/docker.sock");
         let _listener = UnixListener::bind(&own_sock).unwrap();
         std::fs::write(root.join("var/run/docker.pid"), std::process::id().to_string()).unwrap();

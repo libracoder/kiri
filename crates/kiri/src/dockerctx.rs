@@ -413,7 +413,13 @@ pub fn repair_windows_config(dir: &Path, opts: WindowsRepairOpts<'_>) -> io::Res
     }
     let mut out = WindowsRepair::default();
     let meta = context_meta(dir, opts.ours);
-    if opts.force_context_write || !meta.join("meta.json").is_file() {
+    let meta_file = meta.join("meta.json");
+    let unix_host_on_npipe = opts.host.starts_with("npipe:")
+        && read_json(&meta_file)
+            .ok()
+            .and_then(|v| v["Endpoints"]["docker"]["Host"].as_str().map(|h| h.starts_with("unix:")))
+            .unwrap_or(false);
+    if opts.force_context_write || !meta_file.is_file() || unix_host_on_npipe {
         write_context(&meta, opts.ours, opts.description, opts.host)?;
         out.context_written = true;
     }
@@ -777,6 +783,27 @@ mod tests {
         assert_eq!(after["auths"]["ghcr.io"]["auth"], "c2VjcmV0");
         assert_eq!(after["credHelpers"]["ecr"], "ecr-login");
         assert_eq!(after["aliases"]["builder"], "buildx");
+
+        // 2b. A Windows kiri context overwritten with a WSL unix:// socket (through a shared
+        //     ~/.docker/contexts symlink) is self-healed back to npipe:// even without force_context_write.
+        write_context(&context_meta(&docker, "kiri"), "kiri", "Kiri", "unix:///mnt/wsl/kiri/sockets/Ubuntu/docker.sock").unwrap();
+        let r_unix = repair_windows_config(
+            &docker,
+            WindowsRepairOpts {
+                ours: "kiri",
+                description: "Kiri (WSL2)",
+                host: "npipe:////./pipe/kiri",
+                plugins_dir: Some(&plugins),
+                force_context_write: false,
+                set_current_if_empty: false,
+                force_use: false,
+                desktop_installed: false,
+            },
+        )
+        .unwrap();
+        assert!(r_unix.context_written);
+        let healed = read_json(&context_meta(&docker, "kiri").join("meta.json")).unwrap();
+        assert_eq!(healed["Endpoints"]["docker"]["Host"], "npipe:////./pipe/kiri");
 
         // 3. Corrupt config.json is never overwritten.
         std::fs::write(docker.join("config.json"), "{broken").unwrap();
