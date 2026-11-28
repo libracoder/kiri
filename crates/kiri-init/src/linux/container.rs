@@ -885,16 +885,20 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
             .map_err(|e| kill_child(io::Error::new(e.kind(), format!("network: {e}"))))?;
         uplinks.extend(net::Uplink::of(&host_if, "eth0", spec.net.gateway, v6, plug));
         veths.push(("eth0".to_owned(), host_if));
+        net.dns.drop_container(pid);
+        net.dns.set_internal(spec.net.bridge, plug.internal);
+        net.dns.note_container_bridge(pid, spec.net.bridge);
         if embedded_dns {
             net.dns.set_bridge_ipv6(spec.net.bridge, net.bridges.has_ipv6(spec.net.bridge));
             if let Some(name) = net_opts::values(spec.net.opts, net_opts::NETWORK).next() {
                 net.dns.name_network(spec.net.bridge, name);
             }
             // An IPv6-only network's bridge has no IPv4 address to serve on,
-            // and its containers no A records.
+            // and its containers no A records; an isolated one's has none
+            // either (#1001).
             // A gateway that won't take the listener doesn't stop the start
             // (dns.rs `serve_or_warn`, #477).
-            let gateway = (!plug.no_ipv4 && net.dns.serve_or_warn(spec.net.bridge, spec.net.gateway)).then_some(spec.net.gateway);
+            let gateway = (plug.bridge_has_ipv4() && net.dns.serve_or_warn(spec.net.bridge, spec.net.gateway)).then_some(spec.net.gateway);
             // 127.0.0.11 in the container, when it is the resolver. Not when
             // the gateway is (the default bridge in the VM, or on a host
             // whose resolver is one of its own addresses): the listener would
@@ -902,11 +906,6 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
             // bind it.
             let wanted = nameserver.unwrap_or(super::dns::EMBEDDED);
             let (resolver, in_err) = settle_resolver(wanted, gateway, || {
-                // `pid` is this new child's, so a server already kept under
-                // it belonged to a process that exited and was reaped, still
-                // waiting for its output to be read (see `admit`): it must
-                // not stand in for this container's own.
-                net.dns.drop_container(pid);
                 let opened;
                 let ns = match child_netns.as_ref() {
                     Some(f) => f,

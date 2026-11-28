@@ -198,6 +198,14 @@ pub struct Dns {
     /// Bridges whose gateway wouldn't take the listener (`serve_or_warn`):
     /// the warning is said once for each.
     refused: std::collections::HashSet<String>,
+    /// Bridges of `--internal` networks. A server whose networks are all
+    /// internal forwards nothing: a container with no way out must not get
+    /// one through the resolver (Docker, CVE-2024-29018).
+    internal: std::collections::HashSet<String>,
+    /// Every bridge attached to container `pid` (`kiri0` included), so a
+    /// `127.0.0.11` server started or updated on `network connect` knows
+    /// whether the container also holds an external network.
+    container_bridges: HashMap<i32, Vec<String>>,
 }
 
 /// A fresh `Server::id`.
@@ -254,8 +262,14 @@ impl Dns {
             self.forget_pending();
         }
         let sock = bound(gateway, 53)?;
+        // Only what arrives on this user bridge (`kiri0` also serves
+        // `--network host` containers over `lo` in the VM, and holds no
+        // user-network names).
+        bind_gateway_device(&sock, bridge)?;
         let id = server_id();
-        if let Ok(tcp) = tcp_bound(gateway, 53) {
+        if let Ok(tcp) = tcp_bound(gateway, 53)
+            && bind_gateway_device(&tcp, bridge).is_ok()
+        {
             self.tcp_servers.push((id, tcp));
         }
         self.servers.push(Server { id, bridges: vec![bridge.to_owned()], sock, container: None });
@@ -285,14 +299,26 @@ impl Dns {
         }
     }
 
+    /// Records that container `pid` is attached to `bridge` (`kiri0` included),
+    /// updating any active `127.0.0.11` server for `pid`.
+    pub fn note_container_bridge(&mut self, pid: i32, bridge: &str) {
+        let list = self.container_bridges.entry(pid).or_default();
+        if !list.iter().any(|b| b == bridge) {
+            list.push(bridge.to_owned());
+        }
+        if let Some(s) = self.servers.iter_mut().find(|s| s.container == Some(pid))
+            && !s.bridges.iter().any(|b| b == bridge)
+        {
+            s.bridges.push(bridge.to_owned());
+        }
+    }
+
     /// Starts answering at 127.0.0.11:53 in container `pid`'s network
     /// namespace `netns` (lo up) for the names on `bridge`, or adds `bridge`
     /// to the networks its server answers for.
     pub fn serve_in(&mut self, netns: &std::fs::File, pid: i32, bridge: &str) -> io::Result<()> {
-        if let Some(s) = self.servers.iter_mut().find(|s| s.container == Some(pid)) {
-            if !s.bridges.iter().any(|b| b == bridge) {
-                s.bridges.push(bridge.to_owned());
-            }
+        self.note_container_bridge(pid, bridge);
+        if self.servers.iter().any(|s| s.container == Some(pid)) {
             return Ok(());
         }
         let (sock, tcp) = super::netlink::in_netns(netns, embedded_socket)?;
@@ -300,12 +326,16 @@ impl Dns {
         if let Some(tcp) = tcp {
             self.tcp_servers.push((id, tcp));
         }
-        self.servers.push(Server { id, bridges: vec![bridge.to_owned()], sock, container: Some(pid) });
+        let bridges = self.container_bridges.get(&pid).cloned().unwrap_or_else(|| vec![bridge.to_owned()]);
+        self.servers.push(Server { id, bridges, sock, container: Some(pid) });
         Ok(())
     }
 
     /// Container `pid` left `bridge` (`network disconnect`).
     pub fn leave(&mut self, pid: i32, bridge: &str) {
+        if let Some(list) = self.container_bridges.get_mut(&pid) {
+            list.retain(|b| b != bridge);
+        }
         for s in self.servers.iter_mut().filter(|s| s.container == Some(pid)) {
             s.bridges.retain(|b| b != bridge);
         }
@@ -319,6 +349,7 @@ impl Dns {
     /// Container `pid` is gone: its 127.0.0.11 server and `--dns` servers go.
     pub fn drop_container(&mut self, pid: i32) {
         self.servers.retain(|s| s.container != Some(pid));
+        self.container_bridges.remove(&pid);
         self.container_upstreams.remove(&pid);
         self.pending.retain(|p| p.key != ClientKey::Container(pid));
         self.tcp_clients.retain(|c| c.key != ClientKey::Container(pid));
@@ -381,17 +412,36 @@ impl Dns {
         }
     }
 
+    /// Whether `bridge` is an `--internal` network's (`net::Plug`).
+    pub fn set_internal(&mut self, bridge: &str, internal: bool) {
+        if internal {
+            self.internal.insert(bridge.to_owned());
+        } else {
+            self.internal.remove(bridge);
+        }
+    }
+
+    /// Whether every network `server` answers for is internal (vacuously true
+    /// when a container has disconnected from all networks).
+    fn internal_only(&self, server: usize) -> bool {
+        self.servers.get(server).is_some_and(|s| s.bridges.iter().all(|b| self.internal.contains(b)))
+    }
+
     /// A removed network's bridge: its server and names go.
     pub fn forget_bridge(&mut self, bridge: &str) {
         self.servers.retain(|s| s.container.is_some() || !s.bridges.iter().any(|b| b == bridge));
         for s in &mut self.servers {
             s.bridges.retain(|b| b != bridge);
         }
+        for list in self.container_bridges.values_mut() {
+            list.retain(|b| b != bridge);
+        }
         self.names.remove(bridge);
         self.names6.remove(bridge);
         self.ipv6_bridges.remove(bridge);
         self.networks.remove(bridge);
         self.refused.remove(bridge);
+        self.internal.remove(bridge);
         self.forget_pending();
     }
 
@@ -700,6 +750,15 @@ impl Dns {
         key: ClientKey,
         upstream: &[[u8; 4]],
     ) {
+        let Some((_, qtype, end)) = parse_question(q) else {
+            return;
+        };
+        // Only internal networks (or disconnected from all networks): nothing
+        // leaves over UDP, TCP, `--dns` or the host relay (Docker, CVE-2024-29018).
+        if self.internal_only(server) {
+            self.reply_now(server, client, tcp_client, &refused(q, end));
+            return;
+        }
         let now = Instant::now();
         // A query past its deadline is answered SERVFAIL here too, before
         // the slots are counted: `on_readable` runs before `on_timer`.
@@ -711,9 +770,6 @@ impl Dns {
             }
         }
         let own = self.own_servers(key).map(|v| v.len());
-        let Some((_, qtype, end)) = parse_question(q) else {
-            return;
-        };
         // On IPv4-only networks (no bridge on this server has IPv6 enabled),
         // return NOERROR/NODATA for external AAAA queries instead of forwarding
         // upstream and returning unreachable global IPv6 records (matching
@@ -1339,6 +1395,15 @@ fn servfail(id: u16, rd: bool, question: &[u8]) -> Vec<u8> {
     r
 }
 
+/// REFUSED for query `q`, whose question ends at `end`.
+fn refused(q: &[u8], end: usize) -> Vec<u8> {
+    let mut r = q[..end].to_vec();
+    r[2] = 0x80 | (q[2] & 0x01); // QR, RD kept
+    r[3] = 0x80 | 5; // RA, REFUSED
+    r[6..12].fill(0);
+    r
+}
+
 /// A UDP socket connected to `dest`:53 with `msg` sent on it, or None if
 /// it couldn't be sent (no route, the network down).
 fn ask(dest: [u8; 4], msg: &[u8]) -> Option<OwnedFd> {
@@ -1443,6 +1508,26 @@ fn local_port(sock: &OwnedFd) -> io::Result<u16> {
     // SAFETY: a socket we own and a buffer of `len` bytes.
     sys::check(unsafe { libc::getsockname(sock.as_raw_fd(), (&mut a as *mut libc::sockaddr_in).cast(), &mut len) } as _, "dns getsockname")?;
     Ok(u16::from_be(a.sin_port))
+}
+
+/// Scopes a gateway DNS socket (UDP or TCP) to `bridge` (`SO_BINDTODEVICE`)
+/// for every user network bridge, while leaving `kiri0` unbound so `--network
+/// host` containers in the VM can still reach `172.17.0.1:53` over `lo`.
+fn bind_gateway_device(sock: &OwnedFd, bridge: &str) -> io::Result<()> {
+    if bridge == "kiri0" {
+        return Ok(());
+    }
+    on_device(sock, bridge)
+}
+
+/// Packets reach `sock` only when they came in on interface `dev`.
+fn on_device(sock: &OwnedFd, dev: &str) -> io::Result<()> {
+    // SAFETY: setsockopt with a name buffer of the stated length on a socket we own.
+    sys::check(
+        unsafe { libc::setsockopt(sock.as_raw_fd(), libc::SOL_SOCKET, libc::SO_BINDTODEVICE, dev.as_ptr().cast(), dev.len() as libc::socklen_t) } as _,
+        "dns bind to device",
+    )?;
+    Ok(())
 }
 
 /// A UDP socket bound to `ip`:`port` (0: a free one).
@@ -2934,5 +3019,127 @@ mod tests {
         wait_readable(srv_fd);
         dns.on_readable(srv_fd, &[[127, 0, 0, 71]]);
         assert_eq!(dns.pending.len(), 1, "IPv6-enabled bridge forwards external AAAA upstream");
+    }
+
+    /// GHSA-7x2g-c7pw-mpc6: a container whose networks are all `--internal`
+    /// (or disconnected from all networks) gets immediate `REFUSED` over both
+    /// UDP and TCP, even with `--dns` custom upstreams and `relay: true`,
+    /// while internal container names still resolve and attaching an external
+    /// bridge (`kiri0` included) restores upstream forwarding.
+    #[test]
+    fn internal_only_containers_refuse_external_udp_and_tcp_queries_even_with_custom_dns() {
+        use std::io::{Read, Write};
+        use std::os::fd::AsRawFd;
+
+        let upstream_ip = [127, 0, 0, 72];
+        let upstream_udp = std::net::UdpSocket::from(super::bound(upstream_ip, 53).unwrap());
+        upstream_udp.set_nonblocking(true).unwrap();
+        let upstream_tcp = std::net::TcpListener::from(super::tcp_bound(upstream_ip, 53).unwrap());
+        upstream_tcp.set_nonblocking(true).unwrap();
+
+        let srv_udp = super::bound([127, 0, 0, 73], 0).unwrap();
+        let srv_udp_port = super::local_port(&srv_udp).unwrap();
+        let srv_tcp = super::tcp_bound([127, 0, 0, 73], 0).unwrap();
+        let srv_tcp_port = super::local_port(&srv_tcp).unwrap();
+
+        let mut dns = Dns { relay: true, ..Default::default() };
+        dns.set_internal("kiri9", true);
+        dns.note_container_bridge(42, "kiri9");
+        let sid = super::server_id();
+        dns.servers.push(Server { id: sid, bridges: vec!["kiri9".into()], sock: srv_udp, container: Some(42) });
+        dns.tcp_servers.push((sid, srv_tcp));
+        dns.register("kiri9", ["db"].iter(), [10, 9, 0, 3]);
+        dns.set_container_upstream(42, vec![upstream_ip]);
+
+        let client_udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        client_udp.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+        let srv_fd = dns.servers[0].sock.as_raw_fd();
+
+        for qtype in [1u16, 28] {
+            let q = query("secret.exfil.example", qtype);
+            client_udp.send_to(&q, ("127.0.0.73", srv_udp_port)).unwrap();
+            wait_readable(srv_fd);
+            dns.on_readable(srv_fd, &[upstream_ip]);
+            assert!(dns.pending.is_empty());
+            assert!(dns.relay_down_until.is_none(), "host relay never dialed");
+            let mut reply = [0u8; 512];
+            let n = client_udp.recv(&mut reply).unwrap();
+            assert_eq!((reply[2] & 0x80, reply[3] & 0x0f), (0x80, 5), "UDP qtype {qtype} REFUSED");
+            assert_eq!(&reply[12..n], &q[12..]);
+            assert!(upstream_udp.recv(&mut reply).is_err(), "zero UDP packets sent upstream");
+        }
+
+        let q_db = query("db", 1);
+        client_udp.send_to(&q_db, ("127.0.0.73", srv_udp_port)).unwrap();
+        wait_readable(srv_fd);
+        dns.on_readable(srv_fd, &[upstream_ip]);
+        let mut reply = [0u8; 512];
+        let n = client_udp.recv(&mut reply).unwrap();
+        assert_eq!(answers(&reply[..n], q_db.len()), [(1, vec![10, 9, 0, 3])]);
+
+        let tcp_worker = std::thread::spawn(move || {
+            let mut c = std::net::TcpStream::connect(("127.0.0.73", srv_tcp_port)).unwrap();
+            let q1 = query("db", 1);
+            c.write_all(&(q1.len() as u16).to_be_bytes()).unwrap();
+            c.write_all(&q1).unwrap();
+            let mut rlen = [0u8; 2];
+            c.read_exact(&mut rlen).unwrap();
+            let mut r1 = vec![0u8; u16::from_be_bytes(rlen) as usize];
+            c.read_exact(&mut r1).unwrap();
+            assert_eq!(answers(&r1, q1.len()), [(1, vec![10, 9, 0, 3])]);
+
+            let q2 = query("tcp.exfil.example", 1);
+            c.write_all(&(q2.len() as u16).to_be_bytes()).unwrap();
+            c.write_all(&q2).unwrap();
+            c.read_exact(&mut rlen).unwrap();
+            let mut r2 = vec![0u8; u16::from_be_bytes(rlen) as usize];
+            c.read_exact(&mut r2).unwrap();
+            assert_eq!((r2[2] & 0x80, r2[3] & 0x0f), (0x80, 5), "TCP external query REFUSED");
+        });
+        let deadline = Instant::now() + std::time::Duration::from_secs(3);
+        while !tcp_worker.is_finished() && Instant::now() < deadline {
+            let mut fds = Vec::new();
+            dns.interest(&mut fds);
+            let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, 20) };
+            if rc > 0 {
+                for pfd in fds {
+                    if pfd.revents != 0 && dns.owns(pfd.fd) {
+                        dns.on_readable(pfd.fd, &[upstream_ip]);
+                    }
+                }
+            }
+            dns.on_timer();
+        }
+        tcp_worker.join().unwrap();
+        assert!(upstream_tcp.accept().is_err(), "zero TCP connections made upstream");
+
+        dns.set_internal("kiri0", false);
+        dns.note_container_bridge(42, "kiri0");
+        assert!(!dns.internal_only(0), "external kiri0 attached -> forwarding allowed");
+        let q_ext = query("example.com", 1);
+        client_udp.send_to(&q_ext, ("127.0.0.73", srv_udp_port)).unwrap();
+        wait_readable(srv_fd);
+        dns.on_readable(srv_fd, &[upstream_ip]);
+        wait_readable(upstream_udp.as_raw_fd());
+        assert!(upstream_udp.recv(&mut reply).is_ok(), "forwarded once kiri0 is attached");
+        dns.pending.clear();
+
+        dns.leave(42, "kiri0");
+        assert!(dns.internal_only(0), "leaving kiri0 makes server internal_only again");
+        dns.leave(42, "kiri9");
+        assert!(dns.servers[0].bridges.is_empty());
+        assert!(dns.internal_only(0), "disconnected from all networks is vacuously internal_only");
+        dns.forget_bridge("kiri9");
+        assert!(dns.internal.is_empty());
+    }
+
+    #[test]
+    fn gateway_device_binding_skips_kiri0_and_attempts_bind_for_user_bridges() {
+        let udp = udp_socket().unwrap();
+        let tcp = super::tcp_bound([127, 0, 0, 1], 0).unwrap();
+        super::bind_gateway_device(&udp, "kiri0").expect("kiri0 skips SO_BINDTODEVICE on UDP");
+        super::bind_gateway_device(&tcp, "kiri0").expect("kiri0 skips SO_BINDTODEVICE on TCP");
+        assert!(super::bind_gateway_device(&udp, "kiri-nonexistent").is_err());
+        assert!(super::bind_gateway_device(&tcp, "kiri-nonexistent").is_err());
     }
 }
