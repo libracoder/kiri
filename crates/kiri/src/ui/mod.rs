@@ -2474,6 +2474,10 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
             }
             Ok(())
         }
+        "loadxterm" => {
+            window::eval(assemble::xterm_js().to_owned());
+            Ok(())
+        }
         "about" => tx.send(Cmd::About),
         "domains" => tx.send(Cmd::Domains(msg.value.as_bool().unwrap_or(false))),
         // Settings → Domains → HTTPS: macOS asks for the password.

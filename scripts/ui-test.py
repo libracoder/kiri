@@ -298,21 +298,35 @@ def strip(index):
     return no_indent(no_comment_lines(no_css_comments(index)))
 
 
-def page(test, os_name=None):
-    # As assemble.rs builds it: the icons and xterm.js spliced in, and the words
-    # for the language it opens in; the rest come through langwords (host()).
-    packed, pick = strings(), lang_of(test)
+def xterm_loader():
+    """The host's half of loadxterm: injects xterm.css + xterm.js + addons synchronously."""
     xterm = lambda f: open(os.path.join(UI, "xterm", f)).read()
+    css_json = json.dumps(xterm("xterm.css")).replace("<", "\\u003c").replace(">", "\\u003e")
+    js_bundle = "".join(xterm(f) + "\n" for f in ["xterm.js", "addon-fit.js", "addon-search.js", "addon-web-links.js"])
+    js_json = json.dumps(js_bundle).replace("<", "\\u003c").replace(">", "\\u003e")
+    return (
+        f"const HOST_XTERM_CSS = {css_json};\n"
+        f"const HOST_XTERM_JS = {js_json};\n"
+        "{ const post = window.webkit.messageHandlers.kiri.postMessage;\n"
+        "  window.webkit.messageHandlers.kiri.postMessage = (m) => { post(m); const o = JSON.parse(m);\n"
+        "    if (o.cmd !== \"loadxterm\" || typeof Terminal === \"function\") return;\n"
+        "    if (!document.getElementById(\"xterm-css\")) { const s = document.createElement(\"style\"); s.id = \"xterm-css\"; s.textContent = HOST_XTERM_CSS; document.head.appendChild(s); }\n"
+        "    const sc = document.createElement(\"script\"); sc.textContent = HOST_XTERM_JS + \"\\nwindow.kiriXtermReady && window.kiriXtermReady();\"; document.head.appendChild(sc); }; }\n"
+    )
+
+
+def page(test, os_name=None):
+    # As assemble.rs builds it: the icons spliced in, and the words for the
+    # language it opens in; xterm loads lazily via loadxterm and other languages via langwords.
+    packed, pick = strings(), lang_of(test)
     index = (strip(open(os.path.join(UI, "index.html")).read()).replace("/*ICONS*/", open(os.path.join(UI, "icons.js")).read(), 1)
              .replace("/*LANGSTEP*/", open(os.path.join(UI, "langstep.js")).read(), 1)
-             .replace("/*XTERM_CSS*/", xterm("xterm.css"), 1)
-             .replace("/*XTERM_JS*/", "".join(xterm(f) + "\n" for f in ["xterm.js", "addon-fit.js", "addon-search.js", "addon-web-links.js"]), 1)
              .replace("/*LANG*/", f"window.KIRI_LANG = {json.dumps({'os': ['en-US'], 'pick': pick})};", 1)
              .replace("/*STRINGS*/{}", json.dumps(opening(pick, packed), ensure_ascii=False), 1))
     if os_name and os_name != "macos":
         index = index.replace("<head>", f'<head><script>window.KIRI_OS = "{os_name}";</script>', 1)
     fixture = open(os.path.join(ROOT, "tests/ui/fixture.js")).read()
-    return index[: index.rindex("</body>")] + CATCH + f"<script>{REPORT}\n{fixture}\n{host(packed)}\n{open(test).read()}</script></body></html>"
+    return index[: index.rindex("</body>")] + CATCH + f"<script>{REPORT}\n{fixture}\n{host(packed)}\n{xterm_loader()}\n{open(test).read()}</script></body></html>"
 
 
 def run(test, os_name=None):

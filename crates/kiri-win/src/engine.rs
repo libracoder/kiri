@@ -1636,6 +1636,7 @@ pub fn on_message(msg: &str) {
                 Handle.eval(js);
             }
         }
+        "loadxterm" => Handle.eval(crate::assemble::xterm_js().to_owned()),
         // Off the window's thread: GDI lists every installed face, twice.
         "fonts" => {
             std::thread::spawn(|| emit(fonts_event().to_owned()));

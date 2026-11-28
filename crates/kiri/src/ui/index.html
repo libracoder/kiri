@@ -2564,7 +2564,6 @@ tr.usb-more > td { padding: 0; background: var(--panel); }
 /* The same for arrows that are characters: Containers › web, a group's ▸, host → container. */
 [dir=rtl] :is(.crumb > span[aria-hidden], .sh-chev, tr.group .chev, .ctx-flow .arr, .port-row .arrow, .wn-arrow) { display: inline-block; transform: scaleX(-1); }
 </style>
-<style>/*XTERM_CSS*/</style>
 </head>
 <body data-vm="stopped">
 
@@ -2638,8 +2637,6 @@ tr.usb-more > td { padding: 0; background: var(--panel); }
 <div class="rscrim" id="rscrim" role="alertdialog" aria-modal="true" aria-live="assertive" aria-busy="true" hidden></div>
 
 <script>/*ICONS*/</script>
-<!-- The built-in terminal's emulator: xterm.js and its add-ons (xterm/, spliced in by assemble.rs). -->
-<script>/*XTERM_JS*/</script>
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);
@@ -12135,8 +12132,21 @@ function htNewPane(shell) {
   ht.panes.set(id, p);
   return p;
 }
+let htXtermAsked = false;
+function htEnsureXterm() {
+  if (typeof Terminal === "function" || htXtermAsked) return;
+  htXtermAsked = true;
+  send("loadxterm");
+}
+window.kiriXtermReady = () => {
+  if (typeof Terminal !== "function") return;
+  for (const p of ht.panes.values()) htStart(p);
+  htFitAll();
+  if (ht.open) requestAnimationFrame(() => htPane()?.term?.focus());
+};
 function htStart(p) {
-  if (p.term || typeof Terminal !== "function") return;
+  if (p.term) return;
+  if (typeof Terminal !== "function") { htEnsureXterm(); return; }
   const term = new Terminal({ fontFamily: htFont(), fontSize: htFs(), theme: htTheme(), cursorBlink: true, scrollback: 10000, allowProposedApi: true,
     macOptionIsMeta: false, rightClickSelectsWord: false, drawBoldTextInBrightColors: true });
   p.term = term;
@@ -12248,6 +12258,7 @@ function htToggle() {
   if (!ht.open) document.activeElement?.blur?.();
 }
 function htNewTab(shell) {
+  htEnsureXterm();
   if (!ht.shells) { ht.wantTab = shell || true; return send("term", { name: "shells" }); }
   const p = htNewPane(shell || ht.def);
   ht.tabs.push({ shell: p.shell, tree: { t: "pane", id: p.id } });

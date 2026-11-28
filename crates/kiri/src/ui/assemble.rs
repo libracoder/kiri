@@ -17,6 +17,8 @@
 //! them would add some 2 M units to every start, which is why the page
 //! carries only one.
 
+use std::sync::OnceLock;
+
 const ICONS_JS: &str = include_str!("icons.js");
 /// The languages and the first start's language step, which both pages show.
 const LANGSTEP_JS: &str = include_str!("langstep.js");
@@ -26,21 +28,42 @@ const XTERM_CSS: &str = include_str!("xterm/xterm.css");
 const XTERM_JS: [&str; 4] = [include_str!("xterm/xterm.js"), include_str!("xterm/addon-fit.js"), include_str!("xterm/addon-search.js"), include_str!("xterm/addon-web-links.js")];
 
 /// `index` (index.html) with everything spliced in, `lang` (the `lang`
-/// setting) picking its language.
+/// setting) picking its language. xterm.js and its stylesheet are loaded
+/// lazily on first terminal open via [`xterm_js`].
 pub fn page(index: &str, lang: Option<&str>) -> String {
-    let mut js = String::with_capacity(XTERM_JS.iter().map(|s| s.len() + 1).sum());
-    for part in XTERM_JS {
-        js.push_str(part);
-        // Each ends in a source-map comment: the next must start on a line of its own.
-        js.push('\n');
-    }
     without_indent(&without_js_comment_lines(&without_css_comments(index)))
         .replacen("/*ICONS*/", ICONS_JS, 1)
         .replacen("/*LANGSTEP*/", LANGSTEP_JS, 1)
-        .replacen("/*XTERM_CSS*/", XTERM_CSS, 1)
-        .replacen("/*XTERM_JS*/", &js, 1)
         .replacen("/*LANG*/", &super::lang::boot_js(lang), 1)
         .replacen("/*STRINGS*/{}", &super::lang::strings_js(super::lang::resolve(lang)), 1)
+}
+
+/// Self-contained JS bundle evaluated on demand when the user first opens the
+/// built-in terminal: injects `xterm.css`, defines `Terminal` + addons on
+/// `globalThis`, and notifies `window.kiriXtermReady()`.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux", windows)), allow(dead_code))]
+pub fn xterm_js() -> &'static str {
+    static BUNDLE: OnceLock<String> = OnceLock::new();
+    BUNDLE.get_or_init(|| {
+        let css_json = serde_json::to_string(XTERM_CSS)
+            .unwrap_or_else(|_| "\"\"".to_owned())
+            .replace('<', "\\u003c")
+            .replace('>', "\\u003e")
+            .replace('\u{2028}', "\\u2028")
+            .replace('\u{2029}', "\\u2029");
+        let extra: usize = XTERM_JS.iter().map(|s| s.len() + 1).sum();
+        let mut js = String::with_capacity(css_json.len() + extra + 256);
+        js.push_str("(function(){if(!document.getElementById(\"xterm-css\")){const s=document.createElement(\"style\");s.id=\"xterm-css\";s.textContent=");
+        js.push_str(&css_json);
+        js.push_str(";document.head.appendChild(s);}})();\n");
+        for part in XTERM_JS {
+            js.push_str(part);
+            // Each ends in a source-map comment: the next must start on a line of its own.
+            js.push('\n');
+        }
+        js.push_str("window.kiriXtermReady&&window.kiriXtermReady();\n");
+        js
+    })
 }
 
 /// Where the page's own stylesheet is: its plain `<style>` (one with
@@ -549,7 +572,9 @@ mod tests {
         for p in ["/*ICONS*/", "/*LANGSTEP*/", "/*XTERM_CSS*/", "/*XTERM_JS*/", "/*LANG*/", "/*STRINGS*/"] {
             assert!(!page.contains(p), "{p} left in the page");
         }
-        assert!(page.contains(".xterm-viewport"), "xterm.css missing");
+        let xterm = super::xterm_js();
+        assert!(xterm.contains(".xterm-viewport"), "xterm.css missing from lazy bundle");
+        assert!(xterm.contains("kiriXtermReady"), "kiriXtermReady missing from lazy bundle");
         assert!(page.contains("function langStep(") && page.contains("const LANGS = ["), "langstep.js missing");
         let setup = super::words(include_str!("../../../kiri-win/src/setup.html"), None);
         for p in ["/*LANGSTEP*/", "/*LANG*/", "/*STRINGS*/"] {
