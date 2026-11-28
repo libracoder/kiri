@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -730,6 +730,11 @@ pub struct Spec {
     /// own WSL distro on `Caller::Host`), when created in WSL.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wsl_distro: Option<String>,
+    /// Whether this container was created by a non-Host caller (`Caller::Container`
+    /// or `Caller::Wsl`), so start-time symlink re-resolution keeps rejecting
+    /// binds that resolve to an ancestor of Kiri's host socket.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub non_host_creator: bool,
 }
 
 /// Normalizes an ExposedPorts key (`"53"`, `"53/UDP"`, `"132/sctp"`) to
@@ -1650,8 +1655,9 @@ pub struct Engine {
     /// a file in the state dir (`stopped`).
     stopped: std::sync::atomic::AtomicBool,
     pub store: Store,
-    pub networks: Mutex<Networks>,
-    state: Mutex<State>,
+    pub networks: RwLock<Networks>,
+    state: RwLock<State>,
+    changed_seq: Mutex<u64>,
     changed: Condvar,
     /// Serialises sending layers, so two creates of a new image don't send
     /// the same layers twice.
@@ -1791,8 +1797,7 @@ impl VolumeSizesCache {
 
     fn save(&self) {
         if let Ok(json) = serde_json::to_vec(&self.sizes) {
-            let tmp = self.path.with_extension("json.tmp");
-            if let Err(e) = std::fs::write(&tmp, json).and_then(|()| std::fs::rename(&tmp, &self.path)) {
+            if let Err(e) = super::write_atomic_mode(&self.path, &json, 0o600) {
                 crate::diag::error!("saving volume sizes failed", error = e);
             }
         }
@@ -1884,7 +1889,7 @@ impl Engine {
     pub fn boot(store: Store) -> io::Result<Arc<Engine>> {
         let records = store.root().join("containers.json");
         let ceiling = memory_ceiling();
-        let networks = Mutex::new(Networks::load(store.root())?);
+        let networks = RwLock::new(Networks::load(store.root())?);
         let loaded_volumes = super::volumes::Volumes::load(store.root())?;
         let volume_sizes_cache = Mutex::new(VolumeSizesCache::load(store.root(), loaded_volumes.all()));
         let volumes = Mutex::new(loaded_volumes);
@@ -1899,7 +1904,8 @@ impl Engine {
             stopped: std::sync::atomic::AtomicBool::new(stopped_marker().is_some_and(|f| f.exists())),
             networks,
             store,
-            state: Mutex::default(),
+            state: RwLock::default(),
+            changed_seq: Mutex::new(0),
             changed: Condvar::new(),
             layers: Mutex::new(()),
             records,
@@ -2241,7 +2247,7 @@ impl Engine {
             }
             let delay = st.vm_recovery_at.map_or(Duration::ZERO, |at| at.saturating_duration_since(std::time::Instant::now()));
             if !delay.is_zero() {
-                drop(self.changed.wait_timeout(st, delay).unwrap_or_else(|e| e.into_inner()));
+                drop(self.wait_changed_timeout(st, delay));
                 continue;
             }
             let generation = st.vm_recovery_generation;
@@ -2299,7 +2305,13 @@ impl Engine {
     /// boots in a tenth of a second can afford to sleep, and sleeping is the
     /// one thing that gives all its memory back to macOS: Apple's balloon
     /// device takes pages from the guest but does not release them.
-    /// Runs a command in a running container and collects its output.
+    /// Maximum output collected by [`Self::exec_capture`] so a misbehaving
+    /// container cannot exhaust host daemon memory.
+    const MAX_EXEC_CAPTURE: usize = 1024 * 1024;
+    /// Maximum LoadBalancer ports reconciled for `kiri-k8s`.
+    const MAX_K8S_LB_PORTS: usize = 256;
+
+    /// Runs a command in a running container and collects its output (bounded).
     pub fn exec_capture(&self, key: &str, argv: &[&str]) -> Result<(i32, String), Error> {
         let config = ExecConfig {
             console_size: None,
@@ -2316,7 +2328,10 @@ impl Engine {
         let (_, rx) = self.exec_start(&id)?;
         let mut out = Vec::new();
         for (_, data) in rx {
-            out.extend_from_slice(&data);
+            let room = Self::MAX_EXEC_CAPTURE.saturating_sub(out.len());
+            if room > 0 {
+                out.extend_from_slice(&data[..data.len().min(room)]);
+            }
         }
         let code = self.with_exec(&id, |e| e.exit_code.unwrap_or(-1)).unwrap_or(-1);
         self.lock().execs.remove(&id);
@@ -2336,7 +2351,12 @@ impl Engine {
         let _ = std::thread::Builder::new().name("kiri-k8s-lb".into()).spawn(move || loop {
             std::thread::sleep(Duration::from_secs(3));
             let Some(engine) = me.upgrade() else { return };
-            let node = engine.lock().containers.values().find(|c| c.status == Status::Running && is_k8s_node(&c.spec)).map(|c| (c.id.clone(), c.ip));
+            let node = engine
+                .lock()
+                .containers
+                .values()
+                .find(|c| c.status == Status::Running && is_k8s_node_container(c))
+                .map(|c| (c.id.clone(), c.ip));
             let Some((id, Some(ip))) = node else {
                 engine.clear_k8s_lb();
                 continue;
@@ -2418,8 +2438,14 @@ impl Engine {
             .split_whitespace()
             .filter_map(|p| {
                 let (port, proto) = p.split_once('/')?;
-                Some((port.parse().ok()?, proto.to_ascii_lowercase()))
+                let proto = proto.to_ascii_lowercase();
+                if proto != "tcp" && proto != "udp" {
+                    return None;
+                }
+                let port: u16 = port.parse().ok()?;
+                (port != 0).then_some((port, proto))
             })
+            .take(Self::MAX_K8S_LB_PORTS)
             .collect();
         let Some(vm) = self.awake() else { return false };
         let host_ip = if crate::k8s::config().lan { "0.0.0.0" } else { "127.0.0.1" };
@@ -3002,8 +3028,34 @@ impl Engine {
         self.awake().is_some()
     }
 
-    fn lock(&self) -> MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    fn read(&self) -> RwLockReadGuard<'_, State> {
+        self.state.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn lock(&self) -> RwLockWriteGuard<'_, State> {
+        self.state.write().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn notify_changed(&self) {
+        let mut seq = self.changed_seq.lock().unwrap_or_else(|e| e.into_inner());
+        *seq = seq.wrapping_add(1);
+        self.changed.notify_all();
+    }
+
+    fn wait_changed<'a>(&'a self, st: RwLockWriteGuard<'a, State>) -> RwLockWriteGuard<'a, State> {
+        let seq = self.changed_seq.lock().unwrap_or_else(|e| e.into_inner());
+        let cur = *seq;
+        drop(st);
+        drop(self.changed.wait_while(seq, |s| *s == cur).unwrap_or_else(|e| e.into_inner()));
+        self.lock()
+    }
+
+    fn wait_changed_timeout<'a>(&'a self, st: RwLockWriteGuard<'a, State>, dur: Duration) -> RwLockWriteGuard<'a, State> {
+        let seq = self.changed_seq.lock().unwrap_or_else(|e| e.into_inner());
+        let cur = *seq;
+        drop(st);
+        drop(self.changed.wait_timeout_while(seq, dur, |s| *s == cur).unwrap_or_else(|e| e.into_inner()));
+        self.lock()
     }
 
     /// Restores saved containers. Ones that were running when the daemon
@@ -3276,7 +3328,7 @@ impl Engine {
                         e.attached.clear();
                         let (container, exec_id, internal) = (e.container_id.clone(), e.id.clone(), e.config.internal);
                         drop(st);
-                        self.changed.notify_all();
+                        self.notify_changed();
                         if !internal {
                             self.emit_container("exec_die", &container, &[("execID", exec_id), ("exitCode", code.to_string())]);
                         }
@@ -3404,7 +3456,7 @@ impl Engine {
                         me.prune_layers();
                     });
                 }
-                self.changed.notify_all();
+                self.notify_changed();
                 if persist {
                     self.save();
                 }
@@ -3494,7 +3546,7 @@ impl Engine {
                 self.k8s_routes.lock().unwrap_or_else(|e| e.into_inner()).take();
                 *self.uplink.lock().unwrap_or_else(|e| e.into_inner()) = serde_json::Value::Null;
                 super::ports::set_shared_nat_active(None);
-                self.changed.notify_all();
+                self.notify_changed();
                 match end {
                     // sleep_if_idle says why it slept.
                     VmEnd::Slept => {}
@@ -4030,7 +4082,7 @@ impl Engine {
 
     /// Resolves an id, an id prefix or a name to the full id.
     pub fn resolve(&self, key: &str) -> Result<String, Error> {
-        let st = self.lock();
+        let st = self.read();
         resolve(&st, key)
     }
 
@@ -4180,8 +4232,15 @@ impl Engine {
         let (gate, exits, earlier, halted_at_claim) = gate;
         // A bind source that is a link is followed again at every start, as
         // Docker does: re-pointing it between runs (a `current` release
-        // link) mounts the new target.
-        spec.mounts = super::api::fresh_bind_sources(&spec.mounts, &spec.mount_info);
+        // link) mounts the new target. Re-verify macOS hostetc RO and
+        // non-Host socket-ancestor confinement on the freshly resolved path.
+        spec.mounts = match super::api::fresh_bind_sources(&spec.mounts, &spec.mount_info, spec.non_host_creator) {
+            Ok(m) => m,
+            Err(e) => {
+                self.fail_start(&id, &spec, &e);
+                return Err(e);
+            }
+        };
         super::api::refresh_ssh_agent_mounts(&spec.mount_info);
         #[cfg(target_os = "macos")]
         if spec.mounts.iter().any(|m| m.starts_with("/mnt/mac/")) {
@@ -4845,7 +4904,7 @@ impl Engine {
             note_removed(&mut st, id, code);
         }
         drop(st);
-        self.changed.notify_all();
+        self.notify_changed();
         if let Some(c) = removed {
             if let Some(vm) = self.awake() {
                 let _ = vm.remove(id);
@@ -4863,12 +4922,16 @@ impl Engine {
         }
     }
 
-    pub fn lock_net(&self) -> MutexGuard<'_, Networks> {
+    pub fn read_net(&self) -> RwLockReadGuard<'_, Networks> {
+        self.networks.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn lock_net(&self) -> RwLockWriteGuard<'_, Networks> {
         self.lock_networks()
     }
 
-    fn lock_networks(&self) -> MutexGuard<'_, Networks> {
-        self.networks.lock().unwrap_or_else(|e| e.into_inner())
+    fn lock_networks(&self) -> RwLockWriteGuard<'_, Networks> {
+        self.networks.write().unwrap_or_else(|e| e.into_inner())
     }
 
     fn release_ip(&self, network: &str, ip: [u8; 4]) {
@@ -5058,7 +5121,7 @@ impl Engine {
             let c = st.containers.get(&id).expect("resolved");
             (id, c.layers.clone(), c.spec.clone())
         };
-        let (mounts, flags) = copy_mounts_and_flags(&spec, op, flags);
+        let (mounts, flags) = copy_mounts_and_flags(&spec, op, flags)?;
         let vm = self.vm()?;
         let stream = vm.connect(kiri_proto::COPY_PORT)?;
         let mut out = Vec::new();
@@ -5153,6 +5216,11 @@ impl Engine {
         lock_log(&c.log).path()
     }
 
+    /// Maximum stdin bytes buffered for a `Created` container before it starts
+    /// (`attach?stdin=1`), matching `vmlink::INPUT_WINDOW` so an unstarted
+    /// container cannot OOM-kill the host daemon.
+    const MAX_EARLY_INPUT: usize = 256 * 1024;
+
     pub fn input(&self, id: &str, data: &[u8]) -> io::Result<()> {
         {
             let mut st = self.lock();
@@ -5160,6 +5228,9 @@ impl Engine {
                 if !c.live {
                     if c.status == Status::Exited {
                         return Err(io::Error::new(io::ErrorKind::BrokenPipe, "container has exited"));
+                    }
+                    if c.early_input.len().saturating_add(data.len()) > Self::MAX_EARLY_INPUT {
+                        return Err(io::Error::new(io::ErrorKind::WriteZero, "container pre-start stdin buffer full"));
                     }
                     c.early_input.extend_from_slice(data);
                     return Ok(());
@@ -5222,7 +5293,7 @@ impl Engine {
                     _ => {}
                 },
             }
-            st = self.changed.wait(st).unwrap_or_else(|e| e.into_inner());
+            st = self.wait_changed(st);
         }
     }
 
@@ -5548,7 +5619,7 @@ impl Engine {
             if let Some(h) = self.lock().health.get_mut(&id) {
                 close_monitor(h);
             }
-            self.changed.notify_all();
+            self.notify_changed();
         } else {
             self.health_resume(&id);
         }
@@ -5858,13 +5929,13 @@ impl Engine {
                     if left.is_zero() {
                         return Err(Error::Io(io::Error::other(format!("cannot stop container: {}: it did not exit after SIGKILL", &id[..12]))));
                     }
-                    exited = self.changed.wait_timeout(exited, left).unwrap_or_else(|e| e.into_inner()).0;
+                    exited = self.wait_changed_timeout(exited, left);
                 }
                 drop(exited);
                 self.emit_container("stop", &id, &[]);
                 return Ok(true);
             }
-            st = self.changed.wait_timeout(st, left).unwrap_or_else(|e| e.into_inner()).0;
+            st = self.wait_changed_timeout(st, left);
         }
         drop(st);
         self.emit_container("stop", &id, &[]);
@@ -5985,7 +6056,7 @@ impl Engine {
                 if left.is_zero() {
                     break;
                 }
-                st = self.changed.wait_timeout(st, left).unwrap_or_else(|e| e.into_inner()).0;
+                st = self.wait_changed_timeout(st, left);
             }
         }
         Ok(())
@@ -6015,7 +6086,7 @@ impl Engine {
             }
             let mut st = self.lock();
             while st.containers.get(&id).is_some_and(|c| c.status == Status::Running) {
-                st = self.changed.wait_timeout(st, Duration::from_secs(5)).unwrap_or_else(|e| e.into_inner()).0;
+                st = self.wait_changed_timeout(st, Duration::from_secs(5));
             }
         }
         *removing = removing.wrapping_add(1);
@@ -6034,7 +6105,7 @@ impl Engine {
         // before waking waiters or returning to callers that may rebind ports.
         drop(removed.as_mut().and_then(|c| c.forwards.take()));
         self.clear_stopping_op(&id);
-        self.changed.notify_all();
+        self.notify_changed();
         let anon = self.unshared(removed.as_ref().map(|c| c.spec.anon_volumes.clone()).unwrap_or_default());
         if let Some(c) = &removed {
             lock_log(&c.log).remove();
@@ -6276,7 +6347,7 @@ impl Engine {
                 x.attached.clear();
             }
             drop(st);
-            self.changed.notify_all();
+            self.notify_changed();
             return Err(Error::Conflict(msg));
         }
         let started = self.vm()?.exec(&container_id, exec_id, &config.argv, &env, &config.cwd, &config.user, flags, exec_security.1, &exec_security.2);
@@ -6293,7 +6364,7 @@ impl Engine {
                 x.attached.clear();
             }
             drop(st);
-            self.changed.notify_all();
+            self.notify_changed();
             return Err(Error::Io(e));
         }
         if let (true, Some((rows, cols))) = (config.tty, console) {
@@ -6313,14 +6384,14 @@ impl Engine {
     }
 
     pub fn with_exec<T>(&self, exec_id: &str, f: impl FnOnce(&Exec) -> T) -> Result<T, Error> {
-        let st = self.lock();
+        let st = self.read();
         st.execs.get(exec_id).map(f).ok_or_else(|| Error::NotFound(format!("No such exec instance: {exec_id}")))
     }
 
     /// Execs running in a container now (buildx's `buildctl dial-stdio`
     /// while it builds, for one): the managed builder isn't idle while any are.
     pub fn running_execs(&self, container_id: &str) -> usize {
-        self.lock().execs.values().filter(|e| e.container_id == container_id && e.running).count()
+        self.read().execs.values().filter(|e| e.container_id == container_id && e.running).count()
     }
 
     /// Drops a finished exec's record: Kiri's own, which nobody inspects.
@@ -6329,7 +6400,7 @@ impl Engine {
     }
 
     fn is_running(&self, id: &str) -> bool {
-        self.lock().containers.get(id).is_some_and(|c| c.status == Status::Running)
+        self.read().containers.get(id).is_some_and(|c| c.status == Status::Running)
     }
 
     /// Remembers the op under which these containers are being stopped, so
@@ -6370,29 +6441,36 @@ impl Engine {
                 None => (false, false),
             }
         };
-        self.changed.notify_all();
+        self.notify_changed();
         if persist {
             self.save();
         }
         cancelled
     }
 
-    /// Runs `f` over every container, under the lock.
+    /// Runs `f` over every container, under the shared read lock.
     pub fn each<T>(&self, mut f: impl FnMut(&Container) -> Option<T>) -> Vec<T> {
-        self.lock().containers.values().filter_map(&mut f).collect()
+        self.read().containers.values().filter_map(&mut f).collect()
     }
 
     /// Runs `f` over every container alongside the current networks slice,
-    /// locking container state before networks.
-    pub fn each_with_networks<T>(&self, mut f: impl FnMut(&Container, &[super::network::Network]) -> Option<T>) -> Vec<T> {
-        let s = self.lock();
-        let net = self.lock_net();
-        let networks = net.all();
-        s.containers.values().filter_map(|c| f(c, networks)).collect()
+    /// taking shared read locks (container state before networks).
+    pub fn with_containers_and_networks<T>(&self, f: impl FnOnce(&[&Container], &[super::network::Network]) -> T) -> T {
+        let s = self.read();
+        let net = self.read_net();
+        let containers: Vec<&Container> = s.containers.values().collect();
+        f(&containers, net.all())
+    }
+
+    pub fn status_counts(&self) -> (usize, usize) {
+        let s = self.read();
+        let total = s.containers.len();
+        let running = s.containers.values().filter(|c| c.status == Status::Running).count();
+        (total, running)
     }
 
     pub fn with<T>(&self, key: &str, f: impl FnOnce(&Container) -> T) -> Result<T, Error> {
-        let st = self.lock();
+        let st = self.read();
         let id = resolve(&st, key)?;
         Ok(f(st.containers.get(&id).expect("resolved")))
     }
@@ -7502,17 +7580,17 @@ fn close_monitor(h: &mut HealthRun) {
 /// `STAT`) carry the container's mounts (with refreshed bind sources) and
 /// `READONLY_ROOTFS` for `IN`; `EXPORT`, `DIFF`, `COMMIT` and `UPPER` operate
 /// on the container's rootfs/layer alone, without mounts.
-fn copy_mounts_and_flags(spec: &Spec, op: u8, flags: u32) -> (Vec<String>, u32) {
+fn copy_mounts_and_flags(spec: &Spec, op: u8, flags: u32) -> Result<(Vec<String>, u32), Error> {
     if !matches!(op, kiri_proto::copy_op::IN | kiri_proto::copy_op::OUT | kiri_proto::copy_op::STAT) {
-        return (Vec::new(), flags);
+        return Ok((Vec::new(), flags));
     }
-    let mounts = super::api::fresh_bind_sources(&spec.mounts, &spec.mount_info);
+    let mounts = super::api::fresh_bind_sources(&spec.mounts, &spec.mount_info, spec.non_host_creator)?;
     let flags = if op == kiri_proto::copy_op::IN && spec.readonly_rootfs {
         flags | kiri_proto::copy_flags::READONLY_ROOTFS
     } else {
         flags
     };
-    (mounts, flags)
+    Ok((mounts, flags))
 }
 
 fn error_text(e: &Error) -> String {
@@ -7588,7 +7666,7 @@ impl Engine {
                 break;
             }
             let next = pending.iter().filter(|(_, _, k)| k.is_none()).map(|(_, d, _)| d.saturating_duration_since(now)).min().unwrap_or(Duration::from_millis(100));
-            st = self.changed.wait_timeout(st, next.clamp(Duration::from_millis(10), Duration::from_millis(250))).unwrap_or_else(|e| e.into_inner()).0;
+            st = self.wait_changed_timeout(st, next.clamp(Duration::from_millis(10), Duration::from_millis(250)));
         }
         drop(st);
         if engine {
@@ -7601,12 +7679,12 @@ impl Engine {
 
     /// `State.Health` of a container with a healthcheck.
     pub fn health(&self, id: &str) -> Option<super::health::Health> {
-        self.lock().health.get(id).map(|h| h.health.clone())
+        self.read().health.get(id).map(|h| h.health.clone())
     }
 
     /// Health status by container id, for `docker ps`.
     pub fn health_statuses(&self) -> HashMap<String, super::health::Health> {
-        self.lock().health.iter().map(|(id, h)| (id.clone(), h.health.clone())).collect()
+        self.read().health.iter().map(|(id, h)| (id.clone(), h.health.clone())).collect()
     }
 
     /// Docker's `initHealthMonitor` at every start: status back to
@@ -7680,7 +7758,7 @@ impl Engine {
                     if left.is_zero() {
                         break;
                     }
-                    st = self.changed.wait_timeout(st, left).unwrap_or_else(|e| e.into_inner()).0;
+                    st = self.wait_changed_timeout(st, left);
                 }
             }
             let start = SystemTime::now();
@@ -7698,7 +7776,7 @@ impl Engine {
                 (run.health.status != before).then(|| (run.health.status.clone(), auto_remove))
             };
             if let Some((status, auto_remove)) = changed {
-                self.changed.notify_all();
+                self.notify_changed();
                 self.emit_container(&format!("health_status: {status}"), id, &[]);
                 if !auto_remove {
                     self.save();
@@ -7802,7 +7880,7 @@ mod vm_recovery_tests {
             while !ids[..2].iter().all(|id| st.containers[id].status == Status::Running && st.containers[id].restart_count == count) {
                 let left = until.saturating_duration_since(std::time::Instant::now());
                 assert!(!left.is_zero(), "policy containers stayed down without a new VM request");
-                st = engine.changed.wait_timeout(st, left.min(Duration::from_millis(100))).unwrap().0;
+                st = engine.wait_changed_timeout(st, left.min(Duration::from_millis(100)));
             }
             for id in &ids[2..] {
                 assert_eq!(st.containers[id].status, Status::Exited);
@@ -7858,7 +7936,7 @@ mod vm_recovery_tests {
             while !ids[..2].iter().all(|id| st.containers[id].status == Status::Running && st.containers[id].restart_count == count) {
                 let left = until.saturating_duration_since(std::time::Instant::now());
                 assert!(!left.is_zero(), "retirement must allow recovery after confirmed stop");
-                st = engine.changed.wait_timeout(st, left.min(Duration::from_millis(100))).unwrap().0;
+                st = engine.wait_changed_timeout(st, left.min(Duration::from_millis(100)));
             }
             assert!(st.containers[&canceled[0]].stopped_by_user);
             assert_eq!(st.containers[&canceled[0]].status, Status::Exited);
@@ -7885,7 +7963,7 @@ mod vm_recovery_tests {
         while ids[..2].iter().any(|id| st.containers[id].status == Status::Running) {
             let left = until.saturating_duration_since(std::time::Instant::now());
             assert!(!left.is_zero(), "the lost VM must finish exit accounting");
-            st = engine.changed.wait_timeout(st, left).unwrap().0;
+            st = engine.wait_changed_timeout(st, left);
         }
         assert!(st.vm_recovery_at.unwrap() > std::time::Instant::now() + Duration::from_secs(50));
         let spec = st.containers[&ids[0]].spec.clone();
@@ -7907,7 +7985,7 @@ mod vm_recovery_tests {
         while st.vm_recovery_running {
             let left = until.saturating_duration_since(std::time::Instant::now());
             assert!(!left.is_zero(), "stopping the candidates cancels the recovery worker");
-            st = engine.changed.wait_timeout(st, left.min(Duration::from_millis(100))).unwrap().0;
+            st = engine.wait_changed_timeout(st, left.min(Duration::from_millis(100)));
         }
         drop(st);
         assert!(!engine.is_awake(), "no eligible containers means the VM stays down");
@@ -8073,14 +8151,14 @@ mod vm_recovery_tests {
                         if left.is_zero() {
                             return;
                         }
-                        st = engine.changed.wait_timeout(st, left).unwrap().0;
+                        st = engine.wait_changed_timeout(st, left);
                     }
                     let c = st.containers.get_mut(&id).unwrap();
                     c.status = Status::Exited;
                     c.exit_code = 137;
                     c.exits += 1;
                     drop(st);
-                    engine.changed.notify_all();
+                    engine.notify_changed();
                 })
             };
             let r = match op {
@@ -9111,16 +9189,16 @@ mod start_wait_tests {
             "tmpfs\t/tmp\ttmpfs,noexec,nosuid,nodev".into(),
         ];
         s.readonly_rootfs = true;
-        let (mounts, flags) = copy_mounts_and_flags(&s, kiri_proto::copy_op::IN, kiri_proto::copy_flags::CHUNKED);
+        let (mounts, flags) = copy_mounts_and_flags(&s, kiri_proto::copy_op::IN, kiri_proto::copy_flags::CHUNKED).unwrap();
         assert_eq!(mounts, s.mounts);
         assert_eq!(flags, kiri_proto::copy_flags::CHUNKED | kiri_proto::copy_flags::READONLY_ROOTFS);
         for op in [kiri_proto::copy_op::OUT, kiri_proto::copy_op::STAT] {
-            let (mounts, flags) = copy_mounts_and_flags(&s, op, 0);
+            let (mounts, flags) = copy_mounts_and_flags(&s, op, 0).unwrap();
             assert_eq!(mounts, s.mounts);
             assert_eq!(flags, 0);
         }
         for op in [kiri_proto::copy_op::EXPORT, kiri_proto::copy_op::DIFF, kiri_proto::copy_op::COMMIT, kiri_proto::copy_op::UPPER] {
-            let (mounts, flags) = copy_mounts_and_flags(&s, op, 0);
+            let (mounts, flags) = copy_mounts_and_flags(&s, op, 0).unwrap();
             assert!(mounts.is_empty(), "op {op} must not mount volumes/binds");
             assert_eq!(flags, 0);
         }
@@ -10534,6 +10612,7 @@ mod volume_remove_tests {
             volumes_from: vec!["seed-data:ro".into()],
             pid_mode: "host".into(),
             wsl_distro: Some("Ubuntu".into()),
+            non_host_creator: false,
         };
 
         let log_dir = dir.join("containers").join("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
@@ -10872,6 +10951,60 @@ mod exit_forwards_tests {
         drop(engine);
         let _ = std::fs::remove_dir_all(dir);
     }
+
+    #[test]
+    fn early_input_is_bounded_and_k8s_node_requires_canonical_name() {
+        let (engine, id, dir) = engine_running("early-input-and-k8s-name");
+        // Mark back to Created/not-live so `Engine::input` exercises `early_input`.
+        {
+            let mut st = engine.lock();
+            let c = st.containers.get_mut(&id).unwrap();
+            c.status = Status::Created;
+            c.live = false;
+        }
+        let exact = vec![b'x'; Engine::MAX_EARLY_INPUT];
+        engine.input(&id, &exact).unwrap();
+        let err = engine.input(&id, &[b'y']).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WriteZero);
+        {
+            let st = engine.lock();
+            let c = st.containers.get(&id).unwrap();
+            assert_eq!(c.early_input.len(), Engine::MAX_EARLY_INPUT);
+            assert!(!super::is_k8s_node_container(c));
+        }
+
+        // An arbitrary container carrying `dev.kiri.k8s` must NOT qualify as the managed k8s node.
+        let image = Image {
+            mirror: None,
+            name: "test:local".into(),
+            digest: "sha256:test".into(),
+            index_digest: None,
+            config_digest: "sha256:test".into(),
+            layers: Vec::new(),
+            size: 0,
+            platform: "linux/arm64".into(),
+            created: String::new(),
+            pulled_at: 0,
+            config: Default::default(),
+        };
+        let fake_k8s_spec: Spec = serde_json::from_value(serde_json::json!({
+            "image": "test:local", "image_id": "sha256:test", "entrypoint": [], "cmd": ["sleep", "60"],
+            "env": [], "cwd": "/", "user": "", "auto_remove": false, "network_mode": "none",
+            "labels": {"dev.kiri.k8s": "1"},
+            "restart": {"name": "no", "max_retries": 0}
+        }))
+        .unwrap();
+        let fake_id = engine.create(Some("evil-k8s".into()), fake_k8s_spec.clone(), &image).unwrap();
+        let real_id = engine.create(Some("kiri-k8s".into()), fake_k8s_spec, &image).unwrap();
+        {
+            let st = engine.lock();
+            assert!(!super::is_k8s_node_container(st.containers.get(&fake_id).unwrap()));
+            assert!(super::is_k8s_node_container(st.containers.get(&real_id).unwrap()));
+        }
+
+        drop(engine);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 
 /// 10 ms timer slack applied to `kiri-k8s` (`dev.kiri.k8s`) so `k3s`'s dozens of
@@ -10881,6 +11014,13 @@ const K8S_TIMER_SLACK_NS: u64 = 10_000_000;
 
 fn is_k8s_node(spec: &Spec) -> bool {
     spec.labels.get("dev.kiri.k8s").is_some()
+}
+
+/// Canonical managed Kubernetes node container (`kiri-k8s` with `dev.kiri.k8s`
+/// label), so an arbitrary user container carrying label `dev.kiri.k8s` cannot
+/// hijack `reconcile_k8s_lb` host port publishing.
+fn is_k8s_node_container(c: &Container) -> bool {
+    c.name == "kiri-k8s" && is_k8s_node(&c.spec)
 }
 
 fn watches_host_binds(c: &Container) -> bool {

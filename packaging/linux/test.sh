@@ -36,8 +36,9 @@ test_package() { # name full(0|1)
   if [ "$full" = 1 ]; then
     check "deb carries docker, compose, buildx" "dpkg-deb -c '$deb' | grep -q usr/libexec/kiri/bin/docker && dpkg-deb -c '$deb' | grep -q usr/libexec/kiri/cli-plugins/docker-compose && dpkg-deb -c '$deb' | grep -q usr/libexec/kiri/cli-plugins/docker-buildx && ! dpkg-deb -c '$deb' | grep -q usr/lib/docker/"
   else
-    check "deb carries no docker CLI" "! dpkg-deb -c '$deb' | grep -q libexec/kiri"
+    check "deb carries no docker CLI" "! dpkg-deb -c '$deb' | grep -qE 'usr/libexec/kiri/(bin/docker|docker$|cli-plugins)'"
   fi
+  check "deb carries dedicated host-access helper and hardened polkit policy" "dpkg-deb -c '$deb' | grep -q 'usr/libexec/kiri/host-access$' && dpkg-deb --fsys-tarfile '$deb' | tar -xOf - ./usr/share/polkit-1/actions/dev.kiri.host-access.policy > '$tmp/policy.xml' && grep -q '/usr/libexec/kiri/host-access' '$tmp/policy.xml' && ! grep -q '/usr/bin/kiri' '$tmp/policy.xml' && ! grep -q 'auth_admin_keep' '$tmp/policy.xml'"
   check "deb maintainer scripts" "rm -rf '$tmp/deb-ctl' && dpkg-deb -e '$deb' '$tmp/deb-ctl' && test -x '$tmp/deb-ctl/postinst' -a -x '$tmp/deb-ctl/prerm' -a -x '$tmp/deb-ctl/postrm'"
   rpm -qpi "$rpm" 2>/dev/null | grep -E '^(Name|Version|Release|Architecture|License|Size|Summary)' | sed 's/^/     /'
   check "rpm lists kiri, kiri-init, unit, licences" "rpm -qpl '$rpm' | grep -q '^/usr/bin/kiri$' && rpm -qpl '$rpm' | grep -q /usr/bin/kiri-init && rpm -qpl '$rpm' | grep -q /usr/lib/systemd/system/kiri.service && rpm -qpl '$rpm' | grep -q LICENSE && rpm -qpl '$rpm' | grep -q NOTICE"

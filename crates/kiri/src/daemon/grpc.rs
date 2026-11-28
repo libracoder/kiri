@@ -50,7 +50,82 @@ const MAX_FRAME_LIMIT: usize = 4 << 20;
 const MAX_SOLVE_BODY: usize = 16 << 20;
 const MAX_SOLVE_REQ_BYTES: usize = MAX_SOLVE_BODY;
 const MAX_TOTAL_SOLVE_REQ_BYTES: usize = 32 << 20;
+/// Daemon-wide cap on buffered SolveRequest bytes across all concurrent `/grpc`
+/// connections so 128 container connections cannot pin 4 GiB of host RAM.
+const MAX_GLOBAL_SOLVE_REQ_BYTES: usize = 128 << 20;
+const MAX_CONCURRENT_GRPC_STREAMS: usize = 64;
 const MAX_CONCURRENT_SOLVE_STREAMS: usize = 16;
+const GRPC_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+static GLOBAL_SOLVE_REQ_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static ACTIVE_GRPC_STREAMS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+struct GrpcStreamPermit;
+
+impl Drop for GrpcStreamPermit {
+    fn drop(&mut self) {
+        ACTIVE_GRPC_STREAMS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+fn acquire_grpc_stream() -> Option<GrpcStreamPermit> {
+    ACTIVE_GRPC_STREAMS
+        .try_update(std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire, |n| (n < MAX_CONCURRENT_GRPC_STREAMS).then_some(n + 1))
+        .ok()
+        .map(|_| GrpcStreamPermit)
+}
+
+/// RAII tracker for global SolveRequest bytes reserved by one `proxy_grpc` call,
+/// guaranteeing release on normal completion, RST_STREAM, or early error.
+struct GlobalSolveBudget<'a> {
+    counter: &'a std::sync::atomic::AtomicUsize,
+    cap: usize,
+    held: usize,
+}
+
+impl GlobalSolveBudget<'static> {
+    fn new() -> Self {
+        Self::with_counter(&GLOBAL_SOLVE_REQ_BYTES, MAX_GLOBAL_SOLVE_REQ_BYTES)
+    }
+}
+
+impl<'a> GlobalSolveBudget<'a> {
+    fn with_counter(counter: &'a std::sync::atomic::AtomicUsize, cap: usize) -> Self {
+        Self { counter, cap, held: 0 }
+    }
+
+    fn try_add(&mut self, bytes: usize) -> bool {
+        let cap = self.cap;
+        let ok = self
+            .counter
+            .try_update(std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire, |n| {
+                let next = n.checked_add(bytes)?;
+                (next <= cap).then_some(next)
+            })
+            .is_ok();
+        if ok {
+            self.held += bytes;
+        }
+        ok
+    }
+
+    fn release(&mut self, bytes: usize) {
+        let drop_n = bytes.min(self.held);
+        if drop_n > 0 {
+            self.held -= drop_n;
+            self.counter.fetch_sub(drop_n, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+}
+
+impl Drop for GlobalSolveBudget<'_> {
+    fn drop(&mut self) {
+        if self.held > 0 {
+            self.counter.fetch_sub(self.held, std::sync::atomic::Ordering::AcqRel);
+            self.held = 0;
+        }
+    }
+}
 const MAX_CONTINUATION_FRAMES: usize = 32;
 const MAX_HEADER_BLOCK: usize = 1 << 20;
 const MAX_HPACK_TABLE_SIZE: usize = 1 << 20;
@@ -73,18 +148,25 @@ pub fn grpc(req: &Request, engine: &Arc<Engine>, w: &mut UnixStream, r: &mut Buf
         api::error(w, Error::BadRequest("POST /grpc requires Upgrade: h2c".into()))?;
         return Ok(Next::KeepAlive);
     }
+    let Some(_stream_permit) = acquire_grpc_stream() else {
+        api::error(w, Error::Conflict("too many concurrent BuildKit gRPC streams".into()))?;
+        return Ok(Next::Close);
+    };
     http::upgrade_h2c(w)?;
 
     // buildx's driver priority probe dials `/grpc`, checks for 101, and closes
     // immediately without sending any HTTP/2 bytes: wait for the first byte
-    // before touching the builder so probes never wake or pull BuildKit.
+    // (with a bounded handshake timeout) before touching the builder so probes
+    // or idle connections never wake or pull BuildKit.
     let mut initial = r.buffer().to_vec();
     r.consume(initial.len());
     let mut client_r = r.get_ref().try_clone()?;
     if initial.is_empty() {
-        api::wait_readable(&client_r);
+        let _ = client_r.set_read_timeout(Some(GRPC_HANDSHAKE_TIMEOUT));
         let mut buf = [0u8; 4096];
-        match client_r.read(&mut buf) {
+        let first = client_r.read(&mut buf);
+        let _ = client_r.set_read_timeout(None);
+        match first {
             Ok(0) | Err(_) => return Ok(Next::Close),
             Ok(n) => initial.extend_from_slice(&buf[..n]),
         }
@@ -152,11 +234,27 @@ pub fn session(req: &Request, engine: &Arc<Engine>, w: &mut UnixStream, r: &mut 
         .filter(|(k, _)| k.to_ascii_lowercase().starts_with("x-docker-expose-session-"))
         .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
         .collect();
+    let Some(_stream_permit) = acquire_grpc_stream() else {
+        api::error(w, Error::Conflict("too many concurrent BuildKit session streams".into()))?;
+        return Ok(Next::Close);
+    };
     http::upgrade_h2c(w)?;
 
-    let early = r.buffer().to_vec();
+    let mut early = r.buffer().to_vec();
     r.consume(early.len());
-    let client_r = r.get_ref().try_clone()?;
+    let mut client_r = r.get_ref().try_clone()?;
+    // Mirror `grpc()`: wait for at least one client byte (with a bounded
+    // handshake timeout) before waking BuildKit or spawning `buildctl dial-stdio`.
+    if early.is_empty() {
+        let _ = client_r.set_read_timeout(Some(GRPC_HANDSHAKE_TIMEOUT));
+        let mut buf = [0u8; 4096];
+        let first = client_r.read(&mut buf);
+        let _ = client_r.set_read_timeout(None);
+        match first {
+            Ok(0) | Err(_) => return Ok(Next::Close),
+            Ok(n) => early.extend_from_slice(&buf[..n]),
+        }
+    }
 
     let (builder_id, _busy) = match builder::ensure_running(engine, &mut |_| {}) {
         Ok(v) => v,
@@ -454,6 +552,7 @@ where
             let mut header_block = Vec::new();
             let mut solve_req_bufs: HashMap<u32, (Vec<u8>, usize)> = HashMap::new();
             let mut total_solve_req_bytes = 0usize;
+            let mut global_budget = GlobalSolveBudget::new();
 
             let res = (|| -> io::Result<()> {
                 while let Some(frame) = read_frame(&mut client_r)? {
@@ -487,6 +586,7 @@ where
                                 if header_end_stream {
                                     if let Some((buf, _)) = solve_req_bufs.remove(&frame.stream_id) {
                                         total_solve_req_bytes = total_solve_req_bytes.saturating_sub(buf.len());
+                                        global_budget.release(buf.len());
                                     }
                                     shared.lock().unwrap_or_else(|e| e.into_inner()).solve_streams.remove(&frame.stream_id);
                                 } else if headers.iter().any(|(k, v)| k == b":path" && v == SOLVE_PATH.as_bytes()) {
@@ -498,6 +598,7 @@ where
                                     }
                                     if let Some((old_buf, _)) = solve_req_bufs.insert(frame.stream_id, (Vec::new(), 0)) {
                                         total_solve_req_bytes = total_solve_req_bytes.saturating_sub(old_buf.len());
+                                        global_budget.release(old_buf.len());
                                     }
                                     shared.lock().unwrap_or_else(|e| e.into_inner()).solve_streams.insert(frame.stream_id, None);
                                 }
@@ -515,6 +616,7 @@ where
                             let (buf, credited) = solve_req_bufs.get_mut(&sid).unwrap();
                             if buf.len().saturating_add(unpadded.len()) > MAX_SOLVE_REQ_BYTES
                                 || total_solve_req_bytes.saturating_add(unpadded.len()) > MAX_TOTAL_SOLVE_REQ_BYTES
+                                || !global_budget.try_add(unpadded.len())
                             {
                                 return Err(io::Error::new(io::ErrorKind::InvalidData, "SolveRequest exceeds limit"));
                             }
@@ -534,6 +636,7 @@ where
                             }
                             let (raw_grpc, credited) = solve_req_bufs.remove(&sid).unwrap();
                             total_solve_req_bytes = total_solve_req_bytes.saturating_sub(raw_grpc.len());
+                            global_budget.release(raw_grpc.len());
                             let orig_len = raw_grpc.len();
                             let (out_grpc, rewrite_state) = rewrite_grpc_solve_request(&raw_grpc, engine, host_net)?;
                             if let Some(rw) = rewrite_state {
@@ -559,6 +662,7 @@ where
                         FRAME_RST_STREAM => {
                             if let Some((buf, _)) = solve_req_bufs.remove(&frame.stream_id) {
                                 total_solve_req_bytes = total_solve_req_bytes.saturating_sub(buf.len());
+                                global_budget.release(buf.len());
                             }
                             shared.lock().unwrap_or_else(|e| e.into_inner()).solve_streams.remove(&frame.stream_id);
                             write_server_frame(&frame)?;
@@ -2265,6 +2369,43 @@ mod tests {
             assert_eq!(err.kind(), io::ErrorKind::InvalidData);
             assert!(err.to_string().contains("concurrent Solve streams"), "{err}");
         }
+
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_probe_returns_101_without_waking_builder_and_global_budget_caps_memory() {
+        let (engine, dir) = test_engine("session-probe");
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let handle = std::thread::spawn({
+            let engine = engine.clone();
+            move || super::super::api::serve(server, engine, super::super::caller::Caller::Container)
+        });
+        client
+            .write_all(b"POST /session HTTP/1.1\r\nHost: \r\nContent-Length: 0\r\nConnection: Upgrade\r\nUpgrade: h2c\r\n\r\n")
+            .unwrap();
+        let mut resp = Vec::new();
+        let mut buf = [0u8; 512];
+        while !resp.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = client.read(&mut buf).unwrap();
+            assert!(n > 0);
+            resp.extend_from_slice(&buf[..n]);
+        }
+        assert!(String::from_utf8_lossy(&resp).starts_with("HTTP/1.1 101 "));
+        drop(client);
+        handle.join().unwrap().unwrap();
+        assert!(engine.each(|c| Some(c.name.clone())).is_empty());
+
+        let counter = std::sync::atomic::AtomicUsize::new(0);
+        let mut b1 = GlobalSolveBudget::with_counter(&counter, MAX_GLOBAL_SOLVE_REQ_BYTES);
+        assert!(b1.try_add(MAX_GLOBAL_SOLVE_REQ_BYTES));
+        let mut b2 = GlobalSolveBudget::with_counter(&counter, MAX_GLOBAL_SOLVE_REQ_BYTES);
+        assert!(!b2.try_add(1), "global budget must reject allocation above daemon cap");
+        drop(b1);
+        assert!(b2.try_add(1), "dropping budget releases reserved bytes");
+        drop(b2);
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Acquire), 0);
 
         drop(engine);
         let _ = std::fs::remove_dir_all(&dir);

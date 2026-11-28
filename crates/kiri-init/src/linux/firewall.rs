@@ -480,7 +480,12 @@ const ZONE_TRUSTED: &str = "trusted";
 const POLICY_FORWARDING: &str = "kiri-forwarding";
 
 fn firewall_cmd_out(cmd: &Path, args: &[&str]) -> Result<String, String> {
-    match std::process::Command::new(cmd).args(args).stdin(std::process::Stdio::null()).output() {
+    match std::process::Command::new(cmd)
+        .env("PATH", TRUSTED_PATH)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+    {
         Ok(o) if o.status.success() => Ok(String::from_utf8_lossy(&o.stdout).into_owned()),
         Ok(o) => Err(String::from_utf8_lossy(&o.stderr).trim().to_owned()),
         Err(e) => Err(e.to_string()),
@@ -620,6 +625,7 @@ fn stop(st: &mut State) {
 /// Runs an administrator's program; its output when it succeeded.
 fn run(tool: &Path, args: &[&str]) -> Option<String> {
     let mut cmd = std::process::Command::new(tool);
+    cmd.env("PATH", TRUSTED_PATH);
     if tool.file_name().is_some_and(|n| n.to_string_lossy().contains("tables")) {
         // Waits for another program holding the xtables lock (ufw, Docker).
         cmd.args(["-w", "5"]);
@@ -648,15 +654,20 @@ fn write_warnings(st: &mut State, text: String) {
     st.warnings = text;
 }
 
-/// An administrator's program (iptables) by name, wherever the host keeps
-/// it: the agent's PATH may lack the sbin folders.
+const TRUSTED_SBIN_DIRS: [&str; 4] = ["/usr/sbin", "/sbin", "/usr/bin", "/bin"];
+const TRUSTED_PATH: &str = "/usr/sbin:/sbin:/usr/bin:/bin";
+
+/// An administrator's program (`iptables`, `firewall-cmd`) by name, resolved
+/// exclusively from trusted system directories — never from inherited `PATH`.
 fn sbin(name: &str) -> Option<PathBuf> {
-    let path = std::env::var("PATH").unwrap_or_default();
-    path.split(':')
-        .chain(["/usr/sbin", "/sbin", "/usr/local/sbin", "/usr/bin", "/bin"])
-        .filter(|d| !d.is_empty())
+    sbin_in(name, &TRUSTED_SBIN_DIRS)
+}
+
+fn sbin_in(name: &str, dirs: &[&str]) -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    dirs.iter()
         .map(|d| Path::new(d).join(name))
-        .find(|p| p.is_file())
+        .find(|p| std::fs::metadata(p).is_ok_and(|m| m.is_file() && (m.mode() & 0o111 != 0)))
 }
 
 #[cfg(test)]
@@ -803,5 +814,30 @@ mod tests {
         assert!(compute_forwarding_blocked(true, false, false));
         assert!(compute_forwarding_blocked(false, true, false));
         assert!(compute_forwarding_blocked(false, false, true));
+    }
+
+    #[test]
+    fn sbin_ignores_inherited_path_and_requires_executable_bit() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("kiri-firewall-sbin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join("kiri-fake-iptables-tool");
+        std::fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        // Non-executable file in a searched directory is ignored.
+        let dir_str = dir.to_str().unwrap();
+        assert_eq!(sbin_in("kiri-fake-iptables-tool", &[dir_str]), None);
+
+        // Executable file in an explicitly searched directory is found.
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(sbin_in("kiri-fake-iptables-tool", &[dir_str]), Some(fake.clone()));
+
+        // `sbin()` never searches inherited `PATH` (only TRUSTED_SBIN_DIRS).
+        assert!(!TRUSTED_SBIN_DIRS.contains(&dir_str));
+        assert_eq!(sbin("kiri-fake-iptables-tool"), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

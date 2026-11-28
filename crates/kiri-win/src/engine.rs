@@ -574,17 +574,25 @@ fn refresh() {
         let images = client::get_quick("/images/json")?;
         let volumes = client::get_quick("/volumes")?;
         let networks = client::get_quick("/networks")?;
-        let add_icon = |mut v: Value, name_of: &dyn Fn(&Value) -> String| {
+        let mut used_brands = serde_json::Map::new();
+        let mut add_icon = |mut v: Value, name_of: &dyn Fn(&Value) -> String| {
             if let Some(list) = v.as_array_mut() {
                 for item in list {
-                    item["icon"] = json!(brand(&name_of(item)));
+                    if let Some(slug) = brand(&name_of(item)) {
+                        if !used_brands.contains_key(slug)
+                            && let Some(svg) = brand_svg(slug)
+                        {
+                            used_brands.insert(slug.to_owned(), json!(svg));
+                        }
+                        item["icon"] = Value::String(slug.to_owned());
+                    }
                 }
             }
             v
         };
         let containers = add_icon(containers, &|c| c["Image"].as_str().unwrap_or_default().to_owned());
         let images = add_icon(images, &|i| i["RepoTags"][0].as_str().unwrap_or_default().to_owned());
-        Ok(json!({"type": "lists", "containers": containers, "images": images, "volumes": volumes["Volumes"], "networks": networks}))
+        Ok(json!({"type": "lists", "brands": used_brands, "containers": containers, "images": images, "volumes": volumes["Volumes"], "networks": networks}))
     })();
     match lists {
         Ok(v) => {
@@ -673,16 +681,19 @@ fn unanswered(kind: io::ErrorKind, shown: bool) -> Option<&'static str> {
     }
 }
 
-/// The brand logo for an image name like `bitnami/redis:7`: first by the
+/// The brand slug for an image name like `bitnami/redis:7`: first by the
 /// whole repository path, then by its last component.
-pub(crate) fn brand(name: &str) -> Option<[&'static str; 2]> {
+pub(crate) fn brand(name: &str) -> Option<&'static str> {
     let name = name.split_once('@').map_or(name, |(n, _)| n);
     let repo = match name.rfind(':') {
         Some(i) if !name[i..].contains('/') => &name[..i],
         _ => name,
     };
     let last = repo.rsplit('/').next().unwrap_or(repo);
-    let slug = [repo, last].into_iter().find_map(|key| brands::IMAGES.binary_search_by_key(&key, |(k, _)| k).ok().map(|i| brands::IMAGES[i].1))?;
+    [repo, last].into_iter().find_map(|key| brands::IMAGES.binary_search_by_key(&key, |(k, _)| k).ok().map(|i| brands::IMAGES[i].1))
+}
+
+pub(crate) fn brand_svg(slug: &str) -> Option<[&'static str; 2]> {
     let i = brands::BRANDS.binary_search_by_key(&slug, |(s, _, _)| s).ok()?;
     let (_, hex, path) = brands::BRANDS[i];
     Some([hex, path])
@@ -836,7 +847,7 @@ fn pull(name: String) {
             Err(_) if stopped => emit(json!({"type": "pull", "state": "done", "name": reference, "cancelled": true}).to_string()),
             Ok(()) => {
                 emit(json!({"type": "pull", "state": "done", "name": reference}).to_string());
-                emit(json!({"type": "pulled", "name": reference, "ms": began.elapsed().as_millis() as u64, "icon": brand(&reference)}).to_string());
+                emit(json!({"type": "pulled", "name": reference, "ms": began.elapsed().as_millis() as u64, "icon": brand(&reference).and_then(brand_svg)}).to_string());
             }
             Err(e) => emit(json!({"type": "pull", "state": "done", "name": reference, "error": e.to_string()}).to_string()),
         }
@@ -1199,6 +1210,9 @@ fn set_pref(name: &str, value: Value) {
         return;
     }
     if !matches!(name, "font" | "mono" | "scale" | "termH" | "termFs" | "termFont" | "domainsAsked" | "theme" | "accent" | "starAsked" | "updateAuto" | "lang" | "langAsked" | "closeButton" | "startAtLogin" | "stopOnQuit") {
+        return;
+    }
+    if name == "lang" && !value.as_str().is_some_and(crate::lang::valid_pick) {
         return;
     }
     let Some(path) = prefs_path() else { return };
@@ -1633,6 +1647,8 @@ pub fn on_message(msg: &str) {
                 Handle.eval(js);
             }
         }
+        "loadxterm" => Handle.eval(crate::assemble::xterm_js().to_owned()),
+        "loadpanels" => Handle.eval(crate::assemble::panels_js().to_owned()),
         // Off the window's thread: GDI lists every installed face, twice.
         "fonts" => {
             std::thread::spawn(|| emit(fonts_event().to_owned()));

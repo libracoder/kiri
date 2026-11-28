@@ -39,7 +39,82 @@ const KEEP_CAPS: [u32; 14] = [
     29, // AUDIT_WRITE
     31, // SETFCAP
 ];
-const LAST_CAP: u32 = 40;
+const DEFAULT_LAST_CAP: u32 = 40;
+
+const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+const PR_CAP_AMBIENT: libc::c_int = 47;
+const PR_CAP_AMBIENT_CLEAR_ALL: libc::c_ulong = 4;
+
+#[repr(C)]
+struct CapHeader {
+    version: u32,
+    pid: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CapData {
+    effective: u32,
+    permitted: u32,
+    inheritable: u32,
+}
+
+fn parse_cap_last_cap(text: &str) -> Option<u32> {
+    let n: u32 = text.trim().parse().ok()?;
+    (n <= 1024).then_some(n)
+}
+
+fn cap_last_cap() -> u32 {
+    fs::read_to_string("/proc/sys/kernel/cap_last_cap")
+        .ok()
+        .and_then(|s| parse_cap_last_cap(&s))
+        .unwrap_or(DEFAULT_LAST_CAP)
+}
+
+/// Computes the target `[CapData; 2]` for `capset(2)` from current permitted
+/// capabilities (`SEC-V-02`). Intersecting with `cur.permitted` ensures we
+/// never attempt to raise a capability the parent did not hold while dropping
+/// every unwanted bit from `CapEff`, `CapPrm`, and clearing `CapInh`.
+fn compute_cap_data(cur: [CapData; 2], uid: libc::uid_t, privileged: bool, caps: u64) -> [CapData; 2] {
+    if uid != 0 {
+        return [CapData::default(); 2];
+    }
+    let want = if privileged { u64::MAX } else { caps };
+    let lo = cur[0].permitted & (want as u32);
+    let hi = cur[1].permitted & ((want >> 32) as u32);
+    [
+        CapData { effective: lo, permitted: lo, inheritable: 0 },
+        CapData { effective: hi, permitted: hi, inheritable: 0 },
+    ]
+}
+
+fn apply_effective_caps(uid: libc::uid_t, privileged: bool, caps: u64) -> io::Result<()> {
+    // SAFETY: clearing ambient caps takes no pointers; EINVAL on old kernels is fine.
+    unsafe {
+        libc::prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0);
+    }
+    let mut hdr = CapHeader { version: LINUX_CAPABILITY_VERSION_3, pid: 0 };
+    let mut cur = [CapData::default(); 2];
+    // SAFETY: valid CapHeader and 2-element CapData array for version 3.
+    sys::check(unsafe { libc::syscall(libc::SYS_capget, &mut hdr as *mut CapHeader, cur.as_mut_ptr()) }, "capget")?;
+    let next = compute_cap_data(cur, uid, privileged, caps);
+    hdr.version = LINUX_CAPABILITY_VERSION_3;
+    hdr.pid = 0;
+    // SAFETY: valid CapHeader and 2-element CapData array for version 3.
+    sys::check(unsafe { libc::syscall(libc::SYS_capset, &hdr as *const CapHeader, next.as_ptr()) }, "capset")?;
+    Ok(())
+}
+
+/// Computes the effective capability mask for `docker exec`, stripping
+/// `CAP_MKNOD` whenever the container's device eBPF filter failed to attach
+/// (`SEC-V-03`).
+fn effective_exec_caps(caps: u64, privileged: bool, device_filtered: bool) -> u64 {
+    if !device_filtered && !privileged {
+        caps & !(1 << super::devices::CAP_MKNOD)
+    } else {
+        caps
+    }
+}
 
 const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
@@ -104,6 +179,10 @@ pub struct Process {
     /// A container's own compiled seccomp program, empty when it runs under
     /// the default. Its execs run under the same one.
     pub seccomp: Vec<u8>,
+    /// Whether the container's device cgroup eBPF filter attached (or the
+    /// container is privileged). When false, `docker exec` must also strip
+    /// `CAP_MKNOD` (`SEC-V-03`).
+    pub device_filtered: bool,
     /// What to undo when a container exits; None for execs.
     teardown: Option<Teardown>,
     /// A container whose root was not in place when `spawn` returned: the
@@ -270,6 +349,7 @@ impl Process {
             ended_before_ready: None,
             filling: false,
             cancelled: false,
+            device_filtered: false,
         }
     }
 
@@ -953,6 +1033,7 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
         netns,
         joins_netns: net_opts::values(spec.net.opts, net_opts::NETNS).next().is_some(),
         seccomp: spec.seccomp.to_vec(),
+        device_filtered,
         teardown: Some(Teardown { base, cgroup, remove, loop_mounts }),
         starting: starting.get().then_some(root_ready),
         ended_before_ready: None,
@@ -1122,7 +1203,7 @@ pub(super) fn mount_rootfs(paths: &Paths, id: &str, image_layers: &[&str], writa
 }
 
 /// Starts a process inside a running container: same namespaces, same cgroup.
-pub fn exec(spec: &ExecSpec<'_>, target_pid: libc::pid_t, paths: &Paths, profile: &[u8]) -> io::Result<Process> {
+pub fn exec(spec: &ExecSpec<'_>, target_pid: libc::pid_t, paths: &Paths, profile: &[u8], device_filtered: bool) -> io::Result<Process> {
     if spec.argv.is_empty() {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "no command to run"));
     }
@@ -1141,6 +1222,7 @@ pub fn exec(spec: &ExecSpec<'_>, target_pid: libc::pid_t, paths: &Paths, profile
     let cgroup_fd = fs::File::open(paths.cgroup.join(spec.container_id))?;
 
     let mut prepared = prepare(spec.argv, spec.env, spec.cwd, spec.user, None, spec.flags, spec.caps)?;
+    prepared.caps = effective_exec_caps(prepared.caps, prepared.privileged, device_filtered);
     // The container's ulimits and groups apply to its execs too, as with runc.
     let host = super::hostopts::parse(spec.opts)?;
     prepared.host = HostApplied { rlimits: host.rlimits, groups: host.groups, ..Default::default() };
@@ -1242,6 +1324,7 @@ pub fn exec(spec: &ExecSpec<'_>, target_pid: libc::pid_t, paths: &Paths, profile
         netns: 0,
         joins_netns: false,
         seccomp: Vec::new(),
+        device_filtered,
         teardown: None,
         starting: None,
         ended_before_ready: None,
@@ -1866,12 +1949,23 @@ pub(super) fn parse_mounts(list: StrList<'_>) -> io::Result<Vec<Mount>> {
             let target = CString::new(if rel.is_empty() { "." } else { rel })?;
             let ro = flags.contains(&"ro");
             if flags.contains(&"tmpfs") {
-                let opts: Vec<&str> = flags.iter().copied().filter(|f| f.contains('=')).collect();
+                let mut opts = Vec::new();
+                for &f in &flags {
+                    if f.contains('=') {
+                        if !valid_tmpfs_opt(f) {
+                            return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("disallowed tmpfs option {f:?}")));
+                        }
+                        opts.push(f);
+                    }
+                }
                 let opts = if opts.is_empty() { "mode=1777".to_owned() } else { opts.join(",") };
                 let tmpfs_flags = tmpfs_flags(&flags);
                 let ro = tmpfs_flags & libc::MS_RDONLY != 0;
                 out.push(Mount { source: None, target, ro, dir: true, copy_up: false, tmpfs_opts: Some(CString::new(opts)?), tmpfs_flags, loop_mount: None });
                 continue;
+            }
+            if !valid_bind_source(src, super::transport::is_host_process()) {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("invalid mount source {src:?}")));
             }
             // A missing source becomes a directory, as Docker does; one that is
             // there already (a file such as /etc/hostname, too) is used as it is.
@@ -1938,6 +2032,25 @@ pub(super) fn parse_mounts(list: StrList<'_>) -> io::Result<Vec<Mount>> {
     // would be hidden by it. The sort is stable, so equal depths keep theirs.
     out.sort_by_key(|m| depth(&m.target));
     Ok(out)
+}
+
+/// Validates a `key=val` tmpfs mount option against an explicit allowlist (`SEC-D-04`).
+fn valid_tmpfs_opt(opt: &str) -> bool {
+    let Some((key, val)) = opt.split_once('=') else { return false };
+    !val.is_empty() && matches!(key, "size" | "mode" | "uid" | "gid" | "nr_inodes" | "nr_blocks" | "mpol")
+}
+
+/// Validates a bind mount source path (`SEC-D-04`): must be absolute with no
+/// `..` traversal components, and in VM mode must not name an ancestor of
+/// `/mnt/mac` whose recursive bind would bypass share isolation.
+fn valid_bind_source(src: &str, host_process: bool) -> bool {
+    if !src.starts_with('/') || src.split('/').any(|c| c == "..") {
+        return false;
+    }
+    if !host_process && super::volmount::is_vm_share_ancestor(src) {
+        return false;
+    }
+    true
 }
 
 /// How deep a mount target is: `.` is 0, `app` 1, `app/node_modules` 2.
@@ -2790,11 +2903,19 @@ fn finish_child(p: &Prepared, io: &ChildStdio, console: bool) -> ! {
         apply_timer_slack(ns);
     }
 
-    for cap in 0..=LAST_CAP {
-        if !p.privileged && p.caps & (1 << cap) == 0 {
-            // SAFETY: PR_CAPBSET_DROP takes a capability number; EINVAL for
-            // capabilities this kernel does not know is fine to ignore.
-            unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap as libc::c_ulong, 0, 0, 0) };
+    let last_cap = cap_last_cap();
+    for cap in 0..=last_cap {
+        let keep = p.privileged || (cap < 64 && p.caps & (1u64 << cap) != 0);
+        if !keep {
+            // SAFETY: PR_CAPBSET_DROP takes a capability number; ignore only
+            // EINVAL (unknown capability on this kernel) and fail closed on
+            // any other error such as EPERM (`SEC-V-02`).
+            if unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap as libc::c_ulong, 0, 0, 0) } != 0 {
+                let e = io::Error::last_os_error();
+                if e.raw_os_error() != Some(libc::EINVAL) {
+                    fail("drop capability", e);
+                }
+            }
         }
     }
 
@@ -2834,6 +2955,12 @@ fn finish_child(p: &Prepared, io: &ChildStdio, console: bool) -> ! {
         if libc::setgroups(groups.len() as _, groups.as_ptr()) != 0 || libc::setgid(gid) != 0 || libc::setuid(uid) != 0 {
             fail("switch user", io::Error::last_os_error());
         }
+    }
+    // Explicitly reduce CapEff/CapPrm/CapInh via capset(2) before chdir,
+    // pid1::run() (--init never execs), or execve() (`SEC-V-02`).
+    apply_effective_caps(uid, p.privileged, p.caps).unwrap_or_else(|e| fail("capabilities", e));
+    // SAFETY: valid NUL-terminated path in the container root.
+    unsafe {
         if libc::chdir(p.cwd.as_ptr()) != 0 {
             // Docker creates the whole working directory path, like mkdir -p.
             let _ = fs::create_dir_all(std::ffi::OsStr::from_encoded_bytes_unchecked(p.cwd.as_bytes()));
@@ -3280,17 +3407,11 @@ fn api_paths(root: BorrowedFd<'_>, privileged: bool, readonly: &[CString], maske
         let target = proc_fd(&fd);
         sys::mount(&target, &target, c"none", libc::MS_BIND | libc::MS_REC, None)?;
         // The first descriptor is under the new bind mount; look again to
-        // reach the mount itself, and keep its nosuid, nodev and noexec flags.
+        // reach the mount itself, and remount recursively so nested submounts
+        // beneath `ReadonlyPaths` also become read-only (`SEC-V-10`).
         let Some((fd, _)) = lookup_existing(root, path)? else { continue };
         let target = proc_fd(&fd);
-        // SAFETY: statvfs is plain data; all-zero is a valid value.
-        let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
-        // SAFETY: valid NUL-terminated path and a writable struct.
-        if unsafe { libc::statvfs(target.as_ptr(), &mut st) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let keep = st.f_flag & (libc::ST_NOSUID | libc::ST_NODEV | libc::ST_NOEXEC);
-        sys::remount(&target, (libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY) as libc::c_ulong | keep)?;
+        remount_ro_recursive(&target, sys::MOUNT_ATTR_RDONLY, libc::MS_RDONLY)?;
     }
     for p in masked {
         let null = null.ok_or_else(|| io::Error::other("no /dev/null to mask with"))?;
@@ -4856,5 +4977,88 @@ mod tests {
             assert_eq!(libc::kill(pid, 0), -1);
             assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
         }
+    }
+
+    #[test]
+    fn capset_data_and_dynamic_last_cap_drop_unwanted_capabilities() {
+        use super::{CapData, compute_cap_data, default_caps, parse_cap_last_cap};
+
+        assert_eq!(parse_cap_last_cap("40\n"), Some(40));
+        assert_eq!(parse_cap_last_cap("45\n"), Some(45));
+        assert_eq!(parse_cap_last_cap("bad"), None);
+        assert_eq!(parse_cap_last_cap("9999"), None);
+
+        let full = [
+            CapData { effective: u32::MAX, permitted: u32::MAX, inheritable: u32::MAX },
+            CapData { effective: 0x1ff, permitted: 0x1ff, inheritable: 0x1ff },
+        ];
+        // --cap-drop ALL as uid 0 (encoded with high sentinel bit 63) clears all effective/permitted/inheritable caps.
+        let dropped = compute_cap_data(full, 0, false, 1u64 << 63);
+        assert_eq!(dropped, [CapData::default(); 2]);
+
+        // Default caps as uid 0 keep only those bits in effective and permitted, with inheritable cleared.
+        let def = default_caps();
+        let kept = compute_cap_data(full, 0, false, def);
+        assert_eq!(kept[0], CapData { effective: def as u32, permitted: def as u32, inheritable: 0 });
+        assert_eq!(kept[1], CapData { effective: (def >> 32) as u32, permitted: (def >> 32) as u32, inheritable: 0 });
+
+        // Non-root user clears all capabilities even when privileged or caps set.
+        assert_eq!(compute_cap_data(full, 1000, true, u64::MAX), [CapData::default(); 2]);
+        assert_eq!(compute_cap_data(full, 1000, false, def), [CapData::default(); 2]);
+
+        // Privileged uid 0 retains only capabilities already held in current permitted set.
+        let priv_caps = compute_cap_data(full, 0, true, 0);
+        assert_eq!(priv_caps[0], CapData { effective: u32::MAX, permitted: u32::MAX, inheritable: 0 });
+        assert_eq!(priv_caps[1], CapData { effective: 0x1ff, permitted: 0x1ff, inheritable: 0 });
+    }
+
+    #[test]
+    fn exec_strips_cap_mknod_when_device_filter_unavailable() {
+        use super::{default_caps, effective_exec_caps};
+        use crate::linux::devices;
+
+        let def = default_caps();
+        assert_ne!(def & (1 << devices::CAP_MKNOD), 0);
+        // Unfiltered non-privileged container drops CAP_MKNOD in exec.
+        let stripped = effective_exec_caps(def, false, false);
+        assert_eq!(stripped & (1 << devices::CAP_MKNOD), 0);
+        assert_eq!(stripped, def & !(1 << devices::CAP_MKNOD));
+        // Filtered or privileged containers keep CAP_MKNOD.
+        assert_eq!(effective_exec_caps(def, false, true), def);
+        assert_eq!(effective_exec_caps(def, true, false), def);
+    }
+
+    #[test]
+    fn submounts_under_covers_nested_readonly_paths() {
+        use std::path::{Path, PathBuf};
+
+        let mi = "\
+25 1 0:30 / /proc rw,nosuid,nodev,noexec - proc proc rw
+26 25 0:31 / /proc/bus rw,nosuid,nodev,noexec - proc proc rw
+27 26 0:32 / /proc/bus/usb rw,relatime - tmpfs tmpfs rw
+28 25 0:33 / /proc/bus2 rw,relatime - tmpfs tmpfs rw
+";
+        let subs: Vec<PathBuf> = super::submounts_under(mi, Path::new("/proc/bus")).into_iter().map(|e| e.mount_point).collect();
+        assert_eq!(subs, vec![PathBuf::from("/proc/bus"), PathBuf::from("/proc/bus/usb")]);
+    }
+
+    #[test]
+    fn bind_source_and_tmpfs_option_validation_blocks_escapes() {
+        use super::{valid_bind_source, valid_tmpfs_opt};
+
+        assert!(valid_tmpfs_opt("size=64m"));
+        assert!(valid_tmpfs_opt("mode=1777"));
+        assert!(!valid_tmpfs_opt("size="));
+        assert!(!valid_tmpfs_opt("lowerdir=/mnt/mac"));
+        assert!(!valid_tmpfs_opt("nosuid"));
+
+        assert!(valid_bind_source("/mnt/mac/Users/alice/app", false));
+        assert!(valid_bind_source("/var/lib/kiri/volumes/v/_data", false));
+        assert!(!valid_bind_source("relative/path", true));
+        assert!(!valid_bind_source("/mnt/mac/Users/..", false));
+        for ancestor in ["/", "/.", "///", "/mnt", "/mnt/", "/mnt/.", "//mnt", "/mnt//mac", "/mnt/./mac", "/mnt/mac", "/mnt/mac/."] {
+            assert!(!valid_bind_source(ancestor, false), "{ancestor:?}");
+        }
+        assert!(valid_bind_source("/srv/app", true));
     }
 }

@@ -4,7 +4,7 @@
 //! one thread per connection and never parses more than it needs.
 
 use std::cell::Cell;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, IoSlice, Read, Write};
 use std::os::unix::net::UnixStream;
 
 /// API version this daemon speaks. The Docker CLI negotiates down to it.
@@ -152,13 +152,60 @@ pub const HEADER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3
 /// `SO_RCVTIMEO` applies to the underlying kernel socket on both Linux and
 /// macOS, so clearing it here clears it for cloned handles (`w`,
 /// `forward_stdin`, USB passthrough) as well.
+/// Bounds the total elapsed time across all `read`/`fill_buf` syscalls on a
+/// `BufReader<UnixStream>` so a Slowloris peer trickling 1 byte per read
+/// cannot keep extending `SO_RCVTIMEO` indefinitely.
+struct DeadlineBuf<'a> {
+    inner: &'a mut BufReader<UnixStream>,
+    deadline: Option<std::time::Instant>,
+}
+
+impl DeadlineBuf<'_> {
+    fn apply_remaining(&self) -> io::Result<()> {
+        let Some(dl) = self.deadline else { return Ok(()) };
+        let Some(rem) = dl.checked_duration_since(std::time::Instant::now()).filter(|d| !d.is_zero()) else {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "request header deadline exceeded"));
+        };
+        self.inner.get_ref().set_read_timeout(Some(rem))
+    }
+}
+
+impl Read for DeadlineBuf<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.inner.buffer().is_empty() {
+            self.apply_remaining()?;
+        }
+        self.inner.read(buf)
+    }
+}
+
+impl BufRead for DeadlineBuf<'_> {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        if self.inner.buffer().is_empty() {
+            self.apply_remaining()?;
+        }
+        self.inner.fill_buf()
+    }
+
+    fn consume(&mut self, amt: usize) {
+        self.inner.consume(amt);
+    }
+}
+
 pub fn read_request_with_timeout(
     r: &mut BufReader<UnixStream>,
     timeout: std::time::Duration,
     stream: impl Fn(&str, &str) -> bool,
 ) -> io::Result<Option<Request>> {
-    r.get_ref().set_read_timeout(Some(timeout))?;
-    let res = read_request(r, stream);
+    let deadline = std::time::Instant::now() + timeout;
+    // When the buffer is empty (the common non-pipelined case), DeadlineBuf
+    // sets SO_RCVTIMEO to the remaining deadline before the first socket read,
+    // avoiding a redundant setsockopt syscall. When pipelined bytes are already
+    // buffered, set the timeout upfront in case the body still needs a socket read.
+    if !r.buffer().is_empty() {
+        r.get_ref().set_read_timeout(Some(timeout))?;
+    }
+    let res = read_request_deadline(r, Some(deadline), stream);
     if matches!(res, Ok(Some(_))) {
         r.get_ref().set_read_timeout(None)?;
     }
@@ -169,13 +216,22 @@ pub fn read_request_with_timeout(
 /// When `stream(method, path)` is true the body stays unread: the handler
 /// reads it through [`Body`].
 pub fn read_request(r: &mut BufReader<UnixStream>, stream: impl Fn(&str, &str) -> bool) -> io::Result<Option<Request>> {
+    read_request_deadline(r, None, stream)
+}
+
+fn read_request_deadline(
+    r: &mut BufReader<UnixStream>,
+    deadline: Option<std::time::Instant>,
+    stream: impl Fn(&str, &str) -> bool,
+) -> io::Result<Option<Request>> {
     SERVING.with(|s| *s.borrow_mut() = (String::new(), String::new()));
     CLOSING.with(|c| c.set(false));
     PENDING_CONTINUE.with(|c| c.set(false));
-    // The request line and headers are read through a cap, so a client
-    // cannot exhaust memory with an endless line. The body is read after.
+    // The request line and headers are read through a cap and an absolute
+    // deadline, so a client cannot exhaust memory or pin a worker with an
+    // endless or trickled header. The body is read after.
     let (method, path, api_version, query, headers, http10) = {
-        let mut head = (&mut *r).take(MAX_HEAD);
+        let mut head = DeadlineBuf { inner: r, deadline }.take(MAX_HEAD);
         let mut line = String::new();
         if head.read_line(&mut line)? == 0 {
             return Ok(None);
@@ -805,35 +861,108 @@ pub fn current_serving() -> (String, String) {
     SERVING.with(|s| s.borrow().clone())
 }
 
-fn head(w: &mut impl Write, status: u16, extra: &str) -> io::Result<()> {
+fn write_all_vectored(w: &mut impl Write, slices: &[&[u8]]) -> io::Result<()> {
+    let mut idx = 0;
+    let mut off = 0;
+    let mut io_bufs = [IoSlice::new(&[]); 4];
+    while idx < slices.len() {
+        let mut count = 0;
+        for (i, &s) in slices[idx..].iter().enumerate() {
+            let chunk = if i == 0 { &s[off..] } else { s };
+            if !chunk.is_empty() {
+                io_bufs[count] = IoSlice::new(chunk);
+                count += 1;
+            }
+        }
+        if count == 0 {
+            return Ok(());
+        }
+        match w.write_vectored(&io_bufs[..count]) {
+            Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero, "failed to write whole vectored buffer")),
+            Ok(mut n) => {
+                while n > 0 && idx < slices.len() {
+                    let rem = slices[idx].len() - off;
+                    if n >= rem {
+                        n -= rem;
+                        idx += 1;
+                        off = 0;
+                    } else {
+                        off += n;
+                        n = 0;
+                    }
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+fn format_head(buf: &mut Vec<u8>, status: u16, extra: &str) {
     if status >= 400 {
         note_failure(status);
     }
     // A response that names its own Connection (an upgrade, `CLOSE`) keeps it.
     let closing = if (CLOSING.with(std::cell::Cell::get) || PENDING_CONTINUE.with(std::cell::Cell::get)) && !extra.contains("Connection:") { CLOSE } else { "" };
-    write!(
-        w,
+    let _ = write!(
+        buf,
         "HTTP/1.1 {status} {}\r\nApi-Version: {API_VERSION}\r\nDocker-Experimental: false\r\nOstype: linux\r\nServer: Kiri/{} (linux)\r\n{extra}{closing}\r\n",
         reason(status),
         env!("CARGO_PKG_VERSION")
-    )
+    );
+}
+
+fn head(w: &mut impl Write, status: u16, extra: &str) -> io::Result<()> {
+    let mut buf = Vec::with_capacity(160 + extra.len());
+    format_head(&mut buf, status, extra);
+    w.write_all(&buf)
 }
 
 pub fn respond(w: &mut impl Write, status: u16, content_type: &str, body: &[u8]) -> io::Result<()> {
-    let extra = if status == 204 || status == 304 {
-        String::new()
+    let mut hdr = Vec::with_capacity(224);
+    if status == 204 || status == 304 {
+        format_head(&mut hdr, status, "");
     } else {
-        format!("Content-Type: {content_type}\r\nContent-Length: {}\r\n", body.len())
-    };
-    head(w, status, &extra)?;
-    w.write_all(body)?;
+        if status >= 400 {
+            note_failure(status);
+        }
+        let closing = if CLOSING.with(std::cell::Cell::get) || PENDING_CONTINUE.with(std::cell::Cell::get) { CLOSE } else { "" };
+        let _ = write!(
+            hdr,
+            "HTTP/1.1 {status} {}\r\nApi-Version: {API_VERSION}\r\nDocker-Experimental: false\r\nOstype: linux\r\nServer: Kiri/{} (linux)\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n{closing}\r\n",
+            reason(status),
+            env!("CARGO_PKG_VERSION"),
+            body.len(),
+        );
+    }
+    if body.is_empty() {
+        w.write_all(&hdr)?;
+    } else {
+        write_all_vectored(w, &[&hdr, body])?;
+    }
     w.flush()
 }
 
 /// `respond` plus extra header lines, each ending in CRLF.
 pub fn respond_with(w: &mut impl Write, status: u16, content_type: &str, extra: &str, body: &[u8]) -> io::Result<()> {
-    head(w, status, &format!("Content-Type: {content_type}\r\nContent-Length: {}\r\n{extra}", body.len()))?;
-    w.write_all(body)?;
+    if status >= 400 {
+        note_failure(status);
+    }
+    let closing = if (CLOSING.with(std::cell::Cell::get) || PENDING_CONTINUE.with(std::cell::Cell::get)) && !extra.contains("Connection:") { CLOSE } else { "" };
+    let mut hdr = Vec::with_capacity(224 + extra.len());
+    let _ = write!(
+        hdr,
+        "HTTP/1.1 {status} {}\r\nApi-Version: {API_VERSION}\r\nDocker-Experimental: false\r\nOstype: linux\r\nServer: Kiri/{} (linux)\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n{extra}{closing}\r\n",
+        reason(status),
+        env!("CARGO_PKG_VERSION"),
+        body.len(),
+    );
+    if body.is_empty() {
+        w.write_all(&hdr)?;
+    } else {
+        write_all_vectored(w, &[&hdr, body])?;
+    }
     w.flush()
 }
 
@@ -884,9 +1013,13 @@ pub fn chunk(w: &mut impl Write, data: &[u8]) -> io::Result<()> {
     if data.is_empty() {
         return Ok(());
     }
-    write!(w, "{:x}\r\n", data.len())?;
-    w.write_all(data)?;
-    w.write_all(b"\r\n")?;
+    let mut len_buf = [0u8; 20];
+    let n = {
+        let mut cur = io::Cursor::new(&mut len_buf[..]);
+        let _ = write!(cur, "{:x}\r\n", data.len());
+        cur.position() as usize
+    };
+    write_all_vectored(w, &[&len_buf[..n], data, b"\r\n"])?;
     w.flush()
 }
 
@@ -929,8 +1062,7 @@ pub fn mux_frame(w: &mut impl Write, stream: u8, data: &[u8]) -> io::Result<()> 
     let mut header = [0u8; 8];
     header[0] = stream;
     header[4..].copy_from_slice(&(data.len() as u32).to_be_bytes());
-    w.write_all(&header)?;
-    w.write_all(data)?;
+    write_all_vectored(w, &[&header, data])?;
     w.flush()
 }
 
@@ -1640,5 +1772,21 @@ mod tests {
         let req = read_request_with_timeout(&mut r, header_timeout, |_, _| false).unwrap().unwrap();
         assert_eq!(req.path, "/_ping");
         assert_eq!(r.get_ref().read_timeout().unwrap(), None);
+
+        // 5. Slowloris: trickling 1 byte at a time must still hit the total header deadline.
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let mut r = BufReader::new(server);
+        let trickle = std::thread::spawn(move || {
+            let payload = b"GET /_ping HTTP/1.1\r\nHost: d\r\nX-Slow: 1\r\n\r\n";
+            for &b in payload {
+                if client.write_all(&[b]).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        });
+        let err = read_request_with_timeout(&mut r, Duration::from_millis(120), |_, _| false).unwrap_err();
+        assert!(matches!(err.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut), "expected absolute header deadline, got {err:?}");
+        let _ = trickle.join();
     }
 }

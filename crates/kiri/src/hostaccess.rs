@@ -85,6 +85,62 @@ fn add_member_with(user: &str, group: &str, usermod: Option<&Path>, gpasswd: Opt
     Err(io::Error::other(usermod_err.unwrap_or_else(|| "neither usermod nor gpasswd found in system directories".into())))
 }
 
+fn uid_account_name(uid: u32) -> io::Result<Option<String>> {
+    use std::ffi::CStr;
+    let mut cap = 4096usize;
+    loop {
+        let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut buf = vec![0u8; cap];
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        // SAFETY: `getpwuid_r` writes into `pwd` and `buf` (of length `cap`),
+        // setting `result` to `&mut pwd` on match or NULL if not found.
+        let rc = unsafe { libc::getpwuid_r(uid as libc::uid_t, &mut pwd, buf.as_mut_ptr().cast(), buf.len(), &mut result) };
+        if rc == libc::ERANGE && cap < 65536 {
+            cap *= 2;
+            continue;
+        }
+        if rc != 0 {
+            return Err(io::Error::from_raw_os_error(rc));
+        }
+        if result.is_null() || pwd.pw_name.is_null() {
+            return Ok(None);
+        }
+        // SAFETY: `pw_name` points to a NUL-terminated string inside `buf`.
+        let name = unsafe { CStr::from_ptr(pwd.pw_name) }.to_string_lossy().into_owned();
+        return Ok(Some(name));
+    }
+}
+
+/// When invoked via Polkit (`PKEXEC_UID` present), requires the resolved target
+/// account to match the invoking Polkit user so a cached `pkexec` grant cannot
+/// add an arbitrary local account to the root-equivalent `kiri` group.
+fn verify_pkexec_caller(
+    pkexec_uid: Option<&str>,
+    target_account: &str,
+    resolve_uid: impl Fn(u32) -> io::Result<Option<String>>,
+) -> io::Result<()> {
+    let Some(raw_uid) = pkexec_uid else {
+        return Ok(());
+    };
+    let uid: u32 = raw_uid
+        .trim()
+        .parse()
+        .map_err(|_| io::Error::new(io::ErrorKind::PermissionDenied, "invalid PKEXEC_UID"))?;
+    let Some(caller) = resolve_uid(uid)? else {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("no account for PKEXEC_UID {uid}"),
+        ));
+    };
+    if caller != target_account {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("pkexec caller (uid {uid}) cannot grant host access to {target_account}"),
+        ));
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_with(
     user: &str,
@@ -97,9 +153,39 @@ fn run_with(
     grant_acl: impl Fn(&str) -> io::Result<usize>,
     mut emit: impl FnMut(&str),
 ) -> io::Result<u8> {
+    run_with_pkexec(
+        user,
+        group,
+        None,
+        resolve_account,
+        |_| Ok(None),
+        list_members,
+        create_group,
+        add_member,
+        start_engine,
+        grant_acl,
+        &mut emit,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_with_pkexec(
+    user: &str,
+    group: &str,
+    pkexec_uid: Option<&str>,
+    resolve_account: impl Fn(&str) -> io::Result<Option<String>>,
+    resolve_uid: impl Fn(u32) -> io::Result<Option<String>>,
+    list_members: impl Fn(&str) -> io::Result<Vec<String>>,
+    create_group: impl Fn(&str) -> io::Result<()>,
+    add_member: impl Fn(&str, &str) -> io::Result<()>,
+    start_engine: impl Fn() -> io::Result<()>,
+    grant_acl: impl Fn(&str) -> io::Result<usize>,
+    emit: &mut impl FnMut(&str),
+) -> io::Result<u8> {
     let Some(account) = resolve_account(user)? else {
         return Err(io::Error::other(format!("no account named {user}")));
     };
+    verify_pkexec_caller(pkexec_uid, &account, resolve_uid)?;
     match list_members(group) {
         Ok(_) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => create_group(group)?,
@@ -148,10 +234,14 @@ pub fn run(args: &[String]) -> io::Result<u8> {
     if unsafe { libc::geteuid() } != 0 {
         return Err(io::Error::other(format!("needs root: sudo kiri host-access {}{user}", if restart { "--restart " } else { "" })));
     }
-    run_with(
+    let pkexec_uid = std::env::var("PKEXEC_UID").ok();
+    let mut emit = |line: &str| println!("{line}");
+    run_with_pkexec(
         user,
         GROUP,
+        pkexec_uid.as_deref(),
         crate::daemon::access::account_name,
+        uid_account_name,
         crate::daemon::access::members,
         |group| {
             let groupadd = find_tool("groupadd").ok_or_else(|| io::Error::other("groupadd not found in system directories"))?;
@@ -160,7 +250,7 @@ pub fn run(args: &[String]) -> io::Result<u8> {
         |member, group| add_member_with(member, group, find_tool("usermod").as_deref(), find_tool("gpasswd").as_deref()),
         || engine(restart),
         |group| crate::daemon::access::grant(Path::new(SOCKET), group),
-        |line| println!("{line}"),
+        &mut emit,
     )
 }
 
@@ -357,5 +447,32 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("KCanon349") && !err.contains("kcanon349@corp.example"), "got: {err}");
+    }
+
+    #[test]
+    fn pkexec_caller_cannot_grant_access_to_different_account() {
+        let mut emit = |_: &str| {};
+        let err = run_with_pkexec(
+            "bob",
+            "kiri",
+            Some("1000"),
+            |u| Ok(Some(u.to_owned())),
+            |uid| Ok((uid == 1000).then(|| "alice".to_owned())),
+            |_| panic!("must reject before querying group"),
+            |_| panic!("must reject before creating group"),
+            |_, _| panic!("must reject before adding member"),
+            || panic!("must reject before starting engine"),
+            |_| panic!("must reject before granting ACL"),
+            &mut emit,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+
+        // Non-numeric PKEXEC_UID is also refused.
+        let err = verify_pkexec_caller(Some("not-a-uid"), "alice", |_| Ok(Some("alice".into()))).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+
+        // Matching PKEXEC_UID succeeds.
+        verify_pkexec_caller(Some("1000"), "alice", |uid| Ok((uid == 1000).then(|| "alice".into()))).unwrap();
     }
 }

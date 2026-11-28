@@ -47,6 +47,12 @@ mod daemon {
 }
 #[cfg(unix)]
 mod diag;
+#[cfg(windows)]
+mod diag {
+    #[path = "diag/redact.rs"]
+    #[allow(dead_code)]
+    pub mod redact;
+}
 #[cfg(any(unix, windows))]
 mod docker;
 #[cfg(any(target_os = "macos", all(target_os = "linux", feature = "window"), windows, test))]

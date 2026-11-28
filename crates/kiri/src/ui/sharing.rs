@@ -115,6 +115,10 @@ pub fn open(target: String, name: String) {
     start(source.clone(), name, move || resolve(&source).map(|t| (t, None)));
 }
 
+fn escape_segment(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-._~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
+}
+
 /// A port, `host:port` or a container name, the container looked up
 /// through this window's client of the engine.
 fn resolve(arg: &str) -> std::io::Result<share::Target> {
@@ -122,7 +126,7 @@ fn resolve(arg: &str) -> std::io::Result<share::Target> {
         if !crate::client::alive() {
             return Err(std::io::Error::other(format!("`{name}` isn't a port, and Kiri isn't running to look up a container by that name")));
         }
-        let r = crate::client::request("GET", &format!("/containers/{name}/json"), None)?;
+        let r = crate::client::request("GET", &format!("/containers/{}/json", escape_segment(name)), None)?;
         if r.status == 404 {
             return Ok(None);
         }

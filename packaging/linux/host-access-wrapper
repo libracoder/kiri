@@ -1,0 +1,6 @@
+#!/bin/sh
+# Minimal Polkit-authorized helper for `kiri host-access`.
+# Polkit matches org.freedesktop.policykit.exec.path strictly by binary path,
+# so pointing the policy here prevents `pkexec` from running any other `kiri`
+# subcommand as root.
+exec /usr/bin/kiri host-access "$@"

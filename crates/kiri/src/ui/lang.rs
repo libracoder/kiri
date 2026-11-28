@@ -81,17 +81,45 @@ fn words(tag: &str) -> Option<serde_json::Value> {
     Some(keys().iter().map(|k| m.get(*k).map_or(serde_json::Value::Null, |w| w.as_str().into())).collect())
 }
 
-/// The words a page opens with, as one JS object literal: `{"en": [every
-/// English key], "<tag>": [its words, in the keys' order]}`, for the language
-/// `lang` (a tag [`resolve`] gave; "en" sends the keys alone). The keys go in
-/// once, so a language added later ([`words_js`]) costs only its words.
-pub fn strings_js(lang: &str) -> String {
+/// Whether `pick` is a valid saved language setting: `"system"`, `"en"`, or one of [`FILES`].
+pub fn valid_pick(pick: &str) -> bool {
+    pick == "system" || pick == "en" || FILES.iter().any(|(tag, _)| *tag == pick)
+}
+
+/// Escapes JSON for safe splicing into an inline `<script>` tag: prevents
+/// `</script>` breakout (`<`/`>`) and JS line-separator syntax errors.
+/// Output remains valid RFC 8259 JSON.
+fn safe_inline_json(json: String) -> String {
+    json.replace('<', "\\u003c")
+        .replace('>', "\\u003e")
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029")
+}
+
+/// Cached version of [`strings_js`] for each supported language tag plus `"en"`.
+/// Avoids rebuilding and re-escaping ~150 KB of JSON on repeated page assembly.
+pub fn strings_js_cached(lang: &str) -> &'static str {
+    static CACHE: [OnceLock<String>; FILES.len() + 1] = [const { OnceLock::new() }; FILES.len() + 1];
+    let idx = FILES.iter().position(|(tag, _)| *tag == lang).unwrap_or(FILES.len());
+    let slot_lang = if idx < FILES.len() { FILES[idx].0 } else { "en" };
+    CACHE[idx].get_or_init(|| build_strings_js(slot_lang)).as_str()
+}
+
+fn build_strings_js(lang: &str) -> String {
     let mut out = serde_json::Map::new();
     out.insert("en".into(), keys().iter().map(|k| serde_json::Value::from(*k)).collect());
     if let Some(w) = words(lang) {
         out.insert(lang.into(), w);
     }
-    serde_json::Value::Object(out).to_string()
+    safe_inline_json(serde_json::Value::Object(out).to_string())
+}
+
+/// The words a page opens with, as one JS object literal: `{"en": [every
+/// English key], "<tag>": [its words, in the keys' order]}`, for the language
+/// `lang` (a tag [`resolve`] gave; "en" sends the keys alone). The keys go in
+/// once, so a language added later ([`words_js`]) costs only its words.
+pub fn strings_js(lang: &str) -> String {
+    strings_js_cached(lang).to_owned()
 }
 
 /// The host's answer to a page's `langwords`: JS that hands the page `tag`'s
@@ -167,8 +195,14 @@ pub fn should_ask(fresh: bool, prefs: &serde_json::Value, os: &[String]) -> bool
 /// Before the page's script: the system's languages and the saved pick, so
 /// the first paint is already in the right language.
 pub fn boot_js(pick: Option<&str>) -> String {
-    let v = serde_json::json!({ "os": os_languages(), "pick": pick.unwrap_or("system") });
-    format!("window.KIRI_LANG = {v};")
+    let os: Vec<String> = os_languages()
+        .into_iter()
+        .map(|s| s.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_')).collect::<String>())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let pick = pick.filter(|p| valid_pick(p)).unwrap_or("system");
+    let v = serde_json::json!({ "os": os, "pick": pick });
+    format!("window.KIRI_LANG = {};", safe_inline_json(v.to_string()))
 }
 
 /// Whether the language `tag` (one of [`FILES`]' or "en") is written right to left.
@@ -177,8 +211,21 @@ pub fn rtl(tag: &str) -> bool {
 }
 
 /// A letter of a right-to-left script (Hebrew, Arabic and their presentation forms).
+#[inline]
 fn rtl_letter(c: char) -> bool {
     matches!(c, '\u{0590}'..='\u{08FF}' | '\u{FB1D}'..='\u{FDFF}' | '\u{FE70}'..='\u{FEFC}')
+}
+
+/// Fast byte-level prefilter before scanning UTF-8 chars for [`rtl_letter`]:
+/// every RTL codepoint (`U+0590..=U+08FF`, `U+FB1D..=U+FDFF`, `U+FE70..=U+FEFC`)
+/// begins with UTF-8 lead byte `0xD6..=0xDF`, `0xE0`, or `0xEF`.
+#[inline]
+fn has_rtl_letter(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    if !bytes.iter().any(|&b| (0xD6..=0xE0).contains(&b) || b == 0xEF) {
+        return false;
+    }
+    s.chars().any(rtl_letter)
 }
 
 /// Right-to-left words that open with a Latin name ("docker يستخدم Kiri")
@@ -188,7 +235,7 @@ fn rtl_letter(c: char) -> bool {
 /// `{placeholder}` doesn't count as a first letter: [`fill`] makes it an
 /// island of its own. The page's rtlReady does the same for its words.
 fn rtl_ready(s: String) -> String {
-    if !s.chars().any(rtl_letter) {
+    if !has_rtl_letter(&s) {
         return s;
     }
     let mut hole = false;
@@ -206,10 +253,30 @@ fn rtl_ready(s: String) -> String {
     }
 }
 
+/// Per-language lookup table for [`tr`], lazily parsed on first use and with
+/// [`rtl_ready`] pre-applied once for RTL languages.
+fn tr_map(lang: &str) -> Option<&'static HashMap<String, String>> {
+    static TR_MAPS: [OnceLock<HashMap<String, String>>; FILES.len()] = [const { OnceLock::new() }; FILES.len()];
+    let idx = FILES.iter().position(|(tag, _)| *tag == lang)?;
+    Some(TR_MAPS[idx].get_or_init(|| {
+        let (tag, json) = FILES[idx];
+        let mut m: HashMap<String, String> = serde_json::from_str(json).unwrap_or_default();
+        if rtl(tag) {
+            for v in m.values_mut() {
+                let ready = rtl_ready(std::mem::take(v));
+                *v = ready;
+            }
+        }
+        m
+    }))
+}
+
 /// `en` in `lang`, for words drawn natively; English when there's no translation.
 pub fn tr(lang: &str, en: &str) -> String {
-    match maps().get(lang).and_then(|m| m.get(en)) {
-        Some(w) if rtl(lang) => rtl_ready(w.clone()),
+    if lang == "en" {
+        return en.to_owned();
+    }
+    match tr_map(lang).and_then(|m| m.get(en)) {
         Some(w) => w.clone(),
         None => en.to_owned(),
     }
@@ -221,22 +288,35 @@ pub fn tr(lang: &str, en: &str) -> String {
 /// first-strong isolate), so "5.0 GB" or "postgres (localhost:5432)" keeps its
 /// own order inside the Arabic around it; a bare number needs none.
 pub fn fill(s: String, vars: &[(&str, &dyn std::fmt::Display)]) -> String {
-    let islands = s.chars().any(rtl_letter);
-    let mut out = String::with_capacity(s.len());
-    let mut rest = s.as_str();
+    use std::fmt::Write as _;
+    let Some(first_open) = s.find('{') else {
+        return s;
+    };
+    let islands = has_rtl_letter(&s);
+    let mut out = String::with_capacity(s.len() + 32);
+    out.push_str(&s[..first_open]);
+    let mut rest = &s[first_open..];
     while let Some(open) = rest.find('{') {
         out.push_str(&rest[..open]);
         let after = &rest[open + 1..];
-        let name = after.find('}').map(|close| &after[..close]).filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'));
+        let name = after
+            .find('}')
+            .map(|close| &after[..close])
+            .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'));
         match name.and_then(|n| vars.iter().find(|(k, _)| *k == n)) {
             Some((k, v)) => {
-                let v = v.to_string();
-                if islands && !v.chars().all(|c| c.is_ascii_digit() || matches!(c, '.' | ',' | ' ')) {
+                if islands {
+                    let iso_start = out.len();
                     out.push('\u{2068}');
-                    out.push_str(&v);
-                    out.push('\u{2069}');
+                    let val_start = out.len();
+                    let _ = write!(out, "{v}");
+                    if out.as_bytes()[val_start..].iter().all(|&b| b.is_ascii_digit() || matches!(b, b'.' | b',' | b' ')) {
+                        out.drain(iso_start..val_start);
+                    } else {
+                        out.push('\u{2069}');
+                    }
                 } else {
-                    out.push_str(&v);
+                    let _ = write!(out, "{v}");
                 }
                 rest = &after[k.len() + 1..];
             }
@@ -525,5 +605,26 @@ mod tests {
         assert_eq!(fill("تم بدء {name} على {ports}".into(), &[("name", &"web"), ("ports", &8080)]), "تم بدء \u{2068}web\u{2069} على 8080");
         assert_eq!(fill("من {cap}".into(), &[("cap", &"5.0 GB")]), "من \u{2068}5.0 GB\u{2069}");
         assert_eq!(fill("Started {name}".into(), &[("name", &"web")]), "Started web");
+    }
+
+    #[test]
+    fn boot_js_validates_pick_and_escapes_script_tags() {
+        assert!(valid_pick("system"));
+        assert!(valid_pick("en"));
+        assert!(valid_pick("pt-BR"));
+        assert!(!valid_pick("</script><script>alert(1)</script>"));
+        assert!(!valid_pick("klingon"));
+
+        let js = boot_js(Some("</script><script>alert(1)</script>"));
+        assert!(!js.contains("</script>"), "boot_js must not contain closing script tag: {js}");
+        assert!(!js.contains('<') && !js.contains('>'), "boot_js must not contain raw angle brackets: {js}");
+        let body = js.strip_prefix("window.KIRI_LANG = ").and_then(|s| s.strip_suffix(';')).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(parsed["pick"], "system");
+
+        let escaped = safe_inline_json("{\"x\":\"</script>\u{2028}\u{2029}\"}".into());
+        assert!(!escaped.contains('<') && !escaped.contains('>') && !escaped.contains('\u{2028}') && !escaped.contains('\u{2029}'));
+        let reparsed: serde_json::Value = serde_json::from_str(&escaped).unwrap();
+        assert_eq!(reparsed["x"], "</script>\u{2028}\u{2029}");
     }
 }

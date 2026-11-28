@@ -348,7 +348,7 @@
  	}
  
  	return err;
-@@ -2015,44 +2072,54 @@
+@@ -2015,39 +2072,50 @@
   * and the actual truncation by hand.
   */
  static int fuse_caller_setattr_check(struct mnt_idmap *idmap,
@@ -393,21 +393,14 @@
  		return -EPERM;
  
  	if (ia_valid & ATTR_MODE) {
- 		vfsgid_t vfsgid = (ia_valid & ATTR_GID) ?
--			attr->ia_vfsgid : caller_gid;
-+			attr->ia_vfsgid : owner_gid;
- 
 -		if (!vfsuid_eq_kuid(caller_uid, current_fsuid()) &&
 -		    !fuse_caller_capable(fc, CAP_FOWNER))
 +		if (!is_owner && !fuse_caller_capable(fc, CAP_FOWNER))
  			return -EPERM;
  
--		if (!vfsgid_eq(vfsgid, caller_gid) &&
--		    !vfsgid_in_group_p(vfsgid) &&
-+		if (!vfsgid_in_group_p(vfsgid) &&
- 		    !(vfsgid_has_mapping(fc->user_ns, vfsgid) &&
- 		      fuse_caller_capable(fc, CAP_FSETID)))
- 			attr->ia_mode &= ~S_ISGID;
+ 		/* Synthetic caller_owner semantics cannot safely support
+ 		 * POSIX setuid/setgid execution on host-backed files. */
+ 		attr->ia_mode &= ~(S_ISUID | S_ISGID);
  	}
  
  	if ((ia_valid & (ATTR_MTIME_SET | ATTR_ATIME_SET | ATTR_TIMES_SET)) &&
@@ -417,7 +410,7 @@
  		return -EPERM;
  
  	attr->ia_valid |= ATTR_FORCE;
-@@ -2072,6 +2139,9 @@
+@@ -2067,6 +2135,9 @@
  	struct fuse_attr_out outarg;
  	bool is_truncate = false;
  	bool is_wb = fc->writeback_cache && S_ISREG(inode->i_mode);
@@ -427,7 +420,7 @@
  	loff_t oldsize;
  	int err;
  	bool trust_local_cmtime = is_wb;
-@@ -2081,7 +2151,7 @@
+@@ -2076,7 +2147,7 @@
  	if (!fc->default_permissions)
  		attr->ia_valid |= ATTR_FORCE;
  	else if (fc->caller_owner && !(attr->ia_valid & ATTR_FORCE)) {
@@ -436,7 +429,7 @@
  		if (err)
  			return err;
  	}
-@@ -2090,6 +2160,25 @@
+@@ -2085,6 +2156,25 @@
  	if (err)
  		return err;
  
@@ -462,7 +455,7 @@
  	if (attr->ia_valid & ATTR_SIZE) {
  		if (WARN_ON(!S_ISREG(inode->i_mode)))
  			return -EIO;
-@@ -2165,6 +2254,28 @@
+@@ -2160,6 +2250,28 @@
  			inarg.valid |= FATTR_KILL_SUIDGID;
  	}
  
@@ -491,7 +484,7 @@
  	attr_version = fuse_get_attr_version(fm->fc);
  	fuse_setattr_fill(fc, &args, inode, &inarg, &outarg);
  	err = fuse_simple_request(fm, &args);
-@@ -2182,6 +2293,18 @@
+@@ -2177,6 +2289,18 @@
  	}
  
  	spin_lock(&fi->lock);

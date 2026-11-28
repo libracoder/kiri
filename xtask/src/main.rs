@@ -222,7 +222,7 @@ fn guest(root: &Path, arch: Arch) -> io::Result<()> {
     run(Command::new(env!("CARGO"))
         .current_dir(root)
         .env("CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER", "rust-lld")
-        .args(["build", "--release", "-p", "kiri-init", "--target", target]))?;
+        .args(["build", "--release", "--locked", "-p", "kiri-init", "--target", target]))?;
     let init = fs::read(root.join("target").join(target).join("release/kiri-init"))?;
 
     // Uncompressed on purpose: it is small, and the kernel skips decompression.
@@ -262,7 +262,7 @@ fn kernel(root: &Path, arch: Arch) -> io::Result<()> {
         &format!("{}:/src:ro", src.display()),
         "-v",
         &format!("{}:/out", out.display()),
-        "debian:trixie",
+        "debian:trixie@sha256:3cda3ca472ce45507a5109c6a3907093e24d9ae67d55954c9a07a45665dafba2",
         "sh",
         "/src/build.sh",
     ]))
@@ -279,7 +279,7 @@ fn disk(root: &Path) -> io::Result<()> {
         "--rm",
         "-v",
         &format!("{}:/out", out.display()),
-        "debian:trixie",
+        "debian:trixie@sha256:3cda3ca472ce45507a5109c6a3907093e24d9ae67d55954c9a07a45665dafba2",
         "sh",
         "-c",
         "set -e; apt-get update -qq >/dev/null && apt-get install -y -qq e2fsprogs >/dev/null; \
@@ -293,7 +293,11 @@ fn disk(root: &Path) -> io::Result<()> {
 
 fn host(root: &Path, arch: Arch, profile: Profile) -> io::Result<()> {
     let mut build = Command::new(env!("CARGO"));
-    build.current_dir(root).arg("build").args(profile.cargo_args()).args(["-p", "kiri"]);
+    build.current_dir(root).arg("build").args(profile.cargo_args());
+    if profile == Profile::Release {
+        build.arg("--locked");
+    }
+    build.args(["-p", "kiri"]);
     if !arch.native() {
         build.args(["--target", arch.host_target()]);
     }
@@ -331,10 +335,14 @@ fn linux_build(root: &Path, amd64: bool, profile: Profile) -> io::Result<()> {
         // The repo's cross-linking setting is for the guest build from macOS.
         "-e",
         "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=cc",
-        "rust:1-alpine",
+        "rust:1-alpine@sha256:8d0e82abfdf9a38071e07cabc5afba4ddbe077631a80e4e742a760c38beadc33",
         "sh",
         "-c",
-        &format!("apk add -q musl-dev && cargo build --profile {} -p kiri -p kiri-init", profile.dir()),
+        &format!(
+            "apk add -q musl-dev && cargo build --profile {}{} -p kiri -p kiri-init",
+            profile.dir(),
+            if profile == Profile::Release { " --locked" } else { "" },
+        ),
     ]))?;
     for b in ["kiri", "kiri-init"] {
         let p = root.join("target").join(out).join(profile.dir()).join(b);
@@ -618,7 +626,7 @@ fn windows_exe(root: &Path, debug: bool, arch: WinArch, package: &str, manifest:
         build.env("KIRI_BUNDLE_SHA256", m);
     }
     if !debug {
-        build.arg("--release");
+        build.args(["--release", "--locked"]);
     }
     let mut dir = root.join("target");
     if cfg!(windows) {
@@ -711,7 +719,11 @@ fn fetch(cache: &Path, name: &str, url: &str) -> io::Result<PathBuf> {
         // Per process: two checkouts filling the shared cache at once each
         // write their own part, and the rename is atomic.
         let tmp = cache.join(format!("{name}.{}.part", std::process::id()));
-        run(Command::new("curl").args(["-fsSL", "--retry", "3", "-o"]).arg(&tmp).arg(url))?;
+        run(Command::new("curl")
+            .args(["-fsSL", "--proto", "=https", "--proto-redir", "=https", "--retry", "3", "-o"])
+            .arg(&tmp)
+            .arg("--")
+            .arg(url))?;
         fs::rename(&tmp, &path)?;
     }
     Ok(path)
@@ -915,7 +927,12 @@ fn app_dev(root: &Path, built: &Path, feature: Option<&str>) -> io::Result<()> {
     let identity = signing_identity();
     let entitlements = root.join("crates/kiri/kiri.entitlements");
     for target in [exe, app.clone()] {
-        run(Command::new("codesign").args(["--force", "--sign", &identity, "--entitlements"]).arg(&entitlements).arg(target))?;
+        let mut cmd = Command::new("codesign");
+        cmd.args(["--force", "--sign", &identity]);
+        if identity != "-" {
+            cmd.args(["--options", "runtime"]);
+        }
+        run(cmd.arg("--entitlements").arg(&entitlements).arg(target))?;
     }
     run(Command::new("codesign").args(["--verify", "--deep", "--strict"]).arg(&app))?;
     println!("{}: its own engine (~/.{state}, docker context {state}); open it from there or copy it to /Applications", app.display());
@@ -996,7 +1013,9 @@ fn dmg(root: &Path, app: &Path, arch: Arch, lite: bool) -> io::Result<PathBuf> {
     if !Command::new(&dmgbuild).arg("--help").stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().is_ok_and(|s| s.success()) {
         let _ = fs::remove_dir_all(&venv);
         run(Command::new("python3").args(["-m", "venv"]).arg(&venv))?;
-        run(Command::new(venv.join("bin/pip")).args(["install", "--quiet", "--disable-pip-version-check", &format!("dmgbuild=={DMGBUILD}")]))?;
+        run(Command::new(venv.join("bin/pip"))
+            .args(["install", "--quiet", "--disable-pip-version-check", "--only-binary", ":all:", "--require-hashes", "--no-deps", "-r"])
+            .arg(root.join("scripts/dmgbuild-requirements.txt")))?;
     }
     let bg = root.join("target/dmg-background");
     fs::create_dir_all(&bg)?;

@@ -26,6 +26,7 @@ import socket
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 
 IMAGE, TAG = "alpine", "3.21"
@@ -123,16 +124,17 @@ def summary(xs):
 def syscalls_per_run(e, runs):
     """System calls the daemon (every thread, and what it starts) makes for
     one container, from strace's count over `runs` of them."""
-    out = f"/tmp/kiri-strace-{e.pid}.txt"
-    st = subprocess.Popen(["strace", "-f", "-c", "-o", out, "-p", str(e.pid)], stderr=subprocess.DEVNULL)
-    time.sleep(1.0)
-    for _ in range(runs):
-        e.run_once()
-    time.sleep(0.5)
-    st.send_signal(signal.SIGINT)
-    st.wait(timeout=30)
-    with open(out) as f:
-        text = f.read()
+    with tempfile.TemporaryDirectory(prefix="kiri-strace-") as td:
+        out = os.path.join(td, f"strace-{e.pid}.txt")
+        st = subprocess.Popen(["strace", "-f", "-c", "-o", out, "-p", str(e.pid)], stderr=subprocess.DEVNULL)
+        time.sleep(1.0)
+        for _ in range(runs):
+            e.run_once()
+        time.sleep(0.5)
+        st.send_signal(signal.SIGINT)
+        st.wait(timeout=30)
+        with open(out) as f:
+            text = f.read()
     m = re.search(r"^\s*100\.00\s+\S+\s+\S+\s+(\d+)\s+(?:\d+\s+)?total\s*$", text, re.M)
     if not m:
         raise SystemExit(f"could not read strace's total:\n{text[-400:]}")

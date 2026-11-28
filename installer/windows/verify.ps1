@@ -3,9 +3,9 @@
 # and checks it is gone. Safe on a PC where Kiri's setup never completed:
 # the uninstall step only undoes setup when setup.json exists.
 #
-#   pwsh -File installer/windows/verify.ps1 [-Msi path]
+#   pwsh -File installer/windows/verify.ps1 [-Msi path] [-RequireSigned]
 
-param([string]$Msi)
+param([string]$Msi, [switch]$RequireSigned)
 $ErrorActionPreference = 'Continue'
 $root = Resolve-Path (Join-Path $PSScriptRoot '..\..')
 # This PC's own MSI: arm64 on Windows on Arm (native PowerShell says ARM64 there).
@@ -35,10 +35,18 @@ function ArpEntry {
 }
 
 $script:failed = $false
+if ($RequireSigned) {
+    $msiSig = Get-AuthenticodeSignature -LiteralPath $Msi
+    Check "MSI Authenticode signature ($($msiSig.Status))" ($msiSig.Status -eq 'Valid')
+}
 Get-Process kiri-win -ErrorAction SilentlyContinue | Stop-Process -Force
 $p = Start-Process msiexec -ArgumentList "/i `"$Msi`" /qn /norestart /l*v `"$logs\install.log`"" -Wait -PassThru
 Check "msiexec /i exit code $($p.ExitCode)" ($p.ExitCode -eq 0)
 foreach ($f in $files) { Check "installed $f" (Test-Path (Join-Path $dir $f)) }
+if ($RequireSigned -and (Test-Path $exe)) {
+    $exeSig = Get-AuthenticodeSignature -LiteralPath $exe
+    Check "kiri-win.exe Authenticode signature ($($exeSig.Status))" ($exeSig.Status -eq 'Valid')
+}
 Check "Start Menu shortcut" (Test-Path $shortcut)
 if (Test-Path $shortcut) {
     $sh = (New-Object -ComObject WScript.Shell).CreateShortcut($shortcut)

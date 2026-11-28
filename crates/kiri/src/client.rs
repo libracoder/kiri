@@ -261,11 +261,13 @@ impl Write for WinPipe {
     }
 }
 
-fn head(r: &mut impl BufRead) -> io::Result<(u16, Option<usize>, bool)> {
+fn head(r: &mut impl BufRead) -> io::Result<(u16, Option<usize>, bool, bool)> {
     let mut line = String::new();
-    r.read_line(&mut line)?;
+    if r.read_line(&mut line)? == 0 {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "eof reading status"));
+    }
     let status = line.split_whitespace().nth(1).and_then(|s| s.parse().ok()).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad status line"))?;
-    let (mut len, mut chunked) = (None, false);
+    let (mut len, mut chunked, mut close) = (None, false, false);
     loop {
         line.clear();
         if r.read_line(&mut line)? == 0 {
@@ -276,14 +278,16 @@ fn head(r: &mut impl BufRead) -> io::Result<(u16, Option<usize>, bool)> {
             break;
         }
         if let Some((k, v)) = l.split_once(':') {
-            match k.to_ascii_lowercase().as_str() {
-                "content-length" => len = v.trim().parse().ok(),
-                "transfer-encoding" => chunked = v.trim().eq_ignore_ascii_case("chunked"),
-                _ => {}
+            if k.eq_ignore_ascii_case("content-length") {
+                len = v.trim().parse().ok();
+            } else if k.eq_ignore_ascii_case("transfer-encoding") {
+                chunked = v.trim().eq_ignore_ascii_case("chunked");
+            } else if k.eq_ignore_ascii_case("connection") && v.to_ascii_lowercase().contains("close") {
+                close = true;
             }
         }
     }
-    Ok((status, len, chunked))
+    Ok((status, len, chunked, close))
 }
 
 /// Reads one chunk of a chunked body; `None` at the end.
@@ -317,17 +321,99 @@ pub fn get_background(path: &str) -> io::Result<Value> {
     Ok(r.json())
 }
 
+/// Validates an HTTP/1.1 request target before formatting a raw request line
+/// onto the daemon socket/pipe (rejects missing leading `/`, `..` traversal
+/// segments, whitespace, CRLF, and ASCII control characters).
+pub(crate) fn validate_request_path(path: &str) -> io::Result<()> {
+    if !path.starts_with('/') || path.bytes().any(|b| b <= 0x20 || b == 0x7f) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid HTTP request path"));
+    }
+    let path_only = path.split('?').next().unwrap_or(path);
+    if path_only.split('/').any(|seg| seg == "..") {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "HTTP request path must not contain traversal segments"));
+    }
+    Ok(())
+}
+
+fn validate_header_value(value: &str) -> io::Result<()> {
+    if value.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "header contains a line break"));
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn send(method: &str, path: &str, body: Option<&Value>, extra: &str) -> io::Result<Response> {
     send_to(&socket()?, method, path, body, extra)
 }
 
 #[cfg(unix)]
+struct PooledConn {
+    sock: PathBuf,
+    reader: BufReader<UnixStream>,
+    used_at: std::time::Instant,
+}
+
+#[cfg(unix)]
+static CONN_POOL: std::sync::Mutex<Vec<PooledConn>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(unix)]
+const CONN_POOL_MAX: usize = 4;
+
+#[cfg(unix)]
+const CONN_POOL_TTL: Duration = Duration::from_secs(30);
+
+#[cfg(unix)]
+fn take_pooled(sock: &Path) -> Option<BufReader<UnixStream>> {
+    let now = std::time::Instant::now();
+    let mut pool = CONN_POOL.lock().unwrap_or_else(|e| e.into_inner());
+    pool.retain(|c| now.duration_since(c.used_at) < CONN_POOL_TTL);
+    let idx = pool.iter().rposition(|c| c.sock == sock)?;
+    Some(pool.swap_remove(idx).reader)
+}
+
+#[cfg(unix)]
+fn return_pooled(sock: &Path, reader: BufReader<UnixStream>) {
+    if !reader.buffer().is_empty() {
+        return;
+    }
+    let mut pool = CONN_POOL.lock().unwrap_or_else(|e| e.into_inner());
+    if pool.len() >= CONN_POOL_MAX {
+        pool.remove(0);
+    }
+    pool.push(PooledConn { sock: sock.to_path_buf(), reader, used_at: std::time::Instant::now() });
+}
+
+#[cfg(unix)]
 fn send_to(sock: &Path, method: &str, path: &str, body: Option<&Value>, extra: &str) -> io::Result<Response> {
+    validate_request_path(path)?;
+    // Reuse idle HTTP/1.1 keep-alive connections for idempotent bodyless GET/HEAD
+    // polls (such as the UI's 4-endpoint refresh cycle), retrying once on a fresh
+    // connection if the daemon closed an idle socket.
+    let op = op_header();
+    if body.is_none() && (method == "GET" || method == "HEAD") {
+        let req = format!("{method} {path} HTTP/1.1\r\nHost: kiri\r\nConnection: keep-alive\r\n{extra}{op}\r\n");
+        if let Some(mut reader) = take_pooled(sock) {
+            if reader.get_mut().write_all(req.as_bytes()).is_ok()
+                && let Ok((resp, reusable)) = answer_keepalive(&mut reader)
+            {
+                if reusable {
+                    return_pooled(sock, reader);
+                }
+                return Ok(resp);
+            }
+        }
+        let s = connect_to(sock, Some(Duration::from_secs(120)))?;
+        let mut reader = BufReader::new(s);
+        reader.get_mut().write_all(req.as_bytes())?;
+        let (resp, reusable) = answer_keepalive(&mut reader)?;
+        if reusable {
+            return_pooled(sock, reader);
+        }
+        return Ok(resp);
+    }
     let mut s = connect_to(sock, Some(Duration::from_secs(120)))?;
     let payload = body.map(Value::to_string).unwrap_or_default();
-    // The window's action this is part of, for the engine's log lines.
-    let op = op_header();
     write!(
         s,
         "{method} {path} HTTP/1.1\r\nHost: kiri\r\nConnection: close\r\n{extra}{op}Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
@@ -343,6 +429,7 @@ fn send(method: &str, path: &str, body: Option<&Value>, extra: &str) -> io::Resu
 
 #[cfg(windows)]
 fn send_to_pipe(name: &str, method: &str, path: &str, body: Option<&Value>, extra: &str) -> io::Result<Response> {
+    validate_request_path(path)?;
     let mut s = WinPipe::open(name)?;
     let payload = body.map(Value::to_string).unwrap_or_default();
     let op = op_header();
@@ -358,23 +445,31 @@ fn send_to_pipe(name: &str, method: &str, path: &str, body: Option<&Value>, extr
 /// The answer to a request just sent; the whole body is read, chunked or not.
 fn answer(s: impl Read) -> io::Result<Response> {
     let mut r = BufReader::new(s);
-    let (status, len, chunked) = head(&mut r)?;
+    let (resp, _) = answer_keepalive(&mut r)?;
+    Ok(resp)
+}
+
+fn answer_keepalive(r: &mut impl BufRead) -> io::Result<(Response, bool)> {
+    let (status, len, chunked, close) = head(r)?;
     let mut body = Vec::new();
     // These never have a body, and the daemon keeps the connection open.
     if status == 204 || status == 304 {
-        return Ok(Response { status, body });
+        return Ok((Response { status, body }, !close));
     }
-    if chunked {
-        while let Some(c) = chunk(&mut r)? {
+    let framed = if chunked {
+        while let Some(c) = chunk(r)? {
             body.extend_from_slice(&c);
         }
+        true
     } else if let Some(n) = len {
         body.resize(n, 0);
         r.read_exact(&mut body)?;
+        true
     } else {
         r.read_to_end(&mut body)?;
-    }
-    Ok(Response { status, body })
+        false
+    };
+    Ok((Response { status, body }, framed && !close))
 }
 
 /// A POST whose body `write` streams, chunked, so its length need not be
@@ -384,6 +479,8 @@ fn answer(s: impl Read) -> io::Result<Response> {
 /// refused the request), its answer is returned, which says why.
 #[cfg(unix)]
 pub fn post_stream(path: &str, content_type: &str, write: impl FnOnce(&mut dyn Write) -> io::Result<()>) -> io::Result<Response> {
+    validate_request_path(path)?;
+    validate_header_value(content_type)?;
     let s = connect(Some(Duration::from_secs(300)))?;
     let op = op_header();
     (&s).write_all(format!("POST {path} HTTP/1.1\r\nHost: kiri\r\nConnection: close\r\n{op}Content-Type: {content_type}\r\nTransfer-Encoding: chunked\r\n\r\n").as_bytes())?;
@@ -399,6 +496,8 @@ pub fn post_stream(path: &str, content_type: &str, write: impl FnOnce(&mut dyn W
 
 #[cfg(windows)]
 pub fn post_stream(path: &str, content_type: &str, write: impl FnOnce(&mut dyn Write) -> io::Result<()>) -> io::Result<Response> {
+    validate_request_path(path)?;
+    validate_header_value(content_type)?;
     let mut s = WinPipe::open(&pipe())?;
     let op = op_header();
     write!(
@@ -585,15 +684,16 @@ pub fn post_lines_unbounded(path: &str, on_line: impl FnMut(Value)) -> io::Resul
 
 #[cfg(unix)]
 fn post_lines_inner(path: &str, auth: Option<&str>, timeout: Option<Duration>, opened: impl FnOnce(&UnixStream), mut on_line: impl FnMut(Value)) -> io::Result<u16> {
-    if auth.is_some_and(|a| a.contains(['\r', '\n'])) {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "header contains a line break"));
+    validate_request_path(path)?;
+    if let Some(a) = auth {
+        validate_header_value(a)?;
     }
     let auth = auth.map(|a| format!("X-Registry-Auth: {a}\r\n")).unwrap_or_default();
     let mut s = connect(timeout)?;
     opened(&s);
     write!(s, "POST {path} HTTP/1.1\r\nHost: kiri\r\nConnection: close\r\n{auth}{}Content-Type: application/json\r\nContent-Length: 0\r\n\r\n", op_header())?;
     let mut r = BufReader::new(s);
-    let (status, len, chunked) = head(&mut r)?;
+    let (status, len, chunked, _) = head(&mut r)?;
     let mut pending = Vec::new();
     let mut lines = |pending: &mut Vec<u8>| {
         while let Some(i) = pending.iter().position(|&b| b == b'\n') {
@@ -626,7 +726,7 @@ pub fn events(mut on_event: impl FnMut(Value) -> bool) -> io::Result<()> {
     let mut s = connect(None)?;
     write!(s, "GET /events HTTP/1.1\r\nHost: kiri\r\nX-Kiri-Background: 1\r\n\r\n")?;
     let mut r = BufReader::new(s);
-    let (status, _, chunked) = head(&mut r)?;
+    let (status, _, chunked, _) = head(&mut r)?;
     if status != 200 || !chunked {
         return Err(io::Error::other(format!("events: HTTP {status}")));
     }
@@ -655,10 +755,11 @@ pub struct Stream {
 #[cfg(unix)]
 impl Stream {
     pub fn open(path: &str) -> io::Result<Stream> {
+        validate_request_path(path)?;
         let mut s = connect(None)?;
         write!(s, "GET {path} HTTP/1.1\r\nHost: kiri\r\n\r\n")?;
         let mut reader = BufReader::new(s);
-        let (status, _, chunked) = head(&mut reader)?;
+        let (status, _, chunked, _) = head(&mut reader)?;
         if status != 200 || !chunked {
             return Err(io::Error::other(format!("{path}: HTTP {status}")));
         }
@@ -679,20 +780,24 @@ impl Stream {
 /// through the exec API with a terminal, so output arrives unframed.
 #[cfg(unix)]
 pub fn exec(container: &str, cmd: &[&str]) -> io::Result<(i64, String)> {
-    let created = request("POST", &format!("/containers/{container}/exec"), Some(&serde_json::json!({"Cmd": cmd, "AttachStdout": true, "AttachStderr": true, "Tty": true})))?;
+    let create_path = format!("/containers/{container}/exec");
+    validate_request_path(&create_path)?;
+    let created = request("POST", &create_path, Some(&serde_json::json!({"Cmd": cmd, "AttachStdout": true, "AttachStderr": true, "Tty": true})))?;
     if !created.ok() {
         return Err(io::Error::other(created.error()));
     }
     let id = created.json()["Id"].as_str().unwrap_or_default().to_owned();
+    let start_path = format!("/exec/{id}/start");
+    validate_request_path(&start_path)?;
     let mut s = connect(Some(Duration::from_secs(120)))?;
     let body = r#"{"Detach":false,"Tty":true}"#;
     write!(
         s,
-        "POST /exec/{id}/start HTTP/1.1\r\nHost: kiri\r\nConnection: Upgrade\r\nUpgrade: tcp\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        "POST {start_path} HTTP/1.1\r\nHost: kiri\r\nConnection: Upgrade\r\nUpgrade: tcp\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
         body.len()
     )?;
     let mut r = BufReader::new(s);
-    let (status, _, _) = head(&mut r)?;
+    let (status, _, _, _) = head(&mut r)?;
     if status != 101 && status != 200 {
         return Err(io::Error::other(format!("exec: HTTP {status}")));
     }
@@ -946,6 +1051,93 @@ mod tests {
         std::fs::write(&interop, "enabled\n").unwrap();
         assert!(super::is_wsl_env(None, &[&interop]));
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn request_path_and_header_validation_blocks_crlf_and_smuggling() {
+        assert!(super::validate_request_path("/containers/abc/json?all=1").is_ok());
+        for bad in [
+            "",
+            "containers/abc",
+            "/containers/a b/json",
+            "/containers/a\r\nPOST /kiri/stop HTTP/1.1",
+            "/containers/a\n/json",
+            "/containers/a\x00/json",
+            "/containers/a\x7f/json",
+            "/containers/../kiri/stop",
+            "/../kiri/stop",
+        ] {
+            assert_eq!(super::validate_request_path(bad).unwrap_err().kind(), io::ErrorKind::InvalidInput, "{bad:?}");
+        }
+        assert!(super::validate_header_value("application/json").is_ok());
+        assert!(super::validate_header_value("application/json\r\nX-Injected: 1").is_err());
+
+        #[cfg(unix)]
+        {
+            match super::send_to(Path::new("/nonexistent"), "GET", "/bad path\r\n", None, "") {
+                Err(err) => assert_eq!(err.kind(), io::ErrorKind::InvalidInput),
+                Ok(_) => panic!("expected InvalidInput"),
+            }
+            match super::Stream::open("/bad\r\npath") {
+                Err(err) => assert_eq!(err.kind(), io::ErrorKind::InvalidInput),
+                Ok(_) => panic!("expected InvalidInput"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn keepalive_pool_reuses_connection_and_retries_on_idle_close() {
+        use std::io::{BufRead, BufReader};
+        let dir = temp_dir("keepalive-pool");
+        let sock = dir.join("docker.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let accepts = std::sync::Arc::new(AtomicU64::new(0));
+        let accepts_srv = accepts.clone();
+        let server = std::thread::spawn(move || {
+            // Connection 1 serves 2 keep-alive requests, then closes.
+            let (mut conn, _) = listener.accept().unwrap();
+            accepts_srv.fetch_add(1, Ordering::SeqCst);
+            let mut r = BufReader::new(conn.try_clone().unwrap());
+            for body in [b"one", b"two"] {
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    if r.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                write!(conn, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len()).unwrap();
+                conn.write_all(body).unwrap();
+                conn.flush().unwrap();
+            }
+            drop(r);
+            drop(conn);
+            // Connection 2 serves the retry after connection 1 closed while pooled.
+            let (mut conn2, _) = listener.accept().unwrap();
+            accepts_srv.fetch_add(1, Ordering::SeqCst);
+            let mut r2 = BufReader::new(conn2.try_clone().unwrap());
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if r2.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                    break;
+                }
+            }
+            conn2.write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 5\r\n\r\nthree").unwrap();
+            conn2.flush().unwrap();
+        });
+
+        let r1 = super::send_to(&sock, "GET", "/_ping", None, "").unwrap();
+        assert_eq!((r1.status, r1.body.as_slice()), (200, &b"one"[..]));
+        let r2 = super::send_to(&sock, "GET", "/_ping", None, "").unwrap();
+        assert_eq!((r2.status, r2.body.as_slice()), (200, &b"two"[..]));
+        assert_eq!(accepts.load(Ordering::SeqCst), 1, "second GET should reuse pooled keep-alive socket");
+        let r3 = super::send_to(&sock, "GET", "/_ping", None, "").unwrap();
+        assert_eq!((r3.status, r3.body.as_slice()), (200, &b"three"[..]));
+        assert_eq!(accepts.load(Ordering::SeqCst), 2, "third GET should transparently redial after idle close");
+        server.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

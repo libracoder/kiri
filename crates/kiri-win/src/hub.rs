@@ -28,6 +28,9 @@ const FRESH: Duration = Duration::from_secs(24 * 60 * 60);
 const KEEP: usize = 300;
 /// curl's whole-request limit, so a Hub that does not answer cannot pin a thread.
 const TIMEOUT_SECS: &str = "20";
+/// Maximum response bytes accepted from an external registry or Docker Hub API.
+const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_RESPONSE_STR: &str = "4194304";
 
 /// One writer at a time for the cache file.
 static CACHE: Mutex<()> = Mutex::new(());
@@ -111,7 +114,7 @@ fn search(term: &str) -> Result<Value, String> {
                 "description": r["description"],
                 "stars": r["star_count"],
                 "official": r["is_official"],
-                "icon": crate::engine::brand(name),
+                "icon": crate::engine::brand(name).and_then(crate::engine::brand_svg),
             })
         })
         .collect())
@@ -129,12 +132,13 @@ fn tags(repo: &str) -> Result<Vec<String>, String> {
     let url = format!("https://hub.docker.com/v2/repositories/{repo}/tags?page_size=100&ordering=last_updated");
     let mut cmd = crate::win::tool("curl.exe");
     std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x0800_0000);
-    let out = cmd.args(["-fsSL", "--max-time", TIMEOUT_SECS, "--"]).arg(&url).stdin(Stdio::null()).stderr(Stdio::piped()).output().map_err(|e| format!("curl.exe: {e}"))?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
+    cmd.args(["-fsSL", "--proto", "=https", "--proto-redir", "=https", "--globoff", "--max-time", TIMEOUT_SECS, "--max-filesize", MAX_RESPONSE_STR, "--"]).arg(&url);
+    let (status, stdout, stderr) = run_curl_capped(cmd, None)?;
+    if !status.success() {
+        let err = String::from_utf8_lossy(&stderr);
         return Err(err.lines().find(|l| !l.trim().is_empty()).unwrap_or("Docker Hub did not answer").trim().to_owned());
     }
-    let body: Value = serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())?;
+    let body: Value = serde_json::from_slice(&stdout).map_err(|e| e.to_string())?;
     Ok(order_tags(body["results"].as_array().into_iter().flatten().filter_map(|t| t["name"].as_str().map(str::to_owned)).collect()))
 }
 
@@ -174,7 +178,7 @@ fn registry_tags(name: &str) -> Result<Vec<String>, String> {
     while pages < 20 {
         let (status, headers, body) = curl(&url, token.as_deref())?;
         if status == 401 && token.is_none() {
-            token = Some(bearer_token(header(&headers, "www-authenticate").ok_or_else(|| format!("{host} wants a sign-in"))?)?);
+            token = Some(bearer_token(header(&headers, "www-authenticate").ok_or_else(|| format!("{host} wants a sign-in"))?, host)?);
             continue;
         }
         if status != 200 {
@@ -187,9 +191,9 @@ fn registry_tags(name: &str) -> Result<Vec<String>, String> {
         let body: Value = serde_json::from_slice(&body).map_err(|e| e.to_string())?;
         tags.extend(body["tags"].as_array().into_iter().flatten().filter_map(|t| t.as_str()).filter(|t| !t.starts_with("sha256-")).map(str::to_owned));
         pages += 1;
-        // Only a next page on the same registry is followed.
+        // Only a next page on the same registry is followed, with no control/glob/whitespace chars.
         match header(&headers, "link").and_then(tagorder::next_link) {
-            Some(n) if n.starts_with("/v2/") => url = format!("{base}{n}"),
+            Some(n) if valid_next_link(n) => url = format!("{base}{n}"),
             _ => break,
         }
     }
@@ -199,20 +203,157 @@ fn registry_tags(name: &str) -> Result<Vec<String>, String> {
     Ok(tags)
 }
 
+fn valid_next_link(n: &str) -> bool {
+    n.starts_with("/v2/")
+        && !n.contains("..")
+        && !n.bytes().any(|b| b <= 0x20 || b == 0x7f || b"{}[]\\".contains(&b))
+}
+
+fn valid_bearer_token(t: &str) -> bool {
+    !t.is_empty() && t.len() <= 16_384 && t.bytes().all(|b| b.is_ascii_alphanumeric() || b"-._~+/=".contains(&b))
+}
+
+fn is_local_or_private_host(host: &str) -> bool {
+    let bare = host.trim_start_matches('[').trim_end_matches(']').trim_end_matches('.').to_ascii_lowercase();
+    if bare.is_empty()
+        || bare.contains('%')
+        || bare == "localhost"
+        || bare.ends_with(".localhost")
+        || bare.ends_with(".local")
+        || bare.ends_with(".internal")
+    {
+        return true;
+    }
+    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+        return match ip.to_canonical() {
+            std::net::IpAddr::V4(v4) => {
+                v4.is_loopback()
+                    || v4.is_private()
+                    || v4.is_link_local()
+                    || v4.is_unspecified()
+                    || v4.is_broadcast()
+                    || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 64)
+            }
+            std::net::IpAddr::V6(v6) => {
+                v6.is_loopback()
+                    || v6.is_unspecified()
+                    || (v6.segments()[0] & 0xfe00) == 0xfc00
+                    || (v6.segments()[0] & 0xffc0) == 0xfe80
+            }
+        };
+    }
+    // Reject non-dotted-quad numeric/octal/hex/short IPv4 literals (e.g.
+    // `127.1`, `2130706433`, `0x7f000001`, `0177.0.0.1`) that curl/getaddrinfo
+    // resolve to loopback/private IPs; valid DNS TLDs never begin with a digit.
+    bare.rsplit('.').next().is_some_and(|tld| tld.as_bytes().first().is_some_and(u8::is_ascii_digit))
+}
+
+fn host_of_authority(authority: &str) -> &str {
+    if authority.starts_with('[') {
+        authority.find(']').map_or(authority, |i| &authority[..=i])
+    } else {
+        authority.split(':').next().unwrap_or(authority)
+    }
+}
+
+/// Validates a Bearer `realm` URL: HTTPS only, no whitespace/control/glob/userinfo,
+/// and blocks loopback/private/link-local SSRF targets for public registries.
+fn allowed_realm(realm: &str, registry_host: &str) -> Result<(), String> {
+    let Some(rest) = realm.strip_prefix("https://") else {
+        return Err("the registry's sign-in isn't https".to_owned());
+    };
+    if realm.bytes().any(|b| b <= 0x20 || b == 0x7f || b"{}[]\\@".contains(&b)) {
+        return Err("the registry's sign-in URL is invalid".to_owned());
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let realm_host = host_of_authority(authority);
+    if realm_host.is_empty() {
+        return Err("the registry's sign-in URL has no host".to_owned());
+    }
+    let reg_host = host_of_authority(registry_host);
+    if !is_local_or_private_host(reg_host) && is_local_or_private_host(realm_host) {
+        return Err("the registry's sign-in points at a private or local address".to_owned());
+    }
+    Ok(())
+}
+
+fn run_curl_capped(mut cmd: std::process::Command, stdin_bytes: Option<&[u8]>) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>), String> {
+    use std::io::{Read, Write};
+    if stdin_bytes.is_some() {
+        cmd.stdin(Stdio::piped());
+    } else {
+        cmd.stdin(Stdio::null());
+    }
+    let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e| format!("curl.exe: {e}"))?;
+    if let Some(bytes) = stdin_bytes
+        && let Some(mut stdin) = child.stdin.take()
+    {
+        let _ = stdin.write_all(bytes);
+    }
+    let mut stdout_pipe = child.stdout.take().ok_or("curl.exe: no stdout")?;
+    let mut stderr_pipe = child.stderr.take().ok_or("curl.exe: no stderr")?;
+    let err_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr_pipe.by_ref().take(65_536).read_to_end(&mut buf);
+        buf
+    });
+    let mut stdout = Vec::new();
+    let mut chunk = [0u8; 16_384];
+    let mut too_big = false;
+    loop {
+        match stdout_pipe.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                if stdout.len() + n > MAX_RESPONSE_BYTES {
+                    too_big = true;
+                    break;
+                }
+                stdout.extend_from_slice(&chunk[..n]);
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = err_reader.join();
+                return Err(format!("curl.exe: {e}"));
+            }
+        }
+    }
+    if too_big {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = err_reader.join();
+        return Err("the registry's answer was too large".to_owned());
+    }
+    let status = child.wait().map_err(|e| format!("curl.exe: {e}"))?;
+    let stderr = err_reader.join().unwrap_or_default();
+    Ok((status, stdout, stderr))
+}
+
 /// GET through curl.exe: the status, the headers and the body.
 fn curl(url: &str, token: Option<&str>) -> Result<(u16, String, Vec<u8>), String> {
+    if !url.starts_with("https://") || url.bytes().any(|b| b <= 0x20 || b == 0x7f || b"{}[]\\".contains(&b)) {
+        return Err("invalid registry URL".to_owned());
+    }
     let mut cmd = crate::win::tool("curl.exe");
     std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x0800_0000);
-    cmd.args(["-sS", "-i", "--max-time", TIMEOUT_SECS]);
-    if let Some(t) = token {
-        cmd.arg("-H").arg(format!("Authorization: Bearer {t}"));
-    }
-    let out = cmd.arg("--").arg(url).stdin(Stdio::null()).stderr(Stdio::piped()).output().map_err(|e| format!("curl.exe: {e}"))?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
+    cmd.args(["-sS", "-i", "--proto", "=https", "--proto-redir", "=https", "--globoff", "--max-time", TIMEOUT_SECS, "--max-filesize", MAX_RESPONSE_STR]);
+    let cfg = match token {
+        Some(t) => {
+            if !valid_bearer_token(t) {
+                return Err("the registry returned an invalid bearer token".to_owned());
+            }
+            cmd.args(["-K", "-"]);
+            Some(format!("header = \"Authorization: Bearer {t}\"\n"))
+        }
+        None => None,
+    };
+    cmd.arg("--").arg(url);
+    let (status, stdout, stderr) = run_curl_capped(cmd, cfg.as_deref().map(str::as_bytes))?;
+    if !status.success() {
+        let err = String::from_utf8_lossy(&stderr);
         return Err(err.lines().find(|l| !l.trim().is_empty()).unwrap_or("the registry did not answer").trim().to_owned());
     }
-    split_response(&out.stdout).ok_or_else(|| "the registry's answer couldn't be read".to_owned())
+    split_response(&stdout).ok_or_else(|| "the registry's answer couldn't be read".to_owned())
 }
 
 /// `curl -i`'s output: the last header block (after any `100 Continue`) and the body.
@@ -233,20 +374,29 @@ fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
     head.lines().find_map(|l| l.split_once(':').filter(|(k, _)| k.trim().eq_ignore_ascii_case(name)).map(|(_, v)| v.trim()))
 }
 
+fn query_escape(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-._~:/".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
+}
+
 /// The anonymous token a Bearer challenge's realm hands out
 /// (`Bearer realm="https://ghcr.io/token",service="ghcr.io",scope="repository:o/r:pull"`).
-fn bearer_token(challenge: &str) -> Result<String, String> {
+fn bearer_token(challenge: &str, registry_host: &str) -> Result<String, String> {
     let rest = challenge.get(..7).filter(|b| b.eq_ignore_ascii_case("bearer ")).map(|_| &challenge[7..]).ok_or("the registry wants a password")?;
     let param = |k: &str| rest.split(',').find_map(|p| p.trim().strip_prefix(k).and_then(|v| v.strip_prefix('='))).map(|v| v.trim_matches('"').to_owned());
-    let realm = param("realm").filter(|r| r.starts_with("https://")).ok_or("the registry's sign-in isn't https")?;
-    let query: Vec<String> = ["service", "scope"].iter().filter_map(|k| param(k).map(|v| format!("{k}={}", v.replace(' ', "%20")))).collect();
+    let realm = param("realm").ok_or("the registry's sign-in isn't https")?;
+    allowed_realm(&realm, registry_host)?;
+    let query: Vec<String> = ["service", "scope"].iter().filter_map(|k| param(k).map(|v| format!("{k}={}", query_escape(&v)))).collect();
     let url = if query.is_empty() { realm } else { format!("{realm}{}{}", if realm.contains('?') { "&" } else { "?" }, query.join("&")) };
     let (status, _, body) = curl(&url, None)?;
     if status != 200 {
         return Err(format!("the registry's token service answered {status}"));
     }
     let v: Value = serde_json::from_slice(&body).map_err(|e| e.to_string())?;
-    v["token"].as_str().or(v["access_token"].as_str()).map(str::to_owned).ok_or_else(|| "the registry gave no token".to_owned())
+    let tok = v["token"].as_str().or(v["access_token"].as_str()).map(str::to_owned).ok_or_else(|| "the registry gave no token".to_owned())?;
+    if !valid_bearer_token(&tok) {
+        return Err("the registry returned an invalid bearer token".to_owned());
+    }
+    Ok(tok)
 }
 
 fn fetch(kind: Kind, key: &str) -> Result<Value, String> {
@@ -332,6 +482,43 @@ mod tests {
     fn tags_refuse_what_is_not_a_repository() {
         for bad in ["", "-o", "a b", "x?y=1", "../z", "a&b"] {
             assert!(super::tags(bad).is_err(), "{bad:?} was accepted");
+        }
+    }
+
+    #[test]
+    fn bearer_realm_blocks_ssrf_and_token_and_link_reject_injection() {
+        assert!(allowed_realm("https://ghcr.io/token", "ghcr.io").is_ok());
+        for bad in [
+            "http://ghcr.io/token",
+            "https://127.0.0.1/token",
+            "https://127.1/token",
+            "https://2130706433/token",
+            "https://0x7f000001/token",
+            "https://0177.0.0.1/token",
+            "https://localhost:8443/token",
+            "https://localhost./token",
+            "https://metadata.google.internal/token",
+            "https://[::1]/token",
+            "https://169.254.169.254/latest/meta-data",
+            "https://10.0.0.1/token",
+            "https://192.168.1.1/token",
+            "https://ghcr.io/{1..100}",
+            "https://ghcr.io/a b",
+            "https://user@ghcr.io/token",
+        ] {
+            assert!(allowed_realm(bad, "ghcr.io").is_err(), "accepted unsafe realm {bad:?}");
+        }
+        // A local registry may use a local realm.
+        assert!(allowed_realm("https://localhost:5001/token", "localhost:5000").is_ok());
+
+        assert!(valid_bearer_token("eyJhbGciOiJSUzI1NiJ9.abc_123-+/="));
+        for bad in ["", "tok\r\nX-Inject: 1", "tok with space", "tok\"quote"] {
+            assert!(!valid_bearer_token(bad), "accepted unsafe token {bad:?}");
+        }
+
+        assert!(valid_next_link("/v2/o/r/tags/list?last=b&n=1000"));
+        for bad in ["/v1/foo", "/v2/../secret", "/v2/a{1..10}", "/v2/a b", "/v2/a\r\n"] {
+            assert!(!valid_next_link(bad), "accepted unsafe next link {bad:?}");
         }
     }
 }

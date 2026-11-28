@@ -168,6 +168,27 @@ def minify(d, places=1):
     return "".join(out)
 
 
+HEX_RE = re.compile(r"^[0-9A-Fa-f]{6}$")
+SLUG_RE = re.compile(r"^[a-z0-9-]+$")
+PATH_RE = re.compile(r"^[A-Za-z0-9.,+\-\s]+$")
+
+
+def validate_brand(slug, hex_color, svg_path):
+    """Validates remote Simple Icons metadata before emitting Rust code."""
+    if not isinstance(slug, str) or not SLUG_RE.fullmatch(slug):
+        raise ValueError(f"invalid Simple Icons slug: {slug!r}")
+    if not isinstance(hex_color, str) or not HEX_RE.fullmatch(hex_color):
+        raise ValueError(f"invalid Simple Icons hex colour for {slug}: {hex_color!r}")
+    if not isinstance(svg_path, str) or not svg_path or not PATH_RE.fullmatch(svg_path):
+        raise ValueError(f"invalid SVG path for {slug}")
+    return slug, hex_color.upper(), svg_path
+
+
+def format_brand_entry(slug, hex_color, svg_path):
+    slug, hex_color, svg_path = validate_brand(slug, hex_color, svg_path)
+    return f"    ({json.dumps(slug)}, {json.dumps(hex_color)}, {json.dumps(svg_path)}),\n"
+
+
 def main():
     data = json.loads(get(f"https://unpkg.com/simple-icons@{SIMPLE_ICONS}/data/simple-icons.json"))
     by_slug = {i["slug"]: i for i in data}
@@ -176,19 +197,21 @@ def main():
         if slug is None:
             continue
         if slug in LOCAL:
-            brands[slug] = list(LOCAL[slug])
+            _, hex_color, path = validate_brand(slug, LOCAL[slug][0], LOCAL[slug][1])
+            brands[slug] = [hex_color, path]
             continue
         if slug not in by_slug:
             missing.append(f"{image}->{slug}")
             continue
         if slug not in brands and slug not in too_big:
-            version, hex = PINNED.get(slug, (SIMPLE_ICONS, by_slug[slug]["hex"]))
+            version, hex_color = PINNED.get(slug, (SIMPLE_ICONS, by_slug[slug]["hex"]))
             svg = get(f"https://unpkg.com/simple-icons@{version}/icons/{slug}.svg")
             d = path_of(svg)
+            _, hex_color, d = validate_brand(slug, hex_color, d)
             if len(d) > MAX_BYTES and slug not in ALWAYS:
                 too_big[slug] = len(d)
                 continue
-            brands[slug] = [hex, d]
+            brands[slug] = [hex_color, d]
     images = {k: v for k, v in CATALOG.items() if v in brands}
     ui = {name: path_of(get(f"https://unpkg.com/@phosphor-icons/core@{PHOSPHOR}/assets/regular/{ph}.svg"))
           for name, ph in PHOSPHOR_ICONS.items()}
@@ -203,11 +226,11 @@ def main():
         f.write("/// (slug, brand colour, SVG path), sorted by slug.\n")
         f.write("pub static BRANDS: &[(&str, &str, &str)] = &[\n")
         for slug in sorted(brands):
-            f.write(f'    ("{slug}", "{brands[slug][0]}", "{brands[slug][1]}"),\n')
+            f.write(format_brand_entry(slug, brands[slug][0], brands[slug][1]))
         f.write("];\n\n/// (image repository, brand slug), sorted by repository.\n")
         f.write("pub static IMAGES: &[(&str, &str)] = &[\n")
         for image in sorted(images):
-            f.write(f'    ("{image}", "{images[image]}"),\n')
+            f.write(f"    ({json.dumps(image)}, {json.dumps(images[image])}),\n")
         f.write("];\n")
     kb = lambda p: os.path.getsize(p) // 1024
     print(f"{len(brands)} logos for {len(images)} images -> brands.rs ({kb(OUT_RS)} KB in the binary); "
@@ -218,4 +241,5 @@ def main():
         print("not in Simple Icons (falls back to the stack icon):", ", ".join(missing))
 
 
-main()
+if __name__ == "__main__":
+    main()

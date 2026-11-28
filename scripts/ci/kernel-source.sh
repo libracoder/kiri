@@ -10,9 +10,22 @@ case $out in
 esac
 kver=$(sed -n 's/^KVER="${KVER:-\([^}]*\)}"/\1/p' guest/kernel/build.sh)
 [ -n "$kver" ] || { echo "could not read KVER from guest/kernel/build.sh" >&2; exit 1; }
+# Pinned SHA-256 of the upstream kernel.org tarball matching KVER in guest/kernel/build.sh.
+# Override with KVER_SHA256 when building a different KVER.
+if [ -z "${KVER_SHA256:-}" ]; then
+  case "$kver" in
+    6.18.58) KVER_SHA256=069b19f9032c4dac8149ae4b6520c35debca0f42a9f6d52ee55ba6ca9b818013 ;;
+    *) echo "no pinned KVER_SHA256 for linux-$kver.tar.xz; set KVER_SHA256 or update scripts/ci/kernel-source.sh" >&2; exit 1 ;;
+  esac
+fi
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
-curl -fsSL --retry 3 "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$kver.tar.xz" -o "$tmp/linux.tar.xz"
+curl -fsSL --proto '=https' --proto-redir '=https' --retry 3 "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$kver.tar.xz" -o "$tmp/linux.tar.xz"
+if command -v sha256sum >/dev/null 2>&1; then
+  printf '%s  %s\n' "$KVER_SHA256" "$tmp/linux.tar.xz" | sha256sum -c - >/dev/null
+else
+  printf '%s  %s\n' "$KVER_SHA256" "$tmp/linux.tar.xz" | shasum -a 256 -c - >/dev/null
+fi
 tar -xJf "$tmp/linux.tar.xz" -C "$tmp"
 cd "$tmp/linux-$kver"
 for patch in "$root"/guest/kernel/patches/*.patch; do

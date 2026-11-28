@@ -509,6 +509,19 @@ fn gone(e: &io::Error) -> bool {
     matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused)
 }
 
+/// Trusted absolute paths for `systemctl` when `kiri bridge` runs as root.
+const SYSTEMCTL_PATHS: &[&str] = &["/usr/bin/systemctl", "/bin/systemctl", "/run/current-system/sw/bin/systemctl"];
+const SAFE_PATH: &str = "/usr/sbin:/sbin:/usr/bin:/bin:/run/current-system/sw/bin";
+
+fn find_systemctl_in(paths: &[&Path]) -> Option<std::path::PathBuf> {
+    paths.iter().find(|p| p.is_file()).map(|p| p.to_path_buf())
+}
+
+fn find_systemctl() -> Option<std::path::PathBuf> {
+    let paths: Vec<&Path> = SYSTEMCTL_PATHS.iter().map(Path::new).collect();
+    find_systemctl_in(&paths)
+}
+
 /// Starts the daemon as this distro does: kiri-start in Kiri Linux,
 /// systemd's `kiri` service in a distro with systemd (contrib/wsl/install.sh).
 /// Killed at `until`. kiri-start's exit 1 (no socket yet) may still end
@@ -516,10 +529,13 @@ fn gone(e: &io::Error) -> bool {
 fn start_engine(until: Instant) -> Result<(), String> {
     let kiri_start = Path::new(KIRI_START).exists();
     let mut cmd = if kiri_start {
-        Command::new(KIRI_START)
+        let mut c = Command::new(KIRI_START);
+        c.env("PATH", SAFE_PATH);
+        c
     } else if Path::new("/run/systemd/system").exists() {
-        let mut c = Command::new("systemctl");
-        c.args(["start", "kiri"]);
+        let systemctl = find_systemctl().ok_or_else(|| "systemctl not found in trusted system directories".to_owned())?;
+        let mut c = Command::new(systemctl);
+        c.env_clear().env("PATH", SAFE_PATH).env("LC_ALL", "C").args(["start", "kiri"]);
         c
     } else {
         return Err("nothing in this Linux starts it (no kiri-start, no systemd)".to_owned());
@@ -1256,5 +1272,22 @@ mod tests {
             }
         }
         assert_eq!(reply, b"ping");
+    }
+
+    #[test]
+    fn find_systemctl_only_uses_trusted_paths() {
+        let dir = std::env::temp_dir().join(format!("kiri-bridge-systemctl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let untrusted = dir.join("untrusted/systemctl");
+        let missing = dir.join("missing/systemctl");
+        let trusted = dir.join("trusted/systemctl");
+        std::fs::create_dir_all(untrusted.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(trusted.parent().unwrap()).unwrap();
+        std::fs::write(&untrusted, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::write(&trusted, "#!/bin/sh\nexit 0\n").unwrap();
+
+        assert_eq!(find_systemctl_in(&[missing.as_path(), trusted.as_path()]), Some(trusted.clone()));
+        assert_eq!(find_systemctl_in(&[missing.as_path()]), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

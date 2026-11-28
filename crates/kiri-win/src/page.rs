@@ -25,8 +25,12 @@ pub const PAGE_URL: &str = "https://kiri.invalid/";
 /// The WebResourceRequested filter: the whole host, so the handler sees
 /// (and refuses) whatever else is asked of it.
 pub const FILTER: &str = "https://kiri.invalid/*";
-/// The page's headers: UTF-8 HTML, and kept out of the HTTP cache.
-pub const PAGE_HEADERS: &str = "Content-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff";
+/// Catch-all WebResourceRequested filter for defense-in-depth: intercepts
+/// any subresource request to external origins and returns 404.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub const ALL_RESOURCES_FILTER: &str = "*";
+/// The page's headers: UTF-8 HTML, strict CSP, and kept out of the HTTP cache.
+pub const PAGE_HEADERS: &str = "Content-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nContent-Security-Policy: default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; font-src data:; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'";
 pub const NOT_FOUND_HEADERS: &str = "Cache-Control: no-store";
 
 /// What the handler answers a request for `uri` with.
@@ -93,7 +97,7 @@ mod tests {
         }
         assert_eq!(answer("POST", PAGE_URL), Answer::NotFound);
         assert!(FILTER.starts_with(PAGE_URL) && FILTER.ends_with("/*"));
-        assert!(PAGE_HEADERS.contains("text/html; charset=utf-8") && PAGE_HEADERS.contains("no-store") && NOT_FOUND_HEADERS.contains("no-store"));
+        assert!(PAGE_HEADERS.contains("text/html; charset=utf-8") && PAGE_HEADERS.contains("no-store") && PAGE_HEADERS.contains("Content-Security-Policy:") && NOT_FOUND_HEADERS.contains("no-store"));
     }
 
     #[test]

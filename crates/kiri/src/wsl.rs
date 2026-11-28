@@ -70,21 +70,24 @@ fn default_windows_report_out() -> io::Result<PathBuf> {
     Ok(dir.join(format!("kiri-report-{secs}.txt")))
 }
 
-fn redact_windows_home(text: &str) -> String {
-    let Some(home) = std::env::var("USERPROFILE").ok().filter(|h| !h.is_empty()) else {
-        return text.to_owned();
-    };
-    let slash = home.replace('\\', "/");
-    text.replace(&home, "~").replace(&slash, "~")
+fn redact_windows_text_with(text: &str, home: Option<String>, secrets: Vec<String>) -> String {
+    crate::diag::redact::Redactor::new(home, secrets).apply(text)
 }
 
-fn windows_ui_log_section() -> String {
+fn redact_windows_home(text: &str) -> String {
+    let home = std::env::var("USERPROFILE").ok().filter(|h| !h.is_empty());
+    redact_windows_text_with(text, home, Vec::new())
+}
+
+fn redact_windows_report(text: &str) -> String {
+    let home = std::env::var("USERPROFILE").ok().filter(|h| !h.is_empty());
+    let secrets = crate::share::read_config().token.into_iter().collect();
+    redact_windows_text_with(text, home, secrets)
+}
+
+fn windows_ui_log_section_from(path: &Path) -> String {
     const TAIL_MAX: u64 = 120 << 10;
-    let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") else {
-        return String::new();
-    };
-    let path = PathBuf::from(local_app_data).join("Kiri").join("kiri-win.log");
-    let Ok(mut f) = std::fs::File::open(&path) else {
+    let Ok(mut f) = std::fs::File::open(path) else {
         return String::new();
     };
     let len = f.metadata().map_or(0, |m| m.len());
@@ -103,8 +106,15 @@ fn windows_ui_log_section() -> String {
     if body.trim().is_empty() {
         return String::new();
     }
-    let redacted = redact_windows_home(body.trim_end());
-    format!("\n==== Windows UI log (%LOCALAPPDATA%\\Kiri\\kiri-win.log) ====\n{redacted}\n")
+    format!("\n==== Windows UI log (%LOCALAPPDATA%\\Kiri\\kiri-win.log) ====\n{}\n", body.trim_end())
+}
+
+fn windows_ui_log_section() -> String {
+    let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") else {
+        return String::new();
+    };
+    let path = PathBuf::from(local_app_data).join("Kiri").join("kiri-win.log");
+    windows_ui_log_section_from(&path)
 }
 
 fn diag_report(rest: &[String]) -> io::Result<bool> {
@@ -135,7 +145,7 @@ fn diag_report(rest: &[String]) -> io::Result<bool> {
         text = format!("Kiri diagnostics report\nVersion: {}\n", env!("CARGO_PKG_VERSION"));
     }
     text.push_str(&windows_ui_log_section());
-    let text = redact_windows_home(&text);
+    let text = redact_windows_report(&text);
     if let Some(parent) = out_path.parent().filter(|p| !p.as_os_str().is_empty()) {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -657,5 +667,29 @@ mod tests {
         ] {
             assert_eq!(help_for(&s(pass_through)), None, "must not intercept {pass_through:?}");
         }
+    }
+
+    #[test]
+    fn windows_report_redacts_secrets_emails_and_case_insensitive_home_paths() {
+        let raw = concat!(
+            "engine log\n",
+            "path1=c:\\users\\ALICE\\AppData\\Local\\Kiri\n",
+            "json=\"C:\\\\Users\\\\Alice\\\\.kiri\\\\share.json\"\n",
+            "proxy=http://alice:s3cr3t@proxy.corp:3128\n",
+            "Authorization: Bearer tok_supersecret1234\n",
+            "token=ks_abcdef0123456789\n",
+            "client-key-data: LS0tLS1CRUdJTi1rZXk=\n",
+            "email=alice@example.org\n",
+        );
+        let out = super::redact_windows_text_with(
+            raw,
+            Some(r"C:\Users\Alice".to_owned()),
+            vec!["ks_exactsecret99".to_owned()],
+        );
+        for leak in ["ALICE", "Alice", "s3cr3t", "tok_supersecret1234", "abcdef0123456789", "LS0tLS1CRUdJTi", "alice@example.org"] {
+            assert!(!out.contains(leak), "leaked {leak:?} in:\n{out}");
+        }
+        assert!(out.contains("path1=~\\AppData\\Local\\Kiri"), "{out}");
+        assert!(out.contains("json=\"~\\\\.kiri\\\\share.json\""), "{out}");
     }
 }

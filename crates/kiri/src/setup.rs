@@ -252,6 +252,52 @@ pub fn run(args: &[String]) -> io::Result<()> {
     Ok(())
 }
 
+/// Standard base64 encoder for embedding small static/generated files directly
+/// inside privileged root scripts (avoiding user-writable `temp_dir()` TOCTOU).
+pub(crate) fn b64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
+        out.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
+        out.push(if chunk.len() > 1 { TABLE[((n >> 6) & 0x3f) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { TABLE[(n & 0x3f) as usize] as char } else { '=' });
+    }
+    out
+}
+
+/// Validates a Kiri socket path before embedding it into a root shell script or
+/// LaunchDaemon plist (rejects relative paths and ASCII control characters).
+fn validate_socket_path(path: &Path) -> io::Result<String> {
+    let s = path.to_str().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "socket path is not valid UTF-8"))?;
+    if !path.is_absolute() || s.is_empty() || s.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("invalid KIRI_SOCKET path: {s:?}")));
+    }
+    Ok(s.to_owned())
+}
+
+/// Builds the privileged shell script that writes `/etc/resolver/kiri.local`
+/// via a root-only `0700` staging directory (no unprivileged `temp_dir()` files).
+fn domains_command(port: u16, resolver: &str, link_cmd: Option<&str>) -> String {
+    let body = format!("# Kiri: container names (kiri setup --uninstall removes this)\nnameserver 127.0.0.1\nport {port}\n");
+    let b64 = b64_encode(body.as_bytes());
+    let base = format!(
+        "set -e; stage=$(/usr/bin/mktemp -d /var/root/.kiri-install.XXXXXX); trap 'rm -rf \"$stage\"' EXIT; \
+         chmod 700 \"$stage\"; printf '%s' '{b64}' | /usr/bin/base64 -D > \"$stage/resolver\"; \
+         chown root:wheel \"$stage/resolver\"; chmod 644 \"$stage/resolver\"; \
+         mkdir -p /etc/resolver; mv -f \"$stage/resolver\" {}",
+        sh_quote(resolver)
+    );
+    match link_cmd {
+        Some(l) => format!("{base} && ({l} || true)"),
+        None => base,
+    }
+}
+
 /// Points macOS at Kiri for `*.kiri.local`. Writing /etc/resolver needs an
 /// administrator, so macOS asks for the password, once.
 pub fn domains() -> io::Result<()> {
@@ -260,22 +306,17 @@ pub fn domains() -> io::Result<()> {
         println!("containers answer at http://<name>.kiri.local");
         return Ok(());
     }
-    let tmp = std::env::temp_dir().join(format!("kiri-resolver-{}", std::process::id()));
-    std::fs::write(&tmp, format!("# Kiri: container names (kiri setup --uninstall removes this)\nnameserver 127.0.0.1\nport {}\n", dns::PORT))?;
     // /var/run/docker.sock with the same password, when it is free. Its
     // failing must not undo the names: how it went is read back after.
     let link = docker_socket_script()?;
-    let (command, why) = match &link {
-        Some(l) => (
-            format!("mkdir -p /etc/resolver && cp '{}' {} && chmod 644 {} && ({l} || true)", tmp.display(), dns::RESOLVER, dns::RESOLVER),
-            "Kiri wants to give your containers names like myapp.kiri.local, and to answer at /var/run/docker.sock for tools that look for Docker there.",
-        ),
-        None => (format!("mkdir -p /etc/resolver && cp '{}' {} && chmod 644 {}", tmp.display(), dns::RESOLVER, dns::RESOLVER), "Kiri wants to give your containers names like myapp.kiri.local."),
+    let command = domains_command(dns::PORT, dns::RESOLVER, link.as_deref());
+    let why = if link.is_some() {
+        "Kiri wants to give your containers names like myapp.kiri.local, and to answer at /var/run/docker.sock for tools that look for Docker there."
+    } else {
+        "Kiri wants to give your containers names like myapp.kiri.local."
     };
     let result = as_admin(&command, why);
-    let _ = std::fs::remove_file(&tmp);
-    if let Some(l) = &link {
-        let _ = std::fs::remove_file(&l.tmp);
+    if link.is_some() {
         let _ = docker_socket_fallback(&crate::daemon::socket_path()?);
     }
     result?;
@@ -328,29 +369,11 @@ fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// The root commands that link /var/run/docker.sock to Kiri's socket and
-/// install the LaunchDaemon that puts it back at boot.
-struct LinkScript {
-    command: String,
-    /// The LaunchDaemon's plist, written here for the command to copy.
-    tmp: PathBuf,
-}
-
-impl std::fmt::Display for LinkScript {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.command)
-    }
-}
-
-/// The commands for when /var/run/docker.sock is free; None when it is
-/// Kiri's already or another engine's, or for Kiri Dev.
-fn docker_socket_script() -> io::Result<Option<LinkScript>> {
-    let ours = crate::daemon::socket_path()?;
-    if dev() || docker_sock_at_ours(&ours) != Endpoint::Free {
-        return Ok(None);
-    }
-    let esc = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;");
-    let ours_s = ours.to_string_lossy();
+/// Builds the privileged shell script that installs `dev.kiri.docker-socket`
+/// and links `/var/run/docker.sock` to `ours` via a root-only `0700` staging dir.
+fn docker_socket_command(ours: &Path) -> io::Result<String> {
+    let ours_s = validate_socket_path(ours)?;
+    let esc = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
     let boot = format!("[ -e {DOCKER_SOCK} ] || [ -L {DOCKER_SOCK} ] || ln -s \"$1\" {DOCKER_SOCK}");
     let plist = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -366,25 +389,33 @@ fn docker_socket_script() -> io::Result<Option<LinkScript>> {
         esc(&boot),
         esc(&ours_s)
     );
-    let tmp = std::env::temp_dir().join(format!("kiri-docker-socket-{}.plist", std::process::id()));
-    std::fs::write(&tmp, plist)?;
+    let b64 = b64_encode(plist.as_bytes());
     // `[ ! -e ]` again as root: another engine may have started since. A
     // link left dangling by a removed engine is replaced.
-    let command = format!(
-        "cp {} {SOCKET_DAEMON} && chown root:wheel {SOCKET_DAEMON} && chmod 644 {SOCKET_DAEMON} && [ ! -e {DOCKER_SOCK} ] && rm -f {DOCKER_SOCK} && ln -s {} {DOCKER_SOCK}",
-        sh_quote(&tmp.to_string_lossy()),
+    Ok(format!(
+        "set -e; stage=$(/usr/bin/mktemp -d /var/root/.kiri-install.XXXXXX); trap 'rm -rf \"$stage\"' EXIT; \
+         chmod 700 \"$stage\"; printf '%s' '{b64}' | /usr/bin/base64 -D > \"$stage/plist\"; \
+         chown root:wheel \"$stage/plist\"; chmod 644 \"$stage/plist\"; mv -f \"$stage/plist\" {SOCKET_DAEMON} \
+         && [ ! -e {DOCKER_SOCK} ] && rm -f {DOCKER_SOCK} && ln -s {} {DOCKER_SOCK}",
         sh_quote(&ours_s)
-    );
-    Ok(Some(LinkScript { command, tmp }))
+    ))
+}
+
+/// The commands for when /var/run/docker.sock is free; None when it is
+/// Kiri's already or another engine's, or for Kiri Dev.
+fn docker_socket_script() -> io::Result<Option<String>> {
+    let ours = crate::daemon::socket_path()?;
+    if dev() || docker_sock_at_ours(&ours) != Endpoint::Free {
+        return Ok(None);
+    }
+    Ok(Some(docker_socket_command(&ours)?))
 }
 
 /// `kiri setup --docker-socket`: /var/run/docker.sock to Kiri, if free
 /// (macOS asks for the password).
 pub fn docker_socket() -> io::Result<()> {
-    let Some(l) = docker_socket_script()? else { return Ok(()) };
-    let result = as_admin(&l.command, "Kiri wants to answer at /var/run/docker.sock, for tools that look for Docker there.");
-    let _ = std::fs::remove_file(&l.tmp);
-    result
+    let Some(command) = docker_socket_script()? else { return Ok(()) };
+    as_admin(&command, "Kiri wants to answer at /var/run/docker.sock, for tools that look for Docker there.")
 }
 
 /// Says where tools that ignore docker contexts find Kiri, and keeps
@@ -469,7 +500,8 @@ fn remove_docker_socket() -> io::Result<()> {
     }
     let mut command = format!("launchctl bootout system/{SOCKET_LABEL} 2>/dev/null; rm -f {SOCKET_DAEMON}");
     if linked {
-        command.push_str(&format!("; [ \"$(readlink {DOCKER_SOCK})\" = {} ] && rm -f {DOCKER_SOCK}; true", sh_quote(&ours.to_string_lossy())));
+        let ours_s = validate_socket_path(&ours)?;
+        command.push_str(&format!("; [ \"$(readlink {DOCKER_SOCK})\" = {} ] && rm -f {DOCKER_SOCK}; true", sh_quote(&ours_s)));
     }
     as_admin(&command, "Kiri wants to remove its /var/run/docker.sock.")?;
     println!("removed {DOCKER_SOCK}");
@@ -482,9 +514,37 @@ pub fn remove_domains() -> io::Result<()> {
     if !Path::new(resolver).exists() {
         return Ok(());
     }
-    as_admin(&format!("rm -f {resolver}"), "Kiri wants to remove its *.kiri.local names.")?;
+    as_admin(&format!("rm -f {}", sh_quote(resolver)), "Kiri wants to remove its *.kiri.local names.")?;
     println!("removed *.kiri.local");
     Ok(())
+}
+
+/// Escapes a string for an AppleScript double-quoted literal, escaping `\` first
+/// so `\"` cannot break out of the literal, and rejecting NUL bytes.
+fn applescript_escape(s: &str) -> io::Result<String> {
+    if s.contains('\0') {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "AppleScript string contains NUL byte"));
+    }
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\r' => out.push_str("\\r"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    Ok(out)
+}
+
+fn admin_applescript(command: &str, why: &str) -> io::Result<String> {
+    Ok(format!(
+        "do shell script \"{}\" with prompt \"{}\" with administrator privileges",
+        applescript_escape(command)?,
+        applescript_escape(why)?
+    ))
 }
 
 /// Runs a shell command as root through macOS's own password prompt. The
@@ -492,7 +552,7 @@ pub fn remove_domains() -> io::Result<()> {
 /// "Kiri wants to make changes". AppleScript belongs on the main thread: the
 /// window's workers hand it there, and the CLI is already on it.
 pub(crate) fn as_admin(command: &str, why: &str) -> io::Result<()> {
-    let script = format!("do shell script \"{}\" with prompt \"{}\" with administrator privileges", command.replace('"', "\\\""), why.replace('"', "\\\""));
+    let script = admin_applescript(command, why)?;
     // SAFETY: pthread_main_np only reads the calling thread's state.
     if unsafe { libc::pthread_main_np() } == 1 {
         return apple_script(&script);
@@ -1021,6 +1081,26 @@ pub fn start_at_login() -> bool {
         .unwrap_or(true)
 }
 
+/// Ensures `~/.kiri/daemon.log` exists with owner-only `0o600` permissions
+/// before launchd opens it for `StandardOutPath`/`StandardErrorPath`.
+fn ensure_private_log(log: &Path) -> io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+    if let Some(dir) = log.parent() {
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+    }
+    match std::fs::symlink_metadata(log) {
+        Ok(m) if m.file_type().is_file() => {
+            std::fs::set_permissions(log, std::fs::Permissions::from_mode(0o600))?;
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            let _ = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(log);
+        }
+        Err(e) => return Err(e),
+    }
+    Ok(())
+}
+
 /// Updates `RunAtLoad` in `path` (or writes a valid LaunchAgent plist when missing).
 pub(crate) fn set_start_at_login_at(path: &Path, exe: &Path, log: &Path, on: bool) -> io::Result<()> {
     if let Ok(xml) = std::fs::read_to_string(path)
@@ -1031,9 +1111,7 @@ pub(crate) fn set_start_at_login_at(path: &Path, exe: &Path, log: &Path, on: boo
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    if let Some(dir) = log.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
+    ensure_private_log(log)?;
     std::fs::write(path, agent_plist_xml(exe, log, on))
 }
 
@@ -1065,9 +1143,7 @@ fn agent() -> io::Result<PathBuf> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    if let Some(dir) = log.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
+    ensure_private_log(&log)?;
     std::fs::write(&path, plist)?;
     // Reload, so a new path to the binary takes effect.
     let _ = Command::new("/bin/launchctl").args(["bootout", &format!("gui/{}/{AGENT}", uid())]).stderr(std::process::Stdio::null()).status();
@@ -1586,6 +1662,57 @@ mod tests {
         assert!(cands.contains(&std::path::PathBuf::from("/custom/brew/bin/kiri")));
         assert_eq!(super::homebrew_kiri_candidates(Some(std::ffi::OsStr::new("/opt/homebrew"))).len(), 2);
 
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn privileged_setup_commands_avoid_temp_dir_and_escape_applescript() {
+        use std::path::Path;
+
+        let tmp_str = std::env::temp_dir().to_string_lossy().into_owned();
+        let sock = Path::new("/Users/alice/.kiri/run/docker.sock");
+        let link_cmd = super::docker_socket_command(sock).unwrap();
+        assert!(!link_cmd.contains(&tmp_str), "must not reference temp_dir: {link_cmd}");
+        assert!(link_cmd.contains("/var/root/.kiri-install."), "{link_cmd}");
+        assert!(link_cmd.contains("/usr/bin/base64 -D"), "{link_cmd}");
+
+        let dom_cmd = super::domains_command(53535, "/etc/resolver/kiri.local", Some(&link_cmd));
+        assert!(!dom_cmd.contains(&tmp_str), "must not reference temp_dir: {dom_cmd}");
+        assert!(dom_cmd.contains("/var/root/.kiri-install."), "{dom_cmd}");
+
+        // Reject invalid KIRI_SOCKET values (relative or containing control chars).
+        assert!(super::validate_socket_path(Path::new("relative/docker.sock")).is_err());
+        assert!(super::validate_socket_path(Path::new("/tmp/bad\nsock")).is_err());
+
+        // AppleScript escaping must neutralize backslashes, quotes, and newlines without breaking out.
+        let payload = "echo '\\\"' '\\'' && printf \"a\nb\tc\"";
+        let esc = super::applescript_escape(payload).unwrap();
+        assert_eq!(esc, r#"echo '\\\"' '\\'' && printf \"a\nb\tc\""#);
+        assert!(super::applescript_escape("bad\0nul").is_err());
+
+        // Round-trip out-of-process via /usr/bin/osascript (avoiding non-thread-safe
+        // in-process NSAppleScript races with `runs_apple_script`) to prove literal evaluation.
+        let raw = "a\\\"b'\\''\nc\td";
+        let roundtrip_src = format!("return \"{}\"", super::applescript_escape(raw).unwrap());
+        let out = std::process::Command::new("/usr/bin/osascript")
+            .args(["-e", &roundtrip_src])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "escaped AppleScript must compile and evaluate cleanly: {roundtrip_src}; stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let got = String::from_utf8(out.stdout).unwrap();
+        assert_eq!(got.strip_suffix('\n').unwrap_or(&got), raw, "osascript round-trip must preserve literal payload");
+
+        // Private log creation sets 0o600.
+        let d = scratch("priv-log");
+        let log = d.join(".kiri/daemon.log");
+        super::ensure_private_log(&log).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&log).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::metadata(log.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
         let _ = std::fs::remove_dir_all(&d);
     }
 }

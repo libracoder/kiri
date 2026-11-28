@@ -372,19 +372,41 @@ pub fn wsl_enable_script(distro: &str, root: &str) -> String {
            elif pgrep -x dockerd >/dev/null 2>&1 || pidof dockerd >/dev/null 2>&1; then busy=1; fi; \
          fi; \
          [ \"$busy\" = 0 ] && ln -sfn {sock_target} \"$vr/docker.sock\"; \
-         if [ -n \"$uhome\" ] && [ -d {host_prefix}\"$uhome\" ] && [ ! -L {host_prefix}\"$uhome/.docker\" ]; then \
-           dctx={host_prefix}\"$uhome/.docker/contexts\"; \
-           if [ -L \"$dctx\" ]; then \
-             dt=$(readlink \"$dctx\" 2>/dev/null || true); \
-             case \"$dt\" in */mnt/*) \
-               tmp=\"$dctx.kiri.$$\"; rm -rf \"$tmp\"; mkdir -p \"$tmp\" && cp -r \"$dctx/.\" \"$tmp/\" 2>/dev/null || true; \
-               rm -f \"$dctx\" && mv \"$tmp\" \"$dctx\" ;; \
-             esac; \
+         if [ -n \"$uhome\" ] && [ -d {host_prefix}\"$uhome\" ] && [ ! -L {host_prefix}\"$uhome\" ]; then \
+           cbase={host_prefix}\"$uhome\"; \
+           if [ ! -L \"$cbase/.docker\" ]; then \
+             dctx=\"$cbase/.docker/contexts\"; \
+             if [ -L \"$dctx\" ]; then \
+               dt=$(readlink \"$dctx\" 2>/dev/null || true); \
+               case \"$dt\" in */mnt/*) \
+                 tmp=\"$dctx.kiri.$$\"; \
+                 if [ ! -e \"$tmp\" ] && [ ! -L \"$tmp\" ] && mkdir \"$tmp\" 2>/dev/null; then \
+                   cp -rP \"$dctx/.\" \"$tmp/\" 2>/dev/null || true; \
+                   [ -n \"$uuid\" ] && [ -n \"$ugid\" ] && chown -hR \"$uuid:$ugid\" \"$tmp\" 2>/dev/null || true; \
+                   rm -f \"$dctx\" && mv \"$tmp\" \"$dctx\" || rm -rf \"$tmp\" 2>/dev/null || true; \
+                 fi ;; \
+               esac; \
+             fi; \
            fi; \
-           if [ ! -L \"$dctx\" ]; then \
-             cdir=\"$dctx/meta/{KIRI_CONTEXT_HASH}\"; \
-             mkdir -p \"$cdir\" 2>/dev/null && printf %s {} | base64 -d >\"$cdir/meta.json\" 2>/dev/null; \
-             [ -n \"$uuid\" ] && [ -n \"$ugid\" ] && chown -R \"$uuid:$ugid\" {host_prefix}\"$uhome/.docker\" 2>/dev/null || true; \
+           safe=1; \
+           for seg in .docker .docker/contexts .docker/contexts/meta .docker/contexts/meta/{KIRI_CONTEXT_HASH}; do \
+             p=\"$cbase/$seg\"; \
+             if [ -L \"$p\" ]; then safe=0; break; fi; \
+             if [ ! -e \"$p\" ]; then \
+               mkdir \"$p\" 2>/dev/null || {{ safe=0; break; }}; \
+               [ -n \"$uuid\" ] && [ -n \"$ugid\" ] && chown -h \"$uuid:$ugid\" \"$p\" 2>/dev/null || true; \
+             elif [ ! -d \"$p\" ]; then safe=0; break; fi; \
+           done; \
+           if [ \"$safe\" = 1 ]; then \
+             cdir=\"$cbase/.docker/contexts/meta/{KIRI_CONTEXT_HASH}\"; \
+             tmp=\"$cdir/.meta.json.kiri.$$\"; \
+             if [ ! -L \"$tmp\" ]; then \
+               rm -f \"$tmp\" 2>/dev/null; \
+               if (set -C; printf %s {} | base64 -d >\"$tmp\") 2>/dev/null; then \
+                 [ -n \"$uuid\" ] && [ -n \"$ugid\" ] && chown -h \"$uuid:$ugid\" \"$tmp\" 2>/dev/null || true; \
+                 if [ ! -L \"$cdir/meta.json\" ]; then mv -f \"$tmp\" \"$cdir/meta.json\" 2>/dev/null || rm -f \"$tmp\"; else rm -f \"$tmp\"; fi; \
+               else rm -f \"$tmp\" 2>/dev/null; fi; \
+             fi; \
            fi; \
          fi; \
          echo \"$gid\"",
@@ -776,6 +798,16 @@ mod tests {
         let out = Command::new("sh").args(["-c", &disable]).env("PATH", &path).output().unwrap();
         assert!(out.status.success());
         assert!(own_sock.exists(), "running dockerd socket must not be removed on disable");
+
+        // 5. Symlinked meta.json or parent dir in user's home must never overwrite a target outside $HOME.
+        let sentinel = dir.join("root-sentinel.txt");
+        std::fs::write(&sentinel, "DO NOT OVERWRITE").unwrap();
+        let meta_file = root.join(format!("home/alice/.docker/contexts/meta/{KIRI_CONTEXT_HASH}/meta.json"));
+        let _ = std::fs::remove_file(&meta_file);
+        std::os::unix::fs::symlink(&sentinel, &meta_file).unwrap();
+        let out = Command::new("sh").args(["-c", &enable]).env("PATH", &path).output().unwrap();
+        assert!(out.status.success());
+        assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "DO NOT OVERWRITE", "symlinked meta.json must not clobber target");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

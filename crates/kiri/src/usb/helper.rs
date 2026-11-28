@@ -32,6 +32,8 @@ pub const LABEL: Name = Name("dev.kiri.usb", "dev.kiri.usb.dev");
 
 /// Devices one helper serves at once; vhci has 8 ports per speed.
 const MAX_SESSIONS: usize = 32;
+/// Concurrent authenticated handler threads (including in-flight requests).
+const MAX_HANDLERS: usize = MAX_SESSIONS * 2;
 
 fn binary() -> PathBuf {
     PathBuf::from(format!("/Library/PrivilegedHelperTools/{LABEL}"))
@@ -65,13 +67,38 @@ fn current() -> bool {
     digest(&me).is_ok_and(|d| d == installed.trim())
 }
 
-/// Installs (or replaces) the helper: the one administrator prompt.
-fn install() -> io::Result<()> {
-    let me = std::env::current_exe()?.canonicalize()?;
-    let (bin, plist, label) = (binary(), plist(), LABEL.get());
-    // SAFETY: getuid has no preconditions.
-    let uid = unsafe { libc::getuid() };
-    let esc = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;");
+/// Reads the running binary's designated code-signing requirement when it is
+/// signed with a non-ad-hoc identity (e.g. Developer ID), or `None` for local
+/// unsigned/ad-hoc development builds.
+fn designated_requirement(me: &Path) -> Option<String> {
+    let out = Command::new("/usr/bin/codesign").args(["-d", "-r", "-"]).arg(me).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let req = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|l| l.strip_prefix("designated => ").map(str::trim).map(str::to_owned))
+        .filter(|r| !r.is_empty())?;
+    // Ad-hoc signatures have `cdhash H"..."` only; still verifiable against `me`!
+    Some(req)
+}
+
+/// Builds the privileged shell script that installs the USB helper binary and
+/// LaunchDaemon plist via a root-only `0700` staging directory, verifying the
+/// copied binary's SHA-256 (and code signature when present) *as root* before
+/// re-signing and atomically moving it into place.
+#[allow(clippy::too_many_arguments)]
+fn install_command(
+    me: &Path,
+    bin: &Path,
+    src: &Path,
+    plist: &Path,
+    label: &str,
+    uid: u32,
+    sum: &str,
+    designated_req: Option<&str>,
+) -> String {
+    let esc = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
     let body = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -88,30 +115,52 @@ fn install() -> io::Result<()> {
 "#,
         esc(&bin.to_string_lossy())
     );
-    let tmp = std::env::temp_dir().join(format!("{label}.{}.plist", std::process::id()));
-    std::fs::write(&tmp, body)?;
-    let sum = digest(&me)?;
+    let plist_b64 = crate::setup::b64_encode(body.as_bytes());
     let q = |p: &Path| sh_quote(&p.to_string_lossy());
+    let me_q = q(me);
+    let codesign_check = match designated_req {
+        Some(req) => format!("/usr/bin/codesign --verify --strict -R={} {me_q}; ", sh_quote(req)),
+        None => String::new(),
+    };
     // The copy is root's: a helper that ran a binary in the user's app
-    // bundle would run whatever replaced it, as root. Kiri's own signature
-    // seals the app's Info.plist, which the copy is without, so macOS
-    // wouldn't run it: it gets a signature of its own (ad hoc, no
-    // entitlements; it needs none). Then which Kiri it came from.
-    let command = format!(
-        "set -e; mkdir -p /Library/PrivilegedHelperTools; cp {me} {bin}.new; \
-         /usr/bin/codesign --force --sign - --identifier {label} {bin}.new; \
-         chown root:wheel {bin}.new; chmod 755 {bin}.new; mv -f {bin}.new {bin}; echo {sum} > {src}; chmod 644 {src}; \
-         cp {tmp} {plist}; chown root:wheel {plist}; chmod 644 {plist}; \
+    // bundle would run whatever replaced it, as root. Copy into a root-only
+    // 0700 staging directory first, verify its SHA-256 against the digest
+    // computed before the prompt (and the source binary's code signature when
+    // present) to defeat any TOCTOU swap during the admin prompt, then re-sign
+    // the standalone copy (Kiri's own signature seals Info.plist, which the
+    // standalone copy is without) and atomically move everything into place.
+    format!(
+        "set -e; stage=$(/usr/bin/mktemp -d /var/root/.kiri-usb-install.XXXXXX); \
+         trap 'rm -rf \"$stage\"' EXIT; chmod 700 \"$stage\"; \
+         [ -f {me} ] && [ ! -L {me} ]; \
+         {codesign_check}cp {me} \"$stage/bin\"; \
+         got=$(/usr/bin/shasum -a 256 \"$stage/bin\" | /usr/bin/awk '{{print $1}}'); \
+         [ \"$got\" = {sum_q} ]; \
+         /usr/bin/codesign --force --sign - --identifier {label_q} \"$stage/bin\"; \
+         chown root:wheel \"$stage/bin\"; chmod 755 \"$stage/bin\"; \
+         mkdir -p /Library/PrivilegedHelperTools; mv -f \"$stage/bin\" {bin}; \
+         printf '%s\\n' {sum_q} > \"$stage/source\"; chown root:wheel \"$stage/source\"; chmod 644 \"$stage/source\"; mv -f \"$stage/source\" {src}; \
+         printf '%s' '{plist_b64}' | /usr/bin/base64 -D > \"$stage/plist\"; chown root:wheel \"$stage/plist\"; chmod 644 \"$stage/plist\"; mv -f \"$stage/plist\" {plist}; \
          launchctl bootout system/{label} 2>/dev/null || true; launchctl bootstrap system {plist}",
-        me = q(&me),
-        bin = q(&bin),
-        src = q(&source()),
-        tmp = q(&tmp),
-        plist = q(&plist)
-    );
-    let r = crate::setup::as_admin(&command, "Kiri wants to install its USB helper, so it can connect USB devices to its Linux VM. It asks once.");
-    let _ = std::fs::remove_file(&tmp);
-    r
+        me = me_q,
+        bin = q(bin),
+        src = q(src),
+        plist = q(plist),
+        sum_q = sh_quote(sum),
+        label_q = sh_quote(label),
+    )
+}
+
+/// Installs (or replaces) the helper: the one administrator prompt.
+fn install() -> io::Result<()> {
+    let me = std::env::current_exe()?.canonicalize()?;
+    let (bin, plist, label) = (binary(), plist(), LABEL.get());
+    // SAFETY: getuid has no preconditions.
+    let uid = unsafe { libc::getuid() };
+    let sum = digest(&me)?;
+    let req = designated_requirement(&me);
+    let command = install_command(&me, &bin, &source(), &plist, label, uid, &sum, req.as_deref());
+    crate::setup::as_admin(&command, "Kiri wants to install its USB helper, so it can connect USB devices to its Linux VM. It asks once.")
 }
 
 /// Removes the helper (`kiri usb helper remove`, and uninstalling Kiri).
@@ -185,6 +234,38 @@ fn attach_through(helper: UnixStream, location: &str, name: &str, speed: u32, de
 
 // --- The helper itself (root, under launchd) ----------------------------------------
 
+/// Checks synchronously whether `conn`'s peer UID is `uid` or `0` (root).
+fn peer_authorized(conn: &UnixStream, uid: libc::uid_t) -> io::Result<bool> {
+    let (mut peer_uid, mut peer_gid) = (0, 0);
+    // SAFETY: getpeereid on a connected UnixStream we own, writing two ids.
+    if unsafe { libc::getpeereid(conn.as_raw_fd(), &mut peer_uid, &mut peer_gid) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(peer_uid == uid || peer_uid == 0)
+}
+
+/// Drop guard that decrements an `AtomicUsize` concurrency slot on exit.
+struct Slot(Arc<AtomicUsize>);
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn try_acquire_slot(counter: &Arc<AtomicUsize>, limit: usize) -> Option<Slot> {
+    let mut cur = counter.load(Ordering::SeqCst);
+    loop {
+        if cur >= limit {
+            return None;
+        }
+        match counter.compare_exchange(cur, cur + 1, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return Some(Slot(counter.clone())),
+            Err(next) => cur = next,
+        }
+    }
+}
+
 /// `kiri usb helper LABEL UID`: serves attach requests from UID until
 /// launchd stops it.
 pub fn serve(label: &str, uid: &str) -> io::Result<()> {
@@ -205,11 +286,29 @@ pub fn serve(label: &str, uid: &str) -> io::Result<()> {
     // already gone back to macOS.
     let exe = std::env::current_exe()?;
     let sessions = Arc::new(AtomicUsize::new(0));
+    let handlers = Arc::new(AtomicUsize::new(0));
     super::mac::log(&format!("helper listening for uid {uid}"));
     for conn in listener.incoming() {
         let Ok(conn) = conn else { continue };
+        // Authorize peer UID synchronously on the accept thread so an
+        // unauthorized local user cannot spawn threads in the root helper.
+        match peer_authorized(&conn, uid) {
+            Ok(true) => {}
+            Ok(false) => {
+                let _ = conn.set_write_timeout(Some(Duration::from_millis(100)));
+                let _ = writeln!(&conn, "error: not your USB helper");
+                continue;
+            }
+            Err(_) => continue,
+        }
+        let Some(slot) = try_acquire_slot(&handlers, MAX_HANDLERS) else {
+            let _ = conn.set_write_timeout(Some(Duration::from_millis(100)));
+            let _ = writeln!(&conn, "error: too many concurrent requests");
+            continue;
+        };
         let (exe, sessions) = (exe.clone(), sessions.clone());
-        std::thread::spawn(move || {
+        let _ = std::thread::Builder::new().name("kiri-usb-req".into()).spawn(move || {
+            let _slot = slot;
             if let Err(e) = request(&conn, uid, &exe, &sessions) {
                 let _ = writeln!(&conn, "error: {e}");
             }
@@ -219,12 +318,7 @@ pub fn serve(label: &str, uid: &str) -> io::Result<()> {
 }
 
 fn request(conn: &UnixStream, uid: libc::uid_t, exe: &Path, sessions: &Arc<AtomicUsize>) -> io::Result<()> {
-    let (mut peer_uid, mut peer_gid) = (0, 0);
-    // SAFETY: getpeereid on a connected socket we own, writing two ids.
-    if unsafe { libc::getpeereid(conn.as_raw_fd(), &mut peer_uid, &mut peer_gid) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if peer_uid != uid && peer_uid != 0 {
+    if !peer_authorized(conn, uid)? {
         return Err(io::Error::other("not your USB helper"));
     }
     conn.set_read_timeout(Some(Duration::from_secs(10)))?;
@@ -260,6 +354,35 @@ fn request(conn: &UnixStream, uid: libc::uid_t, exe: &Path, sessions: &Arc<Atomi
     Ok(())
 }
 
+/// Relocates descriptors `a` and `b` to FDs 3 and 4 inside `pre_exec`.
+/// Uses `F_DUPFD` with minimum FD 5 so the temporary copies can never collide
+/// with target FDs 3 or 4 (avoiding closing 3/4 when either was free).
+///
+/// # Safety
+/// Must only be called in a child process after `fork` (async-signal-safe).
+unsafe fn relocate_child_fds(a: RawFd, b: RawFd) -> io::Result<()> {
+    let ta = unsafe { libc::fcntl(a, libc::F_DUPFD, 5) };
+    if ta < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let tb = unsafe { libc::fcntl(b, libc::F_DUPFD, 5) };
+    if tb < 0 {
+        let err = io::Error::last_os_error();
+        unsafe { libc::close(ta) };
+        return Err(err);
+    }
+    let ok = unsafe { libc::dup2(ta, 3) >= 0 && libc::dup2(tb, 4) >= 0 };
+    let err = if ok { None } else { Some(io::Error::last_os_error()) };
+    unsafe {
+        libc::close(ta);
+        libc::close(tb);
+    }
+    match err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
 /// `kiri usb serve LOCATION --fd 3 --status 4`, with the USB/IP
 /// connection as fd 3 and the requester's connection as fd 4 for its "ok".
 fn spawn(exe: &Path, location: &str, conn: OwnedFd, status: UnixStream) -> io::Result<std::process::Child> {
@@ -271,18 +394,9 @@ fn spawn(exe: &Path, location: &str, conn: OwnedFd, status: UnixStream) -> io::R
         .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
         .stdin(Stdio::null())
         .stdout(Stdio::null());
-    // SAFETY: only dup2 between fork and exec. Through a spare number
-    // first, so neither lands on the other.
+    // SAFETY: `relocate_child_fds` calls only async-signal-safe `fcntl`/`dup2`/`close`.
     unsafe {
-        cmd.pre_exec(move || {
-            let (ta, tb) = (libc::dup(a), libc::dup(b));
-            if ta < 0 || tb < 0 || libc::dup2(ta, 3) < 0 || libc::dup2(tb, 4) < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            libc::close(ta);
-            libc::close(tb);
-            Ok(())
-        });
+        cmd.pre_exec(move || relocate_child_fds(a, b));
     }
     let child = cmd.spawn();
     drop(conn);
@@ -335,22 +449,33 @@ fn recv_fd(sock: &UnixStream) -> io::Result<(Vec<u8>, Option<OwnedFd>)> {
         if n < 0 {
             return Err(io::Error::last_os_error());
         }
+        let ctrl_start = control.as_ptr() as usize;
+        let ctrl_end = ctrl_start.saturating_add((msg.msg_controllen as usize).min(control.len()));
+        let hdr_len = libc::CMSG_LEN(0) as usize;
         let mut c = libc::CMSG_FIRSTHDR(&msg);
         while !c.is_null() {
-            if (*c).cmsg_level == libc::SOL_SOCKET && (*c).cmsg_type == libc::SCM_RIGHTS {
-                let count = ((*c).cmsg_len as usize - libc::CMSG_LEN(0) as usize) / std::mem::size_of::<RawFd>();
+            if (*c).cmsg_level == libc::SOL_SOCKET
+                && (*c).cmsg_type == libc::SCM_RIGHTS
+                && let Some(payload_len) = ((*c).cmsg_len as usize).checked_sub(hdr_len)
+            {
+                let data_ptr = libc::CMSG_DATA(c);
+                let avail = ctrl_end.saturating_sub(data_ptr as usize);
+                let count = payload_len.min(avail) / std::mem::size_of::<RawFd>();
                 for i in 0..count {
-                    let raw = std::ptr::read_unaligned(libc::CMSG_DATA(c).cast::<RawFd>().add(i));
-                    let owned = OwnedFd::from_raw_fd(raw);
-                    // One is expected; any more are closed.
-                    if fd.is_none() {
-                        fd = Some(owned);
+                    let raw = std::ptr::read_unaligned(data_ptr.cast::<RawFd>().add(i));
+                    if raw >= 0 {
+                        let owned = OwnedFd::from_raw_fd(raw);
+                        // One is expected; any more are closed immediately on drop.
+                        if fd.is_none() {
+                            fd = Some(owned);
+                        }
                     }
                 }
             }
             c = libc::CMSG_NXTHDR(&msg, c);
         }
         if msg.msg_flags & libc::MSG_CTRUNC != 0 {
+            drop(fd);
             return Err(io::Error::other("the request carried too many descriptors"));
         }
         n as usize
@@ -400,5 +525,104 @@ mod tests {
         let (line, fd) = recv_fd(&b).unwrap();
         assert_eq!(line, b"attach 0x1\n");
         assert!(fd.is_none());
+    }
+
+    #[test]
+    fn install_command_avoids_temp_dir_and_verifies_sha256_and_codesign() {
+        let tmp_str = std::env::temp_dir().to_string_lossy().into_owned();
+        let cmd = install_command(
+            Path::new("/Applications/Kiri.app/Contents/MacOS/kiri"),
+            Path::new("/Library/PrivilegedHelperTools/dev.kiri.usb"),
+            Path::new("/Library/PrivilegedHelperTools/dev.kiri.usb.source"),
+            Path::new("/Library/LaunchDaemons/dev.kiri.usb.plist"),
+            "dev.kiri.usb",
+            501,
+            "0123456789abcdef",
+            Some("identifier \"dev.kiri.app\""),
+        );
+        assert!(!cmd.contains(&tmp_str), "must not stage in temp_dir: {cmd}");
+        assert!(cmd.contains("/var/root/.kiri-usb-install."), "{cmd}");
+        assert!(cmd.contains("/usr/bin/shasum -a 256 \"$stage/bin\""), "{cmd}");
+        assert!(cmd.contains("/usr/bin/codesign --verify --strict"), "{cmd}");
+        assert!(cmd.contains("/usr/bin/base64 -D > \"$stage/plist\""), "{cmd}");
+        let sha_pos = cmd.find("/usr/bin/shasum").unwrap();
+        let sign_pos = cmd.find("/usr/bin/codesign --force").unwrap();
+        assert!(sha_pos < sign_pos, "must verify SHA-256 before re-signing");
+    }
+
+    #[test]
+    fn recv_fd_rejects_truncated_multi_fd_control_without_panicking() {
+        let (a, b) = UnixStream::pair().unwrap();
+        let (x1, _y1) = UnixStream::pair().unwrap();
+        let (x2, _y2) = UnixStream::pair().unwrap();
+        let fds = [x1.as_raw_fd(), x2.as_raw_fd()];
+        let data = b"attach 0x1\n";
+        let space = unsafe { libc::CMSG_SPACE((std::mem::size_of_val(&fds)) as u32) } as usize;
+        let mut control = vec![0u8; space];
+        let mut iov = libc::iovec { iov_base: data.as_ptr() as *mut _, iov_len: data.len() };
+        unsafe {
+            let mut msg: libc::msghdr = std::mem::zeroed();
+            msg.msg_iov = &mut iov;
+            msg.msg_iovlen = 1;
+            msg.msg_control = control.as_mut_ptr().cast();
+            msg.msg_controllen = space as _;
+            let c = libc::CMSG_FIRSTHDR(&msg);
+            (*c).cmsg_level = libc::SOL_SOCKET;
+            (*c).cmsg_type = libc::SCM_RIGHTS;
+            (*c).cmsg_len = libc::CMSG_LEN((std::mem::size_of_val(&fds)) as u32) as _;
+            std::ptr::copy_nonoverlapping(fds.as_ptr().cast::<u8>(), libc::CMSG_DATA(c), std::mem::size_of_val(&fds));
+            assert!(libc::sendmsg(a.as_raw_fd(), &msg, 0) >= 0);
+        }
+        // Buffer only fits 1 FD, so kernel sets MSG_CTRUNC; recv_fd must error cleanly.
+        let err = recv_fd(&b).unwrap_err();
+        assert!(err.to_string().contains("too many descriptors"), "{err}");
+    }
+
+    #[test]
+    fn relocate_child_fds_preserves_fd_3_and_4_even_when_free() {
+        let (a_in, mut a_out) = UnixStream::pair().unwrap();
+        let (b_in, mut b_out) = UnixStream::pair().unwrap();
+        let (a_fd, b_fd) = (a_in.as_raw_fd(), b_in.as_raw_fd());
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "printf 'A' >&3 && printf 'B' >&4"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        unsafe {
+            cmd.pre_exec(move || {
+                // Close 3 and 4 first if they aren't a_fd/b_fd so `dup()` would
+                // have collided with 3/4 and closed them!
+                if a_fd != 3 && b_fd != 3 {
+                    libc::close(3);
+                }
+                if a_fd != 4 && b_fd != 4 {
+                    libc::close(4);
+                }
+                relocate_child_fds(a_fd, b_fd)
+            });
+        }
+        let status = cmd.status().unwrap();
+        drop(a_in);
+        drop(b_in);
+        assert!(status.success(), "child failed: {status}");
+        let mut got_a = String::new();
+        let mut got_b = String::new();
+        a_out.read_to_string(&mut got_a).unwrap();
+        b_out.read_to_string(&mut got_b).unwrap();
+        assert_eq!(got_a, "A");
+        assert_eq!(got_b, "B");
+    }
+
+    #[test]
+    fn handler_slots_enforce_limit() {
+        let c = Arc::new(AtomicUsize::new(0));
+        let s1 = try_acquire_slot(&c, 2).unwrap();
+        let s2 = try_acquire_slot(&c, 2).unwrap();
+        assert!(try_acquire_slot(&c, 2).is_none());
+        drop(s1);
+        let s3 = try_acquire_slot(&c, 2).unwrap();
+        drop(s2);
+        drop(s3);
+        assert_eq!(c.load(Ordering::SeqCst), 0);
     }
 }

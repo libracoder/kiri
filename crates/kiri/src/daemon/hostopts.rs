@@ -147,7 +147,7 @@ pub fn guest_lines(opts: &Value, net_host: bool) -> Result<Vec<String>, String> 
         for (key, value) in map {
             let value = value.as_str().map(str::to_owned).unwrap_or_else(|| value.to_string());
             let (ns, path) = sysctl(key, net_host)?;
-            if value.contains(['\t', '\n']) {
+            if value.contains(['\t', '\n', '\r', '\0']) {
                 return Err(format!("invalid value for sysctl {key:?}"));
             }
             out.push(format!("sysctl\t{ns}\t{path}\t{value}"));
@@ -161,7 +161,7 @@ pub fn guest_lines(opts: &Value, net_host: bool) -> Result<Vec<String>, String> 
             if !p.starts_with('/') {
                 return Err(format!("{p} is not an absolute path"));
             }
-            if p.contains(['\t', '\n']) || p.split('/').any(|c| c == "..") {
+            if p.contains(['\t', '\n', '\r', '\0']) || p.split('/').any(|c| c == "..") {
                 return Err(format!("invalid device path {p:?}"));
             }
         }
@@ -175,7 +175,7 @@ pub fn guest_lines(opts: &Value, net_host: bool) -> Result<Vec<String>, String> 
         out.push(format!("devrule\t{t}\t{major}\t{minor}\t{perms}"));
     }
     for g in strings(&opts["GroupAdd"]) {
-        if g.is_empty() || g.contains(['\t', '\n', ':']) {
+        if g.is_empty() || g.contains(['\t', '\n', '\r', '\0', ':']) {
             return Err(format!("invalid group {g:?}"));
         }
         out.push(format!("group\t{g}"));

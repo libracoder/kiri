@@ -239,9 +239,10 @@ pub fn preview(name: String, path: String) {
             emit(e.to_string());
         };
         let Some(file) = container_path(&path) else { return with("error", json!("not a path in the container")) };
-        match read_file(&name, &file) {
-            Ok(bytes) if bytes.len() > PREVIEW_MAX || bytes.contains(&0) => with("binary", json!(true)),
-            Ok(bytes) => match String::from_utf8(bytes) {
+        match read_file_capped(&name, &file, Some(PREVIEW_MAX)) {
+            Ok(None) => with("binary", json!(true)),
+            Ok(Some(bytes)) if bytes.len() > PREVIEW_MAX || bytes.contains(&0) => with("binary", json!(true)),
+            Ok(Some(bytes)) => match String::from_utf8(bytes) {
                 Ok(text) => with("text", json!(text)),
                 Err(_) => with("binary", json!(true)),
             },
@@ -259,10 +260,12 @@ pub(crate) fn safe_filename(leaf: &str) -> String {
         .chars()
         .map(|c| if "\\/:*?\"<>|".contains(c) || (c as u32) < 0x20 || matches!(c as u32, 0x200B..=0x200F | 0x202A..=0x202E | 0x2066..=0x2069) { '_' } else { c })
         .collect();
-    // No leading/trailing dots or spaces (Windows strips them, which could
-    // re-expose an extension or an empty name).
+    // Truncate on a UTF-8 char boundary BEFORE stripping trailing dots/spaces,
+    // so multi-byte characters never panic and truncation cannot re-expose
+    // trailing dots or spaces (which Windows strips).
+    let cut = s.floor_char_boundary(200);
+    s.truncate(cut);
     s = s.trim_matches(|c| c == '.' || c == ' ').to_owned();
-    s.truncate(200);
     if s.is_empty() {
         s = "file".into();
     }
@@ -323,13 +326,9 @@ fn escape(s: &str) -> String {
     s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-._~/".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
 }
 
-/// One regular file's contents, from the archive API's tar.
-fn read_file(container: &str, file: &str) -> std::io::Result<Vec<u8>> {
-    let r = client::request("GET", &format!("/containers/{container}/archive?path={}", escape(file)), None)?;
-    if !r.ok() {
-        return Err(std::io::Error::other(r.error()));
-    }
-    let tar = r.body;
+/// Extracts the first regular file from a tar buffer with overflow-safe bounds
+/// checks; returns `Ok(None)` when `max_bytes` is exceeded.
+fn extract_tar_file(tar: &[u8], max_bytes: Option<usize>) -> std::io::Result<Option<Vec<u8>>> {
     if tar.len() < 512 {
         return Err(std::io::Error::other("empty archive"));
     }
@@ -337,8 +336,28 @@ fn read_file(container: &str, file: &str) -> std::io::Result<Vec<u8>> {
         return Err(std::io::Error::other("a directory"));
     }
     let size_field = String::from_utf8_lossy(&tar[124..136]);
-    let size = usize::from_str_radix(size_field.trim_matches(|c: char| c == '\0' || c.is_whitespace()), 8).map_err(|_| std::io::Error::other("bad archive"))?;
-    tar.get(512..512 + size).map(<[u8]>::to_vec).ok_or_else(|| std::io::Error::other("short archive"))
+    let size = usize::from_str_radix(size_field.trim_matches(|c: char| c == '\0' || c.is_whitespace()), 8)
+        .map_err(|_| std::io::Error::other("bad archive"))?;
+    if let Some(cap) = max_bytes
+        && size > cap
+    {
+        return Ok(None);
+    }
+    let end = 512usize.checked_add(size).ok_or_else(|| std::io::Error::other("archive size overflow"))?;
+    tar.get(512..end).map(|b| Some(b.to_vec())).ok_or_else(|| std::io::Error::other("short archive"))
+}
+
+/// One regular file's contents, from the archive API's tar.
+fn read_file(container: &str, file: &str) -> std::io::Result<Vec<u8>> {
+    read_file_capped(container, file, None)?.ok_or_else(|| std::io::Error::other("file too large"))
+}
+
+fn read_file_capped(container: &str, file: &str, max_bytes: Option<usize>) -> std::io::Result<Option<Vec<u8>>> {
+    let r = client::request("GET", &format!("/containers/{}/archive?path={}", escape(container), escape(file)), None)?;
+    if !r.ok() {
+        return Err(std::io::Error::other(r.error()));
+    }
+    extract_tar_file(&r.body, max_bytes)
 }
 
 /// The docker CLI installed beside kiri-win (kiri.ps1 puts it in bin\),
@@ -363,7 +382,7 @@ pub fn docker_cli() -> String {
 
 /// A console with a shell in the container, as the Mac opens Terminal.
 pub fn terminal(name: &str, pipe: &str) {
-    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || "_.-".contains(c)) {
+    if name.is_empty() || name.starts_with('-') || !name.chars().all(|c| c.is_ascii_alphanumeric() || "_.-".contains(c)) {
         return;
     }
     // \\.\pipe\kiri is npipe:////./pipe/kiri to the docker CLI. Launch the
@@ -374,7 +393,7 @@ pub fn terminal(name: &str, pipe: &str) {
     let mut cmd = crate::win::tool(&docker_cli());
     std::os::windows::process::CommandExt::creation_flags(&mut cmd, CREATE_NEW_CONSOLE);
     let spawned = cmd
-        .args(["--host", &host, "exec", "-it", name, "sh", "-c", "exec $(command -v bash || command -v sh)"])
+        .args(["--host", &host, "exec", "-it", "--", name, "sh", "-c", "exec $(command -v bash || command -v sh)"])
         .spawn();
     if let Err(e) = spawned {
         emit(notice("error", &trf("Could not open a terminal: {error}", &[("error", &e)])));
@@ -401,5 +420,27 @@ mod tests {
         assert_eq!(safe_filename("com1.txt"), "_com1.txt");
         // Ordinary names pass through.
         assert_eq!(safe_filename("report.pdf"), "report.pdf");
+        // Multi-byte UTF-8 straddling byte 200 never panics, and truncation cannot leave a trailing dot.
+        let long_utf8 = format!("{}é.txt", "a".repeat(199));
+        let got = safe_filename(&long_utf8);
+        assert!(got.len() <= 200 && !got.ends_with('.'), "{got:?}");
+        let trailing_dot = format!("{}.txt", "a".repeat(199));
+        assert!(!safe_filename(&trailing_dot).ends_with('.'));
+    }
+
+    #[test]
+    fn extract_tar_file_checks_overflow_and_preview_cap() {
+        let mut tar = vec![0u8; 1024];
+        // Oversized octal size (11 octal 7s = 8 GiB - 1) must fail cleanly.
+        tar[124..135].copy_from_slice(b"77777777777");
+        assert!(super::extract_tar_file(&tar, None).is_err());
+        assert_eq!(super::extract_tar_file(&tar, Some(super::PREVIEW_MAX)).unwrap(), None);
+
+        // Valid 5-byte payload.
+        let mut ok_tar = vec![0u8; 1024];
+        ok_tar[124..135].copy_from_slice(b"00000000005");
+        ok_tar[512..517].copy_from_slice(b"hello");
+        assert_eq!(super::extract_tar_file(&ok_tar, Some(super::PREVIEW_MAX)).unwrap(), Some(b"hello".to_vec()));
+        assert_eq!(super::extract_tar_file(&ok_tar, Some(4)).unwrap(), None);
     }
 }

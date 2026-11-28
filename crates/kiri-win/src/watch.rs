@@ -299,7 +299,7 @@ fn collapse_specs(specs: Vec<WatchSpec>) -> Vec<WatchSpec> {
             if exclude_self && parent.eq_ignore_ascii_case(path) {
                 return false;
             }
-            if path.len() < parent.len() {
+            if path.len() < parent.len() || !path.is_char_boundary(parent.len()) {
                 return false;
             }
             let head = &path[..parent.len()];
@@ -887,5 +887,20 @@ mod tests {
         }
         assert_eq!(tail.last(), Some(&('U', wsl_root)));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn collapse_specs_handles_multibyte_utf8_boundaries() {
+        // Parent "C:\proj\ap" (10 bytes) vs sibling "C:\proj\aé" (byte 10 splits 'é'):
+        // must not panic on UTF-8 char boundary slicing.
+        let specs = vec![
+            WatchSpec { dir: r"C:\proj\ap".into(), recursive: true, only_file: None },
+            WatchSpec { dir: r"C:\proj\aé".into(), recursive: true, only_file: None },
+            WatchSpec { dir: r"C:\proj\ap\sub".into(), recursive: true, only_file: None },
+        ];
+        let collapsed = collapse_specs(specs);
+        assert_eq!(collapsed.len(), 2);
+        assert!(collapsed.iter().any(|s| s.dir == r"C:\proj\ap"));
+        assert!(collapsed.iter().any(|s| s.dir == r"C:\proj\aé"));
     }
 }

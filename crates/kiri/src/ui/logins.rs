@@ -141,11 +141,54 @@ fn edit_auths(change: impl FnOnce(&mut serde_json::Map<String, Value>)) -> io::R
         change(a);
     }
     if let Some(dir) = path.parent() {
+        let existed = dir.exists();
         std::fs::create_dir_all(dir)?;
+        #[cfg(unix)]
+        if !existed {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        }
     }
-    let tmp = path.with_extension("kiri-tmp");
-    std::fs::write(&tmp, serde_json::to_vec_pretty(&cfg).map_err(io::Error::other)?)?;
-    std::fs::rename(tmp, path)
+    let bytes = serde_json::to_vec_pretty(&cfg).map_err(io::Error::other)?;
+    let tmp = write_private_temp(&path, &bytes)?;
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Writes `bytes` to a newly created private temporary file (`0600` on Unix)
+/// beside `path`, ready to be atomically renamed over `path`.
+fn write_private_temp(path: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let pid = std::process::id();
+    for _ in 0..32 {
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp = dir.join(format!(".config.kiri-tmp.{pid}.{n}"));
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        match opts.open(&tmp) {
+            Ok(mut f) => {
+                if let Err(e) = f.write_all(bytes) {
+                    drop(f);
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(e);
+                }
+                return Ok(tmp);
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(io::ErrorKind::AlreadyExists, "could not create temporary config file"))
 }
 
 /// The credential helper config.json names for `key`: its own in
@@ -849,5 +892,23 @@ mod tests {
         let t = header(HUB, &Login { username: TOKEN_USER.into(), secret: "tok".into() });
         let v: Value = serde_json::from_slice(&b64::decode(&t).unwrap()).unwrap();
         assert_eq!(v, json!({"identitytoken": "tok", "serveraddress": HUB}));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_private_temp_creates_mode_0600_and_rename_preserves_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("kiri-logins-perm-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        std::fs::write(&path, br#"{"auths":{"example.com":{"auth":"dXNlcjpwYXNz"}}}"#).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let tmp = write_private_temp(&path, br#"{"auths":{"example.com":{"auth":"dXNlcjpwYXNz"},"ghcr.io":{}}}"#).unwrap();
+        assert_eq!(std::fs::metadata(&tmp).unwrap().permissions().mode() & 0o777, 0o600);
+        std::fs::rename(&tmp, &path).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

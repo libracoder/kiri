@@ -53,8 +53,7 @@ impl Volumes {
 
     fn save(&self) {
         if let Ok(json) = serde_json::to_vec(&self.list) {
-            let tmp = self.path.with_extension("json.tmp");
-            if let Err(e) = std::fs::write(&tmp, json).and_then(|()| std::fs::rename(&tmp, &self.path)) {
+            if let Err(e) = super::write_atomic_mode(&self.path, &json, 0o600) {
                 crate::diag::error!("saving volumes failed", error = e);
             }
         }

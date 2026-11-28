@@ -76,15 +76,60 @@ struct Inner {
     extra: RefCell<Vec<(Retained<VZVirtioSocketListener>, Retained<PortDelegate>)>>,
 }
 
-/// Wraps a value that may only be used on the VM's queue.
-///
-/// Objective-C objects are not `Send`, but the queue serialises all access, so
-/// moving them across threads is sound as long as they are only touched from
-/// inside closures that run on that queue — which is the only way this module
-/// ever reaches them.
-struct OnQueue<T>(T);
-// SAFETY: see the type's documentation; values are only touched on the queue.
-unsafe impl<T> Send for OnQueue<T> {}
+/// Encapsulates values that may only be touched or dropped on a VM's serial
+/// `DispatchQueue`. Making the inner field private to this submodule ensures
+/// callers cannot access ObjC objects off-queue without a [`QueueToken`].
+mod on_queue {
+    use dispatch2::DispatchQueue;
+
+    /// Zero-sized witness proving execution is currently on a VM's serial queue.
+    pub(super) struct QueueToken(());
+
+    /// Wraps a value that may only be used on the VM's queue.
+    ///
+    /// Objective-C objects are not `Send`, but the queue serialises all access,
+    /// so moving them across threads is sound as long as they are only touched
+    /// and dropped on that queue.
+    pub(super) struct OnQueue<T>(T);
+
+    // SAFETY: access to the inner `T` requires a `QueueToken` (only constructed
+    // inside a serial-queue closure), and owners drop `OnQueue<T>` on that queue.
+    unsafe impl<T> Send for OnQueue<T> {}
+
+    impl<T> OnQueue<T> {
+        pub(super) fn new(value: T) -> Self {
+            Self(value)
+        }
+
+        pub(super) fn get<'a>(&'a self, _token: &QueueToken) -> &'a T {
+            &self.0
+        }
+
+        pub(super) fn get_mut<'a>(&'a mut self, _token: &QueueToken) -> &'a mut T {
+            &mut self.0
+        }
+
+        pub(super) fn into_inner(self, _token: &QueueToken) -> T {
+            self.0
+        }
+    }
+
+    pub(super) fn exec_sync<F: FnOnce(&QueueToken) + Send>(queue: &DispatchQueue, f: F) {
+        queue.exec_sync(move || {
+            let token = QueueToken(());
+            f(&token);
+        });
+    }
+
+    pub(super) fn exec_async<F: FnOnce(&QueueToken) + Send + 'static>(queue: &DispatchQueue, f: F) {
+        queue.exec_async(move || {
+            let token = QueueToken(());
+            f(&token);
+        });
+    }
+}
+
+use on_queue::OnQueue;
 
 impl std::fmt::Debug for OnQueue<Inner> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -109,7 +154,7 @@ impl std::fmt::Debug for ConnectionOwner {
 impl Drop for ConnectionOwner {
     fn drop(&mut self) {
         if let Some(vm) = self.vm.get_mut().unwrap_or_else(|e| e.into_inner()).take() {
-            self.queue.exec_sync(move || drop(vm));
+            on_queue::exec_sync(&self.queue, move |tok| drop(vm.into_inner(tok)));
         }
     }
 }
@@ -132,7 +177,7 @@ impl ConnectionOwner {
             let old = vm.take();
             drop(vm);
             if let Some(old) = old {
-                self.queue.exec_sync(move || drop(old));
+                on_queue::exec_sync(&self.queue, move |tok| drop(old.into_inner(tok)));
             }
             return Ok(());
         }
@@ -153,12 +198,15 @@ impl Vm {
         let (started_tx, started_rx) = mpsc::sync_channel::<Result<(), String>>(1);
 
         let mut built: Option<io::Result<OnQueue<Inner>>> = None;
-        let slot = OnQueue(&mut built);
+        let mut vm_ref: Option<OnQueue<Retained<VZVirtualMachine>>> = None;
+        let mut slot = OnQueue::new(&mut built);
+        let mut vm_slot = OnQueue::new(&mut vm_ref);
         let q = queue.clone();
-        queue.exec_sync(move || {
-            let slot = slot;
-            *slot.0 = Some(build(cfg, &q, tx).map(OnQueue));
-            if let Some(Ok(inner)) = slot.0.as_ref() {
+        on_queue::exec_sync(&queue, move |tok| {
+            let built_res = build(cfg, &q, tx);
+            if let Ok(inner) = built_res.as_ref() {
+                // Clone the ObjC VM reference on the VM's queue before leaving it.
+                **vm_slot.get_mut(tok) = Some(OnQueue::new(inner.vm.clone()));
                 let started_tx = started_tx.clone();
                 let done = RcBlock::new(move |err: *mut NSError| {
                     // SAFETY: the framework passes either null or a valid NSError.
@@ -166,11 +214,12 @@ impl Vm {
                     let _ = started_tx.try_send(res);
                 });
                 // SAFETY: called on the VM's queue, as the framework requires.
-                unsafe { inner.0.vm.startWithCompletionHandler(&done) };
+                unsafe { inner.vm.startWithCompletionHandler(&done) };
             }
+            **slot.get_mut(tok) = Some(built_res.map(OnQueue::new));
         });
         let inner = built.expect("build ran synchronously")?;
-        let connection = Arc::new(ConnectionOwner { queue: queue.clone(), vm: RwLock::new(Some(OnQueue(inner.0.vm.clone()))) });
+        let connection = Arc::new(ConnectionOwner { queue: queue.clone(), vm: RwLock::new(vm_ref) });
         let vm = Vm { queue, inner: Some(inner), events, closing: Arc::new(AtomicBool::new(false)), connection: Some(connection) };
         match started_rx.recv_timeout(Duration::from_secs(30)) {
             Ok(Ok(())) => Ok(vm),
@@ -192,19 +241,19 @@ impl Vm {
 
     fn force_stop_checked(&self, timeout: Duration) -> io::Result<()> {
         let Some(inner) = self.inner.as_ref() else { return Ok(()) };
-        let inner = OnQueue(&inner.0);
+        let inner = OnQueue::new(inner);
         let (tx, rx) = mpsc::sync_channel::<Result<(), String>>(1);
-        self.queue.exec_sync(move || {
-            let inner = inner;
+        on_queue::exec_sync(&self.queue, move |tok| {
+            let inner = inner.get(tok).get(tok);
             // SAFETY: on the VM's queue.
             unsafe {
-                if inner.0.vm.canStop() {
+                if inner.vm.canStop() {
                     let done = RcBlock::new(move |err: *mut NSError| {
                         let result = err.as_ref().map_or(Ok(()), |e| Err(describe(e)));
                         let _ = tx.try_send(result);
                     });
-                    inner.0.vm.stopWithCompletionHandler(&done);
-                } else if matches!(inner.0.vm.state(), VZVirtualMachineState::Stopped | VZVirtualMachineState::Error) {
+                    inner.vm.stopWithCompletionHandler(&done);
+                } else if matches!(inner.vm.state(), VZVirtualMachineState::Stopped | VZVirtualMachineState::Error) {
                     let _ = tx.try_send(Ok(()));
                 } else {
                     let _ = tx.try_send(Err("the VM cannot be stopped in its current state".into()));
@@ -220,15 +269,15 @@ impl Vm {
 
     fn is_stopped(&self) -> bool {
         let Some(inner) = self.inner.as_ref() else { return true };
-        let inner = OnQueue(&inner.0);
+        let inner = OnQueue::new(inner);
         let mut stopped = false;
-        let out = OnQueue(&mut stopped);
-        self.queue.exec_sync(move || {
-            let (inner, out) = (inner, out);
+        let mut out = OnQueue::new(&mut stopped);
+        on_queue::exec_sync(&self.queue, move |tok| {
+            let inner = inner.get(tok).get(tok);
             // SAFETY: on the VM's queue, as the framework requires.
             // Error is where a VM ends up when its process dies: it is not
             // running and never will again, so it has let go of its disk.
-            *out.0 = matches!(unsafe { inner.0.vm.state() }, VZVirtualMachineState::Stopped | VZVirtualMachineState::Error);
+            **out.get_mut(tok) = matches!(unsafe { inner.vm.state() }, VZVirtualMachineState::Stopped | VZVirtualMachineState::Error);
         });
         stopped
     }
@@ -243,20 +292,20 @@ impl Vm {
         }
         self.connection.take();
         if let Some(inner) = self.inner.take() {
-            self.queue.exec_sync(move || drop(inner));
+            on_queue::exec_sync(&self.queue, move |tok| drop(inner.into_inner(tok)));
         }
         Ok(())
     }
 
     pub fn is_running(&self) -> bool {
         let Some(inner) = self.inner.as_ref() else { return false };
-        let inner = OnQueue(&inner.0);
+        let inner = OnQueue::new(inner);
         let mut running = false;
-        let out = OnQueue(&mut running);
-        self.queue.exec_sync(move || {
-            let (inner, out) = (inner, out);
+        let mut out = OnQueue::new(&mut running);
+        on_queue::exec_sync(&self.queue, move |tok| {
+            let inner = inner.get(tok).get(tok);
             // SAFETY: on the VM's queue.
-            *out.0 = unsafe { inner.0.vm.state() } == VZVirtualMachineState::Running;
+            **out.get_mut(tok) = unsafe { inner.vm.state() } == VZVirtualMachineState::Running;
         });
         running
     }
@@ -280,7 +329,7 @@ impl std::fmt::Debug for VsockStream {
 impl Drop for VsockStream {
     fn drop(&mut self) {
         if let Some(conn) = self.conn.take() {
-            self.queue.exec_async(move || drop(conn));
+            on_queue::exec_async(&self.queue, move |tok| drop(conn.into_inner(tok)));
         }
     }
 }
@@ -293,16 +342,16 @@ impl Vm {
     /// Asks the guest (through the balloon) to run in `bytes` of memory. The
     /// guest gives the rest back to macOS. Returns the previous target.
     pub fn set_memory_target(&self, bytes: u64) -> Option<u64> {
-        let inner = OnQueue(&self.inner.as_ref()?.0);
+        let inner = OnQueue::new(self.inner.as_ref()?);
         let mut previous = None;
-        let out = OnQueue(&mut previous);
-        self.queue.exec_sync(move || {
-            let (inner, out) = (inner, out);
+        let mut out = OnQueue::new(&mut previous);
+        on_queue::exec_sync(&self.queue, move |tok| {
+            let inner = inner.get(tok).get(tok);
             // SAFETY: on the VM's queue, as the framework requires.
             unsafe {
-                let Some(dev) = inner.0.vm.memoryBalloonDevices().firstObject() else { return };
+                let Some(dev) = inner.vm.memoryBalloonDevices().firstObject() else { return };
                 let Ok(dev) = Retained::downcast::<VZVirtioTraditionalMemoryBalloonDevice>(dev) else { return };
-                *out.0 = Some(dev.targetVirtualMachineMemorySize());
+                **out.get_mut(tok) = Some(dev.targetVirtualMachineMemorySize());
                 dev.setTargetVirtualMachineMemorySize(bytes);
             }
         });
@@ -316,23 +365,23 @@ impl Vm {
             return Err(io::Error::new(io::ErrorKind::NotConnected, "the VM is retiring"));
         }
         let Some(inner) = self.inner.as_ref() else { return Err(io::Error::other("VM is gone")) };
-        let inner = OnQueue(&inner.0);
-        let handler = OnQueue(handler);
+        let inner = OnQueue::new(inner);
+        let handler = OnQueue::new(handler);
         let queue = self.queue.clone();
         let mut result = Err(io::Error::other("vsock device missing"));
-        let out = OnQueue(&mut result);
-        self.queue.exec_sync(move || {
-            let (inner, handler, out) = (inner, handler, out);
+        let mut out = OnQueue::new(&mut result);
+        on_queue::exec_sync(&self.queue, move |tok| {
+            let inner = inner.get(tok).get(tok);
             // SAFETY: on the VM's queue, as the framework requires.
             unsafe {
-                let device = inner.0.vm.socketDevices().firstObject();
+                let device = inner.vm.socketDevices().firstObject();
                 let Some(device) = device.and_then(|d| Retained::downcast::<VZVirtioSocketDevice>(d).ok()) else { return };
                 let listener = VZVirtioSocketListener::new();
-                let delegate = PortDelegate::new(handler.0, queue);
+                let delegate = PortDelegate::new(handler.into_inner(tok), queue);
                 listener.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
                 device.setSocketListener_forPort(&listener, port);
-                inner.0.extra.borrow_mut().push((listener, delegate));
-                *out.0 = Ok(());
+                inner.extra.borrow_mut().push((listener, delegate));
+                **out.get_mut(tok) = Ok(());
             }
         });
         result
@@ -375,42 +424,49 @@ impl Connector {
             return Err(io::Error::new(io::ErrorKind::NotConnected, "the VM is retiring"));
         }
         let Some(vm) = vm.as_ref() else { return Err(io::Error::other("VM is gone")) };
-        let vm = OnQueue(&vm.0);
-        let (tx, rx) = mpsc::sync_channel::<Result<OnQueue<Retained<VZVirtioSocketConnection>>, String>>(1);
-        owner.queue.exec_sync(move || {
-            let vm = vm;
+        let vm = OnQueue::new(vm);
+        let (tx, rx) = mpsc::sync_channel::<io::Result<(OwnedFd, OnQueue<Retained<VZVirtioSocketConnection>>)>>(1);
+        on_queue::exec_sync(&owner.queue, move |tok| {
+            let vm = vm.get(tok).get(tok);
             // SAFETY: on the VM's queue, as the framework requires.
             unsafe {
-                let device = vm.0.socketDevices().firstObject();
+                let device = vm.socketDevices().firstObject();
                 let Some(device) = device.and_then(|d| Retained::downcast::<VZVirtioSocketDevice>(d).ok()) else {
-                    let _ = tx.try_send(Err("VM has no vsock device".into()));
+                    let _ = tx.try_send(Err(io::Error::new(io::ErrorKind::ConnectionRefused, "VM has no vsock device")));
                     return;
                 };
                 let done = RcBlock::new(move |conn: *mut VZVirtioSocketConnection, err: *mut NSError| {
+                    // Completion handler runs on `owner.queue`: invoke `fileDescriptor()`
+                    // and `dup()` here so `conn` is never touched or dropped off-queue.
                     let result = match (conn.as_ref(), err.as_ref()) {
-                        (Some(c), _) => Ok(OnQueue(c.retain())),
-                        (None, Some(e)) => Err(describe(e)),
-                        (None, None) => Err("vsock connect failed".into()),
+                        (Some(c), _) => {
+                            let fd = libc::dup(c.fileDescriptor());
+                            if fd < 0 {
+                                Err(io::Error::last_os_error())
+                            } else {
+                                // SAFETY: `fd` is a fresh descriptor that nothing else owns.
+                                let owned = OwnedFd::from_raw_fd(fd);
+                                Ok((owned, OnQueue::new(c.retain())))
+                            }
+                        }
+                        (None, Some(e)) => Err(io::Error::new(io::ErrorKind::ConnectionRefused, describe(e))),
+                        (None, None) => Err(io::Error::new(io::ErrorKind::ConnectionRefused, "vsock connect failed")),
                     };
                     let _ = tx.try_send(result);
                 });
                 device.connectToPort_completionHandler(port, &done);
             }
         });
-        let conn = match rx.recv_timeout(Duration::from_secs(5)) {
-            Ok(Ok(c)) => c,
-            Ok(Err(e)) => return Err(io::Error::new(io::ErrorKind::ConnectionRefused, e)),
-            Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "vsock connect timed out")),
-        };
-        // SAFETY: the connection owns a valid descriptor while it is alive;
-        // the duplicate is ours and independent of it.
-        let fd = unsafe { libc::dup(conn.0.fileDescriptor()) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(Ok((fd, conn))) => Ok(VsockStream { fd, conn: Some(conn), queue: owner.queue.clone() }),
+            Ok(Err(e)) => Err(e),
+            Err(_) => {
+                // Drop `rx` on `owner.queue` so a racing completion that buffered an
+                // `OnQueue<Retained<VZVirtioSocketConnection>>` releases it on-queue.
+                on_queue::exec_async(&owner.queue, move |_tok| drop(rx));
+                Err(io::Error::new(io::ErrorKind::TimedOut, "vsock connect timed out"))
+            }
         }
-        // SAFETY: `fd` is a fresh descriptor that nothing else owns.
-        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-        Ok(VsockStream { fd, conn: Some(conn), queue: owner.queue.clone() })
     }
 }
 
@@ -422,7 +478,7 @@ impl Drop for Vm {
         }
         // Release every framework object on the queue that owns it.
         if let Some(inner) = self.inner.take() {
-            self.queue.exec_sync(move || drop(inner));
+            on_queue::exec_sync(&self.queue, move |tok| drop(inner.into_inner(tok)));
         }
     }
 }
@@ -639,7 +695,7 @@ define_class!(
             }
             // SAFETY: `fd` is a fresh descriptor that nothing else owns.
             let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-            let stream = VsockStream { fd, conn: Some(OnQueue(conn.retain())), queue: self.ivars().queue.clone() };
+            let stream = VsockStream { fd, conn: Some(OnQueue::new(conn.retain())), queue: self.ivars().queue.clone() };
             (self.ivars().handler)(stream);
             Bool::YES
         }
@@ -711,5 +767,48 @@ impl ListenerDelegate {
         let this = Self::alloc().set_ivars(ListenerIvars { events, connections: RefCell::new(Vec::new()) });
         // SAFETY: NSObject's init on a freshly allocated object.
         unsafe { msg_send![super(this), init] }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn on_queue_executes_and_drops_value_on_serial_queue() {
+        let queue = DispatchQueue::new("dev.kiri.vm.test", DispatchQueueAttr::SERIAL);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let dropped_on_queue = Arc::new(AtomicBool::new(false));
+        struct Guard {
+            flag: Arc<AtomicBool>,
+            on_queue: Arc<AtomicBool>,
+            queue_tid: Arc<std::sync::Mutex<Option<std::thread::ThreadId>>>,
+        }
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.flag.store(true, Ordering::Release);
+                if *self.queue_tid.lock().unwrap() == Some(std::thread::current().id()) {
+                    self.on_queue.store(true, Ordering::Release);
+                }
+            }
+        }
+        let queue_tid = Arc::new(std::sync::Mutex::new(None));
+        let mut cell: Option<OnQueue<Guard>> = None;
+        let mut slot = OnQueue::new(&mut cell);
+        let qtid = queue_tid.clone();
+        let d1 = dropped.clone();
+        let d2 = dropped_on_queue.clone();
+        on_queue::exec_sync(&queue, move |tok| {
+            *qtid.lock().unwrap() = Some(std::thread::current().id());
+            **slot.get_mut(tok) = Some(OnQueue::new(Guard { flag: d1, on_queue: d2, queue_tid: qtid }));
+        });
+        assert!(!dropped.load(Ordering::Acquire));
+        let guard = cell.take().unwrap();
+        on_queue::exec_sync(&queue, move |tok| {
+            *queue_tid.lock().unwrap() = Some(std::thread::current().id());
+            drop(guard.into_inner(tok));
+        });
+        assert!(dropped.load(Ordering::Acquire));
+        assert!(dropped_on_queue.load(Ordering::Acquire));
     }
 }

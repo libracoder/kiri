@@ -97,10 +97,12 @@ pub fn interest(fds: &mut Vec<libc::pollfd>) {
 
 /// Whether `fd` is a copy child's socket; if so, answers its request:
 /// `m<id>` and the container's layers, one per line, to mount its root or
-/// share the mount it has; `h<id>` to only hold a mount there is (a copy
-/// into a running container, which must not outlive a restart's unmount).
-/// The answer is `+`, or `-` and why not.
-pub fn on_readable(fd: i32, paths: &Paths) -> bool {
+/// share the mount it has; `h<id>` to only hold a mount there is; `r<id>` to
+/// verify the container is still live in the agent, hold its root, and pass an
+/// open directory descriptor for `/proc/<pid>/root` via `SCM_RIGHTS` (so the
+/// copy child can never chroot into a recycled PID).
+/// The answer is `+` (plus an `SCM_RIGHTS` fd for `r`), or `-` and why not.
+pub fn on_readable(fd: i32, paths: &Paths, live_pid: impl Fn(&str) -> Option<libc::pid_t>) -> bool {
     CHILDREN.with_borrow_mut(|c| {
         let Some(ch) = c.iter_mut().find(|ch| ch.chan.as_raw_fd() == fd) else { return false };
         let mut buf = vec![0u8; 64 << 10];
@@ -119,6 +121,39 @@ pub fn on_readable(fd: i32, paths: &Paths) -> bool {
         let mut lines = rest.split('\n');
         let id = lines.next().unwrap_or("");
         let layers: Vec<&str> = lines.collect();
+        if kind == "r" {
+            let live_root = (|| -> io::Result<(PathBuf, OwnedFd)> {
+                let Some(pid) = live_pid(id) else {
+                    return Err(io::Error::new(io::ErrorKind::NotFound, "container is not running"));
+                };
+                let root = super::roots::hold(paths, id)?;
+                let proc_root = sys::cstr(format!("/proc/{pid}/root"))?;
+                // SAFETY: `pid` is an unreaped child of this single-threaded agent,
+                // so it cannot have been recycled; `proc_root` is NUL-terminated.
+                let rfd = unsafe { libc::open(proc_root.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+                if rfd < 0 {
+                    let e = io::Error::last_os_error();
+                    if let Some(base) = root.parent() {
+                        super::roots::release(base);
+                    }
+                    return Err(e);
+                }
+                // SAFETY: `rfd` is a fresh descriptor owned only here.
+                Ok((root, unsafe { OwnedFd::from_raw_fd(rfd) }))
+            })();
+            match live_root {
+                Ok((root, root_fd)) => {
+                    ch.root = Some(root);
+                    let _ = send_reply_fd(fd, root_fd.as_raw_fd());
+                }
+                Err(e) => {
+                    let answer = format!("-{e}");
+                    // SAFETY: sending from a buffer we own on a descriptor we own.
+                    unsafe { libc::send(fd, answer.as_ptr().cast(), answer.len(), libc::MSG_NOSIGNAL) };
+                }
+            }
+            return true;
+        }
         let got = match kind {
             "m" => super::roots::acquire(paths, id, &layers, false),
             "h" => super::roots::hold(paths, id),
@@ -137,6 +172,30 @@ pub fn on_readable(fd: i32, paths: &Paths) -> bool {
         unsafe { libc::send(fd, answer.as_ptr().cast(), answer.len(), libc::MSG_NOSIGNAL) };
         true
     })
+}
+
+/// Sends `+` along with one descriptor (`SCM_RIGHTS`) over a `SOCK_SEQPACKET` channel.
+fn send_reply_fd(sock: libc::c_int, fd: libc::c_int) -> io::Result<()> {
+    let mut byte = [b'+'; 1];
+    let mut iov = libc::iovec { iov_base: byte.as_mut_ptr().cast(), iov_len: 1 };
+    // SAFETY: CMSG_SPACE is a pure size computation.
+    let space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as u32) } as usize;
+    let mut control = vec![0u8; space];
+    // SAFETY: zeroed msghdr is valid before initialization.
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr().cast();
+    msg.msg_controllen = space as _;
+    // SAFETY: `msg` points to a control buffer sized for one fd.
+    unsafe {
+        let cmsg = libc::CMSG_FIRSTHDR(&msg);
+        (*cmsg).cmsg_level = libc::SOL_SOCKET;
+        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as u32) as _;
+        std::ptr::write_unaligned(libc::CMSG_DATA(cmsg).cast::<libc::c_int>(), fd);
+        sys::check(libc::sendmsg(sock, &msg, libc::MSG_NOSIGNAL) as _, "sendmsg live root").map(drop)
+    }
 }
 
 /// Linux host, the agent leaving: copies still running end with it, and
@@ -279,13 +338,13 @@ fn enter(spec: &CopySpec<'_>, running: &[(&str, libc::pid_t)], paths: &Paths, ch
             chroot_into(&paths.containers.join(spec.id).join("rootfs"))?;
             Ok(Vec::new())
         }
-        // Through /proc the root shows the container's live mounts (including
-        // tmpfs). The copy holds the container's root meanwhile, so a restart
-        // can't mount a second one over the same layer while it still writes.
-        Some((_, pid)) => {
-            let _ = ask(chan, 'h', spec);
+        // Through an agent-validated `/proc/<pid>/root` fd, showing the
+        // container's live mounts (including tmpfs). Never chroots by stale PID.
+        Some(_) => {
+            let root_fd = ask_live_root(chan, spec)?;
             let mut access = parse_mount_access(spec.mounts)?;
-            chroot_into(&PathBuf::from(format!("/proc/{pid}/root")))?;
+            chroot_into_fd(&root_fd)?;
+            drop(root_fd);
             resolve_mount_targets(&mut access);
             Ok(access)
         }
@@ -346,6 +405,58 @@ fn chroot_into(root: &Path) -> io::Result<()> {
         sys::check(libc::chdir(c"/".as_ptr()) as _, "chdir")?;
     }
     Ok(())
+}
+
+fn chroot_into_fd(root_fd: &OwnedFd) -> io::Result<()> {
+    // SAFETY: `root_fd` is an open directory descriptor obtained from the agent.
+    unsafe {
+        sys::check(libc::fchdir(root_fd.as_raw_fd()) as _, "fchdir")?;
+        sys::check(libc::chroot(c".".as_ptr()) as _, "chroot")?;
+        sys::check(libc::chdir(c"/".as_ptr()) as _, "chdir")?;
+    }
+    Ok(())
+}
+
+/// Asks the agent to verify `spec.id` is still running, hold its root, and
+/// return an open descriptor to its live `/proc/<pid>/root`. Fails closed if
+/// the container stopped or was reaped.
+fn ask_live_root(chan: &OwnedFd, spec: &CopySpec<'_>) -> io::Result<OwnedFd> {
+    let req = format!("r{}", spec.id);
+    // SAFETY: sending from a buffer we own on a descriptor we own.
+    sys::check(unsafe { libc::send(chan.as_raw_fd(), req.as_ptr().cast(), req.len(), libc::MSG_NOSIGNAL) } as _, "ask for live root")?;
+    let mut buf = [0u8; 4096];
+    let mut iov = libc::iovec { iov_base: buf.as_mut_ptr().cast(), iov_len: buf.len() };
+    // SAFETY: CMSG_SPACE is a pure size computation.
+    let space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as u32) } as usize;
+    let mut control = vec![0u8; space];
+    // SAFETY: zeroed msghdr is valid before initialization.
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr().cast();
+    msg.msg_controllen = space as _;
+    // SAFETY: receiving into buffers we own; MSG_CMSG_CLOEXEC prevents fd leaks.
+    let n = sys::check(unsafe { libc::recvmsg(chan.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC) } as _, "recvmsg live root")? as usize;
+    let mut received_fd: Option<OwnedFd> = None;
+    // SAFETY: inspecting control messages populated by recvmsg.
+    unsafe {
+        let cmsg = libc::CMSG_FIRSTHDR(&msg);
+        if !cmsg.is_null()
+            && (*cmsg).cmsg_level == libc::SOL_SOCKET
+            && (*cmsg).cmsg_type == libc::SCM_RIGHTS
+            && (*cmsg).cmsg_len as usize >= libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as u32) as usize
+        {
+            let fd = std::ptr::read_unaligned(libc::CMSG_DATA(cmsg).cast::<libc::c_int>());
+            if fd >= 0 {
+                received_fd = Some(OwnedFd::from_raw_fd(fd));
+            }
+        }
+    }
+    match buf[..n].split_first() {
+        Some((b'+', _)) => received_fd.ok_or_else(|| io::Error::other("agent did not send live root descriptor")),
+        Some((_, why)) => Err(io::Error::other(String::from_utf8_lossy(why).into_owned())),
+        None => Err(io::Error::other("the agent did not answer")),
+    }
 }
 
 /// Asks the agent for the container's root (`m`: mounted, or shared with
@@ -590,6 +701,16 @@ fn unpack_in(
     archive.set_preserve_ownerships(owner.is_none());
     archive.set_unpack_xattrs(false);
     archive.set_overwrite(true);
+    let dest_fd = if owner.is_some() {
+        let c = sys::cstr(dest)?;
+        // SAFETY: `dest` is a validated existing directory.
+        let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+        sys::check(fd as _, "open dest")?;
+        // SAFETY: fresh descriptor owned only here.
+        Some(unsafe { OwnedFd::from_raw_fd(fd) })
+    } else {
+        None
+    };
     for entry in archive.entries()? {
         let mut entry = entry?;
         let path = entry.path()?.into_owned();
@@ -623,30 +744,76 @@ fn unpack_in(
         // `docker cp` and the classic build's context keep a time of 0.
         let target_for_err = check_path.as_deref().unwrap_or(canonical_dest);
         if entry.unpack_in(dest).map_err(|e| map_erofs(e, target_for_err, mounts, readonly_rootfs))? {
-            if let Some((uid, gid)) = owner
+            if let (Some((uid, gid)), Some(root_fd)) = (owner, dest_fd.as_ref())
                 && !etype.is_pax_global_extensions()
             {
-                let mut file_dst = dest.to_path_buf();
-                for part in path.components() {
-                    if let std::path::Component::Normal(p) = part {
-                        file_dst.push(p);
-                    }
-                }
-                if file_dst != dest {
-                    let c = sys::cstr(&file_dst)?;
-                    // SAFETY: valid NUL-terminated path inside the container chroot.
-                    sys::check(unsafe { libc::lchown(c.as_ptr(), uid, gid) } as _, "lchown")?;
-                    if !fs::symlink_metadata(&file_dst)?.file_type().is_symlink()
-                        && let Ok(mode) = entry.header().mode()
-                        && mode & 0o6000 != 0
-                    {
-                        // SAFETY: valid NUL-terminated non-symlink path.
-                        sys::check(unsafe { libc::chmod(c.as_ptr(), (mode & 0o7777) as libc::mode_t) } as _, "chmod")?;
-                    }
-                }
+                let restore_mode = if !etype.is_symlink()
+                    && let Ok(mode) = entry.header().mode()
+                    && mode & 0o6000 != 0
+                {
+                    Some((mode & 0o7777) as libc::mode_t)
+                } else {
+                    None
+                };
+                chown_and_chmod_in(root_fd.as_fd(), &path, uid, gid, restore_mode)?;
             }
             super::layers::keep_zero_time(dest, &path, entry.header())?;
         }
+    }
+    Ok(())
+}
+
+/// Applies `fchownat(..., AT_SYMLINK_NOFOLLOW)` and optional `fchmod` to `rel`
+/// under `dest_fd` without ever following a symlink in any parent or leaf
+/// component (`SEC-V-06`), preventing live-container symlink-swap TOCTOU.
+fn chown_and_chmod_in(
+    dest_fd: std::os::fd::BorrowedFd<'_>,
+    rel: &Path,
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+    restore_mode: Option<libc::mode_t>,
+) -> io::Result<()> {
+    let parts: Vec<&std::ffi::OsStr> = rel
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(p) => Some(p),
+            _ => None,
+        })
+        .collect();
+    let Some((leaf, parents)) = parts.split_last() else {
+        return Ok(());
+    };
+    let mut cur: Option<OwnedFd> = None;
+    for part in parents {
+        let dir = cur.as_ref().map_or(dest_fd.as_raw_fd(), |f| f.as_raw_fd());
+        let c = sys::cstr(Path::new(part))?;
+        // SAFETY: valid directory fd and NUL-terminated single component;
+        // O_DIRECTORY | O_NOFOLLOW refuses any symlink swapped in by a live container.
+        let next = unsafe { libc::openat(dir, c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+        sys::check(next as _, "open parent for chown")?;
+        // SAFETY: fresh descriptor owned only here.
+        cur = Some(unsafe { OwnedFd::from_raw_fd(next) });
+    }
+    let parent = cur.as_ref().map_or(dest_fd.as_raw_fd(), |f| f.as_raw_fd());
+    let leaf_c = sys::cstr(Path::new(leaf))?;
+    // SAFETY: confined non-symlink parent fd and single NUL-terminated component;
+    // AT_SYMLINK_NOFOLLOW never follows a leaf symlink.
+    sys::check(unsafe { libc::fchownat(parent, leaf_c.as_ptr(), uid, gid, libc::AT_SYMLINK_NOFOLLOW) } as _, "fchownat")?;
+    if let Some(mode) = restore_mode {
+        // SAFETY: open without following symlinks and without blocking on FIFOs.
+        let fd = unsafe { libc::openat(parent, leaf_c.as_ptr(), libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC) };
+        sys::check(fd as _, "open for fchmod")?;
+        // SAFETY: fresh descriptor owned only here.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        // SAFETY: zeroed stat filled from our own descriptor.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        sys::check(unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } as _, "fstat for fchmod")?;
+        let kind = st.st_mode & libc::S_IFMT;
+        if kind != libc::S_IFREG && kind != libc::S_IFDIR {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "refusing to chmod special file"));
+        }
+        // SAFETY: fchmod operates directly on the pinned non-symlink descriptor.
+        sys::check(unsafe { libc::fchmod(fd.as_raw_fd(), mode) } as _, "fchmod")?;
     }
     Ok(())
 }
@@ -1027,6 +1194,7 @@ fn in_lower_layers(lowers: &[OwnedFd], rel: &std::path::Path) -> bool {
 
 /// `docker diff` and `docker commit`, from the writable layer.
 fn layer_job(conn: &mut fs::File, spec: &CopySpec<'_>, paths: &Paths) -> io::Result<()> {
+    container::valid_id(spec.id)?;
     if spec.layers.is_empty() {
         return reply_error(conn, "no such container");
     }
@@ -1156,7 +1324,12 @@ fn upper_job(conn: &mut fs::File, spec: &CopySpec<'_>, running: &[(&str, libc::p
 /// beside it first and moved in whole, so a copy cut short leaves the
 /// container as it was; overlayfs's own attributes are stripped, and the
 /// layer is marked plain (`container::mark_plain_upper`).
-fn import_upper(mut reader: impl Read, base: &Path) -> io::Result<()> {
+fn import_upper(reader: impl Read, base: &Path) -> io::Result<()> {
+    import_upper_capped(reader, base, super::layers::MAX_IMPORT_BYTES)
+}
+
+fn import_upper_capped(reader: impl Read, base: &Path, max_bytes: u64) -> io::Result<()> {
+    let mut reader = super::layers::Capped::new(reader, max_bytes);
     let upper = base.join("upper");
     let staging = base.join("upper.import");
     fs::create_dir_all(base)?;
@@ -1752,5 +1925,96 @@ mod tests {
         t.join().unwrap();
         assert_eq!(sizes, vec![PACED_CHUNK, 1234]);
         assert_eq!(received, expected);
+    }
+
+    #[test]
+    fn layer_job_rejects_path_traversal_id() {
+        let base = std::env::temp_dir().join(format!("kiri-copy-layer-id-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let paths = Paths { layers: base.join("layers"), containers: base.join("containers"), cgroup: base.join("cg"), cgroup_root: base.join("cg") };
+        let mut buf = Vec::new();
+        kiri_proto::encode_copy(&mut buf, copy_op::DIFF, "../escape", "", 0, &["sha256:0000000000000000000000000000000000000000000000000000000000000000"], &[] as &[&str]);
+        let kiri_proto::Msg::Copy(spec) = kiri_proto::decode(&buf).unwrap() else { panic!() };
+        let mut dummy = fs::File::open("/dev/null").unwrap();
+        let err = layer_job(&mut dummy, &spec, &paths).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn import_upper_enforces_byte_cap() {
+        let base = std::env::temp_dir().join(format!("kiri-import-cap-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let mut b = tar::Builder::new(Vec::new());
+        let data = vec![b'a'; 4096];
+        let mut h = tar::Header::new_ustar();
+        h.set_entry_type(tar::EntryType::Regular);
+        h.set_size(data.len() as u64);
+        h.set_mode(0o644);
+        h.set_uid(0);
+        h.set_gid(0);
+        h.set_mtime(1);
+        b.append_data(&mut h, "big", &data[..]).unwrap();
+        let bytes = b.into_inner().unwrap();
+        let err = import_upper_capped(&bytes[..], &base, 1024).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(!base.join("upper").exists() && !base.join("upper.import").exists());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn chown_and_chmod_in_refuses_parent_and_leaf_symlinks() {
+        let base = std::env::temp_dir().join(format!("kiri-copy-toctou-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let dest = base.join("dest");
+        let outside = base.join("outside");
+        fs::create_dir_all(&dest).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("secret"), b"ok").unwrap();
+        // Swapped parent directory symlink pointing outside `dest`.
+        std::os::unix::fs::symlink(&outside, dest.join("dir")).unwrap();
+        // Swapped leaf symlink pointing outside `dest`.
+        std::os::unix::fs::symlink(outside.join("secret"), dest.join("leaf")).unwrap();
+
+        let c = sys::cstr(&dest).unwrap();
+        // SAFETY: `dest` is a directory we just created.
+        let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+        assert!(fd >= 0);
+        // SAFETY: fresh descriptor.
+        let dest_fd = unsafe { OwnedFd::from_raw_fd(fd) };
+
+        // SAFETY: plain getters.
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        // Intermediate symlink must fail (never traverse into `outside`).
+        assert!(chown_and_chmod_in(dest_fd.as_fd(), Path::new("dir/secret"), uid, gid, Some(0o4755)).is_err());
+        // Leaf symlink with chmod must fail with ELOOP (never chmod target).
+        assert!(chown_and_chmod_in(dest_fd.as_fd(), Path::new("leaf"), uid, gid, Some(0o4755)).is_err());
+        assert_eq!(fs::symlink_metadata(outside.join("secret")).unwrap().mode() & 0o6000, 0);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn ask_live_root_fails_closed_when_agent_refuses_stopped_container() {
+        let mut pair = [0; 2];
+        // SAFETY: socketpair creates two fresh descriptors.
+        assert_eq!(unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0, pair.as_mut_ptr()) }, 0);
+        // SAFETY: fresh descriptors from socketpair.
+        let (agent_end, child_end) = unsafe { (OwnedFd::from_raw_fd(pair[0]), OwnedFd::from_raw_fd(pair[1])) };
+        let mut buf = Vec::new();
+        kiri_proto::encode_copy(&mut buf, copy_op::STAT, "dead123", "/", 0, &[] as &[&str], &[] as &[&str]);
+        let kiri_proto::Msg::Copy(spec) = kiri_proto::decode(&buf).unwrap() else { panic!() };
+        let t = std::thread::spawn(move || {
+            let mut req = [0u8; 64];
+            // SAFETY: reading from descriptor we own.
+            let n = unsafe { libc::recv(agent_end.as_raw_fd(), req.as_mut_ptr().cast(), req.len(), 0) };
+            assert_eq!(&req[..n as usize], b"rdead123");
+            let reply = b"-container is not running";
+            // SAFETY: writing to descriptor we own.
+            unsafe { libc::send(agent_end.as_raw_fd(), reply.as_ptr().cast(), reply.len(), libc::MSG_NOSIGNAL) };
+        });
+        let err = ask_live_root(&child_end, &spec).unwrap_err();
+        assert!(err.to_string().contains("not running"), "{err}");
+        t.join().unwrap();
     }
 }

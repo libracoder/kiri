@@ -338,8 +338,10 @@ pub(crate) fn current_user_sid() -> Option<String> {
             CloseHandle(token);
             return None;
         }
-        let mut buf = vec![0u8; len as usize];
-        let got = GetTokenInformation(token, TokenUser, buf.as_mut_ptr().cast(), len, &mut len);
+        let words = (len as usize).div_ceil(std::mem::size_of::<usize>());
+        let mut buf = vec![0usize; words];
+        let mut cap = (words * std::mem::size_of::<usize>()) as u32;
+        let got = GetTokenInformation(token, TokenUser, buf.as_mut_ptr().cast(), cap, &mut cap);
         CloseHandle(token);
         if got == 0 {
             return None;

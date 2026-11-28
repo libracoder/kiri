@@ -20,6 +20,7 @@ Source3:        LICENSE
 Source4:        NOTICE
 Source18:       dev.kiri.host-access.policy
 Source20:       kiri-nm.conf
+Source21:       host-access-wrapper
 %if 0%{?with_cli}
 Source5:        docker
 Source6:        docker-compose
@@ -84,6 +85,7 @@ install -D -m 644 %{SOURCE2} %{buildroot}%{_unitdir}/kiri.service
 install -D -m 644 %{SOURCE3} %{buildroot}%{_licensedir}/%{name}/LICENSE
 install -D -m 644 %{SOURCE4} %{buildroot}%{_licensedir}/%{name}/NOTICE
 install -D -m 644 %{SOURCE18} %{buildroot}%{_datadir}/polkit-1/actions/dev.kiri.host-access.policy
+install -D -m 755 %{SOURCE21} %{buildroot}/usr/libexec/kiri/host-access
 install -D -m 644 %{SOURCE20} %{buildroot}%{_prefix}/lib/NetworkManager/conf.d/kiri.conf
 %if 0%{?with_cli}
 install -D -m 755 %{SOURCE5} %{buildroot}/usr/libexec/kiri/bin/docker
@@ -250,9 +252,10 @@ exit 0
 %{_bindir}/kiri-init
 %{_unitdir}/kiri.service
 %{_datadir}/polkit-1/actions/dev.kiri.host-access.policy
+%dir /usr/libexec/kiri
+/usr/libexec/kiri/host-access
 %{_prefix}/lib/NetworkManager/conf.d/kiri.conf
 %if 0%{?with_cli}
-%dir /usr/libexec/kiri
 %dir /usr/libexec/kiri/bin
 /usr/libexec/kiri/bin/docker
 /usr/libexec/kiri/docker

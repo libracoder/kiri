@@ -556,7 +556,13 @@ fn download(pin: &Pin, task_index: usize) -> io::Result<PathBuf> {
     let _ = std::fs::remove_file(&part);
     let label = trf("Downloading {name} from {source}", &[("name", &pin.name), ("source", &if pin.url.contains("github.com/microsoft") { "Microsoft" } else { "ubuntu.com" })]);
     task(task_index, "active", &format!("0 / {} MB", mb(pin.size)));
-    let mut child = quiet("curl.exe").args(["-fsSL", "--retry", "3", "-o"]).arg(&part).arg(pin.url).spawn()?;
+    let max_size = pin.size.saturating_add(16 * 1024 * 1024).to_string();
+    let mut child = quiet("curl.exe")
+        .args(["-fsSL", "--proto", "=https", "--proto-redir", "=https", "--retry", "3", "--max-time", "3600", "--max-filesize", &max_size, "-o"])
+        .arg(&part)
+        .arg("--")
+        .arg(pin.url)
+        .spawn()?;
     let (start, mut last, mut rate) = (Instant::now(), (Instant::now(), 0u64), 0f64);
     loop {
         if CANCEL.load(Ordering::SeqCst) {
@@ -764,7 +770,7 @@ fn install_linux(kind: &str) -> io::Result<()> {
         }
         task(1, "done", "");
         task(2, "active", "");
-        wsl_ok(quiet("wsl.exe").args(["-d", KIRI_DISTRO, "-u", "root", "--", "/usr/local/bin/kiri-start"]))?;
+        wsl_ok(quiet("wsl.exe").args(["-d", KIRI_DISTRO, "-u", "root", "-e", "/usr/local/bin/kiri-start"]))?;
         task(2, "done", "");
         KIRI_DISTRO.to_owned()
     } else {
@@ -797,7 +803,7 @@ fn install_linux(kind: &str) -> io::Result<()> {
         verified("kiri")?;
         verified("kiri-init")?;
         let install = to_wsl(&distro, &verified("install.sh")?)?;
-        wsl_ok(quiet("wsl.exe").args(["-d", &distro, "-u", "root", "--", "sh", &install]))?;
+        wsl_ok(quiet("wsl.exe").args(["-d", &distro, "-u", "root", "-e", "sh", &install]))?;
         task(1, "done", "");
         task(2, "done", "");
         distro
@@ -813,9 +819,21 @@ fn install_linux(kind: &str) -> io::Result<()> {
 
 /// A Windows path as `distro` sees it. Killed after WSL_LIMIT, as the
 /// other calls into WSL to start or restart the engine.
+/// Uses `-e` (`--exec`) rather than `--` so the Windows path is passed as a
+/// single argv element without login-shell word splitting or command substitution.
 pub(crate) fn to_wsl(distro: &str, path: &Path) -> io::Result<String> {
-    let out = crate::update::output_within(quiet("wsl.exe").args(["-d", distro, "--", "wslpath", "-a"]).arg(path.to_string_lossy().replace('\\', "/")), crate::update::WSL_LIMIT)?;
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+    let win_path = path.to_string_lossy().replace('\\', "/");
+    let out = crate::update::output_within(quiet("wsl.exe").args(["-d", distro, "-e", "wslpath", "-a"]).arg(&win_path), crate::update::WSL_LIMIT)?;
+    if !out.status.success() {
+        let text = wsl_output(&out.stdout, &out.stderr);
+        let line = text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("wslpath failed");
+        return Err(io::Error::other(line.to_owned()));
+    }
+    let converted = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    if converted.is_empty() {
+        return Err(io::Error::other("wslpath returned an empty path"));
+    }
+    Ok(converted)
 }
 
 fn wsl_ok(cmd: &mut Command) -> io::Result<()> {

@@ -24,7 +24,6 @@ const RET_ERRNO: u32 = 0x0005_0000;
 const LD_W_ABS: u16 = 0x20;
 const JEQ_K: u16 = 0x15;
 const JSET_K: u16 = 0x45;
-#[cfg(target_arch = "x86_64")]
 const JGE_K: u16 = 0x35;
 const RET_K: u16 = 0x06;
 
@@ -55,6 +54,7 @@ const OFF_ARG0: u32 = 16;
 const CAP_SYS_MODULE: u32 = 16;
 #[cfg(target_arch = "x86_64")]
 const CAP_SYS_RAWIO: u32 = 17;
+const CAP_SYS_CHROOT: u32 = 18;
 const CAP_SYS_PTRACE: u32 = 19;
 const CAP_SYS_PACCT: u32 = 20;
 const CAP_SYS_ADMIN: u32 = 21;
@@ -63,6 +63,20 @@ const CAP_SYS_NICE: u32 = 23;
 const CAP_SYS_TIME: u32 = 25;
 const CAP_PERFMON: u32 = 38;
 const CAP_BPF: u32 = 39;
+
+/// Highest known Linux syscall number allowed through the default profile
+/// (blocks unknown/future kernel syscalls by default, matching Docker's
+/// fail-closed posture for new kernel attack surface).
+const MAX_KNOWN_SYSCALL: u32 = 475;
+
+/// Socket address families allowed by Docker's default seccomp profile
+/// (`< 3` is checked separately; `AF_VSOCK` is always refused with
+/// `EAFNOSUPPORT`). Exotic families such as `AF_ALG` (38), `AF_AX25` (3),
+/// `AF_IPX` (4), `AF_APPLETALK` (5), `AF_ISDN` (34), `AF_CAIF` (37), and
+/// unknown families `>= 46` are refused with `EPERM`.
+const ALLOWED_SOCKET_FAMILIES: [u32; 29] = [
+    7, 8, 9, 10, 13, 14, 15, 16, 17, 18, 21, 22, 24, 26, 27, 28, 29, 30, 31, 32, 33, 35, 36, 39, 41, 42, 43, 44, 45,
+];
 
 const NS_FLAGS: u32 = (libc::CLONE_NEWNS
     | libc::CLONE_NEWUTS
@@ -181,10 +195,19 @@ fn denied() -> Vec<(libc::c_long, Option<u32>)> {
         (SYS_PROCESS_MADVISE, Some(CAP_SYS_PTRACE)),
         (SYS_get_mempolicy, Some(CAP_SYS_NICE)),
         (SYS_SET_MEMPOLICY_HOME_NODE, Some(CAP_SYS_NICE)),
+        (SYS_chroot, Some(CAP_SYS_CHROOT)),
         #[cfg(target_arch = "x86_64")]
         (SYS_ioperm, Some(CAP_SYS_RAWIO)),
         #[cfg(target_arch = "x86_64")]
         (SYS_iopl, Some(CAP_SYS_RAWIO)),
+        #[cfg(target_arch = "x86_64")]
+        (SYS_uselib, None),
+        #[cfg(target_arch = "x86_64")]
+        (SYS_ustat, None),
+        #[cfg(target_arch = "x86_64")]
+        (SYS_sysfs, None),
+        #[cfg(target_arch = "x86_64")]
+        (SYS__sysctl, None),
     ]
 }
 
@@ -243,6 +266,39 @@ fn deny_vsock(p: &mut Vec<Insn>) {
     p.push(stmt(LD_W_ABS, OFF_NR));
 }
 
+/// Rejects unknown/future syscall numbers above [`MAX_KNOWN_SYSCALL`] so the
+/// default profile fails closed on future kernel syscalls (`FS-11`).
+fn deny_unknown_syscalls(p: &mut Vec<Insn>) {
+    p.push(jump(JGE_K, MAX_KNOWN_SYSCALL + 1, 0, 1));
+    p.push(stmt(RET_K, RET_ERRNO | libc::EPERM as u32));
+}
+
+/// Restricts `socket(domain, ...)` to Docker's allowlisted address families.
+/// `deny_vsock` runs first so `AF_VSOCK` still returns `EAFNOSUPPORT`.
+/// Leaves the syscall number loaded on fallthrough.
+fn deny_exotic_sockets(p: &mut Vec<Insn>) {
+    let n = ALLOWED_SOCKET_FAMILIES.len();
+    p.push(jump(JEQ_K, libc::SYS_socket as u32, 0, n as u8 + 4));
+    p.push(stmt(LD_W_ABS, OFF_ARG0));
+    p.push(jump(JGE_K, 3, 0, n as u8 + 1));
+    for (i, &af) in ALLOWED_SOCKET_FAMILIES.iter().enumerate() {
+        p.push(jump(JEQ_K, af, (n - i) as u8, 0));
+    }
+    p.push(stmt(RET_K, RET_ERRNO | libc::EPERM as u32));
+    p.push(stmt(LD_W_ABS, OFF_NR));
+}
+
+/// Restricts `socketpair(domain, ...)` to `AF_UNIX` (1) and `AF_TIPC` (30),
+/// matching Docker's default profile. Leaves the syscall number loaded.
+fn deny_exotic_socketpair(p: &mut Vec<Insn>) {
+    p.push(jump(JEQ_K, libc::SYS_socketpair as u32, 0, 5));
+    p.push(stmt(LD_W_ABS, OFF_ARG0));
+    p.push(jump(JEQ_K, libc::AF_UNIX as u32, 2, 0));
+    p.push(jump(JEQ_K, 30, 1, 0));
+    p.push(stmt(RET_K, RET_ERRNO | libc::EPERM as u32));
+    p.push(stmt(LD_W_ABS, OFF_NR));
+}
+
 /// The filter for `--privileged` and `seccomp=unconfined`: nothing of the
 /// default profile, only the host boundary. io_uring goes too, since its
 /// socket operation makes a socket without the syscall a filter sees.
@@ -260,6 +316,7 @@ fn boundary() -> Vec<Insn> {
 fn program(caps: u64) -> Vec<Insn> {
     let has = |cap: u32| caps & (1u64 << cap) != 0;
     let mut p = head();
+    deny_unknown_syscalls(&mut p);
     for (nr, cap) in denied() {
         if cap.is_some_and(has) {
             continue;
@@ -268,6 +325,8 @@ fn program(caps: u64) -> Vec<Insn> {
     }
     deny_personality(&mut p);
     deny_vsock(&mut p);
+    deny_exotic_sockets(&mut p);
+    deny_exotic_socketpair(&mut p);
     if !has(CAP_SYS_ADMIN) {
         // clone3 hides its flags in memory a filter cannot read: ENOSYS
         // makes libc fall back to clone, whose flags it can.
@@ -360,7 +419,7 @@ mod tests {
         // Every jump lands inside the program.
         for p in [program(0), program(u64::MAX)] {
             for (i, insn) in p.iter().enumerate() {
-                if insn.code == JEQ_K || insn.code == JSET_K {
+                if matches!(insn.code, JEQ_K | JSET_K | JGE_K) {
                     assert!(i + 1 + (insn.jt.max(insn.jf) as usize) < p.len());
                 }
             }
@@ -420,7 +479,6 @@ mod tests {
                 }
                 RET_K => return i.k,
                 JEQ_K => pc += if acc == i.k { i.jt } else { i.jf } as usize,
-                #[cfg(target_arch = "x86_64")]
                 JGE_K => pc += if acc >= i.k { i.jt } else { i.jf } as usize,
                 JSET_K => pc += if acc & i.k != 0 { i.jt } else { i.jf } as usize,
                 other => panic!("opcode {other:#x}"),
@@ -506,5 +564,31 @@ mod tests {
         assert!(decode(&[0; 12]).is_err(), "not whole instructions");
         assert!(decode(&vec![0; 8 * (MAX_INSNS + 1)]).is_err(), "too long");
         assert!(decode(&vec![0; 8 * MAX_INSNS]).is_ok());
+    }
+
+    #[test]
+    fn default_profile_blocks_exotic_sockets_and_unknown_syscalls() {
+        let p = program(0);
+        let eperm = RET_ERRNO | libc::EPERM as u32;
+        let eafnosupport = RET_ERRNO | libc::EAFNOSUPPORT as u32;
+        // Standard socket families pass.
+        for af in [libc::AF_UNIX as u32, libc::AF_INET as u32, libc::AF_INET6 as u32, libc::AF_NETLINK as u32, libc::AF_PACKET as u32] {
+            assert_eq!(answer(&p, libc::SYS_socket as u32, af), RET_ALLOW, "AF {af}");
+        }
+        // AF_VSOCK returns EAFNOSUPPORT; exotic/unknown families return EPERM.
+        assert_eq!(answer(&p, libc::SYS_socket as u32, libc::AF_VSOCK as u32), eafnosupport);
+        for af in [3 /* AF_AX25 */, 4 /* AF_IPX */, 5 /* AF_APPLETALK */, 34 /* AF_ISDN */, 37 /* AF_CAIF */, 38 /* AF_ALG */, 99] {
+            assert_eq!(answer(&p, libc::SYS_socket as u32, af), eperm, "AF {af}");
+        }
+        // socketpair allows only AF_UNIX and AF_TIPC.
+        assert_eq!(answer(&p, libc::SYS_socketpair as u32, libc::AF_UNIX as u32), RET_ALLOW);
+        assert_eq!(answer(&p, libc::SYS_socketpair as u32, 30), RET_ALLOW);
+        assert_eq!(answer(&p, libc::SYS_socketpair as u32, libc::AF_INET as u32), eperm);
+        // Unknown / future syscall numbers fail closed with EPERM.
+        assert_eq!(answer(&p, 999, 0), eperm);
+        assert_eq!(answer(&p, MAX_KNOWN_SYSCALL + 1, 0), eperm);
+        // chroot requires CAP_SYS_CHROOT.
+        assert_eq!(answer(&p, libc::SYS_chroot as u32, 0), eperm);
+        assert_eq!(answer(&program(1 << CAP_SYS_CHROOT), libc::SYS_chroot as u32, 0), RET_ALLOW);
     }
 }

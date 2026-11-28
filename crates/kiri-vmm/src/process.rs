@@ -81,6 +81,21 @@ pub fn rosetta_installed() -> bool {
     false
 }
 
+/// Sanitized `PATH` passed to the privileged Linux host agent (`kiri-init`),
+/// avoiding any user-writable directories inherited via `sudo -E` or a root shell.
+const TRUSTED_AGENT_PATH: &str = "/usr/sbin:/sbin:/usr/bin:/bin";
+
+fn configure_agent_command(cmd: &mut Command, dir: &Path, disk: Option<&Path>) {
+    cmd.env("PATH", TRUSTED_AGENT_PATH)
+        .env("KIRI_AGENT_DIR", dir)
+        .env_remove("KIRI_SOCKET");
+    if let Some(data) = disk {
+        cmd.env("KIRI_AGENT_DATA", data);
+    } else {
+        cmd.env_remove("KIRI_AGENT_DATA");
+    }
+}
+
 /// Watches the agent process: says when it exits, then runs the hook given
 /// to `Vm::on_stop`.
 fn watch(waiter: Arc<Mutex<Child>>, tx: mpsc::Sender<Event>, on_stop: Arc<Mutex<OnStop>>) -> io::Result<()> {
@@ -131,12 +146,7 @@ impl Vm {
             }
         })?;
         let mut cmd = Command::new(&cfg.initrd);
-        cmd.env("KIRI_AGENT_DIR", &dir).env_remove("KIRI_SOCKET");
-        if let Some(data) = &cfg.disk {
-            cmd.env("KIRI_AGENT_DATA", data);
-        } else {
-            cmd.env_remove("KIRI_AGENT_DATA");
-        }
+        configure_agent_command(&mut cmd, &dir, cfg.disk.as_deref());
         if let Some(fd) = cfg.console {
             cmd.stderr(std::process::Stdio::from(fd.try_clone()?)).stdout(std::process::Stdio::from(fd));
         } else {
@@ -381,5 +391,16 @@ mod tests {
     fn runtime_directories_belong_to_one_generation() {
         let root = Path::new("/run");
         assert_ne!(runtime_directory(root), runtime_directory(root));
+    }
+
+    #[test]
+    fn agent_command_sanitizes_path_and_sets_agent_env() {
+        let mut cmd = Command::new("/bin/sh");
+        configure_agent_command(&mut cmd, Path::new("/run/kiri-agent-test"), Some(Path::new("/var/lib/kiri-custom")));
+        let envs: std::collections::HashMap<_, _> = cmd.get_envs().collect();
+        assert_eq!(envs.get(std::ffi::OsStr::new("PATH")), Some(&Some(std::ffi::OsStr::new(TRUSTED_AGENT_PATH))));
+        assert_eq!(envs.get(std::ffi::OsStr::new("KIRI_AGENT_DIR")), Some(&Some(std::ffi::OsStr::new("/run/kiri-agent-test"))));
+        assert_eq!(envs.get(std::ffi::OsStr::new("KIRI_AGENT_DATA")), Some(&Some(std::ffi::OsStr::new("/var/lib/kiri-custom"))));
+        assert_eq!(envs.get(std::ffi::OsStr::new("KIRI_SOCKET")), Some(&None));
     }
 }

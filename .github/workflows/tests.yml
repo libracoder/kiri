@@ -186,8 +186,8 @@ jobs:
           read -r cv csum <<< "$(pin COMPOSE)"
           [ -n "$dsum" ] && [ -n "$csum" ] || { echo "could not read the pins from cli_pins.rs"; exit 1; }
           cd "$RUNNER_TEMP"
-          curl -fsSL --proto '=https' -o docker.tgz "https://download.docker.com/mac/static/stable/aarch64/docker-$dv.tgz"
-          curl -fsSL --proto '=https' -o compose "https://github.com/docker/compose/releases/download/$cv/docker-compose-darwin-aarch64"
+          curl -fsSL --proto '=https' --proto-redir '=https' -o docker.tgz "https://download.docker.com/mac/static/stable/aarch64/docker-$dv.tgz"
+          curl -fsSL --proto '=https' --proto-redir '=https' -o compose "https://github.com/docker/compose/releases/download/$cv/docker-compose-darwin-aarch64"
           echo "$dsum  docker.tgz" | shasum -a 256 -c
           echo "$csum  compose" | shasum -a 256 -c
           mkdir -p bin "$HOME/.docker/cli-plugins"
@@ -254,8 +254,9 @@ jobs:
   # pull request adds to the page that needs one (new addresses, new ways to
   # reach the network, code that builds or hides code, reads of what is
   # worth stealing) and fails until a maintainer who has read it adds the
-  # label page-read. Remove the label when new commits come in: it stays on
-  # the pull request and accepts them too.
+  # label page-read. `.github/workflows/page-read-reset.yml` removes `page-read`
+  # automatically whenever new commits are pushed so earlier approval cannot
+  # carry over to unreviewed JS.
   page-scan:
     needs: scope
     if: needs.scope.outputs.page == 'true'

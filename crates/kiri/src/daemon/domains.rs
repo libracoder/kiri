@@ -48,12 +48,40 @@ struct Router {
 /// The routers, for a container that publishes their port (`step_aside`).
 static ROUTERS: Mutex<Vec<Arc<Router>>> = Mutex::new(Vec::new());
 
+const MAX_DOMAIN_CONNS: usize = 256;
+const HEADER_DEADLINE: Duration = Duration::from_secs(10);
+const DOMAIN_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
+static ACTIVE_DOMAIN_CONNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+struct DomainConnGuard;
+
+impl Drop for DomainConnGuard {
+    fn drop(&mut self) {
+        ACTIVE_DOMAIN_CONNS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+fn acquire_domain_conn() -> Option<DomainConnGuard> {
+    ACTIVE_DOMAIN_CONNS
+        .try_update(std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire, |n| (n < MAX_DOMAIN_CONNS).then_some(n + 1))
+        .ok()
+        .map(|_| DomainConnGuard)
+}
+
 impl Router {
     /// Binds the router's addresses and starts their accept threads; an
     /// error when fewer than `min` (at least one) could be bound, so a
     /// router never comes back on IPv6 alone while a container has IPv4.
     fn listen(self: &Arc<Self>, min: usize) -> io::Result<Vec<(OwnedFd, JoinHandle<()>)>> {
-        let listeners: Vec<TcpListener> = router_addrs(self.port).iter().filter_map(|a| TcpListener::bind(a).ok()).collect();
+        let listeners: Vec<TcpListener> = router_addrs(self.port)
+            .iter()
+            .filter_map(|a| a.parse::<std::net::SocketAddr>().ok())
+            // On macOS, wildcard low-port sockets bind `IP_BOUND_IF`/`IPV6_BOUND_IF`
+            // to `lo0` so LAN peers never reach the listener at the kernel level.
+            .filter_map(|addr| super::ports::bind_socket_on_if(addr, false, cfg!(target_os = "macos")).ok())
+            .map(TcpListener::from)
+            .collect();
         if listeners.len() < min.max(1) {
             return Err(io::Error::new(io::ErrorKind::AddrInUse, format!("port {} is taken", self.port)));
         }
@@ -85,12 +113,21 @@ impl Router {
             if fds[1].revents != 0 {
                 return; // stepped aside
             }
-            while let Ok((conn, _)) = listener.accept() {
+            while let Ok((conn, peer)) = listener.accept() {
+                // Reject non-loopback peers synchronously before spawning a thread.
+                if !peer.ip().to_canonical().is_loopback() {
+                    continue;
+                }
+                let Some(permit) = acquire_domain_conn() else {
+                    continue;
+                };
                 let _ = conn.set_nonblocking(false);
-                // A client that never finishes its request must not hold a thread forever.
-                let _ = conn.set_read_timeout(Some(Duration::from_secs(30)));
+                // Bound initial request header arrival and stalled writes.
+                let _ = conn.set_read_timeout(Some(HEADER_DEADLINE));
+                let _ = conn.set_write_timeout(Some(DOMAIN_WRITE_TIMEOUT));
                 let (engine, tls) = (self.engine.clone(), self.tls.clone());
                 let _ = std::thread::Builder::new().name("kiri-domain-conn".into()).spawn(move || {
+                    let _permit = permit;
                     let _ = match tls {
                         Some(config) => serve_tls(conn, &engine, config),
                         None => serve(conn, &engine),
@@ -470,11 +507,14 @@ pub fn reset(engine: &Arc<Engine>) -> Result<serde_json::Value, String> {
 
 fn serve(mut client: TcpStream, engine: &Engine) -> io::Result<()> {
     // The listener faces the network; only this Mac may use it.
-    if !client.peer_addr()?.ip().is_loopback() {
+    if !client.peer_addr()?.ip().to_canonical().is_loopback() {
         return Ok(());
     }
     client.set_nodelay(true)?;
     let Some((head, guest)) = route(&mut client, engine, "http")? else { return Ok(()) };
+    // Clear the header read deadline once proxying begins; keep write stall timeout.
+    let _ = client.set_read_timeout(None);
+    let _ = client.set_write_timeout(Some(DOMAIN_WRITE_TIMEOUT));
     let mut to_guest = std::fs::File::from(guest.fd.try_clone()?);
     // What the client sent so far goes first, unchanged.
     to_guest.write_all(&head)?;
@@ -492,13 +532,17 @@ fn serve(mut client: TcpStream, engine: &Engine) -> io::Result<()> {
     Ok(())
 }
 
-/// Reads the request head, finds the container its Host names and connects
-/// to it. `None` once it has answered by itself (no such container, an
-/// unreachable one, or a client that went away).
+/// Reads the request head within an absolute deadline, finds the container its
+/// Host names, and connects to it. `None` once it has answered by itself.
 fn route(client: &mut impl ReadWrite, engine: &Engine, scheme: &str) -> io::Result<Option<(Vec<u8>, kiri_vmm::VsockStream)>> {
+    let deadline = std::time::Instant::now() + HEADER_DEADLINE;
     let mut head = Vec::with_capacity(2048);
     let mut buf = [0u8; 4096];
     let end = loop {
+        let Some(rem) = deadline.checked_duration_since(std::time::Instant::now()).filter(|d| !d.is_zero()) else {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "request header deadline exceeded"));
+        };
+        let _ = client.set_header_read_timeout(Some(rem));
         let n = client.read(&mut buf)?;
         if n == 0 {
             return Ok(None);
@@ -630,13 +674,28 @@ fn web_port(engine: &Engine, t: &Target) -> u16 {
     port
 }
 
-trait ReadWrite: Read + Write {}
-impl<T: Read + Write> ReadWrite for T {}
+trait ReadWrite: Read + Write {
+    fn set_header_read_timeout(&self, _timeout: Option<Duration>) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl ReadWrite for TcpStream {
+    fn set_header_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.set_read_timeout(timeout)
+    }
+}
+
+impl ReadWrite for rustls::StreamOwned<rustls::ServerConnection, TcpStream> {
+    fn set_header_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.sock.set_read_timeout(timeout)
+    }
+}
 
 /// One HTTPS connection: TLS with the browser, plain bytes to the container,
 /// pumped in one poll loop (a TLS session cannot be split across threads).
 fn serve_tls(tcp: TcpStream, engine: &Engine, config: Arc<rustls::ServerConfig>) -> io::Result<()> {
-    if !tcp.peer_addr()?.ip().is_loopback() {
+    if !tcp.peer_addr()?.ip().to_canonical().is_loopback() {
         return Ok(());
     }
     tcp.set_nodelay(true)?;
@@ -647,6 +706,8 @@ fn serve_tls(tcp: TcpStream, engine: &Engine, config: Arc<rustls::ServerConfig>)
         let _ = tls.flush();
         return Ok(());
     };
+    let _ = tls.sock.set_read_timeout(None);
+    let _ = tls.sock.set_write_timeout(Some(DOMAIN_WRITE_TIMEOUT));
     let mut container = std::fs::File::from(guest.fd.try_clone()?);
     container.write_all(&head)?;
     let (conn, sock) = (&mut tls.conn, &mut tls.sock);
@@ -900,5 +961,16 @@ mod tests {
         assert_eq!(reset["http"]["port"], 80);
         assert_eq!(reset["https"]["port"], 443);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn domain_conn_permit_is_bounded_and_releases_on_drop() {
+        let mut guards = Vec::new();
+        for _ in 0..super::MAX_DOMAIN_CONNS {
+            guards.push(super::acquire_domain_conn().unwrap());
+        }
+        assert!(super::acquire_domain_conn().is_none());
+        drop(guards);
+        assert!(super::acquire_domain_conn().is_some());
     }
 }

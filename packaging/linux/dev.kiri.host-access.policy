@@ -2,8 +2,10 @@
 <!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
  "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
 <!-- The password prompt the window's setup checklist shows on a Linux host:
-     `pkexec /usr/bin/kiri host-access USER` starts Kiri's engine and lets USER
-     use it (crates/kiri/src/hostaccess.rs). -->
+     `pkexec /usr/libexec/kiri/host-access USER` starts Kiri's engine and lets
+     USER use it (crates/kiri/src/hostaccess.rs). Points at the dedicated
+     host-access helper rather than the main CLI binary so no other subcommand
+     is authorized, and requires fresh admin authentication each time. -->
 <policyconfig>
   <vendor>Kiri</vendor>
   <vendor_url>https://runkiri.com</vendor_url>
@@ -14,8 +16,8 @@
     <defaults>
       <allow_any>auth_admin</allow_any>
       <allow_inactive>auth_admin</allow_inactive>
-      <allow_active>auth_admin_keep</allow_active>
+      <allow_active>auth_admin</allow_active>
     </defaults>
-    <annotate key="org.freedesktop.policykit.exec.path">/usr/bin/kiri</annotate>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/kiri/host-access</annotate>
   </action>
 </policyconfig>

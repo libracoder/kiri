@@ -1,0 +1,46 @@
+# Checks Rust dependency advisories, licenses, bans, and sources against
+# deny.toml on dependency changes, pushes to main, and a weekly schedule.
+#
+# Safe for pull requests from forks: read-only token, no secrets, no build
+# scripts executed (cargo-deny inspects Cargo.toml and Cargo.lock only).
+name: Dependency audit
+
+on:
+  pull_request:
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - crates/*/Cargo.toml
+      - xtask/Cargo.toml
+      - deny.toml
+      - .github/workflows/audit.yml
+  push:
+    branches: [main]
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - crates/*/Cargo.toml
+      - xtask/Cargo.toml
+      - deny.toml
+      - .github/workflows/audit.yml
+  schedule:
+    - cron: "17 5 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  deny:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@bb119f768ea239e765aeaef5769558d4f21213aa # v2.1.5
+        with:
+          command: check --all-features

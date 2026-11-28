@@ -102,7 +102,18 @@ pub(super) fn reply(w: &mut UnixStream, result: Result<Value, Error>, ok: u16) -
         // 201 for a tag, 200 for a network connect or disconnect. Client
         // libraries that check the exact status need it.
         Ok(Value::Null) => http::empty(w, ok)?,
-        Ok(v) => http::json(w, ok, &v.to_string())?,
+        Ok(v) => {
+            let bytes = serde_json::to_vec(&v).map_err(io::Error::other)?;
+            http::respond(w, ok, "application/json", &bytes)?;
+        }
+        Err(e) => error(w, e)?,
+    }
+    Ok(Next::KeepAlive)
+}
+
+fn reply_json_bytes(w: &mut UnixStream, result: Result<Vec<u8>, Error>, ok: u16) -> io::Result<Next> {
+    match result {
+        Ok(bytes) => http::respond(w, ok, "application/json", &bytes)?,
         Err(e) => error(w, e)?,
     }
     Ok(Next::KeepAlive)
@@ -138,10 +149,27 @@ fn status_of(e: Error) -> (u16, String) {
 /// Docker's API has nothing that changes the engine's own settings.
 const CONTAINER_MAY: &[(&str, &str)] = &[("POST", "/kiri/wake")];
 
+/// Kiri read endpoints that return host-only secrets (such as proxy URLs with
+/// embedded `user:pass@` credentials) and are restricted to `Caller::Host`.
+const HOST_ONLY_KIRI_READS: &[&str] = &["/kiri/proxy"];
+
 /// Whether a container's connection may make this request.
 fn container_may(method: &str, path: &str) -> bool {
     let kiri = path == "/kiri" || path.starts_with("/kiri/");
-    !kiri || matches!(method, "GET" | "HEAD") || CONTAINER_MAY.contains(&(method, path))
+    !kiri
+        || (matches!(method, "GET" | "HEAD") && !HOST_ONLY_KIRI_READS.contains(&path))
+        || CONTAINER_MAY.contains(&(method, path))
+}
+
+/// Whether `caller` may make this request. Privileged `/kiri/*` mutations and
+/// secret-bearing reads (`GET /kiri/proxy`) are restricted to `Caller::Host`;
+/// both `Caller::Container` and integrated `Caller::Wsl` distros share the same
+/// narrow allowlist on `/kiri/*`.
+fn caller_may(caller: &Caller, method: &str, path: &str) -> bool {
+    match caller {
+        Caller::Host => true,
+        Caller::Container | Caller::Wsl(_) => container_may(method, path),
+    }
 }
 
 fn route(req: &Request, engine: &Arc<Engine>, caller: &Caller, w: &mut UnixStream, r: &mut BufReader<UnixStream>) -> io::Result<Next> {
@@ -152,12 +180,18 @@ fn route(req: &Request, engine: &Arc<Engine>, caller: &Caller, w: &mut UnixStrea
     }
     let p = req.path.as_str();
     let m = req.method.as_str();
-    // Kiri's own endpoints that change something are for this machine's
-    // programs (caller.rs), not for a container given the socket.
-    if *caller == Caller::Container && !container_may(m, p) {
+    // Kiri's own management endpoints (and secret-bearing reads like /kiri/proxy)
+    // are for this machine's host programs (caller.rs), not for a container or
+    // integrated WSL distro.
+    if !caller_may(caller, m, p) {
         // Closed after the answer: a body the request carried is not left
         // on the connection to be read as the next request.
-        http::error(w, 403, "this is changed in Kiri's window or with the kiri command on this machine, not from a container")?;
+        let why = match caller {
+            Caller::Container => "this is changed in Kiri's window or with the kiri command on this machine, not from a container",
+            Caller::Wsl(_) => "this is only available from Kiri on the host, not from an integrated WSL distro",
+            Caller::Host => unreachable!(),
+        };
+        http::error(w, 403, why)?;
         return Ok(Next::Close);
     }
     // While Settings → Storage moves the data, nothing may change it.
@@ -264,7 +298,7 @@ fn route(req: &Request, engine: &Arc<Engine>, caller: &Caller, w: &mut UnixStrea
             }
             return Ok(Next::KeepAlive);
         }
-        ("GET", "/info") => return reply(w, Ok(info(engine)), 200),
+        ("GET", "/info") => return reply_json_bytes(w, info_json_bytes(engine), 200),
         ("POST", "/build") => return super::builder::build(req, engine, w, r),
         ("POST", "/build/cancel") => return reply(w, super::builder::cancel(req, engine), 200),
         ("POST", "/build/prune") => return reply(w, super::builder::prune(req, engine), 200),
@@ -283,7 +317,7 @@ fn route(req: &Request, engine: &Arc<Engine>, caller: &Caller, w: &mut UnixStrea
         ("POST", "/kiri/fs-events") => return reply(w, fs_events(req, engine), 204),
         ("GET", "/kiri/win-ports") => return reply(w, Ok(win_ports(engine)), 200),
         ("POST", "/kiri/win-ports") => return reply(w, sync_win_ports(req, engine), 200),
-        ("GET", "/images/json") => return reply(w, images(req, engine), 200),
+        ("GET", "/images/json") => return reply_json_bytes(w, images_json_bytes(req, engine), 200),
         ("POST", "/images/create") if req.query("fromSrc").is_some_and(|s| !s.is_empty()) => return image_import(req, engine, w, r),
         ("POST", "/images/create") => return pull(req, engine, w),
         ("POST", "/images/load") => return image_load(req, engine, w, r),
@@ -292,17 +326,17 @@ fn route(req: &Request, engine: &Arc<Engine>, caller: &Caller, w: &mut UnixStrea
             return image_save(engine, &names, w);
         }
         ("POST", "/containers/create") => {
-            if let Some(made) = super::builder::create_for_buildx(engine, req) {
+            if let Some(made) = super::builder::create_for_buildx(engine, req, caller) {
                 return reply(w, made, 201);
             }
             return reply(w, create_by(req, engine, caller), 201);
         }
-        ("GET", "/containers/json") => return reply(w, list(req, engine), 200),
+        ("GET", "/containers/json") => return reply_json_bytes(w, list_json_bytes(req, engine), 200),
         ("GET", "/networks") => return reply(w, networks(req, engine), 200),
         ("POST", "/networks/create") => return reply(w, network_create(req, engine), 201),
         ("POST", "/networks/prune") => return reply(w, network_prune(req, engine), 200),
         ("GET", "/volumes") => return reply(w, volumes(req, engine), 200),
-        ("POST", "/volumes/create") => return reply(w, volume_create(req, engine), 201),
+        ("POST", "/volumes/create") => return reply(w, volume_create(req, engine, caller), 201),
         ("POST", "/volumes/prune") => return reply(w, volume_prune(req, engine), 200),
         _ => {}
     }
@@ -513,57 +547,152 @@ pub(super) fn version() -> Value {
     })
 }
 
-fn info(engine: &Engine) -> Value {
-    let states = engine.each(|c| Some(c.status));
-    let running = states.iter().filter(|s| **s == Status::Running).count();
-    let images = engine.store.images().map(|v| v.len()).unwrap_or(0);
+#[derive(serde::Serialize)]
+struct InfoKiriRuntime {
+    path: &'static str,
+}
+
+#[derive(serde::Serialize)]
+struct InfoRuntimes {
+    kiri: InfoKiriRuntime,
+}
+
+#[inline]
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+#[inline]
+fn is_zero_u8(v: &u8) -> bool {
+    *v == 0
+}
+
+#[inline]
+fn is_zero_i32(v: &i32) -> bool {
+    *v == 0
+}
+
+#[inline]
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
+}
+
+#[inline]
+fn is_zero_f64(v: &f64) -> bool {
+    *v == 0.0
+}
+
+#[inline]
+fn is_empty_values(v: &&[Value]) -> bool {
+    v.is_empty()
+}
+
+#[derive(serde::Serialize)]
+#[allow(non_snake_case)]
+struct InfoSummary {
+    ID: &'static str,
+    Name: &'static str,
+    Containers: usize,
+    ContainersRunning: usize,
+    ContainersPaused: usize,
+    ContainersStopped: usize,
+    Images: usize,
+    Driver: &'static str,
+    ServerVersion: &'static str,
+    KiriVersion: &'static str,
+    OperatingSystem: &'static str,
+    OSType: &'static str,
+    Architecture: &'static str,
+    KernelVersion: String,
+    NCPU: usize,
+    MemTotal: u64,
+    DockerRootDir: &'static str,
+    CgroupDriver: &'static str,
+    CgroupVersion: &'static str,
+    DefaultRuntime: &'static str,
+    Runtimes: InfoRuntimes,
+    SecurityOptions: [&'static str; 2],
+    SystemTime: String,
+    BuilderVersion: &'static str,
+    IndexServerAddress: &'static str,
+    RegistryConfig: Value,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    KiriAgentMemory: u64,
+    KiriVmAwake: bool,
+    #[serde(skip_serializing_if = "Value::is_null")]
+    KiriVmUplink: Value,
+    #[serde(skip_serializing_if = "is_false")]
+    KiriStopped: bool,
+    KiriMemoryCeiling: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    KiriMemoryTarget: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    KiriMemoryUsed: u64,
+    #[serde(skip_serializing_if = "is_zero_f64")]
+    KiriMemoryStall: f64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    KiriOomKills: u64,
+    #[serde(skip_serializing_if = "is_zero_f64")]
+    KiriCpuPercent: f64,
+    KiriStorageReadOnly: Option<String>,
+    KiriStorageZfs: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    Warnings: Vec<String>,
+}
+
+fn info_json_bytes(engine: &Engine) -> Result<Vec<u8>, Error> {
+    let (total, running) = engine.status_counts();
+    let images = engine.store.image_count().unwrap_or(0);
     let (mem_total, _) = engine.guest_memory().unwrap_or((0, 0));
-    json!({
-        "ID": "kiri",
-        "Name": "kiri",
-        "Containers": states.len(),
-        "ContainersRunning": running,
-        "ContainersPaused": 0,
-        "ContainersStopped": states.len() - running,
-        "Images": images,
-        "Driver": "overlayfs",
-        "ServerVersion": ENGINE_VERSION,
-        "KiriVersion": env!("CARGO_PKG_VERSION"),
-        "OperatingSystem": "Kiri",
-        "OSType": "linux",
-        "Architecture": std::env::consts::ARCH,
-        "KernelVersion": kernel_version(),
-        "NCPU": engine.cpus(),
-        "MemTotal": mem_total,
-        "DockerRootDir": "/var/lib/kiri",
-        "CgroupDriver": "cgroupfs",
-        "CgroupVersion": "2",
-        "DefaultRuntime": "kiri",
-        "Runtimes": {"kiri": {"path": "kiri-init"}},
-        "SecurityOptions": ["name=seccomp,profile=builtin", "name=cgroupns"],
+    let (mem_ceiling, mem_target) = engine.memory();
+    let (mem_stall, oom_kills) = engine.memory_trouble();
+    let summary = InfoSummary {
+        ID: "kiri",
+        Name: "kiri",
+        Containers: total,
+        ContainersRunning: running,
+        ContainersPaused: 0,
+        ContainersStopped: total - running,
+        Images: images,
+        Driver: "overlayfs",
+        ServerVersion: ENGINE_VERSION,
+        KiriVersion: env!("CARGO_PKG_VERSION"),
+        OperatingSystem: "Kiri",
+        OSType: "linux",
+        Architecture: std::env::consts::ARCH,
+        KernelVersion: kernel_version(),
+        NCPU: engine.cpus(),
+        MemTotal: mem_total,
+        DockerRootDir: "/var/lib/kiri",
+        CgroupDriver: "cgroupfs",
+        CgroupVersion: "2",
+        DefaultRuntime: "kiri",
+        Runtimes: InfoRuntimes { kiri: InfoKiriRuntime { path: "kiri-init" } },
+        SecurityOptions: ["name=seccomp,profile=builtin", "name=cgroupns"],
         // Compose needs it to attach in `up` and `logs -f` (#346).
-        "SystemTime": time::rfc3339(std::time::SystemTime::now()),
+        SystemTime: time::rfc3339(std::time::SystemTime::now()),
         // Not in Docker's /info (the ping's Builder-Version header is), but
         // tools print it: the classic builder API, served by builder.rs.
-        "BuilderVersion": "1",
+        BuilderVersion: "1",
         // `docker info`'s Registry, Insecure Registries and Registry Mirrors:
         // daemon.json's, as Docker reports its own.
-        "IndexServerAddress": "https://index.docker.io/v1/",
-        "RegistryConfig": super::daemon_json::info(),
-        "KiriAgentMemory": engine.agent_rss().unwrap_or(0),
-        "KiriVmAwake": engine.is_awake(),
-        "KiriVmUplink": engine.uplink_info(),
-        "KiriStopped": engine.is_stopped(),
-        "KiriMemoryCeiling": engine.memory().0,
-        "KiriMemoryTarget": engine.memory().1,
-        "KiriMemoryUsed": engine.memory_used(),
-        "KiriMemoryStall": engine.memory_trouble().0,
-        "KiriOomKills": engine.memory_trouble().1,
-        "KiriCpuPercent": engine.cpu_percent(),
-        "KiriStorageReadOnly": engine.storage_readonly(),
-        "KiriStorageZfs": engine.storage_zfs(),
-        "Warnings": engine.records_damage().into_iter().chain(engine.image_damage()).chain(engine.host_warnings()).collect::<Vec<_>>(),
-    })
+        IndexServerAddress: "https://index.docker.io/v1/",
+        RegistryConfig: super::daemon_json::info(),
+        KiriAgentMemory: engine.agent_rss().unwrap_or(0),
+        KiriVmAwake: engine.is_awake(),
+        KiriVmUplink: engine.uplink_info(),
+        KiriStopped: engine.is_stopped(),
+        KiriMemoryCeiling: mem_ceiling,
+        KiriMemoryTarget: mem_target,
+        KiriMemoryUsed: engine.memory_used(),
+        KiriMemoryStall: mem_stall,
+        KiriOomKills: oom_kills,
+        KiriCpuPercent: engine.cpu_percent(),
+        KiriStorageReadOnly: engine.storage_readonly(),
+        KiriStorageZfs: engine.storage_zfs(),
+        Warnings: engine.records_damage().into_iter().chain(engine.image_damage()).chain(engine.host_warnings()).collect(),
+    };
+    serde_json::to_vec(&summary).map_err(|e| Error::Io(io::Error::other(e)))
 }
 
 pub(super) fn filters(req: &Request, known: &[&str]) -> Result<Filters, Error> {
@@ -620,11 +749,58 @@ fn merge_labels(image_cfg: &Value, body_labels: &Value) -> Value {
     }
 }
 
+/// Serializes `Option<T>` as a 0- or 1-element JSON array without allocating a `Vec`.
+struct OptSeq<T>(Option<T>);
+
+impl<T: serde::Serialize> serde::Serialize for OptSeq<T> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        match &self.0 {
+            Some(v) => {
+                let mut seq = serializer.serialize_seq(Some(1))?;
+                seq.serialize_element(v)?;
+                seq.end()
+            }
+            None => serializer.serialize_seq(Some(0))?.end(),
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+#[allow(non_snake_case)]
+struct ImageSummary<'a> {
+    Id: &'a str,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    ParentId: &'static str,
+    RepoTags: OptSeq<&'a str>,
+    RepoDigests: OptSeq<std::borrow::Cow<'a, str>>,
+    Created: i64,
+    Size: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    SharedSize: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    VirtualSize: Option<u64>,
+    #[serde(skip_serializing_if = "Value::is_null")]
+    Labels: &'a Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    Containers: Option<i64>,
+    // Not Docker's: when this image arrived here, for the window.
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    Pulled: u64,
+}
+
+#[cfg(test)]
 fn images(req: &Request, engine: &Engine) -> Result<Value, Error> {
+    let bytes = images_json_bytes(req, engine)?;
+    serde_json::from_slice(&bytes).map_err(|e| Error::Io(io::Error::other(e)))
+}
+
+fn images_json_bytes(req: &Request, engine: &Engine) -> Result<Vec<u8>, Error> {
     let f = filters(req, &["reference", "dangling", "label", "label!", "before", "since", "until"])?;
-    let mut list = engine.store.images()?;
-    // Newest first, as Docker lists them (#364).
-    list.sort_by_key(|i| std::cmp::Reverse(time::parse_unix(&i.created)));
+    let list = engine.store.images_arc()?;
+    // Newest first, as Docker lists them (#364). Parse each timestamp once and sort indices.
+    let mut order: Vec<(i64, usize)> = list.iter().enumerate().map(|(idx, i)| (time::parse_unix(&i.created), idx)).collect();
+    order.sort_by_key(|&(t, _)| std::cmp::Reverse(t));
     let now = std::time::SystemTime::now();
     let created = |i: &kiri_image::Image| time::docker_timestamp(&i.created, now);
     // Docker's rules (moby daemon/images/image_list.go): `dangling` is a
@@ -651,51 +827,61 @@ fn images(req: &Request, engine: &Engine) -> Result<Value, Error> {
         before = Some(before.map_or(t, |b| b.min(t)));
     }
     let labels = engine.image_labels(&list);
-    Ok(Value::Array(
-        list.iter()
-            .zip(labels)
-            .filter_map(|(i, labels)| {
-                // Kiri keeps an untagged image under its ID.
-                let untagged = i.name.starts_with("sha256:") && !list.iter().any(|o| o.config_digest == i.config_digest && !o.name.starts_with("sha256:"));
-                if i.name.starts_with("sha256:") && !untagged {
-                    return None;
-                }
-                if dangling.is_some_and(|d| d != untagged) {
-                    return None;
-                }
-                if (untagged && f.values("reference").is_some()) || (!untagged && !f.any("reference", |p| reference_matches(p, &i.name))) {
-                    return None;
-                }
-                if !f.labels(&labels) {
-                    return None;
-                }
+    let need_ts = before.is_some() || since.is_some();
+    let legacy_none = req.api_version.is_some_and(|v| v < (1, 43));
+    let tagged_configs: Option<std::collections::HashSet<&str>> = list
+        .iter()
+        .any(|i| i.name.starts_with("sha256:"))
+        .then(|| list.iter().filter(|o| !o.name.starts_with("sha256:")).map(|o| o.config_digest.as_str()).collect());
+    let rows: Vec<ImageSummary<'_>> = order
+        .into_iter()
+        .filter_map(|(created_unix, idx)| {
+            let i = &list[idx];
+            let labels = &labels[idx];
+            // Kiri keeps an untagged image under its ID.
+            let is_sha = i.name.starts_with("sha256:");
+            let untagged = is_sha && !tagged_configs.as_ref().is_some_and(|s| s.contains(i.config_digest.as_str()));
+            if is_sha && !untagged {
+                return None;
+            }
+            if dangling.is_some_and(|d| d != untagged) {
+                return None;
+            }
+            if (untagged && f.values("reference").is_some()) || (!untagged && !f.any("reference", |p| reference_matches(p, &i.name))) {
+                return None;
+            }
+            if !f.labels(labels) {
+                return None;
+            }
+            if need_ts {
                 let t = created(i);
                 if before.is_some_and(|b| !t.is_some_and(|t| t < b)) || since.is_some_and(|s| !t.is_some_and(|t| t > s)) {
                     return None;
                 }
-                // Untagged: no names; before API 1.43 Docker wrote `<none>` ones.
-                let (tags, digests) = match (untagged, req.api_version.is_some_and(|v| v < (1, 43))) {
-                    (false, _) => (json!([i.name]), json!(i.repo_digest().into_iter().collect::<Vec<_>>())),
-                    (true, false) => (json!([]), json!([])),
-                    (true, true) => (json!(["<none>:<none>"]), json!(["<none>@<none>"])),
-                };
-                Some(json!({
-                    "Id": i.config_digest,
-                    "ParentId": "",
-                    "RepoTags": tags,
-                    "RepoDigests": digests,
-                    "Created": time::parse_unix(&i.created),
-                    "Size": i.size,
-                    "SharedSize": -1,
-                    "VirtualSize": i.size,
-                    "Labels": labels,
-                    "Containers": -1,
-                    // Not Docker's: when this image arrived here, for the window.
-                    "Pulled": i.pulled_at,
-                }))
+            }
+            // Untagged: no names; before API 1.43 Docker wrote `<none>` ones.
+            let (tags, digests) = match (untagged, legacy_none) {
+                (false, _) => (OptSeq(Some(i.name.as_str())), OptSeq(i.repo_digest().map(std::borrow::Cow::Owned))),
+                (true, false) => (OptSeq(None), OptSeq(None)),
+                (true, true) => (OptSeq(Some("<none>:<none>")), OptSeq(Some(std::borrow::Cow::Borrowed("<none>@<none>")))),
+            };
+            let legacy_virtual_size = req.api_version.is_some_and(|v| v < (1, 44));
+            Some(ImageSummary {
+                Id: &i.config_digest,
+                ParentId: "",
+                RepoTags: tags,
+                RepoDigests: digests,
+                Created: created_unix,
+                Size: i.size,
+                SharedSize: None,
+                VirtualSize: legacy_virtual_size.then_some(i.size),
+                Labels: labels,
+                Containers: None,
+                Pulled: i.pulled_at,
             })
-            .collect(),
-    ))
+        })
+        .collect();
+    serde_json::to_vec(&rows).map_err(|e| Error::Io(io::Error::other(e)))
 }
 
 /// The image list's `dangling` filter as Docker's `GetBoolOrDefault` reads
@@ -1249,11 +1435,7 @@ fn save_resources(
     } else if let Some(prev) = existing_shared_nat {
         out["shared_nat"] = json!(prev);
     }
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(Error::Io)?;
-    }
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, out.to_string()).and_then(|()| std::fs::rename(&tmp, path)).map_err(Error::Io)
+    super::write_atomic_mode(path, out.to_string().as_bytes(), 0o600).map_err(Error::Io)
 }
 
 fn set_ports(req: &Request, engine: &Engine, id: &str) -> Result<Value, Error> {
@@ -1805,14 +1987,52 @@ fn mac_shared(src: &str) -> bool {
 /// - anything else the Mac has there (/etc/hosts, /etc/localtime) is the
 ///   Mac's.
 /// - what the Mac lacks stays the VM's.
-fn mac_source(src: &str) -> Option<String> {
-    let real = std::fs::canonicalize(src).ok().and_then(|p| p.into_os_string().into_string().ok()).filter(|p| mac_shared(p));
-    if mac_shared(src) {
-        return Some(real.unwrap_or_else(|| src.to_owned()));
+
+/// Whether `src` names one of the synthetic macOS `/etc` paths backed by
+/// `~/.kiri/etc` (`hostetc`), either via `/etc` or directly via `~/.kiri/etc`.
+fn is_mac_hostetc(src: &str) -> bool {
+    let etc_dir = super::state_dir().ok().map(|s| s.join("etc"));
+    is_mac_hostetc_with(src, etc_dir.as_deref())
+}
+
+fn is_mac_hostetc_with(src: &str, etc_dir: Option<&std::path::Path>) -> bool {
+    if !cfg!(target_os = "macos") {
+        return false;
     }
-    let kept = match src.strip_prefix("/etc/") {
+    let norm = lexical_path(src);
+    if norm == "/etc" || norm.strip_prefix("/etc/").is_some_and(|name| super::hostetc::FILES.contains(&name)) {
+        return true;
+    }
+    if let Some(etc_dir) = etc_dir {
+        let etc_str = etc_dir.to_string_lossy();
+        let etc_lex = lexical_path(&etc_str);
+        let etc_canon = canonical_or_ancestor(&etc_str);
+        let matches_etc = |p: &str| {
+            p == etc_lex
+                || p.strip_prefix(&etc_lex).is_some_and(|r| r.starts_with('/'))
+                || etc_canon.as_deref().is_some_and(|c| p == c || p.strip_prefix(c).is_some_and(|r| r.starts_with('/')))
+        };
+        if matches_etc(&norm)
+            || canonical_or_ancestor(src).as_deref().is_some_and(matches_etc)
+            || canonical_or_ancestor(&norm).as_deref().is_some_and(matches_etc)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn mac_source(src: &str) -> Option<String> {
+    let norm = lexical_path(src);
+    let real = std::fs::canonicalize(src).ok().and_then(|p| p.into_os_string().into_string().ok()).filter(|p| mac_shared(p));
+    // Check the lexically normalized path so `/Users/..` (which normalizes to `/`)
+    // never falls back to `/mnt/mac/Users/..` inside the VM.
+    if mac_shared(&norm) {
+        return Some(real.unwrap_or(norm));
+    }
+    let kept = match norm.strip_prefix("/etc/") {
         Some(name) if super::hostetc::FILES.contains(&name) => Some(super::hostetc::file(name)),
-        None if src == "/etc" => Some(super::hostetc::all()),
+        None if norm == "/etc" => Some(super::hostetc::all()),
         _ => None,
     };
     if let Some(kept) = kept {
@@ -1820,7 +2040,7 @@ fn mac_source(src: &str) -> Option<String> {
         // it cannot be written, the path is the VM's, as it was.
         return kept.ok().and_then(|p| p.into_os_string().into_string().ok()).filter(|p| mac_shared(p));
     }
-    if src.strip_prefix("/etc").is_some_and(|rest| rest.is_empty() || rest.starts_with('/')) { real } else { None }
+    if norm.strip_prefix("/etc").is_some_and(|rest| rest.is_empty() || rest.starts_with('/')) { real } else { None }
 }
 
 /// Where the guest finds a host path given for a bind: the Mac's own under
@@ -1832,6 +2052,21 @@ fn guest_bind_source(src: &str) -> String {
     mac_source(src).map_or_else(|| src.to_owned(), |real| format!("{MAC_ROOT}{real}"))
 }
 
+fn ensure_ro_in_rest(rest: &str) -> String {
+    let Some((dst, tail)) = rest.split_once('\t') else {
+        return rest.to_owned();
+    };
+    let (flags, after) = tail.split_once('\t').map_or((tail, None), |(f, a)| (f, Some(a)));
+    let mut parts: Vec<&str> = flags.split(',').filter(|x| !x.is_empty()).collect();
+    if !parts.contains(&"ro") {
+        parts.push("ro");
+    }
+    match after {
+        Some(a) => format!("{dst}\t{}\t{a}", parts.join(",")),
+        None => format!("{dst}\t{}", parts.join(",")),
+    }
+}
+
 /// The guest mount lines with each Mac bind source followed again from the
 /// path the person gave (kept in `info`, one entry per line). Links are
 /// resolved when the container is made; this redoes it at start, so a link
@@ -1841,39 +2076,64 @@ fn guest_bind_source(src: &str) -> String {
 /// it now: by the path the person gave, or else by the path mounted when
 /// it was made, every line, whether or not `info` has one for it. Other
 /// lines stay as they are.
-pub(super) fn fresh_bind_sources(guest: &[String], info: &[Value]) -> Vec<String> {
-    fresh_bind_sources_with(guest, info, super::binds::engine_socket, cfg!(target_os = "macos"))
+pub(super) fn fresh_bind_sources(guest: &[String], info: &[Value], non_host: bool) -> Result<Vec<String>, Error> {
+    fresh_bind_sources_with(guest, info, super::binds::engine_socket, cfg!(target_os = "macos"), non_host, is_mac_hostetc, is_host_socket_ancestor)
 }
 
-fn fresh_bind_sources_with(guest: &[String], info: &[Value], engine_socket: impl Fn(&str) -> Option<String>, mac: bool) -> Vec<String> {
+fn fresh_bind_sources_with(
+    guest: &[String],
+    info: &[Value],
+    engine_socket: impl Fn(&str) -> Option<String>,
+    mac: bool,
+    non_host: bool,
+    hostetc: impl Fn(&str) -> bool,
+    socket_ancestor: impl Fn(&str) -> bool,
+) -> Result<Vec<String>, Error> {
     let paired = guest.len() == info.len();
     if mac && !paired {
-        return guest.to_vec();
+        return Ok(guest.to_vec());
     }
     guest
         .iter()
         .enumerate()
         .map(|(idx, line)| {
-            let Some((old, rest)) = line.split_once('\t') else { return line.clone() };
+            let Some((old, rest)) = line.split_once('\t') else { return Ok(line.clone()) };
             let src = info.get(idx).filter(|i| paired && i["Type"] == "bind").and_then(|i| i["Source"].as_str());
             if !mac {
                 if is_ssh_agent_sock(old) || src.is_some_and(is_ssh_agent_sock) {
-                    return format!("{}\t{rest}", ssh_agent_source_for(!mac));
+                    return Ok(format!("{}\t{rest}", ssh_agent_source_for(!mac)));
                 }
                 let given = src.and_then(&engine_socket).or_else(|| old.starts_with('/').then(|| engine_socket(old)).flatten());
-                return given.map_or_else(|| line.clone(), |given| format!("{given}\t{rest}"));
+                return Ok(given.map_or_else(|| line.clone(), |given| format!("{given}\t{rest}")));
             }
-            let Some(src) = src else { return line.clone() };
+            let Some(src) = src else { return Ok(line.clone()) };
             if engine_socket(src).is_some() {
-                return line.clone();
+                return Ok(line.clone());
             }
             if ssh_agent_bind_for(src, mac).is_some() {
-                return format!("{}\t{rest}", ssh_agent_source_for(!mac));
+                return Ok(format!("{}\t{rest}", ssh_agent_source_for(!mac)));
             }
             if !old.strip_prefix(MAC_ROOT).is_some_and(|p| p.starts_with('/')) {
-                return line.clone();
+                return Ok(line.clone());
             }
-            format!("{}\t{rest}", guest_bind_source(src))
+            if non_host && socket_ancestor(src) {
+                return Err(Error::BadRequest(format!(
+                    "invalid mount source {src}: cannot mount a directory containing Kiri's host socket"
+                )));
+            }
+            let resolved = guest_bind_source(src);
+            let resolved_host = resolved.strip_prefix(MAC_ROOT).unwrap_or(&resolved);
+            if non_host && socket_ancestor(resolved_host) {
+                return Err(Error::BadRequest(format!(
+                    "invalid mount source {src}: cannot mount a directory containing Kiri's host socket"
+                )));
+            }
+            let rest = if hostetc(src) || hostetc(resolved_host) {
+                ensure_ro_in_rest(rest)
+            } else {
+                rest.to_owned()
+            };
+            Ok(format!("{resolved}\t{rest}"))
         })
         .collect()
 }
@@ -1916,15 +2176,23 @@ fn resolve_server(host: &str) -> Option<String> {
     addrs.iter().find(|a| a.is_ipv4()).or(addrs.first()).map(|a| a.ip().to_string())
 }
 
-/// Whether `src` names the mount point the guest keeps the Mac's folders at.
+/// Whether `src` names the mount point the guest keeps the Mac's folders at,
+/// or an ancestor of it (`/` or `/mnt`) whose recursive bind (`MS_BIND | MS_REC`)
+/// would expose `/mnt/mac` inside the container.
 ///
 /// `root` is empty on a Linux host, where the agent sees the host's own
 /// paths and there is no share to name.
 fn guest_share_path(src: &str, root: &str) -> bool {
-    // Compared as the guest kernel will read it: `/mnt//mac`, `/mnt/./mac`
-    // and `/mnt/x/../mac` all name the share.
+    if !root.starts_with('/') || !src.starts_with('/') {
+        return false;
+    }
+    // Compared as the guest kernel will read it: `/mnt//mac`, `/mnt/./mac`,
+    // `/mnt/x/../mac`, `/mnt`, and `/` all reach the share.
     let src = lexical_path(src);
-    root.starts_with('/') && (src == root || src.strip_prefix(root).is_some_and(|rest| rest.starts_with('/')))
+    src == root
+        || src.strip_prefix(root).is_some_and(|rest| rest.starts_with('/'))
+        || src == "/"
+        || root.strip_prefix(&src).is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// An absolute path with empty and `.` components dropped and `..` applied.
@@ -1942,24 +2210,169 @@ fn lexical_path(p: &str) -> String {
     format!("/{}", out.join("/"))
 }
 
-/// Refuses volume driver options that would mount the VM's own shares.
-///
-/// The guest mounts a volume's `device` itself, as root, before the container
-/// starts, so a `type=virtiofs` volume (`device=kiri-mac`) or a bind of
-/// `/mnt/mac` would hand the container the share without `-v` naming it.
-fn check_volume_device(options: &std::collections::BTreeMap<String, String>) -> Result<(), Error> {
-    let kind = options.get("type").map_or("", String::as_str);
-    if kind.eq_ignore_ascii_case("virtiofs") {
-        return Err(Error::BadRequest("invalid volume option type=virtiofs: the VM's shares cannot be mounted as a volume".into()));
+/// Filesystem types permitted for local volume `DriverOpts` (`type=`).
+const ALLOWED_VOLUME_TYPES: &[&str] = &["", "none", "nfs", "nfs4", "cifs", "smb3", "tmpfs"];
+
+/// Canonicalizes `p` if it exists, or canonicalizes its deepest existing ancestor
+/// (following dangling symlinks up to 40 hops) and re-appends the remaining tail
+/// components so symlinked parents (such as `/var/run/kiri -> /run/kiri` or
+/// `/tmp/evil/nonexistent/..`) are resolved even when the leaf does not exist
+/// or ends in `..`.
+fn canonical_or_ancestor(p: &str) -> Option<String> {
+    if let Ok(canon) = std::fs::canonicalize(p) {
+        return canon.into_os_string().into_string().ok().map(|s| lexical_path(&s));
     }
-    let device = options.get("device").map_or("", String::as_str);
-    let (flags, _) = super::volumes::mount_options(options.get("o").map_or("", String::as_str));
-    if flags & 4096 != 0 && guest_share_path(device, MAC_ROOT) {
+    let walk = |start: &std::path::Path| -> Option<String> {
+        let mut cur = start.to_path_buf();
+        let mut tail: Vec<std::ffi::OsString> = Vec::new();
+        let mut hops = 0usize;
+        loop {
+            if let Ok(canon) = std::fs::canonicalize(&cur) {
+                let mut full = canon;
+                for seg in tail.into_iter().rev() {
+                    full.push(seg);
+                }
+                return full.into_os_string().into_string().ok().map(|s| lexical_path(&s));
+            }
+            if hops < 40
+                && let Ok(target) = std::fs::read_link(&cur)
+            {
+                hops += 1;
+                let next = if target.is_absolute() {
+                    target
+                } else {
+                    cur.parent().map_or(target.clone(), |p| p.join(&target))
+                };
+                cur = next;
+                continue;
+            }
+            let name = cur.file_name()?.to_os_string();
+            tail.push(name);
+            cur = cur.parent()?.to_path_buf();
+        }
+    };
+    walk(std::path::Path::new(p)).or_else(|| {
+        let norm = lexical_path(p);
+        walk(std::path::Path::new(&norm))
+    })
+}
+
+/// Whether `src` (either lexically or after resolving symlinks) is a parent or
+/// ancestor directory of Kiri's own host Unix socket (such as `/run/kiri`,
+/// `/var/run/kiri`, `/run`, or `/`), which would let a non-Host caller reach
+/// the host-privileged socket without going through `engine_socket_for_distro`.
+fn is_host_socket_ancestor(src: &str) -> bool {
+    let mut candidates = Vec::new();
+    if let Ok(p) = super::socket_path()
+        && let Some(s) = p.to_str()
+    {
+        candidates.push(s.to_owned());
+    }
+    if let Ok(p) = super::home_socket_path()
+        && let Some(s) = p.to_str()
+    {
+        candidates.push(s.to_owned());
+    }
+    is_host_socket_ancestor_against(src, &candidates)
+}
+
+fn is_host_socket_ancestor_against(src: &str, socket_candidates: &[String]) -> bool {
+    let norm = lexical_path(src);
+    let mut src_forms = vec![norm.clone()];
+    for candidate in [canonical_or_ancestor(src), canonical_or_ancestor(&norm)].into_iter().flatten() {
+        if !src_forms.contains(&candidate) {
+            src_forms.push(candidate);
+        }
+    }
+    let parent_of = |sock: &str| -> Option<String> {
+        let (parent, _) = sock.rsplit_once('/')?;
+        Some(if parent.is_empty() { "/".to_owned() } else { parent.to_owned() })
+    };
+    socket_candidates.iter().any(|sock| {
+        let mut parents = Vec::new();
+        if let Some(p) = parent_of(&lexical_path(sock)) {
+            parents.push(p);
+        }
+        if let Some(canon_sock) = canonical_or_ancestor(sock)
+            && let Some(p) = parent_of(&canon_sock)
+            && !parents.contains(&p)
+        {
+            parents.push(p);
+        }
+        src_forms.iter().any(|sp| {
+            parents
+                .iter()
+                .any(|parent| sp == "/" || sp == parent || parent.strip_prefix(sp.as_str()).is_some_and(|r| r.starts_with('/')))
+        })
+    })
+}
+
+/// Resolves and validates a local bind volume's `device` option with the exact
+/// same caller-aware confinement and socket substitution as regular binds.
+/// Returns `(guest_device_path, force_ro)`.
+fn resolve_volume_bind_device(device: &str, caller: &Caller, wsl: Option<&super::binds::Wsl>) -> Result<(String, bool), Error> {
+    if device.is_empty() {
+        return Err(Error::BadRequest("invalid volume option device: bind device cannot be empty".into()));
+    }
+    let resolved = match (wsl, caller.wsl_distro()) {
+        (_, Some(d)) => super::binds::distro_source(device, d, wsl)?,
+        (Some(w), None) => super::binds::source(device, w)?,
+        (None, None) => device.to_owned(),
+    };
+    if !resolved.starts_with('/') {
+        return Err(Error::BadRequest(format!("invalid volume option device={device}: must be an absolute path")));
+    }
+    if guest_share_path(&resolved, MAC_ROOT) {
         return Err(Error::BadRequest(format!(
             "invalid volume option device={device}: {MAC_ROOT} exists only inside the VM; name the Mac's own path, such as /Users/…"
         )));
     }
-    Ok(())
+    if let Some(sock) = super::binds::engine_socket_for_distro(&resolved, caller.wsl_distro()) {
+        return Ok((sock, false));
+    }
+    if *caller != Caller::Host && is_host_socket_ancestor(&resolved) {
+        return Err(Error::BadRequest(format!(
+            "invalid volume option device={device}: cannot mount a directory containing Kiri's host socket"
+        )));
+    }
+    let force_ro = is_mac_hostetc(&resolved);
+    let mapped = guest_bind_source(&resolved);
+    if !MAC_ROOT.is_empty() && (lexical_path(&mapped) == MAC_ROOT || !mapped.starts_with(&format!("{MAC_ROOT}/")) && guest_share_path(&mapped, MAC_ROOT)) {
+        return Err(Error::BadRequest(format!(
+            "invalid volume option device={device}: {MAC_ROOT} exists only inside the VM; name the Mac's own path, such as /Users/…"
+        )));
+    }
+    Ok((mapped, force_ro))
+}
+
+/// Refuses volume driver options that would mount the VM's own shares,
+/// unsupported kernel filesystems, or paths outside the caller's isolation boundary.
+#[cfg(test)]
+fn check_volume_device(options: &std::collections::BTreeMap<String, String>) -> Result<(), Error> {
+    check_volume_device_for(options, &Caller::Host, None).map(|_| ())
+}
+
+fn check_volume_device_for(
+    options: &std::collections::BTreeMap<String, String>,
+    caller: &Caller,
+    wsl: Option<&super::binds::Wsl>,
+) -> Result<Option<(String, bool)>, Error> {
+    let kind = options.get("type").map_or("", String::as_str);
+    if kind.eq_ignore_ascii_case("virtiofs") {
+        return Err(Error::BadRequest("invalid volume option type=virtiofs: the VM's shares cannot be mounted as a volume".into()));
+    }
+    if !ALLOWED_VOLUME_TYPES.iter().any(|allowed| kind.eq_ignore_ascii_case(allowed)) {
+        return Err(Error::BadRequest(format!(
+            "invalid volume option type={kind}: unsupported local volume filesystem type"
+        )));
+    }
+    let device = options.get("device").map_or("", String::as_str);
+    let (flags, _) = super::volumes::mount_options(options.get("o").map_or("", String::as_str));
+    if flags & 4096 != 0 {
+        let mapped = resolve_volume_bind_device(device, caller, wsl)?;
+        return Ok(Some(mapped));
+    }
+    Ok(None)
 }
 
 /// Refuses text that would forge a field in the tab-separated mount line the
@@ -2157,19 +2570,35 @@ fn mounts_for(body: &Value, engine: &Engine, image: &kiri_image::Image, caller: 
                 if !src.starts_with('/') {
                     return Err(Error::BadRequest(format!("invalid mount source {src}: must be an absolute path")));
                 }
+                if *caller != super::caller::Caller::Host && is_host_socket_ancestor(src) {
+                    return Err(Error::BadRequest(format!(
+                        "invalid mount source {src}: cannot mount a directory containing Kiri's host socket"
+                    )));
+                }
+                // Synthetic macOS `/etc` files live in shared `~/.kiri/etc`: always
+                // mount read-only so a container cannot plant symlinks or poison
+                // shared `/etc` entries for other containers.
+                let bind_ro = ro || is_mac_hostetc(src);
+                let bind_flag = |more: &str| {
+                    let mut f: Vec<&str> = more.split(',').filter(|x| !x.is_empty()).collect();
+                    if bind_ro {
+                        f.push("ro");
+                    }
+                    f.join(",")
+                };
                 // Where the source is on this machine: itself, or on a Mac
                 // the path it leads to (a file Kiri keeps for /etc/passwd).
                 let here = if cfg!(target_os = "macos") { mac_source(src) } else { Some(src.to_owned()) };
                 let Some(here) = here else {
                     // The guest makes a missing source itself, as Docker does on Linux.
-                    out.guest.push(format!("{src}\t{dst}\t{}", flag(if create_missing { "create" } else { "" })));
-                    out.info.push(json!({"Type": "bind", "Source": src, "Destination": dst, "Mode": "", "RW": !ro, "Propagation": "rprivate"}));
+                    out.guest.push(format!("{src}\t{dst}\t{}", bind_flag(if create_missing { "create" } else { "" })));
+                    out.info.push(json!({"Type": "bind", "Source": src, "Destination": dst, "Mode": "", "RW": !bind_ro, "Propagation": "rprivate"}));
                     return Ok(());
                 };
                 prepare_bind_source(src, &here, create_missing)?;
                 // After a missing source was made, so its links are followed too.
-                out.guest.push(format!("{}\t{dst}\t{}", guest_bind_source(src), flag("")));
-                out.info.push(json!({"Type": "bind", "Source": src, "Destination": dst, "Mode": "", "RW": !ro, "Propagation": "rprivate"}));
+                out.guest.push(format!("{}\t{dst}\t{}", guest_bind_source(src), bind_flag("")));
+                out.info.push(json!({"Type": "bind", "Source": src, "Destination": dst, "Mode": "", "RW": !bind_ro, "Propagation": "rprivate"}));
             }
             "volume" => {
                 let (name, anonymous) = if src.is_empty() { (super::engine::random_hex(32), true) } else { (src.to_owned(), false) };
@@ -2179,17 +2608,41 @@ fn mounts_for(body: &Value, engine: &Engine, image: &kiri_image::Image, caller: 
                 for (k, val) in &v.options {
                     wire_text(&format!("volume option {k}"), val)?;
                 }
-                // The guest mounts a volume's device as root, so the share
-                // must not be reachable this way either: not as a virtiofs
-                // tag, and not as a bind of /mnt/mac.
-                check_volume_device(&v.options)?;
+                // The guest mounts a volume's device as root, so enforce the
+                // filesystem allowlist, caller confinement (WSL/Container),
+                // socket substitution, `/mnt/mac` share guard, and hostetc RO.
+                let mapped_bind = check_volume_device_for(&v.options, caller, super::binds::wsl())?;
+                let force_ro = mapped_bind.as_ref().is_some_and(|(_, r)| *r);
+                let vol_ro = ro || force_ro;
+                let vol_flag = |more: &str| {
+                    let mut f: Vec<&str> = more.split(',').filter(|x| !x.is_empty()).collect();
+                    if vol_ro {
+                        f.push("ro");
+                    }
+                    f.join(",")
+                };
+                let effective_opts;
+                let opts_for_guest = if force_ro {
+                    let mut o = v.options.clone();
+                    let existing = o.get("o").map_or("", String::as_str);
+                    let next = if existing.is_empty() { "ro".to_owned() } else { format!("{existing},ro") };
+                    o.insert("o".into(), next);
+                    effective_opts = o;
+                    &effective_opts
+                } else {
+                    &v.options
+                };
                 let path = super::volumes::guest_path(&name);
                 let copy = if extra.contains("nocopy") { "create" } else { "create,copyup" };
                 // A volume with driver options (`type=nfs`, `o=bind` …) is
                 // mounted at its path by the guest at start, then bound in.
-                let vol = super::volumes::guest_mount_fields(&v.options, guest_bind_source, resolve_server);
-                out.guest.push(format!("{path}\t{dst}\t{}{vol}", flag(copy)));
-                out.info.push(json!({"Type": "volume", "Name": name, "Source": path, "Destination": dst, "Driver": "local", "Mode": "z", "RW": !ro, "Propagation": ""}));
+                let vol = super::volumes::guest_mount_fields(
+                    opts_for_guest,
+                    |dev| mapped_bind.as_ref().map(|(m, _)| m.clone()).unwrap_or_else(|| guest_bind_source(dev)),
+                    resolve_server,
+                );
+                out.guest.push(format!("{path}\t{dst}\t{}{vol}", vol_flag(copy)));
+                out.info.push(json!({"Type": "volume", "Name": name, "Source": path, "Destination": dst, "Driver": "local", "Mode": "z", "RW": !vol_ro, "Propagation": ""}));
                 if anonymous {
                     out.anon.push(name);
                 } else {
@@ -2258,6 +2711,7 @@ fn mounts_for(body: &Value, engine: &Engine, image: &kiri_image::Image, caller: 
                 d => return Err(Error::BadRequest(format!("Kiri supports only local volumes, not {d}"))),
             }
             let options = super::volumes::local_options(&driver_opts["Options"]).map_err(Error::BadRequest)?;
+            check_volume_device_for(&options, caller, wsl)?;
             engine.volume_ensure_with(src, m["VolumeOptions"]["Labels"].clone(), options)?;
         }
         add(kind, src, dst, ro, &extra, false, &mut out)?;
@@ -2387,18 +2841,22 @@ fn inspect_mounts(spec: &Spec, is_anon_volume: impl Fn(&str) -> bool) -> Value {
 }
 
 fn volume_json(v: &super::volumes::Volume) -> Value {
-    json!({
-        "Name": v.name,
-        "Driver": "local",
-        "Mountpoint": super::volumes::guest_path(&v.name),
-        "CreatedAt": time::rfc3339(std::time::UNIX_EPOCH + Duration::from_nanos(v.created_ns)),
-        "Labels": if v.labels.is_object() { v.labels.clone() } else { json!({}) },
-        "Scope": "local",
-        "Options": v.options,
-    })
+    let mut m = serde_json::Map::with_capacity(7);
+    m.insert("Name".into(), v.name.clone().into());
+    m.insert("Driver".into(), "local".into());
+    m.insert("Mountpoint".into(), super::volumes::guest_path(&v.name).into());
+    m.insert("CreatedAt".into(), time::rfc3339(std::time::UNIX_EPOCH + Duration::from_nanos(v.created_ns)).into());
+    if v.labels.as_object().is_some_and(|o| !o.is_empty()) {
+        m.insert("Labels".into(), v.labels.clone());
+    }
+    m.insert("Scope".into(), "local".into());
+    if !v.options.is_empty() {
+        m.insert("Options".into(), serde_json::to_value(&v.options).unwrap_or(Value::Null));
+    }
+    Value::Object(m)
 }
 
-fn volume_create(req: &Request, engine: &Engine) -> Result<Value, Error> {
+fn volume_create(req: &Request, engine: &Engine, caller: &Caller) -> Result<Value, Error> {
     let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
     match body["Driver"].as_str().unwrap_or("local") {
         "" | "local" => {}
@@ -2409,6 +2867,7 @@ fn volume_create(req: &Request, engine: &Engine) -> Result<Value, Error> {
         n => n.to_owned(),
     };
     let options = super::volumes::local_options(&body["DriverOpts"]).map_err(Error::BadRequest)?;
+    check_volume_device_for(&options, caller, super::binds::wsl())?;
     let v = engine.volume_ensure_with(&name, body["Labels"].clone(), options)?;
     Ok(volume_json(&v))
 }
@@ -2459,7 +2918,7 @@ fn volumes(req: &Request, engine: &Engine) -> Result<Value, Error> {
         })
         .map(volume_json)
         .collect();
-    Ok(json!({"Volumes": list, "Warnings": []}))
+    Ok(json!({"Volumes": list}))
 }
 
 /// The image's and create request's ExposedPorts keys; a bare port means TCP.
@@ -2475,17 +2934,6 @@ fn exposed_ports(body: &Value, image_cfg: &Value) -> Vec<String> {
     ports.sort_unstable();
     ports.dedup();
     ports
-}
-
-/// What is published right now: Docker's `Ports` list for `ps`.
-fn ports_list(c: &Container) -> Value {
-    let Some(fw) = &c.forwards else { return json!([]) };
-    Value::Array(
-        fw.bound
-            .iter()
-            .map(|(b, ip, port)| json!({"IP": ip, "PrivatePort": b.container_port, "PublicPort": port, "Type": b.proto}))
-            .collect(),
-    )
 }
 
 /// What `-p` asked for, as Docker's inspect keeps it in HostConfig: the
@@ -2859,16 +3307,6 @@ fn create_by(req: &Request, engine: &Engine, caller: &Caller) -> Result<Value, E
     create_inner(req, engine, caller, record_distro)
 }
 
-#[cfg(test)]
-pub(super) fn create_for(req: &Request, engine: &Engine, wsl_distro: Option<&str>) -> Result<Value, Error> {
-    let record_distro = wsl_distro.filter(|d| super::binds::valid_distro_name(d)).map(str::to_owned);
-    let caller = match wsl_distro {
-        Some(d) => Caller::Wsl(d.to_owned()),
-        None => Caller::Host,
-    };
-    create_inner(req, engine, &caller, record_distro)
-}
-
 fn create_inner(req: &Request, engine: &Engine, caller: &Caller, record_wsl_distro: Option<String>) -> Result<Value, Error> {
     let body: Value = serde_json::from_slice(&req.body).map_err(|e| Error::BadRequest(format!("invalid JSON: {e}")))?;
     let image_name = body["Image"].as_str().unwrap_or_default();
@@ -3079,6 +3517,7 @@ fn create_inner(req: &Request, engine: &Engine, caller: &Caller, record_wsl_dist
         volumes_from: strings(&host["VolumesFrom"]).unwrap_or_default(),
         pid_mode,
         wsl_distro: record_wsl_distro,
+        non_host_creator: *caller != Caller::Host,
         mounts: mounts.guest,
         mount_info: mounts.info,
         mount_request: mount_request(&body, &image_cfg),
@@ -3305,7 +3744,7 @@ fn container_inspect(engine: &Engine, key: &str) -> Result<Value, Error> {
     let health = engine.health(&id);
     let anon_vols: Vec<String> = engine.volume_list().into_iter().filter(|v| v.anonymous).map(|v| v.name).collect();
     engine.with(&id, |c| {
-        let net = engine.lock_net();
+        let net = engine.read_net();
         let networks = net.all();
         let mut v = inspect(c, networks, &anon_vols);
         v["NetworkSettings"]["Networks"] = endpoints(c, networks);
@@ -3357,7 +3796,177 @@ fn spec_wsl_distro(spec: &super::engine::Spec) -> Option<String> {
     None
 }
 
+struct SlashName<'a>(&'a str);
+
+impl serde::Serialize for SlashName<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(&format_args!("/{}", self.0))
+    }
+}
+
+#[derive(serde::Serialize)]
+#[allow(non_snake_case)]
+struct PortSummary<'a> {
+    IP: &'a str,
+    PrivatePort: u16,
+    PublicPort: u16,
+    Type: &'a str,
+}
+
+#[derive(serde::Serialize)]
+#[allow(non_snake_case)]
+struct IpamConfigSummary<'a> {
+    #[serde(skip_serializing_if = "str::is_empty")]
+    IPv4Address: &'a str,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    IPv6Address: &'a str,
+}
+
+#[derive(serde::Serialize)]
+#[allow(non_snake_case)]
+struct EndpointSummary<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    IPAMConfig: Option<IpamConfigSummary<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    Links: Option<()>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    Aliases: Option<&'a [String]>,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    MacAddress: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    DriverOpts: Option<()>,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    NetworkID: &'a str,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    EndpointID: &'a str,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    Gateway: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    IPAddress: String,
+    #[serde(skip_serializing_if = "is_zero_u8")]
+    IPPrefixLen: u8,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    IPv6Gateway: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    GlobalIPv6Address: String,
+    #[serde(skip_serializing_if = "is_zero_u8")]
+    GlobalIPv6PrefixLen: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    DNSNames: Option<()>,
+}
+
+#[derive(serde::Serialize)]
+#[allow(non_snake_case)]
+struct HostConfigSummary<'a> {
+    NetworkMode: &'a str,
+}
+
+#[derive(serde::Serialize)]
+#[allow(non_snake_case)]
+struct NetworkSettingsSummary<'a> {
+    Networks: std::collections::BTreeMap<&'a str, EndpointSummary<'a>>,
+}
+
+#[derive(serde::Serialize)]
+#[allow(non_snake_case)]
+struct ContainerSummary<'a> {
+    Id: &'a str,
+    Names: [SlashName<'a>; 1],
+    Image: &'a str,
+    ImageID: &'a str,
+    Command: String,
+    Created: i64,
+    State: &'static str,
+    Status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    KiriStartedAt: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    KiriFinishedAt: Option<i64>,
+    #[serde(skip_serializing_if = "is_zero_i32")]
+    KiriExitCode: i32,
+    #[serde(skip_serializing_if = "is_false")]
+    KiriOOMKilled: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    KiriVmStopped: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    KiriStoppedByUser: bool,
+    Ports: Vec<PortSummary<'a>>,
+    Labels: &'a Value,
+    HostConfig: HostConfigSummary<'a>,
+    NetworkSettings: NetworkSettingsSummary<'a>,
+    #[serde(skip_serializing_if = "is_empty_values")]
+    Mounts: &'a [Value],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    KiriWslDistro: Option<String>,
+}
+
+fn endpoints_typed<'a>(c: &'a Container, networks: &'a [super::network::Network]) -> std::collections::BTreeMap<&'a str, EndpointSummary<'a>> {
+    let mut out = std::collections::BTreeMap::new();
+    if c.spec.network_mode.starts_with("container:") || c.spec.left_all_networks {
+        return out;
+    }
+    let running = c.status == Status::Running;
+    let mut add = |name: &'a str, ip: Option<[u8; 4]>, ip6: Option<[u8; 16]>, aliases: &'a [String], want4: &'a str, want6: &'a str| {
+        let net = networks.iter().find(|n| n.name == name || n.id == name);
+        let ip = ip.filter(|_| running && !net.is_some_and(|n| n.no_ipv4));
+        let ip6 = ip6.filter(|_| running);
+        let gateway = match (ip, net) {
+            (Some(_), Some(n)) if n.gateway != [0; 4] => super::network::ip_str(n.gateway),
+            _ => String::new(),
+        };
+        let v6 = net.and_then(|n| n.v6.as_ref()).filter(|_| ip6.is_some());
+        let ipam = (!want4.is_empty() || !want6.is_empty()).then_some(IpamConfigSummary {
+            IPv4Address: want4,
+            IPv6Address: want6,
+        });
+        out.insert(
+            name,
+            EndpointSummary {
+                IPAMConfig: ipam,
+                Links: None,
+                Aliases: (!aliases.is_empty()).then_some(aliases),
+                MacAddress: "",
+                DriverOpts: None,
+                NetworkID: net.map_or("", |n| n.id.as_str()),
+                EndpointID: if running { c.id.as_str() } else { "" },
+                Gateway: gateway,
+                IPAddress: ip.map(super::network::ip_str).unwrap_or_default(),
+                IPPrefixLen: if ip.is_some() { net.map_or(16, |n| n.prefix) } else { 0 },
+                IPv6Gateway: v6.map(|v| super::network::ip6_str(v.gateway)).unwrap_or_default(),
+                GlobalIPv6Address: ip6.map(super::network::ip6_str).unwrap_or_default(),
+                GlobalIPv6PrefixLen: v6.map_or(0, |v| v.prefix),
+                DNSNames: None,
+            },
+        );
+    };
+    add(&c.spec.network_mode, c.ip, c.ip6, &c.spec.aliases, &c.spec.ipv4_address, &c.spec.ipv6_address);
+    for x in &c.spec.extra_networks {
+        let ip6 = c.extra_ip6s.iter().find(|(n, _)| *n == x.name).map(|(_, ip)| *ip);
+        add(&x.name, c.extra_ips.iter().find(|(n, _)| *n == x.name).map(|(_, ip)| *ip), ip6, &x.aliases, &x.ipv4_address, &x.ipv6_address);
+    }
+    out
+}
+
+fn ports_list_typed(c: &Container) -> Vec<PortSummary<'_>> {
+    let Some(fw) = &c.forwards else { return Vec::new() };
+    fw.bound
+        .iter()
+        .map(|(b, ip, port)| PortSummary {
+            IP: ip.as_str(),
+            PrivatePort: b.container_port,
+            PublicPort: *port,
+            Type: b.proto.as_str(),
+        })
+        .collect()
+}
+
+#[cfg(test)]
 fn list(req: &Request, engine: &Engine) -> Result<Value, Error> {
+    let bytes = list_json_bytes(req, engine)?;
+    serde_json::from_slice(&bytes).map_err(|e| Error::Io(io::Error::other(e)))
+}
+
+fn list_json_bytes(req: &Request, engine: &Engine) -> Result<Vec<u8>, Error> {
     let f = filters(req, &["id", "name", "label", "label!", "status", "ancestor", "network", "exited", "volume", "health"])?;
     if let Some(bad) = f.values("health").and_then(|v| v.iter().find(|v| !super::health::valid_filter(v))) {
         return Err(Error::BadRequest(format!("Unrecognised filter value for health: {bad}")));
@@ -3379,65 +3988,71 @@ fn list(req: &Request, engine: &Engine) -> Result<Value, Error> {
         || limit.is_some()
         || f.values("status").is_some()
         || f.values("exited").is_some();
-    let mut rows = engine.each_with_networks(|c, networks| {
-        if !all && c.status != Status::Running {
-            return None;
-        }
-        let labels = if c.spec.labels.is_object() { c.spec.labels.clone() } else { json!({}) };
-        let first = (!c.spec.left_all_networks)
-            .then(|| networks.iter().find(|n| n.name == c.spec.network_mode || n.id == c.spec.network_mode || (c.spec.network_mode == "default" && n.name == "bridge")))
-            .flatten();
-        let keep = f.any("id", |v| c.id.starts_with(v))
-            && f.name(&c.name)
-            && f.labels(&labels)
-            && f.any("status", |v| v == state_word(c))
-            && f.any("exited", |v| c.status == Status::Exited && v.parse() == Ok(c.exit_code))
-            && ancestors.as_ref().is_none_or(|ids| ids.contains(&c.spec.image_id))
-            && f.any("network", |v| {
-                first.is_some_and(|n| n.name == v || n.id.starts_with(v))
-                    || c.spec.extra_networks.iter().any(|x| networks.iter().find(|n| n.name == x.name).is_some_and(|n| n.name == v || n.id.starts_with(v)))
+    let empty_obj = Value::Object(serde_json::Map::new());
+    let has_net_filter = f.values("network").is_some();
+    engine.with_containers_and_networks(|containers, networks| {
+        let mut matched: Vec<&Container> = containers
+            .iter()
+            .copied()
+            .filter(|c| {
+                if !all && c.status != Status::Running {
+                    return false;
+                }
+                let labels_ref = if c.spec.labels.is_object() { &c.spec.labels } else { &empty_obj };
+                f.any("id", |v| c.id.starts_with(v))
+                    && f.any("status", |v| v == state_word(c))
+                    && f.any("exited", |v| c.status == Status::Exited && v.parse() == Ok(c.exit_code))
+                    && f.labels(labels_ref)
+                    && f.name(&c.name)
+                    && ancestors.as_ref().is_none_or(|ids| ids.contains(&c.spec.image_id))
+                    && (!has_net_filter || {
+                        let first = (!c.spec.left_all_networks)
+                            .then(|| networks.iter().find(|n| n.name == c.spec.network_mode || n.id == c.spec.network_mode || (c.spec.network_mode == "default" && n.name == "bridge")))
+                            .flatten();
+                        f.any("network", |v| {
+                            first.is_some_and(|n| n.name == v || n.id.starts_with(v))
+                                || c.spec.extra_networks.iter().any(|x| networks.iter().find(|n| n.name == x.name).is_some_and(|n| n.name == v || n.id.starts_with(v)))
+                        })
+                    })
+                    && f.any("volume", |v| c.spec.volumes.iter().chain(&c.spec.anon_volumes).any(|n| n == v) || c.spec.mount_info.iter().any(|m| m["Destination"] == v || m["Source"] == v))
+                    && f.any("health", |v| v == health.get(&c.id).map_or("none", |h| h.status.as_str()))
             })
-            && f.any("volume", |v| c.spec.volumes.iter().chain(&c.spec.anon_volumes).any(|n| n == v) || c.spec.mount_info.iter().any(|m| m["Destination"] == v || m["Source"] == v))
-            && f.any("health", |v| v == health.get(&c.id).map_or("none", |h| h.status.as_str()));
-        if !keep {
-            return None;
+            .collect();
+        // Sort and truncate BEFORE building any JSON rows!
+        matched.sort_by(|a, b| b.created.cmp(&a.created).then_with(|| a.id.cmp(&b.id)));
+        if let Some(limit) = limit {
+            matched.truncate(limit);
         }
-        let mut row = json!({
-            "Id": c.id,
-            "Names": [format!("/{}", c.name)],
-            "Image": c.spec.image,
-            "ImageID": c.spec.image_id,
-            "Command": c.argv().join(" "),
-            "Created": time::unix(c.created),
-            "State": state_word(c),
-            "Status": ps_status(c, health.get(&c.id)),
-            // Kiri's own: the window counts "Up 3 s" from these every second.
-            // Docker clients ignore fields they don't know.
-            "KiriStartedAt": c.started.map(time::unix),
-            "KiriFinishedAt": c.finished.map(time::unix),
-            "KiriExitCode": c.exit_code,
-            "KiriOOMKilled": c.oom_killed,
-            "KiriVmStopped": c.vm_stopped,
-            "KiriStoppedByUser": c.stopped_by_user,
-            "Ports": ports_list(c),
-            "Labels": if c.spec.labels.is_object() { c.spec.labels.clone() } else { json!({}) },
-            "HostConfig": {"NetworkMode": c.spec.network_mode},
-            "NetworkSettings": {"Networks": endpoints(c, networks)},
-            "Mounts": c.spec.mount_info,
-        });
-        if let Some(distro) = spec_wsl_distro(&c.spec) {
-            row["KiriWslDistro"] = json!(distro);
-        }
-        Some((c.created, row))
-    });
-    rows.sort_by(|a, b| {
-        b.0.cmp(&a.0)
-            .then_with(|| a.1["Id"].as_str().cmp(&b.1["Id"].as_str()))
-    });
-    if let Some(limit) = limit {
-        rows.truncate(limit);
-    }
-    Ok(Value::Array(rows.into_iter().map(|(_, v)| v).collect()))
+        let rows: Vec<ContainerSummary<'_>> = matched
+            .into_iter()
+            .map(|c| {
+                let labels_ref = if c.spec.labels.is_object() { &c.spec.labels } else { &empty_obj };
+                ContainerSummary {
+                    Id: &c.id,
+                    Names: [SlashName(&c.name)],
+                    Image: &c.spec.image,
+                    ImageID: &c.spec.image_id,
+                    Command: c.argv().join(" "),
+                    Created: time::unix(c.created),
+                    State: state_word(c),
+                    Status: ps_status(c, health.get(&c.id)),
+                    KiriStartedAt: c.started.map(time::unix),
+                    KiriFinishedAt: c.finished.map(time::unix),
+                    KiriExitCode: c.exit_code,
+                    KiriOOMKilled: c.oom_killed,
+                    KiriVmStopped: c.vm_stopped,
+                    KiriStoppedByUser: c.stopped_by_user,
+                    Ports: ports_list_typed(c),
+                    Labels: labels_ref,
+                    HostConfig: HostConfigSummary { NetworkMode: &c.spec.network_mode },
+                    NetworkSettings: NetworkSettingsSummary { Networks: endpoints_typed(c, networks) },
+                    Mounts: &c.spec.mount_info,
+                    KiriWslDistro: spec_wsl_distro(&c.spec),
+                }
+            })
+            .collect();
+        serde_json::to_vec(&rows).map_err(|e| Error::Io(io::Error::other(e)))
+    })
 }
 
 fn inspect(c: &Container, nets: &[super::network::Network], anon_vols: &[String]) -> Value {
@@ -3624,23 +4239,48 @@ fn network_json(engine: &Engine, n: &super::network::Network, with_members: bool
         }
         Value::Array(configs)
     };
-    json!({
-        "Name": n.name,
-        "Id": n.id,
-        "Created": time::rfc3339(std::time::UNIX_EPOCH + Duration::from_nanos(n.created_ns)),
-        "Scope": "local",
-        "Driver": n.driver,
-        "EnableIPv4": !n.no_ipv4,
-        "EnableIPv6": n.v6.is_some(),
-        "IPAM": {"Driver": "default", "Options": if n.ipam_options.is_object() { n.ipam_options.clone() } else { Value::Null }, "Config": ipam},
-        "Internal": n.internal,
-        "Attachable": n.attachable,
-        "Ingress": false,
-        "ConfigOnly": false,
-        "Containers": containers,
-        "Options": super::network::shown_options(n),
-        "Labels": if n.labels.is_object() { n.labels.clone() } else { json!({}) },
-    })
+    let mut ipam_obj = serde_json::Map::with_capacity(3);
+    ipam_obj.insert("Driver".into(), "default".into());
+    if n.ipam_options.is_object() {
+        ipam_obj.insert("Options".into(), n.ipam_options.clone());
+    } else if with_members {
+        ipam_obj.insert("Options".into(), Value::Null);
+    }
+    ipam_obj.insert("Config".into(), ipam);
+    let mut obj = serde_json::Map::with_capacity(15);
+    obj.insert("Name".into(), n.name.clone().into());
+    obj.insert("Id".into(), n.id.clone().into());
+    obj.insert("Created".into(), time::rfc3339(std::time::UNIX_EPOCH + Duration::from_nanos(n.created_ns)).into());
+    obj.insert("Scope".into(), "local".into());
+    obj.insert("Driver".into(), n.driver.clone().into());
+    obj.insert("EnableIPv4".into(), (!n.no_ipv4).into());
+    if with_members || n.v6.is_some() {
+        obj.insert("EnableIPv6".into(), n.v6.is_some().into());
+    }
+    obj.insert("IPAM".into(), Value::Object(ipam_obj));
+    if with_members || n.internal {
+        obj.insert("Internal".into(), n.internal.into());
+    }
+    if with_members || n.attachable {
+        obj.insert("Attachable".into(), n.attachable.into());
+    }
+    if with_members {
+        obj.insert("Ingress".into(), false.into());
+        obj.insert("ConfigOnly".into(), false.into());
+        obj.insert("Containers".into(), Value::Object(containers));
+    } else if !containers.is_empty() {
+        obj.insert("Containers".into(), Value::Object(containers));
+    }
+    let opts = super::network::shown_options(n);
+    if with_members || opts.as_object().is_some_and(|m| !m.is_empty()) {
+        obj.insert("Options".into(), opts);
+    }
+    if n.labels.as_object().is_some_and(|m| !m.is_empty()) {
+        obj.insert("Labels".into(), n.labels.clone());
+    } else if with_members {
+        obj.insert("Labels".into(), json!({}));
+    }
+    Value::Object(obj)
 }
 
 fn network_matches(f: &Filters, engine: &Engine, n: &super::network::Network) -> bool {
@@ -3658,12 +4298,12 @@ const NETWORK_FILTERS: &[&str] = &["name", "id", "driver", "label", "label!", "s
 
 fn networks(req: &Request, engine: &Engine) -> Result<Value, Error> {
     let f = filters(req, NETWORK_FILTERS)?;
-    let list: Vec<super::network::Network> = engine.lock_net().all().to_vec();
+    let list: Vec<super::network::Network> = engine.read_net().all().to_vec();
     Ok(Value::Array(list.iter().filter(|n| network_matches(&f, engine, n)).map(|n| network_json(engine, n, false)).collect()))
 }
 
 fn network_inspect(engine: &Engine, key: &str) -> Result<Value, Error> {
-    let n = engine.lock_net().find(key).cloned().ok_or_else(|| Error::NotFound(format!("network {key} not found")))?;
+    let n = engine.read_net().find(key).cloned().ok_or_else(|| Error::NotFound(format!("network {key} not found")))?;
     Ok(network_json(engine, &n, true))
 }
 
@@ -3901,7 +4541,7 @@ fn exec_inspect(e: &super::engine::Exec) -> Value {
 }
 
 fn logs(req: &Request, engine: &Engine, id: &str, w: &mut UnixStream) -> io::Result<Next> {
-    use super::logfile::{Record, parse_tail, parse_time};
+    use super::logfile::{parse_tail, parse_time};
     let (want_out, want_err, stamps) = (req.flag("stdout"), req.flag("stderr"), req.flag("timestamps"));
     if !want_out && !want_err {
         error(w, Error::BadRequest("Bad parameters: you must choose at least one stream".into()))?;
@@ -3930,40 +4570,62 @@ fn logs(req: &Request, engine: &Engine, id: &str, w: &mut UnixStream) -> io::Res
     // Frames are gathered into chunks of up to 32 KiB: one write per line
     // would make a long log slow to read.
     let mut out = Vec::with_capacity(40 << 10);
-    let mut line = Vec::new();
-    let mut put = |r: &Record, out: &mut Vec<u8>| -> io::Result<()> {
-        let wanted = match r.stream {
+    let mut ts_cache = time::Rfc3339Cache::new();
+    // Coalesce consecutive lines of the same multiplexed stream into a single
+    // Docker mux frame within each 32 KiB HTTP chunk to cut per-line 8-byte headers.
+    let mut open_mux: Option<(u8, usize)> = None;
+    let finish_mux = |out: &mut Vec<u8>, open_mux: &mut Option<(u8, usize)>| {
+        if let Some((_, hdr_pos)) = open_mux.take() {
+            let payload_len = (out.len() - hdr_pos - 8) as u32;
+            out[hdr_pos + 4..hdr_pos + 8].copy_from_slice(&payload_len.to_be_bytes());
+        }
+    };
+    let mut put = |stream: Stream, time_ns: u64, data: &[u8], out: &mut Vec<u8>, open_mux: &mut Option<(u8, usize)>| {
+        let wanted = match stream {
             Stream::Stdout => want_out,
             Stream::Stderr => want_err,
         };
-        if !wanted || since.is_some_and(|s| r.time < s) {
-            return Ok(());
+        if !wanted || since.is_some_and(|s| time_ns < s) {
+            return;
         }
-        let data = if stamps {
-            line.clear();
-            line.extend_from_slice(time::rfc3339(std::time::UNIX_EPOCH + std::time::Duration::from_nanos(r.time)).as_bytes());
-            line.push(b' ');
-            line.extend_from_slice(&r.data);
-            &line[..]
+        if tty {
+            if stamps {
+                ts_cache.write_ns(out, time_ns);
+                out.push(b' ');
+            }
+            out.extend_from_slice(data);
         } else {
-            &r.data[..]
-        };
-        if tty { out.extend_from_slice(data) } else { http::mux_frame(out, r.stream as u8, data)? }
-        Ok(())
+            let s_byte = stream as u8;
+            if open_mux.is_none_or(|(prev, _)| prev != s_byte) {
+                finish_mux(out, open_mux);
+                let hdr_pos = out.len();
+                out.extend_from_slice(&[s_byte, 0, 0, 0, 0, 0, 0, 0]);
+                *open_mux = Some((s_byte, hdr_pos));
+            }
+            if stamps {
+                ts_cache.write_ns(out, time_ns);
+                out.push(b' ');
+            }
+            out.extend_from_slice(data);
+        }
     };
-    let past_until = |r: &Record| until.is_some_and(|u| r.time > u);
+    let past_until = |time_ns: u64| until.is_some_and(|u| time_ns > u);
     let mut ended = false;
-    for r in logs.past.tail(tail) {
-        if past_until(&r) {
+    let mut past = logs.past.tail(tail);
+    let mut rec_buf = Vec::with_capacity(256);
+    while let Some((stream, time_ns)) = past.next_into(&mut rec_buf) {
+        if past_until(time_ns) {
             ended = true;
             break;
         }
-        put(&r, &mut out)?;
+        put(stream, time_ns, &rec_buf, &mut out, &mut open_mux);
         if out.len() >= 32 << 10 {
+            finish_mux(&mut out, &mut open_mux);
             http::chunk(w, &out)?;
             out.clear();
         }
     }
+    finish_mux(&mut out, &mut open_mux);
     http::chunk(w, &out)?;
     out.clear();
     if let (Some(rx), false) = (logs.live, ended) {
@@ -3971,13 +4633,15 @@ fn logs(req: &Request, engine: &Engine, id: &str, w: &mut UnixStream) -> io::Res
             let mut next = Some(r);
             // Whatever else is already waiting goes in the same chunk.
             while let Some(r) = next {
-                if past_until(&r) {
+                if past_until(r.time) {
+                    finish_mux(&mut out, &mut open_mux);
                     http::chunk(w, &out)?;
                     break 'live;
                 }
-                put(&r, &mut out)?;
+                put(r.stream, r.time, &r.data, &mut out, &mut open_mux);
                 next = if out.len() < 32 << 10 { rx.try_recv().ok() } else { None };
             }
+            finish_mux(&mut out, &mut open_mux);
             http::chunk(w, &out)?;
             out.clear();
         }
@@ -5227,9 +5891,9 @@ mod tests {
             "/run/host-services/docker.sock\t/var/run/docker.sock\t".to_owned(),
         ];
         let sock = |s: &str| (s == "/Users/alice/.kiri/run/docker.sock").then(|| "/run/host-services/docker.sock".to_owned());
-        assert_eq!(super::fresh_bind_sources_with(&restarted, &gpg_info, sock, true), restarted);
+        assert_eq!(super::fresh_bind_sources_with(&restarted, &gpg_info, sock, true, false, |_| false, |_| false).unwrap(), restarted);
         assert_eq!(
-            super::fresh_bind_sources_with(&legacy, &gpg_info, sock, true),
+            super::fresh_bind_sources_with(&legacy, &gpg_info, sock, true, false, |_| false, |_| false).unwrap(),
             [
                 "/run/host-services/ssh-auth.sock\t/ssh-agent\tro",
                 "/run/host-services/docker.sock\t/var/run/docker.sock\t",
@@ -5749,9 +6413,22 @@ mod tests {
             assert!(routes.iter().any(|(m, p)| (m.as_str(), p.as_str()) == known), "{known:?} not found in route(): {routes:?}");
         }
         for (m, p) in &routes {
-            let open = matches!(m.as_str(), "GET" | "HEAD") || CONTAINER_MAY.contains(&(m.as_str(), p.as_str()));
+            let open = (matches!(m.as_str(), "GET" | "HEAD") && !HOST_ONLY_KIRI_READS.contains(&p.as_str()))
+                || CONTAINER_MAY.contains(&(m.as_str(), p.as_str()));
             assert_eq!(container_may(m, p), open, "{m} {p}");
         }
+        assert!(!container_may("GET", "/kiri/proxy"));
+        assert!(!caller_may(&Caller::Wsl("Ubuntu".into()), "GET", "/kiri/proxy"));
+        assert!(caller_may(&Caller::Host, "GET", "/kiri/proxy"));
+        assert!(!caller_may(&Caller::Wsl("Ubuntu".into()), "PUT", "/kiri/proxy/system"));
+        assert!(!caller_may(&Caller::Wsl("Ubuntu".into()), "POST", "/kiri/proxy"));
+        assert!(!caller_may(&Caller::Wsl("Ubuntu".into()), "POST", "/kiri/registries"));
+        assert!(!caller_may(&Caller::Wsl("Ubuntu".into()), "POST", "/kiri/storage"));
+        assert!(!caller_may(&Caller::Wsl("Ubuntu".into()), "DELETE", "/kiri/storage/old"));
+        assert!(!caller_may(&Caller::Wsl("Ubuntu".into()), "POST", "/kiri/win-ports"));
+        assert!(!caller_may(&Caller::Wsl("Ubuntu".into()), "POST", "/kiri/fs-events"));
+        assert!(!caller_may(&Caller::Wsl("Ubuntu".into()), "POST", "/kiri/builder"));
+        assert!(caller_may(&Caller::Wsl("Ubuntu".into()), "POST", "/kiri/wake"));
         assert!(!container_may("PATCH", "/kiri/anything/new"));
         assert!(!container_may("POST", "/kiri"));
         assert!(container_may("POST", "/containers/create") && container_may("GET", "/kiri/registries") && container_may("HEAD", "/kiri/registries"));
@@ -6476,18 +7153,18 @@ mod tests {
         let info = vec![json!({"Type": "bind", "Source": "/var/run/docker.sock"}), json!({"Type": "bind", "Source": "/srv/app"}), json!({"Type": "tmpfs", "Source": ""})];
         let sock = |s: &str| matches!(s, "/var/run/docker.sock" | "/run/kiri/docker.sock").then(|| "/run/kiri/docker.container.sock".to_owned());
         let given = ["/run/kiri/docker.container.sock\t/var/run/docker.sock\t", "/srv/app\t/x\tro", "tmpfs\t/t\ttmpfs"];
-        assert_eq!(fresh_bind_sources_with(&guest, &info, sock, false), given);
+        assert_eq!(fresh_bind_sources_with(&guest, &info, sock, false, false, |_| false, |_| false).unwrap(), given);
         // The path the person gave no longer leads to the socket (a link
         // removed or re-pointed): the path mounted when it was made does.
         let moved = vec![json!({"Type": "bind", "Source": "/home/me/sock-link"}), info[1].clone(), info[2].clone()];
-        assert_eq!(fresh_bind_sources_with(&guest, &moved, sock, false), given);
+        assert_eq!(fresh_bind_sources_with(&guest, &moved, sock, false, false, |_| false, |_| false).unwrap(), given);
         // Records that don't pair one to one with the mount lines: each
         // line is still looked at by the path it mounts.
-        assert_eq!(fresh_bind_sources_with(&guest, &info[1..], sock, false), given);
-        assert_eq!(fresh_bind_sources_with(&guest, &[], sock, false), given);
+        assert_eq!(fresh_bind_sources_with(&guest, &info[1..], sock, false, false, |_| false, |_| false).unwrap(), given);
+        assert_eq!(fresh_bind_sources_with(&guest, &[], sock, false, false, |_| false, |_| false).unwrap(), given);
         // A Mac follows binds from the records only, so it leaves unpaired
         // lines as they are.
-        assert_eq!(fresh_bind_sources_with(&guest, &info[1..], sock, true), guest);
+        assert_eq!(fresh_bind_sources_with(&guest, &info[1..], sock, true, false, |_| false, |_| false).unwrap(), guest);
     }
 
     /// A linked bind source is followed again at each start: re-pointing the
@@ -6509,12 +7186,63 @@ mod tests {
         let guest = vec![made, "tmpfs\t/t\tnoexec".to_owned()];
         let info = vec![json!({"Type": "bind", "Source": src}), json!({"Type": "tmpfs", "Source": ""})];
         // Unchanged link: the same lines.
-        assert_eq!(fresh_bind_sources(&guest, &info), guest);
+        assert_eq!(fresh_bind_sources(&guest, &info, false).unwrap(), guest);
         // Re-pointed: the new target; other mounts as they were.
         std::fs::remove_file(&link).unwrap();
         std::os::unix::fs::symlink("r2", &link).unwrap();
-        assert_eq!(fresh_bind_sources(&guest, &info), [at("r2"), guest[1].clone()]);
+        assert_eq!(fresh_bind_sources(&guest, &info, false).unwrap(), [at("r2"), guest[1].clone()]);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Re-pointing a macOS bind symlink between container create and start
+    /// must re-enforce `is_mac_hostetc` (forcing `ro`) and reject
+    /// `is_host_socket_ancestor` for non-Host callers.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn bind_links_recheck_hostetc_ro_and_socket_ancestor_at_start() {
+        let dir = std::env::temp_dir().join(format!("kiri-fresh-binds-sec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let safe = dir.join("safe");
+        let fake_etc = dir.join("state/etc");
+        let fake_sock_dir = dir.join("state/run");
+        for d in [&safe, &fake_etc, &fake_sock_dir] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let fake_sock = fake_sock_dir.join("docker.sock").to_string_lossy().into_owned();
+        let link = dir.join("current");
+        std::os::unix::fs::symlink(&safe, &link).unwrap();
+        let src = link.to_str().unwrap().to_owned();
+        let guest = vec![format!("{}\t/app\t", guest_bind_source(&src))];
+        let guest_with_flag = vec![format!("{}\t/app\tcreate", guest_bind_source(&src))];
+        let info = vec![json!({"Type": "bind", "Source": src})];
+        let hostetc = |p: &str| is_mac_hostetc_with(p, Some(&fake_etc));
+        let sock_anc = |p: &str| is_host_socket_ancestor_against(p, std::slice::from_ref(&fake_sock));
+
+        // 1. Re-point symlink to synthetic hostetc dir: start must force `ro`.
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&fake_etc, &link).unwrap();
+        let etc_real = std::fs::canonicalize(&fake_etc).unwrap();
+        assert_eq!(
+            fresh_bind_sources_with(&guest, &info, |_| None, true, false, hostetc, sock_anc).unwrap(),
+            [format!("/mnt/mac{}\t/app\tro", etc_real.display())]
+        );
+        assert_eq!(
+            fresh_bind_sources_with(&guest_with_flag, &info, |_| None, true, false, hostetc, sock_anc).unwrap(),
+            [format!("/mnt/mac{}\t/app\tcreate,ro", etc_real.display())]
+        );
+
+        // 2. Re-point symlink to host socket ancestor dir: non-Host caller is rejected, Host still works.
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&fake_sock_dir, &link).unwrap();
+        let err = fresh_bind_sources_with(&guest, &info, |_| None, true, true, hostetc, sock_anc).unwrap_err();
+        assert!(matches!(err, Error::BadRequest(ref m) if m.contains("host socket")), "unexpected error: {err:?}");
+        let sock_real = std::fs::canonicalize(&fake_sock_dir).unwrap();
+        assert_eq!(
+            fresh_bind_sources_with(&guest, &info, |_| None, true, false, hostetc, sock_anc).unwrap(),
+            [format!("/mnt/mac{}\t/app\t", sock_real.display())]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -7646,28 +8374,133 @@ mod network_option_tests {
         assert!(!super::guest_share_path("/Users/me", "/mnt/mac"));
         assert!(!super::guest_share_path("/mnt/mac", ""), "a Linux host has no share");
         // Other spellings of the same path name the share too.
-        for p in ["/mnt//mac", "/mnt/./mac", "/mnt/x/../mac/Users", "//mnt/mac/", "/mnt/mac/."] {
+        for p in ["/mnt//mac", "/mnt/./mac", "/mnt/x/../mac/Users", "//mnt/mac/", "/mnt/mac/.", "/mnt", "/", "/Users/..", "/Users/../.."] {
             assert!(super::guest_share_path(p, "/mnt/mac"), "{p}");
         }
         assert!(!super::guest_share_path("/mnt/mac/../macintosh", "/mnt/mac"));
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(super::mac_source("/Users/.."), None);
+            assert_eq!(super::mac_source("/Users/../.."), None);
+            assert_eq!(super::mac_source("/Users/me/../../.."), None);
+            assert!(super::is_mac_hostetc("/etc"));
+            assert!(super::is_mac_hostetc("/etc/passwd"));
+            assert!(!super::is_mac_hostetc("/etc/hosts"));
+        }
     }
 
     /// A volume's device is mounted by the guest as root, so it must not
-    /// reach the share either.
+    /// reach the share, arbitrary kernel filesystems, or other WSL distros.
     #[test]
     fn a_volume_cannot_mount_the_share() {
         let opts = |kv: &[(&str, &str)]| kv.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect::<std::collections::BTreeMap<_, _>>();
         assert!(super::check_volume_device(&opts(&[("type", "virtiofs"), ("device", "kiri-mac")])).is_err());
         assert!(super::check_volume_device(&opts(&[("type", "VirtioFS"), ("device", "rosetta")])).is_err());
+        assert!(super::check_volume_device(&opts(&[("type", "overlay"), ("device", "overlay"), ("o", "lowerdir=/mnt/mac:/tmp")])).is_err());
+        assert!(super::check_volume_device(&opts(&[("type", "ext4"), ("device", "/dev/vda")])).is_err());
+        assert!(super::check_volume_device(&opts(&[("type", "proc"), ("device", "proc")])).is_err());
         if cfg!(target_os = "macos") {
             assert!(super::check_volume_device(&opts(&[("type", "none"), ("o", "bind"), ("device", "/mnt/mac")])).is_err());
             assert!(super::check_volume_device(&opts(&[("type", "none"), ("o", "bind"), ("device", "/mnt//mac/Users")])).is_err());
+            assert!(super::check_volume_device(&opts(&[("type", "none"), ("o", "bind"), ("device", "/Users/..")])).is_err());
+            assert!(super::check_volume_device(&opts(&[("type", "none"), ("o", "rbind"), ("device", "/mnt")])).is_err());
+            assert!(super::check_volume_device(&opts(&[("type", "none"), ("o", "rbind"), ("device", "/")])).is_err());
         }
+        // Integrated WSL distro bind volumes are confined to that distro.
+        let wsl = super::super::binds::Wsl { root: "/mnt/".into(), distro: Some("kiri".into()) };
+        assert!(super::check_volume_device_for(
+            &opts(&[("type", "none"), ("o", "bind"), ("device", "/mnt/wsl/kiri/roots/Debian/etc")]),
+            &Caller::Wsl("Ubuntu".into()),
+            Some(&wsl),
+        ).is_err());
+        assert!(super::check_volume_device_for(
+            &opts(&[("type", "none"), ("o", "bind"), ("device", r"\\wsl$\Debian\etc")]),
+            &Caller::Wsl("Ubuntu".into()),
+            Some(&wsl),
+        ).is_err());
         // Ordinary volumes are untouched.
         assert!(super::check_volume_device(&opts(&[("type", "none"), ("o", "bind"), ("device", "/Users/me/data")])).is_ok());
         assert!(super::check_volume_device(&opts(&[("type", "nfs"), ("o", "addr=10.0.0.1"), ("device", ":/export")])).is_ok());
         assert!(super::check_volume_device(&opts(&[("type", "tmpfs"), ("device", "tmpfs")])).is_ok());
         assert!(super::check_volume_device(&opts(&[])).is_ok());
+
+        // Host socket ancestor guard catches direct parent, ancestors, and symlinked parents.
+        let tmp = std::env::temp_dir().join(format!("kiri-sock-anc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let real_sock_dir = tmp.join("real_run/kiri");
+        std::fs::create_dir_all(&real_sock_dir).unwrap();
+        let sym_sock_dir = tmp.join("var_run_kiri");
+        std::os::unix::fs::symlink(&real_sock_dir, &sym_sock_dir).unwrap();
+        let sibling_dir = tmp.join("other");
+        std::fs::create_dir_all(&sibling_dir).unwrap();
+        let cands = vec![real_sock_dir.join("docker.sock").to_string_lossy().into_owned()];
+        assert!(super::is_host_socket_ancestor_against(&real_sock_dir.to_string_lossy(), &cands));
+        assert!(super::is_host_socket_ancestor_against(&tmp.join("real_run").to_string_lossy(), &cands));
+        assert!(super::is_host_socket_ancestor_against(&sym_sock_dir.to_string_lossy(), &cands));
+        assert!(super::is_host_socket_ancestor_against(
+            &format!("{}/nonexistent/..", sym_sock_dir.display()),
+            &cands,
+        ));
+        assert!(!super::is_host_socket_ancestor_against(&sibling_dir.to_string_lossy(), &cands));
+
+        // Regular binds from Caller::Container cannot bind the host socket parent directory or a symlink to it.
+        let engine = super::super::engine::boot_without_vm(&tmp.join("store"));
+        let img = kiri_image::Image {
+            mirror: None,
+            name: "demo:local".into(),
+            digest: "sha256:test".into(),
+            index_digest: None,
+            config_digest: "sha256:test".into(),
+            layers: Vec::new(),
+            size: 0,
+            platform: "linux/arm64".into(),
+            created: String::new(),
+            pulled_at: 0,
+            config: Default::default(),
+        };
+        if let Ok(sock) = super::super::socket_path()
+            && let Some(parent) = sock.parent()
+        {
+            let body = json!({"HostConfig": {"Binds": [format!("{}:/host-sock", parent.display())]}});
+            assert!(super::mounts_for(&body, &engine, &img, &Caller::Container).is_err());
+            if parent.exists() {
+                let sym_to_parent = tmp.join("sym-sock-parent");
+                std::os::unix::fs::symlink(parent, &sym_to_parent).unwrap();
+                let sym_body = json!({"HostConfig": {"Binds": [format!("{}:/host-sock", sym_to_parent.display())]}});
+                assert!(super::mounts_for(&sym_body, &engine, &img, &Caller::Container).is_err());
+            }
+        }
+
+        // On macOS, a local bind volume targeting `/etc` or `/etc/passwd` must be forced read-only
+        // on both the container mount (`ro`, `RW: false`) and the volume mount flags (`MS_RDONLY`).
+        #[cfg(target_os = "macos")]
+        {
+            let vol_opts = opts(&[("type", "none"), ("o", "bind,rw"), ("device", "/etc")]);
+            engine.volume_ensure_with("etc-bind", json!({}), vol_opts).unwrap();
+            let body = json!({"HostConfig": {"Binds": ["etc-bind:/mnt/etc"]}});
+            let mounts = super::mounts_for(&body, &engine, &img, &Caller::Host).unwrap();
+            assert_eq!(mounts.info.len(), 1);
+            assert_eq!(mounts.info[0]["RW"], json!(false));
+            let parts: Vec<&str> = mounts.guest[0].split('\t').collect();
+            assert!(parts[2].split(',').any(|f| f == "ro"), "container mount must carry ro: {}", mounts.guest[0]);
+            let vol_flags = u64::from_str_radix(parts[5], 16).unwrap();
+            assert_ne!(vol_flags & 1, 0, "volume mount flags must set MS_RDONLY: {}", mounts.guest[0]);
+            let fake_etc = tmp.join("state/etc");
+            std::fs::create_dir_all(&fake_etc).unwrap();
+            let etc_link = tmp.join("evil-etc-link");
+            std::os::unix::fs::symlink(&fake_etc, &etc_link).unwrap();
+            assert!(super::is_mac_hostetc_with(&etc_link.to_string_lossy(), Some(&fake_etc)));
+            assert!(super::is_mac_hostetc_with(&format!("{}/nonexistent/..", etc_link.display()), Some(&fake_etc)));
+            // Also catches dangling symlinks pointing at a not-yet-created `state/etc`.
+            let missing_etc = tmp.join("missing-state/etc");
+            let dangling_link = tmp.join("dangling-etc-link");
+            std::os::unix::fs::symlink(&missing_etc, &dangling_link).unwrap();
+            assert!(super::is_mac_hostetc_with(&dangling_link.to_string_lossy(), Some(&missing_etc)));
+            assert!(super::is_mac_hostetc_with(&format!("{}/nonexistent/..", dangling_link.display()), Some(&missing_etc)));
+        }
+
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -7690,16 +8523,19 @@ mod network_option_tests {
         let guest = vec!["/run/host-services/ssh-auth.sock\t/run/host-services/ssh-auth.sock\tro".to_owned()];
         let info = vec![serde_json::json!({"Type": "bind", "Source": "/run/host-services/ssh-auth.sock"})];
         assert_eq!(
-            super::fresh_bind_sources_with(&guest, &info, |_| None, false),
+            super::fresh_bind_sources_with(&guest, &info, |_| None, false, false, |_| false, |_| false).unwrap(),
             ["/run/kiri/host-services/ssh-auth.sock\t/run/host-services/ssh-auth.sock\tro"]
         );
-        assert_eq!(super::fresh_bind_sources_with(&guest, &[], |_| None, false), ["/run/kiri/host-services/ssh-auth.sock\t/run/host-services/ssh-auth.sock\tro"]);
+        assert_eq!(
+            super::fresh_bind_sources_with(&guest, &[], |_| None, false, false, |_| false, |_| false).unwrap(),
+            ["/run/kiri/host-services/ssh-auth.sock\t/run/host-services/ssh-auth.sock\tro"]
+        );
         let slash_guest = vec!["/run/host-services//ssh-auth.sock\t/run/host-services/ssh-auth.sock\tro".to_owned()];
         assert_eq!(
-            super::fresh_bind_sources_with(&slash_guest, &[], |_| None, false),
+            super::fresh_bind_sources_with(&slash_guest, &[], |_| None, false, false, |_| false, |_| false).unwrap(),
             ["/run/kiri/host-services/ssh-auth.sock\t/run/host-services/ssh-auth.sock\tro"]
         );
-        assert_eq!(super::fresh_bind_sources_with(&guest, &info, |_| None, true), guest);
+        assert_eq!(super::fresh_bind_sources_with(&guest, &info, |_| None, true, false, |_| false, |_| false).unwrap(), guest);
     }
 
     /// `--add-host name:ip` and `--hostname` are written into the container's

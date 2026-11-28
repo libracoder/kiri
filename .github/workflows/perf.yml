@@ -6,7 +6,10 @@
 # system calls one container costs.
 #
 # The limits come from main's copy of the script when it has one, so a pull
-# request can't loosen them for itself.
+# request can't accidentally loosen them for itself. (Because the PR binary
+# runs in a `--privileged` container on the same runner as `base`, this guards
+# against accidental threshold edits rather than adversarial tampering; the
+# job itself has only a read-only token and no secrets.)
 #
 # Safe for pull requests from forks: it runs on GitHub's machines with a
 # read-only token and no secrets, and uses pull_request (never

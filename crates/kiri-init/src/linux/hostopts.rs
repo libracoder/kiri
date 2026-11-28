@@ -101,7 +101,19 @@ pub fn parse(list: StrList<'_>) -> io::Result<HostOpts> {
                 let first = path.split('/').next().unwrap_or("");
                 let allowed = match ns {
                     Ns::Net => first == "net",
-                    Ns::Ipc => (first == "kernel" && path.split('/').count() == 2) || path.starts_with("fs/mqueue/"),
+                    Ns::Ipc => {
+                        matches!(
+                            *path,
+                            "kernel/msgmax"
+                                | "kernel/msgmnb"
+                                | "kernel/msgmni"
+                                | "kernel/sem"
+                                | "kernel/shmall"
+                                | "kernel/shmmax"
+                                | "kernel/shmmni"
+                                | "kernel/shm_rmid_forced"
+                        ) || path.starts_with("fs/mqueue/")
+                    }
                     Ns::Uts => *path == "kernel/domainname",
                 };
                 if !allowed || path.split('/').any(|c| c.is_empty() || c == "." || c == "..") {
@@ -111,9 +123,12 @@ pub fn parse(list: StrList<'_>) -> io::Result<HostOpts> {
             }
             ["device", host, container, perms] => {
                 for p in [host, container] {
-                    if !p.starts_with('/') || p.split('/').any(|c| c == "..") {
+                    if !p.starts_with('/') || p.contains(['\r', '\0']) || p.split('/').any(|c| c == "..") {
                         return Err(bad(line));
                     }
+                }
+                if !is_dev_path(host) {
+                    return Err(bad(line));
                 }
                 devices::access_bits(perms).ok_or_else(|| bad(line))?;
                 o.devices.push(Device { host: (*host).to_owned(), container: (*container).to_owned(), perms: (*perms).to_owned() });
@@ -147,6 +162,16 @@ pub fn parse(list: StrList<'_>) -> io::Result<HostOpts> {
     Ok(o)
 }
 
+/// Maximum recursion depth for `--device <dir>` walks (prevents stack exhaustion).
+const MAX_DEVICE_DEPTH: usize = 16;
+/// Maximum number of device nodes gathered from one `--device` entry.
+const MAX_DEVICE_NODES: usize = 1024;
+
+/// Whether a host device path stays under `/dev`.
+fn is_dev_path(path: &str) -> bool {
+    path == "/dev" || path.starts_with("/dev/")
+}
+
 /// Docker's error for a device it cannot add.
 fn gather_error(path: &str, e: impl std::fmt::Display) -> io::Error {
     io::Error::other(format!("error gathering device information while adding custom device {path:?}: {e}"))
@@ -158,11 +183,18 @@ pub fn resolve_devices(opts: &HostOpts) -> io::Result<(Vec<Node>, Vec<Rule>)> {
     let mut nodes = Vec::new();
     let mut rules = opts.rules.clone();
     for d in &opts.devices {
+        if !is_dev_path(&d.host) {
+            return Err(gather_error(&d.host, "device path must be under /dev"));
+        }
         let access = devices::access_bits(&d.perms).unwrap_or(devices::MKNOD | devices::READ | devices::WRITE);
-        let meta = fs::metadata(&d.host).map_err(|e| gather_error(&d.host, errno_text(&e)))?;
+        let real = fs::canonicalize(&d.host).map_err(|e| gather_error(&d.host, errno_text(&e)))?;
+        if !real.starts_with("/dev") {
+            return Err(gather_error(&d.host, "resolved device path escapes /dev"));
+        }
+        let meta = fs::symlink_metadata(&real).map_err(|e| gather_error(&d.host, errno_text(&e)))?;
         let mut found = Vec::new();
         if meta.is_dir() {
-            walk(Path::new(&d.host), Path::new(&d.container), &mut found)?;
+            walk(&real, Path::new(&d.container), 0, &mut found)?;
         } else if meta.file_type().is_char_device() || meta.file_type().is_block_device() {
             found.push((d.container.clone(), meta));
         } else {
@@ -180,13 +212,23 @@ pub fn resolve_devices(opts: &HostOpts) -> io::Result<(Vec<Node>, Vec<Rule>)> {
 }
 
 /// Device nodes under `host`, each with its path under `container`.
-fn walk(host: &Path, container: &Path, out: &mut Vec<(String, fs::Metadata)>) -> io::Result<()> {
+/// Never follows symlinks and enforces bounded depth and node count (`FS-10`).
+fn walk(host: &Path, container: &Path, depth: usize, out: &mut Vec<(String, fs::Metadata)>) -> io::Result<()> {
+    if depth >= MAX_DEVICE_DEPTH {
+        return Err(gather_error(&host.to_string_lossy(), "device directory exceeds maximum depth"));
+    }
     for e in fs::read_dir(host).map_err(|e| gather_error(&host.to_string_lossy(), errno_text(&e)))?.flatten() {
-        let Ok(m) = fs::metadata(e.path()) else { continue };
+        let Ok(m) = fs::symlink_metadata(e.path()) else { continue };
+        if m.file_type().is_symlink() {
+            continue;
+        }
         let target = container.join(e.file_name());
         if m.is_dir() {
-            walk(&e.path(), &target, out)?;
+            walk(&e.path(), &target, depth + 1, out)?;
         } else if m.file_type().is_char_device() || m.file_type().is_block_device() {
+            if out.len() >= MAX_DEVICE_NODES {
+                return Err(gather_error(&host.to_string_lossy(), "too many device nodes"));
+            }
             out.push((target.to_string_lossy().into_owned(), m));
         }
     }
@@ -518,5 +560,62 @@ mod tests {
         let s = Sysctl { ns: Ns::Net, path: "net/ipv4/ip_unprivileged_port_start".into(), value: "77".into() };
         let e = apply_sysctls(me, None, &[s]).unwrap_err();
         assert_eq!(e.to_string(), "sysctl \"net.ipv4.ip_unprivileged_port_start\" not allowed in host net namespace");
+    }
+
+    #[test]
+    fn ipc_sysctls_allow_only_ipc_namespaced_keys() {
+        for ok in [
+            "sysctl\tipc\tkernel/msgmax\t8192",
+            "sysctl\tipc\tkernel/msgmnb\t16384",
+            "sysctl\tipc\tkernel/msgmni\t32000",
+            "sysctl\tipc\tkernel/sem\t250 32000 32 128",
+            "sysctl\tipc\tkernel/shmall\t4294967296",
+            "sysctl\tipc\tkernel/shmmax\t68719476736",
+            "sysctl\tipc\tkernel/shmmni\t4096",
+            "sysctl\tipc\tkernel/shm_rmid_forced\t1",
+            "sysctl\tipc\tfs/mqueue/msg_max\t10",
+        ] {
+            let buf = list(&[ok]);
+            let kiri_proto::Msg::Retain(l) = kiri_proto::decode(&buf).unwrap() else { panic!() };
+            assert!(parse(l).is_ok(), "{ok}");
+        }
+        for bad in [
+            "sysctl\tipc\tkernel/core_pattern\t|/bin/sh",
+            "sysctl\tipc\tkernel/modprobe\t/tmp/x",
+            "sysctl\tipc\tkernel/poweroff_cmd\t/tmp/x",
+            "sysctl\tipc\tkernel/sysrq\t1",
+            "sysctl\tipc\tkernel/hostname\tx",
+        ] {
+            let buf = list(&[bad]);
+            let kiri_proto::Msg::Retain(l) = kiri_proto::decode(&buf).unwrap() else { panic!() };
+            assert!(parse(l).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn device_walk_ignores_symlinks_enforces_depth_and_dev_containment() {
+        for bad in ["device\t/tmp/fake\t/dev/fake\trwm", "device\t/etc/passwd\t/dev/x\trwm", "device\t/dev2/null\t/dev/null\trwm", "device\t/dev/null\r\t/dev/null\trwm"] {
+            let buf = list(&[bad]);
+            let kiri_proto::Msg::Retain(l) = kiri_proto::decode(&buf).unwrap() else { panic!() };
+            assert!(parse(l).is_err(), "{bad:?}");
+        }
+        let dir = std::env::temp_dir().join(format!("kiri-hostopts-devwalk-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // Self-loop symlink and symlink to /dev must be skipped without recursing or escaping.
+        std::os::unix::fs::symlink(".", dir.join("loop")).unwrap();
+        std::os::unix::fs::symlink("/dev", dir.join("escape")).unwrap();
+        let mut out = Vec::new();
+        walk(&dir, Path::new("/dev/test"), 0, &mut out).unwrap();
+        assert!(out.is_empty(), "symlinks must not be followed: {out:?}");
+
+        // Excessive directory nesting fails cleanly at MAX_DEVICE_DEPTH.
+        let mut deep = dir.join("deep");
+        for i in 0..=MAX_DEVICE_DEPTH {
+            deep.push(format!("d{i}"));
+        }
+        fs::create_dir_all(&deep).unwrap();
+        assert!(walk(&dir.join("deep"), Path::new("/dev/deep"), 0, &mut out).is_err());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

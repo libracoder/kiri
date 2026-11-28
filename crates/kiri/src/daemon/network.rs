@@ -493,6 +493,47 @@ fn parse_cidr6(s: &str, what: &str) -> Result<([u8; 16], u8), String> {
     Ok((ip, bits))
 }
 
+/// Whether two IPv4 CIDRs overlap.
+fn cidrs_overlap(a: [u8; 4], a_prefix: u8, b: [u8; 4], b_prefix: u8) -> bool {
+    let min_prefix = a_prefix.min(b_prefix);
+    let mask = if min_prefix == 0 { 0 } else { u32::MAX << (32 - min_prefix as u32) };
+    (u32::from_be_bytes(a) & mask) == (u32::from_be_bytes(b) & mask)
+}
+
+/// Whether an IPv4 subnet overlaps a reserved range (unspecified, loopback,
+/// link-local/IMDS, multicast, reserved/Class-E, or Kiri's host-gateway IPs).
+fn reserved_v4_subnet(net: [u8; 4], prefix: u8) -> Option<&'static str> {
+    const RESERVED: &[([u8; 4], u8, &str)] = &[
+        ([0, 0, 0, 0], 8, "0.0.0.0/8 (unspecified)"),
+        ([127, 0, 0, 0], 8, "127.0.0.0/8 (loopback)"),
+        ([169, 254, 0, 0], 16, "169.254.0.0/16 (link-local)"),
+        ([224, 0, 0, 0], 4, "224.0.0.0/4 (multicast)"),
+        ([240, 0, 0, 0], 4, "240.0.0.0/4 (reserved)"),
+        ([198, 19, 248, 254], 32, "198.19.248.254 (Kiri host gateway)"),
+        ([192, 168, 65, 254], 32, "192.168.65.254 (WSL host gateway)"),
+    ];
+    RESERVED.iter().find_map(|&(rnet, rprefix, label)| cidrs_overlap(net, prefix, rnet, rprefix).then_some(label))
+}
+
+/// Whether two IPv6 CIDRs overlap.
+fn cidrs6_overlap(a: [u8; 16], a_prefix: u8, b: [u8; 16], b_prefix: u8) -> bool {
+    let min_prefix = a_prefix.min(b_prefix);
+    let m = mask6(min_prefix);
+    (u128::from_be_bytes(a) & m) == (u128::from_be_bytes(b) & m)
+}
+
+/// Whether an IPv6 subnet overlaps a reserved range (`::/128`, `::1/128`,
+/// `fe80::/10` link-local, or `ff00::/8` multicast).
+fn reserved_v6_subnet(net: [u8; 16], prefix: u8) -> Option<&'static str> {
+    const RESERVED: &[([u8; 16], u8, &str)] = &[
+        ([0; 16], 128, "::/128 (unspecified)"),
+        ([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1], 128, "::1/128 (loopback)"),
+        ([0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 10, "fe80::/10 (link-local)"),
+        ([0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 8, "ff00::/8 (multicast)"),
+    ];
+    RESERVED.iter().find_map(|&(rnet, rprefix, label)| cidrs6_overlap(net, prefix, rnet, rprefix).then_some(label))
+}
+
 /// One IPv6 `IPAM.Config` entry.
 fn parse_ipam6(c: &serde_json::Value, subnet: &str) -> Result<Ipam6, String> {
     let field = |k: &str| c[k].as_str().unwrap_or("").to_owned();
@@ -500,6 +541,9 @@ fn parse_ipam6(c: &serde_json::Value, subnet: &str) -> Result<Ipam6, String> {
     // A network needs room for the gateway and at least one container.
     if !(1..=126).contains(&prefix) {
         return Err(format!("invalid subnet {subnet}: Kiri supports IPv6 prefixes from /1 to /126"));
+    }
+    if let Some(why) = reserved_v6_subnet(net, prefix) {
+        return Err(format!("invalid subnet {subnet}: overlaps reserved range {why}"));
     }
     let inside = |ip: [u8; 16]| in_subnet6(ip, net, prefix);
     let ip_range = match field("IPRange") {
@@ -570,6 +614,9 @@ pub fn parse_ipam_both(v: &serde_json::Value) -> Result<(Option<Ipam>, Option<Ip
         }
         if prefix > 30 || prefix < 8 {
             return Err(format!("invalid subnet {subnet}: Kiri supports prefixes from /8 to /30"));
+        }
+        if let Some(why) = reserved_v4_subnet(net, prefix) {
+            return Err(format!("invalid subnet {subnet}: overlaps reserved range {why}"));
         }
         let inside = |ip: [u8; 4]| in_subnet(ip, net, prefix);
         let ip_range = match field("IPRange") {
@@ -1096,8 +1143,12 @@ fn host_addrs() -> Vec<HostNet> {
     while !p.is_null() {
         // SAFETY: `p` is non-null and an entry of the list getifaddrs returned.
         let Some(ifa) = (unsafe { p.as_ref() }) else { break };
-        // SAFETY: ifa_addr is checked non-null before its family is read.
-        if !ifa.ifa_addr.is_null() && !ifa.ifa_netmask.is_null() && i32::from(unsafe { (*ifa.ifa_addr).sa_family }) == libc::AF_INET {
+        // SAFETY: ifa_addr, ifa_netmask, and ifa_name are checked non-null before use.
+        if !ifa.ifa_addr.is_null()
+            && !ifa.ifa_netmask.is_null()
+            && !ifa.ifa_name.is_null()
+            && i32::from(unsafe { (*ifa.ifa_addr).sa_family }) == libc::AF_INET
+        {
             // SAFETY: an AF_INET address and netmask are sockaddr_in.
             let a = unsafe { (*(ifa.ifa_addr as *const libc::sockaddr_in)).sin_addr.s_addr }.to_ne_bytes();
             let m = unsafe { (*(ifa.ifa_netmask as *const libc::sockaddr_in)).sin_addr.s_addr }.to_ne_bytes();
@@ -1699,5 +1750,28 @@ mod tests {
         let mut b = net(None);
         b.name = "bridge".into();
         assert!(b.check_static([10, 5, 0, 10]).unwrap_err().contains("user defined networks only"));
+    }
+
+    #[test]
+    fn ipam_rejects_reserved_and_host_gateway_subnets() {
+        for bad in [
+            "0.0.0.0/8",
+            "127.0.0.0/8",
+            "127.1.0.0/16",
+            "169.254.0.0/16",
+            "224.0.0.0/8",
+            "240.0.0.0/8",
+            "198.19.248.0/24",
+            "192.168.65.0/24",
+            "fe80::/64",
+            "ff00::/16",
+            "::/64",
+        ] {
+            let v = serde_json::json!({"Config": [{"Subnet": bad}]});
+            assert!(parse_ipam_both(&v).is_err(), "subnet {bad} must be rejected");
+        }
+        // Legitimate private IPv4/IPv6 subnets stay accepted.
+        let ok = serde_json::json!({"Config": [{"Subnet": "10.99.0.0/24"}, {"Subnet": "fd00:1234::/64"}]});
+        assert!(parse_ipam_both(&ok).is_ok());
     }
 }

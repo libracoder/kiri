@@ -28,6 +28,23 @@ pub const MARKER: &str = ".kiri-storage";
 const MOVING: &str = ".kiri-moving";
 const IGNORED: &[&str] = &["desktop.ini", "Thumbs.db", MOVING, MARKER];
 
+/// Constant PowerShell command for `compact_vhdx`: the VHDX path is passed
+/// solely through the `KIRI_VHDX` environment variable, never interpolated into
+/// command text (avoiding ASCII and Unicode single-quote breakout).
+#[cfg_attr(not(windows), allow(dead_code))]
+const OPTIMIZE_VHD_CMD: &str = "Optimize-VHD -Path $env:KIRI_VHDX -Mode Full";
+
+/// Builds a `diskpart.exe` script to compact `vhdx`, rejecting characters
+/// (`\r`, `\n`, `\0`, `"`) that could inject extra diskpart commands.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn diskpart_script_content(vhdx: &Path) -> io::Result<String> {
+    let s = vhdx.to_string_lossy();
+    if s.is_empty() || s.contains(['\r', '\n', '\0', '"']) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "VHDX path contains characters not allowed in a diskpart script"));
+    }
+    Ok(format!("select vdisk file=\"{s}\"\r\nattach vdisk readonly\r\ncompact vdisk\r\ndetach vdisk\r\n"))
+}
+
 /// What `storage.json` holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Choice {
@@ -781,26 +798,47 @@ mod imp {
 
     fn compact_vhdx(vhdx: &Path) -> io::Result<()> {
         // First try Hyper-V's Optimize-VHD via PowerShell if installed.
-        let escaped = vhdx.to_string_lossy().replace('\'', "''");
+        // Pass the path via env var (never interpolated into -Command) so ASCII
+        // or Unicode quotes and metacharacters cannot break out of a literal.
         let ps = crate::win::tool("powershell.exe")
             .creation_flags(CREATE_NO_WINDOW)
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                &format!("Optimize-VHD -Path '{escaped}' -Mode Full"),
-            ])
+            .env("KIRI_VHDX", vhdx)
+            .args(["-NoProfile", "-NonInteractive", "-Command", OPTIMIZE_VHD_CMD])
             .output();
         if ps.as_ref().is_ok_and(|o| o.status.success()) {
             return Ok(());
         }
         // Fallback: diskpart compact vdisk on an offline VHDX.
-        let script = std::env::temp_dir().join(format!("kiri-compact-{}.txt", std::process::id()));
-        let vhdx_str = vhdx.to_string_lossy().replace('"', "");
-        let content = format!(
-            "select vdisk file=\"{vhdx_str}\"\r\nattach vdisk readonly\r\ncompact vdisk\r\ndetach vdisk\r\n"
-        );
-        fs::write(&script, content.as_bytes())?;
+        // Write to a newly created private script file inside %LOCALAPPDATA%\Kiri
+        // (never a predictable filename in shared %TEMP%).
+        let content = diskpart_script_content(vhdx)?;
+        let private_dir = config_path().parent().map(Path::to_path_buf).unwrap_or_else(default_root);
+        fs::create_dir_all(&private_dir)?;
+        let (script, mut file) = {
+            use std::sync::atomic::AtomicU64;
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+            let pid = std::process::id();
+            let mut created = None;
+            for _ in 0..32 {
+                let n = SEQ.fetch_add(1, Ordering::Relaxed);
+                let candidate = private_dir.join(format!("compact-{pid}-{n}.txt"));
+                match fs::OpenOptions::new().write(true).create_new(true).open(&candidate) {
+                    Ok(f) => {
+                        created = Some((candidate, f));
+                        break;
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+            created.ok_or_else(|| io::Error::new(io::ErrorKind::AlreadyExists, "could not create private diskpart script"))?
+        };
+        if let Err(e) = io::Write::write_all(&mut file, content.as_bytes()) {
+            drop(file);
+            let _ = fs::remove_file(&script);
+            return Err(e);
+        }
+        drop(file);
         let res = crate::win::tool("diskpart.exe")
             .creation_flags(CREATE_NO_WINDOW)
             .arg("/s")
@@ -859,7 +897,7 @@ mod imp {
                     std::ffi::OsStr::new(&distro),
                     std::ffi::OsStr::new("-u"),
                     std::ffi::OsStr::new("root"),
-                    std::ffi::OsStr::new("--"),
+                    std::ffi::OsStr::new("-e"),
                     std::ffi::OsStr::new("sh"),
                     std::ffi::OsStr::new("-c"),
                     std::ffi::OsStr::new("fstrim /var/lib/kiri 2>/dev/null || true; fstrim / 2>/dev/null || true"),
@@ -1032,5 +1070,25 @@ mod tests {
         let (eff2, clamp2) = effective_vhdx_in_use(Some(17_400_000_000), Some(16_000_000_000), read_vhdx_overhead(&d));
         assert_eq!((eff2, clamp2), (Some(17_400_000_000), Some(1_400_000_000)));
         let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn compact_vhdx_helpers_block_powershell_and_diskpart_injection() {
+        assert_eq!(OPTIMIZE_VHD_CMD, "Optimize-VHD -Path $env:KIRI_VHDX -Mode Full");
+        assert!(!OPTIMIZE_VHD_CMD.contains('\''));
+        // Unicode quotes and semicolons are valid Windows filenames, safe in diskpart quotes.
+        let ok = diskpart_script_content(Path::new(r"C:\Users\o’neil;calc\ext4.vhdx")).unwrap();
+        assert!(ok.starts_with("select vdisk file=\"C:\\Users\\o’neil;calc\\ext4.vhdx\"\r\n"));
+        // Newlines, NULs, and embedded double quotes must be rejected.
+        for bad in [
+            "",
+            "C:\\a\"\r\nselect disk 0\r\nclean",
+            "C:\\a\nclean",
+            "C:\\a\rclean",
+            "C:\\a\0b\\ext4.vhdx",
+            "C:\\a\"b\\ext4.vhdx",
+        ] {
+            assert!(diskpart_script_content(Path::new(bad)).is_err(), "accepted unsafe path: {bad:?}");
+        }
     }
 }

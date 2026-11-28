@@ -5,7 +5,12 @@
 # itself an "update" (ui/mod.rs). Releases take theirs from the tag instead.
 #   scripts/ci/test-version.sh
 set -eu
-last=$(curl -fsS -A kiri-ci https://download.runkiri.com/latest.json | sed -n 's/.*"version": *"\([0-9]*\.[0-9]*\.[0-9]*\)".*/\1/p' | head -1 || true)
+last=$(curl -fsS --proto '=https' --proto-redir '=https' -A kiri-ci https://download.runkiri.com/latest.json | sed -n 's/.*"version": *"\([0-9]*\.[0-9]*\.[0-9]*\)".*/\1/p' | head -1 || true)
 v="${last:-0.0.0}-dev.${GITHUB_RUN_NUMBER:-0}"
 perl -pi -e 's/^version = "[^"]*"/version = "'"$v"'"/ && ($done = 1) unless $done' Cargo.toml
+# Keep workspace member versions in Cargo.lock synchronized offline so
+# subsequent release builds can always pass --locked without network drift.
+if command -v cargo >/dev/null 2>&1; then
+  cargo update --workspace --offline >/dev/null 2>&1 || true
+fi
 grep -m1 '^version = ' Cargo.toml

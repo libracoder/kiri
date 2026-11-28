@@ -406,11 +406,13 @@ fn take_over(root: &std::path::Path, leftovers: impl Fn()) -> io::Result<()> {
         let _ = (&file).read_to_string(&mut text);
         let _ = std::io::Seek::rewind(&mut file);
         let old: libc::pid_t = text.trim().parse().unwrap_or(0);
-        let daemon = parent_of(old);
-        let orphan = old > 0 && !daemon.is_some_and(is_daemon);
+        let old_is_agent = old > 0 && is_kiri_init(old);
+        let daemon = old_is_agent.then(|| parent_of(old)).flatten();
+        let orphan = old_is_agent && !daemon.is_some_and(is_daemon);
         let waited = start.elapsed();
-        // Gone: whatever holds the lock now is something it left running.
-        if orphan && !swept && daemon.is_none() {
+        // Gone (or PID recycled to a non-kiri-init host process): whatever
+        // holds the lock now is something the dead agent left running.
+        if (!old_is_agent || (orphan && daemon.is_none())) && !swept {
             eprintln!("kiri-init: agent {old} is gone but its lock is held: stopping the containers it left");
             leftovers();
             swept = true;
@@ -418,7 +420,7 @@ fn take_over(root: &std::path::Path, leftovers: impl Fn()) -> io::Result<()> {
         }
         if orphan && signalled.is_none() {
             eprintln!("kiri-init: stopping agent {old}, left running by a daemon that is gone");
-            // SAFETY: signalling the process that holds our data directory's lock.
+            // SAFETY: signalling a verified `kiri-init` process that holds our data directory's lock.
             unsafe { libc::kill(old, libc::SIGTERM) };
             signalled = Some(waited);
         } else if orphan && signalled.is_some_and(|t| waited - t > std::time::Duration::from_secs(5)) {
@@ -438,6 +440,41 @@ fn take_over(root: &std::path::Path, leftovers: impl Fn()) -> io::Result<()> {
     file.write_all_at(format!("{}\n", std::process::id()).as_bytes(), 0)?;
     let _ = AGENT_LOCK.set(file);
     Ok(())
+}
+
+/// Whether `pid` is actually a `kiri-init` agent process (and not an unrelated
+/// host process that recycled the dead agent's PID).
+fn is_kiri_init(pid: libc::pid_t) -> bool {
+    if pid <= 0 || pid == std::process::id() as libc::pid_t {
+        return false;
+    }
+    if let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe")) {
+        if std::fs::read_link("/proc/self/exe").is_ok_and(|me| exe == me) {
+            return true;
+        }
+        if exe_is_kiri_init(&exe) {
+            return true;
+        }
+        return false;
+    }
+    std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|c| cmdline_is_kiri_init(&c))
+}
+
+fn exe_is_kiri_init(exe: &std::path::Path) -> bool {
+    exe.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n == "kiri-init" || n == "kiri-init (deleted)")
+}
+
+fn cmdline_is_kiri_init(cmdline: &[u8]) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Some(argv0) = cmdline.split(|&b| b == 0).next().filter(|a| !a.is_empty()) else {
+        return false;
+    };
+    std::path::Path::new(std::ffi::OsStr::from_bytes(argv0))
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n == "kiri-init")
 }
 
 /// A live process's parent, from /proc/<pid>/stat.
@@ -688,6 +725,11 @@ fn delegated(own: &std::path::Path, pids: &[String]) -> bool {
     !pids.is_empty() && pids.iter().all(|p| *p == me || *p == parent)
 }
 
+/// Mount flags for the macOS virtiofs share at `/mnt/mac`: `MS_NOSUID` and
+/// `MS_NODEV` block setuid/setgid privilege escalation and device nodes on
+/// host-backed bind mounts whose server synthesizes caller ownership.
+const MAC_SHARE_MOUNT_FLAGS: libc::c_ulong = libc::MS_NOATIME | libc::MS_NOSUID | libc::MS_NODEV;
+
 /// Mounts the data disk (or a tmpfs without one), creates the layer and
 /// container directories and the cgroup that all containers live under.
 fn data_dirs() -> io::Result<container::Paths> {
@@ -710,7 +752,7 @@ fn data_dirs() -> io::Result<container::Paths> {
     // The Mac's filesystem over virtiofs, for bind mounts.
     sys::mkdir(c"/mnt", 0o755);
     sys::mkdir(c"/mnt/mac", 0o755);
-    if let Err(e) = mount(c"kiri-mac", c"/mnt/mac", c"virtiofs", libc::MS_NOATIME, None) {
+    if let Err(e) = mount(c"kiri-mac", c"/mnt/mac", c"virtiofs", MAC_SHARE_MOUNT_FLAGS, None) {
         eprintln!("kiri-init: no Mac file share ({e}); bind mounts of Mac paths will fail");
     } else if let Err(e) = mac_readahead() {
         eprintln!("kiri-init: keeping the Mac file share's default read-ahead ({e})");
@@ -910,6 +952,58 @@ mod take_over_tests {
         let text = std::fs::read_to_string(root.join("agent.lock")).unwrap();
         assert_eq!(text.trim(), std::process::id().to_string());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn take_over_does_not_kill_unrelated_process_on_pid_reuse() {
+        use std::os::fd::AsRawFd;
+        assert!(super::exe_is_kiri_init(std::path::Path::new("/usr/local/bin/kiri-init")));
+        assert!(super::exe_is_kiri_init(std::path::Path::new("/usr/local/bin/kiri-init (deleted)")));
+        assert!(!super::exe_is_kiri_init(std::path::Path::new("/bin/sleep")));
+        assert!(super::cmdline_is_kiri_init(b"/usr/local/bin/kiri-init\0"));
+        assert!(!super::cmdline_is_kiri_init(b"/bin/sleep\x0060\0"));
+        assert!(!super::cmdline_is_kiri_init(b""));
+
+        let root = std::env::temp_dir().join(format!("kiri-take-over-reuse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut bystander = std::process::Command::new("sleep").arg("60").spawn().unwrap();
+        let bystander_pid = bystander.id();
+        let lock = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(root.join("agent.lock")).unwrap();
+        std::io::Write::write_all(&mut &lock, format!("{bystander_pid}\n").as_bytes()).unwrap();
+        // SAFETY: flock on a descriptor we own.
+        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
+        // SAFETY: child holds the lock until leftovers() reaps it.
+        let left = unsafe { libc::fork() };
+        if left == 0 {
+            loop {
+                // SAFETY: plain pause in child.
+                unsafe { libc::pause() };
+            }
+        }
+        drop(lock);
+        let swept = std::cell::Cell::new(0);
+        super::take_over(&root, || {
+            swept.set(swept.get() + 1);
+            // SAFETY: killing and reaping the child forked above.
+            unsafe {
+                libc::kill(left, libc::SIGKILL);
+                libc::waitpid(left, std::ptr::null_mut(), 0);
+            }
+        })
+        .unwrap();
+        assert_eq!(swept.get(), 1);
+        assert!(bystander.try_wait().unwrap().is_none(), "unrelated process must not be killed");
+        let _ = bystander.kill();
+        let _ = bystander.wait();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mac_share_mount_enforces_nosuid_and_nodev() {
+        assert_ne!(super::MAC_SHARE_MOUNT_FLAGS & libc::MS_NOSUID, 0);
+        assert_ne!(super::MAC_SHARE_MOUNT_FLAGS & libc::MS_NODEV, 0);
+        assert_ne!(super::MAC_SHARE_MOUNT_FLAGS & libc::MS_NOATIME, 0);
     }
 }
 

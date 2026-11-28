@@ -7,6 +7,11 @@ use std::io::{self, Read};
 
 const BLOCK: usize = 512;
 
+/// Upper bound on buffered PAX `x` extension data (1 MiB). Prevents a tiny
+/// compressed tar stream with a multi-gigabyte PAX header from OOM-killing
+/// PID 1 (`kiri-init`) or the host root agent.
+pub const MAX_PAX_SIZE: u64 = 1 << 20;
+
 /// The size field, which tar-rs reads in every header, as (start, end).
 const SIZE: (usize, usize) = (124, 136);
 /// mode, uid, gid and mtime, which it reads for an entry it unpacks, not for
@@ -68,11 +73,11 @@ impl<R: Read> GoNumbers<R> {
         Ok(())
     }
 
-    fn header(&mut self) {
+    fn header(&mut self) -> io::Result<()> {
         let h = &mut self.block;
         if h.iter().all(|&b| b == 0) || Some(checksum(h)) != octal(&h[148..156]) {
             self.passthrough = true;
-            return;
+            return Ok(());
         }
         let ustar = &h[257..263] == b"ustar\0" && &h[263..265] == b"00";
         let gnu = &h[257..263] == b"ustar " && &h[263..265] == b" \0";
@@ -99,7 +104,7 @@ impl<R: Read> GoNumbers<R> {
 
         let Some(mut size) = number(&h[SIZE.0..SIZE.1]) else {
             self.passthrough = true;
-            return;
+            return Ok(());
         };
         if !continues
             && let Some(pax) = self.pax_size.take()
@@ -110,9 +115,16 @@ impl<R: Read> GoNumbers<R> {
         self.sparse_ext = sparse && h[482] == 1;
         self.data = size.div_ceil(BLOCK as u64).saturating_mul(BLOCK as u64);
         if kind == b'x' && (ustar || gnu) {
+            if size > MAX_PAX_SIZE {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("PAX extended header exceeds maximum size ({size} > {MAX_PAX_SIZE})"),
+                ));
+            }
             self.pax = Some((Vec::new(), size));
             self.end_of_data();
         }
+        Ok(())
     }
 
     /// An entry's data has all gone: a PAX entry's records take effect.
@@ -153,6 +165,9 @@ impl<R: Read> Read for GoNumbers<R> {
                 }
                 if let Some((pax, left)) = &mut self.pax {
                     let take = (n as u64).min(*left) as usize;
+                    if pax.len().saturating_add(take) > MAX_PAX_SIZE as usize {
+                        return Err(io::Error::new(io::ErrorKind::InvalidData, "PAX extended header exceeds maximum size"));
+                    }
                     pax.extend_from_slice(&buf[..take]);
                     *left -= take as u64;
                 }
@@ -162,7 +177,7 @@ impl<R: Read> Read for GoNumbers<R> {
             }
             self.next_block()?;
             if !self.passthrough {
-                self.header();
+                self.header()?;
             }
         }
     }
@@ -557,5 +572,18 @@ mod tests {
         assert_eq!(got[0].0, "sparse.bin");
         assert_eq!(got[0].2, fake.as_bytes());
         assert_eq!(got[1].0, "after");
+    }
+
+    #[test]
+    fn oversized_pax_header_is_rejected_without_allocating() {
+        let mut x = tar::Header::new_ustar();
+        x.set_entry_type(tar::EntryType::XHeader);
+        x.set_size(MAX_PAX_SIZE + 1);
+        x.set_cksum();
+        let stream = x.as_bytes().chain(io::repeat(0));
+        let mut r = GoNumbers::new(stream);
+        let mut buf = [0u8; 512];
+        let err = r.read(&mut buf).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }

@@ -132,4 +132,29 @@ t("a pod with no ports and no service asks which port", () => {
   input.value = "5678"; document.querySelector(".scrim [data-go]").click();
   eq(shares().map((x) => [x.name, x.value.port]), [["pod demo/crashy :5678", 5678]], "sent");
 });
+t("compact string-table + tuple k8s payload unpacks identically", () => {
+  kiri.on({
+    type: "k8s",
+    state: "running",
+    ready: true,
+    context: "kiri-dev",
+    icon: "kubernetes",
+    s: ["c", "nginx", "2026-10-28T00:00:00Z", "kiri", "ReplicaSet", "app", "web", "LoadBalancer", "kube-system"],
+    pods: [["web-packed", 1, [[0, 1, 1, 2, [80]]], 2, "10.42.0.55", 3, 4, null, [5, 6]]],
+    services: [["web-svc", "10.43.42.99", [[18080, 80]], 2, [5, 6], null, 7, ["172.17.0.2"]], ["dns-svc", "10.43.0.10", [{ name: "dns", port: 53, protocol: "UDP" }], 2, null, 8]],
+  });
+  eq(k8s.pods[0].ns, "default", "pod default ns");
+  eq(k8s.pods[0].status, "Running", "pod default status");
+  eq(k8s.pods[0].ready, "1/1", "pod ready");
+  eq(k8s.pods[0].allReady, true, "pod allReady");
+  eq(k8s.pods[0].labels, { app: "web" }, "pod labels");
+  eq(k8s.pods[0].containers[0].ports, [{ containerPort: 80 }], "pod port");
+  eq(k8s.services[0].type, "LoadBalancer", "svc type");
+  eq(k8s.services[0].ports, [{ port: 18080, targetPort: 80 }], "svc tuple port");
+  eq(k8s.services[1].ns, "kube-system", "svc interned ns");
+  show("pods");
+  sent.length = 0; cell("web-packed").querySelector("button").click();
+  eq([...$("k-pick").querySelectorAll("[data-kgo]")].map((b) => b.dataset.kgo), ["service default/web-svc :18080", "pod default/web-packed :80"], "compact pod offers its compact service");
+  document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
+});
 report(R);

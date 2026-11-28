@@ -206,18 +206,21 @@ def no_comment_lines(index):
     return index[:i] + "".join(l for l in lines(index[i:]) if not l.lstrip().startswith("// "))
 
 
-def line_states(script):
-    """As assemble.rs's line_states: the state each line starts in, and whether the script ends in code."""
+def scan(script, collect_marks=False):
+    """As assemble.rs's scan: line start states, optional per-char marks, and whether the script ends in code."""
     before = {"return", "typeof", "case", "do", "else", "in", "of", "void", "throw", "new", "delete", "yield", "await"}
     ident = lambda c: c.isalnum() or c in "_$"
     stack, depth, s, braces, prev, raw, word, out = [], [], "code", 0, "\n", "\n", "", []
     prev2, parens, after_cond = "\n", [], False
+    marks = [] if collect_marks else None
     for line in lines(script):
         out.append(s)
         i = 0
-        while i < len(line):
+        n = len(line)
+        while i < n:
+            at, frm = s, i
             c = line[i]
-            nxt = line[i + 1] if i + 1 < len(line) else "\0"
+            nxt = line[i + 1] if i + 1 < n else "\0"
             was_ident = False
             if s == "code":
                 if c == "/" and nxt == "/": s = "line"
@@ -252,11 +255,18 @@ def line_states(script):
                 elif s == "regex" and c in "/\n": s = "code"
             if not was_ident and not c.isspace(): word = ""
             raw = c
-            last = line[i] if i < len(line) else c
+            last = line[i] if i < n else c
             if not last.isspace(): prev2, prev = ("\n" if last == "\n" else prev), last
             if last == "\n": prev = "\n"
+            if marks is not None:
+                marks.extend([at] * (min(i + 1, n) - frm))
             i += 1
-    return out, s == "code" and not stack
+    return (out, marks, s == "code" and not stack) if collect_marks else (out, s == "code" and not stack)
+
+
+def line_states(script):
+    """As assemble.rs's line_states: the state each line starts in, and whether the script ends in code."""
+    return scan(script, False)
 
 
 def no_indent(index):
@@ -293,26 +303,229 @@ def no_indent(index):
     return "".join(out)
 
 
+def compact_css(css):
+    """As assemble.rs's compact_css."""
+    out, quote, i, decl, paren, n = [], None, 0, True, 0, len(css)
+    while i < n:
+        if quote is None and css[i:i + 2] == "/*":
+            end = css.find("*/", i + 2)
+            if end >= 0:
+                end += 2
+                out.extend(css[i:end])
+                i = end
+                continue
+        if quote is None and decl:
+            end = custom_value(css, i)
+            if end is not None:
+                out.extend(css[i:end])
+                i, decl = end, False
+                continue
+        ch = css[i]
+        i += 1
+        if quote is not None:
+            out.append(ch)
+            if ch == "\\":
+                if i < n:
+                    out.append(css[i])
+                    i += 1
+            elif ch == quote:
+                quote = None
+            continue
+        if ch == "\\":
+            out.append(ch)
+            if i < n:
+                out.append(css[i])
+                i += 1
+            decl = False
+            continue
+        if ch in "\"'":
+            quote = ch
+            out.append(ch)
+            decl = False
+            continue
+        if ch == "\r":
+            continue
+        if ch == "\n":
+            if not out or out[-1] in "{};,\n":
+                continue
+            out.append("\n")
+            continue
+        if ch in " \t":
+            if out and (out[-1] in ":,{; \n" or (paren == 0 and out[-1] in ">+~")):
+                continue
+            if i < n and (css[i] in "{};,\n\r" or (paren == 0 and css[i] in ">+~")):
+                continue
+            out.append(" ")
+            continue
+        if ch == "(":
+            paren += 1
+        elif ch == ")" and paren > 0:
+            paren -= 1
+        if ch == "}":
+            if out and out[-1] == ";":
+                out.pop()
+            if out and out[-1] == "\n":
+                out.pop()
+        out.append(ch)
+        if ch not in CSS_SPACE:
+            decl = ch in "{;"
+    return "".join(out)
+
+
+def compact_js(script):
+    """As assemble.rs's compact_js."""
+    _, marks, closed = scan(script, True)
+    if not closed or len(marks) != len(script):
+        return script
+    tight = ";,{}()[]?:"
+    bin_tight = "=<>%^&|*+-"
+    op_guard = "=!<>+-*/%&|^~"
+    out, out_code = [], []
+    i, n = 0, len(script)
+    while i < n:
+        st = marks[i]
+        c = script[i]
+        if st == "code" and c == "/" and i + 1 < n and script[i + 1] == "/" and marks[i + 1] == "line":
+            i += 2
+            while i < n and script[i] != "\n":
+                i += 1
+            continue
+        if st == "code" and c == "/" and i + 1 < n and script[i + 1] == "*" and i + 2 < n and marks[i + 2] == "block":
+            start = i
+            i += 2
+            while i < n and marks[i] == "block":
+                i += 1
+            inner = script[start + 2:max(start + 2, i - 2)]
+            if inner and all(ch.isascii() and (ch.isupper() or ch == "_") for ch in inner):
+                for ch in script[start:i]:
+                    out.append(ch)
+                    out_code.append(False)
+            elif out and not out[-1].isspace() and out[-1] not in tight and i < n and not script[i].isspace() and script[i] not in tight:
+                out.append(" ")
+                out_code.append(True)
+            continue
+        if st != "code":
+            out.append(c)
+            out_code.append(False)
+            i += 1
+            continue
+        if c == "\r":
+            i += 1
+            continue
+        if c == "\n":
+            while out and out[-1] == " " and out_code[-1]:
+                out.pop()
+                out_code.pop()
+            suppress_nl = bool(out) and out_code[-1] and out[-1] in "{;,(["
+            if out and out[-1] != "\n" and not suppress_nl:
+                out.append("\n")
+                out_code.append(True)
+            i += 1
+            continue
+        if c in " \t":
+            prev = out[-1] if out else None
+            prev_is_code = out_code[-1] if out_code else False
+            if prev is None or prev == "\n" or (prev == " " and prev_is_code):
+                i += 1
+                continue
+            j = i + 1
+            while j < n and marks[j] == "code" and script[j] in " \t":
+                j += 1
+            nxt = script[j] if j < n else None
+            nxt_is_code = (marks[j] == "code") if j < n else False
+            drop_before = nxt is not None and (
+                nxt in "\n\r"
+                or (nxt_is_code and nxt in tight)
+                or (nxt_is_code and nxt in bin_tight and prev not in op_guard)
+            )
+            drop_after = prev_is_code and (prev in tight or (prev in bin_tight and nxt is not None and nxt not in op_guard))
+            if not drop_before and not drop_after:
+                out.append(" ")
+                out_code.append(True)
+            i = j
+            continue
+        out.append(c)
+        out_code.append(True)
+        i += 1
+    return "".join(out)
+
+
+def compact_page(index):
+    """As assemble.rs's compact_page."""
+    out, at = [], 0
+    span = style_span(index)
+    a, b = span if span else (-1, -1)
+    if span:
+        a += len("<style>")
+        out.append(index[:a])
+        out.append(compact_css(index[a:b]))
+        at = b
+    pos = max(b, 0)
+    while True:
+        i = find_tag(index, "<script", pos)
+        if i < 0: break
+        o = index.find(">", i)
+        if o < 0: break
+        o += 1
+        c = find_tag(index, "</script", o)
+        c = len(index) if c < 0 else c
+        pos = c
+        if o < at: continue
+        out.append(index[at:o])
+        out.append(compact_js(index[o:c]))
+        at = c
+    out.append(index[at:])
+    return "".join(out)
+
+
 def strip(index):
-    """index.html as assemble.rs's page() has it before the splices: the same bytes."""
-    return no_indent(no_comment_lines(no_css_comments(index)))
+    """index.html as assemble.rs's strip_and_compact() has it before the splices: the same bytes."""
+    return compact_page(no_indent(no_comment_lines(no_css_comments(index))))
+
+
+def xterm_loader():
+    """The host's half of loadxterm: injects xterm.css + xterm.js + addons synchronously."""
+    xterm = lambda f: open(os.path.join(UI, "xterm", f)).read()
+    css_json = json.dumps(xterm("xterm.css")).replace("<", "\\u003c").replace(">", "\\u003e")
+    js_bundle = "".join(xterm(f) + "\n" for f in ["xterm.js", "addon-fit.js", "addon-search.js", "addon-web-links.js"])
+    js_json = json.dumps(js_bundle).replace("<", "\\u003c").replace(">", "\\u003e")
+    return (
+        f"const HOST_XTERM_CSS = {css_json};\n"
+        f"const HOST_XTERM_JS = {js_json};\n"
+        "{ const post = window.webkit.messageHandlers.kiri.postMessage;\n"
+        "  window.webkit.messageHandlers.kiri.postMessage = (m) => { post(m); const o = JSON.parse(m);\n"
+        "    if (o.cmd !== \"loadxterm\" || typeof Terminal === \"function\") return;\n"
+        "    if (!document.getElementById(\"xterm-css\")) { const s = document.createElement(\"style\"); s.id = \"xterm-css\"; s.textContent = HOST_XTERM_CSS; document.head.appendChild(s); }\n"
+        "    const sc = document.createElement(\"script\"); sc.textContent = HOST_XTERM_JS + \"\\nwindow.kiriXtermReady && window.kiriXtermReady();\"; document.head.appendChild(sc); }; }\n"
+    )
+
+
+def panels_loader():
+    """The host's half of loadpanels: injects panels.js synchronously."""
+    js_bundle = compact_js(open(os.path.join(UI, "panels.js")).read())
+    js_json = json.dumps(js_bundle).replace("<", "\\u003c").replace(">", "\\u003e")
+    return (
+        f"const HOST_PANELS_JS = {js_json};\n"
+        "{ const post = window.webkit.messageHandlers.kiri.postMessage;\n"
+        "  window.webkit.messageHandlers.kiri.postMessage = (m) => { post(m); const o = JSON.parse(m);\n"
+        "    if (o.cmd !== \"loadpanels\" || window.__kiriPanelsInjected) return;\n"
+        "    window.__kiriPanelsInjected = true;\n"
+        "    const sc = document.createElement(\"script\"); sc.textContent = HOST_PANELS_JS + \"\\nwindow.kiriPanelsReady && window.kiriPanelsReady();\"; document.head.appendChild(sc); }; }\n"
+    )
 
 
 def page(test, os_name=None):
-    # As assemble.rs builds it: the icons and xterm.js spliced in, and the words
-    # for the language it opens in; the rest come through langwords (host()).
+    # As assemble.rs builds it: the icons spliced in, and the words for the
+    # language it opens in; xterm loads lazily via loadxterm, non-boot panels via loadpanels, and other languages via langwords.
     packed, pick = strings(), lang_of(test)
-    xterm = lambda f: open(os.path.join(UI, "xterm", f)).read()
-    index = (strip(open(os.path.join(UI, "index.html")).read()).replace("/*ICONS*/", open(os.path.join(UI, "icons.js")).read(), 1)
-             .replace("/*LANGSTEP*/", open(os.path.join(UI, "langstep.js")).read(), 1)
-             .replace("/*XTERM_CSS*/", xterm("xterm.css"), 1)
-             .replace("/*XTERM_JS*/", "".join(xterm(f) + "\n" for f in ["xterm.js", "addon-fit.js", "addon-search.js", "addon-web-links.js"]), 1)
+    index = (strip(open(os.path.join(UI, "index.html")).read()).replace("/*ICONS*/", compact_js(open(os.path.join(UI, "icons.js")).read()), 1)
+             .replace("/*LANGSTEP*/", compact_js(open(os.path.join(UI, "langstep.js")).read()), 1)
              .replace("/*LANG*/", f"window.KIRI_LANG = {json.dumps({'os': ['en-US'], 'pick': pick})};", 1)
              .replace("/*STRINGS*/{}", json.dumps(opening(pick, packed), ensure_ascii=False), 1))
     if os_name and os_name != "macos":
         index = index.replace("<head>", f'<head><script>window.KIRI_OS = "{os_name}";</script>', 1)
     fixture = open(os.path.join(ROOT, "tests/ui/fixture.js")).read()
-    return index[: index.rindex("</body>")] + CATCH + f"<script>{REPORT}\n{fixture}\n{host(packed)}\n{open(test).read()}</script></body></html>"
+    return index[: index.rindex("</body>")] + CATCH + f"<script>{REPORT}\n{fixture}\n{host(packed)}\n{xterm_loader()}\n{panels_loader()}\n{open(test).read()}</script></body></html>"
 
 
 def run(test, os_name=None):

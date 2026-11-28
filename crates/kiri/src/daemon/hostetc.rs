@@ -59,8 +59,9 @@ fn file_in(dir: &Path, name: &str, who: &Who) -> io::Result<PathBuf> {
     let path = dir.join(name);
     let text = match name {
         // Made once and kept: a machine-id that changed would not be one.
-        "machine-id" => match std::fs::read_to_string(&path) {
-            Ok(id) if is_machine_id(&id) => return Ok(path),
+        // Only trust an existing regular file (never follow a container-planted symlink).
+        "machine-id" => match std::fs::symlink_metadata(&path).ok().filter(|m| m.file_type().is_file()).and_then(|_| std::fs::read_to_string(&path).ok()) {
+            Some(id) if is_machine_id(&id) => return Ok(path),
             _ => format!("{}\n", super::engine::random_hex(16)),
         },
         "timezone" => format!("{}\n", zone_of(std::fs::read_link("/etc/localtime").ok().as_deref())),
@@ -70,16 +71,14 @@ fn file_in(dir: &Path, name: &str, who: &Who) -> io::Result<PathBuf> {
     Ok(path)
 }
 
-/// Writes `text` unless the file says it already, so a mount does not
-/// change a file other containers have open for nothing.
+/// Writes `text` unless `path` is already a regular file with the same text,
+/// replacing any symlink or modified file atomically without following links.
 fn put(path: &Path, text: &str) -> io::Result<()> {
-    if std::fs::read_to_string(path).is_ok_and(|old| old == text) {
+    let is_regular = std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file());
+    if is_regular && std::fs::read_to_string(path).is_ok_and(|old| old == text) {
         return Ok(());
     }
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    std::fs::write(path, text)
+    super::write_atomic_mode(path, text.as_bytes(), 0o644)
 }
 
 fn is_machine_id(id: &str) -> bool {
@@ -189,5 +188,30 @@ mod tests {
         assert!(std::fs::read_to_string(dir.join("passwd")).unwrap().starts_with("root:x:0:0:"));
         assert!(file_in(&dir, "shadow", &me()).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn planted_symlinks_are_replaced_without_overwriting_targets() {
+        let base = std::env::temp_dir().join(format!("kiri-hostetc-symlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = base.join("etc");
+        std::fs::create_dir_all(&dir).unwrap();
+        let canary_passwd = base.join("canary-passwd");
+        let canary_mid = base.join("canary-machine-id");
+        std::fs::write(&canary_passwd, "do-not-overwrite-passwd").unwrap();
+        std::fs::write(&canary_mid, "do-not-overwrite-machine-id").unwrap();
+        std::os::unix::fs::symlink(&canary_passwd, dir.join("passwd")).unwrap();
+        std::os::unix::fs::symlink(&canary_mid, dir.join("machine-id")).unwrap();
+
+        file_in(&dir, "passwd", &me()).unwrap();
+        file_in(&dir, "machine-id", &me()).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&canary_passwd).unwrap(), "do-not-overwrite-passwd");
+        assert_eq!(std::fs::read_to_string(&canary_mid).unwrap(), "do-not-overwrite-machine-id");
+        assert!(std::fs::symlink_metadata(dir.join("passwd")).unwrap().file_type().is_file());
+        assert!(std::fs::symlink_metadata(dir.join("machine-id")).unwrap().file_type().is_file());
+        assert!(std::fs::read_to_string(dir.join("passwd")).unwrap().starts_with("root:x:0:0:"));
+        assert!(is_machine_id(&std::fs::read_to_string(dir.join("machine-id")).unwrap()));
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

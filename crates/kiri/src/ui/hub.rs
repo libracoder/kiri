@@ -94,7 +94,7 @@ fn fetch(kind: Kind, key: &str) -> Result<Value, String> {
                         "description": r["description"],
                         "stars": r["star_count"],
                         "official": r["is_official"],
-                        "icon": super::brand(name),
+                        "icon": super::brand(name).and_then(super::brand_svg),
                     })
                 })
                 .collect())
