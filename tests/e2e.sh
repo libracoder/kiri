@@ -2632,6 +2632,53 @@ t run-missing-network-no-pull "0" bash -c "$D run --rm --name ans-r --network an
 t run-missing-network-removed "0" bash -c "$D ps -aq --filter name=ans-r | wc -l | tr -d ' '"
 $D rm -f ans ans0 ans-n ans-r >/dev/null 2>&1; $D network rm ansnet >/dev/null 2>&1; $D rmi anstag:x anstag:c >/dev/null 2>&1
 
+section "swarm: services, stacks, secrets (one node)"
+# Kiri is a swarm of one node (#603). A swarm the person made is theirs:
+# the checks run only where none is active, and leave it as they found it.
+sw_wait() { for _ in $(seq 60); do [ "$($D service ls --filter name="$1" --format '{{.Replicas}}' 2>/dev/null)" = "$2" ] && return 0; sleep 1; done; return 1; }
+if [ "$($D info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null)" = "active" ]; then
+  for c in swarm-not-manager swarm-init swarm-info swarm-node service-converged service-replicas service-task-labels service-dns service-tasks-dns service-replaced service-scale service-update service-update-env service-rollback service-restart-none service-ingress service-host-port service-logs secret-in-task config-in-task secret-in-use stack-deploy stack-rm swarm-leave-refused swarm-leave swarm-leave-clean; do skip "$c" "a swarm of the person's own is active"; done
+else
+  SWD=$(mktemp -d)
+  t swarm-not-manager "This node is not a swarm manager" $D service ls
+  t swarm-init "Swarm initialized" $D swarm init --advertise-addr 127.0.0.1
+  t swarm-info "active true" $D info --format '{{.Swarm.LocalNodeState}} {{.Swarm.ControlAvailable}}'
+  t swarm-node "Leader" $D node ls
+  $D network create --driver overlay --attachable sw-net >/dev/null
+  t service-converged "converged" $D service create --name sw-web --replicas 2 --network sw-net --no-resolve-image nginx:alpine
+  t service-replicas "2/2" $D service ls --filter name=sw-web --format '{{.Replicas}}'
+  t service-task-labels "2" bash -c "$D ps -q --filter label=com.docker.swarm.service.name=sw-web | wc -l | tr -d ' '"
+  # A service's name resolves on its network, to each task with tasks.<name>.
+  t service-dns "Welcome to nginx" $D run --rm --network sw-net alpine wget -qO- -T 5 http://sw-web
+  t service-tasks-dns "2" bash -c "$D run --rm --network sw-net alpine nslookup tasks.sw-web 2>/dev/null | grep -c '^Address: '"
+  # A task whose container goes is replaced in its slot.
+  t service-replaced "ok" bash -c "$D rm -f \$($D ps -q --filter label=com.docker.swarm.service.name=sw-web | head -1) >/dev/null; sleep 2; for i in \$(seq 40); do [ \"\$($D service ls --filter name=sw-web --format '{{.Replicas}}')\" = 2/2 ] && echo ok && break; sleep 1; done"
+  t service-scale "1/1" bash -c "$D service scale sw-web=1 >/dev/null 2>&1; $D service ls --filter name=sw-web --format '{{.Replicas}}'"
+  t service-update "converged" $D service update --env-add SW=updated --no-resolve-image sw-web
+  t service-update-env "SW=updated" bash -c "$D exec \$($D ps -q --filter label=com.docker.swarm.service.name=sw-web | head -1) env"
+  t service-rollback "converged" $D service rollback sw-web
+  t service-logs "sw-web.1." $D service logs --tail 1 sw-web
+  # --restart-condition none: a task that ends is not started again.
+  t service-restart-none "1 Complete" bash -c "$D service create -d --name sw-once --restart-condition none --no-resolve-image alpine true >/dev/null; sleep 8; echo \$($D service ps sw-once -q | wc -l | tr -d ' ') \$($D service ps sw-once --format '{{.CurrentState}}' | cut -d' ' -f1)"
+  t service-ingress "200" bash -c "$D service create -d --name sw-pub --publish 18091:80 --no-resolve-image nginx:alpine >/dev/null; for i in \$(seq 40); do c=\$(curl -s -o /dev/null -m 2 -w '%{http_code}' http://127.0.0.1:18091); [ \"\$c\" = 200 ] && break; sleep 1; done; echo \$c"
+  t service-host-port "200" bash -c "$D service create -d --name sw-host --publish published=18092,target=80,mode=host --no-resolve-image nginx:alpine >/dev/null; for i in \$(seq 40); do c=\$(curl -s -o /dev/null -m 2 -w '%{http_code}' http://127.0.0.1:18092); [ \"\$c\" = 200 ] && break; sleep 1; done; echo \$c"
+  printf 'hunter2' | $D secret create sw-pw - >/dev/null
+  echo 'motd' | $D config create sw-cfg - >/dev/null
+  $D service create -d --name sw-read --secret sw-pw --config source=sw-cfg,target=/etc/motd --no-resolve-image alpine sh -c 'cat /run/secrets/sw-pw; echo; cat /etc/motd; sleep 600' >/dev/null
+  sw_wait sw-read 1/1
+  t secret-in-task "hunter2" bash -c "sleep 1; $D service logs --raw sw-read"
+  t config-in-task "motd" $D service logs --raw sw-read
+  t secret-in-use "is in use by the following service: sw-read" $D secret rm sw-pw
+  printf 'services:\n  web:\n    image: nginx:alpine\n    networks: [front]\n  probe:\n    image: alpine\n    command: sh -c "until wget -qO- -T 2 http://web >/dev/null 2>\&1; do sleep 1; done; echo reached-web; sleep 600"\n    networks: [front]\nnetworks:\n  front: {}\n' > "$SWD/compose.yml"
+  t stack-deploy "reached-web" bash -c "$D stack deploy --resolve-image never -c $SWD/compose.yml sw >/dev/null 2>&1; for i in \$(seq 40); do $D service logs --raw sw_probe 2>/dev/null | grep -q reached-web && break; sleep 1; done; $D service logs --raw sw_probe"
+  t stack-rm "0" bash -c "$D stack rm sw >/dev/null; sleep 2; $D network ls -q --filter name=sw_front | wc -l | tr -d ' '"
+  t swarm-leave-refused "Use \`--force\` to ignore this message" $D swarm leave
+  t swarm-leave "Node left the swarm" $D swarm leave --force
+  t swarm-leave-clean "inactive 0" bash -c "echo \$($D info --format '{{.Swarm.LocalNodeState}}') \$($D ps -aq --filter label=com.docker.swarm.task | wc -l | tr -d ' ')"
+  rm -rf "$SWD"
+  $D swarm leave --force >/dev/null 2>&1
+fi
+
 section "errors"
 t bad-image-name "invalid" $D run --rm 'UPPER/case' true
 code no-such-image-pull 125 $D run --rm "$KIRI_REG/kiri-test/no-such-image:none" true

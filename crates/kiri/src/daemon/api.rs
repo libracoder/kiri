@@ -168,6 +168,9 @@ fn route(req: &Request, engine: &Arc<Engine>, caller: &Caller, w: &mut UnixStrea
     if let Some(done) = super::ops::route(req, engine, caller, w) {
         return done;
     }
+    if let Some(done) = super::swarm::route(req, engine, w) {
+        return done;
+    }
     match (m, p) {
         ("GET" | "HEAD", "/_ping") => {
             // Builder-Version 1 keeps classic CLIs, older Compose and SDKs
@@ -562,6 +565,7 @@ fn info(engine: &Engine) -> Value {
         "KiriCpuPercent": engine.cpu_percent(),
         "KiriStorageReadOnly": engine.storage_readonly(),
         "KiriStorageZfs": engine.storage_zfs(),
+        "Swarm": engine.swarm.info(),
         "Warnings": engine.records_damage().into_iter().chain(engine.image_damage()).chain(engine.host_warnings()).collect::<Vec<_>>(),
     })
 }
@@ -3628,8 +3632,8 @@ fn network_json(engine: &Engine, n: &super::network::Network, with_members: bool
         "Name": n.name,
         "Id": n.id,
         "Created": time::rfc3339(std::time::UNIX_EPOCH + Duration::from_nanos(n.created_ns)),
-        "Scope": "local",
-        "Driver": n.driver,
+        "Scope": if engine.swarm.is_overlay(&n.name) { "swarm" } else { "local" },
+        "Driver": if engine.swarm.is_overlay(&n.name) { "overlay" } else { n.driver.as_str() },
         "EnableIPv4": !n.no_ipv4,
         "EnableIPv6": n.v6.is_some(),
         "IPAM": {"Driver": "default", "Options": if n.ipam_options.is_object() { n.ipam_options.clone() } else { Value::Null }, "Config": ipam},
@@ -3647,9 +3651,9 @@ fn network_matches(f: &Filters, engine: &Engine, n: &super::network::Network) ->
     let labels = if n.labels.is_object() { n.labels.clone() } else { json!({}) };
     f.name(&n.name)
         && f.network_id(&n.id)
-        && f.any("driver", |v| v == n.driver)
+        && f.any("driver", |v| v == if engine.swarm.is_overlay(&n.name) { "overlay" } else { n.driver.as_str() })
         && f.labels(&labels)
-        && f.any("scope", |v| v == "local")
+        && f.any("scope", |v| v == if engine.swarm.is_overlay(&n.name) { "swarm" } else { "local" })
         && f.any("type", |v| (v == "custom") != n.builtin())
         && f.bool("dangling").is_none_or(|d| d == (!n.builtin() && engine.network_members(&n.name).is_empty()))
 }
@@ -3667,7 +3671,7 @@ fn network_inspect(engine: &Engine, key: &str) -> Result<Value, Error> {
     Ok(network_json(engine, &n, true))
 }
 
-fn network_create(req: &Request, engine: &Engine) -> Result<Value, Error> {
+pub(super) fn network_create(req: &Request, engine: &Engine) -> Result<Value, Error> {
     let body: Value = serde_json::from_slice(&req.body).map_err(|e| Error::BadRequest(format!("invalid JSON: {e}")))?;
     let name = body["Name"].as_str().unwrap_or_default();
     match body["Driver"].as_str().unwrap_or("bridge") {

@@ -1755,6 +1755,8 @@ pub struct Engine {
     /// and `<state_dir>/volume-sizes.json`), tracking volumes dirtied since the
     /// last guest disk measurement while leaving `GET /system/df` live.
     volume_sizes_cache: Mutex<VolumeSizesCache>,
+    /// Docker Swarm on this one node: services, tasks, secrets and configs.
+    pub swarm: super::swarm::Swarm,
 }
 
 struct VolumeSizesCache {
@@ -1888,6 +1890,7 @@ impl Engine {
         let loaded_volumes = super::volumes::Volumes::load(store.root())?;
         let volume_sizes_cache = Mutex::new(VolumeSizesCache::load(store.root(), loaded_volumes.all()));
         let volumes = Mutex::new(loaded_volumes);
+        let swarm = super::swarm::Swarm::load(store.root())?;
         let engine = Arc::new(Engine {
             volumes,
             link: Mutex::new(None),
@@ -1935,6 +1938,7 @@ impl Engine {
             image_labels: Mutex::new(HashMap::new()),
             uplink: Mutex::new(serde_json::Value::Null),
             volume_sizes_cache,
+            swarm,
         });
         let _ = engine.me.set(Arc::downgrade(&engine));
         engine.start_syncer();
@@ -1944,6 +1948,7 @@ impl Engine {
         engine.start_sleeper();
         engine.start_clock();
         engine.start_k8s_lb();
+        super::swarm::start(&engine);
         #[cfg(target_os = "macos")]
         super::watch::start(Arc::downgrade(&engine));
         Ok(engine)
@@ -2193,7 +2198,7 @@ impl Engine {
     }
 
     /// The VM if it is awake; never boots it.
-    fn awake(&self) -> Option<Arc<VmLink>> {
+    pub(super) fn awake(&self) -> Option<Arc<VmLink>> {
         self.link.lock().unwrap_or_else(|e| e.into_inner()).as_ref().filter(|vm| !vm.is_disconnected()).cloned()
     }
 
