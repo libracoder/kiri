@@ -5369,6 +5369,7 @@ function saveWidths() { send("setpref", { name: "columnWidths", value: widths() 
 const headCells = (tbl) => { const cells = [...tbl.tHead.rows[0].cells].filter((th) => !th.classList.contains("ck")); return [cells, cells.pop()]; };
 const visible = (el) => getComputedStyle(el).display !== "none";
 const COL_MIN = 110;
+const TEXT_W_CACHE = new Map();
 function fitColumns() {
   const tbl = $("content").querySelector("table[data-view]");
   if (!tbl) return;
@@ -5381,18 +5382,24 @@ function fitColumns() {
   // Containers) must not wait for a drag — otherwise a long tag pushes Actions off.
   if (!w && !cells.some((th) => fixed(th) || th.dataset.share)) { for (const th of [...cells, last]) th.style.removeProperty("width"); return; }
   if (!tbl.classList.contains("sized")) tbl.classList.add("sized"); // add() rewrites the attribute even when it's there
-  const box = getComputedStyle(tbl.parentElement);
+  // Read phase: gather all layout metrics before mutating any column widths.
+  const parent = tbl.parentElement;
+  const clientW = parent.clientWidth;
+  const box = getComputedStyle(parent);
   // Actions take what their buttons need, not a saved width: a saved one can be stale or inflated.
   const lastW = actionsWidth(tbl) || w?.last || 0;
-  const ck = tbl.tHead.rows[0].querySelector("th.ck")?.offsetWidth || 0;
-  // A fixed column: its longest value or its heading, whichever is wider, with the cell's padding.
-  // Each column's own padding: the first one beside the boxes has less on its left than the rest.
-  const pad = (th) => { const cs = getComputedStyle(th); return parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight); };
-  // The heading's room includes its sort arrow (th .arrow: 10px wide, 3px margin) even when not sorted.
-  const fixedPx = (th) => Math.ceil(Math.max(textWidth(tbl, th.dataset.fixed) + (+th.dataset.extra || 0), textWidth(tbl, th.firstChild?.textContent || "", th) + 14) + pad(th));
-  const taken = cells.reduce((a, th) => a + (visible(th) && fixed(th) ? fixedPx(th) : 0), 0);
-  const room = tbl.parentElement.clientWidth - parseFloat(box.paddingLeft) - parseFloat(box.paddingRight) - lastW - ck - taken;
-  const share = (th, i) => (fixed(th) || !visible(th) ? 0 : w ? w.cols[i] : +th.dataset.share || 1);
+  const ckEl = tbl.tHead.rows[0].querySelector("th.ck");
+  const ck = ckEl ? ckEl.offsetWidth : 0;
+  const vis = cells.map((th) => visible(th));
+  const fixedW = cells.map((th, i) => {
+    if (!vis[i] || !fixed(th)) return 0;
+    const cs = getComputedStyle(th);
+    const pad = parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight);
+    return Math.ceil(Math.max(textWidth(tbl, th.dataset.fixed) + (+th.dataset.extra || 0), textWidth(tbl, th.firstChild?.textContent || "", th) + 14) + pad);
+  });
+  const taken = fixedW.reduce((a, v) => a + v, 0);
+  const room = clientW - parseFloat(box.paddingLeft) - parseFloat(box.paddingRight) - lastW - ck - taken;
+  const share = (th, i) => (fixed(th) || !vis[i] ? 0 : w ? w.cols[i] : +th.dataset.share || 1);
   const total = cells.reduce((a, th, i) => a + share(th, i), 0) || 1;
   // No column narrower than COL_MIN: the room it needs comes off the wider ones.
   // When there isn't room for every column at COL_MIN (wide Actions, as a failed
@@ -5407,34 +5414,59 @@ function fitColumns() {
   // (the table spreads any rest over every column, the boxes' too).
   const left = Math.floor(room) - fits.reduce((a, v) => a + v, 0), widest = fits.indexOf(Math.max(...fits));
   if (left > 0 && left < fits.length && widest >= 0 && !fixed(cells[widest])) fits[widest] += left;
-  cells.forEach((th, i) => {
-    const px = `${fixed(th) ? fixedPx(th) : fits[i]}px`;
-    if (th.style.width !== px) th.style.width = px;
-  });
-  if (last.style.width !== `${lastW}px`) last.style.width = `${lastW}px`;
+  // Write phase: mutate styles only when a width actually changes.
+  for (let i = 0; i < cells.length; i++) {
+    const th = cells[i], val = `${fixed(th) ? fixedW[i] : fits[i]}px`;
+    if (th.style.width !== val) th.style.width = val;
+  }
+  const lastPx = `${lastW}px`;
+  if (last.style.width !== lastPx) last.style.width = lastPx;
 }
 // How wide a text is in a row's cell (or in a heading, with its capitals and spacing).
 function textWidth(tbl, text, inside) {
+  const key = `${prefs.scale || 1}|${prefs.font || ""}|${inside ? "th" : "td"}|${text}`;
+  const cached = TEXT_W_CACHE.get(key);
+  if (cached !== undefined) return cached;
   const m = document.createElement("span");
   m.style.cssText = "position:absolute;visibility:hidden;white-space:nowrap";
   m.textContent = text;
   (inside || tbl.tBodies[0]?.rows[0]?.cells[1] || tbl).appendChild(m);
   const w = m.offsetWidth;
   m.remove();
+  if (w > 0) TEXT_W_CACHE.set(key, w);
   return w;
 }
 /* The widest row of buttons in the last column, with the cell's padding: what it needs to show them all.
    It adds up the buttons themselves: the row fills its cell, so its own width is the column's, not the need. */
 function actionsWidth(tbl) {
-  let need = 0;
-  for (const row of tbl.tBodies[0]?.rows || []) {
-    const td = row.cells[row.cells.length - 1], inner = td?.classList.contains("actions") && td.firstElementChild;
+  const rows = tbl.tBodies[0]?.rows;
+  if (!rows || !rows.length) return 0;
+  let need = 0, padX = -1, gap = 0, fade = 0;
+  const seen = new Set();
+  for (let r = 0; r < rows.length; r++) {
+    const cells = rows[r].cells, td = cells[cells.length - 1];
+    const inner = td?.classList.contains("actions") && td.firstElementChild;
     if (!inner) continue;
-    const pad = getComputedStyle(td), rs = getComputedStyle(inner), kids = [...inner.children];
-    const buttons = kids.reduce((a, b) => a + b.offsetWidth, 0) + (parseFloat(rs.columnGap) || 0) * Math.max(0, kids.length - 1);
-    // The row's own padding too: the fade on its left (td.actions .acts-row) is part of what it takes.
-    const fade = (parseFloat(rs.paddingLeft) || 0) + (parseFloat(rs.paddingRight) || 0);
-    need = Math.max(need, Math.ceil(buttons + fade + parseFloat(pad.paddingLeft) + parseFloat(pad.paddingRight)));
+    const kids = inner.children, klen = kids.length;
+    if (!klen) continue;
+    let sig = `${klen}`;
+    for (let k = 0; k < klen; k++) {
+      const b = kids[k];
+      sig += `|${b.className}:${b.textContent}`;
+    }
+    if (seen.has(sig)) continue;
+    seen.add(sig);
+    if (padX < 0) {
+      const pad = getComputedStyle(td), rs = getComputedStyle(inner);
+      padX = (parseFloat(pad.paddingLeft) || 0) + (parseFloat(pad.paddingRight) || 0);
+      gap = parseFloat(rs.columnGap) || 0;
+      // The row's own padding too: the fade on its left (td.actions .acts-row) is part of what it takes.
+      fade = (parseFloat(rs.paddingLeft) || 0) + (parseFloat(rs.paddingRight) || 0);
+    }
+    let buttons = gap * Math.max(0, klen - 1);
+    for (let k = 0; k < klen; k++) buttons += kids[k].offsetWidth;
+    const w = Math.ceil(buttons + fade + padX);
+    if (w > need) need = w;
   }
   return need;
 }
@@ -5443,8 +5475,10 @@ function actionsWidth(tbl) {
 function spanRows() {
   const tbl = $("content").querySelector("table[data-view]");
   if (!tbl) return;
+  const fills = tbl.querySelectorAll("td[data-fill]");
+  if (!fills.length) return;
   const n = [...tbl.tHead.rows[0].cells].filter(visible).length;
-  for (const td of tbl.querySelectorAll("td[data-fill]")) {
+  for (const td of fills) {
     const rest = [...td.parentElement.cells].reduce((a, c) => a + (c === td || !visible(c) ? 0 : c.colSpan), 0);
     const span = Math.max(1, n - rest);
     if (td.colSpan !== span) td.colSpan = span;
@@ -10622,30 +10656,56 @@ function morph(el, html) {
   t.innerHTML = html;
   morphKids(el, t);
 }
-const morphKey = (n) => n.nodeType === 1 ? n.dataset.shrow ?? n.dataset.shname ?? n.dataset.key ?? "" : "";
+const morphKey = (n) => (n.nodeType === 1 ? n.dataset.shrow ?? n.dataset.shname ?? n.dataset.key ?? "" : "");
 function morphKids(a, b) {
   // A select's button (ssWrap) isn't in the markup: it goes back before its select, focus and all.
-  const bs = [...a.children].filter((x) => x.ssOf);
-  if (bs.length) {
+  let bs = null;
+  for (let n = a.firstElementChild; n; n = n.nextElementSibling) {
+    if (n.ssOf) (bs ||= []).push(n);
+  }
+  if (bs) {
     const on = document.activeElement;
-    bs.forEach((x) => x.remove());
+    for (let i = 0; i < bs.length; i++) bs[i].remove();
     morphKids(a, b);
-    for (const x of bs) if (x.ssOf.parentNode === a) { x.ssOf.before(x); if (x === on) x.focus(); }
+    for (let i = 0; i < bs.length; i++) { const x = bs[i]; if (x.ssOf.parentNode === a) { x.ssOf.before(x); if (x === on) x.focus(); } }
+    return;
+  }
+  // Fast path: non-keyed parent (99% of cells/divs/spans/svgs) avoids Map/Set allocations.
+  let hasKey = false;
+  for (let x = a.firstChild; x; x = x.nextSibling) { if (morphKey(x)) { hasKey = true; break; } }
+  if (!hasKey) {
+    for (let y = b.firstChild; y; y = y.nextSibling) { if (morphKey(y)) { hasKey = true; break; } }
+  }
+  if (!hasKey) {
+    let x = a.firstChild;
+    while (b.firstChild) {
+      const y = b.firstChild;
+      if (x) {
+        const next = x.nextSibling;
+        morphNode(x, y);
+        if (y.parentNode === b) y.remove();
+        x = next;
+      } else {
+        a.appendChild(y);
+      }
+    }
+    while (x) { const next = x.nextSibling; x.remove(); x = next; }
     return;
   }
   const keyed = new Map();
-  for (const x of a.childNodes) { const k = morphKey(x); if (k) keyed.set(k, x); }
+  for (let x = a.firstChild; x; x = x.nextSibling) { const k = morphKey(x); if (k) keyed.set(k, x); }
   const bn = [...b.childNodes];
   // Rows that are gone go first: left in place, each row after them was moved up one by one (a
   // folded project's members, a removed container), every move a layout of the list.
-  const kept = new Set(bn.map(morphKey));
+  const kept = new Set();
+  for (let i = 0; i < bn.length; i++) { const k = morphKey(bn[i]); if (k) kept.add(k); }
   for (const [k, x] of keyed) if (!kept.has(k)) { x.remove(); keyed.delete(k); }
-  bn.forEach((y, i) => {
-    const at = a.childNodes[i] || null, k = morphKey(y), x = k && keyed.get(k);
+  for (let i = 0; i < bn.length; i++) {
+    const y = bn[i], at = a.childNodes[i] || null, k = morphKey(y), x = k && keyed.get(k);
     if (x) { keyed.delete(k); if (x !== at) a.insertBefore(x, at); morphNode(x, y); }
     else if (at && !morphKey(at)) morphNode(at, y);
     else a.insertBefore(y, at);
-  });
+  }
   while (a.childNodes.length > bn.length) a.lastChild.remove();
 }
 function morphNode(x, y) {
@@ -10662,8 +10722,9 @@ function morphNode(x, y) {
   else if (x.nodeName === "TH" && x.style.width && !y.hasAttribute("style")) y.style.width = x.style.width;
   else if (x.nodeName === "TD" && x.hasAttribute("data-fill") && y.hasAttribute("data-fill")) y.colSpan = x.colSpan;
   if (x.isEqualNode(y)) return;
-  for (const { name } of [...x.attributes]) if (!y.hasAttribute(name)) x.removeAttribute(name);
-  for (const { name, value } of [...y.attributes]) if (x.getAttribute(name) !== value) x.setAttribute(name, value);
+  const xa = x.attributes, ya = y.attributes;
+  for (let i = xa.length - 1; i >= 0; i--) { const n = xa[i].name; if (!y.hasAttribute(n)) x.removeAttribute(n); }
+  for (let i = 0; i < ya.length; i++) { const a = ya[i]; if (x.getAttribute(a.name) !== a.value) x.setAttribute(a.name, a.value); }
   morphKids(x, y);
 }
 
