@@ -4762,22 +4762,24 @@ function table(head, rows, view, last = `<th class="r">${tr("Actions")}</th>`, a
   const tbl = el.firstElementChild;
   // Fast incremental row patch: when the table shell, header, and footer match,
   // reuse every row whose HTML string is unchanged without innerHTML parsing or isEqualNode.
-  if (tbl && tbl === el._listEl && tbl.tagName === "TABLE" && tbl.dataset.view === view && el._headHtml === headHtml && el._afterHtml === after && rows.length) {
+  if (tbl && tbl === el._listEl && tbl.tagName === "TABLE" && tbl.dataset.view === view && el._headHtml === headHtml && el._afterHtml === after && (!after ? el.children.length === 1 : true) && rows.length) {
     const tbody = tbl.tBodies[0];
     if (tbody) {
       let allKeyed = true;
       const keys = new Array(rows.length);
       for (let i = 0; i < rows.length; i++) {
         const k = rowKeyOf(rows[i]);
-        if (!k) { allKeyed = false; break; }
+        if (!k || rows[i].indexOf("<tr", 3) !== -1) { allKeyed = false; break; }
         keys[i] = k;
       }
       if (allKeyed) {
         const byKey = new Map();
         for (let r = tbody.firstElementChild; r; r = r.nextElementSibling) {
           const k = r.dataset.key;
-          if (k) byKey.set(k, r);
+          if (!k) { allKeyed = false; break; }
+          byKey.set(k, r);
         }
+        if (allKeyed) {
         const dirtyIdx = [], dirtyHtml = [];
         const target = new Array(rows.length);
         for (let i = 0; i < rows.length; i++) {
@@ -4818,6 +4820,7 @@ function table(head, rows, view, last = `<th class="r">${tr("Actions")}</th>`, a
         spanRows();
         fitColumns();
         return;
+        }
       }
     }
   }
@@ -6479,8 +6482,7 @@ function renderUsbBody() {
     <td><span class="pill ${cls}">${word}</span></td>
     <td class="muted">${d.state === "kiri" && d.since ? ago(d.since) : "—"}</td>
     <td class="actions"><div class="acts-row">${act(d)}</div></td></tr>${open ? usbMore(d) : ""}`;
-  }), "usb");
-  if (u.note) c.insertAdjacentHTML("beforeend", `<p class="usb-note muted">${esc(u.note)}</p>`);
+  }), "usb", undefined, u.note ? `<p class="usb-note muted">${esc(u.note)}</p>` : "");
 }
 
 /* A device's details, under its row: what it is, where it is, since when, and how
