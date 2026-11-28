@@ -2925,14 +2925,36 @@ const ctrState = (c) => (c.State === "running" || c.State === "paused" ? "runnin
 /* The status pill, marked so the ticker below can redraw its text alone. */
 const statusPill = (c) => `<span class="pill ${esc(c.State)}${exitClass(c)}" data-live="${esc(c.Id)}" title="${esc(statusTitle(c))}">${esc(statusText(c))}</span>`;
 /* Every second, the live pills' text: nothing else is redrawn. */
+let livePills = null, livePillsDirty = true;
+const liveBucket = (c, nowSec) => {
+  const ts = c.State === "exited" ? c.KiriFinishedAt : (c.State === "running" || c.State === "paused") ? c.KiriStartedAt : 0;
+  if (!ts) return -1;
+  const s = Math.max(0, Math.floor(nowSec - ts));
+  if (s < 60) return s;
+  if (s < 3600) return 60 + Math.floor(s / 60);
+  if (s < 86400) return 120 + Math.floor(s / 3600);
+  return 200 + Math.floor(s / 86400);
+};
 setInterval(() => {
+  if (livePillsDirty || !livePills) {
+    livePills = [...document.querySelectorAll("[data-live]")].map((el) => ({ el, id: el.dataset.live, runUp: el.classList.contains("run-up"), bucket: -2, lang: "", c: null }));
+    livePillsDirty = false;
+  }
+  if (!livePills.length) return;
+  const byId = ui.containerById, nowSec = Date.now() / 1000, curLang = LANG;
   let refit = false;
-  for (const el of document.querySelectorAll("[data-live]")) {
-    const c = ui.containers.find((x) => x.Id === el.dataset.live);
-    const text = c && statusText(c);
+  for (let i = 0; i < livePills.length; i++) {
+    const item = livePills[i], el = item.el;
+    if (!el.isConnected) { livePillsDirty = true; continue; }
+    const c = byId ? byId.get(item.id) : ui.containers.find((x) => x.Id === item.id);
+    if (!c) continue;
+    const b = liveBucket(c, nowSec);
+    if (b >= 0 && b === item.bucket && item.lang === curLang && item.c === c) continue;
+    item.bucket = b; item.lang = curLang; item.c = c;
+    const text = statusText(c);
     // Run's "Up 9 s" grows as it counts (10 s, 1 min): the Actions column grows with it.
-    if (text && el.textContent !== text) { if (el.textContent.length !== text.length && el.matches(".run-up")) refit = true; el.textContent = text; }
-    const title = c && statusTitle(c);
+    if (text && el.textContent !== text) { if (item.runUp && el.textContent.length !== text.length) refit = true; el.textContent = text; }
+    const title = c.State !== "exited" ? text : statusTitle(c);
     if (title && el.title !== title) el.title = title;
   }
   if (refit) fitColumns();
@@ -5319,6 +5341,7 @@ function table(head, rows, view, last = `<th class="r">${tr("Actions")}</th>`, a
   if (html === el._list && el.firstElementChild === el._listEl) return;
   const keep = rowSlot();
   morph(el, html);
+  livePillsDirty = true;
   el._list = html; el._listEl = el.firstElementChild;
   rowSlot(keep);
   spanRows();
@@ -7618,6 +7641,7 @@ function navTags() {
 addEventListener("resize", navTags);
 function render() {
   if (held(render)) return;
+  livePillsDirty = true;
   schedulePlaceFloats();
   if (ui.view !== "compose") cmpHWait(false);
   if (langPopState.close) queueMicrotask(() => { if (langPopState.close && !$("pref-lang-btn")) langPopState.close(false); });
@@ -8801,7 +8825,7 @@ window.kiri = {
         // docker build's BuildKit workers (buildx names them buildx_buildkit_<builder>N) are
         // the build machinery, not containers anyone ran: neither is listed. Nor is the
         // rest of the builder (its image, its cache volume) in Images and Volumes.
-        ui.containers = (e.containers || []).filter((c) => !c.Labels?.["io.kiri.probe"] && !isBuildWorker(c)); oomCheck(); starCheck(); ui.builderImage = (e.images || []).find(isBuilderImage) || null; ui.builderVolume = (e.volumes || []).find(isBuilderVolume) || null;
+        ui.containers = (e.containers || []).filter((c) => !c.Labels?.["io.kiri.probe"] && !isBuildWorker(c)); ui.containerById = new Map(ui.containers.map((c) => [c.Id, c])); livePillsDirty = true; oomCheck(); starCheck(); ui.builderImage = (e.images || []).find(isBuilderImage) || null; ui.builderVolume = (e.volumes || []).find(isBuilderVolume) || null;
         ui.images = (e.images || []).filter((i) => !isBuilderImage(i)); ui.volumes = (e.volumes || []).filter((v) => !isBuilderVolume(v)); ui.networks = e.networks || [];
         if (!kept("volumes").length) { ui.volSizes = {}; ui.volSizesKey = ""; ui.volSizesAt = 0; ui.volSizesInFlight = 0; ui.volSizesLoading = false; }
         else if (ui.view === "volumes") requestVolumeSizes();
