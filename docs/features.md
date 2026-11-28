@@ -21,7 +21,11 @@ Apple silicon and Intel Macs (macOS 14+), Windows 10 and 11 (x86-64 and Arm, thr
   privileged and unconfined containers keep the host boundary: no vsock
   sockets (the way to the Mac) and no io_uring
 - **Networking**: a default bridge, user networks with DNS by name and
-  alias, `network connect`/`disconnect` (as with Docker, a container can
+  alias, `--internal` networks (with
+  `-o com.docker.network.bridge.gateway_mode_ipv4=isolated`, or
+  `inhibit_ipv4=true`, the bridge has no IPv4 address, so the host isn't on
+  the network for its containers to reach; the IPv6 counterpart is refused
+  for now), `network connect`/`disconnect` (as with Docker, a container can
   leave any of its networks, its first one too: another of its networks
   then gives its default route, and with none left it has no network, as
   with `--network none`; to leave its first network a running container is

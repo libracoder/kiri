@@ -389,6 +389,67 @@ fn checked_options(options: serde_json::Value) -> Result<serde_json::Value, Stri
     Ok(serde_json::Value::Object(map))
 }
 
+/// `--opt com.docker.network.bridge.gateway_mode_ipv4=isolated` (Docker
+/// 28): the bridge gets no IPv4 address, so the host has none on an
+/// internal network for its containers to reach (#1001).
+pub const GATEWAY_MODE4_OPT: &str = "com.docker.network.bridge.gateway_mode_ipv4";
+/// `gateway_mode_ipv4`'s IPv6 counterpart.
+pub const GATEWAY_MODE6_OPT: &str = "com.docker.network.bridge.gateway_mode_ipv6";
+/// `--opt com.docker.network.bridge.inhibit_ipv4=true`: on an internal
+/// network the same as `gateway_mode_ipv4=isolated`, as in Docker.
+pub const INHIBIT_IPV4_OPT: &str = "com.docker.network.bridge.inhibit_ipv4";
+
+/// An option's value as Docker reads it: a string (`--opt` gives only those).
+fn opt_str<'a>(options: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    options.get(key).map(|v| v.as_str().unwrap_or("?"))
+}
+
+/// Go's `strconv.ParseBool`, which Docker reads `inhibit_ipv4` with.
+fn go_bool(v: &str) -> Option<bool> {
+    match v {
+        "1" | "t" | "T" | "true" | "TRUE" | "True" => Some(true),
+        "0" | "f" | "F" | "false" | "FALSE" | "False" => Some(false),
+        _ => None,
+    }
+}
+
+/// The gateway options, checked as Docker's bridge driver checks them:
+/// a known mode, a boolean `inhibit_ipv4`, and `isolated` only on an
+/// internal network. Kiri gives every other mode the default (`nat`), as
+/// before. An isolated IPv6 gateway isn't done yet, so a network with IPv6
+/// is refused it rather than given one anyway.
+fn checked_gateway_options(options: &serde_json::Value, internal: bool, ipv6: bool) -> Result<(), String> {
+    let mut isolated = [false; 2];
+    for (i, key) in [GATEWAY_MODE4_OPT, GATEWAY_MODE6_OPT].into_iter().enumerate() {
+        match opt_str(options, key) {
+            None | Some("" | "nat" | "nat-unprotected" | "routed") => {}
+            Some("isolated") => isolated[i] = true,
+            Some(v) => return Err(format!("failed to parse {key} value: {v} (unknown gateway mode {v})")),
+        }
+    }
+    if let Some(v) = opt_str(options, INHIBIT_IPV4_OPT)
+        && go_bool(v).is_none()
+    {
+        return Err(format!("failed to parse {INHIBIT_IPV4_OPT} value: {v} (strconv.ParseBool: parsing {v:?}: invalid syntax)"));
+    }
+    if isolated.contains(&true) && !internal {
+        return Err("gateway mode 'isolated' can only be used for an internal network".into());
+    }
+    if isolated[1] && ipv6 {
+        return Err(format!("Kiri does not support {GATEWAY_MODE6_OPT}=isolated yet: the bridge would still have its IPv6 address. Leave it out, or use an IPv4-only internal network with {GATEWAY_MODE4_OPT}=isolated"));
+    }
+    Ok(())
+}
+
+impl Network {
+    /// Whether the bridge has no IPv4 address (`gateway_mode_ipv4=isolated`,
+    /// or `inhibit_ipv4` on an internal network): the host is not on the
+    /// network, and its containers ask Kiri's resolver at 127.0.0.11.
+    pub fn no_gateway4(&self) -> bool {
+        self.internal && (opt_str(&self.options, GATEWAY_MODE4_OPT) == Some("isolated") || opt_str(&self.options, INHIBIT_IPV4_OPT).and_then(go_bool) == Some(true))
+    }
+}
+
 /// A network's options as inspect shows them: a bridge name that is not the
 /// bridge's own (kept by a Kiri that did not refuse it) is left out.
 pub fn shown_options(n: &Network) -> serde_json::Value {
@@ -728,6 +789,7 @@ impl Networks {
             return Err("invalid network config: IPv4 or IPv6 must be enabled".into());
         }
         let options = checked_options(s.options.clone())?;
+        checked_gateway_options(&options, s.internal, s.ipv6)?;
         if s.no_ipv4 && s.ipam.is_some() {
             return Err("invalid network config: an IPv4 subnet was given, but IPv4 is disabled (--ipv4=false)".into());
         }
@@ -1356,6 +1418,44 @@ mod tests {
         assert!(n.create("neither", Settings { no_ipv4: true, ..Default::default() }).unwrap_err().contains("IPv4 or IPv6 must be enabled"));
         let ipam = parse_ipam(&serde_json::json!({"Config": [{"Subnet": "10.77.0.0/24"}]})).unwrap();
         assert!(n.create("both", Settings { no_ipv4: true, ipam, ..v6(None) }).unwrap_err().contains("IPv4 is disabled"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `gateway_mode_ipv4=isolated` (and `inhibit_ipv4` on an internal
+    /// network) leaves the host off the network (#1001), with Docker's own
+    /// checks: `isolated` only on an internal network, a known mode, a
+    /// boolean. The other modes are kept as before.
+    #[test]
+    fn an_isolated_gateway_is_for_internal_networks_only() {
+        let (mut n, dir) = nets();
+        let with = |internal: bool, opts: serde_json::Value| Settings { internal, options: opts, ..Default::default() };
+        let iso = n.create("iso", with(true, serde_json::json!({GATEWAY_MODE4_OPT: "isolated"}))).unwrap();
+        assert!(iso.no_gateway4());
+        assert!(n.create("inhibit", with(true, serde_json::json!({INHIBIT_IPV4_OPT: "true"}))).unwrap().no_gateway4());
+        assert!(!n.create("inhibit-off", with(true, serde_json::json!({INHIBIT_IPV4_OPT: "false"}))).unwrap().no_gateway4());
+        assert!(!n.create("plain-internal", with(true, serde_json::json!({}))).unwrap().no_gateway4());
+        // Outside an internal network inhibit_ipv4 is kept, as before: Docker
+        // leaves such a bridge to be set up by hand, which Kiri doesn't do.
+        assert!(!n.create("inhibit-outside", with(false, serde_json::json!({INHIBIT_IPV4_OPT: "true"}))).unwrap().no_gateway4());
+        for mode in ["nat", "nat-unprotected", "routed"] {
+            let made = n.create(&format!("m-{mode}"), with(false, serde_json::json!({GATEWAY_MODE4_OPT: mode}))).unwrap();
+            assert!(!made.no_gateway4() && made.options[GATEWAY_MODE4_OPT] == mode, "{mode}");
+        }
+        let refused = [
+            (with(false, serde_json::json!({GATEWAY_MODE4_OPT: "isolated"})), "gateway mode 'isolated' can only be used for an internal network".to_owned()),
+            (with(false, serde_json::json!({GATEWAY_MODE6_OPT: "isolated"})), "gateway mode 'isolated' can only be used for an internal network".to_owned()),
+            (with(true, serde_json::json!({GATEWAY_MODE4_OPT: "closed"})), format!("failed to parse {GATEWAY_MODE4_OPT} value: closed (unknown gateway mode closed)")),
+            (with(true, serde_json::json!({INHIBIT_IPV4_OPT: "yes"})), format!("failed to parse {INHIBIT_IPV4_OPT} value: yes (strconv.ParseBool: parsing \"yes\": invalid syntax)")),
+        ];
+        for (i, (settings, want)) in refused.into_iter().enumerate() {
+            assert_eq!(n.create(&format!("bad{i}"), settings).unwrap_err(), want);
+            assert!(n.find(&format!("bad{i}")).is_none(), "nothing made");
+        }
+        // An isolated IPv6 gateway isn't done: refused on a network with IPv6,
+        // and nothing to do on one without.
+        let e = n.create("iso6", Settings { internal: true, options: serde_json::json!({GATEWAY_MODE6_OPT: "isolated"}), ..v6(None) }).unwrap_err();
+        assert!(e.starts_with("Kiri does not support com.docker.network.bridge.gateway_mode_ipv6=isolated yet"), "{e}");
+        assert!(n.create("iso6-v4only", with(true, serde_json::json!({GATEWAY_MODE4_OPT: "isolated", GATEWAY_MODE6_OPT: "isolated"}))).unwrap().no_gateway4());
         let _ = std::fs::remove_dir_all(dir);
     }
 
