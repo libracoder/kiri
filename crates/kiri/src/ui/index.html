@@ -3735,7 +3735,13 @@ function levelOf(line) {
   if (/\b(info|notice)\b/i.test(l)) return "info";
   return "";
 }
-const shown = (div, f, lvl) => (!f || div.textContent.toLowerCase().includes(f)) && (!lvl || div.dataset.lvl === lvl);
+const shown = (div, f, lvl) => {
+  if (lvl && (div._lvl ?? div.dataset.lvl) !== lvl) return false;
+  if (!f) return true;
+  let lc = div._lc;
+  if (lc === undefined) div._lc = lc = div.textContent.toLowerCase();
+  return lc.indexOf(f) !== -1;
+};
 const LOG_LEVEL_OPTS = () => [["", tr("All levels")], ["error", tr("Error")], ["warn", tr("Warn")], ["info", tr("Info")], ["debug", tr("Debug")]];
 function logToolbarHtml({ prefix, filter, level, follow, left = "", right = "", reloadAttr = "", clearAttr }) {
   return `<div class="logbar">${left}<input class="field" id="${prefix}-filter" placeholder="${tr("Find in logs")}" spellcheck="false" value="${esc(filter)}">
@@ -3752,43 +3758,64 @@ function updateLogCount(el, countId, d) {
   cnt.textContent = d.logFilter || d.logLevel ? tr("{showing} of {all} lines", { showing: showing.toLocaleString(), all: all.toLocaleString() }) : tr("{all} lines", { all: all.toLocaleString() });
 }
 function appendLogParts(el, countId, d, partial, nextN, parts) {
-  const atEnd = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+  const atEnd = d.follow && parts.length <= 50 && (el.scrollHeight - el.scrollTop - el.clientHeight < 40);
   const filter = d.logFilter.toLowerCase(), level = d.logLevel;
   const frag = document.createDocumentFragment();
   let addedShown = 0;
-  for (const p of parts) {
+  for (let pi = 0; pi < parts.length; pi++) {
+    const p = parts[pi];
     const key = Boolean(p.e);
-    const lines = ((partial[key] || "") + p.t.replace(ansi, "").replace(/\r\n/g, "\n")).split("\n");
+    let txt = p.t;
+    if (txt.indexOf("\x1b") !== -1) txt = txt.replace(ansi, "");
+    if (txt.indexOf("\r") !== -1) txt = txt.replace(/\r\n/g, "\n");
+    const prefix = partial[key];
+    const lines = (prefix ? prefix + txt : txt).split("\n");
     partial[key] = lines.pop();
-    for (const line of lines) {
+    for (let li = 0; li < lines.length; li++) {
+      const line = lines[li];
       const div = document.createElement("div");
       const lvl = levelOf(line);
-      div.dataset.lvl = lvl || "none";
+      const lvlKey = lvl || "none";
+      div._lvl = lvlKey;
+      div.dataset.lvl = lvlKey;
       if (lvl && lvl !== "info") div.className = `lvl-${lvl}`;
       else if (p.e) div.className = "err";
       div.textContent = line || " ";
       div.dataset.n = nextN();
-      if (shown(div, filter, level)) addedShown++;
-      else div.classList.add("hide");
-      frag.append(div);
+      if (!filter && !level) {
+        addedShown++;
+      } else {
+        if (filter) div._lc = (line || " ").toLowerCase();
+        if (shown(div, filter, level)) addedShown++;
+        else div.classList.add("hide");
+      }
+      frag.appendChild(div);
     }
   }
   el._shown = (el._shown ?? el.childElementCount) + addedShown;
-  el.append(frag);
+  el.appendChild(frag);
   while (el.childElementCount > LOG_MAX) {
     if (!el.firstElementChild.classList.contains("hide")) el._shown--;
     el.firstElementChild.remove();
   }
-  if (d.follow && atEnd || d.follow && parts.length > 50) el.scrollTop = el.scrollHeight;
+  if (d.follow && (atEnd || parts.length > 50)) el.scrollTop = el.scrollHeight;
   updateLogCount(el, countId, d);
 }
 function applyLogFilter(el, countId, d) {
-  const f = d.logFilter.toLowerCase();
+  const f = d.logFilter.toLowerCase(), lvl = d.logLevel;
+  const kids = el.children;
+  if (!f && !lvl) {
+    for (let i = 0; i < kids.length; i++) kids[i].classList.remove("hide");
+    el._shown = kids.length;
+    updateLogCount(el, countId, d);
+    return;
+  }
   let visCount = 0;
-  for (const div of el.children) {
-    const vis = shown(div, f, d.logLevel);
-    div.classList.toggle("hide", !vis);
-    if (vis) visCount++;
+  for (let i = 0; i < kids.length; i++) {
+    const div = kids[i];
+    const vis = shown(div, f, lvl);
+    if (vis) { div.classList.remove("hide"); visCount++; }
+    else div.classList.add("hide");
   }
   el._shown = visCount;
   updateLogCount(el, countId, d);
@@ -7511,15 +7538,22 @@ function setHTML(el, html) {
 }
 const setText = (el, text) => { if (el && el.textContent !== text) el.textContent = text; };
 
-function renderStatus() {
+function renderStatus(preMemTitle) {
   const sb = $("statusbar");
   if (!sb) return;
-  const running = ui.containers.filter((c) => c.State === "running");
-  const k8s = ui.containers.find((c) => c.Names?.[0] === "/kiri-k8s" && c.State === "running");
+  let runningN = 0, k8s = null;
+  for (let i = 0; i < ui.containers.length; i++) {
+    const c = ui.containers[i];
+    if (c.State === "running") {
+      runningN++;
+      if (!k8s && c.Names?.[0] === "/kiri-k8s") k8s = c;
+    }
+  }
   const k8sVersion = k8s ? (k8s.Image.split(":")[1] || "").replace(/-k3s\d+$/, "") : "";
   const { shown: vshown } = engineShown();
   const vmText = { running: tr("{vm} running", { vm: tr(VM) }), stopped: tr("{vm} off", { vm: tr(VM) }), booting: tr("Starting…"), stopping: tr("Stopping…"), restarting: tr("Restarting…") }[vshown] || vshown;
   const mem = ui.mem ? tr("{used} of {total}", { used: memText(ui.mem.used), total: `${Math.round(ui.mem.ceiling / 1024)} GB` }) : "";
+  const mt = ui.vm === "running" && mem ? (preMemTitle ?? memTitle()) : "";
   const parts = [
     `<span class="item">${KDOT}<span>Kiri ${esc(ui.status?.version || "")}</span>${ui.status?.dev ? `<span class="dev" title="${tr("{app}: its own engine, containers and settings", { app: esc(ui.status?.app || "Kiri Dev") })}">DEV</span>` : ""}</span>`,
     usageItem(),
@@ -7529,15 +7563,21 @@ function renderStatus() {
     `<span class="grow"></span>`,
     shareOn() ? shStatusItem() : "",
     `<span class="item"><i class="dot ${esc(vshown)}"></i>${esc(vmText)}</span>`,
-    ui.vm === "running" ? `<span class="sep">·</span><button data-status-go="containers" title="${tr("Show containers")}">${tr("{n} of {total} running", { n: running.length, total: ui.containers.length })}</button>` : "",
+    ui.vm === "running" ? `<span class="sep">·</span><button data-status-go="containers" title="${tr("Show containers")}">${tr("{n} of {total} running", { n: runningN, total: ui.containers.length })}</button>` : "",
     ui.vm === "running" && mem ? (memOut()
-      ? `<span class="sep">·</span><button class="item memfull" data-memmore title="${tr("{why}. Give the VM more memory in Settings → Resources", { why: esc(memTitle().replace(/[.。]$/, "")) })}">${MEM_IC}${tr("Memory full · {mem}", { mem })}</button>`
-      : `<span class="sep">·</span><span class="num" title="${esc(memTitle())}">${mem}</span>`) : "",
+      ? `<span class="sep">·</span><button class="item memfull" data-memmore title="${tr("{why}. Give the VM more memory in Settings → Resources", { why: esc(mt.replace(/[.。]$/, "")) })}">${MEM_IC}${tr("Memory full · {mem}", { mem })}</button>`
+      : `<span class="sep">·</span><span class="num" data-sb-mem title="${esc(mt)}">${mem}</span>`) : "",
     k8s ? `<span class="sep">·</span><span class="item"><svg class="k8s" viewBox="0 0 24 24" aria-hidden="true"><path d="${K8S_LOGO}"/></svg>Kubernetes ${esc(k8sVersion)}</span>` : "",
     ctxStatusItem(),
     `<span class="sep">·</span><button class="item" data-open-site="${FEEDBACK_URL}" title="${tr("Send an idea or report a bug on GitHub")}"><svg class="i" viewBox="0 0 256 256"><path d="${PH.chatdots}"/></svg>${tr("Feedback")}</button>`,
   ];
+  const prevFirst = sb._first;
   setHTML(sb, parts.join(""));
+  if (sb._first !== prevFirst || !sb._memEl || !sb.contains(sb._memEl)) {
+    sb._memEl = sb.querySelector("[data-sb-mem]");
+  }
+  sb._cRef = ui.containers;
+  sb._cLen = ui.containers.length;
 }
 
 /* Updates (design A): a card in the bottom-right corner offers a newer
@@ -8937,21 +8977,50 @@ window.kiri = {
   on(e) {
     switch (e.type) {
       case "state": setVm(e.state, e.error); break;
-      case "vm":
+      case "vm": {
         setText($("vm-running"), String(e.running ?? "—"));
         // The CPUs, and how busy they are together (an engine from before that reading sends none).
         // How busy, then how many: "4% · 1".
-        setHTML($("vm-cpus"), e.cpus == null ? "—" : `${e.awake && e.cpu_pct != null ? `<span class="pct">${pct(e.cpu_pct)} · </span>` : ""}${esc(e.cpus)}`);
+        const cpusEl = $("vm-cpus");
+        if (cpusEl && e.cpus != null && e.awake && e.cpu_pct != null) {
+          const pText = `${pct(e.cpu_pct)} · `, cText = String(e.cpus);
+          if (cpusEl._pctEl && cpusEl.contains(cpusEl._pctEl) && cpusEl._cntNode && cpusEl.contains(cpusEl._cntNode)) {
+            if (cpusEl._pctEl.textContent !== pText) cpusEl._pctEl.textContent = pText;
+            if (cpusEl._cntNode.nodeValue !== cText) cpusEl._cntNode.nodeValue = cText;
+            cpusEl._html = null;
+          } else {
+            setHTML(cpusEl, `<span class="pct">${pText}</span>${esc(cText)}`);
+            cpusEl._pctEl = cpusEl.firstElementChild;
+            cpusEl._cntNode = cpusEl.lastChild;
+          }
+        } else {
+          setHTML(cpusEl, e.cpus == null ? "—" : `${esc(e.cpus)}`);
+          if (cpusEl) { cpusEl._pctEl = null; cpusEl._cntNode = null; }
+        }
         // What the VM uses, of the most it may; asleep, it holds none.
+        const prevOut = memOut();
         ui.mem = { used: e.awake ? e.used_mib : 0, target: e.awake ? e.target_mib : 0, ceiling: e.ceiling_mib, stall: e.awake ? e.stall_pct || 0 : 0 };
         oomCount(e.awake ? e.oom_kills : null);
-        renderStatus();
+        const mt = memTitle();
+        const nextOut = memOut();
+        const sb = $("statusbar");
+        if (sb && sb._memEl && sb.contains(sb._memEl) && ui.vm === "running" && !prevOut && !nextOut && sb._cRef === ui.containers && sb._cLen === ui.containers.length) {
+          const mem = tr("{used} of {total}", { used: memText(ui.mem.used), total: `${Math.round(ui.mem.ceiling / 1024)} GB` });
+          if (sb._memEl.textContent !== mem) sb._memEl.textContent = mem;
+          if (sb._memEl.title !== mt) sb._memEl.title = mt;
+          sb._html = null;
+        } else {
+          renderStatus(mt);
+        }
         // A number keeps its unit and "/ 8 GB" stays together: a narrow card wraps only before the slash.
-        setText($("vm-mem"), `${memText(ui.mem.used).replace(" ", "\u00a0")} /\u00a0${(e.ceiling_mib / 1024).toFixed(0)}\u00a0GB`);
-        if ($("vm-mem").title !== memTitle()) $("vm-mem").title = memTitle();
+        const vmMem = $("vm-mem");
+        setText(vmMem, `${memText(ui.mem.used).replace(" ", "\u00a0")} /\u00a0${(e.ceiling_mib / 1024).toFixed(0)}\u00a0GB`);
+        if (vmMem && vmMem.title !== mt) vmMem.title = mt;
         const meter = `${(ui.mem.used / e.ceiling_mib * 100).toFixed(1)}%`;
-        if ($("vm-meter").style.width !== meter) $("vm-meter").style.width = meter;
+        const vmMeter = $("vm-meter");
+        if (vmMeter && vmMeter.style.width !== meter) vmMeter.style.width = meter;
         break;
+      }
       case "lists": {
         if (e.brands) mergeBrands(e.brands);
         // Links need the routers' ports: ask once the engine answers.
