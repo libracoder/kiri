@@ -41,12 +41,13 @@ t("a hostile label makes no address", () => {
   eq(localUrl(C("a", {}), "a b"), "", "container name");
 });
 t("the list shows the good addresses only", () => {
-  eq(opens(row("good")).includes("http://api.myapp.kiri.localhost"), true, "good row");
-  eq(opens(row("upper")).includes("http://api.shop.kiri.localhost"), true, "upper row");
+  const hasHost = (el, h) => opens(el).some((u) => { try { const p = new URL(u); return p.protocol === "http:" && p.host === h; } catch { return false; } });
+  eq(hasHost(row("good"), "api.myapp.kiri.localhost"), true, "good row");
+  eq(hasHost(row("upper"), "api.shop.kiri.localhost"), true, "upper row");
   for (const k of Object.keys(HOSTILE).map((k) => "h-" + k)) {
     const r = row(k);
     if (!r) throw new Error(`no row for ${k}`);
-    eq(opens(r).filter((u) => /kiri\.local/.test(u)), [], `${k}: an address`);
+    eq(opens(r).filter((u) => { try { return new URL(u).hostname !== "localhost"; } catch { return true; } }), [], `${k}: an address`);
     eq(r.querySelector(".sub-addr, .kbadge"), null, `${k}: address under the name or badge`);
   }
 });

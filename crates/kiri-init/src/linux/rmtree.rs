@@ -521,7 +521,6 @@ mod tests {
 
         let t2 = d.join("t2");
         fs::create_dir(&t2).unwrap();
-        let mut fds: Vec<OwnedFd> = Vec::with_capacity(1_200);
         let mut cur = open_at_raw(
             libc::AT_FDCWD,
             &CString::new(t2.as_os_str().as_bytes()).unwrap(),
@@ -542,6 +541,7 @@ mod tests {
                         libc::O_CREAT | libc::O_WRONLY | libc::O_CLOEXEC,
                         0o400,
                     );
+                    assert!(f >= 0);
                     libc::close(f);
                     assert_eq!(
                         libc::symlinkat(outside_c.as_ptr(), cur.as_raw_fd(), c"sym_out".as_ptr()),
@@ -555,16 +555,14 @@ mod tests {
                 libc::O_RDONLY | libc::O_DIRECTORY,
             )
             .unwrap();
-            fds.push(cur);
+            let mode = if i % 2 == 0 { 0o000 } else { 0o500 };
+            // SAFETY: valid owned directory fd; `next` is already open so `cur` can lock & close now (O(1) FDs).
+            assert_eq!(unsafe { libc::fchmod(cur.as_raw_fd(), mode) }, 0);
             cur = next;
         }
-        fds.push(cur);
-        // Lock permissions bottom-up to alternating 0000 and 0500!
-        for (i, fd) in fds.into_iter().enumerate().rev() {
-            let mode = if i % 2 == 0 { 0o000 } else { 0o500 };
-            // SAFETY: valid owned directory fd.
-            assert_eq!(unsafe { libc::fchmod(fd.as_raw_fd(), mode) }, 0);
-        }
+        // SAFETY: valid owned leaf directory fd.
+        assert_eq!(unsafe { libc::fchmod(cur.as_raw_fd(), 0o000) }, 0);
+        drop(cur);
 
         remove_tree(&t2).unwrap();
         assert!(!t2.exists());
