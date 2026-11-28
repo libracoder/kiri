@@ -35,6 +35,14 @@ const MEMORY_DEADBAND: u64 = 64 << 20;
 /// Hold working-set peak this long after any grow, pressure event, or new peak
 /// before decaying it gently.
 const SHRINK_COOLDOWN: Duration = Duration::from_secs(60);
+/// Upper bound for adaptive sawtooth backoff when active containers repeatedly
+/// grow back shortly after shrinking.
+const SHRINK_COOLDOWN_MAX: Duration = Duration::from_secs(600);
+/// A grow or pressure event within this window after a shrink counts as a
+/// balloon sawtooth reversal.
+const CHURN_WINDOW: Duration = Duration::from_secs(300);
+/// Maximum exponential backoff exponent (`60s * 2^4`, clamped to `SHRINK_COOLDOWN_MAX`).
+const CHURN_MAX_LEVEL: u32 = 4;
 const WS_PEAK_DECAY_INTERVAL: Duration = Duration::from_secs(5);
 const WS_PEAK_DECAY_STEP: u64 = 64 << 20;
 
@@ -175,8 +183,19 @@ struct BalloonState {
     last_target: Option<u64>,
     pending: Option<PendingFallback>,
     ws_peak: u64,
+    hold_started: Option<std::time::Instant>,
     hold_until: Option<std::time::Instant>,
     last_decay: Option<std::time::Instant>,
+    /// Most recent shrink timestamp, used to detect shrink->grow sawtooth churn.
+    last_shrink: Option<std::time::Instant>,
+    /// Most recent qualifying shrink->grow reversal (or calm step-down anchor).
+    /// Aged independently of `hold_until` so sustained periodic churn escalates
+    /// and non-churn grows cannot pin backoff at the cap indefinitely.
+    last_reversal: Option<std::time::Instant>,
+    /// Number of consecutive shrink->grow reversals within `CHURN_WINDOW`.
+    /// Level 0 (`reversals <= 1`) preserves the base 60 s cooldown; sustained
+    /// sawtooth (`reversals >= 2`) backs off exponentially up to `SHRINK_COOLDOWN_MAX`.
+    churn_reversals: u32,
 }
 
 impl BalloonState {
@@ -184,8 +203,66 @@ impl BalloonState {
         self.last_target = None;
         self.pending = None;
         self.ws_peak = 0;
+        self.hold_started = None;
         self.hold_until = None;
         self.last_decay = None;
+        self.last_shrink = None;
+        self.last_reversal = None;
+        self.churn_reversals = 0;
+    }
+
+    fn churn_level(&self) -> u32 {
+        self.churn_reversals.saturating_sub(1).min(CHURN_MAX_LEVEL)
+    }
+
+    fn effective_cooldown(&self) -> Duration {
+        let shift = self.churn_level();
+        SHRINK_COOLDOWN
+            .checked_mul(1u32 << shift)
+            .unwrap_or(SHRINK_COOLDOWN_MAX)
+            .min(SHRINK_COOLDOWN_MAX)
+    }
+
+    fn effective_decay_interval(&self) -> Duration {
+        let shift = self.churn_level();
+        WS_PEAK_DECAY_INTERVAL
+            .checked_mul(1u32 << shift)
+            .unwrap_or(SHRINK_COOLDOWN_MAX)
+    }
+
+    fn arm_hold(&mut self, now: std::time::Instant) {
+        self.hold_started = Some(now);
+        self.hold_until = Some(now + self.effective_cooldown());
+        self.last_decay = None;
+    }
+
+    fn age_churn(&mut self, now: std::time::Instant) {
+        while self.churn_reversals > 0 {
+            let Some(anchor) = self.last_reversal else {
+                self.churn_reversals = 0;
+                break;
+            };
+            // A qualifying reversal needs the current hold + at least one decay
+            // step to shrink, plus up to `CHURN_WINDOW` for the next regrow.
+            let step = self
+                .effective_cooldown()
+                .saturating_add(self.effective_decay_interval())
+                .saturating_add(CHURN_WINDOW);
+            if now.saturating_duration_since(anchor) < step {
+                break;
+            }
+            self.churn_reversals -= 1;
+            self.last_reversal = if self.churn_reversals > 0 { Some(anchor + step) } else { None };
+        }
+    }
+
+    fn note_grow(&mut self, active_containers: usize, now: std::time::Instant) {
+        if active_containers > 0 && self.last_shrink.is_some_and(|t| now.saturating_duration_since(t) <= CHURN_WINDOW) {
+            self.churn_reversals = self.churn_reversals.saturating_add(1).min(CHURN_MAX_LEVEL + 1);
+            self.last_reversal = Some(now);
+            // Consume this shrink so simultaneous pressure + target growth only count once.
+            self.last_shrink = None;
+        }
     }
 
     fn next_target_at(
@@ -244,28 +321,45 @@ impl BalloonState {
         let u_live = live_memory_need(used, mem_total, mem_available, balloon, ceiling).min(ceiling);
         let u_commit = committed_memory_need(used, mem_total, committed_as, ceiling);
 
-        // Hold working-set peak for `SHRINK_COOLDOWN` after any grow, pressure
-        // event, or new peak, then decay gently (at most 64 MiB per 5 s).
-        // During legacy fallback deflation lag (`PendingFallback::Grow`),
-        // `used` is temporarily inflated by `ceiling - target`, so don't raise
-        // `ws_peak` from that lag reading.
+        // Reset sawtooth backoff once all containers have stopped and clamp any
+        // outstanding hold deadline to the base 60 s cooldown so an idle VM
+        // returns memory to macOS promptly.
+        if policy.active_containers == 0 {
+            self.churn_reversals = 0;
+            self.last_shrink = None;
+            self.last_reversal = None;
+            if let (Some(started), Some(until)) = (self.hold_started, self.hold_until) {
+                let base_until = started + SHRINK_COOLDOWN;
+                if until > base_until {
+                    self.hold_until = Some(base_until);
+                }
+            }
+        } else {
+            self.age_churn(now);
+        }
+
+        // Hold working-set peak for `effective_cooldown()` after any grow,
+        // pressure event, or new peak, then decay gently (at most 64 MiB per
+        // `effective_decay_interval()`). During legacy fallback deflation lag
+        // (`PendingFallback::Grow`), `used` is temporarily inflated by
+        // `ceiling - target`, so don't raise `ws_peak` from that lag reading.
         let legacy_grow_lag = legacy_fallback && matches!(self.pending, Some(PendingFallback::Grow { .. }));
         if external_grow || pressure {
+            self.note_grow(policy.active_containers, now);
             self.ws_peak = self.ws_peak.max(target.min(ceiling).saturating_sub(headroom));
-            self.hold_until = Some(now + SHRINK_COOLDOWN);
-            self.last_decay = None;
+            self.arm_hold(now);
         }
         if !legacy_grow_lag && u_live > self.ws_peak {
             self.ws_peak = u_live;
-            self.hold_until = Some(now + SHRINK_COOLDOWN);
-            self.last_decay = None;
+            self.arm_hold(now);
         }
+        let decay_interval = self.effective_decay_interval();
         if !legacy_grow_lag && self.ws_peak > u_live {
             if let Some(hold_until) = self.hold_until {
                 if now >= hold_until {
                     let decay_from = self.last_decay.map_or(hold_until, |t| t.max(hold_until));
                     let elapsed = now.saturating_duration_since(decay_from);
-                    let steps = (elapsed.as_nanos() / WS_PEAK_DECAY_INTERVAL.as_nanos()) as u64;
+                    let steps = (elapsed.as_nanos() / decay_interval.as_nanos()) as u64;
                     if steps > 0 {
                         let drop = steps.saturating_mul(WS_PEAK_DECAY_STEP);
                         if self.ws_peak.saturating_sub(drop) <= u_live {
@@ -275,7 +369,7 @@ impl BalloonState {
                             self.ws_peak -= drop;
                             let next_anchor = u32::try_from(steps)
                                 .ok()
-                                .and_then(|s| WS_PEAK_DECAY_INTERVAL.checked_mul(s))
+                                .and_then(|s| decay_interval.checked_mul(s))
                                 .and_then(|d| decay_from.checked_add(d))
                                 .unwrap_or(now);
                             self.last_decay = Some(next_anchor);
@@ -306,12 +400,14 @@ impl BalloonState {
 
         if let Some(n) = next {
             if n > target {
+                self.note_grow(policy.active_containers, now);
                 let demand = u_live.max(u_commit).min(ceiling);
                 if demand.saturating_add(headroom) > target {
                     self.ws_peak = self.ws_peak.max(demand);
                 }
-                self.hold_until = Some(now + SHRINK_COOLDOWN);
-                self.last_decay = None;
+                self.arm_hold(now);
+            } else if n < target && policy.active_containers > 0 {
+                self.last_shrink = Some(now);
             }
             if legacy_fallback {
                 self.pending = if n > target {
@@ -7430,6 +7526,149 @@ mod memory_target_tests {
         ceil_target = poll_low(&mut ceil_state, ceil_target, false, t_ceil + SHRINK_COOLDOWN + WS_PEAK_DECAY_INTERVAL)
             .expect("should gently decay from ceiling after 60 s pressure cooldown");
         assert_eq!(CEILING - ceil_target, WS_PEAK_DECAY_STEP);
+    }
+
+    /// Repeated shrink -> grow reversals while containers are active indicate
+    /// balloon sawtooth churn: cooldown and decay interval back off exponentially
+    /// (60s -> 120s -> 240s -> 480s -> 600s cap), and reset immediately when the
+    /// VM goes idle (0 active containers).
+    #[test]
+    fn balloon_sawtooth_backs_off_cooldown_and_resets_when_idle() {
+        let policy = active_policy(CEILING);
+        let headroom = memory_headroom(CEILING);
+        let mut state = BalloonState::default();
+        let mut t = Instant::now();
+        let mut target = 6 * GIB;
+
+        let poll_with = |state: &mut BalloonState, policy: BalloonPolicy, target: u64, used: u64, pressure: bool, at: Instant| {
+            let unavail = used + 128 * MIB;
+            let balloon = CEILING.saturating_sub(target);
+            let avail = MEM_TOTAL.saturating_sub(balloon).saturating_sub(unavail);
+            let st = stats_sample(MEM_TOTAL, avail, used, Some(balloon), Some(used));
+            state.next_target_at(&st, used, policy, target, pressure, at)
+        };
+
+        // Prime an initial peak, wait out base 60 s cooldown, then trigger a shrink.
+        if let Some(n) = poll_with(&mut state, policy, target, 4 * GIB, false, t) {
+            target = n;
+        }
+        t += SHRINK_COOLDOWN + WS_PEAK_DECAY_INTERVAL;
+        let shrunk1 = poll_with(&mut state, policy, target, 2 * GIB, false, t).expect("initial shrink after 65 s");
+        assert!(shrunk1 < target);
+        target = shrunk1;
+
+        // 1st reversal: keeps base 60 s cooldown (level 0).
+        t += Duration::from_secs(10);
+        target = (target + MEMORY_GROW).min(CEILING);
+        assert_eq!(poll_with(&mut state, policy, target, 4 * GIB, true, t), None);
+        assert_eq!(state.effective_cooldown(), SHRINK_COOLDOWN);
+
+        // Shrink again, then hit a 2nd reversal -> backs off to 120 s cooldown / 10 s decay.
+        t += SHRINK_COOLDOWN + WS_PEAK_DECAY_INTERVAL;
+        let shrunk2 = poll_with(&mut state, policy, target, 2 * GIB, false, t).expect("second shrink after base cooldown");
+        assert!(shrunk2 < target);
+        target = shrunk2;
+
+        t += Duration::from_secs(10);
+        target = (target + MEMORY_GROW).min(CEILING);
+        assert_eq!(poll_with(&mut state, policy, target, 4 * GIB, true, t), None);
+        assert_eq!(state.effective_cooldown(), SHRINK_COOLDOWN * 2);
+        assert_eq!(state.effective_decay_interval(), WS_PEAK_DECAY_INTERVAL * 2);
+
+        // Must NOT shrink at +65 s or +120 s (120 s cooldown now active).
+        assert_eq!(poll_with(&mut state, policy, target, 2 * GIB, false, t + Duration::from_secs(65)), None);
+        assert_eq!(poll_with(&mut state, policy, target, 2 * GIB, false, t + Duration::from_secs(120)), None);
+        // Must NOT shrink at +125 s (decay interval is now 10 s).
+        assert_eq!(poll_with(&mut state, policy, target, 2 * GIB, false, t + Duration::from_secs(125)), None);
+        // Shrinks at +130 s (120 s cooldown + 10 s decay).
+        let shrunk3 = poll_with(&mut state, policy, target, 2 * GIB, false, t + Duration::from_secs(130))
+            .expect("should shrink after backed-off 120 s cooldown + 10 s decay");
+        assert_eq!(target - shrunk3, WS_PEAK_DECAY_STEP);
+        target = shrunk3;
+
+        // Further reversals cap at SHRINK_COOLDOWN_MAX (600 s).
+        for _ in 0..5 {
+            t += Duration::from_secs(135);
+            target = (target + MEMORY_GROW).min(CEILING);
+            let _ = poll_with(&mut state, policy, target, 4 * GIB, true, t);
+            t += state.effective_cooldown() + state.effective_decay_interval();
+            if let Some(n) = poll_with(&mut state, policy, target, 2 * GIB, false, t) {
+                target = n;
+            }
+        }
+        assert_eq!(state.effective_cooldown(), super::SHRINK_COOLDOWN_MAX);
+
+        // Transitioning to 0 active containers right after arming a 600 s hold
+        // clamps the outstanding hold deadline to the base 60 s cooldown so
+        // the first actual shrink lands at +65 s rather than +605 s.
+        t += Duration::from_secs(10);
+        target = CEILING;
+        let _ = poll_with(&mut state, policy, target, 4 * GIB, true, t);
+        assert_eq!(state.effective_cooldown(), super::SHRINK_COOLDOWN_MAX);
+        let hold_start = t;
+        t += Duration::from_secs(1);
+        let _ = poll_with(&mut state, idle_policy(CEILING), target, 200 * MIB, false, t);
+        assert_eq!(state.effective_cooldown(), SHRINK_COOLDOWN);
+        assert_eq!(state.effective_decay_interval(), WS_PEAK_DECAY_INTERVAL);
+        let idle_shrunk = poll_with(&mut state, idle_policy(CEILING), target, 200 * MIB, false, hold_start + SHRINK_COOLDOWN + WS_PEAK_DECAY_INTERVAL)
+            .expect("idle VM must shrink after clamped 60 s base cooldown + 5 s decay");
+        assert!(idle_shrunk < target);
+
+        // Periodic 180 s churn cycle (shrink at +65 s, regrow 115 s later):
+        // reversal #1 must not age out before reversal #2 at t=360 s.
+        let mut periodic = BalloonState::default();
+        let t0 = Instant::now();
+        let mut p_target = 5120 * MIB;
+        let reserved = CEILING - MEM_TOTAL;
+        let poll_live = |state: &mut BalloonState, target: u64, live_need: u64, at: Instant| {
+            let unavail = live_need.saturating_sub(reserved);
+            let balloon = CEILING.saturating_sub(target);
+            let avail = MEM_TOTAL.saturating_sub(balloon).saturating_sub(unavail);
+            let st = stats_sample(MEM_TOTAL, avail, unavail, Some(balloon), Some(unavail));
+            state.next_target_at(&st, unavail, policy, target, false, at)
+        };
+        for sec in 0..=360u64 {
+            let live = if sec % 180 == 0 { 3072 * MIB } else { 3008 * MIB };
+            if let Some(n) = poll_live(&mut periodic, p_target, live, t0 + Duration::from_secs(sec)) {
+                p_target = n;
+            }
+        }
+        assert!(
+            periodic.effective_cooldown() >= SHRINK_COOLDOWN * 2,
+            "180 s periodic churn must escalate cooldown, got {:?}",
+            periodic.effective_cooldown()
+        );
+
+        // Non-churn grows (> CHURN_WINDOW after last shrink) must not keep
+        // capped backoff pinned indefinitely: once a full hold + decay +
+        // CHURN_WINDOW elapses without a qualifying reversal, backoff steps down.
+        let mut calm = BalloonState::default();
+        let mut ct = Instant::now();
+        let mut c_target = 6 * GIB;
+        for _ in 0..6 {
+            if let Some(n) = poll_with(&mut calm, policy, c_target, 4 * GIB, true, ct) {
+                c_target = n;
+            }
+            ct += calm.effective_cooldown() + calm.effective_decay_interval();
+            if let Some(n) = poll_with(&mut calm, policy, c_target, 2 * GIB, false, ct) {
+                c_target = n;
+            }
+            ct += Duration::from_secs(10);
+            c_target = (c_target + MEMORY_GROW).min(CEILING);
+        }
+        assert_eq!(calm.effective_cooldown(), super::SHRINK_COOLDOWN_MAX);
+        // Repeated grows outside CHURN_WINDOW (>300 s after shrink) do not
+        // refresh `last_reversal`, so backoff decays smoothly from 600 s.
+        for _ in 0..4 {
+            ct += Duration::from_secs(310);
+            let _ = poll_with(&mut calm, policy, c_target, 4 * GIB, true, ct);
+        }
+        assert!(
+            calm.effective_cooldown() < super::SHRINK_COOLDOWN_MAX,
+            "non-churn grows must allow capped backoff to step down, got {:?}",
+            calm.effective_cooldown()
+        );
+        assert!(headroom > 0);
     }
 
     /// Idle VMs (0 active containers) use the 256 MiB idle floor instead of

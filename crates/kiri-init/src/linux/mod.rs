@@ -127,6 +127,7 @@ fn run(init_start_ns: u64) -> io::Result<()> {
     } else {
         leave_initramfs()?;
         mount_kernel_filesystems()?;
+        spread_vm_irqs();
         sys::sethostname(b"kiri")?;
         // Containers may bind the VM's /etc/hostname, as on a Linux host.
         let _ = std::fs::write("/etc/hostname", "kiri\n");
@@ -187,6 +188,125 @@ fn leave_initramfs() -> io::Result<()> {
     // The console descriptors were opened from the old root's /dev/console
     // and keep working; nothing else refers to the initramfs any more.
     Ok(())
+}
+
+/// Parses a Linux sysfs CPU list (e.g. `"0-7"` or `"0,2,4-5"`) into sorted,
+/// deduplicated online CPU IDs.
+pub(crate) fn parse_cpu_list(raw: &str) -> Vec<usize> {
+    let mut cpus = Vec::new();
+    for part in raw.trim().split(',').filter(|p| !p.is_empty()) {
+        if let Some((a, b)) = part.split_once('-') {
+            if let (Ok(start), Ok(end)) = (a.trim().parse::<usize>(), b.trim().parse::<usize>()) {
+                if start <= end && end - start < 4096 {
+                    cpus.extend(start..=end);
+                }
+            }
+        } else if let Ok(id) = part.trim().parse::<usize>() {
+            cpus.push(id);
+        }
+    }
+    cpus.sort_unstable();
+    cpus.dedup();
+    cpus
+}
+
+/// Returns the guest's online CPU IDs from `/sys/devices/system/cpu/online`,
+/// falling back to `0..available_parallelism()`.
+pub(crate) fn online_cpu_ids() -> Vec<usize> {
+    if let Ok(raw) = std::fs::read_to_string("/sys/devices/system/cpu/online") {
+        let ids = parse_cpu_list(&raw);
+        if !ids.is_empty() {
+            return ids;
+        }
+    }
+    let n = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    (0..n).collect()
+}
+
+/// Distributes virtio device interrupts across online vCPUs inside the VM so
+/// `virtio-blk`, `vsock`, and `virtio-balloon` do not pile onto CPU 0 alongside
+/// `virtio-net` hardirqs (GICv3 defaults all SPIs to CPU 0). Best-effort:
+/// missing `/proc/irq` entries or fixed-affinity controllers are skipped.
+fn spread_vm_irqs() {
+    let cpus = online_cpu_ids();
+    if cpus.len() <= 1 {
+        return;
+    }
+    let Ok(interrupts) = std::fs::read_to_string("/proc/interrupts") else { return };
+    let net_dev = virtio_net_dev_name();
+    // Only pin the uplink to CPU 0 when it uses a single RX queue (Apple VZ);
+    // multiqueue MSI-X uplinks keep their own per-queue affinities untouched.
+    let pin_net_to_cpu0 = net::rx_queue_count(net::UPLINK) <= 1;
+    for (irq, cpu) in plan_virtio_irq_cpus(&interrupts, net_dev.as_deref(), pin_net_to_cpu0, &cpus) {
+        let _ = std::fs::write(format!("/proc/irq/{irq}/smp_affinity_list"), format!("{cpu}\n"));
+    }
+}
+
+/// Resolves `eth0`'s backing virtio device name (e.g. `"virtio0"`) from sysfs.
+fn virtio_net_dev_name() -> Option<String> {
+    let target = std::fs::read_link(format!("/sys/class/net/{}/device", net::UPLINK)).ok()?;
+    let name = target.file_name()?.to_str()?;
+    name.starts_with("virtio").then(|| name.to_owned())
+}
+
+/// Matches a `/proc/interrupts` handler token to a virtio device name
+/// (`"virtio0"` matches `"virtio0"` and `"virtio0-input.0"`, not `"virtio00"`).
+fn handler_matches_dev(handler: &str, dev: &str) -> bool {
+    handler == dev || handler.strip_prefix(dev).is_some_and(|rest| rest.starts_with('-'))
+}
+
+/// Plans `(irq, target_cpu)` assignments from `/proc/interrupts`: when
+/// `pin_net_to_cpu0` is true (single-queue uplink), pins the uplink
+/// `virtio-net` device to the first online CPU so `eth0` hardirq/NAPI aligns
+/// with RPS steering; when false (multiqueue uplink), skips uplink IRQs so
+/// driver-managed per-queue affinities stay intact. All other virtio IRQs are
+/// spread round-robin across the remaining online CPUs.
+fn plan_virtio_irq_cpus(
+    proc_interrupts: &str,
+    net_virtio_dev: Option<&str>,
+    pin_net_to_cpu0: bool,
+    online_cpus: &[usize],
+) -> Vec<(u32, usize)> {
+    if online_cpus.len() <= 1 {
+        return Vec::new();
+    }
+    let net_cpu = online_cpus[0];
+    let other_cpus = &online_cpus[1..];
+    let mut plan = Vec::new();
+    let mut other_idx = 0usize;
+    for line in proc_interrupts.lines() {
+        let mut tokens = line.split_whitespace();
+        let Some(first) = tokens.next() else { continue };
+        let Some(irq_str) = first.strip_suffix(':') else { continue };
+        let Ok(irq) = irq_str.parse::<u32>() else { continue };
+        // Check all action names on shared INTx lines so assignment is order-independent.
+        let mut saw_virtio = false;
+        let mut is_net = false;
+        for tok in tokens {
+            let clean = tok.trim_end_matches(',');
+            if clean.starts_with("virtio") {
+                saw_virtio = true;
+                if net_virtio_dev.is_some_and(|dev| handler_matches_dev(clean, dev)) {
+                    is_net = true;
+                }
+            }
+        }
+        if !saw_virtio {
+            continue;
+        }
+        let cpu = if is_net {
+            if !pin_net_to_cpu0 {
+                continue;
+            }
+            net_cpu
+        } else {
+            let slot = other_cpus[other_idx % other_cpus.len()];
+            other_idx += 1;
+            slot
+        };
+        plan.push((irq, cpu));
+    }
+    plan
 }
 
 fn mount_kernel_filesystems() -> io::Result<()> {
@@ -1175,5 +1295,56 @@ mod panic_hook_tests {
 
         let mut empty = [];
         assert_eq!(super::format_panic_message(&mut empty, Some(("a.rs", 1)), Some("x")), b"");
+    }
+
+    #[test]
+    fn virtio_irq_plan_pins_net_to_cpu0_and_spreads_other_devices() {
+        let interrupts = "\
+           CPU0       CPU1       CPU2       CPU3       CPU4       CPU5       CPU6       CPU7
+  1:          0          0          0          0          0          0          0          0     GICv3  30 Level     arch_timer
+ 13:   53301234          0          0          0          0          0          0          0     GICv3  36 Level     virtio0
+ 15:   15523456          0          0          0          0          0          0          0     GICv3  38 Level     virtio2
+ 18:     990123          0          0          0          0          0          0          0     GICv3  41 Level     virtio5
+ 20:    2154321          0          0          0          0          0          0          0     GICv3  43 Level     virtio7
+IPI1:  43300000          0          0          0          0          0          0          0       Function call interrupts
+";
+        assert_eq!(
+            super::plan_virtio_irq_cpus(interrupts, Some("virtio0"), true, &[0, 1, 2, 3, 4, 5, 6, 7]),
+            vec![(13, 0), (15, 1), (18, 2), (20, 3)]
+        );
+        // Sparse online CPU IDs (`0,2,4,6`) target actual online IDs, not 1,2,3.
+        assert_eq!(
+            super::parse_cpu_list("0,2,4-6\n"),
+            vec![0, 2, 4, 5, 6]
+        );
+        assert_eq!(
+            super::plan_virtio_irq_cpus(interrupts, Some("virtio0"), true, &[0, 2, 4, 6]),
+            vec![(13, 0), (15, 2), (18, 4), (20, 6)]
+        );
+        // On a 2-vCPU VM all non-net virtio devices land on CPU 1, keeping CPU 0 clear for eth0.
+        assert_eq!(
+            super::plan_virtio_irq_cpus(interrupts, Some("virtio0"), true, &[0, 1]),
+            vec![(13, 0), (15, 1), (18, 1), (20, 1)]
+        );
+        // Single-vCPU VM skips affinity programming.
+        assert!(super::plan_virtio_irq_cpus(interrupts, Some("virtio0"), true, &[0]).is_empty());
+        // Shared INTx lines assign identically regardless of handler order.
+        let shared_a = " 42: 0 0 IO-APIC 21-fasteoi virtio2, virtio1\n";
+        let shared_b = " 42: 0 0 IO-APIC 21-fasteoi virtio1, virtio2\n";
+        assert_eq!(super::plan_virtio_irq_cpus(shared_a, Some("virtio1"), true, &[0, 1]), vec![(42, 0)]);
+        assert_eq!(super::plan_virtio_irq_cpus(shared_b, Some("virtio1"), true, &[0, 1]), vec![(42, 0)]);
+        // MSI-X per-queue names match their owning device prefix; multiqueue skips uplink IRQs.
+        let msix = "\
+ 30: 0 0 0 0 PCI-MSI 0 Edge virtio1-input.0
+ 31: 0 0 0 0 PCI-MSI 1 Edge virtio10-req.0
+";
+        assert_eq!(
+            super::plan_virtio_irq_cpus(msix, Some("virtio1"), true, &[0, 1, 2, 3]),
+            vec![(30, 0), (31, 1)]
+        );
+        assert_eq!(
+            super::plan_virtio_irq_cpus(msix, Some("virtio1"), false, &[0, 1, 2, 3]),
+            vec![(31, 1)]
+        );
     }
 }

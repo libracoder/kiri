@@ -816,6 +816,76 @@ fn raise_sysctl_min(path: &std::path::Path, min: u64) {
     }
 }
 
+/// Counts sysfs `rx-*` queues exposed for `iface`.
+pub(crate) fn rx_queue_count(iface: &str) -> usize {
+    let queues_dir = std::path::PathBuf::from(format!("/sys/class/net/{iface}/queues"));
+    let Ok(entries) = std::fs::read_dir(&queues_dir) else { return 0 };
+    entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_str().is_some_and(|n| n.starts_with("rx-")))
+        .count()
+}
+
+/// Formats a Linux sysfs `rps_cpus` hex bitmask from actual `online_cpus` IDs.
+/// With >= 4 online CPUs, excludes the first online CPU (dedicated to
+/// `virtio-net` hardirq/NAPI polling) so the remaining CPUs handle `NET_RX`
+/// softirq work; with 2-3 CPUs, includes all online CPUs so steering still fans
+/// out across multiple cores.
+fn format_rps_cpu_mask(online_cpus: &[usize]) -> Option<String> {
+    if online_cpus.len() <= 1 {
+        return None;
+    }
+    let selected = if online_cpus.len() >= 4 { &online_cpus[1..] } else { online_cpus };
+    let max_cpu = *selected.iter().max()?;
+    let words = max_cpu / 32 + 1;
+    let mut chunks = vec![0u32; words];
+    for &cpu in selected {
+        chunks[cpu / 32] |= 1u32 << (cpu % 32);
+    }
+    let mut out = String::new();
+    for &bits in chunks.iter().rev() {
+        if out.is_empty() {
+            out.push_str(&format!("{bits:x}"));
+        } else {
+            out.push_str(&format!(",{bits:08x}"));
+        }
+    }
+    Some(out)
+}
+
+/// Enables Receive Packet Steering (RPS) on the VM's uplink interface so Apple
+/// Virtualization.framework's single-queue `virtio-net` spreads `NET_RX`
+/// softirq work across vCPUs instead of pinning it onto CPU 0. When >= 4 CPUs
+/// isolate CPU 0 from `rps_cpus`, RFS (`rps_flow_cnt`) is intentionally left
+/// disabled so Linux's RFS lookup cannot steer packets back onto CPU 0.
+/// Best-effort: silently skipped if the kernel omits `CONFIG_RPS`.
+fn configure_uplink_rps(iface: &str) {
+    const RFS_FLOW_ENTRIES: u64 = 32_768;
+    let cpus = super::online_cpu_ids();
+    let Some(mask) = format_rps_cpu_mask(&cpus) else { return };
+    let queues_dir = std::path::PathBuf::from(format!("/sys/class/net/{iface}/queues"));
+    let Ok(entries) = std::fs::read_dir(&queues_dir) else { return };
+    let rx_queues: Vec<std::path::PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("rx-")))
+        .collect();
+    if rx_queues.is_empty() {
+        return;
+    }
+    let enable_rfs = cpus.len() < 4;
+    if enable_rfs {
+        raise_sysctl_min(std::path::Path::new("/proc/sys/net/core/rps_sock_flow_entries"), RFS_FLOW_ENTRIES);
+    }
+    let per_queue = (RFS_FLOW_ENTRIES / rx_queues.len() as u64).max(1).to_string();
+    for q in rx_queues {
+        let _ = std::fs::write(q.join("rps_cpus"), &mask);
+        if enable_rfs {
+            let _ = std::fs::write(q.join("rps_flow_cnt"), &per_queue);
+        }
+    }
+}
+
 /// Brings the uplink up and returns a DHCP client for it, or None if the VM
 /// has no network card (shared NAT disabled: installs the VM nftables table
 /// and a fallback default route on `lo` so host-network and bridged containers
@@ -836,6 +906,7 @@ pub fn uplink() -> io::Result<Option<Dhcp>> {
         Ok(index) => {
             let mut nl = Netlink::open(libc::NETLINK_ROUTE)?;
             netlink::set_up(&mut nl, index)?;
+            configure_uplink_rps(UPLINK);
             install_nat(Nat { uplink: index, redirect: true, dnat: Vec::new(), gateway: [0; 4] })?;
             let _ = VM_UPLINK_INDEX.set(index);
             Ok(Some(Dhcp::start(index)?))
@@ -1748,5 +1819,20 @@ mod tests {
         assert_eq!(probe_abstract_lock(name.as_bytes(), me), LockProbe::TransientBusy);
         let rebound = try_bind_abstract_socket(name.as_bytes()).expect("rebind succeeds once first fd closes");
         drop(rebound);
+    }
+
+    #[test]
+    fn rps_cpu_mask_formats_single_and_multi_word_cpumasks() {
+        let seq = |n: usize| (0..n).collect::<Vec<_>>();
+        assert_eq!(format_rps_cpu_mask(&[]), None);
+        assert_eq!(format_rps_cpu_mask(&[0]), None);
+        assert_eq!(format_rps_cpu_mask(&seq(2)).as_deref(), Some("3"));
+        assert_eq!(format_rps_cpu_mask(&seq(3)).as_deref(), Some("7"));
+        assert_eq!(format_rps_cpu_mask(&seq(4)).as_deref(), Some("e"));
+        assert_eq!(format_rps_cpu_mask(&seq(8)).as_deref(), Some("fe"));
+        assert_eq!(format_rps_cpu_mask(&[0, 2, 4, 6]).as_deref(), Some("54"));
+        assert_eq!(format_rps_cpu_mask(&seq(32)).as_deref(), Some("fffffffe"));
+        assert_eq!(format_rps_cpu_mask(&seq(33)).as_deref(), Some("1,fffffffe"));
+        assert_eq!(format_rps_cpu_mask(&seq(64)).as_deref(), Some("ffffffff,fffffffe"));
     }
 }
