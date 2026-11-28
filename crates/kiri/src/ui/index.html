@@ -5330,19 +5330,92 @@ function heads(head, view) {
   };
   return head.map(th).join("");
 }
+const rowKeyOf = (html) => {
+  const i = html.indexOf('data-key="');
+  if (i < 0) return "";
+  const j = html.indexOf('"', i + 10);
+  return j > i + 10 ? html.slice(i + 10, j) : "";
+};
 function table(head, rows, view, last = `<th class="r">${tr("Actions")}</th>`, after = "") {
   // In place: a refresh or a button's change doesn't redraw the rows that stay.
   // A list whose rows can be picked starts with their boxes' column, and takes
   // focus for its keys (⌘A, arrows, Space, Delete).
   const el = $("content");
-  const html = `<table data-view="${view}"${LISTS[view]?.bulk ? ' tabindex="0"' : ""}><thead><tr>${LISTS[view]?.bulk ? pickHead(view) : ""}${heads(head, view)}${last}</tr></thead><tbody>${rows.join("")}</tbody></table>${after}`;
+  const headHtml = `${LISTS[view]?.bulk ? pickHead(view) : ""}${heads(head, view)}${last}`;
+  const tbl = el.firstElementChild;
+  // Fast incremental row patch: when the table shell, header, and footer match,
+  // reuse every row whose HTML string is unchanged without innerHTML parsing or isEqualNode.
+  if (tbl && tbl === el._listEl && tbl.tagName === "TABLE" && tbl.dataset.view === view && el._headHtml === headHtml && el._afterHtml === after && rows.length) {
+    const tbody = tbl.tBodies[0];
+    if (tbody) {
+      let allKeyed = true;
+      const keys = new Array(rows.length);
+      for (let i = 0; i < rows.length; i++) {
+        const k = rowKeyOf(rows[i]);
+        if (!k) { allKeyed = false; break; }
+        keys[i] = k;
+      }
+      if (allKeyed) {
+        const byKey = new Map();
+        for (let r = tbody.firstElementChild; r; r = r.nextElementSibling) {
+          const k = r.dataset.key;
+          if (k) byKey.set(k, r);
+        }
+        const dirtyIdx = [], dirtyHtml = [];
+        const target = new Array(rows.length);
+        for (let i = 0; i < rows.length; i++) {
+          const k = keys[i], html = rows[i], ex = byKey.get(k);
+          if (ex && ex._rowHtml === html) {
+            target[i] = ex;
+          } else {
+            dirtyIdx.push(i);
+            dirtyHtml.push(html);
+          }
+        }
+        if (!dirtyIdx.length && tbody.children.length === rows.length) {
+          let sameOrder = true;
+          for (let i = 0; i < rows.length; i++) if (tbody.children[i] !== target[i]) { sameOrder = false; break; }
+          if (sameOrder) return;
+        }
+        const keep = rowSlot();
+        const want = new Set(keys);
+        for (const [k, r] of byKey) if (!want.has(k)) { r.remove(); byKey.delete(k); }
+        if (dirtyIdx.length) {
+          const tmp = document.createElement("div");
+          tmp.innerHTML = `<table><tbody>${dirtyHtml.join("")}</tbody></table>`;
+          const parsed = [...tmp.firstElementChild.tBodies[0].children];
+          for (let d = 0; d < dirtyIdx.length; d++) {
+            const idx = dirtyIdx[d], k = keys[idx], ex = byKey.get(k), p = parsed[d];
+            if (ex) { morphNode(ex, p); ex._rowHtml = rows[idx]; target[idx] = ex; }
+            else { p._rowHtml = rows[idx]; target[idx] = p; }
+          }
+        }
+        for (let i = 0; i < target.length; i++) {
+          const trEl = target[i], at = tbody.children[i] || null;
+          if (trEl !== at) tbody.insertBefore(trEl, at);
+        }
+        while (tbody.children.length > target.length) tbody.lastElementChild.remove();
+        livePillsDirty = true;
+        el._list = null;
+        rowSlot(keep);
+        spanRows();
+        fitColumns();
+        return;
+      }
+    }
+  }
+  const html = `<table data-view="${view}"${LISTS[view]?.bulk ? ' tabindex="0"' : ""}><thead><tr>${headHtml}</tr></thead><tbody>${rows.join("")}</tbody></table>${after}`;
   // The same list again (each refresh sends it, whatever changed elsewhere): nothing to do. Drawing it
   // again cost a full layout of every row (76 ms for 500 images).
   if (html === el._list && el.firstElementChild === el._listEl) return;
   const keep = rowSlot();
   morph(el, html);
   livePillsDirty = true;
-  el._list = html; el._listEl = el.firstElementChild;
+  el._list = html; el._listEl = el.firstElementChild; el._headHtml = headHtml; el._afterHtml = after;
+  const tbody = el._listEl?.tBodies?.[0];
+  if (tbody && tbody.children.length === rows.length) {
+    for (let i = 0; i < rows.length; i++) tbody.children[i]._rowHtml = rows[i];
+  }
   rowSlot(keep);
   spanRows();
   fitColumns();
@@ -7665,16 +7738,29 @@ window.addEventListener("blur", pressDone);
 const held = (fn) => (press.down ? (press.later.add(fn), true) : false);
 
 // A tag beside a section's name (Beta) goes when the two don't both fit: the name is never cut, the tag never clipped.
-function navTags() {
+let _navTagsKey = "";
+function navTags(force = false) {
+  const key = `${LANG}|${prefs.scale || 1}|${prefs.font || ""}|${document.body.classList.contains("rail") ? 1 : 0}|${$("n-compose")?.textContent || ""}|${$("n-usb")?.textContent || ""}`;
+  if (!force && key === _navTagsKey) return;
+  _navTagsKey = key;
   for (const b of document.querySelectorAll("nav button > .beta")) {
     const l = b.parentElement.querySelector(".lbl");
     b.classList.remove("gone");
     if (l.scrollWidth > l.clientWidth) b.classList.add("gone");
   }
 }
-addEventListener("resize", navTags);
+addEventListener("resize", () => navTags(true));
+let _keptCache = null;
 function render() {
   if (held(render)) return;
+  _keptCache = Object.create(null);
+  try {
+    renderInner();
+  } finally {
+    _keptCache = null;
+  }
+}
+function renderInner() {
   livePillsDirty = true;
   schedulePlaceFloats();
   if (ui.view !== "compose") cmpHWait(false);
@@ -8832,6 +8918,21 @@ function diagEvent(e) {
   }
 }
 
+function listsFingerprint(e) {
+  const cs = e.containers || [], is = e.images || [], vs = e.volumes || [], ns = e.networks || [];
+  let s = `${cs.length}:${is.length}:${vs.length}:${ns.length}|`;
+  for (let i = 0; i < cs.length; i++) {
+    const c = cs[i], l = c.Labels;
+    s += `${c.Id};${c.State};${c.Status || ""};${c.KiriStartedAt || 0};${c.KiriFinishedAt || 0};${c.KiriExitCode || 0};${c.KiriOOMKilled ? 1 : 0};${c.KiriVmStopped ? 1 : 0};${c.KiriStoppedByUser ? 1 : 0};${c.Image || ""};${c.Names?.[0] || ""};${c.Ports?.length || 0};${c.Mounts?.length || 0};${l?.["com.docker.compose.project"] || ""};${l?.["dev.kiri.domain"] || ""}|`;
+  }
+  for (let i = 0; i < is.length; i++) {
+    const im = is[i];
+    s += `${im.Id};${im.Size || 0};${im.RepoTags?.[0] || ""};${im.Created || 0}|`;
+  }
+  for (let i = 0; i < vs.length; i++) s += `${vs[i].Name};`;
+  for (let i = 0; i < ns.length; i++) s += `${ns[i].Id || ns[i].Name};`;
+  return s;
+}
 window.kiri = {
   on(e) {
     switch (e.type) {
@@ -8851,10 +8952,15 @@ window.kiri = {
         const meter = `${(ui.mem.used / e.ceiling_mib * 100).toFixed(1)}%`;
         if ($("vm-meter").style.width !== meter) $("vm-meter").style.width = meter;
         break;
-      case "lists":
+      case "lists": {
         if (e.brands) mergeBrands(e.brands);
         // Links need the routers' ports: ask once the engine answers.
         if ((!ui.rports || ui.rports.error) && Date.now() - ui.rpAt > 5000) { ui.rpAt = Date.now(); send("routerports"); }
+        const fp = listsFingerprint(e);
+        if (fp === ui._listsFp && !ui.openAfter && !ui.batches.length && !ui.pulls.size && !ui.running.size && ui.vm !== "stopped" && ui.view !== "compose") {
+          break;
+        }
+        ui._listsFp = fp;
         // Run's look at an image's start script makes a container it never starts; and
         // docker build's BuildKit workers (buildx names them buildx_buildkit_<builder>N) are
         // the build machinery, not containers anyone ran: neither is listed. Nor is the
@@ -8870,6 +8976,7 @@ window.kiri = {
         paintEngine();
         if (ui.openAfter && ui.containers.some((c) => c.Id === ui.openAfter)) { openDetail(ui.openAfter); ui.openAfter = null; openedTab(); }
         break;
+      }
       case "volumesizes":
         ui.volSizes = e.sizes && typeof e.sizes === "object" ? e.sizes : {};
         ui.volSizesInFlight = Math.max(0, ui.volSizesInFlight - 1);
@@ -11192,8 +11299,17 @@ Object.assign(ui, { tab: {}, pick: { view: "", keys: new Set(), last: "", cur: "
 const tabOf = (v) => ui.tab[v] || "all";
 /* What a list holds less what's held for removal; then what the tab and the search leave. */
 function kept(v) {
-  const L = LISTS[v], held = new Set(ui.batches.filter((b) => b.view === v).flatMap((b) => [...b.keys]));
-  return L.all().filter((x) => !held.has(L.key(x)));
+  if (_keptCache && _keptCache[v]) return _keptCache[v];
+  const L = LISTS[v];
+  let res;
+  if (!ui.batches.length) {
+    res = L.all();
+  } else {
+    const held = new Set(ui.batches.filter((b) => b.view === v).flatMap((b) => [...b.keys]));
+    res = held.size ? L.all().filter((x) => !held.has(L.key(x))) : L.all();
+  }
+  if (_keptCache) _keptCache[v] = res;
+  return res;
 }
 function listed(v) { const L = LISTS[v], tab = tabOf(v); return kept(v).filter((x) => L.hit(x) && (tab === "all" || L.state(x) === tab)); }
 /* The rows Select all takes and the bulk buttons act on: on screen, and pickable. */
@@ -11249,7 +11365,11 @@ function renderHead() {
     return c || on ? `<button class="ltab${bad && c ? " bad" : ""}" data-ltab="${k}" aria-pressed="${on}">${dot !== undefined ? `<i class="${dot}"></i>` : ""}${tr(label)}<span class="n">${c}</span></button>` : "";
   };
   tabs.hidden = !all.length;
-  morph(tabs, all.length ? [["all", "All"], ...(L.tabs || [])].map(tab).join("") : "");
+  const tabsHtml = all.length ? [["all", "All"], ...(L.tabs || [])].map(tab).join("") : "";
+  if (tabs._mh !== tabsHtml || (tabs._mf ? !tabs.contains(tabs._mf) : !!tabs.firstChild)) {
+    morph(tabs, tabsHtml);
+    tabs._mh = tabsHtml; tabs._mf = tabs.firstChild;
+  }
   // Picks that left the screen (filtered, folded, removed) are let go.
   const can = pickables(v), keys = ui.pick.keys, on = new Set(can.map(L.key));
   for (const k of keys) if (!on.has(k)) keys.delete(k);
@@ -11268,9 +11388,13 @@ function renderHead() {
   }
   const going = ui.batches.find((b) => b.view === v && b.phase === "going");
   const junk = L.junk && !going ? all.filter((x) => L.state(x) === L.junk.state && !(v === "containers" && isKiriK8s(x))) : [];
-  morph(right, (going ? `<span class="hbusy" role="status"><span class="hspin"></span><span>${tr("Removing <b>{gone} of {n}</b>…", { gone: going.gone, n: going.n })}</span></span>` : "")
+  const rightHtml = (going ? `<span class="hbusy" role="status"><span class="hspin"></span><span>${tr("Removing <b>{gone} of {n}</b>…", { gone: going.gone, n: going.n })}</span></span>` : "")
     + (junk.length ? `<button class="btn quiet" data-junk title="${esc(L.junk.tip(junk))}">${svgOf("broom").replace("<svg", '<svg class="cue"')}${L.junk.label(junk.length)}</button>` : "")
-    + (L.primary ? L.primary() : ""));
+    + (L.primary ? L.primary() : "");
+  if (right._mh !== rightHtml || (right._mf ? !right.contains(right._mf) : !!right.firstChild)) {
+    morph(right, rightHtml);
+    right._mh = rightHtml; right._mf = right.firstChild;
+  }
   ppPlace();
 }
 $("ltabs").addEventListener("click", (ev) => {
