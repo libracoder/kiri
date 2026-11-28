@@ -354,6 +354,46 @@ fn commit(req: &Request, engine: &Engine) -> Result<Value, Error> {
     Ok(json!({"Id": config_digest}))
 }
 
+/// Kiri's own `POST /kiri/containers/<id>/checkpoint`: the container's
+/// writable files become an image, ready for `kiri run` of it (or plain
+/// Docker's). The name is the body's `image` (a reference, `repo` or
+/// `repo:tag`; the part after the colon is a tag only when it holds no
+/// slash), or a default `checkpoint:<shortid>-<unix time>` whose seconds
+/// change with every call: checkpoints of a container stack up, none
+/// overwrites an earlier one. A checkpoint is files, not the process
+/// table — restoring one is running its image.
+pub(super) fn checkpoint(req: &Request, engine: &Engine, id: &str) -> Result<Value, Error> {
+    let b = body(req)?;
+    let short = engine.resolve(id)?;
+    let (repo, tag) = checkpoint_name(b["image"].as_str(), &short);
+    let mut q: Vec<(&str, &str)> = vec![("container", id), ("repo", repo.as_str())];
+    if let Some(t) = &tag {
+        q.push(("tag", t.as_str()));
+    }
+    let committed = commit(&Request::internal("POST", "/commit", &q, Vec::new()), engine)?;
+    Ok(json!({"Image": format!("{repo}:{}", tag.unwrap_or_else(|| "latest".to_owned())), "Id": committed["Id"]}))
+}
+
+/// A checkpoint's store name from the body's `image` (or none), beside a
+/// container id the same length as any other: a caller-given reference is
+/// its repo and, when the part after the last colon holds no slash, its
+/// tag; no name given makes `checkpoint:<shortid>-<unix time>`, whose
+/// seconds change with every call so the checkpoints of a container
+/// stack up instead of overwriting each other.
+pub(super) fn checkpoint_name(given: Option<&str>, short: &str) -> (String, Option<String>) {
+    match given.filter(|g| !g.is_empty()) {
+        Some(given) => match given.rsplit_once(':') {
+            Some((repo, tag)) if !tag.contains('/') => (repo.to_owned(), Some(tag.to_owned())),
+            _ => (given.to_owned(), None),
+        },
+        None => {
+            let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+            let short = &short[..12.min(short.len())];
+            ("checkpoint".to_owned(), Some(format!("{short}-{at}")))
+        }
+    }
+}
+
 /// A prune's `until` filter, as Docker's daemon reads it (moby
 /// `getUntilFromPruneFilters`): one value, a duration, date or Unix time
 /// (see `time::docker_timestamp`); anything else is refused, never ignored.
@@ -407,10 +447,18 @@ fn image_prune(req: &Request, engine: &Engine) -> Result<Value, Error> {
     // Without `-a` only untagged images go; Kiri keeps none of those around.
     let dangling_only = f.bool("dangling").unwrap_or(true);
     let until = prune_until(&f, "until")?;
+    // `keep=N`: even under `-a`, the N newest unused images stay; older
+    // ones are what this call removes. The policy stays the caller's —
+    // nothing leaves the store except through this explicit call, and a
+    // sweeper Kiri runs on its own still isn't a thing (#895).
+    let keep = match req.query("keep") {
+        None => 0usize,
+        Some(v) => v.parse::<usize>().map_err(|_| Error::BadRequest(format!("the keep parameter must be a whole number of images: {v}")))?,
+    };
     let used: Vec<String> = engine.each(|c| Some(c.spec.image_id.clone()));
-    let mut deleted = Vec::new();
-    let mut any_deleted = false;
-    let mut reclaimed = 0u64;
+    // Selected as a whole before anything is deleted: `keep` needs the
+    // full unused list to pick out the newest from.
+    let mut candidates = Vec::new();
     for i in engine.store.images()? {
         if used.contains(&i.config_digest) || (dangling_only && !i.name.starts_with("sha256:")) {
             continue;
@@ -423,14 +471,26 @@ fn image_prune(req: &Request, engine: &Engine) -> Result<Value, Error> {
         if !f.labels(&super::api::image_labels_from(&cfg)) || (until.is_some() && !created.is_some_and(|c| before(until, c))) {
             continue;
         }
-        if engine.store.remove_image(&i.name)?.is_some() {
-            reclaimed += i.size;
-            deleted.push(json!({"Untagged": i.name}));
-            engine.emit_image("untag", &i.config_digest, &i.name);
-            if !engine.store.images()?.iter().any(|o| o.config_digest == i.config_digest) {
+        candidates.push((i.name, i.config_digest, i.size, created));
+    }
+    // Newest first; an image whose creation time never parsed comes last
+    // and is the first to be told beyond the kept few.
+    candidates.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
+    if keep > 0 && !candidates.is_empty() {
+        candidates.drain(..candidates.len().min(keep));
+    }
+    let mut deleted = Vec::new();
+    let mut any_deleted = false;
+    let mut reclaimed = 0u64;
+    for (name, config_digest, size, _) in candidates {
+        if engine.store.remove_image(&name)?.is_some() {
+            reclaimed += size;
+            deleted.push(json!({"Untagged": &name}));
+            engine.emit_image("untag", &config_digest, &name);
+            if !engine.store.images()?.iter().any(|o| o.config_digest == config_digest) {
                 any_deleted = true;
-                deleted.push(json!({"Deleted": i.config_digest}));
-                engine.emit_image("delete", &i.config_digest, &i.name);
+                deleted.push(json!({"Deleted": &config_digest}));
+                engine.emit_image("delete", &config_digest, &name);
             }
         }
     }
@@ -955,6 +1015,44 @@ mod disk_usage_tests {
         left(&[keep, "tagged:1"]);
         prune(r#"{"label":["keep=1"]}"#).unwrap();
         left(&["tagged:1"]);
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// `keep=N` keeps the N newest unused images even under `-a`: a policy
+    /// the caller passes with the call, not a sweeper Kiri runs on its own.
+    /// An unparsable `keep` is a 400.
+    #[test]
+    fn image_prune_with_keep_keeps_the_newest_unused() {
+        use super::{Error, Request};
+        use serde_json::json;
+        let root = std::env::temp_dir().join(format!("kiri-image-prune-keep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let engine = super::super::engine::boot_without_vm(&root);
+        for (tag, created) in [("a:new", "2026-01-01T00:00:00Z"), ("b:mid", "2021-01-01T00:00:00Z"), ("c:old", "2020-01-01T00:00:00Z")] {
+            let cfg = json!({"created": created, "architecture": "arm64", "os": "linux", "config": {}});
+            let mut w = engine.store.ingest().unwrap();
+            std::io::Write::write_all(&mut w, &serde_json::to_vec(&cfg).unwrap()).unwrap();
+            let (digest, _) = w.finish().unwrap();
+            engine.store.put_image(kiri_image::archive::from_config(tag.into(), &digest, &cfg, Vec::new())).unwrap();
+        }
+        let prune = |keep: Option<&str>| {
+            let mut q: Vec<(&str, &str)> = vec![("filters", r#"{"dangling":["false"]}"#)];
+            if let Some(k) = keep {
+                q.push(("keep", k));
+            }
+            super::image_prune(&Request::internal("POST", "/images/prune", &q, Vec::new()), &engine)
+        };
+        assert!(matches!(prune(Some("soon")), Err(Error::BadRequest(_))));
+        assert!(matches!(prune(Some("1.5")), Err(Error::BadRequest(_))));
+        // keep=1: only the newest stays; the older two are what goes.
+        let answer = prune(Some("1")).unwrap();
+        let deleted = answer["ImagesDeleted"].as_array().map(Vec::as_slice).unwrap_or_default();
+        assert_eq!(deleted.iter().filter(|d| d["Untagged"].is_string()).count(), 2, "{answer:?}");
+        let left: Vec<String> = engine.store.images().unwrap().into_iter().map(|i| i.name).collect();
+        assert_eq!(left, vec!["a:new".to_owned()], "{left:?}");
+        assert_eq!(answer["SpaceReclaimed"].as_u64(), Some(0));
         drop(engine);
         let _ = std::fs::remove_dir_all(root);
     }
