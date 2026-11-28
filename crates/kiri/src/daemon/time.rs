@@ -2,10 +2,104 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Formats `YYYY-MM-DDTHH:MM:SS.` into `dst` (20 ASCII bytes) for years `0000..=9999`.
+fn format_sec_prefix(secs: i64, dst: &mut [u8; 20]) -> bool {
+    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    let (y, m, day) = civil_from_days(days);
+    if !(0..=9999).contains(&y) {
+        return false;
+    }
+    let y = y as u32;
+    let m = m as u32;
+    let day = day as u32;
+    let h = (rem / 3600) as u32;
+    let mi = (rem % 3600 / 60) as u32;
+    let s = (rem % 60) as u32;
+    dst[0] = b'0' + (y / 1000) as u8;
+    dst[1] = b'0' + ((y / 100) % 10) as u8;
+    dst[2] = b'0' + ((y / 10) % 10) as u8;
+    dst[3] = b'0' + (y % 10) as u8;
+    dst[4] = b'-';
+    dst[5] = b'0' + (m / 10) as u8;
+    dst[6] = b'0' + (m % 10) as u8;
+    dst[7] = b'-';
+    dst[8] = b'0' + (day / 10) as u8;
+    dst[9] = b'0' + (day % 10) as u8;
+    dst[10] = b'T';
+    dst[11] = b'0' + (h / 10) as u8;
+    dst[12] = b'0' + (h % 10) as u8;
+    dst[13] = b':';
+    dst[14] = b'0' + (mi / 10) as u8;
+    dst[15] = b'0' + (mi % 10) as u8;
+    dst[16] = b':';
+    dst[17] = b'0' + (s / 10) as u8;
+    dst[18] = b'0' + (s % 10) as u8;
+    dst[19] = b'.';
+    true
+}
+
+#[inline]
+fn format_nanos_z(mut nanos: u32, dst: &mut [u8; 10]) {
+    dst[9] = b'Z';
+    for i in (0..9).rev() {
+        dst[i] = b'0' + (nanos % 10) as u8;
+        nanos /= 10;
+    }
+}
+
+/// 1-entry per-second cache for streaming RFC 3339 nanosecond timestamps
+/// (`api::logs`), avoiding per-line `civil_from_days` and heap allocations.
+pub struct Rfc3339Cache {
+    last_sec: i64,
+    valid: bool,
+    prefix: [u8; 20],
+}
+
+impl Default for Rfc3339Cache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Rfc3339Cache {
+    pub fn new() -> Self {
+        Self { last_sec: i64::MIN, valid: false, prefix: [0u8; 20] }
+    }
+
+    pub fn write_ns(&mut self, out: &mut Vec<u8>, ns: u64) {
+        let secs = (ns / 1_000_000_000) as i64;
+        let nanos = (ns % 1_000_000_000) as u32;
+        if !self.valid || self.last_sec != secs {
+            self.last_sec = secs;
+            self.valid = format_sec_prefix(secs, &mut self.prefix);
+        }
+        if self.valid {
+            let mut tail = [0u8; 10];
+            format_nanos_z(nanos, &mut tail);
+            out.reserve(30);
+            out.extend_from_slice(&self.prefix);
+            out.extend_from_slice(&tail);
+        } else {
+            let s = rfc3339(UNIX_EPOCH + std::time::Duration::from_nanos(ns));
+            out.extend_from_slice(s.as_bytes());
+        }
+    }
+}
+
 /// `2026-10-24T09:41:07.123456789Z`
 pub fn rfc3339(t: SystemTime) -> String {
     let d = t.duration_since(UNIX_EPOCH).unwrap_or_default();
     let secs = d.as_secs() as i64;
+    let mut prefix = [0u8; 20];
+    if format_sec_prefix(secs, &mut prefix) {
+        let mut tail = [0u8; 10];
+        format_nanos_z(d.subsec_nanos(), &mut tail);
+        let mut buf = [0u8; 30];
+        buf[..20].copy_from_slice(&prefix);
+        buf[20..].copy_from_slice(&tail);
+        // SAFETY: `format_sec_prefix` and `format_nanos_z` write pure ASCII bytes.
+        return std::str::from_utf8(&buf).expect("ascii timestamp").to_owned();
+    }
     let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
     let (y, m, day) = civil_from_days(days);
     format!(

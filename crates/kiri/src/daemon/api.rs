@@ -4404,7 +4404,7 @@ fn exec_inspect(e: &super::engine::Exec) -> Value {
 }
 
 fn logs(req: &Request, engine: &Engine, id: &str, w: &mut UnixStream) -> io::Result<Next> {
-    use super::logfile::{Record, parse_tail, parse_time};
+    use super::logfile::{parse_tail, parse_time};
     let (want_out, want_err, stamps) = (req.flag("stdout"), req.flag("stderr"), req.flag("timestamps"));
     if !want_out && !want_err {
         error(w, Error::BadRequest("Bad parameters: you must choose at least one stream".into()))?;
@@ -4433,35 +4433,43 @@ fn logs(req: &Request, engine: &Engine, id: &str, w: &mut UnixStream) -> io::Res
     // Frames are gathered into chunks of up to 32 KiB: one write per line
     // would make a long log slow to read.
     let mut out = Vec::with_capacity(40 << 10);
-    let mut line = Vec::new();
-    let mut put = |r: &Record, out: &mut Vec<u8>| -> io::Result<()> {
-        let wanted = match r.stream {
+    let mut ts_cache = time::Rfc3339Cache::new();
+    let mut put = |stream: Stream, time_ns: u64, data: &[u8], out: &mut Vec<u8>| {
+        let wanted = match stream {
             Stream::Stdout => want_out,
             Stream::Stderr => want_err,
         };
-        if !wanted || since.is_some_and(|s| r.time < s) {
-            return Ok(());
+        if !wanted || since.is_some_and(|s| time_ns < s) {
+            return;
         }
-        let data = if stamps {
-            line.clear();
-            line.extend_from_slice(time::rfc3339(std::time::UNIX_EPOCH + std::time::Duration::from_nanos(r.time)).as_bytes());
-            line.push(b' ');
-            line.extend_from_slice(&r.data);
-            &line[..]
+        if tty {
+            if stamps {
+                ts_cache.write_ns(out, time_ns);
+                out.push(b' ');
+            }
+            out.extend_from_slice(data);
         } else {
-            &r.data[..]
-        };
-        if tty { out.extend_from_slice(data) } else { http::mux_frame(out, r.stream as u8, data)? }
-        Ok(())
+            let hdr_pos = out.len();
+            out.extend_from_slice(&[stream as u8, 0, 0, 0, 0, 0, 0, 0]);
+            if stamps {
+                ts_cache.write_ns(out, time_ns);
+                out.push(b' ');
+            }
+            out.extend_from_slice(data);
+            let payload_len = (out.len() - hdr_pos - 8) as u32;
+            out[hdr_pos + 4..hdr_pos + 8].copy_from_slice(&payload_len.to_be_bytes());
+        }
     };
-    let past_until = |r: &Record| until.is_some_and(|u| r.time > u);
+    let past_until = |time_ns: u64| until.is_some_and(|u| time_ns > u);
     let mut ended = false;
-    for r in logs.past.tail(tail) {
-        if past_until(&r) {
+    let mut past = logs.past.tail(tail);
+    let mut rec_buf = Vec::with_capacity(256);
+    while let Some((stream, time_ns)) = past.next_into(&mut rec_buf) {
+        if past_until(time_ns) {
             ended = true;
             break;
         }
-        put(&r, &mut out)?;
+        put(stream, time_ns, &rec_buf, &mut out);
         if out.len() >= 32 << 10 {
             http::chunk(w, &out)?;
             out.clear();
@@ -4474,11 +4482,11 @@ fn logs(req: &Request, engine: &Engine, id: &str, w: &mut UnixStream) -> io::Res
             let mut next = Some(r);
             // Whatever else is already waiting goes in the same chunk.
             while let Some(r) = next {
-                if past_until(&r) {
+                if past_until(r.time) {
                     http::chunk(w, &out)?;
                     break 'live;
                 }
-                put(&r, &mut out)?;
+                put(r.stream, r.time, &r.data, &mut out);
                 next = if out.len() < 32 << 10 { rx.try_recv().ok() } else { None };
             }
             http::chunk(w, &out)?;

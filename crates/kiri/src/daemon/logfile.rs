@@ -156,6 +156,32 @@ pub fn dir(root: &Path, id: &str) -> PathBuf {
     root.join("containers").join(id)
 }
 
+/// Fast SWAR search for `b'\n'` within `haystack` (8 bytes per step, zero dependencies).
+#[inline]
+fn find_nl(haystack: &[u8]) -> Option<usize> {
+    const LO: u64 = 0x0101_0101_0101_0101;
+    const HI: u64 = 0x8080_8080_8080_8080;
+    const NL: u64 = 0x0a0a_0a0a_0a0a_0a0a;
+    let mut i = 0;
+    let chunks_end = haystack.len() & !7;
+    while i < chunks_end {
+        let word = u64::from_le_bytes(haystack[i..i + 8].try_into().expect("8 bytes"));
+        let x = word ^ NL;
+        let has_zero = x.wrapping_sub(LO) & !x & HI;
+        if has_zero != 0 {
+            return Some(i + (has_zero.trailing_zeros() as usize >> 3));
+        }
+        i += 8;
+    }
+    while i < haystack.len() {
+        if haystack[i] == b'\n' {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Splits a chunk of output into records: one per line (with its newline),
 /// a trailing piece without one, and lines over 16 KiB in pieces.
 pub fn split(data: &[u8]) -> impl Iterator<Item = &[u8]> {
@@ -164,7 +190,8 @@ pub fn split(data: &[u8]) -> impl Iterator<Item = &[u8]> {
         if rest.is_empty() {
             return None;
         }
-        let end = rest.iter().position(|&b| b == b'\n').map_or(rest.len(), |i| i + 1).min(MAX_LINE);
+        let window = &rest[..rest.len().min(MAX_LINE)];
+        let end = find_nl(window).map_or(window.len(), |i| i + 1);
         let (line, more) = rest.split_at(end);
         rest = more;
         Some(line)
@@ -173,11 +200,15 @@ pub fn split(data: &[u8]) -> impl Iterator<Item = &[u8]> {
 
 fn encode(out: &mut Vec<u8>, stream: Stream, time: u64, data: &[u8]) {
     let len = (9 + data.len()) as u32;
-    out.extend_from_slice(&len.to_be_bytes());
-    out.push(stream as u8);
-    out.extend_from_slice(&time.to_be_bytes());
+    let len_bytes = len.to_be_bytes();
+    let mut header = [0u8; 13];
+    header[..4].copy_from_slice(&len_bytes);
+    header[4] = stream as u8;
+    header[5..13].copy_from_slice(&time.to_be_bytes());
+    out.reserve(17 + data.len());
+    out.extend_from_slice(&header);
     out.extend_from_slice(data);
-    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(&len_bytes);
 }
 
 fn stream_of(b: u8) -> Option<Stream> {
@@ -273,10 +304,22 @@ impl Log {
         if self.gone {
             return;
         }
+        if !self.off && self.ring.is_none() && self.buf.capacity() < FLUSH_BYTES {
+            self.buf.reserve(FLUSH_BYTES + 256 - self.buf.len());
+        }
         for line in split(data) {
-            if !self.followers.is_empty() {
-                let rec = Record { stream, time, data: line.to_vec() };
-                self.followers.retain(|tx| tx.send(rec.clone()).is_ok());
+            match self.followers.len() {
+                0 => {}
+                1 => {
+                    let rec = Record { stream, time, data: line.to_vec() };
+                    if self.followers[0].send(rec).is_err() {
+                        self.followers.clear();
+                    }
+                }
+                _ => {
+                    let rec = Record { stream, time, data: line.to_vec() };
+                    self.followers.retain(|tx| tx.send(rec.clone()).is_ok());
+                }
             }
             if self.off {
                 continue;
@@ -298,7 +341,7 @@ impl Log {
             encode(&mut self.buf, stream, time, line);
             self.size += len;
         }
-        if self.buf.len() >= FLUSH_BYTES || self.flushed.elapsed() >= FLUSH_AFTER {
+        if !self.buf.is_empty() && (self.buf.len() >= FLUSH_BYTES || self.flushed.elapsed() >= FLUSH_AFTER) {
             self.flush();
         }
     }
@@ -492,11 +535,17 @@ impl Snapshot {
                 if left == 0 {
                     break;
                 }
-                let starts = match back_starts(f, *len, left) {
-                    Some(s) => s,
-                    // Not walkable backwards: read it forwards.
-                    None => forward_starts(f, *len),
-                };
+                if let Some((count, earliest)) = back_tail(f, *len, left) {
+                    if count >= left {
+                        start = (i, earliest);
+                        break 'files;
+                    }
+                    left -= count;
+                    start = (i, 0);
+                    continue;
+                }
+                // Not walkable backwards: read it forwards.
+                let starts = forward_starts(f, *len);
                 if starts.len() >= left {
                     start = (i, starts[starts.len() - left]);
                     break 'files;
@@ -512,9 +561,9 @@ impl Snapshot {
 
 const BLOCK: u64 = 64 << 10;
 
-/// The start offsets of up to the last `want` records of a file, in file
-/// order; `None` if a length does not add up.
-fn back_starts(f: &File, len: u64, want: usize) -> Option<Vec<u64>> {
+/// `(count, earliest_start)` of up to the last `want` records of a file without
+/// allocating a start-offset vector; `None` if a length does not add up.
+fn back_tail(f: &File, len: u64, want: usize) -> Option<(usize, u64)> {
     let mut block: Vec<u8> = Vec::new();
     let mut block_at = 0u64;
     let mut read_u32 = |pos: u64| -> Option<u32> {
@@ -528,9 +577,9 @@ fn back_starts(f: &File, len: u64, want: usize) -> Option<Vec<u64>> {
         let i = (pos - block_at) as usize;
         Some(u32::from_be_bytes(block[i..i + 4].try_into().ok()?))
     };
-    let mut starts = Vec::new();
+    let mut count = 0usize;
     let mut pos = len;
-    while pos > 0 && starts.len() < want {
+    while pos > 0 && count < want {
         if pos < 8 {
             return None;
         }
@@ -542,11 +591,10 @@ fn back_starts(f: &File, len: u64, want: usize) -> Option<Vec<u64>> {
         if read_u32(start)? != n {
             return None;
         }
-        starts.push(start);
         pos = start;
+        count += 1;
     }
-    starts.reverse();
-    Some(starts)
+    Some((count, pos))
 }
 
 fn forward_starts(f: &File, len: u64) -> Vec<u64> {
@@ -572,10 +620,10 @@ pub struct Reader {
     pos: u64,
 }
 
-impl Iterator for Reader {
-    type Item = Record;
-
-    fn next(&mut self) -> Option<Record> {
+impl Reader {
+    /// Reads the next record's payload into `buf` (reusing its allocation) and
+    /// returns `(stream, time_ns)`, avoiding a heap allocation per log line.
+    pub fn next_into(&mut self, buf: &mut Vec<u8>) -> Option<(Stream, u64)> {
         loop {
             if self.cur.is_none() {
                 if self.files.is_empty() {
@@ -590,10 +638,10 @@ impl Iterator for Reader {
                 self.cur = Some((r.take(len.saturating_sub(off)), len));
             }
             let (r, _) = self.cur.as_mut().expect("set");
-            match read_record(r) {
-                Some(rec) => {
-                    self.pos += 17 + rec.data.len() as u64;
-                    return Some(rec);
+            match read_record_into(r, buf) {
+                Some((stream, time)) => {
+                    self.pos += 17 + buf.len() as u64;
+                    return Some((stream, time));
                 }
                 // The end of this file, or a torn record: on to the next.
                 None => self.cur = None,
@@ -602,7 +650,17 @@ impl Iterator for Reader {
     }
 }
 
-fn read_record(r: &mut impl Read) -> Option<Record> {
+impl Iterator for Reader {
+    type Item = Record;
+
+    fn next(&mut self) -> Option<Record> {
+        let mut data = Vec::new();
+        let (stream, time) = self.next_into(&mut data)?;
+        Some(Record { stream, time, data })
+    }
+}
+
+fn read_record_into(r: &mut impl Read, buf: &mut Vec<u8>) -> Option<(Stream, u64)> {
     let mut head = [0u8; 13];
     r.read_exact(&mut head).ok()?;
     let n = u32::from_be_bytes(head[..4].try_into().ok()?);
@@ -611,11 +669,12 @@ fn read_record(r: &mut impl Read) -> Option<Record> {
     }
     let stream = stream_of(head[4])?;
     let time = u64::from_be_bytes(head[5..13].try_into().ok()?);
-    let mut data = vec![0u8; n as usize - 9];
-    r.read_exact(&mut data).ok()?;
+    buf.clear();
+    buf.resize(n as usize - 9, 0);
+    r.read_exact(buf).ok()?;
     let mut tail = [0u8; 4];
     r.read_exact(&mut tail).ok()?;
-    (u32::from_be_bytes(tail) == n).then_some(Record { stream, time, data })
+    (u32::from_be_bytes(tail) == n).then_some((stream, time))
 }
 
 /// `since`/`until` as the CLI sends them: Unix seconds with an optional
