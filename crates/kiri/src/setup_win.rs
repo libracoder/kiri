@@ -17,7 +17,7 @@ use crate::dockerctx::{
 const USAGE: &str = "usage: kiri setup [--use]";
 
 fn npipe_host(pipe: &str) -> String {
-    format!("npipe:////{}", pipe.replace('\\', "/").trim_start_matches('/'))
+    crate::dockerctx::npipe_host(pipe)
 }
 
 /// Best-effort background self-heal of `%USERPROFILE%\.docker\config.json` and

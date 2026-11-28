@@ -1771,7 +1771,7 @@ fn ensure_windows_kiri_context() {
     let plugins = crate::dockerctx::find_windows_cli_plugins(exe.as_deref(), local.as_deref());
     let desktop = std::env::var_os("ProgramFiles")
         .is_some_and(|p| std::path::Path::new(&p).join(r"Docker\Docker\Docker Desktop.exe").is_file());
-    let host = format!("npipe:{}", client::pipe().replace('\\', "/"));
+    let host = crate::dockerctx::npipe_host(&client::pipe());
     let _ = crate::dockerctx::repair_windows_config(
         &dir,
         crate::dockerctx::WindowsRepairOpts {
