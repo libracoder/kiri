@@ -2939,14 +2939,28 @@ setInterval(() => {
 }, 1000);
 /* Kubernetes' wheel, as in the image catalog (Simple Icons). */
 const K8S_LOGO = "M10.2 14.3l0 0-1 2.4a5.2 5.2 0 0 1-2.1-2.6l2.6-.4 0 0a.4.4 0 0 1 .5.6zm-.8-2.1a.4.4 0 0 0 .2-.8l0 0L7.6 9.7a5.1 5.1 0 0 0-.7 3.3l2.5-.7 0 0zm1.1-2a.4.4 0 0 0 .7-.3l0 0 .1-2.6a5.1 5.1 0 0 0-3 1.4l2.1 1.5 0 0zm.8 2.8l.7.3.7-.3.2-.8-.5-.6h-.8l-.5.6.2.8zm1.5-3.1a.4.4 0 0 0 .7.3l0 0 2.1-1.5a5.2 5.2 0 0 0-3-1.4l.1 2.6 0 0zm10.9 6l-5.8 7.2a1.6 1.6 0 0 1-1.2.6l-9.3 0a1.6 1.6 0 0 1-1.2-.6l-5.8-7.2a1.6 1.6 0 0 1-.3-1.3L2.1 5.6c.1-.5.4-.9.9-1.1L11.3.5a1.6 1.6 0 0 1 1.4 0l8.3 4c.4.2.8.6.9 1.1l2.1 9c.1.5 0 1-.3 1.3zm-3.3-2.1c0 0-.1 0-.1 0-.2 0-.3 0-.5 0-.3 0-.6-.1-.9-.1-.1 0-.2-.2-.2-.2l-.2-.1a6.5 6.5 0 0 0-.1-2.3 6.5 6.5 0 0 0-.9-2.2c.1 0 .1-.1.2-.2 0-.1 0-.2.1-.3.2-.2.4-.3.7-.5.1-.1.3-.1.4-.2 0 0 .1-.1.1-.1.2-.2.3-.5.1-.7-.2-.2-.5-.2-.7 0 0 0-.1.1-.1.1-.1.1-.2.2-.3.3-.2.2-.5.5-.7.6-.1.1-.2 0-.3 0l-.2.1a6.5 6.5 0 0 0-4.1-2l0-.2c-.1-.1-.1-.1-.2-.2 0-.3 0-.6.1-.9 0-.2.1-.3.1-.5 0 0 0-.1 0-.1 0-.3-.2-.6-.5-.6-.3 0-.5.2-.5.6l0 0c0 0 0 .1 0 .1 0 .2 0 .3.1.5 0 .3.1.6.1.9a.5.5 0 0 1-.2.3l0 .2a6.4 6.4 0 0 0-4.2 2 8.4 8.4 0 0 1-.2-.1c-.1 0-.2 0-.3 0-.2-.1-.4-.4-.7-.6-.1-.1-.2-.2-.3-.3 0 0-.1-.1-.1-.1a.6.6 0 0 0-.3-.1.5.5 0 0 0-.4.2c-.2.2-.1.5.1.7l0 0 .1.1c.1.1.3.2.4.2.3.2.5.3.7.5.1.1.1.2.1.3l.2.1a6.5 6.5 0 0 0-1 4.5l-.2.1c-.1.1-.1.2-.2.2-.3.1-.5.1-.9.1-.2 0-.3 0-.5 0 0 0-.1 0-.1 0l0 0 0 0c-.3.1-.5.3-.4.6.1.3.3.4.6.4l0 0 0 0 .1 0c.2 0 .3-.1.4-.2.3-.1.6-.2.9-.3.1 0 .2.1.3.1l.2 0a6.5 6.5 0 0 0 2.9 3.6l-.1.2c0 .1.1.2 0 .3-.1.3-.3.5-.5.8-.1.1-.2.2-.3.4 0 0 0 .1-.1.1-.1.3 0 .6.2.7.2.1.6 0 .7-.3v0c0 0 0-.1.1-.1.1-.2.1-.3.1-.5.1-.3.2-.7.4-.9.1-.1.1-.1.2-.1l.1-.2a6.5 6.5 0 0 0 4.6 0l.1.2c.1 0 .2 0 .3.2.1.2.2.5.3.8.1.2.1.3.1.5 0 0 0 .1.1.1.1.3.4.4.7.3.2-.1.3-.4.2-.7 0 0 0-.1-.1-.1-.1-.2-.2-.3-.3-.4-.2-.3-.3-.5-.4-.8 0-.1 0-.2 0-.3 0 0-.1-.1-.1-.2a6.5 6.5 0 0 0 2.9-3.6c.1 0 .2 0 .2 0 .1-.1.1-.1.3-.1.3 0 .5.1.9.3.2.1.3.1.4.2 0 0 .1 0 .1 0l0 0 0 0c.3.1.6-.1.6-.4.1-.3-.1-.5-.4-.6zM16.4 9.7l-1.9 1.7v0a.4.4 0 0 0 .2.8l0 0 2.5.7a5.2 5.2 0 0 0-.1-1.7A5.2 5.2 0 0 0 16.4 9.7zm-4 5.3a.4.4 0 0 0-.4-.2.4.4 0 0 0-.4.2h0l-1.3 2.3a5.2 5.2 0 0 0 3.3 0l-1.3-2.3h0zm1.9-1.3a.4.4 0 0 0-.3 0 .4.4 0 0 0-.2.6l0 0 1 2.4a5.2 5.2 0 0 0 2.1-2.6l-2.6-.4 0 0z";
+/* Deduplicated brand logo map (`slug -> [hex, path]`) populated from IPC snapshots,
+   plus memoized tile markup so identical brand icons don't recompute luminance or string concat. */
+const BRANDS = new Map();
+const TILE_CACHE = new Map();
+function mergeBrands(b) {
+  if (!b) return;
+  for (const [k, v] of Object.entries(b)) if (Array.isArray(v)) BRANDS.set(k, v);
+}
 /* The image's brand logo in its own colour (dark brand colours are lifted so
    they stay visible), or a Phosphor icon when the catalog has no logo. */
 function tile(icon, fallback = "stack") {
-  if (!icon) return `<div class="tile"><svg viewBox="0 0 256 256"><path d="${PH[fallback]}"/></svg></div>`;
-  const [hex, d] = icon;
+  const pair = typeof icon === "string" ? BRANDS.get(icon) : icon;
+  if (!pair) return `<div class="tile"><svg viewBox="0 0 256 256"><path d="${PH[fallback]}"/></svg></div>`;
+  const [hex, d] = pair;
+  const key = typeof icon === "string" ? icon : `${hex}:${d.length}:${d.slice(0, 16)}`;
+  let html = TILE_CACHE.get(key);
+  if (html) return html;
   const n = parseInt(hex, 16), lum = (0.2126 * (n >> 16) + 0.7152 * (n >> 8 & 255) + 0.0722 * (n & 255)) / 255;
   const fg = lum < 0.22 ? `color-mix(in srgb, #${hex} 45%, var(--text))` : `#${hex}`;
-  return `<div class="tile" style="background:color-mix(in srgb, #${hex} 14%, var(--raised));box-shadow:none;color:${fg}"><svg viewBox="0 0 24 24"><path d="${d}"/></svg></div>`;
+  html = `<div class="tile" style="background:color-mix(in srgb, #${hex} 14%, var(--raised));box-shadow:none;color:${fg}"><svg viewBox="0 0 24 24"><path d="${d}"/></svg></div>`;
+  TILE_CACHE.set(key, html);
+  return html;
 }
 // A reference by digest (repo@sha256:…) splits at the @: the digest is its tag.
 function split(name) {
@@ -8780,6 +8794,7 @@ window.kiri = {
         if ($("vm-meter").style.width !== meter) $("vm-meter").style.width = meter;
         break;
       case "lists":
+        if (e.brands) mergeBrands(e.brands);
         // Links need the routers' ports: ask once the engine answers.
         if ((!ui.rports || ui.rports.error) && Date.now() - ui.rpAt > 5000) { ui.rpAt = Date.now(); send("routerports"); }
         // Run's look at an image's start script makes a container it never starts; and
@@ -9372,6 +9387,7 @@ function k8sOn(e) {
   const d = k8s.detail;
   switch (e.type) {
     case "k8s": {
+      if (e.brands) mergeBrands(e.brands);
       // A list read just before a button was pressed doesn't end its command.
       k8s.op = e.op || (Date.now() - k8s.opAt < 4000 ? k8s.op : "");
       if (!k8s.op) k8s.opLine = "";
@@ -9580,7 +9596,7 @@ const podOf = (d) => k8s.pods.find((p) => p.ns === d.ns && p.name === d.name);
 const nsRank = (n) => (n === "default" ? 0 : n.startsWith("kube-") ? 2 : 1);
 const nsOrder = (a, b) => nsRank(a) - nsRank(b) || a.localeCompare(b);
 const POD_SORT = {
-  name: (p) => p.name, status: (p) => p.status, ready: (p) => p.ready, restarts: (p) => p.restarts,
+  name: (p) => p.name, status: (p) => p.status, ready: (p) => p.ready, restarts: (p) => p.restarts || 0,
   age: (p) => Date.now() - Date.parse(p.created || 0),
 };
 
@@ -9727,7 +9743,7 @@ function podInfo(p) {
       ${row(tr("Status"), `${podPill(p)}${waiting ? `<div class="muted" style="margin-top:4px">${esc(waiting)}</div>` : ""}`)}
       ${row(tr("Namespace"), esc(p.ns))}
       ${row(tr("Ready"), tr("{ready} containers", { ready: esc(p.ready) }))}
-      ${row(tr("Restarts"), String(p.restarts))}
+      ${row(tr("Restarts"), String(p.restarts || 0))}
       ${row(tr("Age"), created ? `${rlm()}<span data-kage="${esc(p.created)}">${podAge(p)}</span> <span class="muted">· ${tr("created {date}", { date: esc(new Date(created).toLocaleString()) })}</span>` : "")}
       ${row(tr("Pod IP"), p.ip && `<span class="mono">${esc(p.ip)}</span>`)}
       ${row(tr("Node"), p.node && esc(p.node))}
@@ -9736,7 +9752,7 @@ function podInfo(p) {
     </dl>
     <h4 class="ksec">${tr("Containers")}</h4>
     <table class="ktable"><thead><tr><th>${tr("Name")}</th><th>${tr("Image")}</th><th>${tr("State")}</th><th class="r">${tr("Restarts")}</th></tr></thead><tbody>
-      ${p.containers.map((c) => `<tr><td>${esc(c.name)}</td><td class="mono muted">${esc(c.image)}</td><td>${containerState(c)}</td><td class="r num">${c.restarts}</td></tr>`).join("")}
+      ${p.containers.map((c) => `<tr><td>${esc(c.name)}</td><td class="mono muted">${esc(c.image)}</td><td>${containerState(c)}</td><td class="r num">${c.restarts || 0}</td></tr>`).join("")}
     </tbody></table>
     <h4 class="ksec">${tr("Labels")}</h4>
     ${labels.length ? `<table class="ktable"><thead><tr><th>${tr("Key")}</th><th>${tr("Value")}</th></tr></thead><tbody>

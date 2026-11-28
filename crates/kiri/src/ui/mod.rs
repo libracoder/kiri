@@ -1707,18 +1707,25 @@ fn refresh(connected: &mut bool) {
         let images = client::get_background("/images/json")?;
         let volumes = client::get_background("/volumes")?;
         let networks = client::get_background("/networks")?;
-        let add_icon = |mut v: serde_json::Value, name_of: &dyn Fn(&serde_json::Value) -> String| {
+        let mut used_brands = serde_json::Map::new();
+        let mut add_icon = |mut v: serde_json::Value, name_of: &dyn Fn(&serde_json::Value) -> String| {
             if let Some(list) = v.as_array_mut() {
                 for item in list {
-                    let icon = brand(&name_of(item));
-                    item["icon"] = serde_json::json!(icon);
+                    if let Some(slug) = brand(&name_of(item)) {
+                        if !used_brands.contains_key(slug)
+                            && let Some(svg) = brand_svg(slug)
+                        {
+                            used_brands.insert(slug.to_owned(), serde_json::json!(svg));
+                        }
+                        item["icon"] = serde_json::Value::String(slug.to_owned());
+                    }
                 }
             }
             v
         };
         let containers = add_icon(containers, &|c| c["Image"].as_str().unwrap_or_default().to_owned());
         let images = add_icon(images, &|i| i["RepoTags"][0].as_str().unwrap_or_default().to_owned());
-        Ok(serde_json::json!({"type": "lists", "containers": containers, "images": images, "volumes": volumes["Volumes"], "networks": networks}))
+        Ok(serde_json::json!({"type": "lists", "brands": used_brands, "containers": containers, "images": images, "volumes": volumes["Volumes"], "networks": networks}))
     })();
     match lists {
         Ok(v) => {
@@ -1859,18 +1866,22 @@ fn compose_store() -> Option<std::path::PathBuf> {
     state_dir().map(|d| d.join("compose.json"))
 }
 
-/// Looks up the brand logo for an image name like `bitnami/redis:7`: first by
+/// Looks up the brand slug for an image name like `bitnami/redis:7`: first by
 /// the whole repository path, then by its last component.
-fn brand(name: &str) -> Option<[&'static str; 2]> {
+fn brand(name: &str) -> Option<&'static str> {
     let name = name.split_once('@').map_or(name, |(n, _)| n);
     let repo = match name.rfind(':') {
         Some(i) if !name[i..].contains('/') => &name[..i],
         _ => name,
     };
     let last = repo.rsplit('/').next().unwrap_or(repo);
-    let slug = [repo, last]
+    [repo, last]
         .into_iter()
-        .find_map(|key| brands::IMAGES.binary_search_by_key(&key, |(k, _)| k).ok().map(|i| brands::IMAGES[i].1))?;
+        .find_map(|key| brands::IMAGES.binary_search_by_key(&key, |(k, _)| k).ok().map(|i| brands::IMAGES[i].1))
+}
+
+/// Resolves a brand slug to its `[hex, svg_path]` entry in [`brands::BRANDS`].
+pub(super) fn brand_svg(slug: &str) -> Option<[&'static str; 2]> {
     let i = brands::BRANDS.binary_search_by_key(&slug, |(s, _, _)| s).ok()?;
     let (_, hex, path) = brands::BRANDS[i];
     Some([hex, path])
@@ -1882,7 +1893,7 @@ fn pulled(reference: &str, ms: u128) -> String {
     let mut s = r#"{"type":"pulled","name":"#.to_string();
     json_str(&mut s, reference);
     s.push_str(&format!(r#","ms":{ms},"icon":"#));
-    match brand(reference) {
+    match brand(reference).and_then(brand_svg) {
         Some([hex, path]) => {
             s.push('[');
             json_str(&mut s, hex);

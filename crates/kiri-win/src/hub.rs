@@ -114,7 +114,7 @@ fn search(term: &str) -> Result<Value, String> {
                 "description": r["description"],
                 "stars": r["star_count"],
                 "official": r["is_official"],
-                "icon": crate::engine::brand(name),
+                "icon": crate::engine::brand(name).and_then(crate::engine::brand_svg),
             })
         })
         .collect())
