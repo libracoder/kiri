@@ -80,14 +80,25 @@ pub fn list() {
 pub fn usage() {
     std::thread::spawn(|| {
         let v = match share::whoami() {
-            Ok(w) => json!({
-                "type": "shareusage", "login": w["login"], "used": w["usage"]["used"], "cap": w["usage"]["cap"],
-                "tunnels": w["limits"]["tunnels"], "rate": w["limits"]["rate"], "warning": w["limits"]["warning"],
-            }),
+            Ok(w) => usage_event(&w),
             Err(e) => json!({"type": "shareusage", "error": e.to_string()}),
         };
         emit(v.to_string());
     });
+}
+
+/// The edge's whoami as the page's `shareusage`, each field its type: the
+/// counts whole numbers (null when absent or not one, as for no cap or no
+/// tunnel limit), the login text and the warning a flag. The page puts
+/// these into its HTML, so nothing else the answer holds may get there.
+fn usage_event(w: &Value) -> Value {
+    // A count: a whole number, or a number written with a fraction or an
+    // exponent (`1e12`), never text; past u64 it is as good as no limit.
+    let n = |v: &Value| v.as_u64().or_else(|| v.as_f64().filter(|f| f.is_finite() && *f >= 0.0 && *f < 1.8e19).map(|f| f as u64));
+    json!({
+        "type": "shareusage", "login": w["login"].as_str(), "used": n(&w["usage"]["used"]).unwrap_or(0), "cap": n(&w["usage"]["cap"]),
+        "tunnels": n(&w["limits"]["tunnels"]), "rate": n(&w["limits"]["rate"]), "warning": w["limits"]["warning"].as_bool().unwrap_or(false),
+    })
 }
 
 fn event(id: u64, ev: share::Event) -> Value {
@@ -422,6 +433,20 @@ pub fn sign_out() {
 
 #[cfg(test)]
 mod tests {
+    /// Whatever the edge answers, the page gets numbers where it shows
+    /// sizes and counts, text for the login and a flag for the warning.
+    #[test]
+    fn the_usage_the_page_gets_is_typed() {
+        let good = serde_json::json!({"login": "ada", "usage": {"used": 1234, "cap": 5_000_000_000u64}, "limits": {"tunnels": 3, "rate": 1_000_000, "warning": true}});
+        assert_eq!(super::usage_event(&good), serde_json::json!({"type": "shareusage", "login": "ada", "used": 1234, "cap": 5_000_000_000u64, "tunnels": 3, "rate": 1_000_000, "warning": true}));
+        let none = serde_json::json!({"login": "ada", "usage": {"used": 0}, "limits": {}});
+        assert_eq!(super::usage_event(&none), serde_json::json!({"type": "shareusage", "login": "ada", "used": 0, "cap": null, "tunnels": null, "rate": null, "warning": false}));
+        let hostile = serde_json::json!({"login": {"x": "<b>"}, "usage": {"used": "<img src=x onerror=alert(1)>", "cap": "1<b>"}, "limits": {"tunnels": "<svg onload=alert(1)>", "rate": [1], "warning": "yes"}});
+        assert_eq!(super::usage_event(&hostile), serde_json::json!({"type": "shareusage", "login": null, "used": 0, "cap": null, "tunnels": null, "rate": null, "warning": false}));
+        let floats = serde_json::json!({"usage": {"used": 12.0, "cap": 1e12}, "limits": {"tunnels": -1, "rate": 1e30}});
+        assert_eq!(super::usage_event(&floats), serde_json::json!({"type": "shareusage", "login": null, "used": 12, "cap": 1_000_000_000_000u64, "tunnels": null, "rate": null, "warning": false}));
+    }
+
     use super::*;
 
     fn t(url: &str, machine: &str, device: &str, kind: &str, client: &str) -> share::LiveTunnel {

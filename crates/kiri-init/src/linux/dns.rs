@@ -3021,7 +3021,7 @@ mod tests {
         assert_eq!(dns.pending.len(), 1, "IPv6-enabled bridge forwards external AAAA upstream");
     }
 
-    /// GHSA-7x2g-c7pw-mpc6: a container whose networks are all `--internal`
+    /// A container whose networks are all `--internal`
     /// (or disconnected from all networks) gets immediate `REFUSED` over both
     /// UDP and TCP, even with `--dns` custom upstreams and `relay: true`,
     /// while internal container names still resolve and attaching an external

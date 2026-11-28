@@ -1,6 +1,7 @@
 //! HostConfig settings applied when a container starts, from the `opts`
 //! lines of `Run` and `Exec`: resource limits (`--ulimit`), sysctls,
-//! devices and device rules, and supplementary groups (`--group-add`). The
+//! devices and device rules, supplementary groups (`--group-add`), and the
+//! AppArmor profile on a Linux host that has AppArmor. The
 //! daemon has checked them already; this side refuses anything malformed
 //! rather than trusting it.
 
@@ -72,6 +73,9 @@ pub struct HostOpts {
     /// Timer slack (`timerslack_ns`, in nanoseconds) applied to the container's
     /// init process so high-frequency background pollers coalesce cleanly (#989).
     pub timer_slack_ns: Option<u64>,
+    /// The AppArmor profile the process runs under (see `apparmor`); none
+    /// leaves it as the agent is.
+    pub apparmor: Option<String>,
 }
 
 fn bad(line: &str) -> io::Error {
@@ -141,10 +145,17 @@ pub fn parse(list: StrList<'_>) -> io::Result<HostOpts> {
                 }
                 o.timer_slack_ns = Some(ns);
             }
+            ["apparmor", p] if valid_profile(p) => o.apparmor = Some((*p).to_owned()),
             _ => return Err(bad(line)),
         }
     }
     Ok(o)
+}
+
+/// A profile name the kernel can be asked for: printable, no spaces (the
+/// request is `exec <name>`), not empty.
+fn valid_profile(name: &str) -> bool {
+    !name.is_empty() && name.len() <= 255 && name.bytes().all(|b| b.is_ascii_graphic())
 }
 
 /// Docker's error for a device it cannot add.
@@ -477,15 +488,23 @@ mod tests {
         assert_eq!(o.readonly, Some(vec![c"/proc/sys".to_owned(), c"/data".to_owned()]));
         assert!(o.cgroupns_host);
         assert_eq!(o.timer_slack_ns, None);
-        let buf = list(&["timerslack\t10000000"]);
+        let buf = list(&["timerslack\t10000000", "apparmor\tkiri-default"]);
         let kiri_proto::Msg::Retain(l) = kiri_proto::decode(&buf).unwrap() else { panic!() };
-        assert_eq!(parse(l).unwrap().timer_slack_ns, Some(10_000_000));
+        let o = parse(l).unwrap();
+        assert_eq!(o.timer_slack_ns, Some(10_000_000));
+        assert_eq!(o.apparmor.as_deref(), Some("kiri-default"));
+        let buf = list(&["group\tvideo"]);
+        let kiri_proto::Msg::Retain(l) = kiri_proto::decode(&buf).unwrap() else { panic!() };
+        assert_eq!(parse(l).unwrap().apparmor, None);
         for bad_path in ["masked\tproc/kcore", "masked\t/../etc", "readonly\t/proc/../etc"] {
             let buf = list(&[bad_path]);
             let kiri_proto::Msg::Retain(l) = kiri_proto::decode(&buf).unwrap() else { panic!() };
             assert!(parse(l).is_err(), "{bad_path}");
         }
         for bad in [
+            "apparmor\t",
+            "apparmor\ttwo words",
+            "apparmor\ta\tb",
             "sysctl\tnet\tkernel/core_pattern\t|x",
             "sysctl\tipc\tkernel/../x\t1",
             "sysctl\tuts\tkernel/hostname\tx",

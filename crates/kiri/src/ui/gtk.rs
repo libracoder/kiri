@@ -20,7 +20,10 @@ use gtk::gdk_pixbuf::{Pixbuf, PixbufLoader};
 use gtk::glib;
 use gtk::prelude::*;
 use javascriptcore::ValueExt;
-use webkit2gtk::{SettingsExt, UserContentInjectedFrames, UserContentManager, UserContentManagerExt, UserScript, UserScriptInjectionTime, WebView, WebViewExt};
+use webkit2gtk::{
+    NavigationPolicyDecision, NavigationPolicyDecisionExt, PolicyDecisionExt, PolicyDecisionType, SettingsExt, URIRequestExt, UserContentInjectedFrames, UserContentManager, UserContentManagerExt, UserScript,
+    UserScriptInjectionTime, WebView, WebViewExt,
+};
 
 use super::{Cmd, PAGE, engine, prefs};
 
@@ -28,6 +31,8 @@ thread_local! {
     /// The page and its window. Only ever touched on GTK's main thread.
     static WEBVIEW: RefCell<Option<WebView>> = const { RefCell::new(None) };
     static WINDOW: RefCell<Option<gtk::Window>> = const { RefCell::new(None) };
+    /// The host just started loading the page: the one navigation let through.
+    static HOST_LOAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Where a page made again (after the window let go of its own) sends
     /// its messages.
     static PAGE_TX: RefCell<Option<mpsc::Sender<Cmd>>> = const { RefCell::new(None) };
@@ -127,6 +132,22 @@ fn make_webview(tx: mpsc::Sender<Cmd>, autostart: bool, view: Option<String>) ->
         _ => desktop_dark(),
     };
     webview.set_background_color(&page_background(dark));
+    // Only the page itself loads; a link, a dropped file or a script sending
+    // the window elsewhere is ignored, and nothing opens a new window, as on
+    // the Mac and Windows. Responses keep WebKit's own handling.
+    webview.connect_decide_policy(|_, decision, kind| {
+        let allow = match kind {
+            PolicyDecisionType::NavigationAction => {
+                let url = decision.downcast_ref::<NavigationPolicyDecision>().and_then(|d| d.navigation_action()).and_then(|a| a.request()).and_then(|r| r.uri()).map(|u| u.to_string()).unwrap_or_default();
+                super::may_navigate(HOST_LOAD.with(|h| h.replace(false)), true, &url)
+            }
+            PolicyDecisionType::NewWindowAction => false,
+            _ => return false,
+        };
+        if allow { decision.use_() } else { decision.ignore() }
+        true
+    });
+    HOST_LOAD.with(|h| h.set(true));
     webview.load_html(&super::assemble::page(PAGE, super::prefs()["lang"].as_str()), None);
     webview
 }

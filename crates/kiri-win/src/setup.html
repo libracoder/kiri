@@ -296,12 +296,18 @@ main.choose .foot{position:sticky;bottom:-24px;margin-bottom:-24px;padding:14px 
    engine.rs answers, setup.rs taking only setup- commands), and its answer
    calls kiriWords with that language's words, packed the same way. */
 var KEYS = [], STRINGS = {};
+/* As the main window's safeWords: a translation keeps only the tags its English
+   key has, exactly as written there; any other tag, and any stray "<", is text. */
+function safeWords(key, w) {
+  var ok = String(key).match(/<[^<>]*>/g) || [];
+  return String(w).replace(/<[^<>]*>|</g, function (t) { return ok.indexOf(t) >= 0 ? t : t.replace(/</g, '&lt;').replace(/>/g, '&gt;'); });
+}
 function addWords(p) {
   if (p.en) KEYS = p.en;
   for (var t in p) {
     if (t === 'en' || !p[t]) continue;
     var m = {};
-    for (var i = 0; i < KEYS.length; i++) if (p[t][i] != null) m[KEYS[i]] = RTL.test(t) ? rtlReady(p[t][i]) : p[t][i];
+    for (var i = 0; i < KEYS.length; i++) if (p[t][i] != null) m[KEYS[i]] = RTL.test(t) ? rtlReady(safeWords(KEYS[i], p[t][i])) : safeWords(KEYS[i], p[t][i]);
     STRINGS[t] = m;
   }
 }

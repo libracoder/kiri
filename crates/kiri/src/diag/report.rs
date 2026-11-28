@@ -90,11 +90,14 @@ fn tail(path: &Path, max: u64) -> String {
     let Ok(mut f) = std::fs::File::open(path) else { return String::new() };
     let len = f.metadata().map(|m| m.len()).unwrap_or(0);
     let from = len.saturating_sub(max);
-    if f.seek(SeekFrom::Start(from)).is_err() {
+    // From the byte before the window too: when it ends a line, the window
+    // starts a whole one, and the cut below keeps it.
+    let start = from.saturating_sub(1);
+    if f.seek(SeekFrom::Start(start)).is_err() {
         return String::new();
     }
     let mut buf = Vec::new();
-    let _ = f.take(max).read_to_end(&mut buf);
+    let _ = f.take(max + (from - start)).read_to_end(&mut buf);
     let text = String::from_utf8_lossy(&buf).into_owned();
     match (from > 0, text.find('\n')) {
         (true, Some(i)) => text[i + 1..].to_owned(),
@@ -1139,5 +1142,32 @@ mod tests {
             resolve_out_path(Some(PathBuf::from("/tmp/kiri-report.txt")), Some(&wsl)).unwrap(),
             PathBuf::from("/tmp/kiri-report.txt")
         );
+    }
+}
+
+#[cfg(test)]
+mod tail_tests {
+    use super::*;
+
+    /// The window's first line is kept when the window starts it; cut off
+    /// in the middle, it goes.
+    #[test]
+    fn tail_keeps_a_first_line_the_window_starts_with() {
+        let dir = std::env::temp_dir().join(format!("kiri-report-tail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("log");
+        for (content, max, want) in [
+            ("first\nsecond\n", 7, "second\n"),
+            ("first\nsecond\n", 9, "second\n"),
+            ("first\nsecond\n", 6, ""),
+            ("first\nsecond\n", 13, "first\nsecond\n"),
+            ("a\nbb\ncc", 5, "bb\ncc"),
+            ("ğ\nok\n", 3, "ok\n"),
+        ] {
+            std::fs::write(&p, content).unwrap();
+            assert_eq!(tail(&p, max), want, "{content:?} {max}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

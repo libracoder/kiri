@@ -11,7 +11,7 @@ crates/kiri-win/src/setup.html, instead of the main window).
 
     python3 scripts/ui-test.py [tests/ui/switch.js ...]
 """
-import html, json, os, re, subprocess, sys, tempfile
+import base64, hashlib, html, json, os, re, subprocess, sys, tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CHROME = os.environ.get("CHROME", "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
@@ -20,10 +20,16 @@ UI = os.path.join(ROOT, "crates/kiri/src/ui")
 
 # The results, in the page; and to the page around it when a test runs in a
 # frame of a given size (`// window:`).
-REPORT = ('const report = (lines) => { if (window.parent !== window) parent.postMessage(lines.join("\\n"), "*");'
+REPORT = ('const report = (lines) => { lines = lines.concat(window.CSP_FAILS || []); if (window.parent !== window) parent.postMessage(lines.join("\\n"), "*");'
           ' document.body.insertAdjacentHTML("beforeend", `<pre id="results">${lines.join("\\n")}</pre>`); };')
 CATCH = ('<script>window.onerror = (m, u, l) => { const s = `FAIL page error: ${m} (line ${l})`; if (window.parent !== window) parent.postMessage(s, "*");'
-         ' document.body.insertAdjacentHTML("beforeend", `<pre id="results">${s}</pre>`); };</script>')
+         ' document.body.insertAdjacentHTML("beforeend", `<pre id="results">${s}</pre>`); };'
+         # Anything the page's Content-Security-Policy refuses is a failure too, unless a test expects it (csp.js).
+         # Before the test reports, the line joins its report; after, its results (the last ones the run reads).
+         ' document.addEventListener("securitypolicyviolation", (e) => { if (window.CSP_EXPECTED) return;'
+         ' const s = `FAIL the page broke its own security policy: ${e.violatedDirective} ${e.blockedURI || ""} (line ${e.lineNumber})`;'
+         ' const r = [...document.querySelectorAll("#results")].pop(); if (!r) { (window.CSP_FAILS ||= []).push(s); return; }'
+         ' r.textContent += "\\n" + s; if (window.parent !== window) parent.postMessage(r.textContent, "*"); });</script>')
 
 
 def strings():
@@ -312,7 +318,26 @@ def page(test, os_name=None):
     if os_name and os_name != "macos":
         index = index.replace("<head>", f'<head><script>window.KIRI_OS = "{os_name}";</script>', 1)
     fixture = open(os.path.join(ROOT, "tests/ui/fixture.js")).read()
-    return index[: index.rindex("</body>")] + CATCH + f"<script>{REPORT}\n{fixture}\n{host(packed)}\n{open(test).read()}</script></body></html>"
+    return script_hashes(index[: index.rindex("</body>")] + CATCH + f"<script>{REPORT}\n{fixture}\n{host(packed)}\n{open(test).read()}</script></body></html>")
+
+
+def script_hashes(doc):
+    """As assemble.rs's with_script_hashes: the policy's /*SCRIPT_HASHES*/ becomes each
+    <script>'s SHA-256 (CR LF read as LF, as HTML does), the test's own scripts included."""
+    at = doc.find("/*SCRIPT_HASHES*/")
+    if at < 0:
+        return doc
+    hashes, pos = [], 0
+    while True:
+        i = find_tag(doc, "<script", pos)
+        if i < 0: break
+        o = doc.index(">", i) + 1
+        c = find_tag(doc, "</script", o)
+        c = len(doc) if c < 0 else c
+        text = doc[o:c].replace("\r\n", "\n").replace("\r", "\n")
+        hashes.append("'sha256-" + base64.b64encode(hashlib.sha256(text.encode("utf-8")).digest()).decode() + "'")
+        pos = c
+    return doc[:at] + " ".join(hashes) + doc[at + len("/*SCRIPT_HASHES*/"):]
 
 
 def run(test, os_name=None):

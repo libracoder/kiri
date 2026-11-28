@@ -260,27 +260,34 @@ pub fn domains() -> io::Result<()> {
         println!("containers answer at http://<name>.kiri.local");
         return Ok(());
     }
-    let tmp = std::env::temp_dir().join(format!("kiri-resolver-{}", std::process::id()));
-    std::fs::write(&tmp, format!("# Kiri: container names (kiri setup --uninstall removes this)\nnameserver 127.0.0.1\nport {}\n", dns::PORT))?;
     // /var/run/docker.sock with the same password, when it is free. Its
     // failing must not undo the names: how it went is read back after.
     let link = docker_socket_script()?;
-    let (command, why) = match &link {
-        Some(l) => (
-            format!("mkdir -p /etc/resolver && cp '{}' {} && chmod 644 {} && ({l} || true)", tmp.display(), dns::RESOLVER, dns::RESOLVER),
-            "Kiri wants to give your containers names like myapp.kiri.local, and to answer at /var/run/docker.sock for tools that look for Docker there.",
-        ),
-        None => (format!("mkdir -p /etc/resolver && cp '{}' {} && chmod 644 {}", tmp.display(), dns::RESOLVER, dns::RESOLVER), "Kiri wants to give your containers names like myapp.kiri.local."),
+    let command = resolver_install_command(dns::PORT, dns::RESOLVER, link.as_deref());
+    let why = if link.is_some() {
+        "Kiri wants to give your containers names like myapp.kiri.local, and to answer at /var/run/docker.sock for tools that look for Docker there."
+    } else {
+        "Kiri wants to give your containers names like myapp.kiri.local."
     };
     let result = as_admin(&command, why);
-    let _ = std::fs::remove_file(&tmp);
-    if let Some(l) = &link {
-        let _ = std::fs::remove_file(&l.tmp);
+    if link.is_some() {
         let _ = docker_socket_fallback(&crate::daemon::socket_path()?);
     }
     result?;
     println!("containers answer at http://<name>.kiri.local");
     Ok(())
+}
+
+fn resolver_install_command(port: u16, resolver: &str, link_cmd: Option<&str>) -> String {
+    let r_new = sh_quote(&format!("{resolver}.new"));
+    let r_dst = sh_quote(resolver);
+    let base = format!(
+        "mkdir -p /etc/resolver && printf '%s\\n' '# Kiri: container names (kiri setup --uninstall removes this)' 'nameserver 127.0.0.1' 'port {port}' > {r_new} && chown root:wheel {r_new} && chmod 644 {r_new} && mv -f {r_new} {r_dst}"
+    );
+    match link_cmd {
+        Some(l) => format!("{base} && ({l} || true)"),
+        None => base,
+    }
 }
 
 /// Where tools that ignore docker contexts look for Docker: docker-py, Go's
@@ -328,63 +335,56 @@ fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// The root commands that link /var/run/docker.sock to Kiri's socket and
-/// install the LaunchDaemon that puts it back at boot.
-struct LinkScript {
-    command: String,
-    /// The LaunchDaemon's plist, written here for the command to copy.
-    tmp: PathBuf,
-}
-
-impl std::fmt::Display for LinkScript {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.command)
-    }
-}
-
 /// The commands for when /var/run/docker.sock is free; None when it is
 /// Kiri's already or another engine's, or for Kiri Dev.
-fn docker_socket_script() -> io::Result<Option<LinkScript>> {
+fn docker_socket_script() -> io::Result<Option<String>> {
     let ours = crate::daemon::socket_path()?;
     if dev() || docker_sock_at_ours(&ours) != Endpoint::Free {
         return Ok(None);
     }
-    let esc = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;");
-    let ours_s = ours.to_string_lossy();
+    docker_socket_command_for(&ours).map(Some)
+}
+
+fn docker_socket_command_for(ours: &Path) -> io::Result<String> {
+    let Some(ours_s) = ours.to_str() else {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "socket path is not valid UTF-8"));
+    };
+    if ours_s.is_empty() || ours_s.contains(['\0', '\n', '\r', '\'', '"']) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "socket path contains unsupported characters"));
+    }
+    let esc = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
     let boot = format!("[ -e {DOCKER_SOCK} ] || [ -L {DOCKER_SOCK} ] || ln -s \"$1\" {DOCKER_SOCK}");
-    let plist = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>{SOCKET_LABEL}</string>
-  <key>ProgramArguments</key><array><string>/bin/sh</string><string>-c</string><string>{}</string><string>kiri-docker-socket</string><string>{}</string></array>
-  <key>RunAtLoad</key><true/>
-</dict>
-</plist>
-"#,
-        esc(&boot),
-        esc(&ours_s)
-    );
-    let tmp = std::env::temp_dir().join(format!("kiri-docker-socket-{}.plist", std::process::id()));
-    std::fs::write(&tmp, plist)?;
+    let lines = [
+        r#"<?xml version="1.0" encoding="UTF-8"?>"#.to_owned(),
+        r#"<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">"#.to_owned(),
+        r#"<plist version="1.0">"#.to_owned(),
+        r#"<dict>"#.to_owned(),
+        format!("  <key>Label</key><string>{SOCKET_LABEL}</string>"),
+        format!(
+            "  <key>ProgramArguments</key><array><string>/bin/sh</string><string>-c</string><string>{}</string><string>kiri-docker-socket</string><string>{}</string></array>",
+            esc(&boot),
+            esc(ours_s)
+        ),
+        r#"  <key>RunAtLoad</key><true/>"#.to_owned(),
+        r#"</dict>"#.to_owned(),
+        r#"</plist>"#.to_owned(),
+    ];
+    let quoted_lines = lines.iter().map(|l| sh_quote(l)).collect::<Vec<_>>().join(" ");
+    let plist_new = sh_quote(&format!("{SOCKET_DAEMON}.new"));
+    let plist_dst = sh_quote(SOCKET_DAEMON);
     // `[ ! -e ]` again as root: another engine may have started since. A
     // link left dangling by a removed engine is replaced.
-    let command = format!(
-        "cp {} {SOCKET_DAEMON} && chown root:wheel {SOCKET_DAEMON} && chmod 644 {SOCKET_DAEMON} && [ ! -e {DOCKER_SOCK} ] && rm -f {DOCKER_SOCK} && ln -s {} {DOCKER_SOCK}",
-        sh_quote(&tmp.to_string_lossy()),
-        sh_quote(&ours_s)
-    );
-    Ok(Some(LinkScript { command, tmp }))
+    Ok(format!(
+        "mkdir -p /Library/LaunchDaemons && printf '%s\\n' {quoted_lines} > {plist_new} && chown root:wheel {plist_new} && chmod 644 {plist_new} && mv -f {plist_new} {plist_dst} && [ ! -e {DOCKER_SOCK} ] && rm -f {DOCKER_SOCK} && ln -s {} {DOCKER_SOCK}",
+        sh_quote(ours_s)
+    ))
 }
 
 /// `kiri setup --docker-socket`: /var/run/docker.sock to Kiri, if free
 /// (macOS asks for the password).
 pub fn docker_socket() -> io::Result<()> {
-    let Some(l) = docker_socket_script()? else { return Ok(()) };
-    let result = as_admin(&l.command, "Kiri wants to answer at /var/run/docker.sock, for tools that look for Docker there.");
-    let _ = std::fs::remove_file(&l.tmp);
-    result
+    let Some(command) = docker_socket_script()? else { return Ok(()) };
+    as_admin(&command, "Kiri wants to answer at /var/run/docker.sock, for tools that look for Docker there.")
 }
 
 /// Says where tools that ignore docker contexts find Kiri, and keeps
@@ -492,7 +492,7 @@ pub fn remove_domains() -> io::Result<()> {
 /// "Kiri wants to make changes". AppleScript belongs on the main thread: the
 /// window's workers hand it there, and the CLI is already on it.
 pub(crate) fn as_admin(command: &str, why: &str) -> io::Result<()> {
-    let script = format!("do shell script \"{}\" with prompt \"{}\" with administrator privileges", command.replace('"', "\\\""), why.replace('"', "\\\""));
+    let script = apple_script_source(command, why)?;
     // SAFETY: pthread_main_np only reads the calling thread's state.
     if unsafe { libc::pthread_main_np() } == 1 {
         return apple_script(&script);
@@ -500,6 +500,16 @@ pub(crate) fn as_admin(command: &str, why: &str) -> io::Result<()> {
     let mut result = None;
     dispatch2::DispatchQueue::main().exec_sync(|| result = Some(apple_script(&script)));
     result.unwrap_or_else(|| Err(io::Error::other("the password prompt did not run")))
+}
+
+fn apple_script_source(command: &str, why: &str) -> io::Result<String> {
+    if command.contains(['\0', '\r', '\n']) || why.contains(['\0', '\r', '\n']) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "AppleScript command or prompt contains control line breaks or NUL"));
+    }
+    // Escape `\` BEFORE `"` so a trailing backslash before a quote (`\"`)
+    // becomes `\\\"` instead of `\\"`, which would close the AppleScript string.
+    let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+    Ok(format!("do shell script \"{}\" with prompt \"{}\" with administrator privileges", esc(command), esc(why)))
 }
 
 fn apple_script(source: &str) -> io::Result<()> {
@@ -1587,5 +1597,34 @@ mod tests {
         assert_eq!(super::homebrew_kiri_candidates(Some(std::ffi::OsStr::new("/opt/homebrew"))).len(), 2);
 
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn admin_applescript_escapes_backslashes_before_quotes_and_avoids_tmpdir() {
+        let src = super::apple_script_source(r#"printf '%s\n' "hi""#, r#"Prompt \"here\""#).unwrap();
+        assert_eq!(
+            src,
+            r#"do shell script "printf '%s\\n' \"hi\"" with prompt "Prompt \\\"here\\\"" with administrator privileges"#,
+        );
+        // `\"` in input must NOT become `\\"` (unescaped quote after escaped backslash).
+        let tricky = super::apple_script_source(r#"echo \"safe"#, "why").unwrap();
+        assert!(tricky.contains(r#"echo \\\"safe"#), "{tricky}");
+        assert!(super::apple_script_source("echo\nboom", "why").is_err());
+        assert!(super::apple_script_source("echo\0boom", "why").is_err());
+
+        let sock_cmd = super::docker_socket_command_for(std::path::Path::new("/Users/ada/.kiri/run/docker.sock")).unwrap();
+        assert!(!sock_cmd.contains("TMPDIR") && !sock_cmd.contains("/tmp/") && !sock_cmd.contains("/var/folders/"), "{sock_cmd}");
+        assert!(sock_cmd.contains("/Library/LaunchDaemons/dev.kiri.docker-socket.plist.new"), "{sock_cmd}");
+        assert!(sock_cmd.contains("chown root:wheel") && sock_cmd.contains("chmod 644") && sock_cmd.contains("mv -f"), "{sock_cmd}");
+        assert!(super::apple_script_source(&sock_cmd, "prompt").is_ok());
+
+        for bad in ["/Users/ada/bad\nsock", "/Users/ada/bad'sock", "/Users/ada/bad\"sock", ""] {
+            assert!(super::docker_socket_command_for(std::path::Path::new(bad)).is_err(), "{bad:?}");
+        }
+
+        let res_cmd = super::resolver_install_command(19353, "/etc/resolver/kiri.local", Some(&sock_cmd));
+        assert!(!res_cmd.contains("/tmp/") && !res_cmd.contains("kiri-resolver-"), "{res_cmd}");
+        assert!(res_cmd.contains("'/etc/resolver/kiri.local.new'") && res_cmd.contains("mv -f '/etc/resolver/kiri.local.new' '/etc/resolver/kiri.local'"), "{res_cmd}");
+        assert!(super::apple_script_source(&res_cmd, "prompt").is_ok());
     }
 }

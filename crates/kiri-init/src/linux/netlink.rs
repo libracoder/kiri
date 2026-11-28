@@ -2365,7 +2365,7 @@ mod tests {
         assert_eq!(attrs(get(&info, IFLA_INFO_SLAVE_DATA)), vec![(IFLA_BRPORT_ISOLATED, &[1u8][..])]);
     }
 
-    /// `--internal` networks (GHSA-gp5c-4g58-vr24, #1010):
+    /// `--internal` networks (#1010, #1013):
     /// 1. `prerouting` accepts `iifname == b` ahead of `HOST_ADDR`, `WSL_HOST_ADDR`,
     ///    `dnat`, and `EGRESS_ROUTES` redirects in both VM and Linux-host modes.
     /// 2. `forward` drops `iifname == b && oifname != b` and `oifname == b && iifname != b`

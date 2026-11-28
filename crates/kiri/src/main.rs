@@ -106,6 +106,8 @@ mod wsl;
 mod share;
 #[cfg(any(target_os = "macos", all(target_os = "linux", feature = "window")))]
 mod ui;
+#[allow(dead_code)]
+mod weburl;
 #[cfg(unix)]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod tools;

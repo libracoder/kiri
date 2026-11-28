@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src /*SCRIPT_HASHES*/; style-src 'unsafe-inline'; img-src data:; connect-src 'none'; font-src 'none'; media-src 'none'; object-src 'none'; frame-src 'none'; worker-src 'none'; manifest-src 'none'; base-uri 'none'; form-action 'none'">
 <title>Kiri</title>
 <style>
 /* Kiri window. Hand-written, no framework: only the rules this page uses. */
@@ -2658,9 +2659,17 @@ const send = (cmd, extra = {}) => window.webkit?.messageHandlers?.kiri?.postMess
    calls kiriWords with that language's words, packed the same way. */
 const KEYS = [];
 const STRINGS = {};
+/* Translations go into the page as HTML, so a translation keeps only the tags
+   its English key has, each exactly as written there (attributes and all);
+   any other tag, and any "<" not starting one of those, shows as text.
+   scripts/i18n-check.py refuses such words too: this is the second wall. */
+function safeWords(key, w) {
+  const ok = new Set(String(key).match(/<[^<>]*>/g) || []);
+  return String(w).replace(/<[^<>]*>|</g, (t) => (ok.has(t) ? t : t.replace(/</g, "&lt;").replace(/>/g, "&gt;")));
+}
 function addWords(p) {
   if (p.en) KEYS.splice(0, KEYS.length, ...p.en);
-  for (const t of Object.keys(p)) if (t !== "en" && Array.isArray(p[t])) STRINGS[t] = Object.fromEntries(KEYS.flatMap((k, i) => (p[t][i] == null ? [] : [[k, RTL.test(t) ? rtlReady(p[t][i]) : p[t][i]]])));
+  for (const t of Object.keys(p)) if (t !== "en" && Array.isArray(p[t])) STRINGS[t] = Object.fromEntries(KEYS.flatMap((k, i) => (p[t][i] == null ? [] : [[k, RTL.test(t) ? rtlReady(safeWords(k, p[t][i])) : safeWords(k, p[t][i])]])));
 }
 /* Written right to left. */
 const RTL = /^(ar|fa|ckb)$/;
@@ -2854,6 +2863,8 @@ const vmLabels = { stopped: "Off", booting: "Starting…", running: "Running", s
 /* i18n */ void [tr("Mac"), tr("PC"), tr("computer"), tr("Linux VM"), tr("Engine")];
 
 function size(b) {
+  // A number, whatever came: text never reaches the HTML through a size.
+  b = Number(b) || 0;
   const u = ["B", "KB", "MB", "GB"]; let i = 0;
   while (b >= 1000 && i < u.length - 1) { b /= 1000; i++; }
   return i ? `${b.toFixed(1)} ${u[i]}` : `${b} B`;
@@ -3894,13 +3905,13 @@ function renderDetail() {
     <div class="dtabs" role="tablist">${tabs}<span class="spacer"></span><span class="dacts">
       ${shareBtn(c, d.name, true)}
       ${reachable ? ibtn("open", tr("Open {url}", { url: esc(domain) }), `data-open="${esc(domain)}"`) : ""}
-      ${up ? lbtn("restart", tr("Restart"), `data-c="restart" data-id="${c.Id}"`) : ""}
-      ${up ? lbtn("stop", tr("Stop"), `data-c="stop" data-id="${c.Id}"`, "halt") : lbtn("play", tr("Start"), `data-c="start" data-id="${c.Id}"`, "go")}
-      ${isKiriK8s(c) || project ? "" : lbtn("trash", tr("Remove"), `data-c="remove" data-id="${c.Id}"`, "danger")}
-      ${btn("⋯", `data-more="${c.Id}"${project ? ` data-noremove data-mfile="${pe}" data-svc="${esc(c.Labels?.["com.docker.compose.service"] || "")}"` : ""} title="${tr("More")}" aria-label="${tr("More actions for {name}", { name: esc(d.name) })}" aria-haspopup="menu"`, "more")}
+      ${up ? lbtn("restart", tr("Restart"), `data-c="restart" data-id="${esc(c.Id)}"`) : ""}
+      ${up ? lbtn("stop", tr("Stop"), `data-c="stop" data-id="${esc(c.Id)}"`, "halt") : lbtn("play", tr("Start"), `data-c="start" data-id="${esc(c.Id)}"`, "go")}
+      ${isKiriK8s(c) || project ? "" : lbtn("trash", tr("Remove"), `data-c="remove" data-id="${esc(c.Id)}"`, "danger")}
+      ${btn("⋯", `data-more="${esc(c.Id)}"${project ? ` data-noremove data-mfile="${pe}" data-svc="${esc(c.Labels?.["com.docker.compose.service"] || "")}"` : ""} title="${tr("More")}" aria-label="${tr("More actions for {name}", { name: esc(d.name) })}" aria-haspopup="menu"`, "more")}
     </span></div>
     ${c.State === "exited" && c.KiriOOMKilled ? oomLine(tr("Stopped: out of memory"), c.KiriFinishedAt ? tr("{time} ago, when the VM's {mem} ran out.", { time: since(c.KiriFinishedAt), mem: memText(ui.mem?.ceiling || 0) }) : tr("when the VM's {mem} ran out.", { mem: memText(ui.mem?.ceiling || 0) }),
-      btn(tr("Start again"), `data-c="start" data-id="${c.Id}"`) + btn(tr("More memory"), "data-memmore")) : ""}
+      btn(tr("Start again"), `data-c="start" data-id="${esc(c.Id)}"`) + btn(tr("More memory"), "data-memmore")) : ""}
     ${fixPanel(c)}`;
   const content = $("content");
   let body = $("dbody");
@@ -3999,13 +4010,22 @@ function filesView(d) {
 
 /* A container's local address: the name it chose with the dev.kiri.domain
    label, else its Compose service.project, else its own name. */
+// A plain host name, as weburl.rs's plain_name: letters, digits, "-" and "_"
+// in dot-separated parts of 1 to 63, 253 in all, no dot or dash at either end.
+const plainName = (n) => n.length <= 253 && !/^[.-]|[.-]$/.test(n) && n.split(".").every((p) => /^[a-z0-9_-]{1,63}$/.test(p));
+// A container's local address, or "" (no Open button, no chip) when its name
+// is not a plain host name: dev.kiri.domain is anyone's text. The Mac menu's
+// local_url (mod.rs) and the engine (own_name) apply the same rule.
 function localUrl(c, name) {
   const scheme = ui.https ? "https" : "http", r = ui.rports?.[scheme];
   if (r && (r.running === false || r.serving === false)) return "";
-  const chosen = (c.Labels?.["dev.kiri.domain"] || "").split(",")[0].trim().replace(/\.kiri\.local(host)?$/, "");
+  const label = String(c.Labels?.["dev.kiri.domain"] || "").trim();
   const project = c.Labels?.["com.docker.compose.project"];
-  const port = r && r.port !== r.default ? `:${r.port}` : "";
-  return `${scheme}://${chosen || (project ? `${c.Labels["com.docker.compose.service"]}.${project}` : name)}.${ui.suffix}${port}`;
+  const host = (label ? label.split(",")[0].trim().toLowerCase().replace(/\.kiri\.local(host)?$/, "")
+    : project ? `${c.Labels["com.docker.compose.service"]}.${project}` : String(name || "")).toLowerCase();
+  if (!plainName(host)) return "";
+  const pn = Number(r?.port), port = r && pn && r.port !== r.default ? `:${pn}` : "";
+  return `${scheme}://${host}.${ui.suffix}${port}`;
 }
 
 /* The tiny Kiri: the mark's body, lid and eyes. */
@@ -5477,7 +5497,7 @@ function noMatch() {
 function ports(c, first) {
   const seen = new Set();
   const all = (c.Ports || []).filter((p) => p.PublicPort && !seen.has(p.PublicPort) && seen.add(p.PublicPort));
-  const link = (p) => `<a class="port" data-open="http://localhost:${p.PublicPort}">${p.PublicPort}→${p.PrivatePort}</a>`;
+  const link = (p) => `<a class="port" data-open="http://localhost:${Number(p.PublicPort)}">${Number(p.PublicPort)}→${Number(p.PrivatePort)}</a>`;
   if (!first || all.length <= first) return all.map(link).join(" ");
   const rest = all.slice(first);
   return `${all.slice(0, first).map(link).join(" ")} <button class="port-more" data-detail="${esc(c.Id)}" title="${esc(rest.map((p) => `${p.PublicPort}→${p.PrivatePort}`).join("\n"))}">${tr("+{n} more", { n: rest.length })}</button>`;
@@ -6284,21 +6304,21 @@ function containerRow(c, member = false, o = {}) {
     // Pressed Start: rolls until it's up, then its buttons ease in once. Stop, Restart and Remove roll till the list shows the change.
     const starting = !up && ui.starting.has(c.Id), enter = up && ui.starting.delete(c.Id) ? "enter" : "", roll = (a) => (ui.acting.get(c.Id)?.action === a ? " rolling" : "");
     const more = `${o.remove === false ? " data-noremove" : ""}${o.file ? ` data-mfile="${esc(project || "")}" data-svc="${esc(c.Labels?.["com.docker.compose.service"] || "")}"` : ""}`;
-    return `<tr class="row${member ? " member" : ""}${chosen(v, c)}" data-rowopen="detail" data-key="${c.Id}"${pickAt(v, c)}>
-      ${pickCell(v, c)}<td><div class="name" data-detail="${c.Id}">${member ? `<span class="tree${member === "last" ? " last" : ""}" aria-hidden="true"></span>` : ""}<div class="tile-wrap">${tile(c.icon, "cube")}${reach ? `<span class="kbadge" title="${tr("Reachable at {addr}", { addr: esc(domain) })}">${KDOT}</span>` : ""}</div><div title="${esc(name)}"><span class="link">${esc(name)}</span>${isKiriK8s(c) ? `<span class="k8s-mark" title="${tr("Kiri's Kubernetes cluster")}" aria-label="Kubernetes"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="${K8S_LOGO}"/></svg></span>` : ""}${reach ? `<div class="sub-name"><button class="sub-addr" data-open="${esc(domain)}" title="${tr("Open {addr}", { addr: esc(domain) })}">${esc(domain.replace(/^https?:\/\//, ""))}</button></div>` : `<div class="sub-name" title="${esc(c.Image)}">${esc(refLabel(c.Image))}</div>`}</div></div></td>
+    return `<tr class="row${member ? " member" : ""}${chosen(v, c)}" data-rowopen="detail" data-key="${esc(c.Id)}"${pickAt(v, c)}>
+      ${pickCell(v, c)}<td><div class="name" data-detail="${esc(c.Id)}">${member ? `<span class="tree${member === "last" ? " last" : ""}" aria-hidden="true"></span>` : ""}<div class="tile-wrap">${tile(c.icon, "cube")}${reach ? `<span class="kbadge" title="${tr("Reachable at {addr}", { addr: esc(domain) })}">${KDOT}</span>` : ""}</div><div title="${esc(name)}"><span class="link">${esc(name)}</span>${isKiriK8s(c) ? `<span class="k8s-mark" title="${tr("Kiri's Kubernetes cluster")}" aria-label="Kubernetes"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="${K8S_LOGO}"/></svg></span>` : ""}${reach ? `<div class="sub-name"><button class="sub-addr" data-open="${esc(domain)}" title="${tr("Open {addr}", { addr: esc(domain) })}">${esc(domain.replace(/^https?:\/\//, ""))}</button></div>` : `<div class="sub-name" title="${esc(c.Image)}">${esc(refLabel(c.Image))}</div>`}</div></div></td>
       <td class="clip col-state">${statusPill(c)}</td>
       <td class="num nowrap">${ports(c, 1) || '<span class="muted">—</span>'}</td>
       ${shareOn() ? `<td class="col-share">${shareCell(c, name)}</td>` : ""}
       <td class="r num">${imageSize(c)}</td>
       <td class="muted col-created">${ago(c.Created)}</td>
       <td class="actions"><div class="acts-row">
-        ${up ? ibtn("restart", tr("Restart"), `data-c="restart" data-id="${c.Id}"`, enter + roll("restart"))
+        ${up ? ibtn("restart", tr("Restart"), `data-c="restart" data-id="${esc(c.Id)}"`, enter + roll("restart"))
           : ibtn("restart", tr("Start it to restart it"), "disabled", "ghost")}
-        ${up ? ibtn("stop", tr("Stop"), `data-c="stop" data-id="${c.Id}"`, `halt ${enter}${roll("stop")}`)
-          : ibtn("play", starting ? tr("Starting…") : tr("Start"), `data-c="start" data-id="${c.Id}"`, starting ? "go rolling" : "go")}
+        ${up ? ibtn("stop", tr("Stop"), `data-c="stop" data-id="${esc(c.Id)}"`, `halt ${enter}${roll("stop")}`)
+          : ibtn("play", starting ? tr("Starting…") : tr("Start"), `data-c="start" data-id="${esc(c.Id)}"`, starting ? "go rolling" : "go")}
         ${o.remove === false ? "" : isKiriK8s(c) ? ibtn("trash", tr("Kubernetes is managed in Settings → Kubernetes"), "data-ksettings", "locked")
-          : ibtn("trash", tr("Remove"), `data-c="remove" data-id="${c.Id}"`, "danger" + roll("remove"))}
-        ${btn("⋯", `data-more="${c.Id}"${more} aria-label="${tr("More actions for {name}", { name: esc(name) })}" aria-haspopup="menu"`, "more")}
+          : ibtn("trash", tr("Remove"), `data-c="remove" data-id="${esc(c.Id)}"`, "danger" + roll("remove"))}
+        ${btn("⋯", `data-more="${esc(c.Id)}"${more} aria-label="${tr("More actions for {name}", { name: esc(name) })}" aria-haspopup="menu"`, "more")}
       </div></td></tr>`;
 }
 const restart0 = () => ibtn("restart", tr("Start it to restart it"), "disabled", "ghost");
@@ -6313,17 +6333,17 @@ function openMenu(button, id, project) {
   if (project && ui.view === "compose" && !button.dataset.gview) return showMenu(button, [[tr("Stop all"), `data-g="stop" data-project="${esc(project)}"`]]);
   // A project's: Restart all and Remove project, as its list has them (LISTS[view].groupMenu).
   const own = [[tr("Restart all"), `data-g="restart" data-project="${esc(project)}"`], [tr("Remove project"), `data-g="remove" data-project="${esc(project)}"`, "danger"]];
-  const items = project ? LISTS[button.dataset.gview]?.groupMenu?.(project, own) || own : [[tr("Ports…"), `data-ports="${id}"`]];
+  const items = project ? LISTS[button.dataset.gview]?.groupMenu?.(project, own) || own : [[tr("Ports…"), `data-ports="${esc(id)}"`]];
   if (project) return showMenu(button, items);
   // Open lives here now that the row's first button is Restart.
   const domain = c.State === "running" && c.Ports?.length ? localUrl(c, cname(c)) : "";
   if (domain) items.unshift([tr("Open {addr}", { addr: esc(domain) }), `data-open="${esc(domain)}"`]);
-  if (c.State === "running") items.push([tr("Pause"), `data-c="pause" data-id="${id}"`]);
-  if (c.State === "paused") items.push([tr("Resume"), `data-c="unpause" data-id="${id}"`]);
+  if (c.State === "running") items.push([tr("Pause"), `data-c="pause" data-id="${esc(id)}"`]);
+  if (c.State === "paused") items.push([tr("Resume"), `data-c="unpause" data-id="${esc(id)}"`]);
   // A row drawn without Remove (Compose) has none here either; one of a project's can show its service in the file.
   if (button.dataset.mfile != null) items.push([tr("Show in compose file"), `data-mfile="${esc(button.dataset.mfile)}" data-svc="${esc(button.dataset.svc || "")}"`]);
   // kiri-k8s goes with Kubernetes, in Settings, not from here.
-  if (!isKiriK8s(c) && button.dataset.noremove == null) items.push([tr("Remove"), `data-c="remove" data-id="${id}"`, "danger"]);
+  if (!isKiriK8s(c) && button.dataset.noremove == null) items.push([tr("Remove"), `data-c="remove" data-id="${esc(id)}"`, "danger"]);
   showMenu(button, items);
 }
 function showMenu(button, items) {
@@ -6914,7 +6934,7 @@ function renderUsbBody() {
     <td><div class="name"><button class="usb-caret" data-usbmore="${esc(d.key)}" aria-expanded="${open}" title="${tr("Details")}" aria-label="${tr("Details")}"><svg class="i" viewBox="0 0 256 256" aria-hidden="true"><path d="${PH.caret}"/></svg></button>${tile(null, USB_ICON[usbKind(d)] || "usb")}<div><div>${esc(d.name)}</div>${d.path ? `<div class="mono muted sub">--device ${esc(d.path)}</div>` : ""}</div></div></td>
     <td class="mono muted">${esc(d.id || "—")}</td>
     <td class="muted">${esc(d.speed ? d.speed[0].toUpperCase() + d.speed.slice(1) : "—")}</td>
-    <td><span class="pill ${cls}">${word}</span></td>
+    <td><span class="pill ${cls}">${esc(word)}</span></td>
     <td class="muted">${d.state === "kiri" && d.since ? ago(d.since) : "—"}</td>
     <td class="actions"><div class="acts-row">${act(d)}</div></td></tr>${open ? usbMore(d) : ""}`;
   }), "usb");
@@ -6936,7 +6956,7 @@ function usbMore(d) {
     ["ID", d.id && mono(d.id)],
     [tr("Serial number"), d.serial && mono(d.serial)],
     [tr("Speed"), USB_SPEED[d.speed] && mono(USB_SPEED[d.speed])],
-    [tr("Location"), d.bus && d.dev ? tr("Bus {bus} · Device {dev}", { bus: d.bus, dev: d.dev }) : d.busid ? mono(d.busid) : ""],
+    [tr("Location"), d.bus && d.dev ? tr("Bus {bus} · Device {dev}", { bus: esc(d.bus), dev: esc(d.dev) }) : d.busid ? mono(d.busid) : ""],
     [tr("Attached"), d.state === "kiri" && d.since ? ago(d.since) : ""],
   ].filter(([, v]) => v);
   return `<tr class="usb-more" data-more="${esc(d.key)}"><td data-fill><div class="usb-more-in">
@@ -8295,7 +8315,7 @@ function fixPanel(c) {
     const h = w.holder && (w.holder.Names?.[0] || "").replace(/^\//, "");
     return box(tr("Port {port} is already in use on this {host}", { port: w.port, host: tr(HOST) }), `${quote}
       <p>${h ? tr("{who} has it. Give {name} another port on this {host}, or stop {holder} first.", { who: `<b>${esc(h)}</b>`, name: esc(name), host: tr(HOST), holder: esc(h) }) : tr("Something else on this {host} has it. Give {name} another port.", { host: tr(HOST), name: esc(name) })}</p>
-      <div class="foot">${btn(tr("Use another port"), `data-ports="${c.Id}"`, "primary")}${h ? btn(tr("Stop {name}", { name: esc(h) }), `data-c="stop" data-id="${w.holder.Id}"`) : ""}<span class="note"></span></div>`);
+      <div class="foot">${btn(tr("Use another port"), `data-ports="${esc(c.Id)}"`, "primary")}${h ? btn(tr("Stop {name}", { name: esc(h) }), `data-c="stop" data-id="${esc(w.holder.Id)}"`) : ""}<span class="note"></span></div>`);
   }
   const secs = c.KiriFinishedAt && c.KiriStartedAt ? Math.max(1, Math.round(c.KiriFinishedAt - c.KiriStartedAt)) : 0;
   return box(secs ? trn(secs, "{name} stopped after {n} second", "{name} stopped after {n} seconds", { name: esc(name) }) : tr("{name} didn't start", { name: esc(name) }), `${w.quote ? quote : `<p>${tr("It wrote nothing to its log.")}</p>`}
@@ -8709,7 +8729,7 @@ function drawDetails() {
   const scrim = $("dt");
   if (!scrim || !dt) return;
   const n = dt.lines?.length ?? 0;
-  let parts = [...new Set((dt.lines || []).map((l) => (DG_PART[l.part] && tr(DG_PART[l.part])) || l.part))].join(tr(" and "));
+  let parts = [...new Set((dt.lines || []).map((l) => (DG_PART[l.part] && tr(DG_PART[l.part])) || esc(l.part || "")))].join(tr(" and "));
   // Lowercase in a sentence, but German nouns keep their capital.
   if (LANG !== "de") parts = parts.toLowerCase();
   scrim.innerHTML = `<div class="dialog dt-dialog" role="dialog" aria-modal="true" aria-labelledby="dt-t">
@@ -9746,14 +9766,14 @@ function podInfo(p) {
    those open in the browser; the rest are only reachable in the cluster. */
 const NOT_HTTP = new Set([22, 25, 53, 1883, 2181, 3306, 5432, 5672, 6379, 6443, 9042, 9092, 11211, 27017]);
 const httpPort = (x) => (x.protocol || "TCP") === "TCP" && (/http|web/i.test(`${x.name || ""} ${x.appProtocol || ""}`) || (!NOT_HTTP.has(x.port) && !NOT_HTTP.has(+x.targetPort)));
-const portUrl = (x) => `${/https/i.test(`${x.name || ""} ${x.appProtocol || ""}`) || x.port === 443 || x.port === 8443 ? "https" : "http"}://localhost:${x.port}`;
+const portUrl = (x) => `${/https/i.test(`${x.name || ""} ${x.appProtocol || ""}`) || x.port === 443 || x.port === 8443 ? "https" : "http"}://localhost:${Number(x.port) || 0}`;
 function svcPorts(s) {
   const lb = s.type === "LoadBalancer";
   return (s.ports || []).map((x) => {
     const proto = x.protocol && x.protocol !== "TCP" ? `/${esc(x.protocol)}` : "";
     const to = x.targetPort != null && String(x.targetPort) !== String(x.port) ? `→${esc(x.targetPort)}` : "";
-    if (lb && httpPort(x)) return `<a class="port" data-open="${portUrl(x)}" title="${portUrl(x)}">${x.port}${to}</a>${proto}`;
-    return `<span>${x.port}${x.nodePort && !lb ? `:${x.nodePort}` : ""}${to}${proto}</span>`;
+    if (lb && httpPort(x)) return `<a class="port" data-open="${portUrl(x)}" title="${portUrl(x)}">${esc(x.port)}${to}</a>${proto}`;
+    return `<span>${esc(x.port)}${x.nodePort && !lb ? `:${esc(x.nodePort)}` : ""}${to}${proto}</span>`;
   }).join(", ") || '<span class="muted">—</span>';
 }
 const SVC_SORT = { name: (s) => s.name, ns: (s) => s.ns, type: (s) => s.type, ip: (s) => s.clusterIP, age: (s) => Date.now() - Date.parse(s.created || 0) };
@@ -9868,16 +9888,16 @@ function kShareClick(el) {
   const { web, skipped } = kPorts(kind, x);
   if (kind === "service") {
     if (web.length === 1) return kShare(kKey(kind, ns, name, web[0].port));
-    return kMenu(el, `<div class="hd">${tr("Share which port?")}</div>${web.map((p, i) => `<button role="menuitemradio" aria-checked="${i === 0}" data-kgo="${esc(kKey(kind, ns, name, p.port))}"><span class="p">${p.port}</span><span class="nm">${esc(p.name || "")}</span>${i === 0 ? `<svg class="ck" viewBox="0 0 256 256"><path d="${PH.check}"/></svg>` : ""}</button>`).join("")}
-      ${skipped.length ? `<div class="ft">${trn(skipped.length, "{ports} isn't a web port, so it isn't listed.", "{ports} aren't web ports, so they aren't listed.", { ports: skipped.map((p) => p.port).join(", ") })}</div>` : ""}`);
+    return kMenu(el, `<div class="hd">${tr("Share which port?")}</div>${web.map((p, i) => `<button role="menuitemradio" aria-checked="${i === 0}" data-kgo="${esc(kKey(kind, ns, name, p.port))}"><span class="p">${esc(p.port)}</span><span class="nm">${esc(p.name || "")}</span>${i === 0 ? `<svg class="ck" viewBox="0 0 256 256"><path d="${PH.check}"/></svg>` : ""}</button>`).join("")}
+      ${skipped.length ? `<div class="ft">${trn(skipped.length, "{ports} isn't a web port, so it isn't listed.", "{ports} aren't web ports, so they aren't listed.", { ports: esc(skipped.map((p) => p.port).join(", ")) })}</div>` : ""}`);
   }
   const svcs = kServicesFor(x);
   if (!svcs.length) return kConfirmPod(x, web);
   const runs = x.owner === "ReplicaSet" ? tr("Deployment {name} runs this pod", { name: esc(svcs[0].name) }) : x.owner ? tr("{owner} runs this pod", { owner: esc(x.owner) }) : tr("A service sends traffic to this pod");
   const wheel = tile(k8s.icon, "services");
   kMenu(el, `<div class="hd">${runs}</div>${svcs.map((s, i) => { const p = kPorts("service", s).web[0];
-      return `<button class="opt" aria-checked="${i === 0}" data-kgo="${esc(kKey("service", s.ns, s.name, p.port))}">${wheel}<b>${tr("Share service {name}", { name: esc(s.name) })}${i === 0 ? `<em>${tr("Recommended")}</em>` : ""}</b><small>${tr("Port {port}. The link keeps working when pods restart.", { port: p.port })}</small></button>`; }).join("")}
-    ${web.map((p) => `<button class="opt warn" data-kgo="${esc(kKey("pod", ns, name, p.port))}">${wheel}<b>${tr("Share this pod's port {port}", { port: p.port })}</b><small>${x.owner ? tr("This pod's name changes when it restarts, and the link would end.") : tr("The link ends when the pod does.")}</small></button>`).join("")}
+      return `<button class="opt" aria-checked="${i === 0}" data-kgo="${esc(kKey("service", s.ns, s.name, p.port))}">${wheel}<b>${tr("Share service {name}", { name: esc(s.name) })}${i === 0 ? `<em>${tr("Recommended")}</em>` : ""}</b><small>${tr("Port {port}. The link keeps working when pods restart.", { port: esc(p.port) })}</small></button>`; }).join("")}
+    ${web.map((p) => `<button class="opt warn" data-kgo="${esc(kKey("pod", ns, name, p.port))}">${wheel}<b>${tr("Share this pod's port {port}", { port: esc(p.port) })}</b><small>${x.owner ? tr("This pod's name changes when it restarts, and the link would end.") : tr("The link ends when the pod does.")}</small></button>`).join("")}
     ${web.length ? "" : `<button class="opt warn" data-kask="${esc(`${ns}/${name}`)}">${wheel}<b>${tr("Share this pod on a port…")}</b><small>${x.owner ? tr("This pod's name changes when it restarts, and the link would end.") : tr("The link ends when the pod does.")}</small></button>`}`, true);
 }
 /* A small menu under the Share button; Escape or a click elsewhere closes it. */
@@ -9909,8 +9929,8 @@ function kConfirmPod(p, web) {
   scrim.className = "scrim";
   // It declares no ports and no service says either: ask which one it listens on.
   const pick = !web.length ? `<input class="field" id="k-pod-port" inputmode="numeric" placeholder="8080" aria-label="${tr("Port")}" style="width:90px"><span class="muted">· ${tr("the port the app in it listens on")}</span>`
-    : web.length > 1 ? `<select id="k-pod-port" aria-label="${tr("Port")}">${web.map((x) => `<option value="${x.port}">${x.port}${x.name ? ` (${esc(x.name)})` : ""}</option>`).join("")}</select>`
-    : `<span class="mono">${web[0].port}</span><span class="muted">· ${tr("the only web port")}</span>`;
+    : web.length > 1 ? `<select id="k-pod-port" aria-label="${tr("Port")}">${web.map((x) => `<option value="${esc(x.port)}">${esc(x.port)}${x.name ? ` (${esc(x.name)})` : ""}</option>`).join("")}</select>`
+    : `<span class="mono">${esc(web[0].port)}</span><span class="muted">· ${tr("the only web port")}</span>`;
   scrim.innerHTML = `<div class="dialog alert" role="dialog" aria-modal="true">${alertIco("info")}<h3>${tr("Share pod {name}?", { name: esc(p.name) })}</h3>
       <p>${tr("No service points at it, so the link goes straight to the pod.")} ${p.owner ? tr("When the pod restarts, it gets a new name and the link ends.") : tr("Nothing restarts it either: when the pod is deleted or restarts, the link ends.")}</p>
       <div class="opt-line"><span class="muted">${tr("Port")}</span>${pick}</div>
@@ -10655,7 +10675,7 @@ function shTarget(it) {
     : `<button class="sh-target" data-kgoto="${esc(it.source)}" title="${tr("Open {name}", { name: `${k.kind} ${esc(k.name)}` })}">${tile(k8s.icon, "services")}<span>${k.kind} ${esc(`${k.ns}/${k.name}`)}</span><em>:${k.port}</em></button>`;
   const c = ui.containers.find((x) => cname(x) === it.source), port = (it.target || "").match(/:(\d+)\)?$/)?.[1];
   if (!c) return `<span class="muted">${rtl() ? "\u200F←" : "→"} ${esc(it.target || "")}</span>`;
-  return `<button class="sh-target" data-shgoc="${c.Id}" title="${tr("Open {name}", { name: esc(it.source) })}">${tile(c.icon, "cube")}<span>${esc(it.source)}</span>${port ? `<em>localhost:${port}</em>` : ""}</button>`;
+  return `<button class="sh-target" data-shgoc="${esc(c.Id)}" title="${tr("Open {name}", { name: esc(it.source) })}">${tile(c.icon, "cube")}<span>${esc(it.source)}</span>${port ? `<em>localhost:${port}</em>` : ""}</button>`;
 }
 
 /* One connection, in a pane under the Share view: its link, numbers and
@@ -11367,7 +11387,7 @@ function hubAsk(kind, key) {
   pp.asked.add(kind + key);
   send(kind === "search" ? "hubsearch" : "hubtags", { name: key });
 }
-const stars = (n) => (n >= 1000 ? `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}k ★` : `${n || 0} ★`);
+const stars = (v) => { const n = Number(v) || 0; return n >= 1000 ? `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}k ★` : `${n} ★`; };
 /* The registry a name is on: its first part when that's a host. */
 const hostOf = (repo) => { const s = repo.split("/"); return s.length > 1 && (/[.:]/.test(s[0]) || s[0] === "localhost") ? s[0] : HUB; };
 /* A reference as the engine names the image once pulled: Docker Hub's

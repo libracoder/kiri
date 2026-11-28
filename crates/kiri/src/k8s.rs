@@ -14,6 +14,16 @@ use crate::client;
 use crate::flavor::CONTEXT;
 
 const IMAGE: (&str, &str) = ("rancher/k3s", "v1.37.1-k3s1");
+/// Default k3s image reference (`rancher/k3s:v1.37.1-k3s1`).
+pub(crate) const DEFAULT_IMAGE: &str = "rancher/k3s:v1.37.1-k3s1";
+/// Multi-arch index digest pinned for [`DEFAULT_IMAGE`].
+pub(crate) const PINNED_IMAGE: &str = "rancher/k3s@sha256:ca7f37d993d82ef0dcdcfecb2e0e2618ea541dbaffc620c8cedebe01a82acd0d";
+/// Expected OCI image config digests (`Id` / container `Image`) for [`DEFAULT_IMAGE`]
+/// (`linux/amd64` and `linux/arm64`).
+pub(crate) const PINNED_CONFIGS: [&str; 2] = [
+    "sha256:3a6621a59ca96f00a38c2455cd3f2635585e06c2891b4800b4b38fcfd657e5a0",
+    "sha256:9ef91591ba2b1a07146f334abcfbb1fd6f77bb75bdfc375561e158cdf2ab97aa",
+];
 /// Default k3s image tag shown in Settings → Kubernetes.
 pub(crate) const DEFAULT_VERSION: &str = IMAGE.1;
 /// The node container; the window reads the cluster through it.
@@ -696,25 +706,31 @@ fn start(use_context: bool) -> io::Result<()> {
     let mut moved_to = None;
     if exists()? {
         let info = client::get(&format!("/containers/{NAME}/json"))?;
-        let made_label = info["Config"]["Labels"][CONFIG_LABEL].as_str();
-        let want_made = made_with_for(&cfg, zfs);
-        if info["State"]["Running"] != true || (zfs && made_label != Some(want_made.as_str())) {
-            // Settings changed while it was stopped (a node from before the label: its port),
-            // or a ZFS node made without ext4 loopback + kubelet root-dir support.
-            let stale = match made_label {
-                Some(made) => made != want_made,
-                None => zfs || bound_port(&info) != Some(want),
-            };
-            if stale {
-                println!("applying the changed settings (the cluster's state is kept)…");
-                ok(client::request("DELETE", &format!("/containers/{NAME}?force=1"), None))?;
-            } else if info["State"]["Running"] != true
-                && let Some(held) = bound_port(&info).filter(|&p| !port_free(p, cfg.lan))
-            {
-                let port = pick_port(want, cfg.lan)?;
-                println!("port {held} is in use now; moving the API server to {port}…");
-                ok(client::request("DELETE", &format!("/containers/{NAME}?force=1"), None))?;
-                moved_to = Some(port);
+        let image = cfg.image();
+        if image == DEFAULT_IMAGE && !is_pinned_config(info["Image"].as_str()) {
+            println!("recreating the node from the verified {DEFAULT_IMAGE} image…");
+            ok(client::request("DELETE", &format!("/containers/{NAME}?force=1"), None))?;
+        } else {
+            let made_label = info["Config"]["Labels"][CONFIG_LABEL].as_str();
+            let want_made = made_with_for(&cfg, zfs);
+            if info["State"]["Running"] != true || (zfs && made_label != Some(want_made.as_str())) {
+                // Settings changed while it was stopped (a node from before the label: its port),
+                // or a ZFS node made without ext4 loopback + kubelet root-dir support.
+                let stale = match made_label {
+                    Some(made) => made != want_made,
+                    None => zfs || bound_port(&info) != Some(want),
+                };
+                if stale {
+                    println!("applying the changed settings (the cluster's state is kept)…");
+                    ok(client::request("DELETE", &format!("/containers/{NAME}?force=1"), None))?;
+                } else if info["State"]["Running"] != true
+                    && let Some(held) = bound_port(&info).filter(|&p| !port_free(p, cfg.lan))
+                {
+                    let port = pick_port(want, cfg.lan)?;
+                    println!("port {held} is in use now; moving the API server to {port}…");
+                    ok(client::request("DELETE", &format!("/containers/{NAME}?force=1"), None))?;
+                    moved_to = Some(port);
+                }
             }
         }
     }
@@ -728,15 +744,12 @@ fn start(use_context: bool) -> io::Result<()> {
         }
         let repo = IMAGE.0;
         let tag = cfg.version_tag();
-        println!("pulling {repo}:{tag}…");
-        let pulled = ok(client::request("POST", &format!("/images/create?fromImage={repo}&tag={tag}"), None))?;
-        if let Some(e) = String::from_utf8_lossy(&pulled.body).lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok()).find_map(|v| v["error"].as_str().map(str::to_owned)) {
-            return Err(io::Error::other(e));
-        }
+        let image = cfg.image();
+        ensure_k3s_image(repo, tag, &image)?;
         ok(client::request("POST", "/volumes/create", Some(&volume_create_body(zfs))))?;
         let cmd = server_cmd_for(&cfg, zfs);
         let body = json!({
-            "Image": cfg.image(),
+            "Image": image,
             "Cmd": cmd,
             "Hostname": "kiri",
             "Labels": {"dev.kiri.k8s": "1", PORT_LABEL: port.to_string(), CONFIG_LABEL: made_with_for(&cfg, zfs)},
@@ -750,6 +763,16 @@ fn start(use_context: bool) -> io::Result<()> {
             },
         });
         ok(client::request("POST", &format!("/containers/create?name={NAME}"), Some(&body)))?;
+        if image == DEFAULT_IMAGE {
+            let created = client::get(&format!("/containers/{NAME}/json"))?;
+            if !is_pinned_config(created["Image"].as_str()) {
+                let _ = client::request("DELETE", &format!("/containers/{NAME}?force=1"), None);
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("refusing to start privileged {NAME}: container image digest {:?} does not match pinned {DEFAULT_IMAGE}", created["Image"].as_str()),
+                ));
+            }
+        }
     }
     let started = client::request("POST", &format!("/containers/{NAME}/start"), None)?;
     if !started.ok() && started.status != 304 {
@@ -784,6 +807,54 @@ fn start(use_context: bool) -> io::Result<()> {
     let moved = if port != want { format!(" ({want} was in use)") } else { String::new() };
     println!("Kubernetes is ready in {:.0} s, API on 127.0.0.1:{port}{moved}: kubectl --context {CONTEXT} get nodes", t0.elapsed().as_secs_f64());
     Ok(())
+}
+
+pub(crate) fn is_pinned_config(id: Option<&str>) -> bool {
+    id.is_some_and(|d| PINNED_CONFIGS.contains(&d))
+}
+
+fn check_stream_pull_error(body: &[u8]) -> io::Result<()> {
+    if let Some(e) = String::from_utf8_lossy(body)
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find_map(|v| v["error"].as_str().or_else(|| v["message"].as_str()).map(str::to_owned))
+    {
+        return Err(io::Error::other(e));
+    }
+    Ok(())
+}
+
+fn local_default_k3s_verified() -> io::Result<bool> {
+    let r = client::request("GET", &format!("/images/{DEFAULT_IMAGE}/json"), None)?;
+    if r.status == 404 {
+        return Ok(false);
+    }
+    if !r.ok() {
+        return Err(io::Error::other(r.error()));
+    }
+    Ok(is_pinned_config(r.json()["Id"].as_str()))
+}
+
+fn ensure_k3s_image(repo: &str, tag: &str, image: &str) -> io::Result<()> {
+    if image == DEFAULT_IMAGE {
+        if local_default_k3s_verified()? {
+            return Ok(());
+        }
+        println!("pulling {DEFAULT_IMAGE} (pinned digest)…");
+        let pulled = ok(client::request("POST", &format!("/images/create?fromImage={PINNED_IMAGE}"), None))?;
+        check_stream_pull_error(&pulled.body)?;
+        ok(client::request("POST", &format!("/images/{PINNED_IMAGE}/tag?repo={repo}&tag={tag}"), None))?;
+        if !local_default_k3s_verified()? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("pulled {DEFAULT_IMAGE} does not match pinned config digest"),
+            ));
+        }
+        return Ok(());
+    }
+    println!("pulling {repo}:{tag}…");
+    let pulled = ok(client::request("POST", &format!("/images/create?fromImage={repo}&tag={tag}"), None))?;
+    check_stream_pull_error(&pulled.body)
 }
 
 /// k3s' own kubeconfig, from the node.
@@ -963,7 +1034,14 @@ fn host_names() -> io::Result<bool> {
 /// with no kubectl needed: the app's `kiri k8s start` runs with launchd's
 /// PATH, where none is found. Whether kubectl's file changed.
 fn kubeconfig(use_context: bool, port: u16) -> io::Result<bool> {
-    let ours = crate::kubeconfig::from_k3s(&k3s_yaml()?, CONTEXT.get(), port);
+    let ctx = CONTEXT.get();
+    let raw = k3s_yaml()?;
+    let ours = if ctx == "kiri" {
+        crate::kubeconfig::from_k3s(&raw, port)
+    } else {
+        crate::kubeconfig::from_k3s_named(&raw, ctx, port)
+    }
+    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("refused unsafe k3s kubeconfig: {e}")))?;
     let own = home()?.join(crate::flavor::STATE.get()).join("kubeconfig");
     std::fs::create_dir_all(own.parent().expect("has a parent"))?;
     std::fs::write(&own, &ours)?;
@@ -1574,5 +1652,17 @@ mod tests {
         .unwrap();
         assert_eq!(healthy_stops.load(Ordering::SeqCst), 0);
         assert!(polls.load(Ordering::SeqCst) >= 3);
+    }
+
+    #[test]
+    fn default_k3s_image_pinning_checks_config_digests() {
+        assert_eq!(super::Config::default().image(), super::DEFAULT_IMAGE);
+        assert!(super::PINNED_IMAGE.starts_with("rancher/k3s@sha256:"));
+        for d in super::PINNED_CONFIGS {
+            assert!(super::is_pinned_config(Some(d)), "{d}");
+        }
+        assert!(!super::is_pinned_config(None));
+        assert!(!super::is_pinned_config(Some("")));
+        assert!(!super::is_pinned_config(Some("sha256:0000000000000000000000000000000000000000000000000000000000000000")));
     }
 }

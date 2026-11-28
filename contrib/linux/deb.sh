@@ -41,7 +41,7 @@ Section: admin
 Priority: optional
 Installed-Size: $size
 Depends: libc6, libgtk-3-0t64 | libgtk-3-0, libwebkit2gtk-4.1-0, docker.io | docker-ce-cli
-Recommends: docker-buildx | docker-buildx-plugin, docker-compose-v2 | docker-compose-plugin
+Recommends: docker-buildx | docker-buildx-plugin, docker-compose-v2 | docker-compose-plugin, apparmor
 Description: Run, build and share containers
  Kiri is a small container engine with its own window. Plain docker
  commands work against it through the "kiri" docker context, and the

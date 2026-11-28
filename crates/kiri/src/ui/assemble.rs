@@ -34,13 +34,54 @@ pub fn page(index: &str, lang: Option<&str>) -> String {
         // Each ends in a source-map comment: the next must start on a line of its own.
         js.push('\n');
     }
-    without_indent(&without_js_comment_lines(&without_css_comments(index)))
+    let page = without_indent(&without_js_comment_lines(&without_css_comments(index)))
         .replacen("/*ICONS*/", ICONS_JS, 1)
         .replacen("/*LANGSTEP*/", LANGSTEP_JS, 1)
         .replacen("/*XTERM_CSS*/", XTERM_CSS, 1)
         .replacen("/*XTERM_JS*/", &js, 1)
         .replacen("/*LANG*/", &super::lang::boot_js(lang), 1)
-        .replacen("/*STRINGS*/{}", &super::lang::strings_js(super::lang::resolve(lang)), 1)
+        .replacen("/*STRINGS*/{}", &super::lang::strings_js(super::lang::resolve(lang)), 1);
+    with_script_hashes(page)
+}
+
+/// Where the page's Content-Security-Policy (its `<meta>` in index.html)
+/// takes the hashes of its scripts. Left unfilled, the policy has no script
+/// source at all, and nothing runs: a page loaded some other way fails shut.
+const SCRIPT_HASHES: &str = "/*SCRIPT_HASHES*/";
+
+/// The page with its policy listing each of its `<script>`s by SHA-256,
+/// as the browser reads them (scripts()): only the scripts it was built
+/// with run, never one or an `on…=` handler that markup brings in.
+/// scripts/ui-test.py fills it the same way, for its own scripts too.
+fn with_script_hashes(page: String) -> String {
+    let Some(at) = page.find(SCRIPT_HASHES) else { return page };
+    let hashes: Vec<String> = scripts(&page).into_iter().map(|(a, b)| script_hash(&page[a..b])).collect();
+    let mut out = String::with_capacity(page.len() + hashes.len() * 56);
+    out.push_str(&page[..at]);
+    out.push_str(&hashes.join(" "));
+    out.push_str(&page[at + SCRIPT_HASHES.len()..]);
+    out
+}
+
+/// `'sha256-…'` for a script's text. HTML reads a CR LF or a lone CR as a
+/// LF before the browser hashes the text, so this does too (a checkout
+/// with Windows line ends).
+fn script_hash(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let text = text.replace("\r\n", "\n").replace('\r', "\n");
+    format!("'sha256-{}'", base64(&Sha256::digest(text.as_bytes())))
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for c in bytes.chunks(3) {
+        let n = (u32::from(c[0]) << 16) | (u32::from(*c.get(1).unwrap_or(&0)) << 8) | u32::from(*c.get(2).unwrap_or(&0));
+        for i in 0..4 {
+            out.push(if i <= c.len() { B64[(n >> (18 - 6 * i) & 63) as usize] as char } else { '=' });
+        }
+    }
+    out
 }
 
 /// Where the page's own stylesheet is: its plain `<style>` (one with
@@ -546,7 +587,7 @@ mod tests {
     fn every_placeholder_is_filled_once_and_the_page_stays_a_sane_size() {
         let units = |s: &str| s.encode_utf16().count();
         let page = super::page(include_str!("index.html"), None);
-        for p in ["/*ICONS*/", "/*LANGSTEP*/", "/*XTERM_CSS*/", "/*XTERM_JS*/", "/*LANG*/", "/*STRINGS*/"] {
+        for p in ["/*ICONS*/", "/*LANGSTEP*/", "/*XTERM_CSS*/", "/*XTERM_JS*/", "/*LANG*/", "/*STRINGS*/", "/*SCRIPT_HASHES*/"] {
             assert!(!page.contains(p), "{p} left in the page");
         }
         assert!(page.contains(".xterm-viewport"), "xterm.css missing");
@@ -579,5 +620,34 @@ mod tests {
         assert!(units(&page) <= worst);
         // Setup's page too.
         assert!(units(&super::words("/*LANG*/ /*STRINGS*/{}", Some(biggest))) < 200_000);
+    }
+
+    /// The page's policy lets its own scripts run, by hash, and nothing
+    /// else: no inline handlers, no eval, nothing fetched. Checked in every
+    /// language, since the words are in a script and change its hash.
+    #[test]
+    fn the_policy_names_each_script_by_hash_and_allows_nothing_else() {
+        for lang in [None].into_iter().chain(lang::FILES.iter().map(|(tag, _)| Some(*tag))) {
+            let page = super::page(include_str!("index.html"), lang);
+            let head = &page[..page.find("<style>").unwrap()];
+            let open = "http-equiv=\"Content-Security-Policy\" content=\"";
+            let at = head.find(open).expect("no policy in the head") + open.len();
+            let policy = &head[at..at + head[at..].find('"').unwrap()];
+            let directive = |name: &str| policy.split(';').map(str::trim).find(|d| d.split(' ').next() == Some(name)).unwrap_or_else(|| panic!("no {name}: {policy}"));
+            for (name, want) in [("default-src", "default-src 'none'"), ("connect-src", "connect-src 'none'"), ("img-src", "img-src data:"), ("style-src", "style-src 'unsafe-inline'"), ("base-uri", "base-uri 'none'"), ("form-action", "form-action 'none'"), ("object-src", "object-src 'none'")] {
+                assert_eq!(directive(name), want);
+            }
+            let script: Vec<&str> = directive("script-src").split(' ').skip(1).collect();
+            let want: Vec<String> = super::scripts(&page).into_iter().map(|(a, b)| super::script_hash(&page[a..b])).collect();
+            assert_eq!(script, want, "{lang:?}: the hashes are not the page's scripts'");
+            assert_eq!(want.len(), 3, "the icons, xterm.js and the page's own script");
+        }
+        // As a browser hashes it: SHA-256 of the UTF-8 text, line ends read as LF.
+        assert_eq!(super::script_hash("alert(1)"), "'sha256-bhHHL3z2vDgxUt0W3dWQOrprscmda2Y5pLsLg4GF+pI='");
+        assert_eq!(super::script_hash("a\r\nb\rc"), super::script_hash("a\nb\nc"));
+        assert_eq!(super::base64(b""), "");
+        assert_eq!(super::base64(b"f"), "Zg==");
+        assert_eq!(super::base64(b"fo"), "Zm8=");
+        assert_eq!(super::base64(b"foo"), "Zm9v");
     }
 }

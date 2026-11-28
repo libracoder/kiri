@@ -304,7 +304,7 @@ leave-first-running-reconnect	#789	reconnecting a running container after leavin
 leave-first-running-promote	#789	disconnecting a running container's first network when attached to a second network failed to isolate the left network, promote the default route, or rebind published ports
 crates/kiri/src/hostrelay.rs	#550	on Windows (WSL 2), host.docker.internal resolved to the WSL bridge gateway (172.17.0.1) instead of 192.168.65.254 relayed to Windows 127.0.0.1 and [::1]
 crates/kiri-win/src/ports.rs	#640	WSL 2's localhostForwarding only forwards loopback TCP, so published UDP container ports and non-loopback Windows host-IP or 0.0.0.0 LAN TCP bindings were unreachable on Windows (#218)
-crates/kiri/src/daemon/ports.rs	#218	publishing a container port on a Windows host interface IP (-p IP:port:port) failed inside WSL 2 with EADDRNOTAVAIL (os error 99) instead of binding WSL's eth0 address for kiri-win to forward
+crates/kiri/src/daemon/ports.rs	#218	publishing a container port on a Windows host interface IP (-p IP:port:port) failed inside WSL 2 with EADDRNOTAVAIL (os error 99) instead of binding WSL's eth0 address for kiri-win to forward, and macOS lacked KIRI_HOST_LOOPBACK=off to block untrusted containers from reaching host loopback services (#995)
 crates/kiri/src/wsl.rs	#761	running kiri.exe diag report [--out PATH] on Windows wrote the report file inside the WSL Linux rootfs instead of the Windows filesystem
 dns-default-bridge-stub	#330	on a Linux host whose /etc/resolv.conf names only 127.0.0.53 (systemd-resolved), default-bridge containers got 1.1.1.1 instead of querying the host stub through the bridge gateway over UDP and TCP
 build-pinned-digest	#288	a digest-pinned FROM image (@sha256:...) already pulled into Kiri's store was re-serialized instead of served with its upstream manifest and index bytes, failing BuildKit's digest check (#330)
@@ -333,7 +333,7 @@ crates/kiri/src/share.rs	#207	Share mutex locks panicked on poisoning under pani
 crates/kiri-init/src/linux/mod.rs	#207	with panic=abort, a panic in PID 1 or the host agent aborted silently without writing its message and location directly to stderr from a stack buffer
 restart-policy-refused	#841	docker update stored unknown restart policies or enabled restarts on AutoRemove containers, and container create/update accepted negative or non-on-failure MaximumRetryCount values
 crates/kiri/src/ui/compose.rs	#770	on Windows, Compose projects started inside a WSL distro had Linux label paths (/home/...) rejected as non-absolute and \\wsl.localhost\<distro>\... rejected as remote UNC paths
-crates/kiri/src/daemon/api.rs	#770	containers created inside WSL did not expose their owning WSL distro on GET /containers/json for Windows Compose path mapping
+crates/kiri/src/daemon/api.rs	#770	containers created inside WSL did not expose their owning WSL distro on GET /containers/json for Windows Compose path mapping, image config Labels could inject dev.kiri.* and com.docker.compose.* control-plane labels, and Caller::Wsl could invoke host admin endpoints (#1013)
 bind-nonroot-parallel	#796	concurrent non-root file and directory creation on a macOS bind mount raced with root stat/ls and /proc/kiri-fsnotify on the shared virtiofs inode's cached i_uid/i_gid, failing with EACCES/EPERM
 bind-nonroot-ro	#796	non-root writes to a read-only 0444 bind-mount file must still fail with EACCES, including inside an unprivileged unshare -Ur user namespace
 crates/kiri/src/daemon/rofs.rs	#768	when Kiri's WSL 2 ext4.vhdx or Linux storage filesystem was remounted read-only (emergency_ro), daemon startup, /info and diagnostics lacked actionable fsck / storage recovery steps
@@ -344,7 +344,7 @@ tls-company-root-login	#303	docker login to a registry signed by a root the syst
 tls-unknown-root-refused	#303	a root the system does not trust must still be refused
 crates/kiri-image/src/roots.rs	#303	root store merge, system distrust filtering (macOS Never Trust, Windows Disallowed and disabled Server Auth EKU), cross-cert preservation, caps, and KIRI_TLS_ROOTS=webpki escape hatch
 crates/kiri/src/daemon/hostroots.rs	#303	Windows host roots persistence in WSL must enforce Caller::Host, 0600 atomic writes, non-symlink/non-FIFO reads, and bounded sizes
-crates/kiri/src/setup.rs	#556	opening Kiri.app re-appended the ~/.kiri/bin PATH block on every launch, and modified shell profiles or replaced /usr/local/bin/kiri even when Homebrew's cask binary stanza already linked kiri directly to the running app (#733)
+crates/kiri/src/setup.rs	#556	opening Kiri.app re-appended the ~/.kiri/bin PATH block on every launch, modified shell profiles or replaced /usr/local/bin/kiri even when Homebrew's cask binary stanza already linked kiri directly (#733), and macOS elevation staged files in $TMPDIR and escaped quotes before backslashes in AppleScript (#1013)
 crates/kiri/src/k8s.rs	#816	kiri k8s set had no --version or --k3s-arg/--clear-k3s-args options to pin a k3s image tag or pass custom k3s server flags, and kiri k8s start did not sync ~/.kiri/k8s-manifests into k3s
 crates/kiri-win/src/k8s.rs	#816	Windows k8s.json config and container creation did not preserve or apply custom k3s version tags and extra k3s server arguments
 k8s-set-keeps-malformed-config	#926	kiri k8s set replaced a k8s.json it could not parse with defaults, losing every other setting, and reported success
@@ -372,7 +372,7 @@ crates/kiri-init/src/linux/net.rs	#443	a second Kiri engine starting in a shared
 machine-prune-keeps	#975	docker container prune and docker system prune deleted a stopped kiri machine and everything in its writable layer
 crates/kiri/src/daemon/vmlink.rs	#948	VmLink::call waited without a timeout and Writer::write blocked indefinitely holding the writer mutex when the guest wedged, deadlocking hundreds of kiri-api threads
 crates/kiri-init/src/linux/container.rs	#948	finish_stdio called recv_fd with no timeout on single-threaded kiri-init and exec did not reap a killed child when TTY setup failed
-crates/kiri/src/daemon/engine.rs	#989	kiri-k8s caused mac_bind_sources to watch all of /Users and /Volumes via FSEvents, spawned kubectl every 3s for LoadBalancer polling, and lacked timer coalescing for k3s's 100ms watch_progress tickers
+crates/kiri/src/daemon/engine.rs	#989	kiri-k8s caused mac_bind_sources to watch all of /Users and /Volumes via FSEvents, spawned kubectl every 3s for LoadBalancer polling, lacked timer coalescing for k3s's 100ms watch_progress tickers, and Engine::route iterated HashMap in random order with equal priority (#1013)
 crates/kiri-init/src/linux/hostopts.rs	#989	kiri-init hostopts lacked timerslack_ns support to coalesce k3s background pollers across execve
 crates/kiri/src/engine_cli.rs	#983	kiri CLI had no `kiri engine start | stop | restart | status [--json]` commands to stop, restart, or inspect the engine without waking a sleeping VM
 crates/kiri-win/src/refuse.rs	#983	Windows pipe gate did not handle `POST /kiri/stop` idempotently while stopped or synchronize `kiri-win` on external CLI stops
@@ -382,3 +382,31 @@ crates/kiri/src/daemon/storage.rs	#190	`statvfs_usage` subtracted `f_bavail` ins
 crates/kiri/src/dockerctx.rs	#269	Windows `repair_windows_config` did not self-heal `%USERPROFILE%\.docker\contexts\meta\<sha256(kiri)>\meta.json` when overwritten with a WSL `unix://` socket endpoint
 crates/kiri-proto/src/lib.rs	#381	`start_on_vm` spawned the container process before attaching `spec.extra_networks`, causing fast `docker compose run` commands on secondary external networks to run before `eth1` and its IPv4 default route were attached
 crates/kiri/src/daemon/binds.rs	#420	WSL distro bind translation rewrote `/run/host-services/ssh-auth.sock` and `/sys` paths into `/mnt/wsl/kiri/roots/<distro>/...`, and local `o=bind` volumes did not resolve `device` relative to the calling WSL distro or Windows drive
+image-load-diffid-mismatch-refused	#1013	docker load accepted archives whose uncompressed layer SHA-256 did not match rootfs.diff_ids
+crates/kiri-image/src/diffid.rs	#1013	image pull and load did not verify uncompressed layer SHA-256 digests against rootfs.diff_ids or bound multi-layer decompression
+crates/kiri-zstd/src/lib.rs	#1013	zstd and gzip layer decompression lacked multi-frame zstd block/checksum verification and trailing-byte gzip rejection
+crates/kiri/src/daemon/builder.rs	#1013	managed privileged BuildKit container trusted mutable local moby/buildkit:buildx-stable-1 tags without verifying pinned config digest and layer diff_ids
+crates/kiri-init/src/linux/rmtree.rs	#1013	deep directory removal in kiri-init used recursive remove_dir_all, exhausting stack or file descriptors and failing on deep read-only trees
+crates/kiri-init/src/linux/tarnum.rs	#993	layer unpack failed on zero-mtime PAX XGlobalHeader entries and leading-NUL octal tar header fields
+bind-share-ancestors-and-proc-refused	#1013	macOS bind mounts did not block VM root/ancestors of /mnt/mac, /proc/<pid>/root/mnt/mac traversals, or symlinks escaping MAC_SHARES, nor revalidate stored mounts on start and cp
+volume-driver-allowlist	#1013	local volume options accepted arbitrary filesystem types and /dev/* block devices such as type=ext4,device=/dev/vda
+crates/kiri-init/src/linux/volmount.rs	#1013	host and VM local volume mount validation lacked strict filesystem type, device, and mount-option allowlists
+dns-and-domainname-control-chars-refused	#1013	Domainname, Dns, DnsSearch, DnsOptions, --link aliases, and build extrahosts accepted control characters or non-IP nameserver strings
+crates/kiri/src/daemon/proxy.rs	#1013	GET /kiri/proxy exposed cleartext proxy credentials to non-Host callers
+internal-dns-refused	#1013	embedded DNS forwarded external queries from --internal networks and gateway DNS listeners did not isolate bridges via SO_BINDTODEVICE
+internal-netadmin-blocked	#1013	--internal bridges were not isolated across nftables prerouting, forward, input, and postrouting chains
+isolated-host-unreached	#1001	com.docker.network.bridge.gateway_mode_ipv4=isolated and inhibit_ipv4=true did not leave the host off an internal network's bridge
+publish-bridge-default-host-ip	#985	com.docker.network.bridge.host_binding_ipv4 was ignored when publishing TCP and UDP ports with an empty HostIp
+icc-off-no-peer	#213	com.docker.network.bridge.enable_icc=false was accepted but not enforced via bridge port isolation
+icc-off-connect-no-peer	#213	a container joined via network connect to an enable_icc=false network still reached peer containers on that bridge
+network-name-default-refused	#992	Networks::create allowed creating an unreachable user network named default and parse_ipam_both accepted network or broadcast addresses as gateways
+crates/kiri/src/daemon/apparmor.rs	#1013	Linux hosts with AppArmor enabled ran containers unconfined without loading and enforcing kiri-default
+crates/kiri/src/kubeconfig.rs	#1013	kubeconfig::from_k3s passed untrusted k3s YAML lines through to ~/.kube/config without an inline credential allowlist and k8s.rs did not pin rancher/k3s by digest
+crates/kiri/src/weburl.rs	#1013	WebView link opening, localUrl domain labels, CSP, navigation policy, and i18n markup parity needed shared strict validation
+tests/ui/csp.js	#1013	assembled UI HTML lacked a SHA-256 script Content-Security-Policy blocking injected scripts
+tests/ui/domain-label.js	#1013	localUrl accepted non-plain hostnames or rendered non-HTTP domain URLs
+tests/ui/tr-markup.js	#1013	localized strings were not sanitized for safe inline tags and attribute parity at runtime
+tests/ui/typed-values.js	#1013	hub and sharing JSON renderers interpolated numeric fields without finite-number coercion
+crates/kiri/src/usb/helper.rs	#1013	macOS USB helper staged signed binaries through $TMPDIR instead of a root-owned staging file verified before codesign
+crates/kiri-win/src/update.rs	#1013	Windows MSI updater staged in %TEMP% and lacked WinVerifyTrust Authenticode / Ed25519 signature verification before silent msiexec
+crates/kiri/src/diag/redact.rs	#994	kiri diag did not redact JSON secret values truncated before their closing quote at end of text

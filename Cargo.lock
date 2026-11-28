@@ -833,6 +833,7 @@ dependencies = [
  "kiri-share-proto",
  "libc",
  "rcgen",
+ "ring",
  "rustls",
  "rustls-native-certs",
  "rustls-pki-types",

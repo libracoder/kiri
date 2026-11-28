@@ -147,7 +147,9 @@ Conflicts: $other
 Replaces: $other
 $([ "$full" = 1 ] || echo "Suggests: docker-cli | docker.io")
 $([ "$full" = 1 ] && [ -n "$window" ] && echo "Depends: libc6 (>= $(glibc_floor "$window" || ldd --version | sed -n '1s/.* //p')), libgtk-3-0t64 | libgtk-3-0, libwebkit2gtk-4.1-0")
-$([ "$full" = 1 ] && [ -n "$window" ] && echo "Recommends: pkexec | policykit-1")
+$(# apparmor: apparmor_parser, with which the engine loads its container
+  # profile on a host with AppArmor enabled (crates/kiri/src/daemon/apparmor.rs).
+  r=apparmor; [ "$full" = 1 ] && [ -n "$window" ] && r="$r, pkexec | policykit-1"; echo "Recommends: $r")
 Description: Tiny, fast container runtime (Docker API)$([ "$full" = 1 ] || echo ", engine only")
  Kiri runs containers on this machine's kernel and speaks the Docker API on
  /run/kiri/docker.sock for users in the kiri group. No VM, no daemon other
