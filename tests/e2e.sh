@@ -979,7 +979,11 @@ $D rm -f hn-all >/dev/null 2>&1
 # goes through the Mac (#732). host.docker.internal answers only there.
 only mac t hostnet-dns-kiri "198.19.248.254" $D run --rm --network host alpine nslookup -timeout=5 host.docker.internal
 only mac t hostnet-dns-names "Address" $D run --rm --network host alpine nslookup -timeout=5 example.com
-only linux,wsl t host-internal-not-loopback "Connection refused" $D run --rm alpine wget -qO- -T 3 http://host.docker.internal:18998/
+if [ "$SYS" = wsl ] && [ "$($D run --rm alpine getent hosts host.docker.internal 2>/dev/null | awk '{print $1}')" = 192.168.65.254 ]; then
+  skip host-internal-not-loopback "Windows host relay forwards localhost by design"
+else
+  only linux,wsl t host-internal-not-loopback "Connection refused" $D run --rm alpine wget -qO- -T 3 http://host.docker.internal:18998/
+fi
 kill "$HTTP_PID" ${HTTP_LO_PID:+"$HTTP_LO_PID"}; rm -rf "$HTTP_DIR"
 
 section "container domains"
@@ -2166,8 +2170,10 @@ else
   skip rename-dns-keeps-own-servers "no name can be resolved from here"
 fi
 # A name of a host stays the host's: the container is not given it.
+RN_HOST_DNS=$($D run --rm --network rndns alpine nslookup host.docker.internal 127.0.0.11 | grep -A1 '^Name:' | tail -1)
+case "$RN_HOST_DNS" in *198.*|*192.168.65.254*) ;; *) RN_HOST_DNS="198." ;; esac
 $D rename rndns-new host.docker.internal
-t rename-dns-host-name-stays-host "198." bash -c "$D run --rm --network rndns alpine nslookup host.docker.internal 127.0.0.11 | grep -A1 '^Name:' | tail -1"
+t rename-dns-host-name-stays-host "$RN_HOST_DNS" bash -c "$D run --rm --network rndns alpine nslookup host.docker.internal 127.0.0.11 | grep -A1 '^Name:' | tail -1"
 code rename-name-starts-with-letter 1 $D rename host.docker.internal _rndns
 $D rm -f rndns-new host.docker.internal >/dev/null 2>&1; $D rm -f rndns-old >/dev/null 2>&1; $D network rm rndns rndns2 >/dev/null
 # Rename edge cases (#467). An alias equal to the old name keeps resolving.

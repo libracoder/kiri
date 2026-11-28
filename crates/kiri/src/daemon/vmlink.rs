@@ -699,6 +699,10 @@ impl VmLink {
         self.ack(|o| Msg::Freeze { id, frozen }.encode(o))
     }
 
+    pub fn start_exec(&self, id: &str) -> io::Result<()> {
+        self.ack(|o| Msg::StartExec { id }.encode(o))
+    }
+
     pub fn container_stats(&self, id: &str) -> io::Result<kiri_proto::ContainerStats> {
         match self.call(|o| Msg::StatsQuery { id }.encode(o), None)? {
             Reply::ContainerStats(s) => Ok(s),

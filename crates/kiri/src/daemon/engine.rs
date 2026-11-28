@@ -4351,6 +4351,12 @@ impl Engine {
             flags |= run_flags::INIT;
         }
         flags |= spec.security_flags();
+        let attach_extra_nets = !spec.extra_networks.is_empty()
+            && flags & (run_flags::NET_HOST | run_flags::NET_NONE) == 0
+            && joined.is_none();
+        if attach_extra_nets {
+            flags |= run_flags::HOLD_EXEC;
+        }
         // Every container can reach the Mac (or Windows host on WSL 2), as with
         // Docker Desktop and OrbStack. --add-host and links come first:
         // /etc/hosts takes the first match, so `--add-host host.docker.internal:IP`
@@ -4463,13 +4469,7 @@ impl Engine {
             }
             return Err(cancelled_start_error(gate.0.cancelled_by(), &id).unwrap_or(Error::Io(e)));
         }
-        // Before anything below, which may itself exec (a health probe),
-        // and after the pid is set.
-        drop(gate);
-        if let (true, Some((rows, cols))) = (spec.tty, size) {
-            let _ = vm.resize(&id, rows, cols);
-        }
-        if flags & (run_flags::NET_HOST | run_flags::NET_NONE) == 0 && joined.is_none() {
+        if attach_extra_nets {
             for (i, extra) in spec.extra_networks.iter().enumerate() {
                 let n = i as u32 + 1;
                 let sync = self.names_sync(&id);
@@ -4487,6 +4487,15 @@ impl Engine {
                     Err(e) => crate::diag::warn!("container not attached to a network", id = &id[..12], network = extra.name, error = format!("{e:?}")),
                 }
             }
+            if let Err(e) = vm.start_exec(&id) {
+                crate::diag::warn!("container start_exec failed", id = &id[..12], error = e);
+            }
+        }
+        // Before anything below, which may itself exec (a health probe),
+        // and after the pid and all configured networks are in place.
+        drop(gate);
+        if let (true, Some((rows, cols))) = (spec.tty, size) {
+            let _ = vm.resize(&id, rows, cols);
         }
         // A container that left all its networks keeps its `-p` bindings
         // but has no address for them, as on Docker, where it publishes none.
@@ -6090,8 +6099,18 @@ impl Engine {
     /// [`Engine::volume_ensure`] with the local driver's options, which a
     /// new volume keeps (an existing one keeps its own).
     pub fn volume_ensure_with(&self, name: &str, labels: serde_json::Value, options: std::collections::BTreeMap<String, String>) -> Result<super::volumes::Volume, Error> {
+        self.volume_ensure_with_distro(name, labels, options, None)
+    }
+
+    pub fn volume_ensure_with_distro(
+        &self,
+        name: &str,
+        labels: serde_json::Value,
+        options: std::collections::BTreeMap<String, String>,
+        wsl_distro: Option<String>,
+    ) -> Result<super::volumes::Volume, Error> {
         let new = self.volume_get(name).is_none();
-        let v = self.lock_volumes().ensure_with(name, labels, false, options).map_err(Error::BadRequest)?;
+        let v = self.lock_volumes().ensure_with_distro(name, labels, false, options, wsl_distro).map_err(Error::BadRequest)?;
         if new {
             self.record_new_volume(&v);
             self.emit_volume("create", name);

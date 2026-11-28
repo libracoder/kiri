@@ -750,6 +750,13 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
                     },
                     Err(e) => Msg::Error(&e).encode(&mut out),
                 },
+                Ok(Msg::StartExec { id }) => match procs.values_mut().find(|p| p.run.id == id && p.run.container.is_none() && p.exited.is_none()) {
+                    Some(p) => match p.run.start_exec() {
+                        Ok(()) => Msg::Ack.encode(&mut out),
+                        Err(e) => Msg::Error(&format!("start exec {id}: {e}")).encode(&mut out),
+                    },
+                    None => Msg::Error(&format!("container {id} is not running")).encode(&mut out),
+                },
                 Ok(Msg::StatsQuery { id }) => match netns_pid(procs, id) {
                     Some(pid) => match super::cgroup::stats(&paths.cgroup.join(id), pid) {
                         Ok(s) => Msg::ContainerStats(s).encode(&mut out),

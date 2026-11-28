@@ -17,7 +17,7 @@ use crate::dockerctx::{
 const USAGE: &str = "usage: kiri setup [--use]";
 
 fn npipe_host(pipe: &str) -> String {
-    format!("npipe:{}", pipe.replace('\\', "/"))
+    format!("npipe:////{}", pipe.replace('\\', "/").trim_start_matches('/'))
 }
 
 /// Best-effort background self-heal of `%USERPROFILE%\.docker\config.json` and
@@ -185,6 +185,10 @@ mod tests {
 
     #[test]
     fn repairs_wiped_docker_config_and_dangling_desktop_linux_context() {
+        assert_eq!(npipe_host(r"\\.\pipe\kiri"), "npipe:////./pipe/kiri");
+        assert_eq!(npipe_host("//./pipe/kiri"), "npipe:////./pipe/kiri");
+        assert_eq!(npipe_host(r"\\.\pipe\kiri-dev"), "npipe:////./pipe/kiri-dev");
+
         let root = scratch("repair");
         let docker = root.join(".docker");
         let plugins = root.join("Kiri/bin/cli-plugins");

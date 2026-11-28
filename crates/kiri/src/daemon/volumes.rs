@@ -32,6 +32,11 @@ pub struct Volume {
     /// `type`, `device`, `o`. Empty for a plain directory.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub options: BTreeMap<String, String>,
+    /// Integrated WSL distro that created this volume (if any), so a local
+    /// bind volume (`o=bind`) resolves relative to `/mnt/wsl/kiri/roots/<distro>`
+    /// while keeping `options["device"]` unchanged in `volume inspect`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wsl_distro: Option<String>,
 }
 
 #[derive(Debug)]
@@ -76,6 +81,17 @@ impl Volumes {
     /// [`Volumes::ensure`] with the local driver's options for a new volume.
     /// An existing volume keeps its own, as Docker's local driver does.
     pub fn ensure_with(&mut self, name: &str, labels: serde_json::Value, anonymous: bool, options: BTreeMap<String, String>) -> Result<Volume, String> {
+        self.ensure_with_distro(name, labels, anonymous, options, None)
+    }
+
+    pub fn ensure_with_distro(
+        &mut self,
+        name: &str,
+        labels: serde_json::Value,
+        anonymous: bool,
+        options: BTreeMap<String, String>,
+        wsl_distro: Option<String>,
+    ) -> Result<Volume, String> {
         if !valid_name(name) {
             return Err(format!("invalid volume name {name:?}: only [a-zA-Z0-9][a-zA-Z0-9_.-] are allowed"));
         }
@@ -92,6 +108,7 @@ impl Volumes {
             labels,
             anonymous,
             options,
+            wsl_distro,
         };
         self.list.push(v.clone());
         self.save();

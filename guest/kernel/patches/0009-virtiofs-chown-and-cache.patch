@@ -593,7 +593,7 @@
  static int fuse_readdir_cached(struct file *file, struct dir_context *ctx)
 --- a/fs/notify/kiri_inject.c
 +++ b/fs/notify/kiri_inject.c
-@@ -34,6 +34,7 @@
+@@ -34,30 +34,48 @@
  #include <linux/mount.h>
  #include <linux/namei.h>
  #include <linux/nsproxy.h>
@@ -601,86 +601,97 @@
  #include <linux/proc_fs.h>
  #include <linux/sched/task.h>
  #include <linux/slab.h>
-@@ -44,20 +45,33 @@
+ #include <linux/string.h>
+ #include <linux/uaccess.h>
+ 
++#include "../fuse/fuse_i.h"
++
+ #define KIRI_SHARE "/mnt/mac"
  #define KIRI_SCOPED (LOOKUP_BENEATH | LOOKUP_NO_SYMLINKS | LOOKUP_NO_XDEV | LOOKUP_NO_MAGICLINKS)
  
- /* Drop a cached file or negative dentry so the next lookup asks the Mac.
+-/* Drop a cached file or negative dentry so the next lookup asks the Mac.
 - * Directories and mount points stay reachable. */
 -static void kiri_drop_dentry(struct dentry *dentry, bool negative_only)
-+ * Directories and mount points stay reachable. When `inval_data` is set,
-+ * also drop cached data pages so an already-open descriptor sees host writes. */
-+static void kiri_drop_dentry(struct dentry *dentry, bool negative_only,
-+			     bool inval_data)
++/* Drop a deleted/negative dentry or expire a positive file dentry so the next
++ * lookup revalidates with the Mac without evicting struct fuse_inode (keeping
++ * in-memory chown_uid/chown_gid intact when nodeid is unchanged). */
++static void kiri_drop_dentry(struct dentry *dentry, bool drop, bool inval_data)
  {
 +	struct inode *inode = NULL;
 +
  	spin_lock(&dentry->d_lock);
- 	if (!d_is_dir(dentry) && !d_mountpoint(dentry) &&
+-	if (!d_is_dir(dentry) && !d_mountpoint(dentry) &&
 -	    (!negative_only || d_really_is_negative(dentry)))
-+	    (!negative_only || d_really_is_negative(dentry))) {
-+		if (inval_data && d_is_reg(dentry)) {
+-		__d_drop(dentry);
++	if (!d_is_dir(dentry) && !d_mountpoint(dentry)) {
++		if (drop || d_really_is_negative(dentry)) {
++			__d_drop(dentry);
++		} else {
 +			inode = d_inode(dentry);
 +			ihold(inode);
 +		}
- 		__d_drop(dentry);
 +	}
  	spin_unlock(&dentry->d_lock);
 +	if (inode) {
-+		invalidate_inode_pages2(inode->i_mapping);
++		fuse_invalidate_entry_cache(dentry);
++		fuse_invalidate_attr(inode);
++		if (inval_data && S_ISREG(inode->i_mode))
++			invalidate_inode_pages2(inode->i_mapping);
 +		iput(inode);
 +	}
  }
  
  /* Walk `rel` below `root` in the guest dcache only (no filesystem lookups or
-  * revalidations to the Mac) and drop the final dentry if cached. */
+- * revalidations to the Mac) and drop the final dentry if cached. */
++ * revalidations to the Mac) and drop or expire the final dentry if cached. */
  static void kiri_drop_cached(struct dentry *root, const char *rel,
 -			     bool negative_only)
-+			     bool negative_only, bool inval_data)
++			     bool drop, bool inval_data)
  {
  	struct dentry *cur = dget(root);
  	const char *p = rel;
-@@ -80,7 +94,7 @@
+@@ -80,7 +98,7 @@
  			cur = next;
  			p = slash + 1;
  		} else {
 -			kiri_drop_dentry(next, negative_only);
-+			kiri_drop_dentry(next, negative_only, inval_data);
++			kiri_drop_dentry(next, drop, inval_data);
  			dput(next);
  			return;
  		}
-@@ -98,7 +112,7 @@
+@@ -98,7 +116,7 @@
  	if (IS_ERR(child))
  		return PTR_ERR(child);
  	if (child)
 -		kiri_drop_dentry(child, false);
-+		kiri_drop_dentry(child, false, false);
++		kiri_drop_dentry(child, true, false);
  	if (child && d_really_is_positive(child)) {
  		struct inode *inode = d_inode(child);
  		__u32 mask = FS_DELETE;
-@@ -150,7 +164,7 @@
+@@ -150,7 +168,7 @@
  			/* Expire before looking up so a replacement or in-place
  			 * change refreshes attributes and inode before watchers
  			 * read; an inotify mark pins the inode across the drop. */
 -			kiri_drop_dentry(cached, op == 'C');
-+			kiri_drop_dentry(cached, op == 'C', op == 'M');
++			kiri_drop_dentry(cached, false, op == 'M');
  			dput(cached);
  		}
  	}
-@@ -230,12 +244,14 @@
+@@ -230,12 +248,14 @@
  		if (!fsnotify_sb_has_watchers(share.dentry->d_sb)) {
  			switch (line[0]) {
  			case 'D':
--			case 'M':
- 			case 'A':
--				kiri_drop_cached(share.dentry, rel, false);
-+				kiri_drop_cached(share.dentry, rel, false, false);
++				kiri_drop_cached(share.dentry, rel, true, false);
 +				break;
-+			case 'M':
+ 			case 'M':
+-			case 'A':
+-				kiri_drop_cached(share.dentry, rel, false);
 +				kiri_drop_cached(share.dentry, rel, false, true);
  				break;
++			case 'A':
  			case 'C':
 -				kiri_drop_cached(share.dentry, rel, true);
-+				kiri_drop_cached(share.dentry, rel, true, false);
++				kiri_drop_cached(share.dentry, rel, false, false);
  				break;
  			default:
  				err = -EINVAL;

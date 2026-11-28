@@ -260,6 +260,10 @@ pub enum Msg<'a> {
     TrimDisk,
     /// Guest → host: bytes discarded by `FITRIM`, plus updated `statvfs` usage.
     DiskTrimmed { trimmed: u64, in_use: u64, capacity: u64 },
+    /// Host → guest: release a container started with [`run_flags::HOLD_EXEC`]
+    /// to exec its program once secondary networks are attached. Answered by
+    /// `Ack` or `Error`.
+    StartExec { id: &'a str },
     /// Success, for requests with nothing else to say.
     Ack,
 }
@@ -509,6 +513,9 @@ pub mod run_flags {
     /// `--pid host`: no PID namespace of its own; the container sees the
     /// VM's processes (on a Linux host, the host's).
     pub const PID_HOST: u32 = 1 << 17;
+    /// Hold the container's process right before exec until [`super::Msg::StartExec`]
+    /// releases it, so `spec.extra_networks` are attached before PID 1 runs.
+    pub const HOLD_EXEC: u32 = 1 << 18;
 }
 
 /// A container's network, as `Run` carries it.
@@ -901,6 +908,7 @@ mod kind {
     pub const DISK_USAGE: u16 = 86;
     pub const TRIM_DISK: u16 = 87;
     pub const DISK_TRIMMED: u16 = 88;
+    pub const START_EXEC: u16 = 89;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1312,6 +1320,7 @@ impl Msg<'_> {
                 put_u64(o, in_use);
                 put_u64(o, capacity);
             }),
+            Msg::StartExec { id } => frame(out, kind::START_EXEC, |o| put_str(o, id)),
             Msg::Listening(lines) => frame(out, kind::LISTENING, |o| {
                 put_u32(o, lines.count);
                 o.extend_from_slice(lines.raw);
@@ -1633,6 +1642,7 @@ pub fn decode(frame: &[u8]) -> Result<Msg<'_>, DecodeError> {
         kind::DISK_USAGE => Msg::DiskUsage { in_use: r.u64()?, capacity: r.u64()? },
         kind::TRIM_DISK => Msg::TrimDisk,
         kind::DISK_TRIMMED => Msg::DiskTrimmed { trimmed: r.u64()?, in_use: r.u64()?, capacity: r.u64()? },
+        kind::START_EXEC => Msg::StartExec { id: r.str()? },
         kind::NET_ATTACH => Msg::NetAttach {
             id: r.str()?,
             ifname: r.str()?,
@@ -1739,6 +1749,7 @@ mod tests {
         assert_eq!(decode(&buf[..buf.len() - 32]).unwrap(), Msg::Stats(no_memory_words));
         assert_eq!(decode(&buf[..buf.len() - 40]).unwrap(), Msg::Stats(Stats { mem_used_kib: 0, ..no_memory_words }));
         round(Msg::LayerQuery("sha256:ab"));
+        round(Msg::StartExec { id: "ctr-123" });
         round(Msg::LayerStatus(true));
         round(Msg::LayerBegin(LayerBegin { digest: "sha256:ab", media_type: "x+gzip", size: 9 }));
         round(Msg::LayerStored(LayerStored { unpacked_bytes: 1, elapsed_ns: 2 }));
