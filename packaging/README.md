@@ -8,6 +8,7 @@ directory (and `installer/windows`) does.
 | Linux (Debian, Ubuntu) | `kiri_<v>_amd64.deb`, `_arm64.deb` | `packaging/linux/build.sh` | engine + docker CLI, Compose, buildx; the window on x86-64 |
 | Linux (Debian, Ubuntu) | `kiri-lite_<v>_amd64.deb`, `_arm64.deb` | `packaging/linux/build.sh` | engine only |
 | Linux (Fedora, RHEL, openSUSE) | `kiri-<v>-1.x86_64.rpm`, `.aarch64.rpm`, `kiri-lite-…rpm` | `packaging/linux/build.sh` | same two flavours |
+| Linux (any distro with GTK 3 and WebKitGTK 4.1) | `Kiri-<v>-x86_64.AppImage`, `-aarch64.AppImage` | `packaging/linux/appimage.sh` | the window and the engine, and a `.zsync` file per AppImage, which goes on the GitHub release next to it so AppImageUpdate and similar tools can update Kiri; the window's setup installs the engine as `/usr/local/bin/kiri` with `/etc/systemd/system/kiri.service` (remove both to uninstall) |
 | Windows | `Kiri-<v>-x86_64.msi` | `cargo xtask msi` | engine for WSL2, `kiri-win.exe`, docker CLI, Compose, buildx |
 | Windows on Arm | `Kiri-<v>-arm64.msi` | `cargo xtask msi --arch arm64` | the same, arm64 throughout (docker CLI built from source) |
 | macOS | `Kiri.app` in `Kiri-<v>-arm64.dmg` (`-x86_64` for Intel), Kiri Lite | `cargo xtask release` | app + CLI tools; Lite downloads the tools |
