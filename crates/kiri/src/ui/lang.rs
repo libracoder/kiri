@@ -211,8 +211,21 @@ pub fn rtl(tag: &str) -> bool {
 }
 
 /// A letter of a right-to-left script (Hebrew, Arabic and their presentation forms).
+#[inline]
 fn rtl_letter(c: char) -> bool {
     matches!(c, '\u{0590}'..='\u{08FF}' | '\u{FB1D}'..='\u{FDFF}' | '\u{FE70}'..='\u{FEFC}')
+}
+
+/// Fast byte-level prefilter before scanning UTF-8 chars for [`rtl_letter`]:
+/// every RTL codepoint (`U+0590..=U+08FF`, `U+FB1D..=U+FDFF`, `U+FE70..=U+FEFC`)
+/// begins with UTF-8 lead byte `0xD6..=0xDF`, `0xE0`, or `0xEF`.
+#[inline]
+fn has_rtl_letter(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    if !bytes.iter().any(|&b| (0xD6..=0xE0).contains(&b) || b == 0xEF) {
+        return false;
+    }
+    s.chars().any(rtl_letter)
 }
 
 /// Right-to-left words that open with a Latin name ("docker يستخدم Kiri")
@@ -222,7 +235,7 @@ fn rtl_letter(c: char) -> bool {
 /// `{placeholder}` doesn't count as a first letter: [`fill`] makes it an
 /// island of its own. The page's rtlReady does the same for its words.
 fn rtl_ready(s: String) -> String {
-    if !s.chars().any(rtl_letter) {
+    if !has_rtl_letter(&s) {
         return s;
     }
     let mut hole = false;
@@ -240,10 +253,30 @@ fn rtl_ready(s: String) -> String {
     }
 }
 
+/// Per-language lookup table for [`tr`], lazily parsed on first use and with
+/// [`rtl_ready`] pre-applied once for RTL languages.
+fn tr_map(lang: &str) -> Option<&'static HashMap<String, String>> {
+    static TR_MAPS: [OnceLock<HashMap<String, String>>; FILES.len()] = [const { OnceLock::new() }; FILES.len()];
+    let idx = FILES.iter().position(|(tag, _)| *tag == lang)?;
+    Some(TR_MAPS[idx].get_or_init(|| {
+        let (tag, json) = FILES[idx];
+        let mut m: HashMap<String, String> = serde_json::from_str(json).unwrap_or_default();
+        if rtl(tag) {
+            for v in m.values_mut() {
+                let ready = rtl_ready(std::mem::take(v));
+                *v = ready;
+            }
+        }
+        m
+    }))
+}
+
 /// `en` in `lang`, for words drawn natively; English when there's no translation.
 pub fn tr(lang: &str, en: &str) -> String {
-    match maps().get(lang).and_then(|m| m.get(en)) {
-        Some(w) if rtl(lang) => rtl_ready(w.clone()),
+    if lang == "en" {
+        return en.to_owned();
+    }
+    match tr_map(lang).and_then(|m| m.get(en)) {
         Some(w) => w.clone(),
         None => en.to_owned(),
     }
@@ -255,22 +288,35 @@ pub fn tr(lang: &str, en: &str) -> String {
 /// first-strong isolate), so "5.0 GB" or "postgres (localhost:5432)" keeps its
 /// own order inside the Arabic around it; a bare number needs none.
 pub fn fill(s: String, vars: &[(&str, &dyn std::fmt::Display)]) -> String {
-    let islands = s.chars().any(rtl_letter);
-    let mut out = String::with_capacity(s.len());
-    let mut rest = s.as_str();
+    use std::fmt::Write as _;
+    let Some(first_open) = s.find('{') else {
+        return s;
+    };
+    let islands = has_rtl_letter(&s);
+    let mut out = String::with_capacity(s.len() + 32);
+    out.push_str(&s[..first_open]);
+    let mut rest = &s[first_open..];
     while let Some(open) = rest.find('{') {
         out.push_str(&rest[..open]);
         let after = &rest[open + 1..];
-        let name = after.find('}').map(|close| &after[..close]).filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'));
+        let name = after
+            .find('}')
+            .map(|close| &after[..close])
+            .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'));
         match name.and_then(|n| vars.iter().find(|(k, _)| *k == n)) {
             Some((k, v)) => {
-                let v = v.to_string();
-                if islands && !v.chars().all(|c| c.is_ascii_digit() || matches!(c, '.' | ',' | ' ')) {
+                if islands {
+                    let iso_start = out.len();
                     out.push('\u{2068}');
-                    out.push_str(&v);
-                    out.push('\u{2069}');
+                    let val_start = out.len();
+                    let _ = write!(out, "{v}");
+                    if out.as_bytes()[val_start..].iter().all(|&b| b.is_ascii_digit() || matches!(b, b'.' | b',' | b' ')) {
+                        out.drain(iso_start..val_start);
+                    } else {
+                        out.push('\u{2069}');
+                    }
                 } else {
-                    out.push_str(&v);
+                    let _ = write!(out, "{v}");
                 }
                 rest = &after[k.len() + 1..];
             }
