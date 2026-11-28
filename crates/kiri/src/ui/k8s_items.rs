@@ -43,6 +43,23 @@ pub(super) fn summarize(list: &Value, starting: bool) -> Value {
     Value::Object(out)
 }
 
+fn compact_ports(ports: &[Value]) -> Vec<Value> {
+    ports
+        .iter()
+        .map(|p| {
+            let Some(obj) = p.as_object() else { return p.clone() };
+            let mut out = Map::with_capacity(obj.len());
+            for (k, v) in obj {
+                if k == "protocol" && v.as_str() == Some("TCP") {
+                    continue;
+                }
+                out.insert(k.clone(), v.clone());
+            }
+            Value::Object(out)
+        })
+        .collect()
+}
+
 /// One pod, with the status `kubectl get pods` would print for it.
 fn pod(p: &Value, used_brands: &mut Map<String, Value>) -> Value {
     let (meta, spec, st) = (&p["metadata"], &p["spec"], &p["status"]);
@@ -68,7 +85,9 @@ fn pod(p: &Value, used_brands: &mut Map<String, Value>) -> Value {
         if restarts > 0 {
             cm.insert("restarts".into(), restarts.into());
         }
-        cm.insert("state".into(), state.into());
+        if state != "running" {
+            cm.insert("state".into(), state.into());
+        }
         if !reason.is_empty() {
             cm.insert("reason".into(), reason.into());
         }
@@ -82,25 +101,25 @@ fn pod(p: &Value, used_brands: &mut Map<String, Value>) -> Value {
             cm.insert("message".into(), msg.clone());
         }
         if let Some(ports) = c["ports"].as_array().filter(|a| !a.is_empty()) {
-            cm.insert("ports".into(), Value::Array(ports.clone()));
+            cm.insert("ports".into(), Value::Array(compact_ports(ports)));
         }
         containers.push(Value::Object(cm));
     }
     let ready = statuses.iter().filter(|s| s["ready"] == true).count();
     let restarts: u64 = statuses.iter().filter_map(|s| s["restartCount"].as_u64()).sum();
     let image = spec_containers.first().and_then(|c| c["image"].as_str()).unwrap_or_default();
-    let mut pm = Map::with_capacity(14);
-    if !meta["namespace"].is_null() {
-        pm.insert("ns".into(), meta["namespace"].clone());
+    let mut pm = Map::with_capacity(12);
+    if let Some(ns) = meta["namespace"].as_str().filter(|&ns| ns != "default") {
+        pm.insert("ns".into(), ns.into());
     }
     if !meta["name"].is_null() {
         pm.insert("name".into(), meta["name"].clone());
     }
-    pm.insert("status".into(), status_of(p).into());
-    pm.insert("ready".into(), format!("{ready}/{}", containers.len()).into());
-    if ready == containers.len() && !containers.is_empty() {
-        pm.insert("allReady".into(), true.into());
+    let status = status_of(p);
+    if status != "Running" {
+        pm.insert("status".into(), status.into());
     }
+    pm.insert("ready".into(), format!("{ready}/{}", containers.len()).into());
     if restarts > 0 {
         pm.insert("restarts".into(), restarts.into());
     }
@@ -177,20 +196,20 @@ fn service(s: &Value) -> Value {
     let (meta, spec) = (&s["metadata"], &s["spec"]);
     let ingress: Vec<&str> = s["status"]["loadBalancer"]["ingress"].as_array().into_iter().flatten().filter_map(|i| i["ip"].as_str().or(i["hostname"].as_str())).collect();
     let mut sm = Map::with_capacity(8);
-    if !meta["namespace"].is_null() {
-        sm.insert("ns".into(), meta["namespace"].clone());
+    if let Some(ns) = meta["namespace"].as_str().filter(|&ns| ns != "default") {
+        sm.insert("ns".into(), ns.into());
     }
     if !meta["name"].is_null() {
         sm.insert("name".into(), meta["name"].clone());
     }
-    if !spec["type"].is_null() {
-        sm.insert("type".into(), spec["type"].clone());
+    if let Some(ty) = spec["type"].as_str().filter(|&t| t != "ClusterIP") {
+        sm.insert("type".into(), ty.into());
     }
     if !spec["clusterIP"].is_null() {
         sm.insert("clusterIP".into(), spec["clusterIP"].clone());
     }
     if let Some(ports) = spec["ports"].as_array().filter(|a| !a.is_empty()) {
-        sm.insert("ports".into(), Value::Array(ports.clone()));
+        sm.insert("ports".into(), Value::Array(compact_ports(ports)));
     }
     if !ingress.is_empty() {
         sm.insert("ingress".into(), json!(ingress));

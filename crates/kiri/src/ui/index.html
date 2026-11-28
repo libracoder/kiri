@@ -9630,7 +9630,27 @@ function k8sOn(e) {
       if (e.want_port) k8s.wantPort = e.want_port;
       if (e.default_version) k8s.defaultVer = e.default_version;
       if (e.manifests_dir) k8s.manifestsDir = e.manifests_dir;
-      if (e.ready) { Object.assign(k8s, { pods: e.pods || [], services: e.services || [], icon: e.icon }); kGone(); }
+      if (e.ready) {
+        const pods = e.pods || [], services = e.services || [];
+        for (let i = 0; i < pods.length; i++) {
+          const p = pods[i];
+          if (!p.ns) p.ns = "default";
+          if (!p.status) p.status = "Running";
+          if (p.allReady == null) {
+            const r = p.ready || "", sl = r.indexOf("/");
+            p.allReady = sl > 0 && r !== "0/0" && r.slice(0, sl) === r.slice(sl + 1);
+          }
+          const cs = p.containers;
+          if (cs) for (let j = 0; j < cs.length; j++) if (!cs[j].state) cs[j].state = "running";
+        }
+        for (let i = 0; i < services.length; i++) {
+          const s = services[i];
+          if (!s.ns) s.ns = "default";
+          if (!s.type) s.type = "ClusterIP";
+        }
+        Object.assign(k8s, { pods, services, icon: e.icon });
+        kGone();
+      }
       k8sCounts();
       k8sSide();
       // Only a change redraws, so hovering a row or typing in the filter is left alone.
