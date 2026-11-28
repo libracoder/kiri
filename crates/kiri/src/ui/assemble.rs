@@ -27,15 +27,280 @@ const XTERM_CSS: &str = include_str!("xterm/xterm.css");
 /// each defining a global), in the order they load.
 const XTERM_JS: [&str; 4] = [include_str!("xterm/xterm.js"), include_str!("xterm/addon-fit.js"), include_str!("xterm/addon-search.js"), include_str!("xterm/addon-web-links.js")];
 
+struct PageTemplate {
+    part0: String,
+    part1: String,
+    part2: String,
+    fixed_len: usize,
+}
+
+impl PageTemplate {
+    fn build(index: &str) -> Self {
+        let stripped = strip_and_compact(index)
+            .replacen("/*ICONS*/", &compact_js(ICONS_JS), 1)
+            .replacen("/*LANGSTEP*/", &compact_js(LANGSTEP_JS), 1);
+        let (part0, rest) = match stripped.split_once("/*LANG*/") {
+            Some((a, b)) => (a.to_owned(), b),
+            None => (stripped, ""),
+        };
+        let (part1, part2) = match rest.split_once("/*STRINGS*/{}") {
+            Some((a, b)) => (a.to_owned(), b.to_owned()),
+            None => (rest.to_owned(), String::new()),
+        };
+        let fixed_len = part0.len() + part1.len() + part2.len();
+        Self { part0, part1, part2, fixed_len }
+    }
+
+    fn render(&self, lang: Option<&str>) -> String {
+        let boot = super::lang::boot_js(lang);
+        let strings = super::lang::strings_js_cached(super::lang::resolve(lang));
+        let mut out = String::with_capacity(self.fixed_len + boot.len() + strings.len());
+        out.push_str(&self.part0);
+        out.push_str(&boot);
+        out.push_str(&self.part1);
+        out.push_str(strings);
+        out.push_str(&self.part2);
+        out
+    }
+}
+
 /// `index` (index.html) with everything spliced in, `lang` (the `lang`
 /// setting) picking its language. xterm.js and its stylesheet are loaded
 /// lazily on first terminal open via [`xterm_js`].
 pub fn page(index: &str, lang: Option<&str>) -> String {
-    without_indent(&without_js_comment_lines(&without_css_comments(index)))
-        .replacen("/*ICONS*/", ICONS_JS, 1)
-        .replacen("/*LANGSTEP*/", LANGSTEP_JS, 1)
-        .replacen("/*LANG*/", &super::lang::boot_js(lang), 1)
-        .replacen("/*STRINGS*/{}", &super::lang::strings_js(super::lang::resolve(lang)), 1)
+    static CACHED: OnceLock<(usize, usize, PageTemplate)> = OnceLock::new();
+    let key = (index.as_ptr() as usize, index.len());
+    let (ptr, len, tpl) = CACHED.get_or_init(|| (key.0, key.1, PageTemplate::build(index)));
+    if (*ptr, *len) == key {
+        tpl.render(lang)
+    } else {
+        PageTemplate::build(index).render(lang)
+    }
+}
+
+/// Full static strip + compaction pass used by both [`page`] and `scripts/ui-test.py --strip`.
+pub(crate) fn strip_and_compact(index: &str) -> String {
+    let base = without_indent(&without_js_comment_lines(&without_css_comments(index)));
+    compact_page(&base)
+}
+
+/// Further compacts CSS and JS sections after comment/indent stripping, while
+/// keeping HTML markup (`<pre>`, `<textarea>`), strings, templates, regexes,
+/// custom property values, and uppercase splice placeholders intact.
+fn compact_page(index: &str) -> String {
+    let mut out = String::with_capacity(index.len());
+    let mut at = 0;
+    if let Some((start, end)) = style_span(index) {
+        let start = start + "<style>".len();
+        out.push_str(&index[..start]);
+        out.push_str(&compact_css(&index[start..end]));
+        at = end;
+    }
+    for (open, close) in scripts(index) {
+        if open < at {
+            continue;
+        }
+        out.push_str(&index[at..open]);
+        out.push_str(&compact_js(&index[open..close]));
+        at = close;
+    }
+    out.push_str(&index[at..]);
+    out
+}
+
+/// Tightens CSS whitespace outside strings, escapes, custom property values,
+/// and splice comments: strips space after `:` / `,`, drops `;` before `}`,
+/// and removes redundant newlines between rules.
+fn compact_css(css: &str) -> String {
+    let c: Vec<char> = css.chars().collect();
+    let mut out: Vec<char> = Vec::with_capacity(c.len());
+    let (mut quote, mut i, mut decl) = (None, 0, true);
+    while i < c.len() {
+        if quote.is_none() && c.get(i..i + 2) == Some(&['/', '*']) {
+            if let Some(rel) = c[i + 2..].windows(2).position(|w| w == ['*', '/']) {
+                let end = i + 2 + rel + 2;
+                out.extend_from_slice(&c[i..end]);
+                i = end;
+                continue;
+            }
+        }
+        if let Some(end) = custom_value(&c, i).filter(|_| quote.is_none() && decl) {
+            out.extend_from_slice(&c[i..end]);
+            (i, decl) = (end, false);
+            continue;
+        }
+        let ch = c[i];
+        i += 1;
+        if let Some(q) = quote {
+            out.push(ch);
+            if ch == '\\' {
+                if let Some(&nx) = c.get(i) {
+                    out.push(nx);
+                    i += 1;
+                }
+            } else if ch == q {
+                quote = None;
+            }
+            continue;
+        }
+        if ch == '\\' {
+            out.push(ch);
+            if let Some(&nx) = c.get(i) {
+                out.push(nx);
+                i += 1;
+            }
+            decl = false;
+            continue;
+        }
+        if matches!(ch, '"' | '\'') {
+            quote = Some(ch);
+            out.push(ch);
+            decl = false;
+            continue;
+        }
+        if ch == '\r' {
+            continue;
+        }
+        if ch == '\n' {
+            if out.last().is_some_and(|p| matches!(p, '{' | '}' | ';' | ',' | '\n')) || out.is_empty() {
+                continue;
+            }
+            out.push('\n');
+            continue;
+        }
+        if ch == ' ' || ch == '\t' {
+            if out.last().is_some_and(|p| matches!(p, ':' | ',' | '{' | ';' | ' ' | '\n')) {
+                continue;
+            }
+            if c.get(i).is_some_and(|n| matches!(n, '{' | '}' | ';' | ',' | '\n' | '\r')) {
+                continue;
+            }
+            out.push(' ');
+            continue;
+        }
+        if ch == '}' {
+            if out.last() == Some(&';') {
+                out.pop();
+            }
+            if out.last() == Some(&'\n') {
+                out.pop();
+            }
+        }
+        out.push(ch);
+        if !CSS_SPACE.contains(&ch) {
+            decl = matches!(ch, '{' | ';');
+        }
+    }
+    out.into_iter().collect()
+}
+
+/// Drops JS block/line comments (keeping uppercase `/*PLACEHOLDER*/` splices),
+/// blank lines, and redundant horizontal whitespace around unambiguous code
+/// punctuation, leaving strings, templates, regexes, and ASI newlines intact.
+fn compact_js(script: &str) -> String {
+    let mut marks = Vec::with_capacity(script.len());
+    let (_, closed) = scan(script, Some(&mut marks));
+    if !closed {
+        return script.to_owned();
+    }
+    let cs: Vec<char> = script.chars().collect();
+    if cs.len() != marks.len() {
+        return script.to_owned();
+    }
+    const TIGHT: &str = ";,{}()[]?:";
+    const OP_GUARD: &str = "=!<>+-*/%&|^~";
+    let mut out: Vec<char> = Vec::with_capacity(cs.len());
+    let mut out_code: Vec<bool> = Vec::with_capacity(cs.len());
+    let mut i = 0;
+    while i < cs.len() {
+        let st = marks[i];
+        let c = cs[i];
+        // Line comment (`//...` up to `\n`): drop comment body, keep `\n` for ASI.
+        if st == S::Code && c == '/' && cs.get(i + 1) == Some(&'/') && marks.get(i + 1) == Some(&S::Line) {
+            i += 2;
+            while i < cs.len() && cs[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        }
+        // Block comment (`/*...*/`): keep uppercase placeholders, drop the rest.
+        if st == S::Code && c == '/' && cs.get(i + 1) == Some(&'*') && marks.get(i + 2) == Some(&S::Block) {
+            let start = i;
+            i += 2;
+            while i < cs.len() && marks[i] == S::Block {
+                i += 1;
+            }
+            let inner = &cs[start + 2..i.saturating_sub(2)];
+            let is_placeholder = !inner.is_empty() && inner.iter().all(|ch| ch.is_ascii_uppercase() || *ch == '_');
+            if is_placeholder {
+                for &ch in &cs[start..i] {
+                    out.push(ch);
+                    out_code.push(false);
+                }
+            } else if out.last().is_some_and(|p| !p.is_whitespace() && !TIGHT.contains(*p))
+                && cs.get(i).is_some_and(|n| !n.is_whitespace() && !TIGHT.contains(*n))
+            {
+                out.push(' ');
+                out_code.push(true);
+            }
+            continue;
+        }
+        if st != S::Code {
+            out.push(c);
+            out_code.push(false);
+            i += 1;
+            continue;
+        }
+        if c == '\r' {
+            i += 1;
+            continue;
+        }
+        if c == '\n' {
+            while out.last() == Some(&' ') && out_code.last() == Some(&true) {
+                out.pop();
+                out_code.pop();
+            }
+            if !out.is_empty() && out.last() != Some(&'\n') {
+                out.push('\n');
+                out_code.push(true);
+            }
+            i += 1;
+            continue;
+        }
+        if c == ' ' || c == '\t' {
+            let prev = out.last().copied();
+            let prev_is_code = out_code.last().copied().unwrap_or(false);
+            if prev.is_none() || prev == Some('\n') || (prev == Some(' ') && prev_is_code) {
+                i += 1;
+                continue;
+            }
+            // Peek next non-space/tab char on the same line.
+            let mut j = i + 1;
+            while j < cs.len() && marks[j] == S::Code && matches!(cs[j], ' ' | '\t') {
+                j += 1;
+            }
+            let next = cs.get(j).copied();
+            let next_is_code = marks.get(j) == Some(&S::Code);
+            let drop_before_next = next.is_some_and(|n| {
+                n == '\n'
+                    || n == '\r'
+                    || (next_is_code && TIGHT.contains(n))
+                    || (next_is_code && n == '=' && prev.is_some_and(|p| !OP_GUARD.contains(p)))
+            });
+            let drop_after_prev = prev_is_code
+                && prev.is_some_and(|p| TIGHT.contains(p) || (p == '=' && next.is_some_and(|n| !OP_GUARD.contains(n))));
+            if !drop_before_next && !drop_after_prev {
+                out.push(' ');
+                out_code.push(true);
+            }
+            i = j;
+            continue;
+        }
+        out.push(c);
+        out_code.push(true);
+        i += 1;
+    }
+    out.into_iter().collect()
 }
 
 /// Self-contained JS bundle evaluated on demand when the user first opens the
@@ -523,7 +788,7 @@ mod tests {
         use std::io::Write;
         // scripts/ui-test.py builds the page its own way: what it strips must be what the window loads.
         let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/ui-test.py");
-        let strip = |page: &str| super::without_indent(&super::without_js_comment_lines(&super::without_css_comments(page)));
+        let strip = |page: &str| super::strip_and_compact(page);
         let cases = [
             include_str!("index.html"),
             "<style>\r\n  /* why */ a{}\r\n  b { content: \"x\\\r\n  y\"; }\r\n</style><script>\r\n  // gone\r\n  const a = \"x\\\r\n  y\";\r\n  b();\r\n</script>",
@@ -575,7 +840,7 @@ mod tests {
         let xterm = super::xterm_js();
         assert!(xterm.contains(".xterm-viewport"), "xterm.css missing from lazy bundle");
         assert!(xterm.contains("kiriXtermReady"), "kiriXtermReady missing from lazy bundle");
-        assert!(page.contains("function langStep(") && page.contains("const LANGS = ["), "langstep.js missing");
+        assert!(page.contains("function langStep(") && (page.contains("const LANGS=[") || page.contains("const LANGS = [")), "langstep.js missing");
         let setup = super::words(include_str!("../../../kiri-win/src/setup.html"), None);
         for p in ["/*LANGSTEP*/", "/*LANG*/", "/*STRINGS*/"] {
             assert!(!setup.contains(p), "{p} left in the setup page");

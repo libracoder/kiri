@@ -96,17 +96,30 @@ fn safe_inline_json(json: String) -> String {
         .replace('\u{2029}', "\\u2029")
 }
 
-/// The words a page opens with, as one JS object literal: `{"en": [every
-/// English key], "<tag>": [its words, in the keys' order]}`, for the language
-/// `lang` (a tag [`resolve`] gave; "en" sends the keys alone). The keys go in
-/// once, so a language added later ([`words_js`]) costs only its words.
-pub fn strings_js(lang: &str) -> String {
+/// Cached version of [`strings_js`] for each supported language tag plus `"en"`.
+/// Avoids rebuilding and re-escaping ~150 KB of JSON on repeated page assembly.
+pub fn strings_js_cached(lang: &str) -> &'static str {
+    static CACHE: [OnceLock<String>; FILES.len() + 1] = [const { OnceLock::new() }; FILES.len() + 1];
+    let idx = FILES.iter().position(|(tag, _)| *tag == lang).unwrap_or(FILES.len());
+    let slot_lang = if idx < FILES.len() { FILES[idx].0 } else { "en" };
+    CACHE[idx].get_or_init(|| build_strings_js(slot_lang)).as_str()
+}
+
+fn build_strings_js(lang: &str) -> String {
     let mut out = serde_json::Map::new();
     out.insert("en".into(), keys().iter().map(|k| serde_json::Value::from(*k)).collect());
     if let Some(w) = words(lang) {
         out.insert(lang.into(), w);
     }
     safe_inline_json(serde_json::Value::Object(out).to_string())
+}
+
+/// The words a page opens with, as one JS object literal: `{"en": [every
+/// English key], "<tag>": [its words, in the keys' order]}`, for the language
+/// `lang` (a tag [`resolve`] gave; "en" sends the keys alone). The keys go in
+/// once, so a language added later ([`words_js`]) costs only its words.
+pub fn strings_js(lang: &str) -> String {
+    strings_js_cached(lang).to_owned()
 }
 
 /// The host's answer to a page's `langwords`: JS that hands the page `tag`'s
