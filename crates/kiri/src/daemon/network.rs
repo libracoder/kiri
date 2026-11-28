@@ -176,6 +176,26 @@ impl V6 {
 }
 
 impl Network {
+    /// The host address published ports bind when they name none; checked
+    /// again on use, so a bad value kept by an older Kiri fails rather than
+    /// binding every address.
+    pub fn host_binding_ip(&self) -> Result<Option<std::net::IpAddr>, String> {
+        host_binding_in(&self.options)
+    }
+
+    /// `--opt com.docker.network.bridge.enable_icc=false`: containers on
+    /// this network cannot reach each other (#213).
+    pub fn icc_disabled(&self) -> bool {
+        self.options.get(ENABLE_ICC_OPT).and_then(|v| v.as_str()).and_then(go_bool) == Some(false)
+    }
+
+    /// Whether the bridge has no IPv4 address (`gateway_mode_ipv4=isolated`,
+    /// or `inhibit_ipv4` on an internal network): the host is not on the
+    /// network, and its containers ask Kiri's resolver at 127.0.0.11 (#1001).
+    pub fn no_gateway4(&self) -> bool {
+        self.internal && (opt_str(&self.options, GATEWAY_MODE4_OPT) == Some("isolated") || opt_str(&self.options, INHIBIT_IPV4_OPT).and_then(go_bool) == Some(true))
+    }
+
     pub fn builtin(&self) -> bool {
         matches!(self.name.as_str(), "bridge" | "host" | "none")
     }
@@ -371,10 +391,92 @@ fn builtin(name: &str, driver: &str, bridge: &str, subnet: [u8; 4], gateway: [u8
 /// than reported and not applied.
 pub const BRIDGE_NAME_OPT: &str = "com.docker.network.bridge.name";
 
+/// `--opt com.docker.network.bridge.host_binding_ipv4=…`: the host IPv4
+/// address a published port of this network binds when it names none itself.
+pub const HOST_BINDING_OPT: &str = "com.docker.network.bridge.host_binding_ipv4";
+
+/// `--opt com.docker.network.bridge.enable_icc=false`: no traffic between
+/// the network's containers, enforced by isolating each one's bridge port.
+pub const ENABLE_ICC_OPT: &str = "com.docker.network.bridge.enable_icc";
+
+/// `--opt com.docker.network.bridge.gateway_mode_ipv4=isolated` (Docker
+/// 28): the bridge gets no IPv4 address, so the host has none on an
+/// internal network for its containers to reach (#1001).
+pub const GATEWAY_MODE4_OPT: &str = "com.docker.network.bridge.gateway_mode_ipv4";
+/// `gateway_mode_ipv4`'s IPv6 counterpart.
+pub const GATEWAY_MODE6_OPT: &str = "com.docker.network.bridge.gateway_mode_ipv6";
+/// `--opt com.docker.network.bridge.inhibit_ipv4=true`: on an internal
+/// network the same as `gateway_mode_ipv4=isolated`, as in Docker.
+pub const INHIBIT_IPV4_OPT: &str = "com.docker.network.bridge.inhibit_ipv4";
+
+/// An option's value as Docker reads it: a string (`--opt` gives only those).
+fn opt_str<'a>(options: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    options.get(key).map(|v| v.as_str().unwrap_or("?"))
+}
+
+/// Go's `strconv.ParseBool`, which Docker reads boolean bridge options with.
+fn go_bool(v: &str) -> Option<bool> {
+    match v {
+        "1" | "t" | "T" | "true" | "TRUE" | "True" => Some(true),
+        "0" | "f" | "F" | "false" | "FALSE" | "False" => Some(false),
+        _ => None,
+    }
+}
+
+/// The default host IPv4 address `options` give published ports: `None` when
+/// the option is absent or empty (`""`, Docker's unset), or an error when it
+/// is not a valid IPv4 address string.
+pub fn host_binding_in(options: &serde_json::Value) -> Result<Option<std::net::IpAddr>, String> {
+    let Some(v) = options.as_object().and_then(|m| m.get(HOST_BINDING_OPT)) else { return Ok(None) };
+    let bad = || format!("invalid value for network option {HOST_BINDING_OPT}: {v} is not an IPv4 address");
+    let s = v.as_str().ok_or_else(bad)?;
+    if s.is_empty() {
+        return Ok(None);
+    }
+    let ip = s.parse::<std::net::Ipv4Addr>().map_err(|_| bad())?;
+    Ok(Some(std::net::IpAddr::V4(ip)))
+}
+
+/// The gateway options, checked as Docker's bridge driver checks them:
+/// a known mode, a boolean `inhibit_ipv4`, and `isolated` only on an
+/// internal network. Kiri gives every other mode the default (`nat`), as
+/// before. An isolated IPv6 gateway isn't done yet, so a network with IPv6
+/// is refused it rather than given one anyway.
+fn checked_gateway_options(options: &serde_json::Value, internal: bool, ipv6: bool) -> Result<(), String> {
+    let mut isolated = [false; 2];
+    for (i, key) in [GATEWAY_MODE4_OPT, GATEWAY_MODE6_OPT].into_iter().enumerate() {
+        match opt_str(options, key) {
+            None | Some("" | "nat" | "nat-unprotected" | "routed") => {}
+            Some("isolated") => isolated[i] = true,
+            Some(v) => return Err(format!("failed to parse {key} value: {v} (unknown gateway mode {v})")),
+        }
+    }
+    if let Some(v) = opt_str(options, INHIBIT_IPV4_OPT)
+        && go_bool(v).is_none()
+    {
+        return Err(format!("failed to parse {INHIBIT_IPV4_OPT} value: {v} (strconv.ParseBool: parsing {v:?}: invalid syntax)"));
+    }
+    if isolated.contains(&true) && !internal {
+        return Err("gateway mode 'isolated' can only be used for an internal network".into());
+    }
+    if isolated[1] && ipv6 {
+        return Err(format!("Kiri does not support {GATEWAY_MODE6_OPT}=isolated yet: the bridge would still have its IPv6 address. Leave it out, or use an IPv4-only internal network with {GATEWAY_MODE4_OPT}=isolated"));
+    }
+    Ok(())
+}
+
 /// The options a network keeps, or why one of them cannot be applied. An
-/// empty bridge name is Docker's "unset" and is dropped.
+/// empty bridge name is Docker's "unset" and is dropped. An `enable_icc`
+/// that is not a boolean is refused, as Docker does, rather than left to
+/// mean the containers may reach each other.
 fn checked_options(options: serde_json::Value) -> Result<serde_json::Value, String> {
+    host_binding_in(&options)?;
     let serde_json::Value::Object(mut map) = options else { return Ok(serde_json::json!({})) };
+    if let Some(v) = map.get(ENABLE_ICC_OPT)
+        && v.as_str().and_then(go_bool).is_none()
+    {
+        return Err(format!("invalid value {v} for the network option {ENABLE_ICC_OPT}: expected true or false"));
+    }
     match map.get(BRIDGE_NAME_OPT).map(|v| v.as_str().unwrap_or("?")) {
         None => {}
         Some("") => {
@@ -532,6 +634,19 @@ fn parse_ipam6(c: &serde_json::Value, subnet: &str) -> Result<Ipam6, String> {
     Ok(Ipam6 { subnet: net, prefix, gateway, ip_range, aux })
 }
 
+/// Rejects subnet network (`host == 0`) and broadcast (`host == (u32::MAX >> prefix)`)
+/// addresses for IPAM gateway and auxiliary addresses on subnets with `prefix < 31`
+/// (guarding `prefix < 31` so `/31` and `/32` never overflow the shift).
+fn check_ipam_host_addr(ip: [u8; 4], net: [u8; 4], prefix: u8, what: &str, s: &str, subnet: &str) -> Result<(), String> {
+    if prefix < 31 {
+        let host = u32::from_be_bytes(ip).wrapping_sub(u32::from_be_bytes(net));
+        if host == 0 || host == (u32::MAX >> u32::from(prefix)) {
+            return Err(format!("invalid {what} {s}: it is the network or broadcast address of subnet {subnet}"));
+        }
+    }
+    Ok(())
+}
+
 /// The `IPAM` object of a network create request: the default driver, at
 /// most one IPv4 and one IPv6 pool.
 pub fn parse_ipam(v: &serde_json::Value) -> Result<Option<Ipam>, String> {
@@ -587,6 +702,7 @@ pub fn parse_ipam_both(v: &serde_json::Value) -> Result<(Option<Ipam>, Option<Ip
             if !inside(ip) {
                 return Err(format!("invalid {what} {s}: parent subnet {subnet} does not contain ip address {s}"));
             }
+            check_ipam_host_addr(ip, net, prefix, what, s, &subnet)?;
             Ok(ip)
         };
         let gateway = match field("Gateway") {
@@ -721,6 +837,11 @@ impl Networks {
         if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b)) {
             return Err(format!("invalid network name {name:?}"));
         }
+        // `find` takes `default` for `bridge`, so a network by that name could
+        // never be reached or removed; Docker refuses it as predefined.
+        if name == "default" {
+            return Err("operation is not permitted on predefined default network".into());
+        }
         if self.find(name).is_some_and(|n| n.name == name) {
             return Err(format!("network with name {name} already exists"));
         }
@@ -728,6 +849,7 @@ impl Networks {
             return Err("invalid network config: IPv4 or IPv6 must be enabled".into());
         }
         let options = checked_options(s.options.clone())?;
+        checked_gateway_options(&options, s.internal, s.ipv6)?;
         if s.no_ipv4 && s.ipam.is_some() {
             return Err("invalid network config: an IPv4 subnet was given, but IPv4 is disabled (--ipv4=false)".into());
         }
@@ -1699,5 +1821,112 @@ mod tests {
         let mut b = net(None);
         b.name = "bridge".into();
         assert!(b.check_static([10, 5, 0, 10]).unwrap_err().contains("user defined networks only"));
+    }
+
+    #[test]
+    fn gateway_and_aux_are_never_the_network_or_broadcast_address_and_slash31_slash32_never_panic() {
+        let bad = |cfg: serde_json::Value| parse_ipam(&serde_json::json!({"Config": [cfg]})).unwrap_err();
+        assert!(bad(serde_json::json!({"Subnet": "10.5.0.0/24", "Gateway": "10.5.0.255"})).contains("broadcast"));
+        assert!(bad(serde_json::json!({"Subnet": "10.5.0.0/24", "Gateway": "10.5.0.0"})).contains("broadcast"));
+        assert!(bad(serde_json::json!({"Subnet": "10.5.0.0/24", "AuxiliaryAddresses": {"r": "10.5.0.0"}})).contains("auxiliary address r"));
+        assert!(bad(serde_json::json!({"Subnet": "10.5.0.0/24", "AuxiliaryAddresses": {"r": "10.5.0.255"}})).contains("auxiliary address r"));
+        assert!(bad(serde_json::json!({"Subnet": "10.4.0.0/30", "Gateway": "10.4.0.3"})).contains("broadcast"));
+
+        let ok = |g: &str, s: &str| parse_ipam(&serde_json::json!({"Config": [{"Subnet": s, "Gateway": g}]})).unwrap().unwrap().gateway;
+        assert_eq!(ok("10.5.0.1", "10.5.0.0/24"), Some([10, 5, 0, 1]));
+        assert_eq!(ok("10.5.0.254", "10.5.0.0/24"), Some([10, 5, 0, 254]));
+        assert_eq!(ok("10.4.0.2", "10.4.0.0/30"), Some([10, 4, 0, 2]));
+
+        assert!(bad(serde_json::json!({"Subnet": "10.5.0.0/31", "Gateway": "10.5.0.0"})).contains("prefixes from /8 to /30"));
+        assert!(bad(serde_json::json!({"Subnet": "10.5.0.1/32", "Gateway": "10.5.0.1"})).contains("prefixes from /8 to /30"));
+        for prefix in [31u8, 32, 33, 255] {
+            assert_eq!(check_ipam_host_addr([10, 5, 0, 0], [10, 5, 0, 0], prefix, "gateway", "10.5.0.0", "10.5.0.0/32"), Ok(()));
+            assert_eq!(check_ipam_host_addr([10, 5, 0, 1], [10, 5, 0, 0], prefix, "gateway", "10.5.0.1", "10.5.0.0/31"), Ok(()));
+        }
+        assert!(check_ipam_host_addr([0, 0, 0, 0], [0, 0, 0, 0], 0, "gateway", "0.0.0.0", "0.0.0.0/0").is_err());
+        assert!(check_ipam_host_addr([255, 255, 255, 255], [0, 0, 0, 0], 0, "gateway", "255.255.255.255", "0.0.0.0/0").is_err());
+    }
+
+    #[test]
+    fn a_network_cannot_be_named_default() {
+        let (mut n, dir) = nets();
+        let e = n.create("default", Settings::default()).unwrap_err();
+        assert!(e.contains("predefined default network"), "{e}");
+        assert!(!n.all().iter().any(|x| x.name == "default"));
+        n.create("default2", Settings::default()).unwrap();
+        assert_eq!(n.find("default2").map(|x| x.name.as_str()), Some("default2"));
+        n.remove("default2").unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn host_binding_option_treats_empty_as_unset_and_validates_ipv4() {
+        let (mut n, dir) = nets();
+        let opts = |v: serde_json::Value| Settings { options: serde_json::json!({HOST_BINDING_OPT: v}), ..Default::default() };
+        let made = n.create("lo", opts("127.0.0.1".into())).unwrap();
+        assert_eq!(made.options, serde_json::json!({HOST_BINDING_OPT: "127.0.0.1"}));
+        assert_eq!(made.host_binding_ip(), Ok(Some("127.0.0.1".parse().unwrap())));
+
+        let empty = n.create("unset", opts("".into())).unwrap();
+        assert_eq!(empty.host_binding_ip(), Ok(None), "empty host_binding_ipv4 is unset (default 0.0.0.0)");
+
+        let any = n.create("any4", opts("0.0.0.0".into())).unwrap();
+        assert_eq!(any.host_binding_ip(), Ok(Some("0.0.0.0".parse().unwrap())));
+
+        for bad in [serde_json::json!("nope"), serde_json::json!("::1"), serde_json::json!("[::1]"), serde_json::json!("::ffff:10.0.0.1"), serde_json::json!(" 127.0.0.1"), serde_json::json!(1), serde_json::Value::Null] {
+            let e = n.create("bad", opts(bad.clone())).unwrap_err();
+            assert!(e.contains(HOST_BINDING_OPT), "{bad}: {e}");
+            assert!(n.find("bad").is_none());
+        }
+        assert_eq!(n.create("plain", Settings::default()).unwrap().host_binding_ip(), Ok(None));
+        let mut old = made.clone();
+        old.options[HOST_BINDING_OPT] = "garbage".into();
+        assert!(old.host_binding_ip().is_err(), "a stored bad value fails closed");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn enable_icc_false_is_read_and_a_bad_value_refused() {
+        let (mut n, dir) = nets();
+        let opts = |v: &str| Settings { options: serde_json::json!({ENABLE_ICC_OPT: v}), ..Default::default() };
+        assert!(n.create("iccoff", opts("false")).unwrap().icc_disabled());
+        assert!(n.create("iccoff0", opts("0")).unwrap().icc_disabled());
+        assert!(n.create("iccofft", opts("False")).unwrap().icc_disabled());
+        assert!(!n.create("iccon", opts("true")).unwrap().icc_disabled());
+        assert!(!n.create("plain", Settings::default()).unwrap().icc_disabled());
+        let e = n.create("iccbad", opts("no")).unwrap_err();
+        assert!(e.contains("invalid value \"no\" for the network option com.docker.network.bridge.enable_icc"), "{e}");
+        assert!(n.find("iccbad").is_none(), "nothing made");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_isolated_gateway_is_for_internal_networks_only() {
+        let (mut n, dir) = nets();
+        let with = |internal: bool, opts: serde_json::Value| Settings { internal, options: opts, ..Default::default() };
+        let iso = n.create("iso", with(true, serde_json::json!({GATEWAY_MODE4_OPT: "isolated"}))).unwrap();
+        assert!(iso.no_gateway4());
+        assert!(n.create("inhibit", with(true, serde_json::json!({INHIBIT_IPV4_OPT: "true"}))).unwrap().no_gateway4());
+        assert!(!n.create("inhibit-off", with(true, serde_json::json!({INHIBIT_IPV4_OPT: "false"}))).unwrap().no_gateway4());
+        assert!(!n.create("plain-internal", with(true, serde_json::json!({}))).unwrap().no_gateway4());
+        assert!(!n.create("inhibit-outside", with(false, serde_json::json!({INHIBIT_IPV4_OPT: "true"}))).unwrap().no_gateway4());
+        for mode in ["nat", "nat-unprotected", "routed"] {
+            let made = n.create(&format!("m-{mode}"), with(false, serde_json::json!({GATEWAY_MODE4_OPT: mode}))).unwrap();
+            assert!(!made.no_gateway4() && made.options[GATEWAY_MODE4_OPT] == mode, "{mode}");
+        }
+        let refused = [
+            (with(false, serde_json::json!({GATEWAY_MODE4_OPT: "isolated"})), "gateway mode 'isolated' can only be used for an internal network".to_owned()),
+            (with(false, serde_json::json!({GATEWAY_MODE6_OPT: "isolated"})), "gateway mode 'isolated' can only be used for an internal network".to_owned()),
+            (with(true, serde_json::json!({GATEWAY_MODE4_OPT: "closed"})), format!("failed to parse {GATEWAY_MODE4_OPT} value: closed (unknown gateway mode closed)")),
+            (with(true, serde_json::json!({INHIBIT_IPV4_OPT: "yes"})), format!("failed to parse {INHIBIT_IPV4_OPT} value: yes (strconv.ParseBool: parsing \"yes\": invalid syntax)")),
+        ];
+        for (i, (settings, want)) in refused.into_iter().enumerate() {
+            assert_eq!(n.create(&format!("bad{i}"), settings).unwrap_err(), want);
+            assert!(n.find(&format!("bad{i}")).is_none(), "nothing made");
+        }
+        let e = n.create("iso6", Settings { internal: true, options: serde_json::json!({GATEWAY_MODE6_OPT: "isolated"}), ..v6(None) }).unwrap_err();
+        assert!(e.starts_with("Kiri does not support com.docker.network.bridge.gateway_mode_ipv6=isolated yet"), "{e}");
+        assert!(n.create("iso6-v4only", with(true, serde_json::json!({GATEWAY_MODE4_OPT: "isolated", GATEWAY_MODE6_OPT: "isolated"}))).unwrap().no_gateway4());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -568,6 +568,15 @@ pub mod net_opts {
     /// only the name the guest keeps it by: neither it nor the bridge gets
     /// one, and DNS has no A record for it.
     pub const NO_IPV4: &str = "noipv4";
+    /// `nogw4=1`: the bridge has no IPv4 address (`gateway_mode_ipv4=isolated`
+    /// on an internal network), so the host isn't on the network. The
+    /// container keeps its own address; it has no default route anyway, and
+    /// asks Kiri's resolver at 127.0.0.11, as nothing listens on the gateway.
+    pub const NO_GATEWAY4: &str = "nogw4";
+    /// `noicc=1`: the network has `com.docker.network.bridge.enable_icc=false`:
+    /// the container's bridge port is isolated, so it reaches no other
+    /// container on that network (#213).
+    pub const NO_ICC: &str = "noicc";
     /// `dnsbridge=kiri3`, one per network: a user network the container
     /// joins once it runs (`NetAttach`). Its embedded DNS answers that
     /// network's names from the start, as Docker's does with every network
