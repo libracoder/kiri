@@ -5,6 +5,9 @@
 # Users in the `kiri` group:  docker context create kiri --docker host=unix:///run/kiri/docker.sock
 # Membership of the `kiri` group is root-equivalent (a member can mount any
 # path into a container as root), exactly like the `docker` group.
+# Where the kernel has AppArmor enabled (Ubuntu, Debian, openSUSE), the
+# engine needs apparmor_parser (package apparmor; apparmor-parser on
+# openSUSE) to load its container profile, kiri-default, when it starts.
 [Unit]
 Description=Kiri container engine
 Documentation=https://kiri.canestack.com

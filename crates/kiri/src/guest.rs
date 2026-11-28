@@ -280,20 +280,22 @@ impl Guest {
         })
     }
 
-    pub fn has_layer(&mut self, digest: &str) -> io::Result<bool> {
+    pub fn has_layer(&mut self, digest: &str, expected_diff_id: &str) -> io::Result<bool> {
         self.send(Msg::LayerQuery(digest))?;
         match self.read()? {
-            Msg::LayerStatus(have) => Ok(have),
+            Msg::LayerStatus { present, diff_id } => {
+                Ok(present && !diff_id.is_empty() && (expected_diff_id.is_empty() || diff_id == expected_diff_id))
+            }
             other => Err(unexpected("LayerStatus", &other)),
         }
     }
 
-    /// Streams a compressed layer blob to the guest, which unpacks it.
-    /// Returns the unpacked size.
-    pub fn send_layer(&mut self, digest: &str, media_type: &str, blob: &std::path::Path) -> io::Result<u64> {
+    /// Streams a compressed layer blob to the guest, which unpacks it and
+    /// verifies its unpacked `diff_id`. Returns the unpacked size.
+    pub fn send_layer(&mut self, digest: &str, expected_diff_id: &str, blob: &std::path::Path) -> io::Result<u64> {
         let mut file = File::open(blob)?;
         let size = file.metadata()?.len();
-        self.send(Msg::LayerBegin(LayerBegin { digest, media_type, size }))?;
+        self.send(Msg::LayerBegin(LayerBegin { digest, size }))?;
         let mut buf = vec![0u8; 256 * 1024];
         let mut left = size;
         while left > 0 {
@@ -306,7 +308,15 @@ impl Guest {
             left -= n as u64;
         }
         match self.read()? {
-            Msg::LayerStored(s) => Ok(s.unpacked_bytes),
+            Msg::LayerStored(s) => {
+                if !expected_diff_id.is_empty() && s.diff_id != expected_diff_id {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("layer {digest} unpacked to {} in guest, expected {expected_diff_id}", s.diff_id),
+                    ));
+                }
+                Ok(s.unpacked_bytes)
+            }
             Msg::Error(e) => Err(io::Error::other(e.to_owned())),
             other => Err(unexpected("LayerStored", &other)),
         }

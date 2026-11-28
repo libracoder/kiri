@@ -267,11 +267,17 @@ pub(super) fn apply_change(cfg: &mut Value, line: &str) -> Result<(), Error> {
 /// `docker commit`: the container's writable layer on top of its image.
 fn commit(req: &Request, engine: &Engine) -> Result<Value, Error> {
     let key = req.query("container").unwrap_or_default();
-    let (id, spec, running) = engine.with(key, |c| (c.id.clone(), c.spec.clone(), c.status == Status::Running))?;
+    let (id, spec, running, own_layers) = engine.with(key, |c| (c.id.clone(), c.spec.clone(), c.status == Status::Running, c.layers.clone()))?;
     let (base, cfg_pin, _base_layer_pins) = engine
         .store
         .with_images(|images| {
-            let base = images.iter().find(|i| i.config_digest == spec.image_id)?.clone();
+            let same_layers = |i: &&kiri_image::Image| i.layers.iter().rev().map(|l| &l.digest).eq(own_layers.iter());
+            let base = images
+                .iter()
+                .filter(|i| i.config_digest == spec.image_id)
+                .find(same_layers)
+                .or_else(|| images.iter().find(|i| i.config_digest == spec.image_id))?
+                .clone();
             let cfg_pin = engine.store.pin(&base.config_digest);
             let layer_pins: Vec<_> = base.layers.iter().map(|l| engine.store.pin(&l.digest)).collect();
             Some((base, cfg_pin, layer_pins))
@@ -310,21 +316,21 @@ fn commit(req: &Request, engine: &Engine) -> Result<Value, Error> {
     if pause {
         engine.pause(&id, true)?;
     }
-    let layer = (|| -> Result<(String, u64, kiri_image::store::Pin), Error> {
+    let layer = (|| -> Result<(kiri_image::Layer, String, kiri_image::store::Pin), Error> {
         let (_stream, mut f) = layer_job(engine, &id, kiri_proto::copy_op::COMMIT, 0)?;
-        let mut w = engine.store.ingest()?;
-        io::copy(&mut f, &mut w)?;
-        Ok(w.finish_pinned()?)
+        Ok(engine.store.ingest_layer_pinned(&mut f)?)
     })();
     if pause {
         let _ = engine.pause(&id, false);
     }
-    // An uncompressed layer: its digest is its diff id.
-    let (digest, size, _layer_pin) = layer?;
+    let (new_layer, diff_id, layer_pin) = layer?;
+    let new_layer_digest = new_layer.digest.clone();
     if !cfg["rootfs"]["diff_ids"].is_array() {
         cfg["rootfs"] = json!({"type": "layers", "diff_ids": []});
+    } else if cfg["rootfs"]["type"].as_str() != Some("layers") {
+        cfg["rootfs"]["type"] = "layers".into();
     }
-    cfg["rootfs"]["diff_ids"].as_array_mut().expect("array").push(digest.clone().into());
+    cfg["rootfs"]["diff_ids"].as_array_mut().expect("array").push(diff_id.into());
     let now = time::rfc3339(std::time::SystemTime::now());
     let comment = req.query("comment").unwrap_or_default();
     let mut hist = cfg["history"].as_array().cloned().unwrap_or_default();
@@ -337,9 +343,9 @@ fn commit(req: &Request, engine: &Engine) -> Result<Value, Error> {
     let bytes = serde_json::to_vec(&cfg).map_err(|e| Error::Io(io::Error::other(e)))?;
     let mut w = engine.store.ingest()?;
     io::Write::write_all(&mut w, &bytes)?;
-    let (config_digest, _, _config_pin) = w.finish_pinned()?;
+    let (config_digest, _, config_pin) = w.finish_pinned()?;
     let mut layers = base.layers.clone();
-    layers.push(kiri_image::Layer { digest, size, media_type: "application/vnd.oci.image.layer.v1.tar".into() });
+    layers.push(new_layer);
     let repo = req.query("repo").unwrap_or_default();
     let name = if repo.is_empty() {
         config_digest.clone()
@@ -348,7 +354,16 @@ fn commit(req: &Request, engine: &Engine) -> Result<Value, Error> {
         kiri_image::Reference::parse(&format!("{repo}:{tag}")).map(|r| r.short()).map_err(|e| Error::BadRequest(format!("invalid reference format: {e}")))?
     };
     let image = kiri_image::archive::from_config(name, &config_digest, &cfg, layers);
-    engine.store.put_image(image)?;
+    if let Err(e) = engine.store.check_image(&image).and_then(|()| engine.store.put_image(image)) {
+        drop((config_pin, layer_pin));
+        for d in [&config_digest, &new_layer_digest] {
+            let _ = engine.store.remove_if_unused(d);
+        }
+        return Err(match e.kind() {
+            io::ErrorKind::InvalidData => Error::Conflict(format!("container {} was not committed: {e}", &id[..12])),
+            _ => Error::Io(e),
+        });
+    }
     engine.prune_layers();
     engine.emit_container("commit", &id, &[]);
     Ok(json!({"Id": config_digest}))

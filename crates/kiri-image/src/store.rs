@@ -584,11 +584,13 @@ impl Store {
     /// once `images` is written.
     fn remove_unused_blobs(&self, gone: &Image, images: &[Image]) {
         let in_use = |d: &str| images.iter().any(|i| i.referenced_digests().any(|r| r == d));
+        let mut deleted = Vec::new();
         for d in gone.referenced_digests() {
-            if !in_use(d) {
-                self.remove_unpinned(d);
+            if !in_use(d) && self.remove_unpinned(d) {
+                deleted.push(d.to_owned());
             }
         }
+        self.forget_diff_ids(&deleted);
     }
 
     /// Deletes the blob `digest` if no image uses it and nothing holds it,
@@ -597,8 +599,8 @@ impl Store {
     pub fn remove_if_unused(&self, digest: &str) -> io::Result<()> {
         let _lock = self.lock_index()?;
         let images = self.read_locked()?;
-        if !images.iter().any(|i| i.referenced_digests().any(|r| r == digest)) {
-            self.remove_unpinned(digest);
+        if !images.iter().any(|i| i.referenced_digests().any(|r| r == digest)) && self.remove_unpinned(digest) {
+            self.forget_diff_ids(&[digest.to_owned()]);
         }
         Ok(())
     }
@@ -606,12 +608,10 @@ impl Store {
     /// The hold check and the delete under the blob lock, which a writer's
     /// pin and rename take too ([`Ingest::finish_pinned`]): a blob written
     /// or found again by a writer between the two is never deleted.
-    fn remove_unpinned(&self, digest: &str) {
-        let Ok(path) = self.blob_path(digest) else { return };
+    fn remove_unpinned(&self, digest: &str) -> bool {
+        let Ok(path) = self.blob_path(digest) else { return false };
         let _one = BLOB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        if !pinned(&path) {
-            let _ = fs::remove_file(path);
-        }
+        !pinned(&path) && fs::remove_file(path).is_ok()
     }
 
     /// Replaces the index with `images`, see [`crate::jsonfile::replace`].
@@ -773,7 +773,7 @@ pub fn sha256_digest(bytes: &[u8]) -> String {
     format!("sha256:{}", hex(&Sha256::digest(bytes)))
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {

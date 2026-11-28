@@ -165,23 +165,41 @@ fn menu_state() -> std::sync::MutexGuard<'static, MenuState> {
 }
 
 /// A container's local address, as the page builds it: its chosen
-/// `dev.kiri.domain`, else Compose's service.project, else its name.
+/// `dev.kiri.domain`, else Compose's service.project, else its name. None
+/// unless that is a plain host name (weburl::plain_name): a label is
+/// anyone's text, and the address is opened from the menu.
 fn local_url(c: &serde_json::Value) -> Option<String> {
     if c["Ports"].as_array().is_none_or(|p| p.is_empty()) {
         return None;
     }
-    let label = |k: &str| c["Labels"][k].as_str().unwrap_or("");
     let suffix = if crate::daemon::dns::installed() { "kiri.local" } else { "kiri.localhost" };
-    let chosen = label("dev.kiri.domain").split(',').next().unwrap_or("").trim();
-    let chosen = chosen.strip_suffix(".kiri.localhost").or_else(|| chosen.strip_suffix(".kiri.local")).unwrap_or(chosen);
-    let name = c["Names"][0].as_str().unwrap_or("").trim_start_matches('/');
-    let host = match (chosen, label("com.docker.compose.project")) {
-        (c, _) if !c.is_empty() => c.to_owned(),
-        (_, p) if !p.is_empty() => format!("{}.{p}", label("com.docker.compose.service")),
-        _ => name.to_owned(),
-    };
     let scheme = if crate::daemon::tls::trusted() { "https" } else { "http" };
-    Some(format!("{scheme}://{host}.{suffix}"))
+    Some(format!("{scheme}://{}.{suffix}", local_name(c)?))
+}
+
+/// The name part of [`local_url`], lower-cased, or None when it is not a
+/// plain host name. A `dev.kiri.domain` that is not one gives no address
+/// rather than falling back to another name.
+fn local_name(c: &serde_json::Value) -> Option<String> {
+    let label = |k: &str| c["Labels"][k].as_str().unwrap_or("");
+    let host = if !label("dev.kiri.domain").trim().is_empty() {
+        crate::weburl::chosen_domain(label("dev.kiri.domain"))
+    } else if !label("com.docker.compose.project").is_empty() {
+        format!("{}.{}", label("com.docker.compose.service"), label("com.docker.compose.project")).to_ascii_lowercase()
+    } else {
+        c["Names"][0].as_str().unwrap_or("").trim_start_matches('/').to_ascii_lowercase()
+    };
+    crate::weburl::plain_name(&host).then_some(host)
+}
+
+/// Whether the Mac or Linux window may go to `url`: only the page itself,
+/// in the one load the host just started (`host_load`), into the main
+/// frame, from memory (`about:blank`). A link, a dropped file, a form or a
+/// script sending the window elsewhere is cancelled, as Windows' page.rs
+/// may_navigate does; links open through the "open" command instead.
+#[cfg_attr(not(any(target_os = "macos", feature = "window")), allow(dead_code))]
+fn may_navigate(host_load: bool, main_frame: bool, url: &str) -> bool {
+    host_load && main_frame && url == "about:blank"
 }
 
 /// Delivers one JSON event to the page. Callable from any thread.
@@ -1935,6 +1953,35 @@ fn fonts_event() -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    /// Only the page's own load: never a second load, a frame, or another address.
+    #[test]
+    fn the_window_goes_nowhere_but_its_page() {
+        use super::may_navigate;
+        assert!(may_navigate(true, true, "about:blank"), "the host's load of the page");
+        assert!(!may_navigate(false, true, "about:blank"), "a load the page started itself");
+        assert!(!may_navigate(true, false, "about:blank"), "a frame");
+        for url in ["https://outside.example/", "http://localhost:8080/", "file:///etc/passwd", "data:text/html,x", "javascript:alert(1)", "about:blank#x", ""] {
+            assert!(!may_navigate(true, true, url), "{url}");
+            assert!(!may_navigate(false, true, url), "{url}");
+        }
+    }
+
+    /// The menu's local address, as the page's localUrl(): a label that is
+    /// not a plain host name gives no address at all.
+    #[test]
+    fn a_hostile_domain_label_gives_no_address() {
+        use super::local_name;
+        let c = |labels: serde_json::Value, name: &str| serde_json::json!({"Names": [format!("/{name}")], "Labels": labels, "Ports": [{"PrivatePort": 80}]});
+        assert_eq!(local_name(&c(serde_json::json!({"dev.kiri.domain": "api.myapp"}), "x")).as_deref(), Some("api.myapp"));
+        assert_eq!(local_name(&c(serde_json::json!({"dev.kiri.domain": "Api.MyApp.kiri.local, b"}), "x")).as_deref(), Some("api.myapp"));
+        assert_eq!(local_name(&c(serde_json::json!({"com.docker.compose.project": "shop", "com.docker.compose.service": "web"}), "x")).as_deref(), Some("web.shop"));
+        assert_eq!(local_name(&c(serde_json::json!({}), "My_App")).as_deref(), Some("my_app"));
+        for hostile in ["outside.example/#", "x@outside.example", "outside.example?", "\"><img src=x onerror=alert(1)>", "a b"] {
+            assert_eq!(local_name(&c(serde_json::json!({"dev.kiri.domain": hostile}), "web")), None, "{hostile:?}");
+        }
+        assert_eq!(local_name(&c(serde_json::json!({"com.docker.compose.project": "shop", "com.docker.compose.service": "x/#"}), "x")), None);
+    }
+
     /// Stop on a stopped container, or Start on a running one (a second
     /// click while a stop is queued, or `docker` getting there first): the
     /// engine answers 304 with no body. That's done, not an empty red toast.
@@ -2851,12 +2898,10 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
             });
             Ok(())
         }
-        // Only the container's own addresses: a page cannot open arbitrary URLs.
+        // Only Kiri's own pages and the containers' own addresses: a page
+        // cannot open arbitrary URLs (weburl.rs, shared with Windows).
         "open" => {
-            let local = msg.name.strip_prefix("http://").or_else(|| msg.name.strip_prefix("https://")).and_then(|r| r.split(['/', ':']).next()).is_some_and(|h| h == "localhost" || h.ends_with(".kiri.localhost") || h.ends_with(".kiri.local"));
-            // A build warning's rule page (docs.docker.com/go/dockerfile/rule/…).
-            let docs = msg.name.strip_prefix("https://docs.docker.com/go/").is_some_and(|rest| rest.bytes().all(|b| b.is_ascii_alphanumeric() || b"-/".contains(&b)));
-            if local || docs || msg.name == "https://runkiri.com" || msg.name == "https://runkiri.com/releases/" || msg.name == "https://runkiri.com/share/notice" || msg.name == "https://canestack.com" || msg.name == "https://discord.gg/K5A8wuqcC" || msg.name == "https://x.com/runkiri" || msg.name == "https://github.com/libracoder/kiri/issues/new" || msg.name == "https://github.com/libracoder/kiri" || msg.name == "https://github.com/anchore/grype" || msg.name == "https://login.docker.com/activate" || msg.name == "https://github.com/login/device" {
+            if crate::weburl::allowed(&msg.name) {
                 open(&msg.name);
             }
             Ok(())

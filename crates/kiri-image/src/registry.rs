@@ -68,6 +68,15 @@ impl From<io::Error> for Error {
     }
 }
 
+impl From<crate::diffid::Error> for Error {
+    fn from(e: crate::diffid::Error) -> Self {
+        match e {
+            crate::diffid::Error::Cancelled => Error::Cancelled,
+            e => Error::Io(e.into()),
+        }
+    }
+}
+
 impl From<ureq::Error> for Error {
     fn from(e: ureq::Error) -> Self {
         Error::Http(e.to_string())
@@ -1213,6 +1222,9 @@ impl Client {
         // records the image, so a concurrent tag replacement or removal of
         // another image sharing a blob cannot delete it mid-pull.
         let pins: Mutex<Vec<Pin>> = Mutex::new(Vec::new());
+        // Newly downloaded blobs in this pull, cleaned up if `diff_ids` or
+        // `put_image` rejects the image (unless cancelled).
+        let fetched: Mutex<Vec<String>> = Mutex::new(Vec::new());
         // Bounded: the manifest declares the size, and a config is small.
         let fetch_config = || -> Result<(), Error> {
             let _on = cancel.enter();
@@ -1222,6 +1234,7 @@ impl Client {
             }
             let (_, pin) = self.download_with(store, target, &config.digest, crate::store::MAX_CONFIG, Some(config.size), &|_| {}, cancel)?;
             pins.lock().unwrap_or_else(|e| e.into_inner()).push(pin);
+            fetched.lock().unwrap_or_else(|e| e.into_inner()).push(config.digest.clone());
             Ok(())
         };
         // A mirror stands in for Docker Hub: an image for another platform
@@ -1283,6 +1296,7 @@ impl Client {
                             match self.download_with(store, target, &layer.digest, layer.size.saturating_add(1), Some(layer.size), &on_bytes, cancel) {
                                 Ok((bytes, pin)) => {
                                     pins.lock().unwrap_or_else(|e| e.into_inner()).push(pin);
+                                    fetched.lock().unwrap_or_else(|e| e.into_inner()).push(layer.digest.clone());
                                     (false, Ok(bytes))
                                 }
                                 Err(e) => (false, Err(e)),
@@ -1307,8 +1321,33 @@ impl Client {
             return Err(e);
         }
         let mut pins = pins.into_inner().unwrap_or_else(|e| e.into_inner());
-        let cfg_bytes = store.read_config(&config.digest)?;
-        let cfg: ImageConfig = serde_json::from_slice(&cfg_bytes).map_err(|e| Error::Manifest(e.to_string()))?;
+        let mut fetched = fetched.into_inner().unwrap_or_else(|e| e.into_inner());
+        let cleanup = |pins: &mut Vec<Pin>, fetched: &[String], e: Error| -> Error {
+            if cancel.is_cancelled() || matches!(e, Error::Cancelled) {
+                return Error::Cancelled;
+            }
+            pins.clear();
+            for d in fetched {
+                let _ = store.remove_if_unused(d);
+            }
+            e
+        };
+
+        let cfg_bytes = match store.read_config(&config.digest) {
+            Ok(b) => b,
+            Err(e) => return Err(cleanup(&mut pins, &fetched, e.into())),
+        };
+        let cfg: ImageConfig = match serde_json::from_slice(&cfg_bytes) {
+            Ok(c) => c,
+            Err(e) => return Err(cleanup(&mut pins, &fetched, Error::Manifest(e.to_string()))),
+        };
+        let raw: serde_json::Value = match serde_json::from_slice(&cfg_bytes) {
+            Ok(v) => v,
+            Err(e) => return Err(cleanup(&mut pins, &fetched, Error::Manifest(e.to_string()))),
+        };
+        if let Err(e) = store.check_diff_ids_with(&raw, &layers, &|| cancel.is_cancelled()) {
+            return Err(cleanup(&mut pins, &fetched, e.into()));
+        }
 
         let run = cfg.config.unwrap_or_default();
         let image = Image {
@@ -1334,25 +1373,31 @@ impl Client {
         // blob store so Kiri's build mirror can serve digest-pinned FROM
         // references (`FROM repo:tag@sha256:…` and `FROM repo@sha256:…`) with
         // matching SHA-256 digests (#288, #330).
-        let mut save_raw = |d: &str, bytes: &[u8]| -> Result<(), Error> {
-            if let Some(pin) = store.pin_existing(d, bytes.len() as u64) {
-                pins.push(pin);
-                return Ok(());
+        let save_result = (|| -> Result<(), Error> {
+            let mut save_raw = |d: &str, bytes: &[u8]| -> Result<(), Error> {
+                if let Some(pin) = store.pin_existing(d, bytes.len() as u64) {
+                    pins.push(pin);
+                    return Ok(());
+                }
+                let mut w = store.blob_writer(d)?;
+                w.write_all(bytes)?;
+                pins.push(w.finish_pinned()?);
+                fetched.push(d.to_owned());
+                Ok(())
+            };
+            save_raw(digest, manifest_bytes)?;
+            if let (Some(idx_digest), Some(idx_bytes)) = (index_digest.as_deref(), index_bytes.as_deref()) {
+                save_raw(idx_digest, idx_bytes)?;
             }
-            let mut w = store.blob_writer(d)?;
-            w.write_all(bytes)?;
-            pins.push(w.finish_pinned()?);
+            if cancel.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
+            store.put_image(image.clone())?;
             Ok(())
-        };
-        save_raw(digest, manifest_bytes)?;
-        if let (Some(idx_digest), Some(idx_bytes)) = (index_digest.as_deref(), index_bytes.as_deref()) {
-            save_raw(idx_digest, idx_bytes)?;
+        })();
+        if let Err(e) = save_result {
+            return Err(cleanup(&mut pins, &fetched, e));
         }
-        // The last moment a cancel can stop it: after this it is pulled.
-        if cancel.is_cancelled() {
-            return Err(Error::Cancelled);
-        }
-        store.put_image(image.clone())?;
         drop(pins);
         Ok(image)
     }
@@ -4117,7 +4162,7 @@ mod tests {
         let expected: Vec<u8> = b"kiri registry mirror test layer".to_vec();
         let layer_digest = sha256_digest(&expected);
         let layer_bytes = layer;
-        let config: Vec<u8> = format!(r#"{{"architecture":"{arch}","os":"linux","config":{{}}}}"#).into_bytes();
+        let config: Vec<u8> = format!(r#"{{"architecture":"{arch}","os":"linux","config":{{}},"rootfs":{{"type":"layers","diff_ids":["{layer_digest}"]}}}}"#).into_bytes();
         let config_digest = sha256_digest(&config);
         let manifest = serde_json::json!({
             "schemaVersion": 2,
@@ -4218,6 +4263,118 @@ mod tests {
         let roots = crate::roots::trusted();
         assert_eq!(certs.len(), roots.len());
         assert!(certs.iter().zip(roots.iter()).all(|(a, b)| a.der() == b.as_ref()));
+    }
+
+    #[test]
+    fn pull_refuses_mismatched_diff_ids_polyglots_and_cleans_up_blobs() {
+        use crate::diffid::testing::{gzip, layer_tar, polyglot, scratch, skippable, zstd};
+        use serde_json::json;
+
+        const TAR: &str = "application/vnd.oci.image.layer.v1.tar";
+        const GZIP: &str = "application/vnd.oci.image.layer.v1.tar+gzip";
+        const ZSTD: &str = "application/vnd.oci.image.layer.v1.tar+zstd";
+
+        let binary_server = |cfg_val: &serde_json::Value, layers: &[(Vec<u8>, &str)]| -> String {
+            let cfg_bytes = serde_json::to_vec(cfg_val).unwrap();
+            let cfg_digest = sha256_digest(&cfg_bytes);
+            let mut blobs = HashMap::from([(cfg_digest.clone(), cfg_bytes.clone())]);
+            let mut descs = Vec::new();
+            for (b, mt) in layers {
+                let d = sha256_digest(b);
+                descs.push(json!({"mediaType": mt, "digest": d, "size": b.len()}));
+                blobs.insert(d, b.clone());
+            }
+            let manifest = serde_json::to_vec(&json!({
+                "schemaVersion": 2,
+                "mediaType": OCI_MANIFEST,
+                "config": {"mediaType": "application/vnd.oci.image.config.v1+json", "digest": cfg_digest, "size": cfg_bytes.len()},
+                "layers": descs,
+            }))
+            .unwrap();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let host = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+            std::thread::spawn(move || {
+                listener.set_nonblocking(true).unwrap();
+                let end = Instant::now() + Duration::from_secs(10);
+                while Instant::now() < end {
+                    let Ok((mut c, _)) = listener.accept() else {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    };
+                    c.set_nonblocking(false).unwrap();
+                    let mut first = [0u8; 1];
+                    if c.peek(&mut first).unwrap_or(0) == 1 && first[0] == 0x16 {
+                        let _ = c.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                        continue;
+                    }
+                    let mut head = Vec::new();
+                    let mut b = [0u8; 1];
+                    while !head.ends_with(b"\r\n\r\n") && c.read(&mut b).unwrap_or(0) == 1 {
+                        head.push(b[0]);
+                    }
+                    let req = String::from_utf8_lossy(&head);
+                    if req.is_empty() || req.starts_with("QUIT") {
+                        break;
+                    }
+                    let path = req.lines().next().and_then(|l| l.split_whitespace().nth(1)).unwrap_or("");
+                    let (status, ct, body): (u16, &str, &[u8]) = if path == "/v2/" {
+                        (200, "application/json", b"{}")
+                    } else if path.contains("/manifests/") {
+                        (200, OCI_MANIFEST, &manifest)
+                    } else if let Some((_, d)) = path.split_once("/blobs/")
+                        && let Some(blob) = blobs.get(d)
+                    {
+                        (200, "application/octet-stream", blob)
+                    } else {
+                        (404, "text/plain", b"")
+                    };
+                    let _ = write!(c, "HTTP/1.1 {status} OK\r\nContent-Type: {ct}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                    let _ = c.write_all(body);
+                }
+            });
+            host
+        };
+
+        let store = Store::open(scratch("pull-diffids")).unwrap();
+        let (real, other) = (layer_tar("etc/os-release", b"real\n"), layer_tar("etc/os-release", b"other\n"));
+        let real_cfg = json!({"architecture": "arm64", "os": "linux", "config": {"Cmd": ["sh"]}, "rootfs": {"type": "layers", "diff_ids": [sha256_digest(&real)]}});
+        let platform = Platform { os: "linux".into(), architecture: "arm64".into() };
+        let do_pull = |cfg_val: &serde_json::Value, layers: &[(Vec<u8>, &str)]| {
+            let host = binary_server(cfg_val, layers);
+            let res = test_client().pull(&store, &Reference::parse(&format!("{host}/t:1")).unwrap(), &platform, &|_| {});
+            quit(&host);
+            res
+        };
+        let blob_count = || std::fs::read_dir(store.root().join("blobs/sha256")).unwrap().count();
+
+        let poly = polyglot(&real, b"evil\n");
+        let poly_as_tar_cfg = json!({"architecture": "arm64", "os": "linux", "config": {}, "rootfs": {"type": "layers", "diff_ids": [sha256_digest(&poly)]}});
+        let bad_type_cfg = json!({"architecture": "arm64", "os": "linux", "config": {}, "rootfs": {"type": "wrong", "diff_ids": [sha256_digest(&real)]}});
+        let trailing_gz = [&gzip(&real)[..], b"trailing-evil"].concat();
+
+        for (label, cfg_val, layers) in [
+            ("wrong layer", &real_cfg, vec![(gzip(&other), GZIP)]),
+            ("extra layer", &real_cfg, vec![(gzip(&real), GZIP), (gzip(&other), GZIP)]),
+            ("missing layer", &real_cfg, vec![]),
+            ("bad rootfs.type", &bad_type_cfg, vec![(gzip(&real), GZIP)]),
+            ("polyglot tar diff_id", &poly_as_tar_cfg, vec![(poly, TAR)]),
+            ("trailing gzip bytes", &real_cfg, vec![(trailing_gz, GZIP)]),
+        ] {
+            let err = do_pull(cfg_val, &layers).expect_err(label);
+            assert!(matches!(&err, Error::Io(e) if e.kind() == io::ErrorKind::InvalidData), "{label}: {err}");
+            assert!(store.images().unwrap().is_empty(), "{label}");
+            assert_eq!(blob_count(), 0, "{label}: newly fetched blobs must be cleaned up");
+        }
+
+        // Valid multi-frame zstd image pulls and records cleanly; subsequent failed pull keeps its blobs.
+        let (p1, p2) = real.split_at(512);
+        let mf_zstd = [skippable(b"hdr"), zstd(p1), zstd(p2), skippable(b"toc")].concat();
+        let pulled = do_pull(&real_cfg, &[(mf_zstd, ZSTD)]).unwrap();
+        assert_eq!(pulled.layers.len(), 1);
+        assert!(do_pull(&poly_as_tar_cfg, &[(gzip(&other), GZIP)]).is_err());
+        assert!(store.has_blob(&pulled.layers[0].digest, pulled.layers[0].size));
+
+        let _ = std::fs::remove_dir_all(store.root());
     }
 
     #[test]

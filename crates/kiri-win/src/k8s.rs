@@ -34,6 +34,12 @@ use items::{summarize, valid};
 mod kubeconfig;
 
 const IMAGE: (&str, &str) = ("rancher/k3s", "v1.37.1-k3s1");
+const DEFAULT_IMAGE: &str = "rancher/k3s:v1.37.1-k3s1";
+const PINNED_IMAGE: &str = "rancher/k3s@sha256:ca7f37d993d82ef0dcdcfecb2e0e2618ea541dbaffc620c8cedebe01a82acd0d";
+const PINNED_CONFIGS: [&str; 2] = [
+    "sha256:3a6621a59ca96f00a38c2455cd3f2635585e06c2891b4800b4b38fcfd657e5a0",
+    "sha256:9ef91591ba2b1a07146f334abcfbb1fd6f77bb75bdfc375561e158cdf2ab97aa",
+];
 /// The node container; the window reads the cluster through it.
 pub(crate) const NAME: &str = "kiri-k8s";
 const VOLUME: &str = "kiri-k8s";
@@ -503,7 +509,11 @@ fn start(say: &dyn Fn(&str)) -> io::Result<()> {
     let mut moved_to = None;
     if exists()? {
         let info = client::get(&format!("/containers/{NAME}/json"))?;
-        if info["State"]["Running"] != true {
+        let image = format!("{}:{}", IMAGE.0, cfg.version_tag());
+        if image == DEFAULT_IMAGE && !is_pinned_config(info["Image"].as_str()) {
+            say(&format!("recreating the node from the verified {DEFAULT_IMAGE} image…"));
+            ok(client::request("DELETE", &format!("/containers/{NAME}?force=1"), None))?;
+        } else if info["State"]["Running"] != true {
             // Settings changed while it was stopped (a node from before the label: its port).
             let stale = match info["Config"]["Labels"][CONFIG_LABEL].as_str() {
                 Some(made) => made != made_with(&cfg),
@@ -530,11 +540,11 @@ fn start(say: &dyn Fn(&str)) -> io::Result<()> {
         }
         let repo = IMAGE.0;
         let tag = cfg.version_tag();
-        say(&format!("pulling {repo}:{tag}…"));
-        pull(repo, tag)?;
+        let image = format!("{repo}:{tag}");
+        ensure_k3s_image(repo, tag, &image, say)?;
         let cmd = server_cmd(&cfg);
         let body = json!({
-            "Image": format!("{repo}:{tag}"),
+            "Image": image,
             "Cmd": cmd,
             "Hostname": "kiri",
             "Labels": {"dev.kiri.k8s": "1", PORT_LABEL: port.to_string(), CONFIG_LABEL: made_with(&cfg)},
@@ -548,6 +558,16 @@ fn start(say: &dyn Fn(&str)) -> io::Result<()> {
             },
         });
         ok(client::request("POST", &format!("/containers/create?name={NAME}"), Some(&body)))?;
+        if image == DEFAULT_IMAGE {
+            let created = client::get(&format!("/containers/{NAME}/json"))?;
+            if !is_pinned_config(created["Image"].as_str()) {
+                let _ = client::request("DELETE", &format!("/containers/{NAME}?force=1"), None);
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("refusing to start privileged {NAME}: container image digest {:?} does not match pinned {DEFAULT_IMAGE}", created["Image"].as_str()),
+                ));
+            }
+        }
     }
     let started = client::request("POST", &format!("/containers/{NAME}/start"), None)?;
     if !started.ok() && started.status != 304 {
@@ -573,11 +593,49 @@ fn start(say: &dyn Fn(&str)) -> io::Result<()> {
     Ok(())
 }
 
+fn is_pinned_config(id: Option<&str>) -> bool {
+    id.is_some_and(|d| PINNED_CONFIGS.contains(&d))
+}
+
+fn local_default_k3s_verified() -> io::Result<bool> {
+    let r = client::request("GET", &format!("/images/{DEFAULT_IMAGE}/json"), None)?;
+    if r.status == 404 {
+        return Ok(false);
+    }
+    if !r.ok() {
+        return Err(io::Error::other(r.error()));
+    }
+    Ok(is_pinned_config(r.json()["Id"].as_str()))
+}
+
+fn ensure_k3s_image(repo: &str, tag: &str, image: &str, say: &dyn Fn(&str)) -> io::Result<()> {
+    if image == DEFAULT_IMAGE {
+        if local_default_k3s_verified()? {
+            return Ok(());
+        }
+        say(&format!("pulling {DEFAULT_IMAGE} (pinned digest)…"));
+        pull_path(&format!("/images/create?fromImage={}", crate::engine::path_escape(PINNED_IMAGE)))?;
+        ok(client::request("POST", &format!("/images/{PINNED_IMAGE}/tag?repo={}&tag={}", crate::engine::path_escape(repo), crate::engine::path_escape(tag)), None))?;
+        if !local_default_k3s_verified()? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("pulled {DEFAULT_IMAGE} does not match pinned config digest"),
+            ));
+        }
+        return Ok(());
+    }
+    say(&format!("pulling {repo}:{tag}…"));
+    pull(repo, tag)
+}
+
 /// Pulls the node's image through the engine, waiting for the whole of it.
 fn pull(repo: &str, tag: &str) -> io::Result<()> {
+    pull_path(&format!("/images/create?fromImage={}&tag={}", crate::engine::path_escape(repo), crate::engine::path_escape(tag)))
+}
+
+fn pull_path(path: &str) -> io::Result<()> {
     let mut error = None;
-    let path = format!("/images/create?fromImage={}&tag={}", crate::engine::path_escape(repo), crate::engine::path_escape(tag));
-    let status = client::post_lines(&path, |v| {
+    let status = client::post_lines(path, |v| {
         if let Some(e) = v["error"].as_str().or(v["message"].as_str()) {
             error = Some(e.to_owned());
         }
@@ -703,7 +761,13 @@ fn k3s_yaml() -> io::Result<String> {
 /// node's certificate names 127.0.0.1. Whether kubectl's file changed.
 fn kubeconfig(port: u16, say: &dyn Fn(&str)) -> io::Result<bool> {
     let ctx = context();
-    let ours = kubeconfig::from_k3s(&k3s_yaml()?, ctx, port);
+    let raw = k3s_yaml()?;
+    let ours = if ctx == "kiri" {
+        kubeconfig::from_k3s(&raw, port)
+    } else {
+        kubeconfig::from_k3s_named(&raw, ctx, port)
+    }
+    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("refused unsafe k3s kubeconfig: {e}")))?;
     let own = state_dir()?.join("kubeconfig");
     std::fs::create_dir_all(own.parent().expect("has a parent"))?;
     std::fs::write(&own, &ours)?;
@@ -942,5 +1006,9 @@ mod tests {
             ]
         );
         assert_ne!(super::made_with(&cfg), super::made_with(&super::Config::default()));
+        for d in super::PINNED_CONFIGS {
+            assert!(super::is_pinned_config(Some(d)), "{d}");
+        }
+        assert!(!super::is_pinned_config(Some("sha256:bad")));
     }
 }

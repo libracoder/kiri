@@ -384,26 +384,91 @@ pub fn ensure_k8s_ext4(data_path: &str) -> io::Result<bool> {
     Ok(true)
 }
 
+fn has_wire_sep(s: &str) -> bool {
+    s.bytes().any(|b| matches!(b, b'\t' | b'\n' | b'\r' | 0))
+}
+
+fn is_dev_path(device: &str) -> bool {
+    if device == "/dev" || device.starts_with("/dev/") {
+        return true;
+    }
+    if device.starts_with('/') {
+        let mut parts: Vec<&str> = Vec::new();
+        for c in device.split('/') {
+            match c {
+                "" | "." => {}
+                ".." => {
+                    parts.pop();
+                }
+                c => parts.push(c),
+            }
+        }
+        return parts.first() == Some(&"dev");
+    }
+    false
+}
+
+/// Validates volume mount parameters against the strict driver allowlist before
+/// invoking `mount(2)`.
+fn validate_volume_mount(kind: &str, device: &str, flags: libc::c_ulong, data: &str) -> io::Result<()> {
+    if has_wire_sep(kind) || has_wire_sep(device) || has_wire_sep(data) {
+        return Err(invalid("volume option contains control character"));
+    }
+    if flags & libc::MS_REMOUNT != 0 {
+        return Err(invalid("remount is not allowed for volumes"));
+    }
+    let bind = flags & libc::MS_BIND != 0;
+    if bind {
+        if kind.eq_ignore_ascii_case("virtiofs") {
+            return Err(invalid("unsupported volume filesystem type: virtiofs"));
+        }
+        if !device.starts_with('/') {
+            return Err(invalid("volume bind device must be an absolute path"));
+        }
+        super::container::check_vm_mount_source(device)?;
+        return Ok(());
+    }
+    match kind {
+        "tmpfs" => {
+            if device.is_empty() || is_dev_path(device) {
+                return Err(invalid(&format!("invalid tmpfs volume device: {device}")));
+            }
+        }
+        "nfs" | "nfs4" => {
+            if !device.contains(':') || is_dev_path(device) {
+                return Err(invalid(&format!("invalid {kind} volume device: {device}")));
+            }
+        }
+        "cifs" | "smb3" => {
+            if !device.starts_with("//") || device.len() <= 2 || device[2..].starts_with('/') {
+                return Err(invalid(&format!("invalid {kind} volume device: {device}")));
+            }
+        }
+        _ => return Err(invalid(&format!("unsupported volume filesystem type: {kind}"))),
+    }
+    Ok(())
+}
+
 /// Mounts the volume at `path` unless something already is: `kind` is the
 /// filesystem (`none` for a bind), `flags_hex` and `data` are `o` split as
 /// mount(2) takes it. Errors read as Docker's.
 pub fn ensure(path: &str, kind: &str, device: &str, flags_hex: &str, data: &str) -> io::Result<()> {
-    if !path.starts_with(ROOT) || path.split('/').any(|c| c == "..") {
+    if !path.starts_with(ROOT) || path.split('/').any(|c| c == "..") || has_wire_sep(path) {
         return Err(invalid("volume mount outside the volume store"));
     }
+    let flags = u64::from_str_radix(flags_hex, 16).map_err(|_| invalid("bad volume mount flags"))? as libc::c_ulong;
+    validate_volume_mount(kind, device, flags, data)?;
     if mounted(path) {
         return Ok(());
     }
-    let flags = u64::from_str_radix(flags_hex, 16).map_err(|_| invalid("bad volume mount flags"))? as libc::c_ulong;
     let fail = |msg: String| io::Error::other(format!("error while mounting volume '{path}': {msg}"));
-    if kind.starts_with("nfs") {
+    if kind.starts_with("nfs")
+        && let Some(addr) = data.split(',').find_map(|w| w.strip_prefix("addr="))
+        && addr.parse::<std::net::IpAddr>().is_err()
+    {
         // The daemon resolved the server; one it could not is reported here,
         // at start, as Docker does.
-        if let Some(addr) = data.split(',').find_map(|w| w.strip_prefix("addr=")) {
-            if addr.parse::<std::net::IpAddr>().is_err() {
-                return Err(fail(format!("error resolving passed in network volume address: lookup {addr}: no such host")));
-            }
-        }
+        return Err(fail(format!("error resolving passed in network volume address: lookup {addr}: no such host")));
     }
     let bind = flags & libc::MS_BIND != 0;
     let c = |s: &str| CString::new(s).map_err(|_| invalid("volume option contains NUL"));
@@ -516,6 +581,51 @@ mod tests {
     }
 
     #[test]
+    fn strict_volume_type_and_device_allowlist() {
+        let p = "/var/lib/kiri/volumes/v1/_data";
+        // Allowed filesystem types and devices pass validation.
+        assert!(validate_volume_mount("tmpfs", "tmpfs", 0, "size=64m").is_ok());
+        assert!(validate_volume_mount("tmpfs", "none", 0, "").is_ok());
+        assert!(validate_volume_mount("nfs", ":/export", 0, "addr=10.0.0.1").is_ok());
+        assert!(validate_volume_mount("nfs4", "10.0.0.1:/export", 0, "").is_ok());
+        assert!(validate_volume_mount("cifs", "//10.0.0.1/share", 0, "vers=3.0").is_ok());
+        assert!(validate_volume_mount("smb3", "//10.0.0.1/share", 0, "").is_ok());
+
+        // Disallowed filesystem types and /dev/* devices fail with InvalidInput.
+        for (kind, dev, flags_hex) in [
+            ("ext4", "/dev/vda", "0"),
+            ("xfs", "/dev/vda1", "0"),
+            ("btrfs", "/dev/sda", "0"),
+            ("vfat", "/dev/sdb1", "0"),
+            ("virtiofs", "kiri-mac", "0"),
+            ("VirtioFS", "rosetta", "0"),
+            ("9p", "share", "0"),
+            ("drvfs", "C:", "0"),
+            ("proc", "proc", "0"),
+            ("sysfs", "sysfs", "0"),
+            ("cgroup2", "cgroup2", "0"),
+            ("devtmpfs", "udev", "0"),
+            ("overlay", "overlay", "0"),
+            ("", "/tmp/x", "0"),
+            ("tmpfs", "", "0"),
+            ("tmpfs", "/dev/vda", "0"),
+            ("tmpfs", "/tmp/../dev/vda", "0"),
+            ("nfs", "/export", "0"),
+            ("nfs", "/dev/vda:/export", "0"),
+            ("cifs", ":/share", "0"),
+            ("cifs", "///share", "0"),
+            ("tmpfs", "tmpfs", "20"), // MS_REMOUNT (0x20)
+            ("none", "relative/path", "1000"), // MS_BIND with relative device
+            ("none", "/tmp/x", "1020"), // MS_BIND | MS_REMOUNT
+            ("virtiofs", "/tmp/x", "1000"), // virtiofs even with MS_BIND
+            ("tmpfs", "tmpfs\nx", "0"),
+        ] {
+            let err = ensure(p, kind, dev, flags_hex, "").unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "({kind}, {dev}, {flags_hex}): {err}");
+        }
+    }
+
+    #[test]
     fn k8s_ext4_paths_and_loop_info_layout() {
         assert!(is_k8s_volume_data("/var/lib/kiri/volumes/kiri-k8s/_data"));
         assert!(!is_k8s_volume_data("/var/lib/kiri/volumes/other/_data"));
@@ -531,8 +641,7 @@ mod tests {
         // Matches Linux struct loop_info64 ABI size across x86_64 and aarch64.
         assert_eq!(std::mem::size_of::<LoopInfo64>(), 232);
 
-        let mut base = LoopInfo64::default();
-        base.lo_flags = 1;
+        let base = LoopInfo64 { lo_flags: 1, ..Default::default() };
         let info = make_loop_info64(base, Path::new("/var/lib/kiri/volumes/kiri-k8s/ext4.img"));
         assert_eq!(info.lo_flags, 1 | LO_FLAGS_AUTOCLEAR);
         let name = std::ffi::CStr::from_bytes_until_nul(&info.lo_file_name).unwrap().to_str().unwrap();

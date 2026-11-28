@@ -9,6 +9,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Map, Value};
 
+// The rows as the page gets them, typed: shared with kiri-win.
+#[path = "hubrows.rs"]
+mod hubrows;
+
 /// How long an answer is used without asking Docker Hub again.
 const FRESH: Duration = Duration::from_secs(24 * 60 * 60);
 /// Entries kept per kind; the oldest go first.
@@ -48,7 +52,12 @@ fn load() -> Value {
 fn cached(kind: Kind, key: &str) -> Option<(u64, Value)> {
     let _guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
     let entry = load()[kind.key()][key].clone();
-    Some((entry["at"].as_u64()?, entry["items"].clone()))
+    // The file is anyone's to edit: read back as Docker Hub's answer is.
+    let items = match kind {
+        Kind::Search => hubrows::search_rows(&entry["items"], super::brand),
+        Kind::Tags => hubrows::tags(&entry["items"]),
+    };
+    Some((entry["at"].as_u64()?, items))
 }
 
 fn store(kind: Kind, key: &str, items: &Value) {
@@ -85,19 +94,7 @@ fn fetch(kind: Kind, key: &str) -> Result<Value, String> {
             // Hub's own order puts empty namesakes first: official images
             // lead, then the most starred.
             rows.sort_by_key(|r| (!r["is_official"].as_bool().unwrap_or(false), std::cmp::Reverse(r["star_count"].as_u64().unwrap_or(0))));
-            Ok(rows
-                .iter()
-                .map(|r| {
-                    let name = r["name"].as_str().unwrap_or_default();
-                    json!({
-                        "name": name,
-                        "description": r["description"],
-                        "stars": r["star_count"],
-                        "official": r["is_official"],
-                        "icon": super::brand(name),
-                    })
-                })
-                .collect())
+            Ok(hubrows::search_rows(&Value::Array(rows), super::brand))
         }
         // A name with a registry in front (`ghcr.io/o/r`, `public.ecr.aws/o/r`)
         // is asked of that registry; a plain one of Docker Hub.

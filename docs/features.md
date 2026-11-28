@@ -16,18 +16,28 @@ Apple silicon and Intel Macs (macOS 14+), Windows 10 and 11 (x86-64 and Arm, thr
   `--health-start-interval`; `ps --filter health=`)
 - **Limits and security**: `--memory`, `--cpus`, `--cpu-shares`,
   `--pids-limit`, `--shm-size`; Docker's default capabilities and a default
-  seccomp filter; `--cap-add`/`--cap-drop`, `--privileged`, `--read-only`,
+  seccomp filter; on Linux hosts with AppArmor enabled, `kiri-default`
+  AppArmor confinement (`--security-opt apparmor=unconfined|<profile>`);
+  `--cap-add`/`--cap-drop`, `--privileged`, `--read-only`,
   `--security-opt seccomp=unconfined` and `no-new-privileges`. Even
   privileged and unconfined containers keep the host boundary: no vsock
   sockets (the way to the Mac) and no io_uring
 - **Networking**: a default bridge, user networks with DNS by name and
-  alias, `network connect`/`disconnect` (as with Docker, a container can
+  alias, `--internal` networks (isolated by nftables and embedded DNS, with
+  `-o com.docker.network.bridge.gateway_mode_ipv4=isolated` or
+  `inhibit_ipv4=true` leaving the host off the network),
+  `-o com.docker.network.bridge.enable_icc=false`,
+  `-o com.docker.network.bridge.host_binding_ipv4=<ip>`,
+  `network connect`/`disconnect` (as with Docker, a container can
   leave any of its networks, its first one too: another of its networks
   then gives its default route, and with none left it has no network, as
   with `--network none`; to leave its first network a running container is
   stopped first), `--network host|none`, `-p`/`-P`
   (TCP and UDP) on all interfaces (as Docker does; `-p 127.0.0.1:8080:80`
-  keeps a port local), `--add-host`, `host.docker.internal`,
+  keeps a port local), `--add-host`, `host.docker.internal` (on a Mac it
+  reaches the Mac's own 127.0.0.1 and ::1; for untrusted workloads such as
+  CI jobs, `KIRI_HOST_LOOPBACK=off` in the daemon's environment turns that
+  off, and only Kiri's build mirror stays reachable there),
   `--network container:<name>` (Compose `network_mode: service:x`; as with
   Docker, if that container restarts, the ones sharing its network keep the
   old, now empty namespace until they are restarted too), IPAM (`--subnet`,

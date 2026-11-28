@@ -98,6 +98,10 @@ mod daemon {
 }
 #[cfg(windows)]
 mod wslconfig;
+// Which page links open, shared with the Mac and Linux window.
+#[cfg(any(windows, test))]
+#[path = "../../kiri/src/weburl.rs"]
+mod weburl;
 // Kiri Dev's names (the window on Windows is always Kiri) and Share, the
 // Mac's own files: crates/kiri/src/flavor.rs and share.rs. Share's roots
 // come from crates/kiri-image/src/roots.rs, mounted here directly as
@@ -114,7 +118,8 @@ mod roots;
 #[path = "../../kiri/src/share.rs"]
 #[allow(dead_code)]
 mod share;
-#[cfg(windows)]
+#[cfg(any(windows, test))]
+#[cfg_attr(not(windows), allow(dead_code))]
 mod update;
 // The engine's files put into WSL, and what a docker client is told when
 // the engine there cannot be reached: plain code, tested on any host.

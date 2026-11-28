@@ -770,10 +770,14 @@ dependencies = [
 name = "kiri-image"
 version = "0.0.0"
 dependencies = [
+ "flate2",
+ "kiri-proto",
+ "kiri-zstd",
  "rcgen",
  "rustls",
  "rustls-native-certs",
  "rustls-pki-types",
+ "ruzstd",
  "schannel",
  "security-framework",
  "serde",
@@ -790,8 +794,10 @@ version = "0.0.0"
 dependencies = [
  "flate2",
  "kiri-proto",
+ "kiri-zstd",
  "libc",
  "ruzstd",
+ "sha2",
  "tar",
 ]
 
@@ -827,6 +833,7 @@ dependencies = [
  "kiri-share-proto",
  "libc",
  "rcgen",
+ "ring",
  "rustls",
  "rustls-native-certs",
  "rustls-pki-types",
@@ -838,6 +845,15 @@ dependencies = [
  "webview2-com",
  "windows",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "kiri-zstd"
+version = "0.0.0"
+dependencies = [
+ "flate2",
+ "kiri-proto",
+ "ruzstd",
 ]
 
 [[package]]

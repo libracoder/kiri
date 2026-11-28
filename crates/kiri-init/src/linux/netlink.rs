@@ -28,6 +28,9 @@ const IFLA_LINKINFO: u16 = 18;
 const IFLA_NET_NS_FD: u16 = 28;
 const IFLA_INFO_KIND: u16 = 1;
 const IFLA_INFO_DATA: u16 = 2;
+const IFLA_INFO_SLAVE_KIND: u16 = 4;
+const IFLA_INFO_SLAVE_DATA: u16 = 5;
+const IFLA_BRPORT_ISOLATED: u16 = 33;
 const VETH_INFO_PEER: u16 = 1;
 const IFA_ADDRESS: u16 = 1;
 const IFA_LOCAL: u16 = 2;
@@ -290,7 +293,10 @@ fn random_bytes() -> [u8; 6] {
 /// peer is created straight inside `netns` as `peer`. The kernel picks the
 /// peer's interface index: a new namespace is not always only lo (with ipip
 /// or gre loaded it has tunl0, gre0 … too), so it is looked up by name.
-pub fn create_veth(nl: &mut Netlink, host: &str, bridge_index: i32, netns: &std::fs::File, mtu: u32, peer: &str, peer_mac: Option<[u8; 6]>) -> io::Result<()> {
+/// With `isolated` the host side becomes an isolated bridge port in the same
+/// request, before the container runs.
+#[allow(clippy::too_many_arguments)]
+pub fn create_veth(nl: &mut Netlink, host: &str, bridge_index: i32, netns: &std::fs::File, mtu: u32, peer: &str, peer_mac: Option<[u8; 6]>, isolated: bool) -> io::Result<()> {
     let mut m = Msg::new(RTM_NEWLINK, NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL);
     m.raw(&ifinfo(0, libc::IFF_UP as u32, libc::IFF_UP as u32)).attr_str(IFLA_IFNAME, host).attr_u32(IFLA_MASTER, bridge_index as u32);
     m.attr_u32(IFLA_MTU, mtu);
@@ -301,7 +307,24 @@ pub fn create_veth(nl: &mut Netlink, host: &str, bridge_index: i32, netns: &std:
         m.attr(IFLA_ADDRESS, &mac);
     }
     m.end().end().end();
-    nl.request(&mut [m])
+    if isolated {
+        nl.request(&mut [m, isolate_port_msg(host)])
+    } else {
+        nl.request(&mut [m])
+    }
+}
+
+/// `ip link set dev <name> type bridge_slave isolated on`: the bridge port
+/// forwards nothing to another isolated port, so containers on the same
+/// network cannot reach each other (Docker's `enable_icc=false`), while the
+/// bridge itself (the gateway, DNS, published ports, egress) still can.
+fn isolate_port_msg(name: &str) -> Msg {
+    let mut m = Msg::new(RTM_NEWLINK, NLM_F_ACK);
+    m.raw(&ifinfo(0, 0, 0)).attr_str(IFLA_IFNAME, name);
+    m.nest(IFLA_LINKINFO).attr_str(IFLA_INFO_SLAVE_KIND, "bridge");
+    m.nest(IFLA_INFO_SLAVE_DATA).attr(IFLA_BRPORT_ISOLATED, &[1]);
+    m.end().end();
+    m
 }
 
 pub fn delete_link(nl: &mut Netlink, name: &str) -> io::Result<()> {
@@ -874,13 +897,22 @@ fn masq4_rule(subnet: [u8; 4], prefix: u8) -> Msg {
     rule
 }
 
-#[cfg(test)]
-fn forward_filter(bridges: &[String], foreign: &[String]) -> Vec<Msg> {
-    forward_filter_in(libc::NFPROTO_IPV4 as u8, bridges, foreign, false)
+/// An `--internal` bridge and the host gateway addresses (if any) its
+/// containers may reach on `chain input`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InternalBridge {
+    pub name: String,
+    pub gw4: Option<[u8; 4]>,
+    pub gw6: Option<[u8; 16]>,
 }
 
-fn forward_filter_v4(bridges: &[String], foreign: &[String], drop_lo: bool) -> Vec<Msg> {
-    forward_filter_in(libc::NFPROTO_IPV4 as u8, bridges, foreign, drop_lo)
+#[cfg(test)]
+fn forward_filter(bridges: &[String], foreign: &[String]) -> Vec<Msg> {
+    forward_filter_in(libc::NFPROTO_IPV4 as u8, bridges, &[], foreign, false)
+}
+
+fn forward_filter_v4(bridges: &[String], internal: &[String], foreign: &[String], drop_lo: bool) -> Vec<Msg> {
+    forward_filter_in(libc::NFPROTO_IPV4 as u8, bridges, internal, foreign, drop_lo)
 }
 
 /// Non-Kiri local bridges on a Linux host (e.g. `docker0`, `br-*`, `virbr*`,
@@ -917,11 +949,14 @@ fn tcp_mss_clamp_rule(family: u8) -> Msg {
 }
 
 /// `forward_filter` for a table of `family`: the same rules hold for IPv6.
+/// `internal`: `--internal` bridges whose packets may never enter from or leave
+/// to any other interface (`iifname == b && oifname != b -> drop` and
+/// `oifname == b && iifname != b -> drop` at the very top of `chain forward`).
 /// `foreign`: non-Kiri local bridges on a Linux host whose bridges `kiri*`
 /// containers must not initiate new connections into.
 /// `drop_lo`: drop forwarded packets routed out `lo` (when a VM has no `eth0`
 /// and installs a fallback `default dev lo` route for host-network egress).
-fn forward_filter_in(family: u8, bridges: &[String], foreign: &[String], drop_lo: bool) -> Vec<Msg> {
+fn forward_filter_in(family: u8, bridges: &[String], internal: &[String], foreign: &[String], drop_lo: bool) -> Vec<Msg> {
     let nft = |msg, flags| nft_in(family, msg, flags);
     let mut chain = nft(NFT_MSG_NEWCHAIN, NLM_F_ACK | NLM_F_CREATE);
     chain.attr_str(1, "kiri").attr_str(3, "forward");
@@ -963,6 +998,23 @@ fn forward_filter_in(family: u8, bridges: &[String], foreign: &[String], drop_lo
     };
     let (accept, drop) = (libc::NF_ACCEPT as u32, libc::NF_DROP as u32);
     let mut msgs = vec![chain];
+    // `--internal` bridges: isolate both outbound (`iifname == b && oifname != b`)
+    // and inbound (`oifname == b && iifname != b`) ahead of every accept rule,
+    // while leaving intra-bridge (`iifname == b && oifname == b`) traffic to pass.
+    for b in internal {
+        let full = ifname_full(b);
+        for (eq_key, neq_key) in [(6u32, 7u32), (7u32, 6u32)] {
+            msgs.push(rule(
+                &|r| {
+                    r.nest(1).attr_str(1, "meta").nest(2).attr_be32(1, 1).attr_be32(2, eq_key).end().end();
+                    r.nest(1).attr_str(1, "cmp").nest(2).attr_be32(1, 1).attr_be32(2, 0).nest(3).attr(1, &full).end().end().end();
+                    r.nest(1).attr_str(1, "meta").nest(2).attr_be32(1, 1).attr_be32(2, neq_key).end().end();
+                    r.nest(1).attr_str(1, "cmp").nest(2).attr_be32(1, 1).attr_be32(2, 1).nest(3).attr(1, &full).end().end().end();
+                },
+                drop,
+            ));
+        }
+    }
     if family == libc::NFPROTO_IPV4 as u8 {
         // Block container forwarding to link-local / cloud IMDS (169.254.0.0/16)
         // ahead of oifname != "kiri*" accept while leaving 100.64.0.0/10 untouched.
@@ -1037,15 +1089,115 @@ fn localnet_guard_rule(addr: [u8; 4], prefix: u8) -> Msg {
     rule
 }
 
+/// `iifname <bridge> accept` at the very top of `chain prerouting`, before
+/// `HOST_ADDR`, `WSL_HOST_ADDR`, published-port `dnat`, and `EGRESS_ROUTES`
+/// `redirect` rules so a container on an `--internal` network (even with
+/// `CAP_NET_ADMIN` adding its own default route) can never hit a prerouting
+/// redirect into `chain input` and bypass `chain forward`.
+fn prerouting_internal_accept(bridge: &str) -> Msg {
+    let full = ifname_full(bridge);
+    let mut rule = nft(NFT_MSG_NEWRULE, NLM_F_ACK | NLM_F_CREATE | 0x800);
+    rule.attr_str(1, "kiri").attr_str(2, "prerouting");
+    rule.nest(4);
+    rule.nest(1).attr_str(1, "meta").nest(2).attr_be32(1, 1).attr_be32(2, 6).end().end();
+    rule.nest(1).attr_str(1, "cmp").nest(2).attr_be32(1, 1).attr_be32(2, 0).nest(3).attr(1, &full).end().end().end();
+    rule.nest(1).attr_str(1, "immediate").nest(2).attr_be32(1, 0).nest(2).nest(2).attr_be32(1, libc::NF_ACCEPT as u32).end().end().end().end();
+    rule.end();
+    rule
+}
+
+/// Keeps containers on `--internal` bridge `bridge` from reaching other host
+/// or VM IPv4 addresses (`WSL_HOST_ADDR`, `HOST_ADDR`, `kiri0`, LAN/uplink
+/// addresses) on `chain input`:
+/// - With `gw4 = Some(gw)` (plain `--internal`): drops new connections to
+///   `ip daddr != gw`, leaving `gw` itself reachable as Docker does.
+/// - With `gw4 = None` (`gateway_mode_ipv4=isolated` or IPv6-only): drops all
+///   IPv4 `input` traffic arriving on `bridge`.
+fn internal_input_guard4(bridge: &str, gw4: Option<[u8; 4]>) -> Msg {
+    let full = ifname_full(bridge);
+    let mut rule = nft(NFT_MSG_NEWRULE, NLM_F_ACK | NLM_F_CREATE | 0x800);
+    rule.attr_str(1, "kiri").attr_str(2, "input");
+    rule.nest(4);
+    rule.nest(1).attr_str(1, "meta").nest(2).attr_be32(1, 1).attr_be32(2, 6).end().end();
+    rule.nest(1).attr_str(1, "cmp").nest(2).attr_be32(1, 1).attr_be32(2, 0).nest(3).attr(1, &full).end().end().end();
+    if let Some(gw) = gw4 {
+        rule.nest(1).attr_str(1, "payload").nest(2).attr_be32(1, 1).attr_be32(2, 1).attr_be32(3, 16).attr_be32(4, 4).end().end();
+        rule.nest(1).attr_str(1, "cmp").nest(2).attr_be32(1, 1).attr_be32(2, 1).nest(3).attr(1, &gw).end().end().end();
+        let mask = CT_ESTABLISHED | CT_RELATED;
+        rule.nest(1).attr_str(1, "ct").nest(2).attr_be32(1, 1).attr_be32(2, 0).end().end();
+        rule.nest(1).attr_str(1, "bitwise").nest(2).attr_be32(1, 1).attr_be32(2, 1).attr_be32(3, 4);
+        rule.nest(4).attr(1, &mask.to_ne_bytes()).end().nest(5).attr(1, &0u32.to_ne_bytes()).end().end().end();
+        rule.nest(1).attr_str(1, "cmp").nest(2).attr_be32(1, 1).attr_be32(2, 0).nest(3).attr(1, &0u32.to_ne_bytes()).end().end().end();
+    }
+    rule.nest(1).attr_str(1, "immediate").nest(2).attr_be32(1, 0).nest(2).nest(2).attr_be32(1, libc::NF_DROP as u32).end().end().end().end();
+    rule.end();
+    rule
+}
+
+/// IPv6 counterpart of `internal_input_guard4` in `table ip6 kiri`:
+/// - With `gw6 = Some(gw6)`: accepts ICMPv6 NDP types 133..=136 so neighbor
+///   discovery for `gw6` works, then drops new packets to `ip6 daddr != gw6`.
+/// - With `gw6 = None` (IPv4-only internal network): drops all IPv6 `input`
+///   packets arriving on `bridge`.
+fn internal_input_rules6(bridge: &str, gw6: Option<[u8; 16]>) -> Vec<Msg> {
+    let v6 = libc::NFPROTO_IPV6 as u8;
+    let full = ifname_full(bridge);
+    let mut out = Vec::new();
+    if let Some(gw) = gw6 {
+        let mut ndp = nft_in(v6, NFT_MSG_NEWRULE, NLM_F_ACK | NLM_F_CREATE | 0x800);
+        ndp.attr_str(1, "kiri").attr_str(2, "input");
+        ndp.nest(4);
+        ndp.nest(1).attr_str(1, "meta").nest(2).attr_be32(1, 1).attr_be32(2, 6).end().end();
+        ndp.nest(1).attr_str(1, "cmp").nest(2).attr_be32(1, 1).attr_be32(2, 0).nest(3).attr(1, &full).end().end().end();
+        ndp.nest(1).attr_str(1, "meta").nest(2).attr_be32(1, 1).attr_be32(2, 16).end().end();
+        ndp.nest(1).attr_str(1, "cmp").nest(2).attr_be32(1, 1).attr_be32(2, 0).nest(3).attr(1, &[libc::IPPROTO_ICMPV6 as u8]).end().end().end();
+        // payload transport header + 0 (icmp6_type), 1 byte => reg 1; 133 <= reg 1 <= 136
+        ndp.nest(1).attr_str(1, "payload").nest(2).attr_be32(1, 1).attr_be32(2, 2).attr_be32(3, 0).attr_be32(4, 1).end().end();
+        ndp.nest(1).attr_str(1, "cmp").nest(2).attr_be32(1, 1).attr_be32(2, 5).nest(3).attr(1, &[133u8]).end().end().end();
+        ndp.nest(1).attr_str(1, "cmp").nest(2).attr_be32(1, 1).attr_be32(2, 3).nest(3).attr(1, &[136u8]).end().end().end();
+        ndp.nest(1).attr_str(1, "immediate").nest(2).attr_be32(1, 0).nest(2).nest(2).attr_be32(1, libc::NF_ACCEPT as u32).end().end().end().end();
+        ndp.end();
+        out.push(ndp);
+
+        let mut drop_other = nft_in(v6, NFT_MSG_NEWRULE, NLM_F_ACK | NLM_F_CREATE | 0x800);
+        drop_other.attr_str(1, "kiri").attr_str(2, "input");
+        drop_other.nest(4);
+        drop_other.nest(1).attr_str(1, "meta").nest(2).attr_be32(1, 1).attr_be32(2, 6).end().end();
+        drop_other.nest(1).attr_str(1, "cmp").nest(2).attr_be32(1, 1).attr_be32(2, 0).nest(3).attr(1, &full).end().end().end();
+        drop_other.nest(1).attr_str(1, "payload").nest(2).attr_be32(1, 1).attr_be32(2, 1).attr_be32(3, 24).attr_be32(4, 16).end().end();
+        drop_other.nest(1).attr_str(1, "cmp").nest(2).attr_be32(1, 1).attr_be32(2, 1).nest(3).attr(1, &gw).end().end().end();
+        let mask = CT_ESTABLISHED | CT_RELATED;
+        drop_other.nest(1).attr_str(1, "ct").nest(2).attr_be32(1, 1).attr_be32(2, 0).end().end();
+        drop_other.nest(1).attr_str(1, "bitwise").nest(2).attr_be32(1, 1).attr_be32(2, 1).attr_be32(3, 4);
+        drop_other.nest(4).attr(1, &mask.to_ne_bytes()).end().nest(5).attr(1, &0u32.to_ne_bytes()).end().end().end();
+        drop_other.nest(1).attr_str(1, "cmp").nest(2).attr_be32(1, 1).attr_be32(2, 0).nest(3).attr(1, &0u32.to_ne_bytes()).end().end().end();
+        drop_other.nest(1).attr_str(1, "immediate").nest(2).attr_be32(1, 0).nest(2).nest(2).attr_be32(1, libc::NF_DROP as u32).end().end().end().end();
+        drop_other.end();
+        out.push(drop_other);
+    } else {
+        let mut drop_all = nft_in(v6, NFT_MSG_NEWRULE, NLM_F_ACK | NLM_F_CREATE | 0x800);
+        drop_all.attr_str(1, "kiri").attr_str(2, "input");
+        drop_all.nest(4);
+        drop_all.nest(1).attr_str(1, "meta").nest(2).attr_be32(1, 1).attr_be32(2, 6).end().end();
+        drop_all.nest(1).attr_str(1, "cmp").nest(2).attr_be32(1, 1).attr_be32(2, 0).nest(3).attr(1, &full).end().end().end();
+        drop_all.nest(1).attr_str(1, "immediate").nest(2).attr_be32(1, 0).nest(2).nest(2).attr_be32(1, libc::NF_DROP as u32).end().end().end().end();
+        drop_all.end();
+        out.push(drop_all);
+    }
+    out
+}
+
 /// The input filter that keeps containers off the host's loopback (`127.0.0.0/8`,
-/// CVE-2020-8558) and link-local / cloud metadata (`169.254.0.0/16`). Replies
-/// to established connections and DNATed ports still pass.
-fn localnet_guard() -> Vec<Msg> {
+/// CVE-2020-8558), link-local / cloud metadata (`169.254.0.0/16`), and (from
+/// `--internal` bridges) any host address other than that bridge's own gateway.
+fn localnet_guard(internal: &[InternalBridge]) -> Vec<Msg> {
     let mut chain = nft(NFT_MSG_NEWCHAIN, NLM_F_ACK | NLM_F_CREATE);
     chain.attr_str(1, "kiri").attr_str(3, "input");
     chain.nest(4).attr_be32(1, 1).attr_be32(2, 0).end(); // NF_INET_LOCAL_IN, priority 0
     chain.attr_be32(5, 1).attr_str(7, "filter");
-    vec![chain, localnet_guard_rule([127, 0, 0, 0], 8), localnet_guard_rule([169, 254, 0, 0], 16)]
+    let mut msgs = vec![chain, localnet_guard_rule([127, 0, 0, 0], 8), localnet_guard_rule([169, 254, 0, 0], 16)];
+    msgs.extend(internal.iter().map(|ib| internal_input_guard4(&ib.name, ib.gw4)));
+    msgs
 }
 
 /// In the VM, the host.docker.internal listener (`port`, on 0.0.0.0) takes
@@ -1145,16 +1297,23 @@ fn masq6_rule(subnet: [u8; 16], prefix: u8) -> Msg {
 ///   }
 /// }
 /// ```
-pub fn install_nat6(subnets: &[([u8; 16], u8)], bridges: &[String], host_port: u16, redirect: bool, dnat: &[Dnat]) -> io::Result<()> {
-    let v6 = libc::NFPROTO_IPV6 as u8;
+pub fn install_nat6(subnets: &[([u8; 16], u8)], bridges: &[String], internal: &[InternalBridge], host_port: u16, redirect: bool, dnat: &[Dnat]) -> io::Result<()> {
     let mut nl = Netlink::open(libc::NETLINK_NETFILTER)?;
+    let mut msgs = build_nat6_batch(subnets, bridges, internal, host_port, redirect, dnat);
+    nl.request(&mut msgs)
+}
+
+fn build_nat6_batch(subnets: &[([u8; 16], u8)], bridges: &[String], internal: &[InternalBridge], host_port: u16, redirect: bool, dnat: &[Dnat]) -> Vec<Msg> {
+    let v6 = libc::NFPROTO_IPV6 as u8;
     let mut begin = Msg::new(NFNL_MSG_BATCH_BEGIN, 0);
     begin.raw(&nfgen(libc::AF_UNSPEC as u8, NFNL_SUBSYS_NFTABLES));
     let [add, delete] = clear_table(v6);
     let mut end = Msg::new(NFNL_MSG_BATCH_END, 0);
     end.raw(&nfgen(libc::AF_UNSPEC as u8, NFNL_SUBSYS_NFTABLES));
     let mut msgs = vec![begin, add, delete];
-    if !subnets.is_empty() || redirect {
+    let has_forward = !subnets.is_empty() || !bridges.is_empty() || !internal.is_empty();
+    let has_input = redirect || !internal.is_empty();
+    if has_forward || has_input {
         let mut table = nft_in(v6, NFT_MSG_NEWTABLE, NLM_F_ACK | NLM_F_CREATE);
         table.attr_str(1, "kiri");
         msgs.push(table);
@@ -1166,24 +1325,36 @@ pub fn install_nat6(subnets: &[([u8; 16], u8)], bridges: &[String], host_port: u
         chain.attr_be32(5, 1).attr_str(7, "nat");
         msgs.push(chain);
         msgs.extend(subnets.iter().map(|(s, p)| masq6_rule(*s, *p)));
-        msgs.extend(forward_filter_in(v6, bridges, &foreign_bridges(), false));
     }
-    if redirect {
+    if has_forward {
+        let internal_names: Vec<String> = internal.iter().map(|ib| ib.name.clone()).collect();
+        msgs.extend(forward_filter_in(v6, bridges, &internal_names, &foreign_bridges(), false));
+    }
+    if has_input {
         let mut input = nft_in(v6, NFT_MSG_NEWCHAIN, NLM_F_ACK | NLM_F_CREATE);
         input.attr_str(1, "kiri").attr_str(3, "input");
         input.nest(4).attr_be32(1, 1).attr_be32(2, 0).end(); // NF_INET_LOCAL_IN, priority 0
         input.attr_be32(5, 1).attr_str(7, "filter");
+        msgs.push(input);
+        for ib in internal {
+            msgs.extend(internal_input_rules6(&ib.name, ib.gw6));
+        }
+        if redirect {
+            msgs.push(host_relay_guard6(host_port));
+        }
+    }
+    if redirect {
         let mut output = nft_in(v6, NFT_MSG_NEWCHAIN, NLM_F_ACK | NLM_F_CREATE);
         output.attr_str(1, "kiri").attr_str(3, "output");
         output.nest(4).attr_be32(1, 3).attr_be32(2, -100i32 as u32).end(); // NF_INET_LOCAL_OUT, priority -100
         output.attr_be32(5, 1).attr_str(7, "nat");
-        msgs.extend([input, host_relay_guard6(host_port), output]);
+        msgs.push(output);
         for d in dnat.iter().filter(|d| !d.udp && d.host_ip == LOOPBACK && d.host_port != host_port) {
             msgs.push(loopback_published_rule6(d.host_port, host_port));
         }
     }
     msgs.push(end);
-    nl.request(&mut msgs)
+    msgs
 }
 
 /// The table, in a container's own network namespace, that sends its DNS
@@ -1484,7 +1655,7 @@ pub fn install_nat_with_egress(
     egress_routes: &[([u8; 4], u8)],
     egress_skip: &[([u8; 4], u8)],
 ) -> io::Result<()> {
-    install_nat_full(uplink_index, host_addr, host_port, redirect, dnat, gateway, bridges, local, egress_port, egress_routes, egress_skip, None, &[], true)
+    install_nat_full(uplink_index, host_addr, host_port, redirect, dnat, gateway, bridges, &[], local, egress_port, egress_routes, egress_skip, None, &[], true)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1496,6 +1667,7 @@ pub fn install_nat_full(
     dnat: &[Dnat],
     gateway: [u8; 4],
     bridges: &[String],
+    internal: &[InternalBridge],
     local: Option<&[[u8; 4]]>,
     egress_port: u16,
     egress_routes: &[([u8; 4], u8)],
@@ -1513,6 +1685,7 @@ pub fn install_nat_full(
         dnat,
         gateway,
         bridges,
+        internal,
         local,
         egress_port,
         egress_routes,
@@ -1533,6 +1706,7 @@ fn build_nat_batch(
     dnat: &[Dnat],
     gateway: [u8; 4],
     bridges: &[String],
+    internal: &[InternalBridge],
     local: Option<&[[u8; 4]]>,
     egress_port: u16,
     egress_routes: &[([u8; 4], u8)],
@@ -1552,6 +1726,7 @@ fn build_nat_batch(
     table.attr_str(1, "kiri"); // NFTA_TABLE_NAME
 
     let has_uplink = uplink_index > 0;
+    let internal_names: Vec<String> = internal.iter().map(|ib| ib.name.clone()).collect();
     let mut msgs = vec![begin, add, delete, table];
     if !redirect {
         // Linux host: masquerade each Kiri bridge subnet regardless of which
@@ -1591,13 +1766,16 @@ fn build_nat_batch(
         // A Linux host: no host.docker.internal redirect, but its published
         // ports are DNATed here (prerouting for the LAN when kernel forwarding
         // allows it, output for the host itself), rebuilt atomically.
-        msgs.extend(forward_filter_v4(bridges, &foreign_bridges(), false));
-        msgs.extend(localnet_guard());
+        msgs.extend(forward_filter_v4(bridges, &internal_names, &foreign_bridges(), false));
+        msgs.extend(localnet_guard(internal));
         if have_egress {
             msgs.push(host_relay_guard(egress_port));
         }
         msgs.push(nat_chain("prerouting", 0, -100));
         msgs.push(nat_chain("output", 3, -100));
+        for ib in internal {
+            msgs.push(prerouting_internal_accept(&ib.name));
+        }
         if let Some(wsl_addr) = wsl_host {
             // UDP 53 sent to 192.168.65.254 from container bridges goes to
             // the embedded DNS on the receiving bridge's gateway.
@@ -1622,13 +1800,17 @@ fn build_nat_batch(
     }
     let pre = nat_chain("prerouting", 0, -100); // NF_INET_PRE_ROUTING
     let out = nat_chain("output", 3, -100); // NF_INET_LOCAL_OUT
+    msgs.extend([pre, out]);
+    for ib in internal {
+        msgs.push(prerouting_internal_accept(&ib.name));
+    }
     // Only from Kiri's own bridges: the LAN must not reach the loopback relay.
     let pre_rule = redirect_rule("prerouting", host_addr, host_port, true);
     // The host's own connections (and `--network host` containers).
     let out_rule = redirect_rule("output", host_addr, host_port, false);
-    msgs.extend([pre, out, dns_redirect_rule(host_addr), pre_rule, out_rule]);
-    msgs.extend(forward_filter_v4(bridges, &foreign_bridges(), !has_uplink));
-    msgs.extend(localnet_guard());
+    msgs.extend([dns_redirect_rule(host_addr), pre_rule, out_rule]);
+    msgs.extend(forward_filter_v4(bridges, &internal_names, &foreign_bridges(), !has_uplink));
+    msgs.extend(localnet_guard(internal));
     msgs.push(host_relay_guard(host_port));
     if have_egress {
         msgs.push(host_relay_guard(egress_port));
@@ -1884,8 +2066,8 @@ mod tests {
         let bridges = ["kiri0".to_owned()];
         let foreign = ["docker0".to_owned(), "br-abc".to_owned()];
         for family in [libc::NFPROTO_IPV4 as u8, libc::NFPROTO_IPV6 as u8] {
-            let plain = forward_filter_in(family, &bridges, &[], false);
-            let guarded = forward_filter_in(family, &bridges, &foreign, false);
+            let plain = forward_filter_in(family, &bridges, &[], &[], false);
+            let guarded = forward_filter_in(family, &bridges, &[], &foreign, false);
             assert_eq!(guarded.len(), plain.len() + foreign.len());
             let start = if family == libc::NFPROTO_IPV4 as u8 { 3 } else { 2 };
             for (g, name) in guarded[start..start + foreign.len()].iter().zip(&foreign) {
@@ -1922,7 +2104,7 @@ mod tests {
         assert_eq!(get(&attrs(get(&e[1].1, 4)), 1)[..8], [255, 255, 255, 255, 255, 255, 255, 0xf8]);
         // the IPv6 forward filter is the IPv4 one without the IPv4-only IMDS rule.
         let bridges = ["kiri3".to_owned()];
-        let f = forward_filter_in(libc::NFPROTO_IPV6 as u8, &bridges, &[], false);
+        let f = forward_filter_in(libc::NFPROTO_IPV6 as u8, &bridges, &[], &[], false);
         assert_eq!(f.len() + 1, forward_filter(&bridges, &[]).len());
         assert!(f[1..].iter().all(|m| !names(m).contains(&"fib".to_owned())), "no nft_fib_ipv6 needed");
         assert!(f.iter().all(|m| m.buf[16] == libc::NFPROTO_IPV6 as u8));
@@ -2019,6 +2201,7 @@ mod tests {
             &[lb],
             [0; 4],
             &["kiri0".to_owned()],
+            &[],
             None,
             1038,
             &[([0, 0, 0, 0], 0)],
@@ -2067,8 +2250,8 @@ mod tests {
     fn linux_host_masq_uses_bridge_subnets_and_skips_prerouting_when_forwarding_blocked() {
         let host_addr = crate::linux::net::HOST_ADDR;
         let d = Dnat { udp: false, host_ip: [0; 4], host_port: 8080, to_ip: [172, 17, 0, 2], to_port: 80 };
-        let open = build_nat_batch(0, host_addr, 1026, false, &[d], [0; 4], &["kiri0".to_owned()], None, 0, &[], &[], None, &[([172, 17, 0, 0], 16)], true);
-        let blocked = build_nat_batch(0, host_addr, 1026, false, &[d], [0; 4], &["kiri0".to_owned()], None, 0, &[], &[], None, &[([172, 17, 0, 0], 16)], false);
+        let open = build_nat_batch(0, host_addr, 1026, false, &[d], [0; 4], &["kiri0".to_owned()], &[], None, 0, &[], &[], None, &[([172, 17, 0, 0], 16)], true);
+        let blocked = build_nat_batch(0, host_addr, 1026, false, &[d], [0; 4], &["kiri0".to_owned()], &[], None, 0, &[], &[], None, &[([172, 17, 0, 0], 16)], false);
         let msg_ty = |m: &Msg| u16::from_ne_bytes([m.buf[4], m.buf[5]]);
         let newrule = (NFNL_SUBSYS_NFTABLES << 8) | NFT_MSG_NEWRULE;
         let chain_of = |r: &Msg| nl_str(get(&attrs(&r.buf[20..]), 2));
@@ -2166,5 +2349,125 @@ mod tests {
         }
         mp.attr(9, &mp_buf);
         assert_eq!(parse_default_route_ifindices(&mp.buf[16..]), vec![3, 4]);
+    }
+
+    /// `enable_icc=false` (#213): the host-side veth, found by name, gets
+    /// the bridge's port attribute `isolated` set, as
+    /// `ip link set dev kv1 type bridge_slave isolated on` sends it.
+    #[test]
+    fn isolate_port_marks_the_veth_an_isolated_bridge_port() {
+        let m = isolate_port_msg("kv1");
+        assert_eq!(u16::from_ne_bytes([m.buf[4], m.buf[5]]), RTM_NEWLINK);
+        let top = attrs(&m.buf[32..]);
+        assert_eq!(get(&top, IFLA_IFNAME), b"kv1\0");
+        let info = attrs(get(&top, IFLA_LINKINFO));
+        assert_eq!(get(&info, IFLA_INFO_SLAVE_KIND), b"bridge\0");
+        assert_eq!(attrs(get(&info, IFLA_INFO_SLAVE_DATA)), vec![(IFLA_BRPORT_ISOLATED, &[1u8][..])]);
+    }
+
+    /// `--internal` networks (#1010, #1013):
+    /// 1. `prerouting` accepts `iifname == b` ahead of `HOST_ADDR`, `WSL_HOST_ADDR`,
+    ///    `dnat`, and `EGRESS_ROUTES` redirects in both VM and Linux-host modes.
+    /// 2. `forward` drops `iifname == b && oifname != b` and `oifname == b && iifname != b`
+    ///    at the very top for IPv4 and IPv6 (even when non-internal `subnets` is empty).
+    /// 3. `input` allows `gw4` on plain internal (`ip daddr != gw4 -> drop`), drops all
+    ///    IPv4 on `gateway_mode_ipv4=isolated` (`gw4 = None`), and for IPv6 allows NDP
+    ///    (133..=136) + `gw6` while dropping all IPv6 when `gw6 = None`.
+    #[test]
+    fn internal_bridges_are_isolated_in_prerouting_forward_and_input_for_ipv4_and_ipv6() {
+        let gw4 = [172, 18, 0, 1];
+        let gw6 = [0xfd, 0, 0x18, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let internal = vec![
+            InternalBridge { name: "kiri1".into(), gw4: Some(gw4), gw6: Some(gw6) },
+            InternalBridge { name: "kiri2".into(), gw4: None, gw6: None },
+        ];
+        let bridges = vec!["kiri0".into(), "kiri1".into(), "kiri2".into()];
+        let d = Dnat { udp: false, host_ip: [0; 4], host_port: 8080, to_ip: [172, 17, 0, 2], to_port: 80 };
+        let msg_ty = |m: &Msg| u16::from_ne_bytes([m.buf[4], m.buf[5]]);
+        let newrule = (NFNL_SUBSYS_NFTABLES << 8) | NFT_MSG_NEWRULE;
+        let chain_of = |r: &Msg| nl_str(get(&attrs(&r.buf[20..]), 2));
+
+        for redirect in [false, true] {
+            let batch = build_nat_batch(
+                2,
+                [198, 19, 248, 254],
+                1026,
+                redirect,
+                &[d],
+                [192, 168, 64, 1],
+                &bridges,
+                &internal,
+                None,
+                1038,
+                &[([0, 0, 0, 0], 0)],
+                &[([127, 0, 0, 0], 8)],
+                (!redirect).then_some([192, 168, 65, 254]),
+                &[([172, 17, 0, 0], 16)],
+                true,
+            );
+            let pre_rules: Vec<&Msg> = batch.iter().filter(|m| msg_ty(m) == newrule && chain_of(m) == "prerouting").collect();
+            assert!(pre_rules.len() >= 4, "redirect={redirect}");
+            for (rule, name) in pre_rules[..2].iter().zip(["kiri1", "kiri2"]) {
+                assert_eq!(names(rule), ["meta", "cmp", "immediate"], "redirect={redirect} {name}");
+                let e = exprs(rule);
+                assert_eq!(be32(get(&e[0].1, 2)), 6, "meta iifname");
+                assert_eq!((be32(get(&e[1].1, 2)), get(&attrs(get(&e[1].1, 3)), 1)), (0, &ifname_full(name)[..]));
+                assert_eq!(verdict(rule), libc::NF_ACCEPT as u32);
+            }
+            assert!(pre_rules[2..].iter().any(|r| names(r).contains(&"redir".to_owned())), "redirects come strictly after internal early accepts");
+
+            let fwd_rules: Vec<&Msg> = batch.iter().filter(|m| msg_ty(m) == newrule && chain_of(m) == "forward").collect();
+            for (idx, name) in [(0usize, "kiri1"), (2usize, "kiri2")] {
+                let full = ifname_full(name);
+                let out_drop = exprs(fwd_rules[idx]);
+                assert_eq!((be32(get(&out_drop[0].1, 2)), be32(get(&out_drop[1].1, 2)), get(&attrs(get(&out_drop[1].1, 3)), 1)), (6, 0, &full[..]));
+                assert_eq!((be32(get(&out_drop[2].1, 2)), be32(get(&out_drop[3].1, 2)), get(&attrs(get(&out_drop[3].1, 3)), 1)), (7, 1, &full[..]));
+                assert_eq!(verdict(fwd_rules[idx]), libc::NF_DROP as u32);
+
+                let in_drop = exprs(fwd_rules[idx + 1]);
+                assert_eq!((be32(get(&in_drop[0].1, 2)), be32(get(&in_drop[1].1, 2)), get(&attrs(get(&in_drop[1].1, 3)), 1)), (7, 0, &full[..]));
+                assert_eq!((be32(get(&in_drop[2].1, 2)), be32(get(&in_drop[3].1, 2)), get(&attrs(get(&in_drop[3].1, 3)), 1)), (6, 1, &full[..]));
+                assert_eq!(verdict(fwd_rules[idx + 1]), libc::NF_DROP as u32);
+            }
+
+            let in_rules: Vec<&Msg> = batch.iter().filter(|m| msg_ty(m) == newrule && chain_of(m) == "input").collect();
+            let plain_in = in_rules[2];
+            assert_eq!(names(plain_in), ["meta", "cmp", "payload", "cmp", "ct", "bitwise", "cmp", "immediate"]);
+            let pe = exprs(plain_in);
+            assert_eq!(get(&attrs(get(&pe[1].1, 3)), 1), &ifname_full("kiri1"));
+            assert_eq!((be32(get(&pe[3].1, 2)), get(&attrs(get(&pe[3].1, 3)), 1)), (1, &gw4[..]), "ip daddr != gw4");
+            assert_eq!(verdict(plain_in), libc::NF_DROP as u32);
+
+            let iso_in = in_rules[3];
+            assert_eq!(names(iso_in), ["meta", "cmp", "immediate"], "no_gateway4 drops all IPv4 input from kiri2");
+            assert_eq!(get(&attrs(get(&exprs(iso_in)[1].1, 3)), 1), &ifname_full("kiri2"));
+            assert_eq!(verdict(iso_in), libc::NF_DROP as u32);
+        }
+
+        let v6_batch = build_nat6_batch(&[], &["kiri1".into()], &internal, 1026, false, &[]);
+        let newchain = (NFNL_SUBSYS_NFTABLES << 8) | NFT_MSG_NEWCHAIN;
+        let v6_chains: Vec<&[u8]> = v6_batch.iter().filter(|m| msg_ty(m) == newchain).map(|m| get(&attrs(&m.buf[20..]), 3)).collect();
+        assert!(!v6_chains.contains(&&b"postrouting\0"[..]), "internal IPv6 subnets are never masqueraded");
+        assert!(v6_chains.contains(&&b"forward\0"[..]) && v6_chains.contains(&&b"input\0"[..]));
+
+        let v6_fwd: Vec<&Msg> = v6_batch.iter().filter(|m| msg_ty(m) == newrule && chain_of(m) == "forward").collect();
+        assert!(v6_fwd.len() >= 4);
+        assert_eq!(verdict(v6_fwd[0]), libc::NF_DROP as u32);
+        assert_eq!(verdict(v6_fwd[1]), libc::NF_DROP as u32);
+
+        let v6_in: Vec<&Msg> = v6_batch.iter().filter(|m| msg_ty(m) == newrule && chain_of(m) == "input").collect();
+        assert_eq!(v6_in.len(), 3, "kiri1: NDP accept + ip6 daddr != gw6 drop; kiri2: unconditional drop");
+        assert_eq!(verdict(v6_in[0]), libc::NF_ACCEPT as u32, "NDP 133..=136 accepted on kiri1");
+        let ndp_e = exprs(v6_in[0]);
+        assert_eq!(get(&attrs(get(&ndp_e[3].1, 3)), 1), &[libc::IPPROTO_ICMPV6 as u8]);
+        assert_eq!((be32(get(&ndp_e[5].1, 2)), get(&attrs(get(&ndp_e[5].1, 3)), 1)), (5, &[133u8][..]));
+        assert_eq!((be32(get(&ndp_e[6].1, 2)), get(&attrs(get(&ndp_e[6].1, 3)), 1)), (3, &[136u8][..]));
+
+        let gw6_e = exprs(v6_in[1]);
+        assert_eq!((be32(get(&gw6_e[3].1, 2)), get(&attrs(get(&gw6_e[3].1, 3)), 1)), (1, &gw6[..]), "ip6 daddr != gw6");
+        assert_eq!(verdict(v6_in[1]), libc::NF_DROP as u32);
+
+        assert_eq!(names(v6_in[2]), ["meta", "cmp", "immediate"], "v4-only internal bridge drops all IPv6 input");
+        assert_eq!(verdict(v6_in[2]), libc::NF_DROP as u32);
     }
 }

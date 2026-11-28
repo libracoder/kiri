@@ -772,7 +772,31 @@ t internal-no-route "unreachable" $D run --rm --network intnet alpine sh -c 'pin
 t internal-no-default "none" $D run --rm --network intnet alpine sh -c 'ip route | grep -q default && echo default || echo none'
 # An IPv4-only network: IPv6 is off on eth0 (no link-local), lo keeps ::1.
 t v4-net-no-inet6 "none" $D run --rm --network intnet alpine sh -c 'ip -6 addr show eth0 | grep -q inet6 && echo some || echo none'
+# --internal DNS refuses external names over UDP and TCP even with --dns,
+# and --internal firewall drops default-route traffic even with NET_ADMIN.
+t internal-dns-refused "refused" $D run --rm --network intnet --dns 8.8.8.8 alpine sh -c 'nslookup -timeout=2 example.com >/dev/null 2>&1 && echo resolved || echo refused'
+t internal-netadmin-blocked "blocked" $D run --rm --network intnet --cap-add NET_ADMIN alpine sh -c 'gw=$(ip route | awk "{print \$1}" | sed "s/\\.0\\/.*/.1/" | head -1); ip route add default via "$gw" 2>/dev/null || true; wget -qO- -T 3 http://1.1.1.1 >/dev/null 2>&1 && echo reached || echo blocked'
 $D rm -f intweb >/dev/null; $D network rm intnet >/dev/null
+# gateway_mode_ipv4=isolated (#1001): an internal network whose bridge has
+# no IPv4 address, so the host isn't on it. A plain internal network's
+# containers reach a server on every host address through the gateway; an
+# isolated one's don't, while its containers still find each other by name
+# (Kiri's resolver answers at 127.0.0.11 in each).
+$D rm -f isohost isoweb >/dev/null 2>&1; $D network rm isonet plainint >/dev/null 2>&1
+$D network create --internal plainint >/dev/null
+$D network create --internal -o com.docker.network.bridge.gateway_mode_ipv4=isolated isonet >/dev/null
+$D run -d --name isohost --network host busybox:1.36 httpd -f -p 18997 -h /tmp >/dev/null
+$D run -d --name isoweb --network isonet nginx:alpine >/dev/null
+nginx_up isoweb
+gw_of() { $D network inspect "$1" -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}'; }
+t isolated-plain-internal-reaches-host "reached" $D run --rm --network plainint alpine sh -c "nc -z -w 3 $(gw_of plainint) 18997 && echo reached || echo unreached"
+t isolated-host-unreached "unreached" $D run --rm --network isonet alpine sh -c "nc -z -w 3 $(gw_of isonet) 18997 && echo reached || echo unreached"
+t isolated-names "Welcome to nginx" $D run --rm --network isonet alpine wget -qO- -T 5 http://isoweb
+t isolated-resolver "nameserver 127.0.0.11" $D run --rm --network isonet alpine grep nameserver /etc/resolv.conf
+t isolated-option-shown "isolated" $D network inspect isonet -f '{{index .Options "com.docker.network.bridge.gateway_mode_ipv4"}}'
+t isolated-connect-unreached "unreached" bash -c "$D rm -f isoconn >/dev/null 2>&1; $D run -d --name isoconn --network plainint alpine sleep 60 >/dev/null && $D network connect isonet isoconn && $D exec isoconn sh -c 'nc -z -w 3 $(gw_of isonet) 18997 && echo reached || echo unreached'; $D rm -f isoconn >/dev/null"
+t isolated-needs-internal "gateway mode 'isolated' can only be used for an internal network" $D network create -o com.docker.network.bridge.gateway_mode_ipv4=isolated isoext
+$D rm -f isohost isoweb >/dev/null; $D network rm isonet plainint >/dev/null
 
 section "networking options"
 # IPAM: a chosen subnet, gateway, range and reserved address.
@@ -788,6 +812,21 @@ t ipam-bad-gateway "no matching subnet for gateway" $D network create --subnet 1
 t bridge-name-refused "does not support the network option com.docker.network.bridge.name" $D network create -o com.docker.network.bridge.name=cp-isolated --subnet 10.234.0.0/24 bridgename
 code bridge-name-nothing-made 1 $D network inspect bridgename
 t bridge-name-empty "map[]" bash -c "$D network create -o com.docker.network.bridge.name= bridgename >/dev/null && $D network inspect -f '{{.Options}}' bridgename; $D network rm bridgename >/dev/null"
+t network-name-default-refused "predefined default network" $D network create default
+t ipam-broadcast-gateway-refused "network or broadcast address" $D network create --subnet 10.235.0.0/24 --gateway 10.235.0.255 ipambcast
+# enable_icc=false: containers on the network don't reach each other (#213).
+$D network create -o com.docker.network.bridge.enable_icc=false noicc >/dev/null
+$D run -d --name noiccweb --network noicc nginx:alpine >/dev/null
+nginx_up noiccweb
+t icc-off-no-peer "blocked" $D run --rm --network noicc alpine sh -c 'wget -qO- -T 3 http://noiccweb >/dev/null 2>&1 && echo reached || echo blocked'
+t icc-off-names "$(ipon noiccweb noicc)" $D run --rm --network noicc alpine sh -c 'getent hosts noiccweb | cut -d" " -f1'
+$D run -d --name noiccjoin alpine sleep 300 >/dev/null
+$D network connect noicc noiccjoin
+t icc-off-connect-no-peer "blocked" $D exec noiccjoin sh -c "wget -qO- -T 3 http://$(ipon noiccweb noicc) >/dev/null 2>&1 && echo reached || echo blocked"
+t icc-off-bad-value "invalid value \"no\" for the network option com.docker.network.bridge.enable_icc" $D network create -o com.docker.network.bridge.enable_icc=no noiccbad
+$D rm -f noiccweb noiccjoin >/dev/null; $D network rm noicc >/dev/null
+# com.docker.network.bridge.host_binding_ipv4 default host bind IP (#985).
+t publish-bridge-default-host-ip "ok" python3 "$(cd "$(dirname "$0")" && pwd)/lib/publish-bridge-default-host-ip.py" "$D"
 # Fixed addresses (--ip, Compose ipv4_address) and MAC addresses.
 $D run -d --name fixed --network ipamnet --ip 10.231.0.10 --mac-address 02:42:0a:e7:00:0a nginx:alpine >/dev/null
 t static-ip "10.231.0.10" $D inspect -f '{{.NetworkSettings.Networks.ipamnet.IPAddress}}' fixed
@@ -957,9 +996,15 @@ python3 -m http.server 18999 --bind $HTTP_BIND --directory "$HTTP_DIR" >/dev/nul
 HTTP_PID=$!
 [ "$SYS" = mac ] || { python3 -m http.server 18998 --bind 127.0.0.1 --directory "$HTTP_DIR" >/dev/null 2>&1 & HTTP_LO_PID=$!; }
 sleep 0.7
-t host-internal "Directory listing" $D run --rm alpine wget -qO- http://host.docker.internal:18999/
-t host-gateway "Directory listing" $D run --rm --add-host mac:host-gateway alpine wget -qO- http://mac:18999/
-t host-internal-hostnet "Directory listing" $D run --rm --network host alpine wget -qO- http://host.docker.internal:18999/
+if [ "$SYS" = mac ] && [ "${KIRI_HOST_LOOPBACK:-}" = off ]; then
+  t host-loopback-off "refused 198.19.248.254" $D run --rm alpine sh -c 'r=refused; wget -qO- -T 5 http://host.docker.internal:18999/ >/dev/null 2>&1 && r=reached; echo "$r $(getent hosts host.docker.internal | cut -d" " -f1)"'
+  t host-loopback-off-gateway "refused" $D run --rm --add-host mac:host-gateway alpine sh -c 'wget -qO- -T 5 http://mac:18999/ >/dev/null 2>&1 && echo reached || echo refused'
+  t host-loopback-off-hostnet "refused" $D run --rm --network host alpine sh -c 'wget -qO- -T 5 http://host.docker.internal:18999/ >/dev/null 2>&1 && echo reached || echo refused'
+else
+  t host-internal "Directory listing" $D run --rm alpine wget -qO- http://host.docker.internal:18999/
+  t host-gateway "Directory listing" $D run --rm --add-host mac:host-gateway alpine wget -qO- http://mac:18999/
+  t host-internal-hostnet "Directory listing" $D run --rm --network host alpine wget -qO- http://host.docker.internal:18999/
+fi
 # A port published on 127.0.0.1 or on every address is in the host's own
 # network, as Docker binds it: a --network host container reaches it at
 # 127.0.0.1 and localhost (::1 first in musl) (#732; a host-network
@@ -1546,6 +1591,73 @@ t unpriv-no-mount "denied" $D run --rm alpine sh -c 'mount -t tmpfs t /mnt 2>/de
 t priv-inspect "true" bash -c "$D run -d --name pv --privileged alpine sleep 30 >/dev/null; $D inspect -f '{{.HostConfig.Privileged}}' pv"
 t priv-exec-caps "000001ffffffffff" $D exec pv grep CapEff /proc/self/status
 $D rm -f pv >/dev/null
+# AppArmor, on a Linux host with it enabled: containers and execs run under
+# Kiri's own profile, kiri-default, as Docker Engine's under docker-default;
+# --privileged and apparmor=unconfined run without one.
+AA_WHY=
+if [ "$SYS" != linux ] || [ "$(cat /sys/module/apparmor/parameters/enabled 2>/dev/null)" != Y ] || [ ! -d /sys/kernel/security/apparmor ]; then
+  AA_WHY="no AppArmor on this kernel"
+elif ! $D info --format '{{.SecurityOptions}}' 2>/dev/null | grep -q name=apparmor; then
+  AA_PID=$(lsof -t "$SOCK" 2>/dev/null | head -1)
+  AA_CAP=$(awk '/^CapEff:/ {print $2}' "/proc/${AA_PID:-0}/status" 2>/dev/null)
+  if [ -z "$AA_CAP" ] || [ $(( 0x$AA_CAP >> 33 & 1 )) = 0 ]; then
+    AA_WHY="the engine may not load AppArmor policy here (in a container?)"
+  fi
+fi
+aa_on() { if [ -z "$AA_WHY" ]; then "$@"; else skip "$2" "$AA_WHY"; fi; }
+aa_off() { if [ -n "$AA_WHY" ]; then "$@"; else skip "$2" "AppArmor confines containers here"; fi; }
+aa_on t apparmor-label "kiri-default (enforce)" $D run --rm alpine cat /proc/self/attr/current
+aa_on t apparmor-label-user "kiri-default (enforce)" $D run --rm --user 1000 --security-opt no-new-privileges alpine cat /proc/self/attr/current
+aa_on t apparmor-label-init "kiri-default (enforce) kiri-default (enforce)" $D run --rm --init alpine sh -c 'echo $(cat /proc/1/attr/current) $(cat /proc/self/attr/current)'
+aa_on t apparmor-privileged "unconfined" $D run --rm --privileged alpine cat /proc/self/attr/current
+aa_on t apparmor-unconfined "unconfined" $D run --rm --security-opt apparmor=unconfined alpine cat /proc/self/attr/current
+aa_on t apparmor-missing-refused "\"kiri-no-such-profile\" is not loaded" $D run --rm --security-opt apparmor=kiri-no-such-profile alpine true
+aa_on t apparmor-kcore "Permission denied" $D run --rm alpine head -c1 /proc/kcore
+aa_on t apparmor-mount "Permission denied" $D run --rm --cap-add SYS_ADMIN alpine mount -t tmpfs none /mnt
+aa_on t apparmor-sysrq "denied" $D run --rm --cap-add SYS_ADMIN alpine sh -c 'umount /proc/sysrq-trigger 2>/dev/null; echo h > /proc/sysrq-trigger 2>/dev/null && echo written || echo denied'
+aa_on t apparmor-no-escape "refused" $D run --rm alpine sh -c "printf 'changeprofile unconfined' 2>/dev/null > /proc/self/attr/apparmor/current && echo changed || echo refused"
+aa_on t apparmor-exec "kiri-default (enforce)" bash -c "$D run -d --name aax alpine sleep 30 >/dev/null; $D exec aax cat /proc/self/attr/current"
+aa_on t apparmor-inspect "kiri-default" $D inspect -f '{{.AppArmorProfile}}' aax
+$D rm -f aax >/dev/null 2>&1
+aa_on t apparmor-info "name=apparmor" $D info --format '{{.SecurityOptions}}'
+aa_off t apparmor-absent-info "absent" bash -c "$D info --format '{{.SecurityOptions}}' | grep -q apparmor && echo listed || echo absent"
+aa_off t apparmor-absent-runs "ran" $D run --rm --security-opt apparmor=kiri-no-such-profile alpine echo ran
+# Mount & volume confinement, diff_ids verification, and control-char validation.
+only mac t bind-share-ancestors-and-proc-refused "refused" bash -c '
+  for s in / /mnt /Users/.. /proc/self/root/mnt/mac; do
+    '"$D"' run --rm -v "$s:/h" alpine true >/dev/null 2>&1 && { echo "allowed:$s"; exit 0; }
+  done
+  echo refused
+'
+t volume-driver-allowlist "refused" bash -c '
+  '"$D"' volume create --opt type=ext4 --opt device=/dev/vda kiri-sec-vda >/dev/null 2>&1 && { echo allowed-ext4; '"$D"' volume rm kiri-sec-vda >/dev/null 2>&1; exit 0; }
+  '"$D"' volume create --opt type=tmpfs --opt device=/dev/vda kiri-sec-tmpdev >/dev/null 2>&1 && { echo allowed-dev; '"$D"' volume rm kiri-sec-tmpdev >/dev/null 2>&1; exit 0; }
+  echo refused
+'
+t dns-and-domainname-control-chars-refused "refused" bash -c '
+  '"$D"' create --domainname $'"'"'a\nb'"'"' alpine true >/dev/null 2>&1 && { echo allowed-dom; exit 0; }
+  '"$D"' create --dns not-an-ip alpine true >/dev/null 2>&1 && { echo allowed-dns; exit 0; }
+  '"$D"' create --dns-search $'"'"'a\nb'"'"' alpine true >/dev/null 2>&1 && { echo allowed-search; exit 0; }
+  echo refused
+'
+t image-load-diffid-mismatch-refused "refused" python3 - "$D" <<'PY'
+import hashlib, io, json, platform, subprocess, sys, tarfile
+D = sys.argv[1].split()
+arch_name = "amd64" if platform.machine() in ("x86_64", "AMD64") else "arm64"
+layer = io.BytesIO()
+with tarfile.open(fileobj=layer, mode="w") as t:
+    ti = tarfile.TarInfo("f"); ti.size = 3; ti.mode = 0o644; t.addfile(ti, io.BytesIO(b"abc"))
+lb = layer.getvalue()
+cfg = json.dumps({"os":"linux","architecture":arch_name,"config":{"Cmd":["/bin/true"]},"rootfs":{"type":"layers","diff_ids":["sha256:" + "0"*64]}}).encode()
+cname = hashlib.sha256(cfg).hexdigest() + ".json"
+man = json.dumps([{"Config":cname,"RepoTags":["kiri-bad-diffid:1"],"Layers":["layer.tar"]}]).encode()
+arch = io.BytesIO()
+with tarfile.open(fileobj=arch, mode="w") as t:
+    for n, d in [("layer.tar", lb), (cname, cfg), ("manifest.json", man)]:
+        ti = tarfile.TarInfo(n); ti.size = len(d); t.addfile(ti, io.BytesIO(d))
+r = subprocess.run([*D, "load"], input=arch.getvalue(), capture_output=True)
+print("allowed" if r.returncode == 0 else "refused")
+PY
 
 section "kernel: netfilter, tc and interfaces"
 # Every line of tests/kernel-features.sh (nftables expressions, the iptables

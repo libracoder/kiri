@@ -1,4 +1,5 @@
 mod agent;
+mod apparmor;
 mod cgroup;
 mod container;
 mod devices;
@@ -16,6 +17,7 @@ mod net;
 mod netlink;
 mod pid1;
 mod relay;
+mod rmtree;
 mod roots;
 mod seccomp;
 mod swap;

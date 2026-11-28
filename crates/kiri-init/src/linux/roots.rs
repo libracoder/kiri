@@ -10,7 +10,6 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -151,7 +150,7 @@ pub fn release(base: &Path) {
         Some(Left::Unmount { remove }) => {
             unmount(&base.join("rootfs"));
             if remove {
-                let _ = fs::remove_dir_all(base);
+                let _ = super::rmtree::remove_tree(base);
             }
         }
     }
@@ -162,7 +161,7 @@ pub fn release(base: &Path) {
 pub fn remove(base: &Path) {
     if TABLE.with_borrow_mut(|t| t.doom(base)) {
         let _ = sys::umount_lazy(&base.join("rootfs"));
-        let _ = fs::remove_dir_all(base);
+        let _ = super::rmtree::remove_tree(base);
     }
 }
 

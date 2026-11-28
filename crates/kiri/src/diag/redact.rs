@@ -280,6 +280,14 @@ fn json_values(s: &str, q: &str) -> String {
                     from = last + q.len();
                     continue;
                 }
+                // The value is never closed (a body cut short): the rest of
+                // its line is the value; a JSON string holds no line break.
+                let end = s[start..].find(['\n', '\r']).map_or(s.len(), |n| start + n);
+                out.push_str(&s[last..start]);
+                out.push_str(MARK);
+                last = end;
+                from = end;
+                continue;
             }
             from = j;
             continue;
@@ -749,5 +757,22 @@ mod tests {
     fn leaves_other_text_and_unicode_alone() {
         let text = "VM booted in 112 ms → 4 CPUs, café=ok, a = b";
         assert_eq!(patterns(text), text);
+    }
+
+    /// A body cut short inside a secret's value (an HTTP error keeps 200
+    /// characters of it) loses the rest of the text, not the redaction.
+    #[test]
+    fn a_json_value_cut_off_by_the_end_of_the_text_is_taken_out() {
+        assert_eq!(
+            patterns(r#"https://auth.example.com/token returned HTTP 500: {"token":"eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOi"#),
+            r#"https://auth.example.com/token returned HTTP 500: {"token":"[redacted]"#
+        );
+        assert_eq!(patterns(r#"body="{\"secret\":\"abcdefghijkl"#), r#"body="{\"secret\":\"[redacted]"#);
+        assert_eq!(patterns(r#"{"token":"aaaa1111","n":1,"password":"bbbb2222"#), r#"{"token":"[redacted]","n":1,"password":"[redacted]"#);
+        // A cut value of any other key stays.
+        assert_eq!(patterns(r#"{"name":"webapp-unfinished"#), r#"{"name":"webapp-unfinished"#);
+        // In a whole report, only the rest of that line goes.
+        let report = "error: {\"token\":\"abcdefghijkl\n== Engine ==\nrunning: yes\r\nlast line";
+        assert_eq!(Redactor::new(None, Vec::new()).apply(report), "error: {\"token\":\"[redacted]\n== Engine ==\nrunning: yes\r\nlast line");
     }
 }

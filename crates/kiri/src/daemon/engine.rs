@@ -908,6 +908,38 @@ impl Spec {
         super::seccomp::compile(json, super::api::profile_caps(self.caps, self.privileged)).map_err(Error::BadRequest)
     }
 
+    /// The guest's `opts` lines for its start: [`Self::guest_opts`], and the
+    /// AppArmor profile on a Linux host that confines containers (an error
+    /// when the profile it needs is not loaded).
+    pub fn start_opts(&self, net_host: bool) -> Result<Vec<String>, Error> {
+        let mut lines = self.guest_opts(net_host)?;
+        let host = super::apparmor::host();
+        if host.confines() {
+            let loaded = |name: &str| super::apparmor::listed(&super::apparmor::loaded_profiles(), name);
+            if let Some(p) = super::apparmor::profile_for(&self.security_opt, self.privileged, host, loaded).map_err(Error::BadRequest)? {
+                lines.push(super::apparmor::guest_line(&p));
+            }
+        }
+        Ok(lines)
+    }
+
+    /// The guest's `opts` lines for an exec: the container's ulimits and
+    /// groups, and its AppArmor profile. Never unconfined by mistake: a
+    /// profile that cannot be worked out is asked for as the default, which
+    /// the guest then refuses if it is not loaded.
+    pub fn exec_opts(&self) -> Vec<String> {
+        let mut lines = self.guest_opts(false).unwrap_or_default();
+        let host = super::apparmor::host();
+        if host.confines() {
+            match super::apparmor::profile_for(&self.security_opt, self.privileged, host, |_| true) {
+                Ok(None) => {}
+                Ok(Some(p)) => lines.push(super::apparmor::guest_line(&p)),
+                Err(_) => lines.push(super::apparmor::guest_line(super::apparmor::DEFAULT_PROFILE)),
+            }
+        }
+        lines
+    }
+
     /// The security flags for the guest: seccomp, no-new-privileges, read-only root.
     pub fn security_flags(&self) -> u32 {
         let mut f = 0;
@@ -1354,6 +1386,34 @@ fn rebind_bindings(ports: &[super::ports::Binding], bound: &[(super::ports::Bind
             super::ports::Binding { host_port, ..b.clone() }
         })
         .collect()
+}
+
+/// Restores the request identity after rebinding to allocated host ports.
+/// The address and port reported by the listener stay as bound.
+fn restore_binding_host_ports(
+    requested: &[super::ports::Binding],
+    effective: &[super::ports::Binding],
+    bound: &mut [(super::ports::Binding, String, u16)],
+) {
+    for (binding, ..) in bound {
+        if let Some((original, _)) = requested.iter().zip(effective).find(|(_, effective)| *effective == &*binding) {
+            binding.host_port = original.host_port;
+        }
+    }
+}
+
+/// The host address a container's published ports without one of their own
+/// bind on `net` (its `host_binding_ipv4`); None off bridge networks or when
+/// every binding names its address. A bad stored value is an error, never
+/// every address.
+fn bridge_host_binding(net: Option<&super::network::Network>, ports: &[super::ports::Binding]) -> Result<Option<std::net::IpAddr>, String> {
+    if !ports.iter().any(|b| b.host_ip.is_empty()) {
+        return Ok(None);
+    }
+    match net {
+        Some(n) if n.driver == "bridge" => n.host_binding_ip(),
+        _ => Ok(None),
+    }
 }
 
 /// The guest IPv4 address that host-side port forwards for a running container
@@ -2134,6 +2194,9 @@ impl Engine {
         })?);
         // host.docker.internal: the guest dials back for each connection.
         vm.listen(super::ports::HOST_BOUND_PORT, Box::new(super::ports::serve_host_bound))?;
+        if !super::ports::host_loopback() {
+            crate::diag::info!("containers don't reach this Mac's loopback through host.docker.internal (KIRI_HOST_LOOPBACK=off)");
+        }
         // Outbound container TCP to VPN tunnel routes or under host egress.
         vm.listen(kiri_proto::EGRESS_TCP_PORT, Box::new(super::ports::serve_egress))?;
         // SSH agent forwarding, for containers that mount /run/host-services/ssh-auth.sock.
@@ -2336,7 +2399,7 @@ impl Engine {
         let _ = std::thread::Builder::new().name("kiri-k8s-lb".into()).spawn(move || loop {
             std::thread::sleep(Duration::from_secs(3));
             let Some(engine) = me.upgrade() else { return };
-            let node = engine.lock().containers.values().find(|c| c.status == Status::Running && is_k8s_node(&c.spec)).map(|c| (c.id.clone(), c.ip));
+            let node = engine.lock().containers.values().find(|c| c.status == Status::Running && is_k8s_node(c)).map(|c| (c.id.clone(), c.ip));
             let Some((id, Some(ip))) = node else {
                 engine.clear_k8s_lb();
                 continue;
@@ -2437,7 +2500,7 @@ impl Engine {
                 continue;
             }
             let b = super::ports::Binding { container_port: port, proto: proto.clone(), host_ip: host_ip.into(), host_port: port };
-            match super::ports::start(vm.clone(), &format!("lb-{port}-{proto}"), &[b], ip) {
+            match super::ports::start(vm.clone(), &format!("lb-{port}-{proto}"), &[b], ip, None) {
                 Ok(fw) => {
                     crate::diag::info!("Kubernetes service published", at = format!("{host_ip}:{port}/{proto}"));
                     lb.insert((port, proto), fw);
@@ -2477,12 +2540,12 @@ impl Engine {
         if !in_k8s_ranges(ip) || port == 0 {
             return Err(Error::BadRequest("not an address in the Kubernetes cluster".into()));
         }
-        let node = self.lock().containers.values().find(|c| c.status == Status::Running && c.spec.labels.get("dev.kiri.k8s").is_some()).and_then(|c| c.ip);
+        let node = self.lock().containers.values().find(|c| c.status == Status::Running && is_k8s_node(c)).and_then(|c| c.ip);
         let Some(node) = node else { return Err(Error::Conflict("Kubernetes isn't running".into())) };
         self.route_k8s(node);
         let vm = self.vm()?;
         let b = super::ports::Binding { container_port: port, proto: "tcp".into(), host_ip: "127.0.0.1".into(), host_port: 0 };
-        let fw = super::ports::start(vm.clone(), &format!("k8s-share-{port}"), &[b], ip)?;
+        let fw = super::ports::start(vm.clone(), &format!("k8s-share-{port}"), &[b], ip, None)?;
         let mac = fw.bound.first().map(|(_, _, p)| *p).unwrap_or(0);
         crate::diag::info!("Kubernetes address forwarded for sharing", to = format!("{}:{port}", std::net::Ipv4Addr::from(ip)), at = format!("127.0.0.1:{mac}"));
         let mut forwards = self.k8s_fwd.lock().unwrap_or_else(|e| e.into_inner());
@@ -3905,49 +3968,52 @@ impl Engine {
         send(&keep)
     }
 
-    /// Sends the guest every layer of these (digest, media type) it doesn't
-    /// have unpacked, from the blob store.
+    /// Sends the guest every layer of these `(digest, expected_diff_id)` it
+    /// doesn't already have unpacked with the matching `diff_id`.
     fn ensure_layers<'a>(&self, vm: &VmLink, layers: impl Iterator<Item = (&'a str, &'a str)>) -> io::Result<()> {
         let _one_at_a_time = self.layers.lock().unwrap_or_else(|e| e.into_inner());
-        for (digest, media_type) in layers {
+        for (digest, expected_diff_id) in layers {
             let _blob_pin = self.store.pin(digest);
-            if !vm.has_layer(digest)? {
-                vm.send_layer(digest, media_type, &self.store.blob_path(digest)?)?;
+            if !vm.has_layer(digest, expected_diff_id)? {
+                vm.send_layer(digest, expected_diff_id, &self.store.blob_path(digest)?)?;
             }
         }
         Ok(())
     }
 
-    /// A container's layers back in the guest before it runs again: the
-    /// guest deletes an unpacked layer at boot when it isn't whole (an unpack
-    /// cut short, or one from before layers were marked whole), and a
-    /// container created before that would otherwise fail to start with
-    /// "layer ... is not unpacked". The media type comes from any image with
-    /// the layer; a layer no image has any more can't be sent again.
+    /// Ensures a container's layers are unpacked in the guest with their
+    /// verified `diff_id`s before it starts again or is copied from.
     fn restore_layers(&self, vm: &VmLink, layers: &[String]) -> Result<(), Error> {
-        let mut missing = Vec::new();
+        let mut missing: Vec<(&str, String)> = Vec::new();
         for digest in layers {
-            if !vm.has_layer(digest)? {
-                missing.push(digest);
+            let expected = match self.store.known_diff_id(digest) {
+                Some(d) => Some(d),
+                None if self.store.blob_path(digest).is_ok_and(|p| p.is_file()) => Some(self.store.diff_id(digest).map_err(io::Error::from)?),
+                None => None,
+            };
+            let want = expected.as_deref().unwrap_or("");
+            if !vm.has_layer(digest, want)? {
+                let Some(want) = expected else {
+                    return Err(Error::Conflict(format!(
+                        "layer {digest} is gone from the engine and no image has it any more: remove this container and create it again"
+                    )));
+                };
+                missing.push((digest.as_str(), want));
             }
         }
-        // The usual case: nothing to send, and no need to read the image index.
         if missing.is_empty() {
             return Ok(());
         }
-        let (wanted, _blob_pins) = self.store.with_images(|images| -> Result<_, Error> {
-            let mut wanted = Vec::with_capacity(missing.len());
-            let mut pins = Vec::with_capacity(missing.len());
-            for digest in &missing {
-                let Some(l) = images.iter().flat_map(|i| &i.layers).find(|l| &l.digest == *digest) else {
-                    return Err(Error::Conflict(format!("layer {digest} is gone from the engine and no image has it any more: remove this container and create it again")));
-                };
-                pins.push(self.store.pin(&l.digest));
-                wanted.push((l.digest.clone(), l.media_type.clone()));
+        let mut pins = Vec::with_capacity(missing.len());
+        for (digest, _) in &missing {
+            pins.push(self.store.pin(digest));
+            if !self.store.blob_path(digest)?.is_file() {
+                return Err(Error::Conflict(format!(
+                    "layer {digest} is gone from the engine and no image has it any more: remove this container and create it again"
+                )));
             }
-            Ok((wanted, pins))
-        })??;
-        Ok(self.ensure_layers(vm, wanted.iter().map(|(d, m)| (d.as_str(), m.as_str())))?)
+        }
+        Ok(self.ensure_layers(vm, missing.iter().map(|(d, w)| (*d, w.as_str())))?)
     }
 
     /// Records a container and makes sure its layers are in the guest, so
@@ -3956,8 +4022,9 @@ impl Engine {
         let _pin = self.pin_layers(image.layers.iter().map(|l| l.digest.as_str()));
         let _blob_pins = self.store.hold_image(image);
         if !image.layers.is_empty() {
+            let diff_ids = self.store.checked_diff_ids(image)?;
             let vm = self.vm()?;
-            self.ensure_layers(&vm, image.layers.iter().map(|l| (l.digest.as_str(), l.media_type.as_str())))?;
+            self.ensure_layers(&vm, image.layers.iter().zip(&diff_ids).map(|(l, d)| (l.digest.as_str(), d.as_str())))?;
         }
         let id = random_hex(32);
         let persist = !spec.auto_remove;
@@ -4180,8 +4247,14 @@ impl Engine {
         let (gate, exits, earlier, halted_at_claim) = gate;
         // A bind source that is a link is followed again at every start, as
         // Docker does: re-pointing it between runs (a `current` release
-        // link) mounts the new target.
-        spec.mounts = super::api::fresh_bind_sources(&spec.mounts, &spec.mount_info);
+        // link) mounts the new target; stale pre-fix mounts are refused here.
+        spec.mounts = match super::api::revalidate_and_refresh_mounts(self, &spec.mounts, &spec.mount_info) {
+            Ok(m) => m,
+            Err(e) => {
+                self.fail_start(&id, &spec, &e);
+                return Err(e);
+            }
+        };
         super::api::refresh_ssh_agent_mounts(&spec.mount_info);
         #[cfg(target_os = "macos")]
         if spec.mounts.iter().any(|m| m.starts_with("/mnt/mac/")) {
@@ -4241,6 +4314,14 @@ impl Engine {
                 return Err(e);
             }
         };
+        let host_binding = match bridge_host_binding(net.as_ref(), &spec.ports) {
+            Ok(d) => d,
+            Err(e) => {
+                let e = Error::BadRequest(e);
+                self.fail_start(&id, &spec, &e);
+                return Err(e);
+            }
+        };
         let mut dns_names: Vec<String> = Vec::new();
         let mut net6_opts: Vec<String> = Vec::new();
         let (bridge, ip, prefix, gateway) = match net.as_ref().map(|n| n.driver.as_str()) {
@@ -4284,6 +4365,12 @@ impl Engine {
                         }
                         if n.no_ipv4 {
                             net6_opts.push(format!("{}=1", kiri_proto::net_opts::NO_IPV4));
+                        }
+                        if n.no_gateway4() {
+                            net6_opts.push(format!("{}=1", kiri_proto::net_opts::NO_GATEWAY4));
+                        }
+                        if n.icc_disabled() {
+                            net6_opts.push(format!("{}=1", kiri_proto::net_opts::NO_ICC));
                         }
                         net6_opts.push(format!("{}={}", kiri_proto::net_opts::NETWORK, n.name));
                     }
@@ -4376,14 +4463,15 @@ impl Engine {
         // Joining a host-network container is the host's namespace too: its
         // net.* sysctls would change the whole VM (or Linux host).
         let joined_host = joined_mode.is_some_and(|m| self.lock_networks().find(&m).is_some_and(|n| n.driver == "host"));
-        let mut host_opts = match spec.guest_opts(flags & run_flags::NET_HOST != 0 || joined_host) {
+        let mut host_opts = match spec.start_opts(flags & run_flags::NET_HOST != 0 || joined_host) {
             Ok(o) => o,
             Err(e) => {
                 self.fail_start(&id, &spec, &e);
                 return Err(e);
             }
         };
-        if let Some(opt) = k8s_timer_slack_opt(&spec) {
+        let container_name = self.lock().containers.get(&id).map(|c| c.name.clone()).unwrap_or_default();
+        if let Some(opt) = k8s_timer_slack_opt(&container_name, &spec) {
             host_opts.push(opt);
         }
         if let Err(e) = self.restore_layers(&vm, &layers) {
@@ -4492,7 +4580,10 @@ impl Engine {
             }
         }
         // Before anything below, which may itself exec (a health probe),
-        // and after the pid and all configured networks are in place.
+        // and after the pid and all configured networks are in place: order
+        // port publishing against operations waiting on the start gate.
+        let sync = self.names_sync(&id);
+        let order = sync.as_ref().map(|m| m.lock().unwrap_or_else(|e| e.into_inner()));
         drop(gate);
         if let (true, Some((rows, cols))) = (spec.tty, size) {
             let _ = vm.resize(&id, rows, cols);
@@ -4513,7 +4604,7 @@ impl Engine {
         if !spec.ports.is_empty()
             && let Some(target) = port_forward_target(forward_mode, Some(ip), cfg!(target_os = "linux"))
         {
-            match super::ports::start(vm.clone(), &id, &spec.ports, target) {
+            match super::ports::start(vm.clone(), &id, &spec.ports, target, host_binding) {
                 Ok(fw) => {
                     let mut st = self.lock();
                     if let Some(c) = st.containers.get_mut(&id).filter(|c| c.status == Status::Running && !vm.is_disconnected()) {
@@ -4535,6 +4626,7 @@ impl Engine {
                 }
             }
         }
+        drop(order);
         if vm.is_disconnected() {
             self.fail_start(&id, &spec, &"the VM stopped");
             return Err(Error::Io(io::Error::other("the VM stopped")));
@@ -4924,23 +5016,49 @@ impl Engine {
         self.lock_networks().allocate6(&n.name, super::network::parse_ip6(want), &avoid).map_err(Error::Conflict)
     }
 
-    /// Where `<host>` (a `*.kiri.localhost` name) should go: the container
-    /// and the ports that could be its web port (domains.rs picks one).
-    /// Names are the container name, or `<service>.<project>` for Compose
-    /// services.
+    /// Where `<host>` (a `*.kiri.localhost` or `*.kiri.local` name) should go:
+    /// deterministic 3-tier resolution ordered by `(c.created, &c.id)` so a
+    /// container's `dev.kiri.domain` label can never shadow another container's
+    /// name/ID or Compose `<service>.<project>`, nor blackhole routing via an
+    /// unroutable `--network none` container.
     pub fn route(&self, host: &str) -> Option<super::domains::Target> {
         let host = super::domains::parse_host_name(host)?;
         let name = host.strip_suffix(".kiri.localhost").or_else(|| host.strip_suffix(".kiri.local"))?.to_owned();
+        if !valid_domain_name(&name) {
+            return None;
+        }
         let st = self.lock();
-        let c = st.containers.values().find(|c| {
-            c.status == Status::Running && {
-                let label = |k: &str| c.spec.labels.get(k).and_then(|v| v.as_str()).unwrap_or("");
-                let service = format!("{}.{}", label("com.docker.compose.service"), label("com.docker.compose.project"));
-                // `dev.kiri.domain=api.myapp` (comma-separated for several) picks the names.
-                let chosen = label(DOMAIN_LABEL).split(',').map(|d| own_name(d.trim())).any(|d| !d.is_empty() && d.eq_ignore_ascii_case(&name));
-                chosen || c.name.eq_ignore_ascii_case(&name) || service.eq_ignore_ascii_case(&name) || (name.len() >= 12 && c.id.starts_with(&name))
-            }
-        })?;
+        let mut running: Vec<&Container> = st.containers.values().filter(|c| c.status == Status::Running).collect();
+        running.sort_by(|a, b| (a.created, &a.id).cmp(&(b.created, &b.id)));
+        fn label_of<'a>(c: &'a Container, k: &str) -> &'a str {
+            c.spec.labels.get(k).and_then(|v| v.as_str()).unwrap_or("")
+        }
+
+        // Tier 1: container name or >= 12-char container ID prefix.
+        let tier1 = running
+            .iter()
+            .copied()
+            .find(|c| c.name.eq_ignore_ascii_case(&name) || (name.len() >= 12 && c.id.starts_with(&name)));
+        // Tier 2: Compose `<service>.<project>` when both labels are non-empty.
+        let tier2 = || {
+            running.iter().copied().find(|c| {
+                let s = label_of(c, "com.docker.compose.service");
+                let p = label_of(c, "com.docker.compose.project");
+                !s.is_empty() && !p.is_empty() && format!("{s}.{p}").eq_ignore_ascii_case(&name)
+            })
+        };
+        // Tier 3: routable container (`--network host` or assigned IP) matching `dev.kiri.domain`.
+        let tier3 = || {
+            running.iter().copied().find(|c| {
+                (c.spec.network_mode == "host" || c.ip.is_some())
+                    && label_of(c, DOMAIN_LABEL)
+                        .split(',')
+                        .map(own_name)
+                        .any(|d| !d.is_empty() && d.eq_ignore_ascii_case(&name))
+            })
+        };
+
+        let c = tier1.or_else(tier2).or_else(tier3)?;
         let ip = if c.spec.network_mode == "host" { [127, 0, 0, 1] } else { c.ip? };
         Some(super::domains::Target {
             ip,
@@ -5067,8 +5185,9 @@ impl Engine {
             let c = st.containers.get(&id).expect("resolved");
             (id, c.layers.clone(), c.spec.clone())
         };
-        let (mounts, flags) = copy_mounts_and_flags(&spec, op, flags);
+        let (mounts, flags) = copy_mounts_and_flags(self, &spec, op, flags)?;
         let vm = self.vm()?;
+        self.restore_layers(&vm, &layers)?;
         let stream = vm.connect(kiri_proto::COPY_PORT)?;
         let mut out = Vec::new();
         kiri_proto::encode_copy(&mut out, op, &id, path, flags, &layers, &mounts);
@@ -5083,10 +5202,20 @@ impl Engine {
     pub fn domains(&self) -> Vec<String> {
         let suffix = if super::dns::installed() { "kiri.local" } else { "kiri.localhost" };
         let mut v = self.each(|c| {
-            let chosen = c.spec.labels.get(DOMAIN_LABEL).and_then(|v| v.as_str()).map(|d| own_name(d.split(',').next().unwrap_or("").trim()).to_owned());
-            (c.status == Status::Running).then(|| format!("{}.{suffix}", chosen.filter(|d| !d.is_empty()).unwrap_or_else(|| c.name.clone())))
+            if c.status != Status::Running || (c.spec.network_mode != "host" && c.ip.is_none()) {
+                return None;
+            }
+            let chosen = c
+                .spec
+                .labels
+                .get(DOMAIN_LABEL)
+                .and_then(|v| v.as_str())
+                .and_then(|raw| raw.split(',').map(own_name).find(|d| !d.is_empty()));
+            let base = chosen.or_else(|| valid_domain_name(&c.name).then(|| c.name.to_ascii_lowercase()))?;
+            Some(format!("{base}.{suffix}"))
         });
         v.sort();
+        v.dedup();
         v
     }
 
@@ -5301,6 +5430,12 @@ impl Engine {
         if net.no_ipv4 {
             opts.push(format!("{}=1", kiri_proto::net_opts::NO_IPV4));
         }
+        if net.no_gateway4() {
+            opts.push(format!("{}=1", kiri_proto::net_opts::NO_GATEWAY4));
+        }
+        if net.icc_disabled() {
+            opts.push(format!("{}=1", kiri_proto::net_opts::NO_ICC));
+        }
         opts.push(format!("{}={}", kiri_proto::net_opts::NETWORK, net.name));
         if let Err(e) = vm.net_attach(id, n, &net.bridge, ip, net.prefix, net.gateway, &names, &opts) {
             self.release_attached_ips(&net.name, Some(ip), ip6);
@@ -5363,12 +5498,15 @@ impl Engine {
         let vm = self.vm()?;
         let (attached_net, ip, ip6) = self.attach_network(&vm, &id, n, &extra, was_left_all)?;
         let fw = if was_left_all && !ports.is_empty() {
-            match super::ports::start(vm.clone(), &id, &ports, ip) {
+            let started = bridge_host_binding(Some(&attached_net), &ports)
+                .map_err(Error::BadRequest)
+                .and_then(|d| super::ports::start(vm.clone(), &id, &ports, ip, d).map_err(|e| Error::Conflict(e.to_string())));
+            match started {
                 Ok(fw) => Some(fw),
                 Err(e) => {
                     let _ = vm.net_detach(&id, n, &attached_net.bridge, ip);
                     self.release_attached_ips(&attached_net.name, Some(ip), ip6);
-                    return Err(Error::Conflict(e.to_string()));
+                    return Err(e);
                 }
             }
         } else {
@@ -5426,6 +5564,7 @@ impl Engine {
                 ip6: Option<[u8; 16]>,
                 old_fw: Option<super::ports::Forwards>,
                 rebind_ports: Vec<super::ports::Binding>,
+                rebind_default: Result<Option<std::net::IpAddr>, String>,
                 new_target: Option<[u8; 4]>,
                 running: bool,
             },
@@ -5445,6 +5584,8 @@ impl Engine {
                 let n = c.first_if.take();
                 let nets = self.lock_networks();
                 c.spec.leave_first_network(|name| nets.find(name).is_some_and(|n| n.internal));
+                // The network the ports move to, not the one left.
+                let promoted_net = (!c.spec.left_all_networks).then(|| nets.find(&c.spec.network_mode).cloned()).flatten();
                 drop(nets);
                 if !c.spec.left_all_networks {
                     let promoted = c.spec.network_mode.clone();
@@ -5465,7 +5606,8 @@ impl Engine {
                     Some(fw) if running && new_target.is_some() && !c.spec.ports.is_empty() => rebind_bindings(&c.spec.ports, &fw.bound),
                     _ => Vec::new(),
                 };
-                Detached::First { n, ip, ip6, old_fw, rebind_ports, new_target, running }
+                let rebind_default = bridge_host_binding(promoted_net.as_ref(), &rebind_ports);
+                Detached::First { n, ip, ip6, old_fw, rebind_ports, rebind_default, new_target, running }
             } else {
                 let Some(pos) = c.spec.extra_networks.iter().position(|x| x.name == net.name) else {
                     return Err(Error::NotFound(format!("container {} is not connected to network {}", &id[..12], net.name)));
@@ -5494,7 +5636,7 @@ impl Engine {
                     unplugged?;
                 }
             }
-            Detached::First { n, ip, ip6, old_fw, rebind_ports, new_target, running } => {
+            Detached::First { n, ip, ip6, old_fw, rebind_ports, rebind_default, new_target, running } => {
                 // Closing listeners joins their threads: never under self.lock().
                 drop(old_fw);
                 let unplugged = match (self.awake(), n, ip) {
@@ -5507,10 +5649,11 @@ impl Engine {
                     && !rebind_ports.is_empty()
                     && let (Some(vm), Some(target)) = (self.awake(), new_target)
                 {
-                    match super::ports::start(vm.clone(), &id, &rebind_ports, target) {
-                        Ok(fw) => {
+                    match rebind_default.map_err(io::Error::other).and_then(|d| super::ports::start(vm.clone(), &id, &rebind_ports, target, d)) {
+                        Ok(mut fw) => {
                             let mut st = self.lock();
                             if let Some(c) = st.containers.get_mut(&id).filter(|c| c.status == Status::Running && c.ip == Some(target) && !vm.is_disconnected()) {
+                                restore_binding_host_ports(&c.spec.ports, &rebind_ports, &mut fw.bound);
                                 c.forwards = Some(fw);
                             } else {
                                 drop(st);
@@ -5634,10 +5777,12 @@ impl Engine {
     /// `docker rename`.
     /// Kiri's own: new published ports for a container. A running one keeps
     /// running: its ports are relays on the Mac, so only they are replaced.
-    /// If the new ones cannot be bound, the old ones are put back.
+    /// If the new ones cannot be bound, try to restore the old listeners.
     pub fn set_ports(&self, key: &str, ports: Vec<super::ports::Binding>) -> Result<(), Error> {
-        let id = self.resolve(key)?;
-        let (old_ports, old_fw, running, target) = {
+        let id = self.resolve_after_start(key)?;
+        let sync = self.names_sync(&id).ok_or_else(|| gone(&id))?;
+        let _order = sync.lock().unwrap_or_else(|e| e.into_inner());
+        let (old_ports, mut old_fw, forwarding) = {
             let mut st = self.lock();
             let c = st.containers.get_mut(&id).ok_or_else(|| gone(&id))?;
             if c.spec.network_mode == "none" && !ports.is_empty() {
@@ -5647,17 +5792,26 @@ impl Engine {
                 return Err(Error::BadRequest("conflicting options: port publishing and the container type network mode".into()));
             }
             let target = port_forward_target(&c.spec.network_mode, c.ip, cfg!(target_os = "linux"));
+            // One snapshot of the network the ports forward into, for the new
+            // ports and the old ones put back. State, then networks.
+            let forwarding = if c.status == Status::Running && !ports.is_empty() && let Some(target) = target {
+                let nets = self.lock_networks();
+                let net = nets.find(&c.spec.network_mode);
+                let new_default = bridge_host_binding(net, &ports).map_err(Error::BadRequest)?;
+                let old_default = bridge_host_binding(net, &c.spec.ports);
+                Some((target, new_default, old_default))
+            } else {
+                None
+            };
             let old = std::mem::replace(&mut c.spec.ports, ports.clone());
-            (old, c.forwards.take(), c.status == Status::Running, target)
+            (old, c.forwards.take(), forwarding)
         };
+        let old_bound = old_fw.as_mut().map(|fw| std::mem::take(&mut fw.bound)).unwrap_or_default();
         // Closing listeners joins their threads: never under the lock.
         drop(old_fw);
-        if running
-            && !ports.is_empty()
-            && let Some(target) = target
-        {
+        if let Some((target, new_default, old_default)) = forwarding {
             let vm = self.vm()?;
-            match super::ports::start(vm.clone(), &id, &ports, target) {
+            match super::ports::start(vm.clone(), &id, &ports, target, new_default) {
                 Ok(fw) => {
                     let mut st = self.lock();
                     let stale = if let Some(c) = st.containers.get_mut(&id).filter(|c| c.status == Status::Running && !vm.is_disconnected()) {
@@ -5669,8 +5823,27 @@ impl Engine {
                     drop(stale);
                 }
                 Err(e) => {
-                    crate::diag::warn!("new ports not published; the old ones are kept", id = &id[..12], error = e);
-                    let back = (!old_ports.is_empty()).then(|| super::ports::start(vm.clone(), &id, &old_ports, target).ok()).flatten();
+                    crate::diag::warn!("new ports not published", id = &id[..12], error = e);
+                    let back = match old_default {
+                        Ok(default) if !old_ports.is_empty() => {
+                            let rebind_ports = rebind_bindings(&old_ports, &old_bound);
+                            match super::ports::start(vm.clone(), &id, &rebind_ports, target, default) {
+                                Ok(mut fw) => {
+                                    restore_binding_host_ports(&old_ports, &rebind_ports, &mut fw.bound);
+                                    Some(fw)
+                                }
+                                Err(e) => {
+                                    crate::diag::warn!("could not rebind old published ports", id = &id[..12], error = e);
+                                    None
+                                }
+                            }
+                        }
+                        Ok(_) => None,
+                        Err(e) => {
+                            crate::diag::warn!("could not restore old published ports with invalid bridge host default", id = &id[..12], error = e);
+                            None
+                        }
+                    };
                     let mut st = self.lock();
                     let stale = if let Some(c) = st.containers.get_mut(&id) {
                         c.spec.ports = old_ports;
@@ -6246,8 +6419,8 @@ impl Engine {
             e.attached.push(tx);
             let config = e.config.clone();
             let (security, caps) = st.containers.get(&container_id).map(|c| (c.spec.security_flags() & !run_flags::READONLY_ROOTFS, c.spec.caps)).unwrap_or_default();
-            // Execs get the container's ulimits and groups, as with runc.
-            let opts = st.containers.get(&container_id).map(|c| c.spec.guest_opts(false).unwrap_or_default()).unwrap_or_default();
+            // Execs get the container's ulimits, groups and AppArmor profile, as with runc.
+            let opts = st.containers.get(&container_id).map(|c| c.spec.exec_opts()).unwrap_or_default();
             exec_security = (security, caps, opts);
             let mut env = st.containers.get(&container_id).map(|c| c.spec.env.clone()).unwrap_or_default();
             for e in &config.env {
@@ -6665,9 +6838,14 @@ pub fn random_hex(bytes: usize) -> String {
 pub const DOMAIN_LABEL: &str = "dev.kiri.domain";
 
 /// `api.myapp`, from any of `api.myapp`, `api.myapp.kiri.local` or
-/// `api.myapp.kiri.localhost`.
-fn own_name(d: &str) -> &str {
-    d.strip_suffix(".kiri.localhost").or_else(|| d.strip_suffix(".kiri.local")).unwrap_or(d)
+/// `api.myapp.kiri.localhost`; "" when it is not a plain host name
+/// (weburl::plain_name), so a hostile label names nothing.
+fn own_name(d: &str) -> String {
+    crate::weburl::chosen_domain(d)
+}
+
+fn valid_domain_name(d: &str) -> bool {
+    crate::weburl::plain_name(d)
 }
 
 /// Docker's container-name rule: `[a-zA-Z0-9][a-zA-Z0-9_.-]*`. A name is a
@@ -6715,6 +6893,22 @@ fn ancestor_ids(images: &[Image], values: &[String]) -> Vec<String> {
         images.iter().find(|i| is_id && i.config_digest.strip_prefix("sha256:").is_some_and(|h| h.starts_with(hex))).cloned()
     };
     values.iter().filter_map(|v| image_named(images.to_vec(), v).or_else(|| by_id(v))).map(|i| i.config_digest).collect()
+}
+
+#[cfg(test)]
+mod domain_label_tests {
+    /// `dev.kiri.domain` names a container only when it is a plain host
+    /// name: anything else is no name, so it neither routes nor shows on
+    /// the router's list.
+    #[test]
+    fn only_a_plain_name_is_a_chosen_domain() {
+        assert_eq!(super::own_name("api.myapp"), "api.myapp");
+        assert_eq!(super::own_name("API.myapp.kiri.localhost"), "api.myapp");
+        assert_eq!(super::own_name("web.kiri.local"), "web");
+        for hostile in ["outside.example/#", "x@outside.example", "<b>x</b>", "web .x", "web\tx", "-web", "web.", "a..b", "bücher"] {
+            assert_eq!(super::own_name(hostile), "", "{hostile:?}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -7518,20 +7712,20 @@ fn close_monitor(h: &mut HealthRun) {
 }
 
 /// Mounts and flags carried on a guest `Copy` frame. Archive ops (`IN`, `OUT`,
-/// `STAT`) carry the container's mounts (with refreshed bind sources) and
-/// `READONLY_ROOTFS` for `IN`; `EXPORT`, `DIFF`, `COMMIT` and `UPPER` operate
-/// on the container's rootfs/layer alone, without mounts.
-fn copy_mounts_and_flags(spec: &Spec, op: u8, flags: u32) -> (Vec<String>, u32) {
+/// `STAT`) carry the container's mounts (revalidated and with refreshed bind
+/// sources) and `READONLY_ROOTFS` for `IN`; `EXPORT`, `DIFF`, `COMMIT` and
+/// `UPPER` operate on the container's rootfs/layer alone, without mounts.
+fn copy_mounts_and_flags(engine: &Engine, spec: &Spec, op: u8, flags: u32) -> Result<(Vec<String>, u32), Error> {
     if !matches!(op, kiri_proto::copy_op::IN | kiri_proto::copy_op::OUT | kiri_proto::copy_op::STAT) {
-        return (Vec::new(), flags);
+        return Ok((Vec::new(), flags));
     }
-    let mounts = super::api::fresh_bind_sources(&spec.mounts, &spec.mount_info);
+    let mounts = super::api::revalidate_and_refresh_mounts(engine, &spec.mounts, &spec.mount_info)?;
     let flags = if op == kiri_proto::copy_op::IN && spec.readonly_rootfs {
         flags | kiri_proto::copy_flags::READONLY_ROOTFS
     } else {
         flags
     };
-    (mounts, flags)
+    Ok((mounts, flags))
 }
 
 fn error_text(e: &Error) -> String {
@@ -7798,12 +7992,13 @@ mod vm_recovery_tests {
         let image = store.images().unwrap().into_iter().find(|i| i.name == "alpine:latest").expect("pull alpine:latest into the isolated store first");
         let engine = Engine::boot(store).unwrap();
         let mut ids = Vec::new();
-        for (name, policy) in [("live-always", "always"), ("live-unless", "unless-stopped"), ("live-no", "no"), ("live-stopped", "unless-stopped"), ("live-failure", "on-failure")] {
+        for (name, policy) in [(crate::k8s::NAME, "always"), ("live-unless", "unless-stopped"), ("live-no", "no"), ("live-stopped", "unless-stopped"), ("live-failure", "on-failure")] {
             let spec: Spec = serde_json::from_value(serde_json::json!({
                 "image": image.name, "image_id": image.digest, "entrypoint": [], "cmd": ["sleep", "600"],
                 "env": [], "cwd": "/", "user": "", "auto_remove": false,
-                "network_mode": if name == "live-always" { "bridge" } else { "none" },
-                "labels": if name == "live-always" { serde_json::json!({"dev.kiri.k8s": "true"}) } else { serde_json::json!({}) },
+                "privileged": name == crate::k8s::NAME,
+                "network_mode": if name == crate::k8s::NAME { "bridge" } else { "none" },
+                "labels": if name == crate::k8s::NAME { serde_json::json!({"dev.kiri.k8s": "true"}) } else { serde_json::json!({}) },
                 "restart": {"name": policy, "max_retries": 0}
             })).unwrap();
             let id = engine.create(Some(name.into()), spec, &image).unwrap();
@@ -7836,7 +8031,7 @@ mod vm_recovery_tests {
         {
             let vm = engine.awake().unwrap();
             let missing = root.join("retirement-missing.blob");
-            assert!(vm.send_layer("sha256:0000000000000000000000000000000000000000000000000000000000000000", "application/vnd.oci.image.layer.v1.tar+gzip", &missing).is_err());
+            assert!(vm.send_layer("sha256:0000000000000000000000000000000000000000000000000000000000000000", "", &missing).is_err());
             assert!(!vm.is_disconnected(), "a missing blob must not cost the VM");
             assert!(vm.stats().is_ok(), "the link still answers after a missing blob");
             println!("PASS: missing layer blob fails before the header; the VM carries on");
@@ -9130,19 +9325,23 @@ mod start_wait_tests {
             "tmpfs\t/tmp\ttmpfs,noexec,nosuid,nodev".into(),
         ];
         s.readonly_rootfs = true;
-        let (mounts, flags) = copy_mounts_and_flags(&s, kiri_proto::copy_op::IN, kiri_proto::copy_flags::CHUNKED);
+        let (mounts, flags) = copy_mounts_and_flags(&engine, &s, kiri_proto::copy_op::IN, kiri_proto::copy_flags::CHUNKED).unwrap();
         assert_eq!(mounts, s.mounts);
         assert_eq!(flags, kiri_proto::copy_flags::CHUNKED | kiri_proto::copy_flags::READONLY_ROOTFS);
         for op in [kiri_proto::copy_op::OUT, kiri_proto::copy_op::STAT] {
-            let (mounts, flags) = copy_mounts_and_flags(&s, op, 0);
+            let (mounts, flags) = copy_mounts_and_flags(&engine, &s, op, 0).unwrap();
             assert_eq!(mounts, s.mounts);
             assert_eq!(flags, 0);
         }
         for op in [kiri_proto::copy_op::EXPORT, kiri_proto::copy_op::DIFF, kiri_proto::copy_op::COMMIT, kiri_proto::copy_op::UPPER] {
-            let (mounts, flags) = copy_mounts_and_flags(&s, op, 0);
+            let (mounts, flags) = copy_mounts_and_flags(&engine, &s, op, 0).unwrap();
             assert!(mounts.is_empty(), "op {op} must not mount volumes/binds");
             assert_eq!(flags, 0);
         }
+        // Forged mount lines in stored specs fail copy_mounts_and_flags on archive ops.
+        let mut bad = s.clone();
+        bad.mounts = vec!["/var/lib/kiri/volumes/pg/_data\t/data\tcreate\text4\t/dev/vda\t0\t".into()];
+        assert!(copy_mounts_and_flags(&engine, &bad, kiri_proto::copy_op::OUT, 0).is_err());
         drop(engine);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -9980,6 +10179,44 @@ mod leave_first_network_tests {
         assert_eq!(rebound.len(), 2);
         assert_eq!(rebound[0].host_port, 49152);
         assert_eq!(rebound[1].host_port, 8443);
+    }
+
+    #[test]
+    fn rebind_bindings_keeps_fixed_and_ephemeral_ports_across_repeat_moves() {
+        let dynamic = super::super::ports::Binding { container_port: 80, proto: "tcp".into(), host_ip: String::new(), host_port: 0 };
+        let fixed = super::super::ports::Binding { host_port: 8080, ..dynamic.clone() };
+        let spec = [fixed.clone(), dynamic.clone()];
+        let initial = [(fixed.clone(), "127.0.0.1".into(), 8080), (dynamic.clone(), "127.0.0.1".into(), 49152)];
+        let first = super::rebind_bindings(&spec, &initial);
+        assert_eq!(first[0], fixed);
+        assert_eq!(first[1].host_port, 49152);
+        assert_eq!(first[1].host_ip, "", "the network default still applies");
+
+        let mut promoted = [(first[0].clone(), "127.0.0.2".into(), 8080), (first[1].clone(), "127.0.0.2".into(), 49152)];
+        super::restore_binding_host_ports(&spec, &first, &mut promoted);
+        assert_eq!(promoted, [(fixed, String::from("127.0.0.2"), 8080), (dynamic, String::from("127.0.0.2"), 49152)]);
+        assert_eq!(super::rebind_bindings(&spec, &promoted), first);
+    }
+
+    #[test]
+    fn bridge_host_binding_is_read_only_when_a_binding_needs_it() {
+        let b = |ip: &str| super::super::ports::Binding { container_port: 80, proto: "tcp".into(), host_ip: ip.into(), host_port: 8080 };
+        let mut net: super::super::network::Network = serde_json::from_value(serde_json::json!({
+            "id": "x", "name": "lo", "driver": "bridge", "bridge": "kiri1", "subnet": [10, 9, 0, 0], "prefix": 24, "gateway": [10, 9, 0, 1], "created_ns": 0,
+            "options": {super::super::network::HOST_BINDING_OPT: "127.0.0.1"}
+        }))
+        .unwrap();
+        let lo = Some("127.0.0.1".parse().unwrap());
+        assert_eq!(super::bridge_host_binding(Some(&net), &[b("")]), Ok(lo));
+        assert_eq!(super::bridge_host_binding(Some(&net), &[b("0.0.0.0")]), Ok(None));
+        assert_eq!(super::bridge_host_binding(None, &[b("")]), Ok(None));
+        net.options[super::super::network::HOST_BINDING_OPT] = "".into();
+        assert_eq!(super::bridge_host_binding(Some(&net), &[b("")]), Ok(None), "empty host_binding_ipv4 is unset");
+        net.options[super::super::network::HOST_BINDING_OPT] = "nope".into();
+        assert!(super::bridge_host_binding(Some(&net), &[b("")]).is_err());
+        assert_eq!(super::bridge_host_binding(Some(&net), &[b("10.0.0.1")]), Ok(None), "unused, so not in the way");
+        net.driver = "host".into();
+        assert_eq!(super::bridge_host_binding(Some(&net), &[b("")]), Ok(None));
     }
 
     #[test]
@@ -10824,7 +11061,7 @@ mod exit_forwards_tests {
                 "/mnt/mac/Users/alice/app\t/app\t".into(),
                 "/mnt/c/Users/alice/app\t/win\t".into(),
             ];
-            assert_eq!(super::k8s_timer_slack_opt(&app.spec), None);
+            assert_eq!(super::k8s_timer_slack_opt(&app.name, &app.spec), None);
 
             let mut k8s = Container {
                 lifecycle: Arc::new(Mutex::new(0)),
@@ -10865,16 +11102,33 @@ mod exit_forwards_tests {
                 ))),
                 attached: Vec::new(),
             };
+            k8s.spec.privileged = true;
             k8s.spec.labels = serde_json::json!({"dev.kiri.k8s": "1"});
             k8s.spec.mounts = vec![
                 "/mnt/mac/Users\t/Users\t".into(),
                 "/mnt/mac/Volumes\t/Volumes\t".into(),
                 "/mnt/c\t/mnt/c\t".into(),
             ];
+            // Unprivileged `kiri-k8s` or differently-named privileged container with
+            // `dev.kiri.k8s=1` must NOT be treated as the k8s node.
+            k8s.spec.privileged = false;
+            assert!(!super::is_k8s_node(&k8s));
+            assert!(super::watches_host_binds(&k8s));
+            assert_eq!(super::k8s_timer_slack_opt(&k8s.name, &k8s.spec), None);
+
+            k8s.spec.privileged = true;
+            k8s.name = "not-kiri-k8s".into();
+            assert!(!super::is_k8s_node(&k8s));
+            assert!(super::watches_host_binds(&k8s));
+            assert_eq!(super::k8s_timer_slack_opt(&k8s.name, &k8s.spec), None);
+
+            k8s.name = "kiri-k8s".into();
+            assert!(super::is_k8s_node(&k8s));
             assert_eq!(
-                super::k8s_timer_slack_opt(&k8s.spec).as_deref(),
+                super::k8s_timer_slack_opt(&k8s.name, &k8s.spec).as_deref(),
                 Some("timerslack\t10000000")
             );
+
             st.containers.insert(k8s.id.clone(), k8s);
         }
 
@@ -10891,6 +11145,102 @@ mod exit_forwards_tests {
         drop(engine);
         let _ = std::fs::remove_dir_all(dir);
     }
+
+    #[test]
+    fn domain_router_uses_deterministic_three_tier_precedence_and_skips_unroutable() {
+        let dir = std::env::temp_dir().join(format!("kiri-domain-tiers-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let engine = boot_without_vm(&dir);
+        let img = kiri_image::Image {
+            mirror: None,
+            name: "alpine:1".into(),
+            digest: "sha256:0123".into(),
+            index_digest: None,
+            config_digest: "sha256:0123".into(),
+            layers: Vec::new(),
+            size: 0,
+            platform: "linux/arm64".into(),
+            created: String::new(),
+            pulled_at: 0,
+            config: Default::default(),
+        };
+        let mk_spec = |net: &str, labels: serde_json::Value| -> Spec {
+            serde_json::from_value(serde_json::json!({
+                "image": "alpine:1", "image_id": "sha256:0123", "entrypoint": [], "cmd": ["sh"],
+                "env": [], "cwd": "/", "user": "", "auto_remove": false,
+                "network_mode": net, "labels": labels,
+                "restart": {"name": "no", "max_retries": 0}
+            }))
+            .unwrap()
+        };
+
+        // Attacker created FIRST with `dev.kiri.domain=web,api.shop,custom` and an unroutable `--network none` sibling.
+        let blackhole_id = engine
+            .create(Some("blackhole".into()), mk_spec("none", serde_json::json!({"dev.kiri.domain": "custom,web"})), &img)
+            .unwrap();
+        let spoof_id = engine
+            .create(Some("spoof".into()), mk_spec("bridge", serde_json::json!({"dev.kiri.domain": "web,api.shop,custom,bad/host"})), &img)
+            .unwrap();
+        let compose_id = engine
+            .create(
+                Some("shop-api-1".into()),
+                mk_spec("bridge", serde_json::json!({"com.docker.compose.service": "api", "com.docker.compose.project": "shop"})),
+                &img,
+            )
+            .unwrap();
+        let web_id = engine.create(Some("web".into()), mk_spec("bridge", serde_json::json!({})), &img).unwrap();
+
+        let t0 = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        {
+            let mut st = engine.lock();
+            for (idx, (id, ip)) in [
+                (&blackhole_id, None),
+                (&spoof_id, Some([172, 17, 0, 10])),
+                (&compose_id, Some([172, 17, 0, 11])),
+                (&web_id, Some([172, 17, 0, 12])),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let c = st.containers.get_mut(id).unwrap();
+                c.created = t0 + Duration::from_secs(idx as u64);
+                c.status = Status::Running;
+                c.ip = ip;
+            }
+        }
+
+        // Tier 1 beats Tier 3 even though `spoof` was created earlier.
+        assert_eq!(engine.route("web.kiri.localhost").unwrap().id, web_id);
+        assert_eq!(engine.route(&format!("{}.kiri.localhost", &web_id[..12])).unwrap().id, web_id);
+        // Tier 2 (`api.shop`) beats Tier 3 (`spoof` claiming `api.shop`).
+        assert_eq!(engine.route("api.shop.kiri.localhost").unwrap().id, compose_id);
+        // Tier 3 skips unroutable `blackhole` (`c.ip == None`) and routes `custom` to `spoof`.
+        assert_eq!(engine.route("custom.kiri.localhost").unwrap().id, spoof_id);
+        // Malformed hostnames (`..`, empty Compose labels `.`) never match.
+        assert!(engine.route(".kiri.localhost").is_none());
+        assert!(engine.route("bad/host.kiri.localhost").is_none());
+
+        // Deterministic tie-breaking within Tier 3: earlier `(created, id)` wins.
+        let later_id = engine
+            .create(Some("later-custom".into()), mk_spec("bridge", serde_json::json!({"dev.kiri.domain": "custom"})), &img)
+            .unwrap();
+        {
+            let mut st = engine.lock();
+            let c = st.containers.get_mut(&later_id).unwrap();
+            c.created = t0 + Duration::from_secs(99);
+            c.status = Status::Running;
+            c.ip = Some([172, 17, 0, 13]);
+        }
+        assert_eq!(engine.route("custom.kiri.localhost").unwrap().id, spoof_id);
+
+        // `domains()` deduplicates, excludes unroutable `blackhole`, and rejects invalid domain syntax.
+        let listed = engine.domains();
+        assert_eq!(listed.iter().filter(|d| d.starts_with("custom.")).count(), 1, "{listed:?}");
+        assert!(!listed.iter().any(|d| d.starts_with("blackhole.") || d.contains('/')), "{listed:?}");
+
+        drop(engine);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 
 /// 10 ms timer slack applied to `kiri-k8s` (`dev.kiri.k8s`) so `k3s`'s dozens of
@@ -10898,16 +11248,20 @@ mod exit_forwards_tests {
 /// cleanly instead of waking virtual CPUs thousands of times per second (#989).
 const K8S_TIMER_SLACK_NS: u64 = 10_000_000;
 
-fn is_k8s_node(spec: &Spec) -> bool {
-    spec.labels.get("dev.kiri.k8s").is_some()
+fn is_k8s_node(c: &Container) -> bool {
+    is_k8s_node_spec(&c.name, &c.spec)
+}
+
+fn is_k8s_node_spec(name: &str, spec: &Spec) -> bool {
+    name == crate::k8s::NAME && spec.privileged && spec.labels.get("dev.kiri.k8s").is_some()
 }
 
 fn watches_host_binds(c: &Container) -> bool {
-    c.status == Status::Running && !is_k8s_node(&c.spec)
+    c.status == Status::Running && !is_k8s_node(c)
 }
 
-fn k8s_timer_slack_opt(spec: &Spec) -> Option<String> {
-    is_k8s_node(spec).then(|| format!("timerslack\t{K8S_TIMER_SLACK_NS}"))
+fn k8s_timer_slack_opt(name: &str, spec: &Spec) -> Option<String> {
+    is_k8s_node_spec(name, spec).then(|| format!("timerslack\t{K8S_TIMER_SLACK_NS}"))
 }
 
 /// Whether a guest `Run` error reports that an image layer was missing under

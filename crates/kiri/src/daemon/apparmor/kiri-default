@@ -1,0 +1,68 @@
+# kiri-default: the AppArmor profile Kiri's containers run under on a Linux
+# host with AppArmor enabled. The engine loads it itself when it starts, and
+# again whenever this text changes (it keeps a hash of the text it loaded).
+#
+# A container is free to do ordinary work: files, the network, the
+# capabilities its capability set gives it, signals and tracing among its own
+# processes. What it may not do, even as root with added capabilities, is
+# change its mounts (which would undo the masked and read-only paths the
+# engine set up), change the kernel's settings through /proc and /sys, read
+# kernel memory, touch security policy, or reach processes under any other
+# profile.
+#
+# No feature ABI is named, on purpose: the profile is then built with the
+# compiler's compatibility ABI, which every apparmor_parser from 2.13 on
+# understands, and newer rule classes (user namespaces, io_uring, message
+# queues) are left to the container's other layers, as before.
+
+profile kiri-default flags=(attach_disconnected, mediate_deleted) {
+  # Ordinary work. The container's capability set decides which
+  # capabilities a process holds; this profile takes none away but the two
+  # that administer security policy.
+  file,
+  network,
+  capability,
+  deny capability mac_admin,
+  deny capability mac_override,
+
+  # Processes outside any profile (the engine, the host's administrator) may
+  # signal container processes. Container processes may signal and trace
+  # one another, as shells, ps and debuggers inside one container need.
+  # Toward anything else only the existence check (signal 0) is allowed.
+  signal (receive) peer=unconfined,
+  signal (send, receive) peer=kiri-default,
+  signal (send) set=("exists"),
+  ptrace (trace, read, tracedby, readby) peer=kiri-default,
+
+  # The mount table stays as the engine left it.
+  deny mount,
+  deny remount,
+  deny umount,
+  deny pivot_root,
+
+  # /proc. The per-process directories (/proc/<pid>, which /proc/self and
+  # /proc/thread-self lead to) stay writable: oom_score_adj, attr, comm.
+  # Everything else written there is the kernel's: files directly in /proc
+  # (sysrq-trigger, ...) and every other directory, /proc/sys among them. A
+  # container's namespaced sysctls are set by the engine before it starts.
+  deny /proc/* w,
+  deny /proc/[^0-9]*/** w,
+  deny /proc/{kcore,kmem,mem,sysrq-trigger} rwklx,
+
+  # /sys. Nothing is written but the container's own cgroup files, and of
+  # those never a cgroup v1 release agent (a program the host would run).
+  # (AppArmor has no "all but": each line below takes one more letter of
+  # "fs/cgroup" and refuses every other name that starts the same way.)
+  deny /sys/* w,
+  deny /sys/{f,[^f]*,f[^s]*,fs?*}/** w,
+  deny /sys/fs/* w,
+  deny /sys/fs/{c,cg,cgr,cgro,cgrou}/** w,
+  deny /sys/fs/{[^c]*,c[^g]*,cg[^r]*,cgr[^o]*,cgro[^u]*,cgrou[^p]*,cgroup?*}/** w,
+  deny /sys/fs/cgroup/**release_agent w,
+  # Not even read: firmware tables, security policy, debugging interfaces,
+  # and energy counters (a side channel on what other code computes).
+  deny /sys/firmware/** rwklx,
+  deny /sys/kernel/security/** rwklx,
+  deny /sys/kernel/debug/** rwklx,
+  deny /sys/devices/virtual/powercap/** rwklx,
+}

@@ -79,14 +79,15 @@ pub fn image(store: &Store, name: &str) -> io::Result<(Image, Vec<kiri_image::st
     Ok((pulled, pins))
 }
 
-/// Makes sure every layer of `image` is unpacked in the guest. Returns how
-/// many had to be sent.
+/// Makes sure every layer of `image` is unpacked in the guest with its
+/// verified `diff_id`. Returns how many had to be sent.
 pub fn ensure_layers(guest: &mut Guest, store: &Store, image: &Image) -> io::Result<usize> {
     let _held = store.hold_image(image);
+    let diff_ids = store.checked_diff_ids(image)?;
     let mut sent = 0;
-    for layer in &image.layers {
-        if !guest.has_layer(&layer.digest)? {
-            guest.send_layer(&layer.digest, &layer.media_type, &store.blob_path(&layer.digest)?)?;
+    for (layer, want) in image.layers.iter().zip(&diff_ids) {
+        if !guest.has_layer(&layer.digest, want)? {
+            guest.send_layer(&layer.digest, want, &store.blob_path(&layer.digest)?)?;
             sent += 1;
         }
     }

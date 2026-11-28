@@ -63,6 +63,9 @@ t port-inspect '{"80/tcp":[{"HostIp":"","HostPort":"18081"}]}' "docker inspect -
 # KIRI_TEST_REGISTRY, which serves Docker Hub's official images as they are.
 t distribution '"mediaType":"application/vnd.oci.image.index.v1+json"' "curl -s --unix-socket /root/.kiri/run/docker.sock http://d/v1.47/distribution/$KIRI_REG/alpine:3.21/json"
 t distribution-missing "404" "curl -s -o /dev/null -w '%{http_code}' --unix-socket /root/.kiri/run/docker.sock http://d/v1.47/distribution/$KIRI_REG/no-such-image-kiri-test/json"
+# An engine in a container may not load AppArmor policy: it says so once
+# and its containers start as before, unconfined.
+t apparmor-in-container "absent ran" "docker info --format '{{.SecurityOptions}}' | grep -q apparmor && printf 'listed ' || printf 'absent '; docker run --rm --security-opt apparmor=kiri-no-such-profile alpine echo ran"
 # A copy into a created container, then its start, mounts the same upper
 # dir twice in a row: kernels with overlayfs index on (Arch) refused the
 # second with EBUSY (#227). A renamed directory must survive a commit.
@@ -194,6 +197,15 @@ t disconnect-hands-ipv6-default-on "default via fd00:193:2::1 dev eth2" "docker 
 # An IPv6 IPAM subnet without --ipv6 is ignored, as Docker does (#433):
 # both with an IPv4 subnet (mailcow-dockerized) and with only an IPv6 subnet.
 t network-ipv6-subnet-ignored-when-disabled "false 1 10.234.0.0/24 false 1 v4" "docker network create --subnet 10.234.0.0/24 --subnet fd4d:6169:6c63:6f77::/64 lh6off >/dev/null && a=\$(docker network inspect lh6off -f '{{.EnableIPv6}} {{len .IPAM.Config}} {{(index .IPAM.Config 0).Subnet}}') && docker network create --subnet fd4d:6169:6c63:6f77::/64 lh6off-auto >/dev/null && b=\$(docker network inspect lh6off-auto -f '{{.EnableIPv6}} {{len .IPAM.Config}}') && s=\$(docker network inspect lh6off-auto -f '{{(index .IPAM.Config 0).Subnet}}') && case \"\$s\" in *.*/*) v=v4;; *) v=bad:\$s;; esac && echo \"\$a \$b \$v\"; docker network rm lh6off lh6off-auto >/dev/null 2>&1"
+# gateway_mode_ipv4=isolated (#1001): the host has no address on an
+# internal network's bridge, so a service on every host address isn't
+# reached through the gateway; without it, it is. Names still resolve.
+t isolated-setup "up" "docker network create --internal lh-plain >/dev/null && docker network create --internal -o com.docker.network.bridge.gateway_mode_ipv4=isolated lh-iso >/dev/null && docker run -d --name lh-isohost --network host alpine nc -lk -p 18997 -e true >/dev/null && docker run -d --name lh-isoweb --network lh-iso nginx:alpine >/dev/null && echo up"
+t isolated-plain-reaches-host "reached" "gw=\$(docker network inspect lh-plain -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}') && docker run --rm --network lh-plain alpine sh -c \"nc -z -w 3 \$gw 18997 && echo reached || echo unreached\""
+t isolated-host-unreached "unreached" "gw=\$(docker network inspect lh-iso -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}') && docker run --rm --network lh-iso alpine sh -c \"nc -z -w 3 \$gw 18997 && echo reached || echo unreached\""
+t isolated-bridge-no-ipv4 "none" "gw=\$(docker network inspect lh-iso -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}'); ip -4 -o addr | grep -q \" \$gw/\" && echo \"\$gw is on the host\" || echo none"
+t isolated-names "Welcome to nginx" "for i in \$(seq 30); do docker run --rm --network lh-iso alpine wget -qO- -T 3 http://lh-isoweb 2>/dev/null && break; sleep 0.3; done"
+t isolated-cleanup "gone" "docker rm -f lh-isohost lh-isoweb >/dev/null; docker network rm lh-plain lh-iso >/dev/null && echo gone"
 # A build's --add-host host-gateway is the bridge gateway, as for docker run (not the Mac VM's 198.19.248.254).
 t build-host-gateway "GW-OK" "gw=\$(docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}'); mkdir -p /bhg && printf 'FROM $KIRI_REG/alpine:3.21\\nRUN grep -w hgw /etc/hosts\\n' > /bhg/Dockerfile && DOCKER_BUILDKIT=0 docker build --no-cache --add-host hgw:host-gateway /bhg 2>&1 | grep -q \"\$gw\" && echo GW-OK"
 # A privileged container must not touch the host's /dev. The kernel has one

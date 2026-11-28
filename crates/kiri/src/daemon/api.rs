@@ -144,6 +144,26 @@ fn container_may(method: &str, path: &str) -> bool {
     !kiri || matches!(method, "GET" | "HEAD") || CONTAINER_MAY.contains(&(method, path))
 }
 
+/// Whether an integrated WSL distro (`Caller::Wsl`) may make this request.
+/// Refuses host-level engine administration and store-migration endpoints.
+fn wsl_may(method: &str, path: &str) -> bool {
+    !matches!(
+        (method, path),
+        ("POST", "/kiri/storage" | "/kiri/storage/check" | "/kiri/storage/reset" | "/kiri/storage/retry")
+            | ("DELETE", "/kiri/storage/old")
+            | ("POST", "/kiri/proxy")
+            | ("PUT", "/kiri/proxy/system")
+            | ("POST", "/kiri/registries")
+            | ("POST" | "DELETE", "/kiri/domains")
+            | ("POST", "/kiri/resources")
+            | ("POST", "/kiri/builder")
+            | ("POST", "/kiri/fs-events")
+            | ("POST", "/kiri/win-ports")
+            | ("PUT", "/kiri/roots/host")
+            | ("POST", "/kiri/wsl")
+    )
+}
+
 fn route(req: &Request, engine: &Arc<Engine>, caller: &Caller, w: &mut UnixStream, r: &mut BufReader<UnixStream>) -> io::Result<Next> {
     if req.api_version.is_some_and(|v| v < http::MIN_API_VERSION) {
         let (major, minor) = req.api_version.unwrap_or_default();
@@ -158,6 +178,10 @@ fn route(req: &Request, engine: &Arc<Engine>, caller: &Caller, w: &mut UnixStrea
         // Closed after the answer: a body the request carried is not left
         // on the connection to be read as the next request.
         http::error(w, 403, "this is changed in Kiri's window or with the kiri command on this machine, not from a container")?;
+        return Ok(Next::Close);
+    }
+    if caller.wsl_distro().is_some() && !wsl_may(m, p) {
+        http::error(w, 403, "this setting is changed in Kiri on the host, not from an integrated WSL distro")?;
         return Ok(Next::Close);
     }
     // While Settings → Storage moves the data, nothing may change it.
@@ -187,7 +211,7 @@ fn route(req: &Request, engine: &Arc<Engine>, caller: &Caller, w: &mut UnixStrea
         // The window's Stop: off until Start, whatever asks for the VM meanwhile.
         ("POST", "/kiri/stop") => return reply(w, engine.stop_all().map(|()| Value::Null), 204),
         ("POST", "/kiri/sleep") => return reply(w, engine.sleep_now().map(|()| Value::Null), 204),
-        ("GET", "/kiri/proxy") => return reply(w, Ok(super::proxy::report()), 200),
+        ("GET", "/kiri/proxy") => return reply(w, Ok(super::proxy::report_for(caller)), 200),
         ("POST", "/kiri/proxy") => return reply(w, set_proxy(req), 200),
         ("PUT", "/kiri/proxy/system") => return reply(w, set_host_proxy(req), 200),
         // kiri-win's Windows roots, for the engine in WSL (#303).
@@ -540,7 +564,7 @@ fn info(engine: &Engine) -> Value {
         "CgroupVersion": "2",
         "DefaultRuntime": "kiri",
         "Runtimes": {"kiri": {"path": "kiri-init"}},
-        "SecurityOptions": ["name=seccomp,profile=builtin", "name=cgroupns"],
+        "SecurityOptions": super::apparmor::info_option().into_iter().chain(["name=seccomp,profile=builtin", "name=cgroupns"]).collect::<Vec<_>>(),
         // Compose needs it to attach in `up` and `logs -f` (#346).
         "SystemTime": time::rfc3339(std::time::SystemTime::now()),
         // Not in Docker's /info (the ping's Builder-Version header is), but
@@ -601,11 +625,42 @@ pub(super) fn image_labels_from(cfg: &Value) -> Value {
     }
 }
 
+fn is_image_reserved_label(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    lower == "dev.kiri"
+        || lower.starts_with("dev.kiri.")
+        || lower == "com.docker.compose"
+        || lower.starts_with("com.docker.compose.")
+}
+
+fn is_host_only_control_label(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    matches!(lower.as_str(), "dev.kiri.k8s" | "dev.kiri.machine" | "dev.kiri.builder")
+        || lower.starts_with("dev.kiri.k8s.")
+        || lower.starts_with("dev.kiri.machine.")
+        || lower.starts_with("dev.kiri.builder.")
+}
+
+fn sanitize_request_labels(body_labels: &Value, caller: &Caller) -> Value {
+    if *caller == Caller::Host {
+        return body_labels.clone();
+    }
+    let Value::Object(map) = body_labels else { return body_labels.clone() };
+    let filtered: serde_json::Map<String, Value> = map
+        .iter()
+        .filter(|(k, _)| !is_host_only_control_label(k))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    Value::Object(filtered)
+}
+
 fn merge_labels(image_cfg: &Value, body_labels: &Value) -> Value {
     let mut merged = serde_json::Map::new();
     if let Value::Object(img) = &image_cfg["config"]["Labels"] {
         for (k, v) in img {
-            merged.insert(k.clone(), v.clone());
+            if !is_image_reserved_label(k) {
+                merged.insert(k.clone(), v.clone());
+            }
         }
     }
     if let Value::Object(req) = body_labels {
@@ -746,8 +801,11 @@ fn image_inspect(engine: &Engine, name: &str) -> Result<Value, Error> {
 fn image_remove(engine: &Engine, name: &str, force: bool) -> Result<Value, Error> {
     let i = engine.image(name)?.ok_or_else(|| Error::NotFound(format!("No such image: {name}")))?;
     // With another tag on the same image, removing this one only untags it.
-    let other_tags = engine.store.images()?.iter().any(|o| o.config_digest == i.config_digest && o.name != i.name);
-    let in_use = if other_tags { Vec::new() } else { engine.each(|c| (c.spec.image_id == i.config_digest).then(|| c.short_id().to_owned())) };
+    // Another image sharing `config_digest` with different layer blobs is NOT
+    // another tag on these blobs, so removing this one still checks containers.
+    let other_tags = engine.store.images()?.iter().any(|o| o.config_digest == i.config_digest && o.name != i.name && o.layers == i.layers);
+    let mine = |c: &super::engine::Container| c.layers.is_empty() || c.layers.iter().eq(i.layers.iter().rev().map(|l| &l.digest));
+    let in_use = if other_tags { Vec::new() } else { engine.each(|c| (c.spec.image_id == i.config_digest && mine(c)).then(|| c.short_id().to_owned())) };
     if let Some(c) = in_use.first() {
         return Err(Error::Conflict(format!(
             "conflict: unable to remove repository reference \"{name}\" (must force) - container {c} is using its referenced image"
@@ -1786,16 +1844,91 @@ const MAC_ROOT: &str = "";
 const MAC_SHARES: &[&str] = &["/Users", "/Volumes", "/private", "/tmp", "/var/folders"];
 
 fn mac_shared(src: &str) -> bool {
-    MAC_SHARES.iter().any(|s| src.strip_prefix(s).is_some_and(|rest| rest.is_empty() || rest.starts_with('/')))
+    let clean = lexical_path(src);
+    MAC_SHARES.iter().any(|s| clean.strip_prefix(s).is_some_and(|rest| rest.is_empty() || rest.starts_with('/')))
+}
+
+/// Resolves the deepest existing prefix of `clean` (an already `lexical_path`-normalized
+/// path) via `std::fs::canonicalize`, following dangling symlinks up to 40 hops,
+/// and appends any trailing non-existent components.
+fn resolve_mac_deepest(raw_src: &str, clean: &str) -> Result<String, Error> {
+    use std::path::{Component, Path, PathBuf};
+    let bad = |why: &str| Error::BadRequest(format!("invalid mount source {raw_src}: {why}"));
+    let mut cur = PathBuf::from(clean);
+    let mut hops = 0usize;
+    loop {
+        let mut prefix = cur.clone();
+        let mut tail: Vec<String> = Vec::new();
+        while prefix != Path::new("/") {
+            match std::fs::symlink_metadata(&prefix) {
+                Ok(_) => break,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    let Some(name) = prefix.file_name().and_then(|n| n.to_str()).map(str::to_owned) else {
+                        return Err(bad("invalid path encoding"));
+                    };
+                    tail.push(name);
+                    if !prefix.pop() {
+                        break;
+                    }
+                }
+                Err(e) => return Err(Error::Io(e)),
+            }
+        }
+        match std::fs::canonicalize(&prefix) {
+            Ok(mut real) => {
+                for comp in tail.into_iter().rev() {
+                    real.push(comp);
+                }
+                let s = real.into_os_string().into_string().map_err(|_| bad("invalid UTF-8 in resolved path"))?;
+                return Ok(lexical_path(&s));
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                // `prefix` or an ancestor is a dangling symlink: expand the first symlink along `cur`.
+                let comps: Vec<String> = cur
+                    .components()
+                    .filter_map(|c| match c {
+                        Component::Normal(n) => n.to_str().map(str::to_owned),
+                        _ => None,
+                    })
+                    .collect();
+                let mut built = PathBuf::from("/");
+                let mut expanded = false;
+                for (i, comp) in comps.iter().enumerate() {
+                    let next = built.join(comp);
+                    if let Ok(link) = std::fs::read_link(&next) {
+                        hops += 1;
+                        if hops > 40 {
+                            return Err(bad("too many levels of symbolic links"));
+                        }
+                        let mut target = if link.is_absolute() { link } else { built.join(link) };
+                        for rest in &comps[i + 1..] {
+                            target.push(rest);
+                        }
+                        let t_str = target.to_str().ok_or_else(|| bad("invalid UTF-8 in symlink target"))?;
+                        cur = PathBuf::from(lexical_path(t_str));
+                        expanded = true;
+                        break;
+                    }
+                    built = next;
+                }
+                if !expanded {
+                    let c_str = cur.to_str().ok_or_else(|| bad("invalid UTF-8 in path"))?;
+                    return Ok(lexical_path(c_str));
+                }
+            }
+            Err(e) => return Err(bad(&e.to_string())),
+        }
+    }
 }
 
 /// A bind source that is the Mac's, as the path the Mac really keeps it at;
-/// None for one that is the VM's own.
+/// `Ok(None)` for one that is the VM's own, or `Err(BadRequest)` if a path in
+/// `MAC_SHARES` traverses a symlink escaping `MAC_SHARES`.
 ///
 /// Links are followed here, on the Mac, as Docker follows a bind source's:
 /// the guest sees the Mac under /mnt/mac, where a link to an absolute path
 /// (/private/etc/localtime, a project folder linked from elsewhere) leads
-/// nowhere. A path whose links leave the shares is left as given.
+/// nowhere.
 ///
 /// /etc is the Mac's link to /private/etc, and Compose files written for a
 /// Linux host mount paths in it:
@@ -1805,46 +1938,53 @@ fn mac_shared(src: &str) -> bool {
 /// - anything else the Mac has there (/etc/hosts, /etc/localtime) is the
 ///   Mac's.
 /// - what the Mac lacks stays the VM's.
-fn mac_source(src: &str) -> Option<String> {
-    let real = std::fs::canonicalize(src).ok().and_then(|p| p.into_os_string().into_string().ok()).filter(|p| mac_shared(p));
-    if mac_shared(src) {
-        return Some(real.unwrap_or_else(|| src.to_owned()));
+fn mac_source(src: &str) -> Result<Option<String>, Error> {
+    let clean = lexical_path(src);
+    if mac_shared(&clean) {
+        let resolved = resolve_mac_deepest(src, &clean)?;
+        if !mac_shared(&resolved) {
+            return Err(Error::BadRequest(format!(
+                "invalid mount source {src}: symlink target {resolved} leaves shared Mac directories"
+            )));
+        }
+        return Ok(Some(resolved));
     }
-    let kept = match src.strip_prefix("/etc/") {
+    let kept = match clean.strip_prefix("/etc/") {
         Some(name) if super::hostetc::FILES.contains(&name) => Some(super::hostetc::file(name)),
-        None if src == "/etc" => Some(super::hostetc::all()),
+        None if clean == "/etc" => Some(super::hostetc::all()),
         _ => None,
     };
     if let Some(kept) = kept {
         // Kiri's data folder is in the person's home, which is shared. If
         // it cannot be written, the path is the VM's, as it was.
-        return kept.ok().and_then(|p| p.into_os_string().into_string().ok()).filter(|p| mac_shared(p));
+        return Ok(kept.ok().and_then(|p| p.into_os_string().into_string().ok()).filter(|p| mac_shared(p)));
     }
-    if src.strip_prefix("/etc").is_some_and(|rest| rest.is_empty() || rest.starts_with('/')) { real } else { None }
+    if clean.strip_prefix("/etc").is_some_and(|rest| rest.is_empty() || rest.starts_with('/')) {
+        let real = std::fs::canonicalize(&clean)
+            .ok()
+            .and_then(|p| p.into_os_string().into_string().ok())
+            .filter(|p| mac_shared(p));
+        Ok(real)
+    } else {
+        Ok(None)
+    }
 }
 
 /// Where the guest finds a host path given for a bind: the Mac's own under
 /// the shares, else the VM's (on Linux, the host's).
-fn guest_bind_source(src: &str) -> String {
+fn guest_bind_source(src: &str) -> Result<String, Error> {
     if !cfg!(target_os = "macos") {
-        return src.to_owned();
+        return Ok(src.to_owned());
     }
-    mac_source(src).map_or_else(|| src.to_owned(), |real| format!("{MAC_ROOT}{real}"))
+    Ok(mac_source(src)?.map_or_else(|| src.to_owned(), |real| format!("{MAC_ROOT}{real}")))
 }
 
-/// The guest mount lines with each Mac bind source followed again from the
-/// path the person gave (kept in `info`, one entry per line). Links are
-/// resolved when the container is made; this redoes it at start, so a link
-/// re-pointed since then leads to its new target. On a Linux host (and
-/// WSL) only a bind of the engine's socket is looked at again, so a
-/// container made before Kiri gave containers a socket of their own gets
-/// it now: by the path the person gave, or else by the path mounted when
-/// it was made, every line, whether or not `info` has one for it. Other
-/// lines stay as they are.
-pub(super) fn fresh_bind_sources(guest: &[String], info: &[Value]) -> Vec<String> {
+#[cfg(test)]
+fn fresh_bind_sources(guest: &[String], info: &[Value]) -> Vec<String> {
     fresh_bind_sources_with(guest, info, super::binds::engine_socket, cfg!(target_os = "macos"))
 }
 
+#[cfg(test)]
 fn fresh_bind_sources_with(guest: &[String], info: &[Value], engine_socket: impl Fn(&str) -> Option<String>, mac: bool) -> Vec<String> {
     let paired = guest.len() == info.len();
     if mac && !paired {
@@ -1873,9 +2013,239 @@ fn fresh_bind_sources_with(guest: &[String], info: &[Value], engine_socket: impl
             if !old.strip_prefix(MAC_ROOT).is_some_and(|p| p.starts_with('/')) {
                 return line.clone();
             }
-            format!("{}\t{rest}", guest_bind_source(src))
+            guest_bind_source(src).map_or_else(|_| line.clone(), |fresh| format!("{fresh}\t{rest}"))
         })
         .collect()
+}
+
+/// Revalidates stored `spec.mounts` and `spec.mount_info` at container `start`
+/// and `docker cp` time, refusing stale pre-fix `/mnt/mac` shares, symlink
+/// escapes, tab-smuggled `Destination` fields, and disallowed volume drivers,
+/// while refreshing Mac bind symlinks and Linux/WSL socket paths.
+pub(super) fn revalidate_and_refresh_mounts(engine: &Engine, guest: &[String], info: &[Value]) -> Result<Vec<String>, Error> {
+    revalidate_mounts_for(engine, guest, info, super::binds::engine_socket, cfg!(target_os = "macos"))
+}
+
+fn revalidate_mounts_for(
+    engine: &Engine,
+    guest: &[String],
+    info: &[Value],
+    engine_socket: impl Fn(&str) -> Option<String>,
+    mac: bool,
+) -> Result<Vec<String>, Error> {
+    let mac_root = if mac { "/mnt/mac" } else { "" };
+    for m in info {
+        let dst = m["Destination"].as_str().unwrap_or("");
+        if !dst.starts_with('/') || dst.split('/').any(|c| c == "..") {
+            return Err(Error::BadRequest(format!("invalid mount target {dst:?}")));
+        }
+        wire_text("mount target", dst)?;
+        let src = m["Source"].as_str().unwrap_or("");
+        wire_text("mount source", src)?;
+    }
+
+    let paired = info.len() == guest.len();
+    let mut out = Vec::with_capacity(guest.len());
+
+    for (idx, line) in guest.iter().enumerate() {
+        if line.bytes().any(|b| matches!(b, b'\n' | b'\r' | 0)) {
+            return Err(Error::BadRequest(format!("invalid mount line {line:?}: contains control character")));
+        }
+        let f: Vec<&str> = line.split('\t').collect();
+        if f.len() != 3 && f.len() != 7 {
+            return Err(Error::BadRequest(format!("invalid mount line {line:?}: unexpected field count")));
+        }
+        let (old_src, dst, words) = (f[0], f[1], f[2]);
+        if !dst.starts_with('/') || dst.split('/').any(|c| c == "..") {
+            return Err(Error::BadRequest(format!("invalid mount target {dst:?}")));
+        }
+        let is_tmpfs_line = words.split(',').any(|w| w == "tmpfs");
+
+        if paired {
+            let m = &info[idx];
+            if m["Destination"].as_str() != Some(dst) {
+                return Err(Error::BadRequest(format!(
+                    "mount target mismatch between mount_info ({:?}) and guest mount ({dst:?})",
+                    m["Destination"].as_str()
+                )));
+            }
+            match m["Type"].as_str() {
+                Some("bind") => {
+                    if f.len() != 3 || is_tmpfs_line {
+                        return Err(Error::BadRequest(format!("invalid bind mount line {line:?}")));
+                    }
+                    let src = m["Source"].as_str().unwrap_or("");
+                    if src.is_empty() {
+                        return Err(Error::BadRequest("invalid bind mount: empty source".into()));
+                    }
+                    if guest_share_path(src, mac_root) {
+                        return Err(Error::BadRequest(format!(
+                            "invalid mount source {src}: {mac_root} exists only inside the VM; name the Mac's own path, such as /Users/…"
+                        )));
+                    }
+                    if !mac {
+                        if is_ssh_agent_sock(old_src) || is_ssh_agent_sock(src) {
+                            out.push(format!("{}\t{dst}\t{words}", ssh_agent_source_for(true)));
+                            continue;
+                        }
+                        let given = engine_socket(src).or_else(|| old_src.starts_with('/').then(|| engine_socket(old_src)).flatten());
+                        if let Some(given) = given {
+                            out.push(format!("{given}\t{dst}\t{words}"));
+                        } else {
+                            if !old_src.starts_with('/') {
+                                return Err(Error::BadRequest(format!("invalid bind mount source {old_src:?}")));
+                            }
+                            out.push(line.clone());
+                        }
+                        continue;
+                    }
+                    if engine_socket(src).is_some() {
+                        if guest_share_path(old_src, mac_root) {
+                            return Err(Error::BadRequest(format!("invalid engine socket mount {old_src:?}")));
+                        }
+                        out.push(line.clone());
+                        continue;
+                    }
+                    if ssh_agent_bind_for(src, true).is_some() {
+                        out.push(format!("{}\t{dst}\t{words}", ssh_agent_source_for(false)));
+                        continue;
+                    }
+                    if !src.starts_with('/') {
+                        return Err(Error::BadRequest(format!("invalid mount source {src}: must be an absolute path")));
+                    }
+                    let fresh = match mac_source(src)? {
+                        Some(real) => format!("{mac_root}{real}"),
+                        None => {
+                            if guest_share_path(old_src, mac_root) {
+                                return Err(Error::BadRequest(format!(
+                                    "invalid mount source {old_src}: {mac_root} exists only inside the VM"
+                                )));
+                            }
+                            old_src.to_owned()
+                        }
+                    };
+                    out.push(format!("{fresh}\t{dst}\t{words}"));
+                }
+                Some("volume") => {
+                    if !old_src.starts_with("/var/lib/kiri/volumes/") || old_src.split('/').any(|c| c == "..") {
+                        return Err(Error::BadRequest(format!("invalid volume mount source {old_src:?}")));
+                    }
+                    let vol_name = m["Name"].as_str().unwrap_or("");
+                    let vol_record = (!vol_name.is_empty()).then(|| engine.volume_get(vol_name)).flatten();
+                    if let Some(v) = &vol_record {
+                        check_volume_device_for(&v.options, mac_root)?;
+                        let (opt_flags, _) = super::volumes::mount_options(v.options.get("o").map_or("", String::as_str));
+                        if opt_flags & 4096 != 0 {
+                            let raw_dev = v.options.get("device").map_or("", String::as_str);
+                            let trans = volume_bind_source(raw_dev, super::binds::wsl(), v.wsl_distro.as_deref())?;
+                            if guest_share_path(&trans, mac_root) {
+                                return Err(Error::BadRequest(format!("invalid volume bind device {raw_dev}")));
+                            }
+                            if mac {
+                                mac_source(&trans)?;
+                            }
+                        }
+                        if v.options.is_empty() && f.len() != 3 {
+                            return Err(Error::BadRequest(format!(
+                                "plain volume {vol_name:?} cannot carry driver mount fields"
+                            )));
+                        }
+                    }
+                    if f.len() == 7 {
+                        let (kind, dev, flags_hex, data) = (f[3], f[4], f[5], f[6]);
+                        let flags = u64::from_str_radix(flags_hex, 16)
+                            .map_err(|_| Error::BadRequest(format!("invalid volume mount flags {flags_hex:?}")))?;
+                        if flags & 4096 != 0 {
+                            if mac && vol_record.is_none() {
+                                return Err(Error::BadRequest(format!(
+                                    "bind volume {vol_name:?} is missing its volume record"
+                                )));
+                            }
+                            check_volume_fields(kind, dev, flags, data, false, mac_root)?;
+                            if let Some(v) = &vol_record
+                                && mac
+                            {
+                                let raw_dev = v.options.get("device").map_or("", String::as_str);
+                                let trans = volume_bind_source(raw_dev, super::binds::wsl(), v.wsl_distro.as_deref())?;
+                                let fresh_dev = mac_source(&trans)?.map_or(trans, |r| format!("{mac_root}{r}"));
+                                out.push(format!("{old_src}\t{dst}\t{words}\t{kind}\t{fresh_dev}\t{flags_hex}\t{data}"));
+                                continue;
+                            }
+                        } else {
+                            check_volume_fields(kind, dev, flags, data, false, mac_root)?;
+                        }
+                    }
+                    out.push(line.clone());
+                }
+                Some("tmpfs") => {
+                    if f.len() != 3 || !is_tmpfs_line {
+                        return Err(Error::BadRequest(format!("invalid tmpfs mount line {line:?}")));
+                    }
+                    out.push(line.clone());
+                }
+                other => {
+                    return Err(Error::BadRequest(format!("unsupported mount type {other:?}")));
+                }
+            }
+            continue;
+        }
+
+        // Unpaired (`info.len() != guest.len()`).
+        if f.len() == 7 {
+            if !old_src.starts_with("/var/lib/kiri/volumes/") || old_src.split('/').any(|c| c == "..") {
+                return Err(Error::BadRequest(format!("invalid volume mount source {old_src:?}")));
+            }
+            let (kind, dev, flags_hex, data) = (f[3], f[4], f[5], f[6]);
+            let flags = u64::from_str_radix(flags_hex, 16)
+                .map_err(|_| Error::BadRequest(format!("invalid volume mount flags {flags_hex:?}")))?;
+            if mac && flags & 4096 != 0 {
+                return Err(Error::BadRequest(
+                    "bind volume mount without matching mount_info is refused on macOS".into(),
+                ));
+            }
+            check_volume_fields(kind, dev, flags, data, false, mac_root)?;
+            out.push(line.clone());
+            continue;
+        }
+
+        if is_tmpfs_line {
+            out.push(line.clone());
+            continue;
+        }
+        if !old_src.starts_with('/') {
+            return Err(Error::BadRequest(format!("invalid mount source {old_src:?}")));
+        }
+        if !mac {
+            if is_ssh_agent_sock(old_src) {
+                out.push(format!("{}\t{dst}\t{words}", ssh_agent_source_for(true)));
+                continue;
+            }
+            if let Some(given) = engine_socket(old_src) {
+                out.push(format!("{given}\t{dst}\t{words}"));
+                continue;
+            }
+            out.push(line.clone());
+            continue;
+        }
+        // Unpaired 3-field mount on macOS: allow plain volumes, tmpfs, and VM
+        // paths/sockets; refuse any raw `/mnt/mac` share path, ancestor, or `/proc` escape.
+        if old_src.starts_with("/var/lib/kiri/volumes/") && !old_src.split('/').any(|c| c == "..") {
+            out.push(line.clone());
+            continue;
+        }
+        if is_ssh_agent_sock(old_src) || engine_socket(old_src).is_some() {
+            out.push(line.clone());
+            continue;
+        }
+        if guest_share_path(old_src, mac_root) {
+            return Err(Error::BadRequest(format!(
+                "invalid mount source {old_src}: {mac_root} exists only inside the VM"
+            )));
+        }
+        out.push(line.clone());
+    }
+
+    Ok(out)
 }
 
 /// Parses `--add-host name:ip` entries into `/etc/hosts` lines (`ip\tname`).
@@ -1916,15 +2286,46 @@ fn resolve_server(host: &str) -> Option<String> {
     addrs.iter().find(|a| a.is_ipv4()).or(addrs.first()).map(|a| a.ip().to_string())
 }
 
-/// Whether `src` names the mount point the guest keeps the Mac's folders at.
+/// Whether a lexically normalized `/proc/...` path is `/proc` itself or
+/// traverses `/proc/<pid|self|thread-self>` magic links (`root`, `cwd`, `fd`,
+/// `fdinfo`, `map_files`, or `task/<tid>/...`).
+fn is_proc_magic_path(clean: &str) -> bool {
+    if clean == "/proc" {
+        return true;
+    }
+    let Some(rest) = clean.strip_prefix("/proc/") else { return false };
+    let parts: Vec<&str> = rest.split('/').collect();
+    let is_pid = |s: &str| matches!(s, "self" | "thread-self") || (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()));
+    if !parts.first().is_some_and(|p| is_pid(p)) {
+        return false;
+    }
+    if parts.len() == 1 || matches!(parts[1], "root" | "cwd" | "fd" | "fdinfo" | "map_files") {
+        return true;
+    }
+    if parts[1] == "task" {
+        return parts.len() <= 3
+            || (is_pid(parts[2]) && matches!(parts[3], "root" | "cwd" | "fd" | "fdinfo" | "map_files"));
+    }
+    false
+}
+
+/// Whether `src` names the mount point the guest keeps the Mac's folders at,
+/// an ancestor of it (`/` or `/mnt`), or a `/proc/<pid>/root` traversal that
+/// could reach it inside the VM.
 ///
 /// `root` is empty on a Linux host, where the agent sees the host's own
 /// paths and there is no share to name.
 fn guest_share_path(src: &str, root: &str) -> bool {
-    // Compared as the guest kernel will read it: `/mnt//mac`, `/mnt/./mac`
-    // and `/mnt/x/../mac` all name the share.
-    let src = lexical_path(src);
-    root.starts_with('/') && (src == root || src.strip_prefix(root).is_some_and(|rest| rest.starts_with('/')))
+    if !src.starts_with('/') || !root.starts_with('/') {
+        return false;
+    }
+    let clean = lexical_path(src);
+    let r = lexical_path(root);
+    clean == r
+        || clean.strip_prefix(&r).is_some_and(|rest| rest.starts_with('/'))
+        || clean == "/"
+        || r.strip_prefix(&clean).is_some_and(|rest| rest.starts_with('/'))
+        || is_proc_magic_path(&clean)
 }
 
 /// An absolute path with empty and `.` components dropped and `..` applied.
@@ -1942,24 +2343,101 @@ fn lexical_path(p: &str) -> String {
     format!("/{}", out.join("/"))
 }
 
-/// Refuses volume driver options that would mount the VM's own shares.
-///
-/// The guest mounts a volume's `device` itself, as root, before the container
-/// starts, so a `type=virtiofs` volume (`device=kiri-mac`) or a bind of
-/// `/mnt/mac` would hand the container the share without `-v` naming it.
-fn check_volume_device(options: &std::collections::BTreeMap<String, String>) -> Result<(), Error> {
-    let kind = options.get("type").map_or("", String::as_str);
-    if kind.eq_ignore_ascii_case("virtiofs") {
-        return Err(Error::BadRequest("invalid volume option type=virtiofs: the VM's shares cannot be mounted as a volume".into()));
+fn is_dev_volume_device(device: &str) -> bool {
+    if device == "/dev" || device.starts_with("/dev/") {
+        return true;
     }
-    let device = options.get("device").map_or("", String::as_str);
-    let (flags, _) = super::volumes::mount_options(options.get("o").map_or("", String::as_str));
-    if flags & 4096 != 0 && guest_share_path(device, MAC_ROOT) {
-        return Err(Error::BadRequest(format!(
-            "invalid volume option device={device}: {MAC_ROOT} exists only inside the VM; name the Mac's own path, such as /Users/…"
-        )));
+    if device.starts_with('/') {
+        let clean = lexical_path(device);
+        return clean == "/dev" || clean.starts_with("/dev/");
+    }
+    false
+}
+
+fn check_volume_fields(
+    kind: &str,
+    device: &str,
+    flags: u64,
+    data: &str,
+    check_host_mac_bind: bool,
+    mac_root: &str,
+) -> Result<(), Error> {
+    wire_text("volume option type", kind)?;
+    wire_text("volume option device", device)?;
+    wire_text("volume option o", data)?;
+    if flags & 32 != 0 {
+        return Err(Error::BadRequest("invalid volume option o=remount: remount is not allowed".into()));
+    }
+    if flags & 4096 != 0 {
+        if kind.eq_ignore_ascii_case("virtiofs") {
+            return Err(Error::BadRequest(
+                "invalid volume option type=virtiofs: the VM's shares cannot be mounted as a volume".into(),
+            ));
+        }
+        if !device.starts_with('/') {
+            return Err(Error::BadRequest(format!(
+                "invalid volume option device={device}: bind volume device must be an absolute path"
+            )));
+        }
+        if check_host_mac_bind {
+            if guest_share_path(device, mac_root) {
+                return Err(Error::BadRequest(format!(
+                    "invalid volume option device={device}: {mac_root} exists only inside the VM; name the Mac's own path, such as /Users/…"
+                )));
+            }
+            if mac_root.starts_with('/') {
+                mac_source(device)?;
+            }
+        }
+        return Ok(());
+    }
+    match kind {
+        "tmpfs" => {
+            if device.is_empty() || is_dev_volume_device(device) {
+                return Err(Error::BadRequest(format!("invalid tmpfs volume device: {device:?}")));
+            }
+        }
+        "nfs" | "nfs4" => {
+            if !device.contains(':') || is_dev_volume_device(device) {
+                return Err(Error::BadRequest(format!("invalid {kind} volume device: {device:?}")));
+            }
+        }
+        "cifs" | "smb3" => {
+            if !device.starts_with("//") || device.len() <= 2 || device[2..].starts_with('/') {
+                return Err(Error::BadRequest(format!("invalid {kind} volume device: {device:?}")));
+            }
+        }
+        _ => {
+            return Err(Error::BadRequest(format!(
+                "invalid volume option type={kind}: Kiri supports only bind, tmpfs, nfs/nfs4, and cifs/smb3 volumes"
+            )));
+        }
     }
     Ok(())
+}
+
+/// Validates local volume driver options against Kiri's strict allowlist so
+/// arbitrary block devices (`/dev/vda`), kernel filesystems (`virtiofs`,
+/// `ext4`, `proc`, `sysfs`, …), `remount`, and VM share escapes are refused.
+fn check_volume_device(options: &std::collections::BTreeMap<String, String>) -> Result<(), Error> {
+    check_volume_device_for(options, MAC_ROOT)
+}
+
+fn check_volume_device_for(options: &std::collections::BTreeMap<String, String>, mac_root: &str) -> Result<(), Error> {
+    for (k, val) in options {
+        wire_text(&format!("volume option {k}"), val)?;
+    }
+    let kind = options.get("type").map_or("", String::as_str);
+    let device = options.get("device").map_or("", String::as_str);
+    let o = options.get("o").map_or("", String::as_str);
+    if kind.is_empty() && device.is_empty() && o.is_empty() {
+        return Ok(());
+    }
+    let (flags, data) = super::volumes::mount_options(o);
+    if kind.is_empty() && flags & 4096 == 0 {
+        return Err(Error::BadRequest("invalid volume options: missing volume filesystem type".into()));
+    }
+    check_volume_fields(kind, device, flags, &data, true, mac_root)
 }
 
 /// Resolves a local bind volume's `device` path for WSL integration or Windows
@@ -1978,13 +2456,15 @@ fn validate_volume_options(
     wsl: Option<&super::binds::Wsl>,
     wsl_distro: Option<&str>,
 ) -> Result<(), Error> {
-    check_volume_device(options)?;
     let (flags, _) = super::volumes::mount_options(options.get("o").map_or("", String::as_str));
-    if flags & 4096 != 0 {
+    if flags & 4096 != 0 && (wsl.is_some() || wsl_distro.is_some()) {
         let device = options.get("device").map_or("", String::as_str);
-        volume_bind_source(device, wsl, wsl_distro)?;
+        let translated = volume_bind_source(device, wsl, wsl_distro)?;
+        let mut checked = options.clone();
+        checked.insert("device".into(), translated);
+        return check_volume_device(&checked);
     }
-    Ok(())
+    check_volume_device(options)
 }
 
 /// Refuses text that would forge a field in the tab-separated mount line the
@@ -2184,7 +2664,7 @@ fn mounts_for(body: &Value, engine: &Engine, image: &kiri_image::Image, caller: 
                 }
                 // Where the source is on this machine: itself, or on a Mac
                 // the path it leads to (a file Kiri keeps for /etc/passwd).
-                let here = if cfg!(target_os = "macos") { mac_source(src) } else { Some(src.to_owned()) };
+                let here = if cfg!(target_os = "macos") { mac_source(src)? } else { Some(src.to_owned()) };
                 let Some(here) = here else {
                     // The guest makes a missing source itself, as Docker does on Linux.
                     out.guest.push(format!("{src}\t{dst}\t{}", flag(if create_missing { "create" } else { "" })));
@@ -2193,7 +2673,7 @@ fn mounts_for(body: &Value, engine: &Engine, image: &kiri_image::Image, caller: 
                 };
                 prepare_bind_source(src, &here, create_missing)?;
                 // After a missing source was made, so its links are followed too.
-                out.guest.push(format!("{}\t{dst}\t{}", guest_bind_source(src), flag("")));
+                out.guest.push(format!("{}\t{dst}\t{}", guest_bind_source(src)?, flag("")));
                 out.info.push(json!({"Type": "bind", "Source": src, "Destination": dst, "Mode": "", "RW": !ro, "Propagation": "rprivate"}));
             }
             "volume" => {
@@ -2207,12 +2687,13 @@ fn mounts_for(body: &Value, engine: &Engine, image: &kiri_image::Image, caller: 
                 // The guest mounts a volume's device as root, so the share
                 // must not be reachable this way either: not as a virtiofs
                 // tag, and not as a bind of /mnt/mac.
-                check_volume_device(&v.options)?;
                 let vol_distro = v.wsl_distro.as_deref().or(wsl_distro);
+                validate_volume_options(&v.options, super::binds::wsl(), vol_distro)?;
                 let (opt_flags, _) = super::volumes::mount_options(v.options.get("o").map_or("", String::as_str));
-                let translated_bind_dev = if opt_flags & 4096 != 0 {
+                let bind_guest_dev = if opt_flags & 4096 != 0 {
                     let raw_dev = v.options.get("device").map_or("", String::as_str);
-                    Some(volume_bind_source(raw_dev, super::binds::wsl(), vol_distro)?)
+                    let translated = volume_bind_source(raw_dev, super::binds::wsl(), vol_distro)?;
+                    Some(guest_bind_source(&translated)?)
                 } else {
                     None
                 };
@@ -2222,7 +2703,7 @@ fn mounts_for(body: &Value, engine: &Engine, image: &kiri_image::Image, caller: 
                 // mounted at its path by the guest at start, then bound in.
                 let vol = super::volumes::guest_mount_fields(
                     &v.options,
-                    |dev| guest_bind_source(translated_bind_dev.as_deref().unwrap_or(dev)),
+                    |_| bind_guest_dev.clone().unwrap_or_default(),
                     resolve_server,
                 );
                 out.guest.push(format!("{path}\t{dst}\t{}{vol}", flag(copy)));
@@ -2927,6 +3408,8 @@ fn create_inner(req: &Request, engine: &Engine, caller: &Caller, record_wsl_dist
         super::seccomp::Choice::Unconfined => true,
         super::seccomp::Choice::Default => false,
     };
+    // So is an AppArmor profile name the kernel could not be asked for.
+    super::apparmor::choice(&security_opt).map_err(Error::BadRequest)?;
     // NetworkMode `bridge` too: Docker joins only the endpoints' networks
     // when there are any, whatever the mode names (k3d sends `bridge` with
     // its cluster network, #727), unless they list bridge.
@@ -3033,6 +3516,38 @@ fn create_inner(req: &Request, engine: &Engine, caller: &Caller, record_wsl_dist
     // The image's own config, for what Kiri's image model does not keep.
     let image_cfg = image_config_json(engine, &image.config_digest);
     // Checked before mounts, which may create volumes.
+    let pick = |field: &str, fallback: &str| match body[field].as_str() {
+        Some(s) if !s.is_empty() => s.to_owned(),
+        _ => fallback.to_owned(),
+    };
+    // The guest writes hostname, domainname, and DNS settings to /etc/hostname,
+    // /etc/hosts, and /etc/resolv.conf.
+    let hostname = pick("Hostname", "");
+    if !hostname.is_empty() && !valid_hostname(&hostname) {
+        return Err(Error::BadRequest(format!("invalid hostname ({hostname})")));
+    }
+    let domainname = body["Domainname"].as_str().unwrap_or_default().to_owned();
+    if !domainname.is_empty() && !valid_hostname(&domainname) {
+        return Err(Error::BadRequest(format!("invalid domainname ({domainname})")));
+    }
+    let dns = strings(&host["Dns"]).unwrap_or_default();
+    for d in &dns {
+        if d.parse::<std::net::IpAddr>().is_err() {
+            return Err(Error::BadRequest(format!("{d} is not an ip address")));
+        }
+    }
+    let dns_search = strings(&host["DnsSearch"]).unwrap_or_default();
+    for s in &dns_search {
+        if s.is_empty() || s.bytes().any(|b| b.is_ascii_control()) {
+            return Err(Error::BadRequest(format!("invalid dns search ({s})")));
+        }
+    }
+    let dns_options = strings(&host["DnsOptions"]).unwrap_or_default();
+    for o in &dns_options {
+        if o.is_empty() || o.bytes().any(|b| b.is_ascii_control()) {
+            return Err(Error::BadRequest(format!("invalid dns option ({o})")));
+        }
+    }
     let healthcheck = healthcheck_from(&body, &image_cfg)?;
     let (entrypoint, cmd) = command(strings(&body["Entrypoint"]), strings(&body["Cmd"]), &image.config.entrypoint, &image.config.cmd)?;
     let restart = restart_policy(&host["RestartPolicy"], true)?;
@@ -3062,15 +3577,7 @@ fn create_inner(req: &Request, engine: &Engine, caller: &Caller, record_wsl_dist
         env.retain(|x| x.split('=').next() != Some(key.as_str()));
         env.push(e);
     }
-    let pick = |field: &str, fallback: &str| match body[field].as_str() {
-        Some(s) if !s.is_empty() => s.to_owned(),
-        _ => fallback.to_owned(),
-    };
-    // The guest writes it to the container's /etc/hostname and /etc/hosts.
-    let hostname = pick("Hostname", "");
-    if !hostname.is_empty() && !valid_hostname(&hostname) {
-        return Err(Error::BadRequest(format!("invalid hostname ({hostname})")));
-    }
+    let req_labels = sanitize_request_labels(&body["Labels"], caller);
     let spec = Spec {
         image: image_name.to_owned(),
         image_id: image.config_digest.clone(),
@@ -3102,12 +3609,12 @@ fn create_inner(req: &Request, engine: &Engine, caller: &Caller, record_wsl_dist
         ipv6_address,
         mac_address,
         left_all_networks: false,
-        dns: strings(&host["Dns"]).unwrap_or_default(),
-        dns_search: strings(&host["DnsSearch"]).unwrap_or_default(),
-        dns_options: strings(&host["DnsOptions"]).unwrap_or_default(),
-        domainname: body["Domainname"].as_str().unwrap_or_default().to_owned(),
+        dns,
+        dns_search,
+        dns_options,
+        domainname,
         links,
-        labels: merge_labels(&image_cfg, &body["Labels"]),
+        labels: merge_labels(&image_cfg, &req_labels),
         tty: body["Tty"].as_bool().unwrap_or(false),
         open_stdin: body["OpenStdin"].as_bool().unwrap_or(false),
         console_size: console_size(&host["ConsoleSize"]),
@@ -3220,7 +3727,11 @@ pub(super) fn parse_link(l: &str) -> Option<(&str, &str)> {
     let (name, alias) = l.split_once(':').unwrap_or((l, l));
     let name = name.trim_start_matches('/');
     let alias = alias.rsplit('/').next().unwrap_or(alias);
-    (!name.is_empty() && !alias.is_empty()).then_some((name, alias))
+    (!name.is_empty()
+        && !name.bytes().any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
+        && valid_hosts_name(alias)
+        && !alias.bytes().any(|b| b.is_ascii_whitespace()))
+    .then_some((name, alias))
 }
 
 fn links_from(list: &[String], engine: &Engine) -> Result<Vec<super::engine::Link>, Error> {
@@ -3564,6 +4075,12 @@ fn inspect(c: &Container, nets: &[super::network::Network], anon_vols: &[String]
         "NetworkSettings": network_settings(c, nets),
         "Mounts": c.spec.mount_info,
     });
+    v["AppArmorProfile"] = json!(super::apparmor::inspect_profile(
+        &c.spec.security_opt,
+        c.spec.privileged,
+        c.started.is_some(),
+        super::apparmor::host(),
+    ));
     for key in ["MaskedPaths", "ReadonlyPaths"] {
         v["HostConfig"][key] = super::hostopts::system_paths(&c.spec.host_opts, key, c.spec.privileged);
     }
@@ -6280,9 +6797,23 @@ mod tests {
             w.write_all(bytes).unwrap();
             w.finish().unwrap()
         };
-        let config = json!({"os": "linux", "architecture": "amd64", "created": "2026-01-01T00:00:00Z", "config": {"Cmd": ["echo", "hi"]}});
+        let mut raw_tar = tar::Builder::new(Vec::new());
+        let mut h = tar::Header::new_ustar();
+        h.set_size(3);
+        h.set_mode(0o644);
+        h.set_entry_type(tar::EntryType::Regular);
+        raw_tar.append_data(&mut h, "etc/hi", &b"hi\n"[..]).unwrap();
+        let raw_tar = raw_tar.into_inner().unwrap();
+        let mut layer_gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        layer_gz.write_all(&raw_tar).unwrap();
+        let layer_gz = layer_gz.finish().unwrap();
+        let config = json!({
+            "os": "linux", "architecture": "amd64", "created": "2026-01-01T00:00:00Z",
+            "config": {"Cmd": ["echo", "hi"]},
+            "rootfs": {"type": "layers", "diff_ids": [kiri_image::store::sha256_digest(&raw_tar)]},
+        });
         let (cfg, _) = put(&serde_json::to_vec(&config).unwrap());
-        let (layer, size) = put(b"\x1f\x8bnot really gzip");
+        let (layer, size) = put(&layer_gz);
         let layers = vec![kiri_image::Layer { digest: layer, size, media_type: "application/vnd.docker.image.rootfs.diff.tar.gzip".into() }];
         let image = kiri_image::archive::from_config("demo:gz".into(), &cfg, &config, layers);
         let mut plain = Vec::new();
@@ -6337,9 +6868,22 @@ mod tests {
             w.finish().unwrap()
         };
         let make_manifest = |arch: &str| {
-            let cfg_bytes = serde_json::to_vec(&json!({"os": "linux", "architecture": arch, "created": "2026-01-01T00:00:00Z", "config": {"Cmd": [arch]}})).unwrap();
+            let mut lb = tar::Builder::new(Vec::new());
+            let payload = format!("layer-{arch}").into_bytes();
+            let mut h = tar::Header::new_ustar();
+            h.set_size(payload.len() as u64);
+            h.set_mode(0o644);
+            h.set_entry_type(tar::EntryType::Regular);
+            lb.append_data(&mut h, "etc/arch", payload.as_slice()).unwrap();
+            let layer_bytes = lb.into_inner().unwrap();
+            let (layer, layer_sz) = put(&layer_bytes);
+            let cfg_bytes = serde_json::to_vec(&json!({
+                "os": "linux", "architecture": arch, "created": "2026-01-01T00:00:00Z",
+                "config": {"Cmd": [arch]},
+                "rootfs": {"type": "layers", "diff_ids": [&layer]},
+            }))
+            .unwrap();
             let (cfg, cfg_sz) = put(&cfg_bytes);
-            let (layer, layer_sz) = put(format!("layer-{arch}").as_bytes());
             let man_bytes = serde_json::to_vec(&json!({
                 "schemaVersion": 2,
                 "config": {"mediaType": "application/vnd.oci.image.config.v1+json", "digest": cfg, "size": cfg_sz},
@@ -6347,7 +6891,7 @@ mod tests {
             }))
             .unwrap();
             let (man, man_sz) = put(&man_bytes);
-            (cfg, cfg_bytes, layer, format!("layer-{arch}").into_bytes(), man, man_bytes, man_sz)
+            (cfg, cfg_bytes, layer, layer_bytes, man, man_bytes, man_sz)
         };
         let amd = make_manifest("amd64");
         let arm = make_manifest("arm64");
@@ -6517,7 +7061,7 @@ mod tests {
         for p in ["/Users", "/Users/me/src", "/Volumes/ext", "/private/tmp/x", "/private/etc/hosts", "/tmp", "/tmp/kind", "/var/folders/ab/T"] {
             assert!(mac_shared(p), "{p} should come from the Mac");
         }
-        for p in ["/lib/modules", "/etc/hostname", "/var/lib/x", "/var", "/run/foo", "/Users2", "/tmpx", "/privatefoo", "/var/folders2", "/"] {
+        for p in ["/lib/modules", "/etc/hostname", "/var/lib/x", "/var", "/run/foo", "/Users2", "/tmpx", "/privatefoo", "/var/folders2", "/", "/Users/..", "/tmp/..", "/Users/me/../.."] {
             assert!(!mac_shared(p), "{p} should be the VM's");
         }
     }
@@ -6528,26 +7072,34 @@ mod tests {
     #[test]
     fn mac_sources_follow_links_and_etc_is_the_macs() {
         // /etc -> private/etc: -v /etc/hosts:/etc/hosts is the Mac's hosts file.
-        assert_eq!(mac_source("/etc/hosts").as_deref(), Some("/private/etc/hosts"));
-        assert_eq!(guest_bind_source("/etc/hosts"), "/mnt/mac/private/etc/hosts");
+        assert_eq!(mac_source("/etc/hosts").unwrap().as_deref(), Some("/private/etc/hosts"));
+        assert_eq!(guest_bind_source("/etc/hosts").unwrap(), "/mnt/mac/private/etc/hosts");
         // /etc/localtime links to an absolute path, which the guest could not follow.
-        let tz = mac_source("/etc/localtime").expect("the Mac has a time zone");
+        let tz = mac_source("/etc/localtime").unwrap().expect("the Mac has a time zone");
         assert!(tz.starts_with("/private/var/db/timezone/"), "{tz}");
-        assert_eq!(mac_source("/private/etc/localtime").as_deref(), Some(tz.as_str()));
+        assert_eq!(mac_source("/private/etc/localtime").unwrap().as_deref(), Some(tz.as_str()));
         // What the Mac lacks, and paths outside the shares, stay the VM's.
         for p in ["/etc/fstab", "/etc/kiri-no-such-file", "/lib/modules", "/var/lib/docker", "/var/run", "/etcetera"] {
-            assert_eq!(mac_source(p), None, "{p} should be the VM's");
-            assert_eq!(guest_bind_source(p), p);
+            assert_eq!(mac_source(p).unwrap(), None, "{p} should be the VM's");
+            assert_eq!(guest_bind_source(p).unwrap(), p);
         }
         // A link inside a share to another place in the shares is followed;
-        // a missing path under a share is passed as given.
+        // a missing path under /tmp resolves /tmp -> /private/tmp;
+        // a symlink escaping MAC_SHARES returns Err(BadRequest).
         let dir = std::env::temp_dir().join(format!("kiri-mac-source-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("real")).unwrap();
         std::os::unix::fs::symlink(dir.join("real"), dir.join("link")).unwrap();
+        std::os::unix::fs::symlink("../../../../../../..", dir.join("escape_root")).unwrap();
+        std::os::unix::fs::symlink("/System/Library", dir.join("escape_sys")).unwrap();
+        std::os::unix::fs::symlink("../../../../../../../nonexistent_outside_share", dir.join("escape_dangling")).unwrap();
         let real = std::fs::canonicalize(dir.join("real")).unwrap();
-        assert_eq!(mac_source(dir.join("link").to_str().unwrap()).as_deref(), real.to_str());
-        assert_eq!(mac_source("/tmp/kiri-no-such-path").as_deref(), Some("/tmp/kiri-no-such-path"));
+        assert_eq!(mac_source(dir.join("link").to_str().unwrap()).unwrap().as_deref(), real.to_str());
+        assert_eq!(mac_source("/tmp/kiri-no-such-path").unwrap().as_deref(), Some("/private/tmp/kiri-no-such-path"));
+        assert!(matches!(mac_source(dir.join("escape_root").to_str().unwrap()), Err(Error::BadRequest(_))));
+        assert!(matches!(mac_source(dir.join("escape_sys").to_str().unwrap()), Err(Error::BadRequest(_))));
+        assert!(matches!(mac_source(dir.join("escape_dangling").to_str().unwrap()), Err(Error::BadRequest(_))));
+        assert!(matches!(guest_bind_source(dir.join("escape_root").to_str().unwrap()), Err(Error::BadRequest(_))));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -6588,7 +7140,7 @@ mod tests {
         std::os::unix::fs::symlink("r1", &link).unwrap();
         let src = link.to_str().unwrap().to_owned();
         let at = |r: &str| format!("/mnt/mac{}\t/app\t", std::fs::canonicalize(dir.join(r)).unwrap().display());
-        let made = format!("{}\t/app\t", guest_bind_source(&src));
+        let made = format!("{}\t/app\t", guest_bind_source(&src).unwrap());
         assert_eq!(made, at("r1"));
         let guest = vec![made, "tmpfs\t/t\tnoexec".to_owned()];
         let info = vec![json!({"Type": "bind", "Source": src}), json!({"Type": "tmpfs", "Source": ""})];
@@ -7729,27 +8281,81 @@ mod network_option_tests {
         assert!(!super::guest_share_path("/mnt/macintosh/x", "/mnt/mac"));
         assert!(!super::guest_share_path("/Users/me", "/mnt/mac"));
         assert!(!super::guest_share_path("/mnt/mac", ""), "a Linux host has no share");
-        // Other spellings of the same path name the share too.
-        for p in ["/mnt//mac", "/mnt/./mac", "/mnt/x/../mac/Users", "//mnt/mac/", "/mnt/mac/."] {
+        assert!(!super::guest_share_path("/mnt", ""), "Linux /mnt stays open");
+        // Other spellings of the same path, ancestors (/ and /mnt), and /proc/<pid>/root traversals.
+        for p in [
+            "/mnt//mac",
+            "/mnt/./mac",
+            "/mnt/x/../mac/Users",
+            "//mnt/mac/",
+            "/mnt/mac/.",
+            "/",
+            "/mnt",
+            "/mnt/",
+            "/Users/..",
+            "/mnt/mac/..",
+            "/mnt/mac/Users/x/../../../../",
+            "/proc",
+            "/proc/self",
+            "/proc/thread-self",
+            "/proc/1",
+            "/proc/self/root/mnt/mac",
+            "/proc/1/root",
+            "/proc/self/cwd/mnt/mac",
+            "/proc/123/fd/3",
+            "/proc/self/fdinfo/0",
+            "/proc/self/map_files",
+            "/proc/1/task/1/root/mnt/mac",
+        ] {
             assert!(super::guest_share_path(p, "/mnt/mac"), "{p}");
         }
         assert!(!super::guest_share_path("/mnt/mac/../macintosh", "/mnt/mac"));
+        assert!(!super::guest_share_path("/proc/meminfo", "/mnt/mac"));
+        assert!(!super::guest_share_path("/proc/sys/kernel/osrelease", "/mnt/mac"));
     }
 
-    /// A volume's device is mounted by the guest as root, so it must not
-    /// reach the share either.
+    /// A volume's device is mounted by the guest as root, so it must pass the
+    /// strict filesystem and device allowlist and never reach the share.
     #[test]
     fn a_volume_cannot_mount_the_share() {
         let opts = |kv: &[(&str, &str)]| kv.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect::<std::collections::BTreeMap<_, _>>();
-        assert!(super::check_volume_device(&opts(&[("type", "virtiofs"), ("device", "kiri-mac")])).is_err());
-        assert!(super::check_volume_device(&opts(&[("type", "VirtioFS"), ("device", "rosetta")])).is_err());
-        if cfg!(target_os = "macos") {
-            assert!(super::check_volume_device(&opts(&[("type", "none"), ("o", "bind"), ("device", "/mnt/mac")])).is_err());
-            assert!(super::check_volume_device(&opts(&[("type", "none"), ("o", "bind"), ("device", "/mnt//mac/Users")])).is_err());
+        for bad in [
+            vec![("type", "virtiofs"), ("device", "kiri-mac")],
+            vec![("type", "VirtioFS"), ("device", "rosetta")],
+            vec![("type", "ext4"), ("device", "/dev/vda")],
+            vec![("type", "xfs"), ("device", "/dev/vda1")],
+            vec![("type", "btrfs"), ("device", "/dev/sda")],
+            vec![("type", "vfat"), ("device", "/dev/sdb1")],
+            vec![("type", "9p"), ("device", "share")],
+            vec![("type", "drvfs"), ("device", "C:")],
+            vec![("type", "proc"), ("device", "proc")],
+            vec![("type", "sysfs"), ("device", "sysfs")],
+            vec![("type", "cgroup2"), ("device", "cgroup2")],
+            vec![("type", "devtmpfs"), ("device", "udev")],
+            vec![("type", "overlay"), ("device", "overlay")],
+            vec![("type", ""), ("device", "/tmp/x")],
+            vec![("type", "tmpfs"), ("device", "")],
+            vec![("type", "tmpfs"), ("device", "/dev/vda")],
+            vec![("type", "tmpfs"), ("device", "/tmp/../dev/vda")],
+            vec![("type", "tmpfs"), ("device", "tmpfs"), ("o", "remount")],
+            vec![("type", "nfs"), ("device", "/export")],
+            vec![("type", "nfs"), ("device", "/dev/vda:/export")],
+            vec![("type", "cifs"), ("device", ":/share")],
+            vec![("type", "none"), ("o", "bind"), ("device", "relative/path")],
+            vec![("type", "none"), ("o", "bind,remount"), ("device", "/Users/me/data")],
+        ] {
+            assert!(super::check_volume_device(&opts(&bad)).is_err(), "{bad:?}");
         }
+        assert!(super::check_volume_device_for(&opts(&[("type", "none"), ("o", "bind"), ("device", "/mnt/mac")]), "/mnt/mac").is_err());
+        assert!(super::check_volume_device_for(&opts(&[("type", "none"), ("o", "bind"), ("device", "/mnt//mac/Users")]), "/mnt/mac").is_err());
+        assert!(super::check_volume_device_for(&opts(&[("type", "none"), ("o", "bind"), ("device", "/")]), "/mnt/mac").is_err());
+        assert!(super::check_volume_device_for(&opts(&[("type", "none"), ("o", "bind"), ("device", "/proc/self/root/mnt/mac")]), "/mnt/mac").is_err());
         // Ordinary volumes are untouched.
         assert!(super::check_volume_device(&opts(&[("type", "none"), ("o", "bind"), ("device", "/Users/me/data")])).is_ok());
         assert!(super::check_volume_device(&opts(&[("type", "nfs"), ("o", "addr=10.0.0.1"), ("device", ":/export")])).is_ok());
+        assert!(super::check_volume_device(&opts(&[("type", "nfs4"), ("device", "10.0.0.1:/export")])).is_ok());
+        assert!(super::check_volume_device(&opts(&[("type", "cifs"), ("device", "//10.0.0.1/share")])).is_ok());
+        assert!(super::check_volume_device(&opts(&[("type", "smb3"), ("device", "//10.0.0.1/share")])).is_ok());
         assert!(super::check_volume_device(&opts(&[("type", "tmpfs"), ("device", "tmpfs")])).is_ok());
         assert!(super::check_volume_device(&opts(&[])).is_ok());
     }
@@ -8277,5 +8883,183 @@ mod resources_disk_tests {
         swap_payload(&mut v, 2048, 1024);
         assert_eq!(v, json!({"swap_mib": 2048, "running_swap_mib": 1024, "max_swap_mib": 16384}));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn security_revalidation_labels_dns_links_and_wsl_admin_gate() {
+        use std::io::{Read, Write};
+        let root = std::env::temp_dir().join(format!("kiri-sec-t2-api-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let engine = super::super::engine::boot_without_vm(&root);
+
+        // 1. Image labels cannot smuggle dev.kiri.* or com.docker.compose.*, while
+        // image_labels_from preserves raw labels for `docker image inspect`.
+        let cfg = json!({
+            "created": "2026-11-16T00:00:00Z",
+            "architecture": go_arch(),
+            "os": "linux",
+            "config": {
+                "Cmd": ["sh"],
+                "Labels": {
+                    "dev.kiri.k8s": "1",
+                    "DEV.KIRI.DOMAIN": "hijack",
+                    "dev.kiri.machine": "vm",
+                    "dev.kiri.builder": "1",
+                    "com.docker.compose.service": "web",
+                    "COM.DOCKER.COMPOSE.project": "shop",
+                    "org.opencontainers.image.title": "clean"
+                }
+            }
+        });
+        let cfg_bytes = serde_json::to_vec(&cfg).unwrap();
+        let mut w = engine.store.ingest().unwrap();
+        io::Write::write_all(&mut w, &cfg_bytes).unwrap();
+        let (digest, _) = w.finish().unwrap();
+        let mut img = kiri_image::archive::from_config("sec:1".into(), &digest, &cfg, Vec::new());
+        img.platform = format!("linux/{}", go_arch());
+        engine.store.put_image(img).unwrap();
+
+        let img_json = image_inspect(&engine, "sec:1").unwrap();
+        assert_eq!(img_json["Config"]["Labels"]["dev.kiri.k8s"], "1");
+        assert_eq!(img_json["Config"]["Labels"]["com.docker.compose.service"], "web");
+
+        // Host caller can set explicit control labels, while image's reserved labels are stripped.
+        let host_req = Request::internal(
+            "POST",
+            "/containers/create",
+            &[("name", "host-c")],
+            serde_json::to_vec(&json!({
+                "Image": "sec:1",
+                "Labels": {"dev.kiri.k8s": "1", "custom": "ok"},
+                "HostConfig": {"NetworkMode": "none"}
+            }))
+            .unwrap(),
+        );
+        create_by(&host_req, &engine, &Caller::Host).unwrap();
+        let host_labels = container_inspect(&engine, "host-c").unwrap()["Config"]["Labels"].clone();
+        assert_eq!(host_labels, json!({"org.opencontainers.image.title": "clean", "dev.kiri.k8s": "1", "custom": "ok"}));
+
+        // Container and WSL callers have dev.kiri.{k8s,k8s.*,machine,builder} stripped from request body too.
+        for (i, caller) in [(1, Caller::Container), (2, Caller::Wsl("Ubuntu".into()))] {
+            let cname = format!("untrusted-{i}");
+            let req = Request::internal(
+                "POST",
+                "/containers/create",
+                &[("name", &cname)],
+                serde_json::to_vec(&json!({
+                    "Image": "sec:1",
+                    "Labels": {
+                        "dev.kiri.k8s": "1",
+                        "dev.kiri.k8s.role": "node",
+                        "DEV.KIRI.MACHINE": "ubuntu",
+                        "dev.kiri.builder": "1",
+                        "dev.kiri.domain": "myapp",
+                        "app": "1"
+                    },
+                    "HostConfig": {"NetworkMode": "none"}
+                }))
+                .unwrap(),
+            );
+            create_by(&req, &engine, &caller).unwrap();
+            let labels = container_inspect(&engine, &cname).unwrap()["Config"]["Labels"].clone();
+            assert_eq!(labels, json!({"org.opencontainers.image.title": "clean", "dev.kiri.domain": "myapp", "app": "1"}));
+        }
+
+        // 2. Domainname, Dns, DnsSearch, DnsOptions, and parse_link validations.
+        for bad_body in [
+            json!({"Image": "sec:1", "Domainname": "corp.local\n1.2.3.4 evil"}),
+            json!({"Image": "sec:1", "Domainname": "corp\tlocal"}),
+            json!({"Image": "sec:1", "HostConfig": {"Dns": ["8.8.8.8\noptions debug"]}}),
+            json!({"Image": "sec:1", "HostConfig": {"Dns": ["not-an-ip"]}}),
+            json!({"Image": "sec:1", "HostConfig": {"DnsSearch": [""]}}),
+            json!({"Image": "sec:1", "HostConfig": {"DnsSearch": ["corp.local\nnameserver 1.2.3.4"]}}),
+            json!({"Image": "sec:1", "HostConfig": {"DnsOptions": [""]}}),
+            json!({"Image": "sec:1", "HostConfig": {"DnsOptions": ["ndots:2\rnameserver 1.2.3.4"]}}),
+        ] {
+            let req = Request::internal("POST", "/containers/create", &[], serde_json::to_vec(&bad_body).unwrap());
+            assert!(matches!(create(&req, &engine), Err(Error::BadRequest(_))), "{bad_body}");
+        }
+        assert_eq!(parse_link("db:my-alias_1"), Some(("db", "my-alias_1")));
+        for bad_link in ["db:a\nb", "db:a b", "db\nx:alias", "db\tx:alias", "db:alias\0"] {
+            assert_eq!(parse_link(bad_link), None, "{bad_link:?}");
+        }
+
+        // 3. Stale mount revalidation catches tab-smuggled Destination, /mnt/mac shares, and bad volume drivers.
+        let forged_guest = vec!["/var/lib/kiri/volumes/anon/_data\t/app\tcreate,copyup\tnone\t/mnt/mac\t1000\t".to_owned()];
+        let forged_info = vec![json!({"Type": "volume", "Name": "anon", "Source": "/var/lib/kiri/volumes/anon/_data", "Destination": "/app\tnone\t/mnt/mac\t1000\t"})];
+        assert!(revalidate_mounts_for(&engine, &forged_guest, &forged_info, |_| None, true).is_err());
+
+        let mismatch_info = vec![json!({"Type": "volume", "Name": "anon", "Source": "/var/lib/kiri/volumes/anon/_data", "Destination": "/other"})];
+        assert!(revalidate_mounts_for(&engine, &forged_guest, &mismatch_info, |_| None, true).is_err());
+
+        // Plain volume in engine store with empty options cannot have 7 fields in guest line.
+        engine.volume_ensure("plain-vol", json!({}), false).unwrap();
+        let injected_vol_guest = vec!["/var/lib/kiri/volumes/plain-vol/_data\t/data\tcreate,copyup\text4\t/dev/vda\t0\t".to_owned()];
+        let injected_vol_info = vec![json!({"Type": "volume", "Name": "plain-vol", "Source": "/var/lib/kiri/volumes/plain-vol/_data", "Destination": "/data"})];
+        assert!(revalidate_mounts_for(&engine, &injected_vol_guest, &injected_vol_info, |_| None, false).is_err());
+
+        // Stale Mac share bind is refused on start/cp revalidation.
+        for bad_src in ["/mnt/mac", "/mnt/mac/Users", "/", "/mnt", "/proc/self/root/mnt/mac"] {
+            let g = vec![format!("{bad_src}\t/host\t")];
+            let inf = vec![json!({"Type": "bind", "Source": bad_src, "Destination": "/host"})];
+            assert!(revalidate_mounts_for(&engine, &g, &inf, |_| None, true).is_err(), "{bad_src}");
+            assert!(revalidate_mounts_for(&engine, &g, &[], |_| None, true).is_err(), "unpaired {bad_src}");
+        }
+
+        // Unpaired 7-field bind on macOS is refused, while valid unpaired tmpfs volume passes.
+        let unpaired_bind = vec!["/var/lib/kiri/volumes/v/_data\t/data\tcreate\tnone\t/Users/me\t1000\t".to_owned()];
+        assert!(revalidate_mounts_for(&engine, &unpaired_bind, &[], |_| None, true).is_err());
+        let unpaired_tmpfs = vec!["/var/lib/kiri/volumes/v/_data\t/data\tcreate\ttmpfs\ttmpfs\t0\tsize=16m".to_owned()];
+        assert!(revalidate_mounts_for(&engine, &unpaired_tmpfs, &[], |_| None, true).is_ok());
+
+        // 4. Caller::Wsl admin gate returns 403 Forbidden on host admin & storage-move endpoints.
+        for req_line in [
+            "POST /kiri/storage",
+            "POST /kiri/storage/check",
+            "POST /kiri/storage/reset",
+            "DELETE /kiri/storage/old",
+            "POST /kiri/proxy",
+            "PUT /kiri/proxy/system",
+            "POST /kiri/registries",
+            "POST /kiri/domains",
+            "DELETE /kiri/domains",
+            "POST /kiri/resources",
+            "POST /kiri/builder",
+            "POST /kiri/fs-events",
+            "POST /kiri/win-ports",
+            "PUT /kiri/roots/host",
+            "POST /kiri/wsl",
+        ] {
+            let (m, p) = req_line.split_once(' ').unwrap();
+            assert!(!wsl_may(m, p), "{req_line} must be denied for Caller::Wsl");
+            let (mut client, server) = UnixStream::pair().unwrap();
+            let served = std::thread::spawn({
+                let engine = engine.clone();
+                move || serve(server, engine, Caller::Wsl("Ubuntu".into()))
+            });
+            client
+                .write_all(format!("{req_line} HTTP/1.1\r\nHost: d\r\nConnection: close\r\nContent-Length: 2\r\n\r\n{{}}").as_bytes())
+                .unwrap();
+            let mut got = String::new();
+            client.read_to_string(&mut got).unwrap();
+            served.join().unwrap().unwrap();
+            assert!(got.starts_with("HTTP/1.1 403 "), "{req_line}: {got}");
+        }
+
+        // GET /kiri/proxy from Caller::Wsl and Caller::Container redacts credentials.
+        super::super::proxy::set_host(super::super::proxy::Effective {
+            http: Some("http://user:topsecret@127.0.0.1:8080".into()),
+            https: Some("http://user:topsecret@127.0.0.1:8443".into()),
+            no_proxy: vec![],
+            pac: false,
+        });
+        let wsl_rep = super::super::proxy::report_for(&Caller::Wsl("Ubuntu".into())).to_string();
+        let ctr_rep = super::super::proxy::report_for(&Caller::Container).to_string();
+        assert!(!wsl_rep.contains("topsecret"), "{wsl_rep}");
+        assert!(!ctr_rep.contains("topsecret"), "{ctr_rep}");
+
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
     }
 }

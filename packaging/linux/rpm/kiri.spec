@@ -48,6 +48,9 @@ Conflicts:      kiri
 BuildArch:      %{kiri_arch}
 # Static binaries: nothing to find by scanning them.
 AutoReq:        no
+# On a host with AppArmor enabled (openSUSE), the engine loads its container
+# profile with apparmor_parser; elsewhere (SELinux) it is not used.
+Suggests:       apparmor-parser
 Requires(pre):  shadow-utils
 %if 0%{?with_cli}
 Requires(post): %{_sbindir}/update-alternatives
