@@ -305,7 +305,7 @@ def no_indent(index):
 
 def compact_css(css):
     """As assemble.rs's compact_css."""
-    out, quote, i, decl, n = [], None, 0, True, len(css)
+    out, quote, i, decl, paren, n = [], None, 0, True, 0, len(css)
     while i < n:
         if quote is None and css[i:i + 2] == "/*":
             end = css.find("*/", i + 2)
@@ -351,12 +351,16 @@ def compact_css(css):
             out.append("\n")
             continue
         if ch in " \t":
-            if out and out[-1] in ":,{; \n":
+            if out and (out[-1] in ":,{; \n" or (paren == 0 and out[-1] in ">+~")):
                 continue
-            if i < n and css[i] in "{};,\n\r":
+            if i < n and (css[i] in "{};,\n\r" or (paren == 0 and css[i] in ">+~")):
                 continue
             out.append(" ")
             continue
+        if ch == "(":
+            paren += 1
+        elif ch == ")" and paren > 0:
+            paren -= 1
         if ch == "}":
             if out and out[-1] == ";":
                 out.pop()
@@ -374,6 +378,7 @@ def compact_js(script):
     if not closed or len(marks) != len(script):
         return script
     tight = ";,{}()[]?:"
+    bin_tight = "=<>%^&|*+-"
     op_guard = "=!<>+-*/%&|^~"
     out, out_code = [], []
     i, n = 0, len(script)
@@ -411,7 +416,8 @@ def compact_js(script):
             while out and out[-1] == " " and out_code[-1]:
                 out.pop()
                 out_code.pop()
-            if out and out[-1] != "\n":
+            suppress_nl = bool(out) and out_code[-1] and out[-1] in "{;,(["
+            if out and out[-1] != "\n" and not suppress_nl:
                 out.append("\n")
                 out_code.append(True)
             i += 1
@@ -430,9 +436,9 @@ def compact_js(script):
             drop_before = nxt is not None and (
                 nxt in "\n\r"
                 or (nxt_is_code and nxt in tight)
-                or (nxt_is_code and nxt == "=" and prev not in op_guard)
+                or (nxt_is_code and nxt in bin_tight and prev not in op_guard)
             )
-            drop_after = prev_is_code and (prev in tight or (prev == "=" and nxt is not None and nxt not in op_guard))
+            drop_after = prev_is_code and (prev in tight or (prev in bin_tight and nxt is not None and nxt not in op_guard))
             if not drop_before and not drop_after:
                 out.append(" ")
                 out_code.append(True)
@@ -494,9 +500,23 @@ def xterm_loader():
     )
 
 
+def panels_loader():
+    """The host's half of loadpanels: injects panels.js synchronously."""
+    js_bundle = compact_js(open(os.path.join(UI, "panels.js")).read())
+    js_json = json.dumps(js_bundle).replace("<", "\\u003c").replace(">", "\\u003e")
+    return (
+        f"const HOST_PANELS_JS = {js_json};\n"
+        "{ const post = window.webkit.messageHandlers.kiri.postMessage;\n"
+        "  window.webkit.messageHandlers.kiri.postMessage = (m) => { post(m); const o = JSON.parse(m);\n"
+        "    if (o.cmd !== \"loadpanels\" || window.__kiriPanelsInjected) return;\n"
+        "    window.__kiriPanelsInjected = true;\n"
+        "    const sc = document.createElement(\"script\"); sc.textContent = HOST_PANELS_JS + \"\\nwindow.kiriPanelsReady && window.kiriPanelsReady();\"; document.head.appendChild(sc); }; }\n"
+    )
+
+
 def page(test, os_name=None):
     # As assemble.rs builds it: the icons spliced in, and the words for the
-    # language it opens in; xterm loads lazily via loadxterm and other languages via langwords.
+    # language it opens in; xterm loads lazily via loadxterm, non-boot panels via loadpanels, and other languages via langwords.
     packed, pick = strings(), lang_of(test)
     index = (strip(open(os.path.join(UI, "index.html")).read()).replace("/*ICONS*/", compact_js(open(os.path.join(UI, "icons.js")).read()), 1)
              .replace("/*LANGSTEP*/", compact_js(open(os.path.join(UI, "langstep.js")).read()), 1)
@@ -505,7 +525,7 @@ def page(test, os_name=None):
     if os_name and os_name != "macos":
         index = index.replace("<head>", f'<head><script>window.KIRI_OS = "{os_name}";</script>', 1)
     fixture = open(os.path.join(ROOT, "tests/ui/fixture.js")).read()
-    return index[: index.rindex("</body>")] + CATCH + f"<script>{REPORT}\n{fixture}\n{host(packed)}\n{xterm_loader()}\n{open(test).read()}</script></body></html>"
+    return index[: index.rindex("</body>")] + CATCH + f"<script>{REPORT}\n{fixture}\n{host(packed)}\n{xterm_loader()}\n{panels_loader()}\n{open(test).read()}</script></body></html>"
 
 
 def run(test, os_name=None):

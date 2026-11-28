@@ -22,6 +22,8 @@ use std::sync::OnceLock;
 const ICONS_JS: &str = include_str!("icons.js");
 /// The languages and the first start's language step, which both pages show.
 const LANGSTEP_JS: &str = include_str!("langstep.js");
+/// Non-boot UI panels (Settings, Builds/Scan, Diagnostics), loaded on demand via `loadpanels`.
+const PANELS_JS: &str = include_str!("panels.js");
 const XTERM_CSS: &str = include_str!("xterm/xterm.css");
 /// xterm.js 6.0.0 and its fit, search and web-links add-ons (UMD builds,
 /// each defining a global), in the order they load.
@@ -114,7 +116,7 @@ fn compact_page(index: &str) -> String {
 fn compact_css(css: &str) -> String {
     let c: Vec<char> = css.chars().collect();
     let mut out: Vec<char> = Vec::with_capacity(c.len());
-    let (mut quote, mut i, mut decl) = (None, 0, true);
+    let (mut quote, mut i, mut decl, mut paren) = (None, 0, true, 0usize);
     while i < c.len() {
         if quote.is_none() && c.get(i..i + 2) == Some(&['/', '*']) {
             if let Some(rel) = c[i + 2..].windows(2).position(|w| w == ['*', '/']) {
@@ -169,14 +171,19 @@ fn compact_css(css: &str) -> String {
             continue;
         }
         if ch == ' ' || ch == '\t' {
-            if out.last().is_some_and(|p| matches!(p, ':' | ',' | '{' | ';' | ' ' | '\n')) {
+            if out.last().is_some_and(|p| matches!(p, ':' | ',' | '{' | ';' | ' ' | '\n') || (paren == 0 && matches!(p, '>' | '+' | '~'))) {
                 continue;
             }
-            if c.get(i).is_some_and(|n| matches!(n, '{' | '}' | ';' | ',' | '\n' | '\r')) {
+            if c.get(i).is_some_and(|n| matches!(n, '{' | '}' | ';' | ',' | '\n' | '\r') || (paren == 0 && matches!(n, '>' | '+' | '~'))) {
                 continue;
             }
             out.push(' ');
             continue;
+        }
+        if ch == '(' {
+            paren += 1;
+        } else if ch == ')' {
+            paren = paren.saturating_sub(1);
         }
         if ch == '}' {
             if out.last() == Some(&';') {
@@ -195,8 +202,9 @@ fn compact_css(css: &str) -> String {
 }
 
 /// Drops JS block/line comments (keeping uppercase `/*PLACEHOLDER*/` splices),
-/// blank lines, and redundant horizontal whitespace around unambiguous code
-/// punctuation, leaving strings, templates, regexes, and ASI newlines intact.
+/// blank lines, non-ASI newlines after `{;,( [`, and redundant horizontal
+/// whitespace around unambiguous code punctuation and operators, leaving
+/// strings, templates, regexes, and ASI newlines intact.
 fn compact_js(script: &str) -> String {
     let mut marks = Vec::with_capacity(script.len());
     let (_, closed) = scan(script, Some(&mut marks));
@@ -208,6 +216,7 @@ fn compact_js(script: &str) -> String {
         return script.to_owned();
     }
     const TIGHT: &str = ";,{}()[]?:";
+    const BIN_TIGHT: &str = "=<>%^&|*+-";
     const OP_GUARD: &str = "=!<>+-*/%&|^~";
     let mut out: Vec<char> = Vec::with_capacity(cs.len());
     let mut out_code: Vec<bool> = Vec::with_capacity(cs.len());
@@ -260,7 +269,9 @@ fn compact_js(script: &str) -> String {
                 out.pop();
                 out_code.pop();
             }
-            if !out.is_empty() && out.last() != Some(&'\n') {
+            let suppress_nl = out_code.last() == Some(&true)
+                && out.last().is_some_and(|p| matches!(p, '{' | ';' | ',' | '(' | '['));
+            if !out.is_empty() && out.last() != Some(&'\n') && !suppress_nl {
                 out.push('\n');
                 out_code.push(true);
             }
@@ -285,10 +296,10 @@ fn compact_js(script: &str) -> String {
                 n == '\n'
                     || n == '\r'
                     || (next_is_code && TIGHT.contains(n))
-                    || (next_is_code && n == '=' && prev.is_some_and(|p| !OP_GUARD.contains(p)))
+                    || (next_is_code && BIN_TIGHT.contains(n) && prev.is_some_and(|p| !OP_GUARD.contains(p)))
             });
             let drop_after_prev = prev_is_code
-                && prev.is_some_and(|p| TIGHT.contains(p) || (p == '=' && next.is_some_and(|n| !OP_GUARD.contains(n))));
+                && prev.is_some_and(|p| TIGHT.contains(p) || (BIN_TIGHT.contains(p) && next.is_some_and(|n| !OP_GUARD.contains(n))));
             if !drop_before_next && !drop_after_prev {
                 out.push(' ');
                 out_code.push(true);
@@ -301,6 +312,18 @@ fn compact_js(script: &str) -> String {
         i += 1;
     }
     out.into_iter().collect()
+}
+
+/// Self-contained JS bundle for deferred non-boot panels (Settings, Builds/Scan,
+/// Diagnostics), evaluated on demand when first opened via `loadpanels`.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux", windows)), allow(dead_code))]
+pub fn panels_js() -> &'static str {
+    static BUNDLE: OnceLock<String> = OnceLock::new();
+    BUNDLE.get_or_init(|| {
+        let mut js = compact_js(PANELS_JS);
+        js.push_str("\nwindow.kiriPanelsReady&&window.kiriPanelsReady();\n");
+        js
+    })
 }
 
 /// Self-contained JS bundle evaluated on demand when the user first opens the
@@ -840,6 +863,9 @@ mod tests {
         let xterm = super::xterm_js();
         assert!(xterm.contains(".xterm-viewport"), "xterm.css missing from lazy bundle");
         assert!(xterm.contains("kiriXtermReady"), "kiriXtermReady missing from lazy bundle");
+        let panels = super::panels_js();
+        assert!(panels.contains("function renderSettings("), "renderSettings missing from lazy panels bundle");
+        assert!(panels.contains("kiriPanelsReady"), "kiriPanelsReady missing from lazy panels bundle");
         assert!(page.contains("function langStep(") && (page.contains("const LANGS=[") || page.contains("const LANGS = [")), "langstep.js missing");
         let setup = super::words(include_str!("../../../kiri-win/src/setup.html"), None);
         for p in ["/*LANGSTEP*/", "/*LANG*/", "/*STRINGS*/"] {

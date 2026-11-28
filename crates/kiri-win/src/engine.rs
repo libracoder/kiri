@@ -1648,6 +1648,7 @@ pub fn on_message(msg: &str) {
             }
         }
         "loadxterm" => Handle.eval(crate::assemble::xterm_js().to_owned()),
+        "loadpanels" => Handle.eval(crate::assemble::panels_js().to_owned()),
         // Off the window's thread: GDI lists every installed face, twice.
         "fonts" => {
             std::thread::spawn(|| emit(fonts_event().to_owned()));

@@ -23,7 +23,7 @@ import json, os, re, subprocess, sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 UI = os.path.join(ROOT, "crates/kiri/src/ui")
-PAGES = [os.path.join(UI, "index.html"), os.path.join(UI, "langstep.js"), os.path.join(ROOT, "crates/kiri-win/src/setup.html")]
+PAGES = [os.path.join(UI, "index.html"), os.path.join(UI, "panels.js"), os.path.join(UI, "langstep.js"), os.path.join(ROOT, "crates/kiri-win/src/setup.html")]
 # The Rust that draws native words or sends the page words (notices, setup steps).
 # (lang.rs is the lookup itself: its tests call tr(lang, words).)
 NATIVE = sorted([os.path.join(UI, f) for f in os.listdir(UI) if f.endswith(".rs") and f != "lang.rs"]
