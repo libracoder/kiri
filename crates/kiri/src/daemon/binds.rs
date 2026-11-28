@@ -259,7 +259,7 @@ pub fn distro_source(src: &str, distro: &str, wsl: Option<&Wsl>) -> Result<Strin
     }
     let distro_root = format!("{roots_dir}/{distro}");
     let cleaned = clean(src);
-    if ENGINE_SOCKS.contains(&cleaned.as_str()) || is_wsl_engine_socket(&cleaned) {
+    if ENGINE_SOCKS.contains(&cleaned.as_str()) || is_wsl_engine_socket(&cleaned) || cleaned == SSH_AGENT_SOCK {
         return Ok(cleaned);
     }
     if cleaned == distro_root || cleaned.strip_prefix(&distro_root).is_some_and(|r| r.starts_with('/')) {
@@ -269,7 +269,12 @@ pub fn distro_source(src: &str, distro: &str, wsl: Option<&Wsl>) -> Result<Strin
         return Ok(target);
     }
     let lex = lexical_clean(src);
-    if ENGINE_SOCKS.contains(&lex.as_str()) || is_wsl_engine_socket(&lex) {
+    if ENGINE_SOCKS.contains(&lex.as_str())
+        || is_wsl_engine_socket(&lex)
+        || lex == SSH_AGENT_SOCK
+        || lex == "/sys"
+        || lex.starts_with("/sys/")
+    {
         return Ok(lex);
     }
     let is_internal_wsl = |p: &str| {
@@ -472,6 +477,7 @@ const VM_ENGINE_SOCK: &str = "/run/host-services/docker.sock";
 /// (`DOCKER_HOST=unix://~/.kiri/run/docker.sock`, which Testcontainers
 /// mounts into Ryuk).
 const ENGINE_SOCKS: &[&str] = &["/var/run/docker.sock", "/run/docker.sock", "/private/var/run/docker.sock"];
+const SSH_AGENT_SOCK: &str = "/run/host-services/ssh-auth.sock";
 
 /// Where a path really is: its links followed, and the file it leads to
 /// as device and inode, which also matches a hard link or another mount of
@@ -879,6 +885,26 @@ mod tests {
         assert_eq!(
             split_for("/run/docker.sock:/var/run/docker.sock", Some(&w), Some("Ubuntu")).unwrap(),
             t("/run/docker.sock", "/var/run/docker.sock", "")
+        );
+        assert_eq!(
+            split_for("/run/host-services/ssh-auth.sock:/run/host-services/ssh-auth.sock", Some(&w), Some("Ubuntu")).unwrap(),
+            t("/run/host-services/ssh-auth.sock", "/run/host-services/ssh-auth.sock", "")
+        );
+        assert_eq!(
+            split_for("/sys/fs/cgroup:/sys/fs/cgroup", Some(&w), Some("Ubuntu")).unwrap(),
+            t("/sys/fs/cgroup", "/sys/fs/cgroup", "")
+        );
+        assert_eq!(
+            split_for("/sys:/hostsys:ro", Some(&w), Some("Ubuntu")).unwrap(),
+            t("/sys", "/hostsys", "ro")
+        );
+        assert_eq!(
+            split_for("/sys/fs/./cgroup:/mnt2", Some(&w), Some("Ubuntu")).unwrap(),
+            t("/sys/fs/cgroup", "/mnt2", "")
+        );
+        assert_eq!(
+            distro_source("/sys/../etc/passwd", "Ubuntu", Some(&w)).unwrap(),
+            "/mnt/wsl/kiri/roots/Ubuntu/etc/passwd"
         );
         assert_eq!(
             split_for("myvol:/data", Some(&w), Some("Ubuntu")).unwrap(),

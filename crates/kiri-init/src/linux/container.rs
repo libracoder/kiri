@@ -121,6 +121,9 @@ pub struct Process {
     /// Its start was cancelled while it was filling a volume (see `cancel`):
     /// killed as soon as its root is in place.
     cancelled: bool,
+    /// Write end of `Prepared::exec_ready` when started with
+    /// `run_flags::HOLD_EXEC` so secondary networks can be attached before PID 1 execs.
+    exec_go: Option<OwnedFd>,
 }
 
 /// Where a container's root stands (see [`Process::root`]).
@@ -233,6 +236,17 @@ impl Process {
     pub fn start_failure(&self) -> Option<&str> {
         self.ended_before_ready.as_deref()
     }
+
+    /// Releases a child started with `run_flags::HOLD_EXEC` so it proceeds to exec.
+    pub fn start_exec(&mut self) -> io::Result<()> {
+        if let Some(go) = self.exec_go.take() {
+            // SAFETY: writing one byte to a pipe we own.
+            if unsafe { libc::write(go.as_raw_fd(), b"g".as_ptr().cast(), 1) } != 1 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
 }
 
 /// A child that ended before its root was in place and said nothing.
@@ -270,6 +284,7 @@ impl Process {
             ended_before_ready: None,
             filling: false,
             cancelled: false,
+            exec_go: None,
         }
     }
 
@@ -339,6 +354,9 @@ struct Prepared {
     /// The child's end of the pipe that says it has been moved into its
     /// cgroup. Only a start that fell back to clone(2) waits on it.
     cgroup_ready: Option<OwnedFd>,
+    /// When `run_flags::HOLD_EXEC` is set, the child waits here (after TTY and
+    /// root setup, before seccomp and exec) until `Msg::StartExec` releases it.
+    exec_ready: Option<OwnedFd>,
 }
 
 /// The parts of [`super::hostopts::HostOpts`] the child applies itself.
@@ -665,6 +683,13 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
     // instead of the container's, where its image users don't exist (#311).
     let (root_ready, child_root_ready) = sys::pipe().map_err(cleanup)?;
     prepared.root_ready = Some(child_root_ready);
+    let exec_go = if spec.flags & run_flags::HOLD_EXEC != 0 {
+        let (r, w) = sys::pipe().map_err(cleanup)?;
+        prepared.exec_ready = Some(r);
+        Some(w)
+    } else {
+        None
+    };
     // The child waits here until the agent has moved it into its cgroup, for
     // a start that clone3 could not place there itself. Once `clone3` with
     // `CLONE_INTO_CGROUP` is confirmed working in this process, skip making
@@ -731,6 +756,7 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
     // it (the child exiting early) read as EOF here.
     drop(prepared.root_ready.take());
     drop(prepared.cgroup_ready.take());
+    drop(prepared.exec_ready.take());
     let child_netns = if flags & libc::CLONE_NEWNET as u64 != 0 {
         let f = fs::File::open(format!("/proc/{pid}/ns/net")).ok();
         netns = f.as_ref().map_or(0, netns_inode);
@@ -958,6 +984,7 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
         ended_before_ready: None,
         filling: filling.get(),
         cancelled: false,
+        exec_go,
     })
 }
 
@@ -1247,6 +1274,7 @@ pub fn exec(spec: &ExecSpec<'_>, target_pid: libc::pid_t, paths: &Paths, profile
         ended_before_ready: None,
         filling: false,
         cancelled: false,
+        exec_go: None,
     })
 }
 
@@ -1532,6 +1560,7 @@ fn prepare(argv: StrList<'_>, env: StrList<'_>, cwd: &str, user: &str, hostname:
         host: HostApplied::default(),
         root_ready: None,
         cgroup_ready: None,
+        exec_ready: None,
     })
 }
 
@@ -2550,6 +2579,7 @@ fn child_fds(p: &Prepared, io: &ChildStdio) -> Vec<RawFd> {
         host: HostApplied { rlimits: _, groups: _, nodes: _, masked: _, readonly: _ },
         root_ready,
         cgroup_ready,
+        exec_ready,
     } = p;
     let mut fds = match io {
         ChildStdio::Tty { sock } => vec![sock.as_raw_fd()],
@@ -2563,6 +2593,7 @@ fn child_fds(p: &Prepared, io: &ChildStdio) -> Vec<RawFd> {
     fds.extend(net_ready.as_ref().map(AsRawFd::as_raw_fd));
     fds.extend(root_ready.as_ref().map(AsRawFd::as_raw_fd));
     fds.extend(cgroup_ready.as_ref().map(AsRawFd::as_raw_fd));
+    fds.extend(exec_ready.as_ref().map(AsRawFd::as_raw_fd));
     fds
 }
 
@@ -2780,6 +2811,16 @@ fn finish_child(p: &Prepared, io: &ChildStdio, console: bool) -> ! {
     // From here on stderr is the container's own (the pipe or the terminal),
     // which is where the user will see why a start failed.
     let fail = |what: &str, e: io::Error| -> ! { child_fail(2, what, e) };
+
+    if console
+        && let Some(ready) = &p.exec_ready
+    {
+        let mut b = [0u8; 1];
+        // SAFETY: reading one byte into a local buffer from a pipe we own.
+        if unsafe { libc::read(ready.as_raw_fd(), b.as_mut_ptr().cast(), 1) } != 1 {
+            fail("network", io::Error::other("the agent could not set up this container's networks"));
+        }
+    }
 
     // While still root with every capability: raising a hard limit needs
     // CAP_SYS_RESOURCE.

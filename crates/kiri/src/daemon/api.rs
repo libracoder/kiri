@@ -302,7 +302,7 @@ fn route(req: &Request, engine: &Arc<Engine>, caller: &Caller, w: &mut UnixStrea
         ("POST", "/networks/create") => return reply(w, network_create(req, engine), 201),
         ("POST", "/networks/prune") => return reply(w, network_prune(req, engine), 200),
         ("GET", "/volumes") => return reply(w, volumes(req, engine), 200),
-        ("POST", "/volumes/create") => return reply(w, volume_create(req, engine), 201),
+        ("POST", "/volumes/create") => return reply(w, volume_create(req, engine, caller), 201),
         ("POST", "/volumes/prune") => return reply(w, volume_prune(req, engine), 200),
         _ => {}
     }
@@ -1962,6 +1962,31 @@ fn check_volume_device(options: &std::collections::BTreeMap<String, String>) -> 
     Ok(())
 }
 
+/// Resolves a local bind volume's `device` path for WSL integration or Windows
+/// drive-letter paths before passing it to the guest, while keeping the raw
+/// `device` option in `volumes.json` for `docker volume inspect`.
+fn volume_bind_source(device: &str, wsl: Option<&super::binds::Wsl>, wsl_distro: Option<&str>) -> Result<String, Error> {
+    match (wsl, wsl_distro) {
+        (_, Some(d)) => super::binds::distro_source(device, d, wsl),
+        (Some(w), None) => super::binds::source(device, w),
+        _ => Ok(device.to_owned()),
+    }
+}
+
+fn validate_volume_options(
+    options: &std::collections::BTreeMap<String, String>,
+    wsl: Option<&super::binds::Wsl>,
+    wsl_distro: Option<&str>,
+) -> Result<(), Error> {
+    check_volume_device(options)?;
+    let (flags, _) = super::volumes::mount_options(options.get("o").map_or("", String::as_str));
+    if flags & 4096 != 0 {
+        let device = options.get("device").map_or("", String::as_str);
+        volume_bind_source(device, wsl, wsl_distro)?;
+    }
+    Ok(())
+}
+
 /// Refuses text that would forge a field in the tab-separated mount line the
 /// guest parses.
 ///
@@ -2183,11 +2208,23 @@ fn mounts_for(body: &Value, engine: &Engine, image: &kiri_image::Image, caller: 
                 // must not be reachable this way either: not as a virtiofs
                 // tag, and not as a bind of /mnt/mac.
                 check_volume_device(&v.options)?;
+                let vol_distro = v.wsl_distro.as_deref().or(wsl_distro);
+                let (opt_flags, _) = super::volumes::mount_options(v.options.get("o").map_or("", String::as_str));
+                let translated_bind_dev = if opt_flags & 4096 != 0 {
+                    let raw_dev = v.options.get("device").map_or("", String::as_str);
+                    Some(volume_bind_source(raw_dev, super::binds::wsl(), vol_distro)?)
+                } else {
+                    None
+                };
                 let path = super::volumes::guest_path(&name);
                 let copy = if extra.contains("nocopy") { "create" } else { "create,copyup" };
                 // A volume with driver options (`type=nfs`, `o=bind` …) is
                 // mounted at its path by the guest at start, then bound in.
-                let vol = super::volumes::guest_mount_fields(&v.options, guest_bind_source, resolve_server);
+                let vol = super::volumes::guest_mount_fields(
+                    &v.options,
+                    |dev| guest_bind_source(translated_bind_dev.as_deref().unwrap_or(dev)),
+                    resolve_server,
+                );
                 out.guest.push(format!("{path}\t{dst}\t{}{vol}", flag(copy)));
                 out.info.push(json!({"Type": "volume", "Name": name, "Source": path, "Destination": dst, "Driver": "local", "Mode": "z", "RW": !ro, "Propagation": ""}));
                 if anonymous {
@@ -2258,7 +2295,8 @@ fn mounts_for(body: &Value, engine: &Engine, image: &kiri_image::Image, caller: 
                 d => return Err(Error::BadRequest(format!("Kiri supports only local volumes, not {d}"))),
             }
             let options = super::volumes::local_options(&driver_opts["Options"]).map_err(Error::BadRequest)?;
-            engine.volume_ensure_with(src, m["VolumeOptions"]["Labels"].clone(), options)?;
+            validate_volume_options(&options, wsl, wsl_distro)?;
+            engine.volume_ensure_with_distro(src, m["VolumeOptions"]["Labels"].clone(), options, wsl_distro.map(str::to_owned))?;
         }
         add(kind, src, dst, ro, &extra, false, &mut out)?;
     }
@@ -2398,7 +2436,7 @@ fn volume_json(v: &super::volumes::Volume) -> Value {
     })
 }
 
-fn volume_create(req: &Request, engine: &Engine) -> Result<Value, Error> {
+fn volume_create(req: &Request, engine: &Engine, caller: &super::caller::Caller) -> Result<Value, Error> {
     let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
     match body["Driver"].as_str().unwrap_or("local") {
         "" | "local" => {}
@@ -2409,7 +2447,9 @@ fn volume_create(req: &Request, engine: &Engine) -> Result<Value, Error> {
         n => n.to_owned(),
     };
     let options = super::volumes::local_options(&body["DriverOpts"]).map_err(Error::BadRequest)?;
-    let v = engine.volume_ensure_with(&name, body["Labels"].clone(), options)?;
+    let wsl_distro = caller.wsl_distro();
+    validate_volume_options(&options, super::binds::wsl(), wsl_distro)?;
+    let v = engine.volume_ensure_with_distro(&name, body["Labels"].clone(), options, wsl_distro.map(str::to_owned))?;
     Ok(volume_json(&v))
 }
 
@@ -5151,6 +5191,50 @@ mod tests {
         assert_eq!(m.info[1]["Source"], "/run/host-services/ssh-auth.sock");
         assert_eq!(m.info[1]["Destination"], "/agent.sock");
         assert_eq!(m.info[1]["RW"], false);
+
+        // From an integrated WSL distro, `/run/host-services/ssh-auth.sock` stays
+        // the SSH relay socket and local `o=bind` volumes translate `device` into
+        // `/mnt/wsl/kiri/roots/<distro>/...` for the guest while keeping `Options.device`
+        // unchanged in `volume inspect`.
+        let wsl_caller = Caller::Wsl("Ubuntu".into());
+        let mw = mounts_for(&body, &engine, &image, &wsl_caller).unwrap();
+        assert_eq!(mw.guest, [format!("{src}\t/run/host-services/ssh-auth.sock\t"), format!("{src}\t/agent.sock\tro")]);
+        assert_eq!(mw.info[0]["Source"], "/run/host-services/ssh-auth.sock");
+        assert_eq!(mw.info[1]["Source"], "/run/host-services/ssh-auth.sock");
+
+        let vreq = Request::internal(
+            "POST",
+            "/volumes/create",
+            &[],
+            serde_json::to_vec(&json!({
+                "Name": "wsl-shared",
+                "Driver": "local",
+                "DriverOpts": {"type": "none", "o": "bind", "device": "/tmp/shared"},
+            }))
+            .unwrap(),
+        );
+        let vj = volume_create(&vreq, &engine, &wsl_caller).unwrap();
+        assert_eq!(vj["Options"]["device"], "/tmp/shared");
+        let vbody = json!({"HostConfig": {"Binds": ["wsl-shared:/shared"]}});
+        let mv = mounts_for(&vbody, &engine, &image, &Caller::Host).unwrap();
+        assert_eq!(
+            mv.guest,
+            ["/var/lib/kiri/volumes/wsl-shared/_data\t/shared\tcreate,copyup\tnone\t/mnt/wsl/kiri/roots/Ubuntu/tmp/shared\t1000\t"]
+        );
+
+        let bad_vreq = Request::internal(
+            "POST",
+            "/volumes/create",
+            &[],
+            serde_json::to_vec(&json!({
+                "Name": "wsl-evil",
+                "Driver": "local",
+                "DriverOpts": {"type": "none", "o": "bind", "device": "/mnt/wsl/kiri/roots/Debian/etc"},
+            }))
+            .unwrap(),
+        );
+        assert!(volume_create(&bad_vreq, &engine, &wsl_caller).is_err());
+
         drop(engine);
         let _ = std::fs::remove_dir_all(root);
     }

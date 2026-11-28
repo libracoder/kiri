@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #381, #382, #420, #984 macOS, Networking & Windows/WSL: preserve virtiofs `chown` across host fsnotify events, attach secondary networks before PID 1 execs, format `npipe:////` context URLs with four slashes, and preserve WSL virtual/cgroup binds and local bind volumes (unreleased)
+- Fixes: #382 (`kiri_inject.c` called `__d_drop` on `C`/`M`/`A` host fsnotify events, evicting `struct fuse_inode` and losing in-memory `chown_uid`/`chown_gid` on macOS bind mounts when `FSEvents` echoed container writes), #381 (`start_on_vm` spawned the container process before attaching `spec.extra_networks`, causing fast `docker compose run` commands on secondary external networks to run before `eth1` and its IPv4 default route were attached), #984 (`setup_win::npipe_host` formatted `\\.\pipe\kiri` with two slashes `npipe://./pipe/kiri` instead of four `npipe:////./pipe/kiri`), #420 / #358 (WSL distro bind translation rewrote `/run/host-services/ssh-auth.sock` and `/sys` paths into `/mnt/wsl/kiri/roots/<distro>/...` and `POST /volumes/create` did not resolve local `o=bind` volume `device` paths relative to the calling WSL distro or Windows drive)
+- Caused: none known
+- Caused by: #1002
+- Check: `bind-chown-chmod`, `internal-first-external-default`, `host-services-ssh-agent-mount`, `compose-wait`, `cgroupns-host-unpriv-ro`, `crates/kiri/src/setup_win.rs`, `crates/kiri-proto/src/lib.rs`, `crates/kiri/src/daemon/binds.rs`
+
 ### #269, #984 Windows & WSL: avoid clobbering `%USERPROFILE%\.docker\contexts` through Docker Desktop's WSL symlink, self-heal `unix://` `kiri` context on Windows, and ignore empty `KIRI_UPDATE_URL` (unreleased)
 - Fixes: #269 (enabling WSL integration when `~/.docker/contexts` in WSL was symlinked to `/mnt/c/Users/<user>/.docker/contexts` overwrote Windows's `npipe:////./pipe/kiri` `kiri` context with a Linux `unix://` socket), #984 (`KIRI_UPDATE_URL=""` from `setx` caused `kiri update --check` to fail with `http: empty string` instead of using the default feed)
 - Caused: none known
@@ -27,7 +33,7 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ### #1002 Release gate fixes: virtiofs deleted-file revalidation across `docker run --rm`, offline `kiri domains set/reset`, netns lock takeover after stuck container start, transient `429` manifest retries, WSL `statvfs` `f_bfree` usage, and WSL `kiri` context hash (unreleased)
 - Fixes: #399 (back-to-back `docker run --rm -v` sees 1 s `ENOENT` recreating a host-deleted file), #744 (`kiri domains set` and `kiri domains reset` failed when the daemon was stopped), #190 (`statvfs_usage` used `f_bavail` instead of `f_bfree`, counting ~55 GB of ext4 reserved blocks on WSL's sparse `ext4.vhdx` as used), #269 (`wslsync.rs` hardcoded the wrong SHA-256 for Docker context `kiri`), `agent-dies-beside-stuck-start` (`claim_host_netns` failed when a dead agent's frozen child still held `@kiri-engine-netns`), `pulls-of-different-images-at-once-leave-a-sound-index` (`Client::manifest` did not retry HTTP `429` / transient registry errors)
-- Caused: Enabling WSL integration in a distro where Docker Desktop had symlinked `~/.docker/contexts` to `/mnt/c/Users/<user>/.docker/contexts` overwrote Windows's `npipe:////./pipe/kiri` `kiri` context with `unix:///mnt/wsl/kiri/sockets/<distro>/docker.sock` (found during 0.2.3 release-gate restore on Windows)
+- Caused: Enabling WSL integration in a distro where Docker Desktop had symlinked `~/.docker/contexts` to `/mnt/c/Users/<user>/.docker/contexts` overwrote Windows's `npipe:////./pipe/kiri` `kiri` context with `unix:///mnt/wsl/kiri/sockets/<distro>/docker.sock` (found during 0.2.3 release-gate restore on Windows); immediate `watch::notify()` on macOS bind-mount container starts caused `FSEvents` `C`/`M`/`A` notifications to hit `kiri_inject.c`'s `__d_drop` and evict `struct fuse_inode`'s in-memory `chown_uid`/`chown_gid` (`bind-chown-chmod`)
 - Caused by: #825, #846, #852, #970
 - Check: `agent-dies-beside-stuck-start`, `pulls-of-different-images-at-once-leave-a-sound-index`, `crates/kiri/src/domains_cli.rs`, `crates/kiri-image/src/registry.rs`, `crates/kiri-win/src/wslsync.rs`
 
