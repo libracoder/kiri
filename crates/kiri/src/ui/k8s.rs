@@ -494,11 +494,20 @@ mod tests {
         }
         let v = super::read_lists();
         assert_eq!((v["state"].as_str(), v["ready"].as_bool()), (Some("running"), Some(true)), "{v}");
+        fn resolve<'a>(st: &'a [serde_json::Value], val: &'a serde_json::Value) -> Option<&'a str> {
+            val.as_u64().and_then(|i| st.get(i as usize)).and_then(|s| s.as_str()).or_else(|| val.as_str())
+        }
+        let st = v["s"].as_array().map(Vec::as_slice).unwrap_or_default();
         let pods = v["pods"].as_array().unwrap();
-        assert!(pods.iter().any(|p| p["ns"] == "kube-system" && p["name"].as_str().unwrap().starts_with("coredns")), "{pods:?}");
-        assert!(v["services"].as_array().unwrap().iter().any(|s| s["name"] == "kubernetes" && s["ns"] == "default"));
+        assert!(pods.iter().any(|p| resolve(st, &p[9]) == Some("kube-system") && p[0].as_str().unwrap_or_default().starts_with("coredns")), "{pods:?}");
+        assert!(v["services"].as_array().unwrap().iter().any(|s| s[0] == "kubernetes" && resolve(st, &s[5]).unwrap_or("default") == "default"));
         for p in pods {
-            eprintln!("{:<12} {:<44} {:<18} {:<5} {}", p["ns"].as_str().unwrap(), p["name"].as_str().unwrap(), p["status"].as_str().unwrap(), p["ready"].as_str().unwrap(), p["restarts"]);
+            let ns = resolve(st, &p[9]).unwrap_or("default");
+            let status = resolve(st, &p[10]).unwrap_or("Running");
+            let total = p[2].as_array().map_or(0, Vec::len);
+            let ready = p[1].as_u64().unwrap_or(0);
+            let restarts = p[11].as_u64().unwrap_or(0);
+            eprintln!("{ns:<12} {:<44} {status:<18} {ready}/{total:<3} {restarts}", p[0].as_str().unwrap_or_default());
         }
         let (code, out) = super::kubectl(&["version", "--client"]).unwrap();
         assert!(code == 0 && out.contains("Client Version"), "{out}");

@@ -9631,22 +9631,79 @@ function k8sOn(e) {
       if (e.default_version) k8s.defaultVer = e.default_version;
       if (e.manifests_dir) k8s.manifestsDir = e.manifests_dir;
       if (e.ready) {
-        const pods = e.pods || [], services = e.services || [];
-        for (let i = 0; i < pods.length; i++) {
-          const p = pods[i];
-          if (!p.ns) p.ns = "default";
-          if (!p.status) p.status = "Running";
-          if (p.allReady == null) {
-            const r = p.ready || "", sl = r.indexOf("/");
-            p.allReady = sl > 0 && r !== "0/0" && r.slice(0, sl) === r.slice(sl + 1);
+        const st = Array.isArray(e.s) ? e.s : null;
+        const S = (v) => (st && typeof v === "number" ? st[v] : v);
+        const kv = (a) => {
+          const o = {};
+          for (let k = 0; k + 1 < a.length; k += 2) o[S(a[k])] = S(a[k + 1]);
+          return o;
+        };
+        const rawPods = e.pods || [], rawSvcs = e.services || [];
+        const pods = new Array(rawPods.length), services = new Array(rawSvcs.length);
+        for (let i = 0; i < rawPods.length; i++) {
+          const p = rawPods[i];
+          if (Array.isArray(p)) {
+            const rawCs = p[2] || [], cs = new Array(rawCs.length);
+            for (let j = 0; j < rawCs.length; j++) {
+              const c = rawCs[j];
+              const co = { name: S(c[0]), ready: !!c[2], state: c[6] != null ? S(c[6]) : "running" };
+              if (c[1] != null) co.image = S(c[1]);
+              if (c[3] != null) co.since = S(c[3]);
+              if (c[4] != null) co.ports = c[4].map((x) => (typeof x === "number" ? { containerPort: x } : x));
+              if (c[5]) co.restarts = c[5];
+              if (c[7] != null) co.reason = S(c[7]);
+              if (c[8] != null) co.exit = c[8];
+              if (c[9] != null) co.message = S(c[9]);
+              cs[j] = co;
+            }
+            const rc = p[1] || 0;
+            const po = {
+              ns: p[9] != null ? S(p[9]) : "default",
+              name: p[0],
+              status: p[10] != null ? S(p[10]) : "Running",
+              ready: `${rc}/${cs.length}`,
+              allReady: cs.length > 0 && rc === cs.length,
+              containers: cs,
+            };
+            if (p[11]) po.restarts = p[11];
+            if (p[3] != null) po.created = S(p[3]);
+            if (p[4] != null) po.ip = p[4];
+            if (p[5] != null) po.node = S(p[5]);
+            if (p[6] != null) po.owner = S(p[6]);
+            if (p[7] != null) po.icon = S(p[7]);
+            if (p[8] != null) po.labels = kv(p[8]);
+            pods[i] = po;
+          } else {
+            if (!p.ns) p.ns = "default";
+            if (!p.status) p.status = "Running";
+            if (p.allReady == null) {
+              const r = p.ready || "", sl = r.indexOf("/");
+              p.allReady = sl > 0 && r !== "0/0" && r.slice(0, sl) === r.slice(sl + 1);
+            }
+            const cs = p.containers;
+            if (cs) for (let j = 0; j < cs.length; j++) if (!cs[j].state) cs[j].state = "running";
+            pods[i] = p;
           }
-          const cs = p.containers;
-          if (cs) for (let j = 0; j < cs.length; j++) if (!cs[j].state) cs[j].state = "running";
         }
-        for (let i = 0; i < services.length; i++) {
-          const s = services[i];
-          if (!s.ns) s.ns = "default";
-          if (!s.type) s.type = "ClusterIP";
+        for (let i = 0; i < rawSvcs.length; i++) {
+          const s = rawSvcs[i];
+          if (Array.isArray(s)) {
+            const so = {
+              ns: s[5] != null ? S(s[5]) : "default",
+              name: s[0],
+              type: s[6] != null ? S(s[6]) : "ClusterIP",
+            };
+            if (s[1] != null) so.clusterIP = s[1];
+            if (s[2] != null) so.ports = s[2].map((x) => (typeof x === "number" ? { port: x } : Array.isArray(x) ? { port: x[0], targetPort: x[1] } : x));
+            if (s[3] != null) so.created = S(s[3]);
+            if (s[4] != null) so.selector = kv(s[4]);
+            if (s[7] != null) so.ingress = s[7];
+            services[i] = so;
+          } else {
+            if (!s.ns) s.ns = "default";
+            if (!s.type) s.type = "ClusterIP";
+            services[i] = s;
+          }
         }
         Object.assign(k8s, { pods, services, icon: e.icon });
         kGone();
@@ -9654,7 +9711,7 @@ function k8sOn(e) {
       k8sCounts();
       k8sSide();
       // Only a change redraws, so hovering a row or typing in the filter is left alone.
-      const sig = JSON.stringify([e.state, e.ready, k8s.op, e.config, k8s.port, e.pods, e.services]);
+      const sig = JSON.stringify([e.state, e.ready, k8s.op, e.config, k8s.port, e.s, e.pods, e.services]);
       if (sig === k8s.sig || !k8sShown()) { k8s.sig = sig; break; }
       k8s.sig = sig;
       if (d?.tab === "logs" && podOf(d) && K8S_VIEWS.has(ui.view)) { const pill = $("kpod-pill"); if (pill) pill.outerHTML = podPill(podOf(d), "kpod-pill"); break; }
