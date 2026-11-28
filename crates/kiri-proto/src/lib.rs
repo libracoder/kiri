@@ -802,6 +802,7 @@ impl<'a> StrList<'a> {
 
     /// Encodes `items` as a list. Used by senders, which hold plain slices.
     pub fn put<S: AsRef<str>>(out: &mut Vec<u8>, items: &[S]) {
+        out.reserve(str_list_wire_len(items));
         out.extend_from_slice(&(items.len() as u32).to_le_bytes());
         for s in items {
             put_str(out, s.as_ref());
@@ -911,6 +912,11 @@ pub enum DecodeError {
     BadUtf8,
 }
 
+#[inline]
+fn str_list_wire_len<S: AsRef<str>>(items: &[S]) -> usize {
+    4 + items.iter().map(|s| 4 + s.as_ref().len()).sum::<usize>()
+}
+
 fn put_u32(out: &mut Vec<u8>, v: u32) {
     out.extend_from_slice(&v.to_le_bytes());
 }
@@ -942,6 +948,17 @@ pub fn encode_exec<S: AsRef<str>>(
     caps: u64,
     opts: &[S],
 ) {
+    let exact = HEADER
+        + (4 + container_id.len())
+        + (4 + exec_id.len())
+        + str_list_wire_len(argv)
+        + str_list_wire_len(env)
+        + (4 + cwd.len())
+        + (4 + user.len())
+        + 4
+        + 8
+        + str_list_wire_len(opts);
+    out.reserve(exact);
     frame(out, kind::EXEC, |out| {
         put_str(out, container_id);
         put_str(out, exec_id);
@@ -1067,6 +1084,26 @@ pub fn encode_run<S: AsRef<str>>(
     opts: &[S],
     seccomp: &[u8],
 ) {
+    let exact = HEADER
+        + (4 + id.len())
+        + str_list_wire_len(layers)
+        + str_list_wire_len(argv)
+        + str_list_wire_len(env)
+        + (4 + cwd.len())
+        + (4 + user.len())
+        + (4 + hostname.len())
+        + 4
+        + (4 + net.bridge.len())
+        + 9
+        + str_list_wire_len(net.extra_hosts)
+        + str_list_wire_len(net.dns_names)
+        + str_list_wire_len(mounts)
+        + 44
+        + 8
+        + str_list_wire_len(net.opts)
+        + str_list_wire_len(opts)
+        + (4 + seccomp.len());
+    out.reserve(exact);
     frame(out, kind::RUN, |out| {
         put_str(out, id);
         StrList::put(out, layers);
@@ -1170,21 +1207,27 @@ impl Msg<'_> {
             }),
             Msg::AwaitStart { id } => frame(out, kind::AWAIT_START, |o| put_str(o, id)),
             Msg::CancelStart { id } => frame(out, kind::CANCEL_START, |o| put_str(o, id)),
-            Msg::Output { id, stream, data } => frame(out, kind::OUTPUT, |o| {
-                put_str(o, id);
-                o.push(stream as u8);
-                put_bytes(o, data);
-            }),
+            Msg::Output { id, stream, data } => {
+                out.reserve(HEADER + 4 + id.len() + 1 + 4 + data.len());
+                frame(out, kind::OUTPUT, |o| {
+                    put_str(o, id);
+                    o.push(stream as u8);
+                    put_bytes(o, data);
+                });
+            }
             Msg::Kill { id, signal } => frame(out, kind::KILL, |o| {
                 put_str(o, id);
                 put_u32(o, signal);
             }),
             Msg::Remove { id } => frame(out, kind::REMOVE, |o| put_str(o, id)),
             Msg::SetTime(ns) => frame(out, kind::SET_TIME, |o| put_u64(o, ns)),
-            Msg::Input { id, data } => frame(out, kind::INPUT, |o| {
-                put_str(o, id);
-                put_bytes(o, data);
-            }),
+            Msg::Input { id, data } => {
+                out.reserve(HEADER + 4 + id.len() + 4 + data.len());
+                frame(out, kind::INPUT, |o| {
+                    put_str(o, id);
+                    put_bytes(o, data);
+                });
+            }
             Msg::CloseStdin { id } => frame(out, kind::CLOSE_STDIN, |o| put_str(o, id)),
             Msg::Resize { id, rows, cols } => frame(out, kind::RESIZE, |o| {
                 put_str(o, id);

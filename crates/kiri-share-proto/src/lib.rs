@@ -250,10 +250,12 @@ impl Msg<'_> {
                 put_u32(o, stream);
                 o.extend_from_slice(remote.as_bytes());
             }),
-            Msg::Data { stream, data } => frame(out, kind::DATA, |o| {
-                put_u32(o, stream);
-                o.extend_from_slice(data);
-            }),
+            Msg::Data { stream, data } => {
+                let hdr = data_header(stream, data.len());
+                out.reserve(hdr.len() + data.len());
+                out.extend_from_slice(&hdr);
+                out.extend_from_slice(data);
+            }
             Msg::Window { stream, credit } => frame(out, kind::WINDOW, |o| {
                 put_u32(o, stream);
                 put_u32(o, credit);
@@ -274,12 +276,12 @@ impl Msg<'_> {
             }),
             Msg::Join { key } => frame(out, kind::JOIN, |o| o.extend_from_slice(key.as_bytes())),
             Msg::Joined => frame(out, kind::JOINED, |_| {}),
-            Msg::Chunk { stream, seq, fin, data } => frame(out, kind::CHUNK, |o| {
-                put_u32(o, stream);
-                put_u32(o, seq);
-                o.push(fin as u8);
-                o.extend_from_slice(data);
-            }),
+            Msg::Chunk { stream, seq, fin, data } => {
+                let hdr = chunk_header(stream, seq, fin, data.len());
+                out.reserve(hdr.len() + data.len());
+                out.extend_from_slice(&hdr);
+                out.extend_from_slice(data);
+            }
         }
     }
 }
