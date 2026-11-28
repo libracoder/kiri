@@ -782,7 +782,7 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
                         let is_user = n.bridge != "kiri0";
                         let attached = net::attach(&mut bridges, n.bridge, &host_if, pid, num, n.ip, n.prefix, n.gateway, mac, v6, plug).and_then(|()| {
                             if !is_user {
-                                if !plug.no_ipv4 && dns.relay {
+                                if plug.bridge_has_ipv4() && dns.relay {
                                     dns.serve_or_warn(n.bridge, n.gateway);
                                 }
                                 return Ok(());
@@ -790,7 +790,8 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
                             // A gateway that won't take the listener doesn't
                             // stop the connect: names answer at 127.0.0.11 in
                             // the container (dns.rs `serve_or_warn`, #477).
-                            if !plug.no_ipv4 {
+                            // No address on an isolated network's bridge (#1001).
+                            if plug.bridge_has_ipv4() {
                                 dns.serve_or_warn(n.bridge, n.gateway);
                             }
                             let res = std::fs::File::open(format!("/proc/{pid}/ns/net")).and_then(|ns| dns.serve_in(&ns, pid, n.bridge));

@@ -773,6 +773,28 @@ t internal-no-default "none" $D run --rm --network intnet alpine sh -c 'ip route
 # An IPv4-only network: IPv6 is off on eth0 (no link-local), lo keeps ::1.
 t v4-net-no-inet6 "none" $D run --rm --network intnet alpine sh -c 'ip -6 addr show eth0 | grep -q inet6 && echo some || echo none'
 $D rm -f intweb >/dev/null; $D network rm intnet >/dev/null
+# gateway_mode_ipv4=isolated (#1001): an internal network whose bridge has
+# no IPv4 address, so the host isn't on it. A plain internal network's
+# containers reach a server on every host address through the gateway; an
+# isolated one's don't, while its containers still find each other by name
+# (Kiri's resolver answers at 127.0.0.11 in each).
+$D rm -f isohost isoweb >/dev/null 2>&1; $D network rm isonet plainint >/dev/null 2>&1
+$D network create --internal plainint >/dev/null
+$D network create --internal -o com.docker.network.bridge.gateway_mode_ipv4=isolated isonet >/dev/null
+$D run -d --name isohost --network host busybox:1.36 httpd -f -p 18997 -h /tmp >/dev/null
+$D run -d --name isoweb --network isonet nginx:alpine >/dev/null
+nginx_up isoweb
+gw_of() { $D network inspect "$1" -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}'; }
+t isolated-plain-internal-reaches-host "reached" $D run --rm --network plainint alpine sh -c "nc -z -w 3 $(gw_of plainint) 18997 && echo reached || echo unreached"
+t isolated-host-unreached "unreached" $D run --rm --network isonet alpine sh -c "nc -z -w 3 $(gw_of isonet) 18997 && echo reached || echo unreached"
+t isolated-names "Welcome to nginx" $D run --rm --network isonet alpine wget -qO- -T 5 http://isoweb
+t isolated-resolver "nameserver 127.0.0.11" $D run --rm --network isonet alpine grep nameserver /etc/resolv.conf
+t isolated-option-shown "isolated" $D network inspect isonet -f '{{index .Options "com.docker.network.bridge.gateway_mode_ipv4"}}'
+# The same through a connect, the network a running container joins.
+t isolated-connect-unreached "unreached" bash -c "$D rm -f isoconn >/dev/null 2>&1; $D run -d --name isoconn --network plainint alpine sleep 60 >/dev/null && $D network connect isonet isoconn && $D exec isoconn sh -c 'nc -z -w 3 $(gw_of isonet) 18997 && echo reached || echo unreached'; $D rm -f isoconn >/dev/null"
+# Only for an internal network, as in Docker.
+t isolated-needs-internal "gateway mode 'isolated' can only be used for an internal network" $D network create -o com.docker.network.bridge.gateway_mode_ipv4=isolated isoext
+$D rm -f isohost isoweb >/dev/null; $D network rm isonet plainint >/dev/null
 
 section "networking options"
 # IPAM: a chosen subnet, gateway, range and reserved address.

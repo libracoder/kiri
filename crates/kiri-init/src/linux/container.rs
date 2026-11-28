@@ -868,7 +868,8 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
             // and its containers no A records.
             // A gateway that won't take the listener doesn't stop the start
             // (dns.rs `serve_or_warn`, #477).
-            let gateway = (!plug.no_ipv4 && net.dns.serve_or_warn(spec.net.bridge, spec.net.gateway)).then_some(spec.net.gateway);
+            // An isolated one's has none either (#1001).
+            let gateway = (plug.bridge_has_ipv4() && net.dns.serve_or_warn(spec.net.bridge, spec.net.gateway)).then_some(spec.net.gateway);
             // 127.0.0.11 in the container, when it is the resolver. Not when
             // the gateway is (the default bridge in the VM, or on a host
             // whose resolver is one of its own addresses): the listener would

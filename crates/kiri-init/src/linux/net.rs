@@ -139,12 +139,22 @@ pub struct Plug {
     pub internal: bool,
     /// IPv6-only: no IPv4 address on the container or the bridge.
     pub no_ipv4: bool,
+    /// `gateway_mode_ipv4=isolated` (#1001): no IPv4 address on the bridge,
+    /// so the host isn't on the network; the container keeps its own.
+    pub no_gateway4: bool,
 }
 
 impl Plug {
     pub fn from_opts(opts: kiri_proto::StrList<'_>) -> Plug {
         use kiri_proto::net_opts as k;
-        Plug { internal: k::values(opts, k::INTERNAL).next().is_some(), no_ipv4: k::values(opts, k::NO_IPV4).next().is_some() }
+        let has = |key| k::values(opts, key).next().is_some();
+        Plug { internal: has(k::INTERNAL), no_ipv4: has(k::NO_IPV4), no_gateway4: has(k::NO_GATEWAY4) }
+    }
+
+    /// Whether the bridge has an IPv4 address: Kiri's resolver can listen
+    /// there, and the network offers an IPv4 gateway.
+    pub fn bridge_has_ipv4(self) -> bool {
+        !self.no_ipv4 && !self.no_gateway4
     }
 }
 
@@ -165,7 +175,7 @@ pub struct Uplink {
 impl Uplink {
     /// None for an internal network, which never gives a default route.
     pub fn of(veth: &str, ifname: &str, gateway: [u8; 4], v6: Option<Ip6>, plug: Plug) -> Option<Uplink> {
-        let v4 = (!plug.internal && !plug.no_ipv4).then_some(gateway);
+        let v4 = (!plug.internal && plug.bridge_has_ipv4()).then_some(gateway);
         let v6 = v6.filter(|_| !plug.internal).map(|v| v.gateway);
         (v4.is_some() || v6.is_some()).then(|| Uplink { veth: veth.to_owned(), ifname: ifname.to_owned(), v4, v6 })
     }
@@ -1408,9 +1418,9 @@ fn attach_with_ns(
     v6: Option<Ip6>,
     plug: Plug,
 ) -> io::Result<()> {
-    let Plug { internal, no_ipv4 } = plug;
+    let Plug { internal, no_ipv4, .. } = plug;
     let mac = Some(mac.unwrap_or_else(|| mac_for(ip)));
-    let bridge_index = bridges.ensure(bridge, (!no_ipv4).then_some(gateway), prefix, v6)?;
+    let bridge_index = bridges.ensure(bridge, plug.bridge_has_ipv4().then_some(gateway), prefix, v6)?;
     let opened_ns;
     let netns = match netns_fd {
         Some(f) => f,
@@ -1457,7 +1467,7 @@ fn attach_with_ns(
         }
         netlink::set_up(&mut inner, index)?;
     }
-    if !internal && !no_ipv4 {
+    if !internal && plug.bridge_has_ipv4() {
         netlink::add_default_route(&mut inner, index, gateway)?;
     }
     if let Some(v) = v6.filter(|_| !internal) {
@@ -1581,11 +1591,24 @@ mod tests {
     #[test]
     fn internal_networks_are_no_uplink() {
         let v6 = Some(Ip6 { ip: [0xfd; 16], prefix: 64, gateway: [0xfd; 16] });
-        assert_eq!(Uplink::of("kv1", "eth0", [10, 0, 0, 1], v6, Plug { internal: true, no_ipv4: false }), None);
+        assert_eq!(Uplink::of("kv1", "eth0", [10, 0, 0, 1], v6, Plug { internal: true, ..Plug::default() }), None);
         let u = Uplink::of("kv1", "eth1", [10, 0, 0, 1], None, Plug::default()).unwrap();
         assert_eq!((u.ifname.as_str(), u.v4, u.v6), ("eth1", Some([10, 0, 0, 1]), None));
-        let u = Uplink::of("kv1", "eth1", [10, 0, 0, 1], v6, Plug { internal: false, no_ipv4: true }).unwrap();
+        let u = Uplink::of("kv1", "eth1", [10, 0, 0, 1], v6, Plug { no_ipv4: true, ..Plug::default() }).unwrap();
         assert_eq!((u.v4, u.v6), (None, Some([0xfd; 16])));
+    }
+
+    /// An isolated network's bridge has no IPv4 address (#1001): no gateway
+    /// to route by or serve DNS on, though the container keeps its own.
+    #[test]
+    fn an_isolated_bridge_has_no_ipv4_gateway() {
+        let iso = Plug { internal: true, no_gateway4: true, ..Plug::default() };
+        assert!(!iso.bridge_has_ipv4());
+        assert!(!Plug { no_ipv4: true, ..Plug::default() }.bridge_has_ipv4());
+        assert!(Plug { internal: true, ..Plug::default() }.bridge_has_ipv4(), "a plain internal network keeps its gateway");
+        assert_eq!(Uplink::of("kv1", "eth0", [10, 0, 0, 1], None, iso), None);
+        let u = Uplink::of("kv1", "eth1", [10, 0, 0, 1], None, Plug { no_gateway4: true, ..Plug::default() });
+        assert_eq!(u.and_then(|u| u.v4), None, "never an IPv4 default route by a gateway that isn't there");
     }
 
     #[test]
@@ -1604,7 +1627,7 @@ mod tests {
         let mut ups = Vec::new();
         ups.extend(Uplink::of("kva0", "eth0", gw_a, None, Plug::default()));
         // An internal network attached in between produces no uplink.
-        ups.extend(Uplink::of("kxi1", "eth1", [10, 98, 9, 1], None, Plug { internal: true, no_ipv4: false }));
+        ups.extend(Uplink::of("kxi1", "eth1", [10, 98, 9, 1], None, Plug { internal: true, ..Plug::default() }));
         ups.extend(Uplink::of("kxz2", "eth2", gw_zeta, None, Plug::default()));
         ups.extend(Uplink::of("kxb3", "eth3", gw_beta, None, Plug::default()));
 
