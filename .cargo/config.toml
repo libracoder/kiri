@@ -11,3 +11,11 @@ linker = "rust-lld"
 rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=/DEPENDENTLOADFLAG:0x800"]
 [target.aarch64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=/DEPENDENTLOADFLAG:0x800"]
+
+# macOS 12 is the minimum version: mark the binaries 12-compatible so
+# the OS lets them run on Monterey (the SDK default would be 14).
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "link-arg=-mmacosx-version-min=12.0"]
+
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=-mmacosx-version-min=12.0"]

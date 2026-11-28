@@ -42,7 +42,7 @@
 
 Make sure you have one of:
 
-- macOS 14 or later, on Apple silicon or Intel
+- macOS 12 or later, on Apple silicon or Intel
 - Windows 10 or 11 with WSL 2, on x86-64 or Arm
 - Linux (Ubuntu, Fedora and others)
 
@@ -58,7 +58,7 @@ Or download the installer for your system:
 
 | Platform | Get it |
 |----------|--------|
-| macOS 14+ (Apple silicon or Intel) | `.dmg` from [runkiri.com/releases](https://runkiri.com/releases/), or `brew install --cask libracoder/kiri/kiri` |
+| macOS 12+ (Apple silicon or Intel) | `.dmg` from [runkiri.com/releases](https://runkiri.com/releases/), or `brew install --cask libracoder/kiri/kiri` |
 | Windows 10 and 11 (x86-64 or Arm, through WSL 2) | `.msi` from [runkiri.com/releases](https://runkiri.com/releases/) |
 | Linux (Ubuntu, Fedora and others) | `.deb` or `.rpm` from [runkiri.com/releases](https://runkiri.com/releases/) |
 

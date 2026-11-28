@@ -435,6 +435,11 @@ fn describe(e: &NSError) -> String {
 /// (`softwareupdate --install-rosetta` adds it).
 #[cfg(target_arch = "aarch64")]
 pub fn rosetta_installed() -> bool {
+    // VZLinuxRosettaDirectoryShare arrived in macOS 13; on macOS 12 the
+    // class does not exist, so check for it before touching it.
+    if objc2::runtime::AnyClass::get(c"VZLinuxRosettaDirectoryShare").is_none() {
+        return false;
+    }
     // SAFETY: a class method with no arguments.
     let availability = unsafe { VZLinuxRosettaDirectoryShare::availability() };
     availability == VZLinuxRosettaAvailability::Installed
