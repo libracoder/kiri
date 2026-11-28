@@ -27,7 +27,10 @@ Apple silicon and Intel Macs (macOS 14+), Windows 10 and 11 (x86-64 and Arm, thr
   with `--network none`; to leave its first network a running container is
   stopped first), `--network host|none`, `-p`/`-P`
   (TCP and UDP) on all interfaces (as Docker does; `-p 127.0.0.1:8080:80`
-  keeps a port local), `--add-host`, `host.docker.internal`,
+  keeps a port local), `--add-host`, `host.docker.internal` (on a Mac it
+  reaches the Mac's own 127.0.0.1 and ::1; for untrusted workloads such as
+  CI jobs, `KIRI_HOST_LOOPBACK=off` in the daemon's environment turns that
+  off, and only Kiri's build mirror stays reachable there),
   `--network container:<name>` (Compose `network_mode: service:x`; as with
   Docker, if that container restarts, the ones sharing its network keep the
   old, now empty namespace until they are restarted too), IPAM (`--subnet`,

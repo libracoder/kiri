@@ -77,6 +77,11 @@ fn save_token(path: &std::path::Path, token: &str) -> io::Result<()> {
     std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)?.write_all(token.as_bytes())
 }
 
+/// The port the mirror listens on, on this computer's loopback, once it does.
+pub fn port() -> Option<u16> {
+    LISTENING.get().copied().flatten().map(|l| l.port)
+}
+
 /// Starts the server (at the daemon's start: a listening socket costs
 /// nothing while no build asks).
 pub fn start(engine: &Arc<Engine>) {

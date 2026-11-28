@@ -957,9 +957,19 @@ python3 -m http.server 18999 --bind $HTTP_BIND --directory "$HTTP_DIR" >/dev/nul
 HTTP_PID=$!
 [ "$SYS" = mac ] || { python3 -m http.server 18998 --bind 127.0.0.1 --directory "$HTTP_DIR" >/dev/null 2>&1 & HTTP_LO_PID=$!; }
 sleep 0.7
+# A daemon started with KIRI_HOST_LOOPBACK=off (#995): containers don't
+# reach the Mac's loopback, though the name still resolves. Run the suite
+# with the same variable set to check it: `KIRI_HOST_LOOPBACK=off kiri
+# daemon`, then `KIRI_HOST_LOOPBACK=off tests/e2e.sh`.
+if [ "$SYS" = mac ] && [ "${KIRI_HOST_LOOPBACK:-}" = off ]; then
+  t host-loopback-off "refused 198.19.248.254" $D run --rm alpine sh -c 'r=refused; wget -qO- -T 5 http://host.docker.internal:18999/ >/dev/null 2>&1 && r=reached; echo "$r $(getent hosts host.docker.internal | cut -d" " -f1)"'
+  t host-loopback-off-gateway "refused" $D run --rm --add-host mac:host-gateway alpine sh -c 'wget -qO- -T 5 http://mac:18999/ >/dev/null 2>&1 && echo reached || echo refused'
+  t host-loopback-off-hostnet "refused" $D run --rm --network host alpine sh -c 'wget -qO- -T 5 http://host.docker.internal:18999/ >/dev/null 2>&1 && echo reached || echo refused'
+else
 t host-internal "Directory listing" $D run --rm alpine wget -qO- http://host.docker.internal:18999/
 t host-gateway "Directory listing" $D run --rm --add-host mac:host-gateway alpine wget -qO- http://mac:18999/
 t host-internal-hostnet "Directory listing" $D run --rm --network host alpine wget -qO- http://host.docker.internal:18999/
+fi
 # A port published on 127.0.0.1 or on every address is in the host's own
 # network, as Docker binds it: a --network host container reaches it at
 # 127.0.0.1 and localhost (::1 first in musl) (#732; a host-network
