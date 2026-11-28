@@ -4,7 +4,7 @@
 //! one thread per connection and never parses more than it needs.
 
 use std::cell::Cell;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, IoSlice, Read, Write};
 use std::os::unix::net::UnixStream;
 
 /// API version this daemon speaks. The Docker CLI negotiates down to it.
@@ -198,7 +198,13 @@ pub fn read_request_with_timeout(
     stream: impl Fn(&str, &str) -> bool,
 ) -> io::Result<Option<Request>> {
     let deadline = std::time::Instant::now() + timeout;
-    r.get_ref().set_read_timeout(Some(timeout))?;
+    // When the buffer is empty (the common non-pipelined case), DeadlineBuf
+    // sets SO_RCVTIMEO to the remaining deadline before the first socket read,
+    // avoiding a redundant setsockopt syscall. When pipelined bytes are already
+    // buffered, set the timeout upfront in case the body still needs a socket read.
+    if !r.buffer().is_empty() {
+        r.get_ref().set_read_timeout(Some(timeout))?;
+    }
     let res = read_request_deadline(r, Some(deadline), stream);
     if matches!(res, Ok(Some(_))) {
         r.get_ref().set_read_timeout(None)?;
@@ -855,35 +861,108 @@ pub fn current_serving() -> (String, String) {
     SERVING.with(|s| s.borrow().clone())
 }
 
-fn head(w: &mut impl Write, status: u16, extra: &str) -> io::Result<()> {
+fn write_all_vectored(w: &mut impl Write, slices: &[&[u8]]) -> io::Result<()> {
+    let mut idx = 0;
+    let mut off = 0;
+    let mut io_bufs = [IoSlice::new(&[]); 4];
+    while idx < slices.len() {
+        let mut count = 0;
+        for (i, &s) in slices[idx..].iter().enumerate() {
+            let chunk = if i == 0 { &s[off..] } else { s };
+            if !chunk.is_empty() {
+                io_bufs[count] = IoSlice::new(chunk);
+                count += 1;
+            }
+        }
+        if count == 0 {
+            return Ok(());
+        }
+        match w.write_vectored(&io_bufs[..count]) {
+            Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero, "failed to write whole vectored buffer")),
+            Ok(mut n) => {
+                while n > 0 && idx < slices.len() {
+                    let rem = slices[idx].len() - off;
+                    if n >= rem {
+                        n -= rem;
+                        idx += 1;
+                        off = 0;
+                    } else {
+                        off += n;
+                        n = 0;
+                    }
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+fn format_head(buf: &mut Vec<u8>, status: u16, extra: &str) {
     if status >= 400 {
         note_failure(status);
     }
     // A response that names its own Connection (an upgrade, `CLOSE`) keeps it.
     let closing = if (CLOSING.with(std::cell::Cell::get) || PENDING_CONTINUE.with(std::cell::Cell::get)) && !extra.contains("Connection:") { CLOSE } else { "" };
-    write!(
-        w,
+    let _ = write!(
+        buf,
         "HTTP/1.1 {status} {}\r\nApi-Version: {API_VERSION}\r\nDocker-Experimental: false\r\nOstype: linux\r\nServer: Kiri/{} (linux)\r\n{extra}{closing}\r\n",
         reason(status),
         env!("CARGO_PKG_VERSION")
-    )
+    );
+}
+
+fn head(w: &mut impl Write, status: u16, extra: &str) -> io::Result<()> {
+    let mut buf = Vec::with_capacity(160 + extra.len());
+    format_head(&mut buf, status, extra);
+    w.write_all(&buf)
 }
 
 pub fn respond(w: &mut impl Write, status: u16, content_type: &str, body: &[u8]) -> io::Result<()> {
-    let extra = if status == 204 || status == 304 {
-        String::new()
+    let mut hdr = Vec::with_capacity(224);
+    if status == 204 || status == 304 {
+        format_head(&mut hdr, status, "");
     } else {
-        format!("Content-Type: {content_type}\r\nContent-Length: {}\r\n", body.len())
-    };
-    head(w, status, &extra)?;
-    w.write_all(body)?;
+        if status >= 400 {
+            note_failure(status);
+        }
+        let closing = if CLOSING.with(std::cell::Cell::get) || PENDING_CONTINUE.with(std::cell::Cell::get) { CLOSE } else { "" };
+        let _ = write!(
+            hdr,
+            "HTTP/1.1 {status} {}\r\nApi-Version: {API_VERSION}\r\nDocker-Experimental: false\r\nOstype: linux\r\nServer: Kiri/{} (linux)\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n{closing}\r\n",
+            reason(status),
+            env!("CARGO_PKG_VERSION"),
+            body.len(),
+        );
+    }
+    if body.is_empty() {
+        w.write_all(&hdr)?;
+    } else {
+        write_all_vectored(w, &[&hdr, body])?;
+    }
     w.flush()
 }
 
 /// `respond` plus extra header lines, each ending in CRLF.
 pub fn respond_with(w: &mut impl Write, status: u16, content_type: &str, extra: &str, body: &[u8]) -> io::Result<()> {
-    head(w, status, &format!("Content-Type: {content_type}\r\nContent-Length: {}\r\n{extra}", body.len()))?;
-    w.write_all(body)?;
+    if status >= 400 {
+        note_failure(status);
+    }
+    let closing = if (CLOSING.with(std::cell::Cell::get) || PENDING_CONTINUE.with(std::cell::Cell::get)) && !extra.contains("Connection:") { CLOSE } else { "" };
+    let mut hdr = Vec::with_capacity(224 + extra.len());
+    let _ = write!(
+        hdr,
+        "HTTP/1.1 {status} {}\r\nApi-Version: {API_VERSION}\r\nDocker-Experimental: false\r\nOstype: linux\r\nServer: Kiri/{} (linux)\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n{extra}{closing}\r\n",
+        reason(status),
+        env!("CARGO_PKG_VERSION"),
+        body.len(),
+    );
+    if body.is_empty() {
+        w.write_all(&hdr)?;
+    } else {
+        write_all_vectored(w, &[&hdr, body])?;
+    }
     w.flush()
 }
 
@@ -934,9 +1013,13 @@ pub fn chunk(w: &mut impl Write, data: &[u8]) -> io::Result<()> {
     if data.is_empty() {
         return Ok(());
     }
-    write!(w, "{:x}\r\n", data.len())?;
-    w.write_all(data)?;
-    w.write_all(b"\r\n")?;
+    let mut len_buf = [0u8; 20];
+    let n = {
+        let mut cur = io::Cursor::new(&mut len_buf[..]);
+        let _ = write!(cur, "{:x}\r\n", data.len());
+        cur.position() as usize
+    };
+    write_all_vectored(w, &[&len_buf[..n], data, b"\r\n"])?;
     w.flush()
 }
 
@@ -979,8 +1062,7 @@ pub fn mux_frame(w: &mut impl Write, stream: u8, data: &[u8]) -> io::Result<()> 
     let mut header = [0u8; 8];
     header[0] = stream;
     header[4..].copy_from_slice(&(data.len() as u32).to_be_bytes());
-    w.write_all(&header)?;
-    w.write_all(data)?;
+    write_all_vectored(w, &[&header, data])?;
     w.flush()
 }
 

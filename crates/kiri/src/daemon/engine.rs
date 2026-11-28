@@ -6443,11 +6443,18 @@ impl Engine {
 
     /// Runs `f` over every container alongside the current networks slice,
     /// taking shared read locks (container state before networks).
-    pub fn each_with_networks<T>(&self, mut f: impl FnMut(&Container, &[super::network::Network]) -> Option<T>) -> Vec<T> {
+    pub fn with_containers_and_networks<T>(&self, f: impl FnOnce(&[&Container], &[super::network::Network]) -> T) -> T {
         let s = self.read();
         let net = self.read_net();
-        let networks = net.all();
-        s.containers.values().filter_map(|c| f(c, networks)).collect()
+        let containers: Vec<&Container> = s.containers.values().collect();
+        f(&containers, net.all())
+    }
+
+    pub fn status_counts(&self) -> (usize, usize) {
+        let s = self.read();
+        let total = s.containers.len();
+        let running = s.containers.values().filter(|c| c.status == Status::Running).count();
+        (total, running)
     }
 
     pub fn with<T>(&self, key: &str, f: impl FnOnce(&Container) -> T) -> Result<T, Error> {

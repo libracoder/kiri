@@ -102,7 +102,18 @@ pub(super) fn reply(w: &mut UnixStream, result: Result<Value, Error>, ok: u16) -
         // 201 for a tag, 200 for a network connect or disconnect. Client
         // libraries that check the exact status need it.
         Ok(Value::Null) => http::empty(w, ok)?,
-        Ok(v) => http::json(w, ok, &v.to_string())?,
+        Ok(v) => {
+            let bytes = serde_json::to_vec(&v).map_err(io::Error::other)?;
+            http::respond(w, ok, "application/json", &bytes)?;
+        }
+        Err(e) => error(w, e)?,
+    }
+    Ok(Next::KeepAlive)
+}
+
+fn reply_json_bytes(w: &mut UnixStream, result: Result<Vec<u8>, Error>, ok: u16) -> io::Result<Next> {
+    match result {
+        Ok(bytes) => http::respond(w, ok, "application/json", &bytes)?,
         Err(e) => error(w, e)?,
     }
     Ok(Next::KeepAlive)
@@ -287,7 +298,7 @@ fn route(req: &Request, engine: &Arc<Engine>, caller: &Caller, w: &mut UnixStrea
             }
             return Ok(Next::KeepAlive);
         }
-        ("GET", "/info") => return reply(w, Ok(info(engine)), 200),
+        ("GET", "/info") => return reply_json_bytes(w, info_json_bytes(engine), 200),
         ("POST", "/build") => return super::builder::build(req, engine, w, r),
         ("POST", "/build/cancel") => return reply(w, super::builder::cancel(req, engine), 200),
         ("POST", "/build/prune") => return reply(w, super::builder::prune(req, engine), 200),
@@ -306,7 +317,7 @@ fn route(req: &Request, engine: &Arc<Engine>, caller: &Caller, w: &mut UnixStrea
         ("POST", "/kiri/fs-events") => return reply(w, fs_events(req, engine), 204),
         ("GET", "/kiri/win-ports") => return reply(w, Ok(win_ports(engine)), 200),
         ("POST", "/kiri/win-ports") => return reply(w, sync_win_ports(req, engine), 200),
-        ("GET", "/images/json") => return reply(w, images(req, engine), 200),
+        ("GET", "/images/json") => return reply_json_bytes(w, images_json_bytes(req, engine), 200),
         ("POST", "/images/create") if req.query("fromSrc").is_some_and(|s| !s.is_empty()) => return image_import(req, engine, w, r),
         ("POST", "/images/create") => return pull(req, engine, w),
         ("POST", "/images/load") => return image_load(req, engine, w, r),
@@ -320,7 +331,7 @@ fn route(req: &Request, engine: &Arc<Engine>, caller: &Caller, w: &mut UnixStrea
             }
             return reply(w, create_by(req, engine, caller), 201);
         }
-        ("GET", "/containers/json") => return reply(w, list(req, engine), 200),
+        ("GET", "/containers/json") => return reply_json_bytes(w, list_json_bytes(req, engine), 200),
         ("GET", "/networks") => return reply(w, networks(req, engine), 200),
         ("POST", "/networks/create") => return reply(w, network_create(req, engine), 201),
         ("POST", "/networks/prune") => return reply(w, network_prune(req, engine), 200),
@@ -536,57 +547,113 @@ pub(super) fn version() -> Value {
     })
 }
 
-fn info(engine: &Engine) -> Value {
-    let states = engine.each(|c| Some(c.status));
-    let running = states.iter().filter(|s| **s == Status::Running).count();
+#[derive(serde::Serialize)]
+struct InfoKiriRuntime {
+    path: &'static str,
+}
+
+#[derive(serde::Serialize)]
+struct InfoRuntimes {
+    kiri: InfoKiriRuntime,
+}
+
+#[derive(serde::Serialize)]
+#[allow(non_snake_case)]
+struct InfoSummary {
+    ID: &'static str,
+    Name: &'static str,
+    Containers: usize,
+    ContainersRunning: usize,
+    ContainersPaused: usize,
+    ContainersStopped: usize,
+    Images: usize,
+    Driver: &'static str,
+    ServerVersion: &'static str,
+    KiriVersion: &'static str,
+    OperatingSystem: &'static str,
+    OSType: &'static str,
+    Architecture: &'static str,
+    KernelVersion: String,
+    NCPU: usize,
+    MemTotal: u64,
+    DockerRootDir: &'static str,
+    CgroupDriver: &'static str,
+    CgroupVersion: &'static str,
+    DefaultRuntime: &'static str,
+    Runtimes: InfoRuntimes,
+    SecurityOptions: [&'static str; 2],
+    SystemTime: String,
+    BuilderVersion: &'static str,
+    IndexServerAddress: &'static str,
+    RegistryConfig: Value,
+    KiriAgentMemory: u64,
+    KiriVmAwake: bool,
+    KiriVmUplink: Value,
+    KiriStopped: bool,
+    KiriMemoryCeiling: u64,
+    KiriMemoryTarget: u64,
+    KiriMemoryUsed: u64,
+    KiriMemoryStall: f64,
+    KiriOomKills: u64,
+    KiriCpuPercent: f64,
+    KiriStorageReadOnly: Option<String>,
+    KiriStorageZfs: bool,
+    Warnings: Vec<String>,
+}
+
+fn info_json_bytes(engine: &Engine) -> Result<Vec<u8>, Error> {
+    let (total, running) = engine.status_counts();
     let images = engine.store.image_count().unwrap_or(0);
     let (mem_total, _) = engine.guest_memory().unwrap_or((0, 0));
-    json!({
-        "ID": "kiri",
-        "Name": "kiri",
-        "Containers": states.len(),
-        "ContainersRunning": running,
-        "ContainersPaused": 0,
-        "ContainersStopped": states.len() - running,
-        "Images": images,
-        "Driver": "overlayfs",
-        "ServerVersion": ENGINE_VERSION,
-        "KiriVersion": env!("CARGO_PKG_VERSION"),
-        "OperatingSystem": "Kiri",
-        "OSType": "linux",
-        "Architecture": std::env::consts::ARCH,
-        "KernelVersion": kernel_version(),
-        "NCPU": engine.cpus(),
-        "MemTotal": mem_total,
-        "DockerRootDir": "/var/lib/kiri",
-        "CgroupDriver": "cgroupfs",
-        "CgroupVersion": "2",
-        "DefaultRuntime": "kiri",
-        "Runtimes": {"kiri": {"path": "kiri-init"}},
-        "SecurityOptions": ["name=seccomp,profile=builtin", "name=cgroupns"],
+    let (mem_ceiling, mem_target) = engine.memory();
+    let (mem_stall, oom_kills) = engine.memory_trouble();
+    let summary = InfoSummary {
+        ID: "kiri",
+        Name: "kiri",
+        Containers: total,
+        ContainersRunning: running,
+        ContainersPaused: 0,
+        ContainersStopped: total - running,
+        Images: images,
+        Driver: "overlayfs",
+        ServerVersion: ENGINE_VERSION,
+        KiriVersion: env!("CARGO_PKG_VERSION"),
+        OperatingSystem: "Kiri",
+        OSType: "linux",
+        Architecture: std::env::consts::ARCH,
+        KernelVersion: kernel_version(),
+        NCPU: engine.cpus(),
+        MemTotal: mem_total,
+        DockerRootDir: "/var/lib/kiri",
+        CgroupDriver: "cgroupfs",
+        CgroupVersion: "2",
+        DefaultRuntime: "kiri",
+        Runtimes: InfoRuntimes { kiri: InfoKiriRuntime { path: "kiri-init" } },
+        SecurityOptions: ["name=seccomp,profile=builtin", "name=cgroupns"],
         // Compose needs it to attach in `up` and `logs -f` (#346).
-        "SystemTime": time::rfc3339(std::time::SystemTime::now()),
+        SystemTime: time::rfc3339(std::time::SystemTime::now()),
         // Not in Docker's /info (the ping's Builder-Version header is), but
         // tools print it: the classic builder API, served by builder.rs.
-        "BuilderVersion": "1",
+        BuilderVersion: "1",
         // `docker info`'s Registry, Insecure Registries and Registry Mirrors:
         // daemon.json's, as Docker reports its own.
-        "IndexServerAddress": "https://index.docker.io/v1/",
-        "RegistryConfig": super::daemon_json::info(),
-        "KiriAgentMemory": engine.agent_rss().unwrap_or(0),
-        "KiriVmAwake": engine.is_awake(),
-        "KiriVmUplink": engine.uplink_info(),
-        "KiriStopped": engine.is_stopped(),
-        "KiriMemoryCeiling": engine.memory().0,
-        "KiriMemoryTarget": engine.memory().1,
-        "KiriMemoryUsed": engine.memory_used(),
-        "KiriMemoryStall": engine.memory_trouble().0,
-        "KiriOomKills": engine.memory_trouble().1,
-        "KiriCpuPercent": engine.cpu_percent(),
-        "KiriStorageReadOnly": engine.storage_readonly(),
-        "KiriStorageZfs": engine.storage_zfs(),
-        "Warnings": engine.records_damage().into_iter().chain(engine.image_damage()).chain(engine.host_warnings()).collect::<Vec<_>>(),
-    })
+        IndexServerAddress: "https://index.docker.io/v1/",
+        RegistryConfig: super::daemon_json::info(),
+        KiriAgentMemory: engine.agent_rss().unwrap_or(0),
+        KiriVmAwake: engine.is_awake(),
+        KiriVmUplink: engine.uplink_info(),
+        KiriStopped: engine.is_stopped(),
+        KiriMemoryCeiling: mem_ceiling,
+        KiriMemoryTarget: mem_target,
+        KiriMemoryUsed: engine.memory_used(),
+        KiriMemoryStall: mem_stall,
+        KiriOomKills: oom_kills,
+        KiriCpuPercent: engine.cpu_percent(),
+        KiriStorageReadOnly: engine.storage_readonly(),
+        KiriStorageZfs: engine.storage_zfs(),
+        Warnings: engine.records_damage().into_iter().chain(engine.image_damage()).chain(engine.host_warnings()).collect(),
+    };
+    serde_json::to_vec(&summary).map_err(|e| Error::Io(io::Error::other(e)))
 }
 
 pub(super) fn filters(req: &Request, known: &[&str]) -> Result<Filters, Error> {
@@ -643,7 +710,47 @@ fn merge_labels(image_cfg: &Value, body_labels: &Value) -> Value {
     }
 }
 
+/// Serializes `Option<T>` as a 0- or 1-element JSON array without allocating a `Vec`.
+struct OptSeq<T>(Option<T>);
+
+impl<T: serde::Serialize> serde::Serialize for OptSeq<T> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        match &self.0 {
+            Some(v) => {
+                let mut seq = serializer.serialize_seq(Some(1))?;
+                seq.serialize_element(v)?;
+                seq.end()
+            }
+            None => serializer.serialize_seq(Some(0))?.end(),
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+#[allow(non_snake_case)]
+struct ImageSummary<'a> {
+    Id: &'a str,
+    ParentId: &'static str,
+    RepoTags: OptSeq<&'a str>,
+    RepoDigests: OptSeq<std::borrow::Cow<'a, str>>,
+    Created: i64,
+    Size: u64,
+    SharedSize: i64,
+    VirtualSize: u64,
+    Labels: &'a Value,
+    Containers: i64,
+    // Not Docker's: when this image arrived here, for the window.
+    Pulled: u64,
+}
+
+#[cfg(test)]
 fn images(req: &Request, engine: &Engine) -> Result<Value, Error> {
+    let bytes = images_json_bytes(req, engine)?;
+    serde_json::from_slice(&bytes).map_err(|e| Error::Io(io::Error::other(e)))
+}
+
+fn images_json_bytes(req: &Request, engine: &Engine) -> Result<Vec<u8>, Error> {
     let f = filters(req, &["reference", "dangling", "label", "label!", "before", "since", "until"])?;
     let list = engine.store.images_arc()?;
     // Newest first, as Docker lists them (#364). Parse each timestamp once and sort indices.
@@ -676,55 +783,59 @@ fn images(req: &Request, engine: &Engine) -> Result<Value, Error> {
     }
     let labels = engine.image_labels(&list);
     let need_ts = before.is_some() || since.is_some();
-    Ok(Value::Array(
-        order
-            .into_iter()
-            .filter_map(|(created_unix, idx)| {
-                let i = &list[idx];
-                let labels = &labels[idx];
-                // Kiri keeps an untagged image under its ID.
-                let untagged = i.name.starts_with("sha256:") && !list.iter().any(|o| o.config_digest == i.config_digest && !o.name.starts_with("sha256:"));
-                if i.name.starts_with("sha256:") && !untagged {
+    let legacy_none = req.api_version.is_some_and(|v| v < (1, 43));
+    let tagged_configs: Option<std::collections::HashSet<&str>> = list
+        .iter()
+        .any(|i| i.name.starts_with("sha256:"))
+        .then(|| list.iter().filter(|o| !o.name.starts_with("sha256:")).map(|o| o.config_digest.as_str()).collect());
+    let rows: Vec<ImageSummary<'_>> = order
+        .into_iter()
+        .filter_map(|(created_unix, idx)| {
+            let i = &list[idx];
+            let labels = &labels[idx];
+            // Kiri keeps an untagged image under its ID.
+            let is_sha = i.name.starts_with("sha256:");
+            let untagged = is_sha && !tagged_configs.as_ref().is_some_and(|s| s.contains(i.config_digest.as_str()));
+            if is_sha && !untagged {
+                return None;
+            }
+            if dangling.is_some_and(|d| d != untagged) {
+                return None;
+            }
+            if (untagged && f.values("reference").is_some()) || (!untagged && !f.any("reference", |p| reference_matches(p, &i.name))) {
+                return None;
+            }
+            if !f.labels(labels) {
+                return None;
+            }
+            if need_ts {
+                let t = created(i);
+                if before.is_some_and(|b| !t.is_some_and(|t| t < b)) || since.is_some_and(|s| !t.is_some_and(|t| t > s)) {
                     return None;
                 }
-                if dangling.is_some_and(|d| d != untagged) {
-                    return None;
-                }
-                if (untagged && f.values("reference").is_some()) || (!untagged && !f.any("reference", |p| reference_matches(p, &i.name))) {
-                    return None;
-                }
-                if !f.labels(labels) {
-                    return None;
-                }
-                if need_ts {
-                    let t = created(i);
-                    if before.is_some_and(|b| !t.is_some_and(|t| t < b)) || since.is_some_and(|s| !t.is_some_and(|t| t > s)) {
-                        return None;
-                    }
-                }
-                // Untagged: no names; before API 1.43 Docker wrote `<none>` ones.
-                let (tags, digests) = match (untagged, req.api_version.is_some_and(|v| v < (1, 43))) {
-                    (false, _) => (json!([i.name]), json!(i.repo_digest().into_iter().collect::<Vec<_>>())),
-                    (true, false) => (json!([]), json!([])),
-                    (true, true) => (json!(["<none>:<none>"]), json!(["<none>@<none>"])),
-                };
-                Some(json!({
-                    "Id": i.config_digest,
-                    "ParentId": "",
-                    "RepoTags": tags,
-                    "RepoDigests": digests,
-                    "Created": created_unix,
-                    "Size": i.size,
-                    "SharedSize": -1,
-                    "VirtualSize": i.size,
-                    "Labels": labels,
-                    "Containers": -1,
-                    // Not Docker's: when this image arrived here, for the window.
-                    "Pulled": i.pulled_at,
-                }))
+            }
+            // Untagged: no names; before API 1.43 Docker wrote `<none>` ones.
+            let (tags, digests) = match (untagged, legacy_none) {
+                (false, _) => (OptSeq(Some(i.name.as_str())), OptSeq(i.repo_digest().map(std::borrow::Cow::Owned))),
+                (true, false) => (OptSeq(None), OptSeq(None)),
+                (true, true) => (OptSeq(Some("<none>:<none>")), OptSeq(Some(std::borrow::Cow::Borrowed("<none>@<none>")))),
+            };
+            Some(ImageSummary {
+                Id: &i.config_digest,
+                ParentId: "",
+                RepoTags: tags,
+                RepoDigests: digests,
+                Created: created_unix,
+                Size: i.size,
+                SharedSize: -1,
+                VirtualSize: i.size,
+                Labels: labels,
+                Containers: -1,
+                Pulled: i.pulled_at,
             })
-            .collect(),
-    ))
+        })
+        .collect();
+    serde_json::to_vec(&rows).map_err(|e| Error::Io(io::Error::other(e)))
 }
 
 /// The image list's `dangling` filter as Docker's `GetBoolOrDefault` reads
@@ -2735,17 +2846,6 @@ fn exposed_ports(body: &Value, image_cfg: &Value) -> Vec<String> {
     ports
 }
 
-/// What is published right now: Docker's `Ports` list for `ps`.
-fn ports_list(c: &Container) -> Value {
-    let Some(fw) = &c.forwards else { return json!([]) };
-    Value::Array(
-        fw.bound
-            .iter()
-            .map(|(b, ip, port)| json!({"IP": ip, "PrivatePort": b.container_port, "PublicPort": port, "Type": b.proto}))
-            .collect(),
-    )
-}
-
 /// What `-p` asked for, as Docker's inspect keeps it in HostConfig: the
 /// container port and protocol, each with the host address and port given
 /// (an empty HostPort for "any free port"). Empty, not null, with none.
@@ -3605,7 +3705,156 @@ fn spec_wsl_distro(spec: &super::engine::Spec) -> Option<String> {
     None
 }
 
+struct SlashName<'a>(&'a str);
+
+impl serde::Serialize for SlashName<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(&format_args!("/{}", self.0))
+    }
+}
+
+#[derive(serde::Serialize)]
+#[allow(non_snake_case)]
+struct PortSummary<'a> {
+    IP: &'a str,
+    PrivatePort: u16,
+    PublicPort: u16,
+    Type: &'a str,
+}
+
+#[derive(serde::Serialize)]
+#[allow(non_snake_case)]
+struct IpamConfigSummary<'a> {
+    #[serde(skip_serializing_if = "str::is_empty")]
+    IPv4Address: &'a str,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    IPv6Address: &'a str,
+}
+
+#[derive(serde::Serialize)]
+#[allow(non_snake_case)]
+struct EndpointSummary<'a> {
+    IPAMConfig: Option<IpamConfigSummary<'a>>,
+    Links: Option<()>,
+    Aliases: Option<&'a [String]>,
+    MacAddress: &'static str,
+    DriverOpts: Option<()>,
+    NetworkID: &'a str,
+    EndpointID: &'a str,
+    Gateway: String,
+    IPAddress: String,
+    IPPrefixLen: u8,
+    IPv6Gateway: String,
+    GlobalIPv6Address: String,
+    GlobalIPv6PrefixLen: u8,
+    DNSNames: Option<()>,
+}
+
+#[derive(serde::Serialize)]
+#[allow(non_snake_case)]
+struct HostConfigSummary<'a> {
+    NetworkMode: &'a str,
+}
+
+#[derive(serde::Serialize)]
+#[allow(non_snake_case)]
+struct NetworkSettingsSummary<'a> {
+    Networks: std::collections::BTreeMap<&'a str, EndpointSummary<'a>>,
+}
+
+#[derive(serde::Serialize)]
+#[allow(non_snake_case)]
+struct ContainerSummary<'a> {
+    Id: &'a str,
+    Names: [SlashName<'a>; 1],
+    Image: &'a str,
+    ImageID: &'a str,
+    Command: String,
+    Created: i64,
+    State: &'static str,
+    Status: String,
+    KiriStartedAt: Option<i64>,
+    KiriFinishedAt: Option<i64>,
+    KiriExitCode: i32,
+    KiriOOMKilled: bool,
+    KiriVmStopped: bool,
+    KiriStoppedByUser: bool,
+    Ports: Vec<PortSummary<'a>>,
+    Labels: &'a Value,
+    HostConfig: HostConfigSummary<'a>,
+    NetworkSettings: NetworkSettingsSummary<'a>,
+    Mounts: &'a [Value],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    KiriWslDistro: Option<String>,
+}
+
+fn endpoints_typed<'a>(c: &'a Container, networks: &'a [super::network::Network]) -> std::collections::BTreeMap<&'a str, EndpointSummary<'a>> {
+    let mut out = std::collections::BTreeMap::new();
+    if c.spec.network_mode.starts_with("container:") || c.spec.left_all_networks {
+        return out;
+    }
+    let running = c.status == Status::Running;
+    let mut add = |name: &'a str, ip: Option<[u8; 4]>, ip6: Option<[u8; 16]>, aliases: &'a [String], want4: &'a str, want6: &'a str| {
+        let net = networks.iter().find(|n| n.name == name || n.id == name);
+        let ip = ip.filter(|_| running && !net.is_some_and(|n| n.no_ipv4));
+        let ip6 = ip6.filter(|_| running);
+        let gateway = match (ip, net) {
+            (Some(_), Some(n)) if n.gateway != [0; 4] => super::network::ip_str(n.gateway),
+            _ => String::new(),
+        };
+        let v6 = net.and_then(|n| n.v6.as_ref()).filter(|_| ip6.is_some());
+        let ipam = (!want4.is_empty() || !want6.is_empty()).then_some(IpamConfigSummary {
+            IPv4Address: want4,
+            IPv6Address: want6,
+        });
+        out.insert(
+            name,
+            EndpointSummary {
+                IPAMConfig: ipam,
+                Links: None,
+                Aliases: (!aliases.is_empty()).then_some(aliases),
+                MacAddress: "",
+                DriverOpts: None,
+                NetworkID: net.map_or("", |n| n.id.as_str()),
+                EndpointID: if running { c.id.as_str() } else { "" },
+                Gateway: gateway,
+                IPAddress: ip.map(super::network::ip_str).unwrap_or_default(),
+                IPPrefixLen: if ip.is_some() { net.map_or(16, |n| n.prefix) } else { 0 },
+                IPv6Gateway: v6.map(|v| super::network::ip6_str(v.gateway)).unwrap_or_default(),
+                GlobalIPv6Address: ip6.map(super::network::ip6_str).unwrap_or_default(),
+                GlobalIPv6PrefixLen: v6.map_or(0, |v| v.prefix),
+                DNSNames: None,
+            },
+        );
+    };
+    add(&c.spec.network_mode, c.ip, c.ip6, &c.spec.aliases, &c.spec.ipv4_address, &c.spec.ipv6_address);
+    for x in &c.spec.extra_networks {
+        let ip6 = c.extra_ip6s.iter().find(|(n, _)| *n == x.name).map(|(_, ip)| *ip);
+        add(&x.name, c.extra_ips.iter().find(|(n, _)| *n == x.name).map(|(_, ip)| *ip), ip6, &x.aliases, &x.ipv4_address, &x.ipv6_address);
+    }
+    out
+}
+
+fn ports_list_typed(c: &Container) -> Vec<PortSummary<'_>> {
+    let Some(fw) = &c.forwards else { return Vec::new() };
+    fw.bound
+        .iter()
+        .map(|(b, ip, port)| PortSummary {
+            IP: ip.as_str(),
+            PrivatePort: b.container_port,
+            PublicPort: *port,
+            Type: b.proto.as_str(),
+        })
+        .collect()
+}
+
+#[cfg(test)]
 fn list(req: &Request, engine: &Engine) -> Result<Value, Error> {
+    let bytes = list_json_bytes(req, engine)?;
+    serde_json::from_slice(&bytes).map_err(|e| Error::Io(io::Error::other(e)))
+}
+
+fn list_json_bytes(req: &Request, engine: &Engine) -> Result<Vec<u8>, Error> {
     let f = filters(req, &["id", "name", "label", "label!", "status", "ancestor", "network", "exited", "volume", "health"])?;
     if let Some(bad) = f.values("health").and_then(|v| v.iter().find(|v| !super::health::valid_filter(v))) {
         return Err(Error::BadRequest(format!("Unrecognised filter value for health: {bad}")));
@@ -3629,67 +3878,69 @@ fn list(req: &Request, engine: &Engine) -> Result<Value, Error> {
         || f.values("exited").is_some();
     let empty_obj = Value::Object(serde_json::Map::new());
     let has_net_filter = f.values("network").is_some();
-    let mut rows = engine.each_with_networks(|c, networks| {
-        if !all && c.status != Status::Running {
-            return None;
-        }
-        let labels_ref = if c.spec.labels.is_object() { &c.spec.labels } else { &empty_obj };
-        let keep = f.any("id", |v| c.id.starts_with(v))
-            && f.any("status", |v| v == state_word(c))
-            && f.any("exited", |v| c.status == Status::Exited && v.parse() == Ok(c.exit_code))
-            && f.labels(labels_ref)
-            && f.name(&c.name)
-            && ancestors.as_ref().is_none_or(|ids| ids.contains(&c.spec.image_id))
-            && (!has_net_filter || {
-                let first = (!c.spec.left_all_networks)
-                    .then(|| networks.iter().find(|n| n.name == c.spec.network_mode || n.id == c.spec.network_mode || (c.spec.network_mode == "default" && n.name == "bridge")))
-                    .flatten();
-                f.any("network", |v| {
-                    first.is_some_and(|n| n.name == v || n.id.starts_with(v))
-                        || c.spec.extra_networks.iter().any(|x| networks.iter().find(|n| n.name == x.name).is_some_and(|n| n.name == v || n.id.starts_with(v)))
-                })
+    engine.with_containers_and_networks(|containers, networks| {
+        let mut matched: Vec<&Container> = containers
+            .iter()
+            .copied()
+            .filter(|c| {
+                if !all && c.status != Status::Running {
+                    return false;
+                }
+                let labels_ref = if c.spec.labels.is_object() { &c.spec.labels } else { &empty_obj };
+                f.any("id", |v| c.id.starts_with(v))
+                    && f.any("status", |v| v == state_word(c))
+                    && f.any("exited", |v| c.status == Status::Exited && v.parse() == Ok(c.exit_code))
+                    && f.labels(labels_ref)
+                    && f.name(&c.name)
+                    && ancestors.as_ref().is_none_or(|ids| ids.contains(&c.spec.image_id))
+                    && (!has_net_filter || {
+                        let first = (!c.spec.left_all_networks)
+                            .then(|| networks.iter().find(|n| n.name == c.spec.network_mode || n.id == c.spec.network_mode || (c.spec.network_mode == "default" && n.name == "bridge")))
+                            .flatten();
+                        f.any("network", |v| {
+                            first.is_some_and(|n| n.name == v || n.id.starts_with(v))
+                                || c.spec.extra_networks.iter().any(|x| networks.iter().find(|n| n.name == x.name).is_some_and(|n| n.name == v || n.id.starts_with(v)))
+                        })
+                    })
+                    && f.any("volume", |v| c.spec.volumes.iter().chain(&c.spec.anon_volumes).any(|n| n == v) || c.spec.mount_info.iter().any(|m| m["Destination"] == v || m["Source"] == v))
+                    && f.any("health", |v| v == health.get(&c.id).map_or("none", |h| h.status.as_str()))
             })
-            && f.any("volume", |v| c.spec.volumes.iter().chain(&c.spec.anon_volumes).any(|n| n == v) || c.spec.mount_info.iter().any(|m| m["Destination"] == v || m["Source"] == v))
-            && f.any("health", |v| v == health.get(&c.id).map_or("none", |h| h.status.as_str()));
-        if !keep {
-            return None;
+            .collect();
+        // Sort and truncate BEFORE building any JSON rows!
+        matched.sort_by(|a, b| b.created.cmp(&a.created).then_with(|| a.id.cmp(&b.id)));
+        if let Some(limit) = limit {
+            matched.truncate(limit);
         }
-        let mut row = json!({
-            "Id": c.id,
-            "Names": [format!("/{}", c.name)],
-            "Image": c.spec.image,
-            "ImageID": c.spec.image_id,
-            "Command": c.argv().join(" "),
-            "Created": time::unix(c.created),
-            "State": state_word(c),
-            "Status": ps_status(c, health.get(&c.id)),
-            // Kiri's own: the window counts "Up 3 s" from these every second.
-            // Docker clients ignore fields they don't know.
-            "KiriStartedAt": c.started.map(time::unix),
-            "KiriFinishedAt": c.finished.map(time::unix),
-            "KiriExitCode": c.exit_code,
-            "KiriOOMKilled": c.oom_killed,
-            "KiriVmStopped": c.vm_stopped,
-            "KiriStoppedByUser": c.stopped_by_user,
-            "Ports": ports_list(c),
-            "Labels": labels_ref,
-            "HostConfig": {"NetworkMode": c.spec.network_mode},
-            "NetworkSettings": {"Networks": endpoints(c, networks)},
-            "Mounts": c.spec.mount_info,
-        });
-        if let Some(distro) = spec_wsl_distro(&c.spec) {
-            row["KiriWslDistro"] = json!(distro);
-        }
-        Some((c.created, row))
-    });
-    rows.sort_by(|a, b| {
-        b.0.cmp(&a.0)
-            .then_with(|| a.1["Id"].as_str().cmp(&b.1["Id"].as_str()))
-    });
-    if let Some(limit) = limit {
-        rows.truncate(limit);
-    }
-    Ok(Value::Array(rows.into_iter().map(|(_, v)| v).collect()))
+        let rows: Vec<ContainerSummary<'_>> = matched
+            .into_iter()
+            .map(|c| {
+                let labels_ref = if c.spec.labels.is_object() { &c.spec.labels } else { &empty_obj };
+                ContainerSummary {
+                    Id: &c.id,
+                    Names: [SlashName(&c.name)],
+                    Image: &c.spec.image,
+                    ImageID: &c.spec.image_id,
+                    Command: c.argv().join(" "),
+                    Created: time::unix(c.created),
+                    State: state_word(c),
+                    Status: ps_status(c, health.get(&c.id)),
+                    KiriStartedAt: c.started.map(time::unix),
+                    KiriFinishedAt: c.finished.map(time::unix),
+                    KiriExitCode: c.exit_code,
+                    KiriOOMKilled: c.oom_killed,
+                    KiriVmStopped: c.vm_stopped,
+                    KiriStoppedByUser: c.stopped_by_user,
+                    Ports: ports_list_typed(c),
+                    Labels: labels_ref,
+                    HostConfig: HostConfigSummary { NetworkMode: &c.spec.network_mode },
+                    NetworkSettings: NetworkSettingsSummary { Networks: endpoints_typed(c, networks) },
+                    Mounts: &c.spec.mount_info,
+                    KiriWslDistro: spec_wsl_distro(&c.spec),
+                }
+            })
+            .collect();
+        serde_json::to_vec(&rows).map_err(|e| Error::Io(io::Error::other(e)))
+    })
 }
 
 fn inspect(c: &Container, nets: &[super::network::Network], anon_vols: &[String]) -> Value {
