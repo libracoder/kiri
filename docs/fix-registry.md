@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #984 Windows: format `npipe:////` context URLs with four slashes in `kiri-win` and `kiri import` and self-heal two-slash `npipe://./pipe/` contexts (unreleased)
+- Fixes: #984 (`kiri-win/src/engine.rs` and `import.rs` formatted `\\.\pipe\kiri` as `npipe://./pipe/kiri` with two slashes instead of `npipe:////./pipe/kiri`, and `repair_windows_config` did not upgrade existing two-slash `npipe://./pipe/kiri` context endpoints on `kiri update <container>` or startup)
+- Caused: none known
+- Caused by: #988
+- Check: `crates/kiri-win/src/engine.rs`, `crates/kiri/src/dockerctx.rs`, `crates/kiri/src/setup_win.rs`
+
 ### #381, #382, #420, #984 macOS, Networking & Windows/WSL: preserve virtiofs `chown` across host fsnotify events, attach secondary networks before PID 1 execs, format `npipe:////` context URLs with four slashes, and preserve WSL virtual/cgroup binds and local bind volumes (unreleased)
 - Fixes: #382 (`kiri_inject.c` called `__d_drop` on `C`/`M`/`A` host fsnotify events, evicting `struct fuse_inode` and losing in-memory `chown_uid`/`chown_gid` on macOS bind mounts when `FSEvents` echoed container writes), #381 (`start_on_vm` spawned the container process before attaching `spec.extra_networks`, causing fast `docker compose run` commands on secondary external networks to run before `eth1` and its IPv4 default route were attached), #984 (`setup_win::npipe_host` formatted `\\.\pipe\kiri` with two slashes `npipe://./pipe/kiri` instead of four `npipe:////./pipe/kiri`), #420 / #358 (WSL distro bind translation rewrote `/run/host-services/ssh-auth.sock` and `/sys` paths into `/mnt/wsl/kiri/roots/<distro>/...` and `POST /volumes/create` did not resolve local `o=bind` volume `device` paths relative to the calling WSL distro or Windows drive)
 - Caused: none known

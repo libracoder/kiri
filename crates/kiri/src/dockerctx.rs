@@ -182,6 +182,13 @@ pub fn sock_at(path: &Path, ours: &Path, engines: &[PathBuf]) -> Endpoint {
     Endpoint::Taken(path.display().to_string())
 }
 
+/// Formats a Windows named pipe (`\\.\pipe\kiri`) as a four-slash Docker
+/// context endpoint (`npipe:////./pipe/kiri`).
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+pub fn npipe_host(pipe: &str) -> String {
+    format!("npipe:////{}", pipe.replace('\\', "/").trim_start_matches('/'))
+}
+
 /// docker's config folder: DOCKER_CONFIG, else `.docker` in the home
 /// folder (HOME, or USERPROFILE on Windows).
 pub fn docker_dir() -> Option<PathBuf> {
@@ -414,12 +421,19 @@ pub fn repair_windows_config(dir: &Path, opts: WindowsRepairOpts<'_>) -> io::Res
     let mut out = WindowsRepair::default();
     let meta = context_meta(dir, opts.ours);
     let meta_file = meta.join("meta.json");
-    let unix_host_on_npipe = opts.host.starts_with("npipe:")
+    let stale_host_on_npipe = opts.host.starts_with("npipe:")
         && read_json(&meta_file)
             .ok()
-            .and_then(|v| v["Endpoints"]["docker"]["Host"].as_str().map(|h| h.starts_with("unix:")))
+            .and_then(|v| {
+                v["Endpoints"]["docker"]["Host"].as_str().map(|h| {
+                    h.starts_with("unix:")
+                        || (h.get(..8).is_some_and(|s| s.eq_ignore_ascii_case("npipe://"))
+                            && !h.starts_with("npipe:////")
+                            && same_host(h, opts.host))
+                })
+            })
             .unwrap_or(false);
-    if opts.force_context_write || !meta_file.is_file() || unix_host_on_npipe {
+    if opts.force_context_write || !meta_file.is_file() || stale_host_on_npipe {
         write_context(&meta, opts.ours, opts.description, opts.host)?;
         out.context_written = true;
     }
@@ -804,6 +818,49 @@ mod tests {
         assert!(r_unix.context_written);
         let healed = read_json(&context_meta(&docker, "kiri").join("meta.json")).unwrap();
         assert_eq!(healed["Endpoints"]["docker"]["Host"], "npipe:////./pipe/kiri");
+
+        // 2c. A two-slash `npipe://./pipe/kiri` written by an earlier build is self-healed
+        //     to four-slash `npipe:////./pipe/kiri`, while a custom pipe (`kiri-2`) stays.
+        write_context(&context_meta(&docker, "kiri"), "kiri", "Kiri (WSL2)", "npipe://./pipe/kiri").unwrap();
+        let r_2slash = repair_windows_config(
+            &docker,
+            WindowsRepairOpts {
+                ours: "kiri",
+                description: "Kiri (WSL2)",
+                host: "npipe:////./pipe/kiri",
+                plugins_dir: Some(&plugins),
+                force_context_write: false,
+                set_current_if_empty: false,
+                force_use: false,
+                desktop_installed: false,
+            },
+        )
+        .unwrap();
+        assert!(r_2slash.context_written);
+        assert_eq!(
+            read_json(&context_meta(&docker, "kiri").join("meta.json")).unwrap()["Endpoints"]["docker"]["Host"],
+            "npipe:////./pipe/kiri"
+        );
+        write_context(&context_meta(&docker, "kiri"), "kiri", "Kiri (WSL2)", "npipe:////./pipe/kiri-2").unwrap();
+        let r_other = repair_windows_config(
+            &docker,
+            WindowsRepairOpts {
+                ours: "kiri",
+                description: "Kiri (WSL2)",
+                host: "npipe:////./pipe/kiri",
+                plugins_dir: Some(&plugins),
+                force_context_write: false,
+                set_current_if_empty: false,
+                force_use: false,
+                desktop_installed: false,
+            },
+        )
+        .unwrap();
+        assert!(!r_other.context_written);
+        assert_eq!(
+            read_json(&context_meta(&docker, "kiri").join("meta.json")).unwrap()["Endpoints"]["docker"]["Host"],
+            "npipe:////./pipe/kiri-2"
+        );
 
         // 3. Corrupt config.json is never overwritten.
         std::fs::write(docker.join("config.json"), "{broken").unwrap();

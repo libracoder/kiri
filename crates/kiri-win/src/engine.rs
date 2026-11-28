@@ -926,7 +926,7 @@ fn about() {
 }
 
 fn npipe_host(pipe: &str) -> String {
-    format!("npipe:{}", pipe.replace('\\', "/"))
+    crate::dockerctx::npipe_host(pipe)
 }
 
 fn context_meta(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
