@@ -557,6 +557,36 @@ struct InfoRuntimes {
     kiri: InfoKiriRuntime,
 }
 
+#[inline]
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+#[inline]
+fn is_zero_u8(v: &u8) -> bool {
+    *v == 0
+}
+
+#[inline]
+fn is_zero_i32(v: &i32) -> bool {
+    *v == 0
+}
+
+#[inline]
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
+}
+
+#[inline]
+fn is_zero_f64(v: &f64) -> bool {
+    *v == 0.0
+}
+
+#[inline]
+fn is_empty_values(v: &&[Value]) -> bool {
+    v.is_empty()
+}
+
 #[derive(serde::Serialize)]
 #[allow(non_snake_case)]
 struct InfoSummary {
@@ -586,18 +616,27 @@ struct InfoSummary {
     BuilderVersion: &'static str,
     IndexServerAddress: &'static str,
     RegistryConfig: Value,
+    #[serde(skip_serializing_if = "is_zero_u64")]
     KiriAgentMemory: u64,
     KiriVmAwake: bool,
+    #[serde(skip_serializing_if = "Value::is_null")]
     KiriVmUplink: Value,
+    #[serde(skip_serializing_if = "is_false")]
     KiriStopped: bool,
     KiriMemoryCeiling: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
     KiriMemoryTarget: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
     KiriMemoryUsed: u64,
+    #[serde(skip_serializing_if = "is_zero_f64")]
     KiriMemoryStall: f64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
     KiriOomKills: u64,
+    #[serde(skip_serializing_if = "is_zero_f64")]
     KiriCpuPercent: f64,
     KiriStorageReadOnly: Option<String>,
     KiriStorageZfs: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     Warnings: Vec<String>,
 }
 
@@ -731,16 +770,22 @@ impl<T: serde::Serialize> serde::Serialize for OptSeq<T> {
 #[allow(non_snake_case)]
 struct ImageSummary<'a> {
     Id: &'a str,
+    #[serde(skip_serializing_if = "str::is_empty")]
     ParentId: &'static str,
     RepoTags: OptSeq<&'a str>,
     RepoDigests: OptSeq<std::borrow::Cow<'a, str>>,
     Created: i64,
     Size: u64,
-    SharedSize: i64,
-    VirtualSize: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    SharedSize: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    VirtualSize: Option<u64>,
+    #[serde(skip_serializing_if = "Value::is_null")]
     Labels: &'a Value,
-    Containers: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    Containers: Option<i64>,
     // Not Docker's: when this image arrived here, for the window.
+    #[serde(skip_serializing_if = "is_zero_u64")]
     Pulled: u64,
 }
 
@@ -820,6 +865,7 @@ fn images_json_bytes(req: &Request, engine: &Engine) -> Result<Vec<u8>, Error> {
                 (true, false) => (OptSeq(None), OptSeq(None)),
                 (true, true) => (OptSeq(Some("<none>:<none>")), OptSeq(Some(std::borrow::Cow::Borrowed("<none>@<none>")))),
             };
+            let legacy_virtual_size = req.api_version.is_some_and(|v| v < (1, 44));
             Some(ImageSummary {
                 Id: &i.config_digest,
                 ParentId: "",
@@ -827,10 +873,10 @@ fn images_json_bytes(req: &Request, engine: &Engine) -> Result<Vec<u8>, Error> {
                 RepoDigests: digests,
                 Created: created_unix,
                 Size: i.size,
-                SharedSize: -1,
-                VirtualSize: i.size,
+                SharedSize: None,
+                VirtualSize: legacy_virtual_size.then_some(i.size),
                 Labels: labels,
-                Containers: -1,
+                Containers: None,
                 Pulled: i.pulled_at,
             })
         })
@@ -2755,15 +2801,19 @@ fn inspect_mounts(spec: &Spec, is_anon_volume: impl Fn(&str) -> bool) -> Value {
 }
 
 fn volume_json(v: &super::volumes::Volume) -> Value {
-    json!({
-        "Name": v.name,
-        "Driver": "local",
-        "Mountpoint": super::volumes::guest_path(&v.name),
-        "CreatedAt": time::rfc3339(std::time::UNIX_EPOCH + Duration::from_nanos(v.created_ns)),
-        "Labels": if v.labels.is_object() { v.labels.clone() } else { json!({}) },
-        "Scope": "local",
-        "Options": v.options,
-    })
+    let mut m = serde_json::Map::with_capacity(7);
+    m.insert("Name".into(), v.name.clone().into());
+    m.insert("Driver".into(), "local".into());
+    m.insert("Mountpoint".into(), super::volumes::guest_path(&v.name).into());
+    m.insert("CreatedAt".into(), time::rfc3339(std::time::UNIX_EPOCH + Duration::from_nanos(v.created_ns)).into());
+    if v.labels.as_object().is_some_and(|o| !o.is_empty()) {
+        m.insert("Labels".into(), v.labels.clone());
+    }
+    m.insert("Scope".into(), "local".into());
+    if !v.options.is_empty() {
+        m.insert("Options".into(), serde_json::to_value(&v.options).unwrap_or(Value::Null));
+    }
+    Value::Object(m)
 }
 
 fn volume_create(req: &Request, engine: &Engine, caller: &Caller) -> Result<Value, Error> {
@@ -2828,7 +2878,7 @@ fn volumes(req: &Request, engine: &Engine) -> Result<Value, Error> {
         })
         .map(volume_json)
         .collect();
-    Ok(json!({"Volumes": list, "Warnings": []}))
+    Ok(json!({"Volumes": list}))
 }
 
 /// The image's and create request's ExposedPorts keys; a bare port means TCP.
@@ -3734,19 +3784,33 @@ struct IpamConfigSummary<'a> {
 #[derive(serde::Serialize)]
 #[allow(non_snake_case)]
 struct EndpointSummary<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
     IPAMConfig: Option<IpamConfigSummary<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     Links: Option<()>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     Aliases: Option<&'a [String]>,
+    #[serde(skip_serializing_if = "str::is_empty")]
     MacAddress: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
     DriverOpts: Option<()>,
+    #[serde(skip_serializing_if = "str::is_empty")]
     NetworkID: &'a str,
+    #[serde(skip_serializing_if = "str::is_empty")]
     EndpointID: &'a str,
+    #[serde(skip_serializing_if = "String::is_empty")]
     Gateway: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
     IPAddress: String,
+    #[serde(skip_serializing_if = "is_zero_u8")]
     IPPrefixLen: u8,
+    #[serde(skip_serializing_if = "String::is_empty")]
     IPv6Gateway: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
     GlobalIPv6Address: String,
+    #[serde(skip_serializing_if = "is_zero_u8")]
     GlobalIPv6PrefixLen: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
     DNSNames: Option<()>,
 }
 
@@ -3773,16 +3837,23 @@ struct ContainerSummary<'a> {
     Created: i64,
     State: &'static str,
     Status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     KiriStartedAt: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     KiriFinishedAt: Option<i64>,
+    #[serde(skip_serializing_if = "is_zero_i32")]
     KiriExitCode: i32,
+    #[serde(skip_serializing_if = "is_false")]
     KiriOOMKilled: bool,
+    #[serde(skip_serializing_if = "is_false")]
     KiriVmStopped: bool,
+    #[serde(skip_serializing_if = "is_false")]
     KiriStoppedByUser: bool,
     Ports: Vec<PortSummary<'a>>,
     Labels: &'a Value,
     HostConfig: HostConfigSummary<'a>,
     NetworkSettings: NetworkSettingsSummary<'a>,
+    #[serde(skip_serializing_if = "is_empty_values")]
     Mounts: &'a [Value],
     #[serde(skip_serializing_if = "Option::is_none")]
     KiriWslDistro: Option<String>,
@@ -4127,23 +4198,48 @@ fn network_json(engine: &Engine, n: &super::network::Network, with_members: bool
         }
         Value::Array(configs)
     };
-    json!({
-        "Name": n.name,
-        "Id": n.id,
-        "Created": time::rfc3339(std::time::UNIX_EPOCH + Duration::from_nanos(n.created_ns)),
-        "Scope": "local",
-        "Driver": n.driver,
-        "EnableIPv4": !n.no_ipv4,
-        "EnableIPv6": n.v6.is_some(),
-        "IPAM": {"Driver": "default", "Options": if n.ipam_options.is_object() { n.ipam_options.clone() } else { Value::Null }, "Config": ipam},
-        "Internal": n.internal,
-        "Attachable": n.attachable,
-        "Ingress": false,
-        "ConfigOnly": false,
-        "Containers": containers,
-        "Options": super::network::shown_options(n),
-        "Labels": if n.labels.is_object() { n.labels.clone() } else { json!({}) },
-    })
+    let mut ipam_obj = serde_json::Map::with_capacity(3);
+    ipam_obj.insert("Driver".into(), "default".into());
+    if n.ipam_options.is_object() {
+        ipam_obj.insert("Options".into(), n.ipam_options.clone());
+    } else if with_members {
+        ipam_obj.insert("Options".into(), Value::Null);
+    }
+    ipam_obj.insert("Config".into(), ipam);
+    let mut obj = serde_json::Map::with_capacity(15);
+    obj.insert("Name".into(), n.name.clone().into());
+    obj.insert("Id".into(), n.id.clone().into());
+    obj.insert("Created".into(), time::rfc3339(std::time::UNIX_EPOCH + Duration::from_nanos(n.created_ns)).into());
+    obj.insert("Scope".into(), "local".into());
+    obj.insert("Driver".into(), n.driver.clone().into());
+    obj.insert("EnableIPv4".into(), (!n.no_ipv4).into());
+    if with_members || n.v6.is_some() {
+        obj.insert("EnableIPv6".into(), n.v6.is_some().into());
+    }
+    obj.insert("IPAM".into(), Value::Object(ipam_obj));
+    if with_members || n.internal {
+        obj.insert("Internal".into(), n.internal.into());
+    }
+    if with_members || n.attachable {
+        obj.insert("Attachable".into(), n.attachable.into());
+    }
+    if with_members {
+        obj.insert("Ingress".into(), false.into());
+        obj.insert("ConfigOnly".into(), false.into());
+        obj.insert("Containers".into(), Value::Object(containers));
+    } else if !containers.is_empty() {
+        obj.insert("Containers".into(), Value::Object(containers));
+    }
+    let opts = super::network::shown_options(n);
+    if with_members || opts.as_object().is_some_and(|m| !m.is_empty()) {
+        obj.insert("Options".into(), opts);
+    }
+    if n.labels.as_object().is_some_and(|m| !m.is_empty()) {
+        obj.insert("Labels".into(), n.labels.clone());
+    } else if with_members {
+        obj.insert("Labels".into(), json!({}));
+    }
+    Value::Object(obj)
 }
 
 fn network_matches(f: &Filters, engine: &Engine, n: &super::network::Network) -> bool {
@@ -4434,7 +4530,16 @@ fn logs(req: &Request, engine: &Engine, id: &str, w: &mut UnixStream) -> io::Res
     // would make a long log slow to read.
     let mut out = Vec::with_capacity(40 << 10);
     let mut ts_cache = time::Rfc3339Cache::new();
-    let mut put = |stream: Stream, time_ns: u64, data: &[u8], out: &mut Vec<u8>| {
+    // Coalesce consecutive lines of the same multiplexed stream into a single
+    // Docker mux frame within each 32 KiB HTTP chunk to cut per-line 8-byte headers.
+    let mut open_mux: Option<(u8, usize)> = None;
+    let finish_mux = |out: &mut Vec<u8>, open_mux: &mut Option<(u8, usize)>| {
+        if let Some((_, hdr_pos)) = open_mux.take() {
+            let payload_len = (out.len() - hdr_pos - 8) as u32;
+            out[hdr_pos + 4..hdr_pos + 8].copy_from_slice(&payload_len.to_be_bytes());
+        }
+    };
+    let mut put = |stream: Stream, time_ns: u64, data: &[u8], out: &mut Vec<u8>, open_mux: &mut Option<(u8, usize)>| {
         let wanted = match stream {
             Stream::Stdout => want_out,
             Stream::Stderr => want_err,
@@ -4449,15 +4554,18 @@ fn logs(req: &Request, engine: &Engine, id: &str, w: &mut UnixStream) -> io::Res
             }
             out.extend_from_slice(data);
         } else {
-            let hdr_pos = out.len();
-            out.extend_from_slice(&[stream as u8, 0, 0, 0, 0, 0, 0, 0]);
+            let s_byte = stream as u8;
+            if open_mux.is_none_or(|(prev, _)| prev != s_byte) {
+                finish_mux(out, open_mux);
+                let hdr_pos = out.len();
+                out.extend_from_slice(&[s_byte, 0, 0, 0, 0, 0, 0, 0]);
+                *open_mux = Some((s_byte, hdr_pos));
+            }
             if stamps {
                 ts_cache.write_ns(out, time_ns);
                 out.push(b' ');
             }
             out.extend_from_slice(data);
-            let payload_len = (out.len() - hdr_pos - 8) as u32;
-            out[hdr_pos + 4..hdr_pos + 8].copy_from_slice(&payload_len.to_be_bytes());
         }
     };
     let past_until = |time_ns: u64| until.is_some_and(|u| time_ns > u);
@@ -4469,12 +4577,14 @@ fn logs(req: &Request, engine: &Engine, id: &str, w: &mut UnixStream) -> io::Res
             ended = true;
             break;
         }
-        put(stream, time_ns, &rec_buf, &mut out);
+        put(stream, time_ns, &rec_buf, &mut out, &mut open_mux);
         if out.len() >= 32 << 10 {
+            finish_mux(&mut out, &mut open_mux);
             http::chunk(w, &out)?;
             out.clear();
         }
     }
+    finish_mux(&mut out, &mut open_mux);
     http::chunk(w, &out)?;
     out.clear();
     if let (Some(rx), false) = (logs.live, ended) {
@@ -4483,12 +4593,14 @@ fn logs(req: &Request, engine: &Engine, id: &str, w: &mut UnixStream) -> io::Res
             // Whatever else is already waiting goes in the same chunk.
             while let Some(r) = next {
                 if past_until(r.time) {
+                    finish_mux(&mut out, &mut open_mux);
                     http::chunk(w, &out)?;
                     break 'live;
                 }
-                put(r.stream, r.time, &r.data, &mut out);
+                put(r.stream, r.time, &r.data, &mut out, &mut open_mux);
                 next = if out.len() < 32 << 10 { rx.try_recv().ok() } else { None };
             }
+            finish_mux(&mut out, &mut open_mux);
             http::chunk(w, &out)?;
             out.clear();
         }
